@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 520" font-family="ui-monospace, 'SF Mono', 'Menlo', Consolas, 'DejaVu Sans Mono', monospace" font-size="13">
+  <!-- Window chrome -->
+  <rect x="0" y="0" width="780" height="520" rx="10" ry="10" fill="#1e1e28"/>
+  <rect x="0" y="0" width="780" height="28" rx="10" ry="10" fill="#2a2a36"/>
+  <rect x="0" y="18" width="780" height="10" fill="#2a2a36"/>
+  <circle cx="18" cy="14" r="6" fill="#ff5f57"/>
+  <circle cx="38" cy="14" r="6" fill="#febc2e"/>
+  <circle cx="58" cy="14" r="6" fill="#28c840"/>
+  <text x="390" y="18" fill="#7a7a88" text-anchor="middle" font-size="11">UEFI Shell — sysinfo.efi</text>
+
+  <!-- Terminal content -->
+  <g transform="translate(16, 52)" xml:space="preserve">
+    <text y="0" fill="#69d4a5">FS0:\&gt;</text><text x="44" y="0" fill="#e4e4ee">sysinfo.efi</text>
+
+    <text y="24" fill="#a3b8ff">=== CPU ===</text>
+    <text y="42" fill="#c0c0d0">  CPU:        Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz</text>
+    <text y="60" fill="#c0c0d0">  Vendor:     GenuineIntel  Family: 6  Model: 167  Stepping: 1</text>
+    <text y="78" fill="#c0c0d0">  Logical:    16 (max per package)</text>
+    <text y="96" fill="#c0c0d0">  Features:   MMX SSE SSE2 SSE3 SSSE3 SSE4.1 SSE4.2 AES-NI AVX HTT</text>
+    <text y="114" fill="#c0c0d0">  Extended:   AVX2 AVX512F SHA AVX512-VBMI</text>
+
+    <text y="142" fill="#a3b8ff">=== Memory ===</text>
+    <text y="160" fill="#c0c0d0">  Total:      65536 MB (64 GB)</text>
+    <text y="178" fill="#c0c0d0">  DIMMs:      2 populated</text>
+    <text y="196" fill="#c0c0d0">  DIMM 0:     32768 MB DDR4-3200  Mfr: Micron  P/N: 18ASF4G72PDZ-3G2E1</text>
+    <text y="214" fill="#c0c0d0">  DIMM 1:     32768 MB DDR4-3200  Mfr: Micron  P/N: 18ASF4G72PDZ-3G2E1</text>
+
+    <text y="242" fill="#a3b8ff">=== Firmware ===</text>
+    <text y="260" fill="#c0c0d0">  Vendor:     EDK II</text>
+    <text y="278" fill="#c0c0d0">  Revision:   0x00010000</text>
+    <text y="296" fill="#c0c0d0">  UEFI:       2.11</text>
+    <text y="314" fill="#c0c0d0">  Secure Boot: <tspan fill="#69d4a5">Enabled</tspan></text>
+    <text y="332" fill="#c0c0d0">  TPM:        present</text>
+
+    <text y="360" fill="#a3b8ff">=== Network ===</text>
+    <text y="378" fill="#c0c0d0">  eth0:       10:7b:44:a8:2e:91  up  1000BASE-T</text>
+    <text y="396" fill="#c0c0d0">              IPv4: 192.168.1.42/24  gw 192.168.1.1</text>
+    <text y="414" fill="#c0c0d0">              DNS:  192.168.1.1  1.1.1.1</text>
+
+    <text y="442" fill="#69d4a5">FS0:\&gt;</text><text x="44" y="442" fill="#e4e4ee">_</text>
+  </g>
+</svg>
