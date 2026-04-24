@@ -1,0 +1,274 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
+/** @file Fetch.c
+    Fetch — HTTP client tool (curl-like).
+
+    Build with axl-cc:
+      axl-cc Fetch.c -o Fetch.efi
+
+    Usage: Fetch.efi [options] <url>
+    See axl_config_usage output for full option list.
+**/
+
+#include <axl.h>
+
+// ---------------------------------------------------------------------------
+// Option definitions
+// ---------------------------------------------------------------------------
+
+static const AxlConfigDesc descs[] = {
+    { "output",      AXL_CFG_STRING, NULL,    'o', "Write response body to FILE",              0, 0 },
+    { "remote-name", AXL_CFG_BOOL,   "false", 'O', "Write to file named from URL path",        0, 0 },
+    { "upload",      AXL_CFG_STRING, NULL,    'T', "Upload FILE via PUT",                      0, 0 },
+    { "data",        AXL_CFG_STRING, NULL,    'd', "Send DATA as POST body",                   0, 0 },
+    { "method",      AXL_CFG_STRING, NULL,    'X', "HTTP method (GET, POST, PUT, DELETE, HEAD)", 0, 0 },
+    { "header",      AXL_CFG_MULTI,  NULL,    'H', "Add header \"Name: Value\" (repeatable)",  0, 0 },
+    { "head",        AXL_CFG_BOOL,   "false", 'I', "HEAD request (show headers only)",         0, 0 },
+    { "verbose",     AXL_CFG_BOOL,   "false", 'v', "Show request/response headers",            0, 0 },
+    { "silent",      AXL_CFG_BOOL,   "false", 's', "Suppress status output",                   0, 0 },
+    { "help",        AXL_CFG_BOOL,   "false", 'h', "Show this help",                           0, 0 },
+    { 0 }
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Print response headers via axl_hash_table_foreach.
+static void
+print_header(
+    const void  *key,
+    void        *value,
+    void        *data
+    )
+{
+    (void)data;
+    axl_printf("< %s: %s\n", (const char *)key, (const char *)value);
+}
+
+/// Extract filename from URL path: "/path/to/file.bin" -> "file.bin"
+static const char *
+get_url_filename(
+    const char  *path
+    )
+{
+    if (path == NULL) {
+        return NULL;
+    }
+    const char *last = path;
+    for (const char *p = path; *p != '\0'; p++) {
+        if (*p == '/') {
+            last = p + 1;
+        }
+    }
+    return (*last != '\0') ? last : NULL;
+}
+
+/// Parse "Name: Value" header string into key and value.
+/// Modifies buf in place (inserts NUL at colon).
+/// Returns false if no colon found.
+static bool
+parse_header_str(
+    char   *buf,
+    char  **key,
+    char  **val
+    )
+{
+    char *colon = NULL;
+    for (char *p = buf; *p != '\0'; p++) {
+        if (*p == ':') {
+            colon = p;
+            break;
+        }
+    }
+    if (colon == NULL) {
+        return false;
+    }
+
+    *colon = '\0';
+    *key = buf;
+
+    // Skip ": " prefix on value
+    char *v = colon + 1;
+    while (*v == ' ') {
+        v++;
+    }
+    *val = v;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+int
+main(
+    int    argc,
+    char **argv
+    )
+{
+    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
+    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
+        axl_printf("Fetch: invalid option\n");
+        axl_config_usage(cfg, "Fetch", "[options] <url>");
+        return 1;
+    }
+
+    if (axl_config_get_bool(cfg, "help")) {
+        axl_config_usage(cfg, "Fetch", "[options] <url>");
+        return 0;
+    }
+
+    const char *url = axl_config_pos(cfg, 0);
+    if (url == NULL) {
+        axl_printf("Fetch: URL required\n");
+        axl_config_usage(cfg, "Fetch", "[options] <url>");
+        return 1;
+    }
+
+    bool silent    = axl_config_get_bool(cfg, "silent");
+    bool verbose   = axl_config_get_bool(cfg, "verbose");
+    bool head_only = axl_config_get_bool(cfg, "head");
+
+    // Determine HTTP method
+    const char *method_str = axl_config_get(cfg, "method");
+    const char *data_str = axl_config_get(cfg, "data");
+    const char *upload_path = axl_config_get(cfg, "upload");
+    char method[16] = "GET";
+    if (method_str != NULL) {
+        axl_strlcpy(method, method_str, sizeof(method));
+    } else if (data_str != NULL) {
+        axl_strlcpy(method, "POST", sizeof(method));
+    } else if (upload_path != NULL) {
+        axl_strlcpy(method, "PUT", sizeof(method));
+    } else if (head_only) {
+        axl_strlcpy(method, "HEAD", sizeof(method));
+    }
+
+    // Build extra headers from -H options
+    AXL_AUTOPTR(AxlHashTable) extra_headers = NULL;
+    size_t hdr_count = axl_config_get_multi_count(cfg, "header");
+    static char hdr_bufs[16][256];
+
+    if (hdr_count > 0) {
+        extra_headers = axl_hash_table_new_str();
+        for (size_t i = 0; i < hdr_count && i < 16; i++) {
+            const char *hdr = axl_config_get_multi(cfg, "header", i);
+            if (hdr == NULL) {
+                continue;
+            }
+            axl_strlcpy(hdr_bufs[i], hdr, sizeof(hdr_bufs[i]));
+            char *key = NULL;
+            char *val = NULL;
+            if (parse_header_str(hdr_bufs[i], &key, &val)) {
+                axl_hash_table_insert(extra_headers, key, val);
+            }
+        }
+    }
+
+    // Load request body
+    AXL_AUTO_FREE void *body = NULL;
+    size_t      body_size = 0;
+    const char *content_type = NULL;
+
+    if (data_str != NULL) {
+        body_size = axl_strlen(data_str);
+        body = axl_memdup(data_str, body_size);
+        content_type = "application/x-www-form-urlencoded";
+    } else if (upload_path != NULL) {
+        if (axl_file_get_contents(upload_path, &body, &body_size) != 0) {
+            axl_printf("Fetch: cannot read '%s'\n", upload_path);
+            return 1;
+        }
+        content_type = "application/octet-stream";
+    }
+
+    // Create HTTP client and send request
+    AXL_AUTOPTR(AxlHttpClient) client = axl_http_client_new();
+    if (client == NULL) {
+        axl_printf("Fetch: out of memory\n");
+        return 1;
+    }
+
+    if (!silent) {
+        axl_printf("> %s %s\n", method, url);
+    }
+
+    AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
+    int rc = axl_http_request(
+        client, method, url, body, body_size,
+        content_type, extra_headers, &resp);
+
+    if (rc != 0 || resp == NULL) {
+        axl_printf("Fetch: request failed\n");
+        return 1;
+    }
+
+    // Print status
+    if (!silent) {
+        axl_printf("< HTTP %zu\n", resp->status_code);
+    }
+
+    // Print headers (verbose or HEAD mode)
+    if (verbose || head_only) {
+        if (resp->headers != NULL) {
+            axl_hash_table_foreach(resp->headers, print_header, NULL);
+        }
+        axl_printf("\n");
+    }
+
+    // Handle response body output
+    int exit_status = 0;
+
+    if (!head_only && resp->body != NULL && resp->body_size > 0) {
+        const char *out_file = axl_config_get(cfg, "output");
+        bool auto_name = axl_config_get_bool(cfg, "remote-name");
+
+        if (out_file != NULL) {
+            if (!axl_file_set_contents(out_file, resp->body, resp->body_size)) {
+                axl_printf("Fetch: write '%s' failed\n", out_file);
+            } else if (!silent) {
+                axl_printf("Saved %u bytes to %s\n",
+                           (unsigned)resp->body_size, out_file);
+            }
+        } else if (auto_name) {
+            AXL_AUTOPTR(AxlUrl) parsed = NULL;
+            int url_rc = axl_url_parse(url, &parsed);
+            if (url_rc == 0 && parsed != NULL) {
+                const char *name = get_url_filename(parsed->path);
+                if (name != NULL && *name != '\0') {
+                    if (!axl_file_set_contents(name, resp->body,
+                                                resp->body_size)) {
+                        axl_printf("Fetch: write '%s' failed\n", name);
+                    } else if (!silent) {
+                        axl_printf("Saved %u bytes to %s\n",
+                                   (unsigned)resp->body_size, name);
+                    }
+                } else {
+                    axl_printf("Fetch: -O: cannot determine filename from URL\n");
+                }
+            } else {
+                axl_printf("Fetch: -O: cannot parse URL\n");
+            }
+        } else {
+            for (size_t i = 0; i < resp->body_size; i++) {
+                char ch = ((char *)resp->body)[i];
+                if (ch == '\n') {
+                    axl_printf("\n");
+                } else if (ch >= 0x20 && ch < 0x7F) {
+                    axl_printf("%c", ch);
+                } else {
+                    axl_printf(".");
+                }
+            }
+            axl_printf("\n");
+        }
+    }
+
+    if (resp->status_code >= 400) {
+        exit_status = 1;
+    }
+
+    return exit_status;
+}

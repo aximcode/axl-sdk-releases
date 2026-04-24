@@ -1,0 +1,299 @@
+#!/bin/bash
+# Run a .efi binary in QEMU and show its output.
+#
+# Uses the project's QEMU/firmware discovery infrastructure from
+# axl-common.sh. Serial output is captured, ANSI codes stripped,
+# and the application's stdout/stderr displayed cleanly.
+#
+# Usage: ./scripts/run-qemu.sh [OPTIONS] <file.efi> [args...]
+#
+# Options:
+#   --arch X64|AARCH64    Architecture (default: X64)
+#   --timeout SECS        QEMU timeout (default: 15)
+#   --raw                 Show full serial log (including firmware boot)
+#   --screenshot FILE     Capture framebuffer screenshot (PNG/PPM)
+#   --net                 Enable user-mode networking (virtio-net)
+#   --hostfwd H:G         Forward host port H to guest port G (repeatable)
+#   --extra FILE          Stage additional .efi file on disk (repeatable)
+#   --nsh FILE            Use custom startup.nsh instead of auto-generated
+#   --background          Launch QEMU in background, print PID
+#   --serial-log FILE     Save serial output to FILE
+#
+# Examples:
+#   ./scripts/run-qemu.sh hello.efi
+#   ./scripts/run-qemu.sh hello.efi world
+#   ./scripts/run-qemu.sh --arch AARCH64 hello.efi
+#   ./scripts/run-qemu.sh --raw hello.efi
+#   ./scripts/run-qemu.sh driver.efi          # auto-detects driver, uses "load"
+#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 HttpFS.efi serve -p 8080
+#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 --background HttpFS.efi serve
+
+set -euo pipefail
+
+source "$(dirname "$0")/axl-common.sh"
+
+ARCH="X64"
+TIMEOUT=15
+RAW=false
+SCREENSHOT=""
+NET=false
+HOSTFWDS=()
+EXTRA_FILES=()
+CUSTOM_NSH=""
+BACKGROUND=false
+SERIAL_LOG=""
+SERIAL_SOCKET=""
+EFI_FILE=""
+EFI_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)       ARCH="$2"; shift 2 ;;
+        --timeout)    TIMEOUT="$2"; shift 2 ;;
+        --raw)        RAW=true; shift ;;
+        --screenshot) SCREENSHOT="$2"; shift 2 ;;
+        --net)        NET=true; shift ;;
+        --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
+        --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
+        --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
+        --background) BACKGROUND=true; shift ;;
+        --serial-log) SERIAL_LOG="$2"; shift 2 ;;
+        --serial-socket) SERIAL_SOCKET="$2"; shift 2 ;;
+        -h|--help)
+            cat <<'HELP'
+Usage: run-qemu.sh [OPTIONS] <file.efi> [args...]
+
+Options:
+  --arch X64|AARCH64       Architecture (default: X64)
+  --timeout SECS           QEMU timeout in seconds (default: 15)
+  --raw                    Show full serial log (including firmware boot)
+  --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
+  --net                    Enable user-mode networking (virtio-net)
+  --hostfwd HOST:GUEST     Forward host port to guest (repeatable)
+  --extra FILE             Stage additional .efi on disk (repeatable)
+  --nsh FILE               Use custom startup.nsh file
+  --background             Launch QEMU in background, print PID
+  --serial-log FILE        Save serial output to file
+  --serial-socket PATH     (background mode) expose serial as a UNIX
+                           socket so host scripts can inject input
+                           (e.g. Ctrl-C via `printf '\x03' | socat ...`)
+  -h, --help               Show this help
+
+Examples:
+  run-qemu.sh hello.efi
+  run-qemu.sh --net --hostfwd 18080:8080 HttpFS.efi serve -p 8080
+  run-qemu.sh --net --extra WebDavFsDxe.efi --nsh test.nsh HttpFS.efi
+HELP
+            exit 0 ;;
+        *)
+            if [[ -z "$EFI_FILE" ]]; then
+                EFI_FILE="$1"
+            else
+                EFI_ARGS+=("$1")
+            fi
+            shift ;;
+    esac
+done
+
+if [[ -z "$EFI_FILE" ]]; then
+    echo "Usage: $0 [OPTIONS] <file.efi> [args...]  (try --help)" >&2
+    exit 1
+fi
+
+if [[ ! -f "$EFI_FILE" ]]; then
+    echo "ERROR: file not found: $EFI_FILE" >&2
+    exit 1
+fi
+
+EFI_NAME="$(basename "$EFI_FILE")"
+[[ "$ARCH" == "AARCH64" ]] && TIMEOUT=$((TIMEOUT + 10))
+
+# Detect PE subsystem: 10=app, 11=boot driver, 12=runtime driver
+IS_DRIVER=false
+if command -v python3 &>/dev/null; then
+    SUBSYSTEM=$(python3 -c "
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    mz = f.read(2)
+    if mz != b'MZ': sys.exit(1)
+    f.seek(0x3C)
+    pe_off = struct.unpack('<I', f.read(4))[0]
+    f.seek(pe_off + 0x5C)
+    print(struct.unpack('<H', f.read(2))[0])
+" "$EFI_FILE" 2>/dev/null || echo "10")
+    [[ "$SUBSYSTEM" == "11" || "$SUBSYSTEM" == "12" ]] && IS_DRIVER=true
+fi
+
+# Resolve QEMU and firmware
+QEMU_BIN=$(find_qemu "$ARCH") || { echo "QEMU not found for $ARCH" >&2; exit 1; }
+find_firmware "$ARCH" || { echo "Firmware not found for $ARCH" >&2; exit 1; }
+SHELL_EFI=$(find_shell_efi "$ARCH") || true
+BOOT_NAME=$(boot_efi_name "$ARCH")
+
+# Set up temp directory
+TMPDIR=$(mktemp -d)
+if [[ "$BACKGROUND" != "true" ]]; then
+    trap 'rm -rf "$TMPDIR"' EXIT
+fi
+
+STAGING="$TMPDIR/staging"
+LOG="$TMPDIR/serial.log"
+
+mkdir -p "$STAGING/EFI/BOOT"
+if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
+    cp "$SHELL_EFI" "$STAGING/EFI/BOOT/$BOOT_NAME"
+fi
+cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+
+# Stage extra files
+if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
+    for extra in "${EXTRA_FILES[@]}"; do
+        if [[ ! -f "$extra" ]]; then
+            echo "ERROR: extra file not found: $extra" >&2
+            exit 1
+        fi
+        cp "$extra" "$STAGING/$(basename "$extra")"
+    done
+fi
+
+# Startup script
+if [[ -n "$CUSTOM_NSH" ]]; then
+    if [[ ! -f "$CUSTOM_NSH" ]]; then
+        echo "ERROR: nsh file not found: $CUSTOM_NSH" >&2
+        exit 1
+    fi
+    cp "$CUSTOM_NSH" "$STAGING/startup.nsh"
+else
+    {
+        echo "@echo -off"
+        echo "fs0:"
+        echo "cd \\"
+        if [[ "$IS_DRIVER" == "true" ]]; then
+            echo "load $EFI_NAME"
+        elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
+            echo "$EFI_NAME ${EFI_ARGS[*]}"
+        else
+            echo "$EFI_NAME"
+        fi
+        if [[ -z "$SCREENSHOT" && "$BACKGROUND" != "true" ]]; then
+            echo "reset -s"
+        fi
+    } > "$STAGING/startup.nsh"
+fi
+
+# Build disk image
+"$MKIMAGE_DIR/mkimage.py" --source "$STAGING" --target "$TMPDIR/disk.img" --label RUN > /dev/null 2>&1
+
+# Prepare NVRAM
+cp "$FW_VARS" "$TMPDIR/vars.fd"
+
+# Build QEMU command
+mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" 512M "$TMPDIR/vars.fd")
+CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
+
+# Networking
+if [[ "$NET" == "true" ]]; then
+    NETDEV="user,id=net0"
+    for fwd in "${HOSTFWDS[@]}"; do
+        HOST_PORT="${fwd%%:*}"
+        GUEST_PORT="${fwd##*:}"
+        NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
+    done
+    CMD+=(-device virtio-net-pci,netdev=net0 -netdev "$NETDEV")
+else
+    CMD+=(-net none)
+fi
+
+# Screenshot mode
+if [[ -n "$SCREENSHOT" ]]; then
+    MONSOCK="$TMPDIR/monitor.sock"
+    CMD+=(-serial "file:$LOG" -display none -device VGA)
+    CMD+=(-monitor "unix:$MONSOCK,server,nowait")
+
+    set +e
+    "${CMD[@]}" &
+    QEMU_PID=$!
+
+    WAIT=$((TIMEOUT - 3))
+    [[ $WAIT -lt 5 ]] && WAIT=5
+    sleep "$WAIT"
+
+    for try in 1 2 3; do
+        echo "screendump $TMPDIR/screenshot.ppm" | \
+            socat -t 2 - "UNIX-CONNECT:$MONSOCK" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    sleep 1
+    kill "$QEMU_PID" >/dev/null 2>&1
+    wait "$QEMU_PID" >/dev/null 2>&1
+    set -e
+
+    if [[ -f "$TMPDIR/screenshot.ppm" ]]; then
+        if command -v convert &>/dev/null; then
+            convert "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
+        else
+            cp "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
+        fi
+        echo "Screenshot saved: $SCREENSHOT"
+    else
+        echo "WARNING: screenshot capture failed" >&2
+    fi
+
+# Background mode
+elif [[ "$BACKGROUND" == "true" ]]; then
+    if [[ -n "$SERIAL_SOCKET" ]]; then
+        # Serial as a UNIX socket the host can open to read output AND
+        # write input. -no-shutdown so the guest's own Exit doesn't
+        # force QEMU to tear down before we've drained the log. Drop
+        # -nographic (it implies serial=stdio) in favour of an
+        # explicit chardev binding.
+        rm -f "$SERIAL_SOCKET"
+        CMD+=(
+            -no-reboot
+            -chardev "socket,id=serial0,path=$SERIAL_SOCKET,server=on,wait=off"
+            -serial chardev:serial0
+            -display none
+        )
+        "${CMD[@]}" > "$LOG" 2>&1 &
+        QEMU_PID=$!
+    else
+        CMD+=(-nographic -no-reboot)
+        "${CMD[@]}" > "$LOG" 2>&1 &
+        QEMU_PID=$!
+    fi
+
+    # Copy serial log path if requested
+    if [[ -n "$SERIAL_LOG" ]]; then
+        # Create a symlink so the caller can find the log
+        ln -sf "$LOG" "$SERIAL_LOG"
+    fi
+
+    echo "QEMU_PID=$QEMU_PID"
+    echo "SERIAL_LOG=$LOG"
+    [[ -n "$SERIAL_SOCKET" ]] && echo "SERIAL_SOCKET=$SERIAL_SOCKET"
+    echo "TMPDIR=$TMPDIR"
+    # Don't clean up — caller is responsible for killing QEMU and
+    # removing TMPDIR when done.
+
+# Normal foreground mode
+else
+    CMD+=(-nographic -no-reboot)
+    timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 || true
+
+    # Copy serial log if requested
+    if [[ -n "$SERIAL_LOG" ]]; then
+        cp "$LOG" "$SERIAL_LOG"
+    fi
+
+    # Strip ANSI escape codes and carriage returns
+    CLEAN="$TMPDIR/clean.log"
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\r' > "$CLEAN"
+
+    if [[ "$RAW" == "true" ]]; then
+        cat "$CLEAN"
+    else
+        sed -n '/to continue\./,/^Reset with/p' "$CLEAN" | \
+            grep -v "to continue\." | \
+            grep -v "^Reset with"
+    fi
+fi

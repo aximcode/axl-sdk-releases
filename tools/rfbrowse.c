@@ -1,0 +1,549 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
+/** @file rfbrowse.c
+    Redfish browser — connect to a BMC and browse Redfish resources.
+
+    Build with axl-cc:
+      axl-cc rfbrowse.c -o rfbrowse.efi
+
+    Usage: rfbrowse.efi <host-or-url> [options] [path|shortcut ...]
+    See -h for full option list.
+**/
+
+#include <axl.h>
+
+// ---------------------------------------------------------------------------
+// Option definitions
+// ---------------------------------------------------------------------------
+
+static const AxlConfigDesc descs[] = {
+    { "user",     AXL_CFG_STRING, NULL,    'u', "Username",                                0, 0 },
+    { "password", AXL_CFG_STRING, NULL,    'p', "Password",                                0, 0 },
+    { "basic",    AXL_CFG_BOOL,   "false", 'b', "Use HTTP Basic auth (default: session)",  0, 0 },
+    { "members",  AXL_CFG_BOOL,   "false", 'm', "List collection Members URIs",            0, 0 },
+    { "expand",   AXL_CFG_BOOL,   "false", 'e', "With -m, GET each member",                0, 0 },
+    { "raw",      AXL_CFG_BOOL,   "false", 'r', "Raw JSON output (no colors)",             0, 0 },
+    { "verbose",  AXL_CFG_BOOL,   "false", 'v', "Show HTTP status and headers",            0, 0 },
+    { "help",     AXL_CFG_BOOL,   "false", 'h', "Show this help",                          0, 0 },
+    { 0 }
+};
+
+// ---------------------------------------------------------------------------
+// Shortcut table
+// ---------------------------------------------------------------------------
+
+static const struct {
+    const char *name;
+    const char *path;
+} shortcuts[] = {
+    { "root",     "/redfish/v1/" },
+    { "systems",  "/redfish/v1/Systems" },
+    { "system",   "/redfish/v1/Systems/1" },
+    { "sys",      "/redfish/v1/Systems/1" },
+    { "chassis",  "/redfish/v1/Chassis" },
+    { "chassis1", "/redfish/v1/Chassis/1" },
+    { "managers", "/redfish/v1/Managers" },
+    { "manager",  "/redfish/v1/Managers/1" },
+    { "mgr",      "/redfish/v1/Managers/1" },
+    { "thermal",  "/redfish/v1/Chassis/1/Thermal" },
+    { "power",    "/redfish/v1/Chassis/1/Power" },
+    { "bios",     "/redfish/v1/Systems/1/Bios" },
+    { "nics",     "/redfish/v1/Systems/1/EthernetInterfaces" },
+    { "storage",  "/redfish/v1/Systems/1/Storage" },
+    { "accounts", "/redfish/v1/AccountService/Accounts" },
+    { "sessions", "/redfish/v1/SessionService/Sessions" },
+    { "logs",     "/redfish/v1/Managers/1/LogServices" },
+    { NULL, NULL }
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a shortcut name to a Redfish path.
+/// Returns the input unchanged if not a known shortcut.
+static const char *
+resolve_shortcut(
+    const char *name
+    )
+{
+    for (int i = 0; shortcuts[i].name != NULL; i++) {
+        if (axl_strcasecmp(name, shortcuts[i].name) == 0) {
+            return shortcuts[i].path;
+        }
+    }
+    return name;
+}
+
+/// Build a full URL from base URL and Redfish path.
+/// If path starts with '/', append it directly.
+/// Otherwise prepend /redfish/v1/.
+static void
+build_url(
+    char       *buf,
+    size_t      size,
+    const char *base_url,
+    const char *path
+    )
+{
+    if (path[0] == '/') {
+        axl_snprintf(buf, size, "%s%s", base_url, path);
+    } else {
+        axl_snprintf(buf, size, "%s/redfish/v1/%s", base_url, path);
+    }
+}
+
+/// Build a base URL from a host-or-url argument.
+/// If it contains "://", use as-is. Otherwise prepend "https://".
+static void
+build_base_url(
+    char       *buf,
+    size_t      size,
+    const char *host
+    )
+{
+    if (axl_strstr(host, "://") != NULL) {
+        axl_strlcpy(buf, host, size);
+    } else {
+        axl_snprintf(buf, size, "https://%s", host);
+    }
+
+    // Strip trailing slash
+    size_t len = axl_strlen(buf);
+    if (len > 0 && buf[len - 1] == '/') {
+        buf[len - 1] = '\0';
+    }
+}
+
+/// Print a response header (for verbose mode).
+static void
+print_header(
+    const void *key,
+    void       *value,
+    void       *data
+    )
+{
+    (void)data;
+    axl_printf("  %s: %s\n", (const char *)key, (const char *)value);
+}
+
+/// Print Redfish error from JSON response body (best-effort).
+static void
+print_redfish_error(
+    const void *body,
+    size_t      body_size,
+    size_t      status_code
+    )
+{
+    if (body == NULL || body_size == 0) {
+        axl_printf("rfbrowse: HTTP %zu (no body)\n", status_code);
+        return;
+    }
+
+    AxlJsonCtx ctx;
+    if (!axl_json_parse((const char *)body, body_size, &ctx)) {
+        axl_printf("rfbrowse: HTTP %zu\n", status_code);
+        return;
+    }
+
+    // Try "error" → "message" nested path.
+    // Redfish errors: {"error":{"message":"...","code":"..."}}
+    // Flat fallback: {"message":"..."}
+    char msg[256];
+    if (axl_json_get_string(&ctx, "message", msg, sizeof(msg))) {
+        axl_printf("rfbrowse: HTTP %zu — %s\n", status_code, msg);
+    } else {
+        axl_printf("rfbrowse: HTTP %zu\n", status_code);
+    }
+    axl_json_free(&ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/// Authenticate via Redfish session creation.
+/// Returns 0 on success, -1 on failure.
+static int
+session_login(
+    AxlHttpClient *client,
+    const char    *base_url,
+    const char    *user,
+    const char    *password,
+    char          *session_uri,
+    size_t         session_uri_size
+    )
+{
+    // Build login JSON
+    char json_buf[256];
+    AxlJsonBuilder jb;
+    axl_json_init(&jb, json_buf, sizeof(json_buf));
+    axl_json_object_start(&jb);
+    axl_json_add_string(&jb, "UserName", user);
+    axl_json_add_string(&jb, "Password", password);
+    axl_json_object_end(&jb);
+    size_t json_len = axl_json_finish(&jb);
+
+    if (jb.overflow) {
+        axl_printf("rfbrowse: credentials too long\n");
+        return -1;
+    }
+
+    // POST to session service
+    char url[512];
+    axl_snprintf(url, sizeof(url),
+                 "%s/redfish/v1/SessionService/Sessions", base_url);
+
+    AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
+    int rc = axl_http_post(client, url, json_buf, json_len,
+                           "application/json", &resp);
+
+    if (rc != 0 || resp == NULL) {
+        axl_printf("rfbrowse: login request failed\n");
+        return -1;
+    }
+
+    if (resp->status_code != 200 && resp->status_code != 201) {
+        print_redfish_error(resp->body, resp->body_size, resp->status_code);
+        return -1;
+    }
+
+    // Extract token from response headers (lowercase)
+    const char *token = NULL;
+    if (resp->headers != NULL) {
+        token = (const char *)axl_hash_table_lookup(
+            resp->headers, "x-auth-token");
+    }
+
+    if (token == NULL) {
+        axl_printf("rfbrowse: login succeeded but no X-Auth-Token in response\n");
+        return -1;
+    }
+
+    // Set persistent auth header
+    axl_http_client_set(client, "header.X-Auth-Token", token);
+
+    // Store session URI for logout
+    if (session_uri != NULL) {
+        const char *loc = (const char *)axl_hash_table_lookup(
+            resp->headers, "location");
+        if (loc != NULL) {
+            axl_strlcpy(session_uri, loc, session_uri_size);
+        } else {
+            session_uri[0] = '\0';
+        }
+    }
+
+    return 0;
+}
+
+/// Set up HTTP Basic authentication.
+static int
+setup_basic_auth(
+    AxlHttpClient *client,
+    const char    *user,
+    const char    *password
+    )
+{
+    // Build "user:password"
+    char creds[256];
+    int n = axl_snprintf(creds, sizeof(creds), "%s:%s", user, password);
+    if (n < 0 || (size_t)n >= sizeof(creds)) {
+        axl_printf("rfbrowse: credentials too long\n");
+        return -1;
+    }
+
+    AXL_AUTO_FREE char *b64 = axl_base64_encode(creds, (size_t)n);
+    if (b64 == NULL) {
+        axl_printf("rfbrowse: base64 encoding failed\n");
+        return -1;
+    }
+
+    char header_val[384];
+    axl_snprintf(header_val, sizeof(header_val), "Basic %s", b64);
+    axl_http_client_set(client, "header.Authorization", header_val);
+    return 0;
+}
+
+/// Logout by DELETEing the session. Best-effort, errors ignored.
+static void
+session_logout(
+    AxlHttpClient *client,
+    const char    *base_url,
+    const char    *session_uri
+    )
+{
+    if (session_uri[0] == '\0') {
+        return;
+    }
+
+    char url[512];
+    build_url(url, sizeof(url), base_url, session_uri);
+
+    AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
+    axl_http_delete(client, url, &resp);
+}
+
+// ---------------------------------------------------------------------------
+// Resource display
+// ---------------------------------------------------------------------------
+
+/// GET a Redfish resource and display it.
+/// Returns 0 on success, -1 on failure.
+static int
+get_resource(
+    AxlHttpClient *client,
+    const char    *url,
+    bool           raw,
+    bool           verbose
+    )
+{
+    AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
+    int rc = axl_http_get(client, url, &resp);
+
+    if (rc != 0 || resp == NULL) {
+        axl_printf("rfbrowse: GET %s failed\n", url);
+        return -1;
+    }
+
+    if (verbose) {
+        axl_printf("< HTTP %zu\n", resp->status_code);
+        if (resp->headers != NULL) {
+            axl_hash_table_foreach(resp->headers, print_header, NULL);
+        }
+        axl_printf("\n");
+    }
+
+    if (resp->status_code >= 400) {
+        print_redfish_error(resp->body, resp->body_size, resp->status_code);
+        return -1;
+    }
+
+    if (resp->body != NULL && resp->body_size > 0) {
+        if (raw) {
+            axl_json_print_raw(resp->body, resp->body_size);
+        } else {
+            axl_json_pretty_print(resp->body, resp->body_size);
+        }
+        axl_printf("\n");
+    }
+
+    return 0;
+}
+
+/// GET a collection and list or expand its Members.
+/// Returns 0 on success, -1 on failure.
+static int
+get_members(
+    AxlHttpClient *client,
+    const char    *url,
+    const char    *base_url,
+    bool           expand,
+    bool           raw,
+    bool           verbose
+    )
+{
+    AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
+    int rc = axl_http_get(client, url, &resp);
+
+    if (rc != 0 || resp == NULL) {
+        axl_printf("rfbrowse: GET %s failed\n", url);
+        return -1;
+    }
+
+    if (verbose) {
+        axl_printf("< HTTP %zu\n", resp->status_code);
+        if (resp->headers != NULL) {
+            axl_hash_table_foreach(resp->headers, print_header, NULL);
+        }
+        axl_printf("\n");
+    }
+
+    if (resp->status_code >= 400) {
+        print_redfish_error(resp->body, resp->body_size, resp->status_code);
+        return -1;
+    }
+
+    if (resp->body == NULL || resp->body_size == 0) {
+        axl_printf("rfbrowse: empty response\n");
+        return -1;
+    }
+
+    AxlJsonCtx ctx;
+    if (!axl_json_parse(resp->body, resp->body_size, &ctx)) {
+        axl_printf("rfbrowse: failed to parse JSON response\n");
+        return -1;
+    }
+
+    // Print collection name if present
+    char name[128];
+    if (axl_json_get_string(&ctx, "Name", name, sizeof(name))) {
+        axl_printf("=== %s ===\n", name);
+    }
+
+    // Iterate Members array
+    AxlJsonArrayIter iter;
+    if (!axl_json_array_begin(&ctx, "Members", &iter)) {
+        axl_printf("rfbrowse: no Members array in response\n");
+        axl_json_free(&ctx);
+        return -1;
+    }
+
+    int result = 0;
+    int count = 0;
+    AxlJsonCtx element;
+
+    while (axl_json_array_next(&iter, &element)) {
+        char odata_id[256];
+        if (!axl_json_get_string(&element, "@odata.id",
+                                 odata_id, sizeof(odata_id))) {
+            continue;
+        }
+
+        count++;
+
+        if (expand) {
+            axl_printf("\n--- %s ---\n", odata_id);
+            char member_url[512];
+            build_url(member_url, sizeof(member_url), base_url, odata_id);
+            if (get_resource(client, member_url, raw, verbose) != 0) {
+                result = -1;
+            }
+        } else {
+            axl_printf("  %s\n", odata_id);
+        }
+    }
+
+    axl_printf("\n%d member(s)\n", count);
+    axl_json_free(&ctx);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+int
+main(
+    int    argc,
+    char **argv
+    )
+{
+    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
+    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
+        axl_printf("rfbrowse: invalid option\n");
+        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
+        return 1;
+    }
+
+    if (axl_config_get_bool(cfg, "help")) {
+        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
+        axl_printf("\nShortcuts:\n");
+        for (int i = 0; shortcuts[i].name != NULL; i++) {
+            axl_printf("  %-10s %s\n", shortcuts[i].name, shortcuts[i].path);
+        }
+        return 0;
+    }
+
+    const char *host = axl_config_pos(cfg, 0);
+    if (host == NULL) {
+        axl_printf("rfbrowse: host required\n");
+        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
+        return 1;
+    }
+
+    const char *user     = axl_config_get(cfg, "user");
+    const char *password = axl_config_get(cfg, "password");
+    bool basic   = axl_config_get_bool(cfg, "basic");
+    bool members = axl_config_get_bool(cfg, "members");
+    bool expand  = axl_config_get_bool(cfg, "expand");
+    bool raw     = axl_config_get_bool(cfg, "raw");
+    bool verbose = axl_config_get_bool(cfg, "verbose");
+
+    // Build base URL
+    char base_url[256];
+    build_base_url(base_url, sizeof(base_url), host);
+
+    // Create and configure HTTP client
+    AXL_AUTOPTR(AxlHttpClient) client = axl_http_client_new();
+    if (client == NULL) {
+        axl_printf("rfbrowse: out of memory\n");
+        return 1;
+    }
+
+    axl_http_client_set(client, "tls.verify", "false");
+    axl_http_client_set(client, "timeout.ms", "30000");
+    axl_http_client_set(client, "header.Accept", "application/json");
+    axl_http_client_set(client, "header.OData-Version", "4.0");
+
+    // Authenticate
+    char session_uri[256] = "";
+    bool have_session = false;
+
+    if (basic && user != NULL && password != NULL) {
+        if (setup_basic_auth(client, user, password) != 0) {
+            return 1;
+        }
+    } else if (user != NULL && password != NULL) {
+        if (session_login(client, base_url, user, password,
+                          session_uri, sizeof(session_uri)) != 0) {
+            return 1;
+        }
+        have_session = true;
+        if (verbose) {
+            axl_printf("Logged in (session: %s)\n\n",
+                       session_uri[0] ? session_uri : "unknown");
+        }
+    }
+
+    // Determine which paths to fetch
+    size_t pos_count = (size_t)axl_config_pos_count(cfg);
+    int result = 0;
+
+    if (pos_count <= 1) {
+        // No path args — fetch service root
+        char url[512];
+        build_url(url, sizeof(url), base_url, "/redfish/v1/");
+
+        if (members) {
+            result = get_members(client, url, base_url, expand, raw, verbose);
+        } else {
+            result = get_resource(client, url, raw, verbose);
+        }
+    } else {
+        // Process each path argument
+        for (size_t i = 1; i < pos_count; i++) {
+            const char *arg = axl_config_pos(cfg, (int)i);
+            if (arg == NULL) {
+                continue;
+            }
+
+            const char *path = resolve_shortcut(arg);
+            char url[512];
+            build_url(url, sizeof(url), base_url, path);
+
+            if (pos_count > 2 && !raw) {
+                axl_printf("=== %s ===\n", arg);
+            }
+
+            int rc;
+            if (members) {
+                rc = get_members(client, url, base_url, expand, raw, verbose);
+            } else {
+                rc = get_resource(client, url, raw, verbose);
+            }
+
+            if (rc != 0) {
+                result = 1;
+            }
+        }
+    }
+
+    // Logout
+    if (have_session) {
+        session_logout(client, base_url, session_uri);
+    }
+
+    return result;
+}

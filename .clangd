@@ -1,0 +1,10 @@
+# clangd project config. See https://clangd.llvm.org/config.
+#
+# AXL intentionally includes umbrella headers like axl-backend.h even
+# when the direct .c file only uses types that arrive transitively —
+# the include documents the dependency and keeps the .c file self-
+# contained if transitive chains change. Disable the include-cleaner
+# diagnostics so clangd stops flagging those as unused or missing.
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None

@@ -1,0 +1,58 @@
+# Doxyfile for AXL SDK — XML-only output for Sphinx/Breathe
+#
+# Run from docs/sphinx/:  doxygen Doxyfile
+
+PROJECT_NAME           = "AXL"
+PROJECT_BRIEF          = "AximCode Library for UEFI"
+
+# Input
+INPUT                  = ../../include/axl
+FILE_PATTERNS          = *.h
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = *-impl.h
+
+# What to extract
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = YES
+HIDE_UNDOC_MEMBERS     = YES
+HIDE_UNDOC_CLASSES     = YES
+
+# C-specific
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+
+# Input filter: strips file-level doc comments (the .rst provides
+# intros) and replaces allocation #define macros with typed function
+# prototypes so Doxygen renders proper C types.
+INPUT_FILTER           = ./doxy-filter.sh
+
+# Preprocessing — expand all macros (AXL_WARN_UNUSED etc.)
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+PREDEFINED             = EFIAPI= \
+                         __attribute__(x)= \
+                         AXL_WARN_UNUSED= \
+                         AXL_NORETURN=
+
+# Output — XML only (Breathe consumes this)
+GENERATE_XML           = YES
+XML_OUTPUT             = ../../out/docs/doxygen-xml
+XML_PROGRAMLISTING     = YES
+
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+
+# Exclude internal macros from output
+EXCLUDE_SYMBOLS        = AXL_WARN_UNUSED \
+                         AXL_NORETURN
+
+# Misc
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_NO_PARAMDOC       = NO
+SORT_MEMBER_DOCS       = NO
+SHOW_INCLUDE_FILES     = NO
+FULL_PATH_NAMES        = NO

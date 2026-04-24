@@ -1,0 +1,647 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
+/**
+ * axl-str.h:
+ *
+ * String utilities. All char * functions operate on UTF-8 strings
+ * (which are a superset of ASCII). Case-insensitive operations
+ * (axl_strcasecmp, axl_strcasestr) fold ASCII letters only — they
+ * do not handle full Unicode case mapping.
+ *
+ * UCS-2 (unsigned short *) functions are in the _w section at the
+ * bottom of this file — these are for UEFI internal use. Consumer
+ * code should use UTF-8 throughout.
+ *
+ * All allocated results are freed with axl_free().
+ */
+
+#ifndef AXL_STR_H
+#define AXL_STR_H
+
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// UTF-8 string/memory operations (freestanding — no <string.h> needed)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Get string length. NULL returns 0.
+ */
+size_t
+axl_strlen(
+    const char *s  ///< NUL-terminated string, or NULL
+);
+
+/**
+ * @brief Compare two strings.
+ *
+ * @return <0, 0, or >0.
+ */
+int
+axl_strcmp(
+    const char *a,  ///< first string
+    const char *b   ///< second string
+);
+
+/**
+ * @brief Test if two strings are equal. NULL-safe.
+ *
+ * Shorthand for `axl_strcmp(a, b) == 0`.
+ *
+ * @return true if equal.
+ */
+static inline bool
+axl_streql(
+    const char *a,
+    const char *b
+    )
+{
+    if (a == b) { return true; }
+    if (a == NULL || b == NULL) { return false; }
+    return axl_strcmp(a, b) == 0;
+}
+
+/**
+ * @brief Compare at most @n bytes of two strings.
+ *
+ * @return <0, 0, or >0.
+ */
+int
+axl_strncmp(
+    const char *a,  ///< first string
+    const char *b,  ///< second string
+    size_t      n   ///< max bytes to compare
+);
+
+/**
+ * @brief Case-insensitive string comparison (ASCII case folding only).
+ *
+ * @return <0, 0, or >0.
+ */
+int
+axl_strcasecmp(
+    const char *a,  ///< first string
+    const char *b   ///< second string
+);
+
+/**
+ * @brief Copy @n bytes from @a src to @a dst.
+ *
+ * Regions must not overlap. NULL-safe: returns @a dst if either is NULL.
+ *
+ * @return @a dst.
+ */
+void *
+axl_memcpy(
+    void       *dst,  ///< destination
+    const void *src,  ///< source
+    size_t      n     ///< byte count
+);
+
+/**
+ * @brief Fill @a n bytes of @a dst with byte @a c.
+ *
+ * @return @a dst.
+ */
+void *
+axl_memset(
+    void  *dst,  ///< destination
+    int    c,    ///< fill byte
+    size_t n     ///< byte count
+);
+
+/**
+ * @brief Copy @a n bytes, handling overlapping regions. Like memmove().
+ *
+ * @return @a dst.
+ */
+void *
+axl_memmove(
+    void       *dst,  ///< destination
+    const void *src,  ///< source
+    size_t      n     ///< byte count
+);
+
+/**
+ * @brief Compare @a n bytes of memory. Like memcmp().
+ *
+ * @return <0, 0, or >0.
+ */
+int
+axl_memcmp(
+    const void *a,  ///< first buffer
+    const void *b,  ///< second buffer
+    size_t      n   ///< byte count
+);
+
+/**
+ * @brief Format into a fixed buffer. Like snprintf().
+ *
+ * Uses AXL's own printf engine (standard C format specifiers).
+ * Always NUL-terminates if size > 0.
+ *
+ * @return number of bytes that would have been written (excluding NUL),
+ *     regardless of buffer size (allows truncation detection).
+ */
+int
+axl_snprintf(
+    char       *buf,   ///< output buffer
+    size_t      size,  ///< buffer size
+    const char *fmt,   ///< printf-style format string
+    ...
+) __attribute__((format(printf, 3, 4)));
+
+// ---------------------------------------------------------------------------
+// Safe string copy/concat (like strlcpy/strlcat)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Copy @a src into @a dst, guaranteeing NUL-termination.
+ *
+ * At most dst_size-1 characters are copied. Like BSD strlcpy / g_strlcpy.
+ *
+ * @return length of @a src (allows truncation detection:
+ *     if return >= dst_size, output was truncated).
+ */
+size_t
+axl_strlcpy(
+    char       *dst,       ///< destination buffer
+    const char *src,       ///< source string
+    size_t      dst_size   ///< total size of @a dst (including NUL)
+);
+
+/**
+ * @brief Append @a src to @a dst, guaranteeing NUL-termination.
+ *
+ * Like BSD strlcat / g_strlcat.
+ *
+ * @return attempted total length (dst_len + src_len).
+ *     If return >= dst_size, output was truncated.
+ */
+size_t
+axl_strlcat(
+    char       *dst,       ///< destination buffer (must be NUL-terminated)
+    const char *src,       ///< string to append
+    size_t      dst_size   ///< total size of @a dst (including NUL)
+);
+
+// ---------------------------------------------------------------------------
+// String duplication
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Duplicate at most @a n bytes of @a s into a new NUL-terminated string.
+ *
+ * Caller frees with axl_free(). NULL-safe: returns NULL if @a s is NULL.
+ *
+ * @return new string, or NULL on failure.
+ */
+char *
+axl_strndup(
+    const char *s,  ///< source string
+    size_t      n   ///< maximum bytes to copy
+);
+
+// ---------------------------------------------------------------------------
+// String splitting, joining, trimming
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Split a string by a delimiter character.
+ *
+ * Returns a NULL-terminated array of newly allocated strings.
+ * Free the result with axl_strfreev().
+ *
+ * @return array of strings, or NULL on failure.
+ */
+char **
+axl_strsplit(
+    const char *str,        ///< string to split
+    char        delimiter   ///< delimiter character
+);
+
+/**
+ * @brief Free a NULL-terminated string array from axl_strsplit.
+ */
+void
+axl_strfreev(
+    char **arr  ///< array to free (NULL-safe)
+);
+
+/**
+ * @brief Join a NULL-terminated string array with a separator.
+ *
+ * Caller frees the result with axl_free().
+ *
+ * @return new string, or NULL on failure.
+ */
+char *
+axl_strjoin(
+    const char  *separator, ///< separator between elements
+    const char **arr        ///< NULL-terminated array of strings
+);
+
+/**
+ * @brief Trim leading and trailing ASCII whitespace in place.
+ *
+ * Modifies the string by shifting content and NUL-terminating.
+ * Returns the input pointer for convenience.
+ *
+ * @return @a str (same pointer).
+ */
+char *
+axl_strstrip(
+    char *str  ///< string to trim (modified in place)
+);
+
+/**
+ * @brief Find first occurrence of character @a c in @a s.
+ *
+ * Like strchr(). Returns pointer to matching character, or NULL.
+ *
+ * @return pointer to first @a c in @a s, or NULL if not found.
+ */
+char *
+axl_strchr(
+    const char *s,  ///< string to search
+    int         c   ///< character to find
+);
+
+/**
+ * @brief Find first occurrence of @a needle in @a haystack.
+ *
+ * Like strstr(). Searches the entire NUL-terminated string.
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strstr(
+    const char *haystack,  ///< string to search
+    const char *needle     ///< substring to find
+);
+
+/**
+ * @brief Copy @a src to @a dst, NUL-padding to @a n bytes.
+ *
+ * Like strncpy(). If @a src is shorter than @a n, the remainder
+ * is filled with NUL bytes. Does NOT guarantee NUL-termination
+ * if @a src is longer than @a n. Prefer axl_strlcpy() for safe
+ * copying with guaranteed NUL-termination.
+ *
+ * @return @a dst.
+ */
+char *
+axl_strncpy(
+    char       *dst,  ///< destination buffer
+    const char *src,  ///< source string
+    size_t      n     ///< max bytes to write
+);
+
+// ---------------------------------------------------------------------------
+// String searching (bounded)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Find first occurrence of @a needle in @a haystack.
+ *
+ * Searches at most @a haystack_len bytes. Pass -1 to search the
+ * entire NUL-terminated string.
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strstr_len(
+    const char *haystack,      ///< string to search
+    long long   haystack_len,  ///< max bytes to search (-1 for all)
+    const char *needle         ///< substring to find
+);
+
+/**
+ * @brief Find last occurrence of @a needle in @a haystack.
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strrstr(
+    const char *haystack,  ///< string to search
+    const char *needle     ///< substring to find
+);
+
+/**
+ * @brief Find last occurrence of @a needle in first @a haystack_len bytes.
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strrstr_len(
+    const char *haystack,      ///< string to search
+    long long   haystack_len,  ///< max bytes to search (-1 for all)
+    const char *needle         ///< substring to find
+);
+
+/**
+ * @brief Case-insensitive substring search (ASCII case folding only).
+ *
+ * Finds the first occurrence of @a needle in @a haystack, ignoring
+ * ASCII letter case. NULL-safe: returns NULL if either argument is NULL.
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strcasestr(
+    const char *haystack,  ///< string to search
+    const char *needle     ///< substring to find (case-insensitive)
+);
+
+// ---------------------------------------------------------------------------
+// String testing
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Glob-style pattern matching.
+ *
+ * Matches @a string against @a pattern using shell glob rules:
+ * `*` matches zero or more characters, `?` matches exactly one,
+ * `[abc]` matches a character class, `[a-z]` matches a range.
+ * Matching is case-sensitive. NULL-safe: returns false if either
+ * argument is NULL.
+ *
+ * @return true if @a string matches @a pattern.
+ */
+bool
+axl_fnmatch(
+    const char *pattern,  ///< glob pattern
+    const char *string    ///< string to match against
+);
+
+/**
+ * @brief Test if @a str starts with @a prefix.
+ *
+ * @return true if @a str begins with @a prefix.
+ */
+bool
+axl_str_has_prefix(
+    const char *str,     ///< string to test
+    const char *prefix   ///< prefix to check for
+);
+
+/**
+ * @brief Test if @a str ends with @a suffix.
+ *
+ * @return true if @a str ends with @a suffix.
+ */
+bool
+axl_str_has_suffix(
+    const char *str,     ///< string to test
+    const char *suffix   ///< suffix to check for
+);
+
+/**
+ * @brief Test if string is pure ASCII (all bytes 0x00-0x7F).
+ *
+ * @return true if all bytes are ASCII.
+ */
+bool
+axl_str_is_ascii(
+    const char *str  ///< string to test
+);
+
+/**
+ * @brief NULL-safe string comparison.
+ *
+ * Two NULLs are equal. NULL sorts before non-NULL.
+ *
+ * @return negative, zero, or positive (like strcmp).
+ */
+int
+axl_strcmp0(
+    const char *str1,  ///< first string (may be NULL)
+    const char *str2   ///< second string (may be NULL)
+);
+
+/**
+ * @brief Byte-by-byte string equality test. (GLib: g_str_equal)
+ *
+ * Parameters are void* so this can be used directly as a hash table
+ * equality function. Both strings must be non-NULL.
+ *
+ * @return true if strings are equal.
+ */
+bool
+axl_str_equal(
+    const void *v1,  ///< first string (cast to const char *)
+    const void *v2   ///< second string (cast to const char *)
+);
+
+/**
+ * @brief FNV-1a hash of a NUL-terminated string. (GLib: g_str_hash)
+ *
+ * Void-pointer signature matches AxlHashFunc so it can be handed
+ * directly to axl_hash_table_new.
+ *
+ * @return hash value.
+ */
+size_t
+axl_str_hash(
+    const void *key  ///< NUL-terminated string (cast to const char *)
+);
+
+/**
+ * @brief Case-insensitive comparison, length-bounded (ASCII only).
+ *
+ * Compares at most @a n bytes. ASCII letters only (A-Z, a-z).
+ *
+ * @return negative, zero, or positive (like strncmp).
+ */
+int
+axl_strncasecmp(
+    const char *s1, ///< first string
+    const char *s2, ///< second string
+    size_t      n   ///< max bytes to compare
+);
+
+/**
+ * @brief Check if a NULL-terminated string array contains @a str.
+ *
+ * @return true if @a str is found in @a strv.
+ */
+bool
+axl_strv_contains(
+    const char *const *strv,  ///< NULL-terminated string array
+    const char        *str    ///< string to search for
+);
+
+/**
+ * @brief Check if two NULL-terminated string arrays are identical.
+ *
+ * Both arrays must be non-NULL. Compares element-by-element.
+ *
+ * @return true if arrays have the same elements in the same order.
+ */
+bool
+axl_strv_equal(
+    const char *const *strv1,  ///< first array
+    const char *const *strv2   ///< second array
+);
+
+// ---------------------------------------------------------------------------
+// UTF-8 <-> UCS-2 conversion
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Convert a UTF-8 string to UCS-2.
+ *
+ * Handles BMP characters (U+0000..U+FFFF). Caller frees with axl_free().
+ * The returned type (unsigned short *) matches UEFI's CHAR16.
+ *
+ * @return newly allocated UCS-2 string, or NULL if @a s is NULL
+ *     or allocation fails.
+ */
+unsigned short *
+axl_utf8_to_ucs2(
+    const char *s  ///< UTF-8 string, or NULL
+);
+
+/**
+ * @brief Widen an ASCII/UTF-8 string to UCS-2 in a caller-provided buffer.
+ *
+ * No allocation. Copies each byte as a 16-bit character. Suitable for
+ * stack buffers in performance-sensitive code (logging, console output).
+ *
+ * @return number of characters written (excluding NUL terminator).
+ */
+size_t
+axl_utf8_to_ucs2_buf(
+    const char     *src,       ///< UTF-8 source string
+    unsigned short *dst,       ///< destination UCS-2 buffer
+    size_t          dst_count  ///< capacity of @a dst in characters (including NUL)
+);
+
+/**
+ * @brief Convert a UCS-2 string to UTF-8.
+ *
+ * Caller frees with axl_free().
+ *
+ * @return newly allocated UTF-8 string, or NULL if @a s is NULL
+ *     or allocation fails.
+ */
+char *
+axl_ucs2_to_utf8(
+    const unsigned short *s  ///< UCS-2 (unsigned short *) string, or NULL
+);
+
+// ---------------------------------------------------------------------------
+// Base64 (RFC 4648)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Base64-encode binary data.
+ *
+ * Caller frees with axl_free().
+ *
+ * @return NUL-terminated base64 string, or NULL on failure.
+ */
+char *
+axl_base64_encode(
+    const void *data,  ///< input bytes
+    size_t      len    ///< input length
+);
+
+/**
+ * @brief Decode a base64 string.
+ *
+ * @return 0 on success, -1 on invalid input.
+ */
+int
+axl_base64_decode(
+    const char *b64,      ///< base64 string
+    void      **out,      ///< (out): pointer to decoded data (caller frees with axl_free)
+    size_t     *out_len   ///< (out): decoded data length
+);
+
+// ---------------------------------------------------------------------------
+// Number parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Parse an unsigned 64-bit integer.
+ *
+ * Handles "0x" prefix for hex. Returns 0 on NULL or invalid input.
+ */
+uint64_t
+axl_strtou64(
+    const char *s  ///< number string (decimal or "0x" hex)
+);
+
+// ---------------------------------------------------------------------------
+// Wide-string (UCS-2) utilities -- UEFI internal use.
+// Consumer code should use UTF-8. Convert with axl_ucs2_to_utf8().
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// UCS-2 primitive operations
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Get UCS-2 string length. NULL returns 0.
+ *
+ * @return number of characters (not including NUL).
+ */
+size_t
+axl_wcslen(
+    const unsigned short *s  ///< UCS-2 string, or NULL
+);
+
+/**
+ * @brief Compare two UCS-2 strings.
+ *
+ * NULL-safe: NULL sorts before non-NULL. Two NULLs are equal.
+ *
+ * @return <0, 0, or >0.
+ */
+int
+axl_wcscmp(
+    const unsigned short *a,  ///< first string
+    const unsigned short *b   ///< second string
+);
+
+/**
+ * @brief Test if two UCS-2 strings are equal. NULL-safe.
+ *
+ * Shorthand for `axl_wcscmp(a, b) == 0`.
+ *
+ * @return true if equal.
+ */
+static inline bool
+axl_wcseql(
+    const unsigned short *a,
+    const unsigned short *b
+    )
+{
+    if (a == b) { return true; }
+    if (a == NULL || b == NULL) { return false; }
+    return axl_wcscmp(a, b) == 0;
+}
+
+/**
+ * @brief Copy UCS-2 string with size limit. Guarantees NUL-termination.
+ */
+void
+axl_wcscpy(
+    unsigned short       *dst,        ///< destination buffer
+    const unsigned short *src,        ///< source string
+    size_t                dst_count   ///< destination buffer size in characters
+);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AXL_STR_H */

@@ -1,0 +1,69 @@
+"""Sphinx configuration for AXL SDK documentation."""
+from __future__ import annotations
+
+import os
+
+# -- Project info ------------------------------------------------------------
+
+project = "AXL"
+author = "AximCode"
+copyright = "2025-2026, AximCode"  # noqa: A001
+release = "0.1"
+
+# -- Extensions --------------------------------------------------------------
+
+extensions = [
+    "breathe",
+    "myst_parser",
+]
+
+# -- MyST (Markdown) ---------------------------------------------------------
+
+myst_heading_anchors = 3
+suppress_warnings = ["myst.header", "myst.xref_missing"]
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
+}
+
+# -- Breathe -----------------------------------------------------------------
+
+breathe_projects = {
+    "axl": os.path.join(os.path.dirname(__file__), "..", "..", "out", "docs", "doxygen-xml"),
+}
+breathe_default_project = "axl"
+breathe_default_members = ("members",)
+breathe_domain_by_extension = {"h": "c"}
+breathe_domain_by_file_pattern = {"*.h": "c"}
+
+# -- HTML output -------------------------------------------------------------
+
+html_theme = "sphinx_rtd_theme"
+html_theme_options = {
+    "navigation_depth": 3,
+    "collapse_navigation": False,
+}
+html_static_path = []
+html_search_language = "en"
+
+# -- Man pages ---------------------------------------------------------------
+
+man_pages = [
+    ("modules/mem",    "axl-mem",    "AXL memory allocation",       [author], 3),
+    ("modules/format", "axl-format", "AXL printf engine",           [author], 3),
+    ("modules/str",    "axl-str",    "AXL string utilities",        [author], 3),
+    ("modules/string", "axl-string", "AXL string builder",          [author], 3),
+    ("modules/io",     "axl-io",     "AXL stream I/O",             [author], 3),
+    ("modules/log",    "axl-log",    "AXL logging",                [author], 3),
+    ("modules/data",   "axl-data",   "AXL data structures",        [author], 3),
+    ("modules/json",   "axl-json",   "AXL JSON parser/builder",    [author], 3),
+    ("modules/cache",  "axl-cache",  "AXL TTL cache",              [author], 3),
+    ("modules/config", "axl-config", "AXL configuration framework", [author], 3),
+    ("modules/path",   "axl-path",   "AXL path manipulation",      [author], 3),
+    ("modules/loop",   "axl-loop",   "AXL event loop",             [author], 3),
+    ("modules/task",   "axl-task",   "AXL task pool and arena",    [author], 3),
+    ("modules/net",    "axl-net",    "AXL networking",             [author], 3),
+    ("modules/tls",    "axl-tls",   "AXL TLS support",            [author], 3),
+    ("modules/sys",    "axl-sys",    "AXL system utilities",       [author], 3),
+    ("modules/gfx",    "axl-gfx",   "AXL graphics",               [author], 3),
+]

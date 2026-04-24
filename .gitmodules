@@ -1,0 +1,4 @@
+[submodule "deps/mbedtls"]
+	path = deps/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
+	shallow = true

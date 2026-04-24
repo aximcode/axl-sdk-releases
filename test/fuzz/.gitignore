@@ -1,0 +1,11 @@
+# Built harness binaries
+url_fuzz
+json_fuzz
+ipmi_fuzz
+
+# libFuzzer crash / leak / timeout / OOM artifacts
+crash-*
+leak-*
+timeout-*
+oom-*
+slow-unit-*

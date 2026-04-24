@@ -1,0 +1,50 @@
+# clang-tidy configuration for the AXL SDK.
+#
+# Policy: enable the bugprone-* and clang-analyzer-* check groups,
+# with a small number of noisy/false-positive checks disabled where
+# they conflict with common C idioms in freestanding UEFI code.
+#
+# Checks disabled (and why):
+#
+# - bugprone-easily-swappable-parameters
+#     Fires on every function with two `const char *` parameters.
+#     Most of the library. Too noisy to be useful.
+#
+# - bugprone-narrowing-conversions
+#     Fires on every implicit `int ↔ size_t` conversion in C code.
+#     Not a real bug signal for C, and auto-fixing to explicit casts
+#     would add hundreds of casts without improving safety.
+#
+# - bugprone-implicit-widening-of-multiplication-result
+#     Fires on `(size_t)(a * b)` patterns that are mathematically safe
+#     given the value ranges involved. We fix genuine overflow risks
+#     case-by-case (see axl_calloc_impl) but don't want a blanket check.
+#
+# - bugprone-multi-level-implicit-pointer-conversion
+#     Fires on every `void *` ↔ `T **` conversion. Endemic to C hash
+#     table and callback code where `void *` is the generic container.
+#
+# - bugprone-reserved-identifier
+#     Flags `_NAME` or `__NAME` which EDK2-compatible code uses for
+#     UEFI symbols. Disabled in favor of a manual audit if this ever
+#     becomes an issue.
+#
+# If a new check becomes useful, add it here and baseline the
+# warnings before flipping it on — see the contributor guide.
+
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-reserved-identifier,
+  clang-analyzer-*
+
+# Treat every remaining warning as an error so CI fails on regression.
+WarningsAsErrors: '*'
+
+# Only lint our own source tree; ignore system headers, UEFI generated
+# headers, and the mbedtls submodule.
+HeaderFilterRegex: '^(?!.*(uefi/generated|deps/mbedtls)).*src/.*$'

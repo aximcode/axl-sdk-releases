@@ -1,0 +1,694 @@
+/** @file axl-test-strbuf.c
+    Unit tests for AxlString string builder and conversion utilities.
+**/
+
+#include "axl-test.h"
+
+static inline int
+test_memcmp(const void *a, const void *b, size_t n)
+{
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (size_t i = 0; i < n; i++) {
+        if (pa[i] != pb[i]) {
+            return (int)pa[i] - (int)pb[i];
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AxlString tests
+// ---------------------------------------------------------------------------
+
+static void
+test_strbuf_basic(void)
+{
+    AxlString    *b;
+
+    b = axl_string_new(NULL);
+    test_check(b != NULL, "strbuf: new non-NULL");
+    test_check(axl_string_len(b) == 0, "strbuf: new len 0");
+    test_check(axl_strcmp(axl_string_str(b), "") == 0, "strbuf: new empty string");
+
+    axl_string_append(b, "hello");
+    test_check(axl_string_len(b) == 5, "strbuf: append len 5");
+    test_check(axl_strcmp(axl_string_str(b), "hello") == 0, "strbuf: append content");
+
+    axl_string_append(b, " world");
+    test_check(axl_strcmp(axl_string_str(b), "hello world") == 0,
+               "strbuf: append concatenates");
+
+    axl_string_free(b);
+
+    // NULL free is safe
+    axl_string_free(NULL);
+    test_check(true, "strbuf: free(NULL) no crash");
+}
+
+static void
+test_strbuf_append_n(void)
+{
+    AxlString  *b;
+
+    b = axl_string_new(NULL);
+    axl_string_append_len(b, "abcdefgh", 4);
+    test_check(axl_string_len(b) == 4, "strbuf: append_n len 4");
+    test_check(axl_strcmp(axl_string_str(b), "abcd") == 0, "strbuf: append_n content");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_putc(void)
+{
+    AxlString  *b;
+
+    b = axl_string_new(NULL);
+    axl_string_append_c(b, 'A');
+    axl_string_append_c(b, 'B');
+    axl_string_append_c(b, 'C');
+    test_check(axl_string_len(b) == 3, "strbuf: putc len 3");
+    test_check(axl_strcmp(axl_string_str(b), "ABC") == 0, "strbuf: putc content");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_printf(void)
+{
+    AxlString  *b;
+
+    b = axl_string_new(NULL);
+    axl_string_append_printf(b, "count=%d", 42);
+    test_check(axl_strcmp(axl_string_str(b), "count=42") == 0,
+               "strbuf: printf basic");
+
+    axl_string_append_printf(b, " name=%s", "test");
+    test_check(axl_strcmp(axl_string_str(b), "count=42 name=test") == 0,
+               "strbuf: printf appends");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_steal(void)
+{
+    AxlString  *b;
+    char       *s;
+
+    b = axl_string_new(NULL);
+    axl_string_append(b, "stolen");
+    s = axl_string_steal(b);
+    test_check(s != NULL, "strbuf: steal non-NULL");
+    test_check(axl_strcmp(s, "stolen") == 0, "strbuf: steal content");
+    test_check(axl_string_len(b) == 0, "strbuf: steal resets len");
+    axl_free(s);
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_clear(void)
+{
+    AxlString  *b;
+
+    b = axl_string_new(NULL);
+    axl_string_append(b, "data");
+    axl_string_clear(b);
+    test_check(axl_string_len(b) == 0, "strbuf: clear resets len");
+    test_check(axl_strcmp(axl_string_str(b), "") == 0, "strbuf: clear empty string");
+
+    // Can reuse after clear
+    axl_string_append(b, "reused");
+    test_check(axl_strcmp(axl_string_str(b), "reused") == 0,
+               "strbuf: reuse after clear");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_grow(void)
+{
+    AxlString  *b;
+    size_t      i;
+    bool        ok;
+
+    // Grow past default capacity by appending many chars
+    b = axl_string_new(NULL);
+    for (i = 0; i < 200; i++) {
+        axl_string_append_c(b, 'X');
+    }
+    test_check(axl_string_len(b) == 200, "strbuf: grow past capacity");
+
+    ok = true;
+    for (i = 0; i < 200; i++) {
+        if (axl_string_str(b)[i] != 'X') {
+            ok = false;
+            break;
+        }
+    }
+    test_check(ok, "strbuf: grow content intact");
+    axl_string_free(b);
+}
+
+// ---------------------------------------------------------------------------
+// prepend / insert / erase / truncate / overwrite tests
+// ---------------------------------------------------------------------------
+
+static void
+test_strbuf_prepend(void)
+{
+    AxlString  *b;
+
+    b = axl_string_new("world");
+    axl_string_prepend(b, "hello ");
+    test_check(axl_strcmp(axl_string_str(b), "hello world") == 0,
+               "prepend: basic");
+    test_check(axl_string_len(b) == 11, "prepend: len 11");
+    axl_string_free(b);
+
+    // prepend_len
+    b = axl_string_new("world");
+    axl_string_prepend_len(b, "hello!!", 6);
+    test_check(axl_strcmp(axl_string_str(b), "hello!world") == 0,
+               "prepend_len: exact bytes");
+    axl_string_free(b);
+
+    // prepend_c
+    b = axl_string_new("bc");
+    axl_string_prepend_c(b, 'a');
+    test_check(axl_strcmp(axl_string_str(b), "abc") == 0,
+               "prepend_c: single char");
+    test_check(axl_string_len(b) == 3, "prepend_c: len 3");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_insert(void)
+{
+    AxlString  *b;
+
+    // Insert at beginning (pos 0)
+    b = axl_string_new("world");
+    axl_string_insert(b, 0, "hello ");
+    test_check(axl_strcmp(axl_string_str(b), "hello world") == 0,
+               "insert: at beginning");
+    axl_string_free(b);
+
+    // Insert in middle
+    b = axl_string_new("helo");
+    axl_string_insert(b, 3, "l");
+    test_check(axl_strcmp(axl_string_str(b), "hello") == 0,
+               "insert: middle");
+    axl_string_free(b);
+
+    // Insert at end (pos >= len -> append)
+    b = axl_string_new("hello");
+    axl_string_insert(b, 100, " world");
+    test_check(axl_strcmp(axl_string_str(b), "hello world") == 0,
+               "insert: past end appends");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_erase(void)
+{
+    AxlString  *b;
+
+    // Erase from middle
+    b = axl_string_new("hello world");
+    axl_string_erase(b, 5, 1);
+    test_check(axl_strcmp(axl_string_str(b), "helloworld") == 0,
+               "erase: middle");
+    test_check(axl_string_len(b) == 10, "erase: middle len");
+    axl_string_free(b);
+
+    // Erase with clamp (len exceeds remaining)
+    b = axl_string_new("hello");
+    axl_string_erase(b, 3, 100);
+    test_check(axl_strcmp(axl_string_str(b), "hel") == 0,
+               "erase: clamp to end");
+    test_check(axl_string_len(b) == 3, "erase: clamp len");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_truncate(void)
+{
+    AxlString  *b;
+
+    // Truncate shorter
+    b = axl_string_new("hello world");
+    axl_string_truncate(b, 5);
+    test_check(axl_strcmp(axl_string_str(b), "hello") == 0,
+               "truncate: shorter");
+    test_check(axl_string_len(b) == 5, "truncate: shorter len");
+    axl_string_free(b);
+
+    // Truncate at same length (no-op)
+    b = axl_string_new("hello");
+    axl_string_truncate(b, 5);
+    test_check(axl_strcmp(axl_string_str(b), "hello") == 0,
+               "truncate: same len no-op");
+    test_check(axl_string_len(b) == 5, "truncate: same len unchanged");
+    axl_string_free(b);
+}
+
+static void
+test_strbuf_overwrite(void)
+{
+    AxlString  *b;
+
+    // Overwrite within bounds
+    b = axl_string_new("hello world");
+    axl_string_overwrite(b, 6, "earth");
+    test_check(axl_strcmp(axl_string_str(b), "hello earth") == 0,
+               "overwrite: within bounds");
+    test_check(axl_string_len(b) == 11, "overwrite: len unchanged");
+    axl_string_free(b);
+
+    // Overwrite extending past end
+    b = axl_string_new("hello");
+    axl_string_overwrite(b, 3, "ping!");
+    test_check(axl_strcmp(axl_string_str(b), "helping!") == 0,
+               "overwrite: extends");
+    test_check(axl_string_len(b) == 8, "overwrite: extended len");
+    axl_string_free(b);
+}
+
+// ---------------------------------------------------------------------------
+// axl_asprintf tests
+// ---------------------------------------------------------------------------
+
+static void
+test_asprintf(void)
+{
+    char   *s;
+
+    s = axl_asprintf("hello %s, %d", "world", 42);
+    test_check(s != NULL, "asprintf: non-NULL");
+    test_check(axl_strcmp(s, "hello world, 42") == 0, "asprintf: content");
+    axl_free(s);
+
+    s = axl_asprintf(NULL);
+    test_check(s == NULL, "asprintf(NULL): returns NULL");
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8 <-> UCS-2 tests
+// ---------------------------------------------------------------------------
+
+static void
+test_utf8_ucs2(void)
+{
+    unsigned short  *w;
+    char            *u;
+
+    // ASCII roundtrip
+    w = axl_utf8_to_ucs2("ABC");
+    test_check(w != NULL, "utf8_to_ucs2: ASCII non-NULL");
+    test_check(w[0] == 'A' && w[1] == 'B' && w[2] == 'C' && w[3] == 0,
+               "utf8_to_ucs2: ASCII content");
+
+    u = axl_ucs2_to_utf8(w);
+    test_check(u != NULL, "ucs2_to_utf8: roundtrip non-NULL");
+    test_check(axl_strcmp(u, "ABC") == 0, "ucs2_to_utf8: roundtrip content");
+    axl_free(w);
+    axl_free(u);
+
+    // Multibyte: Euro sign U+20AC = 0xE2 0x82 0xAC in UTF-8, 0x20AC in UCS-2
+    w = axl_utf8_to_ucs2("\xE2\x82\xAC");
+    test_check(w != NULL, "utf8_to_ucs2: multibyte non-NULL");
+    test_check(w[0] == 0x20AC && w[1] == 0, "utf8_to_ucs2: euro sign");
+    axl_free(w);
+
+    // NULL safety
+    test_check(axl_utf8_to_ucs2(NULL) == NULL, "utf8_to_ucs2(NULL): returns NULL");
+    test_check(axl_ucs2_to_utf8(NULL) == NULL, "ucs2_to_utf8(NULL): returns NULL");
+}
+
+// ---------------------------------------------------------------------------
+// Base64 tests
+// ---------------------------------------------------------------------------
+
+static void
+test_base64(void)
+{
+    char   *enc;
+    void   *dec;
+    size_t  dec_len;
+    int     ret;
+
+    // Encode empty
+    enc = axl_base64_encode("", 0);
+    test_check(enc != NULL && enc[0] == '\0', "base64: encode empty");
+    axl_free(enc);
+
+    // Encode "Hello"
+    enc = axl_base64_encode("Hello", 5);
+    test_check(enc != NULL, "base64: encode Hello non-NULL");
+    test_check(axl_strcmp(enc, "SGVsbG8=") == 0, "base64: encode Hello = SGVsbG8=");
+    axl_free(enc);
+
+    // Decode "SGVsbG8="
+    ret = axl_base64_decode("SGVsbG8=", &dec, &dec_len);
+    test_check(ret == 0, "base64: decode returns 0");
+    test_check(dec_len == 5, "base64: decode len 5");
+    test_check(test_memcmp(dec, "Hello", 5) == 0, "base64: decode content Hello");
+    axl_free(dec);
+
+    // Roundtrip with binary data
+    {
+        uint8_t bin[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+        enc = axl_base64_encode(bin, 4);
+        ret = axl_base64_decode(enc, &dec, &dec_len);
+        test_check(ret == 0 && dec_len == 4 && test_memcmp(dec, bin, 4) == 0,
+                   "base64: binary roundtrip");
+        axl_free(enc);
+        axl_free(dec);
+    }
+
+    // Decode invalid
+    ret = axl_base64_decode("!!!", &dec, &dec_len);
+    test_check(ret == -1, "base64: decode invalid returns -1");
+}
+
+// ---------------------------------------------------------------------------
+// strlcpy / strlcat tests
+// ---------------------------------------------------------------------------
+
+static void
+test_strlcpy(void)
+{
+    char    buf[8];
+    size_t  n;
+
+    // Normal copy fits
+    n = axl_strlcpy(buf, "hello", sizeof(buf));
+    test_check(n == 5, "strlcpy: returns src len 5");
+    test_check(axl_strcmp(buf, "hello") == 0, "strlcpy: copies string");
+
+    // Truncation
+    n = axl_strlcpy(buf, "longstring", sizeof(buf));
+    test_check(n == 10, "strlcpy: returns src len 10(truncated)");
+    test_check(axl_strcmp(buf, "longstr") == 0, "strlcpy: truncates to 7 chars");
+    test_check(buf[7] == '\0', "strlcpy: NUL-terminated after truncation");
+
+    // Zero-size dst
+    n = axl_strlcpy(buf, "test", 0);
+    test_check(n == 4, "strlcpy: dst_size 0 returns src len");
+}
+
+static void
+test_strlcat(void)
+{
+    char    buf[12];
+    size_t  n;
+
+    // Normal cat
+    axl_strlcpy(buf, "hello", sizeof(buf));
+    n = axl_strlcat(buf, " world", sizeof(buf));
+    test_check(n == 11, "strlcat: returns total len 11");
+    test_check(axl_strcmp(buf, "hello world") == 0, "strlcat: appends");
+
+    // Truncation
+    axl_strlcpy(buf, "hello", sizeof(buf));
+    n = axl_strlcat(buf, " world!!", sizeof(buf));
+    test_check(n == 13, "strlcat: returns 13(truncated)");
+    test_check(axl_strcmp(buf, "hello world") == 0, "strlcat: truncates correctly");
+}
+
+// ---------------------------------------------------------------------------
+// Basic string/memory ops tests
+// ---------------------------------------------------------------------------
+
+static void
+test_strlen(void)
+{
+    test_check(axl_strlen("hello") == 5, "strlen: basic");
+    test_check(axl_strlen("") == 0, "strlen: empty");
+    test_check(axl_strlen(NULL) == 0, "strlen: NULL");
+}
+
+static void
+test_strcmp(void)
+{
+    test_check(axl_strcmp("abc", "abc") == 0, "strcmp: equal");
+    test_check(axl_strcmp("abc", "abd") < 0, "strcmp: less");
+    test_check(axl_strcmp("abd", "abc") > 0, "strcmp: greater");
+    test_check(axl_strcmp("ab", "abc") < 0, "strcmp: shorter");
+    test_check(axl_strcmp("abc", "ab") > 0, "strcmp: longer");
+}
+
+static void
+test_strncmp(void)
+{
+    test_check(axl_strncmp("abc", "abd", 2) == 0, "strncmp: match prefix");
+    test_check(axl_strncmp("abc", "abd", 3) < 0, "strncmp: differ at n");
+    test_check(axl_strncmp("abc", "abc", 0) == 0, "strncmp: n=0");
+}
+
+static void
+test_memcpy(void)
+{
+    char src[] = "hello";
+    char dst[8] = {0};
+    axl_memcpy(dst, src, 6);
+    test_check(axl_strcmp(dst, "hello") == 0, "memcpy: basic");
+    test_check(axl_memcpy(NULL, src, 5) == NULL, "memcpy: NULL dst");
+}
+
+static void
+test_memset(void)
+{
+    char buf[8];
+    axl_memset(buf, 'A', 4);
+    buf[4] = '\0';
+    test_check(axl_strcmp(buf, "AAAA") == 0, "memset: fill");
+
+    axl_memset(buf, 0, 4);
+    test_check(buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0,
+               "memset: zero fill");
+}
+
+static void
+test_snprintf(void)
+{
+    char buf[32];
+    int n;
+
+    n = axl_snprintf(buf, sizeof(buf), "hello %s", "world");
+    test_check(n == 11, "snprintf: returns length");
+    test_check(axl_strcmp(buf, "hello world") == 0, "snprintf: formats string");
+
+    n = axl_snprintf(buf, sizeof(buf), "%d + %d = %d", 1, 2, 3);
+    test_check(axl_strcmp(buf, "1 + 2 = 3") == 0, "snprintf: formats ints");
+
+    // Truncation
+    n = axl_snprintf(buf, 6, "hello world");
+    test_check(n == 11, "snprintf: returns full length on truncation");
+    test_check(axl_strcmp(buf, "hello") == 0, "snprintf: truncates correctly");
+    test_check(buf[5] == '\0', "snprintf: NUL terminates on truncation");
+}
+
+// ---------------------------------------------------------------------------
+// Number parsing tests
+// ---------------------------------------------------------------------------
+
+static void
+test_strtou64(void)
+{
+    test_check(axl_strtou64("12345") == 12345, "strtou64: decimal");
+    test_check(axl_strtou64("0xFF") == 0xFF, "strtou64: hex 0xFF");
+    test_check(axl_strtou64("0x1A") == 0x1A, "strtou64: hex 0x1A");
+    test_check(axl_strtou64("0") == 0, "strtou64: zero");
+    test_check(axl_strtou64(NULL) == 0, "strtou64: NULL returns 0");
+}
+
+// ---------------------------------------------------------------------------
+// axl_strcasestr
+// ---------------------------------------------------------------------------
+
+static void
+test_strcasestr(void)
+{
+    test_check(axl_strcasestr("Hello World", "WORLD") != NULL, "strcasestr: case diff");
+    test_check(axl_strcasestr("Hello World", "world") != NULL, "strcasestr: lower needle");
+    test_check(axl_strcasestr("abcdef", "CDE") != NULL, "strcasestr: middle match");
+    test_check(axl_strcasestr("abcdef", "xyz") == NULL, "strcasestr: no match");
+    test_check(axl_strcasestr("abc", "") != NULL, "strcasestr: empty needle");
+    test_check(axl_strcasestr(NULL, "a") == NULL, "strcasestr: NULL haystack");
+    test_check(axl_strcasestr("a", NULL) == NULL, "strcasestr: NULL needle");
+    char *p = axl_strcasestr("FooBarBaz", "bar");
+    test_check(p != NULL && p[0] == 'B' && p[1] == 'a' && p[2] == 'r',
+               "strcasestr: points to match");
+}
+
+// ---------------------------------------------------------------------------
+// axl_fnmatch
+// ---------------------------------------------------------------------------
+
+static void
+test_fnmatch(void)
+{
+    test_check(axl_fnmatch("*.txt", "hello.txt"), "fnmatch: *.txt matches");
+    test_check(!axl_fnmatch("*.txt", "hello.c"), "fnmatch: *.txt rejects .c");
+    test_check(axl_fnmatch("*", "anything"), "fnmatch: * matches all");
+    test_check(axl_fnmatch("*", ""), "fnmatch: * matches empty");
+    test_check(axl_fnmatch("?oo", "foo"), "fnmatch: ? single char");
+    test_check(!axl_fnmatch("?oo", "oo"), "fnmatch: ? requires char");
+    test_check(axl_fnmatch("[abc]x", "bx"), "fnmatch: [abc] class");
+    test_check(!axl_fnmatch("[abc]x", "dx"), "fnmatch: [abc] rejects d");
+    test_check(axl_fnmatch("[a-z]", "m"), "fnmatch: [a-z] range");
+    test_check(!axl_fnmatch("[a-z]", "M"), "fnmatch: [a-z] case sensitive");
+    test_check(axl_fnmatch("[!a-z]", "M"), "fnmatch: [!a-z] inverted");
+    test_check(axl_fnmatch("hello", "hello"), "fnmatch: exact match");
+    test_check(!axl_fnmatch("hello", "world"), "fnmatch: exact mismatch");
+    test_check(!axl_fnmatch(NULL, "a"), "fnmatch: NULL pattern");
+    test_check(!axl_fnmatch("a", NULL), "fnmatch: NULL string");
+    test_check(axl_fnmatch("src/*.c", "src/main.c"), "fnmatch: path glob");
+    test_check(!axl_fnmatch("src/*.c", "lib/main.c"), "fnmatch: path mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// UCS-2 primitive operations
+// ---------------------------------------------------------------------------
+
+static void
+test_wcs(void)
+{
+    const unsigned short hello[] = { 'H', 'e', 'l', 'l', 'o', 0 };
+    const unsigned short hello2[] = { 'H', 'e', 'l', 'l', 'o', 0 };
+    const unsigned short world[] = { 'W', 'o', 'r', 'l', 'd', 0 };
+    const unsigned short empty[] = { 0 };
+
+    /* axl_wcslen */
+    test_check(axl_wcslen(hello) == 5, "wcslen: basic");
+    test_check(axl_wcslen(empty) == 0, "wcslen: empty");
+    test_check(axl_wcslen(NULL) == 0, "wcslen: NULL");
+
+    /* axl_wcscmp */
+    test_check(axl_wcscmp(hello, hello2) == 0, "wcscmp: equal");
+    test_check(axl_wcscmp(hello, world) < 0, "wcscmp: less");
+    test_check(axl_wcscmp(world, hello) > 0, "wcscmp: greater");
+
+    /* axl_wcseql */
+    test_check(axl_wcseql(hello, hello2), "wcseql: equal");
+    test_check(!axl_wcseql(hello, world), "wcseql: not equal");
+    test_check(axl_wcseql(NULL, NULL), "wcseql: both NULL");
+    test_check(!axl_wcseql(hello, NULL), "wcseql: one NULL");
+
+    /* axl_wcscpy */
+    unsigned short buf[8];
+    axl_wcscpy(buf, hello, 8);
+    test_check(axl_wcseql(buf, hello), "wcscpy: basic copy");
+
+    unsigned short small[3];
+    axl_wcscpy(small, hello, 3);
+    test_check(small[2] == 0, "wcscpy: NUL on truncation");
+    test_check(axl_wcslen(small) == 2, "wcscpy: truncated len");
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+// axl_format / axl_vformat tests
+// ---------------------------------------------------------------------------
+
+// Capture callback: appends to a char buffer
+typedef struct {
+    char   buf[256];
+    size_t len;
+} FormatCapture;
+
+static void
+capture_write(const char *data, size_t len, void *ctx)
+{
+    FormatCapture *cap = (FormatCapture *)ctx;
+    for (size_t i = 0; i < len && cap->len + 1 < sizeof(cap->buf); i++) {
+        cap->buf[cap->len++] = data[i];
+    }
+    cap->buf[cap->len] = '\0';
+}
+
+static void
+test_format(void)
+{
+    FormatCapture cap;
+
+    // Basic string formatting
+    cap.len = 0;
+    axl_format(capture_write, &cap, "hello %s", "world");
+    test_check(axl_strcmp(cap.buf, "hello world") == 0, "format: string");
+
+    // Integer formatting
+    cap.len = 0;
+    axl_format(capture_write, &cap, "%d + %d = %d", 2, 3, 5);
+    test_check(axl_strcmp(cap.buf, "2 + 3 = 5") == 0, "format: integers");
+
+    // Hex formatting
+    cap.len = 0;
+    axl_format(capture_write, &cap, "0x%08x", 0xDEAD);
+    test_check(axl_strcmp(cap.buf, "0x0000dead") == 0, "format: hex padded");
+
+    // Multiple calls accumulate (callback is stateful)
+    cap.len = 0;
+    axl_format(capture_write, &cap, "A");
+    axl_format(capture_write, &cap, "B");
+    axl_format(capture_write, &cap, "C");
+    test_check(axl_strcmp(cap.buf, "ABC") == 0, "format: multiple calls accumulate");
+
+    // Empty format (intentional — suppress gcc warning for this edge case test)
+    cap.len = 0;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-zero-length"
+    axl_format(capture_write, &cap, "");
+#pragma GCC diagnostic pop
+    test_check(cap.len == 0, "format: empty string");
+
+    // Literal percent
+    cap.len = 0;
+    axl_format(capture_write, &cap, "100%%");
+    test_check(axl_strcmp(cap.buf, "100%") == 0, "format: literal percent");
+}
+
+// ---------------------------------------------------------------------------
+
+int
+test_strbuf_main(
+    int    argc,
+    char **argv
+    )
+{
+    (void)argc; (void)argv;
+    test_print_header("AxlString");
+
+    test_strbuf_basic();
+    test_strbuf_append_n();
+    test_strbuf_putc();
+    test_strbuf_printf();
+    test_strbuf_steal();
+    test_strbuf_clear();
+    test_strbuf_grow();
+    test_strbuf_prepend();
+    test_strbuf_insert();
+    test_strbuf_erase();
+    test_strbuf_truncate();
+    test_strbuf_overwrite();
+    test_asprintf();
+    test_utf8_ucs2();
+    test_base64();
+    test_strlcpy();
+    test_strlcat();
+    test_strlen();
+    test_strcmp();
+    test_strncmp();
+    test_memcpy();
+    test_memset();
+    test_snprintf();
+    test_strtou64();
+    test_strcasestr();
+    test_fnmatch();
+    test_wcs();
+    test_format();
+
+    return test_print_results();
+}
+
+AXL_APP(test_strbuf_main)
