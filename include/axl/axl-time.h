@@ -6,7 +6,7 @@
  *
  * Time utilities: ISO 8601 formatting and a monotonic counter.
  *
- * Sleep and wait primitives live in <axl/axl-wait.h> -- that's
+ * Sleep and wait primitives live in <axl/axl-wait.h> — that's
  * where to find axl_sleep / axl_msleep / axl_usleep (ergonomic
  * void-return sleep) and the axl_wait_* family (condvar-style
  * blocking with cancel + timeout).

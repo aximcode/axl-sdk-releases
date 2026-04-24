@@ -73,7 +73,7 @@ _axl_signal_on_break(void)
 {
     /* Idempotent. First caller wins; subsequent Ctrl-C observations
      * don't re-invoke the handler until axl_signal_install resets
-     * state explicitly (not offered today -- matches POSIX one-shot
+     * state explicitly (not offered today — matches POSIX one-shot
      * pattern). */
     if (g_axl_interrupted) {
         return;

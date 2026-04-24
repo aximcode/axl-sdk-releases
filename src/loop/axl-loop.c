@@ -470,7 +470,7 @@ axl_loop_add_key_press(AxlLoop *loop, AxlKeyCallback cb, void *data)
         return 0;
     }
 
-    /* Use ConIn's existing WaitForKey event -- don't close it */
+    /* Use ConIn's existing WaitForKey event — don't close it */
     return add_source(loop, SOURCE_KEYPRESS,
                       axl_backend_console_wait_for_key(),
                       false, (void *)cb, data);
@@ -548,7 +548,7 @@ axl_loop_remove_source(AxlLoop *loop, uint32_t source_id)
 
 // ---------------------------------------------------------------------------
 // Nested-wait primitive: drive the loop until a condition fires, without
-// quitting it. Outer sources keep firing during the wait -- see §5.6 of
+// quitting it. Outer sources keep firing during the wait — see §5.6 of
 // docs/AXL-Runtime.md.
 // ---------------------------------------------------------------------------
 

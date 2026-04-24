@@ -1,4 +1,4 @@
-AxlJson -- JSON
+AxlJson — JSON
 ===============
 
 See :doc:`data` for an overview of all data modules including JSON

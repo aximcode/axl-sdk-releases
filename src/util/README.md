@@ -4,18 +4,18 @@ parsing), and path manipulation.
 
 Headers:
 
-- `<axl/axl-sys.h>` -- System operations (reset, GUID, device map refresh)
-- `<axl/axl-env.h>` -- Environment variables and working directory
-- `<axl/axl-time.h>` -- Wall-clock time and monotonic timestamps
-- `<axl/axl-nvstore.h>` -- UEFI NVRAM variable access
-- `<axl/axl-driver.h>` -- Driver binding and lifecycle
-- `<axl/axl-hexdump.h>` -- Hex/ASCII dump formatting
-- `<axl/axl-config.h>` -- Unified configuration + command-line parsing
-- `<axl/axl-path.h>` -- Path manipulation
+- `<axl/axl-sys.h>` — System operations (reset, GUID, device map refresh)
+- `<axl/axl-env.h>` — Environment variables and working directory
+- `<axl/axl-time.h>` — Wall-clock time and monotonic timestamps
+- `<axl/axl-nvstore.h>` — UEFI NVRAM variable access
+- `<axl/axl-driver.h>` — Driver binding and lifecycle
+- `<axl/axl-hexdump.h>` — Hex/ASCII dump formatting
+- `<axl/axl-config.h>` — Unified configuration + command-line parsing
+- `<axl/axl-path.h>` — Path manipulation
 
 The event/cancellable/wait primitives previously listed here now
-live in [`src/event/`](../event/) -- see
-[`src/event/README.md`](../event/README.md).
+live in [`src/event/`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event) — see
+[`src/event/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md).
 
 ## System Utilities
 
@@ -39,10 +39,10 @@ if (axl_guid_cmp(&a, &b) == 0) {
 After `AXL_APP` or `axl_driver_init`, these globals are available
 (typed when `<uefi/axl-uefi.h>` is included):
 
-- `gST` -- System Table (`EFI_SYSTEM_TABLE *`)
-- `gBS` -- Boot Services (`EFI_BOOT_SERVICES *`)
-- `gRT` -- Runtime Services (`EFI_RUNTIME_SERVICES *`)
-- `gImageHandle` -- handle of the running application or driver
+- `gST` — System Table (`EFI_SYSTEM_TABLE *`)
+- `gBS` — Boot Services (`EFI_BOOT_SERVICES *`)
+- `gRT` — Runtime Services (`EFI_RUNTIME_SERVICES *`)
+- `gImageHandle` — handle of the running application or driver
 
 ### NVRAM Variables
 
@@ -77,6 +77,32 @@ EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
 ```
 
 See `sdk/examples/driver.c` for a complete example.
+
+### Auto-Loading Driver Dependencies
+
+Tools that need a protocol provided by a DXE driver (e.g. a RAM-disk
+manager that needs `EFI_RAM_DISK_PROTOCOL` from `RamDiskDxe.efi`)
+can call `axl_driver_ensure` to short-circuit when the protocol is
+already registered, or to find and load the driver themselves
+otherwise:
+
+```c
+if (axl_driver_ensure(&EfiRamDiskProtocolGuid,
+                      "RamDiskDxe.efi") != 0) {
+    axl_printf("RamDiskDxe.efi not available\n");
+    return 1;
+}
+/* Protocol is now usable. */
+```
+
+The search walks `drivers/<arch>/<name>` on the running image's own
+volume first, then the image's own directory, then the volume root,
+and finally every other mounted FAT volume. The first match is
+loaded and started; if it doesn't end up registering the requested
+protocol, the image is unloaded and the search continues. This
+lets tools work whether they're invoked from a bare UEFI shell, a
+boot menu, or a `startup.nsh` that has already eager-loaded the
+driver.
 
 ## Configuration (and Command-Line Parsing)
 
@@ -230,5 +256,5 @@ axl_path_resolve("fs0:/app", "../config/app.cfg",
 
 AxlCompletion / AxlCancellable / axl_wait_* and the foundational
 `AxlEvent` moved out of AxlUtil into the dedicated
-[`src/event/`](../event/) module. See
-[src/event/README.md](../event/README.md) for the current documentation.
+[`src/event/`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event) module. See
+[src/event/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) for the current documentation.

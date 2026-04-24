@@ -4,7 +4,7 @@
 /**
  * axl-runtime.h:
  *
- * AXL runtime surface -- the pieces an app interacts with around its
+ * AXL runtime surface — the pieces an app interacts with around its
  * own lifecycle and interruptibility. The runtime is CRT0-owned:
  * _axl_init (called by the entry stub) sets up the default loop,
  * installs the shell break notify, and initializes the tier-1
@@ -59,7 +59,7 @@ axl_loop_default(void);
  *
  * Behavior:
  *   1. If any immediately-ready work is pending on the default loop
- *      (timers, deferred callbacks), dispatch it -- bounded to one
+ *      (timers, deferred callbacks), dispatch it — bounded to one
  *      iteration.
  *   2. If Ctrl-C was observed during that dispatch, sets the
  *      interrupted flag so axl_interrupted() returns true.
@@ -75,7 +75,7 @@ axl_yield(void);
 /**
  * @brief Return the number of tier-1 resources currently registered.
  *
- * Purely informational -- mostly useful in tests to verify
+ * Purely informational — mostly useful in tests to verify
  * resource-balancing. Returns 0 if the registry has not been
  * initialized yet.
  */

@@ -120,14 +120,14 @@ same return code covers the shell break event (Ctrl-C), so
 consumers see one status for "some external source stopped me."
 
 Two companion primitives round out the set: `AxlEvent` (a one-shot
-producer/waiter rendezvous -- AXL's foundational latch, replacing the
+producer/waiter rendezvous — AXL's foundational latch, replacing the
 earlier `AxlCompletion`) and the `axl_wait_*` helpers (`axl_wait_for`,
 `axl_wait_for_flag`, `axl_wait_ms`, ...), all of which accept the same
 `AxlCancellable`. See `src/event/README.md` for the mental model,
 ownership rules, and worked patterns (timeout, subsystem shutdown,
 user abort). For the full concurrency-primitive taxonomy and the
 "why this model, not Python's GIL / stackful coroutines / protothreads"
-discussion, see [`AXL-Concurrency.md`](AXL-Concurrency.md).
+discussion, see [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
 ## Dependencies
 

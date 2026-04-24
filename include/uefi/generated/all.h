@@ -1,7 +1,7 @@
 /** @file generated/all.h
     Auto-generated from UEFI Specification 2.11.
-    Umbrella -- includes all generated UEFI headers.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Umbrella — includes all generated UEFI headers.
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_ALL_H

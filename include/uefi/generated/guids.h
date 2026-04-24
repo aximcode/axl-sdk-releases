@@ -1,7 +1,7 @@
 /** @file generated/guids.h
     Auto-generated from UEFI Specification 2.11.
     All UEFI protocol GUIDs.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_GUIDS_H

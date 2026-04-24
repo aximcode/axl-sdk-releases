@@ -1,4 +1,4 @@
-AxlTls -- TLS Support
+AxlTls — TLS Support
 =====================
 
 See the TLS section in :doc:`net` for an overview of TLS support

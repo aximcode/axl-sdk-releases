@@ -7,6 +7,45 @@ follows [Semantic Versioning](https://semver.org/).
 
 _No changes yet._
 
+## 0.2.3 — 2026-04-24
+
+### Added
+
+- **`axl_driver_ensure(guid, name)`** — short-circuit on registered
+  protocols, otherwise locate, load, and start a named DXE driver
+  from `drivers/<arch>/<name>` on the running image's volume, the
+  image's own directory, `drivers/<name>` at the volume root, or any
+  other mounted FAT volume. Tools that depend on driver-provided
+  protocols no longer need a `startup.nsh` that pre-loads them.
+- **`tools/dmidecode`** — full SMBIOS record decoder with typed
+  output for the common types and a hex/strings fallback for
+  undecoded ones; companion to `sysinfo` for hardware introspection.
+- **AxlSmbios** promoted to a top-level module
+  (`include/axl/axl-smbios.h`) with typed accessors for Type 0/1/2/3/4
+  /16/17, Type 38 (IPMI Device Info), and Type 42 (Host Interface),
+  plus enumeration helpers (`axl_smbios_next`, `axl_smbios_version`),
+  reentrant string access, and a UUID helper.
+
+### Changed
+
+- **`mkrd`** auto-loads `RamDiskDxe.efi` via `axl_driver_ensure`
+  before dispatching modes. Prints
+  `MkRd: RamDiskDxe.efi not found on any mounted volume.` when the
+  driver isn't discoverable; previously the user saw the more
+  cryptic `EFI_RAM_DISK_PROTOCOL not available` deep inside the
+  create path.
+
+### Fixed
+
+- **Tool argv on Dell firmware.** `_axl_args_init` (in `axl-app.c`)
+  no longer depends on `EFI_SHELL_PARAMETERS_PROTOCOL`. Dell's UEFI
+  firmware doesn't publish that optional Shell-2.0 protocol for
+  cross-volume invocations, which made every AXL tool see `argc=1`
+  and miss all user arguments. The implementation now parses
+  `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions` (the spec-mandated
+  primitive) directly, with a `_tokenize_load_options` helper that
+  handles whitespace splitting and quoted arguments.
+
 ## 0.2.1 — 2026-04-23
 
 ### Legal / Compliance

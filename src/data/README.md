@@ -2,14 +2,14 @@ Core collection types, string utilities, and message digest checksums.
 
 Headers:
 
-- `<axl/axl-hash-table.h>` -- Hash table with string keys (FNV-1a, chained)
-- `<axl/axl-array.h>` -- Dynamic array (auto-growing, index access)
-- `<axl/axl-list.h>` -- Doubly-linked list
-- `<axl/axl-slist.h>` -- Singly-linked list
-- `<axl/axl-queue.h>` -- FIFO queue
-- `<axl/axl-radix-tree.h>` -- Radix tree (compact prefix tree, longest-prefix lookup)
-- `<axl/axl-ring-buf.h>` -- Ring buffer (circular byte buffer, zero-copy, overwrite mode)
-- `<axl/axl-digest.h>` -- Message digest checksums (MD5, SHA-1, SHA-256)
+- `<axl/axl-hash-table.h>` — Hash table with string keys (FNV-1a, chained)
+- `<axl/axl-array.h>` — Dynamic array (auto-growing, index access)
+- `<axl/axl-list.h>` — Doubly-linked list
+- `<axl/axl-slist.h>` — Singly-linked list
+- `<axl/axl-queue.h>` — FIFO queue
+- `<axl/axl-radix-tree.h>` — Radix tree (compact prefix tree, longest-prefix lookup)
+- `<axl/axl-ring-buf.h>` — Ring buffer (circular byte buffer, zero-copy, overwrite mode)
+- `<axl/axl-digest.h>` — Message digest checksums (MD5, SHA-1, SHA-256)
 
 ## Choosing a Collection
 
@@ -151,7 +151,7 @@ axl_list_free(list);
 
 ## AxlSList
 
-Singly-linked list -- lighter than AxlList (no `prev` pointer).
+Singly-linked list — lighter than AxlList (no `prev` pointer).
 Use when you only traverse forward. Matches GLib's GSList. Same
 operations as AxlList: insert_before, remove_all, remove_link,
 sort_with_data, copy_deep.
@@ -174,7 +174,7 @@ axl_queue_remove_all(&q, "first"); // removes all matches
 AxlList *node = axl_queue_find(&q, "second");
 ```
 
-## AxlStr -- String Utilities
+## AxlStr — String Utilities
 
 String utilities operating on UTF-8 `char *` strings. Includes length,
 copy, compare, search, split, join, and case-insensitive operations (ASCII
@@ -188,7 +188,7 @@ Header: `<axl/axl-str.h>`
 
 AXL uses UTF-8 (`char *`) throughout its public API. UEFI firmware
 uses UCS-2 (`unsigned short *`) internally, but AXL handles the
-conversion transparently -- you never need to deal with UCS-2 unless
+conversion transparently — you never need to deal with UCS-2 unless
 making direct UEFI protocol calls.
 
 ### UTF-8 vs UCS-2
@@ -246,7 +246,7 @@ the input string do NOT allocate:
 - `axl_strstr_len`, `axl_strrstr` (return pointer into haystack)
 - `axl_strchr` (return pointer into string)
 
-## AxlString -- String Builder
+## AxlString — String Builder
 
 Mutable auto-growing string builder, like GLib's `GString`. All strings
 are UTF-8. Supports append, prepend, insert, printf-style formatting, and
@@ -282,7 +282,7 @@ char *result = axl_string_steal(b);  // b is now empty
 // caller owns 'result', must free with axl_free()
 ```
 
-The builder can be reused after stealing -- it starts empty with its
+The builder can be reused after stealing — it starts empty with its
 allocated buffer released.
 
 ### Error Handling
@@ -291,7 +291,7 @@ All mutation functions (`append`, `printf`, etc.) return `int`:
 0 on success, -1 if the internal realloc fails. This matches the
 convention used by `axl_array_append`, `axl_hash_table_insert`, etc.
 
-## AxlJson -- JSON
+## AxlJson — JSON
 
 JSON parser (JSMN-based) and builder (fixed buffer). Parse JSON strings into
 a token tree, query values by path, and build JSON documents incrementally.
@@ -302,8 +302,8 @@ Header: `<axl/axl-json.h>`
 
 AXL provides two JSON APIs:
 
-- **Parser** -- parse a JSON string, extract values by key or iterate arrays
-- **Builder** -- construct JSON in a caller-provided buffer with no dynamic allocation
+- **Parser** — parse a JSON string, extract values by key or iterate arrays
+- **Builder** — construct JSON in a caller-provided buffer with no dynamic allocation
 
 ### Parsing JSON
 
@@ -369,7 +369,7 @@ if (axl_json_array_begin(&ctx, "items", &iter)) {
 }
 ```
 
-## AxlCache -- TTL Cache
+## AxlCache — TTL Cache
 
 TTL cache with LRU eviction. Fixed-size slots, string keys, opaque
 fixed-size values. Designed for single-threaded UEFI use.
@@ -408,7 +408,7 @@ axl_cache_invalidate(cache, "gateway");
 axl_cache_invalidate_all(cache);
 ```
 
-## AxlRadixTree -- Radix Tree
+## AxlRadixTree — Radix Tree
 
 Compact prefix tree (radix tree) with string keys. Supports exact
 lookup, longest-prefix lookup, insert with automatic edge splitting,
@@ -419,7 +419,7 @@ Header: `<axl/axl-radix-tree.h>`
 
 ### Overview
 
-Use AxlRadixTree when you need longest-prefix matching -- finding the
+Use AxlRadixTree when you need longest-prefix matching — finding the
 best match for a key that may not be an exact entry. The canonical use
 case is URL route matching: given routes `/api/users` and `/api`, a
 lookup for `/api/users/42` returns the `/api/users` handler.
@@ -459,7 +459,7 @@ axl_radix_tree_insert(tree, "key", axl_strdup("owned value"));
 axl_radix_tree_free(tree);  // value freed automatically
 ```
 
-## AxlRingBuf -- Ring Buffer
+## AxlRingBuf — Ring Buffer
 
 Byte-oriented circular buffer with power-of-2 sizing and three API
 layers. Inspired by Linux kfifo: monotonically increasing indices
@@ -472,11 +472,11 @@ Header: `<axl/axl-ring-buf.h>`
 
 AxlRingBuf provides three layers, each building on the one below:
 
-- **Layer 1 (Bytes)**: raw byte stream -- push, pop, peek, discard,
+- **Layer 1 (Bytes)**: raw byte stream — push, pop, peek, discard,
   zero-copy scatter/gather regions
 - **Layer 2 (Messages)**: variable-size length-prefixed frames --
   push_msg, pop_msg, peek_msg, peek_msg_size
-- **Layer 3 (Elements)**: fixed-size typed entries -- push_elem,
+- **Layer 3 (Elements)**: fixed-size typed entries — push_elem,
   pop_elem, peek_elem, peek/set_nth_elem
 
 Supports reject-on-full (default) and overwrite-on-full modes.

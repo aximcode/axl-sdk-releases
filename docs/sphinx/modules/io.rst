@@ -1,4 +1,4 @@
-AxlIO -- Stream I/O
+AxlIO — Stream I/O
 ===================
 
 .. include:: ../../../src/io/README.md

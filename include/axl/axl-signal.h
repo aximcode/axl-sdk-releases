@@ -14,7 +14,7 @@
  *     runtime sets a global "interrupted" flag and, if the app
  *     has installed a handler via axl_signal_install, invokes it.
  *   - The handler runs in a limited context (raised TPL). It is
- *     expected to set an app flag, log, and return -- not to
+ *     expected to set an app flag, log, and return — not to
  *     allocate, block, or call Boot Services that mutate state.
  *     Cleanup happens at the next yield point or inside the app's
  *     own axl_atexit callback chain.
@@ -77,7 +77,7 @@ axl_signal_install(
 /**
  * @brief Restore the default handler (auto-exit on next yield).
  *
- * Equivalent to axl_signal_install(NULL) -- named for readability.
+ * Equivalent to axl_signal_install(NULL) — named for readability.
  */
 void
 axl_signal_default(void);
@@ -97,7 +97,7 @@ axl_interrupted(void);
  *
  * Runs atexit callbacks (LIFO), sweeps the tier-1 resource registry,
  * then calls gBS->Exit via the backend. This is the ONE blessed exit
- * path -- returning from main takes the same route via CRT0. App
+ * path — returning from main takes the same route via CRT0. App
  * code that calls gBS->Exit directly, or aborts through some other
  * path, bypasses cleanup and leaks firmware resources; don't.
  *

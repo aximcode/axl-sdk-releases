@@ -12,11 +12,11 @@ asyncio style of callbacks-plus-stop-tokens over GIL-style
 threading, stackful coroutines, and protothread macros — so future
 contributors don't re-litigate the design.
 
-See [src/event/README.md](../src/event/README.md) for the prose on
-the event primitives themselves, and [src/loop/README.md](../src/loop/README.md)
+See [src/event/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) for the prose on
+the event primitives themselves, and [src/loop/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md)
 for event-loop mechanics.
 
-**Also see:** [`AXL-Runtime.md`](AXL-Runtime.md) — the CRT0-owned
+**Also see:** [`AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the CRT0-owned
 runtime that ships today (Phase A7, April 2026): lazy default
 loop, Linux-style signal handling, `axl_yield()` for tight loops,
 `axl_atexit` for cleanup, tier-1 resource registry + sweep. Apps
@@ -29,10 +29,10 @@ example.
 
 "Event" appears three times in AXL docs:
 
-- The **event loop** (`AxlLoop`) -- the dispatcher.
-- An **event source** -- a thing registered with the loop (timer,
+- The **event loop** (`AxlLoop`) — the dispatcher.
+- An **event source** — a thing registered with the loop (timer,
   idle, raw event, ...).
-- `AxlEvent` -- one kind of source: a one-shot latch.
+- `AxlEvent` — one kind of source: a one-shot latch.
 
 This mirrors UEFI's own overload. An `AxlEvent` is a one-shot
 latch backed by a UEFI event, and the event loop dispatches them.
@@ -44,17 +44,17 @@ questions. Overlap is minimal and deliberate.
 
 | Axis | Primitive | Purpose | Loop integration |
 |------|-----------|---------|------------------|
-| **Dispatch** — "when does my code run?" | [`AxlLoop`](../src/loop/README.md) + sources (timer, timeout, key, idle, proto-notify, raw event) | The event reactor | *is* the loop |
-| | [`AxlDefer`](../src/loop/README.md) | "Run this soon, on next tick" -- escape a constrained callback | requires a running `AxlLoop` |
-| **Coordination** — "how do I wait for X?" | [`axl_wait_for_flag/word`](../src/event/README.md), `axl_wait_for`, `axl_wait_for_with_tick` | Interruptible poll of memory (MMIO status, hardware) or a predicate | spins up a throwaway `AxlLoop` |
-| | [`AxlEvent`](../src/event/README.md) | Producer signals → waiter resumes (zero polling, UEFI-event-driven) | spins up a throwaway `AxlLoop` for `axl_event_wait_timeout`, or register its handle with a caller-owned loop via `axl_loop_add_event(loop, axl_event_handle(e), ...)` |
-| | [`axl_wait_ms`](../src/event/README.md) | Interruptible sleep | spins up a throwaway `AxlLoop` |
-| **Notification** — "how do I tell others?" | [`AxlCancellable`](../src/event/README.md) | Stop token shared across async ops; cancel once, many ops abort | typed wrapper over `AxlEvent`; ops register its handle on their loop |
-| | [`AxlPubsub`](../src/loop/README.md) | Pub/sub bus -- decoupled, many subscribers | delivery is deferred via `AxlDefer` on the caller's loop |
+| **Dispatch** — "when does my code run?" | [`AxlLoop`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) + sources (timer, timeout, key, idle, proto-notify, raw event) | The event reactor | *is* the loop |
+| | [`AxlDefer`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) | "Run this soon, on next tick" — escape a constrained callback | requires a running `AxlLoop` |
+| **Coordination** — "how do I wait for X?" | [`axl_wait_for_flag/word`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md), `axl_wait_for`, `axl_wait_for_with_tick` | Interruptible poll of memory (MMIO status, hardware) or a predicate | spins up a throwaway `AxlLoop` |
+| | [`AxlEvent`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) | Producer signals → waiter resumes (zero polling, UEFI-event-driven) | spins up a throwaway `AxlLoop` for `axl_event_wait_timeout`, or register its handle with a caller-owned loop via `axl_loop_add_event(loop, axl_event_handle(e), ...)` |
+| | [`axl_wait_ms`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) | Interruptible sleep | spins up a throwaway `AxlLoop` |
+| **Notification** — "how do I tell others?" | [`AxlCancellable`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) | Stop token shared across async ops; cancel once, many ops abort | typed wrapper over `AxlEvent`; ops register its handle on their loop |
+| | [`AxlPubsub`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) | Pub/sub bus — decoupled, many subscribers | delivery is deferred via `AxlDefer` on the caller's loop |
 | | Direct callback | Coupled point-to-point | caller-defined |
 | | `AxlEventHandle` + `axl_event_signal` | Hand a raw UEFI event to `axl_loop_add_event`; fire via `axl_event_signal(e)` | foreign-event interop (TCP completion tokens, protocol-notify) |
-| **Work offload** — "run where?" | [`AxlTask`](../src/task/README.md) pool | Real parallelism on APs (other cores); falls back single-core | AP dispatch, polled via `axl_task_pool_poll()` |
-| | [`AxlAsync`](../src/task/README.md) | Fire-and-forget AP work with a BSP callback | registers an idle source on the caller's loop (natural under `axl_loop_run`; under an `axl_yield`-driven main, see [`AXL-Runtime.md §2.6`](AXL-Runtime.md)) |
+| **Work offload** — "run where?" | [`AxlTask`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) pool | Real parallelism on APs (other cores); falls back single-core | AP dispatch, polled via `axl_task_pool_poll()` |
+| | [`AxlAsync`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) | Fire-and-forget AP work with a BSP callback | registers an idle source on the caller's loop (natural under `axl_loop_run`; under an `axl_yield`-driven main, see [`AXL-Runtime.md §2.6`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md)) |
 
 ## Decision guide
 

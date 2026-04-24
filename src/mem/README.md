@@ -1,4 +1,4 @@
-# AxlMem -- Memory Allocation
+# AxlMem — Memory Allocation
 
 Memory allocation with dmalloc-inspired debug features. Size-tracking headers
 enable `axl_realloc` without passing the old size. Debug builds add
@@ -15,7 +15,7 @@ memory is tracked with a small header that stores the block size, enabling
 old size.
 
 **Do not mix** `axl_malloc` with UEFI's `FreePool`, or `AllocatePool`
-with `axl_free` -- they use different headers.
+with `axl_free` — they use different headers.
 
 ### Debug vs. Release
 

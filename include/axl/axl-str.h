@@ -581,7 +581,7 @@ axl_strtou64(
 );
 
 // ---------------------------------------------------------------------------
-// Wide-string (UCS-2) utilities -- UEFI internal use.
+// Wide-string (UCS-2) utilities — UEFI internal use.
 // Consumer code should use UTF-8. Convert with axl_ucs2_to_utf8().
 // ---------------------------------------------------------------------------
 

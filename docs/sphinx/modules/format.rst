@@ -1,4 +1,4 @@
-AxlFormat -- Printf Engine
+AxlFormat — Printf Engine
 ==========================
 
 .. include:: ../../../src/format/README.md

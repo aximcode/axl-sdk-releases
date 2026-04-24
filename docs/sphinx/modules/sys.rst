@@ -1,4 +1,4 @@
-AxlSys -- System Utilities
+AxlSys — System Utilities
 ==========================
 
 .. include:: ../../../src/util/README.md

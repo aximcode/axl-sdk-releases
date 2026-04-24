@@ -6,9 +6,9 @@ event bus (**AxlPubsub**), both integrated with the loop.
 
 Headers:
 
-- `<axl/axl-loop.h>` -- Event loop core
-- `<axl/axl-defer.h>` -- Deferred work queue (ring buffer)
-- `<axl/axl-pubsub.h>` -- Publish/subscribe event bus
+- `<axl/axl-loop.h>` — Event loop core
+- `<axl/axl-defer.h>` — Deferred work queue (ring buffer)
+- `<axl/axl-pubsub.h>` — Publish/subscribe event bus
 
 ## When to Use What
 
@@ -62,8 +62,8 @@ int main(int argc, char **argv) {
 ## Callback Signatures
 
 All loop callbacks return `bool`:
-- `AXL_SOURCE_CONTINUE` (`true`) -- keep the source active
-- `AXL_SOURCE_REMOVE` (`false`) -- remove it from the loop
+- `AXL_SOURCE_CONTINUE` (`true`) — keep the source active
+- `AXL_SOURCE_REMOVE` (`false`) — remove it from the loop
 
 ```c
 // Generic callback (timers, timeouts, idle, protocol, raw events)
@@ -178,14 +178,14 @@ axl_event_signal(my_event);  // triggers on_custom_event on next tick
 axl_event_free(my_event);
 ```
 
-See [../event/README.md](../event/README.md) for AxlEvent semantics
+See [../event/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) for AxlEvent semantics
 (signal / reset / is_set / wait_timeout) and its typed stop-token
 cousin, `AxlCancellable`.
 
 ## Lifecycle & Cleanup
 
-Tear down caller-owned resources -- sockets, async ops, custom
-`AxlEvent` sources -- before the loop they were registered against.
+Tear down caller-owned resources — sockets, async ops, custom
+`AxlEvent` sources — before the loop they were registered against.
 If `axl_loop_free` finds a raw `AxlEvent` source still active it logs
 an error naming the source id, which usually points at a resource
 freed in the wrong order (e.g. the loop outlived by a lingering async
@@ -233,33 +233,33 @@ Drives `outer` until `done` is signalled, the timeout elapses, or
 Ctrl-C. Does NOT set `outer->quit_requested`, so the enclosing
 `axl_loop_run` resumes normally afterwards. Returns 0 on done,
 -1 on timeout, `AXL_CANCELLED` on interrupt. See
-[`docs/AXL-Runtime.md`](../../docs/AXL-Runtime.md) §5.6.
+[`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §5.6.
 
 ## Default Loop (`axl_loop_default`)
 
-The runtime (see [`src/runtime/README.md`](../runtime/README.md))
+The runtime (see [`src/runtime/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/runtime/README.md))
 exposes a shared singleton loop, **created lazily on the first
 `axl_loop_default()` call** (CRT0 does not pre-create it) and
 freed during `_axl_cleanup` if it was ever materialized. Apps
 can:
 
-1. Ignore it entirely -- `axl_yield()` still observes Ctrl-C by
+1. Ignore it entirely — `axl_yield()` still observes Ctrl-C by
    polling the break flag directly when `mDefaultLoop == NULL`.
 2. Register sources on it and call `axl_yield()` in a tight CPU
-   loop -- yields dispatch the loop non-blocking, so timers,
+   loop — yields dispatch the loop non-blocking, so timers,
    timeouts, defers, and raw events fire in line. **Idle sources
    are a footgun in this mode**: they run on every yield, not
    just when the loop is genuinely idle. See
-   [`docs/AXL-Runtime.md`](../../docs/AXL-Runtime.md) §2.6.
+   [`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §2.6.
 3. Call `axl_loop_run(axl_loop_default())` to hand control to the
-   loop -- appropriate for event-driven servers.
+   loop — appropriate for event-driven servers.
 
 Private loops via `axl_loop_new()` remain first-class and are
 often the right choice for scoped work.
 
 ## AxlDefer
 
-Deferred work queue -- schedules a function to run on the next loop
+Deferred work queue — schedules a function to run on the next loop
 iteration. Use in constrained contexts where complex work isn't safe:
 
 - Protocol notification callbacks (UEFI restricts what you can call)
@@ -306,9 +306,9 @@ named topics; other modules subscribe with callbacks. Delivery is deferred
 
 ### When to Use Pub/sub
 
-- **Decoupling** -- a producer doesn't know (or care) who its consumers are
-- **Multiple consumers** -- adding a new subscriber requires zero changes to the producer
-- **Cross-module events** -- "network is ready", "config changed", "shutdown requested"
+- **Decoupling** — a producer doesn't know (or care) who its consumers are
+- **Multiple consumers** — adding a new subscriber requires zero changes to the producer
+- **Cross-module events** — "network is ready", "config changed", "shutdown requested"
 
 For point-to-point communication (one caller, one callee), use a
 direct function call or a callback pointer instead.
@@ -380,10 +380,10 @@ or between test runs).
 
 ## See also
 
-- [`docs/AXL-Concurrency.md`](../../docs/AXL-Concurrency.md) -- the
+- [`docs/AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the
   full primitive-selection taxonomy across dispatch / coordination /
   notification / offload, including where `AxlLoop`, `AxlDefer`, and
   `AxlPubsub` fit alongside `AxlEvent`, `AxlCancellable`, and the
   `AxlTask` pool.
-- [`src/event/README.md`](../event/README.md) -- `AxlEvent`,
+- [`src/event/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) — `AxlEvent`,
   `AxlCancellable`, and the `axl_wait_*` helpers.

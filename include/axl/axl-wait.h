@@ -41,15 +41,15 @@ extern "C" {
 typedef struct AxlCancellable AxlCancellable;
 
 // ---------------------------------------------------------------------------
-// Tier 1 -- sleep (void return, no cancel, ergonomic)
+// Tier 1 — sleep (void return, no cancel, ergonomic)
 // ---------------------------------------------------------------------------
 //
 // Thin void-return wrappers over axl_wait_ms(NULL, ...). The CPU
-// idles for the duration via a one-shot timer event -- no busy-wait.
+// idles for the duration via a one-shot timer event — no busy-wait.
 //
 // Ctrl-C semantics: Ctrl-C (shell break) returns from sleep early,
 // the same as from any wait helper. UNLIKE Linux, Ctrl-C does NOT
-// automatically terminate the process -- execution continues past
+// automatically terminate the process — execution continues past
 // the sleep. Apps that want Ctrl-C to exit should check it at the
 // main-loop boundary (axl_loop_run returns -1) or call
 // axl_wait_ms() and observe the AXL_CANCELLED return. For truly
@@ -127,7 +127,7 @@ axl_wait_for_word(
 /**
  * @brief Interruptible sleep with cancellable support.
  *
- * The long form of axl_msleep -- use this when you need to inspect
+ * The long form of axl_msleep — use this when you need to inspect
  * the return code (Ctrl-C vs elapsed) or pass a shared AxlCancellable.
  * The CPU idles for the duration.
  *

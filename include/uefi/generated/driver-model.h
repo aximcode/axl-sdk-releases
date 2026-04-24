@@ -1,6 +1,6 @@
 /** @file generated/driver-model.h
     Auto-generated from UEFI Specification 2.11.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_DRIVER_MODEL_H

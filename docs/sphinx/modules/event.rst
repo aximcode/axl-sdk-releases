@@ -1,4 +1,4 @@
-Event Primitives -- AxlEvent, AxlCancellable, AxlWait
+Event Primitives — AxlEvent, AxlCancellable, AxlWait
 =====================================================
 
 The foundational synchronization primitives. All three compose: an
@@ -6,15 +6,15 @@ The foundational synchronization primitives. All three compose: an
 wait helpers drive a throwaway ``AxlLoop`` until an event fires, a
 condition holds, a timeout elapses, or Ctrl-C is received.
 
-- ``AxlEvent`` -- one-shot latch wrapping a UEFI event. Replaces the
+- ``AxlEvent`` — one-shot latch wrapping a UEFI event. Replaces the
   older ``AxlCompletion`` (same mechanical behavior, UEFI-native name).
-- ``AxlCancellable`` -- typed stop token shared across async ops;
+- ``AxlCancellable`` — typed stop token shared across async ops;
   cancel it once and every op observing it aborts with
   ``AXL_CANCELLED``.
-- ``AxlWait`` -- interruptible wait helpers (``axl_wait_for``,
+- ``AxlWait`` — interruptible wait helpers (``axl_wait_for``,
   ``axl_wait_for_flag``, ``axl_wait_ms``, ...) built on ``AxlLoop``.
 
-A note on naming: "event" appears three times in AXL docs -- the
+A note on naming: "event" appears three times in AXL docs — the
 event **loop** (the dispatcher), an event **source** (a thing
 registered with the loop), and ``AxlEvent`` (one kind of source).
 UEFI carries the same overload; an ``AxlEvent`` is a one-shot latch

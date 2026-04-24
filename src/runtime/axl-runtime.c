@@ -57,7 +57,7 @@ axl_yield(void)
     AxlLoop *loop = mDefaultLoop;
 
     /* Phase 1: break detection. Poll the shell break flag directly
-     * when no default loop exists yet -- otherwise a yield-only app
+     * when no default loop exists yet — otherwise a yield-only app
      * (no event sources, no loops) would never see Ctrl-C. When the
      * default loop IS live, axl_loop_dispatch below handles the
      * check as part of its normal flow; we skip the direct poll to
@@ -102,7 +102,7 @@ axl_registry_count(void)
 void
 _axl_init(void *image_handle, void *system_table)
 {
-    /* Set firmware globals before anything else -- backend functions
+    /* Set firmware globals before anything else — backend functions
      * depend on gST / gBS / gRT / gImageHandle being live. */
     extern EFI_HANDLE gImageHandle;
     gImageHandle = (EFI_HANDLE)image_handle;
@@ -122,14 +122,14 @@ _axl_cleanup(void)
     /* Guard against double-run: axl_exit calls _axl_cleanup before
      * gBS->Exit, and CRT0 calls it after main returns. If axl_exit
      * fires, the firmware exit never returns and CRT0 never sees
-     * main return -- but if it ever did (paranoia), we must not
+     * main return — but if it ever did (paranoia), we must not
      * run cleanup twice. */
     if (mCleanupRan) {
         return;
     }
     mCleanupRan = true;
 
-    /* atexit callbacks fire first -- they may free resources that
+    /* atexit callbacks fire first — they may free resources that
      * would otherwise be caught (noisily) by the sweep. */
     _axl_atexit_run_all();
 

@@ -1,4 +1,4 @@
-AxlRingBuf -- Ring Buffer
+AxlRingBuf — Ring Buffer
 =========================
 
 Ring buffer (circular byte buffer) with element-mode bookkeeping.
@@ -8,5 +8,5 @@ radix tree).
 
 Header: ``<axl/axl-ring-buf.h>``
 
-See :doc:`data` -- specifically the **AxlRingBuf** section -- for
+See :doc:`data` — specifically the **AxlRingBuf** section — for
 the type and function reference.

@@ -1,11 +1,11 @@
-# AxlFormat -- Printf Engine
+# AxlFormat — Printf Engine
 
 Callback-driven printf engine. Format text directly into any sink
 (buffer, network socket, file, hash) without intermediate allocation.
 
 This is the engine behind `axl_printf`, `axl_snprintf`, `axl_asprintf`,
 and `axl_string_append_printf`. It has **zero dependencies** (no memory
-allocator, no I/O) -- it breaks the Log -> Data circular dependency by
+allocator, no I/O) — it breaks the Log -> Data circular dependency by
 being self-contained.
 
 Header: `<axl/axl-format.h>`
@@ -13,7 +13,7 @@ Header: `<axl/axl-format.h>`
 ## Callback-Driven Formatting
 
 The core API takes a write callback that receives formatted output
-in chunks. No memory is allocated -- all formatting uses a small
+in chunks. No memory is allocated — all formatting uses a small
 stack buffer.
 
 ```c
@@ -33,8 +33,8 @@ axl_format(net_write, sock, "GET /%s HTTP/1.1\r\nHost: %s\r\n\r\n",
 
 Two functions:
 
-- `axl_format(write_fn, ctx, fmt, ...)` -- variadic convenience
-- `axl_vformat(write_fn, ctx, fmt, args)` -- va_list version
+- `axl_format(write_fn, ctx, fmt, ...)` — variadic convenience
+- `axl_vformat(write_fn, ctx, fmt, args)` — va_list version
 
 The callback type:
 

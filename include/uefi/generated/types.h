@@ -1,7 +1,7 @@
 /** @file generated/types.h
     Auto-generated from UEFI Specification 2.11.
     Base UEFI types, constants, and enums.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_TYPES_H
@@ -293,7 +293,7 @@ VOID
 
 #define TPL_HIGH_LEVEL     31
 
-// EFI_TEXT_ATTR -- commented out in spec, hand-written here
+// EFI_TEXT_ATTR — commented out in spec, hand-written here
 #define EFI_TEXT_ATTR(fg, bg)  ((fg) | ((bg) << 4))
 
 static inline int

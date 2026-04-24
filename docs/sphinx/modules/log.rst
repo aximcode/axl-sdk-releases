@@ -1,4 +1,4 @@
-AxlLog -- Logging
+AxlLog — Logging
 =================
 
 .. include:: ../../../src/log/README.md

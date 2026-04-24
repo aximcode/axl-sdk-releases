@@ -1,4 +1,4 @@
-AxlString -- String Builder
+AxlString — String Builder
 ===========================
 
 See :doc:`data` for an overview of all data modules including the

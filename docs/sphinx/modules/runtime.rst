@@ -1,4 +1,4 @@
-AxlRuntime -- CRT0-owned runtime glue
+AxlRuntime — CRT0-owned runtime glue
 =====================================
 
 .. include:: ../../../src/runtime/README.md

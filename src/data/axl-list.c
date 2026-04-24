@@ -283,7 +283,7 @@ axl_list_insert(
         cur = cur->next;
     }
 
-    /* Out of range -- append */
+    /* Out of range — append */
     if (cur == NULL) {
         return axl_list_append(list, data);
     }
@@ -343,7 +343,7 @@ axl_list_insert_sorted(
         }
     }
 
-    /* data is >= all elements -- append */
+    /* data is >= all elements — append */
     return axl_list_append(list, data);
 }
 

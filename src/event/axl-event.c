@@ -42,7 +42,7 @@ AXL_LOG_DOMAIN("event");
 // Types / sentinels
 // ---------------------------------------------------------------------------
 
-/* "AxLE" in little-endian ASCII -- distinctive enough to avoid
+/* "AxLE" in little-endian ASCII — distinctive enough to avoid
    chance collisions; not a secret. Mirrors the AxlCancellable
    sentinel scheme. */
 #define AXL_EVENT_MAGIC  0x454C7841U

@@ -4,7 +4,7 @@
 /**
  * axl.h:
  *
- * AXL -- AximCode Library for UEFI.
+ * AXL — AximCode Library for UEFI.
  * A GLib-inspired C library. UTF-8 everywhere, standard C types.
  *
  * This is the umbrella header. Include this one file to get the
@@ -60,7 +60,7 @@
 #include <axl/axl-ipmi.h>
 
 // ---------------------------------------------------------------------------
-// AXL_APP -- application entry point
+// AXL_APP — application entry point
 // ---------------------------------------------------------------------------
 
 void _axl_init(void *image_handle, void *system_table);

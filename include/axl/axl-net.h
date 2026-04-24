@@ -8,15 +8,15 @@
  * HTTP server, HTTP client, and network utilities.
  *
  * Individual headers can be included separately:
- *   #include <axl/axl-inet-address.h>  -- IP address + socket address
- *   #include <axl/axl-socket.h>        -- Unified socket
- *   #include <axl/axl-socket-client.h> -- DNS + connect helper
- *   #include <axl/axl-tcp.h>           -- TCP sockets (low-level)
- *   #include <axl/axl-udp.h>           -- UDP sockets (low-level)
- *   #include <axl/axl-url.h>           -- URL parsing only
- *   #include <axl/axl-http-core.h>     -- HTTP raw-buffer parsers
- *   #include <axl/axl-http-server.h>   -- HTTP server
- *   #include <axl/axl-http-client.h>   -- HTTP client
+ *   #include <axl/axl-inet-address.h>  — IP address + socket address
+ *   #include <axl/axl-socket.h>        — Unified socket
+ *   #include <axl/axl-socket-client.h> — DNS + connect helper
+ *   #include <axl/axl-tcp.h>           — TCP sockets (low-level)
+ *   #include <axl/axl-udp.h>           — UDP sockets (low-level)
+ *   #include <axl/axl-url.h>           — URL parsing only
+ *   #include <axl/axl-http-core.h>     — HTTP raw-buffer parsers
+ *   #include <axl/axl-http-server.h>   — HTTP server
+ *   #include <axl/axl-http-client.h>   — HTTP client
  */
 
 #ifndef AXL_NET_H

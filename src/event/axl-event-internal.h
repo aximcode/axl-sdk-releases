@@ -17,7 +17,7 @@
 #include <axl/axl-event.h>
 
 struct AxlEvent {
-    uint32_t       magic;             /* UAF sentinel -- see axl-event.c */
+    uint32_t       magic;             /* UAF sentinel — see axl-event.c */
     uint32_t       _registry_handle;  /* tier-1 registry slot; 0 = unregistered */
     AxlEventHandle handle;
     volatile bool  is_set;

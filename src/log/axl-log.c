@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-log.c
-    AxlLog core -- level filtering, domain overrides, console output
+    AxlLog core — level filtering, domain overrides, console output
     with optional timestamps and func/line, and handler dispatch.
 
     Migrated from AxlLog.c(EDK2-style) to GLib-style API.

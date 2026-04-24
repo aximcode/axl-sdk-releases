@@ -13,13 +13,13 @@ coroutine`) subsumes the Init/Poll/Cleanup module pattern that
 every non-trivial UEFI app ends up reinventing.
 
 **Related reading:**
-- [`AXL-Runtime.md`](AXL-Runtime.md) — the CRT0-owned runtime this
+- [`AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the CRT0-owned runtime this
   layer would build on (atexit, signal, registry sweep, default
   loop, `axl_yield`).
-- [`AXL-Concurrency.md`](AXL-Concurrency.md) — the four-axis
+- [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the four-axis
   taxonomy this layer composes. Notably its "Why not stackful
   coroutines" rejection; see §6 below for why we're reopening it.
-- [`AXL-Design.md`](AXL-Design.md) — overall axl-sdk architecture
+- [`AXL-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) — overall axl-sdk architecture
   (the library this would sit on top of).
 
 ---
@@ -421,7 +421,7 @@ change.
 
 ### 8.4 Hierarchical event loops (the shelved "parent drives children")
 
-See [AXL-Runtime.md §5.4](AXL-Runtime.md#L853) for the prior
+See [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#L853) for the prior
 rejection. The idea was: an `AxlLoop` has children `AxlLoop`s; the
 parent iterates them each tick. Rejected because of source-
 ownership ambiguity, break-event re-entry, poll-timer multiplication,
@@ -444,7 +444,7 @@ accept-then-spawn pattern's sequential-connection cap (ReqLog
 demonstrates 24 connections against a 16-slot PCB with inline
 zombie draining). K4, K7–K9 not started. See the §9.x status
 callouts below and
-[experiments/axl-kernel/README.md](../experiments/axl-kernel/README.md)
+[experiments/axl-kernel/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/experiments/axl-kernel/README.md)
 for resume context.
 
 ### Phase K1 — context switch prototype  **[LANDED]**
@@ -1254,7 +1254,7 @@ Captured here so they don't keep getting re-litigated:
 ## Appendix B — rejected earlier, preserved for context
 
 Previous design conversations concluded against stackful coroutines
-(see [AXL-Concurrency.md](AXL-Concurrency.md)) on memory-cost and
+(see [AXL-Concurrency.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md)) on memory-cost and
 debugger-cost grounds. This design reopens that conclusion because:
 
 1. The memory-cost argument was tuned for PEI/DXE-early constraints

@@ -1,6 +1,6 @@
 # AXL Runtime
 
-**Status:** implemented in Phase A7 (April 2026 -- commits
+**Status:** implemented in Phase A7 (April 2026 — commits
 `3789aea`...`4368256` on `main`). This document now describes the
 runtime as it is, not as proposed. A few items from the original
 design (release-mode heap sweep, opt-in watchdog) remain deferred
@@ -14,11 +14,11 @@ early. It also calls out the hard limits we can't paper over (UEFI
 has no preemption).
 
 Related reading:
-- [`AXL-Concurrency.md`](AXL-Concurrency.md) — the four-axis
+- [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the four-axis
   primitive taxonomy (dispatch / coordination / notification /
   offload). This doc proposes *the runtime under those primitives.*
-- [`AXL-Design.md`](AXL-Design.md) — overall library architecture.
-- [`AXL-SDK-Design.md`](AXL-SDK-Design.md) — CRT0 / `axl-cc` / entry
+- [`AXL-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) — overall library architecture.
+- [`AXL-SDK-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-SDK-Design.md) — CRT0 / `axl-cc` / entry
   point flow.
 
 ---
@@ -119,7 +119,7 @@ yield exits through the normal path.
 
 **Naming note.** The `axl_signal_*` prefix was previously occupied
 by a GObject-style pub/sub bus. Pre-1.0, that bus is renamed to
-`axl_pubsub_*` in [axl-pubsub.h](../include/axl/axl-pubsub.h) (~90
+`axl_pubsub_*` in [axl-pubsub.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-pubsub.h) (~90
 identifiers across 14 files; mechanical rename) specifically to
 free up the `axl_signal_*` namespace for this POSIX-flavored
 interrupt API — the meaning users' muscle memory reaches for
@@ -394,7 +394,7 @@ callbacks) are the dangerous class. A crash two minutes after the
 app exits — triggered by a timer firing into unloaded code — is
 one of the harder UEFI bugs to diagnose.
 
-Today `_axl_cleanup` ([src/posix/axl-app.c:92](../src/posix/axl-app.c#L92))
+Today `_axl_cleanup` ([src/posix/axl-app.c:92](https://github.com/aximcode/axl-sdk-releases/blob/main/src/posix/axl-app.c#L92))
 only:
 1. Frees the argv/argc it allocated in `_axl_init`.
 2. Under `AXL_MEM_DEBUG`, calls `axl_mem_dump_leaks()` — a
@@ -434,7 +434,7 @@ before their contents (events they registered as sources).
 
 `axl_malloc` already tracks every allocation under `AXL_MEM_DEBUG`
 via a doubly-linked list (see
-[src/mem/axl-mem.c:100](../src/mem/axl-mem.c#L100)). Extend the
+[src/mem/axl-mem.c:100](https://github.com/aximcode/axl-sdk-releases/blob/main/src/mem/axl-mem.c#L100)). Extend the
 cleanup path:
 
 - **Under `AXL_MEM_DEBUG`:** keep current behavior — report on
@@ -759,8 +759,8 @@ callback:
   `AxlLoop`, submits the async op against it, runs the loop until
   the op completes or times out, and frees it. The header-side
   contract lives in the "Blocking TCP API" block in
-  [axl-tcp.h](../include/axl/axl-tcp.h) and "Blocking operations"
-  in [axl-socket.h](../include/axl/axl-socket.h).
+  [axl-tcp.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-tcp.h) and "Blocking operations"
+  in [axl-socket.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-socket.h).
 
 ```
 outer axl_loop_run
@@ -782,7 +782,7 @@ that's the nesting cost, accepted.
 an event-driven server (accept → recv → send → recv…) is to use
 the `*_async` variants exclusively and let each callback's `bool`
 return drive re-arm of the next step.
-[`sdk/examples/echo-server.c`](../sdk/examples/echo-server.c) is
+[`sdk/examples/echo-server.c`](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/echo-server.c) is
 the worked example: `on_data` fires `axl_socket_send_async`,
 `on_echo_sent` re-arms recv, `on_accept` returns `true` to stay
 armed. One loop, no nested dispatch, Ctrl-C observed on every
@@ -792,8 +792,8 @@ nesting cost is fine; inside a loop callback they freeze every
 other source on the outer loop for the duration of the call.
 
 **When the blocking shape is the right choice.**
-[`sdk/examples/echo-client.c`](../sdk/examples/echo-client.c) and
-[`sdk/examples/echo-server-sync.c`](../sdk/examples/echo-server-sync.c)
+[`sdk/examples/echo-client.c`](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/echo-client.c) and
+[`sdk/examples/echo-server-sync.c`](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/echo-server-sync.c)
 show the counterpart: top-level linear code, no event loop, no
 callbacks. The per-call temporary loops are invisible because
 there is nothing outer to freeze. This is the right default for
@@ -903,9 +903,9 @@ src/runtime/
 
 **Pre-landing rename (merged as PR #1, commit `eba18a3`).** The
 existing `axl-signal.h` pub/sub bus was renamed to `axl_pubsub_*`
-in [axl-pubsub.h](../include/axl/axl-pubsub.h) specifically to
+in [axl-pubsub.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-pubsub.h) specifically to
 free the `axl_signal_*` namespace for this interrupt API. The
-new [axl-signal.h](../include/axl/axl-signal.h) houses
+new [axl-signal.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-signal.h) houses
 `AxlSignalHandler` / `axl_signal_install` / `axl_signal_default` /
 `axl_interrupted` / `axl_exit`. Blast radius: ~90 identifiers
 across 14 files, entirely mechanical. Identifier map:
@@ -1021,7 +1021,7 @@ case appears:
 ### 10.1 Release-mode heap auto-sweep
 
 §4.2 tier-2 proposed that release builds walk `mAllocList` at
-`_axl_cleanup` and `axl_free` each entry -- so apps that leak
+`_axl_cleanup` and `axl_free` each entry — so apps that leak
 heap on exit don't bleed memory into the firmware pool across
 many invocations.
 
@@ -1029,7 +1029,7 @@ many invocations.
 registry sweep IS implemented and handles the crash-hazard class
 (events, loops, cancellables, arenas). The tier-2 heap sweep was
 skipped because `mAllocList` only exists under `AXL_MEM_DEBUG`
-today -- release builds use a single-word header with no linked
+today — release builds use a single-word header with no linked
 list. Implementing auto-sweep requires promoting the `prev`/`next`
 pointers out of the debug gate (cost: ~16 bytes per allocation on
 x64 in release).
@@ -1037,7 +1037,7 @@ x64 in release).
 **Implement when:** we have a long-running app (e.g. SoftBMC,
 axl-webfs running as a persistent service) where leaked heap survives
 long enough to matter. Short-lived tool-style apps (fetch, sysinfo,
-etc.) don't benefit meaningfully -- the firmware reboot reclaims
+etc.) don't benefit meaningfully — the firmware reboot reclaims
 pool memory anyway.
 
 ### 10.2 Watchdog as library-livelock guard
@@ -1076,7 +1076,7 @@ which CRT0 linked it.
 
 Behavior contrast on a `runtime-demo leak-event` debug build:
 
-- Full runtime: `registry: sweep: AxlEvent leaked at ... -- closing`
+- Full runtime: `registry: sweep: AxlEvent leaked at ... — closing`
   followed by `mem: no leaks detected` (sweep freed the resource).
 - Minimal runtime: no sweep; the debug leak report prints the raw
   allocation site. Apps that opt out own their cleanup.

@@ -1,4 +1,4 @@
-AxlConfig -- Configuration
+AxlConfig — Configuration
 ==========================
 
 See :doc:`sys` for an overview of all utility modules including the

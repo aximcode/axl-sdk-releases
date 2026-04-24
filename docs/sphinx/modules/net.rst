@@ -1,4 +1,4 @@
-AxlNet -- Networking
+AxlNet — Networking
 ====================
 
 .. include:: ../../../src/net/README.md
@@ -41,6 +41,14 @@ AxlUrl
 ~~~~~~
 
 .. doxygenfile:: axl-url.h
+
+AxlHttpCore
+~~~~~~~~~~~
+
+Low-level HTTP/1.1 parsing helpers shared by the server, the client,
+and any consumer code (proxies, middleware, custom transports).
+
+.. doxygenfile:: axl-http-core.h
 
 AxlHttpServer
 ~~~~~~~~~~~~~

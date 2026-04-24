@@ -2,7 +2,7 @@ Getting Started
 ===============
 
 Build and run your first UEFI application with the AXL SDK. No EDK2
-source tree needed -- just a C compiler and a linker.
+source tree needed — just a C compiler and a linker.
 
 Prerequisites
 -------------
@@ -81,7 +81,7 @@ Build
 
     axl-cc hello.c -o hello.efi
 
-That's it -- one command, 11KB binary, zero external dependencies.
+That's it — one command, 11KB binary, zero external dependencies.
 
 Run in QEMU
 ------------

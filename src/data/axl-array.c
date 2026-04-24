@@ -188,7 +188,7 @@ axl_array_sort(AxlArray *a, AxlCompareFunc compare)
         return;
     }
 
-    /* Insertion sort -- adequate for typical UEFI array sizes */
+    /* Insertion sort — adequate for typical UEFI array sizes */
     tmp = axl_malloc(a->element_size);
     if (tmp == NULL) {
         axl_warning("sort allocation failed");
@@ -333,7 +333,7 @@ axl_array_sort_with_data(AxlArray *a, AxlCompareDataFunc compare,
         return;
     }
 
-    /* Insertion sort -- adequate for typical UEFI array sizes */
+    /* Insertion sort — adequate for typical UEFI array sizes */
     tmp = axl_malloc(a->element_size);
     if (tmp == NULL) {
         axl_warning("sort allocation failed");

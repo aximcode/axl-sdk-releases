@@ -64,7 +64,7 @@ typedef bool (*AxlHashTableForeachRemoveFunc)(
  *   size_t axl_str_hash(const void *key);
  *   bool   axl_str_equal(const void *a, const void *b);
  *
- * Include <axl/axl-str.h> -- or the <axl.h> umbrella -- when
+ * Include <axl/axl-str.h> — or the <axl.h> umbrella — when
  * constructing a string-keyed AxlHashTable. */
 
 /// Hash a pointer value directly. (GLib: g_direct_hash)

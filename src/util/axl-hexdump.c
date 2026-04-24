@@ -57,7 +57,7 @@ buf_sprintf(char *buf, size_t buf_size, const char *fmt, ...)
 }
 
 // ---------------------------------------------------------------------------
-// Callback type for output -- either console or log
+// Callback type for output — either console or log
 // ---------------------------------------------------------------------------
 
 typedef void (*hex_output_fn)(void *ctx, const char *line);

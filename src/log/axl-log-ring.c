@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-log-ring.c
-    Ring buffer log handler -- stores last N messages in memory.
+    Ring buffer log handler — stores last N messages in memory.
     Queryable by applications(e.g. SoftBmc serves via /api/logs).
 
     Delegates to AxlRingBuf for circular buffer management.

@@ -1,4 +1,4 @@
-AxlSmbus -- SMBus / I2C block access
+AxlSmbus — SMBus / I2C block access
 ====================================
 
 .. include:: ../../../src/smbus/README.md

@@ -92,7 +92,7 @@ the `axl_` public API shown above.
 For the synchronization-primitive taxonomy (AxlEvent, AxlCancellable,
 AxlWait, AxlLoop sources, AxlDefer, AxlPubsub, AxlTask) and a
 decision guide for which primitive to reach for, see
-[`AXL-Concurrency.md`](AXL-Concurrency.md).
+[`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
 ## Phases
 
@@ -883,7 +883,7 @@ Platform Access modules mirror it.
 
 ## Coding Style
 
-See [AXL-Coding-Style.md](AXL-Coding-Style.md) for the full style
+See [AXL-Coding-Style.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Coding-Style.md) for the full style
 guide. The short version: GLib naming, 4-space indent, standard C
 types in public API, no space before parens.
 

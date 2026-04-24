@@ -167,6 +167,7 @@ ships these `.efi` binaries:
 
 | Tool       | Description |
 |------------|-------------|
+| `dmidecode`| SMBIOS / DMI table decoder (UEFI `dmidecode(8)` equivalent) — dumps every record or filter by `-t <type>`; single-value query via `-s <keyword>` (`bios-vendor`, `system-uuid`, etc.). |
 | `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
 | `find`     | Recursive file and directory finder — glob patterns (`--name '*.efi'`) and type filter (`--type f` or `d`). UEFI `find(1)` equivalent. |
 | `grep`     | Pattern search across files — case-insensitive (`-i`), line numbers (`-n`), match count (`-c`), recursive (`-r`). UEFI `grep(1)` equivalent. |
@@ -175,7 +176,7 @@ ships these `.efi` binaries:
 | `mkrd`     | Create / list / destroy FAT16/FAT32 RAM disks in the UEFI Shell (`mkrd <label> [-s size]`, `-l`, `-d <label>`). Handy for staging files without writing to flash. |
 | `netinfo`  | Network interface diagnostics and ping — lists NICs with IP/MAC/link state, pings with `-c <count>`. UEFI `ifconfig`/`ping` equivalent. |
 | `rfbrowse` | Redfish browser — connects to a BMC over HTTPS and walks resources interactively (shortcut verbs for `/Systems`, `/Managers`, etc., plus arbitrary paths). |
-| `sysinfo`  | System inventory (UEFI `lshw`/`dmidecode` equivalent) — `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. |
+| `sysinfo`  | System inventory summary — compact `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. Use `dmidecode` for the full per-record dump. |
 
 Built with TLS enabled so `fetch` handles HTTPS and `rfbrowse`
 (Redfish over HTTPS) works against real BMCs.
@@ -230,10 +231,10 @@ axl-cc --type driver mydriver.c -o mydriver.efi
 ## Documentation
 
 - [API Reference](https://axl.aximcode.com/) — auto-generated from headers (Sphinx + Breathe)
-- [Coding Style](docs/AXL-Coding-Style.md) — naming conventions, formatting
-- [Porting Guide](docs/AXL-Porting-Guide.md) — how to port EDK2 apps to axl-cc
-- [Design](docs/AXL-Design.md) — architecture, phases
-- [Roadmap](docs/ROADMAP.md) — phase tracker
+- [Coding Style](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Coding-Style.md) — naming conventions, formatting
+- [Porting Guide](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Porting-Guide.md) — how to port EDK2 apps to axl-cc
+- [Design](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) — architecture, phases
+- [Roadmap](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/ROADMAP.md) — phase tracker
 
 ## Architecture
 
@@ -243,15 +244,15 @@ axl-cc --type driver mydriver.c -o mydriver.efi
   `AxlPascalCase` types, standard C types, UTF-8 strings.
 - **`src/`** — module implementations. Each directory has a
   `README.md` with overview, examples, and usage guidance:
-  [mem](src/mem/README.md),
-  [data](src/data/README.md) (str, string, hash, array, list, queue, json, cache),
-  [io](src/io/README.md),
-  [log](src/log/README.md),
-  [util](src/util/README.md) (args, config, path, env, sys, driver),
-  [loop](src/loop/README.md) (event loop, defer, signal),
-  [task](src/task/README.md) (arena, task pool, buf pool, async),
-  [net](src/net/README.md) (tcp, udp, http, tls),
-  [gfx](src/gfx/README.md).
+  [mem](https://github.com/aximcode/axl-sdk-releases/blob/main/src/mem/README.md),
+  [data](https://github.com/aximcode/axl-sdk-releases/blob/main/src/data/README.md) (str, string, hash, array, list, queue, json, cache),
+  [io](https://github.com/aximcode/axl-sdk-releases/blob/main/src/io/README.md),
+  [log](https://github.com/aximcode/axl-sdk-releases/blob/main/src/log/README.md),
+  [util](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/README.md) (args, config, path, env, sys, driver),
+  [loop](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) (event loop, defer, signal),
+  [task](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) (arena, task pool, buf pool, async),
+  [net](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/README.md) (tcp, udp, http, tls),
+  [gfx](https://github.com/aximcode/axl-sdk-releases/blob/main/src/gfx/README.md).
 - **Backend** (`src/backend/`) — platform abstraction over UEFI
   firmware services. Single native implementation.
 
@@ -282,12 +283,6 @@ Real projects that use this SDK as their only UEFI dependency:
   volume (`fsN:`) — live-edit files on your laptop, run them immediately
   in the UEFI shell. Built entirely with `axl-cc`, no EDK2.
 
-- **[aximcode/uefi-devkit](https://github.com/aximcode/uefi-devkit)** —
-  build orchestrator + bootable USB image that bundles the axl-sdk tools
-  (`sysinfo`, `netinfo`, `grep`, `find`, `hexdump`, `fetch`, `ipmi`,
-  `rfbrowse`) plus a crash handler into a multi-arch (x64+aa64)
-  troubleshooting stick.
-
 If you've built something with AXL and want it listed here, open a PR.
 
 ## Status
@@ -299,11 +294,11 @@ GCC) — no EDK2 or external UEFI SDK needed.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). See
-[NOTICE](NOTICE) for copyright and [THIRD_PARTY.md](THIRD_PARTY.md)
+Licensed under the [Apache License, Version 2.0](https://github.com/aximcode/axl-sdk-releases/blob/main/LICENSE). See
+[NOTICE](https://github.com/aximcode/axl-sdk-releases/blob/main/NOTICE) for copyright and [THIRD_PARTY.md](https://github.com/aximcode/axl-sdk-releases/blob/main/THIRD_PARTY.md)
 for attribution of vendored components.
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
+Contributions are welcome — see [CONTRIBUTING.md](https://github.com/aximcode/axl-sdk-releases/blob/main/CONTRIBUTING.md) for
 the DCO sign-off requirement and the contributor-license grant that
 keeps commercial-licensing options open for the project.
 
@@ -311,7 +306,7 @@ keeps commercial-licensing options open for the project.
 
 - **Questions, issues, bug reports** — file an issue on
   [aximcode/axl-sdk-releases](https://github.com/aximcode/axl-sdk-releases/issues).
-- **Security reports** — see [SECURITY.md](SECURITY.md).
+- **Security reports** — see [SECURITY.md](https://github.com/aximcode/axl-sdk-releases/blob/main/SECURITY.md).
 - **Other inquiries** — `support@aximcode.com`.
 
 AXL is developed by [AximCode](https://aximcode.com).

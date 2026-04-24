@@ -9,14 +9,14 @@ defines terms you may encounter.
    :sorted:
 
    BSP
-      **Bootstrap Processor** -- the CPU core that executes firmware
+      **Bootstrap Processor** — the CPU core that executes firmware
       initialization and runs the main application. All UEFI Boot
       Services calls must happen on the BSP. AXL functions that
       interact with firmware (I/O, networking, protocol calls) run
       on the BSP.
 
    AP
-      **Application Processor** -- any CPU core other than the BSP.
+      **Application Processor** — any CPU core other than the BSP.
       APs can be dispatched via the MP Services protocol to run
       compute-heavy tasks (CRC, decompression, hashing) in parallel.
       APs **cannot** call Boot Services, use ``axl_printf``, or
@@ -56,26 +56,26 @@ defines terms you may encounter.
       new instance; ``DestroyChild`` frees it.
 
    GOP
-      **Graphics Output Protocol** -- the UEFI framebuffer interface.
+      **Graphics Output Protocol** — the UEFI framebuffer interface.
       Provides resolution queries, rectangle fill, pixel buffer blit,
       and screen capture. AXL wraps it via ``axl_gfx_*`` functions.
       Not available on headless or serial-only systems.
 
    SNP
-      **Simple Network Protocol** -- the lowest-level NIC interface
+      **Simple Network Protocol** — the lowest-level NIC interface
       in UEFI. Provides raw Ethernet frame send/receive. Higher-level
       protocols (IP4, TCP4, UDP4, DHCP4) are built on top of SNP.
       ``axl_net_auto_init`` loads NIC drivers and brings up the SNP →
       IP4 → TCP4/UDP4 stack.
 
    ConOut
-      **Console Output** -- the UEFI text output protocol
+      **Console Output** — the UEFI text output protocol
       (``EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL``). ``axl_printf`` converts
       UTF-8 to UCS-2 and writes to ConOut. Available on systems with
       a display or serial console.
 
    EFI_STATUS
-      The standard UEFI return type -- a machine-word integer where
+      The standard UEFI return type — a machine-word integer where
       0 = ``EFI_SUCCESS``. AXL functions return ``int`` (0 = success,
       -1 = failure) instead; ``EFI_STATUS`` values appear only in
       direct protocol calls.
@@ -93,13 +93,13 @@ defines terms you may encounter.
       identification.
 
    DXE Driver
-      **Driver Execution Environment** driver -- a UEFI binary that
+      **Driver Execution Environment** driver — a UEFI binary that
       provides services to other binaries. Built with
       ``axl-cc --type driver``. Entry point is ``DriverEntry``
       instead of ``main``. Call ``axl_driver_init`` to set up the
       AXL runtime.
 
    OVMF
-      **Open Virtual Machine Firmware** -- an open-source UEFI
+      **Open Virtual Machine Firmware** — an open-source UEFI
       firmware implementation for virtual machines (QEMU). Used for
       testing AXL applications without real hardware.

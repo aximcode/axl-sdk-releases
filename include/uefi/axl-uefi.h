@@ -6,9 +6,9 @@
 
     Provides all UEFI types, status codes, system table structs,
     protocol definitions, and GUIDs needed by the AXL native backend.
-    Self-contained -- depends only on <stdint.h> and <stddef.h>.
+    Self-contained — depends only on <stdint.h> and <stddef.h>.
 
-    Self-contained -- depends only on <stdint.h> and <stddef.h>.
+    Self-contained — depends only on <stdint.h> and <stddef.h>.
 **/
 
 #ifndef AXL_UEFI_H

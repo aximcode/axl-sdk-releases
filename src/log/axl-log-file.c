@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-log-file.c
-    File log handler -- writes log messages to a file on the filesystem.
+    File log handler — writes log messages to a file on the filesystem.
     Buffers output and flushes periodically or on demand.
 **/
 

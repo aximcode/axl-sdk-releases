@@ -500,7 +500,7 @@ axl_slist_insert_before(
     }
 
     if (prev == NULL) {
-        /* sibling not found in list -- just append the new node */
+        /* sibling not found in list — just append the new node */
         axl_free(node);
         return axl_slist_append(list, data);
     }

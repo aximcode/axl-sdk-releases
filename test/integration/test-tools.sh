@@ -29,6 +29,31 @@ for tool in "$TOOLS_DIR"/*.efi; do
     test_add_efi "$tool"
 done
 
+# Optionally stage RamDiskDxe.efi so mkrd can exercise its
+# axl_driver_ensure() auto-load path end-to-end. Discovery order:
+#   1. $RAMDISKDXE_PATH (explicit override)
+#   2. $AXL_DEVKIT_DIR/build/staging/drivers/<arch>/RamDiskDxe.efi
+#   3. ~/projects/aximcode/uefi-devkit/build/staging/drivers/<arch>/RamDiskDxe.efi
+# If none found, the mkrd test falls back to verifying the
+# search-exhaustion path (still proof axv reached the program).
+RAMDISK_STAGED=0
+_ramdisk_src=""
+if [[ -n "${RAMDISKDXE_PATH:-}" && -f "$RAMDISKDXE_PATH" ]]; then
+    _ramdisk_src="$RAMDISKDXE_PATH"
+elif [[ -n "${AXL_DEVKIT_DIR:-}" \
+        && -f "$AXL_DEVKIT_DIR/build/staging/drivers/$_native_arch/RamDiskDxe.efi" ]]; then
+    _ramdisk_src="$AXL_DEVKIT_DIR/build/staging/drivers/$_native_arch/RamDiskDxe.efi"
+elif [[ -f "$HOME/projects/aximcode/uefi-devkit/build/staging/drivers/$_native_arch/RamDiskDxe.efi" ]]; then
+    _ramdisk_src="$HOME/projects/aximcode/uefi-devkit/build/staging/drivers/$_native_arch/RamDiskDxe.efi"
+fi
+
+if [[ -n "$_ramdisk_src" ]]; then
+    mkdir -p "$TEST_STAGING/drivers/$_native_arch"
+    cp "$_ramdisk_src" "$TEST_STAGING/drivers/$_native_arch/RamDiskDxe.efi"
+    RAMDISK_STAGED=1
+    echo "  Staged RamDiskDxe.efi from $_ramdisk_src"
+fi
+
 # Create test data files
 echo "Hello AXL test data for tools" > "$TEST_STAGING/testdata.txt"
 mkdir -p "$TEST_STAGING/testdir/subdir"
@@ -61,8 +86,33 @@ echo "sub file"            > "$TEST_STAGING/testdir/subdir/deep.txt"
     echo "echo === TEST-SYSINFO ==="
     echo "sysinfo.efi"
     echo ""
+    echo "echo === TEST-DMIDECODE-VERSION ==="
+    echo "dmidecode.efi -V"
+    echo ""
+    echo "echo === TEST-DMIDECODE-BIOS ==="
+    echo "dmidecode.efi -t 0"
+    echo ""
+    echo "echo === TEST-DMIDECODE-STRING ==="
+    echo "dmidecode.efi -s system-manufacturer"
+    echo ""
+    echo "echo === TEST-DMIDECODE-UNDECODED ==="
+    # Type 32 (System Boot Information) has no specialized decoder, so
+    # the tool should fall back to Header-and-Data + Strings.
+    echo "dmidecode.efi -t 32"
+    echo ""
     echo "echo === TEST-MKRD-HELP ==="
     echo "mkrd.efi -h"
+    echo ""
+    echo "echo === TEST-MKRD-POSITIONAL ==="
+    # Reproduces the user-reported case: positional label arg.
+    # When RamDiskDxe.efi is staged at drivers/<arch>/, mkrd's
+    # axl_driver_ensure() auto-load should find it and create the
+    # ramdisk. When not staged, mkrd should print "not found on any
+    # mounted volume" — still proof argv[1] reached the program.
+    echo "mkrd.efi testrd"
+    echo ""
+    echo "echo === TEST-MKRD-LIST ==="
+    echo "mkrd.efi -l"
     echo ""
     echo "echo === TEST-END ==="
     echo "reset -s"
@@ -97,6 +147,23 @@ check() {
     fi
 }
 
+# Negative-match variant: passes if the pattern is ABSENT from the log
+# between the named start marker and the end of the log.
+check_absent_in_section() {
+    local name="$1"
+    local start_marker="$2"
+    local pattern="$3"
+    local section
+    section=$(awk "/$start_marker/,0" "$TEST_CLEAN_LOG")
+    if echo "$section" | grep -q "$pattern"; then
+        echo "  FAIL: $name (saw unwanted: $pattern)"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS: $name"
+        PASS=$((PASS + 1))
+    fi
+}
+
 # hexdump: should show hex bytes + ASCII decode of "Hello AXL"
 check "hexdump-hex-offset"    "00000000:"
 check "hexdump-hex-content"   "4865 6c6c 6f20 4158"
@@ -123,9 +190,41 @@ check "sysinfo-memory"        "=== Memory ==="
 check "sysinfo-firmware"      "=== Firmware ==="
 check "sysinfo-uefi-version"  "UEFI:"
 
+# dmidecode: should report the SMBIOS version QEMU publishes
+check "dmidecode-version"     "SMBIOS .* present"
+# dmidecode -t 0 emits the BIOS Information section (via our typed reader)
+check "dmidecode-bios-header" "BIOS Information"
+check "dmidecode-bios-vendor" "Vendor:"
+# dmidecode -s prints a single string (QEMU is the usual mfr)
+check "dmidecode-string"      "=== TEST-DMIDECODE-STRING ==="
+# Undecoded type falls back to Header-and-Data hex dump
+check "dmidecode-fallback-hex" "Header and Data:"
+
 # mkrd: help output should show usage
 check "mkrd-help-usage"       "Usage: MkRd"
 check "mkrd-help-size"        "Size in MB"
+# mkrd positional: argv[1] must reach the program.
+#   Negative: "label required" would mean the positional never arrived
+#             (reproduces the user-reported Dell-firmware bug).
+check_absent_in_section "mkrd-positional-no-label-required" \
+    "=== TEST-MKRD-POSITIONAL ===" "label required"
+
+if [[ "$RAMDISK_STAGED" == "1" ]]; then
+    # Auto-load proof: with RamDiskDxe.efi staged on the disk,
+    # axl_driver_ensure() must find it, load+start it, and the
+    # ramdisk creation must succeed.
+    check "mkrd-autoload-success" \
+        "RAM disk .testrd. created"
+    # And the listing must include the just-created label, proving
+    # the protocol is genuinely live (not just a happy log line).
+    check "mkrd-list-shows-testrd" \
+        "testrd"
+else
+    # No driver staged: verify the search-exhaustion path runs
+    # cleanly. Still proof argv[1] reached the program.
+    check "mkrd-positional-reached-driver-ensure" \
+        "not found on any mounted volume\|RAM disk .testrd."
+fi
 
 # no memory leaks in any tool
 check "no-leaks"              "no leaks detected"

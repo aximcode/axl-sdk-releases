@@ -221,7 +221,7 @@ _axl_event_wait_timeout_with_tick(
 
 /* GCC's warn_unused_result isn't silenced by a plain (void) cast; use
    an assign-then-ignore pattern. The sleep family genuinely doesn't
-   care about AXL_CANCELLED -- Ctrl-C returns early anyway, and void
+   care about AXL_CANCELLED — Ctrl-C returns early anyway, and void
    return matches POSIX ergonomics. */
 #define AXL_IGNORE_RC(expr) do { int _rc = (expr); (void)_rc; } while (0)
 
@@ -240,7 +240,7 @@ axl_msleep(uint64_t milliseconds)
 void
 axl_usleep(uint64_t microseconds)
 {
-    /* Round sub-ms durations up to 1ms -- the underlying wait
+    /* Round sub-ms durations up to 1ms — the underlying wait
        primitive uses millisecond-granularity timers. Callers who
        need sub-millisecond precision should use the backend's
        Stall primitive directly (internal, not exposed). */

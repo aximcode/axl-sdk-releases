@@ -1,4 +1,4 @@
-AxlRadixTree -- Radix Tree
+AxlRadixTree — Radix Tree
 ==========================
 
 Compact prefix tree (radix / Patricia trie) for string-keyed maps
@@ -7,5 +7,5 @@ on the :doc:`data` page alongside the other AxlData primitives.
 
 Header: ``<axl/axl-radix-tree.h>``
 
-See :doc:`data` -- specifically the **AxlRadixTree** section -- for
+See :doc:`data` — specifically the **AxlRadixTree** section — for
 the type and function reference.

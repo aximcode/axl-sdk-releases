@@ -287,6 +287,128 @@ test_smbios(void)
     // Index 0 returns empty
     str = (unsigned short *)axl_smbios_get_string(hdr, 0);
     test_check(str != NULL && str[0] == L'\0', "smbios: get string 0 empty");
+
+    // Type enum: AXL_SMBIOS_TYPE_BIOS_INFO must equal bare 0
+    hdr = axl_smbios_find(AXL_SMBIOS_TYPE_BIOS_INFO);
+    test_check(hdr != NULL, "smbios: find by enum AXL_SMBIOS_TYPE_BIOS_INFO");
+
+    // axl_smbios_next: walk every record, count them and verify we reach
+    // at least BIOS + System info (the two every firmware publishes).
+    size_t total = 0;
+    bool saw_bios = false;
+    bool saw_system = false;
+    AxlSmbiosHeader *h = NULL;
+    while ((h = axl_smbios_next(h)) != NULL) {
+        total++;
+        if (h->Type == AXL_SMBIOS_TYPE_BIOS_INFO)   { saw_bios = true; }
+        if (h->Type == AXL_SMBIOS_TYPE_SYSTEM_INFO) { saw_system = true; }
+        // Guard against a buggy walker that doesn't terminate
+        if (total > 4096) { break; }
+    }
+    test_check(total > 0,   "smbios: next walks at least one record");
+    test_check(saw_bios,    "smbios: next found Type 0 (BIOS)");
+    test_check(saw_system,  "smbios: next found Type 1 (System)");
+    test_check(total <= 4096, "smbios: next terminates");
+
+    // axl_smbios_version: firmware should report something sensible.
+    unsigned char maj = 0, min = 0;
+    int rc = axl_smbios_version(&maj, &min);
+    test_check(rc == 0, "smbios: version call succeeds");
+    test_check(maj >= 2 && maj <= 3, "smbios: major in [2,3]");
+
+    // Reentrancy: two consecutive get_string calls on different records
+    // must return valid independent pointers (no static-buffer clobber).
+    AxlSmbiosHeader *bios = axl_smbios_find(AXL_SMBIOS_TYPE_BIOS_INFO);
+    AxlSmbiosHeader *sys  = axl_smbios_find(AXL_SMBIOS_TYPE_SYSTEM_INFO);
+    if (bios != NULL && sys != NULL) {
+        const char *bios_vendor = axl_smbios_get_string_utf8(bios, 1);
+        const char *sys_mfr     = axl_smbios_get_string_utf8(sys, 1);
+        test_check(bios_vendor[0] != '\0', "smbios: bios vendor non-empty");
+        test_check(sys_mfr[0]     != '\0', "smbios: sys manufacturer non-empty");
+        /* Both pointers must still be valid and distinct after the second
+           call (would have aliased under the old static-buffer impl). */
+        test_check(bios_vendor != sys_mfr, "smbios: reentrant string returns distinct ptrs");
+    }
+
+    // Typed BIOS info reader
+    AxlSmbiosBiosInfo bi;
+    test_check(axl_smbios_read_bios_info(&bi) == 0, "smbios: read bios info");
+    test_check(bi.vendor != NULL && bi.vendor[0] != '\0', "smbios: bios vendor populated");
+
+    // Typed System info reader + UUID byte-swap
+    AxlSmbiosSystemInfo si;
+    test_check(axl_smbios_read_system_info(&si) == 0, "smbios: read system info");
+    test_check(si.manufacturer != NULL, "smbios: system mfr populated");
+
+    // System UUID getter: either returns 0 with valid bytes, or -1 cleanly
+    uint8_t uuid[16];
+    int uuid_rc = axl_smbios_get_system_uuid(uuid);
+    test_check(uuid_rc == 0 || uuid_rc == -1, "smbios: uuid getter returns 0 or -1");
+
+    // Processor reader: walk every Type 4 and read it
+    size_t cpu_count = 0;
+    AxlSmbiosHeader *ph = NULL;
+    while ((ph = axl_smbios_find_next(AXL_SMBIOS_TYPE_PROCESSOR, ph)) != NULL) {
+        AxlSmbiosProcessorInfo pi;
+        test_check(axl_smbios_read_processor(ph, &pi) == 0, "smbios: read processor");
+        test_check(pi.socket_designation != NULL, "smbios: processor socket populated");
+        cpu_count++;
+        if (cpu_count > 64) { break; }
+    }
+
+    // Memory device reader: walk every Type 17 and read it
+    size_t mem_count = 0;
+    AxlSmbiosHeader *mh = NULL;
+    while ((mh = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE, mh)) != NULL) {
+        AxlSmbiosMemoryDevice md;
+        test_check(axl_smbios_read_memory_device(mh, &md) == 0, "smbios: read memory device");
+        test_check(md.device_locator != NULL, "smbios: mem device locator populated");
+        mem_count++;
+        if (mem_count > 1024) { break; }
+    }
+
+    // Wrong-type guard: read_processor should refuse a non-Type-4 header
+    AxlSmbiosProcessorInfo pi_bad;
+    test_check(axl_smbios_read_processor(bios, &pi_bad) == -1,
+               "smbios: read_processor rejects Type 0 hdr");
+    test_check(axl_smbios_read_memory_device(bios, NULL) == -1,
+               "smbios: read_memory_device rejects NULL out");
+
+    // Type 38 — IPMI Device Information. QEMU + IPMI SSIF test harness
+    // publishes one; plain QEMU doesn't. Just verify the call shape.
+    AxlSmbiosIpmiDeviceInfo ip;
+    int ip_rc = axl_smbios_read_ipmi_device_info(&ip);
+    test_check(ip_rc == 0 || ip_rc == -1,
+               "smbios: read_ipmi_device_info returns 0 or -1");
+    if (ip_rc == 0) {
+        test_check(ip.interface_type <= AXL_SMBIOS_IPMI_SSIF,
+                   "smbios: ipmi interface type in known range");
+        test_check(ip.spec_major <= 15 && ip.spec_minor <= 15,
+                   "smbios: ipmi spec nibbles fit 4 bits");
+    }
+
+    // Type 42 — Management Controller Host Interface. QEMU doesn't
+    // publish one, so the walk should simply find zero and the Redfish
+    // convenience should return -1 cleanly.
+    AxlSmbiosHeader *ih = NULL;
+    size_t host_iface_count = 0;
+    while ((ih = axl_smbios_find_next(AXL_SMBIOS_TYPE_MGMT_HOST_INTERFACE, ih)) != NULL) {
+        AxlSmbiosHostInterface iface;
+        test_check(axl_smbios_read_host_interface(ih, &iface) == 0,
+                   "smbios: read_host_interface on real Type 42");
+        test_check(iface.protocol_count <= 8, "smbios: protocol_count within cap");
+        host_iface_count++;
+        if (host_iface_count > 16) { break; }
+    }
+    AxlSmbiosHeader *rf_hdr = NULL;
+    AxlSmbiosHostInterface rf_iface;
+    int rf_rc = axl_smbios_find_redfish_host_interface(&rf_hdr, &rf_iface);
+    test_check(rf_rc == 0 || rf_rc == -1, "smbios: redfish find returns 0 or -1");
+
+    // Wrong-type guard for Type 42 reader
+    AxlSmbiosHostInterface iface_bad;
+    test_check(axl_smbios_read_host_interface(bios, &iface_bad) == -1,
+               "smbios: read_host_interface rejects Type 0 hdr");
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1094,48 @@ test_config_setv(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_driver_ensure
+// ---------------------------------------------------------------------------
+
+static void
+test_driver_ensure(void)
+{
+    /* Simple File System Protocol — guaranteed to be installed on
+     * any QEMU run because fs0:/ is the disk we're booting from. We
+     * use it as a stand-in for "a protocol that's already registered"
+     * so we can prove the LocateProtocol short-circuit is taken
+     * before the driver-search logic runs. */
+    static const AxlGuid simple_fs = AXL_GUID(
+        0x0964e5b22, 0x6459, 0x11d2,
+        0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b);
+
+    /* Short-circuit: pass a bogus driver name. If the short-circuit
+     * works, the driver lookup never happens and we get 0. If it
+     * doesn't, the bogus name causes a search miss and we get -1. */
+    test_check(axl_driver_ensure(&simple_fs,
+                                 "definitely-not-a-real-driver.efi") == 0,
+               "driver_ensure: short-circuits when protocol registered");
+
+    /* NULL args — both arguments are required. */
+    test_check(axl_driver_ensure(NULL, "x.efi") == -1,
+               "driver_ensure: rejects NULL guid");
+    test_check(axl_driver_ensure(&simple_fs, NULL) == -1,
+               "driver_ensure: rejects NULL name");
+
+    /* Missing protocol + missing driver: a GUID we know is not
+     * registered in QEMU + a filename that doesn't exist anywhere
+     * on the disk. Should walk the search list, find nothing,
+     * return -1 without crashing. */
+    static const AxlGuid never_registered = AXL_GUID(
+        0xdeadbeef, 0xcafe, 0xbabe,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef);
+
+    test_check(axl_driver_ensure(&never_registered,
+                                 "no-such-driver-12345.efi") == -1,
+               "driver_ensure: returns -1 when driver not found");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1006,6 +1170,7 @@ test_util_main(int argc, char **argv)
     test_config_callback();
     test_config_validation();
     test_config_setv();
+    test_driver_ensure();
 
     return test_print_results();
 }

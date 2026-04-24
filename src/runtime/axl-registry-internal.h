@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-registry-internal.h
-    Tier-1 resource registry -- internal API called by the wrappers
+    Tier-1 resource registry — internal API called by the wrappers
     for AxlEvent, AxlLoop, AxlCancellable, and AxlArena. See
     docs/AXL-Runtime.md §4.2 for the design.
 
@@ -11,7 +11,7 @@
     anything still registered (a leak) and closes it before gBS->Exit
     returns control to the shell.
 
-    Not a public header -- never include from outside src/.
+    Not a public header — never include from outside src/.
 **/
 
 #ifndef AXL_REGISTRY_INTERNAL_H

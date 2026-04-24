@@ -73,9 +73,9 @@ worker_proc(
         if (slot->task != 0) {
             proc = (AxlTaskProc)(uintptr_t)slot->task;
             slot->task = 0;
-            __sync_synchronize();          /* acquire -- ensure arg/arena visible */
+            __sync_synchronize();          /* acquire — ensure arg/arena visible */
             proc(slot->arg, slot->arena);
-            __sync_synchronize();          /* release -- ensure task results visible */
+            __sync_synchronize();          /* release — ensure task results visible */
             slot->done = 1;
         }
         cpu_pause();
@@ -237,7 +237,7 @@ axl_task_pool_submit(
             pool->slots[i].arena = arena;
             pool->slots[i].on_complete = on_complete;
             pool->slots[i].id = id;
-            __sync_synchronize();          /* release -- ensure fields visible before task */
+            __sync_synchronize();          /* release — ensure fields visible before task */
             pool->slots[i].task = (uintptr_t)proc;
             return id;
         }
@@ -263,7 +263,7 @@ axl_task_pool_poll(
     completed = 0;
     for (i = 0; i < pool->worker_count; i++) {
         if (pool->slots[i].done) {
-            __sync_synchronize();          /* acquire -- ensure task results visible */
+            __sync_synchronize();          /* acquire — ensure task results visible */
             if (pool->slots[i].on_complete != NULL) {
                 pool->slots[i].on_complete(pool->slots[i].arg,
                                            pool->slots[i].arena);

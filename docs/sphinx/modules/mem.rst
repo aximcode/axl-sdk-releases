@@ -1,4 +1,4 @@
-AxlMem -- Memory Allocation
+AxlMem — Memory Allocation
 ===========================
 
 .. include:: ../../../src/mem/README.md

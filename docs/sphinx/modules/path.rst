@@ -1,4 +1,4 @@
-AxlPath -- Path Manipulation
+AxlPath — Path Manipulation
 ============================
 
 See :doc:`sys` for an overview of all utility modules including path

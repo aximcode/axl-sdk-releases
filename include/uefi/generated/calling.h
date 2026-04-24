@@ -1,7 +1,7 @@
 /** @file generated/calling.h
     Auto-generated from UEFI Specification 2.11.
     UEFI calling convention macros.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_CALLING_H

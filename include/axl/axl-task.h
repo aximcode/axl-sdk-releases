@@ -111,7 +111,7 @@ typedef uint32_t AxlTaskId;
 /**
  * AxlTaskProc:
  *
- * Task procedure -- runs on an AP. Must be AP-safe: no Boot Services,
+ * Task procedure — runs on an AP. Must be AP-safe: no Boot Services,
  * no protocol calls, no axl_print. Use the arena for memory.
  */
 typedef void (*AxlTaskProc)(
@@ -122,7 +122,7 @@ typedef void (*AxlTaskProc)(
 /**
  * AxlTaskComplete:
  *
- * Completion callback -- runs on BSP during axl_task_pool_poll.
+ * Completion callback — runs on BSP during axl_task_pool_poll.
  */
 typedef void (*AxlTaskComplete)(
     void     *arg,  ///< same argument from submit

@@ -5,7 +5,7 @@ AXL SDK
    :widths: 20 80
 
    * - **Version**
-     - 0.1.0
+     - 0.2.2
    * - **License**
      - Apache-2.0
    * - **C header**
@@ -45,6 +45,7 @@ AXL SDK
    modules/tls
    modules/sys
    modules/gfx
+   modules/smbios
    modules/smbus
    modules/ipmi
 

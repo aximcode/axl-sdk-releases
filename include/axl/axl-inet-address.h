@@ -11,7 +11,7 @@
  * @code
  * AxlInetAddress *addr = axl_inet_address_new_from_string("192.168.1.1");
  * AxlSocketAddress *sa = axl_socket_address_new(addr, 8080);
- * // sa now owns addr -- do not free addr separately
+ * // sa now owns addr — do not free addr separately
  * axl_socket_address_free(sa);
  * @endcode
  */
@@ -145,7 +145,7 @@ axl_inet_address_is_loopback(
 typedef struct AxlSocketAddress AxlSocketAddress;
 
 /**
- * @brief IPv4 address (4 bytes). Legacy -- prefer AxlInetAddress for new code.
+ * @brief IPv4 address (4 bytes). Legacy — prefer AxlInetAddress for new code.
  */
 typedef struct {
     uint8_t addr[4];

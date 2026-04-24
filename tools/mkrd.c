@@ -587,6 +587,16 @@ main(
 
     verbose = axl_config_get_bool(cfg, "verbose");
 
+    /* All non-help modes need EFI_RAM_DISK_PROTOCOL. Auto-load
+     * RamDiskDxe.efi if it isn't already registered, so MkRd works
+     * from a bare UEFI shell without a startup.nsh that pre-loads
+     * the driver. */
+    if (axl_driver_ensure((const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+                          "RamDiskDxe.efi") != 0) {
+        axl_printf("MkRd: RamDiskDxe.efi not found on any mounted volume.\n");
+        return 1;
+    }
+
     /* List mode */
     if (axl_config_get_bool(cfg, "list")) {
         return do_list();

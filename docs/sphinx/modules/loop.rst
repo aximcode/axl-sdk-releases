@@ -1,4 +1,4 @@
-AxlLoop -- Event Loop
+AxlLoop — Event Loop
 =====================
 
 .. include:: ../../../src/loop/README.md

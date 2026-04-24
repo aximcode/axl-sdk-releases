@@ -45,7 +45,7 @@ extern "C" {
 #define AXL_LOG_DOMAIN(d)  static const char *_AxlLogDomain __attribute__((unused)) = (d)
 
 /**
- * Convenience macros -- inject __func__ and __LINE__.
+ * Convenience macros — inject __func__ and __LINE__.
  * Stay uppercase because they are macros, not functions.
  */
 #define axl_error(...)   axl_log_full(AXL_LOG_ERROR,   _AxlLogDomain, \

@@ -1,4 +1,4 @@
-AxlTask -- Task Pool and Arena
+AxlTask — Task Pool and Arena
 ==============================
 
 .. include:: ../../../src/task/README.md

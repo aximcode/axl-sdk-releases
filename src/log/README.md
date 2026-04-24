@@ -36,7 +36,7 @@ From most to least severe:
 | DEBUG | 3 | Detailed diagnostic info |
 | TRACE | 4 | Very verbose, per-packet/per-call |
 
-The default level is INFO -- messages at DEBUG and TRACE are suppressed
+The default level is INFO — messages at DEBUG and TRACE are suppressed
 unless explicitly enabled.
 
 ## Level Filtering

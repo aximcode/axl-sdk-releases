@@ -10,19 +10,19 @@ timeout elapses, or Ctrl-C is received.
 
 Headers:
 
-- `<axl/axl-event.h>` -- AxlEvent and AxlEventHandle
-- `<axl/axl-cancellable.h>` -- AxlCancellable
-- `<axl/axl-wait.h>` -- `axl_wait_for`, `axl_wait_for_flag/word`,
+- `<axl/axl-event.h>` — AxlEvent and AxlEventHandle
+- `<axl/axl-cancellable.h>` — AxlCancellable
+- `<axl/axl-wait.h>` — `axl_wait_for`, `axl_wait_for_flag/word`,
   `axl_wait_ms`, `axl_wait_for_with_tick`
 
 ## A note on naming
 
 "Event" is overloaded in AXL docs. It appears in three places:
 
-- The **event loop** (`AxlLoop`) -- the dispatcher.
-- An **event source** -- a thing registered with the loop (timer,
+- The **event loop** (`AxlLoop`) — the dispatcher.
+- An **event source** — a thing registered with the loop (timer,
   idle, raw event, ...).
-- `AxlEvent` -- the one-shot latch described below; one kind of
+- `AxlEvent` — the one-shot latch described below; one kind of
   thing the loop can dispatch.
 
 This is the same overload UEFI uses. An `AxlEvent` is a one-shot
@@ -40,9 +40,9 @@ latch backed by a UEFI event; the event loop dispatches them.
 
 For the full concurrency taxonomy across dispatch / coordination /
 notification / offload (including `AxlLoop`, `AxlPubsub`, `AxlTask`),
-see [`docs/AXL-Concurrency.md`](../../docs/AXL-Concurrency.md).
+see [`docs/AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
-## AxlEvent -- the one-shot latch
+## AxlEvent — the one-shot latch
 
 `AxlEvent` is AXL's foundational producer-waiter rendezvous. An async
 callback signals; the main thread waits. The CPU idles between events
@@ -63,7 +63,7 @@ static void on_done(void *user) {
 ```
 
 The `axl_event_is_set(e)` fast-check reads an internal flag without
-driving the loop -- useful for "did my op already finish?" polls.
+driving the loop — useful for "did my op already finish?" polls.
 `axl_event_reset(e)` drops a pending signal so the same event can be
 reused across cycles. `AXL_DEFINE_AUTOPTR_CLEANUP` makes RAII-style
 lifetimes trivial.
@@ -74,7 +74,7 @@ an `AxlEventHandle`. For an AXL-managed event, pass
 token, protocol-notify event), pass the handle directly. One entry
 point, two sources.
 
-## AxlCancellable -- the typed stop-token
+## AxlCancellable — the typed stop-token
 
 `AxlCancellable` is an `AxlEvent` with stop-token semantics: every
 `axl_*_async` op accepts one, and signalling it aborts every op
@@ -105,19 +105,19 @@ Common patterns:
 - **Subsystem shutdown**: `axl_cancellable_cancel(app->shutdown)`
   aborts every outstanding op registered against `app->shutdown`.
 - **User abort**: wire a Ctrl-C handler or UI button to
-  `axl_cancellable_cancel` -- same result, different trigger.
+  `axl_cancellable_cancel` — same result, different trigger.
 
 Mental model: *`AxlCancellable` is to async ops what `AxlLoop` is to
-event sources -- an optional container you tie operations to and tear
+event sources — an optional container you tie operations to and tear
 down independently.*
 
 Ownership rule: the cancellable must outlive every op that observes
 it. Same discipline as `AxlLoop` outliving its sources. `AXL_AUTOPTR`
-helps -- declare the cancellable in a scope that outlives every async
+helps — declare the cancellable in a scope that outlives every async
 op's loop run.
 
 The `AXL_CANCELLED` return (`-2` in `<axl/axl-macros.h>`) covers both
-explicit cancellation and the shell break event (Ctrl-C) -- consumers
+explicit cancellation and the shell break event (Ctrl-C) — consumers
 see one return code for "some external source stopped me."
 
 ## Sleep and wait helpers
@@ -125,14 +125,14 @@ see one return code for "some external source stopped me."
 Two families, sharing one underlying primitive (timer event +
 `axl_backend_event_wait`):
 
-**Sleep** (`axl_sleep`, `axl_msleep`, `axl_usleep`) -- void return,
+**Sleep** (`axl_sleep`, `axl_msleep`, `axl_usleep`) — void return,
 no cancel parameter, ergonomic. Use when all you want is "idle for
 N time." Ctrl-C returns early (matching POSIX intuition), but
-unlike Linux it does not auto-terminate the app -- execution
+unlike Linux it does not auto-terminate the app — execution
 continues past the sleep. Apps that want Ctrl-C to exit observe it
 at their main-loop boundary.
 
-**Wait** (`axl_wait_ms`, `axl_wait_for_*`) -- int return, optional
+**Wait** (`axl_wait_ms`, `axl_wait_for_*`) — int return, optional
 `AxlCancellable`, condition predicates. Use when you need to
 inspect the reason the wait returned, or when multiple async ops
 share a stop token. Return convention: `0` = condition met / time
@@ -147,7 +147,7 @@ axl_usleep(500);       // rounded up to 1ms (millisecond granularity)
 ```
 
 For sub-millisecond hardware timing, the backend's `Stall` primitive
-is still available internally -- not exposed to SDK consumers.
+is still available internally — not exposed to SDK consumers.
 
 ### Zero-callback waits
 

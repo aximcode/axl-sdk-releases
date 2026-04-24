@@ -1,4 +1,4 @@
-AxlGfx -- Graphics
+AxlGfx — Graphics
 ===================
 
 .. include:: ../../../src/gfx/README.md

@@ -1,8 +1,8 @@
 # AXL Roadmap
 
 Unified phase tracker for the AXL library and SDK.
-Phases from [AXL-Design.md](AXL-Design.md) and
-[AXL-SDK-Design.md](AXL-SDK-Design.md) are combined here in
+Phases from [AXL-Design.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) and
+[AXL-SDK-Design.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-SDK-Design.md) are combined here in
 execution order.
 
 Legend: [x] done, [ ] pending, [-] in progress
@@ -668,11 +668,11 @@ synchronization primitive to reach for.
 ### Phase A7: CRT0-owned runtime (signals, yield, atexit, default loop) — DONE
 
 **Status:** landed April 2026 as seven commits on `main`
-(`3789aea`...`4368256`). See [docs/AXL-Runtime.md](AXL-Runtime.md)
+(`3789aea`...`4368256`). See [docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md)
 (status: implemented) and `src/runtime/`.
 
 Since AXL controls every public API, we approximate Linux-style
-signal responsiveness cooperatively -- `axl_yield()` in tight app
+signal responsiveness cooperatively — `axl_yield()` in tight app
 loops, a centralized break handler invoked on Ctrl-C, and a POSIX-
 flavored `axl_signal_install` / `axl_atexit` / `axl_exit` surface
 for ergonomics. Full preemption is not reachable under UEFI BSP;
@@ -685,7 +685,7 @@ What landed:
       `_axl_init(ImageHandle, SystemTable)` -> `main` ->
       `_axl_cleanup`. `_axl_init` / `_axl_cleanup` now live in
       `src/runtime/axl-runtime.c`.
-- [x] `axl_loop_default()` -- singleton, lazy-created on first
+- [x] `axl_loop_default()` — singleton, lazy-created on first
       call, freed during `_axl_cleanup`.
 - [x] Shell break-flag + break-event detection in
       `axl_loop_next_event` and `axl_yield` calls
@@ -716,37 +716,37 @@ What landed:
 - [x] **Caller attribution via macro shims** on `axl_event_new`,
       `axl_loop_new`, `axl_cancellable_new`, `axl_arena_new`.
       Sweep warnings name the user's call site (or library call
-      site for library-internal allocations -- which correctly
+      site for library-internal allocations — which correctly
       freed never reach the sweep anyway).
 - [x] **`axl_loop_iterate_until`** (nested-wait primitive, design
-      §5.6) -- lets callers inside a loop callback wait on an
+      §5.6) — lets callers inside a loop callback wait on an
       event without freezing the outer loop's other sources.
-- [x] `runtime-demo.c` -- 8 subcommand scenarios covering every
+- [x] `runtime-demo.c` — 8 subcommand scenarios covering every
       facet, validated on X64 + AARCH64.
-- [x] `test/unit/axl-test-runtime.c` (AxlTestRuntime) -- 16
+- [x] `test/unit/axl-test-runtime.c` (AxlTestRuntime) — 16
       `test_check` calls covering atexit, registry, yield,
       interrupted, signal-install.
 - [x] Cooperative-concurrency caveat documented in
-      [docs/AXL-Runtime.md](AXL-Runtime.md) §11 and
-      [docs/AXL-Concurrency.md](AXL-Concurrency.md).
+      [docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §11 and
+      [docs/AXL-Concurrency.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
 Deferred to a future phase (both captured in
-[docs/AXL-Runtime.md](AXL-Runtime.md) §10):
+[docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §10):
 
 - [ ] **Release-mode heap auto-sweep.** `mAllocList` exists only
       under `AXL_MEM_DEBUG` today; making release-build sweeps
       possible costs ~16 bytes per allocation. Implement when a
       long-running app like SoftBMC or persistent-service axl-webfs
       needs the firmware-pool safety net. Short-lived tool apps
-      don't benefit -- firmware reboot reclaims pool memory.
+      don't benefit — firmware reboot reclaims pool memory.
 - [ ] **Watchdog opt-in** (`axl_watchdog_enable(seconds)`) --
       library-livelock guard, not a signal mechanism. No concrete
       caller has asked for it yet.
 
 Design decisions locked in (see design doc §7, §9):
 
-- No `longjmp` from break notify -- async-signal-unsafety.
-- No UEFI watchdog repurpose -- reset-only on every platform.
+- No `longjmp` from break notify — async-signal-unsafety.
+- No UEFI watchdog repurpose — reset-only on every platform.
 - No NMI or platform-specific preemption hooks.
 - CPU-bound no-AXL code is documented as uninterruptible, not
   papered over.
@@ -1134,7 +1134,7 @@ during code review and refactor work, not during original planning.
 
       - [ ] **Async TCP `Configure` retry blocks its caller
             (API-contract issue; no observed impact).**
-            [src/net/axl-tcp-async.c:540](../src/net/axl-tcp-async.c#L540).
+            [src/net/axl-tcp-async.c:540](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-async.c#L540).
             The no-mapping retry loop inside an async-start function
             still blocks the caller for up to
             `TCP_MAPPING_RETRIES * TCP_MAPPING_DELAY` (~10 s) while
@@ -1158,7 +1158,7 @@ during code review and refactor work, not during original planning.
             2026-04-19.
 
       - [ ] **AxlAsync dogfooding of AxlEvent.**
-            [src/task/axl-async.c](../src/task/axl-async.c) currently
+            [src/task/axl-async.c](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/axl-async.c) currently
             hand-rolls its completion reporting via idle-source
             polling and the defer queue. Natural consumer of the
             `AxlEvent` primitive — signal-from-worker, wait-
@@ -1169,7 +1169,7 @@ during code review and refactor work, not during original planning.
             Discovered 2026-04-18.
 
       - [ ] **`axl_yield()` instrumentation of AXL APIs.**
-            [docs/AXL-Runtime.md §3.1](AXL-Runtime.md) lists the
+            [docs/AXL-Runtime.md §3.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) lists the
             targets: file I/O (`axl_file_get_contents` /
             `axl_fread` / directory iteration), HTTP body-read
             loops in `src/net/axl-http-client.c`, `axl_digest_update`
@@ -1201,7 +1201,7 @@ during code review and refactor work, not during original planning.
 
       - [ ] **Idle source fires on non-blocking dispatch —
             revisit when a real caller bites.**
-            [src/loop/axl-loop.c:241-254](../src/loop/axl-loop.c#L241-L254).
+            [src/loop/axl-loop.c:241-254](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/axl-loop.c#L241-L254).
             Idle callbacks run once per `axl_loop_next_event` pass
             regardless of `blocking`. Under `axl_loop_run` that's
             naturally throttled by `WaitForEvent`; under an
@@ -1239,23 +1239,23 @@ during code review and refactor work, not during original planning.
       Priority by measured impact.
 
       _src/net (high — this is the 99% CPU burn AxlTestNet shows):_
-      - [src/net/axl-udp.c:244](../src/net/axl-udp.c#L244) — `axl_udp_send_to` timeout loop (10s default)
-      - [src/net/axl-udp.c:319](../src/net/axl-udp.c#L319) — `axl_udp_receive` timeout loop
-      - [src/net/axl-net-resolve.c:184](../src/net/axl-net-resolve.c#L184) — DNS 5s primary poll
-      - [src/net/axl-net-resolve.c:202](../src/net/axl-net-resolve.c#L202) — DNS secondary poll
-      - [src/net/axl-net-dhcp.c:198](../src/net/axl-net-dhcp.c#L198) — DHCP first-stage wait (100ms stalls)
-      - [src/net/axl-net-dhcp.c:250](../src/net/axl-net-dhcp.c#L250) — DHCP IP-assignment wait (1s stalls)
-      - [src/net/axl-tcp-sync.c:451](../src/net/axl-tcp-sync.c#L451) — TCP close drain
-      - [src/net/axl-tcp-sync.c:209](../src/net/axl-tcp-sync.c#L209) — Configure mapping retry (TCP_MAPPING_DELAY)
-      - [src/net/axl-tcp-async.c:540](../src/net/axl-tcp-async.c#L540) — same Configure retry on the async path (extra-bad: async code should never block the loop)
-      - [src/net/axl-net-ping.c:260](../src/net/axl-net-ping.c#L260) — ping response wait (1ms stalls, full timeout)
+      - [src/net/axl-udp.c:244](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-udp.c#L244) — `axl_udp_send_to` timeout loop (10s default)
+      - [src/net/axl-udp.c:319](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-udp.c#L319) — `axl_udp_receive` timeout loop
+      - [src/net/axl-net-resolve.c:184](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-resolve.c#L184) — DNS 5s primary poll
+      - [src/net/axl-net-resolve.c:202](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-resolve.c#L202) — DNS secondary poll
+      - [src/net/axl-net-dhcp.c:198](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-dhcp.c#L198) — DHCP first-stage wait (100ms stalls)
+      - [src/net/axl-net-dhcp.c:250](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-dhcp.c#L250) — DHCP IP-assignment wait (1s stalls)
+      - [src/net/axl-tcp-sync.c:451](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-sync.c#L451) — TCP close drain
+      - [src/net/axl-tcp-sync.c:209](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-sync.c#L209) — Configure mapping retry (TCP_MAPPING_DELAY)
+      - [src/net/axl-tcp-async.c:540](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-async.c#L540) — same Configure retry on the async path (extra-bad: async code should never block the loop)
+      - [src/net/axl-net-ping.c:260](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-ping.c#L260) — ping response wait (1ms stalls, full timeout)
 
       _src/ipmi (medium — SSIF's 60ms inter-command delay is the largest):_
-      - [src/ipmi/axl-ipmi-ssif.c:109](../src/ipmi/axl-ipmi-ssif.c#L109) — SSIF write-retry delay (60ms)
-      - [src/ipmi/axl-ipmi-ssif.c:124](../src/ipmi/axl-ipmi-ssif.c#L124) — SSIF read-retry exponential backoff (starts 60ms)
-      - [src/ipmi/axl-ipmi-ssif.c:304](../src/ipmi/axl-ipmi-ssif.c#L304) — SSIF 60ms inter-command delay (spec-mandated for iDRAC/Grace)
-      - [src/ipmi/axl-ipmi-kcs.c:93](../src/ipmi/axl-ipmi-kcs.c#L93) — KCS IBF-clear poll (100µs cadence, 5s timeout)
-      - [src/ipmi/axl-ipmi-kcs.c:125](../src/ipmi/axl-ipmi-kcs.c#L125) — KCS OBF-set poll (100µs cadence)
+      - [src/ipmi/axl-ipmi-ssif.c:109](https://github.com/aximcode/axl-sdk-releases/blob/main/src/ipmi/axl-ipmi-ssif.c#L109) — SSIF write-retry delay (60ms)
+      - [src/ipmi/axl-ipmi-ssif.c:124](https://github.com/aximcode/axl-sdk-releases/blob/main/src/ipmi/axl-ipmi-ssif.c#L124) — SSIF read-retry exponential backoff (starts 60ms)
+      - [src/ipmi/axl-ipmi-ssif.c:304](https://github.com/aximcode/axl-sdk-releases/blob/main/src/ipmi/axl-ipmi-ssif.c#L304) — SSIF 60ms inter-command delay (spec-mandated for iDRAC/Grace)
+      - [src/ipmi/axl-ipmi-kcs.c:93](https://github.com/aximcode/axl-sdk-releases/blob/main/src/ipmi/axl-ipmi-kcs.c#L93) — KCS IBF-clear poll (100µs cadence, 5s timeout)
+      - [src/ipmi/axl-ipmi-kcs.c:125](https://github.com/aximcode/axl-sdk-releases/blob/main/src/ipmi/axl-ipmi-kcs.c#L125) — KCS OBF-set poll (100µs cadence)
 
       KCS's 100µs interval sits at the edge of `gBS` timer
       granularity (firmware timers typically snap to 100µs–1ms).
@@ -1263,16 +1263,16 @@ during code review and refactor work, not during original planning.
       sites as spin is defensible on latency grounds.
 
       _Shim / tests (low — negligible wall-time contribution):_
-      - [sdk/examples/smbus-hc-shim.c:267](../sdk/examples/smbus-hc-shim.c#L267) — SMBus wait-ready poll (1ms × 1s)
-      - [sdk/examples/smbus-hc-shim.c:287](../sdk/examples/smbus-hc-shim.c#L287) — SMBus run-and-wait poll (1ms × 1s)
-      - [test/unit/axl-test-net.c:247](../test/unit/axl-test-net.c#L247) — `axl_spin_usleep(10000)` in socket accept test
-      - [test/unit/axl-test-net.c:1502](../test/unit/axl-test-net.c#L1502) — same pattern in socket stream test
+      - [sdk/examples/smbus-hc-shim.c:267](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/smbus-hc-shim.c#L267) — SMBus wait-ready poll (1ms × 1s)
+      - [sdk/examples/smbus-hc-shim.c:287](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/smbus-hc-shim.c#L287) — SMBus run-and-wait poll (1ms × 1s)
+      - [test/unit/axl-test-net.c:247](https://github.com/aximcode/axl-sdk-releases/blob/main/test/unit/axl-test-net.c#L247) — `axl_spin_usleep(10000)` in socket accept test
+      - [test/unit/axl-test-net.c:1502](https://github.com/aximcode/axl-sdk-releases/blob/main/test/unit/axl-test-net.c#L1502) — same pattern in socket stream test
 
       _Legitimate busy-wait (leave alone):_
-      - [src/backend/native/axl-backend-native.c:1162](../src/backend/native/axl-backend-native.c#L1162) — the `gBS->Stall` wrapper itself
-      - [src/util/axl-time.c:47](../src/util/axl-time.c#L47), [:56](../src/util/axl-time.c#L56) — `timer_sleep_us` fallback when timer creation fails
-      - [src/util/axl-time.c:140-152](../src/util/axl-time.c#L140-L152) — `axl_spin_{sleep,msleep,usleep}` public busy-wait API
-      - [src/util/axl-sys.c:79](../src/util/axl-sys.c#L79) — `axl_stall()` public busy-wait wrapper
+      - [src/backend/native/axl-backend-native.c:1162](https://github.com/aximcode/axl-sdk-releases/blob/main/src/backend/native/axl-backend-native.c#L1162) — the `gBS->Stall` wrapper itself
+      - [src/util/axl-time.c:47](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/axl-time.c#L47), [:56](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/axl-time.c#L56) — `timer_sleep_us` fallback when timer creation fails
+      - [src/util/axl-time.c:140-152](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/axl-time.c#L140-L152) — `axl_spin_{sleep,msleep,usleep}` public busy-wait API
+      - [src/util/axl-sys.c:79](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/axl-sys.c#L79) — `axl_stall()` public busy-wait wrapper
 
       **Fix direction — layered API built on top of AxlLoop.**
 

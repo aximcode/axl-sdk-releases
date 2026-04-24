@@ -1,4 +1,4 @@
-Runtime Glue -- CRT0-owned init, signals, exit, atexit
+Runtime Glue — CRT0-owned init, signals, exit, atexit
 ======================================================
 
 The pieces an AXL app interacts with around its own lifecycle and
@@ -12,25 +12,25 @@ registry.
 
 Four sub-modules, each a single concern:
 
-- ``axl-runtime.c`` -- `_axl_init` / `_axl_cleanup`, the
+- ``axl-runtime.c`` — `_axl_init` / `_axl_cleanup`, the
   singleton `axl_loop_default()`, and `axl_yield`.
-- ``axl-registry.c`` -- tier-1 firmware-resource registry.
+- ``axl-registry.c`` — tier-1 firmware-resource registry.
   Internal-only API (`_axl_registry_*`) called by the `_new_impl` /
   `_free` paths of AxlEvent, AxlLoop, AxlCancellable, and AxlArena.
   Sweeps leaked resources during `_axl_cleanup`.
-- ``axl-atexit.c`` -- POSIX-flavored cleanup registry
+- ``axl-atexit.c`` — POSIX-flavored cleanup registry
   (`axl_atexit` / `axl_atexit_remove`). LIFO drain during
   `_axl_cleanup`, before the tier-1 sweep.
-- ``axl-signal.c`` -- `axl_signal_install` / `axl_interrupted` /
+- ``axl-signal.c`` — `axl_signal_install` / `axl_interrupted` /
   `axl_exit`. Hooked into loop break detection; invokes the user
   handler once per Ctrl-C and sets the interrupted flag.
 
 Headers:
 
-- ``<axl/axl-runtime.h>`` -- default loop, yield, registry count
-- ``<axl/axl-signal.h>`` -- interrupt API + blessed exit
-- ``<axl/axl-atexit.h>`` -- LIFO cleanup callbacks
-- ``<axl/axl-loop.h>`` -- includes ``axl_loop_iterate_until``
+- ``<axl/axl-runtime.h>`` — default loop, yield, registry count
+- ``<axl/axl-signal.h>`` — interrupt API + blessed exit
+- ``<axl/axl-atexit.h>`` — LIFO cleanup callbacks
+- ``<axl/axl-loop.h>`` — includes ``axl_loop_iterate_until``
   (nested-wait primitive), the loop-module partner for callers
   inside a callback that need to wait without freezing outer
   sources
@@ -87,14 +87,14 @@ between them. `_axl_cleanup` has a reentrancy guard: if
 
 `_axl_cleanup` runs these in order:
 
-1. **atexit callbacks** (LIFO) -- `_axl_atexit_run_all`. User
+1. **atexit callbacks** (LIFO) — `_axl_atexit_run_all`. User
    callbacks may free resources that would otherwise show up in
    the sweep.
-2. **argv strings** -- `_axl_args_free` in `src/posix/axl-app.c`.
-3. **Default loop** -- explicit `axl_loop_free(mDefaultLoop)` so
+2. **argv strings** — `_axl_args_free` in `src/posix/axl-app.c`.
+3. **Default loop** — explicit `axl_loop_free(mDefaultLoop)` so
    its registry entry comes off cleanly (otherwise sweep would
    flag it as a leak on every exit).
-4. **Tier-1 registry sweep** -- `_axl_registry_sweep`. LIFO walk
+4. **Tier-1 registry sweep** — `_axl_registry_sweep`. LIFO walk
    of live entries, each logged with user `file:line` and closed
    via the appropriate `_free`.
 5. **Heap leak report** (AXL_MEM_DEBUG only) --
@@ -117,16 +117,16 @@ wrapper. Library-internal callers (e.g., `axl_cancellable_new`
 internally calling `axl_event_new`) record the library's own file/
 line by design; library code that correctly frees never reaches
 the sweep, so the only way those appear is if the library itself
-leaks -- in which case the library source is the correct
+leaks — in which case the library source is the correct
 attribution.
 
 ## See also
 
-- [`docs/AXL-Runtime.md`](../../docs/AXL-Runtime.md) -- the design
+- [`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the design
   doc, now describing what landed.
-- [`docs/AXL-Concurrency.md`](../../docs/AXL-Concurrency.md) --
+- [`docs/AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) --
   primitive taxonomy; the runtime sits under these primitives.
-- [`sdk/examples/runtime-demo.c`](../../sdk/examples/runtime-demo.c)
-  -- eight subcommand scenarios exercising every facet.
-- [`src/loop/README.md`](../loop/README.md) -- `AxlLoop`,
+- [`sdk/examples/runtime-demo.c`](https://github.com/aximcode/axl-sdk-releases/blob/main/sdk/examples/runtime-demo.c)
+  — eight subcommand scenarios exercising every facet.
+- [`src/loop/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) — `AxlLoop`,
   `AxlDefer`, `AxlPubsub`, and the nested-wait primitive.

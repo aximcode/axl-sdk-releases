@@ -179,7 +179,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlStream, axl_fclose)
  * @brief Read size*count bytes from stream.
  *
  * Returns number of complete items read (may be less than count at
- * EOF or on error). Returns 0 on both EOF and error -- use axl_read()
+ * EOF or on error). Returns 0 on both EOF and error — use axl_read()
  * if you need to distinguish them (-1 = error, 0 = EOF).
  */
 size_t

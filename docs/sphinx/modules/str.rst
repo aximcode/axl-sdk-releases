@@ -1,4 +1,4 @@
-AxlStr -- String Utilities
+AxlStr — String Utilities
 ==========================
 
 See :doc:`data` for an overview of all data modules including string

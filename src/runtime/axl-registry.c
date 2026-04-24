@@ -174,7 +174,7 @@ _axl_registry_sweep(void)
         axl_warning("sweep: %s leaked at %s:%d -- closing",
                     kind_name(newest->kind), newest->file, newest->line);
 
-        /* Mark dead before calling _free -- the _free path calls back
+        /* Mark dead before calling _free — the _free path calls back
          * into _axl_registry_remove, which is then a safe no-op. */
         AxlResKind  kind     = newest->kind;
         void       *resource = newest->resource;

@@ -7,21 +7,22 @@ Individual headers can be included separately or use the umbrella
 
 Headers:
 
-- `<axl/axl-net.h>` -- Umbrella + network utilities
-- `<axl/axl-inet-address.h>` -- IP address and socket address types
-- `<axl/axl-socket.h>` -- Unified socket (stream/datagram)
-- `<axl/axl-socket-client.h>` -- High-level DNS + connect helper
-- `<axl/axl-tcp.h>` -- TCP sockets (low-level)
-- `<axl/axl-udp.h>` -- UDP sockets (low-level)
-- `<axl/axl-url.h>` -- URL parsing
-- `<axl/axl-http-server.h>` -- HTTP server
-- `<axl/axl-http-client.h>` -- HTTP client
-- `<axl/axl-tls.h>` -- TLS support (optional, requires `AXL_TLS=1`)
+- `<axl/axl-net.h>` — Umbrella + network utilities
+- `<axl/axl-inet-address.h>` — IP address and socket address types
+- `<axl/axl-socket.h>` — Unified socket (stream/datagram)
+- `<axl/axl-socket-client.h>` — High-level DNS + connect helper
+- `<axl/axl-tcp.h>` — TCP sockets (low-level)
+- `<axl/axl-udp.h>` — UDP sockets (low-level)
+- `<axl/axl-url.h>` — URL parsing
+- `<axl/axl-http-core.h>` — Low-level HTTP/1.1 parsing (shared by server + client)
+- `<axl/axl-http-server.h>` — HTTP server
+- `<axl/axl-http-client.h>` — HTTP client
+- `<axl/axl-tls.h>` — TLS support (optional, requires `AXL_TLS=1`)
 
 ## Overview
 
 AXL networking is built on UEFI's TCP4/UDP4 protocol stack. The stack
-must be initialized before use -- either by the UEFI Shell (`ifconfig`)
+must be initialized before use — either by the UEFI Shell (`ifconfig`)
 or by calling `axl_net_auto_init`.
 
 ```text
@@ -54,7 +55,7 @@ axl_net_set_static_ip(0, ip, netmask, gateway);
 
 ## Socket Layer
 
-`AxlSocket` is the recommended socket API for new code -- a
+`AxlSocket` is the recommended socket API for new code — a
 GLib-`GSocket`-shaped abstraction over both stream (TCP) and datagram
 (UDP) transports, with rich address types and blocking and async
 forms. It delegates to the low-level `AxlTcp` / `AxlUdpSocket`
@@ -232,7 +233,7 @@ axl_loop_run(loop);
 **Session-scoped cancellation:**
 
 Every `axl_tcp_*_async` call accepts an optional `AxlCancellable *`.
-Share one cancellable across all ops tied to a session -- closing the
+Share one cancellable across all ops tied to a session — closing the
 session cancels every in-flight op at once, each firing its callback
 with `status == AXL_CANCELLED`.
 
@@ -359,7 +360,7 @@ axl_http_server_run(s);  // serves HTTPS
 
 ### HTTPS Client
 
-HTTPS is automatic -- just use an `https://` URL:
+HTTPS is automatic — just use an `https://` URL:
 
 ```c
 AXL_AUTOPTR(AxlHttpClient) c = axl_http_client_new();
@@ -385,8 +386,8 @@ with SHA-256 signature:
 mbedTLS needs random numbers for key generation and TLS handshakes.
 AXL provides entropy via:
 
-1. **EFI_RNG_PROTOCOL** (hardware RNG) -- preferred, used when available
-2. **Software fallback** -- system time + monotonic counter mixing.
+1. **EFI_RNG_PROTOCOL** (hardware RNG) — preferred, used when available
+2. **Software fallback** — system time + monotonic counter mixing.
    A warning is logged when the fallback is used.
 
 ### Security Considerations

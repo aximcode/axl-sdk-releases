@@ -3,14 +3,14 @@ async work helpers.
 
 Headers:
 
-- `<axl/axl-task.h>` -- Arena allocator and AP task pool
-- `<axl/axl-buf-pool.h>` -- Preallocated buffer pool (LIFO free-stack)
-- `<axl/axl-async.h>` -- AP-offloaded async work
+- `<axl/axl-task.h>` — Arena allocator and AP task pool
+- `<axl/axl-buf-pool.h>` — Preallocated buffer pool (LIFO free-stack)
+- `<axl/axl-async.h>` — AP-offloaded async work
 
 ## Overview
 
-UEFI systems have multiple CPU cores, but only one -- the **Bootstrap
-Processor (BSP)** -- can call Boot Services (I/O, networking, protocol
+UEFI systems have multiple CPU cores, but only one — the **Bootstrap
+Processor (BSP)** — can call Boot Services (I/O, networking, protocol
 calls). The other cores are **Application Processors (APs)** that can
 run compute-heavy tasks in parallel.
 
@@ -107,10 +107,10 @@ axl_async_free(async);
 
 ## See also
 
-- [`docs/AXL-Concurrency.md`](../../docs/AXL-Concurrency.md) -- the
+- [`docs/AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the
   full primitive-selection taxonomy. `AxlTask` and `AxlAsync` are the
   "work offload" axis; the doc also covers `AxlLoop` (dispatch),
   `AxlEvent` / `AxlCancellable` / `AxlWait` (coordination), and
   `AxlPubsub` (notification).
-- [`src/event/README.md`](../event/README.md) -- the signalling
+- [`src/event/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md) — the signalling
   primitive to rendezvous with completed AP work.

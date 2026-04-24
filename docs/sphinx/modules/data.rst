@@ -1,4 +1,4 @@
-AxlData -- Data Structures
+AxlData — Data Structures
 ==========================
 
 .. include:: ../../../src/data/README.md
@@ -41,3 +41,11 @@ AxlRingBuf
 ~~~~~~~~~~
 
 .. doxygenfile:: axl-ring-buf.h
+
+AxlDigest
+~~~~~~~~~
+
+Message digest checksums (MD5, SHA-1, SHA-256). Standalone
+implementations — available even without ``AXL_TLS=1``.
+
+.. doxygenfile:: axl-digest.h

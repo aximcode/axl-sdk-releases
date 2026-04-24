@@ -24,6 +24,8 @@
 
 #include <stddef.h>
 
+#include <axl/axl-sys.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -185,6 +187,45 @@ axl_driver_get_image_path(void);
 int
 axl_driver_connect_handle(
     void *handle  ///< handle to connect (from axl_service_register, etc.)
+);
+
+/**
+ * @brief Ensure a protocol-providing driver is loaded.
+ *
+ * If @p protocol_guid is already registered (LocateProtocol succeeds),
+ * returns 0 immediately. Otherwise searches for @p driver_name and
+ * loads + starts the first match found, in this order:
+ *
+ *   1. drivers/<arch>/<driver_name> on the volume the running image
+ *      booted from
+ *   2. <image_dir>/<driver_name> in the running image's own directory
+ *   3. drivers/<driver_name> at the running image's volume root
+ *   4. drivers/<arch>/<driver_name> on every other mounted FAT volume
+ *
+ * The arch suffix is "x64" or "aa64", matching the running image's
+ * architecture. After load+start, LocateProtocol is re-checked; if
+ * the protocol still isn't registered, the driver is unloaded and
+ * the function returns -1.
+ *
+ * Safe to call multiple times — repeats short-circuit at step 1.
+ * EFI_ALREADY_STARTED on StartImage is treated as success.
+ *
+ * Typical use, before touching a driver-provided protocol:
+ * @code
+ * if (axl_driver_ensure(&EfiRamDiskProtocolGuid, "RamDiskDxe.efi") != 0) {
+ *     axl_printf("RamDiskDxe.efi not available\n");
+ *     return 1;
+ * }
+ * @endcode
+ *
+ * @return 0 if the protocol is registered (was already, or after
+ *     loading the driver); -1 if the driver wasn't found, failed to
+ *     load/start, or didn't register the protocol after starting.
+ */
+int
+axl_driver_ensure(
+    const AxlGuid *protocol_guid,  ///< protocol GUID to look up (must be non-NULL)
+    const char    *driver_name     ///< driver filename (e.g. "RamDiskDxe.efi")
 );
 
 /**

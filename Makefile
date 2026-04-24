@@ -152,13 +152,13 @@ LIB_SOURCES = \
     src/util/axl-path.c \
     src/util/axl-hexdump.c \
     src/util/axl-time.c \
-    src/util/axl-smbios.c \
     src/util/axl-env.c \
     src/util/axl-sys.c \
     src/util/axl-nvstore.c \
     src/util/axl-service.c \
     src/util/axl-driver.c \
     src/util/axl-config.c \
+    src/smbios/axl-smbios.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
@@ -342,6 +342,9 @@ $(BUILDDIR)/%.o: src/net/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/gfx/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/smbios/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/smbus/%.c | $(BUILDDIR)
@@ -671,7 +674,7 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sysinfo netinfo mkrd rfbrowse ipmi
+TOOL_NAMES = hexdump fetch find grep sysinfo netinfo mkrd rfbrowse ipmi dmidecode
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)

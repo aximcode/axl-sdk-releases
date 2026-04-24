@@ -1,4 +1,4 @@
-AxlIpmi -- Local BMC access
+AxlIpmi — Local BMC access
 ===========================
 
 .. include:: ../../../src/ipmi/README.md

@@ -1,7 +1,7 @@
 /** @file generated/status.h
     Auto-generated from UEFI Specification 2.11.
     EFI status codes from Appendix D.
-    Do not edit -- regenerate with scripts/generate-uefi-headers.py
+    Do not edit — regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_STATUS_H
