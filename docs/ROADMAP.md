@@ -15,7 +15,7 @@ Legend: [x] done, [ ] pending, [-] in progress
 
 - [x] Global symbol rename (UDK_ -> AXL_, Udk -> Axl)
 - [x] Directory and header renames
-- [x] Update all consumer repos (uefi-devkit, httpfs, softbmc, ipmitool)
+- [x] Update all consumer repos (uefi-devkit, axl-webfs, softbmc, ipmitool)
 
 ### Phase S1: axl_mem — DONE
 
@@ -66,7 +66,7 @@ Legend: [x] done, [ ] pending, [-] in progress
 - [x] Replace CopyMem/ZeroMem with axl_memcpy/axl_memset
 - [x] Replace AsciiSPrint with axl_snprintf
 - [x] AXL_LOG_DOMAIN in all modules
-- [x] Consumer projects updated (uefi-devkit, httpfs)
+- [x] Consumer projects updated (uefi-devkit, axl-webfs)
 
 ### Phase C3: Test Modernization — DONE
 
@@ -74,7 +74,7 @@ Legend: [x] done, [ ] pending, [-] in progress
 - [x] All 9 test files converted to AXL_APP entry points
 - [x] Wide-string test output replaced with axl_printf
 - [x] Test .inf files updated (_AxlEntry, AxlAppLib)
-- [ ] Consumer build verification in test-axl.sh (httpfs, uefi-devkit)
+- [ ] Consumer build verification in test-axl.sh (axl-webfs, uefi-devkit)
 
 ### Phase C4: Style Compliance Pass 2 — DONE
 
@@ -107,7 +107,7 @@ to anyone who knows GLib.
 - [x] AxlSList: add insert_before, remove_all/link, sort_with_data, copy_deep
 - [x] AxlQueue: add find, find_custom, remove, remove_all
 - [x] New shared types: AxlCompareDataFunc, AxlCopyFunc
-- [x] Update all consumers (tests, examples, httpfs)
+- [x] Update all consumers (tests, examples, axl-webfs)
 
 **Resolved divergences:**
 
@@ -519,7 +519,7 @@ void on_chunk_done(void *arg) {
 
 **Consumer projects:**
 - SoftBMC: firmware update endpoint, bulk SMBIOS collection
-- httpfs: WebDAV PUT (large file writes to UEFI filesystem)
+- axl-webfs: WebDAV PUT (large file writes to UEFI filesystem)
 - uefi-devkit: image deployment
 
 ### Phase A3: AxlDefer — deferred work queue — DONE
@@ -593,7 +593,7 @@ axl_pubsub_subscribe(loop, "ip-address-changed", api_update_endpoint, NULL);
 
 **Consumer projects:**
 - SoftBMC: decouple modules (network → splash, EC → sensors → REST API)
-- httpfs: filesystem mount/unmount notifications
+- axl-webfs: filesystem mount/unmount notifications
 - Any multi-module UEFI application built on AXL
 
 ### Phase A5: AxlEvent foundation + sync-primitive reorg — DONE
@@ -736,7 +736,7 @@ Deferred to a future phase (both captured in
 - [ ] **Release-mode heap auto-sweep.** `mAllocList` exists only
       under `AXL_MEM_DEBUG` today; making release-build sweeps
       possible costs ~16 bytes per allocation. Implement when a
-      long-running app like SoftBMC or persistent-service httpfs
+      long-running app like SoftBMC or persistent-service axl-webfs
       needs the firmware-pool safety net. Short-lived tool apps
       don't benefit -- firmware reboot reclaims pool memory.
 - [ ] **Watchdog opt-in** (`axl_watchdog_enable(seconds)`) --
@@ -1148,7 +1148,7 @@ during code review and refactor work, not during original planning.
             wants to block. **Not fixing preemptively.** Revisit
             when a real caller runs `axl_tcp_connect_async` on a
             shared loop and observes other sources going silent
-            during the Configure-retry window (candidates: httpfs
+            during the Configure-retry window (candidates: axl-webfs
             long-running server mode, SoftBMC-on-AXL). Proper fix
             shape: on `EFI_NO_MAPPING` store pending config in
             `AxlTcp`, register `axl_loop_add_timeout` for

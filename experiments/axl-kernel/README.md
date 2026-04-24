@@ -1,10 +1,11 @@
 # axl-kernel POC
 
-**Status:** K1 + K2 + K3 + K5 + K6 landed (April 2026), plus a
-second SoftBMC-shape port (BootConfig). All tests pass on both
-**X64 and AARCH64**. Experimental. Lives in-tree until the
-approach is validated, then graduates to its own repo
-`aximcode/axl-kernel` (see [docs/AXL-Kernel-Design.md §5](../../docs/AXL-Kernel-Design.md#5-relationship-to-axl-sdk)).
+**Status:** K1 + K2 + K3 + K5 + K6 landed (April 2026), plus two
+additional SoftBMC-shape ports (BootConfig — UEFI NVRAM; ReqLog —
+RAM-resident ring buffer). All tests pass on both **X64 and AARCH64**.
+Experimental. Lives in-tree until the approach is validated, then
+graduates to its own repo `aximcode/axl-kernel`
+(see [docs/AXL-Kernel-Design.md §5](../../docs/AXL-Kernel-Design.md#5-relationship-to-axl-sdk)).
 The K6 SoftBMC-HwInfo port is the design doc's go/no-go gate and
 it has passed — see the comparison section below.
 
@@ -32,6 +33,7 @@ timers, fd completions, and the shell-break event via
 | [test/axlk-echo-server.c](test/axlk-echo-server.c) | K3 driver — TCP echo server, fork-per-connection |
 | [test/axlk-hwinfo-server.c](test/axlk-hwinfo-server.c) | K6 driver — HTTP HwInfo server, SoftBMC-shape |
 | [test/axlk-bootconfig-server.c](test/axlk-bootconfig-server.c) | 2nd port — BootConfig (reads UEFI NVRAM, parses EFI_LOAD_OPTION) |
+| [test/axlk-reqlog-server.c](test/axlk-reqlog-server.c) | 3rd port — ReqLog (RAM-resident ring buffer, cross-request state) |
 
 Public API (entire surface):
 
@@ -41,6 +43,7 @@ int     axlk_init(void);
 int     axlk_run(AxlkProcMain entry, int argc, char **argv);
 AxlkPid axlk_spawn(AxlkProcMain, int argc, char **argv, size_t stack_kib);
 AxlkPid axlk_wait(AxlkPid pid, int *status);
+AxlkPid axlk_waitpid(AxlkPid pid, int *status, int flags); /* AXLK_WNOHANG */
 void    axlk_exit(int status) __attribute__((noreturn));
 void    axlk_yield(void);
 void    axlk_sleep_ms(uint32_t ms);
@@ -60,18 +63,20 @@ void    axlk_close(int fd);
 
 ```
 # X64 (native)
-make ARCH=x64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server
+make ARCH=x64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
 ./test/integration/test-kernel-poc.sh      --arch X64     # K1+K2
 ./test/integration/test-axlk-echo.sh       --arch X64     # K3
 ./test/integration/test-axlk-hwinfo.sh     --arch X64     # K6 (HwInfo port)
 ./test/integration/test-axlk-bootconfig.sh --arch X64     # BootConfig port
+./test/integration/test-axlk-reqlog.sh     --arch X64     # ReqLog port (RAM ring)
 
 # AARCH64 (cross)
-make ARCH=aa64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server
+make ARCH=aa64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server
 ./test/integration/test-kernel-poc.sh      --arch AARCH64 # K1+K2
 ./test/integration/test-axlk-echo.sh       --arch AARCH64 # K3
 ./test/integration/test-axlk-hwinfo.sh     --arch AARCH64 # K6
 ./test/integration/test-axlk-bootconfig.sh --arch AARCH64 # BootConfig port
+./test/integration/test-axlk-reqlog.sh     --arch AARCH64 # ReqLog port
 ```
 
 ## POC measurements (QEMU + KVM on the dev machine)
@@ -117,6 +122,37 @@ make ARCH=aa64 kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-se
 - Same sequential-process shape as HwInfo — validates the model
   holds when the workload moves from SMBIOS scrape to binary
   NVRAM parse.
+
+**3rd port — ReqLog (cross-request RAM state):**
+- The one shape the prior two don't cover: a module-level ring
+  buffer that *every* request mutates, with bounded memory and
+  observable cross-request side effects. SoftBMC's log ring,
+  telemetry counters, and session table all share this shape.
+- **3 endpoints**: `/` (overview: capacity, received, dropped,
+  head), `/log` (oldest→newest entries as JSON, up to capacity),
+  `/healthz` (varies the recorded path mix).
+- Test drives the ring past capacity to validate wrap-around and
+  that `dropped` increments. Receives 11 requests against an
+  8-entry ring and confirms `dropped=3`, `received=11`,
+  buffer holds the 8 most recent.
+- **No locks required.** Child handlers only yield on
+  `axlk_read` / `axlk_write`; the append between
+  "compute slot" and "store entry" has no syscall, so the
+  scheduler can't preempt mid-mutation. Counters increment
+  atomically from the scheduler's perspective. This is the
+  cooperative-coroutine analogue of "the kernel preemption
+  point can't fall here."
+- **Confirms the shared-address-space assumption.** All
+  "processes" are coroutines in one UEFI image, so a global
+  struct is shared by construction — handlers don't need IPC
+  to see each other's mutations. Tested directly: handlers
+  see the cumulative counter on every request.
+- Handles 24 sequential connections against a 16-slot PCB
+  by draining handler zombies inline via `axlk_waitpid(AXLK_PID_ANY,
+  NULL, AXLK_WNOHANG)` at the top of the accept loop. This is the
+  pattern services want: slots recycle immediately instead of
+  accumulating until the post-loop reap. Earlier revisions without
+  this primitive capped out at ~14 connections total.
 
 ## K6 go/no-go assessment — honest read
 
@@ -231,7 +267,7 @@ beyond the initial-rsp/entry setup.
 
 ### Where it stands
 
-Seven commits on `origin/main`, unpaused, tree clean:
+Eight commits on `origin/main`, unpaused, tree clean:
 
 | Commit | Scope |
 |---|---|
@@ -242,20 +278,27 @@ Seven commits on `origin/main`, unpaused, tree clean:
 | `4cf981d` | K6 — HwInfo port passes the go/no-go gate |
 | `3d31814` | K5 — AARCH64 support, all tests green on aa64 |
 | `f5c233d` | 2nd SoftBMC port — BootConfig reads UEFI NVRAM |
+| `(this)`  | 3rd SoftBMC port — ReqLog (RAM-resident ring buffer) |
 
 All integration tests pass on both X64 and AARCH64:
 - `test-kernel-poc.sh` — K1+K2 ping-pong + spawn/wait stress + canary (5/5)
 - `test-axlk-echo.sh` — K3 fork-per-connection echo (7/7)
 - `test-axlk-hwinfo.sh` — K6 HwInfo port (all endpoints)
 - `test-axlk-bootconfig.sh` — BootConfig port (all endpoints)
+- `test-axlk-reqlog.sh` — ReqLog port (ring wrap, drop counter, post-wrap log)
 
 ### What's been proved
 
 - Cooperative stackful coroutines work on UEFI, both archs.
 - fd table + TCP syscalls integrate cleanly with AxlLoop.
 - Linux-shape HTTP services port cleanly to the sequential-process model.
-- Two distinct SoftBMC workloads (SMBIOS scrape + NVRAM parse)
-  produce near-identical port shape — abstraction carries weight.
+- Three distinct SoftBMC workload shapes (stateless SMBIOS scrape,
+  NVRAM parse, RAM-resident ring buffer with cross-request mutation)
+  all produce near-identical port code — the abstraction carries
+  weight across the shape spectrum the design doc anticipated.
+- Cooperative scheduling makes per-request state mutation lock-free
+  by construction (no syscall between read-modify-write = no preempt
+  point), as confirmed by ReqLog's unlocked counter increments.
 - ~30 ns/switch on KVM; zero memory leaks across all scenarios.
 
 ### What's not yet proved (remaining risks)
@@ -263,32 +306,38 @@ All integration tests pass on both X64 and AARCH64:
 - **K4 deferred** — signals, pipes, signalfd, timerfd. None of
   the ports needed them, but inter-process communication /
   graceful shutdown may.
-- **POST / request-body parsing.** HwInfo and BootConfig are
-  GET-only. Mutation-shaped endpoints are untouched.
+- **POST / request-body parsing.** All three ports are GET-only.
+  Mutation endpoints with request bodies are untouched. (ReqLog
+  mutates state on every request, but via the URL-only side effect
+  of being recorded — no body parsing.)
 - **WebSocket / streaming.** SoftBMC RemoteKvm and RemoteShell
   use WS; not tried.
-- **Live cross-request in-memory state.** Ports so far are
-  stateless (SMBIOS rescan) or back to NVRAM (BootConfig).
-  A RAM-resident-state module (session counter, log ring) hasn't
-  been ported.
-- **Concurrency beyond 16 procs.** PCB table is fixed.
+- **True concurrency > 16 procs at once.** PCB table is fixed. The
+  new `axlk_waitpid(AXLK_WNOHANG)` primitive lets sequential
+  workloads run unbounded on a 16-slot table (as ReqLog's 24-conn
+  test shows), but genuinely concurrent fan-out is still capped.
+  Grow the table, or go dynamic.
 - **POST-abort cleanup.** Runaway / killed processes.
 
 ### Options when resuming, ranked
 
+The 3rd-port pressure test is now done; the design's last
+unvalidated shape (RAM-resident cross-request state) holds.
+Remaining options are all "extend a validated design":
+
 1. **Declare victory, spin off `aximcode/axl-kernel` repo.** The
-   POC has passed every gate in the design doc. Moving to a
-   dedicated repo lets it develop independently. This is my
-   recommendation — every remaining phase adds features to a
-   *validated* design, not validation of the design itself.
-2. **3rd port with RAM-resident cross-request state** (e.g.,
-   session counter or log-ring module). Last pressure test the
-   current design doesn't touch.
-3. **K4 — signals + pipes.** Next natural primitive. Unblocks
+   POC has now passed every shape the design doc anticipated
+   (K6 HwInfo, NVRAM, RAM ring) plus all named exit criteria.
+   This is the recommendation — every remaining phase adds
+   *features* to a validated design.
+2. **K4 — signals + pipes.** Next natural primitive. Unblocks
    SIGINT-to-group and shell-style pipelines.
-4. **POST + request-body parsing.** Small, unblocks mutation
+3. **POST + request-body parsing.** Small, unblocks mutation
    endpoints (set BootNext, etc.).
-5. **Concurrent-client stress, crash scenarios, 100-client flood.**
+4. **Concurrent-client stress, crash scenarios, 100-client flood.**
+   The sequential connection cap is now gone (WNOHANG), but
+   truly-concurrent fan-out beyond ~15 active children is still
+   bounded by the fixed PCB.
 
 ### To resume: reading order
 
@@ -297,9 +346,10 @@ All integration tests pass on both X64 and AARCH64:
    phase plan (status callouts on each phase) and §13 POC spec.
 3. [experiments/axl-kernel/src/kernel.c](src/kernel.c) — the
    scheduler + fd layer + syscall pattern.
-4. [experiments/axl-kernel/test/axlk-hwinfo-server.c](test/axlk-hwinfo-server.c)
-   and [axlk-bootconfig-server.c](test/axlk-bootconfig-server.c)
-   — reference port shapes.
+4. [experiments/axl-kernel/test/axlk-hwinfo-server.c](test/axlk-hwinfo-server.c),
+   [axlk-bootconfig-server.c](test/axlk-bootconfig-server.c),
+   and [axlk-reqlog-server.c](test/axlk-reqlog-server.c) —
+   reference port shapes (stateless / NVRAM / RAM-ring).
 
 ### Gotchas not to re-discover
 

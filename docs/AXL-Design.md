@@ -145,7 +145,7 @@ Global rename across all repositories. Mechanical, no logic changes.
 ### Affected repositories
 
 - `uefi-devkit` — AxlLib source, DevKitPkg consumers, docs
-- `httpfs` — HttpFsPkg.dsc references, WebDavFsDxe consumer
+- `axl-webfs` — HttpFsPkg.dsc references, axl-webfs-dxe consumer
 - `softbmc` — SoftBmcPkg.dsc references, all consumers
 - `uefi-ipmitool` — IpmiToolPkg.dsc references
 
@@ -156,7 +156,7 @@ Global rename across all repositories. Mechanical, no logic changes.
 3. Rename header files
 4. Update all .dsc/.inf/.dec files
 5. Build + test all projects
-6. Update external repos (httpfs, softbmc, ipmitool)
+6. Update external repos (axl-webfs, softbmc, ipmitool)
 
 ---
 
@@ -537,7 +537,7 @@ module the work is:
 7. Rename source files: `AxlFoo.c` → `axl-foo.c`
 8. Update tests to use new API names
 9. Remove old declarations from `Library/AxlLib.h`
-10. Update consumer projects (uefi-devkit, httpfs, uefi-ipmitool, softbmc)
+10. Update consumer projects (uefi-devkit, axl-webfs, uefi-ipmitool, softbmc)
 
 ### Backwards compatibility during migration
 
@@ -560,7 +560,7 @@ removed once all consumers have switched.
 | Project | Repo | Modules used | Notes |
 |---------|------|-------------|-------|
 | uefi-devkit | aximcode/uefi-devkit | Log, Data, Util, Loop, Task, Net | Heaviest consumer — all modules |
-| httpfs | aximcode/httpfs | Log, Data, Loop, Net | WebDavFsDxe uses Hash + HttpClient; HttpFS uses Loop + HttpServer |
+| axl-webfs | aximcode/axl-webfs | Log, Data, Loop, Net | axl-webfs-dxe uses Hash + HttpClient; axl-webfs uses Loop + HttpServer |
 | uefi-ipmitool | aximcode/uefi-ipmitool | (none yet) | Does not currently use AxlLib |
 | softbmc | aximcode/softbmc | Log, Data, Util, Loop, Net | Not yet migrated |
 
@@ -606,7 +606,7 @@ Consumer project changes for M1:
 - All projects defining `AXL_LOG_HANDLER` callbacks: update signature from
   `VOID EFIAPI (UINTN, CONST CHAR8*, CONST CHAR8*, VOID*)` to
   `void (int, const char*, const char*, void*)`
-- httpfs: no code changes needed (does not call log macros with format args
+- axl-webfs: no code changes needed (does not call log macros with format args
   or define handler callbacks). DSC needs `AxlFormatLib` line added.
 - uefi-ipmitool: no changes needed (does not use AxlLib)
 
@@ -618,7 +618,7 @@ Old: `AxlHashNew`, `AxlArrayAppend`, `AxlStrDup`, `AxlJsonParse`
 New: `axl_hash_table_new`, `axl_array_append`, `axl_strdup` (already exists), `axl_json_parse`
 
 Consumer project changes for M2:
-- httpfs (WebDavFsDxe): uses `AxlHashNew`, `AxlHashSet`, `AxlHashFree`,
+- axl-webfs (axl-webfs-dxe): uses `AxlHashNew`, `AxlHashSet`, `AxlHashFree`,
   `AXL_HASH_TABLE`. Compat macros cover function renames. Type rename
   `AXL_HASH_TABLE` → `AxlHashTable` needs a compat `#define`.
 - uefi-devkit: uses hash, array, string, JSON extensively. Compat macros
@@ -651,7 +651,7 @@ Old: `AxlLoopNew`, `AxlLoopRun`, `AxlLoopAddTimer`
 New: `axl_loop_new`, `axl_loop_run`, `axl_loop_add_timer`
 
 Consumer project changes for M4:
-- httpfs (HttpFS serve command): uses AxlLoop for HTTP server event loop.
+- axl-webfs (axl-webfs serve command): uses AxlLoop for HTTP server event loop.
   Compat macros cover function renames. Callback types (`AXL_CALLBACK`,
   `AXL_KEY_CALLBACK`) will be renamed — compat `#define` needed.
 - uefi-devkit: several tools use AxlLoop. Same compat approach.
@@ -715,7 +715,7 @@ Consumer project changes for M5:
 - uefi-devkit: SysInfo uses task pool for parallel CPU/memory probing.
   Compat macros cover function renames. Callback types
   (`AXL_TASK_PROC`, `AXL_TASK_COMPLETE`) will be renamed.
-- httpfs, uefi-ipmitool: do not use AxlTask. No changes needed.
+- axl-webfs, uefi-ipmitool: do not use AxlTask. No changes needed.
 
 ### M6: Migrate AxlNet
 
@@ -725,12 +725,12 @@ Old: `AxlTcpConnect`, `AxlHttpServerNew`, `AxlUrlParse`
 New: `axl_tcp_connect`, `axl_http_server_new`, `axl_url_parse`
 
 Consumer project changes for M6:
-- httpfs (WebDavFsDxe): uses `AxlHttpClientNew`, `AxlHttpGet`,
+- axl-webfs (axl-webfs-dxe): uses `AxlHttpClientNew`, `AxlHttpGet`,
   `AxlHttpRequest`, `AxlHttpClientResponseFree`, `AxlHttpClientFree`.
   Compat macros cover function renames. Type renames
   (`AXL_HTTP_CLIENT` → `AxlHttpClient`, `AXL_HTTP_CLIENT_RESPONSE` →
   `AxlHttpResponse`) need compat `#define`.
-- httpfs (HttpFS serve): uses `AxlHttpServer*` extensively. Same approach.
+- axl-webfs (axl-webfs serve): uses `AxlHttpServer*` extensively. Same approach.
 - uefi-devkit (Fetch): uses HTTP client. Compat macros cover it.
 - uefi-ipmitool: does not use AxlNet. No changes needed.
 
@@ -756,7 +756,7 @@ Scope:
   that no longer use UEFI APIs directly
 
 Files: all `axl-*.c` and `axl-*.h` under `src/` and `include/`.
-Consumer projects: httpfs, uefi-devkit (if affected).
+Consumer projects: axl-webfs, uefi-devkit (if affected).
 
 ### C2: Dogfooding
 
@@ -800,7 +800,7 @@ Scope:
 - **Test .inf cleanup:** standardize `[LibraryClasses]` across all
   test .inf files (add AxlAppLib, remove UefiApplicationEntryPoint
   where possible).
-- **Consumer test coverage:** add build verification for httpfs and
+- **Consumer test coverage:** add build verification for axl-webfs and
   uefi-devkit as part of the test-axl.sh runner.
 
 ---
@@ -934,7 +934,7 @@ types in public API, no space before parens.
 
 **Name:** `aximcode/axl-sdk` (public repo)
 
-AXL is a standalone library. Consumer projects (uefi-devkit, httpfs,
+AXL is a standalone library. Consumer projects (uefi-devkit, axl-webfs,
 ipmitool) depend on it via `axl-cc` or CMake integration.
 
 ### Versioning

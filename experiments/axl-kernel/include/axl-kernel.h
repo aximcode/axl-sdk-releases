@@ -28,6 +28,10 @@ extern "C" {
 typedef int32_t AxlkPid;
 #define AXLK_PID_ANY ((AxlkPid)-1)
 
+/** @brief Flag for axlk_waitpid: return 0 immediately if no child is
+ *  ready, instead of blocking. Matches POSIX WNOHANG semantics. */
+#define AXLK_WNOHANG 1
+
 typedef int (*AxlkProcMain)(int argc, char **argv);
 
 /**
@@ -79,11 +83,36 @@ void axlk_exit(int status) __attribute__((noreturn));
  * receives the exit status.
  *
  * @return the pid that exited, or -1 if no children exist.
+ *
+ * Thin wrapper around axlk_waitpid(pid, status, 0).
  */
 AxlkPid
 axlk_wait(
     AxlkPid  pid,
     int    *status
+);
+
+/**
+ * @brief POSIX-shaped waitpid. Reaps a child; optionally non-blocking.
+ *
+ * @p pid = AXLK_PID_ANY waits for any child. @p status (if non-NULL)
+ * receives the exit status on a successful reap.
+ *
+ * Without AXLK_WNOHANG: blocks until a matching child exits, exactly
+ * like axlk_wait.
+ *
+ * With AXLK_WNOHANG: returns 0 immediately if a matching child exists
+ * but hasn't exited yet. This is the pattern services want for
+ * draining zombies between accepts without blocking the accept loop.
+ *
+ * @return > 0 reaped pid, 0 if WNOHANG and no child ready,
+ *         -1 if no matching child exists at all.
+ */
+AxlkPid
+axlk_waitpid(
+    AxlkPid  pid,
+    int    *status,
+    int      flags    ///< 0 or AXLK_WNOHANG
 );
 
 /** @brief Yield the CPU back to the scheduler. */

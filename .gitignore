@@ -22,3 +22,5 @@ SCRATCH.md
 .env
 .envrc
 .env.*
+CLAUDE.md
+.claude/settings.local.json

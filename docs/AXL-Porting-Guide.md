@@ -24,14 +24,14 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 | AsciiStr*/StrCmp/StrLen | axl_str* / standard C | Everything |
 | utf8 to/from ucs2 | axl_utf8_to_ucs2/ucs2_to_utf8 | Everything |
 | GOP->Blt | axl_gfx_* | SoftBMC Splash, RemoteKVM |
-| TCP4 protocol | axl_tcp_* | SoftBMC HttpServer, httpfs |
-| HTTP client/server | axl_http_* | Fetch, httpfs CmdServe, SoftBMC |
+| TCP4 protocol | axl_tcp_* | SoftBMC HttpServer, axl-webfs |
+| HTTP client/server | axl_http_* | Fetch, axl-webfs serve command, SoftBMC |
 | SMBIOS tables | axl_smbios_* | SysInfo, SoftBMC HwInfo |
 | Shell env/cwd | axl_getenv/setenv/chdir | Shell integration |
-| Driver load/connect | axl_driver_* | httpfs CmdMount |
+| Driver load/connect | axl_driver_* | axl-webfs mount command |
 | System reset | axl_reset | SoftBMC PowerControl |
-| Map refresh | axl_map_refresh | httpfs CmdMount |
-| Event loop + timers | axl_loop_* | SoftBMC, httpfs |
+| Map refresh | axl_map_refresh | axl-webfs mount command |
+| Event loop + timers | axl_loop_* | SoftBMC, axl-webfs |
 | Deferred work | axl_defer | SoftBMC event handling |
 | Pub/sub events | axl_pubsub_* | SoftBMC module decoupling |
 | Buffer pool | axl_buf_pool_* | SoftBMC VNC tiles |
@@ -54,20 +54,20 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 | Missing API | Needed by | What it does | Effort |
 |-------------|-----------|-------------|--------|
 | UEFI variable access | SoftBMC Config, SysInfo | gRT->GetVariable/SetVariable for persistent config, Secure Boot info | Medium |
-| Protocol locate/enumerate | SoftBMC, httpfs, SysInfo, NetInfo | gBS->LocateProtocol, LocateHandleBuffer, HandleProtocol | Medium |
-| Device path helpers | httpfs CmdMount, MkRd | FileDevicePath, IsDevicePathEnd, NextDevicePathNode | Medium |
+| Protocol locate/enumerate | SoftBMC, axl-webfs, SysInfo, NetInfo | gBS->LocateProtocol, LocateHandleBuffer, HandleProtocol | Medium |
+| Device path helpers | axl-webfs mount command, MkRd | FileDevicePath, IsDevicePathEnd, NextDevicePathNode | Medium |
 | UDP socket | SoftBMC (SNMP, Syslog) | Send/receive UDP datagrams | Medium |
 
 ### Tier 2: Needed by 1 project, critical for it
 
 | Missing API | Needed by | What it does | Effort |
 |-------------|-----------|-------------|--------|
-| Protocol install/uninstall | httpfs WebDavFsDxe driver | gBS->InstallMultipleProtocolInterfaces | Medium |
-| EFI_FILE_PROTOCOL types | httpfs driver | Type definitions for the protocol the driver implements | Low |
-| EFI_SIMPLE_FILE_SYSTEM_PROTOCOL | httpfs driver | The protocol the driver installs | Low |
+| Protocol install/uninstall | axl-webfs axl-webfs-dxe driver | gBS->InstallMultipleProtocolInterfaces | Medium |
+| EFI_FILE_PROTOCOL types | axl-webfs driver | Type definitions for the protocol the driver implements | Low |
+| EFI_SIMPLE_FILE_SYSTEM_PROTOCOL | axl-webfs driver | The protocol the driver installs | Low |
 | Physical memory | MkRd | AllocatePages/FreePages | Low |
 | RAM disk protocol | MkRd, SoftBMC VirtualMedia | Register memory as a disk | Low |
-| Network init (DHCP/IP config) | SoftBMC Network, httpfs NetworkLib | Full NIC init with DHCP | High |
+| Network init (DHCP/IP config) | SoftBMC Network, axl-webfs NetworkLib | Full NIC init with DHCP | High |
 
 ### Tier 3: Nice to have / can work around
 
@@ -76,7 +76,7 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 | PCI/ACPI/USB/TPM enumeration | SoftBMC HwInfo | Limit to SMBIOS-only |
 | HII database (UEFI Setup) | SoftBMC UefiSetup | Replace with web-based config |
 | Ctrl-C / break flag | Grep, Find | Drop or poll stdin |
-| gRT->GetTime (wall clock) | SoftBMC, httpfs cache | axl_time_* (partial) |
+| gRT->GetTime (wall clock) | SoftBMC, axl-webfs cache | axl_time_* (partial) |
 | Spinlocks | SoftBMC RemoteKVM | Refactor for single-threaded event model |
 
 ---
@@ -95,13 +95,13 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 | **MkRd** | Blocked | Needs RAM disk + physical memory + device paths | Very High |
 | **NetInfo** | Blocked | Needs raw network protocols (SNP, IP4, ICMP) | Very High |
 
-### httpfs
+### axl-webfs
 
 | Component | Status | Blocker | Effort |
 |-----------|--------|---------|--------|
 | **CmdServe** | Ready | Already uses AXL HTTP server, minor cleanup | Low |
 | **CmdMount** | Blocked | Protocol locate + device paths + driver loading | High |
-| **WebDavFsDxe driver** | Blocked | Protocol install, FILE_PROTOCOL implementation | Very High |
+| **axl-webfs-dxe driver** | Blocked | Protocol install, FILE_PROTOCOL implementation | Very High |
 | **FileTransferLib** | Blocked | SimpleFileSystem protocol discovery | High |
 | **NetworkLib** | Blocked | SNP, DHCP4, IP4Config2, ServiceBinding | Very High |
 | **JsonLib** | Ready | Minimal UEFI dependency (string ops only) | Low |
@@ -136,7 +136,7 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 
 ### Phase 1: Port the easy wins (unblocks 4 apps)
 
-Fetch, Grep, Find, and httpfs CmdServe can all be ported today with
+Fetch, Grep, Find, and axl-webfs serve command can all be ported today with
 existing AXL APIs. Just mechanical rewrites (Print to printf, EDK2
 types to C types, AXL_APP entry point).
 
@@ -149,7 +149,7 @@ int axl_nvstore_set(const char *ns, const char *key, const void *buf, size_t siz
 
 Platform-agnostic persistent storage. Namespaces: `"global"`, `"app"`.
 
-### Phase 3: Service registry (unblocks httpfs CmdMount + driver) — DONE
+### Phase 3: Service registry (unblocks axl-webfs mount command + driver) — DONE
 
 ```c
 int axl_service_find(const char *name, void **interface);
@@ -481,7 +481,7 @@ The consumer gets names, paths, and sizes — not handles and GUIDs.
 
 **Category 3: "I AM a protocol provider" (drivers)**
 
-Examples: httpfs WebDavFsDxe installs EFI_SIMPLE_FILE_SYSTEM_PROTOCOL.
+Examples: axl-webfs axl-webfs-dxe installs EFI_SIMPLE_FILE_SYSTEM_PROTOCOL.
 
 Strategy: **AXL provides types, helpers, and wrappers — but the driver
 model is inherently visible.** A driver that installs a protocol IS the

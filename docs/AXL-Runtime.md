@@ -1035,7 +1035,7 @@ pointers out of the debug gate (cost: ~16 bytes per allocation on
 x64 in release).
 
 **Implement when:** we have a long-running app (e.g. SoftBMC,
-httpfs running as a persistent service) where leaked heap survives
+axl-webfs running as a persistent service) where leaked heap survives
 long enough to matter. Short-lived tool-style apps (fetch, sysinfo,
 etc.) don't benefit meaningfully -- the firmware reboot reclaims
 pool memory anyway.

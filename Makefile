@@ -277,7 +277,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server tests tools check-version
+.PHONY: all clean hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -573,6 +573,7 @@ KERNEL_POC_OBJS     = $(KERNEL_CORE_OBJS) $(BUILDDIR)/kernel-poc.o
 AXLK_ECHO_OBJS      = $(KERNEL_CORE_OBJS) $(BUILDDIR)/axlk-echo-server.o
 AXLK_HWINFO_OBJS    = $(KERNEL_CORE_OBJS) $(BUILDDIR)/axlk-hwinfo-server.o
 AXLK_BOOTCFG_OBJS   = $(KERNEL_CORE_OBJS) $(BUILDDIR)/axlk-bootconfig-server.o
+AXLK_REQLOG_OBJS    = $(KERNEL_CORE_OBJS) $(BUILDDIR)/axlk-reqlog-server.o
 
 kernel-poc: $(PREFIX)/AxlKernelPoc.efi
 	@echo "  Built: $(PREFIX)/AxlKernelPoc.efi"
@@ -586,6 +587,9 @@ axlk-hwinfo-server: $(PREFIX)/axlk-hwinfo-server.efi
 axlk-bootconfig-server: $(PREFIX)/axlk-bootconfig-server.efi
 	@echo "  Built: $(PREFIX)/axlk-bootconfig-server.efi"
 
+axlk-reqlog-server: $(PREFIX)/axlk-reqlog-server.efi
+	@echo "  Built: $(PREFIX)/axlk-reqlog-server.efi"
+
 $(PREFIX)/AxlKernelPoc.efi: $(KERNEL_POC_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(KERNEL_POC_OBJS),$@)
 
@@ -597,6 +601,9 @@ $(PREFIX)/axlk-hwinfo-server.efi: $(AXLK_HWINFO_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/
 
 $(PREFIX)/axlk-bootconfig-server.efi: $(AXLK_BOOTCFG_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(AXLK_BOOTCFG_OBJS),$@)
+
+$(PREFIX)/axlk-reqlog-server.efi: $(AXLK_REQLOG_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(AXLK_REQLOG_OBJS),$@)
 
 $(BUILDDIR)/axl-kernel-ctx-switch.o: $(KERNEL_CTX_SRC) | $(BUILDDIR)
 	$(CC) $(CFLAGS_BASE) -c $< -o $@
@@ -614,6 +621,9 @@ $(BUILDDIR)/axlk-hwinfo-server.o: $(KERNEL_POC_DIR)/test/axlk-hwinfo-server.c | 
 	$(CC) $(CFLAGS) $(INCLUDES) $(KERNEL_POC_INC) -c $< -o $@
 
 $(BUILDDIR)/axlk-bootconfig-server.o: $(KERNEL_POC_DIR)/test/axlk-bootconfig-server.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) $(KERNEL_POC_INC) -c $< -o $@
+
+$(BUILDDIR)/axlk-reqlog-server.o: $(KERNEL_POC_DIR)/test/axlk-reqlog-server.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(KERNEL_POC_INC) -c $< -o $@
 
 

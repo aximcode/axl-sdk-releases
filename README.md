@@ -104,6 +104,40 @@ linker only pulls in mbedtls .o files when actually used. Users
 who want an even smaller `libaxl.a` can rebuild from source
 with `AXL_TLS=0`.
 
+**Windows (WSL):** install the Debian or RHEL package inside
+Ubuntu / Debian / Fedora WSL — the `.deb` / `.rpm` paths above
+work unchanged. `axl-cc` runs in the WSL shell; point your
+Windows editor at the WSL filesystem (`\\wsl$\Ubuntu\...`) and
+the resulting `.efi` is a real PE32+ that boots on any UEFI
+system. This is the path we recommend — no separate packaging,
+no parallel toolchain to maintain.
+
+**Windows (native MSYS2 / MinGW-w64):** no binary package yet.
+Build from source under an MSYS2 UCRT64 shell with
+`pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils`
+installed, then `make` as on Linux. Cross-aa64 needs an
+aarch64 ELF cross-toolchain (e.g. an `aarch64-*-gcc` from
+MSYS2 or from Arm's GNU toolchain archives); point at it with
+`make ARCH=aa64 CROSS=<prefix>-`.
+
+**macOS:** no binary package yet. Install cross-toolchains via
+the [messense tap](https://github.com/messense/homebrew-macos-cross-toolchains):
+
+```bash
+brew tap messense/macos-cross-toolchains
+brew install x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+git clone https://github.com/aximcode/axl-sdk-releases.git
+cd axl-sdk-releases
+make            CROSS=x86_64-unknown-linux-gnu-              # x64
+make ARCH=aa64  CROSS=aarch64-unknown-linux-gnu-             # aa64
+```
+
+Native Apple Clang can't produce the ELF intermediates AXL
+needs (we run `gcc → ld -T linker.lds → objcopy --target pei-*`);
+a GNU cross-toolchain is required. The `linux-gnu` triple is
+fine — `libaxl.a` is built `-ffreestanding -nostdlib`, so none
+of the glibc baggage gets linked into your `.efi`.
+
 **Pin a specific version:** use the versioned URL pattern
 `https://github.com/aximcode/axl-sdk-releases/releases/download/v<version>/<file>`.
 Each release publishes a `SHA256SUMS` alongside the packages.
@@ -127,10 +161,24 @@ curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/a
 curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-tools-aa64.tar.gz
 ```
 
-Extract to a FAT-formatted USB stick, boot to the UEFI Shell, run
-a tool with `--help`. Includes `mkrd`, `hexdump`, `fetch`, `find`,
-`grep`, `sysinfo`, `netinfo`, `ipmi`, `rfbrowse`. Built with TLS
-so `fetch` handles HTTPS and `rfbrowse` (Redfish) works.
+Extract to a FAT-formatted USB stick, boot to the UEFI Shell, and
+run any tool with `-h` / `--help` for its option list. The tarball
+ships these `.efi` binaries:
+
+| Tool       | Description |
+|------------|-------------|
+| `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
+| `find`     | Recursive file and directory finder — glob patterns (`--name '*.efi'`) and type filter (`--type f` or `d`). UEFI `find(1)` equivalent. |
+| `grep`     | Pattern search across files — case-insensitive (`-i`), line numbers (`-n`), match count (`-c`), recursive (`-r`). UEFI `grep(1)` equivalent. |
+| `hexdump`  | Hex/ASCII file viewer (`xxd`-style) — seekable with `--offset`/`--length`. |
+| `ipmi`     | Stripped-down `ipmitool` built on AxlIpmi: `info`, `chassis status`/`power on\|off\|cycle\|reset`, `sel list`, `sdr list`, `sensor`, `fru list`, and raw command passthrough (`raw <netfn> <cmd> ...`). |
+| `mkrd`     | Create / list / destroy FAT16/FAT32 RAM disks in the UEFI Shell (`mkrd <label> [-s size]`, `-l`, `-d <label>`). Handy for staging files without writing to flash. |
+| `netinfo`  | Network interface diagnostics and ping — lists NICs with IP/MAC/link state, pings with `-c <count>`. UEFI `ifconfig`/`ping` equivalent. |
+| `rfbrowse` | Redfish browser — connects to a BMC over HTTPS and walks resources interactively (shortcut verbs for `/Systems`, `/Managers`, etc., plus arbitrary paths). |
+| `sysinfo`  | System inventory (UEFI `lshw`/`dmidecode` equivalent) — `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. |
+
+Built with TLS enabled so `fetch` handles HTTPS and `rfbrowse`
+(Redfish over HTTPS) works against real BMCs.
 
 ### Build an app
 
@@ -223,6 +271,25 @@ TLS support uses [mbedTLS](https://github.com/Mbed-TLS/mbedtls)
 (v3.6.3) as a git submodule. Build with `AXL_TLS=1` to enable
 HTTPS server/client and self-signed certificate generation.
 
+## Built with AXL
+
+Real projects that use this SDK as their only UEFI dependency:
+
+- **[aximcode/axl-webfs](https://github.com/aximcode/axl-webfs)** — bidirectional
+  file transfer and remote filesystem access for UEFI. Ships a CLI app
+  (`serve`, `mount`, `umount`) *and* a resident DXE driver
+  (`axl-webfs-dxe.efi`) that exposes a workstation directory as a UEFI
+  volume (`fsN:`) — live-edit files on your laptop, run them immediately
+  in the UEFI shell. Built entirely with `axl-cc`, no EDK2.
+
+- **[aximcode/uefi-devkit](https://github.com/aximcode/uefi-devkit)** —
+  build orchestrator + bootable USB image that bundles the axl-sdk tools
+  (`sysinfo`, `netinfo`, `grep`, `find`, `hexdump`, `fetch`, `ipmi`,
+  `rfbrowse`) plus a crash handler into a multi-arch (x64+aa64)
+  troubleshooting stick.
+
+If you've built something with AXL and want it listed here, open a PR.
+
 ## Status
 
 AXL is under active development. The core library is stable with
@@ -239,3 +306,12 @@ for attribution of vendored components.
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
 the DCO sign-off requirement and the contributor-license grant that
 keeps commercial-licensing options open for the project.
+
+## Contact
+
+- **Questions, issues, bug reports** — file an issue on
+  [aximcode/axl-sdk-releases](https://github.com/aximcode/axl-sdk-releases/issues).
+- **Security reports** — see [SECURITY.md](SECURITY.md).
+- **Other inquiries** — `support@aximcode.com`.
+
+AXL is developed by [AximCode](https://aximcode.com).

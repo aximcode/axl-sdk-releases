@@ -25,8 +25,8 @@
 #   ./scripts/run-qemu.sh --arch AARCH64 hello.efi
 #   ./scripts/run-qemu.sh --raw hello.efi
 #   ./scripts/run-qemu.sh driver.efi          # auto-detects driver, uses "load"
-#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 HttpFS.efi serve -p 8080
-#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 --background HttpFS.efi serve
+#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 axl-webfs.efi serve -p 8080
+#   ./scripts/run-qemu.sh --net --hostfwd 18080:8080 --background axl-webfs.efi serve
 
 set -euo pipefail
 
@@ -81,8 +81,8 @@ Options:
 
 Examples:
   run-qemu.sh hello.efi
-  run-qemu.sh --net --hostfwd 18080:8080 HttpFS.efi serve -p 8080
-  run-qemu.sh --net --extra WebDavFsDxe.efi --nsh test.nsh HttpFS.efi
+  run-qemu.sh --net --hostfwd 18080:8080 axl-webfs.efi serve -p 8080
+  run-qemu.sh --net --extra axl-webfs-dxe.efi --nsh test.nsh axl-webfs.efi
 HELP
             exit 0 ;;
         *)

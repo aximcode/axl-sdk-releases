@@ -73,7 +73,7 @@ parsing AND for runtime configuration, duplicating descriptors.
 
 **Consumer-facing (the biggest win):**
 
-- Any AXL app's own configuration — httpfs's server settings,
+- Any AXL app's own configuration — axl-webfs's server settings,
   uefi-devkit tool options. The unified system would let consumer
   apps define their options once and populate them from command-line
   args, config files, or programmatic calls.

@@ -13,10 +13,10 @@
 #define AXL_MBEDTLS_CONFIG_H
 
 /* Clang targeting windows defines _MSC_VER but we're not MSVC.
-   Pre-define these to prevent mbedTLS from including <sal.h>. */
+   Pre-defining MBEDTLS_CHECK_RETURN prevents mbedTLS from including <sal.h>.
+   Don't pre-define _TYPICAL / _OPTIONAL — platform_util.h defines those
+   unconditionally, so predefining them here produces redefinition warnings. */
 #define MBEDTLS_CHECK_RETURN  __attribute__((warn_unused_result))
-#define MBEDTLS_CHECK_RETURN_TYPICAL  MBEDTLS_CHECK_RETURN
-#define MBEDTLS_CHECK_RETURN_OPTIONAL
 
 /* Platform */
 #define MBEDTLS_HAVE_ASM

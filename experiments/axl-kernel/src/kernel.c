@@ -443,7 +443,7 @@ axlk_exit(int status)
 }
 
 AxlkPid
-axlk_wait(AxlkPid pid, int *status)
+axlk_waitpid(AxlkPid pid, int *status, int flags)
 {
     AxlkProc *self = current_proc;
     if (self == NULL) {
@@ -485,13 +485,24 @@ axlk_wait(AxlkPid pid, int *status)
             return -1;
         }
 
-        /* Block. */
+        /* Matching child exists but isn't a zombie. POSIX WNOHANG
+         * returns 0 here; blocking callers drop into the ctx switch. */
+        if (flags & AXLK_WNOHANG) {
+            return 0;
+        }
+
         self->state        = AXLK_PROC_WAITING;
         self->wait_for_pid = pid;
         current_proc = NULL;
         axlk_ctx_switch(&self->ctx, &sched_ctx);
         /* Resumed — check the zombie list again. */
     }
+}
+
+AxlkPid
+axlk_wait(AxlkPid pid, int *status)
+{
+    return axlk_waitpid(pid, status, 0);
 }
 
 AxlkPid

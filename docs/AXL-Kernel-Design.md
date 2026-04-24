@@ -199,6 +199,7 @@ resume on ready.
 /* Process control */
 AxlPid axl_spawn(AxlProcMain, int argc, char **argv, size_t stack_kib);
 int    axl_wait(AxlPid, int *status);           /* -1 = any child */
+int    axl_waitpid(AxlPid, int *status, int flags); /* AXL_WNOHANG */
 void   axl_exit(int status)   AXL_NORETURN;
 AxlPid axl_getpid(void);
 AxlPid axl_getppid(void);
@@ -434,8 +435,14 @@ Each phase ends with a demo that validates the plan before
 committing to the next. No phase is more than 2 weeks of work.
 
 **Current status (as of last work session):** K1, K2, K3, K5, K6
-landed and pushed, plus a second SoftBMC-shape port (BootConfig).
-K4, K7–K9 not started. Work is paused — see the §9.x status
+landed and pushed, plus two additional SoftBMC-shape ports
+(BootConfig — UEFI NVRAM; ReqLog — RAM-resident ring buffer with
+per-request mutation). The three ports together cover the full
+shape spectrum the design anticipated: stateless, firmware-backed,
+and live RAM state. `axl_waitpid(WNOHANG)` added to lift the
+accept-then-spawn pattern's sequential-connection cap (ReqLog
+demonstrates 24 connections against a 16-slot PCB with inline
+zombie draining). K4, K7–K9 not started. See the §9.x status
 callouts below and
 [experiments/axl-kernel/README.md](../experiments/axl-kernel/README.md)
 for resume context.
@@ -1144,6 +1151,7 @@ int  axl_kernel_run(AxlProcMain pid1_entry, int argc, char **argv);
 /* Process control */
 AxlPid axl_spawn(AxlProcMain, int argc, char **argv, size_t stack_kib);
 int    axl_wait(AxlPid pid, int *status);       /* AXL_PID_ANY = any child */
+int    axl_waitpid(AxlPid pid, int *status, int flags);  /* AXL_WNOHANG */
 void   axl_exit(int status) __attribute__((noreturn));
 AxlPid axl_getpid(void);
 AxlPid axl_getppid(void);
