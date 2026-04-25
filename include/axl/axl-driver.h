@@ -190,6 +190,42 @@ axl_driver_connect_handle(
 );
 
 /**
+ * @brief Find a driver file on disk without loading it.
+ *
+ * Walks the same search order axl_driver_ensure() uses (image's
+ * `drivers/<arch>/`, image's own directory, image's `drivers/`,
+ * other volumes' `drivers/<arch>/`) and writes the first matching
+ * existing path to @p out.
+ *
+ * Useful when the caller needs to control the LoadImage / StartImage
+ * lifecycle directly — for example, to set load options between the
+ * two for a driver that takes per-invocation configuration:
+ * @code
+ * char path[256];
+ * if (axl_driver_locate("axl-webfs-dxe.efi", path, sizeof(path)) != 0) {
+ *     axl_printf("axl-webfs-dxe.efi not found\n");
+ *     return 1;
+ * }
+ * AxlDriverHandle h;
+ * axl_driver_load(path, &h);
+ * axl_driver_set_load_options(h, url_w, url_size);
+ * axl_driver_start(h);
+ * @endcode
+ *
+ * Same trust caveat as axl_driver_ensure: searches every mounted FAT
+ * volume. Don't pass attacker-controlled @p driver_name.
+ *
+ * @return 0 on success (path written to @p out), -1 if the driver
+ *     wasn't found or @p out is too small to hold the result.
+ */
+int
+axl_driver_locate(
+    const char *driver_name,  ///< driver filename (e.g. "axl-webfs-dxe.efi")
+    char       *out,          ///< [out] receives full path on success
+    size_t      out_size      ///< capacity of @p out in bytes
+);
+
+/**
  * @brief Ensure a protocol-providing driver is loaded.
  *
  * If @p protocol_guid is already registered (LocateProtocol succeeds),
@@ -210,13 +246,24 @@ axl_driver_connect_handle(
  * Safe to call multiple times — repeats short-circuit at step 1.
  * EFI_ALREADY_STARTED on StartImage is treated as success.
  *
- * Typical use, before touching a driver-provided protocol:
+ * Typical use, before touching a driver-provided protocol. Note the
+ * cast: `EFI_RAM_DISK_PROTOCOL_GUID` is an `EFI_GUID` from the
+ * generated UEFI headers; AxlGuid is layout-compatible, so a const
+ * cast lets callers pass it through without including any UEFI
+ * headers in their own public surface:
  * @code
- * if (axl_driver_ensure(&EfiRamDiskProtocolGuid, "RamDiskDxe.efi") != 0) {
+ * if (axl_driver_ensure((const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+ *                       "RamDiskDxe.efi") != 0) {
  *     axl_printf("RamDiskDxe.efi not available\n");
  *     return 1;
  * }
  * @endcode
+ *
+ * **Trust model.** This function will load the first matching .efi
+ * file off any mounted FAT volume — including a USB stick the user
+ * just plugged in. UEFI executes loaded drivers with full firmware
+ * privileges. Only call this with driver names you trust, and don't
+ * call it with attacker-controlled @p driver_name values.
  *
  * @return 0 if the protocol is registered (was already, or after
  *     loading the driver); -1 if the driver wasn't found, failed to

@@ -7,6 +7,32 @@ follows [Semantic Versioning](https://semver.org/).
 
 _No changes yet._
 
+## 0.2.4 — 2026-04-24
+
+### Added
+
+- **`axl_driver_locate(name, out, out_size)`** — find a driver file
+  on disk without loading it. Same search order as
+  `axl_driver_ensure`: image's `drivers/<arch>/`, image's own
+  directory, image's `drivers/`, then other volumes' `drivers/<arch>/`.
+  Useful when the caller controls the LoadImage / StartImage
+  lifecycle — for example, to set per-invocation load options
+  between the two steps for a configurable DXE driver. axl-webfs's
+  `mount` command uses this to find `axl-webfs-dxe.efi` regardless
+  of which volume the user invoked the CLI from.
+
+### Changed
+
+- **`axl_driver_ensure` review followups.** Header doc example now
+  shows the required `(const AxlGuid *)` cast that mkrd actually
+  uses (the previous example wouldn't compile against the published
+  signature). Added a trust-model paragraph: this function loads the
+  first matching .efi off any mounted FAT volume at full firmware
+  privilege, so don't pass attacker-controlled driver names. Internal:
+  candidate-list dedup so the common "running tool lives at
+  drivers/&lt;arch&gt;/" case doesn't double-stat the same path; comment
+  on the EFI_GUID const-cast for future readers.
+
 ## 0.2.3 — 2026-04-24
 
 ### Added

@@ -33,9 +33,8 @@ done
 # axl_driver_ensure() auto-load path end-to-end. Discovery order:
 #   1. $RAMDISKDXE_PATH (explicit override)
 #   2. $AXL_DEVKIT_DIR/build/staging/drivers/<arch>/RamDiskDxe.efi
-#   3. ~/projects/aximcode/uefi-devkit/build/staging/drivers/<arch>/RamDiskDxe.efi
-# If none found, the mkrd test falls back to verifying the
-# search-exhaustion path (still proof axv reached the program).
+# If neither is set, the mkrd test falls back to verifying the
+# search-exhaustion path (still proof argv reached the program).
 RAMDISK_STAGED=0
 _ramdisk_src=""
 if [[ -n "${RAMDISKDXE_PATH:-}" && -f "$RAMDISKDXE_PATH" ]]; then
@@ -43,8 +42,6 @@ if [[ -n "${RAMDISKDXE_PATH:-}" && -f "$RAMDISKDXE_PATH" ]]; then
 elif [[ -n "${AXL_DEVKIT_DIR:-}" \
         && -f "$AXL_DEVKIT_DIR/build/staging/drivers/$_native_arch/RamDiskDxe.efi" ]]; then
     _ramdisk_src="$AXL_DEVKIT_DIR/build/staging/drivers/$_native_arch/RamDiskDxe.efi"
-elif [[ -f "$HOME/projects/aximcode/uefi-devkit/build/staging/drivers/$_native_arch/RamDiskDxe.efi" ]]; then
-    _ramdisk_src="$HOME/projects/aximcode/uefi-devkit/build/staging/drivers/$_native_arch/RamDiskDxe.efi"
 fi
 
 if [[ -n "$_ramdisk_src" ]]; then

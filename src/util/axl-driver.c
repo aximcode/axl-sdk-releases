@@ -331,42 +331,52 @@ axl_driver_init(
 }
 
 // ---------------------------------------------------------------------------
-// axl_driver_ensure
+// axl_driver_locate / axl_driver_ensure
 // ---------------------------------------------------------------------------
 
-#define ENSURE_MAX_CANDIDATES   16
-#define ENSURE_MAX_VOLUMES      16
-#define ENSURE_PATH_BUF         256
-#define ENSURE_SUB_BUF          192
+#define DRIVER_MAX_CANDIDATES   16
+#define DRIVER_MAX_VOLUMES      16
+#define DRIVER_PATH_BUF         256
+#define DRIVER_SUB_BUF          192
 
 #if defined(__x86_64__)
-static const char ensure_arch[] = "x64";
+static const char driver_arch[] = "x64";
 #elif defined(__aarch64__)
-static const char ensure_arch[] = "aa64";
+static const char driver_arch[] = "aa64";
 #else
-#error "axl_driver_ensure: unsupported architecture"
+#error "axl-driver: unsupported architecture"
 #endif
 
 static int
-ensure_protocol_registered(
+driver_protocol_registered(
     const AxlGuid *guid
     )
 {
     void *iface = NULL;
+    /* LocateProtocol's prototype is non-const for legacy EDK reasons
+     * (it doesn't actually mutate). The cast is what keeps AxlGuid
+     * out of the public-surface const story. */
     EFI_STATUS st = axl_bs()->LocateProtocol(
         (EFI_GUID *)guid, NULL, &iface);
     return EFI_ERROR(st) ? -1 : 0;
 }
 
 static int
-ensure_append_candidate(
+driver_append_candidate(
     char  **candidates,
     size_t *n_cand,
     const char *path
     )
 {
-    if (*n_cand >= ENSURE_MAX_CANDIDATES || path == NULL) {
+    if (*n_cand >= DRIVER_MAX_CANDIDATES || path == NULL) {
         return -1;
+    }
+    /* Dedup: paths 1 and 2 collide whenever the running image lives
+     * directly under drivers/<arch>/, which is the common mkrd case. */
+    for (size_t i = 0; i < *n_cand; i++) {
+        if (axl_strcmp(candidates[i], path) == 0) {
+            return 0;
+        }
     }
     char *copy = axl_strdup(path);
     if (copy == NULL) {
@@ -376,22 +386,18 @@ ensure_append_candidate(
     return 0;
 }
 
-int
-axl_driver_ensure(
-    const AxlGuid *protocol_guid,
-    const char    *driver_name
+/* Build the standard driver-search candidate list. Caller owns
+ * candidates[0..*n_cand-1] and must axl_free each on the way out. */
+static void
+driver_build_candidates(
+    const char  *driver_name,
+    char       **candidates,
+    size_t      *n_cand
     )
 {
     extern EFI_HANDLE gImageHandle;
 
-    if (protocol_guid == NULL || driver_name == NULL) {
-        return -1;
-    }
-
-    /* Step 1: short-circuit if the protocol is already registered. */
-    if (ensure_protocol_registered(protocol_guid) == 0) {
-        return 0;
-    }
+    *n_cand = 0;
 
     /* Locate the volume the running image was loaded from. The handle
      * stored in EFI_LOADED_IMAGE_PROTOCOL.DeviceHandle is the same
@@ -402,9 +408,9 @@ axl_driver_ensure(
         &EFI_LOADED_IMAGE_PROTOCOL_GUID,
         (void **)&img);
 
-    AxlVolume volumes[ENSURE_MAX_VOLUMES];
+    AxlVolume volumes[DRIVER_MAX_VOLUMES];
     size_t    n_vols = 0;
-    axl_volume_enumerate(volumes, ENSURE_MAX_VOLUMES, &n_vols);
+    axl_volume_enumerate(volumes, DRIVER_MAX_VOLUMES, &n_vols);
 
     const char *image_fs = NULL;
     if (!EFI_ERROR(li_st) && img != NULL) {
@@ -416,20 +422,17 @@ axl_driver_ensure(
         }
     }
 
-    /* Build the candidate list in priority order. */
-    char  *candidates[ENSURE_MAX_CANDIDATES];
-    size_t n_cand = 0;
-    char   path_buf[ENSURE_PATH_BUF];
-    char   sub_buf[ENSURE_SUB_BUF];
+    char path_buf[DRIVER_PATH_BUF];
+    char sub_buf[DRIVER_SUB_BUF];
 
     if (image_fs != NULL) {
         /* 1: drivers/<arch>/<name> on the image's volume. */
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
-                         "/drivers/%s/%s", ensure_arch, driver_name) > 0
+                         "/drivers/%s/%s", driver_arch, driver_name) > 0
             && axl_path_build_uefi(image_fs, sub_buf,
                                    path_buf, sizeof(path_buf)) == 0)
         {
-            ensure_append_candidate(candidates, &n_cand, path_buf);
+            driver_append_candidate(candidates, n_cand, path_buf);
         }
 
         /* 2: <image_dir>/<name> in the running image's own directory. */
@@ -445,7 +448,7 @@ axl_driver_ensure(
                     && axl_path_build_uefi(image_fs, sub_buf,
                                            path_buf, sizeof(path_buf)) == 0)
                 {
-                    ensure_append_candidate(candidates, &n_cand, path_buf);
+                    driver_append_candidate(candidates, n_cand, path_buf);
                 }
             }
         }
@@ -456,23 +459,82 @@ axl_driver_ensure(
             && axl_path_build_uefi(image_fs, sub_buf,
                                    path_buf, sizeof(path_buf)) == 0)
         {
-            ensure_append_candidate(candidates, &n_cand, path_buf);
+            driver_append_candidate(candidates, n_cand, path_buf);
         }
     }
 
     /* 4: drivers/<arch>/<name> on every other mounted volume. */
-    for (size_t i = 0; i < n_vols && n_cand < ENSURE_MAX_CANDIDATES; i++) {
+    for (size_t i = 0; i < n_vols && *n_cand < DRIVER_MAX_CANDIDATES; i++) {
         if (image_fs != NULL && axl_strcmp(volumes[i].name, image_fs) == 0) {
             continue;
         }
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
-                         "/drivers/%s/%s", ensure_arch, driver_name) > 0
+                         "/drivers/%s/%s", driver_arch, driver_name) > 0
             && axl_path_build_uefi(volumes[i].name, sub_buf,
                                    path_buf, sizeof(path_buf)) == 0)
         {
-            ensure_append_candidate(candidates, &n_cand, path_buf);
+            driver_append_candidate(candidates, n_cand, path_buf);
         }
     }
+}
+
+int
+axl_driver_locate(
+    const char *driver_name,
+    char       *out,
+    size_t      out_size
+    )
+{
+    if (driver_name == NULL || out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    char  *candidates[DRIVER_MAX_CANDIDATES];
+    size_t n_cand = 0;
+    driver_build_candidates(driver_name, candidates, &n_cand);
+
+    int rc = -1;
+    for (size_t i = 0; i < n_cand; i++) {
+        AxlFileInfo info;
+        if (axl_file_info(candidates[i], &info) == 0 && !info.is_dir) {
+            size_t len = axl_strlen(candidates[i]);
+            if (len + 1 > out_size) {
+                /* Path doesn't fit in caller buffer; treat as error
+                 * rather than silently truncate. */
+                axl_warning("driver locate: '%s' exceeds %zu bytes",
+                            candidates[i], out_size);
+                break;
+            }
+            axl_memcpy(out, candidates[i], len + 1);
+            rc = 0;
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < n_cand; i++) {
+        axl_free(candidates[i]);
+    }
+    return rc;
+}
+
+int
+axl_driver_ensure(
+    const AxlGuid *protocol_guid,
+    const char    *driver_name
+    )
+{
+    if (protocol_guid == NULL || driver_name == NULL) {
+        return -1;
+    }
+
+    /* Step 1: short-circuit if the protocol is already registered. */
+    if (driver_protocol_registered(protocol_guid) == 0) {
+        return 0;
+    }
+
+    char  *candidates[DRIVER_MAX_CANDIDATES];
+    size_t n_cand = 0;
+    driver_build_candidates(driver_name, candidates, &n_cand);
 
     /* Try each candidate in priority order. */
     int rc = -1;
@@ -500,7 +562,7 @@ axl_driver_ensure(
             continue;
         }
 
-        if (ensure_protocol_registered(protocol_guid) == 0) {
+        if (driver_protocol_registered(protocol_guid) == 0) {
             axl_info("driver ensure: loaded '%s'", candidates[i]);
             rc = 0;
             break;
@@ -514,8 +576,8 @@ axl_driver_ensure(
     }
 
     if (rc != 0) {
-        axl_warning("driver ensure: '%s' not found on %zu volume%s",
-                    driver_name, n_vols, n_vols == 1 ? "" : "s");
+        axl_warning("driver ensure: '%s' not found in %zu candidate path%s",
+                    driver_name, n_cand, n_cand == 1 ? "" : "s");
     }
 
     for (size_t i = 0; i < n_cand; i++) {

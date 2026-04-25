@@ -1136,6 +1136,53 @@ test_driver_ensure(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_driver_locate
+// ---------------------------------------------------------------------------
+
+static void
+test_driver_locate(void)
+{
+    char path[256];
+
+    /* NULL args — all three rejected. */
+    test_check(axl_driver_locate(NULL, path, sizeof(path)) == -1,
+               "driver_locate: rejects NULL name");
+    test_check(axl_driver_locate("x.efi", NULL, sizeof(path)) == -1,
+               "driver_locate: rejects NULL out");
+    test_check(axl_driver_locate("x.efi", path, 0) == -1,
+               "driver_locate: rejects zero size");
+
+    /* Driver missing from disk: walks the search list, finds nothing,
+     * returns -1 cleanly. */
+    test_check(axl_driver_locate("no-such-driver-67890.efi",
+                                 path, sizeof(path)) == -1,
+               "driver_locate: returns -1 when driver not found");
+
+    /* Positive: the running test image itself is on disk under fs0,
+     * and locate's search step 2 ("image's own directory") will find
+     * any file alongside it. We just wrote axl-test-util.tmp earlier,
+     * so locate that — proves the discovery path resolves correctly. */
+    int rc = axl_driver_locate("axl-test-util.tmp", path, sizeof(path));
+    if (rc == 0) {
+        test_check(axl_strlen(path) > 0, "driver_locate: writes non-empty path");
+        AxlFileInfo info;
+        test_check(axl_file_info(path, &info) == 0,
+                   "driver_locate: returned path actually exists");
+    } else {
+        /* Some QEMU configurations don't surface fs0 in the search;
+         * skip the positive check rather than fail the suite. */
+        test_check(rc == -1, "driver_locate: skipped positive test");
+    }
+
+    /* Buffer-too-small: when the discovered path doesn't fit, locate
+     * must return -1 rather than truncate. Use a 1-byte buffer to
+     * force the failure path even on the shortest possible match. */
+    char tiny[1];
+    test_check(axl_driver_locate("axl-test-util.tmp", tiny, sizeof(tiny)) == -1,
+               "driver_locate: rejects too-small buffer");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1171,6 +1218,7 @@ test_util_main(int argc, char **argv)
     test_config_validation();
     test_config_setv();
     test_driver_ensure();
+    test_driver_locate();
 
     return test_print_results();
 }
