@@ -134,7 +134,7 @@ parse_int64(const char *json, const jsmntok_t *tok, int64_t *value)
 // ---------------------------------------------------------------------------
 
 bool
-axl_json_parse(const char *json, size_t len, AxlJsonCtx *ctx)
+axl_json_parse(const char *json, size_t len, AxlJsonReader *ctx)
 {
     jsmn_parser parser;
     int         count;
@@ -189,7 +189,7 @@ axl_json_parse(const char *json, size_t len, AxlJsonCtx *ctx)
 }
 
 void
-axl_json_free(AxlJsonCtx *ctx)
+axl_json_free(AxlJsonReader *ctx)
 {
     if (ctx == NULL) {
         return;
@@ -205,7 +205,7 @@ axl_json_free(AxlJsonCtx *ctx)
 }
 
 bool
-axl_json_get_string(const AxlJsonCtx *ctx, const char *key,
+axl_json_get_string(const AxlJsonReader *ctx, const char *key,
                     char *value, size_t value_size)
 {
     int32_t vi;
@@ -232,7 +232,7 @@ axl_json_get_string(const AxlJsonCtx *ctx, const char *key,
 }
 
 bool
-axl_json_get_int(const AxlJsonCtx *ctx, const char *key, int64_t *value)
+axl_json_get_int(const AxlJsonReader *ctx, const char *key, int64_t *value)
 {
     int32_t vi;
     const jsmntok_t *tok;
@@ -256,7 +256,7 @@ axl_json_get_int(const AxlJsonCtx *ctx, const char *key, int64_t *value)
 }
 
 bool
-axl_json_get_uint(const AxlJsonCtx *ctx, const char *key, uint64_t *value)
+axl_json_get_uint(const AxlJsonReader *ctx, const char *key, uint64_t *value)
 {
     int64_t v;
 
@@ -272,7 +272,7 @@ axl_json_get_uint(const AxlJsonCtx *ctx, const char *key, uint64_t *value)
 }
 
 bool
-axl_json_get_bool(const AxlJsonCtx *ctx, const char *key, bool *value)
+axl_json_get_bool(const AxlJsonReader *ctx, const char *key, bool *value)
 {
     int32_t vi;
     const jsmntok_t *tok;
@@ -304,7 +304,7 @@ bool
 axl_json_extract_string(const char *json, size_t len, const char *key,
                         char *value, size_t value_size)
 {
-    AxlJsonCtx ctx;
+    AxlJsonReader ctx;
 
     if (!axl_json_parse(json, len, &ctx)) {
         return false;
@@ -316,7 +316,7 @@ axl_json_extract_string(const char *json, size_t len, const char *key,
 }
 
 bool
-axl_json_array_begin(const AxlJsonCtx *ctx, const char *key,
+axl_json_array_begin(const AxlJsonReader *ctx, const char *key,
                      AxlJsonArrayIter *iter)
 {
     int32_t vi;
@@ -337,7 +337,7 @@ axl_json_array_begin(const AxlJsonCtx *ctx, const char *key,
         return false;
     }
 
-    iter->ctx = ctx;
+    iter->reader = ctx;
     iter->array_idx = vi;
     iter->pos = vi + 1;
     iter->remaining = tok->size;
@@ -346,7 +346,7 @@ axl_json_array_begin(const AxlJsonCtx *ctx, const char *key,
 }
 
 bool
-axl_json_root_array_begin(const AxlJsonCtx *ctx, AxlJsonArrayIter *iter)
+axl_json_root_array_begin(const AxlJsonReader *ctx, AxlJsonArrayIter *iter)
 {
     const jsmntok_t *tok;
 
@@ -359,7 +359,7 @@ axl_json_root_array_begin(const AxlJsonCtx *ctx, AxlJsonArrayIter *iter)
         return false;
     }
 
-    iter->ctx = ctx;
+    iter->reader = ctx;
     iter->array_idx = 0;
     iter->pos = 1;
     iter->remaining = tok->size;
@@ -368,7 +368,7 @@ axl_json_root_array_begin(const AxlJsonCtx *ctx, AxlJsonArrayIter *iter)
 }
 
 bool
-axl_json_array_next(AxlJsonArrayIter *iter, AxlJsonCtx *element)
+axl_json_array_next(AxlJsonArrayIter *iter, AxlJsonReader *element)
 {
     const jsmntok_t *tokens;
     const jsmntok_t *tok;
@@ -379,23 +379,23 @@ axl_json_array_next(AxlJsonArrayIter *iter, AxlJsonCtx *element)
         return false;
     }
 
-    if (iter->pos >= iter->ctx->token_count) {
+    if (iter->pos >= iter->reader->token_count) {
         return false;
     }
 
-    tokens = (const jsmntok_t *)iter->ctx->tokens;
+    tokens = (const jsmntok_t *)iter->reader->tokens;
     tok = &tokens[iter->pos];
 
     /* Element borrows parent's token array at offset — no copy needed */
-    element->json = iter->ctx->json;
-    element->json_len = iter->ctx->json_len;
-    element->tokens = &iter->ctx->tokens[iter->pos * (int32_t)(sizeof(jsmntok_t) / sizeof(int32_t))];
-    element->token_count = iter->ctx->token_count - iter->pos;
+    element->json = iter->reader->json;
+    element->json_len = iter->reader->json_len;
+    element->tokens = &iter->reader->tokens[iter->pos * (int32_t)(sizeof(jsmntok_t) / sizeof(int32_t))];
+    element->token_count = iter->reader->token_count - iter->pos;
     element->owns_tokens = false;
 
     /* Count tokens to skip(element + all its children) */
     skip_count = 1;
-    for (i = iter->pos + 1; i < iter->ctx->token_count; i++) {
+    for (i = iter->pos + 1; i < iter->reader->token_count; i++) {
         if (tokens[i].start >= tok->end) {
             break;
         }

@@ -196,28 +196,28 @@ axl_http_server_get(AxlHttpServer *s, const char *key)
     return axl_config_get(s->config, key);
 }
 
-void
+int
 axl_http_server_set_max_connections(AxlHttpServer *s, size_t max)
 {
     char buf[32];
     axl_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)max);
-    axl_http_server_set(s, "max.connections", buf);
+    return axl_http_server_set(s, "max.connections", buf);
 }
 
-void
+int
 axl_http_server_set_body_limit(AxlHttpServer *s, size_t limit)
 {
     char buf[32];
     axl_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)limit);
-    axl_http_server_set(s, "body.limit", buf);
+    return axl_http_server_set(s, "body.limit", buf);
 }
 
-void
+int
 axl_http_server_set_keep_alive(AxlHttpServer *s, size_t timeout_sec)
 {
     char buf[32];
     axl_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)timeout_sec);
-    axl_http_server_set(s, "keep.alive.sec", buf);
+    return axl_http_server_set(s, "keep.alive.sec", buf);
 }
 
 // ---------------------------------------------------------------------------

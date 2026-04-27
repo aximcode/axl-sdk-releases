@@ -26,7 +26,6 @@
 
 #define HWINFO_PORT        8080
 #define HWINFO_RECV_BUFSZ  1024
-#define HWINFO_SEND_BUFSZ  4096
 #define HWINFO_MAX_CLIENTS 5
 
 // ---------------------------------------------------------------------------
@@ -46,28 +45,27 @@ smbios_string_at(AxlSmbiosHeader *hdr, unsigned offset)
 }
 
 // ---------------------------------------------------------------------------
-// Endpoint handlers — each builds JSON into a caller-supplied buffer
-// and returns the number of bytes written.
+// Endpoint handlers — each writes one JSON object into the writer.
 // ---------------------------------------------------------------------------
 
-static int
-endpoint_index(char *buf, size_t cap)
+static void
+endpoint_index(AxlJsonWriter *w)
 {
-    return axl_snprintf(buf, cap,
-        "{"
-            "\"endpoints\":["
-                "\"/\","
-                "\"/system\","
-                "\"/cpu\""
-            "]"
-        "}");
+    axl_json_obj_begin(w);
+        axl_json_key(w, "endpoints");
+        axl_json_arr_begin(w);
+            axl_json_str(w, "/");
+            axl_json_str(w, "/system");
+            axl_json_str(w, "/cpu");
+        axl_json_arr_end(w);
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_system(char *buf, size_t cap)
+static void
+endpoint_system(AxlJsonWriter *w)
 {
-    AxlSmbiosHeader *bios   = axl_smbios_find(0);
-    AxlSmbiosHeader *sys    = axl_smbios_find(1);
+    AxlSmbiosHeader *bios = axl_smbios_find(0);
+    AxlSmbiosHeader *sys  = axl_smbios_find(1);
 
     AxlFirmwareInfo  fw;
     uint64_t         mem_bytes = 0;
@@ -75,38 +73,41 @@ endpoint_system(char *buf, size_t cap)
     axl_sys_get_memory_size(&mem_bytes);
 
     /* Each axl_smbios_get_string_utf8 returns a pointer to a single
-     * static 128-char buffer, so only one call is safe at a time. We
-     * compose the JSON by reading one string at a time. */
+     * static 128-char buffer, so only one call is safe at a time —
+     * snapshot strings into local buffers before composing JSON. */
     char bios_vendor [128]; axl_strlcpy(bios_vendor, smbios_string_at(bios, 4), sizeof(bios_vendor));
     char sys_mfr     [128]; axl_strlcpy(sys_mfr,     smbios_string_at(sys,  4), sizeof(sys_mfr));
     char sys_product [128]; axl_strlcpy(sys_product, smbios_string_at(sys,  5), sizeof(sys_product));
 
-    return axl_snprintf(buf, cap,
-        "{"
-            "\"firmware\":{"
-                "\"vendor\":\"%s\","
-                "\"spec\":\"%u.%u\","
-                "\"revision\":\"0x%08x\""
-            "},"
-            "\"bios\":{"
-                "\"vendor\":\"%s\""
-            "},"
-            "\"system\":{"
-                "\"manufacturer\":\"%s\","
-                "\"product\":\"%s\""
-            "},"
-            "\"memory_bytes\":%llu"
-        "}",
-        fw.vendor,
-        (unsigned)fw.spec_major, (unsigned)fw.spec_minor,
-        (unsigned)fw.firmware_revision,
-        bios_vendor,
-        sys_mfr, sys_product,
-        (unsigned long long)mem_bytes);
+    char spec[16];
+    axl_snprintf(spec, sizeof(spec), "%u.%u",
+                 (unsigned)fw.spec_major, (unsigned)fw.spec_minor);
+    char revision[16];
+    axl_snprintf(revision, sizeof(revision), "0x%08x",
+                 (unsigned)fw.firmware_revision);
+
+    axl_json_obj_begin(w);
+        axl_json_key(w, "firmware");
+        axl_json_obj_begin(w);
+            axl_json_kv_str(w, "vendor",   fw.vendor);
+            axl_json_kv_str(w, "spec",     spec);
+            axl_json_kv_str(w, "revision", revision);
+        axl_json_obj_end(w);
+        axl_json_key(w, "bios");
+        axl_json_obj_begin(w);
+            axl_json_kv_str(w, "vendor", bios_vendor);
+        axl_json_obj_end(w);
+        axl_json_key(w, "system");
+        axl_json_obj_begin(w);
+            axl_json_kv_str(w, "manufacturer", sys_mfr);
+            axl_json_kv_str(w, "product",      sys_product);
+        axl_json_obj_end(w);
+        axl_json_kv_uint(w, "memory_bytes", (uint64_t)mem_bytes);
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_cpu(char *buf, size_t cap)
+static void
+endpoint_cpu(AxlJsonWriter *w)
 {
     AxlSmbiosHeader *cpu = axl_smbios_find(4);
 
@@ -119,53 +120,14 @@ endpoint_cpu(char *buf, size_t cap)
         speed_mhz = *(uint16_t *)((uint8_t *)cpu + 0x16);
     }
 
-    return axl_snprintf(buf, cap,
-        "{"
-            "\"processor\":{"
-                "\"manufacturer\":\"%s\","
-                "\"version\":\"%s\","
-                "\"current_speed_mhz\":%u"
-            "}"
-        "}",
-        mfr, ver, (unsigned)speed_mhz);
-}
-
-// ---------------------------------------------------------------------------
-// Tiny HTTP/1.0 request reader — extracts the request path (method is
-// always assumed GET for this demo). Returns 0 on success, -1 on error.
-// ---------------------------------------------------------------------------
-
-static int
-http_read_path(int fd, char *path_out, size_t path_cap)
-{
-    char buf[HWINFO_RECV_BUFSZ];
-    size_t total = 0;
-
-    /* Read until we see \r\n\r\n, or the buffer fills. */
-    while (total < sizeof(buf) - 1) {
-        int n = axlk_read(fd, buf + total, sizeof(buf) - 1 - total);
-        if (n <= 0) {
-            return -1;
-        }
-        total += (size_t)n;
-        buf[total] = '\0';
-        if (axl_strstr(buf, "\r\n\r\n") != NULL) {
-            break;
-        }
-    }
-
-    /* Request line: METHOD <space> PATH <space> HTTP/1.x\r\n */
-    const char *first_space = axl_strchr(buf, ' ');
-    if (first_space == NULL) return -1;
-    const char *path_start  = first_space + 1;
-    const char *second_space = axl_strchr(path_start, ' ');
-    if (second_space == NULL) return -1;
-
-    size_t path_len = (size_t)(second_space - path_start);
-    if (path_len >= path_cap) path_len = path_cap - 1;
-    axl_memcpy(path_out, path_start, path_len);
-    path_out[path_len] = '\0';
-    return 0;
+    axl_json_obj_begin(w);
+        axl_json_key(w, "processor");
+        axl_json_obj_begin(w);
+            axl_json_kv_str (w, "manufacturer",      mfr);
+            axl_json_kv_str (w, "version",           ver);
+            axl_json_kv_uint(w, "current_speed_mhz", (uint64_t)speed_mhz);
+        axl_json_obj_end(w);
+    axl_json_obj_end(w);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,45 +140,55 @@ handle_client(int argc, char **argv)
     (void)argc;
     int fd = (int)(intptr_t)argv;
 
+    char method[16];
     char path[64];
-    char body[HWINFO_SEND_BUFSZ];
-    int  body_len = 0;
+    char scratch[HWINFO_RECV_BUFSZ];
     int  status   = 200;
     const char *status_text = "OK";
 
-    if (http_read_path(fd, path, sizeof(path)) != 0) {
+    AXL_AUTOPTR(AxlString) body = axl_string_new(NULL);
+    AxlJsonWriter w;
+    axl_json_writer_init(&w, body, AXL_JSON_WRITER_DEFAULT);
+
+    if (axlk_http_read_request_line(fd, scratch, sizeof(scratch),
+                                    method, sizeof(method),
+                                    path, sizeof(path)) != 0) {
         status = 400;
         status_text = "Bad Request";
-        body_len = axl_snprintf(body, sizeof(body), "{\"error\":\"bad request\"}");
+        axl_json_obj_begin(&w);
+            axl_json_kv_str(&w, "error", "bad request");
+        axl_json_obj_end(&w);
     } else if (axl_streql(path, "/")) {
-        body_len = endpoint_index(body, sizeof(body));
+        endpoint_index(&w);
     } else if (axl_streql(path, "/system")) {
-        body_len = endpoint_system(body, sizeof(body));
+        endpoint_system(&w);
     } else if (axl_streql(path, "/cpu")) {
-        body_len = endpoint_cpu(body, sizeof(body));
+        endpoint_cpu(&w);
     } else {
         status = 404;
         status_text = "Not Found";
-        body_len = axl_snprintf(body, sizeof(body),
-                                "{\"error\":\"not found\",\"path\":\"%s\"}",
-                                path);
+        axl_json_obj_begin(&w);
+            axl_json_kv_str(&w, "error", "not found");
+            axl_json_kv_str(&w, "path",  path);
+        axl_json_obj_end(&w);
     }
+    size_t body_len = axl_json_writer_finish(&w);
 
-    axl_printf("  pid %d %s → %d (%d bytes)\n",
+    axl_printf("  pid %d %s → %d (%zu bytes)\n",
                (int)axlk_getpid(), path, status, body_len);
 
     char header[256];
     int hlen = axl_snprintf(header, sizeof(header),
         "HTTP/1.0 %d %s\r\n"
         "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n",
         status, status_text, body_len);
 
     axlk_write(fd, header, (size_t)hlen);
     if (body_len > 0) {
-        axlk_write(fd, body, (size_t)body_len);
+        axlk_write(fd, axl_string_str(body), body_len);
     }
     axlk_close(fd);
     return 0;

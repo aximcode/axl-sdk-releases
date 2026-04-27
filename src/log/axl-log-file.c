@@ -238,7 +238,11 @@ axl_log_file_attach(const char *path)
         return -1;
     }
 
-    axl_log_add_handler(file_handler, NULL);
+    if (axl_log_add_handler(file_handler, NULL) != 0) {
+        /* Handler table full — file is open, but messages won't reach it.
+         * Caller should know so they can decide to abort or carry on. */
+        return -1;
+    }
     return 0;
 }
 

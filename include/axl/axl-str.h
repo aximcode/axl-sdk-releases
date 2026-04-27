@@ -571,7 +571,106 @@ axl_base64_decode(
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Parse an unsigned 64-bit integer.
+ * @brief Parse an unsigned 64-bit integer with overflow detection.
+ *
+ * Skips leading whitespace, then accepts an optional "0x"/"0X" hex
+ * prefix. The @p base parameter selects the radix (2-36, or 0 to
+ * auto-detect: "0x"/"0X" prefix → base 16, otherwise base 10 — this
+ * does NOT decode leading "0" as octal, unlike C strtol). A leading
+ * '+' is accepted; a leading '-' is rejected for unsigned variants.
+ *
+ * Returns -1 on syntax error (no digits, invalid digit for base, sign
+ * for unsigned), or out-of-range for the target type. On success,
+ * @p out receives the value and @p endptr (if non-NULL) receives a
+ * pointer just past the last consumed character. On error, @p out
+ * is unchanged and *@p endptr (if non-NULL) is set to @p nptr.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int
+axl_str_to_u64(
+    const char  *nptr,    ///< number string
+    int          base,    ///< 0 (auto), or 2-36
+    uint64_t    *out,     ///< [out] parsed value
+    const char **endptr   ///< [out, optional] past last consumed char
+);
+
+/// Like axl_str_to_u64 but the value must fit in uint32_t.
+int
+axl_str_to_u32(
+    const char  *nptr,
+    int          base,
+    uint32_t    *out,
+    const char **endptr
+);
+
+/// Like axl_str_to_u64 but the value must fit in uint16_t.
+int
+axl_str_to_u16(
+    const char  *nptr,
+    int          base,
+    uint16_t    *out,
+    const char **endptr
+);
+
+/// Like axl_str_to_u64 but the value must fit in uint8_t.
+int
+axl_str_to_u8(
+    const char  *nptr,
+    int          base,
+    uint8_t     *out,
+    const char **endptr
+);
+
+/**
+ * @brief Parse a signed 64-bit integer with overflow detection.
+ *
+ * Same shape and rules as axl_str_to_u64, plus an optional leading
+ * '-' for negatives. Returns -1 on syntax error or out-of-range.
+ */
+int
+axl_str_to_s64(
+    const char  *nptr,
+    int          base,
+    int64_t     *out,
+    const char **endptr
+);
+
+/// Like axl_str_to_s64 but the value must fit in int32_t.
+int
+axl_str_to_s32(
+    const char  *nptr,
+    int          base,
+    int32_t     *out,
+    const char **endptr
+);
+
+/// Like axl_str_to_s64 but the value must fit in int16_t.
+int
+axl_str_to_s16(
+    const char  *nptr,
+    int          base,
+    int16_t     *out,
+    const char **endptr
+);
+
+/// Like axl_str_to_s64 but the value must fit in int8_t.
+int
+axl_str_to_s8(
+    const char  *nptr,
+    int          base,
+    int8_t      *out,
+    const char **endptr
+);
+
+/**
+ * @brief Parse an unsigned 64-bit integer (legacy, lossy).
+ *
+ * @deprecated Prefer axl_str_to_u64. This wrapper preserves the
+ *     previous "best effort, return 0 on any failure" semantics for
+ *     existing callers — overflow wraps silently, "abc" returns 0
+ *     indistinguishable from "0", and partial parses ("123abc"
+ *     returns 123) are accepted.
  *
  * Handles "0x" prefix for hex. Returns 0 on NULL or invalid input.
  */

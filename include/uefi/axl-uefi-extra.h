@@ -113,6 +113,58 @@ typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_CUR_DIR)(
     IN CONST CHAR16  *Dir
     );
 
+// ===================================================================
+// EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (UEFI Spec 2.x, §12.2)
+//
+// AXL backend installs a key notify on this protocol's handle to
+// catch raw 0x03 (Ctrl-C) bytes coming over serial — TerminalDxe
+// delivers them with KeyShiftState=0 (no Ctrl modifier reported on
+// serial), so the EDK2 Shell's own Ctrl-C notify (which requires
+// Ctrl-pressed bits) doesn't fire. We register an additional notify
+// that matches KeyShiftState=0 and signals shell->ExecutionBreak
+// from there.
+//
+// Only RegisterKeyNotify / UnregisterKeyNotify are used; other
+// fields are void* placeholders.
+// ===================================================================
+
+typedef struct {
+    UINT32  KeyShiftState;
+    UINT8   KeyToggleState;
+} EFI_KEY_STATE;
+
+typedef struct {
+    EFI_INPUT_KEY  Key;
+    EFI_KEY_STATE  KeyState;
+} EFI_KEY_DATA;
+
+typedef EFI_STATUS (EFIAPI *EFI_KEY_NOTIFY_FUNCTION)(
+    IN EFI_KEY_DATA  *KeyData
+    );
+
+typedef struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_EX_REGISTER_KEY_NOTIFY)(
+    IN  EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *This,
+    IN  EFI_KEY_DATA                       *KeyData,
+    IN  EFI_KEY_NOTIFY_FUNCTION             KeyNotificationFunction,
+    OUT VOID                              **NotifyHandle
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_EX_UNREGISTER_KEY_NOTIFY)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *This,
+    IN VOID                               *NotificationHandle
+    );
+
+struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL {
+    void                                *Reset;
+    void                                *ReadKeyStrokeEx;
+    EFI_EVENT                            WaitForKeyEx;
+    void                                *SetState;
+    EFI_INPUT_EX_REGISTER_KEY_NOTIFY     RegisterKeyNotify;
+    EFI_INPUT_EX_UNREGISTER_KEY_NOTIFY   UnregisterKeyNotify;
+};
+
 struct _EFI_SHELL_PROTOCOL {
     EFI_SHELL_EXECUTE              Execute;              // 2.2.2 (USED)
     EFI_SHELL_GET_ENV              GetEnv;               // 2.2.3 (USED)

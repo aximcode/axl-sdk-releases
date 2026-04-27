@@ -54,9 +54,15 @@ run_one() {
     local timing_file="$2"
 
     TIMEFORMAT="%R %U %S"
-    # QEMU timeout of 30s covers ~6s boot + 10s waits + slack.
+    # QEMU timeout: KVM ~30s suffices (~6s boot + 10s waits + slack);
+    # TCG (CI runners with no /dev/kvm access) needs ~3-4x longer for
+    # OVMF boot alone. Auto-bump when KVM is unavailable.
+    local timeout_sec=30
+    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+        timeout_sec=120
+    fi
     { time "$PROJECT_DIR/scripts/run-qemu.sh" --arch "$ARCH" \
-            --timeout 30 "$TEST_EFI" > "$qemu_log" 2>&1 ; } 2> "$timing_file"
+            --timeout "$timeout_sec" "$TEST_EFI" > "$qemu_log" 2>&1 ; } 2> "$timing_file"
     unset TIMEFORMAT
 
     # Parse "real user sys" (seconds, floating point)
@@ -73,8 +79,9 @@ expect_guest_done() {
     local log="$1"
     if ! grep -q "cpu-idle: done" "$log"; then
         echo "error: guest binary did not print 'cpu-idle: done'"
-        echo "       tail of qemu log:"
-        tail -20 "$log"
+        echo "       full qemu log (cleaned, $(wc -l < "$log") lines):"
+        cat "$log"
+        echo "       --- end qemu log ---"
         return 1
     fi
     return 0

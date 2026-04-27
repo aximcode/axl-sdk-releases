@@ -42,6 +42,7 @@ EXTRA_FILES=()
 CUSTOM_NSH=""
 BACKGROUND=false
 SERIAL_LOG=""
+SERIAL_LOG_RAW=""
 SERIAL_SOCKET=""
 EFI_FILE=""
 EFI_ARGS=()
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
         --background) BACKGROUND=true; shift ;;
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
+        --serial-log-raw) SERIAL_LOG_RAW="$2"; shift 2 ;;
         --serial-socket) SERIAL_SOCKET="$2"; shift 2 ;;
         -h|--help)
             cat <<'HELP'
@@ -73,7 +75,12 @@ Options:
   --extra FILE             Stage additional .efi on disk (repeatable)
   --nsh FILE               Use custom startup.nsh file
   --background             Launch QEMU in background, print PID
-  --serial-log FILE        Save serial output to file
+  --serial-log FILE        Save serial output to file (foreground:
+                           ANSI-stripped clean transcript; background:
+                           live raw log — symlinked).
+  --serial-log-raw FILE    (foreground only) Save unprocessed serial
+                           with ANSI/cursor codes. Useful for
+                           firmware-level debugging.
   --serial-socket PATH     (background mode) expose serial as a UNIX
                            socket so host scripts can inject input
                            (e.g. Ctrl-C via `printf '\x03' | socat ...`)
@@ -181,8 +188,30 @@ else
     } > "$STAGING/startup.nsh"
 fi
 
-# Build disk image
-"$MKIMAGE_DIR/mkimage.py" --source "$STAGING" --target "$TMPDIR/disk.img" --label RUN > /dev/null 2>&1
+# Build disk image. Prefer mkimage when available (richer tooling,
+# UDF-bridge support); fall back to plain mtools when not (CI runners
+# without the mkimage repo cloned, contributors who haven't set
+# MKIMAGE_DIR, etc.). The fallback is the same recipe common-test.sh
+# uses — dd + mkfs.vfat + mcopy.
+if [[ -n "${MKIMAGE_DIR:-}" && -f "$MKIMAGE_DIR/mkimage.py" ]]; then
+    "$MKIMAGE_DIR/mkimage.py" --source "$STAGING" --target "$TMPDIR/disk.img" --label RUN > /dev/null 2>&1
+else
+    size_kb=$(du -sk "$STAGING" | cut -f1)
+    size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))   # round up to MB
+    [[ $size_kb -lt 40960 ]] && size_kb=40960        # min 40 MB
+    dd if=/dev/zero of="$TMPDIR/disk.img" bs=1K count="$size_kb" 2>/dev/null
+    mkfs.vfat -F 32 -n RUN "$TMPDIR/disk.img" >/dev/null 2>&1
+    # Use mcopy -s for recursive copy. Pass top-level entries by name
+    # (no leading "./") so mcopy's destination path is clean and mtools
+    # creates the directory tree on the fly. The previous per-file
+    # loop produced "::/./EFI/..." paths that mtools refused to write.
+    (
+        cd "$STAGING" || exit 1
+        for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
+            mcopy -s -i "$TMPDIR/disk.img" "$entry" "::/" 2>/dev/null
+        done
+    )
+fi
 
 # Prepare NVRAM
 cp "$FW_VARS" "$TMPDIR/vars.fd"
@@ -254,11 +283,11 @@ elif [[ "$BACKGROUND" == "true" ]]; then
             -serial chardev:serial0
             -display none
         )
-        "${CMD[@]}" > "$LOG" 2>&1 &
+        "${CMD[@]}" > "$LOG" 2>&1 < /dev/null &
         QEMU_PID=$!
     else
         CMD+=(-nographic -no-reboot)
-        "${CMD[@]}" > "$LOG" 2>&1 &
+        "${CMD[@]}" > "$LOG" 2>&1 < /dev/null &
         QEMU_PID=$!
     fi
 
@@ -278,16 +307,56 @@ elif [[ "$BACKGROUND" == "true" ]]; then
 # Normal foreground mode
 else
     CMD+=(-nographic -no-reboot)
-    timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 || true
+    # </dev/null detaches the caller's TTY from QEMU's stdio. With
+    # -nographic QEMU multiplexes serial+monitor over stdio; if a real
+    # TTY is on stdin (typical interactive ssh), QEMU picks up phantom
+    # input and exits before producing a single byte of serial output.
+    # The empty-log diagnostic below catches future surprises.
+    timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null || true
 
-    # Copy serial log if requested
+    # Strip ANSI/DEC escape sequences and carriage returns. The param
+    # byte class is the full CSI parameter range (ECMA-48 0x30-0x3F)
+    # so DEC private modes like ESC[=3h and ESC[?25l strip cleanly,
+    # not just numeric/semicolon CSI like ESC[2J.
+    # Also strip standalone ESC, plus ESC( / ESC) charset designators
+    # which UEFI consoles emit on init.
+    CLEAN="$TMPDIR/clean.log"
+    sed -E '
+        s/\x1b\[[0-9;:<=>?]*[a-zA-Z@`{|}~]//g
+        s/\x1b[()][A-Za-z0-9]//g
+    ' "$LOG" | tr -d '\r' > "$CLEAN"
+
+    # --serial-log saves the cleaned transcript by default (matches
+    # what the user sees on stdout). --serial-log-raw is the explicit
+    # escape hatch for firmware-level debugging.
     if [[ -n "$SERIAL_LOG" ]]; then
-        cp "$LOG" "$SERIAL_LOG"
+        cp "$CLEAN" "$SERIAL_LOG"
+    fi
+    if [[ -n "$SERIAL_LOG_RAW" ]]; then
+        cp "$LOG" "$SERIAL_LOG_RAW"
     fi
 
-    # Strip ANSI escape codes and carriage returns
-    CLEAN="$TMPDIR/clean.log"
-    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\r' > "$CLEAN"
+    # If QEMU produced absolutely nothing, surface the failure
+    # explicitly. Most common cause: stdin is a TTY and QEMU's
+    # -nographic stdio multiplexer ate the boot — but we already
+    # </dev/null above, so this catches new failure modes (KVM
+    # access denied, missing firmware, vars-file collision, etc.).
+    if [[ ! -s "$LOG" ]]; then
+        cat <<EOF >&2
+ERROR: QEMU produced no serial output (0 bytes).
+
+  Disk image:    $TMPDIR/disk.img ($(stat -c%s "$TMPDIR/disk.img" 2>/dev/null || echo "?") bytes)
+  QEMU binary:   $QEMU_BIN
+  Architecture:  $ARCH
+
+Likely causes:
+  - /dev/kvm not accessible (try: ls -l /dev/kvm; id)
+  - Firmware vars file in use by another QEMU process (try: pgrep -fa qemu)
+  - Disk image build failed silently (rerun with bash -x)
+  - QEMU build broken (try: $QEMU_BIN --version)
+EOF
+        exit 1
+    fi
 
     if [[ "$RAW" == "true" ]]; then
         cat "$CLEAN"

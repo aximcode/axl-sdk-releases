@@ -502,6 +502,216 @@ test_strtou64(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_str_to_{u32,s32,u64,s64}
+// ---------------------------------------------------------------------------
+
+static void
+test_str_to_u64(void)
+{
+    uint64_t v;
+    const char *end;
+
+    /* Happy paths. */
+    test_check(axl_str_to_u64("12345", 10, &v, NULL) == 0 && v == 12345,
+               "str_to_u64: decimal");
+    test_check(axl_str_to_u64("0xFF", 0, &v, NULL) == 0 && v == 0xFF,
+               "str_to_u64: base=0 auto-hex");
+    test_check(axl_str_to_u64("FF", 16, &v, NULL) == 0 && v == 0xFF,
+               "str_to_u64: explicit base=16 no prefix");
+    test_check(axl_str_to_u64("0xff", 16, &v, NULL) == 0 && v == 0xFF,
+               "str_to_u64: explicit base=16 with prefix");
+    test_check(axl_str_to_u64("1010", 2, &v, NULL) == 0 && v == 10,
+               "str_to_u64: base=2");
+    test_check(axl_str_to_u64("zz", 36, &v, NULL) == 0 && v == 35*36+35,
+               "str_to_u64: base=36");
+    test_check(axl_str_to_u64("  +42", 10, &v, NULL) == 0 && v == 42,
+               "str_to_u64: leading whitespace + sign");
+
+    /* Boundary: UINT64_MAX. */
+    test_check(axl_str_to_u64("18446744073709551615", 10, &v, NULL) == 0
+               && v == UINT64_MAX,
+               "str_to_u64: UINT64_MAX exact");
+    test_check(axl_str_to_u64("18446744073709551616", 10, &v, NULL) == -1,
+               "str_to_u64: UINT64_MAX + 1 overflows");
+    test_check(axl_str_to_u64("99999999999999999999", 10, &v, NULL) == -1,
+               "str_to_u64: huge value overflows");
+
+    /* Errors. */
+    test_check(axl_str_to_u64(NULL, 10, &v, NULL) == -1, "str_to_u64: NULL");
+    test_check(axl_str_to_u64("", 10, &v, NULL) == -1, "str_to_u64: empty");
+    test_check(axl_str_to_u64("abc", 10, &v, NULL) == -1, "str_to_u64: garbage");
+    test_check(axl_str_to_u64("-5", 10, &v, NULL) == -1, "str_to_u64: rejects sign");
+    test_check(axl_str_to_u64("12", 1, &v, NULL) == -1, "str_to_u64: bad base");
+    test_check(axl_str_to_u64("12", 37, &v, NULL) == -1, "str_to_u64: bad base");
+    test_check(axl_str_to_u64("12", 10, NULL, NULL) == -1, "str_to_u64: NULL out");
+    test_check(axl_str_to_u64("0x", 0, &v, NULL) == -1, "str_to_u64: bare 0x");
+
+    /* endptr — partial parses are rejected unless caller takes endptr. */
+    test_check(axl_str_to_u64("123abc", 10, &v, NULL) == -1,
+               "str_to_u64: partial parse without endptr is error");
+    test_check(axl_str_to_u64("123abc", 10, &v, &end) == 0 && v == 123
+               && *end == 'a',
+               "str_to_u64: partial parse via endptr");
+
+    /* endptr on error points back at nptr. */
+    const char *src = "abc";
+    test_check(axl_str_to_u64(src, 10, &v, &end) == -1 && end == src,
+               "str_to_u64: endptr resets to nptr on error");
+}
+
+static void
+test_str_to_u32(void)
+{
+    uint32_t v;
+    test_check(axl_str_to_u32("4294967295", 10, &v, NULL) == 0
+               && v == UINT32_MAX, "str_to_u32: UINT32_MAX");
+    test_check(axl_str_to_u32("4294967296", 10, &v, NULL) == -1,
+               "str_to_u32: UINT32_MAX + 1 overflows");
+    test_check(axl_str_to_u32("0xffffffff", 0, &v, NULL) == 0
+               && v == UINT32_MAX, "str_to_u32: hex max");
+    test_check(axl_str_to_u32("0x100000000", 0, &v, NULL) == -1,
+               "str_to_u32: hex overflow");
+}
+
+static void
+test_str_to_s64(void)
+{
+    int64_t v;
+
+    test_check(axl_str_to_s64("12345", 10, &v, NULL) == 0 && v == 12345,
+               "str_to_s64: positive");
+    test_check(axl_str_to_s64("-12345", 10, &v, NULL) == 0 && v == -12345,
+               "str_to_s64: negative");
+    test_check(axl_str_to_s64("+12345", 10, &v, NULL) == 0 && v == 12345,
+               "str_to_s64: explicit +");
+
+    /* Boundaries. */
+    test_check(axl_str_to_s64("9223372036854775807", 10, &v, NULL) == 0
+               && v == INT64_MAX, "str_to_s64: INT64_MAX");
+    test_check(axl_str_to_s64("-9223372036854775808", 10, &v, NULL) == 0
+               && v == INT64_MIN, "str_to_s64: INT64_MIN");
+    test_check(axl_str_to_s64("9223372036854775808", 10, &v, NULL) == -1,
+               "str_to_s64: INT64_MAX + 1 overflows");
+    test_check(axl_str_to_s64("-9223372036854775809", 10, &v, NULL) == -1,
+               "str_to_s64: INT64_MIN - 1 overflows");
+}
+
+static void
+test_str_to_s32(void)
+{
+    int32_t v;
+    test_check(axl_str_to_s32("2147483647", 10, &v, NULL) == 0
+               && v == INT32_MAX, "str_to_s32: INT32_MAX");
+    test_check(axl_str_to_s32("-2147483648", 10, &v, NULL) == 0
+               && v == INT32_MIN, "str_to_s32: INT32_MIN");
+    test_check(axl_str_to_s32("2147483648", 10, &v, NULL) == -1,
+               "str_to_s32: INT32_MAX + 1 overflows");
+    test_check(axl_str_to_s32("-2147483649", 10, &v, NULL) == -1,
+               "str_to_s32: INT32_MIN - 1 overflows");
+}
+
+// ---------------------------------------------------------------------------
+// Narrow-width variants: u16/u8/s16/s8
+// ---------------------------------------------------------------------------
+
+static void
+test_str_to_narrow(void)
+{
+    uint16_t u16;
+    uint8_t  u8;
+    int16_t  s16;
+    int8_t   s8;
+
+    /* u16 */
+    test_check(axl_str_to_u16("65535", 10, &u16, NULL) == 0 && u16 == UINT16_MAX,
+               "str_to_u16: UINT16_MAX");
+    test_check(axl_str_to_u16("65536", 10, &u16, NULL) == -1,
+               "str_to_u16: UINT16_MAX + 1 overflows");
+    test_check(axl_str_to_u16("0xffff", 0, &u16, NULL) == 0 && u16 == 0xFFFF,
+               "str_to_u16: hex max");
+    test_check(axl_str_to_u16("0x10000", 0, &u16, NULL) == -1,
+               "str_to_u16: hex overflow");
+    test_check(axl_str_to_u16("-1", 10, &u16, NULL) == -1,
+               "str_to_u16: rejects sign");
+
+    /* u8 */
+    test_check(axl_str_to_u8("255", 10, &u8, NULL) == 0 && u8 == UINT8_MAX,
+               "str_to_u8: UINT8_MAX");
+    test_check(axl_str_to_u8("256", 10, &u8, NULL) == -1,
+               "str_to_u8: UINT8_MAX + 1 overflows");
+    test_check(axl_str_to_u8("0xff", 0, &u8, NULL) == 0 && u8 == 0xFF,
+               "str_to_u8: hex max");
+
+    /* s16 */
+    test_check(axl_str_to_s16("32767", 10, &s16, NULL) == 0 && s16 == INT16_MAX,
+               "str_to_s16: INT16_MAX");
+    test_check(axl_str_to_s16("-32768", 10, &s16, NULL) == 0 && s16 == INT16_MIN,
+               "str_to_s16: INT16_MIN");
+    test_check(axl_str_to_s16("32768", 10, &s16, NULL) == -1,
+               "str_to_s16: INT16_MAX + 1 overflows");
+    test_check(axl_str_to_s16("-32769", 10, &s16, NULL) == -1,
+               "str_to_s16: INT16_MIN - 1 overflows");
+
+    /* s8 */
+    test_check(axl_str_to_s8("127", 10, &s8, NULL) == 0 && s8 == INT8_MAX,
+               "str_to_s8: INT8_MAX");
+    test_check(axl_str_to_s8("-128", 10, &s8, NULL) == 0 && s8 == INT8_MIN,
+               "str_to_s8: INT8_MIN");
+    test_check(axl_str_to_s8("128", 10, &s8, NULL) == -1,
+               "str_to_s8: INT8_MAX + 1 overflows");
+    test_check(axl_str_to_s8("-129", 10, &s8, NULL) == -1,
+               "str_to_s8: INT8_MIN - 1 overflows");
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases the code reviewer flagged
+// ---------------------------------------------------------------------------
+
+static void
+test_str_to_edge_cases(void)
+{
+    uint64_t u64;
+    int64_t  s64;
+    const char *end;
+
+    /* base=0 with leading zero is decimal — NOT octal (deliberately). */
+    test_check(axl_str_to_u64("010", 0, &u64, NULL) == 0 && u64 == 10,
+               "edge: base=0 leading zero is decimal (not octal)");
+    test_check(axl_str_to_u64("077", 0, &u64, NULL) == 0 && u64 == 77,
+               "edge: base=0 0xx is decimal");
+
+    /* "0x" followed by non-hex — strict mode rejects, endptr mode
+     * succeeds with v=0 and endptr at 'x' (matches strtoul). */
+    test_check(axl_str_to_u64("0xZZ", 0, &u64, NULL) == -1,
+               "edge: 0xZZ rejected in strict mode");
+    test_check(axl_str_to_u64("0xZZ", 0, &u64, &end) == 0
+               && u64 == 0 && *end == 'x',
+               "edge: 0xZZ in endptr mode parses as 0, leftover 'xZZ'");
+    test_check(axl_str_to_u64("0x ", 0, &u64, NULL) == -1,
+               "edge: 0x<space> rejected in strict mode");
+
+    /* Trailing whitespace — strict mode rejects (consistent with
+     * "strict means no trailing content"). */
+    test_check(axl_str_to_u64("123 ", 10, &u64, NULL) == -1,
+               "edge: trailing space rejected in strict mode");
+    test_check(axl_str_to_u64("123\t", 10, &u64, NULL) == -1,
+               "edge: trailing tab rejected in strict mode");
+    test_check(axl_str_to_u64("123 ", 10, &u64, &end) == 0
+               && u64 == 123 && *end == ' ',
+               "edge: trailing space OK in endptr mode");
+
+    /* s64 negative-overflow must reset endptr to nptr. The earlier
+     * version of axl_str_to_s64 left endptr advanced past the digits
+     * because the inner u64 succeeded; only the range check failed. */
+    const char *src = "-9223372036854775809";
+    test_check(axl_str_to_s64(src, 10, &s64, &end) == -1 && end == src,
+               "edge: s64 negative overflow resets endptr to nptr");
+    src = "9223372036854775808";
+    test_check(axl_str_to_s64(src, 10, &s64, &end) == -1 && end == src,
+               "edge: s64 positive overflow resets endptr to nptr");
+}
+
+// ---------------------------------------------------------------------------
 // axl_strcasestr
 // ---------------------------------------------------------------------------
 
@@ -683,6 +893,12 @@ test_strbuf_main(
     test_memset();
     test_snprintf();
     test_strtou64();
+    test_str_to_u64();
+    test_str_to_u32();
+    test_str_to_s64();
+    test_str_to_s32();
+    test_str_to_narrow();
+    test_str_to_edge_cases();
     test_strcasestr();
     test_fnmatch();
     test_wcs();

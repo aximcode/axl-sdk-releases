@@ -204,7 +204,13 @@ test_stats(void)
 static void
 test_leak_dump(void)
 {
-    // Just verify it runs without crash — output goes to log
+    /* Verify axl_mem_dump_leaks() runs without crashing. The dump
+     * lists allocations alive at the call site, which here are the
+     * AXL runtime's own bookkeeping (argv, registry slot array, atexit
+     * slot array). They are NOT real leaks — they are released at
+     * process teardown. The log will show a "leak report" with these
+     * runtime allocations; that is expected. */
+    axl_printf("(expected: dump lists AXL runtime's own argv/registry/atexit state)\n");
     axl_mem_dump_leaks();
     test_check(true, "leak dump: no crash");
 }

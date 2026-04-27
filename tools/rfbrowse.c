@@ -141,7 +141,7 @@ print_redfish_error(
         return;
     }
 
-    AxlJsonCtx ctx;
+    AxlJsonReader ctx;
     if (!axl_json_parse((const char *)body, body_size, &ctx)) {
         axl_printf("rfbrowse: HTTP %zu\n", status_code);
         return;
@@ -176,19 +176,20 @@ session_login(
     )
 {
     // Build login JSON
-    char json_buf[256];
-    AxlJsonBuilder jb;
-    axl_json_init(&jb, json_buf, sizeof(json_buf));
-    axl_json_object_start(&jb);
-    axl_json_add_string(&jb, "UserName", user);
-    axl_json_add_string(&jb, "Password", password);
-    axl_json_object_end(&jb);
-    size_t json_len = axl_json_finish(&jb);
+    AXL_AUTOPTR(AxlString) json_str = axl_string_new(NULL);
+    AxlJsonWriter jw;
+    axl_json_writer_init(&jw, json_str, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&jw);
+    axl_json_kv_str(&jw, "UserName", user);
+    axl_json_kv_str(&jw, "Password", password);
+    axl_json_obj_end(&jw);
+    size_t json_len = axl_json_writer_finish(&jw);
 
-    if (jb.overflow) {
+    if (axl_json_writer_error(&jw)) {
         axl_printf("rfbrowse: credentials too long\n");
         return -1;
     }
+    const char *json_buf = axl_string_str(json_str);
 
     // POST to session service
     char url[512];
@@ -322,9 +323,9 @@ get_resource(
 
     if (resp->body != NULL && resp->body_size > 0) {
         if (raw) {
-            axl_json_print_raw(resp->body, resp->body_size);
+            axl_printf("%.*s\n", (int)resp->body_size, (const char *)resp->body);
         } else {
-            axl_json_pretty_print(resp->body, resp->body_size);
+            axl_json_console_print(resp->body, resp->body_size);
         }
         axl_printf("\n");
     }
@@ -370,7 +371,7 @@ get_members(
         return -1;
     }
 
-    AxlJsonCtx ctx;
+    AxlJsonReader ctx;
     if (!axl_json_parse(resp->body, resp->body_size, &ctx)) {
         axl_printf("rfbrowse: failed to parse JSON response\n");
         return -1;
@@ -392,7 +393,7 @@ get_members(
 
     int result = 0;
     int count = 0;
-    AxlJsonCtx element;
+    AxlJsonReader element;
 
     while (axl_json_array_next(&iter, &element)) {
         char odata_id[256];

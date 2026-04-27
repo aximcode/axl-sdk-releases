@@ -269,6 +269,58 @@ test_file_handler(void)
 }
 
 // ---------------------------------------------------------------------------
+// Handler-table overflow — axl_log_add_handler must return -1 when full
+// ---------------------------------------------------------------------------
+
+/* Distinct callback per slot so axl_log_remove_handler can pop them
+ * one at a time rather than nuking everything at once. */
+static void noop_h0(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h1(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h2(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h3(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h4(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h5(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h6(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h7(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h8(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+
+static void
+test_add_handler_overflow(void)
+{
+    AxlLogHandler slots[] = {
+        noop_h0, noop_h1, noop_h2, noop_h3,
+        noop_h4, noop_h5, noop_h6, noop_h7,
+    };
+    /* Fill the table up to MAX_HANDLERS (currently 8). The exact cap
+     * is intentionally not asserted — we just have to keep this array
+     * at >= MAX_HANDLERS slots if the cap ever rises. */
+    int added = 0;
+    for (size_t i = 0; i < sizeof(slots)/sizeof(slots[0]); i++) {
+        if (axl_log_add_handler(slots[i], NULL) == 0) {
+            added++;
+        }
+    }
+    test_check(added > 0, "add_handler overflow: filled at least one slot");
+
+    /* The next add must be rejected. */
+    test_check(axl_log_add_handler(noop_h8, NULL) == -1,
+               "add_handler overflow: returns -1 when table full");
+
+    /* Same contract for the domain-filtered variant. */
+    test_check(axl_log_add_domain_handler("x", AXL_LOG_INFO, noop_h8, NULL) == -1,
+               "add_domain_handler overflow: returns -1 when table full");
+
+    /* NULL handler always rejected, regardless of fullness. */
+    test_check(axl_log_add_handler(NULL, NULL) == -1,
+               "add_handler: NULL handler rejected");
+
+    /* Clean up so subsequent test runs (if any) start fresh. */
+    for (int i = 0; i < added; i++) {
+        axl_log_remove_handler(slots[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -286,6 +338,7 @@ test_log_main(int argc, char **argv)
     test_ring_buffer();
     test_ring_overflow();
     test_file_handler();
+    test_add_handler_overflow();
 
     return test_print_results();
 }

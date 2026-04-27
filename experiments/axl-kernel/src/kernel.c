@@ -7,7 +7,7 @@
  * Process Control Block — the per-process struct that holds pid,
  * state, saved registers, stack pointer, parent/child links, exit
  * status (Linux calls it `task_struct`; FreeBSD `struct proc`).
- * See docs/AXL-Kernel-Design.md §13 for the spec.
+ * See ../AXL-Kernel-Design.md §13 for the spec.
  *
  * AXL API use policy: cold paths use axl-sdk freely (axl_printf,
  * axl_time_get_ms, axl_strcmp, axl_tcp_*). The hot paths — ready
@@ -739,6 +739,67 @@ axlk_close(int fd)
         axl_tcp_close(s->tcp);
     }
     fd_release(fd);
+}
+
+// ---------------------------------------------------------------------------
+// K3.1 — HTTP convenience: read + parse request line
+// ---------------------------------------------------------------------------
+
+int
+axlk_http_read_request_line(
+    int     fd,
+    char   *scratch,
+    size_t  scratch_cap,
+    char   *method_out,
+    size_t  method_cap,
+    char   *path_out,
+    size_t  path_cap)
+{
+    if (scratch == NULL || scratch_cap < 4 ||
+        method_out == NULL || method_cap == 0 ||
+        path_out == NULL || path_cap == 0) {
+        return -1;
+    }
+
+    /* Read until we see the header terminator or the buffer fills. */
+    size_t total = 0;
+    while (total < scratch_cap - 1) {
+        int n = axlk_read(fd, scratch + total, scratch_cap - 1 - total);
+        if (n <= 0) {
+            return -1;
+        }
+        total += (size_t)n;
+        scratch[total] = '\0';
+        if (axl_http_find_header_end(scratch, total) > 0) {
+            break;
+        }
+    }
+    if (axl_http_find_header_end(scratch, total) == 0) {
+        return -1;
+    }
+
+    /* Locate the end of the request line (first \r\n in the buffer). */
+    size_t line_len = 0;
+    while (line_len + 1 < total &&
+           !(scratch[line_len] == '\r' && scratch[line_len + 1] == '\n')) {
+        line_len++;
+    }
+    if (line_len + 1 >= total) {
+        return -1;
+    }
+
+    /* Delegate parsing to the axl-sdk public helper. */
+    AXL_AUTO_FREE char *method = NULL;
+    AXL_AUTO_FREE char *path   = NULL;
+    AXL_AUTO_FREE char *query  = NULL;
+    if (axl_http_parse_request_line(scratch, line_len,
+                                    &method, &path, &query) != 0) {
+        return -1;
+    }
+
+    axl_strlcpy(method_out, method != NULL ? method : "", method_cap);
+    axl_strlcpy(path_out,   path   != NULL ? path   : "", path_cap);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

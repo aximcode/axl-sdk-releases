@@ -76,7 +76,7 @@ jprint_newline(void)
 // ---------------------------------------------------------------------------
 
 void
-axl_json_pretty_print(const char *json, size_t len)
+axl_json_console_print(const char *json, size_t len)
 {
     int      depth;
     bool     in_string;
@@ -214,33 +214,4 @@ axl_json_pretty_print(const char *json, size_t len)
 
     jprint_newline();
     restore_color();
-}
-
-void
-axl_json_print_raw(const char *json, size_t len)
-{
-    unsigned short  buf[129];
-    size_t          pos;
-    size_t          i;
-
-    if (json == NULL || len == 0) {
-        return;
-    }
-
-    pos = 0;
-    for (i = 0; i < len; i++) {
-        buf[pos++] = (unsigned short)(unsigned char)json[i];
-        if (pos >= 128) {
-            buf[pos] = 0;
-            axl_backend_console_write(buf);
-            pos = 0;
-        }
-    }
-
-    if (pos > 0) {
-        buf[pos] = 0;
-        axl_backend_console_write(buf);
-    }
-
-    axl_backend_console_write((const unsigned short *)L"\r\n");
 }

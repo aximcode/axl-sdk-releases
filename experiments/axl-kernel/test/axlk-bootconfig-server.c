@@ -25,7 +25,6 @@
 
 #define BC_PORT            8081
 #define BC_RECV_BUFSZ      1024
-#define BC_SEND_BUFSZ      8192
 #define BC_MAX_CLIENTS     5
 #define BC_MAX_BOOT_ORDER  32
 
@@ -120,106 +119,92 @@ read_boot_entry_description(uint16_t id, char *out, size_t out_cap)
 // Endpoint builders
 // ---------------------------------------------------------------------------
 
-static int
-endpoint_overview(char *buf, size_t cap)
+static void
+endpoint_overview(AxlJsonWriter *w)
 {
     uint16_t order[BC_MAX_BOOT_ORDER];
     int      n = read_boot_order(order, BC_MAX_BOOT_ORDER);
     uint16_t next, timeout;
     uint8_t  sb;
-    int      have_next = (read_boot_next(&next) == 0);
-    int      have_to   = (read_boot_timeout(&timeout) == 0);
-    int      have_sb   = (read_secure_boot(&sb) == 0);
+    bool     have_next = (read_boot_next(&next) == 0);
+    bool     have_to   = (read_boot_timeout(&timeout) == 0);
+    bool     have_sb   = (read_secure_boot(&sb) == 0);
 
-    int w = 0;
-    w += axl_snprintf(buf + w, cap - w, "{\"boot_order\":[");
-    for (int i = 0; i < n; i++) {
-        w += axl_snprintf(buf + w, cap - w, "%s\"Boot%04X\"",
-                          i ? "," : "", (unsigned)order[i]);
-    }
-    w += axl_snprintf(buf + w, cap - w, "],");
-    if (have_next) {
-        w += axl_snprintf(buf + w, cap - w,
-                          "\"boot_next\":\"Boot%04X\",", (unsigned)next);
-    } else {
-        w += axl_snprintf(buf + w, cap - w, "\"boot_next\":null,");
-    }
-    if (have_to) {
-        w += axl_snprintf(buf + w, cap - w, "\"timeout_s\":%u,", (unsigned)timeout);
-    } else {
-        w += axl_snprintf(buf + w, cap - w, "\"timeout_s\":null,");
-    }
-    if (have_sb) {
-        w += axl_snprintf(buf + w, cap - w,
-                          "\"secure_boot\":%s", sb ? "true" : "false");
-    } else {
-        w += axl_snprintf(buf + w, cap - w, "\"secure_boot\":null");
-    }
-    w += axl_snprintf(buf + w, cap - w, "}");
-    return w;
+    axl_json_obj_begin(w);
+        axl_json_key(w, "boot_order");
+        axl_json_arr_begin(w);
+        for (int i = 0; i < n; i++) {
+            char id[16];
+            axl_snprintf(id, sizeof(id), "Boot%04X", (unsigned)order[i]);
+            axl_json_str(w, id);
+        }
+        axl_json_arr_end(w);
+
+        if (have_next) {
+            char id[16];
+            axl_snprintf(id, sizeof(id), "Boot%04X", (unsigned)next);
+            axl_json_kv_str(w, "boot_next", id);
+        } else {
+            axl_json_kv_null(w, "boot_next");
+        }
+
+        if (have_to) {
+            axl_json_kv_uint(w, "timeout_s", (uint64_t)timeout);
+        } else {
+            axl_json_kv_null(w, "timeout_s");
+        }
+
+        if (have_sb) {
+            axl_json_kv_bool(w, "secure_boot", sb != 0);
+        } else {
+            axl_json_kv_null(w, "secure_boot");
+        }
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_entries(char *buf, size_t cap)
+static void
+endpoint_entries(AxlJsonWriter *w)
 {
     uint16_t order[BC_MAX_BOOT_ORDER];
     int      n = read_boot_order(order, BC_MAX_BOOT_ORDER);
 
-    int w = 0;
-    w += axl_snprintf(buf + w, cap - w, "{\"entries\":[");
-    for (int i = 0; i < n; i++) {
-        char desc[256];
-        desc[0] = '\0';
-        read_boot_entry_description(order[i], desc, sizeof(desc));
+    axl_json_obj_begin(w);
+        axl_json_key(w, "entries");
+        axl_json_arr_begin(w);
+        for (int i = 0; i < n; i++) {
+            char desc[256];
+            desc[0] = '\0';
+            read_boot_entry_description(order[i], desc, sizeof(desc));
 
-        w += axl_snprintf(buf + w, cap - w,
-                          "%s{\"id\":\"Boot%04X\",\"description\":\"%s\"}",
-                          i ? "," : "", (unsigned)order[i], desc);
-        if (w >= (int)cap - 64) break;
-    }
-    w += axl_snprintf(buf + w, cap - w, "]}");
-    return w;
+            char id[16];
+            axl_snprintf(id, sizeof(id), "Boot%04X", (unsigned)order[i]);
+
+            axl_json_obj_begin(w);
+                axl_json_kv_str(w, "id",          id);
+                axl_json_kv_str(w, "description", desc);
+            axl_json_obj_end(w);
+        }
+        axl_json_arr_end(w);
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_secureboot(char *buf, size_t cap)
+static void
+endpoint_secureboot(AxlJsonWriter *w)
 {
     uint8_t sb;
-    int     have = (read_secure_boot(&sb) == 0);
-    return axl_snprintf(buf, cap,
-        "{\"secure_boot\":%s}",
-        have ? (sb ? "true" : "false") : "null");
-}
-
-// ---------------------------------------------------------------------------
-// HTTP — same pattern as the HwInfo port
-// ---------------------------------------------------------------------------
-
-static int
-http_read_path(int fd, char *path_out, size_t path_cap)
-{
-    char   buf[BC_RECV_BUFSZ];
-    size_t total = 0;
-
-    while (total < sizeof(buf) - 1) {
-        int n = axlk_read(fd, buf + total, sizeof(buf) - 1 - total);
-        if (n <= 0) return -1;
-        total += (size_t)n;
-        buf[total] = '\0';
-        if (axl_strstr(buf, "\r\n\r\n") != NULL) break;
+    bool    have = (read_secure_boot(&sb) == 0);
+    axl_json_obj_begin(w);
+    if (have) {
+        axl_json_kv_bool(w, "secure_boot", sb != 0);
+    } else {
+        axl_json_kv_null(w, "secure_boot");
     }
-
-    const char *first  = axl_strchr(buf, ' ');
-    if (first == NULL) return -1;
-    const char *second = axl_strchr(first + 1, ' ');
-    if (second == NULL) return -1;
-
-    size_t path_len = (size_t)(second - (first + 1));
-    if (path_len >= path_cap) path_len = path_cap - 1;
-    axl_memcpy(path_out, first + 1, path_len);
-    path_out[path_len] = '\0';
-    return 0;
+    axl_json_obj_end(w);
 }
+
+// ---------------------------------------------------------------------------
+// Per-client handler
+// ---------------------------------------------------------------------------
 
 static int
 handle_client(int argc, char **argv)
@@ -227,44 +212,55 @@ handle_client(int argc, char **argv)
     (void)argc;
     int fd = (int)(intptr_t)argv;
 
+    char method[16];
     char path[64];
-    char body[BC_SEND_BUFSZ];
-    int  body_len = 0, status = 200;
+    char scratch[BC_RECV_BUFSZ];
+    int  status = 200;
     const char *status_text = "OK";
 
-    if (http_read_path(fd, path, sizeof(path)) != 0) {
+    AXL_AUTOPTR(AxlString) body = axl_string_new(NULL);
+    AxlJsonWriter w;
+    axl_json_writer_init(&w, body, AXL_JSON_WRITER_DEFAULT);
+
+    if (axlk_http_read_request_line(fd, scratch, sizeof(scratch),
+                                    method, sizeof(method),
+                                    path, sizeof(path)) != 0) {
         status = 400;
         status_text = "Bad Request";
-        body_len = axl_snprintf(body, sizeof(body), "{\"error\":\"bad request\"}");
+        axl_json_obj_begin(&w);
+            axl_json_kv_str(&w, "error", "bad request");
+        axl_json_obj_end(&w);
     } else if (axl_streql(path, "/")) {
-        body_len = endpoint_overview(body, sizeof(body));
+        endpoint_overview(&w);
     } else if (axl_streql(path, "/entries")) {
-        body_len = endpoint_entries(body, sizeof(body));
+        endpoint_entries(&w);
     } else if (axl_streql(path, "/secureboot")) {
-        body_len = endpoint_secureboot(body, sizeof(body));
+        endpoint_secureboot(&w);
     } else {
         status = 404;
         status_text = "Not Found";
-        body_len = axl_snprintf(body, sizeof(body),
-                                "{\"error\":\"not found\",\"path\":\"%s\"}",
-                                path);
+        axl_json_obj_begin(&w);
+            axl_json_kv_str(&w, "error", "not found");
+            axl_json_kv_str(&w, "path",  path);
+        axl_json_obj_end(&w);
     }
+    size_t body_len = axl_json_writer_finish(&w);
 
-    axl_printf("  pid %d %s → %d (%d bytes)\n",
+    axl_printf("  pid %d %s → %d (%zu bytes)\n",
                (int)axlk_getpid(), path, status, body_len);
 
     char header[256];
     int hlen = axl_snprintf(header, sizeof(header),
         "HTTP/1.0 %d %s\r\n"
         "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n",
         status, status_text, body_len);
 
     axlk_write(fd, header, (size_t)hlen);
     if (body_len > 0) {
-        axlk_write(fd, body, (size_t)body_len);
+        axlk_write(fd, axl_string_str(body), body_len);
     }
     axlk_close(fd);
     return 0;

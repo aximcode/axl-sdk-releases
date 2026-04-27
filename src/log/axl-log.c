@@ -373,11 +373,11 @@ axl_log_set_domain_level(const char *domain, int level)
     mDomainCount++;
 }
 
-void
+int
 axl_log_add_handler(AxlLogHandler handler, void *data)
 {
     if (handler == NULL || mHandlerCount >= MAX_HANDLERS) {
-        return;
+        return -1;
     }
 
     mHandlers[mHandlerCount]      = handler;
@@ -386,14 +386,15 @@ axl_log_add_handler(AxlLogHandler handler, void *data)
     mHandlerMaxLevel[mHandlerCount] = AXL_LOG_TRACE;
     mHandlerFiltered[mHandlerCount] = false;
     mHandlerCount++;
+    return 0;
 }
 
-void
+int
 axl_log_add_domain_handler(const char *domain, int max_level,
                            AxlLogHandler handler, void *data)
 {
     if (handler == NULL || mHandlerCount >= MAX_HANDLERS) {
-        return;
+        return -1;
     }
 
     mHandlers[mHandlerCount]      = handler;
@@ -402,6 +403,7 @@ axl_log_add_domain_handler(const char *domain, int max_level,
     mHandlerMaxLevel[mHandlerCount] = max_level;
     mHandlerFiltered[mHandlerCount] = true;
     mHandlerCount++;
+    return 0;
 }
 
 void

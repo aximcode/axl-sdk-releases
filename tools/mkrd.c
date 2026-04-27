@@ -587,6 +587,15 @@ main(
 
     verbose = axl_config_get_bool(cfg, "verbose");
 
+    if (verbose) {
+        /* Raise log level so axl_driver_ensure's debug trace surfaces. */
+        axl_log_set_level(AXL_LOG_DEBUG);
+        axl_diag_startup(argc, argv);
+        axl_diag_probe_protocol(
+            (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+            "EFI_RAM_DISK_PROTOCOL");
+    }
+
     /* All non-help modes need EFI_RAM_DISK_PROTOCOL. Auto-load
      * RamDiskDxe.efi if it isn't already registered, so MkRd works
      * from a bare UEFI shell without a startup.nsh that pre-loads
@@ -595,6 +604,15 @@ main(
                           "RamDiskDxe.efi") != 0) {
         axl_printf("MkRd: RamDiskDxe.efi not found on any mounted volume.\n");
         return 1;
+    }
+
+    if (verbose) {
+        /* Re-probe — proves whether axl_driver_ensure short-circuited
+         * (status matches the pre-ensure probe) or actually loaded a
+         * driver (status flips from NOT registered to REGISTERED). */
+        axl_diag_probe_protocol(
+            (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+            "EFI_RAM_DISK_PROTOCOL (post-ensure)");
     }
 
     /* List mode */

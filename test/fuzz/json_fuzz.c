@@ -29,7 +29,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         memcpy(input, data, size);
     }
 
-    AxlJsonCtx ctx;
+    AxlJsonReader ctx;
     memset(&ctx, 0, sizeof(ctx));
 
     if (axl_json_parse((const char *)input, size, &ctx)) {

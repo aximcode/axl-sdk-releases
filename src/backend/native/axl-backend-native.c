@@ -991,6 +991,98 @@ axl_backend_shell_break_flag(
     return (status == EFI_SUCCESS);
 }
 
+// ---------------------------------------------------------------------------
+// Serial Ctrl-C bridge
+//
+// EDK2's TerminalDxe (the serial-console driver) delivers raw 0x03
+// bytes from the wire with KeyShiftState=0 — serial protocol carries
+// no shift-state info and OVMF can't synthesize it. The Shell's
+// CtrlCNotifyHandle{1..4} all require KeyShiftState to indicate Ctrl
+// pressed, so they never match on serial input → ExecutionBreak
+// never signals → axl_loop_run waits forever.
+//
+// Fix: register our own SimpleTextInputEx KeyNotify on ConsoleInHandle
+// for {UnicodeChar=0x03, KeyShiftState=0}. When it fires, signal
+// shell->ExecutionBreak directly (the event the loop already waits
+// on). Lazy-init on first call to axl_backend_shell_break_event so
+// drivers and apps that never use the loop pay nothing.
+// ---------------------------------------------------------------------------
+
+static bool   mSerialCtrlCInstalled = false;
+static VOID  *mSerialCtrlCHandle    = NULL;
+
+static EFI_STATUS EFIAPI
+serial_ctrl_c_notify(
+    IN EFI_KEY_DATA  *KeyData
+    )
+{
+    (void)KeyData;
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell != NULL && shell->ExecutionBreak != NULL) {
+        gBS->SignalEvent(shell->ExecutionBreak);
+    }
+    return EFI_SUCCESS;
+}
+
+static void
+install_serial_ctrl_c_notify(void)
+{
+    if (mSerialCtrlCInstalled) {
+        return;
+    }
+    mSerialCtrlCInstalled = true;   /* one-shot regardless of outcome */
+
+    EFI_GUID guid = gEfiSimpleTextInputExProtocolGuid;
+
+    /* Register on every handle exposing SimpleTextInputEx — each
+     * physical console driver (TerminalDxe per serial port + any
+     * keyboard driver). ConSplitter aggregates these but its
+     * forward-to-children path can race with attach order; doing
+     * this directly avoids the timing-sensitive case. */
+    EFI_HANDLE *handles = NULL;
+    UINTN       handle_count = 0;
+    EFI_STATUS  status = gBS->LocateHandleBuffer(
+        ByProtocol, &guid, NULL, &handle_count, &handles);
+    if (EFI_ERROR(status) || handles == NULL || handle_count == 0) {
+        axl_warning("serial Ctrl-C: LocateHandleBuffer found 0 (status=0x%lx)",
+                    (unsigned long)status);
+        return;
+    }
+
+    EFI_KEY_DATA key_data = {0};
+    key_data.Key.UnicodeChar         = 0x03;       /* ETX, raw Ctrl-C byte */
+    key_data.Key.ScanCode            = 0;
+    key_data.KeyState.KeyShiftState  = 0;          /* matches TerminalDxe */
+    key_data.KeyState.KeyToggleState = 0;
+
+    UINTN installed = 0;
+    for (UINTN i = 0; i < handle_count; i++) {
+        EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *simple_ex = NULL;
+        if (gBS->HandleProtocol(handles[i], &guid, (void **)&simple_ex) != 0
+            || simple_ex == NULL) {
+            continue;
+        }
+        VOID *notify_handle = NULL;
+        if (simple_ex->RegisterKeyNotify(simple_ex, &key_data,
+                                         serial_ctrl_c_notify,
+                                         &notify_handle) == 0) {
+            installed++;
+            /* Save the first handle for symmetry — most common case. */
+            if (mSerialCtrlCHandle == NULL) {
+                mSerialCtrlCHandle = notify_handle;
+            }
+        }
+    }
+    gBS->FreePool(handles);
+
+    if (installed == 0) {
+        axl_warning("serial Ctrl-C: registered on 0 handles");
+    } else {
+        axl_info("serial Ctrl-C bridge installed on %lu handle%s",
+                 (unsigned long)installed, installed == 1 ? "" : "s");
+    }
+}
+
 AxlEventHandle
 axl_backend_shell_break_event(
     void
@@ -1002,6 +1094,12 @@ axl_backend_shell_break_event(
     if (shell == NULL) {
         return NULL;
     }
+
+    /* Make sure serial Ctrl-C reaches ExecutionBreak. Real-keyboard
+     * Ctrl-C still goes through the Shell's own Ctrl-modifier notify
+     * unchanged; this is purely additive for the serial-console
+     * case (BMC, IPMI SoL, qemu -nographic, etc.). */
+    install_serial_ctrl_c_notify();
 
     return (AxlEventHandle)shell->ExecutionBreak;
 }

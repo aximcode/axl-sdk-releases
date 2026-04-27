@@ -178,6 +178,38 @@ int axlk_write(int fd, const void *buf, size_t n);
  */
 void axlk_close(int fd);
 
+// ---------------------------------------------------------------------------
+// K3.1 — HTTP convenience: read + parse the request line off a TCP fd.
+//
+// All three SoftBMC-shape ports want exactly this: read until the
+// header terminator, then extract method + path. The parse itself
+// delegates to axl_http_parse_request_line in axl-sdk; this wrapper
+// owns the read loop, line-end detection, and copy-into-caller-
+// buffer step.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Read an HTTP request from @p fd and extract method + path.
+ *
+ * Reads until "\r\n\r\n" arrives or @p scratch fills, then parses the
+ * first line via axl_http_parse_request_line. Method and path are
+ * copied into the caller's buffers (truncated to fit). Query string,
+ * headers, and body are discarded.
+ *
+ * @return 0 on success, -1 on read error, malformed request, or
+ *         missing terminator within the scratch capacity.
+ */
+int
+axlk_http_read_request_line(
+    int     fd,            ///< connected client fd
+    char   *scratch,       ///< caller-provided byte buffer for the raw read
+    size_t  scratch_cap,   ///< capacity of @p scratch
+    char   *method_out,    ///< receives the method (NUL-terminated, truncated to fit)
+    size_t  method_cap,    ///< capacity of @p method_out
+    char   *path_out,      ///< receives the path (NUL-terminated, truncated to fit)
+    size_t  path_cap       ///< capacity of @p path_out
+);
+
 #ifdef __cplusplus
 }
 #endif

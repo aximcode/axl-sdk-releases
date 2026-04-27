@@ -49,7 +49,6 @@ RUN_LOG="$TMP/run.out"
 
 cleanup() {
     [[ -n "$BRIDGE_PID"     ]] && kill "$BRIDGE_PID"     2>/dev/null || true
-    [[ -n "$LOG_READER_PID" ]] && kill "$LOG_READER_PID" 2>/dev/null || true
     [[ -n "$QEMU_PID"       ]] && kill -9 "$QEMU_PID"    2>/dev/null || true
     exec 9>&- 2>/dev/null || true
     rm -rf "$TMP"
@@ -74,14 +73,23 @@ fi
 # the serial log as an additional exit-path signal).
 "$AXL_CC" --debug "$DEMO_C" -o "$EFI" >/dev/null
 
-mkfifo "$QIN"
-
 # Launch QEMU in background. --serial-socket exposes the guest serial
-# as a UNIX socket we can both read AND write from the host side.
+# as a UNIX socket. QEMU's chardev with server=on,wait=off accepts a
+# SINGLE bidirectional client connection — that's why the previous
+# two-socat split (one for reading, one for writing) couldn't work:
+# the second connection was rejected, and 0x03 never reached the
+# guest. We now run a single bidirectional socat that reads from a
+# control FIFO AND tees the socket output to the log file.
+# QEMU's outer timeout: 60 s on KVM, 240 s on TCG. The test's own
+# inner polling (idle_wait_iters etc.) gives up earlier on success
+# paths; this just keeps QEMU alive long enough for slow TCG boots.
+qemu_timeout=60
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    qemu_timeout=240
+fi
 "$RUN_QEMU" \
-    --background --timeout 60 \
+    --background --timeout "$qemu_timeout" \
     --serial-socket "$SOCK" \
-    --serial-log "$LOG" \
     "$EFI" > "$RUN_LOG" 2>&1
 
 QEMU_PID=$(grep -oP '^QEMU_PID=\K\d+' "$RUN_LOG")
@@ -97,21 +105,42 @@ for _ in $(seq 1 50); do
 done
 [[ -S "$SOCK" ]] || { echo "ERROR: serial socket never appeared"; exit 1; }
 
-# Hold FIFO writer open for this shell so the socat reader never EOFs.
-exec 9>"$QIN"
+mkfifo "$QIN"
 
-# Two one-way socat bridges. QEMU's chardev socket accepts a single
-# connection, but splitting direction across two short-lived
-# connections works because QEMU reconnects on EOF. One writer, one
-# reader.
-socat -u "UNIX-CONNECT:$SOCK" "CREATE:$LOG,append=1"  &
-LOG_READER_PID=$!
-socat    "OPEN:$QIN,rdonly"   "UNIX-CONNECT:$SOCK"    &
+# Hold the FIFO writer open in the shell BEFORE starting socat so
+# socat's stdin doesn't see EOF immediately when no other writer is
+# attached. fd 9 is the long-lived writer; the cleanup trap closes
+# it on exit. Opening O_RDWR (<>) avoids the no-reader block on the
+# named pipe.
+exec 9<>"$QIN"
+
+# Single bidirectional bridge using socat's stdio mode.
+#   stdin   ← QIN ← shell fd 9 ← printf '\x03' (host control)
+#   stdout  → tee → LOG (guest serial output)
+# socat copies stdin → socket, socket → stdout. tee appends socat's
+# stdout (the guest's serial output) to LOG. Drops tee's stdout
+# because nothing further consumes it.
+socat - "UNIX-CONNECT:$SOCK" < "$QIN" | tee -a "$LOG" > /dev/null &
 BRIDGE_PID=$!
 
-# Wait for the "entering idle" marker — at most 25 s of polling.
+# Wait briefly for socat to actually open the socket — if it fails
+# we'd hang forever waiting for the idle marker.
+for _ in $(seq 1 30); do
+    grep -q "" "$LOG" 2>/dev/null && break    # any byte means it's running
+    [[ -n $(lsof -tU "$SOCK" 2>/dev/null) ]] && break
+    sleep 0.1
+done
+
+# Wait for the "entering idle" marker. KVM finishes the sort+boot
+# inside ~12-18 s; TCG (CI runners with no /dev/kvm access) needs
+# ~3-4x longer because the array sort runs slower. Bump the budget
+# accordingly.
+idle_wait_iters=100   # 25 s at 0.25 s/iter
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    idle_wait_iters=480   # 120 s for TCG
+fi
 echo "waiting for idle marker..."
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "$idle_wait_iters"); do
     grep -q "entering idle" "$LOG" 2>/dev/null && break
     sleep 0.25
 done

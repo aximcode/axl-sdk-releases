@@ -655,9 +655,9 @@ synchronization primitive to reach for.
       source + AxlEvent type), and comparison with adjacent
       ecosystems (GLib `GMainLoop` + `GCancellable`, Python asyncio,
       libuv, Linux kernel `struct completion`, C++ `std::latch`).
-- [x] Cross-linked from `docs/AXL-Design.md` (after §API Overview),
-      `docs/AXL-SDK-Design.md` (§Async-op cancellation), and
-      `src/event/README.md` (after §When to use what).
+- [x] Cross-linked from `docs/AXL-Design.md` (after [§API Overview](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md#api-overview)),
+      `docs/AXL-SDK-Design.md` ([§Async-op cancellation](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-SDK-Design.md#async-op-cancellation)), and
+      `src/event/README.md` (after [§When to use what](https://github.com/aximcode/axl-sdk-releases/blob/main/src/event/README.md#when-to-use-what)).
 - [x] Sphinx guide page: `docs/sphinx/guides/concurrency.rst`
       `.. include::` of the markdown file; added to the Guides
       toctree in `index.rst` between Design and Coding Style.
@@ -705,7 +705,7 @@ What landed:
       `_axl_cleanup` before the registry sweep.
 - [x] Tier-1 firmware-resource registry --
       `src/runtime/axl-registry.c`. AxlArray-backed + monotonic
-      seq for true LIFO sweep; always on (design §9).
+      seq for true LIFO sweep; always on ([design §9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in)).
 - [x] **`axl_exit(rc)` as the blessed exit path.** NORETURN. Runs
       atexit + sweep, then `axl_backend_boot_exit(rc)` ->
       `gBS->Exit`. Both return-from-main and explicit `axl_exit`
@@ -718,8 +718,8 @@ What landed:
       Sweep warnings name the user's call site (or library call
       site for library-internal allocations — which correctly
       freed never reach the sweep anyway).
-- [x] **`axl_loop_iterate_until`** (nested-wait primitive, design
-      §5.6) — lets callers inside a loop callback wait on an
+- [x] **`axl_loop_iterate_until`** (nested-wait primitive, [design
+      §5.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#56-nested-wait-primitive-axl_loop_iterate_until)) — lets callers inside a loop callback wait on an
       event without freezing the outer loop's other sources.
 - [x] `runtime-demo.c` — 8 subcommand scenarios covering every
       facet, validated on X64 + AARCH64.
@@ -727,11 +727,11 @@ What landed:
       `test_check` calls covering atexit, registry, yield,
       interrupted, signal-install.
 - [x] Cooperative-concurrency caveat documented in
-      [docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §11 and
+      [docs/AXL-Runtime.md §11](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#11-what-this-doesnt-help-with) and
       [docs/AXL-Concurrency.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
 Deferred to a future phase (both captured in
-[docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §10):
+[docs/AXL-Runtime.md §10](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#10-deferred-items)):
 
 - [ ] **Release-mode heap auto-sweep.** `mAllocList` exists only
       under `AXL_MEM_DEBUG` today; making release-build sweeps
@@ -743,7 +743,7 @@ Deferred to a future phase (both captured in
       library-livelock guard, not a signal mechanism. No concrete
       caller has asked for it yet.
 
-Design decisions locked in (see design doc §7, §9):
+Design decisions locked in (see [design doc §7](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#7-what-we-are-not-doing), [§9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in)):
 
 - No `longjmp` from break notify — async-signal-unsafety.
 - No UEFI watchdog repurpose — reset-only on every platform.
@@ -1055,6 +1055,41 @@ during code review and refactor work, not during original planning.
 - [ ] **Benchmark suite.** No benchmarks for the library. The hash
       table, radix tree, ring buffer, format engine, and JSON parser
       are the obvious candidates.
+- [x] **`axl_http_parse_request_line` already public; kernel servers
+      deduped.** The parser was already exposed via
+      `<axl/axl-http-core.h>` (umbrella'd through `<axl.h>`); the
+      ROADMAP entry was wrong about needing to promote it. Real
+      win: added `axlk_http_read_request_line` in
+      `experiments/axl-kernel/include/axl-kernel.h` that wraps the
+      read loop + the public parse, and migrated all three kernel
+      POC servers (hwinfo, bootconfig, reqlog) to use it. ~70 LOC
+      of duplicated byte-fiddling removed.
+- [x] **AxlJsonWriter — JSON output API.** Landed. Renamed
+      `AxlJsonCtx`/`AxlJsonBuilder` to `AxlJsonReader`/`AxlJsonWriter`
+      for symmetry. Writer now AxlString-backed, with orthogonal
+      container/key/atom calls, optional `AXL_JSON_WRITER_PRETTY`
+      flag, sticky error flag (covers OOM + structural misuse),
+      and `axl_json_write_token` bridge for parse → mutate → emit.
+      Migrated tests, fuzz, tools/rfbrowse, sdk/examples. Three
+      kernel POC servers now build their endpoint JSON via the
+      writer, not snprintf chunks.
+- [x] **Kernel-server endpoint builder cleanups.** Done as part of
+      the AxlJsonWriter migration. axlk-reqlog-server's manual
+      NUL-terminated copy loops swapped to `axl_strlcpy`; all three
+      servers' endpoint builders now use the writer.
+- [x] **AxlRingBuf push/lost stats counters.** Landed. Added
+      `pushes_total` + `pushes_lost` as cumulative byte counters on
+      every push path (push, push_msg, push_elem, push_advance —
+      including reject-mode rejection and overwrite-mode
+      input-drop / old-data-displacement). Accessors are
+      `axl_ring_buf_pushes_total/_lost`; struct fields are private
+      and reset on `axl_ring_buf_clear`/init. axlk-reqlog-server
+      now uses AxlRingBuf for its 8-element log ring (replacing
+      the hand-rolled struct + head index + counters), and computes
+      received/dropped by dividing the byte counters by element size.
+      19 new unit tests cover reject-rejected, overwrite-displaced,
+      oversized-overwrite-input-drop, element-mode counts, and
+      clear() reset.
 
 ### Correctness / performance gaps
 
@@ -1169,7 +1204,7 @@ during code review and refactor work, not during original planning.
             Discovered 2026-04-18.
 
       - [ ] **`axl_yield()` instrumentation of AXL APIs.**
-            [docs/AXL-Runtime.md §3.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) lists the
+            [docs/AXL-Runtime.md §3.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#31-where-axl-apis-inject-yields-automatically) lists the
             targets: file I/O (`axl_file_get_contents` /
             `axl_fread` / directory iteration), HTTP body-read
             loops in `src/net/axl-http-client.c`, `axl_digest_update`
@@ -1186,8 +1221,8 @@ during code review and refactor work, not during original planning.
 
       - [ ] **Minimal runtime opt-out via `axl-cc --minimal-runtime`.**
             CRT0 unconditionally installs the registry, atexit list,
-            signal notify, and default loop during `_axl_init`. §9
-            of `AXL-Runtime.md` locked in "registry is always on"
+            signal notify, and default loop during `_axl_init`. [§9
+            of `AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in) locked in "registry is always on"
             with the rationale that drivers don't link CRT0 anyway;
             that's true but leaves size-constrained or exit-managed
             apps with no way out. Ship `axl-crt0-minimal.o` as a
@@ -1213,7 +1248,7 @@ during code review and refactor work, not during original planning.
             to fire every tick, and `test/unit/axl-test-runtime.c`
             has `test_yield_dispatches_ready_work` explicitly
             asserting the current semantics. Kept as-is; documented
-            as a footgun in `AXL-Runtime.md` §2.6 (recommend
+            as a footgun in [`AXL-Runtime.md` §2.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#26-idle-callbacks-and-yield-driven-loops) (recommend
             `axl_loop_add_timer` or `axl_defer` for tight-yield
             apps). Revisit if a real caller hits unresponsive
             idles or unwanted saturation — at which point the

@@ -229,29 +229,12 @@ axl_socket_address_new_from_string(const char *str, uint16_t default_port)
     }
 
     if (colon != NULL) {
-        /* Parse port after colon (max 5 digits: 0-65535) */
-        unsigned int val = 0;
-        const char *p = colon + 1;
-        int digits = 0;
-
-        if (*p == '\0') {
-            return NULL;  /* trailing colon with no port */
+        /* Strict u16 parse rejects empty (trailing colon), non-digit
+         * characters, and > 65535. Same correctness as the previous
+         * 22-line hand-rolled loop. */
+        if (axl_str_to_u16(colon + 1, 10, &port, NULL) != 0) {
+            return NULL;
         }
-        for (; *p != '\0'; p++) {
-            if (*p < '0' || *p > '9') {
-                return NULL;
-            }
-            digits++;
-            if (digits > 5) {
-                return NULL;  /* too many digits */
-            }
-            val = val * 10 + (unsigned int)(*p - '0');
-            if (val > 65535) {
-                return NULL;
-            }
-        }
-        port = (uint16_t)val;
-
         host_len = (size_t)(colon - str);
     } else {
         port = default_port;

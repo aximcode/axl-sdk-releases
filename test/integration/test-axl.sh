@@ -1,14 +1,21 @@
 #!/bin/bash
 # AXL unit tests — boots QEMU and runs all test .efi applications.
 #
-# Usage: ./test/integration/test-axl.sh [--arch X64|AARCH64]
+# Usage: ./test/integration/test-axl.sh [--arch X64|AARCH64] [--log <path>]
+#
+# --log <path>   Save the raw QEMU serial log (full firmware boot,
+#                Shell session, every test's PASS/FAIL lines) to the
+#                given path. Equivalent to setting TEST_KEEP_LOG.
+
+[[ -n "$DEBUG" ]] && set -x
 
 source "$(dirname "$0")/common-test.sh"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) TEST_ARCH="$2"; shift 2 ;;
-        *)      echo "Usage: $0 [--arch X64|AARCH64]"; exit 1 ;;
+        --log)  TEST_KEEP_LOG="$2"; export TEST_KEEP_LOG; shift 2 ;;
+        *)      echo "Usage: $0 [--arch X64|AARCH64] [--log <path>]"; exit 1 ;;
     esac
 done
 

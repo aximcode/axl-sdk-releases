@@ -75,7 +75,13 @@ build_qemu_base_cmd() {
     case "$arch" in
         X64)
             printf '%s\0' "-machine" "q35"
-            [[ -e /dev/kvm ]] && printf '%s\0' "-enable-kvm" "-cpu" "host"
+            # KVM acceleration only when /dev/kvm is actually usable.
+            # Some hosts (CI runners, locked-down workstations) expose
+            # the device node but block read/write — `-enable-kvm` then
+            # makes QEMU exit immediately with no diagnostic.
+            if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+                printf '%s\0' "-enable-kvm" "-cpu" "host"
+            fi
             ;;
         AARCH64)
             printf '%s\0' "-machine" "virt" "-cpu" "cortex-a57"
@@ -120,8 +126,20 @@ find_qemu() {
         return 0
     fi
 
-    log_error "$binary not found at ${QEMU_DIR:-<unset>}"
-    log_error "Set QEMU_DIR or install QEMU to ~/projects/qemu/"
+    # System install (CI runners, distro packages) — search PATH.
+    if command -v "$binary" &>/dev/null; then
+        local resolved
+        resolved=$(command -v "$binary")
+        # Set QEMU_DIR for downstream callers (find_firmware reads it
+        # to discover bundled firmware via $QEMU_DIR/../share/qemu).
+        QEMU_DIR=$(dirname "$resolved")
+        export QEMU_DIR
+        echo "$resolved"
+        return 0
+    fi
+
+    log_error "$binary not found at \${QEMU_DIR}=${QEMU_DIR:-<unset>} or on \$PATH"
+    log_error "Install QEMU (apt/dnf install qemu-system-x86) or set QEMU_DIR"
     return 1
 }
 

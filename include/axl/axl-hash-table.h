@@ -13,6 +13,34 @@
  * - Insert/replace return a tri-state int (1=new, 0=replaced, -1=OOM)
  *   instead of GLib's bool, since GLib aborts on OOM and AXL recovers.
  * - No reference counting (use axl_hash_table_free, not unref)
+ *
+ * # Ownership of keys and values
+ *
+ * All three constructors allocate the AxlHashTable struct itself.
+ * They differ in how the table treats the key and value pointers
+ * passed to insert/replace:
+ *
+ *   axl_hash_table_new_str()
+ *       Keys are COPIED internally via strdup; the table owns the
+ *       copy and frees it on remove/free. Values are borrowed —
+ *       caller manages their lifetime.
+ *
+ *   axl_hash_table_new(hash, equal)
+ *       Keys and values are BORROWED. Caller manages all lifetimes.
+ *       The table never copies or frees either.
+ *
+ *   axl_hash_table_new_full(hash, equal, key_destroy, value_destroy)
+ *       Keys are NOT copied. The table TAKES OWNERSHIP if the
+ *       corresponding destroy callback is non-NULL — on remove/free
+ *       it calls the destroy callback on the pointer it stored.
+ *       If a destroy callback is NULL, that side is treated as
+ *       borrowed.
+ *
+ * Insert vs. replace differ on key collision when ownership is in
+ * play (see axl_hash_table_insert / axl_hash_table_replace docs):
+ *   - insert: keep the OLD key, destroy the NEW key
+ *   - replace: destroy the OLD key, keep the NEW key
+ * Both destroy the old value either way.
  */
 
 #ifndef AXL_HASH_TABLE_H
@@ -78,12 +106,17 @@ bool axl_direct_equal(const void *a, const void *b);
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Create a hash table with string keys (convenience).
+ * @brief Create a string-keyed hash table that COPIES its keys.
  *
- * AXL extension — no GLib equivalent. Keys are copied internally
- * via strdup and freed on removal. Values are not freed.
- * Shorthand for string-keyed tables where the caller passes
- * borrowed or literal key strings.
+ * Allocates the AxlHashTable struct. Each call to insert/replace
+ * also strdup's the key into a heap-allocated copy that the table
+ * owns; that copy is freed on remove and on axl_hash_table_free.
+ * Values are borrowed — caller retains ownership and lifetime
+ * responsibility.
+ *
+ * AXL extension; no GLib equivalent. Use this when keys are
+ * borrowed or literal strings and you want zero ceremony around
+ * key lifetime.
  *
  * @return new AxlHashTable, or NULL on allocation failure.
  */
@@ -91,9 +124,12 @@ AxlHashTable *
 axl_hash_table_new_str(void);
 
 /**
- * @brief Create a hash table with custom hash and equality functions.
+ * @brief Create a hash table that BORROWS keys and values.
  *
- * No key or value destructors — the caller manages lifetime.
+ * Allocates the AxlHashTable struct. Keys and values are stored
+ * as raw pointers — the table never copies and never frees either
+ * side. Caller manages all lifetimes.
+ *
  * Matches g_hash_table_new().
  *
  * @return new AxlHashTable, or NULL on allocation failure.
@@ -105,11 +141,16 @@ axl_hash_table_new(
 );
 
 /**
- * @brief Create a hash table with custom hash/equal and destructors.
+ * @brief Create a hash table that TAKES OWNERSHIP of keys/values.
  *
- * Keys are NOT copied internally. The table takes ownership if
- * @p key_destroy is non-NULL. Pass NULL for @p hash_func and
- * @p equal_func to default to axl_str_hash / axl_str_equal.
+ * Allocates the AxlHashTable struct. Keys and values are stored
+ * by pointer (NOT copied); the table calls @p key_destroy /
+ * @p value_destroy on remove/free for any side whose destroy
+ * callback is non-NULL. Pass NULL for a side to leave it
+ * borrowed (caller retains ownership of that side).
+ *
+ * Pass NULL for @p hash_func and @p equal_func to default to
+ * axl_str_hash / axl_str_equal.
  *
  * Matches g_hash_table_new_full().
  *
@@ -119,8 +160,8 @@ AxlHashTable *
 axl_hash_table_new_full(
     AxlHashFunc      hash_func,    ///< hash function, or NULL for axl_str_hash
     AxlEqualFunc     equal_func,   ///< equality function, or NULL for axl_str_equal
-    AxlDestroyNotify key_destroy,  ///< key destructor, or NULL
-    AxlDestroyNotify value_destroy ///< value destructor, or NULL
+    AxlDestroyNotify key_destroy,  ///< key destructor, or NULL to borrow keys
+    AxlDestroyNotify value_destroy ///< value destructor, or NULL to borrow values
 );
 
 /**

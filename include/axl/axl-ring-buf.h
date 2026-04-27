@@ -52,6 +52,8 @@ struct AxlRingBuf {
     uint32_t  write_pos;  ///< monotonically increasing write index
     uint32_t  flags;      ///< AXL_RING_BUF_OVERWRITE etc.
     uint32_t  elem_size;  ///< fixed element size (0 = byte mode)
+    uint64_t  pushes_total;  ///< cumulative bytes the producer attempted to push (private)
+    uint64_t  pushes_lost;   ///< cumulative bytes invisible to consumer (private)
     void    (*buf_free)(void *);  ///< buffer deallocator, or NULL if caller-owned
 };
 
@@ -485,10 +487,59 @@ axl_ring_buf_is_full(
 
 /**
  * @brief Discard all data and reset to empty.
+ *
+ * Also resets the cumulative push counters (pushes_total / pushes_lost).
  */
 void
 axl_ring_buf_clear(
     AxlRingBuf *rb  ///< ring buffer
+);
+
+// ===========================================================================
+// Push statistics
+// ===========================================================================
+
+/**
+ * @brief Cumulative bytes the producer has attempted to push.
+ *
+ * Increments on every push call (push, push_msg, push_elem,
+ * push_advance) by the number of bytes the producer asked to commit
+ * — including bytes that were rejected (reject mode) or dropped
+ * because the input exceeded ring capacity. Reset to 0 by
+ * axl_ring_buf_clear and on init.
+ *
+ * Unit is BYTES regardless of mode. For element-mode buffers, divide
+ * by the element size to get an element count. For message-mode
+ * buffers each message contributes (sizeof(uint32_t) + payload_len)
+ * bytes (the header counts).
+ *
+ * @return cumulative attempted push bytes since last init/clear.
+ */
+uint64_t
+axl_ring_buf_pushes_total(
+    const AxlRingBuf *rb   ///< ring buffer
+);
+
+/**
+ * @brief Cumulative bytes the consumer cannot see due to overflow.
+ *
+ * Counts:
+ *  - bytes from new pushes that were rejected (reject mode)
+ *  - bytes dropped from the front of an oversized input (overwrite mode,
+ *    when a single push exceeds ring capacity)
+ *  - bytes of older data displaced by new pushes (overwrite mode)
+ *
+ * Reset to 0 by axl_ring_buf_clear and on init. Unit is BYTES.
+ *
+ * Note: pushes_total - pushes_lost is the cumulative byte count the
+ * consumer was at any point able to observe; it is NOT a proxy for
+ * "currently in the ring" (that's axl_ring_buf_get_readable).
+ *
+ * @return cumulative lost bytes since last init/clear.
+ */
+uint64_t
+axl_ring_buf_pushes_lost(
+    const AxlRingBuf *rb   ///< ring buffer
 );
 
 #ifdef __cplusplus

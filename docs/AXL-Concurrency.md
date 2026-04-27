@@ -22,7 +22,7 @@ loop, Linux-style signal handling, `axl_yield()` for tight loops,
 `axl_atexit` for cleanup, tier-1 resource registry + sweep. Apps
 that run a tight CPU loop can stay Ctrl-C responsive and fire
 registered timers by calling `axl_yield()` alone, without ever
-calling `axl_loop_run`; see §2.4 of that doc for the worked
+calling `axl_loop_run`; see [AXL-Runtime.md §2.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#24-tight-loop--yield--timer-worked-example) for the worked
 example.
 
 ## A note on naming

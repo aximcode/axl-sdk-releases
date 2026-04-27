@@ -40,6 +40,7 @@
 #include <axl/axl-sys.h>
 #include <axl/axl-nvstore.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-diag.h>
 #include <axl/axl-config.h>
 #include <axl/axl-event.h>
 #include <axl/axl-loop.h>

@@ -7,6 +7,149 @@ follows [Semantic Versioning](https://semver.org/).
 
 _No changes yet._
 
+## 0.2.5 — 2026-04-25
+
+Substantial release. Three headline buckets: a JSON-module rework
+(reader/writer rename + writer rewrite + stats), `AxlRingBuf` push
+statistics, and a stretch of CI/Ctrl-C plumbing that finally got QEMU
+integration tests running in CI. Plus the typed numeric parsers and
+miscellaneous API hardening that landed on top of v0.2.4.
+
+### Added
+
+- **Typed numeric string parsers.** `axl_str_to_u8/u16/u32/u64` and
+  `axl_str_to_s8/s16/s32/s64` (in `<axl/axl-str.h>`) — the underlying
+  parser is shared, the typed variants enforce range and sign. Replaces
+  hand-rolled port parsers throughout `src/net/` and the
+  `echo-server-sync` example.
+- **`AxlJsonWriter`** — new orthogonal JSON writer with state machine.
+  Backed by a caller-owned `AxlString` (auto-growing, no fixed-buffer
+  guesses). Containers, keys, and atoms are independent calls; the
+  writer handles comma placement, string escaping, and (optional)
+  2-space-indent pretty mode (`AXL_JSON_WRITER_PRETTY` flag). Sticky
+  error flag covers OOM and structural misuse; one check after
+  `axl_json_writer_finish` is sufficient. Includes `kv_*` convenience
+  pairs (`axl_json_kv_str/int/uint/bool/null/hex`) for the dominant
+  key+atom shape, and `kv_strn` / `keyn` for non-NUL-terminated input.
+- **`axl_json_write_token`** — parse → mutate → emit bridge. Splices a
+  parsed token tree (object, array, or atom) into a writer's output
+  verbatim, preserving `\uXXXX` escapes and other source representation.
+- **`AxlRingBuf` push statistics.** New `pushes_total` and `pushes_lost`
+  cumulative byte counters on every push path (`push`, `push_msg`,
+  `push_elem`, `push_advance`), with accessors
+  `axl_ring_buf_pushes_total / _lost`. Counts attempted bytes vs bytes
+  invisible to the consumer (rejected in reject mode, displaced or
+  input-dropped in overwrite mode). Reset on `axl_ring_buf_clear` and
+  on init. Element-mode consumers divide by element size to get
+  element counts.
+- **`axl_diag_startup` / `axl_diag_probe_protocol`** — extracted the
+  `-v` startup-diagnostics block that lived in tools into a public
+  `<axl/axl-diag.h>` API. Tools that want a uniform "what's the
+  firmware seeing" dump get it as a one-liner.
+- **`axlk_http_read_request_line`** (kernel POC) — wraps the
+  read-until-`\r\n\r\n` loop and delegates parsing to the public
+  `axl_http_parse_request_line`. The three SoftBMC-shape kernel POC
+  ports (hwinfo, bootconfig, reqlog) now share one implementation
+  instead of duplicating ~70 LOC of byte-fiddling each.
+- **`--log <path>` flag on `test/integration/test-axl.sh`** — captures
+  the raw QEMU serial log to the given path. Equivalent to setting
+  `TEST_KEEP_LOG`; just discoverable from `--help`.
+- **Phase K10 (`axlk_offload`) added to the AXL-Kernel-Design.md phase
+  plan.** AP compute pool design — out-of-band CPU work via
+  `EFI_MP_SERVICES_PROTOCOL`, with cooperative blocking on completion
+  via a new fd kind. Not started; design is staked.
+
+### Changed
+
+- **`AxlJsonCtx` → `AxlJsonReader`, `AxlJsonBuilder` → `AxlJsonWriter`.**
+  Type rename for symmetry. Reader function signatures unchanged
+  (parameter renamed `ctx` → `r` internally only). All callers
+  migrated: tests, fuzz harness, `tools/rfbrowse`, `sdk/examples/json`,
+  experiments. Old type names are gone — recompile against the new
+  header.
+- **`AxlJsonBuilder.overflow` field → `axl_json_writer_error()`
+  accessor.** Struct fields are private now. The flag also broadened
+  semantically: it's set on either AxlString OOM or structural misuse
+  (key in array, value where key expected, mismatched begin/end, etc.).
+- **`axl_json_pretty_print` → `axl_json_console_print`.** Renamed to
+  make clear it's a *colored UEFI-console* pretty-printer (writes
+  attribute-based color codes directly to the console), distinct from
+  the writer's `AXL_JSON_WRITER_PRETTY` flag (buffer output, no color).
+  rfbrowse keeps its colored Redfish-body output via the renamed call.
+- **Three previously-`void` API sites now report failures.** Surfaced
+  error returns where the caller had no way to know the operation
+  silently failed. Caught by code review of the new typed-parser /
+  config OOR work.
+- **AxlConfig OOR rejection.** Config values that overflow the declared
+  field width are now rejected with a clear warning and the parse
+  fails, instead of being truncated silently.
+- **AxlHashTable header preamble + per-constructor doc-comments.**
+  Ownership semantics across the three constructors (`new_str` copies
+  keys, `new` borrows both sides, `new_full` takes ownership when
+  destroy callbacks are non-NULL) now spelled out at the top of the
+  header and reinforced in each `_new_*` doc-comment. README adds an
+  ownership matrix.
+- **Three SoftBMC-shape kernel POC ports** (hwinfo, bootconfig, reqlog)
+  rewritten to use `AxlJsonWriter` for endpoint JSON, `axl_strlcpy` in
+  place of manual NUL-terminated copy loops, and the new
+  `axlk_http_read_request_line` helper. axlk-reqlog-server's hand-rolled
+  ring buffer replaced with `AxlRingBuf` (received/dropped derived
+  from `pushes_total`/`pushes_lost`). On-the-wire output unchanged.
+- **`axl_json_print_raw` removed** — it was a one-liner over
+  `axl_printf("%.*s", ...)`. The single caller (rfbrowse `--raw` mode)
+  updated to call `axl_printf` directly.
+- **`AXL-Kernel-Design.md` moved into `experiments/axl-kernel/`** —
+  co-located with the source it describes. README cross-refs updated.
+
+### Fixed
+
+- **Cooperative-Ctrl-C plumbing for serial / TCG QEMU.**
+  - Backend bridges serial Ctrl-C to UEFI Shell `ExecutionBreak`.
+  - `axl_loop_run` no longer busy-spins when there are no user sources
+    (was pegging a CPU at 100% in tests with empty source sets).
+  - test-yield-ctrlc fixes: FIFO open-order deadlock, two-socat split
+    collapsed to one bidirectional pipeline, idle-marker + QEMU
+    timeouts bumped to be tolerable on TCG.
+- **`run-qemu.sh` interactive-tty silent failure** — script previously
+  swallowed errors when stdin wasn't a TTY; now surfaces them and
+  cleans up the serial log. Companion `--raw` flag plumbed through
+  test-cpu-idle so failures appear in CI logs.
+- **`run-qemu.sh` mtools-fallback dest path bug** — `mcopy` got the
+  wrong destination when EDK2 mkimage was unavailable; rewritten to
+  use `mcopy -s` correctly.
+- **`u64_to_hex` truncation safety** — overflow path now writes a
+  `"0x0"` placeholder instead of leaving the caller buffer
+  uninitialized. Defensive against future buffer-size shrinks (current
+  callers always size adequately).
+- **Test-log noise:** AxlMem leak-dump test annotated with a
+  clarifying printf so its expected-leak report (the AXL runtime's own
+  argv/registry/atexit state) is no longer mistakable for a real leak.
+  AxlData hash-table fixture leak silenced —
+  `test_hash_insert_vs_replace` now reclaims its `axl_strdup`'d test
+  keys after the table is freed.
+
+### CI / Build
+
+- **QEMU integration tests now run in CI.** `axl-common.sh` falls back
+  to system `PATH` for QEMU binaries when none are pre-staged. `mkimage`
+  build-dependency dropped — the mtools fallback covers the path.
+  UEFIExtract installed from the LongSoft GitHub releases (correct
+  lowercase binary name, A74 / x64_linux asset URL). `chmod 666
+  /dev/kvm` so QEMU can use hardware acceleration; `axl-common.sh`
+  also gracefully drops `-enable-kvm` when `/dev/kvm` isn't read/writable.
+
+### Documentation
+
+- **§ section anchors linkified** across Sphinx-rendered pages and the
+  kernel design doc, so cross-references render as clickable links
+  instead of plain text.
+- **`src/data/README.md`** rewritten to fix existing-broken examples
+  (parser used a wrong `get_string` signature; iterator example
+  referenced types that don't exist) and added new JSON Writer +
+  Round-Trip Transforms + Error Handling sections.
+- **AxlRingBuf README** documents the new push-statistics API + the
+  byte-counter unit semantics.
+
 ## 0.2.4 — 2026-04-24
 
 ### Added

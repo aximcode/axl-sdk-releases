@@ -127,6 +127,14 @@ set_body_copy(
     if (r->body != NULL) {
         axl_memcpy(r->body, data, size);
         r->body_size = size;
+    } else {
+        /* The set_json/set_text/set_range public wrappers all return
+         * void, so a failed alloc would otherwise be invisible — the
+         * client would see a 200 response with an empty body and no
+         * idea why. Surface it via the operator log; the response goes
+         * out empty (current behaviour preserved for ABI). */
+        axl_warning("response body alloc failed: %zu bytes", size);
+        r->body_size = 0;
     }
 }
 

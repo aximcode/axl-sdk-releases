@@ -29,6 +29,28 @@ GLib-style hash table with FNV-1a hashing, chained collision resolution,
 and automatic resize at 75% load factor. Supports generic key types via
 user-provided hash/equal callbacks.
 
+### Ownership
+
+All three constructors allocate the `AxlHashTable` struct. They differ
+in how the table treats the **content** (key/value pointers passed to
+insert/replace):
+
+| Constructor | Keys | Values |
+|---|---|---|
+| `axl_hash_table_new_str()` | **Copied** (strdup'd) — table owns + frees | Borrowed |
+| `axl_hash_table_new(hash, equal)` | Borrowed | Borrowed |
+| `axl_hash_table_new_full(hash, equal, key_destroy, value_destroy)` | **Owned** if `key_destroy` non-NULL (no copy, transferred); borrowed otherwise | **Owned** if `value_destroy` non-NULL; borrowed otherwise |
+
+"Owned" means the table calls the destroy callback when the entry is
+removed or the table is freed. "Borrowed" means the caller is
+responsible for the lifetime; the table never copies and never frees.
+
+`new_str` is the "make this go away easily" choice for literal/borrowed
+string keys. `new_full` is for caller-allocated keys/values where the
+caller wants to transfer ownership at insert time. `new` is for
+borrowed-on-both-sides scenarios (e.g. integer keys cast to `void *`,
+values that outlive the table).
+
 ### Convenience Constructor (string keys)
 
 `axl_hash_table_new_str()` creates a table with string keys that are copied
@@ -293,81 +315,198 @@ convention used by `axl_array_append`, `axl_hash_table_insert`, etc.
 
 ## AxlJson — JSON
 
-JSON parser (JSMN-based) and builder (fixed buffer). Parse JSON strings into
-a token tree, query values by path, and build JSON documents incrementally.
+JSON reader (JSMN-based) and writer. Parse JSON strings into a token
+tree, query values by key, and build JSON documents incrementally over
+an `AxlString`. A separate colored UEFI-console pretty-printer is
+provided for debug output.
 
 Header: `<axl/axl-json.h>`
 
 ### Overview
 
-AXL provides two JSON APIs:
+AXL provides three independent JSON APIs:
 
-- **Parser** — parse a JSON string, extract values by key or iterate arrays
-- **Builder** — construct JSON in a caller-provided buffer with no dynamic allocation
+- **Reader** (`AxlJsonReader`) — parse a JSON string, extract values
+  by key, iterate arrays.
+- **Writer** (`AxlJsonWriter`) — build JSON into an auto-growing
+  `AxlString`. Orthogonal calls (containers, keys, atoms) with a state
+  machine that handles comma placement and string escaping. Optional
+  pretty-print mode with 2-space indent.
+- **Console printer** (`axl_json_console_print`) — colored,
+  attribute-based pretty output to the UEFI console. Distinct from the
+  writer's pretty-print flag (which produces buffer output, no colors).
 
-### Parsing JSON
+### Reading JSON
 
 ```c
 const char *json = "{\"name\":\"AXL\",\"version\":1,\"debug\":true}";
-AxlJsonCtx ctx;
+AxlJsonReader r;
 
-if (axl_json_parse(json, axl_strlen(json), &ctx)) {
-    const char *name;
-    size_t name_len;
-    int64_t version;
-    bool debug;
+if (!axl_json_parse(json, axl_strlen(json), &r)) {
+    axl_printerr("invalid JSON\n");
+    return -1;
+}
 
-    axl_json_get_string(&ctx, "name", &name, &name_len);
-    axl_json_get_int(&ctx, "version", &version);
-    axl_json_get_bool(&ctx, "debug", &debug);
+char    name[64];
+int64_t version;
+bool    debug;
 
-    axl_printf("name=%.*s version=%lld debug=%s\n",
-               (int)name_len, name, version,
-               debug ? "true" : "false");
+if (!axl_json_get_string(&r, "name",    name, sizeof(name)) ||
+    !axl_json_get_int   (&r, "version", &version) ||
+    !axl_json_get_bool  (&r, "debug",   &debug)) {
+    axl_printerr("missing or wrong-type field\n");
+    axl_json_free(&r);
+    return -1;
+}
 
-    axl_json_free(&ctx);
+axl_printf("name=%s version=%lld debug=%s\n",
+           name, (long long)version, debug ? "true" : "false");
+
+axl_json_free(&r);
+```
+
+`axl_json_parse` returns `false` on invalid syntax, unbalanced braces,
+or token-array allocation failure. Each `axl_json_get_*` returns
+`false` if the key is missing, the value has the wrong type, or (for
+strings) the caller buffer is too small. String values are copied into
+the caller buffer — no zero-copy lifetime concerns. Always call
+`axl_json_free` on the reader; the token array is heap-allocated.
+
+### Writing JSON
+
+The writer builds into a caller-owned `AxlString` and grows on demand.
+Comma placement, string escaping, and (optional) indentation are
+handled internally. Containers, keys, and atoms are independent calls
+— a single state machine knows whether the current container is an
+object or an array.
+
+```c
+AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+AxlJsonWriter w;
+
+axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+axl_json_obj_begin(&w);
+    axl_json_kv_str (&w, "name",    "AXL");
+    axl_json_kv_uint(&w, "version", 1);
+    axl_json_kv_bool(&w, "debug",   true);
+    axl_json_key(&w, "tags");
+    axl_json_arr_begin(&w);
+        axl_json_str(&w, "uefi");
+        axl_json_str(&w, "embedded");
+    axl_json_arr_end(&w);
+axl_json_obj_end(&w);
+axl_json_writer_finish(&w);
+
+if (!axl_json_writer_error(&w)) {
+    axl_printf("%s\n", axl_string_str(out));
+    // {"name":"AXL","version":1,"debug":true,"tags":["uefi","embedded"]}
 }
 ```
 
-**Note**: String values returned by `axl_json_get_string` point into
-the original JSON buffer (zero-copy). Do not free the original buffer
-while using extracted strings.
+For convenience, `axl_json_kv_*` collapses a key + atomic value into
+one call (the dominant shape). Use `axl_json_key` followed by an atom
+or container when the value is a nested object/array.
 
-### Building JSON
+### Pretty Printing
 
-The builder writes into a caller-provided buffer with no heap allocation.
-Check `overflow` after building to detect truncation.
+Pass `AXL_JSON_WRITER_PRETTY` at init for 2-space-indent output with
+newlines at every container and member boundary:
 
 ```c
-char buf[256];
-AxlJsonBuilder j;
-
-axl_json_init(&j, buf, sizeof(buf));
-axl_json_object_start(&j);
-axl_json_add_string(&j, "name", "AXL");
-axl_json_add_uint(&j, "version", 1);
-axl_json_add_bool(&j, "debug", true);
-axl_json_object_end(&j);
-axl_json_finish(&j);
-
-if (!j.overflow) {
-    axl_printf("%s\n", buf);
-    // {"name":"AXL","version":1,"debug":true}
-}
+axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+// ... same writer calls ...
+// {
+//   "name": "AXL",
+//   "version": 1,
+//   "tags": [
+//     "uefi",
+//     "embedded"
+//   ]
+// }
 ```
 
 ### Iterating Arrays
 
 ```c
 // Parse: {"items":["a","b","c"]}
-AxlJsonIter iter;
-if (axl_json_array_begin(&ctx, "items", &iter)) {
-    AxlJsonElement elem;
+AxlJsonArrayIter iter;
+if (axl_json_array_begin(&r, "items", &iter)) {
+    AxlJsonReader elem;
     while (axl_json_array_next(&iter, &elem)) {
-        axl_printf("  %.*s\n", (int)elem.len, elem.value);
+        char value[32];
+        axl_json_get_string(&elem, NULL, value, sizeof(value));
+        axl_printf("  %s\n", value);
     }
 }
 ```
+
+For root-level arrays (`[{...}, {...}]`) use `axl_json_root_array_begin`
+instead. Element readers borrow the parent's token array — do not call
+`axl_json_free` on them.
+
+### Round-Trip Transforms
+
+`axl_json_write_token` splices an already-parsed token into the
+writer's output. The bridge writes string and key bytes verbatim from
+the source — jsmn keeps escape sequences in source form, so this
+preserves `\uXXXX`, escaped quotes, etc. without re-escaping. Useful
+for parse → mutate → re-emit flows:
+
+```c
+AxlJsonReader r;
+axl_json_parse(input, input_len, &r);
+
+AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+AxlJsonWriter w;
+axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+
+axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "wrapped_in", "envelope");
+    axl_json_key(&w, "original");
+    axl_json_write_token(&w, &r, 0);   /* splice the entire input doc */
+axl_json_obj_end(&w);
+axl_json_writer_finish(&w);
+
+axl_json_free(&r);
+```
+
+### Error Handling
+
+The writer uses a sticky error flag. The first failure latches it;
+subsequent calls become no-ops; one check after `axl_json_writer_finish`
+is sufficient.
+
+Sources of writer error:
+
+- **AxlString OOM** — auto-grow failed.
+- **Structural misuse** the writer can detect:
+  - emit a bare-primitive root (only objects and arrays are valid
+    JSON root values; matches `axl_json_parse`'s contract)
+  - emit a value outside any container after the root has closed
+  - emit a key inside an array
+  - emit a value when a key was expected in object context
+  - `axl_json_obj_end` on an open array (or vice versa)
+  - close when nothing is open
+  - mismatched begin/end counts at `axl_json_writer_finish`
+
+What the writer does **not** catch:
+
+- Duplicate keys in the same object — JSON technically allows them; the
+  writer doesn't track emitted keys.
+- Non-UTF-8 bytes in `axl_json_str` — passed through escaping unchanged.
+- The contents of `axl_json_raw(&w, fragment)` — the caller asserts the
+  fragment is valid JSON; the writer splices it as-is.
+
+### Console Output
+
+```c
+const char *body = http_response_body;
+axl_json_console_print(body, axl_strlen(body));
+```
+
+Writes to the UEFI console with cyan keys, green strings, yellow
+numbers, magenta booleans. Distinct from the writer's pretty-print
+flag, which emits to a buffer without color.
 
 ## AxlCache — TTL Cache
 
@@ -546,3 +685,24 @@ for (uint32_t i = 0; i < count; i++) {
 }
 axl_ring_buf_pop_advance(rb, total_processed);
 ```
+
+### Push Statistics
+
+Cumulative byte counters track every push attempt, including the
+ones that don't survive:
+
+```c
+uint64_t pushed = axl_ring_buf_pushes_total(rb);  // bytes attempted
+uint64_t lost   = axl_ring_buf_pushes_lost(rb);   // bytes invisible to consumer
+```
+
+`pushes_lost` covers (a) bytes rejected when reject-mode pushes
+exceed available space, (b) bytes dropped from the front of an
+oversized input in overwrite mode, and (c) older bytes displaced
+by a new overwrite-mode push. Both counters reset on
+`axl_ring_buf_clear` and on init.
+
+Element-mode buffers translate trivially: divide by `elem_size` to
+get element counts. The kernel POC's reqlog server uses exactly
+that pattern to surface "received" and "dropped" totals on its
+`/` endpoint.

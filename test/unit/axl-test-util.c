@@ -826,6 +826,85 @@ test_config(void)
     test_check(true, "config: free(NULL) no crash");
 }
 
+// ---------------------------------------------------------------------------
+// Width-overflow rejection — was a silent-truncation bug pre-2026-04-25
+// ---------------------------------------------------------------------------
+
+static void
+test_config_width_overflow(void)
+{
+    typedef struct {
+        uint16_t port;
+        uint32_t timeout_ms;
+        int32_t  threshold;
+    } NarrowTarget;
+
+    static const AxlConfigDesc descs[] = {
+        { "port",      AXL_CFG_UINT, "8080",  'p', "Listen port (u16)",
+          offsetof(NarrowTarget, port), sizeof(uint16_t) },
+        { "timeout",   AXL_CFG_UINT, "30000", 't', "Timeout ms (u32)",
+          offsetof(NarrowTarget, timeout_ms), sizeof(uint32_t) },
+        { "threshold", AXL_CFG_INT,  "0",      0,  "Threshold (i32)",
+          offsetof(NarrowTarget, threshold), sizeof(int32_t) },
+        { 0 }
+    };
+
+    NarrowTarget tgt;
+    axl_memset(&tgt, 0, sizeof(tgt));
+    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, &tgt);
+    test_check(cfg != NULL, "width: config new");
+
+    /* In-range values still work. */
+    test_check(axl_config_set(cfg, "port", "9090") == 0
+               && tgt.port == 9090, "width: u16 9090 accepted");
+    test_check(axl_config_set(cfg, "port", "65535") == 0
+               && tgt.port == 65535, "width: u16 max 65535 accepted");
+
+    /* Overflow rejected — used to silently truncate to 34463. */
+    test_check(axl_config_set(cfg, "port", "65536") == -1,
+               "width: u16 65536 rejected (was: silent truncate to 0)");
+    test_check(axl_config_set(cfg, "port", "99999") == -1,
+               "width: u16 99999 rejected (was: silent truncate to 34463)");
+    test_check(tgt.port == 65535,
+               "width: u16 field preserved after rejection");
+
+    /* u32 boundary. */
+    test_check(axl_config_set(cfg, "timeout", "4294967295") == 0
+               && tgt.timeout_ms == 4294967295u, "width: u32 max accepted");
+    test_check(axl_config_set(cfg, "timeout", "4294967296") == -1,
+               "width: u32 max+1 rejected");
+
+    /* i32 boundaries — both ends. */
+    test_check(axl_config_set(cfg, "threshold", "2147483647") == 0
+               && tgt.threshold == 2147483647, "width: i32 max accepted");
+    test_check(axl_config_set(cfg, "threshold", "-2147483648") == 0
+               && tgt.threshold == -2147483648, "width: i32 min accepted");
+    test_check(axl_config_set(cfg, "threshold", "2147483648") == -1,
+               "width: i32 max+1 rejected");
+    test_check(axl_config_set(cfg, "threshold", "-2147483649") == -1,
+               "width: i32 min-1 rejected");
+
+    /* Rejected set leaves the stored hash entry consistent with the
+     * target field — both keep the previous value, neither drifts. */
+    test_check(axl_strcmp(axl_config_get(cfg, "port"), "65535") == 0,
+               "width: stored value preserved after rejected set");
+
+    /* A descriptor whose default overflows the declared width should
+     * not crash axl_config_new — the default is logged-and-skipped,
+     * the config is still usable. */
+    static const AxlConfigDesc bad_default[] = {
+        { "tiny", AXL_CFG_UINT, "70000", 0, "u16 with overflowing default",
+          offsetof(NarrowTarget, port), sizeof(uint16_t) },
+        { 0 }
+    };
+    NarrowTarget tgt2;
+    axl_memset(&tgt2, 0xAA, sizeof(tgt2));   /* sentinel */
+    AXL_AUTOPTR(AxlConfig) cfg2 = axl_config_new(bad_default, NULL, &tgt2);
+    test_check(cfg2 != NULL, "width: overflowing default doesn't crash new()");
+    test_check(tgt2.port == 0xAAAA,
+               "width: overflowing default leaves field at sentinel");
+}
+
 static void
 test_config_args(void)
 {
@@ -1183,6 +1262,37 @@ test_driver_locate(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_diag_probe_protocol
+// ---------------------------------------------------------------------------
+
+static void
+test_diag_probe_protocol(void)
+{
+    /* NULL guid → -1 with no UEFI call. Pure logic, doesn't depend
+     * on what's registered in firmware. */
+    test_check(axl_diag_probe_protocol(NULL, "x") == -1,
+               "diag_probe: NULL guid rejected");
+    test_check(axl_diag_probe_protocol(NULL, NULL) == -1,
+               "diag_probe: NULL guid rejected even with NULL name");
+
+    /* SimpleFileSystem is guaranteed registered in QEMU (we boot
+     * from fs0). Probe should return 0 and the line should print. */
+    static const AxlGuid simple_fs = AXL_GUID(
+        0x0964e5b22, 0x6459, 0x11d2,
+        0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b);
+    test_check(axl_diag_probe_protocol(&simple_fs,
+                                       "EFI_SIMPLE_FILE_SYSTEM") == 0,
+               "diag_probe: registered protocol returns 0");
+
+    /* Bogus GUID → -1. Doesn't crash on a NULL display_name either. */
+    static const AxlGuid bogus = AXL_GUID(
+        0xdeadbeef, 0xcafe, 0xbabe,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef);
+    test_check(axl_diag_probe_protocol(&bogus, NULL) == -1,
+               "diag_probe: unregistered protocol returns -1, NULL name OK");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1211,6 +1321,7 @@ test_util_main(int argc, char **argv)
     test_time();
     test_time_sleep();
     test_config();
+    test_config_width_overflow();
     test_config_args();
     test_config_parent();
     test_config_multi();
@@ -1219,6 +1330,7 @@ test_util_main(int argc, char **argv)
     test_config_setv();
     test_driver_ensure();
     test_driver_locate();
+    test_diag_probe_protocol();
 
     return test_print_results();
 }

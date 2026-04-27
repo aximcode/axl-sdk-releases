@@ -99,7 +99,7 @@ between them. `_axl_cleanup` has a reentrancy guard: if
    via the appropriate `_free`.
 5. **Heap leak report** (AXL_MEM_DEBUG only) --
    `axl_mem_dump_leaks`. Release-mode auto-free of heap is
-   deferred (see `docs/AXL-Runtime.md` §10.1).
+   deferred (see [`docs/AXL-Runtime.md` §10.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#101-release-mode-heap-auto-sweep)).
 
 ## Caller attribution
 

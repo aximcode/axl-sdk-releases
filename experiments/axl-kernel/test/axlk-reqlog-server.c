@@ -34,7 +34,6 @@
 
 #define RL_PORT          8082
 #define RL_RECV_BUFSZ    1024
-#define RL_SEND_BUFSZ    8192
 /* Unbounded by the 16-slot PCB: the accept loop drains zombies inline
  * via axlk_waitpid(AXLK_WNOHANG), so handler slots recycle immediately.
  * Older revisions were capped at 12 for exactly this reason. */
@@ -43,131 +42,106 @@
 #define RL_PATH_MAX      63
 #define RL_METHOD_MAX    7
 
+/* Padded to 128 bytes so 8 entries × 128 = 1024 (power-of-2) — the size
+ * AxlRingBuf requires for its mask-based wrap. The padding is unused. */
 typedef struct {
     uint64_t ts_ms;
     char     method[RL_METHOD_MAX + 1];
     char     path[RL_PATH_MAX + 1];
+    char     _pad[128 - 8 - (RL_METHOD_MAX + 1) - (RL_PATH_MAX + 1)];
 } ReqLogEntry;
 
 /* The whole point of this port: module-level state shared across all
  * handler processes. No locks — see file header for why. */
-static struct {
-    ReqLogEntry slots[RL_RING_CAP];
-    uint32_t    head;       /* next write index */
-    uint32_t    received;   /* total appends since start */
-    uint32_t    dropped;    /* count of overwritten (oldest) entries */
-} g_ring;
+static AxlRingBuf  g_ring;
+static uint8_t     g_ring_storage[RL_RING_CAP * sizeof(ReqLogEntry)];
+
+static void
+ring_init(void)
+{
+    axl_ring_buf_init_fixed(&g_ring,
+                            g_ring_storage, sizeof(g_ring_storage),
+                            sizeof(ReqLogEntry),
+                            AXL_RING_BUF_OVERWRITE, NULL);
+}
 
 static void
 ring_append(const char *method, const char *path)
 {
-    ReqLogEntry *e = &g_ring.slots[g_ring.head];
+    ReqLogEntry e;
+    e.ts_ms = axl_time_get_ms();
+    axl_strlcpy(e.method, method, sizeof(e.method));
+    axl_strlcpy(e.path,   path,   sizeof(e.path));
+    axl_memset(e._pad, 0, sizeof(e._pad));
+    axl_ring_buf_push_elem(&g_ring, &e);
+}
 
-    e->ts_ms = axl_time_get_ms();
+/* Stats accessors that translate AxlRingBuf's byte counters to elements. */
+static inline uint32_t
+ring_received(void)
+{
+    return (uint32_t)(axl_ring_buf_pushes_total(&g_ring) / sizeof(ReqLogEntry));
+}
 
-    size_t i = 0;
-    while (i < RL_METHOD_MAX && method[i] != '\0') {
-        e->method[i] = method[i];
-        i++;
-    }
-    e->method[i] = '\0';
-
-    i = 0;
-    while (i < RL_PATH_MAX && path[i] != '\0') {
-        e->path[i] = path[i];
-        i++;
-    }
-    e->path[i] = '\0';
-
-    g_ring.head = (g_ring.head + 1) % RL_RING_CAP;
-    g_ring.received++;
-    if (g_ring.received > RL_RING_CAP) {
-        g_ring.dropped = g_ring.received - RL_RING_CAP;
-    }
+static inline uint32_t
+ring_dropped(void)
+{
+    return (uint32_t)(axl_ring_buf_pushes_lost(&g_ring) / sizeof(ReqLogEntry));
 }
 
 // ---------------------------------------------------------------------------
 // Endpoint builders
 // ---------------------------------------------------------------------------
 
-static int
-endpoint_overview(char *buf, size_t cap)
+static void
+endpoint_overview(AxlJsonWriter *w)
 {
-    return axl_snprintf(buf, cap,
-        "{\"capacity\":%u,\"received\":%u,\"dropped\":%u,\"head\":%u}",
-        (unsigned)RL_RING_CAP,
-        (unsigned)g_ring.received,
-        (unsigned)g_ring.dropped,
-        (unsigned)g_ring.head);
+    /* "head" stays in the response shape for backward-compat with the
+     * integration test; it's the next-write index modulo capacity. */
+    uint32_t head = ring_received() % RL_RING_CAP;
+
+    axl_json_obj_begin(w);
+        axl_json_kv_uint(w, "capacity", (uint64_t)RL_RING_CAP);
+        axl_json_kv_uint(w, "received", (uint64_t)ring_received());
+        axl_json_kv_uint(w, "dropped",  (uint64_t)ring_dropped());
+        axl_json_kv_uint(w, "head",     (uint64_t)head);
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_log(char *buf, size_t cap)
+static void
+endpoint_log(AxlJsonWriter *w)
 {
-    /* Walk oldest → newest. If the ring hasn't wrapped yet, oldest is
-     * slot 0; otherwise it's the slot at `head` (which holds the next
-     * to be overwritten = currently the oldest valid). */
-    uint32_t count = g_ring.received < RL_RING_CAP
-                     ? g_ring.received
-                     : RL_RING_CAP;
-    uint32_t start = g_ring.received < RL_RING_CAP ? 0 : g_ring.head;
+    uint32_t count = axl_ring_buf_get_length(&g_ring);
 
-    int w = 0;
-    w += axl_snprintf(buf + w, cap - w, "{\"entries\":[");
-    for (uint32_t i = 0; i < count; i++) {
-        const ReqLogEntry *e = &g_ring.slots[(start + i) % RL_RING_CAP];
-        w += axl_snprintf(buf + w, cap - w,
-            "%s{\"ts_ms\":%llu,\"method\":\"%s\",\"path\":\"%s\"}",
-            i ? "," : "",
-            (unsigned long long)e->ts_ms,
-            e->method, e->path);
-        if (w >= (int)cap - 128) break;
-    }
-    w += axl_snprintf(buf + w, cap - w, "]}");
-    return w;
+    axl_json_obj_begin(w);
+        axl_json_key(w, "entries");
+        axl_json_arr_begin(w);
+        for (uint32_t i = 0; i < count; i++) {
+            ReqLogEntry e;
+            if (axl_ring_buf_peek_nth_elem(&g_ring, i, &e) != 0) {
+                break;
+            }
+            axl_json_obj_begin(w);
+                axl_json_kv_uint(w, "ts_ms",  e.ts_ms);
+                axl_json_kv_str (w, "method", e.method);
+                axl_json_kv_str (w, "path",   e.path);
+            axl_json_obj_end(w);
+        }
+        axl_json_arr_end(w);
+    axl_json_obj_end(w);
 }
 
-static int
-endpoint_healthz(char *buf, size_t cap)
+static void
+endpoint_healthz(AxlJsonWriter *w)
 {
-    return axl_snprintf(buf, cap, "{\"ok\":true}");
+    axl_json_obj_begin(w);
+        axl_json_kv_bool(w, "ok", true);
+    axl_json_obj_end(w);
 }
 
 // ---------------------------------------------------------------------------
-// HTTP — same minimal pattern as the HwInfo / BootConfig ports
+// Per-client handler
 // ---------------------------------------------------------------------------
-
-static int
-http_read_request(int fd, char *method_out, size_t method_cap,
-                  char *path_out, size_t path_cap)
-{
-    char   buf[RL_RECV_BUFSZ];
-    size_t total = 0;
-
-    while (total < sizeof(buf) - 1) {
-        int n = axlk_read(fd, buf + total, sizeof(buf) - 1 - total);
-        if (n <= 0) return -1;
-        total += (size_t)n;
-        buf[total] = '\0';
-        if (axl_strstr(buf, "\r\n\r\n") != NULL) break;
-    }
-
-    const char *first = axl_strchr(buf, ' ');
-    if (first == NULL) return -1;
-    const char *second = axl_strchr(first + 1, ' ');
-    if (second == NULL) return -1;
-
-    size_t method_len = (size_t)(first - buf);
-    if (method_len >= method_cap) method_len = method_cap - 1;
-    axl_memcpy(method_out, buf, method_len);
-    method_out[method_len] = '\0';
-
-    size_t path_len = (size_t)(second - (first + 1));
-    if (path_len >= path_cap) path_len = path_cap - 1;
-    axl_memcpy(path_out, first + 1, path_len);
-    path_out[path_len] = '\0';
-    return 0;
-}
 
 static int
 handle_client(int argc, char **argv)
@@ -177,51 +151,60 @@ handle_client(int argc, char **argv)
 
     char method[16];
     char path[80];
-    char body[RL_SEND_BUFSZ];
-    int  body_len = 0, status = 200;
+    char scratch[RL_RECV_BUFSZ];
+    int  status = 200;
     const char *status_text = "OK";
 
-    if (http_read_request(fd, method, sizeof(method),
-                          path, sizeof(path)) != 0) {
+    AXL_AUTOPTR(AxlString) body = axl_string_new(NULL);
+    AxlJsonWriter jw;
+    axl_json_writer_init(&jw, body, AXL_JSON_WRITER_DEFAULT);
+
+    if (axlk_http_read_request_line(fd, scratch, sizeof(scratch),
+                                    method, sizeof(method),
+                                    path, sizeof(path)) != 0) {
         status = 400;
         status_text = "Bad Request";
-        body_len = axl_snprintf(body, sizeof(body),
-                                "{\"error\":\"bad request\"}");
+        axl_json_obj_begin(&jw);
+            axl_json_kv_str(&jw, "error", "bad request");
+        axl_json_obj_end(&jw);
     } else {
         /* Record FIRST so /log and / observations include themselves —
          * this is what makes "every request mutates state" honest. */
         ring_append(method, path);
 
         if (axl_streql(path, "/")) {
-            body_len = endpoint_overview(body, sizeof(body));
+            endpoint_overview(&jw);
         } else if (axl_streql(path, "/log")) {
-            body_len = endpoint_log(body, sizeof(body));
+            endpoint_log(&jw);
         } else if (axl_streql(path, "/healthz")) {
-            body_len = endpoint_healthz(body, sizeof(body));
+            endpoint_healthz(&jw);
         } else {
             status = 404;
             status_text = "Not Found";
-            body_len = axl_snprintf(body, sizeof(body),
-                "{\"error\":\"not found\",\"path\":\"%s\"}", path);
+            axl_json_obj_begin(&jw);
+                axl_json_kv_str(&jw, "error", "not found");
+                axl_json_kv_str(&jw, "path",  path);
+            axl_json_obj_end(&jw);
         }
     }
+    size_t body_len = axl_json_writer_finish(&jw);
 
-    axl_printf("  pid %d %s %s → %d (%d bytes; recv=%u drop=%u)\n",
+    axl_printf("  pid %d %s %s → %d (%zu bytes; recv=%u drop=%u)\n",
                (int)axlk_getpid(), method, path, status, body_len,
-               (unsigned)g_ring.received, (unsigned)g_ring.dropped);
+               (unsigned)ring_received(), (unsigned)ring_dropped());
 
     char header[256];
     int hlen = axl_snprintf(header, sizeof(header),
         "HTTP/1.0 %d %s\r\n"
         "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n",
         status, status_text, body_len);
 
     axlk_write(fd, header, (size_t)hlen);
     if (body_len > 0) {
-        axlk_write(fd, body, (size_t)body_len);
+        axlk_write(fd, axl_string_str(body), body_len);
     }
     axlk_close(fd);
     return 0;
@@ -235,6 +218,8 @@ static int
 reqlog_service(int argc, char **argv)
 {
     (void)argc; (void)argv;
+
+    ring_init();
 
     int listener = axlk_listen(RL_PORT);
     if (listener < 0) {
@@ -274,8 +259,8 @@ reqlog_service(int argc, char **argv)
     axlk_close(listener);
     axl_printf("PASS: axlk-reqlog-server served %d clients (recv=%u drop=%u)\n",
                RL_MAX_CLIENTS,
-               (unsigned)g_ring.received,
-               (unsigned)g_ring.dropped);
+               (unsigned)ring_received(),
+               (unsigned)ring_dropped());
     return 0;
 }
 

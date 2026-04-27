@@ -139,24 +139,29 @@ test_build_image() {
             --target "$TEST_DISK" \
             --label TEST 2>/dev/null
     else
-        # Fallback: create FAT32 image with standard tools
+        # Fallback: create FAT32 image with standard tools.
+        # mcopy -s -p recurses and preserves attributes; passing
+        # individual top-level entries lets it auto-create the
+        # destination directory tree (per-file `mmd ::/EFI/BOOT`
+        # doesn't work because mmd refuses to create intermediate
+        # parents and the per-file loop hits set-e on the first
+        # unwritable nested file).
         local size_kb
         size_kb=$(du -sk "$TEST_STAGING" | cut -f1)
         size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))  # round up to nearest MB
         [[ $size_kb -lt 40960 ]] && size_kb=40960       # minimum 40MB
         dd if=/dev/zero of="$TEST_DISK" bs=1K count="$size_kb" 2>/dev/null
         mkfs.vfat -F 32 -n TEST "$TEST_DISK" >/dev/null 2>&1
-        # Copy files with mcopy (-s for recursive, -i for image file)
-        cd "$TEST_STAGING"
-        find . -type f | while IFS= read -r f; do
-            local dir
-            dir=$(dirname "${f#./}")
-            if [[ "$dir" != "." ]]; then
-                mmd -i "$TEST_DISK" "::/$dir" 2>/dev/null || true
-            fi
-            mcopy -i "$TEST_DISK" "$f" "::/$f" 2>/dev/null
-        done
-        cd "$OLDPWD"
+        # Recursive copy of every top-level entry under STAGING.
+        # `find -maxdepth 1` to enumerate top-level files and dirs,
+        # then mcopy -s for each (recursive). Run within STAGING so
+        # the destination paths come out at the FAT root.
+        (
+            cd "$TEST_STAGING" || exit 1
+            for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
+                mcopy -s -i "$TEST_DISK" "$entry" "::/" 2>/dev/null
+            done
+        )
     fi
 }
 

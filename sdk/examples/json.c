@@ -1,9 +1,9 @@
 /**
  * json.c — Parse and build JSON.
  *
- * Demonstrates the JSON parser (allocates an exact-fit token array,
- * released by axl_json_free) and the fixed-buffer JSON builder
- * (caller-provided buffer, no dynamic memory).
+ * Demonstrates the JSON reader (allocates an exact-fit token array,
+ * released by axl_json_free) and the AxlString-backed JSON writer
+ * with orthogonal container/key/atom calls and optional pretty mode.
  *
  * Build with: axl-cc json.c -o json.efi
  */
@@ -16,49 +16,75 @@ main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    /* ---- Parse ---- */
+    /* ---- Read ---- */
 
     const char *input = "{\"name\":\"AXL\",\"version\":1,\"uefi\":true}";
-    AxlJsonCtx ctx;
+    AxlJsonReader r;
 
-    if (!axl_json_parse(input, axl_strlen(input), &ctx)) {
+    if (!axl_json_parse(input, axl_strlen(input), &r)) {
         axl_printf("error: JSON parse failed\n");
         return 1;
     }
 
-    char name[32];
+    char    name[32];
     int64_t version;
-    bool uefi;
+    bool    uefi;
 
-    axl_json_get_string(&ctx, "name", name, sizeof(name));
-    axl_json_get_int(&ctx, "version", &version);
-    axl_json_get_bool(&ctx, "uefi", &uefi);
+    if (!axl_json_get_string(&r, "name",    name, sizeof(name)) ||
+        !axl_json_get_int   (&r, "version", &version) ||
+        !axl_json_get_bool  (&r, "uefi",    &uefi)) {
+        axl_printf("error: missing or wrong-type field\n");
+        axl_json_free(&r);
+        return 1;
+    }
 
     axl_printf("Parsed: name=%s version=%lld uefi=%s\n",
                name, (long long)version, uefi ? "true" : "false");
 
-    axl_json_free(&ctx);
+    axl_json_free(&r);
 
-    /* ---- Build ---- */
+    /* ---- Write (compact) ---- */
 
-    char buf[256];
-    AxlJsonBuilder jb;
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter w;
 
-    axl_json_init(&jb, buf, sizeof(buf));
-    axl_json_object_start(&jb);
-    axl_json_add_string(&jb, "greeting", "Hello from UEFI");
-    axl_json_add_uint(&jb, "code", 200);
-    axl_json_add_bool(&jb, "success", true);
-    axl_json_array_start(&jb, "features");
-    axl_json_array_add_string(&jb, "networking");
-    axl_json_array_add_string(&jb, "event-loop");
-    axl_json_array_add_string(&jb, "json");
-    axl_json_array_end(&jb);
-    axl_json_object_end(&jb);
-    axl_json_finish(&jb);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str (&w, "greeting", "Hello from UEFI");
+        axl_json_kv_uint(&w, "code",     200);
+        axl_json_kv_bool(&w, "success",  true);
+        axl_json_key(&w, "features");
+        axl_json_arr_begin(&w);
+            axl_json_str(&w, "networking");
+            axl_json_str(&w, "event-loop");
+            axl_json_str(&w, "json");
+        axl_json_arr_end(&w);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
 
-    axl_printf("Built:\n");
-    axl_json_pretty_print(buf, axl_strlen(buf));
+    if (axl_json_writer_error(&w)) {
+        axl_printf("error: JSON writer failed\n");
+        return 1;
+    }
+
+    axl_printf("Built (compact): %s\n", axl_string_str(out));
+
+    /* ---- Write (pretty) ---- */
+
+    axl_string_clear(out);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str (&w, "greeting", "Hello from UEFI");
+        axl_json_kv_uint(&w, "code",     200);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+
+    axl_printf("Built (pretty):\n%s\n", axl_string_str(out));
+
+    /* ---- Console color print of an arbitrary blob ---- */
+
+    axl_printf("Console-color print:\n");
+    axl_json_console_print(input, axl_strlen(input));
 
     return 0;
 }

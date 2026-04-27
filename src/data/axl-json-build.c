@@ -2,29 +2,36 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-json-build.c
-    Buffer-based JSON builder. No dynamic allocation.
+    Streaming JSON writer, AxlString-backed, with optional pretty-print.
+    Orthogonal calls — containers, keys, atoms — driven by a single
+    state machine that tracks depth + object-vs-array context per
+    level + comma + expecting-value.
 **/
 
 #include <axl/axl-json.h>
+#include <axl/axl-string.h>
 #include <axl/axl-log.h>
+
+#define JSMN_HEADER
+#include "jsmn.h"
 
 AXL_LOG_DOMAIN("json");
 
 // ---------------------------------------------------------------------------
-// Local helpers (no EDK2 dependencies)
+// Number formatting helpers (no allocation)
 // ---------------------------------------------------------------------------
 
 static size_t
 u64_to_str(char *buf, size_t buf_size, uint64_t val)
 {
     char tmp[21];
-    int pos = 0;
+    int  pos = 0;
 
     if (val == 0) {
         tmp[pos++] = '0';
     } else {
         while (val > 0) {
-            tmp[pos++] = '0' + (val % 10);
+            tmp[pos++] = (char)('0' + (val % 10));
             val /= 10;
         }
     }
@@ -43,7 +50,8 @@ i64_to_str(char *buf, size_t buf_size, int64_t val)
 {
     if (val < 0) {
         buf[0] = '-';
-        return 1 + u64_to_str(buf + 1, buf_size - 1, (uint64_t)(~(uint64_t)val + 1));
+        return 1 + u64_to_str(buf + 1, buf_size - 1,
+                              (uint64_t)(~(uint64_t)val + 1));
     }
     return u64_to_str(buf, buf_size, (uint64_t)val);
 }
@@ -53,7 +61,7 @@ u64_to_hex(char *buf, size_t buf_size, uint64_t val)
 {
     static const char hex[] = "0123456789abcdef";
     char tmp[17];
-    int pos = 0;
+    int  pos = 0;
 
     if (val == 0) {
         tmp[pos++] = '0';
@@ -64,6 +72,13 @@ u64_to_hex(char *buf, size_t buf_size, uint64_t val)
         }
     }
     if ((size_t)pos + 2 >= buf_size) {
+        /* Truncation guard: emit a syntactically valid placeholder so callers
+         * that pass the buffer to emit_quoted never read uninitialized data. */
+        if (buf_size >= 4) {
+            buf[0] = '0'; buf[1] = 'x'; buf[2] = '0'; buf[3] = '\0';
+            return 3;
+        }
+        if (buf_size > 0) buf[0] = '\0';
         return 0;
     }
     buf[0] = '0';
@@ -76,66 +91,7 @@ u64_to_hex(char *buf, size_t buf_size, uint64_t val)
 }
 
 // ---------------------------------------------------------------------------
-// Internal Helpers
-// ---------------------------------------------------------------------------
-
-static void
-j_append(AxlJsonBuilder *j, const char *str)
-{
-    while (*str != '\0' && j->pos < j->size - 1) {
-        j->buffer[j->pos++] = *str++;
-    }
-    if (*str != '\0') {
-        j->overflow = true;
-    }
-}
-
-static void
-j_append_char(AxlJsonBuilder *j, char ch)
-{
-    if (j->pos < j->size - 1) {
-        j->buffer[j->pos++] = ch;
-    } else {
-        j->overflow = true;
-    }
-}
-
-static void
-j_comma(AxlJsonBuilder *j)
-{
-    if (j->need_comma) {
-        j_append_char(j, ',');
-    }
-}
-
-static void
-j_escaped(AxlJsonBuilder *j, const char *str)
-{
-    char ch;
-
-    j_append_char(j, '"');
-    while ((ch = *str++) != '\0') {
-        if (ch == '"') {
-            j_append(j, "\\\"");
-        } else if (ch == '\\') {
-            j_append(j, "\\\\");
-        } else if (ch == '\n') {
-            j_append(j, "\\n");
-        } else if (ch == '\r') {
-            j_append(j, "\\r");
-        } else if (ch == '\t') {
-            j_append(j, "\\t");
-        } else if (ch < 0x20) {
-            /* Skip other control characters */
-        } else {
-            j_append_char(j, ch);
-        }
-    }
-    j_append_char(j, '"');
-}
-
-// ---------------------------------------------------------------------------
-// Public API
+// JSON String Escaping (utility, public)
 // ---------------------------------------------------------------------------
 
 int
@@ -147,36 +103,28 @@ axl_json_escape_string(const char *src, char *out, size_t size)
         return -1;
     }
 
-#define ESC_APPEND_CHAR(c) do { \
-    if (pos >= size - 1) return -1; \
-    out[pos++] = (c); \
+#define ESC_APPEND_CHAR(c) do {           \
+    if (pos >= size - 1) return -1;       \
+    out[pos++] = (c);                     \
 } while (0)
 
-#define ESC_APPEND_STR(s) do { \
-    for (const char *_p = (s); *_p != '\0'; _p++) { \
-        ESC_APPEND_CHAR(*_p); \
-    } \
+#define ESC_APPEND_STR(s) do {                          \
+    for (const char *_p = (s); *_p != '\0'; _p++) {     \
+        ESC_APPEND_CHAR(*_p);                           \
+    }                                                   \
 } while (0)
 
     ESC_APPEND_CHAR('"');
 
     while (*src != '\0') {
         char ch = *src++;
-        if (ch == '"') {
-            ESC_APPEND_STR("\\\"");
-        } else if (ch == '\\') {
-            ESC_APPEND_STR("\\\\");
-        } else if (ch == '\n') {
-            ESC_APPEND_STR("\\n");
-        } else if (ch == '\r') {
-            ESC_APPEND_STR("\\r");
-        } else if (ch == '\t') {
-            ESC_APPEND_STR("\\t");
-        } else if (ch < 0x20) {
-            /* skip control characters */
-        } else {
-            ESC_APPEND_CHAR(ch);
-        }
+        if (ch == '"')       { ESC_APPEND_STR("\\\""); }
+        else if (ch == '\\') { ESC_APPEND_STR("\\\\"); }
+        else if (ch == '\n') { ESC_APPEND_STR("\\n");  }
+        else if (ch == '\r') { ESC_APPEND_STR("\\r");  }
+        else if (ch == '\t') { ESC_APPEND_STR("\\t");  }
+        else if (ch < 0x20)  { /* skip */               }
+        else                 { ESC_APPEND_CHAR(ch);     }
     }
 
     ESC_APPEND_CHAR('"');
@@ -188,153 +136,569 @@ axl_json_escape_string(const char *src, char *out, size_t size)
     return (int)pos;
 }
 
-void
-axl_json_init(AxlJsonBuilder *j, char *buffer, size_t size)
+// ---------------------------------------------------------------------------
+// Internal: low-level append (sets sticky error on AxlString OOM)
+// ---------------------------------------------------------------------------
+
+static void
+wr_chr(AxlJsonWriter *w, char c)
 {
-    j->buffer = buffer;
-    j->size = (size < 2) ? 2 : size;
-    j->pos = 0;
-    j->need_comma = false;
-    j->overflow = false;
-    buffer[0] = '\0';
+    if (w->error) return;
+    if (axl_string_append_c(w->out, c) != 0) w->error = true;
 }
 
-void
-axl_json_object_start(AxlJsonBuilder *j)
+static void
+wr_str(AxlJsonWriter *w, const char *s)
 {
-    j_comma(j);
-    j_append_char(j, '{');
-    j->need_comma = false;
+    if (w->error) return;
+    if (axl_string_append(w->out, s) != 0) w->error = true;
 }
 
-void
-axl_json_object_end(AxlJsonBuilder *j)
+static void
+wr_strn(AxlJsonWriter *w, const char *s, size_t n)
 {
-    j_append_char(j, '}');
-    j->buffer[j->pos] = '\0';
-    j->need_comma = true;
+    if (w->error) return;
+    if (axl_string_append_len(w->out, s, n) != 0) w->error = true;
 }
 
-void
-axl_json_object_start_named(AxlJsonBuilder *j, const char *key)
+// ---------------------------------------------------------------------------
+// Internal: state-machine helpers
+// ---------------------------------------------------------------------------
+
+static bool
+is_pretty(const AxlJsonWriter *w)
 {
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    j_append_char(j, '{');
-    j->need_comma = false;
+    return (w->flags & AXL_JSON_WRITER_PRETTY) != 0;
 }
 
-void
-axl_json_array_start(AxlJsonBuilder *j, const char *key)
+static bool
+current_is_array(const AxlJsonWriter *w)
 {
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    j_append_char(j, '[');
-    j->need_comma = false;
+    if (w->depth == 0) return false;
+    return (w->in_array_bits & (1u << (w->depth - 1))) != 0;
 }
 
-void
-axl_json_array_end(AxlJsonBuilder *j)
+static void
+emit_indent(AxlJsonWriter *w, uint32_t depth)
 {
-    j_append_char(j, ']');
-    j->buffer[j->pos] = '\0';
-    j->need_comma = true;
-}
-
-void
-axl_json_array_object_start(AxlJsonBuilder *j)
-{
-    j_comma(j);
-    j_append_char(j, '{');
-    j->need_comma = false;
-}
-
-void
-axl_json_array_add_string(AxlJsonBuilder *j, const char *value)
-{
-    j_comma(j);
-    if (value != NULL) {
-        j_escaped(j, value);
-    } else {
-        j_append(j, "null");
+    if (!is_pretty(w)) return;
+    wr_chr(w, '\n');
+    for (uint32_t i = 0; i < depth; i++) {
+        wr_strn(w, "  ", 2);
     }
-    j->need_comma = true;
 }
 
-void
-axl_json_add_string(AxlJsonBuilder *j, const char *key, const char *value)
+/* Emit comma + indent before the next item. Returns true if the caller
+ * should proceed; false if the writer is in an error state. Honors the
+ * "value-after-key is inline" rule (no comma, no indent). */
+static bool
+begin_item(AxlJsonWriter *w)
 {
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    if (value != NULL) {
-        j_escaped(j, value);
-    } else {
-        j_append(j, "null");
+    if (w->error) return false;
+
+    if (w->expecting_value) {
+        return true;
     }
-    j->need_comma = true;
+
+    /* At depth 0, a second value isn't valid JSON. */
+    if (w->depth == 0 && w->needs_comma) {
+        w->error = true;
+        return false;
+    }
+
+    if (w->needs_comma) {
+        wr_chr(w, ',');
+    }
+    if (w->depth > 0) {
+        emit_indent(w, w->depth);
+    }
+    return true;
 }
 
-void
-axl_json_add_uint(AxlJsonBuilder *j, const char *key, uint64_t value)
+/* Mark that a value was just emitted. */
+static void
+finish_value(AxlJsonWriter *w)
 {
-    char num[24];
-
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    u64_to_str(num, sizeof (num), value);
-    j_append(j, num);
-    j->need_comma = true;
+    w->needs_comma     = true;
+    w->expecting_value = false;
 }
 
-void
-axl_json_add_int(AxlJsonBuilder *j, const char *key, int64_t value)
+/* Push a new container at depth+1. Caller has already validated context
+ * and emitted the opening brace/bracket. */
+static void
+push_container(AxlJsonWriter *w, bool is_array)
 {
-    char num[24];
-
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    i64_to_str(num, sizeof (num), value);
-    j_append(j, num);
-    j->need_comma = true;
+    if (w->depth >= AXL_JSON_WRITER_MAX_DEPTH) {
+        w->error = true;
+        return;
+    }
+    w->depth++;
+    if (is_array) {
+        w->in_array_bits |= (1u << (w->depth - 1));
+    } else {
+        w->in_array_bits &= ~(1u << (w->depth - 1));
+    }
+    w->needs_comma     = false;
+    w->expecting_value = false;
 }
 
-void
-axl_json_add_bool(AxlJsonBuilder *j, const char *key, bool value)
+/* Pop a container. After pop, we're back in the outer container; the
+ * just-closed container counts as a value at the outer level. */
+static void
+pop_container(AxlJsonWriter *w)
 {
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    j_append(j, value ? "true" : "false");
-    j->need_comma = true;
+    if (w->depth == 0) {
+        w->error = true;
+        return;
+    }
+    /* Pretty: dedent before close brace, but only if container had items. */
+    if (is_pretty(w) && w->needs_comma) {
+        emit_indent(w, w->depth - 1);
+    }
+    w->depth--;
+    finish_value(w);
 }
 
-void
-axl_json_add_hex(AxlJsonBuilder *j, const char *key, uint64_t value)
+/* Emit a quoted, escaped string. */
+static void
+emit_quoted(AxlJsonWriter *w, const char *s)
 {
-    char buf[20];
-
-    u64_to_hex(buf, sizeof (buf), value);
-    axl_json_add_string(j, key, buf);
+    wr_chr(w, '"');
+    if (w->error) return;
+    char ch;
+    while ((ch = *s++) != '\0') {
+        if (ch == '"')       wr_strn(w, "\\\"", 2);
+        else if (ch == '\\') wr_strn(w, "\\\\", 2);
+        else if (ch == '\n') wr_strn(w, "\\n",  2);
+        else if (ch == '\r') wr_strn(w, "\\r",  2);
+        else if (ch == '\t') wr_strn(w, "\\t",  2);
+        else if (ch < 0x20)  { /* skip control chars */ }
+        else                 wr_chr(w, ch);
+    }
+    wr_chr(w, '"');
 }
 
-void
-axl_json_add_null(AxlJsonBuilder *j, const char *key)
+static void
+emit_quoted_n(AxlJsonWriter *w, const char *s, size_t n)
 {
-    j_comma(j);
-    j_escaped(j, key);
-    j_append_char(j, ':');
-    j_append(j, "null");
-    j->need_comma = true;
+    wr_chr(w, '"');
+    if (w->error) return;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '"')       wr_strn(w, "\\\"", 2);
+        else if (ch == '\\') wr_strn(w, "\\\\", 2);
+        else if (ch == '\n') wr_strn(w, "\\n",  2);
+        else if (ch == '\r') wr_strn(w, "\\r",  2);
+        else if (ch == '\t') wr_strn(w, "\\t",  2);
+        else if (ch < 0x20)  { /* skip */ }
+        else                 wr_chr(w, ch);
+    }
+    wr_chr(w, '"');
+}
+
+// ---------------------------------------------------------------------------
+// Public API: lifecycle
+// ---------------------------------------------------------------------------
+
+void
+axl_json_writer_init(AxlJsonWriter *w, AxlString *out, uint32_t flags)
+{
+    if (w == NULL) return;
+    w->out             = out;
+    w->flags           = flags;
+    w->depth           = 0;
+    w->in_array_bits   = 0;
+    w->needs_comma     = false;
+    w->expecting_value = false;
+    w->error           = (out == NULL);
 }
 
 size_t
-axl_json_finish(AxlJsonBuilder *j)
+axl_json_writer_finish(AxlJsonWriter *w)
 {
-    j->buffer[j->pos] = '\0';
-    return j->pos;
+    if (w == NULL || w->out == NULL) return 0;
+    if (w->depth != 0) {
+        /* Unclosed container(s) at finish — sticky error. */
+        w->error = true;
+    }
+    return axl_string_len(w->out);
+}
+
+bool
+axl_json_writer_error(const AxlJsonWriter *w)
+{
+    return w == NULL || w->error;
+}
+
+// ---------------------------------------------------------------------------
+// Public API: containers
+// ---------------------------------------------------------------------------
+
+void
+axl_json_obj_begin(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return;
+    /* In object context, a value can only follow a key. */
+    if (w->depth > 0 && !current_is_array(w) && !w->expecting_value) {
+        w->error = true;
+        return;
+    }
+    if (!begin_item(w)) return;
+    wr_chr(w, '{');
+    push_container(w, false);
+}
+
+void
+axl_json_obj_end(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return;
+    if (w->depth == 0 || current_is_array(w) || w->expecting_value) {
+        w->error = true;
+        return;
+    }
+    pop_container(w);
+    wr_chr(w, '}');
+}
+
+void
+axl_json_arr_begin(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return;
+    if (w->depth > 0 && !current_is_array(w) && !w->expecting_value) {
+        w->error = true;
+        return;
+    }
+    if (!begin_item(w)) return;
+    wr_chr(w, '[');
+    push_container(w, true);
+}
+
+void
+axl_json_arr_end(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return;
+    if (w->depth == 0 || !current_is_array(w)) {
+        w->error = true;
+        return;
+    }
+    pop_container(w);
+    wr_chr(w, ']');
+}
+
+// ---------------------------------------------------------------------------
+// Public API: keys
+// ---------------------------------------------------------------------------
+
+/* Internal: validate object-key context, emit comma + indent. Returns
+ * true if the caller should proceed to emit the key bytes themselves. */
+static bool
+key_prefix(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return false;
+    if (w->depth == 0 || current_is_array(w) || w->expecting_value) {
+        w->error = true;
+        return false;
+    }
+    if (w->needs_comma) {
+        wr_chr(w, ',');
+    }
+    emit_indent(w, w->depth);
+    return true;
+}
+
+/* Internal: emit the colon and (pretty) space after a key's quoted form,
+ * and update state so the next call expects a value. */
+static void
+key_suffix(AxlJsonWriter *w)
+{
+    wr_chr(w, ':');
+    if (is_pretty(w)) {
+        wr_chr(w, ' ');
+    }
+    w->needs_comma     = false;
+    w->expecting_value = true;
+}
+
+void
+axl_json_key(AxlJsonWriter *w, const char *key)
+{
+    if (key == NULL) {
+        if (w != NULL) w->error = true;
+        return;
+    }
+    if (!key_prefix(w)) return;
+    emit_quoted(w, key);
+    key_suffix(w);
+}
+
+void
+axl_json_keyn(AxlJsonWriter *w, const char *key, size_t n)
+{
+    if (key == NULL) {
+        if (w != NULL) w->error = true;
+        return;
+    }
+    if (!key_prefix(w)) return;
+    emit_quoted_n(w, key, n);
+    key_suffix(w);
+}
+
+/* Internal: emit a key whose bytes are spliced verbatim from a parsed
+ * source (jsmn keeps escape sequences in source form). Used by the
+ * parse→write bridge. */
+static void
+key_raw(AxlJsonWriter *w, const char *src, size_t n)
+{
+    if (!key_prefix(w)) return;
+    wr_chr(w, '"');
+    wr_strn(w, src, n);
+    wr_chr(w, '"');
+    key_suffix(w);
+}
+
+// ---------------------------------------------------------------------------
+// Public API: atoms
+// ---------------------------------------------------------------------------
+
+static bool
+check_atom_context(AxlJsonWriter *w)
+{
+    if (w == NULL || w->error) return false;
+    /* Bare-primitive root is rejected to mirror axl_json_parse, which
+     * requires the root token to be an object or array. */
+    if (w->depth == 0) {
+        w->error = true;
+        return false;
+    }
+    if (!current_is_array(w) && !w->expecting_value) {
+        w->error = true;
+        return false;
+    }
+    return true;
+}
+
+void
+axl_json_str(AxlJsonWriter *w, const char *s)
+{
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    if (s == NULL) {
+        wr_strn(w, "null", 4);
+    } else {
+        emit_quoted(w, s);
+    }
+    finish_value(w);
+}
+
+void
+axl_json_strn(AxlJsonWriter *w, const char *s, size_t n)
+{
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    if (s == NULL) {
+        wr_strn(w, "null", 4);
+    } else {
+        emit_quoted_n(w, s, n);
+    }
+    finish_value(w);
+}
+
+void
+axl_json_int(AxlJsonWriter *w, int64_t v)
+{
+    char buf[24];
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    i64_to_str(buf, sizeof(buf), v);
+    wr_str(w, buf);
+    finish_value(w);
+}
+
+void
+axl_json_uint(AxlJsonWriter *w, uint64_t v)
+{
+    char buf[24];
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    u64_to_str(buf, sizeof(buf), v);
+    wr_str(w, buf);
+    finish_value(w);
+}
+
+void
+axl_json_bool(AxlJsonWriter *w, bool v)
+{
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    wr_str(w, v ? "true" : "false");
+    finish_value(w);
+}
+
+void
+axl_json_null(AxlJsonWriter *w)
+{
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    wr_strn(w, "null", 4);
+    finish_value(w);
+}
+
+void
+axl_json_hex(AxlJsonWriter *w, uint64_t v)
+{
+    char buf[20];
+    if (!check_atom_context(w)) return;
+    if (!begin_item(w)) return;
+    u64_to_hex(buf, sizeof(buf), v);
+    emit_quoted(w, buf);
+    finish_value(w);
+}
+
+void
+axl_json_raw(AxlJsonWriter *w, const char *fragment)
+{
+    if (!check_atom_context(w)) return;
+    if (fragment == NULL) {
+        w->error = true;
+        return;
+    }
+    if (!begin_item(w)) return;
+    wr_str(w, fragment);
+    finish_value(w);
+}
+
+// ---------------------------------------------------------------------------
+// Public API: convenience kv pairs
+// ---------------------------------------------------------------------------
+
+void
+axl_json_kv_str(AxlJsonWriter *w, const char *key, const char *value)
+{
+    axl_json_key(w, key);
+    axl_json_str(w, value);
+}
+
+void
+axl_json_kv_strn(AxlJsonWriter *w, const char *key,
+                 const char *value, size_t value_n)
+{
+    axl_json_key(w, key);
+    axl_json_strn(w, value, value_n);
+}
+
+void
+axl_json_kv_int(AxlJsonWriter *w, const char *key, int64_t value)
+{
+    axl_json_key(w, key);
+    axl_json_int(w, value);
+}
+
+void
+axl_json_kv_uint(AxlJsonWriter *w, const char *key, uint64_t value)
+{
+    axl_json_key(w, key);
+    axl_json_uint(w, value);
+}
+
+void
+axl_json_kv_bool(AxlJsonWriter *w, const char *key, bool value)
+{
+    axl_json_key(w, key);
+    axl_json_bool(w, value);
+}
+
+void
+axl_json_kv_null(AxlJsonWriter *w, const char *key)
+{
+    axl_json_key(w, key);
+    axl_json_null(w);
+}
+
+void
+axl_json_kv_hex(AxlJsonWriter *w, const char *key, uint64_t value)
+{
+    axl_json_key(w, key);
+    axl_json_hex(w, value);
+}
+
+// ---------------------------------------------------------------------------
+// Public API: parse → write bridge
+// ---------------------------------------------------------------------------
+
+/* Walk one token and emit its JSON form. Returns the index of the next
+ * token after the subtree rooted at @p idx. */
+static int
+write_token_walk(AxlJsonWriter *w, const AxlJsonReader *r, int idx)
+{
+    if (w->error) return idx;
+    if (idx < 0 || idx >= r->token_count) {
+        w->error = true;
+        return idx;
+    }
+    const jsmntok_t *toks = (const jsmntok_t *)r->tokens;
+    const jsmntok_t *t    = &toks[idx];
+
+    if (t->type == JSMN_OBJECT) {
+        axl_json_obj_begin(w);
+        int next = idx + 1;
+        for (int i = 0; i < t->size; i++) {
+            const jsmntok_t *kt = &toks[next];
+            if (kt->type != JSMN_STRING) {
+                w->error = true;
+                return next;
+            }
+            key_raw(w, r->json + kt->start, (size_t)(kt->end - kt->start));
+            next = write_token_walk(w, r, next + 1);
+        }
+        axl_json_obj_end(w);
+        return next;
+    }
+
+    if (t->type == JSMN_ARRAY) {
+        axl_json_arr_begin(w);
+        int next = idx + 1;
+        for (int i = 0; i < t->size; i++) {
+            next = write_token_walk(w, r, next);
+        }
+        axl_json_arr_end(w);
+        return next;
+    }
+
+    if (t->type == JSMN_STRING) {
+        if (!check_atom_context(w)) return idx + 1;
+        if (!begin_item(w)) return idx + 1;
+        /* Splice string bytes verbatim, surrounded by quotes — jsmn keeps
+         * escape sequences in the source so this preserves the original
+         * representation without re-escaping. */
+        wr_chr(w, '"');
+        wr_strn(w, r->json + t->start, (size_t)(t->end - t->start));
+        wr_chr(w, '"');
+        finish_value(w);
+        return idx + 1;
+    }
+
+    if (t->type == JSMN_PRIMITIVE) {
+        if (!check_atom_context(w)) return idx + 1;
+        if (!begin_item(w)) return idx + 1;
+        wr_strn(w, r->json + t->start, (size_t)(t->end - t->start));
+        finish_value(w);
+        return idx + 1;
+    }
+
+    w->error = true;
+    return idx + 1;
+}
+
+void
+axl_json_write_token(AxlJsonWriter *w, const AxlJsonReader *r, int tok_idx)
+{
+    if (w == NULL || w->error || r == NULL || r->tokens == NULL) {
+        if (w != NULL) w->error = true;
+        return;
+    }
+    if (tok_idx < 0 || tok_idx >= r->token_count) {
+        w->error = true;
+        return;
+    }
+    write_token_walk(w, r, tok_idx);
 }

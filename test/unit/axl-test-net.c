@@ -1242,8 +1242,8 @@ run_udp_echo_mode(const char *host, const char *port_str)
     }
     axl_memcpy(&dest, octets, 4);
 
-    uint16_t port = (uint16_t)axl_strtou64(port_str);
-    if (port == 0) {
+    uint16_t port;
+    if (axl_str_to_u16(port_str, 10, &port, NULL) != 0 || port == 0) {
         axl_printf("UDP-ECHO: invalid port '%s'\n", port_str);
         return 1;
     }

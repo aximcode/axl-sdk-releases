@@ -18,7 +18,7 @@ every non-trivial UEFI app ends up reinventing.
   loop, `axl_yield`).
 - [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the four-axis
   taxonomy this layer composes. Notably its "Why not stackful
-  coroutines" rejection; see §6 below for why we're reopening it.
+  coroutines" rejection; see [§6](#6-stack-economics--reopening-the-old-rejection) below for why we're reopening it.
 - [`AXL-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) — overall axl-sdk architecture
   (the library this would sit on top of).
 
@@ -32,7 +32,7 @@ this layer. Concretely:
 
 | Symptom (SoftBMC today) | Root cause (the model) |
 |---|---|
-| HTTP handlers must be fully stateless — SMBIOS re-parsed every request ([design doc §295](../../softbmc/docs/SoftBMC-Design.md)) | No stack-local "this request" context; a handler is a single callback with no continuation |
+| HTTP handlers must be fully stateless — SMBIOS re-parsed every request ([SoftBMC-Design.md:295](../../softbmc/docs/SoftBMC-Design.md#L295)) | No stack-local "this request" context; a handler is a single callback with no continuation |
 | Per-client state tracked via `SoftBmcSetClientData()` sidecar with manual disconnect cleanup | No per-client address space of any kind; void\* + manual teardown is the only option |
 | `RfbPoll()` hand-unrolls VNC tile encoding one 8×8 tile per tick ([RfbServer](../../softbmc/SoftBmcPkg/Application/SoftBmc/Modules/Feature/RemoteKvm/)) | The scheduler doesn't know how to suspend mid-encoding; the code has to split itself across ticks |
 | One buggy `gBS->Stall(1s)` freezes HTTP, WS, terminal, VNC, and watchdog tickle | Single event loop, no isolation; a blocking call anywhere stalls everything |
@@ -63,7 +63,7 @@ Fix the primitive, the rest follows.
   state lives there. Exit releases it wholesale.
 - **Fault containment.** A runaway process that refuses to yield
   is flagged and terminated at the next scheduler opportunity;
-  other processes keep running. (Best-effort — see §10 unknowns.)
+  other processes keep running. (Best-effort — see [§10](#10-open-questions--unknowns) unknowns.)
 - **Composable services.** `axl_spawn(httpd); axl_spawn(kvm);
   axl_spawn(ipmi_watcher);` — no module table, no cleanup ordering.
 
@@ -71,7 +71,7 @@ Fix the primitive, the rest follows.
 
 - **No preemption.** UEFI BSP is cooperatively scheduled. A CPU-bound
   process that never yields *will* stall the scheduler. We mitigate
-  (§10), we do not pretend we solved it.
+  ([§10](#10-open-questions--unknowns)), we do not pretend we solved it.
 - **No MMU isolation.** Processes share one address space. A bug
   in one can scribble another's stack. Same as SoftBMC today; this
   layer doesn't make it worse, but it doesn't fix it either.
@@ -155,7 +155,7 @@ Stackful gives you:
 - Debuggers see real call stacks.
 
 The cost is one stack per process. That cost was the subject of
-axl-sdk's earlier rejection; see §6 for why it's reopenable.
+axl-sdk's earlier rejection; see [§6](#6-stack-economics--reopening-the-old-rejection) for why it's reopenable.
 
 ## 4. Syscall layer — how existing AXL maps
 
@@ -266,7 +266,7 @@ Why separate repo / package:
 
 Proposed final home: `aximcode/axl-kernel` (peer to `aximcode/axl-sdk`,
 `aximcode/uefi-devkit`, `aximcode/softbmc`). **Until the POC
-passes K2's success criteria** (§13), the code incubates in-tree
+passes K2's success criteria** ([§13](#13-poc-specification--what-gets-built-first)), the code incubates in-tree
 under `axl-sdk/experiments/axl-kernel/`. That gives the POC free
 access to AxlLoop, `axl_printf`, the unit-test harness, QEMU
 integration tests, and the build system. Graduating to its own
@@ -415,13 +415,13 @@ handler(msg); }`.
 
 Tasks + priorities + scheduler. Without hardware preemption, this
 reduces to cooperative coroutines with a priority ordering on the
-ready queue. Strict subset of what §3 proposes. If we want
+ready queue. Strict subset of what [§3](#3-core-primitive-process--stackful-coroutine) proposes. If we want
 priorities later, add them to the ready queue; no architectural
 change.
 
 ### 8.4 Hierarchical event loops (the shelved "parent drives children")
 
-See [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#L853) for the prior
+See [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running) for the prior
 rejection. The idea was: an `AxlLoop` has children `AxlLoop`s; the
 parent iterates them each tick. Rejected because of source-
 ownership ambiguity, break-event re-entry, poll-timer multiplication,
@@ -442,7 +442,7 @@ shape spectrum the design anticipated: stateless, firmware-backed,
 and live RAM state. `axl_waitpid(WNOHANG)` added to lift the
 accept-then-spawn pattern's sequential-connection cap (ReqLog
 demonstrates 24 connections against a 16-slot PCB with inline
-zombie draining). K4, K7–K9 not started. See the §9.x status
+zombie draining). K4, K7–K9 not started. See the [§9.x](#9-phased-implementation-plan) status
 callouts below and
 [experiments/axl-kernel/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/experiments/axl-kernel/README.md)
 for resume context.
@@ -539,9 +539,89 @@ for resume context.
 - Exit criteria: only worth building if bringup forces it. Skip
   otherwise.
 
+### Phase K10 — `axlk_offload`: AP compute pool  **[NOT STARTED]**
+
+UEFI is single-threaded **on the BSP**, but the BSP is not the
+only CPU. `EFI_MP_SERVICES_PROTOCOL` lets the BSP dispatch
+procedures to Application Processors that then run *truly
+concurrently* with BSP code. AXL already exploits this in
+[src/task/axl-task-pool.c](../../src/task/axl-task-pool.c) —
+persistent AP workers with lock-free volatile-slot dispatch and
+per-worker arenas, no shared allocator pressure. Phase K10 lifts
+that into a kernel syscall that composes with the fd-readiness
+model.
+
+**Why a phase, not a one-line wrapper:** the value isn't dispatch,
+it's *cooperative blocking on completion*. A coroutine submits
+work, yields, and is rescheduled when the AP finishes. That
+requires a new fd kind whose readiness is driven by an AP-written
+flag, not by `gBS->WaitForEvent`. Once that exists,
+`axlk_offload` falls out as a thin wrapper over the existing task
+pool.
+
+- **Scope.**
+  - New fd kind `AXLK_FD_OFFLOAD` whose readiness predicate watches
+    `volatile uint32_t done` written by the AP.
+  - New syscall `axlk_offload(fn, arg, arena_kb)` returns an fd.
+    `axlk_read(fd, &result, sizeof(result))` cooperatively blocks
+    until completion, copies the result struct, closes the fd.
+  - `AxlLoop` already supports callback-driven event sources;
+    `AXLK_FD_OFFLOAD` registers a poll predicate, no new scheduler
+    code path.
+  - Single-core fallback: if `axl_backend_mp_init` returns NULL,
+    the syscall runs `fn(arg, arena)` synchronously on the BSP and
+    the fd starts already-ready. Same call shape, transparent.
+- **Demo.** A SoftBMC-shape applet whose `/sha256` endpoint
+  hashes a multi-MB payload on an AP while a second concurrent
+  HTTP connection to `/cpu` (HwInfo-style, BSP-only) returns
+  instantly. Run on QEMU `-smp 4`.
+- **Exit criteria.**
+  1. Works on X64 and AARCH64.
+  2. End-to-end latency on `/sha256` at least 1.5× faster than
+     the pure-BSP baseline; concurrent `/cpu` shows no
+     degradation in p99 latency.
+  3. Single-core fallback path identical-API verified by setting
+     QEMU `-smp 1`.
+  4. Zero leaked tier-1 resources after 1000 offload cycles
+     (existing tier-1 registry catches this).
+- **Hard constraints (firmware-level, not AXL choices).**
+  - AP procedures **cannot** call boot-services protocols. No
+    AxlNet, AxlIO, AxlLog (touches console/file), no
+    `LocateProtocol`, no `gBS->Allocate*`. Offloaded work must
+    be pure compute over arena-allocated inputs.
+  - Buffer ownership: caller transfers ownership to the AP for
+    the duration of the offload and reclaims it on completion.
+    No shared mutable state between BSP and AP without explicit
+    `__sync_synchronize` barriers.
+  - After `ExitBootServices`, MP services are gone. Not a kernel
+    concern (we live in DXE/app context); flag it in the porting
+    guide for OS-loader-shaped consumers.
+- **Risks worth flagging at design time.**
+  - Most firmwares disable APs when the BSP is at `TPL_CALLBACK`
+    or higher. The kernel never raises TPL today, but
+    `axlk_offload` should debug-assert `gBS->RaiseTPL(TPL_APPLICATION)`
+    returns `TPL_APPLICATION`.
+  - Compile-time enforcement of the "no boot services from AP"
+    rule is impossible. Code review + a runtime assertion-loop
+    in debug builds (e.g., AP procedure runs inside a guarded
+    region that traps on suspicious calls) is the best we get.
+  - The existing AxlTaskPool busy-spins APs on `cpu_pause`. Fine
+    for compute pool; document that idle APs consume real power
+    and operators must size workloads accordingly.
+- **What this does NOT enable.**
+  - Two TCP handlers running in parallel. The handler needs
+    sockets/files/log — all BSP-only.
+  - Migrating a coroutine mid-flight to an AP. Stacks contain
+    pointers to BSP-only resources.
+  - Preemptive scheduling. Cooperative-on-BSP remains the model.
+
+Phase K10 is independent of K4 and K7 — could ship first if a
+SoftBMC-shape consumer needs CPU-heavy endpoints.
+
 Phases K1–K5 are ~2k LOC of kernel plus ~500 LOC of tests. K6 is
 the decision gate: port HwInfo, measure, decide. K7–K8 deliver
-the interactive story; K9 is optional.
+the interactive story; K9 is optional; K10 is the AP-compute
+extension and is independent of the interactive story.
 
 ## 10. Open questions / unknowns
 
@@ -608,11 +688,15 @@ Drivers stay the same; services get the new shape.
 
 ### 10.7 Interaction with AP offload
 
-`AxlTask` already dispatches work to Application Processors.
-Kernel-wrapped version: `axl_offload(fn, data)` is a syscall that
-dispatches to an AP and yields the BSP process until completion.
+`AxlTask` already dispatches work to Application Processors via
+`EFI_MP_SERVICES_PROTOCOL`. Kernel-wrapped version: `axlk_offload`
+is a syscall that hands a pure-compute job to an AP and
+cooperatively blocks the calling process until completion.
 
-**Lean:** straightforward wrapper; no redesign needed.
+See [Phase K10](#phase-k10--axlk_offload-ap-compute-pool-not-started)
+for the full design — it's been promoted from "lean wrapper" to
+its own phase because the fd-based wake-up surface is what makes
+it compose with the rest of the kernel.
 
 ## 11. What success looks like
 
@@ -627,7 +711,7 @@ dispatches to an AP and yields the BSP process until completion.
 - An ops laptop running `axl ps` / `axl kill` / `axl inspect`
   against a live target behaves the way `kubectl` does against
   a cluster — full readline, autocomplete, scripting — without
-  the target carrying a shell parser (§12).
+  the target carrying a shell parser ([§12](#12-interactive-access--axl-cli--bringup-applet)).
 
 ---
 
@@ -702,7 +786,7 @@ Strawman, to be firmed up in Phase K7:
 
 Auth: bearer token from day 1. No open endpoints. The token
 lives in a file on the ESP and is surfaced via a local
-`axl-debug token` applet (see §12.4) for first-time bootstrap.
+`axl-debug token` applet (see [§12.4](#124-bringup-fallback-axl-debug-applet)) for first-time bootstrap.
 
 TLS: optional at first (most BMC management networks are
 already isolated), mandatory later. mbedTLS is already in
@@ -722,7 +806,7 @@ That idea was rejected once the comparison became clear:
 Host CLI has the *smaller* target-side footprint — the
 counter-intuitive result — plus vastly better tooling for zero
 extra target-side cost. The only thing it gives up is
-serial-only bringup, and §12.4 handles that separately for a
+serial-only bringup, and [§12.4](#124-bringup-fallback-axl-debug-applet) handles that separately for a
 fraction of the cost.
 
 The in-target shell is a real option if a concrete use case
@@ -888,7 +972,7 @@ in the POC (no dynamic PCB allocation to start).
 **pid 0 is a real coroutine** — it has its own stack (allocated
 at kernel init, separate from the user-process stack pool). Every
 `axl_yield` / syscall context-switches back into pid 0. Pid 0's
-body is the scheduler inner loop (§13.8). Every switch goes
+body is the scheduler inner loop ([§13.8](#138-scheduler-inner-loop)). Every switch goes
 through pid 0; there are no direct proc-to-proc switches. This
 makes the reap-exited-stack problem trivial: the scheduler is
 always running on its own stack when it decides what to free.
@@ -960,7 +1044,7 @@ axl_ctx_switch:
 
 ~15 lines of asm. The `ret` pops the return address from the
 target stack — which is how a freshly-spawned coroutine enters
-its trampoline (§13.6).
+its trampoline ([§13.6](#136-spawn--trampoline)).
 
 ### 13.6 Spawn + trampoline
 
@@ -1225,14 +1309,14 @@ Captured here so they don't keep getting re-litigated:
 
 - **Core primitive is stackful coroutine, not stackless.** The
   cost (one stack per process) buys the property that matters
-  most: sequential code model. See §3.2.
+  most: sequential code model. See [§3.2](#32-why-stackful-not-stackless).
 - **No fork() with address-space duplication.** UEFI has no MMU;
   copying address space is meaningless. `axl_spawn(entry, argv, ...)`
   is the primitive; users who want fork+exec write a single spawn.
 - **New layer, not in-tree.** axl-sdk stays a primitive library.
-  axl-kernel is a peer repo that consumes it. See §5.
+  axl-kernel is a peer repo that consumes it. See [§5](#5-relationship-to-axl-sdk).
 - **One loop, many stacks — not many loops.** Sidesteps the
-  hierarchical-loop problems rejected in AXL-Runtime.md §5.4.
+  hierarchical-loop problems rejected in [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running).
 - **Cooperative only.** No attempt at preemption. Runaway detection
   is a best-effort mitigation, not a correctness property.
 - **Libc-shape API.** Function names are `axl_read` etc., but
@@ -1246,7 +1330,7 @@ Captured here so they don't keep getting re-litigated:
   Shell doesn't know about axl-kernel processes, so *any*
   axl-kernel-aware interaction needs new target-side code — and
   a control-plane router is ~500 LOC where an in-target shell
-  is ~2 000 LOC, for strictly better tooling. See §12.
+  is ~2 000 LOC, for strictly better tooling. See [§12](#12-interactive-access--axl-cli--bringup-applet).
 - **Tool name is `axl`, not `axlcmd` / `axlctl`.** Matches the
   `git` / `cargo` / `kubectl` single-word-plus-subcommand
   convention; ties directly to the project identity.

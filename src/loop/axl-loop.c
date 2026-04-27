@@ -267,7 +267,14 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         }
     }
 
-    if (event_count == 0 && !has_idle) {
+    /* No user sources, no idle callbacks. Non-blocking: nothing to
+     * check, return 1 ("no event fired"). Blocking: fall through and
+     * wait on the loop's intrinsic events (poll timer + break event)
+     * so axl_loop_run idles instead of busy-spinning. The yield-test
+     * end-to-end test exercises exactly this path — main() calls
+     * axl_loop_run on the default loop with no other sources to wait
+     * for Ctrl-C. */
+    if (event_count == 0 && !has_idle && !blocking) {
         return 1;
     }
 

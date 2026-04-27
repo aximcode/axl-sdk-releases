@@ -127,8 +127,11 @@ axl_http_server_get(
 
 /**
  * @brief Set maximum simultaneous connections.
+ *
+ * @return 0 on success, -1 if @p s is NULL or the underlying setter
+ *     rejected the value.
  */
-void
+int
 axl_http_server_set_max_connections(
     AxlHttpServer *s,    ///< server
     size_t        max    ///< maximum simultaneous connections (default 8)
@@ -136,8 +139,10 @@ axl_http_server_set_max_connections(
 
 /**
  * @brief Set maximum request body size.
+ *
+ * @return 0 on success, -1 on error.
  */
-void
+int
 axl_http_server_set_body_limit(
     AxlHttpServer *s,          ///< server
     size_t        max_bytes    ///< maximum request body size in bytes (default 4 MB)
@@ -145,8 +150,10 @@ axl_http_server_set_body_limit(
 
 /**
  * @brief Set keep-alive timeout.
+ *
+ * @return 0 on success, -1 on error.
  */
-void
+int
 axl_http_server_set_keep_alive(
     AxlHttpServer *s,             ///< server
     size_t        timeout_sec     ///< keep-alive timeout in seconds (default 30)

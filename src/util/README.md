@@ -9,6 +9,7 @@ Headers:
 - `<axl/axl-time.h>` — Wall-clock time and monotonic timestamps
 - `<axl/axl-nvstore.h>` — UEFI NVRAM variable access
 - `<axl/axl-driver.h>` — Driver binding and lifecycle
+- `<axl/axl-diag.h>` — Tool diagnostic helpers (`-v` output)
 - `<axl/axl-hexdump.h>` — Hex/ASCII dump formatting
 - `<axl/axl-config.h>` — Unified configuration + command-line parsing
 - `<axl/axl-path.h>` — Path manipulation
@@ -103,6 +104,57 @@ protocol, the image is unloaded and the search continues. This
 lets tools work whether they're invoked from a bare UEFI shell, a
 boot menu, or a `startup.nsh` that has already eager-loaded the
 driver.
+
+### Tool Diagnostics
+
+When investigating "why doesn't my tool work on this firmware?", call
+`axl_diag_startup(argc, argv)` from your `-v` / `--verbose` handler.
+It prints six labelled sections in one block:
+
+```
+POSIX argc = 3
+POSIX argv[0] = "mkrd.efi"
+POSIX argv[1] = "-v"
+POSIX argv[2] = "testrd"
+LOADOPT: size = 38 bytes
+LOADOPT: utf8 = "mkrd.efi -v testrd"
+SHELL: protocol OK, Argc = 3
+SHELL: Argv[0] = "FS0:\mkrd.efi"
+...
+IMG: path = \mkrd.efi
+VOLUMES: 1 mounted
+  fs0
+```
+
+POSIX argv shows what reached `main` after `axl-app.c` parsed
+`EFI_LOADED_IMAGE_PROTOCOL.LoadOptions`. LOADOPT shows the raw
+UCS-2 buffer the firmware passed in. SHELL is the optional
+`EFI_SHELL_PARAMETERS_PROTOCOL` probe — Dell firmware sometimes
+doesn't publish it for cross-volume invocations, which was the
+original "argc=1" bug. IMG and VOLUMES are the search anchors
+`axl_driver_ensure` / `axl_driver_locate` use.
+
+For protocol-registration questions specifically, pair it with
+`axl_diag_probe_protocol`:
+
+```c
+if (verbose) {
+    axl_diag_startup(argc, argv);
+    axl_diag_probe_protocol(
+        (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+        "EFI_RAM_DISK_PROTOCOL");
+}
+/* ... call axl_driver_ensure ... */
+if (verbose) {
+    axl_diag_probe_protocol(
+        (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+        "EFI_RAM_DISK_PROTOCOL (post-ensure)");
+}
+```
+
+The two probes around `axl_driver_ensure` show whether the firmware
+already had the driver baked in (both `ALREADY REGISTERED`) or
+whether ensure had to load it from disk (`NOT registered` → `REGISTERED`).
 
 ## Configuration (and Command-Line Parsing)
 

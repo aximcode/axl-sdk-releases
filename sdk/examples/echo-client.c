@@ -37,24 +37,9 @@ parse_port(
     uint16_t   *out    ///< [out] parsed port
 )
 {
-    unsigned int v = 0;
-
-    if (s == NULL || *s == '\0') {
+    if (axl_str_to_u16(s, 10, out, NULL) != 0 || *out == 0) {
         return -1;
     }
-    for (const char *p = s; *p != '\0'; p++) {
-        if (*p < '0' || *p > '9') {
-            return -1;
-        }
-        v = v * 10 + (unsigned int)(*p - '0');
-        if (v > 65535) {
-            return -1;
-        }
-    }
-    if (v == 0) {
-        return -1;
-    }
-    *out = (uint16_t)v;
     return 0;
 }
 

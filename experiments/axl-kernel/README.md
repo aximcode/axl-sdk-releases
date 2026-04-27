@@ -5,7 +5,7 @@ additional SoftBMC-shape ports (BootConfig — UEFI NVRAM; ReqLog —
 RAM-resident ring buffer). All tests pass on both **X64 and AARCH64**.
 Experimental. Lives in-tree until the approach is validated, then
 graduates to its own repo `aximcode/axl-kernel`
-(see [docs/AXL-Kernel-Design.md §5](../../docs/AXL-Kernel-Design.md#5-relationship-to-axl-sdk)).
+(see [AXL-Kernel-Design.md §5](./AXL-Kernel-Design.md#5-relationship-to-axl-sdk)).
 The K6 SoftBMC-HwInfo port is the design doc's go/no-go gate and
 it has passed — see the comparison section below.
 
@@ -342,7 +342,7 @@ Remaining options are all "extend a validated design":
 ### To resume: reading order
 
 1. This README (you're here).
-2. [docs/AXL-Kernel-Design.md](../../docs/AXL-Kernel-Design.md) — especially §9
+2. [AXL-Kernel-Design.md](./AXL-Kernel-Design.md) — especially §9
    phase plan (status callouts on each phase) and §13 POC spec.
 3. [experiments/axl-kernel/src/kernel.c](src/kernel.c) — the
    scheduler + fd layer + syscall pattern.

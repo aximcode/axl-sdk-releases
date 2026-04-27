@@ -529,6 +529,7 @@ axl_driver_ensure(
 
     /* Step 1: short-circuit if the protocol is already registered. */
     if (driver_protocol_registered(protocol_guid) == 0) {
+        axl_debug("driver ensure: protocol already registered, skipping search");
         return 0;
     }
 
@@ -536,13 +537,21 @@ axl_driver_ensure(
     size_t n_cand = 0;
     driver_build_candidates(driver_name, candidates, &n_cand);
 
+    axl_debug("driver ensure: searching %zu candidate path%s for '%s'",
+              n_cand, n_cand == 1 ? "" : "s", driver_name);
+    for (size_t i = 0; i < n_cand; i++) {
+        axl_debug("  [%zu] %s", i, candidates[i]);
+    }
+
     /* Try each candidate in priority order. */
     int rc = -1;
     for (size_t i = 0; i < n_cand; i++) {
         AxlFileInfo info;
         if (axl_file_info(candidates[i], &info) != 0 || info.is_dir) {
+            axl_debug("  miss: %s", candidates[i]);
             continue;
         }
+        axl_debug("  hit:  %s — attempting load", candidates[i]);
 
         AxlDriverHandle drv = NULL;
         if (axl_driver_load(candidates[i], &drv) != 0 || drv == NULL) {

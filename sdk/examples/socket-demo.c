@@ -25,14 +25,9 @@ main(int argc, char **argv)
     }
 
     host = argv[1];
-    if (argc >= 3) {
-        unsigned int val = 0;
-        for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) {
-            val = val * 10 + (unsigned int)(*p - '0');
-        }
-        if (val <= 65535) {
-            port = (uint16_t)val;
-        }
+    if (argc >= 3 && axl_str_to_u16(argv[2], 10, &port, NULL) != 0) {
+        axl_printf("invalid port: %s\n", argv[2]);
+        return 1;
     }
 
     /* Initialize networking (DHCP) */

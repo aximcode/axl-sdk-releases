@@ -233,7 +233,7 @@ Drives `outer` until `done` is signalled, the timeout elapses, or
 Ctrl-C. Does NOT set `outer->quit_requested`, so the enclosing
 `axl_loop_run` resumes normally afterwards. Returns 0 on done,
 -1 on timeout, `AXL_CANCELLED` on interrupt. See
-[`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §5.6.
+[`docs/AXL-Runtime.md` §5.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#56-nested-wait-primitive-axl_loop_iterate_until).
 
 ## Default Loop (`axl_loop_default`)
 
@@ -250,7 +250,7 @@ can:
    timeouts, defers, and raw events fire in line. **Idle sources
    are a footgun in this mode**: they run on every yield, not
    just when the loop is genuinely idle. See
-   [`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) §2.6.
+   [`docs/AXL-Runtime.md` §2.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#26-idle-callbacks-and-yield-driven-loops).
 3. Call `axl_loop_run(axl_loop_default())` to hand control to the
    loop — appropriate for event-driven servers.
 

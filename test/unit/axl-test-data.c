@@ -4,6 +4,8 @@
 
 #include "axl-test.h"
 
+#include <stdint.h>
+
 // ---------------------------------------------------------------------------
 // Hash Table Tests
 // ---------------------------------------------------------------------------
@@ -320,6 +322,11 @@ test_hash_insert_vs_replace(void)
     test_check(got == (void *)2, "ins_vs_rep: insert updated value");
 
     axl_hash_table_free(t);
+    /* test_free_counter doesn't actually free — reclaim test fixture keys
+     * explicitly. Both keys went through the destroy callback (key_a2 at
+     * the insert collision; key_a1 at axl_hash_table_free). */
+    axl_free(key_a1);
+    axl_free(key_a2);
 
     // Now test replace behavior
     t = axl_hash_table_new_full(
@@ -343,6 +350,9 @@ test_hash_insert_vs_replace(void)
     test_check(got == (void *)20, "ins_vs_rep: replace updated value");
 
     axl_hash_table_free(t);
+    /* Reclaim test fixture keys (see comment above). */
+    axl_free(key_b1);
+    axl_free(key_b2);
 }
 
 static void
@@ -620,7 +630,7 @@ test_string(void)
 static void
 test_json_parse(void)
 {
-    AxlJsonCtx ctx;
+    AxlJsonReader r;
     char str_buf[64];
     int64_t int_val;
     uint64_t uint_val;
@@ -630,29 +640,29 @@ test_json_parse(void)
     // Flat object
     const char *json = "{\"name\":\"devkit\",\"version\":42,\"debug\":true}";
 
-    ok = axl_json_parse(json, axl_strlen(json), &ctx);
+    ok = axl_json_parse(json, axl_strlen(json), &r);
     test_check(ok, "json parse: valid");
 
-    ok = axl_json_get_string(&ctx, "name", str_buf, sizeof(str_buf));
+    ok = axl_json_get_string(&r, "name", str_buf, sizeof(str_buf));
     test_check(ok && axl_strcmp(str_buf, "devkit") == 0, "json parse: get string");
 
-    ok = axl_json_get_int(&ctx, "version", &int_val);
+    ok = axl_json_get_int(&r, "version", &int_val);
     test_check(ok && int_val == 42, "json parse: get int");
 
-    ok = axl_json_get_uint(&ctx, "version", &uint_val);
+    ok = axl_json_get_uint(&r, "version", &uint_val);
     test_check(ok && uint_val == 42, "json parse: get uint");
 
-    ok = axl_json_get_bool(&ctx, "debug", &bool_val);
+    ok = axl_json_get_bool(&r, "debug", &bool_val);
     test_check(ok && bool_val == true, "json parse: get bool");
 
     // Missing key
-    ok = axl_json_get_string(&ctx, "missing", str_buf, sizeof(str_buf));
+    ok = axl_json_get_string(&r, "missing", str_buf, sizeof(str_buf));
     test_check(!ok, "json parse: missing key returns false");
 
-    axl_json_free(&ctx);
+    axl_json_free(&r);
 
     // Invalid JSON
-    ok = axl_json_parse("not json", 8, &ctx);
+    ok = axl_json_parse("not json", 8, &r);
     test_check(!ok, "json parse: invalid returns false");
 
     // One-shot convenience
@@ -667,58 +677,199 @@ test_json_parse(void)
 static void
 test_json_build(void)
 {
-    char buf[256];
-    AxlJsonBuilder j;
-    size_t len;
-    AxlJsonCtx ctx;
+    AxlJsonWriter w;
+    AxlJsonReader r;
     char str_buf[64];
     int64_t int_val;
     bool bool_val;
 
     // Build a simple object
-    axl_json_init(&j, buf, sizeof(buf));
-    axl_json_object_start(&j);
-    axl_json_add_string(&j, "name", "devkit");
-    axl_json_add_int(&j, "version", 42);
-    axl_json_add_bool(&j, "debug", true);
-    axl_json_add_null(&j, "extra");
-    axl_json_object_end(&j);
-    len = axl_json_finish(&j);
+    AxlString *out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "name", "devkit");
+    axl_json_kv_int(&w, "version", 42);
+    axl_json_kv_bool(&w, "debug", true);
+    axl_json_kv_null(&w, "extra");
+    axl_json_obj_end(&w);
+    size_t len = axl_json_writer_finish(&w);
 
     test_check(len > 0, "json build: non-empty");
-    test_check(!j.overflow, "json build: no overflow");
+    test_check(!axl_json_writer_error(&w), "json build: no error");
 
     // Round-trip: parse what we built
-    test_check(axl_json_parse(buf, len, &ctx), "json build: round-trip parse");
-    test_check(axl_json_get_string(&ctx, "name", str_buf, sizeof(str_buf))
+    const char *built = axl_string_str(out);
+    test_check(axl_json_parse(built, len, &r), "json build: round-trip parse");
+    test_check(axl_json_get_string(&r, "name", str_buf, sizeof(str_buf))
                && axl_strcmp(str_buf, "devkit") == 0,
                "json build: round-trip name");
-    test_check(axl_json_get_int(&ctx, "version", &int_val) && int_val == 42,
+    test_check(axl_json_get_int(&r, "version", &int_val) && int_val == 42,
                "json build: round-trip version");
-    test_check(axl_json_get_bool(&ctx, "debug", &bool_val) && bool_val == true,
+    test_check(axl_json_get_bool(&r, "debug", &bool_val) && bool_val == true,
                "json build: round-trip debug");
 
-    axl_json_free(&ctx);
+    axl_json_free(&r);
+    axl_string_free(out);
 
-    // Overflow test
-    char small_buf[10];
-    axl_json_init(&j, small_buf, sizeof(small_buf));
-    axl_json_object_start(&j);
-    axl_json_add_string(&j, "long_key", "long_value_that_wont_fit");
-    axl_json_object_end(&j);
-    axl_json_finish(&j);
-    test_check(j.overflow, "json build: overflow detected");
+    // Structural-misuse test: emit a key inside an array (should set sticky error)
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_arr_begin(&w);
+    axl_json_key(&w, "bad");        // illegal: key inside array
+    axl_json_writer_finish(&w);
+    test_check(axl_json_writer_error(&w), "json build: misuse sets error");
+    axl_string_free(out);
 
-    // Nested: array of strings
-    axl_json_init(&j, buf, sizeof(buf));
-    axl_json_object_start(&j);
-    axl_json_array_start(&j, "items");
-    axl_json_array_add_string(&j, "one");
-    axl_json_array_add_string(&j, "two");
-    axl_json_array_end(&j);
-    axl_json_object_end(&j);
-    len = axl_json_finish(&j);
-    test_check(len > 0 && !j.overflow, "json build: array of strings");
+    // Nested: array of strings, object with named array
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+        axl_json_key(&w, "items");
+        axl_json_arr_begin(&w);
+            axl_json_str(&w, "one");
+            axl_json_str(&w, "two");
+        axl_json_arr_end(&w);
+    axl_json_obj_end(&w);
+    len = axl_json_writer_finish(&w);
+    test_check(len > 0 && !axl_json_writer_error(&w),
+               "json build: nested object with array");
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"items\":[\"one\",\"two\"]}") == 0,
+               "json build: nested compact output exact");
+    axl_string_free(out);
+
+    // Pretty mode
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "name", "AXL");
+    axl_json_kv_uint(&w, "version", 1);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json build: pretty no error");
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\n  \"name\": \"AXL\",\n  \"version\": 1\n}") == 0,
+               "json build: pretty exact output");
+    axl_string_free(out);
+
+    // Bridge: write_token splices a parsed sub-document
+    const char *src = "{\"a\":1,\"b\":[2,3]}";
+    test_check(axl_json_parse(src, axl_strlen(src), &r), "json bridge: parse src");
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+        axl_json_key(&w, "wrapped");
+        axl_json_write_token(&w, &r, 0);   // splice entire src doc
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json bridge: no error");
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"wrapped\":{\"a\":1,\"b\":[2,3]}}") == 0,
+               "json bridge: round-trip exact output");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    // Bridge: \uXXXX escapes round-trip verbatim
+    const char *uesc = "{\"k\":\"a\\u00e9b\"}";
+    test_check(axl_json_parse(uesc, axl_strlen(uesc), &r),
+               "json bridge: parse escape src");
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_write_token(&w, &r, 0);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w),
+               "json bridge: escape no error");
+    test_check(axl_strcmp(axl_string_str(out), uesc) == 0,
+               "json bridge: \\uXXXX preserved verbatim");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    // Top-level atom rejection (matches parser's bare-primitive rejection)
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_str(&w, "lonely");
+    test_check(axl_json_writer_error(&w),
+               "json build: top-level atom is rejected");
+    axl_string_free(out);
+
+    // Empty containers in pretty mode emit no internal whitespace
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_obj_begin(&w);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out), "{}") == 0,
+               "json build: pretty empty object is {}");
+    axl_string_free(out);
+
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_arr_begin(&w);
+    axl_json_arr_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out), "[]") == 0,
+               "json build: pretty empty array is []");
+    axl_string_free(out);
+
+    // Numeric boundary: INT64_MIN
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_kv_int(&w, "min", INT64_MIN);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"min\":-9223372036854775808}") == 0,
+               "json build: INT64_MIN renders correctly");
+    axl_string_free(out);
+
+    // Numeric boundary: UINT64_MAX
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_kv_uint(&w, "max", UINT64_MAX);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"max\":18446744073709551615}") == 0,
+               "json build: UINT64_MAX renders correctly");
+    axl_string_free(out);
+
+    // Writer in error state no-ops subsequent calls
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_arr_begin(&w);
+    axl_json_key(&w, "bad");        // sets sticky error
+    size_t len_at_error = axl_string_len(out);
+    axl_json_str(&w, "ignored");    // must be a no-op
+    axl_json_arr_end(&w);           // must be a no-op
+    test_check(axl_json_writer_error(&w),
+               "json build: error sticks");
+    test_check(axl_string_len(out) == len_at_error,
+               "json build: post-error calls are no-ops");
+    axl_string_free(out);
+
+    // axl_json_raw(NULL) sets sticky error
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_key(&w, "x");
+    axl_json_raw(&w, NULL);
+    test_check(axl_json_writer_error(&w),
+               "json build: raw(NULL) sets error");
+    axl_string_free(out);
+
+    // axl_json_kv_strn for non-NUL-terminated values
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    const char *not_terminated = "abcXYZ";   // pretend len-3 slice
+    axl_json_obj_begin(&w);
+    axl_json_kv_strn(&w, "k", not_terminated, 3);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out), "{\"k\":\"abc\"}") == 0,
+               "json build: kv_strn slice is exact");
+    axl_string_free(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +883,7 @@ test_json_print(void)
 
     // Visual test — just verify it doesn't crash
     axl_printf("\njson pretty-print output:\n");
-    axl_json_pretty_print(json, axl_strlen(json));
+    axl_json_console_print(json, axl_strlen(json));
     test_pass("json print: no crash");
 }
 
@@ -1903,6 +2054,104 @@ test_ring_buf_partial(void)
 }
 
 static void
+test_ring_buf_push_stats(void)
+{
+    /* Reject mode (default): rejected bytes go into pushes_lost. */
+    AxlRingBuf *rb = axl_ring_buf_new(4);
+    test_check(axl_ring_buf_pushes_total(rb) == 0,
+               "ring_stats: pushes_total starts at 0");
+    test_check(axl_ring_buf_pushes_lost(rb) == 0,
+               "ring_stats: pushes_lost starts at 0");
+
+    axl_ring_buf_push(rb, "ABCD", 4);
+    test_check(axl_ring_buf_pushes_total(rb) == 4,
+               "ring_stats: total 4 after push 4");
+    test_check(axl_ring_buf_pushes_lost(rb) == 0,
+               "ring_stats: lost 0 when buffer fits");
+
+    /* Reject path: 3 bytes asked, 0 bytes fit. */
+    axl_ring_buf_push(rb, "XYZ", 3);
+    test_check(axl_ring_buf_pushes_total(rb) == 7,
+               "ring_stats: total counts rejected attempts");
+    test_check(axl_ring_buf_pushes_lost(rb) == 3,
+               "ring_stats: lost counts rejected bytes");
+
+    /* Partial reject: 1 free, 3 pushed → 2 lost. */
+    axl_ring_buf_discard(rb, 1);
+    axl_ring_buf_push(rb, "PQR", 3);
+    test_check(axl_ring_buf_pushes_total(rb) == 10,
+               "ring_stats: total counts partial-reject attempt");
+    test_check(axl_ring_buf_pushes_lost(rb) == 5,
+               "ring_stats: lost counts partial-rejected bytes");
+
+    axl_ring_buf_free(rb);
+
+    /* Overwrite mode: displaced old bytes count as lost. */
+    rb = axl_ring_buf_new_full(4, AXL_RING_BUF_OVERWRITE);
+    axl_ring_buf_push(rb, "ABCD", 4);
+    axl_ring_buf_push(rb, "12", 2);   /* displaces 2 old bytes */
+    test_check(axl_ring_buf_pushes_total(rb) == 6,
+               "ring_stats: overwrite total");
+    test_check(axl_ring_buf_pushes_lost(rb) == 2,
+               "ring_stats: overwrite displaces 2 old bytes");
+
+    /* Oversized overwrite push: input dropped + old displaced. */
+    axl_ring_buf_push(rb, "abcdefgh", 8);
+    /* Ring size is 4. orig_len=8: input_dropped=4 (first 4 bytes
+     * of input dropped), only last 4 written. Before this push,
+     * buffer was full (CD12). Those 4 are all displaced. Lost
+     * accumulates: 2 (from previous step) + 4 (input dropped) +
+     * 4 (displaced old) = 10. */
+    test_check(axl_ring_buf_pushes_total(rb) == 14,
+               "ring_stats: oversized overwrite total counts orig_len");
+    test_check(axl_ring_buf_pushes_lost(rb) == 10,
+               "ring_stats: oversized overwrite lost counts dropped+displaced");
+
+    /* clear() resets the counters. */
+    axl_ring_buf_clear(rb);
+    test_check(axl_ring_buf_pushes_total(rb) == 0,
+               "ring_stats: clear resets pushes_total");
+    test_check(axl_ring_buf_pushes_lost(rb) == 0,
+               "ring_stats: clear resets pushes_lost");
+
+    axl_ring_buf_free(rb);
+
+    /* Element mode (the reqlog-shape consumer). */
+    AxlRingBuf rb_elem;
+    uint32_t storage[8];   /* 32 bytes, pow2 */
+    axl_ring_buf_init_fixed(&rb_elem, storage, sizeof(storage),
+                            sizeof(uint32_t),
+                            AXL_RING_BUF_OVERWRITE, NULL);
+    for (uint32_t v = 0; v < 12; v++) {
+        axl_ring_buf_push_elem(&rb_elem, &v);
+    }
+    /* 12 elements pushed * 4 bytes = 48 attempted; 8-elem capacity
+     * means 4 elements were displaced = 16 bytes lost. */
+    test_check(axl_ring_buf_pushes_total(&rb_elem) == 12 * sizeof(uint32_t),
+               "ring_stats: elem total = pushes * elem_size");
+    test_check(axl_ring_buf_pushes_lost(&rb_elem) == 4 * sizeof(uint32_t),
+               "ring_stats: elem lost = displaced * elem_size");
+
+    /* Reject elem: a full ring rejects new elements; rejected count
+     * goes into pushes_lost. */
+    AxlRingBuf rb_reject;
+    uint32_t storage2[4];
+    axl_ring_buf_init_fixed(&rb_reject, storage2, sizeof(storage2),
+                            sizeof(uint32_t), 0, NULL);
+    for (uint32_t v = 0; v < 4; v++) {
+        axl_ring_buf_push_elem(&rb_reject, &v);
+    }
+    /* Now full. Try one more — must reject and count as lost. */
+    uint32_t reject_val = 99;
+    int rc = axl_ring_buf_push_elem(&rb_reject, &reject_val);
+    test_check(rc == -1, "ring_stats: full elem ring rejects");
+    test_check(axl_ring_buf_pushes_total(&rb_reject) == 5 * sizeof(uint32_t),
+               "ring_stats: reject elem counts in total");
+    test_check(axl_ring_buf_pushes_lost(&rb_reject) == sizeof(uint32_t),
+               "ring_stats: reject elem counts elem_size in lost");
+}
+
+static void
 test_ring_buf_power_of_2(void)
 {
     AxlRingBuf *rb;
@@ -2494,6 +2743,7 @@ test_data_main(int argc, char **argv)
     test_ring_buf_peek_discard();
     test_ring_buf_regions();
     test_ring_buf_partial();
+    test_ring_buf_push_stats();
     test_ring_buf_power_of_2();
     test_ring_buf_init();
     test_ring_buf_user_buffer();

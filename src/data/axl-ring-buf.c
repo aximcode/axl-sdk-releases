@@ -124,14 +124,16 @@ axl_ring_buf_init(
         return -1;
     }
 
-    rb->buf       = (uint8_t *)buf;
-    rb->size      = size;
-    rb->mask      = size - 1;
-    rb->read_pos  = 0;
-    rb->write_pos = 0;
-    rb->flags     = flags;
-    rb->elem_size = 0;
-    rb->buf_free  = buf_free_fn;
+    rb->buf          = (uint8_t *)buf;
+    rb->size         = size;
+    rb->mask         = size - 1;
+    rb->read_pos     = 0;
+    rb->write_pos    = 0;
+    rb->flags        = flags;
+    rb->elem_size    = 0;
+    rb->pushes_total = 0;
+    rb->pushes_lost  = 0;
+    rb->buf_free     = buf_free_fn;
     return 0;
 }
 
@@ -286,20 +288,28 @@ axl_ring_buf_push(
         return 0;
     }
 
+    uint32_t orig_len = len;
     uint32_t writable = ring_writable(rb);
 
+    rb->pushes_total += orig_len;
+
     if (rb->flags & AXL_RING_BUF_OVERWRITE) {
+        uint32_t input_dropped = 0;
         if (len > rb->size) {
-            data = (const uint8_t *)data + (len - rb->size);
+            input_dropped = len - rb->size;
+            data = (const uint8_t *)data + input_dropped;
             len = rb->size;
         }
 
+        uint32_t displaced_old = 0;
         if (len > writable) {
-            rb->read_pos += (len - writable);
+            displaced_old = len - writable;
+            rb->read_pos += displaced_old;
         }
 
         ring_copy_in(rb, data, len, rb->write_pos);
         rb->write_pos += len;
+        rb->pushes_lost += (uint64_t)input_dropped + displaced_old;
         return len;
     }
 
@@ -308,11 +318,13 @@ axl_ring_buf_push(
     }
 
     if (len == 0) {
+        rb->pushes_lost += orig_len;
         return 0;
     }
 
     ring_copy_in(rb, data, len, rb->write_pos);
     rb->write_pos += len;
+    rb->pushes_lost += (orig_len - len);
     return len;
 }
 
@@ -474,12 +486,15 @@ axl_ring_buf_push_advance(
         return;
     }
 
+    uint32_t orig_len = len;
     uint32_t writable = ring_writable(rb);
     if (len > writable) {
         len = writable;
     }
 
     rb->write_pos += len;
+    rb->pushes_total += orig_len;
+    rb->pushes_lost  += (orig_len - len);
 }
 
 // ===========================================================================
@@ -501,10 +516,15 @@ axl_ring_buf_push_msg(
 
     if (!(rb->flags & AXL_RING_BUF_OVERWRITE)) {
         if (axl_ring_buf_get_writable(rb) < total) {
+            /* Reject: count the whole message (header + payload) as
+             * attempted-but-lost so the call shows up in stats. */
+            rb->pushes_total += total;
+            rb->pushes_lost  += total;
             return -1;
         }
     }
 
+    /* Successful path: the underlying push() calls track bytes. */
     axl_ring_buf_push(rb, &len, (uint32_t)sizeof(uint32_t));
     if (len > 0) {
         axl_ring_buf_push(rb, data, len);
@@ -620,6 +640,9 @@ axl_ring_buf_push_elem(
 
     if (!(rb->flags & AXL_RING_BUF_OVERWRITE)) {
         if (ring_writable(rb) < rb->elem_size) {
+            /* Reject: count the element as attempted-but-lost. */
+            rb->pushes_total += rb->elem_size;
+            rb->pushes_lost  += rb->elem_size;
             return -1;
         }
     }
@@ -782,6 +805,20 @@ axl_ring_buf_clear(AxlRingBuf *rb)
         return;
     }
 
-    rb->read_pos = 0;
-    rb->write_pos = 0;
+    rb->read_pos     = 0;
+    rb->write_pos    = 0;
+    rb->pushes_total = 0;
+    rb->pushes_lost  = 0;
+}
+
+uint64_t
+axl_ring_buf_pushes_total(const AxlRingBuf *rb)
+{
+    return rb == NULL ? 0 : rb->pushes_total;
+}
+
+uint64_t
+axl_ring_buf_pushes_lost(const AxlRingBuf *rb)
+{
+    return rb == NULL ? 0 : rb->pushes_lost;
 }

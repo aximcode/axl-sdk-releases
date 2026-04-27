@@ -126,9 +126,17 @@ typedef void (*AxlLogHandler)(
 /**
  * @brief Add a global handler.
  *
- * Receives all messages that pass level filtering.
+ * Receives all messages that pass level filtering. The handler table
+ * is bounded; once full, additional registrations are rejected.
+ *
+ * **Re-entrancy.** Handlers must not allocate, send HTTP responses,
+ * or do anything that can itself emit a log line — the dispatcher is
+ * not re-entrant. A handler that triggers another `axl_warning` will
+ * recurse and corrupt the in-flight message.
+ *
+ * @return 0 on success, -1 if @p handler is NULL or the table is full.
  */
-void
+int
 axl_log_add_handler(
     AxlLogHandler handler,  ///< callback
     void         *data      ///< opaque data passed to handler
@@ -136,8 +144,10 @@ axl_log_add_handler(
 
 /**
  * @brief Add a handler that only fires for a specific domain and level range.
+ *
+ * @return 0 on success, -1 if @p handler is NULL or the table is full.
  */
-void
+int
 axl_log_add_domain_handler(
     const char   *domain,     ///< domain to filter (NULL matches all)
     int           max_level,  ///< maximum level to deliver

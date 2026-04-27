@@ -1198,16 +1198,341 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
 // Number parsing
 // ---------------------------------------------------------------------------
 
+/* Map an ASCII digit char to its numeric value for the given base.
+ * Returns -1 if the char isn't a valid digit for that base. */
+static int
+digit_value(
+    char c,
+    int  base
+    )
+{
+    int v;
+    if (c >= '0' && c <= '9') {
+        v = c - '0';
+    } else if (c >= 'a' && c <= 'z') {
+        v = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'Z') {
+        v = c - 'A' + 10;
+    } else {
+        return -1;
+    }
+    return (v < base) ? v : -1;
+}
+
+int
+axl_str_to_u64(
+    const char  *nptr,
+    int          base,
+    uint64_t    *out,
+    const char **endptr
+    )
+{
+    if (endptr != NULL) {
+        *endptr = nptr;
+    }
+    if (nptr == NULL || out == NULL) {
+        return -1;
+    }
+    if (base != 0 && (base < 2 || base > 36)) {
+        return -1;
+    }
+
+    const char *p = nptr;
+
+    /* Leading whitespace (matches strtoul + the legacy axl_strtou64). */
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    /* Optional '+' sign. '-' is rejected for unsigned. */
+    if (*p == '+') {
+        p++;
+    } else if (*p == '-') {
+        return -1;
+    }
+
+    /* "0x"/"0X" prefix: required for base 0 to switch to hex,
+     * tolerated when base is explicitly 16. We deliberately do NOT
+     * decode leading "0" as octal — surprising and rarely useful. */
+    if ((base == 0 || base == 16) && p[0] == '0'
+        && (p[1] == 'x' || p[1] == 'X')
+        && digit_value(p[2], 16) >= 0)
+    {
+        p += 2;
+        base = 16;
+    } else if (base == 0) {
+        base = 10;
+    }
+
+    /* Need at least one valid digit. */
+    if (digit_value(*p, base) < 0) {
+        return -1;
+    }
+
+    /* Accumulate, checking overflow on each step. */
+    uint64_t val = 0;
+    const uint64_t cutoff = UINT64_MAX / (uint64_t)base;
+    const int      cutlim = (int)(UINT64_MAX % (uint64_t)base);
+
+    while (true) {
+        int d = digit_value(*p, base);
+        if (d < 0) {
+            break;
+        }
+        if (val > cutoff || (val == cutoff && d > cutlim)) {
+            return -1;
+        }
+        val = val * (uint64_t)base + (uint64_t)d;
+        p++;
+    }
+
+    /* Strict mode: with no endptr, the entire input must be consumed.
+     * Callers that want partial parsing (tokenization) pass endptr.
+     * This is the whole point of the new API — silent partial parses
+     * are the bug axl_strtou64 had. */
+    if (endptr == NULL) {
+        if (*p != '\0') {
+            return -1;
+        }
+    } else {
+        *endptr = p;
+    }
+    *out = val;
+    return 0;
+}
+
+/* Shared narrow-unsigned helper: parse via u64, range-check against
+ * the caller-supplied ceiling, restore endptr to nptr on overflow. */
+static int
+str_to_unarrow(
+    const char  *nptr,
+    int          base,
+    uint64_t     ceiling,
+    uint64_t    *out,
+    const char **endptr
+    )
+{
+    uint64_t v;
+    if (out == NULL) {
+        return -1;
+    }
+    if (axl_str_to_u64(nptr, base, &v, endptr) != 0) {
+        return -1;
+    }
+    if (v > ceiling) {
+        if (endptr != NULL) {
+            *endptr = nptr;
+        }
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+int
+axl_str_to_u32(
+    const char  *nptr,
+    int          base,
+    uint32_t    *out,
+    const char **endptr
+    )
+{
+    uint64_t v;
+    if (str_to_unarrow(nptr, base, UINT32_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(uint32_t *)out = (uint32_t)v;
+    return 0;
+}
+
+int
+axl_str_to_u16(
+    const char  *nptr,
+    int          base,
+    uint16_t    *out,
+    const char **endptr
+    )
+{
+    uint64_t v;
+    if (str_to_unarrow(nptr, base, UINT16_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(uint16_t *)out = (uint16_t)v;
+    return 0;
+}
+
+int
+axl_str_to_u8(
+    const char  *nptr,
+    int          base,
+    uint8_t     *out,
+    const char **endptr
+    )
+{
+    uint64_t v;
+    if (str_to_unarrow(nptr, base, UINT8_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(uint8_t *)out = (uint8_t)v;
+    return 0;
+}
+
+int
+axl_str_to_s64(
+    const char  *nptr,
+    int          base,
+    int64_t     *out,
+    const char **endptr
+    )
+{
+    if (endptr != NULL) {
+        *endptr = nptr;
+    }
+    if (nptr == NULL || out == NULL) {
+        return -1;
+    }
+
+    const char *p = nptr;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    bool negative = false;
+    if (*p == '+') {
+        p++;
+    } else if (*p == '-') {
+        negative = true;
+        p++;
+    }
+
+    /* Parse the magnitude as unsigned. We bound by the range of the
+     * negative side (|INT64_MIN|) since it's larger than INT64_MAX.
+     * If u64 advances endptr past the magnitude and we then reject for
+     * range, restore endptr to nptr — contract is "endptr untouched
+     * past nptr on error" and overflow is an error. */
+    uint64_t v;
+    if (axl_str_to_u64(p, base, &v, endptr) != 0) {
+        if (endptr != NULL) {
+            *endptr = nptr;
+        }
+        return -1;
+    }
+
+    if (negative) {
+        if (v > (uint64_t)INT64_MAX + 1u) {
+            if (endptr != NULL) {
+                *endptr = nptr;
+            }
+            return -1;
+        }
+        /* -INT64_MIN is undefined; build it without negating. */
+        *out = (v == (uint64_t)INT64_MAX + 1u)
+            ? INT64_MIN
+            : -(int64_t)v;
+    } else {
+        if (v > (uint64_t)INT64_MAX) {
+            if (endptr != NULL) {
+                *endptr = nptr;
+            }
+            return -1;
+        }
+        *out = (int64_t)v;
+    }
+    return 0;
+}
+
+/* Shared narrow-signed helper: parse via s64, range-check against
+ * [floor, ceiling], restore endptr to nptr on overflow. */
+static int
+str_to_snarrow(
+    const char  *nptr,
+    int          base,
+    int64_t      floor,
+    int64_t      ceiling,
+    int64_t     *out,
+    const char **endptr
+    )
+{
+    int64_t v;
+    if (out == NULL) {
+        return -1;
+    }
+    if (axl_str_to_s64(nptr, base, &v, endptr) != 0) {
+        return -1;
+    }
+    if (v < floor || v > ceiling) {
+        if (endptr != NULL) {
+            *endptr = nptr;
+        }
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+int
+axl_str_to_s32(
+    const char  *nptr,
+    int          base,
+    int32_t     *out,
+    const char **endptr
+    )
+{
+    int64_t v;
+    if (str_to_snarrow(nptr, base, INT32_MIN, INT32_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(int32_t *)out = (int32_t)v;
+    return 0;
+}
+
+int
+axl_str_to_s16(
+    const char  *nptr,
+    int          base,
+    int16_t     *out,
+    const char **endptr
+    )
+{
+    int64_t v;
+    if (str_to_snarrow(nptr, base, INT16_MIN, INT16_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(int16_t *)out = (int16_t)v;
+    return 0;
+}
+
+int
+axl_str_to_s8(
+    const char  *nptr,
+    int          base,
+    int8_t      *out,
+    const char **endptr
+    )
+{
+    int64_t v;
+    if (str_to_snarrow(nptr, base, INT8_MIN, INT8_MAX, &v, endptr) != 0) {
+        return -1;
+    }
+    *(int8_t *)out = (int8_t)v;
+    return 0;
+}
+
 uint64_t
 axl_strtou64(const char *s)
 {
-    uint64_t  val;
+    /* Legacy: best-effort, no error reporting, accepts partial parses
+     * and silently wraps on overflow. New code should use
+     * axl_str_to_u64. Implemented in-place rather than via the new
+     * function because the new function rejects partial parses
+     * ("123abc" → -1) and overflow, which would change behavior for
+     * callers that rely on the lax semantics. */
+    uint64_t val;
 
     if (s == NULL) {
         return 0;
     }
 
-    // Skip whitespace
     while (*s == ' ' || *s == '\t') {
         s++;
     }

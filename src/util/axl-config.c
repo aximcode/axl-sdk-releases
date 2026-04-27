@@ -131,65 +131,108 @@ validate_type(int type, const char *value)
     }
 }
 
-static void
+/* Validate + (optionally) write an INT/UINT/BOOL/STRING field.
+ *
+ * Two modes:
+ *   target == NULL          → validate only (parse + range check); no write.
+ *   target != NULL          → validate AND write to target+desc->offset, if
+ *                             desc->field_size matches a known width. If the
+ *                             width is 0 (no auto-apply field declared),
+ *                             we still validate so callers see range errors.
+ *
+ * For numeric types the declared field_size narrows the accepted range:
+ * a uint16_t field rejects 99999, a uint32_t field rejects 2^33, etc.
+ *
+ * Returns 0 on success, -1 on parse error or out-of-range. */
+static int
 auto_apply(void *target, const AxlConfigDesc *desc, const char *value)
 {
-    if (target == NULL || desc->field_size == 0) {
-        return;
-    }
     if (value == NULL) {
-        return;
+        return 0;
     }
 
-    uint8_t *field = (uint8_t *)target + desc->offset;
+    const size_t width = desc->field_size;
+    uint8_t *field = (target != NULL && width > 0)
+        ? (uint8_t *)target + desc->offset
+        : NULL;
 
     switch (desc->type) {
-    case AXL_CFG_BOOL:
-        if (desc->field_size == sizeof(bool)) {
-            *(bool *)field = str_to_bool(value);
+    case AXL_CFG_BOOL: {
+        bool v = str_to_bool(value);
+        if (field != NULL && width == sizeof(bool)) {
+            *(bool *)field = v;
         }
-        break;
+        return 0;
+    }
 
-    case AXL_CFG_INT:
-        if (desc->field_size == sizeof(int64_t)) {
-            int64_t v = 0;
-            bool neg = false;
-            const char *p = value;
-            if (*p == '-') { neg = true; p++; }
-            else if (*p == '+') { p++; }
-            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
-            *(int64_t *)field = neg ? -v : v;
-        } else if (desc->field_size == sizeof(int)) {
-            int64_t v = 0;
-            bool neg = false;
-            const char *p = value;
-            if (*p == '-') { neg = true; p++; }
-            else if (*p == '+') { p++; }
-            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
-            *(int *)field = (int)(neg ? -v : v);
+    case AXL_CFG_INT: {
+        /* sizeof(int) is 4 on every supported AXL target (UEFI x64,
+         * AARCH64). The static assert means we can map `int` and
+         * `int32_t` paths to the same axl_str_to_s32 call without the
+         * runtime guard the previous version had. */
+        _Static_assert(sizeof(int) == sizeof(int32_t),
+                       "AXL assumes sizeof(int) == 4");
+        int64_t v;
+        if (width == sizeof(int32_t)) {
+            int32_t v32;
+            if (axl_str_to_s32(value, 0, &v32, NULL) != 0) {
+                return -1;
+            }
+            v = v32;
+        } else {
+            if (axl_str_to_s64(value, 0, &v, NULL) != 0) {
+                return -1;
+            }
         }
-        break;
+        if (field != NULL) {
+            if (width == sizeof(int64_t)) {
+                *(int64_t *)field = v;
+            } else if (width == sizeof(int32_t)) {
+                *(int32_t *)field = (int32_t)v;
+            }
+        }
+        return 0;
+    }
 
-    case AXL_CFG_UINT:
-        if (desc->field_size == sizeof(uint64_t)) {
-            *(uint64_t *)field = axl_strtou64(value);
-        } else if (desc->field_size == sizeof(uint32_t)) {
-            *(uint32_t *)field = (uint32_t)axl_strtou64(value);
-        } else if (desc->field_size == sizeof(uint16_t)) {
-            *(uint16_t *)field = (uint16_t)axl_strtou64(value);
+    case AXL_CFG_UINT: {
+        uint64_t v;
+        if (width == sizeof(uint16_t)) {
+            uint16_t v16;
+            if (axl_str_to_u16(value, 0, &v16, NULL) != 0) {
+                return -1;
+            }
+            v = v16;
+        } else if (width == sizeof(uint32_t)) {
+            uint32_t v32;
+            if (axl_str_to_u32(value, 0, &v32, NULL) != 0) {
+                return -1;
+            }
+            v = v32;
+        } else {
+            if (axl_str_to_u64(value, 0, &v, NULL) != 0) {
+                return -1;
+            }
         }
-        break;
+        if (field != NULL) {
+            if (width == sizeof(uint64_t)) {
+                *(uint64_t *)field = v;
+            } else if (width == sizeof(uint32_t)) {
+                *(uint32_t *)field = (uint32_t)v;
+            } else if (width == sizeof(uint16_t)) {
+                *(uint16_t *)field = (uint16_t)v;
+            }
+        }
+        return 0;
+    }
 
     case AXL_CFG_STRING:
-        /* For string fields, write a pointer if field is pointer-sized */
-        if (desc->field_size == sizeof(char *)) {
-            /* Store pointer to the value in the hash table */
+        if (field != NULL && width == sizeof(char *)) {
             *(const char **)field = value;
         }
-        break;
+        return 0;
 
     default:
-        break;
+        return 0;
     }
 }
 
@@ -230,13 +273,19 @@ axl_config_new(
         return NULL;
     }
 
-    /* Apply defaults */
+    /* Apply defaults. A default that overflows the declared width is a
+     * descriptor bug — log it but don't fail axl_config_new (we still
+     * have a usable config; the field just won't auto-apply). */
     for (int i = 0; descs[i].key != NULL; i++) {
         if (descs[i].default_value != NULL) {
             axl_hash_table_replace(cfg->values,
                                axl_strdup(descs[i].key),
                                axl_strdup(descs[i].default_value));
-            auto_apply(target, &descs[i], descs[i].default_value);
+            if (auto_apply(target, &descs[i], descs[i].default_value) != 0) {
+                axl_warning("config: default '%s'='%s' out of range for "
+                            "declared type — ignored",
+                            descs[i].key, descs[i].default_value);
+            }
         }
     }
 
@@ -317,6 +366,15 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
         return -1;
     }
 
+    /* Validate the value parses + fits the declared field width before
+     * any side effect. Catches "port=99999" overflowing a uint16_t —
+     * which used to silently truncate to 34463. */
+    if (auto_apply(NULL, desc, value) != 0) {
+        axl_warning("config: '%s' value '%s' out of range for declared type",
+                    key, value);
+        return -1;
+    }
+
     /* Handle MULTI: append to array */
     if (desc->type == AXL_CFG_MULTI) {
         MultiValues *mv = (MultiValues *)axl_hash_table_lookup(cfg->multi, key);
@@ -339,8 +397,9 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
         char *stored = value != NULL ? axl_strdup(value) : NULL;
         axl_hash_table_replace(cfg->values, axl_strdup(key), stored);
 
-        /* Auto-apply uses stored copy (safe for STRING pointer fields) */
-        auto_apply(cfg->target, desc, stored);
+        /* Auto-apply uses stored copy (safe for STRING pointer fields).
+         * The value was validated above so this can't fail; ignore rc. */
+        (void)auto_apply(cfg->target, desc, stored);
     }
 
     return 0;

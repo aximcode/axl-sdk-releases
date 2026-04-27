@@ -4,7 +4,7 @@
 `3789aea`...`4368256` on `main`). This document now describes the
 runtime as it is, not as proposed. A few items from the original
 design (release-mode heap sweep, opt-in watchdog) remain deferred
-and are called out in §10.
+and are called out in [§10](#deferred-items).
 
 This doc describes the higher-level runtime model: CRT0 owning a
 default event loop, Linux-style signal handling for Ctrl-C,
@@ -127,7 +127,7 @@ first. "Break" remains in the internal plumbing (backend helpers
 `axl_backend_shell_break_event` / `axl_backend_shell_break_flag`,
 UEFI's own "ExecutionBreak") because that's the mechanism-level
 name of the firmware event. "Signal" is what the API surface
-offers the app author. See §9 and Appendix.
+offers the app author. See [§9](#design-decisions-locked-in) and [Appendix](#appendix-decision-log).
 
 ### 2.3 The default loop
 
@@ -167,13 +167,13 @@ different pieces of behavior:
 
 All three are valid. Picking one is about what main is for — CPU
 work with side timers, pure event-driven service, or neither.
-Nested loops are a real concern — see §5.
+Nested loops are a real concern — see [§5](#nested-loops).
 
 **Why the singleton exists at all** (honest accounting). As of
 Phase A7 the default loop carries exactly one live responsibility:
 it is the scheduler that `axl_yield()` dispatches when someone has
 registered a source on it. That single integration is what makes
-the shape-2 pattern (§2.4) possible — without it, `axl_yield()`
+the shape-2 pattern ([§2.4](#tight-loop-yield-timer-worked-example)) possible — without it, `axl_yield()`
 reduces to "poll the break flag and maybe `axl_exit`," and the
 tight-loop-with-timer pattern does not work. Everything else the
 singleton *could* be used for (library-internal background work,
@@ -192,7 +192,7 @@ list (empty until you register), and the tier-1 registry
 entirely was considered; keeping it costs nothing when unused and
 preserves the `axl_yield`-as-scheduler design, which is the
 cornerstone of cooperative interruptibility for tight CPU loops
-(§3, §2.4).
+([§3](#axl-yield-cooperative-escape-hatch), [§2.4](#tight-loop-yield-timer-worked-example)).
 
 ### 2.4 "Tight-loop + yield + timer" worked example
 
@@ -256,7 +256,7 @@ via `axl_yield` (non-blocking dispatch) versus `axl_loop_run`
 | **Timeout** (`axl_loop_add_timeout`) | fires once at its deadline, then self-removes | same |
 | **Raw event** (`axl_loop_add_event`) | fires when the underlying `EFI_EVENT` is signaled (TCP completion tokens, protocol notifications, `AxlEvent`, cancellables) | same |
 | **Defer** (`axl_defer`) | drained before source checks — pending defers run each yield | same |
-| **Idle** (`axl_loop_add_idle`) | **fires every yield, including inside tight CPU loops** — see §2.6 | fires every loop iteration (unbounded frequency) |
+| **Idle** (`axl_loop_add_idle`) | **fires every yield, including inside tight CPU loops** — see [§2.6](#idle-callbacks-and-yield-driven-loops) | fires every loop iteration (unbounded frequency) |
 | **Key press** (`axl_loop_add_key_press`) | checks the console non-blocking; a pressed key dispatches | polls on each wakeup |
 | **Protocol notify** | fires when the watched protocol is installed | same |
 
@@ -441,7 +441,7 @@ cleanup path:
   cleanup, don't free. Dev sees bugs and fixes them.
 - **In release builds:** walk the same list, `axl_free` each
   entry. Heap returns to the firmware pool cleanly. *(Status:
-  deferred — see §10.1. The tier-2 sweep is not wired in today;
+  deferred — see [§10.1](#release-mode-heap-auto-sweep). The tier-2 sweep is not wired in today;
   release builds rely on firmware reboot to reclaim pool memory.)*
 
 Rationale: heap leaks waste memory but don't crash firmware.
@@ -810,7 +810,7 @@ default loop's invariants (for CRT0's own use) intact.
 
 ### 5.6 Nested-wait primitive: `axl_loop_iterate_until`
 
-The throwaway-loop pattern in §5.4 has a real cost: while the inner
+The throwaway-loop pattern in [§5.4](#true-nested-loops-inner-loop-runs-while-outer-is-running) has a real cost: while the inner
 loop is running, the outer loop's sources are frozen. Confirmed by
 the Phase A7 prototype (scenario 5, April 2026): a `timeout`
 source added to the outer loop inside a callback cannot fire until
@@ -989,10 +989,10 @@ implementation:
   next bullet.
 - **Pub/sub bus renamed to `axl_pubsub_*`.** Happens as a separate
   pre-landing PR specifically to free up `axl_signal_*` for the
-  interrupt API. Pre-1.0, ~90 identifiers across 14 files; see §6
+  interrupt API. Pre-1.0, ~90 identifiers across 14 files; see [§6](#public-api-surface)
   for the identifier map.
 - **Loop inheritance / `axl_loop_set_parent` deferred.** The
-  nested-wait use case is covered by `axl_loop_iterate_until` (§5.6),
+  nested-wait use case is covered by `axl_loop_iterate_until` ([§5.6](#nested-wait-primitive-axl-loop-iterate-until)),
   which is opt-in at the call site. Revisit only if a concrete use
   case demands inheritance semantics.
 - **Registry storage: dynamic (AxlArray-backed), not fixed-size.**
@@ -1020,7 +1020,7 @@ case appears:
 
 ### 10.1 Release-mode heap auto-sweep
 
-§4.2 tier-2 proposed that release builds walk `mAllocList` at
+[§4.2](#the-internal-resource-registry) tier-2 proposed that release builds walk `mAllocList` at
 `_axl_cleanup` and `axl_free` each entry — so apps that leak
 heap on exit don't bleed memory into the firmware pool across
 many invocations.
@@ -1042,14 +1042,14 @@ pool memory anyway.
 
 ### 10.2 Watchdog as library-livelock guard
 
-§9 locked in "watchdog default: off, opt-in via
+[§9](#design-decisions-locked-in) locked in "watchdog default: off, opt-in via
 `axl_watchdog_enable(seconds)`". The API doesn't exist yet. No
 concrete caller has asked for it. Implement when needed.
 
 ### 10.3 `axl_yield()` instrumentation of AXL APIs
 
 **Status: initial batch landed 2026-04-20.** See the status column
-in §3.1. The high-impact retry and CPU-bound loops now yield:
+in [§3.1](#where-axl-apis-inject-yields-automatically). The high-impact retry and CPU-bound loops now yield:
 `axl_file_get_contents` / `_set_contents`, the `axl_http_get` body-
 read loop, `axl_checksum_update` (chunked at 64 KiB), both
 `axl_array_sort` variants (every 1024 outer iters), and the IPMI
@@ -1105,14 +1105,14 @@ Captures the high-level choices made in our design conversations
 so future contributors don't re-litigate them.
 
 - **No longjmp.** Rejected in the signals discussion for async-
-  signal-unsafety reasons. See §7.
+  signal-unsafety reasons. See [§7](#what-we-are-not-doing).
 - **No watchdog repurpose.** Watchdog is reset-only on every
-  platform; not useful for signal-like semantics. See §7.
+  platform; not useful for signal-like semantics. See [§7](#what-we-are-not-doing).
 - **Yes CRT0-owned runtime.** Controlling every AXL API is the
   right leverage point — cooperative yields in library code
-  approximate POSIX signal responsiveness. See §1 and §3.
+  approximate POSIX signal responsiveness. See [§1](#motivation) and [§3](#axl-yield-cooperative-escape-hatch).
 - **Default loop is optional, not mandatory.** Apps that already
-  manage their own don't have to change. See §5.
+  manage their own don't have to change. See [§5](#nested-loops).
 - **Sleep is Ctrl-C interruptible.** Landed in commit `72ae173`,
   documented in `axl-wait.h`. This doc builds on that assumption.
 - **Interrupt API prefix is `axl_signal_*`.** The POSIX-flavored
@@ -1121,18 +1121,18 @@ so future contributors don't re-litigate them.
   the way (see next entry). Internal plumbing keeps "break" where
   it refers to the UEFI mechanism (`axl_backend_shell_break_*`,
   the firmware event's own name); the user-facing API is "signal".
-  See §2.2.
+  See [§2.2](#signal-subsystem).
 - **Pub/sub bus renamed to `axl_pubsub_*`.** The pre-1.0 rename
   specifically frees the `axl_signal_*` prefix for the interrupt
   API — that's the whole justification for paying the rename
   cost. Prefix + verbs change together: `publish` / `subscribe` /
-  `unsubscribe` / `register`. See §6.
+  `unsubscribe` / `register`. See [§6](#public-api-surface).
 - **Loop inheritance rejected in favor of `axl_loop_iterate_until`.**
   Inheritance solves the nested-wait outer-loop-starved symptom
   but introduces lifetime/ownership ambiguity and conflicts with
   the ephemeral-loop default. The explicit iterate-until primitive
   gives the same ergonomics with opt-in at the call site where the
-  caller already knows which loop they're in. See §5.6.
+  caller already knows which loop they're in. See [§5.6](#nested-wait-primitive-axl-loop-iterate-until).
 - **Phase A7 landed.** `sdk/examples/runtime-demo.c` now drives
   the real runtime (not the pre-landing mini-runtime). Validates
   atexit LIFO, tier-1 registry sweep with caller attribution,

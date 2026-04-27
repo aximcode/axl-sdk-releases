@@ -69,7 +69,7 @@ parsing AND for runtime configuration, duplicating descriptors.
   `axl_log_set("domain.tcp", "warning")` would be powerful
 - `AxlBufPool` — growth policy, alignment
 - `AxlArena` — block size, growth factor
-- `AxlJsonBuilder` — indent style, pretty print options
+- `AxlJsonWriter` — indent style, pretty print options
 
 **Consumer-facing (the biggest win):**
 
