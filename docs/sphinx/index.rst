@@ -5,7 +5,7 @@ AXL SDK
    :widths: 20 80
 
    * - **Version**
-     - 0.2.2
+     - |release|
    * - **License**
      - Apache-2.0
    * - **C header**
@@ -56,10 +56,11 @@ AXL SDK
    guides/getting-started
    guides/design
    guides/concurrency
-   guides/runtime
+   guides/lifecycle
    guides/coding-style
    guides/sdk
    guides/porting
+   guides/releasing
    guides/roadmap
 
 .. toctree::

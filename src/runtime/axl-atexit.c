@@ -4,7 +4,7 @@
 /** @file axl-atexit.c
     POSIX-flavored cleanup registry. Storage is AxlArray + monotonic
     seq, mirroring the tier-1 resource registry's layout — same
-    pattern, different payload. See docs/AXL-Runtime.md §4.3.
+    pattern, different payload. See docs/AXL-Lifecycle.md §4.3.
 **/
 
 #include <axl/axl-atexit.h>

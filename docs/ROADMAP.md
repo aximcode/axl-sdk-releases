@@ -665,10 +665,10 @@ synchronization primitive to reach for.
       coroutines, protothread macros, macro-async/await) so future
       contributors don't re-litigate them.
 
-### Phase A7: CRT0-owned runtime (signals, yield, atexit, default loop) — DONE
+### Phase A7: AXL runtime — lifecycle services (signals, yield, atexit, default loop) — DONE
 
 **Status:** landed April 2026 as seven commits on `main`
-(`3789aea`...`4368256`). See [docs/AXL-Runtime.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md)
+(`3789aea`...`4368256`). See [docs/AXL-Lifecycle.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md)
 (status: implemented) and `src/runtime/`.
 
 Since AXL controls every public API, we approximate Linux-style
@@ -705,7 +705,7 @@ What landed:
       `_axl_cleanup` before the registry sweep.
 - [x] Tier-1 firmware-resource registry --
       `src/runtime/axl-registry.c`. AxlArray-backed + monotonic
-      seq for true LIFO sweep; always on ([design §9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in)).
+      seq for true LIFO sweep; always on ([design §9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#9-design-decisions-locked-in)).
 - [x] **`axl_exit(rc)` as the blessed exit path.** NORETURN. Runs
       atexit + sweep, then `axl_backend_boot_exit(rc)` ->
       `gBS->Exit`. Both return-from-main and explicit `axl_exit`
@@ -719,7 +719,7 @@ What landed:
       site for library-internal allocations — which correctly
       freed never reach the sweep anyway).
 - [x] **`axl_loop_iterate_until`** (nested-wait primitive, [design
-      §5.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#56-nested-wait-primitive-axl_loop_iterate_until)) — lets callers inside a loop callback wait on an
+      §5.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#56-nested-wait-primitive-axl_loop_iterate_until)) — lets callers inside a loop callback wait on an
       event without freezing the outer loop's other sources.
 - [x] `runtime-demo.c` — 8 subcommand scenarios covering every
       facet, validated on X64 + AARCH64.
@@ -727,11 +727,11 @@ What landed:
       `test_check` calls covering atexit, registry, yield,
       interrupted, signal-install.
 - [x] Cooperative-concurrency caveat documented in
-      [docs/AXL-Runtime.md §11](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#11-what-this-doesnt-help-with) and
+      [docs/AXL-Lifecycle.md §11](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#11-what-this-doesnt-help-with) and
       [docs/AXL-Concurrency.md](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md).
 
 Deferred to a future phase (both captured in
-[docs/AXL-Runtime.md §10](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#10-deferred-items)):
+[docs/AXL-Lifecycle.md §10](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#10-deferred-items)):
 
 - [ ] **Release-mode heap auto-sweep.** `mAllocList` exists only
       under `AXL_MEM_DEBUG` today; making release-build sweeps
@@ -743,7 +743,7 @@ Deferred to a future phase (both captured in
       library-livelock guard, not a signal mechanism. No concrete
       caller has asked for it yet.
 
-Design decisions locked in (see [design doc §7](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#7-what-we-are-not-doing), [§9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in)):
+Design decisions locked in (see [design doc §7](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#7-what-we-are-not-doing), [§9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#9-design-decisions-locked-in)):
 
 - No `longjmp` from break notify — async-signal-unsafety.
 - No UEFI watchdog repurpose — reset-only on every platform.
@@ -1204,7 +1204,7 @@ during code review and refactor work, not during original planning.
             Discovered 2026-04-18.
 
       - [ ] **`axl_yield()` instrumentation of AXL APIs.**
-            [docs/AXL-Runtime.md §3.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#31-where-axl-apis-inject-yields-automatically) lists the
+            [docs/AXL-Lifecycle.md §3.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#31-where-axl-apis-inject-yields-automatically) lists the
             targets: file I/O (`axl_file_get_contents` /
             `axl_fread` / directory iteration), HTTP body-read
             loops in `src/net/axl-http-client.c`, `axl_digest_update`
@@ -1222,7 +1222,7 @@ during code review and refactor work, not during original planning.
       - [ ] **Minimal runtime opt-out via `axl-cc --minimal-runtime`.**
             CRT0 unconditionally installs the registry, atexit list,
             signal notify, and default loop during `_axl_init`. [§9
-            of `AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#9-design-decisions-locked-in) locked in "registry is always on"
+            of `AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#9-design-decisions-locked-in) locked in "registry is always on"
             with the rationale that drivers don't link CRT0 anyway;
             that's true but leaves size-constrained or exit-managed
             apps with no way out. Ship `axl-crt0-minimal.o` as a
@@ -1248,7 +1248,7 @@ during code review and refactor work, not during original planning.
             to fire every tick, and `test/unit/axl-test-runtime.c`
             has `test_yield_dispatches_ready_work` explicitly
             asserting the current semantics. Kept as-is; documented
-            as a footgun in [`AXL-Runtime.md` §2.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#26-idle-callbacks-and-yield-driven-loops) (recommend
+            as a footgun in [`AXL-Lifecycle.md` §2.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#26-idle-callbacks-and-yield-driven-loops) (recommend
             `axl_loop_add_timer` or `axl_defer` for tight-yield
             apps). Revisit if a real caller hits unresponsive
             idles or unwanted saturation — at which point the

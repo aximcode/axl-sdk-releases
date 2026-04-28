@@ -28,6 +28,12 @@
 #                         Useful for breaking inside SecMain or PEI.
 #   --debugcon FILE       Capture OVMF DEBUG output (port 0x402) — required
 #                         for gdb-syms.py to recover module load addresses.
+#   --no-cpu-warn         Disable the CPU-spike warning (on by default
+#                         in foreground mode; samples QEMU's host CPU
+#                         after the firmware-boot warm-up and prints
+#                         a WARN line if a spin gets through).
+#   --cpu-threshold N     Spike threshold in cores (default 1.5).
+#   --cpu-sustain SECS    Sustain duration in seconds (default 2).
 #
 # Examples:
 #   ./scripts/run-qemu.sh hello.efi
@@ -59,6 +65,9 @@ GDB_HALT=false
 DEBUGCON_LOG=""
 EFI_FILE=""
 EFI_ARGS=()
+CPU_WARN=true
+CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
+CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +93,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gdb-halt)   GDB_HALT=true; shift ;;
         --debugcon)   DEBUGCON_LOG="$2"; shift 2 ;;
+        --no-cpu-warn) CPU_WARN=false; shift ;;
+        --cpu-threshold) CPU_THRESHOLD="$2"; shift 2 ;;
+        --cpu-sustain) CPU_SUSTAIN="$2"; shift 2 ;;
         -h|--help)
             cat <<'HELP'
 Usage: run-qemu.sh [OPTIONS] <file.efi> [args...]
@@ -107,6 +119,13 @@ Options:
   --serial-socket PATH     (background mode) expose serial as a UNIX
                            socket so host scripts can inject input
                            (e.g. Ctrl-C via `printf '\x03' | socat ...`)
+  --no-cpu-warn            Disable CPU-spike warning. By default a
+                           sampler watches QEMU's host CPU and prints
+                           a WARN line if it sustains ≥1.5 cores for
+                           ≥2 s after the firmware-boot warm-up
+                           window (10 s X64 / 15 s AARCH64).
+  --cpu-threshold CORES    Override spike threshold (default 1.5 cores).
+  --cpu-sustain SECS       Override sustain duration (default 2 s).
   -h, --help               Show this help
 
 Examples:
@@ -238,6 +257,80 @@ fi
 
 # Prepare NVRAM
 cp "$FW_VARS" "$TMPDIR/vars.fd"
+
+# CPU-spike sampler. Runs alongside QEMU sampling /proc/<pid>/stat
+# at 5 Hz after a warm-up window (firmware boot legitimately spins
+# while it walks PCI / loads drivers). Tracks peak host-CPU
+# consumption (in core-units, where 1.0 = one core saturated) and
+# the longest sustained-≥-threshold streak. Writes "<peak>
+# <sustain_max>" to the supplied summary file when QEMU exits.
+# Caller checks the summary against CPU_THRESHOLD / CPU_SUSTAIN
+# and emits a WARN line if breached.
+#
+# Warm-up is ARCH-dependent — TCG (AARCH64 default) is slower
+# through OVMF boot than KVM-X64.
+CPU_WARMUP=10
+[[ "$ARCH" == "AARCH64" ]] && CPU_WARMUP=15
+
+cpu_sampler() {
+    local qpid="$1" out="$2"
+    local hz; hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    awk -v pid="$qpid" -v hz="$hz" -v interval=0.2 \
+        -v warmup="$CPU_WARMUP" -v thr="$CPU_THRESHOLD" '
+    function read_total(p,    line, n, after, f) {
+        if ((getline line < ("/proc/" p "/stat")) <= 0) {
+            close("/proc/" p "/stat"); return -1
+        }
+        close("/proc/" p "/stat")
+        n = index(line, ") ")
+        if (n == 0) return -1
+        split(substr(line, n+2), f, " ")
+        # post-comm fields: state(1) ppid(2) pgrp(3) session(4)
+        # tty_nr(5) tpgid(6) flags(7) minflt(8) cminflt(9)
+        # majflt(10) cmajflt(11) utime(12) stime(13) ...
+        return f[12] + f[13]
+    }
+    function alive(p) { return (system("kill -0 " p " 2>/dev/null") == 0) }
+    BEGIN {
+        system("sleep " warmup)
+        prev = read_total(pid)
+        if (prev < 0) { print "0.00 0.00"; exit 0 }
+        peak = 0; streak = 0; streak_max = 0
+        while (alive(pid)) {
+            system("sleep " interval)
+            cur = read_total(pid)
+            if (cur < 0) break
+            d = cur - prev; prev = cur
+            cores = d / (hz * interval)
+            if (cores > peak) peak = cores
+            if (cores >= thr) {
+                streak += interval
+                if (streak > streak_max) streak_max = streak
+            } else {
+                streak = 0
+            }
+        }
+        printf "%.2f %.2f\n", peak, streak_max
+    }' > "$out"
+}
+
+# Print a CPU-spike summary if the sampler captured a sustained spike.
+# Reads "<peak> <sustain_max>" from the file written by cpu_sampler.
+cpu_summary() {
+    local summary_file="$1"
+    [[ "$CPU_WARN" != "true" ]] && return 0
+    [[ ! -s "$summary_file" ]] && return 0
+    local peak sustain
+    read -r peak sustain < "$summary_file" || return 0
+    # awk for the comparison; $sustain and $CPU_SUSTAIN are floats.
+    local breached
+    breached=$(awk -v s="$sustain" -v t="$CPU_SUSTAIN" \
+        'BEGIN{print (s+0 >= t+0) ? "1" : "0"}')
+    if [[ "$breached" == "1" ]]; then
+        printf "WARN: CPU spike — peak %s cores, sustained ≥%s cores for %ss (threshold %ss)\n" \
+            "$peak" "$CPU_THRESHOLD" "$sustain" "$CPU_SUSTAIN" >&2
+    fi
+}
 
 # Build QEMU command
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" 512M "$TMPDIR/vars.fd")
@@ -372,7 +465,33 @@ else
     # TTY is on stdin (typical interactive ssh), QEMU picks up phantom
     # input and exits before producing a single byte of serial output.
     # The empty-log diagnostic below catches future surprises.
-    timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null || true
+    #
+    # Run QEMU under a wrapper subshell so we can grab its PID for the
+    # CPU sampler. `timeout` reparents the command, but the QEMU
+    # process is still a child of the subshell. After a brief settle
+    # delay (QEMU is up within ~100 ms typical, give it 1 s with
+    # backoff for slow hosts), pgrep -P finds it.
+    ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
+    WRAPPER_PID=$!
+    QPID=""
+    if [[ "$CPU_WARN" == "true" ]]; then
+        for _ in 1 2 3 4 5; do
+            QPID=$(pgrep -P "$WRAPPER_PID" 2>/dev/null | head -1)
+            [[ -n "$QPID" ]] && break
+            sleep 0.2
+        done
+    fi
+    SUMMARY=""
+    SAMPLER_PID=""
+    if [[ -n "$QPID" ]]; then
+        SUMMARY="$TMPDIR/cpu-summary.txt"
+        cpu_sampler "$QPID" "$SUMMARY" &
+        SAMPLER_PID=$!
+    fi
+    wait "$WRAPPER_PID" 2>/dev/null || true
+    if [[ -n "$SAMPLER_PID" ]]; then
+        wait "$SAMPLER_PID" 2>/dev/null || true
+    fi
 
     # Strip ANSI/DEC escape sequences and carriage returns. The param
     # byte class is the full CSI parameter range (ECMA-48 0x30-0x3F)
@@ -425,4 +544,8 @@ EOF
             grep -v "to continue\." | \
             grep -v "^Reset with"
     fi
+
+    # CPU-spike summary. Silent unless threshold breached. Runs after
+    # the serial output so the warning is the last thing the user sees.
+    [[ -n "$SUMMARY" ]] && cpu_summary "$SUMMARY"
 fi

@@ -37,6 +37,12 @@ These EDK2 dependencies have AXL equivalents and apps can port today:
 | Buffer pool | axl_buf_pool_* | SoftBMC VNC tiles |
 | Async AP work | axl_async_* | SoftBMC firmware update |
 | Async-op cancellation | axl_cancellable_* / axl_event_* / axl_wait_* | Anything with async I/O or interruptible polls (see `src/event/README.md`) |
+| `connect -r` + DHCP at startup | `axl_net_auto_init` | Any app touching TCP/UDP/HTTP/DNS — replaces the shell-level driver bind + DHCP wait that EDK2 apps assumed had already happened |
+| Driver self-load on first use | `axl_driver_ensure(GUID, "DriverName.efi")` | Tools that need a DXE driver (e.g. `MkRd` loads `RamDiskDxe.efi`); `axl_driver_locate` for search-only |
+| Ctrl-C / SIGINT handling | `axl_signal_install` / `axl_interrupted` / `axl_exit` | Long-running apps that want graceful shutdown (auto by default; install a handler for custom cleanup) |
+| `atexit`-style cleanup | `axl_atexit` | Apps with long-lived resources that should free on any exit path |
+| Default singleton main loop | `axl_loop_default` | Apps + library code that share one loop; lazy-allocated, freed automatically on `_axl_cleanup` |
+| Cooperative yield | `axl_yield` | Tight CPU loops that need to stay Ctrl-C responsive (no preemption in UEFI BSP) |
 | File seek/tell/eof | axl_fseek/ftell/feof | General file I/O |
 | mkdir/rmdir | axl_dir_mkdir/rmdir | General |
 | File delete/rename | axl_file_delete/rename | General |
@@ -531,10 +537,66 @@ AXL:
 #include <axl.h>
 
 int main(int argc, char **argv) {
-    // argc/argv provided automatically by AXL_APP macro
+    // argc/argv provided by the CRT0 entry stub
     ...
+    return 0;   // 0 == EFI_SUCCESS, non-0 == EFI_ABORTED
 }
 ```
+
+The CRT0 entry stub at `src/crt0/axl-crt0-native.c` (~17 lines)
+bridges UEFI's `_AxlEntry(ImageHandle, SystemTable)` to your
+`int main(argc, argv)`. It calls `_axl_init` before `main` (default
+loop singleton, atexit registry, Ctrl-C notify, tier-1 resource
+registry) and `_axl_cleanup` after. You don't see any of that —
+just write `main`. The full lifecycle is documented in
+[`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md).
+
+### Step 1.5: If your app uses networking or needs a DXE driver
+
+EDK2 apps typically assume the user already ran `connect -r` and
+`ifconfig -s eth0 dhcp` from the UEFI shell before launching, and
+that any DXE drivers they depend on (NIC drivers, RamDiskDxe, etc.)
+are already loaded. AXL apps self-bootstrap so they Just Work
+under `run-qemu.sh foo.efi` and on bare-metal images without a
+hand-curated startup.nsh.
+
+**Networking** — call `axl_net_auto_init` before any
+`axl_tcp_*` / `axl_udp_*` / `axl_http_*` / `axl_dns_*` call:
+
+```c
+if (axl_net_auto_init(SIZE_MAX, /* dhcp_timeout_sec */ 10) != 0) {
+    axl_printf("network bring-up failed\n");
+    return 1;
+}
+```
+
+It loads NIC drivers from the standard search path
+(`drivers/<arch>/`), runs `ConnectController` globally
+(equivalent to shell `connect -r`), and waits up to N seconds for
+DHCP. Idempotent — short-circuits if SNP is already up.
+
+**A specific DXE driver** — call `axl_driver_ensure(GUID, "Name.efi")`
+before using a protocol the driver provides. `MkRd` is the
+canonical example:
+
+```c
+if (axl_driver_ensure((const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+                      "RamDiskDxe.efi") != 0) {
+    axl_printf("RamDiskDxe.efi not available\n");
+    return 1;
+}
+```
+
+The driver search path covers the image's own directory and
+`drivers/<arch>/<name>` on every mounted FAT volume.
+
+**TCP close lifetime** — `axl_tcp_close` returns immediately on
+the async path (typical mid-loop case); the underlying `AxlTcp *`
+pointer outlives the call by up to TIME_WAIT (~2 s) while the
+firmware completes the close. Treat `sock` as freed once
+`axl_tcp_close` returns, and always close TCP sockets *before*
+freeing the loop they were registered with. The header doc in
+`<axl/axl-tcp.h>` describes this explicitly.
 
 ### Step 2: Replace Print with axl_printf
 
@@ -598,7 +660,8 @@ Note: AXL uses UTF-8 everywhere. No `L""` wide strings, no `CHAR16`.
 ### Step 7: Build with axl-cc
 
 ```bash
-# Install SDK
+# Install SDK (or install the .deb / .rpm from the releases page —
+# https://github.com/aximcode/axl-sdk-releases — and skip this step)
 ./scripts/install.sh --prefix /opt/axl-sdk
 
 # Build
@@ -606,7 +669,18 @@ Note: AXL uses UTF-8 everywhere. No `L""` wide strings, no `CHAR16`.
 
 # Test in QEMU
 ./scripts/run-qemu.sh myapp.efi
+
+# For network apps:
+./scripts/run-qemu.sh --net --hostfwd 17000:7000 myapp.efi
+
+# For apps that need a DXE driver staged on disk alongside:
+./scripts/run-qemu.sh --extra MyDriverDxe.efi myapp.efi
 ```
+
+`run-qemu.sh` also samples QEMU's host CPU during the run and
+emits a `WARN: CPU spike` line on stderr if a sustained spike
+gets through (e.g. a loop lost its `axl_yield`). Silent on
+healthy runs — see `--no-cpu-warn` / `--cpu-threshold` to tune.
 
 ### Reference: Hexdump port
 

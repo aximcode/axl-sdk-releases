@@ -1,5 +1,5 @@
-AxlRuntime — CRT0-owned runtime glue
-=====================================
+AxlRuntime — lifecycle services
+================================
 
 .. include:: ../../../src/runtime/README.md
    :parser: myst_parser.sphinx_

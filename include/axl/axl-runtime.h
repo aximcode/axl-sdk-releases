@@ -5,11 +5,16 @@
  * axl-runtime.h:
  *
  * AXL runtime surface — the pieces an app interacts with around its
- * own lifecycle and interruptibility. The runtime is CRT0-owned:
- * _axl_init (called by the entry stub) sets up the default loop,
- * installs the shell break notify, and initializes the tier-1
- * resource registry; _axl_cleanup (called on both return-from-main
- * and axl_exit) runs atexit callbacks and sweeps the registry.
+ * own lifecycle and interruptibility. The runtime is the library
+ * code in src/runtime/ that powers the program lifecycle; the CRT0
+ * entry stub (src/crt0/axl-crt0-native.c) invokes it at two
+ * boundaries:
+ *   - _axl_init (before main): default loop singleton, shell-break
+ *     notify, tier-1 resource registry, atexit registry.
+ *   - _axl_cleanup (after main, or on axl_exit): drain atexit,
+ *     sweep tier-1 leaks, free the default loop if created.
+ *
+ * Full design and the runtime-vs-CRT0 split: docs/AXL-Lifecycle.md.
  *
  * Related headers:
  *   - axl-signal.h   Ctrl-C / interrupt handler API + axl_exit

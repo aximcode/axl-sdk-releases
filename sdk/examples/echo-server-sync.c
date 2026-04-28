@@ -21,7 +21,7 @@
  * there is no outer event loop for the per-call loops to conflict
  * with. Inside an outer loop callback the same pattern would
  * freeze the outer loop for the duration of each call; see
- * docs/AXL-Runtime.md §5.4 for the rule.
+ * docs/AXL-Lifecycle.md §5.4 for the rule.
  *
  * Ctrl-C: each blocking call observes the shell-break event via
  * its internal loop dispatch; the runtime's default policy ends

@@ -43,13 +43,14 @@ distributable. No external dependencies — no EDK2, no gnu-efi.
 │    #include <axl.h>                         │
 │    int main(int argc, char **argv) { ... }  │
 ├─────────────────────────────────────────────┤
-│  axl-crt0-native.c                          │
-│    _AxlEntry → _axl_init → main → cleanup  │
+│  CRT0 entry stub (~17 lines)                │
+│    src/crt0/axl-crt0-native.c               │
+│    _AxlEntry → _axl_init → main → cleanup   │
 ├─────────────────────────────────────────────┤
 │  libaxl.a (static library)                  │
-│    AxlMem, AxlLog, AxlData, AxlIO,         │
+│    AxlMem, AxlLog, AxlData, AxlIO,          │
 │    AxlFormat, AxlLoop, AxlTask, AxlNet,     │
-│    AxlUtil, AxlGfx, AxlApp, AxlBackend     │
+│    AxlRuntime (lifecycle services), …       │
 ├─────────────────────────────────────────────┤
 │  AXL UEFI Headers (include/uefi/)           │
 │    Auto-generated from UEFI/PI specs        │
@@ -58,17 +59,32 @@ distributable. No external dependencies — no EDK2, no gnu-efi.
 └─────────────────────────────────────────────┘
 ```
 
+CRT0 and the runtime are different layers and worth keeping
+straight. **CRT0** is the entry stub at the top: ~17 lines that
+bridge UEFI's `_AxlEntry(ImageHandle, SystemTable)` to `int
+main(argc, argv)`. **The runtime** is the lifecycle library
+(`src/runtime/`) inside `libaxl.a` — it implements `_axl_init`,
+`_axl_cleanup`, the default loop singleton, atexit, signal
+handling, and the tier-1 resource registry. CRT0 invokes the
+runtime; the runtime owns the state. Full design and the runtime-
+vs-CRT0 split: [`docs/AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md).
+
 ### Entry Point Flow
 
 ```
 UEFI firmware
-  └→ _start                         [axl-crt0-gcc-x86_64.S / aarch64.S]
-       └→ _AxlEntry(ImageHandle, SystemTable)  [axl-crt0-native.c]
-            ├→ gST/gBS/gRT = ...    → set firmware table globals
-            ├→ _axl_init()           → streams, memory, console
-            ├→ _axl_get_args()       → argc/argv from Shell protocol
-            ├→ main(argc, argv)      → user code
-            └→ _axl_cleanup()        → teardown
+  └→ _start                              [src/crt0/axl-crt0-gcc-{x86_64,aarch64}.S]
+       └→ _AxlEntry(ImageHandle, SystemTable)  [src/crt0/axl-crt0-native.c]
+            ├→ gST/gBS/gRT = ...         → set firmware table globals
+            ├→ _axl_init()               → enter the runtime (default loop
+            │                              lazy-init, signal notify, tier-1
+            │                              registry, atexit registry, streams,
+            │                              memory, console)
+            ├→ _axl_get_args()           → argc/argv from Shell protocol
+            ├→ main(argc, argv)          → user code
+            └→ _axl_cleanup()            → re-enter the runtime (drain atexit
+                                           LIFO, free default loop if any,
+                                           sweep tier-1, leak report)
 ```
 
 ### Build Flow

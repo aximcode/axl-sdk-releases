@@ -7,7 +7,7 @@
     monotonic seq number so the exit-time sweep processes them in
     true LIFO order (last-registered-first-freed), matching atexit
     semantics and letting containers tear down before their contents.
-    See docs/AXL-Runtime.md §4.2.
+    See docs/AXL-Lifecycle.md §4.2.
 **/
 
 #include "axl-registry-internal.h"

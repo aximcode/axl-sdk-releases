@@ -2,14 +2,15 @@
 /* Copyright 2026 AximCode */
 
 /**
- * axl-crt0-minimal.c — Native UEFI entry point with the AXL runtime
- * turned off.
+ * axl-crt0-minimal.c — Native UEFI entry point that skips the
+ * AXL runtime.
  *
  * Peer to axl-crt0-native.c. Apps link this variant via
  * `axl-cc --minimal-runtime` when they want to opt out of the
- * CRT0-owned runtime (tier-1 resource registry, atexit list,
- * shell-break signal notify, default loop). What this CRT0 *does*
- * still do:
+ * runtime services (tier-1 resource registry, atexit list,
+ * shell-break signal notify, default loop) that the standard CRT0
+ * would otherwise wire up by calling _axl_init. What this CRT0
+ * *does* still do:
  *
  *   - Set the firmware globals (gST, gBS, gRT, gImageHandle) so
  *     any AXL call the app does make works.

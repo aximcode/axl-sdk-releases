@@ -1,17 +1,44 @@
-# AXL Runtime
+# AXL Lifecycle
 
-**Status:** implemented in Phase A7 (April 2026 — commits
-`3789aea`...`4368256` on `main`). This document now describes the
-runtime as it is, not as proposed. A few items from the original
-design (release-mode heap sweep, opt-in watchdog) remain deferred
-and are called out in [§10](#deferred-items).
+This doc describes the **program lifecycle** — the arc from
+firmware entry through `main` to cleanup and exit, and the
+services that live around `main`: a default event loop,
+Linux-style Ctrl-C handling, `axl_yield()` as a first-class
+cooperative escape hatch, atexit, and a tier-1 resource sweep on
+exit. It also calls out the hard limits we can't paper over
+(UEFI BSP has no preemption).
 
-This doc describes the higher-level runtime model: CRT0 owning a
-default event loop, Linux-style signal handling for Ctrl-C,
-`axl_yield()` as a first-class cooperative escape hatch, and a
-coherent story for resource cleanup when `main` returns or exits
-early. It also calls out the hard limits we can't paper over (UEFI
-has no preemption).
+A few items from the original design — release-mode heap sweep
+and an opt-in watchdog — remain deferred and are called out in
+[§10](#deferred-items). The history of how the lifecycle landed
+(Phase A7, April 2026, commits `3789aea`...`4368256`) and the
+decisions locked in along the way are kept for posterity in
+[§9](#design-decisions-locked-in) and the
+[Appendix](#appendix-decision-log).
+
+## Where things live
+
+It's easy to muddle "CRT0" and "the runtime" because both run
+around `main`. They are different layers:
+
+| Layer | Source | Scope |
+|---|---|---|
+| **CRT0** (the entry stub) | [`src/crt0/axl-crt0-native.c`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/crt0/axl-crt0-native.c) — ~17 lines | Bridges UEFI's `_AxlEntry(ImageHandle, SystemTable)` to `int main(argc, argv)`. Sets `gST`/`gBS`/`gRT`, calls `_axl_init`, calls `main`, calls `_axl_cleanup`. Owns nothing beyond the firmware-table globals. |
+| **The AXL runtime** | [`src/runtime/`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/runtime/) — `axl-runtime.c`, `axl-signal.c`, `axl-atexit.c`, `axl-registry.c` | The library invoked by CRT0 at the boundary calls. Owns the default-loop singleton, the atexit registry, the signal subsystem, the tier-1 resource registry, and the cooperative yield mechanism. |
+| **Public API** | [`<axl/axl-runtime.h>`](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-runtime.h), [`<axl/axl-signal.h>`](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-signal.h), [`<axl/axl-atexit.h>`](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-atexit.h) | What apps call: `axl_loop_default`, `axl_yield`, `axl_signal_install`, `axl_atexit`, `axl_exit`, `axl_interrupted`. |
+| **Loop primitives** | [`src/loop/`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/), [`<axl/axl-loop.h>`](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-loop.h) | Independent module. The runtime owns the *default-loop singleton*, but loop semantics (source kinds, dispatch, nested wait) live in the loop module's own design. This doc refers out to it. |
+
+When this doc says **"CRT0 invokes X"** it means the entry stub
+calls `_axl_init` / `_axl_cleanup`. When it says **"the runtime
+owns X"** it means the implementation lives in `src/runtime/` and
+travels with the library. CRT0 doesn't *own* the default loop or
+the atexit registry — the runtime does, and CRT0 wakes it up.
+
+The shorthand "the runtime" without further qualification refers
+to the in-process services, not to UEFI Runtime Services (`gRT`)
+or to the language runtime — three different "runtimes" we have
+to keep straight. Where the distinction matters this doc is
+explicit.
 
 Related reading:
 - [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the four-axis
@@ -20,6 +47,9 @@ Related reading:
 - [`AXL-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Design.md) — overall library architecture.
 - [`AXL-SDK-Design.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-SDK-Design.md) — CRT0 / `axl-cc` / entry
   point flow.
+- [`src/loop/README.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) — the loop module's
+  own reference; this doc only covers the parts of the loop that
+  the runtime touches (default-loop singleton, nested wait).
 
 ---
 
@@ -53,44 +83,49 @@ The key insight: **we control every AXL API**. If every slow API
 checks a flag, the app gets Linux-like responsiveness *without*
 needing preemption.
 
-## 2. Runtime model
+## 2. Lifecycle model
 
 ### 2.1 Who owns what
 
 ```
-_AxlEntry (CRT0)
-  ├─ _axl_init()
+_AxlEntry  (CRT0 entry stub, src/crt0/)
+  ├─ set gST / gBS / gRT from firmware
+  ├─ _axl_init()                                  → enters runtime
   │    ├─ initialize memory, console, backend
   │    ├─ install shell-break notify → sets g_axl_interrupted
   │    ├─ initialize tier-1 resource registry
   │    └─ initialize atexit registry
   │    (UEFI watchdog / livelock guard: deferred — see §10.2)
   ├─ _axl_get_args() → argc/argv
-  ├─ main(argc, argv)                       ← app runs here
-  └─ _axl_cleanup()
+  ├─ main(argc, argv)                             ← app runs here
+  └─ _axl_cleanup()                               → re-enters runtime
        ├─ run atexit callbacks in reverse order
        ├─ axl_loop_free(default_loop) if one was created
        ├─ sweep tier-1 registry (close leaked events/loops/...)
        └─ memory leak report (AXL_MEM_DEBUG)
 ```
 
-CRT0 owns: the break notify, the atexit registry, the tier-1
-resource registry, the watchdog timer. Those live from `_axl_init`
-through `_axl_cleanup`. The **default loop is *not* created by
-CRT0** — it is a lazy singleton, materialized the first time any
-code calls `axl_loop_default()` and freed during `_axl_cleanup` if
-anyone created it.
+The **runtime** owns: the break notify, the atexit registry, the
+tier-1 resource registry, the watchdog timer. Those live from
+`_axl_init` through `_axl_cleanup`. CRT0 invokes the runtime at
+both boundaries but holds none of the state itself.
 
-The app owns: anything it allocates. It can register `axl_atexit`
-handlers to free them automatically.
+The **default loop is *not* eagerly created** — it is a lazy
+singleton inside the runtime, materialized the first time any
+code calls `axl_loop_default()` and freed during `_axl_cleanup`
+if anyone created it.
+
+The **app** owns anything it allocates. It can register
+`axl_atexit` handlers to free them automatically when `main`
+returns or when an interrupt drives `axl_exit`.
 
 ### 2.2 Signal subsystem
 
 Shell break handling moves out of `axl_loop_run` and the wait
 helpers. Instead:
 
-- CRT0 registers a **notify callback** on the shell break event
-  during `_axl_init`.
+- The runtime registers a **notify callback** on the shell break
+  event during `_axl_init` (called from CRT0).
 - The notify sets `g_axl_interrupted = true` and invokes any user
   handler registered via `axl_signal_install`.
 - Default policy (no handler installed): interrupted flag is set,
@@ -133,9 +168,9 @@ offers the app author. See [§9](#design-decisions-locked-in) and [Appendix](#ap
 
 `axl_loop_default()` is a **lazy singleton**:
 
-- CRT0 never touches it — `_axl_init` does not call
-  `axl_loop_default()`, so until user code asks for it the loop
-  doesn't exist.
+- `_axl_init` never touches it — neither CRT0 nor the runtime's
+  init path calls `axl_loop_default()`, so until user code asks
+  for it the loop doesn't exist.
 - The first caller of `axl_loop_default()` materializes the loop
   via `axl_loop_new()`; subsequent callers get the same handle.
 - When the loop exists, `_axl_cleanup` frees it during teardown
@@ -687,8 +722,8 @@ outlive function scope and would leak at process exit.
 
 ## 5. Nested loops
 
-> *"What happens when a user embeds an Axl main loop within our
-> CRT0 created loop?"*
+> *"What happens when a user embeds an Axl main loop within the
+> runtime's default loop?"*
 
 Scenarios and their semantics:
 
@@ -704,9 +739,10 @@ int main(int argc, char **argv) {
 }
 ```
 
-**Semantics:** fine. Default loop exists idle in CRT0 but nothing
-drives it. Break is still detected (via notify callback, not via
-loop dispatch). App's loop is the active one; it picks up the
+**Semantics:** fine. The default loop sits idle (it's a lazy
+singleton inside the runtime; nothing has materialized it yet).
+Break is still detected via the runtime's notify callback, not
+via loop dispatch. App's loop is the active one; it picks up the
 break flag via its own sources (the break-event poll continues to
 register there too, under the hood).
 
@@ -717,13 +753,14 @@ int main(int argc, char **argv) {
     AxlLoop *loop = axl_loop_default();
     axl_loop_add_timer(loop, 1000, on_tick, NULL);
     axl_loop_run(loop);
-    /* no axl_loop_free — CRT0 owns this one */
+    /* no axl_loop_free — the runtime owns this one */
     return 0;
 }
 ```
 
-**Semantics:** fine. One loop, no nesting. Default loop is
-torn down in `_axl_cleanup` by CRT0.
+**Semantics:** fine. One loop, no nesting. The runtime tears
+down the default loop in `_axl_cleanup` (which CRT0 invokes after
+`main` returns).
 
 ### 5.3 App creates its own loop *alongside* the default
 
@@ -806,7 +843,7 @@ one client at a time.
 **The default loop is never used as a wait-helper throwaway.**
 Wait/event-wait always create their own ephemeral loops. This
 prevents source leaks between unrelated waits, and keeps the
-default loop's invariants (for CRT0's own use) intact.
+default loop's invariants (for the runtime's own use) intact.
 
 ### 5.6 Nested-wait primitive: `axl_loop_iterate_until`
 
@@ -1108,9 +1145,11 @@ so future contributors don't re-litigate them.
   signal-unsafety reasons. See [§7](#what-we-are-not-doing).
 - **No watchdog repurpose.** Watchdog is reset-only on every
   platform; not useful for signal-like semantics. See [§7](#what-we-are-not-doing).
-- **Yes CRT0-owned runtime.** Controlling every AXL API is the
-  right leverage point — cooperative yields in library code
-  approximate POSIX signal responsiveness. See [§1](#motivation) and [§3](#axl-yield-cooperative-escape-hatch).
+- **Yes a library-side runtime.** Controlling every AXL API is
+  the right leverage point — cooperative yields in library code
+  approximate POSIX signal responsiveness. CRT0 stays a thin
+  entry stub; the runtime, invoked by CRT0, does the work. See
+  [§1](#motivation) and [§3](#axl-yield-cooperative-escape-hatch).
 - **Default loop is optional, not mandatory.** Apps that already
   manage their own don't have to change. See [§5](#nested-loops).
 - **Sleep is Ctrl-C interruptible.** Landed in commit `72ae173`,

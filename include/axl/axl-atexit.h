@@ -23,7 +23,7 @@
  * }
  * @endcode
  *
- * See docs/AXL-Runtime.md §4.3 for the design rationale.
+ * See docs/AXL-Lifecycle.md §4.3 for the design rationale.
  */
 
 #ifndef AXL_ATEXIT_H

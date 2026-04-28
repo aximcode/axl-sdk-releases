@@ -14,7 +14,7 @@
  * loops to conflict with — every call is from main. Inside an
  * outer loop callback the nesting would freeze the outer loop
  * for the duration of each call; see echo-server.c (multi-client
- * async) and docs/AXL-Runtime.md §5.4 for the rule.
+ * async) and docs/AXL-Lifecycle.md §5.4 for the rule.
  *
  * Ctrl-C: each blocking call observes the shell-break event via
  * its internal loop dispatch and returns -1 with

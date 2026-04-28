@@ -16,13 +16,15 @@ See [src/event/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main
 the event primitives themselves, and [src/loop/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md)
 for event-loop mechanics.
 
-**Also see:** [`AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the CRT0-owned
-runtime that ships today (Phase A7, April 2026): lazy default
-loop, Linux-style signal handling, `axl_yield()` for tight loops,
-`axl_atexit` for cleanup, tier-1 resource registry + sweep. Apps
-that run a tight CPU loop can stay Ctrl-C responsive and fire
-registered timers by calling `axl_yield()` alone, without ever
-calling `axl_loop_run`; see [AXL-Runtime.md §2.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#24-tight-loop--yield--timer-worked-example) for the worked
+**Also see:** [`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md) — the runtime
+services that ship around `main` today (Phase A7, April 2026):
+lazy default loop, Linux-style signal handling, `axl_yield()` for
+tight loops, `axl_atexit` for cleanup, tier-1 resource registry +
+sweep. CRT0 invokes the runtime via `_axl_init` / `_axl_cleanup`;
+the runtime, not CRT0, owns the state. Apps that run a tight CPU
+loop can stay Ctrl-C responsive and fire registered timers by
+calling `axl_yield()` alone, without ever
+calling `axl_loop_run`; see [AXL-Lifecycle.md §2.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#24-tight-loop--yield--timer-worked-example) for the worked
 example.
 
 ## A note on naming
@@ -54,7 +56,7 @@ questions. Overlap is minimal and deliberate.
 | | Direct callback | Coupled point-to-point | caller-defined |
 | | `AxlEventHandle` + `axl_event_signal` | Hand a raw UEFI event to `axl_loop_add_event`; fire via `axl_event_signal(e)` | foreign-event interop (TCP completion tokens, protocol-notify) |
 | **Work offload** — "run where?" | [`AxlTask`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) pool | Real parallelism on APs (other cores); falls back single-core | AP dispatch, polled via `axl_task_pool_poll()` |
-| | [`AxlAsync`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) | Fire-and-forget AP work with a BSP callback | registers an idle source on the caller's loop (natural under `axl_loop_run`; under an `axl_yield`-driven main, see [`AXL-Runtime.md §2.6`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md)) |
+| | [`AxlAsync`](https://github.com/aximcode/axl-sdk-releases/blob/main/src/task/README.md) | Fire-and-forget AP work with a BSP callback | registers an idle source on the caller's loop (natural under `axl_loop_run`; under an `axl_yield`-driven main, see [`AXL-Lifecycle.md §2.6`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md)) |
 
 ## Decision guide
 

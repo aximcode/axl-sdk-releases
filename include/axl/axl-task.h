@@ -42,7 +42,7 @@ axl_arena_new_impl(
 
 /**
  * Captures the caller's file/line for leak reporting via the tier-1
- * resource registry. See docs/AXL-Runtime.md §4.2.1.
+ * resource registry. See docs/AXL-Lifecycle.md §4.2.1.
  */
 #define axl_arena_new(capacity) \
     axl_arena_new_impl((capacity), __FILE__, __LINE__)

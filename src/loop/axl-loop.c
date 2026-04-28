@@ -648,7 +648,7 @@ axl_loop_remove_source(AxlLoop *loop, uint32_t source_id)
 // ---------------------------------------------------------------------------
 // Nested-wait primitive: drive the loop until a condition fires, without
 // quitting it. Outer sources keep firing during the wait — see §5.6 of
-// docs/AXL-Runtime.md.
+// docs/AXL-Lifecycle.md.
 // ---------------------------------------------------------------------------
 
 static bool

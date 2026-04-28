@@ -921,7 +921,13 @@ run_serve_mode(void)
 
     axl_http_server_add_route(s, "GET", "/ttl-short", on_ttl_short, NULL);
     axl_http_server_add_route(s, "GET", "/ttl-long",  on_ttl_long,  NULL);
-    axl_http_server_set_route_ttl(s, "/ttl-short", 150);
+    /* TTL must be above axl_time_get_ms()'s 1-second granularity on
+       UEFI: GetTime returns 0 for nanosecond, so two requests in the
+       same wall-clock second compute age=0 regardless of how much
+       real time elapsed, and a sub-second TTL never expires. The
+       integration test that follows sleeps 2 s before the second
+       request to give us at least one second-boundary crossing. */
+    axl_http_server_set_route_ttl(s, "/ttl-short", 1500);
 
     axl_http_server_add_route(s, "GET", "/api/users/1", on_users_1, NULL);
     axl_http_server_add_route(s, "GET", "/api/users/2", on_users_2, NULL);

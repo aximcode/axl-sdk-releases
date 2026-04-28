@@ -67,7 +67,7 @@ axl_yield(void)
             _axl_signal_on_break();
         }
     } else {
-        /* Phase 2 (see docs/AXL-Runtime.md §3): dispatch any
+        /* Phase 2 (see docs/AXL-Lifecycle.md §3): dispatch any
          * immediately-ready work on the default loop. One
          * iteration only. */
         int r = axl_loop_dispatch(loop, /*blocking=*/false);

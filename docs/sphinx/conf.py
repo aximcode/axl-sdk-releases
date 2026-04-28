@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 # -- Project info ------------------------------------------------------------
 
 project = "AXL"
 author = "AximCode"
 copyright = "2025-2026, AximCode"  # noqa: A001
-release = "0.1"
+# Pull the release string from the canonical VERSION file at the repo
+# root so docs stay in sync with the bumped version automatically.
+# scripts/bump-version.sh is the only thing that should modify
+# VERSION (it also keeps include/axl/axl-version.h in lockstep).
+_repo_root = Path(__file__).resolve().parent.parent.parent
+release = (_repo_root / "VERSION").read_text(encoding="utf-8").strip()
+version = release
 
 # -- Extensions --------------------------------------------------------------
 

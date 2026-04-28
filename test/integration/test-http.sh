@@ -265,9 +265,11 @@ BODY=$(echo "$RESP" | sed '$d')
 echo "$BODY" | grep -q '"count":2' && pass "/cm/1 evicted and re-run (count=2)" || fail "/cm/1 eviction failed ($BODY)"
 
 # ---------------------------------------------------------------------------
-# Per-route TTL — /ttl-short has a 150ms TTL, /ttl-long uses the
-# server-wide 60-second default. After sleeping 400ms, /ttl-short
+# Per-route TTL — /ttl-short has a 1.5s TTL, /ttl-long uses the
+# server-wide 60-second default. After sleeping 2s, /ttl-short
 # must expire (handler re-runs) while /ttl-long stays cached.
+# (TTL must exceed UEFI's 1-second clock granularity so that
+# `now - timestamp_ms` is non-zero on the second request.)
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -281,7 +283,7 @@ RESP=$(http_get "/ttl-long")
 BODY=$(echo "$RESP" | sed '$d')
 echo "$BODY" | grep -q '"count":1' && pass "/ttl-long first request count=1" || fail "/ttl-long first count wrong ($BODY)"
 
-sleep 0.4
+sleep 2
 
 RESP=$(http_get "/ttl-short")
 BODY=$(echo "$RESP" | sed '$d')

@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-signal.c
-    POSIX-flavored interrupt handler API. See docs/AXL-Runtime.md §2.2.
+    POSIX-flavored interrupt handler API. See docs/AXL-Lifecycle.md §2.2.
 
     Detection is piggybacked on the existing loop-level break
     checking: axl_loop_next_event and axl_yield both observe the

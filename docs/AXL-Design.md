@@ -36,9 +36,12 @@ and direct:
 If you've written a GLib daemon, you already understand the AXL
 programming model — what changes is that you're targeting a UEFI
 PE/COFF binary instead of an ELF executable, and AXL handles the
-firmware-side glue (CRT0, event integration, protocol lookup) so
-you don't write `gBS->`, `gST->`, `EFI_*` types, or wide strings
-in your application code.
+firmware-side glue (the CRT0 entry stub, the AXL runtime that
+wraps `main` with default loop / atexit / Ctrl-C / leak sweep,
+event integration, protocol lookup) so you don't write `gBS->`,
+`gST->`, `EFI_*` types, or wide strings in your application code.
+The full lifecycle — boot → init → main → cleanup → exit — is
+documented in [`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md).
 
 **Where the UEFI types come from.** AXL has no source-tree
 dependency on EDK2. The `EFI_*` structs, status codes, protocol
@@ -473,38 +476,27 @@ size_t    axl_hash_table_foreach_remove(AxlHashTable *h, ...);
 ### axl_main entry point
 
 ```c
-// In axl.h
-#define AXL_APP(main_func)                                    \
-  EFI_STATUS EFIAPI _AxlEntry(                                \
-    EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {  \
-    _axl_init(ImageHandle, SystemTable);                      \
-    int argc; char **argv;                                    \
-    _axl_get_args(&argc, &argv);                              \
-    int rc = main_func(argc, argv);                           \
-    _axl_cleanup();                                           \
-    return (rc == 0) ? EFI_SUCCESS : EFI_ABORTED;             \
-  }
-
-// App code:
+// App code today:
 #include <axl.h>
 
-int my_main(int argc, char **argv)
+int main(int argc, char **argv)
 {
     axl_printf("Hello %s\n", argv[1]);
     return 0;
 }
-
-AXL_APP(my_main)
 ```
 
-The `AXL_APP` macro:
-1. Defines the real UEFI entry point (PascalCase, hidden)
-2. Initializes AXL (stdout/stderr/stdin streams, memory subsystem)
-3. Converts UEFI `CHAR16 **Argv` to C `char **argv`
-4. Calls the user's `main` function with C-style argc/argv
-5. Cleans up and returns EFI_STATUS
-
-Apps never see `EFI_HANDLE`, `EFI_SYSTEM_TABLE`, or `EFIAPI`.
+The CRT0 entry stub at `src/crt0/axl-crt0-native.c` implements
+`_AxlEntry(ImageHandle, SystemTable)` once for the whole SDK. It
+sets the firmware-table globals, calls `_axl_init` (which enters
+the runtime), parses argv via the runtime's `_axl_get_args`, calls
+your `main(argc, argv)`, then calls `_axl_cleanup` and returns
+`EFI_SUCCESS` (rc=0) or `EFI_ABORTED`. Apps never see
+`EFI_HANDLE`, `EFI_SYSTEM_TABLE`, or `EFIAPI`. The historical
+`AXL_APP(main_func)` macro that inlined this stub still exists
+for backwards compatibility; new code just declares `int main(int,
+char **)` and links against the CRT0 object that `axl-cc`
+includes by default. Full lifecycle: [`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md).
 
 ---
 
@@ -960,9 +952,15 @@ types in public API, no space before parens.
    Conversion functions (`axl_utf8_to_ucs2`, `axl_ucs2_to_utf8`) are
    exposed for apps that need direct UEFI protocol interop.
 
-7. **EDK2 is invisible.** The `AXL_APP` macro hides the UEFI entry
-   point. `_axl_init` sets up streams and memory. The app sees
-   `int main(int argc, char **argv)`.
+7. **No EDK2 dependency.** AXL has no source-tree dependency on
+   EDK2 — `EFI_*` types are auto-generated from the published UEFI
+   and PI specifications (see "Where the UEFI types come from"
+   above), and the CRT0 entry stub bridges UEFI's `_AxlEntry`
+   directly to `int main(argc, argv)` without any EDK2 build
+   plumbing. The CRT0 stub calls `_axl_init` to enter the
+   runtime, which wires up streams, memory, the default loop,
+   atexit, the signal notify, and the tier-1 registry. The app
+   just sees `int main(int argc, char **argv)`.
 
 8. **Eat our own dog food.** AXL's own internals use the AXL API.
    The library allocates with `axl_malloc`, reports errors with

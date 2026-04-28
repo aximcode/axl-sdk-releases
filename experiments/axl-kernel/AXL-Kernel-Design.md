@@ -13,9 +13,9 @@ coroutine`) subsumes the Init/Poll/Cleanup module pattern that
 every non-trivial UEFI app ends up reinventing.
 
 **Related reading:**
-- [`AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the CRT0-owned runtime this
-  layer would build on (atexit, signal, registry sweep, default
-  loop, `axl_yield`).
+- [`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md) — the AXL runtime
+  services this layer would build on (atexit, signal, registry
+  sweep, default loop, `axl_yield`).
 - [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) — the four-axis
   taxonomy this layer composes. Notably its "Why not stackful
   coroutines" rejection; see [§6](#6-stack-economics--reopening-the-old-rejection) below for why we're reopening it.
@@ -421,7 +421,7 @@ change.
 
 ### 8.4 Hierarchical event loops (the shelved "parent drives children")
 
-See [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running) for the prior
+See [AXL-Lifecycle.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running) for the prior
 rejection. The idea was: an `AxlLoop` has children `AxlLoop`s; the
 parent iterates them each tick. Rejected because of source-
 ownership ambiguity, break-event re-entry, poll-timer multiplication,
@@ -1316,7 +1316,7 @@ Captured here so they don't keep getting re-litigated:
 - **New layer, not in-tree.** axl-sdk stays a primitive library.
   axl-kernel is a peer repo that consumes it. See [§5](#5-relationship-to-axl-sdk).
 - **One loop, many stacks — not many loops.** Sidesteps the
-  hierarchical-loop problems rejected in [AXL-Runtime.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running).
+  hierarchical-loop problems rejected in [AXL-Lifecycle.md §5.4](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#54-true-nested-loops-inner-loop-runs-while-outer-is-running).
 - **Cooperative only.** No attempt at preemption. Runaway detection
   is a best-effort mitigation, not a correctness property.
 - **Libc-shape API.** Function names are `axl_read` etc., but

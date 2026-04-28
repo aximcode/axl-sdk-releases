@@ -39,7 +39,7 @@
  * }
  * @endcode
  *
- * See docs/AXL-Runtime.md §2.2 and §4.4 for the design.
+ * See docs/AXL-Lifecycle.md §2.2 and §4.4 for the design.
  */
 
 #ifndef AXL_SIGNAL_H

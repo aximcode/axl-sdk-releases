@@ -81,7 +81,7 @@ axl_event_new_impl(const char *file, int line);
 
 /**
  * Captures the caller's file/line for leak reporting via the tier-1
- * resource registry. See docs/AXL-Runtime.md §4.2.1.
+ * resource registry. See docs/AXL-Lifecycle.md §4.2.1.
  */
 #define axl_event_new() axl_event_new_impl(__FILE__, __LINE__)
 

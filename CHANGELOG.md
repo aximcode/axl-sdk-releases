@@ -3,6 +3,86 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.2.7 — 2026-04-28
+
+Polish release on top of 0.2.6 (cut earlier the same day). Two
+real changes — a CI-side test fix and a new diagnostic in
+`run-qemu.sh` — alongside a substantial documentation refresh
+that came out of reviewing the CRT0/runtime conflation in the
+docs corpus.
+
+### Added
+
+- **CPU-spike sidecar in `run-qemu.sh`** — samples QEMU's host
+  CPU at 5 Hz after a firmware-boot warm-up window and prints a
+  `WARN: CPU spike` line on stderr if the process sustains
+  ≥1.5 cores for ≥2 s. Default-on, silent on healthy runs.
+  Catches the orphan-QEMU-pegging-100%-CPU class of regression
+  that bit us mid-session in 0.2.6's prep. Tunable via
+  `--cpu-threshold N` / `--cpu-sustain SECS`; opt out with
+  `--no-cpu-warn`. CI now smoke-tests it against
+  `AxlTestCpuIdle.efi` to catch false-positives.
+- **`docs/RELEASING.md`** — step-by-step release-cutting
+  playbook (prereqs, `bump-version.sh`, CHANGELOG dating,
+  branch-then-tag push order, watching workflows via
+  `gh run watch`, recovery from a failed tag). Also surfaces in
+  the Sphinx Guides toctree.
+
+### Fixed
+
+- **`/ttl-short` test was racing against UEFI's 1-second clock
+  granularity.** The async-close speedup in 0.2.6 made both
+  `/ttl-short` requests land in the same wall-clock second, so
+  `now - timestamp_ms = 0` and the cache-hit path took it
+  before the 150 ms TTL could expire. Bump TTL to 1500 ms and
+  the inter-request sleep to 2 s so the test exercises a real
+  expiry; comment on the constraint in the test source so the
+  next person who tries to tune it down sees the reason.
+
+### Documentation
+
+- **Renamed `AXL-Runtime.md` → `AXL-Lifecycle.md`** and swept
+  the corpus for the CRT0-vs-runtime conflation. CRT0 is the
+  ~17-line entry stub; the AXL runtime is the lifecycle library
+  in `src/runtime/`. The rename + sweep covers ~30 sites
+  (design docs, module READMEs, header doc-comments, examples,
+  ROADMAP, sphinx pages). The `git mv` keeps blame.
+- **Audience framing for Linux systems C developers** — README,
+  `AXL-Design.md`, `AXL-SDK-Design.md`, `AXL-Coding-Style.md`,
+  and the `axl.h` / `axl-loop.h` umbrella headers now lead with
+  the audience AXL targets (glibc / GLib / systemd / libcurl
+  developers) rather than the inspiration. Includes an explicit
+  GLib-to-AXL mapping table (`GMainLoop` → `AxlLoop`,
+  `GHashTable` → `AxlHashTable`, etc.).
+- **"How AXL avoids the EDK2 dependency"** — README and design
+  docs now explain that `EFI_*` types are auto-generated from
+  the published UEFI 2.x and PI 1.x specifications via
+  `scripts/generate-uefi-headers.py` + `uefi-manifest.json5`.
+  Spec drift is a manifest update + regeneration, not a vendor
+  merge. Replaces the stale "EDK2 is invisible" phrasing that
+  implied EDK2 was hidden rather than absent.
+- **`AXL-Porting-Guide.md` picks up the v0.2.6 surface** —
+  modern entry-point pattern (`int main(argc, argv)` with no
+  `AXL_APP` macro), a new Step 1.5 covering `axl_net_auto_init`
+  / `axl_driver_ensure` / `axl_tcp_close` lifetime for porters
+  with networking or driver-needing apps, and the
+  `run-qemu.sh --net --hostfwd` shape for testing. Adds seven
+  EDK2→AXL mappings to the "What AXL Already Covers" table
+  (net auto-init, driver self-load, signal, atexit, default
+  loop, yield).
+- **Sphinx version auto-syncs from `VERSION`.** `conf.py` reads
+  the canonical file at build time; `index.rst` uses the
+  `|release|` substitution. axl.aximcode.com's "Version" cell
+  now updates automatically on every tagged release.
+- **Sphinx full-width override** widens `.wy-nav-content` to
+  1200 px so the docs site no longer leaves grey gutters on
+  wide monitors.
+
+### Changed
+
+- **`run-qemu.sh` documents `--no-cpu-warn` / `--cpu-threshold`
+  / `--cpu-sustain` flags** in `--help` and the file header.
+
 ## 0.2.6 — 2026-04-28
 
 Networking-focused release. Headline is a TCP-close lifecycle rework

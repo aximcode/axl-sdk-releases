@@ -333,7 +333,7 @@ Options:
   --release             Release build (-Os, DWARF, no leak tracking) [default]
   --minimal-runtime     Link against axl-crt0-minimal.o (no registry,
                         no atexit, no signal notify, no default loop).
-                        App-type only. See docs/AXL-Runtime.md §10.4.
+                        App-type only. See docs/AXL-Lifecycle.md §10.4.
   --run                 Build and run in QEMU (remaining args passed to run-qemu.sh)
   -o FILE               Output filename (default: <source>.efi)
   -I DIR                Add include search path

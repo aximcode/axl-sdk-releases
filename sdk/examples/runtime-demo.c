@@ -7,7 +7,7 @@
  * and the tier-1 resource registry's exit-time sweep.
  *
  * This file started life as a stand-alone prototype with its own
- * Demo* mini-runtime (Phase A7 §8 of docs/AXL-Runtime.md). That
+ * Demo* mini-runtime (Phase A7 §8 of docs/AXL-Lifecycle.md). That
  * mini-runtime has since moved into src/runtime/ -- what's left here
  * is just scenario code driving the real APIs.
  *
@@ -190,7 +190,7 @@ nested_outer_tick(void *data)
         /* Pre-signal and wait from inside the callback. The wait
          * spins up its own ephemeral loop (the outer one is paused
          * here) and returns immediately via the signalled event.
-         * Validates the nested-wait contract in AXL-Runtime.md §5.4
+         * Validates the nested-wait contract in AXL-Lifecycle.md §5.4
          * -- ephemeral loops don't corrupt the outer loop's state. */
         axl_printf("  inner wait armed\n");
         axl_event_signal(ctx->inner);

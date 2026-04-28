@@ -4,7 +4,7 @@
 /** @file axl-registry-internal.h
     Tier-1 resource registry — internal API called by the wrappers
     for AxlEvent, AxlLoop, AxlCancellable, and AxlArena. See
-    docs/AXL-Runtime.md §4.2 for the design.
+    docs/AXL-Lifecycle.md §4.2 for the design.
 
     Each registered resource gets a handle (slot index + 1). The _free
     path unregisters by handle; a final sweep at _axl_cleanup catches

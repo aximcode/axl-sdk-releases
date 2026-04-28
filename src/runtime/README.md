@@ -1,14 +1,21 @@
-Runtime Glue — CRT0-owned init, signals, exit, atexit
-======================================================
+AXL Runtime — lifecycle services for an AXL app
+================================================
 
 The pieces an AXL app interacts with around its own lifecycle and
-interruptibility. CRT0 (`src/crt0/axl-crt0-native.c`) bridges the
-UEFI entry point to `int main(int argc, char **argv)` by calling
-`_axl_init` before `main` and `_axl_cleanup` after. This module
-owns those two bookends plus everything they wire up: the default
-event loop, the cooperative yield, the interrupt handler registry,
-the tier-1 resource-leak sweep, and the LIFO atexit callback
-registry.
+interruptibility. The CRT0 entry stub
+(`src/crt0/axl-crt0-native.c`, ~17 lines) bridges the UEFI entry
+point to `int main(int argc, char **argv)` by calling
+`_axl_init` before `main` and `_axl_cleanup` after. **This
+module — the AXL runtime — implements those two bookends and
+everything they wire up**: the default event loop, the cooperative
+yield, the interrupt handler registry, the tier-1 resource-leak
+sweep, and the LIFO atexit callback registry. CRT0 holds none of
+that state itself; it just calls in and back out.
+
+The full lifecycle (init → main → cleanup → exit) and the
+runtime-vs-CRT0 split are documented in
+[`docs/AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md). This README is the
+module-level reference for the runtime sources.
 
 Four sub-modules, each a single concern:
 
@@ -99,7 +106,7 @@ between them. `_axl_cleanup` has a reentrancy guard: if
    via the appropriate `_free`.
 5. **Heap leak report** (AXL_MEM_DEBUG only) --
    `axl_mem_dump_leaks`. Release-mode auto-free of heap is
-   deferred (see [`docs/AXL-Runtime.md` §10.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md#101-release-mode-heap-auto-sweep)).
+   deferred (see [`docs/AXL-Lifecycle.md` §10.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#101-release-mode-heap-auto-sweep)).
 
 ## Caller attribution
 
@@ -122,7 +129,7 @@ attribution.
 
 ## See also
 
-- [`docs/AXL-Runtime.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Runtime.md) — the design
+- [`docs/AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md) — the design
   doc, now describing what landed.
 - [`docs/AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Concurrency.md) --
   primitive taxonomy; the runtime sits under these primitives.
