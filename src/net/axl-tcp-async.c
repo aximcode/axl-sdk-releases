@@ -361,9 +361,20 @@ on_recv_complete(void *data)
 
     status = axl_efi_call(sock->tcp4->Receive, 2, sock->tcp4, &sock->rx_token);
     if (EFI_ERROR(status)) {
+        /* Same race as the one axl_tcp_recv_async handles — peer FIN
+         * arrived between the previous recv completing and this re-arm,
+         * so SockNoMoreData ran with an empty token list and the next
+         * Receive() returns EFI_CONNECTION_FIN synchronously. We CAN'T
+         * drop the source and return AXL_SOURCE_REMOVE: that would
+         * silently swallow the EOF. The recv_source is still
+         * registered with the loop and the cached event is still live;
+         * signal it ourselves so the loop dispatches us again on the
+         * next tick with rx_token.Status == EFI_ABORTED, which our
+         * own error branch above translates to cb_status=-1.
+         * Caller sees the EOF and can axl_tcp_close cleanly. */
         axl_debug("recv re-arm Receive: %llx", (unsigned long long)status);
-        axl_tcp_recv_drop_sources(sock);
-        return AXL_SOURCE_REMOVE;
+        axl_backend_event_signal(
+            (AxlEventHandle)sock->rx_token.CompletionToken.Event);
     }
 
     return AXL_SOURCE_CONTINUE;
@@ -438,8 +449,18 @@ axl_tcp_recv_async(
     sock->recv_size     = size;  /* rewritten to bytes-received by on_recv_complete */
 
     //
-    // Create the recv event if not already created
+    // Create the recv event if not already created. Some teardown
+    // paths leave the cached handle pointing at a closed/freed
+    // event (a stale handle survives across the in-handler sync
+    // axl_tcp_send + ephemeral-loop teardown that the WS upgrade and
+    // every send_response use). Detect via CheckEvent and recreate
+    // — otherwise the next Receive succeeds against an invalid event
+    // and the loop never wakes for incoming data.
     //
+    if (sock->rx_token.CompletionToken.Event != NULL &&
+        axl_backend_event_check(sock->rx_token.CompletionToken.Event) == -1) {
+        sock->rx_token.CompletionToken.Event = NULL;
+    }
     if (sock->rx_token.CompletionToken.Event == NULL) {
         rx_event = NULL;
         if (axl_backend_event_create((AxlEventHandle *)&rx_event) != 0) {
@@ -464,13 +485,24 @@ axl_tcp_recv_async(
     sock->rx_token.Packet.RxData          = &sock->rx_data;
 
     status = axl_efi_call(sock->tcp4->Receive, 2, sock->tcp4, &sock->rx_token);
-    if (EFI_ERROR(status)) {
-        /* Connection closed/reset by peer is expected (e.g., HTTP keep-alive
-           timeout) — don't log as ERROR since reconnect handles it. */
-        axl_debug("async Receive: %llx", (unsigned long long)status);
-        return -1;
-    }
 
+    /* Synchronous-failure path: most commonly EFI_CONNECTION_FIN if the
+     * peer FIN'd between the previous recv completing and this re-arm
+     * (the firmware processes the FIN via SockNoMoreData when the recv
+     * token list is empty, so subsequent Receive() returns
+     * EFI_CONNECTION_FIN immediately — see SockRcv in
+     * NetworkPkg/TcpDxe/SockInterface.c). Without delivery to the
+     * user, the server never observes the EOF, never closes, and
+     * never sends its FIN — peer hangs in FIN-WAIT-2 forever.
+     *
+     * Register the source first, then signal the cached event so the
+     * loop dispatches on_recv_complete on the next tick. The token's
+     * Status field stays at the EFI_ABORTED we set above (Receive
+     * doesn't update it on synchronous error), so on_recv_complete
+     * sees EFI_ERROR and translates to cb_status=-1 — exactly what
+     * the user's callback expects for "peer closed". This preserves
+     * the "callback always fires from loop dispatch" contract.
+     */
     sock->recv_source = axl_loop_add_event(
         loop,
         (void *)sock->rx_token.CompletionToken.Event,
@@ -479,8 +511,14 @@ axl_tcp_recv_async(
         );
     if (sock->recv_source == 0) {
         axl_error("async recv: cannot register event with loop");
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->rx_token.CompletionToken);
+        if (!EFI_ERROR(status)) {
+            axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
+                         &sock->rx_token.CompletionToken);
+        }
+        /* Drain any latent signal off the cached event so a later
+           recv_async on this sock doesn't fire a stale completion.
+           CheckEvent consumes the signaled bit when set. */
+        axl_backend_event_check(sock->rx_token.CompletionToken.Event);
         return -1;
     }
 
@@ -491,6 +529,20 @@ axl_tcp_recv_async(
             on_recv_cancel,
             sock
             );
+    }
+
+    /* If Receive failed synchronously (EFI_CONNECTION_FIN etc.), the
+     * firmware will never signal the event. Signal it ourselves so the
+     * loop dispatches on_recv_complete with the existing EFI_ABORTED
+     * status — see comment on the Receive call above. The most
+     * common cause is a peer FIN delivered between the previous
+     * recv completing and this re-arm (normal end-of-stream), so
+     * trace at debug verbosity rather than warn. */
+    if (EFI_ERROR(status)) {
+        axl_debug("async Receive sync-completed (peer EOF likely): %llx",
+                  (unsigned long long)status);
+        axl_backend_event_signal(
+            (AxlEventHandle)sock->rx_token.CompletionToken.Event);
     }
 
     return 0;
@@ -703,6 +755,13 @@ on_connect_complete(void *data)
         axl_error("async connect failed: %llx", (unsigned long long)status);
         AxlTcpCallback  cb   = sock->on_connect;
         void           *udata = sock->connect_data;
+        /* Force sync close path. The connect failure on the sync
+           wrapper's path means we're called from an ephemeral loop
+           that's about to be freed; if we let axl_tcp_close take
+           the async path the close_event source would be left
+           dangling on the soon-to-be-freed loop. Clearing
+           async_loop here makes the close finalize inline. */
+        sock->async_loop = NULL;
         axl_tcp_close(sock);
         (void)cb(NULL, -1, udata);  /* connect is one-shot; return value ignored */
         return AXL_SOURCE_REMOVE;
@@ -731,7 +790,10 @@ on_connect_cancel(void *data)
        sweep — safe because the caller only gets sock in the cb on
        connect success, so they can't have started recv/send yet. The
        cb(NULL, AXL_CANCELLED, data) shape matches on_connect_complete's
-       error path. */
+       error path. Force sync close (see on_connect_complete) — the
+       sync wrapper's ephemeral loop frees right after this returns,
+       so an async close_event source would be left dangling. */
+    sock->async_loop = NULL;
     axl_tcp_close(sock);
     (void)cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;

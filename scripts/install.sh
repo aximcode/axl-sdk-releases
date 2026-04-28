@@ -329,8 +329,8 @@ Options:
   --arch x64|aa64       Target architecture (default: x64)
   --type app|driver|runtime  Image type (default: app)
   --entry NAME          Custom entry point for drivers
-  --debug               Debug build (-Og, debug symbols, leak tracking)
-  --release             Release build (-Os, no debug) [default]
+  --debug               Debug build (-Og, DWARF, leak tracking)
+  --release             Release build (-Os, DWARF, no leak tracking) [default]
   --minimal-runtime     Link against axl-crt0-minimal.o (no registry,
                         no atexit, no signal notify, no default loop).
                         App-type only. See docs/AXL-Runtime.md §10.4.
@@ -392,11 +392,15 @@ run_cmd() {
     "$@"
 }
 
-# Build mode flags
+# Build mode flags. Both modes carry DWARF debug info — release
+# trades only the leak tracking and goes to -Os, debug stays at
+# -Og + AXL_MEM_DEBUG. The .efi itself stays slim either way (debug
+# DWARF lives in the side-by-side .debug file referenced by the PE
+# debug data directory; pe-set-debug wires this up at link time).
 if [[ "$BUILD" == "debug" ]]; then
     OPT_FLAGS="-Og -g -gdwarf -DAXL_MEM_DEBUG"
 else
-    OPT_FLAGS="-Os -DNDEBUG"
+    OPT_FLAGS="-Os -g -gdwarf -DNDEBUG"
 fi
 
 if [[ "$VERBOSE" == "true" ]]; then

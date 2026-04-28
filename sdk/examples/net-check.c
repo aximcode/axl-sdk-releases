@@ -13,8 +13,12 @@ main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    if (!axl_net_is_available()) {
-        axl_printf("Network: not available\n");
+    /* Bring up networking before probing — load NIC drivers, run
+       ConnectController, wait up to 10 s for DHCP. axl_net_auto_init
+       is idempotent and short-circuits if SNP is already up
+       (typical when the firmware shell already ran `connect -r`). */
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("Network: bring-up failed (no NIC, or no DHCP)\n");
         return 1;
     }
 

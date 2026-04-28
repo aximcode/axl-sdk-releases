@@ -1280,7 +1280,11 @@ during code review and refactor work, not during original planning.
       - [src/net/axl-net-resolve.c:202](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-resolve.c#L202) — DNS secondary poll
       - [src/net/axl-net-dhcp.c:198](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-dhcp.c#L198) — DHCP first-stage wait (100ms stalls)
       - [src/net/axl-net-dhcp.c:250](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-dhcp.c#L250) — DHCP IP-assignment wait (1s stalls)
-      - [src/net/axl-tcp-sync.c:451](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-sync.c#L451) — TCP close drain
+      - ~~src/net/axl-tcp-sync.c — TCP close drain~~ FIXED 2026-04-28 in
+        b46686d: close finalizes via the loop when the firmware
+        signals SockConnClosed (no per-close busy-wait); the only
+        remaining `_axl_tcp_wait` site is the sync fallback used when
+        no event loop is running (shutdown / sync-only CLI use).
       - [src/net/axl-tcp-sync.c:209](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-sync.c#L209) — Configure mapping retry (TCP_MAPPING_DELAY)
       - [src/net/axl-tcp-async.c:540](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-tcp-async.c#L540) — same Configure retry on the async path (extra-bad: async code should never block the loop)
       - [src/net/axl-net-ping.c:260](https://github.com/aximcode/axl-sdk-releases/blob/main/src/net/axl-net-ping.c#L260) — ping response wait (1ms stalls, full timeout)

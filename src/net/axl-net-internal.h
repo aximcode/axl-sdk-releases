@@ -96,7 +96,11 @@ typedef struct {
     size_t      body_size;
     size_t      status_code;
     char        content_type[64];
-    uint64_t    timestamp_ms;
+    uint64_t    timestamp_ms;  /* for TTL expiry */
+    uint64_t    insert_seq;    /* monotonic insertion counter for FIFO eviction
+                                  ordering — UEFI GetTime is 1-second
+                                  granularity, so timestamp_ms ties for many
+                                  inserts within the same second */
     size_t      ttl_ms;
 } CachedResponse;
 

@@ -55,6 +55,13 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* Bring up networking (load NIC drivers, ConnectController,
+       wait for DHCP). Idempotent — see net-check.c. */
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("error: network bring-up failed\n");
+        return 1;
+    }
+
     AXL_AUTOPTR(AxlSocket) listener = axl_socket_new(AXL_SOCKET_STREAM);
     if (listener == NULL || axl_socket_listen(listener, port) != 0) {
         axl_printf("error: cannot listen on port %u\n", (unsigned)port);

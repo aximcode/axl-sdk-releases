@@ -31,6 +31,17 @@ typedef struct {
     AxlLoop *loop;
 } SyncResult;
 
+/* Heap-owned context for an in-flight TCP close. The Close()
+   token must outlive axl_tcp_close because EDK2 parks
+   &ctx->close_token in Sock->CloseToken and dereferences it from
+   SockConnClosed long after the call returns. See axl_tcp_close. */
+typedef struct {
+    EFI_TCP4_CLOSE_TOKEN  close_token;
+    AxlTcp               *sock;
+    AxlLoop              *loop;       /* set on the async path */
+    uint32_t              source_id;  /* set on the async path */
+} AxlTcpCloseCtx;
+
 // ---------------------------------------------------------------------------
 // Locate TCP4 service binding
 // ---------------------------------------------------------------------------
@@ -158,6 +169,14 @@ axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
 
     axl_loop_add_timeout(loop, 10000, on_sync_cancel_timeout, cancel);
     axl_loop_run(loop);
+
+    /* axl_tcp_connect_async stamped sock->async_loop with this
+       ephemeral loop. Clear it before the loop frees so a subsequent
+       axl_tcp_close on the returned sock does not dereference freed
+       memory while deciding sync-vs-async finalization. */
+    if (r.sock != NULL) {
+        r.sock->async_loop = NULL;
+    }
 
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
@@ -338,10 +357,21 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
 
     SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
 
+    /* Save and restore the sock's loop association across the
+       ephemeral wrapper loop. axl_tcp_send_async overwrites
+       sock->async_loop with the ephemeral loop; if the caller had
+       previously parked the sock on its own outer loop (e.g. a
+       server's main loop holding an armed accept/recv on the same
+       sock), we must put the original pointer back so subsequent
+       axl_tcp_close on this sock can finalize on that loop instead
+       of falling back to the bounded sync wait. */
+    AxlLoop *saved_loop = sock->async_loop;
+
     if (axl_tcp_send_async(sock, data, size, loop, cancel,
                            on_sync_complete, &r) != 0) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
+        sock->async_loop = saved_loop;
         return -1;
     }
 
@@ -350,6 +380,7 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
 
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
+    sock->async_loop = saved_loop;
 
     return r.status;
 }
@@ -383,10 +414,14 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
 
     SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
 
+    /* See axl_tcp_send for the save/restore rationale. */
+    AxlLoop *saved_loop = sock->async_loop;
+
     if (axl_tcp_recv_async(sock, buf, *size, loop, cancel,
                            on_sync_complete, &r) != 0) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
+        sock->async_loop = saved_loop;
         *size = 0;
         return -1;
     }
@@ -396,6 +431,7 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
 
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
+    sock->async_loop = saved_loop;
 
     if (r.status == 0) {
         *size = axl_tcp_recv_get_size(sock);
@@ -421,7 +457,75 @@ axl_tcp_poll(AxlTcp *sock)
 
 // ---------------------------------------------------------------------------
 // axl_tcp_close
+//
+// Heap-owned, async-finalize close.
+//
+// EDK2 parks `&close_token` in Sock->CloseToken and dereferences it
+// when SockConnClosed signals (post-TIME_WAIT for active close, ~2 s
+// later; immediately for passive close). Earlier shapes either
+// stack-allocated the token (UAF on TIME_WAIT overrun — the Reg A
+// hang) or heap-allocated but waited synchronously (pegged CPU for
+// ~2 s on every active close and dropped the queued FIN if the
+// bounded wait expired before the firmware was done).
+//
+// This shape splits cleanup into two phases:
+//
+//   PHASE 1 (sync, this function):
+//     * Cancel each pending op token, remove its loop source, and
+//       close its per-op event handle. Same sequence the original
+//       sync close did — firmware sees Cancel before CloseEvent so
+//       no completion attempt lands on a freed handle.
+//     * Submit Close() (AbortOnClose=false) with a heap-allocated
+//       close_token so it outlives this call.
+//     * Either register close_event on the caller's running loop
+//       and return immediately, OR fall back to a bounded sync wait
+//       if no loop is running (shutdown after axl_loop_run returned).
+//
+//   PHASE 2 (finalize_close_ctx, fired from on_close_event):
+//     * Configure(NULL) — safe now because the close has fully
+//       completed, so TcpFlushPcb's NetbufQueFlush has nothing left
+//       to drop (vs. the old shape that dropped FIN if the bounded
+//       wait expired early).
+//     * DestroyChild on the service binding.
+//     * Free sock + close_event + ctx.
+//
+// The async path leaves up to one loop source per outstanding close
+// for ~TIME_WAIT seconds; AXL_MAX_SOURCES = 64 has the headroom for
+// an http-server bursting at curl-storm rates.
 // ---------------------------------------------------------------------------
+
+static void
+finalize_sock(AxlTcp *sock)
+{
+    if (sock->tcp4 != NULL) {
+        axl_efi_call(sock->tcp4->Configure, 2, sock->tcp4, NULL);
+    }
+    if (sock->tcp_sb != NULL && sock->tcp_handle != NULL) {
+        axl_efi_call(sock->tcp_sb->DestroyChild, 2, sock->tcp_sb,
+                     sock->tcp_handle);
+    }
+    axl_free(sock);
+}
+
+static void
+finalize_close_ctx(AxlTcpCloseCtx *ctx)
+{
+    finalize_sock(ctx->sock);
+    if (ctx->close_token.CompletionToken.Event != NULL) {
+        axl_backend_event_close(
+            (AxlEventHandle)ctx->close_token.CompletionToken.Event);
+    }
+    axl_free(ctx);
+}
+
+static bool
+on_close_event(void *data)
+{
+    AxlTcpCloseCtx *ctx = (AxlTcpCloseCtx *)data;
+    axl_loop_remove_source(ctx->loop, ctx->source_id);
+    finalize_close_ctx(ctx);
+    return AXL_SOURCE_REMOVE;
+}
 
 void
 axl_tcp_close(AxlTcp *sock)
@@ -431,14 +535,14 @@ axl_tcp_close(AxlTcp *sock)
     }
 
     //
-    // Clean up each async op independently. Source removal (loop-side)
-    // and token event close (UEFI-side) are decoupled — earlier code
-    // guarded the event close on `source > 0`, so if add_event failed
-    // between token creation and source registration the event would
-    // leak. Each Cancel+CloseEvent now runs whenever Event != NULL,
-    // regardless of the source state. Cancel on a completed token is
-    // a documented no-op (EFI_NOT_FOUND) so this is safe for ops that
-    // completed cleanly and already cleared their own event.
+    // PHASE 1: cancel pending ops, remove their loop sources, close
+    // per-op event handles. The Cancel-then-CloseEvent sequence on
+    // each token matches the firmware's expectation: Cancel removes
+    // the token from internal queues so no further completion attempts
+    // happen, then CloseEvent releases the handle. The original sync
+    // close did this same thing — we keep it to avoid the long
+    // window between Close() and finalize where a stale event handle
+    // could be referenced (faults in CoreCheckEvent).
     //
     if (sock->accept_source > 0) {
         axl_loop_remove_source(sock->async_loop, sock->accept_source);
@@ -448,7 +552,7 @@ axl_tcp_close(AxlTcp *sock)
         axl_loop_remove_source(sock->async_loop, sock->accept_cancel_source);
         sock->accept_cancel_source = 0;
     }
-    if (sock->acc_token.CompletionToken.Event != NULL) {
+    if (sock->tcp4 != NULL && sock->acc_token.CompletionToken.Event != NULL) {
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->acc_token.CompletionToken);
         axl_backend_event_close(
@@ -464,7 +568,7 @@ axl_tcp_close(AxlTcp *sock)
         axl_loop_remove_source(sock->async_loop, sock->recv_cancel_source);
         sock->recv_cancel_source = 0;
     }
-    if (sock->rx_token.CompletionToken.Event != NULL) {
+    if (sock->tcp4 != NULL && sock->rx_token.CompletionToken.Event != NULL) {
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->rx_token.CompletionToken);
         axl_backend_event_close(
@@ -480,7 +584,7 @@ axl_tcp_close(AxlTcp *sock)
         axl_loop_remove_source(sock->async_loop, sock->send_cancel_source);
         sock->send_cancel_source = 0;
     }
-    if (sock->tx_token.CompletionToken.Event != NULL) {
+    if (sock->tcp4 != NULL && sock->tx_token.CompletionToken.Event != NULL) {
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->tx_token.CompletionToken);
         axl_backend_event_close(
@@ -496,42 +600,102 @@ axl_tcp_close(AxlTcp *sock)
         axl_loop_remove_source(sock->async_loop, sock->connect_cancel_source);
         sock->connect_cancel_source = 0;
     }
-    if (sock->conn_token.CompletionToken.Event != NULL) {
+    if (sock->tcp4 != NULL && sock->conn_token.CompletionToken.Event != NULL) {
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->conn_token.CompletionToken);
         axl_backend_event_close(
             (AxlEventHandle)sock->conn_token.CompletionToken.Event);
         sock->conn_token.CompletionToken.Event = NULL;
     }
+    if (sock->tcp4 == NULL) {
+        /* No TCP4 protocol bound (e.g. CreateChild succeeded but
+           Configure failed before any op was submitted). The Cancel
+           + CloseEvent blocks above are tcp4-guarded, so any cached
+           per-op event handles weren't released. Close them here so
+           the unconfigured-sock path doesn't leak. */
+        if (sock->acc_token.CompletionToken.Event != NULL) {
+            axl_backend_event_close(
+                (AxlEventHandle)sock->acc_token.CompletionToken.Event);
+            sock->acc_token.CompletionToken.Event = NULL;
+        }
+        if (sock->rx_token.CompletionToken.Event != NULL) {
+            axl_backend_event_close(
+                (AxlEventHandle)sock->rx_token.CompletionToken.Event);
+            sock->rx_token.CompletionToken.Event = NULL;
+        }
+        if (sock->tx_token.CompletionToken.Event != NULL) {
+            axl_backend_event_close(
+                (AxlEventHandle)sock->tx_token.CompletionToken.Event);
+            sock->tx_token.CompletionToken.Event = NULL;
+        }
+        if (sock->conn_token.CompletionToken.Event != NULL) {
+            axl_backend_event_close(
+                (AxlEventHandle)sock->conn_token.CompletionToken.Event);
+            sock->conn_token.CompletionToken.Event = NULL;
+        }
+        finalize_sock(sock);
+        return;
+    }
 
-    if (sock->tcp4 != NULL) {
-        //
-        // Try graceful close
-        //
-        EFI_EVENT  close_event = NULL;
-        if (axl_backend_event_create((AxlEventHandle *)&close_event) == 0) {
-            EFI_TCP4_CLOSE_TOKEN  close_token;
-            axl_memset(&close_token, 0, sizeof(close_token));
-            close_token.CompletionToken.Event = close_event;
-            close_token.AbortOnClose          = false;
-
-            EFI_STATUS  status = axl_efi_call(sock->tcp4->Close, 2,
-                                              sock->tcp4, &close_token);
-            if (!EFI_ERROR(status)) {
-                (void)_axl_tcp_wait(sock->tcp4, close_event, 500 * 1000);
-            }
-
+    //
+    // Heap-allocate the close context so the token outlives this call.
+    // EDK2 parks &ctx->close_token in Sock->CloseToken and dereferences
+    // it when SockConnClosed runs.
+    //
+    AxlTcpCloseCtx *ctx = axl_calloc(1, sizeof(*ctx));
+    EFI_EVENT       close_event = NULL;
+    if (ctx == NULL ||
+        axl_backend_event_create((AxlEventHandle *)&close_event) != 0)
+    {
+        axl_warning("close: ctx/event alloc failed — abrupt teardown");
+        if (ctx != NULL) {
+            axl_free(ctx);
+        }
+        if (close_event != NULL) {
             axl_backend_event_close((AxlEventHandle)close_event);
         }
-
-        axl_efi_call(sock->tcp4->Configure, 2, sock->tcp4, NULL);
+        /* Best-effort: skip Close() entirely. DestroyChild will tear
+           down the firmware state without a graceful FIN. */
+        finalize_sock(sock);
+        return;
     }
 
-    if (sock->tcp_sb != NULL && sock->tcp_handle != NULL) {
-        axl_efi_call(sock->tcp_sb->DestroyChild, 2, sock->tcp_sb, sock->tcp_handle);
+    ctx->sock                              = sock;
+    ctx->close_token.CompletionToken.Event = close_event;
+    ctx->close_token.AbortOnClose          = false;
+
+    EFI_STATUS status = axl_efi_call(sock->tcp4->Close, 2,
+                                     sock->tcp4, &ctx->close_token);
+    if (EFI_ERROR(status)) {
+        axl_debug("close: Close() returned %llx — abrupt teardown",
+                  (unsigned long long)status);
+        finalize_close_ctx(ctx);
+        return;
     }
 
-    axl_free(sock);
+    /* Async path: register close_event on the caller's running loop
+       and return. on_close_event runs finalize_close_ctx when the
+       firmware signals SockConnClosed (post-TIME_WAIT for active
+       close), with no synchronous wait or CPU spin. */
+    if (sock->async_loop != NULL && axl_loop_is_running(sock->async_loop)) {
+        ctx->loop      = sock->async_loop;
+        ctx->source_id = axl_loop_add_event(
+            ctx->loop,
+            (AxlEventHandle)close_event,
+            on_close_event,
+            ctx
+            );
+        if (ctx->source_id != 0) {
+            return;
+        }
+        axl_warning("close: cannot register close event on loop — sync fallback");
+    }
+
+    /* Sync fallback (loop not running, or registration failed). 3 s
+       covers TIME_WAIT for active close; passive close signals
+       immediately so the wait usually returns much sooner. */
+    (void)_axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
+    finalize_close_ctx(ctx);
 }
 
 // ---------------------------------------------------------------------------

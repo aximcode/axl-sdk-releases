@@ -180,6 +180,36 @@ test_build_qemu_cmd() {
         -nographic
         -no-reboot
     )
+    # Debug hooks — opt-in via env vars so the normal test path is
+    # untouched. TEST_QEMU_GDB=PORT exposes the QEMU GDB stub for
+    # interactive debugging; TEST_QEMU_DEBUGCON=FILE captures OVMF
+    # DEBUG output (port 0x402) which scripts/gdb-syms.py needs to
+    # recover module load addresses.
+    if [[ -n "${TEST_QEMU_GDB:-}" ]]; then
+        # Strip -enable-kvm / -cpu host (mirroring run-qemu.sh): KVM
+        # is incompatible with single-stepping early-boot instructions,
+        # so the GDB stub falls back to TCG.
+        local _filtered=()
+        local _skip=0
+        for _arg in "${TEST_QEMU_CMD[@]}"; do
+            if [[ $_skip -gt 0 ]]; then _skip=$((_skip-1)); continue; fi
+            case "$_arg" in
+                -enable-kvm) ;;          # drop
+                -cpu)        _skip=1 ;;  # drop with its value
+                *)           _filtered+=("$_arg") ;;
+            esac
+        done
+        TEST_QEMU_CMD=("${_filtered[@]}")
+        TEST_QEMU_CMD+=(-gdb "tcp::${TEST_QEMU_GDB}")
+        log_info "QEMU GDB stub on tcp::${TEST_QEMU_GDB} (KVM disabled, TCG)"
+    fi
+    if [[ -n "${TEST_QEMU_DEBUGCON:-}" ]]; then
+        TEST_QEMU_CMD+=(
+            -debugcon "file:${TEST_QEMU_DEBUGCON}"
+            -global "isa-debugcon.iobase=0x402"
+        )
+        log_info "OVMF debugcon → ${TEST_QEMU_DEBUGCON}"
+    fi
 }
 
 # NIC device appropriate for the architecture

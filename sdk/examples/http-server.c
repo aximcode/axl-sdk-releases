@@ -36,14 +36,27 @@ main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
+    /* Bring up networking (load NIC drivers, ConnectController,
+       wait for DHCP). Idempotent. */
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("error: network bring-up failed\n");
+        return 1;
+    }
+
     AXL_AUTOPTR(AxlHttpServer) server = axl_http_server_new(8080);
     if (server == NULL) {
         axl_printf("error: cannot create server\n");
         return 1;
     }
 
-    axl_http_server_add_route(server, "GET", "/version", on_version, NULL);
-    axl_http_server_add_route(server, "POST", "/echo", on_echo, NULL);
+    if (axl_http_server_add_route(server, "GET", "/version",
+                                  on_version, NULL) != 0 ||
+        axl_http_server_add_route(server, "POST", "/echo",
+                                  on_echo, NULL) != 0)
+    {
+        axl_printf("error: cannot register routes\n");
+        return 1;
+    }
 
     axl_printf("HTTP server on port 8080\n");
     axl_printf("  GET  /version  — JSON version info\n");

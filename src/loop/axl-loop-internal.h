@@ -22,7 +22,12 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-#define AXL_MAX_SOURCES       16
+/* 64 slots covers an http-server bursting at curl-storm rates: 1
+   accept + 8 active recv + up to ~20 outstanding close ctxes (each
+   holds a slot for ~TIME_WAIT seconds while the async-close
+   finalizes) + per-conn cancellables, with healthy headroom for
+   caller-registered timers / idle / pubsub. */
+#define AXL_MAX_SOURCES       64
 #define AXL_DEFER_BUF_SIZE    1024  /* power of 2, holds ~42 DeferEntry */
 #define AXL_MAX_TOPICS        16
 #define POLL_INTERVAL_MS      10
@@ -99,6 +104,13 @@ struct AxlLoop {
     int             pending_source;
     AxlEventHandle  break_event;
     AxlEventHandle  poll_timer;
+    /* ConIn->WaitForKey, captured at loop creation. Always added to the
+     * WaitForEvent array so we can intercept raw serial Ctrl-C
+     * (UnicodeChar=0x03, KeyShiftState=0 — what TerminalDxe emits) and
+     * signal break. Doesn't conflict with user SOURCE_KEYPRESS sources:
+     * those wait on the same event, so the read in dispatch covers
+     * both — see the keypress-source path in axl_loop_dispatch_event. */
+    AxlEventHandle  keypress_event;
     AxlLoopCallback cleanups[AXL_MAX_SOURCES];
     void           *cleanup_data[AXL_MAX_SOURCES];
     size_t          cleanup_count;

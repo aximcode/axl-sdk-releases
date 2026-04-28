@@ -122,6 +122,28 @@ axl_tcp_poll(
 
 /**
  * @brief Close and free a TCP socket (listener or connected).
+ *
+ * For a connected socket, initiates a graceful close (FIN exchange).
+ * Returns immediately when called from inside a running event loop:
+ * the firmware-level teardown (`Configure(NULL)` + service-binding
+ * `DestroyChild` + freeing the AxlTcp) is deferred until the firmware
+ * signals close-complete (~TIME_WAIT later for an active close), so
+ * the caller never blocks on the close path. When called outside a
+ * running loop (e.g. from a sync CLI tool, or during shutdown after
+ * `axl_loop_run` returned) it falls back to a bounded synchronous
+ * wait (~3 s) and finalizes inline before returning.
+ *
+ * **Ordering: close before freeing the loop.** Always call
+ * `axl_tcp_close` BEFORE `axl_loop_free` on any loop the socket was
+ * registered with. Close has to drop loop sources for the socket,
+ * and the async-finalize path posts the close-complete event back to
+ * the loop. Freeing the loop first leaves both paths dereferencing
+ * freed memory.
+ *
+ * **`sock` outlives this call.** On the async path the AxlTcp struct
+ * lives until the firmware signals close-complete. Callers must not
+ * touch `sock` after `axl_tcp_close` returns; treat the pointer as
+ * freed.
  */
 void
 axl_tcp_close(

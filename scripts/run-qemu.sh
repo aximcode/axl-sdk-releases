@@ -18,6 +18,16 @@
 #   --nsh FILE            Use custom startup.nsh instead of auto-generated
 #   --background          Launch QEMU in background, print PID
 #   --serial-log FILE     Save serial output to FILE
+#   --gdb [PORT]          Expose QEMU GDB stub on tcp::PORT (default 1234).
+#                         Boot runs free; attach with
+#                         `gdb -ex 'target remote :PORT'` and `interrupt`
+#                         when ready. Implies a long timeout under
+#                         --background. Add --gdb-halt to start with -S
+#                         (guest halted before instruction 0).
+#   --gdb-halt            With --gdb, also start with -S (guest halted).
+#                         Useful for breaking inside SecMain or PEI.
+#   --debugcon FILE       Capture OVMF DEBUG output (port 0x402) — required
+#                         for gdb-syms.py to recover module load addresses.
 #
 # Examples:
 #   ./scripts/run-qemu.sh hello.efi
@@ -44,6 +54,9 @@ BACKGROUND=false
 SERIAL_LOG=""
 SERIAL_LOG_RAW=""
 SERIAL_SOCKET=""
+GDB_PORT=""
+GDB_HALT=false
+DEBUGCON_LOG=""
 EFI_FILE=""
 EFI_ARGS=()
 
@@ -61,6 +74,16 @@ while [[ $# -gt 0 ]]; do
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
         --serial-log-raw) SERIAL_LOG_RAW="$2"; shift 2 ;;
         --serial-socket) SERIAL_SOCKET="$2"; shift 2 ;;
+        --gdb)
+            # Optional numeric port arg; default 1234.
+            if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+                GDB_PORT="$2"; shift 2
+            else
+                GDB_PORT="1234"; shift
+            fi
+            ;;
+        --gdb-halt)   GDB_HALT=true; shift ;;
+        --debugcon)   DEBUGCON_LOG="$2"; shift 2 ;;
         -h|--help)
             cat <<'HELP'
 Usage: run-qemu.sh [OPTIONS] <file.efi> [args...]
@@ -219,6 +242,43 @@ cp "$FW_VARS" "$TMPDIR/vars.fd"
 # Build QEMU command
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" 512M "$TMPDIR/vars.fd")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
+
+# GDB stub: -gdb tcp::PORT exposes the GDB protocol; -S starts the
+# guest CPU halted so the debugger can attach before the firmware
+# runs a single instruction. KVM is incompatible with single-stepping
+# many of the early boot instructions — drop -enable-kvm/-cpu host
+# from the base cmd and fall back to TCG when --gdb is requested.
+if [[ -n "$GDB_PORT" ]]; then
+    NEW_CMD=()
+    skip=0
+    for arg in "${CMD[@]}"; do
+        if [[ $skip -gt 0 ]]; then skip=$((skip-1)); continue; fi
+        case "$arg" in
+            -enable-kvm) ;;                 # drop
+            -cpu)        skip=1 ;;          # drop with its value
+            *)           NEW_CMD+=("$arg") ;;
+        esac
+    done
+    CMD=("${NEW_CMD[@]}")
+    CMD+=(-gdb "tcp::$GDB_PORT")
+    if [[ "$GDB_HALT" == "true" ]]; then
+        CMD+=(-S)
+    fi
+    # Bump the watchdog so a debugging session doesn't get terminated.
+    if [[ "$BACKGROUND" != "true" ]]; then
+        TIMEOUT=3600
+    fi
+fi
+
+# OVMF DEBUG-build firmware emits "Loading driver at 0x... NAME.efi"
+# load lines via the QEMU isa-debugcon device on I/O port 0x402, NOT
+# via the regular serial console. Capture them when --debugcon FILE
+# is given (the symbol-loader needs these to relocate ELF debug info
+# at runtime addresses).
+if [[ -n "$DEBUGCON_LOG" ]]; then
+    CMD+=(-debugcon "file:$DEBUGCON_LOG"
+          -global "isa-debugcon.iobase=0x402")
+fi
 
 # Networking
 if [[ "$NET" == "true" ]]; then

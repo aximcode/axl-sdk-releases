@@ -3,6 +3,26 @@
 Part of the [AximCode](https://github.com/aximcode) project.
 AXL = AximCode Library. Pronounced "axle."
 
+## Audience
+
+Linux systems C developers — the glibc / GLib / systemd / libcurl
+audience — who need to ship a UEFI binary without first learning
+EDK2's PascalCase, `EFI_*` type universe, `.inf`/`.dsc` build files,
+and gnu-efi's threadbare runtime. The SDK lets them keep the C
+ergonomics they already use (snake_case, standard C types, an event
+loop modeled on `GMainLoop`, hash tables modeled on `GHashTable`)
+and produces a UEFI `.efi` binary at the end.
+
+**No source-tree dependency on EDK2.** The library's internal `EFI_*`
+type definitions are auto-generated from the published UEFI 2.x and
+PI 1.x specifications via `scripts/generate-uefi-headers.py` +
+`scripts/uefi-manifest.json5`. The SDK ships those generated headers
+under `include/uefi/generated/` for any consumer that does need to
+reach into raw UEFI types (driver authors, interop code), but
+applications never see them — the public `axl/*.h` surface is
+EFI-free. Spec updates are a manifest edit + regeneration; there's
+no vendored EDK2 tree to merge against.
+
 ## Vision
 
 A developer writes a standard C file with `#include <axl.h>` and

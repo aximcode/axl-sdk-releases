@@ -1,0 +1,16 @@
+/* AXL doc tweaks layered on top of sphinx_rtd_theme.
+
+   The RTD theme caps content at 800 px; on a wide monitor that
+   leaves a lot of grey gutter and forces narrow-column reading on
+   API tables that would benefit from horizontal room. Widen to
+   1200 px (still narrow enough that prose lines don't run novel-
+   length on 4K) and recolor the wrap so the gutter reads as page
+   chrome instead of a second sidebar. */
+
+.wy-nav-content {
+    max-width: 1200px;
+}
+
+.wy-nav-content-wrap {
+    background: #fcfcfc;
+}

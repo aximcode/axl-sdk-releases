@@ -1,10 +1,59 @@
 # AXL — AximCode Library for UEFI
 
-A GLib-inspired C library that makes UEFI application development
-look and feel like writing Linux C code. Applications use snake_case
-`axl_` functions with standard C types. No external dependencies.
+A C library that makes UEFI application development look and feel
+like writing Linux C code. Applications use snake_case `axl_`
+functions with standard C types. No external dependencies.
 
 **Name:** AXL = AximCode Library. Pronounced "axle."
+
+## Audience
+
+AXL targets developers who already write C on Linux — kernel,
+systemd unit, GLib daemon, libcurl client — and are reaching into
+firmware territory. EDK2 is the official environment for UEFI work
+but its conventions (PascalCase, EFI_ prefixes, CHAR16/UTF-16
+everywhere, the protocol/service-binding model, gnu-efi's threadbare
+runtime) are unfamiliar to that audience and not a great fit for
+the API shape they're used to.
+
+AXL exposes the API shape they're used to instead. The mapping to
+GLib, the canonical Linux C library for that style, is intentional
+and direct:
+
+| Linux C / GLib                  | AXL                                |
+|--------------------------------|------------------------------------|
+| `GMainLoop` / `g_main_loop_run` | `AxlLoop` / `axl_loop_run`         |
+| `GHashTable`                    | `AxlHashTable`                     |
+| `GSList` / `GList` / `GQueue`   | `AxlSList` / `AxlList` / `AxlQueue`|
+| `GString`                       | `AxlString`                        |
+| `GBytes`                        | `AxlIOBuf`                         |
+| `g_signal_connect`              | `axl_pubsub_subscribe`             |
+| `g_io_channel_*`                | `AxlSocket`, `AxlIO`               |
+| `g_malloc` / `g_free` / `g_new0`| `axl_malloc` / `axl_free` / `axl_new`|
+| `gint64` / `gsize` / `gboolean` | `int64_t` / `size_t` / `bool`      |
+| `GError` out-param              | int return + `axl_error` log       |
+
+If you've written a GLib daemon, you already understand the AXL
+programming model — what changes is that you're targeting a UEFI
+PE/COFF binary instead of an ELF executable, and AXL handles the
+firmware-side glue (CRT0, event integration, protocol lookup) so
+you don't write `gBS->`, `gST->`, `EFI_*` types, or wide strings
+in your application code.
+
+**Where the UEFI types come from.** AXL has no source-tree
+dependency on EDK2. The `EFI_*` structs, status codes, protocol
+GUIDs, and service tables are auto-generated from the published
+UEFI 2.x and PI 1.x specifications by `scripts/generate-uefi-headers.py`
+driven by `scripts/uefi-manifest.json5`. The generator walks the
+spec HTML, extracts each declared type by name and kind, and emits
+a header layout-compatible with EDK2's. The output lives under
+`include/uefi/generated/` and is regenerated on demand; the small
+hand-written `include/uefi/axl-uefi-extra.h` covers anything the
+specs don't (Shell protocols, a few PI-spec table revisions). Spec
+drift is a manifest update + regeneration step rather than a
+vendor merge — the same Python script handles UEFI 2.11 today and
+will handle UEFI 2.12 by re-running against newer spec HTML. See
+Phase N6 in `docs/ROADMAP.md` for the full extraction story.
 
 **Note:** This document was written during the initial design and
 migration from UdkLib. All phases described below (R, S1-S5, M1-M6,

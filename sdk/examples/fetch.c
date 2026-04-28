@@ -16,6 +16,13 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* Bring up networking (load NIC drivers, ConnectController,
+       wait for DHCP). Idempotent. */
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("error: network bring-up failed\n");
+        return 1;
+    }
+
     AXL_AUTOPTR(AxlHttpClient) client = axl_http_client_new();
     if (client == NULL) {
         axl_printf("error: cannot create HTTP client\n");

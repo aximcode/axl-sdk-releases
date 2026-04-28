@@ -9,7 +9,6 @@
 #include "../backend/axl-backend.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-path.h>
 #include <axl/axl-log.h>
 #include <axl/axl-sys.h>
 #include <axl/axl-driver.h>
@@ -112,37 +111,115 @@ axl_net_set_static_ip(
 }
 
 // ---------------------------------------------------------------------------
+// axl_net_ensure_drivers
+// ---------------------------------------------------------------------------
+
+/* Drivers we try to load, in order. NetworkCommon ships the MNP/IP4/TCP4
+ * stack on top of any SNP-providing NIC driver. The remaining names cover
+ * the NIC drivers staged by uefi-devkit. Each is silently skipped if the
+ * .efi isn't found on any mounted volume — the cost of a miss is one file
+ * existence check per candidate. */
+static const char *const net_drivers[] = {
+    "NetworkCommon.efi",
+    "RtkUndiDxe.efi",
+    "RtkUsbUndiDxe.efi",
+    "AsixUsbUndiDxe.efi",
+    "UsbCdcEcm.efi",
+    "UsbCdcNcm.efi",
+    "UsbRndis.efi",
+    "ipxe-intel.efi",
+    "ipxe-broadcom.efi",
+};
+
+static size_t
+net_count_snp(void)
+{
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_service_enumerate("simple-network", &handles, &count) == 0) {
+        axl_free(handles);
+    }
+    return count;
+}
+
+int
+axl_net_ensure_drivers(void)
+{
+    /* Short-circuit if SNP is already registered. This makes the call
+     * idempotent — safe for tools to invoke unconditionally before any
+     * networking work. */
+    if (net_count_snp() > 0) {
+        return AXL_NET_DRIVERS_OK;
+    }
+
+    char path[256];
+    size_t loaded_count = 0;
+
+    for (size_t i = 0; i < sizeof(net_drivers) / sizeof(net_drivers[0]); i++) {
+        const char *name = net_drivers[i];
+
+        /* Locate first — distinguishes "not on volume" (skip silently)
+         * from "found but failed to start" (warn). axl_driver_ensure is
+         * the wrong primitive here: it unloads on protocol-not-registered,
+         * but the chain SNP→MNP→IP→TCP requires multiple drivers loaded
+         * before any single protocol becomes available. */
+        if (axl_driver_locate(name, path, sizeof(path)) != 0) {
+            axl_debug("ensure_drivers: %s not on any volume", name);
+            continue;
+        }
+
+        AxlDriverHandle drv = NULL;
+        if (axl_driver_load(path, &drv) != 0 || drv == NULL) {
+            axl_warning("ensure_drivers: load failed for '%s'", path);
+            continue;
+        }
+
+        /* Inline StartImage so EFI_ALREADY_STARTED counts as success — a
+         * subsequent invocation finds the driver already loaded and just
+         * re-runs ConnectController below. */
+        size_t exit_data_size = 0;
+        EFI_STATUS st = axl_bs()->StartImage(
+            (EFI_HANDLE)drv, &exit_data_size, NULL);
+
+        if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
+            axl_warning("ensure_drivers: StartImage failed for '%s': 0x%llx",
+                        path, (unsigned long long)st);
+            axl_driver_unload(drv);
+            continue;
+        }
+
+        axl_info("ensure_drivers: loaded '%s'", path);
+        loaded_count++;
+    }
+
+    /* Wire up driver bindings globally. NIC drivers register
+     * DRIVER_BINDING_PROTOCOL in their entry point but only bind to PCI/
+     * USB controllers when ConnectController runs. NULL handle reconnects
+     * everything. */
+    axl_bs()->ConnectController(NULL, NULL, NULL, TRUE);
+
+    if (net_count_snp() > 0) {
+        return AXL_NET_DRIVERS_OK;
+    }
+
+    if (loaded_count == 0) {
+        return AXL_NET_DRIVERS_NOT_FOUND;
+    }
+
+    return AXL_NET_DRIVERS_NO_LINK;
+}
+
+// ---------------------------------------------------------------------------
 // axl_net_auto_init
 // ---------------------------------------------------------------------------
 
-/**
- * Try loading NIC drivers from a "drivers" subdirectory next to
- * the running application, then connect all SNP handles to trigger
- * the full network stack (MNP → ARP → IP4 → TCP4).
- */
-static int
-net_bring_up_stack(void)
+static void
+net_connect_snp_handles(void)
 {
-    /* Try to load drivers from app directory */
-    char *img = axl_driver_get_image_path();
-    if (img != NULL) {
-        char *dir = axl_path_get_dirname(img);
-        if (dir != NULL) {
-            char *drv_dir = axl_path_join(dir, "drivers");
-            if (drv_dir != NULL) {
-                size_t loaded = 0;
-                axl_driver_load_dir(drv_dir, NULL, &loaded);
-                if (loaded > 0) {
-                    axl_info("loaded %zu NIC drivers", loaded);
-                }
-                axl_free(drv_dir);
-            }
-            axl_free(dir);
-        }
-        axl_free(img);
-    }
-
-    /* Connect all SNP handles to trigger protocol stack creation */
+    /* Reconnect every SNP handle to make sure the MNP/IP/TCP/UDP stack
+     * is bound on top of each NIC. axl_net_ensure_drivers() already ran
+     * a global ConnectController, but explicit per-handle reconnect is
+     * harmless and matches the prior behavior tools relied on. */
     void  **snp_handles = NULL;
     size_t  snp_count = 0;
     if (axl_service_enumerate("simple-network", &snp_handles, &snp_count) == 0) {
@@ -151,8 +228,6 @@ net_bring_up_stack(void)
         }
         axl_free(snp_handles);
     }
-
-    return (snp_count > 0) ? 0 : -1;
 }
 
 int
@@ -177,8 +252,13 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
         return 0;
     }
 
-    /* Bring up the network stack */
-    net_bring_up_stack();
+    /* Locate and load NIC drivers (and NetworkCommon) if SNP isn't up
+     * yet. We don't care about the specific NOT_FOUND vs NO_LINK error
+     * here — auto_init's contract is "DHCP succeeded or didn't"; the
+     * diagnostic distinction matters to tools that call ensure_drivers
+     * directly. */
+    axl_net_ensure_drivers();
+    net_connect_snp_handles();
 
     /* Wait for link-up before attempting DHCP (max 5 seconds) */
     {

@@ -454,6 +454,28 @@ main(
         return 1;
     }
 
+    /* Auto-load NIC drivers + DHCP so rfbrowse works from a bare UEFI
+     * shell. TLS is freestanding mbedtls — no firmware TlsDxe needed. */
+    switch (axl_net_ensure_drivers()) {
+    case AXL_NET_DRIVERS_OK:
+        break;
+    case AXL_NET_DRIVERS_NOT_FOUND:
+        axl_printf("rfbrowse: no NIC drivers found in drivers/<arch>/ "
+                   "on any mounted volume.\n");
+        return 1;
+    case AXL_NET_DRIVERS_NO_LINK:
+        axl_printf("rfbrowse: drivers loaded but no NIC came up — "
+                   "is a NIC plugged in?\n");
+        return 1;
+    default:
+        axl_printf("rfbrowse: failed to bring up networking.\n");
+        return 1;
+    }
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("rfbrowse: no IP address — DHCP did not complete.\n");
+        return 1;
+    }
+
     const char *user     = axl_config_get(cfg, "user");
     const char *password = axl_config_get(cfg, "password");
     bool basic   = axl_config_get_bool(cfg, "basic");

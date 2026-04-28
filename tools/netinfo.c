@@ -22,6 +22,28 @@ static const AxlConfigDesc descs[] = {
     { 0 }
 };
 
+/* Auto-load NIC drivers so NetInfo works from a bare UEFI shell without
+ * a startup.nsh that pre-loads them. Same shape as MkRd for RamDiskDxe. */
+static int
+ensure_net_drivers(void)
+{
+    switch (axl_net_ensure_drivers()) {
+    case AXL_NET_DRIVERS_OK:
+        return 0;
+    case AXL_NET_DRIVERS_NOT_FOUND:
+        axl_printf("NetInfo: no NIC drivers found in drivers/<arch>/ "
+                   "on any mounted volume.\n");
+        return 1;
+    case AXL_NET_DRIVERS_NO_LINK:
+        axl_printf("NetInfo: drivers loaded but no NIC came up — "
+                   "is a NIC plugged in?\n");
+        return 1;
+    default:
+        axl_printf("NetInfo: failed to bring up networking.\n");
+        return 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // List network interfaces
 // ---------------------------------------------------------------------------
@@ -202,6 +224,11 @@ main(
 
     verbose = axl_config_get_bool(cfg, "verbose");
 
+    /* All non-help paths need NIC drivers + the network stack. */
+    if (ensure_net_drivers() != 0) {
+        return 1;
+    }
+
     const char *cmd = axl_config_pos(cfg, 0);
 
     if (cmd == NULL || axl_strcmp(cmd, "list") == 0) {
@@ -220,6 +247,13 @@ main(
             if (ping_count == 0) {
                 ping_count = 4;
             }
+        }
+
+        /* Ping needs an IP — run DHCP if it hasn't already. ensure_drivers
+         * already ran, so auto_init's driver step short-circuits. */
+        if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+            axl_printf("NetInfo: no IP address — DHCP did not complete.\n");
+            return 1;
         }
 
         return do_ping(target, ping_count);

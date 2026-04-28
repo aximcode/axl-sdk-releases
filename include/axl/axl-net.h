@@ -96,8 +96,8 @@ axl_net_is_available(void);
  * @brief Bring up networking: load drivers, run DHCP, wait for IP.
  *
  * Performs a best-effort network initialization sequence:
- * 1. If no SNP handles exist, attempts to load NIC drivers from
- *    the "drivers" subdirectory next to the running application.
+ * 1. Calls axl_net_ensure_drivers() to locate and load NIC drivers
+ *    from the standard driver search path.
  * 2. Connects all SNP handles to trigger protocol stack creation.
  * 3. Selects a NIC (by @p nic_index, or first available if SIZE_MAX).
  * 4. Waits up to @p dhcp_timeout_sec for an IPv4 address via DHCP.
@@ -109,6 +109,54 @@ axl_net_auto_init(
     size_t nic_index,        ///< NIC index (SIZE_MAX = auto-select first)
     size_t dhcp_timeout_sec  ///< DHCP timeout in seconds (0 = 10s default)
 );
+
+// ---------------------------------------------------------------------------
+// Driver auto-load
+// ---------------------------------------------------------------------------
+
+/// axl_net_ensure_drivers() return codes.
+#define AXL_NET_DRIVERS_OK         0   ///< SNP is registered (already, or after load)
+#define AXL_NET_DRIVERS_NOT_FOUND (-1) ///< no NIC drivers found on any mounted volume
+#define AXL_NET_DRIVERS_NO_LINK   (-2) ///< drivers loaded, but no SNP came up
+
+/**
+ * @brief Ensure network drivers are loaded and SNP is up.
+ *
+ * Locates and loads `NetworkCommon.efi` plus a known list of NIC
+ * drivers (Realtek, Intel/iPXE, Broadcom/iPXE, USB-CDC ECM/NCM,
+ * USB-RNDIS, ASIX-USB) from the standard driver search path used by
+ * axl_driver_ensure() — drivers/&lt;arch&gt;/&lt;name&gt; on the booted volume,
+ * the image's own directory, drivers/&lt;name&gt; at the volume root, then
+ * drivers/&lt;arch&gt;/&lt;name&gt; on every other mounted FAT volume. After
+ * loading, ConnectController is run globally to wire the SNP/MNP/
+ * IP4/TCP4 stack.
+ *
+ * Drivers absent from the volume are skipped silently — the cost of a
+ * missing entry is one file existence check. Drivers whose hardware
+ * isn't present register their binding but never bind to a controller,
+ * which is also fine.
+ *
+ * Short-circuits if an SNP handle already exists. Idempotent — safe to
+ * call multiple times.
+ *
+ * Same trust caveat as axl_driver_ensure: this loads .efi files off
+ * any mounted FAT volume with full firmware privileges.
+ *
+ * Typical use, before touching any networking:
+ * @code
+ * if (axl_net_ensure_drivers() != AXL_NET_DRIVERS_OK) {
+ *     axl_printf("MyTool: networking unavailable\n");
+ *     return 1;
+ * }
+ * @endcode
+ *
+ * @return AXL_NET_DRIVERS_OK on success;
+ *     AXL_NET_DRIVERS_NOT_FOUND if no NIC drivers were found on any
+ *     mounted volume; AXL_NET_DRIVERS_NO_LINK if drivers were loaded
+ *     but no SNP came up (likely no NIC plugged in).
+ */
+int
+axl_net_ensure_drivers(void);
 
 /**
  * @brief Configure a static IPv4 address on a NIC.

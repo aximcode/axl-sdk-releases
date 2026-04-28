@@ -460,11 +460,22 @@ axl_backend_event_create(
 
 /**
  * @brief Close an event. NULL-safe.
+ *
+ * DIAG-WRAPPED 2026-04-27: every call site routes through
+ * axl_backend_event_close_dbg with __FILE__/__LINE__ so a debug ring
+ * can spot double-closes (the suspected source of the
+ * test-http.sh CoreCloseEvent #GP). The wrapped function still does
+ * the same gBS->CloseEvent on the underlying handle.
  */
 void
-axl_backend_event_close(
-    AxlEventHandle  event  ///< event to close
+axl_backend_event_close_dbg(
+    AxlEventHandle  event,    ///< event to close
+    const char     *file,     ///< caller __FILE__
+    int             line      ///< caller __LINE__
     );
+
+#define axl_backend_event_close(event) \
+    axl_backend_event_close_dbg((event), __FILE__, __LINE__)
 
 /**
  * @brief Configure a timer event.
@@ -539,6 +550,24 @@ int
 axl_backend_console_read_key(
     uint16_t  *scan_code,    ///< (out) scan code (0 for printable)
     uint16_t  *unicode_char  ///< (out) unicode character (0 for special)
+    );
+
+/**
+ * @brief Read a keystroke from ConIn including shift-state info.
+ *
+ * Uses SimpleTextInputEx if available; falls back to ReadKeyStroke
+ * (with @p shift_state always set to 0) when the firmware doesn't
+ * publish ConsoleInHandle's ex protocol. The latter is what raw
+ * serial consoles deliver — TerminalDxe carries no shift bits over
+ * the wire — so a 0 result there is correct, not lossy.
+ *
+ * @return 0 on success, -1 on error or no key available.
+ */
+int
+axl_backend_console_read_key_ex(
+    uint16_t  *scan_code,     ///< (out) scan code (0 for printable)
+    uint16_t  *unicode_char,  ///< (out) unicode character (0 for special)
+    uint32_t  *shift_state    ///< (out) KeyShiftState bits (0 if unavailable)
     );
 
 /**

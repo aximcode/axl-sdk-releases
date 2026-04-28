@@ -29,7 +29,7 @@ static char **mArgv;
 
 /* Whitespace-split a UCS-2 command line into argv.
  * Handles double-quoted tokens (including spaces) and backslash-escaped
- * quotes. On success sets *out_argc/*out_argv (caller owns the array and
+ * quotes. On success sets out_argc/out_argv (caller owns the array and
  * each string); on failure returns -1 and leaves them untouched.
  *
  * UEFI shells pass LoadOptions as the full command line including the

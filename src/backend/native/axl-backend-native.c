@@ -826,6 +826,10 @@ axl_backend_wcsstr(
 // Events and timers
 // ===================================================================
 
+/* Forward decl — defined below alongside the close debug ring. */
+static void
+event_close_ring_record_create(void *handle);
+
 int
 axl_backend_event_create_timer(
     AxlEventHandle  *event
@@ -839,7 +843,11 @@ axl_backend_event_create_timer(
 
     status = gBS->CreateEvent(EVT_TIMER, TPL_APPLICATION,
                               NULL, NULL, (EFI_EVENT *)event);
-    return EFI_ERROR(status) ? -1 : 0;
+    if (EFI_ERROR(status)) {
+        return -1;
+    }
+    event_close_ring_record_create((void *)*event);
+    return 0;
 }
 
 int
@@ -855,17 +863,93 @@ axl_backend_event_create(
 
     status = gBS->CreateEvent(0, TPL_APPLICATION,
                               NULL, NULL, (EFI_EVENT *)event);
-    return EFI_ERROR(status) ? -1 : 0;
+    if (EFI_ERROR(status)) {
+        return -1;
+    }
+    event_close_ring_record_create((void *)*event);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Event close debug ring — DIAG 2026-04-27
+//
+// Records recent closes (handle + caller file:line). Scans on every
+// close to catch a double-close BEFORE handing a bad pointer to
+// gBS->CloseEvent (which crashes deep in DxeCore::CoreCloseEvent).
+// We also track creates: UEFI's allocator routinely hands the same
+// handle pointer back after a close, so without create-tracking the
+// ring would flood with false positives.
+//
+// On a real double-close we log file:line of both sites and SKIP the
+// second close so the test can proceed and surface additional info.
+// ---------------------------------------------------------------------------
+
+#define EVENT_CLOSE_RING_SIZE  256
+
+typedef struct {
+    void        *handle;
+    const char  *file;
+    int          line;
+    bool         closed;   /* true after a close; cleared by a fresh create */
+} EventCloseRecord;
+
+static EventCloseRecord  mEventCloseRing[EVENT_CLOSE_RING_SIZE];
+static size_t            mEventCloseHead;
+
+/* Called by every gBS->CreateEvent wrapper on success. Clears any
+ * stale "closed" record for the returned handle so the next close
+ * doesn't trip the double-close detector on what's actually a fresh
+ * event reusing a recycled slot. */
+static void
+event_close_ring_record_create(void *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < EVENT_CLOSE_RING_SIZE; i++) {
+        if (mEventCloseRing[i].handle == handle) {
+            mEventCloseRing[i].handle = NULL;
+            mEventCloseRing[i].closed = false;
+        }
+    }
 }
 
 void
-axl_backend_event_close(
-    AxlEventHandle  event
+axl_backend_event_close_dbg(
+    AxlEventHandle  event,
+    const char     *file,
+    int             line
     )
 {
-    if (event != NULL) {
-        gBS->CloseEvent((EFI_EVENT)event);
+    if (event == NULL) {
+        return;
     }
+
+    /* Scan ring for a prior close of the same handle. */
+    for (size_t i = 0; i < EVENT_CLOSE_RING_SIZE; i++) {
+        EventCloseRecord *rec = &mEventCloseRing[i];
+        if (rec->closed && rec->handle == (void *)event) {
+            axl_warning("DOUBLE-CLOSE: event=%p first-closed-at=%s:%d "
+                        "now-being-closed-at=%s:%d -- skipping to avoid "
+                        "DxeCore CoreCloseEvent #GP",
+                        (void *)event,
+                        rec->file ? rec->file : "?",
+                        rec->line,
+                        file ? file : "?",
+                        line);
+            return;
+        }
+    }
+
+    /* Record this close before performing it. */
+    EventCloseRecord *rec = &mEventCloseRing[mEventCloseHead];
+    rec->handle = (void *)event;
+    rec->file   = file;
+    rec->line   = line;
+    rec->closed = true;
+    mEventCloseHead = (mEventCloseHead + 1) % EVENT_CLOSE_RING_SIZE;
+
+    gBS->CloseEvent((EFI_EVENT)event);
 }
 
 int
@@ -936,6 +1020,11 @@ axl_backend_event_register_protocol_notify(
 // Console input
 // ===================================================================
 
+/* Defined further down alongside the cached SimpleTextInputEx pointer.
+ * Forward-declared here so axl_backend_console_read_key_ex can use it. */
+static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
+get_simple_ex(void);
+
 AxlEventHandle
 axl_backend_console_wait_for_key(
     void
@@ -974,6 +1063,43 @@ axl_backend_console_read_key(
     return 0;
 }
 
+int
+axl_backend_console_read_key_ex(
+    uint16_t  *scan_code,
+    uint16_t  *unicode_char,
+    uint32_t  *shift_state
+    )
+{
+    /* Prefer SimpleTextInputEx so we get KeyShiftState. */
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *simple_ex = get_simple_ex();
+    if (simple_ex != NULL) {
+        EFI_KEY_DATA  key_data;
+        EFI_STATUS    status = simple_ex->ReadKeyStrokeEx(simple_ex, &key_data);
+        if (EFI_ERROR(status)) {
+            return -1;
+        }
+        if (scan_code != NULL) {
+            *scan_code = key_data.Key.ScanCode;
+        }
+        if (unicode_char != NULL) {
+            *unicode_char = key_data.Key.UnicodeChar;
+        }
+        if (shift_state != NULL) {
+            *shift_state = key_data.KeyState.KeyShiftState;
+        }
+        return 0;
+    }
+
+    /* Fallback: SimpleTextInput has no shift-state info. Report 0,
+     * which is exactly what serial consoles deliver anyway (TerminalDxe
+     * doesn't carry shift bits over the wire). */
+    int rc = axl_backend_console_read_key(scan_code, unicode_char);
+    if (shift_state != NULL) {
+        *shift_state = 0;
+    }
+    return rc;
+}
+
 bool
 axl_backend_shell_break_flag(
     void
@@ -992,95 +1118,35 @@ axl_backend_shell_break_flag(
 }
 
 // ---------------------------------------------------------------------------
-// Serial Ctrl-C bridge
+// SimpleTextInputEx access (cached) — used to read keystrokes with their
+// KeyShiftState bits, which axl_backend_console_read_key_ex returns. The
+// loop reads ConsoleInHandle keys event-driven via WaitForKey/Ex; we just
+// need to reconstruct shift state on dispatch so it can recognize raw
+// serial Ctrl-C ({UnicodeChar=0x03, KeyShiftState=0}, what TerminalDxe
+// emits — see axl-loop.c's keypress dispatch).
 //
-// EDK2's TerminalDxe (the serial-console driver) delivers raw 0x03
-// bytes from the wire with KeyShiftState=0 — serial protocol carries
-// no shift-state info and OVMF can't synthesize it. The Shell's
-// CtrlCNotifyHandle{1..4} all require KeyShiftState to indicate Ctrl
-// pressed, so they never match on serial input → ExecutionBreak
-// never signals → axl_loop_run waits forever.
-//
-// Fix: register our own SimpleTextInputEx KeyNotify on ConsoleInHandle
-// for {UnicodeChar=0x03, KeyShiftState=0}. When it fires, signal
-// shell->ExecutionBreak directly (the event the loop already waits
-// on). Lazy-init on first call to axl_backend_shell_break_event so
-// drivers and apps that never use the loop pay nothing.
+// We do NOT call SimpleTextInputEx::RegisterKeyNotify. Doing so puts
+// OVMF's ConSplitter into a TPL_NOTIFY-level key polling loop that
+// preempts our TPL_CALLBACK loop and starves the TCP4 stack — the
+// regression that 12679de's first revision introduced (test-http.sh
+// dropped from 40/19 → 6/53; QEMU pinned at 100% CPU).
 // ---------------------------------------------------------------------------
 
-static bool   mSerialCtrlCInstalled = false;
-static VOID  *mSerialCtrlCHandle    = NULL;
+static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *mSimpleEx       = NULL;
+static bool                                mSimpleExLooked = false;
 
-static EFI_STATUS EFIAPI
-serial_ctrl_c_notify(
-    IN EFI_KEY_DATA  *KeyData
-    )
+static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
+get_simple_ex(void)
 {
-    (void)KeyData;
-    EFI_SHELL_PROTOCOL *shell = get_shell();
-    if (shell != NULL && shell->ExecutionBreak != NULL) {
-        gBS->SignalEvent(shell->ExecutionBreak);
-    }
-    return EFI_SUCCESS;
-}
-
-static void
-install_serial_ctrl_c_notify(void)
-{
-    if (mSerialCtrlCInstalled) {
-        return;
-    }
-    mSerialCtrlCInstalled = true;   /* one-shot regardless of outcome */
-
-    EFI_GUID guid = gEfiSimpleTextInputExProtocolGuid;
-
-    /* Register on every handle exposing SimpleTextInputEx — each
-     * physical console driver (TerminalDxe per serial port + any
-     * keyboard driver). ConSplitter aggregates these but its
-     * forward-to-children path can race with attach order; doing
-     * this directly avoids the timing-sensitive case. */
-    EFI_HANDLE *handles = NULL;
-    UINTN       handle_count = 0;
-    EFI_STATUS  status = gBS->LocateHandleBuffer(
-        ByProtocol, &guid, NULL, &handle_count, &handles);
-    if (EFI_ERROR(status) || handles == NULL || handle_count == 0) {
-        axl_warning("serial Ctrl-C: LocateHandleBuffer found 0 (status=0x%lx)",
-                    (unsigned long)status);
-        return;
-    }
-
-    EFI_KEY_DATA key_data = {0};
-    key_data.Key.UnicodeChar         = 0x03;       /* ETX, raw Ctrl-C byte */
-    key_data.Key.ScanCode            = 0;
-    key_data.KeyState.KeyShiftState  = 0;          /* matches TerminalDxe */
-    key_data.KeyState.KeyToggleState = 0;
-
-    UINTN installed = 0;
-    for (UINTN i = 0; i < handle_count; i++) {
-        EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *simple_ex = NULL;
-        if (gBS->HandleProtocol(handles[i], &guid, (void **)&simple_ex) != 0
-            || simple_ex == NULL) {
-            continue;
-        }
-        VOID *notify_handle = NULL;
-        if (simple_ex->RegisterKeyNotify(simple_ex, &key_data,
-                                         serial_ctrl_c_notify,
-                                         &notify_handle) == 0) {
-            installed++;
-            /* Save the first handle for symmetry — most common case. */
-            if (mSerialCtrlCHandle == NULL) {
-                mSerialCtrlCHandle = notify_handle;
-            }
+    if (!mSimpleExLooked) {
+        mSimpleExLooked = true;
+        if (gST != NULL && gST->ConsoleInHandle != NULL) {
+            EFI_GUID guid = gEfiSimpleTextInputExProtocolGuid;
+            gBS->HandleProtocol(gST->ConsoleInHandle, &guid,
+                                (void **)&mSimpleEx);
         }
     }
-    gBS->FreePool(handles);
-
-    if (installed == 0) {
-        axl_warning("serial Ctrl-C: registered on 0 handles");
-    } else {
-        axl_info("serial Ctrl-C bridge installed on %lu handle%s",
-                 (unsigned long)installed, installed == 1 ? "" : "s");
-    }
+    return mSimpleEx;
 }
 
 AxlEventHandle
@@ -1088,19 +1154,10 @@ axl_backend_shell_break_event(
     void
     )
 {
-    EFI_SHELL_PROTOCOL *shell;
-
-    shell = get_shell();
+    EFI_SHELL_PROTOCOL *shell = get_shell();
     if (shell == NULL) {
         return NULL;
     }
-
-    /* Make sure serial Ctrl-C reaches ExecutionBreak. Real-keyboard
-     * Ctrl-C still goes through the Shell's own Ctrl-modifier notify
-     * unchanged; this is purely additive for the serial-console
-     * case (BMC, IPMI SoL, qemu -nographic, etc.). */
-    install_serial_ctrl_c_notify();
-
     return (AxlEventHandle)shell->ExecutionBreak;
 }
 

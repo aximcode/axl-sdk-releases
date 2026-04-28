@@ -127,6 +127,27 @@ main(
         return 1;
     }
 
+    /* Auto-load NIC drivers + DHCP so Fetch works from a bare UEFI shell. */
+    switch (axl_net_ensure_drivers()) {
+    case AXL_NET_DRIVERS_OK:
+        break;
+    case AXL_NET_DRIVERS_NOT_FOUND:
+        axl_printf("Fetch: no NIC drivers found in drivers/<arch>/ "
+                   "on any mounted volume.\n");
+        return 1;
+    case AXL_NET_DRIVERS_NO_LINK:
+        axl_printf("Fetch: drivers loaded but no NIC came up — "
+                   "is a NIC plugged in?\n");
+        return 1;
+    default:
+        axl_printf("Fetch: failed to bring up networking.\n");
+        return 1;
+    }
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("Fetch: no IP address — DHCP did not complete.\n");
+        return 1;
+    }
+
     bool silent    = axl_config_get_bool(cfg, "silent");
     bool verbose   = axl_config_get_bool(cfg, "verbose");
     bool head_only = axl_config_get_bool(cfg, "head");
@@ -146,14 +167,24 @@ main(
         axl_strlcpy(method, "HEAD", sizeof(method));
     }
 
-    // Build extra headers from -H options
+    // Build extra headers from -H options. The static buffer-pool
+    // bound is generous for typical CLI use; warn when the caller
+    // passes more so the silent truncation in the loop below is
+    // visible.
+    #define FETCH_MAX_HEADERS    16
+    #define FETCH_MAX_HEADER_LEN 256
     AXL_AUTOPTR(AxlHashTable) extra_headers = NULL;
     size_t hdr_count = axl_config_get_multi_count(cfg, "header");
-    static char hdr_bufs[16][256];
+    static char hdr_bufs[FETCH_MAX_HEADERS][FETCH_MAX_HEADER_LEN];
 
+    if (hdr_count > FETCH_MAX_HEADERS) {
+        axl_printf("warning: %zu headers passed; only the first %d "
+                   "will be sent\n",
+                   hdr_count, FETCH_MAX_HEADERS);
+    }
     if (hdr_count > 0) {
         extra_headers = axl_hash_table_new_str();
-        for (size_t i = 0; i < hdr_count && i < 16; i++) {
+        for (size_t i = 0; i < hdr_count && i < FETCH_MAX_HEADERS; i++) {
             const char *hdr = axl_config_get_multi(cfg, "header", i);
             if (hdr == NULL) {
                 continue;

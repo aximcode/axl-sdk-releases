@@ -119,6 +119,7 @@ struct AxlHttpServer {
     AxlHashTable      *cache;        /* key: "METHOD /path", value: CachedResponse* */
     size_t             cache_max;
     size_t             cache_ttl_ms; /* default TTL */
+    uint64_t           cache_seq;    /* monotonic insertion counter for FIFO eviction */
     AxlHashTable      *route_ttls;   /* key: request path, value: (void *)(uintptr_t)ttl_ms; lazily created */
     size_t             upload_chunk_size;
     /* WebSocket routes (small array — typically 1-3 endpoints) */

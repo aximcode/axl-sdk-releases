@@ -1,7 +1,35 @@
 # AXL
 
-AXL (AximCode Library) is a GLib-inspired C library for UEFI, plus an
-SDK for building UEFI applications and drivers without EDK2.
+AXL (AximCode Library) is a UEFI C library and SDK aimed at Linux
+systems C developers — the audience that already writes C against
+the kernel, glibc, and GLib but doesn't necessarily want to learn
+EDK2 conventions, the gnu-efi runtime, or the EFI_ / CHAR16 / PascalCase
+universe to ship a UEFI binary. AXL hides that and exposes the C API
+shape you already know: `axl_snake_case` functions, `AxlPascalCase`
+types, UTF-8 strings, `int`/`size_t`/`uint64_t` everywhere, and an
+event loop and data structures modeled directly on GLib (`AxlLoop`
+≈ `GMainLoop`, `AxlHashTable` ≈ `GHashTable`, …). If you've used
+GLib, you've used 80% of AXL's API surface.
+
+The SDK packages the library with headers, a CRT0 entry point, and
+`axl-cc` (a compiler wrapper) so you build `.efi` binaries with one
+command — no EDK2 source tree, no gnu-efi.
+
+**How AXL avoids the EDK2 dependency.** The UEFI types (`EFI_*`
+structs, status codes, protocol GUIDs, service tables) are
+auto-generated from the published [UEFI](https://uefi.org/specifications)
+and [PI](https://uefi.org/specifications) specifications via
+[`scripts/generate-uefi-headers.py`](scripts/generate-uefi-headers.py)
++ [`scripts/uefi-manifest.json5`](scripts/uefi-manifest.json5).
+The generator walks the spec HTML, extracts each declared type by
+name + kind, and emits a header layout-compatible with EDK2's. The
+output lives in [`include/uefi/generated/`](include/uefi/generated/),
+is rebuilt on demand, and never leaks across the public API
+boundary — application code never includes a UEFI header. Any
+declaration the spec doesn't cover (Shell protocol etc.) lives in
+the small hand-written [`include/uefi/axl-uefi-extra.h`](include/uefi/axl-uefi-extra.h).
+This means AXL has no source-tree dependency on EDK2 (or gnu-efi);
+spec drift is a manifest update + regeneration, not a vendor merge.
 
 - **AXL Library** (`libaxl.a`) — the library itself: data structures,
   file I/O, networking (TCP, UDP, HTTP, TLS), graphics, event loop,

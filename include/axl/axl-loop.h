@@ -4,13 +4,16 @@
 /**
  * axl-loop.h:
  *
- * Event loop with timer, keyboard, idle, protocol notification, and
- * raw event sources. GLib-inspired main loop with FUSE-style primitives.
- *
- * Raw event sources (axl_loop_add_event) allow any UEFI event to be
- * integrated into the loop — TCP completion tokens, protocol-notify
- * events, AxlEvent instances (via axl_event_handle). This eliminates
- * the need for polling timers.
+ * AxlLoop — event loop with timer, keyboard, idle, protocol
+ * notification, and raw event sources. The model maps directly
+ * onto GLib: AxlLoop is the AXL counterpart of GMainLoop,
+ * axl_loop_run / axl_loop_quit play the role of g_main_loop_run /
+ * g_main_loop_quit, axl_loop_add_timer is g_timeout_add, and so on.
+ * If you have written a GLib daemon, the shape is the same — what
+ * differs is the source kinds: AXL adds raw-EFI-event sources
+ * (axl_loop_add_event) so any UEFI event (TCP completion tokens,
+ * protocol-notify, AxlEvent instances via axl_event_handle) drops
+ * straight into the loop without polling.
  */
 
 #ifndef AXL_LOOP_H

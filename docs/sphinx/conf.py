@@ -43,7 +43,10 @@ html_theme_options = {
     "navigation_depth": 3,
     "collapse_navigation": False,
 }
-html_static_path = []
+# sphinx_rtd_theme caps content at ~800 px by default. Override via
+# a tiny stylesheet so wide monitors actually use the screen.
+html_static_path = ["_static"]
+html_css_files   = ["axl.css"]
 html_search_language = "en"
 
 # -- Man pages ---------------------------------------------------------------

@@ -85,12 +85,16 @@ axl_http_server_use_cache(AxlHttpServer *s, size_t max_entries)
     return 0;
 }
 
-/* FIFO eviction: find the entry with the lowest timestamp_ms and
-   remove it. O(n) per call, amortized fine because evictions only
-   happen when the cache is full. */
+/* FIFO eviction: find the entry with the lowest insert_seq (oldest
+   insertion) and remove it. We can't use timestamp_ms for FIFO order
+   because UEFI GetTime is 1-second granularity — many inserts in the
+   same second tie, and tie-broken-by-hash-bucket-iteration is not
+   FIFO. O(n) per call, amortized fine because evictions only happen
+   when the cache is full. */
 typedef struct {
-    uint64_t    min_ts;
+    uint64_t    min_seq;
     const void *min_key;
+    bool        seen_any;
 } EvictCtx;
 
 static void
@@ -99,16 +103,17 @@ find_oldest_cb(const void *key, void *value, void *data)
     CachedResponse *entry = value;
     EvictCtx       *ctx   = data;
 
-    if (ctx->min_key == NULL || entry->timestamp_ms < ctx->min_ts) {
-        ctx->min_ts  = entry->timestamp_ms;
-        ctx->min_key = key;
+    if (!ctx->seen_any || entry->insert_seq < ctx->min_seq) {
+        ctx->min_seq  = entry->insert_seq;
+        ctx->min_key  = key;
+        ctx->seen_any = true;
     }
 }
 
 static void
 evict_oldest_cache_entry(AxlHttpServer *s)
 {
-    EvictCtx ctx = { .min_ts = 0, .min_key = NULL };
+    EvictCtx ctx = { .min_seq = 0, .min_key = NULL, .seen_any = false };
 
     axl_hash_table_foreach(s->cache, find_oldest_cb, &ctx);
     if (ctx.min_key != NULL) {
@@ -334,6 +339,7 @@ dispatch_request(
                 entry->body_size = resp.body_size;
                 entry->status_code = resp.status_code;
                 entry->timestamp_ms = axl_time_get_ms();
+                entry->insert_seq = ++s->cache_seq;
 
                 /* Per-route TTL override, else server-wide default. */
                 entry->ttl_ms = s->cache_ttl_ms;

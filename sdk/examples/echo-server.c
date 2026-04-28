@@ -129,6 +129,15 @@ main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
+    /* Bring up networking before any axl_socket_* call. Loads NIC
+       drivers, runs ConnectController, and waits for DHCP — the
+       same setup the UEFI shell would do for `connect -r &&
+       ifconfig -s eth0 dhcp`. Idempotent. */
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("error: network bring-up failed\n");
+        return 1;
+    }
+
     listener = axl_socket_new(AXL_SOCKET_STREAM);
     if (listener == NULL || axl_socket_listen(listener, 7000) != 0) {
         axl_printf("error: cannot listen on port 7000\n");
@@ -139,9 +148,23 @@ main(int argc, char **argv)
     axl_printf("echo-server: listening on port 7000 (async)\n");
 
     loop = axl_loop_new();
-    axl_socket_accept_async(listener, loop, on_accept, NULL);
+    if (loop == NULL) {
+        axl_printf("error: axl_loop_new failed\n");
+        axl_socket_free(listener);
+        return 1;
+    }
+    if (axl_socket_accept_async(listener, loop, on_accept, NULL) != 0) {
+        axl_printf("error: axl_socket_accept_async failed\n");
+        axl_socket_free(listener);
+        axl_loop_free(loop);
+        return 1;
+    }
     axl_loop_run(loop);
-    axl_loop_free(loop);
+    /* Free the listener BEFORE the loop. axl_socket_free →
+       axl_tcp_close drops the listener's still-armed accept source
+       against this loop; the previous "free loop, then close" order
+       left axl_tcp_close dereferencing freed loop memory. */
     axl_socket_free(listener);
+    axl_loop_free(loop);
     return 0;
 }

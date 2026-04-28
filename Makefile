@@ -48,8 +48,14 @@ CFLAGS_BASE = -ffreestanding -fshort-wchar \
               -Wall \
               -DAXL_BACKEND_NATIVE
 
+# Both DEBUG and RELEASE emit DWARF debug info — the .efi PE/COFF
+# stays slim because objcopy only carries .dbgdir through, and
+# pe-set-debug points the debug data directory at the side-by-side
+# .debug file. RELEASE-with-debug-info means a #PF in the firmware
+# can be addr2line'd against the artifact a user already has,
+# without rebuilding.
 ifeq ($(BUILD),RELEASE)
-  CFLAGS_BUILD = -Os -ffunction-sections -fdata-sections -DNDEBUG
+  CFLAGS_BUILD = -Os -g -gdwarf -ffunction-sections -fdata-sections -DNDEBUG
 else
   CFLAGS_BUILD = -Og -g -gdwarf -DAXL_MEM_DEBUG \
                  -ffunction-sections -fdata-sections

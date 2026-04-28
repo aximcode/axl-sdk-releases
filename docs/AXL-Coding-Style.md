@@ -1,7 +1,16 @@
 # AXL Coding Style
 
-AXL follows GLib naming conventions. All new code uses this style —
-no exceptions, no EDK2-style PascalCase functions.
+AXL follows the C conventions familiar to Linux systems
+developers — the GLib / kernel-style snake_case + PascalCase
+mix — explicitly *not* EDK2's PascalCase-everywhere house style.
+The choice is for the audience: a developer who arrives from
+glibc / GLib / systemd / libcurl reads this code without a
+translation step. All new code uses this style — no exceptions,
+no EDK2-style PascalCase functions in public API.
+
+Public API never returns or accepts an `EFI_*` type. UEFI types
+exist inside `src/` and `include/uefi/` but never leak across
+the `include/axl/` boundary.
 
 ## Naming
 

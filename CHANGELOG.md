@@ -3,9 +3,174 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.2.6 — 2026-04-28
 
-_No changes yet._
+Networking-focused release. Headline is a TCP-close lifecycle rework
+(heap-owned close token + async-finalize on the running loop) that
+fixed three classes of bug at once: a UAF in `axl_tcp_close` that
+corrupted nested-loop frames (the Reg A `/client-test` hang), a
+busy-wait per active close that pegged the CPU during curl-storm
+load, and a FIN drop on `Configure(NULL)` when the bounded close
+wait expired before the firmware finished. Plus debugging tooling
+(GDB-into-QEMU), CI gains (test-http and test-tcp-echo now run on
+every push), debug info in release builds, refreshed audience
+framing for Linux systems C developers, and several supporting
+fixes that surfaced along the way.
+
+### Added
+
+- **GDB-into-QEMU debugging.** `scripts/run-qemu.sh --gdb [PORT]`
+  exposes the QEMU GDB stub; `--debugcon FILE` captures OVMF's
+  `Loading driver at 0x... NAME.efi` lines. `scripts/gdb-syms.py`
+  consumes the debugcon log and emits `add-symbol-file` directives
+  ready to paste into `gdb`. Documented end-to-end in
+  `docs/DEBUGGING.md`. Used to bisect the close-event hangs and
+  the CoreCheckEvent `#PF` (`docs/DEBUGGING.md § Worked example`).
+- **`test/integration/test-tcp-echo.sh`** — minimal TCP-only
+  integration test (15 sequential connect/echo/close probes against
+  `sdk/examples/tcp-echo-server.efi`). Asserts every probe echoes,
+  guest connect/disconnect counts match, and the host TCP table is
+  clean after the storm — narrow signal for FIN-delivery and
+  close-token regressions that test-http would only show as flake.
+  Now part of the CI integration job.
+- **`axl_net_ensure_drivers`** — drives auto-load of TCP4 / DNS4
+  / IP4 service bindings under `NetInfo`, `Fetch`, `RfBrowse` so
+  the tools work on bare-metal images that haven't pre-`connect`'d
+  the network stack. Mirrors the `axl_driver_locate` pattern
+  introduced for `MkRd` in v0.2.3.
+
+### Fixed
+
+- **`axl_tcp_close` no longer corrupts caller stack frames.** The
+  close token is now heap-allocated; EDK2 holds its pointer past
+  TIME_WAIT, and the previous stack-allocated token UAF'd whenever
+  TIME_WAIT outlived the bounded wait. Manifested as the flaky
+  `/client-test` handler hang ("Reg A") in test-http.
+- **No CPU spin per active close.** Close registers its
+  completion event on the caller's running event loop and finalizes
+  asynchronously when SockConnClosed fires; the per-close
+  `_axl_tcp_wait` is now a fallback used only outside a running
+  loop (CLI tools, shutdown after `axl_loop_run` returned).
+  test-http wall time fell ~94 s → ~21 s on the same hardware.
+- **`Configure(NULL)` no longer drops the queued FIN** on active
+  close. Configure-NULL runs from the close-event finalize callback
+  after the firmware has fully completed Close, so `TcpFlushPcb`'s
+  buffer flush has nothing left to send.
+- **Synchronous `Receive()` errors and re-arm errors get delivered
+  through the loop**, not silently swallowed. EDK2 returns
+  `EFI_CONNECTION_FIN` synchronously when `SockNoMoreData` ran with
+  an empty token list before the user re-armed; without delivery
+  the server never observed EOF, never closed, and peers hung in
+  FIN-WAIT-2.
+- **Loop dispatch epilogue skips slot-reuse stomp.** A callback that
+  removed its own source and registered a new one in the same slot
+  used to have its new occupant deactivated by the dispatch
+  epilogue. The dispatcher now snapshots `src->id` before the
+  callback and skips epilogue if the slot was re-issued.
+- **Loop event-array off-by-one.** `event_array[AXL_MAX_SOURCES + 2]`
+  was sized for two sentinels but `axl_loop_next_event` appended a
+  third (intrinsic keypress, added in 0.2.5). Wrote one slot past
+  the stack array — surfaced under load as a stale `AxlEventHandle`
+  the next iteration handed to `gBS->CheckEvent` (`#PF` in
+  `CoreCheckEvent`). Fixed; size is now `+3`.
+- **HTTP response cache FIFO eviction is now actually FIFO.**
+  `axl_time_get_ms()` is 1-second resolution on UEFI, so many
+  inserts within the same second tied on `timestamp_ms` and the
+  tiebreak fell back to hash-bucket-walk order. Switched to a
+  monotonic `cache_seq` counter; eviction is correct independent
+  of clock granularity.
+- **Serial Ctrl-C bridge** — `RegisterKeyNotify` is too sensitive
+  on real hardware (fires on every keystroke at TPL_NOTIFY); use
+  the Simple Text Input Ex `WaitForKeyEx` event under TPL_CALLBACK
+  instead. Drops apparent CPU spin on serial-attached boards.
+
+### Changed
+
+- **`AXL_MAX_SOURCES` bumped 16 → 64.** The async-close shape needs
+  ~one loop source per outstanding close ctx (held for ~TIME_WAIT
+  seconds while SockConnClosed fires). 16 was tight even before —
+  an http-server with the default 8 max-connections plus listener
+  and per-conn cancellables would peak near the limit and fail
+  `axl_loop_add_event` silently. Exhaustion now logs at error
+  level instead of failing silently.
+- **`axl_tcp_send` / `axl_tcp_recv` save/restore `sock->async_loop`**
+  across their ephemeral wrapper loop. Previously each sync wrapper
+  left `async_loop` pointing at the just-freed loop — a follow-up
+  `axl_tcp_close` on the same sock would dereference freed memory
+  while deciding sync-vs-async finalization.
+- **CI integration job runs `test-http.sh` and `test-tcp-echo.sh`**
+  on every push (was unit + tools + cpu-idle only). KVM
+  acceleration is auto-enabled on GitHub-hosted runners via a
+  one-shot `chmod 666 /dev/kvm` step.
+
+### Library API
+
+- **`axl_tcp_close` lifetime semantics** are now documented on the
+  declaration in `axl/axl-tcp.h`. Callers must close TCP sockets
+  before freeing the loop they were registered with; on the async
+  path the AxlTcp pointer outlives the call until the firmware
+  signals close-complete (treat as freed once the call returns).
+
+### Examples / Tools
+
+- **Examples now self-bootstrap networking** via `axl_net_auto_init`
+  in `main` (echo-server, tcp-echo-server, echo-server-sync,
+  http-server, net-check, fetch). Running any of them via plain
+  `run-qemu.sh --net --hostfwd ...` Just Works — no custom nsh
+  needed for `connect -r` / `ifconfig -s eth0 dhcp`. Tools
+  (`fetch`, `netinfo`, `rfbrowse`, `mkrd`) already self-loaded
+  their drivers; the examples now match.
+- **Examples now check fallible-call returns**. `axl_loop_new`,
+  `axl_*_accept_async`, `axl_http_server_add_route`, and
+  `axl_socket_send` returns are checked in `echo-server.c`,
+  `tcp-echo-server.c`, `http-server.c`, and `socket-demo.c` so the
+  patterns developers crib from these files include the error
+  paths, not just the happy path.
+- **`tools/fetch`** now warns when more `-H` headers are passed
+  than the static buffer pool holds (16). Previously truncated
+  silently.
+
+### Build
+
+- **DWARF debug info in RELEASE builds** (Makefile + axl-cc).
+  Both DEBUG and RELEASE now compile with `-g -gdwarf`. The `.efi`
+  PE/COFF stays slim because objcopy still strips DWARF; the
+  side-by-side `.so/.debug` carries it, and `pe-set-debug` points
+  the PE debug-data directory at it. addr2line now works against
+  any built artifact — a `#PF` reported by a user is resolvable
+  against the binary they already have, without rebuilding with
+  debug flags.
+
+### Documentation
+
+- **Audience framing.** README, AXL-Design, AXL-SDK-Design, and the
+  `axl.h` / `axl-loop.h` umbrella headers now lead with the audience
+  AXL is for — Linux systems C developers (glibc / GLib / systemd /
+  libcurl) who need to ship a UEFI binary without learning EDK2.
+  GLib-to-AXL mapping table (GMainLoop → AxlLoop, GHashTable →
+  AxlHashTable, etc.) lives in AXL-Design.md.
+- **How AXL avoids the EDK2 dependency** — README and design docs
+  now explain that the `EFI_*` types are auto-generated from the
+  published UEFI 2.x and PI 1.x specifications via
+  `scripts/generate-uefi-headers.py` driven by
+  `scripts/uefi-manifest.json5`. Spec drift is a manifest update,
+  not a vendor merge.
+- **Sphinx full-width override** — `docs/sphinx/_static/axl.css`
+  widens `.wy-nav-content` to 1200 px so axl.aximcode.com no
+  longer leaves grey gutters on wide monitors.
+
+### Migration
+
+- **`axl_tcp_close` returns immediately on the async path** when
+  called from inside a running loop (typical: server connection
+  teardown). The `AxlTcp *` pointer outlives the call by up to
+  ~TIME_WAIT (~2 s) while the firmware completes the close.
+  Existing callers that already null'd their `AxlTcp` pointer
+  after `axl_tcp_close` work unchanged. Callers that read or use
+  the pointer after close had a UAF in 0.2.5; those now read
+  freed memory more visibly. The header doc on
+  `include/axl/axl-tcp.h` describes the lifetime explicitly. No
+  source changes required for the common case.
 
 ## 0.2.5 — 2026-04-25
 

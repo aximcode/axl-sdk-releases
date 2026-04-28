@@ -116,16 +116,17 @@ typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_CUR_DIR)(
 // ===================================================================
 // EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (UEFI Spec 2.x, §12.2)
 //
-// AXL backend installs a key notify on this protocol's handle to
-// catch raw 0x03 (Ctrl-C) bytes coming over serial — TerminalDxe
-// delivers them with KeyShiftState=0 (no Ctrl modifier reported on
-// serial), so the EDK2 Shell's own Ctrl-C notify (which requires
-// Ctrl-pressed bits) doesn't fire. We register an additional notify
-// that matches KeyShiftState=0 and signals shell->ExecutionBreak
-// from there.
+// AXL uses ReadKeyStrokeEx + WaitForKeyEx to detect raw serial Ctrl-C
+// (UnicodeChar=0x03 with KeyShiftState=0 — what TerminalDxe emits,
+// since the wire carries no shift bits). The loop adds WaitForKeyEx
+// to its event-wait array and intercepts the 0x03 in dispatch.
 //
-// Only RegisterKeyNotify / UnregisterKeyNotify are used; other
-// fields are void* placeholders.
+// We deliberately do NOT call RegisterKeyNotify: doing so puts OVMF's
+// ConSplitter into a TPL_NOTIFY-level key polling loop that preempts
+// our TPL_CALLBACK loop and starves TCP4 (test-http.sh dropped from
+// 40/19 to 6/53 with QEMU pinned at 100% CPU when the bridge used
+// RegisterKeyNotify). The struct still defines those fields for
+// completeness, but they aren't used here.
 // ===================================================================
 
 typedef struct {
@@ -144,6 +145,11 @@ typedef EFI_STATUS (EFIAPI *EFI_KEY_NOTIFY_FUNCTION)(
 
 typedef struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL;
 
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_EX_READ_KEY_STROKE_EX)(
+    IN  EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *This,
+    OUT EFI_KEY_DATA                       *KeyData
+    );
+
 typedef EFI_STATUS (EFIAPI *EFI_INPUT_EX_REGISTER_KEY_NOTIFY)(
     IN  EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *This,
     IN  EFI_KEY_DATA                       *KeyData,
@@ -158,7 +164,7 @@ typedef EFI_STATUS (EFIAPI *EFI_INPUT_EX_UNREGISTER_KEY_NOTIFY)(
 
 struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL {
     void                                *Reset;
-    void                                *ReadKeyStrokeEx;
+    EFI_INPUT_EX_READ_KEY_STROKE_EX      ReadKeyStrokeEx;
     EFI_EVENT                            WaitForKeyEx;
     void                                *SetState;
     EFI_INPUT_EX_REGISTER_KEY_NOTIFY     RegisterKeyNotify;

@@ -32,6 +32,15 @@ add_source(AxlLoop *loop, SourceType type, AxlEventHandle event,
         return 0;
     }
 
+    /* SOURCE_EVENT slot reuse drops Cancel + CloseEvent on the cb's
+       behalf, so a caller passing owns_event=true would leak the EFI
+       event when the slot is later reused. No such caller exists
+       today; reject defensively. */
+    if (type == SOURCE_EVENT && owns_event) {
+        axl_error("add_source: SOURCE_EVENT with owns_event=true is unsupported");
+        return 0;
+    }
+
     /* Reuse inactive slots before appending */
     src = NULL;
     for (i = 0; i < loop->source_count; i++) {
@@ -43,6 +52,10 @@ add_source(AxlLoop *loop, SourceType type, AxlEventHandle event,
 
     if (src == NULL) {
         if (loop->source_count >= AXL_MAX_SOURCES) {
+            axl_error("add_source: AXL_MAX_SOURCES (%d) exhausted — "
+                      "registration failed (type=%d). Bump the limit "
+                      "or audit callers leaking sources.",
+                      AXL_MAX_SOURCES, (int)type);
             return 0;
         }
         src = &loop->sources[loop->source_count];
@@ -107,6 +120,15 @@ axl_loop_new_impl(const char *file, int line)
                                 POLL_INTERVAL_MS * MS_TO_100NS);
 
     loop->break_event = axl_backend_shell_break_event();
+
+    /* Borrow ConIn->WaitForKey for serial-Ctrl-C interception. The
+     * loop adds it to the WaitForEvent array (when no user keypress
+     * source is registered) so a 0x03 byte from a serial console wakes
+     * the loop and we can signal break — fully event-driven, no
+     * RegisterKeyNotify (which would put OVMF's ConSplitter into a
+     * TPL_NOTIFY-level key polling loop and starve TCP4). */
+    loop->keypress_event = axl_backend_console_wait_for_key();
+
     loop->_registry_handle = _axl_registry_add(AXL_RES_LOOP, loop, file, line);
 
     return loop;
@@ -206,8 +228,13 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
 {
     size_t          i;
     size_t          event_count;
-    AxlEventHandle  event_array[AXL_MAX_SOURCES + 2];    /* +2: poll timer + break event */
-    size_t          event_to_source[AXL_MAX_SOURCES + 2];
+    /* +3 sentinels: poll timer + break event + intrinsic keypress
+       (the keypress slot was added by 76df737 but the array sizing
+       lagged behind, off-by-one writing the third sentinel into
+       whatever followed in the stack frame — observed as a stale
+       AxlEventHandle the next iteration handed to gBS->CheckEvent). */
+    AxlEventHandle  event_array[AXL_MAX_SOURCES + 3];
+    size_t          event_to_source[AXL_MAX_SOURCES + 3];
     size_t          fired_index;
     bool            has_idle;
 
@@ -292,6 +319,26 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             event_count++;
         }
 
+        /* Add the intrinsic ConIn keypress event ONLY when no user
+         * SOURCE_KEYPRESS source is active — otherwise the user source
+         * already has the same EFI_EVENT in event_array[] above and
+         * its dispatch path will read + screen for serial Ctrl-C. The
+         * intrinsic exists so a server with no key sources still wakes
+         * on a serial 0x03 and breaks. */
+        bool has_user_keypress = false;
+        for (size_t k = 0; k < loop->source_count; k++) {
+            if (loop->sources[k].active &&
+                loop->sources[k].type == SOURCE_KEYPRESS) {
+                has_user_keypress = true;
+                break;
+            }
+        }
+        if (!has_user_keypress && loop->keypress_event != NULL) {
+            event_to_source[event_count] = (size_t)-3;
+            event_array[event_count] = loop->keypress_event;
+            event_count++;
+        }
+
         if (axl_backend_event_wait(event_count, event_array,
                                    &fired_index) != 0) {
             return 1;
@@ -302,6 +349,22 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             _axl_signal_on_break();
             axl_loop_quit(loop);
             return -1;
+        }
+
+        /* Intrinsic keypress fired — read with shift state, intercept
+         * serial Ctrl-C (UnicodeChar=0x03 with KeyShiftState=0), drop
+         * everything else (no user source wants it). */
+        if (event_to_source[fired_index] == (size_t)-3) {
+            uint16_t scan = 0, uni = 0;
+            uint32_t shift = 0;
+            if (axl_backend_console_read_key_ex(&scan, &uni, &shift) == 0) {
+                if (uni == 0x03 && shift == 0) {
+                    _axl_signal_on_break();
+                    axl_loop_quit(loop);
+                    return -1;
+                }
+            }
+            return 1;
         }
 
         /* Poll timer fired — just a periodic wakeup */
@@ -330,6 +393,7 @@ axl_loop_dispatch_event(AxlLoop *loop)
     LoopSource      *src;
     bool             cont;
     AxlInputKey      akey;
+    uint32_t         dispatched_id;
 
     if (loop == NULL || loop->pending_source < 0) {
         return;
@@ -342,15 +406,43 @@ axl_loop_dispatch_event(AxlLoop *loop)
         return;
     }
 
+    /* Snapshot id so we can detect slot reuse during cb: a callback
+     * may remove this source and add another, and add_source can land
+     * in this same just-freed slot. Without this check the epilogue
+     * below would deactivate the new occupant. The remaining
+     * post-cb manipulation is safe to skip on reuse — we never
+     * own_event a SOURCE_EVENT, and SOURCE_TIMEOUT slots don't get
+     * reused mid-dispatch (timeouts don't trigger remove+add). */
+    dispatched_id = src->id;
+
     /* Dispatch based on source type */
     if (src->type == SOURCE_KEYPRESS) {
-        if (axl_backend_console_read_key(&akey.scan_code,
-                                         &akey.unicode_char) != 0) {
+        /* Read with shift state so we can screen for serial Ctrl-C
+         * (UnicodeChar=0x03, KeyShiftState=0 — what TerminalDxe emits
+         * over a wire that carries no shift bits). Intercepted here so
+         * a key source registered by the user doesn't have to know
+         * about the convention. */
+        uint32_t shift = 0;
+        if (axl_backend_console_read_key_ex(&akey.scan_code,
+                                            &akey.unicode_char,
+                                            &shift) != 0) {
+            return;
+        }
+        if (akey.unicode_char == 0x03 && shift == 0) {
+            _axl_signal_on_break();
+            axl_loop_quit(loop);
             return;
         }
         cont = src->fn.key_cb(akey, src->data);
     } else {
         cont = src->fn.cb(src->data);
+    }
+
+    /* Slot reused during cb? Skip epilogue — touching the new
+     * occupant would corrupt it. The cb that performed the
+     * remove+add already owns the new source's lifecycle. */
+    if (src->id != dispatched_id) {
+        return;
     }
 
     /* AXL_SOURCE_REMOVE: deactivate this source (loop continues).

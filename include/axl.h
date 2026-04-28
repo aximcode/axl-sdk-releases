@@ -5,10 +5,16 @@
  * axl.h:
  *
  * AXL — AximCode Library for UEFI.
- * A GLib-inspired C library. UTF-8 everywhere, standard C types.
+ *
+ * UEFI C library aimed at Linux systems C developers (glibc / GLib /
+ * systemd / libcurl audience) who don't want to learn EDK2 to ship
+ * a UEFI binary. UTF-8 everywhere, standard C types, snake_case
+ * functions, PascalCase types — the API shape carried over directly
+ * from GLib (AxlLoop ~= GMainLoop, AxlHashTable ~= GHashTable, etc).
+ * Public API never returns or accepts EFI_* types.
  *
  * This is the umbrella header. Include this one file to get the
- * entire AXL public API, like GLib's <glib.h>.
+ * entire AXL public API (analogous to GLib's <glib.h>).
  */
 
 #ifndef AXL_H

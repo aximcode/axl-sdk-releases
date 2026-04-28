@@ -53,7 +53,10 @@ main(int argc, char **argv)
     /* Send HTTP GET request */
     int n = axl_snprintf(request, sizeof(request),
         "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host);
-    axl_socket_send(sock, request, (size_t)n, 5000);
+    if (axl_socket_send(sock, request, (size_t)n, 5000) != 0) {
+        axl_printf("Send failed\n");
+        return 1;
+    }
 
     /* Receive response */
     resp_len = sizeof(response) - 1;
