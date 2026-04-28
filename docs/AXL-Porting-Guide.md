@@ -675,6 +675,17 @@ Note: AXL uses UTF-8 everywhere. No `L""` wide strings, no `CHAR16`.
 
 # For apps that need a DXE driver staged on disk alongside:
 ./scripts/run-qemu.sh --extra MyDriverDxe.efi myapp.efi
+
+# For "press a key to exit" stubs and other apps that need real
+# user input — hands the host TTY to QEMU's serial console.
+# Ctrl-A C drops to the QEMU monitor, Ctrl-A X quits.
+./scripts/run-qemu.sh --interactive myapp.efi
+
+# Drop into a UEFI shell with a host directory mounted as fsN:.
+# Build apps on the host, run them from the UEFI shell without
+# rebuilding the disk image each iteration. Requires virtiofsd
+# and an OVMF that ships VirtioFsDxe (modern builds do).
+./scripts/run-qemu.sh --interactive --mount ~/efi-apps
 ```
 
 `run-qemu.sh` also samples QEMU's host CPU during the run and

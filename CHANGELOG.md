@@ -3,6 +3,67 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.2.8 — 2026-04-28
+
+Two `scripts/run-qemu.sh` UX features for interactive UEFI app
+testing: `-i`/`--interactive` to hand the host TTY to the guest,
+and `--mount DIR` to expose a host directory as a virtiofs volume
+the UEFI shell sees as `fsN:`. Together they enable a
+"`./scripts/run-qemu.sh -i --mount ~/efi-apps`" loop where you
+build apps on the host and run them straight from the UEFI shell
+without rebuilding the disk image each iteration.
+
+### Added
+
+- **`run-qemu.sh --interactive` (`-i`)** — hands the host TTY to
+  QEMU so keystrokes reach the guest. Disables the timeout, the
+  CPU-spike sampler, and the ANSI-stripping post-filter (the guest
+  may legitimately emit cursor moves and colors). Mutually
+  exclusive with `--background` and `--screenshot`; composes
+  cleanly with `--gdb` (separate TCP port) and with
+  `--serial-log` (transcript captured via QEMU's chardev
+  `logfile=`). Auto-prints the Ctrl-A C / Ctrl-A X escape hints
+  on startup and installs an `EXIT`/`INT`/`TERM` trap that runs
+  `stty sane` so an abnormal QEMU exit doesn't leave the parent
+  shell in raw mode. Also skips the auto-`reset -s` in the
+  generated `startup.nsh` so users land back at the UEFI shell
+  after the app exits.
+- **Bare-shell mode** — `run-qemu.sh -i` with no `.efi` argument
+  boots OVMF straight into the UEFI Shell. Pairs with `--mount`
+  for a "drop me into a UEFI shell with my host filesystem"
+  workflow.
+- **`run-qemu.sh --mount DIR[:TAG]`** — exposes a host directory
+  to the guest as a virtiofs volume (default tag `hostfs`).
+  Spawns `virtiofsd` as a child, wires the QEMU `vhost-user-fs-pci`
+  device with a `memory-backend-file,share=on` over `/dev/shm`,
+  and adds `map -r` to `startup.nsh` so the volume shows up as
+  `fsN:` from the UEFI shell. Validates virtiofsd availability
+  and `/dev/shm` writability up-front with actionable error
+  messages (Fedora/Debian/Arch install hints; `VIRTIOFSD=` env
+  override). Opportunistically stages a sibling
+  `VirtioFsDxe.efi` from the EDK2 build alongside the firmware
+  if found — works against OVMF builds that don't have the
+  driver baked in. Composes with `--interactive`, `--gdb`,
+  `--background`, and an `.efi` arg (host-fs available alongside
+  the staged FAT). Trap kills virtiofsd on exit (foreground)
+  or emits `VIRTIOFSD_PID=` for the caller (background). Both
+  X64 and AARCH64 supported.
+- **`test/integration/test-run-qemu-flags.sh`** — host-only
+  argument-parsing tests for `run-qemu.sh` (syntax, `--help`,
+  mutual-exclusion guards, missing-file guard, `--mount`
+  validation).
+- **Alternate-screen buffer in `--interactive`** — the script
+  now emits `\e[?1049h` on stderr before exec'ing QEMU and
+  `\e[?1049l` on exit. UEFI's Terminal driver uses absolute
+  cursor positioning against an assumed 80x25 grid; against
+  larger SSH PTYs (MacBook Terminal/iTerm/WSL) it produced
+  artifacts where the shell prompt rendered mid-`ls` output.
+  Alt-screen gives UEFI a fresh canvas with no scrollback
+  interaction (same trick vim/less/htop use). Skipped when
+  stderr isn't a TTY so escape sequences don't pollute log
+  files. Pairs with the `mode <stty cols> <stty rows>` line
+  the script already emits in startup.nsh.
+
 ## 0.2.7 — 2026-04-28
 
 Polish release on top of 0.2.6 (cut earlier the same day). Two

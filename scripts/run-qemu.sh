@@ -28,6 +28,19 @@
 #                         Useful for breaking inside SecMain or PEI.
 #   --debugcon FILE       Capture OVMF DEBUG output (port 0x402) — required
 #                         for gdb-syms.py to recover module load addresses.
+#   -i, --interactive     Hand the host TTY to QEMU so keystrokes reach the
+#                         guest. Use for "press a key to exit" stubs and
+#                         other apps that need real user input. Disables
+#                         the timeout, the CPU-spike sampler, and the
+#                         ANSI-stripping post-filter. Mutually exclusive
+#                         with --background and --screenshot. Ctrl-A C
+#                         drops into the QEMU monitor; Ctrl-A X quits.
+#   --mount DIR[:TAG]     Expose host directory DIR to the guest as a
+#                         virtiofs volume (UEFI fsN: after `map -r`).
+#                         Requires virtiofsd, /dev/shm, and an OVMF
+#                         build that includes VirtioFsDxe (or a
+#                         standalone VirtioFsDxe.efi alongside the
+#                         firmware build). Default volume tag: hostfs.
 #   --no-cpu-warn         Disable the CPU-spike warning (on by default
 #                         in foreground mode; samples QEMU's host CPU
 #                         after the firmware-boot warm-up and prints
@@ -68,6 +81,10 @@ EFI_ARGS=()
 CPU_WARN=true
 CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
 CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
+INTERACTIVE=false
+MOUNT_DIR=""
+MOUNT_TAG="hostfs"
+MEM="512M"            # guest RAM (also used for memory-backend-file size)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -96,6 +113,17 @@ while [[ $# -gt 0 ]]; do
         --no-cpu-warn) CPU_WARN=false; shift ;;
         --cpu-threshold) CPU_THRESHOLD="$2"; shift 2 ;;
         --cpu-sustain) CPU_SUSTAIN="$2"; shift 2 ;;
+        -i|--interactive) INTERACTIVE=true; shift ;;
+        --mount)
+            # Accept "DIR" or "DIR:tag" — tag is the UEFI volume label
+            # virtiofs advertises (defaults to "hostfs"); rarely needed.
+            if [[ "$2" == *:* ]]; then
+                MOUNT_DIR="${2%:*}"
+                MOUNT_TAG="${2##*:}"
+            else
+                MOUNT_DIR="$2"
+            fi
+            shift 2 ;;
         -h|--help)
             cat <<'HELP'
 Usage: run-qemu.sh [OPTIONS] <file.efi> [args...]
@@ -126,12 +154,26 @@ Options:
                            window (10 s X64 / 15 s AARCH64).
   --cpu-threshold CORES    Override spike threshold (default 1.5 cores).
   --cpu-sustain SECS       Override sustain duration (default 2 s).
+  -i, --interactive        Attach the host TTY to QEMU's serial so the
+                           user can type into the guest. Disables the
+                           timeout, the CPU-spike sampler, and the
+                           ANSI-stripping post-filter. Mutually
+                           exclusive with --background and --screenshot.
+                           Ctrl-A C → QEMU monitor; Ctrl-A X → quit.
+  --mount DIR[:TAG]        Expose host directory DIR to the guest as
+                           a virtiofs volume. Mount with `map -r` from
+                           the UEFI shell; appears as fsN:. Requires
+                           virtiofsd, /dev/shm, and an OVMF build
+                           that includes (or ships) VirtioFsDxe.
   -h, --help               Show this help
 
 Examples:
   run-qemu.sh hello.efi
   run-qemu.sh --net --hostfwd 18080:8080 axl-webfs.efi serve -p 8080
   run-qemu.sh --net --extra axl-webfs-dxe.efi --nsh test.nsh axl-webfs.efi
+  run-qemu.sh --interactive noGPT.efi          # press-a-key stubs
+  run-qemu.sh -i --mount ~/efi-apps             # host fs at fsN:, shell prompt
+  run-qemu.sh --mount ~/efi-apps myapp.efi      # run myapp + host fs alongside
 HELP
             exit 0 ;;
         *)
@@ -145,21 +187,96 @@ HELP
 done
 
 if [[ -z "$EFI_FILE" ]]; then
-    echo "Usage: $0 [OPTIONS] <file.efi> [args...]  (try --help)" >&2
-    exit 1
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        # Bare-shell mode: no app to run, just boot OVMF + Shell.efi
+        # interactively so the user can poke around or `load` things
+        # off a --mount volume. Skipping EFI_FILE turns off the
+        # is-driver detection and any app-staging logic below.
+        :
+    else
+        echo "Usage: $0 [OPTIONS] <file.efi> [args...]  (try --help)" >&2
+        echo "  (or: $0 --interactive [--mount DIR] for a UEFI shell)" >&2
+        exit 1
+    fi
 fi
 
-if [[ ! -f "$EFI_FILE" ]]; then
+if [[ -n "$EFI_FILE" && ! -f "$EFI_FILE" ]]; then
     echo "ERROR: file not found: $EFI_FILE" >&2
     exit 1
 fi
 
-EFI_NAME="$(basename "$EFI_FILE")"
+# Interactive mode is incompatible with anything that captures or
+# multiplexes the serial console under another consumer. --gdb is
+# fine because the GDB stub lives on its own TCP port.
+if [[ "$INTERACTIVE" == "true" ]]; then
+    if [[ "$BACKGROUND" == "true" ]]; then
+        echo "ERROR: --interactive cannot be combined with --background" >&2
+        exit 1
+    fi
+    if [[ -n "$SCREENSHOT" ]]; then
+        echo "ERROR: --interactive cannot be combined with --screenshot" >&2
+        exit 1
+    fi
+    # The CPU-spike WARN line would interleave with whatever the user
+    # is reading. Disable the sampler unconditionally in interactive.
+    CPU_WARN=false
+fi
+
+# --mount: validate host-side dependencies up-front so we fail loudly
+# with actionable guidance instead of producing a guest with no fsN:
+# volume. The OVMF-driver check happens after find_firmware below.
+VIRTIOFSD_BIN=""
+if [[ -n "$MOUNT_DIR" ]]; then
+    if [[ ! -d "$MOUNT_DIR" ]]; then
+        echo "ERROR: --mount: '$MOUNT_DIR' is not a directory" >&2
+        exit 1
+    fi
+    # Resolve to an absolute path — virtiofsd needs one and the trap
+    # cleanup below uses it for diagnostic logging.
+    MOUNT_DIR="$(cd "$MOUNT_DIR" && pwd -P)"
+
+    # Locate virtiofsd. Distros disagree about where it lives.
+    for cand in \
+        "${VIRTIOFSD:-}" \
+        "$(command -v virtiofsd 2>/dev/null)" \
+        /usr/libexec/virtiofsd \
+        /usr/lib/qemu/virtiofsd \
+        /usr/lib/kvm/virtiofsd
+    do
+        if [[ -n "$cand" && -x "$cand" ]]; then
+            VIRTIOFSD_BIN="$cand"
+            break
+        fi
+    done
+    if [[ -z "$VIRTIOFSD_BIN" ]]; then
+        cat <<'EOF' >&2
+ERROR: --mount requires virtiofsd, but it was not found.
+
+  Install:
+    Fedora/RHEL/Alma:  sudo dnf install virtiofsd
+    Debian/Ubuntu:     sudo apt install virtiofsd
+    Arch:              sudo pacman -S virtiofsd
+
+  Or set VIRTIOFSD=/path/to/virtiofsd before running this script.
+EOF
+        exit 1
+    fi
+
+    # virtiofs uses a memory-backend-file with share=on. /dev/shm is the
+    # standard backing — fast (tmpfs), and KVM is happy mapping it.
+    if [[ ! -d /dev/shm || ! -w /dev/shm ]]; then
+        echo "ERROR: --mount needs a writable /dev/shm tmpfs (memory-backend-file)" >&2
+        exit 1
+    fi
+fi
+
+EFI_NAME=""
+[[ -n "$EFI_FILE" ]] && EFI_NAME="$(basename "$EFI_FILE")"
 [[ "$ARCH" == "AARCH64" ]] && TIMEOUT=$((TIMEOUT + 10))
 
 # Detect PE subsystem: 10=app, 11=boot driver, 12=runtime driver
 IS_DRIVER=false
-if command -v python3 &>/dev/null; then
+if [[ -n "$EFI_FILE" ]] && command -v python3 &>/dev/null; then
     SUBSYSTEM=$(python3 -c "
 import struct, sys
 with open(sys.argv[1], 'rb') as f:
@@ -179,6 +296,49 @@ find_firmware "$ARCH" || { echo "Firmware not found for $ARCH" >&2; exit 1; }
 SHELL_EFI=$(find_shell_efi "$ARCH") || true
 BOOT_NAME=$(boot_efi_name "$ARCH")
 
+# --mount: VirtioFsDxe needs to be in the guest. Modern OVMF/AAVMF
+# builds include it (the QEMU-bundled edk2-*-code.fd, recent EDK2
+# builds, most distro packages from 2023 onwards). Reliably detecting
+# its presence in the active FV is hard — DXE drivers live in an
+# LZMA-compressed FFS inside the FV, so a strings(1) sweep misses
+# them and proper detection requires uefiextract or equivalent.
+#
+# Pragmatic policy: opportunistically stage a standalone
+# VirtioFsDxe.efi if we can find one alongside the build (so older
+# OVMF works), and emit `load VirtioFsDxe.efi` in startup.nsh when
+# we did. If the firmware also has it integrated, the `load` is a
+# harmless duplicate. If neither path produces a driver, the only
+# symptom is fsN: not appearing in `map -r` from the shell — print
+# a hint at startup so the user knows to check.
+VFS_DRIVER_STAGE=""
+if [[ -n "$MOUNT_DIR" ]]; then
+    fw_dir="$(dirname "$FW_CODE")"
+    case "$ARCH" in
+        X64)     vfs_arch="X64" ;;
+        AARCH64) vfs_arch="AARCH64" ;;
+    esac
+    for cand in \
+        "$fw_dir/../$vfs_arch/VirtioFsDxe.efi" \
+        "$fw_dir/$vfs_arch/VirtioFsDxe.efi" \
+        "$fw_dir/VirtioFsDxe.efi"
+    do
+        if [[ -f "$cand" ]]; then
+            VFS_DRIVER_STAGE="$cand"
+            break
+        fi
+    done
+    if [[ -z "$VFS_DRIVER_STAGE" ]]; then
+        cat >&2 <<EOF
+[run-qemu] --mount: no standalone VirtioFsDxe.efi found alongside
+[run-qemu]   $FW_CODE
+[run-qemu]   Trusting the firmware to provide it. If 'map -r' from
+[run-qemu]   the UEFI shell shows no extra fsN: volume, your OVMF
+[run-qemu]   lacks VirtioFsDxe — rebuild it (OvmfPkg/VirtioFsDxe)
+[run-qemu]   or pass --extra path/to/VirtioFsDxe.efi explicitly.
+EOF
+    fi
+fi
+
 # Set up temp directory
 TMPDIR=$(mktemp -d)
 if [[ "$BACKGROUND" != "true" ]]; then
@@ -192,7 +352,13 @@ mkdir -p "$STAGING/EFI/BOOT"
 if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
     cp "$SHELL_EFI" "$STAGING/EFI/BOOT/$BOOT_NAME"
 fi
-cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+if [[ -n "$EFI_FILE" ]]; then
+    cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+fi
+# Stage VirtioFsDxe.efi if the active OVMF doesn't ship it integrated.
+if [[ -n "$VFS_DRIVER_STAGE" ]]; then
+    cp "$VFS_DRIVER_STAGE" "$STAGING/VirtioFsDxe.efi"
+fi
 
 # Stage extra files
 if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
@@ -215,16 +381,77 @@ if [[ -n "$CUSTOM_NSH" ]]; then
 else
     {
         echo "@echo -off"
+        # In interactive mode, pick a UEFI text mode whose ROW count
+        # matches the host terminal as closely as possible. UEFI's
+        # TerminalDxe registers six fixed modes (80x25, 80x50,
+        # 100x31, 128x40, 160x42, 240x56), and the shell's `mode`
+        # command requires an exact match.
+        #
+        # Why row-match matters: TerminalDxe tracks CursorRow and
+        # saturates it at MaxRow-1 when output scrolls. The host
+        # terminal's natural scroll is independent — its cursor
+        # stays at the bottom row of the visible viewport. When
+        # UEFI later emits an absolute SetCursorPosition (e.g. the
+        # shell backtracking one column to overwrite a `^N` color
+        # token in help text), it sends \e[<MaxRow>;<col>H. If
+        # host_rows > MaxRow, that jumps the host cursor BACKWARD
+        # into already-painted output → prompt-appears-mid-text
+        # artifact. Matching row counts keeps the two cursors in
+        # lockstep.
+        #
+        # `stty size` works inside SSH PTYs and WSL terminals.
+        # If it fails (no TTY, etc.), fall back to mode 100x31
+        # — best general-purpose default.
+        if [[ "$INTERACTIVE" == "true" ]]; then
+            # Use 100x31 (OVMF's default + verified to be in the
+            # registered mode list) so the `mode` line actually
+            # takes effect. TerminalDxe defines 6 modes upstream
+            # but OvmfPkg's PlatformBootManagerLib typically only
+            # exposes 80x25 and 100x31 — silent failure of e.g.
+            # `mode 80 50` was the cause of the prompt-mid-output
+            # artifact (UEFI stayed at 100x31 while the host-side
+            # alignment assumed 50). Fall back to 80x25 if the
+            # host can't fit 31 rows.
+            host_rows=0
+            if command -v stty &>/dev/null; then
+                tty_size=$(stty size 2>/dev/null) && [[ -n "$tty_size" ]] \
+                    && host_rows="${tty_size% *}"
+            fi
+            if [[ "$host_rows" =~ ^[0-9]+$ \
+                  && "$host_rows" -gt 0 \
+                  && "$host_rows" -lt 31 ]]; then
+                echo "mode 80 25 > NUL"
+            else
+                echo "mode 100 31 > NUL"
+            fi
+        fi
         echo "fs0:"
         echo "cd \\"
-        if [[ "$IS_DRIVER" == "true" ]]; then
+        # If we staged a standalone VirtioFsDxe.efi (firmware lacks it),
+        # load it before anything else so fsN: appears for the app and
+        # for any post-app shell prompt the user lands at. `connect -r`
+        # rebinds drivers to handles; `map -r` refreshes the volume
+        # table so the new fsN: shows up.
+        if [[ -n "$VFS_DRIVER_STAGE" ]]; then
+            echo "load VirtioFsDxe.efi"
+            echo "connect -r"
+            echo "map -r"
+        elif [[ -n "$MOUNT_DIR" ]]; then
+            # Driver is in firmware — still rescan so fsN: appears.
+            echo "map -r"
+        fi
+        if [[ -z "$EFI_FILE" ]]; then
+            : # bare-shell mode: no app, no reset, just stay at prompt
+        elif [[ "$IS_DRIVER" == "true" ]]; then
             echo "load $EFI_NAME"
         elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
             echo "$EFI_NAME ${EFI_ARGS[*]}"
         else
             echo "$EFI_NAME"
         fi
-        if [[ -z "$SCREENSHOT" && "$BACKGROUND" != "true" ]]; then
+        if [[ -n "$EFI_FILE" && -z "$SCREENSHOT" \
+              && "$BACKGROUND" != "true" \
+              && "$INTERACTIVE" != "true" ]]; then
             echo "reset -s"
         fi
     } > "$STAGING/startup.nsh"
@@ -333,7 +560,7 @@ cpu_summary() {
 }
 
 # Build QEMU command
-mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" 512M "$TMPDIR/vars.fd")
+mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 
 # GDB stub: -gdb tcp::PORT exposes the GDB protocol; -S starts the
@@ -373,6 +600,58 @@ if [[ -n "$DEBUGCON_LOG" ]]; then
           -global "isa-debugcon.iobase=0x402")
 fi
 
+# --mount: spawn virtiofsd and wire the vhost-user-fs PCI device into
+# QEMU. The shared-memory backend (memory-backend-file with share=on
+# over /dev/shm) is mandatory — vhost-user requires the guest RAM be
+# accessible from the daemon process, which only works through a
+# named/file-backed shared mapping. -numa node,memdev=mem binds the
+# entire guest RAM to that backend.
+#
+# Sandbox=none avoids the user-namespace dance (--sandbox=chroot in
+# rust virtiofsd uses unshare(), which fails without privileged
+# capabilities on locked-down hosts). For the dev-loop use case
+# we own the directory and don't need the extra isolation.
+VIRTIOFSD_PID=""
+if [[ -n "$MOUNT_DIR" ]]; then
+    VFS_SOCK="$TMPDIR/virtiofs.sock"
+    VFS_LOG="$TMPDIR/virtiofsd.log"
+    "$VIRTIOFSD_BIN" \
+        --socket-path="$VFS_SOCK" \
+        --shared-dir="$MOUNT_DIR" \
+        --sandbox=none \
+        --cache=auto \
+        > "$VFS_LOG" 2>&1 &
+    VIRTIOFSD_PID=$!
+
+    # Wait for the daemon to create its socket. virtiofsd is fast
+    # (~50 ms typical) but be lenient on slow hosts.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        [[ -S "$VFS_SOCK" ]] && break
+        sleep 0.1
+    done
+    if [[ ! -S "$VFS_SOCK" ]]; then
+        echo "ERROR: virtiofsd failed to start (no socket at $VFS_SOCK)" >&2
+        echo "--- virtiofsd output ---" >&2
+        cat "$VFS_LOG" >&2 || true
+        kill "$VIRTIOFSD_PID" 2>/dev/null || true
+        exit 1
+    fi
+
+    CMD+=(
+        -chardev "socket,id=axlvfs,path=$VFS_SOCK"
+        -device "vhost-user-fs-pci,queue-size=1024,chardev=axlvfs,tag=$MOUNT_TAG"
+        -object "memory-backend-file,id=axlmem,size=$MEM,mem-path=/dev/shm,share=on"
+        -numa "node,memdev=axlmem"
+    )
+fi
+
+# If --mount is active in foreground modes, extend the cleanup trap
+# so virtiofsd doesn't leak after QEMU exits. Background mode emits
+# the PID for the caller to manage instead (see below).
+if [[ -n "$VIRTIOFSD_PID" && "$BACKGROUND" != "true" ]]; then
+    trap 'kill '"$VIRTIOFSD_PID"' 2>/dev/null; rm -rf "'"$TMPDIR"'"' EXIT
+fi
+
 # Networking
 if [[ "$NET" == "true" ]]; then
     NETDEV="user,id=net0"
@@ -384,6 +663,109 @@ if [[ "$NET" == "true" ]]; then
     CMD+=(-device virtio-net-pci,netdev=net0 -netdev "$NETDEV")
 else
     CMD+=(-net none)
+fi
+
+# Interactive mode — hand the host TTY to QEMU. No pipeline, no
+# timeout, no ANSI strip, no CPU sampler. Ctrl-A C drops to the QEMU
+# monitor; Ctrl-A X quits. mux=on,signal=off lets QEMU handle Ctrl-C
+# as guest input rather than tearing itself down. logfile= preserves
+# the --serial-log transcript inline (raw bytes — interactive apps
+# may legitimately emit cursor moves and colors).
+if [[ "$INTERACTIVE" == "true" ]]; then
+    CHARDEV="stdio,id=axlcon0,mux=on,signal=off"
+    if [[ -n "$SERIAL_LOG" ]]; then
+        CHARDEV="$CHARDEV,logfile=$SERIAL_LOG"
+    fi
+    if [[ -n "$SERIAL_LOG_RAW" ]]; then
+        # Same backend, same content — keep both flags wired so users
+        # who already script around --serial-log-raw don't have to
+        # special-case interactive.
+        CHARDEV="$CHARDEV,logfile=$SERIAL_LOG_RAW"
+    fi
+    CMD+=(-chardev "$CHARDEV"
+          -serial chardev:axlcon0
+          -mon chardev=axlcon0
+          -display none
+          -no-reboot)
+
+    cat >&2 <<'HINT'
+[run-qemu] Interactive console — keystrokes go to the guest.
+[run-qemu]   Ctrl-A C  → QEMU monitor    Ctrl-A X  → quit
+[run-qemu]   Ctrl-A H  → monitor help    Ctrl-A ?  → key list
+HINT
+
+    # Set up the host terminal for the QEMU session:
+    #   1. Disable terminal-to-app reports that would otherwise
+    #      flow into the guest as fake keystrokes:
+    #        ?1004 — focus in/out reports (\e[I, \e[O — sent
+    #                when you click/switch to the terminal window)
+    #        ?2004 — bracketed paste markers (\e[200~ / \e[201~)
+    #        ?1000/1002/1003/1006 — mouse reporting modes
+    #      Modern shells (zsh, bash with bracketed-paste) enable
+    #      some of these by default; we inherit them as our
+    #      child process. Without disabling, the bytes show up
+    #      at the UEFI shell prompt as garbled input — most
+    #      visibly as "FS1:\> [I" on screen.
+    #   2. Switch to the alternate screen buffer (?1049) so
+    #      UEFI's absolute-cursor positioning paints on a fresh
+    #      canvas instead of clobbering scrollback. Same trick
+    #      vim/less/htop use. Original screen + scrollback come
+    #      back on exit.
+    #   3. Set DECSTBM scroll margins (\e[1;<N>r) to confine
+    #      vertical scroll to the same row count UEFI thinks
+    #      the screen has. UEFI's TerminalDxe saturates CursorRow
+    #      at MaxRow-1 during scroll; without DECSTBM, the host
+    #      keeps scrolling to row 50, but UEFI's later absolute
+    #      \e[<MaxRow>;<col>H jumps backward into stale output.
+    #      With DECSTBM, scroll stops at row N, host cursor
+    #      stays at row N, and UEFI's absolute moves to row N
+    #      land exactly where the host cursor is. Pick N to
+    #      match the UEFI mode we set in startup.nsh.
+    # Skipped when stderr isn't a TTY so log files don't get
+    # escape-sequence pollution.
+    altscreen_used=false
+    if [[ -t 2 ]]; then
+        # Use the same row count we'll request via `mode` in
+        # startup.nsh (100x31 normally, 80x25 when host < 31
+        # rows). DECSTBM's scroll region matches UEFI's grid;
+        # UEFI's saturate-at-MaxRow now lands on the same row
+        # as the host's natural-scroll cursor.
+        stbm_r=31
+        host_rows_for_stbm=0
+        if command -v stty &>/dev/null; then
+            tty_size=$(stty size 2>/dev/null) && [[ -n "$tty_size" ]] \
+                && host_rows_for_stbm="${tty_size% *}"
+        fi
+        if [[ "$host_rows_for_stbm" =~ ^[0-9]+$ \
+              && "$host_rows_for_stbm" -gt 0 \
+              && "$host_rows_for_stbm" -lt 31 ]]; then
+            stbm_r=25
+        fi
+        printf '\e[?1004l\e[?2004l\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1049h\e[H\e[2J\e[1;%dr\e[H' "$stbm_r" >&2
+        altscreen_used=true
+    fi
+
+    # QEMU puts the terminal into raw mode. If it dies abnormally
+    # (segfault, OOM, killed by the user) the parent shell is left
+    # without echo or line discipline. Restore on any exit path.
+    # Also kill virtiofsd if --mount spawned one (otherwise it'll
+    # outlive the QEMU process and hold the socket open).
+    cleanup_cmd='rm -rf "'"$TMPDIR"'"; stty sane 2>/dev/null || true'
+    [[ -n "$VIRTIOFSD_PID" ]] && \
+        cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
+    # On exit: reset DECSTBM scroll margins (\e[r), leave
+    # alt-screen, then re-enable focus and bracketed-paste
+    # reporting (most modern shells expect these on; we
+    # re-enable rather than try to detect what was on before,
+    # since terminals don't expose a query for "is mode X
+    # enabled"). Mouse modes stay off — almost no interactive
+    # shell uses them.
+    [[ "$altscreen_used" == "true" ]] && \
+        cleanup_cmd="$cleanup_cmd; printf '\\e[r\\e[?1049l\\e[?1004h\\e[?2004h' >&2"
+    trap "$cleanup_cmd" EXIT INT TERM
+
+    "${CMD[@]}"
+    exit $?
 fi
 
 # Screenshot mode
@@ -453,9 +835,10 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     echo "QEMU_PID=$QEMU_PID"
     echo "SERIAL_LOG=$LOG"
     [[ -n "$SERIAL_SOCKET" ]] && echo "SERIAL_SOCKET=$SERIAL_SOCKET"
+    [[ -n "$VIRTIOFSD_PID" ]] && echo "VIRTIOFSD_PID=$VIRTIOFSD_PID"
     echo "TMPDIR=$TMPDIR"
-    # Don't clean up — caller is responsible for killing QEMU and
-    # removing TMPDIR when done.
+    # Don't clean up — caller is responsible for killing QEMU (and
+    # virtiofsd, when --mount was used) and removing TMPDIR when done.
 
 # Normal foreground mode
 else

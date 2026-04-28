@@ -26,8 +26,8 @@
 
 #define AXL_VERSION_MAJOR   0
 #define AXL_VERSION_MINOR   2
-#define AXL_VERSION_PATCH   7
-#define AXL_VERSION_STRING  "0.2.7"
+#define AXL_VERSION_PATCH   8
+#define AXL_VERSION_STRING  "0.2.8"
 
 /* Encoded as 0xMMmmpp (major, minor, patch) for simple comparisons. */
 #define AXL_VERSION_NUMBER \
