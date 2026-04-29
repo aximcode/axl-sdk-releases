@@ -3,6 +3,23 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.3.1 — 2026-04-29
+
+CI fix on top of v0.3.0 (cut the same day). v0.3.0's release artifacts
+are functional — the bug only triggers on `argv == NULL`, which no
+real caller does — but the CI green-bar matters for consumers
+pinning against a tag.
+
+### Fixed
+
+- **`axl_subcommand_dispatch` clang-tidy null-deref** —
+  the early-help check `if (argc < 2 || argv[1] == NULL)` would
+  dereference a NULL `argv` when called with `argc >= 2 && argv == NULL`
+  (a technically-valid but unlikely shape that test harnesses
+  occasionally exercise). Add an explicit `argv == NULL` guard
+  short-circuiting the array access. CI was running clang-tidy
+  with `-warnings-as-errors='*'`.
+
 ## 0.3.0 — 2026-04-29
 
 Consumer-driven release for delldiags `do.efi` (the hardware-diagnostic

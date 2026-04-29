@@ -232,8 +232,13 @@ axl_subcommand_dispatch(
                ? basename_of(argv[0]) : "<app>";
     }
 
-    /* Empty / help / -h / --help → print help table. */
-    if (argc < 2 || argv[1] == NULL) {
+    /* Empty / help / -h / --help → print help table. The argv ==
+     * NULL guard handles the (technically valid, occasionally
+     * exercised by harnesses) case where main is invoked with
+     * argv = NULL — argc < 2 is true on a NULL argv too, but
+     * being explicit short-circuits clang-tidy's null-deref
+     * analyzer cleanly. */
+    if (argc < 2 || argv == NULL || argv[1] == NULL) {
         axl_subcommand_print_help(table, count, prog);
         return 0;
     }
