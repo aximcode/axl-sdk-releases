@@ -465,6 +465,18 @@ axl_smbios_read_baseboard(
     out->version       = axl_smbios_get_string_utf8(&t->Hdr, t->Version);
     out->serial_number = axl_smbios_get_string_utf8(&t->Hdr, t->SerialNumber);
     out->asset_tag     = axl_smbios_get_string_utf8(&t->Hdr, t->AssetTag);
+
+    /* BoardType lives at offset 0x0D of the formatted area — has been
+     * part of Type 2 since SMBIOS 2.0, so essentially always present.
+     * 0 = "not published" for the rare too-short record. The canonical
+     * server-blade detector is BoardType == 3 (NOT Type 3 chassis
+     * 0x1C/0x1D, which Dell BIOS doesn't reliably set). */
+    if (t->Hdr.Length > 0x0D) {
+        const uint8_t *b = (const uint8_t *)&t->Hdr;
+        out->board_type = b[0x0D];
+    } else {
+        out->board_type = AXL_SMBIOS_BOARD_TYPE_UNKNOWN;
+    }
     return 0;
 }
 
@@ -1094,4 +1106,285 @@ axl_smbios_read_onboard_device_ext(
     out->bus                   = b[0x09];
     out->device_function       = b[0x0A];
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// axl_smbios_strings_byte_len
+//
+// Walk from hdr+Length to the spec-required end-of-region 0x00 0x00.
+// Returns the byte count of the strings region (not including the
+// terminating extra NUL). Records with no strings are formatted-area
+// + 0x00 0x00, returning 0 here.
+// ---------------------------------------------------------------------------
+
+size_t
+axl_smbios_strings_byte_len(
+    AxlSmbiosHeader  *hdr
+    )
+{
+    if (hdr == NULL || hdr->Length < 4) {
+        return 0;
+    }
+    /* Bound the walk against the SMBIOS table memory range so a
+     * malformed record without a double-NUL doesn't run past the
+     * table end into adjacent memory. */
+    uint8_t *start;
+    uint8_t *end;
+    if (smbios_get_range(&start, &end) != 0) {
+        return 0;
+    }
+    uint8_t *base = (uint8_t *)hdr;
+    if (base < start || base >= end) {
+        return 0;
+    }
+    uint8_t *strings = base + hdr->Length;
+    if (strings + 1 >= end) {
+        return 0;
+    }
+    /* Empty-region special case: zero-string records emit just the
+     * two-byte "00 00" sentinel right after the formatted area, so
+     * strings[0] is already the terminator. Return 0 to match the
+     * documented "may be 0" behavior — distinct from the
+     * one-string-of-length-zero case (which can't exist; an empty
+     * string takes one byte, the NUL itself). */
+    if (strings[0] == 0x00 && strings[1] == 0x00) {
+        return 0;
+    }
+    /* Non-empty: scan for the double-NUL terminator. The strings
+     * region runs from `strings` up to and INCLUDING the NUL after
+     * the last string (offset P, where P is the position of the
+     * first NUL of the double-NUL pair). Length = P + 1. */
+    uint8_t *p = strings;
+    while (p + 1 < end) {
+        if (p[0] == 0x00 && p[1] == 0x00) {
+            return (size_t)(p - strings) + 1;
+        }
+        p++;
+    }
+    /* Malformed record: no end-of-region marker before the table
+     * runs out. Return what we walked rather than 0 — caller can
+     * still hexdump the partial region. */
+    return (size_t)(p - strings);
+}
+
+// ---------------------------------------------------------------------------
+// SMBIOS Type 9 (System Slots) spec-value decoders
+//
+// Pure spec lookups, no allocation, return a static const string or
+// NULL. Values match SMBIOS 3.7 Table 13 / EDK2 MdePkg/IndustryStandard/
+// SmBios.h. The "modern slot type" set referenced in dowin's fSlotType
+// (Init.cpp:3395) — OCP NIC, EDSFF, PCIe Gen 5/6 — is included.
+//
+// NOTE: an earlier draft of this table was lifted from delldiags'
+// cmd_bios.c, but a cross-check against EDK2's canonical enum
+// (MISC_SLOT_TYPE) and dowin's own SmBioslib.h SM9_TYPE_PCIE* defines
+// found that delldiags' table had values shifted by 4 (PCIe at 0xA1
+// instead of 0xA5) and labeled PCIe-Mini / U.2 codes (0x21-0x25) as
+// M.2 keys. This implementation uses the spec values; downstream
+// consumers that switch from their local decoder to
+// axl_smbios_slot_type_str will see corrected decoding for any
+// slot whose firmware reports a value the local table got wrong.
+// ---------------------------------------------------------------------------
+
+const char *
+axl_smbios_slot_type_str(
+    uint8_t type
+    )
+{
+    switch (type) {
+        /* Common legacy + transition values */
+        case 0x06: return "PCI";
+        case 0x07: return "PC Card (PCMCIA)";
+        case 0x0F: return "AGP";
+        case 0x10: return "AGP 2X";
+        case 0x11: return "AGP 4X";
+        case 0x12: return "PCI-X";
+        case 0x13: return "AGP 8X";
+
+        /* M.2 keys — true M.2 sockets at 0x14-0x17 (NOT 0x22-0x25;
+         * those are PCIe Mini / U.2). */
+        case 0x14: return "M.2 Socket 1-DP (Mech Key A)";
+        case 0x15: return "M.2 Socket 1-SD (Mech Key E)";
+        case 0x16: return "M.2 Socket 2 (Mech Key B)";
+        case 0x17: return "M.2 Socket 3 (Mech Key M)";
+
+        /* PCIe SFF-8639 / U.2 family at 0x1F, 0x20, 0x24, 0x25 */
+        case 0x1F: return "PCIe Gen 2 SFF-8639 (U.2)";
+        case 0x20: return "PCIe Gen 3 SFF-8639 (U.2)";
+        case 0x21: return "PCIe Mini 52-pin (CEM 2.0, with BSKO)";
+        case 0x22: return "PCIe Mini 52-pin (CEM 2.0, without BSKO)";
+        case 0x23: return "PCIe Mini 76-pin (CEM 2.0, Display-Mini)";
+        case 0x24: return "PCIe Gen 4 SFF-8639 (U.2)";
+        case 0x25: return "PCIe Gen 5 SFF-8639 (U.2)";
+
+        /* OCP NIC 3.0 + Prior */
+        case 0x26: return "OCP NIC 3.0 SFF";
+        case 0x27: return "OCP NIC 3.0 LFF";
+        case 0x28: return "OCP NIC Prior to 3.0";
+
+        /* CXL */
+        case 0x30: return "CXL Flexbus 1.0";
+
+        /* PCIe Gen 1 (the "PCIe" with no generation suffix). PCIe values
+         * occupy 0xA5 onwards, with each generation taking 6 codes:
+         * (no width, x1, x2, x4, x8, x16). 0xB7 is reserved between
+         * Gen 3 and Gen 4. */
+        case 0xA5: return "PCIe";
+        case 0xA6: return "PCIe x1";
+        case 0xA7: return "PCIe x2";
+        case 0xA8: return "PCIe x4";
+        case 0xA9: return "PCIe x8";
+        case 0xAA: return "PCIe x16";
+        case 0xAB: return "PCIe Gen 2";
+        case 0xAC: return "PCIe Gen 2 x1";
+        case 0xAD: return "PCIe Gen 2 x2";
+        case 0xAE: return "PCIe Gen 2 x4";
+        case 0xAF: return "PCIe Gen 2 x8";
+        case 0xB0: return "PCIe Gen 2 x16";
+        case 0xB1: return "PCIe Gen 3";
+        case 0xB2: return "PCIe Gen 3 x1";
+        case 0xB3: return "PCIe Gen 3 x2";
+        case 0xB4: return "PCIe Gen 3 x4";
+        case 0xB5: return "PCIe Gen 3 x8";
+        case 0xB6: return "PCIe Gen 3 x16";
+        /* 0xB7 reserved */
+        case 0xB8: return "PCIe Gen 4";
+        case 0xB9: return "PCIe Gen 4 x1";
+        case 0xBA: return "PCIe Gen 4 x2";
+        case 0xBB: return "PCIe Gen 4 x4";
+        case 0xBC: return "PCIe Gen 4 x8";
+        case 0xBD: return "PCIe Gen 4 x16";
+        case 0xBE: return "PCIe Gen 5";
+        case 0xBF: return "PCIe Gen 5 x1";
+        case 0xC0: return "PCIe Gen 5 x2";
+        case 0xC1: return "PCIe Gen 5 x4";
+        case 0xC2: return "PCIe Gen 5 x8";
+        case 0xC3: return "PCIe Gen 5 x16";
+        case 0xC4: return "PCIe Gen 6 and Beyond";
+
+        /* EDSFF — one code per form-factor family covering both
+         * size variants (E1.S + E1.L share 0xC5; E3.S + E3.L share 0xC6). */
+        case 0xC5: return "EDSFF E1 (E1.S, E1.L)";
+        case 0xC6: return "EDSFF E3 (E3.S, E3.L)";
+
+        default:   return NULL;
+    }
+}
+
+const char *
+axl_smbios_slot_width_str(
+    uint8_t bw
+    )
+{
+    /* SMBIOS spec Table 11 — Slot Data Bus Width. */
+    switch (bw) {
+        case 0x03: return "8b";
+        case 0x04: return "16b";
+        case 0x05: return "32b";
+        case 0x06: return "64b";
+        case 0x07: return "128b";
+        case 0x08: return "1x";
+        case 0x09: return "2x";
+        case 0x0A: return "4x";
+        case 0x0B: return "8x";
+        case 0x0C: return "12x";
+        case 0x0D: return "16x";
+        case 0x0E: return "32x";
+        default:   return NULL;
+    }
+}
+
+const char *
+axl_smbios_slot_usage_str(
+    uint8_t cu
+    )
+{
+    /* SMBIOS spec Table 12 — Current Usage. 0x05 is rendered as
+     * "CPU NOT INSTALLED" — Dell convention from
+     * dowin/Init.cpp:3833 + SmBioslib.h:391, which scripts grep for. */
+    switch (cu) {
+        case 0x01: return "Other";
+        case 0x02: return "Unknown";
+        case 0x03: return "Empty";
+        case 0x04: return "InUse";
+        case 0x05: return "CPU NOT INSTALLED";
+        default:   return NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SMBIOS Type 3 (Chassis) classification
+//
+// Reference: SMBIOS spec Table 17 + ADDF/Libs/SAL/AddfSAL.cpp:fIsNotebookSmbios
+// for the bucket assignments.
+//
+// Pitfalls worth a defense-in-tests:
+//   - 0x18 ("Sealed-case PC") is desktop/SFF, NOT server.
+//   - 0x23 — Dell convention is "Mongoose Mini PC", not IoT Gateway.
+// ---------------------------------------------------------------------------
+
+AxlSmbiosChassisClass
+axl_smbios_chassis_class(
+    uint8_t type
+    )
+{
+    /* Strip the 0x80 lock bit — the Type 3 type field stores it
+     * inline, but classification is on the low 7 bits. */
+    uint8_t t = type & 0x7F;
+
+    switch (t) {
+        case 0x00:                /* (invalid / not set) */
+        case 0x02:                /* Unknown (per spec) */
+            return AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN;
+
+        case 0x03:                /* Desktop */
+        case 0x04:                /* Low Profile Desktop */
+        case 0x05:                /* Pizza Box (legacy desktop variant) */
+        case 0x06:                /* Mini Tower */
+        case 0x07:                /* Tower */
+        case 0x18:                /* Sealed-case PC — desktop/SFF, NOT server.
+                                   * Worth a defense in tests because naive "is server"
+                                   * classifiers based on "anything 0x17-0x1F" would
+                                   * misclassify it. */
+            return AXL_SMBIOS_CHASSIS_CLASS_DESKTOP;
+
+        case 0x08:                /* Portable */
+        case 0x09:                /* LapTop */
+        case 0x0A:                /* Notebook */
+        case 0x0C:                /* Docking Station */
+        case 0x0E:                /* Sub Notebook */
+        case 0x1E:                /* Tablet */
+        case 0x1F:                /* Convertible */
+        case 0x20:                /* Detachable */
+            return AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK;
+
+        case 0x17:                /* Rack Mount Chassis */
+        case 0x19:                /* Multi-system Chassis */
+        case 0x1B:                /* Advanced TCA — server-class.
+                                   * (Some Dell decoders historically
+                                   * label this "Pizza Box"; per the
+                                   * canonical SMBIOS spec / EDK2,
+                                   * Pizza Box is 0x05 and 0x1B is
+                                   * Advanced TCA. Both are server form
+                                   * factors, so the bucket is right
+                                   * either way.) */
+        case 0x1C:                /* Blade */
+        case 0x1D:                /* Blade Enclosure */
+            return AXL_SMBIOS_CHASSIS_CLASS_SERVER;
+
+        case 0x21:                /* IoT Gateway */
+        case 0x22:                /* Embedded PC */
+        case 0x23:                /* Dell convention: Mongoose Mini PC.
+                                   * Worth a defense in tests because the SMBIOS spec
+                                   * calls it an embedded PC variant — naive "0x21 only"
+                                   * classifiers would miss it. */
+            return AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED;
+
+        /* Recognized chassis types outside the above buckets:
+         *   0x01 Other, 0x0B Hand Held, 0x0D All in One, 0x0F Space-saving,
+         *   0x10 Lunch Box, 0x11 Main Server Chassis (legacy), 0x12-0x16
+         *   expansion/raid/peripheral chassis, 0x1A Compact PCI, 0x24 Stick PC. */
+        default:
+            return AXL_SMBIOS_CHASSIS_CLASS_OTHER;
+    }
 }

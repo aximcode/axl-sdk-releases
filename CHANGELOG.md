@@ -3,6 +3,71 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 — 2026-04-29
+
+Second consumer-driven release for delldiags `do.efi` (cat 1 / 1.5 SMBIOS
+landed; this round is decoder-table consolidation). Pulls four pieces
+of SMBIOS spec-table machinery upstream so future spec-fixes propagate
+to every consumer via an SDK bump rather than a manual backport. The
+motivating fixes are the recent ones in dowin's `fSlotType`
+(`Init.cpp:3395`):
+- `0c558a930` (2024-09-25) — OCP NIC SFF/LFF + EDSFF E1.S/E1.L + E3.S/E3.L
+- `aab01c48d` / `569491b6c` (2025-03-27) — SMBIOS slot type 0x25 is Gen 5,
+  not Gen 4
+
+### Added
+
+- **`AxlSmbiosBaseboardInfo.board_type` field** + `AXL_SMBIOS_BOARD_TYPE_*`
+  enum — exposes the BoardType byte at offset 0x0D of Type 2. The
+  canonical "is this a server blade?" detector is `board_type == 3`,
+  NOT Type 3 chassis 0x1C/0x1D (which Dell BIOS doesn't reliably set
+  — see `ADDF/Libs/SAL/AddfSAL.cpp:fIsBladeSmbios`). 0 if not
+  published (rare; field has been part of Type 2 since spec 2.0).
+- **`axl_smbios_slot_type_str` / `axl_smbios_slot_width_str` /
+  `axl_smbios_slot_usage_str`** — Type 9 spec-value decoders. Pure
+  table lookups, no allocation, return a static const string or
+  NULL for unknowns (caller can fall back to raw "0x%02X").
+  Values match SMBIOS 3.7 spec / EDK2's `MISC_SLOT_TYPE` enum.
+  `slot_type_str` covers PCIe Gen 1..6 (`0xA5`-`0xC4`), M.2 Keys
+  A/E/B/M (`0x14`-`0x17`), PCIe Mini variants (`0x21`-`0x23`),
+  PCIe SFF-8639 / U.2 family Gen 2-5 (`0x1F`/`0x20`/`0x24`/`0x25`),
+  OCP NIC 3.0 SFF/LFF / Prior to 3.0 (`0x26`-`0x28`), and EDSFF
+  E1/E3 form factors (`0xC5`/`0xC6`). `slot_usage_str` renders
+  0x05 as "CPU NOT INSTALLED" — Dell convention from
+  `dowin/Init.cpp:3833` + `SmBioslib.h:391`, what every consumer's
+  scripts grep for. **Note**: an earlier draft drew from
+  delldiags' `axl-utils/do/cmd_bios.c` table, which had values
+  shifted by 4 from the spec (PCIe at `0xA1` instead of `0xA5`)
+  and labeled PCIe-Mini / U.2 codes (`0x22`-`0x25`) as M.2 keys.
+  This release uses the canonical spec values; downstream
+  consumers that switch from a local decoder to
+  `axl_smbios_slot_type_str` will see corrected decoding for any
+  slot whose firmware reports a value the local table got wrong.
+- **`axl_smbios_strings_byte_len(hdr)`** — byte length of the
+  inline strings region between the formatted area and the spec's
+  end-of-region double-NUL. Useful for "raw record" dumps that
+  need to know the full record span on disk including its strings
+  (e.g. dowin's `fDumpSmbios` PIMS-381674 fix). Bounded against
+  the SMBIOS table memory range so a malformed record without a
+  terminator can't run past the end.
+- **`AxlSmbiosChassisClass` enum + `axl_smbios_chassis_class(type)`** —
+  pure-spec interpretation of the Type 3 chassis byte into
+  `DESKTOP` / `NOTEBOOK` / `SERVER` / `EMBEDDED` / `OTHER` /
+  `UNKNOWN` buckets. Strips the 0x80 lock bit before classifying.
+  Vendor-specific overrides (sysId tables, PCI audio-device
+  probes, etc.) live in consumer code. Bucket assignments
+  match SMBIOS spec Table 17 +
+  `ADDF/Libs/SAL/AddfSAL.cpp:fIsNotebookSmbios`. Pitfalls
+  defended in tests:
+    - 0x18 ("Sealed-case PC") is **DESKTOP**, not server.
+    - 0x23 (Dell convention "Mongoose Mini PC") is **EMBEDDED**.
+
+### Test stats
+
+1598 unit tests passing (was 1555; 43 new across the four
+additions, including explicit pitfall coverage for the 0x18 and
+0x23 cases the consumer flagged).
+
 ## 0.3.1 — 2026-04-29
 
 CI fix on top of v0.3.0 (cut the same day). v0.3.0's release artifacts

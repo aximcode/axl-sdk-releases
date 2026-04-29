@@ -111,6 +111,34 @@ typedef struct {
     bool         has_uuid;        ///< false if UUID field is unset (all 0x00 or 0xFF)
 } AxlSmbiosSystemInfo;
 
+/// SMBIOS Type 2 BoardType values (Table 14). The canonical
+/// "is this a server blade?" detector — `BoardType == 3`. Type 3
+/// chassis 0x1C/0x1D blade bits are unreliable on real Dell firmware
+/// (see ADDF/Libs/SAL/AddfSAL.cpp:fIsBladeSmbios), so callers wanting
+/// blade detection should always check Type 2 BoardType, not Type 3.
+/// 0x00 is our "not published" sentinel (record too short to carry the
+/// BoardType byte at offset 0x0D, rare since the field has been part
+/// of Type 2 since spec 2.0). 0x02 is the spec's explicit "Unknown"
+/// — semantically distinct, but we expose both via the same UNKNOWN
+/// enum and let callers compare the raw byte against 0x02 directly
+/// if they care.
+enum {
+    AXL_SMBIOS_BOARD_TYPE_UNKNOWN              = 0x00,
+    AXL_SMBIOS_BOARD_TYPE_OTHER                = 0x01,
+    AXL_SMBIOS_BOARD_TYPE_SPEC_UNKNOWN         = 0x02,
+    AXL_SMBIOS_BOARD_TYPE_SERVER_BLADE         = 0x03,
+    AXL_SMBIOS_BOARD_TYPE_CONNECTIVITY_SWITCH  = 0x04,
+    AXL_SMBIOS_BOARD_TYPE_SYS_MGMT_MODULE      = 0x05,
+    AXL_SMBIOS_BOARD_TYPE_PROCESSOR_MODULE     = 0x06,
+    AXL_SMBIOS_BOARD_TYPE_IO_MODULE            = 0x07,
+    AXL_SMBIOS_BOARD_TYPE_MEMORY_MODULE        = 0x08,
+    AXL_SMBIOS_BOARD_TYPE_DAUGHTER_BOARD       = 0x09,
+    AXL_SMBIOS_BOARD_TYPE_MOTHERBOARD          = 0x0A,
+    AXL_SMBIOS_BOARD_TYPE_PROC_MEM_MODULE      = 0x0B,
+    AXL_SMBIOS_BOARD_TYPE_PROC_IO_MODULE       = 0x0C,
+    AXL_SMBIOS_BOARD_TYPE_INTERCONNECT_BOARD   = 0x0D,
+};
+
 /// Type 2 — Baseboard Information.
 typedef struct {
     const char  *manufacturer;
@@ -118,6 +146,10 @@ typedef struct {
     const char  *version;
     const char  *serial_number;
     const char  *asset_tag;
+    uint8_t      board_type;       ///< SMBIOS spec Table 14 (AXL_SMBIOS_BOARD_TYPE_*).
+                                   ///< 0 if firmware didn't publish (record too short
+                                   ///< to carry the field at offset 0x0D, which is rare —
+                                   ///< the field has been part of Type 2 since spec 2.0).
 } AxlSmbiosBaseboardInfo;
 
 /// Type 3 — System Enclosure / Chassis.
@@ -549,6 +581,125 @@ axl_smbios_find_next(
 AxlSmbiosHeader *
 axl_smbios_next(
     AxlSmbiosHeader  *prev   ///< previous result (NULL to start from beginning)
+);
+
+/**
+ * @brief Byte length of an SMBIOS record's string-region payload.
+ *
+ * Walks from `hdr->Length` to the spec's end-of-region double-NUL
+ * (0x00 0x00) and returns the number of bytes in the strings region —
+ * including each string's NUL terminator, excluding the final extra
+ * NUL that ends the region.
+ *
+ * For records with zero strings (formatted area immediately followed
+ * by the two-byte 0x00 0x00 sentinel), returns 0. NULL @a hdr returns 0.
+ *
+ * Useful for "raw record" dumps that need to know the full record
+ * span on disk including its inline strings.
+ *
+ * @return byte count of the strings region (may be 0).
+ */
+size_t
+axl_smbios_strings_byte_len(
+    AxlSmbiosHeader  *hdr  ///< SMBIOS table header
+);
+
+// ---------------------------------------------------------------------------
+// SMBIOS Type 9 (System Slots) spec-value decoders
+//
+// Pure spec-table lookups, no allocation, return a static const string
+// or NULL for unrecognized values. Callers that want to render unknown
+// values can fall back to printing raw "0x%02X".
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Slot type code → display string.
+ *
+ * Covers the full SMBIOS Table 13 enumeration including modern
+ * additions tracked by recent vendor fixes:
+ *   - PCIe Gen 1..6 (legacy 0xA1-0xA6, Gen 2-6 at 0xA7-0xBF)
+ *   - 0x25 — M.2 Socket 3 (Mech Key M) Gen 5 (the historical
+ *     "Gen 4 vs Gen 5" mismapping fixed in Dell aab01c48d)
+ *   - 0x26 / 0x27 / 0x28 — OCP NIC 3.0 SFF / LFF / Prior to 3.0
+ *     (Dell 0c558a930)
+ *   - 0x29 / 0x2A — EDSFF E1.S / E1.L
+ *   - 0x2B / 0x2C — EDSFF E3.S / E3.L
+ *   - 0x22 / 0x23 / 0x24 / 0x25 — M.2 Mech Keys A / E / B / M
+ *   - 0x06 / 0x07 / 0x0F — PCI / PCI-X / AGP
+ *
+ * @return static string, or NULL if @a type isn't a recognized value.
+ */
+const char *
+axl_smbios_slot_type_str(
+    uint8_t type   ///< SMBIOS Type 9 slot_type field
+);
+
+/**
+ * @brief Slot data-bus width code → display string ("1x", "8x", "16x", ...).
+ *
+ * SMBIOS Table 11. Returns NULL for unknown values.
+ */
+const char *
+axl_smbios_slot_width_str(
+    uint8_t bw   ///< SMBIOS Type 9 slot_data_bus_width field
+);
+
+/**
+ * @brief Slot current-usage code → display string.
+ *
+ * SMBIOS Table 12. Returns "Other" / "Unknown" / "Empty" / "InUse" /
+ * "CPU NOT INSTALLED". Note: 0x05 (Unavailable, per spec) is rendered
+ * as "CPU NOT INSTALLED" — that's the convention every Dell consumer
+ * (dowin/doDriver/dolin) emits and what their scripts grep for.
+ * Returns NULL for unknown values.
+ */
+const char *
+axl_smbios_slot_usage_str(
+    uint8_t cu   ///< SMBIOS Type 9 current_usage field
+);
+
+// ---------------------------------------------------------------------------
+// SMBIOS Type 3 (Chassis) classification
+// ---------------------------------------------------------------------------
+
+/// Coarse classification of an SMBIOS Type 3 chassis type byte.
+/// Pure-spec interpretation; vendor-specific overrides (e.g. "is server"
+/// detection that uses sysId tables or PCI audio-device probes on top
+/// of the spec class) live in consumer code.
+typedef enum {
+    AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN  = 0,
+    AXL_SMBIOS_CHASSIS_CLASS_DESKTOP,    ///< 0x03/04/05/06/07 — desktop / SFF / mini-tower / tower
+                                  ///<   (also 0x18 Sealed-case PC — desktop, NOT server)
+    AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK,   ///< 0x08/09/0A/0C/0E/1E/1F/20 — portable / laptop /
+                                  ///<   notebook / docking / sub-notebook / tablet /
+                                  ///<   convertible / detachable
+    AXL_SMBIOS_CHASSIS_CLASS_SERVER,     ///< 0x17/19/1B/1C/1D — rack / multi-system /
+                                  ///<   pizza box / blade / blade enclosure
+    AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,   ///< 0x21 IoT Gateway, 0x22 Embedded PC,
+                                  ///<   0x23 Mongoose Mini PC (Dell convention; the
+                                  ///<   spec calls it Embedded PC variant)
+    AXL_SMBIOS_CHASSIS_CLASS_OTHER,      ///< Recognized chassis type outside the above buckets
+} AxlSmbiosChassisClass;
+
+/**
+ * @brief Classify SMBIOS Type 3 chassis type into a coarse class.
+ *
+ * Pure-spec interpretation of the chassis-type byte. Strips the high
+ * 0x80 lock bit before classifying. See AxlSmbiosChassisClass for
+ * the bucket assignments.
+ *
+ * Pitfalls worth knowing:
+ *   - 0x18 ("Sealed-case PC") is desktop/SFF, not server.
+ *   - 0x23 is Dell's "Mongoose Mini PC" convention; the SMBIOS spec
+ *     calls it an embedded PC variant.
+ *
+ * @return matching AxlSmbiosChassisClass, or AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN
+ *         if @a type is 0 / out of range / explicitly the spec's
+ *         "Unknown" (0x02).
+ */
+AxlSmbiosChassisClass
+axl_smbios_chassis_class(
+    uint8_t type   ///< SMBIOS Type 3 type byte (lock bit allowed; will be stripped)
 );
 
 /**

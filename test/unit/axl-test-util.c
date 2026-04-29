@@ -567,6 +567,208 @@ test_smbios(void)
         test_check(AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT == 41,
                    "smbios: onboard_device_ext enum is 41");
     }
+
+    // ----- Type 2: board_type field on AxlSmbiosBaseboardInfo -----
+    {
+        AxlSmbiosBaseboardInfo bb;
+        if (axl_smbios_read_baseboard(&bb) == 0) {
+            /* board_type has been part of Type 2 since SMBIOS 2.0,
+             * so essentially always present on real firmware.
+             * 0x0A (motherboard) is by far the most common — most
+             * QEMU/OVMF setups report this. Accept any non-zero
+             * since we don't know the test environment's value. */
+            test_check(bb.board_type != AXL_SMBIOS_BOARD_TYPE_UNKNOWN,
+                       "smbios: baseboard board_type populated");
+        }
+        /* Enum sanity */
+        test_check(AXL_SMBIOS_BOARD_TYPE_SERVER_BLADE == 0x03,
+                   "smbios: BOARD_TYPE_SERVER_BLADE == 0x03");
+        test_check(AXL_SMBIOS_BOARD_TYPE_MOTHERBOARD == 0x0A,
+                   "smbios: BOARD_TYPE_MOTHERBOARD == 0x0A");
+    }
+
+    // ----- axl_smbios_strings_byte_len -----
+    {
+        /* BIOS Type 0 has at minimum vendor + version + release_date
+         * strings — region length must be > 0 on any real firmware. */
+        size_t n = axl_smbios_strings_byte_len(bios);
+        test_check(n > 0, "smbios: strings_byte_len bios > 0");
+
+        /* Tight check: walk the same region by hand. The byte count
+         * must equal the sum of (each string's strlen + 1 NUL) for
+         * every string in the record, and must NOT include the
+         * extra terminating NUL after the last string. */
+        size_t expected = 0;
+        for (uint8_t idx = 1; idx <= 255; idx++) {
+            const char *s = axl_smbios_get_string_utf8(bios, idx);
+            if (s == NULL || s[0] == '\0') {
+                /* axl_smbios_get_string_utf8 returns "" for
+                 * out-of-range indices, signalling end of region. */
+                break;
+            }
+            expected += axl_strlen(s) + 1;
+        }
+        test_check(n == expected,
+                   "smbios: strings_byte_len matches sum-of-strlen+NUL");
+
+        /* NULL hdr → 0 */
+        test_check(axl_smbios_strings_byte_len(NULL) == 0,
+                   "smbios: strings_byte_len NULL → 0");
+
+        /* Other typed records also produce sensible region lengths */
+        AxlSmbiosHeader *sys2 = axl_smbios_find(AXL_SMBIOS_TYPE_SYSTEM_INFO);
+        if (sys2 != NULL) {
+            size_t ns = axl_smbios_strings_byte_len(sys2);
+            /* System info typically has manufacturer + product + version
+             * + serial — must be at least 4 bytes (4 empty strings'
+             * NULs would still be 4 — but real firmware never publishes
+             * empty system info strings). */
+            test_check(ns > 0, "smbios: strings_byte_len system > 0");
+        }
+    }
+
+    // ----- Type 9 spec decoders -----
+    {
+        /* Canonical SMBIOS spec / EDK2 values. Many "consumer" slot
+         * tables (incl. an early version of delldiags' cmd_bios.c)
+         * had values shifted by 4 — rejecting that here. */
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xA5), "PCIe") == 0,
+                   "smbios: slot_type_str 0xA5 = PCIe");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xAA), "PCIe x16") == 0,
+                   "smbios: slot_type_str 0xAA = PCIe x16");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xAB), "PCIe Gen 2") == 0,
+                   "smbios: slot_type_str 0xAB = PCIe Gen 2");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xB1), "PCIe Gen 3") == 0,
+                   "smbios: slot_type_str 0xB1 = PCIe Gen 3");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xB8), "PCIe Gen 4") == 0,
+                   "smbios: slot_type_str 0xB8 = PCIe Gen 4");
+        test_check(axl_smbios_slot_type_str(0xB7) == NULL,
+                   "smbios: slot_type_str 0xB7 reserved → NULL");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xBE), "PCIe Gen 5") == 0,
+                   "smbios: slot_type_str 0xBE = PCIe Gen 5");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xC3), "PCIe Gen 5 x16") == 0,
+                   "smbios: slot_type_str 0xC3 = PCIe Gen 5 x16");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xC4),
+                              "PCIe Gen 6 and Beyond") == 0,
+                   "smbios: slot_type_str 0xC4 = PCIe Gen 6 and Beyond");
+
+        /* M.2 keys live at 0x14-0x17 (NOT 0x22-0x25 — those are
+         * PCIe-Mini and U.2 in the spec, a common consumer mislabel). */
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x14),
+                              "M.2 Socket 1-DP (Mech Key A)") == 0,
+                   "smbios: slot_type_str 0x14 = M.2 Mech Key A");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x17),
+                              "M.2 Socket 3 (Mech Key M)") == 0,
+                   "smbios: slot_type_str 0x17 = M.2 Mech Key M");
+
+        /* PCIe SFF-8639 / U.2 family — 0x25 is U.2 Gen 5, NOT M.2. */
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x25),
+                              "PCIe Gen 5 SFF-8639 (U.2)") == 0,
+                   "smbios: slot_type_str 0x25 = PCIe Gen 5 U.2 (NOT M.2)");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x24),
+                              "PCIe Gen 4 SFF-8639 (U.2)") == 0,
+                   "smbios: slot_type_str 0x24 = PCIe Gen 4 U.2");
+
+        /* OCP NIC 3.0 + Prior */
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x26), "OCP NIC 3.0 SFF") == 0,
+                   "smbios: slot_type_str 0x26 = OCP NIC 3.0 SFF");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x27), "OCP NIC 3.0 LFF") == 0,
+                   "smbios: slot_type_str 0x27 = OCP NIC 3.0 LFF");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0x28),
+                              "OCP NIC Prior to 3.0") == 0,
+                   "smbios: slot_type_str 0x28 = OCP NIC Prior to 3.0");
+
+        /* EDSFF: one code per family covering both size variants */
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xC5),
+                              "EDSFF E1 (E1.S, E1.L)") == 0,
+                   "smbios: slot_type_str 0xC5 = EDSFF E1");
+        test_check(axl_strcmp(axl_smbios_slot_type_str(0xC6),
+                              "EDSFF E3 (E3.S, E3.L)") == 0,
+                   "smbios: slot_type_str 0xC6 = EDSFF E3");
+
+        /* Unknown returns NULL (caller can fall back to raw hex) */
+        test_check(axl_smbios_slot_type_str(0xFF) == NULL,
+                   "smbios: slot_type_str unknown → NULL");
+        test_check(axl_smbios_slot_type_str(0x00) == NULL,
+                   "smbios: slot_type_str 0x00 → NULL");
+
+        /* Bus widths */
+        test_check(axl_strcmp(axl_smbios_slot_width_str(0x08), "1x") == 0,
+                   "smbios: slot_width_str 0x08 = 1x");
+        test_check(axl_strcmp(axl_smbios_slot_width_str(0x0D), "16x") == 0,
+                   "smbios: slot_width_str 0x0D = 16x");
+        test_check(axl_smbios_slot_width_str(0xFF) == NULL,
+                   "smbios: slot_width_str unknown → NULL");
+
+        /* Current usage — Dell convention "CPU NOT INSTALLED" for 0x05 */
+        test_check(axl_strcmp(axl_smbios_slot_usage_str(0x03), "Empty") == 0,
+                   "smbios: slot_usage_str 0x03 = Empty");
+        test_check(axl_strcmp(axl_smbios_slot_usage_str(0x04), "InUse") == 0,
+                   "smbios: slot_usage_str 0x04 = InUse");
+        test_check(axl_strcmp(axl_smbios_slot_usage_str(0x05),
+                              "CPU NOT INSTALLED") == 0,
+                   "smbios: slot_usage_str 0x05 = CPU NOT INSTALLED (Dell convention)");
+        test_check(axl_smbios_slot_usage_str(0xFF) == NULL,
+                   "smbios: slot_usage_str unknown → NULL");
+    }
+
+    // ----- Chassis classification -----
+    {
+        /* DESKTOP set */
+        test_check(axl_smbios_chassis_class(0x03) == AXL_SMBIOS_CHASSIS_CLASS_DESKTOP,
+                   "smbios: chassis_class 0x03 (Desktop) = DESKTOP");
+        test_check(axl_smbios_chassis_class(0x07) == AXL_SMBIOS_CHASSIS_CLASS_DESKTOP,
+                   "smbios: chassis_class 0x07 (Tower) = DESKTOP");
+        /* PITFALL: 0x18 is Sealed-case PC, NOT server */
+        test_check(axl_smbios_chassis_class(0x18) == AXL_SMBIOS_CHASSIS_CLASS_DESKTOP,
+                   "smbios: chassis_class 0x18 (Sealed-case PC) = DESKTOP, NOT server");
+
+        /* NOTEBOOK set */
+        test_check(axl_smbios_chassis_class(0x09) == AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK,
+                   "smbios: chassis_class 0x09 (LapTop) = NOTEBOOK");
+        test_check(axl_smbios_chassis_class(0x0A) == AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK,
+                   "smbios: chassis_class 0x0A (Notebook) = NOTEBOOK");
+        test_check(axl_smbios_chassis_class(0x1F) == AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK,
+                   "smbios: chassis_class 0x1F (Convertible) = NOTEBOOK");
+        test_check(axl_smbios_chassis_class(0x20) == AXL_SMBIOS_CHASSIS_CLASS_NOTEBOOK,
+                   "smbios: chassis_class 0x20 (Detachable) = NOTEBOOK");
+
+        /* SERVER set */
+        test_check(axl_smbios_chassis_class(0x17) == AXL_SMBIOS_CHASSIS_CLASS_SERVER,
+                   "smbios: chassis_class 0x17 (Rack Mount) = SERVER");
+        test_check(axl_smbios_chassis_class(0x1C) == AXL_SMBIOS_CHASSIS_CLASS_SERVER,
+                   "smbios: chassis_class 0x1C (Blade) = SERVER");
+        test_check(axl_smbios_chassis_class(0x1D) == AXL_SMBIOS_CHASSIS_CLASS_SERVER,
+                   "smbios: chassis_class 0x1D (Blade Enclosure) = SERVER");
+
+        /* EMBEDDED set */
+        test_check(axl_smbios_chassis_class(0x21) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
+                   "smbios: chassis_class 0x21 (IoT Gateway) = EMBEDDED");
+        /* PITFALL: 0x23 is Mongoose Mini PC (Dell), NOT IoT Gateway */
+        test_check(axl_smbios_chassis_class(0x23) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
+                   "smbios: chassis_class 0x23 (Mongoose Mini PC) = EMBEDDED");
+
+        /* UNKNOWN */
+        test_check(axl_smbios_chassis_class(0x00) == AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN,
+                   "smbios: chassis_class 0x00 = UNKNOWN");
+        test_check(axl_smbios_chassis_class(0x02) == AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN,
+                   "smbios: chassis_class 0x02 (Unknown per spec) = UNKNOWN");
+
+        /* Lock-bit (0x80) stripped before classification */
+        test_check(axl_smbios_chassis_class(0x80 | 0x07) == AXL_SMBIOS_CHASSIS_CLASS_DESKTOP,
+                   "smbios: chassis_class strips 0x80 lock bit");
+        test_check(axl_smbios_chassis_class(0x80 | 0x17) == AXL_SMBIOS_CHASSIS_CLASS_SERVER,
+                   "smbios: chassis_class lock bit | 0x17 = SERVER");
+
+        /* OTHER bucket (recognized but not in any of the 4 named buckets) */
+        test_check(axl_smbios_chassis_class(0x10) == AXL_SMBIOS_CHASSIS_CLASS_OTHER,
+                   "smbios: chassis_class 0x10 (Lunch Box) = OTHER");
+        test_check(axl_smbios_chassis_class(0x0D) == AXL_SMBIOS_CHASSIS_CLASS_OTHER,
+                   "smbios: chassis_class 0x0D (All in One) = OTHER");
+        /* Out-of-range */
+        test_check(axl_smbios_chassis_class(0x7F) == AXL_SMBIOS_CHASSIS_CLASS_OTHER,
+                   "smbios: chassis_class 0x7F = OTHER");
+    }
 }
 
 // ---------------------------------------------------------------------------

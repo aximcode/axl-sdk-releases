@@ -145,6 +145,38 @@ The legacy `axl_smbios_get_string(hdr, idx)` returns UCS-2 in a
 static buffer and is kept for back-compat; new code should use the
 UTF-8 variants.
 
+## Spec-Value Decoders
+
+Type 9 (System Slots) carries enumerated values for slot type, bus
+width, and current usage. The SDK ships pure-spec lookup tables so
+consumers don't reinvent the decoder (and so spec additions like
+EDSFF E1.S/E1.L, OCP NIC 3.0, PCIe Gen 5/6 propagate via SDK bumps):
+
+```c
+AxlSmbiosSystemSlot sl;
+if (axl_smbios_read_system_slot(h, &sl) == 0) {
+    const char *t = axl_smbios_slot_type_str(sl.slot_type);   // "PCIe Gen 5 x16"
+    const char *w = axl_smbios_slot_width_str(sl.slot_data_bus_width); // "16x"
+    const char *u = axl_smbios_slot_usage_str(sl.current_usage);       // "InUse"
+    axl_printf("%s  %s %s%s\n", sl.designation,
+               t ? t : "(unknown)",
+               w ? w : "(unknown)",
+               u ? u : "(unknown)");
+}
+```
+
+Unknown values return NULL so callers can fall back to printing raw
+"0x%02X". `slot_usage_str(0x05)` returns the Dell-convention
+"CPU NOT INSTALLED" string (rather than the spec's "Unavailable")
+that consumer scripts grep for.
+
+`axl_smbios_chassis_class(type)` classifies the Type 3 chassis byte
+into a coarse `AxlSmbiosChassisClass` (DESKTOP / NOTEBOOK / SERVER /
+EMBEDDED / OTHER / UNKNOWN). Two pitfalls worth knowing:
+0x18 ("Sealed-case PC") is DESKTOP, not server; 0x23 is Dell's
+"Mongoose Mini PC" convention. Vendor-specific server detection
+(sysId tables, PCI audio probes) lives in consumer code on top.
+
 ## Walking the Table
 
 `axl_smbios_find(type)` returns the first record of a given type;
