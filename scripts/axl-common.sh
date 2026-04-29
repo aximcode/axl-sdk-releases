@@ -14,10 +14,16 @@ AXL_DIR="${AXL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # --------------------------------------------------------------------------
 # Defaults — override via environment
+#
+# QEMU_DIR / MKIMAGE_DIR are intentionally NOT defaulted here.
+# find_qemu() does a 3-tier search:
+#   1. Honor an explicit QEMU_DIR override (power-user opt-in)
+#   2. command -v on $PATH (system install — apt/dnf qemu-system-*)
+#   3. Fall back to $HOME/projects/qemu/install/bin (legacy custom build)
+# Hard-coding the legacy path as a default broke downstream consumers
+# (delldiags axl-utils, etc.) on machines that have system QEMU/OVMF
+# installed via the package manager but no AXL custom build tree.
 # --------------------------------------------------------------------------
-
-QEMU_DIR="${QEMU_DIR:-$HOME/projects/qemu/install/bin}"
-MKIMAGE_DIR="${MKIMAGE_DIR:-$HOME/projects/mkimage}"
 
 # --------------------------------------------------------------------------
 # Colors and logging
@@ -104,7 +110,11 @@ build_qemu_base_cmd() {
 # --------------------------------------------------------------------------
 # find_qemu — locate QEMU binary for a given architecture
 # Usage: QEMU_BIN=$(find_qemu <arch>) || exit 1
-# Priority: $QEMU_DIR > system PATH > /usr/libexec
+#
+# 3-tier search:
+#   1. $QEMU_DIR (explicit power-user override)
+#   2. command -v on $PATH (system install — apt/dnf qemu-system-*)
+#   3. $HOME/projects/qemu/install/bin (legacy AXL custom build)
 # --------------------------------------------------------------------------
 
 find_qemu() {
@@ -120,13 +130,13 @@ find_qemu() {
             ;;
     esac
 
-    # $QEMU_DIR (from env, defaults to ~/projects/qemu/install/bin)
+    # 1. Explicit override
     if [[ -n "${QEMU_DIR:-}" && -x "$QEMU_DIR/$binary" ]]; then
         echo "$QEMU_DIR/$binary"
         return 0
     fi
 
-    # System install (CI runners, distro packages) — search PATH.
+    # 2. System install — search PATH
     if command -v "$binary" &>/dev/null; then
         local resolved
         resolved=$(command -v "$binary")
@@ -138,8 +148,32 @@ find_qemu() {
         return 0
     fi
 
-    log_error "$binary not found at \${QEMU_DIR}=${QEMU_DIR:-<unset>} or on \$PATH"
-    log_error "Install QEMU (apt/dnf install qemu-system-x86) or set QEMU_DIR"
+    # 3. Legacy AXL custom build (last resort, kept so existing
+    # power-user setups that don't set QEMU_DIR keep working)
+    if [[ -x "$HOME/projects/qemu/install/bin/$binary" ]]; then
+        QEMU_DIR="$HOME/projects/qemu/install/bin"
+        export QEMU_DIR
+        echo "$QEMU_DIR/$binary"
+        return 0
+    fi
+
+    cat >&2 <<EOF
+[ERROR] $binary not found in \$PATH or any known location.
+
+  Install:
+    Debian/Ubuntu:  sudo apt install qemu-system-x86 qemu-system-arm \\
+                                     ovmf qemu-efi-aarch64 \\
+                                     virtiofsd mtools dosfstools
+    Fedora/RHEL:    sudo dnf install qemu-system-x86 qemu-system-aarch64 \\
+                                     edk2-ovmf edk2-aarch64 \\
+                                     virtiofsd mtools dosfstools
+    Arch:           sudo pacman -S qemu-system-x86 qemu-system-aarch64 \\
+                                   edk2-ovmf edk2-armvirt \\
+                                   virtiofsd mtools dosfstools
+    macOS:          brew install qemu
+
+  Or set QEMU_DIR=/path/to/your/qemu/install/bin
+EOF
     return 1
 }
 
@@ -152,7 +186,13 @@ find_qemu() {
 
 find_firmware() {
     local arch="$1"
-    local qemu_share="${QEMU_DIR%/bin}/share/qemu"
+    # QEMU_DIR may be unset if find_firmware/find_shell_efi is called
+    # before find_qemu has populated it. Use the :- default to keep
+    # `set -u` safe; with QEMU_DIR="" the qemu_share resolves to
+    # "/share/qemu" which won't match any real path — fine, the
+    # function falls through to the system-package locations.
+    local qemu_dir="${QEMU_DIR:-}"
+    local qemu_share="${qemu_dir%/bin}/share/qemu"
 
     case "$arch" in
         X64)
@@ -192,8 +232,19 @@ find_firmware() {
                 FW_VARS=/usr/share/edk2-ovmf/x64/OVMF_VARS.fd
                 return 0
             fi
-            log_error "OVMF firmware not found"
-            log_error "Set OVMF_CODE or install: dnf install edk2-ovmf / apt install ovmf"
+            cat >&2 <<'EOF'
+[ERROR] OVMF firmware not found in any known location.
+
+  Searched: /usr/share/edk2/ovmf, /usr/share/OVMF, /usr/share/edk2-ovmf
+
+  Install:
+    Debian/Ubuntu:  sudo apt install ovmf
+    Fedora/RHEL:    sudo dnf install edk2-ovmf
+    Arch:           sudo pacman -S edk2-ovmf
+    macOS:          brew install qemu  # bundles edk2-x86_64-code.fd
+
+  Or set OVMF_CODE=/path/to/OVMF_CODE.fd (and OVMF_VARS=/path/to/OVMF_VARS.fd)
+EOF
             return 1
             ;;
         AARCH64)
@@ -221,8 +272,18 @@ find_firmware() {
                 FW_VARS=/usr/share/AAVMF/AAVMF_VARS.fd
                 return 0
             fi
-            log_error "AAVMF firmware not found"
-            log_error "Set AAVMF_CODE or install: dnf install edk2-aarch64 / apt install qemu-efi-aarch64"
+            cat >&2 <<'EOF'
+[ERROR] AAVMF firmware not found in any known location.
+
+  Searched: /usr/share/edk2/aarch64, /usr/share/AAVMF
+
+  Install:
+    Debian/Ubuntu:  sudo apt install qemu-efi-aarch64
+    Fedora/RHEL:    sudo dnf install edk2-aarch64
+    Arch:           sudo pacman -S edk2-armvirt
+
+  Or set AAVMF_CODE=/path/to/QEMU_EFI.fd (and AAVMF_VARS=/path/to/QEMU_VARS.fd)
+EOF
             return 1
             ;;
         *)
@@ -285,7 +346,13 @@ find_shell_efi() {
     # The active FW_CODE may not contain an extractable Shell.efi (some
     # system-packaged builds use a format uefiextract can't parse), so
     # also try the QEMU-bundled firmware as a fallback.
-    local qemu_share="${QEMU_DIR%/bin}/share/qemu"
+    # QEMU_DIR may be unset if find_firmware/find_shell_efi is called
+    # before find_qemu has populated it. Use the :- default to keep
+    # `set -u` safe; with QEMU_DIR="" the qemu_share resolves to
+    # "/share/qemu" which won't match any real path — fine, the
+    # function falls through to the system-package locations.
+    local qemu_dir="${QEMU_DIR:-}"
+    local qemu_share="${qemu_dir%/bin}/share/qemu"
     local fw_candidates=("$FW_CODE")
     case "$arch" in
         X64)     [[ -f "$qemu_share/edk2-x86_64-code.fd" ]] && \

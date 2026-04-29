@@ -3,6 +3,71 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.2.9 — 2026-04-28
+
+Downstream-consumer release. The motivating case is delldiags
+axl-utils, which needs `run-qemu.sh` and the host-side helpers
+on machines that have system QEMU/OVMF installed via the package
+manager but can't `git clone` the SDK source (corporate MITM
+proxies break TLS verification on `git clone`; a pinned
+`curl` + `sha256sum` doesn't). Four changes:
+
+### Added
+
+- **`axl-sdk-host-tools.tar.gz` and `axl-sdk-host-tools.deb`
+  release artifacts** — flat tarball plus an installable .deb
+  carrying just the host-side runtime tooling: `run-qemu.sh`,
+  `axl-common.sh`, the ELF/PE linker scripts, `gdb-syms.py`,
+  `pe-set-debug.c`, `rsod-decode.py`, and `uefi-manifest.json5`.
+  The .deb declares `Depends: qemu-system-x86 qemu-system-arm
+  ovmf qemu-efi-aarch64 virtiofsd mtools dosfstools` so a
+  single `sudo apt install ./axl-sdk-host-tools.deb` brings the
+  whole pipeline. Drops scripts to `/usr/share/axl-sdk-host-tools/scripts/`
+  with an `/usr/bin/run-qemu` wrapper on PATH. The tarball
+  ships scripts at `scripts/` for unprivileged extraction
+  anywhere. CI smoke-tests the .deb install end-to-end.
+
+### Changed
+
+- **`scripts/axl-common.sh` discovery is now a 3-tier search.**
+  Previously `QEMU_DIR` defaulted to `$HOME/projects/qemu/install/bin`,
+  which broke for downstream consumers without that custom
+  build tree. New order: (1) explicit `$QEMU_DIR` override,
+  (2) `command -v qemu-system-*` on `$PATH` (system install),
+  (3) the legacy `$HOME/projects/qemu/install/bin` path as
+  last-resort fallback. `MKIMAGE_DIR` lost its default
+  similarly — left unset means the script falls through to
+  the mtools recipe (already the working default for
+  consumers without the AXL mkimage tree). Power-user
+  override semantics preserved.
+
+- **Actionable error messages from `find_qemu` / `find_firmware`.**
+  Missing dependencies now print the apt/dnf/pacman/brew
+  install one-liners users can copy-paste, plus the env-var
+  override hint, instead of a one-line "not found" log:
+
+  ```
+  [ERROR] qemu-system-x86_64 not found in $PATH or any known location.
+
+    Install:
+      Debian/Ubuntu:  sudo apt install qemu-system-x86 qemu-system-arm \
+                                       ovmf qemu-efi-aarch64 \
+                                       virtiofsd mtools dosfstools
+      Fedora/RHEL:    sudo dnf install qemu-system-x86 ...
+      Arch:           sudo pacman -S qemu-system-x86 ...
+      macOS:          brew install qemu
+
+    Or set QEMU_DIR=/path/to/your/qemu/install/bin
+  ```
+
+  Same shape for missing OVMF / AAVMF.
+
+- **README install path no longer leads with `git clone`.** The
+  binary `.deb`/`.rpm` is now the recommended consumer path;
+  source builds are documented as the power-user option further
+  down. Adds the new host-tools tarball/.deb to the install
+  matrix.
+
 ## 0.2.8 — 2026-04-28
 
 Two `scripts/run-qemu.sh` UX features for interactive UEFI app

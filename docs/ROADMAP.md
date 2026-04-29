@@ -890,6 +890,27 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 ### Host Tools (scripts/)
 
 - [x] rsod-decode.py — UEFI crash dump (RSOD) decoder with MAP file support
+- [x] run-qemu.sh `--interactive` + `--mount` — interactive UEFI shell
+      with virtiofs host-fs mount (v0.2.8)
+- [x] axl-sdk-host-tools tarball + .deb — packaged for downstream
+      consumers without source clone (v0.2.9)
+- [ ] **Fold `qemu_launch` into `run-qemu.sh` as a daemon-lifecycle
+      mode.** uefi-devkit's `common.sh` currently provides
+      `qemu_launch {start|stop|status|logs}` — a long-running QEMU
+      lifecycle manager used by softbmc, videoterm, uefi-ipmitool
+      for BMC/server-style components. run-qemu.sh's `--background`
+      mode is bare-bones (just emits PID/SOCKET to stdout). Plan:
+      add `run-qemu.sh --start --name=foo`, `--stop --name=foo`,
+      `--status --name=foo`, `--logs --name=foo` with the same
+      file-layout convention `qemu_launch` uses (build/qemu/<name>.{pid,sock,log,qcow2,vars.fd}).
+      Then convert uefi-devkit's `qemu_launch` to a thin wrapper
+      around the host-tools `run-qemu.sh`, retiring the duplicate
+      QEMU-invocation code path.
+
+      Migration: v0.3.x once consumers (softbmc, videoterm,
+      uefi-ipmitool) have been updated to reference the
+      consolidated invocation. axl-common.sh stays put as the
+      shared discovery library — no churn for downstream.
 
 ---
 

@@ -170,12 +170,49 @@ of the glibc baggage gets linked into your `.efi`.
 `https://github.com/aximcode/axl-sdk-releases/releases/download/v<version>/<file>`.
 Each release publishes a `SHA256SUMS` alongside the packages.
 
-**Build from source:** `git clone https://github.com/aximcode/axl-sdk-releases.git`
+**Air-gapped / corporate MITM:** the binary tarballs verify
+against `SHA256SUMS` with `curl -kfsSLO`, no `git clone` over
+HTTPS required:
+
+```bash
+curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk.deb
+curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS && sudo apt install ./axl-sdk.deb
+```
+
+**Build from source (power-user):** for working on the SDK
+itself, or platforms without a binary package:
+`git clone https://github.com/aximcode/axl-sdk-releases.git`
 (checkout a `v*` tag for a specific release), or download the
 **Source code (tar.gz)** archive linked on each
 [release page](https://github.com/aximcode/axl-sdk-releases/releases),
 then run `./scripts/install.sh --prefix /opt/axl-sdk` for the
 same FHS layout under `/opt/axl-sdk/`.
+
+### Host-side QEMU testing tooling
+
+For **downstream consumers** who want `run-qemu.sh` and friends
+to test their UEFI apps under QEMU but don't need the build-side
+SDK (no `axl-cc`, no library), there's a separate tarball
+and `.deb`:
+
+```bash
+# Debian/Ubuntu (.deb pulls system QEMU + OVMF + virtiofsd):
+curl -LO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-host-tools.deb
+sudo apt install ./axl-sdk-host-tools.deb
+run-qemu my-app.efi
+
+# Any distro (tarball — install QEMU/OVMF separately):
+curl -kfsSLO https://github.com/aximcode/axl-sdk-releases/releases/latest/download/axl-sdk-host-tools.tar.gz
+mkdir -p ~/axl-sdk-host-tools && tar xf axl-sdk-host-tools.tar.gz -C ~/axl-sdk-host-tools
+~/axl-sdk-host-tools/scripts/run-qemu.sh my-app.efi
+```
+
+Discovery falls through `$QEMU_DIR` → `$PATH` → legacy custom
+build, so the tarball Just Works against the system QEMU/OVMF
+package on Debian, Ubuntu, Fedora, RHEL, Alma, and Arch. Missing
+dependencies print actionable `apt`/`dnf`/`pacman`/`brew`
+install commands.
 
 ### Pre-built UEFI tools (USB-stick use)
 
