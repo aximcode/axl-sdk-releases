@@ -706,6 +706,244 @@ axl_strtou64_with_offset(
 );
 
 // ---------------------------------------------------------------------------
+// AxlStrReader — cursor-based string parser
+//
+// Symmetric counterpart to AxlString (the builder). A reader BORROWS a
+// `const char *` (no allocation, no ownership) and tracks a cursor with
+// a sticky-error flag. Operations short-circuit when `ok` is false, so
+// chains compose naturally without per-call error checking:
+//
+//     AxlStrReader r;
+//     uint64_t v;
+//     axl_str_reader_init(&r, "N[03A8]");
+//     axl_str_reader_consume_char(&r, 'N');
+//     axl_str_reader_consume_char(&r, '[');
+//     axl_str_reader_take_u64(&r, 16, &v);
+//     axl_str_reader_consume_char(&r, ']');
+//     if (!r.ok || !axl_str_reader_eof(&r)) { ...parse failed... }
+//
+// For one-shot fixed-pattern parses, axl_sscanf below is a convenience
+// wrapper built on top of this same primitive.
+// ---------------------------------------------------------------------------
+
+/// Cursor parser state. Initialize via axl_str_reader_init / _init_n.
+/// Fields are exposed for convenience inspection (`r.ok`, `r.p`); don't
+/// mutate them directly outside the helpers.
+typedef struct {
+    const char  *p;     ///< Current position (may equal end at EOF)
+    const char  *end;   ///< One-past-last byte (sentinel)
+    bool         ok;    ///< Sticky-error: false ⇒ a prior op failed,
+                        ///< all subsequent ops short-circuit no-op
+} AxlStrReader;
+
+/**
+ * @brief Initialize a reader from a NUL-terminated string.
+ *
+ * NULL @a s yields a reader at EOF with @a ok = true (consumers see
+ * "nothing to parse, no error" — typically distinguished by checking
+ * eof() AND remaining() before relying on a successful parse).
+ */
+void
+axl_str_reader_init(
+    AxlStrReader  *r,
+    const char    *s
+);
+
+/**
+ * @brief Initialize a reader from a length-bounded buffer.
+ *
+ * Use when the input is not NUL-terminated (slice into a larger buffer,
+ * embedded NULs allowed). NULL @a s with @a n > 0 is a programming error
+ * and yields an at-EOF reader with @a ok = false.
+ */
+void
+axl_str_reader_init_n(
+    AxlStrReader  *r,
+    const char    *s,
+    size_t         n
+);
+
+/// True iff the cursor is at end-of-input. NULL @a r returns true.
+bool
+axl_str_reader_eof(
+    const AxlStrReader *r
+);
+
+/// Bytes between the cursor and end. 0 at EOF or NULL @a r.
+size_t
+axl_str_reader_remaining(
+    const AxlStrReader *r
+);
+
+/// Peek the next byte without advancing. Returns 0 at EOF or when the
+/// reader is in error state — distinguish via eof() if a 0 byte is
+/// legitimate input.
+char
+axl_str_reader_peek(
+    const AxlStrReader *r
+);
+
+/**
+ * @brief Skip whitespace (' ', '\t', '\r', '\n', '\f', '\v').
+ *
+ * Always succeeds (skipping zero bytes is fine). Doesn't touch ok.
+ * Use this between fields where the input grammar allows whitespace.
+ */
+bool
+axl_str_reader_skip_ws(
+    AxlStrReader *r
+);
+
+/**
+ * @brief Consume a literal character.
+ *
+ * On match, advances past it and returns true. On mismatch (or EOF, or
+ * prior error), sets @a ok = false and returns false; the cursor is not
+ * advanced. Idempotent in the sense that ok-false reader stays ok-false.
+ */
+bool
+axl_str_reader_consume_char(
+    AxlStrReader  *r,
+    char           c
+);
+
+/**
+ * @brief Consume an exact literal string.
+ *
+ * Sets @a ok = false on mismatch (no partial consume). NULL or empty
+ * @a literal is a no-op that returns true.
+ */
+bool
+axl_str_reader_consume_str(
+    AxlStrReader  *r,
+    const char    *literal
+);
+
+/**
+ * @brief Take bytes up to (but not including) @a delim, then consume @a delim.
+ *
+ * On success, @a *out points into the input (no allocation; valid for
+ * the lifetime of the source string) and @a *out_len is the slice
+ * length, which may be 0 (e.g. the input begins with @a delim).
+ * If @a delim is not found before EOF, sets ok = false.
+ */
+bool
+axl_str_reader_take_until(
+    AxlStrReader   *r,
+    char            delim,
+    const char    **out,      ///< [out, optional] start of the slice
+    size_t         *out_len   ///< [out, optional] slice length
+);
+
+/**
+ * @brief Take bytes while @a pred returns true.
+ *
+ * Always succeeds; a zero-length take is not an error (returns true with
+ * @a *out_len = 0). Use the result to distinguish "matched nothing" from
+ * "matched something" if your grammar requires at least one char.
+ */
+bool
+axl_str_reader_take_while(
+    AxlStrReader   *r,
+    bool          (*pred)(char),
+    const char    **out,      ///< [out, optional] start of the slice
+    size_t         *out_len   ///< [out, optional] slice length
+);
+
+/**
+ * @brief Parse a u64 literal at the cursor.
+ *
+ * Behavior matches `axl_str_to_u64`:
+ *   - @a base = 0: auto-detect "0x"/"0X" hex prefix, else decimal.
+ *   - @a base = 16: accepts an optional "0x"/"0X" prefix and otherwise
+ *     reads hex digits.
+ *   - @a base in [2..36] (other than 16): reads digits only, no prefix
+ *     handling.
+ *
+ * Stops at the first non-digit and advances the cursor past the
+ * consumed digits (and prefix, if any). Sets @a ok = false and leaves
+ * the cursor unchanged if no digits are present or the value
+ * overflows u64.
+ */
+bool
+axl_str_reader_take_u64(
+    AxlStrReader  *r,
+    int            base,    ///< 0 (auto-detect), 16 (with optional 0x), or 2..36
+    uint64_t      *out      ///< [out] parsed value
+);
+
+/**
+ * @brief Take a C identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+ *
+ * @a *out points into the input; @a *out_len is the identifier length.
+ * Sets ok = false when the leading char isn't a valid identifier start
+ * (a digit, punctuation, EOF).
+ */
+bool
+axl_str_reader_take_ident(
+    AxlStrReader   *r,
+    const char    **out,     ///< [out, optional]
+    size_t         *out_len  ///< [out, optional]
+);
+
+// ---------------------------------------------------------------------------
+// axl_sscanf — printf's symmetric partner, built on AxlStrReader.
+//
+// Subset of the C99 sscanf format-string grammar with the conversions
+// AXL consumers actually use. Returns the number of successful
+// conversions assigned (may be 0), or -1 on a malformed format string.
+//
+// Whitespace in the format matches any run of input whitespace
+// (including none). A literal char in the format must match the input
+// exactly; mismatch terminates the scan and returns the count so far.
+//
+// Conversion specifiers:
+//
+//   %%          literal '%'
+//   %c          one char (no width modifier; %Nc takes the next N chars)
+//   %d, %i      signed decimal / "auto" (with 0x detection for %i)
+//   %u          unsigned decimal
+//   %o, %x, %X  unsigned octal / hex (case-insensitive on the hex)
+//   %s          run of non-whitespace; REQUIRES a width specifier (%Ns)
+//               so the destination buffer can be bounded — the SDK does
+//               not allow unbounded %s.
+//   %[set]      run of chars matching the set (^set negates)
+//   %n          assigns the number of bytes consumed so far (no input read)
+//
+// Length modifiers: hh, h, l, ll, z (for size_t), j (for intmax_t).
+// For unsigned types, the same modifiers apply.
+//
+// Suppressing assignment with '*' (e.g. %*d) is supported and the
+// conversion is performed but not stored.
+//
+// Returns count of successfully completed *and assigned* conversions,
+// or -1 on a malformed format (e.g. %s without width, unrecognized
+// conversion). NULL @a str returns -1.
+// ---------------------------------------------------------------------------
+
+#include <stdarg.h>
+
+/**
+ * @brief Scan @a str against @a fmt and assign to the listed pointers.
+ *
+ * @return number of conversions stored, or -1 on malformed format.
+ */
+int
+axl_sscanf(
+    const char  *str,
+    const char  *fmt,
+    ...
+) __attribute__((format(scanf, 2, 3)));
+
+/// va_list variant of axl_sscanf.
+int
+axl_vsscanf(
+    const char  *str,
+    const char  *fmt,
+    va_list      ap
+);
+
+// ---------------------------------------------------------------------------
 // Wide-string (UCS-2) utilities — UEFI internal use.
 // Consumer code should use UTF-8. Convert with axl_ucs2_to_utf8().
 // ---------------------------------------------------------------------------

@@ -268,6 +268,49 @@ the input string do NOT allocate:
 - `axl_strstr_len`, `axl_strrstr` (return pointer into haystack)
 - `axl_strchr` (return pointer into string)
 
+## AxlStrReader — Cursor-Based String Parser
+
+Symmetric counterpart to `AxlString` (the builder). A reader BORROWS a
+`const char *` (no allocation, no ownership) and tracks a cursor with
+a sticky-error flag. Operations short-circuit when `ok` is false, so
+chains compose naturally without per-call error checking:
+
+```c
+AxlStrReader r;
+uint64_t     v;
+axl_str_reader_init(&r, "N[03A8]");
+axl_str_reader_consume_char(&r, 'N');
+axl_str_reader_consume_char(&r, '[');
+axl_str_reader_take_u64(&r, 16, &v);
+axl_str_reader_consume_char(&r, ']');
+if (!r.ok || !axl_str_reader_eof(&r)) { /* parse failed */ }
+```
+
+Header: `<axl/axl-str.h>` (alongside the legacy string utilities and
+`axl_sscanf`).
+
+Primitives: `init` / `init_n`, `eof`, `peek`, `remaining`, `skip_ws`,
+`consume_char`, `consume_str`, `take_until`, `take_while`, `take_u64`,
+`take_ident`. No allocation; `*out` slices point directly into the
+input buffer.
+
+For one-shot fixed-pattern parses (IP addresses, MAC addresses,
+ASCII numerics with separators), `axl_sscanf` is built on top of the
+same primitives and reads cleaner:
+
+```c
+unsigned a, b, c, d;
+int consumed;
+if (axl_sscanf(str, "%u.%u.%u.%u%n", &a, &b, &c, &d, &consumed) != 4
+    || str[consumed] != '\0') {
+    return -1;   /* malformed */
+}
+```
+
+Supports the C99 conversions consumers actually need: `%c %d %i %u %o
+%x %X %s (with required width) %[set] %% %n`, length modifiers
+`hh h l ll z j`, and `*` assignment suppression.
+
 ## AxlString — String Builder
 
 Mutable auto-growing string builder, like GLib's `GString`. All strings

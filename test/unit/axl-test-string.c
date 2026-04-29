@@ -575,6 +575,329 @@ test_strtou64_with_offset(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlStrReader
+// ---------------------------------------------------------------------------
+
+static bool is_alpha_pred(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+static bool is_digit_pred(char c) { return c >= '0' && c <= '9'; }
+
+static void
+test_str_reader(void)
+{
+    AxlStrReader r;
+    uint64_t v;
+    const char *out;
+    size_t out_len;
+
+    /* init / eof / remaining / peek */
+    axl_str_reader_init(&r, "abc");
+    test_check(r.ok, "reader: fresh init has ok=true");
+    test_check(!axl_str_reader_eof(&r), "reader: not eof on non-empty");
+    test_check(axl_str_reader_remaining(&r) == 3, "reader: remaining=3");
+    test_check(axl_str_reader_peek(&r) == 'a', "reader: peek 'a'");
+
+    axl_str_reader_init(&r, "");
+    test_check(axl_str_reader_eof(&r), "reader: empty string is eof");
+    test_check(axl_str_reader_peek(&r) == '\0', "reader: peek at eof = 0");
+
+    axl_str_reader_init(&r, NULL);
+    test_check(axl_str_reader_eof(&r), "reader: NULL init is eof");
+    test_check(r.ok, "reader: NULL init ok=true (nothing-to-parse, no error)");
+
+    /* init_n with embedded NUL */
+    axl_str_reader_init_n(&r, "ab\0cd", 5);
+    test_check(axl_str_reader_remaining(&r) == 5, "reader: init_n with embedded NUL");
+
+    /* consume_char */
+    axl_str_reader_init(&r, "(x)");
+    test_check(axl_str_reader_consume_char(&r, '(') && r.ok, "reader: consume '('");
+    test_check(axl_str_reader_peek(&r) == 'x', "reader: cursor advanced past '('");
+    test_check(!axl_str_reader_consume_char(&r, '!') && !r.ok,
+               "reader: mismatch sets ok=false");
+    /* sticky-ok: subsequent ops short-circuit */
+    test_check(!axl_str_reader_consume_char(&r, 'x'),
+               "reader: ok=false sticks (no further ops succeed)");
+
+    /* consume_str */
+    axl_str_reader_init(&r, "hello world");
+    test_check(axl_str_reader_consume_str(&r, "hello") && r.ok,
+               "reader: consume_str 'hello'");
+    test_check(axl_str_reader_peek(&r) == ' ',
+               "reader: cursor at space after consume_str");
+    test_check(!axl_str_reader_consume_str(&r, "xyz") && !r.ok,
+               "reader: consume_str mismatch → ok=false");
+
+    /* consume_str NULL/empty no-op */
+    axl_str_reader_init(&r, "abc");
+    test_check(axl_str_reader_consume_str(&r, NULL),
+               "reader: consume_str NULL is no-op true");
+    test_check(axl_str_reader_consume_str(&r, ""),
+               "reader: consume_str \"\" is no-op true");
+
+    /* take_until */
+    axl_str_reader_init(&r, "host:8080/path");
+    out = NULL; out_len = 0;
+    test_check(axl_str_reader_take_until(&r, ':', &out, &out_len),
+               "reader: take_until ':'");
+    test_check(out_len == 4 && axl_strncmp(out, "host", 4) == 0,
+               "reader: take_until slice = 'host'");
+    test_check(axl_str_reader_peek(&r) == '8',
+               "reader: cursor past ':' delim");
+
+    /* take_until at EOF (delim not found) */
+    axl_str_reader_init(&r, "no-delim-here");
+    test_check(!axl_str_reader_take_until(&r, ':', NULL, NULL),
+               "reader: take_until missing delim → ok=false");
+    test_check(!r.ok, "reader: take_until missing delim sticks ok=false");
+
+    /* take_while */
+    axl_str_reader_init(&r, "abc123!!");
+    test_check(axl_str_reader_take_while(&r, is_alpha_pred, &out, &out_len),
+               "reader: take_while alpha");
+    test_check(out_len == 3 && axl_strncmp(out, "abc", 3) == 0,
+               "reader: take_while alpha → 'abc'");
+    test_check(axl_str_reader_take_while(&r, is_digit_pred, &out, &out_len),
+               "reader: take_while digit");
+    test_check(out_len == 3 && axl_strncmp(out, "123", 3) == 0,
+               "reader: take_while digit → '123'");
+    /* zero-length match is not an error */
+    test_check(axl_str_reader_take_while(&r, is_digit_pred, &out, &out_len),
+               "reader: take_while zero-length is fine");
+    test_check(out_len == 0, "reader: zero-length take returns empty span");
+
+    /* take_u64 — decimal, hex, bare hex with explicit base */
+    axl_str_reader_init(&r, "12345abc");
+    test_check(axl_str_reader_take_u64(&r, 10, &v) && v == 12345,
+               "reader: take_u64 decimal");
+    test_check(axl_str_reader_peek(&r) == 'a',
+               "reader: cursor past digits");
+
+    axl_str_reader_init(&r, "0xFF rest");
+    test_check(axl_str_reader_take_u64(&r, 0, &v) && v == 0xFF,
+               "reader: take_u64 auto 0x");
+
+    axl_str_reader_init(&r, "ff rest");
+    test_check(axl_str_reader_take_u64(&r, 16, &v) && v == 0xFF,
+               "reader: take_u64 explicit base 16");
+
+    /* take_u64 — no digits → ok=false, cursor not advanced */
+    axl_str_reader_init(&r, "abc");
+    test_check(!axl_str_reader_take_u64(&r, 10, &v),
+               "reader: take_u64 no digits → false");
+    test_check(!r.ok, "reader: take_u64 no digits sticks ok=false");
+
+    /* take_ident */
+    axl_str_reader_init(&r, "_id123 = 42");
+    test_check(axl_str_reader_take_ident(&r, &out, &out_len),
+               "reader: take_ident '_id123'");
+    test_check(out_len == 6 && axl_strncmp(out, "_id123", 6) == 0,
+               "reader: take_ident slice");
+    axl_str_reader_init(&r, "1foo");
+    test_check(!axl_str_reader_take_ident(&r, NULL, NULL),
+               "reader: take_ident rejects digit-leading");
+
+    /* skip_ws */
+    axl_str_reader_init(&r, "   \t\nfoo");
+    test_check(axl_str_reader_skip_ws(&r),
+               "reader: skip_ws over mixed whitespace");
+    test_check(axl_str_reader_peek(&r) == 'f',
+               "reader: cursor at first non-ws");
+
+    /* Composed parse: tagged hex N[xxxx] from delldiags case */
+    {
+        AxlStrReader r2;
+        uint64_t val;
+        axl_str_reader_init(&r2, "1[03A8]");
+        axl_str_reader_consume_char(&r2, '1');
+        axl_str_reader_consume_char(&r2, '[');
+        axl_str_reader_take_u64(&r2, 16, &val);
+        axl_str_reader_consume_char(&r2, ']');
+        test_check(r2.ok, "reader: composed tagged-hex parse ok");
+        test_check(axl_str_reader_eof(&r2), "reader: composed parse consumes all input");
+        test_check(val == 0x03A8, "reader: tagged-hex value = 0x03A8");
+    }
+
+    /* Composed parse: malformed input fails cleanly */
+    {
+        AxlStrReader r2;
+        uint64_t val;
+        axl_str_reader_init(&r2, "1[XX]");
+        axl_str_reader_consume_char(&r2, '1');
+        axl_str_reader_consume_char(&r2, '[');
+        axl_str_reader_take_u64(&r2, 16, &val);
+        test_check(!r2.ok, "reader: composed parse fails on bad hex");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axl_sscanf
+// ---------------------------------------------------------------------------
+
+static void
+test_sscanf(void)
+{
+    /* %d / %u / %x */
+    {
+        int      d = 0;
+        unsigned u = 0;
+        unsigned x = 0;
+        int n = axl_sscanf("42 100 ff", "%d %u %x", &d, &u, &x);
+        test_check(n == 3, "sscanf: %d %u %x — 3 conversions");
+        test_check(d == 42, "sscanf: %d=42");
+        test_check(u == 100, "sscanf: %u=100");
+        test_check(x == 0xFF, "sscanf: %x=0xFF");
+    }
+
+    /* %i — auto-detect 0x */
+    {
+        int v = 0;
+        test_check(axl_sscanf("0x10", "%i", &v) == 1, "sscanf: %i 0x10 → 1");
+        test_check(v == 0x10, "sscanf: %i decoded as hex");
+        test_check(axl_sscanf("16", "%i", &v) == 1, "sscanf: %i 16 → 1");
+        test_check(v == 16, "sscanf: %i decoded as decimal");
+    }
+
+    /* Length modifiers */
+    {
+        unsigned char  hh = 0;
+        unsigned short h = 0;
+        unsigned long long ll = 0;
+        size_t z = 0;
+        int n = axl_sscanf("255 65535 18446744073709551615 1024",
+                           "%hhu %hu %llu %zu", &hh, &h, &ll, &z);
+        test_check(n == 4, "sscanf: hh/h/ll/z all parsed");
+        test_check(hh == 255, "sscanf: %hhu=255");
+        test_check(h == 65535, "sscanf: %hu=65535");
+        test_check(ll == 18446744073709551615ULL, "sscanf: %llu=UINT64_MAX");
+        test_check(z == 1024, "sscanf: %zu=1024");
+    }
+
+    /* Negative + signed */
+    {
+        int v = 0;
+        test_check(axl_sscanf("-42", "%d", &v) == 1, "sscanf: %d -42 → 1");
+        test_check(v == -42, "sscanf: %d=-42");
+    }
+
+    /* Boundary: INT64_MIN. The unsigned magnitude is INT64_MAX+1 =
+     * 0x8000000000000000, and computing -(int64_t)v at that value
+     * is signed-int overflow UB if done naively. Verify we pick up
+     * INT64_MIN cleanly. */
+    {
+        long long v = 0;
+        test_check(axl_sscanf("-9223372036854775808", "%lld", &v) == 1,
+                   "sscanf: INT64_MIN parse succeeds");
+        test_check(v == (-9223372036854775807LL - 1LL),
+                   "sscanf: INT64_MIN value correct");
+    }
+
+    /* Literal char in format must match input */
+    {
+        int a = 0, b = 0;
+        test_check(axl_sscanf("1.2", "%d.%d", &a, &b) == 2,
+                   "sscanf: literal '.' separator");
+        test_check(a == 1 && b == 2, "sscanf: a=1 b=2");
+        /* Mismatch terminates scan, returns count so far */
+        test_check(axl_sscanf("1,2", "%d.%d", &a, &b) == 1,
+                   "sscanf: literal mismatch returns partial count");
+    }
+
+    /* Whitespace in format matches any run of input ws */
+    {
+        int a = 0, b = 0;
+        test_check(axl_sscanf("1   2", "%d %d", &a, &b) == 2,
+                   "sscanf: whitespace-flex");
+        test_check(axl_sscanf("1  \t  2", "%d %d", &a, &b) == 2,
+                   "sscanf: whitespace mixed tabs");
+    }
+
+    /* %c — exactly N chars */
+    {
+        char c1 = 0;
+        char buf[4] = {0};
+        test_check(axl_sscanf("xyz", "%c", &c1) == 1, "sscanf: %c 1 char");
+        test_check(c1 == 'x', "sscanf: %c='x'");
+        test_check(axl_sscanf("xyz", "%3c", buf) == 1, "sscanf: %3c");
+        test_check(buf[0] == 'x' && buf[1] == 'y' && buf[2] == 'z',
+                   "sscanf: %3c contents");
+    }
+
+    /* %s — bounded; required width */
+    {
+        char buf[8] = {0};
+        test_check(axl_sscanf("hello world", "%7s", buf) == 1,
+                   "sscanf: %7s reads 'hello'");
+        test_check(axl_strcmp(buf, "hello") == 0, "sscanf: %s contents");
+        /* Width without %s width = format error */
+        test_check(axl_sscanf("foo", "%s", buf) == -1,
+                   "sscanf: %s without width is malformed");
+    }
+
+    /* %[set] / %[^set] */
+    {
+        char buf[16] = {0};
+        test_check(axl_sscanf("abc123 ", "%15[a-z]", buf) == 1,
+                   "sscanf: %[a-z] match");
+        test_check(axl_strcmp(buf, "abc") == 0, "sscanf: %[a-z] contents");
+
+        char buf2[16] = {0};
+        test_check(axl_sscanf("foo:bar", "%15[^:]", buf2) == 1,
+                   "sscanf: %[^:] negated set");
+        test_check(axl_strcmp(buf2, "foo") == 0, "sscanf: %[^:] contents");
+    }
+
+    /* Suppression with '*' */
+    {
+        int a = 0;
+        test_check(axl_sscanf("ignore-me 42", "%*s %d", &a) == 1,
+                   "sscanf: %*s suppression");
+        test_check(a == 42, "sscanf: suppressed conversion not counted");
+    }
+
+    /* %% literal */
+    {
+        int a = 0;
+        test_check(axl_sscanf("100%", "%d%%", &a) == 1, "sscanf: %% literal match");
+        test_check(a == 100, "sscanf: a=100");
+    }
+
+    /* %n — bytes consumed so far */
+    {
+        int a = 0, n_out = 0;
+        test_check(axl_sscanf("123abc", "%d%n", &a, &n_out) == 1,
+                   "sscanf: %n doesn't count as conversion");
+        test_check(a == 123, "sscanf: %n preceded by %d works");
+        test_check(n_out == 3, "sscanf: %n=3 (bytes consumed)");
+    }
+
+    /* IPv4-style — the canonical dogfood case */
+    {
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        test_check(axl_sscanf("192.168.1.42", "%u.%u.%u.%u", &a, &b, &c, &d) == 4,
+                   "sscanf: ipv4 parse");
+        test_check(a == 192 && b == 168 && c == 1 && d == 42,
+                   "sscanf: ipv4 octets");
+    }
+
+    /* Tagged-hex — the delldiags use case */
+    {
+        char tag = 0;
+        unsigned int v = 0;
+        int n = axl_sscanf("1[03A8]", "%c[%x]", &tag, &v);
+        test_check(n == 2 && tag == '1' && v == 0x03A8,
+                   "sscanf: tagged-hex 'N[xxxx]'");
+    }
+
+    /* NULL inputs — return -1 without dereferencing.
+     * (Pass a valid &dummy pointer to avoid -Wformat tripping on NULL.) */
+    {
+        int dummy = 0;
+        test_check(axl_sscanf(NULL, "%d", &dummy) == -1,
+                   "sscanf: NULL str → -1");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // axl_str_to_{u32,s32,u64,s64}
 // ---------------------------------------------------------------------------
 
@@ -967,6 +1290,8 @@ test_strbuf_main(
     test_snprintf();
     test_strtou64();
     test_strtou64_with_offset();
+    test_str_reader();
+    test_sscanf();
     test_str_to_u64();
     test_str_to_u32();
     test_str_to_s64();

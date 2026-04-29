@@ -11,48 +11,22 @@
 int
 axl_ipv4_parse(const char *str, uint8_t octets[4])
 {
-    unsigned int val;
-    int          octet_idx;
-    int          digit_count;
+    if (str == NULL || octets == NULL) { return -1; }
 
-    if (str == NULL || octets == NULL) {
-        return -1;
-    }
-
-    axl_memset(octets, 0, 4);
-    val = 0;
-    octet_idx = 0;
-    digit_count = 0;
-
-    for (int i = 0; ; i++) {
-        char ch = str[i];
-
-        if (ch >= '0' && ch <= '9') {
-            val = val * 10 + (unsigned int)(ch - '0');
-            if (val > 255) {
-                return -1;
-            }
-            digit_count++;
-        } else if (ch == '.' || ch == '\0') {
-            if (digit_count == 0 || octet_idx >= 4) {
-                return -1;
-            }
-            octets[octet_idx] = (uint8_t)val;
-            octet_idx++;
-            val = 0;
-            digit_count = 0;
-            if (ch == '\0') {
-                break;
-            }
-        } else {
-            return -1;
-        }
-    }
-
-    if (octet_idx != 4) {
-        return -1;
-    }
-
+    /* Dogfooded with axl_sscanf — far more readable than the
+     * hand-rolled state machine and exercises the same conversion
+     * paths the SDK ships for downstream consumers. The trailing
+     * %n captures the bytes consumed, so we can reject trailing
+     * garbage ("1.2.3.4junk") without an extra strlen. */
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    int          consumed = 0;
+    int n = axl_sscanf(str, "%u.%u.%u.%u%n", &a, &b, &c, &d, &consumed);
+    if (n != 4 || str[consumed] != '\0') { return -1; }
+    if (a > 255 || b > 255 || c > 255 || d > 255) { return -1; }
+    octets[0] = (uint8_t)a;
+    octets[1] = (uint8_t)b;
+    octets[2] = (uint8_t)c;
+    octets[3] = (uint8_t)d;
     return 0;
 }
 

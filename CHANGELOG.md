@@ -3,6 +3,79 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.5.0 — 2026-04-29
+
+String parsing companion to `AxlString` (the builder). Closes the
+"every consumer hand-rolls the same length-guard plumbing" gap one
+level up from the v0.4.0 SMBIOS spec-table decoders.
+
+### Added
+
+- **`AxlStrReader`** — cursor-based string parser. Borrows a
+  `const char *`, tracks a position + sticky-error flag. Operations
+  short-circuit when `ok` is false, so parse chains compose without
+  per-call error checking:
+
+  ```c
+  AxlStrReader r;
+  uint64_t v;
+  axl_str_reader_init(&r, "N[03A8]");
+  axl_str_reader_consume_char(&r, 'N');
+  axl_str_reader_consume_char(&r, '[');
+  axl_str_reader_take_u64(&r, 16, &v);
+  axl_str_reader_consume_char(&r, ']');
+  if (!r.ok || !axl_str_reader_eof(&r)) { /* parse failed */ }
+  ```
+
+  Twelve primitives covering init, eof/peek/remaining,
+  skip-whitespace, consume-char/literal-string, take-until-delim,
+  take-while-pred, take-u64 (auto-detects `0x` prefix or takes an
+  explicit base), and take-ident (`[A-Za-z_][A-Za-z0-9_]*`). No
+  allocation. Header docs live alongside `AxlString` in
+  `axl-str.h`.
+
+- **`axl_sscanf` / `axl_vsscanf`** — printf's symmetric partner,
+  built on `AxlStrReader`. Supports a useful subset of C99 sscanf:
+  `%c %d %i %u %o %x %X %s (with width) %[set] %% %n`, length
+  modifiers `hh h l ll z j`, `*` assignment suppression, and width
+  specifiers. Width is required for unsuppressed `%s` so the
+  destination buffer is bounded. Returns the count of stored
+  conversions or -1 on a malformed format.
+
+  ```c
+  unsigned a, b, c, d;
+  int n = axl_sscanf("192.168.1.42", "%u.%u.%u.%u", &a, &b, &c, &d);
+  /* n == 4 */
+  ```
+
+### Changed (dogfood)
+
+- **`axl_strtou64_with_offset`** rewritten on top of `AxlStrReader`.
+  Behavior unchanged — all 23 existing test cases still pass — but
+  the implementation is now ~14 lines of cursor calls vs. the
+  previous 40 lines of hand-rolled `endptr` plumbing.
+
+- **`axl_ipv4_parse`** rewritten on top of `axl_sscanf`. Replaces a
+  ~30-line hand-rolled state machine (digit accumulation, dot/NUL
+  switching, octet count tracking) with a 4-line scanf call plus
+  range checks. The trailing `%n` captures bytes consumed so we
+  reject trailing garbage like "1.2.3.4junk" without an extra
+  strlen.
+
+  ```c
+  unsigned int a, b, c, d;
+  int consumed;
+  int n = axl_sscanf(str, "%u.%u.%u.%u%n", &a, &b, &c, &d, &consumed);
+  if (n != 4 || str[consumed] != '\0') return -1;
+  if (a > 255 || b > 255 || c > 255 || d > 255) return -1;
+  ```
+
+### Test stats
+
+1693 unit tests passing (was 1607; 86 new across `AxlStrReader`
+and `axl_sscanf`, plus 0 regressions on the dogfooded
+consumers).
+
 ## 0.4.0 — 2026-04-29
 
 Second consumer-driven release for delldiags `do.efi` (cat 1 / 1.5 SMBIOS
