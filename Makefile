@@ -165,6 +165,7 @@ LIB_SOURCES = \
     src/util/axl-driver.c \
     src/util/axl-diag.c \
     src/util/axl-config.c \
+    src/util/axl-subcommand.c \
     src/smbios/axl-smbios.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \

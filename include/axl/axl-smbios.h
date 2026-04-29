@@ -11,6 +11,7 @@
 #define AXL_SMBIOS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -38,10 +39,13 @@ enum {
     AXL_SMBIOS_TYPE_OEM_STRINGS         = 11,   ///< OEM Strings
     AXL_SMBIOS_TYPE_BIOS_LANGUAGE       = 13,   ///< BIOS Language Information
     AXL_SMBIOS_TYPE_PHYSICAL_MEMORY     = 16,   ///< Physical Memory Array
+    AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY = 16, ///< Alias matching the spec's full name
     AXL_SMBIOS_TYPE_MEMORY_DEVICE       = 17,   ///< Memory Device (per DIMM)
     AXL_SMBIOS_TYPE_MEMORY_ARRAY_MAP    = 19,   ///< Memory Array Mapped Address
+    AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP   = 20,   ///< Memory Device Mapped Address
     AXL_SMBIOS_TYPE_SYSTEM_BOOT         = 32,   ///< System Boot Information
     AXL_SMBIOS_TYPE_IPMI_DEVICE_INFO    = 38,   ///< IPMI Device Information (transport, address)
+    AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT  = 41,   ///< Onboard Devices Extended Information
     AXL_SMBIOS_TYPE_MGMT_HOST_INTERFACE = 42,   ///< Management Controller Host Interface (Redfish, OEM, ...)
     AXL_SMBIOS_TYPE_END                 = 127,  ///< End-of-table sentinel
 };
@@ -200,6 +204,167 @@ int axl_smbios_read_processor(AxlSmbiosHeader *hdr, AxlSmbiosProcessorInfo *out)
  */
 int axl_smbios_read_memory_device(AxlSmbiosHeader *hdr, AxlSmbiosMemoryDevice *out);
 
+/// Type 8 — Port Connector Information.
+typedef struct {
+    const char  *internal_designator;
+    const char  *external_designator;
+    uint8_t      internal_connector_type;   ///< SMBIOS spec Table 8 (e.g. 0x12 = Mini Centronics Type-26)
+    uint8_t      external_connector_type;   ///< Same enum
+    uint8_t      port_type;                 ///< SMBIOS spec Table 9 (e.g. 0x10 = Network Port)
+} AxlSmbiosPortConnector;
+
+/// Type 9 — System Slots. Spec-version-creep poster child: fields beyond
+/// offset 0x0C arrived in 2.6, 3.2, and 3.4. Sentinels distinguish "not
+/// published" from real values:
+///   - segment_group / bus / device_function: 0xFFFF / 0xFF when not in record
+///   - data_bus_width_base / peer_grouping_count: 0 when not in record
+///
+/// current_usage uses spec values 0x03..0x05; the 0xFE "CPU NOT INSTALLED"
+/// extension some Dell firmware emits is a vendor extension on top of 0x05
+/// (Unavailable). The typed reader returns the raw byte, so callers can
+/// match either spec or vendor values directly.
+typedef struct {
+    const char  *designation;
+    uint8_t      slot_type;            ///< PCI/PCIe variant (SMBIOS spec Table 11)
+    uint8_t      slot_data_bus_width;  ///< 0x08=1x..0x0E=32x (decoded width via the standard table)
+    uint8_t      current_usage;        ///< 0x03=Available, 0x04=InUse, 0x05=Unavailable
+    uint8_t      slot_length;
+    uint16_t     slot_id;
+    uint16_t     segment_group;        ///< 0xFFFF if not published (spec 2.6+ field)
+    uint8_t      bus;                  ///< 0xFF if not published
+    uint8_t      device_function;      ///< 0xFF if not published; bits 7:3 = device, bits 2:0 = function
+    uint8_t      data_bus_width_base;  ///< SMBIOS 3.2+ field; 0 if not published
+    uint8_t      peer_grouping_count;  ///< SMBIOS 3.2+ field; 0 if not published
+    /* Variable-length peer grouping array intentionally omitted; consumers
+       that need it can hand-walk via the raw header. */
+} AxlSmbiosSystemSlot;
+
+/// Type 11 — OEM Strings. Each string is accessed by 1-based index in the
+/// SMBIOS spec; the typed reader exposes them as an array for ergonomics.
+/// Real systems publish 4-8 entries; the cap of 16 covers everything we've
+/// seen in the wild.
+typedef struct {
+    uint8_t       count;            ///< Number of strings
+    const char   *strings[16];      ///< 1-based: strings[0] is what the spec calls index 1
+} AxlSmbiosOemStrings;
+
+/// Type 16 — Physical Memory Array. The 32→64-bit max-capacity fallback is
+/// resolved internally: max_capacity_bytes is always populated correctly.
+typedef struct {
+    uint8_t      location;            ///< 0x03=System board, 0x0A=PC Card, ...
+    uint8_t      use;                 ///< 0x03=System Memory, 0x04=Video, ...
+    uint8_t      ecc_type;
+    uint64_t     max_capacity_bytes;  ///< Resolves the 32→64-bit fallback
+                                      ///< (uses ExtendedMaxCapacity at offset 0x0F when
+                                      ///< MaxCapacity field == 0x80000000). 0 if the
+                                      ///< sentinel is set but the record is too short
+                                      ///< to carry the Extended field.
+    uint16_t     error_handle;        ///< 0xFFFE = no error info, 0xFFFF = unknown
+    uint16_t     num_devices;
+} AxlSmbiosPhysicalMemoryArray;
+
+/// Type 19 — Memory Array Mapped Address. The 32→64-bit address fallback
+/// is resolved internally via the ExtendedStartingAddress / ExtendedEndingAddress
+/// fields (spec 2.7+, used when the 32-bit fields == 0xFFFFFFFF). When the
+/// sentinel is set but the record is too short to carry the Extended field
+/// (malformed firmware), the address is reported as 0 rather than the
+/// literal 4 TB - 1 KB the sentinel × 1024 would produce.
+typedef struct {
+    uint64_t     starting_address;    ///< Byte address (resolved from extended field if needed); 0 = unresolvable
+    uint64_t     ending_address;      ///< Byte address (resolved from extended field if needed); 0 = unresolvable
+    uint16_t     array_handle;        ///< Handle of the Type 16 record this maps
+    uint8_t      partition_width;     ///< Number of Type 17s feeding this region
+} AxlSmbiosMemoryArrayMap;
+
+/// Type 20 — Memory Device Mapped Address. Same 64-bit fallback story as Type 19.
+typedef struct {
+    uint64_t     starting_address;    ///< Byte address (resolved from extended field if needed); 0 = unresolvable
+    uint64_t     ending_address;      ///< Byte address (resolved from extended field if needed); 0 = unresolvable
+    uint16_t     device_handle;       ///< Handle of the Type 17 record this maps
+    uint16_t     array_map_handle;    ///< Handle of the Type 19 record this is a child of
+    uint8_t      partition_row_pos;   ///< 0xFF = N/A
+    uint8_t      interleave_position; ///< 0 = non-interleaved, 0xFF = unknown
+    uint8_t      interleave_data_depth; ///< 0xFF = unknown
+} AxlSmbiosMemoryDeviceMap;
+
+/// Type 41 — Onboard Devices Extended Information.
+typedef struct {
+    const char  *reference_designation;
+    uint8_t      device_type;          ///< Bit 7 = Status (0=Disabled, 1=Enabled), low 7 bits = type
+                                       ///< (0x05=Ethernet, 0x07=SAS, etc.)
+    uint8_t      device_type_instance; ///< 1-based per-type index
+    uint16_t     segment_group;
+    uint8_t      bus;
+    uint8_t      device_function;      ///< Packed: bits 7:3 = device, bits 2:0 = function
+} AxlSmbiosOnboardDeviceExt;
+
+/**
+ * @brief Read a Type 8 (Port Connector) record the caller already located.
+ *
+ * Firmware publishes one Type 8 per physical connector. Enumerate with
+ * `axl_smbios_find_next(AXL_SMBIOS_TYPE_PORT_CONNECTOR, prev)` and call
+ * this for each result.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_port_connector(AxlSmbiosHeader *hdr, AxlSmbiosPortConnector *out);
+
+/**
+ * @brief Read a Type 9 (System Slot) record the caller already located.
+ *
+ * Length-aware: fields added in spec 2.6 / 3.2 / 3.4 fall through to the
+ * documented sentinels (0xFFFF / 0xFF / 0) when the firmware's record is
+ * too short to carry them.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_system_slot(AxlSmbiosHeader *hdr, AxlSmbiosSystemSlot *out);
+
+/**
+ * @brief Read a Type 11 (OEM Strings) record the caller already located.
+ *
+ * Populates `count` with the number of strings the record advertises and
+ * `strings[]` with pointers into the SMBIOS table memory (valid for the
+ * life of the app). Caps at 16 entries — anything beyond is ignored.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL or wrong type.
+ */
+int axl_smbios_read_oem_strings(AxlSmbiosHeader *hdr, AxlSmbiosOemStrings *out);
+
+/**
+ * @brief Read a Type 16 (Physical Memory Array) record.
+ *
+ * Resolves the 32→64-bit max-capacity fallback automatically.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_physical_memory_array(AxlSmbiosHeader *hdr, AxlSmbiosPhysicalMemoryArray *out);
+
+/**
+ * @brief Read a Type 19 (Memory Array Mapped Address) record.
+ *
+ * Resolves the 32→64-bit address fallback automatically.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_memory_array_map(AxlSmbiosHeader *hdr, AxlSmbiosMemoryArrayMap *out);
+
+/**
+ * @brief Read a Type 20 (Memory Device Mapped Address) record.
+ *
+ * Resolves the 32→64-bit address fallback automatically.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_memory_device_map(AxlSmbiosHeader *hdr, AxlSmbiosMemoryDeviceMap *out);
+
+/**
+ * @brief Read a Type 41 (Onboard Devices Extended) record.
+ *
+ * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ */
+int axl_smbios_read_onboard_device_ext(AxlSmbiosHeader *hdr, AxlSmbiosOnboardDeviceExt *out);
+
 /// Type 38 — IPMI Device Information.
 typedef struct {
     uint8_t     interface_type;      ///< AXL_SMBIOS_IPMI_* (KCS, SMIC, BT, SSIF, ...)
@@ -300,15 +465,36 @@ axl_smbios_get_string(
 /**
  * @brief Get a string from an SMBIOS table's string area (UTF-8).
  *
- * Returns a pointer to a static 128-char buffer — caller must use
- * the value before the next call (not reentrant).
+ * Returns a direct pointer into the SMBIOS table memory, which persists
+ * for the life of the app. Reentrant — multiple calls in one printf are
+ * safe.
  *
- * @return pointer to static char buffer, or "" if not found.
+ * @return pointer into the SMBIOS table, or "" if not found.
  */
 const char *
 axl_smbios_get_string_utf8(
     AxlSmbiosHeader  *hdr,           ///< SMBIOS table header
     unsigned char     string_index   ///< 1-based string index (0 returns "")
+);
+
+/**
+ * @brief Copy a string from an SMBIOS table's string area into a caller buffer.
+ *
+ * Reentrant alternative for callers that want a writable copy or need
+ * length-bounded handling. Truncates safely on overflow and always
+ * NUL-terminates if @a buf_size > 0.
+ *
+ * @return number of bytes written (excluding the terminating NUL), or 0
+ *         if the string was not found / @a hdr is NULL / @a string_index
+ *         is 0. When the source string would be longer than @a buf_size - 1,
+ *         the return value is @a buf_size - 1 (the truncated length).
+ */
+size_t
+axl_smbios_copy_string_utf8(
+    AxlSmbiosHeader  *hdr,           ///< SMBIOS table header
+    uint8_t           string_index,  ///< 1-based string index (0 writes empty + returns 0)
+    char             *buf,           ///< destination buffer
+    size_t            buf_size       ///< destination buffer capacity
 );
 
 /**

@@ -3,6 +3,80 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 — 2026-04-29
+
+Consumer-driven release for delldiags `do.efi` (the hardware-diagnostic
+CLI port from `efiUtils/doDriver/`). Closes the SMBIOS audit gap on
+Types 8/9/11/16/19/20/41, adds a multi-command CLI dispatch helper,
+and standardizes the hex+offset parser delldiags categories 3-5 share.
+
+### Added
+
+- **Seven new typed SMBIOS readers** matching the existing pattern
+  (`axl_smbios_read_*` returns 0 on success, -1 on NULL/wrong-type/
+  too-short record):
+    - `axl_smbios_read_port_connector` (Type 8)
+    - `axl_smbios_read_system_slot` (Type 9) — length-aware across
+      spec-version creep: SegmentGroup/Bus/DeviceFunc (2.6+),
+      DataBusWidthBase + PeerGroupingCount (3.2+), all with documented
+      `0xFFFF` / `0xFF` / `0` "not published" sentinels
+    - `axl_smbios_read_oem_strings` (Type 11) — array-of-pointers
+      shape capped at 16 entries (matches existing typed-reader idiom)
+    - `axl_smbios_read_physical_memory_array` (Type 16) — resolves
+      the 32→64-bit `MaxCapacity` / `ExtendedMaxCapacity` fallback
+      automatically
+    - `axl_smbios_read_memory_array_map` (Type 19) — same 64-bit
+      address fallback story
+    - `axl_smbios_read_memory_device_map` (Type 20) — same again
+    - `axl_smbios_read_onboard_device_ext` (Type 41)
+- **`AXL_SMBIOS_TYPE_*` enum additions** — Type 20
+  (`MEMORY_DEVICE_MAP`), Type 41 (`ONBOARD_DEVICE_EXT`), plus a
+  `PHYSICAL_MEMORY_ARRAY` alias for the existing Type-16 enum so
+  callers can use the spec's full name.
+- **`axl_smbios_copy_string_utf8(hdr, idx, buf, buf_size)`** —
+  reentrant, length-bounded alternative to
+  `axl_smbios_get_string_utf8`. Truncates safely on overflow,
+  always NUL-terminates if `buf_size > 0`, returns the byte count
+  written. The original `axl_smbios_get_string_utf8` was already
+  reentrant after the v0.2.5 string-area refactor — its docstring
+  is updated to match.
+- **`<axl/axl-subcommand.h>`** — multi-command CLI dispatch helper.
+  Caller-owned `AxlSubcommand` table + a single
+  `axl_subcommand_dispatch(table, count, argc, argv, prog_name)`
+  call covers `<prog>`, `<prog> help`, `<prog> help <cmd>`,
+  `<prog> -h`/`--help`, `<prog> <cmd> ...`, "did you mean" typo
+  suggestions via edit-distance matching, and shifted argv so
+  subcommands see their own name as `argv[0]`. Pairs with
+  `axl_config_*` for per-command flag parsing — `mkrd` is the
+  "single-purpose" pattern, `do` will be the "multi-command"
+  pattern.
+- **`axl_strtou64_with_offset(s, &out)`** — hex/decimal value with
+  an optional `+offset` suffix. Accepts `"0x100"`, `"256"`,
+  `"0x100+0x10"`, `"256+16"`. Strict: trailing garbage, whitespace
+  around `+`, dangling `+`, and overflow on the sum all return -1.
+  Standardizes the `do crb tag+offset reg` / `do rb physAddr+offset
+  count` parsing across delldiags categories 3-5.
+
+### Changed
+
+- `axl_smbios_get_string_utf8` documentation now correctly describes
+  it as reentrant. (The v0.2.5 refactor switched it from a static
+  buffer to a direct pointer into the SMBIOS table — the docstring
+  hadn't caught up.)
+- `src/smbios/README.md` rewritten: added the typed-reader table,
+  split the string-accessor section into "direct pointer vs
+  caller-buffer" guidance, removed the stale "static 128-byte
+  buffer" / "future axl_smbios_next" notes that the v0.2.5
+  refactor and earlier releases had already obsoleted.
+- `docs/AXL-Coding-Style.md` adds a "CLI Patterns" section
+  documenting single-purpose vs multi-command tool shapes
+  (`mkrd` vs `do.efi`).
+
+### Test stats
+
+1552 unit tests passing (was 1488; 64 new across SMBIOS, subcommand,
+and `strtou64_with_offset`).
+
 ## 0.2.9 — 2026-04-28
 
 Downstream-consumer release. The motivating case is delldiags

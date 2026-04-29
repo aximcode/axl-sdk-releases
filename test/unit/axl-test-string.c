@@ -501,6 +501,79 @@ test_strtou64(void)
     test_check(axl_strtou64(NULL) == 0, "strtou64: NULL returns 0");
 }
 
+static void
+test_strtou64_with_offset(void)
+{
+    uint64_t v;
+
+    /* No offset: just the base. */
+    v = 0;
+    test_check(axl_strtou64_with_offset("0x100", &v) == 0 && v == 0x100,
+               "strtou64_with_offset: no offset, hex");
+    v = 0;
+    test_check(axl_strtou64_with_offset("256", &v) == 0 && v == 256,
+               "strtou64_with_offset: no offset, decimal");
+    v = 0;
+    test_check(axl_strtou64_with_offset("0", &v) == 0 && v == 0,
+               "strtou64_with_offset: zero");
+
+    /* With offset, both forms. */
+    v = 0;
+    test_check(axl_strtou64_with_offset("0x100+0x10", &v) == 0 && v == 0x110,
+               "strtou64_with_offset: hex+hex");
+    v = 0;
+    test_check(axl_strtou64_with_offset("256+16", &v) == 0 && v == 272,
+               "strtou64_with_offset: dec+dec");
+    v = 0;
+    test_check(axl_strtou64_with_offset("0x1000+0xFF", &v) == 0 && v == 0x10FF,
+               "strtou64_with_offset: 0x1000+0xFF");
+    v = 0;
+    test_check(axl_strtou64_with_offset("100+0x10", &v) == 0 && v == 100 + 0x10,
+               "strtou64_with_offset: dec+hex (mixed)");
+
+    /* Errors: NULL, empty offset, garbage. */
+    test_check(axl_strtou64_with_offset(NULL, &v) == -1,
+               "strtou64_with_offset: NULL string");
+    test_check(axl_strtou64_with_offset("0x100", NULL) == -1,
+               "strtou64_with_offset: NULL out");
+    test_check(axl_strtou64_with_offset("", &v) == -1,
+               "strtou64_with_offset: empty string");
+    test_check(axl_strtou64_with_offset("0x100+", &v) == -1,
+               "strtou64_with_offset: dangling +");
+    test_check(axl_strtou64_with_offset("0x100+ 0x10", &v) == -1,
+               "strtou64_with_offset: space after +");
+    test_check(axl_strtou64_with_offset("0x100 +0x10", &v) == -1,
+               "strtou64_with_offset: space before +");
+    test_check(axl_strtou64_with_offset("0x100xy", &v) == -1,
+               "strtou64_with_offset: trailing garbage");
+    test_check(axl_strtou64_with_offset("0x100+0x10+0x10", &v) == -1,
+               "strtou64_with_offset: double offset");
+    test_check(axl_strtou64_with_offset("-0x100+0x10", &v) == -1,
+               "strtou64_with_offset: negative rejected");
+    test_check(axl_strtou64_with_offset("0x100++0x10", &v) == -1,
+               "strtou64_with_offset: ++ rejected");
+    test_check(axl_strtou64_with_offset("0x100+-0x10", &v) == -1,
+               "strtou64_with_offset: +- rejected");
+    test_check(axl_strtou64_with_offset("0x100++++0x10", &v) == -1,
+               "strtou64_with_offset: ++++ rejected");
+
+    /* Overflow on base, on the sum. */
+    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF+0x1", &v) == -1,
+               "strtou64_with_offset: sum overflow");
+    test_check(axl_strtou64_with_offset("0x10000000000000000", &v) == -1,
+               "strtou64_with_offset: base overflow");
+
+    /* Edge: max u64 alone (no offset) is valid. */
+    v = 0;
+    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF", &v) == 0
+               && v == 0xFFFFFFFFFFFFFFFFULL,
+               "strtou64_with_offset: max u64 alone");
+    /* Edge: offset==0 still parses fine. */
+    v = 0;
+    test_check(axl_strtou64_with_offset("0x100+0", &v) == 0 && v == 0x100,
+               "strtou64_with_offset: +0 is valid");
+}
+
 // ---------------------------------------------------------------------------
 // axl_str_to_{u32,s32,u64,s64}
 // ---------------------------------------------------------------------------
@@ -893,6 +966,7 @@ test_strbuf_main(
     test_memset();
     test_snprintf();
     test_strtou64();
+    test_strtou64_with_offset();
     test_str_to_u64();
     test_str_to_u32();
     test_str_to_s64();

@@ -409,6 +409,164 @@ test_smbios(void)
     AxlSmbiosHostInterface iface_bad;
     test_check(axl_smbios_read_host_interface(bios, &iface_bad) == -1,
                "smbios: read_host_interface rejects Type 0 hdr");
+
+    // ----- Reentrant copy_string_utf8 -----
+    char copy_buf[64];
+    size_t n;
+    n = axl_smbios_copy_string_utf8(bios, 1, copy_buf, sizeof(copy_buf));
+    test_check(n > 0, "smbios: copy_string_utf8 wrote bytes");
+    test_check(copy_buf[n] == '\0', "smbios: copy_string_utf8 NUL-terminates at n");
+    /* Same byte length as the direct accessor's strlen for the same idx */
+    const char *direct = axl_smbios_get_string_utf8(bios, 1);
+    test_check(axl_strlen(direct) == n, "smbios: copy_string_utf8 length matches direct");
+    /* Index 0 → write empty + return 0 */
+    n = axl_smbios_copy_string_utf8(bios, 0, copy_buf, sizeof(copy_buf));
+    test_check(n == 0 && copy_buf[0] == '\0', "smbios: copy_string_utf8 idx 0 → empty");
+    /* Truncation: ask for 4-byte buf, expect (buf_size - 1) returned */
+    char tiny[4];
+    n = axl_smbios_copy_string_utf8(bios, 1, tiny, sizeof(tiny));
+    if (axl_strlen(direct) >= sizeof(tiny)) {
+        test_check(n == sizeof(tiny) - 1, "smbios: copy_string_utf8 truncation length");
+        test_check(tiny[sizeof(tiny) - 1] == '\0', "smbios: copy_string_utf8 truncation NUL");
+    }
+    /* NULL-buf / 0-size guards */
+    test_check(axl_smbios_copy_string_utf8(bios, 1, NULL, 64) == 0,
+               "smbios: copy_string_utf8 NULL buf returns 0");
+    test_check(axl_smbios_copy_string_utf8(bios, 1, copy_buf, 0) == 0,
+               "smbios: copy_string_utf8 zero size returns 0");
+    test_check(axl_smbios_copy_string_utf8(NULL, 1, copy_buf, sizeof(copy_buf)) == 0,
+               "smbios: copy_string_utf8 NULL hdr returns 0");
+
+    // ----- Type 8: Port Connectors (firmware-dependent; QEMU may have 0 or N) -----
+    {
+        size_t pc_count = 0;
+        AxlSmbiosHeader *ph2 = NULL;
+        while ((ph2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_PORT_CONNECTOR, ph2)) != NULL) {
+            AxlSmbiosPortConnector pc;
+            test_check(axl_smbios_read_port_connector(ph2, &pc) == 0,
+                       "smbios: read_port_connector on real Type 8");
+            test_check(pc.internal_designator != NULL && pc.external_designator != NULL,
+                       "smbios: port-connector designators populated");
+            pc_count++;
+            if (pc_count > 64) { break; }
+        }
+        AxlSmbiosPortConnector pc_bad;
+        test_check(axl_smbios_read_port_connector(bios, &pc_bad) == -1,
+                   "smbios: read_port_connector rejects Type 0 hdr");
+    }
+
+    // ----- Type 9: System Slots -----
+    {
+        size_t sl_count = 0;
+        AxlSmbiosHeader *sh = NULL;
+        while ((sh = axl_smbios_find_next(AXL_SMBIOS_TYPE_SYSTEM_SLOTS, sh)) != NULL) {
+            AxlSmbiosSystemSlot sl;
+            test_check(axl_smbios_read_system_slot(sh, &sl) == 0,
+                       "smbios: read_system_slot on real Type 9");
+            test_check(sl.designation != NULL, "smbios: system-slot designation populated");
+            sl_count++;
+            if (sl_count > 64) { break; }
+        }
+        AxlSmbiosSystemSlot sl_bad;
+        test_check(axl_smbios_read_system_slot(bios, &sl_bad) == -1,
+                   "smbios: read_system_slot rejects Type 0 hdr");
+    }
+
+    // ----- Type 11: OEM Strings -----
+    {
+        AxlSmbiosHeader *oh = axl_smbios_find(AXL_SMBIOS_TYPE_OEM_STRINGS);
+        if (oh != NULL) {
+            AxlSmbiosOemStrings oem;
+            test_check(axl_smbios_read_oem_strings(oh, &oem) == 0,
+                       "smbios: read_oem_strings on real Type 11");
+            test_check(oem.count <= 16, "smbios: oem strings count within cap");
+            for (uint8_t i = 0; i < oem.count; i++) {
+                test_check(oem.strings[i] != NULL, "smbios: oem string entry non-NULL");
+            }
+        }
+        AxlSmbiosOemStrings oem_bad;
+        test_check(axl_smbios_read_oem_strings(bios, &oem_bad) == -1,
+                   "smbios: read_oem_strings rejects Type 0 hdr");
+    }
+
+    // ----- Type 16: Physical Memory Array -----
+    {
+        AxlSmbiosHeader *ah = axl_smbios_find(AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY);
+        if (ah != NULL) {
+            AxlSmbiosPhysicalMemoryArray pma;
+            test_check(axl_smbios_read_physical_memory_array(ah, &pma) == 0,
+                       "smbios: read_physical_memory_array");
+            test_check(pma.max_capacity_bytes > 0,
+                       "smbios: pma max_capacity > 0");
+        }
+        AxlSmbiosPhysicalMemoryArray pma_bad;
+        test_check(axl_smbios_read_physical_memory_array(bios, &pma_bad) == -1,
+                   "smbios: read_physical_memory_array rejects Type 0 hdr");
+        /* Enum alias: PHYSICAL_MEMORY_ARRAY == PHYSICAL_MEMORY == 16 */
+        test_check(AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY == 16,
+                   "smbios: physical_memory_array enum is 16");
+        test_check(AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY ==
+                   AXL_SMBIOS_TYPE_PHYSICAL_MEMORY,
+                   "smbios: type 16 enum alias matches");
+    }
+
+    // ----- Type 19: Memory Array Mapped Address -----
+    {
+        AxlSmbiosHeader *mh2 = NULL;
+        size_t mam_count = 0;
+        while ((mh2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_ARRAY_MAP, mh2)) != NULL) {
+            AxlSmbiosMemoryArrayMap mam;
+            test_check(axl_smbios_read_memory_array_map(mh2, &mam) == 0,
+                       "smbios: read_memory_array_map on real Type 19");
+            test_check(mam.ending_address >= mam.starting_address,
+                       "smbios: type 19 end >= start");
+            mam_count++;
+            if (mam_count > 64) { break; }
+        }
+        AxlSmbiosMemoryArrayMap mam_bad;
+        test_check(axl_smbios_read_memory_array_map(bios, &mam_bad) == -1,
+                   "smbios: read_memory_array_map rejects Type 0 hdr");
+    }
+
+    // ----- Type 20: Memory Device Mapped Address -----
+    {
+        AxlSmbiosHeader *dh = NULL;
+        size_t mdm_count = 0;
+        while ((dh = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP, dh)) != NULL) {
+            AxlSmbiosMemoryDeviceMap mdm;
+            test_check(axl_smbios_read_memory_device_map(dh, &mdm) == 0,
+                       "smbios: read_memory_device_map on real Type 20");
+            test_check(mdm.ending_address >= mdm.starting_address,
+                       "smbios: type 20 end >= start");
+            mdm_count++;
+            if (mdm_count > 64) { break; }
+        }
+        AxlSmbiosMemoryDeviceMap mdm_bad;
+        test_check(axl_smbios_read_memory_device_map(bios, &mdm_bad) == -1,
+                   "smbios: read_memory_device_map rejects Type 0 hdr");
+        test_check(AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP == 20,
+                   "smbios: memory_device_map enum is 20");
+    }
+
+    // ----- Type 41: Onboard Devices Extended -----
+    {
+        AxlSmbiosHeader *oh2 = NULL;
+        size_t obx_count = 0;
+        while ((oh2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT, oh2)) != NULL) {
+            AxlSmbiosOnboardDeviceExt obx;
+            test_check(axl_smbios_read_onboard_device_ext(oh2, &obx) == 0,
+                       "smbios: read_onboard_device_ext on real Type 41");
+            test_check(obx.reference_designation != NULL,
+                       "smbios: type 41 designation populated");
+            obx_count++;
+            if (obx_count > 64) { break; }
+        }
+        AxlSmbiosOnboardDeviceExt obx_bad;
+        test_check(axl_smbios_read_onboard_device_ext(bios, &obx_bad) == -1,
+                   "smbios: read_onboard_device_ext rejects Type 0 hdr");
+        test_check(AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT == 41,
+                   "smbios: onboard_device_ext enum is 41");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1331,155 @@ test_config_setv(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl-subcommand
+// ---------------------------------------------------------------------------
+
+static int g_sub_calls;        /* per-test counter the dummy fns increment */
+static int g_sub_last_argc;
+static const char *g_sub_last_arg0;
+
+static int
+sub_bios(int argc, char **argv)
+{
+    g_sub_calls++;
+    g_sub_last_argc = argc;
+    g_sub_last_arg0 = (argc > 0 && argv != NULL) ? argv[0] : NULL;
+    return 42;     /* arbitrary non-zero so we can verify return passthrough */
+}
+static int
+sub_sysid(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    g_sub_calls++;
+    return 0;
+}
+static int
+sub_crash(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    g_sub_calls++;
+    return -7;
+}
+
+static void
+test_subcommand_dispatch(void)
+{
+    static const AxlSubcommand kCmds[] = {
+        { "bios",  sub_bios,   "[test|pci]",  "do bios test  — run POST self-test\n" },
+        { "sysid", sub_sysid,  "[hexValue]",  NULL  },
+        { "crash", sub_crash,  "trigger",     NULL  },
+    };
+    static const size_t kCount = sizeof(kCmds) / sizeof(kCmds[0]);
+
+    /* exact match → fn invoked, return value passed through */
+    {
+        char *argv[] = { (char *)"do", (char *)"bios", (char *)"--flag", (char *)"v" };
+        g_sub_calls = 0;
+        g_sub_last_arg0 = NULL;
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 4, argv, "do");
+        test_check(rc == 42, "subcommand: dispatch returns fn's rc");
+        test_check(g_sub_calls == 1, "subcommand: fn called exactly once");
+        /* argv shifted so the subcommand sees its own name as argv[0] */
+        test_check(g_sub_last_argc == 3, "subcommand: shifted argc");
+        test_check(g_sub_last_arg0 != NULL
+                   && axl_strcmp(g_sub_last_arg0, "bios") == 0,
+                   "subcommand: argv[0] is the subcommand name");
+    }
+
+    /* "help" alone → returns 0, no fn invoked */
+    {
+        char *argv[] = { (char *)"do", (char *)"help" };
+        g_sub_calls = 0;
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        test_check(rc == 0, "subcommand: help returns 0");
+        test_check(g_sub_calls == 0, "subcommand: help doesn't invoke any fn");
+    }
+
+    /* "-h" / "--help" both → help (no fn invoked) */
+    {
+        char *argv1[] = { (char *)"do", (char *)"-h" };
+        char *argv2[] = { (char *)"do", (char *)"--help" };
+        g_sub_calls = 0;
+        test_check(axl_subcommand_dispatch(kCmds, kCount, 2, argv1, "do") == 0,
+                   "subcommand: -h returns 0");
+        test_check(axl_subcommand_dispatch(kCmds, kCount, 2, argv2, "do") == 0,
+                   "subcommand: --help returns 0");
+        test_check(g_sub_calls == 0, "subcommand: -h/--help no fn invocations");
+    }
+
+    /* "help <cmd>" prints command help, returns 0 */
+    {
+        char *argv[] = { (char *)"do", (char *)"help", (char *)"bios" };
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 3, argv, "do");
+        test_check(rc == 0, "subcommand: help <cmd> returns 0");
+    }
+
+    /* "help <unknown>" returns -1 */
+    {
+        char *argv[] = { (char *)"do", (char *)"help", (char *)"nonsense" };
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 3, argv, "do");
+        test_check(rc == -1, "subcommand: help <unknown> returns -1");
+    }
+
+    /* unknown command → -1 */
+    {
+        char *argv[] = { (char *)"do", (char *)"frobnicate" };
+        g_sub_calls = 0;
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        test_check(rc == -1, "subcommand: unknown command returns -1");
+        test_check(g_sub_calls == 0, "subcommand: unknown doesn't invoke any fn");
+    }
+
+    /* typo close to "sysid" → still -1 but the "did you mean" path runs */
+    {
+        char *argv[] = { (char *)"do", (char *)"sysud" };
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        test_check(rc == -1, "subcommand: close typo returns -1");
+        /* No way to capture stderr text here; just exercise the path. */
+    }
+
+    /* argc < 2 → help, returns 0 */
+    {
+        char *argv[] = { (char *)"do" };
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 1, argv, "do");
+        test_check(rc == 0, "subcommand: no args returns 0 (help)");
+    }
+
+    /* prog_name NULL → derive from argv[0] basename */
+    {
+        char *argv[] = { (char *)"fs0:\\path\\do.efi", (char *)"bios" };
+        g_sub_calls = 0;
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, NULL);
+        test_check(rc == 42 && g_sub_calls == 1,
+                   "subcommand: NULL prog_name still dispatches");
+    }
+
+    /* return -7 from crash subcommand passes through */
+    {
+        char *argv[] = { (char *)"do", (char *)"crash" };
+        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        test_check(rc == -7, "subcommand: negative rc passes through");
+    }
+
+    /* Empty table behaves: help only */
+    {
+        char *argv[] = { (char *)"do" };
+        int rc = axl_subcommand_dispatch(NULL, 0, 1, argv, "do");
+        test_check(rc == 0, "subcommand: empty table + no args returns 0");
+        char *argv2[] = { (char *)"do", (char *)"anything" };
+        int rc2 = axl_subcommand_dispatch(NULL, 0, 2, argv2, "do");
+        test_check(rc2 == -1, "subcommand: empty table + unknown returns -1");
+    }
+
+    /* Public print fns shouldn't crash on edge cases */
+    axl_subcommand_print_help(kCmds, kCount, "do");
+    axl_subcommand_print_help(NULL, 0, "do");
+    axl_subcommand_print_command_help(&kCmds[0], "do");
+    axl_subcommand_print_command_help(NULL, "do");
+    test_check(true, "subcommand: print fns don't crash");
+}
+
+// ---------------------------------------------------------------------------
 // axl_driver_ensure
 // ---------------------------------------------------------------------------
 
@@ -1328,6 +1635,7 @@ test_util_main(int argc, char **argv)
     test_config_callback();
     test_config_validation();
     test_config_setv();
+    test_subcommand_dispatch();
     test_driver_ensure();
     test_driver_locate();
     test_diag_probe_protocol();

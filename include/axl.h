@@ -48,6 +48,7 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-diag.h>
 #include <axl/axl-config.h>
+#include <axl/axl-subcommand.h>
 #include <axl/axl-event.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-defer.h>

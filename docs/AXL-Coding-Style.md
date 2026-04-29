@@ -263,6 +263,52 @@ axl_do_something(AxlHashTable *table, const char *key)
 }
 ```
 
+## CLI Patterns
+
+UEFI applications come in two shapes:
+
+1. **Single-purpose tool** — one job, configured via flags.
+   Canonical example: `mkrd` (`mkrd <label> [-s size] | -l | -d <label>`).
+   Use `axl_config_*` to declare a flag descriptor table, parse
+   `argv` once in `main`, dispatch the operation. No subcommand
+   layer needed.
+
+2. **Multi-command tool** — multiple distinct operations under a
+   common executable, often grouped into categories (`do bios`,
+   `do sysid`, `do crb`). Canonical example: `do.efi` (the
+   delldiags hardware-diagnostic CLI port).
+
+   Use `<axl/axl-subcommand.h>` for dispatch, plus `axl_config_*`
+   inside each subcommand for its own flag parsing:
+
+   ```c
+   static int
+   do_bios(int argc, char **argv)
+   {
+       /* argv[0] is "bios"; flags via axl_config_* on argv */
+       /* ... */
+       return 0;
+   }
+
+   static const AxlSubcommand kCommands[] = {
+       { "bios",  do_bios,  "[test|pci|irq|slot|emb]",
+         "do bios test  — run BIOS POST self-test\n" },
+       { "sysid", do_sysid, "[hexValue]", NULL },
+   };
+
+   int
+   main(int argc, char **argv)
+   {
+       return axl_subcommand_dispatch(kCommands,
+           sizeof(kCommands) / sizeof(kCommands[0]),
+           argc, argv, "do");
+   }
+   ```
+
+   The dispatcher handles `<prog>`, `<prog> help`, `<prog> help <cmd>`,
+   `-h`/`--help`, "did you mean" typo suggestions, and shifts `argv`
+   so each subcommand sees its own name as `argv[0]`.
+
 ## Printf and Variadic Functions
 
 AXL has its own lightweight printf engine (`axl_vformat`) that uses

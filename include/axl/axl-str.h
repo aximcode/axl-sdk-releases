@@ -679,6 +679,32 @@ axl_strtou64(
     const char *s  ///< number string (decimal or "0x" hex)
 );
 
+/**
+ * @brief Parse a hex/decimal value with an optional `+offset` suffix.
+ *
+ * Common pattern in CLI tools that take an address with an offset
+ * (e.g. `do crb tag+offset reg`, `do rb physAddr+offset count`).
+ * Accepts:
+ *
+ *   - "0x100"           → base = 0x100, offset = 0
+ *   - "256"             → base = 256, offset = 0
+ *   - "0x100+0x10"      → base = 0x100, offset = 0x10
+ *   - "256+16"          → base = 256, offset = 16
+ *   - "0x1000+0xFF"     → 0x1000 + 0xFF = 0x10FF
+ *
+ * Strict: any unconsumed characters after the optional offset cause
+ * a parse error. Overflow on either component or on the sum returns
+ * -1. Leading whitespace is allowed (matches `axl_str_to_u64`) but
+ * not whitespace around the `+`. NULL input returns -1.
+ *
+ * @return 0 on success (with @a out populated), -1 on parse error.
+ */
+int
+axl_strtou64_with_offset(
+    const char *s,    ///< number string with optional "+offset" suffix
+    uint64_t   *out   ///< [out] parsed value (base + offset)
+);
+
 // ---------------------------------------------------------------------------
 // Wide-string (UCS-2) utilities — UEFI internal use.
 // Consumer code should use UTF-8. Convert with axl_ucs2_to_utf8().

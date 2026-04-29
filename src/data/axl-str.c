@@ -1562,3 +1562,66 @@ axl_strtou64(const char *s)
 
     return (uint64_t)val;
 }
+
+int
+axl_strtou64_with_offset(
+    const char  *s,
+    uint64_t    *out
+    )
+{
+    if (s == NULL || out == NULL) {
+        return -1;
+    }
+
+    /* Parse the base value. Auto-detect 0x prefix via base=0. The
+     * endptr tells us where parsing stopped — either '\0' (no
+     * offset) or '+' (offset follows). */
+    uint64_t     base_val = 0;
+    const char  *endptr   = NULL;
+    if (axl_str_to_u64(s, 0, &base_val, &endptr) != 0) {
+        return -1;
+    }
+
+    /* No offset: input must be fully consumed. */
+    if (*endptr == '\0') {
+        *out = base_val;
+        return 0;
+    }
+
+    /* Anything other than '+' immediately after the base value is a
+     * parse error. Reject whitespace around the '+' too — a
+     * legitimate value never has spaces in the middle, and being
+     * strict here catches typos that would otherwise silently
+     * produce a wrong result. */
+    if (*endptr != '+') {
+        return -1;
+    }
+    const char *off_str = endptr + 1;
+    if (*off_str == '\0' || *off_str == ' ' || *off_str == '\t') {
+        return -1;
+    }
+    /* axl_str_to_u64 itself accepts a leading '+' (and rejects '-')
+     * — strip those out here so "0x100++0x10" and "0x100+-0x10"
+     * are parse errors instead of slipping through to a positive
+     * accept on the inner call. The "+offset" syntax has exactly
+     * one '+' separator and no signs on either side. */
+    if (*off_str == '+' || *off_str == '-') {
+        return -1;
+    }
+
+    uint64_t     off_val = 0;
+    const char  *off_end = NULL;
+    if (axl_str_to_u64(off_str, 0, &off_val, &off_end) != 0) {
+        return -1;
+    }
+    if (*off_end != '\0') {
+        return -1;   /* trailing garbage after the offset */
+    }
+
+    /* Sum, with overflow check. */
+    if (off_val > UINT64_MAX - base_val) {
+        return -1;
+    }
+    *out = base_val + off_val;
+    return 0;
+}

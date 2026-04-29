@@ -36,6 +36,7 @@ AXL SDK
    modules/radix-tree
    modules/ring-buf
    modules/config
+   modules/subcommand
    modules/path
    modules/loop
    modules/task

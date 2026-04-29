@@ -690,3 +690,408 @@ axl_smbios_find_redfish_host_interface(
     }
     return -1;
 }
+
+// ---------------------------------------------------------------------------
+// axl_smbios_copy_string_utf8 — reentrant caller-buffer string accessor
+// ---------------------------------------------------------------------------
+
+size_t
+axl_smbios_copy_string_utf8(
+    AxlSmbiosHeader  *hdr,
+    uint8_t           string_index,
+    char             *buf,
+    size_t            buf_size
+    )
+{
+    if (buf != NULL && buf_size > 0) { buf[0] = '\0'; }
+    if (buf == NULL || buf_size == 0 || hdr == NULL || string_index == 0) {
+        return 0;
+    }
+
+    /* SMBIOS strings live inline after the formatted area; reuse the
+       direct-pointer helper to find the source then bound-copy. */
+    const char *src = axl_smbios_get_string_utf8(hdr, string_index);
+    if (src == NULL || src[0] == '\0') { return 0; }
+
+    size_t i = 0;
+    size_t cap = buf_size - 1;   /* room for terminator */
+    while (i < cap && src[i] != '\0') {
+        buf[i] = src[i];
+        i++;
+    }
+    buf[i] = '\0';
+    return i;
+}
+
+// ---------------------------------------------------------------------------
+// Type 8 — Port Connector Information
+//
+// Layout (SMBIOS spec):
+//   0x00  AxlSmbiosHeader (type 8)
+//   0x04  InternalReferenceDesignator  (string idx)
+//   0x05  InternalConnectorType        (1 byte)
+//   0x06  ExternalReferenceDesignator  (string idx)
+//   0x07  ExternalConnectorType        (1 byte)
+//   0x08  PortType                     (1 byte)
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_port_connector(
+    AxlSmbiosHeader         *hdr,
+    AxlSmbiosPortConnector  *out
+    )
+{
+    if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_PORT_CONNECTOR
+        || hdr->Length < 0x09)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    out->internal_designator     = axl_smbios_get_string_utf8(hdr, b[0x04]);
+    out->internal_connector_type = b[0x05];
+    out->external_designator     = axl_smbios_get_string_utf8(hdr, b[0x06]);
+    out->external_connector_type = b[0x07];
+    out->port_type               = b[0x08];
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 9 — System Slots
+//
+// Layout — only the fields AXL surfaces are listed; spec adds more after
+// the variable-length peer-grouping array (3.2+) which we don't expose.
+//
+//   0x00  AxlSmbiosHeader
+//   0x04  SlotDesignation       (string idx)
+//   0x05  SlotType              (1 byte)
+//   0x06  SlotDataBusWidth      (1 byte)
+//   0x07  CurrentUsage          (1 byte)
+//   0x08  SlotLength            (1 byte)
+//   0x09  SlotID                (2 bytes)
+//   0x0B  SlotCharacteristics1  (1 byte)
+//   0x0C  SlotCharacteristics2  (1 byte)  end of 2.0-2.5 record (length 0x0D)
+//   0x0D  SegmentGroupNumber    (2 bytes) added 2.6
+//   0x0F  BusNumber             (1 byte)  added 2.6
+//   0x10  DeviceFunction        (1 byte)  added 2.6 — record length 0x11
+//   0x11  DataBusWidthBase      (1 byte)  added 3.2
+//   0x12  PeerGroupingCount     (1 byte)  added 3.2
+//   0x13+ PeerGroups[]                    variable, omitted from typed reader
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_system_slot(
+    AxlSmbiosHeader      *hdr,
+    AxlSmbiosSystemSlot  *out
+    )
+{
+    if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_SYSTEM_SLOTS
+        || hdr->Length < 0x0D)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    out->designation         = axl_smbios_get_string_utf8(hdr, b[0x04]);
+    out->slot_type           = b[0x05];
+    out->slot_data_bus_width = b[0x06];
+    out->current_usage       = b[0x07];
+    out->slot_length         = b[0x08];
+    out->slot_id             = (uint16_t)b[0x09] | ((uint16_t)b[0x0A] << 8);
+
+    /* SMBIOS 2.6+ adds segment / bus / device:function. */
+    if (hdr->Length >= 0x11) {
+        out->segment_group   = (uint16_t)b[0x0D] | ((uint16_t)b[0x0E] << 8);
+        out->bus             = b[0x0F];
+        out->device_function = b[0x10];
+    } else {
+        out->segment_group   = 0xFFFF;
+        out->bus             = 0xFF;
+        out->device_function = 0xFF;
+    }
+
+    /* SMBIOS 3.2+ adds DataBusWidth (base) and PeerGroupingCount. */
+    if (hdr->Length >= 0x13) {
+        out->data_bus_width_base = b[0x11];
+        out->peer_grouping_count = b[0x12];
+    } else {
+        out->data_bus_width_base = 0;
+        out->peer_grouping_count = 0;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 11 — OEM Strings
+//
+// Layout:
+//   0x00  AxlSmbiosHeader
+//   0x04  Count   (1 byte: number of strings to follow)
+//
+// The strings themselves live in the standard SMBIOS string area after
+// the formatted record. axl_smbios_get_string_utf8 walks them by index.
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_oem_strings(
+    AxlSmbiosHeader      *hdr,
+    AxlSmbiosOemStrings  *out
+    )
+{
+    if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_OEM_STRINGS
+        || hdr->Length < 0x05)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    uint8_t  raw_count = b[0x04];
+    uint8_t  cap = (uint8_t)(sizeof(out->strings) / sizeof(out->strings[0]));
+    out->count = (raw_count <= cap) ? raw_count : cap;
+
+    for (uint8_t i = 0; i < cap; i++) {
+        if (i < out->count) {
+            /* SMBIOS strings are 1-based; spec index 1 is at array slot 0. */
+            out->strings[i] = axl_smbios_get_string_utf8(hdr, (uint8_t)(i + 1));
+        } else {
+            out->strings[i] = NULL;
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 16 — Physical Memory Array
+//
+// Layout:
+//   0x00  AxlSmbiosHeader
+//   0x04  Location               (1 byte)
+//   0x05  Use                    (1 byte)
+//   0x06  MemoryErrorCorrection  (1 byte: ECC type)
+//   0x07  MaximumCapacity        (4 bytes, kilobytes; 0x80000000 = use ExtendedMaxCapacity)
+//   0x0B  MemoryErrorInfoHandle  (2 bytes)
+//   0x0D  NumberOfMemoryDevices  (2 bytes)
+//   0x0F  ExtendedMaxCapacity    (8 bytes, bytes) — added 2.7
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_physical_memory_array(
+    AxlSmbiosHeader               *hdr,
+    AxlSmbiosPhysicalMemoryArray  *out
+    )
+{
+    if (out == NULL || hdr == NULL
+        || hdr->Type != AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY
+        || hdr->Length < 0x0F)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    out->location  = b[0x04];
+    out->use       = b[0x05];
+    out->ecc_type  = b[0x06];
+
+    uint32_t max_kb =  (uint32_t)b[0x07]
+                     | ((uint32_t)b[0x08] << 8)
+                     | ((uint32_t)b[0x09] << 16)
+                     | ((uint32_t)b[0x0A] << 24);
+    if (max_kb == 0x80000000U) {
+        /* Sentinel: "actual capacity is in ExtendedMaxCapacity"
+         * (spec 2.7+). If the record is too short to carry the
+         * Extended field, the firmware is malformed — surface
+         * that as 0 ("not published") rather than reading the
+         * literal sentinel × 1024 = 2 TB. */
+        if (hdr->Length >= 0x17) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) {
+                ext |= ((uint64_t)b[0x0F + i]) << (i * 8);
+            }
+            out->max_capacity_bytes = ext;
+        } else {
+            out->max_capacity_bytes = 0;
+        }
+    } else {
+        out->max_capacity_bytes = (uint64_t)max_kb * 1024ULL;
+    }
+
+    out->error_handle = (uint16_t)b[0x0B] | ((uint16_t)b[0x0C] << 8);
+    out->num_devices  = (uint16_t)b[0x0D] | ((uint16_t)b[0x0E] << 8);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 19 — Memory Array Mapped Address
+//
+// Layout:
+//   0x00  AxlSmbiosHeader
+//   0x04  StartingAddress         (4 bytes, KB units; 0xFFFFFFFF = use Extended)
+//   0x08  EndingAddress           (4 bytes, KB units; 0xFFFFFFFF = use Extended)
+//   0x0C  MemoryArrayHandle       (2 bytes)
+//   0x0E  PartitionWidth          (1 byte)
+//   0x0F  ExtendedStartingAddress (8 bytes, bytes) — added 2.7
+//   0x17  ExtendedEndingAddress   (8 bytes, bytes) — added 2.7
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_memory_array_map(
+    AxlSmbiosHeader          *hdr,
+    AxlSmbiosMemoryArrayMap  *out
+    )
+{
+    if (out == NULL || hdr == NULL
+        || hdr->Type != AXL_SMBIOS_TYPE_MEMORY_ARRAY_MAP
+        || hdr->Length < 0x0F)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    uint32_t start_kb =  (uint32_t)b[0x04]
+                       | ((uint32_t)b[0x05] << 8)
+                       | ((uint32_t)b[0x06] << 16)
+                       | ((uint32_t)b[0x07] << 24);
+    uint32_t end_kb   =  (uint32_t)b[0x08]
+                       | ((uint32_t)b[0x09] << 8)
+                       | ((uint32_t)b[0x0A] << 16)
+                       | ((uint32_t)b[0x0B] << 24);
+
+    /* Sentinel 0xFFFFFFFF KB → use Extended* (spec 2.7+). When the
+     * record is too short to carry the Extended field, surface the
+     * unresolvable sentinel as 0 to match the "not published"
+     * convention used by the rest of the readers. */
+    if (start_kb == 0xFFFFFFFFU) {
+        if (hdr->Length >= 0x1F) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) {
+                ext |= ((uint64_t)b[0x0F + i]) << (i * 8);
+            }
+            out->starting_address = ext;
+        } else {
+            out->starting_address = 0;
+        }
+    } else {
+        out->starting_address = (uint64_t)start_kb * 1024ULL;
+    }
+    if (end_kb == 0xFFFFFFFFU) {
+        if (hdr->Length >= 0x1F) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) {
+                ext |= ((uint64_t)b[0x17 + i]) << (i * 8);
+            }
+            out->ending_address = ext;
+        } else {
+            out->ending_address = 0;
+        }
+    } else {
+        out->ending_address = (uint64_t)end_kb * 1024ULL;
+    }
+
+    out->array_handle    = (uint16_t)b[0x0C] | ((uint16_t)b[0x0D] << 8);
+    out->partition_width = b[0x0E];
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 20 — Memory Device Mapped Address
+//
+// Layout:
+//   0x00  AxlSmbiosHeader
+//   0x04  StartingAddress              (4 bytes, KB; 0xFFFFFFFF = use Extended)
+//   0x08  EndingAddress                (4 bytes, KB; 0xFFFFFFFF = use Extended)
+//   0x0C  MemoryDeviceHandle           (2 bytes)
+//   0x0E  MemoryArrayMappedAddrHandle  (2 bytes)
+//   0x10  PartitionRowPosition         (1 byte)
+//   0x11  InterleavePosition           (1 byte)
+//   0x12  InterleaveDataDepth          (1 byte)
+//   0x13  ExtendedStartingAddress      (8 bytes, bytes) — added 2.7
+//   0x1B  ExtendedEndingAddress        (8 bytes, bytes) — added 2.7
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_memory_device_map(
+    AxlSmbiosHeader           *hdr,
+    AxlSmbiosMemoryDeviceMap  *out
+    )
+{
+    if (out == NULL || hdr == NULL
+        || hdr->Type != AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP
+        || hdr->Length < 0x13)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    uint32_t start_kb =  (uint32_t)b[0x04]
+                       | ((uint32_t)b[0x05] << 8)
+                       | ((uint32_t)b[0x06] << 16)
+                       | ((uint32_t)b[0x07] << 24);
+    uint32_t end_kb   =  (uint32_t)b[0x08]
+                       | ((uint32_t)b[0x09] << 8)
+                       | ((uint32_t)b[0x0A] << 16)
+                       | ((uint32_t)b[0x0B] << 24);
+
+    /* Sentinel handling matches Type 19 — see that reader's comment. */
+    if (start_kb == 0xFFFFFFFFU) {
+        if (hdr->Length >= 0x23) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) {
+                ext |= ((uint64_t)b[0x13 + i]) << (i * 8);
+            }
+            out->starting_address = ext;
+        } else {
+            out->starting_address = 0;
+        }
+    } else {
+        out->starting_address = (uint64_t)start_kb * 1024ULL;
+    }
+    if (end_kb == 0xFFFFFFFFU) {
+        if (hdr->Length >= 0x23) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) {
+                ext |= ((uint64_t)b[0x1B + i]) << (i * 8);
+            }
+            out->ending_address = ext;
+        } else {
+            out->ending_address = 0;
+        }
+    } else {
+        out->ending_address = (uint64_t)end_kb * 1024ULL;
+    }
+
+    out->device_handle         = (uint16_t)b[0x0C] | ((uint16_t)b[0x0D] << 8);
+    out->array_map_handle      = (uint16_t)b[0x0E] | ((uint16_t)b[0x0F] << 8);
+    out->partition_row_pos     = b[0x10];
+    out->interleave_position   = b[0x11];
+    out->interleave_data_depth = b[0x12];
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type 41 — Onboard Devices Extended Information
+//
+// Layout:
+//   0x00  AxlSmbiosHeader
+//   0x04  ReferenceDesignation  (string idx)
+//   0x05  DeviceType            (1 byte: bit 7 = Status, low 7 = type)
+//   0x06  DeviceTypeInstance    (1 byte)
+//   0x07  SegmentGroupNumber    (2 bytes)
+//   0x09  BusNumber             (1 byte)
+//   0x0A  DeviceFunctionNumber  (1 byte: bits 7:3 = device, bits 2:0 = function)
+// ---------------------------------------------------------------------------
+
+int
+axl_smbios_read_onboard_device_ext(
+    AxlSmbiosHeader            *hdr,
+    AxlSmbiosOnboardDeviceExt  *out
+    )
+{
+    if (out == NULL || hdr == NULL
+        || hdr->Type != AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT
+        || hdr->Length < 0x0B)
+    {
+        return -1;
+    }
+    const uint8_t *b = (const uint8_t *)hdr;
+    out->reference_designation = axl_smbios_get_string_utf8(hdr, b[0x04]);
+    out->device_type           = b[0x05];
+    out->device_type_instance  = b[0x06];
+    out->segment_group         = (uint16_t)b[0x07] | ((uint16_t)b[0x08] << 8);
+    out->bus                   = b[0x09];
+    out->device_function       = b[0x0A];
+    return 0;
+}

@@ -134,12 +134,32 @@ release is considered shipped.
 
 ### 7. Confirm
 
+The Release is published on the public sibling repo
+`aximcode/axl-sdk-releases`, not on the private upstream — pass
+`--repo` to `gh release view`:
+
 ```sh
-gh release view vX.Y.Z
+gh release view vX.Y.Z --repo aximcode/axl-sdk-releases
 ```
 
-Should show the release page with `axl-sdk_X.Y.Z_amd64.deb` and
-`axl-sdk-X.Y.Z-1.x86_64.rpm` (and AARCH64 equivalents) attached.
+Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
+`axl-sdk-tools-{x64,aa64}.tar.gz`,
+`axl-sdk-host-tools.{tar.gz,deb}`, and `SHA256SUMS` attached.
+
+### 8. Get back on `main`
+
+```sh
+git checkout main      # if `git status` shows detached HEAD
+git status             # confirm: "On branch main, working tree clean"
+```
+
+`git tag -a` and `git push origin <tag>` themselves don't detach
+HEAD, but a typical release session involves enough sideband
+operations (rebases, fix-ups during step 5's tag-message edit,
+`git checkout vX.Y.Z` to spot-check the tagged tree before
+pushing) that it's worth verifying. Subsequent commits made
+while detached will be invisible to `git push origin main`,
+which is the silent-data-loss case to avoid.
 
 ## Recovery: a failed release tag
 
