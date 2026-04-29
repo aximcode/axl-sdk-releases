@@ -3,6 +3,36 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.5.1 — 2026-04-29
+
+Cross-compile fix for installed packages on RHEL-family hosts.
+
+### Fixed
+
+- **aa64 cross-build under installed `axl-cc` on AlmaLinux/RHEL** —
+  the v0.5.0 package staged headers directly under `<prefix>/include/`,
+  so on a system install (`PREFIX=/usr`) `axl-cc` compiled with
+  `-I /usr/include`. Host glibc's `stdint.h` then shadowed cross-gcc's
+  freestanding `stdint.h`, chaining into `gnu/stubs-32.h`, which
+  RHEL/Alma don't ship — failing every `--arch aa64` build with
+  "gnu/stubs-32.h: No such file or directory". Ubuntu only masked
+  this because `gcc-multilib` happens to ship the 32-bit stubs.
+
+### Changed
+
+- **Installed header layout namespaced under `axl-sdk/`** —
+  package now stages headers at `<prefix>/include/axl-sdk/{axl.h,
+  axl/, uefi/}` instead of `<prefix>/include/`. `axl-cc`,
+  `axl-config.cmake`, and `axl.pc` all point at the namespaced
+  subdirectory, so `/usr/include` itself never appears in the
+  compiler command line and cross-gcc's freestanding headers win
+  via the normal built-in search order. User code (`#include <axl.h>`,
+  `#include <axl/axl-mem.h>`) is unchanged. Dev-tree library build
+  unchanged — the namespacing is install-time only.
+- **`-I` → `-isystem` for the SDK include path** — secondary
+  benefit: SDK headers are now treated as system headers, so
+  warnings from them don't bubble up into user-app builds.
+
 ## 0.5.0 — 2026-04-29
 
 String parsing companion to `AxlString` (the builder). Closes the

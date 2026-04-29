@@ -465,11 +465,35 @@ fi
 if [[ -n "${MKIMAGE_DIR:-}" && -f "$MKIMAGE_DIR/mkimage.py" ]]; then
     "$MKIMAGE_DIR/mkimage.py" --source "$STAGING" --target "$TMPDIR/disk.img" --label RUN > /dev/null 2>&1
 else
+    # Validate up-front so a missing tool surfaces with an install
+    # hint instead of dying silently under `set -e` after the next
+    # command's stderr lands in /dev/null.
+    missing=()
+    command -v mkfs.vfat >/dev/null 2>&1 || missing+=("mkfs.vfat (dosfstools)")
+    command -v mcopy     >/dev/null 2>&1 || missing+=("mcopy (mtools)")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        cat >&2 <<EOF
+ERROR: disk-image build needs tools that are not installed:
+  - ${missing[*]}
+
+  Install:
+    Debian/Ubuntu:    sudo apt install dosfstools mtools
+    Fedora/RHEL:      sudo dnf install dosfstools mtools
+    Arch:             sudo pacman -S dosfstools mtools
+
+  Or set MKIMAGE_DIR=/path/to/mkimage to use the mkimage backend instead.
+EOF
+        exit 1
+    fi
+
     size_kb=$(du -sk "$STAGING" | cut -f1)
     size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))   # round up to MB
     [[ $size_kb -lt 40960 ]] && size_kb=40960        # min 40 MB
     dd if=/dev/zero of="$TMPDIR/disk.img" bs=1K count="$size_kb" 2>/dev/null
-    mkfs.vfat -F 32 -n RUN "$TMPDIR/disk.img" >/dev/null 2>&1
+    # mkfs.vfat / mcopy errors are surfaced (not redirected to /dev/null) —
+    # if formatting or staging fails, the user sees why instead of a
+    # silent set -e exit.
+    mkfs.vfat -F 32 -n RUN "$TMPDIR/disk.img" >/dev/null
     # Use mcopy -s for recursive copy. Pass top-level entries by name
     # (no leading "./") so mcopy's destination path is clean and mtools
     # creates the directory tree on the fly. The previous per-file
@@ -477,7 +501,7 @@ else
     (
         cd "$STAGING" || exit 1
         for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
-            mcopy -s -i "$TMPDIR/disk.img" "$entry" "::/" 2>/dev/null
+            mcopy -s -i "$TMPDIR/disk.img" "$entry" "::/"
         done
     )
 fi

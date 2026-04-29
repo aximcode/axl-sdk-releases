@@ -72,8 +72,18 @@ esac
 # dropping these under /usr works identically to a tarball unpacked
 # under /opt/axl-sdk.
 
+# Headers are namespaced under include/axl-sdk/ rather than living
+# directly under include/. This keeps /usr/include itself out of the
+# axl-cc command line on system installs (PREFIX=/usr) — otherwise
+# `-isystem /usr/include` shadows cross-gcc's freestanding stdint.h
+# with host glibc's, which then chains to gnu/stubs-32.h and breaks
+# aa64 cross-builds on hosts (RHEL/Alma) that don't ship 32-bit stubs.
+# axl-cc / cmake / pkg-config all point at <prefix>/include/axl-sdk
+# so user `#include <axl.h>` and `#include <axl/axl-mem.h>` resolve
+# unchanged.
 mkdir -p "$PREFIX/bin" \
-         "$PREFIX/include/axl" "$PREFIX/include/uefi/generated" \
+         "$PREFIX/include/axl-sdk/axl" \
+         "$PREFIX/include/axl-sdk/uefi/generated" \
          "$PREFIX/lib/axl" "$PREFIX/lib/cmake/axl" "$PREFIX/lib/pkgconfig" \
          "$PREFIX/share/axl"
 
@@ -110,7 +120,7 @@ for arch in "${ARCHES[@]}"; do
 prefix=${pcfiledir}/../..
 exec_prefix=${prefix}
 libdir=${prefix}/lib/axl/@AXL_ARCH@
-includedir=${prefix}/include
+includedir=${prefix}/include/axl-sdk
 
 Name: axl
 Description: AximCode Library - GLib-inspired C library for UEFI (@AXL_ARCH@)
@@ -129,11 +139,13 @@ PCEOF
 done
 log_info "Installed axl.pc (pkg-config)"
 
-# Headers (including uefi/generated/ subdirectory)
-cp "$LIBAXL_DIR/include/axl.h"                     "$PREFIX/include/"
-cp "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/include/axl/"
-cp "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/uefi/"
-cp "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/uefi/generated/"
+# Headers (including uefi/generated/ subdirectory).
+# Staged under include/axl-sdk/ so the axl-cc -isystem flag points
+# at a SDK-only directory, not /usr/include directly. See note above.
+cp "$LIBAXL_DIR/include/axl.h"                     "$PREFIX/include/axl-sdk/"
+cp "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/include/axl-sdk/axl/"
+cp "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/axl-sdk/uefi/"
+cp "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi/generated/"
 
 # GCC linker scripts live next to the per-arch lib data.
 cp "$LIBAXL_DIR/scripts/elf_x86_64_efi.lds"  "$PREFIX/lib/axl/"
@@ -171,7 +183,7 @@ if(NOT DEFINED AXL_ARCH)
     set(AXL_ARCH "x64")
 endif()
 
-set(AXL_INCLUDE_DIR "${AXL_SDK_DIR}/include")
+set(AXL_INCLUDE_DIR "${AXL_SDK_DIR}/include/axl-sdk")
 set(AXL_LIB_DIR     "${AXL_SDK_DIR}/lib/axl/${AXL_ARCH}")
 
 if(AXL_ARCH STREQUAL "x64")
@@ -220,7 +232,7 @@ function(axl_add_app TARGET)
         add_custom_command(
             OUTPUT ${OBJ}
             COMMAND ${AXL_CROSS}gcc ${AXL_C_FLAGS} ${AXL_GCC_ARCH}
-                    -I ${AXL_INCLUDE_DIR}
+                    -isystem ${AXL_INCLUDE_DIR}
                     -c ${SRC_ABS} -o ${OBJ}
             DEPENDS ${SRC_ABS}
             COMMENT "gcc: ${SRC}"
@@ -437,7 +449,7 @@ for src in "${SOURCES[@]}"; do
         -ffunction-sections -fdata-sections \
         $OPT_FLAGS -Wall \
         -DAXL_BACKEND_NATIVE \
-        -I"$SDK_DIR/include" \
+        -isystem "$SDK_DIR/include/axl-sdk" \
         ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
         -c "$src" -o "$obj" || { echo "ERROR: compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
 
