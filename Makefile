@@ -688,6 +688,27 @@ TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 tools: $(TOOL_EFIS)
 	@echo "  Built $(words $(TOOL_NAMES)) tools"
 
+# Embedded driver blob for mkrd. Vendored EDK2 RamDiskDxe.efi (one per
+# arch) is converted to a `static const unsigned char[]` header at build
+# time; mkrd LoadImages it from memory when the host firmware doesn't
+# ship EFI_RAM_DISK_PROTOCOL. See third_party/edk2/README.md for
+# provenance and license.
+#
+# xxd -i emits non-static `unsigned char NAME[]` + `unsigned int
+# NAME_len`; sed adds `const` so the data lands in .rodata. Symbols
+# stay external-linkage — mkrd.c declares them via `extern const`
+# at the top of the file (matching declarations satisfy editors and
+# static analyzers that don't see the -include flag).
+EMBEDDED_RAMDISK_SRC = third_party/edk2/RamDiskDxe-$(ARCH).efi
+EMBEDDED_RAMDISK_HDR = $(BUILDDIR)/mkrd-ramdisk-blob.h
+
+$(EMBEDDED_RAMDISK_HDR): $(EMBEDDED_RAMDISK_SRC) | $(BUILDDIR)
+	@echo "  EMBED   $< -> $(notdir $@)"
+	@cd $(dir $<) && xxd -i -n axl_embedded_ramdiskdxe $(notdir $<) \
+	    | sed -e 's/^unsigned char/const unsigned char/' \
+	          -e 's/^unsigned int/const unsigned int/' \
+	    > $(abspath $@)
+
 define BUILD_TOOL
 $(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
 	$$(call LINK_EFI_APP,$(BUILDDIR)/$(1).o,$$@)
@@ -697,6 +718,13 @@ $(BUILDDIR)/$(1).o: tools/$(1).c | $(BUILDDIR)
 endef
 
 $(foreach t,$(TOOL_NAMES),$(eval $(call BUILD_TOOL,$(t))))
+
+# mkrd needs the embedded RamDiskDxe blob — override the generic
+# tool rule with one that depends on (and includes) the generated
+# header. -include forces the header into the translation unit
+# without touching mkrd.c's #include list.
+$(BUILDDIR)/mkrd.o: tools/mkrd.c $(EMBEDDED_RAMDISK_HDR) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -include $(EMBEDDED_RAMDISK_HDR) -c $< -o $@
 
 $(PREFIX)/tools:
 	@mkdir -p $@

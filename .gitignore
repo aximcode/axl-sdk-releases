@@ -11,6 +11,9 @@ tests/.last-pass-count
 *.dll
 *.map
 *.efi
+# Vendored EDK2 binaries embedded into mkrd.efi at build time —
+# tracked despite the *.efi blanket rule above.
+!third_party/edk2/*.efi
 *.lib
 .playwright-mcp/
 .wrangler/

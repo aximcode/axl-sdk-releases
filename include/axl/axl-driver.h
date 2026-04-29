@@ -276,6 +276,54 @@ axl_driver_ensure(
 );
 
 /**
+ * @brief Ensure a protocol-providing driver is loaded, with embedded
+ *        fallback and optional caller override.
+ *
+ * Generalizes axl_driver_ensure() for tools that ship a driver blob
+ * baked into the .efi binary itself, so they work as self-contained
+ * binaries on minimal firmware that omits the corresponding optional
+ * UEFI 2.6+ DXE module.
+ *
+ * Resolution order:
+ *   1. `LocateProtocol(protocol_guid)` — short-circuit if firmware
+ *      already provides the protocol. Most OEM firmware (Dell, HP,
+ *      Supermicro) ships RamDiskDxe and similar in their firmware
+ *      volume; this is the common path.
+ *   2. If `override_name` is non-NULL, search disk for that name only
+ *      using axl_driver_ensure()'s 4-path search. The embedded blob
+ *      is NOT used as a fallback — caller explicitly opted into a
+ *      specific external driver.
+ *   3. Otherwise, search disk for `driver_name` using the same 4-path
+ *      search. If found, load + start it.
+ *   4. If still not registered and `embedded_buf` is non-NULL, call
+ *      `LoadImage(SourceBuffer=embedded_buf, SourceSize=embedded_len)`
+ *      followed by `StartImage`. No filesystem access.
+ *
+ * The embedded path is the safety net — it lets the tool work on
+ * firmware that ships neither the protocol nor a user-staged copy.
+ *
+ * `axl_driver_ensure(g, n)` is exactly `axl_driver_ensure_with_embedded(
+ * g, n, NULL, 0, NULL)`.
+ *
+ * Trust caveat (same as axl_driver_ensure): step 3 will load the first
+ * matching .efi off any mounted FAT volume. Don't pass attacker-
+ * controlled @p driver_name or @p override_name. The embedded buffer
+ * is whatever the build system baked in — caller's responsibility to
+ * verify provenance.
+ *
+ * @return 0 if the protocol is registered (was already, or after
+ *     loading); -1 if all four steps failed.
+ */
+int
+axl_driver_ensure_with_embedded(
+    const AxlGuid       *protocol_guid,   ///< protocol GUID to look up (must be non-NULL)
+    const char          *driver_name,     ///< canonical driver filename, e.g. "RamDiskDxe.efi"
+    const unsigned char *embedded_buf,    ///< embedded .efi bytes (may be NULL)
+    size_t               embedded_len,    ///< length of embedded_buf in bytes (0 if NULL)
+    const char          *override_name    ///< user-provided override name (may be NULL)
+);
+
+/**
  * @brief Load, start, and connect all .efi drivers in a directory.
  *
  * Scans @p dir_path for files matching @p pattern (glob, e.g. "*.efi").

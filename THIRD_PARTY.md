@@ -29,3 +29,21 @@ mpg/p256-m, respectively). Both are distributed within mbedtls under
 compatible Apache 2.0 terms; see the mbedtls LICENSE file for details.
 
 No modifications have been made to the vendored mbedtls source.
+
+## EDK2 — RamDiskDxe.efi
+
+- **Source:** https://github.com/tianocore/edk2 — `MdeModulePkg/Universal/Disk/RamDiskDxe/`
+- **Vendored path in source tree:** `third_party/edk2/RamDiskDxe-{x64,aa64}.efi`
+- **Copyright:** 2017–2024, Intel Corporation. All rights reserved.
+- **License:** [BSD-2-Clause-Patent](https://spdx.org/licenses/BSD-2-Clause-Patent.html)
+- **Full license text:** `third_party/edk2/LICENSE`
+
+The pre-built `.efi` driver binaries are embedded into `tools/mkrd.efi`
+as `static const unsigned char[]` arrays at build time and
+`LoadImage`'d from memory at runtime when the host UEFI firmware does
+not ship `EFI_RAM_DISK_PROTOCOL` (a UEFI 2.6+ optional protocol).
+This lets `mkrd.efi` work as a self-contained binary on legacy /
+minimal firmware. No source modifications; the binaries are stock
+EDK2 GCC5 builds.
+
+See `third_party/edk2/README.md` for regeneration instructions.

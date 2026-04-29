@@ -98,6 +98,14 @@ cp "$PROJECT_ROOT/CHANGELOG.md" "$PROJECT_ROOT/README.md" \
 mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/mbedtls"
 cp "$PROJECT_ROOT/deps/mbedtls/LICENSE" \
    "$STAGE/usr/share/doc/axl-sdk/third_party/mbedtls/"
+# RamDiskDxe.efi (BSD-2-Clause-Patent) is embedded into mkrd.efi —
+# carry its LICENSE/README too. Doesn't affect libaxl.a, only the
+# tools tarball, but the SDK package documents the full third-party
+# surface.
+mkdir -p "$STAGE/usr/share/doc/axl-sdk/third_party/edk2"
+cp "$PROJECT_ROOT/third_party/edk2/LICENSE" \
+   "$PROJECT_ROOT/third_party/edk2/README.md" \
+   "$STAGE/usr/share/doc/axl-sdk/third_party/edk2/"
 
 # ---------------------------------------------------------------------------
 # Build .deb and .rpm
@@ -201,6 +209,13 @@ for arch in x64 aa64; do
     mkdir -p "$TOOLS_STAGE/third_party/mbedtls"
     cp "$PROJECT_ROOT/deps/mbedtls/LICENSE" \
        "$TOOLS_STAGE/third_party/mbedtls/"
+    # RamDiskDxe.efi (BSD-2-Clause-Patent) is embedded into mkrd.efi
+    # so it works on minimal firmware that omits the optional UEFI
+    # 2.6 EFI_RAM_DISK_PROTOCOL — carry its LICENSE.
+    mkdir -p "$TOOLS_STAGE/third_party/edk2"
+    cp "$PROJECT_ROOT/third_party/edk2/LICENSE" \
+       "$PROJECT_ROOT/third_party/edk2/README.md" \
+       "$TOOLS_STAGE/third_party/edk2/"
     cat > "$TOOLS_STAGE/README.txt" <<EOF
 AXL SDK pre-built UEFI tools for $arch
 version: $PKG_VERSION
@@ -233,6 +248,12 @@ Third-party licenses:
   dual-licensed Apache-2.0 OR GPL-2.0-or-later; this
   distribution elects Apache-2.0. Full license text at
   third_party/mbedtls/LICENSE.
+
+  mkrd.efi embeds RamDiskDxe.efi (Copyright (c) Intel
+  Corporation, BSD-2-Clause-Patent, from the EDK2
+  MdeModulePkg) so it works on minimal firmware that omits
+  the optional UEFI 2.6 EFI_RAM_DISK_PROTOCOL. Full license
+  text at third_party/edk2/LICENSE.
 
 Docs: https://axl.aximcode.com/
 EOF

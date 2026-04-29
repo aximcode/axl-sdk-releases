@@ -3,6 +3,43 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.5.2 — 2026-04-29
+
+`mkrd.efi` now ships as a self-contained binary that runs on minimal
+firmware that omits the optional UEFI 2.6 `EFI_RAM_DISK_PROTOCOL`
+(observed in the wild on a 2010-era Dell EDK1 firmware). Stock EDK2
+`RamDiskDxe.efi` is embedded at build time and `LoadImage`-from-memory'd
+at runtime if `LocateProtocol` and the on-disk search both miss.
+
+### Added
+
+- **`axl_driver_ensure_with_embedded()`** — generalization of
+  `axl_driver_ensure()` for tools that bake a driver blob into their
+  own `.efi`. Resolution order: `LocateProtocol` short-circuit →
+  `--driver`-style override (caller-provided name, disk-only) →
+  canonical disk search → `LoadImage` from embedded buffer. The old
+  `axl_driver_ensure(g, n)` is now a thin wrapper passing
+  `embedded_buf=NULL, override_name=NULL`. See
+  [`include/axl/axl-driver.h`](include/axl/axl-driver.h).
+- **`mkrd --driver <name>`** — override the embedded RamDiskDxe and
+  search disk for the named driver instead. When this flag is set,
+  the embedded fallback is intentionally disabled — caller explicitly
+  opted into a specific external driver. Useful for testing patched
+  or vendor-specific RAM-disk drivers.
+
+### Changed
+
+- **`mkrd.efi` is now self-contained.** Embedded
+  [`third_party/edk2/RamDiskDxe-{x64,aa64}.efi`](third_party/edk2/)
+  (BSD-2-Clause-Patent, stock EDK2 `MdeModulePkg`) — adds ~33 KB
+  to the x64 binary and ~41 KB to aa64. Goes into `.rodata`. Most
+  OEM firmware ships the protocol baked-in so the embedded blob is
+  never executed; it's purely a safety net for minimal firmware.
+- **Tools tarballs and SDK packages carry the new
+  `third_party/edk2/{LICENSE,README.md}`** — attribution is required
+  for binary-form redistribution under BSD-2-Clause-Patent §2.
+  Apache-2.0 §4(a) compliance for the SDK package preserved.
+
 ## 0.5.1 — 2026-04-29
 
 Cross-compile fix for installed packages on RHEL-family hosts.

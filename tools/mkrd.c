@@ -11,11 +11,33 @@
       MkRd.efi <label> [-s size]    Create RAM disk (default 4 MB)
       MkRd.efi -l                   List existing RAM disks
       MkRd.efi -d <label>           Destroy RAM disk by label
+      MkRd.efi --driver <name>      Override embedded RamDiskDxe with
+                                    a copy named <name> on disk
       MkRd.efi -h                   Help
+
+    Driver discovery: EFI_RAM_DISK_PROTOCOL is optional in UEFI 2.6+
+    and absent on some firmware. When the protocol isn't already
+    registered, MkRd auto-loads RamDiskDxe via the in-SDK helper:
+        1. LocateProtocol short-circuit (most OEM firmware ships it),
+        2. disk search for RamDiskDxe.efi (or the --driver override),
+        3. an embedded copy baked into MkRd at build time
+           (third_party/edk2/RamDiskDxe-<arch>.efi).
+    The embedded fallback makes MkRd a self-contained binary that
+    works on minimal firmware without the user staging any extra
+    files. See `axl_driver_ensure_with_embedded` in axl-driver.h.
 **/
 
 #include <axl.h>
 #include <uefi/axl-uefi.h>
+
+/* Embedded RamDiskDxe.efi blob — definitions are force-included via
+ * the Makefile's `-include $(BUILDDIR)/mkrd-ramdisk-blob.h` flag,
+ * which is regenerated from third_party/edk2/RamDiskDxe-$(ARCH).efi
+ * by `xxd -i`. The forward declarations here let editors and static
+ * analyzers (clangd, ccls) parse mkrd.c standalone without seeing
+ * the -include flag. The actual storage lives in .rodata in mkrd.o. */
+extern const unsigned char axl_embedded_ramdiskdxe[];
+extern const unsigned int  axl_embedded_ramdiskdxe_len;
 
 // ---------------------------------------------------------------------------
 // Device path constants (UEFI spec Table 10-46, 10-62)
@@ -45,11 +67,12 @@ typedef struct {
 static bool verbose = false;
 
 static const AxlConfigDesc descs[] = {
-    { "size",    AXL_CFG_STRING, NULL,    's', "Size in MB (default 4)",            0, 0 },
-    { "destroy", AXL_CFG_STRING, NULL,    'd', "Destroy RAM disk by volume label",  0, 0 },
-    { "list",    AXL_CFG_BOOL,   "false", 'l', "List existing RAM disks",           0, 0 },
-    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Verbose output",                    0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                    0, 0 },
+    { "size",    AXL_CFG_STRING, NULL,    's', "Size in MB (default 4)",                          0, 0 },
+    { "destroy", AXL_CFG_STRING, NULL,    'd', "Destroy RAM disk by volume label",                0, 0 },
+    { "list",    AXL_CFG_BOOL,   "false", 'l', "List existing RAM disks",                         0, 0 },
+    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Verbose output",                                  0, 0 },
+    { "driver",  AXL_CFG_STRING, NULL,    0,   "Driver name to load instead of embedded RamDiskDxe", 0, 0 },
+    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                                  0, 0 },
     { 0 }
 };
 
@@ -596,13 +619,32 @@ main(
             "EFI_RAM_DISK_PROTOCOL");
     }
 
-    /* All non-help modes need EFI_RAM_DISK_PROTOCOL. Auto-load
-     * RamDiskDxe.efi if it isn't already registered, so MkRd works
-     * from a bare UEFI shell without a startup.nsh that pre-loads
-     * the driver. */
-    if (axl_driver_ensure((const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
-                          "RamDiskDxe.efi") != 0) {
-        axl_printf("MkRd: RamDiskDxe.efi not found on any mounted volume.\n");
+    /* All non-help modes need EFI_RAM_DISK_PROTOCOL. Resolution
+     * order (see axl_driver_ensure_with_embedded):
+     *   1. firmware already published the protocol (most Dell/HP/
+     *      Supermicro boxes hit this path),
+     *   2. --driver <name> override: search disk only, no fallback,
+     *   3. canonical search for RamDiskDxe.efi on disk,
+     *   4. embedded RamDiskDxe.efi blob baked in at build time.
+     * The embedded blob makes MkRd self-contained on minimal
+     * firmware (e.g. Dell client BIOS without UEFI 2.6+ optional
+     * modules). axl_embedded_ramdiskdxe{,_len} are forced-included
+     * by the Makefile rule that consumes
+     * third_party/edk2/RamDiskDxe-$(ARCH).efi via xxd -i. */
+    const char *driver_override = axl_config_get(cfg, "driver");
+    if (axl_driver_ensure_with_embedded(
+            (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
+            "RamDiskDxe.efi",
+            axl_embedded_ramdiskdxe, axl_embedded_ramdiskdxe_len,
+            driver_override) != 0) {
+        if (driver_override != NULL) {
+            axl_printf("MkRd: '%s' not found on any mounted volume "
+                       "(--driver overrides embedded fallback).\n",
+                       driver_override);
+        } else {
+            axl_printf("MkRd: failed to register EFI_RAM_DISK_PROTOCOL "
+                       "(disk search and embedded fallback both failed).\n");
+        }
         return 1;
     }
 

@@ -517,34 +517,50 @@ axl_driver_locate(
     return rc;
 }
 
-int
-axl_driver_ensure(
-    const AxlGuid *protocol_guid,
-    const char    *driver_name
+/* Try to start a loaded driver and confirm it registered protocol_guid.
+ * Caller owns @p drv; on failure (return -1) the driver is unloaded.
+ * On success the driver stays loaded. EFI_ALREADY_STARTED is treated
+ * as success — some drivers DXE-Core-dispatched re-register cleanly. */
+static int
+driver_start_and_verify(
+    AxlDriverHandle drv,
+    const AxlGuid  *protocol_guid,
+    const char     *source_label  ///< for diagnostics, e.g. path or "<embedded>"
     )
 {
-    if (protocol_guid == NULL || driver_name == NULL) {
+    size_t exit_data_size = 0;
+    EFI_STATUS st = axl_bs()->StartImage(
+        (EFI_HANDLE)drv, &exit_data_size, NULL);
+
+    if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
+        axl_warning("driver ensure: StartImage failed for '%s': 0x%llx",
+                    source_label, (unsigned long long)st);
+        axl_driver_unload(drv);
         return -1;
     }
 
-    /* Step 1: short-circuit if the protocol is already registered. */
     if (driver_protocol_registered(protocol_guid) == 0) {
-        axl_debug("driver ensure: protocol already registered, skipping search");
+        axl_info("driver ensure: loaded '%s'", source_label);
         return 0;
     }
 
-    char  *candidates[DRIVER_MAX_CANDIDATES];
-    size_t n_cand = 0;
-    driver_build_candidates(driver_name, candidates, &n_cand);
+    /* Driver started but didn't register the expected protocol.
+     * Unload to keep system state clean. */
+    axl_warning("driver ensure: '%s' did not register protocol; unloading",
+                source_label);
+    axl_driver_unload(drv);
+    return -1;
+}
 
-    axl_debug("driver ensure: searching %zu candidate path%s for '%s'",
-              n_cand, n_cand == 1 ? "" : "s", driver_name);
-    for (size_t i = 0; i < n_cand; i++) {
-        axl_debug("  [%zu] %s", i, candidates[i]);
-    }
-
-    /* Try each candidate in priority order. */
-    int rc = -1;
+/* Walk the candidate list, attempting to load+start each in order.
+ * Returns 0 on first success, -1 if every candidate misses or fails. */
+static int
+driver_try_candidates(
+    const AxlGuid *protocol_guid,
+    char         **candidates,
+    size_t         n_cand
+    )
+{
     for (size_t i = 0; i < n_cand; i++) {
         AxlFileInfo info;
         if (axl_file_info(candidates[i], &info) != 0 || info.is_dir) {
@@ -558,42 +574,121 @@ axl_driver_ensure(
             continue;
         }
 
-        /* Inline StartImage so we can recognize EFI_ALREADY_STARTED.
-         * axl_driver_start collapses every error to -1. */
-        size_t exit_data_size = 0;
-        EFI_STATUS st = axl_bs()->StartImage(
-            (EFI_HANDLE)drv, &exit_data_size, NULL);
-
-        if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
-            axl_warning("driver ensure: StartImage failed for '%s': 0x%llx",
-                        candidates[i], (unsigned long long)st);
-            axl_driver_unload(drv);
-            continue;
+        if (driver_start_and_verify(drv, protocol_guid, candidates[i]) == 0) {
+            return 0;
         }
+    }
+    return -1;
+}
 
-        if (driver_protocol_registered(protocol_guid) == 0) {
-            axl_info("driver ensure: loaded '%s'", candidates[i]);
-            rc = 0;
-            break;
-        }
+/* LoadImage from a memory buffer (no DevicePath, no FilePath). Used
+ * by the embedded-driver fallback so tools work on firmware that
+ * ships neither the protocol nor a user-staged copy on disk. */
+static int
+driver_load_embedded(
+    const AxlGuid       *protocol_guid,
+    const unsigned char *buf,
+    size_t               len
+    )
+{
+    extern EFI_HANDLE gImageHandle;
 
-        /* Driver started but didn't register the expected protocol.
-         * Unload to keep system state clean and try the next path. */
-        axl_warning("driver ensure: '%s' did not register protocol; unloading",
-                    candidates[i]);
-        axl_driver_unload(drv);
+    EFI_HANDLE  drv_handle = NULL;
+    EFI_STATUS  st = axl_bs()->LoadImage(
+        FALSE,                          /* BootPolicy */
+        gImageHandle,                   /* ParentImageHandle */
+        NULL,                           /* DevicePath (none — pure mem load) */
+        (void *)(uintptr_t)buf,         /* SourceBuffer */
+        len,                            /* SourceSize */
+        &drv_handle);
+
+    if (EFI_ERROR(st) || drv_handle == NULL) {
+        axl_warning("driver ensure: LoadImage(embedded, %zu bytes) failed: 0x%llx",
+                    len, (unsigned long long)st);
+        return -1;
     }
 
-    if (rc != 0) {
-        axl_warning("driver ensure: '%s' not found in %zu candidate path%s",
-                    driver_name, n_cand, n_cand == 1 ? "" : "s");
+    return driver_start_and_verify((AxlDriverHandle)drv_handle,
+                                   protocol_guid, "<embedded>");
+}
+
+int
+axl_driver_ensure_with_embedded(
+    const AxlGuid       *protocol_guid,
+    const char          *driver_name,
+    const unsigned char *embedded_buf,
+    size_t               embedded_len,
+    const char          *override_name
+    )
+{
+    if (protocol_guid == NULL || driver_name == NULL) {
+        return -1;
     }
+
+    /* Step 1: short-circuit if the protocol is already registered.
+     * On most OEM firmware the corresponding driver is in the
+     * firmware volume and dispatched at DXE init, so this is the
+     * common path — no disk search, no embedded fallback. */
+    if (driver_protocol_registered(protocol_guid) == 0) {
+        axl_debug("driver ensure: protocol already registered, skipping search");
+        return 0;
+    }
+
+    /* Step 2/3: disk search. If override_name was passed, search for
+     * that exact name and skip the embedded fallback (caller opted
+     * into a specific external driver). Otherwise, search for the
+     * canonical name and fall through to embedded on miss. */
+    const char *search_name = (override_name != NULL) ? override_name : driver_name;
+
+    char  *candidates[DRIVER_MAX_CANDIDATES];
+    size_t n_cand = 0;
+    driver_build_candidates(search_name, candidates, &n_cand);
+
+    axl_debug("driver ensure: searching %zu candidate path%s for '%s'",
+              n_cand, n_cand == 1 ? "" : "s", search_name);
+    for (size_t i = 0; i < n_cand; i++) {
+        axl_debug("  [%zu] %s", i, candidates[i]);
+    }
+
+    int rc = driver_try_candidates(protocol_guid, candidates, n_cand);
 
     for (size_t i = 0; i < n_cand; i++) {
         axl_free(candidates[i]);
     }
 
-    return rc;
+    if (rc == 0) {
+        return 0;
+    }
+
+    /* Disk search failed. Try the embedded blob unless the caller
+     * gave an override (in which case "user said use this specific
+     * file" is a stronger signal than "fall back to whatever the
+     * build embedded"). */
+    if (override_name == NULL && embedded_buf != NULL && embedded_len > 0) {
+        axl_debug("driver ensure: disk search exhausted, "
+                  "trying embedded fallback (%zu bytes)", embedded_len);
+        if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len) == 0) {
+            return 0;
+        }
+    }
+
+    axl_warning("driver ensure: '%s' not found in %zu candidate path%s%s",
+                search_name, n_cand, n_cand == 1 ? "" : "s",
+                (override_name == NULL && embedded_buf != NULL)
+                    ? " (embedded fallback also failed)" : "");
+    return -1;
+}
+
+int
+axl_driver_ensure(
+    const AxlGuid *protocol_guid,
+    const char    *driver_name
+    )
+{
+    return axl_driver_ensure_with_embedded(
+        protocol_guid, driver_name,
+        NULL, 0,        /* no embedded blob */
+        NULL);          /* no override */
 }
 
 // ---------------------------------------------------------------------------
