@@ -20,6 +20,13 @@ omits the corresponding optional UEFI 2.6+ DXE modules.
 - **Build:** GCC5 toolchain via the EDK2 `MdeModulePkg.dsc` build,
   no patches.
 
+### USB-network drivers (NetworkCommon, UsbCdcEcm, UsbCdcNcm, UsbRndis)
+
+Same source/license/build as `RamDiskDxe` above
+(`MdeModulePkg/Bus/Usb/UsbNetwork/...`). Staged in the tools tarball
+at `drivers/<arch>/<name>.efi` for `axl_net_ensure_drivers` to load
+when the host firmware lacks USB-class ethernet bindings.
+
 To regenerate from upstream EDK2:
 
 ```bash

@@ -204,38 +204,70 @@ for arch in x64 aa64; do
     TOOLS_STAGE=$(mktemp -d -t axl-tools-XXXXXX)
     cp "$PROJECT_ROOT/out/native-$arch/tools/"*.efi "$TOOLS_STAGE/"
     echo "$PKG_VERSION" > "$TOOLS_STAGE/VERSION"
+    # Build universal iPXE .efidrv from upstream at pinned commit.
+    log_info "Building iPXE driver ($arch) ..."
+    "$PROJECT_ROOT/scripts/build-ipxe.sh" --arch "$arch" \
+        --out "$PROJECT_ROOT/out/ipxe" 2>&1 | tail -3
+    # Stage drivers under drivers/<arch>/ (the layout
+    # axl_driver_locate / axl_net_ensure_drivers searches for).
+    mkdir -p "$TOOLS_STAGE/drivers/$arch"
+    for drv in NetworkCommon UsbCdcEcm UsbCdcNcm UsbRndis RamDiskDxe; do
+        cp "$PROJECT_ROOT/third_party/edk2/${drv}-${arch}.efi" \
+           "$TOOLS_STAGE/drivers/$arch/${drv}.efi"
+    done
+    cp "$PROJECT_ROOT/out/ipxe/ipxe-all-${arch}.efidrv" \
+       "$TOOLS_STAGE/drivers/$arch/ipxe-all.efidrv"
     # mbedtls is statically linked into tools that use networking;
     # carry its LICENSE for Apache-2.0 compliance.
     mkdir -p "$TOOLS_STAGE/third_party/mbedtls"
     cp "$PROJECT_ROOT/deps/mbedtls/LICENSE" \
        "$TOOLS_STAGE/third_party/mbedtls/"
-    # RamDiskDxe.efi (BSD-2-Clause-Patent) is embedded into mkrd.efi
-    # so it works on minimal firmware that omits the optional UEFI
-    # 2.6 EFI_RAM_DISK_PROTOCOL — carry its LICENSE.
+    # EDK2 drivers (RamDiskDxe + USB-network) — BSD-2-Clause-Patent.
     mkdir -p "$TOOLS_STAGE/third_party/edk2"
     cp "$PROJECT_ROOT/third_party/edk2/LICENSE" \
        "$PROJECT_ROOT/third_party/edk2/README.md" \
        "$TOOLS_STAGE/third_party/edk2/"
+    # iPXE GPL-2.0-or-later — carry COPYING + GPLv2 + UBDL.
+    mkdir -p "$TOOLS_STAGE/third_party/ipxe"
+    cp "$PROJECT_ROOT/third_party/ipxe/COPYING" \
+       "$PROJECT_ROOT/third_party/ipxe/COPYING.GPLv2" \
+       "$PROJECT_ROOT/third_party/ipxe/COPYING.UBDL" \
+       "$PROJECT_ROOT/third_party/ipxe/README.md" \
+       "$TOOLS_STAGE/third_party/ipxe/"
     cat > "$TOOLS_STAGE/README.txt" <<EOF
 AXL SDK pre-built UEFI tools for $arch
 version: $PKG_VERSION
 
 Tools included:
-  mkrd.efi      RAM disk management
-  hexdump.efi   Hex/ASCII file viewer
+  dmidecode.efi SMBIOS / DMI table decoder
   fetch.efi     HTTP client (GET/POST/PUT)
   find.efi      Recursive file finder
   grep.efi      Pattern search
-  sysinfo.efi   System inventory (firmware, SMBIOS, memory)
-  netinfo.efi   Network diagnostics and ping
+  hexdump.efi   Hex/ASCII file viewer
   ipmi.efi      IPMI (BMC operations)
+  mkrd.efi      RAM disk management
+  netinfo.efi   Network diagnostics and ping
   rfbrowse.efi  Redfish browser
+  sysinfo.efi   System inventory summary
+
+Drivers included (drivers/$arch/):
+  ipxe-all.efidrv     Universal NIC driver — covers Intel, Broadcom,
+                      Realtek PCI/USB, Atheros, 3Com, AMD, USB
+                      CDC-ECM/NCM/RNDIS, and many more.
+  (also a few small auxiliary USB-network and RAM-disk drivers —
+   see third_party/ for full attribution.)
 
 Usage:
   1. Format a USB stick as FAT32.
-  2. Copy all .efi files to the stick.
+  2. Copy all .efi files AND the drivers/ directory to the stick.
   3. Boot to the UEFI Shell and cd to the stick.
   4. Run each tool with --help for options.
+
+On firmware that already publishes EFI_SIMPLE_NETWORK_PROTOCOL for
+the NIC, the staged drivers are unused. On minimal firmware (legacy
+Dell EDK1, custom BMCs, etc.) axl_net_ensure_drivers loads them on
+demand from drivers/$arch/ before networking tools (netinfo, fetch,
+rfbrowse) attempt to use the network.
 
 TLS / HTTPS:
   Built with mbedtls; fetch handles both http:// and https://
@@ -249,11 +281,28 @@ Third-party licenses:
   distribution elects Apache-2.0. Full license text at
   third_party/mbedtls/LICENSE.
 
-  mkrd.efi embeds RamDiskDxe.efi (Copyright (c) Intel
-  Corporation, BSD-2-Clause-Patent, from the EDK2
-  MdeModulePkg) so it works on minimal firmware that omits
-  the optional UEFI 2.6 EFI_RAM_DISK_PROTOCOL. Full license
-  text at third_party/edk2/LICENSE.
+  EDK2 drivers (RamDiskDxe, NetworkCommon, UsbCdc{Ecm,Ncm},
+  UsbRndis) are Copyright (c) Intel Corporation, licensed
+  BSD-2-Clause-Patent (from the EDK2 MdeModulePkg). Full
+  license text at third_party/edk2/LICENSE.
+
+  ipxe-all.efidrv is built from upstream iPXE
+  (https://github.com/ipxe/ipxe), licensed GPL-2.0-or-later.
+  Pinned commit + reproducible build recipe at
+  scripts/build-ipxe.sh in the axl-sdk source tree. Full
+  license text at third_party/ipxe/COPYING.GPLv2; mere-
+  aggregation rationale in third_party/ipxe/README.md.
+
+  GPL-2.0 §3(b) written offer: AximCode offers, for at
+  least 3 years from this distribution date, to provide
+  the complete machine-readable source for the iPXE
+  binary in this archive on a medium customarily used
+  for software interchange, at no more than the reasonable
+  cost of physical distribution. Requests:
+    support@aximcode.com  /  https://aximcode.com
+  (The source is also publicly available at the upstream
+  URL above at the pinned commit hash printed by
+  scripts/build-ipxe.sh.)
 
 Docs: https://axl.aximcode.com/
 EOF

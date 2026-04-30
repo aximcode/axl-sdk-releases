@@ -46,4 +46,32 @@ This lets `mkrd.efi` work as a self-contained binary on legacy /
 minimal firmware. No source modifications; the binaries are stock
 EDK2 GCC5 builds.
 
-See `third_party/edk2/README.md` for regeneration instructions.
+A small set of additional `MdeModulePkg/Bus/Usb/UsbNetwork/...`
+driver binaries (`NetworkCommon`, `UsbCdcEcm`, `UsbCdcNcm`,
+`UsbRndis`) ship alongside under the same source/license/build
+recipe. See `third_party/edk2/README.md`.
+
+## iPXE — universal NIC driver
+
+- **Source:** https://github.com/ipxe/ipxe
+- **Vendored at:** `third_party/ipxe/{COPYING,COPYING.GPLv2,COPYING.UBDL,README.md}`
+  (license texts only — the binary is built from upstream at a pinned
+  commit by [`scripts/build-ipxe.sh`](scripts/build-ipxe.sh))
+- **Pinned commit:** see `IPXE_COMMIT=` in `scripts/build-ipxe.sh`
+- **License (aggregate):** [GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html)
+- **Full license texts:** `third_party/ipxe/COPYING.GPLv2`,
+  `third_party/ipxe/COPYING.UBDL`
+
+`axl-sdk-tools-{x64,aa64}.tar.gz` ships
+`drivers/<arch>/ipxe-all.efidrv` — an unmodified upstream iPXE build
+of `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB) — as a universal NIC driver
+fallback. Covers Intel (e1000 / e1000e / i219 / i225), Broadcom
+(BCM4401 / 5760x / 957454), Realtek (RTL8139 / 8169 / 8125 / 8153
+USB), Atheros, 3Com, AMD, NSC, VIA, USB CDC-ECM / CDC-NCM / RNDIS,
+AX88179, and many more — ~2.9k chip IDs total.
+
+The binary ships in the tools tarball alongside our Apache-2.0 tools
+under "mere aggregation" (GPL-2.0 §3) — no static linking into our
+binaries. The build is reproducible from the pinned commit; per
+GPL §3(b) the upstream URL + commit hash printed by
+`scripts/build-ipxe.sh` constitutes the "written offer" for source.

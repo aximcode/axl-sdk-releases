@@ -23,11 +23,139 @@ AXL_LOG_DOMAIN("driver");
 // Device path safety limits
 // ---------------------------------------------------------------------------
 
-#define MAX_DP_WALK  256   /* max nodes to walk before giving up */
+#define MAX_DP_WALK             256   /* max nodes to walk before giving up */
+#define DRIVER_VOL_NAME_MAX      16   /* "fsN:" volume name buffer; matches
+                                         DRIVER_MAX_VOLUMES so axl_volume_enumerate
+                                         returns the same set we can address */
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/* Walk a device path to the END node, returning the total length
+ * INCLUDING the END node. Returns 0 on malformed input. */
+static size_t
+driver_dp_total_size(const EFI_DEVICE_PATH_PROTOCOL *dp)
+{
+    if (dp == NULL) return 0;
+    const EFI_DEVICE_PATH_PROTOCOL *p = dp;
+    int steps = 0;
+    while (steps++ < MAX_DP_WALK) {
+        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(p);
+        if (node_len < 4) return 0;  /* malformed */
+        if (EFI_DP_IS_END(p)) {
+            return (size_t)((const uint8_t *)p - (const uint8_t *)dp) + node_len;
+        }
+        p = EFI_DP_NEXT(p);
+    }
+    return 0;
+}
+
+/* Build a full file-on-volume device path from a UEFI path string
+ * like "fs0:\drivers\x64\foo.efi". The result is suitable for
+ * gBS->LoadImage's DevicePath argument — the firmware will then set
+ * LoadedImage->FilePath correctly, which iPXE and similar drivers
+ * read at StartImage to locate themselves on disk.
+ *
+ * Returns a gBS->AllocatePool-allocated device path on success
+ * (caller frees with gBS->FreePool), or NULL on any failure
+ * (volume not mounted, malformed path, OOM, etc.).
+ *
+ * Failure here is non-fatal — axl_driver_load falls back to the
+ * memory-buffer load path, which works for drivers that don't
+ * require FilePath. */
+static EFI_DEVICE_PATH_PROTOCOL *
+driver_build_file_dp(const char *path)
+{
+    /* Split "fsN:\..." into volume-name and file-portion. */
+    const char *colon = axl_strchr(path, ':');
+    if (colon == NULL || colon == path) return NULL;
+    size_t name_len = (size_t)(colon - path);
+    if (name_len >= DRIVER_VOL_NAME_MAX) return NULL;
+
+    char vol_name[DRIVER_VOL_NAME_MAX];
+    axl_memcpy(vol_name, path, name_len);
+    vol_name[name_len] = '\0';
+
+    const char *file_part = colon + 1;
+    /* MEDIA_FILEPATH_DP wants a leading backslash; tolerate either
+     * orientation in the input. */
+    if (*file_part == '\0') return NULL;
+
+    /* Find the volume handle by name. */
+    AxlVolume volumes[DRIVER_VOL_NAME_MAX];
+    size_t    n_vols = 0;
+    if (axl_volume_enumerate(volumes, DRIVER_VOL_NAME_MAX, &n_vols) != 0
+        || n_vols == 0)
+    {
+        return NULL;
+    }
+    EFI_HANDLE vol_handle = NULL;
+    for (size_t i = 0; i < n_vols; i++) {
+        if (axl_strcmp(volumes[i].name, vol_name) == 0) {
+            vol_handle = (EFI_HANDLE)volumes[i].handle;
+            break;
+        }
+    }
+    if (vol_handle == NULL) return NULL;
+
+    /* Get the volume's device path. */
+    EFI_DEVICE_PATH_PROTOCOL *vol_dp = NULL;
+    if (axl_bs()->HandleProtocol(vol_handle,
+                                 &EFI_DEVICE_PATH_PROTOCOL_GUID,
+                                 (void **)&vol_dp) != EFI_SUCCESS
+        || vol_dp == NULL)
+    {
+        return NULL;
+    }
+    size_t vol_dp_size = driver_dp_total_size(vol_dp);
+    if (vol_dp_size < 4) return NULL;
+    /* Strip the volume DP's END node — we'll append our own. */
+    size_t vol_dp_body = vol_dp_size - 4;
+
+    /* Convert the file portion to UCS-2. UEFI file-path nodes store
+     * the path in UCS-2, with backslash separators, NUL-terminated. */
+    AXL_AUTO_FREE unsigned short *file_w = axl_utf8_to_ucs2(file_part);
+    if (file_w == NULL) return NULL;
+    size_t file_wlen = 0;
+    while (file_w[file_wlen] != 0) {
+        /* Normalize forward slashes to backslashes. */
+        if (file_w[file_wlen] == (unsigned short)'/') {
+            file_w[file_wlen] = (unsigned short)'\\';
+        }
+        file_wlen++;
+    }
+    /* Filepath node: 4-byte header + (wlen+1)*2 bytes of UCS-2 string.
+     * Length must fit in uint16_t. */
+    size_t file_node_size = 4 + (file_wlen + 1) * 2;
+    if (file_node_size > 0xFFFF) return NULL;
+
+    /* Total: stripped volume body + file node + 4-byte END node. */
+    size_t total = vol_dp_body + file_node_size + 4;
+
+    void *out = NULL;
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out)
+        != EFI_SUCCESS || out == NULL)
+    {
+        return NULL;
+    }
+    uint8_t *p = (uint8_t *)out;
+    axl_memcpy(p, vol_dp, vol_dp_body);
+    p += vol_dp_body;
+
+    /* MEDIA_FILEPATH_DP node */
+    p[0] = 0x04;                                    /* MEDIA_DEVICE_PATH */
+    p[1] = 0x04;                                    /* MEDIA_FILEPATH_DP */
+    p[2] = (uint8_t)(file_node_size & 0xff);
+    p[3] = (uint8_t)((file_node_size >> 8) & 0xff);
+    axl_memcpy(p + 4, file_w, (file_wlen + 1) * 2);
+    p += file_node_size;
+
+    /* END node */
+    p[0] = 0x7f; p[1] = 0xff; p[2] = 4; p[3] = 0;
+
+    return (EFI_DEVICE_PATH_PROTOCOL *)out;
+}
 
 int
 axl_driver_load(
@@ -37,8 +165,6 @@ axl_driver_load(
 {
     EFI_STATUS status;
     EFI_HANDLE image = NULL;
-    void *buf = NULL;
-    size_t buf_size = 0;
 
     if (path == NULL || handle == NULL) {
         return -1;
@@ -46,20 +172,47 @@ axl_driver_load(
 
     *handle = NULL;
 
-    /* Read the .efi file into memory */
+    extern EFI_HANDLE gImageHandle;
+
+    /* Prefer DevicePath load. The firmware reads the file from the
+     * volume's filesystem itself, sets LoadedImage->FilePath to the
+     * full DP we just built, and StartImage sees the FilePath that
+     * driver-binding-style drivers (notably iPXE) need to locate
+     * their own install directory. */
+    EFI_DEVICE_PATH_PROTOCOL *file_dp = driver_build_file_dp(path);
+    if (file_dp != NULL) {
+        status = axl_bs()->LoadImage(
+            FALSE,           /* BootPolicy */
+            gImageHandle,    /* ParentImageHandle */
+            file_dp,         /* DevicePath */
+            NULL, 0,         /* No source buffer; firmware reads via DP */
+            &image);
+        axl_bs()->FreePool(file_dp);
+
+        if (!EFI_ERROR(status)) {
+            *handle = (AxlDriverHandle)image;
+            return 0;
+        }
+        axl_debug("driver load: DevicePath LoadImage failed for '%s': 0x%llx; "
+                  "falling back to buffer load",
+                  path, (unsigned long long)status);
+    }
+
+    /* Fallback: read the file ourselves and load from buffer. Works
+     * for drivers that don't read LoadedImage->FilePath at startup
+     * (e.g. RamDiskDxe). Drivers that DO need it (iPXE) will fail
+     * StartImage with EFI_INVALID_PARAMETER on this path; the caller
+     * already logs that case. */
+    void *buf = NULL;
+    size_t buf_size = 0;
     if (axl_file_get_contents(path, &buf, &buf_size) != 0 || buf == NULL) {
         axl_warning("driver load: cannot read '%s'", path);
         return -1;
     }
 
-    /* Load the image from the memory buffer */
-    extern EFI_HANDLE gImageHandle;
     status = axl_bs()->LoadImage(
-        FALSE,           /* BootPolicy */
-        gImageHandle,    /* ParentImageHandle */
-        NULL,            /* DevicePath — NULL for memory source */
-        buf,             /* SourceBuffer */
-        (size_t)buf_size, /* SourceSize */
+        FALSE, gImageHandle, NULL,
+        buf, (size_t)buf_size,
         &image);
 
     axl_free(buf);
@@ -105,13 +258,31 @@ axl_driver_connect(
     AxlDriverHandle handle
     )
 {
-    /* If a real handle is given, connect just that handle.
-       Otherwise, reconnect all controllers globally. */
+    /* If a real handle is given, connect just that handle. */
     if (handle != NULL) {
         return axl_driver_connect_handle(handle);
     }
 
-    axl_bs()->ConnectController(NULL, NULL, NULL, TRUE);
+    /* Otherwise, reconnect every controller in the system. UEFI's
+     * ConnectController() returns EFI_INVALID_PARAMETER when called
+     * with ControllerHandle=NULL — the "connect everything" behavior
+     * the shell's `connect -r` command implements is enumerate-all-
+     * handles + ConnectController on each. We mirror that here.
+     *
+     * NOT_FOUND from per-handle calls is normal (means the handle has
+     * no candidate driver bindings), not an error. */
+    EFI_HANDLE *handles = NULL;
+    UINTN       count = 0;
+    EFI_STATUS  st = axl_bs()->LocateHandleBuffer(
+        AllHandles, NULL, NULL, &count, &handles);
+    if (EFI_ERROR(st) || handles == NULL) {
+        return -1;
+    }
+
+    for (UINTN i = 0; i < count; i++) {
+        axl_bs()->ConnectController(handles[i], NULL, NULL, TRUE);
+    }
+    axl_bs()->FreePool(handles);
     return 0;
 }
 

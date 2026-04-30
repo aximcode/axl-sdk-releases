@@ -114,19 +114,24 @@ axl_net_set_static_ip(
 // axl_net_ensure_drivers
 // ---------------------------------------------------------------------------
 
-/* Drivers we try to load, in order. NetworkCommon ships the MNP/IP4/TCP4
- * stack on top of any SNP-providing NIC driver. The remaining names cover
- * the NIC drivers staged by uefi-devkit. Each is silently skipped if the
- * .efi isn't found on any mounted volume — the cost of a miss is one file
- * existence check per candidate. */
+/* Drivers we try to load, in order. The primary entry is
+ * ipxe-all.efidrv — iPXE's universal-driver build, covering most
+ * Intel/Broadcom/Realtek PCI and USB ethernet hardware in a single
+ * ~1.1 MB blob. The remaining names (NetworkCommon, UsbCdc*,
+ * UsbRndis, Rtk*, Asix*, ipxe-intel/broadcom) are auxiliary drivers
+ * users may stage alongside, all loaded if present.
+ *
+ * Each name is silently skipped when the file isn't on any mounted
+ * volume — the cost of a miss is one file existence check per candidate. */
 static const char *const net_drivers[] = {
+    "ipxe-all.efidrv",
     "NetworkCommon.efi",
-    "RtkUndiDxe.efi",
-    "RtkUsbUndiDxe.efi",
-    "AsixUsbUndiDxe.efi",
     "UsbCdcEcm.efi",
     "UsbCdcNcm.efi",
     "UsbRndis.efi",
+    "RtkUndiDxe.efi",
+    "RtkUsbUndiDxe.efi",
+    "AsixUsbUndiDxe.efi",
     "ipxe-intel.efi",
     "ipxe-broadcom.efi",
 };
@@ -193,10 +198,13 @@ axl_net_ensure_drivers(void)
     }
 
     /* Wire up driver bindings globally. NIC drivers register
-     * DRIVER_BINDING_PROTOCOL in their entry point but only bind to PCI/
-     * USB controllers when ConnectController runs. NULL handle reconnects
-     * everything. */
-    axl_bs()->ConnectController(NULL, NULL, NULL, TRUE);
+     * DRIVER_BINDING_PROTOCOL in their entry point but only bind to
+     * PCI/USB controllers when ConnectController is called on those
+     * controller handles. UEFI's ConnectController(ControllerHandle=
+     * NULL,...) returns EFI_INVALID_PARAMETER per spec, so we go
+     * through axl_driver_connect(NULL), which enumerates every
+     * handle and per-handle reconnects (mirroring shell `connect -r`). */
+    axl_driver_connect(NULL);
 
     if (net_count_snp() > 0) {
         return AXL_NET_DRIVERS_OK;

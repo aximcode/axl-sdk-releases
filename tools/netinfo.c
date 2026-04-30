@@ -12,6 +12,7 @@
 **/
 
 #include <axl.h>
+#include <uefi/axl-uefi.h>
 
 static bool verbose = false;
 
@@ -21,6 +22,147 @@ static const AxlConfigDesc descs[] = {
     { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                0, 0 },
     { 0 }
 };
+
+/* NII protocol GUIDs — not in axl-sdk's generated UEFI headers.
+ * iPXE and other UEFI Driver Model NIC drivers install one of these
+ * on the NIC's PCI/USB controller handle; firmware-bundled SnpDxe
+ * (or equivalent) then binds to NII and produces SNP. To find the
+ * NIC driver image we walk past the SNP wrapper to the NII installer.
+ * The 3.1 GUID is the modern variant; we check both. */
+static const AxlGuid nii_31_guid = {
+    0x1ACED566, 0x76ED, 0x4218,
+    { 0xBC, 0x81, 0x76, 0x7F, 0x1F, 0x97, 0x7A, 0x89 }
+};
+static const AxlGuid nii_legacy_guid = {
+    0xE18541CD, 0xF755, 0x4F73,
+    { 0x92, 0x8D, 0x64, 0x3C, 0x8A, 0x79, 0xB2, 0x29 }
+};
+
+/* Resolve a driver-image handle to a printable path. Walks the
+ * EFI_LOADED_IMAGE_PROTOCOL.FilePath device path until it hits a
+ * MEDIA_FILEPATH_DP node, returning a UTF-8 copy of the UCS-2 path
+ * string. Returns "<firmware volume>" for FV-dispatched drivers
+ * (their file path is a MEDIA_FW_VOL_FILEPATH_DP rather than a
+ * filesystem path), "<unknown>" if neither applies. Caller frees. */
+static char *
+resolve_driver_image_name(EFI_HANDLE agent)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
+    EFI_STATUS st = gBS->HandleProtocol(
+        agent, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&img);
+    if (EFI_ERROR(st) || img == NULL || img->FilePath == NULL) {
+        return axl_strdup("<unknown>");
+    }
+
+    EFI_DEVICE_PATH_PROTOCOL *dp = img->FilePath;
+    int  steps = 0;
+    bool saw_fv_node = false;
+    while (dp != NULL && !EFI_DP_IS_END(dp) && steps < 16) {
+        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(dp);
+        if (node_len < 4) break;
+        /* MEDIA_DEVICE_PATH = 0x04, MEDIA_FILEPATH_DP = 0x04 — file
+         * loaded from a FAT volume; data is a UCS-2 path string. */
+        if (EFI_DP_TYPE(dp) == 0x04 && EFI_DP_SUBTYPE(dp) == 0x04 &&
+            node_len > 4)
+        {
+            return axl_ucs2_to_utf8((unsigned short *)((uint8_t *)dp + 4));
+        }
+        /* MEDIA_DEVICE_PATH=0x04, MEDIA_PIWG_FW_FILE_DP=0x06 — driver
+         * dispatched from an FV (firmware volume), e.g. OVMF's bundled
+         * VirtioNetDxe. The node payload is a GUID, not a printable
+         * name, so we just flag it. */
+        if (EFI_DP_TYPE(dp) == 0x04 && EFI_DP_SUBTYPE(dp) == 0x06) {
+            saw_fv_node = true;
+        }
+        dp = EFI_DP_NEXT(dp);
+        steps++;
+    }
+    return axl_strdup(saw_fv_node ? "<firmware volume>" : "<unknown>");
+}
+
+/* OpenProtocol attribute bits per UEFI 2.10 §7.3.10. We only test
+ * BY_DRIVER here, but the others are listed for reference. */
+#define EFI_OPEN_PROTOCOL_BY_DRIVER          0x00000010
+
+/* Find the BY_DRIVER agent handle that has @p protocol_guid open on
+ * @p handle, and resolve its image name. Returns NULL if no BY_DRIVER
+ * agent exists for that protocol. Caller frees the returned string. */
+static char *
+find_by_driver_agent(EFI_HANDLE handle, const EFI_GUID *protocol_guid)
+{
+    EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *entries = NULL;
+    UINTN n_entries = 0;
+    EFI_STATUS st = gBS->OpenProtocolInformation(
+        handle, (EFI_GUID *)protocol_guid, &entries, &n_entries);
+    if (EFI_ERROR(st) || entries == NULL) return NULL;
+
+    char *result = NULL;
+    for (UINTN e = 0; e < n_entries; e++) {
+        if (entries[e].Attributes & EFI_OPEN_PROTOCOL_BY_DRIVER) {
+            result = resolve_driver_image_name(entries[e].AgentHandle);
+            break;
+        }
+    }
+    gBS->FreePool(entries);
+    return result;
+}
+
+/* Walk the SNP handles and report which driver image is bound to each.
+ *
+ * On UEFI driver-model NIC drivers (iPXE, vendor UNDI binaries) the
+ * actual NIC binding installs EFI_NETWORK_INTERFACE_IDENTIFIER (NII)
+ * — and a higher SnpDxe wrapper then attaches SNP on top. So the
+ * "driver bound to SNP" question is one layer too high; we walk to
+ * NII first and only fall back to the SNP-installer agent when no
+ * NII is present (e.g. drivers that publish SNP directly, like
+ * OVMF's VirtioNetDxe).
+ *
+ * This makes the diagnostic show `\drivers\x64\ipxe-intel.efi` for
+ * an iPXE-driven NIC instead of `<firmware volume>` (which is what
+ * SnpDxe's image path resolves to on a typical FV-dispatched
+ * SnpDxe).  Confirms in one glance that the v0.6.0 staged-iPXE
+ * bundle is in fact what's driving the hardware. */
+static void
+show_nic_drivers(void)
+{
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_service_enumerate("simple-network", &handles, &count) != 0
+        || count == 0)
+    {
+        axl_printf("=== NIC Drivers ===\n  (no simple-network handles)\n\n");
+        if (handles) axl_free(handles);
+        return;
+    }
+
+    axl_printf("=== NIC Drivers ===\n\n");
+    for (size_t i = 0; i < count; i++) {
+        EFI_HANDLE handle = (EFI_HANDLE)handles[i];
+
+        /* Try NII (3.1) → NII (legacy) → SNP. First match wins. */
+        AXL_AUTO_FREE char *nii31  = find_by_driver_agent(
+            handle, (const EFI_GUID *)&nii_31_guid);
+        AXL_AUTO_FREE char *niileg = (nii31 != NULL) ? NULL :
+            find_by_driver_agent(
+                handle, (const EFI_GUID *)&nii_legacy_guid);
+        AXL_AUTO_FREE char *snp = (nii31 != NULL || niileg != NULL) ? NULL :
+            find_by_driver_agent(
+                handle, &EFI_SIMPLE_NETWORK_PROTOCOL_GUID);
+
+        const char *layer;
+        const char *image_label;
+        if (nii31 != NULL)       { layer = "NII3.1"; image_label = nii31; }
+        else if (niileg != NULL) { layer = "NII";    image_label = niileg; }
+        else if (snp != NULL)    { layer = "SNP";    image_label = snp; }
+        else                     { layer = "—";      image_label = "<no driver attached>"; }
+
+        axl_printf("  NIC[%zu] handle=%p [%s] driver=%s\n",
+                   i, handle, layer, image_label);
+    }
+    axl_printf("\n");
+
+    axl_free(handles);
+}
 
 /* Auto-load NIC drivers so NetInfo works from a bare UEFI shell without
  * a startup.nsh that pre-loads them. Same shape as MkRd for RamDiskDxe. */
@@ -223,10 +365,24 @@ main(
     }
 
     verbose = axl_config_get_bool(cfg, "verbose");
+    if (verbose) {
+        /* Surface axl_driver_locate / axl_net_ensure_drivers debug
+         * lines so the user sees which candidate paths got tried. */
+        axl_log_set_level(AXL_LOG_DEBUG);
+    }
 
     /* All non-help paths need NIC drivers + the network stack. */
     if (ensure_net_drivers() != 0) {
         return 1;
+    }
+
+    /* In verbose mode, identify which driver image is bound to each
+     * NIC. Useful when bringing up a new firmware (or new staged
+     * driver bundle) — tells the user immediately whether the SNP
+     * came from OVMF's own FV (firmware volume), an iPXE blob staged
+     * on disk, or some other source. */
+    if (verbose) {
+        show_nic_drivers();
     }
 
     const char *cmd = axl_config_pos(cfg, 0);

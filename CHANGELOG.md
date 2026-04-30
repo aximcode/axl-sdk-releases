@@ -3,6 +3,95 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.6.0 — 2026-04-30
+
+Network tools (`netinfo`, `fetch`, `rfbrowse`) now Just Work on
+minimal firmware that doesn't ship a NIC SNP driver — the tools
+tarball ships a universal NIC driver bundle and the SDK auto-loads
+it on demand. Motivating real-user case: a 2010-era Dell EDK1
+firmware that lacks UEFI 2.6+ NIC drivers entirely.
+
+See [`docs/AXL-Network-Driver-Bundle-Design.md`](docs/AXL-Network-Driver-Bundle-Design.md)
+for the full design + four-test validation matrix.
+
+### Added
+
+- **`drivers/<arch>/` directory in `axl-sdk-tools-{x64,aa64}.tar.gz`** —
+  a self-contained driver bundle that consumers extract alongside
+  the tools `.efi` files onto a FAT USB stick:
+  - `ipxe-all.efidrv` — universal NIC driver built from upstream
+    iPXE at a pinned commit (currently `df4eec8c`). Single ~1.1 MB
+    blob covering Intel (e1000 / e1000e / i219 / i225), Broadcom
+    (BCM4401 / 5760x / 957454), Realtek PCI/USB (RTL8139 / 8169 /
+    8125 / 8153 USB), Atheros, 3Com, AMD, USB CDC-ECM/NCM/RNDIS,
+    AX88179/178a, SMSC75xx/95xx — ~2.9k chip IDs total. Built
+    fresh in CI by [`scripts/build-ipxe.sh`](scripts/build-ipxe.sh);
+    GPL-2.0-or-later, attribution + GPL §3(b) written offer in
+    `third_party/ipxe/README.md`.
+  - `RamDiskDxe.efi` (also embedded in `mkrd.efi` since v0.5.2).
+  - A few small auxiliary EDK2 USB-network drivers for firmware
+    that benefits from them. See `third_party/edk2/README.md` for
+    details.
+- **[`scripts/build-ipxe.sh`](scripts/build-ipxe.sh)** — clones iPXE
+  at the pinned commit and builds the universal `.efidrv` for one
+  or both architectures. Reproducible build (~35s on 16 threads);
+  prints upstream URL+SHA at the end for source-availability
+  documentation.
+- **[`scripts/run-qemu.sh`](scripts/run-qemu.sh) flags** for testing
+  driver-bundle coverage:
+  - `--nic-model MODEL` — choose the QEMU NIC type (virtio-net-pci,
+    e1000, e1000e, rtl8139, pcnet, ne2k_pci, ...). Implies `--net`.
+  - `--nic-no-rom` — suppress QEMU's bundled iPXE PXE option ROM
+    (passes `romfile=`). Required for "firmware lacks NIC driver"
+    tests; without it OVMF wraps the option-ROM-provided UNDI as
+    SNP and hides the gap.
+  - `--extra SRC:DEST` — relative-path staging of additional files
+    into the boot disk image (was previously root-only). Lets tests
+    drop drivers under `drivers/<arch>/...` to exercise the
+    canonical search path.
+- **`netinfo -v`** prints a "NIC Drivers" section identifying the
+  driver image bound to each SNP handle, walking the
+  `NII3.1 → NII (legacy) → SNP` fallback chain. Surfaces the
+  actual NIC-binding driver (e.g.
+  `\drivers\x64\ipxe-all.efidrv`) instead of just the SnpDxe
+  wrapper above it.
+
+### Fixed
+
+- **`axl_driver_load(path)` now uses DevicePath, not memory buffer.**
+  The previous implementation read the .efi file into memory and
+  called `gBS->LoadImage(SourceBuffer=...)`, which leaves
+  `LoadedImage->FilePath = NULL`. iPXE's UEFI driver-binding entry
+  reads `FilePath` to locate its install directory and bails with
+  `EFI_INVALID_PARAMETER` from `StartImage` when it's NULL.
+  `axl_driver_load` now constructs a `<volume DP> +
+  MEDIA_FILEPATH_DP` device path (via the new
+  `driver_build_file_dp` helper) and calls
+  `LoadImage(DevicePath=that, SourceBuffer=NULL)` — matching what
+  UEFI Shell's `load` command does. Memory-buffer load is preserved
+  as a fallback for drivers that don't read `FilePath` (e.g.
+  `RamDiskDxe`).
+- **`axl_driver_connect(NULL)` actually does something now.**
+  UEFI's `gBS->ConnectController(NULL, NULL, NULL, TRUE)` returns
+  `EFI_INVALID_PARAMETER` per spec; the old implementation called
+  it directly and silently succeeded as a no-op. Now enumerates
+  every handle via `LocateHandleBuffer(AllHandles)` and per-handle
+  `ConnectController`, mirroring UEFI Shell's `connect -r`.
+- **`axl_net_ensure_drivers` candidate-list reordered** so
+  `ipxe-all.efidrv` is tried first; existing names retained as
+  back-compat for users with their own staged drivers.
+
+### Validated
+
+- 1695/1695 unit tests pass on x64 and aa64 (DEBUG build).
+- 23/23 tool integration tests pass.
+- End-to-end: `--nic-model {e1000, e1000e, rtl8139, pcnet}
+  --nic-no-rom` (firmware lacks NIC driver) → tarball-staged
+  `ipxe-all.efidrv` self-loads via `axl_net_ensure_drivers` →
+  iPXE binds NII → SnpDxe wraps as SNP → DHCP → HTTP 200.
+  Consumer-flow proven: extract release tarball, run
+  `fetch.efi http://...`, no env overrides, leak-clean exit.
+
 ## 0.5.3 — 2026-04-29
 
 Fixes a regression introduced in v0.2.9 where `--mount` (and other

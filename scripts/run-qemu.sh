@@ -66,6 +66,7 @@ TIMEOUT=15
 RAW=false
 SCREENSHOT=""
 NET=false
+NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrides
 HOSTFWDS=()
 EXTRA_FILES=()
 CUSTOM_NSH=""
@@ -93,6 +94,8 @@ while [[ $# -gt 0 ]]; do
         --raw)        RAW=true; shift ;;
         --screenshot) SCREENSHOT="$2"; shift 2 ;;
         --net)        NET=true; shift ;;
+        --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
+        --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
@@ -134,6 +137,15 @@ Options:
   --raw                    Show full serial log (including firmware boot)
   --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
   --net                    Enable user-mode networking (virtio-net)
+  --nic-model MODEL        QEMU NIC model (implies --net). Examples:
+                           virtio-net-pci (default), e1000, e1000e,
+                           rtl8139, pcnet, ne2k_pci. Use to test
+                           driver-bundle coverage on NICs OVMF lacks.
+  --nic-no-rom             Suppress QEMU's bundled iPXE option ROM
+                           (passes romfile= to the -device line). Use
+                           to force the "firmware lacks NIC driver"
+                           scenario when validating staged-driver
+                           fallback. Implies --net.
   --hostfwd HOST:GUEST     Forward host port to guest (repeatable)
   --extra FILE             Stage additional .efi on disk (repeatable)
   --nsh FILE               Use custom startup.nsh file
@@ -369,14 +381,31 @@ if [[ -n "$VFS_DRIVER_STAGE" ]]; then
     cp "$VFS_DRIVER_STAGE" "$STAGING/VirtioFsDxe.efi"
 fi
 
-# Stage extra files
+# Stage extra files. Each entry is either "PATH" (lands at staging
+# root) or "PATH:DEST" where DEST is a relative target path (intermediate
+# dirs get created). Use the DEST form to drop drivers under a layout
+# like `drivers/x64/<name>.efi` for axl_driver_locate to find them.
 if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
     for extra in "${EXTRA_FILES[@]}"; do
-        if [[ ! -f "$extra" ]]; then
-            echo "ERROR: extra file not found: $extra" >&2
+        # Split src:dest. Reject any DEST that escapes via ".." to keep
+        # the staging dir self-contained.
+        if [[ "$extra" == *:* ]]; then
+            extra_src="${extra%%:*}"
+            extra_dst="${extra#*:}"
+            if [[ "$extra_dst" == *..* || "$extra_dst" = /* ]]; then
+                echo "ERROR: --extra dest must be a relative path without '..': $extra_dst" >&2
+                exit 1
+            fi
+        else
+            extra_src="$extra"
+            extra_dst="$(basename "$extra")"
+        fi
+        if [[ ! -f "$extra_src" ]]; then
+            echo "ERROR: extra file not found: $extra_src" >&2
             exit 1
         fi
-        cp "$extra" "$STAGING/$(basename "$extra")"
+        mkdir -p "$STAGING/$(dirname "$extra_dst")"
+        cp "$extra_src" "$STAGING/$extra_dst"
     done
 fi
 
@@ -693,7 +722,23 @@ if [[ "$NET" == "true" ]]; then
         GUEST_PORT="${fwd##*:}"
         NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
     done
-    CMD+=(-device virtio-net-pci,netdev=net0 -netdev "$NETDEV")
+    # Default NIC model is virtio-net-pci because OVMF has VirtioNetDxe
+    # built in. --nic-model lets tests force other PCI NICs (e1000,
+    # e1000e, rtl8139, pcnet, vmxnet3, ne2k_pci) to validate iPXE-driver
+    # bundle coverage on hardware OVMF lacks a driver for.
+    #
+    # NIC_NO_ROM=true suppresses the QEMU-bundled iPXE option ROM.
+    # Without this, QEMU loads an iPXE PXE ROM that exposes UNDI, and
+    # OVMF wraps UNDI→SNP — giving the appearance that "the firmware
+    # has a driver" for any common NIC. For tests that need a true
+    # "firmware lacks driver" scenario (so we can prove the staged
+    # iPXE driver bundle is loaded from disk), set NIC_NO_ROM=true.
+    NIC_MODEL_ACTUAL="${NIC_MODEL:-virtio-net-pci}"
+    NIC_DEV="${NIC_MODEL_ACTUAL},netdev=net0"
+    if [[ "${NIC_NO_ROM:-false}" == "true" ]]; then
+        NIC_DEV="${NIC_DEV},romfile="
+    fi
+    CMD+=(-device "$NIC_DEV" -netdev "$NETDEV")
 else
     CMD+=(-net none)
 fi
