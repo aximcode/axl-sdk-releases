@@ -57,8 +57,13 @@ test_setup() {
     TEST_NVRAM="$TEST_TMPDIR/vars.fd"
     TEST_BOOT_NAME=$(boot_efi_name "$TEST_ARCH")
 
-    # Resolve QEMU and firmware
+    # Resolve QEMU and firmware. find_qemu's `export QEMU_DIR` happens
+    # in the $() subshell, so it doesn't reach our parent shell —
+    # re-derive it here so find_firmware below can locate QEMU-bundled
+    # firmware ($QEMU_DIR/../share/qemu/edk2-*-code.fd) when applicable.
     TEST_QEMU_BIN=$(find_qemu "$TEST_ARCH") || { echo "QEMU not found for $TEST_ARCH"; exit 1; }
+    QEMU_DIR="$(dirname "$TEST_QEMU_BIN")"
+    export QEMU_DIR
     find_firmware "$TEST_ARCH" || { echo "Firmware not found for $TEST_ARCH"; exit 1; }
 
     # Copy NVRAM template

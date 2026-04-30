@@ -3,6 +3,34 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.5.3 — 2026-04-29
+
+Fixes a regression introduced in v0.2.9 where `--mount` (and other
+features that depend on QEMU-bundled firmware) silently fell through
+to system OVMF/AAVMF on hosts that have both a system QEMU and a
+custom QEMU build with bundled firmware.
+
+### Fixed
+
+- **`QEMU_DIR` not propagating from `find_qemu` to `find_firmware`** —
+  v0.2.9 (commit `ae3c3a6`) removed the top-level
+  `QEMU_DIR="${QEMU_DIR:-$HOME/projects/qemu/install/bin}"` default
+  in `scripts/axl-common.sh` and moved that resolution inside
+  `find_qemu()`. But `find_qemu` is called via `QEMU_BIN=$(find_qemu
+  "$ARCH")` — the `$()` runs it in a subshell, and its
+  `export QEMU_DIR=...` dies with the subshell. `find_firmware` in
+  the parent then sees `QEMU_DIR=""`, computes
+  `qemu_share="/share/qemu"`, fails the QEMU-bundled firmware lookup,
+  and falls through to system OVMF/AAVMF. Symptoms: `--mount`
+  produces no `fs1:` (system OVMF lacks `VirtioFsDxe`); aa64 unit
+  tests silently produce 0 results when the system aa64 QEMU lacks
+  slirp networking. Fix: re-derive and export `QEMU_DIR` in the
+  parent shell after the `$()` call in
+  [`scripts/run-qemu.sh`](scripts/run-qemu.sh) and
+  [`test/integration/common-test.sh`](test/integration/common-test.sh).
+  Idempotent on user-pre-set `QEMU_DIR`. Two call sites; no other
+  `$(find_qemu)` invocations exist in the tree.
+
 ## 0.5.2 — 2026-04-29
 
 `mkrd.efi` now ships as a self-contained binary that runs on minimal

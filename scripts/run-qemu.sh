@@ -290,8 +290,17 @@ with open(sys.argv[1], 'rb') as f:
     [[ "$SUBSYSTEM" == "11" || "$SUBSYSTEM" == "12" ]] && IS_DRIVER=true
 fi
 
-# Resolve QEMU and firmware
+# Resolve QEMU and firmware. find_qemu's `export QEMU_DIR` happens
+# in the $() subshell, so it doesn't reach our parent shell — re-derive
+# it here so find_firmware below can locate QEMU-bundled firmware
+# ($QEMU_DIR/../share/qemu/edk2-*-code.fd) when applicable. This
+# matters on hosts with both a system QEMU/OVMF (no VirtioFsDxe) and
+# a custom QEMU build that bundles richer firmware: without the
+# export propagating, find_firmware silently falls through to the
+# system OVMF and `--mount` (and similar features) breaks.
 QEMU_BIN=$(find_qemu "$ARCH") || { echo "QEMU not found for $ARCH" >&2; exit 1; }
+QEMU_DIR="$(dirname "$QEMU_BIN")"
+export QEMU_DIR
 find_firmware "$ARCH" || { echo "Firmware not found for $ARCH" >&2; exit 1; }
 SHELL_EFI=$(find_shell_efi "$ARCH") || true
 BOOT_NAME=$(boot_efi_name "$ARCH")
