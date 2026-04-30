@@ -3,6 +3,22 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.6.1 — 2026-04-30
+
+### Added
+
+- **`axl-sdk-host-tools.rpm`** — RPM artifact for the host-tools
+  package (run-qemu.sh + helpers). Was a v0.2.9 oversight; the SDK
+  package always shipped both `.deb` and `.rpm` but host-tools only
+  shipped `.deb` and `.tar.gz`. Now `axl-sdk-host-tools.rpm` is on
+  the release page next to its `.deb` counterpart, with stable URL
+  `…/releases/latest/download/axl-sdk-host-tools.rpm`. Both
+  packages are noarch (the host-tools payload is shell + python
+  scripts + linker scripts + C source, no pre-compiled binaries).
+  Fedora/RHEL deps tracked separately from Debian: `qemu-system-x86`,
+  `qemu-system-aarch64`, `edk2-ovmf`, `edk2-aarch64`, `virtiofsd`,
+  `mtools`, `dosfstools`.
+
 ## 0.6.0 — 2026-04-30
 
 Network tools (`netinfo`, `fetch`, `rfbrowse`) now Just Work on
