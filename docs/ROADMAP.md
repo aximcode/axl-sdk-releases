@@ -408,21 +408,123 @@ exercising real SMBus wire traffic through QEMU's ICH9 controller.
 - [x] The "SSIF (B1) is *not* covered here" note removed from
       `test-ipmi-qemu.sh`; the two scripts now cross-reference.
 
-### Phase B3: Platform Access — follow-on modules (Future)
+### Phase B3: Platform Access — follow-on modules
 
-- [ ] **AxlAcpi** — ACPI table discovery + parsing. Scope: RSDP → XSDT
-      walk, header parsing, GAS (Generic Address Structure) decoder,
-      accessors for FADT / MADT / HPET / MCFG. **No AML
-      interpretation** — that's ACPICA-sized and out of scope. Consumer
-      tool: `tools/acpi.c`. Scope anchored on SoftBMC's current usage
-      (`/home/mgosha/projects/aximcode/softbmc/SoftBmcPkg/Application/
-      SoftBmc/Modules/Feature/HwInfo/Acpi*.c`, ~560 LOC), which
-      AxlAcpi should be able to cut by ~60%. Estimate: 1–2 weeks.
-- [ ] **AxlPci** — ECAM / `PciExpressBaseAddress` config-space access
-      via MCFG. Consumer tool: `tools/pci.c` lspci-like walker.
-      Depends on AxlAcpi for MCFG location. Estimate: 1 week.
-- [ ] **AxlSpd** — DDR4/5 SPD readers via `AxlSmbus`. Consumer tool:
-      `tools/memspd.c`. Estimate: 1 week.
+R+1 (delldiags do.efi enabler — see local design doc
+`axl-sdk-needs.md` in delldiags for the full architectural posture):
+
+- [x] **AxlAcpi** — ACPI table discovery + typed readers. RSDP →
+      RSDT/XSDT walk, signature lookup with cursor iteration matching
+      `axl_smbios_find_next`, public checksum verifier, typed
+      readers for MCFG (PCIe ECAM segments), MADT (IOAPIC on x86 +
+      GIC regions on aa64), and FACP/FADT (SMI cmd port, PM1 blocks,
+      DSDT pointer). **No AML interpretation** — that's ACPICA-sized
+      and out of scope. Header: `axl/axl-acpi.h`. Source:
+      `src/acpi/axl-acpi.c`.
+- [x] **`axl_io_port_*`** — promote `axl_backend_io_*` to public
+      with 16/32-bit variants. Build-gated to x86 (compile error on
+      AArch64, not runtime no-op). Header: `axl/axl-io-port.h`.
+- [x] **`axl_nvstore_*` extensions** — namespace registration so
+      vendor GUIDs (Dell/HPE/Lenovo OEM variables) plug in by name
+      without exposing GUIDs at access sites; `_delete`, `_iter`,
+      `_get_attrs`. Built-in namespaces "global" and "app" remain
+      pre-registered. Behaviour change: unregistered namespace is
+      now an error (was: silent fallback to global).
+- [x] **AxlBoot** — typed boot-option management. `AxlBootOption`
+      struct (description / device-path text / opt_data) with
+      `_option_get/_set/_delete/_free`, `_order_get/_set`,
+      `_next_get/_set/_clear`, `_current_get`. `EFI_LOAD_OPTION`
+      codec stays internal — raw wire bytes never cross the public
+      API. Header: `axl/axl-boot.h`. Source: `src/util/axl-boot.c`.
+
+R+2:
+
+- [x] **AxlPci** — ECAM-based config-space access via MCFG. Lazy
+      on first call; typed `AxlPciAddr` struct (16-bit segment,
+      8/5/3-bit bus/dev/func). 8/16/32-bit read+write at any
+      register offset 0..4095. `axl_pci_next` cursor enumerates
+      every responding function, skips empty slots, honours the
+      multi-function header bit. `_find_by_vid_did` and
+      `_find_by_class` (24-bit class triplet) for direct lookups.
+      Cursor-style legacy cap walk (status bit 4 + cap pointer at
+      0x34) and PCIe extended cap walk (offsets 0x100+, 12-bit
+      next pointers). VPD reader walks the keyword-tagged
+      RO/RW resources (PCI 3.0 §6.4) with the F-bit handshake.
+      Header: `axl/axl-pci.h`. Source: `src/pci/axl-pci.c`.
+- [x] **AxlImage** — opaque `AxlImage *` handle for executable
+      image lifecycle. Thin wrapper over `axl_driver_load`/`_unload`
+      adding distinct `_start` semantics that capture the image's
+      EFI_STATUS exit code (`axl_driver_start` drops it because
+      drivers don't exit cleanly). Backend-neutral name; future
+      Linux/coreboot backends map to `posix_spawn`/payload
+      loaders. Header: `axl/axl-image.h`. Source:
+      `src/util/axl-image.c`.
+
+R+3:
+
+- [x] **AxlMemPhys** — physical-memory access. `_map`/`_unmap`
+      held mappings (Linux backend would `mmap("/dev/mem")` here;
+      identity-mapped no-ops on UEFI), one-shot
+      `_read{8,16,32,64}` / `_write{8,16,32,64}` helpers, and
+      `_search` for byte-pattern scans inside a mapped region.
+      Header: `axl/axl-mem-phys.h`. Source: `src/util/axl-mem-phys.c`.
+- [x] **AxlWatchdog** — `_disarm` / `_set(seconds)` / `_pet`. Wraps
+      `gBS->SetWatchdogTimer`. Without this, the firmware's
+      5-minute default watchdog kills any long-running diagnostic.
+      `_pet` re-arms to the value last passed to `_set`. Header:
+      `axl/axl-watchdog.h`.
+- [x] **`axl_reset_*`** — already shipped pre-R+3 in
+      `axl/axl-sys.h` as `axl_reset(int type)` with
+      `AXL_RESET_COLD` / `_WARM` / `_SHUTDOWN` constants. Maps to
+      `gRT->ResetSystem`.
+- [x] **AxlRng** — `axl_rng_bytes(out, len)` wraps
+      `EFI_RNG_PROTOCOL` (UEFI 2.11 §37.5). Returns -1 if the
+      protocol isn't published; consumers that need a deterministic
+      fallback layer their own. Header: `axl/axl-rng.h`.
+
+R+4 — DONE (2026-05-01):
+
+- [x] **AxlSpd** — DDR4/DDR5 SPD reader on `AxlSmbus`. Cursor
+      iteration over 0x50..0x57; key byte at SPD offset 2 selects
+      the codec (0x0C=DDR4, 0x12=DDR5). DDR4 uses the EE1004 SPA
+      pseudo-slave (0x36/0x37) for the upper 256-byte
+      manufacturing block; DDR5 pages via SPD5118 MR11 across
+      eight 128-byte windows. `AxlSpdInfo` carries module/DRAM
+      JEP-106 codes (raw, parity preserved), part number, serial,
+      manufacture year/week, capacity, JEDEC speed grade,
+      ECC/registered flags. Pure-decoder entry point
+      `axl_spd_decode(buf, len, *out)` runs the same codec on a
+      captured buffer with no SMBus involvement — used by the
+      cross-arch unit tests and by consumers doing offline
+      analysis. DDR3 deliberately deferred. Header: `axl/axl-spd.h`.
+      Source: `src/spd/`.
+
+- [x] **`tools/memspd.c`** — verbs `list / show <slot> /
+      decode <slot>`. Vendor lookup is data-driven via
+      `share/jedec.json` (15-vendor stub; auto-discovered next to
+      the .efi or via `--jedec-file`). Missing sidecar → manufacturer
+      fields print as raw 16-bit hex codes.
+
+- [x] **`scripts/qemu-patches/0001-smbus-eeprom-add-memdev-link.patch`**
+      — adds `memdev=<link<memory-backend>>` to QEMU's smbus-eeprom
+      device so `test/integration/test-spd-qemu.sh` can attach a
+      canned SPD blob at SMBus 0x50 and exercise the full wire
+      path through `SmbusHcShim.efi`. Stock QEMU 10.x rejects
+      `memdev=` on smbus-eeprom; the patch is small (~40 lines),
+      idiomatic (mirrors `pc-dimm`'s `memdev=` link), and a
+      candidate for upstreaming.
+
+- [x] **AxlSmbus byte ops** — `axl_smbus_read_byte` /
+      `axl_smbus_write_byte` (SMBus spec §5.5.4 / §5.5.5). Required
+      for SPD EEPROMs (24Cxx-style, no SMBus block framing) and
+      for SPD5118 hub register access. Implemented in both HC
+      (`EfiSmbusReadByte` / `EfiSmbusWriteByte`) and I2C-Master
+      transports; SmbusHcShim extended to translate the new shapes
+      to ICH9 SMBus Read Byte / Write Byte protocol commands.
+
+- [x] **AxlPlatform tests** — 21 new SPD tests (DDR4 + DDR5 decode
+      + bogus-input rejection + probe enumeration). Cross-arch
+      balanced; ratchet 1842 → 1863 on both x86 and AArch64.
 
 ### Phase B2: Redfish Support — DONE (as tool, not library)
 
@@ -911,6 +1013,73 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
       uefi-ipmitool) have been updated to reference the
       consolidated invocation. axl-common.sh stays put as the
       shared discovery library — no churn for downstream.
+
+---
+
+## Hardware Fixture Capture & Replay (Future)
+
+Vendor-neutral capture-and-replay of UEFI platform identity (SMBIOS,
+ACPI, PCI manifest, Redfish, IPMI) so axl-sdk tools can be exercised
+against real-world platforms under QEMU without lab access. Native
+UEFI capture tool (likely a `sysinfo --capture` extension) writes
+a fixture directory; `run-qemu.sh --fixture DIR` replays it.
+
+Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
+
+### Phase HF1: run-qemu.sh low-level flags
+
+- [ ] `--smbios-file FILE` → `-smbios file=FILE`
+- [ ] `--acpi-table FILE` (repeatable) → `-acpitable file=FILE`
+- [ ] `--ipmi-sim` → built-in `ipmi-bmc-sim` + KCS frontend
+- [ ] Hand-craft first fixture from the Proxmox dev VM
+      (`dmidecode --dump-bin`, `acpidump -b`) to validate replay
+      path before writing the capture tool.
+
+### Phase HF2: sysinfo --capture (SMBIOS + ACPI + PCI manifest)
+
+- [ ] Add `--capture <destdir>` flag to `tools/sysinfo.c`
+- [ ] Dump SMBIOS3 raw bytes via EFI Config Table
+- [ ] Walk ACPI RSDT/XSDT, write each table as `acpi/<sig>.dat`
+- [ ] Enumerate PCI via `EFI_PCI_IO_PROTOCOL`, write `pci.json`
+      (VID/DID/class/subsys/BARs) — manifest only, not replayed
+- [ ] Write `manifest.json` (vendor, model, serial, BIOS rev,
+      capture date, capture-tool version)
+- [ ] Support write targets: local FS (`fs0:\fixtures\...`),
+      virtiofs `--mount`, HTTP POST
+
+### Phase HF3: run-qemu.sh --fixture DIR
+
+- [ ] Auto-discover and wire `smbios.bin`, `acpi/*.dat`
+- [ ] Print `manifest.json` summary at startup so user sees which
+      machine the guest is impersonating
+- [ ] Warn (not block) when fixture metadata disagrees with QEMU
+      args (arch mismatch, etc.)
+
+### Phase HF4: Redfish capture & replay
+
+- [ ] Capture: walk service root via axl HTTP client, save JSON
+      tree mirroring `/redfish/v1/...`
+- [ ] Replay: `--redfish-mock DIR` spawns DMTF `Redfish-Mockup-Server`,
+      adds `--hostfwd <port>:443` (lifecycle modeled on virtiofsd)
+- [ ] Reference / validation: OpenBMC firmware running in a sibling
+      QEMU instance — real bmcweb stack, no lab hardware
+- [ ] `--openbmc-qemu PATH` flag for direct OpenBMC sibling launch
+
+### Phase HF5: IPMI capture & replay
+
+- [ ] Capture: in-band KCS sweep (Get-* commands), write raw
+      response bytes to `ipmi/<cmd>.bin`
+- [ ] Replay: `--ipmi-extern PATH` wires QEMU's `ipmi-bmc-extern`
+      to OpenIPMI's `ipmi_sim` seeded with captured replies
+- [ ] Standard commands only — no vendor OEM in the initial pass
+
+### Phase HF6: Sanitization & public fixtures
+
+- [ ] `--sanitize` flag (or post-processor): zero serials/asset
+      tags, replace MACs with locally-administered ranges, review
+      OEM strings for proprietary data
+- [ ] Decide: sibling repo `aximcode/axl-fixtures` vs. local-only
+- [ ] Contributor sanitization-review process (if going public)
 
 ---
 

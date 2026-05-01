@@ -42,6 +42,24 @@ typedef int (*AxlSmbusWriteBlockFn)(
     size_t          len);
 
 /**
+ * Per-transport byte read. Same in/out semantics as axl_smbus_read_byte.
+ */
+typedef int (*AxlSmbusReadByteFn)(
+    void     *ctx,
+    uint8_t   slave,
+    uint8_t   command,
+    uint8_t  *out);
+
+/**
+ * Per-transport byte write. Same in/out semantics as axl_smbus_write_byte.
+ */
+typedef int (*AxlSmbusWriteByteFn)(
+    void     *ctx,
+    uint8_t   slave,
+    uint8_t   command,
+    uint8_t   value);
+
+/**
  * Per-transport cleanup; frees whatever ctx held. Called during
  * axl_smbus_free().
  */
@@ -54,6 +72,8 @@ typedef struct {
     AxlSmbusTransport     kind;
     AxlSmbusReadBlockFn   read_block;
     AxlSmbusWriteBlockFn  write_block;
+    AxlSmbusReadByteFn    read_byte;
+    AxlSmbusWriteByteFn   write_byte;
     AxlSmbusCloseFn       close;
     void                 *ctx;
 } AxlSmbusTransportOps;

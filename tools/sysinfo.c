@@ -16,10 +16,16 @@
 
 static bool verbose = false;
 
-static const AxlConfigDesc descs[] = {
-    { "verbose", AXL_CFG_BOOL, "false", 'v', "Verbose output", 0, 0 },
-    { "help",    AXL_CFG_BOOL, "false", 'h', "Show this help", 0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output" },
+    {0}
+};
+
+static const AxlArgDesc kSection[] = {
+    { .name = "section", .type = AXL_ARG_STRING,
+      .help = "Optional: cpu | mem | fw | smbios | arch (default: all)" },
+    {0}
 };
 
 // ===========================================================================
@@ -437,29 +443,12 @@ show_smbios_info(void)
 // Entry point
 // ===========================================================================
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_sysinfo(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("SysInfo: invalid option\n");
-        axl_config_usage(cfg, "SysInfo",
-                         "[-v] [cpu|mem|fw|smbios|arch]");
-        return 1;
-    }
+    verbose = axl_args_get_bool(a, "verbose");
 
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "SysInfo",
-                         "[-v] [cpu|mem|fw|smbios|arch]");
-        return 0;
-    }
-
-    verbose = axl_config_get_bool(cfg, "verbose");
-
-    const char *section = axl_config_pos(cfg, 0);
+    const char *section = axl_args_get_string(a, "section");
 
     /* "arch" — print architecture tag and exit */
     if (section != NULL && axl_strcmp(section, "arch") == 0) {
@@ -497,4 +486,16 @@ main(
     }
 
     return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "SysInfo",
+        .help         = "Print system information (CPU, memory, firmware, SMBIOS, arch)",
+        .global_flags = kFlags,
+        .positionals  = kSection,
+        .handler      = run_sysinfo,
+    });
 }

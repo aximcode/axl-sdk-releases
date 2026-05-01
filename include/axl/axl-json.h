@@ -90,6 +90,43 @@ axl_json_free(
 );
 
 /**
+ * @brief One-shot: read a file, parse it as JSON.
+ *
+ * Convenience wrapper around @ref axl_file_get_contents +
+ * @ref axl_json_parse. The reader references the loaded buffer —
+ * the caller must keep @c *out_buf alive for the lifetime of
+ * @p r and free it (via @ref axl_free) **after** calling
+ * @ref axl_json_free on @p r.
+ *
+ * Typical use:
+ *
+ * @code
+ * AxlJsonReader r = { 0 };
+ * void   *raw = NULL;
+ * size_t  raw_len = 0;
+ * if (axl_json_load_file("config.json", &r, &raw, &raw_len)) {
+ *     axl_json_get_string(&r, "name", name, sizeof(name));
+ *     // ...
+ *     axl_json_free(&r);
+ *     axl_free(raw);
+ * }
+ * @endcode
+ *
+ * On failure (file unreadable, parse error, OOM) returns false and
+ * leaves @p r untouched, sets @c *out_buf to NULL, and frees any
+ * intermediate allocation.
+ *
+ * @return true on success, false otherwise.
+ */
+bool
+axl_json_load_file(
+    const char     *path,     ///< file path (UTF-8)
+    AxlJsonReader  *r,        ///< [out] reader to fill
+    void          **out_buf,  ///< [out] file contents (caller frees)
+    size_t         *out_len   ///< [out, optional] file size in bytes
+);
+
+/**
  * @brief Extract a string value from a parsed JSON object.
  *
  * @return true if found, false if not found or not a string.

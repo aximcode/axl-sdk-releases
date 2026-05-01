@@ -58,6 +58,46 @@ hc_write_block(void *vctx,
     return EFI_ERROR(s) ? -1 : 0;
 }
 
+static int
+hc_read_byte(void *vctx,
+             uint8_t slave, uint8_t command,
+             uint8_t *out)
+{
+    EFI_SMBUS_HC_PROTOCOL   *hc = (EFI_SMBUS_HC_PROTOCOL *)vctx;
+    EFI_SMBUS_DEVICE_ADDRESS addr = { .SmbusDeviceAddress = slave };
+    EFI_SMBUS_DEVICE_COMMAND cmd  = command;
+    UINTN                    length = 1;
+    uint8_t                  byte = 0;
+
+    EFI_STATUS s = axl_efi_call(hc->Execute, 7,
+                                hc, addr, cmd,
+                                EfiSmbusReadByte, FALSE,
+                                &length, &byte);
+    if (EFI_ERROR(s)) {
+        return -1;
+    }
+    *out = byte;
+    return 0;
+}
+
+static int
+hc_write_byte(void *vctx,
+              uint8_t slave, uint8_t command,
+              uint8_t value)
+{
+    EFI_SMBUS_HC_PROTOCOL   *hc = (EFI_SMBUS_HC_PROTOCOL *)vctx;
+    EFI_SMBUS_DEVICE_ADDRESS addr = { .SmbusDeviceAddress = slave };
+    EFI_SMBUS_DEVICE_COMMAND cmd  = command;
+    UINTN                    length = 1;
+    uint8_t                  byte = value;
+
+    EFI_STATUS s = axl_efi_call(hc->Execute, 7,
+                                hc, addr, cmd,
+                                EfiSmbusWriteByte, FALSE,
+                                &length, &byte);
+    return EFI_ERROR(s) ? -1 : 0;
+}
+
 static void
 hc_close(void *vctx)
 {
@@ -92,6 +132,8 @@ axl_smbus_hc_open(AxlSmbusTransportOps *ops)
     ops->kind        = AXL_SMBUS_TRANSPORT_HC;
     ops->read_block  = hc_read_block;
     ops->write_block = hc_write_block;
+    ops->read_byte   = hc_read_byte;
+    ops->write_byte  = hc_write_byte;
     ops->close       = hc_close;
     ops->ctx         = hc;
     return 0;

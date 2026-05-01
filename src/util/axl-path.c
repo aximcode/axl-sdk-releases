@@ -137,6 +137,21 @@ axl_path_extension(const char *path)
 }
 
 char *
+axl_path_companion(const char *anchor, const char *name)
+{
+    if (anchor == NULL || name == NULL) {
+        return NULL;
+    }
+    char *dir = axl_path_get_dirname(anchor);
+    if (dir == NULL) {
+        return NULL;
+    }
+    char *result = axl_path_join(dir, name);
+    axl_free(dir);
+    return result;
+}
+
+char *
 axl_path_join(const char *dir, const char *name)
 {
     size_t dir_len;

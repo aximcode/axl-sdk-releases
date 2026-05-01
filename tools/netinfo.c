@@ -16,11 +16,22 @@
 
 static bool verbose = false;
 
-static const AxlConfigDesc descs[] = {
-    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Verbose output",                0, 0 },
-    { "count",   AXL_CFG_STRING, NULL,    'c', "Number of pings (default: 4)",  0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                0, 0 },
-    { 0 }
+static const AxlArgDesc kGlobalFlags[] = {
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output (debug-level driver-locate logs)" },
+    {0}
+};
+
+static const AxlArgDesc kPingFlags[] = {
+    { .name = "count", .short_name = 'c', .type = AXL_ARG_U32, .base = 10,
+      .help = "Number of pings (default: 4)" },
+    {0}
+};
+
+static const AxlArgDesc kPingPos[] = {
+    { .name = "target", .type = AXL_ARG_STRING, .required = true,
+      .help = "Target IP address" },
+    {0}
 };
 
 /* NII protocol GUIDs — not in axl-sdk's generated UEFI headers.
@@ -344,79 +355,69 @@ do_ping(
 // Entry point
 // ---------------------------------------------------------------------------
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+/* Pre-run hook: surface verbose mode + ensure NIC drivers are
+   loaded before any verb runs. */
+static int g_netinfo_setup_failed = 0;
+
+static void
+netinfo_pre_run(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("NetInfo: invalid option\n");
-        axl_config_usage(cfg, "NetInfo",
-                         "[-v] [list | ping <ip> [-c <count>]]");
-        return 1;
-    }
-
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "NetInfo",
-                         "[-v] [list | ping <ip> [-c <count>]]");
-        return 0;
-    }
-
-    verbose = axl_config_get_bool(cfg, "verbose");
+    verbose = axl_args_get_bool(a, "verbose");
     if (verbose) {
-        /* Surface axl_driver_locate / axl_net_ensure_drivers debug
-         * lines so the user sees which candidate paths got tried. */
         axl_log_set_level(AXL_LOG_DEBUG);
     }
-
-    /* All non-help paths need NIC drivers + the network stack. */
     if (ensure_net_drivers() != 0) {
-        return 1;
+        g_netinfo_setup_failed = 1;
+        return;
     }
-
-    /* In verbose mode, identify which driver image is bound to each
-     * NIC. Useful when bringing up a new firmware (or new staged
-     * driver bundle) — tells the user immediately whether the SNP
-     * came from OVMF's own FV (firmware volume), an iPXE blob staged
-     * on disk, or some other source. */
     if (verbose) {
         show_nic_drivers();
     }
+}
 
-    const char *cmd = axl_config_pos(cfg, 0);
+static int
+do_list_verb(AxlArgs *a)
+{
+    (void)a;
+    if (g_netinfo_setup_failed) { return 1; }
+    show_interfaces();
+    return 0;
+}
 
-    if (cmd == NULL || axl_strcmp(cmd, "list") == 0) {
-        show_interfaces();
-    } else if (axl_strcmp(cmd, "ping") == 0) {
-        const char *target = axl_config_pos(cfg, 1);
-        if (target == NULL) {
-            axl_printf("NetInfo: ping requires an IP address\n");
-            return 1;
-        }
+static int
+do_ping_verb(AxlArgs *a)
+{
+    if (g_netinfo_setup_failed) { return 1; }
 
-        size_t ping_count = 4;
-        const char *count_str = axl_config_get(cfg, "count");
-        if (count_str != NULL) {
-            ping_count = (size_t)axl_strtou64(count_str);
-            if (ping_count == 0) {
-                ping_count = 4;
-            }
-        }
-
-        /* Ping needs an IP — run DHCP if it hasn't already. ensure_drivers
-         * already ran, so auto_init's driver step short-circuits. */
-        if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
-            axl_printf("NetInfo: no IP address — DHCP did not complete.\n");
-            return 1;
-        }
-
-        return do_ping(target, ping_count);
-    } else {
-        axl_printf("NetInfo: unknown command '%s'\n", cmd);
+    const char *target     = axl_args_get_string(a, "target");
+    uint32_t    ping_count = (uint32_t)axl_args_get_uint(a, "count");
+    if (ping_count == 0) {
+        ping_count = 4;
+    }
+    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+        axl_printf("NetInfo: no IP address — DHCP did not complete.\n");
         return 1;
     }
+    return do_ping(target, ping_count);
+}
 
-    return 0;
+static const AxlVerb kVerbs[] = {
+    { .name = "list", .handler = do_list_verb,
+      .help = "List network interfaces and their state" },
+    { .name = "ping", .handler = do_ping_verb,
+      .flags = kPingFlags, .positionals = kPingPos,
+      .help = "Send ICMP echo to a target IP" },
+    {0}
+};
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "NetInfo",
+        .help         = "Network interface inventory and ICMP ping",
+        .global_flags = kGlobalFlags,
+        .verbs        = kVerbs,
+        .pre_run      = netinfo_pre_run,
+    });
 }

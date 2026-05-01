@@ -17,16 +17,30 @@
 // Option definitions
 // ---------------------------------------------------------------------------
 
-static const AxlConfigDesc descs[] = {
-    { "user",     AXL_CFG_STRING, NULL,    'u', "Username",                                0, 0 },
-    { "password", AXL_CFG_STRING, NULL,    'p', "Password",                                0, 0 },
-    { "basic",    AXL_CFG_BOOL,   "false", 'b', "Use HTTP Basic auth (default: session)",  0, 0 },
-    { "members",  AXL_CFG_BOOL,   "false", 'm', "List collection Members URIs",            0, 0 },
-    { "expand",   AXL_CFG_BOOL,   "false", 'e', "With -m, GET each member",                0, 0 },
-    { "raw",      AXL_CFG_BOOL,   "false", 'r', "Raw JSON output (no colors)",             0, 0 },
-    { "verbose",  AXL_CFG_BOOL,   "false", 'v', "Show HTTP status and headers",            0, 0 },
-    { "help",     AXL_CFG_BOOL,   "false", 'h', "Show this help",                          0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "user",     .short_name = 'u', .type = AXL_ARG_STRING,
+      .help = "Username" },
+    { .name = "password", .short_name = 'p', .type = AXL_ARG_STRING,
+      .help = "Password" },
+    { .name = "basic",    .short_name = 'b', .type = AXL_ARG_BOOL,
+      .help = "Use HTTP Basic auth (default: session)" },
+    { .name = "members",  .short_name = 'm', .type = AXL_ARG_BOOL,
+      .help = "List collection Members URIs" },
+    { .name = "expand",   .short_name = 'e', .type = AXL_ARG_BOOL,
+      .help = "With -m, GET each member" },
+    { .name = "raw",      .short_name = 'r', .type = AXL_ARG_BOOL,
+      .help = "Raw JSON output (no colors)" },
+    { .name = "verbose",  .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Show HTTP status and headers" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "host",  .type = AXL_ARG_STRING, .required = true,
+      .help = "Redfish service host (or full URL)" },
+    { .name = "paths", .type = AXL_ARG_MULTI,
+      .help = "Optional Redfish paths or shortcut names (default: service root)" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -425,34 +439,10 @@ get_members(
 // Entry point
 // ---------------------------------------------------------------------------
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_rfbrowse(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("rfbrowse: invalid option\n");
-        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
-        return 1;
-    }
-
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
-        axl_printf("\nShortcuts:\n");
-        for (int i = 0; shortcuts[i].name != NULL; i++) {
-            axl_printf("  %-10s %s\n", shortcuts[i].name, shortcuts[i].path);
-        }
-        return 0;
-    }
-
-    const char *host = axl_config_pos(cfg, 0);
-    if (host == NULL) {
-        axl_printf("rfbrowse: host required\n");
-        axl_config_usage(cfg, "rfbrowse", "<host-or-url> [options] [path|shortcut ...]");
-        return 1;
-    }
+    const char *host = axl_args_get_string(a, "host");
 
     /* Auto-load NIC drivers + DHCP so rfbrowse works from a bare UEFI
      * shell. TLS is freestanding mbedtls — no firmware TlsDxe needed. */
@@ -476,13 +466,13 @@ main(
         return 1;
     }
 
-    const char *user     = axl_config_get(cfg, "user");
-    const char *password = axl_config_get(cfg, "password");
-    bool basic   = axl_config_get_bool(cfg, "basic");
-    bool members = axl_config_get_bool(cfg, "members");
-    bool expand  = axl_config_get_bool(cfg, "expand");
-    bool raw     = axl_config_get_bool(cfg, "raw");
-    bool verbose = axl_config_get_bool(cfg, "verbose");
+    const char *user     = axl_args_get_string(a, "user");
+    const char *password = axl_args_get_string(a, "password");
+    bool basic   = axl_args_get_bool(a, "basic");
+    bool members = axl_args_get_bool(a, "members");
+    bool expand  = axl_args_get_bool(a, "expand");
+    bool raw     = axl_args_get_bool(a, "raw");
+    bool verbose = axl_args_get_bool(a, "verbose");
 
     // Build base URL
     char base_url[256];
@@ -521,10 +511,10 @@ main(
     }
 
     // Determine which paths to fetch
-    size_t pos_count = (size_t)axl_config_pos_count(cfg);
-    int result = 0;
+    int  path_count = axl_args_get_pos_count(a);
+    int  result     = 0;
 
-    if (pos_count <= 1) {
+    if (path_count == 0) {
         // No path args — fetch service root
         char url[512];
         build_url(url, sizeof(url), base_url, "/redfish/v1/");
@@ -536,8 +526,8 @@ main(
         }
     } else {
         // Process each path argument
-        for (size_t i = 1; i < pos_count; i++) {
-            const char *arg = axl_config_pos(cfg, (int)i);
+        for (int i = 0; i < path_count; i++) {
+            const char *arg = axl_args_get_pos(a, i);
             if (arg == NULL) {
                 continue;
             }
@@ -546,7 +536,7 @@ main(
             char url[512];
             build_url(url, sizeof(url), base_url, path);
 
-            if (pos_count > 2 && !raw) {
+            if (path_count > 1 && !raw) {
                 axl_printf("=== %s ===\n", arg);
             }
 
@@ -569,4 +559,16 @@ main(
     }
 
     return result;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "rfbrowse",
+        .help         = "Redfish REST API browser",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_rfbrowse,
+    });
 }

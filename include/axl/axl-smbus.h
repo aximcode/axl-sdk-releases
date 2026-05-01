@@ -143,6 +143,57 @@ axl_smbus_write_block(
     );
 
 // ---------------------------------------------------------------------------
+// Byte transfers (SMBus 2.0 §5.5.4 / §5.5.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief SMBus "Read Byte" transaction.
+ *
+ * Per spec §5.5.5: write @a command to @a slave, repeated start, read
+ * one data byte. The wire format is plain (no count prefix), which
+ * matches 24Cxx-style EEPROMs that auto-increment from a written
+ * offset — including the JEDEC SPD EEPROMs at 0x50–0x57 (DDR3/4 use
+ * 1-byte offsets; DDR5 SPD5118 hubs use this op for register reads
+ * after a page select via MR11).
+ *
+ * @param s        open session.
+ * @param slave    7-bit SMBus slave address.
+ * @param command  SMBus command byte (register/offset).
+ * @param out      (out) receives the data byte.
+ *
+ * @return 0 on success, -1 on transport error or invalid arguments.
+ */
+int
+axl_smbus_read_byte(
+    AxlSmbus  *s,
+    uint8_t    slave,
+    uint8_t    command,
+    uint8_t   *out
+    );
+
+/**
+ * @brief SMBus "Write Byte" transaction.
+ *
+ * Per spec §5.5.4: write @a command followed by @a value to @a slave.
+ * Used for SPD5118 hub page selection (write page to MR11 / register
+ * 0x0B) before reading from the page window.
+ *
+ * @param s        open session.
+ * @param slave    7-bit SMBus slave address.
+ * @param command  SMBus command byte (register/offset).
+ * @param value    data byte to write.
+ *
+ * @return 0 on success, -1 on transport error or invalid arguments.
+ */
+int
+axl_smbus_write_byte(
+    AxlSmbus  *s,
+    uint8_t    slave,
+    uint8_t    command,
+    uint8_t    value
+    );
+
+// ---------------------------------------------------------------------------
 // Formatting helpers (string table lookups; no allocation)
 // ---------------------------------------------------------------------------
 

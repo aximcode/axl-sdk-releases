@@ -1214,6 +1214,49 @@ capture_write(const char *data, size_t len, void *ctx)
 }
 
 static void
+test_format_bytes(void)
+{
+    char buf[40];
+
+    /* Sub-1KiB → bytes. */
+    test_check(axl_format_bytes(0, buf, sizeof(buf)) > 0,
+               "format_bytes: 0 returns >0");
+    test_check(axl_strcmp(buf, "0 B") == 0,
+               "format_bytes: 0 -> '0 B'");
+
+    test_check(axl_format_bytes(512, buf, sizeof(buf)) > 0
+               && axl_strcmp(buf, "512 B") == 0,
+               "format_bytes: 512 -> '512 B'");
+
+    /* Even multiples of binary units take the whole-number form. */
+    test_check(axl_format_bytes(1024, buf, sizeof(buf)) > 0
+               && axl_strcmp(buf, "1 KiB") == 0,
+               "format_bytes: 1024 -> '1 KiB'");
+    test_check(axl_format_bytes(8ULL << 30, buf, sizeof(buf)) > 0
+               && axl_strcmp(buf, "8 GiB") == 0,
+               "format_bytes: 8 GiB exact");
+
+    /* Non-even values fall back to floor + raw byte hint. */
+    test_check(axl_format_bytes(1500, buf, sizeof(buf)) > 0
+               && axl_strcmp(buf, "1 KiB (1500 B)") == 0,
+               "format_bytes: 1500 -> '1 KiB (1500 B)'");
+
+    /* NULL / zero-cap rejection. */
+    test_check(axl_format_bytes(123, NULL, sizeof(buf)) == -1,
+               "format_bytes: NULL buf -> -1");
+    test_check(axl_format_bytes(123, buf, 0) == -1,
+               "format_bytes: zero capacity -> -1");
+
+    /* Truncation: snprintf-style "would-write" return. */
+    char tiny[2];
+    int written = axl_format_bytes(8ULL << 30, tiny, sizeof(tiny));
+    test_check(written > (int)sizeof(tiny),
+               "format_bytes: truncation returns 'would-write' length > buf_size");
+    test_check(tiny[sizeof(tiny) - 1] == '\0',
+               "format_bytes: buffer NUL-terminated even on truncation");
+}
+
+static void
 test_format(void)
 {
     FormatCapture cap;
@@ -1288,6 +1331,7 @@ test_strbuf_main(
     test_memcpy();
     test_memset();
     test_snprintf();
+    test_format_bytes();
     test_strtou64();
     test_strtou64_with_offset();
     test_str_reader();

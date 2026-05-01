@@ -21,14 +21,26 @@ static bool show_line_numbers = false;
 static bool count_only = false;
 static bool verbose_mode = false;
 
-static const AxlConfigDesc descs[] = {
-    { "ignore-case",  AXL_CFG_BOOL, "false", 'i', "Case-insensitive match",       0, 0 },
-    { "line-number",  AXL_CFG_BOOL, "false", 'n', "Show line numbers",            0, 0 },
-    { "count",        AXL_CFG_BOOL, "false", 'c', "Count matches only",           0, 0 },
-    { "recursive",    AXL_CFG_BOOL, "false", 'r', "Recursive directory search",   0, 0 },
-    { "verbose",      AXL_CFG_BOOL, "false", 'v', "Verbose output",               0, 0 },
-    { "help",         AXL_CFG_BOOL, "false", 'h', "Show this help",               0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "ignore-case", .short_name = 'i', .type = AXL_ARG_BOOL,
+      .help = "Case-insensitive match" },
+    { .name = "line-number", .short_name = 'n', .type = AXL_ARG_BOOL,
+      .help = "Show line numbers" },
+    { .name = "count",       .short_name = 'c', .type = AXL_ARG_BOOL,
+      .help = "Count matches only" },
+    { .name = "recursive",   .short_name = 'r', .type = AXL_ARG_BOOL,
+      .help = "Recursive directory search" },
+    { .name = "verbose",     .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "pattern", .type = AXL_ARG_STRING, .required = true,
+      .help = "Search pattern" },
+    { .name = "files",   .type = AXL_ARG_MULTI,  .required = true,
+      .help = "One or more files (or directories with -r)" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -214,53 +226,22 @@ grep_directory(
 // Entry point
 // ---------------------------------------------------------------------------
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_grep(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("Grep: invalid option\n");
-        axl_config_usage(cfg, "Grep",
-                         "[-i] [-n] [-c] [-r] [-v] pattern file [file...]");
-        return 1;
-    }
+    verbose_mode      = axl_args_get_bool(a, "verbose");
+    case_insensitive  = axl_args_get_bool(a, "ignore-case");
+    show_line_numbers = axl_args_get_bool(a, "line-number");
+    count_only        = axl_args_get_bool(a, "count");
+    bool recursive    = axl_args_get_bool(a, "recursive");
 
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "Grep",
-                         "[-i] [-n] [-c] [-r] [-v] pattern file [file...]");
-        return 0;
-    }
-
-    verbose_mode      = axl_config_get_bool(cfg, "verbose");
-    case_insensitive  = axl_config_get_bool(cfg, "ignore-case");
-    show_line_numbers = axl_config_get_bool(cfg, "line-number");
-    count_only        = axl_config_get_bool(cfg, "count");
-    bool recursive    = axl_config_get_bool(cfg, "recursive");
-
-    const char *pattern = axl_config_pos(cfg, 0);
-    if (pattern == NULL) {
-        axl_printf("Grep: pattern required\n");
-        return 1;
-    }
-
-    size_t pos_count = (size_t)axl_config_pos_count(cfg);
-    if (pos_count < 2) {
-        axl_printf("Grep: file path required\n");
-        return 1;
-    }
-
-    /* Count files to determine if we show filenames */
-    size_t file_count = pos_count - 1;
+    const char *pattern    = axl_args_get_string(a, "pattern");
+    int         file_count = axl_args_get_pos_count(a);
     bool multi_file = (file_count > 1) || recursive || verbose_mode;
 
     size_t total_matches = 0;
-
-    for (size_t i = 1; i < pos_count; i++) {
-        const char *path = axl_config_pos(cfg, (int)i);
-
+    for (int i = 0; i < file_count; i++) {
+        const char *path = axl_args_get_pos(a, i);
         if (recursive && axl_file_is_dir(path)) {
             total_matches += grep_directory(pattern, path, 0);
         } else {
@@ -269,4 +250,16 @@ main(
     }
 
     return (total_matches > 0) ? 0 : 1;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "Grep",
+        .help         = "Search file(s) for a pattern (UNIX grep-style)",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_grep,
+    });
 }

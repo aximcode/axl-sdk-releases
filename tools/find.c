@@ -17,12 +17,20 @@
 
 static bool verbose = false;
 
-static const AxlConfigDesc descs[] = {
-    { "name",    AXL_CFG_STRING, NULL,    0,   "Glob pattern (* and ? wildcards)", 0, 0 },
-    { "type",    AXL_CFG_STRING, NULL,    0,   "Filter: f=files, d=directories",   0, 0 },
-    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Show size and date",               0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                   0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "name",    .type = AXL_ARG_STRING,
+      .help = "Glob pattern (* and ? wildcards)" },
+    { .name = "type",    .type = AXL_ARG_STRING,
+      .help = "Filter: f=files, d=directories" },
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Show size and date" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "path", .type = AXL_ARG_STRING,
+      .help = "Starting path (default: '.')" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -149,32 +157,15 @@ find_walk(
 // Entry point
 // ---------------------------------------------------------------------------
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_find(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("Find: invalid option\n");
-        axl_config_usage(cfg, "Find",
-                         "[--name pattern] [--type f|d] [-v] [path]");
-        return 1;
-    }
+    verbose = axl_args_get_bool(a, "verbose");
 
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "Find",
-                         "[--name pattern] [--type f|d] [-v] [path]");
-        return 0;
-    }
-
-    verbose = axl_config_get_bool(cfg, "verbose");
-
-    const char *name_pattern = axl_config_get(cfg, "name");
+    const char *name_pattern = axl_args_get_string(a, "name");
 
     char type_filter = '\0';
-    const char *type_str = axl_config_get(cfg, "type");
+    const char *type_str = axl_args_get_string(a, "type");
     if (type_str != NULL) {
         type_filter = type_str[0];
         if (type_filter != 'f' && type_filter != 'd') {
@@ -183,7 +174,7 @@ main(
         }
     }
 
-    const char *start_path = axl_config_pos(cfg, 0);
+    const char *start_path = axl_args_get_string(a, "path");
     if (start_path == NULL) {
         start_path = ".";
     }
@@ -196,4 +187,16 @@ main(
     }
 
     return (match_count > 0) ? 0 : 1;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "Find",
+        .help         = "Find files and directories (UNIX find-style)",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_find,
+    });
 }

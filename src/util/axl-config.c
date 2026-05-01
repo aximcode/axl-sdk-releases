@@ -20,7 +20,6 @@ AXL_LOG_DOMAIN("config");
 // Limits
 // ---------------------------------------------------------------------------
 
-#define MAX_POS    32
 #define MAX_MULTI  16
 
 // ---------------------------------------------------------------------------
@@ -39,8 +38,6 @@ struct AxlConfig {
     AxlConfig            *parent;
     AxlHashTable         *values;     /* key → char* (owned copies) */
     AxlHashTable         *multi;      /* key → MultiValues* (owned) */
-    const char           *positional[MAX_POS];
-    int                   pos_count;
 };
 
 // ---------------------------------------------------------------------------
@@ -52,17 +49,6 @@ find_desc(const AxlConfigDesc *descs, const char *key)
 {
     for (int i = 0; descs[i].key != NULL; i++) {
         if (axl_streql(descs[i].key, key)) {
-            return &descs[i];
-        }
-    }
-    return NULL;
-}
-
-static const AxlConfigDesc *
-find_desc_by_short(const AxlConfigDesc *descs, char flag)
-{
-    for (int i = 0; descs[i].key != NULL; i++) {
-        if (descs[i].short_flag == flag) {
             return &descs[i];
         }
     }
@@ -261,7 +247,6 @@ axl_config_new(
     cfg->apply_fn = apply_fn;
     cfg->target = target;
     cfg->parent = NULL;
-    cfg->pos_count = 0;
 
     cfg->values = axl_hash_table_new_full(
         NULL, NULL, axl_free_impl, axl_free_impl);
@@ -532,169 +517,6 @@ axl_config_get_multi(AxlConfig *cfg, const char *key, size_t index)
 // ---------------------------------------------------------------------------
 // Public API — command-line parsing
 // ---------------------------------------------------------------------------
-
-int
-axl_config_parse_args(AxlConfig *cfg, int argc, char **argv)
-{
-    bool stop_opts = false;
-
-    if (cfg == NULL || argv == NULL) {
-        return -1;
-    }
-
-    for (int i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-
-        if (stop_opts || arg[0] != '-' || arg[1] == '\0') {
-            /* Positional argument */
-            if (cfg->pos_count < MAX_POS) {
-                cfg->positional[cfg->pos_count++] = arg;
-            }
-            continue;
-        }
-
-        /* "--" stops option parsing */
-        if (arg[0] == '-' && arg[1] == '-' && arg[2] == '\0') {
-            stop_opts = true;
-            continue;
-        }
-
-        if (arg[1] == '-') {
-            /* Long option: --key or --key=value */
-            const char *key_start = arg + 2;
-            const char *eq = NULL;
-            for (const char *p = key_start; *p != '\0'; p++) {
-                if (*p == '=') { eq = p; break; }
-            }
-
-            char key_buf[128];
-            size_t key_len;
-            if (eq != NULL) {
-                key_len = (size_t)(eq - key_start);
-            } else {
-                key_len = axl_strlen(key_start);
-            }
-            if (key_len >= sizeof(key_buf)) {
-                key_len = sizeof(key_buf) - 1;
-            }
-            axl_memcpy(key_buf, key_start, key_len);
-            key_buf[key_len] = '\0';
-
-            const AxlConfigDesc *desc = find_desc(cfg->descs, key_buf);
-            if (desc == NULL) {
-                axl_warning("unknown option: --%s", key_buf);
-                return -1;
-            }
-
-            if (desc->type == AXL_CFG_BOOL) {
-                const char *bval = (eq != NULL) ? eq + 1 : "true";
-                if (axl_config_set(cfg, desc->key, bval) != 0) {
-                    axl_warning("--%s: invalid value '%s'", key_buf, bval);
-                    return -1;
-                }
-            } else {
-                const char *val;
-                if (eq != NULL) {
-                    val = eq + 1;
-                } else if (i + 1 < argc) {
-                    val = argv[++i];
-                } else {
-                    axl_warning("--%s requires a value", key_buf);
-                    return -1;
-                }
-                if (axl_config_set(cfg, desc->key, val) != 0) {
-                    axl_warning("--%s: invalid value '%s'", key_buf, val);
-                    return -1;
-                }
-            }
-        } else {
-            /* Short option: -k or -k value */
-            char flag = arg[1];
-            const AxlConfigDesc *desc = find_desc_by_short(cfg->descs, flag);
-            if (desc == NULL) {
-                axl_warning("unknown option: -%c", flag);
-                return -1;
-            }
-
-            if (desc->type == AXL_CFG_BOOL) {
-                if (axl_config_set(cfg, desc->key, "true") != 0) {
-                    return -1;
-                }
-            } else {
-                const char *val;
-                if (arg[2] == '=') {
-                    val = arg + 3;
-                } else if (arg[2] != '\0') {
-                    val = arg + 2;
-                } else if (i + 1 < argc) {
-                    val = argv[++i];
-                } else {
-                    axl_warning("-%c requires a value", flag);
-                    return -1;
-                }
-                if (axl_config_set(cfg, desc->key, val) != 0) {
-                    axl_warning("-%c: invalid value '%s'", flag, val);
-                    return -1;
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-const char *
-axl_config_pos(AxlConfig *cfg, int index)
-{
-    if (cfg == NULL || index < 0 || index >= cfg->pos_count) {
-        return NULL;
-    }
-    return cfg->positional[index];
-}
-
-int
-axl_config_pos_count(AxlConfig *cfg)
-{
-    if (cfg == NULL) {
-        return 0;
-    }
-    return cfg->pos_count;
-}
-
-// ---------------------------------------------------------------------------
-// Public API — help generation
-// ---------------------------------------------------------------------------
-
-void
-axl_config_usage(AxlConfig *cfg, const char *program, const char *synopsis)
-{
-    if (cfg == NULL || program == NULL) {
-        return;
-    }
-
-    axl_printf("Usage: %s %s\n\nOptions:\n",
-               program, synopsis != NULL ? synopsis : "");
-
-    for (int i = 0; cfg->descs[i].key != NULL; i++) {
-        const AxlConfigDesc *d = &cfg->descs[i];
-
-        if (d->short_flag != 0) {
-            axl_printf("  -%c, --%-20s", d->short_flag, d->key);
-        } else {
-            axl_printf("      --%-20s", d->key);
-        }
-
-        if (d->description != NULL) {
-            axl_printf("  %s", d->description);
-        }
-
-        if (d->default_value != NULL) {
-            axl_printf(" (default: %s)", d->default_value);
-        }
-
-        axl_printf("\n");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Public API — inheritance

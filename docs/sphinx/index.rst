@@ -45,10 +45,19 @@ AXL SDK
    modules/net
    modules/tls
    modules/sys
+   modules/io-port
+   modules/boot
+   modules/image
+   modules/mem-phys
+   modules/watchdog
+   modules/rng
    modules/gfx
    modules/smbios
+   modules/acpi
+   modules/pci
    modules/smbus
    modules/ipmi
+   modules/spd
 
 .. toctree::
    :maxdepth: 1

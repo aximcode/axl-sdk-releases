@@ -29,6 +29,9 @@ TEST_CLEAN_LOG=""
 TEST_NVRAM=""
 TEST_BOOT_NAME=""
 TEST_QEMU_PID=0
+TEST_ECHO_PID=""
+TEST_ECHO_PORT=""
+TEST_UDP_ECHO_PID=""
 
 # ---------------------------------------------------------------------------
 # Arg parsing
@@ -77,6 +80,14 @@ test_cleanup() {
     if [[ $TEST_QEMU_PID -gt 0 ]]; then
         kill "$TEST_QEMU_PID" 2>/dev/null || true
         wait "$TEST_QEMU_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${TEST_ECHO_PID:-}" ]] && kill -0 "$TEST_ECHO_PID" 2>/dev/null; then
+        kill "$TEST_ECHO_PID" 2>/dev/null || true
+        wait "$TEST_ECHO_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${TEST_UDP_ECHO_PID:-}" ]] && kill -0 "$TEST_UDP_ECHO_PID" 2>/dev/null; then
+        kill "$TEST_UDP_ECHO_PID" 2>/dev/null || true
+        wait "$TEST_UDP_ECHO_PID" 2>/dev/null || true
     fi
     #
     # TEST_KEEP_LOG=<path> preserves the raw serial log outside the
@@ -242,6 +253,91 @@ test_add_network() {
     )
 }
 
+# Slirp subnet IP that the unit-test runner reserves as the "echo
+# target." Tests connect to this IP (any port) and slirp's guestfwd
+# rules redirect the byte stream to a host-side stream-echo server.
+# Picked inside slirp's default 10.0.2.0/24 subnet but distinct from
+# the guest's own DHCP'd 10.0.2.15.
+#
+# Slirp does NOT intercept connections to the guest's own IP — those
+# packets bypass slirp's TCP routing — so a non-self IP is required.
+TEST_ECHO_HOST="10.0.2.100"
+
+# UDP echo port. Slirp's `guestfwd` is TCP-only (no UDP form), but
+# UDP datagrams sent from the guest to 10.0.2.2 (the slirp gateway)
+# are delivered to host loopback natively by slirp. We pin a fixed
+# port so the guest-side test code can target it directly without
+# needing to plumb a runtime-allocated port number into the guest.
+TEST_UDP_ECHO_PORT=35555
+
+# Add networking with a stream-echo backstop reachable at
+# $TEST_ECHO_HOST:<any port>. Tests can do
+# `axl_tcp_connect("10.0.2.100", port, ...)` and get a working remote
+# peer that echoes every byte back, without any real intra-guest
+# networking.
+#
+# This helper:
+#   1. Starts a host-side TCP echo server (test/integration/echo-stream.py)
+#      on 127.0.0.1:<TEST_ECHO_PORT> as a background process. The PID
+#      is captured in TEST_ECHO_PID so the cleanup trap kills it on
+#      exit.
+#   2. Installs `guestfwd` rules that intercept guest connections to
+#      $TEST_ECHO_HOST:<port> at the slirp layer and forward them as
+#      TCP to 127.0.0.1:<TEST_ECHO_PORT>. Both directions of byte
+#      traffic flow transparently.
+#
+# Usage: test_add_network_with_echo <port1> [port2] [port3] ...
+#
+# Note: the `guestfwd cmd:` (spawn a process per connection) form
+# was removed in QEMU 8.0 for security reasons, so a host-side
+# listener is required for the redirect target.
+test_add_network_with_echo() {
+    local echo_script
+    echo_script="$(dirname "${BASH_SOURCE[0]}")/echo-stream.py"
+
+    # Pick a free host port for the echo server.
+    if [[ -z "${TEST_ECHO_PORT:-}" ]]; then
+        TEST_ECHO_PORT=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')
+        export TEST_ECHO_PORT
+    fi
+
+    # Start the TCP echo server in the background and stash its PID
+    # for test_cleanup. Wait briefly for the listener to come up.
+    python3 "$echo_script" --port "$TEST_ECHO_PORT" \
+        > "$TEST_TMPDIR/echo-stream.out" 2>&1 &
+    TEST_ECHO_PID=$!
+
+    local i
+    for i in $(seq 1 50); do
+        if (echo > /dev/tcp/127.0.0.1/"$TEST_ECHO_PORT") 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+
+    # Start the UDP echo on the pinned port. No readiness probe — UDP
+    # is connectionless; if bind failed we'd see test failures, not
+    # hangs.
+    python3 "$echo_script" --udp --port "$TEST_UDP_ECHO_PORT" \
+        > "$TEST_TMPDIR/echo-udp.out" 2>&1 &
+    TEST_UDP_ECHO_PID=$!
+
+    # Build the netdev string — one guestfwd rule per requested port.
+    local netdev="user,id=net0"
+    local port
+    for port in "$@"; do
+        netdev+=",guestfwd=tcp:${TEST_ECHO_HOST}:${port}-tcp:127.0.0.1:${TEST_ECHO_PORT}"
+    done
+    TEST_QEMU_CMD+=(
+        -device "$(_test_nic_device),netdev=net0"
+        -netdev "$netdev"
+    )
+}
+
 # Add -net none (no networking)
 test_add_no_network() {
     TEST_QEMU_CMD+=(-net none)
@@ -287,6 +383,37 @@ test_add_ipmi_bmc_sim_ssif() {
     TEST_QEMU_CMD+=(
         -device "ipmi-bmc-sim,id=bmc0"
         -device "smbus-ipmi,bmc=bmc0,address=0x10"
+    )
+}
+
+# Attach an SPD EEPROM image to the platform SMBus at <address> (default
+# 0x50). Requires the locally-patched QEMU build (scripts/qemu-patches/
+# 0001-smbus-eeprom-add-memdev-link.patch) which adds a memdev= link
+# property to smbus-eeprom; stock 10.x rejects the memdev= argument.
+# The blob must be at least SMBUS_EEPROM_SIZE bytes (256) — the device
+# copies the first 256 bytes into init_data at realize.
+#
+# Usage: test_add_smbus_eeprom <blob-path> [address]
+test_add_smbus_eeprom() {
+    local blob="$1"
+    local addr="${2:-0x50}"
+    if [[ "$TEST_ARCH" != "X64" ]]; then
+        log_warning "test_add_smbus_eeprom: SMBus EEPROM injection is x86-only; skipping on $TEST_ARCH"
+        return
+    fi
+    if [[ ! -f "$blob" ]]; then
+        log_error "test_add_smbus_eeprom: blob '$blob' not found"
+        return 1
+    fi
+    local id="spd_${addr//0x/}"
+    # memory-backend-file rounds `size=` up to the host page; the blob
+    # must be at least one page or QEMU rejects "backing store too
+    # small". gen-spd.py pads to 4096 bytes for this reason. The
+    # smbus-eeprom device only consumes the first 256 bytes; padding
+    # is harmless.
+    TEST_QEMU_CMD+=(
+        -object "memory-backend-file,id=$id,mem-path=$blob,size=4096,share=off,readonly=on"
+        -device "smbus-eeprom,address=$addr,memdev=$id"
     )
 }
 

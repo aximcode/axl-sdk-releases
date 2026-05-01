@@ -142,6 +142,26 @@ axl_memcmp(
 );
 
 /**
+ * @brief Find the first occurrence of @p needle in @p haystack.
+ *
+ * Like the GNU `memmem` extension. Linear byte-by-byte scan;
+ * fine for the sizes we typically search (firmware tables,
+ * rom images, signature blocks) but not designed for
+ * megabyte-scale inputs.
+ *
+ * @return pointer to the first match inside @p haystack, or NULL
+ *     if @p needle is not present, any input is NULL, or
+ *     @p needle_len is 0 / larger than @p haystack_len.
+ */
+void *
+axl_memmem(
+    const void *haystack,        ///< buffer to search
+    size_t      haystack_len,    ///< buffer length in bytes
+    const void *needle,          ///< pattern to find
+    size_t      needle_len       ///< pattern length in bytes
+);
+
+/**
  * @brief Format into a fixed buffer. Like snprintf().
  *
  * Uses AXL's own printf engine (standard C format specifiers).
@@ -157,6 +177,37 @@ axl_snprintf(
     const char *fmt,   ///< printf-style format string
     ...
 ) __attribute__((format(printf, 3, 4)));
+
+/**
+ * @brief Format a byte count into a human-readable string.
+ *
+ * Picks the largest IEC binary unit (KiB / MiB / GiB / TiB) that
+ * yields a non-fractional integer (12884901888 → "12 GiB"). For
+ * sizes that don't divide evenly, falls back to the largest unit
+ * whose floor is non-zero and appends the raw byte count in
+ * parentheses (e.g. 1500 → "1 KiB (1500 B)"). Sub-KiB values are
+ * always rendered in bytes (512 → "512 B").
+ *
+ * Standard snprintf-style return semantics: the value returned is
+ * the length the formatted string would have if @p buf_size were
+ * unlimited. If that value is >= @p buf_size, the output was
+ * truncated and the buffer holds a NUL-terminated prefix.
+ *
+ * @param value     byte count to format.
+ * @param buf       output buffer; NUL-terminated on return when
+ *                  @p buf_size > 0.
+ * @param buf_size  buffer capacity in bytes.
+ *
+ * @return length the formatted string would occupy excluding NUL
+ *     (== or < @p buf_size on success, > @p buf_size on truncation),
+ *     or -1 if @p buf is NULL or @p buf_size is 0.
+ */
+int
+axl_format_bytes(
+    uint64_t  value,
+    char     *buf,
+    size_t    buf_size
+);
 
 // ---------------------------------------------------------------------------
 // Safe string copy/concat (like strlcpy/strlcat)
@@ -535,6 +586,24 @@ axl_utf8_to_ucs2_buf(
 char *
 axl_ucs2_to_utf8(
     const unsigned short *s  ///< UCS-2 (unsigned short *) string, or NULL
+);
+
+/**
+ * @brief Narrow a UCS-2 string to UTF-8 in a caller-provided buffer.
+ *
+ * No allocation. Encodes BMP characters with full UTF-8 multi-byte
+ * sequences. Truncates cleanly at @a dst_size with a NUL terminator
+ * (never writes a partial multi-byte sequence). Suitable for
+ * stack buffers in performance-sensitive code (variable names,
+ * console paths) — companion to axl_utf8_to_ucs2_buf.
+ *
+ * @return number of bytes written to @a dst (excluding NUL).
+ */
+size_t
+axl_ucs2_to_utf8_buf(
+    const unsigned short *src,       ///< UCS-2 source string
+    char                 *dst,       ///< destination UTF-8 buffer
+    size_t                dst_size   ///< capacity of @a dst in bytes (including NUL)
 );
 
 // ---------------------------------------------------------------------------

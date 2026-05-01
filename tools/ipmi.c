@@ -24,10 +24,19 @@
 #include <axl.h>
 #include <axl/axl-ipmi.h>
 
-static const AxlConfigDesc descs[] = {
-    { "verbose", AXL_CFG_BOOL, "false", 'v', "Verbose output",  0, 0 },
-    { "help",    AXL_CFG_BOOL, "false", 'h', "Show this help",  0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output" },
+    {0}
+};
+
+/* Variadic positional collector — every IPMI verb takes its own
+   sub-verb chain (e.g. "mc reset cold", "chassis power on") that
+   the verb handler parses internally. */
+static const AxlArgDesc kVerbArgs[] = {
+    { .name = "args", .type = AXL_ARG_MULTI,
+      .help = "Verb-specific arguments (see verb help)" },
+    {0}
 };
 
 static const char *
@@ -497,127 +506,115 @@ cmd_raw(AxlIpmiSession *ipmi, int count, const char *const *args)
 // Dispatch
 // ---------------------------------------------------------------------------
 
-static void
-show_usage(AxlConfig *cfg)
+/* Open a session lazily — most verbs need it, `probe` doesn't. */
+static AxlIpmiSession *
+get_session(void)
 {
-    axl_config_usage(cfg, "ipmi", "<subcommand> [args]");
-    axl_printf("\n");
-    axl_printf("Subcommands:\n");
-    axl_printf("  info                              BMC info + transport\n");
-    axl_printf("  probe                             Diagnostic snapshot of firmware IPMI surface\n");
-    axl_printf("  mc reset cold|warm                BMC reset (App 0x02/0x03)\n");
-    axl_printf("  chassis status                    Power + chassis state\n");
-    axl_printf("  chassis power on|off|cycle|reset|diag|soft\n");
-    axl_printf("  sel list                          Event log entries\n");
-    axl_printf("  sdr list                          SDR repository entries\n");
-    axl_printf("  sensor                            All sensors with readings\n");
-    axl_printf("  fru list                          FRU 0 raw bytes\n");
-    axl_printf("  raw <netfn> <cmd> [<data>...]     Raw command passthrough\n");
+    AxlIpmiSession *s = axl_ipmi_session_new();
+    if (s == NULL) {
+        axl_printf("No IPMI transport available on this system.\n");
+        axl_printf("Run 'ipmi probe' for a diagnostic snapshot.\n");
+    }
+    return s;
 }
+
+static int run_probe(AxlArgs *a)   { (void)a; return cmd_probe(); }
+
+static int
+run_info(AxlArgs *a)
+{
+    (void)a;
+    AXL_AUTOPTR(AxlIpmiSession) s = get_session();
+    return s ? cmd_info(s) : 1;
+}
+
+static int
+run_mc(AxlArgs *a)
+{
+    int n = axl_args_get_pos_count(a);
+    if (n < 2 || axl_strcmp(axl_args_get_pos(a, 0), "reset") != 0) {
+        axl_printf("usage: ipmi mc reset cold|warm\n");
+        return 1;
+    }
+    AXL_AUTOPTR(AxlIpmiSession) s = get_session();
+    return s ? cmd_mc_reset(s, axl_args_get_pos(a, 1)) : 1;
+}
+
+static int
+run_chassis(AxlArgs *a)
+{
+    int n = axl_args_get_pos_count(a);
+    if (n < 1) {
+        axl_printf("usage: ipmi chassis status|power <action>\n");
+        return 1;
+    }
+    AXL_AUTOPTR(AxlIpmiSession) s = get_session();
+    if (s == NULL) { return 1; }
+    const char *verb = axl_args_get_pos(a, 0);
+    if (axl_strcmp(verb, "status") == 0) {
+        return cmd_chassis_status(s);
+    }
+    if (axl_strcmp(verb, "power") == 0) {
+        if (n < 2) {
+            axl_printf("usage: ipmi chassis power on|off|cycle|reset|diag|soft\n");
+            return 1;
+        }
+        return cmd_chassis_power(s, axl_args_get_pos(a, 1));
+    }
+    axl_printf("unknown chassis verb: %s\n", verb);
+    return 1;
+}
+
+static int run_sel(AxlArgs *a)    { (void)a; AXL_AUTOPTR(AxlIpmiSession) s = get_session(); return s ? cmd_sel_list(s)  : 1; }
+static int run_sdr(AxlArgs *a)    { (void)a; AXL_AUTOPTR(AxlIpmiSession) s = get_session(); return s ? cmd_sdr_list(s)  : 1; }
+static int run_sensor(AxlArgs *a) { (void)a; AXL_AUTOPTR(AxlIpmiSession) s = get_session(); return s ? cmd_sensor(s)    : 1; }
+static int run_fru(AxlArgs *a)    { (void)a; AXL_AUTOPTR(AxlIpmiSession) s = get_session(); return s ? cmd_fru_list(s)  : 1; }
+
+static int
+run_raw(AxlArgs *a)
+{
+    AXL_AUTOPTR(AxlIpmiSession) s = get_session();
+    if (s == NULL) { return 1; }
+    int n = axl_args_get_pos_count(a);
+    const char *raw_args[16];
+    if (n > (int)(sizeof(raw_args) / sizeof(raw_args[0]))) {
+        n = (int)(sizeof(raw_args) / sizeof(raw_args[0]));
+    }
+    for (int i = 0; i < n; i++) {
+        raw_args[i] = axl_args_get_pos(a, i);
+    }
+    return cmd_raw(s, n, raw_args);
+}
+
+static const AxlVerb kVerbs[] = {
+    { .name = "probe",   .handler = run_probe,
+      .help = "Diagnose available IPMI transports without opening a session" },
+    { .name = "info",    .handler = run_info,
+      .help = "Print the BMC's device info (firmware rev, GUID, ...)" },
+    { .name = "mc",      .handler = run_mc,      .positionals = kVerbArgs,
+      .help = "Management controller commands (mc reset cold|warm)" },
+    { .name = "chassis", .handler = run_chassis, .positionals = kVerbArgs,
+      .help = "Chassis status / power control (status; power on|off|cycle|...)" },
+    { .name = "sel",     .handler = run_sel,     .positionals = kVerbArgs,
+      .help = "System Event Log (sel list)" },
+    { .name = "sdr",     .handler = run_sdr,     .positionals = kVerbArgs,
+      .help = "Sensor Data Repository (sdr list)" },
+    { .name = "sensor",  .handler = run_sensor,
+      .help = "All sensors with current readings" },
+    { .name = "fru",     .handler = run_fru,     .positionals = kVerbArgs,
+      .help = "FRU inventory (fru list)" },
+    { .name = "raw",     .handler = run_raw,     .positionals = kVerbArgs,
+      .help = "Raw netfn/cmd/data passthrough" },
+    {0}
+};
 
 int
 main(int argc, char **argv)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL) {
-        axl_printf("failed to create config\n");
-        return 1;
-    }
-    if (axl_config_parse_args(cfg, argc, argv) < 0) {
-        show_usage(cfg);
-        return 1;
-    }
-    if (axl_config_get_bool(cfg, "help")) {
-        show_usage(cfg);
-        return 0;
-    }
-
-    int npos = axl_config_pos_count(cfg);
-    if (npos < 1) {
-        show_usage(cfg);
-        return 1;
-    }
-    const char *sub = axl_config_pos(cfg, 0);
-
-    //
-    // `probe` must run before axl_ipmi_session_new() because its
-    // entire purpose is to diagnose WHY auto-detect couldn't find
-    // a working transport — the probe function is independent of
-    // a live session.
-    //
-    if (axl_strcmp(sub, "probe") == 0) {
-        return cmd_probe();
-    }
-
-    AXL_AUTOPTR(AxlIpmiSession) ipmi = axl_ipmi_session_new();
-    if (ipmi == NULL) {
-        axl_printf("No IPMI transport available on this system.\n");
-        axl_printf("Run 'ipmi probe' for a diagnostic snapshot.\n");
-        return 1;
-    }
-
-    if (axl_strcmp(sub, "info") == 0) {
-        return cmd_info(ipmi);
-    }
-    if (axl_strcmp(sub, "mc") == 0) {
-        if (npos < 3) {
-            axl_printf("usage: ipmi mc reset cold|warm\n");
-            return 1;
-        }
-        if (axl_strcmp(axl_config_pos(cfg, 1), "reset") != 0) {
-            axl_printf("only 'mc reset <mode>' is supported\n");
-            return 1;
-        }
-        return cmd_mc_reset(ipmi, axl_config_pos(cfg, 2));
-    }
-    if (axl_strcmp(sub, "chassis") == 0) {
-        if (npos < 2) {
-            axl_printf("usage: ipmi chassis status|power <action>\n");
-            return 1;
-        }
-        const char *verb = axl_config_pos(cfg, 1);
-        if (axl_strcmp(verb, "status") == 0) {
-            return cmd_chassis_status(ipmi);
-        }
-        if (axl_strcmp(verb, "power") == 0) {
-            if (npos < 3) {
-                axl_printf("usage: ipmi chassis power on|off|cycle|reset|diag|soft\n");
-                return 1;
-            }
-            return cmd_chassis_power(ipmi, axl_config_pos(cfg, 2));
-        }
-        axl_printf("unknown chassis verb: %s\n", verb);
-        return 1;
-    }
-    if (axl_strcmp(sub, "sel") == 0) {
-        return cmd_sel_list(ipmi);
-    }
-    if (axl_strcmp(sub, "sdr") == 0) {
-        return cmd_sdr_list(ipmi);
-    }
-    if (axl_strcmp(sub, "sensor") == 0) {
-        return cmd_sensor(ipmi);
-    }
-    if (axl_strcmp(sub, "fru") == 0) {
-        return cmd_fru_list(ipmi);
-    }
-    if (axl_strcmp(sub, "raw") == 0) {
-        //
-        // Collect positional args starting at index 1 (the "raw"
-        // token itself is at pos 0).
-        //
-        int raw_count = npos - 1;
-        const char *raw_args[16];
-        if (raw_count > (int)(sizeof(raw_args) / sizeof(raw_args[0]))) {
-            raw_count = (int)(sizeof(raw_args) / sizeof(raw_args[0]));
-        }
-        for (int i = 0; i < raw_count; i++) {
-            raw_args[i] = axl_config_pos(cfg, i + 1);
-        }
-        return cmd_raw(ipmi, raw_count, raw_args);
-    }
-
-    axl_printf("unknown subcommand: %s\n", sub);
-    show_usage(cfg);
-    return 1;
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "ipmi",
+        .help         = "IPMI client — KCS / SSIF / BT transport auto-detect",
+        .global_flags = kFlags,
+        .verbs        = kVerbs,
+    });
 }

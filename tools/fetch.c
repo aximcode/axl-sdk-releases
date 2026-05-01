@@ -8,7 +8,7 @@
       axl-cc Fetch.c -o Fetch.efi
 
     Usage: Fetch.efi [options] <url>
-    See axl_config_usage output for full option list.
+    Run with --help for the full option list.
 **/
 
 #include <axl.h>
@@ -17,18 +17,32 @@
 // Option definitions
 // ---------------------------------------------------------------------------
 
-static const AxlConfigDesc descs[] = {
-    { "output",      AXL_CFG_STRING, NULL,    'o', "Write response body to FILE",              0, 0 },
-    { "remote-name", AXL_CFG_BOOL,   "false", 'O', "Write to file named from URL path",        0, 0 },
-    { "upload",      AXL_CFG_STRING, NULL,    'T', "Upload FILE via PUT",                      0, 0 },
-    { "data",        AXL_CFG_STRING, NULL,    'd', "Send DATA as POST body",                   0, 0 },
-    { "method",      AXL_CFG_STRING, NULL,    'X', "HTTP method (GET, POST, PUT, DELETE, HEAD)", 0, 0 },
-    { "header",      AXL_CFG_MULTI,  NULL,    'H', "Add header \"Name: Value\" (repeatable)",  0, 0 },
-    { "head",        AXL_CFG_BOOL,   "false", 'I', "HEAD request (show headers only)",         0, 0 },
-    { "verbose",     AXL_CFG_BOOL,   "false", 'v', "Show request/response headers",            0, 0 },
-    { "silent",      AXL_CFG_BOOL,   "false", 's', "Suppress status output",                   0, 0 },
-    { "help",        AXL_CFG_BOOL,   "false", 'h', "Show this help",                           0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "output",      .short_name = 'o', .type = AXL_ARG_STRING,
+      .help = "Write response body to FILE" },
+    { .name = "remote-name", .short_name = 'O', .type = AXL_ARG_BOOL,
+      .help = "Write to file named from URL path" },
+    { .name = "upload",      .short_name = 'T', .type = AXL_ARG_STRING,
+      .help = "Upload FILE via PUT" },
+    { .name = "data",        .short_name = 'd', .type = AXL_ARG_STRING,
+      .help = "Send DATA as POST body" },
+    { .name = "method",      .short_name = 'X', .type = AXL_ARG_STRING,
+      .help = "HTTP method (GET, POST, PUT, DELETE, HEAD)" },
+    { .name = "header",      .short_name = 'H', .type = AXL_ARG_MULTI,
+      .help = "Add header \"Name: Value\" (repeatable)" },
+    { .name = "head",        .short_name = 'I', .type = AXL_ARG_BOOL,
+      .help = "HEAD request (show headers only)" },
+    { .name = "verbose",     .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Show request/response headers" },
+    { .name = "silent",      .short_name = 's', .type = AXL_ARG_BOOL,
+      .help = "Suppress status output" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "url", .type = AXL_ARG_STRING, .required = true,
+      .help = "URL to fetch" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -102,30 +116,10 @@ parse_header_str(
 // Entry point
 // ---------------------------------------------------------------------------
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_fetch(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("Fetch: invalid option\n");
-        axl_config_usage(cfg, "Fetch", "[options] <url>");
-        return 1;
-    }
-
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "Fetch", "[options] <url>");
-        return 0;
-    }
-
-    const char *url = axl_config_pos(cfg, 0);
-    if (url == NULL) {
-        axl_printf("Fetch: URL required\n");
-        axl_config_usage(cfg, "Fetch", "[options] <url>");
-        return 1;
-    }
+    const char *url = axl_args_get_string(a, "url");
 
     /* Auto-load NIC drivers + DHCP so Fetch works from a bare UEFI shell. */
     switch (axl_net_ensure_drivers()) {
@@ -148,14 +142,14 @@ main(
         return 1;
     }
 
-    bool silent    = axl_config_get_bool(cfg, "silent");
-    bool verbose   = axl_config_get_bool(cfg, "verbose");
-    bool head_only = axl_config_get_bool(cfg, "head");
+    bool silent    = axl_args_get_bool(a,"silent");
+    bool verbose   = axl_args_get_bool(a,"verbose");
+    bool head_only = axl_args_get_bool(a,"head");
 
     // Determine HTTP method
-    const char *method_str = axl_config_get(cfg, "method");
-    const char *data_str = axl_config_get(cfg, "data");
-    const char *upload_path = axl_config_get(cfg, "upload");
+    const char *method_str = axl_args_get_string(a,"method");
+    const char *data_str = axl_args_get_string(a,"data");
+    const char *upload_path = axl_args_get_string(a,"upload");
     char method[16] = "GET";
     if (method_str != NULL) {
         axl_strlcpy(method, method_str, sizeof(method));
@@ -174,7 +168,7 @@ main(
     #define FETCH_MAX_HEADERS    16
     #define FETCH_MAX_HEADER_LEN 256
     AXL_AUTOPTR(AxlHashTable) extra_headers = NULL;
-    size_t hdr_count = axl_config_get_multi_count(cfg, "header");
+    size_t hdr_count = axl_args_get_multi_count(a,"header");
     static char hdr_bufs[FETCH_MAX_HEADERS][FETCH_MAX_HEADER_LEN];
 
     if (hdr_count > FETCH_MAX_HEADERS) {
@@ -185,7 +179,7 @@ main(
     if (hdr_count > 0) {
         extra_headers = axl_hash_table_new_str();
         for (size_t i = 0; i < hdr_count && i < FETCH_MAX_HEADERS; i++) {
-            const char *hdr = axl_config_get_multi(cfg, "header", i);
+            const char *hdr = axl_args_get_multi(a,"header", i);
             if (hdr == NULL) {
                 continue;
             }
@@ -253,8 +247,8 @@ main(
     int exit_status = 0;
 
     if (!head_only && resp->body != NULL && resp->body_size > 0) {
-        const char *out_file = axl_config_get(cfg, "output");
-        bool auto_name = axl_config_get_bool(cfg, "remote-name");
+        const char *out_file = axl_args_get_string(a,"output");
+        bool auto_name = axl_args_get_bool(a,"remote-name");
 
         if (out_file != NULL) {
             if (!axl_file_set_contents(out_file, resp->body, resp->body_size)) {
@@ -302,4 +296,16 @@ main(
     }
 
     return exit_status;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "Fetch",
+        .help         = "HTTP client (curl-like) for UEFI",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_fetch,
+    });
 }

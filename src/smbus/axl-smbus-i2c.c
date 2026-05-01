@@ -118,6 +118,73 @@ i2c_write_block(void *vctx,
     return EFI_ERROR(s) ? -1 : 0;
 }
 
+static int
+i2c_read_byte(void *vctx,
+              uint8_t slave, uint8_t command,
+              uint8_t *out)
+{
+    EFI_I2C_MASTER_PROTOCOL *i2c = (EFI_I2C_MASTER_PROTOCOL *)vctx;
+
+    //
+    // SMBus "Read Byte" (§5.5.5) on raw I2C: write the command byte,
+    // then read a single data byte (no count prefix — matches 24Cxx
+    // EEPROM auto-increment behavior used by JEDEC SPDs).
+    //
+    uint8_t cmd_byte = command;
+    uint8_t rx       = 0;
+
+    struct {
+        UINTN              OperationCount;
+        EFI_I2C_OPERATION  Operation[2];
+    } pkt = {
+        .OperationCount = 2,
+        .Operation = {
+            { .Flags = 0,             .LengthInBytes = 1, .Buffer = &cmd_byte },
+            { .Flags = I2C_FLAG_READ, .LengthInBytes = 1, .Buffer = &rx       },
+        },
+    };
+
+    EFI_STATUS s = axl_efi_call(i2c->StartRequest, 5,
+                                i2c, (UINTN)slave,
+                                (EFI_I2C_REQUEST_PACKET *)&pkt,
+                                NULL, NULL);
+    if (EFI_ERROR(s)) {
+        return -1;
+    }
+    *out = rx;
+    return 0;
+}
+
+static int
+i2c_write_byte(void *vctx,
+               uint8_t slave, uint8_t command,
+               uint8_t value)
+{
+    EFI_I2C_MASTER_PROTOCOL *i2c = (EFI_I2C_MASTER_PROTOCOL *)vctx;
+
+    //
+    // SMBus "Write Byte" (§5.5.4) on raw I2C: [CmdCode][DataByte] in
+    // a single write transaction.
+    //
+    uint8_t tx[2] = { command, value };
+
+    struct {
+        UINTN              OperationCount;
+        EFI_I2C_OPERATION  Operation[1];
+    } pkt = {
+        .OperationCount = 1,
+        .Operation = {
+            { .Flags = 0, .LengthInBytes = 2, .Buffer = tx },
+        },
+    };
+
+    EFI_STATUS s = axl_efi_call(i2c->StartRequest, 5,
+                                i2c, (UINTN)slave,
+                                (EFI_I2C_REQUEST_PACKET *)&pkt,
+                                NULL, NULL);
+    return EFI_ERROR(s) ? -1 : 0;
+}
+
 static void
 i2c_close(void *vctx)
 {
@@ -152,6 +219,8 @@ axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
     ops->kind        = AXL_SMBUS_TRANSPORT_I2C;
     ops->read_block  = i2c_read_block;
     ops->write_block = i2c_write_block;
+    ops->read_byte   = i2c_read_byte;
+    ops->write_byte  = i2c_write_byte;
     ops->close       = i2c_close;
     ops->ctx         = i2c;
     return 0;

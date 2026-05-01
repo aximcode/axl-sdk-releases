@@ -28,13 +28,16 @@
 #include <axl.h>
 #include <axl/axl-smbios.h>
 
-static const AxlConfigDesc descs[] = {
-    { "type",    AXL_CFG_STRING, NULL,    't', "Filter output to records of this SMBIOS type",     0, 0 },
-    { "string",  AXL_CFG_STRING, NULL,    's', "Print a single named value (see --help for keywords)", 0, 0 },
-    { "quiet",   AXL_CFG_BOOL,   "false", 'q', "Suppress section headers and blank lines",         0, 0 },
-    { "version", AXL_CFG_BOOL,   "false", 'V', "Print SMBIOS specification version and exit",      0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                                   0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "type",    .short_name = 't', .type = AXL_ARG_STRING,
+      .help = "Filter output to records of this SMBIOS type" },
+    { .name = "string",  .short_name = 's', .type = AXL_ARG_STRING,
+      .help = "Print a single named value (see --help for keywords)" },
+    { .name = "quiet",   .short_name = 'q', .type = AXL_ARG_BOOL,
+      .help = "Suppress section headers and blank lines" },
+    { .name = "version", .short_name = 'V', .type = AXL_ARG_BOOL,
+      .help = "Print SMBIOS specification version and exit" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -415,41 +418,31 @@ single_string(const char *keyword)
 // Main
 // ---------------------------------------------------------------------------
 
-int
-main(int argc, char **argv)
+static int
+run_dmidecode(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_config_usage(cfg, "dmidecode", "[-t type] [-s keyword] [-q] [-V]");
-        return 1;
-    }
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "dmidecode", "[-t type] [-s keyword] [-q] [-V]");
-        return 0;
-    }
-
     unsigned char major = 0, minor = 0;
     if (axl_smbios_version(&major, &minor) != 0) {
         axl_printf("dmidecode: no SMBIOS table found\n");
         return 1;
     }
 
-    if (axl_config_get_bool(cfg, "version")) {
+    if (axl_args_get_bool(a, "version")) {
         axl_printf("SMBIOS %u.%u present.\n", major, minor);
         return 0;
     }
 
-    const char *keyword = axl_config_get(cfg, "string");
+    const char *keyword = axl_args_get_string(a, "string");
     if (keyword != NULL) {
         return single_string(keyword);
     }
 
-    const char *type_str = axl_config_get(cfg, "type");
+    const char *type_str = axl_args_get_string(a, "type");
     int filter_type = -1;
     if (type_str != NULL) {
         filter_type = (int)axl_strtou64(type_str);
     }
-    bool quiet = axl_config_get_bool(cfg, "quiet");
+    bool quiet = axl_args_get_bool(a, "quiet");
 
     if (!quiet) {
         axl_printf("# dmidecode (axl-sdk)\n");
@@ -495,4 +488,15 @@ main(int argc, char **argv)
                    filter_type < 0 ? "structures present" : "structure(s) of the requested type");
     }
     return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "dmidecode",
+        .help         = "Decode SMBIOS / DMI tables (Linux dmidecode-style)",
+        .global_flags = kFlags,
+        .handler      = run_dmidecode,
+    });
 }

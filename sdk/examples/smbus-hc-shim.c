@@ -175,6 +175,7 @@ pci_cfg_write8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg,
 #define CTL_START      (1 << 6)
 
 // Protocols (in bits 4:2 of SMBHSTCNT)
+#define PROT_BYTE_DATA   2
 #define PROT_BLOCK_DATA  5
 
 // SMBAUXCTL bits
@@ -309,6 +310,35 @@ smb_block_write(uint8_t slave, uint8_t cmd, const uint8_t *buf, size_t len)
 }
 
 static EFI_STATUS
+smb_byte_read(uint8_t slave, uint8_t cmd, uint8_t *out)
+{
+    EFI_STATUS s = smb_wait_ready();
+    if (EFI_ERROR(s)) return s;
+
+    outb(mSmbBase + SMBHSTADD, (uint8_t)((slave << 1) | 1));   // R/W=1
+    outb(mSmbBase + SMBHSTCMD, cmd);
+
+    s = smb_run_and_wait((PROT_BYTE_DATA << 2) | CTL_START);
+    if (EFI_ERROR(s)) return s;
+
+    *out = inb(mSmbBase + SMBHSTDAT0);
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+smb_byte_write(uint8_t slave, uint8_t cmd, uint8_t value)
+{
+    EFI_STATUS s = smb_wait_ready();
+    if (EFI_ERROR(s)) return s;
+
+    outb(mSmbBase + SMBHSTADD, (uint8_t)(slave << 1));         // R/W=0
+    outb(mSmbBase + SMBHSTCMD, cmd);
+    outb(mSmbBase + SMBHSTDAT0, value);
+
+    return smb_run_and_wait((PROT_BYTE_DATA << 2) | CTL_START);
+}
+
+static EFI_STATUS
 smb_block_read(uint8_t slave, uint8_t cmd, uint8_t *buf, size_t cap,
                size_t *out_len)
 {
@@ -337,13 +367,19 @@ smb_block_read(uint8_t slave, uint8_t cmd, uint8_t *buf, size_t cap,
 // ---------------------------------------------------------------------------
 // EFI_I2C_MASTER_PROTOCOL implementation
 //
-// AxlSmbus's I2C path forms exactly two packet shapes
+// AxlSmbus's I2C path forms four packet shapes
 // (see src/smbus/axl-smbus-i2c.c):
-//   - block write: 1 op, write-only, buffer = [cmd][count][data...]
-//   - block read:  2 ops, op[0] writes the cmd byte, op[1] reads
+//   - block write: 1 op, write-only, buffer = [cmd][count][data...]   (len ≥ 3)
+//   - byte  write: 1 op, write-only, buffer = [cmd][value]            (len  = 2)
+//   - block read:  2 ops, op[0] writes the cmd byte, op[1] reads ≥ 2 bytes
 //                  into a buffer whose first byte receives the count
 //                  and whose remainder receives the payload.
+//   - byte  read:  2 ops, op[0] writes the cmd byte, op[1] reads 1 byte.
 // Anything else → EFI_UNSUPPORTED.
+//
+// The block / byte distinction on the read path uses op[1].LengthInBytes
+// (1 → byte read, ≥ 2 → block read). On the write path it uses
+// op[0].LengthInBytes (== 2 → byte write, ≥ 3 → block write).
 // ---------------------------------------------------------------------------
 
 static EFI_STATUS EFIAPI
@@ -380,7 +416,11 @@ i2c_start_request(const EFI_I2C_MASTER_PROTOCOL *This,
         EFI_I2C_OPERATION *op = &RequestPacket->Operation[0];
         if (op->Flags & I2C_FLAG_READ)   return EFI_UNSUPPORTED;
         if (op->LengthInBytes < 2)       return EFI_INVALID_PARAMETER;
-        uint8_t cmd   = op->Buffer[0];
+
+        uint8_t cmd = op->Buffer[0];
+        if (op->LengthInBytes == 2) {
+            return smb_byte_write(slave, cmd, op->Buffer[1]);
+        }
         uint8_t count = op->Buffer[1];
         if (count + 2u != op->LengthInBytes) return EFI_INVALID_PARAMETER;
         return smb_block_write(slave, cmd, &op->Buffer[2], count);
@@ -395,12 +435,14 @@ i2c_start_request(const EFI_I2C_MASTER_PROTOCOL *This,
         if (op1->LengthInBytes < 1)            return EFI_INVALID_PARAMETER;
 
         uint8_t cmd = op0->Buffer[0];
+        if (op1->LengthInBytes == 1) {
+            return smb_byte_read(slave, cmd, &op1->Buffer[0]);
+        }
         size_t  got = 0;
         //
-        // op1's buffer is the [count][payload...] landing zone per
-        // AxlSmbus's I2C read framing. We stash count at Buffer[0]
-        // and payload starting at Buffer[1], matching what the
-        // AxlSmbus code expects.
+        // Block-read shape: op1's buffer is the [count][payload...]
+        // landing zone per AxlSmbus's I2C read framing. We stash
+        // count at Buffer[0] and payload starting at Buffer[1].
         //
         EFI_STATUS s = smb_block_read(slave, cmd,
                                       &op1->Buffer[1],

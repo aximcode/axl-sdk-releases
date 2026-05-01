@@ -10,9 +10,15 @@
  * maps to firmware variables (GetVariable/SetVariable). Variables
  * are organized by namespace.
  *
- * Well-known namespaces:
+ * Built-in namespaces:
  *   "global"  — standard firmware variables (e.g., SecureBoot, BootOrder)
  *   "app"     — application-specific persistent settings
+ *
+ * Vendor namespaces (Dell, HPE, Lenovo OEM variables) plug in via
+ * axl_nvstore_register_namespace() with a backend-specific token.
+ * On UEFI the token is a `const AxlGuid *` (vendor-GUID pointer);
+ * on a Linux backend it might be a path prefix. Access sites stay
+ * UEFI-free — they reference namespaces by name only.
  *
  * @code
  * uint8_t secure_boot;
@@ -20,6 +26,10 @@
  * if (axl_nvstore_get("global", "SecureBoot", &secure_boot, &sz) == 0) {
  *     axl_printf("SecureBoot: %s\n", secure_boot ? "enabled" : "disabled");
  * }
+ *
+ * extern const AxlGuid AXL_DELL_VENDOR_GUID;
+ * axl_nvstore_register_namespace("dell", &AXL_DELL_VENDOR_GUID);
+ * axl_nvstore_get("dell", "SystemId", buf, &sz);
  * @endcode
  */
 
@@ -28,6 +38,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include <axl/axl-sys.h>   /* AxlGuid — used at namespace registration */
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,11 +51,32 @@ extern "C" {
 #define AXL_NV_RUNTIME     0x04  ///< accessible at runtime
 
 /**
+ * @brief Register a namespace name and bind it to a backend token.
+ *
+ * The backend token is opaque to consumers. On UEFI it is a
+ * `const AxlGuid *` (vendor-GUID pointer); on other backends it
+ * may be a path prefix or other identifier. The pointer must remain
+ * valid for the lifetime of the program — the table stores the
+ * pointer, not a copy.
+ *
+ * Built-in namespaces "global" and "app" are pre-registered and do
+ * not need to be registered explicitly.
+ *
+ * @return 0 on success, -1 if the namespace table is full or the
+ *     name is already registered with a different token.
+ */
+int
+axl_nvstore_register_namespace(
+    const char *name,           ///< namespace name (UTF-8, copied)
+    const void *backend_token   ///< opaque per-backend token
+);
+
+/**
  * @brief Read a value from non-volatile storage.
  *
  * @return 0 on success, -1 on error (variable not found, buffer
- *     too small, etc.). On buffer-too-small, @a size is updated
- *     to the required size.
+ *     too small, namespace not registered, etc.). On
+ *     buffer-too-small, @a size is updated to the required size.
  */
 int
 axl_nvstore_get(
@@ -56,15 +89,73 @@ axl_nvstore_get(
 /**
  * @brief Write a value to non-volatile storage.
  *
+ * Passing @c flags == 0 (or @c AXL_NV_VOLATILE alone) defaults to
+ * @c AXL_NV_BOOT — UEFI rejects SetVariable with attribute mask 0
+ * for non-delete writes, so the implementation substitutes
+ * boot-services access as the minimal sensible default.
+ *
  * @return 0 on success, -1 on error.
  */
 int
 axl_nvstore_set(
-    const char *ns,    ///< namespace (e.g., "global", "app")
+    const char *ns,    ///< namespace
     const char *key,   ///< variable name (UTF-8)
     const void *buf,   ///< data to write
     size_t      size,  ///< data size in bytes
-    uint32_t    flags  ///< AXL_NV_* flags
+    uint32_t    flags  ///< AXL_NV_* flags (0 → AXL_NV_BOOT)
+);
+
+/**
+ * @brief Delete a variable from non-volatile storage.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int
+axl_nvstore_delete(
+    const char *ns,    ///< namespace
+    const char *key    ///< variable name (UTF-8)
+);
+
+/**
+ * @brief Get a variable's attribute flags.
+ *
+ * @return 0 on success, -1 on error (variable not found, namespace
+ *     not registered, etc.).
+ */
+int
+axl_nvstore_get_attrs(
+    const char *ns,     ///< namespace
+    const char *key,    ///< variable name (UTF-8)
+    uint32_t   *attrs   ///< [out] AXL_NV_* flags
+);
+
+/**
+ * @brief Iterator callback for axl_nvstore_iter.
+ *
+ * @return 0 to continue iteration, non-zero to stop. The
+ *     non-zero value is returned to the iter() caller.
+ */
+typedef int (*AxlNvstoreIterFn)(
+    const char *key,   ///< variable name (UTF-8)
+    void       *ctx    ///< caller-supplied context
+);
+
+/**
+ * @brief Iterate all keys in a namespace.
+ *
+ * Walks all variables whose backend token matches the registered
+ * namespace's token, invoking @p cb for each. Stops early if @p cb
+ * returns non-zero.
+ *
+ * @return 0 if the walk completed, the callback's non-zero value
+ *     if it stopped early, or -1 if the namespace is not registered
+ *     or the iterator failed.
+ */
+int
+axl_nvstore_iter(
+    const char       *ns,   ///< namespace
+    AxlNvstoreIterFn  cb,   ///< callback, called once per key
+    void             *ctx   ///< passed unchanged to @p cb
 );
 
 #ifdef __cplusplus

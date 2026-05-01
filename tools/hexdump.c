@@ -13,12 +13,20 @@
 
 #include <axl.h>
 
-static const AxlConfigDesc descs[] = {
-    { "offset",  AXL_CFG_STRING, NULL,    'o', "Start offset (hex 0x prefix, or decimal)", 0, 0 },
-    { "length",  AXL_CFG_STRING, NULL,    'n', "Number of bytes to dump (default: all)",   0, 0 },
-    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Show file info header",                    0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                           0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "offset",  .short_name = 'o', .type = AXL_ARG_U64, .base = 0,
+      .help = "Start offset (hex 0x prefix, or decimal)" },
+    { .name = "length",  .short_name = 'n', .type = AXL_ARG_U64, .base = 0,
+      .help = "Number of bytes to dump (default: all)" },
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Show file info header" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "file", .type = AXL_ARG_STRING, .required = true,
+      .help = "Path to the file to dump" },
+    {0}
 };
 
 static void
@@ -56,47 +64,22 @@ print_hex_line(
     axl_printf("\n");
 }
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_hexdump(AxlArgs *a)
 {
     AxlStream  *file;
     AxlFileInfo fi;
-    uint64_t    offset;
-    uint64_t    length;
     uint64_t    file_size;
     bool        has_length;
-    bool        verbose;
     uint8_t     buf[16];
     uint64_t    bytes_read;
 
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("Hexdump: invalid option\n");
-        axl_config_usage(cfg, "Hexdump", "[-o offset] [-n length] [-v] file");
-        return 1;
-    }
+    bool     verbose = axl_args_get_bool(a, "verbose");
+    uint64_t offset  = axl_args_get_uint(a, "offset");
+    uint64_t length  = axl_args_get_uint(a, "length");
+    has_length = (axl_args_get_string(a, "length") != NULL);
 
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "Hexdump", "[-o offset] [-n length] [-v] file");
-        return 0;
-    }
-
-    verbose = axl_config_get_bool(cfg, "verbose");
-    offset = axl_strtou64(axl_config_get(cfg, "offset"));
-
-    const char *length_str = axl_config_get(cfg, "length");
-    has_length = (length_str != NULL);
-    length = axl_strtou64(length_str);
-
-    const char *path = axl_config_pos(cfg, 0);
-    if (path == NULL) {
-        axl_printf("Hexdump: file path required\n");
-        axl_config_usage(cfg, "Hexdump", "[-o offset] [-n length] [-v] file");
-        return 1;
-    }
+    const char *path = axl_args_get_string(a, "file");
 
     /* Get file size */
     file_size = 0;
@@ -155,4 +138,16 @@ main(
 
     axl_fclose(file);
     return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "Hexdump",
+        .help         = "Hex+ASCII file dump",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_hexdump,
+    });
 }

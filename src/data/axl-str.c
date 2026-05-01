@@ -134,6 +134,41 @@ axl_memcmp(const void *a, const void *b, size_t n)
 }
 
 void *
+axl_memmem(
+    const void  *haystack,
+    size_t       haystack_len,
+    const void  *needle,
+    size_t       needle_len
+    )
+{
+    if (haystack == NULL || needle == NULL
+        || needle_len == 0 || needle_len > haystack_len) {
+        return NULL;
+    }
+    const unsigned char *hay = (const unsigned char *)haystack;
+    const unsigned char *nd  = (const unsigned char *)needle;
+    /* First byte is the cheap discriminator; only when it matches
+       do we compare the rest. */
+    size_t last = haystack_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay[i] != nd[0]) {
+            continue;
+        }
+        size_t j = 1;
+        while (j < needle_len && hay[i + j] == nd[j]) {
+            j++;
+        }
+        if (j == needle_len) {
+            /* Cast away const at the API boundary — matches the
+               GNU memmem signature, which lets callers find a
+               match in either const or mutable storage. */
+            return (void *)(hay + i);
+        }
+    }
+    return NULL;
+}
+
+void *
 axl_memmove(void *dst, const void *src, size_t n)
 {
     uint8_t       *d = (uint8_t *)dst;
@@ -192,6 +227,48 @@ axl_snprintf(char *buf, size_t size, const char *fmt, ...)
     }
 
     return (int)ctx.written;
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable byte formatting (IEC binary units)
+// ---------------------------------------------------------------------------
+
+int
+axl_format_bytes(uint64_t value, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) {
+        return -1;
+    }
+    static const struct {
+        uint64_t    divisor;
+        const char *suffix;
+    } units[] = {
+        { 1ULL << 40, "TiB" },
+        { 1ULL << 30, "GiB" },
+        { 1ULL << 20, "MiB" },
+        { 1ULL << 10, "KiB" },
+    };
+
+    /* Pick the largest unit that divides @a value evenly. */
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        if (value >= units[i].divisor && (value % units[i].divisor) == 0) {
+            return axl_snprintf(buf, buf_size, "%llu %s",
+                                (unsigned long long)(value / units[i].divisor),
+                                units[i].suffix);
+        }
+    }
+    /* Non-even values fall back to the largest unit whose floor is
+       non-zero, with the raw byte count appended for transparency. */
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        if (value >= units[i].divisor) {
+            return axl_snprintf(buf, buf_size, "%llu %s (%llu B)",
+                                (unsigned long long)(value / units[i].divisor),
+                                units[i].suffix,
+                                (unsigned long long)value);
+        }
+    }
+    return axl_snprintf(buf, buf_size, "%llu B",
+                        (unsigned long long)value);
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1136,56 @@ axl_ucs2_to_utf8(const unsigned short *s)
     out[i] = '\0';
 
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// UCS-2 -> UTF-8 (caller buffer)
+// ---------------------------------------------------------------------------
+
+size_t
+axl_ucs2_to_utf8_buf(
+    const unsigned short *src,
+    char                 *dst,
+    size_t                dst_size
+    )
+{
+    if (dst == NULL || dst_size == 0) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 0;
+    }
+
+    size_t   i = 0;
+    /* Reserve 1 byte for NUL. Each char takes 1-3 bytes; we only
+       commit if the whole sequence fits. */
+    for (const unsigned short *p = src; *p != 0; p++) {
+        uint16_t ch = (uint16_t)*p;
+        size_t   need;
+        if (ch < 0x80) {
+            need = 1;
+        } else if (ch < 0x800) {
+            need = 2;
+        } else {
+            need = 3;
+        }
+        if (i + need + 1 > dst_size) {
+            break;
+        }
+        if (ch < 0x80) {
+            dst[i++] = (char)ch;
+        } else if (ch < 0x800) {
+            dst[i++] = (char)(0xC0 | (ch >> 6));
+            dst[i++] = (char)(0x80 | (ch & 0x3F));
+        } else {
+            dst[i++] = (char)(0xE0 | (ch >> 12));
+            dst[i++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+            dst[i++] = (char)(0x80 | (ch & 0x3F));
+        }
+    }
+    dst[i] = '\0';
+    return i;
 }
 
 // ---------------------------------------------------------------------------

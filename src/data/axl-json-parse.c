@@ -8,6 +8,7 @@
 #include <axl/axl-json.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
+#include <axl/axl-io.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("json");
@@ -202,6 +203,34 @@ axl_json_free(AxlJsonReader *ctx)
     ctx->tokens = NULL;
     ctx->token_count = 0;
     ctx->owns_tokens = false;
+}
+
+bool
+axl_json_load_file(const char *path, AxlJsonReader *r,
+                   void **out_buf, size_t *out_len)
+{
+    if (path == NULL || r == NULL || out_buf == NULL) {
+        return false;
+    }
+    *out_buf = NULL;
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+
+    void   *raw = NULL;
+    size_t  raw_len = 0;
+    if (axl_file_get_contents(path, &raw, &raw_len) != 0) {
+        return false;
+    }
+    if (!axl_json_parse((const char *)raw, raw_len, r)) {
+        axl_free(raw);
+        return false;
+    }
+    *out_buf = raw;
+    if (out_len != NULL) {
+        *out_len = raw_len;
+    }
+    return true;
 }
 
 bool

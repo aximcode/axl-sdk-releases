@@ -45,10 +45,19 @@
 #include <axl/axl-env.h>
 #include <axl/axl-sys.h>
 #include <axl/axl-nvstore.h>
+#include <axl/axl-io-port.h>
+#include <axl/axl-boot.h>
+#include <axl/axl-acpi.h>
+#include <axl/axl-pci.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-image.h>
+#include <axl/axl-mem-phys.h>
+#include <axl/axl-watchdog.h>
+#include <axl/axl-rng.h>
 #include <axl/axl-diag.h>
 #include <axl/axl-config.h>
 #include <axl/axl-subcommand.h>
+#include <axl/axl-args.h>
 #include <axl/axl-event.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-defer.h>
@@ -58,6 +67,7 @@
 #include <axl/axl-runtime.h>
 #include <axl/axl-atexit.h>
 #include <axl/axl-signal.h>
+#include <axl/axl-app.h>
 #include <axl/axl-task.h>
 #include <axl/axl-buf-pool.h>
 #include <axl/axl-async.h>
@@ -66,6 +76,7 @@
 #include <axl/axl-smbios.h>
 #include <axl/axl-smbus.h>
 #include <axl/axl-ipmi.h>
+#include <axl/axl-spd.h>
 
 // ---------------------------------------------------------------------------
 // AXL_APP — application entry point

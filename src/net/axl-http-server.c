@@ -19,15 +19,15 @@ static bool on_accept_ready(AxlTcp *client, int status, void *data);
 // ---------------------------------------------------------------------------
 
 const AxlConfigDesc http_server_descs[] = {
-    { "max.connections", AXL_CFG_UINT, "8",       0, "Max simultaneous connections",
+    { "max.connections", AXL_CFG_UINT, "8", "Max simultaneous connections",
       offsetof(struct AxlHttpServer, max_conns), sizeof(size_t) },
-    { "body.limit",      AXL_CFG_UINT, "4194304", 0, "Max request body bytes",
+    { "body.limit",      AXL_CFG_UINT, "4194304", "Max request body bytes",
       offsetof(struct AxlHttpServer, body_limit), sizeof(size_t) },
-    { "keep.alive.sec",  AXL_CFG_UINT, "30",      0, "Keep-alive timeout in seconds",
+    { "keep.alive.sec",  AXL_CFG_UINT, "30", "Keep-alive timeout in seconds",
       offsetof(struct AxlHttpServer, keep_alive_sec), sizeof(size_t) },
-    { "upload.chunk.size", AXL_CFG_UINT, "65536",  0, "Upload streaming chunk size in bytes",
+    { "upload.chunk.size", AXL_CFG_UINT, "65536", "Upload streaming chunk size in bytes",
       offsetof(struct AxlHttpServer, upload_chunk_size), sizeof(size_t) },
-    { "cache.ttl.ms",   AXL_CFG_UINT, "60000",    0, "Default response cache TTL in milliseconds",
+    { "cache.ttl.ms",   AXL_CFG_UINT, "60000", "Default response cache TTL in milliseconds",
       offsetof(struct AxlHttpServer, cache_ttl_ms), sizeof(size_t) },
     { 0 }
 };

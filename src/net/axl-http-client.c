@@ -38,13 +38,13 @@ struct AxlHttpClient {
 };
 
 static const AxlConfigDesc http_client_descs[] = {
-    { "timeout.ms",    AXL_CFG_UINT, "10000", 0, "Per-operation timeout in ms",
+    { "timeout.ms",    AXL_CFG_UINT, "10000", "Per-operation timeout in ms",
       offsetof(struct AxlHttpClient, timeout_ms), sizeof(size_t) },
-    { "keep.alive",    AXL_CFG_BOOL, "true",  0, "Reuse TCP connections",
+    { "keep.alive",    AXL_CFG_BOOL, "true", "Reuse TCP connections",
       offsetof(struct AxlHttpClient, keep_alive), sizeof(bool) },
-    { "max.redirects", AXL_CFG_INT,  "5",     0, "HTTP redirect limit",
+    { "max.redirects", AXL_CFG_INT,  "5", "HTTP redirect limit",
       offsetof(struct AxlHttpClient, max_redirects), sizeof(int) },
-    { "tls.verify",    AXL_CFG_BOOL, "true",  0, "TLS certificate verification",
+    { "tls.verify",    AXL_CFG_BOOL, "true", "TLS certificate verification",
       offsetof(struct AxlHttpClient, tls_verify), sizeof(bool) },
     { 0 }
 };

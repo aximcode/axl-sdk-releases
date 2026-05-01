@@ -96,6 +96,31 @@ axl_path_resolve(
 );
 
 /**
+ * @brief Build a path to a file alongside another (the "companion"
+ *     pattern: load `jedec.json` from the directory holding the
+ *     binary that just started running, etc.).
+ *
+ * Equivalent to @ref axl_path_join with the dirname of @p anchor as
+ * the directory portion. Returns just @p name (joined with "."/empty)
+ * if @p anchor has no directory component. NULL-safe.
+ *
+ * Caller frees with @ref axl_free.
+ *
+ * @code
+ * char *cfg = axl_path_companion(axl_app_argv0(), "jedec.json");
+ * // load cfg if non-NULL
+ * @endcode
+ *
+ * @return newly allocated path, or NULL if either argument is NULL or
+ *     allocation fails.
+ */
+char *
+axl_path_companion(
+    const char *anchor,  ///< reference path (e.g. argv[0])
+    const char *name     ///< filename to place beside @p anchor
+);
+
+/**
  * @brief Build a UEFI-style path with volume prefix.
  *
  * Writes "VOLUME:SUBPATH" into @p out, converting forward slashes to

@@ -86,11 +86,37 @@ axl_smbus_write_block(AxlSmbus       *s,
                       const uint8_t  *buf,
                       size_t          len)
 {
-    if (s == NULL || buf == NULL) {
-        return -1;
-    }
-    if (len > AXL_SMBUS_BLOCK_MAX) {
+    /* len == 0 isn't a legal SMBus block write (the count byte must
+       be 1..32 per spec §5.5.7); reject it here so transports don't
+       have to. This also stops a 1-op 2-byte I2C transaction from
+       being misinterpreted as a Byte Write by transports that
+       discriminate write shape on length. */
+    if (s == NULL || buf == NULL || len == 0 || len > AXL_SMBUS_BLOCK_MAX) {
         return -1;
     }
     return s->ops.write_block(s->ops.ctx, slave, command, buf, len);
+}
+
+int
+axl_smbus_read_byte(AxlSmbus *s,
+                    uint8_t   slave,
+                    uint8_t   command,
+                    uint8_t  *out)
+{
+    if (s == NULL || out == NULL) {
+        return -1;
+    }
+    return s->ops.read_byte(s->ops.ctx, slave, command, out);
+}
+
+int
+axl_smbus_write_byte(AxlSmbus *s,
+                     uint8_t   slave,
+                     uint8_t   command,
+                     uint8_t   value)
+{
+    if (s == NULL) {
+        return -1;
+    }
+    return s->ops.write_byte(s->ops.ctx, slave, command, value);
 }

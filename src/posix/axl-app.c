@@ -188,3 +188,16 @@ _axl_get_args(int *argc, char ***argv)
         *argv = mArgv;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Public — axl-app.h
+// ---------------------------------------------------------------------------
+
+const char *
+axl_app_argv0(void)
+{
+    if (mArgc == 0 || mArgv == NULL) {
+        return NULL;
+    }
+    return mArgv[0];
+}

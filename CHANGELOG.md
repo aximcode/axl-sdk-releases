@@ -3,6 +3,144 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.7.0 — 2026-05-01
+
+Phase B3 (Platform Access) lands in full — AxlAcpi, AxlBoot, AxlPci,
+AxlImage, AxlMemPhys, AxlWatchdog, AxlRng, and AxlSpd. Tools layer
+gets a new declarative CLI parser (AxlArgs) and five reusable
+helpers; all 11 in-tree tools migrate to the new framework, and the
+dual-purpose CLI side of AxlConfig retires.
+
+### Added
+
+- **AxlAcpi** — ACPI table discovery via RSDP/RSDT/XSDT walk with
+  cursor iteration matching `axl_smbios_find_next`. Public checksum
+  verifier; typed readers for MCFG (PCIe ECAM segments), MADT (IOAPIC
+  on x86, GIC regions on aa64), and FACP/FADT (SMI cmd, PM1 blocks,
+  DSDT pointer). No AML interpretation. Header: `axl/axl-acpi.h`.
+- **AxlBoot** — typed boot-option management. `AxlBootOption` struct
+  (description / device-path text / opt_data) with
+  `_option_get/_set/_delete/_free` and `_order_get/_set`.
+- **AxlPci** — PCI/PCIe configuration-space access via ECAM (no
+  legacy 0xCF8/CFC). Cursor iteration honours multi-function header
+  bit; lookups by class24 and VID/DID; capability-list walker.
+  Header: `axl/axl-pci.h`.
+- **AxlImage** — load / start / unload UEFI executable images via
+  EFI shell-style paths.
+- **AxlMemPhys** — typed physical-memory access (read8/16/32/64,
+  one-shot or mapped, byte search). Bounds-checked, never crashes
+  on bad addresses.
+- **AxlWatchdog** — `axl_watchdog_set / pet / disarm` wrapping
+  `gBS->SetWatchdogTimer`.
+- **AxlRng** — `axl_rng_bytes` over `EFI_RNG_PROTOCOL`. Returns
+  -1 if the protocol isn't published.
+- **AxlSpd** — DDR4/DDR5 SPD reader on AxlSmbus. Cursor iteration
+  over 0x50..0x57; key byte at SPD offset 2 dispatches to the codec
+  (0x0C=DDR4, 0x12=DDR5). DDR4 paging via EE1004 SPA pseudo-slaves
+  (0x36/0x37); DDR5 paging via SPD5118 MR11 across eight 128-byte
+  windows. Pure-decoder entry point `axl_spd_decode(buf, len, *out)`
+  for offline analysis. DDR3 deliberately deferred.
+- **`axl_io_port_*`** — promoted from internal backend to public.
+  16/32-bit variants. Build-gated to x86 (compile error on aa64).
+- **`axl_nvstore_*` extensions** — namespace registration for OEM
+  variable GUIDs; `_delete`, `_iter`, `_get_attrs`. Behaviour
+  change: unregistered namespace is now an error (was: silent
+  fallback to global).
+- **AxlSmbus byte ops** — `axl_smbus_read_byte` / `_write_byte`
+  (SMBus spec §5.5.4 / §5.5.5). Required for SPD EEPROMs (24Cxx-
+  style, no block framing) and SPD5118 register access.
+- **Five new tool-layer helpers** — `axl_app_argv0` (new
+  `<axl/axl-app.h>`), `axl_path_companion`, `axl_format_bytes`
+  (IEC binary units), `axl_json_load_file`, plus the AxlHashTable
+  adoption pattern in tools/memspd. Caught as gaps during the R+4
+  post-commit review; `<axl/axl-spd.h>` was also missing from the
+  umbrella `<axl.h>` and is now included.
+- **AxlArgs** — new declarative CLI parser (`<axl/axl-args.h>`).
+  Tools declare an `AxlArgsApp` tree (name, global flags, verbs,
+  per-verb flags, typed positionals) and call `axl_args_run` from
+  main; the framework parses argv, validates types and bounds,
+  generates `--help`, and dispatches to a verb handler. Supports
+  single-handler and multi-verb modes. Flag types: BOOL, STRING,
+  U8/U16/U32/U64 with optional [min,max], S64 (delegates to
+  `axl_str_to_s64`), MULTI (repeatable). Auto `--help`/`-h`.
+  Compact short-flag groups (`-vh`) explicitly rejected; extra
+  positionals past a fully-filled list rejected. Lifetime contract
+  documented for AxlLoop interop.
+- **`tools/memspd`** — `decode-dimms`-equivalent. Verbs `list /
+  show <slot> / decode <slot>`. Vendor lookup is data-driven via
+  `share/jedec.json` (15-vendor stub); auto-discovered next to the
+  `.efi` or via `--jedec-file`. Missing sidecar prints raw 16-bit
+  hex codes.
+- **`scripts/qemu-patches/0001-smbus-eeprom-add-memdev-link.patch`**
+  — adds a `memdev=<link<memory-backend>>` property to QEMU's
+  `smbus-eeprom` device. Models on `pc-dimm`'s `memdev=` link.
+  Unblocks `test/integration/test-spd-qemu.sh` end-to-end coverage
+  of the AxlSpd wire path. Candidate for upstreaming.
+- **`test/integration/test-spd-qemu.sh`** — wire-path AxlSpd test
+  through the patched QEMU + SmbusHcShim chain.
+- **`test/integration/test-net-tools.sh`** — closes the
+  `test-tools.sh` coverage gap for the network-using tools (`fetch`,
+  `netinfo`). All 11 in-tree tools now have direct tool-binary
+  integration coverage.
+- **`docs/AXL-Hardware-Fixture-Design.md`** + ROADMAP HF1–HF6 —
+  proposal for vendor-neutral capture-and-replay of UEFI platform
+  identity (SMBIOS, ACPI, PCI manifest, IPMI, Redfish) so axl-sdk
+  tools can be exercised against real-world platforms under QEMU
+  without lab access. No code yet; planning artifact.
+
+### Changed
+
+- **All 11 tools migrated to AxlArgs**: `memspd`, `dmidecode`,
+  `sysinfo`, `fetch`, `grep`, `find`, `hexdump`, `ipmi`, `netinfo`,
+  `mkrd`, `rfbrowse`. Per-tool boilerplate (~12–25 lines of
+  AxlConfig + manual dispatch) collapses to ~5–10 lines of
+  declarative verb tree. Consistent `--help` format across the
+  toolchain; typed positional-arg validation for free.
+- **SmbusHcShim** extended with `smb_byte_read` / `smb_byte_write`
+  (ICH9 SMBus PROT_BYTE_DATA). Required for AxlSpd over the I2C
+  Master path on QEMU.
+- **`axl_smbus_write_block`** now rejects `len == 0` (was a hole
+  the I2C path could route as a byte write under the new shim).
+
+### Removed
+
+- **AxlConfig CLI surface** — `axl_config_parse_args`,
+  `axl_config_pos`, `axl_config_pos_count`, `axl_config_usage`,
+  and the `short_flag` field in `AxlConfigDesc`. AxlConfig now
+  has a focused purpose: live object property bag with typed
+  accessors, auto-apply via offsetof, and dynamic-key callbacks
+  (used by AxlHttpClient/Server). The dual-purpose "config or CLI
+  parser?" confusion is gone. External consumer migration:
+  `aximcode/axl-webfs` cmd-serve + cmd-mount — committed in that
+  repository separately.
+- `sdk/examples/config-demo.c` — only demonstrated the retired
+  CLI surface. Removed.
+
+### Fixed
+
+- **AxlSmbus I2C path** zero-length block-write was misroutable as
+  byte-write under SmbusHcShim's byte-op extension; now rejected
+  at the public API layer.
+- **DDR5 SPD** decoder was masking the ECC-presence bit with
+  `& 0x07`, allowing dual-channel non-ECC modules' channel-count
+  bits to spoof ECC=true. Fixed to `& 0x03` (caught by independent
+  code-review pass before AxlSpd commit).
+- **AxlArgs S64** initial impl reproduced the v0.5.0 INT64_MIN
+  signed-overflow UB by hand-rolling negate-after-strip-minus.
+  Replaced with `axl_str_to_s64` delegation (no live exposure —
+  no tool currently uses S64 — but the bug was in new code).
+- Several minor doc / lifetime-contract clarifications to the new
+  helpers and AxlArgs surface, all caught by the independent
+  review passes.
+
+### Test ratchet
+
+1842 → 1905 on both x86_64 and AArch64 (+63 across R+1..R+4 + the
+tool-helpers + AxlArgs framework + offsetting -13 retired
+test_config_args). All 11 tools have direct integration coverage
+(`test-tools.sh`, `test-net-tools.sh`, `test-redfish.sh`,
+`test-spd-qemu.sh`, `test-ipmi-{qemu,ssif-qemu}.sh`).
+
 ## 0.6.1 — 2026-04-30
 
 ### Added

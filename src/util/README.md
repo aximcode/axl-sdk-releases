@@ -1,14 +1,21 @@
-System operations, environment variables, time, NVRAM storage, driver
-lifecycle, hex dump, configuration framework (including command-line
-parsing), and path manipulation.
+System operations, environment variables, time, NVRAM storage,
+boot-option management, x86 I/O port access, driver lifecycle, hex
+dump, configuration framework (including command-line parsing), and
+path manipulation.
 
 Headers:
 
 - `<axl/axl-sys.h>` — System operations (reset, GUID, device map refresh)
 - `<axl/axl-env.h>` — Environment variables and working directory
 - `<axl/axl-time.h>` — Wall-clock time and monotonic timestamps
-- `<axl/axl-nvstore.h>` — UEFI NVRAM variable access
+- `<axl/axl-nvstore.h>` — Portable NVRAM key-value storage
+- `<axl/axl-boot.h>` — Boot-option management (Boot####/BootOrder/BootNext/BootCurrent)
+- `<axl/axl-io-port.h>` — x86 I/O port access (`in`/`out`)
 - `<axl/axl-driver.h>` — Driver binding and lifecycle
+- `<axl/axl-image.h>` — Executable-image lifecycle (load/start/unload)
+- `<axl/axl-mem-phys.h>` — Physical-memory map/unmap + one-shot read/write
+- `<axl/axl-watchdog.h>` — Boot-services watchdog control
+- `<axl/axl-rng.h>` — Cryptographic random bytes
 - `<axl/axl-diag.h>` — Tool diagnostic helpers (`-v` output)
 - `<axl/axl-hexdump.h>` — Hex/ASCII dump formatting
 - `<axl/axl-config.h>` — Unified configuration + command-line parsing
@@ -47,7 +54,10 @@ After `AXL_APP` or `axl_driver_init`, these globals are available
 
 ### NVRAM Variables
 
-Read and write persistent UEFI variables (survive reboot):
+Portable key-value storage backed by firmware variables, organized
+by namespace. Built-in namespaces are `"global"` (spec UEFI Global
+Variable GUID, e.g. SecureBoot, BootOrder, Boot####) and `"app"`
+(per-app GUID for application settings).
 
 ```c
 // Read
@@ -59,7 +69,129 @@ if (axl_nvstore_get("global", "SecureBoot", &secure_boot, &sz) == 0) {
 
 // Write
 axl_nvstore_set("app", "last-run", timestamp, timestamp_len,
-                AXL_NVSTORE_BOOT | AXL_NVSTORE_NV);
+                AXL_NV_PERSISTENT | AXL_NV_BOOT);
+```
+
+#### Vendor Namespaces
+
+Vendor variables (Dell/HPE/Lenovo OEM keys) plug in via namespace
+registration so consumer call sites stay UEFI-free — they reference
+namespaces by name only. The backend token is opaque (a `const
+AxlGuid *` on UEFI; on a future Linux backend it could be a path
+prefix):
+
+```c
+extern const AxlGuid AXL_DELL_VENDOR_GUID;  // declared per-vendor
+axl_nvstore_register_namespace("dell", &AXL_DELL_VENDOR_GUID);
+axl_nvstore_get("dell", "SystemId", buf, &sz);
+```
+
+Other operations: `axl_nvstore_delete`, `axl_nvstore_iter` (walk
+all keys in a namespace), `axl_nvstore_get_attrs` (read AXL_NV_*
+flags without reading the value).
+
+### Boot Options
+
+Typed wrappers over the `Boot####`/`BootOrder`/`BootNext`/`BootCurrent`
+firmware-variable family. The `EFI_LOAD_OPTION` wire codec stays
+internal to AxlBoot — consumers operate on `AxlBootOption` structs:
+
+```c
+AxlBootOption opt;
+if (axl_boot_option_get(0x0001, &opt) == 0) {
+    axl_printf("Boot0001: %s\n  path: %s\n",
+               opt.description, opt.device_path ?: "(unknown)");
+    axl_boot_option_free(&opt);
+}
+
+uint16_t *order;
+size_t    n;
+if (axl_boot_order_get(&order, &n) == 0) {
+    for (size_t i = 0; i < n; i++) {
+        axl_printf("  %zu: Boot%04X\n", i, order[i]);
+    }
+    axl_free(order);
+}
+```
+
+Set/delete options (`_option_set`, `_option_delete`), reorder boot
+sequence (`_order_set`), or arm a one-shot (`_next_set` / `_next_clear`).
+Encoding device paths to/from text uses the firmware's
+`EFI_DEVICE_PATH_TO_TEXT_PROTOCOL` / `_FROM_TEXT_PROTOCOL` —
+`_set` returns -1 if the from-text protocol isn't published.
+
+### x86 I/O Ports
+
+Public wrappers around `in`/`out` for legacy hardware that hasn't
+moved to MMIO (CMOS, SuperIO, IPMI KCS, port-based ACPI PM blocks):
+
+```c
+#if defined(__x86_64__) || defined(__i386__)
+uint8_t v = axl_io_port_read8(0x70);
+axl_io_port_write8(0x71, v | 0x80);
+#endif
+```
+
+Build-gated to x86 — calls compile out on AArch64, so wrong-arch
+usage surfaces as a link error rather than a silent runtime no-op.
+8/16/32-bit variants for read and write.
+
+### Physical-Memory Access
+
+For tools that scan ROM regions, peek at MMIO control registers,
+or search firmware tables. The `_map`/`_unmap` pair is the held
+abstraction; one-shot `_read{8,16,32,64}` / `_write{8,16,32,64}`
+helpers cover the typical "I just want one byte" case without
+boilerplate. UEFI is identity-mapped so map is effectively a
+no-op; the abstraction exists for portability — a future Linux
+backend would `mmap("/dev/mem")` on the way in.
+
+```c
+// Held mapping over multiple accesses.
+void *va;
+if (axl_mem_phys_map(0xFEE00000, 4096, &va) == 0) {
+    uint32_t apic_id = *(volatile uint32_t *)((uint8_t *)va + 0x20);
+    axl_mem_phys_unmap(va, 4096);
+}
+
+// One-shot read.
+uint32_t signature;
+axl_mem_phys_read32(0xE0000, &signature);
+```
+
+`axl_mem_phys_search` does a byte-by-byte scan for a needle
+within a mapped region — useful for finding signatures inside
+firmware blobs.
+
+### Watchdog
+
+UEFI starts every loaded image with a 5-minute boot-services
+watchdog (UEFI 2.11 §7.5). Long-running diagnostics get killed
+without warning unless they take action:
+
+```c
+// Disable entirely (typical for diagnostics that exceed 5 min).
+axl_watchdog_disarm();
+
+// Or extend without disabling protection.
+axl_watchdog_set(900);  // 15 minutes
+// ... long-running work ...
+axl_watchdog_pet();     // re-arm to the same window
+```
+
+### Random Bytes
+
+Thin wrapper over `EFI_RNG_PROTOCOL` (UEFI 2.11 §37.5). The
+protocol is published by most modern firmware on platforms with
+an entropy source (RDRAND on x86, an SBSA TRNG on aa64). Returns
+-1 if the protocol isn't installed — consumers that need a
+deterministic fallback layer their own.
+
+```c
+uint8_t nonce[16];
+if (axl_rng_bytes(nonce, sizeof(nonce)) != 0) {
+    // RNG not available — bail or fall back
+}
 ```
 
 ### Driver Lifecycle
@@ -78,6 +210,29 @@ EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
 ```
 
 See `sdk/examples/driver.c` for a complete example.
+
+### Image Lifecycle
+
+For loading and running arbitrary EFI images (not DXE drivers),
+use `axl_image_*`:
+
+```c
+AxlImage *img;
+if (axl_image_load("fs0:\\boot\\hello.efi", &img) == 0) {
+    int exit_code = 0;
+    axl_image_start(img, &exit_code);
+    axl_image_unload(img);
+}
+```
+
+The handle is opaque — `EFI_HANDLE` and `EFI_LOADED_IMAGE_PROTOCOL`
+never cross the public API. `axl_image_*` is a thin wrapper over
+`axl_driver_*` (which already handles path-to-device-path
+construction and the device-path / buffer load fallback); the only
+distinct piece is `axl_image_start`, which captures the image's
+exit status (`axl_driver_start` discards it because drivers aren't
+expected to exit cleanly). Forward slashes in the path are
+normalized to backslashes.
 
 ### Auto-Loading Driver Dependencies
 
@@ -211,44 +366,15 @@ size_t port = axl_config_get_uint(cfg, "port");
 const char *port_str = axl_config_get(cfg, "port");  // "9090"
 ```
 
-### Command-Line Integration
+### Command-Line Parsing
 
-The same descriptor table that defines config options also drives
-command-line parsing. Each descriptor's `short_flag` produces a short
-option (e.g. `-p`) and its `key` produces the long form (e.g.
-`--port`). Bool types toggle on without a value (`-v`), other types
-take the next argv (`-p 8080` or `--port=8080`). Repeatable options
-use `AXL_CFG_MULTI`. Positional arguments are available via
-`axl_config_pos` / `axl_config_pos_count`; `--` terminates parsing.
-
-```c
-static const AxlConfigDesc descs[] = {
-    { "port",    AXL_CFG_UINT, "8080",  'p', "Listen port",    0, 0 },
-    { "verbose", AXL_CFG_BOOL, "false", 'v', "Verbose output", 0, 0 },
-    { "header",  AXL_CFG_MULTI, NULL,   'H', "HTTP header (repeatable)", 0, 0 },
-    { "help",    AXL_CFG_BOOL, "false", 'h', "Show this help", 0, 0 },
-    { 0 }
-};
-
-int main(int argc, char **argv) {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_config_usage(cfg, "myapp", "[options] <file>");
-        return 1;
-    }
-
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "myapp", "[options] <file>");
-        return 0;
-    }
-
-    size_t port    = axl_config_get_uint(cfg, "port");
-    bool   verbose = axl_config_get_bool(cfg, "verbose");
-    const char *file = axl_config_pos(cfg, 0);
-    (void)port; (void)verbose; (void)file;
-    return 0;
-}
-```
+AxlConfig is no longer a CLI parser — that role moved to **AxlArgs**
+(`<axl/axl-args.h>`), which adds verb trees, typed positional args
+with min/max bounds, and auto-generated `--help`. Tools that used
+`axl_config_parse_args` / `axl_config_pos` / `axl_config_usage`
+should call `axl_args_run` instead. AxlConfig stays focused on the
+live property-bag use case (HTTP client/server settings, future
+modules with tunable runtime properties).
 
 ### Multi-Value Options
 

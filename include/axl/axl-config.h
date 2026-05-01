@@ -4,11 +4,15 @@
 /**
  * axl-config.h:
  *
- * Unified configuration framework. Declare options once in a
- * descriptor table, populate from command-line args or programmatic
- * set calls, retrieve with typed getters. Supports auto-apply via
- * offsetof, callbacks for custom logic, and optional parent
- * inheritance for cascading defaults.
+ * Live object property bag. Declare typed options once in a
+ * descriptor table; mutate at runtime via @ref axl_config_set;
+ * retrieve via typed getters. Supports auto-apply into a target
+ * struct via offsetof, dynamic-key callbacks (for namespaces like
+ * "header.*"), and parent inheritance for cascading defaults.
+ *
+ * For command-line argument parsing, use @ref axl_args_run from
+ * <axl/axl-args.h>. AxlConfig used to do that too; the CLI surface
+ * was retired once AxlArgs landed.
  */
 
 #ifndef AXL_CONFIG_H
@@ -43,8 +47,7 @@ typedef struct {
     const char *key;            ///< dotted name (e.g. "timeout.ms")
     int         type;           ///< AXL_CFG_BOOL, _INT, _UINT, _STRING, _MULTI
     const char *default_value;  ///< default as string (NULL = no default)
-    char        short_flag;     ///< single-char CLI flag (0 = none)
-    const char *description;    ///< help text
+    const char *description;    ///< help text (logged in debug mode)
     size_t      offset;         ///< offsetof into target struct
     size_t      field_size;     ///< sizeof the target field (0 = no auto-apply)
 } AxlConfigDesc;
@@ -201,63 +204,6 @@ axl_config_get_multi(
     AxlConfig  *cfg,    ///< config
     const char *key,    ///< option key
     size_t      index   ///< 0-based index
-);
-
-// ---------------------------------------------------------------------------
-// Command-line argument parsing
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Parse command-line arguments into config.
- *
- * Maps short flags and long options (key names) to config values.
- * Flags without values are treated as boolean "true".
- * Supports `-k`, `--key`, `--key=value`, and `--` to stop parsing.
- * Unrecognized args are collected as positional arguments.
- *
- * @return 0 on success, -1 on error (unknown flag).
- */
-int
-axl_config_parse_args(
-    AxlConfig *cfg,   ///< config
-    int        argc,  ///< argument count
-    char     **argv   ///< argument vector (argv[0] is program name)
-);
-
-/**
- * @brief Get positional argument by index.
- *
- * @return argument string, or NULL if index out of range.
- */
-const char *
-axl_config_pos(
-    AxlConfig *cfg,   ///< config
-    int        index  ///< 0-based index
-);
-
-/**
- * @brief Get count of positional arguments.
- */
-int
-axl_config_pos_count(
-    AxlConfig *cfg  ///< config
-);
-
-// ---------------------------------------------------------------------------
-// Help / usage
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Print usage from descriptors.
- *
- * Outputs formatted help to stdout: "Usage: PROGRAM SYNOPSIS" followed
- * by option descriptions from the descriptor table.
- */
-void
-axl_config_usage(
-    AxlConfig  *cfg,       ///< config (for descriptors)
-    const char *program,   ///< program name
-    const char *synopsis   ///< usage synopsis (e.g. "[options] FILE")
 );
 
 // ---------------------------------------------------------------------------

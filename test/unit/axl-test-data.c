@@ -671,6 +671,47 @@ test_json_parse(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_json_load_file — round-trip via fs0:\axl_test_jload.tmp
+// ---------------------------------------------------------------------------
+
+static void
+test_json_load_file(void)
+{
+    static const char  kPath[]    = "fs0:\\axl_test_jload.tmp";
+    static const char  kJson[]    = "{\"name\":\"axl\",\"answer\":42}";
+    AxlJsonReader      r          = { 0 };
+    void              *raw        = NULL;
+    size_t             raw_len    = 0;
+
+    /* Stage the JSON file. */
+    test_check(axl_file_set_contents(kPath, kJson, sizeof(kJson) - 1) == 0,
+               "json_load_file: set_contents seeds the fixture");
+
+    /* Successful load. */
+    test_check(axl_json_load_file(kPath, &r, &raw, &raw_len),
+               "json_load_file: load + parse succeeds");
+    test_check(raw != NULL && raw_len == sizeof(kJson) - 1,
+               "json_load_file: out_buf populated, out_len matches file size");
+
+    char str_buf[16];
+    test_check(axl_json_get_string(&r, "name", str_buf, sizeof(str_buf))
+               && axl_strcmp(str_buf, "axl") == 0,
+               "json_load_file: parsed reader extracts string");
+
+    axl_json_free(&r);
+    axl_free(raw);
+
+    /* Failure path: missing file leaves out_buf NULL and returns false. */
+    AxlJsonReader r2  = { 0 };
+    void         *raw2 = (void *)0xdead;   /* sentinel; impl must overwrite */
+    test_check(!axl_json_load_file("fs0:\\__definitely_missing__.tmp",
+                                   &r2, &raw2, NULL),
+               "json_load_file: missing file returns false");
+    test_check(raw2 == NULL,
+               "json_load_file: out_buf cleared on failure");
+}
+
+// ---------------------------------------------------------------------------
 // JSON Build Tests
 // ---------------------------------------------------------------------------
 
@@ -2716,6 +2757,7 @@ test_data_main(int argc, char **argv)
     test_string();
     test_string_ascii();
     test_json_parse();
+    test_json_load_file();
     test_json_build();
     test_json_print();
     test_slist();

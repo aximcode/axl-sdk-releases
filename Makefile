@@ -161,12 +161,21 @@ LIB_SOURCES = \
     src/util/axl-env.c \
     src/util/axl-sys.c \
     src/util/axl-nvstore.c \
+    src/util/axl-io-port.c \
+    src/util/axl-boot.c \
+    src/util/axl-image.c \
+    src/util/axl-mem-phys.c \
+    src/util/axl-watchdog.c \
+    src/util/axl-rng.c \
     src/util/axl-service.c \
     src/util/axl-driver.c \
     src/util/axl-diag.c \
     src/util/axl-config.c \
     src/util/axl-subcommand.c \
+    src/util/axl-args.c \
     src/smbios/axl-smbios.c \
+    src/acpi/axl-acpi.c \
+    src/pci/axl-pci.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
@@ -213,6 +222,9 @@ LIB_SOURCES = \
     src/ipmi/axl-ipmi-dell.c \
     src/ipmi/axl-ipmi-cmd.c \
     src/ipmi/axl-ipmi-format.c \
+    src/spd/axl-spd.c \
+    src/spd/axl-spd-ddr4.c \
+    src/spd/axl-spd-ddr5.c \
     src/posix/axl-app.c \
     src/runtime/axl-atexit.c \
     src/runtime/axl-registry.c \
@@ -355,10 +367,19 @@ $(BUILDDIR)/%.o: src/gfx/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/smbios/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(BUILDDIR)/%.o: src/acpi/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/pci/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(BUILDDIR)/%.o: src/smbus/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/ipmi/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/spd/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/posix/%.c | $(BUILDDIR)
@@ -642,12 +663,12 @@ $(BUILDDIR)/axlk-reqlog-server.o: $(KERNEL_POC_DIR)/test/axlk-reqlog-server.c | 
 # Build test applications (all modules)
 # ===================================================================
 
-TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit
+TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data
 
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \
-        AxlTestSmbus AxlTestIpmi AxlTestEvent AxlTestCpuIdle \
-        AxlTestRuntime
+        AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
+        AxlTestCpuIdle AxlTestRuntime
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -674,6 +695,7 @@ $(eval $(call BUILD_TEST,AxlTestTask,axl-test-task))
 $(eval $(call BUILD_TEST,AxlTestNet,axl-test-net))
 $(eval $(call BUILD_TEST,AxlTestSmbus,axl-test-smbus))
 $(eval $(call BUILD_TEST,AxlTestIpmi,axl-test-ipmi))
+$(eval $(call BUILD_TEST,AxlTestPlatform,axl-test-platform))
 $(eval $(call BUILD_TEST,AxlTestEvent,axl-test-event))
 $(eval $(call BUILD_TEST,AxlTestCpuIdle,axl-test-cpu-idle))
 $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
@@ -682,7 +704,7 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sysinfo netinfo mkrd rfbrowse ipmi dmidecode
+TOOL_NAMES = hexdump fetch find grep sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)

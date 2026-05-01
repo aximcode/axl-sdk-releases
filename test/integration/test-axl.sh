@@ -29,7 +29,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
-TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestEvent AxlTestRuntime)
+TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime)
 
 for app in "${TEST_APPS[@]}"; do
     test_add_efi "$NATIVE_DIR/$app.efi"
@@ -66,6 +66,11 @@ test_build_image
 echo "=== AXL Integration Tests ($TEST_ARCH) ==="
 
 test_build_qemu_cmd
-test_add_network
+# AxlTestNet does several "self-connect" tests against the guest's
+# own DHCP IP. Slirp doesn't loopback to the guest, so without help
+# every connect waits the full 10 s timeout and SKIPs. Wire the
+# stream-echo guestfwd onto each port the suite uses, so the
+# client-side connect+send+recv path runs against a real remote.
+test_add_network_with_echo 9994 9996 9998 9999
 test_run_foreground 120
 test_count_results

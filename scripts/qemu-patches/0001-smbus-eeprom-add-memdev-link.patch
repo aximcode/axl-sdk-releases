@@ -1,0 +1,121 @@
+From: AximCode <noreply@aximcode.com>
+Subject: [PATCH] hw/i2c/smbus_eeprom: add memdev= link for command-line SPD injection
+
+The smbus-eeprom device's init_data is currently programmatic-only:
+machine init code (pc_q35, pc_piix, malta) sets it via a direct
+struct write, and the QOM property table is empty beyond `address`.
+That makes the device unusable from the QEMU command line and
+forces machines that want SPD content to do so via private API.
+
+Add a `memdev=<link<memory-backend>>` property modelled on
+PC_DIMM_MEMDEV_PROP. When set, realize() copies SMBUS_EEPROM_SIZE
+bytes from the memory backend into a freshly allocated init_data
+buffer (matching the existing reset-to-init_data semantics — guest
+writes do not propagate back to the host file). The legacy
+programmatic init_data path is preserved for existing
+machine-init callers.
+
+Reorder the realize() body so the init_data NULL check runs BEFORE
+smbus_eeprom_reset() — the reset path memcpy()s from init_data
+unconditionally and would segfault the host on a misconfigured
+device before realize() could surface the error.
+
+Usage:
+
+  -object memory-backend-file,id=spd0,mem-path=spd-ddr4.bin,size=4096,share=off \
+  -device smbus-eeprom,address=0x50,memdev=spd0
+
+(memory-backend-file rounds size= up to host page size; pad blobs
+to one page or use size matching the rounded value.)
+
+The user-creatable gate is lifted; realize() still asserts that
+either a programmatic init_data or a memdev was supplied.
+
+This unblocks command-line SPD injection for testing memory
+readers like axl-sdk's AxlSpd module.
+
+Signed-off-by: AximCode <noreply@aximcode.com>
+---
+ hw/i2c/smbus_eeprom.c | 44 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+--- a/hw/i2c/smbus_eeprom.c
++++ b/hw/i2c/smbus_eeprom.c
+@@ -32,6 +32,7 @@
+ #include "migration/vmstate.h"
+ #include "hw/i2c/smbus_eeprom.h"
+ #include "qom/object.h"
++#include "system/hostmem.h"
+
+ //#define DEBUG
+
+@@ -45,6 +46,7 @@
+     SMBusDevice smbusdev;
+     uint8_t data[SMBUS_EEPROM_SIZE];
+     uint8_t *init_data;
++    HostMemoryBackend *hostmem;
+     uint8_t offset;
+     bool accessed;
+ };
+@@ -131,12 +133,45 @@
+ {
+     SMBusEEPROMDevice *eeprom = SMBUS_EEPROM(dev);
+
+-    smbus_eeprom_reset(dev);
++    if (eeprom->hostmem != NULL && eeprom->init_data == NULL) {
++        MemoryRegion *mr = host_memory_backend_get_memory(eeprom->hostmem);
++        uint64_t mr_size = memory_region_size(mr);
++
++        if (host_memory_backend_is_mapped(eeprom->hostmem)) {
++            error_setg(errp, "smbus-eeprom: memdev '%s' is already in use",
++                       object_get_canonical_path_component(
++                           OBJECT(eeprom->hostmem)));
++            return;
++        }
++        if (mr_size < SMBUS_EEPROM_SIZE) {
++            error_setg(errp,
++                       "smbus-eeprom: memdev size %" PRIu64
++                       " is smaller than required %u",
++                       mr_size, (unsigned)SMBUS_EEPROM_SIZE);
++            return;
++        }
++        eeprom->init_data = g_memdup2(memory_region_get_ram_ptr(mr),
++                                      SMBUS_EEPROM_SIZE);
++        host_memory_backend_set_mapped(eeprom->hostmem, true);
++    }
++
++    /*
++     * Validate before resetting — smbus_eeprom_reset() memcpy()s from
++     * init_data unconditionally, so a NULL deref here would segfault
++     * the host before realize() could surface the configuration error.
++     */
+     if (eeprom->init_data == NULL) {
+         error_setg(errp, "init_data cannot be NULL");
++        return;
+     }
++    smbus_eeprom_reset(dev);
+ }
+
++static const Property smbus_eeprom_properties[] = {
++    DEFINE_PROP_LINK("memdev", SMBusEEPROMDevice, hostmem,
++                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
++};
++
+ static void smbus_eeprom_class_initfn(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -147,8 +182,12 @@
+     sc->receive_byte = eeprom_receive_byte;
+     sc->write_data = eeprom_write_data;
+     dc->vmsd = &vmstate_smbus_eeprom;
+-    /* Reason: init_data */
+-    dc->user_creatable = false;
++    device_class_set_props(dc, smbus_eeprom_properties);
++    /*
++     * Allow command-line creation; realize() rejects the device if
++     * neither a programmatic init_data nor a memdev= link was set.
++     */
++    dc->user_creatable = true;
+ }
+
+ static const TypeInfo smbus_eeprom_types[] = {

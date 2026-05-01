@@ -66,14 +66,25 @@ typedef struct {
 
 static bool verbose = false;
 
-static const AxlConfigDesc descs[] = {
-    { "size",    AXL_CFG_STRING, NULL,    's', "Size in MB (default 4)",                          0, 0 },
-    { "destroy", AXL_CFG_STRING, NULL,    'd', "Destroy RAM disk by volume label",                0, 0 },
-    { "list",    AXL_CFG_BOOL,   "false", 'l', "List existing RAM disks",                         0, 0 },
-    { "verbose", AXL_CFG_BOOL,   "false", 'v', "Verbose output",                                  0, 0 },
-    { "driver",  AXL_CFG_STRING, NULL,    0,   "Driver name to load instead of embedded RamDiskDxe", 0, 0 },
-    { "help",    AXL_CFG_BOOL,   "false", 'h', "Show this help",                                  0, 0 },
-    { 0 }
+static const AxlArgDesc kFlags[] = {
+    { .name = "size",    .short_name = 's', .type = AXL_ARG_U32, .base = 0,
+      .min = MKRD_MIN_SIZE_MB, .max = MKRD_MAX_SIZE_MB,
+      .help = "Size in MB (default 4)" },
+    { .name = "destroy", .short_name = 'd', .type = AXL_ARG_STRING,
+      .help = "Destroy RAM disk by volume label" },
+    { .name = "list",    .short_name = 'l', .type = AXL_ARG_BOOL,
+      .help = "List existing RAM disks" },
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output" },
+    { .name = "driver",  .type = AXL_ARG_STRING,
+      .help = "Driver name to load instead of embedded RamDiskDxe" },
+    {0}
+};
+
+static const AxlArgDesc kPositional[] = {
+    { .name = "label", .type = AXL_ARG_STRING,
+      .help = "Volume label for the new RAM disk (create mode)" },
+    {0}
 };
 
 // ---------------------------------------------------------------------------
@@ -588,32 +599,14 @@ do_destroy(
 // Entry point
 // ===========================================================================
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+static int
+run_mkrd(AxlArgs *a)
 {
-    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(descs, NULL, NULL);
-    if (cfg == NULL || axl_config_parse_args(cfg, argc, argv) != 0) {
-        axl_printf("MkRd: invalid option\n");
-        axl_config_usage(cfg, "MkRd",
-                         "<label> [-s size] | -l | -d <label>");
-        return 1;
-    }
-
-    if (axl_config_get_bool(cfg, "help")) {
-        axl_config_usage(cfg, "MkRd",
-                         "<label> [-s size] | -l | -d <label>");
-        return 0;
-    }
-
-    verbose = axl_config_get_bool(cfg, "verbose");
+    verbose = axl_args_get_bool(a, "verbose");
 
     if (verbose) {
         /* Raise log level so axl_driver_ensure's debug trace surfaces. */
         axl_log_set_level(AXL_LOG_DEBUG);
-        axl_diag_startup(argc, argv);
         axl_diag_probe_protocol(
             (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
             "EFI_RAM_DISK_PROTOCOL");
@@ -625,13 +618,8 @@ main(
      *      Supermicro boxes hit this path),
      *   2. --driver <name> override: search disk only, no fallback,
      *   3. canonical search for RamDiskDxe.efi on disk,
-     *   4. embedded RamDiskDxe.efi blob baked in at build time.
-     * The embedded blob makes MkRd self-contained on minimal
-     * firmware (e.g. Dell client BIOS without UEFI 2.6+ optional
-     * modules). axl_embedded_ramdiskdxe{,_len} are forced-included
-     * by the Makefile rule that consumes
-     * third_party/edk2/RamDiskDxe-$(ARCH).efi via xxd -i. */
-    const char *driver_override = axl_config_get(cfg, "driver");
+     *   4. embedded RamDiskDxe.efi blob baked in at build time. */
+    const char *driver_override = axl_args_get_string(a, "driver");
     if (axl_driver_ensure_with_embedded(
             (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
             "RamDiskDxe.efi",
@@ -649,44 +637,40 @@ main(
     }
 
     if (verbose) {
-        /* Re-probe — proves whether axl_driver_ensure short-circuited
-         * (status matches the pre-ensure probe) or actually loaded a
-         * driver (status flips from NOT registered to REGISTERED). */
         axl_diag_probe_protocol(
             (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
             "EFI_RAM_DISK_PROTOCOL (post-ensure)");
     }
 
-    /* List mode */
-    if (axl_config_get_bool(cfg, "list")) {
+    if (axl_args_get_bool(a, "list")) {
         return do_list();
     }
-
-    /* Destroy mode */
-    const char *destroy_label = axl_config_get(cfg, "destroy");
+    const char *destroy_label = axl_args_get_string(a, "destroy");
     if (destroy_label != NULL) {
         return do_destroy(destroy_label);
     }
 
-    /* Create mode */
-    const char *label = axl_config_pos(cfg, 0);
+    const char *label = axl_args_get_string(a, "label");
     if (label == NULL) {
-        axl_printf("MkRd: label required\n");
-        axl_config_usage(cfg, "MkRd",
-                         "<label> [-s size] | -l | -d <label>");
+        axl_printf("MkRd: label required (or use --list / --destroy)\n");
         return 1;
     }
-
-    size_t size_mb = MKRD_DEFAULT_SIZE_MB;
-    const char *size_str = axl_config_get(cfg, "size");
-    if (size_str != NULL) {
-        size_mb = (size_t)axl_strtou64(size_str);
-        if (size_mb < MKRD_MIN_SIZE_MB || size_mb > MKRD_MAX_SIZE_MB) {
-            axl_printf("MkRd: size must be %d-%d MB\n",
-                       MKRD_MIN_SIZE_MB, MKRD_MAX_SIZE_MB);
-            return 1;
-        }
+    uint32_t size_mb = (uint32_t)axl_args_get_uint(a, "size");
+    if (size_mb == 0) {
+        size_mb = MKRD_DEFAULT_SIZE_MB;
     }
-
     return do_create(label, size_mb);
+}
+
+int
+main(int argc, char **argv)
+{
+    axl_diag_startup(argc, argv);
+    return axl_args_run(argc, argv, &(AxlArgsApp){
+        .name         = "MkRd",
+        .help         = "Create / list / destroy RAM disks via EFI_RAM_DISK_PROTOCOL",
+        .global_flags = kFlags,
+        .positionals  = kPositional,
+        .handler      = run_mkrd,
+    });
 }
