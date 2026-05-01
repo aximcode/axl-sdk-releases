@@ -456,7 +456,14 @@ test_rng(void)
     uint8_t buf2[32] = { 0 };
     int rc = axl_rng_bytes(buf1, sizeof(buf1));
     if (rc != 0) {
+        /* Four balancers — the fixed path below emits four conditional
+           test_check calls (bytes(32) succeeds + second fill + distinct
+           + non-zero). Off-by-one previously left the skipped count
+           short by one against the populated count, which surfaced as
+           a CI ratchet failure when the runner's OVMF didn't publish
+           EFI_RNG_PROTOCOL but local OVMF did. */
         test_check(true, "rng: protocol not published — bytes test SKIPPED");
+        test_check(true, "rng: protocol not published — second fill SKIPPED");
         test_check(true, "rng: protocol not published — distinct test SKIPPED");
         test_check(true, "rng: protocol not published — non-zero test SKIPPED");
         return;

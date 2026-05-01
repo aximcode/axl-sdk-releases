@@ -3,6 +3,25 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.7.1 — 2026-05-01
+
+CI-only patch — released v0.7.0 artifacts are unaffected.
+
+### Fixed
+
+- **`test_rng` SKIP-path balancer count off by one.** When OVMF
+  doesn't publish `EFI_RNG_PROTOCOL`, `test_rng` takes the SKIP
+  path and emits balancer `test_check(true)` calls instead of
+  exercising the protocol. The populated path emits 4 conditional
+  checks (bytes succeeds, second fill, distinct, non-zero); the
+  SKIP path was emitting only 3, leaving the count short by one
+  vs the populated count. Surfaced as the v0.7.0 CI ratchet
+  failure: local OVMF publishes EFI_RNG_PROTOCOL (full path,
+  1905 tests) but the GitHub Actions runner's OVMF doesn't (SKIP
+  path, 1904 tests). Adds the missing fourth balancer so total
+  stays 1905 regardless of environment. Pre-existing class of
+  bug per the cross-arch parity convention.
+
 ## 0.7.0 — 2026-05-01
 
 Phase B3 (Platform Access) lands in full — AxlAcpi, AxlBoot, AxlPci,
