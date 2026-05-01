@@ -77,6 +77,40 @@ reads as `0xFFFF`), so callers don't have to special-case the
 sentinel. `class24` matches the shape consumed by
 `axl_pci_find_by_class`.
 
+`axl_pci_class_string` decodes the 24-bit class triplet into a
+human-readable form per the PCI Code and ID Assignment Spec:
+
+```c
+uint32_t class24;
+char     cls[80];
+axl_pci_get_class24(addr, &class24);
+axl_pci_class_string(class24, cls, sizeof(cls));
+axl_printf("Class %06X (%s)\n", class24, cls);
+// Class 0C0330 (Serial bus controller / USB / xHCI)
+```
+
+Vendor/device-name lookup (the `pci.ids` database) is intentionally
+out of scope — too large for AXL, and consumers grep their own.
+
+## Config-space dump
+
+`axl_pci_dump` reads up to 4096 bytes (the PCIe ECAM extent) of a
+function's config space in 32-bit ECAM-natural chunks. Folds the
+endian-pack, absent-detection (VID == 0xFFFF), and ECAM cap into one
+call:
+
+```c
+uint8_t  buf[256] = { 0 };
+size_t   ok       = 0;
+if (axl_pci_dump(addr, buf, sizeof(buf), &ok) == 0) {
+    axl_hexdump(buf, ok, 0);    // dump only the bytes that read OK
+}
+```
+
+Returns `-1` on absent functions (no buffer mutation past zeroed
+unread bytes); `*out_read` reports how many bytes the caller can
+safely consume after a partial dump.
+
 ## Lookups
 
 ```c

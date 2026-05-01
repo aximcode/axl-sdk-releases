@@ -146,7 +146,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Hexdump",
         .help         = "Hex+ASCII file dump",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_hexdump,
     });

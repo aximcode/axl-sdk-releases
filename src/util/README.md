@@ -494,6 +494,39 @@ the user types `do bios flarble`, the error reads
 `do bios: unknown verb 'flarble'`. `do bios --help` recurses into
 the bios subtree's auto-generated help.
 
+### Branch with a default handler
+
+A node can set BOTH `verbs` and `handler` — the handler runs only
+when no sub-verb is supplied. Useful for the `do bios` → "print
+summary" pattern where a category has subverbs but also wants a
+default action:
+
+```c
+static const AxlArgsNode bios_verbs[] = {
+    { .name = "info", .handler = bios_info, .help = "Type 0 summary" },
+    { .name = "test", .handler = bios_test, .help = "Walk every record" },
+    {0}
+};
+
+static const AxlArgsNode bios_node = {
+    .name    = "bios",
+    .help    = "BIOS / SMBIOS subcommands",
+    .verbs   = bios_verbs,
+    .handler = bios_info,    // fires on 'do bios' with no sub-verb
+};
+```
+
+Dispatch is unambiguous: a verb argument that matches a child
+recurses into it; a verb argument that matches none errors as
+`do bios: unknown verb 'flarble'` (the handler is **not** a
+catch-all); no verb argument at all invokes the handler with the
+branch's parsed flags. Branch+handler nodes still cannot have
+positionals — the first non-flag is structurally the verb name.
+
+In `do bios --help` output, the verb whose handler matches the
+default is annotated `(default)` so users see which sub-verb the
+no-arg form is equivalent to.
+
 ### Parent-flag visibility
 
 Flags declared on a parent node are visible to descendant handlers

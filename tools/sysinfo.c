@@ -494,7 +494,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "SysInfo",
         .help         = "Print system information (CPU, memory, firmware, SMBIOS, arch)",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = section,
         .handler      = run_sysinfo,
     });

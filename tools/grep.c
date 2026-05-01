@@ -258,7 +258,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Grep",
         .help         = "Search file(s) for a pattern (UNIX grep-style)",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_grep,
     });

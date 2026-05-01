@@ -496,7 +496,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "dmidecode",
         .help         = "Decode SMBIOS / DMI tables (Linux dmidecode-style)",
-        .flags          = flags,
+        .flags        = flags,
         .handler      = run_dmidecode,
     });
 }

@@ -3,6 +3,82 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.8.1 — 2026-05-01
+
+Backward-compatible polish on top of v0.8.0's AxlArgsNode unification:
+branch nodes can now carry a default handler (the `do bios` →
+"print summary" pattern), AXL_ARG_S64 honors min/max bounds, two
+new generic PCI helpers, and follow-up fixes from the post-v0.8.0
+review.
+
+### Added
+
+- **Branch nodes with a default handler.** A node can now set BOTH
+  `.verbs` AND `.handler`; the handler runs only when no sub-verb
+  is supplied. Useful for the established CLI pattern where a
+  category like `do bios` has subverbs (info, test, pci) but also
+  prints a default summary when invoked alone. Dispatch is
+  unambiguous: matched verb → recurse, unmatched non-flag → error
+  ("unknown verb"; the handler is not a catch-all), no non-flag
+  args → handler with parsed branch flags. `--help` still wins
+  at every level. Help output annotates the verb whose handler
+  matches the default with `(default)` so users see which sub-verb
+  the no-arg form is equivalent to.
+- **`axl_pci_dump(addr, buf, bytes, *out_read)`** — single-call
+  PCI config-space dump. Reads up to 4096 bytes (PCIe ECAM cap)
+  in 32-bit chunks; folds endian-pack, absent-detection (VID ==
+  0xFFFF at offset 0), and ECAM cap into one call. Replaces the
+  per-tool hand-rolled `for (reg = 0; reg + 4 <= bytes; reg += 4)
+  read32; pack into buf` loop.
+- **`axl_pci_class_string(class24, buf, buflen)`** — decode the
+  24-bit PCI class code to a human string per the PCI Code and
+  ID Assignment Spec. Output shape: `"<base> / <sub> / <prog>"`
+  (e.g. `"Serial bus controller / USB / xHCI"`). ~140 LOC of
+  static lookup tables; vendor/device-name lookup intentionally
+  out of scope (pci.ids is too large for AXL).
+- **`AXL_ARG_S64` min/max enforcement.** Pre-existing v0.7.x gap
+  closed: U8/U16/U32/U64 enforced bounds but S64 silently
+  accepted any in-type value. Same independent-bound check (each
+  0 = no bound) with int64 cast — for negative lower bounds the
+  descriptor sets `.min = (uint64_t)(int64_t)-N`, two's-complement
+  round-tripped via the cast. Documented in `AxlArgDesc`.
+
+### Changed
+
+- **Documented vendor-naming policy** in `docs/AXL-Coding-Style.md`.
+  AXL is hardware-vendor-agnostic at its public API surface (no
+  `axl_dell_*` function names), but vendor-named files
+  (`axl-ipmi-dell.c`) and vendor-named enum values
+  (`AXL_IPMI_TRANSPORT_DELL`) / probe-struct fields are explicitly
+  allowed where they describe vendor-specific external state.
+  Codifies existing convention; no code changes.
+
+### Fixed
+
+- **Two nested-args tests no longer pass trivially.** Post-v0.8.0
+  review found `test_args_nested_unknown_verb_at_branch` and
+  `test_args_nested_branch_help_lists_subverbs` only asserted
+  `rc + handler-not-called`; nothing verified the breadcrumb
+  appeared in the error message or that help listed the right
+  subverbs. Both now swap `axl_stdout` for an `axl_bufopen()`
+  in-memory stream during the test and assert on captured bytes.
+- **Whitespace alignment in 11 tools.** The earlier
+  `.global_flags` → `.flags` sed left a 10-space indent that
+  diverged from the 8-space sibling alignment. Tightened.
+
+### Compatibility
+
+Backward-compatible with v0.8.0:
+
+- Branches without a default handler keep the v0.8.0 "show help
+  on no-verb" behavior (regression-tested).
+- Consumers that previously got the leaf+branch config error
+  now silently work — additive, not breaking. Note: a consumer
+  who *relied* on that error to catch an accidental
+  handler-pasted-onto-branch programming mistake loses that
+  signal; if you depend on validation-as-lint, audit branch
+  nodes after upgrade.
+
 ## 0.8.0 — 2026-05-01
 
 Source-incompatible AxlArgs unification: the dual `AxlArgsApp` /

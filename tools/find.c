@@ -195,7 +195,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Find",
         .help         = "Find files and directories (UNIX find-style)",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_find,
     });

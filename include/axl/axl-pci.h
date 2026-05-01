@@ -129,6 +129,36 @@ axl_pci_write_config_16(AxlPciAddr addr, uint16_t reg, uint16_t value);
 int
 axl_pci_write_config_32(AxlPciAddr addr, uint16_t reg, uint32_t value);
 
+/// Capacity of a function's full PCIe ECAM config space.
+#define AXL_PCI_CONFIG_SPACE_MAX  4096
+
+/**
+ * @brief Read up to @p bytes of PCI configuration space into @p buf.
+ *
+ * Walks the function's config space in 32-bit ECAM-natural chunks
+ * (little-endian on the wire, packed into @p buf at offsets 0..bytes).
+ * @p bytes is rounded down to a multiple of 4 and capped at
+ * @ref AXL_PCI_CONFIG_SPACE_MAX. The function is treated as **absent**
+ * if zero successful reads occur (vendor ID at offset 0x00 reads as
+ * 0xFFFFFFFF) — returns -1 with @c *out_read = 0. On a partial dump
+ * (some reads succeeded, some failed), @c *out_read tracks how many
+ * bytes the caller can safely consume; the remaining buffer bytes are
+ * zeroed.
+ *
+ * Replaces the per-tool hand-rolled `for (reg = 0; reg + 4 <= bytes;
+ * reg += 4) read32; pack into buf` loop.
+ *
+ * @return 0 on success (one or more successful reads), -1 if the
+ *     function is absent or @p buf is NULL or MCFG isn't available.
+ */
+int
+axl_pci_dump(
+    AxlPciAddr   addr,       ///< target function
+    uint8_t     *buf,        ///< destination buffer
+    size_t       bytes,      ///< capacity (rounded down to 4, capped at AXL_PCI_CONFIG_SPACE_MAX)
+    size_t      *out_read    ///< [out, optional] bytes successfully populated
+);
+
 // ---------------------------------------------------------------------------
 // Common header reads (boilerplate-killer wrappers)
 // ---------------------------------------------------------------------------
@@ -164,6 +194,30 @@ int
 axl_pci_get_class24(
     AxlPciAddr   addr,    ///< target function
     uint32_t    *class24  ///< [out] 24-bit class code
+);
+
+/**
+ * @brief Format a 24-bit PCI class code as a human-readable string.
+ *
+ * Decodes per the PCI Code and ID Assignment Specification — three
+ * tiers: base class (`(class24 >> 16) & 0xFF`), subclass
+ * (`(class24 >> 8) & 0xFF`), and programming interface
+ * (`class24 & 0xFF`). Output shape: `"<base> / <sub> / <prog>"`
+ * (e.g. `"Display controller / VGA-compatible / standard"`); a tier
+ * with no recognized name renders as `"<unknown>"`. Always
+ * NUL-terminates @p buf (snprintf-shape).
+ *
+ * Vendor/device-name lookup (the `pci.ids` database) is intentionally
+ * out of scope — too large for AXL, and consumers grep their own.
+ *
+ * @return number of bytes written excluding NUL, or -1 if @p buf is
+ *     NULL or @p buflen is 0.
+ */
+int
+axl_pci_class_string(
+    uint32_t   class24,   ///< 24-bit class code
+    char      *buf,       ///< destination buffer
+    size_t     buflen     ///< capacity of @p buf
 );
 
 // ---------------------------------------------------------------------------

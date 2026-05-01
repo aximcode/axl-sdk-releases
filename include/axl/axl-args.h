@@ -83,6 +83,25 @@
  * }
  * @endcode
  *
+ * **Branch with a default handler** — the `do bios` → "print
+ * summary" pattern. Same node sets BOTH `verbs` and `handler`;
+ * the handler runs only when no sub-verb is supplied.
+ *
+ * @code
+ * static const AxlArgsNode bios_verbs[] = {
+ *     { .name = "info", .handler = bios_info, .help = "Type 0 summary" },
+ *     { .name = "test", .handler = bios_test, .help = "Walk every record" },
+ *     {0}
+ * };
+ *
+ * static const AxlArgsNode bios_node = {
+ *     .name    = "bios",
+ *     .help    = "BIOS / SMBIOS subcommands",
+ *     .verbs   = bios_verbs,
+ *     .handler = bios_info,    // fires when 'do bios' has no sub-verb
+ * };
+ * @endcode
+ *
  * `--help` and `-h` are always recognised and recurse naturally —
  * `do --help` shows the top tree, `do bios --help` shows just the
  * bios subtree. Unknown flags / verbs / out-of-range typed args
@@ -136,7 +155,12 @@ typedef enum {
  * For numeric types (`AXL_ARG_U8`..`AXL_ARG_S64`):
  *  - @c base: 0 (auto-detect 0x prefix), 10, or 16 — passed to the
  *    @ref axl_str_to_u64 family. Default 0 = auto.
- *  - @c min, @c max: inclusive bounds. Both 0 = no bound.
+ *  - @c min, @c max: inclusive bounds. Each independently 0 = no
+ *    bound (so a U8 with `.min = 0, .max = 0xFF` is the same as
+ *    "no bounds at all").
+ *  - For `AXL_ARG_S64` the bounds are cast as `int64_t`. To express
+ *    a negative lower bound, set `.min = (uint64_t)(int64_t)-N` —
+ *    two's complement round-trips through the cast.
  *
  * For positionals: @c short_name and @c default_value are ignored.
  * Position in the array determines argument order. The LAST entry
@@ -210,16 +234,26 @@ typedef void (*AxlPreRunFunc)(AxlArgs *args);
  *     the root program, an inner branch ("category"), and a leaf
  *     verb all use it.
  *
- * A node is exactly one of:
- *   - **Leaf**: `handler` set, `verbs` NULL (or empty). Positionals
- *     and per-leaf flags consumed at this level; handler invoked
- *     once parsing completes.
+ * A node is one of three shapes:
+ *   - **Leaf**: `handler` set, `verbs` NULL. Positionals and
+ *     per-leaf flags consumed at this level; handler invoked once
+ *     parsing completes.
  *   - **Branch**: `verbs` set (NULL-terminated array of child
- *     `AxlArgsNode`s), `handler` NULL. Positionals MUST be NULL on a
- *     branch — the first non-flag argument is the verb name.
+ *     `AxlArgsNode`s), `handler` NULL. Positionals MUST be NULL on
+ *     a branch — the first non-flag argument is the verb name. If
+ *     no verb is supplied, the framework prints `--help`.
+ *   - **Branch + default handler**: `verbs` AND `handler` both set.
+ *     Same dispatch as Branch when the user supplies a verb;
+ *     when no verb is supplied (just branch-level flags or no
+ *     args at all), `handler` runs as the no-verb default. Useful
+ *     for the `do bios` → "print summary" pattern (`bios` has
+ *     subverbs but defaults to a summary action). Positionals
+ *     still MUST be NULL — the handler runs with parsed flags
+ *     only. An unknown verb still errors; the handler is not a
+ *     catch-all.
  *
- * A node with both, or neither, is a configuration error and the
- * parser exits non-zero before invoking anything.
+ * A node with neither `handler` nor `verbs` is a configuration
+ * error and the parser exits non-zero before invoking anything.
  *
  * Designated initializers expected; zero defaults are sane.
  */

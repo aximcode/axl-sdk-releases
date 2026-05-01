@@ -359,6 +359,398 @@ axl_pci_get_class24(AxlPciAddr addr, uint32_t *class24)
 }
 
 // ---------------------------------------------------------------------------
+// PCI class triplet → human string
+// Tables sourced from the PCI Code and ID Assignment Specification.
+// Linear search (tables are tiny; lookup is human-facing print).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint8_t      base;
+    const char  *name;
+} PciBaseEntry;
+
+typedef struct {
+    uint8_t      base;
+    uint8_t      sub;
+    const char  *name;
+} PciSubEntry;
+
+typedef struct {
+    uint8_t      base;
+    uint8_t      sub;
+    uint8_t      prog;
+    const char  *name;
+} PciProgEntry;
+
+static const PciBaseEntry pci_base_table[] = {
+    { 0x00, "Unclassified" },
+    { 0x01, "Mass storage controller" },
+    { 0x02, "Network controller" },
+    { 0x03, "Display controller" },
+    { 0x04, "Multimedia controller" },
+    { 0x05, "Memory controller" },
+    { 0x06, "Bridge" },
+    { 0x07, "Simple communication controller" },
+    { 0x08, "Base system peripheral" },
+    { 0x09, "Input device controller" },
+    { 0x0A, "Docking station" },
+    { 0x0B, "Processor" },
+    { 0x0C, "Serial bus controller" },
+    { 0x0D, "Wireless controller" },
+    { 0x0E, "Intelligent controller" },
+    { 0x0F, "Satellite communication controller" },
+    { 0x10, "Encryption controller" },
+    { 0x11, "Signal processing controller" },
+    { 0x12, "Processing accelerator" },
+    { 0x13, "Non-essential instrumentation function" },
+    { 0x40, "Co-processor" },
+    { 0xFF, "Unassigned class (vendor-specific)" },
+};
+
+static const PciSubEntry pci_sub_table[] = {
+    /* 0x00: Unclassified */
+    { 0x00, 0x00, "Non-VGA" },
+    { 0x00, 0x01, "VGA-compatible" },
+    /* 0x01: Mass storage controller */
+    { 0x01, 0x00, "SCSI" },
+    { 0x01, 0x01, "IDE" },
+    { 0x01, 0x02, "Floppy" },
+    { 0x01, 0x03, "IPI" },
+    { 0x01, 0x04, "RAID" },
+    { 0x01, 0x05, "ATA" },
+    { 0x01, 0x06, "SATA" },
+    { 0x01, 0x07, "SAS" },
+    { 0x01, 0x08, "Non-volatile memory" },
+    { 0x01, 0x09, "UFS" },
+    { 0x01, 0x80, "Other" },
+    /* 0x02: Network controller */
+    { 0x02, 0x00, "Ethernet" },
+    { 0x02, 0x01, "Token Ring" },
+    { 0x02, 0x02, "FDDI" },
+    { 0x02, 0x03, "ATM" },
+    { 0x02, 0x04, "ISDN" },
+    { 0x02, 0x05, "WorldFip" },
+    { 0x02, 0x06, "PICMG" },
+    { 0x02, 0x07, "InfiniBand" },
+    { 0x02, 0x08, "Fabric" },
+    { 0x02, 0x80, "Other" },
+    /* 0x03: Display controller */
+    { 0x03, 0x00, "VGA-compatible" },
+    { 0x03, 0x01, "XGA" },
+    { 0x03, 0x02, "3D" },
+    { 0x03, 0x80, "Other" },
+    /* 0x04: Multimedia */
+    { 0x04, 0x00, "Video" },
+    { 0x04, 0x01, "Audio" },
+    { 0x04, 0x02, "Telephony" },
+    { 0x04, 0x03, "HD Audio" },
+    { 0x04, 0x80, "Other" },
+    /* 0x05: Memory */
+    { 0x05, 0x00, "RAM" },
+    { 0x05, 0x01, "Flash" },
+    { 0x05, 0x02, "CXL" },
+    { 0x05, 0x80, "Other" },
+    /* 0x06: Bridge */
+    { 0x06, 0x00, "Host bridge" },
+    { 0x06, 0x01, "ISA bridge" },
+    { 0x06, 0x02, "EISA bridge" },
+    { 0x06, 0x03, "MicroChannel bridge" },
+    { 0x06, 0x04, "PCI-to-PCI bridge" },
+    { 0x06, 0x05, "PCMCIA bridge" },
+    { 0x06, 0x06, "NuBus bridge" },
+    { 0x06, 0x07, "CardBus bridge" },
+    { 0x06, 0x08, "RACEway bridge" },
+    { 0x06, 0x09, "Semi-transparent PCI-to-PCI bridge" },
+    { 0x06, 0x0A, "InfiniBand-to-PCI bridge" },
+    { 0x06, 0x0B, "Advanced switching bridge" },
+    { 0x06, 0x80, "Other" },
+    /* 0x07: Simple comm */
+    { 0x07, 0x00, "Serial" },
+    { 0x07, 0x01, "Parallel" },
+    { 0x07, 0x02, "Multiport serial" },
+    { 0x07, 0x03, "Modem" },
+    { 0x07, 0x04, "GPIB" },
+    { 0x07, 0x05, "Smart card" },
+    { 0x07, 0x80, "Other" },
+    /* 0x08: Base system peripheral */
+    { 0x08, 0x00, "PIC" },
+    { 0x08, 0x01, "DMA" },
+    { 0x08, 0x02, "Timer" },
+    { 0x08, 0x03, "RTC" },
+    { 0x08, 0x04, "PCI hot-plug" },
+    { 0x08, 0x05, "SD host" },
+    { 0x08, 0x06, "IOMMU" },
+    { 0x08, 0x07, "RC event collector" },
+    { 0x08, 0x80, "Other" },
+    /* 0x09: Input */
+    { 0x09, 0x00, "Keyboard" },
+    { 0x09, 0x01, "Pen" },
+    { 0x09, 0x02, "Mouse" },
+    { 0x09, 0x03, "Scanner" },
+    { 0x09, 0x04, "Gameport" },
+    { 0x09, 0x80, "Other" },
+    /* 0x0A: Docking */
+    { 0x0A, 0x00, "Generic" },
+    { 0x0A, 0x80, "Other" },
+    /* 0x0B: Processor */
+    { 0x0B, 0x00, "386" },
+    { 0x0B, 0x01, "486" },
+    { 0x0B, 0x02, "Pentium" },
+    { 0x0B, 0x10, "Alpha" },
+    { 0x0B, 0x20, "PowerPC" },
+    { 0x0B, 0x30, "MIPS" },
+    { 0x0B, 0x40, "Co-processor" },
+    { 0x0B, 0x80, "Other" },
+    /* 0x0C: Serial bus */
+    { 0x0C, 0x00, "FireWire" },
+    { 0x0C, 0x01, "ACCESS.bus" },
+    { 0x0C, 0x02, "SSA" },
+    { 0x0C, 0x03, "USB" },
+    { 0x0C, 0x04, "Fibre Channel" },
+    { 0x0C, 0x05, "SMBus" },
+    { 0x0C, 0x06, "InfiniBand" },
+    { 0x0C, 0x07, "IPMI" },
+    { 0x0C, 0x08, "SERCOS" },
+    { 0x0C, 0x09, "CANbus" },
+    { 0x0C, 0x0A, "MIPI I3C" },
+    { 0x0C, 0x80, "Other" },
+    /* 0x0D: Wireless */
+    { 0x0D, 0x00, "iRDA" },
+    { 0x0D, 0x01, "Consumer IR" },
+    { 0x0D, 0x10, "RF" },
+    { 0x0D, 0x11, "Bluetooth" },
+    { 0x0D, 0x12, "Broadband" },
+    { 0x0D, 0x20, "802.11a" },
+    { 0x0D, 0x21, "802.11b" },
+    { 0x0D, 0x40, "Cellular" },
+    { 0x0D, 0x41, "Cellular + Ethernet" },
+    { 0x0D, 0x80, "Other" },
+    /* 0x0E: Intelligent */
+    { 0x0E, 0x00, "I2O" },
+    /* 0x0F: Satellite comm */
+    { 0x0F, 0x01, "TV" },
+    { 0x0F, 0x02, "Audio" },
+    { 0x0F, 0x03, "Voice" },
+    { 0x0F, 0x04, "Data" },
+    /* 0x10: Encryption */
+    { 0x10, 0x00, "Network and computing" },
+    { 0x10, 0x10, "Entertainment" },
+    { 0x10, 0x80, "Other" },
+    /* 0x11: Signal processing */
+    { 0x11, 0x00, "DPIO" },
+    { 0x11, 0x01, "Performance counter" },
+    { 0x11, 0x10, "Communication synchronizer" },
+    { 0x11, 0x20, "Signal processing management" },
+    { 0x11, 0x80, "Other" },
+};
+
+/* Programming interfaces for the subclasses where they're commonly
+   meaningful (USB host controller flavor, IDE/SATA/NVMe, serial UART
+   variants, etc.). Tools that don't recognize prog_if just see the
+   subclass name and "<unknown>" prog. */
+static const PciProgEntry pci_prog_table[] = {
+    /* IDE 01:01 */
+    { 0x01, 0x01, 0x00, "ISA-compat" },
+    { 0x01, 0x01, 0x05, "PCI-native" },
+    { 0x01, 0x01, 0x0A, "ISA-compat (mode-sw)" },
+    { 0x01, 0x01, 0x0F, "PCI-native (mode-sw)" },
+    { 0x01, 0x01, 0x80, "ISA-compat + bus-master" },
+    { 0x01, 0x01, 0x85, "PCI-native + bus-master" },
+    { 0x01, 0x01, 0x8A, "ISA-compat (mode-sw) + bus-master" },
+    { 0x01, 0x01, 0x8F, "PCI-native (mode-sw) + bus-master" },
+    /* SATA 01:06 */
+    { 0x01, 0x06, 0x00, "vendor-specific" },
+    { 0x01, 0x06, 0x01, "AHCI 1.0" },
+    { 0x01, 0x06, 0x02, "Serial Storage Bus" },
+    /* SAS 01:07 */
+    { 0x01, 0x07, 0x00, "SAS" },
+    { 0x01, 0x07, 0x01, "Serial Storage Bus" },
+    /* NVM 01:08 */
+    { 0x01, 0x08, 0x01, "NVMHCI" },
+    { 0x01, 0x08, 0x02, "NVMe" },
+    { 0x01, 0x08, 0x03, "NVMe Mgmt I/F" },
+    /* Display VGA 03:00 */
+    { 0x03, 0x00, 0x00, "standard" },
+    { 0x03, 0x00, 0x01, "8514-compatible" },
+    /* Bridge PCI-to-PCI 06:04 */
+    { 0x06, 0x04, 0x00, "normal decode" },
+    { 0x06, 0x04, 0x01, "subtractive decode" },
+    /* Bridge RACEway 06:08 */
+    { 0x06, 0x08, 0x00, "transparent" },
+    { 0x06, 0x08, 0x01, "endpoint" },
+    /* Bridge semi-transparent 06:09 */
+    { 0x06, 0x09, 0x40, "primary toward host" },
+    { 0x06, 0x09, 0x80, "secondary toward host" },
+    /* Serial UART 07:00 */
+    { 0x07, 0x00, 0x00, "8250" },
+    { 0x07, 0x00, 0x01, "16450" },
+    { 0x07, 0x00, 0x02, "16550" },
+    { 0x07, 0x00, 0x03, "16650" },
+    { 0x07, 0x00, 0x04, "16750" },
+    { 0x07, 0x00, 0x05, "16850" },
+    { 0x07, 0x00, 0x06, "16950" },
+    /* Parallel 07:01 */
+    { 0x07, 0x01, 0x00, "SPP" },
+    { 0x07, 0x01, 0x01, "bidirectional" },
+    { 0x07, 0x01, 0x02, "ECP 1.X" },
+    { 0x07, 0x01, 0x03, "IEEE 1284" },
+    { 0x07, 0x01, 0xFE, "IEEE 1284 target" },
+    /* Modem 07:03 */
+    { 0x07, 0x03, 0x00, "generic" },
+    { 0x07, 0x03, 0x01, "Hayes 16450" },
+    { 0x07, 0x03, 0x02, "Hayes 16550" },
+    { 0x07, 0x03, 0x03, "Hayes 16650" },
+    { 0x07, 0x03, 0x04, "Hayes 16750" },
+    /* PIC 08:00 */
+    { 0x08, 0x00, 0x00, "8259" },
+    { 0x08, 0x00, 0x01, "ISA PIC" },
+    { 0x08, 0x00, 0x02, "EISA PIC" },
+    { 0x08, 0x00, 0x10, "I/O APIC" },
+    { 0x08, 0x00, 0x20, "I/O x2APIC" },
+    /* DMA 08:01 */
+    { 0x08, 0x01, 0x00, "8237" },
+    { 0x08, 0x01, 0x01, "ISA" },
+    { 0x08, 0x01, 0x02, "EISA" },
+    /* Timer 08:02 */
+    { 0x08, 0x02, 0x00, "8254" },
+    { 0x08, 0x02, 0x01, "ISA" },
+    { 0x08, 0x02, 0x02, "EISA" },
+    { 0x08, 0x02, 0x03, "HPET" },
+    /* RTC 08:03 */
+    { 0x08, 0x03, 0x00, "generic" },
+    { 0x08, 0x03, 0x01, "ISA" },
+    /* Keyboard 09:00 — none */
+    /* USB 0C:03 */
+    { 0x0C, 0x03, 0x00, "UHCI" },
+    { 0x0C, 0x03, 0x10, "OHCI" },
+    { 0x0C, 0x03, 0x20, "EHCI" },
+    { 0x0C, 0x03, 0x30, "xHCI" },
+    { 0x0C, 0x03, 0x40, "USB4" },
+    { 0x0C, 0x03, 0x80, "unspecified" },
+    { 0x0C, 0x03, 0xFE, "USB device (not host)" },
+    /* IPMI 0C:07 */
+    { 0x0C, 0x07, 0x00, "SMIC" },
+    { 0x0C, 0x07, 0x01, "Keyboard Controller Style" },
+    { 0x0C, 0x07, 0x02, "Block Transfer" },
+};
+
+static const char *
+lookup_base(uint8_t base)
+{
+    for (size_t i = 0; i < sizeof(pci_base_table) / sizeof(pci_base_table[0]); i++) {
+        if (pci_base_table[i].base == base) {
+            return pci_base_table[i].name;
+        }
+    }
+    return "<unknown>";
+}
+
+static const char *
+lookup_sub(uint8_t base, uint8_t sub)
+{
+    for (size_t i = 0; i < sizeof(pci_sub_table) / sizeof(pci_sub_table[0]); i++) {
+        if (pci_sub_table[i].base == base && pci_sub_table[i].sub == sub) {
+            return pci_sub_table[i].name;
+        }
+    }
+    return "<unknown>";
+}
+
+static const char *
+lookup_prog(uint8_t base, uint8_t sub, uint8_t prog)
+{
+    for (size_t i = 0; i < sizeof(pci_prog_table) / sizeof(pci_prog_table[0]); i++) {
+        if (pci_prog_table[i].base == base
+            && pci_prog_table[i].sub == sub
+            && pci_prog_table[i].prog == prog)
+        {
+            return pci_prog_table[i].name;
+        }
+    }
+    return "<unknown>";
+}
+
+int
+axl_pci_class_string(uint32_t class24, char *buf, size_t buflen)
+{
+    if (buf == NULL || buflen == 0) {
+        return -1;
+    }
+    uint8_t base = (uint8_t)((class24 >> 16) & 0xFFu);
+    uint8_t sub  = (uint8_t)((class24 >>  8) & 0xFFu);
+    uint8_t prog = (uint8_t)( class24        & 0xFFu);
+    return axl_snprintf(buf, buflen, "%s / %s / %s",
+                        lookup_base(base),
+                        lookup_sub(base, sub),
+                        lookup_prog(base, sub, prog));
+}
+
+int
+axl_pci_dump(
+    AxlPciAddr   addr,
+    uint8_t     *buf,
+    size_t       bytes,
+    size_t      *out_read
+    )
+{
+    if (out_read != NULL) {
+        *out_read = 0;
+    }
+    if (buf == NULL) {
+        return -1;
+    }
+    /* Cap at PCIe ECAM extent and round down to 32-bit alignment. */
+    if (bytes > AXL_PCI_CONFIG_SPACE_MAX) {
+        bytes = AXL_PCI_CONFIG_SPACE_MAX;
+    }
+    bytes &= ~(size_t)0x3u;
+    if (bytes == 0) {
+        return -1;
+    }
+
+    /* Absent-function check first. ECAM reads of an unmapped address
+       quietly return 0xFFFFFFFF (the bus-level "no device" sentinel)
+       rather than a hard error, so the read alone can't distinguish
+       absent from present. The standard absent-detection idiom: VID
+       at offset 0x00 reads as 0xFFFF (i.e. low 16 bits of word 0 are
+       all-ones). */
+    uint32_t word0;
+    if (axl_pci_read_config_32(addr, 0, &word0) != 0
+        || (word0 & 0xFFFFu) == 0xFFFFu)
+    {
+        return -1;
+    }
+
+    size_t   ok_bytes = 0;
+    uint16_t reg;
+    for (reg = 0; (size_t)reg + 4u <= bytes; reg = (uint16_t)(reg + 4)) {
+        uint32_t v = (reg == 0) ? word0 : 0;
+        if (reg == 0 || axl_pci_read_config_32(addr, reg, &v) == 0) {
+            buf[reg + 0] = (uint8_t)(v        & 0xFFu);
+            buf[reg + 1] = (uint8_t)((v >> 8) & 0xFFu);
+            buf[reg + 2] = (uint8_t)((v >> 16) & 0xFFu);
+            buf[reg + 3] = (uint8_t)((v >> 24) & 0xFFu);
+            ok_bytes = (size_t)reg + 4u;
+        } else {
+            /* Defense-in-depth: after the VID check above, ECAM reads
+               on the same function should not fail (axl_pci_read_config_32
+               only errors on NULL-out or NULL-ecam_ptr). Keep the zero
+               anyway so a future change to the read path can't leak
+               stale buf bytes past out_read. */
+            buf[reg + 0] = 0;
+            buf[reg + 1] = 0;
+            buf[reg + 2] = 0;
+            buf[reg + 3] = 0;
+        }
+    }
+
+    if (out_read != NULL) {
+        *out_read = ok_bytes;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Enumeration
 // ---------------------------------------------------------------------------
 

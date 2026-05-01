@@ -333,6 +333,23 @@ parse_typed(ParsedArg *slot, const char *value, const char *path)
                           path, value != NULL ? value : "(missing)", d->name);
                 return false;
             }
+            /* Reuse the uint64 min/max fields cast as int64. Same
+               "0 = no bound" convention as the unsigned variants —
+               for negative lower bounds, the descriptor sets
+               .min = (uint64_t)(int64_t)-N which round-trips via
+               two's complement. */
+            int64_t s_min = (int64_t)d->min;
+            int64_t s_max = (int64_t)d->max;
+            if (d->min != 0 && v < s_min) {
+                axl_print("%s: '%s' for --%s is below min %lld\n",
+                          path, value, d->name, (long long)s_min);
+                return false;
+            }
+            if (d->max != 0 && v > s_max) {
+                axl_print("%s: '%s' for --%s exceeds max %lld\n",
+                          path, value, d->name, (long long)s_max);
+                return false;
+            }
             slot->int_value  = v;
             slot->str_value  = value;
             slot->set = true;
@@ -391,13 +408,27 @@ print_help_for(const AxlArgsNode *node, const char *path)
 
     if (node_is_branch(node)) {
         axl_print("Usage: %s [flags] <verb> [args]\n", path);
+        if (node_is_leaf(node)) {
+            axl_print("       %s [flags]"
+                      "                "
+                      "(no verb runs the default handler)\n",
+                      path);
+        }
         axl_print("\nVerbs:\n");
         for (int i = 0; node->verbs[i].name != NULL; i++) {
             const char *marker = node_is_branch(&node->verbs[i]) ? "*" : " ";
-            axl_print("  %s %-12s  %s\n",
-                      marker,
-                      node->verbs[i].name,
-                      node->verbs[i].help != NULL ? node->verbs[i].help : "");
+            const char *help = node->verbs[i].help != NULL
+                               ? node->verbs[i].help : "";
+            bool is_default = (node_is_leaf(node)
+                               && node->verbs[i].handler != NULL
+                               && node->verbs[i].handler == node->handler);
+            if (is_default) {
+                axl_print("  %s %-12s  %s (default)\n",
+                          marker, node->verbs[i].name, help);
+            } else {
+                axl_print("  %s %-12s  %s\n",
+                          marker, node->verbs[i].name, help);
+            }
         }
         axl_print("\n  (* indicates a verb with sub-verbs; "
                   "run `<verb> --help` for details)\n");
@@ -647,10 +678,14 @@ validate_node_shape(const AxlArgsNode *node, const char *path)
 {
     bool leaf   = node_is_leaf(node);
     bool branch = node_is_branch(node);
-    if (leaf && branch) {
-        axl_print("%s: misconfigured (set verbs OR handler, not both)\n", path);
-        return false;
-    }
+    /* leaf, branch, and leaf+branch are all valid:
+       - leaf only: a normal handler-bearing terminal node.
+       - branch only: a category that always requires a sub-verb.
+       - branch + leaf: a category whose handler is the no-verb
+         default ("do bios" with no further verb invokes the
+         handler with parsed branch-level flags). The first non-
+         flag still must match a verb; only the no-verb path
+         falls through to the default handler. */
     if (!leaf && !branch) {
         axl_print("%s: misconfigured (no verbs and no handler)\n", path);
         return false;
@@ -752,15 +787,22 @@ args_run_internal(int argc, char **argv,
         i++;
     }
 
-    /* Branch with no verb supplied → show help. */
-    if (node_is_branch(node) && next_branch == NULL) {
+    /* Branch with no verb supplied:
+       - if the branch has a default handler (branch + leaf shape),
+         fall through to invoke it with parsed branch-level flags;
+       - otherwise show help and exit. */
+    if (node_is_branch(node) && next_branch == NULL && !node_is_leaf(node)) {
         print_help_for(node, path_buf);
         free_args(a);
         return 1;
     }
 
-    /* Leaf: validate required positionals before invoking handler. */
-    if (node_is_leaf(node) && validate_required(a) != 0) {
+    /* Leaf: validate required positionals before invoking handler.
+       (A branch with default handler has no positionals — guarded
+       by validate_node_shape — so this only runs for true leaves.) */
+    if (node_is_leaf(node) && !node_is_branch(node)
+        && validate_required(a) != 0)
+    {
         parse_error = true;
         rc = 1;
         goto out;
@@ -777,7 +819,7 @@ args_run_internal(int argc, char **argv,
         rc = args_run_internal(next_argc, next_argv, next_branch,
                                path_buf, a);
     } else {
-        /* Leaf — invoke handler. */
+        /* Leaf, or branch falling through to its default handler. */
         rc = node->handler(a);
     }
 

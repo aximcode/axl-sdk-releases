@@ -316,7 +316,7 @@ main(
     int rc = axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "memspd",
         .help         = "Read JEDEC SPD content from DDR4/DDR5 DIMMs",
-        .flags          = global_flags,
+        .flags        = global_flags,
         .verbs        = verbs,
         .pre_run      = load_jedec_table_from_args,
     });

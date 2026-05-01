@@ -416,7 +416,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "NetInfo",
         .help         = "Network interface inventory and ICMP ping",
-        .flags          = global_flags,
+        .flags        = global_flags,
         .verbs        = verbs,
         .pre_run      = netinfo_pre_run,
     });

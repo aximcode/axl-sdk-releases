@@ -567,7 +567,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "rfbrowse",
         .help         = "Redfish REST API browser",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_rfbrowse,
     });

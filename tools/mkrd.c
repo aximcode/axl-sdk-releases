@@ -669,7 +669,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "MkRd",
         .help         = "Create / list / destroy RAM disks via EFI_RAM_DISK_PROTOCOL",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_mkrd,
     });

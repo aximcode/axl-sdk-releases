@@ -614,7 +614,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "ipmi",
         .help         = "IPMI client — KCS / SSIF / BT transport auto-detect",
-        .flags          = flags,
+        .flags        = flags,
         .verbs        = verbs,
     });
 }

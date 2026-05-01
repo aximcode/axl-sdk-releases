@@ -2557,30 +2557,100 @@ test_args_nested_3level_dispatch(void)
                "nested args: middle-level --scope reachable from deepest leaf");
 }
 
+/* Swap axl_stdout for an in-memory buffer so a test can assert on
+   what the parser printed. Caller pairs with restore_stdout() in the
+   same scope. Returns the saved original to restore. */
+static AxlStream *
+capture_stdout(AxlStream **buf_out)
+{
+    AxlStream *saved = axl_stdout;
+    AxlStream *buf   = axl_bufopen();
+    test_check(buf != NULL, "capture_stdout: bufopen succeeded");
+    axl_stdout = buf;
+    *buf_out = buf;
+    return saved;
+}
+
+static void
+restore_stdout(AxlStream *saved, AxlStream *buf)
+{
+    axl_stdout = saved;
+    if (buf != NULL) {
+        axl_fclose(buf);
+    }
+}
+
+static bool
+buf_contains(AxlStream *buf, const char *needle)
+{
+    size_t        n = 0;
+    const void   *p = axl_bufdata(buf, &n);
+    if (p == NULL || n == 0 || needle == NULL) {
+        return false;
+    }
+    size_t      nl = axl_strlen(needle);
+    if (nl > n) {
+        return false;
+    }
+    const char *bytes = (const char *)p;
+    for (size_t i = 0; i + nl <= n; i++) {
+        if (axl_memcmp(&bytes[i], needle, nl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void
 test_args_nested_unknown_verb_at_branch(void)
 {
-    /* Branch should reject unknown verb at its own level — error
-       message uses the breadcrumb path (verified by NOT running the
-       handler; the breadcrumb itself goes to stdout, not captured
-       here, but the rejection path is exercised). */
+    /* Branch should reject unknown verb at its own level with an
+       error prefixed by the full breadcrumb path. */
     NestedCapture cap = { 0 };
     char *argv[] = { (char *)"do", (char *)"pci", (char *)"flarble" };
+
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
     int rc = run_nested(&cap, 3, argv);
+    bool has_breadcrumb = buf_contains(buf, "do pci: unknown verb");
+    bool has_token      = buf_contains(buf, "flarble");
+    restore_stdout(saved, buf);
+
     test_check(rc != 0, "nested args: unknown verb at branch rejected");
     test_check(cap.calls == 0, "nested args: leaf handler did not run");
+    test_check(cap.deep_calls == 0,
+               "nested args: deep handler did not run on shallow rejection");
+    test_check(has_breadcrumb,
+               "nested args: error message includes 'do pci:' breadcrumb");
+    test_check(has_token,
+               "nested args: error message names the rejected verb");
 }
 
 static void
 test_args_nested_branch_help_lists_subverbs(void)
 {
-    /* `do pci --help` must trigger help at the pci branch level (not
-       run any handler). */
+    /* `do pci --help` triggers help at the pci branch level and the
+       output names the subverbs of that branch (not the root). */
     NestedCapture cap = { 0 };
     char *argv[] = { (char *)"do", (char *)"pci", (char *)"--help" };
+
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
     int rc = run_nested(&cap, 3, argv);
+    bool has_branch_path = buf_contains(buf, "do pci");
+    bool has_subverb     = buf_contains(buf, "read16");
+    bool has_root_only   = buf_contains(buf, "deep");
+    restore_stdout(saved, buf);
+
     test_check(rc == 0, "nested args: --help at branch returns 0");
     test_check(cap.calls == 0, "nested args: --help did not invoke handler");
+    test_check(cap.deep_calls == 0, "nested args: --help did not recurse");
+    test_check(has_branch_path,
+               "nested args: --help output uses branch breadcrumb");
+    test_check(has_subverb,
+               "nested args: --help output lists branch's subverb 'read16'");
+    test_check(!has_root_only,
+               "nested args: --help at branch does NOT list root-only verbs");
 }
 
 static void
@@ -2598,6 +2668,223 @@ test_args_nested_misconfigured_node_rejected(void)
     char *argv[] = { (char *)"argstest" };
     int rc = axl_args_run(1, argv, &bad);
     test_check(rc != 0, "nested args: handler-less + verb-less node rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Branch + default handler — `do bios` with no sub-verb runs handler
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int          default_calls;     /* incremented when default fires */
+    int          info_calls;        /* incremented when info verb fires */
+    int          test_calls;        /* incremented when test verb fires */
+    bool         saw_branch_flag;   /* did handler see --quiet from branch level */
+} BranchDefaultCapture;
+
+static int
+bdh_info(AxlArgs *a)
+{
+    BranchDefaultCapture *cap = (BranchDefaultCapture *)axl_args_user_data(a);
+    cap->info_calls++;
+    cap->default_calls++;   /* same fn doubles as default — count both */
+    cap->saw_branch_flag = axl_args_get_bool(a, "quiet");
+    return 0;
+}
+
+static int
+bdh_test(AxlArgs *a)
+{
+    BranchDefaultCapture *cap = (BranchDefaultCapture *)axl_args_user_data(a);
+    cap->test_calls++;
+    return 0;
+}
+
+static const AxlArgsNode bdh_bios_verbs[] = {
+    { .name = "info", .handler = bdh_info, .help = "Type 0 summary" },
+    { .name = "test", .handler = bdh_test, .help = "walk records" },
+    {0}
+};
+static const AxlArgDesc bdh_bios_flags[] = {
+    { .name = "quiet", .short_name = 'q', .type = AXL_ARG_BOOL,
+      .help = "suppress per-record progress" },
+    {0}
+};
+static const AxlArgsNode bdh_top_verbs[] = {
+    /* `bios` is a branch with sub-verbs AND a default handler. */
+    { .name = "bios", .verbs = bdh_bios_verbs, .flags = bdh_bios_flags,
+      .handler = bdh_info, .help = "BIOS / SMBIOS subcommands" },
+    {0}
+};
+
+static int
+run_bdh(BranchDefaultCapture *cap, int argc, char **argv)
+{
+    AxlArgsNode root = {
+        .name      = "do",
+        .help      = "branch+default test root",
+        .verbs     = bdh_top_verbs,
+        .user_data = cap,
+    };
+    return axl_args_run(argc, argv, &root);
+}
+
+static void
+test_args_branch_default_fires_on_no_verb(void)
+{
+    /* `do bios` with no further verb invokes the default handler.
+       info_calls AND default_calls both go up because the same fn
+       is referenced as both the explicit verb and the default. */
+    BranchDefaultCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"bios" };
+    int rc = run_bdh(&cap, 2, argv);
+    test_check(rc == 0,
+               "branch+default: 'do bios' with no sub-verb returns 0");
+    test_check(cap.default_calls == 1,
+               "branch+default: default handler fired once");
+    test_check(cap.test_calls == 0,
+               "branch+default: unrelated sub-verb handler did NOT fire");
+}
+
+static void
+test_args_branch_default_subverb_still_recurses(void)
+{
+    /* Explicit sub-verb still recurses normally; default handler
+       does NOT also fire. */
+    BranchDefaultCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"bios", (char *)"test" };
+    int rc = run_bdh(&cap, 3, argv);
+    test_check(rc == 0, "branch+default: explicit sub-verb returns 0");
+    test_check(cap.test_calls == 1,
+               "branch+default: 'test' verb fired");
+    test_check(cap.info_calls == 0,
+               "branch+default: default 'info' did NOT fire when verb supplied");
+}
+
+static void
+test_args_branch_default_unknown_verb_still_errors(void)
+{
+    /* Unknown sub-verb is still an error — default handler is NOT
+       a catch-all. */
+    BranchDefaultCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"bios", (char *)"flarble" };
+
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
+    int rc = run_bdh(&cap, 3, argv);
+    bool has_breadcrumb = buf_contains(buf, "do bios: unknown verb");
+    restore_stdout(saved, buf);
+
+    test_check(rc != 0,
+               "branch+default: unknown sub-verb still rejected");
+    test_check(cap.default_calls == 0 && cap.test_calls == 0,
+               "branch+default: no handler fired on unknown verb");
+    test_check(has_breadcrumb,
+               "branch+default: error message uses branch breadcrumb");
+}
+
+static void
+test_args_branch_default_sees_branch_flags(void)
+{
+    /* --quiet declared on the bios branch must reach the default
+       handler when no sub-verb is supplied. */
+    BranchDefaultCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"bios", (char *)"-q" };
+    int rc = run_bdh(&cap, 3, argv);
+    test_check(rc == 0,
+               "branch+default: branch-level flags before default OK");
+    test_check(cap.default_calls == 1,
+               "branch+default: default fired with branch flags");
+    test_check(cap.saw_branch_flag,
+               "branch+default: handler saw --quiet from branch level");
+}
+
+static void
+test_args_branch_no_handler_still_shows_help(void)
+{
+    /* Regression: a branch WITHOUT a default handler keeps the
+       v0.8.0 behavior of showing help on no-verb. */
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"pci" };
+
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
+    int rc = run_nested(&cap, 2, argv);
+    bool has_help = buf_contains(buf, "Verbs:");
+    restore_stdout(saved, buf);
+
+    test_check(rc != 0,
+               "branch (no handler): no-verb returns non-zero");
+    test_check(cap.calls == 0,
+               "branch (no handler): no handler invoked");
+    test_check(has_help,
+               "branch (no handler): help output emitted");
+}
+
+static int
+s64_capture_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_uint = (uint64_t)axl_args_get_int(a, "value");
+    return 0;
+}
+
+static void
+test_args_s64_bounds(void)
+{
+    /* AXL_ARG_S64 as a FLAG with bounds in [-10, 10]. Flag form
+       is used (rather than a positional) because a bare negative
+       literal "-5" would be parsed as a short-flag prefix; the
+       --value=N form sidesteps that pre-existing limitation. The
+       negative lower bound goes via two's-complement cast — same
+       convention as documented on AxlArgDesc. */
+    static const AxlArgDesc s64_flags[] = {
+        { .name = "value", .type = AXL_ARG_S64,
+          .min = (uint64_t)(int64_t)-10, .max = 10,
+          .help = "signed value in [-10, 10]" },
+        {0}
+    };
+
+    ArgsCapture cap;
+    AxlArgsNode app = {
+        .name      = "argstest",
+        .help      = "S64 bounds test",
+        .flags     = s64_flags,
+        .handler   = s64_capture_handler,
+        .user_data = &cap,
+    };
+
+    /* In-bounds positive value accepted. */
+    cap = (ArgsCapture){0};
+    char *argv_ok[] = { (char *)"argstest", (char *)"--value=5" };
+    test_check(axl_args_run(2, argv_ok, &app) == 0,
+               "args S64: in-bounds value (5) accepted");
+    test_check(cap.calls == 1 && (int64_t)cap.seen_uint == 5,
+               "args S64: handler saw value 5");
+
+    /* In-bounds negative also accepted. */
+    cap = (ArgsCapture){0};
+    char *argv_neg[] = { (char *)"argstest", (char *)"--value=-5" };
+    test_check(axl_args_run(2, argv_neg, &app) == 0,
+               "args S64: in-bounds negative (-5) accepted");
+    test_check(cap.calls == 1 && (int64_t)cap.seen_uint == -5,
+               "args S64: handler saw value -5 via --value=-N");
+
+    /* Below min rejected. */
+    cap = (ArgsCapture){0};
+    char *argv_low[] = { (char *)"argstest", (char *)"--value=-20" };
+    test_check(axl_args_run(2, argv_low, &app) != 0,
+               "args S64: below min (-20 < -10) rejected");
+    test_check(cap.calls == 0,
+               "args S64: handler did not run on below-min");
+
+    /* Above max rejected. */
+    cap = (ArgsCapture){0};
+    char *argv_high[] = { (char *)"argstest", (char *)"--value=50" };
+    test_check(axl_args_run(2, argv_high, &app) != 0,
+               "args S64: above max (50 > 10) rejected");
+    test_check(cap.calls == 0,
+               "args S64: handler did not run on above-max");
 }
 
 static void
@@ -2621,6 +2908,12 @@ test_args(void)
     test_args_nested_unknown_verb_at_branch();
     test_args_nested_branch_help_lists_subverbs();
     test_args_nested_misconfigured_node_rejected();
+    test_args_s64_bounds();
+    test_args_branch_default_fires_on_no_verb();
+    test_args_branch_default_subverb_still_recurses();
+    test_args_branch_default_unknown_verb_still_errors();
+    test_args_branch_default_sees_branch_flags();
+    test_args_branch_no_handler_still_shows_help();
 }
 
 // ---------------------------------------------------------------------------

@@ -88,11 +88,44 @@ interop (e.g., drivers using `<uefi/axl-uefi.h>`).
 | Internal headers | `axl-<module>-internal.h` | `axl-format-internal.h` |
 | Umbrella header | `axl.h` | `#include <axl.h>` |
 | Test files | `axl-test-<module>.c` | `axl-test-mem.c` |
+| Vendor adapters | `axl-<module>-<vendor>.c` | `axl-ipmi-dell.c`, `axl-ipmi-edkii.c` |
 | Directories | lowercase | `src/mem/`, `src/backend/` |
 
 Source files and headers use **lowercase hyphenated** names.
 Internal headers live next to their implementation (e.g.,
 `src/backend/axl-backend.h`), not in `include/`.
+
+## Vendor and Vendor-Specific Code
+
+AXL is hardware-vendor-agnostic at its **public API surface** — the
+function names in `include/axl/*.h` and the types they expose must
+not mention vendors (no `axl_dell_*`, no `AxlIntelFoo`). Consumer
+code calls `axl_ipmi_session_new()` and never knows whether the
+underlying transport is generic KCS or a Dell proprietary protocol.
+
+Vendor names ARE allowed (and expected) in two narrow places:
+
+1. **Vendor adapter files** — `src/<module>/axl-<module>-<vendor>.c`.
+   Use when a real-world vendor protocol needs an adapter under the
+   neutral public API. Examples in the tree: `axl-ipmi-dell.c`
+   (adapts Dell's `EFI_IPMI_TRANSPORT`), `axl-ipmi-edkii.c` (adapts
+   EDKII's `IPMI_PROTOCOL`). Same shape as the Linux kernel's
+   `drivers/platform/x86/dell_*.c`. The naming reflects what the
+   file contains; renaming to a neutral name would obscure
+   maintenance and break grep-ability against vendor docs.
+
+2. **Public enum values and probe-struct fields that name real
+   vendor things** — e.g., `AXL_IPMI_TRANSPORT_DELL` (identifies
+   which transport the auto-detect picked) and
+   `AxlIpmiProbe.dell_ipmi_transport` (a diagnostic snapshot field
+   that's *explicitly* about real-world vendor presence). These
+   stay because they describe vendor-specific external state;
+   renaming them would defeat their purpose.
+
+What stays out of vendor naming: function entry points consumers
+call directly. `axl_ipmi_session_new` (not `axl_ipmi_dell_session_new`),
+`axl_pci_get_vid_did` (not `axl_pci_intel_get_vid_did`). The
+auto-detect picks the vendor adapter; the consumer never names one.
 
 ## Source File Layout
 

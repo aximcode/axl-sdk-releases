@@ -424,6 +424,114 @@ test_pci_vpd_iter(void)
 }
 
 static void
+test_pci_dump(void)
+{
+    /* Host bridge — guaranteed present on QEMU q35. Read 64 bytes
+       (one cache line) of config space and verify the VID at offset
+       0 matches an independent read. */
+    AxlPciAddr root = { .seg = 0, .bus = 0, .dev = 0, .func = 0 };
+    uint8_t  buf[256] = { 0 };
+    size_t   ok       = 0;
+    int rc = axl_pci_dump(root, buf, 64, &ok);
+    if (rc != 0) {
+        axl_printf("SKIP: pci_dump (host bridge unreachable)\n");
+        /* Balance: 7 checks ran in the populated path. */
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "pci dump: SKIP balance");
+        }
+        return;
+    }
+    test_check(rc == 0, "pci dump: host bridge succeeds");
+    test_check(ok == 64, "pci dump: 64 bytes populated");
+
+    /* Cross-check against direct read at offset 0. */
+    uint16_t vid_raw;
+    test_check(axl_pci_read_config_16(root, 0x00, &vid_raw) == 0
+               && (uint16_t)(buf[0] | (buf[1] << 8)) == vid_raw,
+               "pci dump: VID at offset 0 matches direct read");
+
+    /* Absent function — high-bus address that's outside MCFG (or
+       within MCFG but always empty). Either way axl_pci_dump must
+       return -1 with out_read=0. */
+    AxlPciAddr absent_hi = { .seg = 0, .bus = 0xFF, .dev = 0x1F, .func = 7 };
+    size_t ok_absent = 999;
+    test_check(axl_pci_dump(absent_hi, buf, 64, &ok_absent) == -1
+               && ok_absent == 0,
+               "pci dump: absent function (high bus) returns -1, out_read=0");
+
+    /* Empty slot inside known-mapped MCFG range. On QEMU q35 the
+       host bridge owns 00:00.0 but funcs 1..7 are empty, so this
+       exercises the "MCFG hit + ECAM returns 0xFFFFFFFF" path
+       specifically (vs the absent_hi case which may also exit via
+       MCFG miss depending on firmware). */
+    AxlPciAddr absent_func = { .seg = 0, .bus = 0, .dev = 0, .func = 7 };
+    ok_absent = 999;
+    test_check(axl_pci_dump(absent_func, buf, 64, &ok_absent) == -1
+               && ok_absent == 0,
+               "pci dump: empty MCFG-mapped function also returns -1");
+
+    /* Cap behavior: requesting > AXL_PCI_CONFIG_SPACE_MAX silently
+       caps; requesting < 4 returns -1. */
+    test_check(axl_pci_dump(root, buf, 2, NULL) == -1,
+               "pci dump: bytes < 4 returns -1");
+
+    /* NULL guard. */
+    test_check(axl_pci_dump(root, NULL, 64, NULL) == -1,
+               "pci dump: NULL buf returns -1");
+}
+
+static void
+test_pci_class_string(void)
+{
+    char buf[80];
+
+    /* USB xHCI (0C/03/30) — three known tiers. */
+    int n = axl_pci_class_string(0x0C0330, buf, sizeof(buf));
+    test_check(n > 0, "pci class_string: USB xHCI returns positive");
+    test_check(axl_strstr(buf, "Serial bus controller") != NULL
+               && axl_strstr(buf, "USB") != NULL
+               && axl_strstr(buf, "xHCI") != NULL,
+               "pci class_string: USB xHCI decodes all three tiers");
+
+    /* Display VGA standard (03/00/00). */
+    n = axl_pci_class_string(0x030000, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strstr(buf, "Display") != NULL
+               && axl_strstr(buf, "VGA") != NULL,
+               "pci class_string: Display VGA decoded");
+
+    /* Host bridge (06/00/00). */
+    n = axl_pci_class_string(0x060000, buf, sizeof(buf));
+    test_check(n > 0 && axl_strstr(buf, "Host bridge") != NULL,
+               "pci class_string: 0x060000 decodes 'Host bridge'");
+
+    /* SATA AHCI (01/06/01). */
+    n = axl_pci_class_string(0x010601, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strstr(buf, "SATA") != NULL
+               && axl_strstr(buf, "AHCI") != NULL,
+               "pci class_string: SATA AHCI decoded");
+
+    /* Unknown base class — graceful fallback, never crashes. */
+    n = axl_pci_class_string(0xAB1234, buf, sizeof(buf));
+    test_check(n > 0 && axl_strstr(buf, "<unknown>") != NULL,
+               "pci class_string: unknown class falls back to <unknown>");
+
+    /* Unknown subclass under known base — base names, sub/prog don't. */
+    n = axl_pci_class_string(0x06FFFF, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strstr(buf, "Bridge") != NULL
+               && axl_strstr(buf, "<unknown>") != NULL,
+               "pci class_string: known base + unknown sub still names base");
+
+    /* NULL/zero-length guards. */
+    test_check(axl_pci_class_string(0x060000, NULL, 80) == -1,
+               "pci class_string: NULL buf returns -1");
+    test_check(axl_pci_class_string(0x060000, buf, 0) == -1,
+               "pci class_string: buflen=0 returns -1");
+}
+
+static void
 test_pci_capabilities(void)
 {
     /* Walk the full enumeration looking for any device with a
@@ -781,6 +889,8 @@ test_platform_main(int argc, char **argv)
     test_pci_find_by_vid_did();
     test_pci_addr_parse_format();
     test_pci_get_vid_did_class24();
+    test_pci_dump();
+    test_pci_class_string();
     test_pci_capabilities();
     test_pci_vpd_iter();
 

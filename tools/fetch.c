@@ -304,7 +304,7 @@ main(int argc, char **argv)
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Fetch",
         .help         = "HTTP client (curl-like) for UEFI",
-        .flags          = flags,
+        .flags        = flags,
         .positionals  = positional,
         .handler      = run_fetch,
     });
