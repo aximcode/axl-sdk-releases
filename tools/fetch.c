@@ -17,7 +17,7 @@
 // Option definitions
 // ---------------------------------------------------------------------------
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "output",      .short_name = 'o', .type = AXL_ARG_STRING,
       .help = "Write response body to FILE" },
     { .name = "remote-name", .short_name = 'O', .type = AXL_ARG_BOOL,
@@ -39,7 +39,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "url", .type = AXL_ARG_STRING, .required = true,
       .help = "URL to fetch" },
     {0}
@@ -301,11 +301,11 @@ run_fetch(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Fetch",
         .help         = "HTTP client (curl-like) for UEFI",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_fetch,
     });
 }

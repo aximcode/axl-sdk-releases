@@ -24,7 +24,7 @@
 #include <axl.h>
 #include <axl/axl-ipmi.h>
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Verbose output" },
     {0}
@@ -33,7 +33,7 @@ static const AxlArgDesc kFlags[] = {
 /* Variadic positional collector — every IPMI verb takes its own
    sub-verb chain (e.g. "mc reset cold", "chassis power on") that
    the verb handler parses internally. */
-static const AxlArgDesc kVerbArgs[] = {
+static const AxlArgDesc verb_args[] = {
     { .name = "args", .type = AXL_ARG_MULTI,
       .help = "Verb-specific arguments (see verb help)" },
     {0}
@@ -586,24 +586,24 @@ run_raw(AxlArgs *a)
     return cmd_raw(s, n, raw_args);
 }
 
-static const AxlVerb kVerbs[] = {
+static const AxlArgsNode verbs[] = {
     { .name = "probe",   .handler = run_probe,
       .help = "Diagnose available IPMI transports without opening a session" },
     { .name = "info",    .handler = run_info,
       .help = "Print the BMC's device info (firmware rev, GUID, ...)" },
-    { .name = "mc",      .handler = run_mc,      .positionals = kVerbArgs,
+    { .name = "mc",      .handler = run_mc,      .positionals = verb_args,
       .help = "Management controller commands (mc reset cold|warm)" },
-    { .name = "chassis", .handler = run_chassis, .positionals = kVerbArgs,
+    { .name = "chassis", .handler = run_chassis, .positionals = verb_args,
       .help = "Chassis status / power control (status; power on|off|cycle|...)" },
-    { .name = "sel",     .handler = run_sel,     .positionals = kVerbArgs,
+    { .name = "sel",     .handler = run_sel,     .positionals = verb_args,
       .help = "System Event Log (sel list)" },
-    { .name = "sdr",     .handler = run_sdr,     .positionals = kVerbArgs,
+    { .name = "sdr",     .handler = run_sdr,     .positionals = verb_args,
       .help = "Sensor Data Repository (sdr list)" },
     { .name = "sensor",  .handler = run_sensor,
       .help = "All sensors with current readings" },
-    { .name = "fru",     .handler = run_fru,     .positionals = kVerbArgs,
+    { .name = "fru",     .handler = run_fru,     .positionals = verb_args,
       .help = "FRU inventory (fru list)" },
-    { .name = "raw",     .handler = run_raw,     .positionals = kVerbArgs,
+    { .name = "raw",     .handler = run_raw,     .positionals = verb_args,
       .help = "Raw netfn/cmd/data passthrough" },
     {0}
 };
@@ -611,10 +611,10 @@ static const AxlVerb kVerbs[] = {
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "ipmi",
         .help         = "IPMI client — KCS / SSIF / BT transport auto-detect",
-        .global_flags = kFlags,
-        .verbs        = kVerbs,
+        .flags          = flags,
+        .verbs        = verbs,
     });
 }

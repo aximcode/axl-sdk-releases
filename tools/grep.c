@@ -21,7 +21,7 @@ static bool show_line_numbers = false;
 static bool count_only = false;
 static bool verbose_mode = false;
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "ignore-case", .short_name = 'i', .type = AXL_ARG_BOOL,
       .help = "Case-insensitive match" },
     { .name = "line-number", .short_name = 'n', .type = AXL_ARG_BOOL,
@@ -35,7 +35,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "pattern", .type = AXL_ARG_STRING, .required = true,
       .help = "Search pattern" },
     { .name = "files",   .type = AXL_ARG_MULTI,  .required = true,
@@ -255,11 +255,11 @@ run_grep(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Grep",
         .help         = "Search file(s) for a pattern (UNIX grep-style)",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_grep,
     });
 }

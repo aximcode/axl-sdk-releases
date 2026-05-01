@@ -30,23 +30,23 @@ AXL_LOG_DOMAIN("ipmi");
 // protocol is present but we haven't wired it up yet is useful
 // information.
 //
-static const EFI_GUID kAmiDxeIpmiGuid = {
+static const EFI_GUID ami_dxe_ipmi_guid = {
     0x4a1d0e66, 0x5271, 0x4e22,
     {0x83, 0xfe, 0x90, 0x92, 0x1b, 0x74, 0x82, 0x13}
 };
-static const EFI_GUID kAmiSmmIpmiGuid = {
+static const EFI_GUID ami_smm_ipmi_guid = {
     0x1dbd1503, 0x0a60, 0x4230,
     {0xaa, 0xa3, 0x80, 0x16, 0xd8, 0xc3, 0xde, 0x2f}
 };
-static const EFI_GUID kIntelSmIpmiGuid = {
+static const EFI_GUID intel_sm_ipmi_guid = {
     0xdbbb21ce, 0xd92e, 0x4add,
     {0xb4, 0xc0, 0xc4, 0x62, 0xd4, 0xb0, 0x96, 0x02}
 };
-static const EFI_GUID kMuIpmiTransport2Guid = {
+static const EFI_GUID mu_ipmi_transport2_guid = {
     0x40e28370, 0x7247, 0x4bce,
     {0x94, 0x18, 0x77, 0x7f, 0xd5, 0x11, 0x12, 0xf0}
 };
-static const EFI_GUID kDellIdracInterfaceGuid = {
+static const EFI_GUID dell_idrac_interface_guid = {
     0xE0E4EBAD, 0xA45E, 0x419E,
     {0x85, 0x2E, 0xAE, 0xDE, 0x2C, 0x2B, 0xDE, 0x6C}
 };
@@ -345,12 +345,12 @@ axl_ipmi_probe(AxlIpmiProbe *out)
 
     out->edkii_ipmi_protocol     = probe_has_protocol(&gIpmiProtocolGuid);
     out->dell_ipmi_transport     = probe_has_protocol(&gDellIpmiProtocolGuid);
-    out->ami_dxe_ipmi_transport  = probe_has_protocol(&kAmiDxeIpmiGuid);
-    out->ami_smm_ipmi_transport  = probe_has_protocol(&kAmiSmmIpmiGuid);
-    out->intel_sm_ipmi_transport = probe_has_protocol(&kIntelSmIpmiGuid);
-    out->mu_ipmi_transport2      = probe_has_protocol(&kMuIpmiTransport2Guid);
+    out->ami_dxe_ipmi_transport  = probe_has_protocol(&ami_dxe_ipmi_guid);
+    out->ami_smm_ipmi_transport  = probe_has_protocol(&ami_smm_ipmi_guid);
+    out->intel_sm_ipmi_transport = probe_has_protocol(&intel_sm_ipmi_guid);
+    out->mu_ipmi_transport2      = probe_has_protocol(&mu_ipmi_transport2_guid);
     out->smbus_hc_protocol       = probe_has_protocol(&gEfiSmbusHcProtocolGuid);
-    out->dell_idrac_interface    = probe_has_protocol(&kDellIdracInterfaceGuid);
+    out->dell_idrac_interface    = probe_has_protocol(&dell_idrac_interface_guid);
 
     //
     // I2C Master: LocateProtocol only catches one instance. Also

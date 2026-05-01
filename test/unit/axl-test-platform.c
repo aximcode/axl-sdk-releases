@@ -676,7 +676,7 @@ static void
 test_spd_decode_ddr4(void)
 {
     AxlSpdInfo info;
-    int rc = axl_spd_decode(kSpdDdr4Micron8Gb, sizeof(kSpdDdr4Micron8Gb), &info);
+    int rc = axl_spd_decode(spd_ddr4_micron_8gb, sizeof(spd_ddr4_micron_8gb), &info);
     test_check(rc == 0, "spd: DDR4 decode succeeds");
     test_check(info.ddr_generation == 4, "spd: DDR4 ddr_generation == 4");
     test_check(info.capacity_bytes == 8ULL * 1024 * 1024 * 1024,
@@ -693,7 +693,7 @@ static void
 test_spd_decode_ddr5(void)
 {
     AxlSpdInfo info;
-    int rc = axl_spd_decode(kSpdDdr5Samsung16Gb, sizeof(kSpdDdr5Samsung16Gb), &info);
+    int rc = axl_spd_decode(spd_ddr5_samsung_16gb, sizeof(spd_ddr5_samsung_16gb), &info);
     test_check(rc == 0, "spd: DDR5 decode succeeds");
     test_check(info.ddr_generation == 5, "spd: DDR5 ddr_generation == 5");
     test_check(info.capacity_bytes == 16ULL * 1024 * 1024 * 1024,
@@ -729,7 +729,7 @@ test_spd_decode_rejects_bogus(void)
     AxlSpdInfo info;
     test_check(axl_spd_decode(NULL, 256, &info) == -1,
                "spd: NULL buffer rejected");
-    test_check(axl_spd_decode(kSpdDdr4Micron8Gb, 2, &info) == -1,
+    test_check(axl_spd_decode(spd_ddr4_micron_8gb, 2, &info) == -1,
                "spd: short buffer rejected (len < 3)");
 }
 

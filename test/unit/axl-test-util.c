@@ -1547,19 +1547,19 @@ sub_crash(int argc, char **argv)
 static void
 test_subcommand_dispatch(void)
 {
-    static const AxlSubcommand kCmds[] = {
+    static const AxlSubcommand cmds[] = {
         { "bios",  sub_bios,   "[test|pci]",  "do bios test  — run POST self-test\n" },
         { "sysid", sub_sysid,  "[hexValue]",  NULL  },
         { "crash", sub_crash,  "trigger",     NULL  },
     };
-    static const size_t kCount = sizeof(kCmds) / sizeof(kCmds[0]);
+    static const size_t count = sizeof(cmds) / sizeof(cmds[0]);
 
     /* exact match → fn invoked, return value passed through */
     {
         char *argv[] = { (char *)"do", (char *)"bios", (char *)"--flag", (char *)"v" };
         g_sub_calls = 0;
         g_sub_last_arg0 = NULL;
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 4, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 4, argv, "do");
         test_check(rc == 42, "subcommand: dispatch returns fn's rc");
         test_check(g_sub_calls == 1, "subcommand: fn called exactly once");
         /* argv shifted so the subcommand sees its own name as argv[0] */
@@ -1573,7 +1573,7 @@ test_subcommand_dispatch(void)
     {
         char *argv[] = { (char *)"do", (char *)"help" };
         g_sub_calls = 0;
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
         test_check(rc == 0, "subcommand: help returns 0");
         test_check(g_sub_calls == 0, "subcommand: help doesn't invoke any fn");
     }
@@ -1583,9 +1583,9 @@ test_subcommand_dispatch(void)
         char *argv1[] = { (char *)"do", (char *)"-h" };
         char *argv2[] = { (char *)"do", (char *)"--help" };
         g_sub_calls = 0;
-        test_check(axl_subcommand_dispatch(kCmds, kCount, 2, argv1, "do") == 0,
+        test_check(axl_subcommand_dispatch(cmds, count, 2, argv1, "do") == 0,
                    "subcommand: -h returns 0");
-        test_check(axl_subcommand_dispatch(kCmds, kCount, 2, argv2, "do") == 0,
+        test_check(axl_subcommand_dispatch(cmds, count, 2, argv2, "do") == 0,
                    "subcommand: --help returns 0");
         test_check(g_sub_calls == 0, "subcommand: -h/--help no fn invocations");
     }
@@ -1593,14 +1593,14 @@ test_subcommand_dispatch(void)
     /* "help <cmd>" prints command help, returns 0 */
     {
         char *argv[] = { (char *)"do", (char *)"help", (char *)"bios" };
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 3, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "do");
         test_check(rc == 0, "subcommand: help <cmd> returns 0");
     }
 
     /* "help <unknown>" returns -1 */
     {
         char *argv[] = { (char *)"do", (char *)"help", (char *)"nonsense" };
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 3, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "do");
         test_check(rc == -1, "subcommand: help <unknown> returns -1");
     }
 
@@ -1608,7 +1608,7 @@ test_subcommand_dispatch(void)
     {
         char *argv[] = { (char *)"do", (char *)"frobnicate" };
         g_sub_calls = 0;
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
         test_check(rc == -1, "subcommand: unknown command returns -1");
         test_check(g_sub_calls == 0, "subcommand: unknown doesn't invoke any fn");
     }
@@ -1616,7 +1616,7 @@ test_subcommand_dispatch(void)
     /* typo close to "sysid" → still -1 but the "did you mean" path runs */
     {
         char *argv[] = { (char *)"do", (char *)"sysud" };
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
         test_check(rc == -1, "subcommand: close typo returns -1");
         /* No way to capture stderr text here; just exercise the path. */
     }
@@ -1624,7 +1624,7 @@ test_subcommand_dispatch(void)
     /* argc < 2 → help, returns 0 */
     {
         char *argv[] = { (char *)"do" };
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 1, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 1, argv, "do");
         test_check(rc == 0, "subcommand: no args returns 0 (help)");
     }
 
@@ -1632,7 +1632,7 @@ test_subcommand_dispatch(void)
     {
         char *argv[] = { (char *)"fs0:\\path\\do.efi", (char *)"bios" };
         g_sub_calls = 0;
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, NULL);
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, NULL);
         test_check(rc == 42 && g_sub_calls == 1,
                    "subcommand: NULL prog_name still dispatches");
     }
@@ -1640,7 +1640,7 @@ test_subcommand_dispatch(void)
     /* return -7 from crash subcommand passes through */
     {
         char *argv[] = { (char *)"do", (char *)"crash" };
-        int rc = axl_subcommand_dispatch(kCmds, kCount, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
         test_check(rc == -7, "subcommand: negative rc passes through");
     }
 
@@ -1655,9 +1655,9 @@ test_subcommand_dispatch(void)
     }
 
     /* Public print fns shouldn't crash on edge cases */
-    axl_subcommand_print_help(kCmds, kCount, "do");
+    axl_subcommand_print_help(cmds, count, "do");
     axl_subcommand_print_help(NULL, 0, "do");
-    axl_subcommand_print_command_help(&kCmds[0], "do");
+    axl_subcommand_print_command_help(&cmds[0], "do");
     axl_subcommand_print_command_help(NULL, "do");
     test_check(true, "subcommand: print fns don't crash");
 }
@@ -2220,21 +2220,21 @@ args_single_handler(AxlArgs *a)
     return 7;
 }
 
-static const AxlArgDesc kSlotPos[] = {
+static const AxlArgDesc slot_pos[] = {
     { .name = "slot", .type = AXL_ARG_U8, .base = 0,
       .min = 0x50, .max = 0x57, .required = true, .help = "test slot" },
     {0}
 };
-static const AxlArgDesc kArgsFlags[] = {
+static const AxlArgDesc args_flags[] = {
     { .name = "jedec-file", .short_name = 'j', .type = AXL_ARG_STRING,
       .help = "test sidecar" },
     { .name = "verbose",    .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "test verbose" },
     {0}
 };
-static const AxlVerb kArgsVerbs[] = {
+static const AxlArgsNode args_verbs[] = {
     { .name = "list", .handler = args_verb_list, .help = "list" },
-    { .name = "show", .handler = args_verb_show, .positionals = kSlotPos,
+    { .name = "show", .handler = args_verb_show, .positionals = slot_pos,
       .help = "show one slot" },
     {0}
 };
@@ -2242,12 +2242,12 @@ static const AxlVerb kArgsVerbs[] = {
 static int
 run_args(ArgsCapture *cap, int argc, char **argv)
 {
-    AxlArgsApp app = {
-        .name         = "argstest",
-        .help         = "AxlArgs unit test",
-        .global_flags = kArgsFlags,
-        .verbs        = kArgsVerbs,
-        .user_data    = cap,
+    AxlArgsNode app = {
+        .name      = "argstest",
+        .help      = "AxlArgs unit test",
+        .flags     = args_flags,
+        .verbs     = args_verbs,
+        .user_data = cap,
     };
     return axl_args_run(argc, argv, &app);
 }
@@ -2403,7 +2403,7 @@ test_args_single_handler_mode(void)
 {
     ArgsCapture cap = { 0 };
     char *argv[] = { (char *)"argstest", (char *)"file1.txt", (char *)"file2.txt" };
-    AxlArgsApp app = {
+    AxlArgsNode app = {
         .name      = "argstest",
         .help      = "single-handler mode",
         .handler   = args_single_handler,
@@ -2416,6 +2416,188 @@ test_args_single_handler_mode(void)
                "args: single-handler positionals collected (count=2)");
     test_check(cap.pos0 != NULL && axl_strcmp(cap.pos0, "file1.txt") == 0,
                "args: single-handler positional[0] = 'file1.txt'");
+}
+
+// ---------------------------------------------------------------------------
+// Nested AxlArgs — branch verbs, parent-flag visibility, breadcrumbs
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int          calls;
+    const char  *seen_top_string;     /* declared at root, read from leaf */
+    bool         seen_top_bool;       /* declared at root, read from leaf */
+    uint64_t     seen_leaf_uint;      /* leaf's own positional */
+    void        *seen_user_data;      /* parent-walk inheritance */
+    int          deep_calls;          /* 3rd-level handler */
+} NestedCapture;
+
+static int
+nested_pci_read16(AxlArgs *a)
+{
+    NestedCapture *cap = (NestedCapture *)axl_args_user_data(a);
+    cap->calls++;
+    /* Walk up to read root-declared flags. */
+    cap->seen_top_string  = axl_args_get_string(a, "host");
+    cap->seen_top_bool    = axl_args_get_bool(a, "verbose");
+    cap->seen_leaf_uint   = axl_args_get_uint(a, "reg");
+    cap->seen_user_data   = axl_args_user_data(a);
+    return 0;
+}
+
+static int
+nested_deep_handler(AxlArgs *a)
+{
+    NestedCapture *cap = (NestedCapture *)axl_args_user_data(a);
+    cap->deep_calls++;
+    /* Read flag declared at depth 1 (intermediate branch). */
+    cap->seen_top_string = axl_args_get_string(a, "scope");
+    return 0;
+}
+
+static const AxlArgDesc reg_pos[] = {
+    { .name = "reg", .type = AXL_ARG_U16, .base = 0,
+      .required = true, .help = "register offset" },
+    {0}
+};
+
+static const AxlArgsNode pci_sub_verbs[] = {
+    { .name = "read16", .handler = nested_pci_read16,
+      .positionals = reg_pos, .help = "read a 16-bit register" },
+    {0}
+};
+
+/* 3-level tree: root -> outer -> inner (leaf). */
+static const AxlArgsNode inner_verbs[] = {
+    { .name = "leaf", .handler = nested_deep_handler,
+      .help = "deepest leaf" },
+    {0}
+};
+static const AxlArgDesc scope_flags[] = {
+    { .name = "scope", .type = AXL_ARG_STRING, .help = "intermediate scope" },
+    {0}
+};
+static const AxlArgsNode outer_verbs[] = {
+    { .name = "inner", .verbs = inner_verbs, .flags = scope_flags,
+      .help = "intermediate branch with its own flag" },
+    {0}
+};
+
+static const AxlArgDesc root_flags[] = {
+    { .name = "host", .short_name = 'H', .type = AXL_ARG_STRING,
+      .help = "root-declared string flag" },
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "root-declared bool flag" },
+    {0}
+};
+
+static const AxlArgsNode nested_top_verbs[] = {
+    { .name = "pci",  .verbs = pci_sub_verbs,  .help = "PCI/PCIe access" },
+    { .name = "deep", .verbs = outer_verbs,   .help = "3-level subtree" },
+    {0}
+};
+
+static int
+run_nested(NestedCapture *cap, int argc, char **argv)
+{
+    AxlArgsNode root = {
+        .name      = "do",
+        .help      = "nested verb test root",
+        .flags     = root_flags,
+        .verbs     = nested_top_verbs,
+        .user_data = cap,
+    };
+    return axl_args_run(argc, argv, &root);
+}
+
+static void
+test_args_nested_2level_dispatch(void)
+{
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"pci", (char *)"read16",
+                     (char *)"0x10" };
+    int rc = run_nested(&cap, 4, argv);
+    test_check(rc == 0, "nested args: 2-level dispatch returns 0");
+    test_check(cap.calls == 1, "nested args: leaf handler ran exactly once");
+    test_check(cap.seen_leaf_uint == 0x10,
+               "nested args: leaf's own positional parsed (reg=0x10)");
+    test_check(cap.seen_user_data == &cap,
+               "nested args: user_data inherited from root by leaf");
+}
+
+static void
+test_args_nested_parent_flag_visible_at_leaf(void)
+{
+    /* Root-declared --host and --verbose must be readable from the
+       leaf via the same accessors that read the leaf's own args. */
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"--host=bmc.local", (char *)"-v",
+                     (char *)"pci", (char *)"read16", (char *)"0x20" };
+    int rc = run_nested(&cap, 6, argv);
+    test_check(rc == 0, "nested args: root flags + nested verb dispatches");
+    test_check(cap.seen_top_string != NULL
+               && axl_strcmp(cap.seen_top_string, "bmc.local") == 0,
+               "nested args: root --host visible to leaf via parent-walk");
+    test_check(cap.seen_top_bool,
+               "nested args: root -v visible to leaf via parent-walk");
+}
+
+static void
+test_args_nested_3level_dispatch(void)
+{
+    /* do -> deep -> inner -> leaf, with --scope declared at the
+       middle level and read by the deepest handler. */
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"deep",
+                     (char *)"inner", (char *)"--scope=mid", (char *)"leaf" };
+    int rc = run_nested(&cap, 5, argv);
+    test_check(rc == 0, "nested args: 3-level dispatch returns 0");
+    test_check(cap.deep_calls == 1, "nested args: deep leaf ran once");
+    test_check(cap.seen_top_string != NULL
+               && axl_strcmp(cap.seen_top_string, "mid") == 0,
+               "nested args: middle-level --scope reachable from deepest leaf");
+}
+
+static void
+test_args_nested_unknown_verb_at_branch(void)
+{
+    /* Branch should reject unknown verb at its own level — error
+       message uses the breadcrumb path (verified by NOT running the
+       handler; the breadcrumb itself goes to stdout, not captured
+       here, but the rejection path is exercised). */
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"pci", (char *)"flarble" };
+    int rc = run_nested(&cap, 3, argv);
+    test_check(rc != 0, "nested args: unknown verb at branch rejected");
+    test_check(cap.calls == 0, "nested args: leaf handler did not run");
+}
+
+static void
+test_args_nested_branch_help_lists_subverbs(void)
+{
+    /* `do pci --help` must trigger help at the pci branch level (not
+       run any handler). */
+    NestedCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"pci", (char *)"--help" };
+    int rc = run_nested(&cap, 3, argv);
+    test_check(rc == 0, "nested args: --help at branch returns 0");
+    test_check(cap.calls == 0, "nested args: --help did not invoke handler");
+}
+
+static void
+test_args_nested_misconfigured_node_rejected(void)
+{
+    /* A node with neither verbs nor handler is misconfigured and
+       must fail before the parser tries to dispatch. */
+    NestedCapture cap = { 0 };
+    AxlArgsNode bad = {
+        .name      = "argstest",
+        .help      = "broken node",
+        .user_data = &cap,
+        /* no verbs, no handler */
+    };
+    char *argv[] = { (char *)"argstest" };
+    int rc = axl_args_run(1, argv, &bad);
+    test_check(rc != 0, "nested args: handler-less + verb-less node rejected");
 }
 
 static void
@@ -2433,6 +2615,12 @@ test_args(void)
     test_args_compact_short_group_rejected();
     test_args_extra_positional_rejected();
     test_args_single_handler_mode();
+    test_args_nested_2level_dispatch();
+    test_args_nested_parent_flag_visible_at_leaf();
+    test_args_nested_3level_dispatch();
+    test_args_nested_unknown_verb_at_branch();
+    test_args_nested_branch_help_lists_subverbs();
+    test_args_nested_misconfigured_node_rejected();
 }
 
 // ---------------------------------------------------------------------------

@@ -66,7 +66,7 @@ typedef struct {
 
 static bool verbose = false;
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "size",    .short_name = 's', .type = AXL_ARG_U32, .base = 0,
       .min = MKRD_MIN_SIZE_MB, .max = MKRD_MAX_SIZE_MB,
       .help = "Size in MB (default 4)" },
@@ -81,7 +81,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "label", .type = AXL_ARG_STRING,
       .help = "Volume label for the new RAM disk (create mode)" },
     {0}
@@ -666,11 +666,11 @@ int
 main(int argc, char **argv)
 {
     axl_diag_startup(argc, argv);
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "MkRd",
         .help         = "Create / list / destroy RAM disks via EFI_RAM_DISK_PROTOCOL",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_mkrd,
     });
 }

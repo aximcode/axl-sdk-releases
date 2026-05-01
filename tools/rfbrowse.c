@@ -17,7 +17,7 @@
 // Option definitions
 // ---------------------------------------------------------------------------
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "user",     .short_name = 'u', .type = AXL_ARG_STRING,
       .help = "Username" },
     { .name = "password", .short_name = 'p', .type = AXL_ARG_STRING,
@@ -35,7 +35,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "host",  .type = AXL_ARG_STRING, .required = true,
       .help = "Redfish service host (or full URL)" },
     { .name = "paths", .type = AXL_ARG_MULTI,
@@ -564,11 +564,11 @@ run_rfbrowse(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "rfbrowse",
         .help         = "Redfish REST API browser",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_rfbrowse,
     });
 }

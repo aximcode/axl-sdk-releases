@@ -279,7 +279,7 @@ do_decode(
 // AxlArgs declaration
 // ---------------------------------------------------------------------------
 
-static const AxlArgDesc kSlotArg[] = {
+static const AxlArgDesc slot_arg[] = {
     { .name = "slot", .type = AXL_ARG_U8, .base = 0,
       .min = AXL_SPD_ADDR_FIRST, .max = AXL_SPD_ADDR_LAST,
       .required = true,
@@ -287,19 +287,19 @@ static const AxlArgDesc kSlotArg[] = {
     {0}
 };
 
-static const AxlVerb kVerbs[] = {
+static const AxlArgsNode verbs[] = {
     { .name = "list",   .handler = do_list,
       .help = "One-line summary per populated slot" },
     { .name = "show",   .handler = do_show,
-      .positionals = kSlotArg,
+      .positionals = slot_arg,
       .help = "Decoded SPD fields for one slot" },
     { .name = "decode", .handler = do_decode,
-      .positionals = kSlotArg,
+      .positionals = slot_arg,
       .help = "Raw hex dump + decoded fields" },
     {0}
 };
 
-static const AxlArgDesc kGlobalFlags[] = {
+static const AxlArgDesc global_flags[] = {
     { .name = "jedec-file", .short_name = 'j', .type = AXL_ARG_STRING,
       .help = "Path to JEDEC vendor JSON sidecar" },
     {0}
@@ -313,11 +313,11 @@ main(
 {
     axl_diag_startup(argc, argv);
 
-    int rc = axl_args_run(argc, argv, &(AxlArgsApp){
+    int rc = axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "memspd",
         .help         = "Read JEDEC SPD content from DDR4/DDR5 DIMMs",
-        .global_flags = kGlobalFlags,
-        .verbs        = kVerbs,
+        .flags          = global_flags,
+        .verbs        = verbs,
         .pre_run      = load_jedec_table_from_args,
     });
 

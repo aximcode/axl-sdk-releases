@@ -4,18 +4,26 @@
 /** @file axl-args.c
     AxlArgs — declarative command-line parser for AXL tools.
 
-    Replaces the per-tool AxlConfig + axl_subcommand_dispatch +
-    hand-rolled positional-arg parsing with a single data-driven
-    entry point. Tools declare a static @ref AxlArgsApp tree; the
-    framework parses argv, validates types and bounds, generates
-    `--help` output, and dispatches to the matching verb handler.
+    A tool declares a static @ref AxlArgsNode tree (program name +
+    flags + (positionals + handler) for leaves, or (verbs) for
+    branches) and calls @ref axl_args_run from main. The framework
+    parses argv, validates types and bounds, generates `--help`,
+    and dispatches to the matching leaf handler.
 
-    Design choices:
-      - Linear flag/positional storage (N is small; no hash table).
-      - Parsing is single-pass; the verb is resolved when the first
-        non-flag positional is encountered, after which subsequent
-        flags can come from the verb's own descriptor list.
-      - Validation runs at parse time so handlers see only good data.
+    Recursion model: the same AxlArgsNode shape describes the root
+    and every inner branch and leaf. axl_args_run is a thin wrapper
+    around an internal `args_run_internal` that carries a
+    breadcrumb path and a parent AxlArgs pointer for accessor walks.
+    A branch consumes flags + the verb-name positional, then
+    recurses into the matched child node with the remaining argv
+    slice; a leaf consumes flags + positionals at this level and
+    invokes its handler.
+
+    Design choices kept from v1:
+      - Linear flag/positional storage (N is small at every level;
+        no hash table).
+      - Single-pass parse; verb resolved on first non-flag.
+      - Validation runs at parse time so handlers see good data only.
 **/
 
 #include <axl/axl-args.h>
@@ -41,27 +49,36 @@ typedef struct {
 } ParsedArg;
 
 struct AxlArgs {
-    const AxlArgsApp *app;
-    const AxlVerb    *verb;          ///< NULL in single-verb mode
+    const AxlArgsNode *node;          ///< the node being parsed at this level
+    const char        *path;          ///< full breadcrumb ("do bios pci"), borrowed
+    AxlArgs           *parent;        ///< enclosing level, NULL at root
 
     /* Linear arrays of parsed slots: one per descriptor in
-       global_flags + verb->flags + (verb->positionals OR app->positionals).
-       Indexed in the order the descriptors appear. */
-    ParsedArg        *slots;
-    int               slot_count;
+       node->flags + (node->positionals if leaf). */
+    ParsedArg         *slots;
+    int                slot_count;
 
-    AxlArray         *variadic;      ///< collected variadic tail (const char *)
-    int               next_named_pos; ///< next positional descriptor to fill
+    AxlArray          *variadic;      ///< collected variadic tail (const char *)
+    int                next_named_pos; ///< next positional descriptor to fill
 };
 
 // ---------------------------------------------------------------------------
-// Descriptor-list helpers
+// Forward decls
+// ---------------------------------------------------------------------------
+
+static int args_run_internal(int argc, char **argv,
+                             const AxlArgsNode *node,
+                             const char *parent_path,
+                             AxlArgs *parent_args);
+
+static void print_help_for(const AxlArgsNode *node, const char *path);
+
+// ---------------------------------------------------------------------------
+// Descriptor / verb helpers
 // ---------------------------------------------------------------------------
 
 static int
-desc_count(
-    const AxlArgDesc  *list
-    )
+desc_count(const AxlArgDesc *list)
 {
     int n = 0;
     if (list != NULL) {
@@ -72,21 +89,30 @@ desc_count(
     return n;
 }
 
-static const AxlVerb *
-find_verb(
-    const AxlArgsApp  *app,
-    const char        *name
-    )
+static const AxlArgsNode *
+find_verb(const AxlArgsNode *node, const char *name)
 {
-    if (app->verbs == NULL || name == NULL) {
+    if (node->verbs == NULL || name == NULL) {
         return NULL;
     }
-    for (int i = 0; app->verbs[i].name != NULL; i++) {
-        if (axl_strcmp(app->verbs[i].name, name) == 0) {
-            return &app->verbs[i];
+    for (int i = 0; node->verbs[i].name != NULL; i++) {
+        if (axl_strcmp(node->verbs[i].name, name) == 0) {
+            return &node->verbs[i];
         }
     }
     return NULL;
+}
+
+static bool
+node_is_leaf(const AxlArgsNode *node)
+{
+    return node->handler != NULL;
+}
+
+static bool
+node_is_branch(const AxlArgsNode *node)
+{
+    return node->verbs != NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,10 +120,7 @@ find_verb(
 // ---------------------------------------------------------------------------
 
 static ParsedArg *
-slot_by_name(
-    AxlArgs     *a,
-    const char  *name
-    )
+slot_by_name_local(AxlArgs *a, const char *name)
 {
     if (name == NULL) {
         return NULL;
@@ -112,12 +135,25 @@ slot_by_name(
     return NULL;
 }
 
+/* Walk this level + every parent for a slot matching @p name.
+   Parent visibility is the whole point of the nested model — a
+   leaf can read --verbose declared on the root via the same
+   accessor it uses for its own positionals. */
 static ParsedArg *
-slot_by_long(
-    AxlArgs     *a,
-    const char  *key,
-    size_t       key_len
-    )
+slot_by_name(AxlArgs *a, const char *name)
+{
+    while (a != NULL) {
+        ParsedArg *s = slot_by_name_local(a, name);
+        if (s != NULL) {
+            return s;
+        }
+        a = a->parent;
+    }
+    return NULL;
+}
+
+static ParsedArg *
+slot_by_long_local(AxlArgs *a, const char *key, size_t key_len)
 {
     for (int i = 0; i < a->slot_count; i++) {
         const AxlArgDesc *d = a->slots[i].desc;
@@ -132,11 +168,23 @@ slot_by_long(
     return NULL;
 }
 
+/* Long-form flag lookup walks parents too — `--verbose` declared on
+   the root remains settable on the inner verb's command line. */
 static ParsedArg *
-slot_by_short(
-    AxlArgs  *a,
-    char      shortc
-    )
+slot_by_long(AxlArgs *a, const char *key, size_t key_len)
+{
+    while (a != NULL) {
+        ParsedArg *s = slot_by_long_local(a, key, key_len);
+        if (s != NULL) {
+            return s;
+        }
+        a = a->parent;
+    }
+    return NULL;
+}
+
+static ParsedArg *
+slot_by_short_local(AxlArgs *a, char shortc)
 {
     if (shortc == 0) {
         return NULL;
@@ -151,44 +199,46 @@ slot_by_short(
     return NULL;
 }
 
+static ParsedArg *
+slot_by_short(AxlArgs *a, char shortc)
+{
+    while (a != NULL) {
+        ParsedArg *s = slot_by_short_local(a, shortc);
+        if (s != NULL) {
+            return s;
+        }
+        a = a->parent;
+    }
+    return NULL;
+}
+
 // ---------------------------------------------------------------------------
 // Slot table construction
 // ---------------------------------------------------------------------------
 
 static int
-register_descs(
-    AxlArgs            *a,
-    int                 base,
-    const AxlArgDesc   *list
-    )
+register_descs(AxlArgs *a, int base, const AxlArgDesc *list)
 {
     if (list == NULL) {
         return base;
     }
     for (int i = 0; list[i].name != NULL; i++) {
-        a->slots[base + i].desc      = &list[i];
-        a->slots[base + i].set       = false;
-        a->slots[base + i].str_value = list[i].default_value;
-        a->slots[base + i].uint_value = 0;
-        a->slots[base + i].int_value  = 0;
+        a->slots[base + i].desc        = &list[i];
+        a->slots[base + i].set         = false;
+        a->slots[base + i].str_value   = list[i].default_value;
+        a->slots[base + i].uint_value  = 0;
+        a->slots[base + i].int_value   = 0;
         a->slots[base + i].multi_values = NULL;
     }
     return base + desc_count(list);
 }
 
 static bool
-build_slots(
-    AxlArgs              *a,
-    const AxlArgsApp     *app,
-    const AxlVerb        *verb
-    )
+build_slots(AxlArgs *a, const AxlArgsNode *node)
 {
-    int total = desc_count(app->global_flags);
-    if (verb != NULL) {
-        total += desc_count(verb->flags);
-        total += desc_count(verb->positionals);
-    } else {
-        total += desc_count(app->positionals);
+    int total = desc_count(node->flags);
+    if (node_is_leaf(node)) {
+        total += desc_count(node->positionals);
     }
     a->slots = (ParsedArg *)axl_calloc(total > 0 ? (size_t)total : 1,
                                        sizeof(ParsedArg));
@@ -197,12 +247,9 @@ build_slots(
     }
     a->slot_count = total;
     int base = 0;
-    base = register_descs(a, base, app->global_flags);
-    if (verb != NULL) {
-        base = register_descs(a, base, verb->flags);
-        register_descs(a, base, verb->positionals);
-    } else {
-        register_descs(a, base, app->positionals);
+    base = register_descs(a, base, node->flags);
+    if (node_is_leaf(node)) {
+        register_descs(a, base, node->positionals);
     }
     return true;
 }
@@ -212,17 +259,11 @@ build_slots(
 // ---------------------------------------------------------------------------
 
 static bool
-parse_typed(
-    ParsedArg   *slot,
-    const char  *value,
-    const char  *prog
-    )
+parse_typed(ParsedArg *slot, const char *value, const char *path)
 {
     const AxlArgDesc *d = slot->desc;
     switch (d->type) {
         case AXL_ARG_BOOL:
-            /* Bools come from presence; this path handles
-               --flag=true / --flag=false / --flag=1 / --flag=0. */
             slot->uint_value = (value != NULL
                                 && (axl_strcmp(value, "true") == 0
                                     || axl_strcmp(value, "1") == 0
@@ -236,7 +277,7 @@ parse_typed(
             return true;
 
         case AXL_ARG_MULTI:
-            slot->str_value = value;   /* head, for convenience */
+            slot->str_value = value;
             if (slot->multi_values == NULL) {
                 slot->multi_values = axl_array_new(sizeof(const char *));
                 if (slot->multi_values == NULL) {
@@ -254,7 +295,7 @@ parse_typed(
             uint64_t v = 0;
             if (axl_str_to_u64(value, d->base, &v, NULL) != 0) {
                 axl_print("%s: '%s' for --%s is not a valid integer\n",
-                          prog, value != NULL ? value : "(missing)", d->name);
+                          path, value != NULL ? value : "(missing)", d->name);
                 return false;
             }
             uint64_t cap = 0;
@@ -266,34 +307,30 @@ parse_typed(
             }
             if (cap != 0 && v > cap) {
                 axl_print("%s: '%s' for --%s exceeds the type's range\n",
-                          prog, value, d->name);
+                          path, value, d->name);
                 return false;
             }
             if (d->min != 0 && v < d->min) {
                 axl_print("%s: '%s' for --%s is below min %llu\n",
-                          prog, value, d->name, (unsigned long long)d->min);
+                          path, value, d->name, (unsigned long long)d->min);
                 return false;
             }
             if (d->max != 0 && v > d->max) {
                 axl_print("%s: '%s' for --%s exceeds max %llu\n",
-                          prog, value, d->name, (unsigned long long)d->max);
+                          path, value, d->name, (unsigned long long)d->max);
                 return false;
             }
             slot->uint_value = v;
-            slot->str_value  = value;   /* keep raw for logging */
+            slot->str_value  = value;
             slot->set = true;
             return true;
         }
 
         case AXL_ARG_S64: {
-            /* Dogfood axl_str_to_s64 — it handles INT64_MIN correctly,
-               which a hand-rolled "strip minus, parse u64, negate" path
-               does not (signed-overflow UB for the most-negative value;
-               same bug class as the v0.5.0 axl_sscanf review caught). */
             int64_t v = 0;
             if (axl_str_to_s64(value, d->base, &v, NULL) != 0) {
                 axl_print("%s: '%s' for --%s is not a valid integer\n",
-                          prog, value != NULL ? value : "(missing)", d->name);
+                          path, value != NULL ? value : "(missing)", d->name);
                 return false;
             }
             slot->int_value  = v;
@@ -310,9 +347,7 @@ parse_typed(
 // ---------------------------------------------------------------------------
 
 static void
-print_flag_line(
-    const AxlArgDesc  *d
-    )
+print_flag_line(const AxlArgDesc *d)
 {
     char short_buf[8] = "    ";
     if (d->short_name != 0) {
@@ -335,9 +370,7 @@ print_flag_line(
 }
 
 static void
-print_positional_line(
-    const AxlArgDesc  *d
-    )
+print_positional_line(const AxlArgDesc *d)
 {
     const char *suffix = (d->type == AXL_ARG_MULTI) ? "..." : "";
     const char *req    = d->required ? "" : " (optional)";
@@ -347,49 +380,32 @@ print_positional_line(
               req);
 }
 
+/* Render help for one node. @p path is the breadcrumb used in the
+   "Usage:" line ("do bios" rather than "bios"). */
 static void
-print_help_for(
-    const AxlArgsApp  *app,
-    const AxlVerb     *verb
-    )
+print_help_for(const AxlArgsNode *node, const char *path)
 {
-    if (app->help != NULL) {
-        axl_print("%s — %s\n\n", app->name, app->help);
+    if (node->help != NULL) {
+        axl_print("%s — %s\n\n", path, node->help);
     }
 
-    if (verb != NULL) {
-        axl_print("Usage: %s %s [flags]", app->name, verb->name);
-        for (int i = 0; verb->positionals != NULL
-                        && verb->positionals[i].name != NULL; i++) {
-            const AxlArgDesc *d = &verb->positionals[i];
-            if (d->type == AXL_ARG_MULTI) {
-                axl_print(" [<%s>...]", d->name);
-            } else if (d->required) {
-                axl_print(" <%s>", d->name);
-            } else {
-                axl_print(" [<%s>]", d->name);
-            }
-        }
-        axl_print("\n");
-        if (verb->help != NULL) {
-            axl_print("\n%s\n", verb->help);
-        }
-    } else if (app->verbs != NULL) {
-        axl_print("Usage: %s [flags] <verb> [args]\n", app->name);
-        if (app->usage != NULL) {
-            axl_print("       %s %s\n", app->name, app->usage);
-        }
+    if (node_is_branch(node)) {
+        axl_print("Usage: %s [flags] <verb> [args]\n", path);
         axl_print("\nVerbs:\n");
-        for (int i = 0; app->verbs[i].name != NULL; i++) {
-            axl_print("  %-12s  %s\n",
-                      app->verbs[i].name,
-                      app->verbs[i].help != NULL ? app->verbs[i].help : "");
+        for (int i = 0; node->verbs[i].name != NULL; i++) {
+            const char *marker = node_is_branch(&node->verbs[i]) ? "*" : " ";
+            axl_print("  %s %-12s  %s\n",
+                      marker,
+                      node->verbs[i].name,
+                      node->verbs[i].help != NULL ? node->verbs[i].help : "");
         }
+        axl_print("\n  (* indicates a verb with sub-verbs; "
+                  "run `<verb> --help` for details)\n");
     } else {
-        axl_print("Usage: %s [flags]", app->name);
-        for (int i = 0; app->positionals != NULL
-                        && app->positionals[i].name != NULL; i++) {
-            const AxlArgDesc *d = &app->positionals[i];
+        axl_print("Usage: %s [flags]", path);
+        for (int i = 0; node->positionals != NULL
+                        && node->positionals[i].name != NULL; i++) {
+            const AxlArgDesc *d = &node->positionals[i];
             if (d->type == AXL_ARG_MULTI) {
                 axl_print(" [<%s>...]", d->name);
             } else if (d->required) {
@@ -401,41 +417,32 @@ print_help_for(
         axl_print("\n");
     }
 
-    bool any_flags = (app->global_flags != NULL && app->global_flags[0].name != NULL)
-                  || (verb != NULL && verb->flags != NULL && verb->flags[0].name != NULL);
+    bool any_flags = (node->flags != NULL && node->flags[0].name != NULL);
     if (any_flags) {
         axl_print("\nFlags:\n");
-        for (int i = 0; app->global_flags != NULL
-                        && app->global_flags[i].name != NULL; i++) {
-            print_flag_line(&app->global_flags[i]);
-        }
-        if (verb != NULL && verb->flags != NULL) {
-            for (int i = 0; verb->flags[i].name != NULL; i++) {
-                print_flag_line(&verb->flags[i]);
-            }
+        for (int i = 0; node->flags[i].name != NULL; i++) {
+            print_flag_line(&node->flags[i]);
         }
         axl_print("  -h, --help              Show this help\n");
     } else {
         axl_print("\n  -h, --help              Show this help\n");
     }
 
-    /* Positional descriptions. */
-    const AxlArgDesc *pos = (verb != NULL) ? verb->positionals : app->positionals;
-    if (pos != NULL && pos[0].name != NULL) {
+    if (node_is_leaf(node)
+        && node->positionals != NULL && node->positionals[0].name != NULL)
+    {
         axl_print("\nArguments:\n");
-        for (int i = 0; pos[i].name != NULL; i++) {
-            print_positional_line(&pos[i]);
+        for (int i = 0; node->positionals[i].name != NULL; i++) {
+            print_positional_line(&node->positionals[i]);
         }
     }
 }
 
 void
-axl_args_print_help(
-    AxlArgs *args
-    )
+axl_args_print_help(AxlArgs *args)
 {
-    if (args != NULL) {
-        print_help_for(args->app, args->verb);
+    if (args != NULL && args->node != NULL) {
+        print_help_for(args->node, args->path);
     }
 }
 
@@ -444,9 +451,7 @@ axl_args_print_help(
 // ---------------------------------------------------------------------------
 
 static void
-free_args(
-    AxlArgs *a
-    )
+free_args(AxlArgs *a)
 {
     if (a == NULL) {
         return;
@@ -464,77 +469,34 @@ free_args(
 // ---------------------------------------------------------------------------
 
 static bool
-is_help_flag(
-    const char *tok
-    )
+is_help_flag(const char *tok)
 {
-    /* `-h` / `--help` are help anywhere on the command line. The bare
-       word `help` is NOT a help token here — it would shadow legitimate
-       positional args (e.g. `grep help file.txt` looking for the word
-       "help"). The verb-name path handles `help` as a synonym for
-       `--help` only when no verb has been attached yet. */
     return tok != NULL
         && (axl_strcmp(tok, "-h") == 0
             || axl_strcmp(tok, "--help") == 0);
 }
 
-/** Extend the slot table to include the verb's flags + positionals
-    once the verb is resolved. Preserves the existing global-flag
-    slots (and their already-parsed state) — naively rebuilding here
-    would discard any --flag values seen before the verb token. */
 static bool
-attach_verb(
-    AxlArgs           *a,
-    const AxlVerb     *verb
-    )
+consume_positional(AxlArgs *a, const char *value)
 {
-    a->verb = verb;
-    int extra = desc_count(verb->flags) + desc_count(verb->positionals);
-    if (extra == 0) {
-        return true;
-    }
-    int new_count = a->slot_count + extra;
-    ParsedArg *grown = (ParsedArg *)axl_calloc((size_t)new_count, sizeof(ParsedArg));
-    if (grown == NULL) {
-        return false;
-    }
-    for (int i = 0; i < a->slot_count; i++) {
-        grown[i] = a->slots[i];
-    }
-    axl_free(a->slots);
-    a->slots = grown;
-    int base = a->slot_count;
-    a->slot_count = new_count;
-    base = register_descs(a, base, verb->flags);
-    register_descs(a, base, verb->positionals);
-    return true;
-}
-
-static bool
-consume_positional(
-    AxlArgs     *a,
-    const char  *value
-    )
-{
-    const AxlArgDesc *pos_list = (a->verb != NULL)
-                                 ? a->verb->positionals
-                                 : a->app->positionals;
+    /* Branches don't take positionals — the first non-flag positional
+       is the verb name and is consumed by the run loop, not here. */
+    const AxlArgDesc *pos_list = a->node->positionals;
     int n = desc_count(pos_list);
 
-    /* If we have a non-variadic descriptor with a slot still open,
-       fill it. */
-    if (a->next_named_pos < n && pos_list[a->next_named_pos].type != AXL_ARG_MULTI) {
-        ParsedArg *slot = slot_by_name(a, pos_list[a->next_named_pos].name);
+    if (a->next_named_pos < n
+        && pos_list[a->next_named_pos].type != AXL_ARG_MULTI)
+    {
+        ParsedArg *slot = slot_by_name_local(a, pos_list[a->next_named_pos].name);
         if (slot == NULL) {
             return false;
         }
-        if (!parse_typed(slot, value, a->app->name)) {
+        if (!parse_typed(slot, value, a->path)) {
             return false;
         }
         a->next_named_pos++;
         return true;
     }
-    /* Otherwise this is part of the variadic tail. */
     if (n > 0 && pos_list[n - 1].type == AXL_ARG_MULTI) {
         if (a->variadic == NULL) {
             a->variadic = axl_array_new(sizeof(const char *));
@@ -543,24 +505,18 @@ consume_positional(
             }
         }
         (void)axl_array_append_ptr(a->variadic, (void *)value);
-        /* Mark the variadic slot as set so help/required checks pass. */
-        ParsedArg *slot = slot_by_name(a, pos_list[n - 1].name);
+        ParsedArg *slot = slot_by_name_local(a, pos_list[n - 1].name);
         if (slot != NULL) {
             slot->set = true;
         }
         return true;
     }
-    /* The tool declared positionals and they're all filled (no MULTI
-       tail): reject the extra. Silently accepting it would let
-       `memspd show 0x53 garbage` run with `garbage` invisible to the
-       handler. Tools that genuinely want unbounded positionals
-       declare AXL_ARG_MULTI as their tail. */
     if (pos_list != NULL && n > 0) {
-        axl_print("%s: unexpected argument '%s'\n", a->app->name, value);
+        axl_print("%s: unexpected argument '%s'\n", a->path, value);
         return false;
     }
-    /* No descriptor at all — tool just wants to read positionals via
-       axl_args_get_pos. Stash in variadic. */
+    /* No positional descriptor — accumulate into variadic for tools
+       that just want to read positionals via axl_args_get_pos. */
     if (a->variadic == NULL) {
         a->variadic = axl_array_new(sizeof(const char *));
         if (a->variadic == NULL) {
@@ -571,15 +527,8 @@ consume_positional(
     return true;
 }
 
-/** Parse one --flag or -f token; returns the number of argv slots
-    consumed (1 or 2), or -1 on error. */
 static int
-parse_flag_token(
-    AxlArgs   *a,
-    int        i,
-    int        argc,
-    char     **argv
-    )
+parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
 {
     const char *arg = argv[i];
 
@@ -597,7 +546,7 @@ parse_flag_token(
         ParsedArg *slot = slot_by_long(a, key, key_len);
         if (slot == NULL) {
             axl_print("%s: unknown flag --%.*s\n",
-                      a->app->name, (int)key_len, key);
+                      a->path, (int)key_len, key);
             return -1;
         }
         const char *value = NULL;
@@ -609,58 +558,49 @@ parse_flag_token(
             } else if (i + 1 < argc) {
                 value = argv[i + 1];
             } else {
-                axl_print("%s: --%s requires a value\n", a->app->name, slot->desc->name);
+                axl_print("%s: --%s requires a value\n", a->path, slot->desc->name);
                 return -1;
             }
         }
-        if (!parse_typed(slot, value, a->app->name)) {
+        if (!parse_typed(slot, value, a->path)) {
             return -1;
         }
-        /* BOOL with =value consumed only one slot; otherwise (with
-           value from next argv) two. */
         return (slot->desc->type == AXL_ARG_BOOL || eq != NULL) ? 1 : 2;
     }
 
-    /* Short form: -f or -f value. Reject compact short groups
-       (-vh, -abc) — they silently dropped trailing chars in the
-       initial impl, which would surprise anyone trying tar-style
-       invocation. Force the explicit form: `-v -h`. */
+    /* Short form: -f or -f value. */
     char shortc = arg[1];
     if (arg[2] != '\0') {
         axl_print("%s: compact short-flag groups (-%c%c...) "
                   "are not supported; use -%c -%c instead\n",
-                  a->app->name, shortc, arg[2], shortc, arg[2]);
+                  a->path, shortc, arg[2], shortc, arg[2]);
         return -1;
     }
     ParsedArg *slot = slot_by_short(a, shortc);
     if (slot == NULL) {
-        axl_print("%s: unknown flag -%c\n", a->app->name, shortc);
+        axl_print("%s: unknown flag -%c\n", a->path, shortc);
         return -1;
     }
     if (slot->desc->type == AXL_ARG_BOOL) {
-        if (!parse_typed(slot, "true", a->app->name)) {
+        if (!parse_typed(slot, "true", a->path)) {
             return -1;
         }
         return 1;
     }
     if (i + 1 >= argc) {
-        axl_print("%s: -%c requires a value\n", a->app->name, shortc);
+        axl_print("%s: -%c requires a value\n", a->path, shortc);
         return -1;
     }
-    if (!parse_typed(slot, argv[i + 1], a->app->name)) {
+    if (!parse_typed(slot, argv[i + 1], a->path)) {
         return -1;
     }
     return 2;
 }
 
 static int
-validate_required(
-    AxlArgs *a
-    )
+validate_required(AxlArgs *a)
 {
-    const AxlArgDesc *pos_list = (a->verb != NULL)
-                                 ? a->verb->positionals
-                                 : a->app->positionals;
+    const AxlArgDesc *pos_list = a->node->positionals;
     if (pos_list == NULL) {
         return 0;
     }
@@ -668,10 +608,10 @@ validate_required(
         if (!pos_list[i].required) {
             continue;
         }
-        ParsedArg *slot = slot_by_name(a, pos_list[i].name);
+        ParsedArg *slot = slot_by_name_local(a, pos_list[i].name);
         if (slot == NULL || !slot->set) {
             axl_print("%s: missing required argument <%s>\n",
-                      a->app->name, pos_list[i].name);
+                      a->path, pos_list[i].name);
             return -1;
         }
     }
@@ -679,23 +619,67 @@ validate_required(
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Internal entry point — recursive
 // ---------------------------------------------------------------------------
 
-int
-axl_args_run(
-    int                   argc,
-    char                **argv,
-    const AxlArgsApp     *app
-    )
+/* Build the breadcrumb path for this node into @p out. Returns true
+   on success; false if the buffer would overflow. */
+static bool
+build_path(char *out, size_t cap, const char *parent_path, const char *name)
 {
-    if (app == NULL || app->name == NULL) {
+    if (parent_path == NULL) {
+        size_t n = axl_strlen(name);
+        if (n + 1 > cap) return false;
+        for (size_t i = 0; i <= n; i++) out[i] = name[i];
+        return true;
+    }
+    size_t pn = axl_strlen(parent_path);
+    size_t nn = axl_strlen(name);
+    if (pn + 1 + nn + 1 > cap) return false;
+    for (size_t i = 0; i < pn; i++) out[i] = parent_path[i];
+    out[pn] = ' ';
+    for (size_t i = 0; i <= nn; i++) out[pn + 1 + i] = name[i];
+    return true;
+}
+
+static bool
+validate_node_shape(const AxlArgsNode *node, const char *path)
+{
+    bool leaf   = node_is_leaf(node);
+    bool branch = node_is_branch(node);
+    if (leaf && branch) {
+        axl_print("%s: misconfigured (set verbs OR handler, not both)\n", path);
+        return false;
+    }
+    if (!leaf && !branch) {
+        axl_print("%s: misconfigured (no verbs and no handler)\n", path);
+        return false;
+    }
+    if (branch && node->positionals != NULL && node->positionals[0].name != NULL) {
+        axl_print("%s: misconfigured (branch nodes cannot have positionals)\n",
+                  path);
+        return false;
+    }
+    return true;
+}
+
+static int
+args_run_internal(int argc, char **argv,
+                  const AxlArgsNode *node,
+                  const char *parent_path,
+                  AxlArgs *parent_args)
+{
+    if (node == NULL || node->name == NULL) {
         return 1;
     }
-    if ((app->verbs != NULL) == (app->handler != NULL)) {
-        /* Both or neither — caller misconfigured the app. */
-        axl_print("%s: app misconfigured (set verbs or handler, not both)\n",
-                  app->name);
+
+    char path_buf[256];
+    if (!build_path(path_buf, sizeof(path_buf), parent_path, node->name)) {
+        axl_print("args: command path too long\n");
+        return 1;
+    }
+
+    if (!validate_node_shape(node, path_buf)) {
         return 1;
     }
 
@@ -703,35 +687,41 @@ axl_args_run(
     if (a == NULL) {
         return 1;
     }
-    a->app = app;
+    a->node   = node;
+    a->path   = path_buf;
+    a->parent = parent_args;
 
-    /* Initial slot table: globals + (single-verb positionals). Verb
-       slots get merged in once the verb is identified. */
-    if (!build_slots(a, app, NULL)) {
+    if (!build_slots(a, node)) {
         free_args(a);
         return 1;
     }
 
     int  rc          = 0;
-    bool parse_error = false;   /* distinguish from handler return value */
-    int  i           = 1;
+    bool parse_error = false;
+    int  i           = 1;   /* skip argv[0] (program/verb name) */
+
+    /* Branches: first non-flag positional is the verb name. Once
+       found, recurse with the remaining argv slice. */
+    const AxlArgsNode *next_branch = NULL;
+    int                next_argc   = 0;
+    char             **next_argv   = NULL;
+
     while (i < argc) {
         const char *arg = argv[i];
         if (is_help_flag(arg)) {
-            print_help_for(app, a->verb);
+            print_help_for(node, path_buf);
             free_args(a);
             return 0;
         }
-        /* In multi-verb mode before a verb is selected, the bare word
-           `help` is also accepted as a synonym for --help. */
-        if (app->verbs != NULL && a->verb == NULL
-            && axl_strcmp(arg, "help") == 0)
-        {
-            print_help_for(app, NULL);
+        /* Bare `help` is a help synonym only at branches before a
+           verb is selected (so `grep help file` still searches for
+           the word "help" in a leaf). */
+        if (node_is_branch(node) && axl_strcmp(arg, "help") == 0) {
+            print_help_for(node, path_buf);
             free_args(a);
             return 0;
         }
-        if (arg[0] == '-' && arg[1] != '\0' && arg[1] != '-') {
+        if (arg[0] == '-' && arg[1] != '\0') {
             int consumed = parse_flag_token(a, i, argc, argv);
             if (consumed < 0) {
                 parse_error = true;
@@ -741,33 +731,18 @@ axl_args_run(
             i += consumed;
             continue;
         }
-        if (arg[0] == '-' && arg[1] == '-' && arg[2] != '\0') {
-            int consumed = parse_flag_token(a, i, argc, argv);
-            if (consumed < 0) {
+        if (node_is_branch(node)) {
+            const AxlArgsNode *child = find_verb(node, arg);
+            if (child == NULL) {
+                axl_print("%s: unknown verb '%s'\n", path_buf, arg);
                 parse_error = true;
                 rc = 1;
                 goto out;
             }
-            i += consumed;
-            continue;
-        }
-        /* Positional — verb name in multi-verb mode (first one), or
-           a positional value for the current verb / single-verb. */
-        if (app->verbs != NULL && a->verb == NULL) {
-            const AxlVerb *v = find_verb(app, arg);
-            if (v == NULL) {
-                axl_print("%s: unknown verb '%s'\n", app->name, arg);
-                parse_error = true;
-                rc = 1;
-                goto out;
-            }
-            if (!attach_verb(a, v)) {
-                parse_error = true;
-                rc = 1;
-                goto out;
-            }
-            i++;
-            continue;
+            next_branch = child;
+            next_argc   = argc - i;     /* slice starting at the verb name */
+            next_argv   = argv + i;     /* inner skips index 0 (verb name) */
+            break;                      /* recursion happens after pre_run */
         }
         if (!consume_positional(a, arg)) {
             parse_error = true;
@@ -777,41 +752,52 @@ axl_args_run(
         i++;
     }
 
-    /* No verb supplied → show help. */
-    if (app->verbs != NULL && a->verb == NULL) {
-        print_help_for(app, NULL);
+    /* Branch with no verb supplied → show help. */
+    if (node_is_branch(node) && next_branch == NULL) {
+        print_help_for(node, path_buf);
         free_args(a);
         return 1;
     }
-    if (validate_required(a) != 0) {
+
+    /* Leaf: validate required positionals before invoking handler. */
+    if (node_is_leaf(node) && validate_required(a) != 0) {
         parse_error = true;
         rc = 1;
         goto out;
     }
-    if (app->pre_run != NULL) {
-        app->pre_run(a);
+
+    if (node->pre_run != NULL) {
+        node->pre_run(a);
     }
 
-    AxlVerbHandler handler = (a->verb != NULL) ? a->verb->handler : app->handler;
-    if (handler == NULL) {
-        axl_print("%s: no handler for verb\n", app->name);
-        rc = 1;
-        goto out;
+    if (next_branch != NULL) {
+        /* Recurse into the matched child, carrying our path as
+           parent_path and our AxlArgs as parent_args so the child's
+           accessors can walk up to read our flags. */
+        rc = args_run_internal(next_argc, next_argv, next_branch,
+                               path_buf, a);
+    } else {
+        /* Leaf — invoke handler. */
+        rc = node->handler(a);
     }
-    rc = handler(a);
 
 out:
-    /* Only show usage on parse / validation errors. Handler-returned
-       error codes are runtime failures (file not found, BMC offline,
-       etc.) — flooding the screen with usage after a real error
-       message is hostile, and was the loudest UX regression vs the
-       prior AxlConfig-based tools. */
     if (parse_error) {
         axl_print("\n");
-        print_help_for(app, a->verb);
+        print_help_for(node, path_buf);
     }
     free_args(a);
     return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+int
+axl_args_run(int argc, char **argv, const AxlArgsNode *root)
+{
+    return args_run_internal(argc, argv, root, NULL, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -819,10 +805,7 @@ out:
 // ---------------------------------------------------------------------------
 
 const char *
-axl_args_get_string(
-    AxlArgs    *args,
-    const char *name
-    )
+axl_args_get_string(AxlArgs *args, const char *name)
 {
     if (args == NULL) {
         return NULL;
@@ -832,10 +815,7 @@ axl_args_get_string(
 }
 
 bool
-axl_args_get_bool(
-    AxlArgs    *args,
-    const char *name
-    )
+axl_args_get_bool(AxlArgs *args, const char *name)
 {
     if (args == NULL) {
         return false;
@@ -847,7 +827,6 @@ axl_args_get_bool(
     if (s->set) {
         return s->uint_value != 0;
     }
-    /* Fall back to default_value if it was provided. */
     return s->str_value != NULL
         && (axl_strcmp(s->str_value, "true") == 0
             || axl_strcmp(s->str_value, "1") == 0
@@ -855,10 +834,7 @@ axl_args_get_bool(
 }
 
 uint64_t
-axl_args_get_uint(
-    AxlArgs    *args,
-    const char *name
-    )
+axl_args_get_uint(AxlArgs *args, const char *name)
 {
     if (args == NULL) {
         return 0;
@@ -868,10 +844,7 @@ axl_args_get_uint(
 }
 
 int64_t
-axl_args_get_int(
-    AxlArgs    *args,
-    const char *name
-    )
+axl_args_get_int(AxlArgs *args, const char *name)
 {
     if (args == NULL) {
         return 0;
@@ -881,9 +854,7 @@ axl_args_get_int(
 }
 
 int
-axl_args_get_pos_count(
-    AxlArgs *args
-    )
+axl_args_get_pos_count(AxlArgs *args)
 {
     if (args == NULL || args->variadic == NULL) {
         return 0;
@@ -892,10 +863,7 @@ axl_args_get_pos_count(
 }
 
 const char *
-axl_args_get_pos(
-    AxlArgs *args,
-    int      index
-    )
+axl_args_get_pos(AxlArgs *args, int index)
 {
     if (args == NULL || args->variadic == NULL || index < 0) {
         return NULL;
@@ -908,10 +876,7 @@ axl_args_get_pos(
 }
 
 int
-axl_args_get_multi_count(
-    AxlArgs    *args,
-    const char *name
-    )
+axl_args_get_multi_count(AxlArgs *args, const char *name)
 {
     if (args == NULL) {
         return 0;
@@ -924,11 +889,7 @@ axl_args_get_multi_count(
 }
 
 const char *
-axl_args_get_multi(
-    AxlArgs    *args,
-    const char *name,
-    int         index
-    )
+axl_args_get_multi(AxlArgs *args, const char *name, int index)
 {
     if (args == NULL || index < 0) {
         return NULL;
@@ -945,17 +906,22 @@ axl_args_get_multi(
 }
 
 void *
-axl_args_user_data(
-    AxlArgs *args
-    )
+axl_args_user_data(AxlArgs *args)
 {
-    return (args != NULL && args->app != NULL) ? args->app->user_data : NULL;
+    while (args != NULL) {
+        if (args->node != NULL && args->node->user_data != NULL) {
+            return args->node->user_data;
+        }
+        args = args->parent;
+    }
+    return NULL;
 }
 
 const char *
-axl_args_program_name(
-    AxlArgs *args
-    )
+axl_args_program_name(AxlArgs *args)
 {
-    return (args != NULL && args->app != NULL) ? args->app->name : NULL;
+    while (args != NULL && args->parent != NULL) {
+        args = args->parent;
+    }
+    return (args != NULL && args->node != NULL) ? args->node->name : NULL;
 }

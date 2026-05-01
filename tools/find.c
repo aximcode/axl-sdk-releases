@@ -17,7 +17,7 @@
 
 static bool verbose = false;
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "name",    .type = AXL_ARG_STRING,
       .help = "Glob pattern (* and ? wildcards)" },
     { .name = "type",    .type = AXL_ARG_STRING,
@@ -27,7 +27,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "path", .type = AXL_ARG_STRING,
       .help = "Starting path (default: '.')" },
     {0}
@@ -192,11 +192,11 @@ run_find(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Find",
         .help         = "Find files and directories (UNIX find-style)",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_find,
     });
 }

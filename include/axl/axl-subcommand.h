@@ -19,17 +19,17 @@
  *
  *     // before:
  *     static int do_bios(int argc, char **argv) { ... }
- *     static const AxlSubcommand kCommands[] = {
+ *     static const AxlSubcommand commands[] = {
  *         { "bios", do_bios, "[test|pci|irq|slot|emb]",
  *           "do bios test  — ..." },
  *     };
  *     int main(int argc, char **argv) {
- *         return axl_subcommand_dispatch(kCommands, ARRAY_LEN(kCommands),
+ *         return axl_subcommand_dispatch(commands, ARRAY_LEN(commands),
  *             argc, argv, "do");
  *     }
  *
  *     // after:
- *     static const AxlArgDesc kBiosArgs[] = {
+ *     static const AxlArgDesc bios_args[] = {
  *         { .name = "args", .type = AXL_ARG_MULTI,
  *           .help = "subcommand arguments" }, {0}
  *     };
@@ -38,13 +38,13 @@
  *         const char *sub = (n > 0) ? axl_args_get_pos(a, 0) : NULL;
  *         ...
  *     }
- *     static const AxlVerb kVerbs[] = {
- *         { .name = "bios", .handler = do_bios, .positionals = kBiosArgs,
+ *     static const AxlArgsNode verbs[] = {
+ *         { .name = "bios", .handler = do_bios, .positionals = bios_args,
  *           .help = "BIOS / SMBIOS info (test|pci|irq|slot|emb)" }, {0}
  *     };
  *     int main(int argc, char **argv) {
- *         return axl_args_run(argc, argv, &(AxlArgsApp){
- *             .name = "do", .verbs = kVerbs,
+ *         return axl_args_run(argc, argv, &(AxlArgsNode){
+ *             .name = "do", .verbs = verbs,
  *         });
  *     }
  */

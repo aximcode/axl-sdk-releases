@@ -16,13 +16,13 @@
 
 static bool verbose = false;
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Verbose output" },
     {0}
 };
 
-static const AxlArgDesc kSection[] = {
+static const AxlArgDesc section[] = {
     { .name = "section", .type = AXL_ARG_STRING,
       .help = "Optional: cpu | mem | fw | smbios | arch (default: all)" },
     {0}
@@ -491,11 +491,11 @@ run_sysinfo(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "SysInfo",
         .help         = "Print system information (CPU, memory, firmware, SMBIOS, arch)",
-        .global_flags = kFlags,
-        .positionals  = kSection,
+        .flags          = flags,
+        .positionals  = section,
         .handler      = run_sysinfo,
     });
 }

@@ -24,6 +24,7 @@ the `include/axl/` boundary.
 | Local variables | `snake_case` | `char *line` | |
 | Parameters | `snake_case` | `const char *key` | |
 | Static/file scope | `snake_case` | `static bool verbose` | |
+| Static const tables | `snake_case` (no `k`-prefix) | `static const AxlArgsNode verbs[]` | |
 
 ## Types — Standard C Only in Public API
 
@@ -290,7 +291,7 @@ UEFI applications come in two shapes:
        return 0;
    }
 
-   static const AxlSubcommand kCommands[] = {
+   static const AxlSubcommand commands[] = {
        { "bios",  do_bios,  "[test|pci|irq|slot|emb]",
          "do bios test  — run BIOS POST self-test\n" },
        { "sysid", do_sysid, "[hexValue]", NULL },
@@ -299,8 +300,8 @@ UEFI applications come in two shapes:
    int
    main(int argc, char **argv)
    {
-       return axl_subcommand_dispatch(kCommands,
-           sizeof(kCommands) / sizeof(kCommands[0]),
+       return axl_subcommand_dispatch(commands,
+           sizeof(commands) / sizeof(commands[0]),
            argc, argv, "do");
    }
    ```

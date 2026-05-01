@@ -1739,13 +1739,31 @@ during code review and refactor work, not during original planning.
       can review and patch. A few days' polishing to pass
       `lintian`/`rpmlint` clean. Ties directly to the `-devel` split
       above.
-- [ ] **CMake migration of the library build itself.** Parked April
-      2026. The current Makefile is 466 lines and works fine; CMake
-      is awkward for freestanding UEFI cross-compile (toolchain files,
-      two build trees, custom `.so → .efi objcopy` rules). Revisit
-      only if a concrete pain point justifies the cost — e.g., a
-      consumer wants to embed AXL as a CMake subdirectory or a GUI
-      IDE needs CMake project files for navigation.
+- [ ] **Migrate library build to meson+ninja or cmake+ninja.**
+      Parked April 2026 as "wait for a concrete pain point"; the
+      first one landed during the v0.7.3 AxlArgs unification:
+      restructuring a public-header struct (`AxlArgsApp`/`AxlVerb` →
+      `AxlArgsNode`) produced an inconsistent incremental build
+      where `libaxl.a` had members rebuilt against the new header
+      but the test binaries linked a `.a` snapshot that the runtime
+      hit as stale state — `axl_mem_fail_next_alloc` test counter
+      drifted, AxlMem stalled. `make clean && make` cleared it; the
+      fix went into project CLAUDE.md as a manual workaround.
+      Root cause is `ar rcs` not tracking per-member timestamps
+      cleanly + GNU make's `-MD` deps not catching cross-archive
+      dependencies. Both meson and cmake (with ninja generator)
+      handle this naturally via their internal dep DBs.
+      **Preference**: meson — it's lighter, the toolchain-file
+      story for freestanding UEFI cross-compile is cleaner than
+      CMake's, and it generates compile_commands.json for free.
+      Open question: do we keep the `.so → .efi objcopy` step in
+      the build system or move it to a shared script that both
+      meson and the consumer-side `axl-cc` invoke. Real work
+      (multi-day); revisit only when this bites again or a
+      consumer asks. Triggering condition: another stale-build
+      incident, OR landing IDE integration that needs
+      `compile_commands.json` (clangd works without it but the
+      experience is degraded).
 
 ### Documentation gaps
 

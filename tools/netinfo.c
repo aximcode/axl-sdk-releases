@@ -16,19 +16,19 @@
 
 static bool verbose = false;
 
-static const AxlArgDesc kGlobalFlags[] = {
+static const AxlArgDesc global_flags[] = {
     { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Verbose output (debug-level driver-locate logs)" },
     {0}
 };
 
-static const AxlArgDesc kPingFlags[] = {
+static const AxlArgDesc ping_flags[] = {
     { .name = "count", .short_name = 'c', .type = AXL_ARG_U32, .base = 10,
       .help = "Number of pings (default: 4)" },
     {0}
 };
 
-static const AxlArgDesc kPingPos[] = {
+static const AxlArgDesc ping_pos[] = {
     { .name = "target", .type = AXL_ARG_STRING, .required = true,
       .help = "Target IP address" },
     {0}
@@ -401,11 +401,11 @@ do_ping_verb(AxlArgs *a)
     return do_ping(target, ping_count);
 }
 
-static const AxlVerb kVerbs[] = {
+static const AxlArgsNode verbs[] = {
     { .name = "list", .handler = do_list_verb,
       .help = "List network interfaces and their state" },
     { .name = "ping", .handler = do_ping_verb,
-      .flags = kPingFlags, .positionals = kPingPos,
+      .flags = ping_flags, .positionals = ping_pos,
       .help = "Send ICMP echo to a target IP" },
     {0}
 };
@@ -413,11 +413,11 @@ static const AxlVerb kVerbs[] = {
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "NetInfo",
         .help         = "Network interface inventory and ICMP ping",
-        .global_flags = kGlobalFlags,
-        .verbs        = kVerbs,
+        .flags          = global_flags,
+        .verbs        = verbs,
         .pre_run      = netinfo_pre_run,
     });
 }

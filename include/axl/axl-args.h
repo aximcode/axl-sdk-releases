@@ -4,58 +4,97 @@
 /**
  * axl-args.h:
  *
- * Declarative command-line parser for AXL tools. Replaces the
- * AxlConfig + axl_subcommand_dispatch + hand-rolled positional-arg
- * boilerplate that every tool used to repeat.
+ * Declarative command-line parser for AXL tools. A tool declares a
+ * static @ref AxlArgsNode tree (program name + flags + positionals +
+ * handler, OR a list of child verbs) and calls @ref axl_args_run from
+ * main. The framework parses argv, validates types and bounds,
+ * generates a structured `--help`, and dispatches to the matching
+ * leaf handler.
  *
- * A tool declares a static @ref AxlArgsApp tree (program name +
- * synopsis + global flags + verbs + per-verb flags + per-verb
- * positional args + handler) and calls @ref axl_args_run from main.
- * The framework parses argv, validates types and bounds, generates a
- * structured `--help`, and dispatches to the right verb handler.
+ * The same `AxlArgsNode` type describes the root program AND every
+ * verb at every level. A node is either a **leaf** (sets `handler`,
+ * optionally `positionals`) or a **branch** (sets `verbs`, an array
+ * of child nodes terminated by a zero entry). Mutually exclusive,
+ * validated at parse time.
  *
- * Example (memspd-shaped tool with three verbs):
+ * **Single-leaf tool** (one shape, no verbs):
  *
  * @code
- * static int do_show(AxlArgs *a) {
- *     uint8_t addr = (uint8_t)axl_args_get_uint(a, "slot");
- *     // slot is already validated against min/max by the framework
- *     return read_and_print(addr);
+ * static int do_run(AxlArgs *a) {
+ *     const char *path = axl_args_get_string(a, "path");
+ *     return process(path);
  * }
  *
- * static const AxlArgDesc kSlotArg[] = {
- *     { .name = "slot", .type = AXL_ARG_U8, .base = 0,
- *       .min = 0x50, .max = 0x57, .required = true,
- *       .help = "SMBus slot address (hex)" },
- *     {0}
- * };
- *
- * static const AxlVerb kVerbs[] = {
- *     { .name = "show", .handler = do_show, .positionals = kSlotArg,
- *       .help = "Decoded fields for one slot" },
- *     {0}
- * };
- *
- * static const AxlArgDesc kFlags[] = {
- *     { .name = "jedec-file", .short_name = 'j', .type = AXL_ARG_STRING,
- *       .help = "Path to JEDEC vendor JSON sidecar" },
+ * static const AxlArgDesc positionals[] = {
+ *     { .name = "path", .type = AXL_ARG_STRING, .required = true,
+ *       .help = "Input file" },
  *     {0}
  * };
  *
  * int main(int argc, char **argv) {
- *     return axl_args_run(argc, argv, &(AxlArgsApp){
- *         .name = "memspd",
- *         .help = "Read JEDEC SPD content",
- *         .global_flags = kFlags,
- *         .verbs = kVerbs,
+ *     return axl_args_run(argc, argv, &(AxlArgsNode){
+ *         .name = "mytool", .help = "Process a file",
+ *         .positionals = positionals, .handler = do_run,
  *     });
  * }
  * @endcode
  *
- * `--help` and `-h` are always recognised. Unknown flags / missing
- * required positionals / out-of-range typed args produce an error
- * message + the auto-generated usage and exit non-zero, with no
- * handler invocation.
+ * **Multi-verb tool** (one level of verbs):
+ *
+ * @code
+ * static const AxlArgsNode verbs[] = {
+ *     { .name = "show", .handler = do_show, .positionals = slot_arg,
+ *       .help = "Decoded fields for one slot" },
+ *     { .name = "list", .handler = do_list,
+ *       .help = "List populated slots" },
+ *     {0}
+ * };
+ *
+ * int main(int argc, char **argv) {
+ *     return axl_args_run(argc, argv, &(AxlArgsNode){
+ *         .name = "memspd", .help = "Read JEDEC SPD content",
+ *         .flags = flags, .verbs = verbs,
+ *     });
+ * }
+ * @endcode
+ *
+ * **Nested verbs** (`do <category> <verb>` shape):
+ *
+ * @code
+ * static const AxlArgsNode bios_verbs[] = {
+ *     { .name = "test", .handler = bios_test, .help = "..." },
+ *     { .name = "pci",  .handler = bios_pci,  .help = "..." },
+ *     {0}
+ * };
+ *
+ * static const AxlArgsNode top_verbs[] = {
+ *     { .name = "bios", .verbs = bios_verbs,
+ *       .help = "BIOS / SMBIOS subcommands" },
+ *     { .name = "load", .handler = do_load, .positionals = load_args,
+ *       .help = "Load and run a UEFI image" },
+ *     {0}
+ * };
+ *
+ * int main(int argc, char **argv) {
+ *     return axl_args_run(argc, argv, &(AxlArgsNode){
+ *         .name = "do", .help = "Hardware diagnostic CLI",
+ *         .verbs = top_verbs,
+ *     });
+ * }
+ * @endcode
+ *
+ * `--help` and `-h` are always recognised and recurse naturally —
+ * `do --help` shows the top tree, `do bios --help` shows just the
+ * bios subtree. Unknown flags / verbs / out-of-range typed args
+ * produce an error message qualified by the full breadcrumb
+ * (`do bios: unknown verb 'flarble'`) and the auto-generated usage,
+ * exit non-zero, no handler invocation.
+ *
+ * **Flag and `user_data` visibility across levels.** Flags declared
+ * on a parent node are visible to descendant handlers via the same
+ * accessors (`axl_args_get_*` walks up the parent chain on miss).
+ * `user_data` works the same way — descendants inherit the nearest
+ * non-NULL parent value. Per-leaf positionals are leaf-local.
  */
 
 #ifndef AXL_ARGS_H
@@ -117,24 +156,27 @@ typedef struct {
 } AxlArgDesc;
 
 // ---------------------------------------------------------------------------
-// Verb tree + app
+// Node tree
 // ---------------------------------------------------------------------------
 
 typedef struct AxlArgs AxlArgs;
+typedef struct AxlArgsNode AxlArgsNode;
 
 /**
  * @brief Verb handler signature. Return value becomes the program's
  *     exit code.
  *
  * The @p args object exposes parsed flags and positional values via
- * the @c axl_args_get_* accessors. Do not call @c axl_args_run
- * recursively.
+ * the @c axl_args_get_* accessors; flags declared on parent nodes
+ * are visible (the accessors walk up the parent chain on miss).
  *
  * **Lifetime contract** — important when the handler enters an event
  * loop (@ref axl_loop_run) or otherwise blocks before returning:
  *  - The @c AxlArgs struct itself, all `axl_args_get_*` accessor
  *    return values, and the variadic-positional view all live until
- *    the handler returns to @ref axl_args_run.
+ *    the handler returns to @ref axl_args_run (every level's
+ *    `AxlArgs` lives on its own stack frame, so a deep handler still
+ *    sees its parent's flags through the recursion).
  *  - String values returned by @c axl_args_get_string and
  *    @c axl_args_get_multi point into the program's @c argv (which
  *    the runtime keeps alive for the program's lifetime). They
@@ -154,68 +196,67 @@ typedef struct AxlArgs AxlArgs;
 typedef int (*AxlVerbHandler)(AxlArgs *args);
 
 /**
- * @brief Optional pre-handler hook. Called once after argument
- *     parsing succeeds, before the verb handler runs. Useful for
- *     setting up shared resources (config files, opening sessions).
+ * @brief Optional pre-handler hook. Called once at this node's level
+ *     after argument parsing succeeds, before recursing into a child
+ *     verb (branch) or invoking the leaf handler. Useful for setting
+ *     up shared resources whose lifetime spans every descendant
+ *     (config files, opening sessions). When stacked across nested
+ *     levels, parent's @c pre_run runs before child's.
  */
 typedef void (*AxlPreRunFunc)(AxlArgs *args);
 
 /**
- * @brief A single verb in a multi-verb tool.
- */
-typedef struct {
-    const char        *name;         ///< verb name (e.g. "show", "list")
-    const char        *help;         ///< one-line description
-    const AxlArgDesc  *flags;        ///< per-verb flags, NULL-terminated; may be NULL
-    const AxlArgDesc  *positionals;  ///< positionals, NULL-terminated; may be NULL
-    AxlVerbHandler     handler;      ///< must be non-NULL
-} AxlVerb;
-
-/**
- * @brief Top-level application descriptor.
+ * @brief A single node in the args tree. Same type at every level —
+ *     the root program, an inner branch ("category"), and a leaf
+ *     verb all use it.
  *
- * Two shapes:
- *   - Multi-verb: set @c verbs (NULL-terminated). The first
- *     positional is the verb name; remaining positionals are
- *     consumed by the verb's @c positionals. Use @c handler == NULL.
- *   - Single-verb: set @c handler and (optionally) @c positionals.
- *     Leave @c verbs == NULL.
+ * A node is exactly one of:
+ *   - **Leaf**: `handler` set, `verbs` NULL (or empty). Positionals
+ *     and per-leaf flags consumed at this level; handler invoked
+ *     once parsing completes.
+ *   - **Branch**: `verbs` set (NULL-terminated array of child
+ *     `AxlArgsNode`s), `handler` NULL. Positionals MUST be NULL on a
+ *     branch — the first non-flag argument is the verb name.
+ *
+ * A node with both, or neither, is a configuration error and the
+ * parser exits non-zero before invoking anything.
+ *
+ * Designated initializers expected; zero defaults are sane.
  */
-typedef struct {
-    const char        *name;          ///< program name (used in usage line)
-    const char        *help;          ///< one-line synopsis
-    const char        *usage;         ///< optional usage suffix (after verb summary)
-    const AxlArgDesc  *global_flags;  ///< flags accepted in both modes
-    const AxlArgDesc  *positionals;   ///< single-verb mode only
-    const AxlVerb     *verbs;         ///< multi-verb mode (NULL-terminated)
-    AxlVerbHandler     handler;       ///< single-verb mode
-    AxlPreRunFunc      pre_run;       ///< optional pre-handler hook
-    void              *user_data;     ///< available via axl_args_user_data
-} AxlArgsApp;
+struct AxlArgsNode {
+    const char           *name;          ///< program name at root, verb name at depth
+    const char           *help;          ///< one-line description (shown in --help)
+    const AxlArgDesc     *flags;         ///< per-node flags, NULL-terminated; may be NULL
+    const AxlArgDesc     *positionals;   ///< leaf only (positional args, NULL-terminated)
+    const AxlArgsNode    *verbs;         ///< branch only (child nodes, zero-entry-terminated)
+    AxlVerbHandler        handler;       ///< leaf only
+    AxlPreRunFunc         pre_run;       ///< optional, runs at this level top-down
+    void                 *user_data;     ///< per-node; descendants inherit nearest non-NULL
+};
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Parse @p argv against @p app and dispatch the matching
- *     verb (or single handler).
+ * @brief Parse @p argv against @p root and dispatch to the matching
+ *     leaf handler.
  *
  * Behaviour:
- *  - `--help` / `-h` at any position prints auto-generated help to
- *    stdout and returns 0.
+ *  - `--help` / `-h` at any level prints the auto-generated help for
+ *    that level to stdout and returns 0.
  *  - Unknown flags / unknown verbs / missing required positionals /
- *    out-of-range typed args print an error to stderr followed by
- *    the usage line and return 1.
- *  - Successful dispatch returns whatever the handler returned.
+ *    out-of-range typed args print a breadcrumb-prefixed error to
+ *    stderr followed by the usage line and return 1.
+ *  - Successful dispatch returns whatever the leaf handler returned.
  *
  * @return handler return value, 0 on `--help`, 1 on parse error.
  */
 int
 axl_args_run(
-    int                   argc,
-    char                **argv,
-    const AxlArgsApp     *app
+    int                    argc,
+    char                 **argv,
+    const AxlArgsNode     *root
 );
 
 // ---------------------------------------------------------------------------
@@ -226,7 +267,8 @@ axl_args_run(
  * @brief Get a string-valued flag or positional by name.
  *
  * Returns the parsed value, the descriptor's @c default_value if the
- * arg was unset, or NULL if no such name exists.
+ * arg was unset, or NULL if no such name exists at this level OR
+ * any ancestor level (parent walk).
  */
 const char *
 axl_args_get_string(
@@ -236,7 +278,7 @@ axl_args_get_string(
 
 /**
  * @brief Get a boolean flag value by name. Defaults to false when
- *     unset and no @c default_value is configured.
+ *     unset and no @c default_value is configured. Walks parents.
  */
 bool
 axl_args_get_bool(
@@ -248,9 +290,7 @@ axl_args_get_bool(
  * @brief Get an unsigned-integer flag or positional by name.
  *
  * Returns the parsed value (already validated against @c min / @c max
- * by the framework), or 0 if unset / unknown name. For
- * `AXL_ARG_U8`/`U16`/`U32` the value is range-checked but returned
- * via the wider type for caller convenience.
+ * by the framework), or 0 if unset / unknown name. Walks parents.
  */
 uint64_t
 axl_args_get_uint(
@@ -261,6 +301,7 @@ axl_args_get_uint(
 /**
  * @brief Get a signed-integer flag or positional by name. (Only
  *     `AXL_ARG_S64` is supported.) Returns 0 if unset / unknown.
+ *     Walks parents.
  */
 int64_t
 axl_args_get_int(
@@ -269,9 +310,9 @@ axl_args_get_int(
 );
 
 /**
- * @brief Number of variadic positional arguments collected (only
- *     meaningful when a positional descriptor used `AXL_ARG_MULTI`
- *     as its tail entry).
+ * @brief Number of variadic positional arguments collected at this
+ *     level (only meaningful when the leaf's positional descriptor
+ *     used `AXL_ARG_MULTI` as its tail entry).
  */
 int
 axl_args_get_pos_count(
@@ -291,6 +332,8 @@ axl_args_get_pos(
 
 /**
  * @brief Number of times a `AXL_ARG_MULTI` flag was specified.
+ *     Walks parents (so a leaf can inspect a `--include` repeatable
+ *     declared on the root).
  */
 int
 axl_args_get_multi_count(
@@ -301,6 +344,7 @@ axl_args_get_multi_count(
 /**
  * @brief Get the n-th value of a repeatable (`AXL_ARG_MULTI`) flag,
  *     or NULL if @p index >= count or the flag was never specified.
+ *     Walks parents.
  */
 const char *
 axl_args_get_multi(
@@ -310,8 +354,8 @@ axl_args_get_multi(
 );
 
 /**
- * @brief Return the @c user_data pointer that was set on the
- *     @ref AxlArgsApp. Available to handlers without globals.
+ * @brief Return the nearest non-NULL @c user_data found by walking
+ *     from this node up to the root. NULL if no node set one.
  */
 void *
 axl_args_user_data(
@@ -319,7 +363,7 @@ axl_args_user_data(
 );
 
 /**
- * @brief Return the program name (== @c app->name).
+ * @brief Return the program name (the root node's @c name).
  */
 const char *
 axl_args_program_name(
@@ -327,8 +371,9 @@ axl_args_program_name(
 );
 
 /**
- * @brief Print the auto-generated help to stdout. Useful when a
- *     handler wants to surface help on bad input it detects itself.
+ * @brief Print the auto-generated help for this node to stdout.
+ *     Useful when a handler wants to surface help on bad input it
+ *     detects itself.
  */
 void
 axl_args_print_help(

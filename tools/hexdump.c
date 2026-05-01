@@ -13,7 +13,7 @@
 
 #include <axl.h>
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "offset",  .short_name = 'o', .type = AXL_ARG_U64, .base = 0,
       .help = "Start offset (hex 0x prefix, or decimal)" },
     { .name = "length",  .short_name = 'n', .type = AXL_ARG_U64, .base = 0,
@@ -23,7 +23,7 @@ static const AxlArgDesc kFlags[] = {
     {0}
 };
 
-static const AxlArgDesc kPositional[] = {
+static const AxlArgDesc positional[] = {
     { .name = "file", .type = AXL_ARG_STRING, .required = true,
       .help = "Path to the file to dump" },
     {0}
@@ -143,11 +143,11 @@ run_hexdump(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Hexdump",
         .help         = "Hex+ASCII file dump",
-        .global_flags = kFlags,
-        .positionals  = kPositional,
+        .flags          = flags,
+        .positionals  = positional,
         .handler      = run_hexdump,
     });
 }

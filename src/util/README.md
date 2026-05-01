@@ -368,13 +368,10 @@ const char *port_str = axl_config_get(cfg, "port");  // "9090"
 
 ### Command-Line Parsing
 
-AxlConfig is no longer a CLI parser — that role moved to **AxlArgs**
-(`<axl/axl-args.h>`), which adds verb trees, typed positional args
-with min/max bounds, and auto-generated `--help`. Tools that used
-`axl_config_parse_args` / `axl_config_pos` / `axl_config_usage`
-should call `axl_args_run` instead. AxlConfig stays focused on the
-live property-bag use case (HTTP client/server settings, future
-modules with tunable runtime properties).
+CLI parsing moved to **AxlArgs** (`<axl/axl-args.h>`) — see the
+*Command-Line Parsing (AxlArgs)* section below. AxlConfig stays
+focused on the live property-bag use case (HTTP client/server
+settings, future modules with tunable runtime properties).
 
 ### Multi-Value Options
 
@@ -399,6 +396,140 @@ axl_config_set(defaults, "port", "8080");
 AxlConfig *override = axl_config_new_with_parent(opts, defaults);
 // override inherits "port"="8080" until explicitly set
 ```
+
+## Command-Line Parsing (AxlArgs)
+
+Declarative CLI parser — the tool declares a static `AxlArgsNode`
+tree, calls `axl_args_run` from `main`, and the framework parses
+argv, validates types and bounds, generates `--help`, and dispatches
+to the matching leaf handler.
+
+Header: `<axl/axl-args.h>`.
+
+### One node type, three shapes
+
+A single recursive node type (`AxlArgsNode`) describes the program
+root, every inner branch ("category"), and every leaf verb. A node is
+exactly one of:
+
+- **Leaf** — `handler` set, `verbs` NULL. Optionally has
+  `positionals`. Handler runs once parsing completes at this level.
+- **Branch** — `verbs` set (NULL-terminated array of child nodes),
+  `handler` NULL. Positionals MUST be NULL (the first non-flag
+  argument is the verb name).
+- **Single-handler app** — root happens to be a leaf (no verbs).
+  The whole tool is one shape.
+
+A node with both, or neither, is a configuration error and the
+parser exits non-zero before invoking anything.
+
+### Single-handler tool
+
+```c
+static int do_run(AxlArgs *a) {
+    const char *path = axl_args_get_string(a, "path");
+    return process(path);
+}
+
+int main(int argc, char **argv) {
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name = "mytool", .help = "Process a file",
+        .positionals = (AxlArgDesc[]){
+            { .name = "path", .type = AXL_ARG_STRING, .required = true,
+              .help = "Input file" },
+            {0}
+        },
+        .handler = do_run,
+    });
+}
+```
+
+### Multi-verb tool
+
+```c
+static const AxlArgsNode verbs[] = {
+    { .name = "show", .handler = do_show, .positionals = slot_pos,
+      .help = "Decoded fields for one slot" },
+    { .name = "list", .handler = do_list,
+      .help = "List populated slots" },
+    {0}
+};
+
+int main(int argc, char **argv) {
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name = "memspd", .help = "Read JEDEC SPD content",
+        .flags = flags, .verbs = verbs,
+    });
+}
+```
+
+### Nested verbs (`<top> <category> <verb>`)
+
+```c
+static const AxlArgsNode bios_verbs[] = {
+    { .name = "test", .handler = bios_test, .help = "Run BIOS self-test" },
+    { .name = "pci",  .handler = bios_pci,  .help = "List BIOS-PCI map" },
+    {0}
+};
+
+static const AxlArgsNode top_verbs[] = {
+    { .name = "bios", .verbs = bios_verbs,
+      .help = "BIOS / SMBIOS subcommands" },
+    { .name = "load", .handler = do_load, .positionals = load_args,
+      .help = "Load and run a UEFI image" },
+    {0}
+};
+
+int main(int argc, char **argv) {
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name = "do", .help = "Hardware diagnostic CLI",
+        .flags = root_flags,
+        .verbs = top_verbs,
+    });
+}
+```
+
+`do bios test` invokes the leaf with the breadcrumb in scope; if
+the user types `do bios flarble`, the error reads
+`do bios: unknown verb 'flarble'`. `do bios --help` recurses into
+the bios subtree's auto-generated help.
+
+### Parent-flag visibility
+
+Flags declared on a parent node are visible to descendant handlers
+via the same accessors. A `--verbose` declared on the root is
+readable from a leaf two levels deep:
+
+```c
+static int bios_test(AxlArgs *a) {
+    bool verbose = axl_args_get_bool(a, "verbose");   // root flag
+    uint8_t slot = (uint8_t)axl_args_get_uint(a, "slot");  // leaf positional
+    /* ... */
+}
+```
+
+Same for `axl_args_user_data` — descendants inherit the nearest
+non-NULL value walking up the chain.
+
+### Error attribution
+
+Errors are prefixed with the full breadcrumb path so users know
+exactly which level rejected their input:
+
+```
+do bios test: 'foo' for --slot is not a valid integer
+do pci: unknown verb 'flarble'
+do: unknown flag --verbosee
+```
+
+### Lifetime
+
+`AxlArgs` and accessor return values live until the leaf handler
+returns. String values point into argv (program-lifetime); copy
+numeric values, copy variadic-positional pointers if you need them
+past handler return. Never call `axl_args_get_*` from a loop
+callback that fires after the handler returns — extract everything
+into local state inside the handler first.
 
 ## Path Manipulation
 

@@ -246,15 +246,15 @@ test_app_argv0_is_stable(void)
        axl_app_argv0 is silently following the dispatcher — a
        regression. */
     g_verb_app_argv0 = NULL;
-    static const AxlVerb kVerbs[] = {
+    static const AxlArgsNode verbs[] = {
         { .name = "vstub", .handler = argv0_test_verb,
           .help = "argv0 stability test stub" },
         {0}
     };
     char *fake_argv[] = { (char *)"axl-test-runtime", (char *)"vstub", NULL };
-    int rc = axl_args_run(2, fake_argv, &(AxlArgsApp){
+    int rc = axl_args_run(2, fake_argv, &(AxlArgsNode){
         .name  = "axl-test-runtime",
-        .verbs = kVerbs,
+        .verbs = verbs,
     });
 
     test_check(rc == 0, "app_argv0: AxlArgs verb dispatch ran the stub");

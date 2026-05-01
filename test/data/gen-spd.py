@@ -96,8 +96,8 @@ def main() -> None:
     ddr5_padded = ddr5 + b'\x00' * ((page_size - len(ddr5) % page_size) % page_size)
     (out_dir / 'spd-ddr4-micron-8gb.bin').write_bytes(ddr4_padded)
     (out_dir / 'spd-ddr5-samsung-16gb.bin').write_bytes(ddr5_padded)
-    write_c_array(out_dir / 'spd-ddr4-micron-8gb.h', 'kSpdDdr4Micron8Gb', ddr4)
-    write_c_array(out_dir / 'spd-ddr5-samsung-16gb.h', 'kSpdDdr5Samsung16Gb', ddr5)
+    write_c_array(out_dir / 'spd-ddr4-micron-8gb.h', 'spd_ddr4_micron_8gb', ddr4)
+    write_c_array(out_dir / 'spd-ddr5-samsung-16gb.h', 'spd_ddr5_samsung_16gb', ddr5)
     print(f'Wrote SPD blobs (.bin padded to {page_size} bytes, .h natural) into {out_dir}')
 
 

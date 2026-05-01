@@ -769,20 +769,20 @@ test_json5_parse(void)
 static void
 test_json_load_file(void)
 {
-    static const char  kPath[]    = "fs0:\\axl_test_jload.tmp";
-    static const char  kJson[]    = "{\"name\":\"axl\",\"answer\":42}";
+    static const char  path[]    = "fs0:\\axl_test_jload.tmp";
+    static const char  json[]    = "{\"name\":\"axl\",\"answer\":42}";
     AxlJsonReader      r          = { 0 };
     void              *raw        = NULL;
     size_t             raw_len    = 0;
 
     /* Stage the JSON file. */
-    test_check(axl_file_set_contents(kPath, kJson, sizeof(kJson) - 1) == 0,
+    test_check(axl_file_set_contents(path, json, sizeof(json) - 1) == 0,
                "json_load_file: set_contents seeds the fixture");
 
     /* Successful load. */
-    test_check(axl_json_load_file(kPath, &r, &raw, &raw_len),
+    test_check(axl_json_load_file(path, &r, &raw, &raw_len),
                "json_load_file: load + parse succeeds");
-    test_check(raw != NULL && raw_len == sizeof(kJson) - 1,
+    test_check(raw != NULL && raw_len == sizeof(json) - 1,
                "json_load_file: out_buf populated, out_len matches file size");
 
     char str_buf[16];

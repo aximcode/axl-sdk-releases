@@ -28,7 +28,7 @@
 #include <axl.h>
 #include <axl/axl-smbios.h>
 
-static const AxlArgDesc kFlags[] = {
+static const AxlArgDesc flags[] = {
     { .name = "type",    .short_name = 't', .type = AXL_ARG_STRING,
       .help = "Filter output to records of this SMBIOS type" },
     { .name = "string",  .short_name = 's', .type = AXL_ARG_STRING,
@@ -493,10 +493,10 @@ run_dmidecode(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    return axl_args_run(argc, argv, &(AxlArgsApp){
+    return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "dmidecode",
         .help         = "Decode SMBIOS / DMI tables (Linux dmidecode-style)",
-        .global_flags = kFlags,
+        .flags          = flags,
         .handler      = run_dmidecode,
     });
 }
