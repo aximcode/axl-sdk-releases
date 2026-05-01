@@ -166,6 +166,13 @@ axl_ipmi_get_device_id(AxlIpmiSession *session, AxlIpmiDeviceId *out)
     out->device_revision  = p[1];
     out->firmware_major   = p[2];
     out->firmware_minor   = p[3];
+    /* Spec packs firmware minor as BCD — decode for callers that want
+       the human-readable decimal form. Out-of-range nibbles (>9) get
+       clamped via the multiply rather than rejected; consumers that
+       care about validity can compare firmware_minor_decoded against
+       the raw firmware_minor. */
+    out->firmware_minor_decoded =
+        (uint8_t)(((p[3] >> 4) & 0x0F) * 10 + (p[3] & 0x0F));
     out->ipmi_version     = p[4];
     out->device_support   = p[5];
     out->manufacturer_id  = rd24_le(&p[6]);

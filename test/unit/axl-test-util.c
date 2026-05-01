@@ -1538,6 +1538,12 @@ sub_crash(int argc, char **argv)
     return -7;
 }
 
+/* This test exists to verify the AxlSubcommand dispatcher API,
+   which is deprecated in favour of AxlArgs (see <axl/axl-args.h>).
+   Suppress the deprecation warnings inside this function only —
+   the API is intentionally exercised here. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 static void
 test_subcommand_dispatch(void)
 {
@@ -1655,6 +1661,7 @@ test_subcommand_dispatch(void)
     axl_subcommand_print_command_help(NULL, "do");
     test_check(true, "subcommand: print fns don't crash");
 }
+#pragma GCC diagnostic pop
 
 // ---------------------------------------------------------------------------
 // axl_driver_ensure

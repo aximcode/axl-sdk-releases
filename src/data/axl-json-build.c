@@ -206,12 +206,16 @@ begin_item(AxlJsonWriter *w)
         return false;
     }
 
-    if (w->needs_comma) {
+    /* If the last write was a comment, the trailing comma was already
+       emitted before it (so commas don't decorate comment lines).
+       Suppress the duplicate here. */
+    if (w->needs_comma && !w->last_was_comment) {
         wr_chr(w, ',');
     }
     if (w->depth > 0) {
         emit_indent(w, w->depth);
     }
+    w->last_was_comment = false;
     return true;
 }
 
@@ -219,8 +223,9 @@ begin_item(AxlJsonWriter *w)
 static void
 finish_value(AxlJsonWriter *w)
 {
-    w->needs_comma     = true;
-    w->expecting_value = false;
+    w->needs_comma      = true;
+    w->expecting_value  = false;
+    w->last_was_comment = false;
 }
 
 /* Push a new container at depth+1. Caller has already validated context
@@ -238,8 +243,9 @@ push_container(AxlJsonWriter *w, bool is_array)
     } else {
         w->in_array_bits &= ~(1u << (w->depth - 1));
     }
-    w->needs_comma     = false;
-    w->expecting_value = false;
+    w->needs_comma      = false;
+    w->expecting_value  = false;
+    w->last_was_comment = false;
 }
 
 /* Pop a container. After pop, we're back in the outer container; the
@@ -251,8 +257,17 @@ pop_container(AxlJsonWriter *w)
         w->error = true;
         return;
     }
-    /* Pretty: dedent before close brace, but only if container had items. */
-    if (is_pretty(w) && w->needs_comma) {
+    /* JSON5 trailing comma — emit before the dedent + close brace. */
+    if (w->needs_comma &&
+        (w->flags & AXL_JSON_WRITER_TRAILING_COMMAS) &&
+        !w->last_was_comment)
+    {
+        wr_chr(w, ',');
+    }
+    /* Pretty: dedent before close brace, but only if container had any
+       content (a value, or a comment, makes the close brace deserve
+       its own line). */
+    if (is_pretty(w) && (w->needs_comma || w->last_was_comment)) {
         emit_indent(w, w->depth - 1);
     }
     w->depth--;
@@ -306,11 +321,12 @@ axl_json_writer_init(AxlJsonWriter *w, AxlString *out, uint32_t flags)
     if (w == NULL) return;
     w->out             = out;
     w->flags           = flags;
-    w->depth           = 0;
-    w->in_array_bits   = 0;
-    w->needs_comma     = false;
-    w->expecting_value = false;
-    w->error           = (out == NULL);
+    w->depth            = 0;
+    w->in_array_bits    = 0;
+    w->needs_comma      = false;
+    w->expecting_value  = false;
+    w->error            = (out == NULL);
+    w->last_was_comment = false;
 }
 
 size_t
@@ -399,10 +415,13 @@ key_prefix(AxlJsonWriter *w)
         w->error = true;
         return false;
     }
-    if (w->needs_comma) {
+    /* If a comment was just emitted, the comma was already written
+       before it — suppress the duplicate here. Mirrors begin_item. */
+    if (w->needs_comma && !w->last_was_comment) {
         wr_chr(w, ',');
     }
     emit_indent(w, w->depth);
+    w->last_was_comment = false;
     return true;
 }
 
@@ -565,6 +584,53 @@ axl_json_raw(AxlJsonWriter *w, const char *fragment)
     if (!begin_item(w)) return;
     wr_str(w, fragment);
     finish_value(w);
+}
+
+// ---------------------------------------------------------------------------
+// Public API: JSON5 comment (state-preserving)
+// ---------------------------------------------------------------------------
+
+void
+axl_json_comment(AxlJsonWriter *w, const char *text)
+{
+    if (w == NULL || w->error || text == NULL) return;
+
+    /* Emit any pending comma BEFORE the comment so the comma doesn't
+       end up decorating the comment line. The corresponding suppression
+       lives in begin_item / pop_container via last_was_comment. */
+    if (w->needs_comma) {
+        wr_chr(w, ',');
+        w->needs_comma = false;
+    }
+
+    if (is_pretty(w)) {
+        emit_indent(w, w->depth);
+        wr_strn(w, "// ", 3);
+        for (const char *p = text; *p != '\0'; p++) {
+            if (*p == '\n' || *p == '\r') break;
+            wr_chr(w, *p);
+        }
+    } else {
+        wr_strn(w, "/* ", 3);
+        /* Sanitize: strip newlines and split any embedded close-comment
+           sequence (star+slash) so the comment can't terminate early. */
+        for (const char *p = text; *p != '\0'; p++) {
+            if (*p == '\n' || *p == '\r') break;
+            if (*p == '*' && p[1] == '/') {
+                wr_strn(w, "* /", 3);
+                p++;
+            } else {
+                wr_chr(w, *p);
+            }
+        }
+        wr_strn(w, " */", 3);
+    }
+
+    /* needs_comma=true so the next value still triggers a comma in
+       begin_item; last_was_comment=true tells begin_item to suppress
+       the duplicate (the comma was already emitted above). */
+    w->needs_comma      = true;
+    w->last_was_comment = true;
 }
 
 // ---------------------------------------------------------------------------

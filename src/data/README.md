@@ -356,12 +356,18 @@ All mutation functions (`append`, `printf`, etc.) return `int`:
 0 on success, -1 if the internal realloc fails. This matches the
 convention used by `axl_array_append`, `axl_hash_table_insert`, etc.
 
-## AxlJson — JSON
+## AxlJson — JSON / JSON5
 
-JSON reader (JSMN-based) and writer. Parse JSON strings into a token
+JSON reader (jsmn-based) and writer. Parse JSON strings into a token
 tree, query values by key, and build JSON documents incrementally over
 an `AxlString`. A separate colored UEFI-console pretty-printer is
 provided for debug output.
+
+The reader also accepts the [JSON5](https://json5.org) grammar
+superset — comments, trailing commas, single-quoted strings, unquoted
+keys, hex numbers — via an opt-in flag (see the **JSON5 Support**
+section below). The writer can emit trailing commas and JSON5
+comments via additional opt-in flags.
 
 Header: `<axl/axl-json.h>`
 
@@ -539,6 +545,139 @@ What the writer does **not** catch:
 - Non-UTF-8 bytes in `axl_json_str` — passed through escaping unchanged.
 - The contents of `axl_json_raw(&w, fragment)` — the caller asserts the
   fragment is valid JSON; the writer splices it as-is.
+
+### JSON5 Support
+
+[JSON5](https://json5.org) is a strict superset of JSON aimed at
+human-edited config files. AXL accepts the JSON5 grammar on the reader
+side via an opt-in flag, and emits JSON5-flavored extras (trailing
+commas, comments) on the writer side via additional flags. Strict
+callers see no behavior change.
+
+**Reader — opt in with `AXL_JSON_PARSER_JSON5`:**
+
+```c
+const char *cfg =
+    "// jedec.json5 — vendor codes per JEDEC JEP-106\n"
+    "{\n"
+    "  vendors: [\n"
+    "    { code: 0x802C, name: 'Micron'  },\n"
+    "    { code: 0x80AD, name: 'Hynix'   },  // trailing comma below\n"
+    "    { code: 0x80CE, name: 'Samsung' },\n"
+    "  ],\n"
+    "}\n";
+
+AxlJsonReader r;
+if (!axl_json_parse_flags(cfg, axl_strlen(cfg),
+                          AXL_JSON_PARSER_JSON5, &r)) {
+    /* parse error */
+}
+/* All the standard accessors (axl_json_get_string,
+   axl_json_array_begin, axl_json_array_next, ...) work
+   unchanged — JSON5 is normalized at parse time. */
+axl_json_free(&r);
+```
+
+For sidecar files there's a one-shot:
+
+```c
+AxlJsonReader  r;
+void          *raw;
+size_t         raw_len;
+
+if (axl_json_load_file_flags("jedec.json5", AXL_JSON_PARSER_JSON5,
+                             &r, &raw, &raw_len)) {
+    /* ... use r ... */
+    axl_json_free(&r);
+    axl_free(raw);
+}
+```
+
+JSON5 features the parser accepts:
+
+- Line comments (`//`) and block comments
+- Trailing commas in objects and arrays
+- Single-quoted strings (`'text'`)
+- Unquoted (identifier-name) object keys
+- Hex number literals (`0x...`) and `+` / `-` number prefix
+- Extended string escapes: `\'`, `\v`, `\0`, `\x##`, line continuations
+
+Strict callers (`axl_json_parse`, no flags) still go through the
+existing jsmn-based path and reject JSON5 input. The JSON5 path is
+strictly opt-in.
+
+**Writer — emit JSON5 extras with `AXL_JSON_WRITER_TRAILING_COMMAS`
+and `axl_json_comment`:**
+
+```c
+AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+AxlJsonWriter w;
+axl_json_writer_init(&w, out,
+    AXL_JSON_WRITER_PRETTY | AXL_JSON_WRITER_TRAILING_COMMAS);
+
+axl_json_obj_begin(&w);
+    axl_json_comment(&w, "generated — do not edit by hand");
+    axl_json_kv_str(&w, "name",    "AXL");
+    axl_json_kv_int(&w, "version", 1);
+axl_json_obj_end(&w);
+axl_json_writer_finish(&w);
+
+/* {
+ *   // generated — do not edit by hand
+ *   "name": "AXL",
+ *   "version": 1,
+ * }
+ */
+```
+
+Comment behavior:
+
+- Pretty mode emits `// text` on its own line at the current indent.
+- Compact mode emits an inline `/​* text *​/` block; embedded
+  close-comment sequences are split so the comment can't terminate
+  early.
+- Embedded newlines truncate the comment.
+- Comments don't disturb the writer's container state — interleave
+  them freely between values, between key+value pairs, or as the
+  first/last item in a container.
+
+The writer deliberately does **not** emit unquoted object keys or
+single-quoted strings. Those are JSON5 input-side conveniences only;
+emitting them adds escape-correctness footguns with no consumer
+benefit.
+
+#### JSON5 conformance notes
+
+AXL's JSON5 support is scoped to the features that matter for
+firmware-edited sidecar configs (the in-tree consumer is
+`tools/memspd.c` reading `share/jedec.json5`). The following parts
+of the [json5.org](https://json5.org) spec are intentionally
+**not** supported:
+
+- **`Infinity`, `-Infinity`, `NaN`** — AXL is freestanding UEFI
+  with no `libm`. There's no `axl_json_get_double` accessor, so
+  IEEE 754 special values would be lex-only and unretrievable.
+  `axl_json_get_int` on a fractional or scientific-notation token
+  truncates at the first non-digit character (pre-existing
+  strict-mode behavior, unchanged): `{x: 1.5}` returns `1`.
+
+- **Unicode `IdentifierName` for unquoted keys** — only the ASCII
+  subset (`[A-Za-z_$][A-Za-z0-9_$]*`) is recognized. Keys with
+  Unicode letters, combining marks, ZWNJ, or ZWJ require
+  quoting (single or double quotes both work).
+
+- **Unicode whitespace** (U+00A0 NBSP, U+FEFF BOM, U+2028 LS,
+  U+2029 PS, and other `Space_Separator` characters) — only the
+  ASCII whitespace set plus `\v` and `\f` is treated as
+  insignificant. Documents using Unicode separators as whitespace
+  will fail to parse.
+
+These gaps are deliberate — adding lex support for tokens that
+can't be retrieved (floats) or for grammar that no firmware tool
+actually authors (Unicode identifier keys) would expand the
+attack surface and surprise consumers without unlocking new use
+cases. Open an issue if a real consumer needs any of these and
+they can be revisited.
 
 ### Console Output
 

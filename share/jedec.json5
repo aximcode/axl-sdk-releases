@@ -1,0 +1,27 @@
+// JEDEC JEP-106 manufacturer codes for AXL memspd.
+//
+// Code format: packed (bank << 8) | (id_byte & 0x7F).
+// The codes themselves are uncopyrightable factual data; names are
+// sourced from the public JEP-106 registry and verified against
+// vendor datasheets. Add entries as your fleet requires; memspd
+// falls back to printing the raw hex when a code is not present.
+{
+    schema: 1,
+    vendors: [
+        { code: 0x002C, name: 'Micron Technology'   },
+        { code: 0x00CE, name: 'Samsung'             },
+        { code: 0x00AD, name: 'SK Hynix'            },
+        { code: 0x0198, name: 'Kingston'            },
+        { code: 0x859B, name: 'Crucial Technology'  },
+        { code: 0x04CB, name: 'ATP Electronics'     },
+        { code: 0x0194, name: 'Smart Modular'       },
+        { code: 0x02FE, name: 'Elpida'              },
+        { code: 0x0429, name: 'Innodisk'            },
+        { code: 0x017A, name: 'Apacer'              },
+        { code: 0x0443, name: 'Ramaxel'             },
+        { code: 0x0510, name: 'ADATA'               },
+        { code: 0x051D, name: 'Patriot Memory'      },
+        { code: 0x830B, name: 'Nanya Technology'    },
+        { code: 0x00C1, name: 'Infineon'            },
+    ],
+}

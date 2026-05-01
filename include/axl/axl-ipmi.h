@@ -59,6 +59,11 @@ typedef enum {
  *   3. SMBIOS Type 38 — KCS on x86 (I/O at 0x0CA2/0x0CA3 by default)
  *      or SSIF on ARM (slave 0x20 by default)
  *
+ * Returns NULL within microseconds when no live transport responds
+ * (including the case where SMBIOS Type 38 advertises a KCS interface
+ * but no BMC is actually present). Use `axl_ipmi_probe()` for a
+ * deeper snapshot of what the firmware exposes when this returns NULL.
+ *
  * @return session handle, or NULL if no transport is available.
  */
 AxlIpmiSession *
@@ -180,7 +185,8 @@ typedef struct {
     uint8_t   device_id;
     uint8_t   device_revision;        ///< bits 0-3 revision, bit 7 = SDR support
     uint8_t   firmware_major;         ///< bits 0-6 major rev; bit 7 = device busy
-    uint8_t   firmware_minor;         ///< BCD minor rev
+    uint8_t   firmware_minor;         ///< raw BCD minor rev byte (e.g. 0x42 = .42)
+    uint8_t   firmware_minor_decoded; ///< BCD-decoded minor rev (e.g. 42)
     uint8_t   ipmi_version;           ///< BCD: bits 3:0 major, bits 7:4 minor
     uint8_t   device_support;         ///< bitmask of functions supported
     uint32_t  manufacturer_id;        ///< 24-bit IANA manufacturer ID

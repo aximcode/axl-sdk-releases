@@ -190,10 +190,17 @@ axl_nvstore_get(
 
     *size = data_size;
 
-    /* EFI_BUFFER_TOO_SMALL is expected when buf is NULL (size query) */
+    /* EFI_BUFFER_TOO_SMALL is the canonical probe-then-grow signal,
+       and EFI_NOT_FOUND is the canonical "does this key exist?" probe.
+       Both are normal control flow for callers — log at debug, not warn. */
     if (EFI_ERROR(status)) {
-        axl_warning("nvstore get failed: key='%s' status=0x%llx",
-                    key, (unsigned long long)status);
+        if (status == EFI_BUFFER_TOO_SMALL || status == EFI_NOT_FOUND) {
+            axl_debug("nvstore get: key='%s' status=0x%llx",
+                      key, (unsigned long long)status);
+        } else {
+            axl_warning("nvstore get failed: key='%s' status=0x%llx",
+                        key, (unsigned long long)status);
+        }
         return -1;
     }
     return 0;
@@ -264,9 +271,15 @@ axl_nvstore_delete(
         0,
         NULL);
 
+    /* EFI_NOT_FOUND on delete is idempotent — caller asked us to
+       remove a key that already wasn't there. Not an error. */
     if (EFI_ERROR(status)) {
-        axl_warning("nvstore delete failed: key='%s' status=0x%llx",
-                    key, (unsigned long long)status);
+        if (status == EFI_NOT_FOUND) {
+            axl_debug("nvstore delete: key='%s' already absent", key);
+        } else {
+            axl_warning("nvstore delete failed: key='%s' status=0x%llx",
+                        key, (unsigned long long)status);
+        }
         return -1;
     }
     return 0;

@@ -143,6 +143,7 @@ LIB_SOURCES = \
     src/data/axl-slist.c \
     src/data/axl-queue.c \
     src/data/axl-json-parse.c \
+    src/data/axl-json5-parse.c \
     src/data/axl-json-build.c \
     src/data/axl-json-print.c \
     src/data/axl-cache.c \

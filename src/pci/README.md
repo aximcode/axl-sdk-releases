@@ -35,8 +35,47 @@ typedef struct {
 } AxlPciAddr;
 ```
 
-`uint16_t seg` future-proofs against multi-segment platforms.
-Single-segment systems leave it at 0.
+`uint16_t seg` matches the UEFI MCFG / PCIe spec's segment-group
+width — multi-segment platforms (large servers, some ARM SoCs)
+are addressable directly through every `axl_pci_*` API. Single-
+segment systems leave it at 0.
+
+`axl_pci_addr_parse` and `axl_pci_addr_format` round-trip an
+`AxlPciAddr` through the canonical lower-hex `SSSS:BB:DD.F` form
+(same shape as `lspci`). Parse accepts both 3-component
+(`bus:dev.func`, segment defaults to 0) and 4-component
+(`seg:bus:dev.func`) variants, with bounded-range checks at parse
+time:
+
+```c
+AxlPciAddr a;
+if (axl_pci_addr_parse(argv[1], &a) != 0) { /* malformed */ }
+
+char buf[AXL_PCI_ADDR_STR_MAX];
+axl_pci_addr_format(a, buf, sizeof(buf));
+axl_printf("device %s\n", buf);
+```
+
+## Common header reads
+
+Two boilerplate-killer wrappers around the standard config-space
+header offsets — they fold the "is this function absent?" and
+"unpack the 24-bit class triplet" patterns into one call:
+
+```c
+uint16_t vid, did;
+if (axl_pci_get_vid_did(addr, &vid, &did) == 0) {
+    /* function is present (vid != 0xFFFF) and both fields read OK */
+}
+
+uint32_t class24;  /* (base << 16) | (sub << 8) | prog_if */
+axl_pci_get_class24(addr, &class24);
+```
+
+`axl_pci_get_vid_did` returns -1 when the function is absent (vid
+reads as `0xFFFF`), so callers don't have to special-case the
+sentinel. `class24` matches the shape consumed by
+`axl_pci_find_by_class`.
 
 ## Lookups
 
@@ -89,3 +128,25 @@ if (axl_pci_vpd_read(nic, "PN", buf, sizeof(buf), &len) == 0) {
     axl_printf("Part number: %.*s\n", (int)len, buf);
 }
 ```
+
+For "show me everything that's there" — vendor-specific `V0..V9` /
+`Y0..Y9` keywords included — use `axl_pci_vpd_iter` and dispatch
+through a callback:
+
+```c
+static int dump_cb(const char keyword[2], const uint8_t *data,
+                   size_t len, void *ctx) {
+    (void)ctx;
+    axl_printf("  %c%c (%zu): %.*s\n",
+               keyword[0], keyword[1], len, (int)len, data);
+    return 0;  /* return non-zero to stop the walk early */
+}
+
+axl_pci_vpd_iter(nic, dump_cb, NULL);
+```
+
+`axl_pci_vpd_iter` and `axl_pci_vpd_read` share the same VPD
+walker — one cap-list lookup, one tag walk — so calling either
+reflects the same on-device state. The callback's `data` pointer
+is only valid for the duration of the call; copy any bytes you
+want to retain.

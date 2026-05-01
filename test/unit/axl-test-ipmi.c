@@ -123,7 +123,9 @@ test_get_device_id(void)
     test_check(rc == 0, "get_device_id: ok");
     test_check(d.device_id == 0x20, "get_device_id: device id");
     test_check(d.firmware_major == 0x02 && d.firmware_minor == 0x34,
-               "get_device_id: firmware revision");
+               "get_device_id: firmware revision (raw)");
+    test_check(d.firmware_minor_decoded == 34,
+               "get_device_id: firmware minor BCD decode (0x34 → 34)");
     test_check(d.manufacturer_id == 0x000001,
                "get_device_id: manufacturer id little-endian");
     test_check(d.product_id == 0xCDAB,

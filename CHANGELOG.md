@@ -3,6 +3,86 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.7.2 — 2026-05-01
+
+JSON5 reader and writer support; PCI helper expansion driven by the
+delldiags do.efi cat-3 PCI subcommand family; nvstore/IPMI quality-
+of-life fixes from real-hardware bring-up.
+
+### Added
+
+- **JSON5 reader** — opt-in via `AXL_JSON_PARSER_JSON5` flag on the
+  new `axl_json_parse_flags` / `axl_json_load_file_flags`. Accepts
+  the json5.org grammar superset: `//` and block comments, trailing
+  commas, single-quoted strings, unquoted (identifier-name) object
+  keys, hex number literals (`0x...`) and `+`/`-` number prefix,
+  extended string escapes (`\'`, `\v`, `\0`, `\x##`, line
+  continuations). Strict-JSON consumers (`axl_json_parse`) stay on
+  jsmn unchanged. Hand-rolled, no new vendored dependencies. Token
+  layout matches `jsmntok_t`, so the existing accessors
+  (`axl_json_get_string`, `axl_json_array_begin/next`, ...) work
+  without modification.
+- **JSON5 writer** — `AXL_JSON_WRITER_TRAILING_COMMAS` flag and a new
+  `axl_json_comment(w, text)` call. Pretty mode emits comments on
+  their own line at the current indent; compact mode emits inline
+  block comments with embedded close-comment sequences split for
+  safety. Comments don't disturb the writer's container state.
+  Unquoted-key emission deliberately not supported (escape-correctness
+  footgun, no consumer benefit).
+- **`axl_pci_addr_parse` / `axl_pci_addr_format`** — parse and format
+  the canonical lower-hex `SSSS:BB:DD.F` form. Both 3-component
+  (`bus:dev.func`, segment defaults to 0) and 4-component
+  (`seg:bus:dev.func`) variants accepted; range-checked at parse
+  time. Symmetric round-trip.
+- **`axl_pci_get_vid_did` / `axl_pci_get_class24`** — boilerplate-
+  killer wrappers over the standard PCI header offsets. `vid_did`
+  folds the `vid == 0xFFFF` "function absent" sentinel into the
+  return code. `class24` folds offsets 0x09/0x0A/0x0B into the
+  canonical `(base << 16) | (sub << 8) | prog_if` form consumed by
+  `axl_pci_find_by_class`.
+- **`axl_pci_vpd_iter`** — full-walk callback complement to the
+  existing `axl_pci_vpd_read` (which only fetches a single keyword).
+  Visits both Read-Only and Read-Write resource sections; vendor-
+  specific `V0..V9` and `Y0..Y9` keywords reach the callback
+  alongside the standard set. Internal walker shared with
+  `vpd_read` — one cap-list lookup, one tag walk, no duplicated
+  logic.
+- **`AxlIpmiDeviceId.firmware_minor_decoded`** — BCD-decoded
+  companion to the existing raw `firmware_minor` byte. Both stay
+  populated; consumers that care about BCD validity can compare
+  decoded vs raw.
+
+### Changed
+
+- **AxlSubcommand deprecated.** The framework was superseded by
+  AxlArgs in v0.7.0; deprecation warnings ride v0.7.2. Removal in
+  a later release once the last out-of-tree consumer (delldiags
+  do.efi) migrates.
+- **`share/jedec.json` → `share/jedec.json5`.** The file uses the
+  JSON5 grammar (real hex numbers `0x002C` instead of hex-encoded
+  strings, unquoted keys, single-quoted names, `//` header comment
+  block in place of the bogus `_comment` string field). Renamed
+  so VS Code's strict-JSON validator stops flagging every JSON5
+  feature; `tools/memspd.c`'s auto-discovery default updated.
+
+### Fixed
+
+- **`axl_nvstore_get` / `axl_nvstore_delete` log noise.**
+  `EFI_BUFFER_TOO_SMALL` (canonical probe-then-grow size query) and
+  `EFI_NOT_FOUND` (key-existence probe) on `get`, plus
+  `EFI_NOT_FOUND` (idempotent delete) on `delete`, demoted from
+  warning to debug. Both are normal control flow for callers and
+  were producing visible WARN noise during `do boot show` on Dell
+  hardware.
+- **6-second hang on phantom KCS interface.** `axl_ipmi_kcs_open`
+  now rejects a status-byte read of `0xFF` as a floating-bus /
+  phantom KCS. Previously, SMBIOS Type 38 advertising a KCS that
+  no real BMC answered caused the first `axl_ipmi_get_device_id`
+  to spin for the full `KCS_POLL_TIMEOUT_US` (~5 s) inside
+  `kcs_wait_ibf_clear` — a 6 s hang on every misadvertised
+  interface. `axl_ipmi_session_new` doc updated to set the new
+  "fast NULL on phantom transport" expectation.
+
 ## 0.7.1 — 2026-05-01
 
 CI-only patch — released v0.7.0 artifacts are unaffected.

@@ -321,6 +321,21 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
         return -1;
     }
 
+    //
+    // Phantom-BMC guard: a status byte of 0xFF means the bus is
+    // floating high — port I/O works but nothing is mapped there.
+    // Real KCS hardware in any valid state has at least one bit
+    // clear (idle = 0x00, write/read/error states never set all
+    // four state-machine bits at once with both IBF and OBF set).
+    // Without this check, a phantom port reading 0xFF lets the
+    // session open, then the first command spins for the full
+    // KCS_POLL_TIMEOUT_US (~5 s) inside kcs_wait_ibf_clear before
+    // failing — a 6 s hang on every misadvertised SMBIOS Type 38.
+    //
+    if (probe == 0xFF) {
+        return -1;
+    }
+
     KcsCtx *k = axl_malloc(sizeof(KcsCtx));
     if (k == NULL) {
         return -1;

@@ -4,15 +4,18 @@
 /**
  * axl-json.h:
  *
- * JSON reader (JSMN-based) and writer (AxlString-backed). The reader
- * parses a JSON string into a token array; the writer builds JSON into
- * an auto-growing AxlString with orthogonal container/key/atom calls
- * and optional 2-space-indent pretty-print mode. A separate colored
+ * JSON / JSON5 reader and JSON writer (AxlString-backed). The strict
+ * reader parses RFC 8259 JSON via jsmn; an opt-in JSON5 backend
+ * (json5.org grammar superset) is reachable through
+ * @ref axl_json_parse_flags. The writer builds JSON into an
+ * auto-growing AxlString with orthogonal container/key/atom calls,
+ * optional 2-space-indent pretty-print mode, and (opt-in) JSON5
+ * trailing-commas + comment emission. A separate colored
  * UEFI-console pretty-printer is provided for debug output.
  *
  * Three independent APIs:
- *   - AxlJsonReader        — parse + query
- *   - AxlJsonWriter        — build into an AxlString
+ *   - AxlJsonReader        — parse + query (strict JSON or JSON5)
+ *   - AxlJsonWriter        — build into an AxlString (JSON, optionally JSON5-flavored)
  *   - axl_json_console_print — colored console output for already-built JSON
  */
 
@@ -63,6 +66,17 @@ typedef struct {
 } AxlJsonArrayIter;
 
 /**
+ * AxlJsonParserFlags:
+ *
+ * Flags passed to axl_json_parse_flags. The default (0) is strict
+ * RFC 8259 JSON, exactly what axl_json_parse accepts.
+ */
+typedef enum {
+    AXL_JSON_PARSER_DEFAULT = 0,        ///< strict RFC 8259 (default)
+    AXL_JSON_PARSER_JSON5   = 1u << 0,  ///< json5.org grammar superset
+} AxlJsonParserFlags;
+
+/**
  * @brief Parse a JSON string.
  *
  * Allocates a token array sized to fit the document. Call
@@ -75,6 +89,29 @@ axl_json_parse(
     const char    *json,  ///< JSON string (NUL terminator not required)
     size_t         len,   ///< length of @a json in bytes
     AxlJsonReader *r      ///< reader to fill
+);
+
+/**
+ * @brief Parse a JSON or JSON5 string.
+ *
+ * Identical to @ref axl_json_parse but accepts a flags bitmask. Pass
+ * @c AXL_JSON_PARSER_JSON5 to accept the JSON5 grammar superset:
+ * line comments (//) and block comments, trailing commas, single-quoted strings,
+ * unquoted (identifier-name) object keys, hex number literals, and
+ * the JSON5 string-escape set (`\x##`, `\v`, `\0`, line continuations).
+ *
+ * The resulting reader is consumed by the same accessors
+ * (@ref axl_json_get_string etc.) as a strict-JSON reader — JSON5
+ * features are normalized at parse time.
+ *
+ * @return true on success, false on parse error or allocation failure.
+ */
+bool
+axl_json_parse_flags(
+    const char    *json,   ///< JSON / JSON5 string
+    size_t         len,    ///< length in bytes
+    uint32_t       flags,  ///< AxlJsonParserFlags bitmask
+    AxlJsonReader *r       ///< reader to fill
 );
 
 /**
@@ -121,6 +158,24 @@ axl_json_free(
 bool
 axl_json_load_file(
     const char     *path,     ///< file path (UTF-8)
+    AxlJsonReader  *r,        ///< [out] reader to fill
+    void          **out_buf,  ///< [out] file contents (caller frees)
+    size_t         *out_len   ///< [out, optional] file size in bytes
+);
+
+/**
+ * @brief One-shot: read a file, parse it as JSON or JSON5.
+ *
+ * Identical to @ref axl_json_load_file but accepts a flags bitmask
+ * forwarded to @ref axl_json_parse_flags. Use this for sidecar
+ * config files that want comments, trailing commas, etc.
+ *
+ * @return true on success, false otherwise.
+ */
+bool
+axl_json_load_file_flags(
+    const char     *path,     ///< file path (UTF-8)
+    uint32_t        flags,    ///< AxlJsonParserFlags bitmask
     AxlJsonReader  *r,        ///< [out] reader to fill
     void          **out_buf,  ///< [out] file contents (caller frees)
     size_t         *out_len   ///< [out, optional] file size in bytes
@@ -264,8 +319,9 @@ axl_json_escape_string(
  * Flags passed to axl_json_writer_init.
  */
 typedef enum {
-    AXL_JSON_WRITER_DEFAULT = 0,        ///< compact output, no whitespace
-    AXL_JSON_WRITER_PRETTY  = 1u << 0,  ///< 2-space indent + newlines
+    AXL_JSON_WRITER_DEFAULT         = 0,        ///< compact output, strict JSON
+    AXL_JSON_WRITER_PRETTY          = 1u << 0,  ///< 2-space indent + newlines
+    AXL_JSON_WRITER_TRAILING_COMMAS = 1u << 1,  ///< emit JSON5-style trailing commas
 } AxlJsonWriterFlags;
 
 /// Maximum nesting depth the writer's state machine tracks.
@@ -287,6 +343,7 @@ typedef struct {
     bool       needs_comma;                            ///< previous emit needs a trailing comma
     bool       expecting_value;                        ///< object: true after a key
     bool       error;                                  ///< sticky error flag
+    bool       last_was_comment;                       ///< suppress redundant comma + dedent gating
 } AxlJsonWriter;
 
 /**
@@ -434,6 +491,25 @@ void
 axl_json_raw(
     AxlJsonWriter *w,         ///< writer
     const char    *fragment   ///< pre-formed JSON
+);
+
+/**
+ * @brief Emit a JSON5 comment.
+ *
+ * Pretty mode emits `// text` on its own line at the current indent;
+ * compact mode emits `/ * text * /`. Embedded newlines and (in compact
+ * mode) close-comment sequences in @p text are sanitized so the
+ * comment can't break out of its delimiters. The output is only
+ * valid JSON5 — strict-JSON parsers will reject it.
+ *
+ * Comments don't disturb the writer's container state: callers can
+ * interleave comments freely between values, between key+value pairs,
+ * or as the first/last item in a container.
+ */
+void
+axl_json_comment(
+    AxlJsonWriter *w,     ///< writer
+    const char    *text   ///< comment text (NUL-terminated, no markup needed)
 );
 
 // --- Convenience: key + atomic value pairs (object context) ---

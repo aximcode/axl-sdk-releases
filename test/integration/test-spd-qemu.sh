@@ -13,7 +13,7 @@
 #
 # Verifies that tools/memspd.efi:
 #   * decodes the canned DDR4 blob attached at 0x50 (8 GB DDR4-2400 ECC),
-#   * resolves the absent vendor code as raw hex (no jedec.json staged),
+#   * resolves the absent vendor code as raw hex (no jedec.json5 staged),
 #   * lists at least one populated slot.
 #
 # x86-only — ICH9 SMBus and the EEPROM patch are Intel-chipset-specific.
@@ -38,7 +38,7 @@ make -C "$PROJECT_DIR" ARCH="$_native_arch" tools tests smbus-hc-shim 2>&1 | tai
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
 SPD_BLOB="$PROJECT_DIR/test/data/spd-ddr4-micron-8gb.bin"
-JEDEC_FILE="$PROJECT_DIR/share/jedec.json"
+JEDEC_FILE="$PROJECT_DIR/share/jedec.json5"
 
 if [[ ! -f "$SPD_BLOB" ]]; then
     echo "Generating canned SPD blobs..."
@@ -48,8 +48,8 @@ fi
 test_add_efi "$NATIVE_DIR/tools/memspd.efi"
 test_add_efi "$NATIVE_DIR/SmbusHcShim.efi"
 # Stage the JEDEC sidecar next to memspd.efi so its auto-discovery
-# (LoadedImage->FilePath dirname + jedec.json) finds it without a flag.
-cp "$JEDEC_FILE" "$TEST_STAGING/jedec.json"
+# (LoadedImage->FilePath dirname + jedec.json5) finds it without a flag.
+cp "$JEDEC_FILE" "$TEST_STAGING/jedec.json5"
 
 {
     echo "@echo -off"

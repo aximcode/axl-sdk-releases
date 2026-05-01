@@ -671,6 +671,98 @@ test_json_parse(void)
 }
 
 // ---------------------------------------------------------------------------
+// JSON5 Parse Tests
+// ---------------------------------------------------------------------------
+
+static void
+test_json5_parse(void)
+{
+    AxlJsonReader r;
+    char          str_buf[64];
+    int64_t       int_val;
+    bool          bool_val;
+    bool          ok;
+
+    // Comments + trailing commas + unquoted keys + single quotes + hex
+    const char *j5 =
+        "// header comment\n"
+        "{\n"
+        "  /* block comment */\n"
+        "  name: 'devkit',\n"           // unquoted key + single-quoted string
+        "  version: 42,\n"
+        "  port: 0xCA2,\n"              // hex literal
+        "  debug: true,\n"              // trailing comma below
+        "}\n";
+
+    ok = axl_json_parse_flags(j5, axl_strlen(j5),
+                              AXL_JSON_PARSER_JSON5, &r);
+    test_check(ok, "json5 parse: comments + trailing comma + unquoted keys");
+
+    ok = axl_json_get_string(&r, "name", str_buf, sizeof(str_buf));
+    test_check(ok && axl_strcmp(str_buf, "devkit") == 0,
+               "json5 parse: single-quoted string value via unquoted key");
+
+    ok = axl_json_get_int(&r, "version", &int_val);
+    test_check(ok && int_val == 42, "json5 parse: decimal int");
+
+    ok = axl_json_get_int(&r, "port", &int_val);
+    test_check(ok && int_val == 0xCA2, "json5 parse: hex int (0xCA2)");
+
+    ok = axl_json_get_bool(&r, "debug", &bool_val);
+    test_check(ok && bool_val == true, "json5 parse: bool");
+
+    axl_json_free(&r);
+
+    // Trailing comma in array, hex with negative, x-escape in string
+    const char *j5_arr =
+        "{ items: [1, 2, 0x10, -0xFF,], greeting: \"hi\\x21\", }";
+    ok = axl_json_parse_flags(j5_arr, axl_strlen(j5_arr),
+                              AXL_JSON_PARSER_JSON5, &r);
+    test_check(ok, "json5 parse: array trailing comma + signed hex + \\x escape");
+
+    AxlJsonArrayIter it;
+    ok = axl_json_array_begin(&r, "items", &it);
+    test_check(ok, "json5 parse: array_begin on JSON5-parsed reader");
+
+    int idx = 0;
+    AxlJsonReader elem;
+    while (axl_json_array_next(&it, &elem)) {
+        idx++;
+    }
+    test_check(idx == 4, "json5 parse: array_next iterates all 4 elements");
+
+    ok = axl_json_get_string(&r, "greeting", str_buf, sizeof(str_buf));
+    test_check(ok && axl_strcmp(str_buf, "hi!") == 0,
+               "json5 parse: \\x21 decoded to '!'");
+
+    axl_json_free(&r);
+
+    // Strict parser must STILL reject JSON5 input
+    ok = axl_json_parse(j5, axl_strlen(j5), &r);
+    test_check(!ok, "json5 parse: strict mode still rejects JSON5");
+
+    // Default flags == strict
+    ok = axl_json_parse_flags(j5, axl_strlen(j5),
+                              AXL_JSON_PARSER_DEFAULT, &r);
+    test_check(!ok, "json5 parse: AXL_JSON_PARSER_DEFAULT == strict");
+
+    // Strict JSON parses correctly via the JSON5 path too (superset)
+    const char *strict = "{\"a\":1,\"b\":[true,null]}";
+    ok = axl_json_parse_flags(strict, axl_strlen(strict),
+                              AXL_JSON_PARSER_JSON5, &r);
+    test_check(ok, "json5 parse: accepts strict JSON unchanged");
+    ok = axl_json_get_int(&r, "a", &int_val);
+    test_check(ok && int_val == 1, "json5 parse: strict accessors work");
+    axl_json_free(&r);
+
+    // Malformed JSON5 fails (unterminated block comment)
+    const char *bad = "{ /* never closed \n a: 1 }";
+    ok = axl_json_parse_flags(bad, axl_strlen(bad),
+                              AXL_JSON_PARSER_JSON5, &r);
+    test_check(!ok, "json5 parse: unterminated block comment rejected");
+}
+
+// ---------------------------------------------------------------------------
 // axl_json_load_file — round-trip via fs0:\axl_test_jload.tmp
 // ---------------------------------------------------------------------------
 
@@ -910,6 +1002,116 @@ test_json_build(void)
     axl_json_writer_finish(&w);
     test_check(axl_strcmp(axl_string_str(out), "{\"k\":\"abc\"}") == 0,
                "json build: kv_strn slice is exact");
+    axl_string_free(out);
+}
+
+// ---------------------------------------------------------------------------
+// JSON5 Build Tests — comments, trailing commas, and round-trip with reader
+// ---------------------------------------------------------------------------
+
+static void
+test_json5_build(void)
+{
+    AxlJsonWriter w;
+    AxlJsonReader r;
+    AxlString    *out;
+
+    /* Trailing commas, compact */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_TRAILING_COMMAS);
+    axl_json_obj_begin(&w);
+    axl_json_kv_int(&w, "a", 1);
+    axl_json_kv_int(&w, "b", 2);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json5 build: trailing-comma no error");
+    test_check(axl_strcmp(axl_string_str(out), "{\"a\":1,\"b\":2,}") == 0,
+               "json5 build: trailing comma in compact object");
+    /* And the JSON5 reader accepts it. */
+    test_check(axl_json_parse_flags(axl_string_str(out),
+                                    axl_string_len(out),
+                                    AXL_JSON_PARSER_JSON5, &r),
+               "json5 build: trailing-comma output round-trips through JSON5 reader");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    /* Trailing commas, pretty */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out,
+        AXL_JSON_WRITER_PRETTY | AXL_JSON_WRITER_TRAILING_COMMAS);
+    axl_json_arr_begin(&w);
+    axl_json_int(&w, 1);
+    axl_json_int(&w, 2);
+    axl_json_arr_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out), "[\n  1,\n  2,\n]") == 0,
+               "json5 build: pretty array trailing comma");
+    axl_string_free(out);
+
+    /* Comment between values, pretty */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "name", "AXL");
+    axl_json_comment(&w, "version comes from build system");
+    axl_json_kv_int(&w, "version", 1);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json5 build: comment no error");
+    const char *expected_pretty =
+        "{\n"
+        "  \"name\": \"AXL\",\n"
+        "  // version comes from build system\n"
+        "  \"version\": 1\n"
+        "}";
+    test_check(axl_strcmp(axl_string_str(out), expected_pretty) == 0,
+               "json5 build: pretty comment between values exact output");
+    /* JSON5 reader accepts it. */
+    test_check(axl_json_parse_flags(axl_string_str(out),
+                                    axl_string_len(out),
+                                    AXL_JSON_PARSER_JSON5, &r),
+               "json5 build: pretty comment output round-trips");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    /* Comment in compact mode emits inline / * ... * / */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_comment(&w, "header");
+    axl_json_kv_int(&w, "x", 7);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out), "{/* header */\"x\":7}") == 0,
+               "json5 build: compact inline comment");
+    axl_string_free(out);
+
+    /* Comment-as-last-item must still get the closing brace on its own line
+       in pretty mode. */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_obj_begin(&w);
+    axl_json_kv_int(&w, "x", 1);
+    axl_json_comment(&w, "trailing note");
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\n  \"x\": 1,\n  // trailing note\n}") == 0,
+               "json5 build: trailing comment dedents close brace");
+    axl_string_free(out);
+
+    /* Comment sanitization: embedded newline truncates; embedded close-comment
+       sequence in compact mode is split. */
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_obj_begin(&w);
+    axl_json_comment(&w, "a*/b");           // close-comment in middle
+    axl_json_kv_int(&w, "k", 1);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{/* a* /b */\"k\":1}") == 0,
+               "json5 build: compact comment sanitizes embedded close-comment");
     axl_string_free(out);
 }
 
@@ -2757,8 +2959,10 @@ test_data_main(int argc, char **argv)
     test_string();
     test_string_ascii();
     test_json_parse();
+    test_json5_parse();
     test_json_load_file();
     test_json_build();
+    test_json5_build();
     test_json_print();
     test_slist();
     test_list();

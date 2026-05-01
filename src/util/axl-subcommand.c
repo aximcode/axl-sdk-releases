@@ -3,12 +3,26 @@
 
 /** @file axl-subcommand.c
     Subcommand-style CLI dispatch for multi-command UEFI apps.
+
+    DEPRECATED: see <axl/axl-subcommand.h> — the implementation is
+    retained as a thin shim while existing consumers migrate to
+    AxlArgs (`<axl/axl-args.h>`). The deprecation attribute on the
+    public declarations would otherwise fire warnings against the
+    out-of-line definitions in this file; silence them here only —
+    callers in other translation units still get the warning.
 **/
 
 #include "../backend/axl-backend.h"
 #include <axl/axl-io.h>
 #include <axl/axl-log.h>
 #include <axl/axl-str.h>
+
+/* Silence the deprecation across the whole TU — the internal cross-
+   calls between axl_subcommand_dispatch / _print_help /
+   _print_command_help would otherwise fire warnings on every
+   build. Callers in OTHER translation units still get the warning. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include <axl/axl-subcommand.h>
 
 AXL_LOG_DOMAIN("subcommand");
@@ -283,3 +297,5 @@ axl_subcommand_dispatch(
     }
     return e->fn(argc - 1, argv + 1);
 }
+
+#pragma GCC diagnostic pop

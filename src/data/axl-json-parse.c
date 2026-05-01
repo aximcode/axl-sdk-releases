@@ -70,6 +70,15 @@ find_value_token(const char *json, const jsmntok_t *tokens,
     return -1;
 }
 
+static int
+hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static bool
 decode_json_string(const char *src, size_t src_len,
                    char *dst, size_t dst_size)
@@ -89,6 +98,31 @@ decode_json_string(const char *src, size_t src_len,
             case 'n':  dst[out++] = '\n'; break;
             case 'r':  dst[out++] = '\r'; break;
             case 't':  dst[out++] = '\t'; break;
+            /* JSON5 additions — strict-JSON parsers reject these
+               at parse time, so they only reach this decoder for
+               JSON5-flagged readers. Decoding the superset is safe
+               in either mode. */
+            case '\'': dst[out++] = '\''; break;
+            case 'v':  dst[out++] = '\v'; break;
+            case '0':  dst[out++] = '\0'; break;
+            case 'x': {
+                int hi = (i + 1 < src_len) ? hex_nibble(src[i + 1]) : -1;
+                int lo = (i + 2 < src_len) ? hex_nibble(src[i + 2]) : -1;
+                if (hi >= 0 && lo >= 0) {
+                    dst[out++] = (char)((hi << 4) | lo);
+                    i += 2;
+                } else {
+                    dst[out++] = src[i];
+                }
+                break;
+            }
+            case '\n':  /* line continuation: \<LF>     — emit nothing */
+                break;
+            case '\r':  /* line continuation: \<CR>[LF] — emit nothing */
+                if (i + 1 < src_len && src[i + 1] == '\n') {
+                    i++;
+                }
+                break;
             default:   dst[out++] = src[i]; break;
             }
         } else {
@@ -112,10 +146,26 @@ parse_int64(const char *json, const jsmntok_t *tok, int64_t *value)
     end = json + tok->end;
 
     negative = false;
-    if (p < end && *p == '-') {
-        negative = true;
+    if (p < end && (*p == '-' || *p == '+')) {
+        negative = (*p == '-');
         p++;
     }
+
+    /* JSON5: 0x... hex literal */
+    if (p + 1 < end && *p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        if (p >= end) return false;
+        v = 0;
+        while (p < end) {
+            int n = hex_nibble(*p);
+            if (n < 0) return false;
+            v = (v << 4) | n;
+            p++;
+        }
+        *value = negative ? -v : v;
+        return true;
+    }
+
     if (p >= end || *p < '0' || *p > '9') {
         return false;
     }
@@ -133,6 +183,30 @@ parse_int64(const char *json, const jsmntok_t *tok, int64_t *value)
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/* Defined in axl-json5-parse.c — separate file so the strict path
+   carries no JSON5 code when only strict consumers link in. */
+bool axl_json5_parse_internal(const char *json, size_t len, AxlJsonReader *r);
+
+bool
+axl_json_parse_flags(const char *json, size_t len,
+                     uint32_t flags, AxlJsonReader *r)
+{
+    if (json == NULL || len == 0 || r == NULL) {
+        return false;
+    }
+
+    r->json        = json;
+    r->json_len    = len;
+    r->tokens      = NULL;
+    r->token_count = 0;
+    r->owns_tokens = false;
+
+    if (flags & AXL_JSON_PARSER_JSON5) {
+        return axl_json5_parse_internal(json, len, r);
+    }
+    return axl_json_parse(json, len, r);
+}
 
 bool
 axl_json_parse(const char *json, size_t len, AxlJsonReader *ctx)
@@ -206,8 +280,9 @@ axl_json_free(AxlJsonReader *ctx)
 }
 
 bool
-axl_json_load_file(const char *path, AxlJsonReader *r,
-                   void **out_buf, size_t *out_len)
+axl_json_load_file_flags(const char *path, uint32_t flags,
+                         AxlJsonReader *r,
+                         void **out_buf, size_t *out_len)
 {
     if (path == NULL || r == NULL || out_buf == NULL) {
         return false;
@@ -222,7 +297,7 @@ axl_json_load_file(const char *path, AxlJsonReader *r,
     if (axl_file_get_contents(path, &raw, &raw_len) != 0) {
         return false;
     }
-    if (!axl_json_parse((const char *)raw, raw_len, r)) {
+    if (!axl_json_parse_flags((const char *)raw, raw_len, flags, r)) {
         axl_free(raw);
         return false;
     }
@@ -231,6 +306,14 @@ axl_json_load_file(const char *path, AxlJsonReader *r,
         *out_len = raw_len;
     }
     return true;
+}
+
+bool
+axl_json_load_file(const char *path, AxlJsonReader *r,
+                   void **out_buf, size_t *out_len)
+{
+    return axl_json_load_file_flags(path, AXL_JSON_PARSER_DEFAULT,
+                                    r, out_buf, out_len);
 }
 
 bool

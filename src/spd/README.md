@@ -59,9 +59,9 @@ mapping to human names is policy that should be data-driven and
 mutable without rebuilding.
 
 `tools/memspd.c` ships the JSON-sidecar pattern: at startup it
-loads `jedec.json` from the binary's directory (or `--jedec-file
+loads `jedec.json5` from the binary's directory (or `--jedec-file
 <path>`) and resolves `mfg_code_*` to vendor names. The stub
-`share/jedec.json` carries 15 common server vendors; consumers
+`share/jedec.json5` carries 15 common server vendors; consumers
 can extend or replace it freely.
 
 ## Wire-protocol notes
@@ -104,7 +104,7 @@ memspd decode <slot>              — raw hex dump + decoded fields
 ```
 
 Common flag: `--jedec-file <path>` overrides the default sidecar
-discovery (binary's directory → `./jedec.json`). When no sidecar
+discovery (binary's directory → `./jedec.json5`). When no sidecar
 loads, manufacturer fields print as raw hex codes — the
 information still reaches the user, just unresolved.
 

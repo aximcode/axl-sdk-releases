@@ -209,20 +209,19 @@ test_signal_install_accepts_handler_and_null(void)
 // axl_app_argv0 — runtime accessor for the captured invocation path
 // ---------------------------------------------------------------------------
 
-/* Inside an AxlSubcommand handler, the dispatcher passes argv+1 — so
-   the handler's argv[0] is the verb name, not the program name.
-   axl_app_argv0() must keep returning the original captured path,
-   independent of the handler's view of argv. The verb stashes both
-   pieces here so the outer test can verify the divergence. */
-static const char *g_verb_local_argv0   = NULL;
+/* Inside an AxlArgs verb handler, the framework presents the verb
+   selector as argv[0] in the parsed view (via axl_args_get_pos and
+   friends) — the original program-level argv[0] must keep flowing
+   from axl_app_argv0() unchanged. The verb stashes a captured
+   axl_app_argv0() value here so the outer test can verify it
+   matches the pre-dispatch capture. */
 static const char *g_verb_app_argv0     = NULL;
 
 static int
-argv0_test_verb(int argc, char **argv)
+argv0_test_verb(AxlArgs *a)
 {
-    (void)argc;
-    g_verb_local_argv0 = (argv != NULL) ? argv[0] : NULL;
-    g_verb_app_argv0   = axl_app_argv0();
+    (void)a;
+    g_verb_app_argv0 = axl_app_argv0();
     return 0;
 }
 
@@ -239,30 +238,30 @@ test_app_argv0_is_stable(void)
     test_check(axl_app_argv0() == captured,
                "app_argv0: returns the same pointer across calls");
 
-    /* The real stability test: drive axl_subcommand_dispatch through
-       a stub verb that captures both its local argv[0] and the value
-       axl_app_argv0() returns. The dispatcher passes argv+1 to the
-       handler, so the verb's argv[0] is the verb name ("vstub"); the
-       app-level argv[0] should remain the program path the runtime
-       captured at startup. If the two are equal here, axl_app_argv0
-       is silently following the dispatcher — a regression. */
-    g_verb_local_argv0 = NULL;
-    g_verb_app_argv0   = NULL;
-    static const AxlSubcommand kTable[] = {
-        { "vstub", argv0_test_verb,
-          "argv0 stability test stub", NULL },
+    /* The real stability test: drive axl_args_run through a stub
+       verb that captures the value axl_app_argv0() returns. AxlArgs
+       presents its own parsed argv view to the handler; the
+       app-level argv[0] (what the runtime captured at startup) must
+       remain unchanged. If g_verb_app_argv0 != captured here,
+       axl_app_argv0 is silently following the dispatcher — a
+       regression. */
+    g_verb_app_argv0 = NULL;
+    static const AxlVerb kVerbs[] = {
+        { .name = "vstub", .handler = argv0_test_verb,
+          .help = "argv0 stability test stub" },
+        {0}
     };
     char *fake_argv[] = { (char *)"axl-test-runtime", (char *)"vstub", NULL };
-    int rc = axl_subcommand_dispatch(
-        kTable, sizeof(kTable) / sizeof(kTable[0]),
-        2, fake_argv, "axl-test-runtime");
+    int rc = axl_args_run(2, fake_argv, &(AxlArgsApp){
+        .name  = "axl-test-runtime",
+        .verbs = kVerbs,
+    });
 
-    test_check(rc == 0, "app_argv0: subcommand dispatch ran the stub");
-    test_check(g_verb_local_argv0 != NULL
-               && axl_strcmp(g_verb_local_argv0, "vstub") == 0,
-               "app_argv0: verb's local argv[0] is the verb name");
+    test_check(rc == 0, "app_argv0: AxlArgs verb dispatch ran the stub");
+    test_check(g_verb_app_argv0 != NULL,
+               "app_argv0: stub captured a non-NULL value");
     test_check(g_verb_app_argv0 == captured,
-               "app_argv0: stable through subcommand dispatch (still program path)");
+               "app_argv0: stable through AxlArgs dispatch (still program path)");
 }
 
 // ---------------------------------------------------------------------------

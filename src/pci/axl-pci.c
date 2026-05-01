@@ -193,6 +193,172 @@ axl_pci_write_config_32(
 }
 
 // ---------------------------------------------------------------------------
+// Address parse / format
+// ---------------------------------------------------------------------------
+
+static int
+hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Parse 1..max_chars hex digits into *out, returning the consumed
+   count or -1 on no digits / overflow. *out is set even on success
+   of a single digit. */
+static int
+parse_hex_field(const char *s, int max_chars, uint32_t *out)
+{
+    uint32_t v = 0;
+    int      i = 0;
+    while (i < max_chars) {
+        int d = hex_value(s[i]);
+        if (d < 0) break;
+        v = (v << 4) | (uint32_t)d;
+        i++;
+    }
+    if (i == 0) return -1;
+    *out = v;
+    return i;
+}
+
+int
+axl_pci_addr_parse(const char *s, AxlPciAddr *out)
+{
+    if (s == NULL || out == NULL) {
+        return -1;
+    }
+
+    /* Walk the input collecting (hex field, separator) pairs. Both
+       accepted forms have a `.` as the final separator and `:` as
+       all the others, so the only thing that varies is the number
+       of `:`-separated leading fields (1 = bus only, 2 = seg+bus). */
+    uint32_t    parts[4] = { 0, 0, 0, 0 };
+    int         n_parts  = 0;
+    const char *p        = s;
+
+    while (n_parts < 4) {
+        int n = parse_hex_field(p, 5, &parts[n_parts]);
+        if (n < 0) return -1;
+        p += n;
+        n_parts++;
+
+        if (*p == '\0') break;
+        if (*p != ':' && *p != '.') return -1;
+
+        /* Final field must be preceded by '.', all others by ':'. */
+        bool is_final_sep = (*p == '.');
+        p++;
+        if (is_final_sep) {
+            /* func is next; one more parse then must hit EOF. */
+            int fn = parse_hex_field(p, 5, &parts[n_parts]);
+            if (fn < 0) return -1;
+            p += fn;
+            n_parts++;
+            break;
+        }
+    }
+    if (*p != '\0') return -1;
+
+    uint32_t seg, bus, dev, func;
+    if (n_parts == 4) {
+        /* seg:bus:dev.func */
+        seg = parts[0]; bus = parts[1]; dev = parts[2]; func = parts[3];
+    } else if (n_parts == 3) {
+        /* bus:dev.func — segment defaults to 0 */
+        seg = 0;        bus = parts[0]; dev = parts[1]; func = parts[2];
+    } else {
+        return -1;
+    }
+
+    if (seg > 0xFFFFu || bus > 0xFFu || dev > 0x1Fu || func > 0x07u) {
+        return -1;
+    }
+    out->seg  = (uint16_t)seg;
+    out->bus  = (uint8_t)bus;
+    out->dev  = (uint8_t)dev;
+    out->func = (uint8_t)func;
+    return 0;
+}
+
+int
+axl_pci_addr_format(AxlPciAddr addr, char *buf, size_t buflen)
+{
+    /* Canonical form is exactly 12 bytes ("SSSS:BB:DD.F") plus a
+       NUL terminator. AXL_PCI_ADDR_STR_MAX is the recommended
+       allocation; the actual minimum we'll accept is one less. */
+    if (buf == NULL || buflen < 13) {
+        return -1;
+    }
+    /* Manual hex formatting — no axl_snprintf needed and avoids
+       pulling printf into builds that don't otherwise use it. */
+    static const char hex[] = "0123456789abcdef";
+    int pos = 0;
+    /* SSSS — 4 hex digits */
+    buf[pos++] = hex[(addr.seg >> 12) & 0xF];
+    buf[pos++] = hex[(addr.seg >>  8) & 0xF];
+    buf[pos++] = hex[(addr.seg >>  4) & 0xF];
+    buf[pos++] = hex[ addr.seg        & 0xF];
+    buf[pos++] = ':';
+    /* BB — 2 hex digits */
+    buf[pos++] = hex[(addr.bus >> 4) & 0xF];
+    buf[pos++] = hex[ addr.bus       & 0xF];
+    buf[pos++] = ':';
+    /* DD — 2 hex digits */
+    buf[pos++] = hex[(addr.dev >> 4) & 0xF];
+    buf[pos++] = hex[ addr.dev       & 0xF];
+    buf[pos++] = '.';
+    /* F — 1 hex digit */
+    buf[pos++] = hex[addr.func & 0xF];
+    buf[pos]   = '\0';
+    return pos;
+}
+
+// ---------------------------------------------------------------------------
+// Common header reads (boilerplate-killer wrappers)
+// ---------------------------------------------------------------------------
+
+int
+axl_pci_get_vid_did(AxlPciAddr addr, uint16_t *vid, uint16_t *did)
+{
+    if (vid == NULL || did == NULL) {
+        return -1;
+    }
+    uint16_t v;
+    if (axl_pci_read_config_16(addr, 0x00, &v) != 0) {
+        return -1;
+    }
+    if (v == 0xFFFF) {
+        /* Function absent — caller doesn't have to special-case this. */
+        return -1;
+    }
+    if (axl_pci_read_config_16(addr, 0x02, did) != 0) {
+        return -1;
+    }
+    *vid = v;
+    return 0;
+}
+
+int
+axl_pci_get_class24(AxlPciAddr addr, uint32_t *class24)
+{
+    if (class24 == NULL) {
+        return -1;
+    }
+    uint8_t prog_if, sub, base;
+    if (axl_pci_read_config_8(addr, 0x09, &prog_if) != 0 ||
+        axl_pci_read_config_8(addr, 0x0A, &sub)     != 0 ||
+        axl_pci_read_config_8(addr, 0x0B, &base)    != 0)
+    {
+        return -1;
+    }
+    *class24 = ((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog_if;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Enumeration
 // ---------------------------------------------------------------------------
 
@@ -615,19 +781,22 @@ vpd_read_bytes(
     return 0;
 }
 
-int
-axl_pci_vpd_read(
-    AxlPciAddr   addr,
-    const char   keyword[2],
-    uint8_t     *buf,
-    size_t       buflen,
-    size_t      *out_len
-    )
+/* Inner VPD walker — produces every keyword and dispatches to a
+   callback. Used by both axl_pci_vpd_iter (the public iter) and
+   axl_pci_vpd_read (which uses a "stop on match" callback).
+
+   Returns 0 if the walk completed without the callback stopping it,
+   the callback's first non-zero return if it stopped early, or
+   -1 on bus error / malformed VPD. */
+typedef int (*VpdWalkCb)(const char keyword[2],
+                         const uint8_t *data, size_t len, void *ctx);
+
+static int
+vpd_walk(AxlPciAddr addr, VpdWalkCb cb, void *ctx)
 {
-    if (keyword == NULL || out_len == NULL || ensure_init() != 0) {
+    if (cb == NULL || ensure_init() != 0) {
         return -1;
     }
-    *out_len = 0;
 
     uint16_t cap_off;
     if (find_vpd_cap(addr, &cap_off) != 0) {
@@ -651,13 +820,13 @@ axl_pci_vpd_read(
         consumed++;
 
         if (tag == VPD_TAG_END) {
-            return -1;
+            return 0;
         }
 
         /* Large resource tags (high bit set) carry a 16-bit length
            in the next two bytes; small tags carry their length in
            the bottom 3 bits and a 4-bit name in bits 6:3. The
-           comparison at line below uses large-tag constants
+           comparison below uses large-tag constants
            (VPD_TAG_RO=0x90, VPD_TAG_RW=0x91), so small-tag entries
            are correctly ignored — RO/RW are large-tag-only. */
         uint16_t len;
@@ -699,18 +868,91 @@ axl_pci_vpd_read(
                 return -1;
             }
 
-            if (axl_memcmp(ent, keyword, 2) == 0) {
-                *out_len = klen;
-                size_t to_copy = klen < buflen ? klen : buflen;
-                if (to_copy > 0
-                    && vpd_read_bytes(addr, cap_off, kdata, buf, to_copy) != 0) {
-                    return -1;
-                }
-                return 0;
+            /* VPD keyword data length is 1 byte, so klen <= 255 —
+               this stack buffer is always sufficient. */
+            uint8_t kbuf[256];
+            if (klen > 0 &&
+                vpd_read_bytes(addr, cap_off, kdata, kbuf, klen) != 0)
+            {
+                return -1;
+            }
+            int rc = cb((const char *)ent, kbuf, klen, ctx);
+            if (rc != 0) {
+                return rc;
             }
             off = next;
         }
         consumed = (uint16_t)(consumed + len);
     }
+    /* Budget exhausted without seeing END — treat as malformed. */
     return -1;
+}
+
+/* Context + callback for axl_pci_vpd_read's "find one keyword" mode. */
+typedef struct {
+    const char *want;       /* 2-char keyword the caller asked for */
+    uint8_t    *buf;        /* destination */
+    size_t      buflen;     /* destination capacity */
+    size_t     *out_len;    /* receives actual on-device length */
+    bool        found;
+} VpdFindOneCtx;
+
+static int
+vpd_find_one_cb(const char keyword[2],
+                const uint8_t *data, size_t len, void *vctx)
+{
+    VpdFindOneCtx *c = (VpdFindOneCtx *)vctx;
+    if (axl_memcmp(keyword, c->want, 2) != 0) {
+        return 0;
+    }
+    *c->out_len = len;
+    size_t to_copy = (len < c->buflen) ? len : c->buflen;
+    if (to_copy > 0) {
+        axl_memcpy(c->buf, data, to_copy);
+    }
+    c->found = true;
+    return 1;  /* stop walk */
+}
+
+int
+axl_pci_vpd_read(
+    AxlPciAddr   addr,
+    const char   keyword[2],
+    uint8_t     *buf,
+    size_t       buflen,
+    size_t      *out_len
+    )
+{
+    if (keyword == NULL || out_len == NULL) {
+        return -1;
+    }
+    *out_len = 0;
+
+    VpdFindOneCtx ctx = {
+        .want    = keyword,
+        .buf     = buf,
+        .buflen  = buflen,
+        .out_len = out_len,
+        .found   = false,
+    };
+    int rc = vpd_walk(addr, vpd_find_one_cb, &ctx);
+    if (rc < 0) {
+        /* bus error or malformed VPD */
+        return -1;
+    }
+    return ctx.found ? 0 : -1;
+}
+
+int
+axl_pci_vpd_iter(
+    AxlPciAddr   addr,
+    int        (*cb)(const char keyword[2],
+                     const uint8_t *data, size_t len, void *ctx),
+    void        *ctx
+    )
+{
+    if (cb == NULL) {
+        return -1;
+    }
+    return vpd_walk(addr, cb, ctx);
 }

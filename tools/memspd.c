@@ -14,7 +14,7 @@
       memspd [--jedec-file PATH] decode <slot-hex>   Raw hex dump + decoded fields
 
     Vendor-name lookup is data-driven via @ref axl_path_companion at
-    startup: try `jedec.json` next to the .efi binary first, then the
+    startup: try `jedec.json5` next to the .efi binary first, then the
     current working directory. `--jedec-file` overrides both. When no
     sidecar loads, the tool prints raw 16-bit JEP-106 codes.
 **/
@@ -39,7 +39,8 @@ try_load_jedec(
     }
     AxlJsonReader r       = { 0 };
     void         *raw     = NULL;
-    if (!axl_json_load_file(path, &r, &raw, NULL)) {
+    if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,
+                                  &r, &raw, NULL)) {
         return false;
     }
 
@@ -55,17 +56,16 @@ try_load_jedec(
     if (axl_json_array_begin(&r, "vendors", &it)) {
         AxlJsonReader entry;
         while (axl_json_array_next(&it, &entry)) {
-            char     code_str[16] = "";
-            uint16_t code = 0;
-            char     name[64]     = "";
+            uint64_t code64 = 0;
+            char     name[64] = "";
 
-            if (!axl_json_get_string(&entry, "code", code_str, sizeof(code_str))
-                || axl_str_to_u16(code_str, 0, &code, NULL) != 0
-                || code == 0
+            if (!axl_json_get_uint(&entry, "code", &code64)
+                || code64 == 0 || code64 > 0xFFFF
                 || !axl_json_get_string(&entry, "name", name, sizeof(name)))
             {
                 continue;
             }
+            uint16_t code = (uint16_t)code64;
             char *name_owned = axl_strdup(name);
             if (name_owned == NULL) {
                 continue;
@@ -98,7 +98,7 @@ load_jedec_table_from_args(
     if (override_path != NULL && try_load_jedec(override_path)) {
         return;
     }
-    char *companion = axl_path_companion(axl_app_argv0(), "jedec.json");
+    char *companion = axl_path_companion(axl_app_argv0(), "jedec.json5");
     if (companion != NULL) {
         bool loaded = try_load_jedec(companion);
         axl_free(companion);
@@ -106,7 +106,7 @@ load_jedec_table_from_args(
             return;
         }
     }
-    (void)try_load_jedec("jedec.json");
+    (void)try_load_jedec("jedec.json5");
 }
 
 static const char *

@@ -4,37 +4,49 @@
 /**
  * axl-subcommand.h:
  *
+ * @deprecated Use @ref axl_args_run from `<axl/axl-args.h>` instead.
+ *     AxlArgs's multi-verb mode (`AxlArgsApp.verbs[]`) strictly subsumes
+ *     this dispatcher and adds typed positional args, bounds checking,
+ *     and auto-generated `--help`. AxlSubcommand is retained as a thin
+ *     wrapper for source compatibility while existing consumers (notably
+ *     delldiags `do.efi`) migrate. New tools should not use this header.
+ *
  * Subcommand-style CLI dispatch for multi-command UEFI apps. Pairs with
- * axl-config (each subcommand can use its own AxlConfig descriptor table
- * for flag parsing) — `mkrd` is the canonical "single-purpose tool"
- * shape, `do.efi` and friends are the canonical "multi-command tool"
- * shape.
+ * axl-config — `mkrd` was the canonical "single-purpose tool" shape and
+ * `do.efi` the "multi-command" shape; both have been migrated.
  *
- * Usage:
+ * Migrating to AxlArgs in one diff:
  *
- *   static int do_bios(int argc, char **argv) {
- *       // argv[0] is "bios"; flags via axl_config_*
- *       return 0;
- *   }
- *   static int do_sysid(int argc, char **argv) {
- *       // argv[0] is "sysid"
- *       return 0;
- *   }
+ *     // before:
+ *     static int do_bios(int argc, char **argv) { ... }
+ *     static const AxlSubcommand kCommands[] = {
+ *         { "bios", do_bios, "[test|pci|irq|slot|emb]",
+ *           "do bios test  — ..." },
+ *     };
+ *     int main(int argc, char **argv) {
+ *         return axl_subcommand_dispatch(kCommands, ARRAY_LEN(kCommands),
+ *             argc, argv, "do");
+ *     }
  *
- *   static const AxlSubcommand kCommands[] = {
- *       { "bios",  do_bios,  "[test|pci|irq|slot|emb]",
- *         "do bios test  — run BIOS POST self-test\n"
- *         "do bios pci   — dump PCI bus info\n" },
- *       { "sysid", do_sysid, "[hexValue]",
- *         "do sysid       — print system ID\n"
- *         "do sysid <hex> — set system ID\n" },
- *   };
- *
- *   int main(int argc, char **argv) {
- *       return axl_subcommand_dispatch(kCommands,
- *           sizeof(kCommands) / sizeof(kCommands[0]),
- *           argc, argv, "do");
- *   }
+ *     // after:
+ *     static const AxlArgDesc kBiosArgs[] = {
+ *         { .name = "args", .type = AXL_ARG_MULTI,
+ *           .help = "subcommand arguments" }, {0}
+ *     };
+ *     static int do_bios(AxlArgs *a) {
+ *         int n = axl_args_get_pos_count(a);
+ *         const char *sub = (n > 0) ? axl_args_get_pos(a, 0) : NULL;
+ *         ...
+ *     }
+ *     static const AxlVerb kVerbs[] = {
+ *         { .name = "bios", .handler = do_bios, .positionals = kBiosArgs,
+ *           .help = "BIOS / SMBIOS info (test|pci|irq|slot|emb)" }, {0}
+ *     };
+ *     int main(int argc, char **argv) {
+ *         return axl_args_run(argc, argv, &(AxlArgsApp){
+ *             .name = "do", .verbs = kVerbs,
+ *         });
+ *     }
  */
 
 #ifndef AXL_SUBCOMMAND_H
@@ -97,7 +109,7 @@ axl_subcommand_dispatch(
     int                   argc,
     char                **argv,
     const char           *prog_name
-);
+) __attribute__((deprecated("use axl_args_run from <axl/axl-args.h>")));
 
 /**
  * @brief Print only the formatted help table.
@@ -118,7 +130,7 @@ axl_subcommand_print_help(
     const AxlSubcommand  *table,
     size_t                count,
     const char           *prog_name
-);
+) __attribute__((deprecated("use axl_args_run from <axl/axl-args.h>")));
 
 /**
  * @brief Print a single subcommand's detailed usage.
@@ -131,7 +143,7 @@ void
 axl_subcommand_print_command_help(
     const AxlSubcommand  *entry,
     const char           *prog_name
-);
+) __attribute__((deprecated("use axl_args_run from <axl/axl-args.h>")));
 
 #ifdef __cplusplus
 }

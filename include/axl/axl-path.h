@@ -97,7 +97,7 @@ axl_path_resolve(
 
 /**
  * @brief Build a path to a file alongside another (the "companion"
- *     pattern: load `jedec.json` from the directory holding the
+ *     pattern: load `jedec.json5` from the directory holding the
  *     binary that just started running, etc.).
  *
  * Equivalent to @ref axl_path_join with the dirname of @p anchor as
@@ -107,7 +107,7 @@ axl_path_resolve(
  * Caller frees with @ref axl_free.
  *
  * @code
- * char *cfg = axl_path_companion(axl_app_argv0(), "jedec.json");
+ * char *cfg = axl_path_companion(axl_app_argv0(), "jedec.json5");
  * // load cfg if non-NULL
  * @endcode
  *

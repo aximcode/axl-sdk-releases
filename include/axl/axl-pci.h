@@ -41,8 +41,10 @@ extern "C" {
 /**
  * @brief A PCI configuration-space address (segment:bus:dev:func).
  *
- * 16-bit segment future-proofs against multi-segment platforms;
- * single-segment systems leave it at 0. Bus / dev / func are the
+ * 16-bit segment matches the UEFI MCFG / PCIe spec width so multi-
+ * segment platforms are addressable directly — every lookup, walk,
+ * and find helper takes segment as part of the address tuple.
+ * Single-segment systems leave it at 0. Bus / dev / func are the
  * standard 8/5/3-bit fields.
  */
 typedef struct {
@@ -51,6 +53,44 @@ typedef struct {
     uint8_t   dev;    ///< device number (0..31)
     uint8_t   func;   ///< function number (0..7)
 } AxlPciAddr;
+
+/// Buffer size that fits the canonical "SSSS:BB:DD.F" form plus NUL.
+#define AXL_PCI_ADDR_STR_MAX  16
+
+/**
+ * @brief Parse a textual PCI address into an AxlPciAddr.
+ *
+ * Accepts two hex-only formats:
+ *   - `bus:dev.func`             — segment defaults to 0
+ *   - `seg:bus:dev.func`         — explicit segment
+ *
+ * Components are bounded at parse time (bus 0..0xFF, dev 0..0x1F,
+ * func 0..0x07, seg 0..0xFFFF); out-of-range or malformed input
+ * returns -1 with @p out left unmodified.
+ *
+ * @return 0 on success, -1 on malformed input.
+ */
+int
+axl_pci_addr_parse(
+    const char  *s,    ///< input string (NUL-terminated, hex digits + `:` + `.`)
+    AxlPciAddr  *out   ///< [out] parsed address (untouched on error)
+);
+
+/**
+ * @brief Write an AxlPciAddr in canonical `SSSS:BB:DD.F` form.
+ *
+ * Always emits the 4-digit segment — round-trips with @ref
+ * axl_pci_addr_parse. NUL-terminates @p buf when @p buflen >= 13.
+ *
+ * @return number of bytes written excluding NUL, or -1 if @p buflen
+ *     is too small (need >= AXL_PCI_ADDR_STR_MAX).
+ */
+int
+axl_pci_addr_format(
+    AxlPciAddr  addr,    ///< address to format
+    char       *buf,     ///< destination buffer
+    size_t      buflen   ///< capacity of @p buf
+);
 
 // ---------------------------------------------------------------------------
 // Config-space read/write
@@ -88,6 +128,43 @@ axl_pci_write_config_16(AxlPciAddr addr, uint16_t reg, uint16_t value);
 /// Write counterpart to axl_pci_read_config_32.
 int
 axl_pci_write_config_32(AxlPciAddr addr, uint16_t reg, uint32_t value);
+
+// ---------------------------------------------------------------------------
+// Common header reads (boilerplate-killer wrappers)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Read vendor ID and device ID from a function's standard header.
+ *
+ * Reads offsets 0x00 and 0x02. The "function absent" sentinel
+ * (vendor ID == 0xFFFF) is folded into the return code so callers
+ * don't have to special-case it.
+ *
+ * @return 0 on success (both fields populated), -1 if the function
+ *     is absent or any bus error is encountered.
+ */
+int
+axl_pci_get_vid_did(
+    AxlPciAddr   addr,   ///< target function
+    uint16_t    *vid,    ///< [out] vendor ID
+    uint16_t    *did     ///< [out] device ID
+);
+
+/**
+ * @brief Read the 24-bit class code from a function's standard header.
+ *
+ * Folds the three bytes at offsets 0x09 (programming interface),
+ * 0x0A (subclass), and 0x0B (base class) into the canonical
+ * `(base << 16) | (sub << 8) | prog_if` form — same shape consumed
+ * by @ref axl_pci_find_by_class.
+ *
+ * @return 0 on success, -1 on bus error.
+ */
+int
+axl_pci_get_class24(
+    AxlPciAddr   addr,    ///< target function
+    uint32_t    *class24  ///< [out] 24-bit class code
+);
 
 // ---------------------------------------------------------------------------
 // Enumeration
@@ -211,6 +288,38 @@ axl_pci_vpd_read(
     uint8_t     *buf,          ///< destination buffer
     size_t       buflen,       ///< capacity of @p buf
     size_t      *out_len       ///< [out] keyword's actual length
+);
+
+/**
+ * @brief Walk every keyword in a function's VPD area and dispatch to
+ *     a callback.
+ *
+ * Complements @ref axl_pci_vpd_read for tools that want "show me
+ * everything that's there" rather than "fetch this specific
+ * keyword." Visits both the Read-Only (PN/EC/SN/MN/RV/V0..V9/...)
+ * and Read-Write (Y0..Y9/RW/...) resource sections in document
+ * order. Vendor-specific keywords (V0..V9, Y0..Y9) reach the
+ * callback alongside the standard ones.
+ *
+ * The data buffer passed to @p cb is owned by the implementation
+ * and is only valid for the duration of the call — the callback
+ * must copy bytes it wants to retain. Returning non-zero from
+ * @p cb stops iteration; that value becomes the iter return.
+ *
+ * @return 0 if iteration completed without the callback stopping
+ *     it, the callback's non-zero return if it stopped early, or
+ *     -1 if VPD is unsupported or any bus error is encountered.
+ */
+int
+axl_pci_vpd_iter(
+    AxlPciAddr   addr,         ///< target function
+    int        (*cb)(          ///< per-keyword callback
+        const char     keyword[2],  ///< 2-char ASCII keyword
+        const uint8_t *data,        ///< keyword data (impl-owned)
+        size_t         len,         ///< data length in bytes
+        void          *ctx          ///< caller's ctx
+    ),
+    void        *ctx           ///< opaque context forwarded to @p cb
 );
 
 #ifdef __cplusplus
