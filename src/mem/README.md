@@ -115,4 +115,4 @@ axl_mem_dump_leaks();
 ```
 
 See also: **AxlString** for auto-growing string builders,
-**AxlIO** for file I/O.
+**AxlStream** / **AxlFs** for I/O.

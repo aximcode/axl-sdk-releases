@@ -68,24 +68,24 @@ if (axl_pci_get_vid_did(addr, &vid, &did) == 0) {
     /* function is present (vid != 0xFFFF) and both fields read OK */
 }
 
-uint32_t class24;  /* (base << 16) | (sub << 8) | prog_if */
-axl_pci_get_class24(addr, &class24);
+uint32_t class_code;  /* (base << 16) | (sub << 8) | prog_if */
+axl_pci_get_class_code(addr, &class_code);
 ```
 
 `axl_pci_get_vid_did` returns -1 when the function is absent (vid
 reads as `0xFFFF`), so callers don't have to special-case the
-sentinel. `class24` matches the shape consumed by
+sentinel. `class_code` matches the shape consumed by
 `axl_pci_find_by_class`.
 
 `axl_pci_class_string` decodes the 24-bit class triplet into a
 human-readable form per the PCI Code and ID Assignment Spec:
 
 ```c
-uint32_t class24;
+uint32_t class_code;
 char     cls[80];
-axl_pci_get_class24(addr, &class24);
-axl_pci_class_string(class24, cls, sizeof(cls));
-axl_printf("Class %06X (%s)\n", class24, cls);
+axl_pci_get_class_code(addr, &class_code);
+axl_pci_class_string(class_code, cls, sizeof(cls));
+axl_printf("Class %06X (%s)\n", class_code, cls);
 // Class 0C0330 (Serial bus controller / USB / xHCI)
 ```
 

@@ -39,6 +39,19 @@ axl_strlen(const char *s)
     return n;
 }
 
+size_t
+axl_strnlen(const char *s, size_t maxlen)
+{
+    size_t n = 0;
+    if (s == NULL) {
+        return 0;
+    }
+    while (n < maxlen && s[n]) {
+        n++;
+    }
+    return n;
+}
+
 int
 axl_strcmp(const char *a, const char *b)
 {
@@ -75,14 +88,8 @@ axl_strcasecmp(
     )
 {
     while (*a && *b) {
-        unsigned char ca = (unsigned char)*a;
-        unsigned char cb = (unsigned char)*b;
-        if (ca >= 'A' && ca <= 'Z') {
-            ca += 'a' - 'A';
-        }
-        if (cb >= 'A' && cb <= 'Z') {
-            cb += 'a' - 'A';
-        }
+        unsigned char ca = (unsigned char)axl_tolower((unsigned char)*a);
+        unsigned char cb = (unsigned char)axl_tolower((unsigned char)*b);
         if (ca != cb) {
             return (int)ca - (int)cb;
         }
@@ -548,6 +555,96 @@ axl_strstr(const char *haystack, const char *needle)
     return axl_strstr_len(haystack, -1, needle);
 }
 
+// ---------------------------------------------------------------------------
+// Boyer-Moore-Horspool substring search
+//
+// Below the BMH_THRESHOLD, the per-search cost of building the skip
+// table dominates the win — fall back to naive byte-walking. Above
+// it, BMH gives sub-linear average performance and is what every
+// serious strstr (glibc memmem, musl twoway-fallback, BSD libc)
+// uses.
+//
+// One skip table covers the whole alphabet (256 bytes). Default
+// shift is the pattern length; each pattern byte (except the last)
+// shrinks the shift to "distance from end". Later occurrences of a
+// byte in the pattern overwrite earlier — the correct rule for
+// Horspool's variant.
+// ---------------------------------------------------------------------------
+
+#define BMH_THRESHOLD  4u
+
+static const char *
+bmh_search(const char *haystack, size_t h_len,
+           const char *needle,   size_t n_len)
+{
+    /* Skip table: how far to advance the window when the byte at
+       its tail mismatches. Use size_t to avoid overflow on long
+       patterns; 256 entries × 8 bytes = 2KB on x64 stack — fine. */
+    size_t skip[256];
+    for (int i = 0; i < 256; i++) {
+        skip[i] = n_len;
+    }
+    for (size_t k = 0; k + 1 < n_len; k++) {
+        skip[(unsigned char)needle[k]] = n_len - 1 - k;
+    }
+
+    size_t i = 0;
+    const size_t last_n = n_len - 1;
+    while (i + n_len <= h_len) {
+        /* Compare from end of pattern backward — the byte that
+           drives the shift is examined first. */
+        if (haystack[i + last_n] == needle[last_n]) {
+            size_t k = last_n;
+            while (k > 0 && haystack[i + k - 1] == needle[k - 1]) {
+                k--;
+            }
+            if (k == 0) {
+                return haystack + i;
+            }
+        }
+        i += skip[(unsigned char)haystack[i + last_n]];
+    }
+    return NULL;
+}
+
+/* Case-insensitive Horspool variant. The skip table is built over
+   the lowercase-folded pattern, and every haystack byte is folded
+   on the fly during comparison and shift lookup. */
+static const char *
+bmh_isearch(const char *haystack, size_t h_len,
+            const char *needle,   size_t n_len)
+{
+    size_t skip[256];
+    for (int i = 0; i < 256; i++) {
+        skip[i] = n_len;
+    }
+    for (size_t k = 0; k + 1 < n_len; k++) {
+        unsigned char nc = (unsigned char)axl_tolower((unsigned char)needle[k]);
+        skip[nc] = n_len - 1 - k;
+    }
+
+    size_t i = 0;
+    const size_t last_n = n_len - 1;
+    while (i + n_len <= h_len) {
+        unsigned char hc = (unsigned char)axl_tolower((unsigned char)haystack[i + last_n]);
+        unsigned char nc = (unsigned char)axl_tolower((unsigned char)needle[last_n]);
+        if (hc == nc) {
+            size_t k = last_n;
+            while (k > 0) {
+                unsigned char a = (unsigned char)axl_tolower((unsigned char)haystack[i + k - 1]);
+                unsigned char b = (unsigned char)axl_tolower((unsigned char)needle[k - 1]);
+                if (a != b) break;
+                k--;
+            }
+            if (k == 0) {
+                return haystack + i;
+            }
+        }
+        i += skip[(unsigned char)axl_tolower((unsigned char)haystack[i + last_n])];
+    }
+    return NULL;
+}
+
 char *
 axl_strncpy(char *dst, const char *src, size_t n)
 {
@@ -597,6 +694,15 @@ axl_strstr_len(const char *haystack, long long haystack_len, const char *needle)
         return NULL;
     }
 
+    /* Long-needle path: Boyer-Moore-Horspool — sub-linear average,
+       what glibc/musl/BSD libc all use. The skip-table setup costs
+       ~256 stores, so it's only a win once the inner loop saves
+       enough comparisons to amortize it. */
+    if (n_len >= BMH_THRESHOLD) {
+        return (char *)bmh_search(haystack, h_len, needle, n_len);
+    }
+
+    /* Short-needle path: naive scan with first-byte fast-path. */
     for (i = 0; i <= h_len - n_len; i++) {
         if (haystack[i] == needle[0] &&
             axl_strncmp(haystack + i, needle, n_len) == 0) {
@@ -681,38 +787,51 @@ axl_strrstr_len(const char *haystack, long long haystack_len, const char *needle
 }
 
 char *
-axl_strcasestr(
+axl_strcasestr(const char *haystack, const char *needle)
+{
+    return axl_strcasestr_len(haystack, -1, needle);
+}
+
+char *
+axl_strcasestr_len(
     const char  *haystack,
+    long long    haystack_len,
     const char  *needle
     )
 {
     if (haystack == NULL || needle == NULL) {
         return NULL;
     }
-    if (*needle == '\0') {
+
+    size_t n_len = axl_strlen(needle);
+    if (n_len == 0) {
         return (char *)haystack;
     }
 
-    for (; *haystack != '\0'; haystack++) {
-        const char *h = haystack;
-        const char *n = needle;
-        while (*h != '\0' && *n != '\0') {
-            unsigned char ch = (unsigned char)*h;
-            unsigned char cn = (unsigned char)*n;
-            if (ch >= 'A' && ch <= 'Z') {
-                ch += 'a' - 'A';
-            }
-            if (cn >= 'A' && cn <= 'Z') {
-                cn += 'a' - 'A';
-            }
-            if (ch != cn) {
-                break;
-            }
-            h++;
-            n++;
+    size_t h_len = (haystack_len < 0)
+                 ? axl_strlen(haystack)
+                 : (size_t)haystack_len;
+
+    if (n_len > h_len) {
+        return NULL;
+    }
+
+    /* Long-needle path: case-insensitive Horspool. */
+    if (n_len >= BMH_THRESHOLD) {
+        return (char *)bmh_isearch(haystack, h_len, needle, n_len);
+    }
+
+    /* Short-needle path: naive scan with per-byte case fold. */
+    for (size_t i = 0; i <= h_len - n_len; i++) {
+        size_t k = 0;
+        while (k < n_len) {
+            unsigned char ch = (unsigned char)axl_tolower((unsigned char)haystack[i + k]);
+            unsigned char cn = (unsigned char)axl_tolower((unsigned char)needle[k]);
+            if (ch != cn) break;
+            k++;
         }
-        if (*n == '\0') {
-            return (char *)haystack;
+        if (k == n_len) {
+            return (char *)(haystack + i);
         }
     }
 
@@ -932,15 +1051,8 @@ axl_strncasecmp(const char *s1, const char *s2, size_t n)
     }
 
     for (i = 0; i < n; i++) {
-        unsigned char c1 = (unsigned char)s1[i];
-        unsigned char c2 = (unsigned char)s2[i];
-
-        if (c1 >= 'A' && c1 <= 'Z') {
-            c1 += 'a' - 'A';
-        }
-        if (c2 >= 'A' && c2 <= 'Z') {
-            c2 += 'a' - 'A';
-        }
+        unsigned char c1 = (unsigned char)axl_tolower((unsigned char)s1[i]);
+        unsigned char c2 = (unsigned char)axl_tolower((unsigned char)s2[i]);
 
         if (c1 != c2) {
             return (int)c1 - (int)c2;
@@ -1962,15 +2074,13 @@ axl_str_reader_take_u64(
 static bool
 is_ident_start(char c)
 {
-    return (c >= 'A' && c <= 'Z')
-        || (c >= 'a' && c <= 'z')
-        ||  c == '_';
+    return axl_isalpha((unsigned char)c) || c == '_';
 }
 
 static bool
 is_ident_cont(char c)
 {
-    return is_ident_start(c) || (c >= '0' && c <= '9');
+    return is_ident_start(c) || axl_isdigit((unsigned char)c);
 }
 
 bool

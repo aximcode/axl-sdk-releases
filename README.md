@@ -311,7 +311,7 @@ axl-cc --type driver mydriver.c -o mydriver.efi
   `README.md` with overview, examples, and usage guidance:
   [mem](https://github.com/aximcode/axl-sdk-releases/blob/main/src/mem/README.md),
   [data](https://github.com/aximcode/axl-sdk-releases/blob/main/src/data/README.md) (str, string, hash, array, list, queue, json, cache),
-  [io](https://github.com/aximcode/axl-sdk-releases/blob/main/src/io/README.md),
+  [io](https://github.com/aximcode/axl-sdk-releases/blob/main/src/stream/README.md),
   [log](https://github.com/aximcode/axl-sdk-releases/blob/main/src/log/README.md),
   [util](https://github.com/aximcode/axl-sdk-releases/blob/main/src/util/README.md) (args, config, path, env, sys, driver),
   [loop](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md) (event loop, defer, signal),

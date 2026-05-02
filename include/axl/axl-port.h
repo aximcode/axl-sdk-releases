@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/** @file axl-io-port.h
+/** @file axl-port.h
     x86 architectural I/O port access.
 
     Public wrappers around the `in`/`out` instruction family. These are

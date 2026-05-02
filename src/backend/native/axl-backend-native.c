@@ -658,6 +658,56 @@ axl_backend_shell_setenv(
     return EFI_ERROR(status) ? -1 : 0;
 }
 
+/**
+ * @brief Get the SHELL_FILE_HANDLE for the running image's stdin.
+ *
+ * Looks up EFI_SHELL_PARAMETERS_PROTOCOL on the image handle. The
+ * StdIn field there is what the shell wired up — for `tool1 | tool2`
+ * this is the captured LHS output stream. Cached after the first
+ * probe so repeat callers don't pay HandleProtocol overhead.
+ *
+ * @return SHELL_FILE_HANDLE cast as AxlFileHandle, or NULL when the
+ *     shell-params protocol isn't published on this image (cross-
+ *     volume launches, BDS contexts, non-Shell-2.0 launches).
+ */
+static SHELL_FILE_HANDLE  mShellStdIn        = NULL;
+static SHELL_FILE_HANDLE  mShellStdOut       = NULL;
+static bool               mShellStdProbed    = false;
+
+/* Shared probe — looks up EFI_SHELL_PARAMETERS_PROTOCOL once and
+   caches both StdIn and StdOut handles. Both helpers below trigger
+   the same probe on first call. */
+static void
+probe_shell_std_handles(void)
+{
+    if (mShellStdProbed) {
+        return;
+    }
+    mShellStdProbed = true;
+    EFI_SHELL_PARAMETERS_PROTOCOL *sp = NULL;
+    EFI_GUID guid = gEfiShellParametersProtocolGuid;
+    EFI_STATUS status = gBS->HandleProtocol(
+        (EFI_HANDLE)gImageHandle, &guid, (VOID **)&sp);
+    if (!EFI_ERROR(status) && sp != NULL) {
+        mShellStdIn  = sp->StdIn;
+        mShellStdOut = sp->StdOut;
+    }
+}
+
+AxlFileHandle
+axl_backend_shell_stdin(void)
+{
+    probe_shell_std_handles();
+    return (AxlFileHandle)mShellStdIn;
+}
+
+AxlFileHandle
+axl_backend_shell_stdout(void)
+{
+    probe_shell_std_handles();
+    return (AxlFileHandle)mShellStdOut;
+}
+
 const unsigned short *
 axl_backend_shell_getcwd(
     void

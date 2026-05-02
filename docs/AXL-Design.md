@@ -26,9 +26,9 @@ and direct:
 | `GHashTable`                    | `AxlHashTable`                     |
 | `GSList` / `GList` / `GQueue`   | `AxlSList` / `AxlList` / `AxlQueue`|
 | `GString`                       | `AxlString`                        |
-| `GBytes`                        | `AxlIOBuf`                         |
+| `GBytes`                        | `AxlStream` (buffer)                         |
 | `g_signal_connect`              | `axl_pubsub_subscribe`             |
-| `g_io_channel_*`                | `AxlSocket`, `AxlIO`               |
+| `g_io_channel_*`                | `AxlSocket`, `AxlStream`               |
 | `g_malloc` / `g_free` / `g_new0`| `axl_malloc` / `axl_free` / `axl_new`|
 | `gint64` / `gsize` / `gboolean` | `int64_t` / `size_t` / `bool`      |
 | `GError` out-param              | int return + `axl_error` log       |
@@ -967,7 +967,7 @@ types in public API, no space before parens.
    `axl_printerr`, builds strings with `axl_string`. If the API
    isn't good enough for our own code, it isn't good enough to ship.
 
-   Exception: very early initialization (before `axl_io_init`) may
+   Exception: very early initialization (before `axl_stream_init`) may
    use EDK2 primitives directly since streams aren't available yet.
 
 9. **No legacy EDK2-style API.** There is no separate PascalCase

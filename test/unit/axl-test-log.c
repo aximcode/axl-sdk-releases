@@ -5,7 +5,8 @@
 
 #include "axl-test.h"
 #include <axl/axl-log.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-mem.h>
 
 AXL_LOG_DOMAIN("test");

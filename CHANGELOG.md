@@ -3,6 +3,154 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.9.0 — 2026-05-01
+
+Substantial release covering shell-pipe support, per-stream encoding,
+a chunk-buffer line iterator, ASCII ctype helpers, device-path
+iteration, BMH substring search, several extracted patterns, and
+the headline restructure: the umbrella **AxlIO** module split into
+**AxlStream** (byte-stream abstraction, the `<stdio.h>` analog) and
+**AxlFs** (path-based filesystem operations, the `<sys/stat.h>` +
+`<dirent.h>` analog), with a cleaner one-way dependency direction.
+The `axl_io_port_*` x86 PIO module renamed to `axl_port_*` to
+resolve the namespace overlap.
+
+### Breaking
+
+Consumers that include the umbrella `<axl.h>` need no header edits.
+Direct includes and a few public renames:
+
+- `<axl/axl-io.h>` → `<axl/axl-stream.h>` (and/or `<axl/axl-fs.h>`)
+- `<axl/axl-io-port.h>` → `<axl/axl-port.h>`
+- `axl_io_init()` → `axl_stream_init()` (called automatically by
+  `axl_runtime_init` — most callers don't invoke it directly).
+- **PCI**: `class24` field renamed to `class_code` across the
+  `AxlPciInfo` API and helpers — the field is the standard
+  3-byte (Class/Subclass/ProgIF) encoding from PCI config space,
+  not specifically a 24-bit fragment of byte 0x18. Consumers
+  accessing the field by name need to update.
+
+### Added
+
+- **Shell-pipe stdin/stdout** (`axl_stdin`, `axl_stdout_raw`):
+  raw-bytes stdin backed by `EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`
+  and a binary-clean stdout-raw companion that bypasses the
+  UTF-8→UCS-2 console conversion. Tools can now sit in a pipeline
+  without mangling bytes.
+- **Per-stream encoding** (`axl_stream_set_encoding` /
+  `axl_stream_get_encoding`, `AxlEncoding`): configure a stream
+  with its wire-side encoding (UCS-2 LE / UCS-2 BE / ASCII /
+  UTF-8 default), and `axl_read`/`axl_write` transparently
+  transcode. Permissive — bad input never errors. Default UTF-8
+  is passthrough so existing streams are unaffected.
+- **POSIX-shape stream conveniences**: `axl_fgets`,
+  `axl_vfprintf`, `axl_ferror`, `axl_clearerr`, plus the bounded
+  `axl_readline_max(stream, max_bytes)` to cap heap on no-newline
+  inputs.
+- **`axl_text_stream_wrap` headerless UCS-2 sniff**: in addition
+  to BOM detection, the wrapper now content-sniffs UCS-2 LE/BE
+  for files that lack a BOM (UEFI shell `cmd > out.txt` shape).
+- **`AxlLineReader` + `axl_walk_lines`**: chunk-buffer line
+  iteration with caller-supplied working buffer. Constant memory
+  regardless of input size; lines longer than the buffer fire a
+  truncated callback and the rest of the line is drained so line
+  counting stays correct. `axl_walk_lines` is a callback wrapper
+  for callers that prefer dispatch over iterator-style loops.
+- **ASCII ctype helpers** (`axl_isdigit`, `axl_isxdigit`,
+  `axl_isalpha`, `axl_isalnum`, `axl_isspace`, `axl_tolower`,
+  `axl_toupper`) plus **`axl_hex_nibble`** and **`axl_strnlen`**.
+  Closes a dogfood gap — 14 hand-rolled call sites swept.
+- **`axl_strcasestr_len`** — length-bounded case-insensitive
+  substring search. Mirror of `axl_strstr_len`. Lets callers with
+  non-NUL-terminated slices (`AxlLineReader` line bodies, network
+  buffers, etc.) avoid the copy-to-stack-buffer dance.
+- **Device-path iteration** (`axl_device_path_for_each`,
+  `axl_device_path_find`, `axl_device_path_size`): bounded-step
+  walker for `EFI_DEVICE_PATH_PROTOCOL` with one safety floor
+  (64 nodes) shared across all callers.
+- **`AxlVolume.device_path`**: the volume descriptor now carries
+  the firmware-owned DP pointer so callers don't need to look it
+  up per-iteration via `axl_handle_get_service`.
+- **`axl_dir_walk`**: recursive callback-style directory walker
+  with POSIX `find -maxdepth` semantics. Replaces five hand-rolled
+  walks (find, grep, driver, io-demo, etc.).
+- **`axl_smbios_format_uuid`**: SMBIOS §7.2.1 mixed-endian UUID
+  formatter — also fixes a bug in `tools/dmidecode` where UUIDs
+  were emitted byte-raw and didn't match Linux dmidecode output.
+- **`axl_resolve_data_file`**: sidecar-data lookup convenience
+  (override → companion → cwd) for tools that ship optional JSON.
+- **`tools/cat`**: new tool, file/stdin display with `-n -s -A
+  -E -T --raw -e ENC`. First in-tree consumer of
+  `axl_stream_set_encoding`. The `-e` flag forces a wire encoding
+  (utf8/ucs2le/ucs2be/ascii); default BOM-probes via
+  `axl_text_stream_wrap`.
+
+### Changed
+
+- **AxlIO → AxlStream + AxlFs split.** Public header `axl-io.h`
+  replaced by `axl-stream.h` + `axl-fs.h`; source dir `src/io/`
+  by `src/stream/` + `src/fs/`. Mirrors POSIX `<stdio.h>` vs
+  `<sys/stat.h>` + `<dirent.h>`. One-way dependency: AxlFs
+  depends on AxlStream; AxlStream is independent.
+- **`axl_io_port_*` → `axl_port_*`** (x86 PIO). Header
+  `axl-io-port.h` → `axl-port.h`. Resolves the "io" namespace
+  overlap.
+- **`tools/grep` rewrite**: streams its input via `axl_walk_lines`
+  + a 64 KiB working buffer instead of slurping the whole file
+  with a 1024-byte fixed line buffer and a 16 MiB size cap.
+  Single code path for both file and stdin (Linux-grep parity).
+  Memory bounded by the working buffer regardless of file size
+  or line shape.
+- **`axl_strstr_len` / `axl_strcasestr` switch to Boyer-Moore-
+  Horspool** for needles ≥ 4 bytes — sub-linear average; what
+  glibc `memmem` / musl twoway-fallback / BSD libc all use.
+  Below the threshold, naive scan still applies. Speeds up grep,
+  HTTP header parsing, JSON token boundary lookups, log
+  filtering, and SMBIOS string searches transparently.
+- **Build system: `-std=gnu2x`** (was implicit gnu17). The
+  pre-standard alias for C23 — accepted by gcc 13/14 and forward.
+  Codebase consumes the C23 features that matter
+  (`[[nodiscard]]`, `[[noreturn]]`, the `static_assert` keyword)
+  without forcing a toolchain bump. `AXL_WARN_UNUSED` and
+  `AXL_NORETURN` macros now expand to those attributes.
+- **Build system: ramdisk blob via `.incbin`** instead of
+  xxd-generated headers. mkrd's embedded `RamDiskDxe.efi` is now
+  emitted by `tools/mkrd-blob.S`'s `.incbin` directive — no more
+  multi-MB C array literals to parse on every mkrd build.
+
+### Fixed
+
+- `tools/dmidecode` UUID output now matches Linux `dmidecode` and
+  Windows `wmic` (was emitting raw bytes, missing the SMBIOS
+  §7.2.1 mixed-endian Data1/2/3 swap).
+- `axl_handle_get_service` defensively NULLs `*interface` on
+  every error path. UEFI HandleProtocol doesn't guarantee
+  preservation on failure, and callers like `AxlVolume.device_path`
+  now gate on NULL — a stale pointer would have been a footgun.
+- `axl_dir_walk` semantics aligned with POSIX `find -maxdepth`
+  (was off by one).
+- `axl_walk_lines` and `AxlLineReader` correctly drain the rest
+  of an over-cap line from the stream so line counting stays
+  meaningful.
+- `axl_text_stream_wrap` rejects write-only sources at
+  construction (was a NULL-deref on the eager BOM probe).
+- `axl_stream_set_encoding` and `axl_fseek` reset transcode
+  buffers — partial sequences from a prior encoding/position
+  no longer splice onto the new byte stream.
+
+### Internal
+
+- `axl-stream-internal.h` shrunk to just the `struct AxlStream`
+  body + `axl_stream_new()` — the previous `*_internal`
+  trampolines (`axl_fopen_internal`, `axl_bufopen_internal`,
+  `axl_file_get_contents_internal`, etc.) were collapsed; the
+  public names are the implementations directly.
+- 5 patterns extracted from cross-file duplication:
+  `axl_smbios_format_uuid`, `axl_device_path_*`,
+  `AxlVolume.device_path`, `axl_dir_walk`,
+  `axl_resolve_data_file`. mkrd's three near-identical
+  iteration loops shed ~30 lines each.
+
 ## 0.8.1 — 2026-05-01
 
 Backward-compatible polish on top of v0.8.0's AxlArgsNode unification:

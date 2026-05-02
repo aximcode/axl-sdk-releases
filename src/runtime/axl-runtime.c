@@ -21,7 +21,7 @@
 #include <axl/axl-loop.h>
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
 
 AXL_LOG_DOMAIN("runtime");
 
@@ -110,7 +110,7 @@ _axl_init(void *image_handle, void *system_table)
     gBS = gST->BootServices;
     gRT = gST->RuntimeServices;
 
-    axl_io_init();
+    axl_stream_init();
     _axl_registry_init();
     _axl_atexit_init();
     _axl_args_init(image_handle);

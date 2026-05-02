@@ -78,7 +78,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     port_start = host_end;
     if (*port_start == ':') {
         port_start++;
-        while (*port_start >= '0' && *port_start <= '9') {
+        while (axl_isdigit((unsigned char)*port_start)) {
             port = (uint16_t)(port * 10 + (*port_start - '0'));
             port_start++;
         }
@@ -228,10 +228,8 @@ static const char hex_chars[] = "0123456789ABCDEF";
 static bool
 is_unreserved(char c)
 {
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') ||
-           c == '-' || c == '.' || c == '_' || c == '~';
+    return axl_isalnum((unsigned char)c)
+        || c == '-' || c == '.' || c == '_' || c == '~';
 }
 
 int
@@ -267,15 +265,6 @@ axl_url_encode(const char *src, char *out, size_t size)
     return (int)pos;
 }
 
-static int
-hex_digit(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
 int
 axl_url_decode(const char *src, char *out, size_t size)
 {
@@ -291,8 +280,8 @@ axl_url_decode(const char *src, char *out, size_t size)
         }
 
         if (src[0] == '%' && src[1] != '\0' && src[2] != '\0') {
-            int hi = hex_digit(src[1]);
-            int lo = hex_digit(src[2]);
+            int hi = axl_hex_nibble(src[1]);
+            int lo = axl_hex_nibble(src[2]);
             if (hi >= 0 && lo >= 0) {
                 out[pos++] = (char)((hi << 4) | lo);
                 src += 3;

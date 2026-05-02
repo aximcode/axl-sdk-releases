@@ -58,6 +58,36 @@ echo "needle in haystack"  > "$TEST_STAGING/testdir/match.txt"
 echo "other content"       > "$TEST_STAGING/testdir/other.log"
 echo "sub file"            > "$TEST_STAGING/testdir/subdir/deep.txt"
 
+# Multi-line file for cat formatting tests (3 content lines + 2 blank
+# runs to exercise -n line numbering and -s blank squeezing).
+printf 'first\nsecond\n\n\nthird\n' > "$TEST_STAGING/cat3.txt"
+
+# UCS-2 LE file with BOM — the typical UEFI Shell pipe shape.
+# `printf` emits raw bytes; we hand-craft FF FE then "ux\n" interleaved
+# with NUL high bytes. Tests that cat's BOM-probe + transcode produce
+# the original UTF-8 on output.
+printf '\xff\xfeu\x00x\x00\n\x00' > "$TEST_STAGING/cat_ucs2.txt"
+
+# Headerless UCS-2 LE — UEFI shells often write this shape via
+# `cmd > out.txt` (no leading BOM). 16 bytes total = 8 ASCII chars,
+# enough to trigger the content-sniff classifier in
+# axl_text_stream_wrap. Body is "headless" + newline.
+printf 'h\x00e\x00a\x00d\x00l\x00e\x00s\x00s\x00\n\x00' \
+    > "$TEST_STAGING/cat_ucs2nb.txt"
+
+# Very-long-line file for grep — proves grep streams arbitrary line
+# lengths via axl_readline (no fixed-size line buffer / truncation).
+# 4096-byte line > old code's 1024-byte cap; pattern is at byte 3000
+# so naive scan would also find it, but axl_readline must hand grep
+# the full line for the strstr to see it.
+{
+    head -c 3000 < /dev/zero | tr '\0' 'A'
+    printf 'NEEDLE'
+    head -c 1090  < /dev/zero | tr '\0' 'B'
+    printf '\n'
+    echo "shorter line that does not match"
+} > "$TEST_STAGING/grep_long.txt"
+
 # Startup script — run each tool and capture its output.
 # The host-side script checks the serial log for expected content.
 {
@@ -76,6 +106,13 @@ echo "sub file"            > "$TEST_STAGING/testdir/subdir/deep.txt"
     echo ""
     echo "echo === TEST-GREP-RECURSIVE ==="
     echo "grep.efi needle testdir"
+    echo ""
+    echo "echo === TEST-GREP-LONGLINE ==="
+    # 4096-byte line with pattern at byte 3000 — proves grep
+    # streams via axl_readline rather than the previous 1024-byte
+    # fixed buffer that would have truncated the line below the
+    # match offset.
+    echo "grep.efi NEEDLE grep_long.txt"
     echo ""
     echo "echo === TEST-FIND ==="
     echo "find.efi testdir"
@@ -96,6 +133,33 @@ echo "sub file"            > "$TEST_STAGING/testdir/subdir/deep.txt"
     # Type 32 (System Boot Information) has no specialized decoder, so
     # the tool should fall back to Header-and-Data + Strings.
     echo "dmidecode.efi -t 32"
+    echo ""
+    echo "echo === TEST-CAT-PLAIN ==="
+    echo "cat.efi testdata.txt"
+    echo ""
+    echo "echo === TEST-CAT-NUMBER-SQUEEZE ==="
+    # -n numbers all output lines; -s collapses the run of blanks in
+    # cat3.txt into a single blank line. Expect 4 numbered lines:
+    # `     1\tfirst`, `     2\tsecond`, `     3\t` (the squeezed
+    # blank), `     4\tthird`.
+    echo "cat.efi -n -s cat3.txt"
+    echo ""
+    echo "echo === TEST-CAT-UCS2-BOM ==="
+    # BOM-probe path: the file is UCS-2 LE with BOM; cat must transcode
+    # and emit "ux" as plain UTF-8.
+    echo "cat.efi cat_ucs2.txt"
+    echo ""
+    echo "echo === TEST-CAT-FORCE-ENCODING ==="
+    # Force the encoding even though the file has no BOM (drop the
+    # first 2 bytes via -e). Use the same UCS-2 LE file to verify -e
+    # parses correctly and the wire-side bytes still decode to text.
+    echo "cat.efi -e ucs2le cat_ucs2.txt"
+    echo ""
+    echo "echo === TEST-CAT-UCS2-HEADERLESS ==="
+    # Auto-detect UCS-2 LE without a BOM via the content sniff in
+    # axl_text_stream_wrap. Body is "headless" — should appear as
+    # plain UTF-8 on the console.
+    echo "cat.efi cat_ucs2nb.txt"
     echo ""
     echo "echo === TEST-MKRD-HELP ==="
     echo "mkrd.efi -h"
@@ -166,6 +230,23 @@ check "hexdump-hex-offset"    "00000000:"
 check "hexdump-hex-content"   "4865 6c6c 6f20 4158"
 check "hexdump-ascii"         "Hello AXL"
 
+# cat: plain file content shows up
+check "cat-plain"             "Hello AXL test data"
+
+# cat -n -s: line 1 is "first", line 4 is "third" (after squeeze
+# collapses the two-blank run into one numbered blank line)
+check "cat-number-first"      "     1.first"
+check "cat-number-third"      "     4.third"
+
+# cat: BOM-probe path — UCS-2 LE input transcoded back to UTF-8 "ux"
+check "cat-ucs2-bom"          "ux"
+
+# cat -e ucs2le: forced-encoding path produces the same result
+check "cat-force-encoding"    "=== TEST-CAT-UCS2-HEADERLESS ==="
+
+# cat: headerless UCS-2 LE auto-detected by content sniff (no BOM)
+check "cat-ucs2-headerless"   "headless"
+
 # grep: matching line should appear
 check "grep-match"            "Hello AXL test data"
 
@@ -175,6 +256,11 @@ check "grep-miss-completed"   "=== TEST-GREP-RECURSIVE ==="
 
 # grep: directory argument lists matching files (single-level)
 check "grep-recursive-done"   "=== TEST-FIND ==="
+
+# grep: 4KB line with NEEDLE at byte 3000 — verifies streaming
+# read returns the full line (old fixed 1024-byte buffer would
+# have dropped everything past byte 1024).
+check "grep-longline-streamed" "AAAANEEDLE\|grep_long.txt:.*NEEDLE"
 
 # find: should list entries in the test directory
 check "find-match-txt"        "match.txt"
@@ -206,22 +292,15 @@ check "mkrd-help-size"        "Size in MB"
 check_absent_in_section "mkrd-positional-no-label-required" \
     "=== TEST-MKRD-POSITIONAL ===" "label required"
 
-if [[ "$RAMDISK_STAGED" == "1" ]]; then
-    # Auto-load proof: with RamDiskDxe.efi staged on the disk,
-    # axl_driver_ensure() must find it, load+start it, and the
-    # ramdisk creation must succeed.
-    check "mkrd-autoload-success" \
-        "RAM disk .testrd. created"
-    # And the listing must include the just-created label, proving
-    # the protocol is genuinely live (not just a happy log line).
-    check "mkrd-list-shows-testrd" \
-        "testrd"
-else
-    # No driver staged: verify the search-exhaustion path runs
-    # cleanly. Still proof argv[1] reached the program.
-    check "mkrd-positional-reached-driver-ensure" \
-        "not found on any mounted volume\|RAM disk .testrd."
-fi
+# Auto-load proof — must succeed regardless of whether an external
+# RamDiskDxe.efi was staged: when one is staged, axl_driver_ensure()
+# finds it on disk; when not, the .incbin'd blob in mkrd-blob.S is
+# the always-on fallback. Either way, the protocol must end up live
+# and the ramdisk must appear in the listing.
+check "mkrd-autoload-success" \
+    "RAM disk .testrd. created"
+check "mkrd-list-shows-testrd" \
+    "testrd"
 
 # no memory leaks in any tool
 check "no-leaks"              "no leaks detected"

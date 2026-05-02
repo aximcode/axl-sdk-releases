@@ -63,7 +63,7 @@ man_pages = [
     ("modules/format", "axl-format", "AXL printf engine",           [author], 3),
     ("modules/str",    "axl-str",    "AXL string utilities",        [author], 3),
     ("modules/string", "axl-string", "AXL string builder",          [author], 3),
-    ("modules/io",     "axl-io",     "AXL stream I/O",             [author], 3),
+    ("modules/stream",     "axl-stream",     "AXL stream / filesystem",             [author], 3),
     ("modules/log",    "axl-log",    "AXL logging",                [author], 3),
     ("modules/data",   "axl-data",   "AXL data structures",        [author], 3),
     ("modules/json",   "axl-json",   "AXL JSON parser/builder",    [author], 3),

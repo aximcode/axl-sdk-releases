@@ -10,7 +10,7 @@ Headers:
 - `<axl/axl-time.h>` — Wall-clock time and monotonic timestamps
 - `<axl/axl-nvstore.h>` — Portable NVRAM key-value storage
 - `<axl/axl-boot.h>` — Boot-option management (Boot####/BootOrder/BootNext/BootCurrent)
-- `<axl/axl-io-port.h>` — x86 I/O port access (`in`/`out`)
+- `<axl/axl-port.h>` — x86 I/O port access (`in`/`out`)
 - `<axl/axl-driver.h>` — Driver binding and lifecycle
 - `<axl/axl-image.h>` — Executable-image lifecycle (load/start/unload)
 - `<axl/axl-mem-phys.h>` — Physical-memory map/unmap + one-shot read/write

@@ -316,7 +316,7 @@ test_pci_addr_parse_format(void)
 }
 
 static void
-test_pci_get_vid_did_class24(void)
+test_pci_get_vid_did_class_code(void)
 {
     /* Host bridge — guaranteed present on QEMU q35. */
     AxlPciAddr root = { .seg = 0, .bus = 0, .dev = 0, .func = 0 };
@@ -341,23 +341,23 @@ test_pci_get_vid_did_class24(void)
     test_check(axl_pci_get_vid_did(absent, &vid, &did) == -1,
                "pci get_vid_did: absent function returns -1");
 
-    /* class24 on the host bridge — base class 0x06 (Bridge) */
-    uint32_t class24;
-    test_check(axl_pci_get_class24(root, &class24) == 0
-               && (class24 >> 16) == 0x06,
-               "pci get_class24: host bridge base class is 0x06");
+    /* class_code on the host bridge — base class 0x06 (Bridge) */
+    uint32_t class_code;
+    test_check(axl_pci_get_class_code(root, &class_code) == 0
+               && (class_code >> 16) == 0x06,
+               "pci get_class_code: host bridge base class is 0x06");
 
     /* Cross-check against raw byte reads */
     uint8_t base, sub, prog;
     test_check(axl_pci_read_config_8(root, 0x0B, &base) == 0
                && axl_pci_read_config_8(root, 0x0A, &sub)  == 0
                && axl_pci_read_config_8(root, 0x09, &prog) == 0
-               && class24 == (((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog),
-               "pci get_class24: matches raw 0x09/0x0A/0x0B fold");
+               && class_code == (((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog),
+               "pci get_class_code: matches raw 0x09/0x0A/0x0B fold");
 
     /* NULL guards */
     test_check(axl_pci_get_vid_did(root, NULL, &did) == -1, "pci get_vid_did: NULL vid");
-    test_check(axl_pci_get_class24(root, NULL) == -1,       "pci get_class24: NULL out");
+    test_check(axl_pci_get_class_code(root, NULL) == -1,       "pci get_class_code: NULL out");
 }
 
 static int
@@ -888,7 +888,7 @@ test_platform_main(int argc, char **argv)
     test_pci_find_by_class();
     test_pci_find_by_vid_did();
     test_pci_addr_parse_format();
-    test_pci_get_vid_did_class24();
+    test_pci_get_vid_did_class_code();
     test_pci_dump();
     test_pci_class_string();
     test_pci_capabilities();

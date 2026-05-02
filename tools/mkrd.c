@@ -30,14 +30,15 @@
 #include <axl.h>
 #include <uefi/axl-uefi.h>
 
-/* Embedded RamDiskDxe.efi blob — definitions are force-included via
- * the Makefile's `-include $(BUILDDIR)/mkrd-ramdisk-blob.h` flag,
- * which is regenerated from third_party/edk2/RamDiskDxe-$(ARCH).efi
- * by `xxd -i`. The forward declarations here let editors and static
- * analyzers (clangd, ccls) parse mkrd.c standalone without seeing
- * the -include flag. The actual storage lives in .rodata in mkrd.o. */
+/* Embedded RamDiskDxe.efi blob — emitted into .rodata by
+ * tools/mkrd-blob.S via the GNU assembler's `.incbin` directive
+ * (the per-arch path is supplied by the Makefile). The length is
+ * the linker-resolved pointer difference between the two markers,
+ * not a separate `_len` constant. */
 extern const unsigned char axl_embedded_ramdiskdxe[];
-extern const unsigned int  axl_embedded_ramdiskdxe_len;
+extern const unsigned char axl_embedded_ramdiskdxe_end[];
+#define axl_embedded_ramdiskdxe_len \
+    ((unsigned int)(axl_embedded_ramdiskdxe_end - axl_embedded_ramdiskdxe))
 
 // ---------------------------------------------------------------------------
 // Device path constants (UEFI spec Table 10-46, 10-62)
@@ -98,27 +99,18 @@ is_ramdisk_dp(
     uint64_t                 *size_out
     )
 {
-    for (EFI_DEVICE_PATH_PROTOCOL *node = dp;
-         !EFI_DP_IS_END(node);
-         node = EFI_DP_NEXT(node)) {
-        if (EFI_DP_TYPE(node) == MEDIA_DEVICE_PATH &&
-            node->SubType == MEDIA_RAM_DISK_DP) {
-            MEDIA_RAM_DISK_DEVICE_PATH *rd =
-                (MEDIA_RAM_DISK_DEVICE_PATH *)node;
-            uint64_t start = (uint64_t)rd->StartingAddr[0] |
-                             ((uint64_t)rd->StartingAddr[1] << 32);
-            uint64_t end   = (uint64_t)rd->EndingAddr[0] |
-                             ((uint64_t)rd->EndingAddr[1] << 32);
-            if (start_out != NULL) {
-                *start_out = start;
-            }
-            if (size_out != NULL) {
-                *size_out = end - start + 1;
-            }
-            return true;
-        }
+    const MEDIA_RAM_DISK_DEVICE_PATH *rd = axl_device_path_find(
+        dp, MEDIA_DEVICE_PATH, MEDIA_RAM_DISK_DP);
+    if (rd == NULL) {
+        return false;
     }
-    return false;
+    uint64_t start = (uint64_t)rd->StartingAddr[0] |
+                     ((uint64_t)rd->StartingAddr[1] << 32);
+    uint64_t end   = (uint64_t)rd->EndingAddr[0] |
+                     ((uint64_t)rd->EndingAddr[1] << 32);
+    if (start_out != NULL) *start_out = start;
+    if (size_out  != NULL) *size_out  = end - start + 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,11 +125,7 @@ pad_label(
 {
     axl_memset(padded, ' ', 11);
     for (int i = 0; i < 11 && label[i] != '\0'; i++) {
-        char ch = label[i];
-        if (ch >= 'a' && ch <= 'z') {
-            ch = ch - 'a' + 'A';
-        }
-        padded[i] = ch;
+        padded[i] = (char)axl_toupper((unsigned char)label[i]);
     }
 }
 
@@ -406,29 +394,24 @@ do_create(
     }
 
     /* Check for duplicate label */
-    void   **handles = NULL;
-    size_t   handle_count = 0;
-    if (axl_service_enumerate("simple-fs", &handles, &handle_count) == 0) {
-        for (size_t i = 0; i < handle_count; i++) {
-            /* Get device path for this handle */
-            EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
-            axl_handle_get_service(handles[i], "device-path", (void **)&dp);
-            if (dp == NULL || !is_ramdisk_dp(dp, NULL, NULL)) {
+    AxlVolume vols[16];
+    size_t    nvols = 0;
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) == 0) {
+        for (size_t i = 0; i < nvols; i++) {
+            if (vols[i].device_path == NULL
+                || !is_ramdisk_dp(vols[i].device_path, NULL, NULL)) {
                 continue;
             }
-            /* Check volume label */
-            char *vol = axl_volume_get_label_by_handle(handles[i]);
+            char *vol = axl_volume_get_label_by_handle(vols[i].handle);
             if (vol != NULL) {
                 bool match = labels_match(label, vol);
                 axl_free(vol);
                 if (match) {
                     axl_printf("RAM disk \"%s\" already exists.\n", label);
-                    axl_free(handles);
                     return 0;
                 }
             }
         }
-        axl_free(handles);
     }
 
     /* Allocate pages */
@@ -478,11 +461,11 @@ do_create(
 static int
 do_list(void)
 {
-    void   **handles = NULL;
-    size_t   count = 0;
+    AxlVolume vols[16];
+    size_t    nvols = 0;
 
-    if (axl_service_enumerate("simple-fs", &handles, &count) != 0 ||
-        count == 0) {
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != 0
+        || nvols == 0) {
         axl_printf("No filesystems found.\n");
         return 1;
     }
@@ -491,19 +474,15 @@ do_list(void)
     axl_printf("-----------  -------\n");
 
     size_t found = 0;
-    for (size_t i = 0; i < count; i++) {
-        EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
-        axl_handle_get_service(handles[i], "device-path", (void **)&dp);
-        if (dp == NULL) {
-            continue;
-        }
+    for (size_t i = 0; i < nvols; i++) {
+        if (vols[i].device_path == NULL) continue;
 
         uint64_t start = 0, size = 0;
-        if (!is_ramdisk_dp(dp, &start, &size)) {
+        if (!is_ramdisk_dp(vols[i].device_path, &start, &size)) {
             continue;
         }
 
-        char *vol = axl_volume_get_label_by_handle(handles[i]);
+        char *vol = axl_volume_get_label_by_handle(vols[i].handle);
         const char *display_label = (vol != NULL && vol[0] != '\0')
                                     ? vol : "(unlabeled)";
 
@@ -513,8 +492,6 @@ do_list(void)
         found++;
         axl_free(vol);
     }
-
-    axl_free(handles);
 
     if (found == 0) {
         axl_printf("No RAM disks found.\n");
@@ -539,43 +516,34 @@ do_destroy(
         return 1;
     }
 
-    void   **handles = NULL;
-    size_t   count = 0;
-    if (axl_service_enumerate("simple-fs", &handles, &count) != 0 ||
-        count == 0) {
+    AxlVolume vols[16];
+    size_t    nvols = 0;
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != 0
+        || nvols == 0) {
         axl_printf("MkRd: no filesystems found.\n");
         return 1;
     }
 
-    for (size_t i = 0; i < count; i++) {
-        EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
-        axl_handle_get_service(handles[i], "device-path", (void **)&dp);
-        if (dp == NULL) {
-            continue;
-        }
+    for (size_t i = 0; i < nvols; i++) {
+        if (vols[i].device_path == NULL) continue;
 
         uint64_t start = 0, size = 0;
-        if (!is_ramdisk_dp(dp, &start, &size)) {
+        if (!is_ramdisk_dp(vols[i].device_path, &start, &size)) {
             continue;
         }
 
-        char *vol = axl_volume_get_label_by_handle(handles[i]);
-        if (vol == NULL) {
-            continue;
-        }
-
-        if (!labels_match(label, vol)) {
+        char *vol = axl_volume_get_label_by_handle(vols[i].handle);
+        if (vol == NULL || !labels_match(label, vol)) {
             axl_free(vol);
             continue;
         }
         axl_free(vol);
 
         /* Found — unregister */
-        EFI_STATUS status = rd_proto->Unregister(dp);
+        EFI_STATUS status = rd_proto->Unregister(vols[i].device_path);
         if (EFI_ERROR(status)) {
             axl_printf("MkRd: Unregister failed: 0x%llx\n",
                        (unsigned long long)status);
-            axl_free(handles);
             return 1;
         }
 
@@ -586,11 +554,9 @@ do_destroy(
 
         axl_printf("RAM disk \"%s\" destroyed (%llu MB freed).\n",
                    label, (unsigned long long)(size / (1024 * 1024)));
-        axl_free(handles);
         return 0;
     }
 
-    axl_free(handles);
     axl_printf("MkRd: no RAM disk with label \"%s\" found.\n", label);
     return 1;
 }

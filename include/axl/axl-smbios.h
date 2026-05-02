@@ -197,6 +197,23 @@ typedef struct {
 int axl_smbios_read_bios_info(AxlSmbiosBiosInfo *out);
 
 /**
+ * @brief Format a 16-byte SMBIOS UUID as a canonical string.
+ *
+ * SMBIOS §7.2.1 (System UUID) specifies that the first three fields
+ * (Data1: 4 bytes, Data2: 2 bytes, Data3: 2 bytes) are stored
+ * little-endian, while the remaining 8 bytes (Data4: 2 bytes +
+ * Node: 6 bytes) are stored big-endian. The canonical printed form
+ * applies the field-order swap on the first three fields, so a raw
+ * memory dump differs from the printed string. Output matches the
+ * `dmidecode` (Linux) and Windows `wmic csproduct get UUID` formats.
+ *
+ * @param bytes  raw 16 bytes from the SMBIOS Type 1 UUID field
+ * @param out    output buffer of at least 37 bytes (36 + NUL)
+ * @return 0 on success, -1 on NULL args.
+ */
+int axl_smbios_format_uuid(const uint8_t bytes[16], char out[37]);
+
+/**
  * @brief Read Type 1 (System Information) from the SMBIOS table.
  * @return 0 on success, -1 if no Type 1 record is present.
  */

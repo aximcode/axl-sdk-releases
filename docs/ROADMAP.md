@@ -423,7 +423,7 @@ R+1 (delldiags do.efi enabler — see local design doc
       `src/acpi/axl-acpi.c`.
 - [x] **`axl_io_port_*`** — promote `axl_backend_io_*` to public
       with 16/32-bit variants. Build-gated to x86 (compile error on
-      AArch64, not runtime no-op). Header: `axl/axl-io-port.h`.
+      AArch64, not runtime no-op). Header: `axl/axl-port.h`.
 - [x] **`axl_nvstore_*` extensions** — namespace registration so
       vendor GUIDs (Dell/HPE/Lenovo OEM variables) plug in by name
       without exposing GUIDs at access sites; `_delete`, `_iter`,
@@ -1018,11 +1018,18 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 
 ## Hardware Fixture Capture & Replay (Future)
 
-Vendor-neutral capture-and-replay of UEFI platform identity (SMBIOS,
-ACPI, PCI manifest, Redfish, IPMI) so axl-sdk tools can be exercised
-against real-world platforms under QEMU without lab access. Native
-UEFI capture tool (likely a `sysinfo --capture` extension) writes
-a fixture directory; `run-qemu.sh --fixture DIR` replays it.
+Vendor-neutral capture-and-replay of UEFI platform identity
+(SMBIOS, ACPI, PCI/USB/video manifests, SPD, TPM, NVRAM/Secure
+Boot, ESRT, CPU, network details, Redfish, IPMI) so axl-sdk tools
+can be exercised against real-world platforms under QEMU without
+lab access. Native UEFI capture tool (likely a `sysinfo --capture`
+extension) writes a fixture directory; `run-qemu.sh --fixture DIR`
+replays it. Reuses the existing
+[`scripts/qemu-patches/`](../scripts/qemu-patches/) infrastructure
+(originally added for AxlSpd's wire-path test) for command-line
+device injection, plus host-side daemons (`swtpm`, DMTF Redfish
+Mockup-Server, OpenIPMI `ipmi_sim`) wired by lifecycle code modeled
+on the existing virtiofsd handling.
 
 Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 
@@ -1030,18 +1037,42 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 
 - [ ] `--smbios-file FILE` → `-smbios file=FILE`
 - [ ] `--acpi-table FILE` (repeatable) → `-acpitable file=FILE`
+- [ ] `--spd ADDR:FILE` (repeatable) → `memory-backend-file` +
+      `smbus-eeprom,memdev=` (depends on existing patched QEMU)
 - [ ] `--ipmi-sim` → built-in `ipmi-bmc-sim` + KCS frontend
+- [ ] `--tpm` / `--tpm-state DIR` / `--tpm-model tpm-tis|tpm-crb`
+      → spawn swtpm and wire `-tpmdev emulator` + tpm device
 - [ ] Hand-craft first fixture from the Proxmox dev VM
       (`dmidecode --dump-bin`, `acpidump -b`) to validate replay
       path before writing the capture tool.
 
-### Phase HF2: sysinfo --capture (SMBIOS + ACPI + PCI manifest)
+### Phase HF2: sysinfo --capture (manifest-grade UEFI walks)
 
 - [ ] Add `--capture <destdir>` flag to `tools/sysinfo.c`
 - [ ] Dump SMBIOS3 raw bytes via EFI Config Table
 - [ ] Walk ACPI RSDT/XSDT, write each table as `acpi/<sig>.dat`
 - [ ] Enumerate PCI via `EFI_PCI_IO_PROTOCOL`, write `pci.json`
       (VID/DID/class/subsys/BARs) — manifest only, not replayed
+- [ ] Walk USB via `EFI_USB_IO_PROTOCOL` + `EFI_USB2_HC_PROTOCOL`,
+      write `usb.json` (topology, VID/PID, class/subclass/protocol,
+      strings) and per-device descriptor blobs in `usb/*.bin`
+- [ ] Walk GOP/EDID via `EFI_GRAPHICS_OUTPUT_PROTOCOL` +
+      `EFI_EDID_DISCOVERED_PROTOCOL`, write `video.json` (mode list,
+      current mode, FB base, pixel format) and `edid/*.bin` per
+      display; GPU option ROM (`gpu-rom/*.bin`) on-demand only
+- [ ] CPU capture: direct CPUID instructions + microcode revision,
+      write `cpu.json` (vendor, family/model/stepping, brand string,
+      feature flags, cache info)
+- [ ] Network details: per-NIC MAC + link state via
+      `EFI_SIMPLE_NETWORK_PROTOCOL`, SR-IOV VF count from PCIe
+      extended config, write `net.json`
+- [ ] ESRT capture: read EFI Config Table
+      `EFI_SYSTEM_RESOURCE_TABLE_GUID`, write `esrt.json`
+      (per-component FwClass GUID + version)
+- [ ] NVMe capture: per-controller Identify Controller / Identify
+      Namespace via `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`, write
+      `nvme/<bdf>.json` (manifest only — replay is HF9 patch
+      candidate)
 - [ ] Write `manifest.json` (vendor, model, serial, BIOS rev,
       capture date, capture-tool version)
 - [ ] Support write targets: local FS (`fs0:\fixtures\...`),
@@ -1049,13 +1080,70 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 
 ### Phase HF3: run-qemu.sh --fixture DIR
 
-- [ ] Auto-discover and wire `smbios.bin`, `acpi/*.dat`
+- [ ] Auto-discover and wire `smbios.bin`, `acpi/*.dat`, `spd/*.bin`
+- [ ] Default-drop ACPI tables that describe captured-platform
+      topology incompatible with QEMU (`MCFG`, `MPST`, `PMTT`,
+      `HMAT`, `SLIT`, `SRAT`, `SPCR`, `DBG2`); see design doc
+      §"ACPI replay caveats"
+- [ ] `--keep-acpi NAME` / `--drop-acpi NAME` / `--strict-acpi`
+      overrides for the denylist
+- [ ] `--usb-shim [CLASS,...]` opt-in: when manifest indicates a
+      class-compliant device (CDC-ECM, HID kbd/mouse), add the
+      corresponding QEMU stand-in (`usb-net`, `usb-kbd`, etc.)
+- [ ] `--edid FILE` injects raw EDID into QEMU's display chardev
+- [ ] `--gpu-rom FILE` → `-device VGA,romfile=FILE` (no patch needed)
+- [ ] `--cpu-from-fixture`: map captured CPUID
+      (vendor/family/model/stepping) → closest QEMU `-cpu MODEL`;
+      cross-check feature flags and warn on divergence
+- [ ] `--mac ADDR=XX:XX:..` (repeatable, also auto-derived from
+      `net.json`): pin per-NIC MAC via `-device <model>,mac=...`
 - [ ] Print `manifest.json` summary at startup so user sees which
       machine the guest is impersonating
 - [ ] Warn (not block) when fixture metadata disagrees with QEMU
       args (arch mismatch, etc.)
+- [ ] Probe QEMU for required patches (e.g., `smbus-eeprom memdev`)
+      before wiring artifacts that depend on them; warn clearly
+      rather than silently degrading.
 
-### Phase HF4: Redfish capture & replay
+### Phase HF4: SPD capture
+
+- [ ] Extend `memspd` (or fold into `sysinfo --capture`) with a
+      `--capture <destdir>` flag that dumps every populated SMBus
+      EEPROM at 0x50–0x57 to `spd/0xNN.bin`
+- [ ] Validate: capture on a real box, replay via Phase HF3
+      `--fixture` path, AxlSpd output should match bit-for-bit
+- [ ] Document SmbusHcShim.efi requirement on QEMU + native ICH/PCH
+      driver expectation on real Intel platforms
+
+### Phase HF5: TPM capture & replay
+
+- [ ] Capture: PCR values (SHA-1 + SHA-256 banks), capabilities,
+      manufacturer ID, firmware version via `EFI_TCG2_PROTOCOL`;
+      write `tpm.json`
+- [ ] Capture: full TCG event log via `EFI_TCG2_PROTOCOL.GetEventLog()`;
+      write `tpm/event-log.bin`
+- [ ] Replay: spawn `swtpm` with seeded state directory, wire
+      `-tpmdev emulator` + `tpm-tis` (default) or `tpm-crb` per
+      fixture; lifecycle modeled on virtiofsd
+- [ ] Document caveat: seeded PCRs reflect source platform; replay
+      guest's OVMF measurements diverge by design
+
+### Phase HF6: UEFI Variable injection (Secure Boot + boot order)
+
+- [ ] Capture: walk `EFI_GLOBAL_VARIABLE` GUID for `Boot####`,
+      `BootOrder`, `BootCurrent`, `BootNext`, `Timeout`; write
+      `vars/global/<name>.bin`
+- [ ] Capture: PK / KEK / db / dbx via Variable Services; write
+      `vars/secureboot/{PK,KEK,db,dbx}.bin` (raw
+      `EFI_SIGNATURE_LIST` bytes)
+- [ ] Replay: `--secureboot DIR` and `--boot-vars DIR` inject into
+      OVMF `vars.fd` copy before QEMU launch (likely via
+      `virt-fw-vars` from libvirt)
+- [ ] Detect non-secboot OVMF (default `OVMF_CODE.fd` ignores
+      Secure Boot vars) and warn clearly when `--secureboot` is
+      given against it
+
+### Phase HF7: Redfish capture & replay
 
 - [ ] Capture: walk service root via axl HTTP client, save JSON
       tree mirroring `/redfish/v1/...`
@@ -1065,7 +1153,7 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
       QEMU instance — real bmcweb stack, no lab hardware
 - [ ] `--openbmc-qemu PATH` flag for direct OpenBMC sibling launch
 
-### Phase HF5: IPMI capture & replay
+### Phase HF8: IPMI capture & replay
 
 - [ ] Capture: in-band KCS sweep (Get-* commands), write raw
       response bytes to `ipmi/<cmd>.bin`
@@ -1073,7 +1161,25 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
       to OpenIPMI's `ipmi_sim` seeded with captured replies
 - [ ] Standard commands only — no vendor OEM in the initial pass
 
-### Phase HF6: Sanitization & public fixtures
+### Phase HF9: Additional QEMU device-injection patches
+
+Add as future fixture artifacts demand. The existing
+`0001-smbus-eeprom-add-memdev-link.patch` is the canonical example
+of the pattern. Likely candidates:
+
+- [ ] SMBIOS handle preservation for OEM Type-N injection
+- [ ] Non-EEPROM SMBus sensors (LM75-style temp, fan controllers)
+- [ ] IPMI FRU storage seeding for `ipmi-bmc-sim`
+- [ ] `usb-stub` device for non-class-compliant USB descriptor
+      replay (enables "device appears in bus walk" tests)
+- [ ] ESRT publication: a QEMU pseudo-device that publishes a
+      captured `esrt.json` as the EFI_SYSTEM_RESOURCE_TABLE config
+      table at boot
+- [ ] NVMe Identify Controller replay: extend `-device nvme` (or
+      add a sidecar device) to source Identify Controller / Identify
+      Namespace responses from a captured blob
+
+### Phase HF10: Sanitization & public fixtures
 
 - [ ] `--sanitize` flag (or post-processor): zero serials/asset
       tags, replace MACs with locally-administered ranges, review

@@ -82,7 +82,7 @@ skip_ws(J5 *p)
 {
     while (p->pos < p->len) {
         char c = p->json[p->pos];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') {
+        if (axl_isspace((unsigned char)c)) {
             p->pos++;
             continue;
         }
@@ -129,23 +129,13 @@ skip_ws(J5 *p)
 static bool
 is_ident_start(char c)
 {
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= 'a' && c <= 'z') ||
-           c == '_' || c == '$';
+    return axl_isalpha((unsigned char)c) || c == '_' || c == '$';
 }
 
 static bool
 is_ident_cont(char c)
 {
-    return is_ident_start(c) || (c >= '0' && c <= '9');
-}
-
-static bool
-is_hex_digit(char c)
-{
-    return (c >= '0' && c <= '9') ||
-           (c >= 'a' && c <= 'f') ||
-           (c >= 'A' && c <= 'F');
+    return is_ident_start(c) || axl_isdigit((unsigned char)c);
 }
 
 /**
@@ -188,8 +178,8 @@ parse_string(J5 *p, char quote)
             char e = p->json[p->pos + 1];
             if (e == 'x') {
                 if (p->pos + 3 >= p->len ||
-                    !is_hex_digit(p->json[p->pos + 2]) ||
-                    !is_hex_digit(p->json[p->pos + 3])) {
+                    !axl_isxdigit((unsigned char)(p->json[p->pos + 2])) ||
+                    !axl_isxdigit((unsigned char)(p->json[p->pos + 3]))) {
                     axl_debug("bad \\x escape at %zu", p->pos);
                     return -1;
                 }
@@ -199,7 +189,7 @@ parse_string(J5 *p, char quote)
             if (e == 'u') {
                 for (int i = 0; i < 4; i++) {
                     if (p->pos + 2 + i >= p->len ||
-                        !is_hex_digit(p->json[p->pos + 2 + i])) {
+                        !axl_isxdigit((unsigned char)(p->json[p->pos + 2 + i]))) {
                         axl_debug("bad \\u escape at %zu", p->pos);
                         return -1;
                     }
@@ -268,7 +258,7 @@ parse_number(J5 *p)
     {
         p->pos += 2;
         size_t hex_start = p->pos;
-        while (p->pos < p->len && is_hex_digit(p->json[p->pos])) {
+        while (p->pos < p->len && axl_isxdigit((unsigned char)(p->json[p->pos]))) {
             p->pos++;
         }
         if (p->pos == hex_start) {
@@ -279,14 +269,14 @@ parse_number(J5 *p)
         /* Decimal: int [. frac] [exp] — accept JSON5 leading/trailing dot */
         bool saw_digit = false;
         while (p->pos < p->len &&
-               p->json[p->pos] >= '0' && p->json[p->pos] <= '9') {
+               axl_isdigit((unsigned char)p->json[p->pos])) {
             saw_digit = true;
             p->pos++;
         }
         if (p->pos < p->len && p->json[p->pos] == '.') {
             p->pos++;
             while (p->pos < p->len &&
-                   p->json[p->pos] >= '0' && p->json[p->pos] <= '9') {
+                   axl_isdigit((unsigned char)p->json[p->pos])) {
                 saw_digit = true;
                 p->pos++;
             }
@@ -305,7 +295,7 @@ parse_number(J5 *p)
             }
             size_t exp_start = p->pos;
             while (p->pos < p->len &&
-                   p->json[p->pos] >= '0' && p->json[p->pos] <= '9') {
+                   axl_isdigit((unsigned char)p->json[p->pos])) {
                 p->pos++;
             }
             if (p->pos == exp_start) {
@@ -525,7 +515,7 @@ parse_value(J5 *p)
     if (c == '"' || c == '\'') {
         return parse_string(p, c);
     }
-    if (c == '+' || c == '-' || (c >= '0' && c <= '9') || c == '.') {
+    if (c == '+' || c == '-' || axl_isdigit((unsigned char)c) || c == '.') {
         return parse_number(p);
     }
     if (is_ident_start(c)) {

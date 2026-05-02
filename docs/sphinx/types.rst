@@ -100,7 +100,7 @@ I/O and Network Types
      - Header
    * - ``AxlProgressFunc``
      - ``void (*)(uint64_t done, uint64_t total, void *ctx)``
-     - ``<axl/axl-io.h>``
+     - ``<axl/axl-stream.h>``, ``<axl/axl-fs.h>``
    * - ``AxlLogHandler``
      - ``void (*)(int level, const char *domain, const char *msg, void *data)``
      - ``<axl/axl-log.h>``

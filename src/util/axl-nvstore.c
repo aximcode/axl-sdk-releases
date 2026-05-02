@@ -118,10 +118,7 @@ axl_nvstore_register_namespace(
     if (name == NULL || backend_token == NULL) {
         return -1;
     }
-    size_t len = 0;
-    while (name[len] != '\0' && len < NS_NAME_MAX) {
-        len++;
-    }
+    size_t len = axl_strnlen(name, NS_NAME_MAX);
     if (len == 0 || len >= NS_NAME_MAX) {
         axl_warning("namespace name '%s' too long (max %d)",
                     name, NS_NAME_MAX - 1);

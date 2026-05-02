@@ -9,6 +9,24 @@
 
 #include <axl.h>
 
+static int
+io_demo_print_entry(
+    const char         *full_path,
+    const AxlDirEntry  *entry,
+    void               *user
+    )
+{
+    (void)full_path;
+    (void)user;
+    if (entry->is_dir) {
+        axl_printf("  [DIR]  %s\n", entry->name);
+    } else {
+        axl_printf("  %5llu  %s\n",
+                   (unsigned long long)entry->size, entry->name);
+    }
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -105,20 +123,8 @@ main(int argc, char **argv)
     rc = axl_dir_mkdir("testdir");
     axl_printf("mkdir testdir: %s\n", rc == 0 ? "ok" : "FAILED");
 
-    AxlDir *dir = axl_dir_open(".");
-    if (dir) {
-        AxlDirEntry entry;
-        axl_printf("directory listing:\n");
-        while (axl_dir_read(dir, &entry)) {
-            if (entry.is_dir) {
-                axl_printf("  [DIR]  %s\n", entry.name);
-            } else {
-                axl_printf("  %5llu  %s\n",
-                           (unsigned long long)entry.size, entry.name);
-            }
-        }
-        axl_dir_close(dir);
-    }
+    axl_printf("directory listing:\n");
+    axl_dir_walk(".", io_demo_print_entry, NULL, /* max_depth */ 1);
 
     /* ---- 9. Cleanup ---- */
 

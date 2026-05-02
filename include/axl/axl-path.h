@@ -121,6 +121,40 @@ axl_path_companion(
 );
 
 /**
+ * @brief Resolve a sidecar data file by trying override → companion → cwd.
+ *
+ * Standard lookup order for tools that ship optional sidecar JSON
+ * (jedec ID DB, vendor lists, board configs, etc.):
+ *
+ *   1. If @p override_path is non-NULL and the file exists, use it.
+ *   2. `axl_path_companion(axl_app_argv0(), name)` — same directory as
+ *      the running binary.
+ *   3. @p name as-is (current working directory).
+ *
+ * Returns the first path that exists. Caller must axl_free() the
+ * returned string. The check uses @ref axl_file_info, so the file
+ * must be readable at lookup time.
+ *
+ * @code
+ * char *p = axl_resolve_data_file(
+ *     axl_args_get_string(a, "jedec-file"),  // CLI override (may be NULL)
+ *     "jedec.json5"
+ *     );
+ * if (p != NULL) {
+ *     load_table(p);
+ *     axl_free(p);
+ * }
+ * @endcode
+ *
+ * @return newly allocated path, or NULL if no candidate exists.
+ */
+char *
+axl_resolve_data_file(
+    const char *override_path,  ///< optional explicit path (may be NULL)
+    const char *name            ///< filename to resolve
+);
+
+/**
  * @brief Build a UEFI-style path with volume prefix.
  *
  * Writes "VOLUME:SUBPATH" into @p out, converting forward slashes to

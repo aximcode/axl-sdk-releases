@@ -158,10 +158,9 @@ print_uuid(const char *name, const uint8_t u[16], bool has)
         axl_printf("\t%s: Not Present\n", name);
         return;
     }
-    axl_printf("\t%s: %02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X\n",
-               name,
-               u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
-               u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    char buf[37];
+    axl_smbios_format_uuid(u, buf);
+    axl_printf("\t%s: %s\n", name, buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +385,9 @@ single_string(const char *keyword)
         if (axl_strcmp(keyword, "system-family")        == 0) { axl_printf("%s\n", si.family != NULL ? si.family : ""); return 0; }
         if (axl_strcmp(keyword, "system-uuid") == 0) {
             if (si.has_uuid) {
-                const uint8_t *u = si.uuid;
-                axl_printf("%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X\n",
-                           u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
-                           u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+                char buf[37];
+                axl_smbios_format_uuid(si.uuid, buf);
+                axl_printf("%s\n", buf);
             } else {
                 axl_printf("Not Present\n");
             }

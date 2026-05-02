@@ -28,7 +28,7 @@ AXL SDK
    modules/format
    modules/str
    modules/string
-   modules/io
+   modules/stream
    modules/log
    modules/data
    modules/json
@@ -45,7 +45,7 @@ AXL SDK
    modules/net
    modules/tls
    modules/sys
-   modules/io-port
+   modules/stream-port
    modules/boot
    modules/image
    modules/mem-phys

@@ -1102,7 +1102,7 @@ on multi-MB documents.
 **Status: landed 2026-04-20.** `src/crt0/axl-crt0-minimal.c` ships
 as a peer to `axl-crt0-native.c` and is selected via
 `axl-cc --minimal-runtime`. The minimal CRT0 sets the firmware
-globals, calls `axl_io_init()` (needed by `axl_printf`), parses
+globals, calls `axl_stream_init()` (needed by `axl_printf`), parses
 argv, calls `main`, returns. It skips `_axl_registry_init`,
 `_axl_atexit_init`, `_axl_signal_init`, and default-loop creation.
 

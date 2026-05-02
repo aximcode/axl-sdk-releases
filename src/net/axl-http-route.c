@@ -41,11 +41,7 @@ uppercase_method(
 {
     size_t i;
     for (i = 0; method[i] != '\0' && i + 1 < buf_size; i++) {
-        char c = method[i];
-        if (c >= 'a' && c <= 'z') {
-            c = c - 'a' + 'A';
-        }
-        buf[i] = c;
+        buf[i] = (char)axl_toupper((unsigned char)method[i]);
     }
     buf[i] = '\0';
 }

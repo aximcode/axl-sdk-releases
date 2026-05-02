@@ -8,6 +8,7 @@
 #include "../backend/axl-backend.h"
 #include <axl/axl-log.h>
 #include <axl/axl-smbios.h>
+#include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("smbios");
 
@@ -372,6 +373,27 @@ typedef struct {
     uint16_t         ConfiguredClockSpeed;
 } SmbType17;
 #pragma pack()
+
+int
+axl_smbios_format_uuid(const uint8_t bytes[16], char out[37])
+{
+    if (bytes == NULL || out == NULL) {
+        return -1;
+    }
+    /* SMBIOS §7.2.1: Data1/2/3 are little-endian fields; Data4 +
+       Node are big-endian. Reorder accordingly when printing. */
+    axl_snprintf(
+        out, 37,
+        "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        bytes[3], bytes[2], bytes[1], bytes[0],     /* Data1 LE swap */
+        bytes[5], bytes[4],                          /* Data2 LE swap */
+        bytes[7], bytes[6],                          /* Data3 LE swap */
+        bytes[8], bytes[9],                          /* Data4 BE */
+        bytes[10], bytes[11], bytes[12],
+        bytes[13], bytes[14], bytes[15]              /* Node BE */
+        );
+    return 0;
+}
 
 int
 axl_smbios_read_bios_info(

@@ -55,6 +55,38 @@ static const AxlGuid nii_legacy_guid = {
  * string. Returns "<firmware volume>" for FV-dispatched drivers
  * (their file path is a MEDIA_FW_VOL_FILEPATH_DP rather than a
  * filesystem path), "<unknown>" if neither applies. Caller frees. */
+typedef struct {
+    char *image_name;       /* set if a MEDIA_FILEPATH_DP node is found */
+    bool  saw_fv_node;
+} ImgNameCtx;
+
+static int
+resolve_driver_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
+{
+    /* MEDIA_DEVICE_PATH = 0x04 */
+    if (type != 0x04) {
+        return 0;
+    }
+    ImgNameCtx *c = (ImgNameCtx *)user;
+    /* MEDIA_FILEPATH_DP = 0x04 — file loaded from a FAT volume; data
+       is a UCS-2 path string after the 4-byte node header. */
+    if (subtype == 0x04) {
+        uint16_t node_len = (uint16_t)EFI_DP_LENGTH((EFI_DEVICE_PATH_PROTOCOL *)node);
+        if (node_len > 4) {
+            c->image_name = axl_ucs2_to_utf8(
+                (unsigned short *)((const uint8_t *)node + 4));
+            return 1;  /* stop — we have the name */
+        }
+    }
+    /* MEDIA_PIWG_FW_FILE_DP = 0x06 — driver dispatched from an FV
+       (firmware volume), e.g. OVMF's bundled VirtioNetDxe. The node
+       payload is a GUID, not a printable name, so we just flag it. */
+    if (subtype == 0x06) {
+        c->saw_fv_node = true;
+    }
+    return 0;
+}
+
 static char *
 resolve_driver_image_name(EFI_HANDLE agent)
 {
@@ -65,30 +97,12 @@ resolve_driver_image_name(EFI_HANDLE agent)
         return axl_strdup("<unknown>");
     }
 
-    EFI_DEVICE_PATH_PROTOCOL *dp = img->FilePath;
-    int  steps = 0;
-    bool saw_fv_node = false;
-    while (dp != NULL && !EFI_DP_IS_END(dp) && steps < 16) {
-        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(dp);
-        if (node_len < 4) break;
-        /* MEDIA_DEVICE_PATH = 0x04, MEDIA_FILEPATH_DP = 0x04 — file
-         * loaded from a FAT volume; data is a UCS-2 path string. */
-        if (EFI_DP_TYPE(dp) == 0x04 && EFI_DP_SUBTYPE(dp) == 0x04 &&
-            node_len > 4)
-        {
-            return axl_ucs2_to_utf8((unsigned short *)((uint8_t *)dp + 4));
-        }
-        /* MEDIA_DEVICE_PATH=0x04, MEDIA_PIWG_FW_FILE_DP=0x06 — driver
-         * dispatched from an FV (firmware volume), e.g. OVMF's bundled
-         * VirtioNetDxe. The node payload is a GUID, not a printable
-         * name, so we just flag it. */
-        if (EFI_DP_TYPE(dp) == 0x04 && EFI_DP_SUBTYPE(dp) == 0x06) {
-            saw_fv_node = true;
-        }
-        dp = EFI_DP_NEXT(dp);
-        steps++;
+    ImgNameCtx ctx = { .image_name = NULL, .saw_fv_node = false };
+    (void)axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
+    if (ctx.image_name != NULL) {
+        return ctx.image_name;
     }
-    return axl_strdup(saw_fv_node ? "<firmware volume>" : "<unknown>");
+    return axl_strdup(ctx.saw_fv_node ? "<firmware volume>" : "<unknown>");
 }
 
 /* OpenProtocol attribute bits per UEFI 2.10 §7.3.10. We only test

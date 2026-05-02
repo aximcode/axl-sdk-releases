@@ -1,20 +1,35 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/** @file Grep.c
+/** @file grep.c
     Text pattern search in files (UEFI grep(1) equivalent).
 
     Build with axl-cc:
-      axl-cc Grep.c -o Grep.efi
+      axl-cc grep.c -o grep.efi
 
     Usage:
-      Grep.efi [-i] [-n] [-c] [-r] [-v] [-h] pattern file [file...]
+      grep [-i] [-n] [-c] [-r] [-v] [-h] pattern [file ...]
+
+    With no file arguments, reads from stdin — works as the right-hand
+    side of a UEFI Shell pipe (`some-tool | grep pattern`) on shells
+    that publish EFI_SHELL_PARAMETERS_PROTOCOL.
+
+    Streams its input line-by-line via axl_readline, so file and pipe
+    size is unbounded and individual lines may be arbitrarily long
+    (axl_readline grows its buffer as needed).
 **/
 
 #include <axl.h>
 
-#define GREP_MAX_FILE_SIZE  (16 * 1024 * 1024)
 #define MAX_WALK_DEPTH      32
+#define BINARY_PEEK_BYTES   512u   /* first-N bytes scanned for NUL */
+/* Per-stream working buffer. Doubles as the maximum line length:
+   lines longer than this get truncated and reported in verbose
+   mode. 64 KiB is generous for any real text file (no real source
+   file or log line approaches it) and matches GNU grep's chunk
+   size. The cap exists to bound stack on degenerate inputs (a
+   no-newline file, a minified blob misclassified as text, etc.). */
+#define LINE_BUF_BYTES      (64u * 1024u)
 
 static bool case_insensitive = false;
 static bool show_line_numbers = false;
@@ -38,13 +53,17 @@ static const AxlArgDesc flags[] = {
 static const AxlArgDesc positional[] = {
     { .name = "pattern", .type = AXL_ARG_STRING, .required = true,
       .help = "Search pattern" },
-    { .name = "files",   .type = AXL_ARG_MULTI,  .required = true,
-      .help = "One or more files (or directories with -r)" },
+    { .name = "files",   .type = AXL_ARG_MULTI,
+      .help = "Zero or more files (omit to read stdin; with -r, "
+              "one or more directories)" },
     {0}
 };
 
 // ---------------------------------------------------------------------------
-// Binary detection
+// Binary detection: scan up to BINARY_PEEK_BYTES for an embedded NUL.
+// Lines (axl_readline) terminate at NUL, so a binary file with NUL in
+// the first chunk also disrupts streaming — this check is the same
+// signal Linux grep uses ("does the prefix look like text?").
 // ---------------------------------------------------------------------------
 
 static bool
@@ -53,7 +72,7 @@ is_binary_data(
     size_t         size
     )
 {
-    size_t check = (size > 512) ? 512 : size;
+    size_t check = (size > BINARY_PEEK_BYTES) ? BINARY_PEEK_BYTES : size;
     for (size_t i = 0; i < check; i++) {
         if (data[i] == 0) {
             return true;
@@ -63,100 +82,120 @@ is_binary_data(
 }
 
 // ---------------------------------------------------------------------------
-// Search a single file
+// Unified streaming search — used for both files and stdin.
+//
+// For files we peek the first chunk to detect binary content, then
+// rewind. For stdin (not seekable) we skip the binary check and trust
+// the caller — Linux grep does the same when stdin is a non-regular
+// file.
+//
+// `path == NULL` selects stdin; `path` non-NULL opens that file.
+// `show_filename` controls whether matched lines are prefixed with
+// the filename (or "(stdin)" when reading the pipe).
 // ---------------------------------------------------------------------------
 
 static size_t
-grep_file(
+grep_stream(
     const char *pattern,
-    const char *path,
+    const char *path,            /* NULL = stdin */
     bool        show_filename
     )
 {
-    AXL_AUTO_FREE void *data = NULL;
-    size_t size = 0;
+    AxlStream *src       = NULL;
+    bool       owns_src  = false;
 
-    if (axl_file_get_contents(path, &data, &size) != 0) {
-        if (verbose_mode) {
-            axl_printf("Grep: cannot read '%s'\n", path);
-        }
-        return 0;
-    }
-
-    if (size == 0) {
-        return 0;
-    }
-
-    if (size > GREP_MAX_FILE_SIZE) {
-        if (verbose_mode) {
-            axl_printf("Grep: skipping '%s' (too large: %zu bytes)\n",
-                       path, size);
-        }
-        return 0;
-    }
-
-    if (is_binary_data((const uint8_t *)data, size)) {
-        if (verbose_mode) {
-            axl_printf("Grep: skipping binary file '%s'\n", path);
-        }
-        return 0;
-    }
-
-    /* Search line by line */
-    size_t line_num = 1;
-    size_t count = 0;
-    size_t line_start = 0;
-    const char *buf = (const char *)data;
-
-    for (size_t i = 0; i <= size; i++) {
-        bool is_eol = (i == size) || (buf[i] == '\n');
-        if (!is_eol) {
-            continue;
-        }
-
-        /* Extract line [line_start..i), strip trailing \r */
-        size_t line_end = i;
-        if (line_end > line_start && buf[line_end - 1] == '\r') {
-            line_end--;
-        }
-        size_t line_len = line_end - line_start;
-
-        /* NUL-terminate the line in a local buffer */
-        char line_buf[1024];
-        if (line_len >= sizeof(line_buf)) {
-            line_len = sizeof(line_buf) - 1;
-        }
-        axl_memcpy(line_buf, buf + line_start, line_len);
-        line_buf[line_len] = '\0';
-
-        /* Match */
-        const char *found;
-        if (case_insensitive) {
-            found = axl_strcasestr(line_buf, pattern);
-        } else {
-            found = axl_strstr_len(line_buf, -1, pattern);
-        }
-
-        if (found != NULL) {
-            count++;
-            if (!count_only) {
-                if (show_filename) {
-                    axl_printf("%s:", path);
-                }
-                if (show_line_numbers) {
-                    axl_printf("%zu:", line_num);
-                }
-                axl_printf("%s\n", line_buf);
+    if (path != NULL) {
+        src = axl_fopen(path, "r");
+        if (src == NULL) {
+            if (verbose_mode) {
+                axl_printf("grep: cannot read '%s'\n", path);
             }
+            return 0;
+        }
+        owns_src = true;
+
+        /* Peek for binary content. axl_fseek rewinds for the actual
+           read so the wrapper's BOM probe sees the file from byte 0. */
+        uint8_t      peek[BINARY_PEEK_BYTES];
+        axl_ssize_t  n = axl_read(src, peek, sizeof(peek));
+        if (n > 0 && is_binary_data(peek, (size_t)n)) {
+            if (verbose_mode) {
+                axl_printf("grep: skipping binary file '%s'\n", path);
+            }
+            axl_fclose(src);
+            return 0;
+        }
+        if (axl_fseek(src, 0, AXL_SEEK_SET) != 0) {
+            /* Files in this SDK are seekable; if the rewind ever
+               fails, we'd be off-by-N bytes. Bail loudly. */
+            if (verbose_mode) {
+                axl_printf("grep: rewind failed on '%s'\n", path);
+            }
+            axl_fclose(src);
+            return 0;
+        }
+    } else {
+        src = axl_stdin;
+    }
+
+    /* BOM-probe + transparent UTF-8 over UCS-2 LE/BE if the source
+       is a UEFI shell pipe or a Windows-emitted text file. */
+    AxlStream *txt = axl_text_stream_wrap(src);
+    if (txt == NULL) {
+        if (owns_src) axl_fclose(src);
+        return 0;
+    }
+
+    const char *label = (path != NULL) ? path : "(stdin)";
+
+    /* Static — keeps the 64 KiB chunk off the EFI stack (typically
+       128 KiB but recursive directory walking already consumes
+       some). Not thread-safe, but UEFI tools are single-threaded
+       per invocation. */
+    static char    line_buf[LINE_BUF_BYTES];
+    AxlLineReader  r;
+    axl_line_reader_init(&r, txt, line_buf, sizeof(line_buf));
+
+    const char  *line;
+    size_t       len;
+    bool         truncated;
+    size_t       line_num = 1;
+    size_t       count    = 0;
+
+    while (axl_line_reader_next(&r, &line, &len, &truncated)) {
+        if (truncated && verbose_mode) {
+            axl_printf("grep: %s line %zu truncated at %zu bytes\n",
+                       label, line_num, len);
         }
 
+        /* Strip trailing '\r' from a CRLF pair — the '\n' itself is
+           already excluded by the reader. */
+        if (len > 0 && line[len - 1] == '\r') {
+            len--;
+        }
+
+        /* The line slice points into line_buf and is NOT NUL-
+           terminated; both matchers take an explicit length. */
+        bool match = case_insensitive
+                   ? (axl_strcasestr_len(line, (long long)len, pattern) != NULL)
+                   : (axl_strstr_len(line, (long long)len, pattern) != NULL);
+        if (match && !count_only) {
+            if (show_filename) axl_printf("%s:", label);
+            if (show_line_numbers) axl_printf("%zu:", line_num);
+            axl_printf("%.*s\n", (int)len, line);
+        }
+        if (match) count++;
         line_num++;
-        line_start = i + 1;
+    }
+
+    axl_fclose(txt);
+    if (owns_src) {
+        axl_fclose(src);
     }
 
     if (count_only) {
         if (show_filename) {
-            axl_printf("%s:%zu\n", path, count);
+            axl_printf("%s:%zu\n", label, count);
         } else {
             axl_printf("%zu\n", count);
         }
@@ -169,57 +208,33 @@ grep_file(
 // Recursive directory walker
 // ---------------------------------------------------------------------------
 
+typedef struct {
+    const char *pattern;
+    size_t      total;
+} GrepWalkCtx;
+
+static int
+grep_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+{
+    if (!entry->is_dir) {
+        GrepWalkCtx *c = (GrepWalkCtx *)user;
+        c->total += grep_stream(c->pattern, full_path, true);
+    }
+    return 0;
+}
+
 static size_t
 grep_directory(
     const char *pattern,
-    const char *dir_path,
-    size_t      depth
+    const char *dir_path
     )
 {
-    size_t total = 0;
-
-    if (depth >= MAX_WALK_DEPTH) {
-        if (verbose_mode) {
-            axl_printf("Grep: max depth reached at '%s'\n", dir_path);
-        }
-        return 0;
+    GrepWalkCtx ctx = { .pattern = pattern, .total = 0 };
+    if (axl_dir_walk(dir_path, grep_walk_cb, &ctx, MAX_WALK_DEPTH) != 0
+        && verbose_mode) {
+        axl_printf("grep: walk of '%s' did not complete cleanly\n", dir_path);
     }
-
-    AxlDir *dir = axl_dir_open(dir_path);
-    if (dir == NULL) {
-        if (verbose_mode) {
-            axl_printf("Grep: cannot open directory '%s'\n", dir_path);
-        }
-        return 0;
-    }
-
-    AxlDirEntry entry;
-    while (axl_dir_read(dir, &entry)) {
-        if (axl_strcmp(entry.name, ".") == 0 ||
-            axl_strcmp(entry.name, "..") == 0) {
-            continue;
-        }
-
-        char full_path[512];
-        size_t len = axl_strlen(dir_path);
-        if (len > 0 && (dir_path[len - 1] == '/' ||
-                        dir_path[len - 1] == '\\')) {
-            axl_snprintf(full_path, sizeof(full_path), "%s%s",
-                         dir_path, entry.name);
-        } else {
-            axl_snprintf(full_path, sizeof(full_path), "%s/%s",
-                         dir_path, entry.name);
-        }
-
-        if (entry.is_dir) {
-            total += grep_directory(pattern, full_path, depth + 1);
-        } else {
-            total += grep_file(pattern, full_path, true);
-        }
-    }
-
-    axl_dir_close(dir);
-    return total;
+    return ctx.total;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,12 +255,18 @@ run_grep(AxlArgs *a)
     bool multi_file = (file_count > 1) || recursive || verbose_mode;
 
     size_t total_matches = 0;
-    for (int i = 0; i < file_count; i++) {
-        const char *path = axl_args_get_pos(a, i);
-        if (recursive && axl_file_is_dir(path)) {
-            total_matches += grep_directory(pattern, path, 0);
-        } else {
-            total_matches += grep_file(pattern, path, multi_file);
+    if (file_count == 0) {
+        /* No files supplied — read from stdin. Useful as the right-
+           hand side of a UEFI Shell pipe. */
+        total_matches = grep_stream(pattern, NULL, false);
+    } else {
+        for (int i = 0; i < file_count; i++) {
+            const char *path = axl_args_get_pos(a, i);
+            if (recursive && axl_file_is_dir(path)) {
+                total_matches += grep_directory(pattern, path);
+            } else {
+                total_matches += grep_stream(pattern, path, multi_file);
+            }
         }
     }
 
@@ -256,7 +277,7 @@ int
 main(int argc, char **argv)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
-        .name         = "Grep",
+        .name         = "grep",
         .help         = "Search file(s) for a pattern (UNIX grep-style)",
         .flags        = flags,
         .positionals  = positional,

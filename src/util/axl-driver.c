@@ -14,42 +14,22 @@
 #include <axl/axl-str.h>
 #include <axl/axl-path.h>
 #include <axl/axl-log.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-sys.h>
 
 AXL_LOG_DOMAIN("driver");
 
 // ---------------------------------------------------------------------------
-// Device path safety limits
+// Volume-name buffer (matches DRIVER_MAX_VOLUMES so axl_volume_enumerate
+// returns the same set we can address).
 // ---------------------------------------------------------------------------
 
-#define MAX_DP_WALK             256   /* max nodes to walk before giving up */
-#define DRIVER_VOL_NAME_MAX      16   /* "fsN:" volume name buffer; matches
-                                         DRIVER_MAX_VOLUMES so axl_volume_enumerate
-                                         returns the same set we can address */
+#define DRIVER_VOL_NAME_MAX      16
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/* Walk a device path to the END node, returning the total length
- * INCLUDING the END node. Returns 0 on malformed input. */
-static size_t
-driver_dp_total_size(const EFI_DEVICE_PATH_PROTOCOL *dp)
-{
-    if (dp == NULL) return 0;
-    const EFI_DEVICE_PATH_PROTOCOL *p = dp;
-    int steps = 0;
-    while (steps++ < MAX_DP_WALK) {
-        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(p);
-        if (node_len < 4) return 0;  /* malformed */
-        if (EFI_DP_IS_END(p)) {
-            return (size_t)((const uint8_t *)p - (const uint8_t *)dp) + node_len;
-        }
-        p = EFI_DP_NEXT(p);
-    }
-    return 0;
-}
 
 /* Build a full file-on-volume device path from a UEFI path string
  * like "fs0:\drivers\x64\foo.efi". The result is suitable for
@@ -108,7 +88,7 @@ driver_build_file_dp(const char *path)
     {
         return NULL;
     }
-    size_t vol_dp_size = driver_dp_total_size(vol_dp);
+    size_t vol_dp_size = axl_device_path_size(vol_dp);
     if (vol_dp_size < 4) return NULL;
     /* Strip the volume DP's END node — we'll append our own. */
     size_t vol_dp_body = vol_dp_size - 4;
@@ -408,28 +388,16 @@ axl_driver_get_image_path(void)
         return NULL;
     }
 
-    /* Walk the device path to find the file path node.
-       File path nodes have Type=4 (MEDIA_DEVICE_PATH), SubType=4 (MEDIA_FILEPATH_DP).
-       The node data after the 4-byte header is a UCS-2 path string.
-       Limit walk to MAX_DP_WALK nodes to prevent infinite loops on
-       malformed device paths. */
-    EFI_DEVICE_PATH_PROTOCOL *dp = img->FilePath;
-    int steps = 0;
-    while (dp != NULL && !EFI_DP_IS_END(dp) && steps < MAX_DP_WALK) {
-        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(dp);
-        if (node_len < 4) {
-            break;  /* malformed node */
-        }
-        if (EFI_DP_TYPE(dp) == 0x04 && EFI_DP_SUBTYPE(dp) == 0x04 &&
-            node_len > 4)
-        {
-            unsigned short *wpath = (unsigned short *)((uint8_t *)dp + 4);
-            return axl_ucs2_to_utf8(wpath);
-        }
-        dp = EFI_DP_NEXT(dp);
-        steps++;
+    /* Find the MEDIA_FILEPATH_DP node (Type=4, SubType=4); the bytes
+       after its 4-byte header are a UCS-2 path string. The bounded
+       traversal in axl_device_path_for_each guards against runaway
+       on malformed firmware data. */
+    const EFI_DEVICE_PATH_PROTOCOL *fp = axl_device_path_find(
+        img->FilePath, 0x04, 0x04);
+    if (fp != NULL && EFI_DP_LENGTH(fp) > 4) {
+        unsigned short *wpath = (unsigned short *)((uint8_t *)fp + 4);
+        return axl_ucs2_to_utf8(wpath);
     }
-
     return NULL;
 }
 
@@ -497,8 +465,8 @@ axl_driver_init(
     gBS = gST->BootServices;
     gRT = gST->RuntimeServices;
 
-    extern void axl_io_init(void);
-    axl_io_init();
+    extern void axl_stream_init(void);
+    axl_stream_init();
 }
 
 // ---------------------------------------------------------------------------
@@ -866,66 +834,55 @@ axl_driver_ensure(
 // axl_driver_load_dir
 // ---------------------------------------------------------------------------
 
+typedef struct {
+    const char *pattern;
+    size_t      loaded;
+} DriverLoadCtx;
+
+static int
+driver_load_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+{
+    DriverLoadCtx *c = (DriverLoadCtx *)user;
+    if (entry->is_dir || !axl_fnmatch(c->pattern, entry->name)) {
+        return 0;
+    }
+    AxlDriverHandle drv;
+    if (axl_driver_load(full_path, &drv) == 0) {
+        if (axl_driver_start(drv) == 0) {
+            axl_driver_connect(drv);
+            c->loaded++;
+            axl_info("loaded driver: %s", entry->name);
+        } else {
+            axl_driver_unload(drv);
+            axl_warning("failed to start: %s", entry->name);
+        }
+    }
+    return 0;
+}
+
 int
 axl_driver_load_dir(
     const char *dir_path,
     const char *pattern,
     size_t     *loaded_count)
 {
-    AxlDir      *dir;
-    AxlDirEntry  entry;
-    size_t       loaded = 0;
-    const char  *pat;
-
     if (dir_path == NULL) {
         return -1;
     }
 
-    pat = (pattern != NULL) ? pattern : "*.efi";
+    DriverLoadCtx ctx = {
+        .pattern = (pattern != NULL) ? pattern : "*.efi",
+        .loaded  = 0,
+    };
 
-    dir = axl_dir_open(dir_path);
-    if (dir == NULL) {
-        /* Directory doesn't exist — not an error, just 0 loaded */
-        if (loaded_count != NULL) {
-            *loaded_count = 0;
-        }
-        return 0;
-    }
-
-    while (axl_dir_read(dir, &entry)) {
-        if (entry.is_dir) {
-            continue;
-        }
-
-        if (!axl_fnmatch(pat, entry.name)) {
-            continue;
-        }
-
-        /* Build full path: dir_path + "/" + entry.name */
-        char *full_path = axl_path_join(dir_path, entry.name);
-        if (full_path == NULL) {
-            continue;
-        }
-
-        AxlDriverHandle drv;
-        if (axl_driver_load(full_path, &drv) == 0) {
-            if (axl_driver_start(drv) == 0) {
-                axl_driver_connect(drv);
-                loaded++;
-                axl_info("loaded driver: %s", entry.name);
-            } else {
-                axl_driver_unload(drv);
-                axl_warning("failed to start: %s", entry.name);
-            }
-        }
-
-        axl_free(full_path);
-    }
-
-    axl_dir_close(dir);
+    /* max_depth=1 — list immediate children only, no recursion.
+       A missing directory is "not an error, just 0 loaded" per the
+       previous contract; axl_dir_walk returns -1 for that case
+       which we silently translate. */
+    (void)axl_dir_walk(dir_path, driver_load_cb, &ctx, 1);
 
     if (loaded_count != NULL) {
-        *loaded_count = loaded;
+        *loaded_count = ctx.loaded;
     }
     return 0;
 }

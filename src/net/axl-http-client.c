@@ -10,7 +10,8 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-runtime.h>
 #include <axl/axl-str.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-config.h>
 #include "axl-net-internal.h"
 

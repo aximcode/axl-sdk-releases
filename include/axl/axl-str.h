@@ -92,6 +92,97 @@ axl_strcasecmp(
 );
 
 /**
+ * @brief Bounded string length. Like POSIX strnlen().
+ *
+ * Returns the number of bytes in @a s before the first NUL, capped
+ * at @a maxlen. NULL-safe (returns 0). Useful for length-bounded
+ * scans of fixed-width buffers where running off the end would be a
+ * read past the buffer.
+ */
+size_t
+axl_strnlen(
+    const char *s,        ///< NUL-terminated string, or NULL
+    size_t      maxlen    ///< maximum bytes to scan
+);
+
+// ---------------------------------------------------------------------------
+// ASCII character classification (locale-free, inline)
+//
+// These mirror the C `<ctype.h>` predicates but apply only to
+// 7-bit ASCII — UTF-8 high bytes always test false, never undefined
+// behavior. Suitable for tokenizers, hex/JSON parsers, header-name
+// case-folding, etc. Take `int` to match the libc shape (so EOF /
+// negative values pass safely).
+// ---------------------------------------------------------------------------
+
+/** True for ASCII '0'..'9'. */
+static inline bool
+axl_isdigit(int c)
+{
+    return (unsigned)c - '0' < 10u;
+}
+
+/** True for ASCII '0'..'9', 'a'..'f', 'A'..'F'. */
+static inline bool
+axl_isxdigit(int c)
+{
+    return ((unsigned)c - '0' < 10u)
+        || ((unsigned)(c | 0x20) - 'a' < 6u);
+}
+
+/** True for ASCII 'a'..'z' or 'A'..'Z'. */
+static inline bool
+axl_isalpha(int c)
+{
+    return (unsigned)(c | 0x20) - 'a' < 26u;
+}
+
+/** True for ASCII alphanumeric. */
+static inline bool
+axl_isalnum(int c)
+{
+    return axl_isalpha(c) || axl_isdigit(c);
+}
+
+/** True for ASCII whitespace: space, tab, LF, CR, VT, FF. */
+static inline bool
+axl_isspace(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+        || c == '\v' || c == '\f';
+}
+
+/** Lowercase one ASCII char; non-letters returned unchanged. */
+static inline int
+axl_tolower(int c)
+{
+    return ((unsigned)c - 'A' < 26u) ? c + ('a' - 'A') : c;
+}
+
+/** Uppercase one ASCII char; non-letters returned unchanged. */
+static inline int
+axl_toupper(int c)
+{
+    return ((unsigned)c - 'a' < 26u) ? c - ('a' - 'A') : c;
+}
+
+/**
+ * @brief Decode one ASCII hex digit to its integer value.
+ *
+ * Accepts '0'..'9', 'a'..'f', 'A'..'F'. Returns -1 for any other
+ * input — callers can use the return type as both a value and a
+ * validity check.
+ */
+static inline int
+axl_hex_nibble(int c)
+{
+    if ((unsigned)c - '0' < 10u) return c - '0';
+    unsigned lo = (unsigned)(c | 0x20) - 'a';
+    if (lo < 6u) return (int)lo + 10;
+    return -1;
+}
+
+/**
  * @brief Copy @n bytes from @a src to @a dst.
  *
  * Regions must not overlap. NULL-safe: returns @a dst if either is NULL.
@@ -409,6 +500,27 @@ char *
 axl_strcasestr(
     const char *haystack,  ///< string to search
     const char *needle     ///< substring to find (case-insensitive)
+);
+
+/**
+ * @brief Length-bounded case-insensitive substring search.
+ *
+ * Like @ref axl_strcasestr but treats @a haystack as a byte slice
+ * of @a haystack_len bytes — the haystack does NOT need to be
+ * NUL-terminated. Pass `-1` for @a haystack_len to default to
+ * NUL-terminated semantics (mirror of @ref axl_strstr_len).
+ *
+ * Useful for searching slices into a larger buffer (e.g. lines
+ * delivered by `AxlLineReader` that point into a working buffer
+ * without their own NUL terminator).
+ *
+ * @return pointer to match, or NULL if not found.
+ */
+char *
+axl_strcasestr_len(
+    const char *haystack,
+    long long   haystack_len,
+    const char *needle
 );
 
 // ---------------------------------------------------------------------------

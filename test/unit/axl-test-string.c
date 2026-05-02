@@ -1124,6 +1124,62 @@ test_strcasestr(void)
     char *p = axl_strcasestr("FooBarBaz", "bar");
     test_check(p != NULL && p[0] == 'B' && p[1] == 'a' && p[2] == 'r',
                "strcasestr: points to match");
+
+    /* Boyer-Moore-Horspool boundary cases. BMH kicks in at needle
+       length 4; both short and long needles must produce identical
+       results. The "last char repeats earlier" case is the classic
+       BMH bug source — skip table for the last byte must reflect
+       its later occurrence elsewhere in the needle. */
+    test_check(axl_strstr("the quick brown fox", "quick") != NULL,
+               "strstr: BMH path matches needle in middle");
+    test_check(axl_strstr("aaaab", "aaab") != NULL,
+               "strstr: BMH handles repeated-char pattern");
+    test_check(axl_strstr("xxabcabcab", "abcab") != NULL,
+               "strstr: BMH last-char-repeats-earlier (skip table override)");
+    test_check(axl_strstr("abcde", "abcde") != NULL,
+               "strstr: BMH whole-string match");
+    test_check(axl_strstr("abcde", "edcba") == NULL,
+               "strstr: BMH no match");
+    test_check(axl_strstr("hello", "hellox") == NULL,
+               "strstr: BMH needle-longer-than-haystack");
+    test_check(axl_strcasestr("ABCDE FGHIJ KLMNO", "fghij") != NULL,
+               "strcasestr: BMH case-insensitive long needle");
+    test_check(axl_strcasestr("XXXX", "xxxxx") == NULL,
+               "strcasestr: BMH needle-longer-than-haystack");
+    test_check(axl_strcasestr("XYZAbcDef", "abcdef") != NULL,
+               "strcasestr: BMH case-insensitive at tail");
+
+    /* axl_strcasestr_len — length-bounded variant. Mirrors
+       axl_strstr_len for the case-insensitive case so callers with
+       non-NUL-terminated slices (AxlLineReader, etc.) skip the
+       copy-to-stack-buffer dance. */
+    {
+        const char buf[] = "the QUICK brown FOX more bytes after";
+        char *p = axl_strcasestr_len(buf, 16, "quick");  /* slice ends mid-word */
+        test_check(p != NULL && p == buf + 4,
+                   "strcasestr_len: matches inside bounded slice");
+
+        /* Match would extend past the slice end — must not be found. */
+        char *q = axl_strcasestr_len(buf, 16, "fox");
+        test_check(q == NULL,
+                   "strcasestr_len: rejects match past slice end");
+
+        /* haystack_len == -1 should fall back to NUL-terminated. */
+        char *r = axl_strcasestr_len(buf, -1, "FOX");
+        test_check(r != NULL,
+                   "strcasestr_len: -1 length defaults to NUL-terminated");
+
+        /* Empty needle — pointer to start. */
+        char *e = axl_strcasestr_len(buf, 16, "");
+        test_check(e == buf,
+                   "strcasestr_len: empty needle returns haystack");
+
+        /* NULL guards. */
+        test_check(axl_strcasestr_len(NULL, 4, "x") == NULL,
+                   "strcasestr_len: NULL haystack");
+        test_check(axl_strcasestr_len(buf, 4, NULL) == NULL,
+                   "strcasestr_len: NULL needle");
+    }
 }
 
 // ---------------------------------------------------------------------------

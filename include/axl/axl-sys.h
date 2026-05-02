@@ -83,6 +83,76 @@ axl_device_path_has_vendor(
     const AxlGuid *guid          ///< vendor GUID to match
 );
 
+/**
+ * @brief Per-node callback for @ref axl_device_path_for_each.
+ *
+ * Return 0 to continue iteration, any non-zero value to stop —
+ * the return value is propagated back from `axl_device_path_for_each`
+ * so callbacks can use it as a found-flag, error code, or count.
+ *
+ * @p node points at the full device-path node (4-byte header
+ * followed by payload); cast it to the corresponding spec struct
+ * (e.g. `VENDOR_DEVICE_PATH *`) once @p type and @p subtype have
+ * confirmed the shape.
+ */
+typedef int (*AxlDevicePathFn)(
+    uint8_t      type,
+    uint8_t      subtype,
+    const void  *node,
+    void        *user
+);
+
+/**
+ * @brief Walk a device-path node chain with bounded-step safety.
+ *
+ * Iterates from @p device_path through the END node, calling @p fn
+ * on each node with its `(type, subtype, node)` triple. Stops early
+ * when @p fn returns non-zero (and propagates that value), or when
+ * a malformed node is hit (length < 4 or the chain doesn't terminate
+ * within an internal step cap).
+ *
+ * Replaces hand-rolled `while (!EFI_DP_IS_END(node)) ...` loops —
+ * those used to differ on whether they bounded the walk, leaving
+ * malformed firmware data able to runaway.
+ *
+ * @return 0 on a clean traversal to END, the callback's non-zero
+ *     return value if it stopped early, or -1 on malformed input.
+ */
+int
+axl_device_path_for_each(
+    const void       *device_path,  ///< device path (from "device-path" service)
+    AxlDevicePathFn   fn,            ///< per-node callback
+    void             *user           ///< opaque user pointer for the callback
+);
+
+/**
+ * @brief Find the first device-path node matching (type, subtype).
+ *
+ * @return pointer to the node (cast to the corresponding spec
+ *     struct by the caller), or NULL if no match.
+ */
+const void *
+axl_device_path_find(
+    const void *device_path,  ///< device path (from "device-path" service)
+    uint8_t     type,         ///< node type to match
+    uint8_t     subtype       ///< node subtype to match
+);
+
+/**
+ * @brief Compute the total byte length of a device path INCLUDING
+ *        the END node.
+ *
+ * Useful when copying / appending device paths, e.g. when building
+ * a LoadImage argument out of an existing volume DP plus a file
+ * suffix. Bounded by the same step cap as the iterator.
+ *
+ * @return size in bytes, or 0 on malformed input.
+ */
+size_t
+axl_device_path_size(
+    const void *device_path  ///< device path (from "device-path" service)
+);
+
 // ---------------------------------------------------------------------------
 // System control
 // ---------------------------------------------------------------------------

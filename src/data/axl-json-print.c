@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-json.h>
+#include <axl/axl-str.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("json");
@@ -202,7 +203,7 @@ axl_json_console_print(const char *json, size_t len)
             break;
 
         default:
-            if ((ch >= '0' && ch <= '9') || ch == '-' || ch == '.') {
+            if (axl_isdigit((unsigned char)ch) || ch == '-' || ch == '.') {
                 set_color(JP_COLOR_NUMBER);
             } else {
                 set_color(JP_COLOR_BOOL);

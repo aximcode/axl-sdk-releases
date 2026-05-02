@@ -337,6 +337,41 @@ axl_backend_shell_setenv(
     );
 
 /**
+ * @brief Get the SHELL_FILE_HANDLE for the running image's standard
+ *     input, as published by EFI_SHELL_PARAMETERS_PROTOCOL on this
+ *     image's handle.
+ *
+ * Returns the handle the shell wired up — for `tool1 | tool2`
+ * invocations this points to the captured LHS output, so reading
+ * from it via @ref axl_backend_file_read consumes the piped bytes.
+ * For non-redirected interactive launches the handle typically
+ * still exists but is tied to the keyboard.
+ *
+ * Returns NULL when the shell-params protocol isn't published on
+ * this image (cross-volume launches, BDS contexts, or any
+ * non-Shell-2.0 launch path).
+ */
+AxlFileHandle
+axl_backend_shell_stdin(void);
+
+/**
+ * @brief Get the SHELL_FILE_HANDLE for the running image's standard
+ *     output, as published by EFI_SHELL_PARAMETERS_PROTOCOL on this
+ *     image's handle.
+ *
+ * Writing bytes to this handle via @ref axl_backend_file_write
+ * sends them through whatever the shell wired up — a file (`>`),
+ * a pipe RHS (`|`), or the firmware console (no redirection).
+ * Bypasses the CHAR16 console-output path used by axl_print, so
+ * raw binary bytes survive intact across pipes.
+ *
+ * Returns NULL when the shell-params protocol isn't published on
+ * this image. Symmetric with @ref axl_backend_shell_stdin.
+ */
+AxlFileHandle
+axl_backend_shell_stdout(void);
+
+/**
  * @brief Get the current working directory.
  *
  * @return UCS-2 path (pointer to Shell-owned storage), or NULL.

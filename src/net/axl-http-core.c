@@ -243,8 +243,7 @@ axl_http_parse_headers(
 
             if (name != NULL && val != NULL) {
                 for (size_t i = 0; i < name_len; i++) {
-                    char ch = data[pos + i];
-                    name[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+                    name[i] = (char)axl_tolower((unsigned char)data[pos + i]);
                 }
 
                 name[name_len] = '\0';
@@ -387,7 +386,7 @@ net_parse_ip_address(
     for (size_t i = 0; ; i++) {
         char ch = string[i];
 
-        if (ch >= '0' && ch <= '9') {
+        if (axl_isdigit((unsigned char)ch)) {
             octet = octet * 10 + (ch - '0');
             if (octet > 255) {
                 return EFI_INVALID_PARAMETER;

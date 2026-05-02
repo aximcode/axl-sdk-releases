@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/** @file axl-io-buf.c
+/** @file axl-stream-buf.c
     In-memory buffer stream backend.
 **/
 
 #include <stddef.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
 #include <axl/axl-log.h>
-#include "axl-io-internal.h"
+#include "axl-stream-internal.h"
 AXL_LOG_DOMAIN("io");
 
 #define BUF_INITIAL  256
@@ -156,7 +156,7 @@ buf_close(void *ctx)
 // ---------------------------------------------------------------------------
 
 AxlStream *
-axl_bufopen_internal(void)
+axl_bufopen(void)
 {
     AxlStream *s;
     BufCtx *b;

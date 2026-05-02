@@ -196,15 +196,6 @@ axl_pci_write_config_32(
 // Address parse / format
 // ---------------------------------------------------------------------------
 
-static int
-hex_value(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 /* Parse 1..max_chars hex digits into *out, returning the consumed
    count or -1 on no digits / overflow. *out is set even on success
    of a single digit. */
@@ -214,7 +205,7 @@ parse_hex_field(const char *s, int max_chars, uint32_t *out)
     uint32_t v = 0;
     int      i = 0;
     while (i < max_chars) {
-        int d = hex_value(s[i]);
+        int d = axl_hex_nibble(s[i]);
         if (d < 0) break;
         v = (v << 4) | (uint32_t)d;
         i++;
@@ -342,9 +333,9 @@ axl_pci_get_vid_did(AxlPciAddr addr, uint16_t *vid, uint16_t *did)
 }
 
 int
-axl_pci_get_class24(AxlPciAddr addr, uint32_t *class24)
+axl_pci_get_class_code(AxlPciAddr addr, uint32_t *class_code)
 {
-    if (class24 == NULL) {
+    if (class_code == NULL) {
         return -1;
     }
     uint8_t prog_if, sub, base;
@@ -354,7 +345,7 @@ axl_pci_get_class24(AxlPciAddr addr, uint32_t *class24)
     {
         return -1;
     }
-    *class24 = ((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog_if;
+    *class_code = ((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog_if;
     return 0;
 }
 
@@ -671,14 +662,14 @@ lookup_prog(uint8_t base, uint8_t sub, uint8_t prog)
 }
 
 int
-axl_pci_class_string(uint32_t class24, char *buf, size_t buflen)
+axl_pci_class_string(uint32_t class_code, char *buf, size_t buflen)
 {
     if (buf == NULL || buflen == 0) {
         return -1;
     }
-    uint8_t base = (uint8_t)((class24 >> 16) & 0xFFu);
-    uint8_t sub  = (uint8_t)((class24 >>  8) & 0xFFu);
-    uint8_t prog = (uint8_t)( class24        & 0xFFu);
+    uint8_t base = (uint8_t)((class_code >> 16) & 0xFFu);
+    uint8_t sub  = (uint8_t)((class_code >>  8) & 0xFFu);
+    uint8_t prog = (uint8_t)( class_code        & 0xFFu);
     return axl_snprintf(buf, buflen, "%s / %s / %s",
                         lookup_base(base),
                         lookup_sub(base, sub),
@@ -954,7 +945,7 @@ axl_pci_find_by_vid_did(
 
 int
 axl_pci_find_by_class(
-    uint32_t     class24,
+    uint32_t     class_code,
     uint16_t     nth,
     AxlPciAddr  *out
     )
@@ -972,8 +963,8 @@ axl_pci_find_by_class(
         if (axl_pci_read_config_32(*p, 0x08, &reg08) != 0) {
             continue;
         }
-        uint32_t cur_class24 = (reg08 >> 8) & 0xFFFFFFu;
-        if (class24 == 0xFFFFFFu || cur_class24 == class24) {
+        uint32_t cur_class_code = (reg08 >> 8) & 0xFFFFFFu;
+        if (class_code == 0xFFFFFFu || cur_class_code == class_code) {
             if (matches == nth) {
                 *out = *p;
                 return 0;

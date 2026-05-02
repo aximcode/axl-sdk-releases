@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/** @file axl-io-port.c
+/** @file axl-port.c
     x86 architectural I/O port access — `in`/`out` instruction wrappers.
 
     The translation unit is empty on non-x86 targets; the public header
     omits the declarations there and any caller fails to link.
 **/
 
-#include <axl/axl-io-port.h>
+#include <axl/axl-port.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 

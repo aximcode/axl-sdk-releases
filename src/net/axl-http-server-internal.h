@@ -15,7 +15,8 @@
 #include <axl/axl-net.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-time.h>
 #include <axl/axl-digest.h>
 #include <axl/axl-config.h>

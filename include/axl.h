@@ -27,7 +27,8 @@
 #include <axl/axl-format.h>
 #include <axl/axl-string.h>
 #include <axl/axl-str.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-log.h>
 #include <axl/axl-hash-table.h>
 #include <axl/axl-array.h>
@@ -45,7 +46,7 @@
 #include <axl/axl-env.h>
 #include <axl/axl-sys.h>
 #include <axl/axl-nvstore.h>
-#include <axl/axl-io-port.h>
+#include <axl/axl-port.h>
 #include <axl/axl-boot.h>
 #include <axl/axl-acpi.h>
 #include <axl/axl-pci.h>

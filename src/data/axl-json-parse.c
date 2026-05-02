@@ -8,7 +8,8 @@
 #include <axl/axl-json.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("json");
@@ -70,15 +71,6 @@ find_value_token(const char *json, const jsmntok_t *tokens,
     return -1;
 }
 
-static int
-hex_nibble(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 static bool
 decode_json_string(const char *src, size_t src_len,
                    char *dst, size_t dst_size)
@@ -106,8 +98,8 @@ decode_json_string(const char *src, size_t src_len,
             case 'v':  dst[out++] = '\v'; break;
             case '0':  dst[out++] = '\0'; break;
             case 'x': {
-                int hi = (i + 1 < src_len) ? hex_nibble(src[i + 1]) : -1;
-                int lo = (i + 2 < src_len) ? hex_nibble(src[i + 2]) : -1;
+                int hi = (i + 1 < src_len) ? axl_hex_nibble(src[i + 1]) : -1;
+                int lo = (i + 2 < src_len) ? axl_hex_nibble(src[i + 2]) : -1;
                 if (hi >= 0 && lo >= 0) {
                     dst[out++] = (char)((hi << 4) | lo);
                     i += 2;
@@ -157,7 +149,7 @@ parse_int64(const char *json, const jsmntok_t *tok, int64_t *value)
         if (p >= end) return false;
         v = 0;
         while (p < end) {
-            int n = hex_nibble(*p);
+            int n = axl_hex_nibble(*p);
             if (n < 0) return false;
             v = (v << 4) | n;
             p++;
@@ -166,12 +158,12 @@ parse_int64(const char *json, const jsmntok_t *tok, int64_t *value)
         return true;
     }
 
-    if (p >= end || *p < '0' || *p > '9') {
+    if (p >= end || !axl_isdigit(*p)) {
         return false;
     }
 
     v = 0;
-    while (p < end && *p >= '0' && *p <= '9') {
+    while (p < end && axl_isdigit(*p)) {
         v = v * 10 + (*p - '0');
         p++;
     }

@@ -9,6 +9,7 @@
 #include <axl/axl-sys.h>
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("sys");
@@ -58,6 +59,12 @@ axl_handle_get_service(
     if (handle == NULL || name == NULL || interface == NULL) {
         return -1;
     }
+    /* Defensive: ensure the caller sees NULL (not stale data) on
+       any failure path. UEFI HandleProtocol does not guarantee
+       *Interface is preserved on error — EDK2 zeroes it but other
+       firmware may not. Callers like AxlVolume.device_path gate on
+       NULL, so a leftover stale pointer would be a real footgun. */
+    *interface = NULL;
 
     /* Reuse the service name→GUID lookup from axl-service.c */
     extern const EFI_GUID *axl_service_lookup_guid(const char *name, EFI_GUID *fallback);
@@ -71,7 +78,11 @@ axl_handle_get_service(
         (EFI_GUID *)guid,
         interface);
 
-    return EFI_ERROR(status) ? -1 : 0;
+    if (EFI_ERROR(status)) {
+        *interface = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,29 +199,125 @@ axl_sys_get_memory_size(
 }
 
 // ---------------------------------------------------------------------------
+// Device-path iteration
+// ---------------------------------------------------------------------------
+
+/* Cap on node count — guards against malformed firmware data that
+   doesn't terminate. 64 nodes is well above any real device path
+   the SDK has seen (typical UEFI paths max at ~6-12 nodes). */
+#define AXL_DP_MAX_NODES  64u
+
+int
+axl_device_path_for_each(
+    const void       *device_path,
+    AxlDevicePathFn   fn,
+    void             *user
+    )
+{
+    if (device_path == NULL || fn == NULL) {
+        return -1;
+    }
+
+    const EFI_DEVICE_PATH_PROTOCOL *dp =
+        (const EFI_DEVICE_PATH_PROTOCOL *)device_path;
+
+    for (unsigned steps = 0; steps < AXL_DP_MAX_NODES; steps++) {
+        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(dp);
+        if (node_len < 4) {
+            return -1;  /* malformed: each node header is 4 bytes */
+        }
+        if (EFI_DP_IS_END(dp)) {
+            return 0;
+        }
+        int rc = fn((uint8_t)EFI_DP_TYPE(dp), (uint8_t)EFI_DP_SUBTYPE(dp),
+                    dp, user);
+        if (rc != 0) {
+            return rc;
+        }
+        dp = EFI_DP_NEXT(dp);
+    }
+    return -1;  /* step cap exhausted — treat as malformed */
+}
+
+typedef struct {
+    uint8_t      type;
+    uint8_t      subtype;
+    const void  *match;
+} DpFindCtx;
+
+static int
+dp_find_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
+{
+    DpFindCtx *c = (DpFindCtx *)user;
+    if (type == c->type && subtype == c->subtype) {
+        c->match = node;
+        return 1;  /* stop */
+    }
+    return 0;
+}
+
+const void *
+axl_device_path_find(
+    const void *device_path,
+    uint8_t     type,
+    uint8_t     subtype
+    )
+{
+    DpFindCtx ctx = { .type = type, .subtype = subtype, .match = NULL };
+    (void)axl_device_path_for_each(device_path, dp_find_cb, &ctx);
+    return ctx.match;
+}
+
+size_t
+axl_device_path_size(const void *device_path)
+{
+    if (device_path == NULL) {
+        return 0;
+    }
+    const EFI_DEVICE_PATH_PROTOCOL *dp =
+        (const EFI_DEVICE_PATH_PROTOCOL *)device_path;
+    const uint8_t *base = (const uint8_t *)dp;
+    for (unsigned steps = 0; steps < AXL_DP_MAX_NODES; steps++) {
+        uint16_t node_len = (uint16_t)EFI_DP_LENGTH(dp);
+        if (node_len < 4) return 0;
+        if (EFI_DP_IS_END(dp)) {
+            return (size_t)((const uint8_t *)dp - base) + node_len;
+        }
+        dp = EFI_DP_NEXT(dp);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // axl_device_path_has_vendor
 // ---------------------------------------------------------------------------
+
+typedef struct {
+    const AxlGuid *guid;
+    bool           found;
+} VendorMatchCtx;
+
+static int
+vendor_match_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
+{
+    if (type == HARDWARE_DEVICE_PATH && subtype == HW_VENDOR_DP) {
+        VendorMatchCtx *c = (VendorMatchCtx *)user;
+        const VENDOR_DEVICE_PATH *v = (const VENDOR_DEVICE_PATH *)node;
+        if (axl_guid_cmp((const AxlGuid *)&v->Guid, c->guid)) {
+            c->found = true;
+            return 1;  /* stop */
+        }
+    }
+    return 0;
+}
 
 bool
 axl_device_path_has_vendor(void *device_path, const AxlGuid *guid)
 {
-    EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
-
-    if (dp == NULL || guid == NULL) {
+    if (device_path == NULL || guid == NULL) {
         return false;
     }
-
-    while (!EFI_DP_IS_END(dp)) {
-        if (EFI_DP_TYPE(dp) == HARDWARE_DEVICE_PATH &&
-            EFI_DP_SUBTYPE(dp) == HW_VENDOR_DP)
-        {
-            VENDOR_DEVICE_PATH *v = (VENDOR_DEVICE_PATH *)dp;
-            if (axl_guid_cmp((const AxlGuid *)&v->Guid, guid)) {
-                return true;
-            }
-        }
-        dp = EFI_DP_NEXT(dp);
-    }
-
-    return false;
+    VendorMatchCtx ctx = { .guid = guid, .found = false };
+    (void)axl_device_path_for_each(device_path, vendor_match_cb, &ctx);
+    return ctx.found;
 }

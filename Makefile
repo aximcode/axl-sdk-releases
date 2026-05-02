@@ -41,7 +41,8 @@ OBJCOPY    = $(CROSS)objcopy
 # .efi has properly split per-section permissions, see PE characteristics).
 LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments
 
-CFLAGS_BASE = -ffreestanding -fshort-wchar \
+CFLAGS_BASE = -std=gnu2x \
+              -ffreestanding -fshort-wchar \
               -fno-stack-protector -fno-builtin \
               -fno-omit-frame-pointer \
               -fpic $(GCC_ARCH) \
@@ -153,16 +154,18 @@ LIB_SOURCES = \
     src/data/axl-digest-md5.c \
     src/data/axl-digest-sha1.c \
     src/data/axl-digest-sha256.c \
-    src/io/axl-io.c \
-    src/io/axl-io-buf.c \
-    src/io/axl-io-file.c \
+    src/stream/axl-stream.c \
+    src/stream/axl-stream-buf.c \
+    src/stream/axl-stream-file.c \
+    src/stream/axl-stream-text.c \
+    src/fs/axl-fs.c \
     src/util/axl-path.c \
     src/util/axl-hexdump.c \
     src/util/axl-time.c \
     src/util/axl-env.c \
     src/util/axl-sys.c \
     src/util/axl-nvstore.c \
-    src/util/axl-io-port.c \
+    src/util/axl-port.c \
     src/util/axl-boot.c \
     src/util/axl-image.c \
     src/util/axl-mem-phys.c \
@@ -344,7 +347,10 @@ $(BUILDDIR)/%.o: src/log/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/data/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BUILDDIR)/%.o: src/io/%.c | $(BUILDDIR)
+$(BUILDDIR)/%.o: src/stream/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/fs/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/util/%.c | $(BUILDDIR)
@@ -705,32 +711,26 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)
 	@echo "  Built $(words $(TOOL_NAMES)) tools"
 
 # Embedded driver blob for mkrd. Vendored EDK2 RamDiskDxe.efi (one per
-# arch) is converted to a `static const unsigned char[]` header at build
-# time; mkrd LoadImages it from memory when the host firmware doesn't
-# ship EFI_RAM_DISK_PROTOCOL. See third_party/edk2/README.md for
-# provenance and license.
-#
-# xxd -i emits non-static `unsigned char NAME[]` + `unsigned int
-# NAME_len`; sed adds `const` so the data lands in .rodata. Symbols
-# stay external-linkage — mkrd.c declares them via `extern const`
-# at the top of the file (matching declarations satisfy editors and
-# static analyzers that don't see the -include flag).
+# arch) is embedded into mkrd.efi via the GNU assembler's `.incbin`
+# directive — see tools/mkrd-blob.S. mkrd LoadImages it from memory
+# when the host firmware doesn't ship EFI_RAM_DISK_PROTOCOL. See
+# third_party/edk2/README.md for provenance and license.
 EMBEDDED_RAMDISK_SRC = third_party/edk2/RamDiskDxe-$(ARCH).efi
-EMBEDDED_RAMDISK_HDR = $(BUILDDIR)/mkrd-ramdisk-blob.h
+EMBEDDED_RAMDISK_OBJ = $(BUILDDIR)/mkrd-blob.o
 
-$(EMBEDDED_RAMDISK_HDR): $(EMBEDDED_RAMDISK_SRC) | $(BUILDDIR)
-	@echo "  EMBED   $< -> $(notdir $@)"
-	@cd $(dir $<) && xxd -i -n axl_embedded_ramdiskdxe $(notdir $<) \
-	    | sed -e 's/^unsigned char/const unsigned char/' \
-	          -e 's/^unsigned int/const unsigned int/' \
-	    > $(abspath $@)
+# The .S preprocessor stringifies RAMDISK_BLOB_PATH into the path
+# .incbin expects. The .o has a build-time dependency on the .efi
+# itself so a refreshed blob triggers a re-assemble.
+$(EMBEDDED_RAMDISK_OBJ): tools/mkrd-blob.S $(EMBEDDED_RAMDISK_SRC) | $(BUILDDIR)
+	$(CC) $(CFLAGS_BASE) -DRAMDISK_BLOB_PATH=$(EMBEDDED_RAMDISK_SRC) \
+	    -c $< -o $@
 
 define BUILD_TOOL
 $(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
@@ -742,12 +742,11 @@ endef
 
 $(foreach t,$(TOOL_NAMES),$(eval $(call BUILD_TOOL,$(t))))
 
-# mkrd needs the embedded RamDiskDxe blob — override the generic
-# tool rule with one that depends on (and includes) the generated
-# header. -include forces the header into the translation unit
-# without touching mkrd.c's #include list.
-$(BUILDDIR)/mkrd.o: tools/mkrd.c $(EMBEDDED_RAMDISK_HDR) | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -include $(EMBEDDED_RAMDISK_HDR) -c $< -o $@
+# mkrd is linked alongside the .incbin'd blob object. Override the
+# generic tool rule to include the blob in its link line.
+$(PREFIX)/tools/mkrd.efi: $(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ) \
+                         $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+	$(call LINK_EFI_APP,$(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ),$@)
 
 $(PREFIX)/tools:
 	@mkdir -p $@

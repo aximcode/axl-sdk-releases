@@ -402,15 +402,11 @@ show_smbios_info(void)
             axl_printf("  Family:       %s\n",
                        axl_smbios_get_string_utf8(hdr, raw[0x1A]));
 
-            /* UUID at offset 0x08 (16 bytes) */
-            uint8_t *uuid = raw + 0x08;
-            axl_printf("  UUID:         "
-                       "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
-                       "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
-                       uuid[3], uuid[2], uuid[1], uuid[0],
-                       uuid[5], uuid[4], uuid[7], uuid[6],
-                       uuid[8], uuid[9], uuid[10], uuid[11],
-                       uuid[12], uuid[13], uuid[14], uuid[15]);
+            /* UUID at offset 0x08 (16 bytes) — apply SMBIOS §7.2.1
+               mixed-endian field-order swap. */
+            char uuid_str[37];
+            axl_smbios_format_uuid(raw + 0x08, uuid_str);
+            axl_printf("  UUID:         %s\n", uuid_str);
         }
     }
 

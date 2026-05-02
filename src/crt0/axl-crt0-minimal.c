@@ -14,7 +14,7 @@
  *
  *   - Set the firmware globals (gST, gBS, gRT, gImageHandle) so
  *     any AXL call the app does make works.
- *   - Initialize the stdout/stderr file handles via axl_io_init so
+ *   - Initialize the stdout/stderr file handles via axl_stream_init so
  *     axl_printf / axl_error work as expected.
  *   - Parse argv from the UEFI shell's image load options via
  *     _axl_args_init / _axl_get_args, so `int main(argc, argv)`
@@ -53,7 +53,7 @@ void _axl_args_init(void *image_handle);
 void _axl_get_args(int *argc, char ***argv);
 void _axl_args_free(void);
 
-void axl_io_init(void);
+void axl_stream_init(void);
 
 #ifdef AXL_MEM_DEBUG
 void axl_mem_dump_leaks(void);
@@ -73,7 +73,7 @@ _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     gBS = SystemTable->BootServices;
     gRT = SystemTable->RuntimeServices;
 
-    axl_io_init();
+    axl_stream_init();
     _axl_args_init(ImageHandle);
 
     int argc;

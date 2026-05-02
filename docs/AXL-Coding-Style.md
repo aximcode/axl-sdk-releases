@@ -83,7 +83,7 @@ interop (e.g., drivers using `<uefi/axl-uefi.h>`).
 
 | Element | Convention | Example |
 |---------|-----------|---------|
-| Source files | `axl-<module>.c` | `axl-mem.c`, `axl-io-buf.c` |
+| Source files | `axl-<module>.c` | `axl-mem.c`, `axl-stream-buf.c` |
 | Public headers | `axl/axl-<module>.h` | `axl/axl-log.h`, `axl/axl-str.h` |
 | Internal headers | `axl-<module>-internal.h` | `axl-format-internal.h` |
 | Umbrella header | `axl.h` | `#include <axl.h>` |
@@ -419,5 +419,5 @@ AXL's own internals use the AXL API:
 - Build strings with `axl_string`
 - Use `axl_strlcpy`/`axl_strlcat` for bounded copies
 
-Exception: code that runs before `axl_io_init()` (e.g. very early
+Exception: code that runs before `axl_stream_init()` (e.g. very early
 allocator errors) may use EDK2 primitives as a fallback.

@@ -25,11 +25,13 @@
 // Compiler attributes
 // ---------------------------------------------------------------------------
 
-/** Mark a return value as must-use (GLib: G_GNUC_WARN_UNUSED_RESULT). */
-#define AXL_WARN_UNUSED  __attribute__((warn_unused_result))
+/** Mark a return value as must-use (GLib: G_GNUC_WARN_UNUSED_RESULT).
+    Expands to the C23 `[[nodiscard]]` attribute; the project requires
+    `-std=gnu2x` (gcc 13+). */
+#define AXL_WARN_UNUSED  [[nodiscard]]
 
-/** Mark a function as never returning (C11 _Noreturn equivalent). */
-#define AXL_NORETURN     __attribute__((noreturn))
+/** Mark a function as never returning. C23 `[[noreturn]]`. */
+#define AXL_NORETURN     [[noreturn]]
 
 // ---------------------------------------------------------------------------
 // Autoptr (GLib: g_autoptr)

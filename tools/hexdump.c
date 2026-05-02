@@ -8,7 +8,11 @@
       axl-cc Hexdump.c -o Hexdump.efi
 
     Usage:
-      Hexdump.efi [-o offset] [-n length] [-v] [-h|-?] file
+      Hexdump.efi [-o offset] [-n length] [-v] [-h|-?] [file]
+
+    With no file argument, reads from stdin — works as the right-hand
+    side of a UEFI Shell pipe (`some-tool | Hexdump.efi`) on shells
+    that publish EFI_SHELL_PARAMETERS_PROTOCOL.
 **/
 
 #include <axl.h>
@@ -24,8 +28,8 @@ static const AxlArgDesc flags[] = {
 };
 
 static const AxlArgDesc positional[] = {
-    { .name = "file", .type = AXL_ARG_STRING, .required = true,
-      .help = "Path to the file to dump" },
+    { .name = "file", .type = AXL_ARG_STRING,
+      .help = "Path to the file to dump (omit to read from stdin)" },
     {0}
 };
 
@@ -65,6 +69,55 @@ print_hex_line(
 }
 
 static int
+run_hexdump_stdin(uint64_t offset, uint64_t length,
+                  bool has_length, bool verbose)
+{
+    /* Sequential read from axl_stdin — no seek, no pread. The caller's
+       --offset is honored by reading and discarding `offset` bytes
+       first; --length caps total bytes dumped. */
+    if (verbose) {
+        axl_printf("File:   <stdin>\n");
+        if (offset > 0) {
+            axl_printf("Offset: %llu (skipped before dumping)\n",
+                       (unsigned long long)offset);
+        }
+        if (has_length) {
+            axl_printf("Dump:   up to %llu bytes\n\n",
+                       (unsigned long long)length);
+        } else {
+            axl_printf("Dump:   until EOF\n\n");
+        }
+    }
+
+    /* Skip `offset` bytes by reading and discarding. */
+    uint8_t skip_buf[256];
+    while (offset > 0) {
+        size_t want = (offset < sizeof(skip_buf)) ? (size_t)offset
+                                                  : sizeof(skip_buf);
+        axl_ssize_t got = axl_read(axl_stdin, skip_buf, want);
+        if (got <= 0) break;
+        offset -= (uint64_t)got;
+    }
+
+    /* Dump 16 bytes at a time until EOF or length cap. */
+    uint8_t  buf[16];
+    uint64_t bytes_dumped = 0;
+    /* stdin doesn't have meaningful absolute offsets like a file does;
+       address shown is just the position within the dumped region. */
+    while (!has_length || bytes_dumped < length) {
+        size_t want = 16;
+        if (has_length && bytes_dumped + want > length) {
+            want = (size_t)(length - bytes_dumped);
+        }
+        axl_ssize_t got = axl_read(axl_stdin, buf, want);
+        if (got <= 0) break;
+        print_hex_line(bytes_dumped, buf, (size_t)got);
+        bytes_dumped += (uint64_t)got;
+    }
+    return 0;
+}
+
+static int
 run_hexdump(AxlArgs *a)
 {
     AxlStream  *file;
@@ -80,6 +133,9 @@ run_hexdump(AxlArgs *a)
     has_length = (axl_args_get_string(a, "length") != NULL);
 
     const char *path = axl_args_get_string(a, "file");
+    if (path == NULL) {
+        return run_hexdump_stdin(offset, length, has_length, verbose);
+    }
 
     /* Get file size */
     file_size = 0;

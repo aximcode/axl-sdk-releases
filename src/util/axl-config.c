@@ -11,7 +11,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-hash-table.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("config");
@@ -156,8 +156,8 @@ auto_apply(void *target, const AxlConfigDesc *desc, const char *value)
          * AARCH64). The static assert means we can map `int` and
          * `int32_t` paths to the same axl_str_to_s32 call without the
          * runtime guard the previous version had. */
-        _Static_assert(sizeof(int) == sizeof(int32_t),
-                       "AXL assumes sizeof(int) == 4");
+        static_assert(sizeof(int) == sizeof(int32_t),
+                      "AXL assumes sizeof(int) == 4");
         int64_t v;
         if (width == sizeof(int32_t)) {
             int32_t v32;

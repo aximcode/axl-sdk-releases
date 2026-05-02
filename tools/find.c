@@ -39,8 +39,8 @@ static const AxlArgDesc positional[] = {
 
 static void
 print_entry(
-    const char    *path,
-    AxlDirEntry   *entry
+    const char        *path,
+    const AxlDirEntry *entry
     )
 {
     if (verbose) {
@@ -58,99 +58,67 @@ print_entry(
 // Recursive directory walker
 // ---------------------------------------------------------------------------
 
+typedef struct {
+    const char *name_pattern;
+    char        type_filter;
+    size_t      count;
+} FindCtx;
+
+static int
+find_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+{
+    FindCtx *c = (FindCtx *)user;
+
+    bool type_ok = (c->type_filter == '\0')
+                || (c->type_filter == 'f' && !entry->is_dir)
+                || (c->type_filter == 'd' && entry->is_dir);
+
+    bool name_ok = (c->name_pattern == NULL)
+                || axl_fnmatch(c->name_pattern, entry->name);
+
+    if (type_ok && name_ok) {
+        print_entry(full_path, entry);
+        c->count++;
+    }
+    return 0;
+}
+
 static size_t
 find_walk(
     const char *base_path,
     const char *name_pattern,
-    char        type_filter,
-    size_t      depth
+    char        type_filter
     )
 {
-    size_t count = 0;
-
-    if (depth >= MAX_WALK_DEPTH) {
-        if (verbose) {
-            axl_printf("Find: max directory depth reached at '%s'\n",
-                       base_path);
-        }
-        return 0;
-    }
-
-    /* If base_path is a file (not a directory), check if it matches */
+    /* Single-file argument: match against the supplied path directly,
+       with no directory descent. */
     if (!axl_file_is_dir(base_path)) {
-        if (type_filter == '\0' || type_filter == 'f') {
-            const char *name = base_path;
-            for (const char *p = base_path; *p != '\0'; p++) {
-                if (*p == '/' || *p == '\\') {
-                    name = p + 1;
-                }
-            }
-            if (name_pattern == NULL || axl_fnmatch(name_pattern, name)) {
-                AxlDirEntry de;
-                axl_memset(&de, 0, sizeof(de));
-                de.is_dir = false;
-                axl_strlcpy(de.name, name, sizeof(de.name));
-                AxlFileInfo fi;
-                if (axl_file_info(base_path, &fi) == 0) {
-                    de.size = fi.size;
-                }
-                print_entry(base_path, &de);
-                count++;
-            }
+        if (type_filter != '\0' && type_filter != 'f') return 0;
+        const char *name = base_path;
+        for (const char *p = base_path; *p != '\0'; p++) {
+            if (*p == '/' || *p == '\\') name = p + 1;
         }
-        return count;
+        if (name_pattern != NULL && !axl_fnmatch(name_pattern, name)) {
+            return 0;
+        }
+        AxlDirEntry de = { .is_dir = false };
+        axl_strlcpy(de.name, name, sizeof(de.name));
+        AxlFileInfo fi;
+        if (axl_file_info(base_path, &fi) == 0) de.size = fi.size;
+        print_entry(base_path, &de);
+        return 1;
     }
 
-    /* Open directory */
-    AxlDir *dir = axl_dir_open(base_path);
-    if (dir == NULL) {
-        axl_printf("Find: cannot open '%s'\n", base_path);
-        return 0;
+    FindCtx ctx = {
+        .name_pattern = name_pattern,
+        .type_filter  = type_filter,
+        .count        = 0,
+    };
+    if (axl_dir_walk(base_path, find_walk_cb, &ctx, MAX_WALK_DEPTH) != 0
+        && verbose) {
+        axl_printf("Find: walk of '%s' did not complete cleanly\n", base_path);
     }
-
-    AxlDirEntry entry;
-    while (axl_dir_read(dir, &entry)) {
-        /* Skip . and .. */
-        if (axl_strcmp(entry.name, ".") == 0 ||
-            axl_strcmp(entry.name, "..") == 0) {
-            continue;
-        }
-
-        /* Build full path */
-        char full_path[512];
-        size_t base_len = axl_strlen(base_path);
-        if (base_len > 0 && (base_path[base_len - 1] == '/' ||
-                             base_path[base_len - 1] == '\\')) {
-            axl_snprintf(full_path, sizeof(full_path), "%s%s",
-                         base_path, entry.name);
-        } else {
-            axl_snprintf(full_path, sizeof(full_path), "%s/%s",
-                         base_path, entry.name);
-        }
-
-        /* Check type filter */
-        bool type_ok = (type_filter == '\0') ||
-                       (type_filter == 'f' && !entry.is_dir) ||
-                       (type_filter == 'd' && entry.is_dir);
-
-        /* Check name pattern */
-        bool name_ok = (name_pattern == NULL) ||
-                       axl_fnmatch(name_pattern, entry.name);
-
-        if (type_ok && name_ok) {
-            print_entry(full_path, &entry);
-            count++;
-        }
-
-        /* Recurse into subdirectories */
-        if (entry.is_dir) {
-            count += find_walk(full_path, name_pattern, type_filter,
-                               depth + 1);
-        }
-    }
-
-    axl_dir_close(dir);
-    return count;
+    return ctx.count;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,8 +147,7 @@ run_find(AxlArgs *a)
         start_path = ".";
     }
 
-    size_t match_count = find_walk(start_path, name_pattern,
-                                   type_filter, 0);
+    size_t match_count = find_walk(start_path, name_pattern, type_filter);
 
     if (verbose) {
         axl_printf("\n%zu match(es) found.\n", match_count);

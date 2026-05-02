@@ -9,7 +9,8 @@
 #include <axl/axl-diag.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-format.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-path.h>
 #include <axl/axl-str.h>

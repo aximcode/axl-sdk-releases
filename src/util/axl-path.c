@@ -10,6 +10,9 @@
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-fs.h>
+#include <axl/axl-app.h>
 AXL_LOG_DOMAIN("path");
 
 #define MAX_COMPONENTS  64
@@ -149,6 +152,41 @@ axl_path_companion(const char *anchor, const char *name)
     char *result = axl_path_join(dir, name);
     axl_free(dir);
     return result;
+}
+
+/* Helper: returns true if @p path names an existing readable file. */
+static bool
+path_file_exists(const char *path)
+{
+    AxlFileInfo fi;
+    return path != NULL && axl_file_info(path, &fi) == 0 && !fi.is_dir;
+}
+
+char *
+axl_resolve_data_file(const char *override_path, const char *name)
+{
+    if (name == NULL) {
+        return NULL;
+    }
+
+    /* 1. Explicit override wins. */
+    if (path_file_exists(override_path)) {
+        return axl_strdup(override_path);
+    }
+
+    /* 2. Companion file beside the running binary. */
+    char *companion = axl_path_companion(axl_app_argv0(), name);
+    if (path_file_exists(companion)) {
+        return companion;
+    }
+    axl_free(companion);
+
+    /* 3. Bare name (current working directory). */
+    if (path_file_exists(name)) {
+        return axl_strdup(name);
+    }
+
+    return NULL;
 }
 
 char *

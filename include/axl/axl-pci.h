@@ -191,18 +191,18 @@ axl_pci_get_vid_did(
  * @return 0 on success, -1 on bus error.
  */
 int
-axl_pci_get_class24(
+axl_pci_get_class_code(
     AxlPciAddr   addr,    ///< target function
-    uint32_t    *class24  ///< [out] 24-bit class code
+    uint32_t    *class_code  ///< [out] 24-bit class code
 );
 
 /**
  * @brief Format a 24-bit PCI class code as a human-readable string.
  *
  * Decodes per the PCI Code and ID Assignment Specification — three
- * tiers: base class (`(class24 >> 16) & 0xFF`), subclass
- * (`(class24 >> 8) & 0xFF`), and programming interface
- * (`class24 & 0xFF`). Output shape: `"<base> / <sub> / <prog>"`
+ * tiers: base class (`(class_code >> 16) & 0xFF`), subclass
+ * (`(class_code >> 8) & 0xFF`), and programming interface
+ * (`class_code & 0xFF`). Output shape: `"<base> / <sub> / <prog>"`
  * (e.g. `"Display controller / VGA-compatible / standard"`); a tier
  * with no recognized name renders as `"<unknown>"`. Always
  * NUL-terminates @p buf (snprintf-shape).
@@ -215,7 +215,7 @@ axl_pci_get_class24(
  */
 int
 axl_pci_class_string(
-    uint32_t   class24,   ///< 24-bit class code
+    uint32_t   class_code,   ///< 24-bit class code
     char      *buf,       ///< destination buffer
     size_t     buflen     ///< capacity of @p buf
 );
@@ -269,7 +269,7 @@ axl_pci_find_by_vid_did(
  */
 int
 axl_pci_find_by_class(
-    uint32_t     class24,   ///< 24-bit class code
+    uint32_t     class_code,   ///< 24-bit class code
     uint16_t     nth,       ///< 0-based match index
     AxlPciAddr  *out        ///< [out] address of the matching function
 );

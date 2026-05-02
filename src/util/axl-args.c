@@ -30,7 +30,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-array.h>
-#include <axl/axl-io.h>
+#include <axl/axl-stream.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("args");

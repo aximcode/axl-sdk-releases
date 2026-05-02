@@ -85,12 +85,9 @@ process_chunked_data(
         size_t chunk_size = 0;
         for (size_t i = line_start; i < line_end; i++) {
             char ch = buf[i];
-            if (ch >= '0' && ch <= '9') {
-                chunk_size = chunk_size * 16 + (ch - '0');
-            } else if (ch >= 'a' && ch <= 'f') {
-                chunk_size = chunk_size * 16 + (ch - 'a' + 10);
-            } else if (ch >= 'A' && ch <= 'F') {
-                chunk_size = chunk_size * 16 + (ch - 'A' + 10);
+            int  v  = axl_hex_nibble(ch);
+            if (v >= 0) {
+                chunk_size = chunk_size * 16 + (size_t)v;
             } else if (ch == ';') {
                 break;  // chunk extensions — ignore
             }

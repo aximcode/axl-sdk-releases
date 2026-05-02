@@ -48,7 +48,7 @@ distributable. No external dependencies — no EDK2, no gnu-efi.
 │    _AxlEntry → _axl_init → main → cleanup   │
 ├─────────────────────────────────────────────┤
 │  libaxl.a (static library)                  │
-│    AxlMem, AxlLog, AxlData, AxlIO,          │
+│    AxlMem, AxlLog, AxlData, AxlStream, AxlFs,          │
 │    AxlFormat, AxlLoop, AxlTask, AxlNet,     │
 │    AxlRuntime (lifecycle services), …       │
 ├─────────────────────────────────────────────┤

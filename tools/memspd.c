@@ -94,19 +94,13 @@ load_jedec_table_from_args(
     if (g_jedec != NULL) {
         return;
     }
-    const char *override_path = axl_args_get_string(a, "jedec-file");
-    if (override_path != NULL && try_load_jedec(override_path)) {
-        return;
+    char *resolved = axl_resolve_data_file(
+        axl_args_get_string(a, "jedec-file"),
+        "jedec.json5");
+    if (resolved != NULL) {
+        (void)try_load_jedec(resolved);
+        axl_free(resolved);
     }
-    char *companion = axl_path_companion(axl_app_argv0(), "jedec.json5");
-    if (companion != NULL) {
-        bool loaded = try_load_jedec(companion);
-        axl_free(companion);
-        if (loaded) {
-            return;
-        }
-    }
-    (void)try_load_jedec("jedec.json5");
 }
 
 static const char *
