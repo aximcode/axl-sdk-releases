@@ -180,6 +180,8 @@ LIB_SOURCES = \
     src/smbios/axl-smbios.c \
     src/acpi/axl-acpi.c \
     src/pci/axl-pci.c \
+    src/pci/axl-pci-ids.c \
+    src/pci/axl-pci-class.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
@@ -711,7 +713,7 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)

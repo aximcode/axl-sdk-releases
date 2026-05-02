@@ -35,6 +35,30 @@ for app in "${TEST_APPS[@]}"; do
     test_add_efi "$NATIVE_DIR/$app.efi"
 done
 
+# Stage the curated PCI vendor/device database next to the EFIs so
+# AxlTestPlatform's pci-ids loader tests find it via the standard
+# axl_resolve_data_file companion-path lookup. Without this, tests
+# would only exercise the "no database loaded" code path.
+PCI_IDS_FILE="$PROJECT_DIR/share/pci-ids.json5"
+if [[ -f "$PCI_IDS_FILE" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$PCI_IDS_FILE" "$TEST_STAGING/pci-ids.json5"
+fi
+PCI_CLASS_FILE="$PROJECT_DIR/share/pci-class.json5"
+if [[ -f "$PCI_CLASS_FILE" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$PCI_CLASS_FILE" "$TEST_STAGING/pci-class.json5"
+fi
+
+# Stage a deliberately-malformed fixture so the load -1 vs -2 test
+# can prove parse failures distinguish from missing-file failures.
+mkdir -p "$TEST_STAGING"
+cat > "$TEST_STAGING/pci-ids-malformed.json5" <<'EOF'
+@@@ deliberately invalid — no token here is valid JSON5 so parse fails
+unambiguously even with JSON5's permissive grammar (no unquoted-identifier
+key escape, no value-position bareword that could partial-parse).
+EOF
+
 # Startup script: init network, then run each test app.
 #
 # Per-binary timing is extracted host-side from the `=== NAME Tests ===`

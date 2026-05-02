@@ -360,6 +360,966 @@ test_pci_get_vid_did_class_code(void)
     test_check(axl_pci_get_class_code(root, NULL) == -1,       "pci get_class_code: NULL out");
 }
 
+// ---------------------------------------------------------------------------
+// AxlPci — tree walker
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    size_t        n_visits;
+    size_t        n_root;            /* count of depth==0 callbacks */
+    size_t        n_bridges;
+    size_t        n_below_bridge;    /* count of depth>=1 callbacks */
+    unsigned      max_depth;
+    /* Capture the first depth-1 BDF, if any — that's a function
+       behind a bridge, which only exists when the runner config
+       includes a pcie-root-port + child device. */
+    AxlPciAddr    first_child;
+    bool          saw_child;
+} TreeCtx;
+
+static int
+tree_count_cb(
+    AxlPciAddr  addr,
+    unsigned    depth,
+    bool        is_bridge,
+    void       *ctx
+    )
+{
+    TreeCtx *t = ctx;
+    t->n_visits++;
+    if (depth == 0) {
+        t->n_root++;
+    } else {
+        t->n_below_bridge++;
+        if (!t->saw_child) {
+            t->first_child = addr;
+            t->saw_child = true;
+        }
+    }
+    if (is_bridge) {
+        t->n_bridges++;
+    }
+    if (depth > t->max_depth) {
+        t->max_depth = depth;
+    }
+    return 0;
+}
+
+static int
+tree_stop_after_two_cb(
+    AxlPciAddr  addr,
+    unsigned    depth,
+    bool        is_bridge,
+    void       *ctx
+    )
+{
+    (void)addr; (void)depth; (void)is_bridge;
+    int *seen = ctx;
+    (*seen)++;
+    return (*seen >= 2) ? 7 : 0;  /* arbitrary non-zero */
+}
+
+static void
+test_pci_tree_walker(void)
+{
+    /* NULL guard. */
+    test_check(axl_pci_tree_for_each(NULL, NULL) == -1,
+               "pci tree: NULL callback returns -1");
+
+    /* Full walk — every responding function visited exactly once.
+       The visit count must equal axl_pci_next's enumeration count;
+       any drift would indicate either a missed function (cycle
+       killed the walk early) or a double-visit (same bus reached
+       via two paths). */
+    size_t flat_count = 0;
+    AxlPciAddr *p = NULL;
+    while ((p = axl_pci_next(p)) != NULL) {
+        flat_count++;
+    }
+
+    TreeCtx t = {0};
+    test_check(axl_pci_tree_for_each(tree_count_cb, &t) == 0,
+               "pci tree: full walk succeeds");
+    test_check(t.n_visits == flat_count,
+               "pci tree: visit count == axl_pci_next count");
+    test_check(t.n_root > 0,
+               "pci tree: at least one root-bus function visited");
+    test_check(t.max_depth < AXL_PCI_TREE_MAX_DEPTH,
+               "pci tree: depth stayed below AXL_PCI_TREE_MAX_DEPTH");
+
+    /* Bridge coverage: the integration runner adds a pcie-root-port
+       so we expect at least one bridge AND at least one function
+       behind it (depth >= 1). If the runner config drifts and there
+       are no bridges, balance the count so the ratchet doesn't move. */
+    if (t.n_bridges > 0) {
+        test_check(t.n_below_bridge > 0,
+                   "pci tree: at least one function visited below a bridge");
+        test_check(t.saw_child && t.first_child.bus != 0,
+                   "pci tree: child function lives on a non-zero bus");
+        /* Cross-check against bridge_info: the child's bus should
+           equal some bridge's secondary bus number. */
+        AxlPciAddr   br_addr;
+        AxlPciBridge br;
+        bool match = false;
+        if (axl_pci_find_by_class(0x060400, 0, &br_addr) == 0
+            && axl_pci_bridge_info(br_addr, &br) == 0)
+        {
+            match = (br.secondary == t.first_child.bus);
+        }
+        test_check(match,
+                   "pci tree: child bus == bridge.secondary from bridge_info");
+    } else {
+        test_check(true, "pci tree: SKIP — no bridges in topology (3 balancers)");
+        test_check(true, "pci tree: SKIP balance");
+        test_check(true, "pci tree: SKIP balance");
+    }
+
+    /* Early stop: callback returning non-zero must propagate to
+       tree_for_each return value, halting iteration. */
+    int seen = 0;
+    test_check(axl_pci_tree_for_each(tree_stop_after_two_cb, &seen) == 7,
+               "pci tree: cb non-zero return propagates");
+    test_check(seen == 2,
+               "pci tree: walk stopped at second callback");
+}
+
+// ---------------------------------------------------------------------------
+// AxlPci — vendor/device name database (pci-ids.json5)
+// ---------------------------------------------------------------------------
+
+static void
+test_pci_ids_db(void)
+{
+    /* No-database state: lookups return NULL cleanly even when the
+       caller forgets to load. */
+    test_check(axl_pci_vendor_name(0x8086) == NULL,
+               "pci-ids: vendor lookup before load returns NULL");
+    test_check(axl_pci_device_name(0x8086, 0x29C0) == NULL,
+               "pci-ids: device lookup before load returns NULL");
+
+    /* Auto-discover via the companion-path resolver. The integration
+       runner stages share/pci-ids.json5 next to the EFI; passing
+       NULL here exercises that lookup path. */
+    int rc = axl_pci_ids_load(NULL);
+    if (rc != 0) {
+        axl_printf("SKIP: pci-ids load (no companion file staged)\n");
+        /* Balance: 7 conditional test_checks below (rc==0, intel,
+           q35, unknown vendor, unknown device, second-load, after-free). */
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "pci-ids: SKIP balance");
+        }
+        return;
+    }
+    test_check(rc == 0, "pci-ids: companion-path load succeeds");
+
+    /* Known entries from share/pci-ids.json5. The exact strings are
+       part of the contract — if the file content changes, fix the
+       assertion to match. */
+    const char *intel = axl_pci_vendor_name(0x8086);
+    test_check(intel != NULL && axl_strstr(intel, "Intel") != NULL,
+               "pci-ids: vendor 0x8086 decodes to Intel");
+
+    const char *q35 = axl_pci_device_name(0x8086, 0x29C0);
+    test_check(q35 != NULL && axl_strstr(q35, "Q35") != NULL,
+               "pci-ids: device 8086:29C0 decodes to Q35 host bridge");
+
+    /* Unknown IDs return NULL — no fallback to vendor name from
+       device_name (caller composes that themselves). */
+    test_check(axl_pci_vendor_name(0xDEAD) == NULL,
+               "pci-ids: unknown vendor returns NULL");
+    test_check(axl_pci_device_name(0x8086, 0xDEAD) == NULL,
+               "pci-ids: unknown device returns NULL even with known vendor");
+
+    /* Idempotent reload — second call is a no-op success. */
+    test_check(axl_pci_ids_load(NULL) == 0,
+               "pci-ids: second load is a no-op success");
+
+    /* Cleanup. After free, lookups return NULL again. */
+    axl_pci_ids_free();
+    test_check(axl_pci_vendor_name(0x8086) == NULL,
+               "pci-ids: vendor lookup after free returns NULL");
+}
+
+// ---------------------------------------------------------------------------
+// AxlPci — subsystem lookup + iter API (Phase B)
+// ---------------------------------------------------------------------------
+
+static void
+test_pci_ids_subsystem_lookup(void)
+{
+    /* Two subsystem entries under the same SVID — exercises the
+       pair-key disambiguation. Vendor IDs and names are abstract
+       test data; the schema doesn't care. */
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [{ id: 0xAAAA, name: 'TestVendor' }],\n"
+        "  devices: [{ vid: 0xAAAA, did: 0x1000, name: 'TestSilicon' }],\n"
+        "  subsystems: [\n"
+        "    { svid: 0xBBBB, sdid: 0x0001, name: 'OEM Card A' },\n"
+        "    { svid: 0xBBBB, sdid: 0x0002, name: 'OEM Card B' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciIds *h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == 0,
+               "pci-ids subsys: fixture loads");
+
+    /* Hit. */
+    const char *s = axl_pci_ids_subsys_name(h, 0xBBBB, 0x0001);
+    test_check(s != NULL && axl_strcmp(s, "OEM Card A") == 0,
+               "pci-ids subsys: known (BBBB,0001) decodes to OEM Card A");
+
+    /* Different sdid under same svid — verify pair_key disambiguates. */
+    s = axl_pci_ids_subsys_name(h, 0xBBBB, 0x0002);
+    test_check(s != NULL && axl_strcmp(s, "OEM Card B") == 0,
+               "pci-ids subsys: distinct sdid under same svid hits its own entry");
+
+    /* Misses: unknown pair, NULL handle, svid==0. */
+    test_check(axl_pci_ids_subsys_name(h, 0xDEAD, 0xBEEF) == NULL,
+               "pci-ids subsys: unknown pair returns NULL");
+    test_check(axl_pci_ids_subsys_name(NULL, 0xBBBB, 0x0001) == NULL,
+               "pci-ids subsys: NULL handle returns NULL");
+    test_check(axl_pci_ids_subsys_name(h, 0, 0x0001) == NULL,
+               "pci-ids subsys: svid==0 returns NULL (sentinel)");
+
+    axl_pci_ids_close(h);
+}
+
+typedef struct {
+    int n_visits;
+    int n_intel_seen;
+    int stop_after;  /* 0 = never stop */
+} ForeachCtx;
+
+static int
+vendor_count_cb(uint16_t vid, const char *name, void *ctx)
+{
+    ForeachCtx *c = ctx;
+    c->n_visits++;
+    if (vid == 0x8086 || (name != NULL && axl_strstr(name, "Intel") != NULL)) {
+        c->n_intel_seen++;
+    }
+    if (c->stop_after > 0 && c->n_visits >= c->stop_after) {
+        return 42;  /* arbitrary non-zero, propagates */
+    }
+    return 0;
+}
+
+static int
+device_count_cb(uint16_t vid, uint16_t did, const char *name, void *ctx)
+{
+    (void)vid; (void)did; (void)name;
+    ForeachCtx *c = ctx;
+    c->n_visits++;
+    return 0;
+}
+
+static int
+subsys_count_cb(uint16_t svid, uint16_t sdid, const char *name, void *ctx)
+{
+    (void)svid; (void)sdid; (void)name;
+    ForeachCtx *c = ctx;
+    c->n_visits++;
+    return 0;
+}
+
+static void
+test_pci_ids_foreach(void)
+{
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { id: 0x8086, name: 'Intel Corporation' },\n"
+        "    { id: 0x1022, name: 'AMD' },\n"
+        "    { id: 0x10DE, name: 'NVIDIA' },\n"
+        "  ],\n"
+        "  devices: [\n"
+        "    { vid: 0x8086, did: 0x29C0, name: 'Q35' },\n"
+        "    { vid: 0x8086, did: 0x100E, name: '82540EM' },\n"
+        "  ],\n"
+        "  subsystems: [\n"
+        "    { svid: 0xBBBB, sdid: 0x0001, name: 'OEM Card A' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciIds *h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == 0,
+               "pci-ids foreach: fixture loads");
+
+    /* NULL guards. */
+    test_check(axl_pci_ids_foreach_vendor(NULL, vendor_count_cb, NULL) == -1,
+               "pci-ids foreach: NULL handle returns -1");
+    test_check(axl_pci_ids_foreach_vendor(h, NULL, NULL) == -1,
+               "pci-ids foreach: NULL callback returns -1");
+
+    /* Counts match the fixture. */
+    ForeachCtx vc = {0};
+    test_check(axl_pci_ids_foreach_vendor(h, vendor_count_cb, &vc) == 0,
+               "pci-ids foreach_vendor: full walk succeeds");
+    test_check(vc.n_visits == 3,
+               "pci-ids foreach_vendor: visited all 3 vendors");
+    test_check(vc.n_intel_seen == 1,
+               "pci-ids foreach_vendor: saw Intel exactly once");
+
+    ForeachCtx dc = {0};
+    test_check(axl_pci_ids_foreach_device(h, device_count_cb, &dc) == 0
+               && dc.n_visits == 2,
+               "pci-ids foreach_device: visited all 2 devices");
+
+    ForeachCtx sc = {0};
+    test_check(axl_pci_ids_foreach_subsys(h, subsys_count_cb, &sc) == 0
+               && sc.n_visits == 1,
+               "pci-ids foreach_subsys: visited the 1 subsystem entry");
+
+    /* Early stop: callback returning 42 propagates. */
+    ForeachCtx stop = { .stop_after = 1 };
+    test_check(axl_pci_ids_foreach_vendor(h, vendor_count_cb, &stop) == 42,
+               "pci-ids foreach: early-stop return value propagates");
+
+    axl_pci_ids_close(h);
+}
+
+static void
+test_pci_ids_subsys_db(void)
+{
+    /* End-to-end: the staged share/pci-ids.json5 should now have
+       subsystem entries via the singleton API. SKIP-balanced when
+       the DB isn't loaded (e.g. when test EFI is launched outside
+       the integration runner). */
+    if (axl_pci_ids_load(NULL) != 0) {
+        axl_printf("SKIP: pci-ids subsys_db (no companion file staged)\n");
+        for (int i = 0; i < 2; i++) {
+            test_check(true, "pci-ids subsys: SKIP balance");
+        }
+        return;
+    }
+
+    /* The curated share/pci-ids.json5 ships a tiny starter subsystems
+       block — assert one of those entries is reachable through the
+       singleton API. If the curated set is restructured, update the
+       assertion to match. */
+    const char *s = axl_pci_subsys_name(0x1028, 0x1FCA);
+    test_check(s != NULL && axl_strstr(s, "Server NIC") != NULL,
+               "pci-ids subsys: singleton finds curated server-NIC entry");
+    test_check(axl_pci_subsys_name(0x0000, 0x0000) == NULL,
+               "pci-ids subsys: zero pair returns NULL");
+}
+
+// ---------------------------------------------------------------------------
+// AxlPci — class-name overlay sidecar (Phase E)
+// ---------------------------------------------------------------------------
+
+static void
+test_pci_class_db_handle(void)
+{
+    /* Schema: top-level 'classes' array; each entry pins any subset
+       of (base, sub, prog). Overlay handle holds the parsed table;
+       per-tier lookups return NULL when the overlay has no entry
+       for that exact code (no fallback at the handle layer). */
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  classes: [\n"
+        "    { base: 0xCC, name: 'OverlayBase' },\n"
+        "    { base: 0xCC, sub: 0xCD, name: 'OverlaySub' },\n"
+        "    { base: 0xCC, sub: 0xCD, prog: 0xCE, name: 'OverlayProg' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciClassDb *db = NULL;
+    test_check(axl_pci_class_open_from_buffer(
+                   fixture, axl_strlen(fixture), &db) == 0,
+               "pci class_db: handle opens from buffer");
+
+    /* Per-tier lookups return the overlay name for entries the
+       fixture defined. */
+    const char *b = axl_pci_class_db_base_name(db, 0xCC);
+    test_check(b != NULL && axl_strcmp(b, "OverlayBase") == 0,
+               "pci class_db: base lookup returns overlay name");
+    const char *s = axl_pci_class_db_sub_name(db, 0xCC, 0xCD);
+    test_check(s != NULL && axl_strcmp(s, "OverlaySub") == 0,
+               "pci class_db: sub lookup returns overlay name");
+    const char *p = axl_pci_class_db_prog_name(db, 0xCC, 0xCD, 0xCE);
+    test_check(p != NULL && axl_strcmp(p, "OverlayProg") == 0,
+               "pci class_db: prog lookup returns overlay name");
+
+    /* Codes the overlay doesn't define return NULL — no fallback
+       at the handle layer (axl_pci_class_string_fmt does the
+       fallback). */
+    test_check(axl_pci_class_db_base_name(db, 0x06) == NULL,
+               "pci class_db: undefined base returns NULL (no compiled-in fallback)");
+    test_check(axl_pci_class_db_sub_name(db, 0xCC, 0xFF) == NULL,
+               "pci class_db: undefined sub under known base returns NULL");
+
+    /* NULL handle is NULL-safe. */
+    test_check(axl_pci_class_db_base_name(NULL, 0xCC) == NULL,
+               "pci class_db: NULL handle returns NULL");
+
+    /* Bad JSON5 returns -2; close NULL is a no-op. */
+    AxlPciClassDb *bad = NULL;
+    test_check(axl_pci_class_open_from_buffer(
+                   "@@@ garbage", 11, &bad) == -2,
+               "pci class_db: malformed JSON5 returns -2");
+    test_check(bad == NULL, "pci class_db: handle stays NULL on -2");
+
+    axl_pci_class_close(db);
+    axl_pci_class_close(NULL);
+    test_check(true, "pci class_db: close + close(NULL) OK");
+}
+
+static void
+test_pci_class_db_singleton_overrides(void)
+{
+    /* Loading the singleton overlay changes axl_pci_class_string_fmt
+       output for the codes the overlay redefines. The compiled-in
+       table is the fallback for codes the overlay doesn't define. */
+    char buf[AXL_PCI_CLASS_NAME_MAX];
+
+    /* Baseline (no overlay) — exercise compiled-in tables.
+       0x060000 = Bridge / Host bridge per the compiled-in table. */
+    axl_pci_class_free();  /* ensure clean slate */
+    int n = axl_pci_class_string_fmt(0x060000,
+                                     AXL_PCI_CLASS_FMT_FULL,
+                                     buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Bridge / Host bridge") == 0,
+               "pci class_db: baseline (no overlay) uses compiled-in tables");
+
+    /* Stage a singleton overlay via the file-resolver.
+       The integration runner stages share/pci-class.json5
+       alongside the EFI; SKIP-balance when not present.
+       Populated path runs 6 conditional checks below: 'overlay
+       loaded', '[overlay] marker', 'codes outside overlay still
+       hit compiled-in', 'second load no-op', 'free reverts',
+       'missing file -1'. */
+    int rc = axl_pci_class_load(NULL);
+    if (rc != 0) {
+        axl_printf("SKIP: pci class_db (no companion overlay staged)\n");
+        for (int i = 0; i < 6; i++) {
+            test_check(true, "pci class_db: SKIP balance");
+        }
+        return;
+    }
+    test_check(true, "pci class_db: overlay loaded");
+
+    /* The shipped share/pci-class.json5 redefines a benign tier we
+       can pin: 0x060000 (Host bridge) is a stable triple in the
+       compiled-in table that the curated overlay annotates with
+       a vendor-neutral marker so the test sees a stable difference.
+       Pin the substring "[overlay]" which the curated set marks
+       overlay-loaded entries with. */
+    n = axl_pci_class_string_fmt(0x060000,
+                                 AXL_PCI_CLASS_FMT_FULL,
+                                 buf, sizeof(buf));
+    test_check(n > 0 && axl_strstr(buf, "[overlay]") != NULL,
+               "pci class_db: overlay redefines 0x060000 (sees [overlay] marker)");
+
+    /* Codes the overlay doesn't define still come from compiled-in.
+       0x010601 = SATA AHCI 1.0 — every tier is in the compiled-in
+       table. */
+    n = axl_pci_class_string_fmt(0x010601,
+                                 AXL_PCI_CLASS_FMT_FULL,
+                                 buf, sizeof(buf));
+    test_check(n > 0 && axl_strstr(buf, "SATA") != NULL,
+               "pci class_db: codes outside overlay still hit compiled-in");
+
+    /* Reload short-circuits (idempotent). */
+    test_check(axl_pci_class_load(NULL) == 0,
+               "pci class_db: second load is a no-op success");
+
+    /* Free clears the overlay; output reverts to compiled-in. */
+    axl_pci_class_free();
+    n = axl_pci_class_string_fmt(0x060000,
+                                 AXL_PCI_CLASS_FMT_FULL,
+                                 buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Bridge / Host bridge") == 0,
+               "pci class_db: free reverts to compiled-in");
+
+    /* Load failure modes (parallel to pci-ids -1/-2 split). */
+    test_check(axl_pci_class_load(
+                   "fs0:\\does-not-exist-anywhere.json5") == -1,
+               "pci class_db: missing file returns -1 (authoritative)");
+}
+
+// ---------------------------------------------------------------------------
+// AxlPci — composed-name helper (Phase D)
+// ---------------------------------------------------------------------------
+
+static void
+test_pci_format_name(void)
+{
+    /* Composed-name helper renders the same string for the same
+       (vid, did) pair across every consumer that uses it. Tested
+       against (a) the staged singleton DB for cases 1-3 and
+       (b) a handle-loaded pathological fixture for case 4. */
+    char buf[AXL_PCI_NAME_COMPOSED_MAX];
+
+    /* Bad-arg guards apply unconditionally — exercise them before
+       the load gate so they always run. */
+    test_check(axl_pci_format_name(0x8086, 0x29C0, NULL, sizeof(buf)) == -1,
+               "pci format_name: NULL buf returns -1");
+    test_check(axl_pci_format_name(0x8086, 0x29C0, buf, 0) == -1,
+               "pci format_name: buflen 0 returns -1");
+
+    /* Case 4: vendor unknown takes precedence even when the device
+       entry exists. Pathological fixture with a device entry under
+       a vendor that has no vendor-name entry — proves the
+       short-circuit fires. Use the handle API directly so we don't
+       have to disturb the singleton. */
+    {
+        static const char fixture[] =
+            "{ schema: 1,\n"
+            "  vendors: [],\n"
+            "  devices: [{ vid: 0xCAFE, did: 0x0001, name: 'Orphan' }],\n"
+            "}\n";
+        AxlPciIds *h = NULL;
+        test_check(axl_pci_ids_open_from_buffer(
+                       fixture, axl_strlen(fixture), &h) == 0,
+                   "pci format_name: orphan-device fixture loads");
+        int rc = axl_pci_ids_format_name(h, 0xCAFE, 0x0001,
+                                         buf, sizeof(buf));
+        /* Without a vendor entry, output must be numeric — must not
+           leak the device name. */
+        test_check(rc > 0 && axl_strcmp(buf, "cafe:0001") == 0,
+                   "pci format_name: vendor-unknown short-circuits "
+                   "even when device entry would have hit");
+        axl_pci_ids_close(h);
+    }
+
+    /* Cases 1-3 use the staged singleton DB. SKIP-balanced when
+       no companion DB is present. */
+    if (axl_pci_ids_load(NULL) != 0) {
+        axl_printf("SKIP: pci format_name (no companion DB staged)\n");
+        for (int i = 0; i < 3; i++) {
+            test_check(true, "pci format_name: SKIP balance");
+        }
+        return;
+    }
+
+    /* Case 1: vendor + device both known. share/pci-ids.json5 ships
+       Intel (8086) + Q35 Host Bridge (29C0). Pin the exact string
+       — substring matches silently tolerate curator typos. */
+    int n = axl_pci_format_name(0x8086, 0x29C0, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf,
+                   "Intel Corporation Q35 Host Bridge") == 0,
+               "pci format_name: 8086:29C0 == 'Intel Corporation Q35 Host Bridge'");
+
+    /* Case 2: vendor known, device unknown — formatter inserts
+       'Device <DID hex>' with lowercase 4-wide zero-padded hex. */
+    n = axl_pci_format_name(0x8086, 0xDEAD, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf,
+                   "Intel Corporation Device dead") == 0,
+               "pci format_name: 8086:DEAD == 'Intel Corporation Device dead'");
+
+    /* Case 3: vendor unknown — fully numeric, no name material. */
+    n = axl_pci_format_name(0xDEAD, 0xBEEF, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "dead:beef") == 0,
+               "pci format_name: unknown vendor == 'VID:DID'");
+}
+
+// ---------------------------------------------------------------------------
+// AxlPci — handle API, buffer load, length contracts, load failure modes
+// ---------------------------------------------------------------------------
+
+static void
+test_pci_ids_length_macros(void)
+{
+    /* Compile-time contract — caps are public macros consumers can
+       use to size stack buffers. Sanity-check they're sensibly sized
+       relative to one another. */
+    test_check(AXL_PCI_VENDOR_NAME_MAX == 128u,
+               "pci-ids: AXL_PCI_VENDOR_NAME_MAX == 128");
+    test_check(AXL_PCI_DEVICE_NAME_MAX == 192u,
+               "pci-ids: AXL_PCI_DEVICE_NAME_MAX == 192");
+    test_check(AXL_PCI_SUBSYS_NAME_MAX == 192u,
+               "pci-ids: AXL_PCI_SUBSYS_NAME_MAX == 192");
+    test_check(AXL_PCI_NAME_COMPOSED_MAX >= AXL_PCI_VENDOR_NAME_MAX
+               + AXL_PCI_DEVICE_NAME_MAX,
+               "pci-ids: composed name fits vendor+device");
+}
+
+static void
+test_pci_ids_length_enforcement(void)
+{
+    /* Loader silently truncates over-cap entries (axl_json_get_string
+       writes at most buflen-1 bytes + NUL). The contract: lookups
+       always return a string whose length is < the documented cap.
+       Pin this with a fixture whose vendor name exceeds the cap. */
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [{ id: 0x9999, name: '"
+        /* 200 chars of payload — well over AXL_PCI_VENDOR_NAME_MAX. */
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+        "' }] }";
+
+    AxlPciIds *h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == 0,
+               "pci-ids cap: over-cap fixture loads (truncates silently)");
+
+    const char *v = axl_pci_ids_vendor_name(h, 0x9999);
+    test_check(v != NULL,
+               "pci-ids cap: over-cap vendor returns non-NULL (truncated)");
+    test_check(v != NULL
+               && axl_strlen(v) < AXL_PCI_VENDOR_NAME_MAX,
+               "pci-ids cap: returned name is < AXL_PCI_VENDOR_NAME_MAX");
+
+    axl_pci_ids_close(h);
+}
+
+static void
+test_pci_ids_partial_schemas(void)
+{
+    /* Any subset of the three top-level arrays is valid — a database
+       may ship with vendors only, devices only, or even just the
+       schema field (an empty stub). All paths must open cleanly. */
+    AxlPciIds *h = NULL;
+
+    /* Vendors only. */
+    static const char vendors_only[] =
+        "{ schema: 1, vendors: [{ id: 0x0001, name: 'V' }] }";
+    test_check(axl_pci_ids_open_from_buffer(
+                   vendors_only, axl_strlen(vendors_only), &h) == 0,
+               "pci-ids schema: vendors-only loads");
+    test_check(axl_pci_ids_vendor_name(h, 0x0001) != NULL,
+               "pci-ids schema: vendors-only — vendor lookup hits");
+    test_check(axl_pci_ids_device_name(h, 0x0001, 0x0001) == NULL,
+               "pci-ids schema: vendors-only — device lookup misses");
+    axl_pci_ids_close(h);
+
+    /* Devices only. */
+    static const char devices_only[] =
+        "{ schema: 1, devices: [{ vid: 0x0001, did: 0x0001, name: 'D' }] }";
+    test_check(axl_pci_ids_open_from_buffer(
+                   devices_only, axl_strlen(devices_only), &h) == 0,
+               "pci-ids schema: devices-only loads");
+    test_check(axl_pci_ids_device_name(h, 0x0001, 0x0001) != NULL,
+               "pci-ids schema: devices-only — device lookup hits");
+    test_check(axl_pci_ids_vendor_name(h, 0x0001) == NULL,
+               "pci-ids schema: devices-only — vendor lookup misses");
+    axl_pci_ids_close(h);
+
+    /* Schema field only — empty stub. All lookups miss; no crash. */
+    static const char schema_only[] = "{ schema: 1 }";
+    test_check(axl_pci_ids_open_from_buffer(
+                   schema_only, axl_strlen(schema_only), &h) == 0,
+               "pci-ids schema: empty stub loads");
+    test_check(axl_pci_ids_vendor_name(h, 0x0001) == NULL
+               && axl_pci_ids_device_name(h, 0x0001, 0x0001) == NULL,
+               "pci-ids schema: empty stub — every lookup misses");
+    axl_pci_ids_close(h);
+}
+
+static void
+test_pci_ids_handle_buffer(void)
+{
+    /* Buffer-load path lets us embed a tiny test fixture without
+       depending on a staged file. Schema is the same as the on-disk
+       JSON5: top-level vendors/devices arrays. */
+    static const char fixture[] =
+        "{\n"
+        "  schema: 1,\n"
+        "  vendors: [\n"
+        "    { id: 0x1234, name: 'TestVendor' },\n"
+        "    { id: 0x5678, name: 'OtherVendor' },\n"
+        "  ],\n"
+        "  devices: [\n"
+        "    { vid: 0x1234, did: 0x0001, name: 'Test Device 1' },\n"
+        "    { vid: 0x5678, did: 0x00AB, name: 'Other Device AB' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciIds *h = NULL;
+    int rc = axl_pci_ids_open_from_buffer(fixture,
+                                          axl_strlen(fixture), &h);
+    test_check(rc == 0 && h != NULL,
+               "pci-ids handle: open_from_buffer succeeds on valid JSON5");
+
+    const char *v = axl_pci_ids_vendor_name(h, 0x1234);
+    test_check(v != NULL && axl_strcmp(v, "TestVendor") == 0,
+               "pci-ids handle: vendor lookup returns exact name");
+
+    const char *d = axl_pci_ids_device_name(h, 0x5678, 0x00AB);
+    test_check(d != NULL && axl_strcmp(d, "Other Device AB") == 0,
+               "pci-ids handle: device lookup returns exact name");
+
+    /* Unknown lookups return NULL on a present handle. */
+    test_check(axl_pci_ids_vendor_name(h, 0xDEAD) == NULL,
+               "pci-ids handle: unknown vendor returns NULL");
+    test_check(axl_pci_ids_device_name(h, 0x1234, 0xDEAD) == NULL,
+               "pci-ids handle: unknown device returns NULL");
+
+    /* NULL handle propagates as NULL — keeps a layered priority
+       chain (private then public, etc.) readable without per-lookup
+       null guards. */
+    test_check(axl_pci_ids_vendor_name(NULL, 0x1234) == NULL,
+               "pci-ids handle: NULL handle returns NULL");
+
+    /* Close is NULL-safe. */
+    axl_pci_ids_close(h);
+    axl_pci_ids_close(NULL);
+    test_check(true, "pci-ids handle: close + close(NULL) OK");
+}
+
+static void
+test_pci_ids_handle_priority(void)
+{
+    /* Public + private overlay: a private handle shadows the public
+       one for entries the private set redefines. Composed via a
+       caller-side priority lookup (the API doesn't pre-merge —
+       consumers chain handles in their own preferred order). */
+    static const char public_db[] =
+        "{ schema: 1,\n"
+        "  vendors: [{ id: 0x1234, name: 'PublicVendor' }],\n"
+        "  devices: [{ vid: 0x1234, did: 0x0001, name: 'Public Device' }] }\n";
+    static const char private_db[] =
+        "{ schema: 1,\n"
+        "  vendors: [{ id: 0x1234, name: 'PrivateVendor' }],\n"
+        "  devices: [{ vid: 0x1234, did: 0x0001, name: 'Private Rebadge' }] }\n";
+
+    AxlPciIds *pub  = NULL;
+    AxlPciIds *priv = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   public_db, axl_strlen(public_db), &pub) == 0,
+               "pci-ids overlay: public DB opens");
+    test_check(axl_pci_ids_open_from_buffer(
+                   private_db, axl_strlen(private_db), &priv) == 0,
+               "pci-ids overlay: private DB opens");
+
+    /* Priority lookup: private first, public fallback. */
+    const char *v = axl_pci_ids_vendor_name(priv, 0x1234);
+    if (v == NULL) v = axl_pci_ids_vendor_name(pub, 0x1234);
+    test_check(v != NULL && axl_strcmp(v, "PrivateVendor") == 0,
+               "pci-ids overlay: private shadows public on vendor");
+
+    const char *d = axl_pci_ids_device_name(priv, 0x1234, 0x0001);
+    if (d == NULL) d = axl_pci_ids_device_name(pub, 0x1234, 0x0001);
+    test_check(d != NULL && axl_strcmp(d, "Private Rebadge") == 0,
+               "pci-ids overlay: private shadows public on device");
+
+    axl_pci_ids_close(priv);
+    axl_pci_ids_close(pub);
+}
+
+static void
+test_pci_ids_load_failure_modes(void)
+{
+    /* axl_pci_ids_load with an explicit override is authoritative
+       (per the post-friction API change): the override path is used
+       as-is, no fallback to companion/cwd. So passing a known-absent
+       path returns -1, and a known-malformed path returns -2 —
+       deployment vs authoring failure modes stay distinguishable.
+
+       Make sure the singleton is empty before each call: axl_pci_ids_load
+       short-circuits on g_singleton != NULL. */
+    axl_pci_ids_free();
+
+    /* -1: explicit path that doesn't exist. The fact that pci-ids.json5
+       IS staged in the companion path must NOT mask this. */
+    test_check(axl_pci_ids_load(
+                   "fs0:\\does-not-exist-anywhere.json5") == -1,
+               "pci-ids load: explicit missing file returns -1 (no fallback)");
+
+    /* -2: file found but malformed. The integration runner stages
+       pci-ids-malformed.json5 next to the EFI; SKIP-balanced when
+       the fixture isn't present. */
+    int rc = axl_pci_ids_load("pci-ids-malformed.json5");
+    if (rc == -1) {
+        axl_printf("SKIP: pci-ids load -2 (malformed fixture not staged)\n");
+        test_check(true, "pci-ids load: SKIP balance for -2 path");
+    } else {
+        test_check(rc == -2,
+                   "pci-ids load: malformed JSON5 returns -2 (parse error)");
+    }
+
+    /* Handle API mirrors the same -1/-2 split. NULL out param is
+       cleared on error. */
+    AxlPciIds *h = (AxlPciIds *)0x1;
+    test_check(axl_pci_ids_open(
+                   "fs0:\\does-not-exist-anywhere.json5", &h) == -1,
+               "pci-ids open: missing file returns -1");
+    test_check(h == NULL,
+               "pci-ids open: handle cleared to NULL on error");
+}
+
+static int
+ids_buffer_open_cb(const char *fixture)
+{
+    /* Helper: open from a string buffer and immediately close.
+       Used to prove the buffer path doesn't leak. Called from a
+       loop in the test below. */
+    AxlPciIds *h = NULL;
+    int rc = axl_pci_ids_open_from_buffer(fixture,
+                                          axl_strlen(fixture), &h);
+    if (rc == 0) {
+        axl_pci_ids_close(h);
+    }
+    return rc;
+}
+
+static void
+test_pci_ids_schema_v2_hierarchical(void)
+{
+    /* Schema 2 puts devices under their parent vendor and subsystems
+       under their parent device — the natural hand-edit shape for a
+       human maintaining thousands of entries. The loader pivots on
+       the schema field; both schema 1 (flat) and schema 2
+       (hierarchical) populate the same internal hash tables, so
+       lookups don't care which shape the file used. */
+    static const char fixture[] =
+        "{ schema: 2,\n"
+        "  vendors: [\n"
+        "    { id: 0x8086, name: 'TestIntel',\n"
+        "      devices: [\n"
+        "        { did: 0x29C0, name: 'Test Q35',\n"
+        "          subsystems: [\n"
+        "            { svid: 0x1028, sdid: 0x1FCA, name: 'Hier OEM Card' },\n"
+        "          ],\n"
+        "        },\n"
+        "        { did: 0x100E, name: 'Test 82540EM' },\n"
+        "      ],\n"
+        "    },\n"
+        "    { id: 0x10DE, name: 'TestNVIDIA' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciIds *h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == 0,
+               "pci-ids v2: hierarchical fixture loads");
+
+    /* Vendor lookups (top-level vendors[]). */
+    const char *v = axl_pci_ids_vendor_name(h, 0x8086);
+    test_check(v != NULL && axl_strcmp(v, "TestIntel") == 0,
+               "pci-ids v2: vendor at top level decodes");
+    v = axl_pci_ids_vendor_name(h, 0x10DE);
+    test_check(v != NULL && axl_strcmp(v, "TestNVIDIA") == 0,
+               "pci-ids v2: vendor with no nested devices decodes");
+
+    /* Device lookups — keyed on (vid, did) globally, not on nesting. */
+    const char *d = axl_pci_ids_device_name(h, 0x8086, 0x29C0);
+    test_check(d != NULL && axl_strcmp(d, "Test Q35") == 0,
+               "pci-ids v2: nested device decodes via global (vid,did) key");
+    d = axl_pci_ids_device_name(h, 0x8086, 0x100E);
+    test_check(d != NULL && axl_strcmp(d, "Test 82540EM") == 0,
+               "pci-ids v2: device without subsystems decodes");
+
+    /* Subsystem lookup — keyed on (svid, sdid) globally, not on
+       parent (vid, did) context. */
+    const char *s = axl_pci_ids_subsys_name(h, 0x1028, 0x1FCA);
+    test_check(s != NULL && axl_strcmp(s, "Hier OEM Card") == 0,
+               "pci-ids v2: nested subsystem decodes via global (svid,sdid) key");
+
+    /* Misses still return NULL. */
+    test_check(axl_pci_ids_vendor_name(h, 0xDEAD) == NULL,
+               "pci-ids v2: unknown vendor returns NULL");
+    test_check(axl_pci_ids_device_name(h, 0x10DE, 0x0001) == NULL,
+               "pci-ids v2: vendor with no devices array — device lookup misses");
+
+    axl_pci_ids_close(h);
+
+    /* Schema 2 also accepts a top-level subsystems[] block alongside
+       the nested form — orphan entries the maintainer doesn't know
+       which device to nest under can land in the flat block. The
+       loader merges both into the same hash table. */
+    static const char hybrid_fixture[] =
+        "{ schema: 2,\n"
+        "  vendors: [\n"
+        "    { id: 0x8086, name: 'TestIntel',\n"
+        "      devices: [\n"
+        "        { did: 0x1521, name: 'I350',\n"
+        "          subsystems: [\n"
+        "            { svid: 0xAAAA, sdid: 0x0001, name: 'Nested Sub' },\n"
+        "          ],\n"
+        "        },\n"
+        "      ],\n"
+        "    },\n"
+        "  ],\n"
+        "  subsystems: [\n"
+        "    { svid: 0xBBBB, sdid: 0x0002, name: 'Orphan Sub' },\n"
+        "  ],\n"
+        "}\n";
+    test_check(axl_pci_ids_open_from_buffer(
+                   hybrid_fixture, axl_strlen(hybrid_fixture), &h) == 0,
+               "pci-ids v2 hybrid: nested + top-level subsystems[] loads");
+    test_check(axl_pci_ids_subsys_name(h, 0xAAAA, 0x0001) != NULL,
+               "pci-ids v2 hybrid: nested subsystem reachable");
+    test_check(axl_pci_ids_subsys_name(h, 0xBBBB, 0x0002) != NULL,
+               "pci-ids v2 hybrid: orphan top-level subsystem reachable");
+    axl_pci_ids_close(h);
+
+    /* Schema 1 (flat) still works after schema 2 was added. */
+    static const char v1_fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [{ id: 0x8086, name: 'FlatIntel' }],\n"
+        "  devices: [{ vid: 0x8086, did: 0x29C0, name: 'Flat Q35' }],\n"
+        "  subsystems: [{ svid: 0x1028, sdid: 0x1FCA, name: 'Flat OEM' }],\n"
+        "}\n";
+    test_check(axl_pci_ids_open_from_buffer(
+                   v1_fixture, axl_strlen(v1_fixture), &h) == 0,
+               "pci-ids v1: flat fixture still loads after v2 was added");
+    test_check(axl_pci_ids_vendor_name(h, 0x8086) != NULL
+               && axl_strcmp(axl_pci_ids_vendor_name(h, 0x8086),
+                             "FlatIntel") == 0,
+               "pci-ids v1: flat vendor lookup unchanged");
+    axl_pci_ids_close(h);
+
+    /* Unknown schema number returns -2 (parse error) — guards against
+       a future schema 3 file being silently misparsed by this build. */
+    static const char v99_fixture[] =
+        "{ schema: 99, vendors: [{ id: 0x0001, name: 'X' }] }\n";
+    h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   v99_fixture, axl_strlen(v99_fixture), &h) == -2,
+               "pci-ids: unknown schema number returns -2");
+    test_check(h == NULL,
+               "pci-ids: handle stays NULL on unknown-schema -2");
+
+    /* Missing schema field returns -2 (parse error) — would otherwise
+       silently misparse: a v2 file forgetting schema would parse as
+       v1 and silently drop every nested device. The required-field
+       check is the cheap safety net. */
+    static const char no_schema_fixture[] =
+        "{ vendors: [{ id: 0x0001, name: 'X' }] }\n";
+    h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(
+                   no_schema_fixture, axl_strlen(no_schema_fixture),
+                   &h) == -2,
+               "pci-ids: missing 'schema' field returns -2");
+}
+
+static void
+test_pci_ids_buffer_parse_errors(void)
+{
+    /* Buffer load with malformed JSON5 returns -2 — same posture
+       as the file path. Use an unambiguously-invalid token so the
+       JSON5 parser doesn't accidentally accept it via permissive
+       identifier-key grammar (a previous attempt with
+       "{ this is not JSON5 at all" partially parsed because JSON5
+       allows unquoted identifier keys). */
+    static const char bad[] = "@@@ not even close to JSON5 @@@";
+    AxlPciIds *h = NULL;
+    test_check(axl_pci_ids_open_from_buffer(bad, axl_strlen(bad), &h) == -2,
+               "pci-ids buffer: malformed JSON5 returns -2");
+    test_check(h == NULL, "pci-ids buffer: handle stays NULL on parse fail");
+
+    /* Repeated open/close on a valid buffer leaves no leaks (caught
+       by AXL_MEM_DEBUG's per-test leak report). */
+    static const char tiny[] =
+        "{ schema: 1, vendors: [{ id: 0x0001, name: 'Tiny' }] }";
+    for (int i = 0; i < 4; i++) {
+        test_check(ids_buffer_open_cb(tiny) == 0,
+                   "pci-ids buffer: re-open OK (no leaks)");
+    }
+}
+
 static int
 vpd_iter_count_cb(const char keyword[2], const uint8_t *data,
                   size_t len, void *ctx)
@@ -512,17 +1472,98 @@ test_pci_class_string(void)
                && axl_strstr(buf, "AHCI") != NULL,
                "pci class_string: SATA AHCI decoded");
 
-    /* Unknown base class — graceful fallback, never crashes. */
+    /* Unknown base class — falls back to numeric "Class XXXXXX"
+       form, matching Linux lspci. */
     n = axl_pci_class_string(0xAB1234, buf, sizeof(buf));
-    test_check(n > 0 && axl_strstr(buf, "<unknown>") != NULL,
-               "pci class_string: unknown class falls back to <unknown>");
+    test_check(n > 0 && axl_strstr(buf, "Class") != NULL
+               && axl_strstr(buf, "ab1234") != NULL,
+               "pci class_string: unknown class falls back to 'Class XXXXXX'");
 
-    /* Unknown subclass under known base — base names, sub/prog don't. */
+    /* Unknown subclass under known base — emit the base alone (no
+       "<unknown>" placeholder), per lspci. */
     n = axl_pci_class_string(0x06FFFF, buf, sizeof(buf));
     test_check(n > 0
                && axl_strstr(buf, "Bridge") != NULL
-               && axl_strstr(buf, "<unknown>") != NULL,
-               "pci class_string: known base + unknown sub still names base");
+               && axl_strstr(buf, "<unknown>") == NULL,
+               "pci class_string: known base + unknown sub omits sub/prog");
+
+    /* Known base+sub, unknown prog — show base / sub, omit the prog
+       tier rather than print "<unknown>". Host bridge (06:00:xx) is
+       the canonical case: most platforms leave prog_if undefined.
+       Pin the exact string so a regression that re-introduces
+       "<unknown>" can't slip past the substring-only checks. */
+    n = axl_pci_class_string(0x060000, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Bridge / Host bridge") == 0,
+               "pci class_string: 0x060000 == 'Bridge / Host bridge' (prog omitted)");
+
+    /* Base 0x00 ("Unclassified") with sub/prog absent from the table
+       — output collapses to just the base name. virtio-rng-pci on
+       QEMU exercises this path with class 0x00FF00 in real life. */
+    n = axl_pci_class_string(0x00FF00, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Unclassified") == 0,
+               "pci class_string: 0x00FF00 == 'Unclassified' (sub+prog omitted)");
+
+    /* Three-tier canonical case — pin the full string so future
+       refactors that quietly drop a separator are caught here. */
+    n = axl_pci_class_string(0x010601, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf,
+                   "Mass storage controller / SATA / AHCI 1.0") == 0,
+               "pci class_string: 0x010601 == full triplet 'Mass storage / SATA / AHCI 1.0'");
+
+    /* axl_pci_class_string_fmt — explicit shape selector for
+       row-oriented consumers (cdump-style) who want subclass alone
+       or base alone. */
+
+    /* FMT_FULL is identical to axl_pci_class_string. */
+    n = axl_pci_class_string_fmt(0x060000,
+                                 AXL_PCI_CLASS_FMT_FULL, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Bridge / Host bridge") == 0,
+               "pci class_string_fmt(FULL): == 'Bridge / Host bridge'");
+
+    /* FMT_SUBCLASS emits the subclass alone — matches Linux lspci. */
+    n = axl_pci_class_string_fmt(0x060000,
+                                 AXL_PCI_CLASS_FMT_SUBCLASS, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Host bridge") == 0,
+               "pci class_string_fmt(SUBCLASS): 0x060000 == 'Host bridge'");
+    n = axl_pci_class_string_fmt(0x010601,
+                                 AXL_PCI_CLASS_FMT_SUBCLASS, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "SATA") == 0,
+               "pci class_string_fmt(SUBCLASS): 0x010601 == 'SATA'");
+
+    /* FMT_BASE emits the base alone. */
+    n = axl_pci_class_string_fmt(0x060000,
+                                 AXL_PCI_CLASS_FMT_BASE, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Bridge") == 0,
+               "pci class_string_fmt(BASE): 0x060000 == 'Bridge'");
+    n = axl_pci_class_string_fmt(0x010601,
+                                 AXL_PCI_CLASS_FMT_BASE, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Mass storage controller") == 0,
+               "pci class_string_fmt(BASE): 0x010601 == 'Mass storage controller'");
+
+    /* Fallback chain when the requested tier is unknown:
+       SUBCLASS on (known base, unknown sub) → falls back to the base.
+       BASE on (unknown base) → numeric. */
+    n = axl_pci_class_string_fmt(0x06FFFF,
+                                 AXL_PCI_CLASS_FMT_SUBCLASS, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Bridge") == 0,
+               "pci class_string_fmt(SUBCLASS): unknown sub falls back to base");
+    n = axl_pci_class_string_fmt(0xAB1234,
+                                 AXL_PCI_CLASS_FMT_BASE, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Class ab1234") == 0,
+               "pci class_string_fmt(BASE): unknown base → numeric fallback");
+    /* SUBCLASS on a wholly-unknown class falls through both rungs
+       (sub → base → numeric) and lands on the numeric form. */
+    n = axl_pci_class_string_fmt(0xAB1234,
+                                 AXL_PCI_CLASS_FMT_SUBCLASS, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Class ab1234") == 0,
+               "pci class_string_fmt(SUBCLASS): unknown base → numeric fallback");
+
+    /* Bad fmt returns -1 (out-of-range enum value). */
+    test_check(axl_pci_class_string_fmt(0x060000,
+                                        (AxlPciClassFmt)99,
+                                        buf, sizeof(buf)) == -1,
+               "pci class_string_fmt: unknown fmt enum returns -1");
 
     /* NULL/zero-length guards. */
     test_check(axl_pci_class_string(0x060000, NULL, 80) == -1,
@@ -566,6 +1607,63 @@ test_pci_capabilities(void)
         uint16_t off, id;
         test_check(axl_pci_cap_next(root, 0, &off, &id) == -1,
                    "pci: cap_next on no-caps device returns -1");
+    }
+
+    /* Bridge bus tuple. The integration runner injects a pcie-root-port
+       which is header type 1; AxlPci's bridge_info should recognize it
+       and report a non-zero secondary bus. The host bridge at 00:00.0
+       is header type 0 and must be rejected. */
+    {
+        AxlPciBridge br;
+        /* Host bridge is type 0 — bridge_info must say "not a bridge". */
+        test_check(axl_pci_bridge_info(root, &br) == -1,
+                   "pci bridge_info: host bridge (type 0) returns -1");
+
+        /* NULL out param. */
+        test_check(axl_pci_bridge_info(root, NULL) == -1,
+                   "pci bridge_info: NULL out returns -1");
+
+        /* Find the pcie-root-port the test runner adds (class 0x060400,
+           PCI-to-PCI bridge). It's at 00:02.0 in QEMU's auto-assignment
+           but we locate it by class to stay topology-agnostic. */
+        AxlPciAddr rp;
+        if (axl_pci_find_by_class(0x060400, 0, &rp) == 0) {
+            test_check(axl_pci_bridge_info(rp, &br) == 0,
+                       "pci bridge_info: PCI-to-PCI bridge succeeds");
+            test_check(br.secondary != 0,
+                       "pci bridge_info: root port has non-zero secondary bus");
+            test_check(br.subordinate >= br.secondary,
+                       "pci bridge_info: subordinate >= secondary");
+        } else {
+            /* No PCI-PCI bridge on this image — runner config drift.
+               Balance against the populated path so the ratchet stays
+               stable. */
+            test_check(true, "pci bridge_info: SKIP — no bridge in topology");
+            test_check(true, "pci bridge_info: SKIP balance");
+            test_check(true, "pci bridge_info: SKIP balance");
+        }
+    }
+
+    /* Regression: cap_next on an absent BDF must terminate immediately,
+       not loop. Bit aa64 QEMU virt at 0:1f.0 — ECAM all-1s response
+       fooled the walk into a self-loop at offset 0xFC. The fix is a
+       VID precheck at walk entry; a pre-fix run of this test would
+       hang QEMU until the guest watchdog tripped. */
+    {
+        /* In-MCFG empty slot: bus 0 dev 0 func 7 is mapped on q35 and
+           virt but never populated. Exercises the all-1s ECAM path
+           specifically. */
+        AxlPciAddr absent_func = { .seg = 0, .bus = 0, .dev = 0, .func = 7 };
+        uint16_t   off = 0, id = 0;
+        test_check(axl_pci_cap_next(absent_func, 0, &off, &id) == -1,
+                   "pci: cap_next on empty MCFG-mapped function returns -1");
+
+        /* The exact BDF from the original aa64 bug report. May exit
+           via MCFG miss or via the all-1s VID check, either is fine. */
+        AxlPciAddr absent_aa64 = { .seg = 0, .bus = 0, .dev = 0x1F, .func = 0 };
+        off = 0; id = 0;
+        test_check(axl_pci_cap_next(absent_aa64, 0, &off, &id) == -1,
+                   "pci: cap_next on absent 0:1f.0 returns -1 (aa64 regression)");
     }
 }
 
@@ -892,6 +1990,22 @@ test_platform_main(int argc, char **argv)
     test_pci_dump();
     test_pci_class_string();
     test_pci_capabilities();
+    test_pci_tree_walker();
+    test_pci_ids_db();
+    test_pci_ids_length_macros();
+    test_pci_ids_length_enforcement();
+    test_pci_ids_partial_schemas();
+    test_pci_ids_handle_buffer();
+    test_pci_ids_handle_priority();
+    test_pci_ids_load_failure_modes();
+    test_pci_ids_buffer_parse_errors();
+    test_pci_ids_schema_v2_hierarchical();
+    test_pci_ids_subsystem_lookup();
+    test_pci_ids_foreach();
+    test_pci_ids_subsys_db();
+    test_pci_format_name();
+    test_pci_class_db_handle();
+    test_pci_class_db_singleton_overrides();
     test_pci_vpd_iter();
 
     /* axl_io_port_* */

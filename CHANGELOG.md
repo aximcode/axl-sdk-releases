@@ -3,6 +3,131 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.10.0 — 2026-05-02
+
+PCI tooling release: a Linux-style **`lspci.efi`** built on a fully
+fleshed-out PCI topology + name-decoding API. Vendor / device /
+subsystem / class names load opportunistically from JSON5 sidecars
+(`pci-ids.json5`, `pci-class.json5`) so new entries land via a
+`git pull` of the sidecar rather than rebuilding every consumer
+binary. Both sidecars now ship in every release artifact.
+
+Headlines: `axl_pci_tree_for_each` for depth-first PCI topology
+walks (used by `lspci -t`), a handle-based name database with
+multi-handle overlay support, a documented load-failure split
+(`-1` missing vs `-2` parse error), per-name length contracts, a
+hierarchical schema 2 layout for hand-maintained `pci-ids.json5`
+files at scale, and a fix for an aa64 cap-walk infinite-loop that
+surfaced in a downstream consumer.
+
+### Added
+
+**Tools**
+- `lspci.efi` — Linux-style PCI lister. Default short form +
+  `-t` SoftBMC-style tree view + `-v / -vv / -vvv` detail levels
+  (caps, ext caps, subsystem) + `-x / -xx / -xxx` hex dumps
+  (64 B / 256 B / 4 KiB ECAM) + `-s BDF` filter + `-d V[:D]`
+  filter + `-n` numeric mode + `-D` always-show-domain. JSON5
+  sidecars auto-loaded from companion path; `--ids-file` /
+  `--debug` overrides.
+
+**Library — PCI topology**
+- `AxlPciBridge` + `axl_pci_bridge_info(addr, *out)` — read the
+  PCI-PCI bridge bus-number tuple (primary/secondary/subordinate)
+  with header-type validation.
+- `axl_pci_tree_for_each(fn, ctx)` — depth-first per-segment
+  topology walker with cycle detection (per-segment visited-bus
+  bitmap) and recursion cap (`AXL_PCI_TREE_MAX_DEPTH = 16`).
+- `axl_pci_cap_id_str` / `axl_pci_ext_cap_id_str` — cap-ID name
+  lookup (legacy + PCIe extended).
+
+**Library — Name databases**
+- Handle API: `AxlPciIds` opaque type + `axl_pci_ids_open` /
+  `_open_from_buffer` / `_close`.
+- Per-tier handle lookups: `axl_pci_ids_vendor_name` /
+  `_device_name` / `_subsys_name`.
+- Composed-name helper: `axl_pci_ids_format_name(handle, vid,
+  did, buf, buflen)` (handle) + singleton wrapper
+  `axl_pci_format_name(vid, did, buf, buflen)`. Documented
+  fallback chain so every consumer renders the same string for
+  the same `(vid, did)` pair.
+- Iter API: `axl_pci_ids_foreach_vendor` / `_device` / `_subsys`
+  with non-zero-return early-stop semantics.
+- Singleton API: `axl_pci_ids_load(override_path)` with
+  authoritative explicit-path semantics; `axl_pci_ids_free`;
+  `axl_pci_vendor_name` / `_device_name` / `_subsys_name`.
+- Load failure split: `axl_pci_ids_load` / `_open` return
+  `-1` for missing file, `-2` for parse error. Lets tools log
+  deployment problems silently and authoring problems loudly.
+- Per-name length contracts (compile-time stack-buffer sizing):
+  `AXL_PCI_VENDOR_NAME_MAX = 128`, `AXL_PCI_DEVICE_NAME_MAX = 192`,
+  `AXL_PCI_SUBSYS_NAME_MAX = 192`, `AXL_PCI_CLASS_NAME_MAX = 128`,
+  `AXL_PCI_NAME_COMPOSED_MAX = 384`.
+
+**Library — Class-name overlay**
+- `AxlPciClassDb` opaque type + `axl_pci_class_open` /
+  `_open_from_buffer` / `_close` + per-tier handle lookups.
+- Singleton: `axl_pci_class_load` / `_free`.
+  `axl_pci_class_string` and `_fmt` automatically consult the
+  loaded overlay before the compiled-in tables.
+- Output-shape selector: `AxlPciClassFmt` enum
+  (`FULL` / `SUBCLASS` / `BASE`) + `axl_pci_class_string_fmt`.
+
+**Sidecars + host scripts**
+- `share/pci-ids.json5` — curated vendor/device/subsystem starter
+  set (QEMU + common server NICs / NVMe / GPUs). Schema 2
+  hierarchical layout (devices nest under vendor, subsystems
+  nest under device).
+- `share/pci-class.json5` — class triplet name overlay starter.
+- `scripts/pci-ids-to-json5.py` — bulk-converts canonical pci.ids
+  to the JSON5 schemas. Schema 2 default; `--schema 1` for the
+  legacy flat layout; `--vendors-only` filter; `--emit-class FILE`
+  also writes the class overlay; `--self-test` exercises the
+  parser/emitters against an embedded fixture.
+- `src/pci/CONSUMERS.md` — one-page integration playbook
+  (lifecycle, return codes, DB-absent behavior, output
+  convention, layered DB priority chain, thread-safety contract,
+  bulk-population recipe).
+
+**Test infrastructure**
+- PCI bridge tree (one PCIe root port + virtio-rng-pci) injected
+  into the QEMU integration runner so topology-walking code is
+  exercised in CI.
+- `scripts/run-qemu.sh --bridges` mirrors the runner topology
+  for interactive smoke-tests.
+- `scripts/run-qemu.sh` auto-stages `share/pci-ids.json5` and
+  `share/pci-class.json5` next to the EFI on the disk image.
+
+### Changed
+
+- `axl_pci_class_string` no longer emits `<unknown>` for tiers
+  with no defined name — those tiers are omitted entirely
+  (matches Linux lspci posture). Wholly unknown classes fall
+  back to `Class XXXXXX` numeric form.
+- `axl_pci_ids_load(override_path)` is now AUTHORITATIVE for
+  explicit overrides — non-NULL `override_path` does not fall
+  back to companion/cwd discovery (was: fallback chain). NULL
+  still autodiscovers. Old behavior silently masked typos by
+  loading whichever file existed; new behavior surfaces them
+  cleanly with `-1`. Same change applied to `axl_pci_class_load`.
+- JSON5 sidecars now ship in every release artifact:
+  `.deb` / `.rpm` install to `/usr/share/axl/{pci-ids,pci-class}.json5`;
+  the `axl-sdk-tools-<arch>.tar.gz` tools tarball stages them
+  next to the .efi binaries (UEFI auto-discovery picks them up).
+- The pci-ids JSON5 `schema` field is now REQUIRED. Defaulting
+  to either version would silently misparse files of the other
+  version (a v2 file forgetting the declaration would parse as
+  v1 with every nested device dropped).
+
+### Fixed
+
+- `axl_pci_cap_next` / `axl_pci_ext_cap_next` no longer
+  infinite-loop on absent BDFs. ECAM all-1s reads on aa64 QEMU
+  `virt` machine at `0:1f.0` fooled the iterator into a self-loop
+  at offset `0xFC`. Fix: vendor-ID precheck at walk entry +
+  monotonic forward-progress guard. Surfaced via downstream
+  consumer running on aa64 hardware/emulation.
+
 ## 0.9.0 — 2026-05-01
 
 Substantial release covering shell-pipe support, per-stream encoding,

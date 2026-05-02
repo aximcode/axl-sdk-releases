@@ -526,6 +526,49 @@ R+4 — DONE (2026-05-01):
       + bogus-input rejection + probe enumeration). Cross-arch
       balanced; ratchet 1842 → 1863 on both x86 and AArch64.
 
+R+5 — PCI tooling DONE; USB tooling pending:
+
+- [x] **`tools/lspci.c`** — Linux-style PCI lister. Shipped
+      2026-05-02 in commit 485c517 (initial flat list + caps + hex
+      + filters), extended in commit 316c72c with `-t` tree view
+      and JSON5-backed vendor/device name decoding. BAR decoding
+      still deferred.
+- [x] **`axl_pci_cap_id_str` + `axl_pci_ext_cap_id_str`** — small
+      lookup tables in `axl-pci.{h,c}` mapping legacy and PCIe
+      extended capability IDs to human strings. Shipped 2026-05-02
+      in commit bf0273d.
+- [x] **`axl_pci_bridge_info` + `axl_pci_tree_for_each`** — PCI
+      topology API. Shipped 2026-05-02 in commit 2d91898. Test
+      runner now injects a pcie-root-port + virtio-rng so bridge
+      code isn't shipped without coverage (commit 153992f).
+- [x] **PCI vendor/device/subsystem name database** — initial cut
+      shipped 2026-05-02 in commit eb38bac
+      (`axl_pci_ids_load` / `axl_pci_vendor_name` / `axl_pci_device_name`
+      + curated `share/pci-ids.json5`). Extended 2026-05-02 per
+      consumer feedback into a 5-commit chain that landed:
+      handle API + length contracts + load -1/-2 split (commit
+      2d30e91); subsystem lookup + iter API + Python S-line
+      extractor (commit 938ebcb); class-string format flags via
+      `AxlPciClassFmt` enum (commit 13fa258); composed-name helper
+      `axl_pci_format_name` with handle parity (commit ba37a8b);
+      optional class-name overlay sidecar `pci-class.json5`
+      (commit 0d97935). Same JSON5 sidecar pattern memspd uses
+      for `jedec.json5`. Test runner stages the JSON5 next to
+      test EFIs so the loaders are exercised end-to-end. Shared
+      by lspci and downstream consumers.
+- [ ] **AxlUsb** — USB device enumeration via `EFI_USB_IO_PROTOCOL`
+      handles. Standard descriptor walk (device → config →
+      interface → endpoint), class/subclass/protocol decode tables,
+      optional string descriptor reads (manufacturer / product /
+      serial). Header: `axl/axl-usb.h`. Source: `src/usb/`.
+      Sequenced *after* lspci so the "tool over existing platform
+      API" pattern is validated on the simpler PCI surface first.
+- [ ] **`tools/lsusb.c`** — Linux-style USB lister built on AxlUsb.
+      Default short form (`Bus B Device D: ID vid:did class:
+      vendor product`); `-v` adds full descriptor tree. `-s BBB:DDD`
+      and `-d V:D` filters mirroring lspci. Same `--debug` /
+      `-v` convention divergence as lspci.
+
 ### Phase B2: Redfish Support — DONE (as tool, not library)
 
 Decided against a library-level `axl_redfish_*` module — the existing
@@ -988,6 +1031,9 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 - [x] netinfo.efi — network diagnostics and ping
 - [x] mkrd.efi — RAM disk management
 - [x] rfbrowse.efi — Redfish REST API browser
+- [x] lspci.efi — Linux-style PCI lister (Phase B3 R+5; tree view,
+      JSON5-backed vendor/device names, --bridges in run-qemu.sh)
+- [ ] **lsusb.efi** — Linux-style USB lister (Phase B3 R+5, after AxlUsb)
 
 ### Host Tools (scripts/)
 

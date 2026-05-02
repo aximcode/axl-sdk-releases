@@ -1,0 +1,29 @@
+// PCI class-name overlay for axl-sdk.
+//
+// Optional sidecar consulted by axl_pci_class_string_fmt before the
+// compiled-in tables in src/pci/axl-pci.c. Lets new class triplets
+// (CXL Memory Expanders, future PCIe class assignments, etc.) get
+// human-readable names with a `git pull` of this file rather than
+// rebuilding every consumer.
+//
+// Schema:
+//   { schema: 1,
+//     classes: [
+//       { base: 0xNN,                         name: '...' },  // base only
+//       { base: 0xNN, sub: 0xNN,              name: '...' },  // (base,sub)
+//       { base: 0xNN, sub: 0xNN, prog: 0xNN,  name: '...' },  // full triple
+//     ],
+//   }
+//
+// Each entry pins any subset of (base, sub, prog). prog without sub
+// is meaningless — the loader rejects it.
+{
+    schema: 1,
+    classes: [
+        // Demo entry — annotates the well-known Host bridge tier with
+        // an "[overlay]" marker so consumers can see the sidecar is
+        // active. Drop this entry in your own pci-class.json5 if you
+        // don't want the marker on production output.
+        { base: 0x06, sub: 0x00, name: 'Host bridge [overlay]' },
+    ],
+}

@@ -1,0 +1,146 @@
+// PCI vendor/device/subsystem identifier database for axl-sdk.
+//
+// Curated subset of the canonical pci.ids registry — focused on
+// devices that show up in QEMU emulation, common server/BMC
+// hardware, and the consumer workloads axl-sdk consumers actually
+// encounter (NICs, NVMe, GPUs). Numeric IDs themselves are
+// uncopyrightable factual data; names are sourced from the public
+// pci.ids registry (https://pci-ids.ucw.cz/).
+//
+// Schema 2 — hierarchical: devices nest under their parent vendor;
+// subsystems nest under their parent device. Locality of related
+// rows is the win when maintaining thousands of entries by hand.
+// (Schema 1 was the flat layout — three top-level arrays. The
+// loader still accepts schema 1 for backwards compatibility, but
+// new files should use schema 2.)
+//
+// To extract a larger set from the full pci.ids text database,
+// see scripts/pci-ids-to-json5.py.
+{
+    schema: 2,
+    vendors: [
+        { id: 0x1000, name: 'LSI / Broadcom',
+          devices: [
+            { did: 0x0097, name: 'MegaRAID SAS 9460-16i' },
+          ],
+        },
+        { id: 0x1002, name: 'AMD / ATI',
+          devices: [
+            { did: 0x73BF, name: 'Radeon RX 6900 XT' },
+            { did: 0x744C, name: 'Radeon RX 7900 XTX' },
+          ],
+        },
+        { id: 0x1022, name: 'AMD' },
+        { id: 0x1077, name: 'QLogic' },
+        { id: 0x10B5, name: 'PLX / Broadcom' },
+        { id: 0x10DE, name: 'NVIDIA',
+          devices: [
+            { did: 0x1C82, name: 'GeForce GTX 1050 Ti' },
+            { did: 0x2204, name: 'GeForce RTX 3090' },
+            { did: 0x2684, name: 'GeForce RTX 4090' },
+          ],
+        },
+        { id: 0x10EC, name: 'Realtek',
+          devices: [
+            { did: 0x8168, name: 'RTL8111/8168 Gigabit Ethernet' },
+            { did: 0x8125, name: 'RTL8125 2.5Gb Ethernet' },
+          ],
+        },
+        { id: 0x1106, name: 'VIA' },
+        { id: 0x1217, name: 'O2 Micro' },
+        { id: 0x1234, name: 'QEMU / Bochs',
+          devices: [
+            { did: 0x1111, name: 'Bochs Display' },
+          ],
+        },
+        { id: 0x126F, name: 'Silicon Motion' },
+        { id: 0x144D, name: 'Samsung',
+          devices: [
+            { did: 0xA808, name: 'Samsung NVMe SSD 970 EVO' },
+            { did: 0xA80A, name: 'Samsung NVMe SSD 980 PRO' },
+          ],
+        },
+        { id: 0x14E4, name: 'Broadcom',
+          devices: [
+            { did: 0x165F, name: 'BCM5720 Gigabit Ethernet' },
+            { did: 0x1657, name: 'BCM5719 Gigabit Ethernet' },
+          ],
+        },
+        { id: 0x15AD, name: 'VMware',
+          devices: [
+            { did: 0x0405, name: 'VMware SVGA II' },
+            { did: 0x07A0, name: 'VMware PVSCSI' },
+          ],
+        },
+        { id: 0x15B3, name: 'Mellanox',
+          devices: [
+            { did: 0x1013, name: 'ConnectX-4 Mellanox' },
+            { did: 0x101B, name: 'ConnectX-6 Mellanox' },
+          ],
+        },
+        { id: 0x168C, name: 'Qualcomm Atheros' },
+        { id: 0x197B, name: 'JMicron' },
+        { id: 0x19A2, name: 'Emulex' },
+        { id: 0x1AB8, name: 'Parallels' },
+        { id: 0x1AF4, name: 'Red Hat / Virtio',
+          devices: [
+            { did: 0x1000, name: 'Virtio NIC (legacy)' },
+            { did: 0x1001, name: 'Virtio Block (legacy)' },
+            { did: 0x1002, name: 'Virtio Balloon (legacy)' },
+            { did: 0x1003, name: 'Virtio Console (legacy)' },
+            { did: 0x1004, name: 'Virtio SCSI (legacy)' },
+            { did: 0x1005, name: 'Virtio RNG (legacy)' },
+            { did: 0x1009, name: 'Virtio FS (legacy)' },
+            { did: 0x1041, name: 'Virtio NIC (1.0)' },
+            { did: 0x1042, name: 'Virtio Block (1.0)' },
+            { did: 0x1043, name: 'Virtio Console (1.0)' },
+            { did: 0x1044, name: 'Virtio RNG (1.0)' },
+            { did: 0x1048, name: 'Virtio SCSI (1.0)' },
+            { did: 0x1050, name: 'Virtio GPU' },
+          ],
+        },
+        { id: 0x1B36, name: 'Red Hat / QEMU',
+          devices: [
+            { did: 0x0001, name: 'QEMU PCI-PCI Bridge' },
+            { did: 0x0008, name: 'QEMU PCIe Host Bridge (gpex-pcihost)' },
+            { did: 0x000C, name: 'QEMU PCIe Root Port' },
+            { did: 0x000D, name: 'QEMU xHCI USB 3.0' },
+            { did: 0x0100, name: 'QEMU PCIe Root Port' },
+          ],
+        },
+        { id: 0x1B4B, name: 'Marvell' },
+        { id: 0x1C5C, name: 'SK Hynix' },
+        { id: 0x1D6A, name: 'Aquantia / Marvell' },
+        { id: 0x1E0F, name: 'KIOXIA' },
+        { id: 0x8086, name: 'Intel Corporation',
+          devices: [
+            // Q35 / ICH9 (default QEMU x64 platform)
+            { did: 0x29C0, name: 'Q35 Host Bridge' },
+            { did: 0x2918, name: 'ICH9 LPC' },
+            { did: 0x2922, name: 'ICH9 AHCI' },
+            { did: 0x2930, name: 'ICH9 SMBus' },
+            { did: 0x2934, name: 'ICH9 USB UHCI #1' },
+            { did: 0x293A, name: 'ICH9 USB EHCI #1' },
+            // Intel Ethernet — example subsystem (server-class
+            // rebadged 1 GbE NIC under one OEM SVID).
+            { did: 0x100E, name: '82540EM Gigabit Ethernet' },
+            { did: 0x10D3, name: '82574L Gigabit Ethernet' },
+            { did: 0x1521, name: 'I350 Gigabit Network Connection',
+              subsystems: [
+                { svid: 0x1028, sdid: 0x1F5F,
+                  name: 'Server RAID HBA (rebadged)' },
+                { svid: 0x1028, sdid: 0x1FCA,
+                  name: 'Server NIC (rebadged BCM57416)' },
+              ],
+            },
+            { did: 0x1533, name: 'I210 Gigabit Ethernet' },
+            { did: 0x15B8, name: 'I219-V Ethernet' },
+            { did: 0x24CD, name: 'ICH4 USB EHCI' },
+            { did: 0xA12F, name: '100 Series USB 3.0 xHCI' },
+          ],
+        },
+        { id: 0x8087, name: 'Intel (Wireless)' },
+        { id: 0x8088, name: 'Intel (Integrated)' },
+        { id: 0x80EE, name: 'VirtualBox' },
+    ],
+}

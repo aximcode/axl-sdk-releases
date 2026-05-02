@@ -66,6 +66,7 @@ esac
 #   <prefix>/lib/cmake/axl/axl-config.cmake       (find_package(axl))
 #   <prefix>/lib/pkgconfig/axl{,-<arch>}.pc        (pkg-config)
 #   <prefix>/share/axl/{version,build-date,backend} (metadata)
+#   <prefix>/share/axl/{pci-ids,pci-class}.json5     (optional sidecars)
 #
 # Everything is relocatable — the cmake, pkg-config, and axl-cc files
 # resolve paths relative to their own installed location, so a .deb
@@ -156,6 +157,19 @@ cp "$LIBAXL_DIR/scripts/elf_aarch64_efi.lds" "$PREFIX/lib/axl/"
 echo "native"                    > "$PREFIX/share/axl/backend"
 cat "$SDK_DIR/VERSION"           > "$PREFIX/share/axl/version"
 date -u '+%Y-%m-%d'              > "$PREFIX/share/axl/build-date"
+
+# Optional JSON5 sidecars consumed by axl_pci_ids_load /
+# axl_pci_class_load. Shipped as reference content so consumers don't
+# have to clone the SDK to get a starter database — they typically
+# copy these next to their .efi (the auto-discovery companion path)
+# or pass --ids-file / --class-file explicitly. New class triplets
+# (CXL Memory Expanders, future PCIe assignments) can also land here
+# via a JSON5 update without rebuilding any consumer binary.
+for sidecar in pci-ids.json5 pci-class.json5; do
+    if [[ -f "$LIBAXL_DIR/share/$sidecar" ]]; then
+        cp "$LIBAXL_DIR/share/$sidecar" "$PREFIX/share/axl/$sidecar"
+    fi
+done
 
 
 # ---------------------------------------------------------------------------

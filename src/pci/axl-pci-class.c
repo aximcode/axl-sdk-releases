@@ -1,0 +1,363 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
+/** @file axl-pci-class.c
+    Optional class-name overlay loader.
+
+    The PCI class triplet (base, sub, prog) decoders in axl-pci.c
+    use compiled-in tables for the bootstrap default. This file adds
+    a JSON5 sidecar that overlays per-tier names — when a new class
+    triplet ships (e.g. CXL Memory Expanders), field engineers can
+    fix names with a `git pull` of the JSON5 sheet rather than
+    rebuilding every consumer.
+
+    Layered like axl-pci-ids.c: opaque AxlPciClassDb handle, parallel
+    open / open_from_buffer / close, plus a process-global singleton
+    consulted automatically by axl_pci_class_string_fmt.
+
+    Lookup order in axl_pci_class_string_fmt's lookup_* helpers:
+      1. Overlay singleton (this file)
+      2. Compiled-in table (axl-pci.c)
+**/
+
+#include <axl/axl-pci.h>
+#include "axl-pci-class-internal.h"
+#include <axl/axl-fs.h>
+#include <axl/axl-hash-table.h>
+#include <axl/axl-json.h>
+#include <axl/axl-log.h>
+#include <axl/axl-mem.h>
+#include <axl/axl-path.h>
+#include <axl/axl-str.h>
+
+AXL_LOG_DOMAIN("pci-class");
+
+// ---------------------------------------------------------------------------
+// Handle layout
+// ---------------------------------------------------------------------------
+
+struct AxlPciClassDb {
+    AxlHashTable *bases;     /* uintptr_t(base)                     → char* */
+    AxlHashTable *subs;      /* uintptr_t(base<<8 | sub)            → char* */
+    AxlHashTable *progs;     /* uintptr_t(base<<16 | sub<<8 | prog) → char* */
+};
+
+static inline void *
+base_key(
+    uint8_t  base
+    )
+{
+    /* Add a high bit so 0x00 doesn't collide with NULL — base 0x00
+       is the legitimate "Unclassified" tier. */
+    return (void *)((uintptr_t)0x100u | base);
+}
+
+static inline void *
+sub_key(
+    uint8_t  base,
+    uint8_t  sub
+    )
+{
+    return (void *)((uintptr_t)0x10000u
+                  | ((uintptr_t)base << 8)
+                  | (uintptr_t)sub);
+}
+
+static inline void *
+prog_key(
+    uint8_t  base,
+    uint8_t  sub,
+    uint8_t  prog
+    )
+{
+    return (void *)((uintptr_t)0x1000000u
+                  | ((uintptr_t)base << 16)
+                  | ((uintptr_t)sub  << 8)
+                  | (uintptr_t)prog);
+}
+
+// ---------------------------------------------------------------------------
+// JSON5 parser → hash tables
+// ---------------------------------------------------------------------------
+
+/* The schema lets each entry pin any subset of (base, sub, prog).
+   Entry routing:
+     base only         → bases table
+     base + sub        → subs table
+     base + sub + prog → progs table
+   Missing 'base' or 'name' rejects the entry. Missing 'sub' or
+   'prog' demote the entry to the next-coarser tier — there is no
+   "prog without sub" or "sub without base" entry. */
+static bool
+parse_classes(
+    AxlJsonReader  *r,
+    AxlPciClassDb  *db
+    )
+{
+    AxlJsonArrayIter it;
+    if (!axl_json_array_begin(r, "classes", &it)) {
+        return true;  /* empty stub is valid */
+    }
+    AxlJsonReader entry;
+    while (axl_json_array_next(&it, &entry)) {
+        uint64_t base64 = 0;
+        char     name[AXL_PCI_CLASS_NAME_MAX] = "";
+        if (!axl_json_get_uint(&entry, "base", &base64)
+            || base64 > 0xFFu
+            || !axl_json_get_string(&entry, "name", name, sizeof(name)))
+        {
+            continue;
+        }
+        uint8_t  base = (uint8_t)base64;
+        uint64_t sub64 = 0;
+        uint64_t prog64 = 0;
+        bool has_sub  = axl_json_get_uint(&entry, "sub",  &sub64)
+                        && sub64  <= 0xFFu;
+        bool has_prog = axl_json_get_uint(&entry, "prog", &prog64)
+                        && prog64 <= 0xFFu;
+        if (has_prog && !has_sub) {
+            /* prog without sub is meaningless — skip. */
+            continue;
+        }
+        char *name_owned = axl_strdup(name);
+        if (name_owned == NULL) {
+            continue;
+        }
+        AxlHashTable *target;
+        void         *key;
+        if (has_prog) {
+            target = db->progs;
+            key    = prog_key(base, (uint8_t)sub64, (uint8_t)prog64);
+        } else if (has_sub) {
+            target = db->subs;
+            key    = sub_key(base, (uint8_t)sub64);
+        } else {
+            target = db->bases;
+            key    = base_key(base);
+        }
+        if (axl_hash_table_insert(target, key, name_owned) < 0) {
+            axl_free(name_owned);
+        }
+    }
+    return true;
+}
+
+static AxlPciClassDb *
+db_alloc(
+    void
+    )
+{
+    AxlPciClassDb *db = axl_malloc(sizeof(*db));
+    if (db == NULL) {
+        return NULL;
+    }
+    db->bases = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    db->subs  = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    db->progs = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    if (db->bases == NULL || db->subs == NULL || db->progs == NULL) {
+        axl_pci_class_close(db);
+        return NULL;
+    }
+    return db;
+}
+
+// ---------------------------------------------------------------------------
+// Handle API
+// ---------------------------------------------------------------------------
+
+int
+axl_pci_class_open(
+    const char       *path,
+    AxlPciClassDb   **out
+    )
+{
+    if (out == NULL || path == NULL) {
+        return -1;
+    }
+    *out = NULL;
+
+    AxlFileInfo finfo;
+    if (axl_file_info(path, &finfo) != 0) {
+        return -1;
+    }
+
+    AxlJsonReader r   = { 0 };
+    void         *raw = NULL;
+    if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,
+                                  &r, &raw, NULL)) {
+        axl_warning("pci-class: failed to parse %s", path);
+        return -2;
+    }
+    AxlPciClassDb *db = db_alloc();
+    if (db == NULL) {
+        axl_json_free(&r);
+        axl_free(raw);
+        return -2;
+    }
+    parse_classes(&r, db);
+    axl_json_free(&r);
+    axl_free(raw);
+
+    axl_debug("pci-class: %zu base / %zu sub / %zu prog overrides from %s",
+              axl_hash_table_size(db->bases),
+              axl_hash_table_size(db->subs),
+              axl_hash_table_size(db->progs),
+              path);
+    *out = db;
+    return 0;
+}
+
+int
+axl_pci_class_open_from_buffer(
+    const char       *json5,
+    size_t            len,
+    AxlPciClassDb   **out
+    )
+{
+    if (out == NULL) {
+        return -2;
+    }
+    *out = NULL;
+    if (json5 == NULL || len == 0) {
+        return -2;
+    }
+    AxlJsonReader r = { 0 };
+    if (!axl_json_parse_flags(json5, len, AXL_JSON_PARSER_JSON5, &r)) {
+        return -2;
+    }
+    AxlPciClassDb *db = db_alloc();
+    if (db == NULL) {
+        axl_json_free(&r);
+        return -2;
+    }
+    parse_classes(&r, db);
+    axl_json_free(&r);
+    *out = db;
+    return 0;
+}
+
+void
+axl_pci_class_close(
+    AxlPciClassDb  *db
+    )
+{
+    if (db == NULL) {
+        return;
+    }
+    axl_hash_table_free(db->bases);
+    axl_hash_table_free(db->subs);
+    axl_hash_table_free(db->progs);
+    axl_free(db);
+}
+
+const char *
+axl_pci_class_db_base_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base
+    )
+{
+    if (db == NULL) {
+        return NULL;
+    }
+    return (const char *)axl_hash_table_lookup(db->bases, base_key(base));
+}
+
+const char *
+axl_pci_class_db_sub_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base,
+    uint8_t               sub
+    )
+{
+    if (db == NULL) {
+        return NULL;
+    }
+    return (const char *)axl_hash_table_lookup(db->subs, sub_key(base, sub));
+}
+
+const char *
+axl_pci_class_db_prog_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base,
+    uint8_t               sub,
+    uint8_t               prog
+    )
+{
+    if (db == NULL) {
+        return NULL;
+    }
+    return (const char *)axl_hash_table_lookup(db->progs,
+                                               prog_key(base, sub, prog));
+}
+
+// ---------------------------------------------------------------------------
+// Process-global singleton
+// ---------------------------------------------------------------------------
+
+static AxlPciClassDb *g_class_singleton = NULL;
+
+int
+axl_pci_class_load(
+    const char  *override_path
+    )
+{
+    if (g_class_singleton != NULL) {
+        return 0;  /* idempotent */
+    }
+    if (override_path != NULL) {
+        return axl_pci_class_open(override_path, &g_class_singleton);
+    }
+    char *path = axl_resolve_data_file(NULL, "pci-class.json5");
+    if (path == NULL) {
+        return -1;
+    }
+    int rc = axl_pci_class_open(path, &g_class_singleton);
+    axl_free(path);
+    return rc;
+}
+
+void
+axl_pci_class_free(
+    void
+    )
+{
+    axl_pci_class_close(g_class_singleton);
+    g_class_singleton = NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Internal accessors used by axl-pci.c lookup_* helpers.
+// Walk the singleton overlay; return NULL if no overlay loaded or
+// the overlay has no entry for this code. Caller falls back to
+// compiled-in tables.
+// ---------------------------------------------------------------------------
+
+const char *
+_axl_pci_class_overlay_base(
+    uint8_t  base
+    )
+{
+    return axl_pci_class_db_base_name(g_class_singleton, base);
+}
+
+const char *
+_axl_pci_class_overlay_sub(
+    uint8_t  base,
+    uint8_t  sub
+    )
+{
+    return axl_pci_class_db_sub_name(g_class_singleton, base, sub);
+}
+
+const char *
+_axl_pci_class_overlay_prog(
+    uint8_t  base,
+    uint8_t  sub,
+    uint8_t  prog
+    )
+{
+    return axl_pci_class_db_prog_name(g_class_singleton, base, sub, prog);
+}

@@ -15,9 +15,12 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-pci-class-internal.h"
 #include <axl/axl-pci.h>
 #include <axl/axl-acpi.h>
+#include <axl/axl-array.h>
 #include <axl/axl-log.h>
+#include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("pci");
@@ -402,6 +405,7 @@ static const PciSubEntry pci_sub_table[] = {
     /* 0x00: Unclassified */
     { 0x00, 0x00, "Non-VGA" },
     { 0x00, 0x01, "VGA-compatible" },
+    { 0x00, 0x80, "Other" },
     /* 0x01: Mass storage controller */
     { 0x01, 0x00, "SCSI" },
     { 0x01, 0x01, "IDE" },
@@ -537,8 +541,9 @@ static const PciSubEntry pci_sub_table[] = {
 
 /* Programming interfaces for the subclasses where they're commonly
    meaningful (USB host controller flavor, IDE/SATA/NVMe, serial UART
-   variants, etc.). Tools that don't recognize prog_if just see the
-   subclass name and "<unknown>" prog. */
+   variants, etc.). Subclasses without a defined prog_if don't appear
+   here — axl_pci_class_string omits the prog tier in that case rather
+   than printing a "<unknown>" placeholder. */
 static const PciProgEntry pci_prog_table[] = {
     /* IDE 01:01 */
     { 0x01, 0x01, 0x00, "ISA-compat" },
@@ -625,31 +630,46 @@ static const PciProgEntry pci_prog_table[] = {
     { 0x0C, 0x07, 0x02, "Block Transfer" },
 };
 
+/* Per-tier lookup: consult the optional class-name overlay first
+   (loaded via axl_pci_class_load), then fall back to the compiled-in
+   table. NULL when neither has an entry. */
 static const char *
 lookup_base(uint8_t base)
 {
+    const char *override = _axl_pci_class_overlay_base(base);
+    if (override != NULL) {
+        return override;
+    }
     for (size_t i = 0; i < sizeof(pci_base_table) / sizeof(pci_base_table[0]); i++) {
         if (pci_base_table[i].base == base) {
             return pci_base_table[i].name;
         }
     }
-    return "<unknown>";
+    return NULL;
 }
 
 static const char *
 lookup_sub(uint8_t base, uint8_t sub)
 {
+    const char *override = _axl_pci_class_overlay_sub(base, sub);
+    if (override != NULL) {
+        return override;
+    }
     for (size_t i = 0; i < sizeof(pci_sub_table) / sizeof(pci_sub_table[0]); i++) {
         if (pci_sub_table[i].base == base && pci_sub_table[i].sub == sub) {
             return pci_sub_table[i].name;
         }
     }
-    return "<unknown>";
+    return NULL;
 }
 
 static const char *
 lookup_prog(uint8_t base, uint8_t sub, uint8_t prog)
 {
+    const char *override = _axl_pci_class_overlay_prog(base, sub, prog);
+    if (override != NULL) {
+        return override;
+    }
     for (size_t i = 0; i < sizeof(pci_prog_table) / sizeof(pci_prog_table[0]); i++) {
         if (pci_prog_table[i].base == base
             && pci_prog_table[i].sub == sub
@@ -658,11 +678,16 @@ lookup_prog(uint8_t base, uint8_t sub, uint8_t prog)
             return pci_prog_table[i].name;
         }
     }
-    return "<unknown>";
+    return NULL;
 }
 
 int
-axl_pci_class_string(uint32_t class_code, char *buf, size_t buflen)
+axl_pci_class_string_fmt(
+    uint32_t        class_code,
+    AxlPciClassFmt  fmt,
+    char           *buf,
+    size_t          buflen
+    )
 {
     if (buf == NULL || buflen == 0) {
         return -1;
@@ -670,10 +695,65 @@ axl_pci_class_string(uint32_t class_code, char *buf, size_t buflen)
     uint8_t base = (uint8_t)((class_code >> 16) & 0xFFu);
     uint8_t sub  = (uint8_t)((class_code >>  8) & 0xFFu);
     uint8_t prog = (uint8_t)( class_code        & 0xFFu);
-    return axl_snprintf(buf, buflen, "%s / %s / %s",
-                        lookup_base(base),
-                        lookup_sub(base, sub),
-                        lookup_prog(base, sub, prog));
+
+    /* Omit empty tiers rather than emit "<unknown>" placeholders —
+       many spec subclasses have no defined prog_if (Host bridge,
+       ISA bridge, SMBus, ...) and printing "<unknown>" for those
+       is just noise. When the base class itself is unrecognized,
+       fall back to numeric "Class XXXXXX" form. Both behaviors
+       mirror Linux lspci. */
+    const char *base_str = lookup_base(base);
+    const char *sub_str  = lookup_sub(base, sub);
+    const char *prog_str = lookup_prog(base, sub, prog);
+
+    /* Common numeric fallback for "wholly unknown" cases — used by
+       every fmt mode when the requested tier (and the next-coarser
+       fallback) has no entry. */
+    char numeric[20];
+    axl_snprintf(numeric, sizeof(numeric), "Class %06x",
+                 (unsigned)(class_code & 0xFFFFFFu));
+
+    switch (fmt) {
+    case AXL_PCI_CLASS_FMT_BASE:
+        if (base_str == NULL) {
+            return axl_snprintf(buf, buflen, "%s", numeric);
+        }
+        return axl_snprintf(buf, buflen, "%s", base_str);
+
+    case AXL_PCI_CLASS_FMT_SUBCLASS:
+        /* Prefer subclass; coarsen to base; then numeric. */
+        if (sub_str != NULL) {
+            return axl_snprintf(buf, buflen, "%s", sub_str);
+        }
+        if (base_str != NULL) {
+            return axl_snprintf(buf, buflen, "%s", base_str);
+        }
+        return axl_snprintf(buf, buflen, "%s", numeric);
+
+    case AXL_PCI_CLASS_FMT_FULL:
+        if (base_str == NULL) {
+            return axl_snprintf(buf, buflen, "%s", numeric);
+        }
+        if (sub_str == NULL) {
+            return axl_snprintf(buf, buflen, "%s", base_str);
+        }
+        if (prog_str == NULL) {
+            return axl_snprintf(buf, buflen, "%s / %s",
+                                base_str, sub_str);
+        }
+        return axl_snprintf(buf, buflen, "%s / %s / %s",
+                            base_str, sub_str, prog_str);
+    }
+    /* Unknown fmt enum value. */
+    return -1;
+}
+
+int
+axl_pci_class_string(uint32_t class_code, char *buf, size_t buflen)
+{
+    return axl_pci_class_string_fmt(class_code,
+                                    AXL_PCI_CLASS_FMT_FULL,
+                                    buf, buflen);
 }
 
 int
@@ -976,6 +1056,323 @@ axl_pci_find_by_class(
 }
 
 // ---------------------------------------------------------------------------
+// Bridges and topology
+// ---------------------------------------------------------------------------
+
+#define PCI_HEADER_TYPE_PCI_BRIDGE  0x01u  /* low 7 bits of byte at 0x0E */
+#define PCI_BRIDGE_PRIMARY_BUS      0x18u
+#define PCI_BRIDGE_SECONDARY_BUS    0x19u
+#define PCI_BRIDGE_SUBORDINATE_BUS  0x1Au
+
+int
+axl_pci_bridge_info(
+    AxlPciAddr     addr,
+    AxlPciBridge  *out
+    )
+{
+    if (out == NULL) {
+        return -1;
+    }
+    uint8_t htype;
+    if (axl_pci_read_config_8(addr, 0x0E, &htype) != 0) {
+        return -1;
+    }
+    if ((htype & 0x7Fu) != PCI_HEADER_TYPE_PCI_BRIDGE) {
+        return -1;
+    }
+    uint8_t pri, sec, sub;
+    if (axl_pci_read_config_8(addr, PCI_BRIDGE_PRIMARY_BUS, &pri) != 0
+        || axl_pci_read_config_8(addr, PCI_BRIDGE_SECONDARY_BUS, &sec) != 0
+        || axl_pci_read_config_8(addr, PCI_BRIDGE_SUBORDINATE_BUS, &sub) != 0)
+    {
+        return -1;
+    }
+    out->primary     = pri;
+    out->secondary   = sec;
+    out->subordinate = sub;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+
+/* Per-function row collected by the tree walker's first pass. The
+   bridge bus number is captured here so the recursive descent doesn't
+   re-read config space. */
+typedef struct {
+    AxlPciAddr  addr;
+    bool        is_bridge;
+    uint8_t     secondary_bus;
+} AxlPciTreeFunc;
+
+/* Per-segment 256-bit bitmap helpers — one bit per bus number.
+   Used both for "this bus is some bridge's secondary" (so it's NOT
+   a root bus) and for "this bus has been visited" (cycle break). */
+typedef struct {
+    uint64_t  bits[4];      /* 4 * 64 = 256 bits */
+} BusBitmap;
+
+static inline void
+bus_bitmap_set(
+    BusBitmap  *b,
+    uint8_t     bus
+    )
+{
+    b->bits[bus >> 6] |= ((uint64_t)1 << (bus & 0x3Fu));
+}
+
+static inline bool
+bus_bitmap_get(
+    const BusBitmap  *b,
+    uint8_t           bus
+    )
+{
+    return (b->bits[bus >> 6] >> (bus & 0x3Fu)) & 1u;
+}
+
+/* Comparator for sorting AxlPciTreeFunc by (bus, dev, func). Bus
+   sort lets the recursion locate "all functions on bus N" by scanning
+   the contiguous run rather than re-filtering. */
+static int
+tree_func_cmp(
+    const void  *a,
+    const void  *b
+    )
+{
+    const AxlPciTreeFunc *x = a;
+    const AxlPciTreeFunc *y = b;
+    if (x->addr.seg  != y->addr.seg)  { return (x->addr.seg  < y->addr.seg)  ? -1 : 1; }
+    if (x->addr.bus  != y->addr.bus)  { return (x->addr.bus  < y->addr.bus)  ? -1 : 1; }
+    if (x->addr.dev  != y->addr.dev)  { return (x->addr.dev  < y->addr.dev)  ? -1 : 1; }
+    if (x->addr.func != y->addr.func) { return (x->addr.func < y->addr.func) ? -1 : 1; }
+    return 0;
+}
+
+static int
+tree_walk_bus(
+    AxlArray      *funcs,
+    uint16_t       seg,
+    uint8_t        bus,
+    unsigned       depth,
+    BusBitmap     *visited,
+    AxlPciTreeFn   fn,
+    void          *ctx
+    )
+{
+    if (depth >= AXL_PCI_TREE_MAX_DEPTH) {
+        /* Defense-in-depth: real PCI trees are <8 levels. */
+        return -1;
+    }
+    if (bus_bitmap_get(visited, bus)) {
+        /* Cycle — bridge claims a bus already on the walk path. */
+        return 0;
+    }
+    bus_bitmap_set(visited, bus);
+
+    /* Walk every function on this bus. Funcs are sorted by
+       (seg, bus, dev, func), so the run of matches is contiguous. */
+    size_t n = axl_array_len(funcs);
+    for (size_t i = 0; i < n; i++) {
+        const AxlPciTreeFunc *f = axl_array_get(funcs, i);
+        if (f->addr.seg != seg || f->addr.bus != bus) {
+            continue;
+        }
+        int rc = fn(f->addr, depth, f->is_bridge, ctx);
+        if (rc != 0) {
+            return rc;
+        }
+        if (f->is_bridge && f->secondary_bus != bus) {
+            rc = tree_walk_bus(funcs, seg, f->secondary_bus,
+                               depth + 1, visited, fn, ctx);
+            if (rc != 0) {
+                return rc;
+            }
+        }
+    }
+    return 0;
+}
+
+int
+axl_pci_tree_for_each(
+    AxlPciTreeFn  fn,
+    void         *ctx
+    )
+{
+    if (fn == NULL || ensure_init() != 0) {
+        return -1;
+    }
+
+    /* Pass 1: collect every responding function with its bridge
+       bus, if any. */
+    AXL_AUTOPTR(AxlArray) funcs = axl_array_new(sizeof(AxlPciTreeFunc));
+    if (funcs == NULL) {
+        return -1;
+    }
+    AxlPciAddr *p = NULL;
+    while ((p = axl_pci_next(p)) != NULL) {
+        AxlPciTreeFunc f = { .addr = *p, .is_bridge = false, .secondary_bus = 0 };
+        AxlPciBridge   br;
+        if (axl_pci_bridge_info(*p, &br) == 0) {
+            f.is_bridge     = true;
+            f.secondary_bus = br.secondary;
+        }
+        if (axl_array_append(funcs, &f) != 0) {
+            return -1;
+        }
+    }
+    axl_array_sort(funcs, tree_func_cmp);
+
+    /* Pass 2: per segment, mark every bridge's secondary as a child
+       bus, then start the walk from each unmarked bus that has at
+       least one function. Segments are walked in MCFG order. */
+    for (size_t s = 0; s < cached_mcfg.count; s++) {
+        uint16_t seg = cached_mcfg.segments[s].segment;
+        BusBitmap is_child = { .bits = {0} };
+        BusBitmap has_funcs = { .bits = {0} };
+
+        size_t n = axl_array_len(funcs);
+        for (size_t i = 0; i < n; i++) {
+            const AxlPciTreeFunc *f = axl_array_get(funcs, i);
+            if (f->addr.seg != seg) {
+                continue;
+            }
+            bus_bitmap_set(&has_funcs, f->addr.bus);
+            if (f->is_bridge && f->secondary_bus != f->addr.bus) {
+                bus_bitmap_set(&is_child, f->secondary_bus);
+            }
+        }
+
+        BusBitmap visited = { .bits = {0} };
+        for (unsigned b = 0; b < 256; b++) {
+            uint8_t bus = (uint8_t)b;
+            if (bus_bitmap_get(&has_funcs, bus)
+                && !bus_bitmap_get(&is_child, bus))
+            {
+                int rc = tree_walk_bus(funcs, seg, bus, 0,
+                                       &visited, fn, ctx);
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Capability ID -> name (legacy + PCIe extended)
+// Tables sourced from the PCI Local Bus Spec and PCIe Base Spec
+// capability-ID assignments. Linear search — tables are small and
+// the lookup is human-facing print only.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint8_t      id;
+    const char  *name;
+} PciCapEntry;
+
+typedef struct {
+    uint16_t     id;
+    const char  *name;
+} PciExtCapEntry;
+
+static const PciCapEntry pci_cap_table[] = {
+    { 0x01, "Power Management" },
+    { 0x02, "AGP" },
+    { 0x03, "Vital Product Data" },
+    { 0x04, "Slot Identification" },
+    { 0x05, "MSI" },
+    { 0x06, "CompactPCI Hot Swap" },
+    { 0x07, "PCI-X" },
+    { 0x08, "HyperTransport" },
+    { 0x09, "Vendor-Specific" },
+    { 0x0A, "Debug Port" },
+    { 0x0B, "CompactPCI Central Resource Control" },
+    { 0x0C, "PCI Hot-Plug" },
+    { 0x0D, "PCI Bridge Subsystem Vendor ID" },
+    { 0x0E, "AGP 8x" },
+    { 0x0F, "Secure Device" },
+    { 0x10, "PCI Express" },
+    { 0x11, "MSI-X" },
+    { 0x12, "SATA Data/Index Configuration" },
+    { 0x13, "Advanced Features" },
+    { 0x14, "Enhanced Allocation" },
+    { 0x15, "Flattening Portal Bridge" },
+};
+
+static const PciExtCapEntry pci_ext_cap_table[] = {
+    { 0x0001, "Advanced Error Reporting" },
+    { 0x0002, "Virtual Channel" },
+    { 0x0003, "Device Serial Number" },
+    { 0x0004, "Power Budgeting" },
+    { 0x0005, "Root Complex Link Declaration" },
+    { 0x0006, "Root Complex Internal Link Control" },
+    { 0x0007, "Root Complex Event Collector Endpoint Association" },
+    { 0x0008, "Multi-Function Virtual Channel" },
+    { 0x0009, "Virtual Channel (MFVC)" },
+    { 0x000A, "Root Complex Register Block" },
+    { 0x000B, "Vendor-Specific Extended" },
+    { 0x000C, "Configuration Access Correlation" },
+    { 0x000D, "Access Control Services" },
+    { 0x000E, "Alternative Routing-ID Interpretation" },
+    { 0x000F, "Address Translation Services" },
+    { 0x0010, "Single Root I/O Virtualization" },
+    { 0x0011, "Multi Root I/O Virtualization" },
+    { 0x0012, "Multicast" },
+    { 0x0013, "Page Request Interface" },
+    { 0x0014, "Reserved for AMD" },
+    { 0x0015, "Resizable BAR" },
+    { 0x0016, "Dynamic Power Allocation" },
+    { 0x0017, "TPH Requester" },
+    { 0x0018, "Latency Tolerance Reporting" },
+    { 0x0019, "Secondary PCI Express" },
+    { 0x001A, "Protocol Multiplexing" },
+    { 0x001B, "Process Address Space ID" },
+    { 0x001C, "LN Requester" },
+    { 0x001D, "Downstream Port Containment" },
+    { 0x001E, "L1 PM Substates" },
+    { 0x001F, "Precision Time Measurement" },
+    { 0x0020, "PCI Express over M-PHY" },
+    { 0x0021, "FRS Queueing" },
+    { 0x0022, "Readiness Time Reporting" },
+    { 0x0023, "Designated Vendor-Specific" },
+    { 0x0024, "VF Resizable BAR" },
+    { 0x0025, "Data Link Feature" },
+    { 0x0026, "Physical Layer 16.0 GT/s" },
+    { 0x0027, "Lane Margining at the Receiver" },
+    { 0x0028, "Hierarchy ID" },
+    { 0x0029, "Native PCIe Enclosure Management" },
+    { 0x002A, "Physical Layer 32.0 GT/s" },
+    { 0x002B, "Alternate Protocol" },
+    { 0x002C, "System Firmware Intermediary" },
+    { 0x002D, "Shadow Functions" },
+    { 0x002E, "Data Object Exchange" },
+    { 0x002F, "Device 3" },
+    { 0x0030, "Integrity and Data Encryption" },
+};
+
+const char *
+axl_pci_cap_id_str(uint8_t cap_id)
+{
+    for (size_t i = 0; i < sizeof(pci_cap_table) / sizeof(pci_cap_table[0]); i++) {
+        if (pci_cap_table[i].id == cap_id) {
+            return pci_cap_table[i].name;
+        }
+    }
+    return "<unknown>";
+}
+
+const char *
+axl_pci_ext_cap_id_str(uint16_t cap_id)
+{
+    for (size_t i = 0; i < sizeof(pci_ext_cap_table) / sizeof(pci_ext_cap_table[0]); i++) {
+        if (pci_ext_cap_table[i].id == cap_id) {
+            return pci_ext_cap_table[i].name;
+        }
+    }
+    return "<unknown>";
+}
+
+// ---------------------------------------------------------------------------
 // Capability walk (legacy)
 // ---------------------------------------------------------------------------
 
@@ -993,6 +1390,19 @@ axl_pci_cap_next(
 
     uint16_t next;
     if (prev_off == 0) {
+        /* Absent-function check at walk entry. ECAM reads to a
+           nonexistent BDF return all-1s; without this guard the
+           status register reads as 0xFFFF (cap-list bit set), the
+           cap pointer reads as 0xFC, and the cap header at 0xFC
+           reads as 0xFFFF whose `next` byte is 0xFF — the iter
+           then re-reads the same offset forever. Surfaced on aa64
+           QEMU virt where 0:1f.0 doesn't exist. */
+        uint16_t vid;
+        if (axl_pci_read_config_16(addr, PCI_VENDOR_ID_OFFSET, &vid) != 0
+            || vid == 0xFFFF)
+        {
+            return -1;
+        }
         uint16_t status;
         if (axl_pci_read_config_16(addr, PCI_STATUS_OFFSET, &status) != 0) {
             return -1;
@@ -1019,6 +1429,14 @@ axl_pci_cap_next(
        otherwise loop (e.g. a cap whose `next` points back into the
        header). */
     if (next < 0x40 || next > 0xFC) {
+        return -1;
+    }
+    /* Forward-progress guard. Spec doesn't formally require monotonic
+       cap offsets, but no real device chains backwards; a back-pointer
+       (next <= prev_off) is malformed and would loop the iter. Also
+       catches the all-1s self-loop (next == prev_off == 0xFC) on a
+       device that becomes absent mid-walk. */
+    if (next <= prev_off) {
         return -1;
     }
     uint8_t cap_id;
@@ -1056,6 +1474,14 @@ axl_pci_ext_cap_next(
         off = (uint16_t)((hdr >> 20) & 0xFFFu);
     }
     if (off == 0) {
+        return -1;
+    }
+    /* Forward-progress guard, mirror of the legacy-cap walk. A next
+       offset that doesn't move forward is malformed and would loop;
+       valid ext-cap offsets live in 0x100..0xFFC. The absent-device
+       all-1s case still terminates via the cap_id == PCIE_EXT_CAP_END
+       check below, but this catches mid-walk cycles too. */
+    if (prev_off != 0 && off <= prev_off) {
         return -1;
     }
 

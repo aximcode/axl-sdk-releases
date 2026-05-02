@@ -119,22 +119,38 @@ The tag push triggers three workflows on the same commit:
 - **Docs** (`.github/workflows/docs.yml`) — Doxygen + Sphinx
   build + Cloudflare Pages deploy.
 
-**Realistic timing.** Plan for **20–35 minutes** total, not the
-~5 minutes earlier versions of this doc claimed. The dominant
-cost centers (in order):
+**Realistic timing.** On healthy GitHub-runner infrastructure
+the whole flow is **~4–5 minutes wall-clock** (parallel across
+the three workflows). Verified on v0.9.0's successful retry:
+Release 2m57s, Docs 1m44s, CI 4m10s. The longest individual
+jobs are CI's QEMU integration tests (~4 min) and Release's
+Build-tools-aa64 (~3 min, slower than x64 due to QEMU user-mode
+emulation of cross-tool execution). All other jobs finish in
+under 2 minutes.
 
-1. AArch64 builds run on x86 hosted runners under QEMU
-   user-mode emulation. Each `make ARCH=aa64 BUILD=RELEASE` takes
-   8–12 minutes depending on iPXE pull + mbedtls compile.
-2. QEMU integration tests in CI run the unit binaries inside a
-   firmware image — that's a real boot + 2000+ test cases per
-   arch.
-3. Multi-arch .deb/.rpm packaging serializes after both arch
-   builds finish.
-4. The `Docs` workflow occasionally fails on the apt-mirror DNS
-   step (a GitHub-runner-side flake). Re-running the workflow
-   alone is the fix; not a release blocker since artifacts come
-   from `Release`, not `Docs`.
+**Pathological case — bad-DNS days.** When GitHub Actions runner
+DNS is flaky (azure.archive.ubuntu.com mirrors), `apt-get
+install` retries can stall jobs at **30–40 minutes** before
+giving up. The v0.9.0 first attempt hit this — five jobs across
+CI/Release/Docs all failed at exit-code 100 (apt's "couldn't
+fetch packages") after 18–40 minute stalls. The workflows now
+write `Acquire::Retries=3` and `Acquire::http(s)::Timeout=15`
+into `/etc/apt/apt.conf.d/99-axl-retry` as the first action of
+every install-deps step — that bounds the worst case to ~5
+minutes on bad days instead of 30+. Even with the bound, plan
+for **up to ~15 minutes total** if a re-run is needed during a
+runner network blip.
+
+**Workflow notes:**
+
+- AArch64 builds run on x86 hosted runners. The library + tests
+  + tools cross-compile fine in 1-3 min each; QEMU emulation
+  only kicks in when something needs to *execute* an aa64 binary
+  (e.g. CI's QEMU integration tests).
+- The `Docs` workflow occasionally hits transient apt-mirror
+  failures even on otherwise-healthy days. Re-running just that
+  workflow is the fix; it's not a release blocker since
+  artifacts come from `Release`, not `Docs`.
 
 Watch all three. Prefer `gh run watch <id>` — it streams the
 per-step status and exits the moment the run reaches a terminal
@@ -191,11 +207,15 @@ releases, the right fix is to stop polling so aggressively:
   ```sh
   SHA=$(git rev-parse HEAD)
   while true; do
+    # Filter to nodes with a real workflowRun — GitHub creates
+    # phantom check-suites with no run attached (status QUEUED
+    # forever). Without the filter the loop never terminates.
     res=$(gh api graphql -f query="
     { repository(owner:\"aximcode\",name:\"axl-sdk\") {
         object(expression:\"$SHA\") { ... on Commit {
           checkSuites(first:10) { nodes { workflowRun { workflow { name } } status conclusion } }
     } } } }" | jq -r '.data.repository.object.checkSuites.nodes[] |
+                       select(.workflowRun != null) |
                        "\(.workflowRun.workflow.name): \(.status) \(.conclusion // "-")"' | sort)
     echo "$res"
     echo "$res" | grep -q "IN_PROGRESS\|QUEUED" || break

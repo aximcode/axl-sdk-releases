@@ -27,6 +27,7 @@
 #ifndef AXL_PCI_H
 #define AXL_PCI_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -199,13 +200,26 @@ axl_pci_get_class_code(
 /**
  * @brief Format a 24-bit PCI class code as a human-readable string.
  *
- * Decodes per the PCI Code and ID Assignment Specification — three
- * tiers: base class (`(class_code >> 16) & 0xFF`), subclass
+ * Decodes per the PCI Code and ID Assignment Specification — up to
+ * three tiers: base class (`(class_code >> 16) & 0xFF`), subclass
  * (`(class_code >> 8) & 0xFF`), and programming interface
- * (`class_code & 0xFF`). Output shape: `"<base> / <sub> / <prog>"`
- * (e.g. `"Display controller / VGA-compatible / standard"`); a tier
- * with no recognized name renders as `"<unknown>"`. Always
- * NUL-terminates @p buf (snprintf-shape).
+ * (`class_code & 0xFF`). Tiers with no spec-defined name are
+ * omitted rather than rendered as `<unknown>` placeholders. This
+ * mirrors Linux lspci's *posture* (no placeholder noise) but not
+ * its output shape — lspci collapses the triplet to a single
+ * subclass string ("Host bridge"), while AXL keeps the slash-joined
+ * triplet so the base class stays visible. Output shapes:
+ *
+ *   - All known: `"<base> / <sub> / <prog>"`
+ *     (e.g. `"Display controller / VGA-compatible / standard"`)
+ *   - Known base+sub, unknown prog: `"<base> / <sub>"`
+ *     (e.g. `"Bridge / Host bridge"`)
+ *   - Known base, unknown sub: `"<base>"`
+ *     (e.g. `"Bridge"`)
+ *   - Wholly unknown class: `"Class XXXXXX"` (numeric hex), in the
+ *     spirit of lspci's numeric fallback for unidentified classes.
+ *
+ * Always NUL-terminates @p buf (snprintf-shape).
  *
  * Vendor/device-name lookup (the `pci.ids` database) is intentionally
  * out of scope — too large for AXL, and consumers grep their own.
@@ -218,6 +232,46 @@ axl_pci_class_string(
     uint32_t   class_code,   ///< 24-bit class code
     char      *buf,       ///< destination buffer
     size_t     buflen     ///< capacity of @p buf
+);
+
+/**
+ * @brief Output shape selector for @ref axl_pci_class_string_fmt.
+ *
+ * Different consumers want different verbosity from the same class
+ * code. Verbose tools want the full slash-joined triplet; row-oriented
+ * tools where the class column blows out the right margin want the
+ * subclass alone (matches Linux lspci's output shape); coarse
+ * categorization wants just the base.
+ */
+typedef enum {
+    AXL_PCI_CLASS_FMT_FULL     = 0,  ///< "Bridge / Host bridge" (axl_pci_class_string default)
+    AXL_PCI_CLASS_FMT_SUBCLASS = 1,  ///< "Host bridge" (subclass tier alone)
+    AXL_PCI_CLASS_FMT_BASE     = 2,  ///< "Bridge" (base tier alone)
+} AxlPciClassFmt;
+
+/**
+ * @brief Format a class code with a chosen output shape.
+ *
+ * Behavior in each mode follows the same "omit unknown tiers,
+ * fall back to numeric `Class XXXXXX` when wholly unknown" posture
+ * as @ref axl_pci_class_string:
+ *
+ *   - `FMT_FULL` is identical to @ref axl_pci_class_string.
+ *   - `FMT_SUBCLASS` emits just the subclass name. If the subclass
+ *     isn't in the table, falls back to the base name; if the base
+ *     is also unknown, falls back to numeric.
+ *   - `FMT_BASE` emits just the base name. If unknown, numeric
+ *     fallback.
+ *
+ * @return number of bytes written excluding NUL, or -1 on bad args
+ *     or unknown @p fmt.
+ */
+int
+axl_pci_class_string_fmt(
+    uint32_t        class_code,
+    AxlPciClassFmt  fmt,
+    char           *buf,
+    size_t          buflen
 );
 
 // ---------------------------------------------------------------------------
@@ -275,6 +329,97 @@ axl_pci_find_by_class(
 );
 
 // ---------------------------------------------------------------------------
+// Bridges and topology
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Per-bridge bus-number tuple.
+ *
+ * For a PCI-PCI bridge function (header type 1), these three bytes
+ * live at config-space offsets 0x18 / 0x19 / 0x1A. The bridge claims
+ * config-space transactions for buses in the inclusive range
+ * `[secondary, subordinate]` and forwards them downstream.
+ */
+typedef struct {
+    uint8_t  primary;       ///< upstream bus the bridge sits on
+    uint8_t  secondary;     ///< first bus on the downstream side
+    uint8_t  subordinate;   ///< highest bus number behind this bridge
+} AxlPciBridge;
+
+/**
+ * @brief Read the bridge bus tuple, if @p addr is a PCI-PCI bridge.
+ *
+ * Reads the header-type byte first; on a non-bridge function (type 0
+ * endpoint or type 2 CardBus), returns -1 without touching @p out.
+ * Successful return guarantees @p addr is header type 1 and the
+ * three bus-number bytes are populated.
+ *
+ * @return 0 on success, -1 if @p addr is not a PCI-PCI bridge or any
+ *     bus error is encountered.
+ */
+int
+axl_pci_bridge_info(
+    AxlPciAddr      addr,   ///< target function
+    AxlPciBridge   *out     ///< [out] primary/secondary/subordinate
+);
+
+#define AXL_PCI_TREE_MAX_DEPTH  16u  ///< depth backstop for tree walks
+
+/**
+ * @brief Per-node callback for @ref axl_pci_tree_for_each.
+ *
+ * @param addr      function being visited
+ * @param depth     0 for root-bus devices, 1 for first-level bridge
+ *                  children, etc.
+ * @param is_bridge `true` if the function is a PCI-PCI bridge whose
+ *                  secondary bus is about to be descended into
+ * @param ctx       caller's opaque context
+ *
+ * @return non-zero to stop the walk early; the value becomes the
+ *     return of @ref axl_pci_tree_for_each. Return 0 to continue.
+ */
+typedef int (*AxlPciTreeFn)(
+    AxlPciAddr  addr,
+    unsigned    depth,
+    bool        is_bridge,
+    void       *ctx
+);
+
+/**
+ * @brief Walk the PCI topology in tree order, depth-first per segment.
+ *
+ * Builds an in-memory model of the topology by enumerating every
+ * responding function once via @ref axl_pci_next, then identifying
+ * root buses per segment (any bus that's not the secondary bus of
+ * some bridge) and recursing through bridges. Functions on the same
+ * bus are visited in `(dev, func)` order; bridge children are
+ * visited immediately after their bridge.
+ *
+ * Multi-segment platforms are walked one segment at a time; segments
+ * are visited in MCFG-table order.
+ *
+ * Defensive against malformed or hostile topologies: per-segment
+ * visited-bus bitmaps detect cycles, and a recursion-depth cap
+ * (`AXL_PCI_TREE_MAX_DEPTH`) backstops pathological chains. Same
+ * posture as `AXL_DP_MAX_NODES` for device-path iteration and the
+ * cap-walk monotonic-progress guard.
+ *
+ * Not reentrant against @ref axl_pci_next — the walker drives
+ * `axl_pci_next` internally and they share a static cursor. The
+ * callback must not call `axl_pci_next` (the tree walk itself uses
+ * `axl_pci_*` config-space reads, which are fine).
+ *
+ * @return 0 on a clean walk, the callback's first non-zero return
+ *     if it stopped early, or -1 if MCFG is unavailable / any
+ *     internal allocation fails.
+ */
+int
+axl_pci_tree_for_each(
+    AxlPciTreeFn  fn,    ///< per-node callback (must not be NULL)
+    void         *ctx    ///< opaque context forwarded to @p fn
+);
+
+// ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
 
@@ -313,6 +458,41 @@ axl_pci_ext_cap_next(
     uint16_t    prev_off,    ///< previous offset, or 0 to start
     uint16_t   *out_off,     ///< [out] offset of the next capability
     uint16_t   *out_id       ///< [out] extended capability ID
+);
+
+/**
+ * @brief Look up a human-readable name for a legacy PCI capability ID.
+ *
+ * Covers the standard IDs from the PCI Local Bus Specification (PM,
+ * AGP, VPD, Slot ID, MSI, CompactPCI HotSwap, PCI-X, HyperTransport,
+ * Vendor-Specific, Debug, CompactPCI Resource, PCI HotPlug,
+ * Bridge Subsystem ID, AGP 8x, Secure, PCI Express, MSI-X, SATA,
+ * Advanced Features, Enhanced Allocation, FPB).
+ *
+ * @return A pointer to a static string. Always non-NULL — unknown
+ *     IDs return "<unknown>".
+ */
+const char *
+axl_pci_cap_id_str(
+    uint8_t  cap_id          ///< legacy capability ID (8 bits)
+);
+
+/**
+ * @brief Look up a human-readable name for a PCIe extended capability ID.
+ *
+ * Covers the standard IDs from PCIe Base Specification — AER, Virtual
+ * Channel, Serial Number, Power Budgeting, ACS, ATS, SR-IOV, MR-IOV,
+ * Multicast, Resizable BAR, DPA, TPH, LTR, Secondary PCIe, PMUX, PASID,
+ * LNR, DPC, L1 PM Substates, PTM, Frame Capability, ReadyToReset,
+ * Designated Vendor-Specific, VF Resizable BAR, Data Link Feature,
+ * Physical Layer 16/32 GT/s, Lane Margining, Hierarchy ID, NPEM, etc.
+ *
+ * @return A pointer to a static string. Always non-NULL — unknown
+ *     IDs return "<unknown>".
+ */
+const char *
+axl_pci_ext_cap_id_str(
+    uint16_t  cap_id         ///< extended capability ID (16 bits)
 );
 
 // ---------------------------------------------------------------------------
@@ -374,6 +554,437 @@ axl_pci_vpd_iter(
         void          *ctx          ///< caller's ctx
     ),
     void        *ctx           ///< opaque context forwarded to @p cb
+);
+
+// ---------------------------------------------------------------------------
+// Vendor / device / subsystem name database (optional sidecar JSON5)
+// ---------------------------------------------------------------------------
+
+/**
+ * @name Per-name length contracts
+ * @brief Maximum bytes (including NUL) any database lookup can return.
+ *
+ * Documented caps so consumers can stack-allocate buffers at compile
+ * time. The loader truncates over-cap entries on the way in (silent
+ * — `axl_json_get_string` does the truncation), so lookup return
+ * values are always within bounds. Forward-looking: the curated
+ * `share/pci-ids.json5` is well under these numbers today.
+ *
+ * @{
+ */
+/* Sized to comfortably hold real pci.ids entries — vendor strings
+   like "Advanced Micro Devices, Inc. [AMD/ATI]" run ~40 bytes,
+   device strings frequently 100-130 bytes, subsystem strings
+   similar. Composed name ≥ vendor + device + small fixed overhead
+   so axl_pci_format_name never truncates non-truncated inputs. */
+#define AXL_PCI_VENDOR_NAME_MAX     128u   ///< vendor entry max bytes
+#define AXL_PCI_DEVICE_NAME_MAX     192u   ///< device entry max bytes
+#define AXL_PCI_SUBSYS_NAME_MAX     192u   ///< subsystem entry max bytes
+#define AXL_PCI_CLASS_NAME_MAX      128u   ///< class entry max bytes
+#define AXL_PCI_NAME_COMPOSED_MAX   384u   ///< axl_pci_format_name output max
+/** @} */
+
+/**
+ * @brief Opaque handle to a loaded vendor/device/subsystem database.
+ *
+ * Created by @ref axl_pci_ids_open or @ref axl_pci_ids_open_from_buffer,
+ * destroyed by @ref axl_pci_ids_close. Multiple handles can coexist —
+ * a consumer that wants a "public + private" overlay loads two
+ * handles and queries them in priority order, so internal/OEM names
+ * shadow the public set on collisions.
+ *
+ * The process-global API (@ref axl_pci_ids_load and friends) wraps
+ * a single internal handle for the common case.
+ */
+typedef struct AxlPciIds AxlPciIds;
+
+/**
+ * @brief Open a database handle by reading a JSON5 file at @p path.
+ *
+ * @return 0 on success (handle returned via @p out),
+ *         -1 if @p path does not exist or is unreadable,
+ *         -2 if the file was found but JSON5 parsing or schema
+ *           validation failed.
+ *
+ * The -1 / -2 split lets tools log differently — "no database
+ * shipped" is a deployment problem (numeric fallback is fine),
+ * while "parse error" is an authoring problem that should be loud.
+ */
+int
+axl_pci_ids_open(
+    const char   *path,    ///< path to JSON5 file
+    AxlPciIds   **out      ///< [out] handle on success
+);
+
+/**
+ * @brief Open a database handle from an in-memory JSON5 buffer.
+ *
+ * Identical semantics to @ref axl_pci_ids_open but reads from a
+ * caller-owned buffer instead of a file. Useful for embedded or
+ * test fixtures that ship the database compiled in.
+ *
+ * @return 0 on success, -2 on parse / schema error.
+ *     (No -1 return — the buffer is the input, so "not found" doesn't
+ *     apply.)
+ */
+int
+axl_pci_ids_open_from_buffer(
+    const char   *json5,   ///< JSON5 source (no NUL required)
+    size_t        len,     ///< buffer length in bytes
+    AxlPciIds   **out      ///< [out] handle on success
+);
+
+/**
+ * @brief Free a database handle.
+ *
+ * NULL-safe. After calling, every pointer previously returned by
+ * the @c axl_pci_ids_*_name lookups against this handle is invalid.
+ */
+void
+axl_pci_ids_close(
+    AxlPciIds  *ids        ///< handle (NULL-safe)
+);
+
+/**
+ * @brief Vendor lookup against an explicit handle.
+ * @return database-owned string or NULL if unknown / handle empty.
+ */
+const char *
+axl_pci_ids_vendor_name(
+    const AxlPciIds  *ids,
+    uint16_t          vid
+);
+
+/**
+ * @brief Device lookup against an explicit handle.
+ * @return database-owned string or NULL if (vid, did) is unknown.
+ */
+const char *
+axl_pci_ids_device_name(
+    const AxlPciIds  *ids,
+    uint16_t          vid,
+    uint16_t          did
+);
+
+/**
+ * @brief Subsystem lookup against an explicit handle.
+ *
+ * Subsystem IDs identify the OEM card built around a piece of silicon
+ * — a server-vendor rebadged NIC's `(svid, sdid)` decodes to the OEM
+ * SKU name even though the underlying device's `(vid, did)` reports
+ * the silicon vendor. The (svid, sdid) pair lives at config offsets
+ * 0x2C / 0x2E on header-type-0 functions.
+ *
+ * @return database-owned string or NULL if (svid, sdid) is unknown.
+ */
+const char *
+axl_pci_ids_subsys_name(
+    const AxlPciIds  *ids,
+    uint16_t          svid,
+    uint16_t          sdid
+);
+
+/**
+ * @name Database iteration callbacks
+ * @brief Non-zero return stops the walk; the value propagates.
+ * @{
+ */
+typedef int (*AxlPciIdsVendorFn)(uint16_t vid,
+                                 const char *name, void *ctx);
+typedef int (*AxlPciIdsDeviceFn)(uint16_t vid, uint16_t did,
+                                 const char *name, void *ctx);
+typedef int (*AxlPciIdsSubsysFn)(uint16_t svid, uint16_t sdid,
+                                 const char *name, void *ctx);
+/** @} */
+
+/**
+ * @brief Iterate every vendor entry in a database.
+ *
+ * Useful for debug dumps ("show me everything in this overlay"),
+ * validators ("does my private DB shadow these public entries?"),
+ * and code that needs to materialize the database into a different
+ * representation (sorted list, text export, ...).
+ *
+ * Iteration order is hash-table-internal — do not rely on it.
+ *
+ * @return 0 if the walk completed without the callback stopping it,
+ *     the callback's first non-zero return if it stopped early, or
+ *     -1 if @p ids or @p fn is NULL.
+ */
+int
+axl_pci_ids_foreach_vendor(
+    const AxlPciIds   *ids,
+    AxlPciIdsVendorFn  fn,
+    void              *ctx
+);
+
+/// Iterate every (vid, did) device entry. See @ref axl_pci_ids_foreach_vendor.
+int
+axl_pci_ids_foreach_device(
+    const AxlPciIds   *ids,
+    AxlPciIdsDeviceFn  fn,
+    void              *ctx
+);
+
+/// Iterate every (svid, sdid) subsystem entry. See @ref axl_pci_ids_foreach_vendor.
+int
+axl_pci_ids_foreach_subsys(
+    const AxlPciIds   *ids,
+    AxlPciIdsSubsysFn  fn,
+    void              *ctx
+);
+
+// ---------------------------------------------------------------------------
+// Process-global database (singleton — thin shim over a single handle)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Load a curated PCI vendor/device/subsystem name database.
+ *
+ * Two modes selected by @p override_path:
+ *
+ *   - **Explicit** (`override_path` non-NULL): use exactly that path.
+ *     Returns -1 if the file is missing, -2 if found but malformed.
+ *     No fallback — explicit means explicit, so the error code
+ *     reflects what the user asked for.
+ *   - **Autodiscover** (`override_path` NULL): try `pci-ids.json5`
+ *     next to the running .efi (companion path), then in the
+ *     current working directory. Returns -1 if neither candidate
+ *     exists, -2 if a candidate was found but failed to parse.
+ *
+ * The file format is the JSON5 schema axl-sdk ships in
+ * `share/pci-ids.json5` — vendor entries `{ id, name }`, device
+ * entries `{ vid, did, name }`, optional subsystem entries
+ * `{ svid, sdid, name }`. Only IDs explicitly listed are decoded;
+ * for the long tail use @c scripts/pci-ids-to-json5.py to generate
+ * a custom database from the canonical pci.ids text file.
+ *
+ * Idempotent: a successful load is a no-op on subsequent calls.
+ *
+ * @return 0 on success,
+ *         -1 if no file was found,
+ *         -2 if a file was found but failed to parse (the "authoring
+ *           problem" the user fixes by editing the sidecar — distinct
+ *           from -1's "deployment problem" of a missing file).
+ */
+int
+axl_pci_ids_load(
+    const char  *override_path  ///< explicit path, or NULL to auto-discover
+);
+
+/**
+ * @brief Free the loaded vendor/device database.
+ *
+ * Safe to call when no database is loaded. After calling, the
+ * pointers previously returned from @ref axl_pci_vendor_name and
+ * @ref axl_pci_device_name are no longer valid.
+ */
+void
+axl_pci_ids_free(
+    void
+);
+
+/**
+ * @brief Look up a vendor name by 16-bit vendor ID.
+ *
+ * @return pointer to the vendor name (database-owned, valid until
+ *     @ref axl_pci_ids_free), or NULL if no database is loaded or
+ *     @p vid is not present in the loaded set.
+ */
+const char *
+axl_pci_vendor_name(
+    uint16_t  vid     ///< 16-bit vendor ID
+);
+
+/**
+ * @brief Look up a device name by (vid, did) pair.
+ *
+ * Does not fall back to the vendor name when the device is unknown
+ * — callers compose their own "vendor name + numeric device ID"
+ * fallback (or use @ref axl_pci_format_name).
+ *
+ * @return pointer to the device name (database-owned), or NULL if
+ *     no database is loaded or the pair isn't in the loaded set.
+ */
+const char *
+axl_pci_device_name(
+    uint16_t  vid,    ///< 16-bit vendor ID
+    uint16_t  did     ///< 16-bit device ID
+);
+
+/**
+ * @brief Look up a subsystem (OEM card) name by (svid, sdid) pair.
+ *
+ * See @ref axl_pci_ids_subsys_name for the rationale (OEM-rebadged
+ * silicon needs OEM SKU decoding). Same fallback semantics as the
+ * other singleton helpers — NULL when no database is loaded or the
+ * pair is unknown.
+ */
+const char *
+axl_pci_subsys_name(
+    uint16_t  svid,   ///< 16-bit subsystem vendor ID
+    uint16_t  sdid    ///< 16-bit subsystem device ID
+);
+
+/**
+ * @brief Compose a "vendor + device" display string against a handle.
+ *
+ * Centralizes the rendering convention every consumer would
+ * otherwise reinvent — the goal is that every tool prints the same
+ * string for the same (vid, did) pair. Output:
+ *
+ *   - vendor known + device known   → `"<vendor> <device>"`
+ *   - vendor known + device unknown → `"<vendor> Device <DID hex>"`
+ *   - vendor unknown                → `"<VID>:<DID>"`
+ *
+ * Hex literals in the output are lowercase, 4-wide, zero-padded
+ * (matching Linux lspci convention).
+ *
+ * Vendor-unknown short-circuits regardless of device-name presence:
+ * without a verified vendor a device-name hit is ambiguous
+ * provenance, so the fallback is always all-numeric.
+ *
+ * Output never exceeds @ref AXL_PCI_NAME_COMPOSED_MAX bytes — pin
+ * `char buf[AXL_PCI_NAME_COMPOSED_MAX]` and the formatter is
+ * truncation-safe.
+ *
+ * @return number of bytes written excluding NUL (snprintf-shape),
+ *     or -1 on bad arguments.
+ */
+int
+axl_pci_ids_format_name(
+    const AxlPciIds  *ids,
+    uint16_t          vid,
+    uint16_t          did,
+    char             *buf,
+    size_t            buflen
+);
+
+/**
+ * @brief Singleton-backed convenience wrapper for @ref axl_pci_ids_format_name.
+ *
+ * Equivalent to `axl_pci_ids_format_name(<process-global handle>, ...)`.
+ * Layered-DB consumers should call the handle form directly with
+ * their own priority chain.
+ */
+int
+axl_pci_format_name(
+    uint16_t  vid,
+    uint16_t  did,
+    char     *buf,
+    size_t    buflen
+);
+
+// ---------------------------------------------------------------------------
+// Class-name database (optional sidecar JSON5 overlay)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Opaque handle to a loaded PCI class-code name overlay.
+ *
+ * Parallel to @ref AxlPciIds but for class triplet decoding. The
+ * compiled-in tables in axl-pci.c stay as the bootstrap default;
+ * a loaded overlay is consulted first per-tier (base, sub, prog),
+ * with the compiled-in table as the fallback. New class triplets
+ * (CXL Memory Expanders, future PCIe class assignments, ...) can
+ * land via a `git pull` of the JSON5 sidecar without rebuilding
+ * every consumer.
+ *
+ * The schema (see `share/pci-class.json5`) lets each entry pin
+ * any subset of (base, sub, prog) — base only for "all subclasses
+ * of this base", base+sub for a subclass, base+sub+prog for a
+ * specific prog_if.
+ */
+typedef struct AxlPciClassDb AxlPciClassDb;
+
+/**
+ * @brief Open a class-overlay handle from a JSON5 file.
+ * @return 0 success, -1 file missing, -2 found-but-malformed.
+ */
+int
+axl_pci_class_open(
+    const char       *path,
+    AxlPciClassDb   **out
+);
+
+/**
+ * @brief Open a class-overlay handle from an in-memory buffer.
+ * @return 0 success, -2 parse / schema error.
+ */
+int
+axl_pci_class_open_from_buffer(
+    const char       *json5,
+    size_t            len,
+    AxlPciClassDb   **out
+);
+
+/**
+ * @brief Free a class-overlay handle. NULL-safe.
+ */
+void
+axl_pci_class_close(
+    AxlPciClassDb  *db
+);
+
+/**
+ * @brief Per-tier overlay lookups against an explicit handle.
+ *
+ * Only the overlay is consulted — these do NOT fall back to the
+ * compiled-in tables. Consumers that want "overlay first, then
+ * compiled-in" should use @ref axl_pci_class_string_fmt, which
+ * internally walks the singleton overlay then the built-in tables.
+ *
+ * @return database-owned string or NULL if @p db is NULL or the
+ *     tier has no override entry for this code.
+ */
+const char *
+axl_pci_class_db_base_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base
+);
+const char *
+axl_pci_class_db_sub_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base,
+    uint8_t               sub
+);
+const char *
+axl_pci_class_db_prog_name(
+    const AxlPciClassDb  *db,
+    uint8_t               base,
+    uint8_t               sub,
+    uint8_t               prog
+);
+
+/**
+ * @brief Load the process-global class-name overlay.
+ *
+ * Same lookup semantics as @ref axl_pci_ids_load — explicit
+ * @p override_path is authoritative; NULL autodiscovers via
+ * `pci-class.json5` next to the running .efi, then in cwd.
+ *
+ * Once loaded, every @ref axl_pci_class_string and
+ * @ref axl_pci_class_string_fmt call consults the overlay before
+ * the compiled-in tables. The compiled-in tables stay as the
+ * bootstrap so axl-sdk works without a sidecar at all.
+ *
+ * @return 0 success, -1 missing, -2 parse error, idempotent on
+ *     a successful load.
+ */
+int
+axl_pci_class_load(
+    const char  *override_path
+);
+
+/**
+ * @brief Free the process-global class-name overlay.
+ *
+ * After calling, lookups fall back exclusively to the compiled-in
+ * tables.
+ */
+void
+axl_pci_class_free(
+    void
 );
 
 #ifdef __cplusplus

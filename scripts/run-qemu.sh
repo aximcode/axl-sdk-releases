@@ -86,6 +86,7 @@ INTERACTIVE=false
 MOUNT_DIR=""
 MOUNT_TAG="hostfs"
 MEM="512M"            # guest RAM (also used for memory-backend-file size)
+BRIDGES=false         # --bridges adds a small PCI bridge tree (mirrors test runner)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -94,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --raw)        RAW=true; shift ;;
         --screenshot) SCREENSHOT="$2"; shift 2 ;;
         --net)        NET=true; shift ;;
+        --bridges)    BRIDGES=true; shift ;;
         --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
@@ -137,6 +139,11 @@ Options:
   --raw                    Show full serial log (including firmware boot)
   --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
   --net                    Enable user-mode networking (virtio-net)
+  --bridges                Add a small PCI bridge tree (one PCIe root
+                           port + a virtio-rng device behind it). Mirrors
+                           the topology the unit-test runner uses, so
+                           interactive smoke-tests of lspci -t / future
+                           tree-walking tools see real bridges.
   --nic-model MODEL        QEMU NIC model (implies --net). Examples:
                            virtio-net-pci (default), e1000, e1000e,
                            rtl8139, pcnet, ne2k_pci. Use to test
@@ -375,6 +382,20 @@ if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
 fi
 if [[ -n "$EFI_FILE" ]]; then
     cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+fi
+
+# Auto-stage the vendor/device name sidecar so axl_pci_ids_load
+# finds it via the standard companion-path resolver. Tiny file
+# (~3 KB), and non-PCI tools simply ignore its presence — keeping
+# this unconditional avoids the "lspci shows no names because I
+# forgot --bridges" footgun.
+PCI_IDS_FILE="$(dirname "$0")/../share/pci-ids.json5"
+if [[ -f "$PCI_IDS_FILE" ]]; then
+    cp "$PCI_IDS_FILE" "$STAGING/pci-ids.json5"
+fi
+PCI_CLASS_FILE="$(dirname "$0")/../share/pci-class.json5"
+if [[ -f "$PCI_CLASS_FILE" ]]; then
+    cp "$PCI_CLASS_FILE" "$STAGING/pci-class.json5"
 fi
 # Stage VirtioFsDxe.efi if the active OVMF doesn't ship it integrated.
 if [[ -n "$VFS_DRIVER_STAGE" ]]; then
@@ -624,6 +645,17 @@ cpu_summary() {
 # Build QEMU command
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
+
+# --bridges: matching topology to test/integration/common-test.sh so
+# tools that walk PCI bridges (lspci -t, sysinfo --pci, ...) can be
+# smoke-tested interactively against the same shape unit tests use.
+# slot is auto-assigned to avoid colliding with the q35 mch at 00:00.0.
+if [[ "$BRIDGES" == "true" ]]; then
+    CMD+=(
+        -device "pcie-root-port,id=axl_rp0,bus=pcie.0,chassis=1"
+        -device "virtio-rng-pci,bus=axl_rp0"
+    )
+fi
 
 # GDB stub: -gdb tcp::PORT exposes the GDB protocol; -S starts the
 # guest CPU halted so the debugger can attach before the firmware

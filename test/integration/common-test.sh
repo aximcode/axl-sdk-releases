@@ -196,6 +196,27 @@ test_build_qemu_cmd() {
         -nographic
         -no-reboot
     )
+    # Inject a small PCI bridge tree so the AxlPci tree-walker tests
+    # have non-trivial topology to exercise. Stock q35 + aa64 virt are
+    # otherwise flat (no PCI-PCI bridges), and shipping bridge code
+    # without test coverage is how the aa64 cap-walk infinite-loop
+    # (commit 8b90954) made it past CI in the first place.
+    #
+    # Layout: one PCIe root port (a PCI-PCI bridge per the spec) on
+    # the root PCIe bus, with a virtio-rng device behind it. The
+    # exact BDF/secondary-bus is QEMU/firmware-assigned; tests that
+    # care must locate the bridge by class (0x060400) rather than by
+    # hard-coded address.
+    #
+    # Cross-arch: pcie.0 is the root PCIe bus on both q35 and aa64
+    # virt; virtio-rng-pci is supported by both QEMU machines.
+    # chassis=1 is required for pcie-root-port; slot is left unset
+    # so QEMU auto-assigns and avoids collision with the q35 mch
+    # at 00:00.0.
+    TEST_QEMU_CMD+=(
+        -device "pcie-root-port,id=axl_rp0,bus=pcie.0,chassis=1"
+        -device "virtio-rng-pci,bus=axl_rp0"
+    )
     # Debug hooks — opt-in via env vars so the normal test path is
     # untouched. TEST_QEMU_GDB=PORT exposes the QEMU GDB stub for
     # interactive debugging; TEST_QEMU_DEBUGCON=FILE captures OVMF
