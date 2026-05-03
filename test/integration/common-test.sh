@@ -217,6 +217,22 @@ test_build_qemu_cmd() {
         -device "pcie-root-port,id=axl_rp0,bus=pcie.0,chassis=1"
         -device "virtio-rng-pci,bus=axl_rp0"
     )
+    # USB controller + leaf devices so AxlUsb tests have real
+    # EFI_USB_IO_PROTOCOL handles to enumerate. qemu-xhci is
+    # supported on both q35 and aa64-virt; usb-mouse is class-
+    # compliant HID and gets enumerated by OVMF / AAVMF without an
+    # extra driver bundle. usb-hub adds a downstream USB bus tier
+    # so the AxlUsb tree walker (Phase F) can prove non-zero hub
+    # depth against a real port chain; usb-tablet attaches behind
+    # it via port=hub_port.subport notation (QEMU's hierarchical
+    # USB addressing). Total: 3 EFI_USB_IO_PROTOCOL handles
+    # (mouse direct, hub direct, tablet behind hub).
+    TEST_QEMU_CMD+=(
+        -device "qemu-xhci,id=axl_usb0"
+        -device "usb-mouse,bus=axl_usb0.0,port=1"
+        -device "usb-hub,bus=axl_usb0.0,port=2"
+        -device "usb-tablet,bus=axl_usb0.0,port=2.1"
+    )
     # Debug hooks — opt-in via env vars so the normal test path is
     # untouched. TEST_QEMU_GDB=PORT exposes the QEMU GDB stub for
     # interactive debugging; TEST_QEMU_DEBUGCON=FILE captures OVMF

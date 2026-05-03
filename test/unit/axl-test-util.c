@@ -250,10 +250,20 @@ test_path(void)
     test_check(axl_path_extension("noext") == NULL,
         "path: no extension");
 
-    // Join
+    // Join — separator matches the anchor's style. UEFI/Windows-style
+    // anchors (containing `\` or `:`) get a backslash separator;
+    // POSIX-style anchors get `/`. Mixed-separator paths produced by
+    // the older always-`/` behavior were silently rejected by UEFI
+    // shell's OpenFileByName ("fs0:/foo" doesn't open).
     result = axl_path_join("fs0:\\dir", "file.efi");
-    test_check(result != NULL && axl_strcmp(result, "fs0:\\dir/file.efi") == 0,
-        "path: join");
+    test_check(result != NULL && axl_strcmp(result, "fs0:\\dir\\file.efi") == 0,
+        "path: join (UEFI anchor → backslash separator)");
+    axl_free(result);
+
+    // POSIX anchor still gets `/` separator.
+    result = axl_path_join("/usr/bin", "axl-cc");
+    test_check(result != NULL && axl_strcmp(result, "/usr/bin/axl-cc") == 0,
+        "path: join (POSIX anchor → forward slash separator)");
     axl_free(result);
 
     // Join with trailing slash
@@ -629,9 +639,9 @@ test_smbios(void)
 
     // ----- Type 9 spec decoders -----
     {
-        /* Canonical SMBIOS spec / EDK2 values. Many "consumer" slot
-         * tables (incl. an early version of delldiags' cmd_bios.c)
-         * had values shifted by 4 — rejecting that here. */
+        /* Canonical SMBIOS spec / EDK2 values. Some in-the-wild
+         * consumer slot tables have been observed shifted by 4
+         * — rejecting that drift here. */
         test_check(axl_strcmp(axl_smbios_slot_type_str(0xA5), "PCIe") == 0,
                    "smbios: slot_type_str 0xA5 = PCIe");
         test_check(axl_strcmp(axl_smbios_slot_type_str(0xAA), "PCIe x16") == 0,
@@ -700,14 +710,14 @@ test_smbios(void)
         test_check(axl_smbios_slot_width_str(0xFF) == NULL,
                    "smbios: slot_width_str unknown → NULL");
 
-        /* Current usage — Dell convention "CPU NOT INSTALLED" for 0x05 */
+        /* Current usage — OEM convention "CPU NOT INSTALLED" for 0x05 */
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x03), "Empty") == 0,
                    "smbios: slot_usage_str 0x03 = Empty");
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x04), "InUse") == 0,
                    "smbios: slot_usage_str 0x04 = InUse");
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x05),
                               "CPU NOT INSTALLED") == 0,
-                   "smbios: slot_usage_str 0x05 = CPU NOT INSTALLED (Dell convention)");
+                   "smbios: slot_usage_str 0x05 = CPU NOT INSTALLED (OEM convention)");
         test_check(axl_smbios_slot_usage_str(0xFF) == NULL,
                    "smbios: slot_usage_str unknown → NULL");
     }
@@ -744,7 +754,8 @@ test_smbios(void)
         /* EMBEDDED set */
         test_check(axl_smbios_chassis_class(0x21) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
                    "smbios: chassis_class 0x21 (IoT Gateway) = EMBEDDED");
-        /* PITFALL: 0x23 is Mongoose Mini PC (Dell), NOT IoT Gateway */
+        /* PITFALL: 0x23 is Mongoose Mini PC (OEM convention), NOT
+         * IoT Gateway */
         test_check(axl_smbios_chassis_class(0x23) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
                    "smbios: chassis_class 0x23 (Mongoose Mini PC) = EMBEDDED");
 
@@ -971,9 +982,11 @@ test_path_companion(void)
 {
     char *p;
 
-    /* Standard case: anchor has a directory component. */
+    /* Standard case: anchor has a directory component. axl_path_join
+       picks the separator from the anchor's style — UEFI/Windows-style
+       anchor stays consistent backslash. */
     p = axl_path_companion("fs0:\\tools\\memspd.efi", "jedec.json");
-    test_check(p != NULL && axl_strcmp(p, "fs0:\\tools/jedec.json") == 0,
+    test_check(p != NULL && axl_strcmp(p, "fs0:\\tools\\jedec.json") == 0,
                "path_companion: dirname + name (UEFI separators)");
     axl_free(p);
 
@@ -1630,7 +1643,7 @@ test_subcommand_dispatch(void)
 
     /* prog_name NULL → derive from argv[0] basename */
     {
-        char *argv[] = { (char *)"fs0:\\path\\do.efi", (char *)"bios" };
+        char *argv[] = { (char *)"fs0:\\path\\app.efi", (char *)"bios" };
         g_sub_calls = 0;
         int rc = axl_subcommand_dispatch(cmds, count, 2, argv, NULL);
         test_check(rc == 42 && g_sub_calls == 1,

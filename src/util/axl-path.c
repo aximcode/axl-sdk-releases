@@ -174,12 +174,26 @@ axl_resolve_data_file(const char *override_path, const char *name)
         return axl_strdup(override_path);
     }
 
-    /* 2. Companion file beside the running binary. */
-    char *companion = axl_path_companion(axl_app_argv0(), name);
-    if (path_file_exists(companion)) {
-        return companion;
+    /* 2. Companion file beside the running binary. Prefer the image's
+       canonical FILEPATH (from EFI_LOADED_IMAGE_PROTOCOL) over argv[0]:
+       argv[0] is whatever the shell typed and may be a bare basename
+       (e.g. startup.nsh's `app.efi` without a `cd \` prefix), in which
+       case axl_path_companion gives a cwd-relative ./<name> that won't
+       resolve. The image-path source reflects where UEFI actually
+       loaded the binary from, so it works regardless of shell cwd or
+       how the script wrote the invocation. Fall through to argv[0]
+       when no image path is available (synthetic load contexts). */
+    const char *anchors[2] = { axl_app_image_path(), axl_app_argv0() };
+    for (int i = 0; i < 2; i++) {
+        if (anchors[i] == NULL) {
+            continue;
+        }
+        char *companion = axl_path_companion(anchors[i], name);
+        if (path_file_exists(companion)) {
+            return companion;
+        }
+        axl_free(companion);
     }
-    axl_free(companion);
 
     /* 3. Bare name (current working directory). */
     if (path_file_exists(name)) {
@@ -208,6 +222,19 @@ axl_path_join(const char *dir, const char *name)
     name_len = axl_strlen(name);
     need_sep = (dir_len > 0 && !is_sep(dir[dir_len - 1]));
 
+    /* Pick the separator to insert based on the dir's existing style:
+       if it carries a backslash (UEFI / Windows convention) or a
+       drive/volume colon (e.g. "fs0:"), keep the path Windows-style
+       with `\\` so shell OpenFileByName accepts it (UEFI shell
+       silently rejects "fs0:/foo"). Otherwise default to POSIX `/`. */
+    char sep = '/';
+    for (i = 0; i < dir_len; i++) {
+        if (dir[i] == '\\' || dir[i] == ':') {
+            sep = '\\';
+            break;
+        }
+    }
+
     total = dir_len + (need_sep ? 1 : 0) + name_len;
     result = axl_malloc(total + 1);
     if (result == NULL) {
@@ -220,7 +247,7 @@ axl_path_join(const char *dir, const char *name)
         result[pos++] = dir[i];
     }
     if (need_sep) {
-        result[pos++] = '/';
+        result[pos++] = sep;
     }
     for (i = 0; i < name_len; i++) {
         result[pos++] = name[i];

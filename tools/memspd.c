@@ -13,105 +13,32 @@
       memspd [--jedec-file PATH] show   <slot-hex>   Decoded fields
       memspd [--jedec-file PATH] decode <slot-hex>   Raw hex dump + decoded fields
 
-    Vendor-name lookup is data-driven via @ref axl_path_companion at
-    startup: try `jedec.json5` next to the .efi binary first, then the
-    current working directory. `--jedec-file` overrides both. When no
-    sidecar loads, the tool prints raw 16-bit JEP-106 codes.
+    Vendor-name lookup is data-driven via the library's
+    @ref axl_spd_ids_load + companion-path autodiscovery: try
+    `jedec.json5` next to the .efi binary first, then the current
+    working directory. `--jedec-file` overrides both. When no
+    sidecar loads, the tool prints the numeric JEP-106 code via
+    @ref axl_spd_format_name's "0xCCCC" fallback.
 **/
 
 #include <axl.h>
 #include <axl/axl-spd.h>
 
 // ---------------------------------------------------------------------------
-// JEDEC vendor table — code -> name, backed by AxlHashTable
+// JEDEC sidecar loader — thin wrapper around the library API. The
+// pre_run hook fires after AxlArgs has parsed the global flags but
+// before the verb handler runs, so --jedec-file is available here.
 // ---------------------------------------------------------------------------
 
-static AxlHashTable *g_jedec      = NULL;
-static char          g_jedec_path[256];
-
-static bool
-try_load_jedec(
-    const char  *path
-    )
-{
-    if (path == NULL || path[0] == '\0') {
-        return false;
-    }
-    AxlJsonReader r       = { 0 };
-    void         *raw     = NULL;
-    if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,
-                                  &r, &raw, NULL)) {
-        return false;
-    }
-
-    AxlHashTable *table = axl_hash_table_new_full(
-        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
-    if (table == NULL) {
-        axl_json_free(&r);
-        axl_free(raw);
-        return false;
-    }
-
-    AxlJsonArrayIter it;
-    if (axl_json_array_begin(&r, "vendors", &it)) {
-        AxlJsonReader entry;
-        while (axl_json_array_next(&it, &entry)) {
-            uint64_t code64 = 0;
-            char     name[64] = "";
-
-            if (!axl_json_get_uint(&entry, "code", &code64)
-                || code64 == 0 || code64 > 0xFFFF
-                || !axl_json_get_string(&entry, "name", name, sizeof(name)))
-            {
-                continue;
-            }
-            uint16_t code = (uint16_t)code64;
-            char *name_owned = axl_strdup(name);
-            if (name_owned == NULL) {
-                continue;
-            }
-            if (axl_hash_table_insert(table,
-                                      (void *)(uintptr_t)code,
-                                      name_owned) < 0) {
-                axl_free(name_owned);
-            }
-        }
-    }
-
-    axl_json_free(&r);
-    axl_free(raw);
-
-    g_jedec = table;
-    axl_strlcpy(g_jedec_path, path, sizeof(g_jedec_path));
-    return true;
-}
+static AxlSidecarStatus  g_jedec_load_rc = AXL_SIDECAR_FILE_MISSING;
 
 static void
-load_jedec_table_from_args(
+spd_ids_load_pre_run(
     AxlArgs  *a
     )
 {
-    if (g_jedec != NULL) {
-        return;
-    }
-    char *resolved = axl_resolve_data_file(
-        axl_args_get_string(a, "jedec-file"),
-        "jedec.json5");
-    if (resolved != NULL) {
-        (void)try_load_jedec(resolved);
-        axl_free(resolved);
-    }
-}
-
-static const char *
-jedec_lookup(
-    uint16_t  code
-    )
-{
-    if (code == 0 || g_jedec == NULL) {
-        return NULL;
-    }
-    return (const char *)axl_hash_table_lookup(g_jedec, (void *)(uintptr_t)code);
+    g_jedec_load_rc = axl_spd_ids_load(
+        axl_args_get_string(a, "jedec-file"));
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +67,7 @@ print_mfg(
         axl_printf("  %-22s (unset)\n", label);
         return;
     }
-    const char *name = jedec_lookup(code);
+    const char *name = axl_spd_vendor_name(code);
     if (name != NULL) {
         axl_printf("  %-22s %s (0x%04X)\n", label, name, code);
     } else {
@@ -206,7 +133,7 @@ do_list(
         if (info.ddr_generation == 0) {
             axl_printf("Slot 0x%02X  unknown SPD (key byte 0x00)\n", *slot);
         } else {
-            const char *vendor = jedec_lookup(info.mfg_code_module);
+            const char *vendor = axl_spd_vendor_name(info.mfg_code_module);
             const char *part   = info.part_number[0] ? info.part_number : "(no part #)";
             axl_printf("Slot 0x%02X  %-4s  %-12s  %s\n",
                        *slot,
@@ -235,9 +162,10 @@ do_show(
         return 2;
     }
     print_info(addr, &info);
-    if (g_jedec != NULL) {
-        axl_printf("\n(JEDEC table: %zu entries from %s)\n",
-                   axl_hash_table_size(g_jedec), g_jedec_path);
+    if (g_jedec_load_rc == AXL_SIDECAR_OK) {
+        axl_printf("\n(JEDEC table loaded)\n");
+    } else if (g_jedec_load_rc == AXL_SIDECAR_PARSE_ERROR) {
+        axl_printf("\n(JEDEC sidecar present but failed to parse — fix and retry)\n");
     } else {
         axl_printf("\n(JEDEC table not loaded — pass --jedec-file to resolve vendor codes)\n");
     }
@@ -312,12 +240,11 @@ main(
         .help         = "Read JEDEC SPD content from DDR4/DDR5 DIMMs",
         .flags        = global_flags,
         .verbs        = verbs,
-        .pre_run      = load_jedec_table_from_args,
+        .pre_run      = spd_ids_load_pre_run,
     });
 
-    if (g_jedec != NULL) {
-        axl_hash_table_free(g_jedec);
-        g_jedec = NULL;
-    }
+    /* axl_spd_ids_load registered an atexit cleanup on first
+       successful load; the runtime drops the table at process exit
+       without us needing an explicit _free here. */
     return rc;
 }

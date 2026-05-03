@@ -1,0 +1,12 @@
+// Test-only PCI class overlay. Staged by test/integration/test-axl.sh
+// next to AxlTestPlatform.efi as `pci-class-test.json5` so
+// test_pci_class_db_singleton_overrides can load it via the explicit-
+// override path and verify the overlay-applied behavior end-to-end
+// without polluting the production share/pci-class.json5 with a
+// visible "[overlay]" marker.
+{
+    schema: 1,
+    classes: [
+        { base: 0x06, sub: 0x00, name: 'Host bridge [overlay]' },
+    ],
+}

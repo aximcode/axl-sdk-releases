@@ -21,8 +21,8 @@ AXL_DIR="${AXL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 #   2. command -v on $PATH (system install — apt/dnf qemu-system-*)
 #   3. Fall back to $HOME/projects/qemu/install/bin (legacy custom build)
 # Hard-coding the legacy path as a default broke downstream consumers
-# (delldiags axl-utils, etc.) on machines that have system QEMU/OVMF
-# installed via the package manager but no AXL custom build tree.
+# on machines that have system QEMU/OVMF installed via the package
+# manager but no AXL custom build tree.
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------

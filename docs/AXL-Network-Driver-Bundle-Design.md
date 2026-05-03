@@ -20,7 +20,7 @@ trick:
   proprietary; aggregating them inside an Apache-2.0 binary creates
   redistribution problems we don't want.
 
-Real-user-affecting data point: a 2010-era Dell EDK1 firmware
+Real-user-affecting data point: a 2010-era OEM EDK1 firmware
 (`Edk-Dev-Snapshot-20100527`) has no UEFI 2.6 NIC drivers built in
 and no UEFI 2.x option ROMs to fall back on. The current tools
 fail there.
@@ -130,8 +130,8 @@ Hello from host HTTP server — verified by axl-sdk fetch through
 This proves the full network stack — NIC → SNP → MNP → IP4 →
 DHCP4 → TCP4 → HTTP — flows through the **staged-from-disk iPXE
 driver** with no firmware NIC support and no QEMU option ROM.
-The same path on Mark's 2010 Dell EDK1 firmware should produce
-the same result.
+The same path on the 2010-era OEM EDK1 firmware referenced above
+should produce the same result.
 
 TLS path (https:// in `fetch`, or `rfbrowse`) was not separately
 tested — TLS sits atop TCP4 and depends on mbedtls (statically
@@ -255,8 +255,8 @@ Pending:
 
 7. **Tag v0.6.0**, update CHANGELOG, push.
 8. **Validate on real hardware** — loaner with a NIC OVMF doesn't
-   natively support (Mark's 2010 EDK1 Dell would do; another
-   option is a Realtek-only PC).
+   natively support (the 2010-era OEM EDK1 firmware referenced
+   above qualifies; another option is a Realtek-only PC).
 
 ## Final consumer-flow validation
 

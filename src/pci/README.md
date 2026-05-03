@@ -217,14 +217,21 @@ if (axl_pci_ids_load(NULL) == 0) {
 }
 ```
 
-`axl_pci_ids_load` returns:
-  - `0` on success (idempotent on the second call)
-  - `-1` if no candidate file exists
-  - `-2` if a candidate was found but failed to parse
+`axl_pci_ids_load` returns an `AxlSidecarStatus` (defined in
+`<axl/axl-sidecar.h>` and shared with AxlSpdIds, AxlUsbIds, and
+AxlPciClassDb):
+
+  - `AXL_SIDECAR_OK` on success (idempotent on the second call)
+  - `AXL_SIDECAR_FILE_MISSING` if no candidate file exists
+  - `AXL_SIDECAR_PARSE_ERROR` if a candidate was found but failed
+    to parse
 
 The split lets tools log differently — "no database shipped" is a
 deployment problem (numeric fallback is fine), while "parse error"
-is an authoring problem worth being loud about.
+is an authoring problem worth being loud about. Numeric values
+match the legacy `0/-1/-2` ABI, so legacy callers using
+`if (rc != 0)` still compile and run; new code uses the named
+constants.
 
 Two schema versions supported:
 
@@ -243,7 +250,7 @@ Two schema versions supported:
 Both populate the same internal hash tables — lookups are global
 on the respective key regardless of which form the file used. The
 loader pivots on the `schema` field; an unrecognized schema number
-returns `-2` (parse error) rather than silently misparsing.
+returns `AXL_SIDECAR_PARSE_ERROR` rather than silently misparsing.
 
 Subsystem entries identify the OEM card built around a piece of
 silicon; the `(svid, sdid)` pair lives at config-space offsets

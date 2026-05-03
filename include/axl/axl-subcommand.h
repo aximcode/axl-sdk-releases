@@ -8,24 +8,24 @@
  *     AxlArgs's multi-verb mode (`AxlArgsApp.verbs[]`) strictly subsumes
  *     this dispatcher and adds typed positional args, bounds checking,
  *     and auto-generated `--help`. AxlSubcommand is retained as a thin
- *     wrapper for source compatibility while existing consumers (notably
- *     delldiags `do.efi`) migrate. New tools should not use this header.
+ *     wrapper for source compatibility while out-of-tree consumers
+ *     migrate. New tools should not use this header.
  *
  * Subcommand-style CLI dispatch for multi-command UEFI apps. Pairs with
- * axl-config — `mkrd` was the canonical "single-purpose tool" shape and
- * `do.efi` the "multi-command" shape; both have been migrated.
+ * axl-config — `mkrd` was the canonical "single-purpose tool" shape; the
+ * multi-command shape has been migrated to AxlArgs in tree.
  *
  * Migrating to AxlArgs in one diff:
  *
  *     // before:
- *     static int do_bios(int argc, char **argv) { ... }
+ *     static int tool_bios(int argc, char **argv) { ... }
  *     static const AxlSubcommand commands[] = {
- *         { "bios", do_bios, "[test|pci|irq|slot|emb]",
- *           "do bios test  — ..." },
+ *         { "bios", tool_bios, "[test|pci|irq|slot|emb]",
+ *           "tool bios test  — ..." },
  *     };
  *     int main(int argc, char **argv) {
  *         return axl_subcommand_dispatch(commands, ARRAY_LEN(commands),
- *             argc, argv, "do");
+ *             argc, argv, "tool");
  *     }
  *
  *     // after:
@@ -33,18 +33,18 @@
  *         { .name = "args", .type = AXL_ARG_MULTI,
  *           .help = "subcommand arguments" }, {0}
  *     };
- *     static int do_bios(AxlArgs *a) {
+ *     static int tool_bios(AxlArgs *a) {
  *         int n = axl_args_get_pos_count(a);
  *         const char *sub = (n > 0) ? axl_args_get_pos(a, 0) : NULL;
  *         ...
  *     }
  *     static const AxlArgsNode verbs[] = {
- *         { .name = "bios", .handler = do_bios, .positionals = bios_args,
+ *         { .name = "bios", .handler = tool_bios, .positionals = bios_args,
  *           .help = "BIOS / SMBIOS info (test|pci|irq|slot|emb)" }, {0}
  *     };
  *     int main(int argc, char **argv) {
  *         return axl_args_run(argc, argv, &(AxlArgsNode){
- *             .name = "do", .verbs = verbs,
+ *             .name = "tool", .verbs = verbs,
  *         });
  *     }
  */

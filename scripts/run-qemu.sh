@@ -140,10 +140,12 @@ Options:
   --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
   --net                    Enable user-mode networking (virtio-net)
   --bridges                Add a small PCI bridge tree (one PCIe root
-                           port + a virtio-rng device behind it). Mirrors
-                           the topology the unit-test runner uses, so
-                           interactive smoke-tests of lspci -t / future
-                           tree-walking tools see real bridges.
+                           port + a virtio-rng device behind it) AND a
+                           USB topology (qemu-xhci + usb-mouse + usb-hub
+                           + usb-tablet). Mirrors the topology the unit-
+                           test runner uses, so interactive smoke-tests
+                           of lspci -t and lsusb -t see real bridges
+                           and real USB hub-port chains.
   --nic-model MODEL        QEMU NIC model (implies --net). Examples:
                            virtio-net-pci (default), e1000, e1000e,
                            rtl8139, pcnet, ne2k_pci. Use to test
@@ -647,13 +649,18 @@ mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 
 # --bridges: matching topology to test/integration/common-test.sh so
-# tools that walk PCI bridges (lspci -t, sysinfo --pci, ...) can be
-# smoke-tested interactively against the same shape unit tests use.
+# tools that walk PCI bridges (lspci -t, sysinfo --pci, ...) and USB
+# hubs (lsusb -t) can be smoke-tested interactively against the same
+# shape unit tests use.
 # slot is auto-assigned to avoid colliding with the q35 mch at 00:00.0.
 if [[ "$BRIDGES" == "true" ]]; then
     CMD+=(
         -device "pcie-root-port,id=axl_rp0,bus=pcie.0,chassis=1"
         -device "virtio-rng-pci,bus=axl_rp0"
+        -device "qemu-xhci,id=axl_usb0"
+        -device "usb-mouse,bus=axl_usb0.0,port=1"
+        -device "usb-hub,bus=axl_usb0.0,port=2"
+        -device "usb-tablet,bus=axl_usb0.0,port=2.1"
     )
 fi
 

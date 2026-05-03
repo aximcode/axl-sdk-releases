@@ -139,6 +139,8 @@ LIB_SOURCES = \
     src/data/axl-string.c \
     src/data/axl-str-wide.c \
     src/data/axl-hash-table.c \
+    src/data/axl-sidecar.c \
+    src/data/axl-class-fmt.c \
     src/data/axl-array.c \
     src/data/axl-list.c \
     src/data/axl-slist.c \
@@ -182,6 +184,9 @@ LIB_SOURCES = \
     src/pci/axl-pci.c \
     src/pci/axl-pci-ids.c \
     src/pci/axl-pci-class.c \
+    src/usb/axl-usb.c \
+    src/usb/axl-usb-class.c \
+    src/usb/axl-usb-ids.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
@@ -231,6 +236,7 @@ LIB_SOURCES = \
     src/spd/axl-spd.c \
     src/spd/axl-spd-ddr4.c \
     src/spd/axl-spd-ddr5.c \
+    src/spd/axl-spd-ids.c \
     src/posix/axl-app.c \
     src/runtime/axl-atexit.c \
     src/runtime/axl-registry.c \
@@ -380,6 +386,9 @@ $(BUILDDIR)/%.o: src/acpi/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/pci/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/usb/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/smbus/%.c | $(BUILDDIR)
@@ -713,7 +722,7 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)

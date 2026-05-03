@@ -127,8 +127,15 @@ axl_path_companion(
  * (jedec ID DB, vendor lists, board configs, etc.):
  *
  *   1. If @p override_path is non-NULL and the file exists, use it.
- *   2. `axl_path_companion(axl_app_argv0(), name)` — same directory as
- *      the running binary.
+ *   2. Companion path beside the running binary. Two anchors are
+ *      tried in order:
+ *        a. @ref axl_app_image_path — canonical FILEPATH from
+ *           EFI_LOADED_IMAGE_PROTOCOL. Reliable regardless of how
+ *           the shell invoked the binary (basename vs full path,
+ *           cwd-rooted vs absolute).
+ *        b. @ref axl_app_argv0 — the shell-supplied invocation
+ *           string. Fallback for synthetic load contexts where the
+ *           image path is unavailable.
  *   3. @p name as-is (current working directory).
  *
  * Returns the first path that exists. Caller must axl_free() the

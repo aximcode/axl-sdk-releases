@@ -204,6 +204,19 @@ for arch in x64 aa64; do
     TOOLS_STAGE=$(mktemp -d -t axl-tools-XXXXXX)
     cp "$PROJECT_ROOT/out/native-$arch/tools/"*.efi "$TOOLS_STAGE/"
     echo "$PKG_VERSION" > "$TOOLS_STAGE/VERSION"
+    # Stage the curated JSON5 sidecars next to the .efi binaries so
+    # axl_*_ids_load's companion-path autodiscovery resolves them
+    # without an explicit --ids-file flag. lspci / lsusb / memspd
+    # all read these on startup if the user copies the whole tarball
+    # contents to a FAT USB stick. Files that don't exist in the
+    # source tree (rare; only on stripped checkouts) are skipped
+    # silently.
+    for sidecar in pci-ids.json5 pci-class.json5 \
+                   usb-ids.json5 jedec.json5; do
+        if [[ -f "$PROJECT_ROOT/share/$sidecar" ]]; then
+            cp "$PROJECT_ROOT/share/$sidecar" "$TOOLS_STAGE/$sidecar"
+        fi
+    done
     # Build universal iPXE .efidrv from upstream at pinned commit.
     log_info "Building iPXE driver ($arch) ..."
     "$PROJECT_ROOT/scripts/build-ipxe.sh" --arch "$arch" \
@@ -239,16 +252,26 @@ AXL SDK pre-built UEFI tools for $arch
 version: $PKG_VERSION
 
 Tools included:
+  cat.efi       Concatenate files to stdout
   dmidecode.efi SMBIOS / DMI table decoder
   fetch.efi     HTTP client (GET/POST/PUT)
   find.efi      Recursive file finder
   grep.efi      Pattern search
   hexdump.efi   Hex/ASCII file viewer
   ipmi.efi      IPMI (BMC operations)
+  lspci.efi     PCI/PCIe device lister
+  lsusb.efi     USB device lister
+  memspd.efi    DDR4/DDR5 SPD reader (JEDEC vendor decoded)
   mkrd.efi      RAM disk management
   netinfo.efi   Network diagnostics and ping
   rfbrowse.efi  Redfish browser
   sysinfo.efi   System inventory summary
+
+Sidecar databases included (auto-discovered next to the .efi):
+  pci-ids.json5    PCI vendor / device / subsystem names (lspci)
+  pci-class.json5  PCI class-name overlay (lspci)
+  usb-ids.json5    USB vendor / device names (lsusb)
+  jedec.json5      JEDEC JEP-106 manufacturer codes (memspd)
 
 Drivers included (drivers/$arch/):
   ipxe-all.efidrv     Universal NIC driver — covers Intel, Broadcom,

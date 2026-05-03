@@ -1,10 +1,23 @@
 // JEDEC JEP-106 manufacturer codes for AXL memspd.
 //
-// Code format: packed (bank << 8) | (id_byte & 0x7F).
+// Code format: packed (bank_count << 8) | id_byte_raw, where
+// bank_count is the JEP-106 continuation count (no parity bit) and
+// id_byte_raw is the byte as it appears on the wire (odd-parity MSB
+// kept). Lookup keys preserve the raw byte — Samsung is 0x00CE, not
+// 0x004E.
 // The codes themselves are uncopyrightable factual data; names are
 // sourced from the public JEP-106 registry and verified against
 // vendor datasheets. Add entries as your fleet requires; memspd
 // falls back to printing the raw hex when a code is not present.
+//
+// Why no auto-converter (unlike pci-ids.json5 / usb-ids.json5):
+// JEDEC publishes JEP-106 as PDF documents (and sometimes web
+// tables) — there's no canonical plain-text database equivalent
+// to the linux-usb / pciutils ecosystem's `pci.ids` and `usb.ids`.
+// The ~30 entries we curate here are small enough that a converter
+// wouldn't pay back its own complexity. Hand-edit the file when
+// you need to add a vendor; verify the code by cross-referencing
+// the JEDEC registry and a known module's SPD.
 {
     schema: 1,
     vendors: [
@@ -12,7 +25,7 @@
         { code: 0x00CE, name: 'Samsung'             },
         { code: 0x00AD, name: 'SK Hynix'            },
         { code: 0x0198, name: 'Kingston'            },
-        { code: 0x859B, name: 'Crucial Technology'  },
+        { code: 0x059B, name: 'Crucial Technology'  },
         { code: 0x04CB, name: 'ATP Electronics'     },
         { code: 0x0194, name: 'Smart Modular'       },
         { code: 0x02FE, name: 'Elpida'              },
@@ -20,8 +33,8 @@
         { code: 0x017A, name: 'Apacer'              },
         { code: 0x0443, name: 'Ramaxel'             },
         { code: 0x0510, name: 'ADATA'               },
-        { code: 0x051D, name: 'Patriot Memory'      },
-        { code: 0x830B, name: 'Nanya Technology'    },
+        { code: 0x059D, name: 'Patriot Memory'      },
+        { code: 0x030B, name: 'Nanya Technology'    },
         { code: 0x00C1, name: 'Infineon'            },
     ],
 }

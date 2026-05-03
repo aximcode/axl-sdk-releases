@@ -45,6 +45,31 @@ extern "C" {
 const char *
 axl_app_argv0(void);
 
+/**
+ * @brief Return the canonical filesystem path of the running .efi
+ *     image, decoded from EFI_LOADED_IMAGE_PROTOCOL.FilePath.
+ *
+ * Orthogonal to @ref axl_app_argv0. argv[0] reflects whatever the
+ * shell typed — often a basename when the user typed `app.efi`
+ * rather than `fs0:\app.efi`, sometimes a full path, sometimes (in
+ * the `startup.nsh` invocation case) just the name even when the
+ * script wrote the full path. The image path returned here is
+ * decoded from the device-path nodes UEFI used to actually find the
+ * binary, so it's reliable regardless of how the shell was invoked.
+ *
+ * The right anchor for sidecar discovery (`pci-ids.json5`,
+ * `pci-class.json5`, `jedec.json5`, etc.) — see
+ * @ref axl_resolve_data_file, which prefers this over argv[0] when
+ * available.
+ *
+ * @return UTF-8 path string owned by the runtime, or NULL if the
+ *     loaded-image protocol was unavailable or had no FILEPATH nodes
+ *     (rare; only seen with synthetic load contexts that bypass the
+ *     usual file-load path).
+ */
+const char *
+axl_app_image_path(void);
+
 #ifdef __cplusplus
 }
 #endif

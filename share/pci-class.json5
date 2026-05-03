@@ -17,13 +17,14 @@
 //
 // Each entry pins any subset of (base, sub, prog). prog without sub
 // is meaningless — the loader rejects it.
+//
+// Empty stub by default. Add overrides as new triplets ship before
+// the next axl-sdk release. To bulk-populate from canonical pci.ids
+// class-section data, run:
+//
+//   scripts/pci-ids-to-json5.py --emit-class pci-class.json5 \
+//                               --output pci-ids.json5 pci.ids
 {
     schema: 1,
-    classes: [
-        // Demo entry — annotates the well-known Host bridge tier with
-        // an "[overlay]" marker so consumers can see the sidecar is
-        // active. Drop this entry in your own pci-class.json5 if you
-        // don't want the marker on production output.
-        { base: 0x06, sub: 0x00, name: 'Host bridge [overlay]' },
-    ],
+    classes: [],
 }

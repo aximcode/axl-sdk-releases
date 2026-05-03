@@ -10,6 +10,10 @@ Headers:
 - `<axl/axl-radix-tree.h>` — Radix tree (compact prefix tree, longest-prefix lookup)
 - `<axl/axl-ring-buf.h>` — Ring buffer (circular byte buffer, zero-copy, overwrite mode)
 - `<axl/axl-digest.h>` — Message digest checksums (MD5, SHA-1, SHA-256)
+- `<axl/axl-sidecar.h>` — Common JSON5 sidecar loader (used by
+  AxlPciIds / AxlPciClassDb / AxlSpdIds / AxlUsbIds; see its
+  dedicated module page for the open / schema-check / singleton-
+  with-atexit pattern)
 
 ## Choosing a Collection
 

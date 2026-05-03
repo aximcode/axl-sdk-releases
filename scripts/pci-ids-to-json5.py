@@ -27,6 +27,10 @@ This extractor produces TWO outputs:
 Both files are consumed by the loaders in src/pci/axl-pci-ids.c and
 src/pci/axl-pci-class.c.
 
+The line-level parsing is shared with usb-ids-to-json5.py via
+scripts/_ids_parser.py — pci.ids and usb.ids use the same tab-
+indented hierarchy.
+
 Usage:
     pci-ids-to-json5.py PCI_IDS_FILE > pci-ids.json5
     pci-ids-to-json5.py --emit-class pci-class.json5 \\
@@ -44,176 +48,26 @@ want. The script also accepts stdin (`-` as the input path).
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
 from typing import TextIO
 
-
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
-
-# (vendor_id, vendor_name)
-Vendor = tuple[int, str]
-# (vid, did, device_name)
-Device = tuple[int, int, str]
-# (svid, sdid, subsystem_name)
-Subsys = tuple[int, int, str]
-# (base, name)
-ClassBase = tuple[int, str]
-# (base, sub, name)
-ClassSub = tuple[int, int, str]
-# (base, sub, prog, name)
-ClassProg = tuple[int, int, int, str]
-
-# Output of parse_pci_ids — the structured shape that lets the v2
-# emitter properly nest subsystems under their parent device while
-# keeping the flat lists for v1 / class-only output.
-PciIdsParsed = tuple[
-    list[Vendor],
-    list[Device],
-    list[Subsys],
-    dict[tuple[int, int], list[Subsys]],   # subsystems grouped by parent (vid, did)
-    list[ClassBase],
-    list[ClassSub],
-    list[ClassProg],
-]
-
-
-def parse_pci_ids(
-    text: str,
-    allowed_vendors: set[int] | None = None,
-) -> PciIdsParsed:
-    """Single-pass parser. Returns:
-
-      vendors             — list of (vid, name)
-      devices             — list of (vid, did, name)
-      subsystems          — flat list of (svid, sdid, name) for v1 output
-      subsys_by_device    — dict {(vid, did): [(svid, sdid, name), ...]}
-                            for nested v2 output
-      class_bases         — list of (base, name)        from `C XX  ...`
-      class_subs          — list of (base, sub, name)   from `\\tSS  ...`
-      class_progs         — list of (base, sub, prog, name) from `\\t\\tPP  ...`
-
-    `allowed_vendors` filters devices and subsystems by parent vendor;
-    vendor entries themselves are always emitted (so name lookups for
-    vendors outside the curated device set still resolve). Class-section
-    entries are not affected by the filter — class names are global.
-    """
-    vendors: list[Vendor] = []
-    devices: list[Device] = []
-    subsystems: list[Subsys] = []
-    subsys_by_device: dict[tuple[int, int], list[Subsys]] = {}
-    class_bases: list[ClassBase] = []
-    class_subs: list[ClassSub] = []
-    class_progs: list[ClassProg] = []
-
-    current_vendor: int | None = None
-    current_device: int | None = None
-    in_class_section = False
-    current_class_base: int | None = None
-    current_class_sub: int | None = None
-
-    vendor_re = re.compile(r'^([0-9a-fA-F]{4})\s+(.*?)\s*$')
-    device_re = re.compile(r'^\t([0-9a-fA-F]{4})\s+(.*?)\s*$')
-    subsys_re = re.compile(
-        r'^\t\t([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(.*?)\s*$'
-    )
-    class_base_re = re.compile(r'^C\s+([0-9a-fA-F]{2})\s+(.*?)\s*$')
-    class_sub_re  = re.compile(r'^\t([0-9a-fA-F]{2})\s+(.*?)\s*$')
-    class_prog_re = re.compile(r'^\t\t([0-9a-fA-F]{2})\s+(.*?)\s*$')
-
-    for line in text.splitlines():
-        if not line or line.startswith('#'):
-            continue
-
-        # Class section toggle: once we hit `C XX`, all subsequent
-        # data is class triplets (no more vendors). Canonical pci.ids
-        # is monotonic so the flag never resets.
-        if not in_class_section:
-            m = class_base_re.match(line)
-            if m:
-                in_class_section = True
-                current_vendor = None
-                current_device = None
-                current_class_base = int(m.group(1), 16)
-                current_class_sub  = None
-                class_bases.append((current_class_base, m.group(2)))
-                continue
-
-        if in_class_section:
-            # Class triplet rows
-            m = class_prog_re.match(line)
-            if m and current_class_base is not None and current_class_sub is not None:
-                prog = int(m.group(1), 16)
-                name = m.group(2)
-                class_progs.append(
-                    (current_class_base, current_class_sub, prog, name)
-                )
-                continue
-            m = class_sub_re.match(line)
-            if m and current_class_base is not None:
-                sub = int(m.group(1), 16)
-                name = m.group(2)
-                current_class_sub = sub
-                class_subs.append((current_class_base, sub, name))
-                continue
-            m = class_base_re.match(line)
-            if m:
-                current_class_base = int(m.group(1), 16)
-                current_class_sub  = None
-                class_bases.append((current_class_base, m.group(2)))
-                continue
-            # Anything else in the class section is unrecognized — skip.
-            continue
-
-        # Vendor / device / subsystem section
-        if line.startswith('\t\t'):
-            m = subsys_re.match(line)
-            if m and current_vendor is not None and current_device is not None:
-                svid = int(m.group(1), 16)
-                sdid = int(m.group(2), 16)
-                name = m.group(3)
-                if allowed_vendors is None or current_vendor in allowed_vendors:
-                    entry = (svid, sdid, name)
-                    subsystems.append(entry)
-                    subsys_by_device.setdefault(
-                        (current_vendor, current_device), []
-                    ).append(entry)
-            continue
-        if line.startswith('\t'):
-            m = device_re.match(line)
-            if m and current_vendor is not None:
-                did = int(m.group(1), 16)
-                name = m.group(2)
-                current_device = did
-                if allowed_vendors is None or current_vendor in allowed_vendors:
-                    devices.append((current_vendor, did, name))
-            continue
-        m = vendor_re.match(line)
-        if m:
-            current_vendor = int(m.group(1), 16)
-            current_device = None
-            name = m.group(2)
-            vendors.append((current_vendor, name))
-
-    return (
-        vendors, devices, subsystems, subsys_by_device,
-        class_bases, class_subs, class_progs,
-    )
+from _ids_parser import (
+    ClassBase,
+    ClassProg,
+    ClassSub,
+    Device,
+    ParsedIds,
+    Subsys,
+    Vendor,
+    parse_ids,
+    quote_json5,
+)
 
 
 # ---------------------------------------------------------------------------
 # Emitters
 # ---------------------------------------------------------------------------
-
-def quote_json5(s: str) -> str:
-    """Quote a string for JSON5 single-quoted output. Escape only
-    backslashes and the single-quote delimiter; pci.ids names are
-    plain ASCII per upstream policy and don't contain control chars."""
-    return s.replace('\\', '\\\\').replace("'", "\\'")
-
 
 def _emit_v1_flat(
     vendors: list[Vendor],
@@ -287,10 +141,7 @@ def _emit_v2_hierarchical(
 
 
 def emit_pci_ids(
-    vendors: list[Vendor],
-    devices: list[Device],
-    subsystems: list[Subsys],
-    subsys_by_device: dict[tuple[int, int], list[Subsys]],
+    parsed: ParsedIds,
     out: TextIO,
     schema: int = 2,
 ) -> None:
@@ -300,9 +151,10 @@ def emit_pci_ids(
     out.write("// sourced from the public pci.ids registry.\n")
     out.write("{\n")
     if schema == 1:
-        _emit_v1_flat(vendors, devices, subsystems, out)
+        _emit_v1_flat(parsed.vendors, parsed.devices, parsed.subsystems, out)
     elif schema == 2:
-        _emit_v2_hierarchical(vendors, devices, subsys_by_device, out)
+        _emit_v2_hierarchical(
+            parsed.vendors, parsed.devices, parsed.subsys_by_device, out)
     else:
         raise ValueError(f"unsupported schema version: {schema}")
     out.write("}\n")
@@ -364,42 +216,41 @@ C 06  Bridge
 def _self_test() -> int:
     import io
 
-    parsed = parse_pci_ids(_SELF_TEST_INPUT)
-    vendors, devices, subsystems, subsys_by_device, \
-        class_bases, class_subs, class_progs = parsed
+    parsed = parse_ids(_SELF_TEST_INPUT, has_subsystems=True)
 
     # Parser shape
-    assert vendors == [(0x8086, "Intel Corporation"),
-                       (0x10DE, "NVIDIA"),
-                       (0x0001, "EmptyVendor")], vendors
-    assert devices == [(0x8086, 0x1521,
-                        "I350 Gigabit Network Connection"),
-                       (0x8086, 0x100E,
-                        "82540EM Gigabit Ethernet Controller"),
-                       (0x10DE, 0x1C82, "GP107 (GTX 1050 Ti)")], devices
-    assert subsystems == [(0x1028, 0x1F5F, "PERC H730 Mini"),
-                          (0x1028, 0x1FCA, "BCM57416 rNDC")], subsystems
-    assert subsys_by_device == {
+    assert parsed.vendors == [(0x8086, "Intel Corporation"),
+                              (0x10DE, "NVIDIA"),
+                              (0x0001, "EmptyVendor")], parsed.vendors
+    assert parsed.devices == [(0x8086, 0x1521,
+                               "I350 Gigabit Network Connection"),
+                              (0x8086, 0x100E,
+                               "82540EM Gigabit Ethernet Controller"),
+                              (0x10DE, 0x1C82, "GP107 (GTX 1050 Ti)")], \
+        parsed.devices
+    assert parsed.subsystems == [(0x1028, 0x1F5F, "PERC H730 Mini"),
+                                 (0x1028, 0x1FCA, "BCM57416 rNDC")], \
+        parsed.subsystems
+    assert parsed.subsys_by_device == {
         (0x8086, 0x1521): [
             (0x1028, 0x1F5F, "PERC H730 Mini"),
             (0x1028, 0x1FCA, "BCM57416 rNDC"),
         ],
-    }, subsys_by_device
+    }, parsed.subsys_by_device
 
     # Class section
-    assert class_bases == [(0x02, "Network controller"),
-                           (0x06, "Bridge")], class_bases
-    assert class_subs == [(0x02, 0x00, "Ethernet controller"),
-                          (0x02, 0x01, "Token ring network controller"),
-                          (0x06, 0x00, "Host bridge"),
-                          (0x06, 0x04, "PCI bridge")], class_subs
-    assert class_progs == [(0x06, 0x04, 0x01, "Subtractive decode")], \
-        class_progs
+    assert parsed.class_bases == [(0x02, "Network controller"),
+                                  (0x06, "Bridge")], parsed.class_bases
+    assert parsed.class_subs == [(0x02, 0x00, "Ethernet controller"),
+                                 (0x02, 0x01, "Token ring network controller"),
+                                 (0x06, 0x00, "Host bridge"),
+                                 (0x06, 0x04, "PCI bridge")], parsed.class_subs
+    assert parsed.class_progs == [(0x06, 0x04, 0x01, "Subtractive decode")], \
+        parsed.class_progs
 
     # v2 emit nests subsystems under their parent device.
     buf = io.StringIO()
-    emit_pci_ids(vendors, devices, subsystems, subsys_by_device,
-                 buf, schema=2)
+    emit_pci_ids(parsed, buf, schema=2)
     out = buf.getvalue()
     assert "schema: 2" in out
     assert "id: 0x8086" in out
@@ -432,8 +283,7 @@ def _self_test() -> int:
 
     # v1 emit retains the flat layout (back-compat path).
     buf = io.StringIO()
-    emit_pci_ids(vendors, devices, subsystems, subsys_by_device,
-                 buf, schema=1)
+    emit_pci_ids(parsed, buf, schema=1)
     out = buf.getvalue()
     assert "schema: 1" in out
     assert "vid: 0x8086, did: 0x1521" in out
@@ -441,7 +291,7 @@ def _self_test() -> int:
 
     # Class emit produces all three tiers in a single classes[] array.
     buf = io.StringIO()
-    emit_pci_class(class_bases, class_subs, class_progs, buf)
+    emit_pci_class(parsed.class_bases, parsed.class_subs, parsed.class_progs, buf)
     out = buf.getvalue()
     assert "schema: 1" in out
     assert "{ base: 0x06, name: 'Bridge' }" in out
@@ -450,12 +300,15 @@ def _self_test() -> int:
            "name: 'Subtractive decode' }" in out
 
     # Vendor filter affects devices + subsystems but not vendor list.
-    parsed_filtered = parse_pci_ids(_SELF_TEST_INPUT, allowed_vendors={0x10DE})
-    v2, d2, s2, _, _, _, _ = parsed_filtered
-    assert len(v2) == 3, "vendors are unfiltered (Intel + NVIDIA + EmptyVendor)"
-    assert len(d2) == 1 and d2[0][0] == 0x10DE, \
+    parsed_filtered = parse_ids(
+        _SELF_TEST_INPUT, has_subsystems=True, allowed_vendors={0x10DE})
+    assert len(parsed_filtered.vendors) == 3, \
+        "vendors are unfiltered (Intel + NVIDIA + EmptyVendor)"
+    assert len(parsed_filtered.devices) == 1 \
+        and parsed_filtered.devices[0][0] == 0x10DE, \
         "only NVIDIA devices remain after filter"
-    assert s2 == [], "Intel subsystems dropped with their parent vendor"
+    assert parsed_filtered.subsystems == [], \
+        "Intel subsystems dropped with their parent vendor"
 
     print("PASS: scripts/pci-ids-to-json5.py self-test", file=sys.stderr)
     return 0
@@ -519,27 +372,27 @@ def main() -> int:
         allowed = {int(v.strip(), 16)
                    for v in args.vendors_only.split(",") if v.strip()}
 
-    vendors, devices, subsystems, subsys_by_device, \
-        class_bases, class_subs, class_progs = parse_pci_ids(text, allowed)
+    parsed = parse_ids(text, has_subsystems=True, allowed_vendors=allowed)
 
     if args.output:
         with Path(args.output).open("w", encoding="utf-8") as f:
-            emit_pci_ids(vendors, devices, subsystems, subsys_by_device,
-                         f, schema=args.schema)
+            emit_pci_ids(parsed, f, schema=args.schema)
     else:
-        emit_pci_ids(vendors, devices, subsystems, subsys_by_device,
-                     sys.stdout, schema=args.schema)
+        emit_pci_ids(parsed, sys.stdout, schema=args.schema)
 
     if args.emit_class:
         with Path(args.emit_class).open("w", encoding="utf-8") as f:
-            emit_pci_class(class_bases, class_subs, class_progs, f)
+            emit_pci_class(
+                parsed.class_bases, parsed.class_subs, parsed.class_progs, f)
 
-    print(f"# pci-ids schema {args.schema}: {len(vendors)} vendors, "
-          f"{len(devices)} devices, {len(subsystems)} subsystems",
+    print(f"# pci-ids schema {args.schema}: {len(parsed.vendors)} vendors, "
+          f"{len(parsed.devices)} devices, "
+          f"{len(parsed.subsystems)} subsystems",
           file=sys.stderr)
     if args.emit_class:
-        print(f"# pci-class schema 1: {len(class_bases)} bases, "
-              f"{len(class_subs)} subs, {len(class_progs)} progs "
+        print(f"# pci-class schema 1: {len(parsed.class_bases)} bases, "
+              f"{len(parsed.class_subs)} subs, "
+              f"{len(parsed.class_progs)} progs "
               f"-> {args.emit_class}",
               file=sys.stderr)
     return 0

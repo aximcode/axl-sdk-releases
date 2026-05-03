@@ -12,13 +12,14 @@
     2, and surfaces a decoded @ref AxlSpdInfo struct.
 
     Manufacturer fields are exposed as raw 16-bit JEP-106 codes
-    (high byte = continuation-bank index, low byte = position in bank).
-    The library deliberately does not embed a vendor name table —
-    consumers do that lookup at the tool layer (see tools/memspd.c
-    for the JSON-sidecar pattern). The spec calls these codes
-    facts; lookup tables are JEDEC publications. Splitting the
-    concern keeps the library tiny and the decode policy mutable
-    without rebuilding.
+    (high byte = continuation-bank index, low byte = position in
+    bank). For human-readable rendering, the @c axl_spd_ids_* API
+    loads a curated JSON5 sidecar (`jedec.json5`) into a process-
+    global table and exposes lookup / format helpers parallel to
+    @ref axl_pci_ids_load and @ref axl_pci_format_name. Consumers
+    that want a different DB (private OEM sheet, vendor-restricted
+    list) layer their own handle on top via
+    @ref axl_spd_ids_open_from_buffer — same shape as AxlPciIds.
 
     DDR3 is intentionally out of scope for v1. DDR5 modules use the
     SPD5118 hub protocol: the lower 128 bytes of each 128-byte page
@@ -48,6 +49,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#include <axl/axl-sidecar.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -183,6 +186,164 @@ axl_spd_decode(
     const uint8_t  *buf,
     size_t          len,
     AxlSpdInfo     *out
+);
+
+// ---------------------------------------------------------------------------
+// JEDEC vendor-name database (JSON5 sidecar)
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes (including NUL) any vendor-name lookup can return.
+/// Sized for the longest real JEP-106 entry plus headroom.
+#define AXL_SPD_VENDOR_NAME_MAX  64u
+
+/// Maximum bytes (including NUL) for @ref axl_spd_ids_format_name output.
+/// Vendor name plus the "<unknown>" → "0xCCCC" numeric fallback fit.
+#define AXL_SPD_NAME_COMPOSED_MAX  80u
+
+/**
+ * @brief Opaque handle to a loaded JEDEC vendor-name database.
+ *
+ * Created by @ref axl_spd_ids_open or
+ * @ref axl_spd_ids_open_from_buffer; destroyed by
+ * @ref axl_spd_ids_close. Multiple handles can coexist — a consumer
+ * that ships an internal OEM sheet on top of the public set loads
+ * two handles and queries them in priority order, mirroring
+ * @ref AxlPciIds.
+ *
+ * The process-global API (@ref axl_spd_ids_load and friends) wraps
+ * a single internal handle for the common case.
+ */
+typedef struct AxlSpdIds AxlSpdIds;
+
+/**
+ * @brief Open a JEDEC vendor database from a JSON5 file.
+ *
+ * @return @c AXL_SIDECAR_OK on success (handle returned via @p out),
+ *     @c AXL_SIDECAR_FILE_MISSING if @p path does not exist,
+ *     @c AXL_SIDECAR_PARSE_ERROR on JSON5 / schema rejection.
+ */
+AxlSidecarStatus
+axl_spd_ids_open(
+    const char   *path,
+    AxlSpdIds   **out
+);
+
+/**
+ * @brief Open a JEDEC vendor database from an in-memory JSON5 buffer.
+ *
+ * @return @c AXL_SIDECAR_OK on success, @c AXL_SIDECAR_PARSE_ERROR
+ *     on parse / schema error. (No @c FILE_MISSING — the buffer is
+ *     the input.)
+ */
+AxlSidecarStatus
+axl_spd_ids_open_from_buffer(
+    const char   *json5,
+    size_t        len,
+    AxlSpdIds   **out
+);
+
+/**
+ * @brief Free a database handle. NULL-safe.
+ */
+void
+axl_spd_ids_close(
+    AxlSpdIds  *ids
+);
+
+/**
+ * @brief Vendor lookup against an explicit handle.
+ * @return database-owned string or NULL if unknown / handle empty.
+ */
+const char *
+axl_spd_ids_vendor_name(
+    const AxlSpdIds  *ids,
+    uint16_t          code     ///< packed JEP-106 (bank<<8 | id)
+);
+
+/**
+ * @name Database iteration
+ * @brief Walk every vendor entry. Non-zero callback return stops
+ *     iteration and propagates as the iter rc.
+ * @{
+ */
+typedef int (*AxlSpdIdsVendorFn)(uint16_t code, const char *name, void *ctx);
+
+int
+axl_spd_ids_foreach_vendor(
+    const AxlSpdIds   *ids,
+    AxlSpdIdsVendorFn  fn,
+    void              *ctx
+);
+/** @} */
+
+/**
+ * @brief Compose a "vendor name or numeric fallback" display string.
+ *
+ * Centralizes the rendering convention so every consumer prints the
+ * same string for the same JEP-106 code:
+ *   - vendor known   → `"<vendor>"`
+ *   - vendor unknown → `"0xCCCC"` (uppercase 4-digit hex)
+ *
+ * @return number of bytes written excluding NUL (snprintf shape),
+ *     or -1 on bad arguments.
+ */
+int
+axl_spd_ids_format_name(
+    const AxlSpdIds  *ids,
+    uint16_t          code,
+    char             *buf,
+    size_t            buflen
+);
+
+// ---------------------------------------------------------------------------
+// Process-global singleton
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Load the curated JEDEC database into the process-global slot.
+ *
+ * Two modes selected by @p override_path:
+ *   - **Explicit** (`override_path` non-NULL): use exactly that path.
+ *   - **Autodiscover** (`override_path` NULL): try `jedec.json5`
+ *     next to the running .efi, then in the current working
+ *     directory.
+ *
+ * Idempotent: a successful load is a no-op on subsequent calls. On
+ * the first successful load, registers an @ref axl_atexit cleanup
+ * so the parsed table is freed at runtime cleanup automatically.
+ */
+AxlSidecarStatus
+axl_spd_ids_load(
+    const char  *override_path
+);
+
+/**
+ * @brief Free the loaded database. Safe to call when none is loaded.
+ */
+void
+axl_spd_ids_free(
+    void
+);
+
+/**
+ * @brief Singleton-backed vendor lookup.
+ * @return database-owned string or NULL if no database loaded or
+ *     @p code is not present.
+ */
+const char *
+axl_spd_vendor_name(
+    uint16_t  code
+);
+
+/**
+ * @brief Singleton-backed convenience wrapper for
+ *     @ref axl_spd_ids_format_name.
+ */
+int
+axl_spd_format_name(
+    uint16_t  code,
+    char     *buf,
+    size_t    buflen
 );
 
 #ifdef __cplusplus

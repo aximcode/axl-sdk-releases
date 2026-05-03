@@ -852,7 +852,10 @@ A family of modules providing UEFI apps with typed access to
 firmware-level platform inventory and control, so consumers don't
 each reimplement the transport layer. First entry (AxlSmbios) has
 been in the library since the initial migration; AxlIpmi shipped
-in April 2026; AxlAcpi / AxlPci / AxlSpd are roadmap items.
+in April 2026; AxlAcpi / AxlPci / AxlSpd shipped in April-May
+2026; AxlUsb shipped in May 2026 (Phases A-F: enumeration, class
+decode, string descriptors, vendor/device-name JSON5 sidecar,
+`lsusb.efi` tool, and faithful hub-port tree walker).
 
 ### Design conventions
 
@@ -883,8 +886,11 @@ All platform-access modules follow a shared shape:
   across the module boundary. Headers belong in the `<axl.h>`
   umbrella.
 - **Dogfood tool in `tools/`**: `sysinfo` exercises AxlSmbios,
-  `ipmi` exercises AxlIpmi, future `acpi` / `pci` / `memspd` will
-  exercise their respective modules.
+  `ipmi` exercises AxlIpmi, `lspci` exercises AxlPci, `lsusb`
+  exercises AxlUsb, `memspd` exercises AxlSpd. Each tool is a
+  thin renderer over its module's public surface — if a consumer
+  ever needs a different output shape, they can build their own
+  on the same primitives.
 
 ### Roster
 
@@ -892,14 +898,22 @@ All platform-access modules follow a shared shape:
 |--------|--------|--------|---------------|
 | AxlSmbios | `axl/axl-smbios.h` | DONE | `tools/sysinfo` |
 | AxlIpmi   | `axl/axl-ipmi.h`   | DONE (April 2026) | `tools/ipmi` |
-| AxlSmbus  | `axl/axl-smbus.h`  | DONE (April 2026) | (consumed by AxlIpmi SSIF; AxlSpd coming) |
-| AxlAcpi   | `axl/axl-acpi.h`   | Planned (B3) — table discovery + header parsing, NO AML | `tools/acpi` |
-| AxlPci    | `axl/axl-pci.h`    | Planned (B3) — ECAM config space | `tools/pci` |
-| AxlSpd    | `axl/axl-spd.h`    | Planned (B3) — DDR4/5 SPD readers | `tools/memspd` |
+| AxlSmbus  | `axl/axl-smbus.h`  | DONE (April 2026) | (consumed by AxlIpmi SSIF + AxlSpd) |
+| AxlAcpi   | `axl/axl-acpi.h`   | DONE (April 2026) — table discovery + header parsing, NO AML | (consumed by AxlPci MCFG lookup) |
+| AxlPci    | `axl/axl-pci.h`    | DONE (April 2026) — ECAM config space + ids/class JSON5 sidecars | `tools/lspci` |
+| AxlSpd    | `axl/axl-spd.h`    | DONE (April 2026) — DDR4/5 SPD readers + JEDEC ids JSON5 sidecar | `tools/memspd` |
+| AxlUsb    | `axl/axl-usb.h`    | DONE (May 2026) — enumeration, class decode, string descriptors, hub-port tree, ids JSON5 sidecar | `tools/lsusb` |
 
-See `docs/ROADMAP.md` Phase B3 for scope notes on the planned
-modules. AxlAcpi scope specifically excludes AML interpretation
+AxlAcpi scope specifically excludes AML interpretation
 (ACPICA-sized); it only reads fixed-layout tables.
+
+The four modules with JSON5 vendor/device-name sidecars
+(AxlPciIds, AxlPciClassDb, AxlSpdIds, AxlUsbIds) all build on a
+common `<axl/axl-sidecar.h>` scaffold (`axl_sidecar_open_file` /
+`_open_buffer` / `_check_schema` plus an internal singleton-with-
+atexit + foreach trampoline). Adding a new sidecar consumer is
+~50 lines of typed-walk code over the shared loader rather than a
+fresh hash-table-and-lifecycle reinvention.
 
 ### Module layout
 

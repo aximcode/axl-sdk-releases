@@ -410,8 +410,8 @@ exercising real SMBus wire traffic through QEMU's ICH9 controller.
 
 ### Phase B3: Platform Access — follow-on modules
 
-R+1 (delldiags do.efi enabler — see local design doc
-`axl-sdk-needs.md` in delldiags for the full architectural posture):
+R+1 (downstream-consumer-driven; the motivating scenario is a
+hardware-diagnostic CLI port from Linux to UEFI):
 
 - [x] **AxlAcpi** — ACPI table discovery + typed readers. RSDP →
       RSDT/XSDT walk, signature lookup with cursor iteration matching
@@ -556,18 +556,49 @@ R+5 — PCI tooling DONE; USB tooling pending:
       for `jedec.json5`. Test runner stages the JSON5 next to
       test EFIs so the loaders are exercised end-to-end. Shared
       by lspci and downstream consumers.
-- [ ] **AxlUsb** — USB device enumeration via `EFI_USB_IO_PROTOCOL`
-      handles. Standard descriptor walk (device → config →
-      interface → endpoint), class/subclass/protocol decode tables,
-      optional string descriptor reads (manufacturer / product /
-      serial). Header: `axl/axl-usb.h`. Source: `src/usb/`.
-      Sequenced *after* lspci so the "tool over existing platform
-      API" pattern is validated on the simpler PCI surface first.
-- [ ] **`tools/lsusb.c`** — Linux-style USB lister built on AxlUsb.
-      Default short form (`Bus B Device D: ID vid:did class:
-      vendor product`); `-v` adds full descriptor tree. `-s BBB:DDD`
-      and `-d V:D` filters mirroring lspci. Same `--debug` /
-      `-v` convention divergence as lspci.
+- [x] **AxlUsb** — USB device enumeration via `EFI_USB_IO_PROTOCOL`
+      handles. Shipped May 2026 in six phases:
+      - **Phase A** (commit `da71a2e`): enumeration + vid/pid via
+        `axl_usb_next` cursor + `axl_usb_get_vid_pid`.
+      - **Phase B** (commit `f8e4557`): interface class triplet
+        decode (`axl_usb_get_class` + `axl_usb_class_string_fmt`)
+        with compiled-in USB-IF Defined Class Codes tables.
+      - **Phase C** (commit `d39b7c2`): string descriptor reads —
+        `axl_usb_get_manufacturer` / `_product` / `_serial` over
+        `UsbGetStringDescriptor` + UCS-2 → UTF-8.
+      - **Phase D** (commit `8a04454`): vendor/device-name JSON5
+        sidecar (`axl_usb_ids_*` mirroring AxlPciIds), built on
+        the shared AxlSidecar scaffold from `f875b36`.
+      - **Phase F** (commit `75dcd43`): faithful USB hub-port
+        chain via `axl_usb_tree_for_each` — depth derived from the
+        EFI device path's USB messaging-node count, parents-
+        before-children sort guarantee from the existing dev-key
+        order, no second sort pass.
+- [x] **`tools/lsusb.c`** — Linux-style USB lister built on AxlUsb
+      (Phase E, commit `249c3c4`). Default short form, `-s BBB[:DDD]`
+      and `-d V[:P]` filters, `-n` numeric, `-v` / `-vv` verbose
+      with class triplet + string descriptors, `-t` tree view
+      (real USB hub-port topology via `axl_usb_tree_for_each`).
+      `--ids-file` overrides sidecar autodiscovery. Same `--debug`
+      / `-v` convention divergence as lspci.
+- [x] **AxlSidecar** (commit `f875b36`) — shared JSON5 sidecar
+      scaffold (`<axl/axl-sidecar.h>`) consumed by AxlPciIds,
+      AxlPciClassDb, AxlSpdIds, AxlUsbIds. `axl_sidecar_open_file`
+      / `_open_buffer` / `_check_schema` plus an internal
+      singleton-with-atexit + foreach trampoline. `AxlSidecarStatus`
+      enum (`AXL_SIDECAR_OK` / `_FILE_MISSING` / `_PARSE_ERROR`)
+      replaces the prior `0/-1/-2` magic numbers across every load
+      API. `tools/memspd.c` migrated off its inline JEDEC loader
+      onto `axl_spd_ids_load`.
+- [x] **`scripts/{pci,usb}-ids-to-json5.py`** (commit `872bbf6`) —
+      bulk converters for the canonical pci.ids / usb.ids text
+      databases. Line-level parser hoisted into shared
+      `_ids_parser.py` (~200 lines) since pci.ids and usb.ids use
+      the same tab-indented hierarchy. `share/jedec.json5` stays
+      hand-curated (no canonical text database upstream). Both
+      installed to `/usr/share/axl/scripts/` in the .deb/.rpm
+      (commit `85973b4`); both `--self-test`s pass from the
+      installed location.
 
 ### Phase B2: Redfish Support — DONE (as tool, not library)
 
@@ -1033,7 +1064,13 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 - [x] rfbrowse.efi — Redfish REST API browser
 - [x] lspci.efi — Linux-style PCI lister (Phase B3 R+5; tree view,
       JSON5-backed vendor/device names, --bridges in run-qemu.sh)
-- [ ] **lsusb.efi** — Linux-style USB lister (Phase B3 R+5, after AxlUsb)
+- [x] lsusb.efi — Linux-style USB lister (Phase E of AxlUsb,
+      commit `249c3c4`; tree view via `axl_usb_tree_for_each`,
+      JSON5-backed vendor/device names, qemu-xhci + usb-mouse +
+      usb-hub + usb-tablet topology in common-test.sh)
+- [x] memspd.efi — DDR4/DDR5 SPD reader on AxlSpd
+      (Phase B3, JEDEC ids JSON5 sidecar via `axl_spd_ids_*`)
+- [x] cat.efi — concatenate files to stdout
 
 ### Host Tools (scripts/)
 

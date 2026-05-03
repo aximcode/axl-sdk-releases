@@ -1,0 +1,117 @@
+// USB vendor/device identifier database for axl-sdk.
+//
+// Curated subset of the canonical usb.ids registry — focused on
+// vendors that show up in QEMU emulation, common server BMCs and
+// management modules, USB-attached NICs and storage, and HID
+// peripherals seen in field-deployed UEFI environments. Numeric
+// IDs themselves are uncopyrightable factual data; names are
+// sourced from the public Linux USB Project registry
+// (https://www.linux-usb.org/usb.ids).
+//
+// Schema 1 — hierarchical: devices nest under their parent vendor.
+// USB has no subsystem dimension that motivated AxlPciIds's v1→v2
+// flat/hierarchical split, so schema 1 IS the hierarchical layout
+// (no flat-vendors[]/devices[]/subsystems[] alternative).
+//
+// Adding entries: copy the (vendor, device) pair from
+// https://www.linux-usb.org/usb.ids and place under the matching
+// vendor block. Vendor entries without a 'devices' array are valid —
+// they let lookups resolve the vendor name even when no specific
+// device is curated.
+{
+    schema: 1,
+    vendors: [
+        // 0x0421 — Nokia
+        { id: 0x0421, name: 'Nokia Mobile Phones' },
+
+        // 0x0451 — Texas Instruments (USB-IF assignment; lots of TI USB hubs)
+        { id: 0x0451, name: 'Texas Instruments, Inc.' },
+
+        // 0x046D — Logitech, common HID + Unifying receivers
+        { id: 0x046D, name: 'Logitech, Inc.',
+          devices: [
+            { pid: 0xC077, name: 'M105 Optical Mouse' },
+            { pid: 0xC52B, name: 'Unifying Receiver' },
+          ],
+        },
+
+        // 0x04F2 — Chicony Electronics (laptop webcams, integrated HID)
+        { id: 0x04F2, name: 'Chicony Electronics Co., Ltd' },
+
+        // 0x05E3 — Genesys Logic (USB hubs, card readers)
+        { id: 0x05E3, name: 'Genesys Logic, Inc.' },
+
+        // 0x0627 — Adomax Technology (QEMU's USB-mouse vendor;
+        // pin point for the AxlUsb test runner)
+        { id: 0x0627, name: 'Adomax Technology Co., Ltd',
+          devices: [
+            { pid: 0x0001, name: 'QEMU USB Mouse' },
+          ],
+        },
+
+        // 0x0781 — SanDisk (USB mass storage)
+        { id: 0x0781, name: 'SanDisk Corp.' },
+
+        // 0x0930 — Toshiba (storage + dongles)
+        { id: 0x0930, name: 'Toshiba Corp.' },
+
+        // 0x0951 — Kingston Technology (USB drives, HyperX)
+        { id: 0x0951, name: 'Kingston Technology' },
+
+        // 0x093A — Pixart Imaging (HID controllers in keyboards/mice)
+        { id: 0x093A, name: 'Pixart Imaging, Inc.' },
+
+        // 0x0BDA — Realtek Semiconductor (USB NICs, audio, card readers)
+        { id: 0x0BDA, name: 'Realtek Semiconductor Corp.',
+          devices: [
+            { pid: 0x8152, name: 'RTL8152 Fast Ethernet Adapter' },
+            { pid: 0x8153, name: 'RTL8153 Gigabit Ethernet Adapter' },
+          ],
+        },
+
+        // 0x0CF3 — Atheros Communications (USB Bluetooth/Wi-Fi)
+        { id: 0x0CF3, name: 'Qualcomm Atheros Communications' },
+
+        // 0x0DC4 — Macpower Peripherals (storage enclosures)
+        { id: 0x0DC4, name: 'Macpower Peripherals, Ltd' },
+
+        // 0x125F — A-DATA Technology
+        { id: 0x125F, name: 'A-DATA Technology Co., Ltd' },
+
+        // 0x13FE — Kingston Technology Company Inc. (USB drives)
+        { id: 0x13FE, name: 'Kingston Technology Company Inc.' },
+
+        // 0x1532 — Razer (high-end peripherals)
+        { id: 0x1532, name: 'Razer USA, Ltd' },
+
+        // 0x152D — JMicron Technology (USB-SATA bridges)
+        { id: 0x152D, name: 'JMicron Technology Corp.' },
+
+        // 0x174C — ASMedia Technology (USB-SATA, hubs)
+        { id: 0x174C, name: 'ASMedia Technology' },
+
+        // 0x18A5 — Verbatim (USB drives)
+        { id: 0x18A5, name: 'Verbatim, Ltd' },
+
+        // 0x1A40 — Terminus Technology (USB hubs)
+        { id: 0x1A40, name: 'Terminus Technology Inc.' },
+
+        // 0x1B1C — Corsair (gaming peripherals + USB drives)
+        { id: 0x1B1C, name: 'Corsair' },
+
+        // 0x1D6B — Linux Foundation (root hubs the kernel synthesizes)
+        { id: 0x1D6B, name: 'Linux Foundation',
+          devices: [
+            { pid: 0x0001, name: '1.1 root hub' },
+            { pid: 0x0002, name: '2.0 root hub' },
+            { pid: 0x0003, name: '3.0 root hub' },
+          ],
+        },
+
+        // 0x2109 — VIA Labs (USB hubs, USB-3 controllers)
+        { id: 0x2109, name: 'VIA Labs, Inc.' },
+
+        // 0x8087 — Intel (integrated Bluetooth + USB controllers)
+        { id: 0x8087, name: 'Intel Corp.' },
+    ],
+}

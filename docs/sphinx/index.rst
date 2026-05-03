@@ -55,9 +55,11 @@ AXL SDK
    modules/smbios
    modules/acpi
    modules/pci
+   modules/usb
    modules/smbus
    modules/ipmi
    modules/spd
+   modules/sidecar
 
 .. toctree::
    :maxdepth: 1

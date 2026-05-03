@@ -15,6 +15,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "../data/axl-class-fmt.h"
 #include "axl-pci-class-internal.h"
 #include <axl/axl-pci.h>
 #include <axl/axl-acpi.h>
@@ -689,63 +690,28 @@ axl_pci_class_string_fmt(
     size_t          buflen
     )
 {
-    if (buf == NULL || buflen == 0) {
-        return -1;
-    }
+    /* Resolve each tier through the overlay-then-builtin chain
+       (lookup_base / _sub / _prog walk the loaded sidecar overlay
+       first, fall through to compiled-in tables on miss). The
+       output assembly itself — FMT_FULL / FMT_SUBCLASS / FMT_BASE
+       fallbacks, omit-unknown-tier posture, numeric escape — lives
+       in the shared axl-class-fmt helper. AxlPciClassFmt's enum
+       values match AxlClassFmt by construction. */
     uint8_t base = (uint8_t)((class_code >> 16) & 0xFFu);
     uint8_t sub  = (uint8_t)((class_code >>  8) & 0xFFu);
     uint8_t prog = (uint8_t)( class_code        & 0xFFu);
 
-    /* Omit empty tiers rather than emit "<unknown>" placeholders —
-       many spec subclasses have no defined prog_if (Host bridge,
-       ISA bridge, SMBus, ...) and printing "<unknown>" for those
-       is just noise. When the base class itself is unrecognized,
-       fall back to numeric "Class XXXXXX" form. Both behaviors
-       mirror Linux lspci. */
-    const char *base_str = lookup_base(base);
-    const char *sub_str  = lookup_sub(base, sub);
-    const char *prog_str = lookup_prog(base, sub, prog);
-
-    /* Common numeric fallback for "wholly unknown" cases — used by
-       every fmt mode when the requested tier (and the next-coarser
-       fallback) has no entry. */
     char numeric[20];
     axl_snprintf(numeric, sizeof(numeric), "Class %06x",
                  (unsigned)(class_code & 0xFFFFFFu));
 
-    switch (fmt) {
-    case AXL_PCI_CLASS_FMT_BASE:
-        if (base_str == NULL) {
-            return axl_snprintf(buf, buflen, "%s", numeric);
-        }
-        return axl_snprintf(buf, buflen, "%s", base_str);
-
-    case AXL_PCI_CLASS_FMT_SUBCLASS:
-        /* Prefer subclass; coarsen to base; then numeric. */
-        if (sub_str != NULL) {
-            return axl_snprintf(buf, buflen, "%s", sub_str);
-        }
-        if (base_str != NULL) {
-            return axl_snprintf(buf, buflen, "%s", base_str);
-        }
-        return axl_snprintf(buf, buflen, "%s", numeric);
-
-    case AXL_PCI_CLASS_FMT_FULL:
-        if (base_str == NULL) {
-            return axl_snprintf(buf, buflen, "%s", numeric);
-        }
-        if (sub_str == NULL) {
-            return axl_snprintf(buf, buflen, "%s", base_str);
-        }
-        if (prog_str == NULL) {
-            return axl_snprintf(buf, buflen, "%s / %s",
-                                base_str, sub_str);
-        }
-        return axl_snprintf(buf, buflen, "%s / %s / %s",
-                            base_str, sub_str, prog_str);
-    }
-    /* Unknown fmt enum value. */
-    return -1;
+    return axl_class_string_fmt_resolve(
+        lookup_base(base),
+        lookup_sub(base, sub),
+        lookup_prog(base, sub, prog),
+        numeric,
+        (AxlClassFmt)fmt,
+        buf, buflen);
 }
 
 int

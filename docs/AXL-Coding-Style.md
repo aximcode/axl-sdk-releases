@@ -308,9 +308,9 @@ UEFI applications come in two shapes:
    layer needed.
 
 2. **Multi-command tool** — multiple distinct operations under a
-   common executable, often grouped into categories (`do bios`,
-   `do sysid`, `do crb`). Canonical example: `do.efi` (the
-   delldiags hardware-diagnostic CLI port).
+   common executable, often grouped into categories (e.g.
+   `tool bios`, `tool sysid`, `tool crb`). Canonical use case:
+   a downstream-consumer hardware-diagnostic CLI port.
 
    Use `<axl/axl-subcommand.h>` for dispatch, plus `axl_config_*`
    inside each subcommand for its own flag parsing:

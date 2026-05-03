@@ -264,6 +264,41 @@ test_app_argv0_is_stable(void)
                "app_argv0: stable through AxlArgs dispatch (still program path)");
 }
 
+static void
+test_app_image_path_is_canonical(void)
+{
+    /* axl_app_image_path is decoded from EFI_LOADED_IMAGE_PROTOCOL's
+       FilePath device-path chain — orthogonal to argv[0], reliable
+       regardless of how the shell invoked the binary. Under the
+       integration runner, the EFI shell loads AxlTestRuntime.efi
+       from the disk image, so the decoded path must contain that
+       filename. */
+    const char *image_path = axl_app_image_path();
+    test_check(image_path != NULL,
+               "app_image_path: returns non-NULL under EFI shell load");
+    test_check(image_path != NULL
+               && axl_strstr(image_path, "AxlTestRuntime") != NULL,
+               "app_image_path: contains 'AxlTestRuntime' (the running .efi)");
+
+    /* Volume-mapping prefix: under the shell, the image path is
+       prepended with the EFI_SHELL_PROTOCOL.GetMapFromDevicePath
+       mapping (e.g. "FS0:" or "fs0:"). Without the prefix, sidecar
+       discovery would resolve "\\<sidecar>" against the shell's cwd,
+       which breaks when startup.nsh launches the .efi without first
+       doing `cd \`. The colon is the canonical mapping marker —
+       grep for it as a stable shape check rather than the case-
+       sensitive "fs0:" form (different shell builds vary the case). */
+    test_check(image_path != NULL
+               && axl_strchr(image_path, ':') != NULL,
+               "app_image_path: carries the volume-mapping prefix (':' present)");
+
+    /* Stable across calls — pointer-equality check, not just
+       string-equality. The runtime owns the buffer; consumers shouldn't
+       see it move. */
+    test_check(axl_app_image_path() == image_path,
+               "app_image_path: returns the same pointer across calls");
+}
+
 // ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
@@ -293,6 +328,7 @@ test_runtime_main(
     test_signal_install_accepts_handler_and_null();
 
     test_app_argv0_is_stable();
+    test_app_image_path_is_canonical();
 
     return test_print_results();
 }

@@ -1194,17 +1194,15 @@ axl_smbios_strings_byte_len(
 //
 // Pure spec lookups, no allocation, return a static const string or
 // NULL. Values match SMBIOS 3.7 Table 13 / EDK2 MdePkg/IndustryStandard/
-// SmBios.h. The "modern slot type" set referenced in dowin's fSlotType
-// (Init.cpp:3395) — OCP NIC, EDSFF, PCIe Gen 5/6 — is included.
+// SmBios.h. The "modern slot type" set — OCP NIC, EDSFF, PCIe Gen 5/6
+// — is included.
 //
-// NOTE: an earlier draft of this table was lifted from delldiags'
-// cmd_bios.c, but a cross-check against EDK2's canonical enum
-// (MISC_SLOT_TYPE) and dowin's own SmBioslib.h SM9_TYPE_PCIE* defines
-// found that delldiags' table had values shifted by 4 (PCIe at 0xA1
-// instead of 0xA5) and labeled PCIe-Mini / U.2 codes (0x21-0x25) as
-// M.2 keys. This implementation uses the spec values; downstream
-// consumers that switch from their local decoder to
-// axl_smbios_slot_type_str will see corrected decoding for any
+// NOTE: a number of in-the-wild OEM diagnostic tools carry their own
+// slot-type tables; some have been observed with values shifted by 4
+// (e.g. PCIe at 0xA1 instead of 0xA5) and PCIe-Mini / U.2 codes
+// (0x21-0x25) labelled as M.2 keys. This implementation uses the
+// spec values; downstream consumers that switch from a local decoder
+// to axl_smbios_slot_type_str will see corrected decoding for any
 // slot whose firmware reports a value the local table got wrong.
 // ---------------------------------------------------------------------------
 

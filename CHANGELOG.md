@@ -3,6 +3,240 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.11.0 — 2026-05-02
+
+USB tooling release. Adds a new top-level **AxlUsb** module (Phases
+A-F: enumeration → vid/pid → class triplet → string descriptors →
+JSON5 vendor/device sidecar → real hub-port topology) plus a
+**`lsusb.efi`** Linux-style USB lister built on top of it. AxlSpd
+gains a handle/singleton vendor-name API mirroring AxlPciIds, and
+the JSON5 sidecar load lifecycle that AxlPciIds / AxlPciClassDb /
+the inline JEDEC loader were each carrying separately is hoisted
+into a single public **AxlSidecar** scaffold (`AxlSidecarStatus`
+enum replaces the `0/-1/-2` magic numbers). All four shipped
+sidecars (`pci-ids`, `pci-class`, `usb-ids`, `jedec`) now ride in
+every release artifact, and the JSON5 converters that emit them are
+installed alongside.
+
+Headlines: AxlUsb cursor enumeration + per-interface granularity +
+hub-port-aware tree walk; `lsusb.efi` with `-t` tree, `-v / -vv`
+verbose, `-d V[:P]` filter, `-s BUS:DEV`, `-n` numeric;
+AxlSidecar public scaffold; AxlSpd handle API + `axl_spd_vendor_name`
+singleton (memspd migrated off its inline JEDEC loader);
+image-path-anchored sidecar discovery so an absolute-path
+`startup.nsh` invocation no longer needs `cd \`; atexit-driven
+sidecar cleanup so consumers stop leaking on shutdown.
+
+### Added
+
+**Tools**
+- `lsusb.efi` — Linux-style USB lister. Default short form +
+  `-t` tree view (mirrors lspci's tree shape with hub-port chains)
+  + `-v / -vv` per-interface detail + `-d V[:P]` filter +
+  `-s BUS:DEV` filter + `-n` numeric mode. Vendor/device/interface-
+  class names auto-loaded from companion `usb-ids.json5`;
+  `--ids-file` / `--debug` overrides.
+
+**Library — AxlUsb (new module)**
+- Cursor-style enumeration: `axl_usb_next(prev)` walks
+  `EFI_USB_IO_PROTOCOL` handles in (bus, device, interface) order.
+  Bus / addr / interface ordinals synthesized from each handle's
+  device path so they're stable across UEFI shell invocations.
+- Descriptor reads: `axl_usb_get_vid_pid`, `axl_usb_get_class`
+  (interface-class triplet base / sub / protocol; per-field NULL-
+  optional), `axl_usb_get_string` (UTF-8 manufacturer / product /
+  serial via UsbGetStringDescriptor + UCS-2 → UTF-8).
+- `axl_usb_class_string` / `_fmt` mirrors the AxlPci class-string
+  shape (FMT_FULL / FMT_SUBCLASS / FMT_BASE; omits unknown tiers
+  rather than printing `<unknown>`; `Class XXXXXX` numeric
+  fallback for wholly unknown classes).
+- Hub-port topology walker: `axl_usb_tree_for_each(fn, ctx)`
+  emits each device with depth = number-of-USB-nodes − 1; direct
+  attachment to the root hub yields depth 0, one hub in between
+  yields depth 1, etc. `AXL_USB_TREE_MAX_DEPTH = 8` cap is
+  generous against the USB-spec real-world cap of 5 hubs.
+- Handle API for the vendor/device-name database: `AxlUsbIds`
+  opaque type + `axl_usb_ids_open` / `_open_from_buffer` /
+  `_close` / `_vendor_name` / `_device_name` / `_format_name` /
+  `_foreach_*`. Singleton wrapper: `axl_usb_ids_load(override)` /
+  `_free` + `axl_usb_vendor_name` / `_device_name` /
+  `axl_usb_format_name`. Authoritative-override semantics, atexit
+  cleanup, schema-field validation — all mirroring AxlPciIds.
+- Per-name length contracts: `AXL_USB_VENDOR_NAME_MAX = 128`,
+  `AXL_USB_DEVICE_NAME_MAX = 192`, `AXL_USB_CLASS_NAME_MAX = 128`,
+  `AXL_USB_NAME_COMPOSED_MAX = 384`, `AXL_USB_STRING_MAX = 384`
+  (worst-case BMP UTF-8 expansion + NUL).
+
+**Library — AxlSidecar (new public scaffold)**
+- Public `AxlSidecarStatus` enum: `AXL_SIDECAR_OK` /
+  `_FILE_MISSING` / `_PARSE_ERROR` replaces the `0/-1/-2` magic
+  numbers across every sidecar API. Numeric values unchanged so
+  the ABI is preserved.
+- `axl_sidecar_open_file` / `_open_buffer` / `_check_schema`
+  package the JSON5 load + REQUIRED-schema-field validation that
+  AxlPciIds / AxlPciClassDb / AxlSpdIds / AxlUsbIds all share.
+  Diagnostics now uniformly list accepted schema versions when
+  rejecting an unknown one.
+
+**Library — AxlSpd (handle + singleton vendor-name API)**
+- New: `AxlSpdIds` opaque type + `axl_spd_ids_open` /
+  `_open_from_buffer` / `_close` / `_vendor_name` / `_format_name`
+  / `_foreach_vendor`. Singleton: `axl_spd_ids_load` / `_free` +
+  `axl_spd_vendor_name` / `axl_spd_format_name`. Mirrors AxlPciIds
+  shape exactly.
+- Reverses the v0.7.0 "library deliberately does not embed a
+  vendor-name table" stance — every consumer was reinventing the
+  same JEDEC table inline. JSON5 sidecar at
+  `share/jedec.json5` is the curated source.
+- `tools/memspd.c` migrated: g_jedec hash table + try_load_jedec
+  + jedec_lookup → `axl_spd_ids_load` + `axl_spd_vendor_name`.
+  ~70 lines of duplicated loader removed; `--jedec-file` flag
+  flows through to the override path.
+
+**Library — Image-path discovery**
+- `axl_app_image_path()` returns the UTF-8 path UEFI itself used
+  to locate the binary (decoded from
+  `EFI_LOADED_IMAGE_PROTOCOL.FilePath` + `DeviceHandle`'s shell
+  mapping). Volume-prefixed (`FS0:\app.efi` rather than
+  `\app.efi`) so dirname-based companion-file resolution works
+  regardless of the current shell directory.
+- `axl_resolve_data_file` prefers the image-path anchor over
+  `argv[0]` (which can be a basename when the shell normalizes).
+  Sidecars resolve correctly when `startup.nsh` runs the binary
+  by full or basename without `cd \` first.
+
+**Sidecars + host scripts**
+- `share/usb-ids.json5` — curated USB vendor/device starter set
+  (QEMU usb-mouse, common server NICs / mass-storage / HID).
+  Hierarchical schema 1 (devices nest under vendor).
+- `scripts/usb-ids-to-json5.py` — bulk-converts canonical
+  linux-usb `usb.ids` to the JSON5 schema. `--vendors-only`
+  filter, `--self-test` that pins a known parser-misattribution
+  edge case (column-0 `AT` / `HID` / etc. sections after `C XX`
+  classes).
+- `scripts/_ids_parser.py` — the line-level tab-indented hierarchy
+  parser shared by `pci-ids-to-json5.py` and `usb-ids-to-json5.py`.
+  Exposes `parse_ids(text, *, has_subsystems, allowed_vendors)` so
+  any future consumer of the same file family (e.g. `oui.txt`)
+  can plug in.
+- `src/usb/CONSUMERS.md` — one-page integration playbook
+  (lifecycle, what happens when the USB stack or DB is absent,
+  per-device vs per-interface walks with three patterns spelled
+  out, layered DB priority, thread-safety contract, sidecar
+  shipping locations).
+
+**Distribution**
+- `.deb` / `.rpm` install all four sidecars to
+  `/usr/share/axl/{pci-ids,pci-class,usb-ids,jedec}.json5`
+  (was: only `pci-ids` / `pci-class`).
+- The same packages install the JSON5 converter scripts to
+  `/usr/share/axl/scripts/` (`pci-ids-to-json5.py`,
+  `usb-ids-to-json5.py`, `_ids_parser.py`). End users no longer
+  need a clone of the SDK source to convert canonical
+  `pci.ids` / `usb.ids` to the JSON5 format.
+- `axl-sdk-tools-<arch>.tar.gz` UEFI tarball stages all four
+  sidecars next to the `.efi` binaries so AxlPciIds / AxlUsbIds /
+  AxlSpdIds find their data via companion-path autodiscovery on
+  a USB stick boot.
+- `tools-tarball/README.txt` enumerates 14 tools (was: stale
+  manual list missing `lsusb`, `lspci`, `memspd`, `cat`).
+
+**Test infrastructure**
+- QEMU runner now wires `qemu-xhci` + `usb-mouse` (port 1) +
+  `usb-hub` (port 2) + `usb-tablet` (behind hub at port 2.1) so
+  `axl_usb_*` / `lsusb -t` exercise a real multi-tier topology
+  in CI on both arches. SKIP balancers retained for hardware
+  paths the runner can't synthesize.
+- `scripts/run-qemu.sh --bridges` mirrors the runner's USB
+  topology for interactive smoke-tests.
+- `scripts/run-qemu.sh` auto-stages `share/usb-ids.json5` and
+  `share/jedec.json5` next to the EFI on the disk image.
+
+### Changed
+
+- `axl_pci_class_load` and the new sidecar loaders all REQUIRE a
+  top-level `schema: N` field (validated through
+  `axl_sidecar_check_schema`). Defaulting either way silently
+  misparses files of the wrong version. Shipped fixtures already
+  declare it.
+- `axl_pci_class_string_fmt` and the new `axl_usb_class_string_fmt`
+  share an internal output-shape resolver
+  (`axl_class_string_fmt_resolve`) — same FMT_FULL / FMT_SUBCLASS /
+  FMT_BASE rules for both APIs.
+- `axl_path_join` now picks the separator (`/` or `\\`) from the
+  anchor's existing style: an anchor containing `\\` or `:` gets
+  backslash; otherwise forward-slash. Mixed-separator outputs
+  (e.g. `fs0:\\dir/file`) were silently rejected by the UEFI
+  shell.
+- `axl_pci_ids_load` and `axl_pci_class_load` register an
+  `axl_atexit` trampoline on first successful load. Consumers
+  that load once and exit without explicit `_free` no longer leak
+  the parsed hash tables. Calling `_free` explicitly still works
+  (it unregisters the trampoline). New `axl_spd_ids_load` and
+  `axl_usb_ids_load` use the same scaffold.
+- `share/pci-class.json5` ships an empty `classes[]` block (the
+  v0.10.0 demo `[overlay]` marker on Host bridge moved to a test-
+  only fixture). Production output stays name-only.
+- Public API return types: every `axl_*_ids_open` /
+  `_open_from_buffer` / `_load` and `axl_pci_class_*` variant now
+  returns `AxlSidecarStatus` instead of `int`. Numeric values
+  unchanged (0/-1/-2) so legacy `if (rc != 0)` callers keep
+  working at the ABI level. New code uses named constants.
+
+### Fixed
+
+- **`share/jedec.json5`** — three vendor codes had wrong bytes:
+  Nanya (0x830B → 0x030B) and Crucial (0x859B → 0x059B) had the
+  parity bit wrongly OR'd into the bank byte (the bank field is a
+  raw JEP-106 continuation count, no parity); Patriot (0x051D →
+  0x059D) had the id byte missing its odd-parity MSB (real Patriot
+  DIMMs report 0x9D on the wire). All three would have missed
+  every lookup against real hardware. The other 12 entries had
+  bank indices and id bytes that happened to satisfy parity, so
+  the bug was invisible by coincidence.
+- **`tools/lsusb.c` / `tools/lspci.c`** — `expand_count_flags`
+  (the `-vv` → `--vv` pre-expand) called `axl_malloc` without
+  checking for NULL; on OOM the loop NULL-derefed `argv[i]`. Fix:
+  on alloc failure, return the caller's `argv` unchanged with no
+  expansion; main detects pointer equality and skips the free.
+- **`AXL_USB_STRING_MAX`** bumped 256 → 384. USB string
+  descriptors cap at 254 bytes of UCS-2 = 127 BMP code points; a
+  code point in U+0800..U+FFFF expands to 3 UTF-8 bytes, so the
+  worst-case payload is 127 × 3 + NUL = 382. The 256-byte cap
+  silently truncated. The header comment also previously claimed
+  supplementary-plane support, which `axl_ucs2_to_utf8_buf`
+  doesn't implement (it would emit two CESU-8 sequences for a
+  surrogate pair); corrected to "BMP only — surrogate pairs not
+  decoded."
+- **`axl_usb_tree_for_each`** dropped an unreachable
+  `n_ports == 0` branch. `slice_device_path` rejects paths
+  without a USB node and `extract_port_chain` always writes the
+  leaf, so `n_ports >= 1` is guaranteed at walk time.
+- **PCI cap-walk on aa64** — VID precheck at walk entry +
+  monotonic-progress guard. Pre-fix, an unprogrammed function on
+  AArch64 could send `axl_pci_cap_next` into an infinite loop
+  (caught via a downstream consumer's session); post-fix, walks
+  terminate cleanly even on devices that report `0xFFFF` for
+  Vendor ID.
+- **Memory leaks at shutdown** — singleton sidecar loaders no
+  longer require explicit `_free` for leak-free shutdown (the
+  atexit trampoline handles it). Heap entries flagged by
+  `AXL_MEM_DEBUG` are gone post-load + exit.
+- **Image-path-anchored sidecar discovery** — `startup.nsh` that
+  ran `fs0:\app.efi` previously required `cd \\` for sidecar
+  autodiscovery to work. `axl_app_image_path` + `axl_path_join`'s
+  consistent-separator behavior fix this.
+- **`axl_pci_class_string`** no longer emits `<unknown>` for
+  tiers with no defined name — those tiers are omitted entirely
+  (matches Linux lspci posture). Wholly unknown classes fall back
+  to `Class XXXXXX` numeric form.
+
+### Test stats
+
+2424 unit tests passing on both X64 and AARCH64 (was 2316 at v0.10.0
+cut; +108 across AxlUsb Phases A-F, AxlSidecar, AxlSpdIds, image-path,
+atexit cleanup, and the new vendor-code regression pins).
+
 ## 0.10.0 — 2026-05-02
 
 PCI tooling release: a Linux-style **`lspci.efi`** built on a fully
@@ -357,7 +591,7 @@ Backward-compatible with v0.8.0:
 Source-incompatible AxlArgs unification: the dual `AxlArgsApp` /
 `AxlVerb` types collapse into one naturally-recursive `AxlArgsNode`
 that describes the program root, every inner branch ("category"),
-and every leaf verb. Surfaced by delldiags do.efi cat-3 migrating
+and every leaf verb. Surfaced by a downstream consumer migrating
 off the deprecated `axl_subcommand_dispatch` and discovering the
 single-level constraint that forced consumers to either flatten
 unhelpfully or hand-roll the deprecated dispatch pattern.
@@ -435,9 +669,9 @@ naming convention.
 
 ## 0.7.2 — 2026-05-01
 
-JSON5 reader and writer support; PCI helper expansion driven by the
-delldiags do.efi cat-3 PCI subcommand family; nvstore/IPMI quality-
-of-life fixes from real-hardware bring-up.
+JSON5 reader and writer support; PCI helper expansion driven by a
+downstream-consumer cat-3 PCI subcommand family; nvstore/IPMI
+quality-of-life fixes from real-hardware bring-up.
 
 ### Added
 
@@ -486,8 +720,7 @@ of-life fixes from real-hardware bring-up.
 
 - **AxlSubcommand deprecated.** The framework was superseded by
   AxlArgs in v0.7.0; deprecation warnings ride v0.7.2. Removal in
-  a later release once the last out-of-tree consumer (delldiags
-  do.efi) migrates.
+  a later release once the last out-of-tree consumer migrates.
 - **`share/jedec.json` → `share/jedec.json5`.** The file uses the
   JSON5 grammar (real hex numbers `0x002C` instead of hex-encoded
   strings, unquoted keys, single-quoted names, `//` header comment
@@ -945,12 +1178,11 @@ consumers).
 
 ## 0.4.0 — 2026-04-29
 
-Second consumer-driven release for delldiags `do.efi` (cat 1 / 1.5 SMBIOS
-landed; this round is decoder-table consolidation). Pulls four pieces
-of SMBIOS spec-table machinery upstream so future spec-fixes propagate
-to every consumer via an SDK bump rather than a manual backport. The
-motivating fixes are the recent ones in dowin's `fSlotType`
-(`Init.cpp:3395`):
+Second consumer-driven release (cat 1 / 1.5 SMBIOS landed; this round
+is decoder-table consolidation). Pulls four pieces of SMBIOS spec-
+table machinery upstream so future spec-fixes propagate to every
+consumer via an SDK bump rather than a manual backport. The motivating
+fixes match recent OEM diagnostic-tool slot-type updates:
 - `0c558a930` (2024-09-25) — OCP NIC SFF/LFF + EDSFF E1.S/E1.L + E3.S/E3.L
 - `aab01c48d` / `569491b6c` (2025-03-27) — SMBIOS slot type 0x25 is Gen 5,
   not Gen 4
@@ -975,14 +1207,14 @@ motivating fixes are the recent ones in dowin's `fSlotType`
   E1/E3 form factors (`0xC5`/`0xC6`). `slot_usage_str` renders
   0x05 as "CPU NOT INSTALLED" — Dell convention from
   `dowin/Init.cpp:3833` + `SmBioslib.h:391`, what every consumer's
-  scripts grep for. **Note**: an earlier draft drew from
-  delldiags' `axl-utils/do/cmd_bios.c` table, which had values
-  shifted by 4 from the spec (PCIe at `0xA1` instead of `0xA5`)
-  and labeled PCIe-Mini / U.2 codes (`0x22`-`0x25`) as M.2 keys.
-  This release uses the canonical spec values; downstream
-  consumers that switch from a local decoder to
-  `axl_smbios_slot_type_str` will see corrected decoding for any
-  slot whose firmware reports a value the local table got wrong.
+  scripts grep for. **Note**: in-the-wild OEM diagnostic-tool
+  slot-type tables have been observed with values shifted by 4
+  from the spec (PCIe at `0xA1` instead of `0xA5`) and PCIe-Mini /
+  U.2 codes (`0x22`-`0x25`) labelled as M.2 keys. This release uses
+  the canonical spec values; downstream consumers that switch from
+  a local decoder to `axl_smbios_slot_type_str` will see corrected
+  decoding for any slot whose firmware reports a value the local
+  table got wrong.
 - **`axl_smbios_strings_byte_len(hdr)`** — byte length of the
   inline strings region between the formatted area and the spec's
   end-of-region double-NUL. Useful for "raw record" dumps that
@@ -1027,10 +1259,10 @@ pinning against a tag.
 
 ## 0.3.0 — 2026-04-29
 
-Consumer-driven release for delldiags `do.efi` (the hardware-diagnostic
-CLI port from `efiUtils/doDriver/`). Closes the SMBIOS audit gap on
-Types 8/9/11/16/19/20/41, adds a multi-command CLI dispatch helper,
-and standardizes the hex+offset parser delldiags categories 3-5 share.
+Consumer-driven release for a downstream hardware-diagnostic CLI
+port. Closes the SMBIOS audit gap on Types 8/9/11/16/19/20/41,
+adds a multi-command CLI dispatch helper, and standardizes the
+hex+offset parser the consumer's categories 3-5 share.
 
 ### Added
 
@@ -1076,8 +1308,8 @@ and standardizes the hex+offset parser delldiags categories 3-5 share.
   an optional `+offset` suffix. Accepts `"0x100"`, `"256"`,
   `"0x100+0x10"`, `"256+16"`. Strict: trailing garbage, whitespace
   around `+`, dangling `+`, and overflow on the sum all return -1.
-  Standardizes the `do crb tag+offset reg` / `do rb physAddr+offset
-  count` parsing across delldiags categories 3-5.
+  Standardizes the `crb tag+offset reg` / `rb physAddr+offset
+  count` parsing across the downstream consumer's categories 3-5.
 
 ### Changed
 
@@ -1091,8 +1323,7 @@ and standardizes the hex+offset parser delldiags categories 3-5 share.
   buffer" / "future axl_smbios_next" notes that the v0.2.5
   refactor and earlier releases had already obsoleted.
 - `docs/AXL-Coding-Style.md` adds a "CLI Patterns" section
-  documenting single-purpose vs multi-command tool shapes
-  (`mkrd` vs `do.efi`).
+  documenting single-purpose vs multi-command tool shapes.
 
 ### Test stats
 
@@ -1101,8 +1332,8 @@ and `strtou64_with_offset`).
 
 ## 0.2.9 — 2026-04-28
 
-Downstream-consumer release. The motivating case is delldiags
-axl-utils, which needs `run-qemu.sh` and the host-side helpers
+Downstream-consumer release. The motivating case is a downstream
+util project that needs `run-qemu.sh` and the host-side helpers
 on machines that have system QEMU/OVMF installed via the package
 manager but can't `git clone` the SDK source (corporate MITM
 proxies break TLS verification on `git clone`; a pinned

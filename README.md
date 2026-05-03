@@ -232,16 +232,26 @@ ships these `.efi` binaries:
 
 | Tool       | Description |
 |------------|-------------|
+| `cat`      | Concatenate files to stdout (UEFI `cat(1)` equivalent). |
 | `dmidecode`| SMBIOS / DMI table decoder (UEFI `dmidecode(8)` equivalent) — dumps every record or filter by `-t <type>`; single-value query via `-s <keyword>` (`bios-vendor`, `system-uuid`, etc.). |
 | `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
 | `find`     | Recursive file and directory finder — glob patterns (`--name '*.efi'`) and type filter (`--type f` or `d`). UEFI `find(1)` equivalent. |
 | `grep`     | Pattern search across files — case-insensitive (`-i`), line numbers (`-n`), match count (`-c`), recursive (`-r`). UEFI `grep(1)` equivalent. |
 | `hexdump`  | Hex/ASCII file viewer (`xxd`-style) — seekable with `--offset`/`--length`. |
 | `ipmi`     | Stripped-down `ipmitool` built on AxlIpmi: `info`, `chassis status`/`power on\|off\|cycle\|reset`, `sel list`, `sdr list`, `sensor`, `fru list`, and raw command passthrough (`raw <netfn> <cmd> ...`). |
+| `lspci`    | PCI/PCIe device lister (UEFI `lspci(8)` equivalent) — `-s` BDF filter, `-d` VID:DID filter, `-n` numeric, `-v`/`-vv`/`-vvv` verbose, `-x`/`-xx`/`-xxx` hex dump, `-t` tree (PCI bridge topology). Decodes vendor/device/class names from `pci-ids.json5` + `pci-class.json5` sidecars. |
+| `lsusb`    | USB device lister (UEFI `lsusb(8)` equivalent) — `-s BBB[:DDD]`, `-d VID[:PID]`, `-n` numeric, `-v`/`-vv` verbose (per-interface class triplet + iManufacturer/iProduct/iSerial), `-t` tree (real USB hub-port topology). Decodes vendor/device names from `usb-ids.json5`. |
+| `memspd`   | DDR4/DDR5 SPD reader over the platform SMBus — `list` populated slots, `show <slot>` decoded fields, `decode <slot>` raw hex + decoded. JEDEC manufacturer codes resolved via `jedec.json5`. |
 | `mkrd`     | Create / list / destroy FAT16/FAT32 RAM disks in the UEFI Shell (`mkrd <label> [-s size]`, `-l`, `-d <label>`). Handy for staging files without writing to flash. |
 | `netinfo`  | Network interface diagnostics and ping — lists NICs with IP/MAC/link state, pings with `-c <count>`. UEFI `ifconfig`/`ping` equivalent. |
 | `rfbrowse` | Redfish browser — connects to a BMC over HTTPS and walks resources interactively (shortcut verbs for `/Systems`, `/Managers`, etc., plus arbitrary paths). |
 | `sysinfo`  | System inventory summary — compact `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. Use `dmidecode` for the full per-record dump. |
+
+`lspci`, `lsusb`, and `memspd` consult JSON5 sidecar databases
+auto-discovered next to the `.efi` (or via explicit `--ids-file` /
+`--jedec-file`). The tools tarball ships curated starter sets;
+extend or replace via `scripts/{pci,usb}-ids-to-json5.py` against
+the canonical `pci.ids` / `usb.ids` text databases.
 
 Built with TLS enabled so `fetch` handles HTTPS and `rfbrowse`
 (Redfish over HTTPS) works against real BMCs.

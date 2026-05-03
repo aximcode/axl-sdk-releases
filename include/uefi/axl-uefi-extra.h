@@ -113,6 +113,17 @@ typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_CUR_DIR)(
     IN CONST CHAR16  *Dir
     );
 
+/* Shell Spec 2.2 §2.2.9 — return the shell mapping name (e.g.
+   L"fs0:") for a device path. The DevicePath argument is in/out:
+   on input it's the full device path to look up; on success it's
+   advanced past the matched volume portion (so the caller can read
+   the file-portion afterward). Returns NULL if no mapping covers
+   the device path. Used by axl_app_image_path to convert
+   LoadedImage->DeviceHandle into a shell-resolvable prefix. */
+typedef CONST CHAR16 *(EFIAPI *EFI_SHELL_GET_MAP_FROM_DEVICE_PATH)(
+    IN OUT EFI_DEVICE_PATH_PROTOCOL  **DevicePath
+    );
+
 // ===================================================================
 // EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (UEFI Spec 2.x, §12.2)
 //
@@ -179,7 +190,7 @@ struct _EFI_SHELL_PROTOCOL {
     void                          *SetAlias;             // 2.2.6
     void                          *GetHelpText;          // 2.2.7
     void                          *GetDevicePathFromMap; // 2.2.8
-    void                          *GetMapFromDevicePath; // 2.2.9
+    EFI_SHELL_GET_MAP_FROM_DEVICE_PATH GetMapFromDevicePath; // 2.2.9 (USED)
     void                          *GetDevicePathFromFilePath; // 2.2.10
     void                          *GetFilePathFromDevicePath; // 2.2.11
     void                          *SetMap;               // 2.2.12
@@ -447,6 +458,144 @@ typedef struct {
     UINT8                    BaseAddressModifier;
     UINT8                    InterruptNumber;
 } SMBIOS_TABLE_TYPE38;
+#pragma pack()
+
+// ===================================================================
+// EFI_USB_IO_PROTOCOL (UEFI Spec §17.2)
+//
+// The spec HTML's `EFI_USB_IO_PROTOCOL` block has a missing semicolon
+// and a typo (`EFI_USB_IO_SYNC_INTERRPUT_TRANSFER`) that breaks the
+// generator's C extractor — hand-write the protocol here verbatim
+// against EDK2's clean version. AxlUsb only invokes the descriptor
+// readers (UsbGetDeviceDescriptor / UsbGetConfigDescriptor /
+// UsbGetInterfaceDescriptor / UsbGetEndpointDescriptor /
+// UsbGetStringDescriptor / UsbGetSupportedLanguages); the transfer
+// slots are typed as `void *` so callers don't accidentally invoke
+// them through a deliberately-narrow surface.
+// ===================================================================
+
+typedef struct _EFI_USB_IO_PROTOCOL EFI_USB_IO_PROTOCOL;
+
+#pragma pack(1)
+typedef struct {
+    UINT8   Length;
+    UINT8   DescriptorType;
+    UINT16  BcdUSB;
+    UINT8   DeviceClass;
+    UINT8   DeviceSubClass;
+    UINT8   DeviceProtocol;
+    UINT8   MaxPacketSize0;
+    UINT16  IdVendor;
+    UINT16  IdProduct;
+    UINT16  BcdDevice;
+    UINT8   StrManufacturer;
+    UINT8   StrProduct;
+    UINT8   StrSerialNumber;
+    UINT8   NumConfigurations;
+} EFI_USB_DEVICE_DESCRIPTOR;
+
+typedef struct {
+    UINT8   Length;
+    UINT8   DescriptorType;
+    UINT16  TotalLength;
+    UINT8   NumInterfaces;
+    UINT8   ConfigurationValue;
+    UINT8   Configuration;
+    UINT8   Attributes;
+    UINT8   MaxPower;
+} EFI_USB_CONFIG_DESCRIPTOR;
+
+typedef struct {
+    UINT8   Length;
+    UINT8   DescriptorType;
+    UINT8   InterfaceNumber;
+    UINT8   AlternateSetting;
+    UINT8   NumEndpoints;
+    UINT8   InterfaceClass;
+    UINT8   InterfaceSubClass;
+    UINT8   InterfaceProtocol;
+    UINT8   Interface;
+} EFI_USB_INTERFACE_DESCRIPTOR;
+
+typedef struct {
+    UINT8   Length;
+    UINT8   DescriptorType;
+    UINT8   EndpointAddress;
+    UINT8   Attributes;
+    UINT16  MaxPacketSize;
+    UINT8   Interval;
+} EFI_USB_ENDPOINT_DESCRIPTOR;
+#pragma pack()
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_DEVICE_DESCRIPTOR)(
+    IN  EFI_USB_IO_PROTOCOL        *This,
+    OUT EFI_USB_DEVICE_DESCRIPTOR  *DeviceDescriptor
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_CONFIG_DESCRIPTOR)(
+    IN  EFI_USB_IO_PROTOCOL        *This,
+    OUT EFI_USB_CONFIG_DESCRIPTOR  *ConfigurationDescriptor
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_INTERFACE_DESCRIPTOR)(
+    IN  EFI_USB_IO_PROTOCOL           *This,
+    OUT EFI_USB_INTERFACE_DESCRIPTOR  *InterfaceDescriptor
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_ENDPOINT_DESCRIPTOR)(
+    IN  EFI_USB_IO_PROTOCOL          *This,
+    IN  UINT8                         EndpointIndex,
+    OUT EFI_USB_ENDPOINT_DESCRIPTOR  *EndpointDescriptor
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_STRING_DESCRIPTOR)(
+    IN  EFI_USB_IO_PROTOCOL  *This,
+    IN  UINT16                LangID,
+    IN  UINT8                 StringID,
+    OUT CHAR16              **String
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_SUPPORTED_LANGUAGES)(
+    IN  EFI_USB_IO_PROTOCOL  *This,
+    OUT UINT16              **LangIDTable,
+    OUT UINT16               *TableSize
+    );
+
+struct _EFI_USB_IO_PROTOCOL {
+    void                                *UsbControlTransfer;
+    void                                *UsbBulkTransfer;
+    void                                *UsbAsyncInterruptTransfer;
+    void                                *UsbSyncInterruptTransfer;
+    void                                *UsbIsochronousTransfer;
+    void                                *UsbAsyncIsochronousTransfer;
+    EFI_USB_IO_GET_DEVICE_DESCRIPTOR     UsbGetDeviceDescriptor;
+    EFI_USB_IO_GET_CONFIG_DESCRIPTOR     UsbGetConfigDescriptor;
+    EFI_USB_IO_GET_INTERFACE_DESCRIPTOR  UsbGetInterfaceDescriptor;
+    EFI_USB_IO_GET_ENDPOINT_DESCRIPTOR   UsbGetEndpointDescriptor;
+    EFI_USB_IO_GET_STRING_DESCRIPTOR     UsbGetStringDescriptor;
+    EFI_USB_IO_GET_SUPPORTED_LANGUAGES   UsbGetSupportedLanguages;
+    void                                *UsbPortReset;
+};
+
+// USB device-path messaging-node subtype (UEFI Spec §10.3.5.7).
+// Used by AxlUsb to derive (bus, addr) ordinals from the path of an
+// EFI_USB_IO_PROTOCOL handle: the ParentPortNumber + InterfaceNumber
+// pair lives at offset +4 of a USB messaging device-path node.
+// Guarded so future regeneration that emits MESSAGING_DEVICE_PATH
+// from the spec doesn't collide.
+#ifndef MESSAGING_DEVICE_PATH
+#define MESSAGING_DEVICE_PATH       0x03
+#endif
+#ifndef MSG_USB_DP
+#define MSG_USB_DP                  0x05
+#endif
+
+#pragma pack(1)
+typedef struct {
+    EFI_DEVICE_PATH_PROTOCOL  Header;
+    UINT8                     ParentPortNumber;
+    UINT8                     InterfaceNumber;
+} USB_DEVICE_PATH;
 #pragma pack()
 
 #endif /* AXL_UEFI_EXTRA_H */

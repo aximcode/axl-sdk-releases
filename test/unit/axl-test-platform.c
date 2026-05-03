@@ -11,6 +11,7 @@
 #include "axl-test.h"
 #include <axl/axl-log.h>
 #include <axl/axl-spd.h>
+#include <axl/axl-usb.h>
 
 #include "spd-ddr4-micron-8gb.h"
 #include "spd-ddr5-samsung-16gb.h"
@@ -500,8 +501,8 @@ test_pci_ids_db(void)
     /* Auto-discover via the companion-path resolver. The integration
        runner stages share/pci-ids.json5 next to the EFI; passing
        NULL here exercises that lookup path. */
-    int rc = axl_pci_ids_load(NULL);
-    if (rc != 0) {
+    AxlSidecarStatus rc = axl_pci_ids_load(NULL);
+    if (rc != AXL_SIDECAR_OK) {
         axl_printf("SKIP: pci-ids load (no companion file staged)\n");
         /* Balance: 7 conditional test_checks below (rc==0, intel,
            q35, unknown vendor, unknown device, second-load, after-free). */
@@ -531,7 +532,7 @@ test_pci_ids_db(void)
                "pci-ids: unknown device returns NULL even with known vendor");
 
     /* Idempotent reload — second call is a no-op success. */
-    test_check(axl_pci_ids_load(NULL) == 0,
+    test_check(axl_pci_ids_load(NULL) == AXL_SIDECAR_OK,
                "pci-ids: second load is a no-op success");
 
     /* Cleanup. After free, lookups return NULL again. */
@@ -562,7 +563,7 @@ test_pci_ids_subsystem_lookup(void)
 
     AxlPciIds *h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   fixture, axl_strlen(fixture), &h) == 0,
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids subsys: fixture loads");
 
     /* Hit. */
@@ -645,7 +646,7 @@ test_pci_ids_foreach(void)
 
     AxlPciIds *h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   fixture, axl_strlen(fixture), &h) == 0,
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids foreach: fixture loads");
 
     /* NULL guards. */
@@ -688,7 +689,7 @@ test_pci_ids_subsys_db(void)
        subsystem entries via the singleton API. SKIP-balanced when
        the DB isn't loaded (e.g. when test EFI is launched outside
        the integration runner). */
-    if (axl_pci_ids_load(NULL) != 0) {
+    if (axl_pci_ids_load(NULL) != AXL_SIDECAR_OK) {
         axl_printf("SKIP: pci-ids subsys_db (no companion file staged)\n");
         for (int i = 0; i < 2; i++) {
             test_check(true, "pci-ids subsys: SKIP balance");
@@ -729,7 +730,7 @@ test_pci_class_db_handle(void)
 
     AxlPciClassDb *db = NULL;
     test_check(axl_pci_class_open_from_buffer(
-                   fixture, axl_strlen(fixture), &db) == 0,
+                   fixture, axl_strlen(fixture), &db) == AXL_SIDECAR_OK,
                "pci class_db: handle opens from buffer");
 
     /* Per-tier lookups return the overlay name for entries the
@@ -759,7 +760,7 @@ test_pci_class_db_handle(void)
     /* Bad JSON5 returns -2; close NULL is a no-op. */
     AxlPciClassDb *bad = NULL;
     test_check(axl_pci_class_open_from_buffer(
-                   "@@@ garbage", 11, &bad) == -2,
+                   "@@@ garbage", 11, &bad) == AXL_SIDECAR_PARSE_ERROR,
                "pci class_db: malformed JSON5 returns -2");
     test_check(bad == NULL, "pci class_db: handle stays NULL on -2");
 
@@ -786,16 +787,33 @@ test_pci_class_db_singleton_overrides(void)
                && axl_strcmp(buf, "Bridge / Host bridge") == 0,
                "pci class_db: baseline (no overlay) uses compiled-in tables");
 
-    /* Stage a singleton overlay via the file-resolver.
-       The integration runner stages share/pci-class.json5
-       alongside the EFI; SKIP-balance when not present.
+    /* Load the test-only overlay fixture via the explicit-override
+       path. The integration runner stages
+       test/data/pci-class-test.json5 at the disk root next to the
+       EFI; SKIP-balance when not present.
+
+       Note: explicit override is authoritative (no companion-path
+       fallback per the API contract), so this depends on the runner
+       doing `cd \` in startup.nsh — the bare relative
+       `pci-class-test.json5` resolves against CWD. Other consumers
+       of the same loader who don't `cd \` would have to pass an
+       absolute path; the autodiscovery path (NULL override) is the
+       one that gets image-path-anchored discovery via
+       axl_resolve_data_file.
+
+       Production share/pci-class.json5 ships with an empty classes[]
+       block so deployed lspci output isn't polluted with a demo
+       "[overlay]" marker (a downstream session caught this leaking
+       into prod tools). The test-only file is the override that
+       proves the loader-applied lookup actually fires.
+
        Populated path runs 6 conditional checks below: 'overlay
        loaded', '[overlay] marker', 'codes outside overlay still
        hit compiled-in', 'second load no-op', 'free reverts',
        'missing file -1'. */
-    int rc = axl_pci_class_load(NULL);
-    if (rc != 0) {
-        axl_printf("SKIP: pci class_db (no companion overlay staged)\n");
+    AxlSidecarStatus rc = axl_pci_class_load("pci-class-test.json5");
+    if (rc != AXL_SIDECAR_OK) {
+        axl_printf("SKIP: pci class_db (no test overlay staged)\n");
         for (int i = 0; i < 6; i++) {
             test_check(true, "pci class_db: SKIP balance");
         }
@@ -803,12 +821,9 @@ test_pci_class_db_singleton_overrides(void)
     }
     test_check(true, "pci class_db: overlay loaded");
 
-    /* The shipped share/pci-class.json5 redefines a benign tier we
-       can pin: 0x060000 (Host bridge) is a stable triple in the
-       compiled-in table that the curated overlay annotates with
-       a vendor-neutral marker so the test sees a stable difference.
-       Pin the substring "[overlay]" which the curated set marks
-       overlay-loaded entries with. */
+    /* The test fixture redefines 0x060000 (Host bridge) — a stable
+       triple in the compiled-in table — with an "[overlay]" marker
+       that proves the overlay lookup happened. */
     n = axl_pci_class_string_fmt(0x060000,
                                  AXL_PCI_CLASS_FMT_FULL,
                                  buf, sizeof(buf));
@@ -825,7 +840,7 @@ test_pci_class_db_singleton_overrides(void)
                "pci class_db: codes outside overlay still hit compiled-in");
 
     /* Reload short-circuits (idempotent). */
-    test_check(axl_pci_class_load(NULL) == 0,
+    test_check(axl_pci_class_load("pci-class-test.json5") == AXL_SIDECAR_OK,
                "pci class_db: second load is a no-op success");
 
     /* Free clears the overlay; output reverts to compiled-in. */
@@ -837,10 +852,11 @@ test_pci_class_db_singleton_overrides(void)
                && axl_strcmp(buf, "Bridge / Host bridge") == 0,
                "pci class_db: free reverts to compiled-in");
 
-    /* Load failure modes (parallel to pci-ids -1/-2 split). */
+    /* Load failure modes (parallel to pci-ids FILE_MISSING / PARSE_ERROR split). */
     test_check(axl_pci_class_load(
-                   "fs0:\\does-not-exist-anywhere.json5") == -1,
-               "pci class_db: missing file returns -1 (authoritative)");
+                   "fs0:\\does-not-exist-anywhere.json5")
+                   == AXL_SIDECAR_FILE_MISSING,
+               "pci class_db: missing file returns FILE_MISSING (authoritative)");
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +892,7 @@ test_pci_format_name(void)
             "}\n";
         AxlPciIds *h = NULL;
         test_check(axl_pci_ids_open_from_buffer(
-                       fixture, axl_strlen(fixture), &h) == 0,
+                       fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
                    "pci format_name: orphan-device fixture loads");
         int rc = axl_pci_ids_format_name(h, 0xCAFE, 0x0001,
                                          buf, sizeof(buf));
@@ -890,7 +906,7 @@ test_pci_format_name(void)
 
     /* Cases 1-3 use the staged singleton DB. SKIP-balanced when
        no companion DB is present. */
-    if (axl_pci_ids_load(NULL) != 0) {
+    if (axl_pci_ids_load(NULL) != AXL_SIDECAR_OK) {
         axl_printf("SKIP: pci format_name (no companion DB staged)\n");
         for (int i = 0; i < 3; i++) {
             test_check(true, "pci format_name: SKIP balance");
@@ -961,7 +977,7 @@ test_pci_ids_length_enforcement(void)
 
     AxlPciIds *h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   fixture, axl_strlen(fixture), &h) == 0,
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids cap: over-cap fixture loads (truncates silently)");
 
     const char *v = axl_pci_ids_vendor_name(h, 0x9999);
@@ -986,7 +1002,7 @@ test_pci_ids_partial_schemas(void)
     static const char vendors_only[] =
         "{ schema: 1, vendors: [{ id: 0x0001, name: 'V' }] }";
     test_check(axl_pci_ids_open_from_buffer(
-                   vendors_only, axl_strlen(vendors_only), &h) == 0,
+                   vendors_only, axl_strlen(vendors_only), &h) == AXL_SIDECAR_OK,
                "pci-ids schema: vendors-only loads");
     test_check(axl_pci_ids_vendor_name(h, 0x0001) != NULL,
                "pci-ids schema: vendors-only — vendor lookup hits");
@@ -998,7 +1014,7 @@ test_pci_ids_partial_schemas(void)
     static const char devices_only[] =
         "{ schema: 1, devices: [{ vid: 0x0001, did: 0x0001, name: 'D' }] }";
     test_check(axl_pci_ids_open_from_buffer(
-                   devices_only, axl_strlen(devices_only), &h) == 0,
+                   devices_only, axl_strlen(devices_only), &h) == AXL_SIDECAR_OK,
                "pci-ids schema: devices-only loads");
     test_check(axl_pci_ids_device_name(h, 0x0001, 0x0001) != NULL,
                "pci-ids schema: devices-only — device lookup hits");
@@ -1009,7 +1025,7 @@ test_pci_ids_partial_schemas(void)
     /* Schema field only — empty stub. All lookups miss; no crash. */
     static const char schema_only[] = "{ schema: 1 }";
     test_check(axl_pci_ids_open_from_buffer(
-                   schema_only, axl_strlen(schema_only), &h) == 0,
+                   schema_only, axl_strlen(schema_only), &h) == AXL_SIDECAR_OK,
                "pci-ids schema: empty stub loads");
     test_check(axl_pci_ids_vendor_name(h, 0x0001) == NULL
                && axl_pci_ids_device_name(h, 0x0001, 0x0001) == NULL,
@@ -1037,9 +1053,9 @@ test_pci_ids_handle_buffer(void)
         "}\n";
 
     AxlPciIds *h = NULL;
-    int rc = axl_pci_ids_open_from_buffer(fixture,
-                                          axl_strlen(fixture), &h);
-    test_check(rc == 0 && h != NULL,
+    AxlSidecarStatus rc = axl_pci_ids_open_from_buffer(fixture,
+                                                       axl_strlen(fixture), &h);
+    test_check(rc == AXL_SIDECAR_OK && h != NULL,
                "pci-ids handle: open_from_buffer succeeds on valid JSON5");
 
     const char *v = axl_pci_ids_vendor_name(h, 0x1234);
@@ -1087,10 +1103,10 @@ test_pci_ids_handle_priority(void)
     AxlPciIds *pub  = NULL;
     AxlPciIds *priv = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   public_db, axl_strlen(public_db), &pub) == 0,
+                   public_db, axl_strlen(public_db), &pub) == AXL_SIDECAR_OK,
                "pci-ids overlay: public DB opens");
     test_check(axl_pci_ids_open_from_buffer(
-                   private_db, axl_strlen(private_db), &priv) == 0,
+                   private_db, axl_strlen(private_db), &priv) == AXL_SIDECAR_OK,
                "pci-ids overlay: private DB opens");
 
     /* Priority lookup: private first, public fallback. */
@@ -1114,51 +1130,53 @@ test_pci_ids_load_failure_modes(void)
     /* axl_pci_ids_load with an explicit override is authoritative
        (per the post-friction API change): the override path is used
        as-is, no fallback to companion/cwd. So passing a known-absent
-       path returns -1, and a known-malformed path returns -2 —
-       deployment vs authoring failure modes stay distinguishable.
+       path returns AXL_SIDECAR_FILE_MISSING, and a known-malformed
+       path returns AXL_SIDECAR_PARSE_ERROR — deployment vs
+       authoring failure modes stay distinguishable.
 
        Make sure the singleton is empty before each call: axl_pci_ids_load
        short-circuits on g_singleton != NULL. */
     axl_pci_ids_free();
 
-    /* -1: explicit path that doesn't exist. The fact that pci-ids.json5
-       IS staged in the companion path must NOT mask this. */
-    test_check(axl_pci_ids_load(
-                   "fs0:\\does-not-exist-anywhere.json5") == -1,
-               "pci-ids load: explicit missing file returns -1 (no fallback)");
+    /* FILE_MISSING: explicit path that doesn't exist. The fact that
+       pci-ids.json5 IS staged in the companion path must NOT mask this. */
+    test_check(axl_pci_ids_load("fs0:\\does-not-exist-anywhere.json5")
+                   == AXL_SIDECAR_FILE_MISSING,
+               "pci-ids load: explicit missing file returns FILE_MISSING (no fallback)");
 
-    /* -2: file found but malformed. The integration runner stages
-       pci-ids-malformed.json5 next to the EFI; SKIP-balanced when
-       the fixture isn't present. */
-    int rc = axl_pci_ids_load("pci-ids-malformed.json5");
-    if (rc == -1) {
-        axl_printf("SKIP: pci-ids load -2 (malformed fixture not staged)\n");
-        test_check(true, "pci-ids load: SKIP balance for -2 path");
+    /* PARSE_ERROR: file found but malformed. The integration runner
+       stages pci-ids-malformed.json5 next to the EFI; SKIP-balanced
+       when the fixture isn't present. */
+    AxlSidecarStatus rc = axl_pci_ids_load("pci-ids-malformed.json5");
+    if (rc == AXL_SIDECAR_FILE_MISSING) {
+        axl_printf("SKIP: pci-ids load PARSE_ERROR (malformed fixture not staged)\n");
+        test_check(true, "pci-ids load: SKIP balance for PARSE_ERROR path");
     } else {
-        test_check(rc == -2,
-                   "pci-ids load: malformed JSON5 returns -2 (parse error)");
+        test_check(rc == AXL_SIDECAR_PARSE_ERROR,
+                   "pci-ids load: malformed JSON5 returns PARSE_ERROR");
     }
 
-    /* Handle API mirrors the same -1/-2 split. NULL out param is
-       cleared on error. */
+    /* Handle API mirrors the same split. NULL out param is cleared
+       on error. */
     AxlPciIds *h = (AxlPciIds *)0x1;
     test_check(axl_pci_ids_open(
-                   "fs0:\\does-not-exist-anywhere.json5", &h) == -1,
-               "pci-ids open: missing file returns -1");
+                   "fs0:\\does-not-exist-anywhere.json5", &h)
+                   == AXL_SIDECAR_FILE_MISSING,
+               "pci-ids open: missing file returns FILE_MISSING");
     test_check(h == NULL,
                "pci-ids open: handle cleared to NULL on error");
 }
 
-static int
+static AxlSidecarStatus
 ids_buffer_open_cb(const char *fixture)
 {
     /* Helper: open from a string buffer and immediately close.
        Used to prove the buffer path doesn't leak. Called from a
        loop in the test below. */
     AxlPciIds *h = NULL;
-    int rc = axl_pci_ids_open_from_buffer(fixture,
-                                          axl_strlen(fixture), &h);
-    if (rc == 0) {
+    AxlSidecarStatus rc = axl_pci_ids_open_from_buffer(
+        fixture, axl_strlen(fixture), &h);
+    if (rc == AXL_SIDECAR_OK) {
         axl_pci_ids_close(h);
     }
     return rc;
@@ -1192,7 +1210,7 @@ test_pci_ids_schema_v2_hierarchical(void)
 
     AxlPciIds *h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   fixture, axl_strlen(fixture), &h) == 0,
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids v2: hierarchical fixture loads");
 
     /* Vendor lookups (top-level vendors[]). */
@@ -1247,7 +1265,7 @@ test_pci_ids_schema_v2_hierarchical(void)
         "  ],\n"
         "}\n";
     test_check(axl_pci_ids_open_from_buffer(
-                   hybrid_fixture, axl_strlen(hybrid_fixture), &h) == 0,
+                   hybrid_fixture, axl_strlen(hybrid_fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids v2 hybrid: nested + top-level subsystems[] loads");
     test_check(axl_pci_ids_subsys_name(h, 0xAAAA, 0x0001) != NULL,
                "pci-ids v2 hybrid: nested subsystem reachable");
@@ -1263,7 +1281,7 @@ test_pci_ids_schema_v2_hierarchical(void)
         "  subsystems: [{ svid: 0x1028, sdid: 0x1FCA, name: 'Flat OEM' }],\n"
         "}\n";
     test_check(axl_pci_ids_open_from_buffer(
-                   v1_fixture, axl_strlen(v1_fixture), &h) == 0,
+                   v1_fixture, axl_strlen(v1_fixture), &h) == AXL_SIDECAR_OK,
                "pci-ids v1: flat fixture still loads after v2 was added");
     test_check(axl_pci_ids_vendor_name(h, 0x8086) != NULL
                && axl_strcmp(axl_pci_ids_vendor_name(h, 0x8086),
@@ -1277,7 +1295,7 @@ test_pci_ids_schema_v2_hierarchical(void)
         "{ schema: 99, vendors: [{ id: 0x0001, name: 'X' }] }\n";
     h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
-                   v99_fixture, axl_strlen(v99_fixture), &h) == -2,
+                   v99_fixture, axl_strlen(v99_fixture), &h) == AXL_SIDECAR_PARSE_ERROR,
                "pci-ids: unknown schema number returns -2");
     test_check(h == NULL,
                "pci-ids: handle stays NULL on unknown-schema -2");
@@ -1291,7 +1309,7 @@ test_pci_ids_schema_v2_hierarchical(void)
     h = NULL;
     test_check(axl_pci_ids_open_from_buffer(
                    no_schema_fixture, axl_strlen(no_schema_fixture),
-                   &h) == -2,
+                   &h) == AXL_SIDECAR_PARSE_ERROR,
                "pci-ids: missing 'schema' field returns -2");
 }
 
@@ -1306,7 +1324,7 @@ test_pci_ids_buffer_parse_errors(void)
        allows unquoted identifier keys). */
     static const char bad[] = "@@@ not even close to JSON5 @@@";
     AxlPciIds *h = NULL;
-    test_check(axl_pci_ids_open_from_buffer(bad, axl_strlen(bad), &h) == -2,
+    test_check(axl_pci_ids_open_from_buffer(bad, axl_strlen(bad), &h) == AXL_SIDECAR_PARSE_ERROR,
                "pci-ids buffer: malformed JSON5 returns -2");
     test_check(h == NULL, "pci-ids buffer: handle stays NULL on parse fail");
 
@@ -1315,7 +1333,7 @@ test_pci_ids_buffer_parse_errors(void)
     static const char tiny[] =
         "{ schema: 1, vendors: [{ id: 0x0001, name: 'Tiny' }] }";
     for (int i = 0; i < 4; i++) {
-        test_check(ids_buffer_open_cb(tiny) == 0,
+        test_check(ids_buffer_open_cb(tiny) == AXL_SIDECAR_OK,
                    "pci-ids buffer: re-open OK (no leaks)");
     }
 }
@@ -1382,6 +1400,702 @@ test_pci_vpd_iter(void)
         test_check(true, "pci vpd_iter: SKIP balance 2");
     }
 }
+
+// ---------------------------------------------------------------------------
+// AxlUsb (Phase A: enumeration + vid/pid)
+// ---------------------------------------------------------------------------
+
+static void
+test_usb_enumerate(void)
+{
+    AxlUsbAddr *u = NULL;
+    size_t      count = 0;
+    while ((u = axl_usb_next(u)) != NULL) {
+        count++;
+        if (count > 1024) {
+            break;
+        }
+    }
+    if (count == 0) {
+        /* Real-hardware / virt-without-USB envs hit this path; the
+           QEMU test runner injects qemu-xhci + usb-mouse so the
+           populated branch is what CI exercises. Balance the count
+           against the populated branch (3 checks). */
+        axl_printf("SKIP: usb_enumerate (no EFI_USB_IO_PROTOCOL handles)\n");
+        test_check(true, "usb enumerate: SKIP balance 1");
+        test_check(true, "usb enumerate: SKIP balance 2");
+        test_check(true, "usb enumerate: SKIP balance 3");
+        return;
+    }
+    test_check(count > 0, "usb: next finds at least one interface");
+    test_check(count <= 1024, "usb: next terminates");
+
+    /* Cursor-restart semantics: passing a caller-allocated
+       AxlUsbAddr (not the static cursor) restarts the walk silently. */
+    AxlUsbAddr  stack_copy = { 0 };
+    AxlUsbAddr *r = axl_usb_next(&stack_copy);
+    test_check(r != NULL,
+               "usb: next restarts on caller-supplied prev");
+}
+
+static void
+test_usb_get_vid_pid(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_vid_pid (no USB devices)\n");
+        test_check(true, "usb vid_pid: SKIP balance 1");
+        test_check(true, "usb vid_pid: SKIP balance 2");
+        test_check(true, "usb vid_pid: SKIP balance 3");
+        test_check(true, "usb vid_pid: SKIP balance 4");
+        test_check(true, "usb vid_pid: SKIP balance 5");
+        return;
+    }
+
+    /* Distinct sentinels so a stub `*vid = 0; *pid = 0; return 0;`
+       can't slip past the gate — both values must move. */
+    uint16_t vid = 0xDEAD;
+    uint16_t pid = 0xBEEF;
+    int rc = axl_usb_get_vid_pid(*u, &vid, &pid);
+    test_check(rc == 0,
+               "usb get_vid_pid: succeeds on enumerated device");
+    /* common-test.sh injects -device usb-mouse, which surfaces as
+       QEMU vendor 0x0627 (Adomax Technology Co., Ltd. — the QEMU/
+       RedHat default vid for the emulated mouse and tablet). Pin
+       the vid here; the SKIP path covers real hardware where USB
+       might be absent. */
+    test_check(vid == 0x0627,
+               "usb get_vid_pid: vid matches QEMU usb-mouse (0x0627)");
+    test_check(pid != 0xBEEF,
+               "usb get_vid_pid: pid populated (sentinel cleared)");
+
+    /* Bogus address — never enumerated, must return -1. */
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_vid_pid(bogus, &vid, &pid) == -1,
+               "usb get_vid_pid: unknown addr returns -1");
+
+    /* NULL out param. */
+    test_check(axl_usb_get_vid_pid(*u, NULL, &pid) == -1,
+               "usb get_vid_pid: NULL vid rejected");
+}
+
+static void
+test_usb_get_class(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_class (no USB devices)\n");
+        test_check(true, "usb get_class: SKIP balance 1");
+        test_check(true, "usb get_class: SKIP balance 2");
+        test_check(true, "usb get_class: SKIP balance 3");
+        test_check(true, "usb get_class: SKIP balance 4");
+        test_check(true, "usb get_class: SKIP balance 5");
+        test_check(true, "usb get_class: SKIP balance 6");
+        return;
+    }
+
+    /* Distinct sentinels — a stub returning success+zeros must not
+       slip past the per-field "moved from sentinel" check. */
+    uint8_t cls = 0xAA;
+    uint8_t sub = 0xBB;
+    uint8_t prot = 0xCC;
+    int rc = axl_usb_get_class(*u, &cls, &sub, &prot);
+    test_check(rc == 0,
+               "usb get_class: succeeds on enumerated interface");
+    /* QEMU usb-mouse on the test bus exposes the HID Boot Mouse
+       triplet: bInterfaceClass=0x03 (HID), bInterfaceSubClass=0x01
+       (Boot Interface), bInterfaceProtocol=0x02 (Mouse). Pin all
+       three so a stub that fills only one field can't pass. */
+    test_check(cls == 0x03,
+               "usb get_class: class is HID (0x03) for usb-mouse");
+    test_check(sub == 0x01,
+               "usb get_class: subclass is Boot Interface (0x01)");
+    test_check(prot == 0x02,
+               "usb get_class: protocol is Mouse (0x02)");
+
+    /* Out parameters are independently optional. Caller asks for
+       prot only, supplies NULL for class/sub: the call still
+       succeeds and prot is populated. Per-field NULL handling is
+       a documented contract; without this assertion, a regression
+       that re-introduces an "any-NULL → -1" guard would slip
+       through (the prior assertions pre-fill all three). */
+    uint8_t prot_only = 0xCC;
+    test_check(axl_usb_get_class(*u, NULL, NULL, &prot_only) == 0
+               && prot_only == 0x02,
+               "usb get_class: NULL class/sub still populates prot");
+
+    /* Bogus address — never enumerated, must return -1. */
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_class(bogus, &cls, &sub, &prot) == -1,
+               "usb get_class: unknown addr returns -1");
+}
+
+static void
+test_usb_class_string(void)
+{
+    char buf[AXL_USB_CLASS_NAME_MAX];
+
+    /* Full triplet: HID / Boot Interface / Mouse — the usb-mouse
+       fixture's class triplet. Exact-string assertions per
+       feedback_tdd_mandatory: substring match would silently allow
+       regressions. */
+    int n = axl_usb_class_string(0x03, 0x01, 0x02, buf, sizeof(buf));
+    test_check(n > 0,
+               "usb class_string: HID/Boot/Mouse returns positive byte count");
+    test_check(axl_strcmp(buf,
+                          "Human Interface Device / Boot Interface / Mouse")
+               == 0,
+               "usb class_string: HID/Boot/Mouse exact decode");
+
+    /* Known base + sub, unknown prot — drops the prot tier. */
+    n = axl_usb_class_string(0x03, 0x01, 0xEE, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf,
+                             "Human Interface Device / Boot Interface")
+                  == 0,
+               "usb class_string: omits unknown prot tier");
+
+    /* Known base, unknown sub — drops both tiers. */
+    n = axl_usb_class_string(0x03, 0xEE, 0xEE, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Human Interface Device") == 0,
+               "usb class_string: omits unknown sub+prot tiers");
+
+    /* Wholly unknown class — numeric fallback, lowercase 6 hex digits. */
+    n = axl_usb_class_string(0xCD, 0xEE, 0xEF, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Class cdeeef") == 0,
+               "usb class_string: unknown class falls back to numeric");
+
+    /* FMT_BASE: just the base name. */
+    n = axl_usb_class_string_fmt(0x03, 0x01, 0x02,
+                                 AXL_USB_CLASS_FMT_BASE,
+                                 buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Human Interface Device") == 0,
+               "usb class_string_fmt(BASE): base name only");
+
+    /* FMT_SUBCLASS: subclass name; coarsens to base when unknown. */
+    n = axl_usb_class_string_fmt(0x03, 0x01, 0x02,
+                                 AXL_USB_CLASS_FMT_SUBCLASS,
+                                 buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Boot Interface") == 0,
+               "usb class_string_fmt(SUBCLASS): subclass only");
+
+    n = axl_usb_class_string_fmt(0x03, 0xEE, 0x02,
+                                 AXL_USB_CLASS_FMT_SUBCLASS,
+                                 buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Human Interface Device") == 0,
+               "usb class_string_fmt(SUBCLASS): coarsens to base when sub unknown");
+
+    /* Mass Storage / SCSI / BBB triplet — exercises a different
+       branch of the table. */
+    n = axl_usb_class_string(0x08, 0x06, 0x50, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf,
+                             "Mass Storage / SCSI transparent / Bulk-Only Transport")
+                  == 0,
+               "usb class_string: Mass Storage/SCSI/BBB exact decode");
+
+    /* Hub class (0x09) — base only, the spec doesn't define
+       subclasses for hubs. */
+    n = axl_usb_class_string_fmt(0x09, 0x00, 0x00,
+                                 AXL_USB_CLASS_FMT_BASE,
+                                 buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Hub") == 0,
+               "usb class_string_fmt(BASE): Hub class");
+
+    /* Bad args. */
+    test_check(axl_usb_class_string(0x03, 0x01, 0x02, NULL, 16) == -1,
+               "usb class_string: NULL buf rejected");
+    test_check(axl_usb_class_string(0x03, 0x01, 0x02, buf, 0) == -1,
+               "usb class_string: zero buflen rejected");
+    test_check(axl_usb_class_string_fmt(0x03, 0x01, 0x02,
+                                        (AxlUsbClassFmt)99,
+                                        buf, sizeof(buf)) == -1,
+               "usb class_string_fmt: unknown fmt enum rejected");
+}
+
+static void
+test_usb_get_string(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_string (no USB devices)\n");
+        for (int i = 0; i < 5; i++) {
+            test_check(true, "usb get_string: SKIP balance");
+        }
+        return;
+    }
+
+    /* QEMU's usb-mouse advertises iProduct = "QEMU USB Mouse"
+       (hw/usb/dev-hid.c). The string descriptor table puts it at
+       index 2 by convention, but we shouldn't hard-code that —
+       axl_usb_get_product reads the index from the device
+       descriptor. Use that as the way to get a known string into
+       buf; the generic axl_usb_get_string is exercised through it. */
+    char buf[AXL_USB_STRING_MAX];
+    int n = axl_usb_get_product(*u, buf, sizeof(buf));
+    test_check(n > 0,
+               "usb get_string: product read returns positive byte count");
+
+    /* Pin exact value to defeat stub-passes-trivially. QEMU is
+       stable across releases on this string. */
+    test_check(n > 0 && axl_strcmp(buf, "QEMU USB Mouse") == 0,
+               "usb get_string: QEMU usb-mouse product is exact 'QEMU USB Mouse'");
+
+    /* index=0 is the language-ID table; not a real string.
+       axl_usb_get_string must reject it. */
+    test_check(axl_usb_get_string(*u, 0, buf, sizeof(buf)) == -1,
+               "usb get_string: index 0 rejected (lang-ID table, not a string)");
+
+    /* A high index the device doesn't define returns -1. */
+    test_check(axl_usb_get_string(*u, 0xFE, buf, sizeof(buf)) == -1,
+               "usb get_string: missing high index returns -1");
+
+    /* Bogus address — never enumerated. */
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_string(bogus, 1, buf, sizeof(buf)) == -1,
+               "usb get_string: unknown addr returns -1");
+}
+
+static void
+test_usb_get_manufacturer(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_manufacturer (no USB devices)\n");
+        for (int i = 0; i < 3; i++) {
+            test_check(true, "usb get_manufacturer: SKIP balance");
+        }
+        return;
+    }
+
+    /* QEMU usb-mouse: iManufacturer = "QEMU". */
+    char buf[AXL_USB_STRING_MAX];
+    int n = axl_usb_get_manufacturer(*u, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "QEMU") == 0,
+               "usb get_manufacturer: QEMU usb-mouse exact 'QEMU'");
+
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_manufacturer(bogus, buf, sizeof(buf)) == -1,
+               "usb get_manufacturer: unknown addr returns -1");
+
+    /* NULL buf — argument-validation parity with axl_usb_get_string. */
+    test_check(axl_usb_get_manufacturer(*u, NULL, sizeof(buf)) == -1,
+               "usb get_manufacturer: NULL buf rejected");
+}
+
+static void
+test_usb_get_product(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_product (no USB devices)\n");
+        for (int i = 0; i < 3; i++) {
+            test_check(true, "usb get_product: SKIP balance");
+        }
+        return;
+    }
+
+    char buf[AXL_USB_STRING_MAX];
+    int n = axl_usb_get_product(*u, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "QEMU USB Mouse") == 0,
+               "usb get_product: QEMU usb-mouse exact 'QEMU USB Mouse'");
+
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_product(bogus, buf, sizeof(buf)) == -1,
+               "usb get_product: unknown addr returns -1");
+
+    test_check(axl_usb_get_product(*u, buf, 0) == -1,
+               "usb get_product: zero buflen rejected");
+}
+
+static void
+test_usb_get_serial(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_serial (no USB devices)\n");
+        for (int i = 0; i < 4; i++) {
+            test_check(true, "usb get_serial: SKIP balance");
+        }
+        return;
+    }
+
+    /* QEMU's USB stack auto-generates an iSerialNumber per device
+       instance — the format is build-and-topology-dependent (e.g.
+       "89126-0000:00:03.0-1" with PCIe BDF + port chain), so an
+       exact-string pin would be brittle across QEMU versions. The
+       manufacturer + product tests above already defend against
+       stubs that return success+empty; here we just confirm a
+       non-trivial string lands in the buffer. */
+    char buf[AXL_USB_STRING_MAX] = "<sentinel>";
+    int n = axl_usb_get_serial(*u, buf, sizeof(buf));
+    test_check(n > 0,
+               "usb get_serial: QEMU usb-mouse returns a string");
+    test_check(n > 0 && buf[0] != '\0' && buf[0] != '<',
+               "usb get_serial: buf is non-empty + sentinel cleared");
+
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_serial(bogus, buf, sizeof(buf)) == -1,
+               "usb get_serial: unknown addr returns -1");
+
+    /* Sentinel guard: a short buffer (1 byte = NUL only) writes
+       zero useful bytes; the call should still succeed. */
+    char tiny[1];
+    int rc_tiny = axl_usb_get_serial(*u, tiny, sizeof(tiny));
+    test_check(rc_tiny >= 0 && tiny[0] == '\0',
+               "usb get_serial: 1-byte buffer NUL-terminates");
+}
+
+// ---------------------------------------------------------------------------
+// AxlUsb — tree walker (Phase F: real hub-port chain)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    size_t       n_visits;
+    size_t       n_depth_zero;
+    size_t       n_depth_pos;
+    unsigned     max_depth;
+    AxlUsbAddr   first_below_hub;
+    bool         saw_below_hub;
+} UsbTreeCtx;
+
+static int
+usb_tree_count_cb(AxlUsbAddr addr, unsigned depth, void *ctx)
+{
+    UsbTreeCtx *t = ctx;
+    t->n_visits++;
+    if (depth == 0) {
+        t->n_depth_zero++;
+    } else {
+        t->n_depth_pos++;
+        if (!t->saw_below_hub) {
+            t->first_below_hub = addr;
+            t->saw_below_hub = true;
+        }
+    }
+    if (depth > t->max_depth) {
+        t->max_depth = depth;
+    }
+    return 0;
+}
+
+static int
+usb_tree_stop_after_first_cb(AxlUsbAddr addr, unsigned depth, void *ctx)
+{
+    (void)addr; (void)depth;
+    int *seen = ctx;
+    (*seen)++;
+    return 13;  /* arbitrary non-zero */
+}
+
+static void
+test_usb_tree_walker(void)
+{
+    UsbTreeCtx t = { 0 };
+    int rc = axl_usb_tree_for_each(usb_tree_count_cb, &t);
+
+    /* No-USB envs (e.g. real hardware without controllers) skip
+       cleanly. Populated branch — what CI exercises against the
+       qemu-xhci + usb-mouse + usb-hub + usb-tablet runner topology
+       — runs 7 conditional asserts: rc==0, n_visits>=1, depth-zero
+       count >= 2 (mouse + hub direct), depth-positive count >= 1
+       (tablet behind hub), max_depth >= 1, plus early-stop and
+       NULL-fn guards. */
+    if (rc == -1 || t.n_visits == 0) {
+        axl_printf("SKIP: usb_tree_walker (no USB stack)\n");
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "usb tree_walker: SKIP balance");
+        }
+        return;
+    }
+    test_check(rc == 0, "usb tree_walker: clean walk returns 0");
+    test_check(t.n_visits >= 1, "usb tree_walker: visits at least one entry");
+
+    /* The runner's topology guarantees mouse + hub directly attached
+       (depth 0) and a tablet behind the hub (depth 1). Pin both
+       so a stub that emits constant depth=0 can't pass. */
+    test_check(t.n_depth_zero >= 2,
+               "usb tree_walker: at least 2 entries at depth 0 "
+               "(mouse + hub direct attach)");
+    test_check(t.n_depth_pos >= 1,
+               "usb tree_walker: at least 1 entry at depth > 0 "
+               "(tablet behind hub)");
+    test_check(t.max_depth >= 1,
+               "usb tree_walker: max depth >= 1 (hub-attached device visible)");
+
+    /* Early-stop: callback returns non-zero, walker propagates. */
+    int seen = 0;
+    int stop_rc = axl_usb_tree_for_each(usb_tree_stop_after_first_cb, &seen);
+    test_check(stop_rc == 13 && seen == 1,
+               "usb tree_walker: cb non-zero return propagates after first visit");
+
+    /* NULL fn rejected. */
+    test_check(axl_usb_tree_for_each(NULL, &t) == -1,
+               "usb tree_walker: NULL fn rejected");
+}
+
+// ---------------------------------------------------------------------------
+// AxlUsb — vendor/device-name database (Phase D)
+// ---------------------------------------------------------------------------
+
+static int
+usb_count_vendor_cb(uint16_t vid, const char *name, void *ctx)
+{
+    (void)vid; (void)name;
+    int *n = ctx;
+    (*n)++;
+    return 0;
+}
+
+static int
+usb_count_device_cb(uint16_t vid, uint16_t pid, const char *name, void *ctx)
+{
+    (void)vid; (void)pid; (void)name;
+    int *n = ctx;
+    (*n)++;
+    return 0;
+}
+
+static int
+usb_stop_vendor_cb(uint16_t vid, const char *name, void *ctx)
+{
+    (void)vid; (void)name; (void)ctx;
+    return 7;
+}
+
+static int
+usb_stop_device_cb(uint16_t vid, uint16_t pid, const char *name, void *ctx)
+{
+    (void)vid; (void)pid; (void)name; (void)ctx;
+    return 11;
+}
+
+static void
+test_usb_ids_load_failure_modes(void)
+{
+    AxlUsbIds *h = (AxlUsbIds *)0x1;
+    test_check(axl_usb_ids_open("fs0:\\does-not-exist-anywhere.json5", &h)
+                   == AXL_SIDECAR_FILE_MISSING,
+               "usb-ids open: missing file returns FILE_MISSING");
+    test_check(h == NULL,
+               "usb-ids open: handle cleared to NULL on error");
+
+    /* Schema is REQUIRED. */
+    static const char no_schema[] =
+        "{ vendors: [{ id: 0x046D, name: 'Logitech, Inc.' }] }";
+    h = NULL;
+    test_check(axl_usb_ids_open_from_buffer(
+                   no_schema, axl_strlen(no_schema), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "usb-ids open_from_buffer: missing schema returns PARSE_ERROR");
+
+    /* Unrecognized schema. */
+    static const char bad_schema[] = "{ schema: 99, vendors: [] }";
+    h = NULL;
+    test_check(axl_usb_ids_open_from_buffer(
+                   bad_schema, axl_strlen(bad_schema), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "usb-ids open_from_buffer: unknown schema returns PARSE_ERROR");
+
+    /* Malformed JSON5 fails at the parse stage. */
+    static const char garbage[] = "@@@ not even json";
+    h = NULL;
+    test_check(axl_usb_ids_open_from_buffer(
+                   garbage, axl_strlen(garbage), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "usb-ids open_from_buffer: malformed JSON5 returns PARSE_ERROR");
+}
+
+static void
+test_usb_ids_handle_buffer(void)
+{
+    /* Hierarchical schema 1 — devices nest under their vendor. */
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { id: 0x046D, name: 'Logitech, Inc.',\n"
+        "      devices: [\n"
+        "        { pid: 0xC52B, name: 'Unifying Receiver' },\n"
+        "        { pid: 0xC077, name: 'M105 Optical Mouse' },\n"
+        "      ],\n"
+        "    },\n"
+        "    { id: 0x0627, name: 'Adomax Technology Co., Ltd' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlUsbIds *h = NULL;
+    test_check(axl_usb_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
+               "usb-ids handle: open_from_buffer succeeds on schema 1");
+
+    const char *v = axl_usb_ids_vendor_name(h, 0x046D);
+    test_check(v != NULL && axl_strcmp(v, "Logitech, Inc.") == 0,
+               "usb-ids handle: 0x046D decodes to exact 'Logitech, Inc.'");
+
+    const char *d = axl_usb_ids_device_name(h, 0x046D, 0xC52B);
+    test_check(d != NULL && axl_strcmp(d, "Unifying Receiver") == 0,
+               "usb-ids handle: (0x046D, 0xC52B) decodes to exact 'Unifying Receiver'");
+
+    /* Vendor without nested devices is a valid entry. */
+    test_check(axl_usb_ids_vendor_name(h, 0x0627) != NULL,
+               "usb-ids handle: vendor without nested devices still resolves");
+    test_check(axl_usb_ids_device_name(h, 0x0627, 0x0001) == NULL,
+               "usb-ids handle: device under nested-less vendor returns NULL");
+
+    /* Unknown lookups return NULL. */
+    test_check(axl_usb_ids_vendor_name(h, 0xFFFF) == NULL,
+               "usb-ids handle: unknown vendor returns NULL");
+    test_check(axl_usb_ids_device_name(h, 0x046D, 0xDEAD) == NULL,
+               "usb-ids handle: unknown PID under known vendor returns NULL");
+
+    /* NULL handle is NULL-safe. */
+    test_check(axl_usb_ids_vendor_name(NULL, 0x046D) == NULL,
+               "usb-ids handle: NULL handle returns NULL");
+
+    axl_usb_ids_close(h);
+    axl_usb_ids_close(NULL);
+    test_check(true, "usb-ids handle: close + close(NULL) OK");
+}
+
+static void
+test_usb_ids_foreach(void)
+{
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { id: 0x046D, name: 'Logitech, Inc.',\n"
+        "      devices: [\n"
+        "        { pid: 0xC52B, name: 'Unifying Receiver' },\n"
+        "        { pid: 0xC077, name: 'M105 Optical Mouse' },\n"
+        "      ],\n"
+        "    },\n"
+        "    { id: 0x0627, name: 'Adomax' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlUsbIds *h = NULL;
+    test_check(axl_usb_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
+               "usb-ids foreach: fixture loads");
+
+    int n_vendors = 0;
+    test_check(axl_usb_ids_foreach_vendor(h, usb_count_vendor_cb, &n_vendors)
+                   == 0
+               && n_vendors == 2,
+               "usb-ids foreach_vendor: visits exactly 2 vendors");
+
+    int n_devices = 0;
+    test_check(axl_usb_ids_foreach_device(h, usb_count_device_cb, &n_devices)
+                   == 0
+               && n_devices == 2,
+               "usb-ids foreach_device: visits exactly 2 devices");
+
+    /* Early-stop: callback's non-zero return propagates. */
+    test_check(axl_usb_ids_foreach_vendor(h, usb_stop_vendor_cb, NULL) == 7,
+               "usb-ids foreach_vendor: cb non-zero return propagates");
+    test_check(axl_usb_ids_foreach_device(h, usb_stop_device_cb, NULL) == 11,
+               "usb-ids foreach_device: cb non-zero return propagates");
+
+    /* NULL guards. */
+    test_check(axl_usb_ids_foreach_vendor(NULL, usb_count_vendor_cb, &n_vendors)
+                   == -1,
+               "usb-ids foreach_vendor: NULL handle rejected");
+    test_check(axl_usb_ids_foreach_device(h, NULL, &n_devices) == -1,
+               "usb-ids foreach_device: NULL fn rejected");
+
+    axl_usb_ids_close(h);
+}
+
+static void
+test_usb_ids_format_name(void)
+{
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { id: 0x046D, name: 'Logitech, Inc.',\n"
+        "      devices: [{ pid: 0xC52B, name: 'Unifying Receiver' }],\n"
+        "    },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlUsbIds *h = NULL;
+    axl_usb_ids_open_from_buffer(fixture, axl_strlen(fixture), &h);
+
+    char buf[AXL_USB_NAME_COMPOSED_MAX];
+
+    /* vendor known + device known → "<vendor> <device>" */
+    int n = axl_usb_ids_format_name(h, 0x046D, 0xC52B, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Logitech, Inc. Unifying Receiver") == 0,
+               "usb-ids format_name: full known → '<vendor> <device>'");
+
+    /* vendor known + device unknown → "<vendor> Device <pid hex>" */
+    n = axl_usb_ids_format_name(h, 0x046D, 0xDEAD, buf, sizeof(buf));
+    test_check(n > 0
+               && axl_strcmp(buf, "Logitech, Inc. Device dead") == 0,
+               "usb-ids format_name: device unknown → '<vendor> Device <pid>'");
+
+    /* vendor unknown → "<vid>:<pid>" */
+    n = axl_usb_ids_format_name(h, 0xFFFF, 0xC52B, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "ffff:c52b") == 0,
+               "usb-ids format_name: vendor unknown → numeric vid:pid");
+
+    /* NULL handle → numeric. */
+    n = axl_usb_ids_format_name(NULL, 0x046D, 0xC52B, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "046d:c52b") == 0,
+               "usb-ids format_name: NULL handle → numeric");
+
+    test_check(axl_usb_ids_format_name(h, 0x046D, 0xC52B, NULL, 16) == -1,
+               "usb-ids format_name: NULL buf rejected");
+
+    axl_usb_ids_close(h);
+}
+
+static void
+test_usb_ids_singleton(void)
+{
+    /* Make sure the singleton is empty before each call: the loader
+       short-circuits on already-loaded. */
+    axl_usb_ids_free();
+
+    test_check(axl_usb_ids_load("fs0:\\nope.json5")
+                   == AXL_SIDECAR_FILE_MISSING,
+               "usb-ids load: explicit missing returns FILE_MISSING");
+
+    test_check(axl_usb_vendor_name(0x0627) == NULL,
+               "usb-ids: vendor_name pre-load returns NULL");
+
+    /* Autodiscover via companion path — share/usb-ids.json5 staged
+       by the integration runner. SKIP-balanced when not staged. */
+    AxlSidecarStatus rc = axl_usb_ids_load(NULL);
+    if (rc != AXL_SIDECAR_OK) {
+        axl_printf("SKIP: usb-ids load (no companion usb-ids.json5)\n");
+        for (int i = 0; i < 4; i++) {
+            test_check(true, "usb-ids singleton: SKIP balance");
+        }
+        return;
+    }
+    test_check(true, "usb-ids load: autodiscover succeeds");
+
+    /* share/usb-ids.json5 carries Adomax (the QEMU usb-mouse vendor)
+       at 0x0627 and a few common vendors. Pin Adomax exactly. */
+    const char *v = axl_usb_vendor_name(0x0627);
+    test_check(v != NULL && axl_strcmp(v, "Adomax Technology Co., Ltd") == 0,
+               "usb-ids: 0x0627 decodes to exact 'Adomax Technology Co., Ltd'");
+
+    /* Idempotent. */
+    test_check(axl_usb_ids_load(NULL) == AXL_SIDECAR_OK,
+               "usb-ids load: idempotent on second call");
+
+    axl_usb_ids_free();
+    test_check(axl_usb_vendor_name(0x0627) == NULL,
+               "usb-ids: vendor_name returns NULL after _free");
+}
+
+// ---------------------------------------------------------------------------
 
 static void
 test_pci_dump(void)
@@ -1962,6 +2676,227 @@ test_spd_probe(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlSpd — JEDEC vendor-name handle / singleton
+// ---------------------------------------------------------------------------
+
+static int
+spd_count_cb(uint16_t code, const char *name, void *ctx)
+{
+    (void)code; (void)name;
+    int *n = ctx;
+    (*n)++;
+    return 0;
+}
+
+static int
+spd_stop_cb(uint16_t code, const char *name, void *ctx)
+{
+    (void)code; (void)name; (void)ctx;
+    return 7;
+}
+
+static void
+test_spd_ids_load_failure_modes(void)
+{
+    AxlSpdIds *h = (AxlSpdIds *)0x1;
+    test_check(axl_spd_ids_open("fs0:\\does-not-exist-anywhere.json5", &h)
+                   == AXL_SIDECAR_FILE_MISSING,
+               "spd-ids open: missing file returns FILE_MISSING");
+    test_check(h == NULL,
+               "spd-ids open: handle cleared to NULL on error");
+
+    /* Schema is REQUIRED — a buffer without one must fail parse. */
+    static const char no_schema[] =
+        "{ vendors: [{ code: 0x002C, name: 'Micron' }] }";
+    h = NULL;
+    test_check(axl_spd_ids_open_from_buffer(
+                   no_schema, axl_strlen(no_schema), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "spd-ids open_from_buffer: missing schema returns PARSE_ERROR");
+
+    /* Unrecognized schema rejects loud rather than silently misparsing. */
+    static const char bad_schema[] = "{ schema: 99, vendors: [] }";
+    h = NULL;
+    test_check(axl_spd_ids_open_from_buffer(
+                   bad_schema, axl_strlen(bad_schema), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "spd-ids open_from_buffer: unknown schema returns PARSE_ERROR");
+
+    /* Malformed JSON5 fails at parse stage. */
+    static const char garbage[] = "@@@ not even json";
+    h = NULL;
+    test_check(axl_spd_ids_open_from_buffer(
+                   garbage, axl_strlen(garbage), &h)
+                   == AXL_SIDECAR_PARSE_ERROR,
+               "spd-ids open_from_buffer: malformed JSON5 returns PARSE_ERROR");
+}
+
+static void
+test_spd_ids_handle_buffer(void)
+{
+    /* Schema 1: flat vendors[]. Mirrors share/jedec.json5's layout. */
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { code: 0x002C, name: 'Micron' },\n"
+        "    { code: 0x00CE, name: 'Samsung' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlSpdIds *h = NULL;
+    test_check(axl_spd_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
+               "spd-ids handle: open_from_buffer succeeds on schema 1");
+
+    const char *m = axl_spd_ids_vendor_name(h, 0x002C);
+    test_check(m != NULL && axl_strcmp(m, "Micron") == 0,
+               "spd-ids handle: 0x002C decodes to exact 'Micron'");
+    const char *s = axl_spd_ids_vendor_name(h, 0x00CE);
+    test_check(s != NULL && axl_strcmp(s, "Samsung") == 0,
+               "spd-ids handle: 0x00CE decodes to exact 'Samsung'");
+    test_check(axl_spd_ids_vendor_name(h, 0xFFFF) == NULL,
+               "spd-ids handle: unknown code returns NULL");
+    test_check(axl_spd_ids_vendor_name(NULL, 0x002C) == NULL,
+               "spd-ids handle: NULL handle returns NULL");
+
+    axl_spd_ids_close(h);
+    axl_spd_ids_close(NULL);
+    test_check(true, "spd-ids handle: close + close(NULL) OK");
+}
+
+static void
+test_spd_ids_foreach(void)
+{
+    static const char fixture[] =
+        "{ schema: 1,\n"
+        "  vendors: [\n"
+        "    { code: 0x002C, name: 'Micron' },\n"
+        "    { code: 0x00CE, name: 'Samsung' },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlSpdIds *h = NULL;
+    test_check(axl_spd_ids_open_from_buffer(
+                   fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
+               "spd-ids foreach: fixture loads");
+
+    int n = 0;
+    int rc = axl_spd_ids_foreach_vendor(h, spd_count_cb, &n);
+    test_check(rc == 0 && n == 2,
+               "spd-ids foreach: visits exactly 2 entries");
+
+    /* Early-stop: callback's non-zero return propagates. */
+    test_check(axl_spd_ids_foreach_vendor(h, spd_stop_cb, NULL) == 7,
+               "spd-ids foreach: cb non-zero return propagates");
+
+    /* NULL guards. */
+    test_check(axl_spd_ids_foreach_vendor(NULL, spd_count_cb, &n) == -1,
+               "spd-ids foreach: NULL handle rejected");
+    test_check(axl_spd_ids_foreach_vendor(h, NULL, &n) == -1,
+               "spd-ids foreach: NULL fn rejected");
+
+    axl_spd_ids_close(h);
+}
+
+static void
+test_spd_ids_format_name(void)
+{
+    /* Composer: known → "<vendor>", unknown → "0xCCCC". Every consumer
+       prints the same string for the same JEP-106 code. */
+    static const char fixture[] =
+        "{ schema: 1, vendors: [{ code: 0x002C, name: 'Micron' }] }";
+
+    AxlSpdIds *h = NULL;
+    axl_spd_ids_open_from_buffer(fixture, axl_strlen(fixture), &h);
+
+    char buf[AXL_SPD_NAME_COMPOSED_MAX];
+    int n = axl_spd_ids_format_name(h, 0x002C, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "Micron") == 0,
+               "spd-ids format_name: known code renders exact 'Micron'");
+
+    n = axl_spd_ids_format_name(h, 0xABCD, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "0xABCD") == 0,
+               "spd-ids format_name: unknown code renders 0xABCD");
+
+    /* NULL handle falls through to numeric. */
+    n = axl_spd_ids_format_name(NULL, 0x002C, buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, "0x002C") == 0,
+               "spd-ids format_name: NULL handle renders numeric");
+
+    test_check(axl_spd_ids_format_name(h, 0x002C, NULL, 16) == -1,
+               "spd-ids format_name: NULL buf rejected");
+
+    axl_spd_ids_close(h);
+}
+
+static void
+test_spd_ids_singleton(void)
+{
+    /* Make sure the singleton is empty before each call: the loader
+       short-circuits on already-loaded. */
+    axl_spd_ids_free();
+
+    /* FILE_MISSING for an explicit override that doesn't exist. */
+    test_check(axl_spd_ids_load("fs0:\\nope.json5")
+                   == AXL_SIDECAR_FILE_MISSING,
+               "spd-ids load: explicit missing returns FILE_MISSING");
+
+    /* Singleton lookup returns NULL before any successful load. */
+    test_check(axl_spd_vendor_name(0x002C) == NULL,
+               "spd-ids: vendor_name pre-load returns NULL");
+
+    /* Autodiscover via companion path — share/jedec.json5 staged by
+       the integration runner. SKIP-balanced when not staged. */
+    AxlSidecarStatus rc = axl_spd_ids_load(NULL);
+    if (rc != AXL_SIDECAR_OK) {
+        axl_printf("SKIP: spd-ids load (no companion jedec.json5)\n");
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "spd-ids singleton: SKIP balance");
+        }
+        return;
+    }
+    test_check(true, "spd-ids load: autodiscover succeeds");
+
+    /* share/jedec.json5 carries Micron at 0x002C with the long form
+       'Micron Technology'. Pin the exact string — substring matches
+       lie. */
+    const char *m = axl_spd_vendor_name(0x002C);
+    test_check(m != NULL && axl_strcmp(m, "Micron Technology") == 0,
+               "spd-ids: 0x002C decodes to exact 'Micron Technology'");
+
+    /* Regression pins for the encoding contract: bank byte is the
+       raw JEP-106 continuation count (no parity OR'd in). Nanya is
+       bank 4 (count 3 → 0x03), Crucial is bank 6 (count 5 → 0x05).
+       The id_byte keeps its odd-parity MSB on the wire (0x9B / 0x0B).
+       Earlier shipped data had parity wrongly applied to the bank
+       byte (0x830B / 0x859B) and silently failed lookup — these
+       asserts catch that regression. */
+    const char *nanya = axl_spd_vendor_name(0x030B);
+    test_check(nanya != NULL && axl_strcmp(nanya, "Nanya Technology") == 0,
+               "spd-ids: 0x030B decodes to exact 'Nanya Technology'");
+    const char *crucial = axl_spd_vendor_name(0x059B);
+    test_check(crucial != NULL
+                   && axl_strcmp(crucial, "Crucial Technology") == 0,
+               "spd-ids: 0x059B decodes to exact 'Crucial Technology'");
+    /* Patriot is bank 6 (count 5 → 0x05); id position 0x1D + odd-
+       parity MSB → id byte 0x9D (the wire form). Earlier shipped
+       data carried 0x1D without the parity bit and would miss
+       lookups against real Patriot DIMMs. */
+    const char *patriot = axl_spd_vendor_name(0x059D);
+    test_check(patriot != NULL
+                   && axl_strcmp(patriot, "Patriot Memory") == 0,
+               "spd-ids: 0x059D decodes to exact 'Patriot Memory'");
+
+    /* Idempotent: second load is OK without re-opening. */
+    test_check(axl_spd_ids_load(NULL) == AXL_SIDECAR_OK,
+               "spd-ids load: idempotent on second call");
+
+    axl_spd_ids_free();
+    test_check(axl_spd_vendor_name(0x002C) == NULL,
+               "spd-ids: vendor_name returns NULL after _free");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -2008,6 +2943,22 @@ test_platform_main(int argc, char **argv)
     test_pci_class_db_singleton_overrides();
     test_pci_vpd_iter();
 
+    /* AxlUsb */
+    test_usb_enumerate();
+    test_usb_get_vid_pid();
+    test_usb_get_class();
+    test_usb_class_string();
+    test_usb_get_string();
+    test_usb_get_manufacturer();
+    test_usb_get_product();
+    test_usb_get_serial();
+    test_usb_tree_walker();
+    test_usb_ids_load_failure_modes();
+    test_usb_ids_handle_buffer();
+    test_usb_ids_foreach();
+    test_usb_ids_format_name();
+    test_usb_ids_singleton();
+
     /* axl_io_port_* */
     test_io_port();
 
@@ -2021,6 +2972,11 @@ test_platform_main(int argc, char **argv)
     test_spd_decode_ddr5();
     test_spd_decode_unknown();
     test_spd_decode_rejects_bogus();
+    test_spd_ids_load_failure_modes();
+    test_spd_ids_handle_buffer();
+    test_spd_ids_foreach();
+    test_spd_ids_format_name();
+    test_spd_ids_singleton();
     test_spd_probe();
 
     return test_print_results();

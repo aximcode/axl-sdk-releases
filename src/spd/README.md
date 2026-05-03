@@ -6,8 +6,8 @@ exposes (HC protocol, then I2C Master), probes the eight standard
 SPD addresses (0x50..0x57), and hands off to the codec selected
 by the memory-type byte at SPD offset 2.
 
-DDR3 is intentionally out of scope for v1 — the consumer use
-case (Dell delldiagslinux's `dump-memory` parity on UEFI) is
+DDR3 is intentionally out of scope for v1 — the motivating
+consumer use case (Linux-side `dump-memory` parity on UEFI) is
 DDR4/DDR5 server fleets. DDR3 is a small additional codec when
 a consumer asks for it.
 
@@ -52,17 +52,34 @@ typedef struct {
 Manufacturer fields are exposed as **raw 16-bit JEP-106 codes**
 — high byte is the continuation-bank index, low byte is the
 position within that bank as physically stored on the SPD
-(parity bit included). The library deliberately does not embed a
-vendor-name table — consumers do that lookup at the tool layer.
-The codes themselves are uncopyrightable factual data; the
-mapping to human names is policy that should be data-driven and
-mutable without rebuilding.
+(parity bit included). For human-readable rendering, the
+`axl_spd_ids_*` API loads a curated JSON5 sidecar (`jedec.json5`)
+into a process-global table and exposes lookup / format helpers
+parallel to `axl_pci_ids_load` and `axl_pci_format_name`:
 
-`tools/memspd.c` ships the JSON-sidecar pattern: at startup it
-loads `jedec.json5` from the binary's directory (or `--jedec-file
-<path>`) and resolves `mfg_code_*` to vendor names. The stub
-`share/jedec.json5` carries 15 common server vendors; consumers
-can extend or replace it freely.
+```c
+if (axl_spd_ids_load(NULL) == AXL_SIDECAR_OK) {
+    const char *name = axl_spd_vendor_name(info.mfg_code_module);
+    /* NULL-safe; consumers fall back to numeric IDs */
+}
+
+char buf[AXL_SPD_NAME_COMPOSED_MAX];
+axl_spd_format_name(info.mfg_code_module, buf, sizeof(buf));
+/* known → "Micron Technology"; unknown → "0xCCCC" */
+```
+
+The handle API (`axl_spd_ids_open` / `_open_from_buffer` /
+`_close` / `_vendor_name` / `_foreach_vendor` / `_format_name`)
+mirrors AxlPciIds for consumers that want layered databases
+(public + private overlay). Schema 1 only — JEDEC has no
+subsystem dimension that motivated AxlPciIds's v1/v2 split.
+
+`tools/memspd.c` is the reference consumer: at startup it calls
+`axl_spd_ids_load(--jedec-file or NULL)` and renders manufacturer
+fields via `axl_spd_vendor_name` and `axl_spd_format_name`.
+`share/jedec.json5` carries ~30 common server vendors; the
+file is hand-curated (no auto-converter — JEDEC publishes
+JEP-106 as PDF, not a canonical text database).
 
 ## Wire-protocol notes
 
@@ -103,10 +120,11 @@ memspd show <slot>                — decoded fields for one slot
 memspd decode <slot>              — raw hex dump + decoded fields
 ```
 
-Common flag: `--jedec-file <path>` overrides the default sidecar
-discovery (binary's directory → `./jedec.json5`). When no sidecar
-loads, manufacturer fields print as raw hex codes — the
-information still reaches the user, just unresolved.
+Common flag: `--jedec-file <path>` overrides
+`axl_spd_ids_load`'s autodiscovery (binary's directory →
+`./jedec.json5`). When no sidecar loads, manufacturer fields
+print as raw hex codes — the information still reaches the user,
+just unresolved.
 
 ## Testing
 

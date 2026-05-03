@@ -49,7 +49,9 @@
 #include <axl/axl-port.h>
 #include <axl/axl-boot.h>
 #include <axl/axl-acpi.h>
+#include <axl/axl-sidecar.h>
 #include <axl/axl-pci.h>
+#include <axl/axl-usb.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-image.h>
 #include <axl/axl-mem-phys.h>

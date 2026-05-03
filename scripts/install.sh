@@ -65,8 +65,11 @@ esac
 #   <prefix>/lib/axl/elf_<arch>_efi.lds
 #   <prefix>/lib/cmake/axl/axl-config.cmake       (find_package(axl))
 #   <prefix>/lib/pkgconfig/axl{,-<arch>}.pc        (pkg-config)
-#   <prefix>/share/axl/{version,build-date,backend} (metadata)
-#   <prefix>/share/axl/{pci-ids,pci-class}.json5     (optional sidecars)
+#   <prefix>/share/axl/{version,build-date,backend}      (metadata)
+#   <prefix>/share/axl/{pci-ids,pci-class,usb-ids,jedec}.json5
+#                                                        (optional sidecars)
+#   <prefix>/share/axl/scripts/{pci,usb}-ids-to-json5.py + _ids_parser.py
+#                                                        (bulk converters)
 #
 # Everything is relocatable — the cmake, pkg-config, and axl-cc files
 # resolve paths relative to their own installed location, so a .deb
@@ -158,16 +161,32 @@ echo "native"                    > "$PREFIX/share/axl/backend"
 cat "$SDK_DIR/VERSION"           > "$PREFIX/share/axl/version"
 date -u '+%Y-%m-%d'              > "$PREFIX/share/axl/build-date"
 
-# Optional JSON5 sidecars consumed by axl_pci_ids_load /
-# axl_pci_class_load. Shipped as reference content so consumers don't
-# have to clone the SDK to get a starter database — they typically
-# copy these next to their .efi (the auto-discovery companion path)
-# or pass --ids-file / --class-file explicitly. New class triplets
-# (CXL Memory Expanders, future PCIe assignments) can also land here
-# via a JSON5 update without rebuilding any consumer binary.
-for sidecar in pci-ids.json5 pci-class.json5; do
+# Optional JSON5 sidecars consumed by axl_*_ids_load. Shipped as
+# reference content so consumers don't have to clone the SDK to get
+# a starter database — they typically copy these next to their .efi
+# (the auto-discovery companion path) or pass --ids-file explicitly.
+# New class triplets, USB vendors, JEDEC manufacturer codes can all
+# land via a JSON5 update without rebuilding any consumer binary.
+for sidecar in pci-ids.json5 pci-class.json5 \
+               usb-ids.json5 jedec.json5; do
     if [[ -f "$LIBAXL_DIR/share/$sidecar" ]]; then
         cp "$LIBAXL_DIR/share/$sidecar" "$PREFIX/share/axl/$sidecar"
+    fi
+done
+
+# Bulk-conversion scripts for the canonical pci.ids / usb.ids text
+# databases. Installed under share/axl/scripts/ so consumers who
+# need the full tail (vs the curated starter sets above) can run
+# e.g. `python3 /usr/share/axl/scripts/usb-ids-to-json5.py
+# /usr/share/hwdata/usb.ids > usb-ids.json5` to generate fleet-
+# scale OEM-rebadge coverage. JEDEC has no canonical text database
+# so no jedec-to-json5.py — manual curation, see share/jedec.json5.
+mkdir -p "$PREFIX/share/axl/scripts"
+for converter in _ids_parser.py pci-ids-to-json5.py usb-ids-to-json5.py; do
+    if [[ -f "$LIBAXL_DIR/scripts/$converter" ]]; then
+        cp "$LIBAXL_DIR/scripts/$converter" \
+           "$PREFIX/share/axl/scripts/$converter"
+        chmod +x "$PREFIX/share/axl/scripts/$converter"
     fi
 done
 

@@ -494,7 +494,8 @@ run_lspci(
        (the compiled-in tables are the bootstrap default). */
     if (!opt_numeric) {
         g_ids_loaded = (axl_pci_ids_load(
-                            axl_args_get_string(a, "ids-file")) == 0);
+                            axl_args_get_string(a, "ids-file"))
+                        == AXL_SIDECAR_OK);
         (void)axl_pci_class_load(NULL);
     }
 
@@ -572,9 +573,6 @@ expand_count_flags(
     int    *out_argc
     )
 {
-    char **new_argv = axl_malloc((size_t)(argc + 1) * sizeof(char *));
-    int    n = 0;
-
     /* Per-cluster long-form tokens, one per (letter, length) pair we
        support. Static so the new_argv pointers stay valid until the
        program exits. */
@@ -582,6 +580,18 @@ expand_count_flags(
     static char vvv_buf[] = "--vvv";
     static char xx_buf[]  = "--xx";
     static char xxx_buf[] = "--xxx";
+
+    int    n = 0;
+
+    char **new_argv = axl_malloc((size_t)(argc + 1) * sizeof(char *));
+    if (new_argv == NULL) {
+        /* OOM on a few-pointer alloc is implausible in UEFI, but a
+           NULL-deref in the loop below is unsafe. Fall back to the
+           caller's argv with no -vv/-xx expansion; main() detects the
+           equality and skips the free. */
+        *out_argc = argc;
+        return argv;
+    }
 
     if (argc > 0) {
         new_argv[n++] = argv[0];
@@ -619,9 +629,12 @@ main(int argc, char **argv)
         .flags   = flags,
         .handler = run_lspci,
     });
-    /* The array is heap; its contents are either argv strings (caller
-       owns) or pointers to static "-v" / "-x" buffers. Free only the
-       array. */
-    axl_free(new_argv);
+    /* On success new_argv is heap; its contents are either argv strings
+       (caller owns) or pointers to static "-v" / "-x" buffers. Free
+       only the array. On OOM, expand_count_flags returns argv unchanged
+       — don't free in that case. */
+    if (new_argv != argv) {
+        axl_free(new_argv);
+    }
     return rc;
 }

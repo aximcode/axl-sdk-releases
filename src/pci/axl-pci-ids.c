@@ -13,16 +13,20 @@
     internal handle.
 
     Intentionally separate from axl-pci.c so config-space access
-    doesn't drag in the JSON parser.
+    doesn't drag in the JSON parser. Builds on top of `axl-sidecar`
+    (file open / schema check / singleton lifecycle / foreach
+    trampoline) — the only concern this file owns is the
+    schema-specific typed walk into the three flat hash tables.
 **/
 
-#include <axl/axl-pci.h>
-#include <axl/axl-fs.h>
+#include "../data/axl-sidecar-internal.h"
+
 #include <axl/axl-hash-table.h>
 #include <axl/axl-json.h>
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
-#include <axl/axl-path.h>
+#include <axl/axl-pci.h>
+#include <axl/axl-sidecar.h>
 #include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("pci-ids");
@@ -51,7 +55,8 @@ pair_key(
 }
 
 // ---------------------------------------------------------------------------
-// JSON5 parser → hash tables
+// Schema-specific typed walks (concern: turn JSON5 entries into hash-
+// table inserts; everything else lives in axl-sidecar.c)
 //
 // Schema dispatch:
 //
@@ -72,8 +77,8 @@ pair_key(
 //               tables a v1 file would populate.
 //
 // New schema numbers should bump the dispatch in ids_fill — old
-// loaders return -2 on unrecognized schemas rather than silently
-// misparsing.
+// loaders return AXL_SIDECAR_PARSE_ERROR on unrecognized schemas
+// rather than silently misparsing.
 // ---------------------------------------------------------------------------
 
 /* Common helper: copy @p src into the table at @p key, freeing on
@@ -95,7 +100,7 @@ ids_insert_string(
     }
 }
 
-static bool
+static void
 parse_vendors(
     AxlJsonReader  *r,
     AxlHashTable   *out
@@ -103,7 +108,7 @@ parse_vendors(
 {
     AxlJsonArrayIter it;
     if (!axl_json_array_begin(r, "vendors", &it)) {
-        return true;  /* a database may legitimately ship without vendors */
+        return;  /* a database may legitimately ship without vendors */
     }
     AxlJsonReader entry;
     while (axl_json_array_next(&it, &entry)) {
@@ -115,20 +120,11 @@ parse_vendors(
         {
             continue;
         }
-        char *name_owned = axl_strdup(name);
-        if (name_owned == NULL) {
-            continue;
-        }
-        if (axl_hash_table_insert(out,
-                                  (void *)(uintptr_t)id64,
-                                  name_owned) < 0) {
-            axl_free(name_owned);
-        }
+        ids_insert_string(out, (void *)(uintptr_t)id64, name);
     }
-    return true;
 }
 
-static bool
+static void
 parse_devices(
     AxlJsonReader  *r,
     AxlHashTable   *out
@@ -136,7 +132,7 @@ parse_devices(
 {
     AxlJsonArrayIter it;
     if (!axl_json_array_begin(r, "devices", &it)) {
-        return true;
+        return;
     }
     AxlJsonReader entry;
     while (axl_json_array_next(&it, &entry)) {
@@ -151,20 +147,13 @@ parse_devices(
         {
             continue;
         }
-        char *name_owned = axl_strdup(name);
-        if (name_owned == NULL) {
-            continue;
-        }
-        if (axl_hash_table_insert(out,
-                                  pair_key((uint16_t)vid64, (uint16_t)did64),
-                                  name_owned) < 0) {
-            axl_free(name_owned);
-        }
+        ids_insert_string(out,
+                          pair_key((uint16_t)vid64, (uint16_t)did64),
+                          name);
     }
-    return true;
 }
 
-static bool
+static void
 parse_subsystems(
     AxlJsonReader  *r,
     AxlHashTable   *out
@@ -172,7 +161,7 @@ parse_subsystems(
 {
     AxlJsonArrayIter it;
     if (!axl_json_array_begin(r, "subsystems", &it)) {
-        return true;  /* subsystems array is optional */
+        return;  /* subsystems array is optional */
     }
     AxlJsonReader entry;
     while (axl_json_array_next(&it, &entry)) {
@@ -187,45 +176,10 @@ parse_subsystems(
         {
             continue;
         }
-        char *name_owned = axl_strdup(name);
-        if (name_owned == NULL) {
-            continue;
-        }
-        if (axl_hash_table_insert(out,
-                                  pair_key((uint16_t)svid64, (uint16_t)sdid64),
-                                  name_owned) < 0) {
-            axl_free(name_owned);
-        }
+        ids_insert_string(out,
+                          pair_key((uint16_t)svid64, (uint16_t)sdid64),
+                          name);
     }
-    return true;
-}
-
-/* Allocate a handle with all three empty tables. Returns NULL on
-   any allocation failure (caller does not have to free a partial
-   handle). */
-static AxlPciIds *
-ids_alloc(
-    void
-    )
-{
-    AxlPciIds *ids = axl_malloc(sizeof(*ids));
-    if (ids == NULL) {
-        return NULL;
-    }
-    ids->vendors    = axl_hash_table_new_full(
-        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
-    ids->devices    = axl_hash_table_new_full(
-        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
-    ids->subsystems = axl_hash_table_new_full(
-        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
-    if (ids->vendors == NULL
-        || ids->devices == NULL
-        || ids->subsystems == NULL)
-    {
-        axl_pci_ids_close(ids);
-        return NULL;
-    }
-    return ids;
 }
 
 /* Hierarchical (schema 2) parser. Walks vendors[].devices[].subsystems[]
@@ -305,96 +259,105 @@ parse_schema_v2(
     }
 }
 
-/* Schema-aware fill. Returns 0 on success, -1 if the schema field
-   is missing or unrecognized (caller maps to -2 = parse error). */
-static int
+/* Schema-aware fill. Returns AXL_SIDECAR_OK on a recognized schema,
+   AXL_SIDECAR_PARSE_ERROR otherwise. The schema-field validation
+   itself is delegated to axl_sidecar_check_schema. */
+static AxlSidecarStatus
 ids_fill(
     AxlPciIds      *ids,
     AxlJsonReader  *r
     )
 {
-    /* `schema` field is REQUIRED. Defaulting to either version
-       silently misparses files of the other version — a v2 file
-       missing the declaration would parse as v1 with every nested
-       device dropped (no error, no warning). Force explicit
-       declaration; the error message tells the user exactly what
-       to add. */
+    static const uint64_t accepted[] = { 1u, 2u };
     uint64_t schema = 0;
-    if (!axl_json_get_uint(r, "schema", &schema)) {
-        axl_warning("pci-ids: 'schema' field missing — add "
-                    "'schema: 2' (hierarchical, recommended) or "
-                    "'schema: 1' (flat) to the file root");
-        return -1;
+    AxlSidecarStatus rc = axl_sidecar_check_schema(
+        r, "pci-ids", accepted, sizeof(accepted) / sizeof(accepted[0]),
+        &schema);
+    if (rc != AXL_SIDECAR_OK) {
+        return rc;
     }
 
     if (schema == 1) {
         parse_vendors(r, ids->vendors);
         parse_devices(r, ids->devices);
         parse_subsystems(r, ids->subsystems);
-        return 0;
-    }
-    if (schema == 2) {
+    } else /* schema == 2 */ {
         parse_schema_v2(r, ids);
         /* Schema 2 also accepts a top-level subsystems[] block
            alongside the nested form — useful for orphan entries the
            maintainer doesn't know which device to nest under. The
            nested + flat results merge into the same hash table. */
         parse_subsystems(r, ids->subsystems);
-        return 0;
     }
-    /* Unrecognized schema — old loader, new file. Better to fail
-       loud than silently misparse a future schema 3 layout. */
-    axl_warning("pci-ids: unrecognized schema %llu",
-                (unsigned long long)schema);
-    return -1;
+    return AXL_SIDECAR_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Handle alloc / free
+// ---------------------------------------------------------------------------
+
+/* Allocate a handle with all three empty tables. Returns NULL on any
+   allocation failure (caller does not have to free a partial
+   handle). */
+static AxlPciIds *
+ids_alloc(
+    void
+    )
+{
+    AxlPciIds *ids = axl_malloc(sizeof(*ids));
+    if (ids == NULL) {
+        return NULL;
+    }
+    ids->vendors    = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    ids->devices    = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    ids->subsystems = axl_hash_table_new_full(
+        axl_direct_hash, axl_direct_equal, NULL, axl_free_impl);
+    if (ids->vendors == NULL
+        || ids->devices == NULL
+        || ids->subsystems == NULL)
+    {
+        axl_pci_ids_close(ids);
+        return NULL;
+    }
+    return ids;
 }
 
 // ---------------------------------------------------------------------------
 // Handle API
 // ---------------------------------------------------------------------------
 
-int
+AxlSidecarStatus
 axl_pci_ids_open(
     const char   *path,
     AxlPciIds   **out
     )
 {
     if (out == NULL || path == NULL) {
-        return -1;
+        return AXL_SIDECAR_PARSE_ERROR;
     }
     *out = NULL;
 
-    /* Distinguish "no file" (-1) from "parse error" (-2). The JSON
-       loader returns false for both; check existence first so the
-       error code reflects the actual failure mode. There's a TOCTOU
-       window here (file exists at info-check, gone at load-time)
-       but UEFI is single-threaded with no concurrent FS mutators
-       so the window is theoretical. */
-    AxlFileInfo finfo;
-    if (axl_file_info(path, &finfo) != 0) {
-        return -1;
-    }
-
     AxlJsonReader r   = { 0 };
     void         *raw = NULL;
-    if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,
-                                  &r, &raw, NULL)) {
-        axl_warning("pci-ids: failed to parse %s", path);
-        return -2;
+    AxlSidecarStatus rc = axl_sidecar_open_file(path, &r, &raw);
+    if (rc != AXL_SIDECAR_OK) {
+        return rc;
     }
 
     AxlPciIds *ids = ids_alloc();
     if (ids == NULL) {
         axl_json_free(&r);
         axl_free(raw);
-        return -2;
+        return AXL_SIDECAR_PARSE_ERROR;
     }
-    int fill_rc = ids_fill(ids, &r);
+    AxlSidecarStatus fill_rc = ids_fill(ids, &r);
     axl_json_free(&r);
     axl_free(raw);
-    if (fill_rc != 0) {
+    if (fill_rc != AXL_SIDECAR_OK) {
         axl_pci_ids_close(ids);
-        return -2;
+        return fill_rc;
     }
 
     axl_debug("pci-ids: %zu vendors / %zu devices / %zu subsystems from %s",
@@ -403,10 +366,10 @@ axl_pci_ids_open(
               axl_hash_table_size(ids->subsystems),
               path);
     *out = ids;
-    return 0;
+    return AXL_SIDECAR_OK;
 }
 
-int
+AxlSidecarStatus
 axl_pci_ids_open_from_buffer(
     const char   *json5,
     size_t        len,
@@ -414,30 +377,28 @@ axl_pci_ids_open_from_buffer(
     )
 {
     if (out == NULL) {
-        return -2;
+        return AXL_SIDECAR_PARSE_ERROR;
     }
     *out = NULL;
-    if (json5 == NULL || len == 0) {
-        return -2;
-    }
 
     AxlJsonReader r = { 0 };
-    if (!axl_json_parse_flags(json5, len, AXL_JSON_PARSER_JSON5, &r)) {
-        return -2;
+    AxlSidecarStatus rc = axl_sidecar_open_buffer(json5, len, &r);
+    if (rc != AXL_SIDECAR_OK) {
+        return rc;
     }
     AxlPciIds *ids = ids_alloc();
     if (ids == NULL) {
         axl_json_free(&r);
-        return -2;
+        return AXL_SIDECAR_PARSE_ERROR;
     }
-    int fill_rc = ids_fill(ids, &r);
+    AxlSidecarStatus fill_rc = ids_fill(ids, &r);
     axl_json_free(&r);
-    if (fill_rc != 0) {
+    if (fill_rc != AXL_SIDECAR_OK) {
         axl_pci_ids_close(ids);
-        return -2;
+        return fill_rc;
     }
     *out = ids;
-    return 0;
+    return AXL_SIDECAR_OK;
 }
 
 void
@@ -499,34 +460,17 @@ axl_pci_ids_subsys_name(
 // Iter API — debug dumps, validators, materialization
 // ---------------------------------------------------------------------------
 
-/* Trampoline pattern: axl_hash_table_foreach has no early-stop signal,
-   so we wrap the user's callback and short-circuit the body once a
-   non-zero return has been seen. The hash table walk continues to
-   completion (every entry visited) but the user's fn is called only
-   until the stop. For PCI databases (~hundreds of entries) the
-   wasted hash iterations are negligible. */
 typedef struct {
     AxlPciIdsVendorFn  fn;
     void              *ctx;
-    int                stop_rc;
-} VendorTrampoline;
+} VendorAdapterCtx;
 
-static void
-vendor_trampoline_cb(
-    const void  *key,
-    void        *value,
-    void        *data
-    )
+static int
+vendor_adapter(const void *key, void *value, void *data)
 {
-    VendorTrampoline *t = data;
-    if (t->stop_rc != 0) {
-        return;
-    }
+    VendorAdapterCtx *a = data;
     uint16_t vid = (uint16_t)(uintptr_t)key;
-    int rc = t->fn(vid, (const char *)value, t->ctx);
-    if (rc != 0) {
-        t->stop_rc = rc;
-    }
+    return a->fn(vid, (const char *)value, a->ctx);
 }
 
 int
@@ -539,35 +483,23 @@ axl_pci_ids_foreach_vendor(
     if (ids == NULL || fn == NULL) {
         return -1;
     }
-    VendorTrampoline t = { .fn = fn, .ctx = ctx, .stop_rc = 0 };
-    axl_hash_table_foreach(ids->vendors, vendor_trampoline_cb, &t);
-    return t.stop_rc;
+    VendorAdapterCtx adapter = { .fn = fn, .ctx = ctx };
+    return _axl_sidecar_foreach(ids->vendors, vendor_adapter, &adapter);
 }
 
 typedef struct {
     AxlPciIdsDeviceFn  fn;
     void              *ctx;
-    int                stop_rc;
-} DeviceTrampoline;
+} DeviceAdapterCtx;
 
-static void
-device_trampoline_cb(
-    const void  *key,
-    void        *value,
-    void        *data
-    )
+static int
+device_adapter(const void *key, void *value, void *data)
 {
-    DeviceTrampoline *t = data;
-    if (t->stop_rc != 0) {
-        return;
-    }
+    DeviceAdapterCtx *a = data;
     uintptr_t k = (uintptr_t)key;
     uint16_t  vid = (uint16_t)(k >> 16);
     uint16_t  did = (uint16_t)(k & 0xFFFFu);
-    int rc = t->fn(vid, did, (const char *)value, t->ctx);
-    if (rc != 0) {
-        t->stop_rc = rc;
-    }
+    return a->fn(vid, did, (const char *)value, a->ctx);
 }
 
 int
@@ -580,35 +512,23 @@ axl_pci_ids_foreach_device(
     if (ids == NULL || fn == NULL) {
         return -1;
     }
-    DeviceTrampoline t = { .fn = fn, .ctx = ctx, .stop_rc = 0 };
-    axl_hash_table_foreach(ids->devices, device_trampoline_cb, &t);
-    return t.stop_rc;
+    DeviceAdapterCtx adapter = { .fn = fn, .ctx = ctx };
+    return _axl_sidecar_foreach(ids->devices, device_adapter, &adapter);
 }
 
 typedef struct {
     AxlPciIdsSubsysFn  fn;
     void              *ctx;
-    int                stop_rc;
-} SubsysTrampoline;
+} SubsysAdapterCtx;
 
-static void
-subsys_trampoline_cb(
-    const void  *key,
-    void        *value,
-    void        *data
-    )
+static int
+subsys_adapter(const void *key, void *value, void *data)
 {
-    SubsysTrampoline *t = data;
-    if (t->stop_rc != 0) {
-        return;
-    }
+    SubsysAdapterCtx *a = data;
     uintptr_t k = (uintptr_t)key;
     uint16_t  svid = (uint16_t)(k >> 16);
     uint16_t  sdid = (uint16_t)(k & 0xFFFFu);
-    int rc = t->fn(svid, sdid, (const char *)value, t->ctx);
-    if (rc != 0) {
-        t->stop_rc = rc;
-    }
+    return a->fn(svid, sdid, (const char *)value, a->ctx);
 }
 
 int
@@ -621,44 +541,40 @@ axl_pci_ids_foreach_subsys(
     if (ids == NULL || fn == NULL) {
         return -1;
     }
-    SubsysTrampoline t = { .fn = fn, .ctx = ctx, .stop_rc = 0 };
-    axl_hash_table_foreach(ids->subsystems, subsys_trampoline_cb, &t);
-    return t.stop_rc;
+    SubsysAdapterCtx adapter = { .fn = fn, .ctx = ctx };
+    return _axl_sidecar_foreach(ids->subsystems, subsys_adapter, &adapter);
 }
 
 // ---------------------------------------------------------------------------
-// Process-global singleton (thin shim over a single handle)
+// Process-global singleton (thin shim over a single handle, driven by
+// the shared sidecar machinery)
 // ---------------------------------------------------------------------------
 
-static AxlPciIds *g_singleton = NULL;
+static void     *g_singleton;        /* AxlPciIds * cast through void * */
+static uint32_t  g_atexit_handle;
+static void     *g_atexit_ctx;       /* opaque heap pointer owned by sidecar helper */
 
-int
+static AxlSidecarStatus
+singleton_open_thunk(const char *path, void **out)
+{
+    return axl_pci_ids_open(path, (AxlPciIds **)out);
+}
+
+static void
+singleton_close_thunk(void *handle)
+{
+    axl_pci_ids_close((AxlPciIds *)handle);
+}
+
+AxlSidecarStatus
 axl_pci_ids_load(
     const char  *override_path
     )
 {
-    if (g_singleton != NULL) {
-        return 0;  /* idempotent — already loaded */
-    }
-
-    /* Explicit override path: use it authoritatively. No fallback —
-       a non-NULL override means the user named the file they want,
-       so missing/malformed errors should reflect that exact choice
-       rather than silently load a different file. */
-    if (override_path != NULL) {
-        return axl_pci_ids_open(override_path, &g_singleton);
-    }
-
-    /* Autodiscover: walk companion → cwd. Same convention as memspd's
-       jedec.json5 lookup. Distinguish "no candidate at any path" (-1)
-       from "candidate found but parse failed" (-2). */
-    char *path = axl_resolve_data_file(NULL, "pci-ids.json5");
-    if (path == NULL) {
-        return -1;
-    }
-    int rc = axl_pci_ids_open(path, &g_singleton);
-    axl_free(path);
-    return rc;
+    return _axl_sidecar_singleton_load(
+        &g_singleton, &g_atexit_handle, &g_atexit_ctx,
+        override_path, "pci-ids.json5",
+        singleton_open_thunk, singleton_close_thunk);
 }
 
 void
@@ -666,8 +582,9 @@ axl_pci_ids_free(
     void
     )
 {
-    axl_pci_ids_close(g_singleton);
-    g_singleton = NULL;
+    _axl_sidecar_singleton_free(
+        &g_singleton, &g_atexit_handle, &g_atexit_ctx,
+        singleton_close_thunk);
 }
 
 const char *
@@ -675,7 +592,7 @@ axl_pci_vendor_name(
     uint16_t  vid
     )
 {
-    return axl_pci_ids_vendor_name(g_singleton, vid);
+    return axl_pci_ids_vendor_name((AxlPciIds *)g_singleton, vid);
 }
 
 const char *
@@ -684,7 +601,7 @@ axl_pci_device_name(
     uint16_t  did
     )
 {
-    return axl_pci_ids_device_name(g_singleton, vid, did);
+    return axl_pci_ids_device_name((AxlPciIds *)g_singleton, vid, did);
 }
 
 const char *
@@ -693,7 +610,7 @@ axl_pci_subsys_name(
     uint16_t  sdid
     )
 {
-    return axl_pci_ids_subsys_name(g_singleton, svid, sdid);
+    return axl_pci_ids_subsys_name((AxlPciIds *)g_singleton, svid, sdid);
 }
 
 int
@@ -739,5 +656,6 @@ axl_pci_format_name(
     size_t    buflen
     )
 {
-    return axl_pci_ids_format_name(g_singleton, vid, did, buf, buflen);
+    return axl_pci_ids_format_name(
+        (AxlPciIds *)g_singleton, vid, did, buf, buflen);
 }

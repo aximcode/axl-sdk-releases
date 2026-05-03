@@ -15,11 +15,11 @@ int main(int argc, char **argv) {
     /* Once at startup. NULL = autodiscover via companion path
        (next to the running .efi) then cwd. Pass an explicit path
        to override (authoritative; no fallback). */
-    int rc = axl_pci_ids_load(NULL);
-    if (rc == -1) {
+    AxlSidecarStatus rc = axl_pci_ids_load(NULL);
+    if (rc == AXL_SIDECAR_FILE_MISSING) {
         /* Deployment problem — sidecar absent. Fine to ignore;
            lookups will return NULL → numeric fallback. */
-    } else if (rc == -2) {
+    } else if (rc == AXL_SIDECAR_PARSE_ERROR) {
         /* Authoring problem — file exists but malformed. Worth
            logging loudly so the maintainer fixes it. */
         axl_warning("pci-ids.json5 failed to parse");

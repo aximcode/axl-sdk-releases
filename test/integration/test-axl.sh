@@ -49,6 +49,26 @@ if [[ -f "$PCI_CLASS_FILE" ]]; then
     mkdir -p "$TEST_STAGING"
     cp "$PCI_CLASS_FILE" "$TEST_STAGING/pci-class.json5"
 fi
+JEDEC_FILE="$PROJECT_DIR/share/jedec.json5"
+if [[ -f "$JEDEC_FILE" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$JEDEC_FILE" "$TEST_STAGING/jedec.json5"
+fi
+USB_IDS_FILE="$PROJECT_DIR/share/usb-ids.json5"
+if [[ -f "$USB_IDS_FILE" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$USB_IDS_FILE" "$TEST_STAGING/usb-ids.json5"
+fi
+
+# Test-only class overlay fixture. Carries the "[overlay]" marker
+# entry that test_pci_class_db_singleton_overrides loads via the
+# explicit-override path — the production sidecar above stays clean
+# (zero overrides) so deployed lspci output isn't polluted.
+PCI_CLASS_TEST_FILE="$PROJECT_DIR/test/data/pci-class-test.json5"
+if [[ -f "$PCI_CLASS_TEST_FILE" ]]; then
+    mkdir -p "$TEST_STAGING"
+    cp "$PCI_CLASS_TEST_FILE" "$TEST_STAGING/pci-class-test.json5"
+fi
 
 # Stage a deliberately-malformed fixture so the load -1 vs -2 test
 # can prove parse failures distinguish from missing-file failures.

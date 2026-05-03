@@ -31,6 +31,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <axl/axl-sidecar.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -601,16 +603,18 @@ typedef struct AxlPciIds AxlPciIds;
 /**
  * @brief Open a database handle by reading a JSON5 file at @p path.
  *
- * @return 0 on success (handle returned via @p out),
- *         -1 if @p path does not exist or is unreadable,
- *         -2 if the file was found but JSON5 parsing or schema
- *           validation failed.
+ * @return @c AXL_SIDECAR_OK (handle returned via @p out),
+ *         @c AXL_SIDECAR_FILE_MISSING if @p path does not exist or
+ *           is unreadable,
+ *         @c AXL_SIDECAR_PARSE_ERROR if the file was found but JSON5
+ *           parsing or schema validation failed.
  *
- * The -1 / -2 split lets tools log differently — "no database
- * shipped" is a deployment problem (numeric fallback is fine),
- * while "parse error" is an authoring problem that should be loud.
+ * The @c FILE_MISSING / @c PARSE_ERROR split lets tools log
+ * differently — "no database shipped" is a deployment problem
+ * (numeric fallback is fine), while "parse error" is an authoring
+ * problem that should be loud.
  */
-int
+AxlSidecarStatus
 axl_pci_ids_open(
     const char   *path,    ///< path to JSON5 file
     AxlPciIds   **out      ///< [out] handle on success
@@ -623,11 +627,11 @@ axl_pci_ids_open(
  * caller-owned buffer instead of a file. Useful for embedded or
  * test fixtures that ship the database compiled in.
  *
- * @return 0 on success, -2 on parse / schema error.
- *     (No -1 return — the buffer is the input, so "not found" doesn't
- *     apply.)
+ * @return @c AXL_SIDECAR_OK on success, @c AXL_SIDECAR_PARSE_ERROR
+ *     on parse / schema error. (No @c FILE_MISSING return — the
+ *     buffer is the input, so "not found" doesn't apply.)
  */
-int
+AxlSidecarStatus
 axl_pci_ids_open_from_buffer(
     const char   *json5,   ///< JSON5 source (no NUL required)
     size_t        len,     ///< buffer length in bytes
@@ -744,13 +748,15 @@ axl_pci_ids_foreach_subsys(
  * Two modes selected by @p override_path:
  *
  *   - **Explicit** (`override_path` non-NULL): use exactly that path.
- *     Returns -1 if the file is missing, -2 if found but malformed.
- *     No fallback — explicit means explicit, so the error code
+ *     Returns @c AXL_SIDECAR_FILE_MISSING if the file is missing,
+ *     @c AXL_SIDECAR_PARSE_ERROR if found but malformed. No
+ *     fallback — explicit means explicit, so the error code
  *     reflects what the user asked for.
  *   - **Autodiscover** (`override_path` NULL): try `pci-ids.json5`
  *     next to the running .efi (companion path), then in the
- *     current working directory. Returns -1 if neither candidate
- *     exists, -2 if a candidate was found but failed to parse.
+ *     current working directory. Returns @c AXL_SIDECAR_FILE_MISSING
+ *     if neither candidate exists, @c AXL_SIDECAR_PARSE_ERROR if a
+ *     candidate was found but failed to parse.
  *
  * The file format is the JSON5 schema axl-sdk ships in
  * `share/pci-ids.json5` — vendor entries `{ id, name }`, device
@@ -761,13 +767,14 @@ axl_pci_ids_foreach_subsys(
  *
  * Idempotent: a successful load is a no-op on subsequent calls.
  *
- * @return 0 on success,
- *         -1 if no file was found,
- *         -2 if a file was found but failed to parse (the "authoring
- *           problem" the user fixes by editing the sidecar — distinct
- *           from -1's "deployment problem" of a missing file).
+ * On a successful first load, the singleton registers an
+ * @ref axl_atexit cleanup so the parsed hash tables are freed at
+ * runtime cleanup automatically. Calling @ref axl_pci_ids_free
+ * explicitly is still fine (it unregisters the trampoline) and
+ * worth doing for consumers that want to drop the database before
+ * exit, but it's no longer required for leak-free shutdown.
  */
-int
+AxlSidecarStatus
 axl_pci_ids_load(
     const char  *override_path  ///< explicit path, or NULL to auto-discover
 );
@@ -778,6 +785,10 @@ axl_pci_ids_load(
  * Safe to call when no database is loaded. After calling, the
  * pointers previously returned from @ref axl_pci_vendor_name and
  * @ref axl_pci_device_name are no longer valid.
+ *
+ * Optional — @ref axl_pci_ids_load registers an atexit cleanup
+ * automatically. Call this only when you want to drop the database
+ * before runtime cleanup runs (e.g. memory-pressure reclaim).
  */
 void
 axl_pci_ids_free(
@@ -899,9 +910,10 @@ typedef struct AxlPciClassDb AxlPciClassDb;
 
 /**
  * @brief Open a class-overlay handle from a JSON5 file.
- * @return 0 success, -1 file missing, -2 found-but-malformed.
+ * @return @c AXL_SIDECAR_OK / @c AXL_SIDECAR_FILE_MISSING /
+ *     @c AXL_SIDECAR_PARSE_ERROR.
  */
-int
+AxlSidecarStatus
 axl_pci_class_open(
     const char       *path,
     AxlPciClassDb   **out
@@ -909,9 +921,9 @@ axl_pci_class_open(
 
 /**
  * @brief Open a class-overlay handle from an in-memory buffer.
- * @return 0 success, -2 parse / schema error.
+ * @return @c AXL_SIDECAR_OK / @c AXL_SIDECAR_PARSE_ERROR.
  */
-int
+AxlSidecarStatus
 axl_pci_class_open_from_buffer(
     const char       *json5,
     size_t            len,
@@ -968,10 +980,16 @@ axl_pci_class_db_prog_name(
  * the compiled-in tables. The compiled-in tables stay as the
  * bootstrap so axl-sdk works without a sidecar at all.
  *
- * @return 0 success, -1 missing, -2 parse error, idempotent on
- *     a successful load.
+ * Like @ref axl_pci_ids_load, this registers an atexit cleanup on
+ * a successful first load so the overlay is freed at runtime
+ * cleanup automatically. Calling @ref axl_pci_class_free
+ * explicitly is optional (used to drop the overlay early).
+ *
+ * @return @c AXL_SIDECAR_OK on success (idempotent on second call),
+ *     @c AXL_SIDECAR_FILE_MISSING if missing,
+ *     @c AXL_SIDECAR_PARSE_ERROR on parse error.
  */
-int
+AxlSidecarStatus
 axl_pci_class_load(
     const char  *override_path
 );

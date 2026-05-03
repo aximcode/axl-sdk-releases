@@ -703,7 +703,7 @@ test_str_reader(void)
     test_check(axl_str_reader_peek(&r) == 'f',
                "reader: cursor at first non-ws");
 
-    /* Composed parse: tagged hex N[xxxx] from delldiags case */
+    /* Composed parse: tagged hex N[xxxx] from a downstream consumer */
     {
         AxlStrReader r2;
         uint64_t val;
@@ -879,7 +879,7 @@ test_sscanf(void)
                    "sscanf: ipv4 octets");
     }
 
-    /* Tagged-hex — the delldiags use case */
+    /* Tagged-hex — downstream-consumer parser shape */
     {
         char tag = 0;
         unsigned int v = 0;

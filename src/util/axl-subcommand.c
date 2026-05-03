@@ -32,8 +32,8 @@ AXL_LOG_DOMAIN("subcommand");
 // ---------------------------------------------------------------------------
 
 /// Strip directory components from a path so error messages and the help
-/// banner show "do" instead of "fs0:\\do.efi". Caller-friendly when the
-/// app is invoked via the UEFI shell with a fully-qualified path.
+/// banner show e.g. "tool" instead of "fs0:\\tool.efi". Caller-friendly
+/// when the app is invoked via the UEFI shell with a fully-qualified path.
 static const char *
 basename_of(
     const char *path
