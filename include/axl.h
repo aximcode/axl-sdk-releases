@@ -61,6 +61,8 @@
 #include <axl/axl-config.h>
 #include <axl/axl-subcommand.h>
 #include <axl/axl-args.h>
+#include <axl/axl-console.h>
+#include <axl/axl-image-verify.h>
 #include <axl/axl-event.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-defer.h>

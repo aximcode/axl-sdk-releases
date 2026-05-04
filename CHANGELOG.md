@@ -3,6 +3,64 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.11.2 — 2026-05-04
+
+### Added
+
+- **`axl_console_read_key(timeout_ms, *AxlKey)`** + **`axl_console_flush_input()`**
+  in new `<axl/axl-console.h>` — single-keystroke reader with a
+  bounded timeout. Three modes: `0` non-blocking (returns -1
+  immediately if the queue is empty), `UINT64_MAX` block forever,
+  any other value bounds the wait in milliseconds. Wraps the
+  backend's `WaitForKey` event + a freshly-created timer event,
+  closed unconditionally on return so a slow key path doesn't leak.
+  `flush_input` drains buffered keystrokes (eat type-ahead).
+  Unblocks any interactive UEFI tool — `y`/`n` prompts, "press any
+  key", arrow-key menus — that previously had to roll its own
+  ConIn machinery.
+
+- **`axl_image_verify_signature(path, consult_db, *info)`** +
+  **`axl_image_signature_info_free()`** in new
+  `<axl/axl-image-verify.h>` — PE Authenticode signature
+  inspection without launching the image. Two-axis check:
+  *presence* (parse the PE Certificate Table data directory from
+  raw bytes — works regardless of Secure Boot state) and *db
+  validity* (when `consult_db=true`, the firmware's PE loader
+  dry-runs the signature check via `LoadImage(SourceBuffer)` +
+  immediate `UnloadImage`; `EFI_SECURITY_VIOLATION` → invalid,
+  `EFI_SUCCESS` → valid, anything else → "not consulted" with
+  presence-only fallback). The `subject_cn` and `issuer_cn`
+  fields populate from the first certificate in the PKCS#7
+  SignedData bundle via a small in-tree DER walker —
+  PrintableString and UTF8String CommonNames are extracted as
+  heap-allocated UTF-8; T61String / BMPString / IA5String stay
+  NULL (consumer renders "(unknown)" rather than risk
+  malformed-string crashes). Best-effort, diagnostic-only —
+  not a security-decision input (the formal way to identify the
+  Authenticode signer is via SignerInfo's IssuerAndSerial; this
+  walker assumes the conventional first-cert ordering). Unblocks
+  offline integrity-check tooling — incident response on a
+  suspect EFI binary, BIOS-update pre-flight, bootable-media
+  verification — without committing to launching the image.
+
+  Side-effect note (documented in the header): the dry-run path
+  runs the firmware's PE loader, which allocates image memory,
+  applies relocations, and invokes any registered
+  `EFI_SECURITY2_ARCH_PROTOCOL` handlers. Production firmwares
+  that hook those for audit logging, PCR measurement, or `dbx`
+  notifications will trigger those side effects on every
+  `consult_db = true` call. Pass `false` when those side effects
+  are unacceptable.
+
+### Test stats
+
+2543 unit tests passing on both X64 and AARCH64 (was 2522 at
+v0.11.1 cut; +21 across the new console primitive, image-verify
+two-axis check, and the X.509 CN extractor — including 7 hand-
+crafted DER fixtures exercising the Name walker against
+PrintableString / UTF8String / RDN ordering / no-CN /
+unsupported-encoding / truncated-input edge cases).
+
 ## 0.11.1 — 2026-05-03
 
 ### Changed

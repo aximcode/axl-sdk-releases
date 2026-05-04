@@ -255,6 +255,44 @@ exit status (`axl_driver_start` discards it because drivers aren't
 expected to exit cleanly). Forward slashes in the path are
 normalized to backslashes.
 
+### Image Signature Inspection
+
+For "is this PE file signed and does its signature validate?"
+checks without committing to launching the image, use
+`<axl/axl-image-verify.h>`:
+
+```c
+AxlImageSignatureInfo info = {0};
+if (axl_image_verify_signature("fs0:\\boot.efi",
+                               /* consult_db = */ true,
+                               &info) == 0) {
+    if (!info.has_signature) {
+        axl_print("UNSIGNED\n");
+    } else if (info.consulted_db && !info.signature_valid) {
+        axl_print("SIGNATURE INVALID against current Secure Boot db\n");
+    } else {
+        axl_print("SIGNED%s by '%s' (issued by '%s')\n",
+                  info.consulted_db ? " (db-validated)" : " (presence only)",
+                  info.subject_cn != NULL ? info.subject_cn : "(unknown)",
+                  info.issuer_cn  != NULL ? info.issuer_cn  : "(unknown)");
+    }
+    axl_image_signature_info_free(&info);
+}
+```
+
+The presence axis (`has_signature`) is a pure file-bytes parse of
+the PE Certificate Table — no firmware dependencies. The validity
+axis (`signature_valid` + `consulted_db`) opts into a firmware
+dry-run via `LoadImage(SourceBuffer)` + immediate `UnloadImage`,
+which fires `EFI_SECURITY2_ARCH_PROTOCOL` callbacks (audit logs,
+PCR measurement, `dbx` notifications) as a side effect — pass
+`consult_db = false` when those side effects matter. The
+`subject_cn` / `issuer_cn` fields populate from the first
+certificate in the PKCS#7 SignedData bundle via an in-tree
+DER walker; they're best-effort diagnostic strings (the formal
+way to identify the Authenticode signer is via SignerInfo's
+IssuerAndSerial — out of scope for diagnostic CN output).
+
 ### Auto-Loading Driver Dependencies
 
 Tools that need a protocol provided by a DXE driver (e.g. a RAM-disk

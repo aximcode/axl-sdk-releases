@@ -395,6 +395,61 @@ test_stderr_tee(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_console_read_key / axl_console_flush_input
+// ---------------------------------------------------------------------------
+//
+// The test runner has no way to inject a keystroke from inside the
+// guest, so positive-path coverage (a key arrives, gets returned)
+// requires a host-side serial-input integration test we don't have
+// today. Unit coverage is limited to the contract paths that DON'T
+// need a real keystroke:
+//
+//   - NULL out parameter rejected
+//   - Non-blocking timeout (timeout_ms == 0) returns -1 when the
+//     ConIn queue is empty (typical state in the test runner)
+//   - Bounded timeout (small ms) returns -1 after roughly the
+//     expected wall-clock budget
+//   - axl_console_flush_input doesn't crash and is idempotent
+//
+// The blocking-forever path (UINT64_MAX) is intentionally NOT
+// exercised — it would hang the runner.
+
+static void
+test_console_read_key(void)
+{
+    AxlKey k = { .scan_code = 0xCAFE, .unicode_char = 0xBEEF };
+
+    /* NULL out → -1 immediately. */
+    test_check(axl_console_read_key(0, NULL) == -1,
+               "console read_key: NULL out rejected");
+
+    /* Non-blocking with empty queue → -1. The test runner doesn't
+       inject keystrokes, so the ConIn queue is empty here. */
+    test_check(axl_console_read_key(0, &k) == -1,
+               "console read_key: non-blocking with empty queue returns -1");
+    /* Sentinels untouched on the -1 path (the impl writes them
+       only after the wait succeeds; verify it didn't clobber them
+       on the rejected path). */
+    test_check(k.scan_code == 0xCAFE && k.unicode_char == 0xBEEF,
+               "console read_key: out untouched on -1 (no console activity)");
+
+    /* Bounded timeout: 50 ms with no key arriving must return -1.
+       The runner has no key injection, so this hits the timer
+       branch end-to-end. The test catches "blocking forever"
+       regressions: if axl_console_read_key ignored the timer leg,
+       the test runner would hang and the surrounding QEMU timeout
+       would report a missing PASS line. */
+    test_check(axl_console_read_key(50, &k) == -1,
+               "console read_key: 50ms timeout returns -1 (timer leg fires)");
+
+    /* flush is a no-op on an empty queue and must not crash. Call
+       it twice for idempotency. */
+    axl_console_flush_input();
+    axl_console_flush_input();
+    test_check(true, "console flush_input: idempotent on empty queue");
+}
+
+// ---------------------------------------------------------------------------
 // axl_stdout_raw — binary-out symmetric companion to axl_stdin
 // ---------------------------------------------------------------------------
 
@@ -1424,6 +1479,7 @@ test_io_main(int argc, char **argv)
     test_stdin();
     test_stdout_tee();
     test_stderr_tee();
+    test_console_read_key();
     test_stdout_raw();
     test_text_stream();
     test_encoding_default_passthrough();

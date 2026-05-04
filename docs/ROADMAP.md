@@ -669,6 +669,27 @@ code with public typed wrappers:
       variants (e.g. `dd_cfg` / `DD_CFG` both valid). Help-line
       renders `<a|b|c> (case-insensitive)` so users know the
       relaxed match is in effect.
+- [x] **`axl_console_read_key` + `axl_console_flush_input`**
+      (round-5 commit) — interactive single-keystroke read with
+      bounded timeout in new `<axl/axl-console.h>`. Wraps the
+      backend ConIn primitives + a freshly-created timer event,
+      closed unconditionally on return. Three timeout modes
+      (0 non-blocking / `UINT64_MAX` forever / millisecond bound).
+      Unblocks any interactive UEFI tool — y/n prompts, "press
+      any key", arrow-key menus.
+- [x] **`axl_image_verify_signature` + `axl_image_signature_info_free`**
+      (round-5 commit; CN extraction in round-5 follow-up) —
+      PE Authenticode signature inspection without launching the
+      image, in new `<axl/axl-image-verify.h>`. Two-axis check:
+      presence (pure PE Certificate-Table parse, no firmware
+      dependency) + validity (firmware dry-run via
+      `LoadImage(SourceBuffer)` + immediate `UnloadImage` when
+      `consult_db=true`). Caller controls the security-protocol-
+      callback side-effect cost. `subject_cn` / `issuer_cn`
+      populate from the first cert in the PKCS#7 SignedData
+      bundle via an in-tree DER walker (PrintableString /
+      UTF8String). Best-effort diagnostic-only — not a
+      security-decision input.
 - [x] **Vendor-neutralization sweep** (commit `8d06e8f`) —
       `axl_smbios_slot_usage_str(0x05)` now returns spec-canonical
       `"Unavailable"` (was `"CPU NOT INSTALLED"`); chassis 0x23

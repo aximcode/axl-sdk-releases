@@ -19,3 +19,13 @@ API Reference
 -------------
 
 .. doxygenfile:: axl-image.h
+
+AxlImageVerify — Authenticode signature inspection
+---------------------------------------------------
+
+PE Authenticode signature inspection without launching the image —
+two-axis check (presence + Secure-Boot-db validity) for offline
+integrity-check tooling. See ``include/axl/axl-image-verify.h``
+for the side-effect contract on the ``consult_db`` path.
+
+.. doxygenfile:: axl-image-verify.h

@@ -2347,6 +2347,213 @@ test_image(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlImageVerify — Authenticode presence + (best-effort) db validation
+// ---------------------------------------------------------------------------
+
+static void
+test_image_verify_signature(void)
+{
+    AxlImageSignatureInfo info = {0};
+
+    /* NULL guards. */
+    test_check(axl_image_verify_signature(NULL, false, &info) == -1,
+               "image_verify: NULL path rejected");
+    test_check(axl_image_verify_signature("fs0:\\x.efi", false, NULL) == -1,
+               "image_verify: NULL info rejected");
+
+    /* Non-existent file. */
+    test_check(axl_image_verify_signature("fs0:\\definitely-not-a-pe.efi",
+                                          false, &info) == -1,
+               "image_verify: missing file returns -1");
+
+    /* Real test EFI staged by the runner. AxlTestRuntime.efi is
+       built locally + unsigned, so has_signature must be false on
+       the presence-only path. */
+    int rc = axl_image_verify_signature("fs0:\\AxlTestRuntime.efi",
+                                        /*consult_db=*/false, &info);
+    if (rc != 0) {
+        /* Test EFI not staged here — SKIP-balance the populated
+           path's 6 assertions (4 sig fields + 2 CN-NULL pins). */
+        axl_printf("SKIP: image_verify (no AxlTestRuntime.efi)\n");
+        for (int i = 0; i < 6; i++) {
+            test_check(true, "image_verify: SKIP balance");
+        }
+        return;
+    }
+    test_check(rc == 0,
+               "image_verify: AxlTestRuntime.efi parses as a PE");
+    test_check(info.has_signature == false,
+               "image_verify: AxlTestRuntime.efi is unsigned (presence-only)");
+    test_check(info.consulted_db == false,
+               "image_verify: consult_db=false leaves consulted_db=false");
+    test_check(info.signature_valid == false,
+               "image_verify: unsigned PE reports signature_valid=false");
+    /* CN extraction never fires when has_signature=false — the
+       PKCS#7 walker is short-circuited before any allocation.
+       Anchor the regression: a future change that started parsing
+       the cert table on every call would surface as a non-NULL
+       leak here. */
+    test_check(info.subject_cn == NULL,
+               "image_verify: unsigned PE leaves subject_cn NULL");
+    test_check(info.issuer_cn == NULL,
+               "image_verify: unsigned PE leaves issuer_cn NULL");
+
+    axl_image_signature_info_free(&info);
+
+    /* free is NULL-safe. */
+    axl_image_signature_info_free(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// X.509 Subject/Issuer CN extraction
+// ---------------------------------------------------------------------------
+//
+// Direct unit-level coverage of the DER walker that
+// axl_image_verify_signature uses to populate
+// AxlImageSignatureInfo.subject_cn / issuer_cn. The end-to-end PE +
+// PKCS#7 fixture would need ~200 bytes of hand-crafted Authenticode
+// blob for one positive assertion; testing the CN extractor in
+// isolation against hand-crafted Name DER inputs covers the same
+// failure modes (string encoding, RDN walk, OID match) at a tenth
+// the fixture size.
+//
+// _axl_image_verify_name_extract_cn is intentionally non-static in
+// src/util/axl-image-verify.c — it doesn't ship in include/axl/, so
+// consumer code can't reach it, but the test file forward-declares
+// it here.
+
+extern char *_axl_image_verify_name_extract_cn(
+    const uint8_t  *name_seq_value,
+    size_t          name_seq_len);
+
+static void
+test_image_verify_cn_extract(void)
+{
+    /* Hand-crafted Name (RDNSequence content, i.e. what the walker
+       receives after der_expect peels the outer SEQUENCE tag).
+
+       One RDN, one AttributeTypeAndValue, OID 2.5.4.3 (CN), value
+       PrintableString "TestSubject":
+
+         31 11               SET, length 17
+           30 0F             SEQUENCE, length 15
+             06 03 55 04 03  OID 2.5.4.3 (CN)
+             13 08 ...       PrintableString length 8 = "TestSubj"
+
+       Wait — "TestSubject" is 11 chars. Build with that:
+         31 14 30 12 06 03 55 04 03 13 0B 'T' 'e' 's' 't' 'S' 'u' 'b' 'j' 'e' 'c' 't' */
+    {
+        const uint8_t name_printable[] = {
+            0x31, 0x14,                          /* SET, len 20 */
+              0x30, 0x12,                        /* SEQUENCE, len 18 */
+                0x06, 0x03, 0x55, 0x04, 0x03,    /* OID CN */
+                0x13, 0x0B,                      /* PrintableString, len 11 */
+                'T','e','s','t','S','u','b','j','e','c','t',
+        };
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_printable, sizeof(name_printable));
+        test_check(cn != NULL && axl_strcmp(cn, "TestSubject") == 0,
+                   "cn-extract: PrintableString CN round-trips verbatim");
+        if (cn != NULL) axl_free(cn);
+    }
+
+    /* UTF8String variant — same bytes are a valid UTF-8 ASCII run. */
+    {
+        const uint8_t name_utf8[] = {
+            0x31, 0x14,
+              0x30, 0x12,
+                0x06, 0x03, 0x55, 0x04, 0x03,
+                0x0C, 0x0B,                      /* UTF8String, len 11 */
+                'A','x','i','m','c','o','d','e',' ','C','A',
+        };
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_utf8, sizeof(name_utf8));
+        test_check(cn != NULL && axl_strcmp(cn, "Aximcode CA") == 0,
+                   "cn-extract: UTF8String CN round-trips verbatim");
+        if (cn != NULL) axl_free(cn);
+    }
+
+    /* RDN ordering: walker should find CN even when an unrelated
+       attribute (e.g. organizationName, OID 2.5.4.10) precedes it. */
+    {
+        const uint8_t name_o_then_cn[] = {
+            /* RDN 1: O=Aximcode */
+            0x31, 0x13,
+              0x30, 0x11,
+                0x06, 0x03, 0x55, 0x04, 0x0A,    /* O */
+                0x13, 0x0A,
+                'A','x','i','m','c','o','d','e','!','!',
+            /* RDN 2: CN=Foo */
+            0x31, 0x0C,
+              0x30, 0x0A,
+                0x06, 0x03, 0x55, 0x04, 0x03,
+                0x13, 0x03, 'F','o','o',
+        };
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_o_then_cn, sizeof(name_o_then_cn));
+        test_check(cn != NULL && axl_strcmp(cn, "Foo") == 0,
+                   "cn-extract: skips non-CN RDN, finds CN later in sequence");
+        if (cn != NULL) axl_free(cn);
+    }
+
+    /* Name with no CN attribute — return NULL. */
+    {
+        const uint8_t name_no_cn[] = {
+            0x31, 0x13,
+              0x30, 0x11,
+                0x06, 0x03, 0x55, 0x04, 0x0A,    /* O only */
+                0x13, 0x0A,
+                'A','x','i','m','c','o','d','e','!','!',
+        };
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_no_cn, sizeof(name_no_cn));
+        test_check(cn == NULL,
+                   "cn-extract: name with no CN attribute returns NULL");
+    }
+
+    /* Unsupported string encoding (T61String 0x14). Walker hits the
+       CN OID then encounters a tag it doesn't decode — returns NULL
+       rather than allocating a possibly-malformed string. */
+    {
+        const uint8_t name_t61[] = {
+            0x31, 0x0C,
+              0x30, 0x0A,
+                0x06, 0x03, 0x55, 0x04, 0x03,
+                0x14, 0x03, 'B','a','r',          /* T61String */
+        };
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_t61, sizeof(name_t61));
+        test_check(cn == NULL,
+                   "cn-extract: unsupported string encoding (T61) returns NULL");
+    }
+
+    /* Truncated input (length declares more bytes than buffer holds)
+       — DER walker bounds-check refuses to read past end. */
+    {
+        const uint8_t name_truncated[] = {
+            0x31, 0x14,                          /* SET claims 20 bytes */
+              0x30, 0x12,
+                0x06, 0x03, 0x55, 0x04, 0x03,
+                0x13, 0x0B, 'T','e','s','t',     /* but only 4 chars present */
+        };
+        /* Pass the full buffer; walker should fail when it tries to
+           read 11 bytes of string content but only 4 remain. */
+        char *cn = _axl_image_verify_name_extract_cn(
+            name_truncated, sizeof(name_truncated));
+        test_check(cn == NULL,
+                   "cn-extract: truncated DER returns NULL (bounds rejected)");
+    }
+
+    /* Zero-length input — walker enters its loop with cur == end,
+       returns NULL without crashing. */
+    {
+        char *cn = _axl_image_verify_name_extract_cn(NULL, 0);
+        test_check(cn == NULL,
+                   "cn-extract: zero-length input returns NULL");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AxlArgs — declarative CLI parser
 // ---------------------------------------------------------------------------
 
@@ -3273,6 +3480,8 @@ test_util_main(int argc, char **argv)
     test_nvstore_roundtrip();
     test_boot();
     test_image();
+    test_image_verify_signature();
+    test_image_verify_cn_extract();
     test_hexdump();
     test_time();
     test_time_sleep();

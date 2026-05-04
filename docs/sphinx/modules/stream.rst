@@ -9,6 +9,11 @@ API Reference
 
 .. doxygenfile:: axl-stream.h
 
+AxlConsole — interactive console input
+--------------------------------------
+
+.. doxygenfile:: axl-console.h
+
 AxlFs — filesystem operations
 -----------------------------
 

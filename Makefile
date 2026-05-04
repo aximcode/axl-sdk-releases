@@ -179,6 +179,8 @@ LIB_SOURCES = \
     src/util/axl-config.c \
     src/util/axl-subcommand.c \
     src/util/axl-args.c \
+    src/util/axl-console.c \
+    src/util/axl-image-verify.c \
     src/smbios/axl-smbios.c \
     src/acpi/axl-acpi.c \
     src/pci/axl-pci.c \

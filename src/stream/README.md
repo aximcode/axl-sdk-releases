@@ -59,6 +59,30 @@ A symmetric `axl_stream_set_stderr_tee` covers `axl_printerr`.
 Tee write errors are swallowed — a broken log file must not break
 the primary console.
 
+### Interactive console input
+
+`axl_stdin` (above) is shell-pipe input — bytes the shell captured
+from the left-hand side of a `|`. For interactive prompts where
+the tool needs to wait on a real keystroke (`y`/`n` confirmations,
+"press any key", arrow-key menus), use `<axl/axl-console.h>`:
+
+```c
+#include <axl/axl-console.h>
+
+axl_print("Continue? [y/n]: ");
+AxlKey k;
+if (axl_console_read_key(5000, &k) == 0
+    && (k.unicode_char == 'y' || k.unicode_char == 'Y'))
+{
+    /* user said yes */
+}
+```
+
+Three timeout modes: `0` is non-blocking (returns -1 immediately
+if no key is buffered), `UINT64_MAX` blocks forever,
+anything else is a millisecond bound. Pair with
+`axl_console_flush_input()` before a prompt to eat type-ahead.
+
 ## File Read/Write
 
 The simplest way to read or write files:
