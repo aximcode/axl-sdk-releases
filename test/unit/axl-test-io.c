@@ -176,9 +176,9 @@ test_file(void)
     test_check(s == NULL, "file: fopen invalid returns NULL");
 
     // file_get_contents / file_set_contents roundtrip
-    test_check(axl_file_set_contents("fs0:\\axl_test_gc.tmp", "hello", 5) == 0,
+    test_check(axl_file_set_contents("fs0:\\axl_test_gc.tmp", "hello", 5) == AXL_OK,
           "file: set_contents returns 0");
-    test_check(axl_file_get_contents("fs0:\\axl_test_gc.tmp", &contents, &len) == 0,
+    test_check(axl_file_get_contents("fs0:\\axl_test_gc.tmp", &contents, &len) == AXL_OK,
           "file: get_contents returns 0");
     test_check(len == 5 && test_memcmp(contents, "hello", 5) == 0,
           "file: get/set roundtrip content");
@@ -249,7 +249,7 @@ test_stdin(void)
     test_check(axl_write(buf, payload, sizeof(payload) - 1)
                    == (axl_ssize_t)(sizeof(payload) - 1),
                "stdin: seed buffer write");
-    test_check(axl_fseek(buf, 0, AXL_SEEK_SET) == 0,
+    test_check(axl_fseek(buf, 0, AXL_SEEK_SET) == AXL_OK,
                "stdin: seed buffer rewind");
 
     axl_stdin = buf;
@@ -286,7 +286,7 @@ test_stdout_tee(void)
         return;
     }
 
-    test_check(axl_stream_set_stdout_tee(tee) == 0,
+    test_check(axl_stream_set_stdout_tee(tee) == AXL_OK,
                "stdout_tee: set_stdout_tee succeeds");
 
     const char payload[] = "stdout_tee_marker\n";
@@ -378,7 +378,7 @@ test_stderr_tee(void)
         return;
     }
 
-    test_check(axl_stream_set_stderr_tee(tee) == 0,
+    test_check(axl_stream_set_stderr_tee(tee) == AXL_OK,
                "stderr_tee: set_stderr_tee succeeds");
 
     axl_printerr("err:%d\n", 42);
@@ -420,12 +420,12 @@ test_console_read_key(void)
     AxlKey k = { .scan_code = 0xCAFE, .unicode_char = 0xBEEF };
 
     /* NULL out → -1 immediately. */
-    test_check(axl_console_read_key(0, NULL) == -1,
+    test_check(axl_console_read_key(0, NULL) == AXL_ERR,
                "console read_key: NULL out rejected");
 
     /* Non-blocking with empty queue → -1. The test runner doesn't
        inject keystrokes, so the ConIn queue is empty here. */
-    test_check(axl_console_read_key(0, &k) == -1,
+    test_check(axl_console_read_key(0, &k) == AXL_ERR,
                "console read_key: non-blocking with empty queue returns -1");
     /* Sentinels untouched on the -1 path (the impl writes them
        only after the wait succeeds; verify it didn't clobber them
@@ -439,7 +439,7 @@ test_console_read_key(void)
        regressions: if axl_console_read_key ignored the timer leg,
        the test runner would hang and the surrounding QEMU timeout
        would report a missing PASS line. */
-    test_check(axl_console_read_key(50, &k) == -1,
+    test_check(axl_console_read_key(50, &k) == AXL_ERR,
                "console read_key: 50ms timeout returns -1 (timer leg fires)");
 
     /* flush is a no-op on an empty queue and must not crash. Call
@@ -775,14 +775,14 @@ test_encoding_invalid_arg(void)
     test_check(s != NULL, "encoding: bufopen for invalid-arg test");
     if (s == NULL) return;
 
-    test_check(axl_stream_set_encoding(NULL, AXL_ENC_UCS2_LE) == -1,
+    test_check(axl_stream_set_encoding(NULL, AXL_ENC_UCS2_LE) == AXL_ERR,
                "encoding: set_encoding(NULL) returns -1");
-    test_check(axl_stream_set_encoding(s, (AxlEncoding)99) == -1,
+    test_check(axl_stream_set_encoding(s, (AxlEncoding)99) == AXL_ERR,
                "encoding: set_encoding(out-of-range) returns -1");
     test_check(axl_stream_get_encoding(NULL) == AXL_ENC_UTF8,
                "encoding: get_encoding(NULL) returns UTF-8 default");
 
-    test_check(axl_stream_set_encoding(s, AXL_ENC_UCS2_LE) == 0,
+    test_check(axl_stream_set_encoding(s, AXL_ENC_UCS2_LE) == AXL_OK,
                "encoding: set_encoding(UCS2_LE) returns 0");
     test_check(axl_stream_get_encoding(s) == AXL_ENC_UCS2_LE,
                "encoding: get_encoding reports the set value");
@@ -802,7 +802,7 @@ roundtrip(const char *label, AxlEncoding enc,
     AxlStream *s = axl_bufopen();
     if (s == NULL) { test_fail(label); return; }
 
-    test_check(axl_stream_set_encoding(s, enc) == 0,
+    test_check(axl_stream_set_encoding(s, enc) == AXL_OK,
                "encoding: roundtrip set_encoding");
 
     axl_ssize_t w = axl_write(s, utf8, utf8_n);

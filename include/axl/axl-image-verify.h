@@ -53,6 +53,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,7 +121,7 @@ typedef struct {
  *                     further work — so on a -1 return the struct
  *                     is in a defined "unknown / nothing detected"
  *                     state, not arbitrary leftover bytes.
- * @return 0 on success (with @p info populated), -1 if the file is
+ * @return AXL_OK on success (with @p info populated), AXL_ERR if the file is
  *     missing/unreadable, the bytes are not a recognizable PE
  *     image, or @p info is NULL.
  */

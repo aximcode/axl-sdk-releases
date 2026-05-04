@@ -38,6 +38,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #include <axl/axl-sys.h>   /* AxlGuid — used at namespace registration */
 
@@ -62,7 +63,7 @@ extern "C" {
  * Built-in namespaces "global" and "app" are pre-registered and do
  * not need to be registered explicitly.
  *
- * @return 0 on success, -1 if the namespace table is full or the
+ * @return AXL_OK on success, AXL_ERR if the namespace table is full or the
  *     name is already registered with a different token.
  */
 int
@@ -74,7 +75,7 @@ axl_nvstore_register_namespace(
 /**
  * @brief Read a value from non-volatile storage.
  *
- * @return 0 on success, -1 on error (variable not found, buffer
+ * @return AXL_OK on success, AXL_ERR on error (variable not found, buffer
  *     too small, namespace not registered, etc.). On
  *     buffer-too-small, @a size is updated to the required size.
  */
@@ -103,7 +104,7 @@ axl_nvstore_get(
  * C string when the variable's payload doesn't already include a
  * trailing NUL.
  *
- * @return 0 on success, -1 on any error (variable not found,
+ * @return AXL_OK on success, AXL_ERR on any error (variable not found,
  *     allocation failed, namespace not registered, etc.).
  */
 int
@@ -122,7 +123,7 @@ axl_nvstore_get_alloc(
  * for non-delete writes, so the implementation substitutes
  * boot-services access as the minimal sensible default.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_nvstore_set(
@@ -136,7 +137,7 @@ axl_nvstore_set(
 /**
  * @brief Delete a variable from non-volatile storage.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_nvstore_delete(
@@ -147,7 +148,7 @@ axl_nvstore_delete(
 /**
  * @brief Get a variable's attribute flags.
  *
- * @return 0 on success, -1 on error (variable not found, namespace
+ * @return AXL_OK on success, AXL_ERR on error (variable not found, namespace
  *     not registered, etc.).
  */
 int

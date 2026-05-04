@@ -118,7 +118,7 @@ axl_diag_probe_protocol(
     )
 {
     if (protocol_guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     void *iface = NULL;
     /* See axl-driver.c for why this cast is non-const. */
@@ -129,5 +129,5 @@ axl_diag_probe_protocol(
                tag,
                EFI_ERROR(st) ? "NOT registered" : "ALREADY REGISTERED",
                (unsigned long)st);
-    return EFI_ERROR(st) ? -1 : 0;
+    return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
 }

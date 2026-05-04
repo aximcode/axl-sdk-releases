@@ -34,6 +34,8 @@ rest. Setting expectations up front matters.
   chardev=...` connects QEMU's KCS frontend to an external
   simulator (OpenIPMI's `ipmi_sim`) speaking the real wire
   protocol. `-device ipmi-bmc-sim` runs a simpler built-in.
+  Both are **already exposed** via run-qemu.sh's `--ipmi` /
+  `--ipmi-extern` / `--ipmi-prop` flags — no new flag needed.
 - **NIC variety** — already exposed via `--nic-model` in run-qemu.sh.
 
 ### Tractable with host-side mocks
@@ -102,9 +104,10 @@ and intentionally deferred:
 
 ```
 ┌──────────────────────────┐                ┌─────────────────────────┐
-│   Capture (UEFI tool)    │                │   Replay (run-qemu.sh)  │
+│   Capture (UEFI tool)    │                │   Replay (host wrapper) │
 │                          │                │                         │
-│  sysinfo --capture DIR   │  ─── files ──> │  --fixture DIR          │
+│  mkfixture.efi <destdir> │  ─── files ──> │  axl-emulate <dir>      │
+│                          │                │  (wraps run-qemu.sh)    │
 │   ├── smbios.bin         │                │   ├── -smbios file=...  │
 │   ├── acpi/*.dat         │                │   ├── -acpitable file=  │
 │   ├── pci.json           │                │   ├── (manifest only)   │
@@ -128,11 +131,17 @@ and intentionally deferred:
 
 ### Capture: native UEFI, no OS
 
-A UEFI tool — most likely an extension to `tools/sysinfo.c` rather
-than a new binary, since sysinfo already walks SMBIOS/PCI/firmware.
+A new dedicated UEFI tool — `tools/mkfixture.c`, mirroring the
+`mkrd.efi` naming pattern (mk = make). Capture is structurally
+different from inventory display: it writes binary blobs and JSON
+manifests to a strict directory layout, with byte-exact round-trip
+guarantees. Conflating it into `sysinfo` (a human-readable
+inventory tool) would muddy both. Cross-tool sharing of SMBIOS /
+PCI / USB walking happens at the library layer, not at the
+command line.
 
 ```
-sysinfo --capture <destdir>
+mkfixture.efi <destdir> [--include-redfish] [--include-ipmi] ...
 ```
 
 Why native UEFI rather than a Linux capture script:
@@ -141,10 +150,11 @@ Why native UEFI rather than a Linux capture script:
   machine — corporate Windows laptop, server, lab box — run, reboot.
   No Linux install, no IT permissions, no WSL caveats (WSL2 sees
   Hyper-V's synthetic SMBIOS, not the real platform).
-- **Dogfoods axl-sdk.** Capture exercises [src/smbios/](../src/smbios/),
-  [src/ipmi/](../src/ipmi/), [src/net/](../src/net/) (HTTP client
-  for Redfish), and PCI I/O all in one tool. It's an integration
-  test as much as a feature.
+- **Dogfoods axl-sdk hard.** Capture exercises
+  [src/smbios/](../src/smbios/), [src/ipmi/](../src/ipmi/),
+  [src/net/](../src/net/) (HTTP client for Redfish), PCI I/O,
+  USB I/O, GOP, TCG2, Variable Services, and the JSON formatter
+  in one tool. It's an integration test as much as a feature.
 - **Direct config-table access.** SMBIOS3 and ACPI 2.0 are reachable
   from `EFI_SYSTEM_TABLE->ConfigurationTable` — no kernel needed.
   PCI via `EFI_PCI_IO_PROTOCOL`. IPMI via in-band KCS (already in
@@ -154,7 +164,7 @@ Why native UEFI rather than a Linux capture script:
 
 | Artifact | Source | Format |
 |----------|--------|--------|
-| `smbios.bin` | EFI Config Table SMBIOS3 GUID | raw bytes |
+| `smbios.bin` | EFI Config Table SMBIOS3 GUID | raw SMBIOS structure data (no entry-point prefix — see SMBIOS format note below) |
 | `acpi/<sig>.dat` | EFI Config Table ACPI 2.0 GUID, walk RSDT/XSDT | raw bytes per table |
 | `pci.json` | `EFI_PCI_IO_PROTOCOL` per device | JSON manifest (VID/DID/class/subsys/BARs/config) |
 | `usb.json` | `EFI_USB_IO_PROTOCOL` + `EFI_USB2_HC_PROTOCOL` walk | JSON manifest (topology, VID/PID, class/subclass/protocol, strings) |
@@ -171,7 +181,7 @@ Why native UEFI rather than a Linux capture script:
 | `vars/secureboot/{PK,KEK,db,dbx}.bin` | UEFI Variable Services for `EFI_IMAGE_SECURITY_DATABASE` + global GUIDs | raw `EFI_SIGNATURE_LIST` bytes per Secure Boot key database |
 | `esrt.json` | EFI Config Table `EFI_SYSTEM_RESOURCE_TABLE_GUID` | JSON manifest (per-component FwClass GUID, current/lowest-supported version, capsule flags) |
 | `nvme/<bdf>.json` | `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL` Identify Controller + Identify Namespace | JSON manifest (per-controller VID/SSVID/serial/model, namespace LBA format, log page summaries) |
-| `spd/<addr>.bin` | SMBus EEPROMs at 0x50–0x57 (and beyond) via AxlSmbus / memspd | raw 256/512/1024 B blobs per DIMM slot |
+| `spd/<addr>.bin` | SMBus EEPROMs at 0x50–0x57 (and beyond) via AxlSmbus (mkfixture's SPD walk; memspd remains an inspection tool) | raw 256/512/1024 B blobs per DIMM slot |
 | `redfish/**/*.json` | optional — walk service root via HTTP | JSON tree mirroring `/redfish/v1/...` |
 | `ipmi/<cmd>.bin` | optional — canned Get-* commands via KCS | raw response bytes per command |
 | `manifest.json` | top-level metadata | JSON: vendor, model, serial, BIOS rev, capture date, capture-tool version |
@@ -183,6 +193,20 @@ is gated because it requires an SMBus controller driver
 boxes; vendor SMBus driver elsewhere) — present on most servers,
 absent on locked-down corporate laptops.
 
+**SMBIOS format note**: `smbios.bin` is the **raw structure region**
+— a sequence of type/length/handle records terminated by Type 127 —
+with no entry-point structure prefix. This matches QEMU's
+`-smbios file=` consumer, which builds its own entry-point around
+the user-supplied data (see `hw/smbios/smbios.c` in QEMU 10.x). The
+file is therefore **NOT** directly interchangeable with
+`dmidecode --from-dump` (dmidecode prepends a 31-byte SMBIOS 2.x
+or 24-byte SMBIOS 3.x entry-point structure). Tools that want a
+dmidecode-compatible export should concatenate the captured EP
+(via `axl_smbios_entry_point`) with the table bytes. The fragile
+"prepend EP and hope OS walks past it as a bogus type-95 record"
+approach was tried and rejected — it only works for some captures
+by alignment luck and silently hangs others.
+
 #### Write targets
 
 Pick at runtime — all three supported:
@@ -192,21 +216,39 @@ Pick at runtime — all three supported:
 2. **virtiofs `--mount`** — for the dev loop:
    ```sh
    ./scripts/run-qemu.sh --mount fixtures/ \
-       sysinfo.efi --capture hostfs:/proxmox-test
+       mkfixture.efi hostfs:/proxmox-test
    ```
 3. **HTTP POST** — for headless/net-only environments. POST a
    tarball to a host-side collector endpoint.
 
-### Replay: run-qemu.sh `--fixture`
+### Replay: `axl-emulate <fixture-dir>`
 
-A single new flag that auto-discovers files in the directory and
-wires the QEMU command:
+A separate user-facing tool — `scripts/axl-emulate` (Python, no
+extension; ships in the host-tools tarball alongside `run-qemu.sh`
+and `axl-cc`) — that consumes a fixture directory, translates it
+into the right run-qemu.sh primitives, and `exec`s run-qemu.sh.
+
+This is a **wrapper, not a duplicate**. run-qemu.sh stays the
+primitive layer (low-level QEMU launching, OVMF/firmware discovery,
+disk-image build, KVM acceleration, GDB stub, etc.) and exposes
+the per-artifact flags (`--smbios-file`, `--acpi-table`, `--spd`,
+`--tpm`, …) as primitives. axl-emulate is the persona that knows
+about the fixture *layout* — directory structure, ACPI denylist,
+manifest.json — and never duplicates run-qemu.sh's launching
+logic.
 
 ```
---fixture DIR
+axl-emulate <fixture-dir> [efi-file] [args...]
+            [--keep-acpi NAME] [--drop-acpi NAME] [--strict-acpi]
+            [--arch X64|AARCH64]
+            [-- run-qemu-args...]
 ```
 
-resolves to:
+Anything after `--` passes through to run-qemu.sh verbatim, so
+`axl-emulate` can compose with run-qemu.sh's existing knobs
+(`--background`, `-i`, `--mount`, …).
+
+A `<fixture-dir>` resolves to:
 
 - `smbios.bin`        → `-smbios file=DIR/smbios.bin`
 - `acpi/*.dat`        → `-acpitable file=...` (one per file)
@@ -260,13 +302,15 @@ Lower-level flags also exposed for mix-and-match:
 ```
 --smbios-file FILE              # single SMBIOS blob
 --acpi-table FILE               # repeatable
---ipmi-sim                      # built-in ipmi-bmc-sim
---ipmi-extern PATH              # ipmi_sim socket path
+--ipmi                          # (already in run-qemu.sh) ipmi-bmc-sim + KCS
+--ipmi-extern PATH              # (already in run-qemu.sh) ipmi_sim socket
 --redfish-mock DIR              # spawn DMTF mockup, hostfwd to it
 --openbmc-qemu PATH             # alternative: sibling OpenBMC QEMU
---tpm                           # spawn swtpm with default empty state
---tpm-state DIR                 # spawn swtpm seeded from captured state
---tpm-model tpm-tis|tpm-crb     # default tpm-tis; fixture can override
+--tpm                           # spawn swtpm with empty state
+--tpm-state DIR                 # spawn swtpm with DIR as its state directory
+                                # (raw swtpm format; captured-fixture seeding
+                                # is HF5's scope, not HF1)
+--tpm-model tpm-tis|tpm-crb     # arch default (tpm-tis x64 / tpm-crb aa64)
 --secureboot DIR                # inject PK/KEK/db/dbx from DIR/*.bin
 --boot-vars DIR                 # inject Boot####/BootOrder from DIR/*.bin
 --cpu-from-fixture              # map cpu.json → -cpu MODEL
@@ -299,13 +343,26 @@ Then wire QEMU:
 -device tpm-tis,tpmdev=tpm0     # or tpm-crb for CRB-interface fixtures
 ```
 
-When `--tpm-state DIR` is given, the captured `tpm/` directory is
-copied into `$TMPDIR/tpm-state` before swtpm starts so PCR values
-and event log are seeded. Without seeding, swtpm starts with all-
-zero PCRs — useful for clean-slate measured-boot tests.
+**State-seeding is two layers** and they should not be conflated:
+
+1. **HF1 (`--tpm-state DIR`)** — DIR is a **raw swtpm-format state
+   directory** (NVChip files: `tpm2-00.permall`, etc.). swtpm
+   passes through unchanged. `--tpm` with no DIR → fresh empty
+   state in `$TMPDIR/tpm-state` (all-zero PCRs; useful for clean-
+   slate measured-boot tests).
+2. **HF5 (captured-fixture seeding)** — `axl-emulate <dir>` reads
+   the captured `tpm.json` + `tpm/event-log.bin` and **converts**
+   them into swtpm's NVChip state format before swtpm starts. The
+   conversion does not exist yet; swtpm's state format is its own
+   binary layout, not a copy of the raw TCG event log.
+
+HF1 only provides layer 1. The captured-to-swtpm conversion is HF5
+work, gated on us actually having captures to convert.
 
 Lifecycle parallels virtiofsd: spawn, wait for socket, kill on exit
-trap, expose PID in `--background` mode.
+trap, expose PID in `--background` mode. swtpm absent on PATH ⇒
+hard error with install hint, not a warning. (Same precedent as
+`--mount` / virtiofsd.)
 
 **Caveat**: capture-time PCR values reflect the source platform's
 firmware measurements. If the replay guest's OVMF measures different
@@ -427,29 +484,63 @@ ECAM reads all-`0xFF` from the captured range — every QEMU virtio
 device disappears from the guest's view. On stricter firmware the
 mismatch faults instead of returning 0xFF.
 
-**Default-drop denylist on replay**:
+**Default-drop denylist on replay** — two categories, both
+verified empirically (per-table boot bisection against the Proxmox
+fixture) and in source (QEMU `hw/acpi/core.c:acpi_table_install`,
+OVMF `OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c`):
 
-- `MCFG` — PCIe ECAM map (always)
-- `MPST` — memory power state table (references real DIMMs by
-  topology — won't match QEMU's flat RAM)
-- `PMTT` — platform memory topology (same issue)
-- `HMAT`, `SLIT`, `SRAT` — NUMA/proximity topology (almost never
-  matches QEMU; better to let QEMU generate its own)
-- `SPCR` — serial port console redirection (captured address
-  won't exist in QEMU; guest hangs on console init)
-- `DBG2` — debug port table 2 (same issue, secondary ports)
+*Core ACPI singletons* (FACP/FACS/DSDT have absolute physical
+pointers in their bodies; QEMU's `-acpitable` does NOT fix these
+up — only the header is rewritten — and OVMF's
+`EFI_ACPI_TABLE_PROTOCOL.InstallAcpiTable` follows them per the
+spec, dereferencing source-platform addresses that don't exist in
+QEMU's memory map and hanging the boot):
 
-**Default-keep**: FACP, FACS, HPET, BERT, BGRT, MSDM, SLIC, FPDT,
-BOOT, MCHI, ASF!, IORT (AArch64) — platform/firmware identity not
-tied to PCI/memory/serial topology.
+- `FACP` — Fixed ACPI Description Table (FADT). Body contains
+  `FIRMWARE_CTRL`, `DSDT`, `X_FIRMWARE_CTRL`, `X_DSDT`, plus
+  PM1a/b/GPE register block addresses.
+- `FACS` — Firmware ACPI Control Structure. Pointed-to by FACP;
+  installing alone causes FACP-pointer rewriting and corruption.
+- `DSDT` — Differentiated System Description Table. AML namespace
+  with embedded opregion physical addresses; AML interpretation
+  hits invalid addresses and hangs.
 
-**DSDT/SSDT**: huge, contain unrelated useful content (CPU `_PSS`,
-EC handlers, GPE methods) but also `_CRS` resource declarations
-that hardcode the captured topology. Rewriting is impractical;
-dropping loses too much. Default: keep, accept that some `_CRS`
-references will be nonsense in the guest. Tools that walk ACPI for
-inventory/identity get useful data; tools that walk for resource
-allocation see noise.
+(APIC, SSDT, HPET, WAET, BERT, BGRT, MSDM, SLIC, FPDT, MCHI inject
+cleanly. APIC/SSDT/HPET/WAET have no absolute physical addresses
+in their bodies; multiple instances are spec-tolerated. BERT,
+BGRT, FPDT, MCHI *do* have physical pointers (boot error region,
+boot graphic image, perf records, BMC interface), but OVMF and
+Linux don't dereference those pointers on the boot path — they're
+read only on demand (logged error, OS rendering the logo, etc.) —
+so stale captured pointers are inert. Add to this list ONLY when
+an actual hang or misbehavior is observed.)
+
+*Platform topology* (the source platform's PCIe/NUMA/serial
+topology doesn't match QEMU's emulated platform):
+
+- `MCFG` — PCIe ECAM map (the canonical example — see this
+  subsection's introduction).
+- `MPST` — memory power state table (references real DIMMs).
+- `PMTT` — platform memory topology (same).
+- `HMAT`, `SLIT`, `SRAT` — NUMA/proximity topology.
+- `SPCR` — serial console redirection (captured MMIO won't exist
+  in QEMU; guest hangs on console init).
+- `DBG2` — debug port table 2 (same issue, secondary ports).
+
+**Default-keep**: APIC, SSDT, HPET, BERT, BGRT, MSDM, SLIC, FPDT,
+BOOT, MCHI, ASF!, WAET, IORT (AArch64) — either no absolute
+pointers, or the pointers exist but aren't dereferenced on the
+boot path. Add to the denylist only when a per-table boot
+bisection shows a hang.
+
+**Practical implication**: wholesale ACPI replay is rarely
+useful. The interesting OEM data lives in SMBIOS Type 11 (already
+covered by `--smbios-file`) and in DSDT (which we can't replay
+safely — it would need to be REPLACED, not added, and OVMF
+doesn't expose that knob). For most fixture-replay use cases
+the SMBIOS replay is the lever; ACPI replay is reserved for
+specific tables a parser test needs to exercise (BERT for error-
+log handling, MSDM for Windows-licensing checks, etc.).
 
 Override flags:
 ```
@@ -499,11 +590,11 @@ fixture artifact actually needs them):
   from a captured blob and stalls class-specific traffic. Enables
   "device appears in bus walk" replay for non-class-compliant USB.
 
-Replay layer behavior: when `--fixture DIR` discovers an artifact
-that requires a patched-QEMU feature, it checks for the feature's
-presence (e.g., probes `smbus-eeprom` for the `memdev` property via
-`-device help`) and either uses it or warns clearly. No silent
-fallback to a degraded fixture.
+Replay layer behavior: when `axl-emulate <dir>` discovers an
+artifact that requires a patched-QEMU feature, it checks for the
+feature's presence (e.g., probes `smbus-eeprom` for the `memdev`
+property via `-device help`) and either uses it or warns clearly.
+No silent fallback to a degraded fixture.
 
 ## Bootstrap targets
 
@@ -576,21 +667,28 @@ Suggested ordering, smallest viable slices first:
    first fixture from the Proxmox VM (`dmidecode --dump-bin`,
    `acpidump -b`) to validate the replay path before writing the
    capture tool. Smallest possible diff.
-2. **Phase HF2** — `sysinfo --capture` for the cheap UEFI-protocol
-   walks: SMBIOS, ACPI, PCI manifest, USB manifest + descriptors,
-   GOP/EDID, ESRT, CPU (CPUID + microcode), network details
-   (`net.json`), and `manifest.json`. All write to `fs0:`,
-   `--mount` virtiofs, or HTTP POST. Run on the Proxmox VM, replay
-   the captured fixture, compare against Phase HF1's hand-crafted
-   one. Plumbing smoke test.
-3. **Phase HF3** — `--fixture DIR` flag in run-qemu.sh, auto-wires
-   SMBIOS/ACPI from a directory; default-drops the ACPI denylist;
-   prints `manifest.json` summary at startup.
-4. **Phase HF4** — SPD capture: extend `memspd` (or fold into
-   `sysinfo --capture`) to dump every populated SMBus EEPROM at
-   0x50–0x57 to `spd/0xNN.bin`. Validate by capturing on a real box
-   and replaying via the Phase HF3 path; AxlSpd output should match
-   bit-for-bit.
+2. **Phase HF2** — `tools/mkfixture.c` (new dedicated tool;
+   `mkfixture.efi`, mirroring `mkrd.efi` in the existing tools
+   tree). Cheap UEFI-protocol walks: SMBIOS, ACPI, PCI manifest,
+   USB manifest + descriptors, GOP/EDID, ESRT, CPU (CPUID +
+   microcode), network details (`net.json`), and `manifest.json`.
+   All write to `fs0:`, `--mount` virtiofs, or HTTP POST. Run on
+   the Proxmox VM, replay the captured fixture, compare against
+   Phase HF1's hand-crafted one. Plumbing smoke test.
+3. **Phase HF3** — `scripts/axl-emulate` (new Python wrapper;
+   shipped in host-tools alongside `run-qemu.sh`). Consumes a
+   fixture directory, auto-wires SMBIOS/ACPI/SPD/TPM artifacts to
+   the corresponding run-qemu.sh primitives, default-drops the
+   ACPI denylist, prints `manifest.json` summary at startup, and
+   `exec`s run-qemu.sh. Brought forward in front of HF2 so the
+   replay structure is settled before the capture tool's output
+   format hardens.
+4. **Phase HF4** — SPD capture: fold into `mkfixture` (preferred
+   over extending `memspd`, which stays an inspection tool — same
+   sysinfo-vs-mkfixture separation argument). Dump every populated
+   SMBus EEPROM at 0x50–0x57 to `spd/0xNN.bin`. Validate by
+   capturing on a real box and replaying via the Phase HF3 path;
+   AxlSpd output should match bit-for-bit.
 5. **Phase HF5** — TPM capture and replay. Capture: PCR values,
    capabilities, full TCG event log via `EFI_TCG2_PROTOCOL`. Replay:
    spawn `swtpm` with seeded state, wire `-tpmdev emulator` +
@@ -602,11 +700,16 @@ Suggested ordering, smallest viable slices first:
    OVMF `vars.fd` copy before QEMU launch (likely via `virt-fw-vars`).
    Detect non-secboot OVMF and warn when `--secureboot` is requested
    against it.
-7. **Phase HF7** — Redfish capture (HTTP walk) and replay
-   (`--redfish-mock` spawning DMTF mockup-server). Validate against
-   OpenBMC-in-QEMU as the "real BMC" reference.
-8. **Phase HF8** — IPMI capture (KCS sweep) and replay
-   (`--ipmi-extern` against `ipmi_sim`).
+7. **Phase HF7** — Redfish capture (HTTP walk) and replay. Capture
+   on the UEFI side via `mkfixture`. Replay lives in `axl-emulate`,
+   which spawns DMTF `Redfish-Mockup-Server` from the captured
+   `redfish/` tree and adds the appropriate `--hostfwd` arg to its
+   run-qemu.sh invocation. Validate against OpenBMC-in-QEMU as the
+   "real BMC" reference.
+8. **Phase HF8** — IPMI capture (KCS sweep) and replay. Replay
+   lives in `axl-emulate`, which spawns OpenIPMI `ipmi_sim` seeded
+   with captured replies and tells run-qemu.sh `--ipmi-extern
+   <socket>` to wire it.
 9. **Phase HF9** — Additional QEMU device-injection patches as
    future fixture artifacts demand (SMBIOS handle preservation,
    non-EEPROM SMBus sensors, TPM event log seeding refinements,

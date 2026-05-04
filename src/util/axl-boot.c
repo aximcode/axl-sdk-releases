@@ -20,51 +20,23 @@
 AXL_LOG_DOMAIN("boot");
 
 // ---------------------------------------------------------------------------
-// DevicePathToText / DevicePathFromText protocol bindings
+// DevicePathFromText protocol binding
+//
+// DevicePathToText is exposed publicly via axl_device_path_to_text();
+// the from-text direction is private to boot-option encoding and stays
+// inline here.
 // ---------------------------------------------------------------------------
 
 #pragma pack(push, 1)
-typedef struct {
-    unsigned short *(EFIAPI *ConvertDeviceNodeToText)(
-        const void *DeviceNode,
-        BOOLEAN     DisplayOnly,
-        BOOLEAN     AllowShortcuts);
-    unsigned short *(EFIAPI *ConvertDevicePathToText)(
-        const void *DevicePath,
-        BOOLEAN     DisplayOnly,
-        BOOLEAN     AllowShortcuts);
-} DevicePathToTextProtocol;
-
 typedef struct {
     void *(EFIAPI *ConvertTextToDeviceNode)(const unsigned short *Text);
     void *(EFIAPI *ConvertTextToDevicePath)(const unsigned short *Text);
 } DevicePathFromTextProtocol;
 #pragma pack(pop)
 
-static const AxlGuid DEVICE_PATH_TO_TEXT_GUID = AXL_GUID(
-    0x8b843e20, 0x8132, 0x4852,
-    0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c);
-
 static const AxlGuid DEVICE_PATH_FROM_TEXT_GUID = AXL_GUID(
     0x05c99a21, 0xc70f, 0x4ad2,
     0x8a, 0x5f, 0x35, 0xdf, 0x33, 0x43, 0xf5, 0x1e);
-
-static DevicePathToTextProtocol *
-get_to_text(
-    void
-    )
-{
-    static DevicePathToTextProtocol *cached;
-    if (cached != NULL) {
-        return cached;
-    }
-    void *p = NULL;
-    if (axl_bs()->LocateProtocol(
-            (EFI_GUID *)&DEVICE_PATH_TO_TEXT_GUID, NULL, &p) == EFI_SUCCESS) {
-        cached = (DevicePathToTextProtocol *)p;
-    }
-    return cached;
-}
 
 static DevicePathFromTextProtocol *
 get_from_text(
@@ -123,7 +95,7 @@ read_global_variable(
     if (buf == NULL) {
         return -1;
     }
-    if (axl_nvstore_get("global", key, buf, &needed) != 0) {
+    if (axl_nvstore_get("global", key, buf, &needed) != AXL_OK) {
         axl_free(buf);
         return -1;
     }
@@ -192,18 +164,7 @@ decode_load_option(
     out->description = axl_ucs2_to_utf8(desc_w);
 
     /* Device path: convert via DevicePathToText if the protocol is up. */
-    out->device_path = NULL;
-    if (fp_len > 0) {
-        DevicePathToTextProtocol *dptt = get_to_text();
-        if (dptt != NULL && dptt->ConvertDevicePathToText != NULL) {
-            unsigned short *text = dptt->ConvertDevicePathToText(
-                fp_bytes, FALSE, FALSE);
-            if (text != NULL) {
-                out->device_path = axl_ucs2_to_utf8(text);
-                axl_bs()->FreePool(text);
-            }
-        }
-    }
+    out->device_path = (fp_len > 0) ? axl_device_path_to_text(fp_bytes) : NULL;
 
     /* Opt data: copy verbatim. */
     out->opt_data     = NULL;
@@ -384,7 +345,7 @@ axl_boot_option_get(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     char name[9];
     format_boot_name(index, name);
@@ -392,7 +353,7 @@ axl_boot_option_get(
     void  *raw = NULL;
     size_t raw_len = 0;
     if (read_global_variable(name, &raw, &raw_len) != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     out->index         = index;
@@ -406,9 +367,9 @@ axl_boot_option_get(
     axl_free(raw);
     if (rc != 0) {
         axl_boot_option_free(out);
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -418,7 +379,7 @@ axl_boot_option_set(
     )
 {
     if (opt == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     char name[9];
     format_boot_name(index, name);
@@ -426,7 +387,7 @@ axl_boot_option_set(
     void  *encoded = NULL;
     size_t encoded_len = 0;
     if (encode_load_option(opt, &encoded, &encoded_len) != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     int rc = axl_nvstore_set(
@@ -457,20 +418,20 @@ axl_boot_order_get(
     )
 {
     if (out == NULL || count == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     void  *raw = NULL;
     size_t raw_len = 0;
     if (read_global_variable("BootOrder", &raw, &raw_len) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     if ((raw_len % 2) != 0) {
         axl_free(raw);
-        return -1;
+        return AXL_ERR;
     }
     *out   = (uint16_t *)raw;     /* aligned: malloc returns 16-byte aligned */
     *count = raw_len / 2;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -497,16 +458,16 @@ axl_boot_next_get(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     size_t sz = sizeof(uint16_t);
-    if (axl_nvstore_get("global", "BootNext", out, &sz) != 0) {
-        return -1;
+    if (axl_nvstore_get("global", "BootNext", out, &sz) != AXL_OK) {
+        return AXL_ERR;
     }
     if (sz != sizeof(uint16_t)) {
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -533,14 +494,14 @@ axl_boot_current_get(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     size_t sz = sizeof(uint16_t);
-    if (axl_nvstore_get("global", "BootCurrent", out, &sz) != 0) {
-        return -1;
+    if (axl_nvstore_get("global", "BootCurrent", out, &sz) != AXL_OK) {
+        return AXL_ERR;
     }
     if (sz != sizeof(uint16_t)) {
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }

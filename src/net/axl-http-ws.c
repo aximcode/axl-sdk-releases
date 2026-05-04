@@ -18,12 +18,12 @@ axl_http_server_add_websocket(AxlHttpServer *s, const char *path,
                               AxlWsHandler handler, void *data)
 {
     if (s == NULL || path == NULL || handler == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (s->ws_route_count >= 8) {
         axl_warning("too many WebSocket routes (max 8)");
-        return -1;
+        return AXL_ERR;
     }
 
     size_t idx = s->ws_route_count;
@@ -32,7 +32,7 @@ axl_http_server_add_websocket(AxlHttpServer *s, const char *path,
     s->ws_routes[idx].data = data;
     s->ws_route_count++;
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ axl_http_server_add_websocket(AxlHttpServer *s, const char *path,
 // ---------------------------------------------------------------------------
 
 static bool
-on_ws_send_done(AxlTcp *sock, int status, void *data)
+on_ws_send_done(AxlTcp *sock, AxlStatus status, void *data)
 {
     (void)sock;
     (void)status;
@@ -57,11 +57,11 @@ axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
     size_t   frame_buf_size;
 
     if (s == NULL || path == NULL || bcast_data == NULL || size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (s->conns == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Build the frame once, send to all matching clients */
@@ -69,14 +69,14 @@ axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
     frame = axl_malloc(frame_buf_size);
     if (frame == NULL) {
         axl_error("ws broadcast frame alloc failed: %zu bytes", frame_buf_size);
-        return -1;
+        return AXL_ERR;
     }
 
     frame_len = ws_build_frame(WS_OP_TEXT, bcast_data, size,
                                frame, frame_buf_size);
     if (frame_len == 0) {
         axl_free(frame);
-        return -1;
+        return AXL_ERR;
     }
 
     for (size_t i = 0; i < s->max_conns; i++) {
@@ -101,14 +101,14 @@ axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
             }
             if (axl_tcp_send_async(conn->sock, copy, frame_len,
                                    s->loop, NULL,
-                                   on_ws_send_done, copy) != 0) {
+                                   on_ws_send_done, copy) != AXL_OK) {
                 axl_free(copy);
             }
         }
     }
 
     axl_free(frame);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

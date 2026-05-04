@@ -107,7 +107,7 @@ axl_smbus_transport(
  *                 success (clamped to capacity if the device returned
  *                 more than requested).
  *
- * @return 0 on success, -1 on transport error or invalid arguments.
+ * @return AXL_OK on success, AXL_ERR on transport error or invalid arguments.
  */
 int
 axl_smbus_read_block(
@@ -131,7 +131,7 @@ axl_smbus_read_block(
  * @param buf      payload bytes.
  * @param len      payload length; must not exceed @c AXL_SMBUS_BLOCK_MAX.
  *
- * @return 0 on success, -1 on transport error or invalid arguments.
+ * @return AXL_OK on success, AXL_ERR on transport error or invalid arguments.
  */
 int
 axl_smbus_write_block(
@@ -161,7 +161,7 @@ axl_smbus_write_block(
  * @param command  SMBus command byte (register/offset).
  * @param out      (out) receives the data byte.
  *
- * @return 0 on success, -1 on transport error or invalid arguments.
+ * @return AXL_OK on success, AXL_ERR on transport error or invalid arguments.
  */
 int
 axl_smbus_read_byte(
@@ -183,7 +183,7 @@ axl_smbus_read_byte(
  * @param command  SMBus command byte (register/offset).
  * @param value    data byte to write.
  *
- * @return 0 on success, -1 on transport error or invalid arguments.
+ * @return AXL_OK on success, AXL_ERR on transport error or invalid arguments.
  */
 int
 axl_smbus_write_byte(

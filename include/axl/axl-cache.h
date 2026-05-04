@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,7 +41,7 @@ axl_cache_new(
  * exists, the entry is refreshed. If the cache is full, the oldest
  * (LRU) entry is evicted.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_cache_put(
@@ -55,7 +56,7 @@ axl_cache_put(
  * Copies the cached value into @p value if found and not expired.
  * Expired entries are treated as misses and invalidated.
  *
- * @return 0 on hit, -1 on miss or error.
+ * @return AXL_OK on hit, AXL_ERR on miss or error.
  */
 int
 axl_cache_get(

@@ -74,7 +74,7 @@ on_accept_complete(void *data)
            pointing at stale callback data and leaking the acc event
            on close(). */
         axl_tcp_accept_drop_sources(listener);
-        (void)cb(NULL, -1, cb_data);  /* fundamental accept failure — tearing down regardless */
+        (void)cb(NULL, AXL_ERR, cb_data);  /* fundamental accept failure — tearing down regardless */
         return AXL_SOURCE_REMOVE;
     }
 
@@ -92,7 +92,7 @@ on_accept_complete(void *data)
            for the next connection and tearing down the UEFI token
            here would double-free if the user closed the listener in
            response. Match pre-bool behavior for these paths. */
-        (void)cb(NULL, -1, cb_data);
+        (void)cb(NULL, AXL_ERR, cb_data);
         goto rearm;
     }
 
@@ -101,7 +101,7 @@ on_accept_complete(void *data)
         axl_efi_call(new_tcp4->Configure, 2, new_tcp4, NULL);
         axl_efi_call(listener->tcp_sb->DestroyChild, 2, listener->tcp_sb, new_handle);
         /* Same reasoning as above — treat as transient. */
-        (void)cb(NULL, -1, cb_data);
+        (void)cb(NULL, AXL_ERR, cb_data);
         goto rearm;
     }
 
@@ -122,7 +122,7 @@ on_accept_complete(void *data)
     //                     listener; we only touch the saved source
     //                     IDs below, never listener.
     //
-    if (!cb(sock, 0, cb_data)) {
+    if (!cb(sock, AXL_OK, cb_data)) {
         if (saved_accept_src > 0) {
             axl_loop_remove_source(saved_loop, saved_accept_src);
         }
@@ -201,7 +201,7 @@ axl_tcp_accept_async(
     EFI_EVENT   acc_event;
 
     if (listener == NULL || loop == NULL || cb == NULL || !listener->is_listener) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -231,9 +231,9 @@ axl_tcp_accept_async(
     //
     if (listener->acc_token.CompletionToken.Event == NULL) {
         acc_event = NULL;
-        if (axl_backend_event_create((AxlEventHandle *)&acc_event) != 0) {
+        if (axl_backend_event_create((AxlEventHandle *)&acc_event) != AXL_OK) {
             axl_error("async accept: cannot create event");
-            return -1;
+            return AXL_ERR;
         }
 
         listener->acc_token.CompletionToken.Event = acc_event;
@@ -249,7 +249,7 @@ axl_tcp_accept_async(
         axl_backend_event_close(
             (AxlEventHandle)listener->acc_token.CompletionToken.Event);
         listener->acc_token.CompletionToken.Event = NULL;
-        return -1;
+        return AXL_ERR;
     }
 
     listener->accept_source = axl_loop_add_event(
@@ -265,7 +265,7 @@ axl_tcp_accept_async(
         axl_backend_event_close(
             (AxlEventHandle)listener->acc_token.CompletionToken.Event);
         listener->acc_token.CompletionToken.Event = NULL;
-        return -1;
+        return AXL_ERR;
     }
 
     if (cancel != NULL) {
@@ -277,7 +277,7 @@ axl_tcp_accept_async(
             );
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---- recv async ------------------------------------------------------------
@@ -289,7 +289,7 @@ on_recv_complete(void *data)
     EFI_STATUS      status;
     AxlTcpCallback  cb;
     void           *cb_data;
-    int             cb_status;
+    AxlStatus       cb_status;
     bool            keep;
     /* Snapshot IDs so we can drop the loop sources without reading
        sock fields after cb — if cb returns false, it may have called
@@ -304,10 +304,10 @@ on_recv_complete(void *data)
     status = sock->rx_token.CompletionToken.Status;
     if (EFI_ERROR(status)) {
         sock->recv_size = 0;
-        cb_status = -1;
+        cb_status = AXL_ERR;
     } else {
         sock->recv_size = (size_t)sock->rx_data.DataLength;
-        cb_status = 0;
+        cb_status = AXL_OK;
     }
 
     cb = sock->on_recv;
@@ -323,13 +323,13 @@ on_recv_complete(void *data)
     //   - Return false => cb may have called axl_tcp_close; we only
     //                     touch the saved source IDs below, never sock.
     //
-    // Only re-arm on cb_status == 0. Errors (-1) and AXL_CANCELLED
+    // Only re-arm on cb_status == AXL_OK. Errors (-1) and AXL_CANCELLED
     // never re-arm regardless of cb return — the UEFI recv op is
     // already torn down on those paths.
     //
     keep = cb(sock, cb_status, cb_data);
 
-    if (!keep || cb_status != 0) {
+    if (!keep || cb_status != AXL_OK) {
         /* sock may be freed — only touch saved IDs. If cb called
            axl_tcp_close, axl_tcp_close has already removed the source
            via sock->recv_source; axl_loop_remove_source on a
@@ -428,7 +428,7 @@ axl_tcp_recv_async(
     EFI_EVENT   rx_event;
 
     if (sock == NULL || buf == NULL || size == 0 || loop == NULL || cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -463,9 +463,9 @@ axl_tcp_recv_async(
     }
     if (sock->rx_token.CompletionToken.Event == NULL) {
         rx_event = NULL;
-        if (axl_backend_event_create((AxlEventHandle *)&rx_event) != 0) {
+        if (axl_backend_event_create((AxlEventHandle *)&rx_event) != AXL_OK) {
             axl_error("async recv: cannot create event");
-            return -1;
+            return AXL_ERR;
         }
 
         sock->rx_token.CompletionToken.Event = rx_event;
@@ -519,7 +519,7 @@ axl_tcp_recv_async(
            recv_async on this sock doesn't fire a stale completion.
            CheckEvent consumes the signaled bit when set. */
         axl_backend_event_check(sock->rx_token.CompletionToken.Event);
-        return -1;
+        return AXL_ERR;
     }
 
     if (cancel != NULL) {
@@ -545,7 +545,7 @@ axl_tcp_recv_async(
             (AxlEventHandle)sock->rx_token.CompletionToken.Event);
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---- send async ------------------------------------------------------------
@@ -557,16 +557,16 @@ on_send_complete(void *data)
     EFI_STATUS      status;
     AxlTcpCallback  cb;
     void           *cb_data;
-    int             cb_status;
+    AxlStatus       cb_status;
 
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
     status = sock->tx_token.CompletionToken.Status;
     if (EFI_ERROR(status)) {
         axl_error("async send failed: %llx", (unsigned long long)status);
-        cb_status = -1;
+        cb_status = AXL_ERR;
     } else {
-        cb_status = 0;
+        cb_status = AXL_OK;
     }
 
     //
@@ -628,7 +628,7 @@ axl_tcp_send_async(
     EFI_EVENT   tx_event;
 
     if (sock == NULL || buf == NULL || size == 0 || loop == NULL || cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -642,7 +642,7 @@ axl_tcp_send_async(
     //
     if (sock->send_source > 0) {
         axl_error("async send: previous send still pending — cancel first");
-        return -1;
+        return AXL_ERR;
     }
 
     sock->on_send    = cb;
@@ -654,9 +654,9 @@ axl_tcp_send_async(
     //
     if (sock->tx_token.CompletionToken.Event == NULL) {
         tx_event = NULL;
-        if (axl_backend_event_create((AxlEventHandle *)&tx_event) != 0) {
+        if (axl_backend_event_create((AxlEventHandle *)&tx_event) != AXL_OK) {
             axl_error("async send: cannot create event");
-            return -1;
+            return AXL_ERR;
         }
 
         sock->tx_token.CompletionToken.Event = tx_event;
@@ -685,7 +685,7 @@ axl_tcp_send_async(
     status = axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
     if (EFI_ERROR(status)) {
         axl_debug("async Transmit: %llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     sock->send_source = axl_loop_add_event(
@@ -698,7 +698,7 @@ axl_tcp_send_async(
         axl_error("async send: cannot register event with loop");
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->tx_token.CompletionToken);
-        return -1;
+        return AXL_ERR;
     }
 
     if (cancel != NULL) {
@@ -710,7 +710,7 @@ axl_tcp_send_async(
             );
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---- connect async ---------------------------------------------------------
@@ -763,7 +763,7 @@ on_connect_complete(void *data)
            async_loop here makes the close finalize inline. */
         sock->async_loop = NULL;
         axl_tcp_close(sock);
-        (void)cb(NULL, -1, udata);  /* connect is one-shot; return value ignored */
+        (void)cb(NULL, AXL_ERR, udata);  /* connect is one-shot; return value ignored */
         return AXL_SOURCE_REMOVE;
     }
 
@@ -821,15 +821,15 @@ axl_tcp_connect_async(
     AxlTcp                       *sock;
 
     if (host == NULL || loop == NULL || cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
     // Resolve host to IP address
     //
-    if (axl_net_resolve(host, &remote_addr) != 0) {
+    if (axl_net_resolve(host, &remote_addr) != AXL_OK) {
         axl_error("async connect: cannot resolve '%s'", host);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -838,7 +838,7 @@ axl_tcp_connect_async(
     status = tcp_find_service_binding(&sb, &sb_handle);
     if (EFI_ERROR(status)) {
         axl_error("async connect: no TCP4 service binding");
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -847,7 +847,7 @@ axl_tcp_connect_async(
     status = tcp_create_child(sb, &child_handle, &tcp4);
     if (EFI_ERROR(status)) {
         axl_error("async connect CreateChild: %llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -897,7 +897,7 @@ axl_tcp_connect_async(
     if (EFI_ERROR(status)) {
         axl_error("async connect Configure: %llx", (unsigned long long)status);
         axl_efi_call(sb->DestroyChild, 2, sb, child_handle);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -907,7 +907,7 @@ axl_tcp_connect_async(
     if (sock == NULL) {
         axl_efi_call(tcp4->Configure, 2, tcp4, NULL);
         axl_efi_call(sb->DestroyChild, 2, sb, child_handle);
-        return -1;
+        return AXL_ERR;
     }
 
     sock->tcp4         = tcp4;
@@ -923,10 +923,10 @@ axl_tcp_connect_async(
     // Create connect event
     //
     conn_event = NULL;
-    if (axl_backend_event_create((AxlEventHandle *)&conn_event) != 0) {
+    if (axl_backend_event_create((AxlEventHandle *)&conn_event) != AXL_OK) {
         axl_error("async connect: cannot create event");
         axl_tcp_close(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     sock->conn_token.CompletionToken.Event  = conn_event;
@@ -936,7 +936,7 @@ axl_tcp_connect_async(
     if (EFI_ERROR(status)) {
         axl_error("async Connect: %llx", (unsigned long long)status);
         axl_tcp_close(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     sock->connect_source = axl_loop_add_event(
@@ -949,7 +949,7 @@ axl_tcp_connect_async(
         axl_error("async connect: cannot register event with loop");
         axl_efi_call(tcp4->Cancel, 2, tcp4, &sock->conn_token.CompletionToken);
         axl_tcp_close(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     if (cancel != NULL) {
@@ -962,5 +962,5 @@ axl_tcp_connect_async(
         /* Non-fatal if this fails — op runs uncancellable. */
     }
 
-    return 0;
+    return AXL_OK;
 }

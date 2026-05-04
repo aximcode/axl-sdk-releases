@@ -67,7 +67,7 @@ find_udp_service_binding(
         sock->sb_handle, &proto_guid, (void **)&sock->sb,
         gImageHandle, NULL, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL);
 
-    return (status == 0) ? 0 : -1;
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }
 
 static int
@@ -106,25 +106,25 @@ axl_udp_open(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = NULL;
 
     AxlUdpSocket *sock = axl_new(AxlUdpSocket);
     if (sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (find_udp_service_binding(sock) != 0) {
         axl_warning("no UDP4 service binding found");
         axl_free(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     if (create_udp_child(sock) != 0) {
         axl_warning("failed to create UDP4 child");
         axl_free(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Configure — use DHCP-assigned IP, specified local port */
@@ -152,12 +152,12 @@ axl_udp_open(
                                 gImageHandle, sock->udp_handle);
         sock->sb->DestroyChild(sock->sb, sock->udp_handle);
         axl_free(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     axl_debug("opened (port=%u)", (unsigned)local_port);
     *out = sock;
-    return 0;
+    return AXL_OK;
 }
 
 void
@@ -198,7 +198,7 @@ axl_udp_send(
     )
 {
     if (sock == NULL || sock->udp4 == NULL || data == NULL || len == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_UDP4_SESSION_DATA session;
@@ -221,7 +221,7 @@ axl_udp_send(
     EFI_EVENT event = NULL;
     EFI_STATUS status = axl_bs()->CreateEvent(0, 0, NULL, NULL, &event);
     if (status != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_UDP4_COMPLETION_TOKEN token;
@@ -233,16 +233,16 @@ axl_udp_send(
     status = axl_efi_call(sock->udp4->Transmit, 2, sock->udp4, &token);
     if (status != 0) {
         axl_bs()->CloseEvent(event);
-        return -1;
+        return AXL_ERR;
     }
 
     if (_axl_udp_wait(sock->udp4, event, UDP_SEND_TIMEOUT_US) != 0) {
         axl_efi_call(sock->udp4->Cancel, 2, sock->udp4, &token);
         axl_bs()->CloseEvent(event);
-        return -1;
+        return AXL_ERR;
     }
 
-    int rc = (token.Status == 0) ? 0 : -1;
+    int rc = (token.Status == 0) ? AXL_OK : AXL_ERR;
     axl_bs()->CloseEvent(event);
     return rc;
 }
@@ -267,22 +267,22 @@ axl_udp_sendrecv(
     if (sock == NULL || sock->udp4 == NULL ||
         tx_data == NULL || tx_len == 0 ||
         rx_buf == NULL || rx_size == 0 || rx_len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *rx_len = 0;
 
     /* --- Transmit phase --- */
     int rc = axl_udp_send(sock, dest, port, tx_data, tx_len);
-    if (rc != 0) {
-        return -1;
+    if (rc != AXL_OK) {
+        return AXL_ERR;
     }
 
     /* --- Receive phase --- */
     EFI_EVENT rx_event = NULL;
     EFI_STATUS status = axl_bs()->CreateEvent(0, 0, NULL, NULL, &rx_event);
     if (status != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_UDP4_COMPLETION_TOKEN rx_token;
@@ -294,18 +294,18 @@ axl_udp_sendrecv(
     status = axl_efi_call(sock->udp4->Receive, 2, sock->udp4, &rx_token);
     if (status != 0) {
         axl_bs()->CloseEvent(rx_event);
-        return -1;
+        return AXL_ERR;
     }
 
     if (_axl_udp_wait(sock->udp4, rx_event, timeout_ms * 1000) != 0) {
         axl_efi_call(sock->udp4->Cancel, 2, sock->udp4, &rx_token);
         axl_bs()->CloseEvent(rx_event);
-        return -1;
+        return AXL_ERR;
     }
 
     if (rx_token.Status != 0 || rx_token.Packet.RxData == NULL) {
         axl_bs()->CloseEvent(rx_event);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Copy fragment data to caller's buffer */
@@ -329,7 +329,7 @@ axl_udp_sendrecv(
     /* Return buffer to firmware */
     axl_bs()->SignalEvent(rx->RecycleSignal);
     axl_bs()->CloseEvent(rx_event);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,19 +429,19 @@ axl_udp_recv_start(
     )
 {
     if (sock == NULL || sock->udp4 == NULL || loop == NULL || cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (sock->loop != NULL) {
         axl_warning("recv already started");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Create event for receive signaling */
     EFI_STATUS status = axl_bs()->CreateEvent(0, 0, NULL, NULL,
                                               &sock->rx_event);
     if (status != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     sock->loop         = loop;
@@ -459,13 +459,13 @@ axl_udp_recv_start(
         axl_bs()->CloseEvent(sock->rx_event);
         sock->rx_event = NULL;
         sock->loop = NULL;
-        return -1;
+        return AXL_ERR;
     }
 
     sock->loop_source = axl_loop_add_event(
         loop, sock->rx_event, on_udp_recv_event, sock);
 
-    return 0;
+    return AXL_OK;
 }
 
 void

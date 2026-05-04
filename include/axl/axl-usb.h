@@ -42,6 +42,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #include <axl/axl-sidecar.h>
 
@@ -115,7 +116,7 @@ axl_usb_next(
  * — the per-interface granularity of `AxlUsbAddr` does not change the
  * descriptor that backs this call.
  *
- * @return 0 on success (both fields populated), -1 if @p addr is not
+ * @return AXL_OK on success (both fields populated), AXL_ERR if @p addr is not
  *     a known interface or the firmware fails the descriptor read.
  */
 int
@@ -138,7 +139,7 @@ axl_usb_get_vid_pid(
  * Out parameters may be individually NULL if the caller doesn't need
  * that field.
  *
- * @return 0 on success, -1 if @p addr is not a known interface or the
+ * @return AXL_OK on success, AXL_ERR if @p addr is not a known interface or the
  *     firmware fails the descriptor read.
  */
 int
@@ -388,7 +389,7 @@ axl_usb_tree_for_each(
  * has no subsystem dimension that motivated PCI's v1→v2 split, so
  * there's no flat-vs-hierarchical schema dispatch.
  *
- * @code{.json}
+ * @code{.js}
  * { schema: 1,
  *   vendors: [
  *     { id: 0x046D, name: 'Logitech, Inc.',

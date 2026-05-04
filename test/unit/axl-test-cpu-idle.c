@@ -40,8 +40,8 @@ test_cpu_idle_main(int argc, char **argv)
     axl_printf("cpu-idle: start %u x %ums waits\n", NAP_COUNT, NAP_MS);
 
     for (unsigned int i = 0; i < NAP_COUNT; i++) {
-        int rc = axl_wait_ms(NULL, NAP_MS);
-        if (rc != 0) {
+        AxlStatus rc = axl_wait_ms(NULL, NAP_MS);
+        if (rc != AXL_OK) {
             axl_printf("cpu-idle: unexpected rc=%d on nap %u\n", rc, i);
             return 1;
         }

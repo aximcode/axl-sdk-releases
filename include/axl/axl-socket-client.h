@@ -24,6 +24,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,7 +75,7 @@ axl_socket_client_set_timeout(
  *
  * Creates a new AxlSocket, connects to @p addr, and returns it.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_socket_client_connect(
@@ -91,7 +92,7 @@ axl_socket_client_connect(
  * available via axl_socket_get_remote_address() on the returned
  * socket.
  *
- * @return 0 on success, -1 on DNS or connect failure.
+ * @return AXL_OK on success, AXL_ERR on DNS or connect failure.
  */
 int
 axl_socket_client_connect_to_host(

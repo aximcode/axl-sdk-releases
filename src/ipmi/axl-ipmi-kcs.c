@@ -309,7 +309,7 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
                   uint16_t             cmd_port)
 {
     if (ops == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -317,8 +317,8 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
     // on AArch64 without committing to the whole FSM.
     //
     uint8_t probe;
-    if (axl_backend_io_read8(cmd_port, &probe) != 0) {
-        return -1;
+    if (axl_backend_io_read8(cmd_port, &probe) != AXL_OK) {
+        return AXL_ERR;
     }
 
     //
@@ -333,12 +333,12 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
     // failing — a 6 s hang on every misadvertised SMBIOS Type 38.
     //
     if (probe == 0xFF) {
-        return -1;
+        return AXL_ERR;
     }
 
     KcsCtx *k = axl_malloc(sizeof(KcsCtx));
     if (k == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     k->data_port = data_port;
     k->cmd_port  = cmd_port;
@@ -350,5 +350,5 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
 
     axl_info("IPMI KCS transport ready (data=0x%x, cmd=0x%x)",
              (unsigned)data_port, (unsigned)cmd_port);
-    return 0;
+    return AXL_OK;
 }

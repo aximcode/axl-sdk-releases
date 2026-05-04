@@ -96,7 +96,7 @@ on_wait_tick(void *data)
 // Internal primitive (shared by AxlEvent / axl_wait_* / Tier 4)
 // ---------------------------------------------------------------------------
 
-int
+AxlStatus
 _axl_event_wait_timeout_with_tick(
     AxlEventHandle  event,
     AxlCondFn       cond_fn,
@@ -127,13 +127,13 @@ _axl_event_wait_timeout_with_tick(
 
     /* Fast path: condition already holds. No loop, no allocation. */
     if (cond_fn != NULL && cond_fn(cond_ctx)) {
-        return 0;
+        return AXL_OK;
     }
 
     loop = axl_loop_new();
     if (loop == NULL) {
         axl_error("failed to create wait loop");
-        return -1;
+        return AXL_ERR;
     }
 
     w.loop = loop;
@@ -204,7 +204,7 @@ _axl_event_wait_timeout_with_tick(
     axl_loop_free(loop);
 
     if (w.condition_met) {
-        return 0;
+        return AXL_OK;
     }
     if (w.cancelled) {
         return AXL_CANCELLED;
@@ -212,7 +212,7 @@ _axl_event_wait_timeout_with_tick(
     if (rc == -1 && !w.timed_out) {
         return AXL_CANCELLED;  /* Ctrl-C / shell break */
     }
-    return -1;
+    return AXL_TIMEOUT;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ flag_cond(void *ctx)
     return *flag;
 }
 
-int
+AxlStatus
 axl_wait_for_flag(
     volatile const bool *flag,
     AxlCancellable      *cancel,
@@ -266,7 +266,7 @@ axl_wait_for_flag(
     )
 {
     if (flag == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(NULL, flag_cond, (void *)flag,
                                              NULL, NULL, 0,
@@ -285,7 +285,7 @@ word_cond(void *ctx)
     return *c->word != c->not_ready_value;
 }
 
-int
+AxlStatus
 axl_wait_for_word(
     volatile const uint64_t *word,
     uint64_t                 not_ready_value,
@@ -296,7 +296,7 @@ axl_wait_for_word(
     WordCondCtx ctx;
 
     if (word == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx.word = word;
@@ -306,16 +306,16 @@ axl_wait_for_word(
                                              cancel, timeout_us);
 }
 
-int
+AxlStatus
 axl_wait_ms(
     AxlCancellable *cancel,
     uint64_t        ms
     )
 {
-    int rc;
+    AxlStatus rc;
 
     if (ms == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     rc = _axl_event_wait_timeout_with_tick(NULL, NULL, NULL,
@@ -323,16 +323,16 @@ axl_wait_ms(
                                            cancel, ms * 1000);
     /* Pure sleep has no condition or event, so the timeout firing IS
        the success case. The primitive can't tell sleep apart from a
-       failed-to-satisfy wait, so map -1 → 0 here. AXL_CANCELLED
-       propagates through unchanged. */
-    return (rc == -1) ? 0 : rc;
+       failed-to-satisfy wait, so map AXL_TIMEOUT → AXL_OK here.
+       AXL_CANCELLED propagates through unchanged. */
+    return (rc == AXL_TIMEOUT) ? AXL_OK : rc;
 }
 
 // ---------------------------------------------------------------------------
 // Tier 3 — callback form
 // ---------------------------------------------------------------------------
 
-int
+AxlStatus
 axl_wait_for(
     AxlCondFn       cond_fn,
     void           *cond_ctx,
@@ -341,14 +341,14 @@ axl_wait_for(
     )
 {
     if (cond_fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(NULL, cond_fn, cond_ctx,
                                              NULL, NULL, 0,
                                              cancel, timeout_us);
 }
 
-int
+AxlStatus
 axl_wait_for_with_tick(
     AxlCondFn       cond_fn,
     void           *cond_ctx,
@@ -360,7 +360,7 @@ axl_wait_for_with_tick(
     )
 {
     if (cond_fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(NULL, cond_fn, cond_ctx,
                                              tick_fn, tick_ctx, tick_us,

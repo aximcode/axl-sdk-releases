@@ -134,7 +134,7 @@ static int
 cmd_mc_reset(AxlIpmiSession *ipmi, const char *mode)
 {
     if (axl_strcmp(mode, "cold") == 0) {
-        if (axl_ipmi_bmc_cold_reset(ipmi) != 0) {
+        if (axl_ipmi_bmc_cold_reset(ipmi) != AXL_OK) {
             axl_printf("BMC Cold Reset failed\n");
             return 1;
         }
@@ -142,7 +142,7 @@ cmd_mc_reset(AxlIpmiSession *ipmi, const char *mode)
         return 0;
     }
     if (axl_strcmp(mode, "warm") == 0) {
-        if (axl_ipmi_bmc_warm_reset(ipmi) != 0) {
+        if (axl_ipmi_bmc_warm_reset(ipmi) != AXL_OK) {
             axl_printf("BMC Warm Reset failed (not all BMCs implement this).\n");
             return 1;
         }
@@ -307,7 +307,7 @@ cmd_sdr_list(AxlIpmiSession *ipmi)
     for (unsigned i = 0; i < info.record_count && id != 0xFFFF; i++) {
         uint8_t  rec[64];
         size_t   len = sizeof(rec);
-        if (axl_ipmi_sdr_get(ipmi, id, &next, rec, &len) != 0) {
+        if (axl_ipmi_sdr_get(ipmi, id, &next, rec, &len) != AXL_OK) {
             axl_printf("Get SDR %u failed\n", (unsigned)id);
             return 1;
         }
@@ -348,7 +348,7 @@ cmd_sensor(AxlIpmiSession *ipmi)
     for (unsigned i = 0; i < info.record_count && id != 0xFFFF; i++) {
         uint8_t  rec[64];
         size_t   len = sizeof(rec);
-        if (axl_ipmi_sdr_get(ipmi, id, &next, rec, &len) != 0) {
+        if (axl_ipmi_sdr_get(ipmi, id, &next, rec, &len) != AXL_OK) {
             return 1;
         }
         //
@@ -413,7 +413,7 @@ cmd_fru_list(AxlIpmiSession *ipmi)
     while (remain > 0) {
         uint8_t  buf[16];
         size_t   want = (remain < sizeof(buf)) ? remain : sizeof(buf);
-        if (axl_ipmi_fru_read(ipmi, 0, offset, buf, &want) != 0) {
+        if (axl_ipmi_fru_read(ipmi, 0, offset, buf, &want) != AXL_OK) {
             break;
         }
         axl_printf("%04x:", (unsigned)offset);
@@ -487,7 +487,7 @@ cmd_raw(AxlIpmiSession *ipmi, int count, const char *const *args)
     size_t   resp_len = sizeof(resp);
     if (axl_ipmi_raw(ipmi, netfn, cmd,
                      req_len ? req : NULL, req_len,
-                     resp, &resp_len) != 0)
+                     resp, &resp_len) != AXL_OK)
     {
         axl_printf("ipmi raw: transport error\n");
         return 1;

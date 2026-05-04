@@ -139,7 +139,7 @@ parse_classes(
             target = db->bases;
             key    = base_key(base);
         }
-        if (axl_hash_table_insert(target, key, name_owned) < 0) {
+        if (axl_hash_table_insert(target, key, name_owned) == AXL_HASH_TABLE_ERR) {
             axl_free(name_owned);
         }
     }

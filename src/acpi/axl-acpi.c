@@ -289,10 +289,10 @@ axl_acpi_revision(
     )
 {
     if (rev == NULL || ensure_rsdp() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *rev = cached_revision;
-    return 0;
+    return AXL_OK;
 }
 
 bool
@@ -333,15 +333,15 @@ axl_acpi_read_mcfg(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlAcpiHeader *h = axl_acpi_find("MCFG");
     if (h == NULL || h->length < MCFG_HEADER_AND_RESERVED) {
-        return -1;
+        return AXL_ERR;
     }
     if (!axl_acpi_checksum_ok(h)) {
         axl_warning("MCFG checksum invalid");
-        return -1;
+        return AXL_ERR;
     }
 
     out->count = 0;
@@ -356,7 +356,7 @@ axl_acpi_read_mcfg(
         out->segments[out->count].end_bus   = entries[i].end_bus;
         out->count++;
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,15 +397,15 @@ axl_acpi_read_madt(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlAcpiHeader *h = axl_acpi_find("APIC");  /* MADT signature is 'APIC' */
     if (h == NULL || h->length < ACPI_HEADER_SIZE + 8u) {
-        return -1;
+        return AXL_ERR;
     }
     if (!axl_acpi_checksum_ok(h)) {
         axl_warning("MADT checksum invalid");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Zero output, then fill */
@@ -467,7 +467,7 @@ axl_acpi_read_madt(
 
         p += sh->length;
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,15 +544,15 @@ axl_acpi_read_facp(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlAcpiHeader *h = axl_acpi_find("FACP");
     if (h == NULL || h->length < FADT_MIN_LEN_LEGACY) {
-        return -1;
+        return AXL_ERR;
     }
     if (!axl_acpi_checksum_ok(h)) {
         axl_warning("FACP checksum invalid");
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memset(out, 0, sizeof(*out));
@@ -585,5 +585,5 @@ axl_acpi_read_facp(
         out->x_firmware_ctrl = read_u64(p, FADT_OFF_X_FIRMWARE_CTRL);
         out->x_dsdt          = read_u64(p, FADT_OFF_X_DSDT);
     }
-    return 0;
+    return AXL_OK;
 }

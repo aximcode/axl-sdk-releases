@@ -45,18 +45,18 @@ test_file(void)
     // Stat
     AxlFileInfo fi;
     rc = axl_file_info("axl-test-util.tmp", &fi);
-    test_check(rc == 0, "stat: returns 0");
+    test_check(rc == AXL_OK, "stat: returns AXL_OK");
     test_check(fi.size == sizeof(test_data) - 1, "stat: size matches");
     test_check(!fi.is_dir, "stat: not a dir");
 
     rc = axl_file_info("fs0:\\", &fi);
-    test_check(rc == 0, "stat: root dir returns 0");
+    test_check(rc == AXL_OK, "stat: root dir returns AXL_OK");
     test_check(fi.is_dir, "stat: root is dir");
 
-    test_check(axl_file_info("no-such-file-12345", &fi) != 0,
-        "stat: missing file returns -1");
-    test_check(axl_file_info(NULL, &fi) != 0,
-        "stat: NULL path returns -1");
+    test_check(axl_file_info("no-such-file-12345", &fi) != AXL_OK,
+        "stat: missing file returns AXL_ERR");
+    test_check(axl_file_info(NULL, &fi) != AXL_OK,
+        "stat: NULL path returns AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -90,18 +90,18 @@ test_seek_tell(void)
     pos = axl_ftell(s);
     test_check(pos == 4, "seek: tell after read 4 is 4");
 
-    test_check(axl_fseek(s, 0, AXL_SEEK_SET) == 0, "seek: seek SET 0");
+    test_check(axl_fseek(s, 0, AXL_SEEK_SET) == AXL_OK, "seek: seek SET 0");
     pos = axl_ftell(s);
     test_check(pos == 0, "seek: tell after seek SET 0");
 
     axl_fread(buf, 1, 2, s);
     test_check(buf[0] == 'A' && buf[1] == 'B', "seek: re-read after seek");
 
-    test_check(axl_fseek(s, -1, AXL_SEEK_END) == 0, "seek: seek END -1");
+    test_check(axl_fseek(s, -1, AXL_SEEK_END) == AXL_OK, "seek: seek END -1");
     axl_fread(buf, 1, 1, s);
     test_check(buf[0] == 'J', "seek: read last byte via END");
 
-    test_check(axl_fseek(s, -3, AXL_SEEK_CUR) == 0, "seek: seek CUR -3");
+    test_check(axl_fseek(s, -3, AXL_SEEK_CUR) == AXL_OK, "seek: seek CUR -3");
     axl_fread(buf, 1, 1, s);
     test_check(buf[0] == 'H', "seek: read via CUR");
 
@@ -146,8 +146,8 @@ test_file_delete(void)
     if (axl_file_set_contents("axl-del.tmp", "x", 1) != AXL_OK) {
         return;
     }
-    test_check(axl_file_delete("axl-del.tmp") == 0, "delete: returns 0");
-    test_check(axl_file_info("axl-del.tmp", &del_fi) != 0,
+    test_check(axl_file_delete("axl-del.tmp") == AXL_OK, "delete: returns AXL_OK");
+    test_check(axl_file_info("axl-del.tmp", &del_fi) != AXL_OK,
                "delete: file gone after delete");
 }
 
@@ -159,9 +159,9 @@ test_file_rename(void)
     if (axl_file_set_contents("axl-ren-old.tmp", "data", 4) != AXL_OK) {
         return;
     }
-    test_check(axl_file_rename("axl-ren-old.tmp", "axl-ren-new.tmp") == 0,
-               "rename: returns 0");
-    test_check(axl_file_info("axl-ren-new.tmp", &fi) == 0,
+    test_check(axl_file_rename("axl-ren-old.tmp", "axl-ren-new.tmp") == AXL_OK,
+               "rename: returns AXL_OK");
+    test_check(axl_file_info("axl-ren-new.tmp", &fi) == AXL_OK,
                "rename: new exists");
     test_check(fi.size == 4, "rename: size preserved");
 
@@ -172,9 +172,9 @@ test_file_rename(void)
 static void
 test_mkdir_rmdir(void)
 {
-    test_check(axl_dir_mkdir("axl-test-dir") == 0, "mkdir: returns 0");
+    test_check(axl_dir_mkdir("axl-test-dir") == AXL_OK, "mkdir: returns AXL_OK");
     test_check(axl_file_is_dir("axl-test-dir"), "mkdir: is dir");
-    test_check(axl_dir_rmdir("axl-test-dir") == 0, "rmdir: returns 0");
+    test_check(axl_dir_rmdir("axl-test-dir") == AXL_OK, "rmdir: returns AXL_OK");
     test_check(!axl_file_is_dir("axl-test-dir"), "rmdir: gone");
 }
 
@@ -342,25 +342,25 @@ test_smbios(void)
 
     // Typed BIOS info reader
     AxlSmbiosBiosInfo bi;
-    test_check(axl_smbios_read_bios_info(&bi) == 0, "smbios: read bios info");
+    test_check(axl_smbios_read_bios_info(&bi) == AXL_OK, "smbios: read bios info");
     test_check(bi.vendor != NULL && bi.vendor[0] != '\0', "smbios: bios vendor populated");
 
     // Typed System info reader + UUID byte-swap
     AxlSmbiosSystemInfo si;
-    test_check(axl_smbios_read_system_info(&si) == 0, "smbios: read system info");
+    test_check(axl_smbios_read_system_info(&si) == AXL_OK, "smbios: read system info");
     test_check(si.manufacturer != NULL, "smbios: system mfr populated");
 
     // System UUID getter: either returns 0 with valid bytes, or -1 cleanly
     uint8_t uuid[16];
     int uuid_rc = axl_smbios_get_system_uuid(uuid);
-    test_check(uuid_rc == 0 || uuid_rc == -1, "smbios: uuid getter returns 0 or -1");
+    test_check(uuid_rc == AXL_OK || uuid_rc == AXL_ERR, "smbios: uuid getter returns 0 or -1");
 
     // Processor reader: walk every Type 4 and read it
     size_t cpu_count = 0;
     AxlSmbiosHeader *ph = NULL;
     while ((ph = axl_smbios_find_next(AXL_SMBIOS_TYPE_PROCESSOR, ph)) != NULL) {
         AxlSmbiosProcessorInfo pi;
-        test_check(axl_smbios_read_processor(ph, &pi) == 0, "smbios: read processor");
+        test_check(axl_smbios_read_processor(ph, &pi) == AXL_OK, "smbios: read processor");
         test_check(pi.socket_designation != NULL, "smbios: processor socket populated");
         cpu_count++;
         if (cpu_count > 64) { break; }
@@ -371,7 +371,7 @@ test_smbios(void)
     AxlSmbiosHeader *mh = NULL;
     while ((mh = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE, mh)) != NULL) {
         AxlSmbiosMemoryDevice md;
-        test_check(axl_smbios_read_memory_device(mh, &md) == 0, "smbios: read memory device");
+        test_check(axl_smbios_read_memory_device(mh, &md) == AXL_OK, "smbios: read memory device");
         test_check(md.device_locator != NULL, "smbios: mem device locator populated");
         mem_count++;
         if (mem_count > 1024) { break; }
@@ -379,18 +379,18 @@ test_smbios(void)
 
     // Wrong-type guard: read_processor should refuse a non-Type-4 header
     AxlSmbiosProcessorInfo pi_bad;
-    test_check(axl_smbios_read_processor(bios, &pi_bad) == -1,
+    test_check(axl_smbios_read_processor(bios, &pi_bad) == AXL_ERR,
                "smbios: read_processor rejects Type 0 hdr");
-    test_check(axl_smbios_read_memory_device(bios, NULL) == -1,
+    test_check(axl_smbios_read_memory_device(bios, NULL) == AXL_ERR,
                "smbios: read_memory_device rejects NULL out");
 
     // Type 38 — IPMI Device Information. QEMU + IPMI SSIF test harness
     // publishes one; plain QEMU doesn't. Just verify the call shape.
     AxlSmbiosIpmiDeviceInfo ip;
     int ip_rc = axl_smbios_read_ipmi_device_info(&ip);
-    test_check(ip_rc == 0 || ip_rc == -1,
+    test_check(ip_rc == AXL_OK || ip_rc == AXL_ERR,
                "smbios: read_ipmi_device_info returns 0 or -1");
-    if (ip_rc == 0) {
+    if (ip_rc == AXL_OK) {
         test_check(ip.interface_type <= AXL_SMBIOS_IPMI_SSIF,
                    "smbios: ipmi interface type in known range");
         test_check(ip.spec_major <= 15 && ip.spec_minor <= 15,
@@ -404,7 +404,7 @@ test_smbios(void)
     size_t host_iface_count = 0;
     while ((ih = axl_smbios_find_next(AXL_SMBIOS_TYPE_MGMT_HOST_INTERFACE, ih)) != NULL) {
         AxlSmbiosHostInterface iface;
-        test_check(axl_smbios_read_host_interface(ih, &iface) == 0,
+        test_check(axl_smbios_read_host_interface(ih, &iface) == AXL_OK,
                    "smbios: read_host_interface on real Type 42");
         test_check(iface.protocol_count <= 8, "smbios: protocol_count within cap");
         host_iface_count++;
@@ -413,11 +413,11 @@ test_smbios(void)
     AxlSmbiosHeader *rf_hdr = NULL;
     AxlSmbiosHostInterface rf_iface;
     int rf_rc = axl_smbios_find_redfish_host_interface(&rf_hdr, &rf_iface);
-    test_check(rf_rc == 0 || rf_rc == -1, "smbios: redfish find returns 0 or -1");
+    test_check(rf_rc == AXL_OK || rf_rc == AXL_ERR, "smbios: redfish find returns 0 or -1");
 
     // Wrong-type guard for Type 42 reader
     AxlSmbiosHostInterface iface_bad;
-    test_check(axl_smbios_read_host_interface(bios, &iface_bad) == -1,
+    test_check(axl_smbios_read_host_interface(bios, &iface_bad) == AXL_ERR,
                "smbios: read_host_interface rejects Type 0 hdr");
 
     // ----- Reentrant copy_string_utf8 -----
@@ -453,7 +453,7 @@ test_smbios(void)
         AxlSmbiosHeader *ph2 = NULL;
         while ((ph2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_PORT_CONNECTOR, ph2)) != NULL) {
             AxlSmbiosPortConnector pc;
-            test_check(axl_smbios_read_port_connector(ph2, &pc) == 0,
+            test_check(axl_smbios_read_port_connector(ph2, &pc) == AXL_OK,
                        "smbios: read_port_connector on real Type 8");
             test_check(pc.internal_designator != NULL && pc.external_designator != NULL,
                        "smbios: port-connector designators populated");
@@ -461,7 +461,7 @@ test_smbios(void)
             if (pc_count > 64) { break; }
         }
         AxlSmbiosPortConnector pc_bad;
-        test_check(axl_smbios_read_port_connector(bios, &pc_bad) == -1,
+        test_check(axl_smbios_read_port_connector(bios, &pc_bad) == AXL_ERR,
                    "smbios: read_port_connector rejects Type 0 hdr");
     }
 
@@ -471,14 +471,14 @@ test_smbios(void)
         AxlSmbiosHeader *sh = NULL;
         while ((sh = axl_smbios_find_next(AXL_SMBIOS_TYPE_SYSTEM_SLOTS, sh)) != NULL) {
             AxlSmbiosSystemSlot sl;
-            test_check(axl_smbios_read_system_slot(sh, &sl) == 0,
+            test_check(axl_smbios_read_system_slot(sh, &sl) == AXL_OK,
                        "smbios: read_system_slot on real Type 9");
             test_check(sl.designation != NULL, "smbios: system-slot designation populated");
             sl_count++;
             if (sl_count > 64) { break; }
         }
         AxlSmbiosSystemSlot sl_bad;
-        test_check(axl_smbios_read_system_slot(bios, &sl_bad) == -1,
+        test_check(axl_smbios_read_system_slot(bios, &sl_bad) == AXL_ERR,
                    "smbios: read_system_slot rejects Type 0 hdr");
     }
 
@@ -487,7 +487,7 @@ test_smbios(void)
         AxlSmbiosHeader *oh = axl_smbios_find(AXL_SMBIOS_TYPE_OEM_STRINGS);
         if (oh != NULL) {
             AxlSmbiosOemStrings oem;
-            test_check(axl_smbios_read_oem_strings(oh, &oem) == 0,
+            test_check(axl_smbios_read_oem_strings(oh, &oem) == AXL_OK,
                        "smbios: read_oem_strings on real Type 11");
             test_check(oem.count <= 16, "smbios: oem strings count within cap");
             for (uint8_t i = 0; i < oem.count; i++) {
@@ -502,7 +502,7 @@ test_smbios(void)
                 char   buf[256];
                 size_t need = 0;
                 test_check(axl_smbios_get_oem_string(1, buf, sizeof(buf),
-                                                    &need) == 0,
+                                                    &need) == AXL_OK,
                            "smbios get_oem_string: index 1 succeeds");
                 test_check(axl_strcmp(buf, oem.strings[0]) == 0,
                            "smbios get_oem_string: index 1 matches read_oem_strings[0]");
@@ -527,7 +527,7 @@ test_smbios(void)
                     int rc = axl_smbios_get_oem_string(1, sentinel,
                                                        sizeof(sentinel),
                                                        &required_truncated);
-                    test_check(rc == -1,
+                    test_check(rc == AXL_ERR,
                                "smbios get_oem_string: too-small buf returns -1");
                     test_check(required_truncated == required_full,
                                "smbios get_oem_string: *required reports needed bytes (string + NUL)");
@@ -549,7 +549,7 @@ test_smbios(void)
                    implausible for OEM Strings but SKIP-balance it
                    defensively. */
                 if (actual_len > 0) {
-                    test_check(axl_smbios_get_oem_string(1, sentinel, 1, NULL) == -1,
+                    test_check(axl_smbios_get_oem_string(1, sentinel, 1, NULL) == AXL_ERR,
                                "smbios get_oem_string: NULL *required tolerated on truncation");
                 } else {
                     test_check(true,
@@ -561,16 +561,16 @@ test_smbios(void)
                realistic Type 11 string count (cap is 16/record). */
             char obuf[64];
             test_check(axl_smbios_get_oem_string(200, obuf, sizeof(obuf),
-                                                 NULL) == -1,
+                                                 NULL) == AXL_ERR,
                        "smbios get_oem_string: out-of-range index returns -1");
 
             /* NULL / zero-cap guards. */
-            test_check(axl_smbios_get_oem_string(1, NULL, 64, NULL) == -1,
+            test_check(axl_smbios_get_oem_string(1, NULL, 64, NULL) == AXL_ERR,
                        "smbios get_oem_string: NULL buf rejected");
-            test_check(axl_smbios_get_oem_string(1, obuf, 0, NULL) == -1,
+            test_check(axl_smbios_get_oem_string(1, obuf, 0, NULL) == AXL_ERR,
                        "smbios get_oem_string: zero buf_cap rejected");
             test_check(axl_smbios_get_oem_string(0, obuf, sizeof(obuf),
-                                                 NULL) == -1,
+                                                 NULL) == AXL_ERR,
                        "smbios get_oem_string: index 0 (invalid per spec) rejected");
         } else {
             /* No Type 11 record on this firmware: every get_oem_string
@@ -578,14 +578,14 @@ test_smbios(void)
                assertions (2 success + 4 truncation + 4 misc). */
             char buf[64];
             test_check(axl_smbios_get_oem_string(1, buf, sizeof(buf),
-                                                 NULL) == -1,
+                                                 NULL) == AXL_ERR,
                        "smbios get_oem_string: returns -1 with no Type 11");
             for (int i = 0; i < 9; i++) {
                 test_check(true, "smbios get_oem_string: SKIP balance");
             }
         }
         AxlSmbiosOemStrings oem_bad;
-        test_check(axl_smbios_read_oem_strings(bios, &oem_bad) == -1,
+        test_check(axl_smbios_read_oem_strings(bios, &oem_bad) == AXL_ERR,
                    "smbios: read_oem_strings rejects Type 0 hdr");
     }
 
@@ -594,13 +594,13 @@ test_smbios(void)
         AxlSmbiosHeader *ah = axl_smbios_find(AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY);
         if (ah != NULL) {
             AxlSmbiosPhysicalMemoryArray pma;
-            test_check(axl_smbios_read_physical_memory_array(ah, &pma) == 0,
+            test_check(axl_smbios_read_physical_memory_array(ah, &pma) == AXL_OK,
                        "smbios: read_physical_memory_array");
             test_check(pma.max_capacity_bytes > 0,
                        "smbios: pma max_capacity > 0");
         }
         AxlSmbiosPhysicalMemoryArray pma_bad;
-        test_check(axl_smbios_read_physical_memory_array(bios, &pma_bad) == -1,
+        test_check(axl_smbios_read_physical_memory_array(bios, &pma_bad) == AXL_ERR,
                    "smbios: read_physical_memory_array rejects Type 0 hdr");
         /* Enum alias: PHYSICAL_MEMORY_ARRAY == PHYSICAL_MEMORY == 16 */
         test_check(AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY == 16,
@@ -616,7 +616,7 @@ test_smbios(void)
         size_t mam_count = 0;
         while ((mh2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_ARRAY_MAP, mh2)) != NULL) {
             AxlSmbiosMemoryArrayMap mam;
-            test_check(axl_smbios_read_memory_array_map(mh2, &mam) == 0,
+            test_check(axl_smbios_read_memory_array_map(mh2, &mam) == AXL_OK,
                        "smbios: read_memory_array_map on real Type 19");
             test_check(mam.ending_address >= mam.starting_address,
                        "smbios: type 19 end >= start");
@@ -624,7 +624,7 @@ test_smbios(void)
             if (mam_count > 64) { break; }
         }
         AxlSmbiosMemoryArrayMap mam_bad;
-        test_check(axl_smbios_read_memory_array_map(bios, &mam_bad) == -1,
+        test_check(axl_smbios_read_memory_array_map(bios, &mam_bad) == AXL_ERR,
                    "smbios: read_memory_array_map rejects Type 0 hdr");
     }
 
@@ -634,7 +634,7 @@ test_smbios(void)
         size_t mdm_count = 0;
         while ((dh = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP, dh)) != NULL) {
             AxlSmbiosMemoryDeviceMap mdm;
-            test_check(axl_smbios_read_memory_device_map(dh, &mdm) == 0,
+            test_check(axl_smbios_read_memory_device_map(dh, &mdm) == AXL_OK,
                        "smbios: read_memory_device_map on real Type 20");
             test_check(mdm.ending_address >= mdm.starting_address,
                        "smbios: type 20 end >= start");
@@ -642,7 +642,7 @@ test_smbios(void)
             if (mdm_count > 64) { break; }
         }
         AxlSmbiosMemoryDeviceMap mdm_bad;
-        test_check(axl_smbios_read_memory_device_map(bios, &mdm_bad) == -1,
+        test_check(axl_smbios_read_memory_device_map(bios, &mdm_bad) == AXL_ERR,
                    "smbios: read_memory_device_map rejects Type 0 hdr");
         test_check(AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP == 20,
                    "smbios: memory_device_map enum is 20");
@@ -654,7 +654,7 @@ test_smbios(void)
         size_t obx_count = 0;
         while ((oh2 = axl_smbios_find_next(AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT, oh2)) != NULL) {
             AxlSmbiosOnboardDeviceExt obx;
-            test_check(axl_smbios_read_onboard_device_ext(oh2, &obx) == 0,
+            test_check(axl_smbios_read_onboard_device_ext(oh2, &obx) == AXL_OK,
                        "smbios: read_onboard_device_ext on real Type 41");
             test_check(obx.reference_designation != NULL,
                        "smbios: type 41 designation populated");
@@ -662,7 +662,7 @@ test_smbios(void)
             if (obx_count > 64) { break; }
         }
         AxlSmbiosOnboardDeviceExt obx_bad;
-        test_check(axl_smbios_read_onboard_device_ext(bios, &obx_bad) == -1,
+        test_check(axl_smbios_read_onboard_device_ext(bios, &obx_bad) == AXL_ERR,
                    "smbios: read_onboard_device_ext rejects Type 0 hdr");
         test_check(AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT == 41,
                    "smbios: onboard_device_ext enum is 41");
@@ -671,7 +671,7 @@ test_smbios(void)
     // ----- Type 2: board_type field on AxlSmbiosBaseboardInfo -----
     {
         AxlSmbiosBaseboardInfo bb;
-        if (axl_smbios_read_baseboard(&bb) == 0) {
+        if (axl_smbios_read_baseboard(&bb) == AXL_OK) {
             /* board_type has been part of Type 2 since SMBIOS 2.0,
              * so essentially always present on real firmware.
              * 0x0A (motherboard) is by far the most common — most
@@ -951,7 +951,7 @@ test_env(void)
     char *val;
 
     /* Set and get */
-    test_check(axl_setenv("AXL_TEST_VAR", "hello", true) == 0,
+    test_check(axl_setenv("AXL_TEST_VAR", "hello", true) == AXL_OK,
                "env: setenv returns 0");
     val = axl_getenv("AXL_TEST_VAR");
     test_check(val != NULL, "env: getenv returns non-NULL");
@@ -969,7 +969,7 @@ test_env(void)
     }
 
     /* Unset */
-    test_check(axl_unsetenv("AXL_TEST_VAR") == 0, "env: unsetenv returns 0");
+    test_check(axl_unsetenv("AXL_TEST_VAR") == AXL_OK, "env: unsetenv returns 0");
     val = axl_getenv("AXL_TEST_VAR");
     test_check(val == NULL, "env: unset var is gone");
     axl_free(val);
@@ -992,7 +992,7 @@ test_cwd(void)
     test_check(cwd != NULL, "cwd: get_current_dir non-NULL");
     axl_free(cwd);
 
-    test_check(axl_chdir("fs0:\\") == 0, "cwd: chdir to root");
+    test_check(axl_chdir("fs0:\\") == AXL_OK, "cwd: chdir to root");
     cwd = axl_get_current_dir();
     test_check(cwd != NULL, "cwd: get after chdir");
     axl_free(cwd);
@@ -1008,57 +1008,57 @@ test_path_resolve(void)
     char buf[256];
 
     /* Simple join */
-    test_check(axl_path_resolve("/base", "file.efi", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/base", "file.efi", buf, sizeof(buf)) == AXL_OK,
                "resolve: simple join");
     test_check(axl_strcmp(buf, "/base/file.efi") == 0,
                "resolve: simple join value");
 
     /* Dot removal */
-    test_check(axl_path_resolve("/base", "./foo", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/base", "./foo", buf, sizeof(buf)) == AXL_OK,
                "resolve: dot removal");
     test_check(axl_strcmp(buf, "/base/foo") == 0,
                "resolve: dot removal value");
 
     /* Dotdot resolution */
-    test_check(axl_path_resolve("/a/b/c", "../d", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/a/b/c", "../d", buf, sizeof(buf)) == AXL_OK,
                "resolve: dotdot");
     test_check(axl_strcmp(buf, "/a/b/d") == 0,
                "resolve: dotdot value");
 
     /* Multiple dotdot */
-    test_check(axl_path_resolve("/a/b/c", "../../d", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/a/b/c", "../../d", buf, sizeof(buf)) == AXL_OK,
                "resolve: multi-dotdot");
     test_check(axl_strcmp(buf, "/a/d") == 0,
                "resolve: multi-dotdot value");
 
     /* Absolute relative overrides base */
-    test_check(axl_path_resolve("/base", "/absolute/path", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/base", "/absolute/path", buf, sizeof(buf)) == AXL_OK,
                "resolve: absolute override");
     test_check(axl_strcmp(buf, "/absolute/path") == 0,
                "resolve: absolute override value");
 
     /* Root path */
-    test_check(axl_path_resolve("/", ".", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/", ".", buf, sizeof(buf)) == AXL_OK,
                "resolve: root dot");
     test_check(axl_strcmp(buf, "/") == 0,
                "resolve: root dot value");
 
     /* Dotdot underflow past root */
-    test_check(axl_path_resolve("/a", "../../x", buf, sizeof(buf)) == -1,
+    test_check(axl_path_resolve("/a", "../../x", buf, sizeof(buf)) == AXL_ERR,
                "resolve: dotdot underflow");
 
     /* NULL args */
-    test_check(axl_path_resolve(NULL, "foo", buf, sizeof(buf)) == -1,
+    test_check(axl_path_resolve(NULL, "foo", buf, sizeof(buf)) == AXL_ERR,
                "resolve: NULL base");
-    test_check(axl_path_resolve("/a", NULL, buf, sizeof(buf)) == -1,
+    test_check(axl_path_resolve("/a", NULL, buf, sizeof(buf)) == AXL_ERR,
                "resolve: NULL relative");
 
     /* Buffer too small */
-    test_check(axl_path_resolve("/base", "file.efi", buf, 5) == -1,
+    test_check(axl_path_resolve("/base", "file.efi", buf, 5) == AXL_ERR,
                "resolve: buffer too small");
 
     /* Backslash handling */
-    test_check(axl_path_resolve("/a\\b", "c\\d", buf, sizeof(buf)) == 0,
+    test_check(axl_path_resolve("/a\\b", "c\\d", buf, sizeof(buf)) == AXL_OK,
                "resolve: backslash");
     test_check(axl_strcmp(buf, "/a/b/c/d") == 0,
                "resolve: backslash normalized");
@@ -1110,31 +1110,31 @@ test_path_build_uefi(void)
     char buf[64];
 
     /* Basic */
-    test_check(axl_path_build_uefi("fs0", "/dir/file.efi", buf, sizeof(buf)) == 0,
+    test_check(axl_path_build_uefi("fs0", "/dir/file.efi", buf, sizeof(buf)) == AXL_OK,
                "build_uefi: basic");
     test_check(axl_strcmp(buf, "fs0:\\dir\\file.efi") == 0,
                "build_uefi: slashes converted");
 
     /* Root path */
-    test_check(axl_path_build_uefi("fs0", "/", buf, sizeof(buf)) == 0,
+    test_check(axl_path_build_uefi("fs0", "/", buf, sizeof(buf)) == AXL_OK,
                "build_uefi: root");
     test_check(axl_strcmp(buf, "fs0:\\") == 0,
                "build_uefi: root value");
 
     /* Already backslash */
-    test_check(axl_path_build_uefi("fs1", "\\already\\back", buf, sizeof(buf)) == 0,
+    test_check(axl_path_build_uefi("fs1", "\\already\\back", buf, sizeof(buf)) == AXL_OK,
                "build_uefi: backslash passthrough");
     test_check(axl_strcmp(buf, "fs1:\\already\\back") == 0,
                "build_uefi: backslash preserved");
 
     /* Buffer too small */
-    test_check(axl_path_build_uefi("fs0", "/dir/file.efi", buf, 5) == -1,
+    test_check(axl_path_build_uefi("fs0", "/dir/file.efi", buf, 5) == AXL_ERR,
                "build_uefi: buffer too small");
 
     /* NULL safety */
-    test_check(axl_path_build_uefi(NULL, "/foo", buf, sizeof(buf)) == -1,
+    test_check(axl_path_build_uefi(NULL, "/foo", buf, sizeof(buf)) == AXL_ERR,
                "build_uefi: NULL volume");
-    test_check(axl_path_build_uefi("fs0", NULL, buf, sizeof(buf)) == -1,
+    test_check(axl_path_build_uefi("fs0", NULL, buf, sizeof(buf)) == AXL_ERR,
                "build_uefi: NULL subpath");
 }
 
@@ -1149,7 +1149,7 @@ test_dir_list_json(void)
 
     /* Empty list */
     AxlDirEntry empty_entries[1] = {0};
-    test_check(axl_dir_list_json(empty_entries, 0, buf, sizeof(buf)) == 0,
+    test_check(axl_dir_list_json(empty_entries, 0, buf, sizeof(buf)) == AXL_OK,
                "dir_json: empty");
     test_check(axl_strcmp(buf, "[]") == 0,
                "dir_json: empty value");
@@ -1160,7 +1160,7 @@ test_dir_list_json(void)
     entries[0].size = 1024;
     entries[0].is_dir = false;
 
-    test_check(axl_dir_list_json(entries, 1, buf, sizeof(buf)) == 0,
+    test_check(axl_dir_list_json(entries, 1, buf, sizeof(buf)) == AXL_OK,
                "dir_json: single file");
     test_check(axl_strstr_len(buf, -1, "\"name\":\"test.txt\"") != NULL,
                "dir_json: has name");
@@ -1174,7 +1174,7 @@ test_dir_list_json(void)
     entries[1].size = 0;
     entries[1].is_dir = true;
 
-    test_check(axl_dir_list_json(entries, 2, buf, sizeof(buf)) == 0,
+    test_check(axl_dir_list_json(entries, 2, buf, sizeof(buf)) == AXL_OK,
                "dir_json: two entries");
     test_check(axl_strstr_len(buf, -1, "\"dir\":true") != NULL,
                "dir_json: has dir true");
@@ -1182,11 +1182,11 @@ test_dir_list_json(void)
                "dir_json: array brackets");
 
     /* Buffer too small */
-    test_check(axl_dir_list_json(entries, 2, buf, 10) == -1,
+    test_check(axl_dir_list_json(entries, 2, buf, 10) == AXL_ERR,
                "dir_json: buffer overflow");
 
     /* NULL safety */
-    test_check(axl_dir_list_json(NULL, 1, buf, sizeof(buf)) == -1,
+    test_check(axl_dir_list_json(NULL, 1, buf, sizeof(buf)) == AXL_ERR,
                "dir_json: NULL entries");
 }
 
@@ -1200,14 +1200,14 @@ test_volume_enumerate(void)
     size_t count = 0;
 
     /* Query count only */
-    test_check(axl_volume_enumerate(NULL, 0, &count) == 0,
+    test_check(axl_volume_enumerate(NULL, 0, &count) == AXL_OK,
                "vol enum: query count");
     test_check(count > 0, "vol enum: at least 1 volume");
 
     /* Enumerate into array */
     AxlVolume vols[8];
     size_t filled = 0;
-    test_check(axl_volume_enumerate(vols, 8, &filled) == 0,
+    test_check(axl_volume_enumerate(vols, 8, &filled) == AXL_OK,
                "vol enum: fill array");
     test_check(filled == count, "vol enum: filled matches count");
 
@@ -1220,8 +1220,8 @@ test_volume_enumerate(void)
     }
 
     /* NULL count is error */
-    test_check(axl_volume_enumerate(NULL, 0, NULL) == -1,
-               "vol enum: NULL count returns -1");
+    test_check(axl_volume_enumerate(NULL, 0, NULL) == AXL_ERR,
+               "vol enum: NULL count returns AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,7 +1284,7 @@ test_config(void)
                "config: get_bool verbose");
 
     /* Set updates both storage and target struct */
-    test_check(axl_config_set(cfg, "port", "9090") == 0,
+    test_check(axl_config_set(cfg, "port", "9090") == AXL_OK,
                "config: set port");
     test_check(tgt.port == 9090, "config: auto-apply port 9090");
     test_check(axl_config_get_uint(cfg, "port") == 9090,
@@ -1306,11 +1306,11 @@ test_config(void)
                "config: get name after callback");
 
     /* Unknown key rejected */
-    test_check(axl_config_set(cfg, "unknown", "x") == -1,
+    test_check(axl_config_set(cfg, "unknown", "x") == AXL_ERR,
                "config: unknown key rejected");
 
     /* Type validation */
-    test_check(axl_config_set(cfg, "port", "abc") == -1,
+    test_check(axl_config_set(cfg, "port", "abc") == AXL_ERR,
                "config: type validation rejects abc for uint");
 
     /* NULL safety */
@@ -1353,33 +1353,33 @@ test_config_width_overflow(void)
     test_check(cfg != NULL, "width: config new");
 
     /* In-range values still work. */
-    test_check(axl_config_set(cfg, "port", "9090") == 0
+    test_check(axl_config_set(cfg, "port", "9090") == AXL_OK
                && tgt.port == 9090, "width: u16 9090 accepted");
-    test_check(axl_config_set(cfg, "port", "65535") == 0
+    test_check(axl_config_set(cfg, "port", "65535") == AXL_OK
                && tgt.port == 65535, "width: u16 max 65535 accepted");
 
     /* Overflow rejected — used to silently truncate to 34463. */
-    test_check(axl_config_set(cfg, "port", "65536") == -1,
+    test_check(axl_config_set(cfg, "port", "65536") == AXL_ERR,
                "width: u16 65536 rejected (was: silent truncate to 0)");
-    test_check(axl_config_set(cfg, "port", "99999") == -1,
+    test_check(axl_config_set(cfg, "port", "99999") == AXL_ERR,
                "width: u16 99999 rejected (was: silent truncate to 34463)");
     test_check(tgt.port == 65535,
                "width: u16 field preserved after rejection");
 
     /* u32 boundary. */
-    test_check(axl_config_set(cfg, "timeout", "4294967295") == 0
+    test_check(axl_config_set(cfg, "timeout", "4294967295") == AXL_OK
                && tgt.timeout_ms == 4294967295u, "width: u32 max accepted");
-    test_check(axl_config_set(cfg, "timeout", "4294967296") == -1,
+    test_check(axl_config_set(cfg, "timeout", "4294967296") == AXL_ERR,
                "width: u32 max+1 rejected");
 
     /* i32 boundaries — both ends. */
-    test_check(axl_config_set(cfg, "threshold", "2147483647") == 0
+    test_check(axl_config_set(cfg, "threshold", "2147483647") == AXL_OK
                && tgt.threshold == 2147483647, "width: i32 max accepted");
-    test_check(axl_config_set(cfg, "threshold", "-2147483648") == 0
+    test_check(axl_config_set(cfg, "threshold", "-2147483648") == AXL_OK
                && tgt.threshold == -2147483648, "width: i32 min accepted");
-    test_check(axl_config_set(cfg, "threshold", "2147483648") == -1,
+    test_check(axl_config_set(cfg, "threshold", "2147483648") == AXL_ERR,
                "width: i32 max+1 rejected");
-    test_check(axl_config_set(cfg, "threshold", "-2147483649") == -1,
+    test_check(axl_config_set(cfg, "threshold", "-2147483649") == AXL_ERR,
                "width: i32 min-1 rejected");
 
     /* Rejected set leaves the stored hash entry consistent with the
@@ -1502,21 +1502,21 @@ test_config_callback(void)
     AxlConfig *cfg = axl_config_new(descs, test_dynamic_apply, NULL);
 
     /* Known key passes through callback (returns 0) to auto-apply */
-    test_check(axl_config_set(cfg, "port", "9090") == 0,
+    test_check(axl_config_set(cfg, "port", "9090") == AXL_OK,
                "config cb: known key accepted");
     test_check(axl_config_get_uint(cfg, "port") == 9090,
                "config cb: known key value");
 
     /* Dynamic key handled by callback (returns 1) */
     test_cb_counter = 0;
-    test_check(axl_config_set(cfg, "dynamic.foo", "bar") == 0,
+    test_check(axl_config_set(cfg, "dynamic.foo", "bar") == AXL_OK,
                "config cb: dynamic key accepted");
     test_check(test_cb_counter == 1, "config cb: callback fired");
     test_check(axl_strcmp(axl_config_get(cfg, "dynamic.foo"), "bar") == 0,
                "config cb: dynamic key retrievable");
 
     /* Unknown key (not in descriptors, callback returns 0) rejected */
-    test_check(axl_config_set(cfg, "unknown", "x") == -1,
+    test_check(axl_config_set(cfg, "unknown", "x") == AXL_ERR,
                "config cb: unknown key rejected");
 
     axl_config_free(cfg);
@@ -1535,25 +1535,25 @@ test_config_validation(void)
     AxlConfig *cfg = axl_config_new(descs, NULL, NULL);
 
     /* UINT rejects non-numeric */
-    test_check(axl_config_set(cfg, "count", "abc") == -1,
+    test_check(axl_config_set(cfg, "count", "abc") == AXL_ERR,
                "config val: uint rejects abc");
-    test_check(axl_config_set(cfg, "count", "-5") == -1,
+    test_check(axl_config_set(cfg, "count", "-5") == AXL_ERR,
                "config val: uint rejects negative");
-    test_check(axl_config_set(cfg, "count", "0xFF") == 0,
+    test_check(axl_config_set(cfg, "count", "0xFF") == AXL_OK,
                "config val: uint accepts hex");
 
     /* INT rejects non-numeric */
-    test_check(axl_config_set(cfg, "offset", "xyz") == -1,
+    test_check(axl_config_set(cfg, "offset", "xyz") == AXL_ERR,
                "config val: int rejects xyz");
-    test_check(axl_config_set(cfg, "offset", "-42") == 0,
+    test_check(axl_config_set(cfg, "offset", "-42") == AXL_OK,
                "config val: int accepts negative");
     test_check(axl_config_get_int(cfg, "offset") == -42,
                "config val: int value -42");
 
     /* BOOL rejects garbage */
-    test_check(axl_config_set(cfg, "flag", "maybe") == -1,
+    test_check(axl_config_set(cfg, "flag", "maybe") == AXL_ERR,
                "config val: bool rejects maybe");
-    test_check(axl_config_set(cfg, "flag", "yes") == 0,
+    test_check(axl_config_set(cfg, "flag", "yes") == AXL_OK,
                "config val: bool accepts yes");
     test_check(axl_config_get_bool(cfg, "flag") == true,
                "config val: bool yes is true");
@@ -1578,7 +1578,7 @@ test_config_setv(void)
         "host", "10.0.0.1",
         "port", "9090",
         "verbose", "true",
-        NULL) == 0,
+        NULL) == AXL_OK,
         "config setv: success");
 
     test_check(axl_strcmp(axl_config_get(cfg, "host"), "10.0.0.1") == 0,
@@ -1593,7 +1593,7 @@ test_config_setv(void)
         "port", "3000",
         "unknown", "x",
         "verbose", "false",
-        NULL) == -1,
+        NULL) == AXL_ERR,
         "config setv: stops on error");
 
     /* port was set before the error */
@@ -1605,7 +1605,7 @@ test_config_setv(void)
                "config setv: skipped after error");
 
     /* NULL config */
-    test_check(axl_config_setv(NULL, "port", "80", NULL) == -1,
+    test_check(axl_config_setv(NULL, "port", "80", NULL) == AXL_ERR,
                "config setv: NULL cfg");
 
     axl_config_free(cfg);
@@ -1791,9 +1791,9 @@ test_driver_ensure(void)
                "driver_ensure: short-circuits when protocol registered");
 
     /* NULL args — both arguments are required. */
-    test_check(axl_driver_ensure(NULL, "x.efi") == -1,
+    test_check(axl_driver_ensure(NULL, "x.efi") == AXL_ERR,
                "driver_ensure: rejects NULL guid");
-    test_check(axl_driver_ensure(&simple_fs, NULL) == -1,
+    test_check(axl_driver_ensure(&simple_fs, NULL) == AXL_ERR,
                "driver_ensure: rejects NULL name");
 
     /* Missing protocol + missing driver: a GUID we know is not
@@ -1819,11 +1819,11 @@ test_driver_locate(void)
     char path[256];
 
     /* NULL args — all three rejected. */
-    test_check(axl_driver_locate(NULL, path, sizeof(path)) == -1,
+    test_check(axl_driver_locate(NULL, path, sizeof(path)) == AXL_ERR,
                "driver_locate: rejects NULL name");
-    test_check(axl_driver_locate("x.efi", NULL, sizeof(path)) == -1,
+    test_check(axl_driver_locate("x.efi", NULL, sizeof(path)) == AXL_ERR,
                "driver_locate: rejects NULL out");
-    test_check(axl_driver_locate("x.efi", path, 0) == -1,
+    test_check(axl_driver_locate("x.efi", path, 0) == AXL_ERR,
                "driver_locate: rejects zero size");
 
     /* Driver missing from disk: walks the search list, finds nothing,
@@ -1837,10 +1837,10 @@ test_driver_locate(void)
      * any file alongside it. We just wrote axl-test-util.tmp earlier,
      * so locate that — proves the discovery path resolves correctly. */
     int rc = axl_driver_locate("axl-test-util.tmp", path, sizeof(path));
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         test_check(axl_strlen(path) > 0, "driver_locate: writes non-empty path");
         AxlFileInfo info;
-        test_check(axl_file_info(path, &info) == 0,
+        test_check(axl_file_info(path, &info) == AXL_OK,
                    "driver_locate: returned path actually exists");
     } else {
         /* Some QEMU configurations don't surface fs0 in the search;
@@ -1852,7 +1852,7 @@ test_driver_locate(void)
      * must return -1 rather than truncate. Use a 1-byte buffer to
      * force the failure path even on the shortest possible match. */
     char tiny[1];
-    test_check(axl_driver_locate("axl-test-util.tmp", tiny, sizeof(tiny)) == -1,
+    test_check(axl_driver_locate("axl-test-util.tmp", tiny, sizeof(tiny)) == AXL_ERR,
                "driver_locate: rejects too-small buffer");
 }
 
@@ -1865,9 +1865,9 @@ test_diag_probe_protocol(void)
 {
     /* NULL guid → -1 with no UEFI call. Pure logic, doesn't depend
      * on what's registered in firmware. */
-    test_check(axl_diag_probe_protocol(NULL, "x") == -1,
+    test_check(axl_diag_probe_protocol(NULL, "x") == AXL_ERR,
                "diag_probe: NULL guid rejected");
-    test_check(axl_diag_probe_protocol(NULL, NULL) == -1,
+    test_check(axl_diag_probe_protocol(NULL, NULL) == AXL_ERR,
                "diag_probe: NULL guid rejected even with NULL name");
 
     /* SimpleFileSystem is guaranteed registered in QEMU (we boot
@@ -1876,14 +1876,14 @@ test_diag_probe_protocol(void)
         0x0964e5b22, 0x6459, 0x11d2,
         0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b);
     test_check(axl_diag_probe_protocol(&simple_fs,
-                                       "EFI_SIMPLE_FILE_SYSTEM") == 0,
+                                       "EFI_SIMPLE_FILE_SYSTEM") == AXL_OK,
                "diag_probe: registered protocol returns 0");
 
     /* Bogus GUID → -1. Doesn't crash on a NULL display_name either. */
     static const AxlGuid bogus = AXL_GUID(
         0xdeadbeef, 0xcafe, 0xbabe,
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef);
-    test_check(axl_diag_probe_protocol(&bogus, NULL) == -1,
+    test_check(axl_diag_probe_protocol(&bogus, NULL) == AXL_ERR,
                "diag_probe: unregistered protocol returns -1, NULL name OK");
 }
 
@@ -1936,13 +1936,13 @@ test_smbios_extras(void)
     /* Baseboard reader (Type 2). QEMU q35 publishes one. */
     AxlSmbiosBaseboardInfo bb;
     int bb_rc = axl_smbios_read_baseboard(&bb);
-    test_check(bb_rc == 0 || bb_rc == -1,
+    test_check(bb_rc == AXL_OK || bb_rc == AXL_ERR,
                "smbios: read_baseboard returns 0 or -1");
 
     /* Chassis reader (Type 3). */
     AxlSmbiosChassisInfo ch;
     int ch_rc = axl_smbios_read_chassis(&ch);
-    test_check(ch_rc == 0 || ch_rc == -1,
+    test_check(ch_rc == AXL_OK || ch_rc == AXL_ERR,
                "smbios: read_chassis returns 0 or -1");
 
     /* copy_string_utf8: truncation case. Typical BIOS vendor strings
@@ -2003,38 +2003,38 @@ test_nvstore_namespaces(void)
     /* Built-in namespaces are pre-registered. Re-registering them
        with NULL token is a NULL-arg error, not a duplicate-name
        collision. */
-    test_check(axl_nvstore_register_namespace(NULL, &TEST_VENDOR_A) == -1,
+    test_check(axl_nvstore_register_namespace(NULL, &TEST_VENDOR_A) == AXL_ERR,
                "nvstore: register NULL name fails");
-    test_check(axl_nvstore_register_namespace("vendor-a", NULL) == -1,
+    test_check(axl_nvstore_register_namespace("vendor-a", NULL) == AXL_ERR,
                "nvstore: register NULL token fails");
 
     /* First registration succeeds. */
-    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_A) == 0,
+    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_A) == AXL_OK,
                "nvstore: register vendor-a");
 
     /* Idempotent re-register with the SAME token succeeds. */
-    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_A) == 0,
+    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_A) == AXL_OK,
                "nvstore: re-register vendor-a (same token, idempotent)");
 
     /* Re-register with a DIFFERENT token rejects. */
-    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_B) == -1,
+    test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_B) == AXL_ERR,
                "nvstore: re-register vendor-a (different token) fails");
 
     /* Unregistered namespace is an error in get/set/delete/iter. */
     uint8_t  byte = 0;
     size_t   sz   = 1;
-    test_check(axl_nvstore_get("never-registered", "x", &byte, &sz) == -1,
+    test_check(axl_nvstore_get("never-registered", "x", &byte, &sz) == AXL_ERR,
                "nvstore: get on unregistered ns returns -1");
-    test_check(axl_nvstore_set("never-registered", "x", &byte, 1, 0) == -1,
+    test_check(axl_nvstore_set("never-registered", "x", &byte, 1, 0) == AXL_ERR,
                "nvstore: set on unregistered ns returns -1");
-    test_check(axl_nvstore_delete("never-registered", "x") == -1,
+    test_check(axl_nvstore_delete("never-registered", "x") == AXL_ERR,
                "nvstore: delete on unregistered ns returns -1");
 
     /* Built-in "global" and "app" stay reachable. */
     uint8_t  sb;
     size_t   sb_sz = sizeof(sb);
     int g_rc = axl_nvstore_get("global", "SecureBoot", &sb, &sb_sz);
-    test_check(g_rc == 0 || g_rc == -1,
+    test_check(g_rc == AXL_OK || g_rc == AXL_ERR,
                "nvstore: get(global, SecureBoot) returns 0 or -1");
 }
 
@@ -2077,18 +2077,18 @@ test_nvstore_roundtrip(void)
        boot, then cleaned up). */
     int rc = axl_nvstore_set("app", key, data, sizeof(data),
                              AXL_NV_PERSISTENT | AXL_NV_BOOT);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         /* Some firmware reject app-namespace writes (e.g. with
            authentication policies). Skip cleanly. */
         axl_printf("SKIP: nvstore round-trip (set returned -1)\n");
         return;
     }
-    test_check(rc == 0, "nvstore: set app/AxlTestKey");
+    test_check(rc == AXL_OK, "nvstore: set app/AxlTestKey");
 
     /* Read back. */
     sz = sizeof(buf);
     rc = axl_nvstore_get("app", key, buf, &sz);
-    test_check(rc == 0, "nvstore: get app/AxlTestKey");
+    test_check(rc == AXL_OK, "nvstore: get app/AxlTestKey");
     test_check(sz == sizeof(data), "nvstore: get returns original size");
     if (sz == sizeof(data)) {
         test_check(axl_memcmp(buf, data, sizeof(data)) == 0,
@@ -2097,7 +2097,7 @@ test_nvstore_roundtrip(void)
 
     /* Attributes round-trip: we asked for PERSISTENT | BOOT. */
     uint32_t attrs = 0;
-    test_check(axl_nvstore_get_attrs("app", key, &attrs) == 0,
+    test_check(axl_nvstore_get_attrs("app", key, &attrs) == AXL_OK,
                "nvstore: get_attrs succeeds");
     test_check((attrs & AXL_NV_PERSISTENT) != 0,
                "nvstore: attrs include PERSISTENT");
@@ -2116,7 +2116,7 @@ test_nvstore_roundtrip(void)
        lean on for string variables). */
     void   *abuf = (void *)0xDEADBEEFul;  /* deliberate sentinel */
     size_t  asz  = 99;
-    test_check(axl_nvstore_get_alloc("app", key, &abuf, &asz) == 0,
+    test_check(axl_nvstore_get_alloc("app", key, &abuf, &asz) == AXL_OK,
                "nvstore get_alloc: succeeds on existing key");
     test_check(asz == sizeof(data),
                "nvstore get_alloc: out_size matches written payload");
@@ -2131,20 +2131,20 @@ test_nvstore_roundtrip(void)
     /* NULL-arg guards. */
     void   *xbuf = (void *)0x1234ul;
     size_t  xsz  = 7;
-    test_check(axl_nvstore_get_alloc(NULL, key, &xbuf, &xsz) == -1,
+    test_check(axl_nvstore_get_alloc(NULL, key, &xbuf, &xsz) == AXL_ERR,
                "nvstore get_alloc: NULL ns rejected");
-    test_check(axl_nvstore_get_alloc("app", NULL, &xbuf, &xsz) == -1,
+    test_check(axl_nvstore_get_alloc("app", NULL, &xbuf, &xsz) == AXL_ERR,
                "nvstore get_alloc: NULL key rejected");
-    test_check(axl_nvstore_get_alloc("app", key, NULL, &xsz) == -1,
+    test_check(axl_nvstore_get_alloc("app", key, NULL, &xsz) == AXL_ERR,
                "nvstore get_alloc: NULL out_buf rejected");
-    test_check(axl_nvstore_get_alloc("app", key, &xbuf, NULL) == -1,
+    test_check(axl_nvstore_get_alloc("app", key, &xbuf, NULL) == AXL_ERR,
                "nvstore get_alloc: NULL out_size rejected");
 
     /* Missing-key path: out_buf cleared to NULL, out_size cleared
        to 0, return -1. */
     void   *mbuf = (void *)0xC0DEul;
     size_t  msz  = 42;
-    test_check(axl_nvstore_get_alloc("app", "AxlNoSuchKey", &mbuf, &msz) == -1,
+    test_check(axl_nvstore_get_alloc("app", "AxlNoSuchKey", &mbuf, &msz) == AXL_ERR,
                "nvstore get_alloc: missing key returns -1");
     test_check(mbuf == NULL && msz == 0,
                "nvstore get_alloc: out params cleared on failure");
@@ -2157,11 +2157,11 @@ test_nvstore_roundtrip(void)
     const char *empty_key = "AxlTestKeyEmpty";
     int empty_set_rc = axl_nvstore_set("app", empty_key, NULL, 0,
                                        AXL_NV_PERSISTENT | AXL_NV_BOOT);
-    if (empty_set_rc == 0) {
+    if (empty_set_rc == AXL_OK) {
         void   *ebuf = (void *)0x55ul;
         size_t  esz  = 99;
         int rc_e = axl_nvstore_get_alloc("app", empty_key, &ebuf, &esz);
-        test_check(rc_e == 0,
+        test_check(rc_e == AXL_OK,
                    "nvstore get_alloc: 0-byte variable succeeds (not NOT_FOUND)");
         test_check(esz == 0,
                    "nvstore get_alloc: 0-byte variable reports size 0");
@@ -2178,10 +2178,10 @@ test_nvstore_roundtrip(void)
     }
 
     /* Delete + verify gone. */
-    test_check(axl_nvstore_delete("app", key) == 0,
+    test_check(axl_nvstore_delete("app", key) == AXL_OK,
                "nvstore: delete succeeds");
     sz = sizeof(buf);
-    test_check(axl_nvstore_get("app", key, buf, &sz) == -1,
+    test_check(axl_nvstore_get("app", key, buf, &sz) == AXL_ERR,
                "nvstore: get after delete returns -1");
 }
 
@@ -2204,9 +2204,9 @@ test_boot(void)
     /* current_get: 0 if BootCurrent is published, -1 otherwise. */
     uint16_t cur = 0xFFFF;
     int cur_rc = axl_boot_current_get(&cur);
-    test_check(cur_rc == 0 || cur_rc == -1,
+    test_check(cur_rc == AXL_OK || cur_rc == AXL_ERR,
                "boot: current_get returns 0 or -1");
-    test_check(axl_boot_current_get(NULL) == -1,
+    test_check(axl_boot_current_get(NULL) == AXL_ERR,
                "boot: current_get(NULL) returns -1");
 
     /* order_get: same shape. The non-NULL-pointer guarantee on
@@ -2214,23 +2214,23 @@ test_boot(void)
     uint16_t *order = NULL;
     size_t    n_order = 0;
     int order_rc = axl_boot_order_get(&order, &n_order);
-    test_check(order_rc == 0 || order_rc == -1,
+    test_check(order_rc == AXL_OK || order_rc == AXL_ERR,
                "boot: order_get returns 0 or -1");
-    test_check(order_rc != 0 || order != NULL,
+    test_check(order_rc != AXL_OK || order != NULL,
                "boot: order_get on success populates pointer");
-    if (order_rc == 0) {
+    if (order_rc == AXL_OK) {
         axl_free(order);
     }
-    test_check(axl_boot_order_get(NULL, &n_order) == -1,
+    test_check(axl_boot_order_get(NULL, &n_order) == AXL_ERR,
                "boot: order_get(NULL out) returns -1");
-    test_check(axl_boot_order_get(&order, NULL) == -1,
+    test_check(axl_boot_order_get(&order, NULL) == AXL_ERR,
                "boot: order_get(NULL count) returns -1");
 
     /* option_get on an unused index: -1, no allocation. */
     AxlBootOption empty = { 0 };
-    test_check(axl_boot_option_get(0x0FFE, &empty) == -1,
+    test_check(axl_boot_option_get(0x0FFE, &empty) == AXL_ERR,
                "boot: option_get on empty index returns -1");
-    test_check(axl_boot_option_get(0x0FFE, NULL) == -1,
+    test_check(axl_boot_option_get(0x0FFE, NULL) == AXL_ERR,
                "boot: option_get(NULL) returns -1");
 
     /* option_free is NULL-safe and idempotent. */
@@ -2243,20 +2243,20 @@ test_boot(void)
        success (idempotent delete); some return -1. Both are
        valid call shapes. */
     int del_rc = axl_boot_option_delete(0x0FFE);
-    test_check(del_rc == 0 || del_rc == -1,
+    test_check(del_rc == AXL_OK || del_rc == AXL_ERR,
                "boot: option_delete returns 0 or -1");
 
     /* next_get on un-set BootNext: -1. */
     uint16_t nxt = 0;
     int next_get_rc = axl_boot_next_get(&nxt);
-    test_check(next_get_rc == 0 || next_get_rc == -1,
+    test_check(next_get_rc == AXL_OK || next_get_rc == AXL_ERR,
                "boot: next_get returns 0 or -1");
-    test_check(axl_boot_next_get(NULL) == -1,
+    test_check(axl_boot_next_get(NULL) == AXL_ERR,
                "boot: next_get(NULL) returns -1");
 
     /* next_clear is idempotent. */
     int next_clear_rc = axl_boot_next_clear();
-    test_check(next_clear_rc == 0 || next_clear_rc == -1,
+    test_check(next_clear_rc == AXL_OK || next_clear_rc == AXL_ERR,
                "boot: next_clear returns 0 or -1");
 
     /* === Codec round-trip via _set + _get ===
@@ -2276,8 +2276,8 @@ test_boot(void)
         .opt_data_len  = 0,
     };
     int set_rc = axl_boot_option_set(0x0FFE, &put);
-    test_check(set_rc == 0, "boot: option_set BootOFFE (synthesized end-node)");
-    if (set_rc != 0) {
+    test_check(set_rc == AXL_OK, "boot: option_set BootOFFE (synthesized end-node)");
+    if (set_rc != AXL_OK) {
         /* On firmware that still rejects, leave the rest as a
            single shape-pass to keep the test count stable. */
         test_check(true, "boot: round-trip skipped on this firmware");
@@ -2289,7 +2289,7 @@ test_boot(void)
     }
 
     AxlBootOption got = { 0 };
-    test_check(axl_boot_option_get(0x0FFE, &got) == 0,
+    test_check(axl_boot_option_get(0x0FFE, &got) == AXL_OK,
                "boot: option_get BootOFFE");
     test_check(got.attrs == AXL_BOOT_ATTR_ACTIVE,
                "boot: round-trip attrs");
@@ -2300,7 +2300,7 @@ test_boot(void)
                "boot: round-trip opt_data_len 0");
     axl_boot_option_free(&got);
 
-    test_check(axl_boot_option_delete(0x0FFE) == 0,
+    test_check(axl_boot_option_delete(0x0FFE) == AXL_OK,
                "boot: option_delete BootOFFE after round-trip");
 }
 
@@ -2314,35 +2314,35 @@ test_image(void)
     /* axl_image_load on a non-existent path returns -1 without
        mangling the out parameter. */
     AxlImage *bad = (AxlImage *)0xDEADBEEFul;
-    test_check(axl_image_load("fs0:\\definitely-not-a-real-file.efi", &bad) == -1,
+    test_check(axl_image_load("fs0:\\definitely-not-a-real-file.efi", &bad) == AXL_ERR,
                "image: load of missing file returns -1");
     test_check(bad == NULL,
                "image: load failure clears out parameter");
 
     /* NULL args. */
     AxlImage *img = NULL;
-    test_check(axl_image_load(NULL, &img) == -1,
+    test_check(axl_image_load(NULL, &img) == AXL_ERR,
                "image: load NULL path returns -1");
-    test_check(axl_image_load("fs0:\\x.efi", NULL) == -1,
+    test_check(axl_image_load("fs0:\\x.efi", NULL) == AXL_ERR,
                "image: load NULL out returns -1");
 
     /* Real load: AxlTestRuntime.efi is staged into fs0: by the test
        runner. Load it, then unload immediately — don't actually
        start it (would re-enter the test runtime). */
     int rc = axl_image_load("fs0:\\AxlTestRuntime.efi", &img);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_printf("SKIP: image load (AxlTestRuntime.efi not found)\n");
         return;
     }
-    test_check(rc == 0, "image: load AxlTestRuntime.efi");
+    test_check(rc == AXL_OK, "image: load AxlTestRuntime.efi");
     test_check(img != NULL, "image: load populates handle");
 
     /* Unload. */
-    test_check(axl_image_unload(img) == 0,
+    test_check(axl_image_unload(img) == AXL_OK,
                "image: unload");
 
     /* Unload(NULL) is a no-op — return 0. */
-    test_check(axl_image_unload(NULL) == 0,
+    test_check(axl_image_unload(NULL) == AXL_OK,
                "image: unload(NULL) is a no-op");
 }
 
@@ -2356,14 +2356,14 @@ test_image_verify_signature(void)
     AxlImageSignatureInfo info = {0};
 
     /* NULL guards. */
-    test_check(axl_image_verify_signature(NULL, false, &info) == -1,
+    test_check(axl_image_verify_signature(NULL, false, &info) == AXL_ERR,
                "image_verify: NULL path rejected");
-    test_check(axl_image_verify_signature("fs0:\\x.efi", false, NULL) == -1,
+    test_check(axl_image_verify_signature("fs0:\\x.efi", false, NULL) == AXL_ERR,
                "image_verify: NULL info rejected");
 
     /* Non-existent file. */
     test_check(axl_image_verify_signature("fs0:\\definitely-not-a-pe.efi",
-                                          false, &info) == -1,
+                                          false, &info) == AXL_ERR,
                "image_verify: missing file returns -1");
 
     /* Real test EFI staged by the runner. AxlTestRuntime.efi is
@@ -2371,7 +2371,7 @@ test_image_verify_signature(void)
        the presence-only path. */
     int rc = axl_image_verify_signature("fs0:\\AxlTestRuntime.efi",
                                         /*consult_db=*/false, &info);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         /* Test EFI not staged here — SKIP-balance the populated
            path's 6 assertions (4 sig fields + 2 CN-NULL pins). */
         axl_printf("SKIP: image_verify (no AxlTestRuntime.efi)\n");
@@ -2380,7 +2380,7 @@ test_image_verify_signature(void)
         }
         return;
     }
-    test_check(rc == 0,
+    test_check(rc == AXL_OK,
                "image_verify: AxlTestRuntime.efi parses as a PE");
     test_check(info.has_signature == false,
                "image_verify: AxlTestRuntime.efi is unsigned (presence-only)");

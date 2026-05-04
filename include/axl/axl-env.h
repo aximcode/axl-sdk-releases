@@ -20,6 +20,7 @@
 #define AXL_ENV_H
 
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,7 +42,7 @@ axl_getenv(
 /**
  * @brief Set a shell environment variable.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_setenv(
@@ -53,7 +54,7 @@ axl_setenv(
 /**
  * @brief Remove a shell environment variable.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_unsetenv(

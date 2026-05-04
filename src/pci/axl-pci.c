@@ -45,7 +45,7 @@ ensure_init(
     if (init_failed) {
         return -1;
     }
-    if (axl_acpi_read_mcfg(&cached_mcfg) != 0 || cached_mcfg.count == 0) {
+    if (axl_acpi_read_mcfg(&cached_mcfg) != AXL_OK || cached_mcfg.count == 0) {
         axl_warning("MCFG unavailable; PCI access disabled");
         init_failed = true;
         return -1;
@@ -96,14 +96,14 @@ axl_pci_read_config_8(
     )
 {
     if (out == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint8_t *p = ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *p;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -114,14 +114,14 @@ axl_pci_read_config_16(
     )
 {
     if (out == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint16_t *p = (volatile uint16_t *)ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *p;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -132,14 +132,14 @@ axl_pci_read_config_32(
     )
 {
     if (out == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint32_t *p = (volatile uint32_t *)ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *p;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -150,14 +150,14 @@ axl_pci_write_config_8(
     )
 {
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint8_t *p = ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *p = value;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -168,14 +168,14 @@ axl_pci_write_config_16(
     )
 {
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint16_t *p = (volatile uint16_t *)ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *p = value;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -186,14 +186,14 @@ axl_pci_write_config_32(
     )
 {
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     volatile uint32_t *p = (volatile uint32_t *)ecam_ptr(addr, reg);
     if (p == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *p = value;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ int
 axl_pci_addr_parse(const char *s, AxlPciAddr *out)
 {
     if (s == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Walk the input collecting (hex field, separator) pairs. Both
@@ -236,12 +236,12 @@ axl_pci_addr_parse(const char *s, AxlPciAddr *out)
 
     while (n_parts < 4) {
         int n = parse_hex_field(p, 5, &parts[n_parts]);
-        if (n < 0) return -1;
+        if (n < 0) return AXL_ERR;
         p += n;
         n_parts++;
 
         if (*p == '\0') break;
-        if (*p != ':' && *p != '.') return -1;
+        if (*p != ':' && *p != '.') return AXL_ERR;
 
         /* Final field must be preceded by '.', all others by ':'. */
         bool is_final_sep = (*p == '.');
@@ -249,13 +249,13 @@ axl_pci_addr_parse(const char *s, AxlPciAddr *out)
         if (is_final_sep) {
             /* func is next; one more parse then must hit EOF. */
             int fn = parse_hex_field(p, 5, &parts[n_parts]);
-            if (fn < 0) return -1;
+            if (fn < 0) return AXL_ERR;
             p += fn;
             n_parts++;
             break;
         }
     }
-    if (*p != '\0') return -1;
+    if (*p != '\0') return AXL_ERR;
 
     uint32_t seg, bus, dev, func;
     if (n_parts == 4) {
@@ -265,17 +265,17 @@ axl_pci_addr_parse(const char *s, AxlPciAddr *out)
         /* bus:dev.func — segment defaults to 0 */
         seg = 0;        bus = parts[0]; dev = parts[1]; func = parts[2];
     } else {
-        return -1;
+        return AXL_ERR;
     }
 
     if (seg > 0xFFFFu || bus > 0xFFu || dev > 0x1Fu || func > 0x07u) {
-        return -1;
+        return AXL_ERR;
     }
     out->seg  = (uint16_t)seg;
     out->bus  = (uint8_t)bus;
     out->dev  = (uint8_t)dev;
     out->func = (uint8_t)func;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -285,7 +285,7 @@ axl_pci_addr_format(AxlPciAddr addr, char *buf, size_t buflen)
        NUL terminator. AXL_PCI_ADDR_STR_MAX is the recommended
        allocation; the actual minimum we'll accept is one less. */
     if (buf == NULL || buflen < 13) {
-        return -1;
+        return AXL_ERR;
     }
     /* Manual hex formatting — no axl_snprintf needed and avoids
        pulling printf into builds that don't otherwise use it. */
@@ -319,38 +319,38 @@ int
 axl_pci_get_vid_did(AxlPciAddr addr, uint16_t *vid, uint16_t *did)
 {
     if (vid == NULL || did == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint16_t v;
     if (axl_pci_read_config_16(addr, 0x00, &v) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     if (v == 0xFFFF) {
         /* Function absent — caller doesn't have to special-case this. */
-        return -1;
+        return AXL_ERR;
     }
     if (axl_pci_read_config_16(addr, 0x02, did) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *vid = v;
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_pci_get_class_code(AxlPciAddr addr, uint32_t *class_code)
 {
     if (class_code == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t prog_if, sub, base;
-    if (axl_pci_read_config_8(addr, 0x09, &prog_if) != 0 ||
-        axl_pci_read_config_8(addr, 0x0A, &sub)     != 0 ||
-        axl_pci_read_config_8(addr, 0x0B, &base)    != 0)
+    if (axl_pci_read_config_8(addr, 0x09, &prog_if) != AXL_OK ||
+        axl_pci_read_config_8(addr, 0x0A, &sub)     != AXL_OK ||
+        axl_pci_read_config_8(addr, 0x0B, &base)    != AXL_OK)
     {
-        return -1;
+        return AXL_ERR;
     }
     *class_code = ((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog_if;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -365,11 +365,11 @@ axl_pci_get_header_type(AxlPciAddr        addr,
        func" from "function not present." */
     uint16_t v;
     if (axl_pci_read_config_16(addr, 0x00, &v) != 0 || v == 0xFFFF) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t htype;
-    if (axl_pci_read_config_8(addr, 0x0E, &htype) != 0) {
-        return -1;
+    if (axl_pci_read_config_8(addr, 0x0E, &htype) != AXL_OK) {
+        return AXL_ERR;
     }
     if (type != NULL) {
         /* Strip the multi-function bit; pass the low 7 bits through
@@ -380,33 +380,33 @@ axl_pci_get_header_type(AxlPciAddr        addr,
     if (is_multi_function != NULL) {
         *is_multi_function = (htype & 0x80u) != 0;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_pci_get_subsystem(AxlPciAddr addr, uint16_t *svid, uint16_t *sdid)
 {
     if (svid == NULL || sdid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlPciHeaderType hdr;
-    if (axl_pci_get_header_type(addr, &hdr, NULL) != 0) {
-        return -1;
+    if (axl_pci_get_header_type(addr, &hdr, NULL) != AXL_OK) {
+        return AXL_ERR;
     }
     if (hdr != AXL_PCI_HEADER_TYPE_NORMAL) {
         /* PCI-PCI bridges (Type 1) and CardBus bridges (Type 2)
            use 0x2C/0x2E for unrelated fields. */
-        return -1;
+        return AXL_ERR;
     }
     uint16_t v;
     if (axl_pci_read_config_16(addr, 0x2C, &v) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     if (axl_pci_read_config_16(addr, 0x2E, sdid) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *svid = v;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -790,7 +790,7 @@ axl_pci_dump(
         *out_read = 0;
     }
     if (buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* Cap at PCIe ECAM extent and round down to 32-bit alignment. */
     if (bytes > AXL_PCI_CONFIG_SPACE_MAX) {
@@ -798,7 +798,7 @@ axl_pci_dump(
     }
     bytes &= ~(size_t)0x3u;
     if (bytes == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Absent-function check first. ECAM reads of an unmapped address
@@ -811,7 +811,7 @@ axl_pci_dump(
     if (axl_pci_read_config_32(addr, 0, &word0) != 0
         || (word0 & 0xFFFFu) == 0xFFFFu)
     {
-        return -1;
+        return AXL_ERR;
     }
 
     size_t   ok_bytes = 0;
@@ -840,7 +840,7 @@ axl_pci_dump(
     if (out_read != NULL) {
         *out_read = ok_bytes;
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +967,7 @@ axl_pci_next(
                 uint8_t htype;
                 pending_skip_funcs =
                     (axl_pci_read_config_8(cursor,
-                        PCI_HEADER_TYPE_OFFSET, &htype) == 0)
+                        PCI_HEADER_TYPE_OFFSET, &htype) == AXL_OK)
                     && ((htype & PCI_HEADER_MULTIFUNC) == 0);
             } else {
                 pending_skip_funcs = false;
@@ -1023,7 +1023,7 @@ axl_pci_find_by_vid_did(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlPciAddr *p = NULL;
     uint16_t    matches = 0;
@@ -1037,12 +1037,12 @@ axl_pci_find_by_vid_did(
         if (cur_vid == vid && cur_did == did) {
             if (matches == nth) {
                 *out = *p;
-                return 0;
+                return AXL_OK;
             }
             matches++;
         }
     }
-    return -1;
+    return AXL_ERR;
 }
 
 int
@@ -1053,7 +1053,7 @@ axl_pci_find_by_class(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlPciAddr *p = NULL;
     uint16_t    matches = 0;
@@ -1069,12 +1069,12 @@ axl_pci_find_by_class(
         if (class_code == 0xFFFFFFu || cur_class_code == class_code) {
             if (matches == nth) {
                 *out = *p;
-                return 0;
+                return AXL_OK;
             }
             matches++;
         }
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,26 +1093,26 @@ axl_pci_bridge_info(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t htype;
-    if (axl_pci_read_config_8(addr, 0x0E, &htype) != 0) {
-        return -1;
+    if (axl_pci_read_config_8(addr, 0x0E, &htype) != AXL_OK) {
+        return AXL_ERR;
     }
     if ((htype & 0x7Fu) != PCI_HEADER_TYPE_PCI_BRIDGE) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t pri, sec, sub;
-    if (axl_pci_read_config_8(addr, PCI_BRIDGE_PRIMARY_BUS, &pri) != 0
-        || axl_pci_read_config_8(addr, PCI_BRIDGE_SECONDARY_BUS, &sec) != 0
-        || axl_pci_read_config_8(addr, PCI_BRIDGE_SUBORDINATE_BUS, &sub) != 0)
+    if (axl_pci_read_config_8(addr, PCI_BRIDGE_PRIMARY_BUS, &pri) != AXL_OK
+        || axl_pci_read_config_8(addr, PCI_BRIDGE_SECONDARY_BUS, &sec) != AXL_OK
+        || axl_pci_read_config_8(addr, PCI_BRIDGE_SUBORDINATE_BUS, &sub) != AXL_OK)
     {
-        return -1;
+        return AXL_ERR;
     }
     out->primary     = pri;
     out->secondary   = sec;
     out->subordinate = sub;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,25 +1220,25 @@ axl_pci_tree_for_each(
     )
 {
     if (fn == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Pass 1: collect every responding function with its bridge
        bus, if any. */
     AXL_AUTOPTR(AxlArray) funcs = axl_array_new(sizeof(AxlPciTreeFunc));
     if (funcs == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     AxlPciAddr *p = NULL;
     while ((p = axl_pci_next(p)) != NULL) {
         AxlPciTreeFunc f = { .addr = *p, .is_bridge = false, .secondary_bus = 0 };
         AxlPciBridge   br;
-        if (axl_pci_bridge_info(*p, &br) == 0) {
+        if (axl_pci_bridge_info(*p, &br) == AXL_OK) {
             f.is_bridge     = true;
             f.secondary_bus = br.secondary;
         }
-        if (axl_array_append(funcs, &f) != 0) {
-            return -1;
+        if (axl_array_append(funcs, &f) != AXL_OK) {
+            return AXL_ERR;
         }
     }
     axl_array_sort(funcs, tree_func_cmp);
@@ -1277,7 +1277,7 @@ axl_pci_tree_for_each(
             }
         }
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,7 +1407,7 @@ axl_pci_cap_next(
     )
 {
     if (out_off == NULL || out_id == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint16_t next;
@@ -1423,24 +1423,24 @@ axl_pci_cap_next(
         if (axl_pci_read_config_16(addr, PCI_VENDOR_ID_OFFSET, &vid) != 0
             || vid == 0xFFFF)
         {
-            return -1;
+            return AXL_ERR;
         }
         uint16_t status;
         if (axl_pci_read_config_16(addr, PCI_STATUS_OFFSET, &status) != 0) {
-            return -1;
+            return AXL_ERR;
         }
         if ((status & PCI_STATUS_CAP_LIST) == 0) {
-            return -1;
+            return AXL_ERR;
         }
         uint8_t cap_ptr;
-        if (axl_pci_read_config_8(addr, PCI_CAP_PTR_OFFSET, &cap_ptr) != 0) {
-            return -1;
+        if (axl_pci_read_config_8(addr, PCI_CAP_PTR_OFFSET, &cap_ptr) != AXL_OK) {
+            return AXL_ERR;
         }
         next = (uint16_t)(cap_ptr & 0xFC);
     } else {
         uint8_t np;
-        if (axl_pci_read_config_8(addr, (uint16_t)(prev_off + 1), &np) != 0) {
-            return -1;
+        if (axl_pci_read_config_8(addr, (uint16_t)(prev_off + 1), &np) != AXL_OK) {
+            return AXL_ERR;
         }
         next = (uint16_t)(np & 0xFC);
     }
@@ -1451,7 +1451,7 @@ axl_pci_cap_next(
        otherwise loop (e.g. a cap whose `next` points back into the
        header). */
     if (next < 0x40 || next > 0xFC) {
-        return -1;
+        return AXL_ERR;
     }
     /* Forward-progress guard. Spec doesn't formally require monotonic
        cap offsets, but no real device chains backwards; a back-pointer
@@ -1459,15 +1459,15 @@ axl_pci_cap_next(
        catches the all-1s self-loop (next == prev_off == 0xFC) on a
        device that becomes absent mid-walk. */
     if (next <= prev_off) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t cap_id;
-    if (axl_pci_read_config_8(addr, next, &cap_id) != 0) {
-        return -1;
+    if (axl_pci_read_config_8(addr, next, &cap_id) != AXL_OK) {
+        return AXL_ERR;
     }
     *out_off = next;
     *out_id  = cap_id;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,7 +1483,7 @@ axl_pci_ext_cap_next(
     )
 {
     if (out_off == NULL || out_id == NULL || ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint16_t off = (prev_off == 0) ? PCIE_FIRST_EXT_CAP : 0;
@@ -1491,12 +1491,12 @@ axl_pci_ext_cap_next(
     if (prev_off != 0) {
         uint32_t hdr;
         if (axl_pci_read_config_32(addr, prev_off, &hdr) != 0) {
-            return -1;
+            return AXL_ERR;
         }
         off = (uint16_t)((hdr >> 20) & 0xFFFu);
     }
     if (off == 0) {
-        return -1;
+        return AXL_ERR;
     }
     /* Forward-progress guard, mirror of the legacy-cap walk. A next
        offset that doesn't move forward is malformed and would loop;
@@ -1504,20 +1504,20 @@ axl_pci_ext_cap_next(
        all-1s case still terminates via the cap_id == PCIE_EXT_CAP_END
        check below, but this catches mid-walk cycles too. */
     if (prev_off != 0 && off <= prev_off) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t hdr;
     if (axl_pci_read_config_32(addr, off, &hdr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     uint16_t cap_id = (uint16_t)(hdr & 0xFFFFu);
     if (cap_id == PCIE_EXT_CAP_END || cap_id == 0) {
-        return -1;
+        return AXL_ERR;
     }
     *out_off = off;
     *out_id  = cap_id;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,7 +1543,7 @@ find_vpd_cap(
     AxlPciAddr a = addr;
     uint16_t   off = 0;
     uint16_t   id;
-    while (axl_pci_cap_next(a, off, &off, &id) == 0) {
+    while (axl_pci_cap_next(a, off, &off, &id) == AXL_OK) {
         if (id == PCI_CAP_ID_VPD) {
             *out_cap_off = off;
             return 0;
@@ -1755,7 +1755,7 @@ axl_pci_vpd_read(
     )
 {
     if (keyword == NULL || out_len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out_len = 0;
 
@@ -1769,9 +1769,9 @@ axl_pci_vpd_read(
     int rc = vpd_walk(addr, vpd_find_one_cb, &ctx);
     if (rc < 0) {
         /* bus error or malformed VPD */
-        return -1;
+        return AXL_ERR;
     }
-    return ctx.found ? 0 : -1;
+    return ctx.found ? AXL_OK : AXL_ERR;
 }
 
 int
@@ -1783,7 +1783,7 @@ axl_pci_vpd_iter(
     )
 {
     if (cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return vpd_walk(addr, cb, ctx);
 }

@@ -19,6 +19,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 #include <axl/axl-hash-table.h>
 
 #ifdef __cplusplus
@@ -75,7 +76,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlRadixTree, axl_radix_tree_free)
  * If the key already exists, the old value is freed via value_free
  * (if set) and replaced with the new value.
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_radix_tree_insert(

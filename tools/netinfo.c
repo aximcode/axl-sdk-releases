@@ -8,17 +8,20 @@
       axl-cc NetInfo.c -o NetInfo.efi
 
     Usage:
-      NetInfo.efi [-v] [-h] [list | ping <ip> [-c <count>]]
+      NetInfo.efi [-v] [-n] [-h] [list | ping <ip> [-c <count>] | list-bundle]
 **/
 
 #include <axl.h>
 #include <uefi/axl-uefi.h>
 
 static bool verbose = false;
+static bool no_load = false;
 
 static const AxlArgDesc global_flags[] = {
     { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
-      .help = "Verbose output (debug-level driver-locate logs)" },
+      .help = "Verbose output: device-path text, NII layer info, debug logs" },
+    { .name = "no-load", .short_name = 'n', .type = AXL_ARG_BOOL,
+      .help = "Skip auto-loading NIC drivers from drivers/<arch>/" },
     {0}
 };
 
@@ -34,6 +37,17 @@ static const AxlArgDesc ping_pos[] = {
     {0}
 };
 
+/* Build-arch label for drivers/<arch>/ — must match the static
+ * driver_arch in src/util/axl-driver.c. axl-sdk tools are built per-arch
+ * so a compile-time choice is exact. */
+#if defined(__x86_64__)
+static const char netinfo_arch[] = "x64";
+#elif defined(__aarch64__)
+static const char netinfo_arch[] = "aa64";
+#else
+#  error "unknown arch"
+#endif
+
 /* NII protocol GUIDs — not in axl-sdk's generated UEFI headers.
  * iPXE and other UEFI Driver Model NIC drivers install one of these
  * on the NIC's PCI/USB controller handle; firmware-bundled SnpDxe
@@ -48,6 +62,14 @@ static const AxlGuid nii_legacy_guid = {
     0xE18541CD, 0xF755, 0x4F73,
     { 0x92, 0x8D, 0x64, 0x3C, 0x8A, 0x79, 0xB2, 0x29 }
 };
+
+/* NII protocol layout — first field is a UINT64 Revision per the
+ * UEFI/PI spec. We only read the revision; the rest of the struct is
+ * driver-internal. */
+typedef struct {
+    uint64_t  revision;
+    /* trailing fields elided */
+} NiiProtocolHead;
 
 /* Resolve a driver-image handle to a printable path. Walks the
  * EFI_LOADED_IMAGE_PROTOCOL.FilePath device path until it hits a
@@ -132,6 +154,19 @@ find_by_driver_agent(EFI_HANDLE handle, const EFI_GUID *protocol_guid)
     return result;
 }
 
+/* Read the NII Revision word (8 bytes at offset 0) for a handle that
+ * has a BY_DRIVER agent on it for the given NII GUID. Returns 0 if NII
+ * isn't installed on @p handle or the protocol pointer can't be read. */
+static uint64_t
+read_nii_revision(EFI_HANDLE handle, const EFI_GUID *nii_guid)
+{
+    NiiProtocolHead *p = NULL;
+    EFI_STATUS st = gBS->HandleProtocol(
+        handle, (EFI_GUID *)nii_guid, (void **)&p);
+    if (EFI_ERROR(st) || p == NULL) return 0;
+    return p->revision;
+}
+
 /* Walk the SNP handles and report which driver image is bound to each.
  *
  * On UEFI driver-model NIC drivers (iPXE, vendor UNDI binaries) the
@@ -142,25 +177,25 @@ find_by_driver_agent(EFI_HANDLE handle, const EFI_GUID *protocol_guid)
  * NII is present (e.g. drivers that publish SNP directly, like
  * OVMF's VirtioNetDxe).
  *
- * This makes the diagnostic show `\drivers\x64\ipxe-intel.efi` for
- * an iPXE-driven NIC instead of `<firmware volume>` (which is what
- * SnpDxe's image path resolves to on a typical FV-dispatched
- * SnpDxe).  Confirms in one glance that the v0.6.0 staged-iPXE
- * bundle is in fact what's driving the hardware. */
+ * Under -v, also emit:
+ *  - the SNP handle's device path (gives PCI BDF / USB topology / MAC
+ *    in the canonical UEFI format, e.g.
+ *    `PciRoot(0x0)/Pci(0x3,0x0)/MAC(525400123456,0x1)`)
+ *  - the NII protocol revision when we found a BY_DRIVER agent for it. */
 static void
-show_nic_drivers(void)
+show_nic_drivers(const char *label)
 {
     void  **handles = NULL;
     size_t  count = 0;
-    if (axl_service_enumerate("simple-network", &handles, &count) != 0
+    if (axl_service_enumerate("simple-network", &handles, &count) != AXL_OK
         || count == 0)
     {
-        axl_printf("=== NIC Drivers ===\n  (no simple-network handles)\n\n");
+        axl_printf("=== %s ===\n  (no simple-network handles)\n\n", label);
         if (handles) axl_free(handles);
         return;
     }
 
-    axl_printf("=== NIC Drivers ===\n\n");
+    axl_printf("=== %s ===\n\n", label);
     for (size_t i = 0; i < count; i++) {
         EFI_HANDLE handle = (EFI_HANDLE)handles[i];
 
@@ -176,13 +211,39 @@ show_nic_drivers(void)
 
         const char *layer;
         const char *image_label;
-        if (nii31 != NULL)       { layer = "NII3.1"; image_label = nii31; }
-        else if (niileg != NULL) { layer = "NII";    image_label = niileg; }
-        else if (snp != NULL)    { layer = "SNP";    image_label = snp; }
-        else                     { layer = "—";      image_label = "<no driver attached>"; }
+        const EFI_GUID *nii_guid_for_rev = NULL;
+        if (nii31 != NULL) {
+            layer = "NII3.1"; image_label = nii31;
+            nii_guid_for_rev = (const EFI_GUID *)&nii_31_guid;
+        } else if (niileg != NULL) {
+            layer = "NII"; image_label = niileg;
+            nii_guid_for_rev = (const EFI_GUID *)&nii_legacy_guid;
+        } else if (snp != NULL) {
+            layer = "SNP"; image_label = snp;
+        } else {
+            layer = "—"; image_label = "<no driver attached>";
+        }
 
         axl_printf("  NIC[%zu] handle=%p [%s] driver=%s\n",
                    i, handle, layer, image_label);
+
+        if (verbose) {
+            EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
+            if (gBS->HandleProtocol(handle, &EFI_DEVICE_PATH_PROTOCOL_GUID,
+                                    (void **)&dp) == EFI_SUCCESS && dp != NULL)
+            {
+                AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dp);
+                axl_printf("         path=%s\n",
+                           dp_text != NULL ? dp_text : "<unavailable>");
+            }
+            if (nii_guid_for_rev != NULL) {
+                uint64_t rev = read_nii_revision(handle, nii_guid_for_rev);
+                if (rev != 0) {
+                    axl_printf("         nii revision=0x%llx\n",
+                               (unsigned long long)rev);
+                }
+            }
+        }
     }
     axl_printf("\n");
 
@@ -190,23 +251,28 @@ show_nic_drivers(void)
 }
 
 /* Auto-load NIC drivers so NetInfo works from a bare UEFI shell without
- * a startup.nsh that pre-loads them. Same shape as MkRd for RamDiskDxe. */
+ * a startup.nsh that pre-loads them. Same shape as MkRd for RamDiskDxe.
+ * Returns 0 on success-or-no-load, non-zero if hard fail (no NICs and
+ * driver-load couldn't change that). */
 static int
-ensure_net_drivers(void)
+ensure_net_drivers_warn(void)
 {
+    if (no_load) {
+        return 0;  /* user opted out — don't even try */
+    }
     switch (axl_net_ensure_drivers()) {
     case AXL_NET_DRIVERS_OK:
         return 0;
     case AXL_NET_DRIVERS_NOT_FOUND:
-        axl_printf("NetInfo: no NIC drivers found in drivers/<arch>/ "
-                   "on any mounted volume.\n");
+        axl_printf("NetInfo: warning: no NIC drivers found in "
+                   "drivers/<arch>/ on any mounted volume.\n");
         return 1;
     case AXL_NET_DRIVERS_NO_LINK:
-        axl_printf("NetInfo: drivers loaded but no NIC came up — "
-                   "is a NIC plugged in?\n");
+        axl_printf("NetInfo: warning: drivers loaded but no NIC "
+                   "came up — is a NIC plugged in?\n");
         return 1;
     default:
-        axl_printf("NetInfo: failed to bring up networking.\n");
+        axl_printf("NetInfo: warning: failed to bring up networking.\n");
         return 1;
     }
 }
@@ -219,7 +285,7 @@ static void
 show_interfaces(void)
 {
     size_t count = 0;
-    if (axl_net_list_interfaces(NULL, &count) != 0 || count == 0) {
+    if (axl_net_list_interfaces(NULL, &count) != AXL_OK || count == 0) {
         axl_printf("No network interfaces found.\n");
         return;
     }
@@ -273,6 +339,196 @@ show_interfaces(void)
 
     axl_printf("\n");
     axl_free(ifaces);
+}
+
+// ---------------------------------------------------------------------------
+// list-bundle: enumerate drivers/<arch>/ on every mounted volume
+// ---------------------------------------------------------------------------
+
+/* Scan one volume's drivers/<arch>/ directory and print any .efi /
+ * .efidrv entries. Returns the number of entries listed (0 means
+ * "directory absent or empty"). */
+static size_t
+list_bundle_volume(const char *fs_name)
+{
+    char dir_path[64];
+    char sub_path[32];
+    if (axl_snprintf(sub_path, sizeof(sub_path),
+                     "/drivers/%s", netinfo_arch) <= 0) {
+        return 0;
+    }
+    if (axl_path_build_uefi(fs_name, sub_path,
+                            dir_path, sizeof(dir_path)) != AXL_OK) {
+        return 0;
+    }
+
+    AxlDir *dir = axl_dir_open(dir_path);
+    if (dir == NULL) {
+        return 0;
+    }
+
+    size_t shown = 0;
+    AxlDirEntry entry;
+    while (axl_dir_read(dir, &entry)) {
+        if (entry.is_dir) continue;
+        size_t nlen = axl_strlen(entry.name);
+        bool is_driver =
+            (nlen > 4 && axl_strcmp(entry.name + nlen - 4, ".efi") == 0)
+         || (nlen > 7 && axl_strcmp(entry.name + nlen - 7, ".efidrv") == 0);
+        if (!is_driver) continue;
+        if (shown == 0) {
+            axl_printf("  %s/\n", dir_path);
+        }
+        axl_printf("    %-32s %llu bytes\n",
+                   entry.name, (unsigned long long)entry.size);
+        shown++;
+    }
+    axl_dir_close(dir);
+    return shown;
+}
+
+static int
+do_list_bundle_verb(AxlArgs *a)
+{
+    (void)a;
+    AxlVolume volumes[16];
+    size_t n_vols = 0;
+    if (axl_volume_enumerate(volumes, 16, &n_vols) != AXL_OK || n_vols == 0) {
+        axl_printf("=== Driver Bundle ===\n  (no FAT volumes mounted)\n\n");
+        return 0;
+    }
+
+    axl_printf("=== Driver Bundle (drivers/%s/ on each volume) ===\n\n",
+               netinfo_arch);
+    size_t total = 0;
+    for (size_t i = 0; i < n_vols; i++) {
+        total += list_bundle_volume(volumes[i].name);
+    }
+    if (total == 0) {
+        axl_printf("  (no drivers staged)\n");
+    }
+    axl_printf("\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// diag: composite report intended to be copy-pasted to a maintainer
+// ---------------------------------------------------------------------------
+
+static void
+diag_show_firmware(void)
+{
+    AxlFirmwareInfo info = {0};
+    if (axl_sys_get_firmware_info(&info) != AXL_OK) {
+        axl_printf("=== Firmware ===\n  (info unavailable)\n\n");
+        return;
+    }
+    axl_printf("=== Firmware ===\n");
+    axl_printf("  vendor    : %s\n", info.vendor);
+    axl_printf("  rev       : 0x%08x\n", info.firmware_revision);
+    axl_printf("  uefi spec : %u.%u\n", info.spec_major, info.spec_minor);
+    axl_printf("  arch      : %s\n", netinfo_arch);
+    axl_printf("\n");
+}
+
+static void
+diag_show_volumes(void)
+{
+    AxlVolume volumes[16];
+    size_t n = 0;
+    if (axl_volume_enumerate(volumes, 16, &n) != AXL_OK || n == 0) {
+        axl_printf("=== Mounted Volumes ===\n  (none)\n\n");
+        return;
+    }
+    axl_printf("=== Mounted Volumes ===\n");
+    for (size_t i = 0; i < n; i++) {
+        AXL_AUTO_FREE char *dp_text =
+            axl_device_path_to_text(volumes[i].device_path);
+        axl_printf("  %-6s %s\n",
+                   volumes[i].name,
+                   dp_text != NULL ? dp_text : "<no device path>");
+    }
+    axl_printf("\n");
+}
+
+/* PCI class 0x02 = Network controller. Walking by class shows every
+ * NIC the firmware sees in config space — including ones with no UEFI
+ * driver attached. The gap between PCI Network Controllers and
+ * Simple Network Protocol handles is the "missing driver" smoking gun. */
+static void
+diag_show_pci_nics(void)
+{
+    axl_printf("=== PCI Network Controllers (class 0x02xxxx) ===\n");
+    /* Walk every PCI function, filtering by base class 0x02.
+     * axl_pci_find_by_class needs an exact 24-bit class match, which
+     * misses subclasses; the cursor walk lets us match base alone. */
+    AxlPciAddr *p = NULL;
+    bool any = false;
+    while ((p = axl_pci_next(p)) != NULL) {
+        uint32_t class_code = 0;
+        if (axl_pci_get_class_code(*p, &class_code) != AXL_OK) continue;
+        if (((class_code >> 16) & 0xFF) != 0x02) continue;
+
+        uint16_t vid = 0, did = 0;
+        (void)axl_pci_get_vid_did(*p, &vid, &did);
+
+        char addr_buf[AXL_PCI_ADDR_STR_MAX];
+        axl_pci_addr_format(*p, addr_buf, sizeof(addr_buf));
+
+        char id_buf[160];
+        if (axl_pci_format_name(vid, did, id_buf, sizeof(id_buf)) <= 0) {
+            axl_snprintf(id_buf, sizeof(id_buf), "%04x:%04x", vid, did);
+        }
+
+        char class_buf[80];
+        (void)axl_pci_class_string(class_code, class_buf, sizeof(class_buf));
+
+        axl_printf("  %-13s  %s  (%s)\n", addr_buf, id_buf, class_buf);
+        any = true;
+    }
+    if (!any) {
+        axl_printf("  (no network-class PCI functions enumerated)\n");
+    }
+    axl_printf("\n");
+}
+
+static int
+do_diag_verb(AxlArgs *a)
+{
+    (void)a;
+
+    /* diag implies verbose — every section gets its richer payload. */
+    verbose = true;
+    axl_log_set_level(AXL_LOG_DEBUG);
+
+    axl_printf("\n=== NetInfo diag (paste this back to the maintainer) ===\n\n");
+
+    diag_show_firmware();
+    diag_show_volumes();
+    diag_show_pci_nics();
+
+    /* Driver bundle inventory — same shape as `list-bundle`. */
+    (void)do_list_bundle_verb(a);
+
+    /* NIC handle table BEFORE driver-load attempt — shows what
+     * firmware natively provides. */
+    show_nic_drivers("NIC Drivers (before driver-load)");
+
+    /* Try to bring drivers up unless explicitly suppressed. */
+    int rc = ensure_net_drivers_warn();
+    axl_printf("=== ensure_drivers status ===\n");
+    if (no_load) {
+        axl_printf("  --no-load set: skipped\n\n");
+    } else {
+        axl_printf("  result: %s\n\n", rc == 0 ? "OK" : "no link / not found");
+    }
+
+    if (!no_load) {
+        show_nic_drivers("NIC Drivers (after driver-load)");
+    }
+
+    show_interfaces();
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +587,7 @@ do_ping(
         int rc = axl_net_ping(&addr, 5000, &rtt_ms);
         sent++;
 
-        if (rc == 0) {
+        if (rc == AXL_OK) {
             received++;
             rtt_total += rtt_ms;
             if (rtt_ms < rtt_min) {
@@ -369,23 +625,16 @@ do_ping(
 // Entry point
 // ---------------------------------------------------------------------------
 
-/* Pre-run hook: surface verbose mode + ensure NIC drivers are
-   loaded before any verb runs. */
-static int g_netinfo_setup_failed = 0;
-
+/* Pre-run hook: pick up global flags. Per-verb logic owns the
+ * driver-load decision so list-bundle never tries to bring up NICs and
+ * `list` doesn't fail-closed when drivers can't be loaded. */
 static void
 netinfo_pre_run(AxlArgs *a)
 {
     verbose = axl_args_get_bool(a, "verbose");
+    no_load = axl_args_get_bool(a, "no-load");
     if (verbose) {
         axl_log_set_level(AXL_LOG_DEBUG);
-    }
-    if (ensure_net_drivers() != 0) {
-        g_netinfo_setup_failed = 1;
-        return;
-    }
-    if (verbose) {
-        show_nic_drivers();
     }
 }
 
@@ -393,7 +642,22 @@ static int
 do_list_verb(AxlArgs *a)
 {
     (void)a;
-    if (g_netinfo_setup_failed) { return 1; }
+
+    if (verbose) {
+        show_nic_drivers(no_load
+            ? "NIC Drivers (firmware-provided, --no-load)"
+            : "NIC Drivers (before driver-load)");
+    }
+
+    /* Try to bring up drivers, but never gate `list` on the result —
+     * showing zero interfaces when nothing's there is itself a useful
+     * diagnostic. */
+    (void)ensure_net_drivers_warn();
+
+    if (verbose && !no_load) {
+        show_nic_drivers("NIC Drivers (after driver-load)");
+    }
+
     show_interfaces();
     return 0;
 }
@@ -401,14 +665,27 @@ do_list_verb(AxlArgs *a)
 static int
 do_ping_verb(AxlArgs *a)
 {
-    if (g_netinfo_setup_failed) { return 1; }
+    if (verbose) {
+        show_nic_drivers(no_load
+            ? "NIC Drivers (firmware-provided, --no-load)"
+            : "NIC Drivers (before driver-load)");
+    }
+
+    /* ping requires a NIC; fail-closed if drivers can't be loaded. */
+    if (ensure_net_drivers_warn() != 0) {
+        return 1;
+    }
+
+    if (verbose && !no_load) {
+        show_nic_drivers("NIC Drivers (after driver-load)");
+    }
 
     const char *target     = axl_args_get_string(a, "target");
     uint32_t    ping_count = (uint32_t)axl_args_get_uint(a, "count");
     if (ping_count == 0) {
         ping_count = 4;
     }
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("NetInfo: no IP address — DHCP did not complete.\n");
         return 1;
     }
@@ -421,6 +698,10 @@ static const AxlArgsNode verbs[] = {
     { .name = "ping", .handler = do_ping_verb,
       .flags = ping_flags, .positionals = ping_pos,
       .help = "Send ICMP echo to a target IP" },
+    { .name = "list-bundle", .handler = do_list_bundle_verb,
+      .help = "List staged drivers in drivers/<arch>/ on each mounted volume" },
+    { .name = "diag", .handler = do_diag_verb,
+      .help = "Composite report (firmware, PCI NICs, drivers, interfaces)" },
     {0}
 };
 

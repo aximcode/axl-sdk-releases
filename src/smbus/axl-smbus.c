@@ -74,7 +74,7 @@ axl_smbus_read_block(AxlSmbus *s,
                      size_t   *len)
 {
     if (s == NULL || buf == NULL || len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return s->ops.read_block(s->ops.ctx, slave, command, buf, len);
 }
@@ -92,7 +92,7 @@ axl_smbus_write_block(AxlSmbus       *s,
        being misinterpreted as a Byte Write by transports that
        discriminate write shape on length. */
     if (s == NULL || buf == NULL || len == 0 || len > AXL_SMBUS_BLOCK_MAX) {
-        return -1;
+        return AXL_ERR;
     }
     return s->ops.write_block(s->ops.ctx, slave, command, buf, len);
 }
@@ -104,7 +104,7 @@ axl_smbus_read_byte(AxlSmbus *s,
                     uint8_t  *out)
 {
     if (s == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return s->ops.read_byte(s->ops.ctx, slave, command, out);
 }
@@ -116,7 +116,7 @@ axl_smbus_write_byte(AxlSmbus *s,
                      uint8_t   value)
 {
     if (s == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return s->ops.write_byte(s->ops.ctx, slave, command, value);
 }

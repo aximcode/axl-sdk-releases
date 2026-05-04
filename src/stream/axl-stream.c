@@ -162,7 +162,7 @@ console_read(void *ctx, void *buf, size_t count)
         return 0;
     }
     size_t n = count;
-    if (axl_backend_file_read(h, &n, buf) != 0) {
+    if (axl_backend_file_read(h, &n, buf) != AXL_OK) {
         return -1;
     }
     return (axl_ssize_t)n;
@@ -200,7 +200,7 @@ console_write_raw(void *ctx, const void *data, size_t count)
         return -1;
     }
     size_t n = count;
-    if (axl_backend_file_write(h, &n, data) != 0) {
+    if (axl_backend_file_write(h, &n, data) != AXL_OK) {
         return -1;
     }
     return (axl_ssize_t)n;
@@ -233,20 +233,20 @@ int
 axl_stream_set_stdout_tee(AxlStream *extra)
 {
     if (axl_stdout == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     axl_stdout->tee = extra;
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_stream_set_stderr_tee(AxlStream *extra)
 {
     if (axl_stderr == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     axl_stderr->tee = extra;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,11 +257,11 @@ int
 axl_stream_set_encoding(AxlStream *s, AxlEncoding enc)
 {
     if (s == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (enc != AXL_ENC_UTF8 && enc != AXL_ENC_UCS2_LE
         && enc != AXL_ENC_UCS2_BE && enc != AXL_ENC_ASCII) {
-        return -1;
+        return AXL_ERR;
     }
     /* Reset transcode buffers — pending bytes describe partial state
        that is no longer meaningful under the new encoding, and the
@@ -270,7 +270,7 @@ axl_stream_set_encoding(AxlStream *s, AxlEncoding enc)
     s->in_pending_n  = 0;
     s->out_pending_n = 0;
     s->encoding      = enc;
-    return 0;
+    return AXL_OK;
 }
 
 AxlEncoding
@@ -831,7 +831,7 @@ axl_walk_lines(
         int rc = fn(line, len, truncated, user);
         if (rc != 0) return rc;
     }
-    return axl_line_reader_error(&r) ? -1 : 0;
+    return axl_line_reader_error(&r) ? AXL_ERR : AXL_OK;
 }
 
 char *
@@ -947,7 +947,7 @@ int
 axl_fseek(AxlStream *s, int64_t offset, int whence)
 {
     if (s == NULL || s->seek == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* Discard buffered transcode state — those bytes describe a
        partial sequence at the OLD position; splicing them onto the
@@ -980,10 +980,10 @@ int
 axl_fflush(AxlStream *s)
 {
     if (s == NULL) {
-        return 0;
+        return AXL_OK;
     }
     if (s->flush == NULL) {
-        return 0;
+        return AXL_OK;
     }
     return s->flush(s->ctx);
 }

@@ -41,7 +41,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
     EFI_IPv4_ADDRESS              dns_server;
 
     if (hostname == NULL || addr == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -49,7 +49,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
     //
     status = net_parse_ip_address(hostname, (EFI_IPv4_ADDRESS *)addr);
     if (!EFI_ERROR(status)) {
-        return 0;
+        return AXL_OK;
     }
 
     //
@@ -63,7 +63,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
                     &handles);
     if (EFI_ERROR(status) || handle_count == 0) {
         axl_warning("no DNS4 service binding — cannot resolve '%s'", hostname);
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
@@ -72,7 +72,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
                     (void **)&dns_sb);
     axl_backend_free(handles);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -82,7 +82,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
     status = axl_efi_call(dns_sb->CreateChild, 2, dns_sb, &dns_child);
     if (EFI_ERROR(status)) {
         axl_error("DNS4 CreateChild: %llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
@@ -91,7 +91,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
                     (void **)&dns4);
     if (EFI_ERROR(status)) {
         axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -125,7 +125,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
         if (EFI_ERROR(status)) {
             axl_error("DNS4 Configure: %llx", (unsigned long long)status);
             axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-            return -1;
+            return AXL_ERR;
         }
     }
 
@@ -133,10 +133,10 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
     // Create completion event
     //
     dns_event = NULL;
-    if (axl_backend_event_create((AxlEventHandle *)&dns_event) != 0) {
+    if (axl_backend_event_create((AxlEventHandle *)&dns_event) != AXL_OK) {
         axl_efi_call(dns4->Configure, 2, dns4, NULL);
         axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -155,7 +155,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
         axl_backend_event_close((AxlEventHandle)dns_event);
         axl_efi_call(dns4->Configure, 2, dns4, NULL);
         axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-        return -1;
+        return AXL_ERR;
     }
 
     ascii_str_to_ucs2(hostname, host_w, host_len + 1);
@@ -168,7 +168,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
         axl_backend_event_close((AxlEventHandle)dns_event);
         axl_efi_call(dns4->Configure, 2, dns4, NULL);
         axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -211,5 +211,5 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
     axl_backend_event_close((AxlEventHandle)dns_event);
     axl_efi_call(dns4->Configure, 2, dns4, NULL);
     axl_efi_call(dns_sb->DestroyChild, 2, dns_sb, dns_child);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }

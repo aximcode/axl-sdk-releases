@@ -58,17 +58,17 @@ axl_rng_bytes(
     )
 {
     if (out == NULL || len == 0) {
-        return -1;
+        return AXL_ERR;
     }
     EfiRngProtocol *rng = get_rng();
     if (rng == NULL || rng->GetRNG == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     EFI_STATUS status = rng->GetRNG(rng, NULL, (UINTN)len, (uint8_t *)out);
     if (EFI_ERROR(status)) {
         axl_warning("GetRNG(%zu) failed: 0x%llx",
                     len, (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }

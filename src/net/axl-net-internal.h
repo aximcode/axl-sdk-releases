@@ -109,16 +109,18 @@ typedef struct {
 //
 // Each wraps the shared _axl_event_wait_timeout_with_tick primitive and
 // drives its protocol's Poll() as the periodic tick so the UEFI driver
-// advances while the CPU idles between events. All three follow the
-// AxlWait return convention: 0 = event fired, -1 = timeout, -2 = Ctrl-C.
+// advances while the CPU idles between events. All four return @ref
+// AxlStatus: AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED
+// on Ctrl-C, AXL_ERR on internal failure.
 // ---------------------------------------------------------------------------
 
 /**
  * @brief Wait for a UDP4 completion event.
  *
- * @return 0 on event, -1 on timeout, -2 on Ctrl-C.
+ * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
+ *     Ctrl-C, AXL_ERR on internal failure.
  */
-int
+AxlStatus
 _axl_udp_wait(
     EFI_UDP4_PROTOCOL *udp4,        ///< UDP4 protocol (polled each tick)
     EFI_EVENT          event,       ///< completion token's Event
@@ -128,9 +130,10 @@ _axl_udp_wait(
 /**
  * @brief Wait for a TCP4 completion event.
  *
- * @return 0 on event, -1 on timeout, -2 on Ctrl-C.
+ * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
+ *     Ctrl-C, AXL_ERR on internal failure.
  */
-int
+AxlStatus
 _axl_tcp_wait(
     EFI_TCP4_PROTOCOL *tcp4,        ///< TCP4 protocol (polled each tick)
     EFI_EVENT          event,       ///< completion token's Event
@@ -140,9 +143,10 @@ _axl_tcp_wait(
 /**
  * @brief Wait for a DNS4 completion event.
  *
- * @return 0 on event, -1 on timeout, -2 on Ctrl-C.
+ * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
+ *     Ctrl-C, AXL_ERR on internal failure.
  */
-int
+AxlStatus
 _axl_dns_wait(
     EFI_DNS4_PROTOCOL *dns4,        ///< DNS4 protocol (polled each tick)
     EFI_EVENT          event,       ///< completion token's Event
@@ -152,9 +156,10 @@ _axl_dns_wait(
 /**
  * @brief Wait for an IP4 completion event.
  *
- * @return 0 on event, -1 on timeout, -2 on Ctrl-C.
+ * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
+ *     Ctrl-C, AXL_ERR on internal failure.
  */
-int
+AxlStatus
 _axl_ip4_wait(
     EFI_IP4_PROTOCOL *ip4,          ///< IP4 protocol (polled each tick)
     EFI_EVENT         event,        ///< completion token's Event

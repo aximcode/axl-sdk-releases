@@ -154,7 +154,7 @@ void start_conn_recv(AxlHttpServer *s, HttpConn *conn);
 /* HTTP server uses explicit re-arm via start_conn_recv (different
    buffers per phase: header, body, chunk, websocket). Always
    returns false; all continuation is caller-driven. */
-bool on_conn_data(AxlTcp *sock, int status, void *data);
+bool on_conn_data(AxlTcp *sock, AxlStatus status, void *data);
 void dispatch_and_respond(AxlHttpServer *s, HttpConn *conn);
 void reset_connection(HttpConn *conn);
 

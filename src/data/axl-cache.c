@@ -103,7 +103,7 @@ axl_cache_put(AxlCache *c, const char *key, const void *value)
     size_t     idx;
 
     if (c == NULL || key == NULL || value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Update existing? */
@@ -112,7 +112,7 @@ axl_cache_put(AxlCache *c, const char *key, const void *value)
         idx = slot_index(c, slot);
         axl_memcpy(c->values + idx * c->entry_size, value, c->entry_size);
         slot->timestamp_ms = axl_time_get_ms();
-        return 0;
+        return AXL_OK;
     }
 
     /* Find empty slot */
@@ -145,7 +145,7 @@ fill:
     slot->timestamp_ms = axl_time_get_ms();
     slot->valid = true;
     axl_memcpy(c->values + idx * c->entry_size, value, c->entry_size);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -155,17 +155,17 @@ axl_cache_get(AxlCache *c, const char *key, void *value)
     size_t     idx;
 
     if (c == NULL || key == NULL || value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     slot = find_slot(c, key);
     if (slot == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (is_expired(c, slot)) {
         slot->valid = false;
-        return -1;
+        return AXL_ERR;
     }
 
     /* Refresh timestamp on hit (LRU) */
@@ -173,7 +173,7 @@ axl_cache_get(AxlCache *c, const char *key, void *value)
 
     idx = slot_index(c, slot);
     axl_memcpy(value, c->values + idx * c->entry_size, c->entry_size);
-    return 0;
+    return AXL_OK;
 }
 
 void

@@ -65,7 +65,7 @@ driver_build_file_dp(const char *path)
     /* Find the volume handle by name. */
     AxlVolume volumes[DRIVER_VOL_NAME_MAX];
     size_t    n_vols = 0;
-    if (axl_volume_enumerate(volumes, DRIVER_VOL_NAME_MAX, &n_vols) != 0
+    if (axl_volume_enumerate(volumes, DRIVER_VOL_NAME_MAX, &n_vols) != AXL_OK
         || n_vols == 0)
     {
         return NULL;
@@ -147,7 +147,7 @@ axl_driver_load(
     EFI_HANDLE image = NULL;
 
     if (path == NULL || handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *handle = NULL;
@@ -171,7 +171,7 @@ axl_driver_load(
 
         if (!EFI_ERROR(status)) {
             *handle = (AxlDriverHandle)image;
-            return 0;
+            return AXL_OK;
         }
         axl_debug("driver load: DevicePath LoadImage failed for '%s': 0x%llx; "
                   "falling back to buffer load",
@@ -185,9 +185,9 @@ axl_driver_load(
      * already logs that case. */
     void *buf = NULL;
     size_t buf_size = 0;
-    if (axl_file_get_contents(path, &buf, &buf_size) != 0 || buf == NULL) {
+    if (axl_file_get_contents(path, &buf, &buf_size) != AXL_OK || buf == NULL) {
         axl_warning("driver load: cannot read '%s'", path);
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->LoadImage(
@@ -200,11 +200,11 @@ axl_driver_load(
     if (EFI_ERROR(status)) {
         axl_warning("driver load: LoadImage failed for '%s': 0x%llx",
                    path, (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     *handle = (AxlDriverHandle)image;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -216,7 +216,7 @@ axl_driver_start(
     size_t exit_data_size = 0;
 
     if (handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->StartImage(
@@ -227,10 +227,10 @@ axl_driver_start(
     if (EFI_ERROR(status)) {
         axl_warning("driver start failed: 0x%llx",
                    (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -256,14 +256,14 @@ axl_driver_connect(
     EFI_STATUS  st = axl_bs()->LocateHandleBuffer(
         AllHandles, NULL, NULL, &count, &handles);
     if (EFI_ERROR(st) || handles == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     for (UINTN i = 0; i < count; i++) {
         axl_bs()->ConnectController(handles[i], NULL, NULL, TRUE);
     }
     axl_bs()->FreePool(handles);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -273,12 +273,12 @@ axl_driver_disconnect(
 {
     if (handle != NULL) {
         axl_bs()->DisconnectController((EFI_HANDLE)handle, NULL, NULL);
-        return 0;
+        return AXL_OK;
     }
 
     /* NULL handle — disconnect all */
     axl_bs()->DisconnectController(NULL, NULL, NULL);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -289,11 +289,11 @@ axl_driver_unload(
     EFI_STATUS status;
 
     if (handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->UnloadImage((EFI_HANDLE)handle);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -308,7 +308,7 @@ axl_driver_set_load_options(
     void *copy;
 
     if (handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->HandleProtocol(
@@ -318,26 +318,26 @@ axl_driver_set_load_options(
 
     if (EFI_ERROR(status) || img == NULL) {
         axl_warning("driver set_load_options: HandleProtocol failed");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Allow NULL data to clear load options */
     if (data == NULL || size == 0) {
         img->LoadOptions = NULL;
         img->LoadOptionsSize = 0;
-        return 0;
+        return AXL_OK;
     }
 
     /* Copy the data — caller's buffer may be on the stack */
     copy = axl_malloc(size);
     if (copy == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     axl_memcpy(copy, data, size);
 
     img->LoadOptions = copy;
     img->LoadOptionsSize = (UINT32)(size > 0xFFFFFFFF ? 0xFFFFFFFF : size);
-    return 0;
+    return AXL_OK;
 }
 
 char *
@@ -409,7 +409,7 @@ axl_driver_connect_handle(
     EFI_STATUS status;
 
     if (handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->ConnectController(
@@ -417,10 +417,10 @@ axl_driver_connect_handle(
 
     /* NOT_FOUND is OK — means no new bindings, not an error */
     if (EFI_ERROR(status) && status != EFI_NOT_FOUND) {
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -433,7 +433,7 @@ axl_driver_set_unload(
     EFI_STATUS status;
 
     if (gImageHandle == NULL || unload_fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->HandleProtocol(
@@ -442,11 +442,11 @@ axl_driver_set_unload(
         (void **)&img);
 
     if (EFI_ERROR(status) || img == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     img->Unload = (EFI_IMAGE_UNLOAD)unload_fn;
-    return 0;
+    return AXL_OK;
 }
 
 void
@@ -497,7 +497,7 @@ driver_protocol_registered(
      * out of the public-surface const story. */
     EFI_STATUS st = axl_bs()->LocateProtocol(
         (EFI_GUID *)guid, NULL, &iface);
-    return EFI_ERROR(st) ? -1 : 0;
+    return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
 }
 
 static int
@@ -508,21 +508,21 @@ driver_append_candidate(
     )
 {
     if (*n_cand >= DRIVER_MAX_CANDIDATES || path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* Dedup: paths 1 and 2 collide whenever the running image lives
      * directly under drivers/<arch>/, which is the common mkrd case. */
     for (size_t i = 0; i < *n_cand; i++) {
         if (axl_strcmp(candidates[i], path) == 0) {
-            return 0;
+            return AXL_OK;
         }
     }
     char *copy = axl_strdup(path);
     if (copy == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     candidates[(*n_cand)++] = copy;
-    return 0;
+    return AXL_OK;
 }
 
 /* Build the standard driver-search candidate list. Caller owns
@@ -569,7 +569,7 @@ driver_build_candidates(
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
                          "/drivers/%s/%s", driver_arch, driver_name) > 0
             && axl_path_build_uefi(image_fs, sub_buf,
-                                   path_buf, sizeof(path_buf)) == 0)
+                                   path_buf, sizeof(path_buf)) == AXL_OK)
         {
             driver_append_candidate(candidates, n_cand, path_buf);
         }
@@ -585,7 +585,7 @@ driver_build_candidates(
                 if (axl_snprintf(sub_buf, sizeof(sub_buf),
                                  "%s/%s", image_dir, driver_name) > 0
                     && axl_path_build_uefi(image_fs, sub_buf,
-                                           path_buf, sizeof(path_buf)) == 0)
+                                           path_buf, sizeof(path_buf)) == AXL_OK)
                 {
                     driver_append_candidate(candidates, n_cand, path_buf);
                 }
@@ -596,7 +596,7 @@ driver_build_candidates(
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
                          "/drivers/%s", driver_name) > 0
             && axl_path_build_uefi(image_fs, sub_buf,
-                                   path_buf, sizeof(path_buf)) == 0)
+                                   path_buf, sizeof(path_buf)) == AXL_OK)
         {
             driver_append_candidate(candidates, n_cand, path_buf);
         }
@@ -610,7 +610,7 @@ driver_build_candidates(
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
                          "/drivers/%s/%s", driver_arch, driver_name) > 0
             && axl_path_build_uefi(volumes[i].name, sub_buf,
-                                   path_buf, sizeof(path_buf)) == 0)
+                                   path_buf, sizeof(path_buf)) == AXL_OK)
         {
             driver_append_candidate(candidates, n_cand, path_buf);
         }
@@ -625,7 +625,7 @@ axl_driver_locate(
     )
 {
     if (driver_name == NULL || out == NULL || out_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     char  *candidates[DRIVER_MAX_CANDIDATES];
@@ -635,7 +635,7 @@ axl_driver_locate(
     int rc = -1;
     for (size_t i = 0; i < n_cand; i++) {
         AxlFileInfo info;
-        if (axl_file_info(candidates[i], &info) == 0 && !info.is_dir) {
+        if (axl_file_info(candidates[i], &info) == AXL_OK && !info.is_dir) {
             size_t len = axl_strlen(candidates[i]);
             if (len + 1 > out_size) {
                 /* Path doesn't fit in caller buffer; treat as error
@@ -657,7 +657,7 @@ axl_driver_locate(
 }
 
 /* Try to start a loaded driver and confirm it registered protocol_guid.
- * Caller owns @p drv; on failure (return -1) the driver is unloaded.
+ * Caller owns @p drv; on failure (return AXL_ERR) the driver is unloaded.
  * On success the driver stays loaded. EFI_ALREADY_STARTED is treated
  * as success — some drivers DXE-Core-dispatched re-register cleanly. */
 static int
@@ -675,12 +675,12 @@ driver_start_and_verify(
         axl_warning("driver ensure: StartImage failed for '%s': 0x%llx",
                     source_label, (unsigned long long)st);
         axl_driver_unload(drv);
-        return -1;
+        return AXL_ERR;
     }
 
     if (driver_protocol_registered(protocol_guid) == 0) {
         axl_info("driver ensure: loaded '%s'", source_label);
-        return 0;
+        return AXL_OK;
     }
 
     /* Driver started but didn't register the expected protocol.
@@ -688,7 +688,7 @@ driver_start_and_verify(
     axl_warning("driver ensure: '%s' did not register protocol; unloading",
                 source_label);
     axl_driver_unload(drv);
-    return -1;
+    return AXL_ERR;
 }
 
 /* Walk the candidate list, attempting to load+start each in order.
@@ -702,7 +702,7 @@ driver_try_candidates(
 {
     for (size_t i = 0; i < n_cand; i++) {
         AxlFileInfo info;
-        if (axl_file_info(candidates[i], &info) != 0 || info.is_dir) {
+        if (axl_file_info(candidates[i], &info) != AXL_OK || info.is_dir) {
             axl_debug("  miss: %s", candidates[i]);
             continue;
         }
@@ -714,10 +714,10 @@ driver_try_candidates(
         }
 
         if (driver_start_and_verify(drv, protocol_guid, candidates[i]) == 0) {
-            return 0;
+            return AXL_OK;
         }
     }
-    return -1;
+    return AXL_ERR;
 }
 
 /* LoadImage from a memory buffer (no DevicePath, no FilePath). Used
@@ -744,7 +744,7 @@ driver_load_embedded(
     if (EFI_ERROR(st) || drv_handle == NULL) {
         axl_warning("driver ensure: LoadImage(embedded, %zu bytes) failed: 0x%llx",
                     len, (unsigned long long)st);
-        return -1;
+        return AXL_ERR;
     }
 
     return driver_start_and_verify((AxlDriverHandle)drv_handle,
@@ -761,7 +761,7 @@ axl_driver_ensure_with_embedded(
     )
 {
     if (protocol_guid == NULL || driver_name == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Step 1: short-circuit if the protocol is already registered.
@@ -770,7 +770,7 @@ axl_driver_ensure_with_embedded(
      * common path — no disk search, no embedded fallback. */
     if (driver_protocol_registered(protocol_guid) == 0) {
         axl_debug("driver ensure: protocol already registered, skipping search");
-        return 0;
+        return AXL_OK;
     }
 
     /* Step 2/3: disk search. If override_name was passed, search for
@@ -796,7 +796,7 @@ axl_driver_ensure_with_embedded(
     }
 
     if (rc == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     /* Disk search failed. Try the embedded blob unless the caller
@@ -807,7 +807,7 @@ axl_driver_ensure_with_embedded(
         axl_debug("driver ensure: disk search exhausted, "
                   "trying embedded fallback (%zu bytes)", embedded_len);
         if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len) == 0) {
-            return 0;
+            return AXL_OK;
         }
     }
 
@@ -815,7 +815,7 @@ axl_driver_ensure_with_embedded(
                 search_name, n_cand, n_cand == 1 ? "" : "s",
                 (override_name == NULL && embedded_buf != NULL)
                     ? " (embedded fallback also failed)" : "");
-    return -1;
+    return AXL_ERR;
 }
 
 int
@@ -844,7 +844,7 @@ driver_load_cb(const char *full_path, const AxlDirEntry *entry, void *user)
 {
     DriverLoadCtx *c = (DriverLoadCtx *)user;
     if (entry->is_dir || !axl_fnmatch(c->pattern, entry->name)) {
-        return 0;
+        return AXL_OK;
     }
     AxlDriverHandle drv;
     if (axl_driver_load(full_path, &drv) == 0) {
@@ -857,7 +857,7 @@ driver_load_cb(const char *full_path, const AxlDirEntry *entry, void *user)
             axl_warning("failed to start: %s", entry->name);
         }
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -867,7 +867,7 @@ axl_driver_load_dir(
     size_t     *loaded_count)
 {
     if (dir_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     DriverLoadCtx ctx = {
@@ -884,5 +884,5 @@ axl_driver_load_dir(
     if (loaded_count != NULL) {
         *loaded_count = ctx.loaded;
     }
-    return 0;
+    return AXL_OK;
 }

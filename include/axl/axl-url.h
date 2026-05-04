@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,7 +29,7 @@ typedef struct {
 /**
  * @brief Parse a URL string into components.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_url_parse(

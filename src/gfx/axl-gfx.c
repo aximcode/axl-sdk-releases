@@ -68,14 +68,14 @@ axl_gfx_get_info(
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
     if (g == NULL || info == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     info->width       = g->Mode->Info->HorizontalResolution;
     info->height      = g->Mode->Info->VerticalResolution;
     info->stride      = g->Mode->Info->PixelsPerScanLine;
     info->framebuffer = g->Mode->FrameBufferBase;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -89,7 +89,7 @@ axl_gfx_fill_rect(
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
     if (g == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_GRAPHICS_OUTPUT_BLT_PIXEL pixel;
@@ -105,7 +105,7 @@ axl_gfx_fill_rect(
         w, h,   /* size */
         0       /* delta (ignored for fill) */
         );
-    return (status == 0) ? 0 : -1;
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }
 
 int
@@ -119,7 +119,7 @@ axl_gfx_blit(
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
     if (g == NULL || buffer == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_STATUS status = g->Blt(
@@ -130,7 +130,7 @@ axl_gfx_blit(
         w, h,   /* size */
         w * sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL)  /* delta = row stride */
         );
-    return (status == 0) ? 0 : -1;
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }
 
 int
@@ -144,7 +144,7 @@ axl_gfx_capture(
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
     if (g == NULL || buffer == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_STATUS status = g->Blt(
@@ -155,7 +155,7 @@ axl_gfx_capture(
         w, h,   /* size */
         w * sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL)  /* delta = row stride */
         );
-    return (status == 0) ? 0 : -1;
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }
 
 // ===================================================================
@@ -287,12 +287,12 @@ axl_gfx_draw_text(
     size_t     ci;
 
     if (g == NULL || text == NULL || scale == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     len = axl_strlen(text);
     if (len == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     char_w  = FONT_W * scale;
@@ -308,9 +308,9 @@ axl_gfx_draw_text(
     /* Clamp to screen bounds */
     {
         AxlGfxInfo scr;
-        if (axl_gfx_get_info(&scr) == 0) {
+        if (axl_gfx_get_info(&scr) == AXL_OK) {
             if (x >= scr.width || y >= scr.height) {
-                return -1;
+                return AXL_ERR;
             }
             if (x + total_w > scr.width) {
                 total_w = scr.width - x;
@@ -323,7 +323,7 @@ axl_gfx_draw_text(
 
     buf = axl_malloc((size_t)total_w * total_h * sizeof(*buf));
     if (buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Capture existing screen content as background */
@@ -382,5 +382,5 @@ axl_gfx_draw_text(
         );
 
     axl_free(buf);
-    return (status == 0) ? 0 : -1;
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }

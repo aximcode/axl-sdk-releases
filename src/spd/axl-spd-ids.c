@@ -235,7 +235,7 @@ axl_spd_ids_foreach_vendor(
     )
 {
     if (ids == NULL || fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     VendorAdapterCtx adapter = { .fn = fn, .ctx = ctx };
     return _axl_sidecar_foreach(ids->vendors, vendor_adapter, &adapter);
@@ -254,7 +254,7 @@ axl_spd_ids_format_name(
     )
 {
     if (buf == NULL || buflen == 0) {
-        return -1;
+        return AXL_ERR;
     }
     const char *name = axl_spd_ids_vendor_name(ids, code);
     if (name != NULL) {

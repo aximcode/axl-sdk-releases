@@ -91,7 +91,7 @@ The simplest way to read or write files:
 // Read entire file into memory
 void *data;
 size_t len;
-if (axl_file_get_contents("fs0:/config.json", &data, &len) == 0) {
+if (axl_file_get_contents("fs0:/config.json", &data, &len) == AXL_OK) {
     // process data...
     axl_free(data);
 }

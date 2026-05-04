@@ -57,13 +57,13 @@ main(int argc, char **argv)
 
     /* Bring up networking (load NIC drivers, ConnectController,
        wait for DHCP). Idempotent — see net-check.c. */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("error: network bring-up failed\n");
         return 1;
     }
 
     AXL_AUTOPTR(AxlSocket) listener = axl_socket_new(AXL_SOCKET_STREAM);
-    if (listener == NULL || axl_socket_listen(listener, port) != 0) {
+    if (listener == NULL || axl_socket_listen(listener, port) != AXL_OK) {
         axl_printf("error: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
@@ -75,7 +75,7 @@ main(int argc, char **argv)
 
         /* timeout_ms = 0 → wait forever for a client to connect.
            Ctrl-C still ends the wait via the loop's break observation. */
-        if (axl_socket_accept(listener, &client, 0) != 0 || client == NULL) {
+        if (axl_socket_accept(listener, &client, 0) != AXL_OK || client == NULL) {
             if (axl_interrupted()) {
                 break;
             }
@@ -89,14 +89,14 @@ main(int argc, char **argv)
             char   buf[256];
             size_t size = sizeof(buf) - 1;
 
-            if (axl_socket_receive(client, buf, &size, 0) != 0
+            if (axl_socket_receive(client, buf, &size, 0) != AXL_OK
                 || size == 0) {
                 break;
             }
             buf[size] = '\0';
             axl_printf("  recv: %.*s\n", (int)size, buf);
 
-            if (axl_socket_send(client, buf, size, 0) != 0) {
+            if (axl_socket_send(client, buf, size, 0) != AXL_OK) {
                 break;
             }
         }

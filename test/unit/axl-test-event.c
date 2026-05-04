@@ -94,8 +94,8 @@ test_event_signal_before_wait(void)
     }
 
     axl_event_signal(e);
-    test_check(axl_event_wait_timeout(e, NULL, 1000000) == 0,
-               "event: signal-before-wait returns 0");
+    test_check(axl_event_wait_timeout(e, NULL, 1000000) == AXL_OK,
+               "event: signal-before-wait returns AXL_OK");
     axl_event_free(e);
 }
 
@@ -114,8 +114,8 @@ test_event_reset_and_reuse(void)
     axl_event_signal(e);
     test_check(axl_event_is_set(e) == true,
                "event: is_set true after signal");
-    test_check(axl_event_wait_timeout(e, NULL, 1000000) == 0,
-               "event: first wait returns 0");
+    test_check(axl_event_wait_timeout(e, NULL, 1000000) == AXL_OK,
+               "event: first wait returns AXL_OK");
     test_check(axl_event_is_set(e) == false,
                "event: successful wait clears is_set");
 
@@ -126,8 +126,8 @@ test_event_reset_and_reuse(void)
 
     /* Second cycle -- the event is reusable after being consumed. */
     axl_event_signal(e);
-    test_check(axl_event_wait_timeout(e, NULL, 1000000) == 0,
-               "event: second wait returns 0");
+    test_check(axl_event_wait_timeout(e, NULL, 1000000) == AXL_OK,
+               "event: second wait returns AXL_OK");
     test_check(axl_event_is_set(e) == false,
                "event: is_set cleared after second wait");
 
@@ -177,8 +177,8 @@ test_event_timed_out_wait_preserves_is_set(void)
     }
 
     /* Event is unsignalled; short timeout. is_set stays false. */
-    test_check(axl_event_wait_timeout(e, NULL, 20000) == -1,
-               "event: wait returns -1 on timeout");
+    test_check(axl_event_wait_timeout(e, NULL, 20000) == AXL_TIMEOUT,
+               "event: wait returns AXL_TIMEOUT on deadline");
     test_check(axl_event_is_set(e) == false,
                "event: is_set still false after timeout");
 
@@ -198,7 +198,7 @@ test_event_reset_drops_pending(void)
     axl_event_reset(e);
     test_check(axl_event_is_set(e) == false,
                "event: reset drops is_set");
-    test_check(axl_event_wait_timeout(e, NULL, 10000) == -1,
+    test_check(axl_event_wait_timeout(e, NULL, 10000) == AXL_TIMEOUT,
                "event: reset drops pending signal (wait times out)");
 
     axl_event_free(e);
@@ -213,8 +213,38 @@ test_event_timeout(void)
         return;
     }
 
-    test_check(axl_event_wait_timeout(e, NULL, 20000) == -1,
+    test_check(axl_event_wait_timeout(e, NULL, 20000) == AXL_TIMEOUT,
                "event: unsignalled wait times out");
+
+    axl_event_free(e);
+}
+
+/*
+ * Regression test for the AXL_TIMEOUT / AXL_ERR disambiguation
+ * introduced with AxlStatus. Pre-AxlStatus, both timeout and
+ * invalid-arg returned -1, so callers couldn't distinguish "deadline
+ * elapsed" from "you passed garbage". A NULL event must yield
+ * AXL_ERR; a valid-but-unsignalled event with a short timeout must
+ * yield AXL_TIMEOUT — distinct values, distinct meaning.
+ */
+static void
+test_event_timeout_distinct_from_error(void)
+{
+    AxlEvent *e = axl_event_new();
+    if (e == NULL) {
+        test_fail("event: status-disambig: new failed");
+        return;
+    }
+
+    AxlStatus terr  = axl_event_wait_timeout(NULL, NULL, 20000);
+    AxlStatus tout  = axl_event_wait_timeout(e, NULL, 20000);
+
+    test_check(terr == AXL_ERR,
+               "event: NULL event returns AXL_ERR (-1)");
+    test_check(tout == AXL_TIMEOUT,
+               "event: deadline returns AXL_TIMEOUT (-3)");
+    test_check(terr != tout,
+               "event: AXL_ERR and AXL_TIMEOUT are distinct");
 
     axl_event_free(e);
 }
@@ -227,8 +257,8 @@ static void
 test_wait_for_flag_already_true(void)
 {
     g_flag = true;
-    test_check(axl_wait_for_flag(&g_flag, NULL, 1000000) == 0,
-               "wait_for_flag: already-true returns 0 immediately");
+    test_check(axl_wait_for_flag(&g_flag, NULL, 1000000) == AXL_OK,
+               "wait_for_flag: already-true returns AXL_OK immediately");
     g_flag = false;
 }
 
@@ -236,15 +266,15 @@ static void
 test_wait_for_flag_timeout(void)
 {
     g_flag = false;
-    test_check(axl_wait_for_flag(&g_flag, NULL, 20000) == -1,
-               "wait_for_flag: never-set returns -1");
+    test_check(axl_wait_for_flag(&g_flag, NULL, 20000) == AXL_TIMEOUT,
+               "wait_for_flag: never-set returns AXL_TIMEOUT");
 }
 
 static void
 test_wait_for_flag_null(void)
 {
-    test_check(axl_wait_for_flag(NULL, NULL, 1000) == -1,
-               "wait_for_flag: NULL flag returns -1");
+    test_check(axl_wait_for_flag(NULL, NULL, 1000) == AXL_ERR,
+               "wait_for_flag: NULL flag returns AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -255,23 +285,23 @@ static void
 test_wait_for_word_already_ready(void)
 {
     g_word = 0xCAFEBABEULL;
-    test_check(axl_wait_for_word(&g_word, 0, NULL, 1000000) == 0,
-               "wait_for_word: non-not-ready returns 0 immediately");
+    test_check(axl_wait_for_word(&g_word, 0, NULL, 1000000) == AXL_OK,
+               "wait_for_word: non-not-ready returns AXL_OK immediately");
 }
 
 static void
 test_wait_for_word_timeout(void)
 {
     g_word = 0;
-    test_check(axl_wait_for_word(&g_word, 0, NULL, 20000) == -1,
-               "wait_for_word: never-changed returns -1");
+    test_check(axl_wait_for_word(&g_word, 0, NULL, 20000) == AXL_TIMEOUT,
+               "wait_for_word: never-changed returns AXL_TIMEOUT");
 }
 
 static void
 test_wait_for_word_null(void)
 {
-    test_check(axl_wait_for_word(NULL, 0, NULL, 1000) == -1,
-               "wait_for_word: NULL word returns -1");
+    test_check(axl_wait_for_word(NULL, 0, NULL, 1000) == AXL_ERR,
+               "wait_for_word: NULL word returns AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -281,16 +311,16 @@ test_wait_for_word_null(void)
 static void
 test_wait_ms_zero(void)
 {
-    test_check(axl_wait_ms(NULL, 0) == 0,
-               "wait_ms: zero returns 0 immediately");
+    test_check(axl_wait_ms(NULL, 0) == AXL_OK,
+               "wait_ms: zero returns AXL_OK immediately");
 }
 
 static void
 test_wait_ms_short(void)
 {
-    /* Should return 0 after ~10ms, no busy-wait. */
-    test_check(axl_wait_ms(NULL, 10) == 0,
-               "wait_ms: 10ms elapsed returns 0");
+    /* Should return AXL_OK after ~10ms, no busy-wait. */
+    test_check(axl_wait_ms(NULL, 10) == AXL_OK,
+               "wait_ms: 10ms elapsed returns AXL_OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -320,8 +350,8 @@ mock_advance(void *ctx)
 static void
 test_wait_for_with_tick_advances(void)
 {
-    MockSm sm;
-    int    rc;
+    MockSm    sm;
+    AxlStatus rc;
 
     sm.step = 0;
     sm.target = 3;
@@ -331,7 +361,7 @@ test_wait_for_with_tick_advances(void)
     rc = axl_wait_for_with_tick(mock_is_done, &sm,
                                 mock_advance, &sm,
                                 2000, NULL, 500000);
-    test_check(rc == 0, "wait_for_with_tick: state machine completes");
+    test_check(rc == AXL_OK, "wait_for_with_tick: state machine completes");
     test_check(sm.step >= 3, "wait_for_with_tick: advanced past target");
     test_check(g_tick_count >= 3, "wait_for_with_tick: tick fired");
 }
@@ -339,11 +369,11 @@ test_wait_for_with_tick_advances(void)
 static void
 test_wait_for_null_cond(void)
 {
-    test_check(axl_wait_for(NULL, NULL, NULL, 1000) == -1,
-               "wait_for: NULL cond returns -1");
+    test_check(axl_wait_for(NULL, NULL, NULL, 1000) == AXL_ERR,
+               "wait_for: NULL cond returns AXL_ERR");
     test_check(axl_wait_for_with_tick(NULL, NULL, NULL, NULL, 1000,
-                                      NULL, 1000) == -1,
-               "wait_for_with_tick: NULL cond returns -1");
+                                      NULL, 1000) == AXL_ERR,
+               "wait_for_with_tick: NULL cond returns AXL_ERR");
 }
 
 /*
@@ -371,8 +401,8 @@ test_event_use_after_free_detection(void)
                "event: use-after-free reports !is_set");
     test_check(axl_event_handle(stale) == NULL,
                "event: use-after-free returns NULL handle");
-    test_check(axl_event_wait_timeout(stale, NULL, 1000) == -1,
-               "event: use-after-free wait returns -1");
+    test_check(axl_event_wait_timeout(stale, NULL, 1000) == AXL_ERR,
+               "event: use-after-free wait returns AXL_ERR");
     axl_event_free(stale);  /* double-free -- also caught */
     test_pass("event: use-after-free ops don't crash");
 }
@@ -593,9 +623,9 @@ test_wait_for_with_tick_mid_cancel(void)
     }
 
     MidCancelCtx ctx = { x, 0 };
-    int rc = axl_wait_for_with_tick(mid_cancel_cond_false, &ctx,
-                                    mid_cancel_tick, &ctx,
-                                    5000, x, 500000);
+    AxlStatus rc = axl_wait_for_with_tick(mid_cancel_cond_false, &ctx,
+                                          mid_cancel_tick, &ctx,
+                                          5000, x, 500000);
     test_check(rc == AXL_CANCELLED,
                "wait_for_with_tick: mid-wait cancel returns AXL_CANCELLED");
     test_check(ctx.ticks >= 3,
@@ -625,6 +655,7 @@ test_event_main(
     test_event_reset_and_reuse();
     test_event_reset_drops_pending();
     test_event_timeout();
+    test_event_timeout_distinct_from_error();
     test_event_cancelled_wait_preserves_is_set();
     test_event_timed_out_wait_preserves_is_set();
     test_event_use_after_free_detection();

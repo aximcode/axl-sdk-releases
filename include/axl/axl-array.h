@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 #include <axl/axl-types.h>
 
 #ifdef __cplusplus
@@ -48,7 +49,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlArray, axl_array_free)
 /**
  * @brief Append an element (value mode).
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_array_append(
@@ -88,7 +89,7 @@ axl_array_clear(
 /**
  * @brief Append a pointer (pointer mode).
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_array_append_ptr(
@@ -119,7 +120,7 @@ axl_array_sort(
 /**
  * @brief Remove the element at @p index, shifting remaining elements left.
  *
- * @return 0 on success, -1 if index is out of range.
+ * @return AXL_OK on success, AXL_ERR if index is out of range.
  */
 int
 axl_array_remove_index(
@@ -132,7 +133,7 @@ axl_array_remove_index(
  *
  * O(1) but does not preserve order.
  *
- * @return 0 on success, -1 if index is out of range.
+ * @return AXL_OK on success, AXL_ERR if index is out of range.
  */
 int
 axl_array_remove_index_fast(
@@ -143,7 +144,7 @@ axl_array_remove_index_fast(
 /**
  * @brief Remove @p len elements starting at @p index, shifting remaining left.
  *
- * @return 0 on success, -1 if the range is out of bounds.
+ * @return AXL_OK on success, AXL_ERR if the range is out of bounds.
  */
 int
 axl_array_remove_range(
@@ -159,7 +160,7 @@ axl_array_remove_range(
  * capacity, the internal buffer is reallocated. If shrinking, length
  * is reduced without reallocating.
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_array_set_size(

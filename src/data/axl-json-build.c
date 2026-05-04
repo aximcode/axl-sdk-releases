@@ -144,21 +144,21 @@ static void
 wr_chr(AxlJsonWriter *w, char c)
 {
     if (w->error) return;
-    if (axl_string_append_c(w->out, c) != 0) w->error = true;
+    if (axl_string_append_c(w->out, c) != AXL_OK) w->error = true;
 }
 
 static void
 wr_str(AxlJsonWriter *w, const char *s)
 {
     if (w->error) return;
-    if (axl_string_append(w->out, s) != 0) w->error = true;
+    if (axl_string_append(w->out, s) != AXL_OK) w->error = true;
 }
 
 static void
 wr_strn(AxlJsonWriter *w, const char *s, size_t n)
 {
     if (w->error) return;
-    if (axl_string_append_len(w->out, s, n) != 0) w->error = true;
+    if (axl_string_append_len(w->out, s, n) != AXL_OK) w->error = true;
 }
 
 // ---------------------------------------------------------------------------

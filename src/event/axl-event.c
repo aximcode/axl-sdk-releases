@@ -80,7 +80,7 @@ axl_event_new_impl(const char *file, int line)
         return NULL;
     }
 
-    if (axl_backend_event_create(&e->handle) != 0) {
+    if (axl_backend_event_create(&e->handle) != AXL_OK) {
         axl_error("failed to create event");
         axl_free(e);
         return NULL;
@@ -164,25 +164,25 @@ axl_event_handle(const AxlEvent *e)
 // Wait
 // ---------------------------------------------------------------------------
 
-int
+AxlStatus
 axl_event_wait_timeout(
     AxlEvent       *e,
     AxlCancellable *cancel,
     uint64_t        timeout_us
     )
 {
-    int rc;
+    AxlStatus rc;
 
     if (!event_is_live(e, "axl_event_wait_timeout")) {
-        return -1;
+        return AXL_ERR;
     }
     if (e->handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     rc = _axl_event_wait_timeout_with_tick(e->handle, NULL, NULL,
                                            NULL, NULL, 0,
                                            cancel, timeout_us);
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         /* The loop's SOURCE_EVENT dispatch consumed the signal via
            CheckEvent. Mirror that on the is_set fast-check so
            subsequent axl_event_is_set(e) reflects current state
@@ -194,7 +194,7 @@ axl_event_wait_timeout(
     return rc;
 }
 
-int
+AxlStatus
 axl_event_wait(
     AxlEvent       *e,
     AxlCancellable *cancel

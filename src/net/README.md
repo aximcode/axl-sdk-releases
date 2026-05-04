@@ -167,7 +167,7 @@ permits closing the socket inside the callback: the loop does not
 touch the socket again after a false return.
 
 ```c
-bool on_client(AxlSocket *client, int status, void *data) {
+bool on_client(AxlSocket *client, AxlStatus status, void *data) {
     if (status != 0) return true;  // transient error; keep listening
     // handle client...
     axl_socket_free(client);
@@ -217,7 +217,7 @@ if (axl_tcp_connect("192.168.1.1", 8080, &sock) == 0) {
 **Server (async with event loop):**
 
 ```c
-bool on_client(AxlTcp *client, int status, void *data) {
+bool on_client(AxlTcp *client, AxlStatus status, void *data) {
     if (status != 0) return true;  // transient error; keep listening
     // handle client connection...
     axl_tcp_close(client);
@@ -240,7 +240,7 @@ with `status == AXL_CANCELLED`.
 ```c
 typedef struct { AxlCancellable *cancel; AxlTcp *sock; } Session;
 
-static bool on_connected(AxlTcp *sock, int status, void *data) {
+static bool on_connected(AxlTcp *sock, AxlStatus status, void *data) {
     Session *s = data;
     if (status == AXL_CANCELLED) return true;  // session closed before connect
     s->sock = sock;

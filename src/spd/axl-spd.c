@@ -80,7 +80,7 @@ slot_present(
     )
 {
     uint8_t byte0 = 0;
-    return axl_smbus_read_byte(g_session, addr, 0x00, &byte0) == 0;
+    return axl_smbus_read_byte(g_session, addr, 0x00, &byte0) == AXL_OK;
 }
 
 uint8_t *
@@ -126,15 +126,15 @@ axl_spd_dump_raw(
     )
 {
     if (buf == NULL || len == NULL || cap == 0) {
-        return -1;
+        return AXL_ERR;
     }
     if (ensure_session() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     /* Probe + check memory-type byte to choose codec. */
     uint8_t mem_type = 0;
-    if (axl_smbus_read_byte(g_session, addr, 0x02, &mem_type) != 0) {
-        return -1;
+    if (axl_smbus_read_byte(g_session, addr, 0x02, &mem_type) != AXL_OK) {
+        return AXL_ERR;
     }
     switch (mem_type) {
         case AXL_SPD_TYPE_DDR4:
@@ -148,16 +148,16 @@ axl_spd_dump_raw(
                 size_t to_read = cap < 256 ? cap : 256;
                 for (size_t i = 0; i < to_read; i++) {
                     if (axl_smbus_read_byte(g_session, addr,
-                                            (uint8_t)i, &buf[i]) != 0) {
+                                            (uint8_t)i, &buf[i]) != AXL_OK) {
                         if (i == 0) {
-                            return -1;
+                            return AXL_ERR;
                         }
                         *len = i;
-                        return 0;
+                        return AXL_OK;
                     }
                 }
                 *len = to_read;
-                return 0;
+                return AXL_OK;
             }
     }
 }
@@ -169,12 +169,12 @@ axl_spd_read(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t buf[AXL_SPD_RAW_MAX];
     size_t  len = 0;
-    if (axl_spd_dump_raw(addr, buf, sizeof(buf), &len) != 0) {
-        return -1;
+    if (axl_spd_dump_raw(addr, buf, sizeof(buf), &len) != AXL_OK) {
+        return AXL_ERR;
     }
     return axl_spd_decode(buf, len, out);
 }
@@ -187,7 +187,7 @@ axl_spd_decode(
     )
 {
     if (buf == NULL || out == NULL || len < 3) {
-        return -1;
+        return AXL_ERR;
     }
     axl_memset(out, 0, sizeof(*out));
 
@@ -201,7 +201,7 @@ axl_spd_decode(
                and report success so callers can still see the empty
                struct (matches QEMU's default zero-init EEPROMs). */
             out->ddr_generation = 0;
-            return 0;
+            return AXL_OK;
     }
 }
 

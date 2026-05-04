@@ -54,6 +54,18 @@ stall 3000000
 echo === TEST-NETINFO-LIST ===
 netinfo.efi list
 
+echo === TEST-NETINFO-NO-LOAD ===
+netinfo.efi -v --no-load list
+
+echo === TEST-NETINFO-VERBOSE ===
+netinfo.efi -v list
+
+echo === TEST-NETINFO-LIST-BUNDLE ===
+netinfo.efi list-bundle
+
+echo === TEST-NETINFO-DIAG ===
+netinfo.efi diag
+
 echo === TEST-FETCH-GET ===
 fetch.efi http://10.0.2.2:${HOST_PORT}/hello
 
@@ -121,6 +133,32 @@ check_section() {
 # being present at all proves the tool ran and found NIC handles.
 check_section "TEST-NETINFO-LIST" "52:54:00:12:34:56" "netinfo list prints QEMU NIC MAC"
 check_section "TEST-NETINFO-LIST" "MTU"               "netinfo list prints interface table"
+
+# --no-load: list still works (firmware already provides e1000) and
+# the snapshot label switches to the "firmware-provided, --no-load"
+# variant — only emitted on the --no-load path. Its presence proves
+# ensure_drivers was skipped without needing an absence-of-line check.
+check_section "TEST-NETINFO-NO-LOAD" "52:54:00:12:34:56" "--no-load list prints NIC MAC"
+check_section "TEST-NETINFO-NO-LOAD" "firmware-provided, --no-load" "--no-load: snapshot label confirms skip"
+
+# -v list: shows pre/post NIC Drivers snapshots and the enriched
+# per-NIC info (device path text + PCI BDF). The e1000 lives at
+# 0:3.0 in QEMU's default Q35/i440FX layout.
+check_section "TEST-NETINFO-VERBOSE" "NIC Drivers \(before driver-load\)"  "verbose: pre-load snapshot header"
+check_section "TEST-NETINFO-VERBOSE" "NIC Drivers \(after driver-load\)"   "verbose: post-load snapshot header"
+check_section "TEST-NETINFO-VERBOSE" "PciRoot"                              "verbose: device path text rendered"
+
+# list-bundle: no drivers/<arch>/ on the test image, so the verb
+# should print the "no drivers staged" line. Asserting the literal
+# tells us the verb ran (vs. parser rejecting it).
+check_section "TEST-NETINFO-LIST-BUNDLE" "no drivers staged"  "list-bundle reports empty bundle"
+
+# diag: composite report. Spot-check that each section header lands
+# in the output — proves all sub-routines ran without aborting.
+check_section "TEST-NETINFO-DIAG" "=== Firmware ==="                 "diag: firmware section"
+check_section "TEST-NETINFO-DIAG" "=== Mounted Volumes ==="          "diag: volumes section"
+check_section "TEST-NETINFO-DIAG" "=== PCI Network Controllers"      "diag: PCI nic section"
+check_section "TEST-NETINFO-DIAG" "=== ensure_drivers status ==="    "diag: ensure status section"
 
 # fetch GET /hello returns the JSON body our host-server.py serves.
 check_section "TEST-FETCH-GET" "hello from host"     "fetch GET prints response body"

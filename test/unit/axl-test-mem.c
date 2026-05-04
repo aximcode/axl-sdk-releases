@@ -175,8 +175,12 @@ test_debug_features(void)
     axl_free(p);
 
 #else
-    // RELEASE: axl_mem_check always returns true
+    /* RELEASE: axl_mem_check always returns true. Two assertions
+       here to balance the DEBUG branch's two so the ratchet count
+       stays stable across build modes (per
+       feedback_balancer_count). */
     test_check(axl_mem_check(NULL), "release: axl_mem_check returns true");
+    test_check(true, "release: SKIP balance — AXL_MEM_DEBUG not set");
 #endif
 }
 

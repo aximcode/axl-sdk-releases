@@ -49,6 +49,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 
 #include <axl/axl-sidecar.h>
 
@@ -134,7 +135,7 @@ axl_spd_next(
  * @p out is populated; on failure @p out is left in an unspecified
  * state.
  *
- * @return 0 on success, -1 if the slot is empty / unsupported / I/O error.
+ * @return AXL_OK on success, AXL_ERR if the slot is empty / unsupported / I/O error.
  */
 int
 axl_spd_read(
@@ -158,7 +159,7 @@ axl_spd_read(
  * @param cap   buffer capacity in bytes.
  * @param len   (out) bytes actually written.
  *
- * @return 0 on success, -1 on transport error or empty slot.
+ * @return AXL_OK on success, AXL_ERR on transport error or empty slot.
  */
 int
 axl_spd_dump_raw(
@@ -178,7 +179,7 @@ axl_spd_dump_raw(
  * @param len   bytes available in @p buf.
  * @param out   (out) decoded info; zero-initialised by this call.
  *
- * @return 0 on success, -1 if the memory type is unsupported or the
+ * @return AXL_OK on success, AXL_ERR if the memory type is unsupported or the
  *     buffer is too short for the detected generation.
  */
 int

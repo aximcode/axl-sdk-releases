@@ -8,17 +8,17 @@
  *
  * These replace the common "busy-poll with axl_backend_stall" idiom
  * with event-driven waits that idle the CPU between checks and
- * return early on Ctrl-C. Every function follows the same return
- * convention:
+ * return early on Ctrl-C. Every function returns @ref AxlStatus:
  *
- *     0  — condition met / elapsed
- *    -1  — timeout / invalid arg
- *    -2  — interrupted (Ctrl-C / shell break)
+ *     AXL_OK         — condition met / elapsed
+ *     AXL_TIMEOUT    — deadline elapsed before condition
+ *     AXL_ERR        — invalid arg / internal failure
+ *     AXL_CANCELLED  — interrupted (Ctrl-C / shell break / cancel token)
  *
  * @code
  * // Wait for a hardware status flag, CPU idle between checks:
- * if (axl_wait_for_word(&mmio->status, 0, NULL, 500000) != 0) {
- *     return -1;
+ * if (axl_wait_for_word(&mmio->status, 0, NULL, 500000) != AXL_OK) {
+ *     return AXL_ERR;
  * }
  *
  * // Interruptible sleep:
@@ -96,10 +96,10 @@ typedef void (*AxlTickFn)(
  * CPU idles between 1ms checks. Returns 0 immediately if *flag is
  * already true, or AXL_CANCELLED if @p cancel was already signalled.
  *
- * @return 0 on true, -1 on timeout or invalid arg, AXL_CANCELLED on
- *     Ctrl-C or an observed cancellable.
+ * @return AXL_OK on true, AXL_TIMEOUT on deadline, AXL_ERR on invalid
+ *     arg, AXL_CANCELLED on Ctrl-C or an observed cancellable.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_wait_for_flag(
     volatile const bool *flag,       ///< flag to observe
     AxlCancellable      *cancel,     ///< optional cancel token (NULL = only Ctrl-C)
@@ -113,10 +113,10 @@ axl_wait_for_flag(
  * "keep checking this memory word until it changes" pattern.
  * CPU idles between 1ms checks.
  *
- * @return 0 on change, -1 on timeout or invalid arg, AXL_CANCELLED on
- *     Ctrl-C or an observed cancellable.
+ * @return AXL_OK on change, AXL_TIMEOUT on deadline, AXL_ERR on invalid
+ *     arg, AXL_CANCELLED on Ctrl-C or an observed cancellable.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_wait_for_word(
     volatile const uint64_t *word,             ///< memory word to observe
     uint64_t                 not_ready_value,  ///< value that means "keep waiting"
@@ -136,9 +136,9 @@ axl_wait_for_word(
  * cancel comes first. The relative position (cancel immediately
  * before the duration/timeout) is consistent with the other helpers.
  *
- * @return 0 on elapsed, AXL_CANCELLED on Ctrl-C or cancel.
+ * @return AXL_OK on elapsed, AXL_CANCELLED on Ctrl-C or cancel.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_wait_ms(
     AxlCancellable *cancel,  ///< optional cancel token (NULL = only Ctrl-C)
     uint64_t        ms       ///< milliseconds to sleep (0 returns immediately)
@@ -154,10 +154,10 @@ axl_wait_ms(
  * cond_fn is evaluated immediately and then every 1ms. CPU idles
  * between evaluations.
  *
- * @return 0 on cond_fn true, -1 on timeout or invalid arg,
- *     AXL_CANCELLED on Ctrl-C or cancel.
+ * @return AXL_OK on cond_fn true, AXL_TIMEOUT on deadline, AXL_ERR
+ *     on invalid arg, AXL_CANCELLED on Ctrl-C or cancel.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_wait_for(
     AxlCondFn       cond_fn,     ///< predicate
     void           *cond_ctx,    ///< opaque context passed to cond_fn
@@ -173,10 +173,10 @@ axl_wait_for(
  * external state machine is advanced (e.g. calling protocol->Poll
  * on a UEFI driver).
  *
- * @return 0 on cond_fn true, -1 on timeout or invalid arg,
- *     AXL_CANCELLED on Ctrl-C or cancel.
+ * @return AXL_OK on cond_fn true, AXL_TIMEOUT on deadline, AXL_ERR
+ *     on invalid arg, AXL_CANCELLED on Ctrl-C or cancel.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_wait_for_with_tick(
     AxlCondFn       cond_fn,    ///< predicate (required)
     void           *cond_ctx,   ///< opaque context for cond_fn

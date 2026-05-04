@@ -17,18 +17,18 @@ int
 axl_http_server_use(AxlHttpServer *s, AxlHttpMiddleware mw, void *data)
 {
     if (s == NULL || mw == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (s->mw_count >= s->mw_max) {
         axl_error("middleware table full");
-        return -1;
+        return AXL_ERR;
     }
 
     s->middleware[s->mw_count] = mw;
     s->mw_data[s->mw_count]    = data;
     s->mw_count++;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -39,12 +39,12 @@ run_middleware(
     )
 {
     for (size_t i = 0; i < s->mw_count; i++) {
-        if (s->middleware[i](req, resp, s->mw_data[i]) != 0) {
-            return -1;
+        if (s->middleware[i](req, resp, s->mw_data[i]) != AXL_OK) {
+            return AXL_ERR;
         }
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ int
 axl_http_server_use_cache(AxlHttpServer *s, size_t max_entries)
 {
     if (s == NULL || max_entries == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (s->cache != NULL) {
@@ -77,12 +77,12 @@ axl_http_server_use_cache(AxlHttpServer *s, size_t max_entries)
         axl_free_impl, cached_response_free);
     if (s->cache == NULL) {
         axl_error("cache alloc failed for %zu entries", max_entries);
-        return -1;
+        return AXL_ERR;
     }
 
     s->cache_max = max_entries;
 
-    return 0;
+    return AXL_OK;
 }
 
 /* FIFO eviction: find the entry with the lowest insert_seq (oldest
@@ -126,7 +126,7 @@ axl_http_server_set_route_ttl(AxlHttpServer *s, const char *path,
                               size_t ttl_ms)
 {
     if (s == NULL || path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (s->route_ttls == NULL) {
@@ -135,22 +135,22 @@ axl_http_server_set_route_ttl(AxlHttpServer *s, const char *path,
             axl_free_impl, NULL);
         if (s->route_ttls == NULL) {
             axl_error("route_ttls alloc failed");
-            return -1;
+            return AXL_ERR;
         }
     }
 
     char *key = axl_strdup(path);
     if (key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Value is the TTL encoded as a pointer — no allocation. */
-    if (axl_hash_table_insert(s->route_ttls, key, (void *)(uintptr_t)ttl_ms) < 0) {
+    if (axl_hash_table_insert(s->route_ttls, key, (void *)(uintptr_t)ttl_ms) == AXL_HASH_TABLE_ERR) {
         axl_free(key);
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 /* Predicate for axl_hash_table_foreach_remove — removes cache

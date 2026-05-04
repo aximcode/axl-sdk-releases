@@ -117,7 +117,7 @@ print_console_timestamp(void)
 {
     AxlTime time;
 
-    if (axl_backend_get_time(&time) != 0) {
+    if (axl_backend_get_time(&time) != AXL_OK) {
         return;
     }
 
@@ -383,7 +383,7 @@ int
 axl_log_add_handler(AxlLogHandler handler, void *data)
 {
     if (handler == NULL || mHandlerCount >= MAX_HANDLERS) {
-        return -1;
+        return AXL_ERR;
     }
 
     mHandlers[mHandlerCount]      = handler;
@@ -392,7 +392,7 @@ axl_log_add_handler(AxlLogHandler handler, void *data)
     mHandlerMaxLevel[mHandlerCount] = AXL_LOG_TRACE;
     mHandlerFiltered[mHandlerCount] = false;
     mHandlerCount++;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -400,7 +400,7 @@ axl_log_add_domain_handler(const char *domain, int max_level,
                            AxlLogHandler handler, void *data)
 {
     if (handler == NULL || mHandlerCount >= MAX_HANDLERS) {
-        return -1;
+        return AXL_ERR;
     }
 
     mHandlers[mHandlerCount]      = handler;
@@ -409,7 +409,7 @@ axl_log_add_domain_handler(const char *domain, int max_level,
     mHandlerMaxLevel[mHandlerCount] = max_level;
     mHandlerFiltered[mHandlerCount] = true;
     mHandlerCount++;
-    return 0;
+    return AXL_OK;
 }
 
 void

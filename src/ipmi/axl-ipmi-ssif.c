@@ -80,7 +80,7 @@ ssif_try_write(SsifCtx *s, const uint8_t *msg, size_t msg_len)
     size_t off = 0;
     if (axl_smbus_write_block(
             s->smbus, s->slave_addr, SSIF_CMD_MULTI_PART_WR_START,
-            &msg[off], SSIF_BLOCK_MAX) != 0)
+            &msg[off], SSIF_BLOCK_MAX) != AXL_OK)
     {
         return -1;
     }
@@ -89,7 +89,7 @@ ssif_try_write(SsifCtx *s, const uint8_t *msg, size_t msg_len)
     while (off + SSIF_BLOCK_MAX < msg_len) {
         if (axl_smbus_write_block(
                 s->smbus, s->slave_addr, SSIF_CMD_MULTI_PART_WR_MIDDLE,
-                &msg[off], SSIF_BLOCK_MAX) != 0)
+                &msg[off], SSIF_BLOCK_MAX) != AXL_OK)
         {
             return -1;
         }
@@ -129,7 +129,7 @@ ssif_read_first_block(SsifCtx *s, uint8_t *buf, size_t *len)
         size_t cap = *len;
         if (axl_smbus_read_block(
                 s->smbus, s->slave_addr, SSIF_CMD_SINGLE_PART_READ,
-                buf, &cap) == 0)
+                buf, &cap) == AXL_OK)
         {
             *len = cap;
             return 0;
@@ -199,7 +199,7 @@ ssif_read_response(SsifCtx *s, uint8_t *resp, size_t *resp_len)
             buf_len = sizeof(buf);
             if (axl_smbus_read_block(
                     s->smbus, s->slave_addr, SSIF_CMD_MULTI_PART_RD_MIDDLE,
-                    buf, &buf_len) != 0)
+                    buf, &buf_len) != AXL_OK)
             {
                 return -1;
             }
@@ -263,7 +263,7 @@ ssif_read_response(SsifCtx *s, uint8_t *resp, size_t *resp_len)
     // A valid IPMI response is at least one byte (the completion code).
     // Empty means the BMC is confused — treat as transport error.
     //
-    return (total == 0) ? -1 : 0;
+    return (total == 0) ? AXL_ERR : AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,12 +330,12 @@ axl_ipmi_ssif_open(AxlIpmiTransportOps *ops,
                    uint8_t              slave_addr)
 {
     if (ops == NULL || smbus == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     SsifCtx *s = axl_malloc(sizeof(SsifCtx));
     if (s == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     s->smbus      = smbus;
     s->slave_addr = slave_addr;
@@ -348,5 +348,5 @@ axl_ipmi_ssif_open(AxlIpmiTransportOps *ops,
     axl_info("IPMI SSIF transport ready (slave=0x%02x, via %s)",
              (unsigned)slave_addr,
              axl_smbus_transport_string(axl_smbus_transport(smbus)));
-    return 0;
+    return AXL_OK;
 }

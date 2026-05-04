@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,7 +135,7 @@ typedef void (*AxlLogHandler)(
  * not re-entrant. A handler that triggers another `axl_warning` will
  * recurse and corrupt the in-flight message.
  *
- * @return 0 on success, -1 if @p handler is NULL or the table is full.
+ * @return AXL_OK on success, AXL_ERR if @p handler is NULL or the table is full.
  */
 int
 axl_log_add_handler(
@@ -145,7 +146,7 @@ axl_log_add_handler(
 /**
  * @brief Add a handler that only fires for a specific domain and level range.
  *
- * @return 0 on success, -1 if @p handler is NULL or the table is full.
+ * @return AXL_OK on success, AXL_ERR if @p handler is NULL or the table is full.
  */
 int
 axl_log_add_domain_handler(
@@ -285,7 +286,7 @@ axl_log_ring_get(
 /**
  * @brief Open a log file and register a handler that buffers output.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_log_file_attach(

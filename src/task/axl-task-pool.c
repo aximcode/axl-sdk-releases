@@ -128,7 +128,7 @@ axl_task_pool_new(void)
             axl_backend_mp_get_ap_number(pool->mp_ctx, i);
 
         if (axl_backend_mp_start_ap(pool->mp_ctx, i, worker_proc,
-                                    &pool->slots[launched]) != 0) {
+                                    &pool->slots[launched]) != AXL_OK) {
             axl_warning("failed to start AP #%llu",
                        (unsigned long long)pool->slots[launched].ap_number);
             continue;

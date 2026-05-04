@@ -27,11 +27,11 @@ test_acpi_revision(void)
 {
     uint8_t rev = 0xFF;
     int rc = axl_acpi_revision(&rev);
-    test_check(rc == 0, "acpi: revision call succeeds");
+    test_check(rc == AXL_OK, "acpi: revision call succeeds");
     test_check(rev <= 6, "acpi: revision in [0,6]");
 
     /* NULL out param. */
-    test_check(axl_acpi_revision(NULL) == -1,
+    test_check(axl_acpi_revision(NULL) == AXL_ERR,
                "acpi: revision(NULL) returns -1");
 }
 
@@ -119,11 +119,11 @@ test_acpi_read_mcfg(void)
        also publishes MCFG. */
     AxlAcpiMcfg mcfg;
     int rc = axl_acpi_read_mcfg(&mcfg);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_printf("SKIP: acpi read_mcfg (no MCFG on this firmware)\n");
         return;
     }
-    test_check(rc == 0, "acpi: read_mcfg succeeds");
+    test_check(rc == AXL_OK, "acpi: read_mcfg succeeds");
     test_check(mcfg.count >= 1 && mcfg.count <= 16,
                "acpi: mcfg has 1..16 segments");
     test_check(mcfg.segments[0].base_addr != 0,
@@ -137,7 +137,7 @@ test_acpi_read_madt(void)
 {
     AxlAcpiMadt madt;
     int rc = axl_acpi_read_madt(&madt);
-    test_check(rc == 0, "acpi: read_madt succeeds");
+    test_check(rc == AXL_OK, "acpi: read_madt succeeds");
     /* x86 firmware reports IOAPIC entries; aa64 firmware reports
        GIC regions. Whichever side is non-empty is right for this
        arch. */
@@ -150,7 +150,7 @@ test_acpi_read_facp(void)
 {
     AxlAcpiFacp facp;
     int rc = axl_acpi_read_facp(&facp);
-    test_check(rc == 0, "acpi: read_facp succeeds");
+    test_check(rc == AXL_OK, "acpi: read_facp succeeds");
     /* DSDT pointer must be non-zero on any sane firmware. The
        legacy 32-bit field is fine for QEMU OVMF. */
     test_check(facp.dsdt != 0 || facp.x_dsdt != 0,
@@ -216,17 +216,17 @@ test_pci_find_by_class(void)
        bridge at minimum. */
     AxlPciAddr a = { 0 };
     int rc = axl_pci_find_by_class(0x060000, 0, &a);
-    test_check(rc == 0,
+    test_check(rc == AXL_OK,
                "pci: find_by_class host bridge (0x060000)");
 
     /* Wildcard: 0xFFFFFF matches anything. */
     AxlPciAddr any = { 0 };
-    test_check(axl_pci_find_by_class(0xFFFFFF, 0, &any) == 0,
+    test_check(axl_pci_find_by_class(0xFFFFFF, 0, &any) == AXL_OK,
                "pci: find_by_class(0xFFFFFF) wildcard succeeds");
 
     /* nth out of range — return -1. */
     AxlPciAddr none = { 0 };
-    test_check(axl_pci_find_by_class(0xFFFFFF, 65535, &none) == -1,
+    test_check(axl_pci_find_by_class(0xFFFFFF, 65535, &none) == AXL_ERR,
                "pci: find_by_class with huge nth returns -1");
 }
 
@@ -244,14 +244,14 @@ test_pci_find_by_vid_did(void)
     }
 
     AxlPciAddr found = { 0 };
-    test_check(axl_pci_find_by_vid_did(vid, did, 0, &found) == 0,
+    test_check(axl_pci_find_by_vid_did(vid, did, 0, &found) == AXL_OK,
                "pci: find_by_vid_did locates host bridge");
     test_check(found.seg == 0 && found.bus == 0
                && found.dev == 0 && found.func == 0,
                "pci: find_by_vid_did returns 00:00.0");
 
     /* Bogus VID. */
-    test_check(axl_pci_find_by_vid_did(0xDEAD, 0xBEEF, 0, &found) == -1,
+    test_check(axl_pci_find_by_vid_did(0xDEAD, 0xBEEF, 0, &found) == AXL_ERR,
                "pci: find_by_vid_did bogus VID returns -1");
 }
 
@@ -261,40 +261,40 @@ test_pci_addr_parse_format(void)
     AxlPciAddr a;
 
     /* 4-component form */
-    test_check(axl_pci_addr_parse("0001:aa:1f.7", &a) == 0
+    test_check(axl_pci_addr_parse("0001:aa:1f.7", &a) == AXL_OK
                && a.seg == 0x0001 && a.bus == 0xAA
                && a.dev == 0x1F   && a.func == 7,
                "pci addr_parse: seg:bus:dev.func canonical");
 
     /* 3-component form, segment defaults to 0 */
-    test_check(axl_pci_addr_parse("12:03.4", &a) == 0
+    test_check(axl_pci_addr_parse("12:03.4", &a) == AXL_OK
                && a.seg == 0 && a.bus == 0x12
                && a.dev == 3 && a.func == 4,
                "pci addr_parse: bus:dev.func defaults seg=0");
 
     /* All-zero edge case */
-    test_check(axl_pci_addr_parse("0:0.0", &a) == 0
+    test_check(axl_pci_addr_parse("0:0.0", &a) == AXL_OK
                && a.seg == 0 && a.bus == 0 && a.dev == 0 && a.func == 0,
                "pci addr_parse: 0:0.0");
 
     /* Range checks */
-    test_check(axl_pci_addr_parse("100:0.0", &a) == -1,
+    test_check(axl_pci_addr_parse("100:0.0", &a) == AXL_ERR,
                "pci addr_parse: bus 0x100 rejected (>0xFF)");
-    test_check(axl_pci_addr_parse("0:20.0", &a) == -1,
+    test_check(axl_pci_addr_parse("0:20.0", &a) == AXL_ERR,
                "pci addr_parse: dev 0x20 rejected (>0x1F)");
-    test_check(axl_pci_addr_parse("0:0.8", &a) == -1,
+    test_check(axl_pci_addr_parse("0:0.8", &a) == AXL_ERR,
                "pci addr_parse: func 8 rejected (>0x7)");
-    test_check(axl_pci_addr_parse("10000:0:0.0", &a) == -1,
+    test_check(axl_pci_addr_parse("10000:0:0.0", &a) == AXL_ERR,
                "pci addr_parse: seg 0x10000 rejected (>0xFFFF)");
 
     /* Malformed inputs */
-    test_check(axl_pci_addr_parse("",         &a) == -1, "pci addr_parse: empty");
-    test_check(axl_pci_addr_parse("0",        &a) == -1, "pci addr_parse: 1 field");
-    test_check(axl_pci_addr_parse("0.0",      &a) == -1, "pci addr_parse: 2 fields");
-    test_check(axl_pci_addr_parse(":0:0.0",   &a) == -1, "pci addr_parse: leading sep");
-    test_check(axl_pci_addr_parse("0:0:0.0:", &a) == -1, "pci addr_parse: trailing junk");
-    test_check(axl_pci_addr_parse("xx:0.0",   &a) == -1, "pci addr_parse: non-hex");
-    test_check(axl_pci_addr_parse(NULL,       &a) == -1, "pci addr_parse: NULL string");
+    test_check(axl_pci_addr_parse("",         &a) == AXL_ERR, "pci addr_parse: empty");
+    test_check(axl_pci_addr_parse("0",        &a) == AXL_ERR, "pci addr_parse: 1 field");
+    test_check(axl_pci_addr_parse("0.0",      &a) == AXL_ERR, "pci addr_parse: 2 fields");
+    test_check(axl_pci_addr_parse(":0:0.0",   &a) == AXL_ERR, "pci addr_parse: leading sep");
+    test_check(axl_pci_addr_parse("0:0:0.0:", &a) == AXL_ERR, "pci addr_parse: trailing junk");
+    test_check(axl_pci_addr_parse("xx:0.0",   &a) == AXL_ERR, "pci addr_parse: non-hex");
+    test_check(axl_pci_addr_parse(NULL,       &a) == AXL_ERR, "pci addr_parse: NULL string");
 
     /* Format produces canonical lower-hex 4-2-2-1 */
     char buf[AXL_PCI_ADDR_STR_MAX];
@@ -305,7 +305,7 @@ test_pci_addr_parse_format(void)
 
     /* Round-trip */
     AxlPciAddr round = { 0 };
-    test_check(axl_pci_addr_parse(buf, &round) == 0
+    test_check(axl_pci_addr_parse(buf, &round) == AXL_OK
                && round.seg == fmt.seg && round.bus == fmt.bus
                && round.dev == fmt.dev && round.func == fmt.func,
                "pci addr_format: round-trips through addr_parse");
@@ -322,7 +322,7 @@ test_pci_get_vid_did_class_code(void)
     /* Host bridge — guaranteed present on QEMU q35. */
     AxlPciAddr root = { .seg = 0, .bus = 0, .dev = 0, .func = 0 };
     uint16_t vid, did;
-    if (axl_pci_get_vid_did(root, &vid, &did) != 0) {
+    if (axl_pci_get_vid_did(root, &vid, &did) != AXL_OK) {
         axl_printf("SKIP: pci get_vid_did (no host bridge readable)\n");
         return;
     }
@@ -339,26 +339,26 @@ test_pci_get_vid_did_class_code(void)
        a deterministic absent function: bus=0xFF dev=0x1F func=7 has
        no MCFG mapping in any sane firmware. */
     AxlPciAddr absent = { .seg = 0, .bus = 0xFF, .dev = 0x1F, .func = 7 };
-    test_check(axl_pci_get_vid_did(absent, &vid, &did) == -1,
+    test_check(axl_pci_get_vid_did(absent, &vid, &did) == AXL_ERR,
                "pci get_vid_did: absent function returns -1");
 
     /* class_code on the host bridge — base class 0x06 (Bridge) */
     uint32_t class_code;
-    test_check(axl_pci_get_class_code(root, &class_code) == 0
+    test_check(axl_pci_get_class_code(root, &class_code) == AXL_OK
                && (class_code >> 16) == 0x06,
                "pci get_class_code: host bridge base class is 0x06");
 
     /* Cross-check against raw byte reads */
     uint8_t base, sub, prog;
-    test_check(axl_pci_read_config_8(root, 0x0B, &base) == 0
-               && axl_pci_read_config_8(root, 0x0A, &sub)  == 0
-               && axl_pci_read_config_8(root, 0x09, &prog) == 0
+    test_check(axl_pci_read_config_8(root, 0x0B, &base) == AXL_OK
+               && axl_pci_read_config_8(root, 0x0A, &sub)  == AXL_OK
+               && axl_pci_read_config_8(root, 0x09, &prog) == AXL_OK
                && class_code == (((uint32_t)base << 16) | ((uint32_t)sub << 8) | prog),
                "pci get_class_code: matches raw 0x09/0x0A/0x0B fold");
 
     /* NULL guards */
-    test_check(axl_pci_get_vid_did(root, NULL, &did) == -1, "pci get_vid_did: NULL vid");
-    test_check(axl_pci_get_class_code(root, NULL) == -1,       "pci get_class_code: NULL out");
+    test_check(axl_pci_get_vid_did(root, NULL, &did) == AXL_ERR, "pci get_vid_did: NULL vid");
+    test_check(axl_pci_get_class_code(root, NULL) == AXL_ERR,       "pci get_class_code: NULL out");
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +372,7 @@ test_pci_get_header_subsystem(void)
     AxlPciAddr root = { .seg = 0, .bus = 0, .dev = 0, .func = 0 };
     uint16_t   vid;
     uint16_t   did;
-    if (axl_pci_get_vid_did(root, &vid, &did) != 0) {
+    if (axl_pci_get_vid_did(root, &vid, &did) != AXL_OK) {
         axl_printf("SKIP: pci get_header_type/get_subsystem (no host bridge)\n");
         return;
     }
@@ -382,28 +382,28 @@ test_pci_get_header_subsystem(void)
        prescribes. */
     AxlPciHeaderType hdr  = AXL_PCI_HEADER_TYPE_BRIDGE;  /* deliberate bad sentinel */
     bool             mfun = true;                         /* ditto */
-    test_check(axl_pci_get_header_type(root, &hdr, &mfun) == 0,
+    test_check(axl_pci_get_header_type(root, &hdr, &mfun) == AXL_OK,
                "pci get_header_type: host bridge succeeds");
     test_check(hdr == AXL_PCI_HEADER_TYPE_NORMAL,
                "pci get_header_type: host bridge is Type 0");
 
     uint8_t htype_raw = 0xFF;
-    test_check(axl_pci_read_config_8(root, 0x0E, &htype_raw) == 0
+    test_check(axl_pci_read_config_8(root, 0x0E, &htype_raw) == AXL_OK
                    && (AxlPciHeaderType)(htype_raw & 0x7F) == hdr,
                "pci get_header_type: low 7 bits match raw 0x0E read");
     test_check(((htype_raw & 0x80u) != 0) == mfun,
                "pci get_header_type: bit 7 surfaces as is_multi_function");
 
     /* Either out param NULL is allowed per the docstring. */
-    test_check(axl_pci_get_header_type(root, NULL, &mfun) == 0,
+    test_check(axl_pci_get_header_type(root, NULL, &mfun) == AXL_OK,
                "pci get_header_type: NULL type out is allowed");
-    test_check(axl_pci_get_header_type(root, &hdr, NULL) == 0,
+    test_check(axl_pci_get_header_type(root, &hdr, NULL) == AXL_OK,
                "pci get_header_type: NULL is_multi_function out is allowed");
 
     /* Absent function — pick the same well-known absent slot the
        vid_did test uses. */
     AxlPciAddr absent = { .seg = 0, .bus = 0xFF, .dev = 0x1F, .func = 7 };
-    test_check(axl_pci_get_header_type(absent, &hdr, &mfun) == -1,
+    test_check(axl_pci_get_header_type(absent, &hdr, &mfun) == AXL_ERR,
                "pci get_header_type: absent function returns -1");
 
     /* axl_pci_get_subsystem — Type 0 host bridge: succeeds, values
@@ -413,7 +413,7 @@ test_pci_get_header_subsystem(void)
        generic across firmware variants. */
     uint16_t svid = 0xDEAD;
     uint16_t sdid = 0xBEEF;
-    test_check(axl_pci_get_subsystem(root, &svid, &sdid) == 0,
+    test_check(axl_pci_get_subsystem(root, &svid, &sdid) == AXL_OK,
                "pci get_subsystem: Type 0 function succeeds");
     uint16_t svid_raw = 0;
     uint16_t sdid_raw = 0;
@@ -423,13 +423,13 @@ test_pci_get_header_subsystem(void)
                "pci get_subsystem: values match raw 0x2C/0x2E reads");
 
     /* Absent function — should not synthesize zero values; -1 only. */
-    test_check(axl_pci_get_subsystem(absent, &svid, &sdid) == -1,
+    test_check(axl_pci_get_subsystem(absent, &svid, &sdid) == AXL_ERR,
                "pci get_subsystem: absent function returns -1");
 
     /* NULL guards on both out params. */
-    test_check(axl_pci_get_subsystem(root, NULL, &sdid) == -1,
+    test_check(axl_pci_get_subsystem(root, NULL, &sdid) == AXL_ERR,
                "pci get_subsystem: NULL svid out");
-    test_check(axl_pci_get_subsystem(root, &svid, NULL) == -1,
+    test_check(axl_pci_get_subsystem(root, &svid, NULL) == AXL_ERR,
                "pci get_subsystem: NULL sdid out");
 
     /* Bridge path: a header-type-1 function must report -1 from
@@ -445,7 +445,7 @@ test_pci_get_header_subsystem(void)
     AxlPciAddr *cursor = NULL;
     while ((cursor = axl_pci_next(cursor)) != NULL) {
         uint32_t cc = 0;
-        if (axl_pci_get_class_code(*cursor, &cc) == 0 && cc == 0x060400u) {
+        if (axl_pci_get_class_code(*cursor, &cc) == AXL_OK && cc == 0x060400u) {
             bridge      = *cursor;
             have_bridge = true;
             break;
@@ -453,10 +453,10 @@ test_pci_get_header_subsystem(void)
     }
     if (have_bridge) {
         AxlPciHeaderType bhdr = AXL_PCI_HEADER_TYPE_NORMAL;
-        test_check(axl_pci_get_header_type(bridge, &bhdr, NULL) == 0
+        test_check(axl_pci_get_header_type(bridge, &bhdr, NULL) == AXL_OK
                        && bhdr == AXL_PCI_HEADER_TYPE_BRIDGE,
                    "pci get_header_type: PCI-PCI bridge is Type 1");
-        test_check(axl_pci_get_subsystem(bridge, &svid, &sdid) == -1,
+        test_check(axl_pci_get_subsystem(bridge, &svid, &sdid) == AXL_ERR,
                    "pci get_subsystem: rejects Type 1 bridge");
     } else {
         axl_printf("SKIP: pci get_header_type/get_subsystem bridge path "
@@ -567,8 +567,8 @@ test_pci_tree_walker(void)
         AxlPciAddr   br_addr;
         AxlPciBridge br;
         bool match = false;
-        if (axl_pci_find_by_class(0x060400, 0, &br_addr) == 0
-            && axl_pci_bridge_info(br_addr, &br) == 0)
+        if (axl_pci_find_by_class(0x060400, 0, &br_addr) == AXL_OK
+            && axl_pci_bridge_info(br_addr, &br) == AXL_OK)
         {
             match = (br.secondary == t.first_child.bus);
         }
@@ -1562,7 +1562,7 @@ test_usb_get_vid_pid(void)
     uint16_t vid = 0xDEAD;
     uint16_t pid = 0xBEEF;
     int rc = axl_usb_get_vid_pid(*u, &vid, &pid);
-    test_check(rc == 0,
+    test_check(rc == AXL_OK,
                "usb get_vid_pid: succeeds on enumerated device");
     /* common-test.sh injects -device usb-mouse, which surfaces as
        QEMU vendor 0x0627 (Adomax Technology Co., Ltd. — the QEMU/
@@ -1576,11 +1576,11 @@ test_usb_get_vid_pid(void)
 
     /* Bogus address — never enumerated, must return -1. */
     AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
-    test_check(axl_usb_get_vid_pid(bogus, &vid, &pid) == -1,
+    test_check(axl_usb_get_vid_pid(bogus, &vid, &pid) == AXL_ERR,
                "usb get_vid_pid: unknown addr returns -1");
 
     /* NULL out param. */
-    test_check(axl_usb_get_vid_pid(*u, NULL, &pid) == -1,
+    test_check(axl_usb_get_vid_pid(*u, NULL, &pid) == AXL_ERR,
                "usb get_vid_pid: NULL vid rejected");
 }
 
@@ -1605,7 +1605,7 @@ test_usb_get_class(void)
     uint8_t sub = 0xBB;
     uint8_t prot = 0xCC;
     int rc = axl_usb_get_class(*u, &cls, &sub, &prot);
-    test_check(rc == 0,
+    test_check(rc == AXL_OK,
                "usb get_class: succeeds on enumerated interface");
     /* QEMU usb-mouse on the test bus exposes the HID Boot Mouse
        triplet: bInterfaceClass=0x03 (HID), bInterfaceSubClass=0x01
@@ -1625,13 +1625,13 @@ test_usb_get_class(void)
        that re-introduces an "any-NULL → -1" guard would slip
        through (the prior assertions pre-fill all three). */
     uint8_t prot_only = 0xCC;
-    test_check(axl_usb_get_class(*u, NULL, NULL, &prot_only) == 0
+    test_check(axl_usb_get_class(*u, NULL, NULL, &prot_only) == AXL_OK
                && prot_only == 0x02,
                "usb get_class: NULL class/sub still populates prot");
 
     /* Bogus address — never enumerated, must return -1. */
     AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
-    test_check(axl_usb_get_class(bogus, &cls, &sub, &prot) == -1,
+    test_check(axl_usb_get_class(bogus, &cls, &sub, &prot) == AXL_ERR,
                "usb get_class: unknown addr returns -1");
 }
 
@@ -2212,7 +2212,7 @@ test_pci_dump(void)
     uint8_t  buf[256] = { 0 };
     size_t   ok       = 0;
     int rc = axl_pci_dump(root, buf, 64, &ok);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_printf("SKIP: pci_dump (host bridge unreachable)\n");
         /* Balance: 7 checks ran in the populated path. */
         for (int i = 0; i < 7; i++) {
@@ -2220,7 +2220,7 @@ test_pci_dump(void)
         }
         return;
     }
-    test_check(rc == 0, "pci dump: host bridge succeeds");
+    test_check(rc == AXL_OK, "pci dump: host bridge succeeds");
     test_check(ok == 64, "pci dump: 64 bytes populated");
 
     /* Cross-check against direct read at offset 0. */
@@ -2234,7 +2234,7 @@ test_pci_dump(void)
        return -1 with out_read=0. */
     AxlPciAddr absent_hi = { .seg = 0, .bus = 0xFF, .dev = 0x1F, .func = 7 };
     size_t ok_absent = 999;
-    test_check(axl_pci_dump(absent_hi, buf, 64, &ok_absent) == -1
+    test_check(axl_pci_dump(absent_hi, buf, 64, &ok_absent) == AXL_ERR
                && ok_absent == 0,
                "pci dump: absent function (high bus) returns -1, out_read=0");
 
@@ -2245,17 +2245,17 @@ test_pci_dump(void)
        MCFG miss depending on firmware). */
     AxlPciAddr absent_func = { .seg = 0, .bus = 0, .dev = 0, .func = 7 };
     ok_absent = 999;
-    test_check(axl_pci_dump(absent_func, buf, 64, &ok_absent) == -1
+    test_check(axl_pci_dump(absent_func, buf, 64, &ok_absent) == AXL_ERR
                && ok_absent == 0,
                "pci dump: empty MCFG-mapped function also returns -1");
 
     /* Cap behavior: requesting > AXL_PCI_CONFIG_SPACE_MAX silently
        caps; requesting < 4 returns -1. */
-    test_check(axl_pci_dump(root, buf, 2, NULL) == -1,
+    test_check(axl_pci_dump(root, buf, 2, NULL) == AXL_ERR,
                "pci dump: bytes < 4 returns -1");
 
     /* NULL guard. */
-    test_check(axl_pci_dump(root, NULL, 64, NULL) == -1,
+    test_check(axl_pci_dump(root, NULL, 64, NULL) == AXL_ERR,
                "pci dump: NULL buf returns -1");
 }
 
@@ -2402,11 +2402,11 @@ test_pci_capabilities(void)
     while ((p = axl_pci_next(p)) != NULL) {
         uint16_t off = 0;
         uint16_t id;
-        if (axl_pci_cap_next(*p, off, &off, &id) == 0) {
+        if (axl_pci_cap_next(*p, off, &off, &id) == AXL_OK) {
             with_caps++;
             /* Walk a few caps to exercise the chain. */
             for (int i = 0; i < 16; i++) {
-                if (axl_pci_cap_next(*p, off, &off, &id) != 0) {
+                if (axl_pci_cap_next(*p, off, &off, &id) != AXL_OK) {
                     break;
                 }
             }
@@ -2424,7 +2424,7 @@ test_pci_capabilities(void)
     if (axl_pci_read_config_16(root, 0x06, &status) == 0
         && (status & 0x10) == 0) {
         uint16_t off, id;
-        test_check(axl_pci_cap_next(root, 0, &off, &id) == -1,
+        test_check(axl_pci_cap_next(root, 0, &off, &id) == AXL_ERR,
                    "pci: cap_next on no-caps device returns -1");
     }
 
@@ -2435,19 +2435,19 @@ test_pci_capabilities(void)
     {
         AxlPciBridge br;
         /* Host bridge is type 0 — bridge_info must say "not a bridge". */
-        test_check(axl_pci_bridge_info(root, &br) == -1,
+        test_check(axl_pci_bridge_info(root, &br) == AXL_ERR,
                    "pci bridge_info: host bridge (type 0) returns -1");
 
         /* NULL out param. */
-        test_check(axl_pci_bridge_info(root, NULL) == -1,
+        test_check(axl_pci_bridge_info(root, NULL) == AXL_ERR,
                    "pci bridge_info: NULL out returns -1");
 
         /* Find the pcie-root-port the test runner adds (class 0x060400,
            PCI-to-PCI bridge). It's at 00:02.0 in QEMU's auto-assignment
            but we locate it by class to stay topology-agnostic. */
         AxlPciAddr rp;
-        if (axl_pci_find_by_class(0x060400, 0, &rp) == 0) {
-            test_check(axl_pci_bridge_info(rp, &br) == 0,
+        if (axl_pci_find_by_class(0x060400, 0, &rp) == AXL_OK) {
+            test_check(axl_pci_bridge_info(rp, &br) == AXL_OK,
                        "pci bridge_info: PCI-to-PCI bridge succeeds");
             test_check(br.secondary != 0,
                        "pci bridge_info: root port has non-zero secondary bus");
@@ -2474,14 +2474,14 @@ test_pci_capabilities(void)
            specifically. */
         AxlPciAddr absent_func = { .seg = 0, .bus = 0, .dev = 0, .func = 7 };
         uint16_t   off = 0, id = 0;
-        test_check(axl_pci_cap_next(absent_func, 0, &off, &id) == -1,
+        test_check(axl_pci_cap_next(absent_func, 0, &off, &id) == AXL_ERR,
                    "pci: cap_next on empty MCFG-mapped function returns -1");
 
         /* The exact BDF from the original aa64 bug report. May exit
            via MCFG miss or via the all-1s VID check, either is fine. */
         AxlPciAddr absent_aa64 = { .seg = 0, .bus = 0, .dev = 0x1F, .func = 0 };
         off = 0; id = 0;
-        test_check(axl_pci_cap_next(absent_aa64, 0, &off, &id) == -1,
+        test_check(axl_pci_cap_next(absent_aa64, 0, &off, &id) == AXL_ERR,
                    "pci: cap_next on absent 0:1f.0 returns -1 (aa64 regression)");
     }
 }
@@ -2532,11 +2532,11 @@ test_mem_phys(void)
 {
     /* NULL guards. */
     void *va = NULL;
-    test_check(axl_mem_phys_map(0x1000, 16, NULL) == -1,
+    test_check(axl_mem_phys_map(0x1000, 16, NULL) == AXL_ERR,
                "mem_phys: map(NULL out) returns -1");
-    test_check(axl_mem_phys_map(0x1000, 0, &va) == -1,
+    test_check(axl_mem_phys_map(0x1000, 0, &va) == AXL_ERR,
                "mem_phys: map(len=0) returns -1");
-    test_check(axl_mem_phys_read32(0x1000, NULL) == -1,
+    test_check(axl_mem_phys_read32(0x1000, NULL) == AXL_ERR,
                "mem_phys: read32(NULL out) returns -1");
     /* unmap(NULL) is a no-op — must not crash. */
     axl_mem_phys_unmap(NULL, 0);
@@ -2557,12 +2557,12 @@ test_mem_phys(void)
     }
     uintptr_t bios_phys = (uintptr_t)bios;
     uint8_t   first_via_map = 0;
-    if (axl_mem_phys_map(bios_phys, 4, &va) == 0) {
+    if (axl_mem_phys_map(bios_phys, 4, &va) == AXL_OK) {
         first_via_map = *(volatile const uint8_t *)va;
         axl_mem_phys_unmap(va, 4);
     }
     uint8_t  first_via_oneshot = 0xAB;
-    test_check(axl_mem_phys_read8(bios_phys, &first_via_oneshot) == 0,
+    test_check(axl_mem_phys_read8(bios_phys, &first_via_oneshot) == AXL_OK,
                "mem_phys: one-shot read8 succeeds");
     test_check(first_via_map == first_via_oneshot,
                "mem_phys: map+deref matches one-shot read");
@@ -2571,7 +2571,7 @@ test_mem_phys(void)
        within the table, which we already know is at byte 0. */
     const void *match = NULL;
     int rc = axl_mem_phys_search(bios, 4, &first_via_oneshot, 1, &match);
-    test_check(rc == 0 && match == bios,
+    test_check(rc == AXL_OK && match == bios,
                "mem_phys: search finds known byte at offset 0");
 
     /* Negative search. A 4-byte sentinel that cannot occur inside
@@ -2586,13 +2586,13 @@ test_mem_phys(void)
     test_check(match == NULL, "mem_phys: search miss clears *out_match");
 
     /* NULL-arg search. */
-    test_check(axl_mem_phys_search(NULL, 4, miss, 1, &match) == -1,
+    test_check(axl_mem_phys_search(NULL, 4, miss, 1, &match) == AXL_ERR,
                "mem_phys: search(NULL va) returns -1");
-    test_check(axl_mem_phys_search(bios, 4, NULL, 1, &match) == -1,
+    test_check(axl_mem_phys_search(bios, 4, NULL, 1, &match) == AXL_ERR,
                "mem_phys: search(NULL needle) returns -1");
-    test_check(axl_mem_phys_search(bios, 4, miss, 0, &match) == -1,
+    test_check(axl_mem_phys_search(bios, 4, miss, 0, &match) == AXL_ERR,
                "mem_phys: search(needle_len=0) returns -1");
-    test_check(axl_mem_phys_search(bios, 1, miss, 4, &match) == -1,
+    test_check(axl_mem_phys_search(bios, 1, miss, 4, &match) == AXL_ERR,
                "mem_phys: search(needle_len > region) returns -1");
 }
 
@@ -2619,7 +2619,7 @@ static void
 test_mem_phys_round_trip(void)
 {
     uint64_t phys = 0;
-    if (axl_alloc_pages(1, &phys) != 0 || phys == 0) {
+    if (axl_alloc_pages(1, &phys) != AXL_OK || phys == 0) {
         axl_printf("SKIP: mem_phys round-trip (alloc_pages failed)\n");
         for (int i = 0; i < 13; i++) {
             test_check(true, "mem_phys round-trip: SKIP balance");
@@ -2637,10 +2637,10 @@ test_mem_phys_round_trip(void)
     {
         const uint8_t   val  = 0x5A;
         const uintptr_t addr = (uintptr_t)phys + 0x00;
-        test_check(axl_mem_phys_write8(addr, val) == 0,
+        test_check(axl_mem_phys_write8(addr, val) == AXL_OK,
                    "mem_phys: write8 returns 0");
         uint8_t got = 0;
-        test_check(axl_mem_phys_read8(addr, &got) == 0 && got == val,
+        test_check(axl_mem_phys_read8(addr, &got) == AXL_OK && got == val,
                    "mem_phys: read8 sees the byte write8 placed");
         test_check(*(volatile uint8_t *)addr == val,
                    "mem_phys: write8 lands at the addressed byte (deref check)");
@@ -2650,10 +2650,10 @@ test_mem_phys_round_trip(void)
     {
         const uint16_t  val  = 0xBEEF;
         const uintptr_t addr = (uintptr_t)phys + 0x10;
-        test_check(axl_mem_phys_write16(addr, val) == 0,
+        test_check(axl_mem_phys_write16(addr, val) == AXL_OK,
                    "mem_phys: write16 returns 0");
         uint16_t got = 0;
-        test_check(axl_mem_phys_read16(addr, &got) == 0 && got == val,
+        test_check(axl_mem_phys_read16(addr, &got) == AXL_OK && got == val,
                    "mem_phys: read16 sees the word write16 placed");
         test_check(*(volatile uint16_t *)addr == val,
                    "mem_phys: write16 lands at the addressed word (deref check)");
@@ -2663,10 +2663,10 @@ test_mem_phys_round_trip(void)
     {
         const uint32_t  val  = 0xDEADBEEFu;
         const uintptr_t addr = (uintptr_t)phys + 0x20;
-        test_check(axl_mem_phys_write32(addr, val) == 0,
+        test_check(axl_mem_phys_write32(addr, val) == AXL_OK,
                    "mem_phys: write32 returns 0");
         uint32_t got = 0;
-        test_check(axl_mem_phys_read32(addr, &got) == 0 && got == val,
+        test_check(axl_mem_phys_read32(addr, &got) == AXL_OK && got == val,
                    "mem_phys: read32 sees the dword write32 placed");
         test_check(*(volatile uint32_t *)addr == val,
                    "mem_phys: write32 lands at the addressed dword (deref check)");
@@ -2676,10 +2676,10 @@ test_mem_phys_round_trip(void)
     {
         const uint64_t  val  = 0x0123456789ABCDEFull;
         const uintptr_t addr = (uintptr_t)phys + 0x30;
-        test_check(axl_mem_phys_write64(addr, val) == 0,
+        test_check(axl_mem_phys_write64(addr, val) == AXL_OK,
                    "mem_phys: write64 returns 0");
         uint64_t got = 0;
-        test_check(axl_mem_phys_read64(addr, &got) == 0 && got == val,
+        test_check(axl_mem_phys_read64(addr, &got) == AXL_OK && got == val,
                    "mem_phys: read64 sees the qword write64 placed");
         test_check(*(volatile uint64_t *)addr == val,
                    "mem_phys: write64 lands at the addressed qword (deref check)");
@@ -2698,24 +2698,24 @@ test_watchdog(void)
     /* Disarm. UEFI starts with a 5-min watchdog; this turns it
        off. The test runner cleans up the QEMU instance shortly
        after, so leaving it disarmed is fine. */
-    test_check(axl_watchdog_disarm() == 0,
+    test_check(axl_watchdog_disarm() == AXL_OK,
                "watchdog: disarm succeeds");
 
     /* Set a 60-second window. The test will finish well before. */
-    test_check(axl_watchdog_set(60) == 0,
+    test_check(axl_watchdog_set(60) == AXL_OK,
                "watchdog: set(60s) succeeds");
 
     /* pet re-arms to last-set value. */
-    test_check(axl_watchdog_pet() == 0,
+    test_check(axl_watchdog_pet() == AXL_OK,
                "watchdog: pet succeeds");
 
     /* Disarm again before exit so the watchdog isn't running
        when the test app returns. */
-    test_check(axl_watchdog_disarm() == 0,
+    test_check(axl_watchdog_disarm() == AXL_OK,
                "watchdog: re-disarm succeeds");
 
     /* pet after final disarm is still safe (no-op). */
-    test_check(axl_watchdog_pet() == 0,
+    test_check(axl_watchdog_pet() == AXL_OK,
                "watchdog: pet after disarm is a no-op");
 }
 
@@ -2727,10 +2727,10 @@ static void
 test_rng(void)
 {
     /* NULL / zero-length guards. */
-    test_check(axl_rng_bytes(NULL, 16) == -1,
+    test_check(axl_rng_bytes(NULL, 16) == AXL_ERR,
                "rng: bytes(NULL) returns -1");
     uint8_t scratch[16];
-    test_check(axl_rng_bytes(scratch, 0) == -1,
+    test_check(axl_rng_bytes(scratch, 0) == AXL_ERR,
                "rng: bytes(len=0) returns -1");
 
     /* Real fill. EFI_RNG_PROTOCOL is published by OVMF on both
@@ -2741,7 +2741,7 @@ test_rng(void)
     uint8_t buf1[32] = { 0 };
     uint8_t buf2[32] = { 0 };
     int rc = axl_rng_bytes(buf1, sizeof(buf1));
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         /* Four balancers — the fixed path below emits four conditional
            test_check calls (bytes(32) succeeds + second fill + distinct
            + non-zero). Off-by-one previously left the skipped count
@@ -2754,11 +2754,11 @@ test_rng(void)
         test_check(true, "rng: protocol not published — non-zero test SKIPPED");
         return;
     }
-    test_check(rc == 0, "rng: bytes(32) succeeds");
+    test_check(rc == AXL_OK, "rng: bytes(32) succeeds");
 
     /* Two consecutive fills should differ — collision probability
        on 32 bytes from a real RNG is 2^-256. */
-    test_check(axl_rng_bytes(buf2, sizeof(buf2)) == 0,
+    test_check(axl_rng_bytes(buf2, sizeof(buf2)) == AXL_OK,
                "rng: second fill succeeds");
     bool same = true;
     for (size_t i = 0; i < sizeof(buf1); i++) {
@@ -2794,7 +2794,7 @@ test_spd_decode_ddr4(void)
 {
     AxlSpdInfo info;
     int rc = axl_spd_decode(spd_ddr4_micron_8gb, sizeof(spd_ddr4_micron_8gb), &info);
-    test_check(rc == 0, "spd: DDR4 decode succeeds");
+    test_check(rc == AXL_OK, "spd: DDR4 decode succeeds");
     test_check(info.ddr_generation == 4, "spd: DDR4 ddr_generation == 4");
     test_check(info.capacity_bytes == 8ULL * 1024 * 1024 * 1024,
                "spd: DDR4 capacity decodes to 8 GiB");
@@ -2811,7 +2811,7 @@ test_spd_decode_ddr5(void)
 {
     AxlSpdInfo info;
     int rc = axl_spd_decode(spd_ddr5_samsung_16gb, sizeof(spd_ddr5_samsung_16gb), &info);
-    test_check(rc == 0, "spd: DDR5 decode succeeds");
+    test_check(rc == AXL_OK, "spd: DDR5 decode succeeds");
     test_check(info.ddr_generation == 5, "spd: DDR5 ddr_generation == 5");
     test_check(info.capacity_bytes == 16ULL * 1024 * 1024 * 1024,
                "spd: DDR5 capacity decodes to 16 GiB (x8 device, 64-bit bus)");
@@ -2835,7 +2835,7 @@ test_spd_decode_unknown(void)
     uint8_t zero[16] = { 0 };
     AxlSpdInfo info;
     int rc = axl_spd_decode(zero, sizeof(zero), &info);
-    test_check(rc == 0, "spd: zero-init buffer decodes successfully");
+    test_check(rc == AXL_OK, "spd: zero-init buffer decodes successfully");
     test_check(info.ddr_generation == 0,
                "spd: zero-init buffer reports ddr_generation = 0");
 }
@@ -2844,9 +2844,9 @@ static void
 test_spd_decode_rejects_bogus(void)
 {
     AxlSpdInfo info;
-    test_check(axl_spd_decode(NULL, 256, &info) == -1,
+    test_check(axl_spd_decode(NULL, 256, &info) == AXL_ERR,
                "spd: NULL buffer rejected");
-    test_check(axl_spd_decode(spd_ddr4_micron_8gb, 2, &info) == -1,
+    test_check(axl_spd_decode(spd_ddr4_micron_8gb, 2, &info) == AXL_ERR,
                "spd: short buffer rejected (len < 3)");
 }
 
@@ -3094,6 +3094,89 @@ test_spd_ids_singleton(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlSmbios — raw table range
+// ---------------------------------------------------------------------------
+
+static void
+test_smbios_table_range(void)
+{
+    uint8_t *start = NULL, *end = NULL;
+    int rc = axl_smbios_table_range(&start, &end);
+
+    if (rc != 0) {
+        /* No SMBIOS table on this firmware (rare; bare aa64 OVMF
+           sometimes ships without one). Maintain stable test count. */
+        axl_printf("SKIP: smbios_table_range (no SMBIOS table)\n");
+        test_check(true, "smbios_table_range: SKIPPED (no table)");
+        test_check(true, "smbios_table_range: SKIPPED (no table)");
+        test_check(true, "smbios_table_range: SKIPPED (no table)");
+        return;
+    }
+    test_check(rc == 0, "smbios_table_range: returns 0 on success");
+    test_check(start != NULL && end != NULL,
+               "smbios_table_range: out pointers populated");
+
+    /* The range must contain the address of the first table found
+       via the existing axl_smbios_find — cross-check between the
+       raw range API and the typed lookup API ensures both APIs
+       agree on where the SMBIOS structure region lives. */
+    AxlSmbiosHeader *bios = axl_smbios_find(AXL_SMBIOS_TYPE_BIOS_INFO);
+    if (bios != NULL) {
+        uint8_t *p = (uint8_t *)bios;
+        test_check(p >= start && p < end,
+                   "smbios_table_range: contains addr of axl_smbios_find result");
+    } else {
+        test_check(true, "smbios_table_range: no Type 0 to cross-check (skip)");
+    }
+
+    /* NULL-out parameters get rejected. */
+    test_check(axl_smbios_table_range(NULL, &end) == -1,
+               "smbios_table_range: NULL out_start returns -1");
+}
+
+static void
+test_smbios_entry_point(void)
+{
+    uint8_t *base = NULL;
+    size_t   size = 0;
+    int rc = axl_smbios_entry_point(&base, &size);
+
+    if (rc != 0) {
+        /* No SMBIOS table on this firmware (rare). Maintain stable
+           test count. */
+        axl_printf("SKIP: smbios_entry_point (no SMBIOS table)\n");
+        test_check(true, "smbios_entry_point: SKIPPED (no table)");
+        test_check(true, "smbios_entry_point: SKIPPED (no table)");
+        test_check(true, "smbios_entry_point: SKIPPED (no table)");
+        return;
+    }
+    test_check(rc == 0, "smbios_entry_point: returns 0 on success");
+    /* Per DMTF SMBIOS Reference Specification: SMBIOS 2.x entry-point
+       is 31 bytes (anchor "_SM_"); SMBIOS 3.x entry-point is 24 bytes
+       (anchor "_SM3_"). axl_smbios_entry_point must return one of
+       those two — anything else means we're handing back something
+       that isn't an entry-point structure. */
+    test_check(size == 24 || size == 31,
+               "smbios_entry_point: size matches SMBIOS 2.x (31) or 3.x (24)");
+    /* Anchor string sanity-check: first byte must be '_' regardless
+       of variant. Catches bit-rot if the API ever starts returning
+       (e.g.) the table-data pointer instead of the entry-point. */
+    test_check(base != NULL && base[0] == '_',
+               "smbios_entry_point: returned bytes start with anchor '_'");
+}
+
+static void
+test_smbios_entry_point_null_args(void)
+{
+    uint8_t *base = NULL;
+    size_t   size = 0;
+    test_check(axl_smbios_entry_point(NULL, &size) == -1,
+               "smbios_entry_point: NULL out_base returns -1");
+    test_check(axl_smbios_entry_point(&base, NULL) == -1,
+               "smbios_entry_point: NULL out_size returns -1");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -3102,6 +3185,11 @@ test_platform_main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     test_print_header("AxlPlatform");
+
+    /* AxlSmbios */
+    test_smbios_table_range();
+    test_smbios_entry_point();
+    test_smbios_entry_point_null_args();
 
     /* AxlAcpi */
     test_acpi_revision();

@@ -184,6 +184,24 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlHashTable, axl_hash_table_free)
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Outcome of axl_hash_table_insert / axl_hash_table_replace.
+ *
+ * Three distinguishable outcomes — the operation either added a
+ * new entry, replaced an existing one, or failed allocation.
+ * Follows the AxlSidecarStatus precedent for typed multi-outcome
+ * status enums.
+ *
+ * Numeric values are part of the contract: callers comparing
+ * against the named constants AND against literal `1`/`0`/`-1`
+ * both work. New codes only ever extend the negative range.
+ */
+typedef enum {
+    AXL_HASH_TABLE_NEW      =  1,  ///< new entry was added
+    AXL_HASH_TABLE_REPLACED =  0,  ///< existing entry was replaced
+    AXL_HASH_TABLE_ERR      = -1,  ///< allocation failure (also logged)
+} AxlHashTableInsertResult;
+
+/**
  * @brief Insert a key-value pair, keeping the OLD key on collision.
  *
  * If the key already exists: the new key is freed via key_destroy
@@ -193,10 +211,9 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlHashTable, axl_hash_table_free)
  * For tables created with axl_hash_table_new_str() (copy_keys mode),
  * insert and replace behave identically.
  *
- * @return 1 if a new entry was added, 0 if an existing entry was
- *         replaced, -1 on allocation failure (also logged).
+ * @return one of the @ref AxlHashTableInsertResult values.
  */
-int
+AxlHashTableInsertResult
 axl_hash_table_insert(
     AxlHashTable *h,     ///< hash table
     const void   *key,   ///< key (copied for new() tables, owned for new_full())
@@ -213,10 +230,9 @@ axl_hash_table_insert(
  * For tables created with axl_hash_table_new_str() (copy_keys mode),
  * insert and replace behave identically.
  *
- * @return 1 if a new entry was added, 0 if an existing entry was
- *         replaced, -1 on allocation failure (also logged).
+ * @return one of the @ref AxlHashTableInsertResult values.
  */
-int
+AxlHashTableInsertResult
 axl_hash_table_replace(
     AxlHashTable *h,     ///< hash table
     const void   *key,   ///< key (copied for new() tables, owned for new_full())

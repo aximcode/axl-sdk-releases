@@ -53,17 +53,17 @@ demo_resolve(void)
     char buf[128];
 
     int rc = axl_path_resolve("fs0:/data", "../config", buf, sizeof(buf));
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("  resolve(\"fs0:/data\", \"../config\") = \"%s\"\n", buf);
     }
 
     rc = axl_path_resolve("fs0:/a/b/c", "../../x/y", buf, sizeof(buf));
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("  resolve(\"fs0:/a/b/c\", \"../../x/y\") = \"%s\"\n", buf);
     }
 
     rc = axl_path_resolve("fs0:/data", "./file.txt", buf, sizeof(buf));
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("  resolve(\"fs0:/data\", \"./file.txt\") = \"%s\"\n", buf);
     }
 }

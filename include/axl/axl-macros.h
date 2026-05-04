@@ -17,9 +17,29 @@
 // Result codes
 // ---------------------------------------------------------------------------
 
-#define AXL_OK         0   ///< operation succeeded
-#define AXL_ERR      (-1)  ///< operation failed
-#define AXL_CANCELLED (-2) ///< operation cancelled (AxlCancellable signalled or Ctrl-C)
+/**
+ * AxlStatus:
+ *
+ * Project-wide status enum for functions whose return value carries
+ * more information than success/failure. Multi-outcome operations
+ * return `AxlStatus` so callers can branch on the specific code
+ * (cancellation vs. timeout vs. generic error) without consulting
+ * a table of magic numbers. Single-outcome predicates use `bool`;
+ * POSIX-exit-shaped functions like `axl_args_run` keep their `int`
+ * return because their value flows directly into the process exit
+ * code.
+ *
+ * Values are stable; new codes only ever extend the negative range.
+ * The numeric values are part of the contract — code that compares
+ * against the constants (`rc == AXL_CANCELLED`) and code that
+ * compares against the literal integers (`rc == -2`) both work.
+ */
+typedef enum {
+    AXL_OK        =  0,  ///< operation succeeded
+    AXL_ERR       = -1,  ///< operation failed (generic)
+    AXL_CANCELLED = -2,  ///< operation cancelled (AxlCancellable signalled or Ctrl-C)
+    AXL_TIMEOUT   = -3,  ///< operation deadline elapsed before completion
+} AxlStatus;
 
 // ---------------------------------------------------------------------------
 // Compiler attributes

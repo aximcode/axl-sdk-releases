@@ -139,7 +139,7 @@ run_hexdump(AxlArgs *a)
 
     /* Get file size */
     file_size = 0;
-    if (axl_file_info(path, &fi) == 0) {
+    if (axl_file_info(path, &fi) == AXL_OK) {
         file_size = fi.size;
     }
 

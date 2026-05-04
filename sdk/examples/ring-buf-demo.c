@@ -103,7 +103,7 @@ main(int argc, char **argv)
                (unsigned)axl_ring_buf_peek_msg_size(rb));
 
     uint32_t actual;
-    while (axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == 0) {
+    while (axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_OK) {
         buf[actual] = '\0';
         axl_printf("  msg (%u): \"%s\"\n", (unsigned)actual, buf);
     }

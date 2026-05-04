@@ -20,7 +20,7 @@
     @code
     // Held mapping over multiple accesses.
     void *va;
-    if (axl_mem_phys_map(0xFED00000, 4096, &va) == 0) {
+    if (axl_mem_phys_map(0xFED00000, 4096, &va) == AXL_OK) {
         for (size_t i = 0; i < 4096; i += 4) {
             uint32_t w = *(volatile uint32_t *)((uint8_t *)va + i);
             // ...
@@ -39,6 +39,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,7 +59,7 @@ extern "C" {
  * and pairs every successful map with an `axl_mem_phys_unmap`
  * using the same @p len.
  *
- * @return 0 on success, -1 if the mapping cannot be established.
+ * @return AXL_OK on success, AXL_ERR if the mapping cannot be established.
  */
 int
 axl_mem_phys_map(
@@ -91,7 +92,7 @@ axl_mem_phys_unmap(
  * actually need to map, this is one mmap + read + munmap per call,
  * so the held-mapping API above is the better choice for hot loops.
  *
- * @return 0 on success, -1 if the mapping cannot be established.
+ * @return AXL_OK on success, AXL_ERR if the mapping cannot be established.
  */
 int
 axl_mem_phys_read8(
@@ -143,8 +144,8 @@ axl_mem_phys_write64(uintptr_t phys, uint64_t value);
  * for scanning ROMs, firmware tables, or signature blocks. Linear
  * byte-by-byte scan; use sparingly on multi-megabyte regions.
  *
- * @return 0 on hit (and @c *out_match is set to a pointer inside
- *     @p va), -1 if @p needle is not present.
+ * @return AXL_OK on hit (and @c *out_match is set to a pointer inside
+ *     @p va), AXL_ERR if @p needle is not present.
  */
 int
 axl_mem_phys_search(

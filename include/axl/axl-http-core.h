@@ -17,6 +17,7 @@
 #define AXL_HTTP_CORE_H
 
 #include <stddef.h>
+#include <axl/axl-macros.h>
 #include <axl/axl-hash-table.h>
 
 #ifdef __cplusplus
@@ -45,7 +46,7 @@ axl_http_find_header_end(
  * query string. The caller frees each non-NULL output with axl_free.
  * On error, all outputs are set to NULL.
  *
- * @return 0 on success, -1 if the line is malformed or allocation fails.
+ * @return AXL_OK on success, AXL_ERR if the line is malformed or allocation fails.
  */
 int
 axl_http_parse_request_line(
@@ -59,7 +60,7 @@ axl_http_parse_request_line(
 /**
  * @brief Parse an HTTP status line: "HTTP/1.x NNN Reason".
  *
- * @return 0 on success, -1 if the line is malformed.
+ * @return AXL_OK on success, AXL_ERR if the line is malformed.
  */
 int
 axl_http_parse_status_line(
@@ -76,7 +77,7 @@ axl_http_parse_status_line(
  * to enable case-insensitive lookups. The returned table owns its
  * keys and values; the caller frees it with axl_hash_table_free.
  *
- * @return 0 on success, -1 on error (table is left as NULL).
+ * @return AXL_OK on success, AXL_ERR on error.(table is left as NULL).
  */
 int
 axl_http_parse_headers(

@@ -55,7 +55,7 @@ hc_write_block(void *vctx,
                                 hc, addr, cmd,
                                 EfiSmbusWriteBlock, FALSE,
                                 &length, (void *)buf);
-    return EFI_ERROR(s) ? -1 : 0;
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
 static int
@@ -95,7 +95,7 @@ hc_write_byte(void *vctx,
                                 hc, addr, cmd,
                                 EfiSmbusWriteByte, FALSE,
                                 &length, &byte);
-    return EFI_ERROR(s) ? -1 : 0;
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
 static void
@@ -115,18 +115,18 @@ int
 axl_smbus_hc_open(AxlSmbusTransportOps *ops)
 {
     if (ops == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_SMBUS_HC_PROTOCOL *hc   = NULL;
     EFI_GUID               guid = gEfiSmbusHcProtocolGuid;
     EFI_STATUS s = gBS->LocateProtocol(&guid, NULL, (VOID **)&hc);
     if (EFI_ERROR(s) || hc == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (hc->Execute == NULL) {
         axl_warning("EFI_SMBUS_HC_PROTOCOL found but Execute is NULL");
-        return -1;
+        return AXL_ERR;
     }
 
     ops->kind        = AXL_SMBUS_TRANSPORT_HC;
@@ -136,5 +136,5 @@ axl_smbus_hc_open(AxlSmbusTransportOps *ops)
     ops->write_byte  = hc_write_byte;
     ops->close       = hc_close;
     ops->ctx         = hc;
-    return 0;
+    return AXL_OK;
 }

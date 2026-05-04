@@ -302,6 +302,12 @@ struct AxlArgsNode {
  *    stderr followed by the usage line and return 1.
  *  - Successful dispatch returns whatever the leaf handler returned.
  *
+ * Return value is **POSIX exit-code shaped**, not @ref AxlStatus —
+ * tools doing `return axl_args_run(...)` from main propagate it as
+ * the process exit code, so 0/1/2 follow shell convention rather
+ * than the negative-value AxlStatus scheme. Handlers should likewise
+ * return process-exit-shaped ints (0 success, non-zero failure).
+ *
  * @return handler return value, 0 on `--help`, 1 on parse error.
  */
 int

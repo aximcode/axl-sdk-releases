@@ -259,7 +259,7 @@ test_file_handler(void)
 
     // Read back and verify the marker is present
     rc = axl_file_get_contents("axl-test-log.log", &buf, &len);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         test_fail("file handler: cannot reopen log file");
         return;
     }
@@ -297,22 +297,22 @@ test_add_handler_overflow(void)
      * at >= MAX_HANDLERS slots if the cap ever rises. */
     int added = 0;
     for (size_t i = 0; i < sizeof(slots)/sizeof(slots[0]); i++) {
-        if (axl_log_add_handler(slots[i], NULL) == 0) {
+        if (axl_log_add_handler(slots[i], NULL) == AXL_OK) {
             added++;
         }
     }
     test_check(added > 0, "add_handler overflow: filled at least one slot");
 
     /* The next add must be rejected. */
-    test_check(axl_log_add_handler(noop_h8, NULL) == -1,
+    test_check(axl_log_add_handler(noop_h8, NULL) == AXL_ERR,
                "add_handler overflow: returns -1 when table full");
 
     /* Same contract for the domain-filtered variant. */
-    test_check(axl_log_add_domain_handler("x", AXL_LOG_INFO, noop_h8, NULL) == -1,
+    test_check(axl_log_add_domain_handler("x", AXL_LOG_INFO, noop_h8, NULL) == AXL_ERR,
                "add_domain_handler overflow: returns -1 when table full");
 
     /* NULL handler always rejected, regardless of fullness. */
-    test_check(axl_log_add_handler(NULL, NULL) == -1,
+    test_check(axl_log_add_handler(NULL, NULL) == AXL_ERR,
                "add_handler: NULL handler rejected");
 
     /* Clean up so subsequent test runs (if any) start fresh. */

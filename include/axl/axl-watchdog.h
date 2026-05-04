@@ -24,6 +24,7 @@
 #define AXL_WATCHDOG_H
 
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,7 +36,7 @@ extern "C" {
  * Equivalent to @c axl_watchdog_set(0). After this call, the
  * firmware will not reset the image for failing to make progress.
  *
- * @return 0 on success, -1 if the firmware refuses (rare).
+ * @return AXL_OK on success, AXL_ERR if the firmware refuses (rare).
  */
 int
 axl_watchdog_disarm(
@@ -52,7 +53,7 @@ axl_watchdog_disarm(
  *
  * The internal "last set" value is remembered for axl_watchdog_pet.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_watchdog_set(
@@ -66,7 +67,7 @@ axl_watchdog_set(
  * extended periodically. If axl_watchdog_set has not been called
  * yet this session, _pet is a no-op and returns 0.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_watchdog_pet(

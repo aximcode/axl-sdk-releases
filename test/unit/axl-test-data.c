@@ -303,8 +303,8 @@ test_hash_insert_vs_replace(void)
 
     // First insert — no collision; return value should be 1 (new entry)
     free_count = 0;
-    int rc = axl_hash_table_insert(t, key_a1, (void *)1);
-    test_check(rc == 1, "ins_vs_rep: first insert returns 1 (new)");
+    AxlHashTableInsertResult rc = axl_hash_table_insert(t, key_a1, (void *)1);
+    test_check(rc == AXL_HASH_TABLE_NEW, "ins_vs_rep: first insert returns NEW");
     test_check(free_count == 0, "ins_vs_rep: first insert no frees");
     test_check(axl_hash_table_size(t) == 1, "ins_vs_rep: size 1");
 
@@ -312,7 +312,7 @@ test_hash_insert_vs_replace(void)
     // return value should be 0 (replaced)
     free_count = 0;
     rc = axl_hash_table_insert(t, key_a2, (void *)2);
-    test_check(rc == 0, "ins_vs_rep: collision insert returns 0 (replaced)");
+    test_check(rc == AXL_HASH_TABLE_REPLACED, "ins_vs_rep: collision insert returns REPLACED");
     // Expect: key_destroy(key_a2) + value_destroy(old value)
     test_check(free_count == 2, "ins_vs_rep: insert collision frees new key + old value");
     test_check(axl_hash_table_size(t) == 1, "ins_vs_rep: size still 1");
@@ -336,13 +336,13 @@ test_hash_insert_vs_replace(void)
     char *key_b2 = axl_strdup("key_b");
 
     rc = axl_hash_table_replace(t, key_b1, (void *)10);
-    test_check(rc == 1, "ins_vs_rep: first replace returns 1 (new)");
+    test_check(rc == AXL_HASH_TABLE_NEW, "ins_vs_rep: first replace returns NEW");
 
     // replace with collision — OLD key (key_b1) should be freed, NEW key (key_b2) kept;
     // return value should be 0 (replaced)
     free_count = 0;
     rc = axl_hash_table_replace(t, key_b2, (void *)20);
-    test_check(rc == 0, "ins_vs_rep: collision replace returns 0 (replaced)");
+    test_check(rc == AXL_HASH_TABLE_REPLACED, "ins_vs_rep: collision replace returns REPLACED");
     // Expect: key_destroy(key_b1) + value_destroy(old value)
     test_check(free_count == 2, "ins_vs_rep: replace collision frees old key + old value");
 
@@ -531,7 +531,7 @@ test_array_extended(void)
     val = 30; axl_array_append(arr, &val);
     val = 40; axl_array_append(arr, &val);
 
-    test_check(axl_array_remove_index(arr, 1) == 0, "array: remove_index ok");
+    test_check(axl_array_remove_index(arr, 1) == AXL_OK, "array: remove_index ok");
     test_check(axl_array_len(arr) == 3, "array: remove_index len");
     got = axl_array_get(arr, 0);
     test_check(got != NULL && *got == 10, "array: remove_index [0]=10");
@@ -539,7 +539,7 @@ test_array_extended(void)
     test_check(got != NULL && *got == 30, "array: remove_index [1]=30");
     got = axl_array_get(arr, 2);
     test_check(got != NULL && *got == 40, "array: remove_index [2]=40");
-    test_check(axl_array_remove_index(arr, 5) == -1, "array: remove_index oob");
+    test_check(axl_array_remove_index(arr, 5) == AXL_ERR, "array: remove_index oob");
     axl_array_free(arr);
 
     // -- remove_index_fast: [10,20,30,40] remove index 0 -> [40,20,30] --
@@ -549,7 +549,7 @@ test_array_extended(void)
     val = 30; axl_array_append(arr, &val);
     val = 40; axl_array_append(arr, &val);
 
-    test_check(axl_array_remove_index_fast(arr, 0) == 0, "array: remove_fast ok");
+    test_check(axl_array_remove_index_fast(arr, 0) == AXL_OK, "array: remove_fast ok");
     test_check(axl_array_len(arr) == 3, "array: remove_fast len");
     got = axl_array_get(arr, 0);
     test_check(got != NULL && *got == 40, "array: remove_fast [0]=40");
@@ -567,7 +567,7 @@ test_array_extended(void)
     val = 40; axl_array_append(arr, &val);
     val = 50; axl_array_append(arr, &val);
 
-    test_check(axl_array_remove_range(arr, 1, 2) == 0, "array: remove_range ok");
+    test_check(axl_array_remove_range(arr, 1, 2) == AXL_OK, "array: remove_range ok");
     test_check(axl_array_len(arr) == 3, "array: remove_range len");
     got = axl_array_get(arr, 0);
     test_check(got != NULL && *got == 10, "array: remove_range [0]=10");
@@ -575,7 +575,7 @@ test_array_extended(void)
     test_check(got != NULL && *got == 40, "array: remove_range [1]=40");
     got = axl_array_get(arr, 2);
     test_check(got != NULL && *got == 50, "array: remove_range [2]=50");
-    test_check(axl_array_remove_range(arr, 1, 5) == -1, "array: remove_range oob");
+    test_check(axl_array_remove_range(arr, 1, 5) == AXL_ERR, "array: remove_range oob");
     axl_array_free(arr);
 
     // -- set_size grow: 3 elements, set_size(5) --
@@ -584,13 +584,13 @@ test_array_extended(void)
     val = 2; axl_array_append(arr, &val);
     val = 3; axl_array_append(arr, &val);
 
-    test_check(axl_array_set_size(arr, 5) == 0, "array: set_size grow ok");
+    test_check(axl_array_set_size(arr, 5) == AXL_OK, "array: set_size grow ok");
     test_check(axl_array_len(arr) == 5, "array: set_size grow len");
     got = axl_array_get(arr, 3);
     test_check(got != NULL && *got == 0, "array: set_size grow zero-init");
 
     // -- set_size shrink: set_size(2) --
-    test_check(axl_array_set_size(arr, 2) == 0, "array: set_size shrink ok");
+    test_check(axl_array_set_size(arr, 2) == AXL_OK, "array: set_size shrink ok");
     test_check(axl_array_len(arr) == 2, "array: set_size shrink len");
     got = axl_array_get(arr, 0);
     test_check(got != NULL && *got == 1, "array: set_size shrink [0]=1");
@@ -776,7 +776,7 @@ test_json_load_file(void)
     size_t             raw_len    = 0;
 
     /* Stage the JSON file. */
-    test_check(axl_file_set_contents(path, json, sizeof(json) - 1) == 0,
+    test_check(axl_file_set_contents(path, json, sizeof(json) - 1) == AXL_OK,
                "json_load_file: set_contents seeds the fixture");
 
     /* Successful load. */
@@ -1787,14 +1787,14 @@ test_cache(void)
 
     /* Put and get */
     int val = 42;
-    test_check(axl_cache_put(c, "key1", &val) == 0, "cache: put key1");
+    test_check(axl_cache_put(c, "key1", &val) == AXL_OK, "cache: put key1");
 
     int out = 0;
-    test_check(axl_cache_get(c, "key1", &out) == 0, "cache: get key1 hit");
+    test_check(axl_cache_get(c, "key1", &out) == AXL_OK, "cache: get key1 hit");
     test_check(out == 42, "cache: get key1 value");
 
     /* Miss on unknown key */
-    test_check(axl_cache_get(c, "missing", &out) == -1, "cache: miss");
+    test_check(axl_cache_get(c, "missing", &out) == AXL_ERR, "cache: miss");
 
     /* Overwrite existing */
     val = 99;
@@ -1804,7 +1804,7 @@ test_cache(void)
 
     /* Invalidate */
     axl_cache_invalidate(c, "key1");
-    test_check(axl_cache_get(c, "key1", &out) == -1, "cache: invalidated miss");
+    test_check(axl_cache_get(c, "key1", &out) == AXL_ERR, "cache: invalidated miss");
 
     /* Fill cache to capacity (4 slots) */
     int v1 = 1, v2 = 2, v3 = 3, v4 = 4, v5 = 5;
@@ -1815,8 +1815,8 @@ test_cache(void)
 
     /* 5th entry evicts oldest (a) */
     axl_cache_put(c, "e", &v5);
-    test_check(axl_cache_get(c, "a", &out) == -1, "cache: LRU evicted 'a'");
-    test_check(axl_cache_get(c, "e", &out) == 0, "cache: 'e' present");
+    test_check(axl_cache_get(c, "a", &out) == AXL_ERR, "cache: LRU evicted 'a'");
+    test_check(axl_cache_get(c, "e", &out) == AXL_OK, "cache: 'e' present");
     test_check(out == 5, "cache: 'e' value");
 
     /* NULL safety */
@@ -1844,9 +1844,9 @@ test_radix_tree(void)
 
     /* Insert 3 keys */
     size_t v1 = 100, v2 = 200, v3 = 300;
-    test_check(axl_radix_tree_insert(t, "/api", &v1) == 0, "radix: insert /api");
-    test_check(axl_radix_tree_insert(t, "/api/users", &v2) == 0, "radix: insert /api/users");
-    test_check(axl_radix_tree_insert(t, "/index.html", &v3) == 0, "radix: insert /index.html");
+    test_check(axl_radix_tree_insert(t, "/api", &v1) == AXL_OK, "radix: insert /api");
+    test_check(axl_radix_tree_insert(t, "/api/users", &v2) == AXL_OK, "radix: insert /api/users");
+    test_check(axl_radix_tree_insert(t, "/index.html", &v3) == AXL_OK, "radix: insert /index.html");
     test_check(axl_radix_tree_size(t) == 3, "radix: size 3");
 
     /* Exact lookup */
@@ -1867,19 +1867,19 @@ test_radix_tree(void)
 
     /* Overwrite */
     size_t v4 = 400;
-    test_check(axl_radix_tree_insert(t, "/api/users", &v4) == 0, "radix: overwrite");
+    test_check(axl_radix_tree_insert(t, "/api/users", &v4) == AXL_OK, "radix: overwrite");
     test_check(axl_radix_tree_lookup(t, "/api/users") == &v4, "radix: overwrite value");
     test_check(axl_radix_tree_size(t) == 2, "radix: size unchanged after overwrite");
 
     /* Empty key */
     size_t v5 = 500;
-    test_check(axl_radix_tree_insert(t, "", &v5) == 0, "radix: insert empty key");
+    test_check(axl_radix_tree_insert(t, "", &v5) == AXL_OK, "radix: insert empty key");
     test_check(axl_radix_tree_lookup(t, "") == &v5, "radix: lookup empty key");
     test_check(axl_radix_tree_size(t) == 3, "radix: size 3 with empty key");
 
     /* NULL safety */
     test_check(axl_radix_tree_lookup(NULL, "x") == NULL, "radix: lookup NULL tree");
-    test_check(axl_radix_tree_insert(NULL, "x", NULL) == -1, "radix: insert NULL tree");
+    test_check(axl_radix_tree_insert(NULL, "x", NULL) == AXL_ERR, "radix: insert NULL tree");
     axl_radix_tree_free(NULL);
     test_check(true, "radix: free(NULL) no crash");
 
@@ -2387,7 +2387,7 @@ test_ring_buf_push_stats(void)
     /* Now full. Try one more — must reject and count as lost. */
     uint32_t reject_val = 99;
     int rc = axl_ring_buf_push_elem(&rb_reject, &reject_val);
-    test_check(rc == -1, "ring_stats: full elem ring rejects");
+    test_check(rc == AXL_ERR, "ring_stats: full elem ring rejects");
     test_check(axl_ring_buf_pushes_total(&rb_reject) == 5 * sizeof(uint32_t),
                "ring_stats: reject elem counts in total");
     test_check(axl_ring_buf_pushes_lost(&rb_reject) == sizeof(uint32_t),
@@ -2427,7 +2427,7 @@ test_ring_buf_init(void)
     uint8_t buf[64];
     AxlRingBuf rb;
 
-    test_check(axl_ring_buf_init(&rb, buf, 64, 0, NULL) == 0, "ring_init: ok");
+    test_check(axl_ring_buf_init(&rb, buf, 64, 0, NULL) == AXL_OK, "ring_init: ok");
     test_check(axl_ring_buf_get_capacity(&rb) == 64, "ring_init: capacity 64");
     test_check(axl_ring_buf_is_empty(&rb), "ring_init: empty");
 
@@ -2452,17 +2452,17 @@ test_ring_buf_init(void)
     test_check(radix_free_count == 1, "ring_init: buf_free called on deinit");
 
     /* Non-power-of-2 rejected */
-    test_check(axl_ring_buf_init(&rb, buf, 50, 0, NULL) == -1,
+    test_check(axl_ring_buf_init(&rb, buf, 50, 0, NULL) == AXL_ERR,
                "ring_init: reject non-pow2");
 
     /* NULL args rejected */
-    test_check(axl_ring_buf_init(NULL, buf, 64, 0, NULL) == -1,
+    test_check(axl_ring_buf_init(NULL, buf, 64, 0, NULL) == AXL_ERR,
                "ring_init: NULL rb");
-    test_check(axl_ring_buf_init(&rb, NULL, 64, 0, NULL) == -1,
+    test_check(axl_ring_buf_init(&rb, NULL, 64, 0, NULL) == AXL_ERR,
                "ring_init: NULL buf");
 
     /* init_fixed rejects elem_size 0 */
-    test_check(axl_ring_buf_init_fixed(&rb, buf, 64, 0, 0, NULL) == -1,
+    test_check(axl_ring_buf_init_fixed(&rb, buf, 64, 0, 0, NULL) == AXL_ERR,
                "ring_init: init_fixed(0) rejected");
 
     /* new_fixed rejects elem_size 0 */
@@ -2472,9 +2472,9 @@ test_ring_buf_init(void)
     /* Layer 3 functions rejected on byte-mode buffer */
     axl_ring_buf_init(&rb, buf, 64, 0, NULL);
     int dummy = 42;
-    test_check(axl_ring_buf_push_elem(&rb, &dummy) == -1,
+    test_check(axl_ring_buf_push_elem(&rb, &dummy) == AXL_ERR,
                "ring_init: push_elem byte-mode rejected");
-    test_check(axl_ring_buf_pop_elem(&rb, &dummy) == -1,
+    test_check(axl_ring_buf_pop_elem(&rb, &dummy) == AXL_ERR,
                "ring_init: pop_elem byte-mode rejected");
     axl_ring_buf_deinit(&rb);
 
@@ -2517,7 +2517,7 @@ test_ring_buf_push_pop_elem(void)
 
     /* Push 5 ints */
     for (int i = 0; i < 5; i++) {
-        test_check(axl_ring_buf_push_elem(rb, &vals[i]) == 0,
+        test_check(axl_ring_buf_push_elem(rb, &vals[i]) == AXL_OK,
                    "ring_welem: ok");
     }
 
@@ -2527,20 +2527,20 @@ test_ring_buf_push_pop_elem(void)
     /* Pop 5 ints — FIFO order */
     int out;
     for (int i = 0; i < 5; i++) {
-        test_check(axl_ring_buf_pop_elem(rb, &out) == 0,
+        test_check(axl_ring_buf_pop_elem(rb, &out) == AXL_OK,
                    "ring_relem: ok");
         test_check(out == vals[i], "ring_relem: order");
     }
 
     /* Pop from empty fails */
-    test_check(axl_ring_buf_pop_elem(rb, &out) == -1,
+    test_check(axl_ring_buf_pop_elem(rb, &out) == AXL_ERR,
                "ring_relem: empty fails");
 
     /* Push until full (reject mode) */
     AxlRingBuf *small = axl_ring_buf_new_fixed(16, sizeof(int), 0);
     int count = 0;
     int v = 99;
-    while (axl_ring_buf_push_elem(small, &v) == 0) {
+    while (axl_ring_buf_push_elem(small, &v) == AXL_OK) {
         count++;
     }
     test_check(count == 4, "ring_welem: 4 ints in 16 bytes");
@@ -2568,12 +2568,12 @@ test_ring_buf_peek_set_nth_elem(void)
     test_check(out == 500, "ring_get: idx 4 = 500");
 
     /* Out of range */
-    test_check(axl_ring_buf_peek_nth_elem(rb, 5, &out) == -1,
+    test_check(axl_ring_buf_peek_nth_elem(rb, 5, &out) == AXL_ERR,
                "ring_get: out of range");
 
     /* Set by index */
     int newval = 999;
-    test_check(axl_ring_buf_set_nth_elem(rb, 2, &newval) == 0,
+    test_check(axl_ring_buf_set_nth_elem(rb, 2, &newval) == AXL_OK,
                "ring_set: ok");
     axl_ring_buf_peek_nth_elem(rb, 2, &out);
     test_check(out == 999, "ring_set: modified");
@@ -2597,7 +2597,7 @@ test_ring_buf_peek_elem(void)
 
     /* peek_elem gets head without consuming */
     int out = 0;
-    test_check(axl_ring_buf_peek_elem(rb, &out) == 0, "ring_peek_elem: ok");
+    test_check(axl_ring_buf_peek_elem(rb, &out) == AXL_OK, "ring_peek_elem: ok");
     test_check(out == 11, "ring_peek_elem: head value");
 
     /* readable unchanged */
@@ -2624,24 +2624,24 @@ test_ring_buf_peek_msg(void)
     /* peek_msg gets first without consuming */
     char buf[64];
     uint32_t actual;
-    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_peek_msg: ok");
     test_check(actual == 5, "ring_peek_msg: size 5");
     test_check(axl_memcmp(buf, "first", 5) == 0, "ring_peek_msg: data");
 
     /* peek again gives same message */
-    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_peek_msg: still first");
     test_check(actual == 5, "ring_peek_msg: size still 5");
 
     /* pop_msg consumes it */
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_peek_msg: pop ok");
     test_check(actual == 5, "ring_peek_msg: popped first");
     test_check(axl_memcmp(buf, "first", 5) == 0, "ring_peek_msg: popped data");
 
     /* Now peek gets second message */
-    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_peek_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_peek_msg: next");
     test_check(actual == 6, "ring_peek_msg: size 6");
     test_check(axl_memcmp(buf, "second", 6) == 0, "ring_peek_msg: second data");
@@ -2655,10 +2655,10 @@ test_ring_buf_messages(void)
     AxlRingBuf *rb = axl_ring_buf_new(256);
 
     /* Write 3 messages of different sizes */
-    test_check(axl_ring_buf_push_msg(rb, "hi", 2) == 0, "ring_msg: write hi");
-    test_check(axl_ring_buf_push_msg(rb, "hello world", 11) == 0,
+    test_check(axl_ring_buf_push_msg(rb, "hi", 2) == AXL_OK, "ring_msg: write hi");
+    test_check(axl_ring_buf_push_msg(rb, "hello world", 11) == AXL_OK,
                "ring_msg: write hello world");
-    test_check(axl_ring_buf_push_msg(rb, "!", 1) == 0, "ring_msg: write !");
+    test_check(axl_ring_buf_push_msg(rb, "!", 1) == AXL_OK, "ring_msg: write !");
 
     /* Peek size of first message */
     test_check(axl_ring_buf_peek_msg_size(rb) == 2, "ring_msg: peek size 2");
@@ -2666,41 +2666,41 @@ test_ring_buf_messages(void)
     /* Read first message */
     char buf[64];
     uint32_t actual;
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_msg: read 1");
     test_check(actual == 2, "ring_msg: actual 2");
     test_check(axl_memcmp(buf, "hi", 2) == 0, "ring_msg: data hi");
 
     /* Read second */
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_msg: read 2");
     test_check(actual == 11, "ring_msg: actual 11");
     test_check(axl_memcmp(buf, "hello world", 11) == 0, "ring_msg: data hello");
 
     /* Read third */
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == 0,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_OK,
                "ring_msg: read 3");
     test_check(actual == 1, "ring_msg: actual 1");
 
     /* No more messages */
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == -1,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), &actual) == AXL_ERR,
                "ring_msg: empty");
     test_check(axl_ring_buf_peek_msg_size(rb) == 0, "ring_msg: peek empty");
 
     /* Buffer too small for message */
     axl_ring_buf_push_msg(rb, "toolong", 7);
-    test_check(axl_ring_buf_pop_msg(rb, buf, 3, &actual) == -1,
+    test_check(axl_ring_buf_pop_msg(rb, buf, 3, &actual) == AXL_ERR,
                "ring_msg: dest too small");
     /* Message still there */
     test_check(axl_ring_buf_peek_msg_size(rb) == 7, "ring_msg: not consumed");
 
     /* NULL actual_len is ok */
-    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), NULL) == 0,
+    test_check(axl_ring_buf_pop_msg(rb, buf, sizeof(buf), NULL) == AXL_OK,
                "ring_msg: NULL actual_len");
 
     /* Not enough space in reject mode */
     AxlRingBuf *small = axl_ring_buf_new(16);
-    test_check(axl_ring_buf_push_msg(small, buf, 20) == -1,
+    test_check(axl_ring_buf_push_msg(small, buf, 20) == AXL_ERR,
                "ring_msg: reject too large");
     axl_ring_buf_free(small);
 
@@ -2879,7 +2879,7 @@ test_oom_containers(void)
     test_check(tr != NULL, "oom: radix tree reconstructed cleanly");
     axl_mem_fail_next_alloc(1);
     int r2 = axl_radix_tree_insert(tr, "alpha", (void *)1);
-    test_check(r2 == -1, "oom: axl_radix_tree_insert returns -1 on node alloc fail");
+    test_check(r2 == AXL_ERR, "oom: axl_radix_tree_insert returns -1 on node alloc fail");
     axl_radix_tree_free(tr);
 
     /* --- Ring buffer --- */
@@ -2916,7 +2916,7 @@ test_oom_containers(void)
     /* Append enough values that at least one grow is required. */
     for (int i = 0; i < 1024; i++) {
         int val = 100 + i;
-        if (axl_array_append(arr, &val) != 0) {
+        if (axl_array_append(arr, &val) != AXL_OK) {
             break;
         }
     }

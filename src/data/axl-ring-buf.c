@@ -121,7 +121,7 @@ axl_ring_buf_init(
     )
 {
     if (rb == NULL || buf == NULL || !is_pow2(size)) {
-        return -1;
+        return AXL_ERR;
     }
 
     rb->buf          = (uint8_t *)buf;
@@ -134,7 +134,7 @@ axl_ring_buf_init(
     rb->pushes_total = 0;
     rb->pushes_lost  = 0;
     rb->buf_free     = buf_free_fn;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -148,7 +148,7 @@ axl_ring_buf_init_fixed(
     )
 {
     if (elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     int rc = axl_ring_buf_init(rb, buf, size, flags, buf_free_fn);
@@ -157,7 +157,7 @@ axl_ring_buf_init_fixed(
     }
 
     rb->elem_size = elem_size;
-    return 0;
+    return AXL_OK;
 }
 
 void
@@ -509,7 +509,7 @@ axl_ring_buf_push_msg(
     )
 {
     if (rb == NULL || (data == NULL && len > 0)) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t total = (uint32_t)sizeof(uint32_t) + len;
@@ -520,7 +520,7 @@ axl_ring_buf_push_msg(
              * attempted-but-lost so the call shows up in stats. */
             rb->pushes_total += total;
             rb->pushes_lost  += total;
-            return -1;
+            return AXL_ERR;
         }
     }
 
@@ -530,7 +530,7 @@ axl_ring_buf_push_msg(
         axl_ring_buf_push(rb, data, len);
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 /**
@@ -547,12 +547,12 @@ ring_buf_msg_read_internal(
     )
 {
     if (rb == NULL || dest == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t readable = ring_readable(rb);
     if (readable < (uint32_t)sizeof(uint32_t)) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Peek at length header without consuming */
@@ -560,11 +560,11 @@ ring_buf_msg_read_internal(
     ring_copy_out(rb, &msg_len, (uint32_t)sizeof(uint32_t), rb->read_pos);
 
     if (readable < (uint32_t)sizeof(uint32_t) + msg_len) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (max_len < msg_len) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (consume) {
@@ -583,7 +583,7 @@ ring_buf_msg_read_internal(
         *actual_len = msg_len;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -635,7 +635,7 @@ axl_ring_buf_push_elem(
     )
 {
     if (rb == NULL || elem == NULL || rb->elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (!(rb->flags & AXL_RING_BUF_OVERWRITE)) {
@@ -643,12 +643,12 @@ axl_ring_buf_push_elem(
             /* Reject: count the element as attempted-but-lost. */
             rb->pushes_total += rb->elem_size;
             rb->pushes_lost  += rb->elem_size;
-            return -1;
+            return AXL_ERR;
         }
     }
 
     axl_ring_buf_push(rb, elem, rb->elem_size);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -658,15 +658,15 @@ axl_ring_buf_pop_elem(
     )
 {
     if (rb == NULL || elem == NULL || rb->elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (ring_readable(rb) < rb->elem_size) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_ring_buf_pop(rb, elem, rb->elem_size);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -676,15 +676,15 @@ axl_ring_buf_peek_elem(
     )
 {
     if (rb == NULL || dest == NULL || rb->elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (ring_readable(rb) < rb->elem_size) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_ring_buf_peek(rb, dest, rb->elem_size);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -695,17 +695,17 @@ axl_ring_buf_peek_nth_elem(
     )
 {
     if (rb == NULL || dest == NULL || rb->elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t count = ring_readable(rb) / rb->elem_size;
     if (index >= count) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t byte_offset = rb->read_pos + index * rb->elem_size;
     ring_copy_out(rb, dest, rb->elem_size, byte_offset);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -716,17 +716,17 @@ axl_ring_buf_set_nth_elem(
     )
 {
     if (rb == NULL || src == NULL || rb->elem_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t count = ring_readable(rb) / rb->elem_size;
     if (index >= count) {
-        return -1;
+        return AXL_ERR;
     }
 
     uint32_t byte_offset = rb->read_pos + index * rb->elem_size;
     ring_copy_in(rb, src, rb->elem_size, byte_offset);
-    return 0;
+    return AXL_OK;
 }
 
 uint32_t

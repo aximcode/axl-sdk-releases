@@ -214,7 +214,7 @@ session_login(
     int rc = axl_http_post(client, url, json_buf, json_len,
                            "application/json", &resp);
 
-    if (rc != 0 || resp == NULL) {
+    if (rc != AXL_OK || resp == NULL) {
         axl_printf("rfbrowse: login request failed\n");
         return -1;
     }
@@ -317,7 +317,7 @@ get_resource(
     AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
     int rc = axl_http_get(client, url, &resp);
 
-    if (rc != 0 || resp == NULL) {
+    if (rc != AXL_OK || resp == NULL) {
         axl_printf("rfbrowse: GET %s failed\n", url);
         return -1;
     }
@@ -362,7 +362,7 @@ get_members(
     AXL_AUTOPTR(AxlHttpClientResponse) resp = NULL;
     int rc = axl_http_get(client, url, &resp);
 
-    if (rc != 0 || resp == NULL) {
+    if (rc != AXL_OK || resp == NULL) {
         axl_printf("rfbrowse: GET %s failed\n", url);
         return -1;
     }
@@ -461,7 +461,7 @@ run_rfbrowse(AxlArgs *a)
         axl_printf("rfbrowse: failed to bring up networking.\n");
         return 1;
     }
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("rfbrowse: no IP address — DHCP did not complete.\n");
         return 1;
     }

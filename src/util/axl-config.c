@@ -195,7 +195,7 @@ auto_apply(void *target, const AxlConfigDesc *desc, const char *value)
             }
             v = v32;
         } else {
-            if (axl_str_to_u64(value, 0, &v, NULL) != 0) {
+            if (axl_str_to_u64(value, 0, &v, NULL) != AXL_OK) {
                 return -1;
             }
         }
@@ -318,7 +318,7 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
     const AxlConfigDesc *desc;
 
     if (cfg == NULL || key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /*
@@ -331,24 +331,24 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
     if (cfg->apply_fn != NULL) {
         int rc = cfg->apply_fn(cfg->target, key, value);
         if (rc == -1) {
-            return -1;
+            return AXL_ERR;
         }
         if (rc == 1) {
             /* Callback handled it — store value for later retrieval */
             axl_hash_table_replace(cfg->values, axl_strdup(key),
                                value != NULL ? axl_strdup(value) : NULL);
-            return 0;
+            return AXL_OK;
         }
     }
 
     /* Descriptor lookup — reject unknown keys */
     desc = find_desc(cfg->descs, key);
     if (desc == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (!validate_type(desc->type, value)) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Validate the value parses + fits the declared field width before
@@ -357,7 +357,7 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
     if (auto_apply(NULL, desc, value) != 0) {
         axl_warning("config: '%s' value '%s' out of range for declared type",
                     key, value);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Handle MULTI: append to array */
@@ -366,15 +366,15 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
         if (mv == NULL) {
             mv = (MultiValues *)axl_calloc(1, sizeof(MultiValues));
             if (mv == NULL) {
-                return -1;
+                return AXL_ERR;
             }
             axl_hash_table_replace(cfg->multi, key, mv);
         }
         if (mv->count >= MAX_MULTI) {
-            return -1;
+            return AXL_ERR;
         }
         mv->values[mv->count++] = axl_strdup(value);
-        return 0;
+        return AXL_OK;
     }
 
     /* Store value (owned copy) */
@@ -387,7 +387,7 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
         (void)auto_apply(cfg->target, desc, stored);
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -397,7 +397,7 @@ axl_config_setv(AxlConfig *cfg, ...)
     const char *key;
 
     if (cfg == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     va_start(ap, cfg);
@@ -409,14 +409,14 @@ axl_config_setv(AxlConfig *cfg, ...)
     // NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized)
     while ((key = va_arg(ap, const char *)) != NULL) {
         const char *value = va_arg(ap, const char *);
-        if (axl_config_set(cfg, key, value) != 0) {
+        if (axl_config_set(cfg, key, value) != AXL_OK) {
             va_end(ap);
-            return -1;
+            return AXL_ERR;
         }
     }
     va_end(ap);
 
-    return 0;
+    return AXL_OK;
 }
 
 const char *

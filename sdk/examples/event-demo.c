@@ -2,11 +2,12 @@
  * @file event-demo.c
  *
  * Demonstrates AxlEvent's signal/wait/reset state machine and the
- * three return-code paths of axl_event_wait_timeout:
+ * four AxlStatus paths of axl_event_wait_timeout:
  *
- *     0              -- event was (or became) signalled
- *    -1              -- timeout elapsed first
- *    AXL_CANCELLED   -- Ctrl-C or a signalled cancellable interrupted
+ *     AXL_OK         -- event was (or became) signalled
+ *     AXL_TIMEOUT    -- timeout elapsed first
+ *     AXL_ERR        -- invalid arg / internal failure
+ *     AXL_CANCELLED  -- Ctrl-C or a signalled cancellable interrupted
  *
  * In real code the signal comes from an async callback (HTTP
  * response handler, TCP completion token, MP worker finishing)
@@ -33,23 +34,24 @@ main(int argc, char **argv)
 
     axl_printf("event-demo: signal/wait/reset state machine\n\n");
 
-    /* 1. Signal-before-wait -- wait returns immediately with 0. This
-     * is the common case when the async op completes before the main
-     * thread parks. */
+    /* 1. Signal-before-wait -- wait returns immediately with AXL_OK.
+     * This is the common case when the async op completes before the
+     * main thread parks. */
     axl_event_signal(e);
-    int rc = axl_event_wait_timeout(e, NULL, 1000 * 1000);
-    axl_printf("  [1] signal -> wait(1s):    rc=%d   (expect 0, already signalled)\n", rc);
+    AxlStatus rc = axl_event_wait_timeout(e, NULL, 1000 * 1000);
+    axl_printf("  [1] signal -> wait(1s):    rc=%d   (expect 0 = AXL_OK, already signalled)\n", rc);
 
     /* 2. Reset, then wait with a short timeout and no signal. Wait
-     * blocks the CPU idle for the full timeout and returns -1. */
+     * blocks the CPU idle for the full timeout and returns AXL_TIMEOUT. */
     axl_event_reset(e);
     rc = axl_event_wait_timeout(e, NULL, 200 * 1000);
-    axl_printf("  [2] reset -> wait(200ms):  rc=%d  (expect -1, timed out)\n", rc);
+    axl_printf("  [2] reset -> wait(200ms):  rc=%d  (expect %d = AXL_TIMEOUT, timed out)\n",
+               rc, AXL_TIMEOUT);
 
     /* 3. Signal-after-reset -- wait returns immediately again. */
     axl_event_signal(e);
     rc = axl_event_wait_timeout(e, NULL, 1000 * 1000);
-    axl_printf("  [3] signal -> wait(1s):    rc=%d   (expect 0, signalled)\n", rc);
+    axl_printf("  [3] signal -> wait(1s):    rc=%d   (expect 0 = AXL_OK, signalled)\n", rc);
 
     /* 4. Cancellable interruption. Wait with a pre-signalled
      * cancellable returns AXL_CANCELLED immediately without

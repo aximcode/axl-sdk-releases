@@ -77,12 +77,12 @@ send_response(
     len += axl_snprintf(header + len, sizeof(header) - len, "\r\n");
 
     if (conn->tls_ctx != NULL) {
-        if (axl_tls_write(conn->tls_ctx, header, len) != 0) {
+        if (axl_tls_write(conn->tls_ctx, header, len) != AXL_OK) {
             axl_warning("TLS write failed for headers");
             return;
         }
         if (resp->body != NULL && resp->body_size > 0) {
-            if (axl_tls_write(conn->tls_ctx, resp->body, resp->body_size) != 0) {
+            if (axl_tls_write(conn->tls_ctx, resp->body, resp->body_size) != AXL_OK) {
                 axl_warning("TLS write failed for body");
                 return;
             }
@@ -187,7 +187,7 @@ axl_http_response_set_file(AxlHttpResponse *r, const char *path)
         int      rc;
 
         rc = axl_file_get_contents(path, &tmp, &len);
-        if (rc != 0) {
+        if (rc != AXL_OK) {
             axl_debug("static file not found: %s", path);
             r->status_code = 404;
             return;

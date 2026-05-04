@@ -29,6 +29,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 #include <axl/axl-hash-table.h>
 
 #ifdef __cplusplus
@@ -70,7 +71,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlHttpClient, axl_http_client_free)
  * All values are strings, parsed internally. See header comment
  * for the list of supported options.
  *
- * @return 0 on success, -1 on unknown option.
+ * @return AXL_OK on success, AXL_ERR on unknown option.
  */
 int
 axl_http_client_set(
@@ -96,7 +97,7 @@ axl_http_client_get(
 /**
  * @brief HTTP GET request.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_get(
@@ -108,7 +109,7 @@ axl_http_get(
 /**
  * @brief HTTP POST request.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_post(
@@ -123,7 +124,7 @@ axl_http_post(
 /**
  * @brief HTTP PUT request.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_put(
@@ -138,7 +139,7 @@ axl_http_put(
 /**
  * @brief HTTP DELETE request.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_delete(
@@ -150,7 +151,7 @@ axl_http_delete(
 /**
  * @brief Generic HTTP request with optional per-request headers.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_request(
@@ -179,7 +180,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlHttpClientResponse, axl_http_client_response_free)
 /**
  * @brief Download a URL to a local file.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_download(

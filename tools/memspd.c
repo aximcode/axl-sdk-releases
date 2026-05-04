@@ -126,7 +126,7 @@ do_list(
     uint8_t *slot  = NULL;
     while ((slot = axl_spd_next(slot)) != NULL) {
         AxlSpdInfo info;
-        if (axl_spd_read(*slot, &info) != 0) {
+        if (axl_spd_read(*slot, &info) != AXL_OK) {
             axl_printf("Slot 0x%02X: read failed\n", *slot);
             continue;
         }
@@ -157,7 +157,7 @@ do_show(
 {
     uint8_t addr = (uint8_t)axl_args_get_uint(a, "slot");
     AxlSpdInfo info;
-    if (axl_spd_read(addr, &info) != 0) {
+    if (axl_spd_read(addr, &info) != AXL_OK) {
         axl_printf("Slot 0x%02X: SPD read failed (slot empty or I/O error)\n", addr);
         return 2;
     }
@@ -180,7 +180,7 @@ do_decode(
     uint8_t addr = (uint8_t)axl_args_get_uint(a, "slot");
     uint8_t raw[AXL_SPD_RAW_MAX];
     size_t  raw_len = 0;
-    if (axl_spd_dump_raw(addr, raw, sizeof(raw), &raw_len) != 0 || raw_len == 0) {
+    if (axl_spd_dump_raw(addr, raw, sizeof(raw), &raw_len) != AXL_OK || raw_len == 0) {
         axl_printf("Slot 0x%02X: raw read failed\n", addr);
         return 2;
     }
@@ -189,7 +189,7 @@ do_decode(
     axl_printf("\n");
 
     AxlSpdInfo info;
-    if (axl_spd_decode(raw, raw_len, &info) == 0) {
+    if (axl_spd_decode(raw, raw_len, &info) == AXL_OK) {
         print_info(addr, &info);
     } else {
         axl_printf("(decode failed)\n");

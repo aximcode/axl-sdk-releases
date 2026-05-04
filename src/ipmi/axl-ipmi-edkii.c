@@ -80,18 +80,18 @@ int
 axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
 {
     if (ops == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     IPMI_PROTOCOL *ipmi = NULL;
     EFI_GUID       guid = gIpmiProtocolGuid;
     EFI_STATUS     s = gBS->LocateProtocol(&guid, NULL, (VOID **)&ipmi);
     if (EFI_ERROR(s) || ipmi == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (ipmi->IpmiSubmitCommand == NULL) {
         axl_warning("EDKII IPMI_PROTOCOL found but IpmiSubmitCommand is NULL");
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -115,12 +115,12 @@ axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
     if (EFI_ERROR(probe_st) || probe_size < 1) {
         axl_debug("EDKII probe rejected (Get Device ID failed 0x%lx)",
                   (unsigned long)probe_st);
-        return -1;
+        return AXL_ERR;
     }
     if (probe_resp[0] != 0x00) {
         axl_debug("EDKII probe rejected (CC=0x%02x)",
                   (unsigned)probe_resp[0]);
-        return -1;
+        return AXL_ERR;
     }
 
     ops->kind     = AXL_IPMI_TRANSPORT_EDKII;
@@ -130,5 +130,5 @@ axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
 
     axl_info("IPMI EDKII transport ready (IPMI_PROTOCOL @ %p)",
              (void *)ipmi);
-    return 0;
+    return AXL_OK;
 }

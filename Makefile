@@ -423,7 +423,15 @@ endif
 $(PE_SET_DEBUG): scripts/pe-set-debug.c | $(BUILDDIR)
 	$(HOSTCC) -Wall -O2 -o $@ $<
 
+# `ar rcs` inserts-or-replaces members matching by basename — if a
+# source file is renamed or removed, its .o stays in the archive
+# forever (and a future build picks the stale copy first since `ar`
+# preserves insertion order). Delete the archive before each rebuild
+# so only the CURRENT $(LIB_OBJS) make it in. This is what the
+# "structural header change → make clean" warning in CLAUDE.md was
+# papering over.
 $(PREFIX)/lib/libaxl.a: $(LIB_OBJS) | $(PREFIX)/lib
+	@rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILDDIR):
@@ -724,7 +732,7 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: $(TOOL_EFIS)
@@ -753,13 +761,18 @@ $(BUILDDIR)/$(1).o: tools/$(1).c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $$< -o $$@
 endef
 
-$(foreach t,$(TOOL_NAMES),$(eval $(call BUILD_TOOL,$(t))))
+# mkrd is linked alongside the .incbin'd blob object — filter it out
+# of the generic foreach so BUILD_TOOL doesn't generate a recipe that
+# the special rule below would have to override. Without this filter
+# `make` warns "overriding recipe for target mkrd.efi" on every build.
+$(foreach t,$(filter-out mkrd,$(TOOL_NAMES)),$(eval $(call BUILD_TOOL,$(t))))
 
-# mkrd is linked alongside the .incbin'd blob object. Override the
-# generic tool rule to include the blob in its link line.
 $(PREFIX)/tools/mkrd.efi: $(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ) \
                          $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
 	$(call LINK_EFI_APP,$(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ),$@)
+
+$(BUILDDIR)/mkrd.o: tools/mkrd.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(PREFIX)/tools:
 	@mkdir -p $@

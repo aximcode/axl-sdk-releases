@@ -108,7 +108,7 @@ add_route_internal(
            only matches paths inside the directory, not siblings. */
         axl_snprintf(key_buf, sizeof(key_buf), "%s %.*s",
                      method_str, (int)(path_len - 1), path);
-        ok = (axl_radix_tree_insert(s->prefix_routes, key_buf, r) == 0);
+        ok = (axl_radix_tree_insert(s->prefix_routes, key_buf, r) == AXL_OK);
     } else {
         axl_snprintf(key_buf, sizeof(key_buf), "%s %s",
                      method_str, path);
@@ -122,7 +122,7 @@ add_route_internal(
             return NULL;
         }
         /* insert returns 1=new, 0=replaced, -1=OOM */
-        ok = (axl_hash_table_replace(s->exact_routes, key_dup, r) >= 0);
+        ok = (axl_hash_table_replace(s->exact_routes, key_dup, r) != AXL_HASH_TABLE_ERR);
         if (!ok) {
             /* OOM: hash table did not take ownership of key_dup */
             axl_free(key_dup);
@@ -146,10 +146,10 @@ axl_http_server_add_route(AxlHttpServer *s, const char *method,
                           void *data)
 {
     if (handler == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return (add_route_internal(s, method, path, handler, data) != NULL)
-           ? 0 : -1;
+           ? AXL_OK : AXL_ERR;
 }
 
 int
@@ -158,15 +158,15 @@ axl_http_server_add_route_auth(AxlHttpServer *s, const char *method,
                                void *data, uint32_t auth_flags)
 {
     if (handler == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     HttpRoute *r = add_route_internal(s, method, path, handler, data);
     if (r == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     r->auth_flags = auth_flags;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ static_file_handler(
     )
 {
     axl_http_response_set_file(resp, (const char *)data);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -194,14 +194,14 @@ axl_http_server_add_static(AxlHttpServer *s, const char *prefix,
     char   *fs_copy;
 
     if (s == NULL || prefix == NULL || fs_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Build wildcard path (e.g., "/css/" + "*") */
     prefix_len = axl_strlen(prefix);
     if (prefix_len + 2 >= sizeof(path_buf)) {
         axl_error("static prefix too long: %s", prefix);
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memcpy(path_buf, prefix, prefix_len);
@@ -217,7 +217,7 @@ axl_http_server_add_static(AxlHttpServer *s, const char *prefix,
     fs_copy = axl_malloc(fs_len + 1);
     if (fs_copy == NULL) {
         axl_error("static route alloc failed for %s", prefix);
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memcpy(fs_copy, fs_path, fs_len + 1);
@@ -229,10 +229,10 @@ axl_http_server_add_static(AxlHttpServer *s, const char *prefix,
         r->fs_path   = fs_copy;
     } else {
         axl_free(fs_copy);
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,13 +248,13 @@ axl_http_server_add_upload_route(AxlHttpServer *s, const char *method,
     if (r == NULL) {
         axl_error("upload route registration failed for %s %s",
                   method ? method : "*", path);
-        return -1;
+        return AXL_ERR;
     }
 
     r->is_upload = true;
     r->upload_handler = handler;
     r->handler = NULL;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

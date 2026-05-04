@@ -58,7 +58,7 @@ axl_http_parse_request_line(
     size_t qs_end;
 
     if (line == NULL || method == NULL || path == NULL || query == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *method = NULL;
@@ -75,7 +75,7 @@ axl_http_parse_request_line(
 
     if (method_end == 0 || method_end >= line_len) {
         axl_error("malformed request line: no method");
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -108,18 +108,18 @@ axl_http_parse_request_line(
     if (qs_start < qs_end) {
         q_local = axl_strndup(line + qs_start, qs_end - qs_start);
         if (q_local == NULL) {
-            return -1;
+            return AXL_ERR;
         }
     }
 
     if (m_local == NULL || p_local == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *method = axl_steal_pointer(&m_local);
     *path   = axl_steal_pointer(&p_local);
     *query  = axl_steal_pointer(&q_local);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ axl_http_parse_status_line(
     size_t space_pos;
 
     if (line == NULL || status_code == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -151,7 +151,7 @@ axl_http_parse_status_line(
 
     if (space_pos == 0 || space_pos + 3 >= line_len) {
         axl_error("malformed status line");
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -162,7 +162,7 @@ axl_http_parse_status_line(
         line[space_pos + 3] < '0' || line[space_pos + 3] > '9')
     {
         axl_error("malformed status code");
-        return -1;
+        return AXL_ERR;
     }
 
     *status_code =
@@ -170,7 +170,7 @@ axl_http_parse_status_line(
         (size_t)(line[space_pos + 2] - '0') * 10 +
         (size_t)(line[space_pos + 3] - '0');
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,14 +187,14 @@ axl_http_parse_headers(
     size_t        pos;
 
     if (data == NULL || headers == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *headers = NULL;
 
     table = axl_hash_table_new_full(NULL, NULL, axl_free_impl, axl_free_impl);
     if (table == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     pos = 0;
@@ -250,7 +250,7 @@ axl_http_parse_headers(
                 axl_memcpy(val, data + val_start, val_len);
                 val[val_len] = '\0';
 
-                if (axl_hash_table_replace(table, name, val) >= 0) {
+                if (axl_hash_table_replace(table, name, val) != AXL_HASH_TABLE_ERR) {
                     axl_steal_pointer(&name);
                     axl_steal_pointer(&val);
                 }
@@ -269,7 +269,7 @@ axl_http_parse_headers(
     }
 
     *headers = table;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

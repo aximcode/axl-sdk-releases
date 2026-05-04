@@ -25,7 +25,7 @@ start_conn_recv(
         /* WebSocket / upload stream — recv into chunk_read_buf */
         if (axl_tcp_recv_async(conn->sock,
                                conn->chunk_read_buf, sizeof(conn->chunk_read_buf),
-                               s->loop, NULL, on_conn_data, conn) != 0)
+                               s->loop, NULL, on_conn_data, conn) != AXL_OK)
         {
             reset_connection(conn);
         }
@@ -45,7 +45,7 @@ start_conn_recv(
 
         if (axl_tcp_recv_async(conn->sock,
                                conn->header_buf + conn->header_len,
-                               avail, s->loop, NULL, on_conn_data, conn) != 0)
+                               avail, s->loop, NULL, on_conn_data, conn) != AXL_OK)
         {
             axl_error("recv_start failed for header phase");
             reset_connection(conn);
@@ -56,7 +56,7 @@ start_conn_recv(
         //
         if (axl_tcp_recv_async(conn->sock,
                                conn->chunk_read_buf, sizeof(conn->chunk_read_buf),
-                               s->loop, NULL, on_conn_data, conn) != 0)
+                               s->loop, NULL, on_conn_data, conn) != AXL_OK)
         {
             axl_error("recv_start failed for chunked body");
             reset_connection(conn);
@@ -70,7 +70,7 @@ start_conn_recv(
         size_t remaining = conn->content_length - conn->body_bytes_read;
         if (axl_tcp_recv_async(conn->sock,
                                (char *)conn->body + conn->body_bytes_read,
-                               remaining, s->loop, NULL, on_conn_data, conn) != 0)
+                               remaining, s->loop, NULL, on_conn_data, conn) != AXL_OK)
         {
             axl_error("recv_start failed for body");
             reset_connection(conn);
@@ -92,16 +92,16 @@ start_conn_recv(
 
 bool
 on_conn_data(
-    AxlTcp  *sock,
-    int      status,
-    void    *data
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
     )
 {
     HttpConn       *conn = (HttpConn *)data;
     AxlHttpServer  *s    = conn->server;
     size_t          bytes;
 
-    if (status != 0) {
+    if (status != AXL_OK) {
         reset_connection(conn);
         return false;
     }

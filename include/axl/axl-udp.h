@@ -39,7 +39,7 @@ typedef struct AxlUdpSocket AxlUdpSocket;
  * Uses the NIC's DHCP-assigned or static IP address.
  * Pass 0 for @a local_port to use an ephemeral port.
  *
- * @return 0 on success, -1 if UDP4 stack is not available.
+ * @return AXL_OK on success, AXL_ERR if UDP4 stack is not available.
  */
 int
 axl_udp_open(
@@ -64,7 +64,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlUdpSocket, axl_udp_close)
  *
  * Fire-and-forget — no response expected.
  *
- * @return 0 on success, -1 on error or timeout.
+ * @return AXL_OK on success, AXL_ERR on error or timeout.
  */
 int
 axl_udp_send(
@@ -81,7 +81,7 @@ axl_udp_send(
  * Sends @a tx_data, then polls for an incoming datagram up to
  * @a timeout_ms milliseconds. Useful for DNS queries, NTP, etc.
  *
- * @return 0 on success, -1 on error or timeout.
+ * @return AXL_OK on success, AXL_ERR on error or timeout.
  */
 int
 axl_udp_sendrecv(
@@ -116,7 +116,7 @@ typedef void (*AxlUdpRecvCallback)(
  * @a cb fires on each received datagram. Receiving continues until
  * axl_udp_recv_stop() is called or the socket is closed.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_udp_recv_start(

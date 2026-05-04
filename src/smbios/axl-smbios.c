@@ -16,39 +16,89 @@ AXL_LOG_DOMAIN("smbios");
 // Internal: locate SMBIOS table range
 // ---------------------------------------------------------------------------
 
+/* Internal helper — locate the SMBIOS3 / SMBIOS 2.x entry-point
+   structures in the EFI Configuration Table. Either out pointer
+   may be NULL if the caller doesn't care about that variant. */
 static int
-smbios_get_range(
-    uint8_t **out_start,
-    uint8_t **out_end
+smbios_locate_entry_points(
+    SMBIOS3_STRUCTURE_TABLE **out_smbios3,
+    SMBIOS_STRUCTURE_TABLE  **out_smbios2
     )
 {
-#define smbios_guid_equal(a, b)  axl_guid_equal((a), (b))
     SMBIOS3_STRUCTURE_TABLE *smbios3 = NULL;
     SMBIOS_STRUCTURE_TABLE  *smbios2 = NULL;
 
     for (size_t i = 0; i < axl_st()->NumberOfTableEntries; i++) {
         EFI_GUID *guid = &axl_st()->ConfigurationTable[i].VendorGuid;
-        if (smbios_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
+        if (axl_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
             smbios3 = axl_st()->ConfigurationTable[i].VendorTable;
-        } else if (smbios_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
+        } else if (axl_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
             smbios2 = axl_st()->ConfigurationTable[i].VendorTable;
         }
     }
-#undef smbios_guid_equal
+
+    if (out_smbios3) { *out_smbios3 = smbios3; }
+    if (out_smbios2) { *out_smbios2 = smbios2; }
+    return (smbios3 || smbios2) ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_smbios_table_range(
+    uint8_t **out_start,
+    uint8_t **out_end
+    )
+{
+    SMBIOS3_STRUCTURE_TABLE *smbios3 = NULL;
+    SMBIOS_STRUCTURE_TABLE  *smbios2 = NULL;
+
+    if (out_start == NULL || out_end == NULL) {
+        return AXL_ERR;
+    }
+
+    if (smbios_locate_entry_points(&smbios3, &smbios2) != 0) {
+        axl_debug("SMBIOS table not found in configuration table");
+        return AXL_ERR;
+    }
 
     if (smbios3 != NULL) {
         *out_start = (uint8_t *)(size_t)smbios3->TableAddress;
         *out_end = *out_start + smbios3->TableMaximumSize;
-        return 0;
+        return AXL_OK;
     }
-    if (smbios2 != NULL) {
-        *out_start = (uint8_t *)(size_t)smbios2->TableAddress;
-        *out_end = *out_start + smbios2->TableLength;
-        return 0;
+    *out_start = (uint8_t *)(size_t)smbios2->TableAddress;
+    *out_end = *out_start + smbios2->TableLength;
+    return AXL_OK;
+}
+
+int
+axl_smbios_entry_point(
+    uint8_t **out_base,
+    size_t   *out_size
+    )
+{
+    SMBIOS3_STRUCTURE_TABLE *smbios3 = NULL;
+    SMBIOS_STRUCTURE_TABLE  *smbios2 = NULL;
+
+    if (out_base == NULL || out_size == NULL) {
+        return AXL_ERR;
     }
 
-    axl_debug("SMBIOS table not found in configuration table");
-    return -1;
+    if (smbios_locate_entry_points(&smbios3, &smbios2) != 0) {
+        return AXL_ERR;
+    }
+
+    /* Prefer SMBIOS3 over 2.x when both are published — matches
+       what axl_smbios_table_range does, so the (entry-point bytes,
+       table data bytes) pair stays self-consistent for callers
+       that concatenate them into a dump blob. */
+    if (smbios3 != NULL) {
+        *out_base = (uint8_t *)smbios3;
+        *out_size = smbios3->Length;
+        return AXL_OK;
+    }
+    *out_base = (uint8_t *)smbios2;
+    *out_size = smbios2->Length;
+    return AXL_OK;
 }
 
 /// Advance past a table entry (formatted area + string table + double NUL).
@@ -169,7 +219,7 @@ axl_smbios_find_next(
     uint8_t *end;
     uint8_t *ptr;
 
-    if (smbios_get_range(&start, &end) != 0) {
+    if (axl_smbios_table_range(&start, &end) != 0) {
         return NULL;
     }
 
@@ -213,7 +263,7 @@ axl_smbios_next(
     uint8_t *end;
     uint8_t *ptr;
 
-    if (smbios_get_range(&start, &end) != 0) {
+    if (axl_smbios_table_range(&start, &end) != 0) {
         return NULL;
     }
 
@@ -262,14 +312,14 @@ axl_smbios_version(
     if (smbios3 != NULL) {
         if (major != NULL) { *major = smbios3->MajorVersion; }
         if (minor != NULL) { *minor = smbios3->MinorVersion; }
-        return 0;
+        return AXL_OK;
     }
     if (smbios2 != NULL) {
         if (major != NULL) { *major = smbios2->MajorVersion; }
         if (minor != NULL) { *minor = smbios2->MinorVersion; }
-        return 0;
+        return AXL_OK;
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +428,7 @@ int
 axl_smbios_format_uuid(const uint8_t bytes[16], char out[37])
 {
     if (bytes == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* SMBIOS §7.2.1: Data1/2/3 are little-endian fields; Data4 +
        Node are big-endian. Reorder accordingly when printing. */
@@ -392,7 +442,7 @@ axl_smbios_format_uuid(const uint8_t bytes[16], char out[37])
         bytes[10], bytes[11], bytes[12],
         bytes[13], bytes[14], bytes[15]              /* Node BE */
         );
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -400,9 +450,9 @@ axl_smbios_read_bios_info(
     AxlSmbiosBiosInfo *out
     )
 {
-    if (out == NULL) { return -1; }
+    if (out == NULL) { return AXL_ERR; }
     SmbType0 *t = (SmbType0 *)axl_smbios_find(AXL_SMBIOS_TYPE_BIOS_INFO);
-    if (t == NULL) { return -1; }
+    if (t == NULL) { return AXL_ERR; }
 
     out->vendor       = axl_smbios_get_string_utf8(&t->Hdr, t->Vendor);
     out->version      = axl_smbios_get_string_utf8(&t->Hdr, t->BiosVersion);
@@ -417,7 +467,7 @@ axl_smbios_read_bios_info(
         out->major_release = 0xFF;
         out->minor_release = 0xFF;
     }
-    return 0;
+    return AXL_OK;
 }
 
 static bool
@@ -448,9 +498,9 @@ axl_smbios_read_system_info(
     AxlSmbiosSystemInfo *out
     )
 {
-    if (out == NULL) { return -1; }
+    if (out == NULL) { return AXL_ERR; }
     SmbType1 *t = (SmbType1 *)axl_smbios_find(AXL_SMBIOS_TYPE_SYSTEM_INFO);
-    if (t == NULL) { return -1; }
+    if (t == NULL) { return AXL_ERR; }
 
     out->manufacturer  = axl_smbios_get_string_utf8(&t->Hdr, t->Manufacturer);
     out->product_name  = axl_smbios_get_string_utf8(&t->Hdr, t->ProductName);
@@ -471,7 +521,7 @@ axl_smbios_read_system_info(
         smbios_uuid_to_rfc4122(t->Uuid, out->uuid);
         out->has_uuid = true;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -479,9 +529,9 @@ axl_smbios_read_baseboard(
     AxlSmbiosBaseboardInfo *out
     )
 {
-    if (out == NULL) { return -1; }
+    if (out == NULL) { return AXL_ERR; }
     SmbType2 *t = (SmbType2 *)axl_smbios_find(AXL_SMBIOS_TYPE_BASEBOARD);
-    if (t == NULL) { return -1; }
+    if (t == NULL) { return AXL_ERR; }
     out->manufacturer  = axl_smbios_get_string_utf8(&t->Hdr, t->Manufacturer);
     out->product_name  = axl_smbios_get_string_utf8(&t->Hdr, t->ProductName);
     out->version       = axl_smbios_get_string_utf8(&t->Hdr, t->Version);
@@ -499,7 +549,7 @@ axl_smbios_read_baseboard(
     } else {
         out->board_type = AXL_SMBIOS_BOARD_TYPE_UNKNOWN;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -507,15 +557,15 @@ axl_smbios_read_chassis(
     AxlSmbiosChassisInfo *out
     )
 {
-    if (out == NULL) { return -1; }
+    if (out == NULL) { return AXL_ERR; }
     SmbType3 *t = (SmbType3 *)axl_smbios_find(AXL_SMBIOS_TYPE_CHASSIS);
-    if (t == NULL) { return -1; }
+    if (t == NULL) { return AXL_ERR; }
     out->manufacturer  = axl_smbios_get_string_utf8(&t->Hdr, t->Manufacturer);
     out->version       = axl_smbios_get_string_utf8(&t->Hdr, t->Version);
     out->serial_number = axl_smbios_get_string_utf8(&t->Hdr, t->SerialNumber);
     out->asset_tag     = axl_smbios_get_string_utf8(&t->Hdr, t->AssetTag);
     out->type          = t->Type & 0x7F;   /* strip the 0x80 lock-bit flag */
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -525,7 +575,7 @@ axl_smbios_read_processor(
     )
 {
     if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_PROCESSOR) {
-        return -1;
+        return AXL_ERR;
     }
     SmbType4 *t = (SmbType4 *)hdr;
     out->socket_designation = axl_smbios_get_string_utf8(hdr, t->Socket);
@@ -553,7 +603,7 @@ axl_smbios_read_processor(
         out->core_count   = 0;
         out->thread_count = 0;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -563,7 +613,7 @@ axl_smbios_read_memory_device(
     )
 {
     if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_MEMORY_DEVICE) {
-        return -1;
+        return AXL_ERR;
     }
     SmbType17 *t = (SmbType17 *)hdr;
     out->device_locator = axl_smbios_get_string_utf8(hdr, t->DeviceLocator);
@@ -586,7 +636,7 @@ axl_smbios_read_memory_device(
     } else {
         out->size_mb = t->Size;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -595,10 +645,10 @@ axl_smbios_get_system_uuid(
     )
 {
     AxlSmbiosSystemInfo sys;
-    if (axl_smbios_read_system_info(&sys) != 0) { return -1; }
-    if (!sys.has_uuid) { return -1; }
+    if (axl_smbios_read_system_info(&sys) != 0) { return AXL_ERR; }
+    if (!sys.has_uuid) { return AXL_ERR; }
     for (size_t i = 0; i < 16; i++) { out[i] = sys.uuid[i]; }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -620,9 +670,9 @@ axl_smbios_read_ipmi_device_info(
     AxlSmbiosIpmiDeviceInfo *out
     )
 {
-    if (out == NULL) { return -1; }
+    if (out == NULL) { return AXL_ERR; }
     AxlSmbiosHeader *hdr = axl_smbios_find(AXL_SMBIOS_TYPE_IPMI_DEVICE_INFO);
-    if (hdr == NULL || hdr->Length < 0x10) { return -1; }
+    if (hdr == NULL || hdr->Length < 0x10) { return AXL_ERR; }
 
     const uint8_t *b = (const uint8_t *)hdr;
     out->interface_type     = b[0x04];
@@ -640,7 +690,7 @@ axl_smbios_read_ipmi_device_info(
     out->base_address     = base & ~(uint64_t)0x1;
 
     out->interrupt_number = (hdr->Length >= 0x12) ? b[0x11] : 0;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,13 +717,13 @@ axl_smbios_read_host_interface(
     if (out == NULL || hdr == NULL
         || hdr->Type != AXL_SMBIOS_TYPE_MGMT_HOST_INTERFACE)
     {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Minimum length for the modern layout: header(4) + type(1) + data_len(1)
        + proto_count(1) = 7 bytes. The old pre-3.0 layout is 5 bytes and not
        supported here. */
-    if (hdr->Length < 7) { return -1; }
+    if (hdr->Length < 7) { return AXL_ERR; }
 
     const uint8_t *base = (const uint8_t *)hdr;
     const uint8_t *end  = base + hdr->Length;
@@ -684,23 +734,23 @@ axl_smbios_read_host_interface(
 
     /* Validate the interface_data fits inside the record. */
     const uint8_t *p = out->interface_data + out->interface_data_len;
-    if (p + 1 > end) { return -1; }
+    if (p + 1 > end) { return AXL_ERR; }
 
     uint8_t proto_count = *p++;
     out->protocol_count = 0;
 
     for (uint8_t i = 0; i < proto_count && i < 8; i++) {
-        if (p + 2 > end) { return -1; }
+        if (p + 2 > end) { return AXL_ERR; }
         uint8_t  type = p[0];
         uint8_t  dlen = p[1];
-        if (p + 2 + dlen > end) { return -1; }
+        if (p + 2 + dlen > end) { return AXL_ERR; }
         out->protocols[i].protocol_type = type;
         out->protocols[i].data_len      = dlen;
         out->protocols[i].data          = p + 2;
         p += 2 + dlen;
         out->protocol_count++;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -718,11 +768,11 @@ axl_smbios_find_redfish_host_interface(
             if (iface.protocols[i].protocol_type == AXL_SMBIOS_HIP_REDFISH_OVER_IP) {
                 if (hdr_out != NULL)   { *hdr_out   = h; }
                 if (iface_out != NULL) { *iface_out = iface; }
-                return 0;
+                return AXL_OK;
             }
         }
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +828,7 @@ axl_smbios_read_port_connector(
     if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_PORT_CONNECTOR
         || hdr->Length < 0x09)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     out->internal_designator     = axl_smbios_get_string_utf8(hdr, b[0x04]);
@@ -786,7 +836,7 @@ axl_smbios_read_port_connector(
     out->external_designator     = axl_smbios_get_string_utf8(hdr, b[0x06]);
     out->external_connector_type = b[0x07];
     out->port_type               = b[0x08];
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +871,7 @@ axl_smbios_read_system_slot(
     if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_SYSTEM_SLOTS
         || hdr->Length < 0x0D)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     out->designation         = axl_smbios_get_string_utf8(hdr, b[0x04]);
@@ -850,7 +900,7 @@ axl_smbios_read_system_slot(
         out->data_bus_width_base = 0;
         out->peer_grouping_count = 0;
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -873,7 +923,7 @@ axl_smbios_read_oem_strings(
     if (out == NULL || hdr == NULL || hdr->Type != AXL_SMBIOS_TYPE_OEM_STRINGS
         || hdr->Length < 0x05)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     uint8_t  raw_count = b[0x04];
@@ -888,7 +938,7 @@ axl_smbios_read_oem_strings(
             out->strings[i] = NULL;
         }
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -900,7 +950,7 @@ axl_smbios_get_oem_string(
     )
 {
     if (buf == NULL || buf_cap == 0 || index_one_based == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Walk Type 11 records in firmware order, accumulating string
@@ -923,7 +973,7 @@ axl_smbios_get_oem_string(
             uint8_t local = (uint8_t)(index_one_based - base);
             const char *s = rec.strings[local - 1];
             if (s == NULL) {
-                return -1;
+                return AXL_ERR;
             }
             /* Compute the source length so we can refuse to
                truncate. Callers explicitly retry with a larger
@@ -933,13 +983,13 @@ axl_smbios_get_oem_string(
                 if (required != NULL) {
                     *required = need + 1;
                 }
-                return -1;
+                return AXL_ERR;
             }
             for (size_t i = 0; i < need; i++) {
                 buf[i] = s[i];
             }
             buf[need] = '\0';
-            return 0;
+            return AXL_OK;
         }
         base = (uint8_t)(base + rec.count);
         /* If we've consumed all 16 slots from this record's cap, the
@@ -948,7 +998,7 @@ axl_smbios_get_oem_string(
            cap at 16, so we keep walking — subsequent records may
            contain more strings legitimately. */
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1025,7 @@ axl_smbios_read_physical_memory_array(
         || hdr->Type != AXL_SMBIOS_TYPE_PHYSICAL_MEMORY_ARRAY
         || hdr->Length < 0x0F)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     out->location  = b[0x04];
@@ -1007,7 +1057,7 @@ axl_smbios_read_physical_memory_array(
 
     out->error_handle = (uint16_t)b[0x0B] | ((uint16_t)b[0x0C] << 8);
     out->num_devices  = (uint16_t)b[0x0D] | ((uint16_t)b[0x0E] << 8);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1083,7 @@ axl_smbios_read_memory_array_map(
         || hdr->Type != AXL_SMBIOS_TYPE_MEMORY_ARRAY_MAP
         || hdr->Length < 0x0F)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     uint32_t start_kb =  (uint32_t)b[0x04]
@@ -1078,7 +1128,7 @@ axl_smbios_read_memory_array_map(
 
     out->array_handle    = (uint16_t)b[0x0C] | ((uint16_t)b[0x0D] << 8);
     out->partition_width = b[0x0E];
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,7 +1157,7 @@ axl_smbios_read_memory_device_map(
         || hdr->Type != AXL_SMBIOS_TYPE_MEMORY_DEVICE_MAP
         || hdr->Length < 0x13)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     uint32_t start_kb =  (uint32_t)b[0x04]
@@ -1152,7 +1202,7 @@ axl_smbios_read_memory_device_map(
     out->partition_row_pos     = b[0x10];
     out->interleave_position   = b[0x11];
     out->interleave_data_depth = b[0x12];
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1228,7 @@ axl_smbios_read_onboard_device_ext(
         || hdr->Type != AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT
         || hdr->Length < 0x0B)
     {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *b = (const uint8_t *)hdr;
     out->reference_designation = axl_smbios_get_string_utf8(hdr, b[0x04]);
@@ -1187,7 +1237,7 @@ axl_smbios_read_onboard_device_ext(
     out->segment_group         = (uint16_t)b[0x07] | ((uint16_t)b[0x08] << 8);
     out->bus                   = b[0x09];
     out->device_function       = b[0x0A];
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1262,7 @@ axl_smbios_strings_byte_len(
      * table end into adjacent memory. */
     uint8_t *start;
     uint8_t *end;
-    if (smbios_get_range(&start, &end) != 0) {
+    if (axl_smbios_table_range(&start, &end) != 0) {
         return 0;
     }
     uint8_t *base = (uint8_t *)hdr;

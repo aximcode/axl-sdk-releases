@@ -59,7 +59,7 @@ format_timestamp(char *buf, size_t buf_size)
 {
     AxlTime time;
 
-    if (axl_backend_get_time(&time) != 0) {
+    if (axl_backend_get_time(&time) != AXL_OK) {
         axl_strlcpy(buf, "0000-00-00T00:00:00.000000 ", buf_size);
         return axl_strlen(buf);
     }
@@ -201,7 +201,7 @@ int
 axl_log_file_attach(const char *path)
 {
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     // Close existing file handler if any
@@ -214,7 +214,7 @@ axl_log_file_attach(const char *path)
     if (mFileBuf == NULL) {
         mFileBuf = axl_backend_alloc_zero(FILE_BUF_SIZE);
         if (mFileBuf == NULL) {
-            return -1;
+            return AXL_ERR;
         }
     }
 
@@ -222,7 +222,7 @@ axl_log_file_attach(const char *path)
 
     unsigned short *wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     int rc = axl_backend_file_open(
@@ -233,17 +233,17 @@ axl_log_file_attach(const char *path)
 
     axl_free(wide_path);
 
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         mFileHandle = NULL;
-        return -1;
+        return AXL_ERR;
     }
 
-    if (axl_log_add_handler(file_handler, NULL) != 0) {
+    if (axl_log_add_handler(file_handler, NULL) != AXL_OK) {
         /* Handler table full — file is open, but messages won't reach it.
          * Caller should know so they can decide to abort or carry on. */
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 void

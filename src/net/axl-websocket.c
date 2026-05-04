@@ -50,7 +50,7 @@ ws_compute_accept_key(const char *client_key)
     /* SHA-1 hash */
     if (axl_compute_checksum_digest(AXL_CHECKSUM_SHA1,
                                     concat, key_len + guid_len,
-                                    digest, sizeof(digest)) != 0) {
+                                    digest, sizeof(digest)) != AXL_OK) {
         return NULL;
     }
 

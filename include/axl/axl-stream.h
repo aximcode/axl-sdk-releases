@@ -123,7 +123,7 @@ axl_stream_init(void);
  * with the caller bytes — log-on-best-effort. A broken primary
  * console must not cost you the log.
  *
- * @return 0 on success, -1 if axl_stdout isn't initialized.
+ * @return AXL_OK on success, AXL_ERR if axl_stdout isn't initialized.
  */
 int
 axl_stream_set_stdout_tee(
@@ -135,7 +135,7 @@ axl_stream_set_stdout_tee(
  *
  * Symmetric to @ref axl_stream_set_stdout_tee but for axl_stderr.
  *
- * @return 0 on success, -1 if axl_stderr isn't initialized.
+ * @return AXL_OK on success, AXL_ERR if axl_stderr isn't initialized.
  */
 int
 axl_stream_set_stderr_tee(
@@ -444,7 +444,7 @@ axl_walk_lines(
 /**
  * @brief Set the stream position.
  *
- * @return 0 on success, -1 on error or if not supported.
+ * @return AXL_OK on success, AXL_ERR on error or if not supported.
  */
 int
 axl_fseek(
@@ -478,7 +478,7 @@ axl_feof(
 /**
  * @brief Flush pending writes to the underlying file. NULL-safe.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_fflush(
@@ -528,7 +528,7 @@ typedef enum {
  * encoding's byte stream. Likewise, @ref axl_fseek discards
  * transcode buffers — they describe state at the pre-seek position.
  *
- * @return 0 on success, -1 if @p s is NULL or @p enc is out of range.
+ * @return AXL_OK on success, AXL_ERR if @p s is NULL or @p enc is out of range.
  */
 int
 axl_stream_set_encoding(

@@ -286,7 +286,7 @@ axl_json_load_file_flags(const char *path, uint32_t flags,
 
     void   *raw = NULL;
     size_t  raw_len = 0;
-    if (axl_file_get_contents(path, &raw, &raw_len) != 0) {
+    if (axl_file_get_contents(path, &raw, &raw_len) != AXL_OK) {
         return false;
     }
     if (!axl_json_parse_flags((const char *)raw, raw_len, flags, r)) {

@@ -30,6 +30,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #include <axl/axl-sidecar.h>
 
@@ -71,7 +72,7 @@ typedef struct {
  * func 0..0x07, seg 0..0xFFFF); out-of-range or malformed input
  * returns -1 with @p out left unmodified.
  *
- * @return 0 on success, -1 on malformed input.
+ * @return AXL_OK on success, AXL_ERR on malformed input.
  */
 int
 axl_pci_addr_parse(
@@ -102,7 +103,7 @@ axl_pci_addr_format(
 /**
  * @brief Read a byte from PCI configuration space.
  *
- * @return 0 on success, -1 if the address is outside any MCFG
+ * @return AXL_OK on success, AXL_ERR if the address is outside any MCFG
  *     segment or MCFG isn't available.
  */
 int
@@ -151,7 +152,7 @@ axl_pci_write_config_32(AxlPciAddr addr, uint16_t reg, uint32_t value);
  * Replaces the per-tool hand-rolled `for (reg = 0; reg + 4 <= bytes;
  * reg += 4) read32; pack into buf` loop.
  *
- * @return 0 on success (one or more successful reads), -1 if the
+ * @return AXL_OK on success (one or more successful reads), AXL_ERR if the
  *     function is absent or @p buf is NULL or MCFG isn't available.
  */
 int
@@ -173,7 +174,7 @@ axl_pci_dump(
  * (vendor ID == 0xFFFF) is folded into the return code so callers
  * don't have to special-case it.
  *
- * @return 0 on success (both fields populated), -1 if the function
+ * @return AXL_OK on success (both fields populated), AXL_ERR if the function
  *     is absent or any bus error is encountered.
  */
 int
@@ -191,7 +192,7 @@ axl_pci_get_vid_did(
  * `(base << 16) | (sub << 8) | prog_if` form — same shape consumed
  * by @ref axl_pci_find_by_class.
  *
- * @return 0 on success, -1 on bus error.
+ * @return AXL_OK on success, AXL_ERR on bus error.
  */
 int
 axl_pci_get_class_code(
@@ -222,7 +223,7 @@ typedef enum {
  * enum — callers can compare against the named constants and treat
  * unknown values as opaque. Bus error returns -1.
  *
- * @return 0 on success, -1 on bus error.
+ * @return AXL_OK on success, AXL_ERR on bus error.
  */
 int
 axl_pci_get_header_type(
@@ -240,7 +241,7 @@ axl_pci_get_header_type(
  * in: a non-zero header type returns -1 with @p svid / @p sdid
  * untouched.
  *
- * @return 0 on success (both fields populated), -1 if the function
+ * @return AXL_OK on success (both fields populated), AXL_ERR if the function
  *     is absent, has a non-Type-0 header, or any bus error is
  *     encountered.
  */
@@ -357,7 +358,7 @@ axl_pci_next(
 /**
  * @brief Find the @p nth function with matching vendor+device IDs.
  *
- * @return 0 on success, -1 if no @p nth match exists.
+ * @return AXL_OK on success, AXL_ERR if no @p nth match exists.
  */
 int
 axl_pci_find_by_vid_did(
@@ -373,7 +374,7 @@ axl_pci_find_by_vid_did(
  * The 24-bit class is `(base_class << 16) | (subclass << 8) | prog_if`,
  * matching how `lspci -vvv` prints it. Pass `0xFFFFFF` to match any.
  *
- * @return 0 on success, -1 if no @p nth match exists.
+ * @return AXL_OK on success, AXL_ERR if no @p nth match exists.
  */
 int
 axl_pci_find_by_class(
@@ -408,7 +409,7 @@ typedef struct {
  * Successful return guarantees @p addr is header type 1 and the
  * three bus-number bytes are populated.
  *
- * @return 0 on success, -1 if @p addr is not a PCI-PCI bridge or any
+ * @return AXL_OK on success, AXL_ERR if @p addr is not a PCI-PCI bridge or any
  *     bus error is encountered.
  */
 int
@@ -485,7 +486,7 @@ axl_pci_tree_for_each(
  * the function returns the first capability; on subsequent calls
  * pass @p out_off from the previous return value to advance.
  *
- * @return 0 on success (capability found), -1 when no more
+ * @return AXL_OK on success (capability found), AXL_ERR when no more
  *     capabilities exist or the function has no capabilities.
  */
 int
@@ -503,7 +504,7 @@ axl_pci_cap_next(
  * extended capability chain. Returns -1 if the device is not
  * PCIe (no extended caps).
  *
- * @return 0 on success, -1 when the chain ends or no extended
+ * @return AXL_OK on success, AXL_ERR when the chain ends or no extended
  *     caps are present.
  */
 int
@@ -563,7 +564,7 @@ axl_pci_ext_cap_id_str(
  * locates the matching keyword in either RO or RW area and copies
  * up to @p buflen bytes of its data into @p buf.
  *
- * @return 0 on success, -1 if VPD is unsupported, the keyword is
+ * @return AXL_OK on success, AXL_ERR if VPD is unsupported, the keyword is
  *     not present, or any bus error is encountered. On success,
  *     @c *out_len is set to the keyword's actual data length
  *     (which may exceed @p buflen — in which case the buffer was

@@ -116,13 +116,13 @@ axl_nvstore_register_namespace(
     )
 {
     if (name == NULL || backend_token == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     size_t len = axl_strnlen(name, NS_NAME_MAX);
     if (len == 0 || len >= NS_NAME_MAX) {
         axl_warning("namespace name '%s' too long (max %d)",
                     name, NS_NAME_MAX - 1);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Already registered? Allow idempotent re-register with same token,
@@ -130,17 +130,17 @@ axl_nvstore_register_namespace(
     for (size_t i = 0; i < num_namespaces; i++) {
         if (axl_strcmp(name, namespaces[i].name) == 0) {
             if (namespaces[i].guid == (const EFI_GUID *)backend_token) {
-                return 0;
+                return AXL_OK;
             }
             axl_warning("namespace '%s' already registered with different token",
                         name);
-            return -1;
+            return AXL_ERR;
         }
     }
 
     if (num_namespaces >= MAX_NAMESPACES) {
         axl_warning("namespace table full (max %d)", MAX_NAMESPACES);
-        return -1;
+        return AXL_ERR;
     }
 
     NamespaceEntry *e = &namespaces[num_namespaces];
@@ -150,7 +150,7 @@ axl_nvstore_register_namespace(
     e->name[len] = '\0';
     e->guid = (const EFI_GUID *)backend_token;
     num_namespaces++;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +166,12 @@ axl_nvstore_get(
     )
 {
     if (key == NULL || size == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
         axl_warning("get: namespace '%s' not registered", ns ? ns : "(null)");
-        return -1;
+        return AXL_ERR;
     }
 
     unsigned short wkey[128];
@@ -198,9 +198,9 @@ axl_nvstore_get(
             axl_warning("nvstore get failed: key='%s' status=0x%llx",
                         key, (unsigned long long)status);
         }
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -212,7 +212,7 @@ axl_nvstore_get_alloc(
     )
 {
     if (out_buf == NULL || out_size == NULL || key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out_buf  = NULL;
     *out_size = 0;
@@ -227,9 +227,9 @@ axl_nvstore_get_alloc(
        to return). */
     size_t needed   = 0;
     int    probe_rc = axl_nvstore_get(ns, key, NULL, &needed);
-    if (probe_rc != 0 && needed == 0) {
+    if (probe_rc != AXL_OK && needed == 0) {
         /* NOT_FOUND or some other non-truncation read failure. */
-        return -1;
+        return AXL_ERR;
     }
 
     /* Allocate needed+1 so callers reading a string variable can
@@ -240,7 +240,7 @@ axl_nvstore_get_alloc(
        deref or pass to printf("%s", ...). */
     void *buf = axl_malloc(needed + 1);
     if (buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     ((uint8_t *)buf)[needed] = 0;
 
@@ -248,9 +248,9 @@ axl_nvstore_get_alloc(
        payload is empty — the probe answered the whole question. */
     size_t actual = needed;
     if (needed > 0) {
-        if (axl_nvstore_get(ns, key, buf, &actual) != 0) {
+        if (axl_nvstore_get(ns, key, buf, &actual) != AXL_OK) {
             axl_free(buf);
-            return -1;
+            return AXL_ERR;
         }
         /* Defensive: a racing concurrent SetVariable could have grown
            the payload between the probe and the read. Don't lie about
@@ -263,7 +263,7 @@ axl_nvstore_get_alloc(
     }
     *out_buf  = buf;
     *out_size = actual;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -276,12 +276,12 @@ axl_nvstore_set(
     )
 {
     if (key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
         axl_warning("set: namespace '%s' not registered", ns ? ns : "(null)");
-        return -1;
+        return AXL_ERR;
     }
 
     unsigned short wkey[128];
@@ -297,9 +297,9 @@ axl_nvstore_set(
     if (EFI_ERROR(status)) {
         axl_warning("nvstore set failed: key='%s' status=0x%llx",
                     key, (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -309,13 +309,13 @@ axl_nvstore_delete(
     )
 {
     if (key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
         axl_warning("delete: namespace '%s' not registered",
                     ns ? ns : "(null)");
-        return -1;
+        return AXL_ERR;
     }
 
     unsigned short wkey[128];
@@ -340,9 +340,9 @@ axl_nvstore_delete(
             axl_warning("nvstore delete failed: key='%s' status=0x%llx",
                         key, (unsigned long long)status);
         }
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -353,11 +353,11 @@ axl_nvstore_get_attrs(
     )
 {
     if (key == NULL || attrs == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     const EFI_GUID *guid = ns_to_guid(ns);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     unsigned short wkey[128];
@@ -376,10 +376,10 @@ axl_nvstore_get_attrs(
        was NULL / too small). EFI_SUCCESS only happens for zero-length
        variables, which is also fine. */
     if (status != EFI_BUFFER_TOO_SMALL && EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     *attrs = efi_to_axl_attrs(efi_attrs);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,13 +394,13 @@ axl_nvstore_iter(
     )
 {
     if (cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     const EFI_GUID *target = ns_to_guid(ns);
     if (target == NULL) {
         axl_warning("iter: namespace '%s' not registered",
                     ns ? ns : "(null)");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Working buffer for variable names. UEFI variable names are
@@ -409,7 +409,7 @@ axl_nvstore_iter(
     size_t          name_chars = 256;
     unsigned short *wname = axl_malloc(name_chars * sizeof(unsigned short));
     if (wname == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     wname[0] = 0;
     EFI_GUID iter_guid = { 0 };
@@ -433,7 +433,7 @@ axl_nvstore_iter(
             unsigned short *bigger = axl_malloc(new_chars * sizeof(unsigned short));
             if (bigger == NULL) {
                 axl_free(wname);
-                return -1;
+                return AXL_ERR;
             }
             axl_memcpy(bigger, wname, name_chars * sizeof(unsigned short));
             axl_free(wname);
@@ -443,7 +443,7 @@ axl_nvstore_iter(
         }
         if (EFI_ERROR(status)) {
             axl_free(wname);
-            return -1;
+            return AXL_ERR;
         }
 
         /* Filter by GUID match */

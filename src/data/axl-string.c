@@ -126,39 +126,39 @@ axl_string_append(AxlString *b, const char *s)
     size_t  len;
 
     if (b == NULL || s == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     len = axl_strlen(s);
     if (len == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     if (!grow(b, len)) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memcpy(b->buf + b->len, s, len);
     b->len += len;
     b->buf[b->len] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_string_append_len(AxlString *b, const char *data, size_t len)
 {
     if (b == NULL || data == NULL || len == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     if (!grow(b, len)) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memcpy(b->buf + b->len, data, len);
     b->len += len;
     b->buf[b->len] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -167,31 +167,31 @@ axl_string_append_printf(AxlString *b, const char *fmt, ...)
     va_list args;
 
     if (b == NULL || fmt == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     b->error = false;
     va_start(args, fmt);
     axl_vformat(strbuf_write, b, fmt, args);
     va_end(args);
-    return b->error ? -1 : 0;
+    return b->error ? AXL_ERR : AXL_OK;
 }
 
 int
 axl_string_append_c(AxlString *b, char c)
 {
     if (b == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     if (!grow(b, 1)) {
-        return -1;
+        return AXL_ERR;
     }
 
     b->buf[b->len] = c;
     b->len++;
     b->buf[b->len] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -201,16 +201,16 @@ axl_string_prepend(AxlString *b, const char *s)
     size_t  i;
 
     if (b == NULL || s == NULL) {
-        return b == NULL ? -1 : 0;
+        return b == NULL ? AXL_ERR : AXL_OK;
     }
 
     slen = axl_strlen(s);
     if (slen == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     if (!grow(b, slen)) {
-        return -1;
+        return AXL_ERR;
     }
 
     // Shift existing content right (byte-by-byte, end to start)
@@ -220,7 +220,7 @@ axl_string_prepend(AxlString *b, const char *s)
 
     axl_memcpy(b->buf, s, slen);
     b->len += slen;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -229,14 +229,14 @@ axl_string_prepend_len(AxlString *b, const char *s, size_t len)
     size_t  i;
 
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (s == NULL || len == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     if (!grow(b, len)) {
-        return -1;
+        return AXL_ERR;
     }
 
     // Shift existing content right
@@ -246,7 +246,7 @@ axl_string_prepend_len(AxlString *b, const char *s, size_t len)
 
     axl_memcpy(b->buf, s, len);
     b->len += len;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -255,11 +255,11 @@ axl_string_prepend_c(AxlString *b, char c)
     size_t  i;
 
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (!grow(b, 1)) {
-        return -1;
+        return AXL_ERR;
     }
 
     // Shift existing content right by 1
@@ -269,7 +269,7 @@ axl_string_prepend_c(AxlString *b, char c)
 
     b->buf[0] = c;
     b->len++;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -279,15 +279,15 @@ axl_string_insert(AxlString *b, size_t pos, const char *s)
     size_t  i;
 
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (s == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     slen = axl_strlen(s);
     if (slen == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     // If pos >= len, just append
@@ -296,7 +296,7 @@ axl_string_insert(AxlString *b, size_t pos, const char *s)
     }
 
     if (!grow(b, slen)) {
-        return -1;
+        return AXL_ERR;
     }
 
     // Shift content at pos right by slen (end to start)
@@ -306,7 +306,7 @@ axl_string_insert(AxlString *b, size_t pos, const char *s)
 
     axl_memcpy(b->buf + pos, s, slen);
     b->len += slen;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -316,11 +316,11 @@ axl_string_erase(AxlString *b, size_t pos, size_t len)
     size_t  tail;
 
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (pos >= b->len) {
-        return 0;
+        return AXL_OK;
     }
 
     // Clamp len to available bytes
@@ -336,23 +336,23 @@ axl_string_erase(AxlString *b, size_t pos, size_t len)
 
     b->len -= len;
     b->buf[b->len] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_string_truncate(AxlString *b, size_t len)
 {
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (len >= b->len) {
-        return 0;
+        return AXL_OK;
     }
 
     b->len = len;
     b->buf[b->len] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -362,28 +362,28 @@ axl_string_overwrite(AxlString *b, size_t pos, const char *s)
     size_t  end;
 
     if (b == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (s == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     slen = axl_strlen(s);
     if (slen == 0) {
-        return 0;
+        return AXL_OK;
     }
 
     end = pos + slen;
     if (end > b->len) {
         if (!grow(b, end - b->len)) {
-            return -1;
+            return AXL_ERR;
         }
         b->len = end;
         b->buf[b->len] = '\0';
     }
 
     axl_memcpy(b->buf + pos, s, slen);
-    return 0;
+    return AXL_OK;
 }
 
 const char *

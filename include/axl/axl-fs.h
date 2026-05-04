@@ -96,7 +96,7 @@ typedef struct {
 /**
  * @brief Get file metadata. Wraps UEFI EFI_FILE_INFO.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_file_info(
@@ -111,7 +111,7 @@ axl_file_info(
 /**
  * @brief Delete a file.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_file_delete(
@@ -121,7 +121,7 @@ axl_file_delete(
 /**
  * @brief Rename or move a file.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_file_rename(
@@ -132,7 +132,7 @@ axl_file_rename(
 /**
  * @brief Create a directory.
  *
- * @return 0 on success, -1 on error (including if it already exists).
+ * @return AXL_OK on success, AXL_ERR on error (including if it already exists).
  */
 int
 axl_dir_mkdir(
@@ -142,7 +142,7 @@ axl_dir_mkdir(
 /**
  * @brief Remove an empty directory.
  *
- * @return 0 on success, -1 on error (including if not empty).
+ * @return AXL_OK on success, AXL_ERR on error (including if not empty).
  */
 int
 axl_dir_rmdir(
@@ -246,7 +246,7 @@ axl_dir_walk(
  *
  * Example output: [{"name":"foo.txt","size":1024,"dir":false}]
  *
- * @return 0 on success, -1 on error or buffer overflow.
+ * @return AXL_OK on success, AXL_ERR on error or buffer overflow.
  */
 int
 axl_dir_list_json(
@@ -302,7 +302,7 @@ typedef struct {
  * name ("fs0", "fs1", ...) and an opaque handle. On return, @p count
  * receives the number of entries filled.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_volume_enumerate(

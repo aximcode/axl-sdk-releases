@@ -270,7 +270,7 @@ list_default(
     while ((u = axl_usb_next(u)) != NULL) {
         uint16_t vid = 0;
         uint16_t pid = 0;
-        if (axl_usb_get_vid_pid(*u, &vid, &pid) != 0) {
+        if (axl_usb_get_vid_pid(*u, &vid, &pid) != AXL_OK) {
             continue;
         }
         if (!match_filters(*u, vid, pid)) {
@@ -304,7 +304,7 @@ list_default(
 
         if (opt_verbose >= 1) {
             uint8_t cls = 0, sub = 0, prot = 0;
-            if (axl_usb_get_class(*u, &cls, &sub, &prot) == 0) {
+            if (axl_usb_get_class(*u, &cls, &sub, &prot) == AXL_OK) {
                 axl_printf("    If %u: ", (unsigned)u->intf);
                 print_class_triplet(cls, sub, prot);
                 axl_printf("\n");
@@ -352,7 +352,7 @@ tree_render_cb(
        continue the walk; the rendering just elides this row. */
     uint16_t vid = 0;
     uint16_t pid = 0;
-    if (axl_usb_get_vid_pid(addr, &vid, &pid) != 0) {
+    if (axl_usb_get_vid_pid(addr, &vid, &pid) != AXL_OK) {
         return 0;
     }
     if (!match_filters(addr, vid, pid)) {
@@ -389,7 +389,7 @@ tree_render_cb(
     }
     axl_printf("    \\- Interface %u", (unsigned)addr.intf);
     uint8_t cls = 0, sub = 0, prot = 0;
-    if (axl_usb_get_class(addr, &cls, &sub, &prot) == 0) {
+    if (axl_usb_get_class(addr, &cls, &sub, &prot) == AXL_OK) {
         axl_printf(": ");
         print_class_triplet(cls, sub, prot);
     }

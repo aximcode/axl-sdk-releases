@@ -1203,9 +1203,14 @@ Vendor-neutral capture-and-replay of UEFI platform identity
 (SMBIOS, ACPI, PCI/USB/video manifests, SPD, TPM, NVRAM/Secure
 Boot, ESRT, CPU, network details, Redfish, IPMI) so axl-sdk tools
 can be exercised against real-world platforms under QEMU without
-lab access. Native UEFI capture tool (likely a `sysinfo --capture`
-extension) writes a fixture directory; `run-qemu.sh --fixture DIR`
-replays it. Reuses the existing
+lab access. New dedicated UEFI capture tool (`tools/mkfixture.c`
+→ `mkfixture.efi`, mirroring the `mkrd.efi` naming pattern) writes
+a fixture directory; `axl-emulate <fixture-dir>` (Python wrapper
+around `run-qemu.sh`) replays it. Keeping replay in a separate
+tool stops `run-qemu.sh` from ballooning as HF4–HF8 layer in
+USB shims, EDID injection, CPU mapping, TPM seeding, Secure Boot
+vars, Redfish mock, IPMI sim, etc.
+Reuses the existing
 [`scripts/qemu-patches/`](../scripts/qemu-patches/) infrastructure
 (originally added for AxlSpd's wire-path test) for command-line
 device injection, plus host-side daemons (`swtpm`, DMTF Redfish
@@ -1219,17 +1224,28 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 - [ ] `--smbios-file FILE` → `-smbios file=FILE`
 - [ ] `--acpi-table FILE` (repeatable) → `-acpitable file=FILE`
 - [ ] `--spd ADDR:FILE` (repeatable) → `memory-backend-file` +
-      `smbus-eeprom,memdev=` (depends on existing patched QEMU)
-- [ ] `--ipmi-sim` → built-in `ipmi-bmc-sim` + KCS frontend
-- [ ] `--tpm` / `--tpm-state DIR` / `--tpm-model tpm-tis|tpm-crb`
-      → spawn swtpm and wire `-tpmdev emulator` + tpm device
+      `smbus-eeprom,memdev=` (depends on existing patched QEMU;
+      probe and error clearly when absent; aa64 warn-and-skip)
+- [ ] `--tpm` / `--tpm-state DIR` /
+      `--tpm-model tpm-tis|tpm-crb|tpm-tis-device`
+      → spawn swtpm (raw state passthrough; captured-fixture
+      seeding deferred to HF5) and wire `-tpmdev emulator` + tpm
+      device. Arch-aware default model
+      (tpm-tis on x64, tpm-tis-device on aa64; tpm-crb is x86-only).
+      swtpm absent on PATH ⇒ hard error with install hint.
+- [ ] **NOT a new flag**: IPMI is already covered by the existing
+      `--ipmi` / `--ipmi-extern` / `--ipmi-prop` in run-qemu.sh;
+      no `--ipmi-sim` alias added.
 - [ ] Hand-craft first fixture from the Proxmox dev VM
       (`dmidecode --dump-bin`, `acpidump -b`) to validate replay
       path before writing the capture tool.
 
-### Phase HF2: sysinfo --capture (manifest-grade UEFI walks)
+### Phase HF2: mkfixture.efi (manifest-grade UEFI walks)
 
-- [ ] Add `--capture <destdir>` flag to `tools/sysinfo.c`
+- [ ] New tool `tools/mkfixture.c` → `mkfixture.efi` (separate
+      from `sysinfo` — capture is a binary-blob writer, not an
+      inventory display, and conflating them muddies both;
+      cross-tool sharing happens at the library layer)
 - [ ] Dump SMBIOS3 raw bytes via EFI Config Table
 - [ ] Walk ACPI RSDT/XSDT, write each table as `acpi/<sig>.dat`
 - [ ] Enumerate PCI via `EFI_PCI_IO_PROTOCOL`, write `pci.json`
@@ -1259,38 +1275,48 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 - [ ] Support write targets: local FS (`fs0:\fixtures\...`),
       virtiofs `--mount`, HTTP POST
 
-### Phase HF3: run-qemu.sh --fixture DIR
+### Phase HF3: scripts/axl-emulate (replay wrapper)
 
-- [ ] Auto-discover and wire `smbios.bin`, `acpi/*.dat`, `spd/*.bin`
+New Python tool, ships in host-tools tarball. Wraps `run-qemu.sh`
+rather than extending it — keeps run-qemu.sh focused on QEMU
+launching primitives, gives fixture-replay logic its own home so
+HF4–HF8 doesn't balloon run-qemu.sh further.
+
+```
+axl-emulate <fixture-dir> [efi-file] [args...]
+            [--keep-acpi NAME] [--drop-acpi NAME] [--strict-acpi]
+            [--arch X64|AARCH64]
+            [-- run-qemu-args...]
+```
+
+- [ ] `scripts/axl-emulate` (Python, no extension; `#!/usr/bin/env
+      python3`) — auto-discover and translate `smbios.bin`,
+      `acpi/*.dat`, `spd/*.bin`, `tpm/` (presence triggers
+      `--tpm-state`) into the corresponding run-qemu.sh primitives
 - [ ] Default-drop ACPI tables that describe captured-platform
       topology incompatible with QEMU (`MCFG`, `MPST`, `PMTT`,
-      `HMAT`, `SLIT`, `SRAT`, `SPCR`, `DBG2`); see design doc
-      §"ACPI replay caveats"
+      `HMAT`, `SLIT`, `SRAT`, `SPCR`, `DBG2`); detection via
+      4-byte signature read from each `.dat`
 - [ ] `--keep-acpi NAME` / `--drop-acpi NAME` / `--strict-acpi`
       overrides for the denylist
-- [ ] `--usb-shim [CLASS,...]` opt-in: when manifest indicates a
-      class-compliant device (CDC-ECM, HID kbd/mouse), add the
-      corresponding QEMU stand-in (`usb-net`, `usb-kbd`, etc.)
-- [ ] `--edid FILE` injects raw EDID into QEMU's display chardev
-- [ ] `--gpu-rom FILE` → `-device VGA,romfile=FILE` (no patch needed)
-- [ ] `--cpu-from-fixture`: map captured CPUID
-      (vendor/family/model/stepping) → closest QEMU `-cpu MODEL`;
-      cross-check feature flags and warn on divergence
-- [ ] `--mac ADDR=XX:XX:..` (repeatable, also auto-derived from
-      `net.json`): pin per-NIC MAC via `-device <model>,mac=...`
-- [ ] Print `manifest.json` summary at startup so user sees which
-      machine the guest is impersonating
-- [ ] Warn (not block) when fixture metadata disagrees with QEMU
-      args (arch mismatch, etc.)
-- [ ] Probe QEMU for required patches (e.g., `smbus-eeprom memdev`)
-      before wiring artifacts that depend on them; warn clearly
-      rather than silently degrading.
+- [ ] Print `manifest.json` summary at startup if present so user
+      sees which machine the guest is impersonating
+- [ ] Warn (not block) when fixture metadata disagrees with `--arch`
+- [ ] Pass-through `--` separator: anything after lands as
+      additional run-qemu.sh args (compose with `--background`,
+      `-i`, `--mount`, `--gdb`, etc.)
+- [ ] **Future-phase wiring (NOT in HF3 scope)** — `--usb-shim`
+      (HF4), `--edid` / `--gpu-rom` (HF4), `--cpu-from-fixture` /
+      `--mac` (HF4), TPM event-log seeding (HF5), Secure Boot /
+      boot-vars injection (HF6), Redfish mock spawn (HF7), IPMI
+      sim spawn (HF8) all land in axl-emulate as their phases ship.
 
 ### Phase HF4: SPD capture
 
-- [ ] Extend `memspd` (or fold into `sysinfo --capture`) with a
-      `--capture <destdir>` flag that dumps every populated SMBus
-      EEPROM at 0x50–0x57 to `spd/0xNN.bin`
+- [ ] Add SPD walk to `mkfixture` (NOT extending `memspd`, which
+      stays an inspection tool — same separation argument as
+      sysinfo-vs-mkfixture). Dump every populated SMBus EEPROM at
+      0x50–0x57 to `spd/0xNN.bin`
 - [ ] Validate: capture on a real box, replay via Phase HF3
       `--fixture` path, AxlSpd output should match bit-for-bit
 - [ ] Document SmbusHcShim.efi requirement on QEMU + native ICH/PCH
@@ -1479,6 +1505,341 @@ from the beginning.
 
 **Estimated effort:** P1 (1 day), P2 (3-5 days), P3 (2-3 days),
 P4 (3-5 days). Total: ~2-3 weeks.
+
+---
+
+## C++ Bindings — `axlmm` (Future)
+
+Sibling C++ wrapper library over the C public surface, modeled on
+GLib's `glibmm`. The C library remains canonical; `axlmm` is a
+thin, optional layer for consumers who prefer C++ ergonomics
+(RAII, exceptions, range-based for, `std::string_view`) without
+requiring the C surface to grow C++-aware.
+
+**Why a sibling library, not a rewrite:**
+- Most UEFI tooling is plain C; the C library carries no C++
+  toolchain, runtime, or ABI cost for those consumers.
+- C++ consumers (UEFI test harnesses, vendor diagnostic tools that
+  already use C++, future axl-sdk-built apps with richer object
+  models) get an idiomatic surface without losing access to the C
+  primitives.
+- GLib/glibmm precedent — independently versioned, additive, never
+  blocks the C library's release cadence.
+
+**Scope (in):**
+- RAII wrappers for handle-bearing types: AxlStream, AxlEvent,
+  AxlCancellable, AxlHashTable, AxlArray, AxlList, AxlSlist,
+  AxlQueue, AxlStrBuf, AxlHttpServer, AxlHttpClient, AxlPciIds,
+  AxlUsbIds, AxlSpdIds, AxlSidecar, AxlArena, AxlBufPool,
+  AxlRingBuf, AxlRadixTree, AxlCache.
+- `std::string_view` / `std::span<const std::byte>` friendly
+  overloads where the C API takes `const char *, size_t` or
+  `const void *, size_t`.
+- Exception-throwing variants (`axlmm::Exception` derived from
+  `std::runtime_error`) of the error-returning C functions, gated
+  per call site (the underlying C function stays available for
+  consumers that prefer error codes).
+- Range-based-for adapters for the `_foreach` / `_iter` /
+  `_next`-cursor APIs (AxlPci cursor, AxlUsb cursor, AxlHashTable
+  iter, AxlArray iter, AxlSidecar foreach).
+- Type-safe wrappers for the variadic format APIs (`axl_printf`
+  family) using parameter packs.
+
+**Scope (out — non-goals):**
+- No STL allocator integration. AxlMem stays the allocation root;
+  `axlmm` containers wrap AxlArray/AxlHashTable rather than
+  re-implementing `std::vector`/`std::unordered_map` over AxlMem.
+- No rewrite of any C internals. `axlmm` is consumer-only headers
+  + a small linkable shim where exception translation needs a
+  hidden symbol.
+- No template-heavy headers — UEFI binary size matters. Templates
+  used sparingly (handles, span overloads); no header-only
+  generic-algorithms library.
+- No runtime polymorphism for handle types — the C API's opaque
+  pointer model maps to a single `class` per type, not an
+  inheritance hierarchy.
+- No coroutine / `std::future` integration in the first cut. The
+  AXL async model is callback-based; bridging it to coroutines is
+  a separate larger design (revisit if a consumer asks).
+
+**Toolchain:**
+- New `axl-c++` driver (or `axl-cc --lang=cpp`) — same flag
+  surface as `axl-cc`, invokes `g++` for compilation, otherwise
+  identical link flow. Build-gated by `AXL_CPP=1` at SDK install
+  time so the C-only install stays minimal.
+- Headers under `include/axlmm/*.hpp`. Umbrella `<axlmm.hpp>`
+  mirroring `<axl.h>`. Namespace `axlmm`.
+- Shipped as a separate package: `axl-sdk-cpp.deb` /
+  `axl-sdk-cpp.rpm` depending on `axl-sdk`. The base `axl-sdk`
+  package never grows a libstdc++ runtime dependency.
+- Unit tests under `test/unit/axlmm-test-*.cpp`, run by the same
+  `test-axl.sh` ratchet (separate count tier so the C-side
+  ratchet isn't perturbed).
+
+### Phase CPP1: Foundation + handle-bearing wrappers
+
+- [ ] `axl-c++` toolchain driver (or `axl-cc --lang=cpp`)
+- [ ] `<axlmm/handle.hpp>` — common RAII handle template
+      (move-only, configurable deleter)
+- [ ] `<axlmm/exception.hpp>` — `axlmm::Exception` base + per-status
+      derived types (`CancelledError`, `NoMemoryError`, etc.)
+- [ ] First wrapper pass: AxlStream, AxlEvent, AxlCancellable,
+      AxlStrBuf, AxlArena
+- [ ] Build-gate `AXL_CPP=1` in `scripts/install.sh`; new package
+      target in release flow
+- [ ] `sdk/examples/hello.cpp` builds via `axl-c++` and prints to
+      a wrapped AxlStream
+
+### Phase CPP2: Containers + iteration
+
+- [ ] AxlArray, AxlList, AxlSlist, AxlQueue, AxlHashTable wrappers
+      with `begin()`/`end()` and range-for support
+- [ ] AxlSidecar foreach adapter
+- [ ] AxlPci / AxlUsb cursor adapters (range-for over enumeration)
+- [ ] `std::string_view` + `std::span` overloads across the
+      Phase CPP1 surface
+
+### Phase CPP3: Networking + format
+
+- [ ] AxlHttpServer / AxlHttpClient wrappers (route registration
+      via lambdas with capture-friendly storage)
+- [ ] AxlTcp / AxlUdp socket wrappers
+- [ ] Type-safe `axlmm::format` / `axlmm::print` parameter-pack
+      wrappers over `axl_printf` family
+
+### Phase CPP4: Polish
+
+- [ ] Sphinx documentation generation for `<axlmm/*.hpp>` (Doxygen
+      already supports C++; needs Breathe pages alongside the C
+      module pages)
+- [ ] Cross-arch CI coverage (X64 + AARCH64 axlmm test build)
+- [ ] Migration recipe doc: "porting a C consumer to axlmm" with
+      before/after examples
+
+**Open questions (defer until CPP1 lands):**
+- Coroutine bridge for async APIs — `co_await`-able wrappers
+  around AxlCancellable-aware async ops. Probably worth it
+  eventually but a real consumer should drive the design.
+- C++20 `std::expected` vs. exceptions for the error-returning
+  variants — exceptions are the GLib precedent; `expected` is
+  closer to the underlying C semantics. Likely both, with the
+  caller picking per call site.
+- libstdc++ in a UEFI environment — exception unwinding, RTTI,
+  and `std::string` allocation all have caveats in firmware.
+  CPP1 must validate the toolchain end-to-end before CPP2 commits
+  to STL types in the public headers.
+
+---
+
+## API Hygiene — Return Value Conventions (Future)
+
+The public API surface mixes return-value shapes that pre-date a
+unified convention. A 2026-05-04 audit of `include/axl/*.h` (~705
+non-void public functions) categorized them and the result is on
+file in this section. The motivation was a discussion about whether
+to introduce typed `Axl*Status` enums for return values; the answer
+turned out to be "narrower than that, but also wider than that"
+once the data was in.
+
+### Background
+
+- **AxlSidecar precedent (v0.11.0)** — `AxlSidecarStatus` (`OK /
+  FILE_MISSING / PARSE_ERROR`) replaced 0/-1/-2 magic in 15 sidecar
+  loaders. Set the project pattern: typed status enum **only** when
+  3+ outcomes are genuinely distinguishable and consumers branch on
+  them.
+- **AxlStatus introduction (post-v0.11.2)** — promoted the
+  pre-existing `AXL_OK / AXL_ERR / AXL_CANCELLED` `#define` triple
+  to a typed enum and added `AXL_TIMEOUT (-3)` to disambiguate
+  deadline-elapsed from invalid-arg in the wait/event family.
+  Adopted by the wait/event/Tier-4-net cluster (~12 functions).
+
+### Phase H1: named-constants hygiene + targeted predicate flip
+
+**Reframed 2026-05-04** after an aborted "bool sweep" attempt
+(commits cbc26e3..5132f76, reverted in 2bd2942). The original
+2026-05-04 audit found ~190 `int`-returning functions whose
+docstrings only mentioned `0` and `-1` and labeled them
+"bool-in-disguise." That framing was wrong — it conflated
+"binary outcome" with "predicate."
+
+Per [AXL-Coding-Style.md §"Return Value Conventions"](AXL-Coding-Style.md),
+the table draws a sharper line:
+
+| Pattern | Type | Examples |
+|---|---|---|
+| **Predicates** (yes/no question) | `bool` | `axl_dir_read`, `axl_net_is_available` |
+| **Operations** (do something, can fail) | `int` AXL_OK/AXL_ERR | **`axl_file_delete`, `axl_file_get_contents`** |
+
+The flipped-and-reverted batches were operations, not predicates:
+file/dir/volume ops, ring-buf push/pop, TLS connect/write/read,
+mem-phys read/write/map, driver load/start/unload, string
+builders. Those belong in the int row. The diagnostic was every
+batch produced boundary-translation sites of the form
+`rc = axl_foo(...) ? 0 : -1;` — the call sites telling you the
+callee wanted to remain int. Compounding signal: 3 of 8 batches
+shipped sign-flip bugs caught only by independent code review
+(HTTPS client, mkrd, axl_string_len).
+
+**Reframed plan, two distinct passes:**
+
+#### H1a: Named-constants hygiene — DONE (2026-05-04)
+
+Shipped across 16 module commits in two passes after the bool-
+sweep revert. ~280 single-failure-mode operations across 35 public
+headers now return `AXL_OK`/`AXL_ERR` named constants. Signatures
+unchanged — semantically a no-op since AXL_OK==0 and AXL_ERR==-1
+by AxlStatus enum contract — but call sites read as status checks
+instead of magic-int comparisons.
+
+**First pass — 9 modules from the original audit (b53ab94..8f96c67):**
+
+| # | Header | Ops | Commit |
+|---|---|---|---|
+| 1 | axl-fs.h | 9 | b53ab94 |
+| 2 | axl-ring-buf.h | 10 + 1 helper | 22187dc |
+| 3 | axl-tls.h | 5 (multi-shape kept literal) | fc6a366 |
+| 4 | axl-mem-phys.h | 10 | 0938fa8 |
+| 5 | axl-stream.h | 5 (count returners kept literal) | beffdfd |
+| 6 | axl-sys.h | 9 (DP iterator kept literal) | 291af6a |
+| 7 | axl-driver.h | 12 + statics | 13a41cd |
+| 8 | axl-string.h | 11 builders (axl_string_len kept literal) | db3c66f |
+| 9 | axl-http-server.h | 17 + 3 callback typedefs | 8f96c67 |
+
+**Re-audit pass — 26 additional headers (1b4f0fa..3740a12):**
+
+The post-H1a re-audit revealed 37 untouched headers with int 0/-1
+docstrings beyond the original audit set. Cluster commits:
+
+| # | Cluster | Headers | Ops | Commit |
+|---|---|---|---|---|
+| 10 | smbios | 1 | 19 | 1b4f0fa |
+| 11 | pci | 1 | 13 | 35bb8a9 |
+| 12 | hardware | acpi+smbus+ipmi+usb+spd | 18 | dc59472 |
+| 13 | data-structures | array+cache+queue+radix-tree | 11 | aad7df3 |
+| 14 | util-storage | nvstore+config+env+path+boot | 22 | 95d4120 |
+| 15 | util-misc | gfx+watchdog+rng+console+str+mem+digest+image+image-verify+diag+log | 30 | b4993b1 |
+| 16 | networking | tcp+udp+socket+socket-client+net+http-client+http-core+url | ~50 | 3740a12 |
+
+Two headers explicitly EXCLUDED as non-single-failure shape:
+  - `axl-loop.h` — multi-shape (event loop returns 0/1/-1 for
+    different states; some funcs propagate callback rcs).
+  - `axl-subcommand.h` — pass-through (returns whatever the
+    subcommand returned).
+
+Plus axl-tls.h's `axl_tls_handshake` and `axl_tls_read` keep their
+0/1/-1 multi-shape docstrings literal.
+
+A regression caught in the re-audit pass: the hardware cluster
+(commit dc59472) wrongly converted `axl_usb_get_string`'s `-1`
+returns to `AXL_ERR`. That function is a count returner where -1
+is the error sentinel for a positive-int-returning function, NOT
+a status code. Reverted in the util-misc cluster commit (b4993b1).
+The h1a-convert.py tooling was upgraded to use header-driven scope
+filtering (extracts ops from `@return AXL_OK` docstrings + contract-
+sharing chains via `Like X / as X / @ref X`) so the script no
+longer touches count returners or comparison functions.
+
+Tests 2555/2555 both arches at every commit; HTTP integration
+62/62 verified at the http-server commit.
+
+Methodology lessons captured for future H1 work:
+
+- **Independent code review caught real issues in 2 of 9 modules**:
+  6 missed call sites in axl-fs (regex blind spot for callers
+  using `int rc = axl_foo(...)` then `if (rc != 0)`), 1 missed
+  rc-indirection in axl-ring-buf, 1 wrapper-chain inconsistency
+  in axl-tls (client_send wrapping axl_tls_write). Per-module
+  `grep` for both direct-call comparisons AND intermediate-rc
+  comparisons is now the standard pre-commit check.
+- **Some headers needed `#include <axl/axl-macros.h>` added**:
+  axl-mem-phys.h, axl-string.h. The macros include is required
+  whenever the public docstrings reference AXL_OK/AXL_ERR so
+  consumers comparing against the constants get them defined.
+- **Multi-shape functions stayed literal**: axl_tls_handshake,
+  axl_tls_read (return 0/1/-1 for "more data needed"),
+  axl_dir_walk + dir_walk_recursive (callback-rc pass-through),
+  axl_device_path_for_each (multi-shape iterator),
+  axl_stream_for_each_line. Recognizing these by their
+  contract — anything returning more than success+failure — is
+  the discriminator.
+- **Count returners stayed literal**: ring_buf push/pop/peek
+  (uint32_t bytes), axl_string_len (size_t), axl_pread/pwrite
+  (axl_ssize_t), axl_device_path_size (size_t),
+  ring_buf get_length/readable/writable/capacity. The `0`
+  return means "0 bytes," not "OK."
+
+#### H1b: Targeted predicate flip — NO-OP (2026-05-04)
+
+A post-H1a sweep for int-returning predicates found **zero
+candidates needing flip**. Every genuine predicate in the SDK
+already uses `bool`:
+
+- `axl_*_is_*` / `axl_*_has_*` / `axl_*_contains` — none exist
+  as `int`-returners.
+- Existence/availability/state predicates already bool:
+  `axl_acpi_checksum_ok`, `axl_gfx_available`,
+  `axl_loop_is_running`, `axl_net_is_available`,
+  `axl_queue_is_empty`, `axl_ring_buf_is_empty`,
+  `axl_ring_buf_is_full`, `axl_task_pool_done`,
+  `axl_tls_available`.
+- Iteration predicates already bool: `axl_dir_read`,
+  `axl_log_read`, `axl_json_array_iter_next`,
+  `axl_stream_read_line`, etc.
+
+Two int-returning functions have docstrings with `1 if X, 0 if Y`
+shape (axl_hash_table_insert / axl_hash_table_replace), but they
+return THREE distinct values (1 = new entry, 0 = existing
+replaced, -1 = error). That's multi-shape, not a yes/no predicate
+— would be a Phase H3 candidate for a per-module typed enum if
+3+ branchable outcomes earn their keep.
+
+H1b is closed. The convention rule (predicates → bool) was
+already in force; the bool sweep had it backward.
+
+#### What we explicitly walked away from
+
+- **No bulk `int → bool` sweep.** Tried it; reverted it.
+  Operations stay `int` AXL_OK/AXL_ERR per the style guide.
+- **No new `Axl*Status` enums** unless 3+ outcomes earn their
+  keep (Phase H3 rule, unchanged).
+
+### Phase H2: AxlStatus expansion — opportunistic
+
+The async TCP cluster documents `AXL_CANCELLED` in its callback
+signature (`void (*AxlTcpCb)(AxlTcp *, int status, void *)` —
+`int status` should be `AxlStatus status`). Migration was deferred
+from the initial AxlStatus commit because the callback type change
+ripples through every consumer's TCP callback. Worth doing the next
+time a TCP-touching change is in flight anyway.
+
+- [ ] `AxlTcpCb` `int status` → `AxlStatus status` (and the
+      analogous HTTP-client callback). Updates axl-webfs callsites.
+- [ ] Other multi-outcome candidates surfaced by future audits.
+
+### Phase H3: Per-module status enums — case-by-case
+
+Don't create them prophylactically. Future test before adding a new
+`Axl*Status`: "do consumers need to write three or more distinct
+branches based on the rc?" If yes, typed enum (sidecar/wait
+precedent). If no, `bool` (or `int`/`AxlStatus` if it fits the
+existing conventions).
+
+### What we're explicitly NOT doing
+
+- **Not promoting `axl_args_run` to AxlStatus.** It's POSIX-exit-
+  code shaped (returns from `main()` straight into the process exit
+  code, where AxlStatus's negative values would round to 254/255).
+  Documented inline in `axl-args.h`.
+- **Not changing comparison-style functions.** `axl_strcmp`,
+  `axl_memcmp`, etc. return libc-style sign — that's information,
+  not a status code.
+- **Not changing count-returning functions.** `int axl_args_get_pos_count`,
+  `axl_snprintf`, `axl_args_get_multi_count`, etc. return values,
+  not statuses.
+- **Not adding numeric-value mapping macros.** `AXL_CANCELLED` is
+  `(-2)` and stays `(-2)`; the enum members ARE the contract, the
+  numeric values ARE the contract, both work, no glue needed.
 
 ---
 

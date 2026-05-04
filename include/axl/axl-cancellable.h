@@ -27,9 +27,9 @@
  *     return AXL_SOURCE_REMOVE;
  * }
  *
- * // The op's callback fires exactly once, with status either 0 on
- * // success, or AXL_CANCELLED (-2) if the cancellable fired first.
- * static void on_connected(AxlTcp *sock, int status, void *ctx) {
+ * // The op's callback fires exactly once, with status either AXL_OK
+ * // on success, or AXL_CANCELLED if the cancellable fired first.
+ * static void on_connected(AxlTcp *sock, AxlStatus status, void *ctx) {
  *     if (status == AXL_CANCELLED) { axl_tcp_close(sock); return; }
  *     // sock is ready to use
  * }

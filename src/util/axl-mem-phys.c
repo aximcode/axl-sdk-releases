@@ -21,10 +21,10 @@ axl_mem_phys_map(
     )
 {
     if (out_va == NULL || len == 0) {
-        return -1;
+        return AXL_ERR;
     }
     *out_va = (void *)phys;
-    return 0;
+    return AXL_OK;
 }
 
 void
@@ -49,10 +49,10 @@ axl_mem_phys_read8(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *(volatile const uint8_t *)phys;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -62,10 +62,10 @@ axl_mem_phys_read16(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *(volatile const uint16_t *)phys;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -75,10 +75,10 @@ axl_mem_phys_read32(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *(volatile const uint32_t *)phys;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -88,10 +88,10 @@ axl_mem_phys_read64(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = *(volatile const uint64_t *)phys;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -101,7 +101,7 @@ axl_mem_phys_write8(
     )
 {
     *(volatile uint8_t *)phys = value;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -111,7 +111,7 @@ axl_mem_phys_write16(
     )
 {
     *(volatile uint16_t *)phys = value;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -121,7 +121,7 @@ axl_mem_phys_write32(
     )
 {
     *(volatile uint32_t *)phys = value;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -131,7 +131,7 @@ axl_mem_phys_write64(
     )
 {
     *(volatile uint64_t *)phys = value;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ axl_mem_phys_search(
     )
 {
     if (out_match == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* Clear the out parameter unconditionally so a -1 return never
        leaves a stale pointer from a prior successful call lying
@@ -156,8 +156,8 @@ axl_mem_phys_search(
     *out_match = NULL;
     void *hit = axl_memmem(va, len, needle, needle_len);
     if (hit == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out_match = hit;
-    return 0;
+    return AXL_OK;
 }

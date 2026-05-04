@@ -128,7 +128,7 @@ file_seek(void *ctx, int64_t offset, int whence)
         pos = (uint64_t)offset;
     } else if (whence == AXL_SEEK_CUR) {
         uint64_t cur;
-        if (axl_backend_file_get_position(f->handle, &cur) != 0) {
+        if (axl_backend_file_get_position(f->handle, &cur) != AXL_OK) {
             return -1;
         }
         if (offset < 0 && (uint64_t)(-offset) > cur) {
@@ -157,7 +157,7 @@ file_tell(void *ctx)
     FileCtx *f = (FileCtx *)ctx;
     uint64_t pos;
 
-    if (axl_backend_file_get_position(f->handle, &pos) != 0) {
+    if (axl_backend_file_get_position(f->handle, &pos) != AXL_OK) {
         return -1;
     }
     return (int64_t)pos;

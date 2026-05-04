@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,7 +111,7 @@ axl_acpi_next(
  * 0 = ACPI 1.0 (32-bit RSDT pointers only).
  * 2+ = ACPI 2.0 or later (64-bit XSDT preferred when present).
  *
- * @return 0 on success, -1 if RSDP is not available.
+ * @return AXL_OK on success, AXL_ERR if RSDP is not available.
  */
 int
 axl_acpi_revision(
@@ -162,7 +163,7 @@ typedef struct {
 /**
  * @brief Read and decode the MCFG table.
  *
- * @return 0 on success, -1 if MCFG is missing or malformed.
+ * @return AXL_OK on success, AXL_ERR if MCFG is missing or malformed.
  */
 int
 axl_acpi_read_mcfg(
@@ -216,7 +217,7 @@ typedef struct {
 /**
  * @brief Read and decode the MADT (APIC) table.
  *
- * @return 0 on success, -1 if MADT is missing or malformed.
+ * @return AXL_OK on success, AXL_ERR if MADT is missing or malformed.
  */
 int
 axl_acpi_read_madt(
@@ -258,7 +259,7 @@ typedef struct {
 /**
  * @brief Read and decode the FADT.
  *
- * @return 0 on success, -1 if the table is missing or malformed.
+ * @return AXL_OK on success, AXL_ERR if the table is missing or malformed.
  */
 int
 axl_acpi_read_facp(

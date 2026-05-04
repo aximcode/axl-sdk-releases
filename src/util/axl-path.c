@@ -159,7 +159,7 @@ static bool
 path_file_exists(const char *path)
 {
     AxlFileInfo fi;
-    return path != NULL && axl_file_info(path, &fi) == 0 && !fi.is_dir;
+    return path != NULL && axl_file_info(path, &fi) == AXL_OK && !fi.is_dir;
 }
 
 char *
@@ -277,7 +277,7 @@ axl_path_resolve(
     size_t      wpos = 0;
 
     if (base == NULL || relative == NULL || out == NULL || size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /*
@@ -340,13 +340,13 @@ axl_path_resolve(
             if (depth > 0) {
                 depth--;
             } else if (has_root) {
-                return -1;  /* underflow past root */
+                return AXL_ERR;  /* underflow past root */
             }
             continue;
         }
 
         if (depth >= MAX_COMPONENTS) {
-            return -1;  /* too many components */
+            return AXL_ERR;  /* too many components */
         }
         stack[depth] = comp;
         stack_len[depth] = clen;
@@ -360,7 +360,7 @@ axl_path_resolve(
 
     if (has_root) {
         if (opos >= size) {
-            return -1;
+            return AXL_ERR;
         }
         out[opos++] = '/';
     }
@@ -368,12 +368,12 @@ axl_path_resolve(
     for (int i = 0; i < depth; i++) {
         if (i > 0) {
             if (opos >= size) {
-                return -1;
+                return AXL_ERR;
             }
             out[opos++] = '/';
         }
         if (opos + stack_len[i] >= size) {
-            return -1;
+            return AXL_ERR;
         }
         for (size_t j = 0; j < stack_len[i]; j++) {
             char ch = stack[i][j];
@@ -384,18 +384,18 @@ axl_path_resolve(
     /* Empty result (no root, all ".." consumed) */
     if (opos == 0) {
         if (size < 2) {
-            return -1;
+            return AXL_ERR;
         }
         out[0] = '.';
         out[1] = '\0';
-        return 0;
+        return AXL_OK;
     }
 
     if (opos >= size) {
-        return -1;
+        return AXL_ERR;
     }
     out[opos] = '\0';
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,12 +413,12 @@ axl_path_build_uefi(
     char *p;
 
     if (volume == NULL || subpath == NULL || out == NULL || size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     n = axl_snprintf(out, size, "%s:%s", volume, subpath);
     if (n < 0 || (size_t)n >= size) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Convert forward slashes to backslashes */
@@ -428,7 +428,7 @@ axl_path_build_uefi(
         }
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -455,12 +455,12 @@ axl_chdir(const char *path)
     int rc;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide = axl_utf8_to_ucs2(path);
     if (wide == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_shell_chdir(wide);

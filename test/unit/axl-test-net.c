@@ -198,8 +198,8 @@ test_net_available(void)
 
         AxlIPv4Address addr;
         int ret = axl_net_get_ip_address(&addr);
-        test_check(ret == 0, "GetIpAddress succeeds");
-        if (ret == 0) {
+        test_check(ret == AXL_OK, "GetIpAddress succeeds");
+        if (ret == AXL_OK) {
             axl_printf("  IP: %d.%d.%d.%d\n",
                 addr.addr[0], addr.addr[1], addr.addr[2], addr.addr[3]);
             test_check(addr.addr[0] != 0 || addr.addr[1] != 0 ||
@@ -267,13 +267,13 @@ typedef struct {
 } TcpRearmCtx;
 
 static bool
-on_tcp_rearm_data(AxlTcp *sock, int status, void *data)
+on_tcp_rearm_data(AxlTcp *sock, AxlStatus status, void *data)
 {
     TcpRearmCtx *c = (TcpRearmCtx *)data;
     size_t len = axl_tcp_recv_get_size(sock);
 
     c->fires++;
-    if (status != 0 || len == 0) {
+    if (status != AXL_OK || len == 0) {
         axl_loop_quit(c->loop);
         return false;
     }
@@ -319,7 +319,7 @@ test_tcp_recv_async_rearm(void)
         return;
     }
 
-    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9998, &client) != 0) {
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9998, &client) != AXL_OK) {
         axl_printf("SKIP: TCP recv_async rearm (connect failed)\n");
         return;
     }
@@ -933,7 +933,7 @@ run_serve_tls_mode(void)
 
     axl_net_auto_init(SIZE_MAX, 10);
 
-    if (axl_tls_init() != 0) {
+    if (axl_tls_init() != AXL_OK) {
         axl_printf("ERROR: TLS init failed\n");
         return -1;
     }
@@ -959,7 +959,7 @@ run_serve_tls_mode(void)
         return -1;
     }
 
-    if (axl_http_server_use_tls(s, cert, cert_len, key, key_len) != 0) {
+    if (axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
         axl_printf("ERROR: TLS setup failed\n");
         axl_http_server_free(s);
         axl_free(cert);
@@ -1162,30 +1162,30 @@ test_ipv4_parse_format(void)
     char    buf[32];
 
     /* Parse valid addresses */
-    test_check(axl_ipv4_parse("192.168.1.1", octets) == 0, "ipv4 parse: 192.168.1.1");
+    test_check(axl_ipv4_parse("192.168.1.1", octets) == AXL_OK, "ipv4 parse: 192.168.1.1");
     test_check(octets[0] == 192 && octets[1] == 168 &&
                octets[2] == 1 && octets[3] == 1, "ipv4 parse: octets correct");
 
-    test_check(axl_ipv4_parse("0.0.0.0", octets) == 0, "ipv4 parse: 0.0.0.0");
+    test_check(axl_ipv4_parse("0.0.0.0", octets) == AXL_OK, "ipv4 parse: 0.0.0.0");
     test_check(octets[0] == 0 && octets[3] == 0, "ipv4 parse: all zeros");
 
-    test_check(axl_ipv4_parse("255.255.255.255", octets) == 0, "ipv4 parse: 255.255.255.255");
+    test_check(axl_ipv4_parse("255.255.255.255", octets) == AXL_OK, "ipv4 parse: 255.255.255.255");
     test_check(octets[0] == 255 && octets[3] == 255, "ipv4 parse: all 255");
 
-    test_check(axl_ipv4_parse("10.0.0.1", octets) == 0, "ipv4 parse: 10.0.0.1");
+    test_check(axl_ipv4_parse("10.0.0.1", octets) == AXL_OK, "ipv4 parse: 10.0.0.1");
 
     /* Parse invalid addresses */
-    test_check(axl_ipv4_parse("256.0.0.1", octets) == -1, "ipv4 parse: 256 octet");
-    test_check(axl_ipv4_parse("1.2.3", octets) == -1, "ipv4 parse: 3 octets");
-    test_check(axl_ipv4_parse("abc", octets) == -1, "ipv4 parse: letters");
-    test_check(axl_ipv4_parse("", octets) == -1, "ipv4 parse: empty");
-    test_check(axl_ipv4_parse(NULL, octets) == -1, "ipv4 parse: NULL str");
-    test_check(axl_ipv4_parse("1.2.3.4", NULL) == -1, "ipv4 parse: NULL octets");
-    test_check(axl_ipv4_parse("1.2.3.4.5", octets) == -1, "ipv4 parse: 5 octets");
+    test_check(axl_ipv4_parse("256.0.0.1", octets) == AXL_ERR, "ipv4 parse: 256 octet");
+    test_check(axl_ipv4_parse("1.2.3", octets) == AXL_ERR, "ipv4 parse: 3 octets");
+    test_check(axl_ipv4_parse("abc", octets) == AXL_ERR, "ipv4 parse: letters");
+    test_check(axl_ipv4_parse("", octets) == AXL_ERR, "ipv4 parse: empty");
+    test_check(axl_ipv4_parse(NULL, octets) == AXL_ERR, "ipv4 parse: NULL str");
+    test_check(axl_ipv4_parse("1.2.3.4", NULL) == AXL_ERR, "ipv4 parse: NULL octets");
+    test_check(axl_ipv4_parse("1.2.3.4.5", octets) == AXL_ERR, "ipv4 parse: 5 octets");
 
     /* Format */
     uint8_t addr[] = { 10, 0, 0, 1 };
-    test_check(axl_ipv4_format(addr, buf, sizeof(buf)) == 0, "ipv4 format: 10.0.0.1");
+    test_check(axl_ipv4_format(addr, buf, sizeof(buf)) == AXL_OK, "ipv4 format: 10.0.0.1");
     test_check(axl_strcmp(buf, "10.0.0.1") == 0, "ipv4 format: string correct");
 
     /* Format roundtrip */
@@ -1194,11 +1194,11 @@ test_ipv4_parse_format(void)
     test_check(axl_strcmp(buf, "192.168.100.200") == 0, "ipv4 format: roundtrip");
 
     /* Format small buffer */
-    test_check(axl_ipv4_format(addr, buf, 4) == -1, "ipv4 format: small buffer");
+    test_check(axl_ipv4_format(addr, buf, 4) == AXL_ERR, "ipv4 format: small buffer");
 
     /* Format NULL safety */
-    test_check(axl_ipv4_format(NULL, buf, sizeof(buf)) == -1, "ipv4 format: NULL octets");
-    test_check(axl_ipv4_format(addr, NULL, 16) == -1, "ipv4 format: NULL buf");
+    test_check(axl_ipv4_format(NULL, buf, sizeof(buf)) == AXL_ERR, "ipv4 format: NULL octets");
+    test_check(axl_ipv4_format(addr, NULL, 16) == AXL_ERR, "ipv4 format: NULL buf");
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1212,7 @@ run_udp_echo_mode(const char *host, const char *port_str)
     AxlIPv4Address dest;
     uint8_t octets[4];
 
-    if (axl_ipv4_parse(host, octets) != 0) {
+    if (axl_ipv4_parse(host, octets) != AXL_OK) {
         axl_printf("UDP-ECHO: invalid host '%s'\n", host);
         return 1;
     }
@@ -1228,7 +1228,7 @@ run_udp_echo_mode(const char *host, const char *port_str)
     axl_net_auto_init(SIZE_MAX, 10);
 
     AxlUdpSocket *sock = NULL;
-    if (axl_udp_open(&sock, 0) != 0) {
+    if (axl_udp_open(&sock, 0) != AXL_OK) {
         axl_printf("UDP-ECHO: failed to open socket\n");
         return 1;
     }
@@ -1244,7 +1244,7 @@ run_udp_echo_mode(const char *host, const char *port_str)
                               rx_buf, sizeof(rx_buf) - 1, &rx_len,
                               5000);
 
-    if (rc == 0 && rx_len > 0) {
+    if (rc == AXL_OK && rx_len > 0) {
         rx_buf[rx_len] = '\0';
         axl_printf("UDP-ECHO: received %zu bytes: %s\n", rx_len, rx_buf);
         axl_printf("PASS: udp-echo-response\n");
@@ -1254,7 +1254,7 @@ run_udp_echo_mode(const char *host, const char *port_str)
     }
 
     axl_udp_close(sock);
-    return (rc == 0) ? 0 : 1;
+    return (rc == AXL_OK) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,11 +1495,11 @@ test_socket_client_invalid(void)
     AxlSocket *sock = NULL;
 
     /* NULL host */
-    test_check(axl_socket_client_connect_to_host(client, NULL, 80, &sock) == -1,
+    test_check(axl_socket_client_connect_to_host(client, NULL, 80, &sock) == AXL_ERR,
                "socket_client: NULL host");
 
     /* NULL out_sock */
-    test_check(axl_socket_client_connect_to_host(client, "10.0.0.1", 80, NULL) == -1,
+    test_check(axl_socket_client_connect_to_host(client, "10.0.0.1", 80, NULL) == AXL_ERR,
                "socket_client: NULL out_sock");
 
     axl_socket_client_free(client);
@@ -1582,7 +1582,7 @@ test_socket_datagram_send(void)
     axl_socket_address_free(dest);
 
     /* send (stream-only) should fail on datagram */
-    test_check(axl_socket_send(sock, "test", 4, 0) == -1,
+    test_check(axl_socket_send(sock, "test", 4, 0) == AXL_ERR,
                "socket datagram: send (stream-only) fails");
 
     axl_socket_free(sock);
@@ -1643,7 +1643,7 @@ test_socket_type_errors(void)
     if (stream != NULL) {
         AxlSocketAddress *dest = axl_socket_address_new(
             axl_inet_address_new_loopback(), 80);
-        test_check(axl_socket_send_to(stream, "x", 1, dest) == -1,
+        test_check(axl_socket_send_to(stream, "x", 1, dest) == AXL_ERR,
                    "socket type_errors: send_to on stream fails");
         axl_socket_address_free(dest);
 
@@ -1651,7 +1651,7 @@ test_socket_type_errors(void)
         /* receive on unconnected stream -> error */
         size_t sz = 64;
         char buf[64];
-        test_check(axl_socket_receive(stream, buf, &sz, 0) == -1,
+        test_check(axl_socket_receive(stream, buf, &sz, 0) == AXL_ERR,
                    "socket type_errors: receive on unconnected fails");
 
         axl_socket_free(stream);
@@ -1660,7 +1660,7 @@ test_socket_type_errors(void)
     /* listen on datagram -> error */
     AxlSocket *dgram = axl_socket_new(AXL_SOCKET_DATAGRAM);
     if (dgram != NULL) {
-        test_check(axl_socket_listen(dgram, 9995) == -1,
+        test_check(axl_socket_listen(dgram, 9995) == AXL_ERR,
                    "socket type_errors: listen on datagram fails");
         axl_socket_free(dgram);
     }
@@ -1677,11 +1677,11 @@ typedef struct {
 } UdpRecvTestCtx;
 
 static bool
-on_udp_recv_test(AxlSocket *sock, int status, void *data)
+on_udp_recv_test(AxlSocket *sock, AxlStatus status, void *data)
 {
     UdpRecvTestCtx *ctx = (UdpRecvTestCtx *)data;
 
-    ctx->received = (status == 0);
+    ctx->received = (status == AXL_OK);
     ctx->recv_len = axl_socket_receive_get_size(sock);
     axl_loop_quit(ctx->loop);
     return false;  /* single-fire test */
@@ -1724,7 +1724,7 @@ test_socket_udp_async_recv(void)
 
     /* Bind ephemerally — needed so the socket has a known local
        port that slirp can NAT the reply back to. */
-    if (axl_socket_bind(sock, 9990) != 0) {
+    if (axl_socket_bind(sock, 9990) != AXL_OK) {
         axl_printf("SKIP: socket UDP async recv (bind 9990 failed)\n");
         axl_socket_free(sock);
         return;
@@ -1738,8 +1738,8 @@ test_socket_udp_async_recv(void)
     int rc = axl_socket_receive_async(sock, recv_buf,
                                       sizeof(recv_buf) - 1,
                                       loop, on_udp_recv_test, &ctx);
-    test_check(rc == 0, "socket UDP async: receive_async");
-    if (rc != 0) {
+    test_check(rc == AXL_OK, "socket UDP async: receive_async");
+    if (rc != AXL_OK) {
         axl_loop_free(loop);
         axl_socket_free(sock);
         return;
@@ -1793,17 +1793,17 @@ test_socket_bind(void)
     }
 
     /* Bind to a specific port */
-    test_check(axl_socket_bind(sock, 9989) == 0,
+    test_check(axl_socket_bind(sock, 9989) == AXL_OK,
                "socket bind: port 9989");
 
     /* Bind to a different port */
-    test_check(axl_socket_bind(sock, 9988) == 0,
+    test_check(axl_socket_bind(sock, 9988) == AXL_OK,
                "socket bind: rebind to 9988");
 
     /* Bind on stream should fail */
     AxlSocket *stream = axl_socket_new(AXL_SOCKET_STREAM);
     if (stream != NULL) {
-        test_check(axl_socket_bind(stream, 9987) == -1,
+        test_check(axl_socket_bind(stream, 9987) == AXL_ERR,
                    "socket bind: stream fails");
         axl_socket_free(stream);
     }

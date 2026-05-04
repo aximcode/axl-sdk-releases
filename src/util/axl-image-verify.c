@@ -572,7 +572,7 @@ axl_image_verify_signature(
        arbitrary leftover bytes. The NULL-info case is the only -1
        return the caller can't observe through the struct anyway. */
     if (info == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     info->has_signature   = false;
     info->signature_valid = false;
@@ -581,13 +581,13 @@ axl_image_verify_signature(
     info->issuer_cn       = NULL;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     void   *buf = NULL;
     size_t  size = 0;
-    if (axl_file_get_contents(path, &buf, &size) != 0 || buf == NULL) {
-        return -1;
+    if (axl_file_get_contents(path, &buf, &size) != AXL_OK || buf == NULL) {
+        return AXL_ERR;
     }
 
     uint32_t cert_offset = 0;
@@ -598,7 +598,7 @@ axl_image_verify_signature(
         /* Not a recognizable PE image — caller can't make any
            statement about its signature. */
         axl_free(buf);
-        return -1;
+        return AXL_ERR;
     }
 
     info->has_signature = (cert_size > 0);
@@ -627,7 +627,7 @@ axl_image_verify_signature(
     }
 
     axl_free(buf);
-    return 0;
+    return AXL_OK;
 }
 
 void

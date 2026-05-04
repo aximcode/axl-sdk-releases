@@ -49,7 +49,7 @@ axl_time_format(char *buf, size_t buf_size)
         return 0;
     }
 
-    if (axl_backend_get_time(&time) != 0) {
+    if (axl_backend_get_time(&time) != AXL_OK) {
         /* Fallback: zero timestamp */
         const char *zero = "0000-00-00T00:00:00.000000";
         size_t i;
@@ -89,7 +89,7 @@ axl_time_get_ms(void)
 {
     AxlTime time;
 
-    if (axl_backend_get_time(&time) != 0) {
+    if (axl_backend_get_time(&time) != AXL_OK) {
         return 0;
     }
 

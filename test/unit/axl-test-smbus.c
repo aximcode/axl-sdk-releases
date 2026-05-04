@@ -272,7 +272,7 @@ test_transport_selection_hc_preferred(void)
     //
     uint8_t payload = 0xAB;
     int rc = axl_smbus_write_block(s, 0x10, 0x02, &payload, 1);
-    test_check(rc == 0, "axl_smbus_write_block (HC): succeeds");
+    test_check(rc == AXL_OK, "axl_smbus_write_block (HC): succeeds");
     test_check(g_hc_called,
                "axl_smbus_write_block (HC): dispatches via EFI_SMBUS_HC_PROTOCOL");
     test_check(g_cap.call_count == 0,
@@ -302,7 +302,7 @@ test_block_write_byte_count_prefix(void)
     const uint8_t payload[2] = { 0x18, 0x01 }; /* NetFn App << 2 | cmd Get Device ID */
     int rc = axl_smbus_write_block(s, /*slave=*/0x10, /*command=*/0x02,
                                    payload, sizeof(payload));
-    test_check(rc == 0, "axl_smbus_write_block: returns 0");
+    test_check(rc == AXL_OK, "axl_smbus_write_block: returns 0");
     test_check(g_cap.call_count == 1, "block_write: exactly one I2C dispatch");
     test_check(g_cap.captured_slave == 0x10,
                "block_write: slave address passed through");
@@ -348,7 +348,7 @@ test_block_read_strips_count_byte(void)
     size_t  out_len = sizeof(out);
     int rc = axl_smbus_read_block(s, /*slave=*/0x10, /*command=*/0x03,
                                   out, &out_len);
-    test_check(rc == 0, "axl_smbus_read_block: returns 0");
+    test_check(rc == AXL_OK, "axl_smbus_read_block: returns 0");
     test_check(g_cap.call_count == 1, "block_read: exactly one I2C dispatch");
     test_check(g_cap.captured_op_count == 2,
                "block_read: emits exactly two I2C operations");
@@ -382,7 +382,7 @@ test_write_rejects_oversized(void)
 
     uint8_t big[AXL_SMBUS_BLOCK_MAX + 1];
     int rc = axl_smbus_write_block(s, 0x10, 0x02, big, sizeof(big));
-    test_check(rc == -1,
+    test_check(rc == AXL_ERR,
                "axl_smbus_write_block: rejects len > AXL_SMBUS_BLOCK_MAX");
     test_check(g_cap.call_count == 0,
                "axl_smbus_write_block: no dispatch on overflow");
@@ -411,7 +411,7 @@ test_read_clamps_to_caller_capacity(void)
     uint8_t out[8];                    // smaller than the claimed count
     size_t  out_len = sizeof(out);
     int rc = axl_smbus_read_block(s, 0x10, 0x03, out, &out_len);
-    test_check(rc == 0, "axl_smbus_read_block (short/bogus): returns 0");
+    test_check(rc == AXL_OK, "axl_smbus_read_block (short/bogus): returns 0");
     test_check(out_len == sizeof(out),
                "axl_smbus_read_block: clamps to caller's capacity");
 }
@@ -429,7 +429,7 @@ test_write_propagates_error(void)
 
     uint8_t p = 0x55;
     int rc = axl_smbus_write_block(s, 0x10, 0x02, &p, 1);
-    test_check(rc == -1,
+    test_check(rc == AXL_ERR,
                "axl_smbus_write_block: returns -1 on StartRequest error");
 }
 
@@ -446,9 +446,9 @@ test_null_safety(void)
     // (The error path is cheap to test and is the typical way a
     // consumer misuses the API.)
     //
-    test_check(axl_smbus_read_block(NULL, 0x10, 0x03, buf, &len) == -1,
+    test_check(axl_smbus_read_block(NULL, 0x10, 0x03, buf, &len) == AXL_ERR,
                "axl_smbus_read_block: rejects NULL session");
-    test_check(axl_smbus_write_block(NULL, 0x10, 0x02, buf, 1) == -1,
+    test_check(axl_smbus_write_block(NULL, 0x10, 0x02, buf, 1) == AXL_ERR,
                "axl_smbus_write_block: rejects NULL session");
 
     test_check(axl_smbus_transport(NULL) == AXL_SMBUS_TRANSPORT_UNKNOWN,

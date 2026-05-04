@@ -50,7 +50,7 @@ axl_inet_address_new_from_string(const char *str)
         return NULL;
     }
 
-    if (axl_ipv4_parse(str, addr->addr) != 0) {
+    if (axl_ipv4_parse(str, addr->addr) != AXL_OK) {
         axl_debug("invalid IPv4 address: %s", str);
         axl_free(addr);
         return NULL;

@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,7 +111,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlConfig, axl_config_free)
  * offsetof (if descriptor has offset). Stores the string value
  * internally for later retrieval.
  *
- * @return 0 on success, -1 on unknown key, type mismatch, or
+ * @return AXL_OK on success, AXL_ERR on unknown key, type mismatch, or
  *     callback rejection.
  */
 int
@@ -133,7 +134,7 @@ axl_config_set(
  *     NULL);
  * @endcode
  *
- * @return 0 on success, -1 on first error.
+ * @return AXL_OK on success, AXL_ERR on first error.
  */
 int
 axl_config_setv(

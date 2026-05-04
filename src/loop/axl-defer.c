@@ -35,7 +35,7 @@ axl_defer(
     entry.id        = loop->defer_next_id;
     entry.cancelled = false;
 
-    if (axl_ring_buf_push_elem(&loop->defer_ring, &entry) != 0)
+    if (axl_ring_buf_push_elem(&loop->defer_ring, &entry) != AXL_OK)
     {
         axl_warning("defer queue full");
         return 0;
@@ -65,7 +65,7 @@ axl_defer_cancel(
 
     count = axl_ring_buf_get_length(&loop->defer_ring);
     for (i = 0; i < count; i++) {
-        if (axl_ring_buf_peek_nth_elem(&loop->defer_ring, i, &entry) != 0) {
+        if (axl_ring_buf_peek_nth_elem(&loop->defer_ring, i, &entry) != AXL_OK) {
             continue;
         }
 
@@ -96,7 +96,7 @@ axl_defer_drain_internal(AxlLoop *loop)
 
     count = axl_ring_buf_get_length(&loop->defer_ring);
     for (i = 0; i < count; i++) {
-        if (axl_ring_buf_pop_elem(&loop->defer_ring, &entry) != 0)
+        if (axl_ring_buf_pop_elem(&loop->defer_ring, &entry) != AXL_OK)
         {
             break;
         }

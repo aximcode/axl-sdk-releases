@@ -40,6 +40,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,7 +105,7 @@ axl_boot_option_free(
  * Populates @p out with description, device-path text (if obtainable)
  * and any opt_data. The caller frees with axl_boot_option_free().
  *
- * @return 0 on success, -1 if the variable is missing or malformed.
+ * @return AXL_OK on success, AXL_ERR if the variable is missing or malformed.
  */
 int
 axl_boot_option_get(
@@ -120,7 +121,7 @@ axl_boot_option_get(
  * service (DevicePathFromText on UEFI); on backends without one,
  * returns -1.
  *
- * @return 0 on success, -1 on encode or write failure.
+ * @return AXL_OK on success, AXL_ERR on encode or write failure.
  */
 int
 axl_boot_option_set(
@@ -131,7 +132,7 @@ axl_boot_option_set(
 /**
  * @brief Delete a Boot#### option.
  *
- * @return 0 on success (or if the variable already absent), -1 on error.
+ * @return AXL_OK on success (or if the variable already absent), AXL_ERR on error.
  */
 int
 axl_boot_option_delete(
@@ -148,7 +149,7 @@ axl_boot_option_delete(
  * Allocates an array of Boot#### indices in firmware order. Caller
  * frees @c *out with axl_free().
  *
- * @return 0 on success, -1 if BootOrder is absent or malformed.
+ * @return AXL_OK on success, AXL_ERR if BootOrder is absent or malformed.
  */
 int
 axl_boot_order_get(
@@ -159,7 +160,7 @@ axl_boot_order_get(
 /**
  * @brief Write the BootOrder variable.
  *
- * @return 0 on success, -1 on write failure.
+ * @return AXL_OK on success, AXL_ERR on write failure.
  */
 int
 axl_boot_order_set(
@@ -174,7 +175,7 @@ axl_boot_order_set(
 /**
  * @brief Read the BootNext one-shot override.
  *
- * @return 0 on success, -1 if BootNext is unset.
+ * @return AXL_OK on success, AXL_ERR if BootNext is unset.
  */
 int
 axl_boot_next_get(
@@ -187,7 +188,7 @@ axl_boot_next_get(
  * Firmware will boot @p index on the next reboot, then automatically
  * delete BootNext.
  *
- * @return 0 on success, -1 on write failure.
+ * @return AXL_OK on success, AXL_ERR on write failure.
  */
 int
 axl_boot_next_set(
@@ -197,7 +198,7 @@ axl_boot_next_set(
 /**
  * @brief Clear the BootNext one-shot override.
  *
- * @return 0 on success (or if BootNext already absent), -1 on error.
+ * @return AXL_OK on success (or if BootNext already absent), AXL_ERR on error.
  */
 int
 axl_boot_next_clear(
@@ -210,7 +211,7 @@ axl_boot_next_clear(
  * BootCurrent is set by firmware to the Boot#### index that the
  * current boot used. Useful for "which entry got us here" reporting.
  *
- * @return 0 on success, -1 if BootCurrent is absent.
+ * @return AXL_OK on success, AXL_ERR if BootCurrent is absent.
  */
 int
 axl_boot_current_get(

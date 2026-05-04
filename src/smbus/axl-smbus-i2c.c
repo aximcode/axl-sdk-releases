@@ -115,7 +115,7 @@ i2c_write_block(void *vctx,
                                 i2c, (UINTN)slave,
                                 (EFI_I2C_REQUEST_PACKET *)&pkt,
                                 NULL, NULL);
-    return EFI_ERROR(s) ? -1 : 0;
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
 static int
@@ -182,7 +182,7 @@ i2c_write_byte(void *vctx,
                                 i2c, (UINTN)slave,
                                 (EFI_I2C_REQUEST_PACKET *)&pkt,
                                 NULL, NULL);
-    return EFI_ERROR(s) ? -1 : 0;
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
 static void
@@ -202,18 +202,18 @@ int
 axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
 {
     if (ops == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     EFI_I2C_MASTER_PROTOCOL *i2c  = NULL;
     EFI_GUID                 guid = EFI_I2C_MASTER_PROTOCOL_GUID;
     EFI_STATUS s = gBS->LocateProtocol(&guid, NULL, (VOID **)&i2c);
     if (EFI_ERROR(s) || i2c == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (i2c->StartRequest == NULL) {
         axl_warning("EFI_I2C_MASTER_PROTOCOL found but StartRequest is NULL");
-        return -1;
+        return AXL_ERR;
     }
 
     ops->kind        = AXL_SMBUS_TRANSPORT_I2C;
@@ -223,5 +223,5 @@ axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
     ops->write_byte  = i2c_write_byte;
     ops->close       = i2c_close;
     ops->ctx         = i2c;
-    return 0;
+    return AXL_OK;
 }

@@ -111,7 +111,7 @@ axl_loop_new_impl(const char *file, int line)
     /* Poll timer for periodic deferred-work draining and (if no shell)
        Ctrl-C detection.  When the shell is available, the break event
        gives immediate Ctrl-C response without polling. */
-    if (axl_backend_event_create_timer(&loop->poll_timer) != 0) {
+    if (axl_backend_event_create_timer(&loop->poll_timer) != AXL_OK) {
         axl_error("failed to create poll timer");
         axl_free(loop);
         return NULL;
@@ -340,7 +340,7 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         }
 
         if (axl_backend_event_wait(event_count, event_array,
-                                   &fired_index) != 0) {
+                                   &fired_index) != AXL_OK) {
             return 1;
         }
 
@@ -357,7 +357,7 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         if (event_to_source[fired_index] == (size_t)-3) {
             uint16_t scan = 0, uni = 0;
             uint32_t shift = 0;
-            if (axl_backend_console_read_key_ex(&scan, &uni, &shift) == 0) {
+            if (axl_backend_console_read_key_ex(&scan, &uni, &shift) == AXL_OK) {
                 if (uni == 0x03 && shift == 0) {
                     _axl_signal_on_break();
                     axl_loop_quit(loop);
@@ -425,7 +425,7 @@ axl_loop_dispatch_event(AxlLoop *loop)
         uint32_t shift = 0;
         if (axl_backend_console_read_key_ex(&akey.scan_code,
                                             &akey.unicode_char,
-                                            &shift) != 0) {
+                                            &shift) != AXL_OK) {
             return;
         }
         if (akey.unicode_char == 0x03 && shift == 0) {
@@ -522,13 +522,13 @@ axl_loop_add_timer(AxlLoop *loop, uint32_t interval_ms,
         return 0;
     }
 
-    if (axl_backend_event_create_timer(&event) != 0) {
+    if (axl_backend_event_create_timer(&event) != AXL_OK) {
         axl_error("failed to create timer event");
         return 0;
     }
 
     if (axl_backend_event_set_timer(event, AXL_TIMER_PERIODIC,
-                                    interval_ms * MS_TO_100NS) != 0) {
+                                    interval_ms * MS_TO_100NS) != AXL_OK) {
         axl_error("failed to set timer");
         axl_backend_event_close(event);
         return 0;
@@ -547,13 +547,13 @@ axl_loop_add_timeout(AxlLoop *loop, uint32_t delay_ms,
         return 0;
     }
 
-    if (axl_backend_event_create_timer(&event) != 0) {
+    if (axl_backend_event_create_timer(&event) != AXL_OK) {
         axl_error("failed to create timeout event");
         return 0;
     }
 
     if (axl_backend_event_set_timer(event, AXL_TIMER_RELATIVE,
-                                    delay_ms * MS_TO_100NS) != 0) {
+                                    delay_ms * MS_TO_100NS) != AXL_OK) {
         axl_error("failed to set timeout");
         axl_backend_event_close(event);
         return 0;
@@ -596,13 +596,13 @@ axl_loop_add_protocol_notify(AxlLoop *loop, void *guid,
         return 0;
     }
 
-    if (axl_backend_event_create(&event) != 0) {
+    if (axl_backend_event_create(&event) != AXL_OK) {
         axl_error("failed to create protocol notify event");
         return 0;
     }
 
     if (axl_backend_event_register_protocol_notify(guid, event,
-                                                   &registration) != 0) {
+                                                   &registration) != AXL_OK) {
         axl_error("failed to register protocol notify");
         axl_backend_event_close(event);
         return 0;

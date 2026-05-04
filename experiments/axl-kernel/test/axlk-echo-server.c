@@ -109,7 +109,7 @@ main(int argc, char **argv)
     /* Bring up networking via DHCP before the kernel starts.
      * axl_net_auto_init is idempotent and safe even if startup.nsh
      * already ran ifconfig. */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("FAIL: network not available\n");
         return 1;
     }

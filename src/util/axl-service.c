@@ -125,12 +125,12 @@ axl_service_find(
     EFI_STATUS      status;
 
     if (name == NULL || interface == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->LocateProtocol(
@@ -140,7 +140,7 @@ axl_service_find(
         axl_debug("service '%s' not found", name);
     }
 
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -157,12 +157,12 @@ axl_service_enumerate(
     EFI_HANDLE     *buf = NULL;
 
     if (name == NULL || handles == NULL || count == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->LocateHandleBuffer(
@@ -175,7 +175,7 @@ axl_service_enumerate(
     if (EFI_ERROR(status) || buf == NULL) {
         *handles = NULL;
         *count = 0;
-        return (status == EFI_NOT_FOUND) ? 0 : -1;
+        return (status == EFI_NOT_FOUND) ? AXL_OK : AXL_ERR;
     }
 
     /* LocateHandleBuffer allocates with gBS->AllocatePool, not axl_malloc.
@@ -184,14 +184,14 @@ axl_service_enumerate(
         axl_backend_free(buf);
         *handles = NULL;
         *count = 0;
-        return -1;
+        return AXL_ERR;
     }
     void **copy = (void **)axl_malloc(buf_size * sizeof(void *));
     if (copy == NULL) {
         axl_backend_free(buf);
         *handles = NULL;
         *count = 0;
-        return -1;
+        return AXL_ERR;
     }
     for (size_t i = 0; i < buf_size; i++) {
         copy[i] = (void *)buf[i];
@@ -200,7 +200,7 @@ axl_service_enumerate(
 
     *handles = copy;
     *count = (size_t)buf_size;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -215,12 +215,12 @@ axl_service_register(
     EFI_STATUS      status;
 
     if (name == NULL || interface == NULL || handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->InstallProtocolInterface(
@@ -229,7 +229,7 @@ axl_service_register(
         EFI_NATIVE_INTERFACE,
         interface);
 
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -249,7 +249,7 @@ axl_service_register_multiple(
     EFI_STATUS status;
 
     if (handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Collect name/interface pairs */
@@ -268,12 +268,12 @@ axl_service_register_multiple(
         void *iface = va_arg(ap, void *);
         if (iface == NULL || count >= 8) {
             va_end(ap);
-            return -1;
+            return AXL_ERR;
         }
         const EFI_GUID *g = axl_service_lookup_guid(name, &fallbacks[count]);
         if (g == NULL) {
             va_end(ap);
-            return -1;
+            return AXL_ERR;
         }
         axl_memcpy(&guids[count], g, sizeof(EFI_GUID));
         ifaces[count] = iface;
@@ -282,7 +282,7 @@ axl_service_register_multiple(
     va_end(ap);
 
     if (count == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Install all protocols. Use individual InstallProtocolInterface calls
@@ -299,11 +299,11 @@ axl_service_register_multiple(
                 axl_bs()->UninstallProtocolInterface(
                     *((EFI_HANDLE *)handle), &guids[j], ifaces[j]);
             }
-            return -1;
+            return AXL_ERR;
         }
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -318,12 +318,12 @@ axl_service_unregister(
     EFI_STATUS      status;
 
     if (handle == NULL || name == NULL || interface == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->UninstallProtocolInterface(
@@ -331,5 +331,5 @@ axl_service_unregister(
         (EFI_GUID *)guid,
         interface);
 
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }

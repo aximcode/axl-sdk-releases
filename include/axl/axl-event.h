@@ -169,10 +169,10 @@ axl_event_handle(
  * signalled cancellable. Equivalent to
  * axl_event_wait_timeout(e, cancel, 0).
  *
- * @return 0 on signal, -1 on invalid arg, AXL_CANCELLED on Ctrl-C
- *     or cancel.
+ * @return AXL_OK on signal, AXL_ERR on invalid arg, AXL_CANCELLED
+ *     on Ctrl-C or cancel.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_event_wait(
     AxlEvent       *e,      ///< event
     AxlCancellable *cancel  ///< optional cancel token (NULL = only Ctrl-C)
@@ -184,10 +184,10 @@ axl_event_wait(
  * The CPU idles between events. A @a timeout_us of 0 means wait
  * forever. Returns early on Ctrl-C or a signalled cancellable.
  *
- * @return 0 on signal, -1 on timeout or invalid arg, AXL_CANCELLED
- *     on Ctrl-C or cancel.
+ * @return AXL_OK on signal, AXL_TIMEOUT on deadline, AXL_ERR on
+ *     invalid arg, AXL_CANCELLED on Ctrl-C or cancel.
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_event_wait_timeout(
     AxlEvent       *e,          ///< event
     AxlCancellable *cancel,     ///< optional cancel token

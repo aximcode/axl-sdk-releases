@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 
 // ===================================================================
 // UEFI types and table pointers
@@ -110,7 +111,7 @@ typedef struct {
 /**
  * @brief Get the current date/time from firmware.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_get_time(
@@ -127,7 +128,7 @@ axl_backend_get_time(
  * Platform-specific. On x86 this issues `in`; on AARCH64 the call
  * returns -1 and leaves @a *value untouched (no port I/O on ARM).
  *
- * @return 0 on success, -1 if port I/O is not available on this arch.
+ * @return AXL_OK on success, AXL_ERR if port I/O is not available on this arch.
  */
 int
 axl_backend_io_read8(
@@ -141,7 +142,7 @@ axl_backend_io_read8(
  * Platform-specific. On x86 this issues `out`; on AARCH64 the call
  * returns -1 without side effects.
  *
- * @return 0 on success, -1 if port I/O is not available on this arch.
+ * @return AXL_OK on success, AXL_ERR if port I/O is not available on this arch.
  */
 int
 axl_backend_io_write8(
@@ -167,7 +168,7 @@ typedef void *AxlFileHandle;
 /**
  * @brief Open a file by UCS-2 path.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_open(
@@ -180,7 +181,7 @@ axl_backend_file_open(
 /**
  * @brief Close a file handle. NULL-safe.
  *
- * @return 0 on success.
+ * @return AXL_OK on success.
  */
 int
 axl_backend_file_close(
@@ -190,7 +191,7 @@ axl_backend_file_close(
 /**
  * @brief Read from a file.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_read(
@@ -202,7 +203,7 @@ axl_backend_file_read(
 /**
  * @brief Write to a file.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_write(
@@ -214,7 +215,7 @@ axl_backend_file_write(
 /**
  * @brief Get current file position.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_get_position(
@@ -225,7 +226,7 @@ axl_backend_file_get_position(
 /**
  * @brief Set file position.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_set_position(
@@ -236,7 +237,7 @@ axl_backend_file_set_position(
 /**
  * @brief Delete a file by UCS-2 path.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_delete(
@@ -268,7 +269,7 @@ axl_backend_file_is_dir(
  *
  * Opens the file, queries EFI_FILE_INFO, closes.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_stat(
@@ -282,7 +283,7 @@ axl_backend_file_stat(
 /**
  * @brief Rename a file by path.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_rename(
@@ -293,7 +294,7 @@ axl_backend_file_rename(
 /**
  * @brief Create a directory by path.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_mkdir(
@@ -303,7 +304,7 @@ axl_backend_file_mkdir(
 /**
  * @brief Remove an empty directory by path.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_file_rmdir(
@@ -327,7 +328,7 @@ axl_backend_shell_getenv(
 /**
  * @brief Set a shell environment variable.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_shell_setenv(
@@ -382,7 +383,7 @@ axl_backend_shell_getcwd(void);
 /**
  * @brief Change the current working directory.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_shell_chdir(
@@ -392,7 +393,7 @@ axl_backend_shell_chdir(
 /**
  * @brief Execute a shell command string.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_shell_execute(
@@ -473,7 +474,7 @@ axl_backend_wcsstr(
  * Creates an EVT_TIMER event at TPL_APPLICATION with no notify.
  * Use axl_backend_event_set_timer to configure the timer.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_event_create_timer(
@@ -486,7 +487,7 @@ axl_backend_event_create_timer(
  * Creates a plain event (type 0) at TPL_APPLICATION with no notify.
  * Used for protocol notifications and non-blocking AP dispatch.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_event_create(
@@ -517,7 +518,7 @@ axl_backend_event_close_dbg(
  *
  * @param type  AXL_TIMER_PERIODIC, AXL_TIMER_RELATIVE, or AXL_TIMER_CANCEL
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_event_set_timer(
@@ -529,7 +530,7 @@ axl_backend_event_set_timer(
 /**
  * @brief Wait for one of several events to fire (blocking).
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_event_wait(
@@ -551,7 +552,7 @@ axl_backend_event_check(
 /**
  * @brief Register for protocol install notification.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_event_register_protocol_notify(
@@ -579,7 +580,7 @@ axl_backend_console_wait_for_key(
 /**
  * @brief Read a keystroke from ConIn.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_console_read_key(
@@ -596,7 +597,7 @@ axl_backend_console_read_key(
  * serial consoles deliver — TerminalDxe carries no shift bits over
  * the wire — so a 0 result there is correct, not lossy.
  *
- * @return 0 on success, -1 on error or no key available.
+ * @return AXL_OK on success, AXL_ERR on error or no key available.
  */
 int
 axl_backend_console_read_key_ex(
@@ -671,7 +672,7 @@ axl_backend_mp_init(
 /**
  * @brief Dispatch a worker procedure on an AP (non-blocking).
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_backend_mp_start_ap(

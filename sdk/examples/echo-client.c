@@ -61,7 +61,7 @@ main(int argc, char **argv)
     const char *msg     = (argc >= 4) ? argv[3] : DEFAULT_MESSAGE;
     size_t      msg_len = axl_strlen(msg);
 
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("error: network not available\n");
         return 1;
     }
@@ -70,13 +70,13 @@ main(int argc, char **argv)
     AXL_AUTOPTR(AxlSocket)       sock   = NULL;
 
     axl_printf("connecting to %s:%u\n", host, (unsigned)port);
-    if (axl_socket_client_connect_to_host(client, host, port, &sock) != 0) {
+    if (axl_socket_client_connect_to_host(client, host, port, &sock) != AXL_OK) {
         axl_printf("error: connect failed\n");
         return 1;
     }
     axl_printf("connected\n");
 
-    if (axl_socket_send(sock, msg, msg_len, 5000) != 0) {
+    if (axl_socket_send(sock, msg, msg_len, 5000) != AXL_OK) {
         axl_printf("error: send failed\n");
         return 1;
     }
@@ -84,7 +84,7 @@ main(int argc, char **argv)
 
     char   buf[512];
     size_t size = sizeof(buf) - 1;
-    if (axl_socket_receive(sock, buf, &size, 5000) != 0) {
+    if (axl_socket_receive(sock, buf, &size, 5000) != AXL_OK) {
         axl_printf("error: receive failed\n");
         return 1;
     }

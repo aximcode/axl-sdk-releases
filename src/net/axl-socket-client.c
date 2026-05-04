@@ -60,22 +60,22 @@ axl_socket_client_connect(AxlSocketClient *client, AxlSocketAddress *addr,
     (void)client;
 
     if (addr == NULL || out_sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     sock = axl_socket_new(AXL_SOCKET_STREAM);
     if (sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_socket_connect(sock, addr);
     if (rc != 0) {
         axl_socket_free(sock);
-        return -1;
+        return AXL_ERR;
     }
 
     *out_sock = sock;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -89,23 +89,23 @@ axl_socket_client_connect_to_host(AxlSocketClient *client, const char *host,
     (void)client;
 
     if (host == NULL || out_sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Resolve hostname (or parse dotted-decimal) */
-    if (axl_net_resolve(host, &ipv4) != 0) {
+    if (axl_net_resolve(host, &ipv4) != AXL_OK) {
         axl_warning("socket_client: DNS resolve failed for '%s'", host);
-        return -1;
+        return AXL_ERR;
     }
 
     inet = axl_inet_address_new_from_bytes(ipv4.addr);
     if (inet == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     sa = axl_socket_address_new(inet, port);
     if (sa == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     int rc = axl_socket_client_connect(client, sa, out_sock);

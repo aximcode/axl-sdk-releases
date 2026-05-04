@@ -1,6 +1,9 @@
 # AXL Network Driver Bundle — v0.6.0 Design
 
-Status: **Prototype validated 2026-04-29**, target release v0.6.0.
+Status: **Shipped in v0.6.0** (tag dd3c4e2, 2026-04-29). This doc is
+the as-built record. Real-hardware validation against firmware
+without native NIC drivers is still pending — QEMU coverage is the
+only validation to date.
 
 ## Problem
 
@@ -41,7 +44,8 @@ axl-sdk-tools-x64.tar.gz
 │   └── ipxe-all.efidrv         # universal iPXE NIC driver (GPL-2.0+)
 ├── third_party/
 │   ├── edk2/{LICENSE,README.md}
-│   └── ipxe/{LICENSE,README.md}
+│   ├── ipxe/{COPYING,COPYING.GPLv2,COPYING.UBDL,README.md}
+│   └── mbedtls/LICENSE
 └── README.txt                  # explains drivers/ layout
 ```
 
@@ -69,7 +73,7 @@ exact commit hash, or a companion source tarball).
 | `UsbCdcEcm.efi` | 7.5 KB | BSD-2-Clause-Patent | EDK2 `MdeModulePkg/Bus/Usb/UsbNetwork/UsbCdcEcm` |
 | `UsbCdcNcm.efi` | 8.2 KB | BSD-2-Clause-Patent | EDK2 `MdeModulePkg/Bus/Usb/UsbNetwork/UsbCdcNcm` |
 | `UsbRndis.efi` | 12 KB | BSD-2-Clause-Patent | EDK2 `MdeModulePkg/Bus/Usb/UsbNetwork/UsbRndis` |
-| `ipxe-all.efidrv` | ~500–800 KB | GPL-2.0+ | iPXE master, `ALL_DRIVERS=1` build |
+| `ipxe-all.efidrv` | ~1.1 MB | GPL-2.0+ | iPXE pinned commit `df4eec8c`, `ALL_DRIVERS=1` build |
 
 **Excluded** (proprietary, license review pain not worth it):
 `RtkUndiDxe.efi`, `RtkUsbUndiDxe.efi`, `AsixUsbUndiDxe.efi`. iPXE
@@ -162,12 +166,11 @@ the boot disk image. (`--mount` becomes the cleaner choice on
 firmware that includes `VirtioFsDxe`, or once a standalone
 `VirtioFsDxe.efi` ships in our host-tools tarball.)
 
-## Open SDK fixes (gated by v0.6.0 release)
+## Implementation notes — three SDK fixes the bundle required
 
-Two issues surfaced during prototyping that need to land before
-v0.6.0 ships. Neither blocks the bundle design — but both are
-required for the bundle to actually work without manual `load`
-gymnastics from a startup.nsh.
+Three issues surfaced during prototyping. All shipped in v0.6.0;
+notes preserved here because they explain why the code is shaped
+the way it is.
 
 ### 1. `axl_driver_load` must load via DevicePath, not memory buffer
 
@@ -200,9 +203,16 @@ A previously-tried workaround — load from buffer then patch
 satisfy iPXE; it likely walks for a parent volume node. Real
 device-path load is required.
 
-~50–80 lines of code; tests in QEMU should pass once this lands.
+Shipped in [ad24077](https://github.com/aximcode/axl-sdk/commit/ad24077).
 
-### 2. netinfo diagnostic must walk past the SnpDxe wrapper
+### 2. `axl_driver_connect(NULL)` must enumerate-and-connect
+
+`gBS->ConnectController(NULL,...)` returns `EFI_INVALID_PARAMETER`
+per spec, so the obvious "connect everything" call was a silent
+no-op. Reworked to enumerate handles and connect each, mirroring
+UEFI shell's `connect -r`.
+
+### 3. netinfo diagnostic must walk past the SnpDxe wrapper
 
 The current `-v` output reports the agent that opened the SNP
 handle BY_DRIVER. With iPXE driving the NIC, the chain is:
@@ -221,42 +231,25 @@ when the actual NIC-binding driver is iPXE.
 and report that agent's image path instead of (or alongside) the
 SNP-installing one. The NII installer is the actual NIC driver.
 
-## v0.6.0 work breakdown
+## Build and packaging
 
-Status as of 2026-04-29 (in working tree, uncommitted):
+- **iPXE build script** — [`scripts/build-ipxe.sh`](../scripts/build-ipxe.sh)
+  clones iPXE at pinned commit `df4eec8c` and builds the universal
+  `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB, ~2.9k chip IDs on x64).
+  Reproducible (~35s wall on 16-thread).
+- **Packaging** — `release.yml` and `build-packages.sh` build iPXE
+  in CI, stage `drivers/<arch>/` with `ipxe-all.efidrv` plus auxiliary
+  USB-network drivers (kept for firmware that benefits from them —
+  see `third_party/edk2/README.md`), and carry
+  `third_party/{edk2,ipxe,mbedtls}/...` attribution. THIRD_PARTY.md
+  reflects the bundle.
 
-1. ✅ **`axl_driver_load` DevicePath rework** — done; loads via
-   the volume's full DP + MEDIA_FILEPATH_DP, with memory-buffer
-   fallback for drivers that don't read FilePath. iPXE now starts
-   cleanly via `axl_net_ensure_drivers` (was returning
-   EFI_INVALID_PARAMETER).
-2. ✅ **`axl_driver_connect(NULL)` enumerate-and-connect** — fixes
-   the silent no-op where `gBS->ConnectController(NULL,...)`
-   returns EFI_INVALID_PARAMETER per spec. Now mirrors UEFI shell's
-   `connect -r`.
-3. ✅ **netinfo diagnostic walks NII layer** — `-v` output surfaces
-   the actual NIC-binding driver image (e.g.
-   `\drivers\x64\ipxe-all.efidrv`) instead of the SnpDxe wrapper.
-   NII3.1 → NII (legacy) → SNP fallback chain.
-4. ✅ **iPXE build script** — [`scripts/build-ipxe.sh`](../scripts/build-ipxe.sh)
-   clones iPXE at pinned commit `df4eec8c` and builds the universal
-   `bin-<arch>-efi/ipxe.efidrv` (~1.1 MB, ~2.9k chip IDs on x64).
-   Reproducible (35s wall on 16-thread). Validated against e1000,
-   e1000e, rtl8139, pcnet under `--nic-no-rom`.
-5. ✅ **Packaging wired** — `release.yml` and `build-packages.sh`
-   build iPXE in CI, stage `drivers/<arch>/` with `ipxe-all.efidrv`
-   plus a small set of auxiliary USB-network drivers (kept for
-   compat with firmware that benefits from them — see
-   `third_party/edk2/README.md`), and carry
-   `third_party/{edk2,ipxe,mbedtls}/...` attribution.
-   THIRD_PARTY.md updated.
+## Outstanding
 
-Pending:
-
-7. **Tag v0.6.0**, update CHANGELOG, push.
-8. **Validate on real hardware** — loaner with a NIC OVMF doesn't
-   natively support (the 2010-era OEM EDK1 firmware referenced
-   above qualifies; another option is a Realtek-only PC).
+- **Real-hardware validation** — needs a loaner with a NIC OVMF
+  doesn't natively support (the 2010-era OEM EDK1 firmware referenced
+  above qualifies; another option is a Realtek-only PC). Not yet
+  done as of v0.11.2.
 
 ## Final consumer-flow validation
 
@@ -295,8 +288,7 @@ These were added during prototyping and are useful independently:
 - [`scripts/run-qemu.sh`](../scripts/run-qemu.sh): `--nic-model
   MODEL`, `--nic-no-rom`, and `--extra SRC:DEST` (relative-path
   staging into the boot disk).
-- [`tools/netinfo.c`](../tools/netinfo.c): `-v` now prints a "NIC
+- [`tools/netinfo.c`](../tools/netinfo.c): `-v` prints a "NIC
   Drivers" section identifying the driver image bound to each SNP
-  handle, and raises log level so `axl_net_ensure_drivers` debug
-  surfaces. Note: per "fix 2" above this output is correct but
-  one layer too high until the NII walk is added.
+  handle (walks NII3.1 → NII → SNP per fix 3 above), and raises
+  log level so `axl_net_ensure_drivers` debug surfaces.

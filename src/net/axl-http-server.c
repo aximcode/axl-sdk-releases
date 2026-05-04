@@ -12,7 +12,7 @@
 
 AXL_LOG_DOMAIN("http");
 
-static bool on_accept_ready(AxlTcp *client, int status, void *data);
+static bool on_accept_ready(AxlTcp *client, AxlStatus status, void *data);
 
 // ---------------------------------------------------------------------------
 // Configuration descriptors
@@ -150,20 +150,20 @@ static int
 allocate_conns(AxlHttpServer *s)
 {
     if (s->conns != NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     s->conns = axl_calloc(s->max_conns, sizeof(HttpConn));
     if (s->conns == NULL) {
         axl_error("failed to allocate %zu connection slots", s->max_conns);
-        return -1;
+        return AXL_ERR;
     }
 
     for (size_t i = 0; i < s->max_conns; i++) {
         s->conns[i].server = s;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,13 +174,13 @@ int
 axl_http_server_set(AxlHttpServer *s, const char *key, const char *value)
 {
     if (s == NULL || key == NULL || value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Guard: can't change max.connections after listener started */
     if (axl_streql(key, "max.connections") && s->conns != NULL) {
         axl_warning("cannot change max.connections after server started");
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_config_set(s->config, key, value);
@@ -228,12 +228,12 @@ int
 axl_http_server_use_auth(AxlHttpServer *s, AxlAuthCallback cb, void *data)
 {
     if (s == NULL || cb == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     s->auth_cb = cb;
     s->auth_data = data;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,25 +250,25 @@ axl_http_server_use_tls(
     )
 {
     if (s == NULL || cert_der == NULL || key_der == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (!axl_tls_available()) {
         axl_warning("TLS not available (build with AXL_TLS=1)");
-        return -1;
+        return AXL_ERR;
     }
 
-    if (axl_tls_init() != 0) {
-        return -1;
+    if (axl_tls_init() != AXL_OK) {
+        return AXL_ERR;
     }
 
-    if (axl_tls_server_set_cert(cert_der, cert_len, key_der, key_len) != 0) {
-        return -1;
+    if (axl_tls_server_set_cert(cert_der, cert_len, key_der, key_len) != AXL_OK) {
+        return AXL_ERR;
     }
 
     s->tls_enabled = true;
     axl_info("TLS enabled on port %u", (unsigned)s->port);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,22 +279,22 @@ int
 axl_http_server_attach(AxlHttpServer *s, AxlLoop *loop)
 {
     if (s == NULL || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
     // Allocate connection pool (deferred so SetMaxConnections takes effect)
     //
     if (allocate_conns(s) != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
     // Start listener if not already
     //
     if (s->listener == NULL) {
-        if (axl_tcp_listen(s->port, &s->listener) != 0) {
-            return -1;
+        if (axl_tcp_listen(s->port, &s->listener) != AXL_OK) {
+            return AXL_ERR;
         }
     }
 
@@ -309,11 +309,11 @@ axl_http_server_attach(AxlHttpServer *s, AxlLoop *loop)
     // TCP layer, so we only call this once.
     //
     if (axl_tcp_accept_async(s->listener, loop, NULL,
-                             on_accept_ready, s) != 0) {
-        return -1;
+                             on_accept_ready, s) != AXL_OK) {
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -322,17 +322,17 @@ axl_http_server_run(AxlHttpServer *s)
     AxlLoop *loop;
 
     if (s == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     loop = axl_loop_new();
     if (loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (axl_http_server_attach(s, loop) != 0) {
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
     {
@@ -349,15 +349,15 @@ axl_http_server_run(AxlHttpServer *s)
 
 static bool
 on_accept_ready(
-    AxlTcp  *client,
-    int      status,
-    void    *data
+    AxlTcp    *client,
+    AxlStatus  status,
+    void      *data
     )
 {
     AxlHttpServer *s = (AxlHttpServer *)data;
     uint16_t       remote_port;
 
-    if (status != 0 || client == NULL) {
+    if (status != AXL_OK || client == NULL) {
         /* Per-accept error — keep listening. */
         return true;
     }
@@ -415,7 +415,7 @@ on_accept_ready(
                     uint8_t hs_buf[4096];
                     size_t  hs_len = sizeof(hs_buf);
                     if (axl_tcp_recv(client, hs_buf,
-                                     &hs_len, 200) == 0 && hs_len > 0) {
+                                     &hs_len, 200) == AXL_OK && hs_len > 0) {
                         axl_tls_stage_data(tls, hs_buf, hs_len);
                     }
                     int rc = axl_tls_handshake(tls);

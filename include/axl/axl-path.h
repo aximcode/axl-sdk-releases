@@ -13,6 +13,7 @@
 #define AXL_PATH_H
 
 #include <stddef.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,7 +85,7 @@ axl_path_join(
  * If @p relative is absolute (starts with '/' or '\\'), @p base
  * is ignored. The output always uses '/' separators.
  *
- * @return 0 on success, -1 on error (NULL args, buffer too small,
+ * @return AXL_OK on success, AXL_ERR on error (NULL args, buffer too small,
  *     or ".." underflow past root).
  */
 int
@@ -168,7 +169,7 @@ axl_resolve_data_file(
  * backslashes. For example, axl_path_build_uefi("fs0", "/dir/file")
  * produces "fs0:\\dir\\file".
  *
- * @return 0 on success, -1 on error (NULL args or buffer too small).
+ * @return AXL_OK on success, AXL_ERR on error (NULL args or buffer too small).
  */
 int
 axl_path_build_uefi(
@@ -195,7 +196,7 @@ axl_get_current_dir(void);
 /**
  * @brief Change the current working directory.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_chdir(

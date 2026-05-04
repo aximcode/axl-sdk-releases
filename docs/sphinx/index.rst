@@ -45,7 +45,7 @@ AXL SDK
    modules/net
    modules/tls
    modules/sys
-   modules/stream-port
+   modules/port
    modules/boot
    modules/image
    modules/mem-phys

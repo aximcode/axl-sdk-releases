@@ -32,12 +32,13 @@
  *
  * A @a timeout_us of 0 means no timeout.
  *
- * Return convention matches the public wait helpers:
- *   0  — condition met or event fired
- *  -1  — timeout / allocation failure
- *  -2  — interrupted (Ctrl-C / shell break)
+ * Return convention matches the public wait helpers (@ref AxlStatus):
+ *   AXL_OK         — condition met or event fired
+ *   AXL_TIMEOUT    — timeout fired with condition not yet met
+ *   AXL_ERR        — allocation failure (no loop available)
+ *   AXL_CANCELLED  — interrupted (Ctrl-C / shell break / cancel token)
  */
-int
+AxlStatus
 _axl_event_wait_timeout_with_tick(
     AxlEventHandle  event,       ///< event handle to wake on (may be NULL)
     AxlCondFn       cond_fn,     ///< condition predicate (may be NULL)

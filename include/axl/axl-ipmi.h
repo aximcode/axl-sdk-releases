@@ -124,7 +124,7 @@ axl_ipmi_session_last_cc(
  * @a resp_len is in/out: on entry holds the buffer capacity; on
  * success receives the number of bytes actually written.
  *
- * @return 0 on success (transport completed the transaction;
+ * @return AXL_OK on success (transport completed the transaction;
  *     check @a resp[0] for the IPMI completion code). -1 on
  *     transport error or invalid arguments.
  */
@@ -247,7 +247,7 @@ int axl_ipmi_chassis_control(
  * exposed by this wrapper — callers that want the BMC default
  * pass interval_sec = 15 explicitly.
  *
- * @return 0 on CC 0x00, -1 on transport error or non-zero CC.
+ * @return AXL_OK on CC 0x00, AXL_ERR on transport error or non-zero CC.
  *     Last CC observable via axl_ipmi_session_last_cc().
  */
 int axl_ipmi_chassis_identify(
@@ -262,7 +262,7 @@ int axl_ipmi_chassis_identify(
  * Full BMC reboot. The BMC is unresponsive to further IPMI for
  * 20–30 seconds afterward; callers should plan a retry delay.
  *
- * @return 0 on success.
+ * @return AXL_OK on success.
  */
 int axl_ipmi_bmc_cold_reset(AxlIpmiSession *session);
 
@@ -272,7 +272,7 @@ int axl_ipmi_bmc_cold_reset(AxlIpmiSession *session);
  * Resets BMC state without full reboot. Not all BMCs implement this
  * — expect CC 0xC1 "Invalid command" on some platforms.
  *
- * @return 0 on success.
+ * @return AXL_OK on success.
  */
 int axl_ipmi_bmc_warm_reset(AxlIpmiSession *session);
 
@@ -337,7 +337,7 @@ int axl_ipmi_sdr_info(
  * are defined in the IPMI spec; callers decode the returned bytes
  * based on the SDR header's record type.
  *
- * @return 0 on success; @a *next_record_id receives the record id
+ * @return AXL_OK on success; @a *next_record_id receives the record id
  *     to pass on the next call (0xFFFF after the last record).
  */
 int axl_ipmi_sdr_get(
@@ -392,7 +392,7 @@ int axl_ipmi_fru_info(
  * @a len is in/out: buffer capacity on entry, bytes actually read
  * on return.
  *
- * @return 0 on success.
+ * @return AXL_OK on success.
  */
 int axl_ipmi_fru_read(
     AxlIpmiSession  *session,
@@ -474,7 +474,7 @@ typedef struct {
  *     state. Always succeeds (fields are zero-filled when the
  *     corresponding feature isn't present).
  *
- * @return 0 on success, -1 only on NULL argument.
+ * @return AXL_OK on success, AXL_ERR only on NULL argument.
  */
 int
 axl_ipmi_probe(

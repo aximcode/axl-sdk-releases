@@ -31,7 +31,7 @@ main(int argc, char **argv)
     }
 
     /* Initialize networking (DHCP) */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("Network not available\n");
         return 1;
     }
@@ -43,7 +43,7 @@ main(int argc, char **argv)
 
     axl_printf("Connecting to %s:%u...\n", host, (unsigned)port);
 
-    if (axl_socket_client_connect_to_host(client, host, port, &sock) != 0) {
+    if (axl_socket_client_connect_to_host(client, host, port, &sock) != AXL_OK) {
         axl_printf("Connect failed\n");
         return 1;
     }
@@ -53,14 +53,14 @@ main(int argc, char **argv)
     /* Send HTTP GET request */
     int n = axl_snprintf(request, sizeof(request),
         "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host);
-    if (axl_socket_send(sock, request, (size_t)n, 5000) != 0) {
+    if (axl_socket_send(sock, request, (size_t)n, 5000) != AXL_OK) {
         axl_printf("Send failed\n");
         return 1;
     }
 
     /* Receive response */
     resp_len = sizeof(response) - 1;
-    if (axl_socket_receive(sock, response, &resp_len, 5000) == 0) {
+    if (axl_socket_receive(sock, response, &resp_len, 5000) == AXL_OK) {
         response[resp_len] = '\0';
         axl_printf("Response (%zu bytes):\n%s\n", resp_len, response);
     } else {

@@ -18,7 +18,7 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (axl_file_get_contents(argv[1], &buf, &len) != 0) {
+    if (axl_file_get_contents(argv[1], &buf, &len) != AXL_OK) {
         axl_printf("error: cannot read '%s'\n", argv[1]);
         return 1;
     }

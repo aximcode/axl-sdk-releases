@@ -69,9 +69,11 @@ through the same `axl_malloc_impl`, one hook point catches them all.
 The injection logs at `axl_debug` level so it doesn't pollute the
 real-OOM error signal in test output.
 
-In release builds the hook is a no-op — the counter check is
-compiled out. Tests always build with `AXL_MEM_DEBUG` so they can
-rely on the hook being active.
+The hook is active in both DEBUG and RELEASE — the counter check
+is one well-predicted branch on the malloc path, cheap enough that
+production builds keep the contract too. The fence/leak-tracking
+machinery (alloc-fill, fences, alloc-list) stays DEBUG-only; only
+the fail-next-alloc counter is universal.
 
 ### RAII Auto-Cleanup
 

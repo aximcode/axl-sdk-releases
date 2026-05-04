@@ -244,9 +244,8 @@ axl_hash_table_new_full(
 
 /// Internal insert/replace with a flag controlling key behavior.
 /// keep_old_key=true is GLib "insert", keep_old_key=false is GLib "replace".
-/// Returns 1 if a NEW entry was added, 0 if an existing entry was replaced,
-/// -1 on allocation failure (also logged).
-static int
+/// Returns one of the AxlHashTableInsertResult values.
+static AxlHashTableInsertResult
 hash_table_insert_or_replace(
     AxlHashTable *h,
     const void   *key,
@@ -258,7 +257,7 @@ hash_table_insert_or_replace(
     hash_node *node;
 
     if (h == NULL || key == NULL) {
-        return -1;
+        return AXL_HASH_TABLE_ERR;
     }
 
     idx = h->hash_func(key) % h->bucket_count;
@@ -284,7 +283,7 @@ hash_table_insert_or_replace(
                 h->value_destroy(node->value);
             }
             node->value = value;
-            return 0;
+            return AXL_HASH_TABLE_REPLACED;
         }
     }
 
@@ -297,7 +296,7 @@ hash_table_insert_or_replace(
     node = axl_malloc(sizeof(hash_node));
     if (node == NULL) {
         axl_error("failed to allocate hash node");
-        return -1;
+        return AXL_HASH_TABLE_ERR;
     }
 
     if (h->copy_keys) {
@@ -305,7 +304,7 @@ hash_table_insert_or_replace(
         if (node->key == NULL) {
             axl_error("failed to allocate key copy");
             axl_free(node);
-            return -1;
+            return AXL_HASH_TABLE_ERR;
         }
     } else {
         node->key = (void *)key;
@@ -316,10 +315,10 @@ hash_table_insert_or_replace(
     h->buckets[idx] = node;
     h->entry_count++;
 
-    return 1;
+    return AXL_HASH_TABLE_NEW;
 }
 
-int
+AxlHashTableInsertResult
 axl_hash_table_insert(
     AxlHashTable *h,
     const void   *key,
@@ -329,7 +328,7 @@ axl_hash_table_insert(
     return hash_table_insert_or_replace(h, key, value, true);
 }
 
-int
+AxlHashTableInsertResult
 axl_hash_table_replace(
     AxlHashTable *h,
     const void   *key,

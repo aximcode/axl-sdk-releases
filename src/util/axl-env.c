@@ -49,7 +49,7 @@ axl_setenv(const char *name, const char *value, bool overwrite)
     int rc;
 
     if (name == NULL || value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (!overwrite) {
@@ -60,11 +60,11 @@ axl_setenv(const char *name, const char *value, bool overwrite)
                 "axl_setenv: OOM converting name '%s' to UCS-2 (existence check)",
                 name
                 );
-            return -1;
+            return AXL_ERR;
         }
         if (axl_backend_shell_getenv(wide_name) != NULL) {
             axl_free(wide_name);
-            return 0;  /* exists, don't overwrite */
+            return AXL_OK;  /* exists, don't overwrite */
         }
         axl_free(wide_name);
     }
@@ -72,14 +72,14 @@ axl_setenv(const char *name, const char *value, bool overwrite)
     wide_name = axl_utf8_to_ucs2(name);
     if (wide_name == NULL) {
         axl_warning("axl_setenv: OOM converting name '%s' to UCS-2", name);
-        return -1;
+        return AXL_ERR;
     }
 
     wide_value = axl_utf8_to_ucs2(value);
     if (wide_value == NULL) {
         axl_warning("axl_setenv: OOM converting value for '%s' to UCS-2", name);
         axl_free(wide_name);
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_shell_setenv(wide_name, wide_value, true);
@@ -95,13 +95,13 @@ axl_unsetenv(const char *name)
     int rc;
 
     if (name == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_name = axl_utf8_to_ucs2(name);
     if (wide_name == NULL) {
         axl_warning("axl_unsetenv: OOM converting name '%s' to UCS-2", name);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Setting to empty string removes the variable in UEFI Shell */

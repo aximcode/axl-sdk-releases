@@ -81,7 +81,7 @@ typedef struct {
  * the backing buffer. Pass a @p buf_free function to have deinit free
  * the buffer, or NULL if the caller manages the buffer lifetime.
  *
- * @return 0 on success, -1 if @p size is not a power of 2 or args NULL.
+ * @return AXL_OK on success, AXL_ERR if @p size is not a power of 2 or args NULL.
  */
 int
 axl_ring_buf_init(
@@ -98,7 +98,7 @@ axl_ring_buf_init(
  * Same as axl_ring_buf_init but enables Layer 3 element functions
  * (push_elem, pop_elem, peek_elem, peek_nth_elem, set_nth_elem).
  *
- * @return 0 on success, -1 if @p size is not a power of 2 or args NULL.
+ * @return AXL_OK on success, AXL_ERR if @p size is not a power of 2 or args NULL.
  */
 int
 axl_ring_buf_init_fixed(
@@ -299,7 +299,7 @@ axl_ring_buf_push_advance(
  * all-or-nothing in reject mode. In overwrite mode, the push
  * always succeeds but may corrupt the oldest message framing.
  *
- * @return 0 on success, -1 if not enough space.
+ * @return AXL_OK on success, AXL_ERR if not enough space.
  */
 int
 axl_ring_buf_push_msg(
@@ -314,7 +314,7 @@ axl_ring_buf_push_msg(
  * Consumes the length header and payload. If @p max_len is too
  * small for the message, returns -1 without consuming.
  *
- * @return 0 on success, -1 if no message or buffer too small.
+ * @return AXL_OK on success, AXL_ERR if no message or buffer too small.
  */
 int
 axl_ring_buf_pop_msg(
@@ -329,7 +329,7 @@ axl_ring_buf_pop_msg(
  *
  * Same as pop_msg but leaves the message in the buffer.
  *
- * @return 0 on success, -1 if no message or buffer too small.
+ * @return AXL_OK on success, AXL_ERR if no message or buffer too small.
  */
 int
 axl_ring_buf_peek_msg(
@@ -360,7 +360,7 @@ axl_ring_buf_peek_msg_size(
  * In reject mode, fails if insufficient space. In overwrite mode,
  * always succeeds by discarding the oldest data.
  *
- * @return 0 on success, -1 if not enough space or not in element mode.
+ * @return AXL_OK on success, AXL_ERR if not enough space or not in element mode.
  */
 int
 axl_ring_buf_push_elem(
@@ -371,7 +371,7 @@ axl_ring_buf_push_elem(
 /**
  * @brief Pop a fixed-size element (all-or-nothing).
  *
- * @return 0 on success, -1 if not enough data or not in element mode.
+ * @return AXL_OK on success, AXL_ERR if not enough data or not in element mode.
  */
 int
 axl_ring_buf_pop_elem(
@@ -382,7 +382,7 @@ axl_ring_buf_pop_elem(
 /**
  * @brief Peek at the head element without consuming.
  *
- * @return 0 on success, -1 if empty or not in element mode.
+ * @return AXL_OK on success, AXL_ERR if empty or not in element mode.
  */
 int
 axl_ring_buf_peek_elem(
@@ -395,7 +395,7 @@ axl_ring_buf_peek_elem(
  *
  * Index 0 is the oldest element, get_length - 1 is the newest.
  *
- * @return 0 on success, -1 if index out of range or not in element mode.
+ * @return AXL_OK on success, AXL_ERR if index out of range or not in element mode.
  */
 int
 axl_ring_buf_peek_nth_elem(
@@ -409,7 +409,7 @@ axl_ring_buf_peek_nth_elem(
  *
  * Index 0 is the oldest element, get_length - 1 is the newest.
  *
- * @return 0 on success, -1 if index out of range or not in element mode.
+ * @return AXL_OK on success, AXL_ERR if index out of range or not in element mode.
  */
 int
 axl_ring_buf_set_nth_elem(

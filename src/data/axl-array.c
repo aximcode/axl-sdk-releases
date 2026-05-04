@@ -112,18 +112,18 @@ int
 axl_array_append(AxlArray *a, const void *element)
 {
     if (a == NULL || element == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (ensure_capacity(a) != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memcpy(a->buffer + a->length * a->element_size,
              element, a->element_size);
     a->length++;
 
-    return 0;
+    return AXL_OK;
 }
 
 void *
@@ -224,7 +224,7 @@ int
 axl_array_remove_index(AxlArray *a, size_t index)
 {
     if (a == NULL || index >= a->length) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (index < a->length - 1) {
@@ -234,14 +234,14 @@ axl_array_remove_index(AxlArray *a, size_t index)
     }
 
     a->length--;
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_array_remove_index_fast(AxlArray *a, size_t index)
 {
     if (a == NULL || index >= a->length) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (index < a->length - 1) {
@@ -251,18 +251,18 @@ axl_array_remove_index_fast(AxlArray *a, size_t index)
     }
 
     a->length--;
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_array_remove_range(AxlArray *a, size_t index, size_t len)
 {
     if (a == NULL || len == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (index >= a->length || len > a->length - index) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (index + len < a->length) {
@@ -272,19 +272,19 @@ axl_array_remove_range(AxlArray *a, size_t index, size_t len)
     }
 
     a->length -= len;
-    return 0;
+    return AXL_OK;
 }
 
 int
 axl_array_set_size(AxlArray *a, size_t len)
 {
     if (a == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (len <= a->length) {
         a->length = len;
-        return 0;
+        return AXL_OK;
     }
 
     /* Grow capacity if needed */
@@ -299,7 +299,7 @@ axl_array_set_size(AxlArray *a, size_t len)
         new_buf = axl_calloc(1, new_cap * a->element_size);
         if (new_buf == NULL) {
             axl_error("failed to resize array to %zu elements", new_cap);
-            return -1;
+            return AXL_ERR;
         }
 
         if (a->buffer != NULL) {
@@ -316,7 +316,7 @@ axl_array_set_size(AxlArray *a, size_t len)
             (len - a->length) * a->element_size);
     a->length = len;
 
-    return 0;
+    return AXL_OK;
 }
 
 void

@@ -137,7 +137,7 @@ run_fetch(AxlArgs *a)
         axl_printf("Fetch: failed to bring up networking.\n");
         return 1;
     }
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("Fetch: no IP address — DHCP did not complete.\n");
         return 1;
     }
@@ -202,7 +202,7 @@ run_fetch(AxlArgs *a)
         body = axl_memdup(data_str, body_size);
         content_type = "application/x-www-form-urlencoded";
     } else if (upload_path != NULL) {
-        if (axl_file_get_contents(upload_path, &body, &body_size) != 0) {
+        if (axl_file_get_contents(upload_path, &body, &body_size) != AXL_OK) {
             axl_printf("Fetch: cannot read '%s'\n", upload_path);
             return 1;
         }
@@ -225,7 +225,7 @@ run_fetch(AxlArgs *a)
         client, method, url, body, body_size,
         content_type, extra_headers, &resp);
 
-    if (rc != 0 || resp == NULL) {
+    if (rc != AXL_OK || resp == NULL) {
         axl_printf("Fetch: request failed\n");
         return 1;
     }
@@ -260,7 +260,7 @@ run_fetch(AxlArgs *a)
         } else if (auto_name) {
             AXL_AUTOPTR(AxlUrl) parsed = NULL;
             int url_rc = axl_url_parse(url, &parsed);
-            if (url_rc == 0 && parsed != NULL) {
+            if (url_rc == AXL_OK && parsed != NULL) {
                 const char *name = get_url_filename(parsed->path);
                 if (name != NULL && *name != '\0') {
                     if (!axl_file_set_contents(name, resp->body,

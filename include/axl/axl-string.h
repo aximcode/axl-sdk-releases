@@ -23,6 +23,7 @@
 #define AXL_STRING_H
 
 #include <stddef.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,7 +57,7 @@ axl_string_new_size(
 
 /**
  * @brief Append a string. NULL is treated as empty.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_append(
@@ -66,7 +67,7 @@ axl_string_append(
 
 /**
  * @brief Append exactly @a len bytes from @a data.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_append_len(
@@ -77,7 +78,7 @@ axl_string_append_len(
 
 /**
  * @brief Append formatted text. Auto-grows the buffer as needed.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_append_printf(
@@ -88,7 +89,7 @@ axl_string_append_printf(
 
 /**
  * @brief Append a single character.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_append_c(
@@ -98,7 +99,7 @@ axl_string_append_c(
 
 /**
  * @brief Prepend a NUL-terminated string.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_prepend(
@@ -108,7 +109,7 @@ axl_string_prepend(
 
 /**
  * @brief Prepend exactly @a len bytes from @a s.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_prepend_len(
@@ -119,7 +120,7 @@ axl_string_prepend_len(
 
 /**
  * @brief Prepend a single character.
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_prepend_c(
@@ -132,7 +133,7 @@ axl_string_prepend_c(
  *
  * If @a pos >= current length, equivalent to append.
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_insert(
@@ -147,7 +148,7 @@ axl_string_insert(
  * If @a pos >= current length, no-op. If pos + len exceeds the
  * length, erases to end.
  *
- * @return 0 on success, -1 if b is NULL.
+ * @return AXL_OK on success, AXL_ERR if b is NULL.
  */
 int
 axl_string_erase(
@@ -161,7 +162,7 @@ axl_string_erase(
  *
  * If @a len >= current length, no-op (does not grow).
  *
- * @return 0 on success, -1 if b is NULL.
+ * @return AXL_OK on success, AXL_ERR if b is NULL.
  */
 int
 axl_string_truncate(
@@ -175,7 +176,7 @@ axl_string_truncate(
  * If pos + strlen(s) exceeds the current length, the string is
  * grown to accommodate.
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_string_overwrite(

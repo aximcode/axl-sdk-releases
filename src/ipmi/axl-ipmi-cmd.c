@@ -115,7 +115,7 @@ send_and_check(AxlIpmiSession *session,
     size_t resp_len = resp_cap;
     int rc = axl_ipmi_raw(session, netfn, cmd,
                           req, req_len, resp, &resp_len);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         return -1;
     }
     if (resp_len < 1) {
@@ -138,14 +138,14 @@ int
 axl_ipmi_get_device_id(AxlIpmiSession *session, AxlIpmiDeviceId *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  resp[16];
     size_t   payload;
     if (send_and_check(session, IPMI_NETFN_APP, CMD_GET_DEVICE_ID,
                        NULL, 0, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Response body (after CC) — spec 20.1 Table 20-2:
@@ -160,7 +160,7 @@ axl_ipmi_get_device_id(AxlIpmiSession *session, AxlIpmiDeviceId *out)
     //   [11..14] AuxFirmwareRev (optional, may be absent)
     //
     if (payload < 11) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->device_id        = p[0];
@@ -187,7 +187,7 @@ axl_ipmi_get_device_id(AxlIpmiSession *session, AxlIpmiDeviceId *out)
                       "returning 0", payload - 11);
         }
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,24 +199,24 @@ axl_ipmi_get_chassis_status(AxlIpmiSession *session,
                             AxlIpmiChassisStatus *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  resp[5];
     size_t   payload;
     if (send_and_check(session, IPMI_NETFN_CHASSIS, CMD_GET_CHASSIS_STATUS,
                        NULL, 0, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     if (payload < 3) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->current_power_state = p[0];
     out->last_power_event    = p[1];
     out->misc_state          = p[2];
     out->front_panel_caps    = (payload >= 4) ? p[3] : 0;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -280,14 +280,14 @@ int
 axl_ipmi_sel_info(AxlIpmiSession *session, AxlIpmiSelInfo *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  resp[15];
     size_t   payload;
     if (send_and_check(session, IPMI_NETFN_STORAGE, CMD_GET_SEL_INFO,
                        NULL, 0, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Spec 31.2 Table 31-1 response body (after CC):
@@ -299,7 +299,7 @@ axl_ipmi_sel_info(AxlIpmiSession *session, AxlIpmiSelInfo *out)
     //   [13] Operation support bitmask
     //
     if (payload < 14) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->version              = p[0];
@@ -308,7 +308,7 @@ axl_ipmi_sel_info(AxlIpmiSession *session, AxlIpmiSelInfo *out)
     out->most_recent_addition = rd32_le(&p[5]);
     out->most_recent_erase    = rd32_le(&p[9]);
     out->op_support           = p[13];
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -317,7 +317,7 @@ axl_ipmi_sel_get_entry(AxlIpmiSession *session,
                        AxlIpmiSelEntry *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Get SEL Entry request (Spec 31.5 Table 31-5):
@@ -337,10 +337,10 @@ axl_ipmi_sel_get_entry(AxlIpmiSession *session,
     if (send_and_check(session, IPMI_NETFN_STORAGE, CMD_GET_SEL_ENTRY,
                        req, sizeof(req), resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     if (payload < 2 + 16) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->next_record_id = rd16_le(&p[0]);
@@ -348,7 +348,7 @@ axl_ipmi_sel_get_entry(AxlIpmiSession *session,
     for (size_t i = 0; i < 16; i++) {
         out->record[i] = p[2 + i];
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,17 +359,17 @@ int
 axl_ipmi_sdr_info(AxlIpmiSession *session, AxlIpmiSdrInfo *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  resp[15];
     size_t   payload;
     if (send_and_check(session, IPMI_NETFN_STORAGE, CMD_GET_SDR_INFO,
                        NULL, 0, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     if (payload < 14) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->version              = p[0];
@@ -378,7 +378,7 @@ axl_ipmi_sdr_info(AxlIpmiSession *session, AxlIpmiSdrInfo *out)
     out->most_recent_addition = rd32_le(&p[5]);
     out->most_recent_erase    = rd32_le(&p[9]);
     out->op_support           = p[13];
-    return 0;
+    return AXL_OK;
 }
 
 /**
@@ -470,11 +470,11 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
                  size_t *len)
 {
     if (next_record_id == NULL || buf == NULL || len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     size_t cap = *len;
     if (cap < 5) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -506,7 +506,7 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
         // BMC requires a reservation. Grab one and retry.
         //
         if (sdr_reserve(session, &rsv_id) != 0) {
-            return -1;
+            return AXL_ERR;
         }
         header_chunk = SDR_HEADER_BYTES;
         rc = sdr_get_partial(session, rsv_id, record_id, 0,
@@ -514,10 +514,10 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
                              buf, &header_chunk);
     }
     if (rc != 0) {
-        return -1;
+        return AXL_ERR;
     }
     if (header_chunk < SDR_HEADER_BYTES) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -543,7 +543,7 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
                             (uint8_t)offset, ask,
                             &ign, &buf[offset], &got) != 0)
         {
-            return -1;
+            return AXL_ERR;
         }
         if (got == 0) {
             //
@@ -561,7 +561,7 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
     }
 
     *len = offset;
-    return 0;
+    return AXL_OK;
     #undef SDR_HEADER_BYTES
     #undef SDR_READ_CHUNK
 }
@@ -576,24 +576,24 @@ axl_ipmi_get_sensor_reading(AxlIpmiSession *session,
                             AxlIpmiSensorReading *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  resp[5];
     size_t   payload;
     if (send_and_check(session, IPMI_NETFN_SENSOR, CMD_GET_SENSOR_READING,
                        &sensor_num, 1, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     if (payload < 2) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->reading           = p[0];
     out->event_status      = p[1];
     out->reading_fields    = (payload >= 3) ? p[2] : 0;
     out->threshold_fields  = (payload >= 4) ? p[3] : 0;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +606,7 @@ axl_ipmi_fru_info(AxlIpmiSession *session,
                   AxlIpmiFruInfo *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     uint8_t  req = fru_id;
     uint8_t  resp[4];
@@ -614,7 +614,7 @@ axl_ipmi_fru_info(AxlIpmiSession *session,
     if (send_and_check(session, IPMI_NETFN_STORAGE, CMD_GET_FRU_INFO,
                        &req, 1, resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Spec 34.1 Table 34-1 response body (after CC):
@@ -622,12 +622,12 @@ axl_ipmi_fru_info(AxlIpmiSession *session,
     //   [2]    Access type: bit 0 set = word-addressable
     //
     if (payload < 3) {
-        return -1;
+        return AXL_ERR;
     }
     const uint8_t *p = &resp[1];
     out->size_bytes  = rd16_le(&p[0]);
     out->word_access = (p[2] & 0x01) != 0;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -638,10 +638,10 @@ axl_ipmi_fru_read(AxlIpmiSession *session,
                   size_t *len)
 {
     if (buf == NULL || len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (*len == 0) {
-        return -1;
+        return AXL_ERR;
     }
     //
     // IPMI "Read FRU Data" request tops out at 255 bytes per call
@@ -662,13 +662,13 @@ axl_ipmi_fru_read(AxlIpmiSession *session,
     if (send_and_check(session, IPMI_NETFN_STORAGE, CMD_READ_FRU_DATA,
                        req, sizeof(req), resp, sizeof(resp), &payload) != 0)
     {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Spec 34.2: response body [0] = count read, [1..] = data bytes.
     //
     if (payload < 1) {
-        return -1;
+        return AXL_ERR;
     }
     size_t got = resp[1];
     if (got > payload - 1) {
@@ -681,5 +681,5 @@ axl_ipmi_fru_read(AxlIpmiSession *session,
         buf[i] = resp[2 + i];
     }
     *len = got;
-    return 0;
+    return AXL_OK;
 }

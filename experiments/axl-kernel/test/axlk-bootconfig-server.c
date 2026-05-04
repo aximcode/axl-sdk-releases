@@ -39,7 +39,7 @@ read_boot_order(uint16_t *ids, int cap)
     uint16_t buf[BC_MAX_BOOT_ORDER];
     size_t   sz = sizeof(buf);
 
-    if (axl_nvstore_get("global", "BootOrder", buf, &sz) != 0) {
+    if (axl_nvstore_get("global", "BootOrder", buf, &sz) != AXL_OK) {
         return 0;
     }
     int count = (int)(sz / sizeof(uint16_t));
@@ -54,21 +54,21 @@ static int
 read_boot_next(uint16_t *out)
 {
     size_t sz = sizeof(*out);
-    return axl_nvstore_get("global", "BootNext", out, &sz) == 0 ? 0 : -1;
+    return axl_nvstore_get("global", "BootNext", out, &sz) == AXL_OK ? 0 : -1;
 }
 
 static int
 read_boot_timeout(uint16_t *out)
 {
     size_t sz = sizeof(*out);
-    return axl_nvstore_get("global", "Timeout", out, &sz) == 0 ? 0 : -1;
+    return axl_nvstore_get("global", "Timeout", out, &sz) == AXL_OK ? 0 : -1;
 }
 
 static int
 read_secure_boot(uint8_t *out)
 {
     size_t sz = sizeof(*out);
-    return axl_nvstore_get("global", "SecureBoot", out, &sz) == 0 ? 0 : -1;
+    return axl_nvstore_get("global", "SecureBoot", out, &sz) == AXL_OK ? 0 : -1;
 }
 
 /* Read Boot#### variable, extract UCS-2 description into UTF-8 out.
@@ -81,7 +81,7 @@ read_boot_entry_description(uint16_t id, char *out, size_t out_cap)
     size_t  sz = sizeof(buf);
 
     axl_snprintf(name, sizeof(name), "Boot%04X", (unsigned)id);
-    if (axl_nvstore_get("global", name, buf, &sz) != 0) {
+    if (axl_nvstore_get("global", name, buf, &sz) != AXL_OK) {
         return -1;
     }
 
@@ -316,7 +316,7 @@ main(int argc, char **argv)
 
     axl_printf("axlk-bootconfig-server: starting\n");
 
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("FAIL: network not available\n");
         return 1;
     }

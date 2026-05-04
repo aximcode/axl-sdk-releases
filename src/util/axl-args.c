@@ -356,7 +356,7 @@ parse_typed(ParsedArg *slot, const char *value, const char *path)
         case AXL_ARG_U32:
         case AXL_ARG_U64: {
             uint64_t v = 0;
-            if (axl_str_to_u64(value, d->base, &v, NULL) != 0) {
+            if (axl_str_to_u64(value, d->base, &v, NULL) != AXL_OK) {
                 axl_print("%s: '%s' for --%s is not a valid integer\n",
                           path, value != NULL ? value : "(missing)", d->name);
                 return false;

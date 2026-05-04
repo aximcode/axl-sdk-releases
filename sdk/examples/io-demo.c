@@ -37,14 +37,14 @@ main(int argc, char **argv)
 
     const char *text = "hello\nworld\n";
     int rc = axl_file_set_contents("test.txt", text, 12);
-    axl_printf("write test.txt: %s\n", rc == 0 ? "ok" : "FAILED");
+    axl_printf("write test.txt: %s\n", rc == AXL_OK ? "ok" : "FAILED");
 
     /* ---- 2. Read whole file ---- */
 
     void *data = NULL;
     size_t size = 0;
     rc = axl_file_get_contents("test.txt", &data, &size);
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("read test.txt: %zu bytes: %.*s", size, (int)size, (char *)data);
         axl_free(data);
     } else {
@@ -111,7 +111,7 @@ main(int argc, char **argv)
 
     AxlFileInfo info;
     rc = axl_file_info("test.txt", &info);
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("test.txt info: size=%llu dir=%s ro=%s\n",
                    (unsigned long long)info.size,
                    info.is_dir ? "yes" : "no",
@@ -121,7 +121,7 @@ main(int argc, char **argv)
     /* ---- 8. Directory operations ---- */
 
     rc = axl_dir_mkdir("testdir");
-    axl_printf("mkdir testdir: %s\n", rc == 0 ? "ok" : "FAILED");
+    axl_printf("mkdir testdir: %s\n", rc == AXL_OK ? "ok" : "FAILED");
 
     axl_printf("directory listing:\n");
     axl_dir_walk(".", io_demo_print_entry, NULL, /* max_depth */ 1);

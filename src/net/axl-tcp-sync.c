@@ -25,10 +25,10 @@
 AXL_LOG_DOMAIN("tcp");
 
 typedef struct {
-    AxlTcp  *sock;
-    int      status;
-    bool     done;
-    AxlLoop *loop;
+    AxlTcp    *sock;
+    AxlStatus  status;
+    bool       done;
+    AxlLoop   *loop;
 } SyncResult;
 
 /* Heap-owned context for an in-flight TCP close. The Close()
@@ -118,7 +118,7 @@ tcp_create_child(
 // ---------------------------------------------------------------------------
 
 static bool
-on_sync_complete(AxlTcp *sock, int status, void *data)
+on_sync_complete(AxlTcp *sock, AxlStatus status, void *data)
 {
     SyncResult *r = data;
     r->sock   = sock;
@@ -144,27 +144,27 @@ int
 axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
 {
     if (host == NULL || out_sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlLoop        *loop   = axl_loop_new();
     if (loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlCancellable *cancel = axl_cancellable_new();
     if (cancel == NULL) {
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
-    SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
+    SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
     if (axl_tcp_connect_async(host, port, loop, cancel,
-                              on_sync_complete, &r) != 0) {
+                              on_sync_complete, &r) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
     axl_loop_add_timeout(loop, 10000, on_sync_cancel_timeout, cancel);
@@ -183,11 +183,11 @@ axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
 
     /* On cancel/error the async op fires cb with NULL sock and closes
        the partial socket internally. Only hand back on clean success. */
-    if (r.status == 0) {
+    if (r.status == AXL_OK) {
         *out_sock = r.sock;
-        return 0;
+        return AXL_OK;
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,19 +207,19 @@ axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
     AxlTcp                       *sock;
 
     if (out_listener == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = tcp_find_service_binding(&sb, &sb_handle);
     if (EFI_ERROR(status)) {
         axl_error("no TCP4 service binding");
-        return -1;
+        return AXL_ERR;
     }
 
     status = tcp_create_child(sb, &child_handle, &tcp4);
     if (EFI_ERROR(status)) {
         axl_error("TCP4 CreateChild: %llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -251,14 +251,14 @@ axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
     if (EFI_ERROR(status)) {
         axl_error("TCP4 Configure(listen port %u): %llx", port, (unsigned long long)status);
         axl_efi_call(sb->DestroyChild, 2, sb, child_handle);
-        return -1;
+        return AXL_ERR;
     }
 
     sock = axl_calloc(1, sizeof(AxlTcp));
     if (sock == NULL) {
         axl_efi_call(tcp4->Configure, 2, tcp4, NULL);
         axl_efi_call(sb->DestroyChild, 2, sb, child_handle);
-        return -1;
+        return AXL_ERR;
     }
 
     sock->tcp4       = tcp4;
@@ -269,7 +269,7 @@ axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
 
     *out_listener = sock;
     axl_info("listening on port %u", port);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,27 +280,27 @@ int
 axl_tcp_accept(AxlTcp *listener, AxlTcp **out_client, size_t timeout_ms)
 {
     if (listener == NULL || out_client == NULL || !listener->is_listener) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlLoop *loop = axl_loop_new();
     if (loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlCancellable *cancel = axl_cancellable_new();
     if (cancel == NULL) {
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
-    SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
+    SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
     if (axl_tcp_accept_async(listener, loop, cancel,
-                             on_sync_complete, &r) != 0) {
+                             on_sync_complete, &r) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
     if (timeout_ms > 0) {
@@ -322,11 +322,11 @@ axl_tcp_accept(AxlTcp *listener, AxlTcp **out_client, size_t timeout_ms)
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
 
-    if (r.status == 0) {
+    if (r.status == AXL_OK) {
         *out_client = r.sock;
-        return 0;
+        return AXL_OK;
     }
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ int
 axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
 {
     if (sock == NULL || data == NULL || size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (timeout_ms == 0) {
@@ -346,16 +346,16 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
 
     AxlLoop *loop = axl_loop_new();
     if (loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlCancellable *cancel = axl_cancellable_new();
     if (cancel == NULL) {
         axl_loop_free(loop);
-        return -1;
+        return AXL_ERR;
     }
 
-    SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
+    SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
     /* Save and restore the sock's loop association across the
        ephemeral wrapper loop. axl_tcp_send_async overwrites
@@ -368,11 +368,11 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
     AxlLoop *saved_loop = sock->async_loop;
 
     if (axl_tcp_send_async(sock, data, size, loop, cancel,
-                           on_sync_complete, &r) != 0) {
+                           on_sync_complete, &r) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
         sock->async_loop = saved_loop;
-        return -1;
+        return AXL_ERR;
     }
 
     axl_loop_add_timeout(loop, timeout_ms, on_sync_cancel_timeout, cancel);
@@ -393,7 +393,7 @@ int
 axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
 {
     if (sock == NULL || buf == NULL || size == NULL || *size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (timeout_ms == 0) {
@@ -402,28 +402,28 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
 
     AxlLoop *loop = axl_loop_new();
     if (loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlCancellable *cancel = axl_cancellable_new();
     if (cancel == NULL) {
         axl_loop_free(loop);
         *size = 0;
-        return -1;
+        return AXL_ERR;
     }
 
-    SyncResult r = { .sock = NULL, .status = -1, .done = false, .loop = loop };
+    SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
     /* See axl_tcp_send for the save/restore rationale. */
     AxlLoop *saved_loop = sock->async_loop;
 
     if (axl_tcp_recv_async(sock, buf, *size, loop, cancel,
-                           on_sync_complete, &r) != 0) {
+                           on_sync_complete, &r) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
         sock->async_loop = saved_loop;
         *size = 0;
-        return -1;
+        return AXL_ERR;
     }
 
     axl_loop_add_timeout(loop, timeout_ms, on_sync_cancel_timeout, cancel);
@@ -433,7 +433,7 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
     axl_loop_free(loop);
     sock->async_loop = saved_loop;
 
-    if (r.status == 0) {
+    if (r.status == AXL_OK) {
         *size = axl_tcp_recv_get_size(sock);
     } else {
         *size = 0;
@@ -449,10 +449,10 @@ int
 axl_tcp_poll(AxlTcp *sock)
 {
     if (sock == NULL || sock->tcp4 == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
-    return EFI_ERROR(axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4)) ? -1 : 0;
+    return EFI_ERROR(axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4)) ? AXL_ERR : AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -645,7 +645,7 @@ axl_tcp_close(AxlTcp *sock)
     AxlTcpCloseCtx *ctx = axl_calloc(1, sizeof(*ctx));
     EFI_EVENT       close_event = NULL;
     if (ctx == NULL ||
-        axl_backend_event_create((AxlEventHandle *)&close_event) != 0)
+        axl_backend_event_create((AxlEventHandle *)&close_event) != AXL_OK)
     {
         axl_warning("close: ctx/event alloc failed — abrupt teardown");
         if (ctx != NULL) {
@@ -750,14 +750,14 @@ int
 axl_tcp_get_local_addr(AxlTcp *sock, char *addr, size_t size,
                        uint16_t *out_port)
 {
-    return EFI_ERROR(get_mode_addr(sock, addr, size, out_port, true)) ? -1 : 0;
+    return EFI_ERROR(get_mode_addr(sock, addr, size, out_port, true)) ? AXL_ERR : AXL_OK;
 }
 
 int
 axl_tcp_get_remote_addr(AxlTcp *sock, char *addr, size_t size,
                         uint16_t *out_port)
 {
-    return EFI_ERROR(get_mode_addr(sock, addr, size, out_port, false)) ? -1 : 0;
+    return EFI_ERROR(get_mode_addr(sock, addr, size, out_port, false)) ? AXL_ERR : AXL_OK;
 }
 
 size_t

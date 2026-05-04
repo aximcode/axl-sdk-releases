@@ -611,7 +611,7 @@ int
 axlk_listen(uint16_t port)
 {
     AxlTcp *listener = NULL;
-    if (axl_tcp_listen(port, &listener) != 0 || listener == NULL) {
+    if (axl_tcp_listen(port, &listener) != AXL_OK || listener == NULL) {
         return -1;
     }
     int fd = fd_alloc(AXLK_FD_TCP_LISTENER, listener);
@@ -623,11 +623,11 @@ axlk_listen(uint16_t port)
 }
 
 static bool
-on_accept_complete(AxlTcp *client, int status, void *data)
+on_accept_complete(AxlTcp *client, AxlStatus status, void *data)
 {
     AxlkProc *p = (AxlkProc *)data;
     intptr_t result = -1;
-    if (status == 0 && client != NULL) {
+    if (status == AXL_OK && client != NULL) {
         int fd = fd_alloc(AXLK_FD_TCP_CONN, client);
         if (fd < 0) {
             axl_tcp_close(client);
@@ -652,7 +652,7 @@ axlk_accept(int listen_fd)
     }
 
     if (axl_tcp_accept_async(slot->tcp, sched_loop, NULL,
-                             on_accept_complete, me) != 0) {
+                             on_accept_complete, me) != AXL_OK) {
         return -1;
     }
     syscall_suspend_and_switch(me);
@@ -660,17 +660,22 @@ axlk_accept(int listen_fd)
 }
 
 static bool
-on_recv_complete(AxlTcp *sock, int status, void *data)
+on_recv_complete(AxlTcp *sock, AxlStatus status, void *data)
 {
     AxlkProc *p = (AxlkProc *)data;
     intptr_t  result;
-    if (status == 0) {
+    switch (status) {
+    case AXL_OK:
         result = (intptr_t)axl_tcp_recv_get_size(sock);
-    } else if (status == AXL_CANCELLED) {
+        break;
+    case AXL_CANCELLED:
+    case AXL_TIMEOUT:
         result = -1;
-    } else {
-        /* Peer closed or error — return 0 bytes as EOF. */
+        break;
+    default:
+        /* AXL_ERR or peer-closed — return 0 bytes as EOF. */
         result = 0;
+        break;
     }
     syscall_wake(p, result);
     return false;
@@ -689,7 +694,7 @@ axlk_read(int fd, void *buf, size_t n)
     }
 
     if (axl_tcp_recv_async(slot->tcp, buf, n, sched_loop, NULL,
-                           on_recv_complete, me) != 0) {
+                           on_recv_complete, me) != AXL_OK) {
         return -1;
     }
     syscall_suspend_and_switch(me);
@@ -697,11 +702,11 @@ axlk_read(int fd, void *buf, size_t n)
 }
 
 static bool
-on_send_complete(AxlTcp *sock, int status, void *data)
+on_send_complete(AxlTcp *sock, AxlStatus status, void *data)
 {
     (void)sock;
     AxlkProc *p = (AxlkProc *)data;
-    syscall_wake(p, (status == 0) ? 0 : -1);
+    syscall_wake(p, (status == AXL_OK) ? 0 : -1);
     return false;
 }
 
@@ -718,7 +723,7 @@ axlk_write(int fd, const void *buf, size_t n)
     }
 
     if (axl_tcp_send_async(slot->tcp, buf, n, sched_loop, NULL,
-                           on_send_complete, me) != 0) {
+                           on_send_complete, me) != AXL_OK) {
         return -1;
     }
     syscall_suspend_and_switch(me);
@@ -793,7 +798,7 @@ axlk_http_read_request_line(
     AXL_AUTO_FREE char *path   = NULL;
     AXL_AUTO_FREE char *query  = NULL;
     if (axl_http_parse_request_line(scratch, line_len,
-                                    &method, &path, &query) != 0) {
+                                    &method, &path, &query) != AXL_OK) {
         return -1;
     }
 

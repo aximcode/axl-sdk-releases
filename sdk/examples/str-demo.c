@@ -139,7 +139,7 @@ demo_base64(void)
     void *decoded = NULL;
     size_t decoded_len = 0;
     int rc = axl_base64_decode(encoded, &decoded, &decoded_len);
-    if (rc == 0) {
+    if (rc == AXL_OK) {
         axl_printf("  decode(\"%s\") = \"%.*s\" (len=%llu)\n",
                    encoded, (int)decoded_len, (char *)decoded,
                    (unsigned long long)decoded_len);

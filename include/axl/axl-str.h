@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -738,7 +739,7 @@ axl_base64_encode(
 /**
  * @brief Decode a base64 string.
  *
- * @return 0 on success, -1 on invalid input.
+ * @return AXL_OK on success, AXL_ERR on invalid input.
  */
 int
 axl_base64_decode(
@@ -766,7 +767,7 @@ axl_base64_decode(
  * pointer just past the last consumed character. On error, @p out
  * is unchanged and *@p endptr (if non-NULL) is set to @p nptr.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_str_to_u64(
@@ -878,7 +879,7 @@ axl_strtou64(
  * -1. Leading whitespace is allowed (matches `axl_str_to_u64`) but
  * not whitespace around the `+`. NULL input returns -1.
  *
- * @return 0 on success (with @a out populated), -1 on parse error.
+ * @return AXL_OK on success (with @a out populated), AXL_ERR on parse error.
  */
 int
 axl_strtou64_with_offset(

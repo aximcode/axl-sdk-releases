@@ -95,7 +95,7 @@ ids_insert_string(
     if (owned == NULL) {
         return;
     }
-    if (axl_hash_table_insert(t, key, owned) < 0) {
+    if (axl_hash_table_insert(t, key, owned) == AXL_HASH_TABLE_ERR) {
         axl_free(owned);
     }
 }
@@ -481,7 +481,7 @@ axl_pci_ids_foreach_vendor(
     )
 {
     if (ids == NULL || fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     VendorAdapterCtx adapter = { .fn = fn, .ctx = ctx };
     return _axl_sidecar_foreach(ids->vendors, vendor_adapter, &adapter);
@@ -510,7 +510,7 @@ axl_pci_ids_foreach_device(
     )
 {
     if (ids == NULL || fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     DeviceAdapterCtx adapter = { .fn = fn, .ctx = ctx };
     return _axl_sidecar_foreach(ids->devices, device_adapter, &adapter);
@@ -539,7 +539,7 @@ axl_pci_ids_foreach_subsys(
     )
 {
     if (ids == NULL || fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     SubsysAdapterCtx adapter = { .fn = fn, .ctx = ctx };
     return _axl_sidecar_foreach(ids->subsystems, subsys_adapter, &adapter);
@@ -623,7 +623,7 @@ axl_pci_ids_format_name(
     )
 {
     if (buf == NULL || buflen == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Single-source-of-truth fallback chain so every consumer

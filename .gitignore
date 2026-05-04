@@ -27,3 +27,7 @@ SCRATCH.md
 .env.*
 CLAUDE.md
 .claude/settings.local.json
+# Hardware-fixture captures (HF1+) — machine-specific, often contain
+# identifying data (serials, MACs, OEM strings). Local-only by default;
+# sanitization + public corpus is HF10's scope.
+test/fixtures/

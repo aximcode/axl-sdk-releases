@@ -103,18 +103,18 @@ int
 axl_ipmi_dell_open(AxlIpmiTransportOps *ops)
 {
     if (ops == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     DELL_IPMI_TRANSPORT *dell = NULL;
     EFI_GUID             guid = gDellIpmiProtocolGuid;
     EFI_STATUS           s = gBS->LocateProtocol(&guid, NULL, (VOID **)&dell);
     if (EFI_ERROR(s) || dell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (dell->IpmiSubmitCommand == NULL) {
         axl_warning("Dell EFI_IPMI_TRANSPORT found but IpmiSubmitCommand is NULL");
-        return -1;
+        return AXL_ERR;
     }
 
     ops->kind     = AXL_IPMI_TRANSPORT_DELL;
@@ -124,5 +124,5 @@ axl_ipmi_dell_open(AxlIpmiTransportOps *ops)
 
     axl_info("IPMI Dell transport ready (revision=%llu)",
              (unsigned long long)dell->Revision);
-    return 0;
+    return AXL_OK;
 }

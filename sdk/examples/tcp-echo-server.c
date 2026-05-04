@@ -35,14 +35,14 @@ typedef struct {
 
 static AxlLoop *loop = NULL;
 
-static bool on_data(AxlTcp *sock, int status, void *data);
+static bool on_data(AxlTcp *sock, AxlStatus status, void *data);
 
 static bool
-on_echo_sent(AxlTcp *sock, int status, void *data)
+on_echo_sent(AxlTcp *sock, AxlStatus status, void *data)
 {
     EchoConn *conn = (EchoConn *)data;
 
-    if (status != 0) {
+    if (status != AXL_OK) {
         /* Send failed — peer likely gone. Close and stop. */
         axl_tcp_close(sock);
         axl_free(conn);
@@ -56,12 +56,12 @@ on_echo_sent(AxlTcp *sock, int status, void *data)
 }
 
 static bool
-on_data(AxlTcp *sock, int status, void *data)
+on_data(AxlTcp *sock, AxlStatus status, void *data)
 {
     EchoConn *conn = (EchoConn *)data;
     size_t len = axl_tcp_recv_get_size(sock);
 
-    if (status != 0 || len == 0) {
+    if (status != AXL_OK || len == 0) {
         axl_printf("  disconnected\n");
         axl_tcp_close(sock);
         axl_free(conn);
@@ -82,11 +82,11 @@ on_data(AxlTcp *sock, int status, void *data)
 }
 
 static bool
-on_accept(AxlTcp *client, int status, void *data)
+on_accept(AxlTcp *client, AxlStatus status, void *data)
 {
     (void)data;
 
-    if (status != 0 || client == NULL) {
+    if (status != AXL_OK || client == NULL) {
         return true;  /* per-accept error — keep listening */
     }
 
@@ -118,12 +118,12 @@ main(int argc, char **argv)
        drivers, runs ConnectController, and waits for DHCP — the
        same setup the UEFI shell would do for `connect -r &&
        ifconfig -s eth0 dhcp`. Idempotent. */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("error: network bring-up failed\n");
         return 1;
     }
 
-    if (axl_tcp_listen(7000, &listener) != 0) {
+    if (axl_tcp_listen(7000, &listener) != AXL_OK) {
         axl_printf("error: cannot listen on port 7000\n");
         return 1;
     }
@@ -136,7 +136,7 @@ main(int argc, char **argv)
         axl_tcp_close(listener);
         return 1;
     }
-    if (axl_tcp_accept_async(listener, loop, NULL, on_accept, NULL) != 0) {
+    if (axl_tcp_accept_async(listener, loop, NULL, on_accept, NULL) != AXL_OK) {
         axl_printf("error: axl_tcp_accept_async failed\n");
         axl_tcp_close(listener);
         axl_loop_free(loop);

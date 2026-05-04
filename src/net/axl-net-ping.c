@@ -89,7 +89,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     EFI_IP4_FRAGMENT_DATA         fragment;
 
     if (target == NULL || out_rtt_ms == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *out_rtt_ms = 0;
@@ -105,7 +105,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
                     &handles);
     if (EFI_ERROR(status) || handle_count == 0) {
         axl_error("no IP4 service binding");
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
@@ -114,7 +114,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
                     (void **)&ip4_sb);
     axl_backend_free(handles);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -124,7 +124,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     status = axl_efi_call(ip4_sb->CreateChild, 2, ip4_sb, &ip4_child);
     if (EFI_ERROR(status)) {
         axl_error("IP4 CreateChild: %llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
@@ -133,7 +133,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
                     (void **)&ip4);
     if (EFI_ERROR(status)) {
         axl_efi_call(ip4_sb->DestroyChild, 2, ip4_sb, ip4_child);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -153,7 +153,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     if (EFI_ERROR(status)) {
         axl_error("IP4 Configure: %llx", (unsigned long long)status);
         axl_efi_call(ip4_sb->DestroyChild, 2, ip4_sb, ip4_child);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -234,10 +234,10 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
 
     uint64_t start_ms = axl_time_get_ms();
     while (elapsed < timeout_us) {
-        int wrc = _axl_ip4_wait(ip4, rx_event, timeout_us - elapsed);
+        AxlStatus wrc = _axl_ip4_wait(ip4, rx_event, timeout_us - elapsed);
         elapsed = (axl_time_get_ms() - start_ms) * 1000;
 
-        if (wrc != 0) {
+        if (wrc != AXL_OK) {
             break;  /* timeout or Ctrl-C */
         }
 
@@ -288,5 +288,5 @@ done:
 
     axl_efi_call(ip4->Configure, 2, ip4, NULL);
     axl_efi_call(ip4_sb->DestroyChild, 2, ip4_sb, ip4_child);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }

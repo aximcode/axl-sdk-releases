@@ -231,7 +231,7 @@ axl_radix_tree_insert(
     )
 {
     if (tree == NULL || key == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     RadixNode *node = tree->root;
@@ -245,17 +245,17 @@ axl_radix_tree_insert(
             /* No matching child — create a new leaf */
             RadixNode *leaf = radix_node_new(key + pos, key_len - pos);
             if (leaf == NULL) {
-                return -1;
+                return AXL_ERR;
             }
 
             leaf->value = value;
             if (radix_node_add_child(node, leaf) != 0) {
                 radix_node_free(leaf, NULL);
-                return -1;
+                return AXL_ERR;
             }
 
             tree->size++;
-            return 0;
+            return AXL_OK;
         }
 
         /* Compare child's edge with remaining key */
@@ -279,7 +279,7 @@ axl_radix_tree_insert(
         /* Partial match — split the edge at match_len */
         RadixNode *split = radix_node_new(child->edge, match_len);
         if (split == NULL) {
-            return -1;
+            return AXL_ERR;
         }
 
         /* Shorten the old child's edge to the unmatched suffix */
@@ -295,7 +295,7 @@ axl_radix_tree_insert(
             child->edge = old_edge;
             axl_free(split->edge);
             axl_free(split);
-            return -1;
+            return AXL_ERR;
         }
 
         axl_memcpy(child->edge, old_edge + match_len,
@@ -343,7 +343,7 @@ axl_radix_tree_insert(
 
                 axl_free(split->edge);
                 axl_free(split);
-                return -1;
+                return AXL_ERR;
             }
 
             split->child_cap = RADIX_CHILDREN_INIT_CAP;
@@ -355,7 +355,7 @@ axl_radix_tree_insert(
             /* Key ends at the split point — split gets the value */
             split->value = value;
             tree->size++;
-            return 0;
+            return AXL_OK;
         }
 
         /* Remaining key goes into a new leaf under split */
@@ -363,17 +363,17 @@ axl_radix_tree_insert(
         RadixNode *leaf = radix_node_new(key + leaf_start,
                                           key_len - leaf_start);
         if (leaf == NULL) {
-            return -1;
+            return AXL_ERR;
         }
 
         leaf->value = value;
         if (radix_node_add_child(split, leaf) != 0) {
             radix_node_free(leaf, NULL);
-            return -1;
+            return AXL_ERR;
         }
 
         tree->size++;
-        return 0;
+        return AXL_OK;
     }
 
     /* Key fully consumed at current node — set/replace value */
@@ -386,7 +386,7 @@ axl_radix_tree_insert(
     }
 
     node->value = value;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

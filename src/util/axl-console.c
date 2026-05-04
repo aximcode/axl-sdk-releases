@@ -19,7 +19,7 @@ axl_console_read_key(
     )
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlEventHandle key_evt = axl_backend_console_wait_for_key();
@@ -27,27 +27,27 @@ axl_console_read_key(
         /* No console (driver app, raw firmware ctx, BDS hand-off
            that hasn't published ConIn yet). Caller can fall back
            to whatever degraded UI they want. */
-        return -1;
+        return AXL_ERR;
     }
 
     if (timeout_ms == 0) {
         /* Non-blocking: poll the event without waiting. */
         if (axl_backend_event_check(key_evt) != 0) {
-            return -1;
+            return AXL_ERR;
         }
     } else if (timeout_ms == UINT64_MAX) {
         /* Block forever on the key event alone. */
         size_t fired = 0;
-        if (axl_backend_event_wait(1, &key_evt, &fired) != 0) {
-            return -1;
+        if (axl_backend_event_wait(1, &key_evt, &fired) != AXL_OK) {
+            return AXL_ERR;
         }
     } else {
         /* Bounded wait: union of {key event, timer}. The timer event
            is closed unconditionally on return so a slow key path
            doesn't leak it. */
         AxlEventHandle timer = NULL;
-        if (axl_backend_event_create_timer(&timer) != 0) {
-            return -1;
+        if (axl_backend_event_create_timer(&timer) != AXL_OK) {
+            return AXL_ERR;
         }
         /* Cap the multiplication to avoid overflow when the caller
            passes a near-UINT64_MAX timeout; UEFI's interval field
@@ -57,9 +57,9 @@ axl_console_read_key(
                                       ? UINT64_MAX
                                       : timeout_ms * HUNDRED_NS_PER_MS;
         if (axl_backend_event_set_timer(timer, AXL_TIMER_RELATIVE,
-                                        interval_100ns) != 0) {
+                                        interval_100ns) != AXL_OK) {
             axl_backend_event_close(timer);
-            return -1;
+            return AXL_ERR;
         }
         AxlEventHandle events[2];
         events[0] = key_evt;
@@ -67,12 +67,12 @@ axl_console_read_key(
         size_t fired = 0;
         int rc = axl_backend_event_wait(2, events, &fired);
         axl_backend_event_close(timer);
-        if (rc != 0) {
-            return -1;
+        if (rc != AXL_OK) {
+            return AXL_ERR;
         }
         if (fired == 1) {
             /* Timer beat the key — timeout. */
-            return -1;
+            return AXL_ERR;
         }
     }
 
@@ -98,7 +98,7 @@ axl_console_flush_input(
        read_key short-circuits when the protocol isn't published. */
     uint16_t scan = 0;
     uint16_t uni  = 0;
-    while (axl_backend_console_read_key(&scan, &uni) == 0) {
+    while (axl_backend_console_read_key(&scan, &uni) == AXL_OK) {
         /* discard */
     }
 }

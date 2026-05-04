@@ -25,6 +25,7 @@
 #define AXL_RNG_H
 
 #include <stddef.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,7 +38,7 @@ extern "C" {
  * SP800-90A on most modern systems. Callers that need a specific
  * algorithm can layer one of EDK2's RngLib variants on top.
  *
- * @return 0 on success, -1 if EFI_RNG_PROTOCOL is unavailable or
+ * @return AXL_OK on success, AXL_ERR if EFI_RNG_PROTOCOL is unavailable or
  *     the firmware reports an error.
  */
 int

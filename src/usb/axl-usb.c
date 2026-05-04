@@ -490,24 +490,24 @@ axl_usb_get_vid_pid(
     )
 {
     if (vid == NULL || pid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     Entry *e = find_entry(addr);
     if (e == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     EFI_USB_DEVICE_DESCRIPTOR  desc = { 0 };
     EFI_STATUS status = axl_efi_call(
         e->io->UsbGetDeviceDescriptor, 2, e->io, &desc);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     *vid = desc.IdVendor;
     *pid = desc.IdProduct;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -677,10 +677,10 @@ axl_usb_tree_for_each(
     )
 {
     if (fn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     size_t n = axl_array_len(entries);
     for (size_t i = 0; i < n; i++) {
@@ -694,7 +694,7 @@ axl_usb_tree_for_each(
             return rc;
         }
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -706,17 +706,17 @@ axl_usb_get_class(
     )
 {
     if (ensure_init() != 0) {
-        return -1;
+        return AXL_ERR;
     }
     Entry *e = find_entry(addr);
     if (e == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     EFI_USB_INTERFACE_DESCRIPTOR  desc = { 0 };
     EFI_STATUS status = axl_efi_call(
         e->io->UsbGetInterfaceDescriptor, 2, e->io, &desc);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     /* Each out parameter is independently optional — composite
        devices that only need the base class for routing can pass
@@ -730,5 +730,5 @@ axl_usb_get_class(
     if (prot != NULL) {
         *prot = desc.InterfaceProtocol;
     }
-    return 0;
+    return AXL_OK;
 }

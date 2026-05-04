@@ -153,6 +153,27 @@ axl_device_path_size(
     const void *device_path  ///< device path (from "device-path" service)
 );
 
+/**
+ * @brief Render a device path as the firmware's canonical text form.
+ *
+ * Wraps the EFI_DEVICE_PATH_TO_TEXT_PROTOCOL the firmware exposes
+ * (`ConvertDevicePathToText`) and converts the resulting UCS-2
+ * string to UTF-8. The output is the same format `dh -d` and
+ * `bcfg boot dump` produce — e.g.
+ * `PciRoot(0x0)/Pci(0x3,0x0)/MAC(525400123456,0x1)`.
+ *
+ * Returns NULL when the firmware doesn't expose
+ * EFI_DEVICE_PATH_TO_TEXT_PROTOCOL (some vintage UEFI 2.0 builds
+ * omit it) or when @p device_path is NULL.
+ *
+ * @return UTF-8 string allocated with `axl_malloc`, or NULL on
+ *     failure. Caller frees with `axl_free`.
+ */
+char *
+axl_device_path_to_text(
+    const void *device_path  ///< device path (from "device-path" service)
+);
+
 // ---------------------------------------------------------------------------
 // System control
 // ---------------------------------------------------------------------------
@@ -177,7 +198,7 @@ axl_reset(
  * Equivalent to the Shell "map -r" command. Call after hot-plugging
  * a USB drive or after a driver installs a new filesystem.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_map_refresh(void);
@@ -199,7 +220,7 @@ typedef struct {
 /**
  * @brief Get firmware information (vendor, revision, spec version).
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_sys_get_firmware_info(
@@ -211,7 +232,7 @@ axl_sys_get_firmware_info(
  *
  * Queries the firmware memory map and sums all usable regions.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_sys_get_memory_size(
@@ -221,7 +242,7 @@ axl_sys_get_memory_size(
 /**
  * @brief Get a service interface from a specific handle.
  *
- * @return 0 on success, -1 if not found.
+ * @return AXL_OK on success, AXL_ERR if not found.
  */
 int
 axl_handle_get_service(
@@ -240,7 +261,7 @@ axl_handle_get_service(
  * Looks up a named service in the platform service registry.
  * Well-known names: "smbios", "shell", "simple-network", "simple-fs".
  *
- * @return 0 on success, -1 if not found.
+ * @return AXL_OK on success, AXL_ERR if not found.
  */
 int
 axl_service_find(
@@ -253,7 +274,7 @@ axl_service_find(
  *
  * Caller frees the returned handles array with axl_free().
  *
- * @return 0 on success (count may be 0), -1 on error.
+ * @return AXL_OK on success (count may be 0), AXL_ERR on error.
  */
 int
 axl_service_enumerate(
@@ -267,7 +288,7 @@ axl_service_enumerate(
  *
  * Creates a new handle if @a *handle is NULL.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_service_register(
@@ -279,7 +300,7 @@ axl_service_register(
 /**
  * @brief Unregister a service from a handle.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_service_unregister(
@@ -303,7 +324,7 @@ axl_service_unregister(
  *     NULL);
  * @endcode
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_service_register_multiple(

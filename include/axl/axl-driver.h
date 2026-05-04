@@ -38,7 +38,7 @@ typedef void *AxlDriverHandle;
  *
  * Loads the .efi file into memory but does not start it.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_load(
@@ -52,7 +52,7 @@ axl_driver_load(
  * Calls the driver's entry point. The driver registers its
  * binding protocol(s) but does not yet bind to devices.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_start(
@@ -65,7 +65,7 @@ axl_driver_start(
  * Triggers the driver's Supported/Start sequence for each
  * compatible device. Call after axl_driver_start.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_connect(
@@ -77,7 +77,7 @@ axl_driver_connect(
  *
  * Triggers the driver's Stop sequence for each bound device.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_disconnect(
@@ -89,7 +89,7 @@ axl_driver_disconnect(
  *
  * The driver must be disconnected first.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_unload(
@@ -105,7 +105,7 @@ axl_driver_unload(
  * Pass NULL data to clear load options.
  * Call between axl_driver_load and axl_driver_start.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_set_load_options(
@@ -144,7 +144,7 @@ axl_driver_init(
  * convention — declare it as:
  *   EFI_STATUS EFIAPI MyUnload(EFI_HANDLE ImageHandle)
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_set_unload(
@@ -182,7 +182,7 @@ axl_driver_get_image_path(void);
  * a filesystem protocol on a new handle). More targeted than
  * axl_driver_connect which reconnects all handles.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_driver_connect_handle(
@@ -215,7 +215,7 @@ axl_driver_connect_handle(
  * Same trust caveat as axl_driver_ensure: searches every mounted FAT
  * volume. Don't pass attacker-controlled @p driver_name.
  *
- * @return 0 on success (path written to @p out), -1 if the driver
+ * @return AXL_OK on success (path written to @p out), AXL_ERR if the driver
  *     wasn't found or @p out is too small to hold the result.
  */
 int
@@ -265,8 +265,8 @@ axl_driver_locate(
  * privileges. Only call this with driver names you trust, and don't
  * call it with attacker-controlled @p driver_name values.
  *
- * @return 0 if the protocol is registered (was already, or after
- *     loading the driver); -1 if the driver wasn't found, failed to
+ * @return AXL_OK if the protocol is registered (was already, or after
+ *     loading the driver); AXL_ERR if the driver wasn't found, failed to
  *     load/start, or didn't register the protocol after starting.
  */
 int
@@ -311,8 +311,8 @@ axl_driver_ensure(
  * is whatever the build system baked in — caller's responsibility to
  * verify provenance.
  *
- * @return 0 if the protocol is registered (was already, or after
- *     loading); -1 if all four steps failed.
+ * @return AXL_OK if the protocol is registered (was already, or after
+ *     loading); AXL_ERR if all four steps failed.
  */
 int
 axl_driver_ensure_with_embedded(
@@ -331,7 +331,7 @@ axl_driver_ensure_with_embedded(
  * @p loaded_count receives the number of drivers successfully started.
  * Pass NULL for @p pattern to match all .efi files.
  *
- * @return 0 on success (even if no drivers found), -1 on error.
+ * @return AXL_OK on success (even if no drivers found), AXL_ERR on error.
  */
 int
 axl_driver_load_dir(

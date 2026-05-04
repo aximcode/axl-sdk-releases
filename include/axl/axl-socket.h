@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <axl/axl-macros.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,9 +50,11 @@ typedef enum {
  *
  * @p sock is the socket for the completed operation (new socket for
  * accept, or the original socket for send/recv/connect).
- * @p status is 0 on success, -1 on error.
- * On error, @p sock may be NULL (accept) or half-initialized (connect).
- * Always check @p status before using @p sock.
+ * @p status is an @ref AxlStatus value: AXL_OK on success, AXL_ERR
+ * on UEFI error, AXL_CANCELLED if the cancellable on the *_async
+ * call was signalled before completion. On error, @p sock may be
+ * NULL (accept) or half-initialized (connect). Always check @p
+ * status before using @p sock.
  *
  * Return value controls re-arming for ops that support it:
  *   - `axl_socket_receive_async`: true = re-arm with same buffer, false = stop
@@ -70,7 +74,7 @@ typedef enum {
  */
 typedef bool (*AxlSocketCallback)(
     AxlSocket *sock,    ///< socket
-    int        status,  ///< 0 = success, -1 = error
+    AxlStatus  status,  ///< AXL_OK on success, AXL_ERR on error, AXL_CANCELLED on cancel
     void      *data     ///< caller-provided context
 );
 
@@ -136,7 +140,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlSocket, axl_socket_free)
  * Closes the current ephemeral UDP socket and reopens on @p port.
  * Pass 0 to rebind to a new ephemeral port.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_socket_bind(
@@ -147,7 +151,7 @@ axl_socket_bind(
 /**
  * @brief Connect a stream socket to a remote address. Blocking.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_socket_connect(
@@ -158,7 +162,7 @@ axl_socket_connect(
 /**
  * @brief Start listening on a stream socket.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_socket_listen(
@@ -175,7 +179,7 @@ axl_socket_listen(
  * Pass a positive value to bound the wait; Ctrl-C ends the wait
  * either way via the loop's break observation.
  *
- * @return 0 on success, -1 on failure, timeout, or cancel.
+ * @return AXL_OK on success, AXL_ERR on failure. timeout, or cancel.
  */
 int
 axl_socket_accept(
@@ -187,7 +191,7 @@ axl_socket_accept(
 /**
  * @brief Send data on a connected stream socket. Blocking.
  *
- * @return 0 on success, -1 on failure or timeout.
+ * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
 axl_socket_send(
@@ -200,7 +204,7 @@ axl_socket_send(
 /**
  * @brief Send a datagram to a specific address. Datagram sockets only.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_socket_send_to(
@@ -216,7 +220,7 @@ axl_socket_send_to(
  * @p size is in/out: on entry the buffer capacity, on return the
  * number of bytes received.
  *
- * @return 0 on success, -1 on failure or timeout.
+ * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
 axl_socket_receive(
@@ -267,7 +271,7 @@ axl_socket_get_type(
 /**
  * @brief Async connect — returns immediately, callback fires from loop.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_socket_connect_async(
@@ -284,7 +288,7 @@ axl_socket_connect_async(
  * Re-arming is controlled by the callback's return value: `true`
  * keeps the listener armed, `false` stops accepting.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_socket_accept_async(
@@ -299,7 +303,7 @@ axl_socket_accept_async(
  *
  * The buffer must stay valid until the callback fires.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_socket_send_async(
@@ -323,7 +327,7 @@ axl_socket_send_async(
  * by the callback's return value: `true` re-arms with the same
  * buffer, `false` stops receiving.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_socket_receive_async(

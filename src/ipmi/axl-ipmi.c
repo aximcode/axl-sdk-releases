@@ -306,13 +306,13 @@ axl_ipmi_raw(AxlIpmiSession *session,
              uint8_t *resp, size_t *resp_len)
 {
     if (session == NULL || resp == NULL || resp_len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (req == NULL && req_len != 0) {
-        return -1;
+        return AXL_ERR;
     }
     if (session->ops.send_raw == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return session->ops.send_raw(session->ops.ctx,
                                  netfn, cmd,
@@ -328,7 +328,7 @@ int
 axl_ipmi_probe(AxlIpmiProbe *out)
 {
     if (out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     //
     // Zero-fill first — every field has a meaningful "not found"
@@ -377,5 +377,5 @@ axl_ipmi_probe(AxlIpmiProbe *out)
         axl_memcpy(&out->smbios_base_address, &raw[8], sizeof(uint64_t));
     }
 
-    return 0;
+    return AXL_OK;
 }

@@ -103,7 +103,7 @@ axl_spd_ddr4_read(
     )
 {
     if (smbus == NULL || buf == NULL || len == NULL || cap == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Lower 256 bytes — always accessible. */
@@ -111,12 +111,12 @@ axl_spd_ddr4_read(
 
     size_t lower_len = cap < 256 ? cap : 256;
     for (size_t i = 0; i < lower_len; i++) {
-        if (axl_smbus_read_byte(smbus, addr, (uint8_t)i, &buf[i]) != 0) {
+        if (axl_smbus_read_byte(smbus, addr, (uint8_t)i, &buf[i]) != AXL_OK) {
             if (i == 0) {
-                return -1;
+                return AXL_ERR;
             }
             *len = i;
-            return 0;
+            return AXL_OK;
         }
     }
 
@@ -126,7 +126,7 @@ axl_spd_ddr4_read(
             axl_debug("DDR4 SPA1 NACK at 0x%02X; manufacturing block unavailable",
                       addr);
             *len = lower_len;
-            return 0;
+            return AXL_OK;
         }
         size_t upper_cap = cap - 256;
         if (upper_cap > 256) {
@@ -134,21 +134,21 @@ axl_spd_ddr4_read(
         }
         for (size_t i = 0; i < upper_cap; i++) {
             if (axl_smbus_read_byte(smbus, addr,
-                                    (uint8_t)i, &buf[256 + i]) != 0) {
+                                    (uint8_t)i, &buf[256 + i]) != AXL_OK) {
                 /* Restore lower-page selection so subsequent reads from
                    neighbour SPDs see the right bytes. */
                 (void)ddr4_set_page(smbus, false);
                 *len = 256 + i;
-                return 0;
+                return AXL_OK;
             }
         }
         (void)ddr4_set_page(smbus, false);
         *len = 256 + upper_cap;
-        return 0;
+        return AXL_OK;
     }
 
     *len = lower_len;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,10 +163,10 @@ axl_spd_ddr4_decode(
     )
 {
     if (buf == NULL || out == NULL || len < 64) {
-        return -1;
+        return AXL_ERR;
     }
     if (buf[DDR4_OFF_KEY_BYTE] != AXL_SPD_TYPE_DDR4) {
-        return -1;
+        return AXL_ERR;
     }
 
     out->ddr_generation = 4;
@@ -206,7 +206,7 @@ axl_spd_ddr4_decode(
     /* Manufacturing info lives at offset 320+. Bail out early if the
        buffer is too short (e.g., upper-page read failed in QEMU). */
     if (len < DDR4_OFF_DRAM_MFG_ID + 1) {
-        return 0;
+        return AXL_OK;
     }
 
     out->mfg_code_module = axl_spd_pack_mfg_code(
@@ -235,5 +235,5 @@ axl_spd_ddr4_decode(
     out->mfg_code_dram = axl_spd_pack_mfg_code(
             buf[DDR4_OFF_DRAM_MFG_BANK], buf[DDR4_OFF_DRAM_MFG_ID]);
 
-    return 0;
+    return AXL_OK;
 }

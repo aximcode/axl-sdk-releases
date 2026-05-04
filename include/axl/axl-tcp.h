@@ -15,6 +15,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <axl/axl-macros.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,7 +48,7 @@ typedef struct AxlCancellable AxlCancellable;
 /**
  * @brief Connect to a remote host via TCP4.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tcp_connect(
@@ -58,7 +60,7 @@ axl_tcp_connect(
 /**
  * @brief Create a TCP4 listener on the given port.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tcp_listen(
@@ -75,7 +77,7 @@ axl_tcp_listen(
  * positive value to bound the wait; Ctrl-C ends the wait either
  * way via the loop's break observation.
  *
- * @return 0 on success, -1 on failure, timeout, or cancel.
+ * @return AXL_OK on success, AXL_ERR on failure. timeout, or cancel.
  */
 int
 axl_tcp_accept(
@@ -87,7 +89,7 @@ axl_tcp_accept(
 /**
  * @brief Send data over a connected TCP socket.
  *
- * @return 0 on success, -1 on failure or timeout.
+ * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
 axl_tcp_send(
@@ -100,7 +102,7 @@ axl_tcp_send(
 /**
  * @brief Receive data from a connected TCP socket.
  *
- * @return 0 on success, -1 on failure or timeout.
+ * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
 axl_tcp_recv(
@@ -113,7 +115,7 @@ axl_tcp_recv(
 /**
  * @brief Poll a TCP socket to drive its internal state machine.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tcp_poll(
@@ -153,7 +155,7 @@ axl_tcp_close(
 /**
  * @brief Query the local address of a connected or listening socket.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tcp_get_local_addr(
@@ -166,7 +168,7 @@ axl_tcp_get_local_addr(
 /**
  * @brief Query the remote address of a connected socket.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tcp_get_remote_addr(
@@ -193,11 +195,11 @@ axl_tcp_get_remote_addr(
  * connected socket — caller retains ownership and can reuse or close
  * it.
  *
- * @p status is:
- *   - 0 on success
- *   - -1 on UEFI error
- *   - AXL_CANCELLED (-2) if the cancellable passed to the *_async
- *     call was signalled before completion
+ * @p status is an @ref AxlStatus value:
+ *   - AXL_OK on success
+ *   - AXL_ERR on UEFI error
+ *   - AXL_CANCELLED if the cancellable passed to the *_async call
+ *     was signalled before completion
  *
  * Return value controls re-arming for ops that support it:
  *   - `axl_tcp_recv_async`: true = re-arm with same buffer, false = stop
@@ -225,9 +227,9 @@ axl_tcp_get_remote_addr(
  * See each *_async function's doc for per-op nuances.
  */
 typedef bool (*AxlTcpCallback)(
-    AxlTcp *sock,   ///< socket (may be NULL — see per-op docs)
-    int     status, ///< 0, -1, or AXL_CANCELLED
-    void   *data    ///< caller-provided context
+    AxlTcp   *sock,   ///< socket (may be NULL — see per-op docs)
+    AxlStatus status, ///< AXL_OK, AXL_ERR, or AXL_CANCELLED
+    void     *data    ///< caller-provided context
 );
 
 /**
@@ -236,15 +238,16 @@ typedef bool (*AxlTcpCallback)(
  * The callback fires from the event loop when the connection completes,
  * fails, or is cancelled via @p cancel. On success the newly connected
  * socket is passed; on error or cancellation the sock pointer is NULL
- * and the partial socket is closed internally. Status is 0 on success,
- * -1 on UEFI error, or AXL_CANCELLED (-2) if @p cancel was signalled.
+ * and the partial socket is closed internally. Status is AXL_OK on
+ * success, AXL_ERR on UEFI error, or AXL_CANCELLED if @p cancel was
+ * signalled.
  *
  * **Cancel is terminal for connect.** The partial socket is closed by
  * the library — caller has nothing to free on a cancel callback.
  * Contrast with accept/recv/send below, which leave their socket
  * intact on cancel.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_tcp_connect_async(
@@ -270,7 +273,7 @@ axl_tcp_connect_async(
  * to resume listening. Close the listener with `axl_tcp_close` when
  * done.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_tcp_accept_async(
@@ -296,7 +299,7 @@ axl_tcp_accept_async(
  * recv or send, or close it. Contrast with connect, which destroys
  * the sock on cancel.
  *
- * @return 0 if initiated, -1 on immediate failure.
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure.
  */
 int
 axl_tcp_recv_async(
@@ -339,7 +342,7 @@ axl_tcp_recv_get_size(
  * the send outcome as unknown and resync at the application level
  * if needed.
  *
- * @return 0 if initiated, -1 on immediate failure or if a send is
+ * @return AXL_OK if initiated, AXL_ERR on immediate failure or if a send is
  *   already in flight.
  */
 int

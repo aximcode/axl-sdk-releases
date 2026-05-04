@@ -35,7 +35,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     AxlUrl *u = NULL;
     int rc = axl_url_parse(input, &u);
-    if (rc == 0 && u != NULL) {
+    if (rc == AXL_OK && u != NULL) {
         //
         // Touch each field so ASan flags any uninitialized read or
         // bad strdup result the parser left behind.

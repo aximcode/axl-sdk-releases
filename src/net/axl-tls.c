@@ -19,24 +19,24 @@
 // ===================================================================
 
 bool axl_tls_available(void) { return false; }
-int  axl_tls_init(void) { return -1; }
+int  axl_tls_init(void) { return AXL_ERR; }
 void axl_tls_cleanup(void) {}
 int  axl_tls_generate_self_signed(const char *cn,
     const AxlIPv4Address *ips, size_t ip_count,
     void **cert, size_t *cert_len, void **key, size_t *key_len)
-{ (void)cn;(void)ips;(void)ip_count;(void)cert;(void)cert_len;(void)key;(void)key_len; return -1; }
+{ (void)cn;(void)ips;(void)ip_count;(void)cert;(void)cert_len;(void)key;(void)key_len; return AXL_ERR; }
 int  axl_tls_server_set_cert(const void *c, size_t cl, const void *k, size_t kl)
-{ (void)c;(void)cl;(void)k;(void)kl; return -1; }
+{ (void)c;(void)cl;(void)k;(void)kl; return AXL_ERR; }
 AxlTlsContext *axl_tls_accept(AxlTcp *s) { (void)s; return NULL; }
 AxlTlsContext *axl_tls_connect(AxlTcp *s, const char *h) { (void)s;(void)h; return NULL; }
 int  axl_tls_handshake(AxlTlsContext *c) { (void)c; return -1; }
 int  axl_tls_read(AxlTlsContext *c, void *b, size_t s, size_t *o)
 { (void)c;(void)b;(void)s;(void)o; return -1; }
 int  axl_tls_write(AxlTlsContext *c, const void *d, size_t l)
-{ (void)c;(void)d;(void)l; return -1; }
+{ (void)c;(void)d;(void)l; return AXL_ERR; }
 int  axl_tls_write_async(AxlTlsContext *c, const void *d, size_t l,
     AxlLoop *loop, AxlTcpCallback cb, void *data)
-{ (void)c;(void)d;(void)l;(void)loop;(void)cb;(void)data; return -1; }
+{ (void)c;(void)d;(void)l;(void)loop;(void)cb;(void)data; return AXL_ERR; }
 void axl_tls_free(AxlTlsContext *c) { (void)c; }
 void axl_tls_stage_data(AxlTlsContext *c, const void *d, size_t l)
 { (void)c;(void)d;(void)l; }
@@ -119,7 +119,7 @@ tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
 
     /* Direct send via TCP */
     int rc = axl_tcp_send(tc->sock, buf, len, TLS_SEND_TIMEOUT_MS);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
     }
     return (int)len;
@@ -155,7 +155,7 @@ int
 axl_tls_init(void)
 {
     if (g_initialized) {
-        return 0;
+        return AXL_OK;
     }
 
     mbedtls_ssl_config_init(&g_tls_config);
@@ -179,7 +179,7 @@ axl_tls_init(void)
                                 (const unsigned char *)"AXL", 3);
     if (ret != 0) {
         axl_warning("CTR-DRBG seed failed: -0x%04x", (unsigned)-ret);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Default server config (TLS 1.2) */
@@ -189,14 +189,14 @@ axl_tls_init(void)
         MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) {
         axl_warning("SSL config defaults failed: -0x%04x", (unsigned)-ret);
-        return -1;
+        return AXL_ERR;
     }
 
     mbedtls_ssl_conf_rng(&g_tls_config, mbedtls_ctr_drbg_random, &g_ctr_drbg);
 
     g_initialized = true;
     axl_info("initialized (mbedTLS)");
-    return 0;
+    return AXL_OK;
 }
 
 void
@@ -233,7 +233,7 @@ axl_tls_generate_self_signed(
     if (!g_initialized || cn == NULL ||
         cert_der == NULL || cert_len == NULL ||
         key_der == NULL || key_len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *cert_der = NULL;
@@ -251,7 +251,7 @@ axl_tls_generate_self_signed(
     if (ret != 0) {
         axl_warning("pk_setup failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
-        return -1;
+        return AXL_ERR;
     }
 
     ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
@@ -260,7 +260,7 @@ axl_tls_generate_self_signed(
     if (ret != 0) {
         axl_warning("key generation failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Export private key to DER */
@@ -269,7 +269,7 @@ axl_tls_generate_self_signed(
     if (ret < 0) {
         axl_warning("key export failed: -0x%04x", (unsigned)-ret);
         mbedtls_pk_free(&pk);
-        return -1;
+        return AXL_ERR;
     }
     /* mbedTLS writes backwards — data starts at key_buf + sizeof - ret */
     size_t klen = (size_t)ret;
@@ -418,12 +418,12 @@ axl_tls_generate_self_signed(
     mbedtls_pk_free(&pk);
 
     axl_info("generated self-signed cert: %s (%zu bytes)", subject, *cert_len);
-    return 0;
+    return AXL_OK;
 
 cert_fail:
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&pk);
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +439,7 @@ axl_tls_server_set_cert(
     )
 {
     if (!g_initialized || cert_der == NULL || key_der == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     int ret;
@@ -452,7 +452,7 @@ axl_tls_server_set_cert(
                                      cert_der, cert_len);
     if (ret != 0) {
         axl_warning("cert parse failed: -0x%04x", (unsigned)-ret);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Parse private key */
@@ -465,7 +465,7 @@ axl_tls_server_set_cert(
                                mbedtls_ctr_drbg_random, &g_ctr_drbg);
     if (ret != 0) {
         axl_warning("key parse failed: -0x%04x", (unsigned)-ret);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Attach to config */
@@ -473,11 +473,11 @@ axl_tls_server_set_cert(
                                     &g_server_cert, &g_server_key);
     if (ret != 0) {
         axl_warning("conf_own_cert failed: -0x%04x", (unsigned)-ret);
-        return -1;
+        return AXL_ERR;
     }
 
     axl_info("server certificate loaded");
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -660,11 +660,11 @@ axl_tls_write(
     )
 {
     if (ctx == NULL || data == NULL || len == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     int ret = mbedtls_ssl_write(&ctx->ssl, data, len);
-    return (ret == (int)len) ? 0 : -1;
+    return (ret == (int)len) ? AXL_OK : AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +679,7 @@ typedef struct {
 } TlsWriteAsyncCtx;
 
 static bool
-tls_write_async_done(AxlTcp *sock, int status, void *data)
+tls_write_async_done(AxlTcp *sock, AxlStatus status, void *data)
 {
     TlsWriteAsyncCtx *wctx = (TlsWriteAsyncCtx *)data;
     AxlTcpCallback    cb      = wctx->user_cb;
@@ -703,7 +703,7 @@ axl_tls_write_async(
     )
 {
     if (ctx == NULL || data == NULL || len == 0 || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Encrypt into the buffered output */
@@ -716,7 +716,7 @@ axl_tls_write_async(
 
     if (ret != (int)len || ctx->out_len == 0) {
         ctx->out_len = 0;
-        return -1;
+        return AXL_ERR;
     }
 
     /* Copy the encrypted data (out_buf is shared state) */
@@ -725,26 +725,26 @@ axl_tls_write_async(
     ctx->out_len = 0;
 
     if (enc_copy == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     TlsWriteAsyncCtx *wctx = axl_new(TlsWriteAsyncCtx);
     if (wctx == NULL) {
         axl_free(enc_copy);
-        return -1;
+        return AXL_ERR;
     }
     wctx->user_cb   = cb;
     wctx->user_data = cb_data;
     wctx->enc_buf   = enc_copy;
 
     if (axl_tcp_send_async(ctx->sock, enc_copy, enc_len, loop, NULL,
-                           tls_write_async_done, wctx) != 0) {
+                           tls_write_async_done, wctx) != AXL_OK) {
         axl_free(enc_copy);
         axl_free(wctx);
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

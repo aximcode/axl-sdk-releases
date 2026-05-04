@@ -41,7 +41,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
     int rc;
 
     if (path == NULL || buf == NULL || len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Firmware Read is uninterruptible, but a caller batching many
@@ -51,21 +51,21 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
         axl_warning("utf8_to_ucs2 failed: %s", path);
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_open(
         (const unsigned short *)wide_path, AXL_FILE_MODE_READ, 0, &handle);
     axl_free(wide_path);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_warning("open failed: %s", path);
-        return -1;
+        return AXL_ERR;
     }
 
     file_size_signed = axl_backend_file_get_size(handle);
     if (file_size_signed < 0) {
         axl_backend_file_close(&handle);
-        return -1;
+        return AXL_ERR;
     }
     file_size = (size_t)file_size_signed;
 
@@ -73,17 +73,17 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
     if (data == NULL) {
         axl_warning("allocation failed for %zu bytes", file_size);
         axl_backend_file_close(&handle);
-        return -1;
+        return AXL_ERR;
     }
 
     read_size = file_size;
     rc = axl_backend_file_read(handle, &read_size, data);
     axl_backend_file_close(&handle);
 
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_warning("read failed: %s", path);
         axl_free(data);
-        return -1;
+        return AXL_ERR;
     }
 
     /* NUL-terminate for convenience(not counted in len) */
@@ -91,7 +91,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
 
     *buf = data;
     *len = read_size;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -103,7 +103,7 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
     int rc;
 
     if (path == NULL || buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Yield at entry so a caller batching many whole-file writes
@@ -113,7 +113,7 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
         axl_warning("utf8_to_ucs2 failed: %s", path);
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_open(
@@ -121,20 +121,20 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
         AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE | AXL_FILE_MODE_CREATE,
         0, &handle);
     axl_free(wide_path);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_warning("open failed: %s", path);
-        return -1;
+        return AXL_ERR;
     }
 
     write_size = len;
     rc = axl_backend_file_write(handle, &write_size, buf);
     axl_backend_file_close(&handle);
 
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_warning("write failed: %s", path);
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -147,12 +147,12 @@ axl_file_info(
     int rc;
 
     if (path == NULL || info == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_stat(
@@ -171,7 +171,7 @@ axl_file_is_dir(const char *path)
 {
     AxlFileInfo info;
 
-    if (axl_file_info(path, &info) != 0) {
+    if (axl_file_info(path, &info) != AXL_OK) {
         return false;
     }
     return info.is_dir;
@@ -188,12 +188,12 @@ axl_file_delete(const char *path)
     int rc;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_delete((const unsigned short *)wide_path);
@@ -209,18 +209,18 @@ axl_file_rename(const char *old_path, const char *new_path)
     int rc;
 
     if (old_path == NULL || new_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_old = axl_utf8_to_ucs2(old_path);
     if (wide_old == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_new = axl_utf8_to_ucs2(new_path);
     if (wide_new == NULL) {
         axl_free(wide_old);
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_rename(
@@ -238,12 +238,12 @@ axl_dir_mkdir(const char *path)
     int rc;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_mkdir((const unsigned short *)wide_path);
@@ -258,12 +258,12 @@ axl_dir_rmdir(const char *path)
     int rc;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_backend_file_rmdir((const unsigned short *)wide_path);
@@ -302,7 +302,7 @@ axl_dir_open(const char *path)
         AXL_FILE_MODE_READ, 0, &handle);
     axl_free(wide_path);
 
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         return NULL;
     }
 
@@ -330,7 +330,7 @@ axl_dir_read(AxlDir *dir, AxlDirEntry *entry)
     /* Read one directory entry (EFI_FILE_INFO) */
     buf_size = sizeof(dir->buf);
     rc = axl_backend_file_read(dir->handle, &buf_size, dir->buf);
-    if (rc != 0 || buf_size == 0) {
+    if (rc != AXL_OK || buf_size == 0) {
         return false;
     }
 
@@ -493,7 +493,7 @@ axl_volume_get_label(
        to resolve "fs0:" to a filesystem handle and open the root */
     AxlFileHandle fh = NULL;
     if (axl_backend_file_open(wpath,
-                              AXL_FILE_MODE_READ, 0, &fh) != 0) {
+                              AXL_FILE_MODE_READ, 0, &fh) != AXL_OK) {
         return NULL;
     }
 
@@ -624,11 +624,11 @@ axl_dir_list_json(
     int    n;
 
     if (entries == NULL || buf == NULL || buf_size == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (buf_size < 3) {
-        return -1;  /* need room for at least "[]" + NUL */
+        return AXL_ERR;  /* need room for at least "[]" + NUL */
     }
 
     buf[pos++] = '[';
@@ -636,7 +636,7 @@ axl_dir_list_json(
     for (size_t i = 0; i < count; i++) {
         if (i > 0) {
             if (pos >= buf_size) {
-                return -1;
+                return AXL_ERR;
             }
             buf[pos++] = ',';
         }
@@ -649,18 +649,18 @@ axl_dir_list_json(
             entries[i].is_dir ? "true" : "false");
 
         if (n < 0 || (size_t)n >= buf_size - pos) {
-            return -1;
+            return AXL_ERR;
         }
         pos += (size_t)n;
     }
 
     if (pos + 1 >= buf_size) {
-        return -1;
+        return AXL_ERR;
     }
     buf[pos++] = ']';
     buf[pos] = '\0';
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -674,12 +674,12 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
     size_t  num = 0;
 
     if (count == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
-    if (axl_service_enumerate("simple-fs", &handles, &num) != 0) {
+    if (axl_service_enumerate("simple-fs", &handles, &num) != AXL_OK) {
         *count = 0;
-        return 0;
+        return AXL_OK;
     }
 
     size_t filled = 0;
@@ -700,5 +700,5 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
     axl_free(handles);
 
     *count = (out != NULL) ? (filled < max ? filled : max) : filled;
-    return 0;
+    return AXL_OK;
 }

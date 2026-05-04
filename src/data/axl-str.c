@@ -1380,18 +1380,18 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
     uint8_t  a, b, c, d;
 
     if (b64 == NULL || out == NULL || out_len == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     in_len = axl_strlen(b64);
     if (in_len == 0) {
         *out = axl_malloc(1);
         *out_len = 0;
-        return (*out != NULL) ? 0 : -1;
+        return (*out != NULL) ? AXL_OK : AXL_ERR;
     }
 
     if ((in_len % 4) != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     pad = 0;
@@ -1402,7 +1402,7 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
     raw = (uint8_t *)axl_malloc(raw_len + 1);
     if (raw == NULL) {
         axl_warning("base64_decode allocation failed");
-        return -1;
+        return AXL_ERR;
     }
 
     j = 0;
@@ -1414,23 +1414,23 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
 
         if (a == 0xFF || b == 0xFF) {
             axl_free(raw);
-            return -1;
+            return AXL_ERR;
         }
 
         raw[j++] = (uint8_t)((a << 2) | (b >> 4));
         if (j < raw_len) {
-            if (c == 0xFF && b64[i+2] != '=') { axl_free(raw); return -1; }
+            if (c == 0xFF && b64[i+2] != '=') { axl_free(raw); return AXL_ERR; }
             raw[j++] = (uint8_t)((b << 4) | (c >> 2));
         }
         if (j < raw_len) {
-            if (d == 0xFF && b64[i+3] != '=') { axl_free(raw); return -1; }
+            if (d == 0xFF && b64[i+3] != '=') { axl_free(raw); return AXL_ERR; }
             raw[j++] = (uint8_t)((c << 6) | d);
         }
     }
 
     *out = raw;
     *out_len = (size_t)raw_len;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,10 +1470,10 @@ axl_str_to_u64(
         *endptr = nptr;
     }
     if (nptr == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (base != 0 && (base < 2 || base > 36)) {
-        return -1;
+        return AXL_ERR;
     }
 
     const char *p = nptr;
@@ -1487,7 +1487,7 @@ axl_str_to_u64(
     if (*p == '+') {
         p++;
     } else if (*p == '-') {
-        return -1;
+        return AXL_ERR;
     }
 
     /* "0x"/"0X" prefix: required for base 0 to switch to hex,
@@ -1505,7 +1505,7 @@ axl_str_to_u64(
 
     /* Need at least one valid digit. */
     if (digit_value(*p, base) < 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Accumulate, checking overflow on each step. */
@@ -1519,7 +1519,7 @@ axl_str_to_u64(
             break;
         }
         if (val > cutoff || (val == cutoff && d > cutlim)) {
-            return -1;
+            return AXL_ERR;
         }
         val = val * (uint64_t)base + (uint64_t)d;
         p++;
@@ -1531,13 +1531,13 @@ axl_str_to_u64(
      * are the bug axl_strtou64 had. */
     if (endptr == NULL) {
         if (*p != '\0') {
-            return -1;
+            return AXL_ERR;
         }
     } else {
         *endptr = p;
     }
     *out = val;
-    return 0;
+    return AXL_OK;
 }
 
 /* Shared narrow-unsigned helper: parse via u64, range-check against
@@ -1555,7 +1555,7 @@ str_to_unarrow(
     if (out == NULL) {
         return -1;
     }
-    if (axl_str_to_u64(nptr, base, &v, endptr) != 0) {
+    if (axl_str_to_u64(nptr, base, &v, endptr) != AXL_OK) {
         return -1;
     }
     if (v > ceiling) {
@@ -1578,10 +1578,10 @@ axl_str_to_u32(
 {
     uint64_t v;
     if (str_to_unarrow(nptr, base, UINT32_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(uint32_t *)out = (uint32_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1594,10 +1594,10 @@ axl_str_to_u16(
 {
     uint64_t v;
     if (str_to_unarrow(nptr, base, UINT16_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(uint16_t *)out = (uint16_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1610,10 +1610,10 @@ axl_str_to_u8(
 {
     uint64_t v;
     if (str_to_unarrow(nptr, base, UINT8_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(uint8_t *)out = (uint8_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1628,7 +1628,7 @@ axl_str_to_s64(
         *endptr = nptr;
     }
     if (nptr == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     const char *p = nptr;
@@ -1650,11 +1650,11 @@ axl_str_to_s64(
      * range, restore endptr to nptr — contract is "endptr untouched
      * past nptr on error" and overflow is an error. */
     uint64_t v;
-    if (axl_str_to_u64(p, base, &v, endptr) != 0) {
+    if (axl_str_to_u64(p, base, &v, endptr) != AXL_OK) {
         if (endptr != NULL) {
             *endptr = nptr;
         }
-        return -1;
+        return AXL_ERR;
     }
 
     if (negative) {
@@ -1662,7 +1662,7 @@ axl_str_to_s64(
             if (endptr != NULL) {
                 *endptr = nptr;
             }
-            return -1;
+            return AXL_ERR;
         }
         /* -INT64_MIN is undefined; build it without negating. */
         *out = (v == (uint64_t)INT64_MAX + 1u)
@@ -1673,11 +1673,11 @@ axl_str_to_s64(
             if (endptr != NULL) {
                 *endptr = nptr;
             }
-            return -1;
+            return AXL_ERR;
         }
         *out = (int64_t)v;
     }
-    return 0;
+    return AXL_OK;
 }
 
 /* Shared narrow-signed helper: parse via s64, range-check against
@@ -1719,10 +1719,10 @@ axl_str_to_s32(
 {
     int64_t v;
     if (str_to_snarrow(nptr, base, INT32_MIN, INT32_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(int32_t *)out = (int32_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1735,10 +1735,10 @@ axl_str_to_s16(
 {
     int64_t v;
     if (str_to_snarrow(nptr, base, INT16_MIN, INT16_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(int16_t *)out = (int16_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1751,10 +1751,10 @@ axl_str_to_s8(
 {
     int64_t v;
     if (str_to_snarrow(nptr, base, INT8_MIN, INT8_MAX, &v, endptr) != 0) {
-        return -1;
+        return AXL_ERR;
     }
     *(int8_t *)out = (int8_t)v;
-    return 0;
+    return AXL_OK;
 }
 
 uint64_t
@@ -1808,7 +1808,7 @@ axl_strtou64_with_offset(
     uint64_t    *out
     )
 {
-    if (s == NULL || out == NULL) { return -1; }
+    if (s == NULL || out == NULL) { return AXL_ERR; }
 
     /* Dogfooded with AxlStrReader. Grammar:
      *   value := u64
@@ -1818,30 +1818,30 @@ axl_strtou64_with_offset(
     axl_str_reader_init(&r, s);
 
     uint64_t base_val = 0;
-    if (!axl_str_reader_take_u64(&r, 0, &base_val)) { return -1; }
+    if (!axl_str_reader_take_u64(&r, 0, &base_val)) { return AXL_ERR; }
 
     /* No offset: input must be fully consumed. */
     if (axl_str_reader_eof(&r)) {
         *out = base_val;
-        return 0;
+        return AXL_OK;
     }
 
     /* Otherwise must be '+' followed by an unsigned literal with no
      * sign chars or whitespace. Sticky-ok handles the chain. */
-    if (!axl_str_reader_consume_char(&r, '+')) { return -1; }
+    if (!axl_str_reader_consume_char(&r, '+')) { return AXL_ERR; }
     char next = axl_str_reader_peek(&r);
     if (next == '+' || next == '-' || next == ' ' || next == '\t' || next == '\0') {
-        return -1;
+        return AXL_ERR;
     }
 
     uint64_t off_val = 0;
-    if (!axl_str_reader_take_u64(&r, 0, &off_val)) { return -1; }
-    if (!axl_str_reader_eof(&r))                   { return -1; }
+    if (!axl_str_reader_take_u64(&r, 0, &off_val)) { return AXL_ERR; }
+    if (!axl_str_reader_eof(&r))                   { return AXL_ERR; }
 
     /* Sum, with overflow check. */
-    if (off_val > UINT64_MAX - base_val) { return -1; }
+    if (off_val > UINT64_MAX - base_val) { return AXL_ERR; }
     *out = base_val + off_val;
-    return 0;
+    return AXL_OK;
 }
 
 // ===========================================================================
@@ -2060,7 +2060,7 @@ axl_str_reader_take_u64(
 
     uint64_t     v;
     const char  *endptr = NULL;
-    if (axl_str_to_u64(tmp, base, &v, &endptr) != 0 || endptr == tmp) {
+    if (axl_str_to_u64(tmp, base, &v, &endptr) != AXL_OK || endptr == tmp) {
         r->ok = false;
         return false;
     }

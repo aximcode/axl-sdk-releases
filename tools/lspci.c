@@ -236,7 +236,7 @@ print_caps(
     uint16_t off = 0;
     uint16_t id;
     int      walked = 0;
-    while (axl_pci_cap_next(a, off, &off, &id) == 0) {
+    while (axl_pci_cap_next(a, off, &off, &id) == AXL_OK) {
         axl_printf("\tCapabilities: [%02x] %s\n",
                    (unsigned)off, axl_pci_cap_id_str((uint8_t)id));
         if (++walked > 64) {
@@ -254,7 +254,7 @@ print_ext_caps(
     uint16_t off = 0;
     uint16_t id;
     int      walked = 0;
-    while (axl_pci_ext_cap_next(a, off, &off, &id) == 0) {
+    while (axl_pci_ext_cap_next(a, off, &off, &id) == AXL_OK) {
         axl_printf("\tExtended Capabilities: [%03x v?] %s\n",
                    (unsigned)off, axl_pci_ext_cap_id_str(id));
         if (++walked > 64) {
@@ -274,7 +274,7 @@ print_subsystem(
        capability instead, not at 0x2C — skip on bridges to avoid
        printing junk. */
     uint8_t htype;
-    if (axl_pci_read_config_8(a, 0x0E, &htype) != 0) {
+    if (axl_pci_read_config_8(a, 0x0E, &htype) != AXL_OK) {
         return;
     }
     if ((htype & 0x7Fu) != 0) {
@@ -321,7 +321,7 @@ print_hex_dump(
        partial read (e.g. legacy device with no ECAM). */
     static uint8_t buf[4096];
     size_t ok = 0;
-    if (axl_pci_dump(a, buf, bytes, &ok) != 0) {
+    if (axl_pci_dump(a, buf, bytes, &ok) != AXL_OK) {
         return;
     }
     /* lspci(8) -x format: "OO: BB BB BB BB BB BB BB BB BB BB BB BB BB BB BB BB" */
@@ -345,7 +345,7 @@ list_function(
     )
 {
     uint16_t vid, did;
-    if (axl_pci_get_vid_did(a, &vid, &did) != 0) {
+    if (axl_pci_get_vid_did(a, &vid, &did) != AXL_OK) {
         if (diagnose_absent) {
             print_bdf(a);
             axl_print(" no device\n");
@@ -394,7 +394,7 @@ tree_print_cb(
     (void)ctx; (void)is_bridge;
 
     uint16_t vid, did;
-    if (axl_pci_get_vid_did(addr, &vid, &did) != 0) {
+    if (axl_pci_get_vid_did(addr, &vid, &did) != AXL_OK) {
         return 0;
     }
     if (!match_filters(addr, vid, did)) {
@@ -501,7 +501,7 @@ run_lspci(
 
     const char *addr_str = axl_args_get_string(a, "addr");
     if (addr_str != NULL && addr_str[0] != '\0') {
-        if (axl_pci_addr_parse(addr_str, &filter_addr) != 0) {
+        if (axl_pci_addr_parse(addr_str, &filter_addr) != AXL_OK) {
             axl_printf("lspci: invalid -s value '%s' "
                        "(expected [SSSS:]BB:DD.F)\n", addr_str);
             return 1;

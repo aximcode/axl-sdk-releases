@@ -251,7 +251,7 @@ main(int argc, char **argv)
 
     axl_printf("axlk-hwinfo-server: starting\n");
 
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("FAIL: network not available\n");
         return 1;
     }

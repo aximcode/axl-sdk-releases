@@ -17,13 +17,13 @@ main(int argc, char **argv)
        ConnectController, wait up to 10 s for DHCP. axl_net_auto_init
        is idempotent and short-circuits if SNP is already up
        (typical when the firmware shell already ran `connect -r`). */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("Network: bring-up failed (no NIC, or no DHCP)\n");
         return 1;
     }
 
     AxlIPv4Address addr;
-    if (axl_net_get_ip_address(&addr) == 0) {
+    if (axl_net_get_ip_address(&addr) == AXL_OK) {
         axl_printf("Network: %d.%d.%d.%d\n",
                    addr.addr[0], addr.addr[1],
                    addr.addr[2], addr.addr[3]);

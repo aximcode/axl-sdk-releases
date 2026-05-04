@@ -104,7 +104,7 @@ find_walk(
         AxlDirEntry de = { .is_dir = false };
         axl_strlcpy(de.name, name, sizeof(de.name));
         AxlFileInfo fi;
-        if (axl_file_info(base_path, &fi) == 0) de.size = fi.size;
+        if (axl_file_info(base_path, &fi) == AXL_OK) de.size = fi.size;
         print_entry(base_path, &de);
         return 1;
     }

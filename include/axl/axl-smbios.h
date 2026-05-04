@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,7 +28,7 @@ typedef struct {
 
 /// Common SMBIOS table types. Values match the SMBIOS specification;
 /// use these constants instead of bare numbers for readability.
-enum {
+typedef enum {
     AXL_SMBIOS_TYPE_BIOS_INFO           = 0,    ///< BIOS Information
     AXL_SMBIOS_TYPE_SYSTEM_INFO         = 1,    ///< System Information (manufacturer, product, UUID)
     AXL_SMBIOS_TYPE_BASEBOARD           = 2,    ///< Baseboard / Module
@@ -48,19 +49,19 @@ enum {
     AXL_SMBIOS_TYPE_ONBOARD_DEVICE_EXT  = 41,   ///< Onboard Devices Extended Information
     AXL_SMBIOS_TYPE_MGMT_HOST_INTERFACE = 42,   ///< Management Controller Host Interface (Redfish, OEM, ...)
     AXL_SMBIOS_TYPE_END                 = 127,  ///< End-of-table sentinel
-};
+} AxlSmbiosTableType;
 
 /// IPMI interface type codes (Type 38 offset 0x04).
-enum {
+typedef enum {
     AXL_SMBIOS_IPMI_UNKNOWN             = 0x00,
     AXL_SMBIOS_IPMI_KCS                 = 0x01,
     AXL_SMBIOS_IPMI_SMIC                = 0x02,
     AXL_SMBIOS_IPMI_BT                  = 0x03,
     AXL_SMBIOS_IPMI_SSIF                = 0x04,
-};
+} AxlSmbiosIpmiInterface;
 
 /// Management Controller Host Interface types (Type 42 offset 0x04).
-enum {
+typedef enum {
     AXL_SMBIOS_HIF_KCS                  = 0x02,  ///< Keyboard Controller Style
     AXL_SMBIOS_HIF_UART_8250            = 0x03,
     AXL_SMBIOS_HIF_UART_16450           = 0x04,
@@ -70,15 +71,15 @@ enum {
     AXL_SMBIOS_HIF_UART_16850           = 0x08,
     AXL_SMBIOS_HIF_NETWORK              = 0x40,  ///< Network Host Interface (used for Redfish)
     AXL_SMBIOS_HIF_OEM                  = 0xF0,  ///< OEM-defined
-};
+} AxlSmbiosHostIfaceType;
 
 /// Management Controller Host Interface protocols (Type 42 protocol record).
-enum {
+typedef enum {
     AXL_SMBIOS_HIP_IPMI                 = 0x02,
     AXL_SMBIOS_HIP_MCTP                 = 0x03,
     AXL_SMBIOS_HIP_REDFISH_OVER_IP      = 0x04,  ///< Requires SMBIOS 3.2+
     AXL_SMBIOS_HIP_OEM                  = 0xF0,
-};
+} AxlSmbiosHostIfaceProtocol;
 
 // ---------------------------------------------------------------------------
 // Typed record accessors
@@ -122,7 +123,7 @@ typedef struct {
 /// — semantically distinct, but we expose both via the same UNKNOWN
 /// enum and let callers compare the raw byte against 0x02 directly
 /// if they care.
-enum {
+typedef enum {
     AXL_SMBIOS_BOARD_TYPE_UNKNOWN              = 0x00,
     AXL_SMBIOS_BOARD_TYPE_OTHER                = 0x01,
     AXL_SMBIOS_BOARD_TYPE_SPEC_UNKNOWN         = 0x02,
@@ -137,7 +138,7 @@ enum {
     AXL_SMBIOS_BOARD_TYPE_PROC_MEM_MODULE      = 0x0B,
     AXL_SMBIOS_BOARD_TYPE_PROC_IO_MODULE       = 0x0C,
     AXL_SMBIOS_BOARD_TYPE_INTERCONNECT_BOARD   = 0x0D,
-};
+} AxlSmbiosBoardType;
 
 /// Type 2 — Baseboard Information.
 typedef struct {
@@ -192,7 +193,7 @@ typedef struct {
 
 /**
  * @brief Read Type 0 (BIOS Information) from the SMBIOS table.
- * @return 0 on success, -1 if no Type 0 record is present.
+ * @return AXL_OK on success, AXL_ERR if no Type 0 record is present.
  */
 int axl_smbios_read_bios_info(AxlSmbiosBiosInfo *out);
 
@@ -209,25 +210,25 @@ int axl_smbios_read_bios_info(AxlSmbiosBiosInfo *out);
  *
  * @param bytes  raw 16 bytes from the SMBIOS Type 1 UUID field
  * @param out    output buffer of at least 37 bytes (36 + NUL)
- * @return 0 on success, -1 on NULL args.
+ * @return AXL_OK on success, AXL_ERR on NULL args.
  */
 int axl_smbios_format_uuid(const uint8_t bytes[16], char out[37]);
 
 /**
  * @brief Read Type 1 (System Information) from the SMBIOS table.
- * @return 0 on success, -1 if no Type 1 record is present.
+ * @return AXL_OK on success, AXL_ERR if no Type 1 record is present.
  */
 int axl_smbios_read_system_info(AxlSmbiosSystemInfo *out);
 
 /**
  * @brief Read Type 2 (Baseboard Information) from the SMBIOS table.
- * @return 0 on success, -1 if no Type 2 record is present.
+ * @return AXL_OK on success, AXL_ERR if no Type 2 record is present.
  */
 int axl_smbios_read_baseboard(AxlSmbiosBaseboardInfo *out);
 
 /**
  * @brief Read Type 3 (System Enclosure / Chassis) from the SMBIOS table.
- * @return 0 on success, -1 if no Type 3 record is present.
+ * @return AXL_OK on success, AXL_ERR if no Type 3 record is present.
  */
 int axl_smbios_read_chassis(AxlSmbiosChassisInfo *out);
 
@@ -238,7 +239,7 @@ int axl_smbios_read_chassis(AxlSmbiosChassisInfo *out);
  * `axl_smbios_find_next(AXL_SMBIOS_TYPE_PROCESSOR, prev)` and call this
  * for each result.
  *
- * @return 0 on success, -1 if @a hdr is NULL or the wrong record type.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL or the wrong record type.
  */
 int axl_smbios_read_processor(AxlSmbiosHeader *hdr, AxlSmbiosProcessorInfo *out);
 
@@ -249,7 +250,7 @@ int axl_smbios_read_processor(AxlSmbiosHeader *hdr, AxlSmbiosProcessorInfo *out)
  * Enumerate with `axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE, prev)`
  * and call this for each result.
  *
- * @return 0 on success, -1 if @a hdr is NULL or the wrong record type.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL or the wrong record type.
  */
 int axl_smbios_read_memory_device(AxlSmbiosHeader *hdr, AxlSmbiosMemoryDevice *out);
 
@@ -354,7 +355,7 @@ typedef struct {
  * `axl_smbios_find_next(AXL_SMBIOS_TYPE_PORT_CONNECTOR, prev)` and call
  * this for each result.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_port_connector(AxlSmbiosHeader *hdr, AxlSmbiosPortConnector *out);
 
@@ -365,7 +366,7 @@ int axl_smbios_read_port_connector(AxlSmbiosHeader *hdr, AxlSmbiosPortConnector 
  * documented sentinels (0xFFFF / 0xFF / 0) when the firmware's record is
  * too short to carry them.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_system_slot(AxlSmbiosHeader *hdr, AxlSmbiosSystemSlot *out);
 
@@ -376,7 +377,7 @@ int axl_smbios_read_system_slot(AxlSmbiosHeader *hdr, AxlSmbiosSystemSlot *out);
  * `strings[]` with pointers into the SMBIOS table memory (valid for the
  * life of the app). Caps at 16 entries — anything beyond is ignored.
  *
- * @return 0 on success, -1 if @a hdr is NULL or wrong type.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL or wrong type.
  */
 int axl_smbios_read_oem_strings(AxlSmbiosHeader *hdr, AxlSmbiosOemStrings *out);
 
@@ -401,7 +402,7 @@ int axl_smbios_read_oem_strings(AxlSmbiosHeader *hdr, AxlSmbiosOemStrings *out);
  * failure modes (no Type 11 record, index out of range, bad args)
  * leave @p *required unchanged.
  *
- * @return 0 on success, -1 if no Type 11 record exists, the
+ * @return AXL_OK on success, AXL_ERR if no Type 11 record exists, the
  *     index is out of range, @p buf / @p buf_cap are bad, or
  *     @p buf_cap is too small for the matched string.
  */
@@ -418,7 +419,7 @@ axl_smbios_get_oem_string(
  *
  * Resolves the 32→64-bit max-capacity fallback automatically.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_physical_memory_array(AxlSmbiosHeader *hdr, AxlSmbiosPhysicalMemoryArray *out);
 
@@ -427,7 +428,7 @@ int axl_smbios_read_physical_memory_array(AxlSmbiosHeader *hdr, AxlSmbiosPhysica
  *
  * Resolves the 32→64-bit address fallback automatically.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_memory_array_map(AxlSmbiosHeader *hdr, AxlSmbiosMemoryArrayMap *out);
 
@@ -436,14 +437,14 @@ int axl_smbios_read_memory_array_map(AxlSmbiosHeader *hdr, AxlSmbiosMemoryArrayM
  *
  * Resolves the 32→64-bit address fallback automatically.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_memory_device_map(AxlSmbiosHeader *hdr, AxlSmbiosMemoryDeviceMap *out);
 
 /**
  * @brief Read a Type 41 (Onboard Devices Extended) record.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or too short.
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or too short.
  */
 int axl_smbios_read_onboard_device_ext(AxlSmbiosHeader *hdr, AxlSmbiosOnboardDeviceExt *out);
 
@@ -482,7 +483,7 @@ typedef struct {
  * This is what AxlIpmi's transport auto-detector reads to decide
  * between KCS, SMIC, BT, and SSIF.
  *
- * @return 0 on success, -1 if no Type 38 record is present.
+ * @return AXL_OK on success, AXL_ERR if no Type 38 record is present.
  */
 int axl_smbios_read_ipmi_device_info(AxlSmbiosIpmiDeviceInfo *out);
 
@@ -495,7 +496,7 @@ int axl_smbios_read_ipmi_device_info(AxlSmbiosIpmiDeviceInfo *out);
  * modern variable-length layout; older spec versions of Type 42 are not
  * supported and return -1.
  *
- * @return 0 on success, -1 if @a hdr is NULL, wrong type, or the record
+ * @return AXL_OK on success, AXL_ERR if @a hdr is NULL, wrong type, or the record
  *         layout is too old to decode.
  */
 int axl_smbios_read_host_interface(AxlSmbiosHeader *hdr, AxlSmbiosHostInterface *out);
@@ -510,7 +511,7 @@ int axl_smbios_read_host_interface(AxlSmbiosHeader *hdr, AxlSmbiosHostInterface 
  *
  * @param hdr_out    optional — receives the matching Type 42 header
  * @param iface_out  optional — receives the parsed interface (typed reader output)
- * @return 0 on success, -1 if nothing matches.
+ * @return AXL_OK on success, AXL_ERR if nothing matches.
  */
 int axl_smbios_find_redfish_host_interface(
     AxlSmbiosHeader        **hdr_out,
@@ -525,7 +526,7 @@ int axl_smbios_find_redfish_host_interface(
  * form expects big-endian. This helper returns the RFC 4122 byte order
  * so you can feed the result to anything expecting canonical UUID bytes.
  *
- * @return 0 on success, -1 if no Type 1 record or UUID is unset
+ * @return AXL_OK on success, AXL_ERR if no Type 1 record or UUID is unset
  *         (all 0x00 or all 0xFF per the spec's "not present" markers).
  */
 int axl_smbios_get_system_uuid(uint8_t out[16]);
@@ -577,6 +578,52 @@ axl_smbios_copy_string_utf8(
     uint8_t           string_index,  ///< 1-based string index (0 writes empty + returns 0)
     char             *buf,           ///< destination buffer
     size_t            buf_size       ///< destination buffer capacity
+);
+
+/**
+ * @brief Get the address range of the raw SMBIOS structure table.
+ *
+ * Returns the [start, end) byte range of the contiguous SMBIOS
+ * structure region as published by firmware (SMBIOS3 entry point's
+ * `TableAddress`/`TableMaximumSize`, or the SMBIOS 2.x equivalent).
+ *
+ * Tools that need the typed lookups (`axl_smbios_find`, etc.) don't
+ * need this. Callers that want to dump the raw bytes — e.g. fixture
+ * capture (mkfixture) producing a `dmidecode --dump-bin`-compatible
+ * blob, or a snapshot tool — use this to know how many bytes the
+ * firmware exposed without re-implementing the EFI Configuration
+ * Table walk.
+ *
+ * Both out parameters must be non-NULL.
+ *
+ * @return AXL_OK on success; AXL_ERR if the firmware did not publish an
+ *     SMBIOS table or either out pointer is NULL.
+ */
+int
+axl_smbios_table_range(
+    uint8_t  **out_start,   ///< [out] receives start of structure region (inclusive)
+    uint8_t  **out_end      ///< [out] receives end of structure region (exclusive)
+);
+
+/**
+ * @brief Get the SMBIOS entry-point structure bytes.
+ *
+ * Returns the address and size of the SMBIOS entry-point structure
+ * itself (24 bytes for SMBIOS3, 31 bytes for SMBIOS 2.x — the
+ * `Length` field of the structure). Tools that produce a
+ * `dmidecode --dump-bin`-compatible blob concatenate this with the
+ * table data from @ref axl_smbios_table_range to write the standard
+ * file format that QEMU's `-smbios file=` consumes.
+ *
+ * Both out parameters must be non-NULL.
+ *
+ * @return AXL_OK on success; AXL_ERR if the firmware did not publish an
+ *     SMBIOS table or either out pointer is NULL.
+ */
+int
+axl_smbios_entry_point(
+    uint8_t  **out_base,    ///< [out] receives entry-point base
+    size_t    *out_size     ///< [out] receives entry-point structure size in bytes
 );
 
 /**
@@ -757,7 +804,7 @@ axl_smbios_chassis_class(
  * Device fields were added in SMBIOS 2.7, and Type 43 TPM Device requires
  * 3.1 or later.
  *
- * @return 0 on success, -1 if no SMBIOS table was found.
+ * @return AXL_OK on success, AXL_ERR if no SMBIOS table was found.
  */
 int
 axl_smbios_version(

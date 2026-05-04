@@ -101,13 +101,16 @@ static size_t  mTotalBytes;
 
 #ifdef AXL_MEM_DEBUG
 static AXL_MEM_HEADER  *mAllocList;
+#endif
 
 /* Fault-injection counter for OOM testing. 0 = disabled; N > 0
    causes the Nth subsequent allocation through axl_malloc_impl to
    return NULL without touching the backend. Set via
-   axl_mem_fail_next_alloc(). */
+   axl_mem_fail_next_alloc(). Always present (not gated by
+   AXL_MEM_DEBUG) so consumers can exercise their real error-
+   handling paths in either build mode — the cost is one
+   well-predicted branch per allocation. */
 static size_t  mFailNextAlloc;
-#endif
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -258,11 +261,12 @@ axl_malloc_impl(
         size = 1;
     }
 
-#ifdef AXL_MEM_DEBUG
     /* Fault injection for OOM path testing. Fires without touching
        the backend so callers exercise their real error-handling
        path, and logs at debug level so the real-OOM error signal
-       stays clean. See axl_mem_fail_next_alloc in axl-mem.h. */
+       stays clean. See axl_mem_fail_next_alloc in axl-mem.h.
+       Always-on (not gated by AXL_MEM_DEBUG) so the documented
+       public-API contract holds in both DEBUG and RELEASE. */
     if (mFailNextAlloc > 0) {
         mFailNextAlloc--;
         if (mFailNextAlloc == 0) {
@@ -273,7 +277,6 @@ axl_malloc_impl(
             return NULL;
         }
     }
-#endif
 
     total = total_size(size);
     hdr = (AXL_MEM_HEADER *)axl_backend_alloc(total);
@@ -514,11 +517,7 @@ axl_mem_fail_next_alloc(
     size_t  n
     )
 {
-#ifdef AXL_MEM_DEBUG
     mFailNextAlloc = n;
-#else
-    (void)n;
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +534,7 @@ axl_alloc_pages(
     EFI_PHYSICAL_ADDRESS addr = 0;
 
     if (count == 0 || phys_addr == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->AllocatePages(
@@ -545,11 +544,11 @@ axl_alloc_pages(
         &addr);
 
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     *phys_addr = (uint64_t)addr;
-    return 0;
+    return AXL_OK;
 }
 
 void

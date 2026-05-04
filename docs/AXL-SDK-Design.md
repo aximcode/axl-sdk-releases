@@ -145,6 +145,17 @@ dependencies.
 These use a different subsystem value in the PE/COFF header and
 the driver provides its own entry point (no axl-crt0).
 
+### C++ bindings (planned, not yet shipped)
+
+A sibling C++ wrapper library — `axlmm`, modeled on glibmm — is
+on the roadmap (see [`ROADMAP.md` §"C++ Bindings — `axlmm` (Future)"](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/ROADMAP.md#c-bindings--axlmm-future)).
+The C library stays canonical; `axlmm` ships as a separate
+package (`axl-sdk-cpp.deb` / `.rpm`) so plain C consumers carry
+no libstdc++ runtime cost. A new `axl-c++` toolchain driver
+mirrors `axl-cc` but invokes `g++`. Headers under
+`include/axlmm/*.hpp`, namespace `axlmm`, build-gated by
+`AXL_CPP=1` at install time.
+
 ### Async-op cancellation
 
 Async operations in AXL (`axl_tcp_connect_async`,

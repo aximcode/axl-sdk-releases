@@ -36,23 +36,23 @@ axl_image_load(
     )
 {
     if (path == NULL || out == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     *out = NULL;
 
     AxlDriverHandle h = NULL;
-    if (axl_driver_load(path, &h) != 0 || h == NULL) {
-        return -1;
+    if (axl_driver_load(path, &h) != AXL_OK || h == NULL) {
+        return AXL_ERR;
     }
 
     AxlImage *img = axl_malloc(sizeof(*img));
     if (img == NULL) {
         axl_driver_unload(h);
-        return -1;
+        return AXL_ERR;
     }
     img->handle = h;
     *out = img;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -62,7 +62,7 @@ axl_image_start(
     )
 {
     if (img == NULL || img->handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     UINTN       exit_data_size = 0;
@@ -91,7 +91,7 @@ axl_image_start(
        hard failure is when StartImage couldn't transfer control at
        all; UEFI doesn't distinguish those cleanly, but in practice
        those failures manifest as crashes that don't return here. */
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -100,9 +100,9 @@ axl_image_unload(
     )
 {
     if (img == NULL) {
-        return 0;
+        return AXL_OK;
     }
-    int rc = 0;
+    int rc = AXL_OK;
     if (img->handle != NULL) {
         rc = axl_driver_unload(img->handle);
     }

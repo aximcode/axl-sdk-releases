@@ -65,7 +65,7 @@ get_timestamp(void)
 {
     AxlTime time;
 
-    if (axl_backend_get_time(&time) != 0) {
+    if (axl_backend_get_time(&time) != AXL_OK) {
         return 0;
     }
 

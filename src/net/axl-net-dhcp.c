@@ -40,14 +40,14 @@ axl_net_set_static_ip(
     EFI_STATUS status;
 
     if (ip == NULL || netmask == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
-    if (axl_service_enumerate("ip4-config2", &handles, &count) != 0
+    if (axl_service_enumerate("ip4-config2", &handles, &count) != AXL_OK
         || count == 0)
     {
         axl_warning("no IP4Config2 protocol found");
-        return -1;
+        return AXL_ERR;
     }
 
     size_t idx = (nic_index < count) ? nic_index : 0;
@@ -60,7 +60,7 @@ axl_net_set_static_ip(
     axl_free(handles);
 
     if (cfg == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Set policy to static (value 0) */
@@ -72,7 +72,7 @@ axl_net_set_static_ip(
     if (EFI_ERROR(status)) {
         axl_warning("failed to set static policy: %llx",
                    (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Set manual address + subnet mask */
@@ -88,7 +88,7 @@ axl_net_set_static_ip(
     if (EFI_ERROR(status)) {
         axl_warning("failed to set manual address: %llx",
                    (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Set gateway if provided */
@@ -107,7 +107,7 @@ axl_net_set_static_ip(
         }
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ net_count_snp(void)
 {
     void  **handles = NULL;
     size_t  count = 0;
-    if (axl_service_enumerate("simple-network", &handles, &count) == 0) {
+    if (axl_service_enumerate("simple-network", &handles, &count) == AXL_OK) {
         axl_free(handles);
     }
     return count;
@@ -150,10 +150,14 @@ net_count_snp(void)
 int
 axl_net_ensure_drivers(void)
 {
+    size_t snp_before = net_count_snp();
+    axl_info("ensure_drivers: starting (%zu SNP handles already present)",
+             snp_before);
+
     /* Short-circuit if SNP is already registered. This makes the call
      * idempotent — safe for tools to invoke unconditionally before any
      * networking work. */
-    if (net_count_snp() > 0) {
+    if (snp_before > 0) {
         return AXL_NET_DRIVERS_OK;
     }
 
@@ -168,13 +172,13 @@ axl_net_ensure_drivers(void)
          * the wrong primitive here: it unloads on protocol-not-registered,
          * but the chain SNP→MNP→IP→TCP requires multiple drivers loaded
          * before any single protocol becomes available. */
-        if (axl_driver_locate(name, path, sizeof(path)) != 0) {
+        if (axl_driver_locate(name, path, sizeof(path)) != AXL_OK) {
             axl_debug("ensure_drivers: %s not on any volume", name);
             continue;
         }
 
         AxlDriverHandle drv = NULL;
-        if (axl_driver_load(path, &drv) != 0 || drv == NULL) {
+        if (axl_driver_load(path, &drv) != AXL_OK || drv == NULL) {
             axl_warning("ensure_drivers: load failed for '%s'", path);
             continue;
         }
@@ -206,7 +210,11 @@ axl_net_ensure_drivers(void)
      * handle and per-handle reconnects (mirroring shell `connect -r`). */
     axl_driver_connect(NULL);
 
-    if (net_count_snp() > 0) {
+    size_t snp_after = net_count_snp();
+    axl_info("ensure_drivers: %zu drivers loaded, SNP handles %zu→%zu",
+             loaded_count, snp_before, snp_after);
+
+    if (snp_after > 0) {
         return AXL_NET_DRIVERS_OK;
     }
 
@@ -230,7 +238,7 @@ net_connect_snp_handles(void)
      * harmless and matches the prior behavior tools relied on. */
     void  **snp_handles = NULL;
     size_t  snp_count = 0;
-    if (axl_service_enumerate("simple-network", &snp_handles, &snp_count) == 0) {
+    if (axl_service_enumerate("simple-network", &snp_handles, &snp_count) == AXL_OK) {
         for (size_t i = 0; i < snp_count; i++) {
             axl_driver_connect_handle(snp_handles[i]);
         }
@@ -256,8 +264,8 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
      * the DHCP path below and leave the caller with no IP. Use the
      * stricter get_ip_address() check that matches our contract.
      */
-    if (axl_net_get_ip_address(&addr) == 0) {
-        return 0;
+    if (axl_net_get_ip_address(&addr) == AXL_OK) {
+        return AXL_OK;
     }
 
     /* Locate and load NIC drivers (and NetworkCommon) if SNP isn't up
@@ -276,7 +284,7 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
 
         for (int attempt = 0; attempt < 50; attempt++) {
             iface_count = 4;
-            if (axl_net_list_interfaces(ifaces, &iface_count) == 0) {
+            if (axl_net_list_interfaces(ifaces, &iface_count) == AXL_OK) {
                 for (size_t i = 0; i < iface_count; i++) {
                     if (ifaces[i].link_up) {
                         link_found = true;
@@ -300,11 +308,11 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
      */
     void  **cfg_handles = NULL;
     size_t  cfg_count = 0;
-    if (axl_service_enumerate("ip4-config2", &cfg_handles, &cfg_count) != 0
+    if (axl_service_enumerate("ip4-config2", &cfg_handles, &cfg_count) != AXL_OK
         || cfg_count == 0)
     {
         axl_warning("no IP4Config2 protocol found");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Select NIC */
@@ -319,7 +327,7 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
     axl_free(cfg_handles);
 
     if (ip4cfg == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Set DHCP policy (value 1 = DHCP per UEFI spec) */
@@ -335,9 +343,9 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
 
     /* Poll for IP assignment — strict get_ip_address() check, see above */
     for (elapsed = 0; elapsed < timeout; elapsed++) {
-        if (axl_net_get_ip_address(&addr) == 0) {
+        if (axl_net_get_ip_address(&addr) == AXL_OK) {
             axl_info("network ready after %zu seconds", elapsed + 1);
-            return 0;
+            return AXL_OK;
         }
         if (axl_wait_ms(NULL, 1000) == AXL_CANCELLED) {
             break;  /* Ctrl-C */
@@ -345,5 +353,5 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
     }
 
     axl_warning("DHCP timeout after %zu seconds", timeout);
-    return -1;
+    return AXL_ERR;
 }

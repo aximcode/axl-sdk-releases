@@ -386,7 +386,7 @@ do_create(
 {
     /* Get RAM disk protocol */
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
-    if (axl_service_find("ram-disk", (void **)&rd_proto) != 0 ||
+    if (axl_service_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
         rd_proto == NULL) {
         axl_printf("MkRd: EFI_RAM_DISK_PROTOCOL not available.\n");
         axl_printf("Load RamDiskDxe.efi first.\n");
@@ -396,7 +396,7 @@ do_create(
     /* Check for duplicate label */
     AxlVolume vols[16];
     size_t    nvols = 0;
-    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) == 0) {
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) == AXL_OK) {
         for (size_t i = 0; i < nvols; i++) {
             if (vols[i].device_path == NULL
                 || !is_ramdisk_dp(vols[i].device_path, NULL, NULL)) {
@@ -419,7 +419,7 @@ do_create(
     size_t   pages = (size_t)((disk_bytes + 4095) / 4096);
     uint64_t phys_addr = 0;
 
-    if (axl_alloc_pages(pages, &phys_addr) != 0) {
+    if (axl_alloc_pages(pages, &phys_addr) != AXL_OK) {
         axl_printf("MkRd: failed to allocate %zu MB\n", size_mb);
         return 1;
     }
@@ -464,7 +464,7 @@ do_list(void)
     AxlVolume vols[16];
     size_t    nvols = 0;
 
-    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != 0
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != AXL_OK
         || nvols == 0) {
         axl_printf("No filesystems found.\n");
         return 1;
@@ -510,7 +510,7 @@ do_destroy(
     )
 {
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
-    if (axl_service_find("ram-disk", (void **)&rd_proto) != 0 ||
+    if (axl_service_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
         rd_proto == NULL) {
         axl_printf("MkRd: EFI_RAM_DISK_PROTOCOL not available.\n");
         return 1;
@@ -518,7 +518,7 @@ do_destroy(
 
     AxlVolume vols[16];
     size_t    nvols = 0;
-    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != 0
+    if (axl_volume_enumerate(vols, sizeof(vols)/sizeof(vols[0]), &nvols) != AXL_OK
         || nvols == 0) {
         axl_printf("MkRd: no filesystems found.\n");
         return 1;

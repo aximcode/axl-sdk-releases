@@ -76,7 +76,7 @@ test_session_callback(void)
     uint8_t resp[4];
     size_t  resp_len = sizeof(resp);
     int rc = axl_ipmi_raw(s, 0x06, 0x01, NULL, 0, resp, &resp_len);
-    test_check(rc == 0, "axl_ipmi_raw: forwards to callback");
+    test_check(rc == AXL_OK, "axl_ipmi_raw: forwards to callback");
     test_check(c.call_count == 1, "axl_ipmi_raw: exactly one dispatch");
     test_check(c.last_netfn == 0x06 && c.last_cmd == 0x01,
                "axl_ipmi_raw: netfn + cmd reach the callback");
@@ -198,7 +198,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0x00}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 0, false) == 0,
+        test_check(axl_ipmi_chassis_identify(s, 0, false) == AXL_OK,
                    "chassis_identify: stop (interval=0, force_on=false) returns 0");
         test_check(c.last_netfn == 0x00 && c.last_cmd == 0x04,
                    "chassis_identify: dispatches NetFn 0x00 / Cmd 0x04");
@@ -213,7 +213,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0x00}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 30, false) == 0,
+        test_check(axl_ipmi_chassis_identify(s, 30, false) == AXL_OK,
                    "chassis_identify: timed (interval=30, force_on=false) returns 0");
         test_check(c.last_req_len == 1 && c.last_req[0] == 30,
                    "chassis_identify: timed body is [interval] only");
@@ -225,7 +225,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0x00}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 0, true) == 0,
+        test_check(axl_ipmi_chassis_identify(s, 0, true) == AXL_OK,
                    "chassis_identify: force_on (interval=0) returns 0");
         test_check(c.last_req_len == 2
                        && c.last_req[0] == 0x00 && c.last_req[1] == 0x01,
@@ -239,7 +239,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0x00}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 15, true) == 0,
+        test_check(axl_ipmi_chassis_identify(s, 15, true) == AXL_OK,
                    "chassis_identify: force_on with interval=15 returns 0");
         test_check(c.last_req_len == 2
                        && c.last_req[0] == 15 && c.last_req[1] == 0x01,
@@ -251,7 +251,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0x00}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 0xFF, false) == 0,
+        test_check(axl_ipmi_chassis_identify(s, 0xFF, false) == AXL_OK,
                    "chassis_identify: interval=0xFF (max 8-bit) returns 0");
         test_check(c.last_req_len == 1 && c.last_req[0] == 0xFF,
                    "chassis_identify: interval=0xFF carries through unmodified");
@@ -262,7 +262,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0xC1}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 0, true) == -1,
+        test_check(axl_ipmi_chassis_identify(s, 0, true) == AXL_ERR,
                    "chassis_identify: CC=0xC1 surfaces as -1");
         test_check(axl_ipmi_session_last_cc(s) == 0xC1,
                    "chassis_identify: last_cc records 0xC1 from rejection");
@@ -273,7 +273,7 @@ test_chassis_identify(void)
         Canned c = { .resp = {0xCC}, .resp_len = 1 };
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
-        test_check(axl_ipmi_chassis_identify(s, 5, false) == -1,
+        test_check(axl_ipmi_chassis_identify(s, 5, false) == AXL_ERR,
                    "chassis_identify: CC=0xCC surfaces as -1");
         test_check(axl_ipmi_session_last_cc(s) == 0xCC,
                    "chassis_identify: last_cc records 0xCC");
@@ -283,7 +283,7 @@ test_chassis_identify(void)
     {
         AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
             AXL_IPMI_TRANSPORT_KCS, err_send_raw, NULL);
-        test_check(axl_ipmi_chassis_identify(s, 0, false) == -1,
+        test_check(axl_ipmi_chassis_identify(s, 0, false) == AXL_ERR,
                    "chassis_identify: transport error surfaces as -1");
     }
 }
@@ -434,7 +434,7 @@ test_fru_read(void)
     uint8_t buf[16];
     size_t  got = sizeof(buf);
     int rc = axl_ipmi_fru_read(s, 0x00, 0, buf, &got);
-    test_check(rc == 0, "fru_read: ok");
+    test_check(rc == AXL_OK, "fru_read: ok");
     test_check(got == 8, "fru_read: bytes read");
     test_check(buf[0] == 0x01, "fru_read: first byte");
 }
@@ -450,7 +450,7 @@ test_bmc_cold_reset(void)
     AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
         AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
 
-    test_check(axl_ipmi_bmc_cold_reset(s) == 0, "bmc_cold_reset: ok");
+    test_check(axl_ipmi_bmc_cold_reset(s) == AXL_OK, "bmc_cold_reset: ok");
     test_check(c.last_netfn == 0x06 && c.last_cmd == 0x02,
                "bmc_cold_reset: App 0x02");
 }
@@ -462,7 +462,7 @@ test_bmc_warm_reset(void)
     AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
         AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
 
-    test_check(axl_ipmi_bmc_warm_reset(s) == 0, "bmc_warm_reset: ok");
+    test_check(axl_ipmi_bmc_warm_reset(s) == AXL_OK, "bmc_warm_reset: ok");
     test_check(c.last_netfn == 0x06 && c.last_cmd == 0x03,
                "bmc_warm_reset: App 0x03");
 }
@@ -554,7 +554,7 @@ test_sdr_chunked_read(void)
     uint8_t  rec[64];
     size_t   rec_len = sizeof(rec);
     uint16_t next;
-    test_check(axl_ipmi_sdr_get(s, 0x0001, &next, rec, &rec_len) == 0,
+    test_check(axl_ipmi_sdr_get(s, 0x0001, &next, rec, &rec_len) == AXL_OK,
                "sdr_get: chunked read ok");
     test_check(rec_len == 30,
                "sdr_get: reassembled length = header + body");
@@ -671,7 +671,7 @@ test_sdr_reservation_retry(void)
     uint8_t  rec[32];
     size_t   rec_len = sizeof(rec);
     uint16_t next;
-    test_check(axl_ipmi_sdr_get(s, 0x0001, &next, rec, &rec_len) == 0,
+    test_check(axl_ipmi_sdr_get(s, 0x0001, &next, rec, &rec_len) == AXL_OK,
                "sdr_reserve: succeeds after CC=0xC5 triggers Reserve SDR");
     test_check(h.call_count == 4,
                "sdr_reserve: four IPMI calls (reject + reserve + hdr + body)");

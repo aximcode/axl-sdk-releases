@@ -38,7 +38,7 @@ main(int argc, char **argv)
 
     /* Bring up networking (load NIC drivers, ConnectController,
        wait for DHCP). Idempotent. */
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("error: network bring-up failed\n");
         return 1;
     }

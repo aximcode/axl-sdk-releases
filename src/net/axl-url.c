@@ -30,7 +30,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     uint16_t                port;
 
     if (url == NULL || out_parsed == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -46,7 +46,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
 
     if (scheme_end == NULL || scheme_end == url) {
         axl_error("malformed URL: no scheme in '%s'", url);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -55,7 +55,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     host_start = scheme_end + 3;
     if (*host_start == '\0') {
         axl_error("malformed URL: no host in '%s'", url);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -68,7 +68,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
 
     if (host_end == host_start) {
         axl_error("malformed URL: empty host in '%s'", url);
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -125,7 +125,7 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     //
     u = axl_calloc(1, sizeof(AxlUrl));
     if (u == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     u->scheme = axl_strndup(url, (size_t)(scheme_end - url));
@@ -142,16 +142,16 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     if (query_start != NULL) {
         u->query = axl_strdup(query_start);
         if (u->query == NULL) {
-            return -1;
+            return AXL_ERR;
         }
     }
 
     if (u->scheme == NULL || u->host == NULL || u->path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     *out_parsed = axl_steal_pointer(&u);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

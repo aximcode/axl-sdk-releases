@@ -100,7 +100,7 @@ axl_spd_ddr5_read(
     )
 {
     if (smbus == NULL || buf == NULL || len == NULL || cap == 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     size_t pages = (cap + AXL_SPD_DDR5_PAGE_SIZE - 1) / AXL_SPD_DDR5_PAGE_SIZE;
@@ -114,7 +114,7 @@ axl_spd_ddr5_read(
         if (ddr5_select_page(smbus, addr, (uint8_t)p) != 0) {
             axl_debug("DDR5 page-select to %u failed at 0x%02X",
                       (unsigned)p, addr);
-            rc = (total == 0) ? -1 : 0;
+            rc = (total == 0) ? AXL_ERR : AXL_OK;
             goto out;
         }
         /* Read this page's 128 bytes from offsets 0x80..0xFF. */
@@ -124,9 +124,9 @@ axl_spd_ddr5_read(
         }
         for (size_t i = 0; i < want; i++) {
             uint8_t off = (uint8_t)(0x80 + i);
-            if (axl_smbus_read_byte(smbus, addr, off, &buf[total + i]) != 0) {
+            if (axl_smbus_read_byte(smbus, addr, off, &buf[total + i]) != AXL_OK) {
                 total += i;
-                rc = (total == 0) ? -1 : 0;
+                rc = (total == 0) ? AXL_ERR : AXL_OK;
                 goto out;
             }
         }
@@ -158,10 +158,10 @@ axl_spd_ddr5_decode(
     )
 {
     if (buf == NULL || out == NULL || len < 64) {
-        return -1;
+        return AXL_ERR;
     }
     if (buf[DDR5_OFF_KEY_BYTE_0] != AXL_SPD_TYPE_DDR5) {
-        return -1;
+        return AXL_ERR;
     }
 
     out->ddr_generation = 5;
@@ -211,7 +211,7 @@ axl_spd_ddr5_decode(
 
     /* Manufacturing info lives at offset 512+. */
     if (len < DDR5_OFF_DRAM_MFG_ID + 1) {
-        return 0;
+        return AXL_OK;
     }
 
     out->mfg_code_module = axl_spd_pack_mfg_code(
@@ -239,5 +239,5 @@ axl_spd_ddr5_decode(
     out->mfg_code_dram = axl_spd_pack_mfg_code(
             buf[DDR5_OFF_DRAM_MFG_BANK], buf[DDR5_OFF_DRAM_MFG_ID]);
 
-    return 0;
+    return AXL_OK;
 }

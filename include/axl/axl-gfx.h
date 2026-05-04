@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,7 +64,7 @@ axl_gfx_available(void);
 
 /// Get framebuffer information.
 ///
-/// @return 0 on success, -1 if GOP not available.
+/// @return AXL_OK on success, AXL_ERR if GOP not available.
 int
 axl_gfx_get_info(
     AxlGfxInfo  *info  ///< [out] receives display info
@@ -75,7 +76,7 @@ axl_gfx_get_info(
 
 /// Fill a rectangle with a solid color.
 ///
-/// @return 0 on success, -1 if GOP not available.
+/// @return AXL_OK on success, AXL_ERR if GOP not available.
 int
 axl_gfx_fill_rect(
     uint32_t     x,      ///< left edge
@@ -90,7 +91,7 @@ axl_gfx_fill_rect(
 /// @a buffer must contain at least @a w * @a h pixels in row-major
 /// order with AxlGfxPixel (BGRX) layout.
 ///
-/// @return 0 on success, -1 if GOP not available.
+/// @return AXL_OK on success, AXL_ERR if GOP not available.
 int
 axl_gfx_blit(
     const AxlGfxPixel  *buffer,  ///< [in] source pixel buffer
@@ -104,7 +105,7 @@ axl_gfx_blit(
 ///
 /// @a buffer must have space for at least @a w * @a h pixels.
 ///
-/// @return 0 on success, -1 if GOP not available.
+/// @return AXL_OK on success, AXL_ERR if GOP not available.
 int
 axl_gfx_capture(
     AxlGfxPixel  *buffer,  ///< [out] destination pixel buffer
@@ -125,7 +126,7 @@ axl_gfx_capture(
 /// background pixels are preserved).  Output is clamped to screen
 /// bounds.
 ///
-/// @return 0 on success, -1 if GOP not available or text is NULL.
+/// @return AXL_OK on success, AXL_ERR if GOP not available or text is NULL.
 int
 axl_gfx_draw_text(
     uint32_t     x,     ///< left edge (pixels)

@@ -118,7 +118,7 @@ endpoint_log(AxlJsonWriter *w)
         axl_json_arr_begin(w);
         for (uint32_t i = 0; i < count; i++) {
             ReqLogEntry e;
-            if (axl_ring_buf_peek_nth_elem(&g_ring, i, &e) != 0) {
+            if (axl_ring_buf_peek_nth_elem(&g_ring, i, &e) != AXL_OK) {
                 break;
             }
             axl_json_obj_begin(w);
@@ -271,7 +271,7 @@ main(int argc, char **argv)
 
     axl_printf("axlk-reqlog-server: starting\n");
 
-    if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
         axl_printf("FAIL: network not available\n");
         return 1;
     }

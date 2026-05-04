@@ -156,7 +156,7 @@ void axl_usb_class_free(void);
 
 Mirror `pci-ids.json5` schema 2 hierarchical:
 
-```json5
+```js
 {
     schema: 1,
     vendors: [

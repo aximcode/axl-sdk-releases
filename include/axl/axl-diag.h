@@ -71,7 +71,7 @@ axl_diag_startup(
  * firmware had it baked in (short-circuit) or whether ensure
  * actually loaded a driver from disk.
  *
- * @return 0 if registered, -1 otherwise.
+ * @return AXL_OK if registered, AXL_ERR otherwise.
  */
 int
 axl_diag_probe_protocol(

@@ -27,7 +27,18 @@ extensions = [
 # -- MyST (Markdown) ---------------------------------------------------------
 
 myst_heading_anchors = 3
-suppress_warnings = ["myst.header", "myst.xref_missing"]
+suppress_warnings = [
+    "myst.header",
+    "myst.xref_missing",
+    # Breathe re-emits each anonymous-enum enumerator at the parent
+    # enum's "line", so Sphinx's C domain sees them as duplicate
+    # declarations. axl-smbios.h has 4 anonymous enums (table
+    # types, IPMI iface, host iface, host iface protocol) — that's
+    # where all 100+ "Duplicate C declaration" warnings come from.
+    # The underlying source has no real duplicates; this is purely
+    # a Breathe rendering artifact for unnamed enums.
+    "duplicate_declaration.c",
+]
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "markdown",

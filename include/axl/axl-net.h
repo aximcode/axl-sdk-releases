@@ -23,6 +23,7 @@
 #define AXL_NET_H
 
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 /* AxlIPv4Address (legacy IPv4 type) is declared in axl-inet-address.h
  * alongside AxlInetAddress / AxlSocketAddress. Pull that in first so
@@ -53,7 +54,7 @@ extern "C" {
 /**
  * @brief Get the local IPv4 address of the first configured NIC.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_net_get_ip_address(
@@ -63,7 +64,7 @@ axl_net_get_ip_address(
 /**
  * @brief Send an ICMP echo request and measure round-trip time.
  *
- * @return 0 on success, -1 on failure or timeout.
+ * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
 axl_net_ping(
@@ -76,7 +77,7 @@ axl_net_ping(
  * @brief Resolve a hostname to an IPv4 address via DNS4.
  * Falls back to parsing the hostname as a dotted-decimal IP.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_net_resolve(
@@ -102,7 +103,7 @@ axl_net_is_available(void);
  * 3. Selects a NIC (by @p nic_index, or first available if SIZE_MAX).
  * 4. Waits up to @p dhcp_timeout_sec for an IPv4 address via DHCP.
  *
- * @return 0 on success (IP address acquired), -1 on failure.
+ * @return AXL_OK on success (IP address acquired), AXL_ERR on failure.
  */
 int
 axl_net_auto_init(
@@ -165,7 +166,7 @@ axl_net_ensure_drivers(void);
  * subnet mask, and optional gateway. Pass NULL for @p gateway to
  * leave it unconfigured.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_net_set_static_ip(
@@ -185,7 +186,7 @@ axl_net_set_static_ip(
  * Accepts strings like "192.168.1.1". Each octet must be 0-255.
  * No leading zeros validation — "01.02.03.04" is accepted.
  *
- * @return 0 on success, -1 on invalid input.
+ * @return AXL_OK on success, AXL_ERR on invalid input.
  */
 int
 axl_ipv4_parse(
@@ -199,7 +200,7 @@ axl_ipv4_parse(
  * Writes at most @p size bytes (including NUL). 16 bytes is always
  * sufficient ("255.255.255.255" + NUL).
  *
- * @return 0 on success, -1 if buffer is too small or args are NULL.
+ * @return AXL_OK on success, AXL_ERR if buffer is too small or args are NULL.
  */
 int
 axl_ipv4_format(
@@ -235,7 +236,7 @@ typedef struct {
  * On return, @a *count is set to the number of entries filled.
  * Call with @a out=NULL to query the number of interfaces.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_net_list_interfaces(

@@ -508,69 +508,69 @@ test_strtou64_with_offset(void)
 
     /* No offset: just the base. */
     v = 0;
-    test_check(axl_strtou64_with_offset("0x100", &v) == 0 && v == 0x100,
+    test_check(axl_strtou64_with_offset("0x100", &v) == AXL_OK && v == 0x100,
                "strtou64_with_offset: no offset, hex");
     v = 0;
-    test_check(axl_strtou64_with_offset("256", &v) == 0 && v == 256,
+    test_check(axl_strtou64_with_offset("256", &v) == AXL_OK && v == 256,
                "strtou64_with_offset: no offset, decimal");
     v = 0;
-    test_check(axl_strtou64_with_offset("0", &v) == 0 && v == 0,
+    test_check(axl_strtou64_with_offset("0", &v) == AXL_OK && v == 0,
                "strtou64_with_offset: zero");
 
     /* With offset, both forms. */
     v = 0;
-    test_check(axl_strtou64_with_offset("0x100+0x10", &v) == 0 && v == 0x110,
+    test_check(axl_strtou64_with_offset("0x100+0x10", &v) == AXL_OK && v == 0x110,
                "strtou64_with_offset: hex+hex");
     v = 0;
-    test_check(axl_strtou64_with_offset("256+16", &v) == 0 && v == 272,
+    test_check(axl_strtou64_with_offset("256+16", &v) == AXL_OK && v == 272,
                "strtou64_with_offset: dec+dec");
     v = 0;
-    test_check(axl_strtou64_with_offset("0x1000+0xFF", &v) == 0 && v == 0x10FF,
+    test_check(axl_strtou64_with_offset("0x1000+0xFF", &v) == AXL_OK && v == 0x10FF,
                "strtou64_with_offset: 0x1000+0xFF");
     v = 0;
-    test_check(axl_strtou64_with_offset("100+0x10", &v) == 0 && v == 100 + 0x10,
+    test_check(axl_strtou64_with_offset("100+0x10", &v) == AXL_OK && v == 100 + 0x10,
                "strtou64_with_offset: dec+hex (mixed)");
 
     /* Errors: NULL, empty offset, garbage. */
-    test_check(axl_strtou64_with_offset(NULL, &v) == -1,
+    test_check(axl_strtou64_with_offset(NULL, &v) == AXL_ERR,
                "strtou64_with_offset: NULL string");
-    test_check(axl_strtou64_with_offset("0x100", NULL) == -1,
+    test_check(axl_strtou64_with_offset("0x100", NULL) == AXL_ERR,
                "strtou64_with_offset: NULL out");
-    test_check(axl_strtou64_with_offset("", &v) == -1,
+    test_check(axl_strtou64_with_offset("", &v) == AXL_ERR,
                "strtou64_with_offset: empty string");
-    test_check(axl_strtou64_with_offset("0x100+", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100+", &v) == AXL_ERR,
                "strtou64_with_offset: dangling +");
-    test_check(axl_strtou64_with_offset("0x100+ 0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100+ 0x10", &v) == AXL_ERR,
                "strtou64_with_offset: space after +");
-    test_check(axl_strtou64_with_offset("0x100 +0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100 +0x10", &v) == AXL_ERR,
                "strtou64_with_offset: space before +");
-    test_check(axl_strtou64_with_offset("0x100xy", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100xy", &v) == AXL_ERR,
                "strtou64_with_offset: trailing garbage");
-    test_check(axl_strtou64_with_offset("0x100+0x10+0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100+0x10+0x10", &v) == AXL_ERR,
                "strtou64_with_offset: double offset");
-    test_check(axl_strtou64_with_offset("-0x100+0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("-0x100+0x10", &v) == AXL_ERR,
                "strtou64_with_offset: negative rejected");
-    test_check(axl_strtou64_with_offset("0x100++0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100++0x10", &v) == AXL_ERR,
                "strtou64_with_offset: ++ rejected");
-    test_check(axl_strtou64_with_offset("0x100+-0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100+-0x10", &v) == AXL_ERR,
                "strtou64_with_offset: +- rejected");
-    test_check(axl_strtou64_with_offset("0x100++++0x10", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x100++++0x10", &v) == AXL_ERR,
                "strtou64_with_offset: ++++ rejected");
 
     /* Overflow on base, on the sum. */
-    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF+0x1", &v) == -1,
+    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF+0x1", &v) == AXL_ERR,
                "strtou64_with_offset: sum overflow");
-    test_check(axl_strtou64_with_offset("0x10000000000000000", &v) == -1,
+    test_check(axl_strtou64_with_offset("0x10000000000000000", &v) == AXL_ERR,
                "strtou64_with_offset: base overflow");
 
     /* Edge: max u64 alone (no offset) is valid. */
     v = 0;
-    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF", &v) == 0
+    test_check(axl_strtou64_with_offset("0xFFFFFFFFFFFFFFFF", &v) == AXL_OK
                && v == 0xFFFFFFFFFFFFFFFFULL,
                "strtou64_with_offset: max u64 alone");
     /* Edge: offset==0 still parses fine. */
     v = 0;
-    test_check(axl_strtou64_with_offset("0x100+0", &v) == 0 && v == 0x100,
+    test_check(axl_strtou64_with_offset("0x100+0", &v) == AXL_OK && v == 0x100,
                "strtou64_with_offset: +0 is valid");
 }
 
@@ -908,50 +908,50 @@ test_str_to_u64(void)
     const char *end;
 
     /* Happy paths. */
-    test_check(axl_str_to_u64("12345", 10, &v, NULL) == 0 && v == 12345,
+    test_check(axl_str_to_u64("12345", 10, &v, NULL) == AXL_OK && v == 12345,
                "str_to_u64: decimal");
-    test_check(axl_str_to_u64("0xFF", 0, &v, NULL) == 0 && v == 0xFF,
+    test_check(axl_str_to_u64("0xFF", 0, &v, NULL) == AXL_OK && v == 0xFF,
                "str_to_u64: base=0 auto-hex");
-    test_check(axl_str_to_u64("FF", 16, &v, NULL) == 0 && v == 0xFF,
+    test_check(axl_str_to_u64("FF", 16, &v, NULL) == AXL_OK && v == 0xFF,
                "str_to_u64: explicit base=16 no prefix");
-    test_check(axl_str_to_u64("0xff", 16, &v, NULL) == 0 && v == 0xFF,
+    test_check(axl_str_to_u64("0xff", 16, &v, NULL) == AXL_OK && v == 0xFF,
                "str_to_u64: explicit base=16 with prefix");
-    test_check(axl_str_to_u64("1010", 2, &v, NULL) == 0 && v == 10,
+    test_check(axl_str_to_u64("1010", 2, &v, NULL) == AXL_OK && v == 10,
                "str_to_u64: base=2");
-    test_check(axl_str_to_u64("zz", 36, &v, NULL) == 0 && v == 35*36+35,
+    test_check(axl_str_to_u64("zz", 36, &v, NULL) == AXL_OK && v == 35*36+35,
                "str_to_u64: base=36");
-    test_check(axl_str_to_u64("  +42", 10, &v, NULL) == 0 && v == 42,
+    test_check(axl_str_to_u64("  +42", 10, &v, NULL) == AXL_OK && v == 42,
                "str_to_u64: leading whitespace + sign");
 
     /* Boundary: UINT64_MAX. */
-    test_check(axl_str_to_u64("18446744073709551615", 10, &v, NULL) == 0
+    test_check(axl_str_to_u64("18446744073709551615", 10, &v, NULL) == AXL_OK
                && v == UINT64_MAX,
                "str_to_u64: UINT64_MAX exact");
-    test_check(axl_str_to_u64("18446744073709551616", 10, &v, NULL) == -1,
+    test_check(axl_str_to_u64("18446744073709551616", 10, &v, NULL) == AXL_ERR,
                "str_to_u64: UINT64_MAX + 1 overflows");
-    test_check(axl_str_to_u64("99999999999999999999", 10, &v, NULL) == -1,
+    test_check(axl_str_to_u64("99999999999999999999", 10, &v, NULL) == AXL_ERR,
                "str_to_u64: huge value overflows");
 
     /* Errors. */
-    test_check(axl_str_to_u64(NULL, 10, &v, NULL) == -1, "str_to_u64: NULL");
-    test_check(axl_str_to_u64("", 10, &v, NULL) == -1, "str_to_u64: empty");
-    test_check(axl_str_to_u64("abc", 10, &v, NULL) == -1, "str_to_u64: garbage");
-    test_check(axl_str_to_u64("-5", 10, &v, NULL) == -1, "str_to_u64: rejects sign");
-    test_check(axl_str_to_u64("12", 1, &v, NULL) == -1, "str_to_u64: bad base");
-    test_check(axl_str_to_u64("12", 37, &v, NULL) == -1, "str_to_u64: bad base");
-    test_check(axl_str_to_u64("12", 10, NULL, NULL) == -1, "str_to_u64: NULL out");
-    test_check(axl_str_to_u64("0x", 0, &v, NULL) == -1, "str_to_u64: bare 0x");
+    test_check(axl_str_to_u64(NULL, 10, &v, NULL) == AXL_ERR, "str_to_u64: NULL");
+    test_check(axl_str_to_u64("", 10, &v, NULL) == AXL_ERR, "str_to_u64: empty");
+    test_check(axl_str_to_u64("abc", 10, &v, NULL) == AXL_ERR, "str_to_u64: garbage");
+    test_check(axl_str_to_u64("-5", 10, &v, NULL) == AXL_ERR, "str_to_u64: rejects sign");
+    test_check(axl_str_to_u64("12", 1, &v, NULL) == AXL_ERR, "str_to_u64: bad base");
+    test_check(axl_str_to_u64("12", 37, &v, NULL) == AXL_ERR, "str_to_u64: bad base");
+    test_check(axl_str_to_u64("12", 10, NULL, NULL) == AXL_ERR, "str_to_u64: NULL out");
+    test_check(axl_str_to_u64("0x", 0, &v, NULL) == AXL_ERR, "str_to_u64: bare 0x");
 
     /* endptr — partial parses are rejected unless caller takes endptr. */
-    test_check(axl_str_to_u64("123abc", 10, &v, NULL) == -1,
+    test_check(axl_str_to_u64("123abc", 10, &v, NULL) == AXL_ERR,
                "str_to_u64: partial parse without endptr is error");
-    test_check(axl_str_to_u64("123abc", 10, &v, &end) == 0 && v == 123
+    test_check(axl_str_to_u64("123abc", 10, &v, &end) == AXL_OK && v == 123
                && *end == 'a',
                "str_to_u64: partial parse via endptr");
 
     /* endptr on error points back at nptr. */
     const char *src = "abc";
-    test_check(axl_str_to_u64(src, 10, &v, &end) == -1 && end == src,
+    test_check(axl_str_to_u64(src, 10, &v, &end) == AXL_ERR && end == src,
                "str_to_u64: endptr resets to nptr on error");
 }
 
@@ -1071,28 +1071,28 @@ test_str_to_edge_cases(void)
     const char *end;
 
     /* base=0 with leading zero is decimal — NOT octal (deliberately). */
-    test_check(axl_str_to_u64("010", 0, &u64, NULL) == 0 && u64 == 10,
+    test_check(axl_str_to_u64("010", 0, &u64, NULL) == AXL_OK && u64 == 10,
                "edge: base=0 leading zero is decimal (not octal)");
-    test_check(axl_str_to_u64("077", 0, &u64, NULL) == 0 && u64 == 77,
+    test_check(axl_str_to_u64("077", 0, &u64, NULL) == AXL_OK && u64 == 77,
                "edge: base=0 0xx is decimal");
 
     /* "0x" followed by non-hex — strict mode rejects, endptr mode
      * succeeds with v=0 and endptr at 'x' (matches strtoul). */
-    test_check(axl_str_to_u64("0xZZ", 0, &u64, NULL) == -1,
+    test_check(axl_str_to_u64("0xZZ", 0, &u64, NULL) == AXL_ERR,
                "edge: 0xZZ rejected in strict mode");
-    test_check(axl_str_to_u64("0xZZ", 0, &u64, &end) == 0
+    test_check(axl_str_to_u64("0xZZ", 0, &u64, &end) == AXL_OK
                && u64 == 0 && *end == 'x',
                "edge: 0xZZ in endptr mode parses as 0, leftover 'xZZ'");
-    test_check(axl_str_to_u64("0x ", 0, &u64, NULL) == -1,
+    test_check(axl_str_to_u64("0x ", 0, &u64, NULL) == AXL_ERR,
                "edge: 0x<space> rejected in strict mode");
 
     /* Trailing whitespace — strict mode rejects (consistent with
      * "strict means no trailing content"). */
-    test_check(axl_str_to_u64("123 ", 10, &u64, NULL) == -1,
+    test_check(axl_str_to_u64("123 ", 10, &u64, NULL) == AXL_ERR,
                "edge: trailing space rejected in strict mode");
-    test_check(axl_str_to_u64("123\t", 10, &u64, NULL) == -1,
+    test_check(axl_str_to_u64("123\t", 10, &u64, NULL) == AXL_ERR,
                "edge: trailing tab rejected in strict mode");
-    test_check(axl_str_to_u64("123 ", 10, &u64, &end) == 0
+    test_check(axl_str_to_u64("123 ", 10, &u64, &end) == AXL_OK
                && u64 == 123 && *end == ' ',
                "edge: trailing space OK in endptr mode");
 

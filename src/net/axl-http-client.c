@@ -132,7 +132,7 @@ int
 axl_http_client_set(AxlHttpClient *c, const char *key, const char *value)
 {
     if (c == NULL || key == NULL || value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_config_set(c->config, key, value);
@@ -185,13 +185,13 @@ ensure_connected(
     c->connected_host = NULL;
 
     /* Connect */
-    if (axl_tcp_connect(host, port, &c->sock) != 0) {
+    if (axl_tcp_connect(host, port, &c->sock) != AXL_OK) {
         return -1;
     }
 
     /* TLS handshake if enabled */
     if (c->tls_enabled) {
-        if (axl_tls_init() != 0) {
+        if (axl_tls_init() != AXL_OK) {
             axl_error("TLS init failed for %s:%u", host, port);
             axl_tcp_close(c->sock);
             c->sock = NULL;
@@ -212,7 +212,7 @@ ensure_connected(
             uint8_t hs_buf[4096];
             size_t  hs_len = sizeof(hs_buf);
             if (axl_tcp_recv(c->sock, hs_buf, &hs_len,
-                             200) == 0 && hs_len > 0) {
+                             200) == AXL_OK && hs_len > 0) {
                 axl_tls_stage_data(c->tls_ctx, hs_buf, hs_len);
             }
             int rc = axl_tls_handshake(c->tls_ctx);
@@ -259,7 +259,7 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
     if (c->tls_ctx != NULL) {
         /* Receive raw TLS record from TCP, decrypt */
         size_t raw_len = *len;
-        if (axl_tcp_recv(c->sock, buf, &raw_len, c->timeout_ms) != 0) {
+        if (axl_tcp_recv(c->sock, buf, &raw_len, c->timeout_ms) != AXL_OK) {
             return -1;
         }
         if (raw_len == 0) {
@@ -328,7 +328,7 @@ do_request(
     *resp = NULL;
 
     /* Parse URL */
-    if (axl_url_parse(url, &parsed) != 0) {
+    if (axl_url_parse(url, &parsed) != AXL_OK) {
         return -1;
     }
 
@@ -415,7 +415,7 @@ do_request(
                             sizeof(req_buf) - req_len, "\r\n");
 
     /* Send request (with auto-reconnect on stale connection) */
-    if (client_send(c, req_buf, req_len) != 0) {
+    if (client_send(c, req_buf, req_len) != AXL_OK) {
         /*
          * Send failed — likely a stale connection (peer closed).
          * Close, reconnect, and retry once.
@@ -430,7 +430,7 @@ do_request(
         c->connected_host = NULL;
 
         if (ensure_connected(c, parsed->host, parsed->port) != 0 ||
-            client_send(c, req_buf, req_len) != 0)
+            client_send(c, req_buf, req_len) != AXL_OK)
         {
             axl_url_free(parsed);
             return -1;
@@ -439,7 +439,7 @@ do_request(
 
     /* Send body if present */
     if (body != NULL && body_size > 0) {
-        if (client_send(c, body, body_size) != 0) {
+        if (client_send(c, body, body_size) != AXL_OK) {
             axl_url_free(parsed);
             return -1;
         }
@@ -497,7 +497,7 @@ do_request(
 
     int status = axl_http_parse_status_line(recv_buf, first_line_end,
                                             &status_code);
-    if (status != 0) {
+    if (status != AXL_OK) {
         axl_url_free(parsed);
         return -1;
     }
@@ -507,7 +507,7 @@ do_request(
     status = axl_http_parse_headers(recv_buf + hdr_start,
                                     header_end - hdr_start,
                                     &resp_headers);
-    if (status != 0) {
+    if (status != AXL_OK) {
         if (resp_headers != NULL) {
             axl_hash_table_free(resp_headers);
         }
@@ -644,7 +644,7 @@ axl_http_get(AxlHttpClient *c, const char *url,
              AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || url == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     c->retry_attempted = false;
@@ -657,7 +657,7 @@ axl_http_post(AxlHttpClient *c, const char *url, const void *body,
               AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || url == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     c->retry_attempted = false;
@@ -671,7 +671,7 @@ axl_http_put(AxlHttpClient *c, const char *url, const void *body,
              AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || url == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     c->retry_attempted = false;
@@ -684,7 +684,7 @@ axl_http_delete(AxlHttpClient *c, const char *url,
                 AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || url == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     c->retry_attempted = false;
@@ -698,7 +698,7 @@ axl_http_request(AxlHttpClient *c, const char *method, const char *url,
                  AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || method == NULL || url == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     c->retry_attempted = false;
@@ -732,16 +732,16 @@ axl_http_download(AxlHttpClient *c, const char *url,
     int                    result = 0;
 
     if (c == NULL || url == NULL || local_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
-    if (axl_http_get(c, url, &resp) != 0) {
-        return -1;
+    if (axl_http_get(c, url, &resp) != AXL_OK) {
+        return AXL_ERR;
     }
 
     if (resp->status_code != 200) {
         axl_http_client_response_free(resp);
-        return -1;
+        return AXL_ERR;
     }
 
     if (resp->body != NULL && resp->body_size > 0) {

@@ -134,12 +134,12 @@ axl_queue_push_head(
     AxlList *node;
 
     if (queue == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     node = alloc_node(data);
     if (node == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     node->next = queue->head;
@@ -151,7 +151,7 @@ axl_queue_push_head(
 
     queue->head = node;
     queue->length++;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -162,12 +162,12 @@ axl_queue_push_tail(
     AxlList *node;
 
     if (queue == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     node = alloc_node(data);
     if (node == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     node->prev = queue->tail;
@@ -179,7 +179,7 @@ axl_queue_push_tail(
 
     queue->tail = node;
     queue->length++;
-    return 0;
+    return AXL_OK;
 }
 
 void *
@@ -307,7 +307,7 @@ axl_queue_copy(
     }
 
     for (cur = queue->head; cur != NULL; cur = cur->next) {
-        if (axl_queue_push_tail(copy, cur->data) != 0) {
+        if (axl_queue_push_tail(copy, cur->data) != AXL_OK) {
             axl_queue_free(copy);
             return NULL;
         }

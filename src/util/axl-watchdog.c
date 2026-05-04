@@ -38,10 +38,10 @@ axl_watchdog_set(
         axl_warning("SetWatchdogTimer(%llu) failed: 0x%llx",
                     (unsigned long long)seconds,
                     (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
     last_seconds = seconds;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -55,7 +55,7 @@ axl_watchdog_pet(
            5-minute boot timer; in the latter case the consumer
            needs to call axl_watchdog_set explicitly to take
            ownership. */
-        return 0;
+        return AXL_OK;
     }
     return axl_watchdog_set(last_seconds);
 }

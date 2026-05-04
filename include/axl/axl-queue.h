@@ -17,6 +17,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
 #include <axl/axl-list.h>  /* AxlList, AxlFunc, AxlDestroyNotify, AxlCompareFunc */
 
 #ifdef __cplusplus
@@ -100,7 +101,7 @@ axl_queue_get_length(
 /**
  * @brief Push data to the front. O(1).
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_queue_push_head(
@@ -111,7 +112,7 @@ axl_queue_push_head(
 /**
  * @brief Push data to the back. O(1).
  *
- * @return 0 on success, -1 on allocation failure.
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
  */
 int
 axl_queue_push_tail(

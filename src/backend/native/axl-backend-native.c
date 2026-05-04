@@ -161,12 +161,12 @@ axl_backend_get_time(
     EFI_STATUS  status;
 
     if (time == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = gRT->GetTime(&efi_time, NULL);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     time->year       = efi_time.Year;
@@ -176,7 +176,7 @@ axl_backend_get_time(
     time->minute     = efi_time.Minute;
     time->second     = efi_time.Second;
     time->nanosecond = efi_time.Nanosecond;
-    return 0;
+    return AXL_OK;
 }
 
 // ===================================================================
@@ -187,16 +187,16 @@ int
 axl_backend_io_read8(uint16_t port, uint8_t *value)
 {
     if (value == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 #if defined(__x86_64__) || defined(__i386__)
     uint8_t v;
     __asm__ __volatile__("inb %1, %0" : "=a"(v) : "Nd"(port));
     *value = v;
-    return 0;
+    return AXL_OK;
 #else
     (void)port;
-    return -1;
+    return AXL_ERR;
 #endif
 }
 
@@ -205,11 +205,11 @@ axl_backend_io_write8(uint16_t port, uint8_t value)
 {
 #if defined(__x86_64__) || defined(__i386__)
     __asm__ __volatile__("outb %0, %1" : : "a"(value), "Nd"(port));
-    return 0;
+    return AXL_OK;
 #else
     (void)port;
     (void)value;
-    return -1;
+    return AXL_ERR;
 #endif
 }
 
@@ -237,21 +237,21 @@ axl_backend_file_open(
     (void)attributes;
 
     if (path == NULL || handle == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->OpenFileByName((CHAR16 *)path, &fh, mode);
     if (EFI_ERROR(status)) {
         axl_debug("file open failed: status=0x%llx", (unsigned long long)status);
-        return -1;
+        return AXL_ERR;
     }
     *handle = (AxlFileHandle)fh;
-    return 0;
+    return AXL_OK;
 }
 
 /**
@@ -267,7 +267,7 @@ axl_backend_file_close(
     EFI_SHELL_PROTOCOL  *shell;
 
     if (handle == NULL || *handle == NULL) {
-        return 0;
+        return AXL_OK;
     }
 
     shell = get_shell();
@@ -275,7 +275,7 @@ axl_backend_file_close(
         shell->CloseFile((SHELL_FILE_HANDLE)*handle);
     }
     *handle = NULL;
-    return 0;
+    return AXL_OK;
 }
 
 /**
@@ -295,18 +295,18 @@ axl_backend_file_read(
     UINTN                usize;
 
     if (size == NULL || buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     usize = *size;
     status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize, buf);
     *size = usize;
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -326,19 +326,19 @@ axl_backend_file_write(
     UINTN                usize;
 
     if (size == NULL || buf == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     usize = *size;
     status = shell->WriteFile((SHELL_FILE_HANDLE)handle, &usize,
                                (VOID *)buf);
     *size = usize;
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -357,19 +357,19 @@ axl_backend_file_get_position(
     UINT64               efi_pos;
 
     if (pos == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->GetFilePosition((SHELL_FILE_HANDLE)handle, &efi_pos);
     if (!EFI_ERROR(status)) {
         *pos = efi_pos;
     }
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -388,11 +388,11 @@ axl_backend_file_set_position(
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->SetFilePosition((SHELL_FILE_HANDLE)handle, pos);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -409,16 +409,16 @@ axl_backend_file_delete(
     EFI_STATUS           status;
 
     if (path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     shell = get_shell();
     if (shell == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->DeleteFileByName((CHAR16 *)path);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -497,21 +497,21 @@ axl_backend_file_rename(
 
     shell = get_shell();
     if (shell == NULL || old_path == NULL || new_path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Open the existing file */
     status = shell->OpenFileByName((CHAR16 *)old_path, &fh,
                                     AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Get current file info */
     info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
     if (info == NULL) {
         shell->CloseFile(fh);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Build new info with the new filename */
@@ -522,7 +522,7 @@ axl_backend_file_rename(
     if (new_info == NULL) {
         axl_backend_free(info);
         shell->CloseFile(fh);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Copy metadata, replace filename */
@@ -537,7 +537,7 @@ axl_backend_file_rename(
     axl_backend_free(info);
     shell->CloseFile(fh);
 
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -551,15 +551,15 @@ axl_backend_file_mkdir(
 
     shell = get_shell();
     if (shell == NULL || path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->CreateFile((CHAR16 *)path, EFI_FILE_DIRECTORY, &fh);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     shell->CloseFile(fh);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -587,19 +587,19 @@ axl_backend_file_stat(
 
     shell = get_shell();
     if (shell == NULL || path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->OpenFileByName((CHAR16 *)path, &fh,
                                     AXL_FILE_MODE_READ);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
     if (info == NULL) {
         shell->CloseFile(fh);
-        return -1;
+        return AXL_ERR;
     }
 
     if (size != NULL) {
@@ -617,7 +617,7 @@ axl_backend_file_stat(
 
     axl_backend_free(info);
     shell->CloseFile(fh);
-    return 0;
+    return AXL_OK;
 }
 
 // ===================================================================
@@ -650,12 +650,12 @@ axl_backend_shell_setenv(
 
     shell = get_shell();
     if (shell == NULL || name == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->SetEnv((CONST CHAR16 *)name, (CONST CHAR16 *)value,
                             volatile_var ? TRUE : FALSE);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 /**
@@ -732,11 +732,11 @@ axl_backend_shell_chdir(
 
     shell = get_shell();
     if (shell == NULL || path == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->SetCurDir(NULL, (CONST CHAR16 *)path);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -749,11 +749,11 @@ axl_backend_shell_execute(
 
     shell = get_shell();
     if (shell == NULL || command == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = shell->Execute(NULL, (CHAR16 *)command, NULL, NULL);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 // ===================================================================
@@ -888,16 +888,16 @@ axl_backend_event_create_timer(
     EFI_STATUS  status;
 
     if (event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = gBS->CreateEvent(EVT_TIMER, TPL_APPLICATION,
                               NULL, NULL, (EFI_EVENT *)event);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     event_close_ring_record_create((void *)*event);
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -908,16 +908,16 @@ axl_backend_event_create(
     EFI_STATUS  status;
 
     if (event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = gBS->CreateEvent(0, TPL_APPLICATION,
                               NULL, NULL, (EFI_EVENT *)event);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     event_close_ring_record_create((void *)*event);
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1013,7 @@ axl_backend_event_set_timer(
 
     status = gBS->SetTimer((EFI_EVENT)event, (EFI_TIMER_DELAY)type,
                            interval_100ns);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 int
@@ -1028,10 +1028,10 @@ axl_backend_event_wait(
 
     status = gBS->WaitForEvent((UINTN)count, (EFI_EVENT *)events, &index);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
     *fired_index = (size_t)index;
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1063,7 +1063,7 @@ axl_backend_event_register_protocol_notify(
     status = gBS->RegisterProtocolNotify((EFI_GUID *)guid,
                                          (EFI_EVENT)event,
                                          registration);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 // ===================================================================
@@ -1096,12 +1096,12 @@ axl_backend_console_read_key(
     EFI_STATUS     status;
 
     if (gST == NULL || gST->ConIn == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = gST->ConIn->ReadKeyStroke(gST->ConIn, &key);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (scan_code != NULL) {
@@ -1110,7 +1110,7 @@ axl_backend_console_read_key(
     if (unicode_char != NULL) {
         *unicode_char = key.UnicodeChar;
     }
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -1126,7 +1126,7 @@ axl_backend_console_read_key_ex(
         EFI_KEY_DATA  key_data;
         EFI_STATUS    status = simple_ex->ReadKeyStrokeEx(simple_ex, &key_data);
         if (EFI_ERROR(status)) {
-            return -1;
+            return AXL_ERR;
         }
         if (scan_code != NULL) {
             *scan_code = key_data.Key.ScanCode;
@@ -1137,7 +1137,7 @@ axl_backend_console_read_key_ex(
         if (shift_state != NULL) {
             *shift_state = key_data.KeyState.KeyShiftState;
         }
-        return 0;
+        return AXL_OK;
     }
 
     /* Fallback: SimpleTextInput has no shift-state info. Report 0,
@@ -1312,13 +1312,13 @@ axl_backend_mp_start_ap(
     EFI_EVENT   ap_event;
 
     if (ctx == NULL || ap_index >= ctx->count || proc == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Create temp event for non-blocking StartupThisAP */
     status = gBS->CreateEvent(0, TPL_APPLICATION, NULL, NULL, &ap_event);
     if (EFI_ERROR(status)) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = ctx->mp->StartupThisAP(
@@ -1331,7 +1331,7 @@ axl_backend_mp_start_ap(
                  NULL);
 
     gBS->CloseEvent(ap_event);
-    return EFI_ERROR(status) ? -1 : 0;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
 size_t

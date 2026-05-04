@@ -25,7 +25,7 @@ main(int argc, char **argv)
 
     /* Network */
     if (axl_net_is_available()) {
-        if (axl_net_get_ip_address(&addr) == 0) {
+        if (axl_net_get_ip_address(&addr) == AXL_OK) {
             axl_printf("IP Address: %d.%d.%d.%d\n",
                        addr.addr[0], addr.addr[1],
                        addr.addr[2], addr.addr[3]);

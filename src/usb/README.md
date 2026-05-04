@@ -168,7 +168,7 @@ Schema 1 is the only supported layout — hierarchical from the
 start (vendors with nested devices). USB has no subsystem dimension
 that motivated AxlPciIds's v1 (flat) → v2 (hierarchical) split.
 
-```json5
+```js
 {
     schema: 1,
     vendors: [

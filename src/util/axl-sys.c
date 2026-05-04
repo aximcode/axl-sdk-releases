@@ -57,7 +57,7 @@ axl_handle_get_service(
     EFI_STATUS      status;
 
     if (handle == NULL || name == NULL || interface == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     /* Defensive: ensure the caller sees NULL (not stale data) on
        any failure path. UEFI HandleProtocol does not guarantee
@@ -70,7 +70,7 @@ axl_handle_get_service(
     extern const EFI_GUID *axl_service_lookup_guid(const char *name, EFI_GUID *fallback);
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->HandleProtocol(
@@ -80,9 +80,9 @@ axl_handle_get_service(
 
     if (EFI_ERROR(status)) {
         *interface = NULL;
-        return -1;
+        return AXL_ERR;
     }
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,12 +98,12 @@ axl_sys_get_firmware_info(
     size_t i;
 
     if (info == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     st = axl_st();
     if (st == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memset(info, 0, sizeof(*info));
@@ -123,7 +123,7 @@ axl_sys_get_firmware_info(
     info->spec_major = (uint16_t)(st->Hdr.Revision >> 16);
     info->spec_minor = (uint16_t)(st->Hdr.Revision & 0xFFFF);
 
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +144,7 @@ axl_sys_get_memory_size(
     uint64_t               total = 0;
 
     if (total_bytes == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* First call: get required size */
@@ -153,7 +153,7 @@ axl_sys_get_memory_size(
         &map_key, &desc_size, &desc_ver);
 
     if (status != EFI_BUFFER_TOO_SMALL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Add slack for map growth between calls */
@@ -164,7 +164,7 @@ axl_sys_get_memory_size(
             "axl_sys_get_memory_size: OOM allocating %zu-byte memory map buffer",
             map_size
             );
-        return -1;
+        return AXL_ERR;
     }
 
     status = axl_bs()->GetMemoryMap(
@@ -173,7 +173,7 @@ axl_sys_get_memory_size(
 
     if (EFI_ERROR(status)) {
         axl_free(map);
-        return -1;
+        return AXL_ERR;
     }
 
     /* Sum usable memory regions */
@@ -195,7 +195,7 @@ axl_sys_get_memory_size(
 
     axl_free(map);
     *total_bytes = total;
-    return 0;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,4 +320,52 @@ axl_device_path_has_vendor(void *device_path, const AxlGuid *guid)
     VendorMatchCtx ctx = { .guid = guid, .found = false };
     (void)axl_device_path_for_each(device_path, vendor_match_cb, &ctx);
     return ctx.found;
+}
+
+// ---------------------------------------------------------------------------
+// axl_device_path_to_text
+// ---------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+typedef struct {
+    void *ConvertDeviceNodeToText;
+    unsigned short *(EFIAPI *ConvertDevicePathToText)(
+        const void *DevicePath,
+        BOOLEAN     DisplayOnly,
+        BOOLEAN     AllowShortcuts);
+} DevicePathToTextProtocol;
+#pragma pack(pop)
+
+static const AxlGuid DEVICE_PATH_TO_TEXT_GUID = AXL_GUID(
+    0x8b843e20, 0x8132, 0x4852,
+    0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c);
+
+char *
+axl_device_path_to_text(const void *device_path)
+{
+    if (device_path == NULL) {
+        return NULL;
+    }
+    static DevicePathToTextProtocol *cached;
+    if (cached == NULL) {
+        void *p = NULL;
+        if (axl_bs()->LocateProtocol(
+                (EFI_GUID *)&DEVICE_PATH_TO_TEXT_GUID, NULL, &p) != EFI_SUCCESS
+            || p == NULL)
+        {
+            return NULL;
+        }
+        cached = (DevicePathToTextProtocol *)p;
+    }
+    if (cached->ConvertDevicePathToText == NULL) {
+        return NULL;
+    }
+    unsigned short *text = cached->ConvertDevicePathToText(
+        device_path, FALSE, FALSE);
+    if (text == NULL) {
+        return NULL;
+    }
+    char *utf8 = axl_ucs2_to_utf8(text);
+    axl_bs()->FreePool(text);
+    return utf8;
 }

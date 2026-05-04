@@ -183,7 +183,7 @@ _axl_auto_free_func(void *p)
  * memory. Suitable for DMA buffers, RAM disks, and other uses
  * requiring physical address alignment.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_alloc_pages(
@@ -252,8 +252,10 @@ bool axl_mem_check(
  * assert(t == NULL);
  * @endcode
  *
- * Pass 0 to disable injection. DEBUG builds only — in release
- * builds this is a no-op and allocations always proceed.
+ * Pass 0 to disable injection. Available in both DEBUG and
+ * RELEASE builds — the cost on the malloc path is one
+ * well-predicted branch. The fence/leak-tracking machinery
+ * stays DEBUG-only; only the fail-counter is universal.
  */
 void axl_mem_fail_next_alloc(
     size_t n  ///< fail the Nth next alloc (1 = next, 0 = disabled)

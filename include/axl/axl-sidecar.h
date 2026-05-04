@@ -146,7 +146,7 @@ axl_sidecar_open_buffer(
  *
  * Every axl-sdk sidecar declares its layout version up front:
  *
- * @code{.json}
+ * @code{.js}
  *   { schema: 2, vendors: [...] }
  * @endcode
  *

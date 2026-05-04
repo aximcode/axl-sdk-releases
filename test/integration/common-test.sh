@@ -111,7 +111,16 @@ test_add_efi() {
 
     if [[ ! -f "$src" ]]; then
         echo "Not found: $src"
-        echo "Build first: ./build.sh --rebuild"
+        # Point at the right make target based on the missing artifact
+        # so the next command actually builds the missing thing.
+        local hint
+        case "$src" in
+            */tools/*.efi)  hint="make tools${TEST_ARCH:+ ARCH=${TEST_ARCH,,}}" ;;
+            */AxlTest*.efi) hint="make tests${TEST_ARCH:+ ARCH=${TEST_ARCH,,}}" ;;
+            *.efi)          hint="make all${TEST_ARCH:+ ARCH=${TEST_ARCH,,}}" ;;
+            *)              hint="make all tools tests${TEST_ARCH:+ ARCH=${TEST_ARCH,,}}" ;;
+        esac
+        echo "Build first: $hint"
         exit 1
     fi
 

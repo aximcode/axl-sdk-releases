@@ -51,7 +51,7 @@ axl_sidecar_open_file(
        info call and the load is theoretical on a single-threaded
        UEFI system without concurrent FS mutators. */
     AxlFileInfo finfo;
-    if (axl_file_info(path, &finfo) != 0) {
+    if (axl_file_info(path, &finfo) != AXL_OK) {
         return AXL_SIDECAR_FILE_MISSING;
     }
     if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,

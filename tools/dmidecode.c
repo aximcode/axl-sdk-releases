@@ -171,7 +171,7 @@ static void
 decode_bios(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosBiosInfo b;
-    if (axl_smbios_read_bios_info(&b) != 0) { return; }
+    if (axl_smbios_read_bios_info(&b) != AXL_OK) { return; }
     (void)hdr;
     print_field("Vendor",       b.vendor);
     print_field("Version",      b.version);
@@ -185,7 +185,7 @@ static void
 decode_system(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosSystemInfo s;
-    if (axl_smbios_read_system_info(&s) != 0) { return; }
+    if (axl_smbios_read_system_info(&s) != AXL_OK) { return; }
     (void)hdr;
     print_field("Manufacturer",   s.manufacturer);
     print_field("Product Name",   s.product_name);
@@ -200,7 +200,7 @@ static void
 decode_baseboard(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosBaseboardInfo b;
-    if (axl_smbios_read_baseboard(&b) != 0) { return; }
+    if (axl_smbios_read_baseboard(&b) != AXL_OK) { return; }
     (void)hdr;
     print_field("Manufacturer",  b.manufacturer);
     print_field("Product Name",  b.product_name);
@@ -213,7 +213,7 @@ static void
 decode_chassis(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosChassisInfo c;
-    if (axl_smbios_read_chassis(&c) != 0) { return; }
+    if (axl_smbios_read_chassis(&c) != AXL_OK) { return; }
     (void)hdr;
     print_field("Manufacturer",  c.manufacturer);
     axl_printf("\tType: %s\n", chassis_type_name(c.type));
@@ -226,7 +226,7 @@ static void
 decode_processor(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosProcessorInfo p;
-    if (axl_smbios_read_processor(hdr, &p) != 0) { return; }
+    if (axl_smbios_read_processor(hdr, &p) != AXL_OK) { return; }
     print_field("Socket Designation", p.socket_designation);
     print_field("Manufacturer",       p.manufacturer);
     print_field("Version",            p.version);
@@ -247,7 +247,7 @@ static void
 decode_memory_device(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosMemoryDevice m;
-    if (axl_smbios_read_memory_device(hdr, &m) != 0) { return; }
+    if (axl_smbios_read_memory_device(hdr, &m) != AXL_OK) { return; }
     print_field("Locator",      m.device_locator);
     print_field("Bank Locator", m.bank_locator);
     if (m.size_mb == 0) {
@@ -310,7 +310,7 @@ decode_ipmi_device_info(AxlSmbiosHeader *hdr)
 {
     (void)hdr;
     AxlSmbiosIpmiDeviceInfo ip;
-    if (axl_smbios_read_ipmi_device_info(&ip) != 0) { return; }
+    if (axl_smbios_read_ipmi_device_info(&ip) != AXL_OK) { return; }
     axl_printf("\tInterface Type: %s (0x%02X)\n",
                ipmi_interface_name(ip.interface_type), ip.interface_type);
     axl_printf("\tSpecification Version: %u.%u\n", ip.spec_major, ip.spec_minor);
@@ -332,7 +332,7 @@ static void
 decode_host_interface(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosHostInterface h;
-    if (axl_smbios_read_host_interface(hdr, &h) != 0) {
+    if (axl_smbios_read_host_interface(hdr, &h) != AXL_OK) {
         axl_printf("\t(pre-3.0 host interface layout — not decoded)\n");
         return;
     }
@@ -362,21 +362,21 @@ single_string(const char *keyword)
     AxlSmbiosChassisInfo ch;
 
     if (axl_strcmp(keyword, "bios-vendor") == 0
-        && axl_smbios_read_bios_info(&bi) == 0) {
+        && axl_smbios_read_bios_info(&bi) == AXL_OK) {
         axl_printf("%s\n", bi.vendor);
         return 0;
     }
     if (axl_strcmp(keyword, "bios-version") == 0
-        && axl_smbios_read_bios_info(&bi) == 0) {
+        && axl_smbios_read_bios_info(&bi) == AXL_OK) {
         axl_printf("%s\n", bi.version);
         return 0;
     }
     if (axl_strcmp(keyword, "bios-release-date") == 0
-        && axl_smbios_read_bios_info(&bi) == 0) {
+        && axl_smbios_read_bios_info(&bi) == AXL_OK) {
         axl_printf("%s\n", bi.release_date);
         return 0;
     }
-    if (axl_smbios_read_system_info(&si) == 0) {
+    if (axl_smbios_read_system_info(&si) == AXL_OK) {
         if (axl_strcmp(keyword, "system-manufacturer")  == 0) { axl_printf("%s\n", si.manufacturer);  return 0; }
         if (axl_strcmp(keyword, "system-product-name")  == 0) { axl_printf("%s\n", si.product_name);  return 0; }
         if (axl_strcmp(keyword, "system-version")       == 0) { axl_printf("%s\n", si.version);       return 0; }
@@ -394,14 +394,14 @@ single_string(const char *keyword)
             return 0;
         }
     }
-    if (axl_smbios_read_baseboard(&ba) == 0) {
+    if (axl_smbios_read_baseboard(&ba) == AXL_OK) {
         if (axl_strcmp(keyword, "baseboard-manufacturer")  == 0) { axl_printf("%s\n", ba.manufacturer);  return 0; }
         if (axl_strcmp(keyword, "baseboard-product-name")  == 0) { axl_printf("%s\n", ba.product_name);  return 0; }
         if (axl_strcmp(keyword, "baseboard-version")       == 0) { axl_printf("%s\n", ba.version);       return 0; }
         if (axl_strcmp(keyword, "baseboard-serial-number") == 0) { axl_printf("%s\n", ba.serial_number); return 0; }
         if (axl_strcmp(keyword, "baseboard-asset-tag")     == 0) { axl_printf("%s\n", ba.asset_tag);     return 0; }
     }
-    if (axl_smbios_read_chassis(&ch) == 0) {
+    if (axl_smbios_read_chassis(&ch) == AXL_OK) {
         if (axl_strcmp(keyword, "chassis-manufacturer")  == 0) { axl_printf("%s\n", ch.manufacturer);  return 0; }
         if (axl_strcmp(keyword, "chassis-version")       == 0) { axl_printf("%s\n", ch.version);       return 0; }
         if (axl_strcmp(keyword, "chassis-serial-number") == 0) { axl_printf("%s\n", ch.serial_number); return 0; }

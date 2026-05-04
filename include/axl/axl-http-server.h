@@ -52,7 +52,7 @@ typedef struct {
 /**
  * @brief Route handler callback.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 typedef int (*AxlHttpHandler)(
     AxlHttpRequest  *req,   ///< incoming request
@@ -64,7 +64,7 @@ typedef int (*AxlHttpHandler)(
  * @brief Middleware callback. Return 0 to continue pipeline, -1 to
  * short-circuit.
  *
- * @return 0 to continue, -1 to abort.
+ * @return AXL_OK to continue, AXL_ERR to abort.
  */
 typedef int (*AxlHttpMiddleware)(
     AxlHttpRequest  *req,   ///< incoming request
@@ -105,7 +105,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlHttpServer, axl_http_server_free)
  *
  * Supported keys: "max.connections", "body.limit", "keep.alive.sec".
  *
- * @return 0 on success, -1 on unknown key or invalid value.
+ * @return AXL_OK on success, AXL_ERR on unknown key or invalid value.
  */
 int
 axl_http_server_set(
@@ -128,7 +128,7 @@ axl_http_server_get(
 /**
  * @brief Set maximum simultaneous connections.
  *
- * @return 0 on success, -1 if @p s is NULL or the underlying setter
+ * @return AXL_OK on success, AXL_ERR if @p s is NULL or the underlying setter
  *     rejected the value.
  */
 int
@@ -140,7 +140,7 @@ axl_http_server_set_max_connections(
 /**
  * @brief Set maximum request body size.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_http_server_set_body_limit(
@@ -151,7 +151,7 @@ axl_http_server_set_body_limit(
 /**
  * @brief Set keep-alive timeout.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_http_server_set_keep_alive(
@@ -163,7 +163,7 @@ axl_http_server_set_keep_alive(
  * @brief Register middleware executed in registration order.
  * Return 0 from mw to continue pipeline, -1 to short-circuit.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_use(
@@ -175,7 +175,7 @@ axl_http_server_use(
 /**
  * @brief Register a route handler.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_add_route(
@@ -189,7 +189,7 @@ axl_http_server_add_route(
 /**
  * @brief Serve static files from a filesystem path.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_add_static(
@@ -201,7 +201,7 @@ axl_http_server_add_static(
 /**
  * @brief Attach server to an event loop for cooperative polling.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_attach(
@@ -212,7 +212,7 @@ axl_http_server_attach(
 /**
  * @brief Run the server in standalone mode (blocks until quit).
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_run(
@@ -333,7 +333,7 @@ axl_http_accepts(
  * key can be generated with axl_tls_generate_self_signed().
  * Requires AXL_TLS=1 at build time.
  *
- * @return 0 on success, -1 if TLS not available or cert/key invalid.
+ * @return AXL_OK on success, AXL_ERR if TLS not available or cert/key invalid.
  */
 int
 axl_http_server_use_tls(
@@ -356,7 +356,7 @@ axl_http_server_use_tls(
 /**
  * @brief WebSocket event callback.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 typedef int (*AxlWsHandler)(
     size_t     event,       ///< one of AXL_WS_CONNECT, AXL_WS_TEXT, AXL_WS_BINARY, AXL_WS_DISCONNECT
@@ -368,7 +368,7 @@ typedef int (*AxlWsHandler)(
 /**
  * @brief Register a WebSocket endpoint.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_add_websocket(
@@ -381,7 +381,7 @@ axl_http_server_add_websocket(
 /**
  * @brief Broadcast data to all connected WebSocket clients on a path.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_ws_broadcast(
@@ -403,7 +403,7 @@ typedef struct {
 /**
  * @brief Authentication callback.
  *
- * @return 0 on success (authenticated), -1 on failure.
+ * @return AXL_OK on success (authenticated), AXL_ERR on failure.
  */
 typedef int (*AxlAuthCallback)(
     AxlHttpRequest *req,       ///< incoming request
@@ -418,7 +418,7 @@ typedef int (*AxlAuthCallback)(
 /**
  * @brief Register an authentication handler for the server.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_use_auth(
@@ -430,7 +430,7 @@ axl_http_server_use_auth(
 /**
  * @brief Register a route handler with authentication requirements.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_add_route_auth(
@@ -451,7 +451,7 @@ axl_http_server_add_route_auth(
 /**
  * @brief Enable response caching on the server.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_use_cache(
@@ -469,7 +469,7 @@ axl_http_server_use_cache(
  * set the TTL on the exact sub-paths you expect, or rely on the
  * server default.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_set_route_ttl(
@@ -500,9 +500,9 @@ axl_http_server_cache_invalidate(
  *
  * Called repeatedly with chunks up to the configured upload.chunk.size.
  * The final call has chunk=NULL, chunk_size=0 — set resp fields there.
- * Return -1 from any call to abort the upload (sends 500).
+ * Return AXL_ERR from any call to abort the upload (sends 500).
  *
- * @return 0 on success, -1 to abort.
+ * @return AXL_OK on success, AXL_ERR to abort.
  */
 typedef int (*AxlUploadHandler)(
     AxlHttpRequest  *req,         ///< incoming request
@@ -515,7 +515,7 @@ typedef int (*AxlUploadHandler)(
 /**
  * @brief Register a streaming upload route.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_http_server_add_upload_route(

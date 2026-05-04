@@ -29,7 +29,7 @@ udp_poll_tick(void *ctx)
     axl_efi_call(udp4->Poll, 1, udp4);
 }
 
-int
+AxlStatus
 _axl_udp_wait(
     EFI_UDP4_PROTOCOL *udp4,
     EFI_EVENT          event,
@@ -37,7 +37,7 @@ _axl_udp_wait(
     )
 {
     if (udp4 == NULL || event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)event,
@@ -57,7 +57,7 @@ tcp_poll_tick(void *ctx)
     axl_efi_call(tcp4->Poll, 1, tcp4);
 }
 
-int
+AxlStatus
 _axl_tcp_wait(
     EFI_TCP4_PROTOCOL *tcp4,
     EFI_EVENT          event,
@@ -65,7 +65,7 @@ _axl_tcp_wait(
     )
 {
     if (tcp4 == NULL || event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)event,
@@ -85,7 +85,7 @@ dns_poll_tick(void *ctx)
     axl_efi_call(dns4->Poll, 1, dns4);
 }
 
-int
+AxlStatus
 _axl_dns_wait(
     EFI_DNS4_PROTOCOL *dns4,
     EFI_EVENT          event,
@@ -93,7 +93,7 @@ _axl_dns_wait(
     )
 {
     if (dns4 == NULL || event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)event,
@@ -113,7 +113,7 @@ ip4_poll_tick(void *ctx)
     axl_efi_call(ip4->Poll, 1, ip4);
 }
 
-int
+AxlStatus
 _axl_ip4_wait(
     EFI_IP4_PROTOCOL *ip4,
     EFI_EVENT         event,
@@ -121,7 +121,7 @@ _axl_ip4_wait(
     )
 {
     if (ip4 == NULL || event == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     return _axl_event_wait_timeout_with_tick(
         (AxlEventHandle)event,

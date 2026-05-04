@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+# axl-emulate -- replay a captured hardware fixture under QEMU.
+#
+# Phase HF3 of the Hardware Fixture Capture & Replay design (see
+# docs/AXL-Hardware-Fixture-Design.md). Wraps run-qemu.sh: takes a
+# fixture directory produced by mkfixture.efi (HF2) or hand-crafted
+# from dmidecode/acpidump (HF1), translates each artifact into the
+# corresponding low-level run-qemu.sh flag, applies the default-drop
+# ACPI denylist, and execs run-qemu.sh.
+#
+# Layered cleanly on the HF1 primitives in run-qemu.sh — this tool
+# never duplicates the QEMU launching machinery; it just decides
+# which primitives to invoke.
+#
+# Future phases land here, NOT in run-qemu.sh:
+#   HF4: --usb-shim, --edid, --gpu-rom, --cpu-from-fixture, --mac
+#   HF5: TPM event-log → swtpm NVChip seeding
+#   HF6: Secure Boot / boot-vars vars.fd injection
+#   HF7: Redfish mock spawn (DMTF Redfish-Mockup-Server)
+#   HF8: IPMI sim spawn (OpenIPMI ipmi_sim)
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ACPI tables we drop by default on replay. Two categories,
+# both for the same underlying reason: replaying them on top of
+# OVMF's auto-generated tables breaks the guest. See
+# AXL-Hardware-Fixture-Design.md §"ACPI replay caveats" for the
+# rationale.
+#
+# 1. Core singleton tables (FACP/FACS/DSDT): ACPI singletons whose
+#    bodies contain absolute physical pointers (FACP→FACS, FACP→DSDT,
+#    FACP→PM register blocks, DSDT→AML opregion addresses). QEMU's
+#    `-acpitable` APPENDS to the RSDT alongside QEMU's own (verified
+#    in hw/i386/acpi-build.c:2594-2600) and does NOT fix up body
+#    pointers — only the header is rewritten. OVMF passes the captured
+#    table through `EFI_ACPI_TABLE_PROTOCOL.InstallAcpiTable`, which
+#    has special semantics for these three signatures (per UEFI ACPI
+#    Table Protocol spec): it follows FIRMWARE_CTRL/DSDT/AML
+#    references during install, dereferences source-platform addresses
+#    that don't exist in QEMU's memory map, and hangs the boot.
+#    Verified by per-table bisection against the Proxmox fixture.
+#
+# 2. Platform-topology: describe the source platform's PCIe
+#    layout, NUMA topology, serial console — none of which match
+#    QEMU's emulated platform. MCFG is the canonical case (captured
+#    ECAM base != QEMU's, every ECAM read returns 0xFF).
+#
+# Why some tables with absolute pointers are NOT here: BERT (boot
+# error region), BGRT (boot graphic image), FPDT (perf records),
+# MCHI (BMC interface), etc. all have physical pointers in their
+# bodies per ACPI 6.5. They don't hang because OVMF/Linux don't
+# DEREFERENCE those pointers on the boot path — BERT is only read
+# if there's a logged error, BGRT if the OS chooses to render the
+# logo, etc. Stale captured pointers are inert. Add to this list
+# only when an actual hang or misbehavior is observed (per
+# feedback_verify_before_diverging in memory).
+#
+# Both categories drop by default. The user can re-enable any
+# specific table with --keep-acpi NAME if they have a real reason
+# (e.g., axl-acpi parser tests that want to exercise a specific
+# captured DSDT). --strict-acpi reduces the denylist to MCFG only,
+# matching the design doc's "minimum viable filtering" mode.
+CORE_FIRMWARE_DENYLIST = {
+    "FACP",  # Fixed ACPI Description Table (FADT) — singleton
+    "FACS",  # Firmware ACPI Control Structure — singleton, pointed-to by FACP
+    "DSDT",  # Differentiated System Description Table — singleton, AML
+}
+TOPOLOGY_DENYLIST = {
+    "MCFG",  # PCIe ECAM map
+    "MPST",  # memory power state
+    "PMTT",  # platform memory topology
+    "HMAT",  # heterogeneous memory attributes
+    "SLIT",  # NUMA proximity distances
+    "SRAT",  # NUMA system resource affinity
+    "SPCR",  # serial console redirection
+    "DBG2",  # debug port table 2
+}
+DEFAULT_DENYLIST = CORE_FIRMWARE_DENYLIST | TOPOLOGY_DENYLIST
+STRICT_DENYLIST = {"MCFG"}
+
+
+@dataclass
+class Artifacts:
+    """Typed view of the artifacts found in a fixture directory.
+    Replaces dict[str, object] returns so pylance-strict doesn't
+    require isinstance() boilerplate at every consumer."""
+
+    smbios: Path | None = None
+    acpi: list[Path] = field(default_factory=list)
+    spd: list[tuple[str, Path]] = field(default_factory=list)
+    tpm_dir: Path | None = None
+    manifest: dict[str, object] | None = None
+
+
+def acpi_signature(path: Path) -> str:
+    """Return the 4-byte ASCII signature at the start of an ACPI
+    table file. Decoded with 'replace' so non-ASCII bytes don't
+    crash the loader. Returns "" for empty / short files (caller
+    treats this as 'unknown signature, keep' since malformed blobs
+    are surfaced via warn_malformed_acpi)."""
+    raw = path.read_bytes()[:4]
+    if len(raw) < 4:
+        return ""
+    return raw.decode("ascii", "replace")
+
+
+def warn_malformed_acpi(tables: list[Path]) -> None:
+    """Surface .dat files that look bogus (too short / non-ASCII
+    signature) BEFORE QEMU sees them — QEMU's diagnostic for these
+    is cryptic, ours is actionable."""
+    for path in tables:
+        raw = path.read_bytes()[:4]
+        if len(raw) < 4:
+            print(
+                f"WARN: {path}: too short to contain an ACPI signature "
+                f"({len(raw)} bytes); will pass to QEMU unchecked",
+                file=sys.stderr,
+            )
+            continue
+        sig = raw.decode("ascii", "replace")
+        if any(c == "�" or not c.isprintable() for c in sig):
+            print(
+                f"WARN: {path}: 4-byte signature is non-ASCII ({raw!r}); "
+                f"will pass to QEMU unchecked",
+                file=sys.stderr,
+            )
+
+
+def discover_artifacts(fixture: Path) -> Artifacts:
+    """Walk the fixture directory and return a typed view of the
+    artifacts we know how to replay."""
+    smbios = fixture / "smbios.bin"
+    acpi_dir = fixture / "acpi"
+    spd_dir = fixture / "spd"
+    tpm_dir = fixture / "tpm"
+    manifest_file = fixture / "manifest.json"
+
+    acpi_tables: list[Path] = []
+    if acpi_dir.is_dir():
+        acpi_tables = sorted(p for p in acpi_dir.iterdir() if p.is_file() and p.suffix == ".dat")
+
+    # Filename convention: spd/0xNN.bin. The address is recovered
+    # from the stem so the user doesn't have to repeat themselves.
+    spd_blobs: list[tuple[str, Path]] = []
+    if spd_dir.is_dir():
+        for p in sorted(spd_dir.iterdir()):
+            if not (p.is_file() and p.suffix == ".bin"):
+                continue
+            addr = p.stem  # "0x50.bin" -> "0x50"
+            spd_blobs.append((addr, p))
+
+    manifest: dict[str, object] | None = None
+    if manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            # Don't block replay on a corrupt manifest — just warn.
+            print(
+                f"WARN: manifest.json present but unreadable: {exc}",
+                file=sys.stderr,
+            )
+
+    return Artifacts(
+        smbios=smbios if smbios.is_file() else None,
+        acpi=acpi_tables,
+        spd=spd_blobs,
+        tpm_dir=tpm_dir if tpm_dir.is_dir() else None,
+        manifest=manifest,
+    )
+
+
+def filter_acpi(
+    tables: list[Path],
+    denylist: set[str],
+    keep: set[str],
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Partition the ACPI tables into kept and dropped. Returns
+    (kept, dropped) where dropped is [(path, signature), ...] for
+    diagnostic logging. Signature is the 4-byte ASCII at offset 0
+    of each .dat file (NOT the filename — capture tools may write
+    lowercase filenames while the spec-defined signature is upper)."""
+    kept: list[Path] = []
+    dropped: list[tuple[Path, str]] = []
+    for path in tables:
+        sig = acpi_signature(path).upper()
+        if sig in denylist and sig not in keep:
+            dropped.append((path, sig))
+        else:
+            kept.append(path)
+    return kept, dropped
+
+
+def print_manifest_summary(manifest: dict[str, object]) -> None:
+    """Print a one-line identity from the captured manifest so the
+    user sees which machine the guest is impersonating. Tolerant
+    of missing keys — older / hand-crafted fixtures may only have
+    a subset."""
+    fields = ("vendor", "model", "bios_rev", "capture_date")
+    bits = [str(manifest[k]) for k in fields if manifest.get(k)]
+    if bits:
+        print(f"axl-emulate: replaying {' / '.join(bits)}", file=sys.stderr)
+
+
+def build_run_qemu_args(
+    fixture: Path,
+    artifacts: Artifacts,
+    arch: str | None,
+    keep_acpi: set[str],
+    extra_drop_acpi: set[str],
+    strict_acpi: bool,
+    efi_file: Path | None,
+    pass_through: list[str],
+) -> list[str]:
+    """Translate the artifact manifest into a run-qemu.sh argv.
+    Returns the full list of arguments (excluding the run-qemu.sh
+    path itself) that will be exec'd."""
+    args: list[str] = []
+
+    if arch is not None:
+        args.extend(["--arch", arch])
+
+    if artifacts.smbios is not None:
+        args.extend(["--smbios-file", str(artifacts.smbios)])
+
+    warn_malformed_acpi(artifacts.acpi)
+    denylist = (STRICT_DENYLIST if strict_acpi else DEFAULT_DENYLIST) | extra_drop_acpi
+    kept, dropped = filter_acpi(artifacts.acpi, denylist, keep_acpi)
+    for path in kept:
+        args.extend(["--acpi-table", str(path)])
+    for path, sig in dropped:
+        print(
+            f"axl-emulate: dropping ACPI {sig} ({path.name}) — see design "
+            f"doc §ACPI replay caveats; override with --keep-acpi {sig}",
+            file=sys.stderr,
+        )
+
+    for addr, blob in artifacts.spd:
+        args.extend(["--spd", f"{addr}:{blob}"])
+
+    if artifacts.tpm_dir is not None:
+        # HF1 contract: --tpm-state DIR is raw swtpm-format
+        # passthrough. HF5 will convert captured tpm/ artifacts
+        # (tpm.json + event-log.bin) into NVChip format before
+        # we get here. For HF3, an empty tpm/ subdir → swtpm
+        # initialises clean PCRs; a populated one is assumed
+        # already-converted (no-op until HF5).
+        args.extend(["--tpm-state", str(artifacts.tpm_dir)])
+
+    if efi_file is not None:
+        args.append(str(efi_file))
+
+    if pass_through:
+        args.extend(pass_through)
+
+    return args
+
+
+def parse_argv(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    """Parse argv with `--` as the pass-through separator. Anything
+    after `--` is forwarded to run-qemu.sh verbatim, so axl-emulate
+    composes with run-qemu.sh's existing knobs (--background, -i,
+    --mount, --gdb, ...) without us having to mirror each one."""
+    if "--" in argv:
+        idx = argv.index("--")
+        ours = argv[:idx]
+        pass_through = argv[idx + 1 :]
+    else:
+        ours = argv
+        pass_through = []
+
+    parser = argparse.ArgumentParser(
+        prog="axl-emulate",
+        description=(
+            "Replay a captured hardware fixture under QEMU by translating "
+            "the fixture directory into run-qemu.sh primitives. "
+            "Wrapper around scripts/run-qemu.sh — see "
+            "docs/AXL-Hardware-Fixture-Design.md for the full design."
+        ),
+        epilog=(
+            "Anything after `--` is passed through to run-qemu.sh, e.g.:\n"
+            "  axl-emulate fixtures/proxmox-vm/ sysinfo.efi -- --background\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "fixture_dir",
+        nargs="?",
+        help="Path to a fixture directory (smbios.bin, acpi/*.dat, ...).",
+    )
+    parser.add_argument(
+        "efi_file",
+        nargs="?",
+        help="Optional .efi binary to run inside the guest.",
+    )
+    parser.add_argument(
+        "--arch",
+        choices=("X64", "AARCH64"),
+        help="Target architecture (forwarded to run-qemu.sh).",
+    )
+    parser.add_argument(
+        "--keep-acpi",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Force-keep an ACPI table that the default denylist would drop. Repeatable.",
+    )
+    parser.add_argument(
+        "--drop-acpi",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Force-drop an ACPI table that the default denylist would keep. Repeatable.",
+    )
+    parser.add_argument(
+        "--strict-acpi",
+        action="store_true",
+        help="Reduce the denylist to MCFG only (keep everything else, even SPCR/SRAT/...).",
+    )
+    args = parser.parse_args(ours)
+
+    if args.fixture_dir is None:
+        parser.error("a fixture directory is required (try --help)")
+
+    return args, pass_through
+
+
+def main(argv: list[str]) -> int:
+    args, pass_through = parse_argv(argv)
+
+    fixture = Path(args.fixture_dir)
+    if not fixture.is_dir():
+        print(
+            f"ERROR: fixture directory not found: {fixture}",
+            file=sys.stderr,
+        )
+        return 1
+
+    fixture = fixture.resolve()
+
+    artifacts = discover_artifacts(fixture)
+    if artifacts.manifest is not None:
+        print_manifest_summary(artifacts.manifest)
+        if args.arch:
+            # Best-effort metadata-vs-arch consistency check: warn
+            # rather than block, since fixture metadata is informational.
+            arch_hint = artifacts.manifest.get("arch")
+            if arch_hint and str(arch_hint).upper() != args.arch:
+                print(
+                    f"WARN: fixture metadata reports arch={arch_hint} but "
+                    f"--arch {args.arch} requested — proceeding anyway",
+                    file=sys.stderr,
+                )
+
+    efi_file: Path | None = None
+    if args.efi_file is not None:
+        efi_file = Path(args.efi_file)
+
+    run_qemu_args = build_run_qemu_args(
+        fixture=fixture,
+        artifacts=artifacts,
+        arch=args.arch,
+        keep_acpi={s.upper() for s in args.keep_acpi},
+        extra_drop_acpi={s.upper() for s in args.drop_acpi},
+        strict_acpi=args.strict_acpi,
+        efi_file=efi_file,
+        pass_through=pass_through,
+    )
+
+    # Locate run-qemu.sh next to ourselves.
+    here = Path(__file__).resolve().parent
+    run_qemu = here / "run-qemu.sh"
+    if not run_qemu.is_file():
+        print(
+            f"ERROR: run-qemu.sh not found alongside axl-emulate: {run_qemu}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmd = [str(run_qemu), *run_qemu_args]
+
+    # AXL_EMULATE_DRYRUN=1 mirrors run-qemu.sh's QEMU_DRYRUN
+    # convention: print the constructed argv (one token per line,
+    # prefixed with "AXL_EMULATE_DRYRUN: ") and exit without
+    # exec'ing. Useful for tests and for "what would axl-emulate
+    # actually run?" debugging.
+    if os.environ.get("AXL_EMULATE_DRYRUN", "0") == "1":
+        for token in cmd:
+            print(f"AXL_EMULATE_DRYRUN: {token}")
+        return 0
+
+    os.execv(str(run_qemu), cmd)
+    # Unreachable.
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -26,6 +26,7 @@
 #define AXL_CONSOLE_H
 
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,7 +56,7 @@ typedef struct {
  * waits on the union of {ConIn WaitForKey, timer}, then reads one
  * keystroke. The timer is closed before return.
  *
- * @return 0 on key read (with @p out populated), -1 on timeout,
+ * @return AXL_OK on key read (with @p out populated), -1 on timeout,
  *     no console available, or backend error.
  */
 int

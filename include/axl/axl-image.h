@@ -28,6 +28,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,7 +51,7 @@ typedef struct AxlImage AxlImage;
  * accepted and normalized internally. The image is loaded but
  * not yet started.
  *
- * @return 0 on success, -1 if the file can't be read or the
+ * @return AXL_OK on success, AXL_ERR if the file can't be read or the
  *     image format is rejected.
  */
 int
@@ -75,8 +76,8 @@ axl_image_load(
  * value as "image did not succeed" rather than rely on a specific
  * code.
  *
- * @return 0 on successful start (regardless of the image's exit
- *     code), -1 if the image could not be started at all.
+ * @return AXL_OK on successful start (regardless of the image's exit
+ *     code), AXL_ERR if the image could not be started at all.
  */
 int
 axl_image_start(
@@ -89,7 +90,7 @@ axl_image_start(
  *
  * Safe to call on a never-started image. Frees the handle.
  *
- * @return 0 on success, -1 if the firmware refuses (e.g. the image
+ * @return AXL_OK on success, AXL_ERR if the firmware refuses (e.g. the image
  *     has installed protocols that aren't released yet).
  */
 int

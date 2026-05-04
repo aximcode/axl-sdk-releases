@@ -13,7 +13,7 @@
  *   - Transparent integration with AxlTcp, AxlHttpServer, AxlHttpClient
  *
  * @code
- * if (axl_tls_init() == 0) {
+ * if (axl_tls_init() == AXL_OK) {
  *     void *cert, *key;
  *     size_t cert_len, key_len;
  *     axl_tls_generate_self_signed("MyServer", NULL, 0,
@@ -52,7 +52,7 @@ axl_tls_available(void);
 
 /**
  * @brief Initialize the TLS subsystem. Call once at startup.
- * @return 0 on success, -1 if TLS not compiled in or init failed.
+ * @return AXL_OK on success, AXL_ERR if TLS not compiled in or init failed.
  */
 int
 axl_tls_init(void);
@@ -70,7 +70,7 @@ axl_tls_cleanup(void);
  * and any provided IP addresses. Valid for 10 years.
  * Caller frees @a cert_der and @a key_der with axl_free().
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tls_generate_self_signed(
@@ -88,7 +88,7 @@ axl_tls_generate_self_signed(
  *
  * After this call, TLS accept operations use this certificate.
  *
- * @return 0 on success, -1 on failure.
+ * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_tls_server_set_cert(
@@ -157,7 +157,7 @@ axl_tls_read(
  *
  * Encrypts and sends data via the underlying TCP socket.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_tls_write(
@@ -175,7 +175,7 @@ axl_tls_write(
  * the callback's bool return is ignored (send owns its buffer;
  * each write needs a fresh call).
  *
- * @return 0 if initiated, -1 on failure.
+ * @return AXL_OK if initiated, AXL_ERR on failure.
  */
 int
 axl_tls_write_async(

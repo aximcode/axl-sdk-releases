@@ -29,7 +29,7 @@ axl_net_get_ip_address(AxlIPv4Address *addr)
     size_t                          data_size;
 
     if (addr == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_memset(addr, 0, sizeof(*addr));
@@ -45,7 +45,7 @@ axl_net_get_ip_address(AxlIPv4Address *addr)
                     &handles);
     if (EFI_ERROR(status)) {
         axl_debug("no IP4Config2 protocol found");
-        return -1;
+        return AXL_ERR;
     }
 
     //
@@ -102,7 +102,7 @@ axl_net_get_ip_address(AxlIPv4Address *addr)
         axl_memcpy(addr, station_addr, sizeof(EFI_IPv4_ADDRESS));
         axl_backend_free(if_info);
         axl_backend_free(handles);
-        return 0;
+        return AXL_OK;
     }
 
     axl_backend_free(handles);
@@ -110,7 +110,7 @@ axl_net_get_ip_address(AxlIPv4Address *addr)
        while waiting for DHCP, so a warning here would spam every second.
        Callers that care log their own message on final timeout. */
     axl_debug("no configured NIC found");
-    return -1;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ axl_net_is_available(void)
 {
     AxlIPv4Address addr;
 
-    if (axl_net_get_ip_address(&addr) == 0) {
+    if (axl_net_get_ip_address(&addr) == AXL_OK) {
         return true;
     }
 
@@ -160,7 +160,7 @@ axl_net_list_interfaces(AxlNetInterface *out, size_t *count)
     size_t       filled = 0;
 
     if (count == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     capacity = (out != NULL) ? *count : 0;
@@ -175,7 +175,7 @@ axl_net_list_interfaces(AxlNetInterface *out, size_t *count)
 
     if (EFI_ERROR(status) || num_handles == 0) {
         *count = 0;
-        return 0;
+        return AXL_OK;
     }
 
     for (size_t i = 0; i < num_handles && filled < capacity; i++) {
@@ -262,5 +262,5 @@ axl_net_list_interfaces(AxlNetInterface *out, size_t *count)
         *count = filled;
     }
 
-    return 0;
+    return AXL_OK;
 }

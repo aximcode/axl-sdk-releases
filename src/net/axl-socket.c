@@ -66,7 +66,7 @@ axl_socket_new(AxlSocketType type)
     sock->type = type;
 
     if (type == AXL_SOCKET_DATAGRAM) {
-        if (axl_udp_open(&sock->udp, 0) != 0) {
+        if (axl_udp_open(&sock->udp, 0) != AXL_OK) {
             axl_warning("socket: failed to open UDP socket");
             axl_free(sock);
             return NULL;
@@ -122,23 +122,23 @@ int
 axl_socket_bind(AxlSocket *sock, uint16_t port)
 {
     if (sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_DATAGRAM) {
         axl_warning("socket: bind on non-datagram socket");
-        return -1;
+        return AXL_ERR;
     }
 
     /* Close existing UDP socket and reopen on the requested port */
     axl_udp_close(sock->udp);
     sock->udp = NULL;
 
-    if (axl_udp_open(&sock->udp, port) != 0) {
+    if (axl_udp_open(&sock->udp, port) != AXL_OK) {
         axl_warning("socket: bind to port %u failed", (unsigned)port);
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -149,15 +149,15 @@ axl_socket_connect(AxlSocket *sock, AxlSocketAddress *addr)
     uint16_t port;
 
     if (sock == NULL || addr == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM) {
         axl_warning("socket: connect on non-stream socket");
-        return -1;
+        return AXL_ERR;
     }
     if (sock->tcp != NULL) {
         axl_warning("socket: already connected");
-        return -1;
+        return AXL_ERR;
     }
 
     inet = axl_socket_address_get_address(addr);
@@ -165,7 +165,7 @@ axl_socket_connect(AxlSocket *sock, AxlSocketAddress *addr)
     port = axl_socket_address_get_port(addr);
 
     if (host == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_tcp_connect(host, port, &sock->tcp);
@@ -175,15 +175,15 @@ int
 axl_socket_listen(AxlSocket *sock, uint16_t port)
 {
     if (sock == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM) {
         axl_warning("socket: listen on non-stream socket");
-        return -1;
+        return AXL_ERR;
     }
     if (sock->tcp != NULL) {
         axl_warning("socket: already connected/listening");
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_tcp_listen(port, &sock->tcp);
@@ -196,23 +196,23 @@ axl_socket_accept(AxlSocket *sock, AxlSocket **out_client, size_t timeout_ms)
     int rc;
 
     if (sock == NULL || out_client == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     rc = axl_tcp_accept(sock->tcp, &client_tcp, timeout_ms);
     if (rc != 0) {
-        return -1;
+        return AXL_ERR;
     }
 
     *out_client = axl_socket_new_from_tcp(client_tcp);
     if (*out_client == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
-    return 0;
+    return AXL_OK;
 }
 
 int
@@ -220,11 +220,11 @@ axl_socket_send(AxlSocket *sock, const void *data, size_t size,
                 size_t timeout_ms)
 {
     if (sock == NULL || data == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
         axl_warning("socket: send on non-stream or unconnected socket");
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_tcp_send(sock->tcp, data, size, timeout_ms);
@@ -238,11 +238,11 @@ axl_socket_send_to(AxlSocket *sock, const void *data, size_t size,
     uint16_t port;
 
     if (sock == NULL || data == NULL || dest == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_DATAGRAM || sock->udp == NULL) {
         axl_warning("socket: send_to on non-datagram socket");
-        return -1;
+        return AXL_ERR;
     }
 
     axl_socket_address_to_ipv4(dest, &ipv4, &port);
@@ -255,11 +255,11 @@ axl_socket_receive(AxlSocket *sock, void *buf, size_t *size,
                    size_t timeout_ms)
 {
     if (sock == NULL || buf == NULL || size == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
         axl_warning("socket: receive on non-stream or unconnected socket");
-        return -1;
+        return AXL_ERR;
     }
 
     return axl_tcp_recv(sock->tcp, buf, size, timeout_ms);
@@ -284,7 +284,7 @@ axl_socket_get_local_address(AxlSocket *sock)
     }
 
     if (axl_tcp_get_local_addr(sock->tcp, addr_buf, sizeof(addr_buf),
-                               &port) != 0) {
+                               &port) != AXL_OK) {
         return NULL;
     }
 
@@ -311,7 +311,7 @@ axl_socket_get_remote_address(AxlSocket *sock)
     }
 
     if (axl_tcp_get_remote_addr(sock->tcp, addr_buf, sizeof(addr_buf),
-                                &port) != 0) {
+                                &port) != AXL_OK) {
         return NULL;
     }
 
@@ -338,11 +338,11 @@ axl_socket_get_type(AxlSocket *sock)
 // ---------------------------------------------------------------------------
 
 static bool
-tcp_connect_bridge(AxlTcp *tcp, int status, void *ctx_data)
+tcp_connect_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
 {
     SocketAsyncCtx *ctx = ctx_data;
 
-    if (status == 0 && tcp != NULL) {
+    if (status == AXL_OK && tcp != NULL) {
         ctx->sock->tcp = tcp;
     }
 
@@ -364,15 +364,15 @@ axl_socket_connect_async(AxlSocket *sock, AxlSocketAddress *addr,
     uint16_t port;
 
     if (sock == NULL || addr == NULL || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx = axl_calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx->sock = sock;
@@ -385,28 +385,28 @@ axl_socket_connect_async(AxlSocket *sock, AxlSocketAddress *addr,
 
     if (host == NULL) {
         axl_free(ctx);
-        return -1;
+        return AXL_ERR;
     }
 
     int rc = axl_tcp_connect_async(host, port, loop, NULL,
                                    tcp_connect_bridge, ctx);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_free(ctx);
     }
     return rc;
 }
 
 static bool
-tcp_accept_bridge(AxlTcp *tcp, int status, void *ctx_data)
+tcp_accept_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
 {
     SocketAsyncCtx *ctx = ctx_data;
     AxlSocket *client = NULL;
     bool keep = true;  /* default: keep listening if no user cb */
 
-    if (status == 0 && tcp != NULL) {
+    if (status == AXL_OK && tcp != NULL) {
         client = axl_socket_new_from_tcp(tcp);
         if (client == NULL) {
-            status = -1;
+            status = AXL_ERR;
         }
     }
 
@@ -427,10 +427,10 @@ axl_socket_accept_async(AxlSocket *sock, AxlLoop *loop,
     int rc;
 
     if (sock == NULL || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     /* Free any previous accept ctx (re-arm case) */
@@ -439,7 +439,7 @@ axl_socket_accept_async(AxlSocket *sock, AxlLoop *loop,
     ctx = axl_calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
         sock->accept_ctx = NULL;
-        return -1;
+        return AXL_ERR;
     }
 
     ctx->sock = sock;
@@ -458,7 +458,7 @@ axl_socket_accept_async(AxlSocket *sock, AxlLoop *loop,
 }
 
 static bool
-tcp_send_bridge(AxlTcp *tcp, int status, void *ctx_data)
+tcp_send_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
 {
     SocketAsyncCtx *ctx = ctx_data;
     (void)tcp;
@@ -478,15 +478,15 @@ axl_socket_send_async(AxlSocket *sock, const void *buf, size_t size,
     SocketAsyncCtx *ctx;
 
     if (sock == NULL || buf == NULL || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
     if (sock->type != AXL_SOCKET_STREAM || sock->tcp == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx = axl_calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx->sock = sock;
@@ -495,14 +495,14 @@ axl_socket_send_async(AxlSocket *sock, const void *buf, size_t size,
 
     int rc = axl_tcp_send_async(sock->tcp, buf, size, loop, NULL,
                                 tcp_send_bridge, ctx);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_free(ctx);
     }
     return rc;
 }
 
 static bool
-tcp_recv_bridge(AxlTcp *tcp, int status, void *ctx_data)
+tcp_recv_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
 {
     SocketAsyncCtx *ctx = ctx_data;
     bool keep = false;
@@ -544,7 +544,7 @@ udp_recv_bridge(AxlUdpSocket *udp, const void *payload, size_t len,
 
     /* Fire user callback — return value controls re-arm like TCP. */
     if (sock->udp_recv_cb != NULL) {
-        keep = sock->udp_recv_cb(sock, 0, sock->udp_recv_data);
+        keep = sock->udp_recv_cb(sock, AXL_OK, sock->udp_recv_data);
     }
 
     /* If not keeping, stop the underlying UDP recv. axl_udp_recv_start
@@ -560,12 +560,12 @@ axl_socket_receive_async(AxlSocket *sock, void *buf, size_t size,
                          AxlLoop *loop, AxlSocketCallback cb, void *data)
 {
     if (sock == NULL || buf == NULL || loop == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     if (sock->type == AXL_SOCKET_DATAGRAM) {
         if (sock->udp == NULL) {
-            return -1;
+            return AXL_ERR;
         }
 
         /* Store receive state for the UDP bridge */
@@ -580,12 +580,12 @@ axl_socket_receive_async(AxlSocket *sock, void *buf, size_t size,
 
     /* Stream (TCP) path */
     if (sock->tcp == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     SocketAsyncCtx *ctx = axl_calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     ctx->sock = sock;
@@ -594,7 +594,7 @@ axl_socket_receive_async(AxlSocket *sock, void *buf, size_t size,
 
     int rc = axl_tcp_recv_async(sock->tcp, buf, size, loop, NULL,
                                 tcp_recv_bridge, ctx);
-    if (rc != 0) {
+    if (rc != AXL_OK) {
         axl_free(ctx);
     }
     return rc;

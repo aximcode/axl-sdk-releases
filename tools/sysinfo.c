@@ -246,7 +246,7 @@ show_mem_info(void)
 
     /* Total usable memory */
     uint64_t total_bytes = 0;
-    if (axl_sys_get_memory_size(&total_bytes) == 0 && total_bytes > 0) {
+    if (axl_sys_get_memory_size(&total_bytes) == AXL_OK && total_bytes > 0) {
         uint64_t total_mb = total_bytes / (1024 * 1024);
         if (total_mb >= 1024) {
             axl_printf("  Total:      %llu MB (%llu GB)\n",
@@ -335,7 +335,7 @@ show_fw_info(void)
 
     /* Firmware vendor and revision */
     AxlFirmwareInfo fw;
-    if (axl_sys_get_firmware_info(&fw) == 0) {
+    if (axl_sys_get_firmware_info(&fw) == AXL_OK) {
         axl_printf("  Vendor:     %s\n", fw.vendor);
         axl_printf("  Revision:   0x%08x\n", fw.firmware_revision);
         axl_printf("  UEFI:       %u.%u\n", fw.spec_major, fw.spec_minor);
@@ -344,13 +344,13 @@ show_fw_info(void)
     /* Secure Boot state */
     uint8_t sb_val = 0;
     size_t sb_size = sizeof(sb_val);
-    if (axl_nvstore_get("global", "SecureBoot", &sb_val, &sb_size) == 0) {
+    if (axl_nvstore_get("global", "SecureBoot", &sb_val, &sb_size) == AXL_OK) {
         axl_printf("  Secure Boot: %s", sb_val ? "Enabled" : "Disabled");
 
         uint8_t setup_mode = 0;
         size_t sm_size = sizeof(setup_mode);
         if (axl_nvstore_get("global", "SetupMode",
-                            &setup_mode, &sm_size) == 0) {
+                            &setup_mode, &sm_size) == AXL_OK) {
             axl_printf(" (%s)",
                        setup_mode ? "Setup Mode" : "User Mode");
         }
@@ -369,7 +369,7 @@ show_fw_info(void)
 
     /* TPM — skip for now until axl_service_find supports "tcg2" */
     void *tcg2 = NULL;
-    if (axl_service_find("tcg2", &tcg2) == 0 && tcg2 != NULL) {
+    if (axl_service_find("tcg2", &tcg2) == AXL_OK && tcg2 != NULL) {
         axl_printf("  TPM:        present\n");
     } else {
         axl_printf("  TPM:        not detected\n");

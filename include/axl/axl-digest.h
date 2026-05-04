@@ -30,6 +30,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <axl/axl-macros.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -151,7 +152,7 @@ axl_compute_checksum(
 /**
  * @brief Compute a checksum and write raw digest bytes.
  *
- * @return 0 on success, -1 on error.
+ * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_compute_checksum_digest(

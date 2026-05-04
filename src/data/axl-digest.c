@@ -224,17 +224,17 @@ axl_compute_checksum_digest(AxlChecksumType type, const void *data,
     size_t dlen = axl_checksum_type_get_length(type);
 
     if (out == NULL || dlen == 0 || out_len < dlen) {
-        return -1;
+        return AXL_ERR;
     }
 
     AxlChecksum *cs = axl_checksum_new(type);
     if (cs == NULL) {
-        return -1;
+        return AXL_ERR;
     }
 
     axl_checksum_update(cs, data, len);
     axl_checksum_get_digest(cs, out, &out_len);
     axl_checksum_free(cs);
 
-    return 0;
+    return AXL_OK;
 }

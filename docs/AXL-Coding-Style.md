@@ -243,36 +243,126 @@ are always fine.
 
 ## Return Value Conventions
 
-Two patterns, used consistently:
+Pick the narrowest type that carries the actual information. Four
+patterns in order of how much the return tells the caller:
 
 | Pattern | Return type | Success | Failure | Example |
 |---------|------------|---------|---------|---------|
-| **Operations** | `int` | `AXL_OK` (0) | `AXL_ERR` (-1) | `axl_file_get_contents` |
 | **Predicates** | `bool` | `true` | `false` | `axl_dir_read`, `axl_net_is_available` |
+| **Pointer producers** | `T *` | non-NULL | `NULL` | `axl_event_new`, `axl_dir_open` |
+| **Operations (single failure)** | `int` | `AXL_OK` (0) | `AXL_ERR` (-1) | `axl_file_get_contents`, `axl_file_delete` |
+| **Operations (multi-outcome)** | `AxlStatus` or `Axl<Module>Status` | `AXL_OK` (0) | one of the documented codes | `axl_event_wait_timeout`, `axl_sidecar_open_file` |
 
-**Operations** (set, parse, open, write, etc.) return `int`. Check with
-`!= AXL_OK`, never with `!` or truthiness:
+### Choosing the right shape
+
+Walk the table top-down and stop at the first row that fits the
+information you actually return:
+
+1. **Bool** if it's a yes/no question and there's nothing useful to
+   say beyond "yes" or "no." `axl_dir_read(dir, &entry)` either
+   produced an entry or didn't.
+2. **Pointer** if you allocate or look up an object. NULL is the
+   universal "couldn't" channel; no need to layer a status code on
+   top.
+3. **`int` returning `AXL_OK`/`AXL_ERR`** if there's an operation
+   that can fail but you don't have multiple failure modes worth
+   distinguishing. Most file ops fall here.
+4. **Typed `AxlStatus` or `Axl<Module>Status`** if there are 3+
+   distinguishable outcomes that consumers will branch on. Promote
+   from `int` only when the third code earns its keep.
+
+When in doubt, start narrower. Adding an outcome later is easy;
+removing one consumers came to depend on is breaking.
+
+### Multi-outcome status — `AxlStatus` (project-wide)
+
+`<axl/axl-macros.h>` defines:
 
 ```c
-if (axl_file_get_contents(path, &buf, &len) != AXL_OK) {
-    // error
-}
+typedef enum {
+    AXL_OK        =  0,  // operation succeeded
+    AXL_ERR       = -1,  // operation failed (generic)
+    AXL_CANCELLED = -2,  // AxlCancellable signalled or Ctrl-C
+    AXL_TIMEOUT   = -3,  // deadline elapsed before completion
+} AxlStatus;
 ```
 
-**Predicates** (is_X, has_X, dir_read iterator) return `bool`. Check
-with truthiness:
+Numeric values are part of the contract — comparing against the
+named constants and against the literal integers both work. New
+codes only ever extend the negative range; existing values never
+change.
+
+Use `AxlStatus` (rather than a per-module enum) when the four
+existing outcomes already cover what your function returns. The
+wait/event family (`axl_event_wait_timeout`, the `axl_wait_*`
+helpers, the per-protocol `_axl_{udp,tcp,dns,ip4}_wait` Tier 4
+helpers) all return `AxlStatus`.
+
+### Per-module status — `Axl<Module>Status`
+
+Define a module-local enum when your function has distinguishable
+outcomes that don't map onto `AxlStatus`'s OK/ERR/CANCELLED/TIMEOUT
+shape — typically because the outcomes are domain-specific.
+`AxlSidecar` is the canonical example:
 
 ```c
-while (axl_dir_read(dir, &entry)) {
-    // process entry
-}
+typedef enum {
+    AXL_SIDECAR_OK           =  0,
+    AXL_SIDECAR_FILE_MISSING = -1,  // would have been a generic AXL_ERR
+    AXL_SIDECAR_PARSE_ERROR  = -2,  // ditto, but distinct
+} AxlSidecarStatus;
 ```
 
-Functions returning pointers follow the pointer convention: `NULL` on
-error, non-NULL on success.
+Naming: `Axl<Module>Status` (PascalCase), member prefix
+`AXL_<MODULE>_<NAME>` (screaming snake-case). Member values follow
+the `AxlStatus` convention — `_OK = 0`, additional outcomes in the
+negative range, numeric values stable.
 
-Critical `int`-returning functions are marked `AXL_WARN_UNUSED` in the
-header to catch unchecked returns at compile time.
+### Check style
+
+For `int` and `AxlStatus`, compare against the named constant. Never
+use truthiness on a status return — it works by accident today and
+breaks the moment a new code appears.
+
+```c
+// good
+if (axl_event_wait_timeout(e, NULL, 1000) != AXL_OK) { return -1; }
+if (rc == AXL_CANCELLED) { ... }
+if (rc == AXL_TIMEOUT)   { ... }
+
+// bad — implicit "anything non-zero is failure" stops working when
+// callers want to treat AXL_TIMEOUT differently from AXL_ERR.
+if (axl_event_wait_timeout(e, NULL, 1000)) { ... }
+if (!axl_event_wait_timeout(e, NULL, 1000)) { ... }
+```
+
+Predicates check with truthiness:
+
+```c
+while (axl_dir_read(dir, &entry)) { ... }
+```
+
+### POSIX-exit-code outliers
+
+A handful of public functions return `int` but **deliberately keep
+POSIX exit-code semantics** (`0` success, `1` general error, `2`
+misuse), because their value flows directly into a process exit
+code via `return ...` from `main()`. The canonical case is
+`axl_args_run` — promoting it to `AxlStatus` would make a parse
+error exit the process with code 254/255 instead of 1, which is
+wrong for shell scripting.
+
+Such functions are explicitly documented as POSIX-exit-shaped in
+their docstrings. Don't promote them to `AxlStatus`.
+
+### `AXL_WARN_UNUSED`
+
+Critical `int` / `AxlStatus`-returning functions are marked
+`AXL_WARN_UNUSED` (C23 `[[nodiscard]]`) in the header to catch
+unchecked returns at compile time. Apply it to any function whose
+caller really should look at the return value — every wait/event
+function, every operation that can leak resources on the failure
+path, every `axl_*_open` that needs paired `_close`.
 
 ## Event Loop Callback Convention
 

@@ -125,7 +125,7 @@ grep_stream(
             axl_fclose(src);
             return 0;
         }
-        if (axl_fseek(src, 0, AXL_SEEK_SET) != 0) {
+        if (axl_fseek(src, 0, AXL_SEEK_SET) != AXL_OK) {
             /* Files in this SDK are seekable; if the rewind ever
                fails, we'd be off-by-N bytes. Bail loudly. */
             if (verbose_mode) {

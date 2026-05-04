@@ -3,6 +3,299 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.12.0 — 2026-05-04
+
+### Added
+
+- **`AxlHashTableInsertResult` typed enum** in
+  `<axl/axl-hash-table.h>` — `axl_hash_table_insert` and
+  `axl_hash_table_replace` return type promoted from `int` to the
+  new enum: `AXL_HASH_TABLE_NEW = 1`, `AXL_HASH_TABLE_REPLACED = 0`,
+  `AXL_HASH_TABLE_ERR = -1`. Numeric values match the prior int
+  contract — consumers comparing against literal `1`/`0`/`-1` keep
+  working unchanged. New code can write `!= AXL_HASH_TABLE_ERR` /
+  `== AXL_HASH_TABLE_NEW` for a status-shaped read. Follows the
+  AxlSidecarStatus per-module-status precedent. (Phase H3.)
+
+- **`axl_device_path_to_text(dp)`** in `<axl/axl-sys.h>` — wraps
+  EFI_DEVICE_PATH_TO_TEXT_PROTOCOL, returning the firmware's
+  canonical `PciRoot(0x0)/Pci(0x3,0x0)/MAC(...)` representation
+  as UTF-8. Caller frees with `axl_free`. axl-boot.c had grown a
+  private copy for boot-option decoding; promoted to a real
+  public API and refactored to dogfood it.
+
+- **`axl_net_ensure_drivers` breadcrumbs** — emits begin/end
+  info-level log lines (`"starting (N SNP handles)"`,
+  `"M drivers loaded, SNP handles N→K"`) so diagnostic tools
+  can surface whether ensure_drivers actually contributed new
+  SNP handles vs. found everything already there.
+
+- **`netinfo` diagnostic verbs and flags** — turns netinfo from
+  "make networking work" into a "what does this firmware
+  natively provide" diagnostic. New surface:
+  - `-n` / `--no-load`: skip `axl_net_ensure_drivers` entirely;
+    enumerate only what the firmware natively provides.
+  - `list-bundle`: walk every mounted volume's `drivers/<arch>/`
+    and list staged `.efi`/`.efidrv` files.
+  - `diag`: composite report — firmware vendor/rev/spec, mounted
+    volumes with full device paths, all PCI Network Controllers
+    with VID:DID lookup, driver bundle inventory, NIC handles
+    before and after driver-load, ensure_drivers status, final
+    interfaces table. Intended for copy-paste to a maintainer.
+  - `-v` now wraps each verb with pre-/post-load NIC handle
+    snapshots so the diff is visible.
+  - Per-NIC `-v` output adds the device-path text (PCI BDF / USB
+    topology / MAC in canonical form) and NII Revision when a
+    BY_DRIVER agent is found for the NII protocol.
+  - `list` no longer fail-closes when ensure_drivers fails — zero
+    interfaces is itself useful information. `ping` keeps the gate.
+
+- **`AxlStatus` enum** in `<axl/axl-macros.h>` — project-wide typed
+  status for functions whose return value carries more information
+  than success/failure. Promotes the prior `#define AXL_OK / AXL_ERR
+  / AXL_CANCELLED` magic-int triple to a named enum and adds
+  **`AXL_TIMEOUT (-3)`** as a fourth code so callers can distinguish
+  "deadline elapsed" from "you passed garbage." Numeric values stay
+  stable; new codes only ever extend the negative range. Code that
+  compares against the constants (`rc == AXL_CANCELLED`) and code
+  that compares against literal integers (`rc == -2`) both still
+  work — promotion is purely additive at the value level.
+
+  Adoption: the entire wait/event family promoted from `int` to
+  `AxlStatus` return type — `axl_event_wait`, `axl_event_wait_timeout`,
+  `axl_wait_for`, `axl_wait_for_with_tick`, `axl_wait_for_flag`,
+  `axl_wait_for_word`, `axl_wait_ms`, plus the internal
+  `_axl_event_wait_timeout_with_tick` and the per-protocol
+  `_axl_{udp,tcp,dns,ip4}_wait` Tier 4 helpers.
+
+  Behavior change inside the enum: `axl_event_wait_timeout` (and
+  the rest of the wait family) now returns `AXL_TIMEOUT` on the
+  deadline path instead of overloading `AXL_ERR (-1)` for both
+  timeout and invalid-arg failures — the prior overload was a
+  latent bug consumers couldn't disambiguate. Pure-sleep callers
+  (`axl_sleep`/`axl_msleep`/`axl_usleep`/`axl_wait_ms` with no
+  condition) collapse `AXL_TIMEOUT` → `AXL_OK` internally so
+  ergonomics are unchanged.
+
+- **`AxlStatus` migration policy in `axl-args.h`** — `axl_args_run`
+  explicitly stays `int` (POSIX-exit-code shaped: 0/1 returned from
+  `main()` flow into the process exit code, where `AxlStatus`'s
+  negative values would round to 254/255). Documented inline so
+  future readers don't propose flipping it.
+
+### Tests
+
+- **netinfo integration tests** — 4 new sections in
+  `test/integration/test-net-tools.sh` covering `--no-load`,
+  pre/post snapshot headers + device-path rendering under `-v`,
+  `list-bundle` (asserts "no drivers staged" on the test image),
+  and `diag` (asserts each section header lands).
+
+- New `test_event_timeout_distinct_from_error` in
+  `axl-test-event.c` — regression test for the AXL_TIMEOUT vs
+  AXL_ERR disambiguation. Confirms NULL event yields `AXL_ERR`
+  while a deadline yields `AXL_TIMEOUT` and the two are distinct
+  values. Existing event/wait tests re-pointed at the named
+  constants instead of bare `-1`.
+
+### Fixed
+
+- **Stale archive members across structural header changes** —
+  the libaxl.a build recipe now deletes the archive before
+  `ar rcs` rebuilds it. `ar` insert-or-replace was retaining
+  stale `.o` members from renamed/removed sources; a future
+  `ar` lookup picked the stale copy first since `ar` preserves
+  insertion order. Resolves the documented "After any structural
+  change to a public-header struct, run `make clean` first"
+  footgun — incremental builds are now reliable.
+
+- **Phase H1 typos from sed regex** — 8 docstring sites in
+  `<axl/axl-tcp.h>`, `<axl/axl-socket.h>`, `<axl/axl-net.h>`,
+  `<axl/axl-udp.h>` had `failure.or` / `error.or` (period instead
+  of space) from an unescaped `.` in the H1a networking-cluster
+  sed. Cosmetic, but fixed before tag.
+
+- **`mkrd.efi` recipe-override warnings** — Makefile's generic
+  tool foreach was emitting two-line "overriding recipe" /
+  "ignoring old recipe" warnings on every build because the
+  special mkrd-with-blob rule overrode it. `$(filter-out
+  mkrd,$(TOOL_NAMES))` removes the conflict; mkrd has its own
+  explicit recipe.
+
+- **Test runner build hint** — `test_add_efi`'s "Build first"
+  message now picks the right `make` target based on the missing
+  artifact (`make tools` for `tools/*.efi`, `make tests` for
+  `AxlTest*.efi`) instead of suggesting `./build.sh --rebuild`.
+
+- **Doc-build warnings reduced from ~240 to 119** — Sphinx
+  toctree pointed at a renamed `modules/stream-port` page (now
+  `modules/port`); `@code{.json}` and ` ```json5` blocks
+  containing JSON5-style content (unquoted keys, single-quoted
+  strings) switched to `@code{.js}` / ` ```js` lexer that
+  handles the shape; anonymous SMBIOS enums named (see Changed
+  above). Remaining 119 warnings are Doxygen `\ref` cross-
+  reference resolution failures — flagged for a future doc
+  cleanup pass; non-blocking.
+
+### Changed
+
+- **`axl_mem_fail_next_alloc` works in RELEASE builds** — the OOM
+  injection counter was previously gated by `#ifdef AXL_MEM_DEBUG`
+  and no-op'd in RELEASE. The counter check is one well-predicted
+  branch on the malloc path; lifting it out of the guard makes
+  the public API contract hold universally and lets RELEASE
+  builds exercise their own error-handling paths. The genuinely-
+  costly debug machinery (alloc-fill 0xDA, fence words, leak
+  list) stays DEBUG-only. Header docstring + src/mem/README.md
+  updated to reflect the new contract.
+
+- **Backend hygiene — `<axl/axl-backend.h>` operations use
+  AXL_OK/AXL_ERR** — the internal backend abstraction (used by
+  every library module) now follows the same single-failure
+  convention as the public API. 25 backend ops converted; 64
+  return statements + 12 ternary `EFI_ERROR(...) ? -1 : 0`
+  rewrites in `src/backend/native/axl-backend-native.c`.
+
+- **Anonymous SMBIOS enums named** — five `enum { ... }`
+  declarations in `<axl/axl-smbios.h>` promoted to
+  `typedef enum { ... } AxlSmbiosFoo`:
+  `AxlSmbiosTableType`, `AxlSmbiosIpmiInterface`,
+  `AxlSmbiosHostIfaceType`, `AxlSmbiosHostIfaceProtocol`,
+  `AxlSmbiosBoardType`. Enumerator values and call-site int
+  compatibility are unchanged. Resolves Sphinx C-domain
+  duplicate-declaration noise (~104 build warnings).
+
+- **`<axl/axl-http-server.h>` named-constants hygiene** — all 17
+  HTTP-server operations (`axl_http_server_set`, `_set_max_connections`,
+  `_set_body_limit`, `_set_keep_alive`, `_use`, `_add_route`,
+  `_add_static`, `_attach`, `_run`, `_use_tls`, `_add_websocket`,
+  `_ws_broadcast`, `_use_auth`, `_add_route_auth`, `_use_cache`,
+  `_set_route_ttl`, `_add_upload_route`) now return `AXL_OK`/`AXL_ERR`.
+  Three callback typedef contracts (`AxlHttpMiddleware`,
+  `AxlAuthCallback`, `AxlUploadHandler`) updated to document
+  `AXL_OK`/`AXL_ERR` returns — consumers can return either named
+  constants or literal 0/-1 (numerically equivalent). The static
+  middleware-runner in `src/net/axl-http-dispatch.c` updated to
+  compare middleware callbacks against `AXL_OK`. Caller updates:
+  `test/unit/axl-test-net.c` (1 site). Ninth and final module of
+  Phase H1a from the originally-audited bool-sweep targets.
+
+- **`<axl/axl-string.h>` named-constants hygiene** — all 11
+  AxlString builder operations (`axl_string_append`, `_append_len`,
+  `_append_printf`, `_append_c`, `_prepend`, `_prepend_len`,
+  `_prepend_c`, `_insert`, `_erase`, `_truncate`, `_overwrite`)
+  now return `AXL_OK`/`AXL_ERR`. The pointer producers
+  (`axl_string_new`, `_new_size`, `_str`, `_steal`,
+  `axl_asprintf`), the count returner (`axl_string_len` —
+  `size_t`, NULL→0), and void functions are unchanged. The ternary
+  return in `axl_string_append_printf` (`b->error ? -1 : 0`)
+  converted. Header gains `#include <axl/axl-macros.h>` (was missing
+  because the prior bool-sweep added `<stdbool.h>`; the H1a hygiene
+  pass uses AXL_OK/AXL_ERR which need axl-macros.h directly).
+  Caller updates: `src/data/axl-json-build.c` (3). Eighth module of
+  Phase H1a.
+
+- **`<axl/axl-driver.h>` named-constants hygiene** — all 12 int-
+  returning operations (`axl_driver_load`, `_start`, `_connect`,
+  `_disconnect`, `_unload`, `_set_load_options`, `_set_unload`,
+  `_connect_handle`, `_locate`, `_ensure`, `_ensure_with_embedded`,
+  `_load_dir`) now return `AXL_OK`/`AXL_ERR`. Two ternary returns
+  (`EFI_ERROR(...) ? -1 : 0`) in the impl converted. Static
+  helpers in src/util/axl-driver.c also converted for internal
+  consistency. `axl_image_unload` (which passes through
+  axl_driver_unload's rc) updated to use AXL_OK in its rc-init and
+  NULL-arg paths. Call sites in `src/net/axl-net-dhcp.c`,
+  `src/util/axl-image.c`, `test/unit/axl-test-util.c` (8 sites
+  including 1 rc-indirection) updated. Seventh module of Phase H1a.
+
+- **`<axl/axl-sys.h>` named-constants hygiene** — 9 single-failure
+  ops (`axl_map_refresh`, `axl_sys_get_firmware_info`,
+  `axl_sys_get_memory_size`, `axl_handle_get_service`,
+  `axl_service_find`, `axl_service_enumerate`, `axl_service_register`,
+  `axl_service_unregister`, `axl_service_register_multiple`) now
+  return `AXL_OK`/`AXL_ERR`. The multi-shape iterator
+  `axl_device_path_for_each` (returns 0 / callback-rc / -1 for
+  malformed) and the count returner `axl_device_path_size` (size_t)
+  deliberately keep literal returns. Call sites in
+  `src/net/axl-net-dhcp.c`, `tools/sysinfo.c`, `tools/mkrd.c`,
+  `tools/netinfo.c` updated. Sixth module of Phase H1a.
+
+- **`<axl/axl-stream.h>` named-constants hygiene** — 5 single-failure
+  ops (`axl_stream_set_stdout_tee`, `_stderr_tee`, `_encoding`,
+  `axl_fseek`, `axl_fflush`) now return `AXL_OK`/`AXL_ERR`. The count
+  returners (`axl_pread`, `axl_pwrite`, `axl_fread`, `axl_fwrite`,
+  `axl_ftell`) deliberately keep their `-1` sentinel — return value
+  carries information beyond status. The multi-shape iterator
+  `axl_stream_for_each_line` (returns 0 / callback-rc / -1) also
+  unchanged. Call sites in `tools/grep.c`, `test/unit/axl-test-util.c`,
+  `test/unit/axl-test-io.c` updated. Fifth module of Phase H1a.
+
+- **`<axl/axl-mem-phys.h>` named-constants hygiene** — all 10
+  single-failure operations (`axl_mem_phys_map`, `_read8`, `_read16`,
+  `_read32`, `_read64`, `_write8`, `_write16`, `_write32`, `_write64`,
+  `_search`) now return `AXL_OK`/`AXL_ERR`. Header gains
+  `#include <axl/axl-macros.h>` since the docstrings now reference
+  the named constants. `@code` example block updated to compare
+  against `AXL_OK`. Test sites in `test/unit/axl-test-platform.c`
+  (18 sites including one `rc`-indirection) updated. Fourth module
+  of Phase H1a.
+
+- **`<axl/axl-tls.h>` named-constants hygiene** — single-failure
+  TLS operations (`axl_tls_init`, `axl_tls_generate_self_signed`,
+  `axl_tls_server_set_cert`, `axl_tls_write`, `axl_tls_write_async`)
+  now return `AXL_OK`/`AXL_ERR` named constants. Both stub
+  (AXL_TLS=0) and real (AXL_TLS=1) implementations updated. The
+  multi-shape functions `axl_tls_handshake` and `axl_tls_read`
+  (return 0 / 1 for "more data needed" / -1 for error) deliberately
+  keep literal returns — those are not single-failure shape.
+  Header `@code` example updated. Call sites in
+  `src/net/axl-http-client.c`, `src/net/axl-http-response.c`,
+  `src/net/axl-http-server.c`, `test/unit/axl-test-net.c` updated.
+  Third module of Phase H1a.
+
+- **`<axl/axl-ring-buf.h>` named-constants hygiene** — single-failure
+  ring-buf operations (`axl_ring_buf_init`, `_init_fixed`,
+  `_push_msg`, `_pop_msg`, `_peek_msg`, `_push_elem`, `_pop_elem`,
+  `_peek_elem`, `_peek_nth_elem`, `_set_nth_elem`) now return
+  `AXL_OK`/`AXL_ERR` named constants. Signatures unchanged. The
+  byte-count returners (`_push`, `_pop`, `_peek`, `_discard`,
+  `_*_regions`, `_get_*`) keep `uint32_t` returns with literal `0`
+  for empty/no-op (count, not status). Call sites in
+  `src/loop/axl-defer.c`, `experiments/axl-kernel/test/`,
+  `sdk/examples/ring-buf-demo.c`, `test/unit/axl-test-data.c`
+  updated. Second module of Phase H1a.
+
+- **`<axl/axl-fs.h>` named-constants hygiene** — operation
+  functions (`axl_file_get_contents`, `axl_file_set_contents`,
+  `axl_file_info`, `axl_file_delete`, `axl_file_rename`,
+  `axl_dir_mkdir`, `axl_dir_rmdir`, `axl_dir_list_json`,
+  `axl_volume_enumerate`) now return `AXL_OK` / `AXL_ERR` named
+  constants in their impl and standardized docstrings. **Signatures
+  unchanged** — `int` return type is the documented shape per
+  [docs/AXL-Coding-Style.md §"Return Value Conventions"](docs/AXL-Coding-Style.md)
+  for single-failure operations, so consumers comparing against
+  literal `0`/`-1` or against `AXL_OK`/`AXL_ERR` both compile and
+  run unchanged. Call sites in `src/`, `tools/`, `test/`, `sdk/`
+  updated to compare against the named constants for clarity.
+  `axl_dir_walk` deliberately keeps literal `0`/`-1` because it
+  propagates callback return values (multi-shape, not single-
+  failure). First module of Phase H1a per
+  [docs/ROADMAP.md §"API Hygiene"](docs/ROADMAP.md).
+
+- **`AxlTcpCallback` and `AxlSocketCallback` `status` parameter**
+  promoted from `int` to `AxlStatus` — the async TCP and AxlSocket
+  completion callbacks receive a typed status code now. Numeric
+  values are unchanged (`AXL_OK = 0`, `AXL_ERR = -1`, `AXL_CANCELLED
+  = -2`), so existing callbacks compile and run unchanged at the
+  ABI level. Internal callbacks (8 in `src/net/`), SDK examples
+  (`echo-server.c`, `tcp-echo-server.c`), test callbacks, and the
+  experimental axl-kernel POC updated to use `AxlStatus` parameter
+  type and named constants in comparisons (e.g. `if (status !=
+  AXL_OK)` instead of `if (status != 0)`). `axl-tcp.h` and
+  `axl-socket.h` gain a `<axl/axl-macros.h>` include for the
+  enum type. The `AxlTcp` synchronous wrappers' internal
+  `SyncResult.status` field promoted to `AxlStatus` to match.
+
 ## 0.11.2 — 2026-05-04
 
 ### Added
