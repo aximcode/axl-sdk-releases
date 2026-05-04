@@ -276,6 +276,69 @@ parse_typed(ParsedArg *slot, const char *value, const char *path)
             slot->set = true;
             return true;
 
+        case AXL_ARG_CHOICE:
+            /* NULL or empty choices array → behave like AXL_ARG_STRING
+               (unconstrained). Otherwise the value must match one of
+               the entries. Comparison is byte-equal by default; set
+               choices_case_insensitive = true to relax to ASCII
+               case-folded match (axl_strcasecmp). */
+            if (d->choices != NULL && d->choices[0] != NULL) {
+                bool ok = false;
+                for (size_t i = 0; d->choices[i] != NULL; i++) {
+                    if (value == NULL) { break; }
+                    int cmp = d->choices_case_insensitive
+                                  ? axl_strcasecmp(value, d->choices[i])
+                                  : axl_strcmp(value, d->choices[i]);
+                    if (cmp == 0) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    /* Build a human-readable choice list inline. The
+                       buffer is sized for ~16 short choices; longer
+                       sets get truncated with an ellipsis, which is
+                       fine for an error message. */
+                    char  list[256];
+                    size_t off = 0;
+                    list[0] = '\0';
+                    for (size_t i = 0; d->choices[i] != NULL; i++) {
+                        size_t left = sizeof(list) - off;
+                        if (left <= 4) {
+                            /* Not enough room for one more choice
+                               plus the trailing NUL. Replace the
+                               last 3 chars of the existing content
+                               with "..." in place; the NUL snprintf
+                               placed at list[off] stays valid (the
+                               buffer never reaches sizeof(list) by
+                               construction — snprintf reserves its
+                               own NUL byte). */
+                            if (off >= 3) {
+                                list[off - 3] = '.';
+                                list[off - 2] = '.';
+                                list[off - 1] = '.';
+                            }
+                            break;
+                        }
+                        const char *sep = (off == 0) ? "" : ", ";
+                        int n = axl_snprintf(list + off, left, "%s%s",
+                                             sep, d->choices[i]);
+                        if (n <= 0 || (size_t)n >= left) {
+                            break;
+                        }
+                        off += (size_t)n;
+                    }
+                    axl_print("%s: '%s' for --%s is not one of: %s\n",
+                              path,
+                              value != NULL ? value : "(missing)",
+                              d->name, list);
+                    return false;
+                }
+            }
+            slot->str_value = value;
+            slot->set = true;
+            return true;
+
         case AXL_ARG_MULTI:
             slot->str_value = value;
             if (slot->multi_values == NULL) {
@@ -373,10 +436,58 @@ print_flag_line(const AxlArgDesc *d)
         short_buf[2] = ',';
     }
     const char *value_hint = "";
+    /* Choice-aware hint buffer; lives on the stack with enough room
+       for "<a|b|c|...>" up to ~80 chars. CHOICE with no list falls
+       back to the generic " <str>" hint. */
+    char choice_hint[96];
     switch (d->type) {
         case AXL_ARG_BOOL:                                 break;
         case AXL_ARG_STRING:                               value_hint = " <str>";   break;
         case AXL_ARG_MULTI:                                value_hint = " <str>*";  break;
+        case AXL_ARG_CHOICE:
+            value_hint = " <str>";
+            if (d->choices != NULL && d->choices[0] != NULL) {
+                size_t off = 0;
+                int n = axl_snprintf(choice_hint, sizeof(choice_hint), " <");
+                if (n > 0) { off = (size_t)n; }
+                for (size_t i = 0; d->choices[i] != NULL && off + 1 < sizeof(choice_hint); i++) {
+                    n = axl_snprintf(choice_hint + off,
+                                     sizeof(choice_hint) - off,
+                                     "%s%s", (i == 0 ? "" : "|"),
+                                     d->choices[i]);
+                    if (n <= 0 || (size_t)n >= sizeof(choice_hint) - off) {
+                        /* Truncate gracefully — close the bracket and stop. */
+                        if (off + 4 < sizeof(choice_hint)) {
+                            axl_snprintf(choice_hint + off,
+                                         sizeof(choice_hint) - off, "|...");
+                            off += 4;
+                        }
+                        break;
+                    }
+                    off += (size_t)n;
+                }
+                if (off + 1 < sizeof(choice_hint)) {
+                    choice_hint[off++] = '>';
+                    choice_hint[off]   = '\0';
+                }
+                /* Mark case-insensitive CHOICE in help so users know
+                   that e.g. "DD_CFG" and "dd_cfg" are both valid.
+                   Append " (case-insensitive)" if there's room; on
+                   buffers already near capacity, drop the marker
+                   silently rather than ellipsize. */
+                if (d->choices_case_insensitive) {
+                    const char *suffix = " (case-insensitive)";
+                    size_t      slen   = axl_strlen(suffix);
+                    if (off + slen + 1 < sizeof(choice_hint)) {
+                        for (size_t i = 0; i < slen; i++) {
+                            choice_hint[off++] = suffix[i];
+                        }
+                        choice_hint[off] = '\0';
+                    }
+                }
+                value_hint = choice_hint;
+            }
+            break;
         case AXL_ARG_U8:  case AXL_ARG_U16:
         case AXL_ARG_U32: case AXL_ARG_U64:                value_hint = " <uint>";  break;
         case AXL_ARG_S64:                                  value_hint = " <int>";   break;

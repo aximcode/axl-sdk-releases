@@ -298,13 +298,19 @@ void
 axl_log_full(int level, const char *domain, const char *func,
              int line, const char *fmt, ...)
 {
-    va_list args;
-    char msg_buf[MSG_BUF_SIZE];
-    BufCtx bc = { msg_buf, 0, sizeof (msg_buf) };
-
+    /* Early-return BEFORE the va_list declaration. clang-tidy's
+       valist.Uninitialized analyzer otherwise traces the
+       get_effective_level → axl_strcmp call from inside the
+       declared-but-unstarted lifetime and false-positives an
+       "uninitialized va_list" diagnostic. Functionally identical;
+       cheaper too, since the level filter skips the buffer alloc. */
     if (level > get_effective_level(domain)) {
         return;
     }
+
+    va_list args;
+    char    msg_buf[MSG_BUF_SIZE];
+    BufCtx  bc = { msg_buf, 0, sizeof (msg_buf) };
 
     va_start(args, fmt);
     axl_vformat(buf_write, &bc, fmt, args);
@@ -316,13 +322,13 @@ axl_log_full(int level, const char *domain, const char *func,
 void
 axl_log(int level, const char *domain, const char *fmt, ...)
 {
-    va_list args;
-    char msg_buf[MSG_BUF_SIZE];
-    BufCtx bc = { msg_buf, 0, sizeof (msg_buf) };
-
     if (level > get_effective_level(domain)) {
         return;
     }
+
+    va_list args;
+    char    msg_buf[MSG_BUF_SIZE];
+    BufCtx  bc = { msg_buf, 0, sizeof (msg_buf) };
 
     va_start(args, fmt);
     axl_vformat(buf_write, &bc, fmt, args);

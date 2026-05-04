@@ -229,6 +229,26 @@ axl_stream_init(void)
     axl_stdout_raw = &mStdoutRaw;
 }
 
+int
+axl_stream_set_stdout_tee(AxlStream *extra)
+{
+    if (axl_stdout == NULL) {
+        return -1;
+    }
+    axl_stdout->tee = extra;
+    return 0;
+}
+
+int
+axl_stream_set_stderr_tee(AxlStream *extra)
+{
+    if (axl_stderr == NULL) {
+        return -1;
+    }
+    axl_stderr->tee = extra;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Per-stream encoding (transcoders for the byte-I/O primitives)
 // ---------------------------------------------------------------------------
@@ -555,11 +575,33 @@ axl_write(AxlStream *s, const void *buf, size_t count)
         return 0;
     }
     if (s->encoding != AXL_ENC_UTF8) {
-        return write_transcode(s, buf, count);
+        n = write_transcode(s, buf, count);
+    } else {
+        n = s->write(s->ctx, buf, count);
+        if (n < 0) {
+            s->err = true;
+        }
     }
-    n = s->write(s->ctx, buf, count);
-    if (n < 0) {
-        s->err = true;
+    /* Tee path: forward the same caller bytes to the optional tee
+       target. Errors on the tee are swallowed — a broken log file
+       must not break the primary console output. We deliberately
+       call into the tee's own write path (not s->tee->write
+       directly) so the tee's encoding gets honored, but we read
+       s->tee into a local first to avoid recursing into the tee's
+       own tee (accidental loops double-write once instead of
+       cascading). */
+    if (s->tee != NULL) {
+        AxlStream *t = s->tee;
+        if (t->write != NULL) {
+            if (t->encoding != AXL_ENC_UTF8) {
+                (void)write_transcode(t, buf, count);
+            } else {
+                axl_ssize_t tn = t->write(t->ctx, buf, count);
+                if (tn < 0) {
+                    t->err = true;
+                }
+            }
+        }
     }
     return n;
 }

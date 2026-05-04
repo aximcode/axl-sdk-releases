@@ -600,6 +600,83 @@ R+5 — PCI tooling DONE; USB tooling pending:
       (commit `85973b4`); both `--self-test`s pass from the
       installed location.
 
+### Post-v0.11.0 follow-ups — vendor-neutral typed wrappers
+
+Round-2 vendor-neutral additions surfaced from a downstream-
+consumer session, all retiring re-implemented patterns in consumer
+code with public typed wrappers:
+
+- [x] **`axl_ipmi_chassis_identify`** (commit `1264e39`) — typed
+      wrapper around IPMI Chassis 0x04 (front-panel ID LED).
+      Replaces the raw `axl_ipmi_raw(s, 0x00, 0x04, ...)` consumers
+      were writing.
+- [x] **`axl_pci_get_header_type`** + **`axl_pci_get_subsystem`**
+      (commit `ffc9177`) — typed readers for PCI config offset
+      0x0E (header type + multi-function bit) and 0x2C/0x2E
+      (SVID/SDID with Type-0 check baked in). New
+      `AxlPciHeaderType` enum.
+- [x] **`axl_nvstore_get_alloc`** (commit `063f391`) — read-with-
+      malloc variant of `axl_nvstore_get` for variable-length NV
+      values. Probe-then-grow uses the probe rc to distinguish
+      empty (success, 1-byte NUL allocation) from missing (-1).
+- [x] **`axl_smbios_get_oem_string`** (commit `063f391`) —
+      convenience reader for Type 11 OEM Strings by 1-based global
+      index across all Type 11 records.
+- [x] **`AXL_ARG_CHOICE` typed positional / flag** (commit
+      `063f391`) — string restricted to a caller-supplied set,
+      with framework-side rejection + `<a|b|c>` value-hint help.
+      Field appended to `AxlArgDesc` so existing designated-
+      initializer literals keep working.
+- [x] **`assert_in_section LABEL SECTION_MARKER PATTERN`**
+      (initial commit `2adc170`; signature simplified in round-3
+      commit) — section-aware assertion helper in
+      `scripts/axl-common.sh` for nsh-driven QEMU log assertions.
+      Reads the log path from `$LOG` (falls back to
+      `$TEST_CLEAN_LOG`) so callers don't repeat the path.
+- [x] **`axl_stream_set_stdout_tee` + `axl_stream_set_stderr_tee`**
+      (round-3 commit) — log-tee primitive. New `tee` field on
+      the internal `AxlStream` struct; `axl_write` forwards bytes
+      to `s->tee` after the primary write. NULL clears, multiple
+      calls replace (no chain). Replaces the ~50-line tee-
+      callback + atexit-cleanup pattern consumers wrote per tool
+      with a `-o:<file>` log option.
+- [x] **`run-qemu.sh --qemu-arg STRING`** (round-3 commit) —
+      repeatable literal-token passthrough to qemu's command line.
+      Each STRING is shell-word-split; values with embedded spaces
+      aren't supported.
+- [x] **`run-qemu.sh --ipmi` / `--ipmi-extern SOCK` / `--ipmi-prop K=V`**
+      (round-3 commit) — IPMI BMC simulator shortcuts at the
+      canonical KCS port 0xca2 (matches AxlIpmi's KCS default and
+      `test/integration/test-ipmi-qemu.sh`). `--ipmi-extern`
+      paired with `ipmi-sim` is the path to verifying full BMC
+      behavior including Chassis Identify and OEM commands on
+      QEMU. aa64 warns and skips — no QEMU IPMI device support
+      there.
+- [x] **`QEMU_DRYRUN=1`** env on `run-qemu.sh` (round-3 commit) —
+      prints CMD tokens one per `QEMU_DRYRUN: <token>` line and
+      exits 0 without launching qemu. Backs the new
+      `test-run-qemu-flags.sh` flag-shape regression tests.
+- [x] **`axl_smbios_get_oem_string` truncation contract amended**
+      (round-3 commit) — gains a `*required` out param; too-small
+      buffers now return -1 with `*required` populated (was: silent
+      truncation with rc=0). Lets callers size a follow-up
+      allocation exactly.
+- [x] **`AxlArgDesc.choices_case_insensitive`** flag on
+      `AXL_ARG_CHOICE` (round-4 commit) — additive per-descriptor
+      bool that switches CHOICE validation to ASCII case-folded
+      comparison. Default false preserves the byte-equal contract.
+      Helps consumers migrating from CLIs that accept mixed-case
+      variants (e.g. `dd_cfg` / `DD_CFG` both valid). Help-line
+      renders `<a|b|c> (case-insensitive)` so users know the
+      relaxed match is in effect.
+- [x] **Vendor-neutralization sweep** (commit `8d06e8f`) —
+      `axl_smbios_slot_usage_str(0x05)` now returns spec-canonical
+      `"Unavailable"` (was `"CPU NOT INSTALLED"`); chassis 0x23
+      "Mongoose Mini PC" comments → "Mini PC" per SMBIOS 3.7;
+      `AxlIpmiCapabilities.dell_idrac_interface` removed (reverse-
+      engineered GUID, no public spec). New "Spec-decoder strings
+      are spec-canonical" rule in `docs/AXL-Coding-Style.md`.
+
 ### Phase B2: Redfish Support — DONE (as tool, not library)
 
 Decided against a library-level `axl_redfish_*` module — the existing

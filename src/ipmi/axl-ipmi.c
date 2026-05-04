@@ -46,10 +46,6 @@ static const EFI_GUID mu_ipmi_transport2_guid = {
     0x40e28370, 0x7247, 0x4bce,
     {0x94, 0x18, 0x77, 0x7f, 0xd5, 0x11, 0x12, 0xf0}
 };
-static const EFI_GUID dell_idrac_interface_guid = {
-    0xE0E4EBAD, 0xA45E, 0x419E,
-    {0x85, 0x2E, 0xAE, 0xDE, 0x2C, 0x2B, 0xDE, 0x6C}
-};
 
 static bool
 probe_has_protocol(const EFI_GUID *guid)
@@ -350,7 +346,6 @@ axl_ipmi_probe(AxlIpmiProbe *out)
     out->intel_sm_ipmi_transport = probe_has_protocol(&intel_sm_ipmi_guid);
     out->mu_ipmi_transport2      = probe_has_protocol(&mu_ipmi_transport2_guid);
     out->smbus_hc_protocol       = probe_has_protocol(&gEfiSmbusHcProtocolGuid);
-    out->dell_idrac_interface    = probe_has_protocol(&dell_idrac_interface_guid);
 
     //
     // I2C Master: LocateProtocol only catches one instance. Also

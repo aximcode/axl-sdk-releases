@@ -3,6 +3,201 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.11.1 — 2026-05-03
+
+### Changed
+
+- **`axl_smbios_slot_usage_str(0x05)` returns spec-canonical
+  `"Unavailable"`** (was `"CPU NOT INSTALLED"`, a vendor
+  reinterpretation). SMBIOS 3.7 Table 12 row 0x05 is "Unavailable";
+  vendor-flavored renderings (e.g. an OEM that wants
+  "CPU NOT INSTALLED" for socket-associated 0x05 slots) belong in
+  consumer code via the typed
+  `AxlSmbiosSystemSlot.current_usage` raw byte. Breaking change for
+  downstream tools that grep for the literal old string.
+
+- **`axl_smbios_get_oem_string` signature gains a `*required` out
+  parameter** (was `(idx, buf, buf_cap)`, now
+  `(idx, buf, buf_cap, *required)`). The truncation contract
+  changed: a too-small buffer now returns -1 without copying
+  (instead of silently truncating), and `*required` is set to
+  the byte count needed (string length + NUL). NULL `*required`
+  is allowed. Breaking change for any consumer that called the
+  old 3-arg form expecting silent truncation; the v0.11.0
+  shipping signature was test-only so no in-tree callers are
+  affected.
+
+### Removed
+
+- **`AxlIpmiCapabilities.dell_idrac_interface`** — informational
+  probe of a reverse-engineered Dell iDRAC GUID with no public
+  spec. Field removed from the struct, GUID + probe call removed
+  from `src/ipmi/axl-ipmi.c`, and the corresponding
+  `tools/ipmi.c probe` line removed. Pre-1.0 ABI reorder of
+  subsequent fields. The Dell `EFI_IPMI_TRANSPORT` adapter
+  (`axl-ipmi-dell.c`) and its `dell_ipmi_transport` capability
+  bool stay — that protocol's shape is published in open-source
+  uefi-ipmitool, so it qualifies as publicly knowable vendor-
+  protocol naming.
+
+### Fixed
+
+- **Comments referencing "Mongoose Mini PC"** (Dell internal
+  product name) for SMBIOS chassis type 0x23 changed to "Mini PC"
+  per SMBIOS 3.7 spec. Bucket assignment unchanged
+  (0x23 → `AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED`); comment-only
+  cleanup across `src/smbios/axl-smbios.c`,
+  `include/axl/axl-smbios.h`, `src/smbios/README.md`, and the
+  test description.
+
+### Added
+
+- **`axl_ipmi_chassis_identify(session, interval_sec, force_on)`**
+  — typed wrapper around IPMI Chassis 0x04 (front-panel ID LED)
+  next to `axl_ipmi_chassis_control`. Sends 1 byte (timed
+  identify) when `force_on` is false, 2 bytes (with bit 0 of byte
+  1 set) when true. Returns 0 on CC 0x00, -1 on transport error
+  or non-zero CC; CC observable via
+  `axl_ipmi_session_last_cc()`. 8 unit-test scenarios covering
+  the wire-format paths and the CC=0xC1 / 0xCC / transport-error
+  failure modes.
+
+- **`axl_pci_get_header_type(addr, *type, *is_multi_function)`**
+  — typed reader for PCI config offset 0x0E. Splits the byte into
+  the new `AxlPciHeaderType` enum (`NORMAL` / `BRIDGE` / `CARDBUS`)
+  and the bit-7 multi-function flag. Either out param NULL is
+  allowed. Absent-function precheck via `VID == 0xFFFF` mirrors
+  `axl_pci_get_vid_did`'s posture so callers don't get a bogus
+  "0x7F multi-func" result on missing slots.
+
+- **`axl_pci_get_subsystem(addr, *svid, *sdid)`** — typed reader
+  for SVID/SDID at config offsets 0x2C/0x2E with header-type-0
+  check baked in. Returns -1 for non-Type-0 functions (PCI-PCI
+  bridges and CardBus bridges use those bytes for unrelated
+  fields). Retires three raw config-space reads + manual header-
+  type masking that consumers re-implement on every PCI walk.
+
+- **`axl_nvstore_get_alloc(ns, key, **buf, *size)`** — read-with-
+  malloc variant of `axl_nvstore_get`. Probes for size, allocates
+  `needed + 1` bytes (zero-extended trailing byte so callers can
+  treat the result as NUL-terminated), reads the payload, and
+  hands the buffer back to the caller. Caller frees with
+  `axl_free`. Probe-then-grow uses the probe's return code to
+  distinguish a 0-byte variable (success, 1-byte NUL allocation)
+  from a missing variable (-1). UEFI's `SetVariable(size=0)` means
+  "delete" so the empty-variable path can't be exercised on the
+  EFI backend; the distinction matters for any future backend
+  (Linux `/sys/firmware/efi/efivars/`, in-process mock harness)
+  that allows 0-byte values.
+
+- **`axl_smbios_get_oem_string(idx, buf, buf_cap)`** — convenience
+  reader for SMBIOS Type 11 OEM Strings by 1-based global index
+  across all Type 11 records. Walks records in firmware order,
+  accumulates per-record string counts, copies the string at the
+  requested index into the caller's buffer with NUL-terminating
+  truncation. Most platforms ship a single Type 11 record; the
+  multi-record path is robustness for firmware that splits OEM
+  strings across records. The existing
+  `axl_smbios_read_oem_strings(hdr, ...)` is still available for
+  callers that want raw string-pointer arrays.
+
+- **`AXL_ARG_CHOICE` typed positional / flag** — new
+  `AxlArgType` enum value plus a `choices` field on `AxlArgDesc`
+  (NULL-terminated `const char *const *`). The framework rejects
+  any input not in the allowed set with a breadcrumb-prefixed
+  error matching the out-of-range numeric format, and emits the
+  choice list as a `<a|b|c>` value hint in `--help`. NULL or
+  empty `choices` array degrades to `AXL_ARG_STRING` (caller can
+  declare CHOICE without a list when validation is custom).
+  Comparison is case-sensitive. Field is appended to the end of
+  `AxlArgDesc`, so existing zero-initialized literals via
+  designated initializers keep working unchanged.
+
+- **`assert_in_section LABEL SECTION_MARKER PATTERN`** in
+  `scripts/axl-common.sh` — section-aware assertion helper for
+  nsh-driven QEMU tests. Convention: bracket each command's
+  output with `echo "=== <SECTION> ==="`; `assert_in_section`
+  slices the log between markers and greps just that slice, so
+  an assertion can target a specific command's output rather
+  than the whole serial log. Reads the log path from the global
+  `$LOG` (or `$TEST_CLEAN_LOG` as a fallback for scripts already
+  using that name). PASS/FAIL output shape matches the existing
+  test runner.
+
+- **`axl_stream_set_stdout_tee(extra)`** + **`axl_stream_set_stderr_tee(extra)`**
+  — log-tee primitive. After the call, every byte written to
+  `axl_stdout` (resp. `axl_stderr`) via `axl_print` / `axl_printf` /
+  `axl_fprintf(axl_stdout, ...)` / `axl_write(axl_stdout, ...)` is
+  also written to @p extra. NULL clears; multiple calls replace
+  (no chain). The caller owns the tee stream and is responsible
+  for closing it (typical pairing with `axl_atexit`). Tee write
+  errors are swallowed — a broken log file must not break the
+  console. Replaces the ~50-line `do_printf` + tee-callback +
+  atexit-cleanup pattern downstream consumers wrote per tool that
+  needed a `-o:<file>` log option.
+
+- **`run-qemu.sh --qemu-arg STRING`** (repeatable) — passthrough
+  for literal QEMU CLI tokens. Each `STRING` is shell-word-split
+  and appended to the qemu command line in order. Lets test
+  scripts add device emulation, debug knobs, or anything the
+  script doesn't natively expose without forking it. Shell
+  quoting is NOT honored — values with spaces aren't supported
+  via this flag.
+
+- **`AxlArgDesc.choices_case_insensitive`** — additive bool flag
+  on `AXL_ARG_CHOICE` positionals/flags. When true, validation
+  uses ASCII case-folded comparison (`axl_strcasecmp`) instead of
+  byte-equal (`axl_strcmp`); the value reaching the handler still
+  reflects the user's original casing. Lets consumers preserve
+  user-facing tolerances like "DD_CFG / dd_cfg / DD_cfg all valid"
+  on a typed positional. Default false preserves the byte-equal
+  contract; field is appended at the end of `AxlArgDesc` so
+  existing zero-initialized literals via designated initializers
+  keep working unchanged. `--help` appends ` (case-insensitive)`
+  to the `<a|b|c>` value hint when the flag is set so users know
+  the relaxed match is in effect.
+
+- **`run-qemu.sh --ipmi`** + **`--ipmi-extern SOCK`** + **`--ipmi-prop K=V`**
+  — IPMI BMC simulator shortcuts. `--ipmi` adds an in-process
+  `ipmi-bmc-sim` + `isa-ipmi-kcs` at canonical port 0xca2 (matches
+  AxlIpmi's KCS default and `test/integration/test-ipmi-qemu.sh`'s
+  wiring). `--ipmi-extern` switches to `ipmi-bmc-extern` over a
+  Unix-domain socket the caller provides (lets consumers exercise
+  full BMC behavior including OEM commands and Chassis Identify
+  via OpenIPMI's `ipmi-sim` or pyghmi-bmcsim). `--ipmi-prop K=V`
+  appends K=V to the `ipmi-bmc-sim` device line (mfg_id,
+  product_id, fwrev1, fwrev2, device_id, guid, slave_addr).
+  AArch64 emits a clear `WARN: --ipmi not supported on AARCH64
+  (skipping)` and continues without IPMI wiring rather than
+  failing.
+
+- **`QEMU_DRYRUN=1`** env var on `run-qemu.sh` — prints the
+  constructed qemu command (one token per `QEMU_DRYRUN: <token>`
+  line) and exits 0 without launching qemu. Used by the new
+  `test-run-qemu-flags.sh` scenarios; also useful for "what
+  would run-qemu.sh do?" debugging.
+
+### Tests
+
+- **AxlMemPhys read/write round-trip across 8/16/32/64 widths.**
+  New `test_mem_phys_round_trip` allocates a real identity-mapped
+  phys page via `axl_alloc_pages`, then for each width writes a
+  width-specific sentinel via `axl_mem_phys_writeN`, reads it
+  back via `axl_mem_phys_readN`, and cross-checks via a direct
+  `volatile uintN_t *` deref. Closes the gap in earlier coverage
+  where every write helper and read{16,32,64} were untested.
+
+### Test stats
+
+2522 unit tests passing on both X64 and AARCH64 (was 2424 at
+v0.11.0 cut; +98 across `axl_ipmi_chassis_identify`,
+`axl_mem_phys_*` round-trip, the four PCI / nvstore / SMBIOS /
+AxlArgs typed wrappers, the new stdout/stderr tee primitive,
+the case-insensitive CHOICE flag, and the JEDEC vendor-code
+regression pins shipped late in v0.11.0). Plus 15/15 in
+`test-run-qemu-flags.sh` covering the new `--qemu-arg` /
+`--ipmi` flags via `QEMU_DRYRUN`.
+
 ## 0.11.0 — 2026-05-02
 
 USB tooling release. Adds a new top-level **AxlUsb** module (Phases

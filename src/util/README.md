@@ -72,6 +72,27 @@ axl_nvstore_set("app", "last-run", timestamp, timestamp_len,
                 AXL_NV_PERSISTENT | AXL_NV_BOOT);
 ```
 
+For variable-length values (NV strings, OEM blobs of unknown size),
+`axl_nvstore_get_alloc` does the probe-allocate-read dance for you
+and hands back a heap buffer the caller frees with `axl_free`. The
+buffer is allocated `needed + 1` bytes with the trailing byte zeroed,
+so a string-shaped variable can be dereferenced as NUL-terminated
+even if the wire payload omitted the NUL:
+
+```c
+void   *buf;
+size_t  sz;
+if (axl_nvstore_get_alloc("global", "PlatformLang", &buf, &sz) == 0) {
+    axl_printf("PlatformLang = '%s' (%zu bytes)\n", (char *)buf, sz);
+    axl_free(buf);
+}
+```
+
+`get_alloc` returns -1 for missing variables (and for backends that
+allow 0-byte values, succeeds with `sz == 0` and a 1-byte NUL
+allocation; UEFI's `SetVariable(size=0)` means "delete" so the
+empty path doesn't surface there).
+
 #### Vendor Namespaces
 
 Vendor variables (Dell/HPE/Lenovo OEM keys) plug in via namespace
@@ -462,6 +483,59 @@ int main(int argc, char **argv) {
     });
 }
 ```
+
+### Argument types
+
+`AxlArgDesc.type` selects the parser. Numeric types
+(`AXL_ARG_U8`..`AXL_ARG_S64`) accept optional `min` / `max` bounds
+and a `base` (0 = auto-detect, 10, or 16). String types get one
+more knob:
+
+- `AXL_ARG_BOOL` — presence flag, no value
+- `AXL_ARG_STRING` — unconstrained string
+- `AXL_ARG_MULTI` — repeatable string (variadic positional, or
+  repeatable flag); accumulates into `axl_args_get_multi`
+- `AXL_ARG_U8` / `AXL_ARG_U16` / `AXL_ARG_U32` / `AXL_ARG_U64` /
+  `AXL_ARG_S64` — typed integers with bounds
+- `AXL_ARG_CHOICE` — string restricted to a caller-supplied set:
+
+```c
+static const char *const fields[] = {
+    "noHdds", "riserCfg", "delRiser", NULL
+};
+static const AxlArgDesc field_pos[] = {
+    { .name = "field", .type = AXL_ARG_CHOICE, .required = false,
+      .choices = fields,
+      .default_value = "noHdds",
+      .help = "field selector" },
+    {0}
+};
+```
+
+The framework rejects values not in `choices` with a
+breadcrumb-prefixed error matching the out-of-range numeric format,
+and lists the accepted values as `<noHdds|riserCfg|delRiser>` in
+`--help` output. Comparison is case-sensitive by default. Setting
+`choices` to NULL or an empty array degrades to `AXL_ARG_STRING`
+(unconstrained); useful when the caller wants `<a|b|c>` help text
+but custom validation in the handler.
+
+For case-insensitive match — useful when migrating CLIs that
+already accept mixed-case variants — set `.choices_case_insensitive
+= true`:
+
+```c
+{ .name = "field", .type = AXL_ARG_CHOICE,
+  .choices = fields,
+  .choices_case_insensitive = true,
+  .help = "field selector" }
+```
+
+`--help` then renders `<noHdds|riserCfg|delRiser> (case-insensitive)`
+so users know `dd_cfg` and `DD_CFG` both work. The value the
+handler sees retains the user's original casing — only validation
+folds case. ASCII-only fold (per `axl_strcasecmp`); non-ASCII bytes
+compare byte-equal.
 
 ### Nested verbs (`<top> <category> <verb>`)
 

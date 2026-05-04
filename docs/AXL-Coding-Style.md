@@ -127,6 +127,34 @@ call directly. `axl_ipmi_session_new` (not `axl_ipmi_dell_session_new`),
 `axl_pci_get_vid_did` (not `axl_pci_intel_get_vid_did`). The
 auto-detect picks the vendor adapter; the consumer never names one.
 
+### Spec-decoder strings are spec-canonical
+
+When a function decodes a *published-spec* value to a string —
+SMBIOS / ACPI / PCI / USB / IPMI / JEDEC / etc. — the string
+**matches the spec verbatim**. Vendor-flavored renderings
+(rewordings, OEM extensions, alternative interpretations) live
+in consumer code on top of the typed reader.
+
+Concrete: `axl_smbios_slot_usage_str(0x05)` returns `"Unavailable"`
+(SMBIOS 3.7 Table 12), not Dell's `"CPU NOT INSTALLED"` rendering
+that some consumers prefer for socket-associated 0x05 slots. The
+typed reader (`AxlSmbiosSystemSlot.current_usage`) surfaces the
+raw byte, so a consumer that wants vendor-flavored output writes:
+
+```c
+const char *display = (slot.current_usage == 0x05 && is_cpu_socket(slot))
+                    ? "CPU NOT INSTALLED"
+                    : axl_smbios_slot_usage_str(slot.current_usage);
+```
+
+…in their own code. The SDK stays vendor-neutral; the consumer
+adds vendor flavor where it actually belongs.
+
+This rule applies to every spec-decoder string in the public
+surface. Comments may reference vendor-specific renderings as
+*examples* (so consumers know the typed-reader translation
+recipe), but never bake them into the returned string.
+
 ## Source File Layout
 
 Every `.c` and `.h` file starts with a two-line SPDX/copyright block,

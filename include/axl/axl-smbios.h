@@ -268,10 +268,10 @@ typedef struct {
 ///   - segment_group / bus / device_function: 0xFFFF / 0xFF when not in record
 ///   - data_bus_width_base / peer_grouping_count: 0 when not in record
 ///
-/// current_usage uses spec values 0x03..0x05; the 0xFE "CPU NOT INSTALLED"
-/// extension some Dell firmware emits is a vendor extension on top of 0x05
-/// (Unavailable). The typed reader returns the raw byte, so callers can
-/// match either spec or vendor values directly.
+/// current_usage uses spec values 0x03..0x05. The typed reader returns
+/// the raw byte, so callers that want a vendor-specific rendering
+/// (e.g. "CPU NOT INSTALLED" for socket-associated 0x05 slots) can
+/// translate downstream.
 typedef struct {
     const char  *designation;
     uint8_t      slot_type;            ///< PCI/PCIe variant (SMBIOS spec Table 11)
@@ -379,6 +379,39 @@ int axl_smbios_read_system_slot(AxlSmbiosHeader *hdr, AxlSmbiosSystemSlot *out);
  * @return 0 on success, -1 if @a hdr is NULL or wrong type.
  */
 int axl_smbios_read_oem_strings(AxlSmbiosHeader *hdr, AxlSmbiosOemStrings *out);
+
+/**
+ * @brief Read one Type 11 OEM string by 1-based global index.
+ *
+ * Walks Type 11 records in firmware order and treats the strings
+ * across all records as one contiguous 1-based list. Index 1 is
+ * the first string of the first Type 11 record; if that record
+ * publishes 4 strings, index 5 is the first string of the second
+ * record, and so on. Most platforms ship a single Type 11 record;
+ * this is mostly a robustness convenience for callers that don't
+ * want to enumerate records themselves.
+ *
+ * On success the string is copied into @p buf and NUL-terminated.
+ * If the string (including the NUL) doesn't fit in @p buf_cap,
+ * the function returns -1 without copying — the caller is
+ * expected to retry with a larger buffer rather than receive a
+ * silently-truncated value. When @p required is non-NULL it is
+ * set to the byte count needed (string length + 1 for the NUL),
+ * letting callers size a follow-up allocation exactly. Other
+ * failure modes (no Type 11 record, index out of range, bad args)
+ * leave @p *required unchanged.
+ *
+ * @return 0 on success, -1 if no Type 11 record exists, the
+ *     index is out of range, @p buf / @p buf_cap are bad, or
+ *     @p buf_cap is too small for the matched string.
+ */
+int
+axl_smbios_get_oem_string(
+    uint8_t  index_one_based,   ///< 1-based string index per SMBIOS §7.12
+    char    *buf,               ///< [out] receives the NUL-terminated string
+    size_t   buf_cap,           ///< capacity of @p buf in bytes (must be >= 1)
+    size_t  *required           ///< [out, NULL OK] byte count needed (string + NUL) on too-small
+);
 
 /**
  * @brief Read a Type 16 (Physical Memory Array) record.
@@ -665,10 +698,10 @@ axl_smbios_slot_width_str(
  * @brief Slot current-usage code → display string.
  *
  * SMBIOS Table 12. Returns "Other" / "Unknown" / "Empty" / "InUse" /
- * "CPU NOT INSTALLED". Note: 0x05 (Unavailable, per spec) is rendered
- * as "CPU NOT INSTALLED" — that's the convention every Dell consumer
- * (dowin/doDriver/dolin) emits and what their scripts grep for.
- * Returns NULL for unknown values.
+ * "Unavailable" — strings match the SMBIOS 3.7 spec. Vendor-specific
+ * renderings (e.g. "CPU NOT INSTALLED" for socket-associated 0x05
+ * slots) belong in consumer code; read AxlSmbiosSystemSlot.current_usage
+ * and translate. Returns NULL for unknown values.
  */
 const char *
 axl_smbios_slot_usage_str(
@@ -693,8 +726,7 @@ typedef enum {
     AXL_SMBIOS_CHASSIS_CLASS_SERVER,     ///< 0x17/19/1B/1C/1D — rack / multi-system /
                                   ///<   pizza box / blade / blade enclosure
     AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,   ///< 0x21 IoT Gateway, 0x22 Embedded PC,
-                                  ///<   0x23 Mongoose Mini PC (Dell convention; the
-                                  ///<   spec calls it Embedded PC variant)
+                                  ///<   0x23 Mini PC (per SMBIOS 3.7)
     AXL_SMBIOS_CHASSIS_CLASS_OTHER,      ///< Recognized chassis type outside the above buckets
 } AxlSmbiosChassisClass;
 
@@ -707,8 +739,7 @@ typedef enum {
  *
  * Pitfalls worth knowing:
  *   - 0x18 ("Sealed-case PC") is desktop/SFF, not server.
- *   - 0x23 is Dell's "Mongoose Mini PC" convention; the SMBIOS spec
- *     calls it an embedded PC variant.
+ *   - 0x23 ("Mini PC" per SMBIOS 3.7) is EMBEDDED, not IoT Gateway.
  *
  * @return matching AxlSmbiosChassisClass, or AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN
  *         if @a type is 0 / out of range / explicitly the spec's

@@ -204,6 +204,69 @@ axl_nvstore_get(
 }
 
 int
+axl_nvstore_get_alloc(
+    const char  *ns,
+    const char  *key,
+    void       **out_buf,
+    size_t      *out_size
+    )
+{
+    if (out_buf == NULL || out_size == NULL || key == NULL) {
+        return -1;
+    }
+    *out_buf  = NULL;
+    *out_size = 0;
+
+    /* Size probe: GetVariable(Data=NULL, DataSize=0) returns:
+         - EFI_NOT_FOUND       → axl_nvstore_get rc=-1, size unchanged at 0
+         - EFI_SUCCESS         → axl_nvstore_get rc=0, size=0 (genuinely 0-byte var)
+         - EFI_BUFFER_TOO_SMALL → axl_nvstore_get rc=-1, size=actual payload
+       The two rc=-1 cases differ only by whether *size was updated
+       past zero. Use the probe's rc to distinguish "empty variable"
+       (legitimate, success) from "missing / failed" (-1, no value
+       to return). */
+    size_t needed   = 0;
+    int    probe_rc = axl_nvstore_get(ns, key, NULL, &needed);
+    if (probe_rc != 0 && needed == 0) {
+        /* NOT_FOUND or some other non-truncation read failure. */
+        return -1;
+    }
+
+    /* Allocate needed+1 so callers reading a string variable can
+       treat the result as NUL-terminated even when the wire payload
+       omitted the NUL. The empty-variable case (needed==0) still
+       gets a 1-byte allocation holding a single NUL — the caller
+       sees out_size==0 and a non-NULL out_buf they can freely
+       deref or pass to printf("%s", ...). */
+    void *buf = axl_malloc(needed + 1);
+    if (buf == NULL) {
+        return -1;
+    }
+    ((uint8_t *)buf)[needed] = 0;
+
+    /* Skip the second GetVariable call when we already know the
+       payload is empty — the probe answered the whole question. */
+    size_t actual = needed;
+    if (needed > 0) {
+        if (axl_nvstore_get(ns, key, buf, &actual) != 0) {
+            axl_free(buf);
+            return -1;
+        }
+        /* Defensive: a racing concurrent SetVariable could have grown
+           the payload between the probe and the read. Don't lie about
+           *out_size; report what was actually read and let the caller
+           decide whether the truncation matters. */
+        if (actual > needed) {
+            actual = needed;
+        }
+        ((uint8_t *)buf)[actual] = 0;
+    }
+    *out_buf  = buf;
+    *out_size = actual;
+    return 0;
+}
+
+int
 axl_nvstore_set(
     const char *ns,
     const char *key,

@@ -174,6 +174,120 @@ test_chassis_control(void)
                "chassis_control: carries action byte");
 }
 
+// Transport-error callback: simulates a session whose underlying
+// transport (KCS state machine, SSIF I2C, vendor protocol) refuses
+// the request before any BMC bytes flow. The wrapper must return -1
+// and not stash a stale CC.
+static int
+err_send_raw(void *user_data,
+             uint8_t netfn, uint8_t cmd,
+             const uint8_t *req, size_t req_len,
+             uint8_t *resp, size_t *resp_len)
+{
+    (void)user_data; (void)netfn; (void)cmd;
+    (void)req; (void)req_len; (void)resp;
+    *resp_len = 0;
+    return -1;
+}
+
+static void
+test_chassis_identify(void)
+{
+    /* (1) force_on=false, interval=0: stop request, single-byte body. */
+    {
+        Canned c = { .resp = {0x00}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 0, false) == 0,
+                   "chassis_identify: stop (interval=0, force_on=false) returns 0");
+        test_check(c.last_netfn == 0x00 && c.last_cmd == 0x04,
+                   "chassis_identify: dispatches NetFn 0x00 / Cmd 0x04");
+        test_check(c.last_req_len == 1 && c.last_req[0] == 0x00,
+                   "chassis_identify: stop body is single 0x00 byte");
+        test_check(axl_ipmi_session_last_cc(s) == 0x00,
+                   "chassis_identify: last_cc records 0x00 on success");
+    }
+
+    /* (2) force_on=false, interval=30: timed identify, single-byte body. */
+    {
+        Canned c = { .resp = {0x00}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 30, false) == 0,
+                   "chassis_identify: timed (interval=30, force_on=false) returns 0");
+        test_check(c.last_req_len == 1 && c.last_req[0] == 30,
+                   "chassis_identify: timed body is [interval] only");
+    }
+
+    /* (3) force_on=true, interval=0: indefinite identify, two-byte body
+           with bit 0 of the second byte set. */
+    {
+        Canned c = { .resp = {0x00}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 0, true) == 0,
+                   "chassis_identify: force_on (interval=0) returns 0");
+        test_check(c.last_req_len == 2
+                       && c.last_req[0] == 0x00 && c.last_req[1] == 0x01,
+                   "chassis_identify: force_on body is [interval, 0x01]");
+    }
+
+    /* (4) Force_on=true with a non-zero interval still sends both
+           bytes — a BMC implementing both behaviors picks force_on
+           per spec when bit 0 of byte 1 is set. */
+    {
+        Canned c = { .resp = {0x00}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 15, true) == 0,
+                   "chassis_identify: force_on with interval=15 returns 0");
+        test_check(c.last_req_len == 2
+                       && c.last_req[0] == 15 && c.last_req[1] == 0x01,
+                   "chassis_identify: force_on with interval body is [15, 0x01]");
+    }
+
+    /* (4b) Boundary: interval_sec = 0xFF (max 8-bit value, 255 seconds). */
+    {
+        Canned c = { .resp = {0x00}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 0xFF, false) == 0,
+                   "chassis_identify: interval=0xFF (max 8-bit) returns 0");
+        test_check(c.last_req_len == 1 && c.last_req[0] == 0xFF,
+                   "chassis_identify: interval=0xFF carries through unmodified");
+    }
+
+    /* (5) BMC rejects force-on with CC 0xC1 (Invalid command). */
+    {
+        Canned c = { .resp = {0xC1}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 0, true) == -1,
+                   "chassis_identify: CC=0xC1 surfaces as -1");
+        test_check(axl_ipmi_session_last_cc(s) == 0xC1,
+                   "chassis_identify: last_cc records 0xC1 from rejection");
+    }
+
+    /* (6) BMC reports no chassis to identify (CC 0xCC). */
+    {
+        Canned c = { .resp = {0xCC}, .resp_len = 1 };
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, canned_send_raw, &c);
+        test_check(axl_ipmi_chassis_identify(s, 5, false) == -1,
+                   "chassis_identify: CC=0xCC surfaces as -1");
+        test_check(axl_ipmi_session_last_cc(s) == 0xCC,
+                   "chassis_identify: last_cc records 0xCC");
+    }
+
+    /* (7) Transport error from the underlying send-raw callback. */
+    {
+        AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new_with_callback(
+            AXL_IPMI_TRANSPORT_KCS, err_send_raw, NULL);
+        test_check(axl_ipmi_chassis_identify(s, 0, false) == -1,
+                   "chassis_identify: transport error surfaces as -1");
+    }
+}
+
 static void
 test_sel_info(void)
 {
@@ -702,6 +816,7 @@ test_ipmi_main(int argc, char **argv)
     test_get_device_id();
     test_get_chassis_status();
     test_chassis_control();
+    test_chassis_identify();
     test_sel_info();
     test_sel_get_entry();
     test_sdr_info();

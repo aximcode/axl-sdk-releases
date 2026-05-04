@@ -353,6 +353,62 @@ axl_pci_get_class_code(AxlPciAddr addr, uint32_t *class_code)
     return 0;
 }
 
+int
+axl_pci_get_header_type(AxlPciAddr        addr,
+                        AxlPciHeaderType *type,
+                        bool             *is_multi_function)
+{
+    /* Absent-function precheck: raw config-space reads complete
+       successfully even on missing slots (the bus returns 0xFFFF
+       for every byte). Mirror axl_pci_get_vid_did's posture so
+       callers don't have to disambiguate "header type 0x7F multi-
+       func" from "function not present." */
+    uint16_t v;
+    if (axl_pci_read_config_16(addr, 0x00, &v) != 0 || v == 0xFFFF) {
+        return -1;
+    }
+    uint8_t htype;
+    if (axl_pci_read_config_8(addr, 0x0E, &htype) != 0) {
+        return -1;
+    }
+    if (type != NULL) {
+        /* Strip the multi-function bit; pass the low 7 bits through
+           as the enum value. Unknown values (anything outside the
+           three named constants) round-trip as their numeric form. */
+        *type = (AxlPciHeaderType)(htype & 0x7Fu);
+    }
+    if (is_multi_function != NULL) {
+        *is_multi_function = (htype & 0x80u) != 0;
+    }
+    return 0;
+}
+
+int
+axl_pci_get_subsystem(AxlPciAddr addr, uint16_t *svid, uint16_t *sdid)
+{
+    if (svid == NULL || sdid == NULL) {
+        return -1;
+    }
+    AxlPciHeaderType hdr;
+    if (axl_pci_get_header_type(addr, &hdr, NULL) != 0) {
+        return -1;
+    }
+    if (hdr != AXL_PCI_HEADER_TYPE_NORMAL) {
+        /* PCI-PCI bridges (Type 1) and CardBus bridges (Type 2)
+           use 0x2C/0x2E for unrelated fields. */
+        return -1;
+    }
+    uint16_t v;
+    if (axl_pci_read_config_16(addr, 0x2C, &v) != 0) {
+        return -1;
+    }
+    if (axl_pci_read_config_16(addr, 0x2E, sdid) != 0) {
+        return -1;
+    }
+    *svid = v;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // PCI class triplet → human string
 // Tables sourced from the PCI Code and ID Assignment Specification.

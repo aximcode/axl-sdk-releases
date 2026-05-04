@@ -267,6 +267,134 @@ test_stdin(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_stream_set_stdout_tee / set_stderr_tee — log-tee primitive
+// ---------------------------------------------------------------------------
+
+static void
+test_stdout_tee(void)
+{
+    /* Install a buffer-stream tee on the real axl_stdout, write a
+       known payload via axl_print, then read the buffer back. Note
+       we cannot swap axl_stdout itself because test_check internally
+       writes to axl_stdout — swapping would route assertion output
+       into the buffer and silence the test runner. Instead we
+       verify only the tee branch (the primary still goes to the
+       real console and shows up in the serial log normally). */
+    AxlStream *tee = axl_bufopen();
+    test_check(tee != NULL, "stdout_tee: bufopen tee");
+    if (tee == NULL) {
+        return;
+    }
+
+    test_check(axl_stream_set_stdout_tee(tee) == 0,
+               "stdout_tee: set_stdout_tee succeeds");
+
+    const char payload[] = "stdout_tee_marker\n";
+    axl_print("%s", payload);
+
+    /* Clear the tee BEFORE further test_check calls — otherwise
+       every subsequent PASS/FAIL line lands in the buffer too and
+       throws off the size assertions. */
+    axl_stream_set_stdout_tee(NULL);
+
+    /* Read tee contents and confirm our payload is in there. The
+       tee may also contain the "PASS: stdout_tee: bufopen tee"
+       and "PASS: stdout_tee: set_stdout_tee succeeds" lines from
+       the test_checks that ran before clear — that's actually a
+       useful sanity check (proves earlier writes also tee'd). */
+    axl_fseek(tee, 0, AXL_SEEK_SET);
+    char buf[512] = {0};
+    axl_ssize_t got = axl_read(tee, buf, sizeof(buf) - 1);
+    test_check(got > 0,
+               "stdout_tee: tee captured bytes");
+    test_check(axl_strstr(buf, payload) != NULL,
+               "stdout_tee: tee contents include payload");
+    /* test_check itself writes to axl_stdout, so PASS lines emitted
+       while the tee was installed should also be in the buffer.
+       Confirm — proves the tee is exercised on the actual axl_print
+       path test_check uses, not just on direct axl_print calls. */
+    test_check(axl_strstr(buf, "PASS: stdout_tee: set_stdout_tee succeeds") != NULL,
+               "stdout_tee: tee captured a test_check PASS line emitted post-install");
+
+    /* Set, then clear, then write — second write should NOT be in
+       a NEW capture. Reset the buffer position and count post-write
+       bytes captured. */
+    axl_fseek(tee, 0, AXL_SEEK_END);
+    axl_ssize_t pre = axl_ftell(tee);
+    axl_print("%s", "post-clear-marker\n");
+    axl_fseek(tee, 0, AXL_SEEK_END);
+    axl_ssize_t post = axl_ftell(tee);
+    test_check(post == pre,
+               "stdout_tee: cleared tee receives no further bytes");
+
+    /* Re-set replaces (no chain): install the same buf again, write,
+       then install a fresh buf, write — the original captures the
+       first write, the fresh captures the second only. */
+    AxlStream *tee2 = axl_bufopen();
+    test_check(tee2 != NULL, "stdout_tee: bufopen tee2");
+    if (tee2 != NULL) {
+        axl_stream_set_stdout_tee(tee);
+        axl_print("first-marker\n");
+        axl_stream_set_stdout_tee(tee2);
+        axl_print("second-marker\n");
+        axl_stream_set_stdout_tee(NULL);
+
+        axl_fseek(tee, 0, AXL_SEEK_SET);
+        char tbuf[512] = {0};
+        axl_read(tee, tbuf, sizeof(tbuf) - 1);
+        test_check(axl_strstr(tbuf, "first-marker")  != NULL
+                       && axl_strstr(tbuf, "second-marker") == NULL,
+                   "stdout_tee: replaced (old) tee captured only first write");
+
+        axl_fseek(tee2, 0, AXL_SEEK_SET);
+        char t2buf[256] = {0};
+        axl_read(tee2, t2buf, sizeof(t2buf) - 1);
+        test_check(axl_strstr(t2buf, "second-marker") != NULL
+                       && axl_strstr(t2buf, "first-marker")  == NULL,
+                   "stdout_tee: replacement tee captured only post-set bytes");
+
+        axl_fclose(tee2);
+    } else {
+        for (int i = 0; i < 2; i++) {
+            test_check(true, "stdout_tee: SKIP balance (tee2 alloc)");
+        }
+    }
+
+    /* Final cleanup. */
+    axl_stream_set_stdout_tee(NULL);
+    axl_fclose(tee);
+}
+
+static void
+test_stderr_tee(void)
+{
+    /* Mirror test_stdout_tee against axl_stderr — same primitive,
+       different global. We don't capture test_check (it writes to
+       axl_stdout, not stderr) so we can both inspect freely AND
+       leave the tee installed across asserts. */
+    AxlStream *tee = axl_bufopen();
+    test_check(tee != NULL, "stderr_tee: bufopen tee");
+    if (tee == NULL) {
+        return;
+    }
+
+    test_check(axl_stream_set_stderr_tee(tee) == 0,
+               "stderr_tee: set_stderr_tee succeeds");
+
+    axl_printerr("err:%d\n", 42);
+
+    axl_stream_set_stderr_tee(NULL);
+
+    axl_fseek(tee, 0, AXL_SEEK_SET);
+    char buf[64] = {0};
+    axl_read(tee, buf, sizeof(buf) - 1);
+    test_check(axl_strstr(buf, "err:42") != NULL,
+               "stderr_tee: tee captured printerr payload");
+
+    axl_fclose(tee);
+}
+
+// ---------------------------------------------------------------------------
 // axl_stdout_raw — binary-out symmetric companion to axl_stdin
 // ---------------------------------------------------------------------------
 
@@ -1294,6 +1422,8 @@ test_io_main(int argc, char **argv)
     test_file();
     test_printf();
     test_stdin();
+    test_stdout_tee();
+    test_stderr_tee();
     test_stdout_raw();
     test_text_stream();
     test_encoding_default_passthrough();

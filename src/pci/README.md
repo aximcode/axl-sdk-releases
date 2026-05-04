@@ -58,9 +58,10 @@ axl_printf("device %s\n", buf);
 
 ## Common header reads
 
-Two boilerplate-killer wrappers around the standard config-space
-header offsets — they fold the "is this function absent?" and
-"unpack the 24-bit class triplet" patterns into one call:
+Boilerplate-killer wrappers around the standard config-space header
+offsets. They fold the "is this function absent?", "unpack the
+24-bit class triplet", "split header type from multi-function bit",
+and "Type-0-only fields" patterns into single calls:
 
 ```c
 uint16_t vid, did;
@@ -70,11 +71,27 @@ if (axl_pci_get_vid_did(addr, &vid, &did) == 0) {
 
 uint32_t class_code;  /* (base << 16) | (sub << 8) | prog_if */
 axl_pci_get_class_code(addr, &class_code);
+
+AxlPciHeaderType  hdr;
+bool              is_multi_function;
+axl_pci_get_header_type(addr, &hdr, &is_multi_function);
+/* hdr is one of NORMAL (0x00) / BRIDGE (0x01) / CARDBUS (0x02);
+   either out param may be NULL. */
+
+uint16_t svid, sdid;
+if (axl_pci_get_subsystem(addr, &svid, &sdid) == 0) {
+    /* function is Type 0 (regular endpoint) and SVID/SDID read OK;
+       Type 1 / Type 2 functions return -1 — those bytes are
+       repurposed in PCI-PCI and CardBus bridges. */
+}
 ```
 
 `axl_pci_get_vid_did` returns -1 when the function is absent (vid
 reads as `0xFFFF`), so callers don't have to special-case the
-sentinel. `class_code` matches the shape consumed by
+sentinel. `axl_pci_get_header_type` and `axl_pci_get_subsystem`
+share the same absent-function check internally — their `-1`
+return covers "function not present" alongside the type-specific
+rejection cases. `class_code` matches the shape consumed by
 `axl_pci_find_by_class`.
 
 `axl_pci_class_string` decodes the 24-bit class triplet into a

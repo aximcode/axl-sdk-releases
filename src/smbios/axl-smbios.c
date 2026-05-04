@@ -891,6 +891,66 @@ axl_smbios_read_oem_strings(
     return 0;
 }
 
+int
+axl_smbios_get_oem_string(
+    uint8_t  index_one_based,
+    char    *buf,
+    size_t   buf_cap,
+    size_t  *required
+    )
+{
+    if (buf == NULL || buf_cap == 0 || index_one_based == 0) {
+        return -1;
+    }
+
+    /* Walk Type 11 records in firmware order, accumulating string
+       counts, until we've reached the record containing the
+       requested index. Most platforms ship a single Type 11
+       record; the multi-record path is mostly here for robustness
+       against firmware that splits OEM strings across records. */
+    AxlSmbiosHeader *hdr = NULL;
+    uint8_t          base = 0;  /* strings counted before the current record */
+    while ((hdr = axl_smbios_find_next(AXL_SMBIOS_TYPE_OEM_STRINGS, hdr))
+           != NULL)
+    {
+        AxlSmbiosOemStrings rec;
+        if (axl_smbios_read_oem_strings(hdr, &rec) != 0) {
+            continue;
+        }
+        /* Does the requested index land in this record? Inputs are
+           1-based; rec.count is the per-record count. */
+        if (index_one_based <= base + rec.count) {
+            uint8_t local = (uint8_t)(index_one_based - base);
+            const char *s = rec.strings[local - 1];
+            if (s == NULL) {
+                return -1;
+            }
+            /* Compute the source length so we can refuse to
+               truncate. Callers explicitly retry with a larger
+               buffer rather than receive a silently-clipped value. */
+            size_t need = axl_strlen(s);
+            if (need + 1 > buf_cap) {
+                if (required != NULL) {
+                    *required = need + 1;
+                }
+                return -1;
+            }
+            for (size_t i = 0; i < need; i++) {
+                buf[i] = s[i];
+            }
+            buf[need] = '\0';
+            return 0;
+        }
+        base = (uint8_t)(base + rec.count);
+        /* If we've consumed all 16 slots from this record's cap, the
+           caller's index can't be satisfied without overflowing the
+           per-record cap; but the spec doesn't require Type 11 to
+           cap at 16, so we keep walking — subsequent records may
+           contain more strings legitimately. */
+    }
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // Type 16 — Physical Memory Array
 //
@@ -1319,15 +1379,18 @@ axl_smbios_slot_usage_str(
     uint8_t cu
     )
 {
-    /* SMBIOS spec Table 12 — Current Usage. 0x05 is rendered as
-     * "CPU NOT INSTALLED" — Dell convention from
-     * dowin/Init.cpp:3833 + SmBioslib.h:391, which scripts grep for. */
+    /* SMBIOS spec Table 12 — Current Usage. Strings match the spec
+     * exactly so callers see canonical decoding regardless of which
+     * BIOS family produced the table. Vendor-specific renderings
+     * (e.g. an OEM that wants "CPU NOT INSTALLED" for socket-
+     * associated 0x05 slots) belong in consumer code: read the raw
+     * byte off AxlSmbiosSystemSlot.current_usage and translate. */
     switch (cu) {
         case 0x01: return "Other";
         case 0x02: return "Unknown";
         case 0x03: return "Empty";
         case 0x04: return "InUse";
-        case 0x05: return "CPU NOT INSTALLED";
+        case 0x05: return "Unavailable";
         default:   return NULL;
     }
 }
@@ -1340,7 +1403,7 @@ axl_smbios_slot_usage_str(
 //
 // Pitfalls worth a defense-in-tests:
 //   - 0x18 ("Sealed-case PC") is desktop/SFF, NOT server.
-//   - 0x23 — Dell convention is "Mongoose Mini PC", not IoT Gateway.
+//   - 0x23 ("Mini PC" per SMBIOS 3.7) is EMBEDDED, NOT IoT Gateway.
 // ---------------------------------------------------------------------------
 
 AxlSmbiosChassisClass
@@ -1394,10 +1457,9 @@ axl_smbios_chassis_class(
 
         case 0x21:                /* IoT Gateway */
         case 0x22:                /* Embedded PC */
-        case 0x23:                /* Dell convention: Mongoose Mini PC.
-                                   * Worth a defense in tests because the SMBIOS spec
-                                   * calls it an embedded PC variant — naive "0x21 only"
-                                   * classifiers would miss it. */
+        case 0x23:                /* "Mini PC" per SMBIOS 3.7 — embedded form factor.
+                                   * Worth a defense in tests because naive "0x21 only"
+                                   * IoT-Gateway classifiers would miss it. */
             return AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED;
 
         /* Recognized chassis types outside the above buckets:

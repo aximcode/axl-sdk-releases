@@ -69,6 +69,22 @@ NET=false
 NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrides
 HOSTFWDS=()
 EXTRA_FILES=()
+# --qemu-arg STRING: literal QEMU command-line tokens to append before
+# invocation. Repeatable; shell-word-split. Lets test scripts add
+# device emulation, debug knobs, or anything run-qemu.sh doesn't
+# expose natively, without forking the script. Each STRING is
+# split via bash word-splitting so a single --qemu-arg with a multi-
+# token string ("-device foo,bar=1") works as one logical addition.
+EXTRA_QEMU_ARGS=()
+
+# --ipmi / --ipmi-extern / --ipmi-prop: in-process or external IPMI
+# BMC simulator. Centralizes the device-shape choice (KCS at 0xCA0
+# is the canonical pairing — matches what test-ipmi-qemu.sh uses)
+# so every consumer doesn't reinvent it. x86-only; aa64 QEMU has
+# no IPMI device support today.
+IPMI_INPROC=false
+IPMI_EXTERN_SOCK=""
+IPMI_PROPS=()
 CUSTOM_NSH=""
 BACKGROUND=false
 SERIAL_LOG=""
@@ -100,6 +116,10 @@ while [[ $# -gt 0 ]]; do
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
+        --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
+        --ipmi)       IPMI_INPROC=true; shift ;;
+        --ipmi-extern) IPMI_EXTERN_SOCK="$2"; shift 2 ;;
+        --ipmi-prop)  IPMI_PROPS+=("$2"); IPMI_INPROC=true; shift 2 ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
         --background) BACKGROUND=true; shift ;;
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
@@ -157,6 +177,36 @@ Options:
                            fallback. Implies --net.
   --hostfwd HOST:GUEST     Forward host port to guest (repeatable)
   --extra FILE             Stage additional .efi on disk (repeatable)
+  --qemu-arg STRING        Append literal STRING to the qemu command
+                           line. Repeatable; multiple values accumulate
+                           in order. Each STRING is shell-word-split,
+                           so "-device foo,bar=1" lands as one logical
+                           pair. NOTE: shell quoting is NOT honored —
+                           tokens with embedded spaces aren't supported
+                           via this flag (use one --qemu-arg per
+                           token; a per-token flag is the workaround).
+                           Useful for device emulation or debug knobs
+                           not natively exposed.
+  --ipmi                   Add an in-process IPMI BMC simulator
+                           (ipmi-bmc-sim + isa-ipmi-kcs at canonical
+                           KCS port 0xca2). Matches AxlIpmi's KCS
+                           default so axl_ipmi_session_new() opens
+                           the simulator without further wiring.
+                           Sim implements spec-standard commands;
+                           Chassis Identify and OEM commands return
+                           CC 0xC1. x86-only — warns and continues
+                           without IPMI on AArch64.
+  --ipmi-extern SOCK       Wire ipmi-bmc-extern to a Unix-domain
+                           socket. Caller is responsible for running
+                           an external BMC simulator (OpenIPMI
+                           ipmi-sim, pyghmi-bmcsim, ...) bound to
+                           SOCK. Lets consumers exercise full BMC
+                           behavior including OEM commands and
+                           Chassis Identify. x86-only.
+  --ipmi-prop K=V          Override an ipmi-bmc-sim property
+                           (mfg_id, product_id, fwrev1, fwrev2,
+                           device_id, guid, slave_addr). Repeatable.
+                           Implies --ipmi.
   --nsh FILE               Use custom startup.nsh file
   --background             Launch QEMU in background, print PID
   --serial-log FILE        Save serial output to file (foreground:
@@ -780,6 +830,64 @@ if [[ "$NET" == "true" ]]; then
     CMD+=(-device "$NIC_DEV" -netdev "$NETDEV")
 else
     CMD+=(-net none)
+fi
+
+# --ipmi / --ipmi-extern / --ipmi-prop: BMC simulator wiring. Both
+# in-process (ipmi-bmc-sim) and external (ipmi-bmc-extern) are
+# x86-only — aa64 QEMU has no IPMI device support today, so we warn
+# and proceed without IPMI rather than fail.
+if [[ "$IPMI_INPROC" == "true" || -n "$IPMI_EXTERN_SOCK" ]]; then
+    if [[ "$ARCH" != "X64" ]]; then
+        echo "WARN: --ipmi/--ipmi-extern not supported on $ARCH (skipping)" >&2
+    elif [[ -n "$IPMI_EXTERN_SOCK" ]]; then
+        # External: bmc=ipmi-bmc-extern,id=axl_bmc,chardev=axl_bmcsock
+        # backed by the caller-provided unix socket. Port 0xca2 is
+        # the canonical KCS data port AxlIpmi probes by default —
+        # matching test/integration/common-test.sh's helper so the
+        # transport opens cleanly.
+        CMD+=(-chardev "socket,id=axl_bmcsock,path=${IPMI_EXTERN_SOCK},reconnect=1"
+              -device   "ipmi-bmc-extern,id=axl_bmc,chardev=axl_bmcsock"
+              -device   "isa-ipmi-kcs,bmc=axl_bmc,ioport=0xca2")
+    else
+        # In-process: ipmi-bmc-sim with sane defaults; --ipmi-prop K=V
+        # overrides any of the spec-standard ipmi-bmc-sim properties.
+        # Port 0xca2 matches AxlIpmi's KCS default + the existing
+        # test-ipmi-qemu.sh wiring; consumers using --ipmi compose
+        # cleanly with axl_ipmi_session_new().
+        bmc_dev="ipmi-bmc-sim,id=axl_bmc"
+        for prop in "${IPMI_PROPS[@]}"; do
+            bmc_dev="${bmc_dev},${prop}"
+        done
+        CMD+=(-device "$bmc_dev"
+              -device "isa-ipmi-kcs,bmc=axl_bmc,ioport=0xca2")
+    fi
+fi
+
+# --qemu-arg passthrough: shell-word-split each accumulated STRING
+# into individual tokens and append. Single quotes / spaces in the
+# user-supplied string aren't honored as quoting (callers wanting
+# spaces inside a single token should pass it as one --qemu-arg
+# without surrounding quotes); this matches the "literal qemu CLI
+# tokens" contract documented in --help.
+if [[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]]; then
+    for arg in "${EXTRA_QEMU_ARGS[@]}"; do
+        # shellcheck disable=SC2206 — intentional word-split
+        toks=( $arg )
+        CMD+=( "${toks[@]}" )
+    done
+fi
+
+# QEMU_DRYRUN=1 prints the constructed CMD and exits without launching
+# qemu. Useful for argument-shape regression tests and for "what
+# would run-qemu.sh do?" debugging. Each CMD token is printed on its
+# own line prefixed with "QEMU_DRYRUN: " — no shell-quoting noise so
+# tests can grep for token literals (commas in -device strings, etc.)
+# without escaping.
+if [[ "${QEMU_DRYRUN:-0}" == "1" ]]; then
+    for tok in "${CMD[@]}"; do
+        printf 'QEMU_DRYRUN: %s\n' "$tok"
+    done
+    exit 0
 fi
 
 # Interactive mode — hand the host TTY to QEMU. No pipeline, no

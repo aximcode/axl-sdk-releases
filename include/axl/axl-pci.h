@@ -199,6 +199,58 @@ axl_pci_get_class_code(
     uint32_t    *class_code  ///< [out] 24-bit class code
 );
 
+/// PCI configuration-space header type, decoded from the low 7 bits
+/// of offset 0x0E. The high bit (0x80) is the multi-function flag and
+/// is exposed separately by @ref axl_pci_get_header_type.
+typedef enum {
+    AXL_PCI_HEADER_TYPE_NORMAL  = 0x00,  ///< Type 0: regular function (BARs, SVID/SDID, etc.)
+    AXL_PCI_HEADER_TYPE_BRIDGE  = 0x01,  ///< Type 1: PCI-PCI bridge
+    AXL_PCI_HEADER_TYPE_CARDBUS = 0x02,  ///< Type 2: CardBus bridge
+} AxlPciHeaderType;
+
+/**
+ * @brief Read the configuration-space header type and multi-function bit.
+ *
+ * Splits the byte at offset 0x0E into the type enum (low 7 bits) and
+ * the multi-function flag (bit 7). Eliminates the manual `& 0x7F`
+ * masking and `& 0x80` bit test that every consumer rolling its own
+ * type detection writes. Either out parameter may be NULL.
+ *
+ * If the firmware reports a header-type byte the spec doesn't define
+ * (anything outside 0x00..0x02 in the low 7 bits) the call still
+ * returns 0 and @p type is set to the raw value cast through the
+ * enum — callers can compare against the named constants and treat
+ * unknown values as opaque. Bus error returns -1.
+ *
+ * @return 0 on success, -1 on bus error.
+ */
+int
+axl_pci_get_header_type(
+    AxlPciAddr         addr,                 ///< target function
+    AxlPciHeaderType  *type,                 ///< [out] header type (NULL allowed)
+    bool              *is_multi_function     ///< [out] bit 7 of offset 0x0E (NULL allowed)
+);
+
+/**
+ * @brief Read a Type 0 function's Subsystem Vendor ID and Subsystem ID.
+ *
+ * Only Type 0 functions (regular endpoints) carry SVID/SDID at config
+ * offsets 0x2C / 0x2E; Type 1 (PCI-PCI bridge) and Type 2 (CardBus)
+ * use those bytes for other purposes. The header-type check is baked
+ * in: a non-zero header type returns -1 with @p svid / @p sdid
+ * untouched.
+ *
+ * @return 0 on success (both fields populated), -1 if the function
+ *     is absent, has a non-Type-0 header, or any bus error is
+ *     encountered.
+ */
+int
+axl_pci_get_subsystem(
+    AxlPciAddr   addr,    ///< target function (must be header-type 0)
+    uint16_t    *svid,    ///< [out] subsystem vendor ID
+    uint16_t    *sdid     ///< [out] subsystem device ID
+);
+
 /**
  * @brief Format a 24-bit PCI class code as a human-readable string.
  *

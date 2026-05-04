@@ -35,6 +35,13 @@ struct AxlStream {
        UTF-8 sequence still missing its tail). */
     uint8_t      out_pending[3];
     size_t       out_pending_n;
+    /* Optional tee target for axl_write — when non-NULL, bytes
+       successfully forwarded to this stream are also written to
+       the tee. The tee's own `tee` field is intentionally ignored
+       at write time so accidental loops just double-write once
+       instead of recursing. Typical use: `-o:<file>` log option
+       on a tool wired via axl_stream_set_stdout_tee. */
+    AxlStream   *tee;
 };
 
 /* Allocate a stream with the default field initializers. Used by

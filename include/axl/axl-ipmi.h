@@ -232,6 +232,31 @@ int axl_ipmi_chassis_control(
     );
 
 /**
+ * @brief Send IPMI Chassis Identify (Chassis 0x04).
+ *
+ * Flashes the front-panel chassis identify LED. The wire format
+ * mirrors IPMI 2.0 §28.5:
+ *   - With @p force_on false the request body is a single byte
+ *     (the interval). @p interval_sec = 0 stops an in-progress
+ *     identify; 1-255 sets the LED on for that many seconds.
+ *   - With @p force_on true a second byte with bit 0 set is
+ *     appended, telling the BMC to keep the LED on indefinitely.
+ *     Some BMCs do not implement force-on and reply CC 0xC1.
+ *
+ * The spec-omitted-byte case (no interval byte at all) is not
+ * exposed by this wrapper — callers that want the BMC default
+ * pass interval_sec = 15 explicitly.
+ *
+ * @return 0 on CC 0x00, -1 on transport error or non-zero CC.
+ *     Last CC observable via axl_ipmi_session_last_cc().
+ */
+int axl_ipmi_chassis_identify(
+    AxlIpmiSession  *session,
+    uint8_t          interval_sec,
+    bool             force_on
+    );
+
+/**
  * @brief Send a BMC Cold Reset (App 0x02).
  *
  * Full BMC reboot. The BMC is unresponsive to further IPMI for
@@ -433,7 +458,6 @@ typedef struct {
     // Supporting infrastructure
     bool  smbus_hc_protocol;          ///< EFI_SMBUS_HC_PROTOCOL
     bool  i2c_master_protocol;        ///< EFI_I2C_MASTER_PROTOCOL (any)
-    bool  dell_idrac_interface;       ///< Dell iDRAC (non-IPMI)
 
     // SMBIOS Type 38 (IPMI Device Information)
     bool     smbios_type38_present;

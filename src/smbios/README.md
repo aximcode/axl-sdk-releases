@@ -145,6 +145,46 @@ The legacy `axl_smbios_get_string(hdr, idx)` returns UCS-2 in a
 static buffer and is kept for back-compat; new code should use the
 UTF-8 variants.
 
+### Type 11 OEM Strings — convenience accessor
+
+For the common "fetch the OEM string at index N" pattern,
+`axl_smbios_get_oem_string(idx, buf, buf_cap, *required)` walks
+every Type 11 record in firmware order, treats their strings as
+one contiguous 1-based list, and copies the requested string into
+the caller's buffer:
+
+```c
+char   product_id[64];
+size_t need = 0;
+if (axl_smbios_get_oem_string(/*1-based*/ 1, product_id,
+                              sizeof(product_id), &need) == 0) {
+    axl_printf("OEM string 1: %s\n", product_id);
+}
+```
+
+A too-small buffer returns -1 *without* copying — the call refuses
+to truncate silently. When `*required` is non-NULL it is set to
+the byte count needed (string length + NUL), letting callers
+size a follow-up allocation exactly:
+
+```c
+size_t need = 0;
+if (axl_smbios_get_oem_string(1, NULL, 0, &need) == -1 && need > 0) {
+    char *buf = axl_malloc(need);
+    axl_smbios_get_oem_string(1, buf, need, NULL);
+    /* ... */
+    axl_free(buf);
+}
+```
+
+Most platforms ship a single Type 11 record; the multi-record path
+is robustness for firmware that splits OEM strings across records.
+Other failure modes (no Type 11 record, index out of range, bad
+buffer) leave `*required` unchanged. Callers that want raw
+`(count, strings[])` arrays can still use
+`axl_smbios_read_oem_strings(hdr, *out)` after locating a header
+with `axl_smbios_find(AXL_SMBIOS_TYPE_OEM_STRINGS)`.
+
 ## Spec-Value Decoders
 
 Type 9 (System Slots) carries enumerated values for slot type, bus
@@ -166,16 +206,19 @@ if (axl_smbios_read_system_slot(h, &sl) == 0) {
 ```
 
 Unknown values return NULL so callers can fall back to printing raw
-"0x%02X". `slot_usage_str(0x05)` returns the Dell-convention
-"CPU NOT INSTALLED" string (rather than the spec's "Unavailable")
-that consumer scripts grep for.
+"0x%02X". Strings match SMBIOS 3.7 Table 12 exactly (e.g.
+`slot_usage_str(0x05)` returns "Unavailable"); vendor-specific
+renderings (e.g. an OEM that wants "CPU NOT INSTALLED" for
+socket-associated 0x05 slots) belong in consumer code, which can
+read `AxlSmbiosSystemSlot.current_usage` directly and translate.
 
 `axl_smbios_chassis_class(type)` classifies the Type 3 chassis byte
 into a coarse `AxlSmbiosChassisClass` (DESKTOP / NOTEBOOK / SERVER /
 EMBEDDED / OTHER / UNKNOWN). Two pitfalls worth knowing:
-0x18 ("Sealed-case PC") is DESKTOP, not server; 0x23 is Dell's
-"Mongoose Mini PC" convention. Vendor-specific server detection
-(sysId tables, PCI audio probes) lives in consumer code on top.
+0x18 ("Sealed-case PC") is DESKTOP, not server; 0x23 ("Mini PC" per
+SMBIOS 3.7) is EMBEDDED, not IoT Gateway. Vendor-specific server
+detection (sysId tables, PCI audio probes) lives in consumer code
+on top.
 
 ## Walking the Table
 

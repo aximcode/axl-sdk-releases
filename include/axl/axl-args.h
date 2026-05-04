@@ -143,6 +143,7 @@ typedef enum {
     AXL_ARG_U64,     ///< uint64_t
     AXL_ARG_S64,     ///< int64_t (only signed type supported)
     AXL_ARG_MULTI,   ///< Repeatable string (variadic positional, or repeatable flag)
+    AXL_ARG_CHOICE,  ///< String value restricted to a caller-supplied set
 } AxlArgType;
 
 /**
@@ -168,15 +169,32 @@ typedef enum {
  * remaining positionals" (variadic tail).
  */
 typedef struct {
-    const char *name;          ///< long name; positional arg name; lookup key
-    char        short_name;    ///< short flag (single char), 0 if none
-    AxlArgType  type;
-    const char *default_value; ///< default for flags when unset, NULL = unset
-    const char *help;          ///< one-line description (shown in --help)
-    bool        required;      ///< (positionals only) error if missing
-    int         base;          ///< (numeric types) 0 (auto) | 10 | 16
-    uint64_t    min;           ///< (numeric types) inclusive min, 0 = none
-    uint64_t    max;           ///< (numeric types) inclusive max, 0 = none
+    const char  *name;          ///< long name; positional arg name; lookup key
+    char         short_name;    ///< short flag (single char), 0 if none
+    AxlArgType   type;
+    const char  *default_value; ///< default for flags when unset, NULL = unset
+    const char  *help;          ///< one-line description (shown in --help)
+    bool         required;      ///< (positionals only) error if missing
+    int          base;          ///< (numeric types) 0 (auto) | 10 | 16
+    uint64_t     min;           ///< (numeric types) inclusive min, 0 = none
+    uint64_t     max;           ///< (numeric types) inclusive max, 0 = none
+    /// (`AXL_ARG_CHOICE` only) NULL-terminated array of allowed string
+    /// values; the framework rejects any input not present here with
+    /// the same breadcrumb-prefixed error it uses for out-of-range
+    /// numerics, and lists the choices in `--help`. Comparison is
+    /// case-sensitive by default; set @ref choices_case_insensitive
+    /// to relax. NULL or empty array makes a CHOICE behave like an
+    /// unconstrained AXL_ARG_STRING.
+    const char *const *choices;
+    /// (`AXL_ARG_CHOICE` only) when true, match against @ref choices
+    /// using ASCII case-folded comparison (`axl_strcasecmp`). Folds
+    /// letters only — non-ASCII bytes compare as bytes, so localized
+    /// or UTF-8 multi-byte choice strings still effectively match
+    /// case-sensitively. The returned string reflects the user's
+    /// original casing; only the validation step is case-insensitive.
+    /// Default false preserves the byte-equal contract earlier
+    /// consumers rely on.
+    bool               choices_case_insensitive;
 } AxlArgDesc;
 
 // ---------------------------------------------------------------------------

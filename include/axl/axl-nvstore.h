@@ -87,6 +87,34 @@ axl_nvstore_get(
 );
 
 /**
+ * @brief Read a value from non-volatile storage into a heap buffer.
+ *
+ * Like @ref axl_nvstore_get, but the buffer is allocated for you.
+ * Useful when reading variable-length blobs (NV strings, OEM
+ * settings) where the caller doesn't know the size up front and
+ * picking a fixed stack buffer either over-allocates or risks
+ * truncation. On success, @c *out_buf is a heap pointer of @c
+ * *out_size bytes that the caller frees with @ref axl_free.
+ *
+ * On failure, @c *out_buf is set to NULL and @c *out_size is set
+ * to 0. The buffer is allocated with one extra byte beyond
+ * @c *out_size and zeroed there, so callers that read string
+ * variables can dereference @c (char *)*out_buf as a NUL-terminated
+ * C string when the variable's payload doesn't already include a
+ * trailing NUL.
+ *
+ * @return 0 on success, -1 on any error (variable not found,
+ *     allocation failed, namespace not registered, etc.).
+ */
+int
+axl_nvstore_get_alloc(
+    const char  *ns,        ///< namespace (e.g., "global", "app")
+    const char  *key,       ///< variable name (UTF-8)
+    void       **out_buf,   ///< [out] heap buffer, caller frees with axl_free
+    size_t      *out_size   ///< [out] payload size in bytes (excluding the trailing NUL)
+);
+
+/**
  * @brief Write a value to non-volatile storage.
  *
  * Passing @c flags == 0 (or @c AXL_NV_VOLATILE alone) defaults to

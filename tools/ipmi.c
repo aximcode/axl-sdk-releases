@@ -184,7 +184,6 @@ cmd_probe(void)
         axl_printf("    I2C Master handle count      %zu\n",
                    p.i2c_master_handle_count);
     }
-    probe_print_proto("Dell iDRAC Interface",         p.dell_idrac_interface);
 
     axl_printf("\nSMBIOS Type 38 (IPMI Device Information):\n");
     if (!p.smbios_type38_present) {

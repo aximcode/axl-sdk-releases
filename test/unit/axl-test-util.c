@@ -493,6 +493,96 @@ test_smbios(void)
             for (uint8_t i = 0; i < oem.count; i++) {
                 test_check(oem.strings[i] != NULL, "smbios: oem string entry non-NULL");
             }
+
+            /* axl_smbios_get_oem_string convenience accessor: index 1
+               on this record matches strings[0] from the typed reader.
+               The typical use is "read string at known index" without
+               the caller hand-walking Type 11 records. */
+            if (oem.count >= 1 && oem.strings[0] != NULL) {
+                char   buf[256];
+                size_t need = 0;
+                test_check(axl_smbios_get_oem_string(1, buf, sizeof(buf),
+                                                    &need) == 0,
+                           "smbios get_oem_string: index 1 succeeds");
+                test_check(axl_strcmp(buf, oem.strings[0]) == 0,
+                           "smbios get_oem_string: index 1 matches read_oem_strings[0]");
+
+                /* Truncation contract: when buf_cap is too small the
+                   call returns -1 WITHOUT writing buf. *required is
+                   set to the byte count needed (string length + NUL)
+                   so callers can size a follow-up allocation
+                   exactly. Pin the required value against a known-
+                   capacity copy of the same string. */
+                size_t actual_len = 0;
+                while (oem.strings[0][actual_len] != '\0') actual_len++;
+                size_t required_full = actual_len + 1;
+
+                char    sentinel[4];
+                size_t  required_truncated = 0;
+                sentinel[0] = sentinel[1] = sentinel[2] = sentinel[3] = 'X';
+                /* Only meaningful if the string is longer than 3 bytes;
+                   for very short OEM strings the tiny buffer might be
+                   adequate. Gate on the actual length. */
+                if (required_full > sizeof(sentinel)) {
+                    int rc = axl_smbios_get_oem_string(1, sentinel,
+                                                       sizeof(sentinel),
+                                                       &required_truncated);
+                    test_check(rc == -1,
+                               "smbios get_oem_string: too-small buf returns -1");
+                    test_check(required_truncated == required_full,
+                               "smbios get_oem_string: *required reports needed bytes (string + NUL)");
+                    test_check(sentinel[0] == 'X' && sentinel[1] == 'X'
+                                   && sentinel[2] == 'X' && sentinel[3] == 'X',
+                               "smbios get_oem_string: too-small buf leaves caller buffer untouched");
+                } else {
+                    /* String is short enough to fit; SKIP-balance the
+                       three truncation-contract assertions. */
+                    for (int i = 0; i < 3; i++) {
+                        test_check(true, "smbios get_oem_string: SKIP balance (short string)");
+                    }
+                }
+
+                /* NULL *required is allowed even on truncation: pass
+                   a 1-byte buffer so any non-empty string forces the
+                   truncation path. The 0-length-string case (where a
+                   1-byte buffer would actually fit just the NUL) is
+                   implausible for OEM Strings but SKIP-balance it
+                   defensively. */
+                if (actual_len > 0) {
+                    test_check(axl_smbios_get_oem_string(1, sentinel, 1, NULL) == -1,
+                               "smbios get_oem_string: NULL *required tolerated on truncation");
+                } else {
+                    test_check(true,
+                               "smbios get_oem_string: NULL *required SKIP balance (empty source)");
+                }
+            }
+
+            /* Out-of-range index returns -1. Use 200 — well past any
+               realistic Type 11 string count (cap is 16/record). */
+            char obuf[64];
+            test_check(axl_smbios_get_oem_string(200, obuf, sizeof(obuf),
+                                                 NULL) == -1,
+                       "smbios get_oem_string: out-of-range index returns -1");
+
+            /* NULL / zero-cap guards. */
+            test_check(axl_smbios_get_oem_string(1, NULL, 64, NULL) == -1,
+                       "smbios get_oem_string: NULL buf rejected");
+            test_check(axl_smbios_get_oem_string(1, obuf, 0, NULL) == -1,
+                       "smbios get_oem_string: zero buf_cap rejected");
+            test_check(axl_smbios_get_oem_string(0, obuf, sizeof(obuf),
+                                                 NULL) == -1,
+                       "smbios get_oem_string: index 0 (invalid per spec) rejected");
+        } else {
+            /* No Type 11 record on this firmware: every get_oem_string
+               call returns -1. SKIP-balance the populated path's 10
+               assertions (2 success + 4 truncation + 4 misc). */
+            char buf[64];
+            test_check(axl_smbios_get_oem_string(1, buf, sizeof(buf),
+                                                 NULL) == -1,
+                       "smbios get_oem_string: returns -1 with no Type 11");
+            for (int i = 0; i < 9; i++) {
+                test_check(true, "smbios get_oem_string: SKIP balance");
+            }
         }
         AxlSmbiosOemStrings oem_bad;
         test_check(axl_smbios_read_oem_strings(bios, &oem_bad) == -1,
@@ -710,14 +800,16 @@ test_smbios(void)
         test_check(axl_smbios_slot_width_str(0xFF) == NULL,
                    "smbios: slot_width_str unknown → NULL");
 
-        /* Current usage — OEM convention "CPU NOT INSTALLED" for 0x05 */
+        /* Current usage — strings match SMBIOS 3.7 Table 12 exactly.
+         * Vendor-specific renderings (e.g. "CPU NOT INSTALLED" for
+         * socket-associated 0x05 slots) belong in consumer code. */
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x03), "Empty") == 0,
                    "smbios: slot_usage_str 0x03 = Empty");
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x04), "InUse") == 0,
                    "smbios: slot_usage_str 0x04 = InUse");
         test_check(axl_strcmp(axl_smbios_slot_usage_str(0x05),
-                              "CPU NOT INSTALLED") == 0,
-                   "smbios: slot_usage_str 0x05 = CPU NOT INSTALLED (OEM convention)");
+                              "Unavailable") == 0,
+                   "smbios: slot_usage_str 0x05 = Unavailable (per SMBIOS spec)");
         test_check(axl_smbios_slot_usage_str(0xFF) == NULL,
                    "smbios: slot_usage_str unknown → NULL");
     }
@@ -754,10 +846,9 @@ test_smbios(void)
         /* EMBEDDED set */
         test_check(axl_smbios_chassis_class(0x21) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
                    "smbios: chassis_class 0x21 (IoT Gateway) = EMBEDDED");
-        /* PITFALL: 0x23 is Mongoose Mini PC (OEM convention), NOT
-         * IoT Gateway */
+        /* PITFALL: 0x23 is "Mini PC" per SMBIOS 3.7, NOT IoT Gateway. */
         test_check(axl_smbios_chassis_class(0x23) == AXL_SMBIOS_CHASSIS_CLASS_EMBEDDED,
-                   "smbios: chassis_class 0x23 (Mongoose Mini PC) = EMBEDDED");
+                   "smbios: chassis_class 0x23 (Mini PC) = EMBEDDED");
 
         /* UNKNOWN */
         test_check(axl_smbios_chassis_class(0x00) == AXL_SMBIOS_CHASSIS_CLASS_UNKNOWN,
@@ -2019,6 +2110,73 @@ test_nvstore_roundtrip(void)
     test_check(iter_rc == 0, "nvstore: iter completes");
     test_check(ctx.matches >= 1, "nvstore: iter finds at least one key");
 
+    /* axl_nvstore_get_alloc — heap-allocated read variant.
+       Allocation succeeds, payload matches, byte one past the
+       payload is zeroed (the NUL-extension guarantee callers can
+       lean on for string variables). */
+    void   *abuf = (void *)0xDEADBEEFul;  /* deliberate sentinel */
+    size_t  asz  = 99;
+    test_check(axl_nvstore_get_alloc("app", key, &abuf, &asz) == 0,
+               "nvstore get_alloc: succeeds on existing key");
+    test_check(asz == sizeof(data),
+               "nvstore get_alloc: out_size matches written payload");
+    if (asz == sizeof(data) && abuf != NULL) {
+        test_check(axl_memcmp(abuf, data, sizeof(data)) == 0,
+                   "nvstore get_alloc: out_buf matches written payload");
+        test_check(((uint8_t *)abuf)[asz] == 0,
+                   "nvstore get_alloc: byte past payload zero-extended");
+    }
+    axl_free(abuf);
+
+    /* NULL-arg guards. */
+    void   *xbuf = (void *)0x1234ul;
+    size_t  xsz  = 7;
+    test_check(axl_nvstore_get_alloc(NULL, key, &xbuf, &xsz) == -1,
+               "nvstore get_alloc: NULL ns rejected");
+    test_check(axl_nvstore_get_alloc("app", NULL, &xbuf, &xsz) == -1,
+               "nvstore get_alloc: NULL key rejected");
+    test_check(axl_nvstore_get_alloc("app", key, NULL, &xsz) == -1,
+               "nvstore get_alloc: NULL out_buf rejected");
+    test_check(axl_nvstore_get_alloc("app", key, &xbuf, NULL) == -1,
+               "nvstore get_alloc: NULL out_size rejected");
+
+    /* Missing-key path: out_buf cleared to NULL, out_size cleared
+       to 0, return -1. */
+    void   *mbuf = (void *)0xC0DEul;
+    size_t  msz  = 42;
+    test_check(axl_nvstore_get_alloc("app", "AxlNoSuchKey", &mbuf, &msz) == -1,
+               "nvstore get_alloc: missing key returns -1");
+    test_check(mbuf == NULL && msz == 0,
+               "nvstore get_alloc: out params cleared on failure");
+
+    /* Empty-variable round-trip: 0-byte SetVariable → get_alloc
+       must succeed (legitimate empty value, not "missing"), with
+       out_size==0 and out_buf non-NULL pointing at a single NUL.
+       Regression for the prior probe that conflated 0-byte success
+       with NOT_FOUND. */
+    const char *empty_key = "AxlTestKeyEmpty";
+    int empty_set_rc = axl_nvstore_set("app", empty_key, NULL, 0,
+                                       AXL_NV_PERSISTENT | AXL_NV_BOOT);
+    if (empty_set_rc == 0) {
+        void   *ebuf = (void *)0x55ul;
+        size_t  esz  = 99;
+        int rc_e = axl_nvstore_get_alloc("app", empty_key, &ebuf, &esz);
+        test_check(rc_e == 0,
+                   "nvstore get_alloc: 0-byte variable succeeds (not NOT_FOUND)");
+        test_check(esz == 0,
+                   "nvstore get_alloc: 0-byte variable reports size 0");
+        test_check(ebuf != NULL && ((uint8_t *)ebuf)[0] == 0,
+                   "nvstore get_alloc: 0-byte variable returns 1-byte NUL buffer");
+        axl_free(ebuf);
+        (void)axl_nvstore_delete("app", empty_key);
+    } else {
+        /* Some firmware reject zero-byte SetVariable. SKIP-balance
+           the three populated-path assertions. */
+        for (int i = 0; i < 3; i++) {
+            test_check(true, "nvstore get_alloc empty: SKIP balance");
+        }
+    }
+
     /* Delete + verify gone. */
     test_check(axl_nvstore_delete("app", key) == 0,
                "nvstore: delete succeeds");
@@ -2233,11 +2391,44 @@ args_single_handler(AxlArgs *a)
     return 7;
 }
 
+/* Dedicated capture for the CHOICE positional — reads the named
+   "field" positional via axl_args_get_string so the test can pin
+   the exact value that landed in the handler. */
+static int
+args_field_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_string = axl_args_get_string(a, "field");
+    return 7;
+}
+
 static const AxlArgDesc slot_pos[] = {
     { .name = "slot", .type = AXL_ARG_U8, .base = 0,
       .min = 0x50, .max = 0x57, .required = true, .help = "test slot" },
     {0}
 };
+
+static const char *const args_choice_choices[] = {
+    "noHdds", "riserCfg", "delRiser", NULL
+};
+static const AxlArgDesc field_pos[] = {
+    { .name = "field", .type = AXL_ARG_CHOICE, .required = false,
+      .choices = args_choice_choices,
+      .default_value = "noHdds",
+      .help = "field selector" },
+    {0}
+};
+
+static const AxlArgDesc field_ci_pos[] = {
+    { .name = "field", .type = AXL_ARG_CHOICE, .required = false,
+      .choices = args_choice_choices,
+      .choices_case_insensitive = true,
+      .default_value = "noHdds",
+      .help = "field selector (case-insensitive)" },
+    {0}
+};
+
 static const AxlArgDesc args_flags[] = {
     { .name = "jedec-file", .short_name = 'j', .type = AXL_ARG_STRING,
       .help = "test sidecar" },
@@ -2249,6 +2440,11 @@ static const AxlArgsNode args_verbs[] = {
     { .name = "list", .handler = args_verb_list, .help = "list" },
     { .name = "show", .handler = args_verb_show, .positionals = slot_pos,
       .help = "show one slot" },
+    { .name = "field", .handler = args_field_handler, .positionals = field_pos,
+      .help = "exercise CHOICE positional" },
+    { .name = "field-ci", .handler = args_field_handler,
+      .positionals = field_ci_pos,
+      .help = "exercise case-insensitive CHOICE positional" },
     {0}
 };
 
@@ -2333,6 +2529,122 @@ test_args_missing_required_positional(void)
     int rc = run_args(&cap, 2, argv);
     test_check(rc != 0, "args: missing required positional rejected");
     test_check(cap.calls == 0, "args: handler did not run on missing arg");
+}
+
+static void
+test_args_choice_positional(void)
+{
+    /* Valid choice — handler runs, named-positional value reaches it
+       via axl_args_get_string. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"field", (char *)"riserCfg" };
+        int rc = run_args(&cap, 3, argv);
+        test_check(rc == 7,
+                   "args choice: valid value dispatches to handler");
+        test_check(cap.calls == 1,
+                   "args choice: handler ran exactly once");
+        test_check(cap.seen_string != NULL
+                       && axl_strcmp(cap.seen_string, "riserCfg") == 0,
+                   "args choice: positional value reaches handler");
+    }
+
+    /* Bad choice — rejected before handler runs. The error message
+       contains "is not one of:" plus the choice list; we don't pin
+       the exact text (it's user-facing) but verify the rejection
+       reaches the framework, not the handler. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"field", (char *)"banana" };
+        int rc = run_args(&cap, 3, argv);
+        test_check(rc != 0,
+                   "args choice: invalid value rejected at parse time");
+        test_check(cap.calls == 0,
+                   "args choice: handler did NOT run on invalid value");
+    }
+
+    /* Optional CHOICE positional with default — omitted argument is
+       fine; handler runs with the defaulted value. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"field" };
+        int rc = run_args(&cap, 2, argv);
+        test_check(rc == 7,
+                   "args choice: omitted optional positional dispatches");
+        test_check(cap.calls == 1,
+                   "args choice: handler ran with defaulted value");
+    }
+
+    /* Boundary: first and last entries in the choice list. Each is
+       valid in its own right — catches any off-by-one in the
+       NULL-terminator walk. */
+    {
+        ArgsCapture cap1 = { 0 };
+        char *argv1[] = { (char *)"argstest", (char *)"field", (char *)"noHdds" };
+        test_check(run_args(&cap1, 3, argv1) == 7 && cap1.calls == 1,
+                   "args choice: first list entry accepted");
+
+        ArgsCapture cap3 = { 0 };
+        char *argv3[] = { (char *)"argstest", (char *)"field", (char *)"delRiser" };
+        test_check(run_args(&cap3, 3, argv3) == 7 && cap3.calls == 1,
+                   "args choice: last list entry accepted");
+    }
+
+    /* Default case-sensitivity: a wrong-case input must be rejected
+       on the standard `field` verb. Pin the negative path so a
+       future change that flipped the default would fail. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"field", (char *)"NOHDDS" };
+        int rc = run_args(&cap, 3, argv);
+        test_check(rc != 0 && cap.calls == 0,
+                   "args choice: default mode rejects wrong-case input");
+    }
+
+    /* choices_case_insensitive=true on the `field-ci` verb accepts
+       upper-case, mixed-case, and lower-case spellings of any
+       canonical entry; rejects entries that aren't in the list. */
+    {
+        const struct {
+            const char *input;
+            int         expected_rc;
+            const char *label;
+        } cases[] = {
+            { "noHdds",   7, "args choice ci: canonical case accepted" },
+            { "NOHDDS",   7, "args choice ci: upper-case accepted" },
+            { "nohdds",   7, "args choice ci: lower-case accepted" },
+            { "RisErCfG", 7, "args choice ci: mixed-case accepted" },
+            { "delriser", 7, "args choice ci: lower-case last entry accepted" },
+            { "banana",   1, "args choice ci: out-of-list rejected" },
+            { "noHdd",    1, "args choice ci: prefix rejected (exact-match contract preserved)" },
+            { "noHddsx",  1, "args choice ci: extra-char rejected" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            ArgsCapture cap = { 0 };
+            char *argv[] = {
+                (char *)"argstest", (char *)"field-ci", (char *)cases[i].input
+            };
+            int rc = run_args(&cap, 3, argv);
+            bool got_handler = (cap.calls == 1);
+            bool ok;
+            if (cases[i].expected_rc == 7) {
+                ok = (rc == 7) && got_handler;
+            } else {
+                ok = (rc != 0) && !got_handler;
+            }
+            test_check(ok, cases[i].label);
+        }
+
+        /* Captured value retains the user's original casing (we
+           validate case-insensitively but don't rewrite). Confirm
+           "RisErCfG" reaches the handler verbatim. */
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"field-ci", (char *)"RisErCfG" };
+        run_args(&cap, 3, argv);
+        test_check(cap.seen_string != NULL
+                       && axl_strcmp(cap.seen_string, "RisErCfG") == 0,
+                   "args choice ci: handler sees user's original casing");
+    }
 }
 
 static void
@@ -2909,6 +3221,7 @@ test_args(void)
     test_args_bool_flag_presence();
     test_args_typed_positional_bounds();
     test_args_missing_required_positional();
+    test_args_choice_positional();
     test_args_unknown_verb();
     test_args_global_flag_before_verb_survives_attach();
     test_args_help_word_only_pre_verb();

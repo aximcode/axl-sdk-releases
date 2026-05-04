@@ -38,6 +38,27 @@ axl_printf("Hello %s, value=%d\n", name, 42);
 axl_printerr("Error: %s\n", msg);  // writes to ConErr
 ```
 
+### Tee (`-o:<file>` log support)
+
+`axl_stream_set_stdout_tee` installs an additional stream that
+receives every byte written to `axl_stdout` — `axl_print`,
+`axl_printf`, direct `axl_write(axl_stdout, ...)`. Pass NULL to
+clear; multiple calls replace the previous tee with no chaining.
+The caller owns the tee stream and is responsible for closing it
+(typical pairing: `axl_atexit`):
+
+```c
+AxlStream *log = axl_fopen("fs0:\\app.log", "a");
+axl_stream_set_stdout_tee(log);
+axl_atexit(close_log_stream, log);
+
+axl_printf("greet %s\n", who);   /* lands in the console AND log */
+```
+
+A symmetric `axl_stream_set_stderr_tee` covers `axl_printerr`.
+Tee write errors are swallowed — a broken log file must not break
+the primary console.
+
 ## File Read/Write
 
 The simplest way to read or write files:

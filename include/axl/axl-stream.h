@@ -90,6 +90,58 @@ extern AxlStream *axl_stdout_raw;
 void
 axl_stream_init(void);
 
+/**
+ * @brief Tee subsequent writes to @p extra alongside the console.
+ *
+ * After this call, every byte written to @ref axl_stdout via
+ * `axl_print`, `axl_printf`, `axl_fprintf(axl_stdout, ...)`, or
+ * direct `axl_write(axl_stdout, ...)` is also written to @p extra.
+ * Pass NULL to clear an active tee. Multiple calls replace the
+ * previous tee — there is no chain (the @p extra stream's own
+ * `tee` field is intentionally ignored, so an accidental loop
+ * just double-writes once instead of recursing).
+ *
+ * Lifetime: the caller owns @p extra and is responsible for
+ * closing it. axl-sdk does not close the tee on exit. The typical
+ * idiom for a `-o:<file>` log option is:
+ *
+ * @code
+ * AxlStream *log = axl_fopen(path, "a");
+ * axl_stream_set_stdout_tee(log);
+ * axl_atexit(close_log_stream, log);
+ * @endcode
+ *
+ * The tee target is written with the same UTF-8 caller bytes
+ * passed to `axl_write` — NOT the post-transcode wire bytes the
+ * source produced. If the tee target itself has a non-UTF-8
+ * encoding set via @ref axl_stream_set_encoding, the tee
+ * transcodes those caller bytes through its own encoding on the
+ * way out (so a UTF-8 source teeing to a UCS-2-LE log file
+ * produces a UCS-2-LE log file, not a UTF-8 one).
+ *
+ * If the primary write fails (returns -1), the tee still fires
+ * with the caller bytes — log-on-best-effort. A broken primary
+ * console must not cost you the log.
+ *
+ * @return 0 on success, -1 if axl_stdout isn't initialized.
+ */
+int
+axl_stream_set_stdout_tee(
+    AxlStream *extra   ///< stream to tee to (NULL clears)
+);
+
+/**
+ * @brief Tee subsequent writes to @p extra alongside the stderr console.
+ *
+ * Symmetric to @ref axl_stream_set_stdout_tee but for axl_stderr.
+ *
+ * @return 0 on success, -1 if axl_stderr isn't initialized.
+ */
+int
+axl_stream_set_stderr_tee(
+    AxlStream *extra   ///< stream to tee to (NULL clears)
+);
+
 // ---------------------------------------------------------------------------
 // Layer 1: Simple console helpers (GLib-style)
 // ---------------------------------------------------------------------------

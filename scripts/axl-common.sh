@@ -405,3 +405,70 @@ find_shell_efi() {
     echo "$cached"
     return 0
 }
+
+# --------------------------------------------------------------------------
+# Test-log section assertions
+#
+# UEFI nsh-driven QEMU tests typically run several commands per boot and
+# pipe the entire serial console into one log. A whole-log grep can't tell
+# whether the matched line came from the right command, which makes
+# strict assertions fragile.
+#
+# The convention is to bracket each command's output with a marker line
+# (`echo "=== <SECTION> ==="`) before invoking it. assert_in_section then
+# slices the log between that marker and the next "===" marker — so the
+# assertion only sees the output of the targeted command.
+#
+# Usage:
+#   assert_in_section LABEL SECTION_MARKER PATTERN
+#     LABEL          short tag printed in PASS/FAIL output
+#     SECTION_MARKER text after "=== " on the marker line (e.g. "memspd list")
+#     PATTERN        ERE pattern grepped against the slice
+#
+# The log path is taken from the global $LOG variable. Existing scripts
+# in test/integration/ use $TEST_CLEAN_LOG (set by test_clean_log) for
+# the same purpose; assert_in_section falls back to that if $LOG isn't
+# set, so callers can use either convention without an explicit alias.
+# Returns 0 on a hit, 1 on miss; prints PASS / FAIL line in the same
+# shape the existing test-runner uses so a containing script's
+# fail-counter increment works the same way.
+# --------------------------------------------------------------------------
+
+assert_in_section() {
+    local label="$1"
+    local section="$2"
+    local pattern="$3"
+
+    local log="${LOG:-${TEST_CLEAN_LOG:-}}"
+    if [[ -z "$log" ]]; then
+        echo "FAIL: $label  (\$LOG / \$TEST_CLEAN_LOG global not set; assert_in_section needs one)"
+        return 1
+    fi
+    if [[ ! -f "$log" ]]; then
+        echo "FAIL: $label  (log file '$log' not found)"
+        return 1
+    fi
+
+    # Slice from the section's "=== <section> ===" line, exclusive of
+    # the line itself, up to the next line starting with "===" (any
+    # text after). awk emits everything strictly between the two
+    # markers, so the slice is just that command's output.
+    local slice
+    slice=$(awk -v want="=== $section ===" '
+        $0 == want                  { in_section = 1; next }
+        in_section && /^=== /        { in_section = 0 }
+        in_section                   { print }
+    ' "$log")
+
+    if [[ -z "$slice" ]]; then
+        echo "FAIL: $label  (section '=== $section ===' not found in $log)"
+        return 1
+    fi
+
+    if echo "$slice" | grep -qE -- "$pattern"; then
+        echo "PASS: $label"
+        return 0
+    fi
+    echo "FAIL: $label  (pattern not in section '$section': $pattern)"
+    return 1
+}

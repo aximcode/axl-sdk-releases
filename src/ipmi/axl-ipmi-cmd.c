@@ -41,6 +41,7 @@ AXL_LOG_DOMAIN("ipmi-cmd");
 // Chassis
 #define CMD_GET_CHASSIS_STATUS    0x01
 #define CMD_CHASSIS_CONTROL       0x02
+#define CMD_CHASSIS_IDENTIFY      0x04
 
 // Sensor
 #define CMD_GET_SENSOR_READING    0x2D
@@ -245,6 +246,30 @@ axl_ipmi_chassis_control(AxlIpmiSession *session,
     size_t   payload;
     return send_and_check(session, IPMI_NETFN_CHASSIS, CMD_CHASSIS_CONTROL,
                           &req, 1, resp, sizeof(resp), &payload);
+}
+
+int
+axl_ipmi_chassis_identify(AxlIpmiSession *session,
+                          uint8_t        interval_sec,
+                          bool           force_on)
+{
+    /* Spec 28.5: byte 0 = interval, byte 1 (optional) = bit-0 force-on
+       flag. We always send byte 0 and append byte 1 only when the
+       caller wants force-on, so a BMC that doesn't implement byte 1
+       sees the simpler request and runs the timed-identify path. */
+    uint8_t  req[2];
+    size_t   req_len;
+    req[0] = interval_sec;
+    if (force_on) {
+        req[1]  = 0x01;
+        req_len = 2;
+    } else {
+        req_len = 1;
+    }
+    uint8_t  resp[1];
+    size_t   payload;
+    return send_and_check(session, IPMI_NETFN_CHASSIS, CMD_CHASSIS_IDENTIFY,
+                          req, req_len, resp, sizeof(resp), &payload);
 }
 
 // ---------------------------------------------------------------------------
