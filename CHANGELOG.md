@@ -3,6 +3,21 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.13.1 — 2026-05-06
+
+### Fixed
+
+- **CI clang-tidy dead-store flags** in `src/net/axl-tcp-sync.c`
+  (`tcp_find_service_binding`). A newer clang-tidy on the GitHub
+  Actions runners flagged two `chosen_rank = N` assignments
+  followed by unconditional `break` in the loop, with the var
+  never read after the loop — same code passed CI on v0.12.0.
+  Behavior unchanged; the conceptual rank scheme is preserved as
+  comments at the corresponding sites. v0.13.0's tagged commit
+  has a red CI for this reason despite all release artifacts
+  shipping correctly. v0.13.1 restores green-CI on the release
+  tag.
+
 ## 0.13.0 — 2026-05-06
 
 ### Added

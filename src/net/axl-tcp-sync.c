@@ -133,10 +133,12 @@ tcp_find_service_binding(
 
         if (forced_source != NULL) {
             /* Pinned-source mode: must exactly match. Anything else
-               is ineligible. */
+               is ineligible. The conceptual "rank 3" doesn't need to
+               be written to chosen_rank because we break immediately
+               and the var isn't read after the loop — clang-tidy
+               flags the assignment as a dead-store. */
             if (axl_ipv4_equals(station.Addr, forced_source->Addr)) {
-                chosen      = handles[i];
-                chosen_rank = 3;
+                chosen = handles[i];
                 break;
             }
             continue;
@@ -150,12 +152,11 @@ tcp_find_service_binding(
 
         if (dest != NULL && axl_ipv4_in_subnet(dest->Addr, station.Addr, mask.Addr)) {
             if (chosen_rank < 2) {
-                chosen      = handles[i];
-                chosen_rank = 2;
-                /* Don't break — a later handle could still produce a
-                   better tie with the same destination subnet, but
-                   subnet-match is the strongest auto signal we have,
-                   so first match wins. */
+                chosen = handles[i];
+                /* "Rank 2" — subnet-match is the strongest auto
+                   signal; first match wins. break is unconditional
+                   so chosen_rank doesn't need updating (dead-store
+                   per clang-tidy). */
                 break;
             }
         }
