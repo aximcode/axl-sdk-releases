@@ -3,6 +3,141 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.13.0 — 2026-05-06
+
+### Added
+
+- **AxlSmbus PIIX4 direct-I/O backend** (`src/smbus/axl-smbus-piix4.c`) —
+  third transport alongside EFI_SMBUS_HC and EFI_I2C_MASTER. Targets
+  the AMD FCH SMBus controller (1022:790b family) when the firmware
+  declines to expose it via the standard EFI protocols. Mirrors
+  Linux's `i2c_piix4` algorithm split: SMBSLVCNT IMC arbitration on
+  the MAIN controller, plain access on the AUX. New transport enum
+  `AXL_SMBUS_TRANSPORT_PIIX4`. Walker integration in
+  `axl_smbus_new_with_probe` and `axl_smbus_visit_all`.
+
+- **New AxlSmbus public APIs**:
+  - `axl_smbus_describe(s)` — per-instance human-readable identity
+    (e.g. "AMD FCH PIIX4 AUX port 1 at 0xB20"). Filled by each
+    backend at session-open time.
+  - `axl_smbus_quick(s, slave, is_read)` — SMBus QUICK protocol
+    (address+R/W ACK probe, no command, no data). Linux's
+    `i2cdetect` default mode.
+  - `axl_smbus_receive_byte(s, slave, *out)` — SMBus Receive Byte
+    (read 1 byte, no command). The safer EEPROM-area probe Linux's
+    i2cdetect uses for 0x30..0x37 + 0x50..0x5F.
+
+- **`tools/i2c.efi`** — Linux `i2c-tools`-style explorer over
+  AxlSmbus. Verbs: `list`, `probe`, `get`, `set`, `dump`. AUTO mode
+  matches Linux i2cdetect's per-address mode selection (QUICK
+  default, Receive Byte for EEPROM-prone ranges).
+
+- **JEDEC SPD5118 hub protocol** for DDR5 SPDs — modeled byte-for-
+  byte on Linux's `drivers/hwmon/spd5118.c`. Identifies hubs via
+  MR0:MR1=0x18:0x51 device-ID check, preserves the addr-mode bit
+  on every page-select, caches the current page across reads, and
+  implements the Renesas/ITD stuck-page recovery dance. Replaces
+  the prior "blind write MR11=0 then read at 0x80" probe which
+  silently mis-attributed any responder at 0x50..0x57.
+
+- **`AXL_LOG_LEVEL` env var + `axl_log_init_from_env()`** — Glib-
+  style log filter with per-domain syntax (`smbus:debug,net:info`,
+  wildcard `*:warn,smbus:debug`, aliases `all` / `off`).
+  Case-insensitive level keywords. Lazy init at every entry point
+  that observes levels (both log-emission paths plus both
+  setter functions). RUST_LOG precedence: env is the baseline,
+  programmatic `axl_log_set_level` / `axl_log_set_domain_level`
+  calls win.
+
+- **`AXL_DIAG` env var** — gates `axl_diag_startup`'s cross-tool
+  startup-diagnostic dump (SDK / arch / protocols / handles).
+  Tools call the function unconditionally; it self-gates on the
+  env var. Frees the `-v` short flag across tools to carry
+  Linux-counterpart semantics.
+
+### Changed
+
+- **AxlSpd codec dispatch** now identifies SPD5118 hubs by reading
+  MR0:MR1 first, falling through to the legacy "byte-2 mem-type"
+  heuristic only when the device-ID doesn't match. Fixes a long-
+  standing mis-route where DDR5 hubs took the unknown-codec branch
+  because register 2 on a hub is MR2 (revision), not the SPD
+  memory-type byte (which lives at content offset 2 = register
+  0x82 after page-select).
+
+- **AxlSpd / memspd platform limitations documented** at three
+  layers (`<axl/axl-spd.h>` API doc, `src/spd/README.md`,
+  `tools/memspd.c` help text). Empirically verified on UEFI AND
+  on Linux from kernel context (kernel 6.19.10, spd5118 driver
+  fails to bind on the same hardware): AMD FCH AUX controller
+  exhibits the false-ACK + zero-data quirk Linux warns about in
+  `drivers/i2c/busses/i2c-piix4.c` lines 968-974. On affected
+  platforms callers fall back to SMBIOS Type 17 — same data
+  source `dmidecode -t 17` exposes.
+
+- **`grep -v` now means INVERT MATCH** — Linux grep semantics. The
+  prior unused boolean labelled "Verbose output" is gone; the old
+  `--verbose` long form moved to `--show-progress` (no short
+  alias). **Breaking** for any script that used `grep -v`
+  expecting the no-op verbose behavior.
+
+- **`cat -v` shows non-printing characters** — Linux `cat -v` /
+  `--show-nonprinting` semantics. Standalone `-v` doesn't enable
+  `-E` or `-T` (the existing `-A` meta still bundles all three).
+
+- **`lsusb --debug` and `lspci --debug` removed.** Both forced
+  `axl_log_set_level(AXL_LOG_DEBUG)`. Use `AXL_LOG_LEVEL=debug` —
+  or per-domain `usb:debug` / `pci:debug` — instead.
+
+- **`memspd --verbose` removed entirely.** It was only a trigger
+  for `axl_diag_startup`. Use `set AXL_DIAG 1` instead.
+
+- **`mkrd --verbose` simplified** — no longer overrides log level
+  or unconditionally calls `axl_diag_startup`. The flag still
+  triggers the mkrd-specific `EFI_RAM_DISK_PROTOCOL` probe.
+
+- **`netinfo --verbose` no longer overrides log level.** Tool-
+  specific richer-payload behavior still works the same way.
+
+- **`share/pci-ids.json5` is now the single PCI sidecar** — schema 2
+  hierarchical, with two top-level sections: `vendors[]` (vendor /
+  device / subsystem) and `classes[]` (base / subclass / progIF).
+  Both `axl_pci_ids_load` and `axl_pci_class_load` consume this
+  file; each ignores the section it doesn't care about. Closes the
+  convention gap that left `pci-class.json5` at schema 1 (flat)
+  while `pci-ids.json5` had moved to schema 2 (hierarchical).
+
+- **`share/pci-class.json5` removed.** Class data lives in
+  `pci-ids.json5`'s `classes[]` section now. Consumers that passed
+  `"pci-class.json5"` via `override_path` need to repoint at
+  `pci-ids.json5`. Auto-discovery callers see no behavior change —
+  same lookup semantics, single canonical filename.
+
+- **`scripts/pci-ids-to-json5.py` simplified** — `--schema 2`
+  (default) emits the unified file in one pass (vendors + classes,
+  both hierarchical). Drops `--unified` (now redundant) and
+  `--emit-class` (the separate file is no longer generated).
+  `--schema 1` retained as a back-compat path for the legacy flat
+  vendors-only layout.
+
+### Added
+
+- **Schema 2 hierarchical class layout** in
+  `<axl/axl-pci.h>`'s sidecar contract — `classes: [{ base, name,
+  subclasses: [{ sub, name, progs: [{ prog, name }] }] }]`. The
+  loader (`src/pci/axl-pci-class.c`) accepts both schema 1
+  (legacy flat) and schema 2 (hierarchical) and routes both into
+  the same composite-key hash tables, so lookups are
+  layout-agnostic.
+
+### Tests
+
+- Schema 2 hierarchical class parser coverage in
+  `axl-test-platform.c` — fixtures exercising the v1 → v2 result
+  equivalence (same data, both layouts, same query results),
+  nameless-base parent nodes, and schema-99 rejection. +10 tests
+  (2555 → 2565 both arches).
+
 ## 0.12.0 — 2026-05-04
 
 ### Added

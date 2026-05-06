@@ -80,17 +80,16 @@ process_chunked_data(
         }
 
         //
-        // Parse hex chunk size
+        // Parse hex chunk size. axl_hex_parse_u64 stops at the first
+        // non-hex byte, which covers both chunk-extensions (`;...`)
+        // and an empty line — both are treated as end-of-size here.
         //
-        size_t chunk_size = 0;
-        for (size_t i = line_start; i < line_end; i++) {
-            char ch = buf[i];
-            int  v  = axl_hex_nibble(ch);
-            if (v >= 0) {
-                chunk_size = chunk_size * 16 + (size_t)v;
-            } else if (ch == ';') {
-                break;  // chunk extensions — ignore
-            }
+        uint64_t parsed_size = 0;
+        size_t   chunk_size  = 0;
+        if (axl_hex_parse_u64(buf + line_start,
+                              line_end - line_start,
+                              &parsed_size) >= 0) {
+            chunk_size = (size_t)parsed_size;
         }
 
         pos = line_end + 2;  // skip \r\n after size line

@@ -39,6 +39,7 @@
 
 #include "../backend/axl-backend.h"
 #include <axl/axl-array.h>
+#include <axl/axl-atexit.h>
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -81,6 +82,34 @@ typedef struct {
 static bool      init_done;
 static bool      init_failed;
 static AxlArray *entries;          /* AxlArray<Entry> */
+
+/* atexit cleanup. The entries array is process-lifetime by design (so
+   cursors stay valid across arbitrary calls), but lsusb-style tools
+   exit the app and AxlMem's leak detector then flags every owned
+   buffer + the array itself. Free explicitly at exit so the leak
+   report stays clean on real hardware (~2.7KB on a typical OEM server with
+   16+ USB devices). */
+static void
+cleanup_entries(void *unused)
+{
+    (void)unused;
+    if (entries == NULL) {
+        return;
+    }
+    size_t n = axl_array_len(entries);
+    for (size_t i = 0; i < n; i++) {
+        Entry *e = (Entry *)axl_array_get(entries, i);
+        /* bus_key and dev_key are LITERALLY the same pointer
+           (different `*_len` views into the same axl_memdup'd
+           buffer) — see ingest_handle. Free once via either alias. */
+        if (e != NULL && e->bus_key != NULL) {
+            axl_free((void *)e->bus_key);
+        }
+    }
+    axl_array_free(entries);
+    entries = NULL;
+    init_done = false;
+}
 
 /* Cursor returned to callers. Storage is reused across calls; passing
    any pointer other than &cursor restarts the walk (see header). */
@@ -395,6 +424,7 @@ ensure_init(
         init_failed = true;
         return -1;
     }
+    axl_atexit(cleanup_entries, NULL);
 
     EFI_HANDLE *handles      = NULL;
     size_t      handle_count = 0;
@@ -480,6 +510,50 @@ find_entry(
         }
     }
     return NULL;
+}
+
+int
+axl_usb_control_transfer(
+    AxlUsbAddr      addr,
+    uint8_t         request_type,
+    uint8_t         request,
+    uint16_t        value,
+    uint16_t        index,
+    AxlUsbDataDir   direction,
+    uint32_t        timeout_ms,
+    void           *data,
+    size_t          data_len
+    )
+{
+    if (ensure_init() != 0) {
+        return AXL_ERR;
+    }
+    Entry *e = find_entry(addr);
+    if (e == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_USB_DEVICE_REQUEST req = {
+        .RequestType = request_type,
+        .Request     = request,
+        .Value       = value,
+        .Index       = index,
+        .Length      = (UINT16)data_len,
+    };
+    UINT32     usb_status = 0;
+    EFI_STATUS status     = axl_efi_call(
+        e->io->UsbControlTransfer, 7,
+        e->io,
+        &req,
+        (EFI_USB_DATA_DIRECTION)direction,
+        (UINT32)timeout_ms,
+        data,
+        (UINTN)data_len,
+        &usb_status);
+    if (EFI_ERROR(status) || usb_status != 0) {
+        return AXL_ERR;
+    }
+    return AXL_OK;
 }
 
 int

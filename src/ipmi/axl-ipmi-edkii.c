@@ -100,7 +100,7 @@ axl_ipmi_edkii_open(AxlIpmiTransportOps *ops)
     // stub/broken IpmiSubmitCommand is otherwise indistinguishable
     // from a working one; without this probe, auto-detect would
     // pick EDKII and then every subsequent command would fail, with
-    // no fallback to Dell/SMBIOS/default-KCS.
+    // no fallback to vendor/SMBIOS/default-KCS.
     //
     // Probe cost: one IPMI round-trip on the happy path (~10-100ms).
     // Paid once per axl_ipmi_session_new(), which callers generally

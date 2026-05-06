@@ -31,7 +31,7 @@ mirror:
    (v1 flat / v2 hierarchical), parse helpers, singleton shim.
 3. `src/pci/axl-pci-class.c` — overlay sidecar pattern (compiled-in
    tables + optional JSON5 overlay).
-4. `share/pci-ids.json5` + `share/pci-class.json5` — JSON5 sidecar
+4. `share/pci-ids.json5` JSON5 sidecar
    shape (schema field is REQUIRED).
 5. `scripts/pci-ids-to-json5.py` — bulk conversion tool with
    `--self-test`, `--schema`, `--vendors-only`, `--emit-class FILE`.

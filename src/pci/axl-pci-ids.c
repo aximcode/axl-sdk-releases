@@ -571,6 +571,10 @@ axl_pci_ids_load(
     const char  *override_path
     )
 {
+    /* Autodiscovery looks for share/pci-ids.json5 (companion to the
+       running .efi or in cwd). The file may carry both vendors[] and
+       classes[] sections; this loader consumes only vendors[].
+       axl_pci_class_load reads classes[] from the same path. */
     return _axl_sidecar_singleton_load(
         &g_singleton, &g_atexit_handle, &g_atexit_ctx,
         override_path, "pci-ids.json5",

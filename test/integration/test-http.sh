@@ -491,6 +491,35 @@ BODY=$(echo "$RESP" | sed '$d')
 [[ "$CODE" == "200" ]] && pass "client-test 404 proxy returns 200" || fail "client-test 404 proxy (got $CODE)"
 echo "$BODY" | grep -q '"client_status":404' && pass "AxlHttpGet sees 404 from host" || fail "AxlHttpGet didn't see 404 (body: $BODY)"
 
+# Client GET — Transfer-Encoding: chunked. Host emits two body chunks
+# (0xb + 0x9 = 0x14 = 20 bytes total) plus terminator. Decoded body must
+# be the exact concatenation "hello-chunk-second!!".
+RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == "200" ]] && pass "client-test chunked proxy returns 200" || fail "client-test chunked proxy (got $CODE)"
+echo "$BODY" | grep -q '"client_status":200' && pass "AxlHttpGet got 200 from chunked host" || fail "AxlHttpGet wrong status from chunked (body: $BODY)"
+echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet decoded chunked body size=20" || fail "AxlHttpGet chunked body size (body: $BODY)"
+echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked body bytes" || fail "AxlHttpGet chunked body bytes (body: $BODY)"
+
+# Client GET — chunked with chunk extensions (`b;name=foo`) and a
+# trailer header (`X-Trace`). Real servers emit these in production.
+RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked-ext")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == "200" ]] && pass "client-test chunked-ext proxy returns 200" || fail "client-test chunked-ext proxy (got $CODE)"
+echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet ignores chunk extensions" || fail "AxlHttpGet chunked-ext body size (body: $BODY)"
+echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked-ext body bytes" || fail "AxlHttpGet chunked-ext body bytes (body: $BODY)"
+
+# Client GET — both Content-Length and Transfer-Encoding: chunked.
+# RFC 7230 §3.3.3: chunked wins, the bogus Content-Length is ignored.
+RESP=$(http_get "/client-test?url=http://10.0.2.2:${HOST_SERVER_PORT}/chunked-with-cl")
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == "200" ]] && pass "client-test chunked+CL proxy returns 200" || fail "client-test chunked+CL proxy (got $CODE)"
+echo "$BODY" | grep -q '"client_body_size":20' && pass "AxlHttpGet prefers chunked over Content-Length" || fail "AxlHttpGet chunked+CL body size (body: $BODY)"
+echo "$BODY" | grep -q '"client_body":"hello-chunk-second!!"' && pass "AxlHttpGet decoded chunked+CL body bytes" || fail "AxlHttpGet chunked+CL body bytes (body: $BODY)"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed ($TEST_ARCH)"
 [[ $FAIL -eq 0 && $PASS -gt 0 ]] && exit 0 || exit 1

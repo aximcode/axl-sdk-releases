@@ -47,7 +47,8 @@ typedef struct AxlSmbus AxlSmbus;
 typedef enum {
     AXL_SMBUS_TRANSPORT_UNKNOWN = 0,  ///< No controller available
     AXL_SMBUS_TRANSPORT_HC,           ///< EFI_SMBUS_HC_PROTOCOL
-    AXL_SMBUS_TRANSPORT_I2C           ///< EFI_I2C_MASTER_PROTOCOL (framed here)
+    AXL_SMBUS_TRANSPORT_I2C,          ///< EFI_I2C_MASTER_PROTOCOL (framed here)
+    AXL_SMBUS_TRANSPORT_PIIX4         ///< AMD FCH / Intel PIIX4 direct I/O
 } AxlSmbusTransport;
 
 /**
@@ -61,6 +62,59 @@ typedef enum {
  */
 AxlSmbus *
 axl_smbus_new(void);
+
+/**
+ * @brief Open the FIRST SMBus controller where @p probe returns true.
+ *
+ * Auto-detect via `axl_smbus_new()` uses `LocateProtocol`, which
+ * returns only one EFI_SMBUS_HC_PROTOCOL or EFI_I2C_MASTER_PROTOCOL
+ * instance. On multi-segment platforms (server AMD EPYC boards
+ * commonly publish 1 SMBus HC + a dozen I2C masters) the first
+ * instance is rarely the bus carrying DIMM SPDs. This walker enumerates
+ * EVERY published handle of both protocols and runs the caller's
+ * probe against each opened session — useful for pickers like
+ * AxlSpd that need a specific slave address to respond.
+ *
+ * @p probe receives the candidate session and is expected to attempt
+ * a single read/write at the slave address it cares about. Return
+ * true to claim the session; the caller will receive it as the
+ * @ref axl_smbus_new return value. Return false to discard and try
+ * the next handle. @p user is forwarded verbatim.
+ *
+ * Sessions discarded by the probe are freed before the next attempt.
+ *
+ * @return session handle, or NULL if no enumeration step succeeded.
+ */
+typedef bool (*AxlSmbusProbeFn)(AxlSmbus *s, void *user);
+
+AxlSmbus *
+axl_smbus_new_with_probe(
+    AxlSmbusProbeFn  probe,    ///< called per candidate session
+    void            *user      ///< opaque pointer forwarded to probe
+    );
+
+/**
+ * @brief Visit every published SMBus controller (HC + I2C master)
+ *     for diagnostic / inventory purposes.
+ *
+ * Unlike `axl_smbus_new_with_probe`, this never claims a session.
+ * Each controller is opened, handed to @p visit, then freed before
+ * the next iteration. Useful for scanners that want to report the
+ * full topology rather than pick a single bus.
+ *
+ * @return number of controllers visited (0 means none published).
+ */
+typedef void (*AxlSmbusVisitFn)(
+    AxlSmbus     *s,       ///< transient session for this controller
+    size_t        index,   ///< 0-based visit order
+    void         *user     ///< opaque pointer forwarded to visit
+    );
+
+size_t
+axl_smbus_visit_all(
+    AxlSmbusVisitFn  visit,   ///< called per controller
+    void            *user     ///< opaque pointer forwarded to visit
+    );
 
 /**
  * @brief Free an SMBus session. NULL-safe.
@@ -80,6 +134,69 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlSmbus, axl_smbus_free)
 AxlSmbusTransport
 axl_smbus_transport(
     const AxlSmbus  *s   ///< session (NULL returns UNKNOWN)
+    );
+
+/**
+ * @brief SMBus "Receive Byte" transaction (§5.5.3).
+ *
+ * Wire format: address + R bit, then the slave returns one byte.
+ * NO command byte is sent — different from @ref axl_smbus_read_byte
+ * which writes a command then re-reads. Linux's `i2cdetect` uses
+ * Receive Byte as the safest probe for EEPROM-prone address ranges
+ * (0x30..0x37, 0x50..0x5F) because writing a stray command byte
+ * could trigger device behavior — e.g., a register-pointer reset
+ * or, on some EEPROMs, a partial erase.
+ *
+ * @return AXL_OK on success, AXL_ERR on transport error or invalid
+ *     arguments.
+ */
+int
+axl_smbus_receive_byte(
+    AxlSmbus  *s,
+    uint8_t    slave,
+    uint8_t   *out
+    );
+
+/**
+ * @brief SMBus QUICK probe — address-only ACK check.
+ *
+ * Sends @a slave + R/W bit and returns whether the slave ACKed.
+ * No command byte, no data. This is what Linux's `i2cdetect`
+ * uses by default — the safest way to detect "is something at
+ * this address?" without triggering register reads or writes.
+ *
+ * @a is_read selects the R/W bit (true = read direction). Some
+ * EEPROMs at 0x50..0x5F can be erased by stray writes, so prefer
+ * is_read=true for those address ranges.
+ *
+ * @return AXL_OK if the slave acknowledged; AXL_ERR if it
+ *     NACKed, the bus errored, or the transport doesn't
+ *     implement QUICK (currently all three transports do).
+ */
+int
+axl_smbus_quick(
+    AxlSmbus  *s,
+    uint8_t    slave,
+    bool       is_read
+    );
+
+/**
+ * @brief Per-instance human-readable identity, filled by the
+ *     backend at session-open time.
+ *
+ * Examples:
+ *   - "EFI SMBus HC"               (every HC handle, no further detail)
+ *   - "EFI I2C Master"             (every I2C Master handle)
+ *   - "AMD FCH PIIX4 port 0 at 0xB00"  (MAIN controller)
+ *   - "AMD FCH PIIX4 port 1 at 0xB20"  (AUX controller)
+ *
+ * Returned pointer lives as long as the session — do not free,
+ * do not retain across @ref axl_smbus_free. NULL only if @p s is
+ * NULL.
+ */
+const char *
+axl_smbus_describe(
+    const AxlSmbus  *s   ///< session (NULL returns NULL)
     );
 
 // ---------------------------------------------------------------------------

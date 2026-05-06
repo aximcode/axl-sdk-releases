@@ -32,6 +32,8 @@ static const AxlArgDesc flags[] = {
       .help = "Raw JSON output (no colors)" },
     { .name = "verbose",  .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Show HTTP status and headers" },
+    { .name = "source",                      .type = AXL_ARG_STRING,
+      .help = "Pin connect to interface with this station IPv4 (auto if unset)" },
     {0}
 };
 
@@ -489,6 +491,11 @@ run_rfbrowse(AxlArgs *a)
     axl_http_client_set(client, "timeout.ms", "30000");
     axl_http_client_set(client, "header.Accept", "application/json");
     axl_http_client_set(client, "header.OData-Version", "4.0");
+
+    const char *source = axl_args_get_string(a, "source");
+    if (source != NULL && source[0] != '\0') {
+        axl_http_client_set(client, "source.ip", source);
+    }
 
     // Authenticate
     char session_uri[256] = "";

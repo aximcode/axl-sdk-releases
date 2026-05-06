@@ -291,6 +291,64 @@ axl_usb_get_serial(
 );
 
 // ---------------------------------------------------------------------------
+// Control transfers
+// ---------------------------------------------------------------------------
+
+/// Direction of USB data transfer. Values match the USB-IO protocol's
+/// `EFI_USB_DATA_DIRECTION` ordering exactly so the implementation can
+/// pass through without translation.
+typedef enum {
+    AXL_USB_DATA_IN  = 0,  ///< host reads data from device
+    AXL_USB_DATA_OUT = 1,  ///< host writes data to device
+    AXL_USB_NO_DATA  = 2,  ///< setup-only; @p data must be NULL, @p data_len 0
+} AxlUsbDataDir;
+
+/**
+ * @brief Issue a USB control transfer to a specific interface.
+ *
+ * Wraps `EFI_USB_IO_PROTOCOL.ControlTransfer` for a target identified
+ * by `AxlUsbAddr`. Useful for class-specific control requests (CDC
+ * SEND_ENCAPSULATED_COMMAND, HID SET_REPORT, etc.) that need to talk
+ * to a device after enumeration but without going through a higher-
+ * level driver.
+ *
+ * For class-targeted requests, build the setup packet's
+ * @p request_type with `0x21` (Class | Interface | Out) or `0xA1`
+ * (Class | Interface | In), and pass the interface number — typically
+ * @p addr.intf — in @p index.
+ *
+ * @param addr          target interface
+ * @param request_type  bmRequestType byte of the USB setup packet
+ * @param request       bRequest byte of the USB setup packet
+ * @param value         wValue field of the setup packet
+ * @param index         wIndex field of the setup packet
+ * @param direction     data-stage direction (in / out / none)
+ * @param timeout_ms    transfer timeout in milliseconds
+ * @param data          buffer for the data stage; NULL if @p direction
+ *                      is `AXL_USB_NO_DATA`
+ * @param data_len      bytes to transfer in the data stage
+ * @return AXL_OK on success, AXL_ERR if @p addr is unknown, the
+ *         underlying `ControlTransfer` returns an EFI error, OR the
+ *         per-transfer USB status word is non-zero (any of
+ *         `EFI_USB_ERR_STALL` / `_NAK` / `_CRC` / `_TIMEOUT` /
+ *         `_BABBLE` / etc.). Callers that need to distinguish
+ *         transient NAKs from hard stalls would need a richer API —
+ *         this helper collapses everything non-zero into AXL_ERR.
+ */
+int
+axl_usb_control_transfer(
+    AxlUsbAddr      addr,
+    uint8_t         request_type,
+    uint8_t         request,
+    uint16_t        value,
+    uint16_t        index,
+    AxlUsbDataDir   direction,
+    uint32_t        timeout_ms,
+    void           *data,
+    size_t          data_len
+);
+
+// ---------------------------------------------------------------------------
 // Topology walk (Phase F — real hub-port chain)
 // ---------------------------------------------------------------------------
 

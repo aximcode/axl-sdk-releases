@@ -43,6 +43,113 @@ spd_cleanup(
     }
 }
 
+/*
+ * Probe predicate for axl_smbus_new_with_probe: claim a candidate
+ * session iff some address in the JEDEC SPD range (0x50..0x57)
+ * returns a *plausible SPD memory-type byte* (DDR4 = 0x0C, DDR5 =
+ * 0x12; also accept 0x0B/0x0E/0x0F/0x10/0x11 for DDR3/LPDDR variants
+ * seen in the wild). Bare "read succeeded" isn't enough — some I2C
+ * masters terminate transactions with 0x00 even when no slave is
+ * present, and some DDR5 hubs ack with 0xFF for non-existent
+ * registers, both of which would cause us to claim the wrong bus.
+ *
+ * DDR4 vs DDR5 layout:
+ *   DDR4 (ee1004 hub): SPD content is mapped directly. Byte 0 is
+ *                      the memory-type field. Read 1 byte at reg 0.
+ *   DDR5 (SPD5 hub):   Hub MR registers at 0x00..0x7F (byte 0 is
+ *                      a vendor MR, often 0xFF on factory part);
+ *                      page-selected SPD content at 0x80..0xFF.
+ *                      First write MR11=0 (page 0), then read at
+ *                      0x80 to get the memory-type field.
+ *
+ * We try DDR4 first (cheaper, no write); fall back to DDR5 if
+ * the byte 0 read either fails or returns implausible-for-DDR4.
+ */
+static bool
+spd_bus_probe(
+    AxlSmbus  *cand,
+    void      *user
+    )
+{
+    (void)user;
+    for (uint8_t addr = AXL_SPD_ADDR_FIRST; addr <= AXL_SPD_ADDR_LAST; addr++) {
+        /* DDR4 path: byte 0 = memory-type directly. */
+        uint8_t byte0;
+        if (axl_smbus_read_byte(cand, addr, 0x00, &byte0) != AXL_OK) {
+            /* Slave didn't ack — don't attempt the DDR5 write to this
+             * address. Otherwise we'd be blind-writing register 0x0B = 0
+             * to whatever non-SPD device might respond on a different
+             * bus (PMBus PSU, board sensor, etc.). */
+            continue;
+        }
+        if (byte0 >= 0x09 && byte0 <= 0x12) {
+            return true;
+        }
+
+        /* DDR5 path — slave acked but byte 0 wasn't a DDR4 mem-type.
+         * For SPD5118 hubs, MR0 (0x00) MUST equal 0x18 and MR1 (0x01)
+         * MUST equal 0x51 (Linux's spd5118.c uses i2c_smbus_read_word_
+         * swapped at MR0 expecting 0x5118). If MR0 doesn't match, this
+         * either isn't a DDR5 hub or it's stuck on a non-zero page (a
+         * Renesas/ITD-style strict-masking variant — see spd5118.c
+         * lines 645-676 for the recovery dance). */
+        if (byte0 != AXL_SPD_DDR5_DEVTYPE_LSB) {
+            /* Stuck-page recovery — match Linux's spd5118_i2c_init
+             * (spd5118.c:645-676): the strict-masking variants
+             * (Renesas/ITD) zero out MR space when the hub is left
+             * paged on a non-zero page. To recognize this state we
+             * require ALL of: MR0=MR1=MR3=MR4=0 AND MR11 page-bits
+             * non-zero. Skipping any check risks rewriting MR11 on
+             * a non-SPD5118 slave that happens to ack at this
+             * address. */
+            uint8_t mr1  = 0xFF;
+            uint8_t mr3  = 0xFF;
+            uint8_t mr4  = 0xFF;
+            uint8_t mr11 = 0;
+            if (byte0 != 0x00 ||
+                axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR1, &mr1)  != AXL_OK ||
+                mr1 != 0x00 ||
+                axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR3, &mr3)  != AXL_OK ||
+                mr3 != 0x00 ||
+                axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR4, &mr4)  != AXL_OK ||
+                mr4 != 0x00 ||
+                axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR11, &mr11) != AXL_OK ||
+                (mr11 & AXL_SPD_DDR5_MR11_PAGE_MASK) == 0)
+            {
+                continue;   /* Not a stuck-page SPD5118; not a hub. */
+            }
+            /* Write MR11 = (mr11 & ADDR_BIT) to clear the page bits
+             * while preserving the addr-mode configuration the BIOS
+             * chose. */
+            if (axl_smbus_write_byte(cand, addr, AXL_SPD_DDR5_MR11,
+                                     (uint8_t)(mr11 & AXL_SPD_DDR5_MR11_ADDR_BIT))
+                != AXL_OK)
+            {
+                continue;
+            }
+            if (axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR0, &byte0) != AXL_OK
+                || byte0 != AXL_SPD_DDR5_DEVTYPE_LSB)
+            {
+                /* Recovery failed — restore original MR11 best-effort
+                 * and move on. */
+                (void)axl_smbus_write_byte(cand, addr, AXL_SPD_DDR5_MR11, mr11);
+                continue;
+            }
+            /* Recovery succeeded — fall through to MR1 verification. */
+        }
+
+        /* MR0 == 0x18; verify MR1 == 0x51 to complete the 0x5118 ID. */
+        uint8_t mr1 = 0;
+        if (axl_smbus_read_byte(cand, addr, AXL_SPD_DDR5_MR1, &mr1) != AXL_OK
+            || mr1 != AXL_SPD_DDR5_DEVTYPE_MSB)
+        {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 static int
 ensure_session(
     void
@@ -52,10 +159,15 @@ ensure_session(
         return 0;
     }
     /* Don't cache a sticky failure — a UEFI shell session may load
-       SmbusHcShim (or similar) after our first probe attempt. We re-
-       try axl_smbus_new() on each call; the cost is one LocateProtocol
-       round-trip, negligible compared to the SMBus reads that follow. */
-    g_session = axl_smbus_new();
+       SmbusHcShim (or similar) after our first probe attempt. */
+    g_session = axl_smbus_new_with_probe(spd_bus_probe, NULL);
+    if (g_session == NULL) {
+        /* Fallback for hosts where SPDs aren't reachable via a probe
+         * (e.g., DIMMs not yet enumerated, or BMC owns the bus during
+         * BDS): take whatever SMBus controller LocateProtocol returns
+         * so caller-driven addressing still works. */
+        g_session = axl_smbus_new();
+    }
     if (g_session == NULL) {
         axl_debug("SMBus controller unavailable; SPD access disabled");
         return -1;
@@ -131,7 +243,26 @@ axl_spd_dump_raw(
     if (ensure_session() != 0) {
         return AXL_ERR;
     }
-    /* Probe + check memory-type byte to choose codec. */
+    /* Codec selection — DDR5 SPD5118 hubs vs flat DDR4 EE1004 EEPROMs
+     * have different register-vs-content mappings. The legacy heuristic
+     * "read byte at offset 2" works on DDR4 (memory-type byte sits at
+     * content offset 2 = register 2) but fails on DDR5 (register 2
+     * is MR2 = revision; memory-type byte lives at register 0x82
+     * after page-select). So check the SPD5118 device-ID at MR0:MR1
+     * first; fall through to byte-2 sampling only when it doesn't
+     * match. */
+    uint8_t id_lo = 0;
+    uint8_t id_hi = 0;
+    if (axl_smbus_read_byte(g_session, addr, AXL_SPD_DDR5_MR0, &id_lo) == AXL_OK
+        && id_lo == AXL_SPD_DDR5_DEVTYPE_LSB
+        && axl_smbus_read_byte(g_session, addr, AXL_SPD_DDR5_MR1, &id_hi) == AXL_OK
+        && id_hi == AXL_SPD_DDR5_DEVTYPE_MSB)
+    {
+        return axl_spd_ddr5_read(g_session, addr, buf, cap, len);
+    }
+    /* Not a DDR5 hub (or stuck on a non-zero page — spd_bus_probe
+     * handles recovery during probe; if we got here without going
+     * through probe, accept the platform as DDR4-or-unknown). */
     uint8_t mem_type = 0;
     if (axl_smbus_read_byte(g_session, addr, 0x02, &mem_type) != AXL_OK) {
         return AXL_ERR;
@@ -140,6 +271,9 @@ axl_spd_dump_raw(
         case AXL_SPD_TYPE_DDR4:
             return axl_spd_ddr4_read(g_session, addr, buf, cap, len);
         case AXL_SPD_TYPE_DDR5:
+            /* Reached only on systems where MR0:MR1 doesn't return
+             * 0x18:0x51 but byte 2 reads as 0x12 — unusual but match
+             * the legacy heuristic for compatibility. */
             return axl_spd_ddr5_read(g_session, addr, buf, cap, len);
         default:
             /* Unknown / unprogrammed — read the lower 256 bytes anyway

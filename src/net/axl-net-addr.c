@@ -47,3 +47,96 @@ axl_ipv4_format(const uint8_t octets[4], char *buf, size_t size)
 
     return AXL_OK;
 }
+
+bool
+axl_ipv4_equals(const uint8_t a[4], const uint8_t b[4])
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+bool
+axl_ipv4_in_subnet(const uint8_t dest[4], const uint8_t station[4],
+                   const uint8_t mask[4])
+{
+    if (dest == NULL || station == NULL || mask == NULL) {
+        return false;
+    }
+    /* Zero mask = no policy yet; refuse to match. */
+    if ((mask[0] | mask[1] | mask[2] | mask[3]) == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if ((dest[i] & mask[i]) != (station[i] & mask[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int
+axl_ipv6_format(const uint8_t octets[16], char *buf, size_t size)
+{
+    if (octets == NULL || buf == NULL || size == 0) {
+        return AXL_ERR;
+    }
+
+    /* Decompose into 8 16-bit groups (network byte order: hi byte first). */
+    uint16_t g[8];
+    for (size_t i = 0; i < 8; i++) {
+        g[i] = (uint16_t)((uint16_t)octets[2 * i] << 8
+                          | (uint16_t)octets[2 * i + 1]);
+    }
+
+    /* Find the longest run of consecutive zero groups for `::` collapsing.
+       RFC 5952 §4.2: only collapse runs of length >= 2; ties go to the
+       leftmost run. */
+    int best_start = -1, best_len = 0;
+    int cur_start  = -1, cur_len  = 0;
+    for (int i = 0; i < 8; i++) {
+        if (g[i] == 0) {
+            if (cur_start < 0) {
+                cur_start = i;
+                cur_len   = 1;
+            } else {
+                cur_len++;
+            }
+            if (cur_len > best_len) {
+                best_start = cur_start;
+                best_len   = cur_len;
+            }
+        } else {
+            cur_start = -1;
+            cur_len   = 0;
+        }
+    }
+    if (best_len < 2) {
+        best_start = -1;
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < 8; i++) {
+        if (i == best_start) {
+            /* Emit "::" and skip the collapsed run. The leading colon
+               handles the i==0 case (":...") and subsequent groups
+               provide their own leading colon. */
+            int n = axl_snprintf(buf + pos, size - pos, "::");
+            if (n < 0 || (size_t)n >= size - pos) {
+                return AXL_ERR;
+            }
+            pos += (size_t)n;
+            i += best_len - 1;
+            continue;
+        }
+        const char *fmt = (i == 0 || i == best_start + best_len) ? "%x" : ":%x";
+        int n = axl_snprintf(buf + pos, size - pos, fmt, (unsigned)g[i]);
+        if (n < 0 || (size_t)n >= size - pos) {
+            return AXL_ERR;
+        }
+        pos += (size_t)n;
+    }
+
+    return AXL_OK;
+}

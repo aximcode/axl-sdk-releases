@@ -9,12 +9,21 @@
     Shape matches uefi-ipmitool's IpmiDellProtocolSendCommand
     (IpmiTransportLib.c:151-222).
 
-    Quirk: the Dell firmware returns response data WITHOUT the
-    IPMI completion-code byte. Every other AXL IPMI transport
-    places the completion code at resp[0]; to keep that invariant,
-    we write the vendor's bytes into resp[1..] and synthesize a
-    CC=0x00 at resp[0]. Callers see the same shape whether they're
-    talking to a Dell BMC or anything else.
+    Two quirks must be honored exactly or the firmware silently
+    returns garbage on real Dell hardware:
+
+      1. The vendor's SendIpmiCommand has 8 args including a Lun
+         byte at slot 3 (always 0 in our usage). The signature is
+         encoded in the typedef in axl-uefi-extra.h.
+
+      2. The Dell firmware returns response data WITHOUT the IPMI
+         completion-code byte AND will only populate the buffer if
+         it's handed at offset 0 — passing &resp[1] yields zeros
+         (uefi-ipmitool's IpmiTransportLib.c:184-188 documents the
+         same empirical finding). The dispatcher hands the firmware
+         resp[0..N-1], shifts the bytes right by one after the
+         call, and synthesizes CC=0x00 at resp[0] so callers see
+         the same shape as KCS/SSIF/EDKII.
 
     Structure + GUID: include/uefi/axl-uefi-extra.h.
 **/
@@ -40,34 +49,33 @@ dell_send_raw(void *vctx,
         return -1;
     }
     //
-    // Dell firmware returns response data without a leading completion
-    // code, so the dispatcher synthesizes CC=0x00 at resp[0] and gives
-    // the firmware a shifted buffer starting at resp[1]. Require at
-    // least 2 bytes so the synthesis has room to hold both CC and at
-    // least one vendor byte; a 1-byte buffer is degenerate (firmware
-    // would get zero room and we'd still write resp[0]=0x00 over it).
+    // Need at least 2 bytes: one for the synthesized CC and one for a
+    // vendor byte. Dell's protocol uses UINT8 sizes so request length
+    // is capped at 255.
     //
     if (*resp_len < 2 || req_len > 0xFF) {
         return -1;
     }
 
     //
-    // Dell's protocol uses UINT8 response sizes — capped at 255.
-    // Leave room for the synthesized CC byte at resp[0].
+    // Quirk #2 (see file docstring): the firmware only populates the
+    // buffer it was handed at offset 0. We hand it resp[0..avail-1],
+    // limited so the post-call shift can still fit the CC byte.
     //
-    size_t  avail = (*resp_len - 1);
+    size_t  avail = *resp_len;
     if (avail > 0xFF) {
-        avail = 0xFF;
+        avail = 0xFF;       /* leaves shift room: 0xFE body + CC = 0xFF */
     }
-    UINT8   rsp_size = (UINT8)avail;
+    UINT8   rsp_size = (UINT8)(avail - 1);
 
     EFI_STATUS s = dell->IpmiSubmitCommand(
         dell,
         netfn,
+        /*Lun=*/ 0,
         cmd,
         (UINT8 *)req,
         (UINT8)req_len,
-        /*ResponseData=*/ &resp[1],
+        /*ResponseData=*/ resp,
         /*ResponseDataSize=*/ &rsp_size);
 
     if (EFI_ERROR(s)) {
@@ -77,10 +85,13 @@ dell_send_raw(void *vctx,
     }
 
     //
-    // Synthesize the IPMI completion code byte. This matches upstream
-    // uefi-ipmitool behavior and lets callers treat Dell responses
-    // identically to KCS/SSIF/EDKII ones.
+    // Shift the firmware's data right by one byte and synthesize CC=0x00
+    // at resp[0]. After this, resp[0] = CC and resp[1..rsp_size] holds
+    // the vendor body — same shape as KCS/SSIF/EDKII.
     //
+    for (size_t i = (size_t)rsp_size; i > 0; i--) {
+        resp[i] = resp[i - 1];
+    }
     resp[0] = 0x00;
     *resp_len = (size_t)rsp_size + 1;
     return 0;

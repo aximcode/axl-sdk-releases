@@ -3,7 +3,7 @@ AxlSidecar — JSON5 sidecar loader
 
 Common scaffolding for JSON5 *sidecar* files — curated companion
 data shipped next to a ``.efi`` binary and loaded at startup. axl-
-sdk uses this for ``pci-ids.json5``, ``pci-class.json5``,
+sdk uses this for ``pci-ids.json5``,
 ``usb-ids.json5``, and ``jedec.json5``; downstream consumers can
 build their own sidecars on top of the same primitives.
 

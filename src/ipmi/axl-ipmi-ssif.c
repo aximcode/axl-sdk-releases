@@ -11,7 +11,7 @@
     Transport hazards (enforced here, not in callers):
 
       - 60 ms inter-command delay after every completed transaction.
-        Without it, bulk operations (SDR list on iDRAC / Nvidia Grace)
+        Without it, bulk operations (SDR list on some BMC firmware / Nvidia Grace)
         overwhelm the BMC's SSIF interface and it stalls.
       - Write retries up to 5 times at 60 ms intervals.
       - Read retries up to 10 times with exponential backoff starting

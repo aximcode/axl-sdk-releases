@@ -288,7 +288,7 @@ check "mkrd-help-usage"       "Usage: MkRd"
 check "mkrd-help-size"        "Size in MB"
 # mkrd positional: argv[1] must reach the program.
 #   Negative: "label required" would mean the positional never arrived
-#             (reproduces the user-reported Dell-firmware bug).
+#             (reproduces the user-reported OEM-firmware bug).
 check_absent_in_section "mkrd-positional-no-label-required" \
     "=== TEST-MKRD-POSITIONAL ===" "label required"
 

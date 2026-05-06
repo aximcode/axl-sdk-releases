@@ -16,7 +16,7 @@
     from the response. Regression coverage for B1
     (code-review finding in 78859fa): the byte-count prefix MUST
     appear at buf[1] on writes and MUST be stripped on reads. Missing
-    either bite only surfaces on real hardware (Dell iDRAC,
+    either bite only surfaces on real hardware (some BMC firmware,
     Nvidia Grace Arm64) — matches uefi-ipmitool's I2C helpers
     (IpmiSsif.c:237-306).
 **/
@@ -24,6 +24,7 @@
 #include "axl-smbus-internal.h"
 
 #include <axl/axl-log.h>
+#include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("smbus-i2c");
 
@@ -185,6 +186,66 @@ i2c_write_byte(void *vctx,
     return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
+static int
+i2c_receive_byte(void *vctx, uint8_t slave, uint8_t *out)
+{
+    EFI_I2C_MASTER_PROTOCOL *i2c = (EFI_I2C_MASTER_PROTOCOL *)vctx;
+
+    /* SMBus Receive Byte: address+R, then 1-byte read. No preceding
+     * write of a command byte (different from i2c_read_byte which
+     * sends command first). */
+    uint8_t rx = 0;
+
+    struct {
+        UINTN              OperationCount;
+        EFI_I2C_OPERATION  Operation[1];
+    } pkt = {
+        .OperationCount = 1,
+        .Operation = {
+            { .Flags = I2C_FLAG_READ, .LengthInBytes = 1, .Buffer = &rx },
+        },
+    };
+
+    EFI_STATUS s = axl_efi_call(i2c->StartRequest, 5,
+                                i2c, (UINTN)slave,
+                                (EFI_I2C_REQUEST_PACKET *)&pkt,
+                                NULL, NULL);
+    if (EFI_ERROR(s)) {
+        return AXL_ERR;
+    }
+    *out = rx;
+    return AXL_OK;
+}
+
+static int
+i2c_quick(void *vctx, uint8_t slave, bool is_read)
+{
+    EFI_I2C_MASTER_PROTOCOL *i2c = (EFI_I2C_MASTER_PROTOCOL *)vctx;
+
+    /* Zero-byte transaction: address + R/W bit only. The I2C Master
+     * spec doesn't strictly say a 0-length read is permitted, but
+     * EDK2 implementations and SmbusHcShim both treat it as an
+     * address-ACK probe. If a particular firmware rejects it, the
+     * caller will get AXL_ERR for every slave — same outcome as
+     * "controller doesn't support quick" which is also AXL_ERR. */
+    struct {
+        UINTN              OperationCount;
+        EFI_I2C_OPERATION  Operation[1];
+    } pkt = {
+        .OperationCount = 1,
+        .Operation = {
+            { .Flags = is_read ? I2C_FLAG_READ : 0,
+              .LengthInBytes = 0, .Buffer = NULL },
+        },
+    };
+
+    EFI_STATUS s = axl_efi_call(i2c->StartRequest, 5,
+                                i2c, (UINTN)slave,
+                                (EFI_I2C_REQUEST_PACKET *)&pkt,
+                                NULL, NULL);
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
+}
+
 static void
 i2c_close(void *vctx)
 {
@@ -197,6 +258,39 @@ i2c_close(void *vctx)
 // ---------------------------------------------------------------------------
 // Public opener
 // ---------------------------------------------------------------------------
+
+int
+axl_smbus_i2c_open_handle(AxlSmbusTransportOps *ops, void *handle)
+{
+    if (ops == NULL || handle == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_I2C_MASTER_PROTOCOL *i2c  = NULL;
+    EFI_GUID                 guid = EFI_I2C_MASTER_PROTOCOL_GUID;
+    EFI_STATUS s = gBS->HandleProtocol((EFI_HANDLE)handle, &guid, (VOID **)&i2c);
+    if (EFI_ERROR(s) || i2c == NULL) {
+        return AXL_ERR;
+    }
+    if (i2c->StartRequest == NULL) {
+        return AXL_ERR;
+    }
+
+    ops->kind        = AXL_SMBUS_TRANSPORT_I2C;
+    ops->read_block  = i2c_read_block;
+    ops->write_block = i2c_write_block;
+    ops->read_byte   = i2c_read_byte;
+    ops->write_byte  = i2c_write_byte;
+    ops->quick        = i2c_quick;
+    ops->receive_byte = i2c_receive_byte;
+    ops->close       = i2c_close;
+    ops->ctx         = i2c;
+    /* Handle pointer disambiguates which of the (frequently many)
+     * I2C Master instances this session represents. */
+    axl_snprintf(ops->desc, sizeof(ops->desc),
+                 "EFI I2C Master handle %p", handle);
+    return AXL_OK;
+}
 
 int
 axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
@@ -221,7 +315,11 @@ axl_smbus_i2c_open(AxlSmbusTransportOps *ops)
     ops->write_block = i2c_write_block;
     ops->read_byte   = i2c_read_byte;
     ops->write_byte  = i2c_write_byte;
+    ops->quick        = i2c_quick;
+    ops->receive_byte = i2c_receive_byte;
     ops->close       = i2c_close;
     ops->ctx         = i2c;
+    axl_snprintf(ops->desc, sizeof(ops->desc),
+                 "EFI I2C Master (LocateProtocol)");
     return AXL_OK;
 }

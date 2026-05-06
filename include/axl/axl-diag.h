@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 /**
- * @brief Dump image-launch state to axl_printf.
+ * @brief Dump image-launch state to axl_printf if @c AXL_DIAG is set.
  *
  * Prints six labelled sections covering everything a tool typically
  * wants to know on first boot of unfamiliar firmware:
@@ -38,12 +38,22 @@ extern "C" {
  *     Mismatch with POSIX argv would mean axl-app's tokenizer got
  *     confused by quoting or unusual whitespace.
  *   - `SHELL` — `EFI_SHELL_PARAMETERS_PROTOCOL` probe + its argv if
- *     available. Optional protocol; some firmwares (Dell pre-fix)
- *     don't publish it for cross-volume invocations.
+ *     available. Optional protocol; some firmwares (some OEM platforms
+ *     before fix) don't publish it for cross-volume invocations.
  *   - `IMG` — image path (where the running `.efi` was loaded from).
  *   - `VOLUMES` — mounted FAT volumes with their `fsN` names. These
  *     are the search anchors for `axl_driver_ensure` /
  *     `axl_driver_locate`.
+ *
+ * Activation: gated on the `AXL_DIAG` shell environment variable.
+ * Set to any non-empty value (e.g. `set AXL_DIAG 1`) to enable;
+ * unset or empty silences the dump entirely. This frees the `-v`
+ * short flag in tools to carry their counterpart's Linux semantics
+ * (e.g. `grep -v` = invert match) instead of being hijacked for
+ * cross-tool framework diagnostics.
+ *
+ * Tools should call this unconditionally near the top of their main
+ * handler — the env-var check happens internally. No-op when unset.
  *
  * Output is plain text via `axl_printf`; no allocation beyond the
  * UTF-8 conversion buffers (auto-freed). Safe to call from any

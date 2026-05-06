@@ -51,6 +51,17 @@ ensure_init(
         return -1;
     }
     axl_debug("MCFG: %zu segment(s)", cached_mcfg.count);
+    /* Per-segment detail at debug level — captures the base address
+       and bus range so platform-specific oddities (an MCFG entry
+       that's declared but unmapped, narrow bus ranges, segments
+       reported out of order) are visible without rebuilding. */
+    for (size_t i = 0; i < cached_mcfg.count; i++) {
+        const AxlAcpiMcfgEntry *e = &cached_mcfg.segments[i];
+        axl_debug("MCFG[%zu]: seg=0x%04x base=0x%llx bus=0x%02x..0x%02x",
+                  i, (unsigned)e->segment,
+                  (unsigned long long)e->base_addr,
+                  (unsigned)e->start_bus, (unsigned)e->end_bus);
+    }
     init_done = true;
     return 0;
 }
@@ -200,23 +211,19 @@ axl_pci_write_config_32(
 // Address parse / format
 // ---------------------------------------------------------------------------
 
-/* Parse 1..max_chars hex digits into *out, returning the consumed
-   count or -1 on no digits / overflow. *out is set even on success
-   of a single digit. */
+/* Parse 1..max_chars hex digits into *out (uint32_t), returning the
+   consumed count or -1 on no digits / overflow. Thin wrapper around
+   axl_hex_parse_u64 with a 32-bit-overflow check on top. */
 static int
 parse_hex_field(const char *s, int max_chars, uint32_t *out)
 {
-    uint32_t v = 0;
-    int      i = 0;
-    while (i < max_chars) {
-        int d = axl_hex_nibble(s[i]);
-        if (d < 0) break;
-        v = (v << 4) | (uint32_t)d;
-        i++;
+    uint64_t v = 0;
+    int      n = axl_hex_parse_u64(s, (size_t)max_chars, &v);
+    if (n < 0 || v > 0xFFFFFFFFu) {
+        return -1;
     }
-    if (i == 0) return -1;
-    *out = v;
-    return i;
+    *out = (uint32_t)v;
+    return n;
 }
 
 int

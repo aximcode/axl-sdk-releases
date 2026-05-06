@@ -60,8 +60,8 @@ static const AxlArgDesc flags[] = {
       .help = "Tree view (SoftBMC-style: indented per bridge)" },
     { .name = "ids-file", .type = AXL_ARG_STRING,
       .help = "Path to pci-ids.json5 (default: companion to .efi or cwd)" },
-    { .name = "debug",   .type = AXL_ARG_BOOL,
-      .help = "Set log level to DEBUG (replaces our usual -v)" },
+    /* Use AXL_LOG_LEVEL=debug (or AXL_LOG_LEVEL=pci:debug) to enable
+     * library debug logs; the tool no longer carries its own switch. */
     {0}
 };
 
@@ -92,40 +92,22 @@ parse_id_filter(
     if (s == NULL || s[0] == '\0') {
         return 0;
     }
-    uint32_t  v = 0;
-    int       i = 0;
-    while (i < 4 && s[i] != '\0' && s[i] != ':') {
-        int d = axl_hex_nibble(s[i]);
-        if (d < 0) {
-            return -1;
-        }
-        v = (v << 4) | (uint32_t)d;
-        i++;
-    }
-    if (i == 0) {
+    uint64_t v = 0;
+    int      n = axl_hex_parse_u64(s, 4, &v);
+    if (n < 0 || (s[n] != '\0' && s[n] != ':')) {
         return -1;
     }
     filter_vid     = (uint16_t)v;
     filter_vid_set = true;
 
-    if (s[i] == '\0') {
+    if (s[n] == '\0') {
         return 0;
     }
-    if (s[i] != ':') {
-        return -1;
-    }
-    i++;
-    uint32_t d_val = 0;
-    int      j = 0;
-    while (j < 4 && s[i + j] != '\0') {
-        int d = axl_hex_nibble(s[i + j]);
-        if (d < 0) {
-            return -1;
-        }
-        d_val = (d_val << 4) | (uint32_t)d;
-        j++;
-    }
-    if (j == 0 || s[i + j] != '\0') {
+    /* s[n] == ':' — parse the device-id field after it. */
+    const char *did_str = s + n + 1;
+    uint64_t    d_val   = 0;
+    int         m       = axl_hex_parse_u64(did_str, 4, &d_val);
+    if (m < 0 || did_str[m] != '\0') {
         return -1;
     }
     filter_did     = (uint16_t)d_val;
@@ -450,9 +432,6 @@ run_lspci(
     AxlArgs  *a
     )
 {
-    if (axl_args_get_bool(a, "debug")) {
-        axl_log_set_level(AXL_LOG_DEBUG);
-    }
     opt_numeric     = axl_args_get_bool(a, "numeric");
     opt_show_domain = axl_args_get_bool(a, "domain");
     opt_tree        = axl_args_get_bool(a, "tree");

@@ -258,7 +258,15 @@ static int
 ensure_net_drivers_warn(void)
 {
     if (no_load) {
-        return 0;  /* user opted out — don't even try */
+        /* User opted out of disk-driver loading, but still want
+           firmware-provided drivers to bind. UEFI doesn't run the
+           equivalent of `connect -r` automatically — without it,
+           NICs that have a firmware-provided driver bound at boot
+           may not have SNP up yet. Trigger the connect explicitly
+           so `--no-load` produces a useful "firmware baseline"
+           instead of silently zero NICs. */
+        axl_driver_connect(NULL);
+        return 0;
     }
     switch (axl_net_ensure_drivers()) {
     case AXL_NET_DRIVERS_OK:
@@ -497,9 +505,10 @@ do_diag_verb(AxlArgs *a)
 {
     (void)a;
 
-    /* diag implies verbose — every section gets its richer payload. */
+    /* diag implies verbose — every section gets its richer payload.
+     * Library debug logs come from AXL_LOG_LEVEL=debug (or per-domain
+     * filters); we don't override here. */
     verbose = true;
-    axl_log_set_level(AXL_LOG_DEBUG);
 
     axl_printf("\n=== NetInfo diag (paste this back to the maintainer) ===\n\n");
 
@@ -633,9 +642,9 @@ netinfo_pre_run(AxlArgs *a)
 {
     verbose = axl_args_get_bool(a, "verbose");
     no_load = axl_args_get_bool(a, "no-load");
-    if (verbose) {
-        axl_log_set_level(AXL_LOG_DEBUG);
-    }
+    /* For library debug logs use AXL_LOG_LEVEL=debug rather than
+     * a tool-level switch — frees -v to carry tool-specific
+     * verbose-output semantics. */
 }
 
 static int

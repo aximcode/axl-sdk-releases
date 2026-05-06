@@ -2422,3 +2422,986 @@ during code review and refactor work, not during original planning.
       per-release. Entries moved under a version heading at tag time
       (see the v0.1.2 entry for an example). Release notes in
       `release.yml` link to it rather than duplicating content.
+
+---
+
+## Real-hardware findings — Dell PowerEdge XE7745 (iDRAC10), May 2026
+
+Empirical session against actual hardware (svc tag KCH0TD1) shook out a
+number of discoveries and followups that would never have surfaced in
+QEMU. Tracked as a single section so the cross-cutting fixes don't get
+lost in per-phase backlogs.
+
+### Confirmed working on hardware
+
+- [x] axl-sdk USB-NIC bundle (`NetworkCommon.efi` + `UsbRndis.efi`,
+      ~20KB total) brings up the iDRAC virtual USB-NIC on the host
+      UEFI shell. iDRAC enumerates as Microsoft RNDIS, NOT
+      CDC-ECM/NCM. Dell's BIOS DXE volume on this platform has the
+      full TCP/IP stack above SNP and the full USB stack below, but
+      no USB-NIC class driver in between — that's exactly the gap
+      axl-sdk fills. Verified empirically (5 independent checks
+      including `dh -p`, `dh -p LoadedImage`, `bcfg driver dump`,
+      explicit `connect <usb-io-handle>` against every USB endpoint).
+- [x] axl-webfs `--help` and `list-nics` work cleanly on real
+      hardware (mount/serve blocked by L3 routing — see below).
+- [x] `racadm console com2` works from the laptop SSH wrapper as
+      long as `BIOS.SerialCommSettings.SerialComm = OnConRedir` is
+      applied. Disconnect: `Ctrl-\\`.
+
+### Bugs found and fixed (2026-05-04)
+
+- [x] **iPXE leaves boot-services watchdog armed.** When axl-sdk
+      loads `ipxe-intel.efi` or any iPXE-derived driver via
+      `axl_net_ensure_drivers`, iPXE's `efi_watchdog.c` arms a
+      5-min `SetWatchdogTimer` and re-arms every 10s while alive.
+      iPXE's shutdown handler only disarms when chaining to an OS
+      (`booting==true`); when iPXE exits without booting (the
+      axl-sdk SNP-binding case), the watchdog stays armed → host
+      resets ~5 min later (Dell BIOS extends the timeout to ~30 min
+      in BDS phase). Fixed by adding `axl_watchdog_disarm()` at end
+      of `axl_net_ensure_drivers`. Cannot be unit-tested in QEMU
+      (real hardware only); regression covered via on-hardware
+      cycle test.
+- [x] **`lsusb` leaks per-entry device-path bytes.** `axl_memdup` at
+      `src/usb/axl-usb.c:354` allocates one buffer per USB interface
+      entry; entries array is process-lifetime by design but cleanup
+      was missing → `axl_mem_dump_leaks()` flagged ~2.7KB on a real
+      Dell with 16+ USB devices. Fixed by registering an
+      `axl_atexit` cleanup that frees each entry's `bus_key` (alias
+      of `dev_key`) and the array itself.
+- [x] **`lspci` sidecar singleton ctx leaks ~32 bytes.** The
+      atexit-thunk in `src/data/axl-sidecar.c` explicitly didn't
+      free its `SingletonAtexitCtx`, on the rationale "process exit
+      reclaims the small allocation." But our `axl_mem_dump_leaks()`
+      runs at axl_runtime_cleanup BEFORE that, so the comment was
+      contradictory in our environment. Fixed by freeing ctx in the
+      thunk (callers are forbidden from running `_free` after
+      atexit-thunks have fired, which is the established axl-sdk
+      convention).
+
+- [x] **AXL_TLS toggle silently produced non-TLS libaxl.a + tools.**
+      Two related Makefile bugs surfaced while wiring TLS into
+      uefi-devkit's tool build pipeline. (1) Toggling `AXL_TLS=1`
+      grows `LIB_OBJS` with ~50 mbedtls .o files but make sees
+      libaxl.a (from prior non-TLS run) as up-to-date and skips
+      `ar rcs` — TLS symbols never enter the archive. (2) Tool
+      .efis from prior runs are NEWER than the (about-to-be-rebuilt)
+      libaxl.a, so make decides they're up-to-date and skips
+      re-linking — observed `fetch.efi` 22:23, libaxl.a 22:25.
+      Both produce non-TLS binaries with no warning. Fixed by
+      detecting the AXL_TLS state-change at make parse time (via
+      `$(BUILDDIR)/.axl-tls-state`) and wiping `.o`s, libaxl.a, and
+      tools when it flips. Also added the missing `clean-tools`
+      target uefi-devkit references in its `tools-clean` recipe.
+      Detected via `fetch.efi` size: 185KB (non-TLS) vs 433KB (TLS).
+
+### Bugs found while exercising tools end-to-end (2026-05-05/06 sweep)
+
+Re-tested every shipped tool against XE7745 via the axl-webfs PUT
+loop (`docs/HW-Testing-Workflow.md`). Catalog of new findings:
+
+- [x] **Dell IPMI `chassis status` returned all zeros.** Verified
+      fixed on hardware: `Power State: on`, `Current Power State:
+      0x2d` after the buffer-shift fix below. Was: all-zero response
+      on iDRAC10 (server obviously powered on) — root cause was the
+      Dell vendor protocol writing into `Response[0]` not `&Response[1]`.
+      Reference comment in `uefi-ipmitool/IpmiToolPkg/Library/
+      IpmiTransportLib/IpmiTransportLib.c:184-188` documents the exact
+      empirical finding ("Previous testing showed that &Response[1]
+      returns zeros"). Fix: hand the firmware `resp[0..N-1]`, shift
+      right by one after the call, synthesize CC=0x00 at `resp[0]`.
+      Also fixed the `DELL_IPMI_SEND_COMMAND` typedef which was
+      missing the mandatory `Lun` parameter at slot 3 — without it
+      every following arg slid into the wrong register/stack slot.
+      Regression test in `test/unit/axl-test-ipmi.c`
+      (`test_dell_transport_dispatch`) installs a mock vtable, runs
+      `axl_ipmi_get_device_id`, and asserts both quirks are honored.
+
+- [x] **IPMI auto-detect now follows the spec: SMBIOS Type 38 first,
+      vendor protocols as fallback.** Previously the chain was
+      EDKII → Dell → SMBIOS → default-KCS, so on Dell hardware the
+      vendor protocol always won even when SMBIOS Type 38 explicitly
+      pointed at a working KCS port. New chain: SMBIOS Type 38 →
+      EDKII → Dell → default-KCS. Also added a public
+      `axl_ipmi_session_new_with_transport(hint)` API and an
+      `ipmi.efi --transport kcs|ssif|edkii|dell` flag so users can
+      pin a specific transport (escape hatch when auto-detect
+      misbehaves on a quirky platform).
+
+- [x] **iDRAC10 IPMI now works via KCS** — fixed 2026-05-06 with a
+      run of four state-machine fixes against the live hardware
+      (see commits 2aecf16 + the staging-buffer + read-loop
+      cleanup). Get Device ID returns byte-for-byte the same
+      response Linux's `ipmitool raw 6 1` does
+      (`20 81 01 20 02 df a2 02 00 00 01 00 08 3c 37`); chassis
+      status, sel list, raw passthrough all functional with auto-
+      detect (no `--transport` flag needed) since the SMBIOS
+      Type 38 path now picks the right ports + drives the state
+      machine compatibly. Original investigation findings on the
+      Dell-vendor-protocol garbage problem preserved below for
+      historical context — that path is still broken on iDRAC10
+      but no longer matters since the spec-defined KCS works.
+
+      **Resolved root causes** (each one would have masked the next
+      if not all four had been fixed):
+
+      1. SMBIOS Type 38 BaseAddressModifier register-spacing bits
+         live at bits 7..6, not bits 1..0 as I'd memorized from a
+         stale read of the spec. `(modifier >> 6) & 3` matches
+         dmidecode + Linux ipmi_si. Wrong bits gave 16-byte stride
+         (cmd at 0xCB8, unmapped) instead of 4-byte (cmd at 0xCAC).
+
+      2. Missing `clear_obf` calls during write phase. iDRAC10 sets
+         OBF=1 during the WRITE_START echo; without draining, the
+         BMC sees OBF=1 while we drive the next write and treats it
+         as a protocol violation (status went to 0xC1 = ERROR).
+         Linux's `ipmi_kcs_sm.c` drains OBF at every state-machine
+         transition.
+
+      3. `kcs_wait_obf_set` rejected `state != expected` even when
+         OBF=0 (BMC still transitioning). Real BMCs have a window
+         between a status field flipping and OBF asserting.
+
+      4. Read loop assumed every byte arrived in `state == READ`.
+         Last response byte routinely arrives with `state == IDLE`
+         already (BMC set the byte then immediately transitioned).
+         New loop matches Linux's WAIT_READ pattern: handle
+         `state in {READ, IDLE}`, drain final OBF, complete.
+
+      Plus a structural fix: `kcs_send_raw` now stages the wire
+      response into an internal 258-byte buffer (echo + max IPMI
+      response) and only copies post-echo body bytes into the
+      caller's buffer. Previously the typed wrappers' small
+      buffers (chassis_status used resp[5]) had no room for the
+      2-byte echo + body.
+
+      **Original (now mostly historical) capture state on iDRAC10:**
+
+      * Dell EFI_IPMI_TRANSPORT (vendor) — published, accepts
+        commands, returns EFI_SUCCESS. **chassis_status (3-byte
+        response) returns real BMC data** (Power State: on, byte
+        0x21 = power_on + restore_policy bits set). **Get Device ID
+        (11-byte response) returns garbage** — the buffer is filled
+        with stack contents (Dell protocol GUID bytes
+        `7409d614-5abf-4869` are observable mid-buffer across runs).
+        uefi-ipmitool's reference impl shows the same brokenness
+        (`mc info: failed to get device ID (Time out)`,
+        `raw 6 1: transport error (Time out)`), so this isn't an
+        axl-sdk bug per se — Dell changed something between iDRAC9
+        (which uefi-ipmitool was developed against on PowerEdge
+        XE8712 ARM64) and iDRAC10.
+
+      * KCS at SMBIOS Type 38 port (0xCA8/0xCA9) — port-IO read
+        returns 0xFF idle. The phantom-BMC guard now retries with
+        a Get Status command (write 0x60 to cmd port, wait 1ms,
+        re-read) per the IPMI spec — designed to catch BMCs that
+        *do* idle at 0xFF but respond to commands. **iDRAC10 fails
+        even this**: the byte stays 0xFF after the Get Status write,
+        confirming the port is truly unmapped. Bypassing the guard
+        entirely and forcing the KCS sequence hits IBF-clear
+        timeout. The LPC/KCS path is genuinely locked down on
+        iDRAC10 (likely intentional — production servers commonly
+        disable host→BMC I/O port access for security).
+
+      * SSIF (I2C @ slave 0x20) — uefi-ipmitool's I2C probe shows
+        write succeeds but read returns 32 bytes of 0xFF on the one
+        I2C master that responds (handle [4]). Disconnected bus or
+        unprogrammed slave; SSIF not viable.
+
+      * **NEW:** `DELL_IDRAC_INTERFACE_PROTOCOL`
+        (E0E4EBAD-A45E-419E-852E-AEDE2C2BDE6C) is published on
+        iDRAC10. uefi-ipmitool labels it "non-IPMI" — probably the
+        new iDRAC config/management interface that supersedes the
+        legacy 7409D614 Dell IPMI vendor protocol. No public docs
+        found; understanding its API would require Dell datasheets
+        or reverse engineering.
+
+      Bottom line: on iDRAC10 from the host UEFI shell, the only
+      reliable BMC path is the Dell vendor protocol limited to
+      small-response commands. Linux on iDRAC10 likely uses
+      either LANplus over the iDRAC USB-NIC (port 623) or the new
+      Dell iDRAC interface protocol. Suggested next step: add an
+      out-of-band IPMI-over-LANplus transport to axl-sdk (it would
+      reuse the existing TLS+TCP stack and would work on any iDRAC
+      where the USB-NIC is functional, sidestepping the broken
+      in-band path entirely).
+
+- [x] **`memspd list` finds no DIMMs on AMD EPYC** — resolved
+      2026-05-06 with two changes:
+
+      1. New public API `axl_smbus_new_with_probe(probe, user)` +
+         `axl_smbus_visit_all(visit, user)` walk every published
+         `EFI_SMBUS_HC_PROTOCOL` and `EFI_I2C_MASTER_PROTOCOL`
+         handle (Dell PowerEdge XE7745 publishes 1 HC + 12 I2C
+         masters). axl-spd's `ensure_session` now uses the probe
+         API with a strict predicate: claim a controller iff some
+         slave at 0x50..0x57 returns a plausible SPD type byte
+         (0x09..0x12 per JEDEC spec table 4). New `memspd scan`
+         verb dumps SPD-range byte 0 from every visited
+         controller — diagnostic gold for "which bus has my
+         SPDs?" investigations.
+
+      2. **Empirical finding from running the scan on iDRAC10**:
+         *no* I2C bus reachable from UEFI carries the DIMM SPDs.
+         13 controllers visited (1 HC + 12 I2C masters); only one
+         I2C master returned anything at 0x50, and that was 0xFF
+         (bus floating, no slave). The DIMM SPDs are gated behind
+         BMC/SMM on iDRAC10 — same lockdown pattern as KCS.
+         memspd's `list` therefore falls back to enumerating
+         SMBIOS Type 17 records (BIOS-populated at POST) and
+         emits the standard size/speed/manufacturer/part-number
+         summary. HW-validated on XE7745: 4 DDR5 64GB SK Hynix
+         HMCG94AHBRA487N @ 6400 MT/s in slots A1/A2/B1/B2,
+         matching the BIOS DIMM map.
+
+      The `axl_smbus_new_with_probe` API is reusable for any
+      caller that needs to pick a specific SMBus controller —
+      e.g., a future SSIF backend that needs to find the BMC's
+      bus rather than just the first I2C master.
+
+- [x] **`netinfo diag` IPv4 column blank for DHCP-bound NICs.**
+      Resolved 2026-05-05: `axl_net_list_interfaces` now enumerates
+      IP4Config2 handles separately and correlates to SNP by MAC,
+      so it picks up Dell's child-handle binding correctly. HW-
+      validated on XE7745 — eth0 (DHCP) now shows 10.9.177.98 with
+      netmask 255.255.254.0; eth1 shows static 169.254.1.2 with
+      gateway 169.254.1.1.
+
+- [x] **`netinfo` DEBUG file-open spam.** Resolved 2026-05-05:
+      `axl_backend_file_open` now suppresses the DEBUG log line
+      for `EFI_NOT_FOUND` (the normal "file doesn't exist" case
+      flooded by `axl_driver_locate` probing every mounted volume).
+      Real errors (media, permissions) still surface. HW-validated
+      — `netinfo diag` Driver Bundle section is now clean.
+
+- [x] **`memspd` and `mkrd` dumped `--- AXL diag ---` block on every
+      run unconditionally.** `axl_diag_startup` is documented in
+      `axl-diag.h` and `src/util/README.md` as `-v`/`--verbose`
+      gated, but both tools called it from `main()` before arg
+      parse. Fixed: gated behind the parsed verbose flag (mkrd had
+      the flag; memspd grew one).
+
+- [N/A] **fetch "eager TLS init" was actually iDRAC HTTP→HTTPS
+      redirect.** `fetch.efi --head http://169.254.1.1/` shows
+      `tls: initialized (mbedTLS)` because iDRAC10's HTTP server
+      301-redirects to HTTPS, and fetch transparently follows the
+      redirect — the TLS init fires for the second (HTTPS) hop.
+      Verified empirically 2026-05-05 by inspecting the response
+      headers: the `< HTTP 401` reply included
+      `strict-transport-security: max-age=...; includeSubDomains;
+      preload`, which only an HTTPS server emits. Not a bug.
+
+- [x] **`make tools` from a fresh state fails on missing crt0/reloc/
+      debug-info `.o` files.** Resolved 2026-05-05: `tools` target
+      now depends on `all`, so the per-arch object set + libaxl.a
+      are built before any tool tries to link.
+
+- [ ] **HTTPS to iDRAC eth0 routed address times out cleanly.**
+      `https://10.215.120.97/` from the host's RTL8153 NIC stalls
+      ~10s then "request failed". `http://10.215.120.97/`, ICMP, and
+      `https://169.254.1.1/` (same iDRAC, different NIC) all work —
+      so axl-sdk's TLS path is healthy. Strongly suggests corp
+      network policy blocks 443/tcp on the segment between the host
+      eth0 and 10.215.120.97. Captured here so a future investigator
+      doesn't waste time chasing it as an axl-sdk bug.
+
+### Confirmed-still-working on real hardware (2026-05-05/06 sweep)
+
+End-to-end re-tested via the axl-webfs PUT loop. All passed
+(no leaks, real microsec timestamps in tool output):
+
+- [x] `lspci` — both PCI segments enumerated (118 entries in seg 0,
+      87 in seg 1). The earlier-flagged "lspci skips segment 0" is
+      no longer reproducible on tip; segment 0 prints without the
+      `0000:` prefix.
+- [x] `lsusb` flat + `--tree` — full hierarchy (RTL8153, iDRAC USB
+      composite, hubs, HID, CDC interfaces). Per-entry leak from
+      handoff fixed by commit 50aed78.
+- [x] `sysinfo` — full CPU/memory/firmware/SMBIOS block.
+- [x] `dmidecode --type 42` — VLAN sentinel `<none>` (not
+      `4294967295`), full IPv4 + IPv6 record bodies decoded.
+- [x] `cat`, `hexdump` — files from cross-volume paths.
+- [x] `fetch` over both HTTP and HTTPS via the iDRAC USB-NIC.
+
+### Pre-existing open followups
+
+- [x] **`dmidecode --type 42` decode bodies.** Resolved 2026-05-05
+      in commits 6b256ad + e9ec5c8 and **HW-validated on XE7745
+      2026-05-06**: dmidecode now decodes both Type 42 records
+      cleanly. IPv4 record: Host DHCP → 169.254.1.2/24, Service
+      static → 169.254.1.1:443, hostname `idrac.local`. IPv6
+      record: Host AutoConfigure, Service static
+      `fde1:53ba:e9a0:de11::1` port 443, same hostname. New public
+      API: `AxlSmbiosRedfishOverIp` + `axl_smbios_read_redfish_over_ip`
+      (parses the 91-byte fixed prefix + variable hostname per
+      SMBIOS 3.x §7.43.3); plus `axl_ipv6_format` sibling of
+      `axl_ipv4_format` (RFC 5952 canonical form). dmidecode prints
+      structured Redfish-over-IP fields, hex-dumps `interface_data`
+      and unrecognized protocol payloads. 2591/2591 unit tests both
+      arches; original entry kept below for posterity.
+
+- [x] **OBSOLETE — `dmidecode --type 42` decode bodies.** Currently prints only
+      the header (`Interface Type: Network Host Interface (0x40)`,
+      protocol count, lengths). The 7-byte interface-data and
+      102-byte Redfish-over-IP protocol-data bodies aren't parsed.
+      `axl-smbios.c` already has `axl_smbios_get_host_interface()`
+      that returns a parsed `AxlSmbiosHostInterface` with the
+      Redfish-over-IP fields (host MAC, IP, port, hostname, service
+      UUID); the dmidecode tool just doesn't call it. Extend
+      `tools/dmidecode.c` case 42 to print:
+      - For interface-type 0x40 (Network): USB vendor:product or
+        PCI BDF
+      - For protocol 0x04 (Redfish over IP): host IP/mask/gateway,
+        service port, hostname, service UUID
+      Use case: dmidecode --type 42 should tell you *which* USB
+      device is the iDRAC Redfish gateway and how to reach it.
+
+- [ ] **USB-NIC driver image-unload entry points.** Per the
+      `third_party/edk2/README.md`, these drivers are upstream
+      EDK2 NetworkPkg vendored binaries — axl-sdk doesn't own the
+      source. Adding `Image Unload` would have to be upstreamed.
+      Also worth noting: `axl_net_ensure_drivers` deliberately
+      leaves these loaded between tool invocations (so subsequent
+      tools find SNP already up). An unload entry-point that
+      actually disconnected SNP would defeat that contract. So
+      the practical fix is "live with EFI_UNSUPPORTED on `unload`,
+      it's the right behavior for the ensure pattern" — the
+      original framing of this as a bug was overcautious. Mark
+      the entry to make this clear next time.
+      `NetworkCommon.efi`, `UsbCdcEcm.efi`, `UsbCdcNcm.efi`,
+      `UsbRndis.efi` all return `EFI_UNSUPPORTED` on `unload <handle>`
+      because they don't register an unload entry-point. Only
+      `RtkUsbUndiDxe.efi` (third-party Realtek) gets it right. Each
+      affected driver's `DriverEntry` should:
+      1. Register an unload handler that `DisconnectController`'s
+         every controller it bound, then `UninstallMultipleProtocolInterfaces`
+         for any image-handle-installed protocols
+      2. Verify by `load X.efi` + `connect -r` + `unload <handle>`
+         expecting Success
+      Source for these is likely EDK2 `USBNetworkPkg` derivatives —
+      patches go upstream-of-axl-sdk. Quality-of-life for
+      development testing without rebooting the host.
+
+- [x] **`fetch.efi --secure` flag (and flip default to insecure).**
+      Resolved in commit 4120a6a: `fetch.efi` now defaults to
+      `tls.verify=false` when built with `AXL_TLS=1`, prints
+      "TLS certificate verification disabled (use --secure to
+      enable)" in verbose mode, and the `--secure` short-`-S` flag
+      opts back into verification. Long-term Mozilla CA bundle
+      remains a future enhancement.
+
+- [x] **`lspci` doesn't enumerate PCI segment 0** — **NOT A BUG.**
+      Diagnostic logging from commit 48f5b39 confirms both segments
+      enumerate cleanly on XE7745:
+      `MCFG[0]: seg=0x0000 base=0x60000000 bus=0x00..0xff`
+      `MCFG[1]: seg=0x0001 base=0x70000000 bus=0x00..0xff`
+      Tree output shows entries from both: segment 0 prints in the
+      bare `bus:dev.func` format (`00:00.0`), segment 1 prints with
+      the explicit prefix (`0001:80:02.0`). The original observation
+      was an output-reading artifact — `grep '^[0-9a-f]{4}:'` skips
+      the bare-format segment-0 entries because lspci omits the
+      `0000:` prefix unless `--show-domain` is passed.
+      Lesson: when lspci output looks suspicious, verify with
+      `--show-domain` (force the seg prefix) or `--debug` (which
+      prints the MCFG table) before filing a bug. Original entry
+      preserved below.
+
+- [x] **OBSOLETE — `lspci` doesn't enumerate PCI segment 0** (filed
+      saw `MCFG: 2 segment(s)` in debug log but the lspci output
+      only listed segment `0001:` devices — every host bridge,
+      bridge, and endpoint missing from segment 0. Bug in
+      `axl-pci.c` enumeration walk; either off-by-one on segment
+      iteration or assumes single-segment.
+
+- [x] **`netinfo --no-load` does not stop ConnectController.**
+      Resolved: `--no-load` now still calls `axl_driver_connect(NULL)`
+      to bind firmware-provided drivers — only the disk-driver
+      loading is skipped. The two operations were bundled inside
+      `axl_net_ensure_drivers`; netinfo's `--no-load` early-return
+      bypassed both. Now the early-return path explicitly runs the
+      connect, so "use only firmware-provided drivers" is reachable
+      via the flag (originally needed a manual shell `connect -r`).
+
+- [ ] **AXL_TLS=1 in uefi-devkit's pinned axl-sdk build.**
+      Tracked as a uefi-devkit-side task: enable `AXL_TLS=1` so the
+      bundled `fetch.efi` and friends gain HTTPS support. iDRAC
+      Redfish is HTTPS-only; without this flag, `fetch.efi` errors
+      with "HTTPS requires AXL_TLS=1 build." Source already supports
+      TLS via mbedtls (`src/net/axl-tls.c`); just a build-flag flip.
+
+- [ ] **Stage `rfbrowse.efi` in uefi-devkit images.** rfbrowse is
+      built and works (Phase B2 done) but not staged in
+      `uefi-devkit/build/staging/<arch>/`. Add a manifest entry so
+      it ships with uefi-devkit ISOs.
+
+- [x] **`UsbRndis.efi` data plane silently drops packets — RESOLVED
+      via axl-sdk-side workaround.** Tip 2acf40f, **HW-validated on
+      XE7745 2026-05-06**:
+      - `RndisFix.efi` walks USB interfaces, finds RNDIS comms
+        (vid:pid 413c:a102, class 02/02/ff), sends
+        `REMOTE_NDIS_SET_MSG / OID_GEN_CURRENT_PACKET_FILTER = 0x0D`
+        via `SEND_ENCAPSULATED_COMMAND` directly, bypassing the
+        EDK2 `SetUsbRndisPacketFilter` stub.
+      - After `RndisFix`, `ping 169.254.1.1` goes from 100% loss to
+        0% loss (same TCP/HTTPS works too).
+      - Auto-pick TCP routing in commit 22410f8 makes
+        `RfBrowse -b 169.254.1.1` zero-config: subnet-match picks
+        eth1 (169.254.1.0/24). Full Redfish service-root JSON
+        returned.
+      - `--source` flag tested with valid pin (works), invalid IP
+        string (hard error, no silent fallback), and IP no
+        interface owns (hard error).
+      The EDK2 stub remains a defect upstream — see commit message
+      for details. axl-sdk's workaround makes the issue invisible
+      to consumers without requiring an EDK2 build environment.
+
+- [ ] **OBSOLETE — `UsbRndis.efi` data plane silently drops packets — root cause
+      identified.** EDK2's `MdeModulePkg/Bus/Usb/UsbNetwork/UsbRndis/`
+      driver has a stub `SetUsbRndisPacketFilter` at
+      `UsbRndisFunction.c:903-911` that just `return EFI_SUCCESS`
+      without ever sending a `REMOTE_NDIS_SET_MSG` to the device.
+      Wiring at `UsbRndis.c:669` exposes this stub through the
+      `EDKII_USB_ETHERNET_PROTOCOL.SetUsbEthPacketFilter` vtable
+      slot; both `RndisUndiReceiveFilter` (via `PxeFunction.c:854`)
+      and any caller hoping to set the packet filter call into the
+      no-op. Result: the iDRAC's RNDIS endpoint stays in its
+      post-INITIALIZE default state with packet filter = 0; it
+      accepts our TX bulk-out frames but never delivers RX frames
+      up the bulk-in pipe. SNP comes UP, link reports "Media
+      present", `ifconfig` accepts a static IP — but ICMP / TCP /
+      DHCP / anything to 169.254.1.1 gets 100% packet loss, exactly
+      what we see on XE7745. Linux's `drivers/net/usb/rndis_host.c`
+      always sends `RNDIS_MSG_SET` with
+      `OID_GEN_CURRENT_PACKET_FILTER = NDIS_PACKET_TYPE_DIRECTED |
+      _BROADCAST | _ALL_MULTICAST = 0x0D` during `rndis_bind()` —
+      that is the step EDK2 omits.
+
+      Confirmed empirically 2026-05-06: with eth1 statically
+      assigned 169.254.1.2/24 + default gateway 169.254.1.1, both
+      UEFI shell `ping -s 169.254.1.2 169.254.1.1` and
+      `NetInfo.efi ping 169.254.1.1` time out 100%.
+
+      Fix paths, in increasing order of effort:
+      1. **EDK2 upstream patch** (~25 lines): implement
+         `SetUsbRndisPacketFilter` to build a `REMOTE_NDIS_SET_MSG`
+         (struct already exists at `UsbRndis.h:469`), populate
+         `Oid = OID_GEN_CURRENT_PACKET_FILTER (0x0001010E)`,
+         payload = 0x0D, send via the existing `RndisControlMsg`
+         path (model on `RndisUndiInitialize` at
+         `UsbRndisFunction.c:1063-1116`). Ship a fixed
+         `UsbRndis.efi` in `third_party/edk2/`.
+      2. **axl-sdk-side workaround**: post-load, walk USB-IO
+         handles bound by UsbRndis, issue the
+         `SEND_ENCAPSULATED_COMMAND` USB control transfer
+         directly (bmRequestType=0x21, bRequest=0x00) carrying
+         the `REMOTE_NDIS_SET_MSG`. Doesn't require modifying the
+         vendored binary; can ship as a small `axl-rndis-fix.c`
+         in `src/net/`. Calling
+         `EDKII_USB_ETHERNET_PROTOCOL.SetUsbEthPacketFilter` from
+         axl-sdk is useless — that's the stub.
+
+      Sources:
+      - Linux canonical: `drivers/net/usb/rndis_host.c` —
+        `RNDIS_DEFAULT_FILTER` definition and `rndis_bind()`
+        sequence
+      - Microsoft NDIS: OID_GEN_CURRENT_PACKET_FILTER spec
+      - EDK2 source: `MdeModulePkg/Bus/Usb/UsbNetwork/UsbRndis/`
+        in edk2-stable202505 (same defect in edk2-stable202408 —
+        long-standing, not a regression)
+
+- [ ] **OBSOLETE — `UsbRndis.efi` data plane silently drops packets on iDRAC10
+      USB-NIC** (was filed as "L3 to iDRAC USB-NIC fails," now
+      narrowed). Confirmed 2026-05-04 on XE7745:
+      - Bind chain is correct: with `UsbCdcEcm`+`UsbCdcNcm`+`UsbRndis`
+        all loaded and competing on the iDRAC USB-IO handle, RNDIS
+        wins (ECM/NCM `Supported()` both return NOT_FOUND for this
+        device descriptor). So the class is genuinely RNDIS.
+      - SNP comes UP, MNP children spawn, EDK2 `ifconfig -s eth0
+        static 169.254.1.2 255.255.0.0 169.254.1.1` applies cleanly
+        (verified via `ifconfig -l`: routes set, gateway set).
+      - Both ICMP ping and TCP/80 + TCP/443 connect attempts to
+        iDRAC's `169.254.1.1` produce 100% packet loss / "login
+        request failed."
+      - `delldiagslinux` libredfish on the same hardware works
+        fine from a booted Linux (kernel `cdc_rndis`) — so iDRAC
+        backend IS responsive; the gap is purely in our UEFI
+        RNDIS data plane.
+
+      Most likely root causes inside `UsbRndis.efi`:
+      - `REMOTE_NDIS_INITIALIZE_MSG` over the RNDIS control endpoint
+        either not sent or not negotiated correctly (without it the
+        device buffers and discards frames silently)
+      - `REMOTE_NDIS_SET_MSG` with `OID_GEN_CURRENT_PACKET_FILTER`
+        not configured (default filter rejects all received frames)
+      - MTU / max-transfer-size mismatch from a partial init
+
+      Audit `UsbRndis` source against Linux's `drivers/net/usb/rndis_host.c`
+      and Microsoft's RNDIS spec sections 2.2.4–2.2.7. Adding verbose
+      RNDIS-init log lines behind a debug build flag would make the
+      next investigation tractable. Without USB packet capture, this
+      is otherwise blind.
+
+      Side note: axl-sdk's `netinfo list` doesn't reflect static IP
+      set by `ifconfig` either (column shows `IPv4=-` when ifconfig
+      reports `169.254.1.2`); netinfo is reading from a different
+      source than IPv4Config2. Filed separately as a netinfo display
+      bug.
+
+- [x] **axl-webfs serve volume listing corrupted (multi-volume) +
+      teardown leaves loop with active event sources.** RESOLVED
+      2026-05-05, **HW-validated on XE7745 2026-05-06**: serve
+      lists `fs0:` through `fs4:` cleanly (all five ASCII names,
+      no garbage, fs4 present), and ESC-stop produces just
+      `mem: no leaks detected` with no AxlLoop-free-with-active-
+      events warning. Three commits:
+      - axl-webfs `c5328ac` aliases FtVolume to AxlVolume so the
+        struct layout can't drift. The 8-byte size mismatch caused
+        every entry past index 0 in the volume listing to read
+        garbage (because file-transfer.c casts mVolumes directly
+        to AxlVolume*).
+      - axl-webfs `a3c3611` reverses the cmd-serve teardown order
+        so the HTTP server frees BEFORE its parent AxlLoop, which
+        clears the TCP listener event sources.
+      - axl-sdk `e642c9c` adds `<image_fs>:<name>` to the driver
+        candidate search list so "drop driver next to app at
+        volume root" works (covers both axl-webfs's mount tests
+        in QEMU and the user-friendly install pattern).
+      Tests: 47/47 X64 + 67/67 X64+AARCH64 axl-webfs full suite.
+
+- [ ] **axl-webfs serve volume listing is corrupted on real
+      hardware** (XE7745, 2026-05-05). axl-webfs's volume enumeration
+      emits volumes with mangled labels: expected fs0/fs1/fs2/fs3/fs4,
+      actual `fs0`, `<garbage>2`, ` <garbage>2`, ` `, `fs3`,
+      `<garbage>p1`, AND fs4 (the volume with the actual tools) is
+      missing entirely. `curl /fs4/` returns "Volume not found."
+      Looks like volume names are read as multi-byte chars (likely
+      UCS-2 from EFI_FILE_INFO->VolumeLabel) and emitted raw,
+      producing invalid UTF-8 over HTTP. fs0 and fs3 happen to
+      survive because their labels are ASCII-clean coincidentally.
+      Fix lives in axl-webfs (its volume enumerator) — tracking
+      here since it surfaced during axl-sdk hardware validation.
+
+- [x] **`rfbrowse` against iDRAC10 over TLS-RSA crashes host with
+      #GP** — RESOLVED in commit 33d5d55. Original entry preserved
+      below for context; root cause was rsa.c not being in
+      MBEDTLS_SOURCES, leaving mbedtls_rsa_init as an undefined-but-
+      PLT-stubbed symbol whose GOT slot held the link-time RVA
+      (0x56D00) rather than a runtime address. **Empirically
+      confirmed working on real hardware 2026-05-05** against XE7745
+      (svc tag KCH0TD1, iDRAC10 at 10.215.120.97):
+      `rfbrowse.efi -v -u root -p calvin -b 10.215.120.97` returned
+      HTTP 200 with full Redfish service-root JSON (1805 bytes,
+      RedfishVersion 1.22.0). TLS handshake completed (`tls:
+      initialized (mbedTLS)`); SNP came up via core drivers in 4s,
+      iPXE fallback correctly skipped per commit 6bde651. End-to-end
+      validation of the 15-commit chain (build-system + linker +
+      mbedtls + iPXE-fallback + watchdog).
+
+- [x] **`axl_http_client` does not decode `Transfer-Encoding:
+      chunked` response bodies.** Surfaced + RESOLVED 2026-05-05 on
+      XE7745, **empirically validated end-to-end** against iDRAC10:
+      `RfBrowse.efi -v -u root -p calvin -b 10.215.120.97
+      /redfish/v1/Systems/System.Embedded.1` returns the full
+      multi-KB chunked Dell ComputerSystem JSON (PCIe device list,
+      DIMM topology, OEM Dell extensions, etc.). The fix landed in
+      four commits:
+      - `b0f5cef` — `read_chunked_body` state machine (ST_SIZE →
+        ST_DATA → ST_TRAIL → ST_TRAILERS → ST_DONE) plus
+        `axl_hex_parse_u64` public helper, dogfooded by
+        `axl-http-request.c` and `axl-pci.c`.
+      - `b9c88dd` — don't treat 0-byte recv as EOF (TLS WANT_READ
+        case).
+      - `dfad8a4` — first attempt at draining staged TLS data; had
+        a buffer-aliasing flaw.
+      - `e9df883` — adopt softbmc's canonical pattern: persistent
+        per-client `tls_rx_buf`, `tls_drain` loop, separate
+        plaintext destination. Cross-checked against EDK2
+        `NetworkPkg/HttpDxe/HttpsSupport.c` (alternative manual-
+        framing design) and Mongoose's same-bug fix
+        (cesanta/mongoose#2668). HTTP integration: `/chunked`,
+        `/chunked-ext`, `/chunked-with-cl`. 2569/2569 unit +
+        72/72 HTTP integration both arches.
+
+- [x] **Content-Length body-read loop hangs on TLS `WANT_READ`.**
+      Originally filed against the old `client_recv` (TCP→stage→read,
+      one shot per call). The rewrite in commit e9df883 (persistent
+      `tls_rx_buf` + `tls_drain` loop) made `client_recv` always
+      drive progress: each call does a TCP recv that adds bytes to
+      mbedtls's internal record-assembly state, even if the round
+      doesn't yet yield plaintext. So the Content-Length loop's
+      `recv_len == 0` rounds are guaranteed to be transient — the
+      next iteration's TCP recv will eventually complete a record.
+      Resolved as a side-effect of the chunked-decode fix.
+
+- [x] **216-byte leak in `src/net/axl-mbedtls-platform.c:31`** on
+      rfbrowse exit, surfaced 2026-05-05 by the in-tree leak tracker
+      after the chunked-decode validation succeeded. RESOLVED in
+      commit 4e9ff8d, **empirically validated on XE7745**: same
+      RfBrowse system-inventory probe now reports
+      `mem: no leaks detected` on exit. Root cause was that
+      `axl_tls_init` set up five mbedtls globals (config / cert /
+      PK / CTR-DRBG / entropy) without registering the matching
+      `axl_tls_cleanup` anywhere; commit hooks it via `axl_atexit`,
+      matching the AxlSpd / AxlUsb pattern.
+
+- [ ] **Tools have inline hex-string parsers worth migrating to
+      `axl_hex_parse_u64`.** Reviewer flagged 2026-05-05:
+      `tools/lspci.c` (parse_hex_field/pair pattern, same as
+      pre-refactor axl-pci.c), `tools/lsusb.c` (same), `tools/ipmi.c`
+      around `(v << 4) | n` loops, `src/data/axl-json-parse.c` for
+      JSON5 `0x...` numeric literal parsing. Migrating buys free
+      uint64-overflow detection. `axl-url.c` and the JSON5 `\xHH`
+      decoder are lower priority — `axl_hex_nibble × 2` is arguably
+      clearer for fixed-2-digit decoding.
+
+- [x] **OBSOLETE — original entry kept for posterity:** `rfbrowse`
+      against iDRAC10 over TLS-RSA crashes host with #GP** (XE7745,
+      2026-05-05, mbedtls config commit a7a7cf2). Now
+      that ECDHE-RSA / RSA-PKCS1 cipher suites are enabled, the
+      handshake gets past `NO_CIPHER_CHOSEN` and proceeds — but
+      crashes the host:
+      ```
+      UEFI0011: CPU Exception Type 0x0D: General Protection (Software)
+      ```
+      from iDRAC lifecycle log timestamped 05:24:56, exactly when
+      rfbrowse was invoked. RSOD text (currently uncaptured) is
+      needed to identify the faulting RIP. Likely candidates inside
+      mbedtls/RSA path:
+      - Misaligned bignum access (mbedtls's `mbedtls_mpi` arrays
+        need natural alignment; if our PEM/X509 parser hands it
+        unaligned bytes the hardware traps)
+      - Stack overflow — RSA-2048 needs more stack than ECDHE-ECDSA;
+        EDK2 default per-app stack is 128KB, mbedtls might overflow
+        when chains/key-sizes get larger
+      - Buffer overrun in our `axl-mbedtls-platform.c` shim (alloc/
+        free/snprintf wrappers) that's only exercised on the RSA
+        path (extra alloc/free pressure from RSA blinding etc.)
+
+      Plan: capture the RSOD screenshot, run through
+      `~/projects/aximcode/rsod-decode/rsod-decode.py` with the
+      built rfbrowse.efi to map RIP→source line, fix at root cause.
+      Until fixed, ECDHE-RSA / RSA cipher suites should perhaps be
+      enabled behind a build flag (default off) so non-iDRAC
+      consumers don't pay for an unstable codepath.
+
+- [ ] **`Load Error` on subsequent `.efi` launches after running
+      axl-sdk tools.** User-attributed 2026-05-05 (corrects two
+      prior wrong hypotheses): the failure is NOT iDRAC-virtual-
+      media-related (user reproduced with the bundle copied to
+      other media), and is NOT iPXE-LoadImage-hook-related (iPXE
+      not loaded in any of the failing sessions). At least three
+      distinct bites observed in this session, all requiring a
+      host reboot to recover.
+
+      **DO NOT DISMISS — the bug is real and is expected to
+      recur.** User's standing instruction 2026-05-05: keep this
+      open until paired captures definitively pin the cause; the
+      "stress test didn't reproduce it" finding below is data, not
+      a fix.
+
+      **Empirical findings from a stress test post-commit 4e9ff8d
+      (mbedtls atexit cleanup):** ran 7 distinct tools (NetInfo,
+      LsPci, LsUsb, SysInfo, Dmidecode, RfBrowse, Hexdump) plus
+      3 sequential RfBrowse invocations — all completed cleanly,
+      0 Load Errors, every run reported "mem: no leaks detected",
+      and `memmap` totals (LoaderCode/BS_Code/BS_Data/RT_Code/
+      RT_Data) were byte-identical across captures. **This rules
+      out one specific hypothesis** — "pool fragmentation from
+      cumulative leaks" — because per-run accounting is now exact.
+      It does NOT mean the bug is fixed; the failure is reportedly
+      random and tens of clean runs don't disprove a sporadic
+      failure mode. The user has explicitly observed this
+      symptom with the bundle copied to non-iDRAC media, so the
+      cause is in axl-sdk-tool execution residue of some kind.
+
+      Remaining candidates worth investigating:
+      1. Some specific tool sequence that this stress test didn't
+         hit (e.g., killing a tool with Ctrl-C mid-network-op,
+         tools that fail vs. tools that succeed, etc.).
+      2. State accumulating outside what `memmap` and the
+         AxlMem leak tracker observe — protocol installations on
+         the handle table, event/timer registrations, driver
+         binding state, OpenProtocol agent records that aren't
+         CloseProtocol'd, etc.
+      3. Race / TOCTOU in the loader itself triggered by axl-sdk
+         driver-binding or signal-handler installation.
+
+      Capture ritual when it next bites (memorize this, the bug
+      window is short — recovery requires reboot):
+      ```
+      dh -p LoadedImage         # count loaded images
+      dh -p Image               # broader image protocol coverage
+      memmap                    # page totals + free fragmentation
+      ```
+      Both at a known-good state (after a successful tool run)
+      and at a failing state (right before re-trying a tool that
+      Load-Errors). The diff is the shortest path to root cause;
+      a single failing-state capture without a paired good
+      baseline is much weaker.
+
+- [ ] **uefi-devkit's `net-init.nsh` bypasses the iPXE-fallback
+      protection in `axl_net_ensure_drivers`.** The script does:
+      ```nsh
+      for %d in drivers\%arch%\*.efi
+          load %d
+      endfor
+      connect -r
+      ```
+      This wildcard-loads `ipxe-intel.efi` / `ipxe-broadcom.efi`
+      eagerly, regardless of whether SNP comes up from non-iPXE
+      class drivers — so the protection added in axl-sdk commit
+      6bde651 (load iPXE only as fallback) doesn't apply when users
+      run `net-init.nsh` directly. Result: same LoadImage poisoning
+      and watchdog-armed states the axl-sdk fix was supposed to
+      prevent.
+
+      Two options for uefi-devkit-side fix:
+      (a) Drop `net-init.nsh` entirely. Tools like `NetInfo list`
+          already trigger `axl_net_ensure_drivers` with the right
+          fallback semantics — that's the correct entry point.
+      (b) Rewrite `net-init.nsh` to skip iPXE explicitly:
+          ```nsh
+          for %d in drivers\%arch%\*.efi
+              if not %d eq drivers\%arch%\ipxe-intel.efi then
+                if not %d eq drivers\%arch%\ipxe-broadcom.efi then
+                  if not %d eq drivers\%arch%\ipxe-all.efidrv then
+                    load %d
+                  endif
+                endif
+              endif
+          endfor
+          connect -r
+          ```
+      (a) is cleaner and matches axl-sdk's intent. Track in
+      uefi-devkit, but log here since it surfaced during axl-sdk
+      hardware validation.
+
+- [ ] **axl-webfs serve frees AxlLoop with active TCP event source**
+      (XE7745, 2026-05-05). Shutdown emits:
+      ```
+      loop: axl_loop_free: caller-owned event source id=2 still active
+      loop: axl_loop_free: 1 caller-owned event source(s) still active
+      — free will proceed but consumers may crash on next use
+      ```
+      Use-after-free vector on next loop reuse. axl-webfs's serve
+      cleanup needs to disconnect the listener and remove event
+      sources before `axl_loop_free`. Real bug; not theoretical.
+
+### Test infrastructure — quirky KCS BMC fixture (medium priority)
+
+Our QEMU IPMI testing uses a clean reference BMC simulator that
+exposes none of the timing/state-transition quirks real Dell
+hardware has. The four iDRAC10 KCS bugs (commit 2aecf16 and
+its follow-ups) shipped through QEMU clean and only surfaced on
+real hardware:
+
+  - SMBIOS Type 38 BaseAddressModifier in QEMU is `0x00` →
+    1-byte stride either way (bits 1..0 OR bits 7..6 read as 0).
+    Real Dell publishes `0x4A` → 4-byte stride.
+  - QEMU's BMC keeps OBF=0 during the WRITE_START echo phase;
+    real Dell sets OBF=1 as a side effect of state-machine
+    internals.
+  - QEMU transitions OBF + state atomically; real Dell has a
+    few-microsecond window where OBF rises before state flips.
+  - QEMU keeps state==READ until host acks the last byte; real
+    Dell flips state to IDLE at the moment it places the final
+    response byte.
+
+Plus a coverage gap: `axl-test-ipmi.c` unit tests use
+`axl_ipmi_session_new_with_callback` which bypasses the wire
+protocol entirely. The KCS state machine is only exercised by
+the `test_real_hw` path that runs against an external BMC
+simulator started by `test-ipmi-qemu.sh` — and only validates
+`resp_len >= 12` for Get Device ID, doesn't stress the quirky
+transitions.
+
+Plan: write a "mean BMC" fixture (Python or QEMU device device
+patch) that exposes each of the above quirks behind flags, plus
+optional misbehaviors (slow OBF, non-spec spacing, more body
+bytes than the spec mandates). Wire it into `test-ipmi-qemu.sh`
+as a parallel KCS test job; either as random fuzz or a curated
+matrix.
+
+Concrete acceptance: a future change to `axl-ipmi-kcs.c` that
+re-introduces *any* of the four bugs above MUST cause this test
+to fail in CI before it can land.
+
+### ~~New tool — `i2c` / SMBus low-level explorer~~ — DONE (commit c3fe679)
+
+Shipped: tools/i2c.efi with verbs `list`, `probe`, `get`, `set`,
+`dump` and Linux i2cdetect-style argument compatibility (`--quick`,
+`--read`, `--all`, optional `[first] [last]` positionals, AUTO mode
+mirroring Linux's per-address mode selection). Plus three new public
+AxlSmbus APIs (`axl_smbus_describe`, `axl_smbus_quick`,
+`axl_smbus_receive_byte`) so the tool can do everything Linux's
+i2c-tools does.
+
+Diagnostic value already realized — probing the AMD FCH AUX
+controller (where DDR5 SPDs live on AMD server boards) in all three
+modes from UEFI returns zero ACKs, while Linux on the same hardware
+sees the full address range respond. Confirms the UEFI silent-
+failure isn't byte-data-specific; the controller is gated at the
+protocol level until OS handoff. The original problem section is
+preserved below for context.
+
+### Original problem statement — `i2c` / SMBus low-level explorer
+
+axl-sdk has the SMBus library piece (`AxlSmbus` with HC + I2C
+master backends, multi-handle walker as of 2026-05-06) but no
+tool that exposes it. Linux's `i2c-tools` (`i2cdetect`, `i2cget`,
+`i2cset`, `i2cdump`) is the canonical reference for what such a
+tool needs to do; the same diagnostic gap is what made the
+"memspd finds no DIMMs on AMD EPYC" investigation harder than it
+should have been (we had to add an ad-hoc `memspd scan` verb to
+get visibility into per-controller behavior).
+
+Proposed surface (`tools/i2c.c`):
+
+  - `i2c list` — enumerate every published `EFI_SMBUS_HC_PROTOCOL`
+    + `EFI_I2C_MASTER_PROTOCOL` handle with its kind label and
+    handle pointer (parallels `i2cdetect -l`).
+
+  - `i2c probe <bus>` — Linux's `i2cdetect -y -r <bus>` equivalent.
+    Walk every 7-bit slave address, print which respond; mark
+    slaves that look like SPD by reading byte 0 and matching
+    JEDEC type-byte range (0x09..0x12).
+
+  - `i2c get <bus> <slave> <reg>` — single-byte read.
+    `i2c get <bus> <slave> <reg> <count>` — block read. Mirrors
+    `i2cget [-y] <bus> <slave> <reg>`.
+
+  - `i2c set <bus> <slave> <reg> <byte> [<byte>...]` — block
+    write. Refuse without an interactive confirmation (writes can
+    brick devices); add `--force` to bypass.
+
+  - `i2c dump <bus> <slave>` — full 256-byte hex dump (parallels
+    `i2cdump`).
+
+Why it matters: ANY future tool that needs to read a non-SPD
+SMBus device (FRU EEPROMs at 0xA0..0xAE, fan controllers,
+voltage monitors, temperature sensors at 0x4C/0x4D, USB-C TCPCs,
+PCIe retimers, etc.) needs the same enumerate-and-probe machinery
+that `memspd scan` has. Centralizing it in `tools/i2c.c` makes
+the next investigation 5 minutes instead of an hour.
+
+Empirical motivation captured in `DellXE7745/02-spd-and-i2c.log`:
+on this Dell, Linux's `i2cdetect -l` shows 4 buses (3 PIIX4
+ports + 1 MGA i2c) but UEFI exposes a different set (1 SMBus HC +
+12 I2C masters, none of which carries DIMM SPDs). A tool would
+make this immediately visible without writing one-off probe code.
+
+### OEM CPLD SMBus adapter — vendor-protocol consumer (medium priority)
+
+On some AMD server platforms the DDR5 SPDs aren't routed to the
+FCH SMBus at all — they sit behind an OEM-specific CPLD ("FPGA
+hub PLD") accessed via a vendor UEFI protocol. BIOS reads from
+the CPLD and publishes a subset of the data via SMBIOS Type 17,
+which is what memspd's existing fallback path consumes.
+
+The CPLD memory map carries more than DIMM SPDs: common /
+control / inventory / error-event / misc / sticky / payload /
+riser-slot-map sections — totalling around 35 KB of platform
+state. A shaped consumer module would unlock telemetry that
+isn't in SMBIOS Type 17 (fan/temp/power detail, riser-slot
+inventory, PCIe topology hints, etc.).
+
+Reference shape (Dell BIOS reference impl studied 2026-05-06):
+
+  - `DELL_CPLD_SMBUS_PROTOCOL` GUID
+    `6B14C95E-84FF-477D-16AF-168FCE8B7D99`
+  - Two function pointers: `DellCpldReadByte(Offset, *Data,
+    Location)` and `DellCpldWriteByte(Offset, *Data)`.
+    `Location=0` returns the byte from a BIOS-cached host memory
+    map; `Location=1` reads live from the CPLD slave at SMBus
+    address `0xC4` over SSIF (the EFI_I2C_MASTER protocol path).
+  - 0x8A10-byte memory map split into named regions
+    (CPLD_COMMON_OFFSET, CPLD_CONTROL_OFFSET, CPLD_INVENTORY,
+    CPLD_MISC, etc.).
+
+Proposed shape — parallel to existing `src/ipmi/axl-ipmi-dell.c`:
+
+  - `src/oem/axl-oem-cpld-dell.c` — vendor adapter consuming
+    `DELL_CPLD_SMBUS_PROTOCOL` when published. Internal-only; no
+    public header — exposes its data through the generic AxlSmbus
+    descriptor or a future `axl-oem.h` umbrella.
+  - Probe at session-open time. Falls through if the protocol
+    isn't installed (other platforms, other vendors).
+  - Vendor-name policy applies: file naming is OK
+    (`axl-oem-cpld-dell.c` is proper-noun protocol identity,
+    parallel to `axl-ipmi-dell.c`); incidental empirical
+    comments stay generic.
+
+Why "medium" not "high":
+
+  - SMBIOS Type 17 already covers the common DIMM-info case, so
+    memspd doesn't need this path
+  - No current consumer needs the extended telemetry
+  - Adding it is ~200 LOC + tests; not free
+  - The mechanism is now documented in
+    `src/smbus/axl-smbus-piix4.c` and `<axl/axl-spd.h>` so
+    future maintainers see the route exists
+
+Lift the priority if a consumer ever needs riser-slot or
+fine-grained thermal data from UEFI on these platforms.
+
+### Console + tooling improvements (lower priority)
+
+- [ ] **Log timestamp `.usec` field is always `.000000`.**
+      `print_console_timestamp` in `src/log/axl-log.c:116` formats
+      6 fractional-second digits from `AxlTime.nanosecond / 1000`,
+      but the backend at `src/backend/native/axl-backend-native.c:178`
+      copies the raw `EFI_TIME.Nanosecond` straight from
+      `gRT->GetTime`. Most firmware leaves Nanosecond=0 — the UEFI
+      spec lets firmware populate it but doesn't require it, and
+      the Dell PowerEdge / OVMF / iDRAC platforms we test on all
+      report 0. Result: every log line ends in `.000000` which is
+      worse than just hiding the field.
+      Fix options:
+      1. Detect Nanosecond=0 and fall back to a monotonic counter
+         delta — supplement wallclock with elapsed-since-boot in
+         milliseconds (we can read it via a UEFI Stall(0)-anchored
+         timer or, on x64, the TSC + frequency from CPUID).
+      2. Hide the fractional field when Nanosecond=0 — minimum
+         viable, no resolution improvement but stops lying.
+      Surfaced 2026-05-06 by user during the in-band Redfish
+      validation session.
+
+- [ ] **`axl-webfs serve` should accept `--source <ip>` to bind a
+      specific listening interface.** `axl_tcp_listen` currently
+      auto-picks via `tcp_find_service_binding(NULL, NULL, ...)`
+      which lands on the first non-zero handle. On a multi-NIC
+      host (laptop curl path needs eth0 = 10.9.177.98; in-band
+      BMC path needs eth1 = 169.254.1.2), the user has no way to
+      pick. The TCP layer already plumbs a source-IP through
+      `axl_tcp_connect_via`; the listen path needs a sibling.
+      Plan:
+      1. Add `axl_tcp_listen_via(port, source_ip, &listener)` to
+         the public `axl-tcp.h`. `source_ip == NULL` keeps current
+         auto-pick.
+      2. Plumb through `axl_http_server` so the server config
+         exposes a "listen.ip" option.
+      3. Wire `--source <ip>` into axl-webfs's serve subcommand.
+      Surfaced 2026-05-06 during PUT/GET validation: with eth0
+      and eth1 both configured, auto-pick chose handles[0]
+      consistently which happened to be the correct one — but
+      that's fragile. Explicit pin is the right shape.
+
+- [ ] **Console-aware tool output mode.** Tools like `lspci`,
+      `drivers`, `netinfo`, `dmidecode` emit ANSI escape sequences
+      (color, cursor positioning) that are noise when consumed via
+      IPMI SOL or piped capture. UEFI `ConOut->Mode` lets tools
+      detect serial-console mode (or expose an env var); switch to
+      flat output when set.
+
+- [ ] **Real-hardware test runner.** Today axl-sdk has 2565
+      ratcheted unit tests in QEMU. The QEMU↔real-Dell coverage gap
+      is real (mkrd Load Error on the R6725 didn't reproduce in
+      QEMU; `--no-load` semantics are hardware-dependent). A
+      `scripts/test-axl-hw.sh` that:
+      1. Mounts the test bundle via iDRAC virtual media
+      2. Cold powercycles the host
+      3. Watches IPMI SOL for the UEFI shell prompt
+      4. Drives test EFIs sequentially, captures output
+      5. Reports pass/fail in ratchet style
+      Closes the QEMU-coverage gap for pre-release CI.

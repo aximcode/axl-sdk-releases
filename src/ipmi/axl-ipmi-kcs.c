@@ -125,16 +125,35 @@ kcs_wait_obf_set(KcsCtx *k, uint8_t expected_state)
         if (kcs_read_status(k, &status) != 0) {
             return -1;
         }
+        //
+        // ERROR state is fatal at any point — abort sequence required
+        // to recover, which we don't do here.
+        //
         if ((status & KCS_STATE_MASK) == KCS_STATE_ERROR) {
             axl_warning("KCS error state (status=0x%02x)", status);
             return -1;
         }
-        if ((status & KCS_STATE_MASK) != expected_state) {
-            axl_warning("KCS state mismatch (got 0x%02x want 0x%02x)",
-                        status & KCS_STATE_MASK, expected_state);
-            return -1;
-        }
-        if (status & KCS_OBF) {
+        //
+        // The state field is only meaningful AFTER the BMC has
+        // committed its next byte (OBF=1). Before then the BMC may
+        // still be in the previous state (e.g., WRITE while it
+        // processes our final WRITE_END+data byte before flipping
+        // to READ). Don't bail on transient mismatches — Linux's
+        // ipmi_si state machine and the IPMI spec §9.10 figure 9-6
+        // both expect this transition window.
+        //
+        //
+        // Looking for OBF=1 in expected_state. Linux's ipmi_kcs_sm.c
+        // additionally flags state==expected with OBF=0 as "still
+        // working, keep polling" — same as our outer loop. The wrinkle
+        // we hit on one BMC observed during testing is OBF=1 going
+        // high with state still WRITE for ~ms before state catches up
+        // (status seen: 0x83 = WRITE + OBF + IBF). Wait for state to
+        // settle to expected rather than bailing immediately —
+        // matches Linux's approach of NOT treating the transient as
+        // fatal until error-recovery thresholds trip.
+        //
+        if ((status & KCS_OBF) && (status & KCS_STATE_MASK) == expected_state) {
             return 0;
         }
         /* 100 us cadence: see note in kcs_wait_ibf_clear — too fine
@@ -225,6 +244,82 @@ kcs_send_raw(void *vctx,
         payload[2 + i] = req[i];
     }
 
+    //
+    // Pre-flight: ensure BMC is in IDLE before starting a new
+    // transaction. the BMC observed during testing was wedging in ERROR
+    // state mid-test; without this, every subsequent command fails
+    // with "BMC not idle". Linux's ipmi_si state machine does the
+    // equivalent check + abort recovery on every entry.
+    //
+    {
+        uint8_t status_initial;
+        if (kcs_read_status(k, &status_initial) != 0) {
+            return -1;
+        }
+        if ((status_initial & KCS_STATE_MASK) != KCS_STATE_IDLE
+            || (status_initial & KCS_OBF))
+        {
+            axl_debug("KCS pre-flight: BMC not idle (status=0x%02x), "
+                      "issuing abort", status_initial);
+            //
+            // IPMI spec §9.10 abort: write Get_Status (0x60) to cmd,
+            // wait IBF clear, write 0x00 to data; BMC responds with
+            // status byte then enters IDLE.
+            //
+            (void)kcs_wait_ibf_clear(k);
+            if (kcs_write_cmd(k, KCS_CTRL_GET_STATUS) != 0) {
+                return -1;
+            }
+            (void)kcs_wait_ibf_clear(k);
+            /* Drain any stale OBF before issuing the abort data byte. */
+            uint8_t s_after_cmd;
+            if (kcs_read_status(k, &s_after_cmd) == 0
+                && (s_after_cmd & KCS_OBF))
+            {
+                uint8_t drop;
+                (void)kcs_read_data(k, &drop);
+            }
+            if (kcs_write_data(k, 0x00) != 0) {
+                return -1;
+            }
+            /* Drain the abort response (1 byte status + transition to IDLE). */
+            for (int i = 0; i < 4; i++) {
+                uint8_t s_drain;
+                if (kcs_wait_ibf_clear(k) != 0
+                    || kcs_read_status(k, &s_drain) != 0)
+                {
+                    break;
+                }
+                if (s_drain & KCS_OBF) {
+                    uint8_t drop;
+                    (void)kcs_read_data(k, &drop);
+                    if ((s_drain & KCS_STATE_MASK) == KCS_STATE_READ) {
+                        (void)kcs_write_data(k, KCS_CTRL_READ);
+                    }
+                }
+                if ((s_drain & KCS_STATE_MASK) == KCS_STATE_IDLE) {
+                    break;
+                }
+            }
+        }
+    }
+
+    //
+    // Linux's ipmi_kcs_sm.c calls clear_obf() — drain stale data
+    // byte if OBF=1 — at every state transition. that BMC sets OBF
+    // during the WRITE_START echo phase; without draining we leave
+    // BMC with OBF=1 while we drive the next write, which BMC
+    // treats as a protocol violation and transitions to ERROR.
+    //
+    #define KCS_CLEAR_OBF_IF_SET()                                   \
+        do {                                                          \
+            uint8_t _s;                                               \
+            if (kcs_read_status(k, &_s) == 0 && (_s & KCS_OBF)) {     \
+                uint8_t _drop;                                        \
+                (void)kcs_read_data(k, &_drop);                       \
+            }                                                         \
+        } while (0)
+
     if (kcs_wait_ibf_clear(k) != 0 ||
         kcs_write_cmd(k, KCS_CTRL_WRITE_START) != 0)
     {
@@ -236,9 +331,11 @@ kcs_send_raw(void *vctx,
     // always >= 2 so the lower bound is 1 — no empty-loop case.
     //
     for (size_t i = 0; i + 1 < payload_len; i++) {
-        if (kcs_wait_ibf_clear(k) != 0 ||
-            kcs_write_data(k, payload[i]) != 0)
-        {
+        if (kcs_wait_ibf_clear(k) != 0) {
+            return -1;
+        }
+        KCS_CLEAR_OBF_IF_SET();
+        if (kcs_write_data(k, payload[i]) != 0) {
             return -1;
         }
     }
@@ -246,50 +343,100 @@ kcs_send_raw(void *vctx,
     //
     // WRITE_END + final data byte.
     //
-    if (kcs_wait_ibf_clear(k) != 0 ||
-        kcs_write_cmd(k, KCS_CTRL_WRITE_END) != 0 ||
-        kcs_wait_ibf_clear(k) != 0 ||
-        kcs_write_data(k, payload[payload_len - 1]) != 0)
+    if (kcs_wait_ibf_clear(k) != 0) {
+        return -1;
+    }
+    KCS_CLEAR_OBF_IF_SET();
+    if (kcs_write_cmd(k, KCS_CTRL_WRITE_END) != 0 ||
+        kcs_wait_ibf_clear(k) != 0)
     {
         return -1;
     }
-
-    //
-    // Read phase: skip the two bytes of NetFn/Cmd echo, then copy
-    // the rest (CompletionCode + response data) into the caller's
-    // buffer until the state machine goes IDLE.
-    //
-    uint8_t discard;
-    for (size_t i = 0; i < 2; i++) {
-        if (kcs_read_byte(k, &discard) != 0) {
-            return -1;
-        }
-    }
-
-    size_t  cap = *resp_len;
-    size_t  out = 0;
-    uint8_t status = 0;
-
-    while (out < cap) {
-        uint8_t byte;
-        if (kcs_read_byte(k, &byte) != 0) {
-            return -1;
-        }
-        resp[out++] = byte;
-        if (kcs_read_status(k, &status) != 0) {
-            return -1;
-        }
-        if ((status & KCS_STATE_MASK) == KCS_STATE_IDLE) {
-            break;
-        }
-    }
-
-    if ((status & KCS_STATE_MASK) != KCS_STATE_IDLE) {
-        axl_warning("KCS response overflow (cap=%zu)", cap);
+    KCS_CLEAR_OBF_IF_SET();
+    if (kcs_write_data(k, payload[payload_len - 1]) != 0) {
         return -1;
     }
 
-    *resp_len = out;
+    //
+    // Read loop. Linux's ipmi_kcs_sm WAIT_READ pattern:
+    //   - check state: must be READ or IDLE (anything else = error)
+    //   - if READ + OBF: read byte, write KCS_READ_BYTE to ack
+    //   - if IDLE: drain any final OBF byte, transaction complete
+    //
+    // Critical: the LAST response byte routinely arrives with state
+    // already IDLE (BMC set the byte then immediately transitioned
+    // because there's nothing more to send). Treating that as a state
+    // mismatch loses the byte AND wastes 5 s waiting for a state==READ
+    // that won't come.
+    //
+    // We use an internal staging buffer because every KCS response
+    // begins with a 2-byte [NetFn|LUN, Cmd] echo before the CC byte
+    // the caller actually wants — sizing solely off resp_len would
+    // truncate the user's data by 2. that BMC also emits trailing
+    // vendor-specific bytes past the spec body for some commands;
+    // truncating those silently matches Linux ipmi_kcs_sm.
+    //
+    uint8_t  staging[2 + 256];      /* 2 echo + max IPMI response */
+    size_t   stage_cap = sizeof(staging);
+    size_t   stage_out = 0;
+    while (1) {
+        uint8_t status;
+        if (kcs_wait_ibf_clear(k) != 0
+            || kcs_read_status(k, &status) != 0)
+        {
+            return -1;
+        }
+        uint8_t state = status & KCS_STATE_MASK;
+        if (state == KCS_STATE_ERROR) {
+            axl_warning("KCS error state during read (status=0x%02x)",
+                        status);
+            return -1;
+        }
+        if (state == KCS_STATE_IDLE) {
+            /* Final dummy byte per spec — some BMCs emit, others don't */
+            if (status & KCS_OBF) {
+                uint8_t discard;
+                (void)kcs_read_data(k, &discard);
+            }
+            break;
+        }
+        if (state != KCS_STATE_READ) {
+            axl_warning("KCS unexpected state during read (status=0x%02x)",
+                        status);
+            return -1;
+        }
+        /* state == READ; wait for OBF if not yet set */
+        if (!(status & KCS_OBF)) {
+            axl_backend_stall(KCS_POLL_INTERVAL_US);
+            continue;
+        }
+        uint8_t byte;
+        if (kcs_read_data(k, &byte) != 0) {
+            return -1;
+        }
+        if (stage_out < stage_cap) {
+            staging[stage_out++] = byte;
+        }
+        if (kcs_write_data(k, KCS_CTRL_READ) != 0) {
+            return -1;
+        }
+    }
+
+    //
+    // Strip the 2-byte echo and copy as much of the body (CC + data)
+    // as the caller's buffer can hold. Anything past resp_len falls
+    // off — fine, callers' command-specific decoders ignore trailing
+    // bytes anyway.
+    //
+    if (stage_out < 2) {
+        return -1;
+    }
+    size_t body_len = stage_out - 2;
+    size_t copy = (body_len < *resp_len) ? body_len : *resp_len;
+    for (size_t i = 0; i < copy; i++) {
+        resp[i] = staging[2 + i];
+    }
+    *resp_len = copy;
     return 0;
 }
 
@@ -322,18 +469,31 @@ axl_ipmi_kcs_open(AxlIpmiTransportOps *ops,
     }
 
     //
-    // Phantom-BMC guard: a status byte of 0xFF means the bus is
-    // floating high — port I/O works but nothing is mapped there.
-    // Real KCS hardware in any valid state has at least one bit
-    // clear (idle = 0x00, write/read/error states never set all
-    // four state-machine bits at once with both IBF and OBF set).
-    // Without this check, a phantom port reading 0xFF lets the
-    // session open, then the first command spins for the full
-    // KCS_POLL_TIMEOUT_US (~5 s) inside kcs_wait_ibf_clear before
-    // failing — a 6 s hang on every misadvertised SMBIOS Type 38.
+    // Phantom-BMC guard: a status byte of 0xFF on idle usually means
+    // the bus is floating high — port I/O works but nothing is mapped
+    // there. Real KCS hardware in any valid state has at least one bit
+    // clear (idle = 0x00, write/read/error states never set all four
+    // state-machine bits at once with both IBF and OBF set).
+    //
+    // Some BMCs nonetheless idle at 0xFF (or get there after a partial
+    // prior transaction), then come alive on a Get Status command.
+    // Try one before declaring the port dead — write 0x60 to the cmd
+    // port, give the BMC a moment, re-read. If the byte changes to a
+    // plausible value, the port IS mapped; proceed.
     //
     if (probe == 0xFF) {
-        return AXL_ERR;
+        if (axl_backend_io_write8(cmd_port, KCS_CTRL_GET_STATUS) != AXL_OK) {
+            return AXL_ERR;
+        }
+        axl_backend_stall(1000);   /* 1 ms — enough for BMC IBF latch */
+        uint8_t reprobe;
+        if (axl_backend_io_read8(cmd_port, &reprobe) != AXL_OK) {
+            return AXL_ERR;
+        }
+        if (reprobe == 0xFF) {
+            /* Truly floating — no BMC behind this port. */
+            return AXL_ERR;
+        }
     }
 
     KcsCtx *k = axl_malloc(sizeof(KcsCtx));

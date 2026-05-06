@@ -410,9 +410,15 @@ static __attribute__((unused)) EFI_GUID gEfiSmbusHcProtocolGuid =
 // DELL_IPMI_TRANSPORT — Dell vendor IPMI protocol
 //
 // Proprietary to Dell platforms. Shape extracted from uefi-ipmitool's
-// IpmiTransportLib. Quirk: the firmware's response buffer does NOT
-// include the completion code byte; callers must synthesize CC=0x00
-// on top of the returned data (matches uefi-ipmitool behavior).
+// IpmiTransportLib. Two well-documented quirks:
+//
+//   1. The vendor's SendIpmiCommand has 8 positional args including a
+//      Lun byte at slot 3. Omitting it slides every following arg into
+//      the wrong register/stack slot — observable on the affected vendor BMC firmware as
+//      Get Device ID returning uninitialized bytes.
+//   2. The response buffer does NOT include the completion code byte;
+//      callers must synthesize CC=0x00 on top of the returned data
+//      (matches uefi-ipmitool behavior).
 // ===================================================================
 
 typedef struct _DELL_IPMI_TRANSPORT DELL_IPMI_TRANSPORT;
@@ -420,11 +426,12 @@ typedef struct _DELL_IPMI_TRANSPORT DELL_IPMI_TRANSPORT;
 typedef EFI_STATUS (EFIAPI *DELL_IPMI_SEND_COMMAND)(
     IN  DELL_IPMI_TRANSPORT  *This,
     IN  UINT8                 NetFn,
+    IN  UINT8                 Lun,
     IN  UINT8                 Command,
     IN  UINT8                *CommandData,
     IN  UINT8                 CommandDataSize,
     OUT UINT8                *ResponseData,
-    OUT UINT8                *ResponseDataSize
+    IN OUT UINT8             *ResponseDataSize
     );
 
 struct _DELL_IPMI_TRANSPORT {
@@ -527,6 +534,32 @@ typedef struct {
 } EFI_USB_ENDPOINT_DESCRIPTOR;
 #pragma pack()
 
+typedef enum {
+    EfiUsbDataIn,
+    EfiUsbDataOut,
+    EfiUsbNoData
+} EFI_USB_DATA_DIRECTION;
+
+#pragma pack(1)
+typedef struct {
+    UINT8   RequestType;
+    UINT8   Request;
+    UINT16  Value;
+    UINT16  Index;
+    UINT16  Length;
+} EFI_USB_DEVICE_REQUEST;
+#pragma pack()
+
+typedef EFI_STATUS (EFIAPI *EFI_USB_IO_CONTROL_TRANSFER)(
+    IN  EFI_USB_IO_PROTOCOL        *This,
+    IN  EFI_USB_DEVICE_REQUEST     *Request,
+    IN  EFI_USB_DATA_DIRECTION      Direction,
+    IN  UINT32                      Timeout,
+    IN OUT VOID                    *Data OPTIONAL,
+    IN  UINTN                       DataLength,
+    OUT UINT32                     *Status
+    );
+
 typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_DEVICE_DESCRIPTOR)(
     IN  EFI_USB_IO_PROTOCOL        *This,
     OUT EFI_USB_DEVICE_DESCRIPTOR  *DeviceDescriptor
@@ -562,7 +595,7 @@ typedef EFI_STATUS (EFIAPI *EFI_USB_IO_GET_SUPPORTED_LANGUAGES)(
     );
 
 struct _EFI_USB_IO_PROTOCOL {
-    void                                *UsbControlTransfer;
+    EFI_USB_IO_CONTROL_TRANSFER          UsbControlTransfer;
     void                                *UsbBulkTransfer;
     void                                *UsbAsyncInterruptTransfer;
     void                                *UsbSyncInterruptTransfer;

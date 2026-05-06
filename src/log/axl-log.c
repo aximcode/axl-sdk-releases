@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include "../backend/axl-backend.h"
+#include <axl/axl-env.h>
 #include <axl/axl-log.h>
 #include <axl/axl-str.h>
 #include <axl/axl-format.h>
@@ -131,14 +132,40 @@ print_console_timestamp(void)
     buf[pos++] = ':';
     buf[pos++] = '0' + (time.second / 10);
     buf[pos++] = '0' + (time.second % 10);
-    buf[pos++] = '.';
+    /* Sub-second precision. EFI_TIME.Nanosecond is allowed by spec but
+       most firmware (OVMF, vendor BMC firmware) leaves it 0. Prefer the
+       backend's monotonic counter for a real microsecond-resolution
+       fractional field. Falls back to Nanosecond if monotonic isn't
+       available, then to no-fraction at all.
+
+       Caveat: the wallclock seconds (HH:MM:SS) are RTC-derived and
+       tick at integer-second boundaries; the fractional comes from
+       a separate counter with an unrelated epoch. Within a single
+       wallclock second the fractional can appear to go backwards
+       — e.g. `12:34:05.998500` followed by `12:34:05.012300` is
+       possible if the RTC tick to second 06 hasn't fired yet but
+       the monotonic-us counter has wrapped past 1_000_000. Acceptable
+       for human-eyeball debugging (you see *some* fractional change
+       between adjacent lines, which is what was missing before).
+       For machine ordering use AxlLogEntry.timestamp from the ring
+       handler, which uses raw monotonic-us and is strictly
+       monotonic. */
     unsigned usec = time.nanosecond / 1000;
-    buf[pos++] = '0' + ((usec / 100000) % 10);
-    buf[pos++] = '0' + ((usec / 10000) % 10);
-    buf[pos++] = '0' + ((usec / 1000) % 10);
-    buf[pos++] = '0' + ((usec / 100) % 10);
-    buf[pos++] = '0' + ((usec / 10) % 10);
-    buf[pos++] = '0' + (usec % 10);
+    if (usec == 0) {
+        uint64_t mono = axl_backend_get_monotonic_us();
+        if (mono > 0) {
+            usec = (unsigned)(mono % 1000000u);
+        }
+    }
+    if (usec > 0) {
+        buf[pos++] = '.';
+        buf[pos++] = '0' + ((usec / 100000) % 10);
+        buf[pos++] = '0' + ((usec / 10000) % 10);
+        buf[pos++] = '0' + ((usec / 1000) % 10);
+        buf[pos++] = '0' + ((usec / 100) % 10);
+        buf[pos++] = '0' + ((usec / 10) % 10);
+        buf[pos++] = '0' + (usec % 10);
+    }
     buf[pos++] = ' ';
     buf[pos] = '\0';
 
@@ -290,6 +317,9 @@ log_dispatch(int level, const char *domain, const char *func,
     }
 }
 
+// Forward decl — implementation is below the public-API section.
+static void ensure_env_init_once(void);
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -298,6 +328,9 @@ void
 axl_log_full(int level, const char *domain, const char *func,
              int line, const char *fmt, ...)
 {
+    /* Apply AXL_LOG_LEVEL on first emission (idempotent). */
+    ensure_env_init_once();
+
     /* Early-return BEFORE the va_list declaration. clang-tidy's
        valist.Uninitialized analyzer otherwise traces the
        get_effective_level → axl_strcmp call from inside the
@@ -322,6 +355,7 @@ axl_log_full(int level, const char *domain, const char *func,
 void
 axl_log(int level, const char *domain, const char *fmt, ...)
 {
+    ensure_env_init_once();
     if (level > get_effective_level(domain)) {
         return;
     }
@@ -340,12 +374,17 @@ axl_log(int level, const char *domain, const char *fmt, ...)
 void
 axl_log_set_level(int level)
 {
+    /* Apply env-baseline first so programmatic calls take precedence
+     * over AXL_LOG_LEVEL — RUST_LOG semantics (env is baseline,
+     * code wins). Idempotent / no-op if env is unset. */
+    ensure_env_init_once();
     mGlobalLevel = level;
 }
 
 void
 axl_log_set_domain_level(const char *domain, int level)
 {
+    ensure_env_init_once();
     if (domain == NULL) {
         return;
     }
@@ -377,6 +416,193 @@ axl_log_set_domain_level(const char *domain, int level)
     axl_strlcpy(mDomains[mDomainCount], domain, DOMAIN_LEN);
     mDomainLevels[mDomainCount] = level;
     mDomainCount++;
+}
+
+// ---------------------------------------------------------------------------
+// AXL_LOG_LEVEL — env-var-driven configuration
+// ---------------------------------------------------------------------------
+
+/* Sentinel return values for parse_level_keyword. Both are negative
+ * integers far below AXL_LOG_ERROR (=0) so the filter check
+ * `level > effective_level` always evaluates to "filtered" if either
+ * is stored as a domain/global level — but they MUST be distinct
+ * from each other so apply_one_entry can tell them apart. */
+#define LEVEL_PARSE_UNKNOWN  (-100)   /* "garbage" → ignore */
+#define LEVEL_OFF            (-10)    /* "off" / "none" / "silent" */
+
+/* Case-insensitive keyword equality on a length-bounded slice
+ * against a NUL-terminated reference. Avoids a heap copy. */
+static bool
+ci_equal(const char *s, size_t len, const char *kw)
+{
+    if (axl_strlen(kw) != len) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char a = s[i];
+        char b = kw[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int
+parse_level_keyword(const char *s, size_t len)
+{
+    /* Case-insensitive — `DEBUG`, `Debug`, and `debug` all parse the
+     * same. Matches RUST_LOG / G_MESSAGES_DEBUG ergonomics. */
+    struct { const char *kw; int level; } map[] = {
+        { "off",     LEVEL_OFF       },
+        { "none",    LEVEL_OFF       },
+        { "silent",  LEVEL_OFF       },
+        { "error",   AXL_LOG_ERROR   },
+        { "err",     AXL_LOG_ERROR   },
+        { "warning", AXL_LOG_WARNING },
+        { "warn",    AXL_LOG_WARNING },
+        { "info",    AXL_LOG_INFO    },
+        { "debug",   AXL_LOG_DEBUG   },
+        { "trace",   AXL_LOG_TRACE   },
+        { NULL, 0 }
+    };
+    for (size_t i = 0; map[i].kw != NULL; i++) {
+        if (ci_equal(s, len, map[i].kw)) {
+            return map[i].level;
+        }
+    }
+    return LEVEL_PARSE_UNKNOWN;
+}
+
+/**
+ * Parse one "domain:level" entry; @a end is past-the-end of the
+ * entry (just before a comma, or the trailing NUL). Bare "level"
+ * (no colon) sets the global default.
+ */
+static void
+apply_one_entry(const char *p, const char *end)
+{
+    /* Skip leading whitespace */
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    /* Trim trailing whitespace */
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+    }
+    if (p == end) {
+        return;
+    }
+
+    /* Aliases: bare "all" / "off" / "none" / "silent" set the global
+     * default before any colon-parsing. */
+    size_t total_len = (size_t)(end - p);
+    if (total_len == 3 && axl_strncmp(p, "all", 3) == 0) {
+        axl_log_set_level(AXL_LOG_DEBUG);
+        return;
+    }
+
+    /* Look for ':' separator */
+    const char *colon = NULL;
+    for (const char *q = p; q < end; q++) {
+        if (*q == ':') { colon = q; break; }
+    }
+
+    const char *level_str;
+    size_t      level_len;
+    const char *domain_str = NULL;
+    size_t      domain_len = 0;
+
+    if (colon == NULL) {
+        /* Bare level → global default */
+        level_str = p;
+        level_len = total_len;
+    } else {
+        domain_str = p;
+        domain_len = (size_t)(colon - p);
+        level_str  = colon + 1;
+        level_len  = (size_t)(end - level_str);
+        /* Trim spaces around the level part */
+        while (level_len > 0 && (*level_str == ' ' || *level_str == '\t')) {
+            level_str++; level_len--;
+        }
+        while (level_len > 0 &&
+               (level_str[level_len - 1] == ' ' ||
+                level_str[level_len - 1] == '\t'))
+        {
+            level_len--;
+        }
+    }
+
+    int level = parse_level_keyword(level_str, level_len);
+    if (level == LEVEL_PARSE_UNKNOWN) {
+        return;     /* Unknown — silently ignore (no log churn at init). */
+    }
+    /* `level` is now either a valid AXL_LOG_* level (0..4) or
+     * LEVEL_OFF (-10). Both are safe to pass to axl_log_set_level
+     * (anything < AXL_LOG_ERROR filters even axl_error since the
+     * filter check is `msg_level > stored_level`). */
+
+    if (domain_str == NULL) {
+        /* Global default. */
+        axl_log_set_level(level);
+        return;
+    }
+
+    if (domain_len == 1 && *domain_str == '*') {
+        /* Wildcard: same as bare level. */
+        axl_log_set_level(level);
+        return;
+    }
+
+    /* Per-domain. axl_log_set_domain_level needs a NUL-terminated
+     * string; copy onto a stack buffer bounded by DOMAIN_LEN. */
+    char domain_buf[DOMAIN_LEN];
+    if (domain_len >= DOMAIN_LEN) {
+        domain_len = DOMAIN_LEN - 1;
+    }
+    for (size_t i = 0; i < domain_len; i++) {
+        domain_buf[i] = domain_str[i];
+    }
+    domain_buf[domain_len] = '\0';
+    axl_log_set_domain_level(domain_buf, level);
+}
+
+void
+axl_log_init_from_env(void)
+{
+    const char *v = axl_getenv("AXL_LOG_LEVEL");
+    if (v == NULL || *v == '\0') {
+        return;
+    }
+    /* Walk comma-separated entries. */
+    const char *p = v;
+    while (*p != '\0') {
+        const char *q = p;
+        while (*q != '\0' && *q != ',') {
+            q++;
+        }
+        apply_one_entry(p, q);
+        p = (*q == ',') ? q + 1 : q;
+    }
+}
+
+/* One-shot guard used by the dispatcher to apply env-var config on
+ * first log emission. Init order is irrelevant — any caller paying
+ * attention to log levels passes through axl_log_full / axl_log,
+ * which both call get_effective_level which sees the configured
+ * state on second-and-later calls. */
+static bool mEnvInitDone = false;
+static void
+ensure_env_init_once(void)
+{
+    if (mEnvInitDone) {
+        return;
+    }
+    mEnvInitDone = true;
+    axl_log_init_from_env();
 }
 
 int

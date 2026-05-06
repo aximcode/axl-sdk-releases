@@ -11,6 +11,40 @@ consumer use case (Linux-side `dump-memory` parity on UEFI) is
 DDR4/DDR5 server fleets. DDR3 is a small additional codec when
 a consumer asks for it.
 
+## Platform limitations — when AxlSpd doesn't deliver
+
+Direct SPD reads work only when the platform's SMBus exposes the
+DIMM EEPROMs to non-firmware software. On many server boards this
+isn't true and `axl_spd_next` returns NULL on first call. **Always
+have an SMBIOS Type 17 fallback ready** (see `tools/memspd.c` for
+the reference pattern).
+
+Confirmed-affected platforms:
+
+- **OEM-CPLD-routed DIMMs on some AMD server boards (FCH
+  1022:790b family).** DDR5 SPDs are NOT on the FCH AUX SMBus
+  on these platforms. They're physically routed through an
+  OEM-specific CPLD ("FPGA hub PLD") behind a vendor UEFI
+  protocol; BIOS reads them there and publishes the results
+  via SMBIOS Type 17. The FCH AUX SMBus controller is
+  electrically present but empty, returning the chipset-
+  default "all-ACK + zero-data" pattern Linux warns about in
+  `drivers/i2c/busses/i2c-piix4.c` lines 968-974. Linux's
+  spd5118 driver fails to bind for the same reason —
+  verified on an AMD-EPYC server with kernel 6.19.10.
+
+- **Platforms where the SPD-carrying SMBus isn't published as
+  `EFI_SMBUS_HC_PROTOCOL` or `EFI_I2C_MASTER_PROTOCOL`.** AxlSpd's
+  auto-detect can't find a transport. The AMD FCH PIIX4 direct-I/O
+  fallback in `axl-smbus-piix4.c` covers boards where firmware is
+  opinionated about which controller it advertises, but the
+  chipset still has to deliver real bytes (see #1 above).
+
+The cases where AxlSpd genuinely beats SMBIOS Type 17 are rare:
+live timing parameters (tCL, tRCD, tRP, tRAS) that aren't in
+Type 17, and platforms where the BIOS publishes a stale or
+partial Type 17 (uncommon on modern firmware).
+
 ```c
 uint8_t *slot = NULL;
 while ((slot = axl_spd_next(slot)) != NULL) {

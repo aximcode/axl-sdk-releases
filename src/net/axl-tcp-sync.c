@@ -46,15 +46,63 @@ typedef struct {
 // Locate TCP4 service binding
 // ---------------------------------------------------------------------------
 
+/* Address-comparison helpers all live in axl-net-addr.c
+   (axl_ipv4_equals / axl_ipv4_in_subnet); operate on bare uint8_t[4]
+   so the EFI_IPv4_ADDRESS.Addr field passes through untouched. */
+
+/// Try to read InterfaceInfo from the IP4Config2 protocol on @p handle.
+/// On success copies StationAddress + SubnetMask into the outputs.
+/// Returns EFI_NOT_FOUND if the handle has no IP4Config2.
+static EFI_STATUS
+get_iface_info(
+    EFI_HANDLE         handle,
+    EFI_IPv4_ADDRESS  *station_out,
+    EFI_IPv4_ADDRESS  *mask_out
+    )
+{
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+    EFI_STATUS status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+        handle, &gEfiIp4Config2ProtocolGuid, (void **)&cfg);
+    if (EFI_ERROR(status) || cfg == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    /* Two-phase: ask for size, alloc, then read. The InterfaceInfo
+       buffer carries an OPTIONAL trailing route table whose size we
+       don't know up front. */
+    UINTN data_size = 0;
+    status = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &data_size, NULL);
+    if (status != EFI_BUFFER_TOO_SMALL || data_size < sizeof(EFI_IP4_CONFIG2_INTERFACE_INFO)) {
+        return EFI_NOT_FOUND;
+    }
+    EFI_IP4_CONFIG2_INTERFACE_INFO *info = axl_malloc(data_size);
+    if (info == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    status = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &data_size, info);
+    if (EFI_ERROR(status)) {
+        axl_free(info);
+        return status;
+    }
+    *station_out = info->StationAddress;
+    *mask_out    = info->SubnetMask;
+    axl_free(info);
+    return EFI_SUCCESS;
+}
+
 EFI_STATUS
 tcp_find_service_binding(
+    const EFI_IPv4_ADDRESS         *dest,
+    const EFI_IPv4_ADDRESS         *forced_source,
     EFI_SERVICE_BINDING_PROTOCOL  **sb,
     EFI_HANDLE                    *out_handle
     )
 {
     EFI_STATUS  status;
-    EFI_HANDLE  *handles;
-    size_t       handle_count;
+    EFI_HANDLE  *handles      = NULL;
+    size_t       handle_count = 0;
 
     status = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
                     ByProtocol,
@@ -67,13 +115,69 @@ tcp_find_service_binding(
         return EFI_NOT_FOUND;
     }
 
+    /* First pass: scan once and pick the best candidate.
+       Priority (highest first):
+         3 = pinned source IP matches station (only path when forced_source)
+         2 = subnet-match against destination
+         1 = first non-zero station IP
+         0 = unconfigured (skip) */
+    EFI_HANDLE chosen      = NULL;
+    int        chosen_rank = 0;
+
+    for (size_t i = 0; i < handle_count; i++) {
+        EFI_IPv4_ADDRESS station = { 0 };
+        EFI_IPv4_ADDRESS mask    = { 0 };
+        if (get_iface_info(handles[i], &station, &mask) != EFI_SUCCESS) {
+            continue;
+        }
+
+        if (forced_source != NULL) {
+            /* Pinned-source mode: must exactly match. Anything else
+               is ineligible. */
+            if (axl_ipv4_equals(station.Addr, forced_source->Addr)) {
+                chosen      = handles[i];
+                chosen_rank = 3;
+                break;
+            }
+            continue;
+        }
+
+        /* Auto mode: skip 0.0.0.0 entirely. */
+        static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+        if (axl_ipv4_equals(station.Addr, zero4)) {
+            continue;
+        }
+
+        if (dest != NULL && axl_ipv4_in_subnet(dest->Addr, station.Addr, mask.Addr)) {
+            if (chosen_rank < 2) {
+                chosen      = handles[i];
+                chosen_rank = 2;
+                /* Don't break — a later handle could still produce a
+                   better tie with the same destination subnet, but
+                   subnet-match is the strongest auto signal we have,
+                   so first match wins. */
+                break;
+            }
+        }
+
+        if (chosen_rank < 1) {
+            chosen      = handles[i];
+            chosen_rank = 1;
+        }
+    }
+
+    if (chosen == NULL) {
+        axl_backend_free(handles);
+        return EFI_NOT_FOUND;
+    }
+
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
-                    handles[0],
+                    chosen,
                     &gEfiTcp4ServiceBindingProtocolGuid,
                     (void **)sb
                     );
     if (!EFI_ERROR(status)) {
-        *out_handle = handles[0];
+        *out_handle = chosen;
     }
 
     axl_backend_free(handles);
@@ -141,7 +245,9 @@ on_sync_cancel_timeout(void *data)
 }
 
 int
-axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
+axl_tcp_connect_via(const char *host, uint16_t port,
+                    const AxlIPv4Address *source_ip,
+                    AxlTcp **out_sock)
 {
     if (host == NULL || out_sock == NULL) {
         return AXL_ERR;
@@ -160,8 +266,8 @@ axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
 
     SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
-    if (axl_tcp_connect_async(host, port, loop, cancel,
-                              on_sync_complete, &r) != AXL_OK) {
+    if (axl_tcp_connect_async_via(host, port, source_ip, loop, cancel,
+                                  on_sync_complete, &r) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
         return AXL_ERR;
@@ -190,12 +296,20 @@ axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
     return AXL_ERR;
 }
 
+int
+axl_tcp_connect(const char *host, uint16_t port, AxlTcp **out_sock)
+{
+    /* Legacy entry point — auto-pick the source interface. */
+    return axl_tcp_connect_via(host, port, NULL, out_sock);
+}
+
 // ---------------------------------------------------------------------------
 // axl_tcp_listen
 // ---------------------------------------------------------------------------
 
 int
-axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
+axl_tcp_listen_via(uint16_t port, const AxlIPv4Address *source_ip,
+                   AxlTcp **out_listener)
 {
     EFI_STATUS                    status;
     EFI_SERVICE_BINDING_PROTOCOL  *sb;
@@ -210,9 +324,27 @@ axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
         return AXL_ERR;
     }
 
-    status = tcp_find_service_binding(&sb, &sb_handle);
+    /* Listener: no destination IP. If source_ip is non-NULL non-zero,
+       pin to that interface; else first valid handle (skip 0.0.0.0). */
+    EFI_IPv4_ADDRESS  efi_src;
+    EFI_IPv4_ADDRESS *forced = NULL;
+    if (source_ip != NULL) {
+        bool nonzero = source_ip->addr[0] || source_ip->addr[1]
+                    || source_ip->addr[2] || source_ip->addr[3];
+        if (nonzero) {
+            axl_memcpy(efi_src.Addr, source_ip->addr, 4);
+            forced = &efi_src;
+        }
+    }
+    status = tcp_find_service_binding(NULL, forced, &sb, &sb_handle);
     if (EFI_ERROR(status)) {
-        axl_error("no TCP4 service binding");
+        if (forced != NULL) {
+            axl_error("no interface with station IP %u.%u.%u.%u",
+                source_ip->addr[0], source_ip->addr[1],
+                source_ip->addr[2], source_ip->addr[3]);
+        } else {
+            axl_error("no TCP4 service binding");
+        }
         return AXL_ERR;
     }
 
@@ -270,6 +402,13 @@ axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
     *out_listener = sock;
     axl_info("listening on port %u", port);
     return AXL_OK;
+}
+
+int
+axl_tcp_listen(uint16_t port, AxlTcp **out_listener)
+{
+    /* Legacy entry point — auto-pick the listening interface. */
+    return axl_tcp_listen_via(port, NULL, out_listener);
 }
 
 // ---------------------------------------------------------------------------

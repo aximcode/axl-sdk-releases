@@ -70,6 +70,32 @@ AxlIpmiSession *
 axl_ipmi_session_new(void);
 
 /**
+ * @brief Open an IPMI session against a caller-pinned transport,
+ *     skipping auto-detect for the others.
+ *
+ * Useful when auto-detect would pick a misbehaving vendor protocol
+ * — e.g., on some BMC firmware the vendor EFI_IPMI_TRANSPORT is published
+ * but Get Device ID returns garbage, so the user wants to force KCS
+ * (which the Linux kernel ipmi_si driver uses successfully on the
+ * same hardware).
+ *
+ * Behavior per @p hint:
+ *   - AXL_IPMI_TRANSPORT_UNKNOWN — same as `axl_ipmi_session_new()`.
+ *   - AXL_IPMI_TRANSPORT_EDKII — try EDKII only.
+ *   - AXL_IPMI_TRANSPORT_DELL — try Dell vendor only.
+ *   - AXL_IPMI_TRANSPORT_KCS — try SMBIOS-Type-38-detected KCS
+ *     first, then default x86 I/O ports 0x0CA2/0x0CA3 as fallback.
+ *   - AXL_IPMI_TRANSPORT_SSIF — try SMBIOS-Type-38-detected SSIF only.
+ *
+ * @return session handle, or NULL if the requested transport is
+ *     unavailable.
+ */
+AxlIpmiSession *
+axl_ipmi_session_new_with_transport(
+    AxlIpmiTransport  hint  ///< transport to pin, or _UNKNOWN for auto
+    );
+
+/**
  * @brief Free an IPMI session. NULL-safe.
  */
 void
@@ -456,7 +482,7 @@ typedef struct {
     bool  mu_ipmi_transport2;         ///< Microsoft Project Mu
 
     // Supporting infrastructure
-    bool  smbus_hc_protocol;          ///< EFI_SMBUS_HC_PROTOCOL
+    bool  smbus_hc_protocol;          ///< EFI_SMBUS_HC_PROTOCOL (any)
     bool  i2c_master_protocol;        ///< EFI_I2C_MASTER_PROTOCOL (any)
 
     // SMBIOS Type 38 (IPMI Device Information)
@@ -467,6 +493,7 @@ typedef struct {
 
     // Handle counts
     size_t   i2c_master_handle_count;
+    size_t   smbus_hc_handle_count;
 } AxlIpmiProbe;
 
 /**

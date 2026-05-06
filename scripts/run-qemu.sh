@@ -625,10 +625,6 @@ PCI_IDS_FILE="$(dirname "$0")/../share/pci-ids.json5"
 if [[ -f "$PCI_IDS_FILE" ]]; then
     cp "$PCI_IDS_FILE" "$STAGING/pci-ids.json5"
 fi
-PCI_CLASS_FILE="$(dirname "$0")/../share/pci-class.json5"
-if [[ -f "$PCI_CLASS_FILE" ]]; then
-    cp "$PCI_CLASS_FILE" "$STAGING/pci-class.json5"
-fi
 # Stage VirtioFsDxe.efi if the active OVMF doesn't ship it integrated.
 if [[ -n "$VFS_DRIVER_STAGE" ]]; then
     cp "$VFS_DRIVER_STAGE" "$STAGING/VirtioFsDxe.efi"

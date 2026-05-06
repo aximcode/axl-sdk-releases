@@ -25,10 +25,11 @@ int main(int argc, char **argv) {
         axl_warning("pci-ids.json5 failed to parse");
     }
 
-    /* Optional class-overlay sidecar — same lifecycle. The
-       compiled-in tables in axl-pci.c are the bootstrap default,
-       so this is purely additive (new triplet names land via
-       a `git pull` of pci-class.json5 instead of a rebuild). */
+    /* Optional class-overlay — reads the classes[] section of
+       pci-ids.json5 (same file). Compiled-in tables in axl-pci.c
+       are the bootstrap default, so this is purely additive (new
+       triplet names land via a `git pull` of pci-ids.json5
+       instead of a rebuild). */
     (void)axl_pci_class_load(NULL);
 
     /* ... use the lookups ... */
@@ -123,22 +124,21 @@ If a consumer needs hot-swap of the database (e.g. reload after a
 sidecar update), serialize the `_free` + `_load` pair against
 every reader.
 
-## Where the sidecars live in shipped artifacts
+## Where the sidecar lives in shipped artifacts
 
-  - **Tools tarball** (`axl-sdk-tools-<arch>.tar.gz`): both
-    `pci-ids.json5` and `pci-class.json5` ship next to the .efi
-    binaries at the tarball root. UEFI auto-discovery via the
-    companion-path lookup finds them with no flags or paths
-    needed — boot from the USB stick, run `lspci.efi`, names
-    decode.
-  - **`.deb` / `.rpm`** (axl-sdk SDK package): both files install
-    to `/usr/share/axl/{pci-ids,pci-class}.json5`. Reference content
-    — copy or symlink to wherever your .efi runs from, or pass via
-    `--ids-file` / future `--class-file`.
-  - **Source tree** (`share/pci-ids.json5`, `share/pci-class.json5`):
-    the curated starter set lives here. Edit in place when
-    contributing additions; the build/install/release pipeline
-    picks up changes on the next pass.
+  - **Tools tarball** (`axl-sdk-tools-<arch>.tar.gz`):
+    `pci-ids.json5` ships next to the .efi binaries at the tarball
+    root. UEFI auto-discovery via the companion-path lookup finds
+    it with no flags or paths needed — boot from the USB stick,
+    run `lspci.efi`, names decode.
+  - **`.deb` / `.rpm`** (axl-sdk SDK package): file installs to
+    `/usr/share/axl/pci-ids.json5`. Reference content — copy or
+    symlink to wherever your .efi runs from, or pass via
+    `--ids-file`.
+  - **Source tree** (`share/pci-ids.json5`): the curated starter
+    set lives here. Edit in place when contributing additions; the
+    build/install/release pipeline picks up changes on the next
+    pass.
 
 ## Bulk population from canonical pci.ids
 
@@ -147,18 +147,19 @@ for QEMU + a few common cards). For fleet-scale OEM-rebadge
 coverage, run the conversion against the canonical pci.ids:
 
 ```bash
-# Hierarchical (default, recommended for hand-edit on top):
-scripts/pci-ids-to-json5.py /path/to/pci.ids \
-    > pci-ids.json5
+# Schema 2 (default) — hierarchical, both vendors[] and classes[]
+# in one file. Recommended for hand-edit on top.
+scripts/pci-ids-to-json5.py /path/to/pci.ids > pci-ids.json5
 
 # Curated subset (drops devices / subsystems for vendors not in
 # the list; vendors themselves are always emitted):
 scripts/pci-ids-to-json5.py --vendors-only 8086,1022,10de,14e4,15b3 \
     /path/to/pci.ids > pci-ids.json5
 
-# Class overlay (writes pci-class.json5 alongside the pci-ids file):
-scripts/pci-ids-to-json5.py --emit-class pci-class.json5 \
-    /path/to/pci.ids > pci-ids.json5
+# Schema 1 (legacy) — flat vendors-only layout for back-compat
+# with old generated files. Drops the classes[] section.
+scripts/pci-ids-to-json5.py --schema 1 /path/to/pci.ids \
+    > pci-ids-legacy.json5
 
 # Verify the script itself:
 scripts/pci-ids-to-json5.py --self-test
@@ -167,10 +168,10 @@ scripts/pci-ids-to-json5.py --self-test
 ## Testing your integration
 
 The integration test runner (`test/integration/test-axl.sh`) stages
-both `share/pci-ids.json5` and `share/pci-class.json5` next to test
-EFIs. Consumer tests can exercise the lookup paths against the
-known curated entries (e.g. `0x8086:0x29C0` decodes to
-`"Intel Corporation Q35 Host Bridge"`).
+`share/pci-ids.json5` next to test EFIs. Consumer tests can
+exercise the lookup paths against the known curated entries
+(e.g. `0x8086:0x29C0` decodes to `"Intel Corporation Q35 Host
+Bridge"`).
 
 For consumer-side fixtures that need controlled input, prefer the
 buffer API (`axl_pci_ids_open_from_buffer` / `axl_pci_class_open_from_buffer`)

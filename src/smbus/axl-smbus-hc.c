@@ -13,6 +13,7 @@
 #include "axl-smbus-internal.h"
 
 #include <axl/axl-log.h>
+#include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("smbus-hc");
 
@@ -98,6 +99,43 @@ hc_write_byte(void *vctx,
     return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
 }
 
+static int
+hc_receive_byte(void *vctx, uint8_t slave, uint8_t *out)
+{
+    EFI_SMBUS_HC_PROTOCOL   *hc = (EFI_SMBUS_HC_PROTOCOL *)vctx;
+    EFI_SMBUS_DEVICE_ADDRESS addr = { .SmbusDeviceAddress = slave };
+    EFI_SMBUS_DEVICE_COMMAND cmd  = 0;
+    UINTN                    length = 1;
+    uint8_t                  byte = 0;
+
+    EFI_STATUS s = axl_efi_call(hc->Execute, 7,
+                                hc, addr, cmd,
+                                EfiSmbusReceiveByte, FALSE,
+                                &length, &byte);
+    if (EFI_ERROR(s)) {
+        return AXL_ERR;
+    }
+    *out = byte;
+    return AXL_OK;
+}
+
+static int
+hc_quick(void *vctx, uint8_t slave, bool is_read)
+{
+    EFI_SMBUS_HC_PROTOCOL   *hc = (EFI_SMBUS_HC_PROTOCOL *)vctx;
+    EFI_SMBUS_DEVICE_ADDRESS addr = { .SmbusDeviceAddress = slave };
+    EFI_SMBUS_DEVICE_COMMAND cmd  = 0;
+    UINTN                    length = 0;
+
+    EFI_STATUS s = axl_efi_call(hc->Execute, 7,
+                                hc, addr, cmd,
+                                is_read ? EfiSmbusQuickRead
+                                        : EfiSmbusQuickWrite,
+                                FALSE,
+                                &length, NULL);
+    return EFI_ERROR(s) ? AXL_ERR : AXL_OK;
+}
+
 static void
 hc_close(void *vctx)
 {
@@ -110,6 +148,39 @@ hc_close(void *vctx)
 // ---------------------------------------------------------------------------
 // Public opener
 // ---------------------------------------------------------------------------
+
+int
+axl_smbus_hc_open_handle(AxlSmbusTransportOps *ops, void *handle)
+{
+    if (ops == NULL || handle == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_SMBUS_HC_PROTOCOL *hc   = NULL;
+    EFI_GUID               guid = gEfiSmbusHcProtocolGuid;
+    EFI_STATUS s = gBS->HandleProtocol((EFI_HANDLE)handle, &guid, (VOID **)&hc);
+    if (EFI_ERROR(s) || hc == NULL) {
+        return AXL_ERR;
+    }
+    if (hc->Execute == NULL) {
+        return AXL_ERR;
+    }
+
+    ops->kind        = AXL_SMBUS_TRANSPORT_HC;
+    ops->read_block  = hc_read_block;
+    ops->write_block = hc_write_block;
+    ops->read_byte   = hc_read_byte;
+    ops->write_byte  = hc_write_byte;
+    ops->quick        = hc_quick;
+    ops->receive_byte = hc_receive_byte;
+    ops->close       = hc_close;
+    ops->ctx         = hc;
+    /* Handle pointer disambiguates which of the (typically 1, sometimes
+     * several) HC instances this session represents. */
+    axl_snprintf(ops->desc, sizeof(ops->desc),
+                 "EFI SMBus HC handle %p", handle);
+    return AXL_OK;
+}
 
 int
 axl_smbus_hc_open(AxlSmbusTransportOps *ops)
@@ -134,7 +205,11 @@ axl_smbus_hc_open(AxlSmbusTransportOps *ops)
     ops->write_block = hc_write_block;
     ops->read_byte   = hc_read_byte;
     ops->write_byte  = hc_write_byte;
+    ops->quick        = hc_quick;
+    ops->receive_byte = hc_receive_byte;
     ops->close       = hc_close;
     ops->ctx         = hc;
+    axl_snprintf(ops->desc, sizeof(ops->desc),
+                 "EFI SMBus HC (LocateProtocol)");
     return AXL_OK;
 }

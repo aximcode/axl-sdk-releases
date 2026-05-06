@@ -68,8 +68,22 @@ struct AxlTcp {
 /* EFI service-binding helpers shared between sync and async files.
    Defined in axl-tcp-sync.c. */
 
+/* Walk every TCP4 service binding handle and pick one that's actually
+   usable for the requested route:
+     1. If `forced_source != NULL`, only a handle whose
+        IP4Config2 InterfaceInfo.StationAddress matches is acceptable.
+     2. Otherwise, skip handles with StationAddress == 0.0.0.0.
+     3. Among the remaining, prefer one whose
+        (StationAddress & SubnetMask) == (dest & SubnetMask).
+     4. Fall back to the first valid handle if no subnet match.
+   `forced_source == NULL` is the default "auto" path; pass an
+   AxlIPv4Address to pin to a specific local interface.
+   `dest` is the destination IPv4 — used only for subnet-match
+   preference and may be NULL (degrades to "first valid"). */
 EFI_STATUS
 tcp_find_service_binding(
+    const EFI_IPv4_ADDRESS         *dest,
+    const EFI_IPv4_ADDRESS         *forced_source,
     EFI_SERVICE_BINDING_PROTOCOL  **sb,
     EFI_HANDLE                    *out_handle
 );

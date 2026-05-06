@@ -103,7 +103,7 @@ cover the USB-IF Defined Class Codes
 (<https://www.usb.org/defined-class-codes>) — base classes, common
 subclasses (HID Boot, Mass Storage SCSI, CDC variants, ...), and the
 most-used protocol bytes (HID Mouse / Keyboard, BBB, UAS). No
-sidecar overlay yet (AxlPci has one — `pci-class.json5` — but the
+sidecar overlay yet (AxlPci has one — the `classes[]` section of `pci-ids.json5` — but the
 USB compiled-in set covers what we ship today).
 
 ## Topology walk

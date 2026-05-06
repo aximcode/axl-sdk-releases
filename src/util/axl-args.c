@@ -73,6 +73,8 @@ static int args_run_internal(int argc, char **argv,
 
 static void print_help_for(const AxlArgsNode *node, const char *path);
 
+static bool parse_typed(ParsedArg *slot, const char *value, const char *path);
+
 // ---------------------------------------------------------------------------
 // Descriptor / verb helpers
 // ---------------------------------------------------------------------------
@@ -229,6 +231,27 @@ register_descs(AxlArgs *a, int base, const AxlArgDesc *list)
         a->slots[base + i].uint_value  = 0;
         a->slots[base + i].int_value   = 0;
         a->slots[base + i].multi_values = NULL;
+        /* If a default_value is configured for a numeric type, parse it
+         * now so axl_args_get_uint/get_int return the default when the
+         * flag is unset. parse_typed sets .set=true unconditionally; we
+         * restore it to false so the slot still looks "user did not
+         * pass this flag" — distinguishes default from explicit-set
+         * for callers that care (e.g., --port not given vs --port 8080
+         * explicitly). String/bool/multi types already work correctly
+         * via str_value alone, so we only run this for numeric types. */
+        if (list[i].default_value != NULL) {
+            switch (list[i].type) {
+                case AXL_ARG_U8:  case AXL_ARG_U16:
+                case AXL_ARG_U32: case AXL_ARG_U64:
+                case AXL_ARG_S64:
+                    parse_typed(&a->slots[base + i],
+                                list[i].default_value, "default");
+                    a->slots[base + i].set = false;
+                    break;
+                default:
+                    break;
+            }
+        }
     }
     return base + desc_count(list);
 }

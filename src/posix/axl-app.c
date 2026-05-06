@@ -332,7 +332,7 @@ _axl_args_init(void *image_handle)
      * invoked apps this is the raw command-line string the user typed
      * (as UCS-2). We parse it ourselves instead of relying on
      * EFI_SHELL_PARAMETERS_PROTOCOL — the shell-params protocol is
-     * Shell 2.0-specific and not universally published (e.g. Dell's
+     * Shell 2.0-specific and not universally published (e.g. some OEM
      * firmware shell doesn't install it for cross-volume invocations,
      * and it's entirely absent in BDS/bootloader contexts). Parsing
      * LoadOptions is one code path that works everywhere. */

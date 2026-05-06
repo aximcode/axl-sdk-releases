@@ -39,7 +39,7 @@ OBJCOPY    = $(CROSS)objcopy
 # an intermediate consumed by objcopy → PE/COFF; no OS ever loads it,
 # so the linker's RWX-segment warning is a false positive (the resulting
 # .efi has properly split per-section permissions, see PE characteristics).
-LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments
+LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined
 
 CFLAGS_BASE = -std=gnu2x \
               -ffreestanding -fshort-wchar \
@@ -227,6 +227,7 @@ LIB_SOURCES = \
     src/smbus/axl-smbus.c \
     src/smbus/axl-smbus-hc.c \
     src/smbus/axl-smbus-i2c.c \
+    src/smbus/axl-smbus-piix4.c \
     src/smbus/axl-smbus-format.c \
     src/ipmi/axl-ipmi.c \
     src/ipmi/axl-ipmi-kcs.c \
@@ -273,6 +274,8 @@ MBEDTLS_SOURCES = \
     deps/mbedtls/library/pkwrite.c \
     deps/mbedtls/library/pk_ecc.c \
     deps/mbedtls/library/pk_wrap.c \
+    deps/mbedtls/library/rsa.c \
+    deps/mbedtls/library/rsa_alt_helpers.c \
     deps/mbedtls/library/platform.c \
     deps/mbedtls/library/platform_util.c \
     deps/mbedtls/library/sha256.c \
@@ -300,6 +303,52 @@ endif
 BUILDDIR   = $(PREFIX)/build
 LIB_OBJS   = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(LIB_SOURCES)))
 
+# ===================================================================
+# AXL_TLS state-change detection
+# ===================================================================
+#
+# Toggling AXL_TLS between builds changes which .c files end up in
+# LIB_SOURCES (mbedtls files are appended only when AXL_TLS=1). Naive
+# `make` is unsafe across the toggle for two reasons:
+#
+#   1. libaxl.a from a previous AXL_TLS=0 run has its mtime AFTER all
+#      its .o files, so make sees it as up-to-date and skips the
+#      `ar rcs` step — the new mbedtls .o files never get archived.
+#      Result: a "TLS-enabled" libaxl.a that's missing every TLS
+#      symbol, silently produces non-TLS tool binaries.
+#
+#   2. Tool .efi files from a previous run can be NEWER than the old
+#      libaxl.a. With AXL_TLS=1 added, libaxl.a will be rebuilt
+#      mid-make to a later mtime, but make computed dep freshness at
+#      startup using OLD libaxl.a mtime — so it concluded the tools
+#      were up-to-date and never re-linked them. End state: tool
+#      .efis older than the libaxl.a they're "linked against." Real
+#      symptom observed 2026-05-04: `fetch.efi` 22:23, libaxl.a 22:25.
+#
+# Both are fixed by detecting the toggle at parse time (before any
+# rule fires) and wiping the artifacts that would be stale. Subsequent
+# rules see a clean build tree and rebuild correctly. A make-time
+# state change is rare enough that the wipe cost is acceptable.
+# Only act on the toggle when the user is actually building something.
+# `make clean*` and `make help` shouldn't trip the state-change wipe,
+# nor write the state file (we don't want a clean-tools call to alter
+# the recorded state and confuse the next real build).
+NONCLEAN_GOALS := $(filter-out clean clean-tools help check-version,$(or $(MAKECMDGOALS),all))
+
+ifneq ($(NONCLEAN_GOALS),)
+TLS_STATE := $(if $(AXL_TLS),on,off)
+TLS_STATE_FILE := $(BUILDDIR)/.axl-tls-state
+PREV_TLS_STATE := $(shell cat $(TLS_STATE_FILE) 2>/dev/null)
+
+ifneq ($(TLS_STATE),$(PREV_TLS_STATE))
+ifneq ($(PREV_TLS_STATE),)
+$(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, and tools to avoid stale-archive linkage)
+$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so)
+endif
+$(shell mkdir -p $(BUILDDIR) && echo $(TLS_STATE) > $(TLS_STATE_FILE))
+endif
+endif
+
 # CRT0 objects (C entry point bridges).
 #   native  -- full runtime: registry, atexit, signal notify, default loop.
 #   minimal -- opt-out variant for size-constrained or exit-managed apps.
@@ -311,7 +360,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version
+.PHONY: all clean clean-tools hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -732,10 +781,10 @@ $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
-tools: $(TOOL_EFIS)
+tools: all $(TOOL_EFIS)
 	@echo "  Built $(words $(TOOL_NAMES)) tools"
 
 # Embedded driver blob for mkrd. Vendored EDK2 RamDiskDxe.efi (one per
@@ -789,3 +838,10 @@ $(PREFIX)/tools:
 
 clean:
 	rm -rf $(PREFIX)
+
+# Targeted clean for tool binaries (uefi-devkit references this from
+# its `tools-clean` recipe — it doesn't want to wipe libaxl.a). Also
+# drops the per-tool .o files since BUILD_TOOL puts them in $(BUILDDIR).
+clean-tools:
+	rm -f $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so
+	@for t in $(TOOL_NAMES); do rm -f $(BUILDDIR)/$$t.o; done

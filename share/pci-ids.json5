@@ -1,18 +1,31 @@
-// PCI vendor/device/subsystem identifier database for axl-sdk.
+// PCI vendor/device/subsystem + class-name database for axl-sdk.
+//
+// Schema 2 — hierarchical, two independent top-level sections:
+//
+//   vendors[]   — devices nest under their parent vendor;
+//                 subsystems nest under their parent device.
+//                 Read by axl_pci_ids_load.
+//   classes[]   — subclasses nest under bases; programming
+//                 interfaces nest under subclasses.
+//                 Read by axl_pci_class_load (overlay on top of
+//                 the compiled-in tables in src/pci/axl-pci.c).
+//
+// Either section is optional — the loader for an absent section
+// just sees an empty walk. The two loaders read the same file;
+// each ignores the section it doesn't care about.
 //
 // Curated subset of the canonical pci.ids registry — focused on
 // devices that show up in QEMU emulation, common server/BMC
 // hardware, and the consumer workloads axl-sdk consumers actually
 // encounter (NICs, NVMe, GPUs). Numeric IDs themselves are
 // uncopyrightable factual data; names are sourced from the public
-// pci.ids registry (https://pci-ids.ucw.cz/).
+// pci.ids registry (https://pci-ids.ucw.cz/). Class triplet names
+// sourced from the PCI-SIG Code and ID Assignment Specification.
 //
-// Schema 2 — hierarchical: devices nest under their parent vendor;
-// subsystems nest under their parent device. Locality of related
-// rows is the win when maintaining thousands of entries by hand.
-// (Schema 1 was the flat layout — three top-level arrays. The
-// loader still accepts schema 1 for backwards compatibility, but
-// new files should use schema 2.)
+// History — schema 1 (flat) was the original layout; schema 2
+// (hierarchical) replaced it pre-v0.12.0 for vendors[] and
+// post-v0.12.0 for classes[]. The loader still accepts schema 1
+// for back-compat with old generated files; new data is schema 2.
 //
 // To extract a larger set from the full pci.ids text database,
 // see scripts/pci-ids-to-json5.py.
@@ -143,4 +156,19 @@
         { id: 0x8088, name: 'Intel (Integrated)' },
         { id: 0x80EE, name: 'VirtualBox' },
     ],
+
+    // -----------------------------------------------------------------
+    // Class triplet overrides (base, subclass, programming interface)
+    //
+    // Optional overlay consulted by axl_pci_class_string_fmt before
+    // the compiled-in tables in src/pci/axl-pci.c. Lets new class
+    // triplets (CXL Memory Expanders, future PCIe class assignments)
+    // get human-readable names with a `git pull` of this file rather
+    // than rebuilding every consumer.
+    //
+    // Empty by default — the compiled-in tables in axl-pci.c cover
+    // the ~150 standard triplets. Add overrides as new ones ship
+    // before the next axl-sdk release.
+    // -----------------------------------------------------------------
+    classes: [],
 }

@@ -44,6 +44,9 @@ static const AxlArgDesc flags[] = {
       .help = "Append `$` at the end of each line" },
     { .name = "show-tabs",     .short_name = 'T', .type = AXL_ARG_BOOL,
       .help = "Display TAB characters as `^I`" },
+    { .name = "show-nonprinting", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Display non-printing characters via caret/M-notation "
+              "(matches Linux `cat -v`)" },
     { .name = "raw",                              .type = AXL_ARG_BOOL,
       .help = "Write through axl_stdout_raw (binary-clean pipes; "
               "no UTF-8→UCS-2 console conversion)" },
@@ -318,12 +321,14 @@ run_cat(AxlArgs *a)
 {
     number_lines   = axl_args_get_bool(a, "number");
     squeeze_blanks = axl_args_get_bool(a, "squeeze-blank");
-    show_ends      = axl_args_get_bool(a, "show-ends");
-    show_tabs      = axl_args_get_bool(a, "show-tabs");
-    raw_output     = axl_args_get_bool(a, "raw");
+    show_ends        = axl_args_get_bool(a, "show-ends");
+    show_tabs        = axl_args_get_bool(a, "show-tabs");
+    show_nonprinting = axl_args_get_bool(a, "show-nonprinting");
+    raw_output       = axl_args_get_bool(a, "raw");
 
-    /* -A is a meta-flag that turns on -E, -T, and the caret/M-notation
-       transformer simultaneously (matching Linux `cat -A`). */
+    /* -A is a meta-flag that turns on -E, -T, and -v simultaneously
+       (matching Linux `cat -A`). -v alone is the just-non-printing
+       transformer. */
     if (axl_args_get_bool(a, "show-all")) {
         show_ends        = true;
         show_tabs        = true;

@@ -11,7 +11,7 @@
     Intentionally publishes only EFI_I2C_MASTER_PROTOCOL (not SMBus
     HC): AxlSmbus probes HC first, and if we published both the SMBus
     HC path would win — but the B1-fixed framing (and the real
-    Dell/Grace firmware path) is the I2C Master fallback. So this
+    some OEM/Grace firmware path) is the I2C Master fallback. So this
     shim forces the fallback so the test exercises the code path that
     actually matters.
 

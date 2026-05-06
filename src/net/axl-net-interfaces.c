@@ -150,6 +150,109 @@ axl_net_is_available(void)
 // axl_net_list_interfaces
 // ---------------------------------------------------------------------------
 
+/*
+ * Populate iface->ipv4/netmask/gateway/has_ipv4 from any IP4Config2
+ * instance whose SNP (or IP4 service-binding parent) MAC matches the
+ * caller's mac[6]. some OEM UEFI implementations bind IP4Config2 to a child handle
+ * separate from the bare-NIC SNP handle, so we have to enumerate
+ * IP4Config2 handles independently and correlate by MAC rather than
+ * looking it up on the SNP handle directly.
+ *
+ * EDK2 shell `ifconfig` does the same enumeration. Pre-fix behavior
+ * was to call HandleProtocol(IP4Config2) on each SNP handle, which
+ * returned NOT_FOUND for that style of binding → IPv4 column showed "-"
+ * for DHCP-bound NICs.
+ */
+static void
+populate_ipv4_for_mac(
+    AxlNetInterface *iface
+    )
+{
+    EFI_STATUS   status;
+    EFI_HANDLE  *handles = NULL;
+    size_t       num_handles = 0;
+
+    status = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
+        ByProtocol,
+        &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+        NULL,
+        &num_handles,
+        &handles);
+    if (EFI_ERROR(status) || num_handles == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < num_handles; i++) {
+        /* Match by MAC: SNP on the same handle (or inherited via the
+         * binding chain) carries the controller's MAC. If no SNP is
+         * reachable from this handle, we can't safely correlate and
+         * skip the entry. */
+        EFI_SIMPLE_NETWORK_PROTOCOL *snp = NULL;
+        status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+            handles[i],
+            &EFI_SIMPLE_NETWORK_PROTOCOL_GUID,
+            (void **)&snp);
+        if (EFI_ERROR(status) || snp == NULL || snp->Mode == NULL) {
+            continue;
+        }
+
+        size_t mac_len = snp->Mode->HwAddressSize;
+        if (mac_len > 6) mac_len = 6;
+        if (axl_memcmp(iface->mac, &snp->Mode->CurrentAddress, mac_len) != 0) {
+            continue;
+        }
+
+        EFI_IP4_CONFIG2_PROTOCOL *ip4cfg = NULL;
+        status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+            handles[i],
+            &EFI_IP4_CONFIG2_PROTOCOL_GUID,
+            (void **)&ip4cfg);
+        if (EFI_ERROR(status) || ip4cfg == NULL) {
+            continue;
+        }
+
+        /* Two-call pattern: first GetData with NULL buf returns
+         * EFI_BUFFER_TOO_SMALL with the required size. */
+        size_t info_size = 0;
+        status = axl_efi_call(ip4cfg->GetData, 4,
+            ip4cfg, Ip4Config2DataTypeInterfaceInfo, &info_size, NULL);
+        if (status != EFI_BUFFER_TOO_SMALL || info_size == 0) {
+            continue;
+        }
+        EFI_IP4_CONFIG2_INTERFACE_INFO *info = axl_backend_alloc(info_size);
+        if (info == NULL) {
+            continue;
+        }
+        status = axl_efi_call(ip4cfg->GetData, 4,
+            ip4cfg, Ip4Config2DataTypeInterfaceInfo, &info_size, info);
+        if (EFI_ERROR(status)) {
+            axl_backend_free(info);
+            continue;
+        }
+        EFI_IPv4_ADDRESS *sa = &info->StationAddress;
+        if (sa->Addr[0] != 0 || sa->Addr[1] != 0 ||
+            sa->Addr[2] != 0 || sa->Addr[3] != 0)
+        {
+            iface->has_ipv4 = true;
+            axl_memcpy(iface->ipv4,    &info->StationAddress, 4);
+            axl_memcpy(iface->netmask, &info->SubnetMask,     4);
+        }
+        axl_backend_free(info);
+
+        if (iface->has_ipv4) {
+            EFI_IPv4_ADDRESS gw;
+            size_t gw_size = sizeof(gw);
+            status = axl_efi_call(ip4cfg->GetData, 4,
+                ip4cfg, Ip4Config2DataTypeGateway, &gw_size, &gw);
+            if (!EFI_ERROR(status)) {
+                axl_memcpy(iface->gateway, &gw, 4);
+            }
+            break;     /* one IP per NIC is enough for the listing */
+        }
+    }
+    axl_backend_free(handles);
+}
+
 int
 axl_net_list_interfaces(AxlNetInterface *out, size_t *count)
 {
@@ -207,49 +310,10 @@ axl_net_list_interfaces(AxlNetInterface *out, size_t *count)
         iface->link_up = snp->Mode->MediaPresent ? true : false;
         iface->mtu = snp->Mode->MaxPacketSize;
 
-        /* Try to get IPv4 config from IP4Config2 on the same handle */
-        EFI_IP4_CONFIG2_PROTOCOL *ip4cfg = NULL;
-        status = axl_efi_call(axl_bs()->HandleProtocol, 3,
-            handles[i],
-            &EFI_IP4_CONFIG2_PROTOCOL_GUID,
-            (void **)&ip4cfg);
-
-        if (!EFI_ERROR(status) && ip4cfg != NULL) {
-            EFI_IP4_CONFIG2_INTERFACE_INFO info;
-            size_t info_size = sizeof(info);
-
-            status = axl_efi_call(ip4cfg->GetData, 4,
-                ip4cfg,
-                Ip4Config2DataTypeInterfaceInfo,
-                &info_size,
-                &info);
-
-            if (!EFI_ERROR(status)) {
-                /* Check if IP is nonzero */
-                if (info.StationAddress.Addr[0] != 0 ||
-                    info.StationAddress.Addr[1] != 0 ||
-                    info.StationAddress.Addr[2] != 0 ||
-                    info.StationAddress.Addr[3] != 0)
-                {
-                    iface->has_ipv4 = true;
-                    axl_memcpy(iface->ipv4, &info.StationAddress, 4);
-                    axl_memcpy(iface->netmask, &info.SubnetMask, 4);
-                }
-            }
-
-            /* Try to get gateway via policy data */
-            EFI_IPv4_ADDRESS gw;
-            size_t gw_size = sizeof(gw);
-            status = axl_efi_call(ip4cfg->GetData, 4,
-                ip4cfg,
-                Ip4Config2DataTypeGateway,
-                &gw_size,
-                &gw);
-
-            if (!EFI_ERROR(status) && iface->has_ipv4) {
-                axl_memcpy(iface->gateway, &gw, 4);
-            }
-        }
+        /* IP4Config2 lives on a child handle on some OEM firmware; can't
+         * just HandleProtocol on this SNP handle. Walk all
+         * IP4Config2 instances and match by MAC. */
+        populate_ipv4_for_mac(iface);
 
         filled++;
     }

@@ -29,6 +29,8 @@ const AxlConfigDesc http_server_descs[] = {
       offsetof(struct AxlHttpServer, upload_chunk_size), sizeof(size_t) },
     { "cache.ttl.ms",   AXL_CFG_UINT, "60000", "Default response cache TTL in milliseconds",
       offsetof(struct AxlHttpServer, cache_ttl_ms), sizeof(size_t) },
+    { "listen.ip",      AXL_CFG_STRING, "", "Bind listener to interface with this station IP (dotted-quad, empty = auto)",
+      offsetof(struct AxlHttpServer, listen_ip), sizeof(char *) },
     { 0 }
 };
 
@@ -290,10 +292,28 @@ axl_http_server_attach(AxlHttpServer *s, AxlLoop *loop)
     }
 
     //
-    // Start listener if not already
+    // Start listener if not already. If `listen.ip` is set (non-empty,
+    // non-zero, parseable), pin the listener to that interface; else
+    // auto-pick (skip 0.0.0.0 interfaces, first valid handle).
+    // Mirrors the source.ip flow on the http-client side; same parse-
+    // failure-is-hard-error semantics.
     //
     if (s->listener == NULL) {
-        if (axl_tcp_listen(s->port, &s->listener) != AXL_OK) {
+        AxlIPv4Address  src   = { 0 };
+        AxlIPv4Address *src_p = NULL;
+        if (s->listen_ip != NULL && s->listen_ip[0] != '\0') {
+            if (axl_ipv4_parse(s->listen_ip, src.addr) != AXL_OK) {
+                axl_error("listen.ip='%s' is not a valid IPv4 address",
+                          s->listen_ip);
+                return AXL_ERR;
+            }
+            bool nonzero = src.addr[0] || src.addr[1]
+                        || src.addr[2] || src.addr[3];
+            if (nonzero) {
+                src_p = &src;
+            }
+        }
+        if (axl_tcp_listen_via(s->port, src_p, &s->listener) != AXL_OK) {
             return AXL_ERR;
         }
     }

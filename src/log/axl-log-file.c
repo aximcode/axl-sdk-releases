@@ -66,7 +66,15 @@ format_timestamp(char *buf, size_t buf_size)
 
     unsigned y = time.year, mo = time.month, d = time.day;
     unsigned h = time.hour, mi = time.minute, s = time.second;
+    /* Prefer the monotonic counter for sub-second precision —
+       firmware Nanosecond is 0 on every platform we test on. */
     unsigned us = time.nanosecond / 1000;
+    if (us == 0) {
+        uint64_t mono = axl_backend_get_monotonic_us();
+        if (mono > 0) {
+            us = (unsigned)(mono % 1000000u);
+        }
+    }
 
     int p = 0;
     buf[p++] = '0' + (y / 1000) % 10;

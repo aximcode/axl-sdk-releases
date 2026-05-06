@@ -420,6 +420,91 @@ test_smbios(void)
     test_check(axl_smbios_read_host_interface(bios, &iface_bad) == AXL_ERR,
                "smbios: read_host_interface rejects Type 0 hdr");
 
+    // ----- Synthetic Type 42 + Redfish-over-IP for the rich decoder -----
+    // Build a Type 42 record (header + interface + 1 protocol = ROI),
+    // then verify both the basic walker and the rich Redfish parser.
+    // Layout per SMBIOS 3.x §7.43.3 (91 fixed bytes + hostname).
+    //
+    // Hand-crafted bytes — easier to read than alignas-decorated structs.
+    static const uint8_t synthetic_type42[] = {
+        // SMBIOS header
+        42,             // Type = 42
+        7 + 0 + 1 + (2 + 91 + 4),   // Length = hdr(4) + iface_type(1) + iface_data_len(1) + iface_data(0) + proto_count(1) + proto_hdr(2) + ROI(91 + 4)
+        0x80, 0x00,     // Handle
+        // Type 42 modern body
+        0x40,           // interface_type = AXL_SMBIOS_HIF_NETWORK
+        0x00,           // interface_data_len = 0 (no device descriptor for this synthetic)
+        0x01,           // protocol_count = 1
+        // Protocol record [0]: Redfish-over-IP
+        0x04,           // protocol_type = AXL_SMBIOS_HIP_REDFISH_OVER_IP
+        91 + 4,         // protocol data length: 91 fixed + 4-char hostname
+        // -- ROI fixed payload (91 bytes) --
+        // service_uuid (16 bytes) — pattern 0x10..0x1F
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        0x02,           // host_ip_assignment = DHCP
+        0x01,           // host_ip_format = IPv4
+        // host_ip_address (16) — 169.254.1.10 in IPv4 mode
+        169, 254, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        // host_ip_mask (16)
+        255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x01,           // service_ip_discovery = Static
+        0x01,           // service_ip_format = IPv4
+        // service_ip_address (16) — 169.254.1.1
+        169, 254, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        // service_ip_mask (16)
+        255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xBB, 0x01,     // service_port = 0x01BB = 443 (HTTPS)
+        0x00, 0x00, 0x00, 0x00, // service_vlan_id = 0
+        0x04,           // hostname_len = 4
+        'b', 'm', 'c', 's',     // hostname = "bmcs"
+        // SMBIOS string table — empty terminator
+        0x00, 0x00,
+    };
+
+    AxlSmbiosHostInterface synth_iface;
+    AxlSmbiosHeader *synth_hdr = (AxlSmbiosHeader *)synthetic_type42;
+    test_check(axl_smbios_read_host_interface(synth_hdr, &synth_iface) == AXL_OK,
+               "smbios: synth read_host_interface OK");
+    test_check(synth_iface.interface_type == 0x40,
+               "smbios: synth interface_type == HIF_NETWORK");
+    test_check(synth_iface.protocol_count == 1,
+               "smbios: synth one protocol record");
+    test_check(synth_iface.protocols[0].protocol_type == 0x04,
+               "smbios: synth proto[0] is Redfish-over-IP");
+
+    AxlSmbiosRedfishOverIp roi;
+    test_check(axl_smbios_read_redfish_over_ip(&synth_iface.protocols[0], &roi) == AXL_OK,
+               "smbios: read_redfish_over_ip OK");
+    test_check(roi.host_ip_assignment == AXL_SMBIOS_REDFISH_HOST_IP_DHCP,
+               "smbios: ROI host_ip_assignment == DHCP");
+    test_check(roi.host_ip_format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4,
+               "smbios: ROI host_ip_format == IPv4");
+    test_check(roi.host_ip_address[0] == 169 && roi.host_ip_address[1] == 254
+            && roi.host_ip_address[2] == 1   && roi.host_ip_address[3] == 10,
+               "smbios: ROI host_ip 169.254.1.10");
+    test_check(roi.service_ip_address[0] == 169 && roi.service_ip_address[3] == 1,
+               "smbios: ROI service_ip 169.254.1.1");
+    test_check(roi.service_port == 443,
+               "smbios: ROI service_port == 443");
+    test_check(roi.hostname_len == 4
+            && roi.hostname != NULL
+            && roi.hostname[0] == 'b'
+            && roi.hostname[3] == 's',
+               "smbios: ROI hostname == \"bmcs\"");
+
+    /* Wrong protocol type → AXL_ERR. Use a doctored entry. */
+    AxlSmbiosHostInterfaceProtocol bad_proto = synth_iface.protocols[0];
+    bad_proto.protocol_type = 0x01;  /* IPMI, not Redfish */
+    test_check(axl_smbios_read_redfish_over_ip(&bad_proto, &roi) == AXL_ERR,
+               "smbios: read_redfish_over_ip rejects non-ROI protocol");
+
+    /* Truncated data → AXL_ERR. */
+    AxlSmbiosHostInterfaceProtocol short_proto = synth_iface.protocols[0];
+    short_proto.data_len = 50;  /* < 91 fixed minimum */
+    test_check(axl_smbios_read_redfish_over_ip(&short_proto, &roi) == AXL_ERR,
+               "smbios: read_redfish_over_ip rejects truncated data");
+
     // ----- Reentrant copy_string_utf8 -----
     char copy_buf[64];
     size_t n;
@@ -3419,6 +3504,10 @@ test_args_s64_bounds(void)
                "args S64: handler did not run on above-max");
 }
 
+/* Forward decl — definition follows test_args() so the new regression
+   doesn't disrupt the existing function ordering in this file. */
+static void test_args_numeric_default_value_applied(void);
+
 static void
 test_args(void)
 {
@@ -3447,6 +3536,66 @@ test_args(void)
     test_args_branch_default_unknown_verb_still_errors();
     test_args_branch_default_sees_branch_flags();
     test_args_branch_no_handler_still_shows_help();
+    test_args_numeric_default_value_applied();
+}
+
+/* Regression: AXL_ARG_U16/U32/U64 with .default_value="N" should
+   make axl_args_get_uint return N when the flag is unset.
+   Pre-fix bug (caught 2026-05-05 on axl-webfs serve hardware run):
+   register_descs assigned default_value into str_value but never
+   ran parse_typed, so uint_value stayed 0. axl-webfs's serve
+   listened on port 0 instead of the declared default 8080. */
+static int
+default_uint_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_uint = axl_args_get_uint(a, "port");
+    return 0;
+}
+
+static void
+test_args_numeric_default_value_applied(void)
+{
+    static const AxlArgDesc default_uint_flags[] = {
+        { .name = "port", .short_name = 'p', .type = AXL_ARG_U16,
+          .default_value = "8080", .help = "test port" },
+        {0}
+    };
+
+    /* Case 1: flag unset — should see the parsed default 8080. */
+    {
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name      = "argstest",
+            .help      = "default-value test",
+            .flags     = default_uint_flags,
+            .handler   = default_uint_handler,
+            .user_data = &cap,
+        };
+        char *argv[] = { (char *)"argstest" };
+        int rc = axl_args_run(1, argv, &app);
+        test_check(rc == 0, "args: default_value run accepted");
+        test_check(cap.seen_uint == 8080,
+                   "args: U16 default_value=\"8080\" applied to uint_value");
+    }
+
+    /* Case 2: flag explicitly set — should override the default. */
+    {
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name      = "argstest",
+            .help      = "default-value override test",
+            .flags     = default_uint_flags,
+            .handler   = default_uint_handler,
+            .user_data = &cap,
+        };
+        char *argv[] = { (char *)"argstest", (char *)"-p", (char *)"4242" };
+        int rc = axl_args_run(3, argv, &app);
+        test_check(rc == 0, "args: explicit override accepted");
+        test_check(cap.seen_uint == 4242,
+                   "args: explicit -p 4242 overrides default_value");
+    }
 }
 
 // ---------------------------------------------------------------------------

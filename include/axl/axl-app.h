@@ -58,7 +58,7 @@ axl_app_argv0(void);
  * binary, so it's reliable regardless of how the shell was invoked.
  *
  * The right anchor for sidecar discovery (`pci-ids.json5`,
- * `pci-class.json5`, `jedec.json5`, etc.) — see
+ * the `classes[]` section of `pci-ids.json5`, `jedec.json5`, etc.) — see
  * @ref axl_resolve_data_file, which prefers this over argv[0] when
  * available.
  *

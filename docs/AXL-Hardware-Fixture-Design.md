@@ -476,7 +476,7 @@ hardware topology, parts of which contradict QEMU's emulated
 hardware. Naive replay of every captured table breaks the guest.
 
 The clearest example is **MCFG**: it declares the PCIe ECAM base
-address and per-segment bus range. A captured Dell MCFG points at
+address and per-segment bus range. A captured OEM MCFG points at
 (say) `0xE0000000` covering buses `0x00–0xFF`. QEMU's pc-q35
 emulates ECAM at a different address with a different range. If
 the guest trusts the captured MCFG, every PCIe enumeration via

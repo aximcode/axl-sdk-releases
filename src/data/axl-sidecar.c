@@ -148,6 +148,12 @@ axl_sidecar_check_schema(
    _singleton_free pops it explicitly via axl_atexit_remove). */
 typedef struct {
     void                **handle_slot;
+    /* Back-pointers to the caller's bookkeeping slots so the thunk can
+       null them when it frees ctx — prevents `_singleton_free` running
+       after the thunk from double-freeing or dereferencing a dangling
+       *atexit_ctx_slot. */
+    uint32_t             *atexit_slot;
+    void                **atexit_ctx_slot;
     AxlSidecarCloseFn     close_fn;
 } SingletonAtexitCtx;
 
@@ -166,12 +172,23 @@ singleton_atexit_thunk(
         ctx->close_fn(*ctx->handle_slot);
         *ctx->handle_slot = NULL;
     }
-    /* ctx itself is intentionally not freed here — process exit
-       reclaims the small allocation. The early-free path
-       (_axl_sidecar_singleton_free) reclaims the heap via the
-       *atexit_ctx_slot bookkeeping. Skipping the free here means a
-       stale pointer can't surface in *atexit_ctx_slot if _free runs
-       after the thunk fires. */
+    /* Null the caller's bookkeeping BEFORE we free ctx. If
+       `_axl_sidecar_singleton_free` runs after this thunk (legal in
+       cleanup ordering — another module's atexit handler could call
+       it on its own way out), it will see a zeroed atexit_slot +
+       null atexit_ctx_slot and short-circuit safely. Without these
+       two writes, the late _free would `axl_free` a dangling
+       pointer. */
+    if (ctx->atexit_slot != NULL) {
+        *ctx->atexit_slot = 0;
+    }
+    if (ctx->atexit_ctx_slot != NULL) {
+        *ctx->atexit_ctx_slot = NULL;
+    }
+    /* Free ctx — atexit-runall happens before axl_mem_dump_leaks() in
+       axl_runtime_cleanup, so leaving ctx live here would surface as
+       a leak in the AxlMem report. */
+    axl_free(ctx);
 }
 
 AxlSidecarStatus
@@ -223,8 +240,10 @@ _axl_sidecar_singleton_load(
        reclaim the heap when it deregisters the thunk early. */
     SingletonAtexitCtx *ctx = axl_malloc(sizeof(*ctx));
     if (ctx != NULL) {
-        ctx->handle_slot = handle_slot;
-        ctx->close_fn    = close_fn;
+        ctx->handle_slot     = handle_slot;
+        ctx->atexit_slot     = atexit_slot;
+        ctx->atexit_ctx_slot = atexit_ctx_slot;
+        ctx->close_fn        = close_fn;
         *atexit_slot     = axl_atexit(singleton_atexit_thunk, ctx);
         if (*atexit_slot == 0) {
             axl_free(ctx);

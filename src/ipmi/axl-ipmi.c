@@ -84,16 +84,32 @@ probe_has_protocol(const EFI_GUID *guid)
  */
 static void
 decode_kcs_ports(uint64_t base_addr,
+                 uint8_t  base_addr_modifier,
                  uint16_t *out_data,
                  uint16_t *out_cmd)
 {
     uint64_t io_addr = base_addr & ~1ULL;
     //
-    // SMBIOS Type 38 stores the *data* port for KCS. The command/
-    // status port is data + 1 on standard platforms.
+    // SMBIOS Type 38 stores the *data* port for KCS. The cmd/status
+    // port is data + register_spacing. The spacing is encoded in
+    // BaseAddressModifier bits 7..6 per the SMBIOS spec (DSP0134
+    // 3.3.39.5) — verified against dmidecode source
+    // (dmi_ipmi_register_spacing reads `(data[0x10] >> 6) & 0x03`)
+    // and Linux's `ipmi_si_intf.c`:
+    //   0b00 → 1-byte stride (cmd = data + 1) — most x86 systems
+    //   0b01 → 4-byte stride (cmd = data + 4) — DWord-mapped
+    //                                            (some OEM BMCs
+    //                                            use this:
+    //                                            modifier=0x4A,
+    //                                            bits 7..6 = 01b)
+    //   0b10 → 16-byte stride (cmd = data + 16)
+    //   0b11 → reserved; treat as 1-byte fallback
     //
+    static const uint8_t reg_spacings[4] = { 1, 4, 16, 1 };
+    uint8_t spacing = reg_spacings[(base_addr_modifier >> 6) & 0x03];
+
     *out_data = (uint16_t)io_addr;
-    *out_cmd  = (uint16_t)(io_addr + 1);
+    *out_cmd  = (uint16_t)(io_addr + spacing);
 }
 
 //
@@ -142,11 +158,59 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
 
     switch (iface) {
     case IPMI_SMBIOS_IFACE_KCS: {
+        //
+        // Try the spec-encoded spacing first; if that cmd port reads
+        // 0xFF (unmapped), retry with the other two valid spacings.
+        // Some platforms (observed on some OEM BMC firmware) publish a modifier
+        // that doesn't match the actual hardware layout. Linux's
+        // ipmi_si_intf does similar probing fallbacks.
+        //
         uint16_t data_port, cmd_port;
-        decode_kcs_ports(base, &data_port, &cmd_port);
-        axl_info("SMBIOS Type 38: KCS @ 0x%x/0x%x",
-                 (unsigned)data_port, (unsigned)cmd_port);
-        return axl_ipmi_kcs_open(ops, data_port, cmd_port);
+        const uint8_t  spec_spacings[3] = { 1, 4, 16 };
+        const uint8_t  spec_modifier   = raw[16];
+        const uint8_t  primary_idx     = spec_modifier & 0x03;
+
+        decode_kcs_ports(base, spec_modifier, &data_port, &cmd_port);
+        axl_info("SMBIOS Type 38: KCS @ 0x%x/0x%x (modifier=0x%02x)",
+                 (unsigned)data_port, (unsigned)cmd_port,
+                 (unsigned)spec_modifier);
+        if (axl_ipmi_kcs_open(ops, data_port, cmd_port) == 0) {
+            return 0;
+        }
+        for (size_t i = 0; i < 3; i++) {
+            if (i == primary_idx) {
+                continue;       /* already tried */
+            }
+            uint8_t spacing = spec_spacings[i];
+            uint16_t alt_data = (uint16_t)(base & ~1ULL);
+            uint16_t alt_cmd  = (uint16_t)(alt_data + spacing);
+            axl_info("SMBIOS Type 38: KCS retry @ 0x%x/0x%x "
+                     "(spacing=%u, modifier mismatch fallback)",
+                     (unsigned)alt_data, (unsigned)alt_cmd,
+                     (unsigned)spacing);
+            if (axl_ipmi_kcs_open(ops, alt_data, alt_cmd) == 0) {
+                return 0;
+            }
+        }
+        //
+        // Last-resort: try swapping data/cmd ports. Some OEM
+        // platforms appear to publish the cmd port as Type 38
+        // BaseAddress (instead of the data port that Linux
+        // ipmi_si and the IPMI spec assume).
+        //
+        for (size_t i = 0; i < 3; i++) {
+            uint8_t spacing = spec_spacings[i];
+            uint16_t alt_cmd  = (uint16_t)(base & ~1ULL);
+            uint16_t alt_data = (uint16_t)(alt_cmd + spacing);
+            axl_info("SMBIOS Type 38: KCS swapped retry @ 0x%x/0x%x "
+                     "(spacing=%u, base-is-cmd fallback)",
+                     (unsigned)alt_data, (unsigned)alt_cmd,
+                     (unsigned)spacing);
+            if (axl_ipmi_kcs_open(ops, alt_data, alt_cmd) == 0) {
+                return 0;
+            }
+        }
+        return -1;
     }
     case IPMI_SMBIOS_IFACE_SSIF: {
         //
@@ -198,31 +262,92 @@ try_default_kcs(AxlIpmiTransportOps *ops)
 AxlIpmiSession *
 axl_ipmi_session_new(void)
 {
+    return axl_ipmi_session_new_with_transport(AXL_IPMI_TRANSPORT_UNKNOWN);
+}
+
+AxlIpmiSession *
+axl_ipmi_session_new_with_transport(AxlIpmiTransport hint)
+{
     AXL_AUTOPTR(AxlIpmiSession) s = axl_calloc(1, sizeof(AxlIpmiSession));
     if (s == NULL) {
         return NULL;
     }
 
-    //
-    // Auto-detect priority:
-    //   1. EDKII IPMI_PROTOCOL — firmware-mediated, preferred when
-    //      available because it handles platform quirks and reaches
-    //      BMCs we can't always address directly (e.g., no port I/O
-    //      access from this execution environment).
-    //   2. Dell EFI_IPMI_TRANSPORT — vendor-specific; nearly as good
-    //      as EDKII on Dell hardware.
-    //   3. SMBIOS Type 38 — pick KCS or SSIF based on InterfaceType.
-    //   4. Last-resort x86 default KCS ports (0x0CA2 / 0x0CA3).
-    //
-    if (axl_ipmi_edkii_open(&s->ops) != 0 &&
-        axl_ipmi_dell_open(&s->ops)  != 0 &&
-        try_smbios_detect(&s->ops)   != 0 &&
-        try_default_kcs(&s->ops)     != 0)
-    {
-        axl_warning("No IPMI transport available");
-        return NULL;
+    int rc = -1;
+    switch (hint) {
+    case AXL_IPMI_TRANSPORT_EDKII:
+        rc = axl_ipmi_edkii_open(&s->ops);
+        break;
+    case AXL_IPMI_TRANSPORT_DELL:
+        rc = axl_ipmi_dell_open(&s->ops);
+        break;
+    case AXL_IPMI_TRANSPORT_KCS:
+        //
+        // Prefer SMBIOS-Type-38-detected ports — some OEM platforms advertise
+        // 0xCA8/0xCA9 which differs from the x86 default. The linux kernel
+        // ipmi_si driver uses these same SMBIOS ports successfully on
+        // that BMC firmware, where the vendor EFI protocol misbehaves. If
+        // Type 38 says SSIF instead, refuse rather than silently
+        // downgrading — caller asked for KCS specifically.
+        //
+        rc = try_smbios_detect(&s->ops);
+        if (rc == 0 && s->ops.kind != AXL_IPMI_TRANSPORT_KCS) {
+            if (s->ops.close != NULL) {
+                s->ops.close(s->ops.ctx);
+            }
+            rc = -1;
+        }
+        if (rc != 0) {
+            rc = try_default_kcs(&s->ops);
+        }
+        break;
+    case AXL_IPMI_TRANSPORT_SSIF:
+        rc = try_smbios_detect(&s->ops);
+        if (rc == 0 && s->ops.kind != AXL_IPMI_TRANSPORT_SSIF) {
+            //
+            // SMBIOS Type 38 advertised KCS, not SSIF. Caller asked for
+            // SSIF specifically; refuse rather than silently downgrading.
+            //
+            if (s->ops.close != NULL) {
+                s->ops.close(s->ops.ctx);
+            }
+            rc = -1;
+        }
+        break;
+    case AXL_IPMI_TRANSPORT_UNKNOWN:
+    default:
+        //
+        // Auto-detect priority (IPMI spec puts SMBIOS Type 38 first;
+        // vendor protocols are convenience layers on top, used only
+        // as fallback). Real-world reason this order matters: the vendor
+        // EFI_IPMI_TRANSPORT on some firmware advertises itself but Get
+        // Device ID returns garbage, so trusting it over the spec
+        // path silently broke ipmi info / mc info / sel list etc.
+        //
+        //   1. SMBIOS Type 38 — KCS or SSIF per InterfaceType.
+        //      The Linux kernel ipmi_si driver also keys off this.
+        //   2. EDKII IPMI_PROTOCOL — firmware-mediated fallback.
+        //   3. Dell EFI_IPMI_TRANSPORT — vendor fallback.
+        //   4. Last-resort x86 default KCS ports (0x0CA2 / 0x0CA3).
+        //
+        // Override with axl_ipmi_session_new_with_transport(hint).
+        //
+        if (try_smbios_detect(&s->ops)   != 0 &&
+            axl_ipmi_edkii_open(&s->ops) != 0 &&
+            axl_ipmi_dell_open(&s->ops)  != 0 &&
+            try_default_kcs(&s->ops)     != 0)
+        {
+            rc = -1;
+        } else {
+            rc = 0;
+        }
+        break;
     }
 
+    if (rc != 0) {
+        axl_warning("No IPMI transport available (hint=%d)", (int)hint);
+        return NULL;
+    }
     return axl_steal_pointer(&s);
 }
 
@@ -346,6 +471,25 @@ axl_ipmi_probe(AxlIpmiProbe *out)
     out->intel_sm_ipmi_transport = probe_has_protocol(&intel_sm_ipmi_guid);
     out->mu_ipmi_transport2      = probe_has_protocol(&mu_ipmi_transport2_guid);
     out->smbus_hc_protocol       = probe_has_protocol(&gEfiSmbusHcProtocolGuid);
+
+    //
+    // SMBus HC: LocateProtocol only returns one instance, but some OEM
+    // platforms typically publish multiple HCs (one per bus segment
+    // — DIMMs are usually on a different segment than NIC EEPROMs
+    // etc.). Count handles so multi-segment platforms surface here,
+    // and so memspd can pick the right HC for SPD scanning.
+    //
+    EFI_GUID hc_guid = gEfiSmbusHcProtocolGuid;
+    UINTN    hc_count = 0;
+    EFI_HANDLE *hc_buf = NULL;
+    EFI_STATUS hc_st = gBS->LocateHandleBuffer(
+        ByProtocol, &hc_guid, NULL, &hc_count, &hc_buf);
+    if (!EFI_ERROR(hc_st)) {
+        out->smbus_hc_handle_count = (size_t)hc_count;
+        if (hc_buf != NULL) {
+            gBS->FreePool(hc_buf);
+        }
+    }
 
     //
     // I2C Master: LocateProtocol only catches one instance. Also

@@ -118,6 +118,27 @@ axl_backend_get_time(
     AxlTime  *time  ///< (out) receives current time
     );
 
+/**
+ * @brief Read a high-resolution monotonic counter, in microseconds.
+ *
+ * Uses the architecture's cycle counter (x86 TSC / aarch64
+ * CNTPCT_EL0) calibrated once at first call against a brief
+ * `gBS->Stall` interval (TSC) or read from the architectural
+ * frequency register (CNTFRQ_EL0). Subsequent calls are cheap —
+ * a single counter read and a multiplication.
+ *
+ * The epoch is "first call to this function" — values are
+ * monotonically increasing across calls within a single boot but
+ * have no defined relationship to wallclock time. Use
+ * @ref axl_backend_get_time for wallclock; combine the two for
+ * sub-second-precision logging.
+ *
+ * @return microseconds since the implicit boot epoch. Returns 0
+ *         if the architecture has no usable cycle counter.
+ */
+uint64_t
+axl_backend_get_monotonic_us(void);
+
 // ===================================================================
 // Low-level platform I/O (for AxlIpmi, future AxlPci/AxlSpd)
 // ===================================================================

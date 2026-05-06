@@ -167,7 +167,7 @@ date -u '+%Y-%m-%d'              > "$PREFIX/share/axl/build-date"
 # (the auto-discovery companion path) or pass --ids-file explicitly.
 # New class triplets, USB vendors, JEDEC manufacturer codes can all
 # land via a JSON5 update without rebuilding any consumer binary.
-for sidecar in pci-ids.json5 pci-class.json5 \
+for sidecar in pci-ids.json5 \
                usb-ids.json5 jedec.json5; do
     if [[ -f "$LIBAXL_DIR/share/$sidecar" ]]; then
         cp "$LIBAXL_DIR/share/$sidecar" "$PREFIX/share/axl/$sidecar"

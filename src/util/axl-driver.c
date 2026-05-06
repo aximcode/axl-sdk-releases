@@ -600,6 +600,19 @@ driver_build_candidates(
         {
             driver_append_candidate(candidates, n_cand, path_buf);
         }
+
+        /* 3.5: <name> at the volume root. Covers the common case where
+           the user drops the app and its driver side-by-side at fs0:\.
+           Candidate #2 (<image_dir>/<name>) misses this when the
+           image's own directory is just "\" or "/" — the join produces
+           a doubled separator that some path normalizers reject. */
+        if (axl_snprintf(sub_buf, sizeof(sub_buf),
+                         "/%s", driver_name) > 0
+            && axl_path_build_uefi(image_fs, sub_buf,
+                                   path_buf, sizeof(path_buf)) == AXL_OK)
+        {
+            driver_append_candidate(candidates, n_cand, path_buf);
+        }
     }
 
     /* 4: drivers/<arch>/<name> on every other mounted volume. */

@@ -102,9 +102,9 @@ AxlGuid *` on UEFI; on a future Linux backend it could be a path
 prefix):
 
 ```c
-extern const AxlGuid AXL_DELL_VENDOR_GUID;  // declared per-vendor
-axl_nvstore_register_namespace("dell", &AXL_DELL_VENDOR_GUID);
-axl_nvstore_get("dell", "SystemId", buf, &sz);
+extern const AxlGuid AXL_OEM_VENDOR_GUID;  // declared per-vendor
+axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID);
+axl_nvstore_get("oem", "AssetTag", buf, &sz);
 ```
 
 Other operations: `axl_nvstore_delete`, `axl_nvstore_iter` (walk
@@ -343,7 +343,7 @@ VOLUMES: 1 mounted
 POSIX argv shows what reached `main` after `axl-app.c` parsed
 `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions`. LOADOPT shows the raw
 UCS-2 buffer the firmware passed in. SHELL is the optional
-`EFI_SHELL_PARAMETERS_PROTOCOL` probe — Dell firmware sometimes
+`EFI_SHELL_PARAMETERS_PROTOCOL` probe — some OEM firmware sometimes
 doesn't publish it for cross-volume invocations, which was the
 original "argc=1" bug. IMG and VOLUMES are the search anchors
 `axl_driver_ensure` / `axl_driver_locate` use.

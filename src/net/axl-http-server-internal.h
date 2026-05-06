@@ -101,6 +101,9 @@ typedef struct {
 struct AxlHttpServer {
     AxlConfig         *config;
     uint16_t           port;
+    /* Optional listen-bind IP. Empty / "0.0.0.0" = auto-pick.
+       Otherwise pin to the interface whose station IP matches. */
+    char              *listen_ip;
     AxlTcp            *listener;
     HttpConn          *conns;
     size_t             max_conns;

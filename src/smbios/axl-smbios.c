@@ -542,7 +542,7 @@ axl_smbios_read_baseboard(
      * part of Type 2 since SMBIOS 2.0, so essentially always present.
      * 0 = "not published" for the rare too-short record. The canonical
      * server-blade detector is BoardType == 3 (NOT Type 3 chassis
-     * 0x1C/0x1D, which Dell BIOS doesn't reliably set). */
+     * 0x1C/0x1D, which some OEM BIOS doesn't reliably set). */
     if (t->Hdr.Length > 0x0D) {
         const uint8_t *b = (const uint8_t *)&t->Hdr;
         out->board_type = b[0x0D];
@@ -750,6 +750,81 @@ axl_smbios_read_host_interface(
         p += 2 + dlen;
         out->protocol_count++;
     }
+    return AXL_OK;
+}
+
+int
+axl_smbios_read_redfish_over_ip(
+    const AxlSmbiosHostInterfaceProtocol *proto,
+    AxlSmbiosRedfishOverIp               *out
+    )
+{
+    /* Layout per SMBIOS 3.x §7.43.3:
+       16  service_uuid
+        1  host_ip_assignment
+        1  host_ip_format
+       16  host_ip_address
+       16  host_ip_mask
+        1  service_ip_discovery
+        1  service_ip_format
+       16  service_ip_address
+       16  service_ip_mask
+        2  service_port (LE)
+        4  service_vlan_id (LE)
+        1  hostname_len (= H)
+        H  hostname
+       Fixed prefix = 91 bytes; total = 91 + hostname_len. */
+    if (proto == NULL || out == NULL) {
+        return AXL_ERR;
+    }
+    if (proto->protocol_type != AXL_SMBIOS_HIP_REDFISH_OVER_IP) {
+        return AXL_ERR;
+    }
+    if (proto->data == NULL || proto->data_len < 91) {
+        return AXL_ERR;
+    }
+
+    const uint8_t *p = proto->data;
+
+    /* Bulk byte fields. */
+    for (size_t i = 0; i < 16; i++) {
+        out->service_uuid[i] = p[i];
+    }
+    out->host_ip_assignment = (AxlSmbiosRedfishHostIpAssignment)p[16];
+    out->host_ip_format     = (AxlSmbiosRedfishIpFormat)p[17];
+    for (size_t i = 0; i < 16; i++) {
+        out->host_ip_address[i] = p[18 + i];
+    }
+    for (size_t i = 0; i < 16; i++) {
+        out->host_ip_mask[i] = p[34 + i];
+    }
+    out->service_ip_discovery = p[50];
+    out->service_ip_format    = (AxlSmbiosRedfishIpFormat)p[51];
+    for (size_t i = 0; i < 16; i++) {
+        out->service_ip_address[i] = p[52 + i];
+    }
+    for (size_t i = 0; i < 16; i++) {
+        out->service_ip_mask[i] = p[68 + i];
+    }
+    /* Multi-byte fields are little-endian on the SMBIOS wire. */
+    out->service_port = (uint16_t)((uint16_t)p[84]
+                                 | ((uint16_t)p[85] << 8));
+    out->service_vlan_id = (uint32_t)p[86]
+                         | ((uint32_t)p[87] << 8)
+                         | ((uint32_t)p[88] << 16)
+                         | ((uint32_t)p[89] << 24);
+    out->hostname_len = p[90];
+
+    /* Hostname bytes follow the fixed prefix. Reject truncated records
+       where firmware claims a hostname longer than the protocol_data
+       length permits. */
+    if ((size_t)91 + (size_t)out->hostname_len > proto->data_len) {
+        return AXL_ERR;
+    }
+    out->hostname = (out->hostname_len > 0)
+                  ? (const char *)(p + 91)
+                  : NULL;
+
     return AXL_OK;
 }
 
@@ -1494,7 +1569,7 @@ axl_smbios_chassis_class(
         case 0x17:                /* Rack Mount Chassis */
         case 0x19:                /* Multi-system Chassis */
         case 0x1B:                /* Advanced TCA — server-class.
-                                   * (Some Dell decoders historically
+                                   * (some downstream decoders historically
                                    * label this "Pizza Box"; per the
                                    * canonical SMBIOS spec / EDK2,
                                    * Pizza Box is 0x05 and 0x1B is

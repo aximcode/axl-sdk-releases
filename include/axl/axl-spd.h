@@ -41,6 +41,55 @@
 
     There is no @c axl_spd_init() entry point — first call to a
     public function lazily opens an @ref AxlSmbus session.
+
+    @section spd_limitations Platform limitations
+
+    Direct SPD reads work only when the platform's SMBus exposes
+    the DIMM EEPROMs to non-firmware software. On many server
+    boards this isn't true and the API returns 0 populated slots.
+    Known affected classes (verified empirically):
+
+    -# **OEM-CPLD-routed DIMMs on some AMD server boards
+       (FCH 1022:790b family)** — DDR5 SPDs are NOT on the FCH
+       AUX SMBus on these platforms. They're physically routed
+       through an OEM-specific CPLD ("FPGA hub PLD") behind a
+       vendor UEFI protocol; BIOS reads them there and
+       publishes the results via SMBIOS Type 17. The FCH AUX
+       SMBus is electrically present but empty, returning the
+       chipset-default "all-ACK + zero-data" pattern Linux
+       warns about in `drivers/i2c/busses/i2c-piix4.c` lines
+       968-974. Linux's spd5118 driver fails to bind for the
+       same reason — verified on an AMD-EPYC server with
+       kernel 6.19.10.
+
+    -# **Platforms where the SMBus exposing DIMM SPDs isn't
+       published as `EFI_SMBUS_HC_PROTOCOL` or
+       `EFI_I2C_MASTER_PROTOCOL`** — AxlSpd's auto-detect can't
+       find a transport. The PIIX4 direct-I/O fallback (when
+       AMD FCH SMBus PCI device is present) helps on boards
+       where firmware is opinionated about which controller it
+       advertises, but the chipset still has to deliver real
+       bytes (see #1).
+
+    -# **DDR3 / pre-2014 modules** — codec coverage is DDR4 +
+       DDR5 only. SPD3 EEPROMs respond but `axl_spd_decode`
+       returns `AxlSpdInfo{ ddr_generation = 0 }` for them.
+
+    @section spd_fallback Recommended consumer pattern
+
+    Treat AxlSpd as opportunistic and always have an SMBIOS
+    Type 17 fallback ready. Per-DIMM SMBIOS data — manufacturer,
+    part number, capacity, configured speed, ECC bits, slot
+    locator — is BIOS-populated on every system that ships
+    SMBIOS, including all the platforms where AxlSpd silently
+    finds nothing. See `tools/memspd.c` for the reference
+    "try AxlSpd first, fall back to SMBIOS Type 17" pattern.
+
+    The cases where AxlSpd genuinely beats SMBIOS Type 17 are
+    rare: live timing parameters (tCL, tRCD, tRP, tRAS) that
+    aren't exposed via Type 17, and platforms where the BIOS
+    publishes a stale or partial Type 17 (uncommon on modern
+    firmware).
 **/
 
 #ifndef AXL_SPD_H

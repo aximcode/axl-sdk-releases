@@ -58,6 +58,32 @@ axl_tcp_connect(
 );
 
 /**
+ * @brief Connect to a remote host via TCP4, with explicit interface selection.
+ *
+ * Like @ref axl_tcp_connect but adds optional pinning to a specific
+ * local interface by station IP. When @p source_ip is non-NULL and
+ * non-zero, the connect uses only the network interface whose IP4
+ * config matches that station address — useful when the host has
+ * multiple NICs and the destination is reachable via a specific one
+ * (e.g. an in-band BMC USB-NIC at 169.254.1.0/24).
+ *
+ * Pass @p source_ip = NULL or {0,0,0,0} for the auto-pick path:
+ *   1. skip interfaces whose station IP is 0.0.0.0
+ *   2. prefer an interface whose subnet contains the destination
+ *   3. fall back to the first valid (non-zero) interface
+ *
+ * @return AXL_OK on success, AXL_ERR on failure (including "no
+ *     interface matches @p source_ip" when forced).
+ */
+int
+axl_tcp_connect_via(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlTcp               **out_sock
+);
+
+/**
  * @brief Create a TCP4 listener on the given port.
  *
  * @return AXL_OK on success, AXL_ERR on failure.
@@ -66,6 +92,24 @@ int
 axl_tcp_listen(
     uint16_t port,           ///< local port to listen on
     AxlTcp   **out_listener  ///< receives the listener handle
+);
+
+/**
+ * @brief Create a TCP4 listener pinned to a specific local interface.
+ *
+ * Like @ref axl_tcp_listen but takes an optional source IP that
+ * selects which network interface to bind on a multi-NIC host. When
+ * @p source_ip is NULL or all-zeros, falls through to the auto-pick
+ * path used by @ref axl_tcp_listen.
+ *
+ * @return AXL_OK on success, AXL_ERR on failure (including "no
+ *     interface has station IP @p source_ip" when forced).
+ */
+int
+axl_tcp_listen_via(
+    uint16_t              port,
+    const AxlIPv4Address *source_ip,
+    AxlTcp              **out_listener
 );
 
 /**
@@ -257,6 +301,22 @@ axl_tcp_connect_async(
     AxlCancellable *cancel,  ///< optional cancel token (NULL = uncancellable)
     AxlTcpCallback  cb,      ///< callback on completion (return value ignored)
     void           *data     ///< opaque context
+);
+
+/**
+ * @brief Async sibling of @ref axl_tcp_connect_via.
+ *
+ * @p source_ip semantics match the synchronous variant.
+ */
+int
+axl_tcp_connect_async_via(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data
 );
 
 /**

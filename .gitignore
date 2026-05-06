@@ -31,3 +31,6 @@ CLAUDE.md
 # identifying data (serials, MACs, OEM strings). Local-only by default;
 # sanitization + public corpus is HF10's scope.
 test/fixtures/
+
+# Real-hardware capture data (not for distribution)
+DellXE7745/

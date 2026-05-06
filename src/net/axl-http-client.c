@@ -36,6 +36,18 @@ struct AxlHttpClient {
     bool            keep_alive;
     size_t          timeout_ms;
     int             max_redirects;
+    /* Optional source-IPv4 (dotted-quad string). Empty / "0.0.0.0"
+       means auto-pick (skip 0.0.0.0 interfaces, prefer subnet match,
+       else first valid). */
+    char           *source_ip;
+    /* Persistent ciphertext staging buffer for TLS recv. Held here
+       (not on the stack of client_recv) so the BIO's stage_buf
+       pointer remains valid across calls — mbedtls reads ciphertext
+       from this buffer incrementally as the caller drains plaintext.
+       Keeping it separate from the caller's plaintext destination
+       avoids the buffer-aliasing class of bugs (mbedtls writing
+       plaintext over still-staged ciphertext). */
+    uint8_t         tls_rx_buf[HTTP_CLIENT_RECV_BUF];
 };
 
 static const AxlConfigDesc http_client_descs[] = {
@@ -47,6 +59,8 @@ static const AxlConfigDesc http_client_descs[] = {
       offsetof(struct AxlHttpClient, max_redirects), sizeof(int) },
     { "tls.verify",    AXL_CFG_BOOL, "true", "TLS certificate verification",
       offsetof(struct AxlHttpClient, tls_verify), sizeof(bool) },
+    { "source.ip",     AXL_CFG_STRING, "", "Pin connect to interface with this station IP (dotted-quad, empty = auto)",
+      offsetof(struct AxlHttpClient, source_ip), sizeof(char *) },
     { 0 }
 };
 
@@ -184,8 +198,29 @@ ensure_connected(
     axl_free(c->connected_host);
     c->connected_host = NULL;
 
-    /* Connect */
-    if (axl_tcp_connect(host, port, &c->sock) != AXL_OK) {
+    /* Connect. If `source.ip` is set (non-empty, non-zero, parseable),
+       pin to that interface — fail fast on a malformed value rather
+       than silently falling through to auto-pick: an explicit pin that
+       silently isn't honored defeats the whole point of the flag. */
+    AxlIPv4Address  src   = { 0 };
+    AxlIPv4Address *src_p = NULL;
+    if (c->source_ip != NULL && c->source_ip[0] != '\0') {
+        if (axl_ipv4_parse(c->source_ip, src.addr) != AXL_OK) {
+            axl_error("source.ip='%s' is not a valid IPv4 address",
+                      c->source_ip);
+            return -1;
+        }
+        bool nonzero = src.addr[0] || src.addr[1]
+                    || src.addr[2] || src.addr[3];
+        if (nonzero) {
+            src_p = &src;
+        }
+        /* "0.0.0.0" string falls through to auto-pick — a documented
+           way for callers to spell "no preference" using the same
+           string slot, mirroring the C-level (NULL || zero) contract
+           on axl_tcp_connect_via. */
+    }
+    if (axl_tcp_connect_via(host, port, src_p, &c->sock) != AXL_OK) {
         return -1;
     }
 
@@ -253,25 +288,79 @@ client_send(AxlHttpClient *c, const void *data, size_t len)
     return axl_tcp_send(c->sock, data, len, c->timeout_ms);
 }
 
+/// Drain plaintext from mbedtls into `dst[0..want]` until either the
+/// destination fills, mbedtls signals WANT_READ (staging exhausted),
+/// or the connection closes. Returns plaintext bytes written.
+/// `*closed` is set true if peer sent close-notify or mbedtls error.
+static size_t
+tls_drain(
+    AxlTlsContext *ctx,
+    uint8_t       *dst,
+    size_t         want,
+    bool          *closed)
+{
+    size_t got = 0;
+    while (got < want) {
+        size_t out = 0;
+        int    rc  = axl_tls_read(ctx, dst + got, want - got, &out);
+        if (rc == 0 && out > 0) {
+            got += out;
+            continue;
+        }
+        if (rc == 1) {
+            break;  /* WANT_READ — staging exhausted */
+        }
+        /* rc < 0 (mbedtls error / close-notify) or rc == 0 with
+           out == 0 (shouldn't happen per axl_tls_read contract). */
+        *closed = true;
+        break;
+    }
+    return got;
+}
+
 static int
 client_recv(AxlHttpClient *c, void *buf, size_t *len)
 {
     if (c->tls_ctx != NULL) {
-        /* Receive raw TLS record from TCP, decrypt */
-        size_t raw_len = *len;
-        if (axl_tcp_recv(c->sock, buf, &raw_len, c->timeout_ms) != AXL_OK) {
+        /* TLS pattern (mirrors softbmc HttpServer.c TlsShimRead loop):
+           1. Drain any plaintext from already-staged ciphertext into
+              the caller's buf. The BIO's stage_buf points to our
+              persistent c->tls_rx_buf, which remains valid across
+              client_recv calls (and is never aliased with the
+              caller's plaintext destination, so mbedtls's
+              record-decrypt can't overwrite still-staged ciphertext).
+           2. If we got nothing, fetch a fresh TCP burst into
+              c->tls_rx_buf, restage, and drain again. A single TCP
+              burst can carry multiple TLS records; the drain loop
+              extracts them all in one call so the next stage_data
+              doesn't replace unconsumed ciphertext. */
+        size_t want   = *len;
+        bool   closed = false;
+
+        size_t got = tls_drain(c->tls_ctx, (uint8_t *)buf, want, &closed);
+        if (got > 0) {
+            *len = got;
+            return 0;
+        }
+        if (closed) {
+            return -1;
+        }
+
+        size_t raw_len = sizeof(c->tls_rx_buf);
+        if (axl_tcp_recv(c->sock, c->tls_rx_buf, &raw_len,
+                         c->timeout_ms) != AXL_OK) {
             return -1;
         }
         if (raw_len == 0) {
             *len = 0;
             return 0;
         }
-        axl_tls_stage_data(c->tls_ctx, buf, raw_len);
-        size_t out_len = 0;
-        int rc = axl_tls_read(c->tls_ctx, buf, *len, &out_len);
-        *len = out_len;
-        if (rc < 0) {
-            return -1;  /* TLS error or connection closed */
+        axl_tls_stage_data(c->tls_ctx, c->tls_rx_buf, raw_len);
+
+        got = tls_drain(c->tls_ctx, (uint8_t *)buf, want, &closed);
+        *len = got;
+        if (got == 0 && closed) {
+            return -1;
         }
         return 0;
     }
@@ -294,6 +383,150 @@ emit_extra_header(
             (const char *)key,
             (const char *)value);
     }
+}
+
+/// Read a Transfer-Encoding: chunked response body.
+///
+/// `initial` / `initial_len` are the bytes already received past the
+/// blank-line that ends the headers. The function consumes those plus
+/// reads more from the socket, decoding chunk framing until the
+/// terminating zero-sized chunk + (possibly empty) trailers.
+///
+/// On success: `*out_body` is malloc'd (axl_free) and `*out_size` is
+/// the decoded byte count. Returns 0 / -1.
+static int
+read_chunked_body(
+    AxlHttpClient *c,
+    const char    *initial,
+    size_t         initial_len,
+    void         **out_body,
+    size_t        *out_size)
+{
+    enum { ST_SIZE, ST_DATA, ST_TRAIL, ST_TRAILERS, ST_DONE };
+    int    state = ST_SIZE;
+    size_t chunk_remaining = 0;
+
+    /* work_buf carries undecoded bytes pending parsing. Sized to match
+       the recv buffer so we can absorb everything that came in with the
+       headers without reallocation. */
+    char   work_buf[HTTP_CLIENT_RECV_BUF];
+    size_t work_len = 0;
+    if (initial_len > sizeof(work_buf)) {
+        return -1;
+    }
+    if (initial_len > 0) {
+        axl_memcpy(work_buf, initial, initial_len);
+        work_len = initial_len;
+    }
+
+    /* Output body — grows by doubling as chunks arrive. */
+    void  *body      = NULL;
+    size_t body_cap  = 0;
+    size_t body_size = 0;
+
+    while (state != ST_DONE) {
+        bool progress = false;
+
+        if (state == ST_SIZE) {
+            char *crlf = (char *)axl_memmem(work_buf, work_len, "\r\n", 2);
+            if (crlf != NULL) {
+                size_t   line_len = (size_t)(crlf - work_buf);
+                uint64_t sz       = 0;
+                /* axl_hex_parse_u64 stops at first non-hex byte (chunk
+                   extension `;` or end-of-line) and returns -1 if no
+                   digit was present, which means a malformed line. */
+                if (axl_hex_parse_u64(work_buf, line_len, &sz) < 0) {
+                    axl_free(body);
+                    return -1;
+                }
+                size_t consumed = line_len + 2;
+                axl_memmove(work_buf, work_buf + consumed,
+                            work_len - consumed);
+                work_len -= consumed;
+                chunk_remaining = (size_t)sz;
+                state = (sz == 0) ? ST_TRAILERS : ST_DATA;
+                progress = true;
+            }
+        } else if (state == ST_DATA) {
+            size_t take = chunk_remaining < work_len
+                          ? chunk_remaining : work_len;
+            if (take > 0) {
+                if (body_size + take > body_cap) {
+                    size_t new_cap = body_cap == 0 ? 256 : body_cap * 2;
+                    while (new_cap < body_size + take) {
+                        new_cap *= 2;
+                    }
+                    void *nb = axl_realloc(body, new_cap);
+                    if (nb == NULL) {
+                        axl_free(body);
+                        return -1;
+                    }
+                    body = nb;
+                    body_cap = new_cap;
+                }
+                axl_memcpy((uint8_t *)body + body_size, work_buf, take);
+                body_size += take;
+                chunk_remaining -= take;
+                axl_memmove(work_buf, work_buf + take, work_len - take);
+                work_len -= take;
+                progress = true;
+            }
+            if (chunk_remaining == 0) {
+                state = ST_TRAIL;
+            }
+        } else if (state == ST_TRAIL) {
+            if (work_len >= 2) {
+                if (work_buf[0] != '\r' || work_buf[1] != '\n') {
+                    axl_free(body);
+                    return -1;
+                }
+                axl_memmove(work_buf, work_buf + 2, work_len - 2);
+                work_len -= 2;
+                state = ST_SIZE;
+                progress = true;
+            }
+        } else if (state == ST_TRAILERS) {
+            /* Drain optional trailer-fields. Each is CRLF-terminated;
+               an empty line (CRLF at buffer start) ends the body. */
+            char *crlf = (char *)axl_memmem(work_buf, work_len, "\r\n", 2);
+            if (crlf != NULL) {
+                size_t line_len = (size_t)(crlf - work_buf);
+                size_t consumed = line_len + 2;
+                axl_memmove(work_buf, work_buf + consumed,
+                            work_len - consumed);
+                work_len -= consumed;
+                if (line_len == 0) {
+                    state = ST_DONE;
+                }
+                progress = true;
+            }
+        }
+
+        if (progress) {
+            continue;
+        }
+
+        /* Need more data. */
+        if (work_len >= sizeof(work_buf)) {
+            axl_free(body);
+            return -1;
+        }
+        size_t want = sizeof(work_buf) - work_len;
+        if (client_recv(c, work_buf + work_len, &want) != 0) {
+            axl_free(body);
+            return -1;
+        }
+        /* `want == 0` with success is the TLS `MBEDTLS_ERR_SSL_WANT_READ`
+           case: bytes arrived on the wire but didn't complete a TLS
+           record yet. Retry — `client_recv` returns -1 on real EOF /
+           close-notify / TCP timeout, so this can't loop forever. */
+        work_len += want;
+        axl_yield();
+    }
+
+    *out_body = body;
+    *out_size = body_size;
+    return 0;
 }
 
 static int
@@ -543,13 +776,34 @@ do_request(
         }
     }
 
-    /* Read body */
+    /* Read body. Two transports: Content-Length (size known up front)
+       or Transfer-Encoding: chunked (size discovered chunk-by-chunk).
+       Per RFC 7230 §3.3.3, if both are present chunked wins. */
     resp_content_len = axl_http_get_content_length(resp_headers);
     resp_body = NULL;
 
     size_t resp_body_read = 0;
 
-    if (resp_content_len > 0) {
+    bool chunked = false;
+    {
+        const char *te = (const char *)axl_hash_table_lookup(
+            resp_headers, "transfer-encoding");
+        if (te != NULL && axl_strcasecmp(te, "chunked") == 0) {
+            chunked = true;
+        }
+    }
+
+    if (chunked) {
+        if (read_chunked_body(c,
+                              recv_buf + header_end,
+                              total_recv - header_end,
+                              &resp_body,
+                              &resp_body_read) != 0) {
+            axl_hash_table_free(resp_headers);
+            axl_url_free(parsed);
+            return -1;
+        }
+    } else if (resp_content_len > 0) {
         resp_body = axl_malloc(resp_content_len);
         if (resp_body == NULL) {
             axl_hash_table_free(resp_headers);

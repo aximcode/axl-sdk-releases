@@ -36,6 +36,12 @@ static const AxlArgDesc flags[] = {
       .help = "Show request/response headers" },
     { .name = "silent",      .short_name = 's', .type = AXL_ARG_BOOL,
       .help = "Suppress status output" },
+#ifdef AXL_HAVE_TLS
+    { .name = "secure",      .short_name = 'S', .type = AXL_ARG_BOOL,
+      .help = "Verify TLS certificate (default: off; UEFI has no CA bundle)" },
+#endif
+    { .name = "source",                          .type = AXL_ARG_STRING,
+      .help = "Pin connect to interface with this station IPv4 (auto if unset)" },
     {0}
 };
 
@@ -214,6 +220,23 @@ run_fetch(AxlArgs *a)
     if (client == NULL) {
         axl_printf("Fetch: out of memory\n");
         return 1;
+    }
+
+#ifdef AXL_HAVE_TLS
+    /* Default insecure: there's no CA bundle in the UEFI environment,
+       and the dominant fetch use cases (BMC, lab boot servers) ship
+       self-signed certs. --secure opts back into verification.
+       Same posture as common Redfish clients (DMTF libredfish, etc.). */
+    bool secure = axl_args_get_bool(a, "secure");
+    axl_http_client_set(client, "tls.verify", secure ? "true" : "false");
+    if (verbose && !secure) {
+        axl_printf("* TLS certificate verification disabled (use --secure to enable)\n");
+    }
+#endif
+
+    const char *source = axl_args_get_string(a, "source");
+    if (source != NULL && source[0] != '\0') {
+        axl_http_client_set(client, "source.ip", source);
     }
 
     if (!silent) {

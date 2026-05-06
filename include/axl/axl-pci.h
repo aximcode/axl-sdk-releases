@@ -954,7 +954,7 @@ axl_pci_format_name(
  * land via a `git pull` of the JSON5 sidecar without rebuilding
  * every consumer.
  *
- * The schema (see `share/pci-class.json5`) lets each entry pin
+ * The overlay lives in the `classes[]` section of `share/pci-ids.json5`. Schema 2 nests subclasses under bases and progs under subclasses; schema 1 (legacy flat) lets each entry pin
  * any subset of (base, sub, prog) — base only for "all subclasses
  * of this base", base+sub for a subclass, base+sub+prog for a
  * specific prog_if.
@@ -1026,7 +1026,7 @@ axl_pci_class_db_prog_name(
  *
  * Same lookup semantics as @ref axl_pci_ids_load — explicit
  * @p override_path is authoritative; NULL autodiscovers via
- * `pci-class.json5` next to the running .efi, then in cwd.
+ * `pci-ids.json5` next to the running .efi, then in cwd. Loader reads only the `classes[]` section, ignoring `vendors[]`.
  *
  * Once loaded, every @ref axl_pci_class_string and
  * @ref axl_pci_class_string_fmt call consults the overlay before

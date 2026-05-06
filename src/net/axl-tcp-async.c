@@ -800,13 +800,14 @@ on_connect_cancel(void *data)
 }
 
 int
-axl_tcp_connect_async(
-    const char     *host,
-    uint16_t        port,
-    AxlLoop        *loop,
-    AxlCancellable *cancel,
-    AxlTcpCallback  cb,
-    void           *data
+axl_tcp_connect_async_via(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data
     )
 {
     EFI_STATUS                    status;
@@ -833,11 +834,33 @@ axl_tcp_connect_async(
     }
 
     //
-    // Find TCP4 service binding
+    // Find TCP4 service binding. Auto-pick prefers an interface whose
+    // subnet contains `remote_addr`; explicit `source_ip` (if non-NULL
+    // and non-zero) pins to that station address.
     //
-    status = tcp_find_service_binding(&sb, &sb_handle);
+    EFI_IPv4_ADDRESS efi_dest;
+    axl_memcpy(efi_dest.Addr, remote_addr.addr, 4);
+
+    EFI_IPv4_ADDRESS  efi_src;
+    EFI_IPv4_ADDRESS *forced = NULL;
+    if (source_ip != NULL) {
+        bool nonzero = source_ip->addr[0] || source_ip->addr[1]
+                    || source_ip->addr[2] || source_ip->addr[3];
+        if (nonzero) {
+            axl_memcpy(efi_src.Addr, source_ip->addr, 4);
+            forced = &efi_src;
+        }
+    }
+
+    status = tcp_find_service_binding(&efi_dest, forced, &sb, &sb_handle);
     if (EFI_ERROR(status)) {
-        axl_error("async connect: no TCP4 service binding");
+        if (forced != NULL) {
+            axl_error("async connect: no interface with station IP %u.%u.%u.%u",
+                source_ip->addr[0], source_ip->addr[1],
+                source_ip->addr[2], source_ip->addr[3]);
+        } else {
+            axl_error("async connect: no TCP4 service binding");
+        }
         return AXL_ERR;
     }
 
@@ -963,4 +986,18 @@ axl_tcp_connect_async(
     }
 
     return AXL_OK;
+}
+
+int
+axl_tcp_connect_async(
+    const char     *host,
+    uint16_t        port,
+    AxlLoop        *loop,
+    AxlCancellable *cancel,
+    AxlTcpCallback  cb,
+    void           *data
+    )
+{
+    /* Legacy entry point — auto-pick the source interface. */
+    return axl_tcp_connect_async_via(host, port, NULL, loop, cancel, cb, data);
 }

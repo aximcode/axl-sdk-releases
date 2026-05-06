@@ -34,19 +34,24 @@
 static bool case_insensitive = false;
 static bool show_line_numbers = false;
 static bool count_only = false;
-static bool verbose_mode = false;
+static bool invert_match = false;
+static bool show_progress = false;
 
 static const AxlArgDesc flags[] = {
-    { .name = "ignore-case", .short_name = 'i', .type = AXL_ARG_BOOL,
+    { .name = "ignore-case",   .short_name = 'i', .type = AXL_ARG_BOOL,
       .help = "Case-insensitive match" },
-    { .name = "line-number", .short_name = 'n', .type = AXL_ARG_BOOL,
+    { .name = "line-number",   .short_name = 'n', .type = AXL_ARG_BOOL,
       .help = "Show line numbers" },
-    { .name = "count",       .short_name = 'c', .type = AXL_ARG_BOOL,
+    { .name = "count",         .short_name = 'c', .type = AXL_ARG_BOOL,
       .help = "Count matches only" },
-    { .name = "recursive",   .short_name = 'r', .type = AXL_ARG_BOOL,
+    { .name = "recursive",     .short_name = 'r', .type = AXL_ARG_BOOL,
       .help = "Recursive directory search" },
-    { .name = "verbose",     .short_name = 'v', .type = AXL_ARG_BOOL,
-      .help = "Verbose output" },
+    { .name = "invert-match",  .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Invert match — print lines that do NOT contain the pattern "
+              "(matches Linux grep -v semantics)" },
+    { .name = "show-progress",                    .type = AXL_ARG_BOOL,
+      .help = "Print diagnostic notes (skipped binaries, "
+              "truncated lines, unreadable files)" },
     {0}
 };
 
@@ -107,7 +112,7 @@ grep_stream(
     if (path != NULL) {
         src = axl_fopen(path, "r");
         if (src == NULL) {
-            if (verbose_mode) {
+            if (show_progress) {
                 axl_printf("grep: cannot read '%s'\n", path);
             }
             return 0;
@@ -119,7 +124,7 @@ grep_stream(
         uint8_t      peek[BINARY_PEEK_BYTES];
         axl_ssize_t  n = axl_read(src, peek, sizeof(peek));
         if (n > 0 && is_binary_data(peek, (size_t)n)) {
-            if (verbose_mode) {
+            if (show_progress) {
                 axl_printf("grep: skipping binary file '%s'\n", path);
             }
             axl_fclose(src);
@@ -128,7 +133,7 @@ grep_stream(
         if (axl_fseek(src, 0, AXL_SEEK_SET) != AXL_OK) {
             /* Files in this SDK are seekable; if the rewind ever
                fails, we'd be off-by-N bytes. Bail loudly. */
-            if (verbose_mode) {
+            if (show_progress) {
                 axl_printf("grep: rewind failed on '%s'\n", path);
             }
             axl_fclose(src);
@@ -163,7 +168,7 @@ grep_stream(
     size_t       count    = 0;
 
     while (axl_line_reader_next(&r, &line, &len, &truncated)) {
-        if (truncated && verbose_mode) {
+        if (truncated && show_progress) {
             axl_printf("grep: %s line %zu truncated at %zu bytes\n",
                        label, line_num, len);
         }
@@ -179,12 +184,15 @@ grep_stream(
         bool match = case_insensitive
                    ? (axl_strcasestr_len(line, (long long)len, pattern) != NULL)
                    : (axl_strstr_len(line, (long long)len, pattern) != NULL);
-        if (match && !count_only) {
+        /* `--invert-match` flips the predicate — print lines that
+         * do NOT contain the pattern. Linux `grep -v` semantics. */
+        bool emit = invert_match ? !match : match;
+        if (emit && !count_only) {
             if (show_filename) axl_printf("%s:", label);
             if (show_line_numbers) axl_printf("%zu:", line_num);
             axl_printf("%.*s\n", (int)len, line);
         }
-        if (match) count++;
+        if (emit) count++;
         line_num++;
     }
 
@@ -231,7 +239,7 @@ grep_directory(
 {
     GrepWalkCtx ctx = { .pattern = pattern, .total = 0 };
     if (axl_dir_walk(dir_path, grep_walk_cb, &ctx, MAX_WALK_DEPTH) != 0
-        && verbose_mode) {
+        && show_progress) {
         axl_printf("grep: walk of '%s' did not complete cleanly\n", dir_path);
     }
     return ctx.total;
@@ -244,15 +252,16 @@ grep_directory(
 static int
 run_grep(AxlArgs *a)
 {
-    verbose_mode      = axl_args_get_bool(a, "verbose");
+    show_progress     = axl_args_get_bool(a, "show-progress");
     case_insensitive  = axl_args_get_bool(a, "ignore-case");
     show_line_numbers = axl_args_get_bool(a, "line-number");
     count_only        = axl_args_get_bool(a, "count");
+    invert_match      = axl_args_get_bool(a, "invert-match");
     bool recursive    = axl_args_get_bool(a, "recursive");
 
     const char *pattern    = axl_args_get_string(a, "pattern");
     int         file_count = axl_args_get_pos_count(a);
-    bool multi_file = (file_count > 1) || recursive || verbose_mode;
+    bool multi_file = (file_count > 1) || recursive || show_progress;
 
     size_t total_matches = 0;
     if (file_count == 0) {

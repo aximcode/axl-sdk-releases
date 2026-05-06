@@ -44,11 +44,6 @@ if [[ -f "$PCI_IDS_FILE" ]]; then
     mkdir -p "$TEST_STAGING"
     cp "$PCI_IDS_FILE" "$TEST_STAGING/pci-ids.json5"
 fi
-PCI_CLASS_FILE="$PROJECT_DIR/share/pci-class.json5"
-if [[ -f "$PCI_CLASS_FILE" ]]; then
-    mkdir -p "$TEST_STAGING"
-    cp "$PCI_CLASS_FILE" "$TEST_STAGING/pci-class.json5"
-fi
 JEDEC_FILE="$PROJECT_DIR/share/jedec.json5"
 if [[ -f "$JEDEC_FILE" ]]; then
     mkdir -p "$TEST_STAGING"

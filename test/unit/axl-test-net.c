@@ -1199,6 +1199,87 @@ test_ipv4_parse_format(void)
     /* Format NULL safety */
     test_check(axl_ipv4_format(NULL, buf, sizeof(buf)) == AXL_ERR, "ipv4 format: NULL octets");
     test_check(axl_ipv4_format(addr, NULL, 16) == AXL_ERR, "ipv4 format: NULL buf");
+
+    /* IPv6 format — full address, no zero collapsing. */
+    uint8_t v6_full[16] = {
+        0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x01,
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+    };
+    char v6_buf[40];
+    test_check(axl_ipv6_format(v6_full, v6_buf, sizeof(v6_buf)) == AXL_OK,
+               "ipv6 format: 2001:db8 full");
+    test_check(axl_strcmp(v6_buf, "2001:db8:85a3:1:1234:5678:9abc:def0") == 0,
+               "ipv6 format: leading-zero suppression");
+
+    /* IPv6 format — zero-run collapse `::`. */
+    uint8_t v6_loopback[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    test_check(axl_ipv6_format(v6_loopback, v6_buf, sizeof(v6_buf)) == AXL_OK
+               && axl_strcmp(v6_buf, "::1") == 0,
+               "ipv6 format: ::1 loopback");
+
+    uint8_t v6_unspec[16] = { 0 };
+    test_check(axl_ipv6_format(v6_unspec, v6_buf, sizeof(v6_buf)) == AXL_OK
+               && axl_strcmp(v6_buf, "::") == 0,
+               "ipv6 format: :: unspecified");
+
+    /* IPv6 format — single zero group is NOT collapsed (RFC 5952). */
+    uint8_t v6_single_zero[16] = {
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    test_check(axl_ipv6_format(v6_single_zero, v6_buf, sizeof(v6_buf)) == AXL_OK
+               && axl_strcmp(v6_buf, "2001:db8:0:1::1") == 0,
+               "ipv6 format: longest-run collapse");
+
+    /* IPv6 format — small buffer + NULL safety. */
+    test_check(axl_ipv6_format(v6_full, v6_buf, 8) == AXL_ERR,
+               "ipv6 format: small buffer");
+    test_check(axl_ipv6_format(NULL, v6_buf, sizeof(v6_buf)) == AXL_ERR,
+               "ipv6 format: NULL octets");
+    test_check(axl_ipv6_format(v6_full, NULL, sizeof(v6_buf)) == AXL_ERR,
+               "ipv6 format: NULL buf");
+
+    /* axl_ipv4_equals — pure compare. */
+    uint8_t a[4] = { 10, 0, 0, 1 };
+    uint8_t b[4] = { 10, 0, 0, 1 };
+    uint8_t c[4] = { 10, 0, 0, 2 };
+    test_check(axl_ipv4_equals(a, b),  "ipv4_equals: identical");
+    test_check(!axl_ipv4_equals(a, c), "ipv4_equals: differ in last");
+    test_check(!axl_ipv4_equals(NULL, b), "ipv4_equals: NULL a is false");
+    test_check(!axl_ipv4_equals(a, NULL), "ipv4_equals: NULL b is false");
+
+    /* axl_ipv4_in_subnet — routing-decision predicate.
+       The function rejects a 0.0.0.0 mask explicitly so an unconfigured
+       interface (UEFI brings link UP before IP4Config2 policy applies)
+       doesn't falsely match every destination. */
+    uint8_t station[4] = { 169, 254, 1, 2 };
+    uint8_t mask24[4]  = { 255, 255, 255, 0 };
+    uint8_t same_subnet[4]  = { 169, 254, 1, 99 };
+    uint8_t other_subnet[4] = { 10, 0, 0, 1 };
+    test_check(axl_ipv4_in_subnet(same_subnet, station, mask24),
+               "ipv4_in_subnet: same /24");
+    test_check(!axl_ipv4_in_subnet(other_subnet, station, mask24),
+               "ipv4_in_subnet: other /24");
+
+    uint8_t mask23[4] = { 255, 255, 254, 0 };
+    uint8_t station_23[4] = { 10, 9, 176, 1 };
+    uint8_t in_23[4]      = { 10, 9, 177, 250 };
+    uint8_t out_23[4]     = { 10, 9, 178, 1 };
+    test_check(axl_ipv4_in_subnet(in_23, station_23, mask23),
+               "ipv4_in_subnet: /23 includes second half");
+    test_check(!axl_ipv4_in_subnet(out_23, station_23, mask23),
+               "ipv4_in_subnet: /23 excludes outside");
+
+    uint8_t zero_mask[4] = { 0, 0, 0, 0 };
+    test_check(!axl_ipv4_in_subnet(same_subnet, station, zero_mask),
+               "ipv4_in_subnet: zero mask rejected (no policy yet)");
+
+    test_check(!axl_ipv4_in_subnet(NULL, station, mask24),
+               "ipv4_in_subnet: NULL dest is false");
+    test_check(!axl_ipv4_in_subnet(same_subnet, NULL, mask24),
+               "ipv4_in_subnet: NULL station is false");
+    test_check(!axl_ipv4_in_subnet(same_subnet, station, NULL),
+               "ipv4_in_subnet: NULL mask is false");
 }
 
 // ---------------------------------------------------------------------------

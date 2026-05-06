@@ -56,6 +56,26 @@ int   axl_mbedtls_printf(const char *fmt, ...);
 /* Key exchange: ECDHE-ECDSA only (lean, no RSA) */
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED
+/* RSA-cert variants — required to talk to BMCs and other servers
+ * that ship RSA certificates (almost all of them in 2026: Dell
+ * iDRAC, HPE iLO, Lenovo XCC, Supermicro, etc.). Without these,
+ * the TLS handshake fails with MBEDTLS_ERR_SSL_NO_CIPHER_CHOSEN
+ * (-0x7780) on the cipher-suite negotiation. Confirmed against
+ * vendor BMC firmware (AMD-EPYC server, 2026-05-05). */
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
+#define MBEDTLS_RSA_C
+#define MBEDTLS_PKCS1_V15
+
+/* Force mbedtls to use its own bundled software inet_pton() in
+ * x509_crt.c instead of trying to call the platform one. In our
+ * freestanding UEFI build there is no <arpa/inet.h> / inet_pton,
+ * but the compiler's __has_include picks up <sys/socket.h> from
+ * the build host and AF_INET6 ends up defined — which would route
+ * to the (missing) platform inet_pton and produce an undefined-
+ * symbol link error once --no-undefined is enabled. The bundled
+ * fallback is a simple ~30-line C function with no dependencies. */
+#define MBEDTLS_TEST_SW_INET_PTON
 
 /* Elliptic curves */
 #define MBEDTLS_ECP_C

@@ -184,6 +184,35 @@ axl_hex_nibble(int c)
 }
 
 /**
+ * @brief Parse a run of ASCII hex digits as an unsigned 64-bit integer.
+ *
+ * Reads up to @p max_chars hex digits from @p s into @p out, stopping
+ * at the first non-hex byte. The buffer need not be NUL-terminated as
+ * long as it has at least @p max_chars bytes available; this lets the
+ * function operate on arbitrary-length slices of larger buffers.
+ *
+ * @p max_chars is treated as a strict upper bound. Pass 0 only if you
+ * want an immediate failure (returns -1 — useful when callers pass a
+ * runtime length that may legitimately be empty).
+ *
+ * Useful for parsing hex fields embedded in larger strings — chunk
+ * sizes in HTTP `Transfer-Encoding: chunked`, the leading hex fields
+ * of a PCI BDF address, JSON `\uXXXX` escapes, etc.
+ *
+ * @param s          Input buffer; reading starts at @p s[0].
+ * @param max_chars  Strict upper bound on digits to consume.
+ * @param out        Receives the parsed value on success.
+ * @return Number of digits actually consumed (>= 1) on success, or -1
+ *         if no hex digit was found at the start, or if the value
+ *         would overflow a uint64_t.
+ */
+int
+axl_hex_parse_u64(
+    const char *s,
+    size_t      max_chars,
+    uint64_t   *out);
+
+/**
  * @brief Copy @n bytes from @a src to @a dst.
  *
  * Regions must not overlap. NULL-safe: returns @a dst if either is NULL.

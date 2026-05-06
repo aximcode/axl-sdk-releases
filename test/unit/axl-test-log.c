@@ -4,6 +4,7 @@
 **/
 
 #include "axl-test.h"
+#include <axl/axl-env.h>
 #include <axl/axl-log.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
@@ -325,6 +326,115 @@ test_add_handler_overflow(void)
 // Entry Point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// AXL_LOG_LEVEL parser
+// ---------------------------------------------------------------------------
+
+static void
+test_axl_log_level_env(void)
+{
+    /* Helper pattern for each case: reset state, set env, init, fire
+     * a probe message via the custom handler, count what came through. */
+    axl_log_add_handler(custom_handler, NULL);
+
+    /* 1. Bare level keyword — global default */
+    axl_log_set_level(AXL_LOG_INFO);
+    axl_log_set_domain_level("evttest", -1);
+    axl_setenv("AXL_LOG_LEVEL", "debug", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "evttest", "should pass");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL=debug: DEBUG passes globally");
+
+    /* 2. Wildcard syntax (*:warn) — explicit default */
+    axl_setenv("AXL_LOG_LEVEL", "*:warn", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_INFO, "evttest", "info filtered");
+    test_check(custom_handler_calls == 0,
+               "AXL_LOG_LEVEL=*:warn: INFO filtered");
+    axl_log(AXL_LOG_WARNING, "evttest", "warning passes");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL=*:warn: WARNING passes");
+
+    /* 3. Per-domain — domain loud, default quiet */
+    axl_setenv("AXL_LOG_LEVEL", "*:warn,evttest:debug", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "evttest", "domain-loud passes");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL multi-domain: domain DEBUG passes");
+    axl_log(AXL_LOG_INFO, "other", "default-quiet filtered");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL multi-domain: default INFO filtered");
+
+    /* 4. "all" alias — every domain to DEBUG */
+    axl_log_set_domain_level("evttest", -1);
+    axl_setenv("AXL_LOG_LEVEL", "all", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "anywhere", "all-alias passes");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL=all: DEBUG passes everywhere");
+
+    /* 5. "off" alias — even ERROR is filtered */
+    axl_setenv("AXL_LOG_LEVEL", "off", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_ERROR, "test", "should be filtered");
+    test_check(custom_handler_calls == 0,
+               "AXL_LOG_LEVEL=off: ERROR filtered");
+
+    /* 6. Unknown level keyword — ignored, prior config kept */
+    axl_log_set_level(AXL_LOG_INFO);
+    axl_setenv("AXL_LOG_LEVEL", "garbage", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_INFO, "test", "still works");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL=garbage: ignored, prior config kept");
+
+    /* 7. Case-insensitive level keywords */
+    axl_setenv("AXL_LOG_LEVEL", "DEBUG", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "test", "uppercase debug accepted");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL=DEBUG (uppercase): parsed as debug");
+
+    axl_setenv("AXL_LOG_LEVEL", "Warn", true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_INFO, "test", "info filtered");
+    test_check(custom_handler_calls == 0,
+               "AXL_LOG_LEVEL=Warn (mixed case): parsed as warning");
+
+    /* 8. Env precedence — env applied lazily, programmatic call wins */
+    axl_unsetenv("AXL_LOG_LEVEL");
+    axl_setenv("AXL_LOG_LEVEL", "warn", true);
+    /* Programmatic set BEFORE first emission. axl_log_set_level()
+     * itself runs ensure_env_init_once() (so env baseline is applied)
+     * and then writes the user's level on top — code wins. */
+    axl_log_set_level(AXL_LOG_DEBUG);
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "test", "code-wins precedence");
+    test_check(custom_handler_calls == 1,
+               "axl_log_set_level after env: programmatic call wins");
+
+    /* Cleanup so other tests start fresh */
+    axl_log_remove_handler(custom_handler);
+    axl_unsetenv("AXL_LOG_LEVEL");
+    axl_log_set_level(AXL_LOG_INFO);
+    axl_log_set_domain_level("evttest", -1);
+    axl_log_set_domain_level("anywhere", -1);
+    axl_log_set_domain_level("other", -1);
+}
+
+// ---------------------------------------------------------------------------
+// Entry Point
+// ---------------------------------------------------------------------------
+
 int
 test_log_main(int argc, char **argv)
 {
@@ -340,6 +450,7 @@ test_log_main(int argc, char **argv)
     test_ring_overflow();
     test_file_handler();
     test_add_handler_overflow();
+    test_axl_log_level_env();
 
     return test_print_results();
 }

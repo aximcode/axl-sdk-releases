@@ -13,6 +13,7 @@
 
 #include "axl-test.h"
 #include <axl/axl-ipmi.h>
+#include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
 // Canned-response harness
@@ -788,6 +789,211 @@ test_truncated_response(void)
 }
 
 // ---------------------------------------------------------------------------
+// Dell vendor IPMI transport — buffer-shift + arg-passing regression
+//
+// Dell EFI_IPMI_TRANSPORT (GUID 7409d614) has two well-documented
+// quirks the dispatcher in src/ipmi/axl-ipmi-dell.c must handle (see
+// uefi-ipmitool's IpmiTransportLib.c:55-74,144-222 reference impl):
+//
+//   1. The vendor's SendIpmiCommand has 8 positional args:
+//        (This, NetFn, Lun, Cmd, ReqData, ReqSize, RspData, *RspSize)
+//      The Lun parameter at position 3 is mandatory (always 0). axl-sdk
+//      previously omitted it from the typedef, so the call passed 7
+//      args and the firmware saw NetFn,Cmd,...payload-pointer-truncated
+//      shifted into the wrong slots — Get Device ID returned uninit
+//      bytes (Manufacturer ID changed across runs on real BMC firmware).
+//
+//   2. Empirical observation in the reference impl (line 184-188):
+//      passing &Response[1] yields zeros — Dell writes only into the
+//      buffer it was handed at offset 0. The dispatcher must hand
+//      Response[0..N-1], then shift right by one and synthesize CC=0x00
+//      at Response[0] so callers see the same shape as KCS/SSIF/EDKII.
+//
+// This test installs a mock DELL_IPMI_TRANSPORT, runs the public
+// axl_ipmi_get_device_id, and asserts both quirks are honored:
+//   - mock saw NetFn=0x06, Lun=0x00, Cmd=0x01
+//   - the 11-byte body the mock wrote got parsed correctly (DeviceId,
+//     Manufacturer ID), proving the shift+CC-prepend round-trip works.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    size_t  call_count;
+    uint8_t captured_netfn;
+    uint8_t captured_lun;
+    uint8_t captured_cmd;
+    uint8_t captured_req[8];
+    uint8_t captured_req_size;
+    uint8_t captured_resp_size_in;
+    /* The exact pointer the dispatcher handed the firmware. Used to
+     * assert dispatcher passes &resp[0] not &resp[1]. A pointer-honoring
+     * mock can't otherwise distinguish "write to resp[0]+shift" from
+     * "write to resp[1], no shift" — the post-call buffer is identical
+     * either way, but real Dell firmware ignores non-zero offsets and
+     * writes to its internal offset 0 regardless. */
+    void   *captured_resp_ptr;
+} DellMock;
+
+static DellMock g_dell_mock;
+
+//
+// Mock with the CORRECT 8-param signature per uefi-ipmitool reference.
+// Bound to the protocol slot via a void * to stay decoupled from
+// axl-sdk's DELL_IPMI_SEND_COMMAND typedef (which the bug fix changes).
+//
+static EFI_STATUS EFIAPI
+mock_dell_send(
+    IN     VOID   *This,
+    IN     UINT8   NetFn,
+    IN     UINT8   Lun,
+    IN     UINT8   Cmd,
+    IN     UINT8  *RequestData,
+    IN     UINT8   RequestDataSize,
+    OUT    UINT8  *ResponseData,
+    IN OUT UINT8  *ResponseDataSize)
+{
+    (void)This;
+    g_dell_mock.call_count++;
+    g_dell_mock.captured_netfn        = NetFn;
+    g_dell_mock.captured_lun          = Lun;
+    g_dell_mock.captured_cmd          = Cmd;
+    g_dell_mock.captured_req_size     = RequestDataSize;
+    g_dell_mock.captured_resp_size_in = *ResponseDataSize;
+    g_dell_mock.captured_resp_ptr     = (void *)ResponseData;
+    for (UINT8 i = 0;
+         i < RequestDataSize && i < sizeof(g_dell_mock.captured_req);
+         i++)
+    {
+        g_dell_mock.captured_req[i] = RequestData[i];
+    }
+
+    //
+    // Canned IPMI Get Device ID response body — NO leading completion
+    // code (Dell convention: firmware strips it). 11 bytes is the
+    // mandatory length per IPMI 2.0 spec table 20-2.
+    //
+    static const UINT8 kBody[11] = {
+        0x20,                    /* [0]  DeviceId           */
+        0x80,                    /* [1]  DeviceRevision     */
+        0x01,                    /* [2]  FirmwareMajor      */
+        0x23,                    /* [3]  FirmwareMinor BCD  */
+        0x02,                    /* [4]  IpmiVersion BCD    */
+        0xBF,                    /* [5]  DeviceSupport      */
+        0xAA, 0xBB, 0xCC,        /* [6..8]  Mfr LE = 0xCCBBAA */
+        0xDD, 0xEE,              /* [9..10] Prod LE = 0xEEDD  */
+    };
+    UINT8 n = sizeof(kBody);
+    if (n > *ResponseDataSize) {
+        n = *ResponseDataSize;
+    }
+    for (UINT8 i = 0; i < n; i++) {
+        ResponseData[i] = kBody[i];
+    }
+    *ResponseDataSize = n;
+    return EFI_SUCCESS;
+}
+
+//
+// Raw mock-protocol layout: { UINT64 Revision; void *fn }. Identical
+// in-memory shape to DELL_IPMI_TRANSPORT regardless of how the typedef
+// declares the function pointer — what matters at runtime is the
+// 8-byte slot at +8 holding our mock's address.
+//
+typedef struct {
+    UINT64  Revision;
+    void   *SendIpmiCommand;
+} MockDellTransport;
+
+static MockDellTransport g_dell_proto = {
+    .Revision        = 1,
+    .SendIpmiCommand = (void *)mock_dell_send,
+};
+
+static EFI_HANDLE g_dell_handle = NULL;
+
+static bool
+install_mock_dell(void)
+{
+    EFI_GUID guid = gDellIpmiProtocolGuid;
+    EFI_STATUS s = gBS->InstallProtocolInterface(
+        &g_dell_handle, &guid, EFI_NATIVE_INTERFACE, &g_dell_proto);
+    return !EFI_ERROR(s);
+}
+
+static void
+uninstall_mock_dell(void)
+{
+    if (g_dell_handle == NULL) {
+        return;
+    }
+    EFI_GUID guid = gDellIpmiProtocolGuid;
+    gBS->UninstallProtocolInterface(g_dell_handle, &guid, &g_dell_proto);
+    g_dell_handle = NULL;
+}
+
+static void
+test_dell_transport_dispatch(void)
+{
+    g_dell_mock = (DellMock){0};
+    test_check(install_mock_dell(),
+               "dell transport: mock protocol installed");
+
+    AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new();
+    test_check(s != NULL && axl_ipmi_session_transport(s) == AXL_IPMI_TRANSPORT_DELL,
+               "dell transport: auto-detect picked Dell vendor protocol");
+
+    /* Use axl_ipmi_raw with a test-owned buffer — only this lets us
+     * assert the dispatcher passed the WHOLE buffer (not &resp[1]) to
+     * the firmware. axl_ipmi_get_device_id allocates internally so we
+     * couldn't compare pointers. */
+    uint8_t  resp[16];
+    size_t   resp_len = sizeof(resp);
+    for (size_t i = 0; i < sizeof(resp); i++) {
+        resp[i] = 0xCD;     /* sentinel for "untouched by dispatcher" */
+    }
+
+    int rc = axl_ipmi_raw(s,
+                          /*netfn=*/  0x06,
+                          /*cmd=*/    0x01,
+                          /*req=*/    NULL,
+                          /*req_len=*/ 0,
+                          resp, &resp_len);
+
+    test_check(rc == AXL_OK,
+               "dell transport: axl_ipmi_raw round-trips through dispatcher");
+    test_check(g_dell_mock.call_count == 1,
+               "dell transport: mock saw exactly one IpmiSubmitCommand call");
+    test_check(g_dell_mock.captured_netfn == 0x06,
+               "dell transport: NetFn==0x06 reaches mock unshifted");
+    test_check(g_dell_mock.captured_lun == 0x00,
+               "dell transport: Lun==0x00 (regression: missing-Lun typedef)");
+    test_check(g_dell_mock.captured_cmd == 0x01,
+               "dell transport: Cmd==0x01 reaches mock unshifted");
+    test_check(g_dell_mock.captured_req_size == 0,
+               "dell transport: zero-body req size==0");
+    test_check(g_dell_mock.captured_resp_ptr == (void *)resp,
+               "dell transport: ResponseData == &resp[0] (regression: &resp[1])");
+
+    /* Post-call buffer state — verifies the right-shift loop fired and
+     * the synthesized CC landed at resp[0]. With a faithful dispatcher:
+     *   resp[0]    = 0x00 (synthesized CC)
+     *   resp[1..N] = mock-written bytes shifted right by one
+     *   resp[N+1..15] = untouched (sentinel 0xCD)
+     */
+    test_check(resp_len == 12,
+               "dell transport: resp_len = body(11) + CC(1)");
+    test_check(resp[0] == 0x00,
+               "dell transport: synthesized CC=0x00 at resp[0]");
+    test_check(resp[1] == 0x20 && resp[2] == 0x80,
+               "dell transport: device_id+rev shifted to resp[1..2]");
+    test_check(resp[7] == 0xAA && resp[8] == 0xBB && resp[9] == 0xCC,
+               "dell transport: mfr LE bytes shifted to resp[7..9]");
+    test_check(resp[12] == 0xCD,
+               "dell transport: bytes past payload remain untouched");
+
+    uninstall_mock_dell();
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -832,6 +1038,8 @@ test_ipmi_main(int argc, char **argv)
     test_last_cc();
     test_cc_failure();
     test_truncated_response();
+
+    test_dell_transport_dispatch();
 
     //
     // Real-hardware test: only when explicitly requested (e.g. via

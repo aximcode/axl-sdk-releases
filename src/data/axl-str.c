@@ -194,6 +194,40 @@ axl_memmove(void *dst, const void *src, size_t n)
 }
 
 // ---------------------------------------------------------------------------
+// Hex parsing
+// ---------------------------------------------------------------------------
+
+int
+axl_hex_parse_u64(
+    const char *s,
+    size_t      max_chars,
+    uint64_t   *out)
+{
+    if (s == NULL || out == NULL) {
+        return -1;
+    }
+    uint64_t v = 0;
+    size_t   i = 0;
+    while (i < max_chars) {
+        int d = axl_hex_nibble((unsigned char)s[i]);
+        if (d < 0) {
+            break;
+        }
+        /* Detect overflow: shifting left 4 must not lose top nibble. */
+        if ((v >> 60) != 0) {
+            return -1;
+        }
+        v = (v << 4) | (uint64_t)d;
+        i++;
+    }
+    if (i == 0) {
+        return -1;
+    }
+    *out = v;
+    return (int)i;
+}
+
+// ---------------------------------------------------------------------------
 // axl_snprintf — format into fixed buffer via axl_vformat
 // ---------------------------------------------------------------------------
 

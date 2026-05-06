@@ -14,6 +14,7 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-net.h>
 #include <axl/axl-wait.h>
+#include <axl/axl-watchdog.h>
 
 AXL_LOG_DOMAIN("net");
 
@@ -114,17 +115,34 @@ axl_net_set_static_ip(
 // axl_net_ensure_drivers
 // ---------------------------------------------------------------------------
 
-/* Drivers we try to load, in order. The primary entry is
- * ipxe-all.efidrv — iPXE's universal-driver build, covering most
- * Intel/Broadcom/Realtek PCI and USB ethernet hardware in a single
- * ~1.1 MB blob. The remaining names (NetworkCommon, UsbCdc*,
- * UsbRndis, Rtk*, Asix*, ipxe-intel/broadcom) are auxiliary drivers
- * users may stage alongside, all loaded if present.
+/* Drivers tried in two phases:
  *
- * Each name is silently skipped when the file isn't on any mounted
- * volume — the cost of a miss is one file existence check per candidate. */
-static const char *const net_drivers[] = {
-    "ipxe-all.efidrv",
+ *   Phase 1 (core): non-iPXE class drivers covering the common cases —
+ *   USB-CDC ECM/NCM/RNDIS for BMC virtual NICs and USB dongles, plus
+ *   Realtek/Asix vendor UNDI drivers. ~20-200 KB each. Safe to load
+ *   unconditionally — they only bind controllers they recognize.
+ *
+ *   Phase 2 (iPXE fallback): iPXE-derived drivers (~280-1100 KB each).
+ *   Only loaded if Phase 1 didn't produce any SNP handles. Two reasons
+ *   to gate iPXE this way (discovered 2026-05-04 on an AMD-EPYC server):
+ *
+ *   (a) iPXE's UEFI option-ROM appears to hook LoadImage in ways that
+ *       break subsequent EFI image loads in the same shell session
+ *       — observed as "Command Error Status: Load Error" on every
+ *       fs0:\foo.efi attempt after iPXE has been resident, even on
+ *       healthy hardware. Same shape as the original mkrd Load Error
+ *       mystery, which also followed netinfo running iPXE.
+ *
+ *   (b) iPXE's efi_watchdog.c arms a 5-min boot-services watchdog
+ *       continuously while it's loaded and only disarms when chaining
+ *       to an OS. axl_net_ensure_drivers calls axl_watchdog_disarm()
+ *       at the end as a safety net, but skipping iPXE entirely when
+ *       it's not needed is cleaner.
+ *
+ *   Each name is silently skipped when the file isn't on any mounted
+ *   volume — the cost of a miss is one file existence check per
+ *   candidate. */
+static const char *const net_drivers_core[] = {
     "NetworkCommon.efi",
     "UsbCdcEcm.efi",
     "UsbCdcNcm.efi",
@@ -132,6 +150,10 @@ static const char *const net_drivers[] = {
     "RtkUndiDxe.efi",
     "RtkUsbUndiDxe.efi",
     "AsixUsbUndiDxe.efi",
+};
+
+static const char *const net_drivers_ipxe[] = {
+    "ipxe-all.efidrv",
     "ipxe-intel.efi",
     "ipxe-broadcom.efi",
 };
@@ -147,25 +169,20 @@ net_count_snp(void)
     return count;
 }
 
-int
-axl_net_ensure_drivers(void)
+/* Locate-and-load helper for a single driver-name list. Returns the
+ * count of drivers actually loaded (excluding files not present on
+ * any volume). Each name not on any volume is skipped silently; load
+ * or StartImage failures emit a warning but don't abort the rest. */
+static size_t
+load_driver_list(
+    const char *const *names,
+    size_t             n
+    )
 {
-    size_t snp_before = net_count_snp();
-    axl_info("ensure_drivers: starting (%zu SNP handles already present)",
-             snp_before);
-
-    /* Short-circuit if SNP is already registered. This makes the call
-     * idempotent — safe for tools to invoke unconditionally before any
-     * networking work. */
-    if (snp_before > 0) {
-        return AXL_NET_DRIVERS_OK;
-    }
-
     char path[256];
-    size_t loaded_count = 0;
-
-    for (size_t i = 0; i < sizeof(net_drivers) / sizeof(net_drivers[0]); i++) {
-        const char *name = net_drivers[i];
+    size_t loaded = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char *name = names[i];
 
         /* Locate first — distinguishes "not on volume" (skip silently)
          * from "found but failed to start" (warn). axl_driver_ensure is
@@ -198,17 +215,71 @@ axl_net_ensure_drivers(void)
         }
 
         axl_info("ensure_drivers: loaded '%s'", path);
-        loaded_count++;
+        loaded++;
+    }
+    return loaded;
+}
+
+int
+axl_net_ensure_drivers(void)
+{
+    size_t snp_before = net_count_snp();
+    axl_info("ensure_drivers: starting (%zu SNP handles already present)",
+             snp_before);
+
+    /* Short-circuit if SNP is already registered. This makes the call
+     * idempotent — safe for tools to invoke unconditionally before any
+     * networking work. */
+    if (snp_before > 0) {
+        return AXL_NET_DRIVERS_OK;
     }
 
-    /* Wire up driver bindings globally. NIC drivers register
+    /* Phase 1: load core (non-iPXE) drivers + ConnectController.
+     *
+     * Wire up driver bindings globally. NIC drivers register
      * DRIVER_BINDING_PROTOCOL in their entry point but only bind to
      * PCI/USB controllers when ConnectController is called on those
      * controller handles. UEFI's ConnectController(ControllerHandle=
      * NULL,...) returns EFI_INVALID_PARAMETER per spec, so we go
      * through axl_driver_connect(NULL), which enumerates every
      * handle and per-handle reconnects (mirroring shell `connect -r`). */
+    size_t loaded_count = load_driver_list(
+        net_drivers_core,
+        sizeof(net_drivers_core) / sizeof(net_drivers_core[0]));
     axl_driver_connect(NULL);
+
+    size_t snp_after_core = net_count_snp();
+
+    /* Phase 2 (iPXE fallback): only if core drivers didn't produce
+     * any SNP handle. iPXE's UEFI driver (a) hooks LoadImage in ways
+     * that break subsequent EFI image loads in the same shell session
+     * and (b) arms a 5-min boot-services watchdog. Skipping it when
+     * unnecessary avoids both side-effects. See net_drivers_ipxe[]
+     * comment for the empirical evidence captured during development. */
+    if (snp_after_core == 0) {
+        axl_info(
+            "ensure_drivers: no SNP after core drivers — falling back to iPXE");
+        loaded_count += load_driver_list(
+            net_drivers_ipxe,
+            sizeof(net_drivers_ipxe) / sizeof(net_drivers_ipxe[0]));
+        axl_driver_connect(NULL);
+    } else {
+        axl_info(
+            "ensure_drivers: SNP came up via core drivers (%zu handles) — skipping iPXE",
+            snp_after_core);
+    }
+
+    /* Disarm any boot-services watchdog the loaded drivers may have
+     * armed. iPXE in particular installs a 10-second holdoff timer
+     * that re-arms a 5-minute SetWatchdogTimer continuously while it
+     * runs, and only disarms in its shutdown path when chaining to
+     * an OS (booting==true). When axl-sdk loads iPXE just for SNP
+     * binding, iPXE exits with the watchdog still armed → host
+     * resets ~5 minutes later. Verified on an AMD-EPYC server 2026-05-04
+     * (iPXE source: src/interface/efi/efi_watchdog.c). Disarming here
+     * is unconditionally safe — no axl-sdk caller of this function is
+     * relying on the watchdog being armed. */
+    axl_watchdog_disarm();
 
     size_t snp_after = net_count_snp();
     axl_info("ensure_drivers: %zu drivers loaded, SNP handles %zu→%zu",

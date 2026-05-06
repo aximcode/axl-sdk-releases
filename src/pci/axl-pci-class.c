@@ -84,16 +84,53 @@ prog_key(
 // Schema-specific typed walk
 // ---------------------------------------------------------------------------
 
-/* The schema lets each entry pin any subset of (base, sub, prog).
+/* Insert one (base,sub,prog,name) tuple into the right table per
+   the routing below. Shared by both schema parsers — schema 1 calls
+   it once per flat row, schema 2 calls it once per (base,sub,prog)
+   slot reached during the hierarchical walk.
+
    Entry routing:
      base only         → bases table
      base + sub        → subs table
      base + sub + prog → progs table
-   Missing 'base' or 'name' rejects the entry. Missing 'sub' or
-   'prog' demote the entry to the next-coarser tier — there is no
-   "prog without sub" or "sub without base" entry. */
+   prog without sub is meaningless — the caller must ensure sub is
+   present whenever prog is. */
 static void
-parse_classes(
+class_insert(
+    AxlPciClassDb  *db,
+    uint8_t         base,
+    bool            has_sub,
+    uint8_t         sub,
+    bool            has_prog,
+    uint8_t         prog,
+    const char     *name
+    )
+{
+    char *name_owned = axl_strdup(name);
+    if (name_owned == NULL) {
+        return;
+    }
+    AxlHashTable *target;
+    void         *key;
+    if (has_prog) {
+        target = db->progs;
+        key    = prog_key(base, sub, prog);
+    } else if (has_sub) {
+        target = db->subs;
+        key    = sub_key(base, sub);
+    } else {
+        target = db->bases;
+        key    = base_key(base);
+    }
+    if (axl_hash_table_insert(target, key, name_owned) == AXL_HASH_TABLE_ERR) {
+        axl_free(name_owned);
+    }
+}
+
+/* Schema 1 — flat: each entry pins any subset of (base, sub, prog).
+   Missing 'base' or 'name' rejects the entry. */
+static void
+parse_classes_v1(
     AxlJsonReader  *r,
     AxlPciClassDb  *db
     )
@@ -112,7 +149,6 @@ parse_classes(
         {
             continue;
         }
-        uint8_t  base = (uint8_t)base64;
         uint64_t sub64 = 0;
         uint64_t prog64 = 0;
         bool has_sub  = axl_json_get_uint(&entry, "sub",  &sub64)
@@ -120,27 +156,79 @@ parse_classes(
         bool has_prog = axl_json_get_uint(&entry, "prog", &prog64)
                         && prog64 <= 0xFFu;
         if (has_prog && !has_sub) {
-            /* prog without sub is meaningless — skip. */
+            continue;  /* prog without sub is meaningless */
+        }
+        class_insert(db, (uint8_t)base64,
+                     has_sub,  (uint8_t)sub64,
+                     has_prog, (uint8_t)prog64, name);
+    }
+}
+
+/* Schema 2 — hierarchical: subclasses nest under bases, progs nest
+   under subclasses. Locality matches pci-ids schema 2; lookups are
+   global on the same composite keys regardless of file shape. */
+static void
+parse_classes_v2(
+    AxlJsonReader  *r,
+    AxlPciClassDb  *db
+    )
+{
+    AxlJsonArrayIter b_it;
+    if (!axl_json_array_begin(r, "classes", &b_it)) {
+        return;  /* empty stub is valid */
+    }
+    AxlJsonReader b_entry;
+    while (axl_json_array_next(&b_it, &b_entry)) {
+        uint64_t base64 = 0;
+        char     bname[AXL_PCI_CLASS_NAME_MAX] = "";
+        if (!axl_json_get_uint(&b_entry, "base", &base64)
+            || base64 > 0xFFu)
+        {
             continue;
         }
-        char *name_owned = axl_strdup(name);
-        if (name_owned == NULL) {
+        uint8_t base = (uint8_t)base64;
+        /* Base-tier 'name' is optional in v2 — a base entry can exist
+           purely as a parent node for nested subclasses. */
+        if (axl_json_get_string(&b_entry, "name", bname, sizeof(bname))) {
+            class_insert(db, base, false, 0, false, 0, bname);
+        }
+        AxlJsonArrayIter s_it;
+        if (!axl_json_array_begin(&b_entry, "subclasses", &s_it)) {
             continue;
         }
-        AxlHashTable *target;
-        void         *key;
-        if (has_prog) {
-            target = db->progs;
-            key    = prog_key(base, (uint8_t)sub64, (uint8_t)prog64);
-        } else if (has_sub) {
-            target = db->subs;
-            key    = sub_key(base, (uint8_t)sub64);
-        } else {
-            target = db->bases;
-            key    = base_key(base);
-        }
-        if (axl_hash_table_insert(target, key, name_owned) == AXL_HASH_TABLE_ERR) {
-            axl_free(name_owned);
+        AxlJsonReader s_entry;
+        while (axl_json_array_next(&s_it, &s_entry)) {
+            uint64_t sub64 = 0;
+            char     sname[AXL_PCI_CLASS_NAME_MAX] = "";
+            if (!axl_json_get_uint(&s_entry, "sub", &sub64)
+                || sub64 > 0xFFu)
+            {
+                continue;
+            }
+            uint8_t sub = (uint8_t)sub64;
+            if (axl_json_get_string(&s_entry, "name",
+                                    sname, sizeof(sname)))
+            {
+                class_insert(db, base, true, sub, false, 0, sname);
+            }
+            AxlJsonArrayIter p_it;
+            if (!axl_json_array_begin(&s_entry, "progs", &p_it)) {
+                continue;
+            }
+            AxlJsonReader p_entry;
+            while (axl_json_array_next(&p_it, &p_entry)) {
+                uint64_t prog64 = 0;
+                char     pname[AXL_PCI_CLASS_NAME_MAX] = "";
+                if (!axl_json_get_uint(&p_entry, "prog", &prog64)
+                    || prog64 > 0xFFu
+                    || !axl_json_get_string(&p_entry, "name",
+                                            pname, sizeof(pname)))
+                {
+                    continue;
+                }
+                class_insert(db, base, true, sub, true,
+                             (uint8_t)prog64, pname);
+            }
         }
     }
 }
@@ -151,7 +239,7 @@ db_fill(
     AxlJsonReader  *r
     )
 {
-    static const uint64_t accepted[] = { 1u };
+    static const uint64_t accepted[] = { 1u, 2u };
     uint64_t schema = 0;
     AxlSidecarStatus rc = axl_sidecar_check_schema(
         r, "pci-class", accepted, sizeof(accepted) / sizeof(accepted[0]),
@@ -159,7 +247,11 @@ db_fill(
     if (rc != AXL_SIDECAR_OK) {
         return rc;
     }
-    parse_classes(r, db);
+    if (schema == 1) {
+        parse_classes_v1(r, db);
+    } else /* schema == 2 */ {
+        parse_classes_v2(r, db);
+    }
     return AXL_SIDECAR_OK;
 }
 
@@ -344,9 +436,14 @@ axl_pci_class_load(
     const char  *override_path
     )
 {
+    /* Autodiscovery looks for share/pci-ids.json5 — the same file
+       axl_pci_ids_load consumes. The schema-2 layout carries both
+       vendors[] (read by ids_load) and classes[] (read here); this
+       loader simply ignores the vendors[] block. Override path is
+       honored verbatim. */
     return _axl_sidecar_singleton_load(
         &g_class_singleton, &g_class_atexit_handle, &g_class_atexit_ctx,
-        override_path, "pci-class.json5",
+        override_path, "pci-ids.json5",
         class_open_thunk, class_close_thunk);
 }
 

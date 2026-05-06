@@ -27,9 +27,9 @@
  *     axl_printf("SecureBoot: %s\n", secure_boot ? "enabled" : "disabled");
  * }
  *
- * extern const AxlGuid AXL_DELL_VENDOR_GUID;
- * axl_nvstore_register_namespace("dell", &AXL_DELL_VENDOR_GUID);
- * axl_nvstore_get("dell", "SystemId", buf, &sz);
+ * extern const AxlGuid AXL_OEM_VENDOR_GUID;
+ * axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID);
+ * axl_nvstore_get("oem", "AssetTag", buf, &sz);
  * @endcode
  */
 

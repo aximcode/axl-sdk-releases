@@ -27,6 +27,8 @@
 static const AxlArgDesc flags[] = {
     { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Verbose output" },
+    { .name = "transport",                    .type = AXL_ARG_STRING,
+      .help = "Force transport: kcs|ssif|edkii|dell (default: SMBIOS Type 38)" },
     {0}
 };
 
@@ -179,6 +181,10 @@ cmd_probe(void)
 
     axl_printf("\nSupporting infrastructure:\n");
     probe_print_proto("EFI_SMBUS_HC_PROTOCOL",        p.smbus_hc_protocol);
+    if (p.smbus_hc_handle_count > 0) {
+        axl_printf("    SMBus HC handle count        %zu\n",
+                   p.smbus_hc_handle_count);
+    }
     probe_print_proto("EFI_I2C_MASTER_PROTOCOL",      p.i2c_master_protocol);
     if (p.i2c_master_protocol) {
         axl_printf("    I2C Master handle count      %zu\n",
@@ -437,22 +443,16 @@ cmd_fru_list(AxlIpmiSession *ipmi)
 static int
 parse_hex_byte(const char *s, uint8_t *out)
 {
-    uint32_t v = 0;
     const char *p = s;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
         p += 2;
     }
-    if (*p == '\0') {
+    /* Accept any number of hex digits as long as the value fits in a
+       byte and the input is fully consumed (no trailing junk). */
+    uint64_t v = 0;
+    int      n = axl_hex_parse_u64(p, 16, &v);
+    if (n < 0 || p[n] != '\0' || v > 0xFF) {
         return -1;
-    }
-    for (; *p != '\0'; p++) {
-        uint8_t n;
-        if (*p >= '0' && *p <= '9')       n = (uint8_t)(*p - '0');
-        else if (*p >= 'a' && *p <= 'f')  n = (uint8_t)(*p - 'a' + 10);
-        else if (*p >= 'A' && *p <= 'F')  n = (uint8_t)(*p - 'A' + 10);
-        else                              return -1;
-        v = (v << 4) | n;
-        if (v > 0xFF)                     return -1;
     }
     *out = (uint8_t)v;
     return 0;
@@ -505,16 +505,41 @@ cmd_raw(AxlIpmiSession *ipmi, int count, const char *const *args)
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/* Open a session lazily — most verbs need it, `probe` doesn't. */
+/* Open a session lazily — most verbs need it, `probe` doesn't.
+ * The --transport flag at the root level is consumed here so every
+ * verb honors it without each handler having to thread it through. */
+static AxlIpmiTransport g_transport_hint = AXL_IPMI_TRANSPORT_UNKNOWN;
+
 static AxlIpmiSession *
 get_session(void)
 {
-    AxlIpmiSession *s = axl_ipmi_session_new();
+    AxlIpmiSession *s =
+        axl_ipmi_session_new_with_transport(g_transport_hint);
     if (s == NULL) {
         axl_printf("No IPMI transport available on this system.\n");
         axl_printf("Run 'ipmi probe' for a diagnostic snapshot.\n");
     }
     return s;
+}
+
+static AxlIpmiTransport
+parse_transport_flag(const char *s)
+{
+    if (s == NULL || *s == '\0')         return AXL_IPMI_TRANSPORT_UNKNOWN;
+    if (axl_strcmp(s, "kcs")   == 0)     return AXL_IPMI_TRANSPORT_KCS;
+    if (axl_strcmp(s, "ssif")  == 0)     return AXL_IPMI_TRANSPORT_SSIF;
+    if (axl_strcmp(s, "edkii") == 0)     return AXL_IPMI_TRANSPORT_EDKII;
+    if (axl_strcmp(s, "dell")  == 0)     return AXL_IPMI_TRANSPORT_DELL;
+    axl_printf("ipmi: unknown --transport value '%s' "
+               "(expected kcs|ssif|edkii|dell)\n", s);
+    return AXL_IPMI_TRANSPORT_UNKNOWN;
+}
+
+static void
+ipmi_pre_run(AxlArgs *a)
+{
+    g_transport_hint = parse_transport_flag(
+        axl_args_get_string(a, "transport"));
 }
 
 static int run_probe(AxlArgs *a)   { (void)a; return cmd_probe(); }
@@ -612,8 +637,9 @@ main(int argc, char **argv)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "ipmi",
-        .help         = "IPMI client — KCS / SSIF / BT transport auto-detect",
+        .help         = "IPMI client — SMBIOS Type 38 auto-detect (override: --transport)",
         .flags        = flags,
         .verbs        = verbs,
+        .pre_run      = ipmi_pre_run,
     });
 }

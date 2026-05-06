@@ -110,6 +110,51 @@ axl_log_set_domain_level(
     int         level    ///< level for this domain, or -1 to clear the override
 );
 
+/**
+ * @brief Apply log-level configuration from the @c AXL_LOG_LEVEL
+ *     environment variable.
+ *
+ * Format (@c value of the env var):
+ *
+ *     AXL_LOG_LEVEL=debug                     # all domains, debug
+ *     AXL_LOG_LEVEL=smbus:debug               # smbus only
+ *     AXL_LOG_LEVEL=smbus:debug,net:info      # multi-domain
+ *     AXL_LOG_LEVEL=*:warn,smbus:debug        # explicit default
+ *     AXL_LOG_LEVEL=all                       # alias for *:debug
+ *     AXL_LOG_LEVEL=off                       # alias for *:none
+ *
+ * Each entry is `<domain>:<level>` separated by commas. Level
+ * keywords (case-insensitive): @c off / @c none, @c error,
+ * @c warning / @c warn, @c info, @c debug, @c trace. Domain
+ * @c * sets the global default. Bare `<level>` (no colon) is a
+ * shorthand for `*:<level>`.
+ *
+ * The function is idempotent and safe to call multiple times.
+ * It is invoked automatically:
+ *   - on first log emission (`axl_log` / `axl_log_full`)
+ *   - on first call to `axl_log_set_level` /
+ *     `axl_log_set_domain_level`
+ * — so setting @c AXL_LOG_LEVEL in the shell before invoking a
+ * tool takes effect with no further configuration.
+ *
+ * **Precedence**: the env var is the **baseline**; programmatic
+ * @c axl_log_set_level / @c axl_log_set_domain_level calls
+ * **always win** because the lazy init runs first inside those
+ * setters before they apply the explicit level. This matches
+ * @c RUST_LOG semantics — env defines the floor, code overrides.
+ *
+ * Level keywords are case-insensitive (`debug`, `Debug`,
+ * `DEBUG` all parse the same). Unrecognized levels and malformed
+ * entries are silently ignored — no log churn during init.
+ *
+ * Per-domain configuration is the larger value-add over a CLI
+ * flag — keeps `-d` / `-v` / `--debug` namespace free for
+ * tool-specific use. Mirrors the @c RUST_LOG / @c GST_DEBUG /
+ * @c G_MESSAGES_DEBUG conventions.
+ */
+void
+axl_log_init_from_env(void);
+
 // ---------------------------------------------------------------------------
 // Handler management
 // ---------------------------------------------------------------------------
@@ -177,7 +222,9 @@ axl_log_suppress_console(void);
  */
 void
 axl_log_set_console_timestamp(
-    bool enable  ///< true to show HH:MM:SS.uuuuuu timestamps
+    bool enable  ///< true to show `HH:MM:SS[.uuuuuu]` timestamps (the
+                 ///< fractional field is omitted on platforms whose
+                 ///< firmware doesn't populate `EFI_TIME.Nanosecond`)
 );
 
 /**
@@ -223,6 +270,10 @@ typedef struct {
     const char  *message;
     int          level;
     const char  *domain;
+    /* Microseconds since axl init — strictly monotonic across the
+       lifetime of the running app. Use for ordering / time-deltas
+       between entries. To recover wallclock, capture
+       (mono_us, AxlTime) once at app start and add the offset. */
     uint64_t     timestamp;
 } AxlLogEntry;
 

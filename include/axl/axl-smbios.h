@@ -114,7 +114,7 @@ typedef struct {
 
 /// SMBIOS Type 2 BoardType values (Table 14). The canonical
 /// "is this a server blade?" detector — `BoardType == 3`. Type 3
-/// chassis 0x1C/0x1D blade bits are unreliable on real Dell firmware
+/// chassis 0x1C/0x1D blade bits are unreliable on some OEM firmware
 /// (see ADDF/Libs/SAL/AddfSAL.cpp:fIsBladeSmbios), so callers wanting
 /// blade detection should always check Type 2 BoardType, not Type 3.
 /// 0x00 is our "not published" sentinel (record too short to carry the
@@ -518,6 +518,60 @@ int axl_smbios_find_redfish_host_interface(
     AxlSmbiosHostInterface  *iface_out
 );
 
+/// SMBIOS Type 42 — Redfish-over-IP protocol-data assignment types.
+typedef enum {
+    AXL_SMBIOS_REDFISH_HOST_IP_UNKNOWN       = 0x00,
+    AXL_SMBIOS_REDFISH_HOST_IP_STATIC        = 0x01,
+    AXL_SMBIOS_REDFISH_HOST_IP_DHCP          = 0x02,
+    AXL_SMBIOS_REDFISH_HOST_IP_AUTOCONFIG    = 0x03,
+    AXL_SMBIOS_REDFISH_HOST_IP_HOST_SELECTED = 0x04,
+} AxlSmbiosRedfishHostIpAssignment;
+
+/// SMBIOS Type 42 — Redfish-over-IP IP-address-format byte.
+typedef enum {
+    AXL_SMBIOS_REDFISH_IP_FORMAT_UNKNOWN = 0x00,
+    AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4    = 0x01,
+    AXL_SMBIOS_REDFISH_IP_FORMAT_IPV6    = 0x02,
+} AxlSmbiosRedfishIpFormat;
+
+/**
+ * @brief Decoded Redfish-over-IP protocol record (SMBIOS 3.x §7.43.3).
+ *
+ * Hostname pointer is into the SMBIOS table (caller must not free).
+ * `hostname_len` is the byte count emitted by firmware; the run is
+ * NUL-terminated only if firmware chose to terminate it.
+ */
+typedef struct {
+    uint8_t                              service_uuid[16];
+    AxlSmbiosRedfishHostIpAssignment     host_ip_assignment;
+    AxlSmbiosRedfishIpFormat             host_ip_format;
+    uint8_t                              host_ip_address[16];     ///< IPv4 in first 4 bytes if format==IPv4
+    uint8_t                              host_ip_mask[16];
+    uint8_t                              service_ip_discovery;    ///< same enum as host_ip_assignment
+    AxlSmbiosRedfishIpFormat             service_ip_format;
+    uint8_t                              service_ip_address[16];
+    uint8_t                              service_ip_mask[16];
+    uint16_t                             service_port;
+    uint32_t                             service_vlan_id;
+    uint8_t                              hostname_len;
+    const char                          *hostname;                ///< pointer into the SMBIOS table; not necessarily NUL-terminated
+} AxlSmbiosRedfishOverIp;
+
+/**
+ * @brief Decode the protocol-specific data of a Redfish-over-IP record.
+ *
+ * @param proto    a protocol record from `AxlSmbiosHostInterface.protocols[]`
+ *                 with `protocol_type == AXL_SMBIOS_HIP_REDFISH_OVER_IP`.
+ * @param out      receives the parsed fields on success.
+ * @return AXL_OK on success, AXL_ERR if @p proto is NULL, wrong protocol
+ *         type, or the data is too short for the fixed Redfish-over-IP
+ *         layout (91 bytes + hostname).
+ */
+int
+axl_smbios_read_redfish_over_ip(
+    const AxlSmbiosHostInterfaceProtocol *proto,
+    AxlSmbiosRedfishOverIp               *out);
+
 /**
  * @brief Get the system UUID with the endian-swap SMBIOS requires applied.
  *
@@ -716,9 +770,9 @@ axl_smbios_strings_byte_len(
  * additions tracked by recent vendor fixes:
  *   - PCIe Gen 1..6 (legacy 0xA1-0xA6, Gen 2-6 at 0xA7-0xBF)
  *   - 0x25 — M.2 Socket 3 (Mech Key M) Gen 5 (the historical
- *     "Gen 4 vs Gen 5" mismapping fixed in Dell aab01c48d)
+ *     "Gen 4 vs Gen 5" mismapping fixed upstream in dmidecode aab01c48d)
  *   - 0x26 / 0x27 / 0x28 — OCP NIC 3.0 SFF / LFF / Prior to 3.0
- *     (Dell 0c558a930)
+ *     (dmidecode commit 0c558a930)
  *   - 0x29 / 0x2A — EDSFF E1.S / E1.L
  *   - 0x2B / 0x2C — EDSFF E3.S / E3.L
  *   - 0x22 / 0x23 / 0x24 / 0x25 — M.2 Mech Keys A / E / B / M

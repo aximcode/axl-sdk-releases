@@ -77,17 +77,23 @@ ddr5_sdram_bytes(
 // ---------------------------------------------------------------------------
 
 /**
- * Select page @a page (0..7) on the SPD5118 hub at @a addr. Writes
- * the page index to MR11 (register 0x0B). Errors propagate.
+ * Set MR11 to (addr_mode_bit | page) — preserves the addr-mode bit
+ * the BIOS configured (bit 3 = 1 for 2-byte, 0 for 1-byte legacy
+ * mode). Linux's spd5118 driver does the same: only the low 3 bits
+ * are touched per page change, the addr-mode bit is read once and
+ * threaded through every subsequent write. Clobbering it would flip
+ * the hub into a mode our SMBus byte ops can't drive.
  */
 static int
 ddr5_select_page(
     AxlSmbus  *smbus,
     uint8_t    addr,
+    uint8_t    addr_mode_bit,
     uint8_t    page
     )
 {
-    return axl_smbus_write_byte(smbus, addr, AXL_SPD_DDR5_MR11, page);
+    uint8_t mr11 = (uint8_t)(addr_mode_bit | (page & AXL_SPD_DDR5_MR11_PAGE_MASK));
+    return axl_smbus_write_byte(smbus, addr, AXL_SPD_DDR5_MR11, mr11);
 }
 
 int
@@ -103,19 +109,38 @@ axl_spd_ddr5_read(
         return AXL_ERR;
     }
 
+    /* Read MR11 once to capture the addr-mode bit. We must preserve
+     * it across every page-select write (per JEDEC SPD5118 spec —
+     * Linux's spd5118.c does the same at line 663). */
+    uint8_t mr11_orig = 0;
+    if (axl_smbus_read_byte(smbus, addr, AXL_SPD_DDR5_MR11, &mr11_orig)
+        != AXL_OK)
+    {
+        axl_debug("DDR5 MR11 read failed at 0x%02X", addr);
+        return AXL_ERR;
+    }
+    uint8_t addr_mode = mr11_orig & AXL_SPD_DDR5_MR11_ADDR_BIT;
+
     size_t pages = (cap + AXL_SPD_DDR5_PAGE_SIZE - 1) / AXL_SPD_DDR5_PAGE_SIZE;
     if (pages > AXL_SPD_DDR5_NUM_PAGES) {
         pages = AXL_SPD_DDR5_NUM_PAGES;
     }
 
-    size_t total = 0;
-    int    rc    = 0;
+    size_t  total       = 0;
+    uint8_t cached_page = (uint8_t)(mr11_orig & AXL_SPD_DDR5_MR11_PAGE_MASK);
+    bool    page_known  = true;
+    int     rc          = 0;
+
     for (size_t p = 0; p < pages; p++) {
-        if (ddr5_select_page(smbus, addr, (uint8_t)p) != 0) {
-            axl_debug("DDR5 page-select to %u failed at 0x%02X",
-                      (unsigned)p, addr);
-            rc = (total == 0) ? AXL_ERR : AXL_OK;
-            goto out;
+        if (!page_known || (uint8_t)p != cached_page) {
+            if (ddr5_select_page(smbus, addr, addr_mode, (uint8_t)p) != 0) {
+                axl_debug("DDR5 page-select to %zu failed at 0x%02X",
+                          p, addr);
+                rc = (total == 0) ? AXL_ERR : AXL_OK;
+                goto out;
+            }
+            cached_page = (uint8_t)p;
+            page_known  = true;
         }
         /* Read this page's 128 bytes from offsets 0x80..0xFF. */
         size_t want = cap - total;
@@ -123,8 +148,10 @@ axl_spd_ddr5_read(
             want = AXL_SPD_DDR5_PAGE_SIZE;
         }
         for (size_t i = 0; i < want; i++) {
-            uint8_t off = (uint8_t)(0x80 + i);
-            if (axl_smbus_read_byte(smbus, addr, off, &buf[total + i]) != AXL_OK) {
+            uint8_t off = (uint8_t)(AXL_SPD_DDR5_EEPROM_BASE + i);
+            if (axl_smbus_read_byte(smbus, addr, off, &buf[total + i])
+                != AXL_OK)
+            {
                 total += i;
                 rc = (total == 0) ? AXL_ERR : AXL_OK;
                 goto out;
@@ -134,11 +161,13 @@ axl_spd_ddr5_read(
     }
 
 out:
-    /* Always restore page 0 so the device is in a predictable state
-       for the next consumer — including mid-read failures, where
-       we'd otherwise leave the hub on the last selected page and
-       silently mis-serve subsequent reads. Best-effort. */
-    (void)ddr5_select_page(smbus, addr, 0);
+    /* Restore page 0 so the device is in a predictable state for the
+     * next consumer. Preserve the addr-mode bit. Best-effort.
+     * Skip if we never moved off page 0 in the first place — saves a
+     * redundant SMBus op. */
+    if (cached_page != 0 || !page_known) {
+        (void)ddr5_select_page(smbus, addr, addr_mode, 0);
+    }
 
     if (rc == 0) {
         *len = total;

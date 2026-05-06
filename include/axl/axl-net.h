@@ -209,6 +209,46 @@ axl_ipv4_format(
     size_t        size        ///< buffer size (16 bytes sufficient)
 );
 
+/**
+ * @brief Format 16 IPv6 octets to a colon-separated text representation.
+ *
+ * Emits the canonical lowercase form with `::` collapsing the longest
+ * run of all-zero 16-bit groups, per RFC 5952. Single zero groups are
+ * not collapsed; ties go to the leftmost run.
+ *
+ * Writes at most @p size bytes (including NUL). 40 bytes is always
+ * sufficient (max form: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" + NUL,
+ * 39 chars + 1).
+ *
+ * @return AXL_OK on success, AXL_ERR if buffer is too small or args
+ *         are NULL.
+ */
+int
+axl_ipv6_format(
+    const uint8_t octets[16],  ///< sixteen octets
+    char         *buf,         ///< output buffer
+    size_t        size         ///< buffer size (40 bytes sufficient)
+);
+
+/// True if @p a equals @p b byte-for-byte.
+bool
+axl_ipv4_equals(
+    const uint8_t a[4],
+    const uint8_t b[4]
+);
+
+/// True if @p dest is in the same subnet as @p station given @p mask.
+/// A zero mask is treated as "no policy" and returns false rather
+/// than the technically-true "every IP matches" — callers using this
+/// for routing decisions don't want an unconfigured interface to
+/// claim every destination.
+bool
+axl_ipv4_in_subnet(
+    const uint8_t dest[4],
+    const uint8_t station[4],
+    const uint8_t mask[4]
+);
+
 // ===========================================================================
 //
 //  Network Interface Enumeration

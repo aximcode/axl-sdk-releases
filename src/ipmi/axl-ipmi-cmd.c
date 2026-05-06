@@ -481,7 +481,7 @@ axl_ipmi_sdr_get(AxlIpmiSession *session,
     // Chunked read strategy: matches Linux ipmitool's
     // ipmi_sdr_get_record(). Full-record reads (BytesToRead=0xFF)
     // produce 60+ byte IPMI responses that force multi-part SSIF
-    // reads, which hang on the Nvidia UEFI I2C driver + Dell iDRAC
+    // reads, which hang on the Nvidia UEFI I2C driver + vendor BMC
     // combination (uefi-ipmitool commit 8c6acdb documented this).
     // Header-first + 23-byte body chunks keeps every response in a
     // single SSIF block.

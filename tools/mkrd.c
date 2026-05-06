@@ -565,14 +565,23 @@ do_destroy(
 // Entry point
 // ===========================================================================
 
+static int    g_argc;
+static char **g_argv;
+
 static int
 run_mkrd(AxlArgs *a)
 {
     verbose = axl_args_get_bool(a, "verbose");
 
+    /* AXL_DIAG-gated cross-tool startup dump (no-op when env unset). */
+    axl_diag_startup(g_argc, g_argv);
+
     if (verbose) {
-        /* Raise log level so axl_driver_ensure's debug trace surfaces. */
-        axl_log_set_level(AXL_LOG_DEBUG);
+        /* mkrd-specific verbose: the EFI_RAM_DISK_PROTOCOL state at
+         * entry tells you whether ensure-with-embedded had any work
+         * to do or the firmware already published the driver. For
+         * library-level debug output (axl_driver_ensure's traces,
+         * SMBus / driver-load detail), set AXL_LOG_LEVEL=debug. */
         axl_diag_probe_protocol(
             (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
             "EFI_RAM_DISK_PROTOCOL");
@@ -580,7 +589,7 @@ run_mkrd(AxlArgs *a)
 
     /* All non-help modes need EFI_RAM_DISK_PROTOCOL. Resolution
      * order (see axl_driver_ensure_with_embedded):
-     *   1. firmware already published the protocol (most Dell/HP/
+     *   1. firmware already published the protocol (most modern OEM firmware,
      *      Supermicro boxes hit this path),
      *   2. --driver <name> override: search disk only, no fallback,
      *   3. canonical search for RamDiskDxe.efi on disk,
@@ -631,7 +640,8 @@ run_mkrd(AxlArgs *a)
 int
 main(int argc, char **argv)
 {
-    axl_diag_startup(argc, argv);
+    g_argc = argc;
+    g_argv = argv;
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "MkRd",
         .help         = "Create / list / destroy RAM disks via EFI_RAM_DISK_PROTOCOL",

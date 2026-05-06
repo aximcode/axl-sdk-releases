@@ -23,11 +23,31 @@
 #define AXL_SPD_DDR4_SPA0   0x36   ///< select lower 256 bytes
 #define AXL_SPD_DDR4_SPA1   0x37   ///< select upper 256 bytes
 
-// SPD5118 (DDR5) MR11 register selects the read page for the upper
-// 128-byte window of the 1024-byte address space.
-#define AXL_SPD_DDR5_MR11   0x0B
+// SPD5118 (DDR5) Mode Register layout — see JEDEC SPD5118 spec.
+// The hub fronts ~128 bytes of MR space at 0x00..0x7F (vendor / device
+// ID, capabilities, page-select, integrated TS sensor) and 8 pages of
+// 128 bytes of EEPROM content at 0x80..0xFF after a page-select via
+// MR11. We mirror Linux's `drivers/hwmon/spd5118.c` register names.
+#define AXL_SPD_DDR5_MR0    0x00   ///< device-type LSB; expect 0x18
+#define AXL_SPD_DDR5_MR1    0x01   ///< device-type MSB; expect 0x51
+#define AXL_SPD_DDR5_MR3    0x03   ///< vendor bank
+#define AXL_SPD_DDR5_MR4    0x04   ///< vendor id (JEP-106, odd parity)
+#define AXL_SPD_DDR5_MR5    0x05   ///< capability — bit 1 = TS_SUPPORT
+#define AXL_SPD_DDR5_MR11   0x0B   ///< I2C legacy mode: ADDR + page index
+
+#define AXL_SPD_DDR5_DEVTYPE_LSB    0x18  ///< MR0 expected
+#define AXL_SPD_DDR5_DEVTYPE_MSB    0x51  ///< MR1 expected (-> 0x5118)
+
+// MR11 bit layout
+#define AXL_SPD_DDR5_MR11_ADDR_BIT  0x08   ///< 0=1-byte (legacy), 1=2-byte
+#define AXL_SPD_DDR5_MR11_PAGE_MASK 0x07   ///< low 3 bits = page index 0..7
+
+// MR5 bit layout
+#define AXL_SPD_DDR5_MR5_TS_SUPPORT 0x02
+
 #define AXL_SPD_DDR5_PAGE_SIZE  128
 #define AXL_SPD_DDR5_NUM_PAGES  8       ///< 0..7 → covers 0..1023
+#define AXL_SPD_DDR5_EEPROM_BASE 0x80   ///< page content starts here
 
 // ---------------------------------------------------------------------------
 // DDR4 codec (axl-spd-ddr4.c)

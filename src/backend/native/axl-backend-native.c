@@ -179,6 +179,105 @@ axl_backend_get_time(
     return AXL_OK;
 }
 
+/* High-resolution monotonic microseconds. The wallclock from
+   gRT->GetTime is only second-resolution on most firmware (OVMF and
+   most BMC firmware leave EFI_TIME.Nanosecond=0). Use the architecture's
+   cycle counter for sub-second precision. */
+
+#if defined(__x86_64__)
+static inline uint64_t
+read_cycle_counter(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+#elif defined(__aarch64__)
+static inline uint64_t
+read_cycle_counter(void)
+{
+    uint64_t v;
+    /* CNTPCT_EL0: physical counter. Always accessible at EL0/EL1. */
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+}
+static inline uint64_t
+read_counter_freq(void)
+{
+    uint64_t v;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+}
+#endif
+
+/* High-resolution monotonic-us, calibration semantics:
+
+   - 0 means "uninitialized" — the next call will calibrate.
+   - The first call's RETURN value reflects elapsed time during
+     calibration itself (a few microseconds plus the 10ms Stall on
+     x86) so callers don't have to handle a special "0 on first
+     call" case.
+   - On platforms where the cycle counter is too slow to give us
+     microsecond resolution (counter freq < 1 MHz), we leave
+     `ticks_per_us` at the no-resolution sentinel and every call
+     after returns 0. Better to surface "no fractional" than emit
+     wildly-wrong values from a 1-tick-per-call fallback.
+
+   UEFI is single-threaded at TPL_APPLICATION so we don't need
+   atomics around the static state. RDTSC isn't serializing — for
+   microsecond-resolution log timestamps, the few-cycle OoO window
+   is invisible. The x86 path assumes invariant TSC (Nehalem+ /
+   all server CPUs); pre-2008 laptops would see drift under DVFS. */
+#define AXL_MONOTONIC_NO_RESOLUTION  ((uint64_t)~0ULL)
+
+uint64_t
+axl_backend_get_monotonic_us(void)
+{
+#if defined(__x86_64__) || defined(__aarch64__)
+    static uint64_t base_count   = 0;
+    static uint64_t ticks_per_us = 0;  /* 0 = uninit, sentinel = giveup */
+
+    if (ticks_per_us == AXL_MONOTONIC_NO_RESOLUTION) {
+        return 0;
+    }
+
+    if (ticks_per_us == 0) {
+        /* Set base_count BEFORE calibration so the first call returns
+           the calibration interval itself (a useful non-zero value)
+           rather than 0. */
+        base_count = read_cycle_counter();
+#if defined(__aarch64__)
+        uint64_t freq = read_counter_freq();
+        if (freq < 1000000u) {
+            /* Counter is too slow to give us microsecond resolution.
+               Surface that as "no fractional" rather than emit
+               misleadingly-scaled values. */
+            ticks_per_us = AXL_MONOTONIC_NO_RESOLUTION;
+            return 0;
+        }
+        ticks_per_us = freq / 1000000u;
+#else  /* x86_64: calibrate via 10ms Stall. */
+        uint64_t before = base_count;
+        gBS->Stall(10000);
+        uint64_t after  = read_cycle_counter();
+        uint64_t diff   = after - before;
+        if (diff < 10000u) {
+            /* Counter advanced fewer than 10000 ticks in 10ms — less
+               than 1 MHz. Below microsecond resolution. */
+            ticks_per_us = AXL_MONOTONIC_NO_RESOLUTION;
+            return 0;
+        }
+        ticks_per_us = diff / 10000u;
+#endif
+    }
+
+    uint64_t now = read_cycle_counter();
+    return (now - base_count) / ticks_per_us;
+#else
+    return 0;
+#endif
+}
+
 // ===================================================================
 // Low-level platform I/O (for AxlIpmi, future AxlPci/AxlSpd)
 // ===================================================================
@@ -247,7 +346,14 @@ axl_backend_file_open(
 
     status = shell->OpenFileByName((CHAR16 *)path, &fh, mode);
     if (EFI_ERROR(status)) {
-        axl_debug("file open failed: status=0x%llx", (unsigned long long)status);
+        /* EFI_NOT_FOUND is the normal "file doesn't exist" case and
+         * floods the log when callers probe many candidate paths
+         * (e.g., axl_driver_locate walking every mounted volume).
+         * Real errors — media, permissions — still surface. */
+        if (status != EFI_NOT_FOUND) {
+            axl_debug("file open failed: status=0x%llx",
+                      (unsigned long long)status);
+        }
         return AXL_ERR;
     }
     *handle = (AxlFileHandle)fh;

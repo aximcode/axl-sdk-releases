@@ -328,6 +328,117 @@ decode_ipmi_device_info(AxlSmbiosHeader *hdr)
     }
 }
 
+static const char *
+roi_assignment_name(uint8_t v)
+{
+    switch (v) {
+        case AXL_SMBIOS_REDFISH_HOST_IP_UNKNOWN:        return "Unknown";
+        case AXL_SMBIOS_REDFISH_HOST_IP_STATIC:         return "Static";
+        case AXL_SMBIOS_REDFISH_HOST_IP_DHCP:           return "DHCP";
+        case AXL_SMBIOS_REDFISH_HOST_IP_AUTOCONFIG:     return "AutoConfigure";
+        case AXL_SMBIOS_REDFISH_HOST_IP_HOST_SELECTED:  return "HostSelected";
+        default:                                        return "Reserved";
+    }
+}
+
+static const char *
+roi_format_name(AxlSmbiosRedfishIpFormat f)
+{
+    switch (f) {
+        case AXL_SMBIOS_REDFISH_IP_FORMAT_UNKNOWN: return "Unknown";
+        case AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4:    return "IPv4";
+        case AXL_SMBIOS_REDFISH_IP_FORMAT_IPV6:    return "IPv6";
+        default:                                   return "Reserved";
+    }
+}
+
+/// Print an IP address in the format announced by `format`. For IPv4
+/// the first 4 bytes carry the address; the rest are zero-padding per
+/// SMBIOS spec. Delegates to axl_ipv4_format / axl_ipv6_format so all
+/// consumers share the same canonical text representation.
+static void
+print_roi_ip(const char *label, AxlSmbiosRedfishIpFormat format,
+             const uint8_t addr[16])
+{
+    char buf[40];  /* fits longest IPv6 form */
+    if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4
+        && axl_ipv4_format(addr, buf, sizeof(buf)) == AXL_OK)
+    {
+        axl_printf("\t%s: %s\n", label, buf);
+    } else if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV6
+               && axl_ipv6_format(addr, buf, sizeof(buf)) == AXL_OK)
+    {
+        axl_printf("\t%s: %s\n", label, buf);
+    } else {
+        axl_printf("\t%s: <unknown format>\n", label);
+    }
+}
+
+/// Hex-dump a buffer with one tab indent. For hand-readability of
+/// interface_data and unrecognized protocol payloads.
+static void
+hex_dump_field(const char *label, const uint8_t *buf, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+    axl_printf("\t%s (%zu bytes):", label, len);
+    for (size_t i = 0; i < len; i++) {
+        if ((i % 16) == 0) {
+            axl_printf("\n\t  ");
+        }
+        axl_printf("%02X ", buf[i]);
+    }
+    axl_printf("\n");
+}
+
+static void
+decode_redfish_over_ip(const AxlSmbiosHostInterfaceProtocol *proto)
+{
+    AxlSmbiosRedfishOverIp roi;
+    if (axl_smbios_read_redfish_over_ip(proto, &roi) != AXL_OK) {
+        hex_dump_field("Protocol Data", proto->data, proto->data_len);
+        return;
+    }
+    axl_printf("\t  Service UUID: ");
+    for (size_t i = 0; i < 16; i++) {
+        axl_printf("%02X", roi.service_uuid[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) {
+            axl_printf("-");
+        }
+    }
+    axl_printf("\n");
+    axl_printf("\t  Host IP Assignment: %s\n",
+               roi_assignment_name(roi.host_ip_assignment));
+    axl_printf("\t  Host IP Format: %s\n",
+               roi_format_name(roi.host_ip_format));
+    print_roi_ip("  Host IP Address", roi.host_ip_format, roi.host_ip_address);
+    print_roi_ip("  Host IP Mask",    roi.host_ip_format, roi.host_ip_mask);
+    axl_printf("\t  Service IP Discovery: %s\n",
+               roi_assignment_name(roi.service_ip_discovery));
+    axl_printf("\t  Service IP Format: %s\n",
+               roi_format_name(roi.service_ip_format));
+    print_roi_ip("  Service IP Address", roi.service_ip_format,
+                 roi.service_ip_address);
+    print_roi_ip("  Service IP Mask",    roi.service_ip_format,
+                 roi.service_ip_mask);
+    axl_printf("\t  Service Port: %u\n", roi.service_port);
+    /* Valid 802.1Q VLAN IDs are 0..4095 (12 bits). Anything else —
+       most commonly 0xFFFFFFFF — is firmware's "no VLAN" sentinel.
+       Print "<none>" rather than 4294967295. */
+    if (roi.service_vlan_id > 4095) {
+        axl_printf("\t  Service VLAN: <none>\n");
+    } else {
+        axl_printf("\t  Service VLAN: %u\n", (unsigned)roi.service_vlan_id);
+    }
+    if (roi.hostname_len > 0 && roi.hostname != NULL) {
+        axl_printf("\t  Service Hostname: %.*s\n",
+                   (int)roi.hostname_len, roi.hostname);
+    } else {
+        axl_printf("\t  Service Hostname: <empty>\n");
+    }
+}
+
 static void
 decode_host_interface(AxlSmbiosHeader *hdr)
 {
@@ -339,6 +450,7 @@ decode_host_interface(AxlSmbiosHeader *hdr)
     axl_printf("\tInterface Type: %s (0x%02X)\n",
                hif_type_name(h.interface_type), h.interface_type);
     axl_printf("\tInterface Data Length: %u\n", h.interface_data_len);
+    hex_dump_field("Interface Data", h.interface_data, h.interface_data_len);
     axl_printf("\tProtocol Count: %u\n", h.protocol_count);
     for (uint8_t i = 0; i < h.protocol_count; i++) {
         axl_printf("\t  Protocol %u: %s (0x%02X)  data=%u bytes\n",
@@ -346,6 +458,14 @@ decode_host_interface(AxlSmbiosHeader *hdr)
                    hip_type_name(h.protocols[i].protocol_type),
                    h.protocols[i].protocol_type,
                    h.protocols[i].data_len);
+        if (h.protocols[i].protocol_type
+            == AXL_SMBIOS_HIP_REDFISH_OVER_IP) {
+            decode_redfish_over_ip(&h.protocols[i]);
+        } else {
+            hex_dump_field("  Protocol Data",
+                           h.protocols[i].data,
+                           h.protocols[i].data_len);
+        }
     }
 }
 

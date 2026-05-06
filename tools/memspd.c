@@ -19,10 +19,24 @@
     working directory. `--jedec-file` overrides both. When no
     sidecar loads, the tool prints the numeric JEP-106 code via
     @ref axl_spd_format_name's "0xCCCC" fallback.
+
+    Direct SPD reads only work where the platform's SMBus exposes
+    the DIMM EEPROMs to non-firmware software, which on many
+    server boards isn't the case (notably AMD FCH-based platforms
+    where the AUX controller exhibits a false-ACK + zero-data
+    quirk — see `<axl/axl-spd.h>`'s "Platform limitations" section
+    for the full list). When the SMBus path returns no slots,
+    memspd falls back to SMBIOS Type 17 — the same data
+    `dmidecode --type 17` exposes on Linux. Use `memspd scan` to
+    see which controller(s) actually responded with plausible
+    SPD bytes (`scan` is also useful when bringing up a new
+    platform — it tells you whether the SMBus path is blocked
+    chipset-wide or just at the codec layer).
 **/
 
 #include <axl.h>
 #include <axl/axl-spd.h>
+#include <axl/axl-smbios.h>
 
 // ---------------------------------------------------------------------------
 // JEDEC sidecar loader — thin wrapper around the library API. The
@@ -31,6 +45,8 @@
 // ---------------------------------------------------------------------------
 
 static AxlSidecarStatus  g_jedec_load_rc = AXL_SIDECAR_FILE_MISSING;
+static int               g_argc;
+static char            **g_argv;
 
 static void
 spd_ids_load_pre_run(
@@ -39,6 +55,11 @@ spd_ids_load_pre_run(
 {
     g_jedec_load_rc = axl_spd_ids_load(
         axl_args_get_string(a, "jedec-file"));
+
+    /* AXL_DIAG env-var triggers the cross-tool startup dump. The
+     * function self-gates on the env var, so unconditional call
+     * is correct and cheap. */
+    axl_diag_startup(g_argc, g_argv);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +137,62 @@ print_info(
 // Verbs
 // ---------------------------------------------------------------------------
 
+/*
+ * Pretty-print SMBIOS Type 17 memory-type byte. Subset of the spec
+ * table sufficient to label what's typically deployed today.
+ */
+static const char *
+dmi_memory_type_label(uint8_t t)
+{
+    switch (t) {
+        case 0x18: return "DDR3";
+        case 0x1A: return "DDR4";
+        case 0x1E: return "LPDDR3";
+        case 0x1F: return "LPDDR4";
+        case 0x22: return "DDR5";
+        case 0x23: return "LPDDR5";
+        default:   return "?";
+    }
+}
+
+/*
+ * Fallback path when the I2C/SMBus bus carrying DIMM SPDs isn't
+ * reachable from UEFI (some server firmwares don't publish it; on
+ * AMD platforms the SPDs sit on the AUX SMBus controller which is
+ * frequently held by the BMC during BDS).
+ * BIOS populates SMBIOS Type 17 from its own SPD reads at POST,
+ * so the data is authoritative — just static rather than live.
+ */
+static int
+do_list_via_dmi(void)
+{
+    AxlSmbiosHeader *hdr = NULL;
+    int populated = 0, total = 0;
+    while ((hdr = axl_smbios_find_next(AXL_SMBIOS_TYPE_MEMORY_DEVICE, hdr))
+           != NULL)
+    {
+        AxlSmbiosMemoryDevice md = {0};
+        if (axl_smbios_read_memory_device(hdr, &md) != AXL_OK) {
+            continue;
+        }
+        total++;
+        if (md.size_mb == 0) {
+            continue;
+        }
+        populated++;
+        axl_printf("  %-12s  %-5s  %5u MB  %4u MT/s  %-10s  %s\n",
+                   md.device_locator ? md.device_locator : "?",
+                   dmi_memory_type_label(md.memory_type),
+                   (unsigned)md.size_mb,
+                   (unsigned)md.speed_mhz,
+                   md.manufacturer ? md.manufacturer : "?",
+                   md.part_number  ? md.part_number  : "?");
+    }
+    axl_printf("\n%d populated of %d slots (per SMBIOS Type 17)\n",
+               populated, total);
+    return populated > 0 ? 0 : 1;
+}
+
 static int
 do_list(
     AxlArgs  *a
@@ -144,8 +221,15 @@ do_list(
         found++;
     }
     if (found == 0) {
-        axl_printf("No populated DIMM slots detected on the SMBus.\n");
-        return 1;
+        /* SMBus path is dead; fall back to BIOS-populated SMBIOS
+         * Type 17. Common on AMD server platforms where DIMM SPDs
+         * aren't routed to any UEFI-reachable bus. The data is
+         * static (POST snapshot) but accurate. `memspd scan`
+         * confirms whether any controller actually responds. */
+        axl_printf("No DIMM SPDs reachable on any SMBus / I2C controller\n");
+        axl_printf("(see `memspd scan` for per-controller probe results)\n");
+        axl_printf("Falling back to SMBIOS Type 17 (BIOS-populated):\n\n");
+        return do_list_via_dmi();
     }
     return 0;
 }
@@ -198,6 +282,54 @@ do_decode(
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic: scan every published SMBus controller, dump SPD-range
+// byte 0 from each. Useful when `list` finds nothing — tells the user
+// which controller(s) (if any) speak to slaves at 0x50..0x57 and what
+// they actually return.
+// ---------------------------------------------------------------------------
+
+static void
+scan_visit(
+    AxlSmbus  *s,
+    size_t     index,
+    void      *user
+    )
+{
+    (void)user;
+    AxlSmbusTransport tk = axl_smbus_transport(s);
+    axl_printf("[%zu] %s controller — byte 0 at SPD addresses:\n",
+               index, axl_smbus_transport_string(tk));
+    int responses = 0;
+    for (uint8_t addr = AXL_SPD_ADDR_FIRST; addr <= AXL_SPD_ADDR_LAST; addr++) {
+        uint8_t byte0 = 0;
+        int rc = axl_smbus_read_byte(s, addr, 0x00, &byte0);
+        if (rc == AXL_OK) {
+            const char *plausible =
+                (byte0 >= 0x09 && byte0 <= 0x12) ? " (looks like SPD)" : "";
+            axl_printf("    0x%02X: 0x%02X%s\n",
+                       (unsigned)addr, (unsigned)byte0, plausible);
+            responses++;
+        }
+    }
+    if (responses == 0) {
+        axl_printf("    (no slave at 0x50..0x57 acknowledged)\n");
+    }
+}
+
+static int
+do_scan(
+    AxlArgs  *a
+    )
+{
+    (void)a;
+    axl_printf("Scanning every published SMBus + I2C controller for SPD slaves\n");
+    axl_printf("(plausible SPD type byte is 0x09..0x12 per JEDEC spec)\n\n");
+    size_t n = axl_smbus_visit_all(scan_visit, NULL);
+    axl_printf("\n%zu controller(s) visited.\n", n);
+    return n > 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 // AxlArgs declaration
 // ---------------------------------------------------------------------------
 
@@ -218,12 +350,17 @@ static const AxlArgsNode verbs[] = {
     { .name = "decode", .handler = do_decode,
       .positionals = slot_arg,
       .help = "Raw hex dump + decoded fields" },
+    { .name = "scan",   .handler = do_scan,
+      .help = "Diagnostic: dump SPD-range byte 0 from every SMBus/I2C controller" },
     {0}
 };
 
 static const AxlArgDesc global_flags[] = {
     { .name = "jedec-file", .short_name = 'j', .type = AXL_ARG_STRING,
       .help = "Path to JEDEC vendor JSON sidecar" },
+    /* No tool-specific --verbose for memspd. Set AXL_DIAG=1 to get
+     * the cross-tool startup-diagnostic dump; AXL_LOG_LEVEL=debug
+     * to see library debug logs from the SMBus / SPD codecs. */
     {0}
 };
 
@@ -233,11 +370,14 @@ main(
     char **argv
     )
 {
-    axl_diag_startup(argc, argv);
+    g_argc = argc;
+    g_argv = argv;
 
     int rc = axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "memspd",
-        .help         = "Read JEDEC SPD content from DDR4/DDR5 DIMMs",
+        .help         = "Read JEDEC SPD content from DDR4/DDR5 DIMMs "
+                        "(falls back to SMBIOS Type 17 on platforms "
+                        "where the SMBus path is unavailable)",
         .flags        = global_flags,
         .verbs        = verbs,
         .pre_run      = spd_ids_load_pre_run,

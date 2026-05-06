@@ -216,14 +216,20 @@ posture as the cap-walk monotonic guard from commit 8b90954.
 
 ## Vendor / device / subsystem name database
 
-`axl_pci_ids_load(override_path)` loads a curated JSON5 sidecar
-(`pci-ids.json5`). When `override_path` is non-NULL it is used
-authoritatively (no fallback — explicit means explicit). When it
-is NULL the loader autodiscovers in this order: companion to the
-running .efi, then current working directory. axl-sdk ships a
-starter set in `share/pci-ids.json5` covering QEMU emulated
+`axl_pci_ids_load(override_path)` loads `share/pci-ids.json5` —
+a curated JSON5 sidecar that pairs `vendors[]` (read here) with
+`classes[]` (read by `axl_pci_class_load`) in one schema-2 file.
+When `override_path` is non-NULL it is used authoritatively (no
+fallback — explicit means explicit); when NULL the loader
+autodiscovers `pci-ids.json5` companion to the running .efi or
+in cwd. axl-sdk ships a starter set covering QEMU emulated
 devices, common server NICs, NVMe, and GPUs — extend or replace
 as your fleet requires.
+
+Both loaders read the same file. Each ignores the section it
+doesn't care about (`axl_pci_class_load` skips `vendors[]`,
+`axl_pci_ids_load` skips `classes[]`), so a tool that only needs
+class names doesn't pay for the much larger vendor table.
 
 ```c
 if (axl_pci_ids_load(NULL) == 0) {
@@ -334,13 +340,14 @@ Sized to comfortably hold real `pci.ids` entries; loader silently
 truncates over-cap names. Pin `char buf[AXL_PCI_NAME_COMPOSED_MAX]`
 on the stack and never have to worry about formatter overflow.
 
-## Class-name overlay (optional sidecar)
+## Class-name overlay (optional)
 
 For decoding the class triplet itself, the compiled-in tables in
-`src/pci/axl-pci.c` are the bootstrap default. A JSON5 sidecar
-(`pci-class.json5`) layered on top lets new triplets (CXL Memory
-Expanders, future PCIe class assignments, ...) get human names
-without rebuilding every consumer:
+`src/pci/axl-pci.c` are the bootstrap default. The `classes[]`
+section of `pci-ids.json5` overlays per-tier names — consulted
+before the compiled-in table — so new triplets (CXL Memory
+Expanders, future PCIe class assignments, ...) can ship via a
+`git pull` of the sidecar instead of rebuilding every consumer:
 
 ```c
 axl_pci_class_load(NULL);  /* opt-in opportunistic load */
@@ -351,8 +358,17 @@ axl_pci_class_string_fmt(0x060000, AXL_PCI_CLASS_FMT_FULL,
 ```
 
 Same `-1`/`-2` distinction and override-authoritative semantics as
-`axl_pci_ids_load`. Schema in `share/pci-class.json5` — each entry
-pins any subset of `(base, sub, prog)`.
+`axl_pci_ids_load`. Both schemas parse:
+
+- **Schema 2** (current) — hierarchical: subclasses nest under
+  bases, programming interfaces nest under subclasses. Locality
+  matches the `vendors[]` convention.
+- **Schema 1** (legacy) — flat: each entry pins any subset of
+  `(base, sub, prog)`. Useful for hand-edited overrides where the
+  hierarchy adds friction over a one-line addition.
+
+Both populate the same internal hash tables; lookups are global on
+the composite key regardless of file shape.
 
 `AxlPciClassFmt` selects the output shape:
   - `FMT_FULL` — `"Bridge / Host bridge / <prog>"` (default)

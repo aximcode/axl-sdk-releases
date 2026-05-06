@@ -60,23 +60,19 @@ next_pow2(uint32_t v)
     return v;
 }
 
+/* Ring timestamps must be monotonic so consumers that sort or
+   diff entries don't see inversion. Earlier this function combined
+   wallclock seconds with `monotonic_us % 1_000_000` for the
+   fractional — that broke ordering within a wallclock second
+   (mono advances continuously while RTC ticks at integer-second
+   boundaries; the combined value can go backwards). Use raw
+   monotonic-us-since-axl-init: strictly monotonic, microsecond-
+   precise, no wallclock interaction. Wallclock formatting is the
+   caller's job at dump time. */
 static uint64_t
 get_timestamp(void)
 {
-    AxlTime time;
-
-    if (axl_backend_get_time(&time) != AXL_OK) {
-        return 0;
-    }
-
-    uint64_t seconds = (uint64_t)(time.year - 2000) * 31557600
-                     + (uint64_t)(time.month - 1)   * 2629800
-                     + (uint64_t)(time.day - 1)     * 86400
-                     + (uint64_t)time.hour          * 3600
-                     + (uint64_t)time.minute        * 60
-                     + (uint64_t)time.second;
-
-    return seconds * 1000000 + (uint64_t)(time.nanosecond / 1000);
+    return axl_backend_get_monotonic_us();
 }
 
 static void

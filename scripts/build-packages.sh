@@ -211,7 +211,7 @@ for arch in x64 aa64; do
     # contents to a FAT USB stick. Files that don't exist in the
     # source tree (rare; only on stripped checkouts) are skipped
     # silently.
-    for sidecar in pci-ids.json5 pci-class.json5 \
+    for sidecar in pci-ids.json5 \
                    usb-ids.json5 jedec.json5; do
         if [[ -f "$PROJECT_ROOT/share/$sidecar" ]]; then
             cp "$PROJECT_ROOT/share/$sidecar" "$TOOLS_STAGE/$sidecar"
@@ -268,8 +268,8 @@ Tools included:
   sysinfo.efi   System inventory summary
 
 Sidecar databases included (auto-discovered next to the .efi):
-  pci-ids.json5    PCI vendor / device / subsystem names (lspci)
-  pci-class.json5  PCI class-name overlay (lspci)
+  pci-ids.json5    PCI vendor / device / subsystem + class names
+                   (consumed by lspci; one file, two sections)
   usb-ids.json5    USB vendor / device names (lsusb)
   jedec.json5      JEDEC JEP-106 manufacturer codes (memspd)
 
@@ -288,7 +288,7 @@ Usage:
 
 On firmware that already publishes EFI_SIMPLE_NETWORK_PROTOCOL for
 the NIC, the staged drivers are unused. On minimal firmware (legacy
-Dell EDK1, custom BMCs, etc.) axl_net_ensure_drivers loads them on
+legacy EDK1 firmware, custom BMCs, etc.) axl_net_ensure_drivers loads them on
 demand from drivers/$arch/ before networking tools (netinfo, fetch,
 rfbrowse) attempt to use the network.
 

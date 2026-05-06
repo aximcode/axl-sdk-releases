@@ -48,6 +48,7 @@ void axl_tls_stage_data(AxlTlsContext *c, const void *d, size_t l)
 // ===================================================================
 
 #include "../backend/axl-backend.h"
+#include <axl/axl-atexit.h>
 #include <axl/axl-log.h>
 
 #include <mbedtls/ssl.h>
@@ -145,6 +146,8 @@ tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 // Public API: lifecycle
 // ---------------------------------------------------------------------------
 
+static void axl_tls_cleanup_thunk(void *unused);
+
 bool
 axl_tls_available(void)
 {
@@ -195,6 +198,7 @@ axl_tls_init(void)
     mbedtls_ssl_conf_rng(&g_tls_config, mbedtls_ctr_drbg_random, &g_ctr_drbg);
 
     g_initialized = true;
+    axl_atexit(axl_tls_cleanup_thunk, NULL);
     axl_info("initialized (mbedTLS)");
     return AXL_OK;
 }
@@ -213,6 +217,15 @@ axl_tls_cleanup(void)
     mbedtls_entropy_free(&g_entropy);
 
     g_initialized = false;
+}
+
+/// Atexit thunk — drops the void* arg so axl_tls_cleanup keeps a
+/// caller-friendly signature.
+static void
+axl_tls_cleanup_thunk(void *unused)
+{
+    (void)unused;
+    axl_tls_cleanup();
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 #include "../backend/axl-backend.h"
 #include <axl/axl-diag.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-env.h>
 #include <axl/axl-format.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
@@ -26,6 +27,16 @@ axl_diag_startup(
     char **argv
     )
 {
+    /* Gated on AXL_DIAG env var. Tools call us unconditionally; the
+     * env-var check lives here so the cross-tool diagnostic dump is
+     * activated framework-wide via `set AXL_DIAG 1` rather than
+     * each tool reserving a `-v` slot for it. Frees `-v` to carry
+     * Linux-counterpart semantics (e.g. `grep -v` = invert match). */
+    const char *diag = axl_getenv("AXL_DIAG");
+    if (diag == NULL || *diag == '\0') {
+        return;
+    }
+
     extern EFI_HANDLE gImageHandle;
 
     axl_printf("--- AXL diag ---\n");
@@ -63,7 +74,7 @@ axl_diag_startup(
     }
 
     /* (3) EFI_SHELL_PARAMETERS_PROTOCOL probe + its argv. Optional;
-     *     Dell firmware sometimes doesn't publish it for cross-volume
+     *     some OEM firmware sometimes doesn't publish it for cross-volume
      *     invocations. */
     EFI_SHELL_PARAMETERS_PROTOCOL *sp = NULL;
     EFI_GUID sp_guid = gEfiShellParametersProtocolGuid;

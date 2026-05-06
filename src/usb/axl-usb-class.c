@@ -15,7 +15,7 @@
     list. This is a curated subset — the long tail (e.g. exotic
     BCD-Audio formats, every Smart-Card protocol byte) lives in
     Linux's `lsusb` / `usb.ids` but is rarely worth shipping inline.
-    A future `usb-class.json5` sidecar (parallel to `pci-class.json5`)
+    A future `usb-class.json5` sidecar (parallel to the `classes[]` section of `pci-ids.json5`)
     will let consumers extend without rebuilding.
 **/
 

@@ -872,6 +872,84 @@ test_pci_class_db_handle(void)
     axl_pci_class_close(db);
     axl_pci_class_close(NULL);
     test_check(true, "pci class_db: close + close(NULL) OK");
+
+    /* Schema 2 — hierarchical: subclasses nest under bases, progs
+       nest under subclasses. Lookups resolve to the same composite
+       keys as schema 1, so the same fixture data via either layout
+       must produce identical query results. */
+    static const char fixture_v2[] =
+        "{ schema: 2,\n"
+        "  classes: [\n"
+        "    { base: 0xCC, name: 'OverlayBase',\n"
+        "      subclasses: [\n"
+        "        { sub: 0xCD, name: 'OverlaySub',\n"
+        "          progs: [\n"
+        "            { prog: 0xCE, name: 'OverlayProg' },\n"
+        "          ],\n"
+        "        },\n"
+        "      ],\n"
+        "    },\n"
+        "  ],\n"
+        "}\n";
+
+    AxlPciClassDb *db_v2 = NULL;
+    test_check(axl_pci_class_open_from_buffer(
+                   fixture_v2, axl_strlen(fixture_v2), &db_v2)
+               == AXL_SIDECAR_OK,
+               "pci class_db v2: handle opens from buffer");
+
+    const char *b2 = axl_pci_class_db_base_name(db_v2, 0xCC);
+    test_check(b2 != NULL && axl_strcmp(b2, "OverlayBase") == 0,
+               "pci class_db v2: base lookup matches v1 result");
+    const char *s2 = axl_pci_class_db_sub_name(db_v2, 0xCC, 0xCD);
+    test_check(s2 != NULL && axl_strcmp(s2, "OverlaySub") == 0,
+               "pci class_db v2: sub lookup matches v1 result");
+    const char *p2 = axl_pci_class_db_prog_name(db_v2, 0xCC, 0xCD, 0xCE);
+    test_check(p2 != NULL && axl_strcmp(p2, "OverlayProg") == 0,
+               "pci class_db v2: prog lookup matches v1 result");
+
+    /* Schema 2 base entry without nested subclasses (parent-only
+       node with just a name) — same as schema 1 base-only entries. */
+    test_check(axl_pci_class_db_sub_name(db_v2, 0xCC, 0xEE) == NULL,
+               "pci class_db v2: undefined sub still NULL");
+
+    axl_pci_class_close(db_v2);
+
+    /* Schema 2 base node with no name but nested subclasses — the
+       base entry exists purely as a container. Mirrors the schema
+       2 vendors[] convention where vendor 'name' is optional. */
+    static const char fixture_v2_nameless_base[] =
+        "{ schema: 2,\n"
+        "  classes: [\n"
+        "    { base: 0xCC,\n"
+        "      subclasses: [\n"
+        "        { sub: 0xCD, name: 'OnlySubName' },\n"
+        "      ],\n"
+        "    },\n"
+        "  ],\n"
+        "}\n";
+    AxlPciClassDb *db_nb = NULL;
+    test_check(axl_pci_class_open_from_buffer(
+                   fixture_v2_nameless_base,
+                   axl_strlen(fixture_v2_nameless_base), &db_nb)
+               == AXL_SIDECAR_OK,
+               "pci class_db v2: nameless-base parent node opens");
+    test_check(axl_pci_class_db_base_name(db_nb, 0xCC) == NULL,
+               "pci class_db v2: nameless base → no base entry");
+    const char *snb = axl_pci_class_db_sub_name(db_nb, 0xCC, 0xCD);
+    test_check(snb != NULL && axl_strcmp(snb, "OnlySubName") == 0,
+               "pci class_db v2: nameless base still routes nested sub");
+    axl_pci_class_close(db_nb);
+
+    /* Schema 99 (unknown) → AXL_SIDECAR_PARSE_ERROR. */
+    static const char fixture_bad_schema[] =
+        "{ schema: 99, classes: [] }\n";
+    AxlPciClassDb *db_bad = NULL;
+    test_check(axl_pci_class_open_from_buffer(
+                   fixture_bad_schema, axl_strlen(fixture_bad_schema),
+                   &db_bad) == AXL_SIDECAR_PARSE_ERROR,
+               "pci class_db: schema 99 rejected");
+    test_check(db_bad == NULL, "pci class_db: bad-schema handle stays NULL");
 }
 
 static void
@@ -906,7 +984,7 @@ test_pci_class_db_singleton_overrides(void)
        one that gets image-path-anchored discovery via
        axl_resolve_data_file.
 
-       Production share/pci-class.json5 ships with an empty classes[]
+       Production share/pci-ids.json5 ships with an empty classes[]
        block so deployed lspci output isn't polluted with a demo
        "[overlay]" marker (a downstream session caught this leaking
        into prod tools). The test-only file is the override that
