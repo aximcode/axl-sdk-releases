@@ -3,6 +3,22 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.13.2 — 2026-05-06
+
+### Fixed
+
+- **`axl-cc --version` reports "unknown" when invoked through
+  `/bin/axl-cc` on usrmerge distros** (Fedora / Arch / Ubuntu
+  ≥19). The wrapper resolved its install dir with
+  `cd "$(dirname "$0")"` which follows symlinks logically; on
+  `/bin → /usr/bin` systems, `dirname /bin` = `/`, making
+  `SDK_DIR = /` and breaking version + every relative path
+  lookup. Also surfaced under `sudo` (the secure-PATH typically
+  puts `/bin` ahead of `/usr/bin`). Fix: switch the `cd` to
+  `cd -P` for physical-path resolution. Reported by a
+  downstream consumer after upgrading to v0.13.1; one-character
+  patch in `scripts/install.sh`'s axl-cc heredoc.
+
 ## 0.13.1 — 2026-05-06
 
 ### Fixed

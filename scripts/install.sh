@@ -322,7 +322,14 @@ cat > "$PREFIX/bin/axl-cc" << 'NATIVE_WRAPPER'
 # axl-cc — compile C source to UEFI .efi binary
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# `cd -P` resolves symlinks physically — when axl-cc is invoked
+# through /bin/axl-cc on a distro where /bin is a symlink to
+# /usr/bin (Fedora/Arch/etc., usrmerge), plain `cd` preserves the
+# logical /bin path and SDK_DIR resolves to / instead of /usr.
+# The result is --version printing "unknown" (and worse, missing
+# include/lib lookups) under sudo or any other invocation that
+# hits the /bin alias.
+SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
 SDK_DIR="$(dirname "$SCRIPT_DIR")"
 
 ARCH="x64"

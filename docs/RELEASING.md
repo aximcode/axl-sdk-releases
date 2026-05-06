@@ -152,79 +152,65 @@ runner network blip.
   workflow is the fix; it's not a release blocker since
   artifacts come from `Release`, not `Docs`.
 
-Watch all three. Prefer `gh run watch <id>` — it streams the
-per-step status and exits the moment the run reaches a terminal
-state, with no polling lag. Critical: **`gh run watch` follows
-ALL jobs in the workflow**, not just the first one. Don't be
-misled by an early `✓ Complete job` line in the output —
-multi-arch workflows have several jobs, and the watcher keeps
-running until the slowest one finishes.
+**The default — and what to use unless you have a specific
+reason to stream live output:**
 
 ```sh
-# 1. After `git push origin vX.Y.Z`, list the runs on this commit:
-gh run list --commit "$(git rev-parse HEAD)" \
-    --json databaseId,workflowName,status --limit 5
-
-# 2. Live-stream each (run them in parallel via run_in_background
-#    or separate terminals — they're independent):
-gh run watch <ci-id>
-gh run watch <release-id>
-gh run watch <docs-id>
+scripts/watch-release-runs.sh
 ```
 
-Each `gh run watch` exits with rc=0 on green, non-zero on red.
+That's it. The script polls all three workflows via GraphQL
+(separate quota pool from REST) at 60-second intervals, prints
+status per workflow per tick, exits rc=0 only when all three
+reach SUCCESS, rc=1 if any finish non-SUCCESS. Total cost:
+~60 GraphQL calls/hour. **Use this. Don't reach for `gh run
+watch`** unless you have a specific reason to stream
+per-step output.
 
 CI and Release **must** finish green for the release to be
 considered shipped. Docs is best-effort — re-run later if it
 flakes.
 
-If you'd rather poll once and move on, `gh run list --commit ...
---json status,conclusion`gives a snapshot, but expect to revisit
-in 20–30 minutes. **Don't tighten the polling cadence below 30
-seconds** — gh hits GitHub API rate limits faster than that.
+#### Why not `gh run watch`?
 
-**Rate-limit pitfall — and how to avoid it.** GitHub's REST API
-has a 5,000 req/hour cap (per authenticated user). `gh run
-watch --exit-status` is a polling loop disguised as a stream —
-it makes ~1 request every 3 seconds. Three parallel watchers
-(CI + Release + Docs) for a 30-minute multi-arch workflow
-generates ~1,800 calls; add ad-hoc `gh run view` / `gh run list`
-during diagnosis and you'll exhaust the quota mid-flight. When
-that happens the watcher exits **rc=1** on the rate-limit error,
-which is indistinguishable from "the run failed" by exit code
-alone.
+GitHub's REST API has a 5,000 req/hour cap per authenticated
+user. `gh run watch --exit-status` is a polling loop disguised
+as a stream — it makes ~1 request every 3 seconds. Three
+parallel watchers (CI + Release + Docs) for a 30-minute
+multi-arch workflow generates **~1,800 calls**; add ad-hoc
+`gh run view` / `gh run list` during diagnosis and you'll
+exhaust the quota mid-flight. When that happens the watcher
+exits **rc=1** on the rate-limit error, which is
+indistinguishable from "the run failed" by exit code alone.
 
 GitHub does NOT sell a per-account rate-limit boost; the only
 escape is Enterprise Cloud (15,000/hr) or a GitHub App on a
-multi-installation org (up to 12,500/hr). For one-developer
-releases, the right fix is to stop polling so aggressively:
+multi-installation org (up to 12,500/hr).
 
-- **Watch one workflow at a time, not three in parallel.**
-  Pick the slowest (Release), run `gh run watch <id>` against
-  just it. The other workflows finish faster anyway.
-- **Or use GraphQL** (separate 5,000-points/hr pool):
+`scripts/watch-release-runs.sh` sidesteps the entire issue —
+GraphQL has its own 5,000-points/hr quota that REST polling
+doesn't touch, and a status query costs ~1 point. ~60 calls
+per hour is well below the limit even if you forget to stop
+the loop.
 
-  ```sh
-  SHA=$(git rev-parse HEAD)
-  while true; do
-    # Filter to nodes with a real workflowRun — GitHub creates
-    # phantom check-suites with no run attached (status QUEUED
-    # forever). Without the filter the loop never terminates.
-    res=$(gh api graphql -f query="
-    { repository(owner:\"aximcode\",name:\"axl-sdk\") {
-        object(expression:\"$SHA\") { ... on Commit {
-          checkSuites(first:10) { nodes { workflowRun { workflow { name } } status conclusion } }
-    } } } }" | jq -r '.data.repository.object.checkSuites.nodes[] |
-                       select(.workflowRun != null) |
-                       "\(.workflowRun.workflow.name): \(.status) \(.conclusion // "-")"' | sort)
-    echo "$res"
-    echo "$res" | grep -q "IN_PROGRESS\|QUEUED" || break
-    sleep 60
-  done
-  ```
+#### The `gh run watch` fallback
 
-  Costs ~60 calls per hour total. Stays well under the limit
-  even if you forget to stop it.
+When you need streaming per-step output (e.g., debugging a
+specific job's failure), use `gh run watch` for **one
+workflow at a time** — never three in parallel. Pick the
+slowest (Release):
+
+```sh
+gh run list --commit "$(git rev-parse HEAD)" \
+    --json databaseId,workflowName,status --limit 5
+gh run watch <release-id>
+```
+
+Critical caveat: **`gh run watch` follows ALL jobs in the
+workflow**, not just the first one. Don't be misled by an
+early `✓ Complete job` line in the output — multi-arch
+workflows have several jobs, and the watcher keeps running
+until the slowest one finishes.
 
 Two corollaries:
 
