@@ -3,6 +3,45 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.14.0 — 2026-05-06
+
+### Added
+
+- **`axl_strjoinv(separator, count, argv)`** — count+array variant of
+  `axl_strjoin` for argv-shape inputs (e.g. joining `argc, argv` from
+  a UEFI shell entry point). Saves the small reshape allocation
+  needed to build a NULL-terminated copy. `axl_strjoin` is now a
+  thin wrapper over `axl_strjoinv`.
+
+- **`axl_nvstore_set_str(ns, key, str, attrs)`** — convenience
+  wrapper that writes `axl_strlen(str) + 1` bytes (including the
+  trailing NUL) so callers don't repeat the `+1` ritual at every
+  string-variable site. Empty string writes a 1-byte NUL payload;
+  `NULL str` is rejected (use `axl_nvstore_delete` to remove a
+  variable).
+
+- **`axl_nvstore_get_str(ns, key, &str)`** — heap-allocating string
+  read on top of `axl_nvstore_get_alloc`. Trailing NUL is
+  guaranteed (the alloc path zero-extends by one byte) so the
+  result is always a valid C string regardless of whether the
+  firmware payload included a NUL.
+
+- **`axl_args_get_uint_offset(args, name, &out)`** — accessor for
+  STRING-typed positionals/flags holding `base[+offset]` syntax.
+  Reads the slot via `axl_args_get_string` and parses with
+  `axl_strtou64_with_offset`. Walks parents like the other
+  `axl_args_get_*` family members. Lets tools that accept
+  register/memory addresses in a single argv token shrink each
+  handler's fetch+parse from ~5 lines to 1. Returns
+  `AXL_OK / AXL_ERR` (no in-band sentinel for `uint64_t` parse
+  failure).
+
+### Changed
+
+- **`axl_strtou64_with_offset` docstring** — dropped two leaked
+  downstream-tool examples per project rule "no consumer names in
+  upstream code/docs". Behavior unchanged.
+
 ## 0.13.2 — 2026-05-06
 
 ### Fixed

@@ -135,6 +135,53 @@ axl_nvstore_set(
 );
 
 /**
+ * @brief Write a NUL-terminated string to non-volatile storage.
+ *
+ * Convenience over @ref axl_nvstore_set: the payload size is
+ * @c axl_strlen(str) + 1, including the trailing NUL, so callers
+ * don't need to repeat the @c +1 ritual at every site that stores
+ * a string. The empty string @c "" writes a single NUL byte.
+ *
+ * To delete a string variable, use @ref axl_nvstore_delete — this
+ * function does not double as a deleter; @c str == NULL is an
+ * error so the two operations stay distinct.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_nvstore_set_str(
+    const char *ns,    ///< namespace
+    const char *key,   ///< variable name (UTF-8)
+    const char *str,   ///< NUL-terminated string to write (must be non-NULL)
+    uint32_t    flags  ///< AXL_NV_* flags (0 → AXL_NV_BOOT)
+);
+
+/**
+ * @brief Read a string-valued variable into a heap buffer.
+ *
+ * Convenience over @ref axl_nvstore_get_alloc for string variables.
+ * On success, @c *out_str is a NUL-terminated heap-allocated C
+ * string the caller frees with @ref axl_free. The trailing NUL is
+ * guaranteed even if the firmware payload omitted one (the alloc
+ * path zero-extends by one byte).
+ *
+ * On failure, @c *out_str is set to NULL.
+ *
+ * No content validation is performed — if the variable holds
+ * binary data with embedded NULs, the returned string ends at the
+ * first NUL.
+ *
+ * @return AXL_OK on success, AXL_ERR on error (variable not found,
+ *     allocation failed, namespace not registered, etc.).
+ */
+int
+axl_nvstore_get_str(
+    const char  *ns,        ///< namespace
+    const char  *key,       ///< variable name (UTF-8)
+    char       **out_str    ///< [out] heap C string, caller frees with axl_free
+);
+
+/**
  * @brief Delete a variable from non-volatile storage.
  *
  * @return AXL_OK on success, AXL_ERR on error.

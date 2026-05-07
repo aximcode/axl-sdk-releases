@@ -303,6 +303,44 @@ axl_nvstore_set(
 }
 
 int
+axl_nvstore_set_str(
+    const char *ns,
+    const char *key,
+    const char *str,
+    uint32_t    flags
+    )
+{
+    if (str == NULL) {
+        return AXL_ERR;
+    }
+    return axl_nvstore_set(ns, key, str, axl_strlen(str) + 1, flags);
+}
+
+int
+axl_nvstore_get_str(
+    const char  *ns,
+    const char  *key,
+    char       **out_str
+    )
+{
+    if (out_str == NULL) {
+        return AXL_ERR;
+    }
+    *out_str = NULL;
+
+    void   *buf = NULL;
+    size_t  sz  = 0;
+    if (axl_nvstore_get_alloc(ns, key, &buf, &sz) != AXL_OK) {
+        return AXL_ERR;
+    }
+    /* axl_nvstore_get_alloc guarantees one byte past the payload is
+       NUL-extended, so the cast yields a NUL-terminated C string
+       even when the wire payload omitted the trailing NUL. */
+    *out_str = (char *)buf;
+    return AXL_OK;
+}
+
+int
 axl_nvstore_delete(
     const char *ns,
     const char *key

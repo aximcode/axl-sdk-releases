@@ -1603,6 +1603,43 @@ test_str_join(void)
     test_check(result != NULL && axl_strcmp(result, "solo") == 0,
                "strjoin: single element");
     axl_free(result);
+
+    /* axl_strjoinv: argv-shape (count + array, no NULL terminator). */
+    const char *const argv[] = { "one", "two", "three" };
+    result = axl_strjoinv(", ", 3, argv);
+    test_check(result != NULL && axl_strcmp(result, "one, two, three") == 0,
+               "strjoinv: comma-space separator");
+    axl_free(result);
+
+    /* Single element via count=1 */
+    result = axl_strjoinv(",", 1, argv);
+    test_check(result != NULL && axl_strcmp(result, "one") == 0,
+               "strjoinv: single element");
+    axl_free(result);
+
+    /* Empty separator */
+    result = axl_strjoinv("", 3, argv);
+    test_check(result != NULL && axl_strcmp(result, "onetwothree") == 0,
+               "strjoinv: empty separator");
+    axl_free(result);
+
+    /* count == 0 → allocated empty string (NULL argv). */
+    result = axl_strjoinv(",", 0, NULL);
+    test_check(result != NULL && axl_strcmp(result, "") == 0,
+               "strjoinv: count=0 NULL argv returns empty allocated string");
+    axl_free(result);
+
+    /* count == 0 → empty string even when argv is non-NULL. */
+    result = axl_strjoinv(",", 0, argv);
+    test_check(result != NULL && axl_strcmp(result, "") == 0,
+               "strjoinv: count=0 non-NULL argv returns empty allocated string");
+    axl_free(result);
+
+    /* NULL separator behaves like empty separator (matches strjoin). */
+    result = axl_strjoinv(NULL, 3, argv);
+    test_check(result != NULL && axl_strcmp(result, "onetwothree") == 0,
+               "strjoinv: NULL separator behaves like empty");
+    axl_free(result);
 }
 
 static void

@@ -1030,6 +1030,19 @@ axl_args_get_int(AxlArgs *args, const char *name)
 }
 
 int
+axl_args_get_uint_offset(AxlArgs *args, const char *name, uint64_t *out_value)
+{
+    if (args == NULL || name == NULL || out_value == NULL) {
+        return AXL_ERR;
+    }
+    ParsedArg *s = slot_by_name(args, name);
+    if (s == NULL || s->str_value == NULL) {
+        return AXL_ERR;
+    }
+    return axl_strtou64_with_offset(s->str_value, out_value);
+}
+
+int
 axl_args_get_pos_count(AxlArgs *args)
 {
     if (args == NULL || args->variadic == NULL) {

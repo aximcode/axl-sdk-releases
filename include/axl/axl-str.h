@@ -421,6 +421,29 @@ axl_strjoin(
 );
 
 /**
+ * @brief Join a counted string array with a separator (argv shape).
+ *
+ * Variant of @ref axl_strjoin for callers that already have a
+ * count + argv pair (typically `argc, argv` from a UEFI shell entry
+ * point). Avoids the small reshape allocation needed to build a
+ * NULL-terminated copy. All @c count elements of @a argv must be
+ * non-NULL; passing @c NULL elements is undefined.
+ *
+ * @c count == 0 returns an empty allocated string (a 1-byte buffer
+ * holding a single NUL). @a argv may be NULL only when @c count is 0.
+ *
+ * Caller frees the result with axl_free().
+ *
+ * @return new string, or NULL on failure.
+ */
+char *
+axl_strjoinv(
+    const char        *separator, ///< separator between elements
+    size_t             count,     ///< number of elements in @a argv
+    const char *const  argv[]     ///< element pointers; non-NULL when count>0
+);
+
+/**
  * @brief Trim leading and trailing ASCII whitespace in place.
  *
  * Modifies the string by shifting content and NUL-terminating.
@@ -893,9 +916,9 @@ axl_strtou64(
 /**
  * @brief Parse a hex/decimal value with an optional `+offset` suffix.
  *
- * Common pattern in CLI tools that take an address with an offset
- * (e.g. `do crb tag+offset reg`, `do rb physAddr+offset count`).
- * Accepts:
+ * Common pattern in low-level CLI tools that read or write hardware
+ * registers and want to express a target as `base+offset` in a
+ * single argv token. Accepts:
  *
  *   - "0x100"           → base = 0x100, offset = 0
  *   - "256"             → base = 256, offset = 0

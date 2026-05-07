@@ -2262,6 +2262,79 @@ test_nvstore_roundtrip(void)
         }
     }
 
+    /* axl_nvstore_set_str / axl_nvstore_get_str — string-payload
+       round-trip. set_str writes strlen+1 bytes; get_str returns a
+       NUL-terminated heap copy. */
+    const char *str_key = "AxlTestStrKey";
+    const char *str_val = "hello, world";
+    int set_str_rc = axl_nvstore_set_str("app", str_key, str_val,
+                                         AXL_NV_PERSISTENT | AXL_NV_BOOT);
+    if (set_str_rc == AXL_OK) {
+        test_check(set_str_rc == AXL_OK, "nvstore set_str: succeeds");
+
+        /* Underlying byte size must be strlen+1. */
+        void   *raw_buf = NULL;
+        size_t  raw_sz  = 0;
+        test_check(axl_nvstore_get_alloc("app", str_key, &raw_buf, &raw_sz) == AXL_OK,
+                   "nvstore set_str: readable via get_alloc");
+        test_check(raw_sz == axl_strlen(str_val) + 1,
+                   "nvstore set_str: payload is strlen+1 bytes");
+        axl_free(raw_buf);
+
+        /* get_str returns NUL-terminated heap copy. */
+        char *got = NULL;
+        test_check(axl_nvstore_get_str("app", str_key, &got) == AXL_OK,
+                   "nvstore get_str: succeeds on existing key");
+        test_check(got != NULL && axl_strcmp(got, str_val) == 0,
+                   "nvstore get_str: value matches written string");
+        axl_free(got);
+
+        /* Empty string: 1-byte NUL payload, get_str returns "". */
+        const char *empty_str_key = "AxlTestStrKeyEmpty";
+        int empty_rc = axl_nvstore_set_str("app", empty_str_key, "",
+                                           AXL_NV_PERSISTENT | AXL_NV_BOOT);
+        test_check(empty_rc == AXL_OK,
+                   "nvstore set_str: empty string succeeds");
+        char *egot = NULL;
+        test_check(axl_nvstore_get_str("app", empty_str_key, &egot) == AXL_OK,
+                   "nvstore get_str: empty string succeeds");
+        test_check(egot != NULL && egot[0] == '\0',
+                   "nvstore get_str: empty string returns \"\"");
+        axl_free(egot);
+        (void)axl_nvstore_delete("app", empty_str_key);
+
+        (void)axl_nvstore_delete("app", str_key);
+    } else {
+        /* Firmware refused our string write — SKIP-balance the 8
+           populated-path assertions above. */
+        for (int i = 0; i < 8; i++) {
+            test_check(true, "nvstore set_str/get_str: SKIP balance");
+        }
+    }
+
+    /* NULL-arg guards on set_str / get_str. */
+    test_check(axl_nvstore_set_str(NULL, "k", "v", 0) == AXL_ERR,
+               "nvstore set_str: NULL ns rejected");
+    test_check(axl_nvstore_set_str("app", NULL, "v", 0) == AXL_ERR,
+               "nvstore set_str: NULL key rejected");
+    test_check(axl_nvstore_set_str("app", "k", NULL, 0) == AXL_ERR,
+               "nvstore set_str: NULL str rejected (use delete)");
+
+    char *xstr = (char *)0x1234ul;
+    test_check(axl_nvstore_get_str(NULL, "k", &xstr) == AXL_ERR,
+               "nvstore get_str: NULL ns rejected");
+    test_check(axl_nvstore_get_str("app", NULL, &xstr) == AXL_ERR,
+               "nvstore get_str: NULL key rejected");
+    test_check(axl_nvstore_get_str("app", "k", NULL) == AXL_ERR,
+               "nvstore get_str: NULL out_str rejected");
+
+    /* Missing key: out_str cleared to NULL, return -1. */
+    char *mstr = (char *)0xC0DEul;
+    test_check(axl_nvstore_get_str("app", "AxlNoSuchStrKey", &mstr) == AXL_ERR,
+               "nvstore get_str: missing key returns -1");
+    test_check(mstr == NULL,
+               "nvstore get_str: out_str cleared on failure");
+
     /* Delete + verify gone. */
     test_check(axl_nvstore_delete("app", key) == AXL_OK,
                "nvstore: delete succeeds");
@@ -3507,6 +3580,7 @@ test_args_s64_bounds(void)
 /* Forward decl — definition follows test_args() so the new regression
    doesn't disrupt the existing function ordering in this file. */
 static void test_args_numeric_default_value_applied(void);
+static void test_args_get_uint_offset(void);
 
 static void
 test_args(void)
@@ -3537,6 +3611,7 @@ test_args(void)
     test_args_branch_default_sees_branch_flags();
     test_args_branch_no_handler_still_shows_help();
     test_args_numeric_default_value_applied();
+    test_args_get_uint_offset();
 }
 
 /* Regression: AXL_ARG_U16/U32/U64 with .default_value="N" should
@@ -3595,6 +3670,204 @@ test_args_numeric_default_value_applied(void)
         test_check(rc == 0, "args: explicit override accepted");
         test_check(cap.seen_uint == 4242,
                    "args: explicit -p 4242 overrides default_value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AxlArgs — axl_args_get_uint_offset accessor
+// ---------------------------------------------------------------------------
+
+/* Captures the four NULL/unknown-name AXL_ERR returns of
+   axl_args_get_uint_offset from inside a real handler. */
+typedef struct {
+    int rc_null_args;
+    int rc_null_name;
+    int rc_null_out;
+    int rc_unknown_name;
+} UintOffsetGuardCap;
+
+static int
+uint_offset_null_guard_handler(AxlArgs *a)
+{
+    UintOffsetGuardCap *g = (UintOffsetGuardCap *)axl_args_user_data(a);
+    uint64_t out = 0;
+    g->rc_null_args    = axl_args_get_uint_offset(NULL, "addr", &out);
+    g->rc_null_name    = axl_args_get_uint_offset(a, NULL, &out);
+    g->rc_null_out     = axl_args_get_uint_offset(a, "addr", NULL);
+    g->rc_unknown_name = axl_args_get_uint_offset(a, "noSuchName", &out);
+    return 0;
+}
+
+static int
+uint_offset_capture_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    uint64_t v = 0;
+    if (axl_args_get_uint_offset(a, "addr", &v) == AXL_OK) {
+        cap->seen_uint = v;
+    } else {
+        cap->seen_uint = 0xBADBADul;  /* sentinel — must not appear */
+    }
+    return 0;
+}
+
+static void
+test_args_get_uint_offset(void)
+{
+    /* 1. Round-trip via STRING positional: "0x1000+0x50" → 0x1050. */
+    {
+        static const AxlArgDesc args[] = {
+            { .name = "addr", .type = AXL_ARG_STRING, .required = true,
+              .help = "register/memory address (hex+offset)" },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .help = "uint_offset",
+            .positionals = args, .handler = uint_offset_capture_handler,
+            .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t", (char *)"0x1000+0x50" };
+        int rc = axl_args_run(2, argv, &app);
+        test_check(rc == 0, "args uint_offset: round-trip run accepted");
+        test_check(cap.seen_uint == 0x1050,
+                   "args uint_offset: '0x1000+0x50' resolves to 0x1050");
+    }
+
+    /* 2. Plain hex (no offset). */
+    {
+        static const AxlArgDesc args[] = {
+            { .name = "addr", .type = AXL_ARG_STRING, .required = true },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .positionals = args,
+            .handler = uint_offset_capture_handler, .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t", (char *)"0xabcd" };
+        int rc = axl_args_run(2, argv, &app);
+        test_check(rc == 0 && cap.seen_uint == 0xabcd,
+                   "args uint_offset: plain hex value parsed");
+    }
+
+    /* 3. default_value picked up when the flag is unset. */
+    {
+        static const AxlArgDesc default_flags[] = {
+            { .name = "addr", .short_name = 'a', .type = AXL_ARG_STRING,
+              .default_value = "0x1000+0x10",
+              .help = "address (with offset)" },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .flags = default_flags,
+            .handler = uint_offset_capture_handler, .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t" };
+        int rc = axl_args_run(1, argv, &app);
+        test_check(rc == 0, "args uint_offset: default_value run accepted");
+        test_check(cap.seen_uint == 0x1010,
+                   "args uint_offset: default_value '0x1000+0x10' parsed → 0x1010");
+    }
+
+    /* 4. Optional positional, value absent → AXL_ERR (caller's
+       sentinel survives). */
+    {
+        static const AxlArgDesc args[] = {
+            { .name = "addr", .type = AXL_ARG_STRING, .required = false,
+              .help = "optional address" },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .positionals = args,
+            .handler = uint_offset_capture_handler, .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t" };
+        int rc = axl_args_run(1, argv, &app);
+        test_check(rc == 0 && cap.calls == 1,
+                   "args uint_offset: optional absent → handler still ran");
+        test_check(cap.seen_uint == 0xBADBADul,
+                   "args uint_offset: absent arg returns AXL_ERR (sentinel kept)");
+    }
+
+    /* 5. Malformed token surfaces as AXL_ERR through the accessor.
+       The framework itself doesn't pre-validate (STRING accepts
+       anything), so the parse failure happens inside the
+       accessor on the handler side. */
+    {
+        static const AxlArgDesc args[] = {
+            { .name = "addr", .type = AXL_ARG_STRING, .required = true },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .positionals = args,
+            .handler = uint_offset_capture_handler, .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t", (char *)"zz" };
+        int rc = axl_args_run(2, argv, &app);
+        test_check(rc == 0 && cap.calls == 1,
+                   "args uint_offset: malformed value still reaches handler "
+                   "(STRING is unconstrained)");
+        test_check(cap.seen_uint == 0xBADBADul,
+                   "args uint_offset: malformed token → accessor returns AXL_ERR");
+    }
+
+    /* 6. Parents-walk: arg declared on the parent node is reachable
+       from a child verb's handler via the same accessor. Mirrors
+       the family contract documented on the other axl_args_get_*
+       accessors. */
+    {
+        static const AxlArgDesc parent_flags[] = {
+            { .name = "addr", .short_name = 'a', .type = AXL_ARG_STRING,
+              .help = "parent-level address" },
+            {0}
+        };
+        static const AxlArgsNode child_verbs[] = {
+            { .name = "go", .handler = uint_offset_capture_handler,
+              .help = "child verb" },
+            {0}
+        };
+        ArgsCapture cap = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .flags = parent_flags, .verbs = child_verbs,
+            .user_data = &cap,
+        };
+        char *argv[] = { (char *)"t",
+                         (char *)"--addr=0x200+0x40",
+                         (char *)"go" };
+        int rc = axl_args_run(3, argv, &app);
+        test_check(rc == 0, "args uint_offset: parents-walk run accepted");
+        test_check(cap.calls == 1 && cap.seen_uint == 0x240,
+                   "args uint_offset: parent-level addr reachable from child handler");
+    }
+
+    /* 7. NULL/unknown-name guards on the accessor itself. */
+    {
+        static const AxlArgDesc args[] = {
+            { .name = "addr", .type = AXL_ARG_STRING, .required = true },
+            {0}
+        };
+        UintOffsetGuardCap guard = { 0 };
+        AxlArgsNode app = {
+            .name = "t", .positionals = args,
+            .handler = uint_offset_null_guard_handler,
+            .user_data = &guard,
+        };
+        char *argv[] = { (char *)"t", (char *)"0x10" };
+        int rc = axl_args_run(2, argv, &app);
+        test_check(rc == 0, "args uint_offset: NULL-guard run accepted");
+        test_check(guard.rc_null_args == AXL_ERR,
+                   "args uint_offset: NULL args → AXL_ERR");
+        test_check(guard.rc_null_name == AXL_ERR,
+                   "args uint_offset: NULL name → AXL_ERR");
+        test_check(guard.rc_null_out == AXL_ERR,
+                   "args uint_offset: NULL out_value → AXL_ERR");
+        test_check(guard.rc_unknown_name == AXL_ERR,
+                   "args uint_offset: unknown name → AXL_ERR");
     }
 }
 

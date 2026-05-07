@@ -475,52 +475,53 @@ axl_strfreev(char **arr)
 }
 
 char *
-axl_strjoin(const char *separator, const char **arr)
+axl_strjoinv(const char *separator, size_t count, const char *const argv[])
 {
-    size_t  total;
-    size_t  sep_len;
-    size_t  count;
-    size_t  i;
-    char   *result;
-    size_t  pos;
-
-    if (arr == NULL) {
+    if (count > 0 && argv == NULL) {
         return NULL;
     }
 
-    sep_len = (separator != NULL) ? axl_strlen(separator) : 0;
+    size_t sep_len = (separator != NULL) ? axl_strlen(separator) : 0;
 
-    /* Calculate total length */
-    total = 0;
-    count = 0;
-    for (i = 0; arr[i] != NULL; i++) {
-        if (count > 0) {
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (i > 0) {
             total += sep_len;
         }
-        total += axl_strlen(arr[i]);
-        count++;
+        total += axl_strlen(argv[i]);
     }
 
-    result = axl_malloc(total + 1);
+    char *result = axl_malloc(total + 1);
     if (result == NULL) {
         axl_error("failed to allocate strjoin result");
         return NULL;
     }
 
-    /* Build string */
-    pos = 0;
-    for (i = 0; arr[i] != NULL; i++) {
+    size_t pos = 0;
+    for (size_t i = 0; i < count; i++) {
         if (i > 0 && sep_len > 0) {
             axl_memcpy(result + pos, separator, sep_len);
             pos += sep_len;
         }
-        size_t slen = axl_strlen(arr[i]);
-        axl_memcpy(result + pos, arr[i], slen);
+        size_t slen = axl_strlen(argv[i]);
+        axl_memcpy(result + pos, argv[i], slen);
         pos += slen;
     }
     result[pos] = '\0';
-
     return result;
+}
+
+char *
+axl_strjoin(const char *separator, const char **arr)
+{
+    if (arr == NULL) {
+        return NULL;
+    }
+    size_t count = 0;
+    while (arr[count] != NULL) {
+        count++;
+    }
+    return axl_strjoinv(separator, count, arr);
 }
 
 char *

@@ -368,6 +368,35 @@ axl_args_get_int(
 );
 
 /**
+ * @brief Read a string-typed arg and parse it as `base[+offset]`.
+ *
+ * Convenience over `axl_args_get_string` + @ref
+ * axl_strtou64_with_offset. Suited for tools that accept
+ * register/memory addresses in a single token like `0x1000+0x50`
+ * across many verbs — the descriptor is declared as
+ * `AXL_ARG_STRING` and this accessor handles the parse so each
+ * handler doesn't repeat it.
+ *
+ * Walks parents like the other accessors. The descriptor's
+ * @c default_value (if set) is used when the arg was unset.
+ *
+ * Note: unlike @ref axl_args_get_uint (which returns the value
+ * directly with 0 on miss), this accessor returns
+ * @c AXL_OK / @c AXL_ERR — there is no in-band sentinel for a
+ * `uint64_t` parse failure, and 0 is a legitimate result.
+ *
+ * @return AXL_OK on success (with @a out_value populated),
+ *     AXL_ERR if the arg is missing, unset with no default, or
+ *     fails to parse.
+ */
+int
+axl_args_get_uint_offset(
+    AxlArgs    *args,
+    const char *name,
+    uint64_t   *out_value   ///< [out] base + offset
+);
+
+/**
  * @brief Number of variadic positional arguments collected at this
  *     level (only meaningful when the leaf's positional descriptor
  *     used `AXL_ARG_MULTI` as its tail entry).
