@@ -24,6 +24,16 @@
 #include "../stream/axl-stream-internal.h"
 AXL_LOG_DOMAIN("fs");
 
+// ---------------------------------------------------------------------------
+// Internal types and macros
+// ---------------------------------------------------------------------------
+
+struct AxlDir {
+    AxlFileHandle  handle;
+    uint8_t        buf[1024];  /* scratch for EFI_FILE_INFO */
+};
+
+#define AXL_DIR_WALK_PATH_MAX  512u
 
 // ---------------------------------------------------------------------------
 // Whole-file helpers
@@ -275,11 +285,6 @@ axl_dir_rmdir(const char *path)
 // Directory iteration
 // ---------------------------------------------------------------------------
 
-struct AxlDir {
-    AxlFileHandle  handle;
-    uint8_t        buf[1024];  /* scratch for EFI_FILE_INFO */
-};
-
 AxlDir *
 axl_dir_open(const char *path)
 {
@@ -387,8 +392,6 @@ axl_dir_close(AxlDir *dir)
 // ---------------------------------------------------------------------------
 // Recursive directory walk
 // ---------------------------------------------------------------------------
-
-#define AXL_DIR_WALK_PATH_MAX  512u
 
 /* Recursive worker. Consolidates the open-dir / skip-./.. /
    build-full-path / recurse pattern that find, grep, driver, and

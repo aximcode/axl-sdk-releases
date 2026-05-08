@@ -21,6 +21,15 @@
 #define DT_RELASZ   8
 #define DT_RELAENT  9
 
+/* Per-arch RELATIVE relocation type. */
+#if defined(__x86_64__)
+#define R_RELATIVE  8   /* R_X86_64_RELATIVE */
+#elif defined(__aarch64__)
+#define R_RELATIVE  1027 /* R_AARCH64_RELATIVE */
+#else
+#error "Unsupported architecture for ELF relocation"
+#endif
+
 /* ELF RELA entry */
 typedef struct {
     uint64_t  offset;
@@ -34,16 +43,10 @@ typedef struct {
     uint64_t  val;
 } Elf64Dyn;
 
-/* Relocation types */
-#if defined(__x86_64__)
-#define R_RELATIVE  8   /* R_X86_64_RELATIVE */
-#elif defined(__aarch64__)
-#define R_RELATIVE  1027 /* R_AARCH64_RELATIVE */
-#else
-#error "Unsupported architecture for ELF relocation"
-#endif
-
-/* Linker-provided symbols */
+/* Linker-provided symbols. _DYNAMIC and ImageBase are emitted by
+   the linker script (scripts/elf_x86_64_efi.lds /
+   elf_aarch64_efi.lds). External `extern` is correct here — these
+   are not project symbols, they're linker-synthesized. */
 extern Elf64Dyn _DYNAMIC[];
 extern char     ImageBase[];
 

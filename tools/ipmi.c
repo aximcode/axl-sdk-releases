@@ -41,6 +41,12 @@ static const AxlArgDesc verb_args[] = {
     {0}
 };
 
+/* Caller-supplied transport override. Set once by pre_run from the
+   --transport flag; every subsequent get_session() call passes it
+   to axl_ipmi_session_new_with_transport(). UNKNOWN = SMBIOS Type
+   38 auto-detect. */
+static AxlIpmiTransport g_transport_hint = AXL_IPMI_TRANSPORT_UNKNOWN;
+
 static const char *
 transport_name(AxlIpmiTransport t)
 {
@@ -506,10 +512,9 @@ cmd_raw(AxlIpmiSession *ipmi, int count, const char *const *args)
 // ---------------------------------------------------------------------------
 
 /* Open a session lazily — most verbs need it, `probe` doesn't.
- * The --transport flag at the root level is consumed here so every
- * verb honors it without each handler having to thread it through. */
-static AxlIpmiTransport g_transport_hint = AXL_IPMI_TRANSPORT_UNKNOWN;
-
+ * The --transport flag at the root level is consumed via pre_run
+ * (see g_transport_hint near the top) so every verb honors it
+ * without each handler having to thread it through. */
 static AxlIpmiSession *
 get_session(void)
 {

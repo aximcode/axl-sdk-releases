@@ -10,16 +10,17 @@
     platform hooks: memory allocator, printf, fprintf, time, and entropy.
 **/
 
+#include <stddef.h>
+#include <stdarg.h>
+#include <mbedtls/platform_time.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <axl/axl-format.h>
+#include <axl/axl-time.h>
 
 AXL_LOG_DOMAIN("tls");
-
-#include <stddef.h>
-#include <stdarg.h>
 
 // ---------------------------------------------------------------------------
 // Memory: mbedTLS calloc/free → axl_calloc/axl_free
@@ -139,13 +140,10 @@ time(long long *timer)
 // Millisecond timer for mbedTLS
 // ---------------------------------------------------------------------------
 
-#include <mbedtls/platform_time.h>
-
 mbedtls_ms_time_t
 mbedtls_ms_time(void)
 {
     /* Use AXL's monotonic millisecond counter */
-    extern uint64_t axl_time_get_ms(void);
     return (mbedtls_ms_time_t)axl_time_get_ms();
 }
 

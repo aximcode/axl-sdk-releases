@@ -284,6 +284,34 @@ struct AxlArgsNode {
     AxlVerbHandler        handler;       ///< leaf only
     AxlPreRunFunc         pre_run;       ///< optional, runs at this level top-down
     void                 *user_data;     ///< per-node; descendants inherit nearest non-NULL
+
+    /// Optional free-form text printed in `--help` BEFORE the
+    /// auto-generated `Usage:` line (and the per-section blocks
+    /// that follow it). Use for a multi-paragraph description,
+    /// usage examples, environment-variable list, or anything
+    /// that doesn't fit on the single-line @ref help summary.
+    /// Per-node: each level's `--help` uses its own prolog;
+    /// `do --help` shows the root node's, `do bios --help` shows
+    /// the bios node's. NULL = nothing printed (default).
+    ///
+    /// Whitespace policy: printed verbatim, then the framework
+    /// adds a single trailing blank line as a separator before
+    /// `Usage:`. Don't include leading or trailing newlines
+    /// yourself — the framework handles separation.
+    const char           *help_prolog;
+
+    /// Optional free-form text printed in `--help` AFTER all
+    /// auto-generated sections (Usage, Verbs / Flags,
+    /// Arguments). Standard place for "see also" pointers,
+    /// "report bugs to ..." footers, links to external docs,
+    /// version stamps, etc. Per-node like @ref help_prolog;
+    /// NULL = nothing printed.
+    ///
+    /// Whitespace policy: same as @ref help_prolog — the
+    /// framework prepends a single blank-line separator and
+    /// appends a single trailing newline. Consumer should not
+    /// include leading or trailing newlines.
+    const char           *help_epilog;
 };
 
 // ---------------------------------------------------------------------------

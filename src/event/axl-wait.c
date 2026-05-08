@@ -23,6 +23,16 @@
 AXL_LOG_DOMAIN("wait");
 
 // ---------------------------------------------------------------------------
+// Macros
+// ---------------------------------------------------------------------------
+
+/* GCC's warn_unused_result isn't silenced by a plain (void) cast; use
+   an assign-then-ignore pattern. The sleep family genuinely doesn't
+   care about AXL_CANCELLED — Ctrl-C returns early anyway, and void
+   return matches POSIX ergonomics. */
+#define AXL_IGNORE_RC(expr) do { int _rc = (expr); (void)_rc; } while (0)
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -36,6 +46,11 @@ typedef struct {
     bool       timed_out;
     bool       cancelled;
 } WaitCtx;
+
+typedef struct {
+    volatile const uint64_t *word;
+    uint64_t                 not_ready_value;
+} WordCondCtx;
 
 /* Default tick cadence when caller needs periodic condition checks
    but has not supplied a specific period. 1 ms matches the granularity
@@ -219,12 +234,6 @@ _axl_event_wait_timeout_with_tick(
 // Tier 1 — sleep (void return, no cancel, ergonomic)
 // ---------------------------------------------------------------------------
 
-/* GCC's warn_unused_result isn't silenced by a plain (void) cast; use
-   an assign-then-ignore pattern. The sleep family genuinely doesn't
-   care about AXL_CANCELLED — Ctrl-C returns early anyway, and void
-   return matches POSIX ergonomics. */
-#define AXL_IGNORE_RC(expr) do { int _rc = (expr); (void)_rc; } while (0)
-
 void
 axl_sleep(uint64_t seconds)
 {
@@ -272,11 +281,6 @@ axl_wait_for_flag(
                                              NULL, NULL, 0,
                                              cancel, timeout_us);
 }
-
-typedef struct {
-    volatile const uint64_t *word;
-    uint64_t                 not_ready_value;
-} WordCondCtx;
 
 static bool
 word_cond(void *ctx)

@@ -66,8 +66,6 @@ EFI_STATUS
 EFIAPI
 _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
-    extern EFI_HANDLE gImageHandle;
-
     gImageHandle = ImageHandle;
     gST = SystemTable;
     gBS = SystemTable->BootServices;

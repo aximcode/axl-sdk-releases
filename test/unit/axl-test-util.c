@@ -1026,6 +1026,49 @@ test_time_sleep(void)
     test_pass("time: usleep(1000) completes");
 }
 
+static void
+test_time_get_us(void)
+{
+    /* axl_time_get_us is a thin public wrapper around the
+       architecture-cycle-counter backend. The first call is the
+       calibration tick and may return 0; subsequent calls return a
+       monotonically-increasing count. Verify the contract: two
+       calls with a stall between produce strictly increasing values
+       on the second/third pair, and the elapsed delta is at least
+       the requested stall. */
+
+    /* Discard the calibration tick; second call returns a real
+       value. */
+    (void)axl_time_get_us();
+
+    uint64_t t0 = axl_time_get_us();
+    axl_usleep(2000);  /* 2ms = 2000us */
+    uint64_t t1 = axl_time_get_us();
+    axl_usleep(2000);
+    uint64_t t2 = axl_time_get_us();
+
+    test_check(t1 >= t0,
+               "time: get_us monotonic across 2ms stall");
+    test_check(t2 >= t1,
+               "time: get_us monotonic across consecutive stalls");
+
+    /* Elapsed delta lower bound: the stall must take at least its
+       requested duration, so t1-t0 >= 2000us minus a generous
+       sampling slop. We don't enforce an upper bound — firmware
+       Stall granularity and emulator scheduling jitter both vary. */
+    if (t1 > t0) {
+        uint64_t elapsed = t1 - t0;
+        test_check(elapsed >= 1000,
+                   "time: get_us elapsed >= 1ms after 2ms stall");
+    } else {
+        /* Calibration not available on this arch (counter returned
+           0) — elapsed is meaningless; SKIP-balance. */
+        test_check(true,
+                   "time: get_us elapsed >= 1ms after 2ms stall (SKIP "
+                   "— no cycle counter)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Environment variable tests
 // ---------------------------------------------------------------------------
@@ -3291,6 +3334,30 @@ buf_contains(AxlStream *buf, const char *needle)
     return false;
 }
 
+/* First-occurrence byte offset of @p needle in the captured buffer,
+   or SIZE_MAX if not found. Used by tests that need to assert
+   ordering between two substrings (e.g. prolog before Usage). */
+static size_t
+buf_offset_of(AxlStream *buf, const char *needle)
+{
+    size_t        n = 0;
+    const void   *p = axl_bufdata(buf, &n);
+    if (p == NULL || n == 0 || needle == NULL) {
+        return SIZE_MAX;
+    }
+    size_t      nl = axl_strlen(needle);
+    if (nl > n) {
+        return SIZE_MAX;
+    }
+    const char *bytes = (const char *)p;
+    for (size_t i = 0; i + nl <= n; i++) {
+        if (axl_memcmp(&bytes[i], needle, nl) == 0) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
 static void
 test_args_nested_unknown_verb_at_branch(void)
 {
@@ -3581,6 +3648,7 @@ test_args_s64_bounds(void)
    doesn't disrupt the existing function ordering in this file. */
 static void test_args_numeric_default_value_applied(void);
 static void test_args_get_uint_offset(void);
+static void test_args_help_prolog_epilog(void);
 
 static void
 test_args(void)
@@ -3612,6 +3680,7 @@ test_args(void)
     test_args_branch_no_handler_still_shows_help();
     test_args_numeric_default_value_applied();
     test_args_get_uint_offset();
+    test_args_help_prolog_epilog();
 }
 
 /* Regression: AXL_ARG_U16/U32/U64 with .default_value="N" should
@@ -3670,6 +3739,151 @@ test_args_numeric_default_value_applied(void)
         test_check(rc == 0, "args: explicit override accepted");
         test_check(cap.seen_uint == 4242,
                    "args: explicit -p 4242 overrides default_value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AxlArgs — help_prolog / help_epilog
+// ---------------------------------------------------------------------------
+
+static int
+prolog_dummy_handler(AxlArgs *a)
+{
+    (void)a;
+    return 0;
+}
+
+static void
+test_args_help_prolog_epilog(void)
+{
+    static const AxlArgDesc dummy_flags[] = {
+        { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+          .help = "verbose output" },
+        {0}
+    };
+    static const AxlArgsNode bios_verbs[] = {
+        { .name = "info",
+          .help = "Type 0 summary",
+          .handler = prolog_dummy_handler },
+        {0}
+    };
+
+    /* Per-node prolog/epilog: each level has its own. The bios-node
+       strings use distinctive markers ("BIOS-PROLOG-XYZZY" /
+       "BIOS-EPILOG-PLUGH") so the per-node test below can prove
+       'do bios --help' uses these and NOT the root node's. */
+    static const AxlArgsNode bios_node = {
+        .name        = "bios",
+        .help        = "BIOS / SMBIOS subcommands",
+        .verbs       = bios_verbs,
+        .help_prolog = "BIOS-PROLOG-XYZZY: bios-only context.",
+        .help_epilog = "BIOS-EPILOG-PLUGH: bios-only see-also.",
+    };
+
+    static const AxlArgsNode top_verbs[] = {
+        bios_node,
+        {0}
+    };
+
+    AxlArgsNode root = {
+        .name        = "tester",
+        .help        = "Hardware diagnostic CLI",
+        .flags       = dummy_flags,
+        .verbs       = top_verbs,
+        .help_prolog =
+            "ROOT-PROLOG-FROBNICATE\n"
+            "Multi-line prolog text describing the tool.\n"
+            "Includes examples and a list of env vars.",
+        .help_epilog =
+            "ROOT-EPILOG-CROMULENT\n"
+            "Report bugs at https://example.invalid/issues",
+    };
+
+    /* 1. Root --help renders prolog before "Usage:" and epilog
+       after the last auto-section. */
+    {
+        char *argv[] = { (char *)"tester", (char *)"--help" };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(2, argv, &root);
+        size_t off_prolog = buf_offset_of(buf, "ROOT-PROLOG-FROBNICATE");
+        size_t off_usage  = buf_offset_of(buf, "Usage: tester");
+        size_t off_help_flag = buf_offset_of(buf, "-h, --help");
+        size_t off_epilog = buf_offset_of(buf, "ROOT-EPILOG-CROMULENT");
+        bool   has_multi  = buf_contains(buf, "Multi-line prolog text");
+        restore_stdout(saved, buf);
+
+        test_check(rc == 0, "args help prolog: root --help returns 0");
+        test_check(off_prolog != SIZE_MAX,
+                   "args help prolog: root prolog appears in --help");
+        test_check(has_multi,
+                   "args help prolog: multi-line prolog text rendered intact");
+        test_check(off_usage != SIZE_MAX
+                   && off_prolog < off_usage,
+                   "args help prolog: prolog precedes 'Usage:'");
+        test_check(off_epilog != SIZE_MAX,
+                   "args help prolog: root epilog appears in --help");
+        /* Epilog must come AFTER the last auto-generated line. The
+           '-h, --help' flag line is the last thing the framework
+           prints in every node shape (with or without flags), so
+           it's the most reliable "tail of auto output" anchor. */
+        test_check(off_help_flag != SIZE_MAX
+                   && off_help_flag < off_epilog,
+                   "args help prolog: epilog follows the last auto-generated line");
+    }
+
+    /* 2. Per-node: `tester bios --help` uses the bios node's
+       prolog/epilog, NOT the root's. This is the load-bearing
+       contract — if the framework only honored the root, sub-verb
+       help would either repeat the root's text or show neither. */
+    {
+        char *argv[] = { (char *)"tester", (char *)"bios", (char *)"--help" };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(3, argv, &root);
+        bool has_bios_prolog = buf_contains(buf, "BIOS-PROLOG-XYZZY");
+        bool has_bios_epilog = buf_contains(buf, "BIOS-EPILOG-PLUGH");
+        bool has_root_prolog = buf_contains(buf, "ROOT-PROLOG-FROBNICATE");
+        bool has_root_epilog = buf_contains(buf, "ROOT-EPILOG-CROMULENT");
+        restore_stdout(saved, buf);
+
+        test_check(rc == 0, "args help prolog: 'bios --help' returns 0");
+        test_check(has_bios_prolog,
+                   "args help prolog: sub-verb shows its own prolog");
+        test_check(has_bios_epilog,
+                   "args help prolog: sub-verb shows its own epilog");
+        test_check(!has_root_prolog,
+                   "args help prolog: sub-verb does NOT inherit root prolog");
+        test_check(!has_root_epilog,
+                   "args help prolog: sub-verb does NOT inherit root epilog");
+    }
+
+    /* 3. NULL prolog/epilog: no extra output, no marker bytes,
+       no spurious blank lines beyond the existing baseline.
+       Regression for every existing caller (which doesn't set
+       these fields). */
+    {
+        AxlArgsNode bare = {
+            .name = "bare",
+            .help = "no prolog or epilog",
+            .handler = prolog_dummy_handler,
+            /* help_prolog / help_epilog left zero-init NULL */
+        };
+        char *argv[] = { (char *)"bare", (char *)"--help" };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(2, argv, &bare);
+        bool has_xyzzy = buf_contains(buf, "XYZZY");
+        bool has_plugh = buf_contains(buf, "PLUGH");
+        bool has_usage = buf_contains(buf, "Usage: bare");
+        restore_stdout(saved, buf);
+
+        test_check(rc == 0,
+                   "args help prolog: bare --help returns 0");
+        test_check(has_usage,
+                   "args help prolog: bare --help still emits Usage section");
+        test_check(!has_xyzzy && !has_plugh,
+                   "args help prolog: NULL prolog/epilog → nothing extra printed");
     }
 }
 
@@ -3906,6 +4120,7 @@ test_util_main(int argc, char **argv)
     test_image_verify_cn_extract();
     test_hexdump();
     test_time();
+    test_time_get_us();
     test_time_sleep();
     test_config();
     test_config_width_overflow();

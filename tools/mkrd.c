@@ -65,7 +65,71 @@ typedef struct {
 #define MKRD_MIN_SIZE_MB      1
 #define MKRD_MAX_SIZE_MB      32768
 
+// ---------------------------------------------------------------------------
+// FAT16/FAT32 on-disk layout — reused by the FAT-formatting helpers
+// further down. Pragma-packed so field offsets match the spec.
+// ---------------------------------------------------------------------------
+
+#pragma pack(1)
+typedef struct {
+    uint8_t   jmp_boot[3];
+    char      oem_name[8];
+    uint16_t  bytes_per_sec;
+    uint8_t   sec_per_clus;
+    uint16_t  rsvd_sec_cnt;
+    uint8_t   num_fats;
+    uint16_t  root_ent_cnt;
+    uint16_t  tot_sec16;
+    uint8_t   media;
+    uint16_t  fat_sz16;
+    uint16_t  sec_per_trk;
+    uint16_t  num_heads;
+    uint32_t  hidd_sec;
+    uint32_t  tot_sec32;
+    /* FAT32 extension */
+    uint32_t  fat_sz32;
+    uint16_t  ext_flags;
+    uint16_t  fs_ver;
+    uint32_t  root_clus;
+    uint16_t  fs_info;
+    uint16_t  bk_boot_sec;
+    uint8_t   reserved[12];
+    uint8_t   drv_num;
+    uint8_t   reserved1;
+    uint8_t   boot_sig;
+    uint32_t  vol_id;
+    char      vol_lab[11];
+    char      fil_sys_type[8];
+    uint8_t   boot_code[420];
+    uint16_t  signature;
+} fat_boot_sector;
+
+typedef struct {
+    uint32_t  lead_sig;
+    uint8_t   reserved1[480];
+    uint32_t  struc_sig;
+    uint32_t  free_count;
+    uint32_t  nxt_free;
+    uint8_t   reserved2[12];
+    uint32_t  trail_sig;
+} fat32_fsinfo;
+
+typedef struct {
+    char      name[11];
+    uint8_t   attr;
+    uint8_t   reserved[20];
+} fat_dir_entry;
+#pragma pack()
+
 static bool verbose = false;
+
+/* argv stash — used by `gpt` and `wrap` after run_mkrd's leaf
+   handler has consumed and forwarded the original AxlArgs slot,
+   so the main RAM-disk install code can still read positional
+   args (image path, opt flags) by index. Set once at the top of
+   run_mkrd. */
+static int    g_argc;
+static char **g_argv;
 
 static const AxlArgDesc flags[] = {
     { .name = "size",    .short_name = 's', .type = AXL_ARG_U32, .base = 0,
@@ -164,57 +228,6 @@ labels_match(
 // ===========================================================================
 // FAT Formatting (FAT16 for <=512MB, FAT32 for >512MB)
 // ===========================================================================
-
-#pragma pack(1)
-typedef struct {
-    uint8_t   jmp_boot[3];
-    char      oem_name[8];
-    uint16_t  bytes_per_sec;
-    uint8_t   sec_per_clus;
-    uint16_t  rsvd_sec_cnt;
-    uint8_t   num_fats;
-    uint16_t  root_ent_cnt;
-    uint16_t  tot_sec16;
-    uint8_t   media;
-    uint16_t  fat_sz16;
-    uint16_t  sec_per_trk;
-    uint16_t  num_heads;
-    uint32_t  hidd_sec;
-    uint32_t  tot_sec32;
-    /* FAT32 extension */
-    uint32_t  fat_sz32;
-    uint16_t  ext_flags;
-    uint16_t  fs_ver;
-    uint32_t  root_clus;
-    uint16_t  fs_info;
-    uint16_t  bk_boot_sec;
-    uint8_t   reserved[12];
-    uint8_t   drv_num;
-    uint8_t   reserved1;
-    uint8_t   boot_sig;
-    uint32_t  vol_id;
-    char      vol_lab[11];
-    char      fil_sys_type[8];
-    uint8_t   boot_code[420];
-    uint16_t  signature;
-} fat_boot_sector;
-
-typedef struct {
-    uint32_t  lead_sig;
-    uint8_t   reserved1[480];
-    uint32_t  struc_sig;
-    uint32_t  free_count;
-    uint32_t  nxt_free;
-    uint8_t   reserved2[12];
-    uint32_t  trail_sig;
-} fat32_fsinfo;
-
-typedef struct {
-    char      name[11];
-    uint8_t   attr;
-    uint8_t   reserved[20];
-} fat_dir_entry;
-#pragma pack()
 
 static uint8_t
 fat16_sec_per_clus(
@@ -564,9 +577,6 @@ do_destroy(
 // ===========================================================================
 // Entry point
 // ===========================================================================
-
-static int    g_argc;
-static char **g_argv;
 
 static int
 run_mkrd(AxlArgs *a)

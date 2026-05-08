@@ -937,9 +937,18 @@ test_dell_transport_dispatch(void)
     test_check(install_mock_dell(),
                "dell transport: mock protocol installed");
 
-    AXL_AUTOPTR(AxlIpmiSession) s = axl_ipmi_session_new();
+    //
+    // Pin the Dell transport explicitly. We're verifying the Dell
+    // dispatcher's wire shape, not auto-detect priority — under QEMU,
+    // OVMF publishes a SMBIOS Type 38 entry which auto-detect prefers
+    // over the vendor protocol (correct for real hardware; see
+    // axl_ipmi_session_new_with_transport docstring), so the mock
+    // would never get called via auto-detect.
+    //
+    AXL_AUTOPTR(AxlIpmiSession) s =
+        axl_ipmi_session_new_with_transport(AXL_IPMI_TRANSPORT_DELL);
     test_check(s != NULL && axl_ipmi_session_transport(s) == AXL_IPMI_TRANSPORT_DELL,
-               "dell transport: auto-detect picked Dell vendor protocol");
+               "dell transport: explicit hint picks Dell vendor protocol");
 
     /* Use axl_ipmi_raw with a test-owned buffer — only this lets us
      * assert the dispatcher passed the WHOLE buffer (not &resp[1]) to

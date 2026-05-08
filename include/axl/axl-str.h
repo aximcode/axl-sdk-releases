@@ -20,6 +20,7 @@
 #define AXL_STR_H
 
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
@@ -1154,8 +1155,6 @@ axl_str_reader_take_ident(
 // or -1 on a malformed format (e.g. %s without width, unrecognized
 // conversion). NULL @a str returns -1.
 // ---------------------------------------------------------------------------
-
-#include <stdarg.h>
 
 /**
  * @brief Scan @a str against @a fmt and assign to the listed pointers.

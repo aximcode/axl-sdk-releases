@@ -221,6 +221,30 @@ is only used within a specific branch and hoisting it would hurt
 readability. For-loop iterator declarations (`for (size_t i = 0; ...)`)
 are always fine.
 
+**Split, don't hoist into a giant top-of-file**: if a section under
+a banner comment accumulates its own typedefs, macros, and
+file-scope statics, that's a signal to break it out into a sibling
+file rather than declare them inline in the body or hoist them
+into a 100-line top-of-file block. A typedef defined 1500 lines
+from its only caller is harder to find than the same typedef
+declared inline in the section that uses it; the right answer is
+usually a smaller file (`axl-pci.c` → `axl-pci-cap.c`,
+`axl-acpi.c` → `axl-acpi-fadt.c` / `-mcfg.c` / `-madt.c`,
+`axl-str.c` → `axl-str-bmh.c` / `-base64.c` / `-scan.c`). Use
+an internal header (`src/<module>/axl-<module>-internal.h`) to
+share helpers between the split files. Public API surface stays
+unchanged — only the .c file decomposes.
+
+**Function-local helper macros are an exception**: if a macro
+references caller-scope variables (e.g. `va_list` in a
+SCAN_STORE_* helper, or local accumulator state in an
+ESC_APPEND_* string-builder), it has to live next to its single
+caller — moving it to the top of the file would either break
+expansion or require an awkward parameter-passing refactor.
+Section-local macros that simply happen to be near their first
+use, but don't reference local state, should still be hoisted to
+the macros section.
+
 ## Formatting
 
 | Rule | Convention | Example |

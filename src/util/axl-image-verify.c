@@ -33,6 +33,29 @@ AXL_LOG_DOMAIN("image-verify");
 #define PE_OPT_MAGIC_PE32      0x010Bu
 #define PE_OPT_MAGIC_PE32_PLUS 0x020Bu
 
+/* DER tag numbers used by the PKCS#7 / X.509 walkers below. Single-
+   byte tags only — the high tag-number form doesn't appear at the
+   levels we walk. */
+#define DER_TAG_INTEGER          0x02
+#define DER_TAG_OCTET_STRING     0x04
+#define DER_TAG_OID              0x06
+#define DER_TAG_UTF8_STRING      0x0C
+#define DER_TAG_PRINTABLE_STRING 0x13
+#define DER_TAG_SEQUENCE         0x30
+#define DER_TAG_SET              0x31
+#define DER_TAG_CONTEXT_0        0xA0   /* [0] EXPLICIT or IMPLICIT */
+#define DER_TAG_CONTEXT_3        0xA3
+
+/* CommonName OID = 2.5.4.3 → DER: 06 03 55 04 03. The surrounding
+   06 03 prefix is the tag/length of an OID that the walker has
+   already consumed; we compare against the value bytes only. */
+static const uint8_t OID_CN_VALUE[] = { 0x55, 0x04, 0x03 };
+
+/* signedData OID = 1.2.840.113549.1.7.2 → 09-byte value. */
+static const uint8_t OID_SIGNED_DATA_VALUE[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02
+};
+
 /* DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] index (PE/COFF §3.4.6 +
    §6.4). SECURITY is index 4 — Certificate Table. */
 #define PE_DATA_DIR_SECURITY   4u
@@ -148,28 +171,6 @@ locate_certificate_table(
 // rather than risking a malformed-string crash. All bounds checks widen
 // to size_t to defeat pointer-overflow on hostile inputs.
 // ---------------------------------------------------------------------------
-
-/* Tag numbers used below. Single-byte tags only (high tag-number form
-   doesn't appear in PKCS#7 / X.509 at the levels we walk). */
-#define DER_TAG_INTEGER          0x02
-#define DER_TAG_OCTET_STRING     0x04
-#define DER_TAG_OID              0x06
-#define DER_TAG_UTF8_STRING      0x0C
-#define DER_TAG_PRINTABLE_STRING 0x13
-#define DER_TAG_SEQUENCE         0x30
-#define DER_TAG_SET              0x31
-#define DER_TAG_CONTEXT_0        0xA0   /* [0] EXPLICIT or IMPLICIT */
-#define DER_TAG_CONTEXT_3        0xA3
-
-/* CommonName OID = 2.5.4.3 → DER: 06 03 55 04 03. We compare the
-   value bytes only; the surrounding 06 03 prefix is the tag/length of
-   an OID that the walker has already consumed. */
-static const uint8_t OID_CN_VALUE[] = { 0x55, 0x04, 0x03 };
-
-/* signedData OID = 1.2.840.113549.1.7.2 → 09-byte value. */
-static const uint8_t OID_SIGNED_DATA_VALUE[] = {
-    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02
-};
 
 /* Decode one DER TLV. Sets *out_tag to the tag byte, *out_value to the
    start of the value, *out_len to the value length, and advances *cur

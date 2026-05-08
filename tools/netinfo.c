@@ -14,28 +14,39 @@
 #include <axl.h>
 #include <uefi/axl-uefi.h>
 
+// ---------------------------------------------------------------------------
+// File-scope macros and types
+// ---------------------------------------------------------------------------
+
+/* OpenProtocol attribute bits per UEFI 2.10 §7.3.10. We only test
+ * BY_DRIVER here, but the others are listed for reference. */
+#define EFI_OPEN_PROTOCOL_BY_DRIVER          0x00000010
+
+/* NII protocol layout — first field is a UINT64 Revision per the
+ * UEFI/PI spec. We only read the revision; the rest of the struct is
+ * driver-internal. */
+typedef struct {
+    uint64_t  revision;
+    /* trailing fields elided */
+} NiiProtocolHead;
+
+/* Resolve a driver-image handle to a printable path. Walks the
+ * EFI_LOADED_IMAGE_PROTOCOL.FilePath device path until it hits a
+ * MEDIA_FILEPATH_DP node, returning a UTF-8 copy of the UCS-2 path
+ * string. Returns "<firmware volume>" for FV-dispatched drivers
+ * (their file path is a MEDIA_FW_VOL_FILEPATH_DP rather than a
+ * filesystem path), "<unknown>" if neither applies. Caller frees. */
+typedef struct {
+    char *image_name;       /* set if a MEDIA_FILEPATH_DP node is found */
+    bool  saw_fv_node;
+} ImgNameCtx;
+
+// ---------------------------------------------------------------------------
+// File-scope variables
+// ---------------------------------------------------------------------------
+
 static bool verbose = false;
 static bool no_load = false;
-
-static const AxlArgDesc global_flags[] = {
-    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
-      .help = "Verbose output: device-path text, NII layer info, debug logs" },
-    { .name = "no-load", .short_name = 'n', .type = AXL_ARG_BOOL,
-      .help = "Skip auto-loading NIC drivers from drivers/<arch>/" },
-    {0}
-};
-
-static const AxlArgDesc ping_flags[] = {
-    { .name = "count", .short_name = 'c', .type = AXL_ARG_U32, .base = 10,
-      .help = "Number of pings (default: 4)" },
-    {0}
-};
-
-static const AxlArgDesc ping_pos[] = {
-    { .name = "target", .type = AXL_ARG_STRING, .required = true,
-      .help = "Target IP address" },
-    {0}
-};
 
 /* Build-arch label for drivers/<arch>/ — must match the static
  * driver_arch in src/util/axl-driver.c. axl-sdk tools are built per-arch
@@ -63,24 +74,25 @@ static const AxlGuid nii_legacy_guid = {
     { 0x92, 0x8D, 0x64, 0x3C, 0x8A, 0x79, 0xB2, 0x29 }
 };
 
-/* NII protocol layout — first field is a UINT64 Revision per the
- * UEFI/PI spec. We only read the revision; the rest of the struct is
- * driver-internal. */
-typedef struct {
-    uint64_t  revision;
-    /* trailing fields elided */
-} NiiProtocolHead;
+static const AxlArgDesc global_flags[] = {
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,
+      .help = "Verbose output: device-path text, NII layer info, debug logs" },
+    { .name = "no-load", .short_name = 'n', .type = AXL_ARG_BOOL,
+      .help = "Skip auto-loading NIC drivers from drivers/<arch>/" },
+    {0}
+};
 
-/* Resolve a driver-image handle to a printable path. Walks the
- * EFI_LOADED_IMAGE_PROTOCOL.FilePath device path until it hits a
- * MEDIA_FILEPATH_DP node, returning a UTF-8 copy of the UCS-2 path
- * string. Returns "<firmware volume>" for FV-dispatched drivers
- * (their file path is a MEDIA_FW_VOL_FILEPATH_DP rather than a
- * filesystem path), "<unknown>" if neither applies. Caller frees. */
-typedef struct {
-    char *image_name;       /* set if a MEDIA_FILEPATH_DP node is found */
-    bool  saw_fv_node;
-} ImgNameCtx;
+static const AxlArgDesc ping_flags[] = {
+    { .name = "count", .short_name = 'c', .type = AXL_ARG_U32, .base = 10,
+      .help = "Number of pings (default: 4)" },
+    {0}
+};
+
+static const AxlArgDesc ping_pos[] = {
+    { .name = "target", .type = AXL_ARG_STRING, .required = true,
+      .help = "Target IP address" },
+    {0}
+};
 
 static int
 resolve_driver_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
@@ -126,10 +138,6 @@ resolve_driver_image_name(EFI_HANDLE agent)
     }
     return axl_strdup(ctx.saw_fv_node ? "<firmware volume>" : "<unknown>");
 }
-
-/* OpenProtocol attribute bits per UEFI 2.10 §7.3.10. We only test
- * BY_DRIVER here, but the others are listed for reference. */
-#define EFI_OPEN_PROTOCOL_BY_DRIVER          0x00000010
 
 /* Find the BY_DRIVER agent handle that has @p protocol_guid open on
  * @p handle, and resolve its image name. Returns NULL if no BY_DRIVER

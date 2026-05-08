@@ -29,6 +29,14 @@
 // Default console attribute (light gray on black)
 #define DEFAULT_ATTR  EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK)
 
+/* Sentinel return values for parse_level_keyword. Both are negative
+ * integers far below AXL_LOG_ERROR (=0) so the filter check
+ * `level > effective_level` always evaluates to "filtered" if either
+ * is stored as a domain/global level — but they MUST be distinct
+ * from each other so apply_one_entry can tell them apart. */
+#define LEVEL_PARSE_UNKNOWN  (-100)   /* "garbage" → ignore */
+#define LEVEL_OFF            (-10)    /* "off" / "none" / "silent" */
+
 // ---------------------------------------------------------------------------
 // buf_write adapter for axl_vformat
 // ---------------------------------------------------------------------------
@@ -73,6 +81,11 @@ static bool           mHandlerFiltered[MAX_HANDLERS];
 static size_t         mHandlerCount     = 0;
 
 static int            mFatalLevel       = -1;   // disabled
+
+/* Lazy-init guard: ensure_env_init_once() reads AXL_LOG_LEVEL on the
+   first log emission and applies the global/per-domain levels it
+   parsed. The flag prevents re-parsing on every subsequent call. */
+static bool           mEnvInitDone      = false;
 static bool           mFatalTriggered   = false;
 static EFI_HANDLE     mFatalImageHandle = NULL;
 
@@ -422,14 +435,6 @@ axl_log_set_domain_level(const char *domain, int level)
 // AXL_LOG_LEVEL — env-var-driven configuration
 // ---------------------------------------------------------------------------
 
-/* Sentinel return values for parse_level_keyword. Both are negative
- * integers far below AXL_LOG_ERROR (=0) so the filter check
- * `level > effective_level` always evaluates to "filtered" if either
- * is stored as a domain/global level — but they MUST be distinct
- * from each other so apply_one_entry can tell them apart. */
-#define LEVEL_PARSE_UNKNOWN  (-100)   /* "garbage" → ignore */
-#define LEVEL_OFF            (-10)    /* "off" / "none" / "silent" */
-
 /* Case-insensitive keyword equality on a length-bounded slice
  * against a NUL-terminated reference. Avoids a heap copy. */
 static bool
@@ -593,8 +598,8 @@ axl_log_init_from_env(void)
  * first log emission. Init order is irrelevant — any caller paying
  * attention to log levels passes through axl_log_full / axl_log,
  * which both call get_effective_level which sees the configured
- * state on second-and-later calls. */
-static bool mEnvInitDone = false;
+ * state on second-and-later calls. (mEnvInitDone is declared with
+ * the rest of the file-scope state near the top.) */
 static void
 ensure_env_init_once(void)
 {

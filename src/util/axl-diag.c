@@ -37,8 +37,6 @@ axl_diag_startup(
         return;
     }
 
-    extern EFI_HANDLE gImageHandle;
-
     axl_printf("--- AXL diag ---\n");
 
     /* (1) POSIX argv as it reached main, after axl-app.c parsed

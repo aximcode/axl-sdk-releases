@@ -13,6 +13,108 @@
 AXL_LOG_DOMAIN("smbios");
 
 // ---------------------------------------------------------------------------
+// Raw SMBIOS record layouts
+// ---------------------------------------------------------------------------
+
+/* We define the fields AXL cares about inline rather than pulling in
+   EDK2's IndustryStandard/SmBios.h, keeping this file decoupled from
+   the EDK2 package layout. Field offsets match the SMBIOS spec.
+   Used by axl_smbios_read_*_info() further down. */
+
+#pragma pack(1)
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint8_t          Vendor;              /* string idx */
+    uint8_t          BiosVersion;         /* string idx */
+    uint16_t         BiosSegment;
+    uint8_t          BiosReleaseDate;     /* string idx */
+    uint8_t          BiosSize;
+    uint64_t         Characteristics;
+    uint8_t          BiosCharExt[2];
+    uint8_t          MajorRelease;
+    uint8_t          MinorRelease;
+} SmbType0;
+
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint8_t          Manufacturer;
+    uint8_t          ProductName;
+    uint8_t          Version;
+    uint8_t          SerialNumber;
+    uint8_t          Uuid[16];
+    uint8_t          WakeUpType;
+    uint8_t          SKUNumber;
+    uint8_t          Family;
+} SmbType1;
+
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint8_t          Manufacturer;
+    uint8_t          ProductName;
+    uint8_t          Version;
+    uint8_t          SerialNumber;
+    uint8_t          AssetTag;
+} SmbType2;
+
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint8_t          Manufacturer;
+    uint8_t          Type;
+    uint8_t          Version;
+    uint8_t          SerialNumber;
+    uint8_t          AssetTag;
+} SmbType3;
+
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint8_t          Socket;              /* string idx */
+    uint8_t          ProcessorType;
+    uint8_t          ProcessorFamily;
+    uint8_t          ProcessorManufacturer;/* string idx */
+    uint64_t         ProcessorId;
+    uint8_t          ProcessorVersion;    /* string idx */
+    uint8_t          Voltage;
+    uint16_t         ExternalClock;
+    uint16_t         MaxSpeed;
+    uint16_t         CurrentSpeed;
+    uint8_t          Status;
+    uint8_t          ProcessorUpgrade;
+    uint16_t         L1CacheHandle;
+    uint16_t         L2CacheHandle;
+    uint16_t         L3CacheHandle;
+    uint8_t          SerialNumber;        /* string idx */
+    uint8_t          AssetTag;            /* string idx */
+    uint8_t          PartNumber;          /* string idx */
+    uint8_t          CoreCount;
+    uint8_t          EnabledCoreCount;
+    uint8_t          ThreadCount;
+} SmbType4;
+
+typedef struct {
+    AxlSmbiosHeader  Hdr;
+    uint16_t         MemoryArrayHandle;
+    uint16_t         MemoryErrorInfoHandle;
+    uint16_t         TotalWidth;
+    uint16_t         DataWidth;
+    uint16_t         Size;
+    uint8_t          FormFactor;
+    uint8_t          DeviceSet;
+    uint8_t          DeviceLocator;       /* string idx */
+    uint8_t          BankLocator;         /* string idx */
+    uint8_t          MemoryType;
+    uint16_t         TypeDetail;
+    uint16_t         Speed;
+    uint8_t          Manufacturer;        /* string idx */
+    uint8_t          SerialNumber;        /* string idx */
+    uint8_t          AssetTag;            /* string idx */
+    uint8_t          PartNumber;          /* string idx */
+    uint8_t          Attributes;
+    uint32_t         ExtendedSize;
+    uint16_t         ConfiguredClockSpeed;
+} SmbType17;
+#pragma pack()
+
+// ---------------------------------------------------------------------------
 // Internal: locate SMBIOS table range
 // ---------------------------------------------------------------------------
 
@@ -325,104 +427,6 @@ axl_smbios_version(
 // ---------------------------------------------------------------------------
 // Typed record accessors
 // ---------------------------------------------------------------------------
-
-/* Raw record layouts. We define the fields AXL cares about inline rather
-   than pulling in EDK2's IndustryStandard/SmBios.h, keeping this file
-   decoupled from the EDK2 package layout. Field offsets match the SMBIOS
-   specification. */
-
-#pragma pack(1)
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint8_t          Vendor;              /* string idx */
-    uint8_t          BiosVersion;         /* string idx */
-    uint16_t         BiosSegment;
-    uint8_t          BiosReleaseDate;     /* string idx */
-    uint8_t          BiosSize;
-    uint64_t         Characteristics;
-    uint8_t          BiosCharExt[2];
-    uint8_t          MajorRelease;
-    uint8_t          MinorRelease;
-} SmbType0;
-
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint8_t          Manufacturer;
-    uint8_t          ProductName;
-    uint8_t          Version;
-    uint8_t          SerialNumber;
-    uint8_t          Uuid[16];
-    uint8_t          WakeUpType;
-    uint8_t          SKUNumber;
-    uint8_t          Family;
-} SmbType1;
-
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint8_t          Manufacturer;
-    uint8_t          ProductName;
-    uint8_t          Version;
-    uint8_t          SerialNumber;
-    uint8_t          AssetTag;
-} SmbType2;
-
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint8_t          Manufacturer;
-    uint8_t          Type;
-    uint8_t          Version;
-    uint8_t          SerialNumber;
-    uint8_t          AssetTag;
-} SmbType3;
-
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint8_t          Socket;              /* string idx */
-    uint8_t          ProcessorType;
-    uint8_t          ProcessorFamily;
-    uint8_t          ProcessorManufacturer;/* string idx */
-    uint64_t         ProcessorId;
-    uint8_t          ProcessorVersion;    /* string idx */
-    uint8_t          Voltage;
-    uint16_t         ExternalClock;
-    uint16_t         MaxSpeed;
-    uint16_t         CurrentSpeed;
-    uint8_t          Status;
-    uint8_t          ProcessorUpgrade;
-    uint16_t         L1CacheHandle;
-    uint16_t         L2CacheHandle;
-    uint16_t         L3CacheHandle;
-    uint8_t          SerialNumber;        /* string idx */
-    uint8_t          AssetTag;            /* string idx */
-    uint8_t          PartNumber;          /* string idx */
-    uint8_t          CoreCount;
-    uint8_t          EnabledCoreCount;
-    uint8_t          ThreadCount;
-} SmbType4;
-
-typedef struct {
-    AxlSmbiosHeader  Hdr;
-    uint16_t         MemoryArrayHandle;
-    uint16_t         MemoryErrorInfoHandle;
-    uint16_t         TotalWidth;
-    uint16_t         DataWidth;
-    uint16_t         Size;
-    uint8_t          FormFactor;
-    uint8_t          DeviceSet;
-    uint8_t          DeviceLocator;       /* string idx */
-    uint8_t          BankLocator;         /* string idx */
-    uint8_t          MemoryType;
-    uint16_t         TypeDetail;
-    uint16_t         Speed;
-    uint8_t          Manufacturer;        /* string idx */
-    uint8_t          SerialNumber;        /* string idx */
-    uint8_t          AssetTag;            /* string idx */
-    uint8_t          PartNumber;          /* string idx */
-    uint8_t          Attributes;
-    uint32_t         ExtendedSize;
-    uint16_t         ConfiguredClockSpeed;
-} SmbType17;
-#pragma pack()
 
 int
 axl_smbios_format_uuid(const uint8_t bytes[16], char out[37])

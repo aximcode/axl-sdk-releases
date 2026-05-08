@@ -34,6 +34,46 @@
 AXL_LOG_DOMAIN("i2c");
 
 // ---------------------------------------------------------------------------
+// Per-bus operation types
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    OP_PROBE,
+    OP_GET,
+    OP_SET,
+    OP_DUMP,
+} OpKind;
+
+typedef enum {
+    PROBE_QUICK,    /* SMBus QUICK — just address + R/W ACK. Linux i2cdetect default. */
+    PROBE_READ,     /* SMBus byte-data read at register 0. Linux i2cdetect -r. */
+    PROBE_AUTO,     /* QUICK with safe-byte-read for 0x30-0x37 + 0x50-0x5F.
+                       Matches Linux's exact default (which switches mode
+                       per-address to avoid accidentally erasing EEPROMs). */
+} ProbeMode;
+
+typedef struct {
+    OpKind   op;
+    size_t   target_bus;
+    bool     target_found;
+    int      rc;
+
+    /* OP_PROBE */
+    ProbeMode probe_mode;
+    uint8_t   probe_first;   /* 0x03 default */
+    uint8_t   probe_last;    /* 0x77 default */
+
+    /* OP_GET / OP_SET / OP_DUMP */
+    uint8_t  slave;
+    uint8_t  reg;            /* OP_GET, OP_SET — start register */
+    size_t   read_count;     /* OP_GET — bytes to read (1 = byte read) */
+
+    /* OP_SET */
+    const uint8_t *write_data;
+    size_t         write_len;
+} BusOp;
+
+// ---------------------------------------------------------------------------
 // list
 // ---------------------------------------------------------------------------
 
@@ -86,42 +126,6 @@ do_list(
 // ---------------------------------------------------------------------------
 // Per-bus operation framework
 // ---------------------------------------------------------------------------
-
-typedef enum {
-    OP_PROBE,
-    OP_GET,
-    OP_SET,
-    OP_DUMP,
-} OpKind;
-
-typedef enum {
-    PROBE_QUICK,    /* SMBus QUICK — just address + R/W ACK. Linux i2cdetect default. */
-    PROBE_READ,     /* SMBus byte-data read at register 0. Linux i2cdetect -r. */
-    PROBE_AUTO,     /* QUICK with safe-byte-read for 0x30-0x37 + 0x50-0x5F.
-                       Matches Linux's exact default (which switches mode
-                       per-address to avoid accidentally erasing EEPROMs). */
-} ProbeMode;
-
-typedef struct {
-    OpKind   op;
-    size_t   target_bus;
-    bool     target_found;
-    int      rc;
-
-    /* OP_PROBE */
-    ProbeMode probe_mode;
-    uint8_t   probe_first;   /* 0x03 default */
-    uint8_t   probe_last;    /* 0x77 default */
-
-    /* OP_GET / OP_SET / OP_DUMP */
-    uint8_t  slave;
-    uint8_t  reg;            /* OP_GET, OP_SET — start register */
-    size_t   read_count;     /* OP_GET — bytes to read (1 = byte read) */
-
-    /* OP_SET */
-    const uint8_t *write_data;
-    size_t         write_len;
-} BusOp;
 
 /* Decide which SMBus operation to use for a given probe address —
  * matches Linux i2cdetect's exact mode-per-address logic.

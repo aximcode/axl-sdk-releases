@@ -8,6 +8,14 @@
 #include <axl/axl-str.h>
 #include "axl-digest-internal.h"
 
+#define SHA256_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SHA256_CH(x, y, z) (((x) & (y)) ^ ((~(x)) & (z)))
+#define SHA256_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SHA256_S0(x) (SHA256_ROTR(x, 2) ^ SHA256_ROTR(x, 13) ^ SHA256_ROTR(x, 22))
+#define SHA256_S1(x) (SHA256_ROTR(x, 6) ^ SHA256_ROTR(x, 11) ^ SHA256_ROTR(x, 25))
+#define SHA256_s0(x) (SHA256_ROTR(x, 7) ^ SHA256_ROTR(x, 18) ^ ((x) >> 3))
+#define SHA256_s1(x) (SHA256_ROTR(x, 17) ^ SHA256_ROTR(x, 19) ^ ((x) >> 10))
+
 static const uint32_t sha256_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -26,14 +34,6 @@ static const uint32_t sha256_k[64] = {
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
-
-#define SHA256_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define SHA256_CH(x, y, z) (((x) & (y)) ^ ((~(x)) & (z)))
-#define SHA256_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define SHA256_S0(x) (SHA256_ROTR(x, 2) ^ SHA256_ROTR(x, 13) ^ SHA256_ROTR(x, 22))
-#define SHA256_S1(x) (SHA256_ROTR(x, 6) ^ SHA256_ROTR(x, 11) ^ SHA256_ROTR(x, 25))
-#define SHA256_s0(x) (SHA256_ROTR(x, 7) ^ SHA256_ROTR(x, 18) ^ ((x) >> 3))
-#define SHA256_s1(x) (SHA256_ROTR(x, 17) ^ SHA256_ROTR(x, 19) ^ ((x) >> 10))
 
 static void
 sha256_transform(uint32_t state[8], const uint8_t block[64])

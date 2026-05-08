@@ -26,6 +26,23 @@ AXL_LOG_DOMAIN("driver");
 // ---------------------------------------------------------------------------
 
 #define DRIVER_VOL_NAME_MAX      16
+#define DRIVER_MAX_CANDIDATES    16
+#define DRIVER_MAX_VOLUMES       16
+#define DRIVER_PATH_BUF          256
+#define DRIVER_SUB_BUF           192
+
+#if defined(__x86_64__)
+static const char driver_arch[] = "x64";
+#elif defined(__aarch64__)
+static const char driver_arch[] = "aa64";
+#else
+#error "axl-driver: unsupported architecture"
+#endif
+
+typedef struct {
+    const char *pattern;
+    size_t      loaded;
+} DriverLoadCtx;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -152,7 +169,6 @@ axl_driver_load(
 
     *handle = NULL;
 
-    extern EFI_HANDLE gImageHandle;
 
     /* Prefer DevicePath load. The firmware reads the file from the
      * volume's filesystem itself, sets LoadedImage->FilePath to the
@@ -343,7 +359,6 @@ axl_driver_set_load_options(
 char *
 axl_driver_get_load_options(void)
 {
-    extern EFI_HANDLE gImageHandle;
     EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
     EFI_STATUS status;
 
@@ -371,7 +386,6 @@ axl_driver_get_load_options(void)
 char *
 axl_driver_get_image_path(void)
 {
-    extern EFI_HANDLE gImageHandle;
     EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
     EFI_STATUS status;
 
@@ -428,7 +442,6 @@ axl_driver_set_unload(
     void *unload_fn
     )
 {
-    extern EFI_HANDLE gImageHandle;
     EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
     EFI_STATUS status;
 
@@ -465,26 +478,12 @@ axl_driver_init(
     gBS = gST->BootServices;
     gRT = gST->RuntimeServices;
 
-    extern void axl_stream_init(void);
     axl_stream_init();
 }
 
 // ---------------------------------------------------------------------------
 // axl_driver_locate / axl_driver_ensure
 // ---------------------------------------------------------------------------
-
-#define DRIVER_MAX_CANDIDATES   16
-#define DRIVER_MAX_VOLUMES      16
-#define DRIVER_PATH_BUF         256
-#define DRIVER_SUB_BUF          192
-
-#if defined(__x86_64__)
-static const char driver_arch[] = "x64";
-#elif defined(__aarch64__)
-static const char driver_arch[] = "aa64";
-#else
-#error "axl-driver: unsupported architecture"
-#endif
 
 static int
 driver_protocol_registered(
@@ -534,7 +533,6 @@ driver_build_candidates(
     size_t      *n_cand
     )
 {
-    extern EFI_HANDLE gImageHandle;
 
     *n_cand = 0;
 
@@ -743,7 +741,6 @@ driver_load_embedded(
     size_t               len
     )
 {
-    extern EFI_HANDLE gImageHandle;
 
     EFI_HANDLE  drv_handle = NULL;
     EFI_STATUS  st = axl_bs()->LoadImage(
@@ -846,11 +843,6 @@ axl_driver_ensure(
 // ---------------------------------------------------------------------------
 // axl_driver_load_dir
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    const char *pattern;
-    size_t      loaded;
-} DriverLoadCtx;
 
 static int
 driver_load_cb(const char *full_path, const AxlDirEntry *entry, void *user)

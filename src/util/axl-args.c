@@ -540,6 +540,14 @@ print_help_for(const AxlArgsNode *node, const char *path)
         axl_print("%s — %s\n\n", path, node->help);
     }
 
+    if (node->help_prolog != NULL) {
+        /* Print verbatim, then a single blank-line separator before
+           the auto-generated `Usage:` block. The docstring on
+           AxlArgsNode.help_prolog tells consumers not to include
+           leading or trailing newlines themselves. */
+        axl_print("%s\n\n", node->help_prolog);
+    }
+
     if (node_is_branch(node)) {
         axl_print("Usage: %s [flags] <verb> [args]\n", path);
         if (node_is_leaf(node)) {
@@ -600,6 +608,13 @@ print_help_for(const AxlArgsNode *node, const char *path)
         for (int i = 0; node->positionals[i].name != NULL; i++) {
             print_positional_line(&node->positionals[i]);
         }
+    }
+
+    if (node->help_epilog != NULL) {
+        /* Blank-line separator before the epilog, then verbatim
+           text plus a closing newline. Consumer doesn't include
+           leading or trailing newlines. */
+        axl_print("\n%s\n", node->help_epilog);
     }
 }
 

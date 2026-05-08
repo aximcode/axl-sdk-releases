@@ -5,12 +5,13 @@
     Service registry — platform-agnostic service discovery and registration.
 **/
 
+#include <stdarg.h>
 #include "../backend/axl-backend.h"
+#include "axl-service-internal.h"
 #include <axl/axl-sys.h>
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-log.h>
-#include <stdarg.h>
 
 AXL_LOG_DOMAIN("service");
 
@@ -18,9 +19,9 @@ AXL_LOG_DOMAIN("service");
 // Name → GUID mapping
 // ---------------------------------------------------------------------------
 
-/* Forward declaration — also used by axl-sys.c */
-const EFI_GUID *
-axl_service_lookup_guid(const char *name, EFI_GUID *fallback);
+/* axl_service_lookup_guid prototype lives in axl-service-internal.h
+   so axl-sys.c can call it without the prior extern-at-point-of-use
+   workaround. */
 
 typedef struct {
     const char     *name;

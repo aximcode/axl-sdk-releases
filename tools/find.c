@@ -33,6 +33,12 @@ static const AxlArgDesc positional[] = {
     {0}
 };
 
+typedef struct {
+    const char *name_pattern;
+    char        type_filter;
+    size_t      count;
+} FindCtx;
+
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
@@ -57,12 +63,6 @@ print_entry(
 // ---------------------------------------------------------------------------
 // Recursive directory walker
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    const char *name_pattern;
-    char        type_filter;
-    size_t      count;
-} FindCtx;
 
 static int
 find_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)

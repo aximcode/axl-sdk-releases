@@ -104,7 +104,6 @@ _axl_init(void *image_handle, void *system_table)
 {
     /* Set firmware globals before anything else — backend functions
      * depend on gST / gBS / gRT / gImageHandle being live. */
-    extern EFI_HANDLE gImageHandle;
     gImageHandle = (EFI_HANDLE)image_handle;
     gST = (EFI_SYSTEM_TABLE *)system_table;
     gBS = gST->BootServices;

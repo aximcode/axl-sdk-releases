@@ -127,6 +127,8 @@ endif
 
 LIB_SOURCES = \
     src/backend/native/axl-backend-native.c \
+    src/backend/native/axl-backend-native-event.c \
+    src/backend/native/axl-backend-native-mp.c \
     src/mem/axl-mem.c \
     src/mem/axl-intrinsics.c \
     src/mem/axl-arena.c \
@@ -135,6 +137,9 @@ LIB_SOURCES = \
     src/log/axl-log-ring.c \
     src/log/axl-log-file.c \
     src/data/axl-str.c \
+    src/data/axl-str-bmh.c \
+    src/data/axl-str-base64.c \
+    src/data/axl-str-scan.c \
     src/data/axl-str-compat.c \
     src/data/axl-string.c \
     src/data/axl-str-wide.c \
@@ -183,7 +188,11 @@ LIB_SOURCES = \
     src/util/axl-image-verify.c \
     src/smbios/axl-smbios.c \
     src/acpi/axl-acpi.c \
+    src/acpi/axl-acpi-mcfg.c \
+    src/acpi/axl-acpi-madt.c \
+    src/acpi/axl-acpi-fadt.c \
     src/pci/axl-pci.c \
+    src/pci/axl-pci-cap.c \
     src/pci/axl-pci-ids.c \
     src/pci/axl-pci-class.c \
     src/usb/axl-usb.c \

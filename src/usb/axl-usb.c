@@ -48,6 +48,24 @@
 AXL_LOG_DOMAIN("usb");
 
 // ---------------------------------------------------------------------------
+// File-scope macros and types
+// ---------------------------------------------------------------------------
+
+/* Hard cap on device-path size; any path longer than this is treated
+   as malformed by the slicer (`slice_device_path`) and the entry is
+   dropped. */
+#define EFI_DP_MAX_BYTES  (4u * 1024u)
+
+/* Standard device-descriptor string slots for the
+   axl_usb_get_{manufacturer,product,serial} convenience helpers.
+   Mirrors EFI_USB_DEVICE_DESCRIPTOR's field naming. */
+typedef enum {
+    DESC_STR_MANUFACTURER = 1,
+    DESC_STR_PRODUCT      = 2,
+    DESC_STR_SERIAL       = 3,
+} DescStrSlot;
+
+// ---------------------------------------------------------------------------
 // Per-handle entry layout
 // ---------------------------------------------------------------------------
 
@@ -83,6 +101,12 @@ static bool      init_done;
 static bool      init_failed;
 static AxlArray *entries;          /* AxlArray<Entry> */
 
+/* Cursor returned to callers. Storage is reused across calls; passing
+   any pointer other than &cursor restarts the walk (see header). */
+static AxlUsbAddr  cursor;
+static bool        cursor_valid;
+static size_t      cursor_idx;
+
 /* atexit cleanup. The entries array is process-lifetime by design (so
    cursors stay valid across arbitrary calls), but lsusb-style tools
    exit the app and AxlMem's leak detector then flags every owned
@@ -111,12 +135,6 @@ cleanup_entries(void *unused)
     init_done = false;
 }
 
-/* Cursor returned to callers. Storage is reused across calls; passing
-   any pointer other than &cursor restarts the walk (see header). */
-static AxlUsbAddr  cursor;
-static bool        cursor_valid;
-static size_t      cursor_idx;
-
 // ---------------------------------------------------------------------------
 // Device-path slicing
 // ---------------------------------------------------------------------------
@@ -131,8 +149,6 @@ static size_t      cursor_idx;
    Returns false if the path doesn't contain a USB messaging node, or
    the END node is missing within EFI_DP_MAX_BYTES — both signal "not
    a USB IO handle's path" and we drop the entry. */
-#define EFI_DP_MAX_BYTES  (4u * 1024u)
-
 static bool
 slice_device_path(
     const EFI_DEVICE_PATH_PROTOCOL  *dp,
@@ -660,14 +676,6 @@ axl_usb_get_string(
     axl_backend_free(str);
     return (int)n;
 }
-
-/* Standard device-descriptor slots for the three convenience
-   helpers. Mirrors EFI_USB_DEVICE_DESCRIPTOR's field naming. */
-typedef enum {
-    DESC_STR_MANUFACTURER = 1,
-    DESC_STR_PRODUCT      = 2,
-    DESC_STR_SERIAL       = 3,
-} DescStrSlot;
 
 /* Read the DeviceDescriptor's string-index byte at @p slot and
    delegate to axl_usb_get_string with that index. Returns -1 if

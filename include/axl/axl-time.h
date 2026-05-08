@@ -50,6 +50,28 @@ axl_time_format(
 uint64_t
 axl_time_get_ms(void);
 
+/**
+ * @brief Get a high-resolution monotonic microsecond counter.
+ *
+ * Reads the architecture's cycle counter (x86 TSC / aarch64
+ * CNTPCT_EL0). The first call calibrates against a brief firmware
+ * stall and returns 0; subsequent calls are cheap (one counter
+ * read + a multiply) and return microseconds since the calibration
+ * call. No defined relationship to wallclock time — pair with
+ * @ref axl_time_get_ms when you need both elapsed-microsecond
+ * resolution and a wallclock anchor.
+ *
+ * Use this instead of @ref axl_time_get_ms when the measurement
+ * window is on the order of milliseconds or shorter (firmware
+ * stall calibration, network round-trips, parser benchmarking).
+ *
+ * @return microseconds since the implicit calibration epoch.
+ *     Returns 0 on the very first call (calibration tick) and on
+ *     architectures with no usable cycle counter.
+ */
+uint64_t
+axl_time_get_us(void);
+
 #ifdef __cplusplus
 }
 #endif

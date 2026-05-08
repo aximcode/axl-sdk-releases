@@ -3,6 +3,82 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.16.0 — 2026-05-08
+
+### Added
+
+- **`axl_time_get_us()`** — public monotonic-microsecond clock,
+  declared in `<axl/axl-time.h>` alongside `axl_time_get_ms`. Thin
+  pass-through to the architecture's cycle-counter backend (x86 TSC
+  / aarch64 CNTPCT_EL0); first call calibrates and returns 0,
+  subsequent calls are cheap. Prefer this over `axl_time_get_ms`
+  for sub-second timing — the latter is wallclock-derived and not
+  useful below ~1 s on most firmware. Closes the last extern in the
+  tools tree (`tools/timetest.c` previously declared
+  `axl_backend_get_monotonic_us` directly to avoid pulling the
+  internal backend header).
+
+- **`AxlArgsNode.help_prolog` / `help_epilog`** — two optional
+  free-form text fields rendered in `--help` output. The prolog
+  appears between the `name — help` header and `Usage:`; the
+  epilog appears after all auto-generated sections. Per-node
+  (sub-verb help shows the sub-verb's prolog/epilog, not the
+  root's). NULL = nothing printed; every existing caller's `--help`
+  output is unchanged. Use cases: multi-paragraph descriptions,
+  usage examples, environment-variable lists, "see also" pointers,
+  "report bugs to ..." footers.
+
+### Changed
+
+- **Style cleanup passes A1 / A2 / B / C** — mechanical
+  no-behavior-change sweep across the source tree per
+  `docs/Style-Cleanup-Plan.md`. Pass A dropped redundant
+  `extern` declarations and hoisted mid-file `#include` directives
+  to top-of-file include blocks. Pass B hoisted scattered
+  typedefs / macros / file-scope statics into each file's canonical
+  top section across 20 files. Pass C split four large multi-concern
+  files into per-sub-module siblings:
+
+    - `src/acpi/axl-acpi.c` → core + `axl-acpi-mcfg.c`,
+      `axl-acpi-madt.c`, `axl-acpi-fadt.c` (typed-table readers each
+      own their on-wire struct definitions and offset macros).
+    - `src/backend/native/axl-backend-native.c` → core +
+      `axl-backend-native-event.c` (events + timers + close-debug
+      ring) + `axl-backend-native-mp.c` (MP services).
+    - `src/data/axl-str.c` → core + `axl-str-bmh.c`
+      (Boyer-Moore-Horspool substring search), `axl-str-base64.c`
+      (RFC 4648 codec), `axl-str-scan.c` (`AxlStrReader` + `axl_sscanf`).
+    - `src/pci/axl-pci.c` → core + `axl-pci-cap.c` (capability walk
+      + cap-ID name tables + VPD reader).
+
+  Internal headers (`axl-acpi-internal.h`, `axl-pci-internal.h`,
+  `axl-service-internal.h`) added where the split-out files share
+  helpers with the core. No public-API impact.
+
+- **`docs/AXL-Coding-Style.md` codifies the split-vs-hoist rule** —
+  when a section accumulates its own typedefs / macros / statics,
+  prefer a sibling `.c` file with an internal header over a
+  giant top-of-file declaration block. Function-local helper macros
+  that reference caller-scope variables (e.g. va_list-bearing
+  `SCAN_STORE_*`, `ESC_APPEND_CHAR`) are an explicit exception —
+  they have to live next to their single caller.
+
+### Fixed
+
+- **`test_dell_transport_dispatch` no longer cascade-fails 7 of 7
+  assertions under QEMU.** The test installs a mock Dell IPMI
+  vendor protocol then opens a session, expecting to dispatch
+  through the mock. Auto-detect (correctly, for real hardware)
+  prefers SMBIOS Type 38 over the Dell vendor protocol — and OVMF
+  publishes a Type 38 entry — so the mock never got called. Test
+  now pins the transport via
+  `axl_ipmi_session_new_with_transport(AXL_IPMI_TRANSPORT_DELL)`;
+  the dispatcher's wire-shape regression guard (`&resp[0]` vs
+  `&resp[1]` one-byte shift bug) is preserved without weakening
+  auto-detect priority for real-hardware use. `AxlTestIpmi.efi`:
+  98 passed / 0 failed under both KCS-mode and SSIF-mode QEMU
+  boots (was 91 / 7).
+
 ## 0.15.0 — 2026-05-07
 
 ### Added

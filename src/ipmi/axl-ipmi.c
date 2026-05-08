@@ -47,6 +47,16 @@ static const EFI_GUID mu_ipmi_transport2_guid = {
     {0x94, 0x18, 0x77, 0x7f, 0xd5, 0x11, 0x12, 0xf0}
 };
 
+/* Caller-provided-transport adapter context — wraps the user's
+   AxlIpmiSendRaw fn pointer so axl_ipmi_session_open_callback can
+   plug it into the same dispatch path the real KCS/SSIF transports
+   use. Keep here so all internal types live above the function
+   bodies. */
+typedef struct {
+    AxlIpmiSendRaw  send_raw;
+    void           *user_data;
+} CallbackCtx;
+
 static bool
 probe_has_protocol(const EFI_GUID *guid)
 {
@@ -375,11 +385,6 @@ axl_ipmi_session_transport(const AxlIpmiSession *session)
 // ---------------------------------------------------------------------------
 // Caller-provided transport (testing + pluggable transports)
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    AxlIpmiSendRaw  send_raw;
-    void           *user_data;
-} CallbackCtx;
 
 static int
 callback_send_raw(void *vctx,

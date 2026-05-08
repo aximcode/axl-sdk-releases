@@ -102,3 +102,13 @@ axl_time_get_ms(void)
     ms += (uint64_t)(time.nanosecond / 1000000);
     return ms;
 }
+
+uint64_t
+axl_time_get_us(void)
+{
+    /* Thin pass-through to the backend cycle-counter. Lives here
+       (rather than as a backend stub) so consumer code reaches
+       it through the public <axl/axl-time.h> surface without
+       needing the internal backend header. */
+    return axl_backend_get_monotonic_us();
+}

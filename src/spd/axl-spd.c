@@ -28,8 +28,14 @@ AXL_LOG_DOMAIN("spd");
 // Lazy session
 // ---------------------------------------------------------------------------
 
-static AxlSmbus  *g_session         = NULL;
+static AxlSmbus  *g_session           = NULL;
 static bool       g_atexit_registered = false;
+
+/* Iteration cursor (used by axl_spd_next). Storage is reused across
+   calls; consumers pass &g_cursor to walk the slots in address
+   order. */
+static uint8_t    g_cursor       = 0;
+static bool       g_cursor_valid = false;
 
 static void
 spd_cleanup(
@@ -182,9 +188,6 @@ ensure_session(
 // ---------------------------------------------------------------------------
 // Iteration
 // ---------------------------------------------------------------------------
-
-static uint8_t  g_cursor       = 0;
-static bool     g_cursor_valid = false;
 
 static bool
 slot_present(

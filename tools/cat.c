@@ -32,6 +32,10 @@ static bool show_tabs        = false;   // -T
 static bool show_nonprinting = false;   // implied by -A
 static bool raw_output       = false;   // --raw
 
+/* Output sink — set once in run_cat to either axl_stdout or
+   axl_stdout_raw, then used by every emit helper. */
+static AxlStream *out_sink;
+
 static const AxlArgDesc flags[] = {
     { .name = "number",        .short_name = 'n', .type = AXL_ARG_BOOL,
       .help = "Number all output lines" },
@@ -99,8 +103,6 @@ parse_encoding(const char *s, AxlEncoding *out)
 // Output helpers — route all writes through one sink (axl_stdout or
 // axl_stdout_raw) so --raw is transparent to the formatting code.
 // ---------------------------------------------------------------------------
-
-static AxlStream *out_sink;
 
 static void
 out_write(const void *buf, size_t n)

@@ -64,6 +64,11 @@ static const AxlArgDesc positional[] = {
     {0}
 };
 
+typedef struct {
+    const char *pattern;
+    size_t      total;
+} GrepWalkCtx;
+
 // ---------------------------------------------------------------------------
 // Binary detection: scan up to BINARY_PEEK_BYTES for an embedded NUL.
 // Lines (axl_readline) terminate at NUL, so a binary file with NUL in
@@ -215,11 +220,6 @@ grep_stream(
 // ---------------------------------------------------------------------------
 // Recursive directory walker
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    const char *pattern;
-    size_t      total;
-} GrepWalkCtx;
 
 static int
 grep_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)

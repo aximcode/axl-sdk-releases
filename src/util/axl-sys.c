@@ -6,6 +6,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-service-internal.h"
 #include <axl/axl-sys.h>
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
@@ -13,6 +14,51 @@
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("sys");
+
+// ---------------------------------------------------------------------------
+// File-scope macros and types
+// ---------------------------------------------------------------------------
+
+/* Cap on node count for axl_device_path_for_each — guards against
+   malformed firmware data that doesn't terminate. 64 nodes is well
+   above any real device path the SDK has seen (typical UEFI paths
+   max at ~6-12 nodes). */
+#define AXL_DP_MAX_NODES  64u
+
+/* Walk-callback context used by axl_device_path_find. */
+typedef struct {
+    uint8_t      type;
+    uint8_t      subtype;
+    const void  *match;
+} DpFindCtx;
+
+/* Walk-callback context used by axl_device_path_has_vendor. */
+typedef struct {
+    const AxlGuid *guid;
+    bool           found;
+} VendorMatchCtx;
+
+/* EFI_DEVICE_PATH_TO_TEXT_PROTOCOL function-pointer subset — only
+   ConvertDevicePathToText is used here, so the first slot is left
+   as a generic void * placeholder rather than re-declaring the
+   ConvertDeviceNodeToText prototype. */
+#pragma pack(push, 1)
+typedef struct {
+    void *ConvertDeviceNodeToText;
+    unsigned short *(EFIAPI *ConvertDevicePathToText)(
+        const void *DevicePath,
+        BOOLEAN     DisplayOnly,
+        BOOLEAN     AllowShortcuts);
+} DevicePathToTextProtocol;
+#pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// File-scope variables
+// ---------------------------------------------------------------------------
+
+static const AxlGuid DEVICE_PATH_TO_TEXT_GUID = AXL_GUID(
+    0x8b843e20, 0x8132, 0x4852,
+    0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c);
 
 void
 axl_reset(int type)
@@ -66,8 +112,7 @@ axl_handle_get_service(
        NULL, so a leftover stale pointer would be a real footgun. */
     *interface = NULL;
 
-    /* Reuse the service name→GUID lookup from axl-service.c */
-    extern const EFI_GUID *axl_service_lookup_guid(const char *name, EFI_GUID *fallback);
+    /* Reuse the service name→GUID lookup from axl-service.c. */
     guid = axl_service_lookup_guid(name, &fallback);
     if (guid == NULL) {
         return AXL_ERR;
@@ -202,11 +247,6 @@ axl_sys_get_memory_size(
 // Device-path iteration
 // ---------------------------------------------------------------------------
 
-/* Cap on node count — guards against malformed firmware data that
-   doesn't terminate. 64 nodes is well above any real device path
-   the SDK has seen (typical UEFI paths max at ~6-12 nodes). */
-#define AXL_DP_MAX_NODES  64u
-
 int
 axl_device_path_for_each(
     const void       *device_path,
@@ -238,12 +278,6 @@ axl_device_path_for_each(
     }
     return -1;  /* step cap exhausted — treat as malformed */
 }
-
-typedef struct {
-    uint8_t      type;
-    uint8_t      subtype;
-    const void  *match;
-} DpFindCtx;
 
 static int
 dp_find_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
@@ -292,11 +326,6 @@ axl_device_path_size(const void *device_path)
 // axl_device_path_has_vendor
 // ---------------------------------------------------------------------------
 
-typedef struct {
-    const AxlGuid *guid;
-    bool           found;
-} VendorMatchCtx;
-
 static int
 vendor_match_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
 {
@@ -325,20 +354,6 @@ axl_device_path_has_vendor(void *device_path, const AxlGuid *guid)
 // ---------------------------------------------------------------------------
 // axl_device_path_to_text
 // ---------------------------------------------------------------------------
-
-#pragma pack(push, 1)
-typedef struct {
-    void *ConvertDeviceNodeToText;
-    unsigned short *(EFIAPI *ConvertDevicePathToText)(
-        const void *DevicePath,
-        BOOLEAN     DisplayOnly,
-        BOOLEAN     AllowShortcuts);
-} DevicePathToTextProtocol;
-#pragma pack(pop)
-
-static const AxlGuid DEVICE_PATH_TO_TEXT_GUID = AXL_GUID(
-    0x8b843e20, 0x8132, 0x4852,
-    0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c);
 
 char *
 axl_device_path_to_text(const void *device_path)

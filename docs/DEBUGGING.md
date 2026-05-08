@@ -158,8 +158,8 @@ breakpoints or continue. You drive the rest interactively.
 |----------|------|-------|
 | `axl_tcp_close` | src/net/axl-tcp-sync.c | Sync close path |
 | `axl_loop_dispatch_event` | src/loop/axl-loop.c | Per-event dispatch |
-| `axl_backend_event_create` | src/backend/native/axl-backend-native.c | Wraps gBS->CreateEvent |
-| `axl_backend_event_close_dbg` | src/backend/native/axl-backend-native.c | Wraps gBS->CloseEvent + records double-close ring |
+| `axl_backend_event_create` | src/backend/native/axl-backend-native-event.c | Wraps gBS->CreateEvent |
+| `axl_backend_event_close_dbg` | src/backend/native/axl-backend-native-event.c | Wraps gBS->CloseEvent + records double-close ring |
 
 ### EDK2 firmware
 

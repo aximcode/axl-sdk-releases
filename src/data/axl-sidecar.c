@@ -32,6 +32,33 @@
 AXL_LOG_DOMAIN("sidecar");
 
 // ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+/* Atexit dispatch: the registered fn receives the data pointer, so
+   we wrap the close_fn pair in a tiny stub that knows how to undo a
+   _load. The stub allocation lives until atexit runs (or
+   _singleton_free pops it explicitly via axl_atexit_remove). */
+typedef struct {
+    void                **handle_slot;
+    /* Back-pointers to the caller's bookkeeping slots so the thunk can
+       null them when it frees ctx — prevents `_singleton_free` running
+       after the thunk from double-freeing or dereferencing a dangling
+       *atexit_ctx_slot. */
+    uint32_t             *atexit_slot;
+    void                **atexit_ctx_slot;
+    AxlSidecarCloseFn     close_fn;
+} SingletonAtexitCtx;
+
+/* Trampoline carrying a stop_rc out of axl_hash_table_foreach so
+   the early-stop semantics survive the void-callback contract. */
+typedef struct {
+    AxlSidecarEntryFn  fn;
+    void              *ctx;
+    int                stop_rc;
+} ForeachTrampoline;
+
+// ---------------------------------------------------------------------------
 // Public — file / buffer load
 // ---------------------------------------------------------------------------
 
@@ -141,21 +168,6 @@ axl_sidecar_check_schema(
 // ---------------------------------------------------------------------------
 // Internal — singleton lifecycle
 // ---------------------------------------------------------------------------
-
-/* Atexit dispatch: the registered fn receives the data pointer, so
-   we wrap the close_fn pair in a tiny stub that knows how to undo a
-   _load. The stub allocation lives until atexit runs (or
-   _singleton_free pops it explicitly via axl_atexit_remove). */
-typedef struct {
-    void                **handle_slot;
-    /* Back-pointers to the caller's bookkeeping slots so the thunk can
-       null them when it frees ctx — prevents `_singleton_free` running
-       after the thunk from double-freeing or dereferencing a dangling
-       *atexit_ctx_slot. */
-    uint32_t             *atexit_slot;
-    void                **atexit_ctx_slot;
-    AxlSidecarCloseFn     close_fn;
-} SingletonAtexitCtx;
 
 static void
 singleton_atexit_thunk(
@@ -288,12 +300,6 @@ _axl_sidecar_singleton_free(
 // ---------------------------------------------------------------------------
 // Internal — hash-table foreach with early-stop
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    AxlSidecarEntryFn  fn;
-    void              *ctx;
-    int                stop_rc;
-} ForeachTrampoline;
 
 static void
 foreach_thunk(

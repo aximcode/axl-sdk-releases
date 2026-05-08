@@ -19,12 +19,14 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>
+#include <axl/axl-mem-impl.h>   /* declares the _impl functions
+                                    that the axl_malloc / axl_free
+                                    macros below expand to */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <axl/axl-macros.h>
 
 // ---------------------------------------------------------------------------
 // Allocation (macros hide the _impl functions — see axl-mem-impl.h)
@@ -260,9 +262,6 @@ bool axl_mem_check(
 void axl_mem_fail_next_alloc(
     size_t n  ///< fail the Nth next alloc (1 = next, 0 = disabled)
 );
-
-// Implementation details for the axl_malloc/free macros
-#include <axl/axl-mem-impl.h>
 
 #ifdef __cplusplus
 }
