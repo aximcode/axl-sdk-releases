@@ -3,6 +3,45 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.15.0 — 2026-05-07
+
+### Added
+
+- **`axl_http_response_set_static(resp, body, size, content_type)`** —
+  install a borrowed read-only body the SDK will NOT free after
+  sending. Suited for embedded `.rodata` HTML / JS / CSS assets and
+  other immutable blobs (xxd'd binary, JSON5 sidecar contents).
+  Avoids the silent copy that `axl_http_response_set_text` /
+  `_json` would force, and avoids the heap-corruption footgun of
+  assigning a static literal to `resp->body` directly.
+
+### Changed
+
+- **`AxlHttpResponse.body` ownership contract is now documented** in
+  `axl-http-server.h`: the SDK calls `axl_free` on the pointer
+  after the response is sent unless `body_static` is set. New
+  `body_static` field (zero-init false → preserves existing
+  behavior for every existing caller; no migration required).
+  Reported by an axl-webfs consumer after a `.rodata`-assigned
+  body caused first-OK / second-hangs heap corruption.
+
+- **`scripts/run-qemu.sh --timeout` is now honored in `--background`
+  mode.** Previously the timeout was foreground-only; an abandoned
+  background QEMU (e.g. driver dying with SIGPIPE mid-run) leaked
+  its hostfwd binding and camped the host port forever. The
+  background launch now wraps QEMU with `timeout(1)` the same way
+  the foreground branch does. `--gdb` continues to bump the
+  timeout to 3600 s for both modes.
+
+### Migration
+
+- **`AxlHttpResponse` struct grew by one `bool` (+ padding).**
+  Pre-1.0 ABI churn — consumer projects (e.g. axl-webfs) must
+  rebuild against this version; no source changes required for
+  callers that go through the `set_text` / `set_json` / `set_file`
+  / `set_range` helpers. Direct `resp->body = …` assignments still
+  work and behave identically (zero-init `body_static = false`).
+
 ## 0.14.0 — 2026-05-06
 
 ### Added

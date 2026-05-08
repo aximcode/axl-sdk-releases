@@ -281,7 +281,13 @@ dispatch_request(
                 resp.body = cached->body;
                 resp.body_size = cached->body_size;
                 send_response(conn, &resp);
-                resp.body = NULL;  /* owned by cache */
+                /* Cache owns the body. The early return below means
+                   we don't reach the dispatch-tail axl_free, but
+                   defense-in-depth: also flag body_static so a
+                   future refactor that consolidates the cleanup
+                   path can't accidentally double-free. */
+                resp.body = NULL;
+                resp.body_static = true;
                 return;
             }
             /* Expired — remove and re-fetch */
@@ -373,7 +379,7 @@ dispatch_request(
         }
     }
 
-    if (resp.body != NULL) {
+    if (resp.body != NULL && !resp.body_static) {
         axl_free(resp.body);
     }
 

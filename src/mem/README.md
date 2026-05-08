@@ -14,8 +14,8 @@ memory is tracked with a small header that stores the block size, enabling
 `axl_realloc` and debug features without requiring the caller to pass the
 old size.
 
-**Do not mix** `axl_malloc` with UEFI's `FreePool`, or `AllocatePool`
-with `axl_free` — they use different headers.
+**Do not mix** `axl_malloc`/`axl_free` with UEFI's
+`AllocatePool`/`FreePool` — they use different headers.
 
 ### Debug vs. Release
 

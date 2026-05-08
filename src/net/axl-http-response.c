@@ -119,9 +119,13 @@ set_body_copy(
     size_t           size
     )
 {
-    if (r->body != NULL) {
+    /* Only free a previously-installed body if WE owned it. A body
+       marked static was lent to us by the caller via set_static —
+       drop the pointer without freeing. */
+    if (r->body != NULL && !r->body_static) {
         axl_free(r->body);
     }
+    r->body_static = false;
 
     r->body = axl_malloc(size);
     if (r->body != NULL) {
@@ -204,9 +208,10 @@ axl_http_response_set_file(AxlHttpResponse *r, const char *path)
         size_t size = (size_t)len;
         axl_free(tmp);
 
-        if (r->body != NULL) {
+        if (r->body != NULL && !r->body_static) {
             axl_free(r->body);
         }
+        r->body_static = false;
 
         r->body      = buffer;
         r->body_size = size;
@@ -245,6 +250,41 @@ axl_http_response_set_file(AxlHttpResponse *r, const char *path)
         }
     }
 
+    if (r->status_code == 0) {
+        r->status_code = 200;
+    }
+}
+
+void
+axl_http_response_set_static(
+    AxlHttpResponse *r,
+    const void      *body,
+    size_t           size,
+    const char      *content_type
+    )
+{
+    if (r == NULL || body == NULL) {
+        return;
+    }
+
+    /* Free any previously-installed *owned* body. A body already
+       marked static was lent to us by the caller — we don't free it,
+       we just overwrite the pointer with the new one. */
+    if (r->body != NULL && !r->body_static) {
+        axl_free(r->body);
+    }
+
+    /* Cast away const: the struct stores a single `void *` for both
+       owned and borrowed bodies, with body_static disambiguating
+       lifetime. The dispatch loop will not write to it; the only
+       read is the send path, which treats body as `const`. */
+    r->body        = (void *)body;
+    r->body_size   = size;
+    r->body_static = true;
+
+    if (content_type != NULL) {
+        r->content_type = content_type;
+    }
     if (r->status_code == 0) {
         r->status_code = 200;
     }

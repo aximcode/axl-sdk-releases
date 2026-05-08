@@ -30,8 +30,14 @@ if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
-SHA=$(git rev-parse "$TARGET" 2>/dev/null) || {
-    echo "ERROR: cannot resolve '$TARGET' to a sha" >&2
+# Dereference to the commit sha. `git rev-parse v0.14.0` on an
+# annotated tag returns the *tag*'s sha (a Tag object); the
+# GraphQL `... on Commit` fragment below would silently miss and
+# checkSuites.nodes would come back null. The `^{commit}` peel
+# resolves to the underlying commit for both annotated and
+# lightweight tags as well as branches and bare shas.
+SHA=$(git rev-parse "${TARGET}^{commit}" 2>/dev/null) || {
+    echo "ERROR: cannot resolve '$TARGET' to a commit sha" >&2
     exit 2
 }
 

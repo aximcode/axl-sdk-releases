@@ -447,6 +447,60 @@ test_http_round_trip(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlHttpResponse — set_static contract
+// ---------------------------------------------------------------------------
+
+static const char STATIC_ASSET_BODY[] =
+    "console.log('embedded asset');\n";
+
+static void
+test_http_response_set_static(void)
+{
+    AxlHttpResponse r;
+    axl_memset(&r, 0, sizeof(r));
+
+    axl_http_response_set_static(&r,
+                                 STATIC_ASSET_BODY,
+                                 sizeof(STATIC_ASSET_BODY) - 1,
+                                 "application/javascript");
+
+    test_check(r.body == (void *)STATIC_ASSET_BODY,
+               "set_static: body points at the caller's buffer (no copy)");
+    test_check(r.body_size == sizeof(STATIC_ASSET_BODY) - 1,
+               "set_static: body_size matches the size argument");
+    test_check(r.body_static,
+               "set_static: body_static flag is set so the dispatch "
+               "loop will not call axl_free on the static buffer");
+    test_check(r.content_type != NULL
+               && axl_strcmp(r.content_type, "application/javascript") == 0,
+               "set_static: content_type captured");
+    test_check(r.status_code == 200,
+               "set_static: defaults status to 200 when unset");
+
+    /* NULL content_type leaves the existing one in place. */
+    AxlHttpResponse r2;
+    axl_memset(&r2, 0, sizeof(r2));
+    r2.content_type = "text/plain";
+    axl_http_response_set_static(&r2, "abc", 3, NULL);
+    test_check(r2.content_type != NULL
+               && axl_strcmp(r2.content_type, "text/plain") == 0,
+               "set_static: NULL content_type preserves prior value");
+
+    /* Switching from a copy-based helper to set_static frees the
+       previous body without leaking. The leak detector / fence
+       checker would catch a regression here. */
+    AxlHttpResponse r3;
+    axl_memset(&r3, 0, sizeof(r3));
+    axl_http_response_set_text(&r3, "previous body");
+    test_check(r3.body != NULL && !r3.body_static,
+               "set_static: pre-state — set_text installed an owned body");
+    axl_http_response_set_static(&r3, STATIC_ASSET_BODY,
+                                 sizeof(STATIC_ASSET_BODY) - 1, NULL);
+    test_check(r3.body == (void *)STATIC_ASSET_BODY && r3.body_static,
+               "set_static: replaces a previously-owned body cleanly");
+}
+
+// ---------------------------------------------------------------------------
 // HTTP Server Mode -- "serve" argument starts a server for external testing
 // ---------------------------------------------------------------------------
 
@@ -483,6 +537,27 @@ on_get_plain(
     (void)req;
     (void)data;
     axl_http_response_set_text(resp, "Hello from AxlNet");
+    return 0;
+}
+
+/* Static-asset route — exercises axl_http_response_set_static end-to-end.
+   Returns the same .rodata buffer twice in a row; the integration test
+   curls /static-asset twice and verifies both bodies match exactly. If
+   the dispatch loop ever stops honoring body_static and frees the
+   .rodata pointer, the second request hangs / returns truncated data /
+   blows up the heap (the original axl-webfs bug shape). */
+static int
+on_get_static_asset(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    (void)req;
+    (void)data;
+    axl_http_response_set_static(resp,
+                                 STATIC_ASSET_BODY,
+                                 sizeof(STATIC_ASSET_BODY) - 1,
+                                 "application/javascript");
     return 0;
 }
 
@@ -859,6 +934,7 @@ run_serve_mode(void)
     axl_http_server_add_route(s, "GET",  "/plain",        on_get_plain,    NULL);
     axl_http_server_add_route(s, "POST", "/echo",         on_echo,         NULL);
     axl_http_server_add_route(s, "GET",  "/client-test",  on_client_test,  NULL);
+    axl_http_server_add_route(s, "GET",  "/static-asset", on_get_static_asset, NULL);
 
     /*
      * Route lookup tests — verify exact and prefix routes coexist at the
@@ -1987,6 +2063,7 @@ test_net_main(
     test_tcp_echo();
     test_tcp_recv_async_rearm();
     test_http_round_trip();
+    test_http_response_set_static();
 
     //
     // AxlSocket (network required)

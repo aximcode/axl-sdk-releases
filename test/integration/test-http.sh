@@ -131,6 +131,26 @@ BODY=$(echo "$RESP" | sed '$d')
 [[ "$CODE" == "200" ]] && pass "POST /echo returns 200" || fail "POST /echo (got $CODE)"
 echo "$BODY" | grep -q "test payload" && pass "/echo returns posted body" || fail "/echo wrong body"
 
+# GET /static-asset twice — regression for the body_static contract.
+# Handler returns the same .rodata buffer via axl_http_response_set_static.
+# Pre-fix, the dispatch loop axl_free()'d the .rodata pointer after the
+# first send (heap corruption); the second curl typically hung mid-stream
+# or returned truncated data (curl exit 56). Both responses must be
+# byte-identical and 200 OK.
+RESP=$(http_get "/static-asset")
+CODE=$(echo "$RESP" | tail -1)
+BODY1=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == "200" ]] && pass "GET /static-asset (1st) returns 200" || fail "GET /static-asset 1st (got $CODE)"
+echo "$BODY1" | grep -q "embedded asset" && pass "/static-asset 1st has expected body" || fail "/static-asset 1st wrong body"
+
+RESP=$(http_get "/static-asset")
+CODE=$(echo "$RESP" | tail -1)
+BODY2=$(echo "$RESP" | sed '$d')
+[[ "$CODE" == "200" ]] && pass "GET /static-asset (2nd) returns 200" || fail "GET /static-asset 2nd (got $CODE)"
+echo "$BODY2" | grep -q "embedded asset" && pass "/static-asset 2nd has expected body" || fail "/static-asset 2nd wrong body"
+[[ "$BODY1" == "$BODY2" ]] && pass "/static-asset is byte-identical across requests (no free)" \
+                          || fail "/static-asset bodies diverged (heap corruption symptom)"
+
 # GET /nonexistent — 404
 RESP=$(http_get "/nonexistent")
 CODE=$(echo "$RESP" | tail -1)

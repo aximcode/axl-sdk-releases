@@ -216,17 +216,13 @@ Host idrac-* 10.9.177.* 10.9.176.* 10.215.*
 ```
 
 `sshpass` is needed on both ashley and laptop. The `laptop`
-wrapper script (in `~/bin/laptop`) bundles the
-`ssh ... idrac ... racadm console com2` chain into one command —
-adapt the wrapper to your environment if you set this up fresh.
-At minimum it needs subcommands for:
-
-- `idrac [host] [args]` — racadm one-shot or interactive
-- `console [host]` — racadm `console com2` for serial-redirected
-  UEFI shell (used by every `slowtype | laptop console …` block
-  in this doc)
-- `sol [host]` — IPMI Serial-over-LAN (iDRAC10 may fail with
-  UDP/623 RMCP+ session error; use `console` instead)
+wrapper used in this doc bundles
+`ssh laptop-tunnel "sshpass … ssh root@<idrac> racadm console com2"`
+into a single `laptop console <idrac-ip>` invocation, plus a few
+peers (`laptop idrac`, `laptop sol`) for adjacent racadm/IPMI
+shapes. Adapt the wrapper to your environment if you set this
+up fresh — only `console` is exercised by the worked examples
+above.
 
 ## Linux-side investigation
 

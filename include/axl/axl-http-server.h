@@ -38,11 +38,33 @@ typedef struct {
 } AxlHttpRequest;
 
 typedef struct {
-    size_t      status_code;
-    AxlHashTable     *headers;
+    size_t       status_code;
+    AxlHashTable *headers;
+
+    /// Response body bytes. **Ownership: the SDK calls @ref axl_free
+    /// on this pointer after the response is sent**, unless
+    /// @ref body_static is set. Handlers that assign @ref body
+    /// directly must therefore pass an @ref axl_malloc'd buffer.
+    /// Assigning a `.rodata` / static const literal here is a heap
+    /// corruption bug — use @ref axl_http_response_set_static for
+    /// embedded read-only assets, or one of the copy-based helpers
+    /// (`axl_http_response_set_text` / `_json` / `_file`) which
+    /// allocate internally.
     void        *body;
-    size_t      body_size;
+    size_t       body_size;
+
+    /// Content-Type header value. Borrowed pointer — the SDK does
+    /// NOT free this. Static string literals are fine; if a caller
+    /// allocates dynamically, the caller is responsible for the
+    /// lifetime (must outlive the response send).
     const char  *content_type;
+
+    /// When true, the SDK will NOT free @ref body after the response
+    /// is sent. Set by @ref axl_http_response_set_static; ignore
+    /// otherwise. Default false (zero-init) preserves the
+    /// "axl_malloc'd, SDK frees" contract for every existing
+    /// caller — no migration required.
+    bool         body_static;
 } AxlHttpResponse;
 
 // ---------------------------------------------------------------------------
@@ -258,6 +280,35 @@ void
 axl_http_response_set_file(
     AxlHttpResponse *r,     ///< response
     const char      *path   ///< filesystem path (UTF-8)
+);
+
+/**
+ * @brief Set response body to a borrowed static buffer that the SDK
+ *     must NOT free.
+ *
+ * Use this for embedded read-only assets — `.rodata` C string
+ * literals, static const arrays of HTML / JS / CSS, immutable
+ * binary blobs xxd'd into the binary. Sets @ref AxlHttpResponse.body
+ * to @a body, @ref body_size to @a size, marks
+ * @ref AxlHttpResponse.body_static = true so the dispatch loop skips
+ * its post-send `axl_free`. Passing such a pointer to the
+ * @ref axl_http_response_set_text / `_json` family would force a copy
+ * (waste); assigning it to @ref AxlHttpResponse.body directly causes
+ * heap corruption (the dispatch loop would treat the literal as an
+ * `axl_malloc`'d buffer and free it).
+ *
+ * @a content_type is borrowed (typically a string literal). NULL
+ * leaves the existing content-type unchanged.
+ *
+ * If a previous body was set via the copy-based helpers, this
+ * function frees it before installing the static buffer.
+ */
+void
+axl_http_response_set_static(
+    AxlHttpResponse *r,             ///< response
+    const void      *body,          ///< pointer to read-only / static buffer
+    size_t           size,          ///< size of @a body in bytes
+    const char      *content_type   ///< MIME type (borrowed); NULL = leave as-is
 );
 
 /**

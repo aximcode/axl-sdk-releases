@@ -9,7 +9,11 @@
 #
 # Options:
 #   --arch X64|AARCH64    Architecture (default: X64)
-#   --timeout SECS        QEMU timeout (default: 15)
+#   --timeout SECS        QEMU timeout (default: 15). Honored in both
+#                         foreground and --background modes — the
+#                         background launcher wraps QEMU with `timeout`
+#                         so an abandoned process can't camp on
+#                         hostfwd ports forever.
 #   --raw                 Show full serial log (including firmware boot)
 #   --screenshot FILE     Capture framebuffer screenshot (PNG/PPM)
 #   --net                 Enable user-mode networking (virtio-net)
@@ -170,7 +174,10 @@ Usage: run-qemu.sh [OPTIONS] <file.efi> [args...]
 
 Options:
   --arch X64|AARCH64       Architecture (default: X64)
-  --timeout SECS           QEMU timeout in seconds (default: 15)
+  --timeout SECS           QEMU timeout in seconds (default: 15;
+                           honored in --background mode too — wraps
+                           QEMU with timeout(1) to prevent hostfwd
+                           port leaks)
   --raw                    Show full serial log (including firmware boot)
   --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
   --net                    Enable user-mode networking (virtio-net)
@@ -912,9 +919,12 @@ if [[ -n "$GDB_PORT" ]]; then
         CMD+=(-S)
     fi
     # Bump the watchdog so a debugging session doesn't get terminated.
-    if [[ "$BACKGROUND" != "true" ]]; then
-        TIMEOUT=3600
-    fi
+    # Apply in both foreground and background — the background guard
+    # was a no-op when --background ignored TIMEOUT entirely; with
+    # the timeout now wired into background mode (so abandoned QEMUs
+    # can't camp on hostfwd ports), --background --gdb would be
+    # killed at the default 15 s without this bump.
+    TIMEOUT=3600
 fi
 
 # OVMF DEBUG-build firmware emits "Loading driver at 0x... NAME.efi"
@@ -1334,6 +1344,18 @@ if [[ -n "$SCREENSHOT" ]]; then
 
 # Background mode
 elif [[ "$BACKGROUND" == "true" ]]; then
+    # Wrap with `timeout` so a forgotten/orphaned background QEMU can't
+    # camp on hostfwd ports forever. Caller's --timeout governs the
+    # upper bound; default falls back to TIMEOUT (15 s base, +10 s
+    # AARCH64 — see ARCH adjust above). Without this guard, scripts
+    # whose driver dies mid-run (SIGPIPE from a tail filter, manual
+    # abort, …) leak QEMU and the next run's hostfwd binding fails
+    # silently with "server did not start".
+    #
+    # `timeout` reparents the command, but QEMU stays a direct child
+    # of the wrapper subshell — `pgrep -P` finds it the same way the
+    # foreground branch does, so anything that grabs QEMU_PID for
+    # later kill/screenshot still works.
     if [[ -n "$SERIAL_SOCKET" ]]; then
         # Serial as a UNIX socket the host can open to read output AND
         # write input. -no-shutdown so the guest's own Exit doesn't
@@ -1347,12 +1369,26 @@ elif [[ "$BACKGROUND" == "true" ]]; then
             -serial chardev:serial0
             -display none
         )
-        "${CMD[@]}" > "$LOG" 2>&1 < /dev/null &
-        QEMU_PID=$!
     else
         CMD+=(-nographic -no-reboot)
-        "${CMD[@]}" > "$LOG" 2>&1 < /dev/null &
-        QEMU_PID=$!
+    fi
+    ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
+    WRAPPER_PID=$!
+    QEMU_PID=""
+    for _ in 1 2 3 4 5; do
+        QEMU_PID=$(pgrep -P "$WRAPPER_PID" 2>/dev/null | head -1)
+        [[ -n "$QEMU_PID" ]] && break
+        sleep 0.2
+    done
+    if [[ -z "$QEMU_PID" ]]; then
+        # Fall back to the wrapper PID. `kill $WRAPPER_PID` won't
+        # propagate to a still-execing `timeout`+QEMU pair (they'd
+        # be reparented to init and run until the timeout fires),
+        # so this is a best-effort handle for the caller — the
+        # `timeout SECS` watchdog above is the actual guarantee
+        # that QEMU goes away. In practice pgrep finds the child
+        # within tens of ms, so this branch is rare.
+        QEMU_PID=$WRAPPER_PID
     fi
 
     # Copy serial log path if requested
