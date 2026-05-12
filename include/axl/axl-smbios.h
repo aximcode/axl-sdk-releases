@@ -666,7 +666,7 @@ axl_smbios_table_range(
  * itself (24 bytes for SMBIOS3, 31 bytes for SMBIOS 2.x — the
  * `Length` field of the structure). Tools that produce a
  * `dmidecode --dump-bin`-compatible blob concatenate this with the
- * table data from @ref axl_smbios_table_range to write the standard
+ * table data from axl_smbios_table_range to write the standard
  * file format that QEMU's `-smbios file=` consumes.
  *
  * Both out parameters must be non-NULL.

@@ -78,7 +78,7 @@ axl_smbus_new(void);
  * @p probe receives the candidate session and is expected to attempt
  * a single read/write at the slave address it cares about. Return
  * true to claim the session; the caller will receive it as the
- * @ref axl_smbus_new return value. Return false to discard and try
+ * axl_smbus_new return value. Return false to discard and try
  * the next handle. @p user is forwarded verbatim.
  *
  * Sessions discarded by the probe are freed before the next attempt.
@@ -140,7 +140,7 @@ axl_smbus_transport(
  * @brief SMBus "Receive Byte" transaction (§5.5.3).
  *
  * Wire format: address + R bit, then the slave returns one byte.
- * NO command byte is sent — different from @ref axl_smbus_read_byte
+ * NO command byte is sent — different from axl_smbus_read_byte
  * which writes a command then re-reads. Linux's `i2cdetect` uses
  * Receive Byte as the safest probe for EEPROM-prone address ranges
  * (0x30..0x37, 0x50..0x5F) because writing a stray command byte
@@ -191,7 +191,7 @@ axl_smbus_quick(
  *   - "AMD FCH PIIX4 port 1 at 0xB20"  (AUX controller)
  *
  * Returned pointer lives as long as the session — do not free,
- * do not retain across @ref axl_smbus_free. NULL only if @p s is
+ * do not retain across axl_smbus_free. NULL only if @p s is
  * NULL.
  */
 const char *

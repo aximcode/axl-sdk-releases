@@ -49,10 +49,10 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (axl_http_server_add_route(server, "GET", "/version",
-                                  on_version, NULL) != 0 ||
-        axl_http_server_add_route(server, "POST", "/echo",
-                                  on_echo, NULL) != 0)
+    if (axl_http_server_add_routes(server,
+            "GET",  "/version", on_version, NULL,
+            "POST", "/echo",    on_echo,    NULL,
+            NULL) != AXL_OK)
     {
         axl_printf("error: cannot register routes\n");
         return 1;

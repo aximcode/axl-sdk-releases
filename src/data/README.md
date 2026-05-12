@@ -694,6 +694,133 @@ Writes to the UEFI console with cyan keys, green strings, yellow
 numbers, magenta booleans. Distinct from the writer's pretty-print
 flag, which emits to a buffer without color.
 
+## AxlXml — Streaming XML writer + pull-token reader
+
+Streaming XML writer over an `AxlString` plus a pull-token reader
+over a byte buffer. Caller manages namespaces (qnames like
+`D:multistatus` are opaque to the writer; namespace declarations
+are normal attributes). Out of scope: DTD validation, XSD, RelaxNG,
+XPath, XSLT, XML signatures. UTF-8 only.
+
+Header: `<axl/axl-xml.h>`
+
+### Overview
+
+Two independent APIs:
+
+- **Writer** (`AxlXmlWriter`) — value-typed state machine that
+  builds XML into a caller-owned `AxlString`. Mirrors
+  `AxlJsonWriter`'s shape: init takes flags bitmask, emitters
+  return void, errors are sticky and checked at `_finish`.
+  Auto-escapes `<` `>` `&` in body text and `<` `&` `"` in
+  attribute values. Tag balance and start-tag-open windows are
+  enforced; misuse sets the sticky error flag.
+- **Reader** (`AxlXmlReader`) — opaque pull-token reader. One
+  `AXL_XML_TOKEN_{START_ELEMENT, END_ELEMENT, TEXT, END_DOCUMENT}`
+  per `axl_xml_reader_next` call. Attribute lookup via
+  `axl_xml_reader_attr` while positioned at a `START_ELEMENT`.
+  Entity decoding (5 named + `&#NNN;` / `&#xHH;`) into a
+  reader-owned scratch buffer reused per token. CDATA passes
+  through with `is_cdata` set. Comments, processing instructions,
+  and DOCTYPE declarations are skipped silently.
+
+### Writing XML
+
+```c
+AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+AxlXmlWriter w;
+
+axl_xml_writer_init(&w, out, AXL_XML_WRITER_DEFAULT);
+axl_xml_writer_prologue(&w);
+axl_xml_writer_start_element(&w, "D:multistatus");
+axl_xml_writer_attribute(&w, "xmlns:D", "DAV:");
+    axl_xml_writer_start_element(&w, "D:response");
+        axl_xml_writer_start_element(&w, "D:href");
+        axl_xml_writer_text(&w, "/dav/file.txt");  // auto-escaped
+        axl_xml_writer_end_element(&w);
+    axl_xml_writer_end_element(&w);
+axl_xml_writer_end_element(&w);
+axl_xml_writer_finish(&w);
+
+if (!axl_xml_writer_error(&w)) {
+    axl_printf("%s\n", axl_string_str(out));
+}
+```
+
+Pass `AXL_XML_WRITER_PRETTY` at init for 2-space indent + newlines
+between child elements; text-only elements stay on one line.
+
+### Reading XML
+
+```c
+const char *xml = "<root><greet lang=\"en\">hello &amp; world</greet></root>";
+AxlXmlReader *r = axl_xml_reader_new(xml, axl_strlen(xml));
+AxlXmlToken t;
+
+while (axl_xml_reader_next(r, &t)) {
+    switch (t.type) {
+    case AXL_XML_TOKEN_START_ELEMENT:
+        axl_printf("START: %.*s\n", (int)t.name_len, t.name);
+        const char *lang = axl_xml_reader_attr(r, "lang");
+        if (lang != NULL) {
+            axl_printf("  lang=%s\n", lang);
+        }
+        break;
+    case AXL_XML_TOKEN_TEXT:
+        axl_printf("TEXT: %.*s\n", (int)t.text_len, t.text);
+        break;
+    case AXL_XML_TOKEN_END_ELEMENT:
+        axl_printf("END: %.*s\n", (int)t.name_len, t.name);
+        break;
+    case AXL_XML_TOKEN_END_DOCUMENT:
+        break;
+    }
+}
+
+uint32_t line, col;
+const char *msg;
+if (axl_xml_reader_error(r, &line, &col, &msg)) {
+    axl_printerr("parse error at %u:%u: %s\n", line, col, msg);
+}
+axl_xml_reader_free(r);
+```
+
+Token `name` / `text` pointers reference reader-owned storage and
+are invalidated on the next `axl_xml_reader_next` call. Copy out
+anything you need to keep.
+
+### Entity decoding + safety
+
+The reader decodes the five named entities (`&amp;` `&lt;` `&gt;`
+`&quot;` `&apos;`) plus decimal and hex numeric character
+references. UTF-8 encoded for codepoints ≥ 0x80. Per XML 1.0 §4.1:
+references to U+0000 and to UTF-16 surrogates (U+D800..U+DFFF) are
+rejected as parse errors — both would otherwise corrupt downstream
+C-string handling or produce invalid UTF-8.
+
+DOCTYPE declarations are tokenized and skipped, but the reader
+balances `[` and `]` brackets across the declaration so any
+internal entity definitions are NEVER processed. This closes the
+billion-laughs / external-entity attack classes without any
+content-side checks.
+
+### Well-formedness
+
+Strict by construction:
+
+- Tag balance enforced (mismatched end tag → error).
+- Exactly one root element (content after root → error).
+- Non-whitespace content before / after the root → error.
+- Tag nesting capped at 64 levels in both writer and reader.
+
+### Status code
+
+X1 (writer) shipped 2026-05-10. X2 (reader) shipped 2026-05-10.
+WebDAV `axl_http_server_add_webdav`'s PROPFIND emit migrated to
+`AxlXmlWriter` in X3 the same day; class-2 verb bodies
+(PROPPATCH / LOCK / UNLOCK) become implementable via the reader
+when a consumer asks.
+
 ## AxlCache — TTL Cache
 
 TTL cache with LRU eviction. Fixed-size slots, string keys, opaque

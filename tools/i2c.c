@@ -548,11 +548,7 @@ static const AxlArgsNode verbs[] = {
     {0}
 };
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+AXL_TOOL_MAIN(i2c)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name = "i2c",

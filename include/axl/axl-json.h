@@ -7,7 +7,7 @@
  * JSON / JSON5 reader and JSON writer (AxlString-backed). The strict
  * reader parses RFC 8259 JSON via jsmn; an opt-in JSON5 backend
  * (json5.org grammar superset) is reachable through
- * @ref axl_json_parse_flags. The writer builds JSON into an
+ * axl_json_parse_flags. The writer builds JSON into an
  * auto-growing AxlString with orthogonal container/key/atom calls,
  * optional 2-space-indent pretty-print mode, and (opt-in) JSON5
  * trailing-commas + comment emission. A separate colored
@@ -94,14 +94,14 @@ axl_json_parse(
 /**
  * @brief Parse a JSON or JSON5 string.
  *
- * Identical to @ref axl_json_parse but accepts a flags bitmask. Pass
+ * Identical to axl_json_parse but accepts a flags bitmask. Pass
  * @c AXL_JSON_PARSER_JSON5 to accept the JSON5 grammar superset:
  * line comments (//) and block comments, trailing commas, single-quoted strings,
  * unquoted (identifier-name) object keys, hex number literals, and
  * the JSON5 string-escape set (`\x##`, `\v`, `\0`, line continuations).
  *
  * The resulting reader is consumed by the same accessors
- * (@ref axl_json_get_string etc.) as a strict-JSON reader — JSON5
+ * (axl_json_get_string etc.) as a strict-JSON reader — JSON5
  * features are normalized at parse time.
  *
  * @return true on success, false on parse error or allocation failure.
@@ -129,11 +129,11 @@ axl_json_free(
 /**
  * @brief One-shot: read a file, parse it as JSON.
  *
- * Convenience wrapper around @ref axl_file_get_contents +
- * @ref axl_json_parse. The reader references the loaded buffer —
+ * Convenience wrapper around axl_file_get_contents +
+ * axl_json_parse. The reader references the loaded buffer —
  * the caller must keep @c *out_buf alive for the lifetime of
- * @p r and free it (via @ref axl_free) **after** calling
- * @ref axl_json_free on @p r.
+ * @p r and free it (via axl_free) **after** calling
+ * axl_json_free on @p r.
  *
  * Typical use:
  *
@@ -166,8 +166,8 @@ axl_json_load_file(
 /**
  * @brief One-shot: read a file, parse it as JSON or JSON5.
  *
- * Identical to @ref axl_json_load_file but accepts a flags bitmask
- * forwarded to @ref axl_json_parse_flags. Use this for sidecar
+ * Identical to axl_json_load_file but accepts a flags bitmask
+ * forwarded to axl_json_parse_flags. Use this for sidecar
  * config files that want comments, trailing commas, etc.
  *
  * @return true on success, false otherwise.

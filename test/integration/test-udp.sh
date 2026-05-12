@@ -82,8 +82,9 @@ check() {
     fi
 }
 
-check "udp-socket-opened"   "UDP-ECHO: sending"
-check "udp-echo-response"   "PASS: udp-echo-response"
+check "udp-socket-opened"    "UDP-ECHO: sending"
+check "udp-get-local-addr"   "PASS: udp-get-local-addr"
+check "udp-echo-response"    "PASS: udp-echo-response"
 check "udp-response-content" "ECHO:hello from UEFI"
 
 echo ""

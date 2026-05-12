@@ -10,10 +10,10 @@
  * header exposes read-only views of it that don't get clobbered when
  * subcommand dispatchers shift argv inside the program.
  *
- * Tools that use @ref axl_subcommand_dispatch see `argv[0]` rewritten
+ * Tools that use axl_subcommand_dispatch see `argv[0]` rewritten
  * to the verb name inside each handler. To find the original program
  * path (e.g. for loading a sidecar file from the binary's directory),
- * call @ref axl_app_argv0 — it returns the value the runtime captured
+ * call axl_app_argv0 — it returns the value the runtime captured
  * at startup, regardless of subsequent argv mutation.
  */
 
@@ -30,7 +30,7 @@ extern "C" {
  *
  * The returned pointer is owned by the runtime — never freed by the
  * caller, valid until the runtime's cleanup phase (which runs after
- * @c main returns). Stable across @ref axl_subcommand_dispatch and
+ * @c main returns). Stable across axl_subcommand_dispatch and
  * similar argv-shifting helpers.
  *
  * Don't call this from atexit handlers registered before runtime
@@ -49,7 +49,7 @@ axl_app_argv0(void);
  * @brief Return the canonical filesystem path of the running .efi
  *     image, decoded from EFI_LOADED_IMAGE_PROTOCOL.FilePath.
  *
- * Orthogonal to @ref axl_app_argv0. argv[0] reflects whatever the
+ * Orthogonal to axl_app_argv0. argv[0] reflects whatever the
  * shell typed — often a basename when the user typed `app.efi`
  * rather than `fs0:\app.efi`, sometimes a full path, sometimes (in
  * the `startup.nsh` invocation case) just the name even when the
@@ -59,7 +59,7 @@ axl_app_argv0(void);
  *
  * The right anchor for sidecar discovery (`pci-ids.json5`,
  * the `classes[]` section of `pci-ids.json5`, `jedec.json5`, etc.) — see
- * @ref axl_resolve_data_file, which prefers this over argv[0] when
+ * axl_resolve_data_file, which prefers this over argv[0] when
  * available.
  *
  * @return UTF-8 path string owned by the runtime, or NULL if the

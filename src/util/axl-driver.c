@@ -10,6 +10,7 @@
 
 #include "../backend/axl-backend.h"
 #include <axl/axl-driver.h>
+#include <axl/axl-efi-status.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-path.h>
@@ -19,6 +20,31 @@
 #include <axl/axl-sys.h>
 
 AXL_LOG_DOMAIN("driver");
+
+/* AxlEfiStatus is declared in <axl/axl-efi-status.h> as a 64-bit
+   alias for EFI_STATUS so consumers writing UEFI-spec-protocol
+   methods can return spec-mandated values without pulling
+   <uefi/axl-uefi.h>. The contract is that the two are
+   value-for-value swappable; this is the only TU that includes
+   both, so it's the natural home for the build-time check. */
+_Static_assert(sizeof(AxlEfiStatus) == sizeof(EFI_STATUS),
+               "AxlEfiStatus must be ABI-compatible with EFI_STATUS");
+_Static_assert((AxlEfiStatus)AXL_EFI_SUCCESS == (AxlEfiStatus)EFI_SUCCESS,
+               "AXL_EFI_SUCCESS must equal EFI_SUCCESS");
+_Static_assert((AxlEfiStatus)AXL_EFI_NOT_FOUND == (AxlEfiStatus)EFI_NOT_FOUND,
+               "AXL_EFI_NOT_FOUND must equal EFI_NOT_FOUND");
+_Static_assert((AxlEfiStatus)AXL_EFI_INVALID_PARAMETER == (AxlEfiStatus)EFI_INVALID_PARAMETER,
+               "AXL_EFI_INVALID_PARAMETER must equal EFI_INVALID_PARAMETER");
+_Static_assert((AxlEfiStatus)AXL_EFI_UNSUPPORTED == (AxlEfiStatus)EFI_UNSUPPORTED,
+               "AXL_EFI_UNSUPPORTED must equal EFI_UNSUPPORTED");
+_Static_assert((AxlEfiStatus)AXL_EFI_OUT_OF_RESOURCES == (AxlEfiStatus)EFI_OUT_OF_RESOURCES,
+               "AXL_EFI_OUT_OF_RESOURCES must equal EFI_OUT_OF_RESOURCES");
+_Static_assert((AxlEfiStatus)AXL_EFI_BUFFER_TOO_SMALL == (AxlEfiStatus)EFI_BUFFER_TOO_SMALL,
+               "AXL_EFI_BUFFER_TOO_SMALL must equal EFI_BUFFER_TOO_SMALL");
+_Static_assert((AxlEfiStatus)AXL_EFI_DEVICE_ERROR == (AxlEfiStatus)EFI_DEVICE_ERROR,
+               "AXL_EFI_DEVICE_ERROR must equal EFI_DEVICE_ERROR");
+_Static_assert((AxlEfiStatus)AXL_EFI_END_OF_FILE == (AxlEfiStatus)EFI_END_OF_FILE,
+               "AXL_EFI_END_OF_FILE must equal EFI_END_OF_FILE");
 
 // ---------------------------------------------------------------------------
 // Volume-name buffer (matches DRIVER_MAX_VOLUMES so axl_volume_enumerate
@@ -297,6 +323,63 @@ axl_driver_disconnect(
     return AXL_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Load-options ownership table
+//
+// axl_driver_set_load_options copies the caller's buffer with axl_malloc
+// and hands the pointer to the firmware via LoadedImage->LoadOptions; the
+// firmware retains the pointer for the lifetime of the loaded image and
+// has no callback to free it. Without this side table, axl_driver_unload
+// would leak the copy on every load+set+unload cycle (142 bytes per
+// driver instance in the original axl-webfs reproducer).
+//
+// Mirrors the NotifyTimerEntry pattern in axl-backend-native-event.c:
+// fixed-capacity table indexed by handle, allocated/freed only in this
+// module's set/unload pair. 16 slots — sequential driver loads/unloads
+// are the realistic case; a consumer holding 16+ driver instances open
+// concurrently with load options is unusual for an SDK user. Out of
+// slots returns AXL_ERR rather than installing-and-leaking — the
+// log-and-leak alternative would silently re-introduce the bug this
+// table exists to prevent.
+// ---------------------------------------------------------------------------
+
+#define LOAD_OPTIONS_TABLE_SIZE  16
+
+typedef struct {
+    AxlDriverHandle  handle;  /* NULL = slot free; non-NULL = tracked */
+    void            *opts;
+} LoadOptionsEntry;
+
+static LoadOptionsEntry mLoadOptionsTable[LOAD_OPTIONS_TABLE_SIZE];
+
+/* Find the table slot for `handle`. Returns LOAD_OPTIONS_TABLE_SIZE if
+   not found. handle == NULL is rejected at the public-API boundary, so
+   never reaches here. */
+static size_t
+load_options_find(AxlDriverHandle handle)
+{
+    for (size_t i = 0; i < LOAD_OPTIONS_TABLE_SIZE; i++) {
+        if (mLoadOptionsTable[i].handle == handle) {
+            return i;
+        }
+    }
+    return LOAD_OPTIONS_TABLE_SIZE;
+}
+
+/* Free + clear the slot for `handle`. No-op if the handle was never
+   tracked (caller never set load options). */
+static void
+load_options_release(AxlDriverHandle handle)
+{
+    size_t slot = load_options_find(handle);
+    if (slot == LOAD_OPTIONS_TABLE_SIZE) {
+        return;
+    }
+    axl_free(mLoadOptionsTable[slot].opts);
+    mLoadOptionsTable[slot].handle = NULL;
+    mLoadOptionsTable[slot].opts   = NULL;
+}
+
 int
 axl_driver_unload(
     AxlDriverHandle handle
@@ -308,8 +391,37 @@ axl_driver_unload(
         return AXL_ERR;
     }
 
+    /* Free any tracked load-options copy BEFORE UnloadImage runs the
+       driver's Unload handler — once the image is unloaded the
+       firmware-side LoadedImage pointer is gone, but the heap copy is
+       ours regardless of UnloadImage's outcome. Releasing first means
+       a UnloadImage failure still doesn't leak the copy. */
+    load_options_release(handle);
+
     status = axl_bs()->UnloadImage((EFI_HANDLE)handle);
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    if (EFI_ERROR(status)) {
+        /* Surface the raw status so callers can triage. EFI_ACCESS_DENIED
+           is the most-misdiagnosed shape — the firmware's post-callback
+           refcount check refuses because the image still holds open
+           protocol references — so we add a hint at that case
+           specifically. Other failures (EFI_INVALID_PARAMETER, _UNSUPPORTED,
+           rollback-path errors) get a generic message. */
+        if (status == EFI_ACCESS_DENIED) {
+            axl_warning("axl_driver_unload: UnloadImage(handle=%p) "
+                        "returned EFI_ACCESS_DENIED (0x%llx) — image "
+                        "still holds open protocol references; if your "
+                        "service opens UEFI protocols in setup, ensure "
+                        "teardown closes every one (axl_http_server_free, "
+                        "axl_tcp_close, etc.) before returning",
+                        (void *)handle, (unsigned long long)status);
+        } else {
+            axl_warning("axl_driver_unload: UnloadImage(handle=%p) "
+                        "returned 0x%llx",
+                        (void *)handle, (unsigned long long)status);
+        }
+        return AXL_ERR;
+    }
+    return AXL_OK;
 }
 
 int
@@ -337,8 +449,10 @@ axl_driver_set_load_options(
         return AXL_ERR;
     }
 
-    /* Allow NULL data to clear load options */
+    /* Allow NULL data to clear load options. Drop any previous tracked
+       copy so the count stays accurate. */
     if (data == NULL || size == 0) {
+        load_options_release(handle);
         img->LoadOptions = NULL;
         img->LoadOptionsSize = 0;
         return AXL_OK;
@@ -350,6 +464,33 @@ axl_driver_set_load_options(
         return AXL_ERR;
     }
     axl_memcpy(copy, data, size);
+
+    /* Track for unload-time release. If the handle already has a tracked
+       copy (re-set), free the old one first and reuse the slot.
+       Otherwise reserve a fresh slot. Out-of-slots is fatal: the only
+       alternative is to install the copy without tracking it, which
+       silently re-introduces the very leak this table exists to
+       prevent. */
+    size_t slot = load_options_find(handle);
+    if (slot < LOAD_OPTIONS_TABLE_SIZE) {
+        axl_free(mLoadOptionsTable[slot].opts);
+        mLoadOptionsTable[slot].opts = copy;
+    } else {
+        for (slot = 0; slot < LOAD_OPTIONS_TABLE_SIZE; slot++) {
+            if (mLoadOptionsTable[slot].handle == NULL) {
+                mLoadOptionsTable[slot].handle = handle;
+                mLoadOptionsTable[slot].opts   = copy;
+                break;
+            }
+        }
+        if (slot == LOAD_OPTIONS_TABLE_SIZE) {
+            axl_error("driver set_load_options: tracking table full "
+                      "(%d slots) — increase LOAD_OPTIONS_TABLE_SIZE",
+                      LOAD_OPTIONS_TABLE_SIZE);
+            axl_free(copy);
+            return AXL_ERR;
+        }
+    }
 
     img->LoadOptions = copy;
     img->LoadOptionsSize = (UINT32)(size > 0xFFFFFFFF ? 0xFFFFFFFF : size);
@@ -381,6 +522,37 @@ axl_driver_get_load_options(void)
 
     /* LoadOptions is typically UCS-2 — convert to UTF-8 */
     return axl_ucs2_to_utf8((const unsigned short *)img->LoadOptions);
+}
+
+int
+axl_driver_get_load_options_raw(
+    const void **out_buf,
+    size_t      *out_size
+    )
+{
+    EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
+    EFI_STATUS status;
+
+    if (out_buf == NULL || out_size == NULL || gImageHandle == NULL) {
+        return AXL_ERR;
+    }
+
+    *out_buf  = NULL;
+    *out_size = 0;
+
+    status = axl_bs()->HandleProtocol(
+        gImageHandle,
+        &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+        (void **)&img);
+
+    if (EFI_ERROR(status) || img == NULL ||
+        img->LoadOptions == NULL || img->LoadOptionsSize == 0) {
+        return AXL_ERR;
+    }
+
+    *out_buf  = img->LoadOptions;
+    *out_size = (size_t)img->LoadOptionsSize;
+    return AXL_OK;
 }
 
 char *
@@ -464,8 +636,8 @@ axl_driver_set_unload(
 
 void
 axl_driver_init(
-    void *image_handle,
-    void *system_table
+    AxlHandle        image_handle,
+    AxlSystemTable  *system_table
     )
 {
     extern EFI_SYSTEM_TABLE     *gST;
@@ -668,16 +840,34 @@ axl_driver_locate(
 }
 
 /* Try to start a loaded driver and confirm it registered protocol_guid.
- * Caller owns @p drv; on failure (return AXL_ERR) the driver is unloaded.
- * On success the driver stays loaded. EFI_ALREADY_STARTED is treated
- * as success — some drivers DXE-Core-dispatched re-register cleanly. */
+ * Caller owns @p drv; on failure (return AXL_ERR) the driver is unloaded
+ * (which also frees any installed load_options copy via the side-table
+ * path in axl_driver_unload). On success the driver stays loaded.
+ * EFI_ALREADY_STARTED is treated as success — some drivers
+ * DXE-Core-dispatched re-register cleanly. */
 static int
 driver_start_and_verify(
     AxlDriverHandle drv,
     const AxlGuid  *protocol_guid,
-    const char     *source_label  ///< for diagnostics, e.g. path or "<embedded>"
+    const char     *source_label,  ///< for diagnostics, e.g. path or "<embedded>"
+    const void     *load_options,
+    size_t          load_options_size
     )
 {
+    /* Install LoadOptions BEFORE StartImage so DriverEntry sees them
+       in EFI_LOADED_IMAGE_PROTOCOL.LoadOptions / .LoadOptionsSize.
+       Skip silently when the caller didn't pass any (every existing
+       caller pre-AxlService passes NULL/0 — this is an additive arg). */
+    if (load_options != NULL && load_options_size > 0) {
+        if (axl_driver_set_load_options(drv, load_options,
+                                        load_options_size) != AXL_OK) {
+            axl_warning("driver ensure: set_load_options failed for '%s'",
+                        source_label);
+            axl_driver_unload(drv);
+            return AXL_ERR;
+        }
+    }
+
     size_t exit_data_size = 0;
     EFI_STATUS st = axl_bs()->StartImage(
         (EFI_HANDLE)drv, &exit_data_size, NULL);
@@ -708,7 +898,9 @@ static int
 driver_try_candidates(
     const AxlGuid *protocol_guid,
     char         **candidates,
-    size_t         n_cand
+    size_t         n_cand,
+    const void    *load_options,
+    size_t         load_options_size
     )
 {
     for (size_t i = 0; i < n_cand; i++) {
@@ -724,23 +916,24 @@ driver_try_candidates(
             continue;
         }
 
-        if (driver_start_and_verify(drv, protocol_guid, candidates[i]) == 0) {
+        if (driver_start_and_verify(drv, protocol_guid, candidates[i],
+                                    load_options, load_options_size) == 0) {
             return AXL_OK;
         }
     }
     return AXL_ERR;
 }
 
-/* LoadImage from a memory buffer (no DevicePath, no FilePath). Used
- * by the embedded-driver fallback so tools work on firmware that
- * ships neither the protocol nor a user-staged copy on disk. */
-static int
-driver_load_embedded(
-    const AxlGuid       *protocol_guid,
+int
+axl_driver_load_buffer(
     const unsigned char *buf,
-    size_t               len
+    size_t               len,
+    AxlDriverHandle     *out_handle
     )
 {
+    if (buf == NULL || len == 0 || out_handle == NULL) {
+        return AXL_ERR;
+    }
 
     EFI_HANDLE  drv_handle = NULL;
     EFI_STATUS  st = axl_bs()->LoadImage(
@@ -752,13 +945,36 @@ driver_load_embedded(
         &drv_handle);
 
     if (EFI_ERROR(st) || drv_handle == NULL) {
-        axl_warning("driver ensure: LoadImage(embedded, %zu bytes) failed: 0x%llx",
+        axl_warning("driver load_buffer: LoadImage(%zu bytes) failed: 0x%llx",
                     len, (unsigned long long)st);
+        *out_handle = NULL;
         return AXL_ERR;
     }
 
-    return driver_start_and_verify((AxlDriverHandle)drv_handle,
-                                   protocol_guid, "<embedded>");
+    *out_handle = (AxlDriverHandle)drv_handle;
+    return AXL_OK;
+}
+
+/* LoadImage from a memory buffer + start + verify the protocol got
+ * registered. Used by the embedded-driver fallback so tools work on
+ * firmware that ships neither the protocol nor a user-staged copy on
+ * disk. */
+static int
+driver_load_embedded(
+    const AxlGuid       *protocol_guid,
+    const unsigned char *buf,
+    size_t               len,
+    const void          *load_options,
+    size_t               load_options_size
+    )
+{
+    AxlDriverHandle drv = NULL;
+    if (axl_driver_load_buffer(buf, len, &drv) != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    return driver_start_and_verify(drv, protocol_guid, "<embedded>",
+                                   load_options, load_options_size);
 }
 
 int
@@ -767,7 +983,9 @@ axl_driver_ensure_with_embedded(
     const char          *driver_name,
     const unsigned char *embedded_buf,
     size_t               embedded_len,
-    const char          *override_name
+    const char          *override_name,
+    const void          *load_options,
+    size_t               load_options_size
     )
 {
     if (protocol_guid == NULL || driver_name == NULL) {
@@ -777,7 +995,9 @@ axl_driver_ensure_with_embedded(
     /* Step 1: short-circuit if the protocol is already registered.
      * On most OEM firmware the corresponding driver is in the
      * firmware volume and dispatched at DXE init, so this is the
-     * common path — no disk search, no embedded fallback. */
+     * common path — no disk search, no embedded fallback. The
+     * already-published instance isn't ours to re-configure, so
+     * load_options is silently ignored on this path. */
     if (driver_protocol_registered(protocol_guid) == 0) {
         axl_debug("driver ensure: protocol already registered, skipping search");
         return AXL_OK;
@@ -799,7 +1019,8 @@ axl_driver_ensure_with_embedded(
         axl_debug("  [%zu] %s", i, candidates[i]);
     }
 
-    int rc = driver_try_candidates(protocol_guid, candidates, n_cand);
+    int rc = driver_try_candidates(protocol_guid, candidates, n_cand,
+                                   load_options, load_options_size);
 
     for (size_t i = 0; i < n_cand; i++) {
         axl_free(candidates[i]);
@@ -816,7 +1037,8 @@ axl_driver_ensure_with_embedded(
     if (override_name == NULL && embedded_buf != NULL && embedded_len > 0) {
         axl_debug("driver ensure: disk search exhausted, "
                   "trying embedded fallback (%zu bytes)", embedded_len);
-        if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len) == 0) {
+        if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len,
+                                 load_options, load_options_size) == 0) {
             return AXL_OK;
         }
     }
@@ -837,7 +1059,8 @@ axl_driver_ensure(
     return axl_driver_ensure_with_embedded(
         protocol_guid, driver_name,
         NULL, 0,        /* no embedded blob */
-        NULL);          /* no override */
+        NULL,           /* no override */
+        NULL, 0);       /* no LoadOptions */
 }
 
 // ---------------------------------------------------------------------------

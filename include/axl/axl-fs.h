@@ -12,7 +12,7 @@
  *
  * All paths are UTF-8; backend converts to UCS-2 internally.
  * High-level convenience wrappers (`axl_file_get_contents`) layer on
- * top of @ref axl_fopen — they're path-based shortcuts, not stream
+ * top of axl_fopen — they're path-based shortcuts, not stream
  * primitives.
  */
 
@@ -89,6 +89,7 @@ typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx);
 typedef struct {
     uint64_t  size;         ///< file size in bytes
     uint64_t  alloc_size;   ///< physical allocation size on disk
+    uint64_t  mtime_unix;   ///< modification time, Unix epoch seconds (0 = unknown)
     bool      is_dir;       ///< true if directory
     bool      read_only;    ///< true if read-only attribute set
 } AxlFileInfo;
@@ -119,14 +120,57 @@ axl_file_delete(
 );
 
 /**
- * @brief Rename or move a file.
+ * @brief Rename a file within its current directory.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * @p new_path may be a basename only ("bar.txt") or a full path
+ * with the same directory prefix as @p old_path ("fs0:\\dir\\bar.txt"
+ * given "fs0:\\dir\\foo.txt"). Cross-directory renames are refused
+ * with AXL_ERR — most UEFI FAT drivers can't move a file across
+ * directories via SetFileInfo. Use axl_file_move for cross-directory
+ * cases (it falls back to copy + delete).
+ *
+ * @return AXL_OK on success, AXL_ERR on cross-directory request,
+ *     missing source, or backend failure.
  */
 int
 axl_file_rename(
     const char *old_path,  ///< current path (UTF-8)
-    const char *new_path   ///< new path (UTF-8)
+    const char *new_path   ///< new path or basename (UTF-8); same dir as @p old_path
+);
+
+/**
+ * @brief Move a file. Same-directory case is an atomic rename;
+ *     cross-directory falls back to copy + delete.
+ *
+ * Tries axl_file_rename first (atomic on FAT for same-directory).
+ * On refusal — typically because @p new_path's directory differs
+ * from @p old_path's — falls back to chunked stream copy followed
+ * by source delete.
+ *
+ * Overwrite semantics: an existing file at @p new_path is replaced
+ * (matches POSIX `rename(2)`). The implementation removes
+ * @p new_path eagerly before attempting the rename / copy — this
+ * is NOT atomic. If the subsequent move then fails, the prior
+ * destination is gone; the source remains for retry. Callers that
+ * want "fail-if-exists" must probe with axl_file_info first.
+ *
+ * Failure modes (the fallback is NOT atomic — no rollback):
+ *
+ *   - Copy fails mid-stream → partial destination file exists;
+ *     source is untouched. Caller can retry or clean up @p new_path.
+ *   - Copy succeeds but delete fails → both files exist. Caller
+ *     can retry the delete.
+ *
+ * Callers needing atomicity across directories must orchestrate
+ * temp-file + rename themselves at a higher layer.
+ *
+ * @return AXL_OK on success; AXL_ERR if either source missing,
+ *     destination unwritable, copy fails, or delete fails.
+ */
+int
+axl_file_move(
+    const char *old_path,  ///< current path (UTF-8)
+    const char *new_path   ///< new path (UTF-8); may be in a different directory
 );
 
 /**
@@ -159,6 +203,7 @@ typedef struct AxlDir AxlDir;
 typedef struct {
     char      name[256];  ///< filename (UTF-8, not full path)
     uint64_t  size;       ///< file size in bytes (0 for directories)
+    uint64_t  mtime_unix; ///< modification time, Unix epoch seconds (0 = unknown)
     bool      is_dir;     ///< true if this entry is a directory
 } AxlDirEntry;
 
@@ -192,7 +237,7 @@ axl_dir_close(
 );
 
 /**
- * @brief Per-entry callback for @ref axl_dir_walk.
+ * @brief Per-entry callback for axl_dir_walk.
  *
  * @param full_path  full path to the entry (root + separator + name)
  * @param entry      the AxlDirEntry, including name, size, is_dir
@@ -275,14 +320,14 @@ axl_volume_get_label(
 /**
  * @brief Get the filesystem volume label for a handle.
  *
- * Use with handles from axl_service_enumerate("simple-fs", ...).
+ * Use with handles from axl_protocol_enumerate("simple-fs", ...).
  * Returns a UTF-8 copy of the label. Caller frees with axl_free().
  *
  * @return label string, or NULL on error.
  */
 char *
 axl_volume_get_label_by_handle(
-    void *handle  ///< filesystem handle from axl_service_enumerate
+    void *handle  ///< filesystem handle from axl_protocol_enumerate
 );
 
 /// Volume descriptor for axl_volume_enumerate.

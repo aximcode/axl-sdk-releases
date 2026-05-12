@@ -6,12 +6,13 @@
 **/
 
 #include "../backend/axl-backend.h"
-#include "axl-service-internal.h"
+#include "axl-protocol-internal.h"
 #include <axl/axl-sys.h>
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-fs.h>
 #include <axl/axl-log.h>
+#include <axl/axl-digest.h>
 
 AXL_LOG_DOMAIN("sys");
 
@@ -92,7 +93,7 @@ axl_map_refresh(void)
 // ---------------------------------------------------------------------------
 
 int
-axl_handle_get_service(
+axl_handle_get_protocol(
     void        *handle,
     const char  *name,
     void       **interface
@@ -112,8 +113,8 @@ axl_handle_get_service(
        NULL, so a leftover stale pointer would be a real footgun. */
     *interface = NULL;
 
-    /* Reuse the service name→GUID lookup from axl-service.c. */
-    guid = axl_service_lookup_guid(name, &fallback);
+    /* Reuse the protocol name→GUID lookup from axl-protocol.c. */
+    guid = axl_protocol_lookup_guid(name, &fallback);
     if (guid == NULL) {
         return AXL_ERR;
     }
@@ -383,4 +384,51 @@ axl_device_path_to_text(const void *device_path)
     char *utf8 = axl_ucs2_to_utf8(text);
     axl_bs()->FreePool(text);
     return utf8;
+}
+
+// ---------------------------------------------------------------------------
+// GUID derivation — name-based UUIDv5
+// ---------------------------------------------------------------------------
+
+int
+axl_guid_v5(
+    const AxlGuid *namespace_uuid,
+    const char    *name,
+    AxlGuid       *out
+    )
+{
+    if (namespace_uuid == NULL || name == NULL || out == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Dogfood: AxlChecksum is the public SHA-1 entry point. The
+       incremental form lets us hash namespace + name without
+       allocating a temp concat buffer. */
+    AxlChecksum *cs = axl_checksum_new(AXL_CHECKSUM_SHA1);
+    if (cs == NULL) {
+        return AXL_ERR;
+    }
+    axl_checksum_update(cs, namespace_uuid, sizeof(AxlGuid));
+    axl_checksum_update(cs, name, axl_strlen(name));
+
+    /* SHA-1 digest is 20 bytes; we keep the first 16 and overwrite
+       the version + variant bits per RFC 4122 §4.3. axl_checksum_get_digest
+       always sets *len to 20 for SHA-1 — no truncation/short-write
+       case to defend against. */
+    uint8_t digest[20];
+    size_t  digest_len = sizeof(digest);
+    axl_checksum_get_digest(cs, digest, &digest_len);
+    axl_checksum_free(cs);
+
+    /* RFC 4122 §4.3 sets the version (high nibble of byte 6) to 5
+       and the variant (high two bits of byte 8) to 10b. We operate
+       on the raw 16-byte image — the result is treated as opaque
+       AxlGuid storage downstream, never read field-by-field as
+       host-order ints, so endian is irrelevant for our derivation
+       contract. */
+    digest[6] = (uint8_t)((digest[6] & 0x0F) | 0x50);  /* version 5 */
+    digest[8] = (uint8_t)((digest[8] & 0x3F) | 0x80);  /* variant 10b */
+
+    axl_memcpy(out, digest, sizeof(AxlGuid));
+    return AXL_OK;
 }

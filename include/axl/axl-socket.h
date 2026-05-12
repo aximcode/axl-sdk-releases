@@ -5,7 +5,7 @@
  * axl-socket.h:
  *
  * Unified socket abstraction. AxlSocket wraps AxlTcp (stream) and
- * AxlUdpSocket (datagram) behind a single API. Blocking and async
+ * AxlUdp (datagram) behind a single API. Blocking and async
  * (event-loop integrated) operations are both supported.
  *
  * @code
@@ -50,7 +50,7 @@ typedef enum {
  *
  * @p sock is the socket for the completed operation (new socket for
  * accept, or the original socket for send/recv/connect).
- * @p status is an @ref AxlStatus value: AXL_OK on success, AXL_ERR
+ * @p status is an AxlStatus value: AXL_OK on success, AXL_ERR
  * on UEFI error, AXL_CANCELLED if the cancellable on the *_async
  * call was signalled before completion. On error, @p sock may be
  * NULL (accept) or half-initialized (connect). Always check @p
@@ -127,7 +127,7 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlSocket, axl_socket_free)
 //
 // Sync wrappers (axl_socket_connect, axl_socket_accept,
 // axl_socket_send, axl_socket_receive) delegate to the underlying
-// AxlTcp/AxlUdpSocket blocking APIs, which each create their OWN
+// AxlTcp/AxlUdp blocking APIs, which each create their OWN
 // temporary AxlLoop per call and run it to completion. They do NOT
 // participate in the caller's event loop. If you are already inside
 // a loop callback, calling a sync wrapper nests a second loop and

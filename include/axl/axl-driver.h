@@ -47,6 +47,37 @@ axl_driver_load(
 );
 
 /**
+ * @brief Load a driver image from a memory buffer.
+ *
+ * Buffer-source counterpart to axl_driver_load. Calls
+ * `gBS->LoadImage` with `SourceBuffer`/`SourceSize` and no
+ * `DevicePath`, returning the resulting handle for use with
+ * axl_driver_set_load_options, axl_driver_start, and
+ * axl_driver_unload.
+ *
+ * Used by tools that `.incbin` a companion driver into the app to
+ * ship as a single binary. For the higher-level AxlService case use
+ * axl_service_start_embedded — this primitive is for
+ * non-AxlService drivers that still need per-call LoadOptions or
+ * explicit handle tracking.
+ *
+ * The driver is loaded but NOT started. The image's
+ * `LoadedImage->FilePath` is left NULL; drivers that read FilePath
+ * at startup (some Driver-Binding-style drivers do, notably iPXE)
+ * will not work via this entry point — load them by path instead.
+ *
+ * @return AXL_OK on success (`*out_handle` is set); AXL_ERR on
+ *     argument validation failure or LoadImage failure
+ *     (`*out_handle` is set to NULL).
+ */
+int
+axl_driver_load_buffer(
+    const unsigned char *buf,         ///< driver image bytes (must be non-NULL)
+    size_t               len,         ///< length in bytes (must be > 0)
+    AxlDriverHandle     *out_handle   ///< [out] driver handle for set_load_options/start/unload
+);
+
+/**
  * @brief Start a loaded driver image.
  *
  * Calls the driver's entry point. The driver registers its
@@ -87,7 +118,12 @@ axl_driver_disconnect(
 /**
  * @brief Unload a driver image from memory.
  *
- * The driver must be disconnected first.
+ * The driver must be disconnected first. Also frees any load-options
+ * copy installed via axl_driver_set_load_options() on this handle —
+ * the firmware retains the LoadOptions pointer for the loaded-image
+ * lifetime, so the AXL-side copy must be released here. Release runs
+ * BEFORE gBS->UnloadImage so a UnloadImage failure still doesn't leak
+ * the copy.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
@@ -102,10 +138,20 @@ axl_driver_unload(
  * Provides configuration data (e.g., a URL) that the driver reads
  * from EFI_LOADED_IMAGE_PROTOCOL.LoadOptions during startup.
  * The data is copied internally — caller's buffer can be freed after.
- * Pass NULL data to clear load options.
- * Call between axl_driver_load and axl_driver_start.
+ * The copy is owned by AXL and freed by axl_driver_unload() (or by
+ * a subsequent set on the same handle, which replaces the previous
+ * copy). Pass NULL data to clear load options and free any previous
+ * copy. Call between axl_driver_load and axl_driver_start.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * AXL tracks at most 16 outstanding driver handles with load options
+ * — a 17th call returns AXL_ERR and frees the would-be copy without
+ * touching firmware state. Sequential load/unload is the realistic
+ * case; if you legitimately need more concurrent driver instances
+ * with load options, bump LOAD_OPTIONS_TABLE_SIZE in
+ * src/util/axl-driver.c.
+ *
+ * @return AXL_OK on success, AXL_ERR on bad arguments, alloc failure,
+ *     HandleProtocol failure, or tracking-table-full.
  */
 int
 axl_driver_set_load_options(
@@ -121,19 +167,35 @@ axl_driver_set_load_options(
  * DriverEntry to set up firmware table pointers (gST/gBS/gRT)
  * and I/O streams so axl_printf, axl_malloc, etc. work.
  *
+ * Most drivers don't need to call this directly — the
+ * `AXL_DRIVER(entry, unload)` macro in `<axl.h>` emits the
+ * DriverEntry stub and wires `axl_driver_init` automatically.
+ * Use this manual path only when your driver publishes
+ * spec-defined UEFI protocols (`EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`,
+ * `EFI_BLOCK_IO_PROTOCOL`, etc.) and you've opted into
+ * `<uefi/axl-uefi.h>` for the spec types — in that case cast
+ * the firmware-supplied `EFI_HANDLE` / `EFI_SYSTEM_TABLE *` to
+ * the AXL parameter types at the call site (the underlying
+ * pointers are bit-identical; the cast is a typing-only
+ * formality).
+ *
  * @code
- * EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
- *                                EFI_SYSTEM_TABLE *SystemTable) {
- *     axl_driver_init(ImageHandle, SystemTable);
- *     axl_printf("Driver loaded\n");
+ * // AXL-only driver:
+ * static int my_main(AxlHandle image, AxlSystemTable *st);
+ * static int my_unload(AxlHandle image);
+ * AXL_DRIVER(my_main, my_unload)
+ *
+ * // Spec-protocol publisher (tier 2):
+ * EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE h, EFI_SYSTEM_TABLE *st) {
+ *     axl_driver_init((AxlHandle)h, (AxlSystemTable *)st);
  *     ...
  * }
  * @endcode
  */
 void
 axl_driver_init(
-    void *image_handle,   ///< EFI_HANDLE from DriverEntry
-    void *system_table    ///< EFI_SYSTEM_TABLE* from DriverEntry
+    AxlHandle        image_handle,  ///< image handle from DriverEntry
+    AxlSystemTable  *system_table   ///< system table from DriverEntry
 );
 
 /**
@@ -143,6 +205,24 @@ axl_driver_init(
  * when the driver is unloaded. The callback has EFIAPI calling
  * convention — declare it as:
  *   EFI_STATUS EFIAPI MyUnload(EFI_HANDLE ImageHandle)
+ *
+ * Cleanup contract — what the firmware does NOT do for you:
+ *
+ *   - Services registered via `axl_protocol_register` /
+ *     `axl_protocol_register_multiple` are NOT auto-released. The
+ *     AXL protocol registry never owned the install; it issued a
+ *     `gBS->InstallProtocolInterface` and forgot. The unload
+ *     callback must walk every protocol the driver published and
+ *     call `axl_protocol_unregister` for each. Forgetting leaves
+ *     dangling handle entries that point at freed driver memory —
+ *     subsequent `LocateProtocol` calls hand consumers a stale
+ *     vtable and the next dispatch faults.
+ *   - Heap allocations made via `axl_malloc` are not auto-freed.
+ *     `axl_mem_dump_leaks` (DEBUG builds) prints what was missed.
+ *   - Events / timers created via the AxlLoop or backend layer
+ *     stay live; close them with the matching `_close` calls.
+ *
+ * `sdk/examples/driver.c` shows the canonical shape.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
@@ -162,6 +242,28 @@ axl_driver_set_unload(
  */
 char *
 axl_driver_get_load_options(void);
+
+/**
+ * @brief Get the LoadOptions buffer as raw bytes (no encoding conversion).
+ *
+ * UEFI shell launches pass `LoadOptions` as a UCS-2 string —
+ * axl_driver_get_load_options is the right entry point for that.
+ * Programmatic loaders (axl_driver_set_load_options) pass arbitrary
+ * bytes; this entry point hands them back unchanged.
+ *
+ * Used by AxlService to read its UTF-8 axl_config_to_string payload
+ * without misinterpreting it as UCS-2.
+ *
+ * @return AXL_OK on success (out params populated with a borrowed
+ *     pointer into the firmware's LoadedImage struct — do NOT free),
+ *     AXL_ERR if the image has no LoadOptions or HandleProtocol
+ *     failed.
+ */
+int
+axl_driver_get_load_options_raw(
+    const void **out_buf,    ///< [out] borrowed pointer into LoadedImage
+    size_t      *out_size    ///< [out] LoadOptionsSize in bytes
+);
 
 /**
  * @brief Get the filesystem path the current image was loaded from.
@@ -186,7 +288,7 @@ axl_driver_get_image_path(void);
  */
 int
 axl_driver_connect_handle(
-    void *handle  ///< handle to connect (from axl_service_register, etc.)
+    void *handle  ///< handle to connect (from axl_protocol_register, etc.)
 );
 
 /**
@@ -232,11 +334,11 @@ axl_driver_locate(
  * returns 0 immediately. Otherwise searches for @p driver_name and
  * loads + starts the first match found, in this order:
  *
- *   1. drivers/<arch>/<driver_name> on the volume the running image
+ *   1. `drivers/<arch>/<driver_name>` on the volume the running image
  *      booted from
- *   2. <image_dir>/<driver_name> in the running image's own directory
- *   3. drivers/<driver_name> at the running image's volume root
- *   4. drivers/<arch>/<driver_name> on every other mounted FAT volume
+ *   2. `<image_dir>/<driver_name>` in the running image's own directory
+ *   3. `drivers/<driver_name>` at the running image's volume root
+ *   4. `drivers/<arch>/<driver_name>` on every other mounted FAT volume
  *
  * The arch suffix is "x64" or "aa64", matching the running image's
  * architecture. After load+start, LocateProtocol is re-checked; if
@@ -303,7 +405,18 @@ axl_driver_ensure(
  * firmware that ships neither the protocol nor a user-staged copy.
  *
  * `axl_driver_ensure(g, n)` is exactly `axl_driver_ensure_with_embedded(
- * g, n, NULL, 0, NULL)`.
+ * g, n, NULL, 0, NULL, NULL, 0)`.
+ *
+ * **LoadOptions** (`load_options` / `load_options_size`): when
+ * non-NULL, AXL installs the bytes into the loaded image's
+ * `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions` BEFORE `StartImage` is
+ * called, via the same axl_driver_set_load_options path (so
+ * unload-time release is automatic). Applied on BOTH the disk-load
+ * path (steps 2/3) and the embedded path (step 4). Skipped on the
+ * step-1 short-circuit — the firmware-provided protocol implies a
+ * driver instance the consumer doesn't own. Used by AxlService to
+ * ship a foreground process's options through to the driver image
+ * (typically via axl_config_to_string).
  *
  * Trust caveat (same as axl_driver_ensure): step 3 will load the first
  * matching .efi off any mounted FAT volume. Don't pass attacker-
@@ -316,11 +429,13 @@ axl_driver_ensure(
  */
 int
 axl_driver_ensure_with_embedded(
-    const AxlGuid       *protocol_guid,   ///< protocol GUID to look up (must be non-NULL)
-    const char          *driver_name,     ///< canonical driver filename, e.g. "RamDiskDxe.efi"
-    const unsigned char *embedded_buf,    ///< embedded .efi bytes (may be NULL)
-    size_t               embedded_len,    ///< length of embedded_buf in bytes (0 if NULL)
-    const char          *override_name    ///< user-provided override name (may be NULL)
+    const AxlGuid       *protocol_guid,    ///< protocol GUID to look up (must be non-NULL)
+    const char          *driver_name,      ///< canonical driver filename, e.g. "RamDiskDxe.efi"
+    const unsigned char *embedded_buf,     ///< embedded .efi bytes (may be NULL)
+    size_t               embedded_len,     ///< length of embedded_buf in bytes (0 if NULL)
+    const char          *override_name,    ///< user-provided override name (may be NULL)
+    const void          *load_options,     ///< LoadOptions to install pre-Start (may be NULL)
+    size_t               load_options_size ///< size of @p load_options in bytes (0 if NULL)
 );
 
 /**

@@ -155,16 +155,16 @@ int axl_nvstore_set(const char *ns, const char *key, const void *buf, size_t siz
 
 Platform-agnostic persistent storage. Namespaces: `"global"`, `"app"`.
 
-### Phase 3: Service registry (unblocks axl-webfs mount command + driver) — DONE
+### Phase 3: Protocol registry (unblocks axl-webfs mount command + driver) — DONE
 
 ```c
-int axl_service_find(const char *name, void **interface);
-int axl_service_enumerate(const char *name, void ***handles, size_t *count);
-int axl_service_register(const char *name, void *interface, void **handle);
-int axl_service_unregister(void *handle, const char *name, void *interface);
+int axl_protocol_find(const char *name, void **interface);
+int axl_protocol_enumerate(const char *name, void ***handles, size_t *count);
+int axl_protocol_register(const char *name, void *interface, void **handle);
+int axl_protocol_unregister(void *handle, const char *name, void *interface);
 ```
 
-Platform-agnostic service discovery. Well-known names: `"smbios"`,
+Platform-agnostic protocol discovery. Well-known names: `"smbios"`,
 `"shell"`, `"simple-network"`, `"simple-fs"`, `"tcp4"`, etc.
 
 ### Phase 4: Network interface enumeration (unblocks NetInfo)
@@ -178,10 +178,10 @@ High-level NIC discovery — returns names, MACs, IPv4 config.
 ### Phase 5: UDP sockets (unblocks SoftBMC SNMP/Syslog)
 
 ```c
-int  axl_udp_open(AxlUdpSocket **sock, uint16_t local_port);
-int  axl_udp_send(AxlUdpSocket *sock, const char *host, uint16_t port, const void *data, size_t len);
-int  axl_udp_recv(AxlUdpSocket *sock, void *buf, size_t size, size_t *received);
-void axl_udp_close(AxlUdpSocket *sock);
+int  axl_udp_open(AxlUdp **sock, uint16_t local_port);
+int  axl_udp_send(AxlUdp *sock, const char *host, uint16_t port, const void *data, size_t len);
+int  axl_udp_recv(AxlUdp *sock, void *buf, size_t size, size_t *received);
+void axl_udp_close(AxlUdp *sock);
 ```
 
 ### Phase 6: Network initialization (unblocks SoftBMC Network)

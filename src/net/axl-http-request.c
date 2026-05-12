@@ -7,6 +7,7 @@
 **/
 
 #include "axl-http-server-internal.h"
+#include <axl/axl-json.h>
 
 AXL_LOG_DOMAIN("http");
 
@@ -233,7 +234,7 @@ process_request_data(
                         );
         if (parse_status != 0) {
             send_error_response(conn, 400);
-            reset_connection(conn);
+            /* reset_connection runs from on_response_sent now */
             return;
         }
 
@@ -248,7 +249,7 @@ process_request_data(
                         );
         if (parse_status != 0) {
             send_error_response(conn, 400);
-            reset_connection(conn);
+            /* reset_connection runs from on_response_sent now */
             return;
         }
 
@@ -290,6 +291,60 @@ process_request_data(
         if (early_route != NULL && early_route->is_upload &&
             early_route->upload_handler != NULL) {
             //
+            // Middleware first, before a single body byte reaches the
+            // upload handler. The regular dispatch path runs middleware
+            // inside dispatch_request, but uploads never go through
+            // dispatch_request — without this short-circuit any
+            // cross-cutting middleware (auth, rate limit, read-only
+            // gating) silently bypasses upload routes.
+            //
+            // Body is NULL here by design: streaming uploads don't
+            // materialize the body, so middleware that needs the body
+            // can't be applied to upload routes — header-based gating
+            // is the contract.
+            //
+            AxlHttpRequest  mw_req;
+            AxlHttpResponse mw_resp;
+            axl_memset(&mw_req, 0, sizeof(mw_req));
+            mw_req.method  = conn->method;
+            mw_req.path    = conn->path;
+            mw_req.query   = conn->query;
+            mw_req.headers = conn->headers;
+            axl_memcpy(mw_req.client_addr, conn->client_addr,
+                       sizeof(mw_req.client_addr));
+
+            axl_memset(&mw_resp, 0, sizeof(mw_resp));
+            mw_resp.status_code = 200;
+
+            if (run_middleware(s, &mw_req, &mw_resp) != AXL_OK) {
+                axl_warning("middleware rejected upload %s %s (status %zu)",
+                            conn->method, conn->path, mw_resp.status_code);
+                if (mw_resp.status_code == 200) {
+                    mw_resp.status_code = 500;
+                }
+                /* Force-close: the client almost certainly already
+                   pushed body bytes into the kernel TCP buffer (curl
+                   et al. send headers + body in one write). If we
+                   stayed in keep-alive, on_response_sent's rearm would
+                   read those leftover body bytes into header_buf and
+                   parse them as the next request line. Same reason
+                   send_error_response forces close. */
+                conn->keep_alive = false;
+                send_response(conn, &mw_resp);
+                /* send_response memcpy'd headers + body into tx_buf;
+                   the originals (set by middleware via
+                   axl_http_response_set_text / _json / etc.) are
+                   ours to free. */
+                if (mw_resp.body != NULL && !mw_resp.body_static) {
+                    axl_free(mw_resp.body);
+                }
+                if (mw_resp.headers != NULL) {
+                    axl_hash_table_free(mw_resp.headers);
+                }
+                return;
+            }
+
+            //
             // Upload streaming — don't buffer the body, stream chunks
             // to the handler as they arrive.
             //
@@ -301,7 +356,7 @@ process_request_data(
             conn->upload_buf = axl_malloc(s->upload_chunk_size);
             if (conn->upload_buf == NULL) {
                 send_error_response(conn, 500);
-                reset_connection(conn);
+                /* reset_connection runs from on_response_sent now */
                 return;
             }
             conn->upload_buf_len = 0;
@@ -367,7 +422,7 @@ process_request_data(
             //
             if (conn->content_length > s->body_limit) {
                 send_error_response(conn, 413);
-                reset_connection(conn);
+                /* reset_connection runs from on_response_sent now */
                 return;
             }
 
@@ -375,7 +430,7 @@ process_request_data(
             conn->body_alloc = conn->content_length;
             if (conn->body == NULL) {
                 send_error_response(conn, 500);
-                reset_connection(conn);
+                /* reset_connection runs from on_response_sent now */
                 return;
             }
 
@@ -430,4 +485,41 @@ process_request_data(
             dispatch_and_respond(s, conn);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public request helpers — content negotiation + JSON body parse
+//
+// These are not on the parsing path; they're consumer-side conveniences for
+// REST-shaped handlers. Lifted out of axl-webfs's serve module so any HTTP
+// consumer (REST API, one-shot fetch tool, future services) can reuse them.
+// ---------------------------------------------------------------------------
+
+bool
+axl_http_request_accepts(const AxlHttpRequest *req, const char *mime)
+{
+    if (req == NULL || req->headers == NULL) {
+        return false;
+    }
+    const char *accept = (const char *)axl_hash_table_lookup(
+        req->headers, "accept");
+    /* axl_http_accepts already handles NULL accept-header, wildcards,
+       case-insensitive matching, q-values, and whitespace. This wrapper
+       just routes from AxlHttpRequest to that primitive — same semantics. */
+    return axl_http_accepts(accept, mime);
+}
+
+bool
+axl_http_request_wants_json(const AxlHttpRequest *req)
+{
+    return axl_http_request_accepts(req, "application/json");
+}
+
+bool
+axl_http_request_get_json(const AxlHttpRequest *req, AxlJsonReader *out)
+{
+    if (req == NULL || out == NULL || req->body == NULL || req->body_size == 0) {
+        return false;
+    }
+    return axl_json_parse((const char *)req->body, req->body_size, out);
 }

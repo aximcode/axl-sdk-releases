@@ -608,8 +608,7 @@ run_dmidecode(AxlArgs *a)
     return 0;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(dmidecode)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "dmidecode",

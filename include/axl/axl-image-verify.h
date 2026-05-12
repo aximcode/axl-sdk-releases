@@ -5,13 +5,13 @@
  * @file axl-image-verify.h
  * @brief PE Authenticode signature inspection without launching the image.
  *
- * @ref axl_image_load runs the firmware's PE-loader signature checks
+ * axl_image_load runs the firmware's PE-loader signature checks
  * as a side-effect of loading, and only when Secure Boot is on. Tools
  * that want to ask "is this PE file signed and does its signature
  * validate against the current Secure Boot db?" without committing
  * to launching the image (incident-response triage, BIOS-update
  * pre-flight, bootable-media verification) reach for
- * @ref axl_image_verify_signature.
+ * axl_image_verify_signature.
  *
  * The check has two orthogonal axes:
  *
@@ -61,12 +61,12 @@ extern "C" {
 
 /// PE Authenticode signature inspection result.
 ///
-/// Cleared with @ref axl_image_signature_info_free, which is
+/// Cleared with axl_image_signature_info_free, which is
 /// NULL-safe — callers that don't pass a non-NULL info pointer to
-/// @ref axl_image_verify_signature can skip the free.
+/// axl_image_verify_signature can skip the free.
 typedef struct {
     bool   has_signature;     ///< PE Certificate Table directory entry holds a non-empty WIN_CERTIFICATE blob
-    bool   signature_valid;   ///< signature validates (db-validated when @ref consulted_db, presence-only otherwise)
+    bool   signature_valid;   ///< signature validates (db-validated when consulted_db, presence-only otherwise)
     bool   consulted_db;      ///< Secure Boot db was actually consulted (firmware LoadImage dry-run succeeded)
     /// Subject CommonName from the first certificate in the
     /// PKCS#7 SignedData bundle. signtool.exe and most Authenticode
@@ -75,13 +75,13 @@ typedef struct {
     /// the signer is via SignerInfo's IssuerAndSerial. This field
     /// is best-effort, suitable for diagnostic output ("Signed by
     /// `<cn>`") but NOT for security decisions. NULL if
-    /// @ref has_signature is false, the cert can't be parsed, no
+    /// has_signature is false, the cert can't be parsed, no
     /// CN attribute is present, or the CN string uses an encoding
     /// the walker doesn't support (T61String, BMPString,
     /// IA5String). Heap-allocated UTF-8; caller frees via
-    /// @ref axl_image_signature_info_free.
+    /// axl_image_signature_info_free.
     char  *subject_cn;
-    /// Issuer CommonName from the same certificate as @ref subject_cn,
+    /// Issuer CommonName from the same certificate as subject_cn,
     /// extracted by the same parser. Same "first cert in the bundle,
     /// best-effort, diagnostic-only" caveats apply.
     char  *issuer_cn;
@@ -115,7 +115,7 @@ typedef struct {
  *                     when those side effects are unacceptable.
  * @param info         [out] receives the inspection result. Must be
  *                     non-NULL. Caller frees via
- *                     @ref axl_image_signature_info_free. When
+ *                     axl_image_signature_info_free. When
  *                     @p info is non-NULL, every bool/pointer
  *                     field is cleared to false / NULL before any
  *                     further work — so on a -1 return the struct
@@ -135,7 +135,7 @@ axl_image_verify_signature(
 /**
  * @brief Release any heap-allocated fields inside @p info.
  *
- * Frees @ref AxlImageSignatureInfo::subject_cn and @ref AxlImageSignatureInfo::issuer_cn
+ * Frees AxlImageSignatureInfo::subject_cn and AxlImageSignatureInfo::issuer_cn
  * (each independently — either may be NULL) and clears the
  * struct's pointer fields back to NULL. NULL-safe on the @p info
  * pointer itself.

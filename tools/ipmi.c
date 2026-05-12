@@ -637,8 +637,7 @@ static const AxlArgsNode verbs[] = {
     {0}
 };
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(ipmi)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "ipmi",

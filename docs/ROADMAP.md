@@ -1098,7 +1098,7 @@ but SoftBMC hasn't migrated to AXL yet — see Phase 10).
 
 ### Phase S7: Socket abstraction layer — DONE
 
-GLib-style socket layer wrapping existing AxlTcp/AxlUdpSocket. Unifies
+GLib-style socket layer wrapping existing AxlTcp/AxlUdp. Unifies
 inconsistent address handling (hostname strings, AxlIPv4Address, raw bytes)
 behind a clean API.
 
@@ -1242,12 +1242,33 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 
 ### Phase HF2: mkfixture.efi (manifest-grade UEFI walks)
 
-- [ ] New tool `tools/mkfixture.c` → `mkfixture.efi` (separate
+Phase HF2 ships in slices — HF2.1 covers the smallest viable
+fixture (SMBIOS + ACPI + manifest); HF2.2+ adds the per-protocol
+JSON manifests; HF2.3 adds alternative write targets.
+
+**HF2.1 — DONE (commit 46a326c)**:
+- [x] New tool `tools/mkfixture.c` → `mkfixture.efi` (separate
       from `sysinfo` — capture is a binary-blob writer, not an
       inventory display, and conflating them muddies both;
       cross-tool sharing happens at the library layer)
-- [ ] Dump SMBIOS3 raw bytes via EFI Config Table
-- [ ] Walk ACPI RSDT/XSDT, write each table as `acpi/<sig>.dat`
+- [x] Dump SMBIOS3 raw bytes via EFI Config Table
+- [x] Walk ACPI RSDT/XSDT, write each table as `acpi/<sig>.dat`
+- [x] Write `manifest.json` (vendor, model, BIOS rev/date,
+      capture-tool version, fixture format)
+
+**HF2.2 — DONE**:
+- [x] CPU capture: direct CPUID (x86) / MIDR_EL1 (aa64), write
+      `cpu.json` (vendor, family/model/stepping, brand string,
+      feature words). Future axl-emulate `--cpu-from-fixture`
+      maps to a QEMU `-cpu MODEL` choice.
+- [x] ESRT capture: read EFI Config Table
+      `EFI_SYSTEM_RESOURCE_TABLE_GUID`, write `esrt.json`
+      (per-component FwClass GUID + version + last-attempt status)
+- [x] New public API `axl_efi_find_config_table` (axl-runtime.h)
+      so tools can do one-shot config-table lookups without
+      duplicating the EFI Configuration Table walk
+
+**HF2.3 — TODO** (manifest expansion):
 - [ ] Enumerate PCI via `EFI_PCI_IO_PROTOCOL`, write `pci.json`
       (VID/DID/class/subsys/BARs) — manifest only, not replayed
 - [ ] Walk USB via `EFI_USB_IO_PROTOCOL` + `EFI_USB2_HC_PROTOCOL`,
@@ -1257,23 +1278,18 @@ Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
       `EFI_EDID_DISCOVERED_PROTOCOL`, write `video.json` (mode list,
       current mode, FB base, pixel format) and `edid/*.bin` per
       display; GPU option ROM (`gpu-rom/*.bin`) on-demand only
-- [ ] CPU capture: direct CPUID instructions + microcode revision,
-      write `cpu.json` (vendor, family/model/stepping, brand string,
-      feature flags, cache info)
 - [ ] Network details: per-NIC MAC + link state via
       `EFI_SIMPLE_NETWORK_PROTOCOL`, SR-IOV VF count from PCIe
       extended config, write `net.json`
-- [ ] ESRT capture: read EFI Config Table
-      `EFI_SYSTEM_RESOURCE_TABLE_GUID`, write `esrt.json`
-      (per-component FwClass GUID + version)
 - [ ] NVMe capture: per-controller Identify Controller / Identify
       Namespace via `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`, write
       `nvme/<bdf>.json` (manifest only — replay is HF9 patch
       candidate)
-- [ ] Write `manifest.json` (vendor, model, serial, BIOS rev,
-      capture date, capture-tool version)
-- [ ] Support write targets: local FS (`fs0:\fixtures\...`),
-      virtiofs `--mount`, HTTP POST
+
+**HF2.4 — TODO** (alternative write targets):
+- [ ] Support write targets: local FS (`fs0:\fixtures\...`) is the
+      default and shipped in HF2.1; add virtiofs `--mount` and
+      HTTP POST
 
 ### Phase HF3: scripts/axl-emulate (replay wrapper)
 
@@ -1631,6 +1647,148 @@ requiring the C surface to grow C++-aware.
 
 ---
 
+## AxlXml — generic XML reader + writer (LANDED 2026-05-10)
+
+**X1 + X2 shipped.** Writer in `src/data/axl-xml-writer.c`, reader in
+`src/data/axl-xml-parse.c`, public surface
+`<axl/axl-xml.h>`. 53 unit tests. The pre-landing draft below is
+kept for the design history; the shipped API differs in detail
+(value-typed `AxlXmlWriter` per JSON's pattern, pull-token reader
+`AxlXmlReader` returning `AxlXmlToken` rather than callback-SAX,
+`AXL_XML_WRITER_PRETTY` flag rather than separate pretty-print
+setter). Remaining work:
+
+- **X3: WebDAV PROPFIND emit migration** — replace the hand-rolled
+  XML emit in `src/net/axl-http-webdav.c::emit_entry` with
+  `axl_xml_writer_*` calls. ~50 lines deleted + 7-line escaper
+  removed. Existing integration tests should be unchanged.
+- **WebDAV W6 (class-2 verbs)** — PROPPATCH / LOCK / UNLOCK request
+  bodies become implementable with the reader. Gated on a consumer
+  asking.
+- **Dell delldiagslinux port** — `stout::XmlSink` migrates to
+  `AxlXmlWriter`; `pugi::xml_document` consumers in
+  `systemconfig/*` and every module's `configuration.cpp` migrate
+  to the pull-token reader. Pre-1.0 axl-sdk Linux port is the
+  trigger.
+
+### Original design notes (kept for history)
+
+**Surfaced 2026-05-10** during the WebDAV W2 landing. WebDAV's
+PROPFIND emit currently hand-rolls XML via `axl_string_append`
+calls in `src/net/axl-http-webdav.c::emit_entry` (~50 lines) +
+a 7-line escaper for `<>&"'`. Two design pressures converging:
+
+1. **WebDAV growth** — PROPPATCH and LOCK request bodies are
+   real XML documents that need parsing (out of scope for v1
+   per `sdk-prompts/2026-05-10-webdav-server.md`, but next on
+   the WebDAV roadmap when a consumer asks). The hand-rolled
+   emit also picks up a second site (PROPPATCH response,
+   LOCK response) — the escaper and structural correctness
+   start fragmenting.
+2. **Second consumer** — at least one other AximCode use case
+   has surfaced (user noted 2026-05-10, not yet documented in
+   the SDK; will pull the requirements in when the
+   consumer-side prompt lands).
+
+### Phase X1: AxlXmlWriter — minimal streaming writer
+
+```c
+AxlXmlWriter *w = axl_xml_writer_new();
+axl_xml_writer_decl(w, "1.0", "utf-8");
+axl_xml_writer_start(w, "D:multistatus");
+axl_xml_writer_attr(w,  "xmlns:D", "DAV:");
+  axl_xml_writer_start(w, "D:response");
+    axl_xml_writer_start(w, "D:href");
+    axl_xml_writer_text(w,  "/dav/preset-stat");   // auto-escaped
+    axl_xml_writer_end(w);
+    /* ...propstat... */
+  axl_xml_writer_end(w);
+axl_xml_writer_end(w);
+char *xml = axl_xml_writer_steal(w);  // caller owns
+axl_xml_writer_free(w);
+```
+
+**Scope:**
+- Element start / end with tag-balance enforcement (writer
+  refuses to emit `</D:foo>` when the open stack top is
+  `<D:bar>`).
+- Attributes with auto-escaping of `"` and `&`.
+- Text content with auto-escaping of `<`, `>`, `&`.
+- Backed by `AxlString` for buffer growth.
+- Optional pretty-print (newlines + indent — useful for
+  PROPFIND responses; off by default for compactness).
+- Namespace-prefix handling stays caller-managed: writer
+  treats `D:multistatus` as an opaque qname; namespace
+  declarations are normal attributes via `axl_xml_writer_attr`.
+  No xmlns scope tracking.
+
+### Phase X2: AxlXmlReader — minimal SAX/event reader
+
+```c
+typedef int (*AxlXmlEventCb)(void *user, const AxlXmlEvent *ev);
+
+axl_xml_reader_parse(buf, len, on_event, user);
+```
+
+Events: `START_ELEMENT(qname, attrs)`, `END_ELEMENT(qname)`,
+`TEXT(content, len)`. Caller owns state-machine assembly into
+whatever shape they need (DOM, application records).
+
+**Scope:**
+- UTF-8 input; reject UTF-16 / EBCDIC declarations.
+- Decode the five named entities (`&amp;` `&lt;` `&gt;` `&quot;`
+  `&apos;`) and decimal/hex character references (`&#NNN;`,
+  `&#xHHHH;`). Reject unknown named entities (no DTD support).
+- Skip XML decl, comments, processing instructions, CDATA
+  sections (treat CDATA content as TEXT events).
+- Reject DOCTYPE — no entity expansion = no billion-laughs
+  vector.
+- Strict well-formedness: tag balance, single root.
+- Stop calling consumer callbacks on first error; return
+  `AxlStatus` so caller can distinguish parse error from
+  callback abort.
+
+### Phase X3: WebDAV migration
+
+Once X1 ships, replace `emit_entry` + `xml_escape_append` in
+`src/net/axl-http-webdav.c` with `AxlXmlWriter` calls. Net LOC
+roughly the same, structural correctness by construction.
+
+Once X2 ships, add PROPFIND request-body parsing (defer for
+WebDAV v1 today): `<allprop/>` vs `<prop>...</prop>` vs
+`<propname/>`. Then PROPPATCH and LOCK request bodies become
+implementable.
+
+### Out of scope (intentional)
+
+- DTD validation, schema validation (XSD/RelaxNG), XPath,
+  XSLT — none of these have an axl-sdk consumer driving them.
+- DOM API on top of the SAX reader. Add iff a consumer wants
+  it; meanwhile callers build their own state machines on
+  the events.
+- XML signatures / encryption (XMLDSig / XMLEnc) — out of
+  scope unless an EDK2 capsule manifest consumer asks.
+
+### Tests
+
+Unit:
+- Writer: round-trip via reader (build a doc, serialize,
+  reparse, compare event sequence).
+- Writer: tag-balance refusal (start `<a>`, attempt `end("b")`).
+- Writer: auto-escape on `<>&"'` in text and attr values.
+- Reader: well-formed input → expected event sequence.
+- Reader: malformed input (mismatched tags, unclosed
+  element, DOCTYPE, unknown entity) → AXL_ERR.
+- Reader: entity decoding (`&amp;`, `&#65;`, `&#x41;`).
+
+Integration:
+- WebDAV PROPFIND emit migrated; existing assertions
+  unchanged.
+- (Once X2 + PROPPATCH lands) cadaver / davfs2 round-trip
+  PROPFIND with non-allprop bodies.
+
+---
+
 ## API Hygiene — Return Value Conventions (Future)
 
 The public API surface mixes return-value shapes that pre-date a
@@ -1930,6 +2088,40 @@ during code review and refactor work, not during original planning.
       clear() reset.
 
 ### Correctness / performance gaps
+
+- [ ] **AxlLoop event-driven driver mode (eliminate `driver_tick_ms`).**
+      Driver-mode dispatch is currently polled: `axl_loop_attach_driver`
+      installs a periodic `EVT_TIMER | EVT_NOTIFY_SIGNAL` at
+      `TPL_CALLBACK` whose notify drains all sources every
+      `tick_ms` (default 50 ms). Every source whose readiness IS a
+      UEFI event (TCP4 receive completion, EVT_TIMER, protocol-installed
+      notify) currently re-enters via the loop's polled dispatch
+      cycle, which means up to ~`tick_ms / 2` average added latency
+      and a TPL_CALLBACK budget that has to be hand-managed (per
+      `axl-loop.h` "notify-budget rule"). A genuinely event-driven
+      driver mode would attach each source's underlying UEFI event
+      to its OWN `EVT_NOTIFY_SIGNAL` callback that runs that source's
+      dispatch directly. Net effect:
+        - `axl_loop_attach_driver` / `_detach_driver` go away
+        - `AxlService.driver_tick_ms` field deleted
+        - `AXL_SERVICE_DEFAULT_TICK_MS` deleted
+        - average dispatch latency drops from ~25 ms to firmware-
+          callback latency (~µs)
+        - "AxlLoop is event-driven" stops being a half-truth in
+          driver mode
+      Trade-off: real surgery on the source abstraction. Every
+      source type (TCP, timer, idle, defer, pubsub, raw event) needs
+      its dispatch path rewired to fire from its own firmware notify
+      event. Idle and defer don't have a UEFI-event analogue and
+      need a different home (idle = "run after current notify
+      drains," defer = its own EVT_TIMER). Foreground mode still
+      wants the centralized loop cycle so you end up with two
+      source-dispatch paths instead of one. The integration tests
+      are currently load-bearing on tick semantics in places (the
+      drain-cap fix from the b0e567b HTTP-server starvation bug).
+      Not blocking anything today — axl-webfs serve works fine at
+      50 ms — so this is post-1.0 work. Revisit when latency or
+      conceptual cleanup actually starts costing something.
 
 - [x] **Sync ops busy-poll instead of blocking on events — new
       AxlCompletion module.** Landed April 2026. AxlCompletion +

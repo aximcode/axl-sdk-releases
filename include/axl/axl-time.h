@@ -58,10 +58,10 @@ axl_time_get_ms(void);
  * stall and returns 0; subsequent calls are cheap (one counter
  * read + a multiply) and return microseconds since the calibration
  * call. No defined relationship to wallclock time — pair with
- * @ref axl_time_get_ms when you need both elapsed-microsecond
+ * axl_time_get_ms when you need both elapsed-microsecond
  * resolution and a wallclock anchor.
  *
- * Use this instead of @ref axl_time_get_ms when the measurement
+ * Use this instead of axl_time_get_ms when the measurement
  * window is on the order of milliseconds or shorter (firmware
  * stall calibration, network round-trips, parser benchmarking).
  *

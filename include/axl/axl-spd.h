@@ -7,19 +7,19 @@
     SPD EEPROMs sit on the platform SMBus at addresses 0x50–0x57 (one
     per DIMM slot) and carry the JEDEC-defined module-identification
     block written by the DIMM vendor at manufacture time. AxlSpd
-    talks to them over @ref AxlSmbus (so HC and I2C-Master transports
+    talks to them over AxlSmbus (so HC and I2C-Master transports
     both work), branches the codec on the memory-type byte at offset
-    2, and surfaces a decoded @ref AxlSpdInfo struct.
+    2, and surfaces a decoded AxlSpdInfo struct.
 
     Manufacturer fields are exposed as raw 16-bit JEP-106 codes
     (high byte = continuation-bank index, low byte = position in
     bank). For human-readable rendering, the @c axl_spd_ids_* API
     loads a curated JSON5 sidecar (`jedec.json5`) into a process-
     global table and exposes lookup / format helpers parallel to
-    @ref axl_pci_ids_load and @ref axl_pci_format_name. Consumers
+    axl_pci_ids_load and axl_pci_format_name. Consumers
     that want a different DB (private OEM sheet, vendor-restricted
     list) layer their own handle on top via
-    @ref axl_spd_ids_open_from_buffer — same shape as AxlPciIds.
+    axl_spd_ids_open_from_buffer — same shape as AxlPciIds.
 
     DDR3 is intentionally out of scope for v1. DDR5 modules use the
     SPD5118 hub protocol: the lower 128 bytes of each 128-byte page
@@ -27,7 +27,7 @@
     (register 0x0B). AxlSpd handles the page selection internally.
 
     Iteration mirrors the established cursor pattern (see
-    @ref axl_smbios_find_next, @ref axl_pci_next):
+    axl_smbios_find_next, axl_pci_next):
 
     @code
     uint8_t *slot = NULL;
@@ -40,7 +40,7 @@
     @endcode
 
     There is no @c axl_spd_init() entry point — first call to a
-    public function lazily opens an @ref AxlSmbus session.
+    public function lazily opens an AxlSmbus session.
 
     @section spd_limitations Platform limitations
 
@@ -129,7 +129,7 @@ extern "C" {
 /**
  * @brief Decoded module identification block.
  *
- * Populated by @ref axl_spd_read or @ref axl_spd_decode. Caller-owned
+ * Populated by axl_spd_read or axl_spd_decode. Caller-owned
  * (no allocations); zero-initialise before passing in.
  *
  * @c mfg_code_module and @c mfg_code_dram are packed JEP-106 codes:
@@ -165,7 +165,7 @@ typedef struct {
  * or the previous non-NULL return value to advance. The caller never
  * owns the cursor's storage.
  *
- * Lazy: opens an @ref AxlSmbus session on first call.
+ * Lazy: opens an AxlSmbus session on first call.
  *
  * @return pointer to the next populated SMBus address, or NULL when
  *     enumeration is complete (or no SMBus controller is available).
@@ -189,7 +189,7 @@ axl_spd_next(
 int
 axl_spd_read(
     uint8_t      addr,   ///< 7-bit SMBus address (0x50..0x57)
-    AxlSpdInfo  *out
+    AxlSpdInfo  *out     ///< receives the decoded SPD on success
 );
 
 /**
@@ -199,8 +199,8 @@ axl_spd_read(
  * device supports it). For DDR5 reads up to 1024 bytes across all
  * eight 128-byte pages, switching pages via MR11 as needed.
  *
- * The buffer can later be fed to @ref axl_spd_decode to obtain the
- * same decoded view as @ref axl_spd_read — useful for capturing SPDs
+ * The buffer can later be fed to axl_spd_decode to obtain the
+ * same decoded view as axl_spd_read — useful for capturing SPDs
  * on real hardware and decoding them off-box.
  *
  * @param addr  7-bit SMBus address.
@@ -246,21 +246,21 @@ axl_spd_decode(
 /// Sized for the longest real JEP-106 entry plus headroom.
 #define AXL_SPD_VENDOR_NAME_MAX  64u
 
-/// Maximum bytes (including NUL) for @ref axl_spd_ids_format_name output.
+/// Maximum bytes (including NUL) for axl_spd_ids_format_name output.
 /// Vendor name plus the "<unknown>" → "0xCCCC" numeric fallback fit.
 #define AXL_SPD_NAME_COMPOSED_MAX  80u
 
 /**
  * @brief Opaque handle to a loaded JEDEC vendor-name database.
  *
- * Created by @ref axl_spd_ids_open or
- * @ref axl_spd_ids_open_from_buffer; destroyed by
- * @ref axl_spd_ids_close. Multiple handles can coexist — a consumer
+ * Created by axl_spd_ids_open or
+ * axl_spd_ids_open_from_buffer; destroyed by
+ * axl_spd_ids_close. Multiple handles can coexist — a consumer
  * that ships an internal OEM sheet on top of the public set loads
  * two handles and queries them in priority order, mirroring
- * @ref AxlPciIds.
+ * AxlPciIds.
  *
- * The process-global API (@ref axl_spd_ids_load and friends) wraps
+ * The process-global API (axl_spd_ids_load and friends) wraps
  * a single internal handle for the common case.
  */
 typedef struct AxlSpdIds AxlSpdIds;
@@ -306,7 +306,7 @@ axl_spd_ids_close(
  */
 const char *
 axl_spd_ids_vendor_name(
-    const AxlSpdIds  *ids,
+    const AxlSpdIds  *ids,     ///< handle from axl_spd_ids_load
     uint16_t          code     ///< packed JEP-106 (bank<<8 | id)
 );
 
@@ -359,7 +359,7 @@ axl_spd_ids_format_name(
  *     directory.
  *
  * Idempotent: a successful load is a no-op on subsequent calls. On
- * the first successful load, registers an @ref axl_atexit cleanup
+ * the first successful load, registers an axl_atexit cleanup
  * so the parsed table is freed at runtime cleanup automatically.
  */
 AxlSidecarStatus
@@ -387,7 +387,7 @@ axl_spd_vendor_name(
 
 /**
  * @brief Singleton-backed convenience wrapper for
- *     @ref axl_spd_ids_format_name.
+ *     axl_spd_ids_format_name.
  */
 int
 axl_spd_format_name(

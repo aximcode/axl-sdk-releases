@@ -4,7 +4,7 @@
 /**
  * axl-subcommand.h:
  *
- * @deprecated Use @ref axl_args_run from `<axl/axl-args.h>` instead.
+ * @deprecated Use axl_args_run from `<axl/axl-args.h>` instead.
  *     AxlArgs's multi-verb mode (`AxlArgsApp.verbs[]`) strictly subsumes
  *     this dispatcher and adds typed positional args, bounds checking,
  *     and auto-generated `--help`. AxlSubcommand is retained as a thin
@@ -117,13 +117,13 @@ axl_subcommand_dispatch(
  * Useful when the caller wants to show help in response to an invalid
  * argument outside the dispatch path. Output format:
  *
- *   Usage: <prog> <command> [args...]
+ *   Usage: `<prog> <command> [args...]`
  *
  *   Commands:
  *     bios   [test|pci|irq|slot|emb]
  *     sysid  [hexValue]
  *
- *   Run '<prog> help <command>' for detailed usage.
+ *   Run `<prog> help <command>` for detailed usage.
  */
 void
 axl_subcommand_print_help(

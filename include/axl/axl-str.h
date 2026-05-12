@@ -424,7 +424,7 @@ axl_strjoin(
 /**
  * @brief Join a counted string array with a separator (argv shape).
  *
- * Variant of @ref axl_strjoin for callers that already have a
+ * Variant of axl_strjoin for callers that already have a
  * count + argv pair (typically `argc, argv` from a UEFI shell entry
  * point). Avoids the small reshape allocation needed to build a
  * NULL-terminated copy. All @c count elements of @a argv must be
@@ -559,10 +559,10 @@ axl_strcasestr(
 /**
  * @brief Length-bounded case-insensitive substring search.
  *
- * Like @ref axl_strcasestr but treats @a haystack as a byte slice
+ * Like axl_strcasestr but treats @a haystack as a byte slice
  * of @a haystack_len bytes — the haystack does NOT need to be
  * NUL-terminated. Pass `-1` for @a haystack_len to default to
- * NUL-terminated semantics (mirror of @ref axl_strstr_len).
+ * NUL-terminated semantics (mirror of axl_strstr_len).
  *
  * Useful for searching slices into a larger buffer (e.g. lines
  * delivered by `AxlLineReader` that point into a working buffer
@@ -1019,7 +1019,7 @@ axl_str_reader_peek(
 );
 
 /**
- * @brief Skip whitespace (' ', '\t', '\r', '\n', '\f', '\v').
+ * @brief Skip whitespace (` `, `\t`, `\r`, `\n`, `\f`, `\v`).
  *
  * Always succeeds (skipping zero bytes is fine). Doesn't touch ok.
  * Use this between fields where the input grammar allows whitespace.

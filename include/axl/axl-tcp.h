@@ -60,7 +60,7 @@ axl_tcp_connect(
 /**
  * @brief Connect to a remote host via TCP4, with explicit interface selection.
  *
- * Like @ref axl_tcp_connect but adds optional pinning to a specific
+ * Like axl_tcp_connect but adds optional pinning to a specific
  * local interface by station IP. When @p source_ip is non-NULL and
  * non-zero, the connect uses only the network interface whose IP4
  * config matches that station address — useful when the host has
@@ -97,10 +97,10 @@ axl_tcp_listen(
 /**
  * @brief Create a TCP4 listener pinned to a specific local interface.
  *
- * Like @ref axl_tcp_listen but takes an optional source IP that
+ * Like axl_tcp_listen but takes an optional source IP that
  * selects which network interface to bind on a multi-NIC host. When
  * @p source_ip is NULL or all-zeros, falls through to the auto-pick
- * path used by @ref axl_tcp_listen.
+ * path used by axl_tcp_listen.
  *
  * @return AXL_OK on success, AXL_ERR on failure (including "no
  *     interface has station IP @p source_ip" when forced).
@@ -196,6 +196,10 @@ axl_tcp_close(
     AxlTcp *sock  ///< socket to close (NULL-safe)
 );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlTcp, axl_tcp_close)
+#endif
+
 /**
  * @brief Query the local address of a connected or listening socket.
  *
@@ -239,7 +243,7 @@ axl_tcp_get_remote_addr(
  * connected socket — caller retains ownership and can reuse or close
  * it.
  *
- * @p status is an @ref AxlStatus value:
+ * @p status is an AxlStatus value:
  *   - AXL_OK on success
  *   - AXL_ERR on UEFI error
  *   - AXL_CANCELLED if the cancellable passed to the *_async call
@@ -304,7 +308,7 @@ axl_tcp_connect_async(
 );
 
 /**
- * @brief Async sibling of @ref axl_tcp_connect_via.
+ * @brief Async sibling of axl_tcp_connect_via.
  *
  * @p source_ip semantics match the synchronous variant.
  */

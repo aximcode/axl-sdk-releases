@@ -32,6 +32,11 @@ AxlDriver
 
 .. doxygenfile:: axl-driver.h
 
+AxlEmbed
+~~~~~~~~
+
+.. doxygenfile:: axl-embed.h
+
 AxlDiag
 ~~~~~~~
 

@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-socket.c
-    Unified socket abstraction — delegates to AxlTcp / AxlUdpSocket.
+    Unified socket abstraction — delegates to AxlTcp / AxlUdp.
 **/
 
 #include <axl/axl-socket.h>
@@ -33,11 +33,11 @@ struct AxlSocket {
     AxlSocketType type;
     union {
         AxlTcp       *tcp;
-        AxlUdpSocket *udp;
+        AxlUdp *udp;
     };
     SocketAsyncCtx *accept_ctx;  /* owned, freed on socket_free */
 
-    /* UDP async receive state (for bridging AxlUdpRecvCallback) */
+    /* UDP async receive state (for bridging AxlUdpCallback) */
     void              *udp_recv_buf;
     size_t             udp_recv_buf_size;
     size_t             udp_recv_len;       /* bytes received */
@@ -521,38 +521,36 @@ tcp_recv_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
     return keep;
 }
 
-static void
-udp_recv_bridge(AxlUdpSocket *udp, const void *payload, size_t len,
+static bool
+udp_recv_bridge(AxlUdp *udp, AxlStatus status,
+                const void *payload, size_t len,
                 const AxlIPv4Address *from, uint16_t from_port, void *udata)
 {
     AxlSocket *sock = (AxlSocket *)udata;
-    bool keep = false;
 
     (void)udp;
     (void)from;
     (void)from_port;
 
-    /* Copy received data into the user's buffer */
+    /* Copy received data into the user's buffer (no-op on err/cancel
+       — payload NULL, len 0). */
     size_t copy_len = len;
     if (copy_len > sock->udp_recv_buf_size) {
         copy_len = sock->udp_recv_buf_size;
     }
-    if (copy_len > 0 && sock->udp_recv_buf != NULL) {
+    if (copy_len > 0 && sock->udp_recv_buf != NULL && payload != NULL) {
         axl_memcpy(sock->udp_recv_buf, payload, copy_len);
     }
     sock->udp_recv_len = copy_len;
 
-    /* Fire user callback — return value controls re-arm like TCP. */
+    /* Forward to user callback. The UDP layer now respects the
+       bool return value (true = re-arm, false = stop + drop sources
+       + cancel EFI op), so we just propagate it — no special-case
+       _stop call needed like the pre-parity-sweep API required. */
     if (sock->udp_recv_cb != NULL) {
-        keep = sock->udp_recv_cb(sock, AXL_OK, sock->udp_recv_data);
+        return sock->udp_recv_cb(sock, status, sock->udp_recv_data);
     }
-
-    /* If not keeping, stop the underlying UDP recv. axl_udp_recv_start
-       stays armed until _stop is called; not calling stop here means
-       the next datagram will fire this bridge again. */
-    if (!keep) {
-        axl_udp_recv_stop(sock->udp);
-    }
+    return false;
 }
 
 int
@@ -575,7 +573,8 @@ axl_socket_receive_async(AxlSocket *sock, void *buf, size_t size,
         sock->udp_recv_cb = cb;
         sock->udp_recv_data = data;
 
-        return axl_udp_recv_start(sock->udp, loop, udp_recv_bridge, sock);
+        return axl_udp_recv_async(sock->udp, loop, NULL,
+                                  udp_recv_bridge, sock);
     }
 
     /* Stream (TCP) path */

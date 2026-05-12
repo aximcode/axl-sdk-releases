@@ -184,6 +184,18 @@ axl_loop_free(AxlLoop *loop)
         axl_backend_event_close(loop->poll_timer);
     }
 
+    /* Driver-mode safety net: if the consumer forgot to call
+       axl_loop_detach_driver, do it here so the periodic timer
+       doesn't fire into freed-loop memory. axl_backend_event_close
+       cancels the timer + closes + frees the bridge context. */
+    if (loop->driver_timer != NULL) {
+        axl_warning("axl_loop_free: detaching abandoned driver-mode "
+                    "timer — DriverUnload should call "
+                    "axl_loop_detach_driver before axl_loop_free");
+        axl_backend_event_close(loop->driver_timer);
+        loop->driver_timer = NULL;
+    }
+
     _axl_registry_remove(loop->_registry_handle);
     axl_pubsub_reset_internal(loop);
     axl_free(loop);
@@ -506,6 +518,125 @@ axl_loop_run(AxlLoop *loop)
     loop->running = false;
 
     return loop->quit_requested ? -1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Driver-mode dispatch — see axl_loop_attach_driver doxygen for the
+// TPL trapdoor this exists to dodge.
+// ---------------------------------------------------------------------------
+
+static void
+driver_dispatch_notify(void *ctx)
+{
+    AxlLoop *loop = (AxlLoop *)ctx;
+
+    if (loop == NULL || loop->quit_requested) {
+        return;
+    }
+
+    /* Auto-set running on first notify so axl_loop_dispatch /
+       axl_loop_next_event don't bail with the foreground-mode
+       "loop not running" check. */
+    if (!loop->running) {
+        loop->running = true;
+    }
+
+    /* Drain everything pending this tick. Non-blocking is the only
+       legal choice (gBS->WaitForEvent returns EFI_UNSUPPORTED above
+       TPL_APPLICATION).
+
+       Earlier this called axl_loop_dispatch exactly once per tick.
+       That one-event-per-tick budget starved completion handlers
+       under realistic HTTP load: a recv-data callback synchronously
+       submits a Transmit (which TCP4 typically completes inline),
+       but the corresponding tx-event was only checked on the *next*
+       50 ms tick. Each tick handled the older accept signal first,
+       so 8 sequential requests filled the conn pool with active=true
+       slots whose on_response_sent never ran. The 9th connection saw
+       NO FREE SLOT and the listener appeared wedged.
+
+       The fix matches the doxygen contract on axl_loop_attach_driver
+       ("processes whatever's pending in this tick before returning"):
+       loop until axl_loop_dispatch returns "nothing ready". Each
+       iteration calls next_event afresh, which rebuilds event_array
+       from loop->sources, so a callback that frees a sock (and its
+       sources) here drops them out of the next iter automatically —
+       no new lifetime exposure beyond what dispatch_event's
+       slot-reuse snapshot (line 428) already handles for one cb.
+
+       The cap is a safety net for a pathological cb that re-arms an
+       always-signaled source — it puts an upper bound on how long
+       we hold TPL_CALLBACK in any single tick. AXL_MAX_SOURCES is
+       the upper bound on event_count, so capping at 2× that lets a
+       legitimate burst (accept + N×(recv+send) for the full source
+       table) drain in one tick while still bounding pathological
+       runaway. Hitting the cap is logged so the consumer sees it
+       before the next mystery wedge. */
+    int drained = 0;
+    for (drained = 0; drained < AXL_MAX_SOURCES * 2; drained++) {
+        if (axl_loop_dispatch(loop, /*blocking=*/false) != 0) {
+            break;  /* nothing pending */
+        }
+        if (loop->quit_requested) {
+            break;
+        }
+    }
+    if (drained == AXL_MAX_SOURCES * 2) {
+        axl_warning("driver_dispatch_notify: hit drain cap (%d) — a "
+                    "source callback may be re-arming an always-signaled "
+                    "event; check notify-budget guidance",
+                    AXL_MAX_SOURCES * 2);
+    }
+}
+
+int
+axl_loop_attach_driver(AxlLoop *loop, uint64_t interval_ms)
+{
+    AxlEventHandle  event;
+
+    if (loop == NULL || interval_ms == 0) {
+        return AXL_ERR;
+    }
+
+    if (loop->driver_timer != NULL) {
+        axl_warning("axl_loop_attach_driver: loop already attached "
+                    "— call axl_loop_detach_driver first");
+        return AXL_ERR;
+    }
+
+    if (axl_backend_event_create_notify_timer(
+            driver_dispatch_notify, loop,
+            interval_ms * MS_TO_100NS, &event) != AXL_OK) {
+        axl_error("axl_loop_attach_driver: backend refused timer");
+        return AXL_ERR;
+    }
+
+    /* Don't touch loop->running here — driver_dispatch_notify
+       lazy-sets it on the first tick, which means a foreground
+       axl_loop_run still owns the running-flag invariant if both
+       paths happen to be active. axl_loop_quit clears it; that's
+       the only intended toggle. */
+    loop->driver_timer = event;
+    return AXL_OK;
+}
+
+int
+axl_loop_detach_driver(AxlLoop *loop)
+{
+    if (loop == NULL || loop->driver_timer == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Backend close cancels the timer first, then CloseEvent
+       drains any in-flight notify, then the bridging context is
+       freed — see axl_backend_event_close_dbg in
+       axl-backend-native-event.c. Don't clear loop->running:
+       attach didn't set it (driver_dispatch_notify did, lazily),
+       and clearing it now would step on a foreground caller if
+       one happens to be running concurrently. */
+    axl_backend_event_close(loop->driver_timer);
+    loop->driver_timer = NULL;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------

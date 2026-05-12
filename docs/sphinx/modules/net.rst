@@ -12,6 +12,16 @@ Network Utilities
 
 .. doxygenfile:: axl-net.h
 
+AxlNetOpts
+~~~~~~~~~~
+
+Canonical NIC / static-IP / port / listen-IP options bag,
+embedded as a sub-struct in a consumer's own options type and
+paired with the ``axl_config_descs_net`` group-injection helper
+in ``<axl/axl-config.h>``.
+
+.. doxygenfile:: axl-net-opts.h
+
 AxlInetAddress / AxlSocketAddress
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

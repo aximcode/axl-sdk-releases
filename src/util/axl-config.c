@@ -13,6 +13,7 @@
 #include <axl/axl-hash-table.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-log.h>
+#include <axl/axl-url.h>
 
 AXL_LOG_DOMAIN("config");
 
@@ -515,6 +516,331 @@ axl_config_get_multi(AxlConfig *cfg, const char *key, size_t index)
 }
 
 // ---------------------------------------------------------------------------
+// Public API — cross-binary serialization
+// ---------------------------------------------------------------------------
+
+/* Append `key=value&` (URL-encoded) to *out, advancing *cursor and
+   shrinking *remaining. Returns AXL_OK if the encode + concat fit,
+   AXL_ERR on overflow. The trailing '&' is unconditional — caller
+   strips it after the loop. */
+static int
+to_string_emit_pair(const char *key, const char *value,
+                    char **cursor, size_t *remaining)
+{
+    int n;
+
+    if (*remaining == 0) {
+        return AXL_ERR;
+    }
+
+    n = axl_url_encode(key, *cursor, *remaining);
+    if (n < 0) {
+        return AXL_ERR;
+    }
+    *cursor    += n;
+    *remaining -= (size_t)n;
+
+    if (*remaining < 2) {  /* room for '=' + at least the trailing NUL */
+        return AXL_ERR;
+    }
+    **cursor = '=';
+    (*cursor)++;
+    (*remaining)--;
+
+    /* Empty value is legal (e.g. "key=") — encode produces 0 bytes. */
+    n = axl_url_encode(value != NULL ? value : "", *cursor, *remaining);
+    if (n < 0) {
+        return AXL_ERR;
+    }
+    *cursor    += n;
+    *remaining -= (size_t)n;
+
+    if (*remaining < 2) {
+        return AXL_ERR;
+    }
+    **cursor = '&';
+    (*cursor)++;
+    (*remaining)--;
+
+    return AXL_OK;
+}
+
+typedef struct {
+    char    *cursor;
+    size_t   remaining;
+    int      rc;
+} ToStringCtx;
+
+static void
+to_string_scalar_cb(const void *key, void *value, void *data)
+{
+    ToStringCtx *ctx = (ToStringCtx *)data;
+
+    if (ctx->rc != AXL_OK) {
+        return;  /* short-circuit on first error */
+    }
+    ctx->rc = to_string_emit_pair((const char *)key,
+                                  (const char *)value,
+                                  &ctx->cursor, &ctx->remaining);
+}
+
+static void
+to_string_multi_cb(const void *key, void *value, void *data)
+{
+    ToStringCtx       *ctx = (ToStringCtx *)data;
+    const MultiValues *mv  = (const MultiValues *)value;
+
+    for (size_t i = 0; i < mv->count; i++) {
+        if (ctx->rc != AXL_OK) {
+            return;
+        }
+        ctx->rc = to_string_emit_pair((const char *)key,
+                                      mv->values[i],
+                                      &ctx->cursor, &ctx->remaining);
+    }
+}
+
+int
+axl_config_to_string(AxlConfig *cfg, char *out, size_t out_size)
+{
+    if (cfg == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+
+    ToStringCtx ctx;
+    ctx.cursor    = out;
+    ctx.remaining = out_size;
+    ctx.rc        = AXL_OK;
+
+    /* Scalar values (the multi map's keys also appear in `values`
+       but pointing at MULTI sentinels — skip those, walk multi
+       separately below). The scalar walk hits each non-multi key
+       exactly once. */
+    axl_hash_table_foreach(cfg->values, to_string_scalar_cb, &ctx);
+
+    /* MULTI walk emits one `key=value&` for each value. */
+    axl_hash_table_foreach(cfg->multi, to_string_multi_cb, &ctx);
+
+    if (ctx.rc != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    /* Strip the trailing '&' if we emitted at least one pair, otherwise
+       NUL-terminate the empty buffer. */
+    if (ctx.cursor > out && ctx.cursor[-1] == '&') {
+        ctx.cursor--;
+        ctx.remaining++;
+    }
+    *ctx.cursor = '\0';
+    return AXL_OK;
+}
+
+int
+axl_config_target_to_string(
+    const AxlConfigDesc *descs,
+    const void          *target,
+    char                *out,
+    size_t               out_size
+    )
+{
+    if (descs == NULL || target == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+
+    char  *cursor    = out;
+    size_t remaining = out_size;
+    char   buf[64];   /* numeric/bool formatting */
+
+    for (const AxlConfigDesc *d = descs; d->key != NULL; d++) {
+        if (d->field_size == 0) {
+            /* No auto-apply, no offsetof anchor — can't read from target. */
+            continue;
+        }
+
+        const uint8_t *field = (const uint8_t *)target + d->offset;
+        const char    *val   = NULL;
+
+        switch (d->type) {
+        case AXL_CFG_BOOL:
+            if (d->field_size == sizeof(bool)) {
+                val = (*(const bool *)field) ? "true" : "false";
+            } else {
+                axl_warning("config: target_to_string: '%s' BOOL has "
+                            "field_size %zu, expected %zu — skipping",
+                            d->key, d->field_size, sizeof(bool));
+            }
+            break;
+
+        case AXL_CFG_INT: {
+            int64_t v = 0;
+            if (d->field_size == sizeof(int32_t)) {
+                v = *(const int32_t *)field;
+            } else if (d->field_size == sizeof(int64_t)) {
+                v = *(const int64_t *)field;
+            } else {
+                axl_warning("config: target_to_string: '%s' INT has "
+                            "field_size %zu, expected 4 or 8 — skipping",
+                            d->key, d->field_size);
+                continue;
+            }
+            axl_snprintf(buf, sizeof(buf), "%lld", (long long)v);
+            val = buf;
+            break;
+        }
+
+        case AXL_CFG_UINT: {
+            uint64_t v = 0;
+            if (d->field_size == sizeof(uint8_t)) {
+                v = *(const uint8_t *)field;
+            } else if (d->field_size == sizeof(uint16_t)) {
+                v = *(const uint16_t *)field;
+            } else if (d->field_size == sizeof(uint32_t)) {
+                v = *(const uint32_t *)field;
+            } else if (d->field_size == sizeof(uint64_t)) {
+                v = *(const uint64_t *)field;
+            } else {
+                axl_warning("config: target_to_string: '%s' UINT has "
+                            "field_size %zu, expected 1/2/4/8 — skipping",
+                            d->key, d->field_size);
+                continue;
+            }
+            axl_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+            val = buf;
+            break;
+        }
+
+        case AXL_CFG_STRING:
+            if (d->field_size == sizeof(char *)) {
+                const char *p = *(const char *const *)field;
+                if (p == NULL) {
+                    continue;  /* nothing set */
+                }
+                val = p;
+            } else {
+                /* Common consumer-side mistake: declaring a `char buf[N]`
+                   field instead of `char *`. AXL_CFG_STRING auto-applies
+                   a pointer to cfg-interned storage, not a memcpy. */
+                axl_warning("config: target_to_string: '%s' STRING has "
+                            "field_size %zu, expected %zu (sizeof(char*)) "
+                            "— declare the target field as `const char *`, "
+                            "not a char buffer; skipping",
+                            d->key, d->field_size, sizeof(char *));
+            }
+            break;
+
+        case AXL_CFG_MULTI:
+        default:
+            /* MULTI doesn't have an offset target; skip silently —
+               this is the documented contract. */
+            continue;
+        }
+
+        if (val == NULL) {
+            continue;
+        }
+
+        if (to_string_emit_pair(d->key, val, &cursor, &remaining) != AXL_OK) {
+            return AXL_ERR;
+        }
+    }
+
+    /* Strip trailing '&' if any pair emitted, NUL-terminate either way. */
+    if (cursor > out && cursor[-1] == '&') {
+        cursor--;
+    }
+    *cursor = '\0';
+    return AXL_OK;
+}
+
+int
+axl_config_from_string(AxlConfig *cfg, const char *in)
+{
+    if (cfg == NULL || in == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Parse `key=value&key=value`. Decode each half via axl_url_decode
+       into stack-bounded buffers (key + value capped to keep the
+       parser stackable; over-cap pairs are an error rather than a
+       silent truncate — matches the conservative split rest of AXL
+       takes on URL parsing). */
+    char key_buf[128];
+    char val_buf[1024];
+
+    const char *p = in;
+    while (*p != '\0') {
+        const char *amp = p;
+        while (*amp != '\0' && *amp != '&') {
+            amp++;
+        }
+
+        size_t pair_len = (size_t)(amp - p);
+        if (pair_len == 0) {
+            /* Empty pair (e.g. leading "&" or "&&") — skip. */
+            if (*amp == '&') {
+                amp++;
+            }
+            p = amp;
+            continue;
+        }
+
+        /* Find '=' inside the pair. No '=' → value is empty string. */
+        const char *eq = p;
+        while (eq < amp && *eq != '=') {
+            eq++;
+        }
+
+        size_t key_enc_len = (size_t)(eq - p);
+        size_t val_enc_len = (eq < amp) ? (size_t)(amp - eq - 1) : 0;
+
+        if (key_enc_len == 0) {
+            axl_warning("axl_config_from_string: empty key at offset %zd",
+                        (intptr_t)(p - in));
+            return AXL_ERR;
+        }
+        if (key_enc_len >= sizeof(key_buf) ||
+            val_enc_len >= sizeof(val_buf)) {
+            axl_warning("axl_config_from_string: pair too large at offset %zd",
+                        (intptr_t)(p - in));
+            return AXL_ERR;
+        }
+
+        /* axl_url_decode reads a NUL-terminated string. Stage into
+           a small buffer first to NUL-terminate the encoded slice. */
+        char enc_key[sizeof(key_buf)];
+        char enc_val[sizeof(val_buf)];
+        axl_memcpy(enc_key, p, key_enc_len);
+        enc_key[key_enc_len] = '\0';
+        if (val_enc_len > 0) {
+            axl_memcpy(enc_val, eq + 1, val_enc_len);
+        }
+        enc_val[val_enc_len] = '\0';
+
+        if (axl_url_decode(enc_key, key_buf, sizeof(key_buf)) < 0) {
+            axl_warning("axl_config_from_string: bad key encoding");
+            return AXL_ERR;
+        }
+        if (axl_url_decode(enc_val, val_buf, sizeof(val_buf)) < 0) {
+            axl_warning("axl_config_from_string: bad value encoding");
+            return AXL_ERR;
+        }
+
+        if (axl_config_set(cfg, key_buf, val_buf) != AXL_OK) {
+            axl_warning("axl_config_from_string: set('%s', '%s') failed",
+                        key_buf, val_buf);
+            return AXL_ERR;
+        }
+
+        if (*amp == '&') {
+            amp++;
+        }
+        p = amp;
+    }
+
+    return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Public API — command-line parsing
 // ---------------------------------------------------------------------------
 
@@ -529,4 +855,37 @@ axl_config_set_parent(AxlConfig *cfg, AxlConfig *parent)
         return;
     }
     cfg->parent = parent;
+}
+
+// ---------------------------------------------------------------------------
+// Public API — descriptor-table composition
+// ---------------------------------------------------------------------------
+
+size_t
+axl_config_descs_append(
+    AxlConfigDesc       *out,
+    size_t               cap,
+    const AxlConfigDesc *src)
+{
+    if (out == NULL || src == NULL) {
+        return 0;
+    }
+
+    /* Count source entries (stopping at the {0} sentinel) before
+       writing anything, so an under-capacity request is a clean
+       no-op rather than a partial copy. */
+    size_t n = 0;
+    while (src[n].key != NULL) {
+        n++;
+    }
+
+    if (n > cap) {
+        axl_warning("axl_config_descs_append: cap=%zu cannot hold %zu entries",
+                    cap, n);
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        out[i] = src[i];
+    }
+    return n;
 }

@@ -5,12 +5,12 @@
  * axl-config.h:
  *
  * Live object property bag. Declare typed options once in a
- * descriptor table; mutate at runtime via @ref axl_config_set;
+ * descriptor table; mutate at runtime via axl_config_set;
  * retrieve via typed getters. Supports auto-apply into a target
  * struct via offsetof, dynamic-key callbacks (for namespaces like
  * "header.*"), and parent inheritance for cascading defaults.
  *
- * For command-line argument parsing, use @ref axl_args_run from
+ * For command-line argument parsing, use axl_args_run from
  * <axl/axl-args.h>. AxlConfig used to do that too; the CLI surface
  * was retired once AxlArgs landed.
  */
@@ -43,6 +43,15 @@ extern "C" {
 
 /**
  * @brief Option descriptor. Define a static array terminated by {0}.
+ *
+ * AxlConfig itself only consumes @c key, @c type, @c default_value,
+ * @c offset, and @c field_size — the parser doesn't care whether an
+ * option also has a CLI short flag or a closed set of allowed values.
+ * The remaining fields exist so consumers can use a single descriptor
+ * table to drive both AxlConfig auto-apply AND a synthesized
+ * @c AxlArgDesc[] CLI surface (see @c axl_service_main, which walks
+ * this table to build its argv parser). The CLI-only fields are
+ * ignored by AxlConfig parsing.
  */
 typedef struct {
     const char *key;            ///< dotted name (e.g. "timeout.ms")
@@ -51,6 +60,18 @@ typedef struct {
     const char *description;    ///< help text (logged in debug mode)
     size_t      offset;         ///< offsetof into target struct
     size_t      field_size;     ///< sizeof the target field (0 = no auto-apply)
+    char        short_name;     ///< CLI short flag (single char), 0 = none.
+                                ///< Used by axl_service_main when synthesizing
+                                ///< its AxlArgDesc[]; AxlConfig parsing ignores.
+    const char *const *choices; ///< NULL-terminated allowed-value list for
+                                ///< STRING-typed options. When set, the
+                                ///< axl_service_main synthesizer emits
+                                ///< AXL_ARG_CHOICE instead of AXL_ARG_STRING
+                                ///< so the CLI parser validates and the
+                                ///< --help text lists the values. NULL = no
+                                ///< restriction. Trailing position keeps the
+                                ///< struct's existing zero-init layout
+                                ///< compatible.
 } AxlConfigDesc;
 
 // ---------------------------------------------------------------------------
@@ -205,6 +226,159 @@ axl_config_get_multi(
     AxlConfig  *cfg,    ///< config
     const char *key,    ///< option key
     size_t      index   ///< 0-based index
+);
+
+// ---------------------------------------------------------------------------
+// Cross-binary serialization
+// ---------------------------------------------------------------------------
+//
+// Wire format: URL-encoded query string (RFC 3986) — `key=value&key=...`.
+// Both keys and values percent-encode anything outside the unreserved
+// set (so '&' and '=' inside values are escaped as `%26` / `%3D`).
+// Repeated keys become AXL_CFG_MULTI values on the parse side. Used by
+// AxlService to ship a foreground process's options through
+// EFI_LOADED_IMAGE_PROTOCOL.LoadOptions to a same-source-tree driver
+// image.
+//
+// Parsers / encoders dogfood axl_url_encode / axl_url_decode — same
+// escaping rules as the rest of AXL's net stack, no bespoke format.
+
+/**
+ * @brief Serialize all set values to a URL query string.
+ *
+ * Walks every value currently set in the config (single and MULTI),
+ * emits `key=value&...` with both key and value URL-percent-encoded.
+ * Defaults that haven't been overridden are NOT emitted (the parsing
+ * side will re-apply defaults from its own descriptor table).
+ *
+ * @return AXL_OK on success, AXL_ERR on @p out_size overflow or NULL
+ *     args. On overflow @p out is left in an unspecified state.
+ */
+int
+axl_config_to_string(
+    AxlConfig *cfg,        ///< config to serialize
+    char      *out,        ///< output buffer
+    size_t     out_size    ///< capacity of @p out in bytes
+);
+
+/**
+ * @brief Serialize a target struct directly via its descriptor table.
+ *
+ * Walks @p descs, reads each option's current value from @p target
+ * via offsetof, formats it, URL-encodes the pair, appends to @p out.
+ * Independent of any AxlConfig instance — useful for cross-binary
+ * marshalling where the consumer populates @p target through CLI
+ * parsing (axl_args_*) without ever creating an AxlConfig.
+ *
+ * Skips MULTI options (offset/field_size are 0 for those by
+ * convention; serializing requires walking an opaque list the
+ * descriptor doesn't reach). Skips entries with field_size == 0.
+ *
+ * @return AXL_OK on success, AXL_ERR on overflow or NULL args.
+ */
+int
+axl_config_target_to_string(
+    const AxlConfigDesc *descs,    ///< descriptor table (terminated by {0})
+    const void          *target,   ///< struct to read fields from
+    char                *out,      ///< output buffer
+    size_t               out_size  ///< capacity of @p out in bytes
+);
+
+/**
+ * @brief Parse a URL query string into the config.
+ *
+ * Splits on '&' into pairs, splits each pair on the first '=',
+ * URL-decodes both halves, calls axl_config_set on each. A value
+ * with no '=' is treated as the empty string. Repeated keys are
+ * fed to axl_config_set in order (which appends to MULTI options
+ * and overwrites scalar ones).
+ *
+ * Stops at the first axl_config_set failure and returns AXL_ERR —
+ * callers that need partial-parse-on-error semantics should split
+ * the string themselves and call axl_config_set in a loop.
+ *
+ * @return AXL_OK on success, AXL_ERR on NULL args, malformed encoding,
+ *     or any axl_config_set failure.
+ */
+int
+axl_config_from_string(
+    AxlConfig  *cfg,   ///< config to populate
+    const char *in     ///< URL query string (NUL-terminated)
+);
+
+// ---------------------------------------------------------------------------
+// Descriptor-table composition helpers (group injection)
+// ---------------------------------------------------------------------------
+//
+// Networked tools and services typically need the same NIC /
+// static-IP / port / listen-IP options that a sibling library
+// (e.g. AxlNetOpts) defines. Instead of every consumer copy-pasting
+// the descriptor entries, the consumer embeds the standard sub-struct
+// in its own options type and calls axl_config_descs_net(...) to
+// emit the matching descriptors into a local accumulator. The
+// consumer then appends its own descriptor fragment via
+// axl_config_descs_append and terminates with a zeroed entry. The
+// resulting table is fed to axl_config_new as usual.
+//
+// Why this shape (no varargs axl_config_compose): keeps the C type
+// system fully engaged on the consumer's own fragment (no untyped
+// va_args), preserves AxlConfigDesc's short_name / choices fields,
+// and is ~30 LOC instead of ~120. Future axl_config_descs_log /
+// axl_config_descs_tls slot in the same pattern when a second
+// consumer asks for them.
+
+/**
+ * @brief Emit the standard NIC / static-IP / port / listen-IP
+ *     descriptors into a consumer-owned accumulator.
+ *
+ * @p kinds is a bitmask of AxlNetOptKind values (see
+ * <axl/axl-net-opts.h>) selecting which subset to emit; the
+ * AXL_NET_OPT_CLIENT / _SERVER presets are the common cases.
+ *
+ * Each emitted descriptor's @c offset is added to @p base_offset —
+ * the @c offsetof of the consumer's embedded @c AxlNetOpts
+ * sub-struct in its own options type — so AxlConfig's auto-apply
+ * lands the parsed value in the right place. @c field_size is set
+ * from the corresponding @c AxlNetOpts member, including the
+ * @c uint16_t @c port (so AXL_CFG_UINT auto-apply doesn't write
+ * past the field).
+ *
+ * Writes consecutively into @p out starting at index 0. Does NOT
+ * append a terminating zeroed entry — callers compose with
+ * axl_config_descs_append and terminate the combined table
+ * themselves.
+ *
+ * @return number of descriptors written. Returns 0 (no partial
+ *     write) and logs a warning via log domain @c "net" if
+ *     @p cap is too small or @p out is NULL.
+ */
+size_t
+axl_config_descs_net(
+    AxlConfigDesc *out,          ///< accumulator (caller-owned, written at [0..])
+    size_t         cap,          ///< capacity of @p out in entries
+    uint32_t       kinds,        ///< bitmask of AxlNetOptKind
+    size_t         base_offset   ///< offsetof(consumer-Opts, AxlNetOpts-sub-struct)
+);
+
+/**
+ * @brief Copy a consumer-owned NULL-terminated descriptor fragment
+ *     onto the end of an accumulator.
+ *
+ * Walks @p src until the first zeroed entry (key == NULL),
+ * copying each preceding descriptor into @p out. The terminator
+ * is NOT copied — the caller writes the final zeroed entry once,
+ * after all fragments have been appended.
+ *
+ * @return number of descriptors copied. Returns 0 (no partial
+ *     write) if @p out or @p src is NULL; an under-capacity
+ *     request also returns 0 and logs a warning via log domain
+ *     @c "config".
+ */
+size_t
+axl_config_descs_append(
+    AxlConfigDesc       *out,   ///< accumulator (write position)
+    size_t               cap,   ///< remaining capacity in entries
+    const AxlConfigDesc *src    ///< NULL-terminated fragment to copy
 );
 
 // ---------------------------------------------------------------------------

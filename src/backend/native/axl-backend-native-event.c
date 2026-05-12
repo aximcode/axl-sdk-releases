@@ -20,6 +20,7 @@
 
 #include "axl-backend.h"
 #include <axl/axl-log.h>
+#include <axl/axl-mem.h>
 
 AXL_LOG_DOMAIN("backend");
 
@@ -101,6 +102,137 @@ axl_backend_event_create(
     return AXL_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Periodic notify-signal timer — driver-mode dispatch primitive.
+//
+// Used by axl_loop_attach_driver. Allocates a small NotifyTimerCtx
+// that bridges the firmware's (EFI_EVENT, void *) notify signature
+// to AXL's (void *ctx) callback shape, and tracks the allocation in
+// a fixed table so axl_backend_event_close can free it without a
+// separate close primitive.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    void  (*notify)(void *);
+    void   *ctx;
+} NotifyTimerCtx;
+
+#define NOTIFY_TIMER_TABLE_SIZE  16
+
+typedef struct {
+    EFI_EVENT       handle;
+    NotifyTimerCtx *ctx;
+    bool            active;
+} NotifyTimerEntry;
+
+static NotifyTimerEntry mNotifyTimerTable[NOTIFY_TIMER_TABLE_SIZE];
+
+static VOID EFIAPI
+notify_timer_trampoline(
+    EFI_EVENT  event,
+    VOID      *ctx_v
+    )
+{
+    (void)event;
+    NotifyTimerCtx *nc = (NotifyTimerCtx *)ctx_v;
+    if (nc != NULL && nc->notify != NULL) {
+        nc->notify(nc->ctx);
+    }
+}
+
+int
+axl_backend_event_create_notify_timer(
+    void   (*notify)(void *ctx),
+    void    *ctx,
+    uint64_t interval_100ns,
+    AxlEventHandle *event
+    )
+{
+    EFI_STATUS       status;
+    EFI_EVENT        ev = NULL;
+    NotifyTimerCtx  *nc = NULL;
+    size_t           slot = NOTIFY_TIMER_TABLE_SIZE;
+
+    if (notify == NULL || event == NULL || interval_100ns == 0) {
+        return AXL_ERR;
+    }
+
+    /* Reserve a tracking slot first — fail before allocating if the
+       table is full so we don't have to roll back the alloc. */
+    for (size_t i = 0; i < NOTIFY_TIMER_TABLE_SIZE; i++) {
+        if (!mNotifyTimerTable[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == NOTIFY_TIMER_TABLE_SIZE) {
+        axl_warning("notify-timer table full (%d slots) — "
+                    "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
+                    NOTIFY_TIMER_TABLE_SIZE);
+        return AXL_ERR;
+    }
+
+    nc = (NotifyTimerCtx *)axl_malloc(sizeof(NotifyTimerCtx));
+    if (nc == NULL) {
+        return AXL_ERR;
+    }
+    nc->notify = notify;
+    nc->ctx    = ctx;
+
+    /* TPL_CALLBACK is the lowest TPL legal for an EVT_NOTIFY_SIGNAL
+       event per UEFI 2.11 §7.1 (TPL_APPLICATION rejects with
+       EFI_INVALID_PARAMETER — there is no signal queue at the main-
+       thread level). TPL_CALLBACK alternates fairly with co-located
+       firmware drivers' notifies (TCP4/MNP/SNP run at the same
+       level) so a fast consumer notify doesn't starve them. The
+       caller's notify MUST be short — see axl_loop_attach_driver
+       doxygen and src/loop/README.md. */
+    status = gBS->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                              notify_timer_trampoline, nc, &ev);
+    if (EFI_ERROR(status)) {
+        axl_free(nc);
+        return AXL_ERR;
+    }
+
+    status = gBS->SetTimer(ev, TimerPeriodic, interval_100ns);
+    if (EFI_ERROR(status)) {
+        gBS->CloseEvent(ev);
+        axl_free(nc);
+        return AXL_ERR;
+    }
+
+    mNotifyTimerTable[slot].handle = ev;
+    mNotifyTimerTable[slot].ctx    = nc;
+    mNotifyTimerTable[slot].active = true;
+
+    event_close_ring_record_create((void *)ev);
+    *event = (AxlEventHandle)ev;
+    return AXL_OK;
+}
+
+/* Look up and release a notify-timer's tracking slot. Returns true
+   if the handle was a tracked notify-timer (caller has already
+   closed the EFI event); the close path in event_close_dbg uses
+   this to free the bridging context. */
+static bool
+notify_timer_release(EFI_EVENT handle)
+{
+    if (handle == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < NOTIFY_TIMER_TABLE_SIZE; i++) {
+        if (mNotifyTimerTable[i].active &&
+            mNotifyTimerTable[i].handle == handle) {
+            axl_free(mNotifyTimerTable[i].ctx);
+            mNotifyTimerTable[i].handle = NULL;
+            mNotifyTimerTable[i].ctx    = NULL;
+            mNotifyTimerTable[i].active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 void
 axl_backend_event_close_dbg(
     AxlEventHandle  event,
@@ -136,7 +268,29 @@ axl_backend_event_close_dbg(
     rec->closed = true;
     mEventCloseHead = (mEventCloseHead + 1) % EVENT_CLOSE_RING_SIZE;
 
+    /* If this was a notify-timer created by
+       axl_backend_event_create_notify_timer, cancel the timer first
+       so no NEW notifies queue, then CloseEvent (which the UEFI
+       spec requires to drain any in-flight notify before
+       returning), then free the bridging context. The cancel +
+       close + free ordering ensures the trampoline never reads
+       freed `nc` memory: by the time we hit notify_timer_release,
+       CloseEvent has guaranteed no notify is mid-execution. */
+    bool is_notify_timer = false;
+    for (size_t i = 0; i < NOTIFY_TIMER_TABLE_SIZE; i++) {
+        if (mNotifyTimerTable[i].active &&
+            mNotifyTimerTable[i].handle == (EFI_EVENT)event) {
+            is_notify_timer = true;
+            gBS->SetTimer((EFI_EVENT)event, TimerCancel, 0);
+            break;
+        }
+    }
+
     gBS->CloseEvent((EFI_EVENT)event);
+
+    if (is_notify_timer) {
+        notify_timer_release((EFI_EVENT)event);
+    }
 }
 
 int

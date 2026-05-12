@@ -99,6 +99,17 @@ and intentionally deferred:
   config; HEST is in the ACPI bundle.
 - **NUMA topology (SRAT/SLIT/HMAT)** — on the ACPI denylist; QEMU
   generates its own.
+- **Dynamic protocol traces** (KCS state-machine logs, IPMI
+  request/response timing, USB enumeration order) are NOT fixture
+  artifacts — they are validation data for axl-sdk's state
+  machines. The XE7745 lab archive contains examples (e.g.
+  `10-axl-sdk-kcs-WORKING-on-iDRAC10.log`,
+  `15-memspd-port0-only-traces.log`) that proved the bit-position
+  bug in the KCS BaseAddressModifier; these get re-run during
+  bring-up, not replayed against fixtures. If we ever want
+  trace-driven replay (e.g. "feed this captured KCS sequence to
+  the BMC sim and verify the same state walk"), it's a separate
+  feature — not part of HF.
 
 ## Architecture
 
@@ -188,10 +199,32 @@ Why native UEFI rather than a Linux capture script:
 
 Optional captures (Redfish, IPMI, SPD) are gated by CLI flags. The
 SMBIOS/ACPI/PCI capture is always cheap and always on. SPD capture
-is gated because it requires an SMBus controller driver
-(`SmbusHcShim.efi` on QEMU; native ICH/PCH driver on real Intel
-boxes; vendor SMBus driver elsewhere) — present on most servers,
-absent on locked-down corporate laptops.
+is gated because it requires the platform to expose an SMBus
+controller through `EFI_SMBUS_HC_PROTOCOL` or `EFI_I2C_MASTER_PROTOCOL`.
+Four real-world cases:
+
+1. **QEMU**: `SmbusHcShim.efi` republishes the ICH9 SMBus as
+   `EFI_I2C_MASTER_PROTOCOL`. Always available in our test rig.
+2. **Native Intel server / desktop**: ICH/PCH driver in firmware,
+   typically present on enterprise boards. Works.
+3. **Other vendor SMBus driver** (e.g. AMD FCH on a board where
+   the firmware DOES expose it): works.
+4. **Vendor server where firmware deliberately hides the SMBus
+   controller** — e.g. **Dell PowerEdge XE7745** has an AMD FCH
+   PIIX4 SMBus at I/O port 0xB20 visible to Linux's `piix4` driver,
+   carrying the DDR5 SPDs at 0x50–0x57, but Dell's UEFI publishes
+   neither `EFI_SMBUS_HC_PROTOCOL` nor `EFI_I2C_MASTER_PROTOCOL`
+   for it. mkfixture's `spd/` directory will be **empty** on these
+   boxes even though SPDs are physically present and readable from
+   any OS that can drive the chipset directly. This is a vendor
+   firmware choice, not a tooling bug. Capture from a Linux boot
+   on the same hardware (a future HF-host pipeline, not in scope
+   yet) is the only workaround. See `DellXE7745/17-fedora44-spd5118-binding-fails.md`
+   in the gitignored capture archive for the live-system evidence.
+
+Memo for future readers: when a Dell-class server captures with no
+SPDs, the missing data is almost certainly category 4 above —
+don't chase it as a mkfixture bug.
 
 **SMBIOS format note**: `smbios.bin` is the **raw structure region**
 — a sequence of type/length/handle records terminated by Type 127 —
@@ -413,6 +446,8 @@ is fuzzy by design:
 | AMD Rome (23.49)              | `EPYC-Rome` |
 | AMD Milan (25.1)              | `EPYC-Milan` |
 | AMD Genoa (25.17)             | `EPYC-Genoa` |
+| AMD Bergamo (25.17, 32C/64T)  | `EPYC-Genoa` (with `-smp` cores= override) |
+| AMD Turin (26.17)             | `EPYC-Turin` (QEMU 9.0+) |
 | (unknown family.model)        | `host` if KVM, else `qemu64` |
 
 Exact CPUID-leaf replay is intractable without per-leaf overrides —
@@ -442,6 +477,22 @@ add `--usb-shim` (or `--usb-shim CLASS,...`) to enable. The
 manifest distinction matters: a CDC-ECM stand-in is a virtio-style
 USB-NIC, NOT the real BMC; tests that rely on the actual BMC USB
 protocol will mislead if the user thinks the shim is faithful.
+
+**Concrete example — Dell PowerEdge XE7745 iDRAC**: the iDRAC10
+publishes a USB-RNDIS NIC (NOT plain CDC-ECM) plus a Realtek
+RTL8153 over the host-side virtual USB bus, plus a "DRAC virtual
+KB/M" HID composite. mkfixture's `usb.json` will record all three
+(VID/PID, class/subclass, descriptor blob in `usb/<bus>-<port>.bin`).
+Replay options:
+- `usb-net` shim: gets us "an SNP NIC appears" but not the
+  Dell-RNDIS framing. axl-sdk's existing UsbRndis driver bundle
+  works against a real iDRAC, NOT against the QEMU `usb-net` shim.
+- HID stand-ins (`usb-kbd`/`usb-tablet`): work for input, but the
+  Dell virtual-KB/M's vendor-extension descriptors (which the
+  iDRAC firmware reads to do special key remapping) are lost.
+- For real BMC behavior, point axl-sdk at OpenBMC-in-QEMU (HF7
+  reference setup) — a real BMC firmware stack — instead of
+  trying to fake the Dell USB-RNDIS protocol.
 
 Anything beyond class-compliant — proprietary BMC virtual media,
 IDSDM control endpoints, vendor HID extensions — needs a future
@@ -701,11 +752,20 @@ Suggested ordering, smallest viable slices first:
    Detect non-secboot OVMF and warn when `--secureboot` is requested
    against it.
 7. **Phase HF7** — Redfish capture (HTTP walk) and replay. Capture
-   on the UEFI side via `mkfixture`. Replay lives in `axl-emulate`,
-   which spawns DMTF `Redfish-Mockup-Server` from the captured
-   `redfish/` tree and adds the appropriate `--hostfwd` arg to its
-   run-qemu.sh invocation. Validate against OpenBMC-in-QEMU as the
-   "real BMC" reference.
+   on the UEFI side via `mkfixture`. **Endpoint discovery** uses
+   the SMBIOS captures from HF2.1: SMBIOS Type 42 (Management
+   Controller Host Interface) records publish the BMC's Redfish
+   endpoint URL, credentials hint, and host-interface type
+   (USB-NIC vs PCI vs OEM). mkfixture's HF2.1 `smbios.bin` already
+   contains Type 42 — HF7 just parses it to know which IP/port to
+   walk. Confirmed on Dell XE7745: dmidecode --type 42 shows the
+   iDRAC10 Redfish-over-IP record, and axl-sdk's existing Type 42
+   reader (`axl_smbios_find_redfish_host_interface`) decodes it.
+   Replay lives in `axl-emulate`, which spawns DMTF
+   `Redfish-Mockup-Server` from the captured `redfish/` tree and
+   adds the appropriate `--hostfwd` arg to its run-qemu.sh
+   invocation. Validate against OpenBMC-in-QEMU as the "real BMC"
+   reference.
 8. **Phase HF8** — IPMI capture (KCS sweep) and replay. Replay
    lives in `axl-emulate`, which spawns OpenIPMI `ipmi_sim` seeded
    with captured replies and tells run-qemu.sh `--ipmi-extern

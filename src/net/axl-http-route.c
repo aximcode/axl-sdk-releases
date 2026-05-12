@@ -6,6 +6,7 @@
 **/
 
 #include "axl-http-server-internal.h"
+#include <stdarg.h>
 
 AXL_LOG_DOMAIN("http");
 
@@ -150,6 +151,33 @@ axl_http_server_add_route(AxlHttpServer *s, const char *method,
     }
     return (add_route_internal(s, method, path, handler, data) != NULL)
            ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_http_server_add_routes(AxlHttpServer *s, ...)
+{
+    va_list ap;
+    va_start(ap, s);
+
+    int rc = AXL_OK;
+    for (;;) {
+        const char *method = va_arg(ap, const char *);
+        if (method == NULL) {
+            /* Sentinel: end of list. */
+            break;
+        }
+        const char     *path    = va_arg(ap, const char *);
+        AxlHttpHandler  handler = va_arg(ap, AxlHttpHandler);
+        void           *data    = va_arg(ap, void *);
+
+        if (axl_http_server_add_route(s, method, path, handler, data) != AXL_OK) {
+            rc = AXL_ERR;
+            break;
+        }
+    }
+
+    va_end(ap);
+    return rc;
 }
 
 int

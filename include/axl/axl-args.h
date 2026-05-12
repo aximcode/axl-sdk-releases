@@ -5,8 +5,8 @@
  * axl-args.h:
  *
  * Declarative command-line parser for AXL tools. A tool declares a
- * static @ref AxlArgsNode tree (program name + flags + positionals +
- * handler, OR a list of child verbs) and calls @ref axl_args_run from
+ * static AxlArgsNode tree (program name + flags + positionals +
+ * handler, OR a list of child verbs) and calls axl_args_run from
  * main. The framework parses argv, validates types and bounds,
  * generates a structured `--help`, and dispatches to the matching
  * leaf handler.
@@ -155,7 +155,7 @@ typedef enum {
  *
  * For numeric types (`AXL_ARG_U8`..`AXL_ARG_S64`):
  *  - @c base: 0 (auto-detect 0x prefix), 10, or 16 — passed to the
- *    @ref axl_str_to_u64 family. Default 0 = auto.
+ *    axl_str_to_u64 family. Default 0 = auto.
  *  - @c min, @c max: inclusive bounds. Each independently 0 = no
  *    bound (so a U8 with `.min = 0, .max = 0xFF` is the same as
  *    "no bounds at all").
@@ -182,11 +182,11 @@ typedef struct {
     /// values; the framework rejects any input not present here with
     /// the same breadcrumb-prefixed error it uses for out-of-range
     /// numerics, and lists the choices in `--help`. Comparison is
-    /// case-sensitive by default; set @ref choices_case_insensitive
+    /// case-sensitive by default; set choices_case_insensitive
     /// to relax. NULL or empty array makes a CHOICE behave like an
     /// unconstrained AXL_ARG_STRING.
     const char *const *choices;
-    /// (`AXL_ARG_CHOICE` only) when true, match against @ref choices
+    /// (`AXL_ARG_CHOICE` only) when true, match against choices
     /// using ASCII case-folded comparison (`axl_strcasecmp`). Folds
     /// letters only — non-ASCII bytes compare as bytes, so localized
     /// or UTF-8 multi-byte choice strings still effectively match
@@ -213,10 +213,10 @@ typedef struct AxlArgsNode AxlArgsNode;
  * are visible (the accessors walk up the parent chain on miss).
  *
  * **Lifetime contract** — important when the handler enters an event
- * loop (@ref axl_loop_run) or otherwise blocks before returning:
+ * loop (axl_loop_run) or otherwise blocks before returning:
  *  - The @c AxlArgs struct itself, all `axl_args_get_*` accessor
  *    return values, and the variadic-positional view all live until
- *    the handler returns to @ref axl_args_run (every level's
+ *    the handler returns to axl_args_run (every level's
  *    `AxlArgs` lives on its own stack frame, so a deep handler still
  *    sees its parent's flags through the recursion).
  *  - String values returned by @c axl_args_get_string and
@@ -289,7 +289,7 @@ struct AxlArgsNode {
     /// auto-generated `Usage:` line (and the per-section blocks
     /// that follow it). Use for a multi-paragraph description,
     /// usage examples, environment-variable list, or anything
-    /// that doesn't fit on the single-line @ref help summary.
+    /// that doesn't fit on the single-line help summary.
     /// Per-node: each level's `--help` uses its own prolog;
     /// `do --help` shows the root node's, `do bios --help` shows
     /// the bios node's. NULL = nothing printed (default).
@@ -304,10 +304,10 @@ struct AxlArgsNode {
     /// auto-generated sections (Usage, Verbs / Flags,
     /// Arguments). Standard place for "see also" pointers,
     /// "report bugs to ..." footers, links to external docs,
-    /// version stamps, etc. Per-node like @ref help_prolog;
+    /// version stamps, etc. Per-node like help_prolog;
     /// NULL = nothing printed.
     ///
-    /// Whitespace policy: same as @ref help_prolog — the
+    /// Whitespace policy: same as help_prolog — the
     /// framework prepends a single blank-line separator and
     /// appends a single trailing newline. Consumer should not
     /// include leading or trailing newlines.
@@ -330,7 +330,7 @@ struct AxlArgsNode {
  *    stderr followed by the usage line and return 1.
  *  - Successful dispatch returns whatever the leaf handler returned.
  *
- * Return value is **POSIX exit-code shaped**, not @ref AxlStatus —
+ * Return value is **POSIX exit-code shaped**, not AxlStatus —
  * tools doing `return axl_args_run(...)` from main propagate it as
  * the process exit code, so 0/1/2 follow shell convention rather
  * than the negative-value AxlStatus scheme. Handlers should likewise
@@ -398,8 +398,7 @@ axl_args_get_int(
 /**
  * @brief Read a string-typed arg and parse it as `base[+offset]`.
  *
- * Convenience over `axl_args_get_string` + @ref
- * axl_strtou64_with_offset. Suited for tools that accept
+ * Convenience over `axl_args_get_string` + axl_strtou64_with_offset. Suited for tools that accept
  * register/memory addresses in a single token like `0x1000+0x50`
  * across many verbs — the descriptor is declared as
  * `AXL_ARG_STRING` and this accessor handles the parse so each
@@ -408,7 +407,7 @@ axl_args_get_int(
  * Walks parents like the other accessors. The descriptor's
  * @c default_value (if set) is used when the arg was unset.
  *
- * Note: unlike @ref axl_args_get_uint (which returns the value
+ * Note: unlike axl_args_get_uint (which returns the value
  * directly with 0 on miss), this accessor returns
  * @c AXL_OK / @c AXL_ERR — there is no in-band sentinel for a
  * `uint64_t` parse failure, and 0 is a legitimate result.

@@ -124,6 +124,11 @@ struct AxlLoop {
     PubsubTopic     topics[AXL_MAX_TOPICS];
     size_t          topic_count;
     uint32_t        pubsub_next_sub_id;
+
+    // Driver-mode attachment — firmware-managed periodic timer that
+    // drives axl_loop_dispatch from TPL_APPLICATION notify. NULL when
+    // not attached. See axl_loop_attach_driver.
+    AxlEventHandle  driver_timer;
 };
 
 // ---------------------------------------------------------------------------

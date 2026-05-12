@@ -1,0 +1,6 @@
+Hello from an embedded asset!
+
+This file was bundled into the .efi at link time via .incbin and is
+read at runtime through AXL_EMBED_DATA / AXL_EMBED_SIZE. The same
+mechanism works for any binary content: TLS CA bundles, static
+JSON5 config, HTML for an embedded HTTP server, lookup tables, etc.

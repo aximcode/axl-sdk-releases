@@ -97,7 +97,10 @@ SECTIONS
   . = ALIGN(4096);
   .dynstr   : { *(.dynstr) }
   . = ALIGN(4096);
-  .dbgdir : { *(.dbgdir) }
+  /* KEEP — pe-set-debug requires this section to be present even if
+     no symbol references it. --gc-sections (recently enabled) would
+     otherwise strip it as unreachable. */
+  .dbgdir : { KEEP (*(.dbgdir)) }
   . = ALIGN(4096);
   .ignored.reloc :
   {

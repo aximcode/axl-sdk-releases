@@ -5,7 +5,7 @@
  * @file axl-console.h
  * @brief Interactive console input — single-keystroke read with timeout.
  *
- * `axl_stdin` (in @ref axl-stream.h) is shell-pipe input only:
+ * `axl_stdin` (in axl-stream.h) is shell-pipe input only:
  * bytes the shell captured from the left-hand side of a `|`. Tools
  * that need to wait on a real keystroke (`y` / `n` prompts, "press
  * any key", arrow-key menus) reach for the SimpleTextInputProtocol
@@ -33,8 +33,7 @@ extern "C" {
 #endif
 
 /// One decoded keystroke, in the shape the UEFI Simple Text Input
-/// Protocol delivers it. Exactly one of @ref scan_code and @ref
-/// unicode_char carries the user's intent: printable keys leave
+/// Protocol delivers it. Exactly one of scan_code and unicode_char carries the user's intent: printable keys leave
 /// scan_code = 0; special keys (arrows, F-keys, Esc, Home/End, etc.)
 /// leave unicode_char = 0.
 typedef struct {

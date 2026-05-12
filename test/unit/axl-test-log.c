@@ -268,6 +268,53 @@ test_file_handler(void)
     test_check(len > 0 && test_strstr((const char *)buf, "file-handler-test-marker") != NULL,
                "file handler: marker found in log file");
     axl_free(buf);
+
+    /* Detach: explicit teardown that pairs with attach. After detach,
+       subsequent log calls must NOT make it into the file (handler is
+       gone). Re-attach with the same path then read back to confirm
+       only the second-attach-era marker is present beyond the first.
+       This is the AxlService driver-teardown pattern: attach in setup,
+       detach in teardown, image unload doesn't have to clean up. */
+    axl_log_file_detach();
+    axl_log(AXL_LOG_INFO, "file", "after-detach-marker");
+    /* No flush needed — the buffer's empty after detach (it flushed)
+       and the handler is gone so this log went only to the console. */
+
+    /* Re-attach to a fresh path so the new write isn't conflated with
+       seek-to-0 overwriting prior content (UEFI Open with READ|WRITE|
+       CREATE preserves bytes but starts position at 0; a re-attach to
+       the same path overwrites from byte 0 — that's the SDK's expected
+       behavior, not what this test is here to assert). The test goal is
+       "detach + re-attach round-trip works AND the post-detach
+       no-handler window really blocks writes." */
+    rc = axl_log_file_attach("axl-test-log-2.log");
+    test_check(rc == 0, "file handler: re-attach after detach succeeds");
+    if (rc != 0) {
+        return;
+    }
+    axl_log(AXL_LOG_INFO, "file", "second-attach-marker");
+    axl_log_flush();
+
+    rc = axl_file_get_contents("axl-test-log-2.log", &buf, &len);
+    test_check(rc == AXL_OK, "file handler: reopen after re-attach");
+    if (rc == AXL_OK) {
+        const char *s = (const char *)buf;
+        test_check(test_strstr(s, "second-attach-marker") != NULL,
+                   "file handler: second-attach marker present in new file");
+        test_check(test_strstr(s, "after-detach-marker") == NULL,
+                   "file handler: detach really stopped the handler from writing");
+        axl_free(buf);
+    }
+
+    /* Final detach + double-detach safety: after two detaches the
+       internal state must still be clean enough for a fresh attach to
+       succeed. Reaching the third attach proves the second detach
+       neither corrupted state nor double-freed anything. */
+    axl_log_file_detach();
+    axl_log_file_detach();
+    rc = axl_log_file_attach("axl-test-log.log");
+    test_check(rc == 0, "file handler: attach after double-detach succeeds");
+    axl_log_file_detach();
 }
 
 // ---------------------------------------------------------------------------

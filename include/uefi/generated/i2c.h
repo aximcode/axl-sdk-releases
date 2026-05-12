@@ -1,6 +1,9 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
 /** @file generated/i2c.h
     Auto-generated from UEFI Specification 2.11.
-    Do not edit — regenerate with scripts/generate-uefi-headers.py
+    Do not edit -- regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_I2C_H

@@ -140,6 +140,13 @@ axl_http_server_free(AxlHttpServer *s)
         axl_free(s->ws_routes[i].path);
     }
 
+    /* WebDAV mounts are heap-allocated AxlWebDavCtx (one per
+       add_webdav call); free each. The route table itself is
+       freed by the route_table_free path elsewhere. */
+    for (size_t i = 0; i < s->webdav_ctx_count; i++) {
+        webdav_ctx_free(s->webdav_ctxs[i]);
+    }
+
     axl_config_free(s->config);
     axl_free(s);
 }
@@ -278,7 +285,7 @@ axl_http_server_use_tls(
 // ---------------------------------------------------------------------------
 
 int
-axl_http_server_attach(AxlHttpServer *s, AxlLoop *loop)
+axl_http_server_start(AxlHttpServer *s, AxlLoop *loop)
 {
     if (s == NULL || loop == NULL) {
         return AXL_ERR;
@@ -350,7 +357,7 @@ axl_http_server_run(AxlHttpServer *s)
         return AXL_ERR;
     }
 
-    if (axl_http_server_attach(s, loop) != 0) {
+    if (axl_http_server_start(s, loop) != 0) {
         axl_loop_free(loop);
         return AXL_ERR;
     }

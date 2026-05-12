@@ -211,7 +211,7 @@ typedef enum {
  * For tables created with axl_hash_table_new_str() (copy_keys mode),
  * insert and replace behave identically.
  *
- * @return one of the @ref AxlHashTableInsertResult values.
+ * @return one of the AxlHashTableInsertResult values.
  */
 AxlHashTableInsertResult
 axl_hash_table_insert(
@@ -230,7 +230,7 @@ axl_hash_table_insert(
  * For tables created with axl_hash_table_new_str() (copy_keys mode),
  * insert and replace behave identically.
  *
- * @return one of the @ref AxlHashTableInsertResult values.
+ * @return one of the AxlHashTableInsertResult values.
  */
 AxlHashTableInsertResult
 axl_hash_table_replace(
@@ -303,6 +303,40 @@ axl_hash_table_steal(
  */
 size_t
 axl_hash_table_size(
+    AxlHashTable *h  ///< hash table
+);
+
+/**
+ * @brief Predicate: does this table take ownership of (and free) any
+ *     pointer key + value passed to insert / replace?
+ *
+ * Returns true iff the table satisfies all of:
+ *   - `copy_keys == false` — caller-provided keys are stored
+ *     as-is (so a `axl_strdup`'d key handed to insert isn't
+ *     redundantly re-strdup'd).
+ *   - `key_destroy != NULL` — the table will free those keys
+ *     on remove / replace / table free.
+ *   - `value_destroy != NULL` — the table will likewise free
+ *     stored values.
+ *
+ * Tables built via `axl_hash_table_new_full(..., axl_free_impl,
+ * axl_free_impl)` satisfy this. Tables built via
+ * `axl_hash_table_new_str()` (copy_keys=true, both destroys NULL)
+ * do NOT — passing strdup'd keys leaks the caller's copy AND the
+ * value isn't freed on table free.
+ *
+ * Useful for helpers that lazy-allocate or compose with a caller's
+ * pre-existing table and want to verify the destroy-func contract
+ * before inserting heap-owned entries (e.g. the
+ * `axl_http_response_set_content_range` helper that strdups both
+ * sides of the `Content-Range` header).
+ *
+ * @return true if both keys and values will be freed on remove and
+ *     copy_keys is false (so caller-provided pointer keys are
+ *     stored without redundant strdup); false otherwise.
+ */
+bool
+axl_hash_table_owns_entries(
     AxlHashTable *h  ///< hash table
 );
 

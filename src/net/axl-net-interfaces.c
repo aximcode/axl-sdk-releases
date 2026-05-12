@@ -4,14 +4,152 @@
 /** @file axl-net-interfaces.c
     Network interface enumeration and IPv4 query:
     axl_net_get_ip_address, axl_net_is_available, axl_net_list_interfaces.
+    Also hosts axl_net_locate_sb — the per-NIC service-binding picker
+    shared by TCP and UDP for source-IP / subnet-match selection.
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-net-internal.h"
+#include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <axl/axl-net.h>
 
 AXL_LOG_DOMAIN("net");
+
+// ---------------------------------------------------------------------------
+// axl_net_locate_sb — per-NIC service-binding picker shared by TCP +
+// UDP open / listen / _via paths. See header doc for the priority
+// ladder; impl walks all handles publishing @p sb_guid, queries each
+// underlying interface's IP4Config2 InterfaceInfo for StationAddress
+// + SubnetMask, picks the best candidate.
+// ---------------------------------------------------------------------------
+
+/// Try to read InterfaceInfo from the IP4Config2 protocol on @p handle.
+/// On success copies StationAddress + SubnetMask into the outputs.
+static EFI_STATUS
+get_iface_info(
+    EFI_HANDLE         handle,
+    EFI_IPv4_ADDRESS  *station_out,
+    EFI_IPv4_ADDRESS  *mask_out
+    )
+{
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+    EFI_STATUS status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+        handle, &gEfiIp4Config2ProtocolGuid, (void **)&cfg);
+    if (EFI_ERROR(status) || cfg == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    /* Two-phase: ask for size, alloc, then read. The InterfaceInfo
+       buffer carries an OPTIONAL trailing route table whose size we
+       don't know up front. */
+    UINTN data_size = 0;
+    status = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &data_size, NULL);
+    if (status != EFI_BUFFER_TOO_SMALL ||
+        data_size < sizeof(EFI_IP4_CONFIG2_INTERFACE_INFO))
+    {
+        return EFI_NOT_FOUND;
+    }
+    EFI_IP4_CONFIG2_INTERFACE_INFO *info = axl_malloc(data_size);
+    if (info == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    status = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &data_size, info);
+    if (EFI_ERROR(status)) {
+        axl_free(info);
+        return status;
+    }
+    *station_out = info->StationAddress;
+    *mask_out    = info->SubnetMask;
+    axl_free(info);
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+axl_net_locate_sb(
+    const EFI_GUID                 *sb_guid,
+    const EFI_IPv4_ADDRESS         *dest,
+    const EFI_IPv4_ADDRESS         *forced_source,
+    EFI_SERVICE_BINDING_PROTOCOL  **sb,
+    EFI_HANDLE                     *out_handle
+    )
+{
+    EFI_STATUS  status;
+    EFI_HANDLE *handles      = NULL;
+    size_t      handle_count = 0;
+
+    if (sb_guid == NULL || sb == NULL || out_handle == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    status = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
+                    ByProtocol,
+                    sb_guid,
+                    NULL,
+                    &handle_count,
+                    &handles
+                    );
+    if (EFI_ERROR(status) || handle_count == 0) {
+        return EFI_NOT_FOUND;
+    }
+
+    EFI_HANDLE chosen      = NULL;
+    int        chosen_rank = 0;
+
+    for (size_t i = 0; i < handle_count; i++) {
+        EFI_IPv4_ADDRESS station = { 0 };
+        EFI_IPv4_ADDRESS mask    = { 0 };
+        if (get_iface_info(handles[i], &station, &mask) != EFI_SUCCESS) {
+            continue;
+        }
+
+        if (forced_source != NULL) {
+            if (axl_ipv4_equals(station.Addr, forced_source->Addr)) {
+                chosen = handles[i];
+                break;
+            }
+            continue;
+        }
+
+        /* Auto mode: skip 0.0.0.0 entirely. */
+        static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+        if (axl_ipv4_equals(station.Addr, zero4)) {
+            continue;
+        }
+
+        if (dest != NULL &&
+            axl_ipv4_in_subnet(dest->Addr, station.Addr, mask.Addr))
+        {
+            chosen = handles[i];
+            break;  /* subnet-match is the strongest auto signal */
+        }
+
+        if (chosen_rank < 1) {
+            chosen      = handles[i];
+            chosen_rank = 1;
+        }
+    }
+
+    if (chosen == NULL) {
+        axl_backend_free(handles);
+        return EFI_NOT_FOUND;
+    }
+
+    status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+                    chosen,
+                    sb_guid,
+                    (void **)sb
+                    );
+    if (!EFI_ERROR(status)) {
+        *out_handle = chosen;
+    }
+
+    axl_backend_free(handles);
+    return status;
+}
 
 // ---------------------------------------------------------------------------
 // axl_net_get_ip_address

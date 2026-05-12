@@ -35,10 +35,7 @@
  * (the per-arch path is supplied by the Makefile). The length is
  * the linker-resolved pointer difference between the two markers,
  * not a separate `_len` constant. */
-extern const unsigned char axl_embedded_ramdiskdxe[];
-extern const unsigned char axl_embedded_ramdiskdxe_end[];
-#define axl_embedded_ramdiskdxe_len \
-    ((unsigned int)(axl_embedded_ramdiskdxe_end - axl_embedded_ramdiskdxe))
+AXL_EMBED_DECLARE(ramdiskdxe);
 
 // ---------------------------------------------------------------------------
 // Device path constants (UEFI spec Table 10-46, 10-62)
@@ -399,7 +396,7 @@ do_create(
 {
     /* Get RAM disk protocol */
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
-    if (axl_service_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
+    if (axl_protocol_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
         rd_proto == NULL) {
         axl_printf("MkRd: EFI_RAM_DISK_PROTOCOL not available.\n");
         axl_printf("Load RamDiskDxe.efi first.\n");
@@ -523,7 +520,7 @@ do_destroy(
     )
 {
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
-    if (axl_service_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
+    if (axl_protocol_find("ram-disk", (void **)&rd_proto) != AXL_OK ||
         rd_proto == NULL) {
         axl_printf("MkRd: EFI_RAM_DISK_PROTOCOL not available.\n");
         return 1;
@@ -608,8 +605,9 @@ run_mkrd(AxlArgs *a)
     if (axl_driver_ensure_with_embedded(
             (const AxlGuid *)&EFI_RAM_DISK_PROTOCOL_GUID,
             "RamDiskDxe.efi",
-            axl_embedded_ramdiskdxe, axl_embedded_ramdiskdxe_len,
-            driver_override) != 0) {
+            AXL_EMBED_DATA(ramdiskdxe), AXL_EMBED_SIZE(ramdiskdxe),
+            driver_override,
+            NULL, 0) != 0) {  /* RamDiskDxe doesn't read LoadOptions */
         if (driver_override != NULL) {
             axl_printf("MkRd: '%s' not found on any mounted volume "
                        "(--driver overrides embedded fallback).\n",
@@ -647,8 +645,7 @@ run_mkrd(AxlArgs *a)
     return do_create(label, size_mb);
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(mkrd)
 {
     g_argc = argc;
     g_argv = argv;

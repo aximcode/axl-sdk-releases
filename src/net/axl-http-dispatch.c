@@ -241,6 +241,17 @@ dispatch_request(
         }
 
         send_response(conn, &resp);
+        /* The dispatch tail's body/headers free runs only on the
+           success path below. Mirror the cleanup here so middleware-
+           allocated response state (set_text, set_json, etc.) doesn't
+           leak on rejection. send_response already memcpy'd into
+           tx_buf, so the originals are safe to free. */
+        if (resp.body != NULL && !resp.body_static) {
+            axl_free(resp.body);
+        }
+        if (resp.headers != NULL) {
+            axl_hash_table_free(resp.headers);
+        }
         return;
     }
 

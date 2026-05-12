@@ -597,8 +597,7 @@ expand_count_flags(
     return new_argv;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(lspci)
 {
     int    new_argc;
     char **new_argv = expand_count_flags(argc, argv, &new_argc);

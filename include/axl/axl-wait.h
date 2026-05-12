@@ -8,7 +8,7 @@
  *
  * These replace the common "busy-poll with axl_backend_stall" idiom
  * with event-driven waits that idle the CPU between checks and
- * return early on Ctrl-C. Every function returns @ref AxlStatus:
+ * return early on Ctrl-C. Every function returns AxlStatus:
  *
  *     AXL_OK         — condition met / elapsed
  *     AXL_TIMEOUT    — deadline elapsed before condition

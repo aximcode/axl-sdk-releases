@@ -364,11 +364,7 @@ static const AxlArgDesc global_flags[] = {
     {0}
 };
 
-int
-main(
-    int    argc,
-    char **argv
-    )
+AXL_TOOL_MAIN(memspd)
 {
     g_argc = argc;
     g_argv = argv;

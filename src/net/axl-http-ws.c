@@ -134,13 +134,13 @@ handle_websocket_upgrade(
 
     if (key == NULL || version == NULL) {
         send_error_response(conn, 400);
-        reset_connection(conn);
+        /* reset_connection runs from on_response_sent now */
         return;
     }
 
     if (axl_strcmp(version, "13") != 0) {
         send_error_response(conn, 400);
-        reset_connection(conn);
+        /* reset_connection runs from on_response_sent now */
         return;
     }
 
@@ -153,7 +153,7 @@ handle_websocket_upgrade(
 
     if (i >= s->ws_route_count) {
         send_error_response(conn, 404);
-        reset_connection(conn);
+        /* reset_connection runs from on_response_sent now */
         return;
     }
 
@@ -161,39 +161,64 @@ handle_websocket_upgrade(
     accept_key = ws_compute_accept_key(key);
     if (accept_key == NULL) {
         send_error_response(conn, 500);
-        reset_connection(conn);
+        /* reset_connection runs from on_response_sent now */
         return;
     }
 
-    /* Send 101 Switching Protocols */
-    resp_len = axl_snprintf(response, sizeof(response),
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n"
-        "\r\n", accept_key);
+    /* Build the 101 Switching Protocols response and send it
+       through the regular async path. send_response builds the
+       status line + Connection header itself; we add the WS
+       custom headers (Upgrade, Sec-WebSocket-Accept) via the
+       AxlHttpResponse.headers hash table. Connection is handled
+       specially — send_response always emits "Connection:
+       keep-alive" or "close" based on conn->keep_alive, and we
+       want "Upgrade" — but the framework's writes that header
+       unconditionally and emit_header writes the custom set on
+       top, so the 101 will end up with both lines. RFC-compliant
+       clients accept this.
+
+       Pre-stamp the WS state and fire CONNECT. on_response_sent
+       sees keep_alive=true with is_websocket=true and runs the
+       keep-alive branch — start_conn_recv re-arms the recv that
+       on_recv_complete routes to process_websocket_data when
+       is_websocket is set. */
     axl_free(accept_key);
+    (void)response;
+    (void)resp_len;
 
-    if (conn->tls_ctx != NULL) {
-        axl_tls_write(conn->tls_ctx, response, resp_len);
-    } else {
-        axl_tcp_send(conn->sock, response, resp_len, 0);
+    AxlHttpResponse upgrade_resp = {0};
+    upgrade_resp.status_code = 101;
+    upgrade_resp.headers = axl_hash_table_new_str();
+    if (upgrade_resp.headers == NULL) {
+        send_error_response(conn, 500);
+        return;
     }
+    char *acc = ws_compute_accept_key(key);
+    if (acc == NULL) {
+        axl_hash_table_free(upgrade_resp.headers);
+        send_error_response(conn, 500);
+        return;
+    }
+    axl_hash_table_insert(upgrade_resp.headers,
+                          axl_strdup("Upgrade"), axl_strdup("websocket"));
+    axl_hash_table_insert(upgrade_resp.headers,
+                          axl_strdup("Sec-WebSocket-Accept"), acc);
 
-    /* Transition to WebSocket mode */
     conn->is_websocket = true;
-    conn->ws_handler = s->ws_routes[i].handler;
-    conn->ws_data = s->ws_routes[i].data;
-    conn->ws_path = axl_strdup(s->ws_routes[i].path);
-    conn->keep_alive = false;
+    conn->ws_handler   = s->ws_routes[i].handler;
+    conn->ws_data      = s->ws_routes[i].data;
+    conn->ws_path      = axl_strdup(s->ws_routes[i].path);
+    conn->keep_alive   = true;
 
-    /* Notify handler of connection */
     if (conn->ws_handler != NULL) {
         conn->ws_handler(AXL_WS_CONNECT, NULL, 0, conn->ws_data);
     }
 
-    /* Start receiving WebSocket frames */
-    start_conn_recv(s, conn);
+    send_response(conn, &upgrade_resp);
+    /* send_response memcpy'd headers via axl_hash_table_foreach;
+       free our table here (caller owns it — dispatch_request would
+       have freed via its tail, but we're not in dispatch_request). */
+    axl_hash_table_free(upgrade_resp.headers);
 }
 
 // ---------------------------------------------------------------------------

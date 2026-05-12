@@ -85,6 +85,9 @@ static const AxlArgDesc global_flags[] = {
 static const AxlArgDesc ping_flags[] = {
     { .name = "count", .short_name = 'c', .type = AXL_ARG_U32, .base = 10,
       .help = "Number of pings (default: 4)" },
+    { .name = "nic",                                           .type = AXL_ARG_U64,
+      .default_value = AXL_NET_NIC_AUTO_STR,
+      .help = "NIC index for DHCP target (default: auto-select first usable)" },
     {0}
 };
 
@@ -195,7 +198,7 @@ show_nic_drivers(const char *label)
 {
     void  **handles = NULL;
     size_t  count = 0;
-    if (axl_service_enumerate("simple-network", &handles, &count) != AXL_OK
+    if (axl_protocol_enumerate("simple-network", &handles, &count) != AXL_OK
         || count == 0)
     {
         axl_printf("=== %s ===\n  (no simple-network handles)\n\n", label);
@@ -702,8 +705,9 @@ do_ping_verb(AxlArgs *a)
     if (ping_count == 0) {
         ping_count = 4;
     }
-    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
-        axl_printf("NetInfo: no IP address — DHCP did not complete.\n");
+    if (axl_net_init(axl_args_get_uint(a, "nic"), 10) != AXL_OK) {
+        axl_printf("NetInfo: networking unavailable "
+                   "(NIC driver, link, or DHCP setup failed).\n");
         return 1;
     }
     return do_ping(target, ping_count);
@@ -722,8 +726,7 @@ static const AxlArgsNode verbs[] = {
     {0}
 };
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(netinfo)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "NetInfo",

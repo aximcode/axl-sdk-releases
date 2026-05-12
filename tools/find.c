@@ -156,8 +156,7 @@ run_find(AxlArgs *a)
     return (match_count > 0) ? 0 : 1;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(find)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Find",

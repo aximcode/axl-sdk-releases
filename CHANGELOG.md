@@ -3,6 +3,1197 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.17.0 — 2026-05-11
+
+### Added
+
+- **`<axl/axl-net-opts.h>` + `axl_config_descs_net` /
+  `axl_config_descs_append`** — canonical `AxlNetOpts` sub-struct
+  with three stateless connection-side fields: `nic_index`
+  (with `AXL_NET_NIC_AUTO` sentinel for auto-detect),
+  `local_ip` (IPv4 to `bind(2)` the local socket end — outbound
+  source for clients, listen address for servers; same syscall,
+  role implied by what the consumer does next), and `port`
+  (`uint16_t`). `axl_net_init` / `axl_net_init_from_opts` are
+  the one-call DHCP bring-up — static-IP setup is intentionally
+  out of scope (it's the firmware `ifconfig` layer's job; call
+  `axl_net_set_static_ip` directly or use UEFI Shell
+  `ifconfig`). The paired `axl_config_descs_net` / `_append`
+  helpers in `<axl/axl-config.h>` emit the standard descriptor
+  entries into a consumer-owned accumulator with offsets shifted
+  by the consumer's embedded-sub-struct `offsetof`, so consumers
+  compose their own `AxlConfigDesc[]` table without copy-paste;
+  preserves `short_name` / `choices` and keeps full C
+  type-checking on the consumer's own fragment.
+  `AXL_NET_OPT_SOURCE_IP` (CLIENT preset) and
+  `AXL_NET_OPT_LISTEN_IP` (SERVER preset) both target the same
+  `local_ip` field, differing only in CLI vocabulary
+  (`--source-ip` vs `--listen-ip`). `tools/fetch.c`,
+  `tools/rfbrowse.c`, and `tools/netinfo.c` gain `--nic` and
+  `--source-ip` flags via the new helpers (the hand-rolled
+  `--source` flag was renamed `--source-ip` for consistency).
+  Solves a four-consumer pain point filed by axl-webfs; future
+  `_log` / `_tls` group helpers slot in the same pattern when a
+  second consumer asks.
+
+- **Streaming HTTP client request bodies** in
+  `<axl/axl-http-client.h>` — `axl_http_request_streaming(c,
+  method, url, streamer, ctx, cleanup_fn, total_size, content_type,
+  extra_headers, &out_resp)` lets a producer callback feed the
+  request body chunk-by-chunk; `axl_http_request_stream_file(c,
+  method, url, path, ...)` is the file-source convenience. Passing
+  `total_size = (size_t)-1` selects `Transfer-Encoding: chunked`;
+  any other value emits `Content-Length`. Closes the
+  client/server symmetry — the server already streamed both
+  response bodies (`axl_http_response_set_streamer`) and request
+  bodies (upload routes). Mount clients hitting multi-chunk PUTs
+  through axl-webfs were forced into per-chunk-PUT (broken, each
+  Write overwrites) or buffer-all-then-flush (bounded by ~256 MB
+  UEFI RAM); both go away.
+
+- **`axl_http_response_set_streamer(r, total, streamer, ctx,
+  cleanup_fn)`** in `<axl/axl-http-server.h>` — server-side
+  streaming response bodies via a producer callback. Caller
+  emits the body chunk-by-chunk through `AxlStream` writes;
+  the server frames `Transfer-Encoding: chunked` when
+  `total = (size_t)-1` or `Content-Length: <total>` otherwise.
+  Used by the WebDAV GET path and any consumer that needs to
+  hand the body off to an in-process generator without RAM-
+  resident assembly.
+
+- **`AxlUrl` userinfo + fragment parsing** in `<axl/axl-url.h>` —
+  `AxlUrl` gains `user`, `password`, and `fragment` fields
+  populated by `axl_url_parse`. Full RFC 3986
+  `scheme://user:pass@host:port/path?query#fragment` round-trip
+  through `axl_url_to_string`. Lets clients carry credentials
+  in a single URL token (e.g. Basic-auth Redfish endpoints) and
+  honor fragment identifiers without a separate field plumbing
+  pass.
+
+- **`axl_file_move(src, dst)`** in `<axl/axl-fs.h>` —
+  cross-directory file move via copy-then-delete. Complements
+  `axl_file_rename`, which is restricted to the same parent
+  directory by UEFI's `SetInfo(FileInfo)` semantics.
+
+- **`AxlFileInfo.mtime_unix` + `AxlDirEntry.mtime_unix`** fields
+  in `<axl/axl-fs.h>` — Unix-epoch modification time surfaced
+  from `EFI_FILE_INFO.ModificationTime` (previously discarded).
+  Source-compatible addition; consumers that initialize these
+  structs with `{...}` get the new field zero-initialized for
+  free. Unblocks WebDAV `<D:getlastmodified>` and any consumer
+  that needs file mtime without an extra `SetInfo` round-trip.
+
+- **`axl_efi_find_config_table(guid, out_ptr)`** in
+  `<axl/axl-sys.h>` — looks up an entry in the EFI System
+  Table's `ConfigurationTable` array by GUID. Used by mkfixture
+  to snapshot ACPI / SMBIOS / ESRT root pointers without
+  re-implementing the walk; usable directly by any consumer
+  reaching into the configuration-table set.
+
+- **WebDAV `before_response` hook** in `axl_http_server_add_webdav`
+  — opt-in last-call header-mutation callback fired after the
+  response status/headers are assembled but before bytes hit the
+  wire. Used by the WebDAV `Want-Digest` path (below) to emit
+  `Digest:` only when the client requested it. Consumer-supplied
+  callbacks can also inject custom headers or tweak status codes
+  per-request.
+
+- **WebDAV RFC 3230 digest support** in `axl_http_server_add_webdav`
+  — server-side response-body digest emission when the client
+  sends `Want-Digest: <alg>` (responding `Digest: <alg>=<base64>`
+  via the new `before_response` hook), plus PUT-side
+  validation: when the request carries a `Digest:` header,
+  the upload path computes the configured algorithm over the
+  received body and rejects on mismatch with `409 Conflict`.
+  Algorithms surfaced from `<axl/axl-digest.h>`. Lets clients
+  catch in-flight body corruption without an out-of-band hash
+  fetch.
+
+- **`AxlXmlWriter` + `AxlXmlReader` (`<axl/axl-xml.h>`)** — streaming
+  XML writer and pull-token reader. Writer mirrors `AxlJsonWriter`'s
+  shape: value-typed state struct, caller-owned `AxlString` backing,
+  flags bitmask at init (`AXL_XML_WRITER_PRETTY`), void emitters,
+  sticky-error flag. Auto-escapes `&` `<` `>` in body and `&` `<` `"`
+  in attribute values. Bit-packed per-depth flags decide self-close
+  vs `</foo>` and pretty-mode newline-before-close. Reader is opaque
+  with `axl_xml_reader_next(r, &token)` pulling one
+  `AXL_XML_TOKEN_{START_ELEMENT, END_ELEMENT, TEXT, END_DOCUMENT}` at
+  a time; attribute lookup via `axl_xml_reader_attr(r, "name")` while
+  positioned at a START. Entity decoding into a reusable scratch
+  buffer: 5 named (`&amp;` `&lt;` `&gt;` `&quot;` `&apos;`) plus
+  decimal and hex numeric character refs (UTF-8 encoded; U+0000 and
+  UTF-16 surrogates U+D800-U+DFFF rejected per XML 1.0 §4.1). CDATA
+  passes through as TEXT with `is_cdata` set. Comments, processing
+  instructions, and DOCTYPE declarations are skipped silently — the
+  reader balances `[`/`]` brackets inside DOCTYPE so entity
+  definitions never get processed (closes the billion-laughs class).
+  Strict well-formedness: tag balance, single root, no
+  non-whitespace content before/after root. Error reporting via
+  `axl_xml_reader_error(r, &line, &col, &msg)`. Namespace-aware
+  resolution: when the reader hits an `xmlns:` declaration it
+  populates `AxlXmlToken.ns_uri` so WebDAV / SOAP-style envelope
+  consumers can dispatch on namespace URI rather than prefixed
+  local name. Companion helpers `axl_xml_token_local_name(&tok)`
+  and `axl_xml_token_attr_local_name(&tok, "name")` strip the
+  prefix when the consumer wants the bare local-name half of a
+  prefixed `QName`. 53 unit tests covering both halves including
+  a WebDAV PROPFIND envelope round-trip through both writer and
+  reader. Out of scope: DTD / XSD / RelaxNG validation, XPath,
+  XSLT, XML signatures.
+
+- **`axl_guid_v5(namespace, name, out)`** in `<axl/axl-sys.h>` —
+  name-based UUIDv5-shaped GUID derivation. SHA-1 of namespace
+  bytes + name bytes, version + variant bits set per RFC 4122
+  §4.3. Used internally by `axl_service_guid` to derive each
+  service's identity from `AxlService.name`; useful directly to
+  any consumer that wants stable GUIDs from string keys.
+
+- **`axl_service_guid(svc, out)`** in `<axl/axl-service.h>` —
+  convenience wrapper that derives a service's protocol identity
+  GUID via `axl_guid_v5` against the AXL_SERVICE namespace.
+
+- **`axl_service_supervise(deploy)`** in `<axl/axl-service.h>` —
+  the standard "block on default loop, then stop the service"
+  body extracted from `axl_service_main`'s `start` verb. Custom
+  consumer mains compose this directly instead of duplicating the
+  `loop_run` / `stop` / rc-translate sequence.
+
+- **`axl_protocol_find_guid` / `axl_protocol_enumerate_guid`** in
+  `<axl/axl-sys.h>` — GUID-keyed counterparts to `axl_protocol_find`
+  / `_enumerate`, symmetric with the existing
+  `axl_protocol_register_guid` / `_unregister_guid`. Lets consumers
+  that already hold a GUID skip the name-registry lookup. AxlService
+  uses these to drop its raw `axl_bs()->LocateProtocol` /
+  `LocateHandleBuffer` calls — its body is now UEFI-type-free
+  outside the firmware-ABI unload-stub signature.
+
+- **`axl_net_drivers_up()`** in `<axl/axl-net.h>` — load NIC
+  drivers, connect SNP, wait for link-up. Decoupled from address
+  assignment so static-IP callers don't burn the 10 s default DHCP
+  timeout that `axl_net_auto_init` otherwise imposes. Used
+  internally by `axl_net_auto_init` (refactored to call this first)
+  and by the new `axl_net_bring_up`.
+
+- **`axl_net_bring_up(nic, static_ipv4, netmask, gateway, timeout, addr_out)`**
+  in `<axl/axl-net.h>` — one-call DHCP-or-static bring-up + address
+  read-back. NULL `static_ipv4` → DHCP path; non-NULL → static IP
+  with caller-supplied or `/24`-default netmask + optional gateway,
+  then 500 ms IP4Config2 settle. The "what every networked tool
+  does at startup" preamble factored out so HTTP services, REST
+  tools, and one-shot fetch utilities don't reinvent it.
+  `tools/{fetch,rfbrowse,netinfo}` migrated to use it.
+
+- **REST request helpers** in `<axl/axl-http-server.h>`:
+  `axl_http_request_accepts(req, mime)` (routes through the existing
+  `axl_http_accepts` matcher — case-insensitive, wildcard-aware, q-value
+  tolerant), `axl_http_request_wants_json(req)` (the
+  `application/json` shorthand), and `axl_http_request_get_json(req,
+  out)` (parses `req->body` into a caller-owned `AxlJsonReader`).
+  Lifted from axl-webfs's serve module so any HTTP consumer (REST
+  API, one-shot fetch, future services) can reuse them.
+
+- **`axl_http_server_add_routes(server, ...)`** variadic in
+  `<axl/axl-http-server.h>` — batch route registration.
+  `(method, path, handler, data)` groups terminated by a sentinel
+  `NULL` method. Replaces 5–6 separate `add_route` calls + their
+  per-call `!= 0` checks with one call + one error path.
+  `sdk/examples/{http-server,http-server-driver}.c` migrated to
+  dogfood it.
+
+- **`axl_log_file_detach()`** in `<axl/axl-log.h>` — symmetric
+  teardown for `axl_log_file_attach`. Flushes the buffer, removes
+  the internal handler, closes the file. NULL-safe on
+  not-attached state. Closes the gap surfaced by axl-webfs's
+  serve service: AxlService driver setup attaches a log file but
+  had nothing to call from teardown — the consumer either accepted
+  the leak or hand-rolled a parallel implementation.
+
+- **Busybox build (`make axl-busybox`)** — opt-in single-binary
+  deployment shape. One `axl.efi` hosts all 18 tools as
+  subcommands (`axl.efi cat foo`, `axl.efi grep pattern file`,
+  `axl.efi --help`). Default `make tools` is unchanged — per-tool
+  `.efi` binaries remain the supported shape. New
+  `AXL_TOOL_MAIN(name)` macro in `<axl.h>` switches each tool's
+  entry point between `int main(...)` (standalone) and
+  `int axl_tool_<name>_main(...)` (busybox) based on
+  `-DAXL_BUSYBOX`. Sizes: 18 standalone tools = 3.21 MB total; one
+  axl.efi = 569 KB (X64) / 624 KB (AARCH64). Disk savings aren't
+  the point — "one file" deployment is.
+
+- **`make tool-sizes` target** — prints per-tool `.efi` size
+  sorted ascending plus total + libaxl.a archive size.
+  Demonstrates the selective-linking benefit (each tool carries
+  only the libaxl.a slices it references).
+
+- **`sdk/examples/service-demo-custom.c` — worked example with
+  consumer-visible AxlArgs + AxlConfig usage.** Same single-file
+  dual-compile pattern as `service-demo.c`, but `main()` is
+  written by hand instead of via the `AXL_SERVICE` macro. Shows
+  the consumer how to:
+
+  - mix the standard `start` / `stop` / `status` verbs (which
+    `axl_service_main` builds automatically) with a custom verb;
+  - call `axl_args_get_uint` / `_bool` / `_string` directly to
+    populate the option struct;
+  - walk an `AxlConfigDesc[]` table to format option values
+    against their descriptor metadata (the `config` verb prints
+    parsed values + descriptions + defaults).
+
+  ```
+  service_demo_custom.efi start --port 9090 --verbose --name foo
+  service_demo_custom.efi stop
+  service_demo_custom.efi status
+  service_demo_custom.efi config --port 9090   # foreground only
+  ```
+
+  The `config` verb is foreground-only (no driver involvement) and
+  exists specifically to demonstrate the AxlArgs ↔ AxlConfig
+  connection that `axl_service_main` packages internally.
+
+  Output binaries: `service_demo_custom.efi` (launcher) +
+  `service_demo_custom-dxe.efi` (driver). New Makefile target
+  `service-demo-custom`. Different protocol GUID from
+  service-demo so both demos can run side-by-side.
+
+- **WebDAV class-1 + MOVE/COPY (`axl_http_server_add_webdav`)** in
+  `<axl/axl-http-server.h>`. Generic WebDAV server adjunct to
+  `AxlHttpServer` (RFC 4918 §9). The SDK owns all the protocol
+  bits — verb dispatch, PROPFIND 207 Multi-Status XML, Depth /
+  Destination / Overwrite header parsing, DAV: 1 advertisement;
+  the consumer fills in an `AxlWebDavOps` callback table mapped
+  onto its own filesystem. Verb scope: OPTIONS, PROPFIND, GET,
+  HEAD, PUT, DELETE, MKCOL, MOVE, COPY. PROPPATCH, LOCK, UNLOCK,
+  and If-header conditionals remain out of v1 scope (modern
+  clients — Windows Explorer, macOS Finder, davfs2, cadaver —
+  work without them when the server doesn't advertise the lock
+  class). COPY adds the spec-strict Depth parser (only "0" or
+  "infinity" per §9.8.3; "1" → 400) and pre-stats the source for
+  an RFC-correct 404 on missing-source (rather than the generic
+  409 the MOVE handler still emits).
+
+  GET and PUT inherit the streaming primitives from earlier in
+  this run: `axl_http_response_set_streamer` for response bodies
+  (multi-GB safe) and the `AxlUploadHandler` abort contract for
+  request bodies. Range requests on GET use
+  `axl_http_response_set_content_range` to advertise the slice;
+  unsatisfiable ranges return 416 per RFC 7233 §4.4. Up to 4
+  WebDAV mounts per server. Per-mount single-in-flight PUT — the
+  SDK refuses concurrent PUTs on the same mount rather than
+  trampling either request's state. Two consumers ready to
+  migrate: axl-webfs's serve service (~120 lines of adapter +
+  one setup line) and SoftBMC's BMC web UI (deletes ~540 lines
+  of WebDav.{c,h}, replaces with ~100 lines of adapter).
+
+- **`axl_hash_table_owns_entries(h)`** in `<axl/axl-hash-table.h>` —
+  predicate returning true iff `!copy_keys && key_destroy != NULL
+  && value_destroy != NULL`. Used by `set_content_range_header`
+  (and WebDAV's `ensure_headers`) to detect when a caller
+  pre-allocated `r->headers` with the wrong destroy-func contract
+  (e.g. `axl_hash_table_new_str()` would silently leak both
+  strdup'd key and value).
+
+- **TCP/UDP API parity sweep** — UDP catches up to TCP across the
+  async, addressing, and lifecycle surfaces:
+
+  - **`AXL_DEFINE_AUTOPTR_CLEANUP(AxlTcp, axl_tcp_close)`** —
+    `AXL_AUTOPTR(AxlTcp)` now works (UDP already had it).
+
+  - **`axl_udp_get_local_addr(sock, addr, size, *port)`** in
+    `<axl/axl-udp.h>` — read back the bound station address +
+    port. Required for the ephemeral-port case
+    (`axl_udp_open(&s, 0)` had no readback path before).
+
+  - **`axl_udp_recv_async(sock, loop, cancel, cb, data)`** —
+    replaces `axl_udp_recv_start` / `_stop`. New `AxlUdpCallback`
+    typedef receives per-event `AxlStatus` and returns `bool`
+    (true = re-arm, false = stop in-place). Optional
+    `AxlCancellable`. Mirrors `axl_tcp_recv_async`. Breaking
+    change for the old typedef + start/stop functions.
+
+  - **`axl_udp_send_async(sock, dest, port, buf, len, loop,
+    cancel, cb, data)`** — non-blocking Transmit with completion
+    callback. Single in-flight enforced (returns AXL_ERR if a
+    previous send hasn't completed). Mirrors `axl_tcp_send_async`.
+
+  - **`axl_udp_open_via(out, port, source_ip)`** — source-IP
+    pinning for multi-NIC hosts. Mirrors `axl_tcp_listen_via`.
+    Internally factored out the per-NIC service-binding picker
+    (`axl_net_locate_sb` in `axl-net-internal.h`) so TCP and UDP
+    share the same selection ladder.
+
+  - **`AxlUdpSocket` → `AxlUdp`** — type rename for naming
+    parity with `AxlTcp`. Breaking; no external consumers in
+    sibling repos at the time of the change.
+
+  - **`axl_udp_connect(sock, peer, port)` / `axl_udp_disconnect(sock)`** —
+    Linux-style peer lock for UDP. After connect, the kernel
+    filters incoming datagrams to the peer; subsequent
+    `axl_udp_send` / `_send_async` accept NULL `dest` (uses the
+    configured peer). Explicit dest still overrides per-packet
+    (per UEFI 2.x §27.4.1).
+
+  - **`axl_udp_join_multicast(sock, group)` /
+    `axl_udp_leave_multicast(sock, group)` /
+    `axl_udp_set_broadcast(sock, enable)`** — IGMP join/leave via
+    `EFI_UDP4_PROTOCOL.Groups()`, broadcast recv-filter toggle.
+    `leave_multicast(NULL)` leaves all groups (matches UEFI
+    semantics). Multicast-addr validation (224.0.0.0/4) at the
+    API boundary.
+
+- **`axl_http_response_set_content_range(r, start, end, total)`** in
+  `<axl/axl-http-server.h>` — formats and inserts the
+  `Content-Range` header without touching status or body. For
+  partial-content responses sent via
+  @ref axl_http_response_set_streamer (or any other path that
+  doesn't go through @ref axl_http_response_set_range), where the
+  consumer manages status separately. Lazy-allocates `r->headers`
+  with `axl_str_hash` + `axl_free_impl` destructors so it composes
+  cleanly with the request-side header-table allocation pattern.
+
+- **`axl-cc --service NAME source.c` — single-file service build.**
+  Compiles the source twice and produces both `.efi` outputs:
+
+  1. `axl-cc --type driver -DAXL_SERVICE_BUILD_DRIVER source.c
+      -o NAME-dxe.efi` (driver image)
+  2. `axl-cc --embed NAME-dxe.efi=NAME source.c -o NAME.efi`
+      (launcher app, with the driver baked in)
+
+  NAME must be a valid C identifier — the embed symbol the
+  `AXL_EMBED_DECLARE(svc)` inside the `AXL_SERVICE(svc)` macro
+  expects must match `axl_embedded_<NAME>`. So passing
+  `--service my_service` pairs with `AXL_SERVICE(my_service)` in
+  the source.
+
+  All other flags (`--debug`, `--release`, `--arch`, `--verbose`,
+  `--minimal-runtime`, `-I`, `-D`, `-W`) forward to both
+  invocations. `-o` is ignored — output filenames are fixed at
+  `NAME.efi` and `NAME-dxe.efi` in the current directory.
+
+  ```
+  axl-cc --service my_service service.c
+  # → my_service.efi + my_service-dxe.efi
+  ```
+
+  Step 4 of 5 toward the `AXL_SERVICE` single-file pattern.
+  Service-demo migration in step 5 proves the end-to-end path.
+
+- **`AXL_SERVICE(svc)` — single-file service macro.** New macro in
+  `<axl.h>` that emits whichever entry point the current build
+  needs:
+
+  - When `AXL_SERVICE_BUILD_DRIVER` is defined (driver-image
+    compile), expands to `AXL_SERVICE_DRIVER(svc)` — emits
+    `DriverEntry`.
+  - Otherwise (launcher-app compile), expands to `main()` that
+    declares the embedded driver blob (matching the symbol name
+    `axl-cc --service` emits) and delegates to `axl_service_main`
+    with a pre-filled deploy descriptor.
+
+  Pairs with the forthcoming `axl-cc --service NAME source.c` flag
+  that compiles the same source twice (once with
+  `-DAXL_SERVICE_BUILD_DRIVER` for the driver, once without for the
+  launcher; embeds the driver into the launcher). Result: **one
+  source file, two `.efi` outputs, zero handwritten launcher
+  boilerplate**.
+
+  ```c
+  /* service.c — entire file */
+  #include <axl.h>
+
+  typedef struct { uint16_t port; bool verbose; } MyOpts;
+  static MyOpts opts;
+  static const AxlConfigDesc opts_descs[] = { /* ... */ };
+  static int my_setup(AxlLoop *loop, void *user) { /* ... */ }
+  static int my_teardown(void *user) { /* ... */ }
+
+  static const AxlService my_service = {
+      .name           = "my-service",
+      .opts_descs     = opts_descs,
+      .setup          = my_setup,
+      .teardown       = my_teardown,
+      .user           = &opts,
+      .driver_tick_ms = 50,
+  };
+
+  AXL_SERVICE(my_service);
+  ```
+
+  Multi-service tools and consumers wanting custom verbs don't use
+  the macro — they write their own `main()` and call
+  `axl_service_main` directly (or wire `axl_args_run` themselves).
+
+- **`axl_service_main(deploy, argc, argv)` — default launcher /
+  supervisor body for service consumers.** Builds a default
+  `axl_args_run` verb tree (`launch [--detach]`, `stop`, `status`)
+  from the deploy descriptor and dispatches argv. The `launch`
+  verb auto-populates `svc->user` from the parsed args
+  (synthesizing an `AxlArgDesc[]` from `svc->opts_descs` so the
+  consumer doesn't repeat the descriptor in two formats), calls
+  `axl_service_launch_embedded`, and either:
+
+  - exits if `--detach` was passed (driver continues to run);
+  - blocks on `axl_loop_default` until Ctrl-C, then calls
+    `axl_service_stop` on the way out.
+
+  Most service consumers won't need their own `main()` — the
+  forthcoming `AXL_SERVICE` macro will emit one that delegates to
+  this. Direct use is for consumers who want to mix the default
+  verbs with their own (extra verbs, custom help prolog) — they
+  call `axl_args_run` themselves and dispatch the standard verbs
+  in.
+
+  AXL_CFG → AXL_ARG type mapping (UINT field-size dispatch
+  matches the existing `axl_config_target_to_string` pattern):
+  BOOL→BOOL, UINT→U8/U16/U32/U64 by field_size, INT→S64,
+  STRING→STRING. AXL_CFG_MULTI is mapped to STRING (single-value;
+  consumers needing multi populate `svc->user` manually).
+
+- **`AxlService.restart_max` + `.restart_backoff_ms` — setup retry.**
+  New fields on the AxlService struct:
+
+  ```c
+  uint32_t restart_max;        // default 0 = no retry
+  uint32_t restart_backoff_ms; // delay between retries
+  ```
+
+  When `restart_max > 0` and setup returns non-AXL_OK, the framework
+  retries up to `restart_max` more times (total attempts =
+  `restart_max + 1`) with `restart_backoff_ms` between attempts.
+  Useful for services where setup may transiently fail (NIC not yet
+  up, DHCP pending, fs not yet enumerated). axl-webfs's `serve` is
+  the canonical case — `serve` over a NIC that just came up may
+  need a beat before TCP4 is bindable.
+
+  Foreground only. Driver-mode setup failure aborts DriverEntry; the
+  firmware decides what to do next (typically unload, then maybe
+  reload on a later dispatch).
+
+  Test pinning: succeeds-on-attempt-3 with restart_max=2,
+  exhaust-budget returns AXL_ERR, exact attempt counts in both
+  cases.
+
+- **AxlService lifecycle banner logs.** `axl_service_main` /
+  `axl_service_supervise` emit two info-level log lines around
+  the run, tagged with the framework's `service` domain:
+
+  ```
+  [service]  service 'axl-webfs-serve' starting
+  ...
+  [service]  service 'axl-webfs-serve' stopped (rc=-1, 8423 ms)
+  ```
+
+  Consumers don't write any code — the banner appears whenever a
+  service runs to completion (or setup fails, in which case the
+  stopped line includes "setup failed"). Elapsed milliseconds use
+  `axl_time_get_ms` (monotonic). The existing `axl_debug`
+  setup/teardown ENTER/EXIT markers stay; the banner is at info
+  level so it surfaces under default log levels without
+  `AXL_LOG_LEVEL=debug`.
+
+  Driver-mode services (deployed via `AXL_SERVICE_DRIVER`) keep
+  the existing debug-level lifecycle markers — there's no clean
+  "stopped" moment in the driver's DriverEntry-returns-immediately
+  shape, and noisy info-level lines per tick would be wrong.
+
+- **`AxlService.watchdog_keep_armed` — opt-out for the auto-disarm.**
+  New field on the AxlService struct: `bool watchdog_keep_armed`.
+  Default false (zero-init). At run start, the framework calls
+  `axl_watchdog_disarm()` so the firmware's 5-min boot-services
+  timeout doesn't reset the system mid-session — long-running
+  foreground services would otherwise hit the watchdog.
+
+  Set `.watchdog_keep_armed = true` if your service is short-lived
+  enough to want the safety net or you manage the watchdog
+  yourself (`axl_watchdog_set` / `axl_watchdog_pet`). No restore
+  on teardown — the consumer that disables this flag owns the
+  watchdog policy.
+
+- **`AxlService.on_signal` — opt-in Ctrl-C / break callback.** New
+  field on the AxlService struct: `AxlSignalHandler on_signal`.
+  When non-NULL, the framework installs it via
+  `axl_signal_install` for the duration of the run and restores
+  the default on teardown. NULL keeps the existing behavior — the
+  loop polls the break flag and quits, which then unwinds through
+  teardown.
+
+  Use this for custom shutdown logging or to set application
+  flags before the loop returns. Doesn't replace the loop's
+  built-in poll-and-quit; it composes with it.
+
+  Test pinning: precondition (no handler), loop_new,
+  run-to-quit, setup ran, handler observed installed during
+  setup, handler restored to default after.
+
+- **`axl_driver_load_buffer(buf, len, *out_handle)` — buffer-source
+  counterpart to `axl_driver_load(path, *out)`.** LoadImage from a
+  memory buffer with no DevicePath; returns the driver handle for use
+  with `axl_driver_set_load_options` / `axl_driver_start` /
+  `axl_driver_unload`. Use case: tools that `.incbin` a companion
+  driver into the app and need per-call LoadOptions and explicit
+  handle tracking. `axl_driver_ensure_with_embedded` doesn't fit when
+  (a) the protocol isn't unique-per-driver — its step-1 short-circuit
+  on `LocateProtocol` skips your load if some unrelated handle is
+  already registered (e.g. EFI_FILE_PROTOCOL), or (b) the consumer
+  needs the AxlDriverHandle to set per-call LoadOptions. For the
+  AxlService case keep using `axl_service_start_embedded`.
+
+  Internal `driver_load_embedded` refactored to call this
+  primitive + `driver_start_and_verify`, so there's one
+  LoadImage-from-buffer call site. The existing
+  `test-service-driver.sh` integration test continues to PASS as
+  positive-path coverage.
+
+- **`axl-cc --embed PATH[=NAME]` and `<axl/axl-embed.h>` macros.**
+  axl-cc now generates the `.incbin` sidecar and links it into the
+  output, replacing the hand-rolled `.S` file consumers used to
+  carry alongside their launcher `.c`. NAME defaults to the basename
+  of PATH with non-identifier chars replaced by `_`; emitted symbols
+  are `axl_embedded_<NAME>` and `axl_embedded_<NAME>_end` to match
+  the existing in-tree convention. Repeatable.
+
+  The framework is content-agnostic — driver `.efi` is the canonical
+  use case but anything works (TLS CA bundles, static JSON5 config,
+  HTML for an embedded server, lookup tables, license text, calibration
+  data). `sdk/examples/embed-asset.c` is the non-driver worked example;
+  `sdk/examples/service-demo/launch.c` covers the driver case.
+
+  The new public header `<axl/axl-embed.h>` provides
+  `AXL_EMBED_DECLARE(name)` / `AXL_EMBED_DATA(name)` /
+  `AXL_EMBED_SIZE(name)` so the C-side declarations stay in sync
+  with whatever generated the symbols (axl-cc or a hand-written
+  `.S`). Use:
+
+  ```c
+  AXL_EMBED_DECLARE(my_driver);
+  /* ... */
+  d.driver_blob     = AXL_EMBED_DATA(my_driver);
+  d.driver_blob_len = AXL_EMBED_SIZE(my_driver);
+  ```
+
+  Intended pairing: `axl_service_launch_embedded` / mkrd-style
+  embedded-driver tools.
+
+  `sdk/examples/service-demo/launch.c` updated to use the macros as
+  the in-tree proof. New integration test
+  `test/integration/test-axl-cc-embed.sh` (wired into CI alongside
+  test-yield-ctrlc.sh) builds the launcher via `axl-cc --embed` and
+  asserts the same cross-binary `LoadOptions` round-trip the
+  Makefile-built path produces.
+
+- **`axl_service_stop(deploy)` — symmetric counterpart to
+  `axl_service_launch_embedded`.** Resolves the running driver
+  image's handle by `LocateHandleBuffer` against
+  `deploy->service->protocol_guid`, then `axl_driver_unload`s each
+  match. The driver image's `AXL_SERVICE_DRIVER` unload stub fires
+  synchronously and runs the framework's teardown sequence
+  (loop_detach → service teardown → protocol unregister →
+  axl_config_free → loop_free). Idempotent: returns AXL_OK when the
+  protocol isn't currently published. Doxygen documents the
+  consumer-held interface dangling hazard (UEFI's protocol model
+  has no ref counting; same risk as the shell's `unload -n`).
+
+  **Macro change:** `AXL_SERVICE_DRIVER` now publishes the service
+  GUID on the driver image's own handle (gImageHandle) rather than
+  a fresh sentinel. This is what makes stop work — `LocateHandleBuffer`
+  now returns the image handle directly, no separate metadata
+  lookup needed. Drivers that want to layer additional protocols
+  on the image handle continue to compose normally; the service GUID
+  just shares the handle's protocol list.
+
+  Reasoning: the side-table / dual-install / metadata-protocol
+  alternatives all worked around a sentinel that didn't need to
+  exist. UEFI itself routinely installs identity-marker protocols
+  on the driver image's own handle (LoadedImage, DevicePath, etc.).
+
+  Tests
+  - `test_service_stop_validates` in axl-test-util — NULL safety +
+    "stop on never-running deploy is no-op success." 2793/2793
+    both arches.
+  - `test/integration/test-service-driver.sh` extended to
+    launch → stop → relaunch round-trip. Asserts the driver's
+    teardown actually fired (proves UnloadImage triggered the
+    AXL_SERVICE_DRIVER unload stub) AND that relaunch sees a fresh
+    setup (no stuck-protocol short-circuit).
+
+  Example: `sdk/examples/service-demo/stop.c` — three calls
+  (`is_running`, `stop`, `is_running`).
+
+- **`AxlService` — structured-lifecycle wrapper over `AxlLoop`.** New
+  public header `<axl/axl-service.h>`. A typed shape for
+  "long-running event loop with setup/teardown/options," shipped
+  as a UEFI driver image and supervised from a foreground
+  launcher. The driver image carries the `setup`/`teardown`
+  callbacks + an `AxlConfigDesc[]` for its options; the launcher
+  passes options through `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions`
+  as a URL-encoded query string, the driver decodes them back
+  into the same `svc.user` struct, and `axl_loop_attach_driver`
+  runs the loop under the firmware notify-timer.
+
+  Deployment surface (end-state — see the individual entries
+  elsewhere in this release for each piece):
+
+  - **Driver image**: `AXL_SERVICE_DRIVER(svc)` macro emits the
+    DXE driver shim (LoadOptions decode + `setup` + supervised
+    loop + UnloadImage teardown).
+
+  - **Single-source-file build**: `AXL_SERVICE(svc)` macro +
+    `axl-cc --service NAME source.c` produce both binaries
+    (launcher + driver) from one `.c`.
+
+  - **Launcher supervision**: `axl_service_main(deploy, argc,
+    argv)` provides default `start [--detach]` / `stop` /
+    `status` verbs; consumers that want custom verbs call
+    `axl_service_supervise` directly from their own `main`.
+
+  - **In-process driver-tick mode**:
+    `axl_service_attach_driver` / `_detach_driver` /
+    `_teardown` for consumers that drive the loop themselves
+    (no separate driver image — same launcher binary).
+
+  - **Embedded-binary lifecycle**: `axl_service_start_embedded` /
+    `axl_service_stop` / `axl_service_is_running` for explicit
+    foreground control of an embedded driver image.
+
+  Setup-failure contract: setup owns its own unwind; framework
+  only calls teardown after a successful setup.
+
+  Cross-binary ABI tripwire is documented on the header — same
+  source tree, identical compile flags (`AXL_TLS`,
+  `AXL_MEM_DEBUG`, arch) for both binaries. Identity GUID is
+  derived from `AxlService.name` via `axl_guid_v5` so launcher
+  and driver agree without manual GUID plumbing.
+
+  NOT a Unix daemon (no fork/setsid/chdir/umask). Closer in
+  shape to a systemd unit. Naming retired the alternative
+  `AxlDaemon` candidate to avoid the Linux baggage.
+
+  axl-webfs is the empirical consumer. mkrd doesn't fit
+  (one-shot protocol publish, no setup/teardown lifecycle) and
+  stays on the underlying `axl_driver_ensure_with_embedded`
+  directly.
+
+- **`axl_config_to_string` / `axl_config_from_string` /
+  `axl_config_target_to_string`** in `<axl/axl-config.h>` —
+  three primitives behind the service API's cross-binary option
+  hand-off, also useful standalone for diagnostics or any other
+  cross-binary state passing. Wire format is URL-encoded query
+  string per RFC 3986 (`key=value&...`) — both keys and values
+  percent-encode special bytes so `&` / `=` / Unicode in values
+  round-trip cleanly. Dogfoods `axl_url_encode`/`_decode`.
+
+- **`axl_driver_ensure_with_embedded` extended with
+  `load_options` + `load_options_size` arguments.** Installs
+  the bytes via `axl_driver_set_load_options` between LoadImage
+  and StartImage on both the disk-load and embedded-blob paths;
+  the side-table from the LoadOptions-leak fix catches the
+  unload-time release automatically. Existing callers
+  (`axl_driver_ensure`, mkrd) updated to pass `NULL/0` — no
+  behavior change.
+
+- **`axl_driver_get_load_options_raw(out_buf, out_size)`** —
+  raw-bytes counterpart to `axl_driver_get_load_options`
+  (which assumes UCS-2). `AXL_SERVICE_DRIVER` uses this to
+  read the UTF-8 query-string payload without encoding
+  misinterpretation.
+
+- **`AXL_DRIVER(entry, unload)` macro + `AxlHandle` /
+  `AxlSystemTable` / `AXLAPI` / `AxlEfiStatus`** — DXE drivers can
+  now be written without spelling `EFI_*` or `EFIAPI` in consumer
+  source. The `AXL_DRIVER` macro emits the firmware-side
+  `DriverEntry` + unload stubs and wires `axl_driver_init` /
+  `axl_driver_set_unload` automatically; consumer entry/unload
+  take `AxlHandle` parameters and return `int` (0 = OK, non-zero
+  aborts the load). New header `<axl/axl-efi-status.h>` exposes
+  `AxlEfiStatus` (binary-compatible with `EFI_STATUS`) and 27
+  curated UEFI 2.11 Appendix D status constants
+  (`AXL_EFI_NOT_FOUND`, `AXL_EFI_INVALID_PARAMETER`, etc.) for
+  spec-protocol publishers (`EFI_FILE_PROTOCOL`,
+  `EFI_BLOCK_IO_PROTOCOL`, driver-binding callbacks) that need to
+  return spec-mandated values without pulling all of
+  `<uefi/axl-uefi.h>`. `_Static_assert`s in `src/util/axl-driver.c`
+  pin the binary compat. `sdk/examples/driver.c` is the reference
+  for the AXL-only path (zero `EFI_*` identifiers in the consumer
+  source after this refactor). `AXLAPI` is published as an alias
+  for `EFIAPI` for the rare consumer-defined firmware-called
+  callback that lives outside the macro path.
+
+- **`axl_loop_attach_driver(loop, interval_ms)` /
+  `axl_loop_detach_driver(loop)`** — drive an `AxlLoop` from a
+  firmware-managed periodic timer when the consumer is a DXE
+  driver image with no foreground caller. `axl_loop_run` is the
+  foreground driver and blocks in `gBS->WaitForEvent`; UEFI driver
+  entry points return to the firmware after publishing protocols,
+  so without this helper anything async in the loop is dead. The
+  attach helper installs an `EVT_TIMER | EVT_NOTIFY_SIGNAL` event
+  at `TPL_CALLBACK` (the lowest TPL legal for signal events per
+  UEFI 2.11 §7.1) whose notify drains the loop in non-blocking
+  mode every `interval_ms`. Idle callbacks, defer-queue work, and
+  source events all dispatch from this notify the same way they
+  would inside `axl_loop_run`. New backend primitive
+  `axl_backend_event_create_notify_timer` exposes the underlying
+  EVT_TIMER+EVT_NOTIFY_SIGNAL machinery; the matching close path
+  cancels the timer first then frees the bridging context, so
+  `axl_backend_event_close` is the symmetric teardown.
+
+  Documented contract — every consumer's source callback must run
+  fast (< ~1 ms is the rule of thumb). At `TPL_CALLBACK` the loop
+  shares the firmware-driver notify FIFO with TCP4 / MNP / SNP, so
+  a slow callback holds the TPL and starves co-located firmware
+  drivers. `axl-webfs` is the reference consumer (HTTP server
+  inside a DXE driver image). See `src/loop/README.md` § "Driver
+  Mode" and `<axl/axl-loop.h>` doxygen for the full contract.
+
+### Changed
+
+- **`AxlUploadHandler` gains a 6th parameter `bool aborted`.** When
+  the TCP peer disconnects mid-upload, `reset_connection` now calls
+  the registered upload handler with `(req, resp, NULL, 0, data,
+  true)` while the request state is still valid. Mirrors the
+  existing `AXL_WS_DISCONNECT` event for WebSocket handlers — same
+  lifecycle gap. Handlers that hold per-request state across chunk
+  calls (open file handles, accumulators, allocations) MUST release
+  it on the abort call; without this signal, that state leaked
+  into the next request on the same handler globals (caused
+  cross-request data corruption in axl-webfs's PUT path). Mutually
+  exclusive with the existing clean-EOF NULL/0 call. Breaking
+  change for existing handlers — add the parameter and an
+  `if (aborted)` early branch.
+
+- **HTTP middleware now runs ahead of upload routes.** Routes
+  registered via `axl_http_server_add_upload_route` previously
+  bypassed `axl_http_server_use` middleware entirely (they were
+  routed before the dispatch path that runs middleware). Any
+  cross-cutting concern (auth, read-only gating, rate limiting)
+  silently failed to apply to uploads. Middleware now fires once
+  per upload, before the first chunk reaches the handler. On
+  rejection, the connection is force-closed (the client almost
+  always sent body bytes before reading the rejection — staying in
+  keep-alive desyncs the next request). Same fix shape as
+  `send_error_response`. Symmetric leak fix in the existing
+  `dispatch_request` middleware-rejection path: it was leaking
+  `resp.body` / `resp.headers` via early return.
+
+- **`AxlService.protocol_guid` field removed; identity is derived
+  from `AxlService.name`.** Consumers no longer hand-allocate a
+  UUID per service. The new public helper `axl_guid_v5(namespace,
+  name, out)` (in `<axl/axl-sys.h>`) does name-based UUIDv5-shaped
+  derivation; `axl_service_guid(svc, out)` is the convenience
+  wrapper that uses AxlService's fixed namespace. Both binaries
+  in a single-source-tree build see the same derived GUID by
+  construction. **Source break, ABI break** for any consumer with
+  a static `AxlService` initializer that set `.protocol_guid`:
+  delete the line. axl-webfs's `webfs_serve` migrated; demos
+  migrated. `AxlService.name` is now REQUIRED — consumers that
+  previously omitted it as a log-only label must set it. Per
+  `feedback_change_apis_freely` — pre-1.0, no compat bar.
+
+- **`AxlService.driver_tick_ms` is now the single source of truth
+  for the firmware-tick period.** `axl_service_attach_driver`
+  loses its `tick_ms` parameter — it reads `svc->driver_tick_ms`
+  with `0 → AXL_SERVICE_DEFAULT_TICK_MS` (a new public 50 ms
+  constant). Eliminates the field/parameter double state and the
+  prior "field 0 = default" vs "param 0 = AXL_ERR" asymmetry.
+  `AXL_SERVICE_DEFAULT_TICK_MS` is now exposed in
+  `<axl/axl-service.h>` so consumers can reference the default.
+
+- **`AxlConfigDesc` gains trailing `.short_name` and `.choices`
+  fields** for consumers that want a single descriptor table to
+  drive both AxlConfig auto-apply AND a synthesized `AxlArgDesc[]`
+  CLI surface. AxlConfig parsing ignores both fields;
+  `axl_service_main`'s synthesizer passes them through —
+  `.short_name` becomes the AxlArgs short flag, and a non-NULL
+  `.choices` on a STRING-typed entry elevates to `AXL_ARG_CHOICE`
+  so the CLI parser validates the value and `--help` lists the
+  options.
+
+- **AxlService verb / API renamed `launch` → `start`** (systemctl-
+  flavored). The default verb tree from `axl_service_main` is now
+  `start [--detach]` / `stop` / `status`, mirroring `systemctl`'s
+  semantics directly. The matching foreground API renames:
+
+  ```
+  axl_service_launch_embedded(deploy)  →  axl_service_start_embedded(deploy)
+  ```
+
+  axl_service_stop / _is_running / _teardown unchanged. Per
+  `feedback_change_apis_freely` — pre-1.0, no compat bar. axl-webfs
+  is the only known consumer; its `serve` handler will need
+  s/launch_embedded/start_embedded/ when it migrates.
+
+- **`sdk/examples/service-demo/` collapses into a single
+  `sdk/examples/service-demo.c`.** The whole demo — types,
+  descriptor, setup/teardown, AxlService struct, and the
+  `AXL_SERVICE` macro that emits the entry point — now fits in
+  one ~100-line file. No subdirectory, no `core.c` / `main.c` /
+  `driver.c` split, no shared.h.
+
+  Build (in-tree): `make service-demo` produces `service_demo.efi`
+  + `service_demo-dxe.efi` from the same source compiled twice
+  (once with `-DAXL_SERVICE_BUILD_DRIVER` for the driver image,
+  once with `EMBED_BLOB(service_demo, ...)` for the launcher).
+
+  Build (consumer / SDK release):
+  ```
+  axl-cc --service service_demo service-demo.c
+  ```
+
+  Output binaries renamed: `service-demo.efi` / `service-demo-launch.efi` /
+  `service-demo-stop.efi` / `service-demo-driver.efi` from earlier
+  in this branch all collapse into `service_demo.efi` (with default
+  verbs `launch` / `stop` / `status` from `axl_service_main`) and
+  `service_demo-dxe.efi`.
+
+  `test-axl-cc-embed.sh` renamed to `test-axl-cc-service.sh` —
+  asserts the same cross-binary round-trip via the driver-side
+  setup log line, but builds the demo via `axl-cc --service`
+  instead of two-step manual compile. `test-service-driver.sh`
+  asserts on the new log lines (`service-demo: setup: ...`,
+  `teardown`, `stopped`) instead of the old `LAUNCH-PASS` /
+  `STOP-PASS` printf markers.
+
+  Step 5 of 5 — completes the AxlService driver-only redesign +
+  single-file pattern. Total: 5 commits, ~1600 LOC removed,
+  consumers writing single-service tools now have a 100-line
+  shape with zero handwritten launcher boilerplate.
+
+- **DHCP completion is event-driven instead of 1 Hz polled.**
+  `axl_net_auto_init` now registers an `EFI_IP4_CONFIG2_PROTOCOL`
+  DataNotify on `Ip4Config2DataTypeInterfaceInfo` and waits on the
+  event via the AxlWait infrastructure. EDK2's IP4Config2 driver
+  fires the event from `Ip4Config2OnDhcp4Complete` when the address
+  commits, so the wakeup is sub-millisecond after DHCP finishes —
+  the prior code wasted up to 1 second of dead time per startup.
+  The 1 s tick is kept as a fallback for firmware that returns
+  `EFI_UNSUPPORTED` on RegisterDataNotify or doesn't fire DataNotify
+  on completion.
+
+  `axl_net_drivers_up`'s link-up wait is similarly routed through
+  AxlWait's event-loop infrastructure with a condition function
+  (no portable SNP-side notify event for link-state, so this stays
+  a 100 ms tick poll, just centrally managed and Ctrl-C-cancellable).
+
+- **PIIX4 SMBus IMC retry stalls via `axl_msleep`, not
+  `axl_backend_stall`.** The IMC semaphore acquire-loop's
+  inter-retry wait was a 1 ms busy-spin, up to 2 seconds at 100% CPU
+  on a contended bus. Now event-driven; the host CPU idles between
+  checks. Same 2 s budget, no busy waste. (The remaining
+  `axl_backend_stall` callers all run at sub-ms cadence below
+  firmware timer resolution and are correctly documented:
+  KCS IPMI 100 µs, PIIX4 50 µs poll, PIIX4 500 µs hardware errata
+  pre-stall, x86_64 TSC calibration 10 ms one-time, NORETURN spin
+  after `gBS->Exit`.)
+
+- **`--gc-sections` enabled in LDFLAGS_EFI.** Combined with the
+  existing `-ffunction-sections / -fdata-sections` in CFLAGS, this
+  gives per-symbol selective linking — dead functions inside an
+  otherwise-referenced .o get dropped at link time. Per-binary
+  saving today is ~0.2% (the static-archive .o-member granularity
+  was already doing most of the work); the real value is
+  regression-proofing against future bloat. `KEEP(*(.dbgdir))`
+  added to both linker scripts since gc-sections strips it
+  otherwise (no symbol references it; only the post-link
+  `pe-set-debug` tool reads it).
+
+- **`AXL_SERVICE_DRIVER` macro is now a one-line shim.** The macro
+  body — ~145 lines of LoadOptions decode, protocol publish, loop
+  creation, attach_driver, and the matching unload-stub teardown
+  sequence — moved into a SDK library function
+  `_axl_service_driver_init`. The macro shrinks to:
+
+  ```c
+  #define AXL_SERVICE_DRIVER(svc)                                    \
+    EFI_STATUS EFIAPI                                                \
+    DriverEntry(EFI_HANDLE _img, EFI_SYSTEM_TABLE *_st) {            \
+      return _axl_service_driver_init(_img, _st, &(svc));            \
+    }
+  ```
+
+  `tick_ms` is no longer a macro arg — it's a new `.driver_tick_ms`
+  field on `AxlService` (0 means use the 50 ms default). Driver-image
+  consumers update from:
+
+  ```c
+  AXL_SERVICE_DRIVER(my_service, 50)
+  ```
+
+  to:
+
+  ```c
+  static const AxlService my_service = {
+      ..., .driver_tick_ms = 50,
+  };
+  AXL_SERVICE_DRIVER(my_service);
+  ```
+
+  A single AxlService instance now describes everything the driver
+  side needs; the macro only emits the firmware-mandated DriverEntry
+  symbol that delegates to the library. Library-side per-image
+  static state (loop, cfg, handle, svc pointer) replaces what was
+  previously per-TU statics inlined by the macro — single instance
+  per .efi, no behavior change. Test-service-driver.sh PASS
+  both arches.
+
+  Caught in pre-commit code review: the unload stub MUST carry
+  `EFIAPI` calling convention. The first cut declared it as plain
+  `int(void *)` and crashed at unload time on x64 (firmware called
+  it with ms_abi but the function expected SysV; corrupted-stack
+  reads showed the heap-poison 0xAF pattern in registers).
+
+- **In-tree `.S` sidecar files retired.** The Makefile grew an
+  `EMBED_BLOB(name, path)` function that generates the `.incbin`
+  sidecar on the fly (mirrors what `axl-cc --embed` does for SDK
+  consumers). `sdk/examples/service-demo-launch-blob.S`,
+  `sdk/examples/embed-asset-blob.S`, and `tools/mkrd-blob.S` are
+  deleted; the three call sites use `$(eval $(call EMBED_BLOB,...))`
+  + `$(BLOB_OBJ_<name>)` instead. `tools/mkrd.c` migrates from
+  hand-rolled `extern axl_embedded_ramdiskdxe[]` decls to
+  `AXL_EMBED_DECLARE` / `AXL_EMBED_DATA` / `AXL_EMBED_SIZE`. No
+  behavior change; same symbols, same .efi bytes.
+
+- **`axl_service_detach_driver` no longer runs teardown.** The
+  function is now timer-detach only; callers that own a "setup
+  ran → teardown should run" relationship invoke
+  `axl_service_teardown` explicitly. Previously teardown was
+  hidden inside detach_driver's success path, which silently
+  skipped teardown when `axl_loop_detach_driver` returned ERR —
+  any future failure mode there inherited the silent skip.
+  Splitting makes each function's responsibility narrow and the
+  `AXL_SERVICE_DRIVER` macro's unload-time flow visible. New
+  public `axl_service_teardown(svc)` returns the teardown
+  callback's rc so the macro's unload stub propagates it into
+  the `EFI_STATUS` `gBS->UnloadImage` observes — teardown
+  failure surfaces to the firmware rather than getting
+  absorbed.
+
+  Migration: any consumer that called `axl_service_detach_driver`
+  expecting it to run teardown follows up with
+  `axl_service_teardown(&svc)` directly. axl-webfs (the only
+  out-of-tree consumer) uses `axl_service_stop` / the
+  `AXL_SERVICE_DRIVER` macro, neither of which call
+  detach_driver directly — so no migration on the consumer
+  side.
+
+- **AxlService gains visible teardown logging.** All
+  framework-driven teardown invocations log `service '<name>':
+  teardown ENTER` / `teardown EXIT rc=N` at debug level; a
+  non-OK rc gets promoted to `axl_warning`. Bumped via
+  `AXL_LOG_LEVEL=debug` from the consumer side; off by default.
+  Prevents future "did teardown actually run?" misdiagnoses
+  without forcing every consumer to add their own printf.
+
+- **AxlService held-protocol hazard documented** on
+  `<axl/axl-service.h>` typedefs (AxlServiceSetup,
+  AxlServiceTeardown) and in `src/util/README.md`'s AxlService
+  section. UEFI's `gBS->UnloadImage` performs a post-callback
+  refcount check that refuses with `EFI_ACCESS_DENIED` if the
+  image still holds open protocol references — the most common
+  cause of "stop fails" on a service-shaped driver. Documented
+  with the exact warning shape from `axl_driver_unload` so a
+  consumer who hits this in the wild can search for and find
+  the relevant explanation.
+
+- **`axl_driver_init` signature tightened from `(void *, void *)`
+  to `(AxlHandle, AxlSystemTable *)`.** Drivers using the
+  `AXL_DRIVER` macro never see this — the macro casts internally.
+  Hand-rolled `DriverEntry` consumers (tier-2 spec-protocol
+  publishers like axl-webfs's filesystem driver) add two casts
+  at the call site:
+
+  ```c
+  // before:
+  axl_driver_init(ImageHandle, SystemTable);
+  // after:
+  axl_driver_init((AxlHandle)ImageHandle, (AxlSystemTable *)SystemTable);
+  ```
+
+  Pointer values are bit-identical; the cast is a typing-only
+  formality. The strict signature keeps the AXL_DRIVER path's
+  contract honest (consumers there really do work with
+  `AxlHandle` and never see `EFI_*`).
+
+- **Renamed the AXL service registry to the AXL protocol registry.**
+  The abstraction is a thin name-keyed wrapper over UEFI's
+  `InstallProtocolInterface` / `LocateProtocol` family — calling it
+  "service" was colliding with a separate "service" concept in the
+  paused axl-kernel POC (long-running, systemd-shaped process units),
+  which we want to spin off as a sibling repo. Renaming now is cheap
+  while the only consumer outside the SDK is axl-webfs (already
+  migrated in lock-step). Pre-1.0 — no compat shim.
+
+  Migration for downstream consumers — straight identifier renames:
+
+  | Old                              | New                                |
+  |----------------------------------|------------------------------------|
+  | `axl_service_find`               | `axl_protocol_find`                |
+  | `axl_service_enumerate`          | `axl_protocol_enumerate`           |
+  | `axl_service_register`           | `axl_protocol_register`            |
+  | `axl_service_register_name`      | `axl_protocol_register_name`       |
+  | `axl_service_register_multiple`  | `axl_protocol_register_multiple`   |
+  | `axl_service_unregister`         | `axl_protocol_unregister`          |
+  | `axl_handle_get_service`         | `axl_handle_get_protocol`          |
+
+  No verb changes — the rename is purely on the noun. Built-in
+  well-known names (`"smbios"`, `"shell"`, `"simple-fs"`, `"tcp4"`,
+  etc.) are unchanged. Internal file rename: `src/util/axl-service.c`
+  → `src/util/axl-protocol.c`; doxygen / Sphinx / README sections
+  updated to match. The PASS-line names in `sdk/examples/driver.c`
+  changed from `driver-service-pin`/`-find` to
+  `driver-protocol-pin`/`-find`; consumers parsing those strings
+  must update.
+
+### Removed
+
+- **AxlService is now driver-only — `axl_service_run*` removed.**
+  The four foreground-runs-the-service entry points
+  (`axl_service_run`, `_with_loop`, `_args`, `_with_loop_args`) and
+  the operational fields tied to them (`.on_signal`,
+  `.watchdog_keep_armed`, `.restart_max`, `.restart_backoff_ms`)
+  are gone. AxlService now describes a DXE driver, period — long-
+  running work in UEFI lives in driver images, not foreground apps.
+
+  Surviving entry points:
+  - `AXL_SERVICE_DRIVER(svc)` — driver-image macro (unchanged).
+  - `axl_service_attach_driver` / `_detach_driver` — used by the
+    macro; rare for direct consumer use.
+  - `axl_service_launch_embedded` / `_stop` / `_is_running` —
+    foreground-side primitives for loading, stopping, querying a
+    driver image.
+  - `axl_service_teardown` — internal teardown hook.
+
+  Surviving struct fields:
+  ```c
+  typedef struct {
+      const char           *name;
+      const AxlConfigDesc  *opts_descs;
+      AxlServiceSetup       setup;
+      AxlServiceTeardown    teardown;
+      void                 *user;
+      AxlGuid               protocol_guid;
+      uint64_t              driver_tick_ms;  /* 0 = 50ms default */
+  } AxlService;
+  ```
+
+  Migration: foreground apps that called `axl_service_run*` switch
+  to `axl_service_launch_embedded` + (optional) supervise loop +
+  `axl_service_stop`. The forthcoming `axl_service_main` helper
+  packages this pattern; for now consumers wire it explicitly.
+
+  service-demo's `run` verb migrated: launches the embedded
+  driver, blocks on the default loop until Ctrl-C, then stops the
+  driver. `test-service.sh` (which only tested the foreground sync
+  path) deleted; `test-service-driver.sh` covers launch/stop/
+  relaunch.
+
+  Pre-1.0, no wire-compat bar. axl-webfs is the only known
+  consumer; its in-process serve handler will need the same
+  launch+supervise+stop migration.
+
+### Fixed
+
+- **`axl_file_rename` rejects cross-directory renames and
+  malformed paths.** The UEFI backend's `SetInfo(FileInfo)` was
+  receiving the full new-path (including `fs0:\` volume prefix)
+  as the FileName, which FAT drivers documented-reject. Every
+  WebDAV `MOVE` returned 409. Fix: extract basename before
+  passing to the backend, verify any directory prefix matches
+  the source, refuse cross-directory rename (use the new
+  `axl_file_move` for that). Empty-basename inputs also
+  rejected up-front.
+
+- **`axl_url_parse` strict port parsing.** The `:PORT` segment
+  now rejects non-digit characters, overflow past `uint16_t`,
+  and trailing garbage; previously these silently parsed as
+  truncated or zero. Callers that round-tripped malformed URLs
+  through `axl_url_parse` will now see `AXL_ERR` instead of a
+  silently-broken `AxlUrl`. Fixes a class of "why is my port
+  wrong" bugs in URL-driven config.
+
+- **`axl_http_response_set_range` now emits the `Content-Range`
+  header per RFC 9110 §15.3.7.** The function set `status_code = 206`
+  and copied the slice into the response body, but never wrote the
+  `Content-Range: bytes <start>-<end>/<total>` header that 206
+  responses MUST carry. Tolerant clients (curl, browsers) accepted
+  the header-less 206 because `Content-Length` matched the requested
+  slice; strict clients (some download managers, range-stitching
+  HTTP libraries) would reject it. The function's docstring already
+  promised the header — the implementation just never delivered.
+
+- **DXE-driver-mode HTTP delivered headers but no body, server stuck
+  in CLOSE-WAIT.** `send_response` called the synchronous
+  `axl_tcp_send`, which spins a private `AxlLoop` and `axl_loop_run`s
+  on it. In driver mode dispatch fires at `TPL_CALLBACK`, where
+  `gBS->WaitForEvent` returns `EFI_UNSUPPORTED`. The wait failed
+  silently, `sock->send_source` stayed pinned to the freed ephemeral
+  loop, and the body send was rejected by `axl_tcp_send_async`'s
+  "previous send still pending" guard. `reset_connection`'s
+  `axl_tcp_close` then cancelled the queued Transmit before TCP4
+  put it on the wire. `send_response` is now a single
+  `axl_malloc(headers+body)` + one `axl_tcp_send_async` (or
+  `axl_tls_write_async` for TLS) + one `on_response_sent` callback
+  that frees `tx_buf` and decides keep-alive vs reset_connection.
+  WS-upgrade 101 also async-ified. All `send_error_response`
+  callsites stripped of the synchronous `reset_connection` they
+  used to chain after — error responses now force `keep_alive=false`
+  and let `on_response_sent` drive teardown after the wire transmit
+  completes. Reproducer in `test/integration/test-driver-http.sh`
+  (8 sequential GETs + body + CLOSE-WAIT settle check).
+
+- **Driver-mode listener wedged after exactly `HTTP_DEFAULT_MAX_CONNS`
+  requests.** `driver_dispatch_notify` was processing exactly one
+  event source per 50 ms tick. Under HTTP load, recv-data callbacks
+  synchronously submit `axl_tcp_send_async` (TCP4 typically completes
+  the Transmit inline), but the corresponding tx-event was only
+  checked on the NEXT tick. Each tick handled the older accept
+  signal first (slot 0), so eight sequential GETs filled the conn
+  pool with `active=true` slots whose `on_response_sent` never ran.
+  The 9th connection saw `NO FREE SLOT` and the listener appeared
+  wedged. Driver-mode dispatch now drains all signaled events per
+  tick (capped at `2 × AXL_MAX_SOURCES` as runaway guard, hitting
+  the cap is logged). Matches the doxygen contract on
+  `axl_loop_attach_driver` ("processes whatever's pending in this
+  tick before returning"). `axl_loop_run` was unaffected. Regression
+  test in `test/integration/test-driver-http.sh` adds a malformed
+  request after the 8 successful GETs to exercise the failure mode.
+
+- **`axl_driver_set_load_options` leaked one allocation per
+  load+set+unload cycle (142 bytes per driver instance in the
+  axl-webfs reproducer).** The function `axl_malloc(size)`s a copy of
+  the caller's data and hands the pointer to the firmware via
+  `LoadedImage->LoadOptions`. The firmware retains the pointer for
+  the loaded-image lifetime and provides no callback to free it;
+  `axl_driver_unload` only called `gBS->UnloadImage`. AXL now tracks
+  the copy in a fixed-capacity (16-slot) side table mapping
+  `AxlDriverHandle → owned LoadOptions copy`, mirroring the
+  `NotifyTimerEntry` pattern from
+  `src/backend/native/axl-backend-native-event.c`.
+  `axl_driver_unload` calls `load_options_release(handle)` BEFORE
+  `gBS->UnloadImage` so a UnloadImage failure still doesn't leak.
+  Re-set on a handle frees the old copy and reuses its slot.
+  Out-of-slots returns `AXL_ERR` and frees the would-be copy
+  rather than installing-and-leaking. Regression test in
+  `test/integration/test-driver-leak.sh` (3 phases: basic, re-set,
+  table-full at 17th load).
+
+### Documentation
+
+- **`src/util/README.md` and Sphinx glossary now define what UEFI
+  means by "protocol".** UEFI's term is awkward — a "protocol" is
+  a C struct of function pointers identified by a GUID and bound
+  to a handle (closer to a COM interface or a Java/Swift interface
+  on an instance than anything wire-shaped). The README's "Protocol
+  Registry" section opens with a "What UEFI Means by Protocol"
+  preamble + cross-language analogs; the glossary entry expands to
+  match; the public header banner in `<axl/axl-sys.h>` carries a
+  short pointer to the README.
+
+### Tests
+
+Unit test ratchet at 3125/3125 on both X64 and AARCH64. HTTP
+integration 177/0, Redfish 12/0, net-tools 15/0, tcp-echo 4/0,
+tool 31/0, cpu-idle PASS. `BUILD=RELEASE` clean on both arches;
+`AXL_TLS=1 BUILD=RELEASE` clean on X64. `scripts/build-docs.sh`
+zero warnings.
+
 ## 0.16.0 — 2026-05-08
 
 ### Added

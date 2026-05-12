@@ -7,6 +7,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "../event/axl-wait-internal.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
@@ -23,6 +24,51 @@ typedef struct {
     EFI_IPv4_ADDRESS  Address;
     EFI_IPv4_ADDRESS  SubnetMask;
 } Ip4Config2ManualAddress;
+
+// ---------------------------------------------------------------------------
+// axl_net_bring_up — one-call DHCP-or-static bring-up + address read-back
+// ---------------------------------------------------------------------------
+
+#define AXL_NET_STATIC_IP_SETTLE_MS  500
+
+int
+axl_net_bring_up(
+    size_t          nic_index,
+    const uint8_t  *static_ipv4,
+    const uint8_t  *netmask,
+    const uint8_t  *gateway,
+    size_t          timeout_sec,
+    AxlIPv4Address *addr_out)
+{
+    if (static_ipv4 == NULL) {
+        if (axl_net_auto_init(nic_index, timeout_sec) != AXL_OK) {
+            return AXL_ERR;
+        }
+    } else {
+        /* Static path: drivers_up gets us link without burning the
+           DHCP timeout (which would fire if we routed through
+           auto_init). Then set the static address. */
+        if (axl_net_drivers_up() != AXL_OK) {
+            return AXL_ERR;
+        }
+        static const uint8_t mask24[4] = { 255, 255, 255, 0 };
+        const uint8_t *m = (netmask != NULL) ? netmask : mask24;
+        if (axl_net_set_static_ip(nic_index, static_ipv4, m, gateway) != AXL_OK) {
+            return AXL_ERR;
+        }
+        /* IP4Config2 applies the policy + address asynchronously; without
+           a short settle, the next GetData can still report the prior
+           state. 500 ms is the empirically-stable budget. */
+        axl_msleep(AXL_NET_STATIC_IP_SETTLE_MS);
+    }
+
+    if (addr_out != NULL) {
+        if (axl_net_get_ip_address(addr_out) != AXL_OK) {
+            return AXL_ERR;
+        }
+    }
+    return AXL_OK;
+}
 
 // ---------------------------------------------------------------------------
 // axl_net_set_static_ip
@@ -44,7 +90,7 @@ axl_net_set_static_ip(
         return AXL_ERR;
     }
 
-    if (axl_service_enumerate("ip4-config2", &handles, &count) != AXL_OK
+    if (axl_protocol_enumerate("ip4-config2", &handles, &count) != AXL_OK
         || count == 0)
     {
         axl_warning("no IP4Config2 protocol found");
@@ -163,7 +209,7 @@ net_count_snp(void)
 {
     void  **handles = NULL;
     size_t  count = 0;
-    if (axl_service_enumerate("simple-network", &handles, &count) == AXL_OK) {
+    if (axl_protocol_enumerate("simple-network", &handles, &count) == AXL_OK) {
         axl_free(handles);
     }
     return count;
@@ -297,8 +343,24 @@ axl_net_ensure_drivers(void)
 }
 
 // ---------------------------------------------------------------------------
-// axl_net_auto_init
+// axl_net_drivers_up — load NIC drivers, connect SNP, wait for link
+// (no DHCP, no IP assignment — that's auto_init / set_static_ip / bring_up's
+// job). Used both internally by axl_net_auto_init and by axl_net_bring_up's
+// static-IP path, where waiting 10s for a DHCP response is dead time.
 // ---------------------------------------------------------------------------
+
+#define AXL_NET_DRIVERS_UP_IFACE_MAX  4
+
+/* axl_net_auto_init's DHCP-completion cond — re-checks GetData on every
+   wakeup. Lives at file scope so axl_net_drivers_up's static link cond
+   isn't the only example here. */
+static bool
+ip4cfg_addr_acquired(void *ctx)
+{
+    (void)ctx;
+    AxlIPv4Address addr;
+    return axl_net_get_ip_address(&addr) == AXL_OK;
+}
 
 static void
 net_connect_snp_handles(void)
@@ -309,7 +371,7 @@ net_connect_snp_handles(void)
      * harmless and matches the prior behavior tools relied on. */
     void  **snp_handles = NULL;
     size_t  snp_count = 0;
-    if (axl_service_enumerate("simple-network", &snp_handles, &snp_count) == AXL_OK) {
+    if (axl_protocol_enumerate("simple-network", &snp_handles, &snp_count) == AXL_OK) {
         for (size_t i = 0; i < snp_count; i++) {
             axl_driver_connect_handle(snp_handles[i]);
         }
@@ -317,11 +379,64 @@ net_connect_snp_handles(void)
     }
 }
 
+/* axl_net_drivers_up's link-up cond — runs as the AxlWait condition
+   function; returns true when at least one NIC reports link_up.
+   No SNP-side notify event covers link-state portably across drivers,
+   so the wait stays a 100ms-tick poll routed through the SDK's central
+   AxlWait infrastructure (event-loop integrated, Ctrl-C cancellable). */
+static bool
+link_is_up(void *ctx)
+{
+    AxlNetInterface *ifaces = (AxlNetInterface *)ctx;
+    size_t iface_count = AXL_NET_DRIVERS_UP_IFACE_MAX;
+    if (axl_net_list_interfaces(ifaces, &iface_count) != AXL_OK) {
+        return false;
+    }
+    for (size_t i = 0; i < iface_count; i++) {
+        if (ifaces[i].link_up) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int
+axl_net_drivers_up(void)
+{
+    /* Locate and load NIC drivers (and NetworkCommon) if SNP isn't up
+     * yet. We don't care about the specific NOT_FOUND vs NO_LINK error
+     * here — drivers_up's contract is "did we get a link or not"; the
+     * diagnostic distinction matters to tools that call ensure_drivers
+     * directly. */
+    axl_net_ensure_drivers();
+    net_connect_snp_handles();
+
+    /* Wait for link-up (max 5s, condition polled by AxlWait at 100ms).
+       Fast-path: if a link is already up, AxlWait returns AXL_OK without
+       creating a loop. */
+    AxlNetInterface ifaces[AXL_NET_DRIVERS_UP_IFACE_MAX];
+    AxlStatus rc = _axl_event_wait_timeout_with_tick(
+        NULL,
+        link_is_up, ifaces,
+        NULL, NULL,
+        100ULL * 1000ULL,        /* tick_us = 100 ms */
+        NULL,
+        5ULL * 1000ULL * 1000ULL); /* timeout_us = 5 s */
+    if (rc != AXL_OK) {
+        axl_warning("no link detected on any NIC");
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_auto_init
+// ---------------------------------------------------------------------------
+
 int
 axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
 {
     size_t timeout;
-    size_t elapsed;
 
     AxlIPv4Address addr;
 
@@ -339,39 +454,10 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
         return AXL_OK;
     }
 
-    /* Locate and load NIC drivers (and NetworkCommon) if SNP isn't up
-     * yet. We don't care about the specific NOT_FOUND vs NO_LINK error
-     * here — auto_init's contract is "DHCP succeeded or didn't"; the
-     * diagnostic distinction matters to tools that call ensure_drivers
-     * directly. */
-    axl_net_ensure_drivers();
-    net_connect_snp_handles();
-
-    /* Wait for link-up before attempting DHCP (max 5 seconds) */
-    {
-        AxlNetInterface ifaces[4];
-        size_t iface_count = 4;
-        bool link_found = false;
-
-        for (int attempt = 0; attempt < 50; attempt++) {
-            iface_count = 4;
-            if (axl_net_list_interfaces(ifaces, &iface_count) == AXL_OK) {
-                for (size_t i = 0; i < iface_count; i++) {
-                    if (ifaces[i].link_up) {
-                        link_found = true;
-                        break;
-                    }
-                }
-            }
-            if (link_found) {
-                break;
-            }
-            axl_msleep(100);
-        }
-        if (!link_found) {
-            axl_warning("no link detected on any NIC");
-        }
-    }
+    /* drivers_up returns AXL_ERR if no link came up — auto_init still
+       continues (older callers rely on the DHCP poll being attempted
+       even on no-link paths to surface a clearer error). */
+    (void)axl_net_drivers_up();
 
     /*
      * Set DHCP policy via IP4Config2. We find the right handle,
@@ -379,7 +465,7 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
      */
     void  **cfg_handles = NULL;
     size_t  cfg_count = 0;
-    if (axl_service_enumerate("ip4-config2", &cfg_handles, &cfg_count) != AXL_OK
+    if (axl_protocol_enumerate("ip4-config2", &cfg_handles, &cfg_count) != AXL_OK
         || cfg_count == 0)
     {
         axl_warning("no IP4Config2 protocol found");
@@ -412,15 +498,54 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
                    (unsigned long long)dhcp_status);
     }
 
-    /* Poll for IP assignment — strict get_ip_address() check, see above */
-    for (elapsed = 0; elapsed < timeout; elapsed++) {
-        if (axl_net_get_ip_address(&addr) == AXL_OK) {
-            axl_info("network ready after %zu seconds", elapsed + 1);
-            return AXL_OK;
+    /* Wait for DHCP completion via IP4Config2 RegisterDataNotify on
+       Ip4Config2DataTypeInterfaceInfo. The IP4Config2 driver fires the
+       event from Ip4Config2OnDhcp4Complete (see EDK2
+       NetworkPkg/Ip4Dxe/Ip4Config2Impl.c) at the moment the address is
+       committed — sub-millisecond latency vs. the prior 1 Hz polling
+       loop's worst-case 1 s of dead time per startup. The condition
+       function still re-checks GetData on every wakeup so a firmware
+       that signals the event without the address actually being live
+       (or a firmware that doesn't fire DataNotify at all) still
+       converges via the AxlWait tick — the 1 s tick keeps total CPU
+       use comparable to the prior poll. */
+    EFI_EVENT cfg_event = NULL;
+    bool      cfg_event_registered = false;
+    if (axl_bs()->CreateEvent(0, 0, NULL, NULL, &cfg_event) == EFI_SUCCESS
+        && cfg_event != NULL)
+    {
+        EFI_STATUS reg_st = axl_efi_call(ip4cfg->RegisterDataNotify, 3,
+            ip4cfg, Ip4Config2DataTypeInterfaceInfo, cfg_event);
+        if (reg_st == EFI_SUCCESS) {
+            cfg_event_registered = true;
+        } else {
+            axl_debug("RegisterDataNotify(InterfaceInfo) returned 0x%llx — "
+                      "falling back to tick-only poll",
+                      (unsigned long long)reg_st);
+            axl_bs()->CloseEvent(cfg_event);
+            cfg_event = NULL;
         }
-        if (axl_wait_ms(NULL, 1000) == AXL_CANCELLED) {
-            break;  /* Ctrl-C */
-        }
+    }
+
+    AxlStatus wait_rc = _axl_event_wait_timeout_with_tick(
+        (AxlEventHandle)cfg_event,
+        ip4cfg_addr_acquired, NULL,
+        NULL, NULL,
+        1000ULL * 1000ULL,             /* tick_us = 1 s — same fallback cadence */
+        NULL,
+        timeout * 1000ULL * 1000ULL);  /* timeout_us */
+
+    if (cfg_event_registered) {
+        axl_efi_call(ip4cfg->UnregisterDataNotify, 3,
+            ip4cfg, Ip4Config2DataTypeInterfaceInfo, cfg_event);
+    }
+    if (cfg_event != NULL) {
+        axl_bs()->CloseEvent(cfg_event);
+    }
+
+    if (wait_rc == AXL_OK) {
+        axl_info("network ready");
+        return AXL_OK;
     }
 
     axl_warning("DHCP timeout after %zu seconds", timeout);

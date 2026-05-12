@@ -183,6 +183,140 @@ test_file(void)
     test_check(len == 5 && test_memcmp(contents, "hello", 5) == 0,
           "file: get/set roundtrip content");
     axl_free(contents);
+
+    /* --- axl_file_rename: full-path new_path acceptance.
+       The UEFI shell backend used to stuff the entire new_path
+       (including `fs0:\` prefix) into EFI_FILE_INFO.FileName,
+       which the FAT driver rejects because the FileName slot
+       expects a basename. axl_file_rename now extracts the
+       basename + verifies same-directory before delegating. */
+    axl_file_set_contents("fs0:\\axl_rn_src.tmp", "x", 1);
+    test_check(axl_file_rename("fs0:\\axl_rn_src.tmp",
+                               "fs0:\\axl_rn_dst.tmp") == AXL_OK,
+               "file: rename with full-path new_path");
+    test_check(axl_file_get_contents("fs0:\\axl_rn_dst.tmp",
+                                     &contents, &len) == AXL_OK,
+               "file: renamed-to path readable");
+    axl_free(contents);
+    /* Cleanup */
+    axl_file_delete("fs0:\\axl_rn_dst.tmp");
+
+    /* Cross-directory rename must be refused — SetFileInfo can't
+       move across directories on most FAT drivers, and we surface
+       that as AXL_ERR rather than silently doing the wrong thing.
+       Materialize the destination directory first so a refusal here
+       MUST come from the SDK's prefix-check, not the backend
+       failing to find the target dir (which would mask a regression
+       where the prefix check is silently deleted). */
+    axl_dir_mkdir("fs0:\\axl_sub");
+    axl_file_set_contents("fs0:\\axl_rn_x.tmp", "y", 1);
+    test_check(axl_file_rename("fs0:\\axl_rn_x.tmp",
+                               "fs0:\\axl_sub\\axl_rn_x.tmp") != AXL_OK,
+               "file: cross-directory rename refused");
+    /* Source must still exist — verifies the refusal happened before
+       any backend mutation. */
+    AxlFileInfo finfo_src;
+    test_check(axl_file_info("fs0:\\axl_rn_x.tmp", &finfo_src) == AXL_OK,
+               "file: cross-dir refusal left source in place");
+    axl_file_delete("fs0:\\axl_rn_x.tmp");
+    axl_dir_rmdir("fs0:\\axl_sub");
+
+    /* Basename-only new_path (common from shell-style callers)
+       continues to work — the same-dir check accepts no-separator
+       new as "implicitly in old's directory". */
+    axl_file_set_contents("fs0:\\axl_rn_b.tmp", "z", 1);
+    test_check(axl_file_rename("fs0:\\axl_rn_b.tmp",
+                               "axl_rn_b2.tmp") == AXL_OK,
+               "file: rename to basename-only new_path");
+    axl_file_delete("fs0:\\axl_rn_b2.tmp");
+
+    /* --- AxlFileInfo.mtime_unix surfaces UEFI ModificationTime.
+       After writing a file, axl_file_info should fill mtime_unix
+       with a non-zero Unix epoch timestamp (the firmware's clock
+       value at write time). Used by WebDAV PROPFIND so clients
+       like macOS Finder can decide if a cached entry needs
+       re-fetch. */
+    axl_file_set_contents("fs0:\\axl_mt.tmp", "data", 4);
+    AxlFileInfo finfo;
+    test_check(axl_file_info("fs0:\\axl_mt.tmp", &finfo) == AXL_OK,
+               "file: info on test file");
+    test_check(finfo.mtime_unix > 0,
+               "file: info.mtime_unix non-zero after write");
+    axl_file_delete("fs0:\\axl_mt.tmp");
+
+    /* --- axl_file_move: same-directory case falls through to rename
+       (fast atomic-on-FAT path); cross-directory case does the
+       copy+delete fallback that axl_file_rename refuses. */
+    axl_file_set_contents("fs0:\\axl_mv_a.tmp", "alpha", 5);
+    test_check(axl_file_move("fs0:\\axl_mv_a.tmp",
+                             "fs0:\\axl_mv_a2.tmp") == AXL_OK,
+               "file: move same-dir succeeds");
+    test_check(axl_file_get_contents("fs0:\\axl_mv_a2.tmp",
+                                     &contents, &len) == AXL_OK &&
+               len == 5 && test_memcmp(contents, "alpha", 5) == 0,
+               "file: move same-dir preserved content");
+    axl_free(contents);
+    AxlFileInfo finfo_mv;
+    test_check(axl_file_info("fs0:\\axl_mv_a.tmp", &finfo_mv) != AXL_OK,
+               "file: move same-dir removed source");
+    axl_file_delete("fs0:\\axl_mv_a2.tmp");
+
+    /* Cross-directory move via copy+delete. */
+    axl_dir_mkdir("fs0:\\axl_mv_sub");
+    axl_file_set_contents("fs0:\\axl_mv_x.tmp", "beta-x", 6);
+    test_check(axl_file_move("fs0:\\axl_mv_x.tmp",
+                             "fs0:\\axl_mv_sub\\axl_mv_x.tmp") == AXL_OK,
+               "file: move cross-dir succeeds");
+    test_check(axl_file_get_contents("fs0:\\axl_mv_sub\\axl_mv_x.tmp",
+                                     &contents, &len) == AXL_OK &&
+               len == 6 && test_memcmp(contents, "beta-x", 6) == 0,
+               "file: move cross-dir preserved content");
+    axl_free(contents);
+    test_check(axl_file_info("fs0:\\axl_mv_x.tmp", &finfo_mv) != AXL_OK,
+               "file: move cross-dir removed source");
+    axl_file_delete("fs0:\\axl_mv_sub\\axl_mv_x.tmp");
+    axl_dir_rmdir("fs0:\\axl_mv_sub");
+
+    /* Missing source → error. */
+    test_check(axl_file_move("fs0:\\does-not-exist.tmp",
+                             "fs0:\\dst.tmp") != AXL_OK,
+               "file: move missing source errors");
+
+    /* Overwrite-if-exists semantics (POSIX rename-style). Pin the
+       contract so consumers can rely on it. Same-directory and
+       cross-directory both replace an existing destination. */
+    axl_file_set_contents("fs0:\\axl_ow_src.tmp", "new", 3);
+    axl_file_set_contents("fs0:\\axl_ow_dst.tmp", "OLD-DATA", 8);
+    test_check(axl_file_move("fs0:\\axl_ow_src.tmp",
+                             "fs0:\\axl_ow_dst.tmp") == AXL_OK,
+               "file: move same-dir overwrites existing dest");
+    test_check(axl_file_get_contents("fs0:\\axl_ow_dst.tmp",
+                                     &contents, &len) == AXL_OK &&
+               len == 3 && test_memcmp(contents, "new", 3) == 0,
+               "file: same-dir overwrite installed new content");
+    axl_free(contents);
+    axl_file_delete("fs0:\\axl_ow_dst.tmp");
+
+    /* AxlDirEntry.mtime_unix also populated by the dir-walk path. */
+    axl_file_set_contents("fs0:\\axl_md.tmp", "more", 4);
+    AxlDir *dir = axl_dir_open("fs0:\\");
+    test_check(dir != NULL, "dir: open fs0:\\");
+    bool saw_md_with_mtime = false;
+    if (dir != NULL) {
+        AxlDirEntry de;
+        while (axl_dir_read(dir, &de)) {
+            if (axl_strcmp(de.name, "axl_md.tmp") == 0 &&
+                de.mtime_unix > 0)
+            {
+                saw_md_with_mtime = true;
+                break;
+            }
+        }
+        axl_dir_close(dir);
+    }
+    test_check(saw_md_with_mtime,
+               "dir: entry mtime_unix non-zero after write");
+    axl_file_delete("fs0:\\axl_md.tmp");
 }
 
 // ---------------------------------------------------------------------------

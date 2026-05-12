@@ -13,7 +13,7 @@
     consumers can present a Linux-lsusb-shaped view: one row per
     interface, deduplicated and ordered by bus/device/interface.
 
-    Cursor-style iteration mirrors @ref axl_pci_next:
+    Cursor-style iteration mirrors axl_pci_next:
 
     @code
     AxlUsbAddr *u = NULL;
@@ -159,12 +159,12 @@ axl_usb_get_class(
 #define AXL_USB_CLASS_NAME_MAX  128u
 
 /**
- * @brief Output shape selector for @ref axl_usb_class_string_fmt.
+ * @brief Output shape selector for axl_usb_class_string_fmt.
  *
  * USB class triplets decode into base / subclass / protocol tiers.
  * Verbose tools want the full slash-joined triplet; row-oriented
  * tools want the subclass alone (matches Linux lsusb shape); coarse
- * categorization wants just the base. Mirrors @ref AxlPciClassFmt.
+ * categorization wants just the base. Mirrors AxlPciClassFmt.
  */
 typedef enum {
     AXL_USB_CLASS_FMT_FULL     = 0,  ///< "Human Interface Device / Boot Interface / Mouse"
@@ -203,7 +203,7 @@ axl_usb_class_string_fmt(
     size_t           buflen   ///< capacity of @p buf
 );
 
-/// Convenience wrapper for @ref axl_usb_class_string_fmt with `FMT_FULL`.
+/// Convenience wrapper for axl_usb_class_string_fmt with `FMT_FULL`.
 int
 axl_usb_class_string(
     uint8_t  class_,
@@ -260,12 +260,12 @@ axl_usb_get_string(
 /**
  * @brief Read the device's manufacturer string (UTF-8).
  *
- * Convenience over @ref axl_usb_get_string — reads the
+ * Convenience over axl_usb_get_string — reads the
  * @c iManufacturer index from the device descriptor, then fetches
  * that string. Returns -1 if the device descriptor declares no
  * manufacturer string (index = 0), mirroring `axl_usb_get_string`.
  *
- * @return UTF-8 byte count or -1 (see @ref axl_usb_get_string).
+ * @return UTF-8 byte count or -1 (see axl_usb_get_string).
  */
 int
 axl_usb_get_manufacturer(
@@ -274,7 +274,7 @@ axl_usb_get_manufacturer(
     size_t       buflen
 );
 
-/// Read the device's product string (UTF-8). See @ref axl_usb_get_manufacturer.
+/// Read the device's product string (UTF-8). See axl_usb_get_manufacturer.
 int
 axl_usb_get_product(
     AxlUsbAddr   addr,
@@ -282,7 +282,7 @@ axl_usb_get_product(
     size_t       buflen
 );
 
-/// Read the device's serial-number string (UTF-8). See @ref axl_usb_get_manufacturer.
+/// Read the device's serial-number string (UTF-8). See axl_usb_get_manufacturer.
 int
 axl_usb_get_serial(
     AxlUsbAddr   addr,
@@ -359,10 +359,10 @@ axl_usb_control_transfer(
 #define AXL_USB_TREE_MAX_DEPTH  8u
 
 /**
- * @brief Per-node callback for @ref axl_usb_tree_for_each.
+ * @brief Per-node callback for axl_usb_tree_for_each.
  *
  * @param addr   the interface being visited (same shape
- *               @ref axl_usb_next emits)
+ *               axl_usb_next emits)
  * @param depth  USB hub depth — 0 means the device is directly
  *               attached to the host controller's root hub; 1
  *               means the device is one hub deep; etc. Different
@@ -370,7 +370,7 @@ axl_usb_control_transfer(
  * @param ctx    caller's opaque context
  *
  * @return non-zero to stop the walk early; the value becomes the
- *     return of @ref axl_usb_tree_for_each. Return 0 to continue.
+ *     return of axl_usb_tree_for_each. Return 0 to continue.
  */
 typedef int (*AxlUsbTreeFn)(
     AxlUsbAddr   addr,
@@ -393,12 +393,12 @@ typedef int (*AxlUsbTreeFn)(
  * N-deep hub); their interface is enumerable via the same
  * `EFI_USB_IO_PROTOCOL` handle every other USB device exposes. The
  * caller can disambiguate hubs from leaves by reading the interface
- * class via @ref axl_usb_get_class — class 0x09 is the USB Hub
+ * class via axl_usb_get_class — class 0x09 is the USB Hub
  * class.
  *
  * The callback may freely call AxlUsb read-only APIs against the
  * visited @p addr (vid/pid, class, string descriptors) but must
- * not invoke @ref axl_usb_next during the walk — the cursor it
+ * not invoke axl_usb_next during the walk — the cursor it
  * uses is module-static and a re-entrant call would corrupt the
  * outer iteration.
  *
@@ -436,8 +436,8 @@ axl_usb_tree_for_each(
 /**
  * @brief Opaque handle to a loaded USB vendor/device-name database.
  *
- * Created by @ref axl_usb_ids_open or @ref axl_usb_ids_open_from_buffer,
- * destroyed by @ref axl_usb_ids_close. Multiple handles can coexist —
+ * Created by axl_usb_ids_open or axl_usb_ids_open_from_buffer,
+ * destroyed by axl_usb_ids_close. Multiple handles can coexist —
  * a consumer that wants a "public + private" overlay loads two
  * handles and queries them in priority order. Mirrors AxlPciIds and
  * AxlSpdIds.
@@ -554,7 +554,7 @@ axl_usb_ids_foreach_device(
  *
  * Hex literals are lowercase, 4-wide, zero-padded (matches Linux
  * lsusb's `-d` filter form). Output never exceeds
- * @ref AXL_USB_NAME_COMPOSED_MAX bytes.
+ * AXL_USB_NAME_COMPOSED_MAX bytes.
  *
  * @return number of bytes written excluding NUL (snprintf shape),
  *     or -1 on bad arguments.
@@ -583,7 +583,7 @@ axl_usb_ids_format_name(
  *     current working directory.
  *
  * Idempotent — a successful load is a no-op on subsequent calls.
- * Registers an @ref axl_atexit cleanup on first success so the
+ * Registers an axl_atexit cleanup on first success so the
  * parsed table is freed automatically at runtime cleanup.
  */
 AxlSidecarStatus
@@ -612,7 +612,7 @@ axl_usb_vendor_name(
 /**
  * @brief Singleton-backed device lookup. Does not fall back to the
  *     vendor name when the device is unknown — callers compose their
- *     own "vendor name + numeric PID" via @ref axl_usb_format_name.
+ *     own "vendor name + numeric PID" via axl_usb_format_name.
  */
 const char *
 axl_usb_device_name(
@@ -622,7 +622,7 @@ axl_usb_device_name(
 
 /**
  * @brief Singleton-backed convenience wrapper for
- *     @ref axl_usb_ids_format_name.
+ *     axl_usb_ids_format_name.
  */
 int
 axl_usb_format_name(

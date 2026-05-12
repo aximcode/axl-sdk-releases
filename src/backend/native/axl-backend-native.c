@@ -677,11 +677,68 @@ axl_backend_file_rmdir(
     return axl_backend_file_delete(path);
 }
 
+/* Days-from-civil per Howard Hinnant — works for any year in the
+   proleptic Gregorian calendar; we only need the post-1970 range
+   that fits in a uint64_t Unix epoch. */
+static int64_t
+days_from_civil(uint32_t y, uint32_t m, uint32_t d)
+{
+    int64_t yy   = (int64_t)y - (m <= 2);
+    int64_t era  = (yy >= 0 ? yy : yy - 399) / 400;
+    uint32_t yoe = (uint32_t)(yy - era * 400);
+    uint32_t mp  = (m > 2) ? (m - 3) : (m + 9);
+    uint32_t doy = (153 * mp + 2) / 5 + d - 1;
+    uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+uint64_t
+axl_backend_efi_time_to_unix(const void *efi_time_16)
+{
+    /* EFI_TIME layout (16 bytes, all little-endian):
+         u16 Year, u8 Month, u8 Day, u8 Hour, u8 Minute, u8 Second,
+         u8 Pad1, u32 Nanosecond, i16 TimeZone, u8 Daylight, u8 Pad2.
+       Match by byte offset rather than casting to EFI_TIME directly
+       so axl-fs.c can call this against the slice it pulls out of
+       the EFI_FILE_INFO buffer without dragging in UEFI headers. */
+    if (efi_time_16 == NULL) {
+        return 0;
+    }
+    const uint8_t *b = (const uint8_t *)efi_time_16;
+    uint16_t year   = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+    uint8_t  month  = b[2];
+    uint8_t  day    = b[3];
+    uint8_t  hour   = b[4];
+    uint8_t  minute = b[5];
+    uint8_t  second = b[6];
+    /* TimeZone at offset 12 (int16_t, little-endian). */
+    int16_t  tz_minutes = (int16_t)(b[12] | ((uint16_t)b[13] << 8));
+
+    if (year == 0 || month == 0 || day == 0) {
+        return 0;
+    }
+
+    int64_t days = days_from_civil(year, month, day);
+    if (days < 0) {
+        return 0;
+    }
+    int64_t secs = days * 86400 + (int64_t)hour * 3600 +
+                   (int64_t)minute * 60 + (int64_t)second;
+    /* EFI_UNSPECIFIED_TIMEZONE (0x07FF = 2047) means "no TZ info" —
+       treat as UTC. Otherwise subtract the offset (TZ is minutes
+       east of UTC, so local - tz = UTC). */
+    if (tz_minutes != 0x07FF) {
+        secs -= (int64_t)tz_minutes * 60;
+    }
+    return secs < 0 ? 0 : (uint64_t)secs;
+}
+
 int
 axl_backend_file_stat(
     const unsigned short  *path,
     uint64_t              *size,
     uint64_t              *alloc_size,
+    uint64_t              *mtime_unix,
     bool                  *is_dir,
     bool                  *read_only
     )
@@ -713,6 +770,9 @@ axl_backend_file_stat(
     }
     if (alloc_size != NULL) {
         *alloc_size = info->PhysicalSize;
+    }
+    if (mtime_unix != NULL) {
+        *mtime_unix = axl_backend_efi_time_to_unix(&info->ModificationTime);
     }
     if (is_dir != NULL) {
         *is_dir = (info->Attribute & EFI_FILE_DIRECTORY) != 0;

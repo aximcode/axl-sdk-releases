@@ -39,7 +39,14 @@ OBJCOPY    = $(CROSS)objcopy
 # an intermediate consumed by objcopy → PE/COFF; no OS ever loads it,
 # so the linker's RWX-segment warning is a false positive (the resulting
 # .efi has properly split per-section permissions, see PE characteristics).
-LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined
+# --gc-sections drops unreferenced .text/.data sections from each linked
+# .efi. Combined with -ffunction-sections / -fdata-sections in CFLAGS, this
+# gives per-symbol selective linking: a tool that uses 5% of libaxl.a
+# carries only that 5% in its .efi. Disabling this would balloon every
+# tool binary by 50–80% (each .o member of libaxl.a brought in for one
+# referenced symbol pulls every other symbol in that .o along with it).
+LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined \
+              --gc-sections
 
 CFLAGS_BASE = -std=gnu2x \
               -ffreestanding -fshort-wchar \
@@ -103,6 +110,36 @@ define LINK_EFI_DRIVER
 	$(PE_SET_DEBUG) $(2)
 endef
 
+# EMBED_BLOB(name, path) — generate a .s with .incbin around `path`,
+# assemble it to .o, and expose the .o as $(BLOB_OBJ_<name>). Mirrors
+# what `axl-cc --embed PATH=NAME` does internally; eliminates the
+# hand-written .S sidecar from the in-tree examples / tools.
+#
+# Usage:  $(eval $(call EMBED_BLOB,greeting,sdk/examples/embed-asset.txt))
+#         link with: $(BLOB_OBJ_greeting)
+# C side: AXL_EMBED_DECLARE(greeting) — emits axl_embedded_greeting{,_end}.
+define EMBED_BLOB
+BLOB_OBJ_$(1) := $$(BUILDDIR)/embed-blob-$(1).o
+
+$$(BUILDDIR)/embed-blob-$(1).s: $(2) | $$(BUILDDIR)
+	@: 'Tabs inside the single-quoted args below are load-bearing'
+	@: 'assembler indent — leave alone if you reflow this recipe.'
+	@printf '%s\n' \
+	    '	.section .rodata' \
+	    '	.balign 8' \
+	    '	.globl axl_embedded_$(1)' \
+	    '	.globl axl_embedded_$(1)_end' \
+	    'axl_embedded_$(1):' \
+	    '	.incbin "$$<"' \
+	    'axl_embedded_$(1)_end:' \
+	    '' \
+	    '	.section .note.GNU-stack, "", %progbits' \
+	    > $$@
+
+$$(BUILDDIR)/embed-blob-$(1).o: $$(BUILDDIR)/embed-blob-$(1).s | $$(BUILDDIR)
+	$$(CC) $$(CFLAGS_BASE) -c $$< -o $$@
+endef
+
 # ===================================================================
 # Common configuration
 # ===================================================================
@@ -154,6 +191,8 @@ LIB_SOURCES = \
     src/data/axl-json5-parse.c \
     src/data/axl-json-build.c \
     src/data/axl-json-print.c \
+    src/data/axl-xml-writer.c \
+    src/data/axl-xml-parse.c \
     src/data/axl-cache.c \
     src/data/axl-radix-tree.c \
     src/data/axl-ring-buf.c \
@@ -178,7 +217,7 @@ LIB_SOURCES = \
     src/util/axl-mem-phys.c \
     src/util/axl-watchdog.c \
     src/util/axl-rng.c \
-    src/util/axl-service.c \
+    src/util/axl-protocol.c \
     src/util/axl-driver.c \
     src/util/axl-diag.c \
     src/util/axl-config.c \
@@ -201,6 +240,7 @@ LIB_SOURCES = \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
+    src/service/axl-service.c \
     src/event/axl-event.c \
     src/event/axl-cancellable.c \
     src/event/axl-wait.c \
@@ -216,6 +256,7 @@ LIB_SOURCES = \
     src/net/axl-net-interfaces.c \
     src/net/axl-net-addr.c \
     src/net/axl-net-dhcp.c \
+    src/net/axl-net-opts.c \
     src/net/axl-http-core.c \
     src/net/axl-http-server.c \
     src/net/axl-http-route.c \
@@ -225,6 +266,7 @@ LIB_SOURCES = \
     src/net/axl-http-response.c \
     src/net/axl-http-upload.c \
     src/net/axl-http-ws.c \
+    src/net/axl-http-webdav.c \
     src/net/axl-http-client.c \
     src/net/axl-tls.c \
     src/net/axl-url.c \
@@ -351,8 +393,19 @@ PREV_TLS_STATE := $(shell cat $(TLS_STATE_FILE) 2>/dev/null)
 
 ifneq ($(TLS_STATE),$(PREV_TLS_STATE))
 ifneq ($(PREV_TLS_STATE),)
-$(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, and tools to avoid stale-archive linkage)
-$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so)
+$(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage)
+# Wipe everything that links against libaxl.a. The earlier targeted
+# wipe missed test binaries (which live at $(PREFIX)/AxlTest*.efi —
+# root of PREFIX, not tools/) AND example binaries (hello.efi,
+# driver.efi, etc., also root of PREFIX). A test-binary built
+# against the old AXL_TLS state links OK against the new libaxl.a
+# (no undefined symbols — axl_tls_* has stub fallbacks) but its
+# struct ABI (fence sizes, debug fill, struct layout for
+# TLS-aware structs like AxlHttpServer) mismatches the library's,
+# producing baffling failures like "alloc fill 0xDA" tripping on
+# freshly-malloced memory. Blanket-wipe everything that could
+# reference the libaxl.a ABI; rebuilds are cheap.
+$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so)
 endif
 $(shell mkdir -p $(BUILDDIR) && echo $(TLS_STATE) > $(TLS_STATE_FILE))
 endif
@@ -369,7 +422,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version
+.PHONY: all clean clean-tools hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -422,6 +475,9 @@ $(BUILDDIR)/%.o: src/fs/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/util/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/service/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/loop/%.c | $(BUILDDIR)
@@ -535,6 +591,111 @@ $(PREFIX)/driver.efi: $(BUILDDIR)/driver.o $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_DRIVER,$(BUILDDIR)/driver.o,$@)
 
 $(BUILDDIR)/driver.o: sdk/examples/driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build http-server-driver.efi — DXE-driver-mode HTTP server,
+# integration-test target for axl_loop_attach_driver + the
+# fully-async send_response path.
+# ===================================================================
+
+http-server-driver: $(PREFIX)/http-server-driver.efi
+	@echo "  Built: $(PREFIX)/http-server-driver.efi"
+
+$(PREFIX)/http-server-driver.efi: $(BUILDDIR)/http-server-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/http-server-driver.o,$@)
+
+$(BUILDDIR)/http-server-driver.o: sdk/examples/http-server-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build service_demo.efi + service_demo-dxe.efi — single-source-file
+# AxlService demo. The same service-demo.c is compiled twice via the
+# AXL_SERVICE(svc) macro: once with -DAXL_SERVICE_BUILD_DRIVER for
+# the driver image, once without (with the driver embedded via
+# EMBED_BLOB) for the launcher app. Mirrors what `axl-cc --service`
+# does for SDK consumers — see scripts/install.sh.
+# ===================================================================
+
+service-demo: $(PREFIX)/service_demo.efi $(PREFIX)/service_demo-dxe.efi
+	@echo "  Built: $(PREFIX)/service_demo.efi + service_demo-dxe.efi"
+
+# Driver image — same source, compiled with AXL_SERVICE_BUILD_DRIVER.
+$(PREFIX)/service_demo-dxe.efi: $(BUILDDIR)/service-demo-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/service-demo-dxe.o,$@)
+
+$(BUILDDIR)/service-demo-dxe.o: sdk/examples/service-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+# Launcher app — same source, no AXL_SERVICE_BUILD_DRIVER, embeds
+# the driver via EMBED_BLOB. Embed symbol axl_embedded_service_demo
+# matches AXL_EMBED_DECLARE(service_demo) inside the AXL_SERVICE
+# macro.
+$(eval $(call EMBED_BLOB,service_demo,$(PREFIX)/service_demo-dxe.efi))
+
+$(PREFIX)/service_demo.efi: $(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo),$@)
+
+$(BUILDDIR)/service-demo-app.o: sdk/examples/service-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build service_demo_custom.efi + service_demo_custom-dxe.efi —
+# worked example showing consumer-visible AxlArgs + AxlConfig usage.
+# Same dual-compile pattern as service-demo, but main() is written
+# by hand (not via AXL_SERVICE) so the consumer can mix the standard
+# start/stop/status verbs with custom verbs (here: `config`).
+# ===================================================================
+
+service-demo-custom: $(PREFIX)/service_demo_custom.efi $(PREFIX)/service_demo_custom-dxe.efi
+	@echo "  Built: $(PREFIX)/service_demo_custom.efi + service_demo_custom-dxe.efi"
+
+$(PREFIX)/service_demo_custom-dxe.efi: $(BUILDDIR)/service-demo-custom-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/service-demo-custom-dxe.o,$@)
+
+$(BUILDDIR)/service-demo-custom-dxe.o: sdk/examples/service-demo-custom.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+$(eval $(call EMBED_BLOB,service_demo_custom,$(PREFIX)/service_demo_custom-dxe.efi))
+
+$(PREFIX)/service_demo_custom.efi: $(BUILDDIR)/service-demo-custom-app.o $(BLOB_OBJ_service_demo_custom) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/service-demo-custom-app.o $(BLOB_OBJ_service_demo_custom),$@)
+
+$(BUILDDIR)/service-demo-custom-app.o: sdk/examples/service-demo-custom.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build embed-asset.efi — non-driver worked example for
+# <axl/axl-embed.h>. Embeds embed-asset.txt via .incbin and prints
+# its bytes at runtime. Demonstrates that the embed framework is
+# content-agnostic (bytes in, bytes out — driver .efi is just one
+# special case).
+# ===================================================================
+
+embed-asset: $(PREFIX)/embed-asset.efi
+	@echo "  Built: $(PREFIX)/embed-asset.efi"
+
+$(eval $(call EMBED_BLOB,greeting,sdk/examples/embed-asset.txt))
+
+$(PREFIX)/embed-asset.efi: $(BUILDDIR)/embed-asset.o $(BLOB_OBJ_greeting) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/embed-asset.o $(BLOB_OBJ_greeting),$@)
+
+$(BUILDDIR)/embed-asset.o: sdk/examples/embed-asset.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build driver-leak-test.efi — exercises axl_driver_load +
+# set_load_options + unload, asserts no leak. Integration target
+# for the LoadOptions-leak fix in src/util/axl-driver.c.
+# ===================================================================
+
+driver-leak-test: $(PREFIX)/driver-leak-test.efi
+	@echo "  Built: $(PREFIX)/driver-leak-test.efi"
+
+$(PREFIX)/driver-leak-test.efi: $(BUILDDIR)/driver-leak-test.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/driver-leak-test.o,$@)
+
+$(BUILDDIR)/driver-leak-test.o: test/integration/driver-leak-test.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -754,7 +915,7 @@ TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \
         AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
-        AxlTestCpuIdle AxlTestRuntime
+        AxlTestCpuIdle AxlTestRuntime AxlTestXml
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -785,6 +946,7 @@ $(eval $(call BUILD_TEST,AxlTestPlatform,axl-test-platform))
 $(eval $(call BUILD_TEST,AxlTestEvent,axl-test-event))
 $(eval $(call BUILD_TEST,AxlTestCpuIdle,axl-test-cpu-idle))
 $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
+$(eval $(call BUILD_TEST,AxlTestXml,axl-test-xml))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
@@ -796,20 +958,38 @@ TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 tools: all $(TOOL_EFIS)
 	@echo "  Built $(words $(TOOL_NAMES)) tools"
 
+# tool-sizes — print per-tool .efi size, sorted ascending.
+# Surfaces the selective-linking benefit: a tool that uses 5% of
+# libaxl.a carries only that 5% (per-symbol via --gc-sections plus
+# the static-archive's per-.o member resolution). Run after `make
+# tools` to see what each tool weighs in at.
+.PHONY: tool-sizes
+tool-sizes: tools
+	@echo ""
+	@echo "Tool .efi sizes ($(ARCH)):"
+	@for t in $(TOOL_NAMES); do \
+	    f=$(PREFIX)/tools/$$t.efi; \
+	    if [ -f $$f ]; then \
+	        sz=$$(stat -c %s $$f); \
+	        printf "  %7d B   %s\n" "$$sz" "$$t"; \
+	    fi; \
+	done | sort -n
+	@total=$$(stat -c %s $(TOOL_EFIS) | awk '{s+=$$1} END {print s}'); \
+	    echo "  -------------------------"; \
+	    printf "  %7d B   total\n" "$$total"; \
+	    libsz=$$(stat -c %s $(PREFIX)/lib/libaxl.a); \
+	    printf "  (libaxl.a archive: %d B — selective linking pulls only \
+referenced symbols)\n" "$$libsz"
+
 # Embedded driver blob for mkrd. Vendored EDK2 RamDiskDxe.efi (one per
 # arch) is embedded into mkrd.efi via the GNU assembler's `.incbin`
-# directive — see tools/mkrd-blob.S. mkrd LoadImages it from memory
-# when the host firmware doesn't ship EFI_RAM_DISK_PROTOCOL. See
-# third_party/edk2/README.md for provenance and license.
+# directive — see the EMBED_BLOB macro near the top. mkrd LoadImages
+# it from memory when the host firmware doesn't ship
+# EFI_RAM_DISK_PROTOCOL. See third_party/edk2/README.md for provenance
+# and license.
 EMBEDDED_RAMDISK_SRC = third_party/edk2/RamDiskDxe-$(ARCH).efi
-EMBEDDED_RAMDISK_OBJ = $(BUILDDIR)/mkrd-blob.o
-
-# The .S preprocessor stringifies RAMDISK_BLOB_PATH into the path
-# .incbin expects. The .o has a build-time dependency on the .efi
-# itself so a refreshed blob triggers a re-assemble.
-$(EMBEDDED_RAMDISK_OBJ): tools/mkrd-blob.S $(EMBEDDED_RAMDISK_SRC) | $(BUILDDIR)
-	$(CC) $(CFLAGS_BASE) -DRAMDISK_BLOB_PATH=$(EMBEDDED_RAMDISK_SRC) \
-	    -c $< -o $@
+$(eval $(call EMBED_BLOB,ramdiskdxe,$(EMBEDDED_RAMDISK_SRC)))
+EMBEDDED_RAMDISK_OBJ = $(BLOB_OBJ_ramdiskdxe)
 
 define BUILD_TOOL
 $(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
@@ -836,6 +1016,49 @@ $(PREFIX)/tools:
 	@mkdir -p $@
 
 # ===================================================================
+# axl-busybox — single-binary build hosting all tools as subcommands
+# ===================================================================
+#
+# Opt-in alternative deployment shape: one axl.efi instead of 18
+# per-tool .efi files. Same source files; each tool .c is recompiled
+# with -DAXL_BUSYBOX so its AXL_TOOL_MAIN(name) macro emits
+# axl_tool_<name>_main() instead of main(). tools/axl.c is the
+# dispatcher that argv[1]-routes to the matching tool.
+#
+# Default `make tools` is unaffected — it still produces individual
+# .efi binaries from the same sources without -DAXL_BUSYBOX.
+
+BUSYBOX_DIR  = $(BUILDDIR)/busybox
+BUSYBOX_OBJS = $(patsubst %,$(BUSYBOX_DIR)/%.o,$(TOOL_NAMES) axl)
+BUSYBOX_EFI  = $(PREFIX)/axl.efi
+
+# Same CFLAGS as standalone tools, with AXL_BUSYBOX defined so
+# AXL_TOOL_MAIN expands to a uniquely-named function per tool.
+$(BUSYBOX_DIR)/%.o: tools/%.c | $(BUSYBOX_DIR)
+	$(CC) $(CFLAGS) -DAXL_BUSYBOX $(INCLUDES) -c $< -o $@
+
+$(BUSYBOX_DIR):
+	@mkdir -p $@
+
+# mkrd's embedded RamDiskDxe blob comes along even in the busybox
+# build — it's small (KB) and lets `axl mkrd` work the same as
+# standalone mkrd.efi.
+$(BUSYBOX_EFI): $(BUSYBOX_OBJS) $(EMBEDDED_RAMDISK_OBJ) \
+                $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)
+	$(call LINK_EFI_APP,$(BUSYBOX_OBJS) $(EMBEDDED_RAMDISK_OBJ),$@)
+
+axl-busybox: all $(BUSYBOX_EFI)
+	@echo ""
+	@echo "  axl busybox built ($(ARCH))"
+	@echo "  Binary:    $(BUSYBOX_EFI)"
+	@printf  "  Size:      %d B\n" "$$(stat -c %s $(BUSYBOX_EFI))"
+	@echo "  Try:       axl --help"
+	@echo "             axl <tool> --help"
+	@echo ""
+
+.PHONY: axl-busybox
+
+# ===================================================================
 # Clean
 # ===================================================================
 
@@ -854,3 +1077,5 @@ clean:
 clean-tools:
 	rm -f $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so
 	@for t in $(TOOL_NAMES); do rm -f $(BUILDDIR)/$$t.o; done
+	rm -f $(BUSYBOX_EFI) $(PREFIX)/axl.so
+	rm -rf $(BUSYBOX_DIR)

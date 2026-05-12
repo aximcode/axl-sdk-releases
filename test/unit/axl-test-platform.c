@@ -3255,6 +3255,34 @@ test_smbios_entry_point_null_args(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_efi_find_config_table — generic UEFI Configuration Table lookup
+// ---------------------------------------------------------------------------
+
+static void
+test_efi_find_config_table(void)
+{
+    /* Cross-check via SMBIOS3/SMBIOS_TABLE_GUID — at least one of
+       these must be present on any platform that exposes SMBIOS at
+       all (we already require that in test_smbios_table_range).
+       AxlGuid is layout-compatible with EFI_GUID, so we cast the
+       generated UEFI GUID symbols through. */
+    void *smbios3 = axl_efi_find_config_table((const AxlGuid *)&SMBIOS3_TABLE_GUID);
+    void *smbios2 = axl_efi_find_config_table((const AxlGuid *)&SMBIOS_TABLE_GUID);
+    test_check(smbios3 != NULL || smbios2 != NULL,
+               "efi_find_config_table: finds SMBIOS3 or SMBIOS via known GUIDs");
+
+    /* A made-up GUID must return NULL. Using the all-zeros pattern
+       — guaranteed not registered. */
+    AxlGuid bogus = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+    test_check(axl_efi_find_config_table(&bogus) == NULL,
+               "efi_find_config_table: unknown GUID returns NULL");
+
+    /* NULL guid returns NULL — defensive. */
+    test_check(axl_efi_find_config_table(NULL) == NULL,
+               "efi_find_config_table: NULL guid returns NULL");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -3268,6 +3296,9 @@ test_platform_main(int argc, char **argv)
     test_smbios_table_range();
     test_smbios_entry_point();
     test_smbios_entry_point_null_args();
+
+    /* axl_efi_find_config_table — generic config-table lookup */
+    test_efi_find_config_table();
 
     /* AxlAcpi */
     test_acpi_revision();

@@ -1,7 +1,10 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
 /** @file generated/all.h
     Auto-generated from UEFI Specification 2.11.
-    Umbrella — includes all generated UEFI headers.
-    Do not edit — regenerate with scripts/generate-uefi-headers.py
+    Umbrella -- includes all generated UEFI headers.
+    Do not edit -- regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_ALL_H
@@ -22,6 +25,8 @@ typedef struct _EFI_IPv6_ADDRESS EFI_IPv6_ADDRESS;
 typedef struct _EFI_MEMORY_DESCRIPTOR EFI_MEMORY_DESCRIPTOR;
 typedef struct _EFI_OPEN_PROTOCOL_INFORMATION_ENTRY EFI_OPEN_PROTOCOL_INFORMATION_ENTRY;
 typedef struct _EFI_CAPSULE_HEADER EFI_CAPSULE_HEADER;
+typedef struct _EFI_SYSTEM_RESOURCE_ENTRY EFI_SYSTEM_RESOURCE_ENTRY;
+typedef struct _EFI_SYSTEM_RESOURCE_TABLE EFI_SYSTEM_RESOURCE_TABLE;
 typedef struct _EFI_DEVICE_PATH_PROTOCOL EFI_DEVICE_PATH_PROTOCOL;
 typedef struct _EFI_TABLE_HEADER EFI_TABLE_HEADER;
 typedef struct _SIMPLE_TEXT_OUTPUT_MODE SIMPLE_TEXT_OUTPUT_MODE;

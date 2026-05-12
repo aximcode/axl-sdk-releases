@@ -32,8 +32,11 @@ static const AxlArgDesc flags[] = {
       .help = "Raw JSON output (no colors)" },
     { .name = "verbose",  .short_name = 'v', .type = AXL_ARG_BOOL,
       .help = "Show HTTP status and headers" },
-    { .name = "source",                      .type = AXL_ARG_STRING,
-      .help = "Pin connect to interface with this station IPv4 (auto if unset)" },
+    { .name = "source-ip",                   .type = AXL_ARG_STRING,
+      .help = "Outbound bind IPv4 (empty = kernel-chosen source)" },
+    { .name = "nic",                         .type = AXL_ARG_U64,
+      .default_value = AXL_NET_NIC_AUTO_STR,
+      .help = "NIC index for DHCP target (default: auto-select first usable)" },
     {0}
 };
 
@@ -448,23 +451,9 @@ run_rfbrowse(AxlArgs *a)
 
     /* Auto-load NIC drivers + DHCP so rfbrowse works from a bare UEFI
      * shell. TLS is freestanding mbedtls — no firmware TlsDxe needed. */
-    switch (axl_net_ensure_drivers()) {
-    case AXL_NET_DRIVERS_OK:
-        break;
-    case AXL_NET_DRIVERS_NOT_FOUND:
-        axl_printf("rfbrowse: no NIC drivers found in drivers/<arch>/ "
-                   "on any mounted volume.\n");
-        return 1;
-    case AXL_NET_DRIVERS_NO_LINK:
-        axl_printf("rfbrowse: drivers loaded but no NIC came up — "
-                   "is a NIC plugged in?\n");
-        return 1;
-    default:
-        axl_printf("rfbrowse: failed to bring up networking.\n");
-        return 1;
-    }
-    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
-        axl_printf("rfbrowse: no IP address — DHCP did not complete.\n");
+    if (axl_net_init(axl_args_get_uint(a, "nic"), 10) != AXL_OK) {
+        axl_printf("rfbrowse: networking unavailable "
+                   "(NIC driver, link, or DHCP setup failed).\n");
         return 1;
     }
 
@@ -492,7 +481,7 @@ run_rfbrowse(AxlArgs *a)
     axl_http_client_set(client, "header.Accept", "application/json");
     axl_http_client_set(client, "header.OData-Version", "4.0");
 
-    const char *source = axl_args_get_string(a, "source");
+    const char *source = axl_args_get_string(a, "source-ip");
     if (source != NULL && source[0] != '\0') {
         axl_http_client_set(client, "source.ip", source);
     }
@@ -568,8 +557,7 @@ run_rfbrowse(AxlArgs *a)
     return result;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(rfbrowse)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "rfbrowse",

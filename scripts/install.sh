@@ -343,6 +343,8 @@ RUN=false
 RUN_ARGS=()
 SOURCES=()
 CFLAGS_EXTRA=()
+EMBEDS=()
+SERVICE_NAME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -352,6 +354,8 @@ while [[ $# -gt 0 ]]; do
         --debug)    BUILD="debug"; shift ;;
         --release)  BUILD="release"; shift ;;
         --minimal-runtime) RUNTIME="minimal"; shift ;;
+        --embed)    EMBEDS+=("$2"); shift 2 ;;
+        --service)  SERVICE_NAME="$2"; shift 2 ;;
         --run)      RUN=true; shift
                     # Remaining args after --run are passed to run-qemu.sh
                     while [[ $# -gt 0 ]]; do
@@ -386,6 +390,22 @@ Options:
   --minimal-runtime     Link against axl-crt0-minimal.o (no registry,
                         no atexit, no signal notify, no default loop).
                         App-type only. See docs/AXL-Lifecycle.md §10.4.
+  --embed PATH[=NAME]   Embed an arbitrary binary blob (driver .efi,
+                        CA bundle, static config, anything) into the
+                        output. Generates the .incbin sidecar and
+                        links it. NAME defaults to the basename of
+                        PATH with non-identifier chars replaced by '_'.
+                        Symbols emitted: axl_embedded_<NAME>{,_end} —
+                        match <axl/axl-embed.h>'s AXL_EMBED_DECLARE.
+                        Repeatable.
+  --service NAME        Single-source-file AxlService build. Compiles
+                        the input twice — once as a driver image
+                        (-DAXL_SERVICE_BUILD_DRIVER, output
+                        NAME-dxe.efi) and once as an app embedding
+                        the driver (output NAME.efi). Pair with the
+                        AXL_SERVICE(svc) macro in the source. -o is
+                        ignored; output goes to NAME{,-dxe}.efi in
+                        the current directory.
   --run                 Build and run in QEMU (remaining args passed to run-qemu.sh)
   -o FILE               Output filename (default: <source>.efi)
   -I DIR                Add include search path
@@ -401,6 +421,9 @@ Examples:
   axl-cc --debug hello.c -o hello.efi
   axl-cc hello.c --run
   axl-cc hello.c --run --net --timeout 30
+  axl-cc --embed mydriver.efi=my_driver launch.c -o launch.efi
+  axl-cc --embed isrgrootx1.pem=ca_bundle myapp.c -o myapp.efi
+  axl-cc --service my-service service.c
 
 Toolchain: gcc
 HELP
@@ -420,6 +443,37 @@ for src in "${SOURCES[@]}"; do
         exit 1
     fi
 done
+
+# --service NAME: dual-compile the source into a driver image AND a
+# launcher app that embeds it. The source uses AXL_SERVICE(svc) which
+# emits DriverEntry under -DAXL_SERVICE_BUILD_DRIVER and main()
+# otherwise. axl-cc reinvokes itself twice with appropriate flags.
+if [[ -n "$SERVICE_NAME" ]]; then
+    # NAME must match the svc identifier passed to AXL_SERVICE(svc) —
+    # both sides need to agree on the embed symbol axl_embedded_<NAME>.
+    if ! [[ "$SERVICE_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        echo "ERROR: --service: NAME must be a C identifier (matches the AXL_SERVICE(svc) macro arg): '$SERVICE_NAME'" >&2
+        exit 1
+    fi
+    fwd=("--arch" "$ARCH")
+    [[ "$BUILD"   == "debug" ]]   && fwd+=("--debug")
+    [[ "$RUNTIME" == "minimal" ]] && fwd+=("--minimal-runtime")
+    [[ "$VERBOSE" == "true" ]]    && fwd+=("--verbose")
+    for x in ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}; do
+        fwd+=("$x")
+    done
+
+    # Pass 1: driver image
+    "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
+        --type driver -DAXL_SERVICE_BUILD_DRIVER \
+        "${SOURCES[@]}" -o "${SERVICE_NAME}-dxe.efi" \
+        || { echo "ERROR: --service: driver build failed" >&2; exit 1; }
+
+    # Pass 2: launcher app, embedding the driver from pass 1
+    exec "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
+        --embed "${SERVICE_NAME}-dxe.efi=${SERVICE_NAME}" \
+        "${SOURCES[@]}" -o "${SERVICE_NAME}.efi"
+fi
 
 [[ -z "$OUTPUT" ]] && OUTPUT="${SOURCES[0]%.c}.efi"
 
@@ -494,6 +548,59 @@ for src in "${SOURCES[@]}"; do
         -c "$src" -o "$obj" || { echo "ERROR: compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
 
     OBJS+=("$obj")
+done
+
+# --embed: generate a tiny .s sidecar per blob and assemble it. The
+# emitted symbols (axl_embedded_<name>{,_end}) match the convention
+# <axl/axl-embed.h>'s AXL_EMBED_DECLARE / DATA / SIZE expects.
+for spec in ${EMBEDS[@]+"${EMBEDS[@]}"}; do
+    if [[ "$spec" == *"="* ]]; then
+        embed_path="${spec%%=*}"
+        embed_sym="${spec#*=}"
+    else
+        embed_path="$spec"
+        embed_base="$(basename "$embed_path")"
+        embed_base="${embed_base%%.*}"
+        embed_sym="$(printf '%s' "$embed_base" | sed 's/[^a-zA-Z0-9_]/_/g')"
+    fi
+
+    if [[ ! -f "$embed_path" ]]; then
+        echo "ERROR: --embed: file not found: $embed_path" >&2
+        rm -rf "$TMPDIR"; exit 1
+    fi
+    if ! [[ "$embed_sym" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        echo "ERROR: --embed: derived symbol '$embed_sym' is not a valid C identifier; pass --embed PATH=name explicitly" >&2
+        rm -rf "$TMPDIR"; exit 1
+    fi
+    # .incbin's argument is a quoted string literal; reject characters
+    # that would break out of it (", \) or split it across lines (\n,
+    # \r, NUL, other ctrl chars). Practically rare on UEFI build paths,
+    # but the filter is paranoia, not a soft limit — finish the job.
+    if [[ "$embed_path" == *[$'\x00-\x1f\x7f"\\']* ]]; then
+        echo "ERROR: --embed: path contains characters that can't be embedded in .incbin: $embed_path" >&2
+        rm -rf "$TMPDIR"; exit 1
+    fi
+
+    # Resolve to absolute so the path is independent of the invocation CWD
+    [[ "$embed_path" != /* ]] && embed_path="$PWD/$embed_path"
+
+    embed_s="$TMPDIR/embed_${embed_sym}.s"
+    cat > "$embed_s" <<EMBED_S
+    .section .rodata
+    .balign 8
+    .globl axl_embedded_${embed_sym}
+    .globl axl_embedded_${embed_sym}_end
+axl_embedded_${embed_sym}:
+    .incbin "${embed_path}"
+axl_embedded_${embed_sym}_end:
+
+    .section .note.GNU-stack, "", %progbits
+EMBED_S
+
+    embed_o="$TMPDIR/embed_${embed_sym}.o"
+    run_cmd ${CROSS}gcc -c "$embed_s" -o "$embed_o" \
+        || { echo "ERROR: --embed: assembly failed for $embed_path" >&2; rm -rf "$TMPDIR"; exit 1; }
+    OBJS+=("$embed_o")
 done
 
 # Link

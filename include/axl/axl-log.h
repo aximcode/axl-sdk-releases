@@ -337,12 +337,38 @@ axl_log_ring_get(
 /**
  * @brief Open a log file and register a handler that buffers output.
  *
+ * Calling this with a file already attached transparently detaches
+ * the previous one (flush + remove handler + close) before opening
+ * the new path — no separate detach call needed for the
+ * single-file-at-a-time pattern. Pair with axl_log_file_detach
+ * for the explicit-teardown pattern (typical of AxlService driver
+ * teardown that runs before image unload).
+ *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_log_file_attach(
     const char *path  ///< UTF-8 file path (e.g. "fs0:/app.log")
 );
+
+/**
+ * @brief Detach the file handler installed by axl_log_file_attach.
+ *
+ * Flushes any buffered output, removes the internal handler from the
+ * dispatcher, and closes the file. NULL-safe when no file is attached
+ * — calling this against a never-attached or already-detached state
+ * is a no-op (the underlying flush / remove_handler / file_close
+ * primitives all tolerate cleared state).
+ *
+ * Symmetric with axl_log_file_attach for consumers — typically
+ * AxlService driver teardown — that need explicit cleanup before
+ * image unload. Without an explicit detach, firmware UnloadImage
+ * eventually tears down the per-image static state, but that's a
+ * resource-leak-by-design that doesn't match the rest of AxlService's
+ * setup/teardown ergonomics.
+ */
+void
+axl_log_file_detach(void);
 
 /**
  * @brief Flush the file handler's buffer to disk.

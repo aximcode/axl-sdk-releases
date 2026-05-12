@@ -491,6 +491,17 @@ axl_hash_table_size(AxlHashTable *h)
     return h->entry_count;
 }
 
+bool
+axl_hash_table_owns_entries(AxlHashTable *h)
+{
+    if (h == NULL) {
+        return false;
+    }
+    return !h->copy_keys
+        && h->key_destroy   != NULL
+        && h->value_destroy != NULL;
+}
+
 // ===========================================================================
 // Iteration
 // ===========================================================================

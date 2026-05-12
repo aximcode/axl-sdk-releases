@@ -282,8 +282,7 @@ run_grep(AxlArgs *a)
     return (total_matches > 0) ? 0 : 1;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(grep)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "grep",

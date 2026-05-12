@@ -18,22 +18,41 @@
 extern "C" {
 #endif
 
+/**
+ * Parsed URL components per RFC 3986 (subset). Heap-allocated by
+ * axl_url_parse; freed by axl_url_free. NULL string fields mean the
+ * component wasn't present in the input — distinguish from
+ * "present but empty" via empty-string check (e.g. `user:@host` →
+ * password is `""`, not NULL).
+ */
 typedef struct {
-    char      *scheme;
-    char      *host;
-    char      *path;
-    char      *query;
-    uint16_t  port;
+    char      *scheme;     ///< URL scheme without `://` ("http", "https", ...)
+    char      *user;       ///< userinfo user portion before `:` (NULL if no `user[:pass]@` in authority)
+    char      *password;   ///< userinfo password portion after `:` (NULL if no `:` in userinfo; "" if `user:@host`)
+    char      *host;       ///< hostname or IP literal (no userinfo, no port)
+    char      *path;       ///< path component starting with `/` ("/" if absent)
+    char      *query;      ///< raw query string after `?` (NULL if no `?`)
+    char      *fragment;   ///< fragment after `#` (NULL if no `#`)
+    uint16_t   port;       ///< port number (default for scheme if not specified)
 } AxlUrl;
 
 /**
  * @brief Parse a URL string into components.
  *
+ * Supports the RFC 3986 generic URI shape:
+ *   `scheme://[user[:password]@]host[:port][/path][?query][#fragment]`
+ *
+ * Userinfo is recognized only when an `@` appears in the authority
+ * (between `://` and the first `/`, `?`, or `#`); an `@` later in
+ * the path or query is left alone. Percent-decoding is NOT applied
+ * to any field — the parser returns raw bytes for round-trip
+ * fidelity.
+ *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
 axl_url_parse(
-    const char *url,         ///< URL string (e.g. "http://host:8080/path?q=1")
+    const char *url,         ///< URL string (e.g. "http://user:pass@host:8080/path?q=1#frag")
     AxlUrl     **out_parsed  ///< receives allocated AxlUrl; free with axl_url_free()
 );
 

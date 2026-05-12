@@ -32,6 +32,7 @@ AXL SDK
    modules/log
    modules/data
    modules/json
+   modules/xml
    modules/cache
    modules/radix-tree
    modules/ring-buf
@@ -42,6 +43,7 @@ AXL SDK
    modules/task
    modules/event
    modules/runtime
+   modules/service
    modules/net
    modules/tls
    modules/sys

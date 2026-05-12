@@ -169,6 +169,7 @@ axl_file_info(
         (const unsigned short *)wide_path,
         &info->size,
         &info->alloc_size,
+        &info->mtime_unix,
         &info->is_dir,
         &info->read_only
         );
@@ -211,6 +212,22 @@ axl_file_delete(const char *path)
     return rc;
 }
 
+/* Return pointer to the basename of @p path — the substring after
+   the last '/' or '\' separator. Accepts mixed-separator paths
+   ("fs0:\\dir/foo.txt" → "foo.txt"). For separator-free input,
+   returns @p path unchanged. */
+static const char *
+path_basename(const char *path)
+{
+    const char *base = path;
+    for (const char *p = path; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
 int
 axl_file_rename(const char *old_path, const char *new_path)
 {
@@ -222,12 +239,40 @@ axl_file_rename(const char *old_path, const char *new_path)
         return AXL_ERR;
     }
 
+    /* SetFileInfo on UEFI FAT drivers expects a basename, not a
+       full path, in EFI_FILE_INFO.FileName — and can't move across
+       directories. Extract the basename of @p new_path; if @p
+       new_path also carries a directory prefix, refuse the rename
+       unless that prefix matches @p old_path's prefix (so a
+       cross-directory move is rejected with AXL_ERR rather than
+       silently dropping the path component).
+
+       Caller wants cross-directory move? Use axl_file_move(), which
+       falls back to copy + delete for the cross-directory case. */
+    const char *new_base    = path_basename(new_path);
+    if (*new_base == '\0') {
+        /* "fs0:\\" — trailing separator with no name part. The
+           backend would reject this anyway; catch it here so a
+           well-formed AXL_ERR surfaces. */
+        return AXL_ERR;
+    }
+    size_t      new_dir_len = (size_t)(new_base - new_path);
+    if (new_dir_len > 0) {
+        const char *old_base    = path_basename(old_path);
+        size_t      old_dir_len = (size_t)(old_base - old_path);
+        if (new_dir_len != old_dir_len ||
+            axl_strncmp(old_path, new_path, old_dir_len) != 0)
+        {
+            return AXL_ERR;
+        }
+    }
+
     wide_old = axl_utf8_to_ucs2(old_path);
     if (wide_old == NULL) {
         return AXL_ERR;
     }
 
-    wide_new = axl_utf8_to_ucs2(new_path);
+    wide_new = axl_utf8_to_ucs2(new_base);
     if (wide_new == NULL) {
         axl_free(wide_old);
         return AXL_ERR;
@@ -239,6 +284,73 @@ axl_file_rename(const char *old_path, const char *new_path)
     axl_free(wide_old);
     axl_free(wide_new);
     return rc;
+}
+
+int
+axl_file_move(const char *old_path, const char *new_path)
+{
+    if (old_path == NULL || new_path == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Pre-flight: ensure the destination doesn't exist. UEFI FAT
+       SetFileInfo rejects a same-directory rename if the target
+       name is taken, and the copy fallback's write-open does not
+       truncate past the new content's length — both paths would
+       otherwise leave behind stale or hybrid content. Eagerly
+       removing @p new_path gives clean POSIX-rename-style overwrite
+       semantics regardless of which path runs. NOT atomic: if the
+       move then fails, the destination is gone — caller can
+       inspect the source and retry. Ignore the delete return
+       (file may legitimately not exist). */
+    axl_file_delete(new_path);
+
+    /* Same-directory case — try the atomic rename path first. */
+    if (axl_file_rename(old_path, new_path) == AXL_OK) {
+        return AXL_OK;
+    }
+
+    /* Cross-directory (or rename otherwise refused). Fall back to
+       chunked stream copy + source delete. NOT atomic — partial
+       failures leave observable state (see header docstring). */
+    AxlStream *src = axl_fopen(old_path, "r");
+    if (src == NULL) {
+        return AXL_ERR;
+    }
+    AxlStream *dst = axl_fopen(new_path, "w");
+    if (dst == NULL) {
+        axl_fclose(src);
+        return AXL_ERR;
+    }
+
+    char    buf[4096];
+    bool    ok = true;
+    for (;;) {
+        axl_yield();  /* keep Ctrl-C responsive on large copies */
+        axl_ssize_t n = axl_read(src, buf, sizeof(buf));
+        if (n < 0) {
+            ok = false;
+            break;
+        }
+        if (n == 0) {
+            break;  /* EOF */
+        }
+        if (axl_write(dst, buf, (size_t)n) != n) {
+            ok = false;
+            break;
+        }
+    }
+
+    axl_fclose(src);
+    axl_fclose(dst);
+
+    if (!ok) {
+        /* Partial dest file may exist. Leave it for caller to
+           inspect / retry — silently deleting it would hide
+           diagnostic info and isn't always desirable. */
+        return AXL_ERR;
+    }
+    return axl_file_delete(old_path);
 }
 
 int
@@ -340,24 +452,22 @@ axl_dir_read(AxlDir *dir, AxlDirEntry *entry)
     }
 
     /* Parse the EFI_FILE_INFO from the buffer.
-       Layout: UINT64 Size, UINT64 FileSize, UINT64 PhysicalSize,
-               EFI_TIME Create, EFI_TIME LastAccess, EFI_TIME Mod,
-               UINT64 Attribute, unsigned short FileName[] */
+       Layout (UEFI 2.10 §13.5): UINT64 Size, UINT64 FileSize,
+       UINT64 PhysicalSize, EFI_TIME CreateTime (offset 24),
+       EFI_TIME LastAccessTime (offset 40), EFI_TIME ModificationTime
+       (offset 56), UINT64 Attribute (offset 72), CHAR16 FileName[]
+       (offset 80). */
     uint64_t file_size;
     uint64_t attribute;
     unsigned short *filename;
 
-    /* FileSize is at offset 8 */
     axl_memcpy(&file_size, dir->buf + 8, sizeof(uint64_t));
-    /* Attribute is at offset 56 (8+8+8+16+16+16 = 72... actually let me
-       compute: Size(8) + FileSize(8) + PhysicalSize(8) + CreateTime(16)
-       + LastAccessTime(16) + ModificationTime(16) + Attribute(8) = 80,
-       so Attribute is at offset 72, FileName at offset 80) */
     axl_memcpy(&attribute, dir->buf + 72, sizeof(uint64_t));
     filename = (unsigned short *)(dir->buf + 80);
 
-    entry->size = file_size;
-    entry->is_dir = (attribute & 0x10) != 0;  /* EFI_FILE_DIRECTORY */
+    entry->size       = file_size;
+    entry->mtime_unix = axl_backend_efi_time_to_unix(dir->buf + 56);
+    entry->is_dir     = (attribute & 0x10) != 0;  /* EFI_FILE_DIRECTORY */
 
     /* Convert UCS-2 filename to UTF-8 */
     char *utf8 = axl_ucs2_to_utf8(filename);
@@ -680,7 +790,7 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
         return AXL_ERR;
     }
 
-    if (axl_service_enumerate("simple-fs", &handles, &num) != AXL_OK) {
+    if (axl_protocol_enumerate("simple-fs", &handles, &num) != AXL_OK) {
         *count = 0;
         return AXL_OK;
     }
@@ -694,7 +804,7 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
             /* device_path is firmware-owned — share the pointer.
                NULL on rare handles that don't publish a DP. */
             out[filled].device_path = NULL;
-            (void)axl_handle_get_service(handles[i], "device-path",
+            (void)axl_handle_get_protocol(handles[i], "device-path",
                                          &out[filled].device_path);
         }
         filled++;

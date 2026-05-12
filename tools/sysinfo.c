@@ -367,9 +367,9 @@ show_fw_info(void)
                    (pk_size > 0) ? "enrolled" : "not enrolled");
     }
 
-    /* TPM — skip for now until axl_service_find supports "tcg2" */
+    /* TPM — skip for now until axl_protocol_find supports "tcg2" */
     void *tcg2 = NULL;
-    if (axl_service_find("tcg2", &tcg2) == AXL_OK && tcg2 != NULL) {
+    if (axl_protocol_find("tcg2", &tcg2) == AXL_OK && tcg2 != NULL) {
         axl_printf("  TPM:        present\n");
     } else {
         axl_printf("  TPM:        not detected\n");
@@ -484,8 +484,7 @@ run_sysinfo(AxlArgs *a)
     return 0;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(sysinfo)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "SysInfo",

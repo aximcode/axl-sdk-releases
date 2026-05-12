@@ -205,6 +205,21 @@ file_handler(int level, const char *domain, const char *message, void *data)
 // Public API
 // ---------------------------------------------------------------------------
 
+/* Tear down whatever axl_log_file_attach last installed. NULL-safe by
+   construction — flush_buffer / axl_log_remove_handler / file_close all
+   no-op when their state is unset, so calling this against an
+   already-detached (or never-attached) state runs harmlessly. */
+static void
+detach_file_handler(void)
+{
+    flush_buffer();
+    axl_log_remove_handler(file_handler);
+    if (mFileHandle != NULL) {
+        axl_backend_file_close(&mFileHandle);
+        mFileHandle = NULL;
+    }
+}
+
 int
 axl_log_file_attach(const char *path)
 {
@@ -214,9 +229,7 @@ axl_log_file_attach(const char *path)
 
     // Close existing file handler if any
     if (mFileHandle != NULL) {
-        flush_buffer();
-        axl_log_remove_handler(file_handler);
-        axl_backend_file_close(&mFileHandle);
+        detach_file_handler();
     }
 
     if (mFileBuf == NULL) {
@@ -258,4 +271,10 @@ void
 axl_log_flush(void)
 {
     flush_buffer();
+}
+
+void
+axl_log_file_detach(void)
+{
+    detach_file_handler();
 }

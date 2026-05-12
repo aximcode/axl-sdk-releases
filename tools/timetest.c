@@ -72,8 +72,7 @@ run_timetest(AxlArgs *a)
     return 0;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(timetest)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name    = "timetest",

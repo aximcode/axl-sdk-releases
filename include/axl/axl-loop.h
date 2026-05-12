@@ -193,6 +193,90 @@ axl_loop_run(
     AxlLoop *loop  ///< event loop
 );
 
+/**
+ * @brief Drive the loop's dispatch from a firmware-managed periodic
+ *     timer (DXE driver mode).
+ *
+ * `axl_loop_run` is the foreground driver — it owns `TPL_APPLICATION`
+ * and blocks in `gBS->WaitForEvent`. UEFI driver entry points have
+ * no foreground caller: `DriverEntry` returns to the firmware after
+ * publishing protocols. Without a foreground caller, sources never
+ * dispatch and timers never fire, so anything async in the loop is
+ * dead.
+ *
+ * `axl_loop_attach_driver` installs a periodic firmware-managed
+ * `EVT_TIMER | EVT_NOTIFY_SIGNAL` event at `TPL_CALLBACK` whose
+ * notify drains the loop in non-blocking mode every @p interval_ms.
+ * Idle callbacks, defer-queue work, and source events all dispatch
+ * from this notify exactly as they would inside `axl_loop_run`.
+ * `DriverEntry` calls this and returns; `DriverUnload` calls
+ * `axl_loop_detach_driver`.
+ *
+ * **TPL contract.** UEFI 2.11 §7.1 allows only `TPL_CALLBACK` or
+ * `TPL_NOTIFY` for `EVT_NOTIFY_SIGNAL` events — there is no signal
+ * queue at `TPL_APPLICATION`. We use `TPL_CALLBACK`. Co-located
+ * firmware drivers (TCP4 / MNP / SNP) run their own state machines
+ * at the same `TPL_CALLBACK` level, so the FIFO notify queue
+ * alternates fairly between them and us as long as **our notify
+ * stays short**.
+ *
+ * **Notify-budget rule.** The consumer's loop sources must run
+ * fast. Each tick runs at `TPL_CALLBACK` and drains every source
+ * with a signaled event, calling each callback exactly once before
+ * returning (capped at 2× `AXL_MAX_SOURCES` per tick as a runaway
+ * guard — hitting the cap is logged). If a source callback does
+ * heavy work
+ * (large allocation, synchronous I/O, blocking protocol calls), it
+ * holds `TPL_CALLBACK` for that whole duration and starves
+ * co-located firmware drivers that need the same TPL — at best you
+ * see latency spikes, at worst connection-refused on a co-located
+ * TCP4. Keep source callbacks under ~1 ms; defer slow work via
+ * `axl_defer_call_later` to break it up across ticks.
+ *
+ * **Boot Services TPL ceiling.** `gBS->WaitForEvent` is unavailable
+ * above `TPL_APPLICATION`, so the dispatch is non-blocking-only.
+ * The sources you can use safely from driver mode are the same
+ * sources `axl_loop_run` supports (timers, idle, raw events,
+ * pubsub) — anything that would internally call `WaitForEvent`
+ * (notably `axl_loop_iterate_until` with a non-zero timeout) is
+ * not safe inside a source callback.
+ *
+ * Typical period: 50 ms — frequent enough for a responsive HTTP
+ * server, sparse enough to leave headroom. Pick lower for
+ * latency-sensitive pubsub delivery; pick higher for cost-sensitive
+ * idle workloads.
+ *
+ * Idempotent-fail: returns AXL_ERR if the loop is already attached
+ * (call `axl_loop_detach_driver` first to change the period).
+ *
+ * @return AXL_OK on success, AXL_ERR if @p loop is NULL, already
+ *     attached, or the firmware refused the timer.
+ */
+int
+axl_loop_attach_driver(
+    AxlLoop  *loop,         ///< loop to attach (must already exist)
+    uint64_t  interval_ms   ///< dispatch period in ms (typical: 50)
+);
+
+/**
+ * @brief Tear down a driver-mode loop attachment.
+ *
+ * Cancels the periodic timer, drains any in-flight notify, and
+ * frees the timer's bridging context. Pair with
+ * `axl_loop_attach_driver` from `DriverUnload`. NULL-safe; safe to
+ * call on a loop that was never attached (returns AXL_ERR).
+ *
+ * Order in `DriverUnload`: detach the loop FIRST, then unregister
+ * any protocols, then free the loop. Detaching first guarantees no
+ * notify is in flight when consumer state goes away.
+ *
+ * @return AXL_OK on success, AXL_ERR if not currently attached.
+ */
+int
+axl_loop_detach_driver(
+    AxlLoop  *loop          ///< loop to detach
+);
+
 // ---------------------------------------------------------------------------
 // Event sources (return source ID, 0 on failure)
 // ---------------------------------------------------------------------------

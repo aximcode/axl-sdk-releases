@@ -43,11 +43,23 @@ defines terms you may encounter.
       Accessed via ``gST`` in AXL.
 
    Protocol
-      A UEFI interface identified by a GUID. Protocols are installed
-      on handles and discovered via ``LocateProtocol`` or
-      ``LocateHandleBuffer``. Examples: TCP4, UDP4, GOP (graphics),
-      SimpleNetwork, Shell. AXL's ``axl_service_find`` wraps protocol
-      lookup with string names instead of GUIDs.
+      The UEFI spec's term for what most languages would call an
+      *interface bound to a specific instance*: a C struct of
+      function pointers (sometimes with inline state), identified
+      by a 128-bit GUID, installed on a handle. Closest analogs:
+      a COM interface (IID-keyed vtable on an object) or a Java /
+      Swift interface implementation (with the implementer-class
+      role played by a handle and the type-identity role played
+      by a GUID). The name is unfortunate — it has nothing to do
+      with wire protocols or network specs — but it is what the
+      spec uses everywhere, so AXL adopts it.
+
+      Consumers discover protocols via ``LocateProtocol`` /
+      ``LocateHandleBuffer`` (and AXL's name-keyed
+      ``axl_protocol_find`` wraps both); drivers publish them via
+      ``InstallProtocolInterface`` (or ``axl_protocol_register``).
+      Examples: TCP4, UDP4, GOP (graphics), SimpleNetwork, Shell,
+      SMBIOS.
 
    Service Binding
       A protocol pattern for creating child instances. Used by

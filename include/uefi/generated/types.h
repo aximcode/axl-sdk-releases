@@ -1,7 +1,10 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 AximCode */
+
 /** @file generated/types.h
     Auto-generated from UEFI Specification 2.11.
     Base UEFI types, constants, and enums.
-    Do not edit — regenerate with scripts/generate-uefi-headers.py
+    Do not edit -- regenerate with scripts/generate-uefi-headers.py
 **/
 
 #ifndef AXL_UEFI_GEN_TYPES_H
@@ -187,6 +190,23 @@ typedef struct _EFI_CAPSULE_HEADER {
    UINT32               CapsuleImageSize;
  } EFI_CAPSULE_HEADER;
 
+typedef struct _EFI_SYSTEM_RESOURCE_ENTRY {
+  EFI_GUID       FwClass;
+  UINT32         FwType;
+  UINT32         FwVersion;
+  UINT32         LowestSupportedFwVersion;
+  UINT32         CapsuleFlags;
+  UINT32         LastAttemptVersion;
+  UINT32         LastAttemptStatus;
+}   EFI_SYSTEM_RESOURCE_ENTRY;
+
+typedef struct _EFI_SYSTEM_RESOURCE_TABLE {
+  UINT32                         FwResourceCount;
+  UINT32                         FwResourceCountMax;
+  UINT64                         FwResourceVersion;
+  //EFI_SYSTEM_RESOURCE_ENTRY    Entries[1];
+} EFI_SYSTEM_RESOURCE_TABLE;
+
 typedef struct _EFI_DEVICE_PATH_PROTOCOL {
   UINT8           Type;
   UINT8           SubType;
@@ -293,7 +313,7 @@ VOID
 
 #define TPL_HIGH_LEVEL     31
 
-// EFI_TEXT_ATTR — commented out in spec, hand-written here
+// EFI_TEXT_ATTR -- commented out in spec, hand-written here
 #define EFI_TEXT_ATTR(fg, bg)  ((fg) | ((bg) << 4))
 
 static inline int

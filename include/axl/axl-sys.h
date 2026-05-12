@@ -24,6 +24,33 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Opaque handle for any UEFI-tracked entity.
+ *
+ * Binary-compatible with `EFI_HANDLE` (both `void *`). Use in
+ * public API and consumer code wherever a UEFI handle would
+ * appear — image handles from `DriverEntry`, protocol handles
+ * returned by `axl_protocol_register`, controller handles passed
+ * to `axl_driver_connect_handle`, handles returned by
+ * `axl_protocol_enumerate`. `AxlHandle` is an opaque token; never
+ * dereference it. The EFI_* spelling stays available via
+ * `<uefi/axl-uefi.h>` for the rare consumer that needs to call a
+ * `gBS->...(EFI_HANDLE)` directly.
+ */
+typedef void *AxlHandle;
+
+/**
+ * @brief Opaque firmware system-table pointer.
+ *
+ * Forward-decl for `EFI_SYSTEM_TABLE`. Drivers receive an
+ * `AxlSystemTable *` from the `AXL_DRIVER` adapter and pass it
+ * straight to `axl_driver_init`; consumers never dereference it.
+ * Reach for `<uefi/axl-uefi.h>`'s typed `EFI_SYSTEM_TABLE` only
+ * when you need to poke at firmware internals the AXL surface
+ * doesn't cover.
+ */
+typedef struct AxlSystemTable AxlSystemTable;
+
+/**
  * @brief UEFI-compatible GUID in standard C types.
  *
  * Binary-compatible with EFI_GUID. Use in public API so consumer
@@ -65,6 +92,42 @@ axl_guid_cmp(
 #define AXL_GUID(d1, d2, d3, d4_0, d4_1, d4_2, d4_3, d4_4, d4_5, d4_6, d4_7) \
     { (d1), (d2), (d3), { (d4_0), (d4_1), (d4_2), (d4_3), (d4_4), (d4_5), (d4_6), (d4_7) } }
 
+/**
+ * @brief Derive a deterministic GUID from a (namespace, name) pair.
+ *
+ * Name-based UUID generation in the shape of RFC 4122 §4.3 (UUIDv5):
+ * the SHA-1 of `namespace_bytes || name_bytes` is truncated to 16 bytes,
+ * with the version field set to 5 and the RFC-4122 variant bits set on
+ * the result. Same `(namespace, name)` always yields the same GUID,
+ * across binaries / arches / runs.
+ *
+ * Used by AxlService to derive each service's identity GUID from
+ * `AxlService.name` so consumers don't have to hand-allocate a UUID
+ * per service. Other AXL modules that want stable GUIDs from string
+ * keys can use the same primitive.
+ *
+ * **Namespace bytes are fed verbatim** — AxlGuid's storage layout
+ * (data1/data2/data3 in host byte order) is what hashes, NOT the
+ * RFC-4122 network-byte-order serialization. The 16-byte result is
+ * likewise stored as opaque AxlGuid bytes; AXL never reads its
+ * data1/data2/data3 fields as host-order ints once derived. This is
+ * an internal AXL convention, not strict RFC 4122 — GUIDs derived
+ * here won't match what a UUIDv5 generator on another platform would
+ * produce given "the same" namespace UUID written in canonical text
+ * form. That's fine for AXL's use case (derivation lives entirely
+ * inside AXL) and avoids a host-vs-network endian conversion that
+ * would otherwise creep into every caller.
+ *
+ * @return AXL_OK on success (@p out populated); AXL_ERR if @p namespace
+ *     or @p name is NULL or @p out is NULL.
+ */
+int
+axl_guid_v5(
+    const AxlGuid *namespace_uuid,  ///< namespace UUID (e.g. an AXL module's identity)
+    const char    *name,            ///< NUL-terminated name string
+    AxlGuid       *out              ///< [out] derived GUID
+);
+
 // ---------------------------------------------------------------------------
 // Device path
 // ---------------------------------------------------------------------------
@@ -79,12 +142,12 @@ axl_guid_cmp(
  */
 bool
 axl_device_path_has_vendor(
-    void          *device_path,  ///< device path (from "device-path" service)
+    void          *device_path,  ///< device path (from "device-path" protocol)
     const AxlGuid *guid          ///< vendor GUID to match
 );
 
 /**
- * @brief Per-node callback for @ref axl_device_path_for_each.
+ * @brief Per-node callback for axl_device_path_for_each.
  *
  * Return 0 to continue iteration, any non-zero value to stop —
  * the return value is propagated back from `axl_device_path_for_each`
@@ -120,7 +183,7 @@ typedef int (*AxlDevicePathFn)(
  */
 int
 axl_device_path_for_each(
-    const void       *device_path,  ///< device path (from "device-path" service)
+    const void       *device_path,  ///< device path (from "device-path" protocol)
     AxlDevicePathFn   fn,            ///< per-node callback
     void             *user           ///< opaque user pointer for the callback
 );
@@ -133,7 +196,7 @@ axl_device_path_for_each(
  */
 const void *
 axl_device_path_find(
-    const void *device_path,  ///< device path (from "device-path" service)
+    const void *device_path,  ///< device path (from "device-path" protocol)
     uint8_t     type,         ///< node type to match
     uint8_t     subtype       ///< node subtype to match
 );
@@ -150,7 +213,7 @@ axl_device_path_find(
  */
 size_t
 axl_device_path_size(
-    const void *device_path  ///< device path (from "device-path" service)
+    const void *device_path  ///< device path (from "device-path" protocol)
 );
 
 /**
@@ -171,7 +234,7 @@ axl_device_path_size(
  */
 char *
 axl_device_path_to_text(
-    const void *device_path  ///< device path (from "device-path" service)
+    const void *device_path  ///< device path (from "device-path" protocol)
 );
 
 // ---------------------------------------------------------------------------
@@ -240,85 +303,245 @@ axl_sys_get_memory_size(
 );
 
 /**
- * @brief Get a service interface from a specific handle.
+ * @brief Get a protocol interface from a specific handle.
  *
  * @return AXL_OK on success, AXL_ERR if not found.
  */
 int
-axl_handle_get_service(
-    void        *handle,     ///< handle from axl_service_enumerate
-    const char  *name,       ///< service name (e.g., "device-path", "simple-fs")
-    void       **interface   ///< [out] service interface pointer
+axl_handle_get_protocol(
+    void        *handle,     ///< handle from axl_protocol_enumerate
+    const char  *name,       ///< protocol name (e.g., "device-path", "simple-fs")
+    void       **interface   ///< [out] protocol interface pointer
 );
 
 // ---------------------------------------------------------------------------
-// Service registry
+// Protocol registry
 // ---------------------------------------------------------------------------
+//
+// "Protocol" here is the UEFI spec's term, not a wire protocol. A
+// UEFI protocol is a C struct of function pointers (sometimes with
+// inline state), identified by a 128-bit GUID, installed on a
+// handle — closer in shape to a COM interface or a Java/Swift
+// interface bound to a specific instance than to anything network-
+// shaped. The name is awkward and we adopt it anyway because the
+// spec uses it everywhere. See `src/util/README.md` § "Protocol
+// Registry" for the longer explainer.
+//
+// All register/find/enumerate/unregister calls bottom out in UEFI Boot
+// Services protocol-database operations (`InstallProtocolInterface`,
+// `LocateProtocol`, `LocateHandleBuffer`, `UninstallProtocolInterface`)
+// and `axl_malloc` (which calls `gBS->AllocatePool`). UEFI 2.11 §7.3
+// requires those to be invoked at TPL <= `TPL_NOTIFY`, so the same
+// constraint applies to every entry point in this section. Callers
+// running from a timer event handler at `TPL_NOTIFY` are fine; callers
+// running at `TPL_HIGH_LEVEL` must lower first.
+//
+// Callbacks invoked via `AxlLoop` (defer-drain, pubsub dispatch,
+// source handlers) all run at `TPL_APPLICATION` — the loop itself
+// calls `WaitForEvent`, which mandates that level.
 
 /**
- * @brief Find a system service by name.
+ * @brief Pin a stable vendor GUID to a custom protocol name.
  *
- * Looks up a named service in the platform service registry.
+ * By default `axl_protocol_register("custom-name", ...)` synthesizes a
+ * deterministic GUID from the name string via FNV-1a. That works for
+ * single-image use, but the GUID is unstable across name spelling
+ * (a typo gives a different GUID) and isn't usable for cross-image
+ * discovery via raw `LocateProtocol` because external consumers
+ * can't reproduce it without the same name string.
+ *
+ * Calling `axl_protocol_register_name(name, guid)` once at startup
+ * pins @p name to @p guid in the per-process registry, so subsequent
+ * `axl_protocol_register` / `_find` / `_enumerate` / `_unregister`
+ * calls for that name install or look up against @p guid instead.
+ * Other consumers can publish the GUID in their own headers and
+ * `LocateProtocol` against it without going through the AXL
+ * protocol-registry layer at all.
+ *
+ * Idempotent: re-registering the same `(name, guid)` pair returns
+ * `AXL_OK`. Re-registering a name with a different GUID, or
+ * registering a name already in the built-in well-known table
+ * (e.g. "smbios", "simple-fs"), returns `AXL_ERR`. Names are
+ * copied internally; @p name does not need to outlive the call.
+ *
+ * Process-lifetime: the registration persists for the lifetime of
+ * the running image. There is no `axl_protocol_unregister_name`;
+ * unregistering a *handle* with `axl_protocol_unregister` does not
+ * remove the name pinning, since other consumers may still want to
+ * reuse the same name → GUID mapping. The custom-name table is
+ * fixed-capacity (16 entries per image) and statically linked into
+ * each image — consumers loading and unloading drivers on a tight
+ * loop should pin once at first init, not on every iteration.
+ *
+ * Cross-image discovery: each image has its own copy of the AXL
+ * protocol-registry layer (via static linkage of libaxl.a), so a
+ * consumer in image B that wants to find a protocol published by
+ * image A must either (a) call `axl_protocol_register_name` itself
+ * with the same `(name, guid)` pair before calling
+ * `axl_protocol_find`, or (b) call `LocateProtocol` directly
+ * against the published GUID without going through the AXL
+ * protocol-registry layer.
+ *
+ * @return AXL_OK on success or idempotent re-register; AXL_ERR if
+ *     @p name is NULL/empty, @p guid is NULL, the name shadows a
+ *     built-in well-known name, the name is already pinned to a
+ *     different GUID, or the registry is full.
+ */
+int
+axl_protocol_register_name(
+    const char    *name,    ///< protocol name (copied internally)
+    const AxlGuid *guid     ///< vendor GUID to bind to @p name
+);
+
+/**
+ * @brief Find a system protocol by name.
+ *
+ * Looks up a named protocol in the platform protocol registry.
  * Well-known names: "smbios", "shell", "simple-network", "simple-fs".
+ * Custom names work too — names registered via
+ * `axl_protocol_register_name` resolve to their pinned GUID;
+ * unregistered custom names fall back to a deterministic FNV-1a
+ * GUID derived from the name string.
+ *
+ * Cross-image gotcha: the name → GUID table is per-image. A
+ * consumer that wants to find a custom-named protocol published by
+ * a different image must first call `axl_protocol_register_name`
+ * with the same `(name, guid)` pair, or skip the name layer and
+ * `LocateProtocol` against the published GUID directly.
  *
  * @return AXL_OK on success, AXL_ERR if not found.
  */
 int
-axl_service_find(
-    const char *name,       ///< service name
+axl_protocol_find(
+    const char *name,       ///< protocol name
     void      **interface   ///< [out] service interface pointer
 );
 
 /**
- * @brief Enumerate all handles providing a named service.
+ * @brief Enumerate all handles providing a named protocol.
  *
  * Caller frees the returned handles array with axl_free().
  *
  * @return AXL_OK on success (count may be 0), AXL_ERR on error.
  */
 int
-axl_service_enumerate(
-    const char  *name,      ///< service name
+axl_protocol_enumerate(
+    const char  *name,      ///< protocol name
     void      ***handles,   ///< [out] array of handles
     size_t      *count      ///< [out] number of handles
 );
 
 /**
- * @brief Register a service on a handle.
+ * @brief Register a protocol on a handle.
  *
  * Creates a new handle if @a *handle is NULL.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
-axl_service_register(
-    const char *name,       ///< service name
-    void       *interface,  ///< service interface to install
+axl_protocol_register(
+    const char *name,       ///< protocol name
+    void       *interface,  ///< protocol interface to install
     void      **handle      ///< [in/out] handle (NULL to create new)
 );
 
 /**
- * @brief Unregister a service from a handle.
+ * @brief Unregister a protocol from a handle.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
-axl_service_unregister(
-    void       *handle,     ///< handle from axl_service_register
-    const char *name,       ///< service name
+axl_protocol_unregister(
+    void       *handle,     ///< handle from axl_protocol_register
+    const char *name,       ///< protocol name
     void       *interface   ///< interface to remove
 );
 
 /**
- * @brief Register multiple services on a handle atomically.
+ * @brief Locate a protocol interface by GUID directly.
  *
- * Installs one or more services on the same handle in one operation.
+ * GUID-keyed counterpart to axl_protocol_find. Skips the
+ * name-registry name → GUID lookup; useful for consumers that
+ * already hold a GUID (notably AxlService, whose identity is the
+ * name-derived GUID from axl_service_guid). Returns the first
+ * interface registered for the GUID via @c LocateProtocol semantics.
+ *
+ * @return AXL_OK on success (@p interface populated); AXL_ERR if no
+ *     handle publishes the GUID or arguments are NULL.
+ */
+int
+axl_protocol_find_guid(
+    const AxlGuid *guid,        ///< protocol GUID to look up (must be non-NULL)
+    void         **interface    ///< [out] service interface pointer
+);
+
+/**
+ * @brief Enumerate all handles publishing a protocol by GUID directly.
+ *
+ * GUID-keyed counterpart to axl_protocol_enumerate. Returns an
+ * @c axl_malloc'd array of handles publishing @p guid; caller frees
+ * with @c axl_free. Used by @c axl_service_stop to discover every
+ * driver image that registered the service's identity GUID
+ * (typically one, but the contract handles N for symmetry with the
+ * underlying @c LocateHandleBuffer).
+ *
+ * Empty result (no handle publishes the GUID) is success: @p handles
+ * is set to NULL and @p count to 0.
+ *
+ * @return AXL_OK on success (count may be 0); AXL_ERR on bad
+ *     arguments or firmware allocation failure.
+ */
+int
+axl_protocol_enumerate_guid(
+    const AxlGuid  *guid,       ///< protocol GUID to look up (must be non-NULL)
+    void         ***handles,    ///< [out] axl_malloc'd handle array (may be NULL on empty)
+    size_t         *count       ///< [out] number of handles
+);
+
+/**
+ * @brief Register a protocol on a handle by GUID directly.
+ *
+ * Skips the name-registry name → GUID lookup. Used by AxlService's
+ * AXL_SERVICE_DRIVER macro to publish a sentinel handle for the
+ * service's identity GUID without going through `axl_protocol_register_name`
+ * (which would pollute the per-image name table). Also useful for
+ * consumers that already have a GUID and don't need the name layer.
+ *
+ * Creates a new handle if @p *handle is NULL.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_protocol_register_guid(
+    const AxlGuid *guid,       ///< protocol GUID
+    void          *interface,  ///< protocol interface to install
+    void         **handle      ///< [in/out] handle (NULL to create new)
+);
+
+/**
+ * @brief Unregister a protocol by GUID directly.
+ *
+ * GUID-based counterpart to axl_protocol_unregister.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_protocol_unregister_guid(
+    void          *handle,     ///< handle from axl_protocol_register_guid
+    const AxlGuid *guid,       ///< protocol GUID
+    void          *interface   ///< interface to remove
+);
+
+/**
+ * @brief Register multiple protocols on a handle atomically.
+ *
+ * Installs one or more protocols on the same handle in one operation.
  * If any fails, none are installed. Creates a new handle if
  * @a *handle is NULL. Pass name/interface pairs followed by NULL:
  *
  * @code
  * void *h = NULL;
- * axl_service_register_multiple(&h,
+ * axl_protocol_register_multiple(&h,
  *     "simple-fs", &my_fs,
  *     "device-path", &my_dp,
  *     NULL);
@@ -327,7 +550,7 @@ axl_service_unregister(
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
-axl_service_register_multiple(
+axl_protocol_register_multiple(
     void      **handle,  ///< [in/out] handle (NULL to create new)
     ...                  ///< name, interface pairs, terminated by NULL
 );

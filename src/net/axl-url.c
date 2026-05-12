@@ -29,11 +29,15 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
 {
     const char             *p;
     const char             *scheme_end;
+    const char             *authority_start;
+    const char             *userinfo_end;
+    const char             *user_end;
     const char             *host_start;
     const char             *host_end;
     const char             *port_start;
     const char             *path_start;
     const char             *query_start;
+    const char             *fragment_start;
     AXL_AUTOPTR(AxlUrl)     u = NULL;
     uint16_t                port;
 
@@ -58,19 +62,57 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     }
 
     //
-    // Host starts after "://"
+    // Authority starts after "://" and ends at the first '/', '?',
+    // or '#' (or NUL). Look for an '@' inside the authority — if
+    // present, the prefix is the userinfo (`user[:password]`) and
+    // the host starts after the '@'. An '@' AFTER the authority
+    // boundary (in path or query) is part of that component and
+    // must NOT be treated as userinfo separator.
     //
-    host_start = scheme_end + 3;
-    if (*host_start == '\0') {
+    authority_start = scheme_end + 3;
+    if (*authority_start == '\0') {
         axl_error("malformed URL: no host in '%s'", url);
         return AXL_ERR;
     }
 
+    userinfo_end = NULL;
+    for (p = authority_start;
+         *p != '\0' && *p != '/' && *p != '?' && *p != '#';
+         p++)
+    {
+        if (*p == '@') {
+            userinfo_end = p;
+            break;
+        }
+    }
+
+    if (userinfo_end != NULL) {
+        host_start = userinfo_end + 1;
+        //
+        // Userinfo: split on the FIRST ':' into user / password.
+        // Subsequent ':' bytes belong to the password (RFC 3986
+        // technically deprecates `:` in userinfo, but tolerate it
+        // for round-trip fidelity).
+        //
+        user_end = userinfo_end;
+        for (p = authority_start; p < userinfo_end; p++) {
+            if (*p == ':') {
+                user_end = p;
+                break;
+            }
+        }
+    } else {
+        host_start = authority_start;
+        user_end   = NULL;
+    }
+
     //
-    // Find end of host — terminated by ':', '/', '?', or NUL
+    // Find end of host — terminated by ':', '/', '?', '#', or NUL
     //
     host_end = host_start;
-    while (*host_end != '\0' && *host_end != ':' && *host_end != '/' && *host_end != '?') {
+    while (*host_end != '\0' && *host_end != ':' && *host_end != '/' &&
+           *host_end != '?' && *host_end != '#')
+    {
         host_end++;
     }
 
@@ -80,16 +122,42 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     }
 
     //
-    // Optional port after ':'
+    // Optional port after ':'. RFC 3986 §3.2.3 allows an empty
+    // port (`host:` → scheme default). Non-digit bytes are NOT
+    // accepted — they'd otherwise leave the parser staring at
+    // garbage and silently mis-parse the rest of the URL. We also
+    // bound at uint16_t so `host:99999` doesn't silently truncate.
     //
     port = 0;
     port_start = host_end;
     if (*port_start == ':') {
         port_start++;
+        uint32_t  port32    = 0;
+        bool      any_digit = false;
         while (axl_isdigit((unsigned char)*port_start)) {
-            port = (uint16_t)(port * 10 + (*port_start - '0'));
+            port32 = port32 * 10 + (uint32_t)(*port_start - '0');
+            if (port32 > 65535) {
+                axl_error("malformed URL: port out of range in '%s'", url);
+                return AXL_ERR;
+            }
+            any_digit = true;
             port_start++;
         }
+        // After the digit run we must be at a path/query/fragment
+        // terminator or NUL — anything else means the port had
+        // trailing non-digit bytes (e.g. `host:80abc`) and the
+        // input is malformed.
+        if (*port_start != '\0' && *port_start != '/' &&
+            *port_start != '?' && *port_start != '#')
+        {
+            axl_error("malformed URL: non-digit port in '%s'", url);
+            return AXL_ERR;
+        }
+        if (any_digit) {
+            port = (uint16_t)port32;
+        }
+        // else: empty port (`host:/`), fall through with port = 0
+        // so the default-port logic below picks the scheme default.
 
         p = port_start;
     } else {
@@ -97,22 +165,35 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     }
 
     //
-    // Path starts at '/' or is empty
+    // Path starts at '/' or is empty. Stop at '?' (query) or '#'
+    // (fragment).
     //
     path_start = NULL;
     if (*p == '/') {
         path_start = p;
-        while (*p != '\0' && *p != '?') {
+        while (*p != '\0' && *p != '?' && *p != '#') {
             p++;
         }
     }
 
     //
-    // Query starts after '?'
+    // Query starts after '?', ends at '#' or NUL.
     //
     query_start = NULL;
     if (*p == '?') {
         query_start = p + 1;
+        p++;
+        while (*p != '\0' && *p != '#') {
+            p++;
+        }
+    }
+
+    //
+    // Fragment starts after '#', runs to NUL.
+    //
+    fragment_start = NULL;
+    if (*p == '#') {
+        fragment_start = p + 1;
     }
 
     //
@@ -140,16 +221,54 @@ axl_url_parse(const char *url, AxlUrl **out_parsed)
     u->host   = axl_strndup(host_start, (size_t)(host_end - host_start));
     u->port   = port;
 
+    //
+    // Userinfo (user + optional password). Distinguish "absent" vs
+    // "present but empty": NULL means no `@` in authority; empty
+    // string ("") means the slot was present with no bytes (e.g.
+    // `user:@host` → password = "").
+    //
+    if (userinfo_end != NULL) {
+        u->user = axl_strndup(authority_start,
+                              (size_t)(user_end - authority_start));
+        if (u->user == NULL) {
+            return AXL_ERR;
+        }
+        if (user_end < userinfo_end) {
+            // user_end points at the ':' between user and password
+            u->password = axl_strndup(user_end + 1,
+                                      (size_t)(userinfo_end - (user_end + 1)));
+            if (u->password == NULL) {
+                return AXL_ERR;
+            }
+        }
+    }
+
     if (path_start != NULL) {
-        const char *path_end = (query_start != NULL) ? (query_start - 1) : (url + axl_strlen(url));
+        // Path ends at the first '?' / '#' / NUL after path_start
+        const char *path_end = path_start;
+        while (*path_end != '\0' && *path_end != '?' && *path_end != '#') {
+            path_end++;
+        }
         u->path = axl_strndup(path_start, (size_t)(path_end - path_start));
     } else {
         u->path = axl_strdup("/");
     }
 
     if (query_start != NULL) {
-        u->query = axl_strdup(query_start);
+        // Query ends at '#' or NUL
+        const char *query_end = query_start;
+        while (*query_end != '\0' && *query_end != '#') {
+            query_end++;
+        }
+        u->query = axl_strndup(query_start, (size_t)(query_end - query_start));
         if (u->query == NULL) {
+            return AXL_ERR;
+        }
+    }
+
+    if (fragment_start != NULL) {
+        u->fragment = axl_strdup(fragment_start);
+        if (u->fragment == NULL) {
             return AXL_ERR;
         }
     }
@@ -174,9 +293,12 @@ axl_url_free(AxlUrl *url)
     }
 
     axl_free(url->scheme);
+    axl_free(url->user);
+    axl_free(url->password);
     axl_free(url->host);
     axl_free(url->path);
     axl_free(url->query);
+    axl_free(url->fragment);
     axl_free(url);
 }
 

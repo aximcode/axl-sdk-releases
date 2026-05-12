@@ -43,54 +43,10 @@ typedef struct {
 } AxlTcpCloseCtx;
 
 // ---------------------------------------------------------------------------
-// Locate TCP4 service binding
+// Locate TCP4 service binding — thin wrapper over the generic
+// axl_net_locate_sb (in axl-net-interfaces.c). The same locator
+// serves UDP via axl_udp_open_via.
 // ---------------------------------------------------------------------------
-
-/* Address-comparison helpers all live in axl-net-addr.c
-   (axl_ipv4_equals / axl_ipv4_in_subnet); operate on bare uint8_t[4]
-   so the EFI_IPv4_ADDRESS.Addr field passes through untouched. */
-
-/// Try to read InterfaceInfo from the IP4Config2 protocol on @p handle.
-/// On success copies StationAddress + SubnetMask into the outputs.
-/// Returns EFI_NOT_FOUND if the handle has no IP4Config2.
-static EFI_STATUS
-get_iface_info(
-    EFI_HANDLE         handle,
-    EFI_IPv4_ADDRESS  *station_out,
-    EFI_IPv4_ADDRESS  *mask_out
-    )
-{
-    EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
-    EFI_STATUS status = axl_efi_call(axl_bs()->HandleProtocol, 3,
-        handle, &gEfiIp4Config2ProtocolGuid, (void **)&cfg);
-    if (EFI_ERROR(status) || cfg == NULL) {
-        return EFI_NOT_FOUND;
-    }
-
-    /* Two-phase: ask for size, alloc, then read. The InterfaceInfo
-       buffer carries an OPTIONAL trailing route table whose size we
-       don't know up front. */
-    UINTN data_size = 0;
-    status = axl_efi_call(cfg->GetData, 4, cfg,
-        Ip4Config2DataTypeInterfaceInfo, &data_size, NULL);
-    if (status != EFI_BUFFER_TOO_SMALL || data_size < sizeof(EFI_IP4_CONFIG2_INTERFACE_INFO)) {
-        return EFI_NOT_FOUND;
-    }
-    EFI_IP4_CONFIG2_INTERFACE_INFO *info = axl_malloc(data_size);
-    if (info == NULL) {
-        return EFI_OUT_OF_RESOURCES;
-    }
-    status = axl_efi_call(cfg->GetData, 4, cfg,
-        Ip4Config2DataTypeInterfaceInfo, &data_size, info);
-    if (EFI_ERROR(status)) {
-        axl_free(info);
-        return status;
-    }
-    *station_out = info->StationAddress;
-    *mask_out    = info->SubnetMask;
-    axl_free(info);
-    return EFI_SUCCESS;
-}
 
 EFI_STATUS
 tcp_find_service_binding(
@@ -100,89 +56,8 @@ tcp_find_service_binding(
     EFI_HANDLE                    *out_handle
     )
 {
-    EFI_STATUS  status;
-    EFI_HANDLE  *handles      = NULL;
-    size_t       handle_count = 0;
-
-    status = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
-                    ByProtocol,
-                    &gEfiTcp4ServiceBindingProtocolGuid,
-                    NULL,
-                    &handle_count,
-                    &handles
-                    );
-    if (EFI_ERROR(status) || handle_count == 0) {
-        return EFI_NOT_FOUND;
-    }
-
-    /* First pass: scan once and pick the best candidate.
-       Priority (highest first):
-         3 = pinned source IP matches station (only path when forced_source)
-         2 = subnet-match against destination
-         1 = first non-zero station IP
-         0 = unconfigured (skip) */
-    EFI_HANDLE chosen      = NULL;
-    int        chosen_rank = 0;
-
-    for (size_t i = 0; i < handle_count; i++) {
-        EFI_IPv4_ADDRESS station = { 0 };
-        EFI_IPv4_ADDRESS mask    = { 0 };
-        if (get_iface_info(handles[i], &station, &mask) != EFI_SUCCESS) {
-            continue;
-        }
-
-        if (forced_source != NULL) {
-            /* Pinned-source mode: must exactly match. Anything else
-               is ineligible. The conceptual "rank 3" doesn't need to
-               be written to chosen_rank because we break immediately
-               and the var isn't read after the loop — clang-tidy
-               flags the assignment as a dead-store. */
-            if (axl_ipv4_equals(station.Addr, forced_source->Addr)) {
-                chosen = handles[i];
-                break;
-            }
-            continue;
-        }
-
-        /* Auto mode: skip 0.0.0.0 entirely. */
-        static const uint8_t zero4[4] = { 0, 0, 0, 0 };
-        if (axl_ipv4_equals(station.Addr, zero4)) {
-            continue;
-        }
-
-        if (dest != NULL && axl_ipv4_in_subnet(dest->Addr, station.Addr, mask.Addr)) {
-            if (chosen_rank < 2) {
-                chosen = handles[i];
-                /* "Rank 2" — subnet-match is the strongest auto
-                   signal; first match wins. break is unconditional
-                   so chosen_rank doesn't need updating (dead-store
-                   per clang-tidy). */
-                break;
-            }
-        }
-
-        if (chosen_rank < 1) {
-            chosen      = handles[i];
-            chosen_rank = 1;
-        }
-    }
-
-    if (chosen == NULL) {
-        axl_backend_free(handles);
-        return EFI_NOT_FOUND;
-    }
-
-    status = axl_efi_call(axl_bs()->HandleProtocol, 3,
-                    chosen,
-                    &gEfiTcp4ServiceBindingProtocolGuid,
-                    (void **)sb
-                    );
-    if (!EFI_ERROR(status)) {
-        *out_handle = chosen;
-    }
-
-    axl_backend_free(handles);
-    return status;
+    return axl_net_locate_sb(&gEfiTcp4ServiceBindingProtocolGuid,
+                             dest, forced_source, sb, out_handle);
 }
 
 // ---------------------------------------------------------------------------

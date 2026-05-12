@@ -297,8 +297,26 @@ axl_backend_file_stat(
     const unsigned short  *path,       ///< UCS-2 path
     uint64_t              *size,       ///< [out] file size (NULL OK)
     uint64_t              *alloc_size, ///< [out] allocation size (NULL OK)
+    uint64_t              *mtime_unix, ///< [out] modification time, Unix epoch seconds (NULL OK, 0 = unknown)
     bool                  *is_dir,     ///< [out] directory flag (NULL OK)
     bool                  *read_only   ///< [out] read-only flag (NULL OK)
+    );
+
+/**
+ * Convert a 16-byte EFI_TIME value to Unix epoch seconds. The input
+ * is read out of EFI_FILE_INFO.ModificationTime (or any of the other
+ * EFI_TIME fields) by either the backend or the axl-fs.c dir-entry
+ * parser. Returns 0 (caller's "unknown" sentinel) if the wire bytes
+ * indicate an unset / zero date.
+ *
+ * Treats TimeZone as UTC when EFI_UNSPECIFIED_TIMEZONE (0x07FF) is
+ * stored; otherwise subtracts TimeZone-minutes to convert to UTC.
+ * Daylight bit is ignored (the timezone offset already accounts for
+ * it on platforms that bother to set it).
+ */
+uint64_t
+axl_backend_efi_time_to_unix(
+    const void  *efi_time_16  ///< pointer to 16 bytes in EFI_TIME layout
     );
 
 /**
@@ -513,6 +531,42 @@ axl_backend_event_create_timer(
 int
 axl_backend_event_create(
     AxlEventHandle  *event  ///< (out) receives event handle
+    );
+
+/**
+ * @brief Create a periodic timer with a notify-signal callback.
+ *
+ * Creates an `EVT_TIMER | EVT_NOTIFY_SIGNAL` event at
+ * `TPL_CALLBACK` and arms it as periodic with the given period.
+ * The firmware invokes @p notify(@p ctx) on each tick. Used by
+ * `axl_loop_attach_driver` to drive an `AxlLoop`'s dispatch from
+ * firmware-managed timer events when no foreground caller exists
+ * (DXE driver mode).
+ *
+ * `TPL_CALLBACK` is the lowest TPL legal for an `EVT_NOTIFY_SIGNAL`
+ * event — UEFI 2.11 §7.1 only maintains signal queues at
+ * `TPL_CALLBACK` and `TPL_NOTIFY` (firmware rejects
+ * `TPL_APPLICATION` with `EFI_INVALID_PARAMETER`). At
+ * `TPL_CALLBACK` the notify shares the FIFO queue with co-located
+ * firmware drivers (TCP4 / MNP / SNP run their state machines at
+ * the same level), so each notify must stay short or co-located
+ * drivers can't make progress. See `axl_loop_attach_driver`
+ * doxygen for the notify-budget rule.
+ *
+ * Pair every successful call with `axl_backend_event_close` — the
+ * close path cancels the timer, lets in-flight notifies drain via
+ * `gBS->CloseEvent`, then frees the bridging context. Calling
+ * `axl_backend_event_set_timer` afterward is supported (e.g. to
+ * change the period) but not required.
+ *
+ * @return AXL_OK on success, AXL_ERR on error or table-full.
+ */
+int
+axl_backend_event_create_notify_timer(
+    void   (*notify)(void *ctx),    ///< notify function (TPL_CALLBACK)
+    void    *ctx,                   ///< opaque context passed to @p notify
+    uint64_t interval_100ns,        ///< period in 100ns units
+    AxlEventHandle *event           ///< (out) receives event handle
     );
 
 /**

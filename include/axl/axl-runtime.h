@@ -27,6 +27,8 @@
 
 #include <stddef.h>
 
+#include <axl/axl-sys.h>   /* AxlGuid for axl_efi_find_config_table */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -72,6 +74,37 @@ axl_loop_default(void);
  */
 void
 axl_yield(void);
+
+// ---------------------------------------------------------------------------
+// UEFI System Configuration Table accessor
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Look up a UEFI Configuration Table entry by VendorGuid.
+ *
+ * Walks the EFI System Table's ConfigurationTable for an entry
+ * whose VendorGuid matches @p guid. Returns the corresponding
+ * VendorTable pointer (typed `void *` — caller casts to the
+ * spec-defined struct type for the GUID).
+ *
+ * Common GUIDs and their published types:
+ *   - `EFI_ACPI_20_TABLE_GUID`           → RSDP
+ *   - `SMBIOS3_TABLE_GUID`               → SMBIOS3 entry-point struct
+ *   - `EFI_SYSTEM_RESOURCE_TABLE_GUID`   → ESRT
+ *   - `EFI_DEBUG_IMAGE_INFO_TABLE_GUID`  → debug image info
+ *
+ * Modules with their own typed lookups (axl-acpi, axl-smbios) call
+ * this internally. New code that needs a one-shot lookup of an
+ * uncommon table (ESRT, MEMATTR, dmar, etc.) should use this
+ * directly instead of duplicating the configuration-table walk.
+ *
+ * @return the matching VendorTable, or NULL if no match or @p guid
+ *     is NULL.
+ */
+void *
+axl_efi_find_config_table(
+    const AxlGuid *guid    ///< guid to match (NULL → returns NULL)
+);
 
 // ---------------------------------------------------------------------------
 // Registry inspection (debug)

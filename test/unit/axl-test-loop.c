@@ -5,6 +5,7 @@
 #include "axl-test.h"
 #include <axl/axl-log.h>
 #include <axl/axl-loop.h>
+#include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
 // Test 1: Timer fires N times then quits
@@ -1069,6 +1070,107 @@ test_iterate_until_timeout(void)
 }
 
 // ---------------------------------------------------------------------------
+// Driver-mode attach (axl_loop_attach_driver / axl_loop_detach_driver)
+//
+// Closing the loop with axl_loop_run inside this test would mask
+// the new path: axl_loop_run's own poll_timer drives idle anyway,
+// so a counter incremented from idle proves nothing about the
+// driver-mode timer. Instead we do NOT call axl_loop_run — the
+// only thing that can fire idle is the firmware-managed
+// EVT_TIMER+EVT_NOTIFY_SIGNAL preempting at TPL_CALLBACK during
+// gBS->Stall (or gBS->WaitForEvent at any TPL <= TPL_APPLICATION).
+// We stall, watch the counter advance, then detach and assert no
+// further ticks fire.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int  tick_count;
+} DriverModeCtx;
+
+/* Idle callback fires from inside whatever axl_loop_dispatch path
+   walks idle sources. With the driver-mode timer attached and
+   axl_loop_run NOT called, the only path firing idle is the
+   driver-mode timer's notify trampoline. Each notify increments
+   tick_count by exactly 1. */
+static bool
+driver_mode_idle_increment(void *user)
+{
+    DriverModeCtx *ctx = user;
+    ctx->tick_count++;
+    return AXL_SOURCE_CONTINUE;
+}
+
+static void
+test_loop_attach_driver(void)
+{
+    /* 1. Argument validation */
+    test_check(axl_loop_attach_driver(NULL, 50) != AXL_OK,
+               "loop: attach_driver rejects NULL loop");
+    test_check(axl_loop_detach_driver(NULL) != AXL_OK,
+               "loop: detach_driver rejects NULL loop");
+
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("loop: attach_driver: loop_new alloc failed");
+        return;
+    }
+
+    test_check(axl_loop_attach_driver(loop, 0) != AXL_OK,
+               "loop: attach_driver rejects zero interval");
+
+    /* 2. Detach when not attached returns ERR */
+    test_check(axl_loop_detach_driver(loop) != AXL_OK,
+               "loop: detach_driver on un-attached loop returns ERR");
+
+    /* 3. First attach succeeds */
+    test_check(axl_loop_attach_driver(loop, 20) == AXL_OK,
+               "loop: attach_driver succeeds first time");
+
+    /* 4. Re-attach fails (must detach first) */
+    test_check(axl_loop_attach_driver(loop, 20) != AXL_OK,
+               "loop: attach_driver refuses to re-attach without detach");
+
+    /* 5. The notify actually drives axl_loop_dispatch — verify by
+       seeing the idle counter advance from a stall (no foreground
+       axl_loop_run masking the new path). 20 ms tick × 200 ms stall
+       should net 5-10 ticks; assert >= 2 to leave slack for QEMU
+       jitter. */
+    DriverModeCtx ctx = { .tick_count = 0 };
+    axl_loop_add_idle(loop, driver_mode_idle_increment, &ctx);
+
+    gBS->Stall(200000);  /* 200 ms */
+    test_check(ctx.tick_count >= 2,
+               "loop: driver-mode notify fires axl_loop_dispatch (no foreground caller)");
+    int ticks_during_attach = ctx.tick_count;
+
+    /* 6. Detach succeeds + cleans up */
+    test_check(axl_loop_detach_driver(loop) == AXL_OK,
+               "loop: detach_driver succeeds");
+
+    /* 7. After detach the timer no longer fires — counter stays
+       flat across another stall. */
+    gBS->Stall(200000);  /* 200 ms */
+    test_check(ctx.tick_count == ticks_during_attach,
+               "loop: detach_driver actually stops the timer (no further dispatch)");
+
+    /* 8. Detach is not idempotent — second call returns ERR */
+    test_check(axl_loop_detach_driver(loop) != AXL_OK,
+               "loop: second detach_driver returns ERR");
+
+    /* 9. Re-attach after detach succeeds + counter advances again */
+    test_check(axl_loop_attach_driver(loop, 20) == AXL_OK,
+               "loop: attach_driver works again after detach");
+    int ticks_before_reattach_stall = ctx.tick_count;
+    gBS->Stall(200000);  /* 200 ms */
+    test_check(ctx.tick_count > ticks_before_reattach_stall,
+               "loop: re-attached timer drives dispatch again");
+    test_check(axl_loop_detach_driver(loop) == AXL_OK,
+               "loop: detach_driver after re-attach succeeds");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1209,7 @@ test_loop_main(
     test_pubsub_reset();
     test_iterate_until_done();
     test_iterate_until_timeout();
+    test_loop_attach_driver();
 
     return test_print_results();
 }

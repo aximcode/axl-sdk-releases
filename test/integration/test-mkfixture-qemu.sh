@@ -114,6 +114,52 @@ if [[ -f "$FIX_DIR/fix/manifest.json" ]]; then
     fi
 fi
 
+# HF2.2: cpu.json must be present and well-formed JSON. On x86 the
+# arch is "x86_64" and the vendor field comes from CPUID leaf 0
+# (GenuineIntel/AuthenticAMD/etc.); on aa64 the arch is "aarch64"
+# and the doc has midr_el1 instead. Test the x86 case here since the
+# integration test is x86-only (line 19 in this file).
+if [[ -f "$FIX_DIR/fix/cpu.json" ]]; then
+    if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FIX_DIR/fix/cpu.json" 2>/dev/null; then
+        pass "cpu.json is well-formed JSON"
+    else
+        fail "cpu.json is not valid JSON"
+    fi
+    if grep -q '"arch": "x86_64"' "$FIX_DIR/fix/cpu.json"; then
+        pass "cpu.json reports arch=x86_64"
+    else
+        fail "cpu.json missing or wrong arch" \
+             "$(cat "$FIX_DIR/fix/cpu.json")"
+    fi
+    if grep -qE '"vendor": "(GenuineIntel|AuthenticAMD|TCGTCGTCGTCG)"' "$FIX_DIR/fix/cpu.json"; then
+        pass "cpu.json captures plausible CPUID vendor string"
+    else
+        fail "cpu.json vendor doesn't match known x86 patterns" \
+             "$(grep vendor "$FIX_DIR/fix/cpu.json")"
+    fi
+    if grep -qE '"family": [0-9]+' "$FIX_DIR/fix/cpu.json"; then
+        pass "cpu.json reports family"
+    else
+        fail "cpu.json missing family"
+    fi
+else
+    fail "cpu.json missing"
+fi
+
+# HF2.2: esrt.json. On QEMU/OVMF the ESRT config table is typically
+# absent — accept either "skipped — no ESRT" path (manifest skipped
+# by mkfixture) OR the file exists with valid JSON if the firmware
+# does publish one. The point: mkfixture must not crash on absence.
+if [[ -f "$FIX_DIR/fix/esrt.json" ]]; then
+    if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FIX_DIR/fix/esrt.json" 2>/dev/null; then
+        pass "esrt.json is well-formed JSON (firmware published ESRT)"
+    else
+        fail "esrt.json is not valid JSON"
+    fi
+else
+    pass "esrt.json absent (firmware did not publish ESRT — expected on OVMF)"
+fi
+
 # ----------------------------------------------------------------------
 # Replay phase: feed the captured fixture into a fresh Q35 OVMF guest
 # (NO custom SMBIOS this time) and verify the captured custom identity

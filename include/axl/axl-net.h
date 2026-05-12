@@ -8,15 +8,15 @@
  * HTTP server, HTTP client, and network utilities.
  *
  * Individual headers can be included separately:
- *   #include <axl/axl-inet-address.h>  — IP address + socket address
- *   #include <axl/axl-socket.h>        — Unified socket
- *   #include <axl/axl-socket-client.h> — DNS + connect helper
- *   #include <axl/axl-tcp.h>           — TCP sockets (low-level)
- *   #include <axl/axl-udp.h>           — UDP sockets (low-level)
- *   #include <axl/axl-url.h>           — URL parsing only
- *   #include <axl/axl-http-core.h>     — HTTP raw-buffer parsers
- *   #include <axl/axl-http-server.h>   — HTTP server
- *   #include <axl/axl-http-client.h>   — HTTP client
+ *   - `#include <axl/axl-inet-address.h>`  — IP address + socket address
+ *   - `#include <axl/axl-socket.h>`        — Unified socket
+ *   - `#include <axl/axl-socket-client.h>` — DNS + connect helper
+ *   - `#include <axl/axl-tcp.h>`           — TCP sockets (low-level)
+ *   - `#include <axl/axl-udp.h>`           — UDP sockets (low-level)
+ *   - `#include <axl/axl-url.h>`           — URL parsing only
+ *   - `#include <axl/axl-http-core.h>`     — HTTP raw-buffer parsers
+ *   - `#include <axl/axl-http-server.h>`   — HTTP server
+ *   - `#include <axl/axl-http-client.h>`   — HTTP client
  */
 
 #ifndef AXL_NET_H
@@ -158,6 +158,72 @@ axl_net_auto_init(
  */
 int
 axl_net_ensure_drivers(void);
+
+/**
+ * @brief Load drivers, connect SNP, wait for link.
+ *
+ * Decoupled from address assignment — does NOT run DHCP and does NOT
+ * touch IP4Config2. Composes axl_net_ensure_drivers + per-handle
+ * SNP reconnect + a 5 s link-up poll, which is the front half of
+ * axl_net_auto_init.
+ *
+ * Used directly by axl_net_bring_up's static-IP path (where the
+ * DHCP wait that auto_init would otherwise burn is dead time) and
+ * internally by axl_net_auto_init. Consumers that want IP
+ * assignment should call axl_net_bring_up or axl_net_auto_init
+ * — those layer DHCP / static configuration on top of this primitive.
+ *
+ * @return AXL_OK on success (at least one NIC link came up); AXL_ERR if
+ *     no NIC link was detected within the 5 s wait. Drivers and SNP
+ *     reconnect are best-effort — failures there are not surfaced.
+ */
+int
+axl_net_drivers_up(void);
+
+/**
+ * @brief Bring up networking with a single call — drivers + DHCP or
+ *     static IP + address read-back.
+ *
+ * Composes the typical "what every networked tool does at startup"
+ * sequence into one call so consumers don't reinvent it. Behavior is
+ * controlled by @p static_ipv4:
+ *
+ *   - @p static_ipv4 == NULL → DHCP. Calls axl_net_auto_init
+ *     (which itself runs axl_net_drivers_up and waits up to
+ *     @p timeout_sec for a lease).
+ *
+ *   - @p static_ipv4 != NULL → static. Calls axl_net_drivers_up
+ *     (load drivers + link wait, no DHCP timeout), then
+ *     axl_net_set_static_ip with @p netmask (defaulting to
+ *     `255.255.255.0` if NULL) and @p gateway (NULL = no gateway).
+ *     Sleeps 500 ms after to let IP4Config2 apply the change — the
+ *     firmware applies the policy + address asynchronously and a
+ *     subsequent @c GetData can still report the prior state without
+ *     the settle.
+ *
+ * In either case, on success @p addr_out is populated via
+ * axl_net_get_ip_address (skipped if @p addr_out is NULL).
+ *
+ * Used by HTTP services (axl-webfs and similar), REST tools, and
+ * one-shot fetch-style utilities — they all open with the same
+ * "load drivers, get an IP, here's my address" preamble. AxlService
+ * is NOT on the call path; this is plain network bring-up, callable
+ * from any AXL-consuming code.
+ *
+ * @return AXL_OK on success (network up, IP acquired, @p addr_out
+ *     populated if non-NULL); AXL_ERR if drivers couldn't be loaded,
+ *     no NIC came up, DHCP timed out, or static-IP configuration
+ *     failed.
+ */
+int
+axl_net_bring_up(
+    size_t            nic_index,    ///< NIC index (SIZE_MAX = auto-select)
+    const uint8_t    *static_ipv4,  ///< NULL = DHCP; non-NULL = 4-byte static IPv4
+    const uint8_t    *netmask,      ///< 4-byte netmask (NULL = 255.255.255.0); ignored on DHCP path
+    const uint8_t    *gateway,      ///< 4-byte gateway (NULL = none); ignored on DHCP path
+    size_t            timeout_sec,  ///< DHCP wait (0 = 10 s default; ignored on static path)
+    AxlIPv4Address   *addr_out      ///< [out] resolved IPv4 (NULL = caller doesn't care)
+);
 
 /**
  * @brief Configure a static IPv4 address on a NIC.

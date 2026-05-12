@@ -396,8 +396,7 @@ run_cat(AxlArgs *a)
     return (errors > 0) ? 1 : 0;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(cat)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name        = "cat",

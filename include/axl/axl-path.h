@@ -101,11 +101,11 @@ axl_path_resolve(
  *     pattern: load `jedec.json5` from the directory holding the
  *     binary that just started running, etc.).
  *
- * Equivalent to @ref axl_path_join with the dirname of @p anchor as
+ * Equivalent to axl_path_join with the dirname of @p anchor as
  * the directory portion. Returns just @p name (joined with "."/empty)
  * if @p anchor has no directory component. NULL-safe.
  *
- * Caller frees with @ref axl_free.
+ * Caller frees with axl_free.
  *
  * @code
  * char *cfg = axl_path_companion(axl_app_argv0(), "jedec.json5");
@@ -130,17 +130,17 @@ axl_path_companion(
  *   1. If @p override_path is non-NULL and the file exists, use it.
  *   2. Companion path beside the running binary. Two anchors are
  *      tried in order:
- *        a. @ref axl_app_image_path — canonical FILEPATH from
+ *        a. axl_app_image_path — canonical FILEPATH from
  *           EFI_LOADED_IMAGE_PROTOCOL. Reliable regardless of how
  *           the shell invoked the binary (basename vs full path,
  *           cwd-rooted vs absolute).
- *        b. @ref axl_app_argv0 — the shell-supplied invocation
+ *        b. axl_app_argv0 — the shell-supplied invocation
  *           string. Fallback for synthetic load contexts where the
  *           image path is unavailable.
  *   3. @p name as-is (current working directory).
  *
  * Returns the first path that exists. Caller must axl_free() the
- * returned string. The check uses @ref axl_file_info, so the file
+ * returned string. The check uses axl_file_info, so the file
  * must be readable at lookup time.
  *
  * @code

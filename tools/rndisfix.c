@@ -253,8 +253,7 @@ run_rndisfix(AxlArgs *a)
     return failed == 0 ? 0 : 1;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(rndisfix)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "rndisfix",

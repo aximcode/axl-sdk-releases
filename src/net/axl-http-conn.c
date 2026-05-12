@@ -211,54 +211,14 @@ dispatch_and_respond(
 {
     dispatch_request(s, conn);
 
-    //
-    // WebSocket upgrade or upload stream — already handled, do not reset
-    //
-    if (conn->is_websocket || conn->is_upload_stream) {
-        return;
-    }
-
-    //
-    // After dispatch, either keep alive or close
-    //
-    if (conn->keep_alive) {
-        //
-        // Reset for next request on same connection
-        //
-        axl_free(conn->method);
-        conn->method = NULL;
-
-        axl_free(conn->path);
-        conn->path = NULL;
-
-        axl_free(conn->query);
-        conn->query = NULL;
-
-        if (conn->headers != NULL) {
-            axl_hash_table_free(conn->headers);
-            conn->headers = NULL;
-        }
-
-        if (conn->body != NULL) {
-            axl_free(conn->body);
-            conn->body = NULL;
-        }
-
-        conn->header_len      = 0;
-        conn->headers_done    = false;
-        conn->content_length  = 0;
-        conn->body_bytes_read = 0;
-        conn->body_alloc      = 0;
-        conn->chunked         = false;
-        conn->chunked_done    = false;
-
-        //
-        // Start reading next request on the same connection
-        //
-        start_conn_recv(s, conn);
-    } else {
-        reset_connection(conn);
-    }
+    /* Post-send work — keep-alive vs close — runs from
+       on_response_sent (axl-http-response.c) when the async send
+       completes. The websocket and upload-stream branches sequence
+       their own follow-up sends and don't go through send_response,
+       so dispatch_request already returned them in their final
+       state. Nothing left for this function to do. */
+    (void)s;
+    (void)conn;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,9 +232,43 @@ reset_connection(HttpConn *conn)
         return;
     }
 
+    /* Free any in-flight response buffer. axl_tcp_close below will
+       cancel an outstanding send (and that cancel removes the
+       send_source from the loop), so on_response_sent won't fire to
+       free this for us. Safety-net here avoids the leak. */
+    if (conn->tx_buf != NULL) {
+        axl_free(conn->tx_buf);
+        conn->tx_buf = NULL;
+    }
+
+    /* Streaming response state: same race as tx_buf — the producer
+       owns ctx (file handle, generated-data state), and our cleanup
+       hook is the only thing that can release it cleanly when the
+       client disconnects mid-stream. end_stream_state is no-op when
+       no stream is active, so always safe to call. */
+    end_stream_state(conn);
+
     /* Fire WebSocket DISCONNECT while transport is still open */
     if (conn->is_websocket && conn->ws_handler != NULL) {
         conn->ws_handler(AXL_WS_DISCONNECT, NULL, 0, conn->ws_data);
+    }
+
+    /* Fire upload-handler abort signal while transport is still open
+       and the handler's req/data are still valid. The handler
+       accumulated per-request state (open file handles, partial
+       writes) across earlier chunk calls — without this notification
+       that state hangs into the next request and corrupts it. Mirror
+       of the WebSocket DISCONNECT just above. Clear is_upload_stream
+       immediately so on_response_sent's upload-stream cleanup path
+       (which would normally fire after a clean response) doesn't also
+       run — we own the teardown from here. */
+    if (conn->is_upload_stream && conn->upload_route != NULL &&
+        conn->upload_route->upload_handler != NULL) {
+        conn->upload_route->upload_handler(
+            &conn->upload_req, &conn->upload_resp,
+            NULL, 0, conn->upload_route->data, true);
+        conn->is_upload_stream = false;
+        conn->upload_route     = NULL;
     }
 
     if (conn->tls_ctx != NULL) {

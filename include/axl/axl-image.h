@@ -9,7 +9,7 @@
     backend the same shape would map to `posix_spawn` or
     `execve`-style entry; on coreboot stages, to their loader.
     Consumer code never references `EFI_HANDLE` or
-    `EFI_LOADED_IMAGE_PROTOCOL` directly — the @ref AxlImage handle
+    `EFI_LOADED_IMAGE_PROTOCOL` directly — the AxlImage handle
     is opaque.
 
     @code

@@ -107,6 +107,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-pci.h>
 #include <axl/axl-str.h>
+#include <axl/axl-wait.h>
 
 AXL_LOG_DOMAIN("smbus-piix4");
 
@@ -176,11 +177,14 @@ AXL_LOG_DOMAIN("smbus-piix4");
 #define PIIX4_POLL_INTERVAL_US  50
 #define PIIX4_POLL_TIMEOUT_US   (100 * 1000)
 
-/* IMC semaphore retry budget — 2000 × 1ms stall = 2 seconds total.
- * Linux's MAX_TIMEOUT for the equivalent loop is around 500ms; 2s is
- * conservative for the rare case where the IMC is busy. */
-#define PIIX4_IMC_RETRY_MAX     2000
-#define PIIX4_IMC_RETRY_STALL_US 1000
+/* IMC semaphore retry budget — 2000 × 1 ms = 2 seconds total. Linux's
+ * MAX_TIMEOUT for the equivalent loop is around 500 ms; 2 s is
+ * conservative for the rare case where the IMC is busy. The 1 ms
+ * inter-retry sleep is event-driven (axl_msleep, not axl_backend_stall)
+ * so the host CPU idles while we wait — busy-spinning was a 100% CPU
+ * waste in the worst case. */
+#define PIIX4_IMC_RETRY_MAX        2000
+#define PIIX4_IMC_RETRY_SLEEP_MS   1
 
 // ---------------------------------------------------------------------------
 // Per-session state
@@ -285,7 +289,7 @@ piix4_imc_acquire(Piix4Ctx *p, uint8_t *save)
         if (cur & PIIX4_SLV_REQ) {
             return 0;
         }
-        axl_backend_stall(PIIX4_IMC_RETRY_STALL_US);
+        axl_msleep(PIIX4_IMC_RETRY_SLEEP_MS);
     }
     axl_warning("piix4 IMC semaphore acquire timeout @ port 0x%x (last=0x%02x)",
                 (unsigned)p->base, cur);

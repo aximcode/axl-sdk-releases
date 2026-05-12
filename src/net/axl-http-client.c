@@ -529,6 +529,15 @@ read_chunked_body(
     return 0;
 }
 
+/* Body framing: at most one of (contiguous) or (streamer) is set.
+   - body != NULL, body_size > 0  → contiguous body, Content-Length: body_size.
+   - streamer != NULL            → producer-callback body. If
+                                     stream_total_size == (size_t)-1 the
+                                     framing is Transfer-Encoding:
+                                     chunked; otherwise Content-Length:
+                                     stream_total_size with byte-count
+                                     verification at EOF.
+   - both NULL                    → no body. */
 static int
 do_request(
     AxlHttpClient          *c,
@@ -536,6 +545,9 @@ do_request(
     const char             *url,
     const void             *body,
     size_t                  body_size,
+    AxlRequestBodyStreamer  streamer,
+    void                   *stream_ctx,
+    size_t                  stream_total_size,
     const char             *content_type,
     AxlHashTable           *extra_headers,
     AxlHttpClientResponse **resp,
@@ -603,11 +615,26 @@ do_request(
     req_len += axl_snprintf(req_buf + req_len, sizeof(req_buf) - req_len,
                             "Host: %s\r\n", parsed->host);
 
+    bool stream_chunked = false;
     if (body != NULL && body_size > 0) {
         req_len += axl_snprintf(req_buf + req_len,
                                 sizeof(req_buf) - req_len,
                                 "Content-Length: %llu\r\n",
                                 (unsigned long long)body_size);
+    } else if (streamer != NULL) {
+        if (stream_total_size == (size_t)-1) {
+            req_len += axl_snprintf(req_buf + req_len,
+                                    sizeof(req_buf) - req_len,
+                                    "Transfer-Encoding: chunked\r\n");
+            stream_chunked = true;
+        } else {
+            req_len += axl_snprintf(req_buf + req_len,
+                                    sizeof(req_buf) - req_len,
+                                    "Content-Length: %llu\r\n",
+                                    (unsigned long long)stream_total_size);
+        }
+    }
+    if ((body != NULL && body_size > 0) || streamer != NULL) {
         if (content_type != NULL) {
             req_len += axl_snprintf(req_buf + req_len,
                                     sizeof(req_buf) - req_len,
@@ -647,12 +674,14 @@ do_request(
     req_len += axl_snprintf(req_buf + req_len,
                             sizeof(req_buf) - req_len, "\r\n");
 
-    /* Send request (with auto-reconnect on stale connection) */
+    /* Send request (with auto-reconnect on stale connection).
+       The retry path replays the header send — safe because the
+       header buffer is still valid. For streaming bodies, retry
+       is permitted only on a header-send failure BEFORE any body
+       bytes have been pulled from the streamer (the streamer is a
+       one-shot pipe). The producer's first pull happens below, so
+       retrying the header send is still safe here. */
     if (client_send(c, req_buf, req_len) != AXL_OK) {
-        /*
-         * Send failed — likely a stale connection (peer closed).
-         * Close, reconnect, and retry once.
-         */
         if (c->tls_ctx != NULL) {
             axl_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
@@ -670,11 +699,76 @@ do_request(
         }
     }
 
-    /* Send body if present */
+    /* Send body if present. Three modes: contiguous, streaming
+       with Content-Length, streaming with chunked transfer. */
     if (body != NULL && body_size > 0) {
         if (client_send(c, body, body_size) != AXL_OK) {
             axl_url_free(parsed);
             return -1;
+        }
+    } else if (streamer != NULL) {
+        /* 8 KiB pull buffer — same size class the upload-route
+           uses on the server side. Stack-resident. */
+        unsigned char chunk[8192];
+        uint64_t bytes_sent = 0;
+        for (;;) {
+            size_t got = 0;
+            if (streamer(stream_ctx, chunk, sizeof(chunk), &got) != AXL_OK) {
+                axl_warning("streaming request body: producer returned error");
+                axl_url_free(parsed);
+                return -1;
+            }
+            if (got == 0) {
+                /* End of body. */
+                if (stream_chunked) {
+                    static const char eof_chunk[] = "0\r\n\r\n";
+                    if (client_send(c, eof_chunk,
+                                    sizeof(eof_chunk) - 1) != AXL_OK)
+                    {
+                        axl_url_free(parsed);
+                        return -1;
+                    }
+                } else if (bytes_sent != stream_total_size) {
+                    axl_error("streaming request body: producer EOF after "
+                              "%llu bytes, declared Content-Length %llu",
+                              (unsigned long long)bytes_sent,
+                              (unsigned long long)stream_total_size);
+                    axl_url_free(parsed);
+                    return -1;
+                }
+                break;
+            }
+            if (stream_chunked) {
+                char hex_hdr[32];
+                int hlen = axl_snprintf(hex_hdr, sizeof(hex_hdr),
+                                        "%zx\r\n", got);
+                if (hlen < 0 || (size_t)hlen >= sizeof(hex_hdr)) {
+                    axl_url_free(parsed);
+                    return -1;
+                }
+                if (client_send(c, hex_hdr, (size_t)hlen) != AXL_OK ||
+                    client_send(c, chunk, got) != AXL_OK ||
+                    client_send(c, "\r\n", 2) != AXL_OK)
+                {
+                    axl_url_free(parsed);
+                    return -1;
+                }
+            } else {
+                /* Content-Length transfer: defend against a producer
+                   overshooting the declared length. */
+                if (bytes_sent + got > stream_total_size) {
+                    axl_error("streaming request body: producer over-ran "
+                              "declared Content-Length %llu",
+                              (unsigned long long)stream_total_size);
+                    axl_url_free(parsed);
+                    return -1;
+                }
+                if (client_send(c, chunk, got) != AXL_OK) {
+                    axl_url_free(parsed);
+                    return -1;
+                }
+            }
+            bytes_sent += got;
         }
     }
 
@@ -690,7 +784,12 @@ do_request(
              * may have been reset between send and recv. Reconnect and
              * retry the entire request.
              */
-            if (total_recv == 0 && !c->retry_attempted) {
+            if (total_recv == 0 && !c->retry_attempted &&
+                streamer == NULL)
+            {
+                /* Stale-connection retry: only safe when the body is
+                   contiguous (or absent). Streaming bodies have
+                   already drained their producer; we can't replay. */
                 axl_tcp_close(c->sock);
                 c->sock = NULL;
                 axl_free(c->connected_host);
@@ -698,6 +797,7 @@ do_request(
                 c->retry_attempted = true;
                 axl_url_free(parsed);
                 return do_request(c, method, url, body, body_size,
+                                  streamer, stream_ctx, stream_total_size,
                                   content_type, extra_headers,
                                   resp, redirect_count);
             }
@@ -748,10 +848,14 @@ do_request(
         return -1;
     }
 
-    /* Handle redirects */
+    /* Handle redirects. Streaming bodies can't be replayed, so a
+       redirect on a streaming request is reported as success at
+       the redirect status — caller decides whether to issue a
+       fresh request with a new streamer. */
     if ((status_code == 301 || status_code == 302 ||
          status_code == 307) &&
-        redirect_count < (size_t)c->max_redirects)
+        redirect_count < (size_t)c->max_redirects &&
+        streamer == NULL)
     {
         const char *location = (const char *)axl_hash_table_lookup(
             resp_headers, "location");
@@ -769,7 +873,8 @@ do_request(
             c->connected_host = NULL;
 
             int rc = do_request(c, method, redirect_url, body,
-                                body_size, content_type, extra_headers,
+                                body_size, NULL, NULL, 0,
+                                content_type, extra_headers,
                                 resp, redirect_count + 1);
             axl_free(redirect_url);
             return rc;
@@ -902,7 +1007,8 @@ axl_http_get(AxlHttpClient *c, const char *url,
     }
 
     c->retry_attempted = false;
-    return do_request(c, "GET", url, NULL, 0, NULL, NULL, out_resp, 0);
+    return do_request(c, "GET", url, NULL, 0, NULL, NULL, 0, NULL, NULL,
+                      out_resp, 0);
 }
 
 int
@@ -915,8 +1021,9 @@ axl_http_post(AxlHttpClient *c, const char *url, const void *body,
     }
 
     c->retry_attempted = false;
-    return do_request(c, "POST", url, body, (size_t)size, content_type,
-                      NULL, out_resp, 0);
+    return do_request(c, "POST", url, body, (size_t)size,
+                      NULL, NULL, 0,
+                      content_type, NULL, out_resp, 0);
 }
 
 int
@@ -929,8 +1036,9 @@ axl_http_put(AxlHttpClient *c, const char *url, const void *body,
     }
 
     c->retry_attempted = false;
-    return do_request(c, "PUT", url, body, (size_t)size, content_type,
-                      NULL, out_resp, 0);
+    return do_request(c, "PUT", url, body, (size_t)size,
+                      NULL, NULL, 0,
+                      content_type, NULL, out_resp, 0);
 }
 
 int
@@ -942,7 +1050,9 @@ axl_http_delete(AxlHttpClient *c, const char *url,
     }
 
     c->retry_attempted = false;
-    return do_request(c, "DELETE", url, NULL, 0, NULL, NULL, out_resp, 0);
+    return do_request(c, "DELETE", url, NULL, 0,
+                      NULL, NULL, 0,
+                      NULL, NULL, out_resp, 0);
 }
 
 int
@@ -957,7 +1067,91 @@ axl_http_request(AxlHttpClient *c, const char *method, const char *url,
 
     c->retry_attempted = false;
     return do_request(c, method, url, body, (size_t)body_size,
+                      NULL, NULL, 0,
                       content_type, extra_headers, out_resp, 0);
+}
+
+/* Adapter that pulls the producer's bytes out of an AxlStream via
+   axl_read. Lets axl_http_request_stream_file (and any other
+   "stream-backed body" wrapper consumers add) share the streaming
+   transport with the raw-callback path. */
+static int
+stream_producer_adapter(void *ctx, void *out_buf, size_t out_buf_size,
+                        size_t *out_size)
+{
+    AxlStream  *s = ctx;
+    axl_ssize_t n = axl_read(s, out_buf, out_buf_size);
+    if (n < 0) {
+        return AXL_ERR;
+    }
+    *out_size = (size_t)n;
+    return AXL_OK;
+}
+
+static void
+stream_producer_cleanup(void *ctx)
+{
+    axl_fclose((AxlStream *)ctx);
+}
+
+int
+axl_http_request_stream_file(AxlHttpClient *c, const char *method,
+                             const char *url, const char *path,
+                             const char *content_type,
+                             AxlHashTable *extra_headers,
+                             AxlHttpClientResponse **out_resp)
+{
+    AxlFileInfo info;
+    if (c == NULL || method == NULL || url == NULL || path == NULL) {
+        return AXL_ERR;
+    }
+    if (axl_file_info(path, &info) != AXL_OK) {
+        axl_warning("stream_file: cannot stat '%s'", path);
+        return AXL_ERR;
+    }
+    if (info.is_dir) {
+        axl_warning("stream_file: '%s' is a directory", path);
+        return AXL_ERR;
+    }
+    AxlStream *src = axl_fopen(path, "r");
+    if (src == NULL) {
+        axl_warning("stream_file: cannot open '%s' for read", path);
+        return AXL_ERR;
+    }
+    /* Hand the stream off as the producer ctx — cleanup callback
+       closes it on completion (success OR error). */
+    return axl_http_request_streaming(
+        c, method, url,
+        stream_producer_adapter, src, stream_producer_cleanup,
+        (size_t)info.size, content_type, extra_headers, out_resp);
+}
+
+int
+axl_http_request_streaming(AxlHttpClient *c, const char *method,
+                           const char *url,
+                           AxlRequestBodyStreamer streamer, void *ctx,
+                           void (*cleanup_fn)(void *ctx),
+                           size_t total_size,
+                           const char *content_type,
+                           AxlHashTable *extra_headers,
+                           AxlHttpClientResponse **out_resp)
+{
+    if (c == NULL || method == NULL || url == NULL || streamer == NULL) {
+        if (cleanup_fn != NULL) {
+            cleanup_fn(ctx);
+        }
+        return AXL_ERR;
+    }
+    c->retry_attempted = false;
+    int rc = do_request(c, method, url, NULL, 0,
+                        streamer, ctx, total_size,
+                        content_type, extra_headers, out_resp, 0);
+    /* Cleanup fires regardless of success — consumer doesn't need
+       to thread free-on-error through every callsite. */
+    if (cleanup_fn != NULL) {
+        cleanup_fn(ctx);
+    }
+    return rc;
 }
 
 void

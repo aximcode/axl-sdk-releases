@@ -17,6 +17,28 @@
 #include <axl/axl-net.h>
 
 // ---------------------------------------------------------------------------
+// Service-binding locator — shared between TCP, UDP, and any future
+// per-NIC protocol that follows the select-then-CreateChild pattern.
+// Walks all handles publishing @p sb_guid:
+//   1. forced_source non-NULL: pick the handle whose IP4Config2
+//      InterfaceInfo.StationAddress exactly matches (or fail).
+//   2. Else skip handles with StationAddress == 0.0.0.0.
+//   3. Else prefer a handle whose subnet contains @p dest.
+//   4. Else fall back to the first valid handle.
+// `dest == NULL` and `forced_source == NULL` is the default auto
+// path (e.g. for a listener with no destination). Returns
+// EFI_NOT_FOUND if no usable handle exists.
+// ---------------------------------------------------------------------------
+EFI_STATUS
+axl_net_locate_sb(
+    const EFI_GUID                 *sb_guid,
+    const EFI_IPv4_ADDRESS         *dest,
+    const EFI_IPv4_ADDRESS         *forced_source,
+    EFI_SERVICE_BINDING_PROTOCOL  **sb,
+    EFI_HANDLE                     *out_handle
+);
+
+// ---------------------------------------------------------------------------
 // HTTP Core — internal helpers (raw-buffer parsers are public, see
 // <axl/axl-http-core.h>; this file declares only the internal builders.)
 // ---------------------------------------------------------------------------

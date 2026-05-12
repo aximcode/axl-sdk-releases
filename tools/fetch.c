@@ -40,8 +40,11 @@ static const AxlArgDesc flags[] = {
     { .name = "secure",      .short_name = 'S', .type = AXL_ARG_BOOL,
       .help = "Verify TLS certificate (default: off; UEFI has no CA bundle)" },
 #endif
-    { .name = "source",                          .type = AXL_ARG_STRING,
-      .help = "Pin connect to interface with this station IPv4 (auto if unset)" },
+    { .name = "source-ip",                        .type = AXL_ARG_STRING,
+      .help = "Outbound bind IPv4 (empty = kernel-chosen source)" },
+    { .name = "nic",                              .type = AXL_ARG_U64,
+      .default_value = AXL_NET_NIC_AUTO_STR,
+      .help = "NIC index for DHCP target (default: auto-select first usable)" },
     {0}
 };
 
@@ -127,24 +130,13 @@ run_fetch(AxlArgs *a)
 {
     const char *url = axl_args_get_string(a, "url");
 
-    /* Auto-load NIC drivers + DHCP so Fetch works from a bare UEFI shell. */
-    switch (axl_net_ensure_drivers()) {
-    case AXL_NET_DRIVERS_OK:
-        break;
-    case AXL_NET_DRIVERS_NOT_FOUND:
-        axl_printf("Fetch: no NIC drivers found in drivers/<arch>/ "
-                   "on any mounted volume.\n");
-        return 1;
-    case AXL_NET_DRIVERS_NO_LINK:
-        axl_printf("Fetch: drivers loaded but no NIC came up — "
-                   "is a NIC plugged in?\n");
-        return 1;
-    default:
-        axl_printf("Fetch: failed to bring up networking.\n");
-        return 1;
-    }
-    if (axl_net_auto_init(SIZE_MAX, 10) != AXL_OK) {
-        axl_printf("Fetch: no IP address — DHCP did not complete.\n");
+    /* Auto-load NIC drivers + DHCP so Fetch works from a bare UEFI
+       shell. Static IPv4 setup is the firmware ifconfig layer's job
+       (UEFI Shell `ifconfig` or axl_net_set_static_ip), not a
+       per-tool option. */
+    if (axl_net_init(axl_args_get_uint(a, "nic"), 10) != AXL_OK) {
+        axl_printf("Fetch: networking unavailable "
+                   "(NIC driver, link, or DHCP setup failed).\n");
         return 1;
     }
 
@@ -234,7 +226,7 @@ run_fetch(AxlArgs *a)
     }
 #endif
 
-    const char *source = axl_args_get_string(a, "source");
+    const char *source = axl_args_get_string(a, "source-ip");
     if (source != NULL && source[0] != '\0') {
         axl_http_client_set(client, "source.ip", source);
     }
@@ -321,8 +313,7 @@ run_fetch(AxlArgs *a)
     return exit_status;
 }
 
-int
-main(int argc, char **argv)
+AXL_TOOL_MAIN(fetch)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "Fetch",

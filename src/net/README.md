@@ -39,26 +39,97 @@ Application
 
 ### Network Initialization
 
+The recommended one-call shape is `axl_net_bring_up` — load drivers,
+acquire an IP (DHCP or static), optionally read it back. Used by
+HTTP services, REST tools, and one-shot fetch utilities — they all
+open with the same preamble:
+
 ```c
-// Auto-init: load drivers, run DHCP, wait for IP
-if (axl_net_auto_init(SIZE_MAX, 10) != 0) {
+// DHCP — most common case
+if (axl_net_bring_up(SIZE_MAX, NULL, NULL, NULL, 10, NULL) != AXL_OK) {
     axl_printf("Network not available\n");
     return -1;
 }
 
-// Or configure static IP
-uint8_t ip[]      = {192, 168, 1, 100};
-uint8_t netmask[] = {255, 255, 255, 0};
-uint8_t gateway[] = {192, 168, 1, 1};
-axl_net_set_static_ip(0, ip, netmask, gateway);
+// Static IP — pass the address (NULL netmask = /24 default,
+// NULL gateway = none); also reads the resolved address back.
+uint8_t  ip[] = { 192, 168, 1, 100 };
+AxlIPv4Address addr;
+if (axl_net_bring_up(SIZE_MAX, ip, NULL, NULL, 0, &addr) != AXL_OK) {
+    return -1;
+}
 ```
+
+### Standard option helpers
+
+Most consumers (tools, services) take the same NIC / local-IP /
+port options on the command line and run the same DHCP bring-up
+preamble. `<axl/axl-net-opts.h>` ships a canonical option bag
+plus a one-call init helper:
+
+```c
+typedef struct {
+    AxlNetOpts net;          // embed as sub-struct
+    const char *url;
+    bool        verbose;
+} MyOpts;
+
+// DHCP bring-up driven by the bag — maps AXL_NET_NIC_AUTO to
+// SIZE_MAX and runs axl_net_bring_up under the hood:
+if (axl_net_init_from_opts(&opts.net, 10) != AXL_OK) {
+    axl_printf("network unavailable\n");
+    return 1;
+}
+
+// Use opts.net.local_ip for the local socket bind — outbound
+// source for clients, listen address for servers (same bind(2)).
+```
+
+The bag carries three fields:
+
+- `nic_index` — which NIC to DHCP on; `AXL_NET_NIC_AUTO` picks the
+  first usable one.
+- `local_ip` — IPv4 to `bind(2)` the local socket end to.
+  Outbound source for clients (curl `--interface`-style),
+  listen address for servers — same syscall, role implied by
+  what the consumer does next.
+- `port` — `uint16_t`; consumers define their own domain default.
+
+**Out of scope by design**: installing a static IPv4 on the NIC.
+That's a firmware-`ifconfig`-layer concern (UEFI Shell
+`ifconfig`, or `axl_net_set_static_ip` for tools that genuinely
+need to mutate `IP4Config2` policy). The options bag is for
+stateless connection-side selectors only.
+
+Pair with the descriptor-table composition helpers in
+`<axl/axl-config.h>` (`axl_config_descs_net`,
+`axl_config_descs_append`) to also inject the matching CLI / config
+descriptors into a consumer's own table without copy-paste — see
+the AxlConfig docs. The `AXL_NET_OPT_SOURCE_IP` and
+`AXL_NET_OPT_LISTEN_IP` selector bits both target the same
+`local_ip` field; they differ only in CLI vocabulary
+(`--source-ip` vs `--listen-ip`).
+
+Three layered primitives sit underneath if a consumer needs finer
+control:
+
+- `axl_net_drivers_up()` — load NIC drivers, connect SNP, wait for
+  link-up (5 s budget). No DHCP, no IP assignment.
+- `axl_net_auto_init(nic, dhcp_timeout)` — drivers_up + DHCP wait.
+  Used by the DHCP path of `bring_up` internally. Event-driven
+  via `EFI_IP4_CONFIG2_PROTOCOL.RegisterDataNotify` —
+  sub-millisecond wakeup after DHCP completes (firmware that
+  doesn't support the notify falls back to a 1 s tick).
+- `axl_net_set_static_ip(nic, ip, netmask, gateway)` — raw
+  IP4Config2 setter; static path of `bring_up` calls it after
+  `drivers_up`.
 
 ## Socket Layer
 
 `AxlSocket` is the recommended socket API for new code — a
 GLib-`GSocket`-shaped abstraction over both stream (TCP) and datagram
 (UDP) transports, with rich address types and blocking and async
-forms. It delegates to the low-level `AxlTcp` / `AxlUdpSocket`
+forms. It delegates to the low-level `AxlTcp` / `AxlUdp`
 primitives under the hood (see the [Low-Level TCP / UDP](#low-level-tcp--udp)
 section below).
 
@@ -187,7 +258,7 @@ stays-armed mode (callback returns `true` to keep receiving).
 ## Low-Level TCP / UDP
 
 > Most applications should use the [Socket Layer](#socket-layer)
-> above. `AxlTcp` and `AxlUdpSocket` are the primitives underneath --
+> above. `AxlTcp` and `AxlUdp` are the primitives underneath --
 > thin wrappers over UEFI's `TCP4_PROTOCOL` / `UDP4_PROTOCOL`. Reach
 > for them only when you need raw access to UEFI tokens, want the
 > session-scoped cancellation pattern shown below, or are minimizing
@@ -261,16 +332,24 @@ axl_cancellable_cancel(s->cancel);
 
 ### UDP Sockets
 
-Fire-and-forget datagram sending and request-response patterns.
+Fire-and-forget datagram sending, request-response patterns, plus
+async receive / send and connection-style peer locking. Mirrors
+`AxlTcp`'s async / cancellable / source-IP-pinning shape.
 
 ```c
-AXL_AUTOPTR(AxlUdpSocket) sock = NULL;
-axl_udp_open(&sock, 0);  // ephemeral port
+AXL_AUTOPTR(AxlUdp) sock = NULL;
+axl_udp_open(&sock, 0);                 // ephemeral local port
+// or pin to a specific NIC:
+// axl_udp_open_via(&sock, 0, &source_ip);
+
+uint16_t bound;
+char     bound_addr[16];
+axl_udp_get_local_addr(sock, bound_addr, sizeof(bound_addr), &bound);
 
 AxlIPv4Address dest;
 axl_ipv4_parse("192.168.1.100", dest.addr);
 
-// Fire-and-forget
+// Fire-and-forget (sync, 2 s timeout)
 axl_udp_send(sock, &dest, 514, msg, msg_len);
 
 // Request-response (e.g., DNS query)
@@ -278,6 +357,44 @@ char reply[512];
 size_t reply_len;
 axl_udp_sendrecv(sock, &dest, 53, query, query_len,
                  reply, sizeof(reply), &reply_len, 3000);
+```
+
+**Async send + receive**, with optional `AxlCancellable`:
+
+```c
+bool on_recv(AxlUdp *s, AxlStatus status, const void *data, size_t len,
+             const AxlIPv4Address *from, uint16_t from_port, void *udata) {
+    if (status != AXL_OK) return false;   // err / cancel — stop
+    process(data, len, from);
+    return true;                          // re-arm for next datagram
+}
+axl_udp_recv_async(sock, loop, /*cancel=*/NULL, on_recv, NULL);
+
+bool on_sent(AxlUdp *s, AxlStatus status, void *udata) {
+    if (status != AXL_OK) log_warn("send failed");
+    return true;                          // ignored for send
+}
+axl_udp_send_async(sock, &dest, 514, msg, msg_len,
+                   loop, /*cancel=*/NULL, on_sent, NULL);
+```
+
+**Connection-style peer lock** — kernel-side recv filter plus
+NULL-`dest` shorthand on send:
+
+```c
+axl_udp_connect(sock, &peer, 9999);
+axl_udp_send(sock, NULL, 0, msg, msg_len);   // uses configured peer
+axl_udp_disconnect(sock);                    // back to "send anywhere"
+```
+
+**Multicast / broadcast:**
+
+```c
+AxlIPv4Address mdns = { .addr = {224, 0, 0, 251} };
+axl_udp_join_multicast(sock, &mdns);      // mDNS group
+axl_udp_set_broadcast(sock, true);        // accept inbound broadcasts
+// ... receive ...
+axl_udp_leave_multicast(sock, NULL);      // leave all groups
 ```
 
 ## HTTP Server
@@ -294,9 +411,133 @@ axl_http_server_add_route(s, "GET", "/hello", on_hello, NULL);
 axl_http_server_run(s);  // blocks, serving requests
 ```
 
+For multiple routes, the variadic batch form collapses the per-call
+error checks into one:
+
+```c
+axl_http_server_add_routes(s,
+    "GET",  "/version", on_version, NULL,
+    "GET",  "/health",  on_health,  NULL,
+    "POST", "/echo",    on_echo,    NULL,
+    NULL);   // sentinel — required
+```
+
+### REST request helpers
+
+For REST-shaped handlers, three helpers route through the
+existing HTTP machinery so routes don't reinvent content
+negotiation or JSON body parsing:
+
+```c
+int handle_request(AxlHttpRequest *req, AxlHttpResponse *resp, void *data) {
+    if (axl_http_request_wants_json(req)) {
+        // ...emit JSON
+    }
+
+    AxlJsonReader r;
+    if (axl_http_request_get_json(req, &r)) {
+        int64_t value;
+        if (axl_json_get_int(&r, "key", &value)) { /* ... */ }
+        axl_json_free(&r);
+    }
+    return 0;
+}
+```
+
+`axl_http_request_accepts(req, mime)` is the underlying primitive
+(case-insensitive, multi-type lists, wildcards, q-value tolerant).
+`_wants_json` is the `application/json` shorthand. `_get_json`
+parses `req->body` into a caller-owned `AxlJsonReader` (caller
+frees with `axl_json_free`).
+
 The server supports middleware, WebSocket endpoints, authentication,
-response caching, and streaming uploads. See the API reference for
-details.
+response caching, streaming uploads, and WebDAV mounts. See the
+API reference for details.
+
+### WebDAV class-1 + MOVE/COPY
+
+`axl_http_server_add_webdav(s, prefix, &ops, user_data)` mounts
+a WebDAV handler at the given URL prefix. Verb scope:
+OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY —
+covers class-1 plus MOVE and COPY. PROPPATCH, LOCK, UNLOCK, and
+If-header conditionals remain out of v1 scope (Windows Explorer,
+macOS Finder, davfs2, cadaver work without them when the server
+doesn't advertise the lock class).
+
+The consumer fills in an `AxlWebDavOps` callback table mapped
+onto its own filesystem; the SDK owns the protocol — verb
+dispatch, PROPFIND 207 Multi-Status XML emit (driven by
+`AxlXmlWriter`; see [`<axl/axl-xml.h>`](../data/README.md#axlxml--streaming-xml-writer--pull-token-reader)),
+Depth / Destination / Overwrite header parsing, RFC 1123
+Last-Modified date formatting, RFC 3230 Want-Digest /
+Digest header negotiation (opt-in via the consumer's
+optional `digest` callback), DAV: 1 advertisement on every
+WebDAV-method response. GET inherits
+`axl_http_response_set_streamer` (multi-GB safe, Range
+requests via `axl_http_response_set_content_range`); PUT
+inherits the upload-route chunk handler (write_open / chunk /
+close(aborted)). Per-mount single-in-flight PUT — concurrent
+PUTs to the same mount are refused rather than silently
+trampling each other's state.
+
+```c
+static int my_stat(void *user, const char *path, AxlWebDavEntry *out);
+static int my_list_dir(void *user, const char *path,
+                       AxlWebDavEntry *out, size_t max, size_t *count);
+static int my_read_open (void *user, const char *path,
+                         uint64_t offset, void **out_ctx);
+static int my_read_chunk(void *ctx, void *buf, size_t cap, size_t *got);
+static void my_read_close(void *ctx);
+/* ... write_open / write_chunk / write_close / mkdir / remove
+       / move / copy / content_type ... */
+
+static const AxlWebDavOps my_ops = {
+    .stat         = my_stat,
+    .list_dir     = my_list_dir,
+    .read_open    = my_read_open,
+    .read_chunk   = my_read_chunk,
+    .read_close   = my_read_close,
+    /* ... */
+};
+
+axl_http_server_add_webdav(server, "/dav", &my_ops, my_user_data);
+```
+
+Up to 4 WebDAV mounts per server. The `ops` struct is COPIED
+into the server; the consumer may free or re-use it after
+`add_webdav` returns. `user_data` is borrowed and must outlive
+the server.
+
+### Streaming uploads
+
+`axl_http_server_add_upload_route(server, method, path, handler, data)`
+registers a route that streams the body to `handler` in chunks
+instead of buffering — required for multi-GB uploads (the body never
+materializes in RAM, bypasses `body.limit`).
+
+The `AxlUploadHandler` callback distinguishes three terminating
+shapes by the `chunk` and `aborted` arguments:
+
+| chunk        | aborted | meaning                                                  |
+| ------------ | ------- | -------------------------------------------------------- |
+| `!= NULL`    | `false` | body chunk arrived; process it and return AXL_OK         |
+| `NULL`, 0    | `false` | clean EOF — set `resp` fields, response is sent          |
+| `NULL`, 0    | `true`  | TCP disconnect / recv error — release per-request state  |
+
+The abort call is mutually exclusive with the clean-EOF call: a
+handler that received the clean-EOF call will NOT also receive an
+abort, even if the response send subsequently fails. On abort the
+handler MUST NOT touch the connection or call any response setter
+— it exists only to release per-request state (open file handles,
+accumulators, allocations) accumulated across earlier chunk calls.
+Without this signal, that state leaks across requests.
+
+Middleware registered via `axl_http_server_use` runs before the
+upload handler sees a single byte. On rejection the connection is
+force-closed (clients almost always send body bytes before reading
+the rejection — staying in keep-alive desyncs the next request).
+Header-based gating only — the body isn't materialized so middleware
+that needs the body can't apply to upload routes.
 
 ## HTTP Client
 

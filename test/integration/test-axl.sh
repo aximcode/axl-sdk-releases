@@ -29,7 +29,7 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
-TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime)
+TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml)
 
 for app in "${TEST_APPS[@]}"; do
     test_add_efi "$NATIVE_DIR/$app.efi"

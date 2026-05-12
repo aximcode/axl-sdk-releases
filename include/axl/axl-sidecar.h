@@ -96,12 +96,12 @@ typedef enum {
  * @brief Open a JSON5 sidecar file with the standard error-code split.
  *
  * Performs the same sequence axl-sdk modules previously hand-rolled:
- * existence-check via @ref axl_file_info (so we can distinguish
- * "missing" from "parse failed"), then @ref axl_json_load_file_flags
+ * existence-check via axl_file_info (so we can distinguish
+ * "missing" from "parse failed"), then axl_json_load_file_flags
  * with the @c AXL_JSON_PARSER_JSON5 grammar.
  *
  * On @c AXL_SIDECAR_OK, the caller owns @p r and @p *out_raw and must
- * release them with @ref axl_json_free followed by @c axl_free
+ * release them with axl_json_free followed by @c axl_free
  * respectively. On any error return both are left untouched (the
  * caller does NOT free anything).
  *
@@ -124,7 +124,7 @@ axl_sidecar_open_file(
  * unit tests.
  *
  * On @c AXL_SIDECAR_OK, the caller owns @p r and must release it
- * with @ref axl_json_free (the buffer itself stays caller-owned —
+ * with axl_json_free (the buffer itself stays caller-owned —
  * the reader references it but does not copy).
  *
  * @return @c AXL_SIDECAR_OK on a successful parse,

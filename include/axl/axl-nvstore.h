@@ -90,12 +90,12 @@ axl_nvstore_get(
 /**
  * @brief Read a value from non-volatile storage into a heap buffer.
  *
- * Like @ref axl_nvstore_get, but the buffer is allocated for you.
+ * Like axl_nvstore_get, but the buffer is allocated for you.
  * Useful when reading variable-length blobs (NV strings, OEM
  * settings) where the caller doesn't know the size up front and
  * picking a fixed stack buffer either over-allocates or risks
  * truncation. On success, @c *out_buf is a heap pointer of @c
- * *out_size bytes that the caller frees with @ref axl_free.
+ * *out_size bytes that the caller frees with axl_free.
  *
  * On failure, @c *out_buf is set to NULL and @c *out_size is set
  * to 0. The buffer is allocated with one extra byte beyond
@@ -137,12 +137,12 @@ axl_nvstore_set(
 /**
  * @brief Write a NUL-terminated string to non-volatile storage.
  *
- * Convenience over @ref axl_nvstore_set: the payload size is
+ * Convenience over axl_nvstore_set: the payload size is
  * @c axl_strlen(str) + 1, including the trailing NUL, so callers
  * don't need to repeat the @c +1 ritual at every site that stores
  * a string. The empty string @c "" writes a single NUL byte.
  *
- * To delete a string variable, use @ref axl_nvstore_delete — this
+ * To delete a string variable, use axl_nvstore_delete — this
  * function does not double as a deleter; @c str == NULL is an
  * error so the two operations stay distinct.
  *
@@ -159,9 +159,9 @@ axl_nvstore_set_str(
 /**
  * @brief Read a string-valued variable into a heap buffer.
  *
- * Convenience over @ref axl_nvstore_get_alloc for string variables.
+ * Convenience over axl_nvstore_get_alloc for string variables.
  * On success, @c *out_str is a NUL-terminated heap-allocated C
- * string the caller frees with @ref axl_free. The trailing NUL is
+ * string the caller frees with axl_free. The trailing NUL is
  * guaranteed even if the firmware payload omitted one (the alloc
  * path zero-extends by one byte).
  *

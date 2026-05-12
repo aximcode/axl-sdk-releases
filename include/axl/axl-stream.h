@@ -22,7 +22,7 @@
  *
  * All strings are UTF-8. Paths in axl_fopen are converted to UCS-2
  * internally. Per-stream wire encoding (UCS-2 LE/BE/ASCII) is
- * available via @ref axl_stream_set_encoding.
+ * available via axl_stream_set_encoding.
  */
 
 #ifndef AXL_STREAM_H
@@ -93,7 +93,7 @@ axl_stream_init(void);
 /**
  * @brief Tee subsequent writes to @p extra alongside the console.
  *
- * After this call, every byte written to @ref axl_stdout via
+ * After this call, every byte written to axl_stdout via
  * `axl_print`, `axl_printf`, `axl_fprintf(axl_stdout, ...)`, or
  * direct `axl_write(axl_stdout, ...)` is also written to @p extra.
  * Pass NULL to clear an active tee. Multiple calls replace the
@@ -114,7 +114,7 @@ axl_stream_init(void);
  * The tee target is written with the same UTF-8 caller bytes
  * passed to `axl_write` — NOT the post-transcode wire bytes the
  * source produced. If the tee target itself has a non-UTF-8
- * encoding set via @ref axl_stream_set_encoding, the tee
+ * encoding set via axl_stream_set_encoding, the tee
  * transcodes those caller bytes through its own encoding on the
  * way out (so a UTF-8 source teeing to a UCS-2-LE log file
  * produces a UCS-2-LE log file, not a UTF-8 one).
@@ -133,7 +133,7 @@ axl_stream_set_stdout_tee(
 /**
  * @brief Tee subsequent writes to @p extra alongside the stderr console.
  *
- * Symmetric to @ref axl_stream_set_stdout_tee but for axl_stderr.
+ * Symmetric to axl_stream_set_stdout_tee but for axl_stderr.
  *
  * @return AXL_OK on success, AXL_ERR if axl_stderr isn't initialized.
  */
@@ -247,7 +247,7 @@ axl_fprintf(
  *
  * **Unbounded** — grows the internal buffer until '\\n' or EOF.
  * For arbitrary input (untrusted files, network streams, output
- * piped from another tool) prefer @ref axl_readline_max so a
+ * piped from another tool) prefer axl_readline_max so a
  * single oversized line cannot exhaust memory.
  *
  * Caller frees with axl_free(). Returns NULL at EOF or on error.
@@ -260,7 +260,7 @@ axl_readline(
 /**
  * @brief Read one line with a memory cap.
  *
- * Like @ref axl_readline but bounded: stops appending after
+ * Like axl_readline but bounded: stops appending after
  * @p max_bytes-1 bytes have been buffered. The returned string is
  * always NUL-terminated.
  *
@@ -355,7 +355,7 @@ axl_line_reader_init(
  * counts in the caller stay consistent.
  *
  * @return true if a line was read, false at EOF or on backend
- *     read error. Use @ref axl_line_reader_error to distinguish.
+ *     read error. Use axl_line_reader_error to distinguish.
  */
 bool
 axl_line_reader_next(
@@ -377,7 +377,7 @@ axl_line_reader_error(
 );
 
 /**
- * @brief Per-line callback for @ref axl_walk_lines.
+ * @brief Per-line callback for axl_walk_lines.
  *
  * @p line points into the caller's working buffer — valid only
  * for the duration of this callback invocation. @p len excludes
@@ -400,7 +400,7 @@ typedef int (*AxlLineFn)(
 );
 
 /**
- * @brief Callback wrapper around @ref AxlLineReader.
+ * @brief Callback wrapper around AxlLineReader.
  *
  * Convenience for callers that prefer callback dispatch over
  * iterator-style `while (next(...))` loops. Equivalent to:
@@ -494,7 +494,7 @@ axl_fflush(
  * — `axl_read` returns UTF-8, `axl_write` accepts UTF-8 — and
  * `axl_stream_set_encoding` declares what's on the wire underneath.
  *
- * Default is @ref AXL_ENC_UTF8, which is a passthrough (no
+ * Default is AXL_ENC_UTF8, which is a passthrough (no
  * transcoding) — existing behavior is unchanged for any stream
  * the consumer doesn't explicitly configure.
  *
@@ -516,16 +516,15 @@ typedef enum {
 /**
  * @brief Set the wire-side encoding for a stream.
  *
- * Applies to the byte-I/O primitives — @ref axl_read, @ref axl_write,
- * @ref axl_fread, @ref axl_fwrite, @ref axl_readline, @ref axl_fgets.
- * Does **not** affect @ref axl_print / @ref axl_printf / @ref
- * axl_printerr — those go through the console_write path which
+ * Applies to the byte-I/O primitives — axl_read, axl_write,
+ * axl_fread, axl_fwrite, axl_readline, axl_fgets.
+ * Does **not** affect axl_print / axl_printf / axl_printerr — those go through the console_write path which
  * does its own UTF-8→UCS-2 conversion.
  *
  * Switching encoding mid-stream **discards** any partial multi-byte
  * sequence that was being buffered under the previous encoding.
  * That avoids silently splicing stale partial bytes onto the new
- * encoding's byte stream. Likewise, @ref axl_fseek discards
+ * encoding's byte stream. Likewise, axl_fseek discards
  * transcode buffers — they describe state at the pre-seek position.
  *
  * @return AXL_OK on success, AXL_ERR if @p s is NULL or @p enc is out of range.
@@ -539,7 +538,7 @@ axl_stream_set_encoding(
 /**
  * @brief Get the current wire-side encoding for a stream.
  *
- * @return current encoding (defaults to @ref AXL_ENC_UTF8).
+ * @return current encoding (defaults to AXL_ENC_UTF8).
  */
 AxlEncoding
 axl_stream_get_encoding(
@@ -560,7 +559,7 @@ axl_stream_get_encoding(
  * non-NULL return is delivered.
  *
  * @return @p buf on success, NULL at EOF (with no bytes read) or
- *     on error (use @ref axl_ferror to distinguish).
+ *     on error (use axl_ferror to distinguish).
  */
 char *
 axl_fgets(
@@ -572,7 +571,7 @@ axl_fgets(
 /**
  * @brief Write formatted text to a stream (va_list variant).
  *
- * Like POSIX `vfprintf()`. The @ref axl_fprintf entry point wraps
+ * Like POSIX `vfprintf()`. The axl_fprintf entry point wraps
  * this for the variadic case.
  *
  * @return number of bytes written, or -1 on error.
@@ -588,7 +587,7 @@ axl_vfprintf(
  * @brief Test the sticky error indicator on a stream.
  *
  * Set by any backend read/write/seek error. Mirror of POSIX
- * `ferror()`. Cleared by @ref axl_clearerr.
+ * `ferror()`. Cleared by axl_clearerr.
  *
  * @return true if an error has been signaled on @p stream.
  */
@@ -661,7 +660,7 @@ axl_clearerr(
  * consumer needs proper SMP support, a follow-up can add the
  * surrogate-pair combiner.
  *
- * @return wrapper stream (free with @ref axl_fclose), or NULL on
+ * @return wrapper stream (free with axl_fclose), or NULL on
  *     OOM or NULL @p src.
  */
 AxlStream *

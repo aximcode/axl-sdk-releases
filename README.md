@@ -284,7 +284,7 @@ axl-cc --type driver mydriver.c -o mydriver.efi
 ### Run tests
 
 ```bash
-# Unit tests (776 tests)
+# Unit tests (3000+ assertions, both X64 and AARCH64)
 ./test/integration/test-axl.sh
 
 # Tool tests (hexdump, grep, find, sysinfo, etc.)

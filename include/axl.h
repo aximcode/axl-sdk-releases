@@ -36,6 +36,7 @@
 #include <axl/axl-slist.h>
 #include <axl/axl-queue.h>
 #include <axl/axl-json.h>
+#include <axl/axl-xml.h>
 #include <axl/axl-cache.h>
 #include <axl/axl-radix-tree.h>
 #include <axl/axl-ring-buf.h>
@@ -53,6 +54,9 @@
 #include <axl/axl-pci.h>
 #include <axl/axl-usb.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-embed.h>
+#include <axl/axl-service.h>
+#include <axl/axl-efi-status.h>
 #include <axl/axl-image.h>
 #include <axl/axl-mem-phys.h>
 #include <axl/axl-watchdog.h>
@@ -77,11 +81,46 @@
 #include <axl/axl-buf-pool.h>
 #include <axl/axl-async.h>
 #include <axl/axl-net.h>
+#include <axl/axl-net-opts.h>
 #include <axl/axl-gfx.h>
 #include <axl/axl-smbios.h>
 #include <axl/axl-smbus.h>
 #include <axl/axl-ipmi.h>
 #include <axl/axl-spd.h>
+
+// ---------------------------------------------------------------------------
+// AXL_TOOL_MAIN — tool entry point with optional busybox-style dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * AXL_TOOL_MAIN(name):
+ *
+ * Per-tool entry-point declaration. Replaces the bare `int main(...)`
+ * line in each tool's source. In the default per-tool build it expands
+ * to `int main(int argc, char **argv)` — a tool compiled this way
+ * produces the usual standalone `<tool>.efi` binary.
+ *
+ * In the busybox build (compile with `-DAXL_BUSYBOX`), the same
+ * macro instead expands to `int axl_tool_<name>_main(int argc,
+ * char **argv)` — every tool's body becomes a regular function in a
+ * single fat binary, dispatched by `tools/axl.c`'s verb tree.
+ *
+ * Use at file scope, immediately around the tool's body:
+ *
+ *     AXL_TOOL_MAIN(cat) {
+ *         AxlArgs *a = ... ;
+ *         return axl_args_run(...);
+ *     }
+ *
+ * @c name should match the .c filename's stem so the busybox
+ * dispatcher's `extern` declarations resolve. The tools/axl.c
+ * dispatcher table is the source of truth for which names exist.
+ */
+#ifdef AXL_BUSYBOX
+  #define AXL_TOOL_MAIN(name) int axl_tool_##name##_main(int argc, char **argv)
+#else
+  #define AXL_TOOL_MAIN(name) int main(int argc, char **argv)
+#endif
 
 // ---------------------------------------------------------------------------
 // AXL_APP — application entry point
@@ -103,8 +142,26 @@ void _axl_cleanup(void);
  * Not needed for SDK builds — the SDK provides axl-crt0-native.c
  * which bridges int main() to the UEFI entry point automatically.
  */
-/* Include UEFI types for AXL_APP macro */
+/* Include UEFI types for AXL_APP / AXL_DRIVER macros — the
+ * generated stubs need EFI_STATUS / EFIAPI / EFI_HANDLE /
+ * EFI_SYSTEM_TABLE / EFI_SUCCESS / EFI_ABORTED at expansion time.
+ * Consumer code that uses the macros doesn't need to reference
+ * these names directly; the macro hides them. */
 #include <uefi/axl-uefi.h>
+
+/**
+ * AXLAPI:
+ *
+ * Calling convention macro for callbacks the firmware invokes
+ * directly (custom protocol entry points, raw event notifies,
+ * shell command dispatchers). On the UEFI backend this is
+ * `EFIAPI` (Microsoft-x64 / AAPCS64 with the spec's per-arch
+ * conventions). Drivers using `AXL_DRIVER` don't need to spell
+ * `AXLAPI` themselves — the macro already adapts; this is for
+ * the genuine escape-hatch case where a consumer registers a
+ * firmware-called function outside the AXL helper surface.
+ */
+#define AXLAPI EFIAPI
 
 #define AXL_APP(main_func)                                            \
   int main_func(int, char **);                                        \
@@ -118,5 +175,189 @@ void _axl_cleanup(void);
     _axl_cleanup();                                                    \
     return (_axl_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                \
   }
+
+/**
+ * AXL_DRIVER:
+ * @entry_func: int entry(AxlHandle image, AxlSystemTable *st)
+ * @unload_func: int unload(AxlHandle image)
+ *
+ * Defines the UEFI DriverEntry + Unload entry points for a DXE
+ * driver image without making the consumer write `EFIAPI`,
+ * `EFI_STATUS`, `EFI_HANDLE`, or `EFI_SYSTEM_TABLE` themselves.
+ * Wires `axl_driver_init` and `axl_driver_set_unload`
+ * automatically. Consumer entry/unload return `int` — 0 means
+ * success (the macro maps to `EFI_SUCCESS`), non-zero aborts the
+ * load (mapped to `EFI_ABORTED`).
+ *
+ * @code
+ *   static int my_main(AxlHandle image, AxlSystemTable *st);
+ *   static int my_unload(AxlHandle image);
+ *
+ *   AXL_DRIVER(my_main, my_unload)
+ *
+ *   static int my_main(AxlHandle image, AxlSystemTable *st) {
+ *       (void)image; (void)st;
+ *       // ... axl_protocol_register, axl_loop_attach_driver, ...
+ *       return 0;
+ *   }
+ *
+ *   static int my_unload(AxlHandle image) {
+ *       (void)image;
+ *       // ... axl_protocol_unregister, axl_loop_detach_driver, ...
+ *       return 0;
+ *   }
+ * @endcode
+ *
+ * Consumers needing UEFI types beyond what AXL exposes (publishing
+ * a spec-defined protocol struct like `EFI_FILE_PROTOCOL`, calling
+ * `gBS->...` directly) opt into `<uefi/axl-uefi.h>` separately —
+ * the macro doesn't preclude that.
+ *
+ * Type-match caveat: `AxlHandle` is itself a `void *` typedef and
+ * `AxlSystemTable *` is implicitly convertible from `void *`, so
+ * the compiler will silently accept consumer functions declared
+ * with mismatched parameter types (`int my_main(void *, void *)`
+ * compiles without a warning against the macro's forward decl).
+ * Use the documented signatures literally so future readers see
+ * the intent.
+ */
+#define AXL_DRIVER(entry_func, unload_func)                              \
+  int entry_func(AxlHandle, AxlSystemTable *);                           \
+  int unload_func(AxlHandle);                                            \
+                                                                         \
+  static EFI_STATUS EFIAPI                                               \
+  _axl_driver_unload_stub(EFI_HANDLE _img) {                             \
+    int _rc = unload_func((AxlHandle)_img);                              \
+    return (_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                       \
+  }                                                                      \
+                                                                         \
+  EFI_STATUS EFIAPI                                                      \
+  DriverEntry(EFI_HANDLE _ImageHandle, EFI_SYSTEM_TABLE *_SystemTable) { \
+    axl_driver_init((AxlHandle)_ImageHandle,                             \
+                    (AxlSystemTable *)_SystemTable);                     \
+    axl_driver_set_unload((void *)_axl_driver_unload_stub);              \
+    int _rc = entry_func((AxlHandle)_ImageHandle,                        \
+                         (AxlSystemTable *)_SystemTable);                \
+    return (_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                       \
+  }
+
+/**
+ * AXL_SERVICE_DRIVER:
+ * @svc: an `AxlService` lvalue (typically a `static const`)
+ *
+ * Driver-image counterpart to `axl_service_start_embedded` /
+ * `AxlServiceDeploy` on the foreground side. Emits the firmware
+ * `DriverEntry` symbol that delegates to the SDK library
+ * (@ref _axl_service_driver_init): backend init, LoadOptions
+ * decode, protocol publish, loop creation, and attach against
+ * `svc.driver_tick_ms` (defaults to 50 ms when zero).
+ *
+ * The driver image must link the same `svc` descriptor object the
+ * foreground app describes. The cross-binary ABI tripwire applies
+ * (see `<axl/axl-service.h>`): both binaries must be built from
+ * the same source tree with identical compile flags.
+ *
+ * @code
+ *   // shared between foreground and driver image:
+ *   typedef struct { uint16_t port; bool verbose; } MyOpts;
+ *   static MyOpts opts;
+ *   static const AxlConfigDesc opts_descs[] = { ... { 0 } };
+ *   static int my_setup(AxlLoop *loop, void *user) { ... }
+ *   static int my_teardown(void *user) { ... }
+ *   static const AxlService my_service = {
+ *       .name           = "my-service",
+ *       .opts_descs     = opts_descs,
+ *       .setup          = my_setup,
+ *       .teardown       = my_teardown,
+ *       .user           = &opts,
+ *       .driver_tick_ms = 50,
+ *   };
+ *
+ *   // in the driver image's only .c file:
+ *   AXL_SERVICE_DRIVER(my_service);
+ * @endcode
+ *
+ * On LoadOptions decode failure the library logs and aborts the
+ * load (firmware sees EFI_ABORTED → driver image is unloaded).
+ * Setup failure follows the same path.
+ *
+ * **Use AXL_SERVICE_DRIVER xor AXL_DRIVER per translation unit.**
+ * Both expand to a `DriverEntry` symbol; defining both produces a
+ * link-time multiple-definition error. AXL_SERVICE_DRIVER is the
+ * higher-level wrapper for the loop-and-options pattern; AXL_DRIVER
+ * is the bare-bones macro for drivers that don't run a service
+ * (publish-protocol-and-leave style). Pick one.
+ */
+#define AXL_SERVICE_DRIVER(svc)                                            \
+  EFI_STATUS EFIAPI                                                        \
+  DriverEntry(EFI_HANDLE _ImageHandle, EFI_SYSTEM_TABLE *_SystemTable) {   \
+    return (EFI_STATUS)_axl_service_driver_init(                           \
+               (void *)_ImageHandle, (void *)_SystemTable, &(svc));        \
+  }
+
+/**
+ * AXL_SERVICE:
+ * @svc: an `AxlService` lvalue (typically a `static const`)
+ *
+ * One-shot single-source-file service: emits whichever entry point
+ * the current build needs. Pair with `axl-cc --service NAME source.c`
+ * (which compiles the same source twice — once with
+ * `-DAXL_SERVICE_BUILD_DRIVER` for the driver image, once without
+ * for the launcher app — and embeds the driver into the launcher).
+ *
+ * - When `AXL_SERVICE_BUILD_DRIVER` is defined (driver-image
+ *   compile), expands to @ref AXL_SERVICE_DRIVER.
+ * - Otherwise (launcher-app compile), expands to a `main()` that
+ *   declares the embedded driver blob (matching the symbol name
+ *   `axl-cc --service` emits) and delegates to
+ *   @ref axl_service_main with a deploy descriptor pre-filled.
+ *
+ * @code
+ *   // service.c — single source file
+ *   #include <axl.h>
+ *
+ *   typedef struct { uint16_t port; bool verbose; } MyOpts;
+ *   static MyOpts opts;
+ *   static const AxlConfigDesc opts_descs[] = { ... { 0 } };
+ *   static int my_setup(AxlLoop *loop, void *user) { ... }
+ *   static int my_teardown(void *user) { ... }
+ *   static const AxlService my_service = {
+ *       .name           = "my-service",
+ *       .opts_descs     = opts_descs,
+ *       .setup          = my_setup,
+ *       .teardown       = my_teardown,
+ *       .user           = &opts,
+ *       .driver_tick_ms = 50,
+ *   };
+ *
+ *   AXL_SERVICE(my_service);   // emits DriverEntry or main()
+ * @endcode
+ *
+ * Build:
+ * @code
+ *   axl-cc --service my-service service.c
+ *   # produces: my-service.efi (launcher) + my-service-dxe.efi (driver)
+ * @endcode
+ *
+ * For consumers that need a custom verb tree (multi-service tools,
+ * extra subcommands), don't use this macro — write your own main()
+ * that calls `axl_service_main(&deploy, argc, argv)` directly, or
+ * mix the standard verbs with your own via `axl_args_run`.
+ */
+#ifdef AXL_SERVICE_BUILD_DRIVER
+  #define AXL_SERVICE(svc) AXL_SERVICE_DRIVER(svc)
+#else
+  #define AXL_SERVICE(svc)                                                  \
+    AXL_EMBED_DECLARE(svc);                                                 \
+    int main(int argc, char **argv) {                                       \
+      AxlServiceDeploy _axl_svc_deploy = {                                  \
+        .service          = &(svc),                                         \
+        .driver_blob      = AXL_EMBED_DATA(svc),                            \
+        .driver_blob_len  = AXL_EMBED_SIZE(svc),                            \
+        .driver_name      = #svc "-dxe.efi",                                \
+      };                                                                    \
+      return axl_service_main(&_axl_svc_deploy, argc, argv);                \
+    }
+#endif
 
 #endif /* AXL_H */

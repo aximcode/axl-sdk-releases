@@ -71,9 +71,9 @@ gImageHandle;`** sites across 4 files that should consolidate.
 - `src/util/axl-driver.c:468` — `extern void axl_stream_init(void);`
   inside a function. Replace with `#include <axl/axl-stream.h>`.
 - `src/util/axl-sys.c:70` — `extern const EFI_GUID
-  *axl_service_lookup_guid(...);` inside a function. Symbol is
-  defined in `src/util/axl-service.c`; needs an internal header
-  (e.g. `src/util/axl-service-internal.h`) to share between the
+  *axl_protocol_lookup_guid(...);` inside a function. Symbol is
+  defined in `src/util/axl-protocol.c`; needs an internal header
+  (e.g. `src/util/axl-protocol-internal.h`) to share between the
   two files without leaking to public API.
 - `tools/timetest.c:21` — `extern uint64_t
   axl_backend_get_monotonic_us(void);` workaround for not exposing

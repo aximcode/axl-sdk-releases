@@ -36,13 +36,15 @@ stream_upload_data(
             int rc = route->upload_handler(
                 &conn->upload_req, &conn->upload_resp,
                 conn->upload_buf, conn->upload_buf_len,
-                route->data);
+                route->data, false);
             conn->upload_buf_len = 0;
             if (rc != 0) {
                 axl_warning("upload handler aborted during chunk flush");
                 conn->upload_resp.status_code = 500;
+                /* Force close-after-send. on_response_sent will run
+                   reset_connection AFTER the 500 hits the wire. */
+                conn->keep_alive = false;
                 send_response(conn, &conn->upload_resp);
-                reset_connection(conn);
                 return;
             }
         }
@@ -58,64 +60,34 @@ stream_upload_data(
         int rc = route->upload_handler(
             &conn->upload_req, &conn->upload_resp,
             conn->upload_buf, conn->upload_buf_len,
-            route->data);
+            route->data, false);
         conn->upload_buf_len = 0;
         if (rc != 0) {
             axl_warning("upload handler aborted during final flush");
             conn->upload_resp.status_code = 500;
+            conn->keep_alive = false;
             send_response(conn, &conn->upload_resp);
-            reset_connection(conn);
             return;
         }
     }
 
-    /* Final call: chunk=NULL, chunk_size=0 — handler sets response */
+    /* Clean-EOF final call: chunk=NULL, chunk_size=0, aborted=false —
+       handler sets response. */
     int rc = route->upload_handler(
         &conn->upload_req, &conn->upload_resp,
-        NULL, 0, route->data);
+        NULL, 0, route->data, false);
     if (rc != 0 && conn->upload_resp.status_code == 200) {
         axl_warning("upload handler failed on finalize");
         conn->upload_resp.status_code = 500;
     }
 
+    /* on_response_sent runs the keep-alive vs reset_connection
+       decision after the response actually transmits, AND knows
+       to release upload-stream state (upload_buf, upload_resp.body
+       /headers, is_upload_stream/upload_route). The synchronous
+       teardown that lived here previously raced the new async
+       send: axl_tcp_close inside reset_connection cancelled the
+       just-queued Transmit before TCP4 put it on the wire. */
+    (void)s;
     send_response(conn, &conn->upload_resp);
-
-    if (conn->keep_alive) {
-        /* Reset upload state */
-        axl_free(conn->upload_buf);
-        conn->upload_buf = NULL;
-        conn->upload_buf_len = 0;
-        conn->is_upload_stream = false;
-        conn->upload_route = NULL;
-        if (conn->upload_resp.body != NULL) {
-            axl_free(conn->upload_resp.body);
-        }
-        if (conn->upload_resp.headers != NULL) {
-            axl_hash_table_free(conn->upload_resp.headers);
-        }
-        axl_memset(&conn->upload_resp, 0, sizeof(conn->upload_resp));
-
-        /* Reset request state for next request (same as dispatch_and_respond) */
-        axl_free(conn->method);
-        conn->method = NULL;
-        axl_free(conn->path);
-        conn->path = NULL;
-        axl_free(conn->query);
-        conn->query = NULL;
-        if (conn->headers != NULL) {
-            axl_hash_table_free(conn->headers);
-            conn->headers = NULL;
-        }
-        conn->header_len      = 0;
-        conn->headers_done    = false;
-        conn->content_length  = 0;
-        conn->body_bytes_read = 0;
-        conn->body_alloc      = 0;
-        conn->chunked         = false;
-        conn->chunked_done    = false;
-
-        start_conn_recv(s, conn);
-    } else {
-        reset_connection(conn);
-    }
 }

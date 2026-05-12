@@ -87,7 +87,19 @@ axl_log_ring_free(ring);
 Write log messages to a file on the UEFI filesystem:
 
 ```c
-axl_log_file_open("fs0:/app.log");
+axl_log_file_attach("fs0:/app.log");
 // ... all log messages are now also written to the file ...
-axl_log_file_close();
+axl_log_flush();         // optional — buffered output is drained periodically
+axl_log_file_detach();   // pair with attach for explicit teardown
 ```
+
+`axl_log_file_attach` opens the file, registers a buffered handler,
+and starts forwarding log messages to disk. Calling it again with a
+new path transparently detaches the previous one — `_detach` is only
+needed when you want to stop logging without re-opening.
+
+`axl_log_file_detach` is the symmetric teardown — flushes the
+buffer, removes the internal handler, closes the file. NULL-safe on
+not-attached state. The typical AxlService pattern is:
+attach in driver `setup`, detach in driver `teardown`, before
+firmware UnloadImage tears the per-image static state down.

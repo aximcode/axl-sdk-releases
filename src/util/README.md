@@ -232,6 +232,11 @@ EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
 
 See `sdk/examples/driver.c` for a complete example.
 
+For long-running services (cross-binary marshalling, structured
+setup/teardown, foreground or driver-tick deployment), see
+[AxlService](../service/README.md) — the lifecycle wrapper over
+AxlLoop that composes axl-driver + axl-config + axl-loop.
+
 ### Image Lifecycle
 
 For loading and running arbitrary EFI images (not DXE drivers),
@@ -292,6 +297,140 @@ certificate in the PKCS#7 SignedData bundle via an in-tree
 DER walker; they're best-effort diagnostic strings (the formal
 way to identify the Authenticode signer is via SignerInfo's
 IssuerAndSerial — out of scope for diagnostic CN output).
+
+### Protocol Registry
+
+#### What UEFI Means by "Protocol"
+
+A UEFI **protocol** is *not* a wire protocol or a network spec — it's
+the closest thing UEFI has to an object or a vtable. Concretely, a
+protocol is:
+
+- a **C struct of function pointers** (and sometimes inline state),
+- identified by a **128-bit GUID**,
+- **installed on a handle** (a firmware-allocated opaque token that
+  represents some logical entity — a disk, a network port, a driver
+  image, a service endpoint, etc.).
+
+Consumers find a protocol by GUID via the `LocateProtocol` or
+`LocateHandleBuffer` Boot Services calls; the firmware returns the
+struct pointer; the consumer calls the function pointers it carries.
+
+Mental-model translation if you come from elsewhere:
+
+- **Java / C# / Swift**: a UEFI protocol is roughly an *interface*
+  bound to a specific instance — except identity is a GUID instead
+  of a class type, and instances are handles instead of objects.
+- **COM**: very similar to a COM interface — IID-keyed vtable on a
+  handle. UEFI's design lineage is COM-via-IntelBIOS.
+- **POSIX**: there's no clean parallel. The closest analog is "a
+  device-driver `struct file_operations` registered in a kobject
+  hierarchy keyed by a UUID instead of a path."
+
+The naming is awkward and we're stuck with it because that's what
+the UEFI spec writes everywhere. AXL's protocol registry is a
+name-keyed wrapper over this UEFI-native concept: instead of
+shipping a GUID literal at every call site, consumers pass a string
+name and the registry resolves it. Internally it still calls
+`InstallProtocolInterface` / `LocateProtocol` — there is no extra
+runtime cost, just less boilerplate and fewer GUIDs to copy-paste.
+
+#### Using the Registry
+
+Built-in well-known names cover the spec-defined protocols a
+portable consumer typically reaches for: `"smbios"`, `"shell"`,
+`"simple-network"`, `"simple-fs"`, `"device-path"`, `"loaded-image"`,
+`"ram-disk"`, the IPv4 networking family (`"tcp4"`, `"tcp4-sb"`,
+`"ip4"`, `"ip4-config2"`, `"dhcp4"`, `"dhcp4-sb"`, `"dns4"`,
+`"dns4-sb"`), and `"tcg2"`.
+
+```c
+// Find a protocol (consumer side)
+EFI_SMBIOS_PROTOCOL *smbios;
+if (axl_protocol_find("smbios", (void **)&smbios) == AXL_OK) {
+    // ...
+}
+
+// Enumerate all handles publishing a protocol
+void   **handles;
+size_t   count;
+if (axl_protocol_enumerate("simple-fs", &handles, &count) == AXL_OK) {
+    for (size_t i = 0; i < count; i++) { /* ... */ }
+    axl_free(handles);
+}
+```
+
+#### Custom Protocol Names
+
+Drivers can publish their own protocols under a project-defined name.
+By default `axl_protocol_register("my-protocol", &iface, &handle)`
+synthesizes a deterministic GUID from the name string (FNV-1a).
+That works for single-image use, but the GUID is unstable across
+typos and not directly usable for cross-image discovery via raw
+`LocateProtocol`. Pin a published vendor GUID once at startup:
+
+```c
+static const AxlGuid kMySvcGuid =
+    AXL_GUID(0xdead0001, 0xbeef, 0xcafe,
+             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0);
+
+// In DriverEntry
+axl_protocol_register_name("my-protocol", &kMySvcGuid);
+axl_protocol_register("my-protocol", &mInterface, &mHandle);
+```
+
+External consumers can either use `axl_protocol_find("my-protocol",
+…)` (after a matching `register_name` of their own — names are
+per-image) or `LocateProtocol(&kMySvcGuid, …)` directly against the
+published GUID. `register_name` is idempotent for the same
+`(name, guid)` pair, refuses to shadow built-in well-known names,
+and returns `AXL_ERR` if the name is already pinned to a different
+GUID.
+
+#### Driver-Image Lifecycle
+
+Registered protocols are NOT auto-released when a driver image is
+unloaded — the AXL protocol registry never owned the install. Walk
+your protocols in `axl_driver_set_unload`'s callback:
+
+```c
+static EFI_STATUS EFIAPI MyUnload(EFI_HANDLE image) {
+    if (mHandle != NULL) {
+        axl_protocol_unregister(mHandle, "my-protocol", &mInterface);
+    }
+    return EFI_SUCCESS;
+}
+```
+
+`sdk/examples/driver.c` is the canonical reference. Forgetting to
+unregister leaves dangling handle entries pointing at freed driver
+memory; subsequent `LocateProtocol` calls hand consumers a stale
+vtable and the next dispatch faults.
+
+#### TPL Contract
+
+All entry points (`_register`, `_register_name`, `_register_multiple`,
+`_find`, `_enumerate`, `_unregister`) bottom out in UEFI Boot
+Services calls (`InstallProtocolInterface`, `LocateProtocol`,
+`LocateHandleBuffer`, `UninstallProtocolInterface`) plus
+`axl_malloc`, all of which require TPL ≤ `TPL_NOTIFY` per UEFI 2.11
+§7.3. Callers running from a timer handler at `TPL_NOTIFY` are
+fine; callers at `TPL_HIGH_LEVEL` must lower first. Callbacks
+dispatched through `AxlLoop` (defer-drain, pubsub delivery, source
+handlers) all run at `TPL_APPLICATION` — the loop calls
+`WaitForEvent`, which mandates that level — so consumers writing
+protocol-event-driven code don't need to worry about TPL inside
+handlers.
+
+#### Protocol-Event Subscriptions
+
+For protocols that need to publish events ("client connected",
+"upload complete"), reuse `axl_pubsub_*` from `<axl/axl-pubsub.h>`
+rather than rolling a protocol-internal callback list. Topics are
+string-keyed; multiple consumers can subscribe; delivery is
+deferred via the loop's defer queue, so handlers always fire at
+`TPL_APPLICATION`. Pubsub is `AxlLoop`-scoped: subscribers must run
+on the same loop instance as the publisher to receive events.
 
 ### Auto-Loading Driver Dependencies
 
@@ -443,6 +582,57 @@ for (size_t i = 0; i < count; i++) {
     axl_printf("  header: %s\n", hdr);
 }
 ```
+
+### Standard option groups (group injection)
+
+Networked tools repeat the same NIC / local-IP / port
+descriptors over and over. `axl_config_descs_net` emits the
+canonical entries into a consumer-owned accumulator, with
+descriptor offsets shifted by the consumer's embedded
+`AxlNetOpts` sub-struct offset:
+
+```c
+typedef struct {
+    AxlNetOpts net;       // the standard sub-struct
+    const char *url;
+    bool        read_only;
+} MountOpts;
+
+static const AxlConfigDesc mount_consumer_descs[] = {
+    { "url",       AXL_CFG_STRING, "",      "Server URL",
+      offsetof(MountOpts, url),       sizeof(((MountOpts*)0)->url) },
+    { "read-only", AXL_CFG_BOOL,   "false", "Mount read-only",
+      offsetof(MountOpts, read_only), sizeof(bool), 'r' },
+    { 0 }
+};
+
+static AxlConfigDesc mount_descs[16];
+void mount_descs_init(void) {
+    size_t n = axl_config_descs_net(mount_descs, ARRAY_SIZE(mount_descs),
+                                    AXL_NET_OPT_SERVER,
+                                    offsetof(MountOpts, net));
+    n += axl_config_descs_append(mount_descs + n,
+                                 ARRAY_SIZE(mount_descs) - n - 1,
+                                 mount_consumer_descs);
+    mount_descs[n] = (AxlConfigDesc){ 0 };
+}
+```
+
+`AXL_NET_OPT_CLIENT` / `_SERVER` presets cover the common cases;
+finer-grained bitmasks (`AXL_NET_OPT_NIC | AXL_NET_OPT_PORT`)
+also work. `AXL_NET_OPT_SOURCE_IP` and `AXL_NET_OPT_LISTEN_IP`
+both target the same `local_ip` field (same `bind(2)` syscall);
+they differ only in CLI vocabulary — pick whichever matches your
+tool's role. The emitted descriptors preserve `short_name` /
+`choices` and route through AxlConfig's auto-apply machinery
+exactly like the consumer's own table. See `<axl/axl-net-opts.h>`
+for the option-bag types and the matching `axl_net_init_from_opts`
+bring-up helper.
+
+The companion `axl_config_descs_append` copies a consumer-owned
+descriptor fragment (terminated by `{0}`) onto the accumulator;
+the caller writes the final `{0}` terminator once, after all
+fragments have been appended.
 
 ### Parent Inheritance
 
