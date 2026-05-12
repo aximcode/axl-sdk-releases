@@ -113,8 +113,13 @@ status_to_efi(AxlFsStatus s)
         case AXL_FS_ERR_ACCESS_DENIED:    return EFI_ACCESS_DENIED;
         case AXL_FS_ERR_WRITE_PROTECTED:  return EFI_WRITE_PROTECTED;
         case AXL_FS_ERR_NO_SPACE:         return EFI_VOLUME_FULL;
-        case AXL_FS_ERR_NOT_DIR:          return EFI_INVALID_PARAMETER;
-        case AXL_FS_ERR_IS_DIR:           return EFI_INVALID_PARAMETER;
+        /* Three "wrong-kind / bad-args" cases all map to
+           EFI_INVALID_PARAMETER per UEFI 2.11 §13.5 — the spec has
+           no separate "kind mismatch" code. The AXL enum still
+           distinguishes them so the provider can express intent
+           and so a future spec extension can split the mapping. */
+        case AXL_FS_ERR_NOT_DIR:          /* fallthrough */
+        case AXL_FS_ERR_IS_DIR:           /* fallthrough */
         case AXL_FS_ERR_INVALID:          return EFI_INVALID_PARAMETER;
         case AXL_FS_ERR_NO_MEMORY:        return EFI_OUT_OF_RESOURCES;
         case AXL_FS_ERR_IO:               return EFI_DEVICE_ERROR;
@@ -164,6 +169,17 @@ static void
 pub_list_remove(FileThunk *f)
 {
     Publication *p = f->pub;
+    /* `f->pub` is non-NULL throughout the live → close-via-thunk
+       lifetime; the only path that nulls it is the orphan step in
+       axl_fs_provider_unpublish, which happens AFTER the in-loop
+       pub_list_remove call. clang-tidy can't prove that across
+       function boundaries — guard explicitly so the null-deref
+       analyzer pass clears. */
+    if (p == NULL) {
+        f->prev = NULL;
+        f->next = NULL;
+        return;
+    }
     if (f->prev != NULL) f->prev->next = f->next;
     else                 p->open_first  = f->next;
     if (f->next != NULL) f->next->prev = f->prev;
@@ -458,8 +474,11 @@ static EFI_STATUS EFIAPI
 thunk_close(EFI_FILE_PROTOCOL *this)
 {
     FileThunk *self = FILE_FROM_EFI(this);
-    /* Per UEFI 2.11 §13.5.4, Close always returns EFI_SUCCESS. */
-    if (!self->dead && self->backing != NULL) {
+    /* Per UEFI 2.11 §13.5.4, Close always returns EFI_SUCCESS.
+       The pub-NULL guard mirrors the orphan-on-unpublish contract:
+       once unpublish has run, self->dead is true AND self->pub is
+       NULL; either flag short-circuits the provider call. */
+    if (!self->dead && self->pub != NULL && self->backing != NULL) {
         self->pub->provider.close(self->backing);
     }
     self->backing = NULL;

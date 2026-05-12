@@ -75,10 +75,17 @@ while [[ $terminal -eq 0 ]]; do
 done
 
 # Final verdict — exit non-zero if any conclusion isn't SUCCESS.
+# Also print a machine-greppable verdict line: when the script is
+# piped through `tail` / `head` / etc. the pipe swallows the exit
+# code, so automation should grep for `RELEASE_VERDICT:` rather
+# than rely on $?. Use `set -o pipefail` in the caller's shell if
+# you want the original exit to propagate through pipelines.
 echo
 if echo "$res" | awk -F'\t' '{print $3}' | grep -qvE "^SUCCESS$"; then
     echo "FAIL — at least one workflow did not succeed."
+    echo "RELEASE_VERDICT: FAIL"
     exit 1
 fi
 echo "All workflows green."
+echo "RELEASE_VERDICT: PASS"
 exit 0

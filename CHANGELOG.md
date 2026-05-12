@@ -3,6 +3,35 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.18.1 — 2026-05-12
+
+### Fixed
+
+- **clang-tidy CI gate cleared.** v0.18.0 shipped artifacts
+  successfully (Release + Docs workflows green) but the CI
+  workflow's clang-tidy step failed on four findings — same
+  shape as the v0.16→v0.17.1 sequence. `src/fs/axl-fs-provider.c`:
+  - line 116 (`bugprone-branch-clone`): the three "wrong-kind /
+    bad-args" `AxlFsStatus` cases all map to `EFI_INVALID_PARAMETER`.
+    Collapsed into a single fallthrough block with a note about
+    why the AXL enum still distinguishes them.
+  - lines 168/170 (`clang-analyzer-core.NullDereference` on
+    `pub_list_remove`): the analyzer can't prove
+    `f->pub != NULL` across function boundaries given the
+    orphan-on-unpublish contract that nulls it. Added an
+    explicit guard at function entry.
+  - line 463 (`clang-analyzer-core.NullDereference` in
+    `thunk_close`): same reason — `self->dead` was checked but
+    the `self->pub` deref wasn't independently guarded. Added
+    `self->pub != NULL` to the guard.
+- **`scripts/watch-release-runs.sh` now prints
+  `RELEASE_VERDICT: PASS` / `RELEASE_VERDICT: FAIL`** on the
+  last line so callers can grep for the verdict when the script
+  is invoked through a pipe (`... | tail -N`) that swallows the
+  exit code. Bit me on the v0.18.0 release run — the watcher
+  correctly `exit 1`'d on CI failure but the wrapping pipe in
+  the automation reported PASS.
+
 ## 0.18.0 — 2026-05-12
 
 Phases A + B + C of the EFI-encapsulation plan
