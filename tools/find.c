@@ -46,11 +46,11 @@ typedef struct {
 static void
 print_entry(
     const char        *path,
-    const AxlDirEntry *entry
+    const AxlFsEntry *entry
     )
 {
     if (verbose) {
-        if (entry->is_dir) {
+        if (axl_fs_entry_is_dir(entry)) {
             axl_printf("     <DIR> ");
         } else {
             axl_printf("%10llu ", (unsigned long long)entry->size);
@@ -65,13 +65,14 @@ print_entry(
 // ---------------------------------------------------------------------------
 
 static int
-find_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+find_walk_cb(const char *full_path, const AxlFsEntry *entry, void *user)
 {
     FindCtx *c = (FindCtx *)user;
 
+    bool is_dir = axl_fs_entry_is_dir(entry);
     bool type_ok = (c->type_filter == '\0')
-                || (c->type_filter == 'f' && !entry->is_dir)
-                || (c->type_filter == 'd' && entry->is_dir);
+                || (c->type_filter == 'f' && !is_dir)
+                || (c->type_filter == 'd' && is_dir);
 
     bool name_ok = (c->name_pattern == NULL)
                 || axl_fnmatch(c->name_pattern, entry->name);
@@ -101,9 +102,12 @@ find_walk(
         if (name_pattern != NULL && !axl_fnmatch(name_pattern, name)) {
             return 0;
         }
-        AxlDirEntry de = { .is_dir = false };
+        AxlFsEntry de = {
+            .struct_size = sizeof(de),
+            .version     = AXL_FS_ENTRY_VERSION,
+        };
         axl_strlcpy(de.name, name, sizeof(de.name));
-        AxlFileInfo fi;
+        AxlFsEntry fi;
         if (axl_file_info(base_path, &fi) == AXL_OK) de.size = fi.size;
         print_entry(base_path, &de);
         return 1;

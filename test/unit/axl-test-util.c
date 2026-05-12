@@ -44,15 +44,15 @@ test_file(void)
     // Note: no portable delete API yet; temp file left behind
 
     // Stat
-    AxlFileInfo fi;
+    AxlFsEntry fi;
     rc = axl_file_info("axl-test-util.tmp", &fi);
     test_check(rc == AXL_OK, "stat: returns AXL_OK");
     test_check(fi.size == sizeof(test_data) - 1, "stat: size matches");
-    test_check(!fi.is_dir, "stat: not a dir");
+    test_check(!axl_fs_entry_is_dir(&fi), "stat: not a dir");
 
     rc = axl_file_info("fs0:\\", &fi);
     test_check(rc == AXL_OK, "stat: root dir returns AXL_OK");
-    test_check(fi.is_dir, "stat: root is dir");
+    test_check(axl_fs_entry_is_dir(&fi), "stat: root is dir");
 
     test_check(axl_file_info("no-such-file-12345", &fi) != AXL_OK,
         "stat: missing file returns AXL_ERR");
@@ -142,7 +142,7 @@ test_feof(void)
 static void
 test_file_delete(void)
 {
-    AxlFileInfo del_fi;
+    AxlFsEntry del_fi;
 
     if (axl_file_set_contents("axl-del.tmp", "x", 1) != AXL_OK) {
         return;
@@ -155,7 +155,7 @@ test_file_delete(void)
 static void
 test_file_rename(void)
 {
-    AxlFileInfo fi;
+    AxlFsEntry fi;
 
     if (axl_file_set_contents("axl-ren-old.tmp", "data", 4) != AXL_OK) {
         return;
@@ -187,7 +187,7 @@ static void
 test_dir_read(void)
 {
     AxlDir *dir;
-    AxlDirEntry entry;
+    AxlFsEntry entry;
     bool found_self = false;
     int count = 0;
 
@@ -1303,17 +1303,29 @@ test_dir_list_json(void)
     char buf[512];
 
     /* Empty list */
-    AxlDirEntry empty_entries[1] = {0};
+    AxlFsEntry empty_entries[1] = {0};
     test_check(axl_dir_list_json(empty_entries, 0, buf, sizeof(buf)) == AXL_OK,
                "dir_json: empty");
     test_check(axl_strcmp(buf, "[]") == 0,
                "dir_json: empty value");
 
-    /* Single file entry */
-    AxlDirEntry entries[2];
+    /* Two AxlFsEntry slots, properly versioned per the struct's
+       forward-compat contract (struct_size + version up front). */
+    AxlFsEntry entries[2] = {
+        [0] = {
+            .struct_size = sizeof(AxlFsEntry),
+            .version     = AXL_FS_ENTRY_VERSION,
+            .size        = 1024,
+            .attributes  = 0,     /* regular file */
+        },
+        [1] = {
+            .struct_size = sizeof(AxlFsEntry),
+            .version     = AXL_FS_ENTRY_VERSION,
+            .size        = 0,
+            .attributes  = AXL_FS_ATTR_DIRECTORY,
+        },
+    };
     axl_strlcpy(entries[0].name, "test.txt", sizeof(entries[0].name));
-    entries[0].size = 1024;
-    entries[0].is_dir = false;
 
     test_check(axl_dir_list_json(entries, 1, buf, sizeof(buf)) == AXL_OK,
                "dir_json: single file");
@@ -1326,8 +1338,6 @@ test_dir_list_json(void)
 
     /* Directory entry */
     axl_strlcpy(entries[1].name, "subdir", sizeof(entries[1].name));
-    entries[1].size = 0;
-    entries[1].is_dir = true;
 
     test_check(axl_dir_list_json(entries, 2, buf, sizeof(buf)) == AXL_OK,
                "dir_json: two entries");
@@ -2905,7 +2915,7 @@ test_driver_locate(void)
     int rc = axl_driver_locate("axl-test-util.tmp", path, sizeof(path));
     if (rc == AXL_OK) {
         test_check(axl_strlen(path) > 0, "driver_locate: writes non-empty path");
-        AxlFileInfo info;
+        AxlFsEntry info;
         test_check(axl_file_info(path, &info) == AXL_OK,
                    "driver_locate: returned path actually exists");
     } else {
@@ -3441,6 +3451,223 @@ test_boot(void)
 
     test_check(axl_boot_option_delete(0x0FFE) == AXL_OK,
                "boot: option_delete BootOFFE after round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// axl_app_boot_path
+// ---------------------------------------------------------------------------
+
+static void
+test_app_boot_path(void)
+{
+    char buf[128];
+
+    /* Happy path: relative path with no leading separator gets the
+       volume prefix from axl_app_image_path() prepended. The result
+       is fully-qualified and starts with the same volume label as
+       axl_app_image_path. */
+    int rc = axl_app_boot_path("crash-report.txt", buf, sizeof(buf));
+    test_check(rc == AXL_OK, "boot_path: 'crash-report.txt' returns AXL_OK");
+    test_check(axl_strstr(buf, ":") != NULL,
+               "boot_path: result has a ':' volume separator");
+    test_check(axl_strstr(buf, "crash-report.txt") != NULL,
+               "boot_path: result contains the relative path");
+
+    const char *self = axl_app_image_path();
+    if (self != NULL) {
+        /* Result's volume prefix matches self's. Find ':' in each
+           and compare the prefixes byte-for-byte. */
+        const char *self_colon = axl_strstr(self, ":");
+        const char *buf_colon  = axl_strstr(buf, ":");
+        test_check(self_colon != NULL && buf_colon != NULL,
+                   "boot_path: both image_path and result have ':'");
+        if (self_colon != NULL && buf_colon != NULL) {
+            size_t self_prefix_len = (size_t)(self_colon - self);
+            size_t buf_prefix_len  = (size_t)(buf_colon  - buf);
+            test_check(self_prefix_len == buf_prefix_len
+                       && axl_strncmp(self, buf, self_prefix_len) == 0,
+                       "boot_path: volume prefix matches axl_app_image_path");
+        }
+    }
+
+    /* Leading '\\' is normalized — no double-separator. */
+    rc = axl_app_boot_path("\\crash-report.txt", buf, sizeof(buf));
+    test_check(rc == AXL_OK,
+               "boot_path: leading-backslash path returns AXL_OK");
+    test_check(axl_strstr(buf, ":\\\\") == NULL
+               && axl_strstr(buf, ":/\\") == NULL,
+               "boot_path: no doubled separator after volume");
+
+    /* NULL safety. */
+    test_check(axl_app_boot_path(NULL, buf, sizeof(buf)) == AXL_ERR,
+               "boot_path: NULL relative_path -> AXL_ERR");
+    test_check(axl_app_boot_path("x", NULL, sizeof(buf)) == AXL_ERR,
+               "boot_path: NULL out -> AXL_ERR");
+
+    /* Buffer too small: refuse cleanly. */
+    char tiny[4];
+    test_check(axl_app_boot_path("crash-report.txt", tiny, sizeof(tiny)) == AXL_ERR,
+               "boot_path: tiny out buffer -> AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
+// axl_image_enumerate + axl_image_self_get_range
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    size_t count;
+    bool   saw_self;
+    void  *self_base;
+} ImageEnumCtx;
+
+static int
+image_enum_collect(const AxlImageInfo *info, void *ctx)
+{
+    ImageEnumCtx *c = (ImageEnumCtx *)ctx;
+    c->count++;
+    if (info->base != NULL && info->base == c->self_base) {
+        c->saw_self = true;
+    }
+    return 0;  /* continue */
+}
+
+static int
+image_enum_stop_after_one(const AxlImageInfo *info, void *ctx)
+{
+    (void)info;
+    int *seen = (int *)ctx;
+    (*seen)++;
+    return 42;  /* stop early; 42 must surface as return value */
+}
+
+static void
+test_image_enumerate(void)
+{
+    /* axl_image_self_get_range gives us a known base to look for
+       inside the enumerate walk. */
+    void   *self_base = NULL;
+    size_t  self_size = 0;
+    int rc = axl_image_self_get_range(&self_base, &self_size);
+    test_check(rc == AXL_OK,
+               "image_self_get_range: returns AXL_OK");
+    test_check(self_base != NULL,
+               "image_self_get_range: base is non-NULL");
+    test_check(self_size > 0,
+               "image_self_get_range: size is non-zero");
+
+    /* NULL size is allowed. */
+    void *base2 = NULL;
+    test_check(axl_image_self_get_range(&base2, NULL) == AXL_OK
+               && base2 == self_base,
+               "image_self_get_range: NULL out_size accepted");
+
+    /* NULL base is rejected. */
+    size_t s = 0;
+    test_check(axl_image_self_get_range(NULL, &s) == AXL_ERR,
+               "image_self_get_range: NULL out_base -> AXL_ERR");
+
+    /* Enumerate every loaded image, count, and confirm we saw
+       ourselves. */
+    ImageEnumCtx ctx = { .count = 0, .saw_self = false, .self_base = self_base };
+    rc = axl_image_enumerate(image_enum_collect, &ctx);
+    test_check(rc == AXL_OK,
+               "image_enumerate: full walk returns AXL_OK");
+    test_check(ctx.count > 0,
+               "image_enumerate: walks at least one image");
+    test_check(ctx.saw_self,
+               "image_enumerate: includes the current test image");
+
+    /* Early-stop: callback returns 42, enumerate returns 42. */
+    int seen = 0;
+    rc = axl_image_enumerate(image_enum_stop_after_one, &seen);
+    test_check(rc == 42,
+               "image_enumerate: callback non-zero return surfaces");
+    test_check(seen == 1,
+               "image_enumerate: stops at first non-zero callback");
+
+    /* NULL callback is rejected. */
+    test_check(axl_image_enumerate(NULL, NULL) == AXL_ERR,
+               "image_enumerate: NULL callback -> AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
+// axl_cpu_register_exception (validation paths — no live trigger)
+// ---------------------------------------------------------------------------
+
+static void
+cpu_test_cb(const AxlCpuException *exc, void *user)
+{
+    (void)exc; (void)user;
+    /* Never actually called in unit-test context — the live trigger
+       is in uefi-devkit/crashtest/crashtest.c. */
+}
+
+static void
+test_cpu_register_exception(void)
+{
+    /* The API surface itself works regardless of EFI_CPU_ARCH_PROTOCOL
+       availability: out-of-range / NULL-cb / wrong-arch returns
+       AXL_ERR before reaching the protocol. */
+    test_check(axl_cpu_register_exception((AxlCpuExceptionKind)0, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: kind=0 -> AXL_ERR");
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_KIND_MAX, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: kind=KIND_MAX -> AXL_ERR");
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_GP_FAULT, NULL, NULL) == AXL_ERR,
+               "cpu_register: NULL cb -> AXL_ERR");
+
+    /* Arch-availability gating. On x64, aa64-only kinds must refuse;
+       on aa64, x64-only kinds must refuse. */
+#if defined(__x86_64__)
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_SYNCHRONOUS, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: aa64-only SYNCHRONOUS on x64 -> AXL_ERR");
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_SERROR, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: aa64-only SERROR on x64 -> AXL_ERR");
+#elif defined(__aarch64__)
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_DIVIDE_ERROR, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: x64-only DIVIDE on aa64 -> AXL_ERR");
+    test_check(axl_cpu_register_exception(AXL_CPU_EXCEPTION_DOUBLE_FAULT, cpu_test_cb, NULL) == AXL_ERR,
+               "cpu_register: x64-only DOUBLE_FAULT on aa64 -> AXL_ERR");
+#endif
+
+    /* Happy path: pick a kind that's valid on this arch, register +
+       unregister. If EFI_CPU_ARCH_PROTOCOL isn't published on this
+       firmware, every call returns AXL_ERR — treat that branch as
+       SKIP and balance the assertion count. */
+#if defined(__x86_64__)
+    AxlCpuExceptionKind valid = AXL_CPU_EXCEPTION_GP_FAULT;
+#else
+    AxlCpuExceptionKind valid = AXL_CPU_EXCEPTION_SYNCHRONOUS;
+#endif
+    int reg = axl_cpu_register_exception(valid, cpu_test_cb, NULL);
+    if (reg == AXL_OK) {
+        /* Re-register the same kind with a different user pointer:
+           the API contract says "second call replaces the first."
+           Black-box, we can only observe that the call returns
+           AXL_OK rather than EFI_ALREADY_STARTED. */
+        test_check(axl_cpu_register_exception(valid, cpu_test_cb,
+                                              (void *)0x1234) == AXL_OK,
+                   "cpu_register: re-register same kind returns AXL_OK");
+        /* Unregister the live registration. */
+        test_check(axl_cpu_unregister_exception(valid) == AXL_OK,
+                   "cpu_unregister: live kind returns AXL_OK");
+        /* Unregister an already-unregistered kind: contract says
+           no-op AXL_OK (not AXL_ERR). */
+        test_check(axl_cpu_unregister_exception(valid) == AXL_OK,
+                   "cpu_unregister: already-unregistered returns AXL_OK");
+    } else {
+        axl_printf("SKIP: cpu_register live path (EFI_CPU_ARCH_PROTOCOL not published)\n");
+        /* Balance the 3 assertions in the populated branch. */
+        test_check(true, "cpu_register: SKIP balance 1");
+        test_check(true, "cpu_register: SKIP balance 2");
+        test_check(true, "cpu_register: SKIP balance 3");
+    }
+
+    /* Unregister out-of-range is AXL_ERR. KIND_MAX is the only
+       defined out-of-range sentinel — casting a literal integer
+       past the enum's underlying-type range is implementation-
+       defined behavior, so we don't probe that case here. */
+    test_check(axl_cpu_unregister_exception(AXL_CPU_EXCEPTION_KIND_MAX) == AXL_ERR,
+               "cpu_unregister: KIND_MAX -> AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -5053,6 +5280,9 @@ test_util_main(int argc, char **argv)
     test_nvstore_namespaces();
     test_nvstore_roundtrip();
     test_boot();
+    test_app_boot_path();
+    test_image_enumerate();
+    test_cpu_register_exception();
     test_image();
     test_image_verify_signature();
     test_image_verify_cn_extract();

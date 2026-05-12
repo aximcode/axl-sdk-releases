@@ -387,9 +387,9 @@ list_bundle_volume(const char *fs_name)
     }
 
     size_t shown = 0;
-    AxlDirEntry entry;
+    AxlFsEntry entry;
     while (axl_dir_read(dir, &entry)) {
-        if (entry.is_dir) continue;
+        if (axl_fs_entry_is_dir(&entry)) continue;
         size_t nlen = axl_strlen(entry.name);
         bool is_driver =
             (nlen > 4 && axl_strcmp(entry.name + nlen - 4, ".efi") == 0)

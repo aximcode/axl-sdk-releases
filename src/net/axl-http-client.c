@@ -1101,7 +1101,7 @@ axl_http_request_stream_file(AxlHttpClient *c, const char *method,
                              AxlHashTable *extra_headers,
                              AxlHttpClientResponse **out_resp)
 {
-    AxlFileInfo info;
+    AxlFsEntry info;
     if (c == NULL || method == NULL || url == NULL || path == NULL) {
         return AXL_ERR;
     }
@@ -1109,7 +1109,7 @@ axl_http_request_stream_file(AxlHttpClient *c, const char *method,
         axl_warning("stream_file: cannot stat '%s'", path);
         return AXL_ERR;
     }
-    if (info.is_dir) {
+    if (axl_fs_entry_is_dir(&info)) {
         axl_warning("stream_file: '%s' is a directory", path);
         return AXL_ERR;
     }

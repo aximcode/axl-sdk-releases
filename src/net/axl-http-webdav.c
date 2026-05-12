@@ -297,13 +297,13 @@ compose_href(const AxlWebDavCtx *ctx, const char *rel, bool is_dir,
    the AxlXmlWriter. */
 static void
 emit_entry(AxlXmlWriter *w, const AxlWebDavCtx *ctx,
-           const char *rel, const AxlWebDavEntry *e)
+           const char *rel, const AxlFsEntry *e)
 {
     axl_xml_writer_start_element(w, "D:response");
 
     /* href */
     char href[1024];
-    if (compose_href(ctx, rel, e->is_dir, href, sizeof(href))) {
+    if (compose_href(ctx, rel, axl_fs_entry_is_dir(e), href, sizeof(href))) {
         axl_xml_writer_start_element(w, "D:href");
         axl_xml_writer_text(w, href);
         axl_xml_writer_end_element(w);
@@ -318,7 +318,7 @@ emit_entry(AxlXmlWriter *w, const AxlWebDavCtx *ctx,
 
     /* resourcetype */
     axl_xml_writer_start_element(w, "D:resourcetype");
-    if (e->is_dir) {
+    if (axl_fs_entry_is_dir(e)) {
         axl_xml_writer_start_element(w, "D:collection");
         axl_xml_writer_end_element(w);
     }
@@ -331,7 +331,7 @@ emit_entry(AxlXmlWriter *w, const AxlWebDavCtx *ctx,
 
     /* getcontentlength — files only; directories don't carry a
        meaningful size per RFC 4918 §15.4. */
-    if (!e->is_dir) {
+    if (!axl_fs_entry_is_dir(e)) {
         char clen[32];
         axl_snprintf(clen, sizeof(clen), "%llu",
                      (unsigned long long)e->size);
@@ -403,7 +403,7 @@ on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     /* Stat the resource itself first — drives both the Depth=0
        case AND the parent <D:response> in Depth=1. RFC 4918 §9.1
        says a missing resource returns 404 (not a 207 envelope). */
-    AxlWebDavEntry self;
+    AxlFsEntry self;
     axl_memset(&self, 0, sizeof(self));
     if (ctx->ops.stat(ctx->user_data, rel, &self) != AXL_OK) {
         resp->status_code = 404;
@@ -443,11 +443,11 @@ on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
 
     /* Children — only when Depth > 0 AND the resource is a dir
        AND the consumer wired list_dir. */
-    if (include_children && self.is_dir && ctx->ops.list_dir != NULL) {
+    if (include_children && axl_fs_entry_is_dir(&self) && ctx->ops.list_dir != NULL) {
         /* Cap: enough for typical UEFI volumes. Consumers with
            larger directories should paginate at a higher layer
            (out of scope for v1). */
-        AxlWebDavEntry kids[256];
+        AxlFsEntry kids[256];
         size_t kids_max = sizeof(kids) / sizeof(kids[0]);
         size_t count = 0;
         if (ctx->ops.list_dir(ctx->user_data, rel, kids,
@@ -550,13 +550,13 @@ on_get_or_head(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
         return 0;
     }
 
-    AxlWebDavEntry e;
+    AxlFsEntry e;
     axl_memset(&e, 0, sizeof(e));
     if (ctx->ops.stat(ctx->user_data, rel, &e) != AXL_OK) {
         resp->status_code = 404;
         return 0;
     }
-    if (e.is_dir) {
+    if (axl_fs_entry_is_dir(&e)) {
         /* GET on a collection — could redirect to a directory
            listing, render HTML, or return PROPFIND-equivalent.
            v1 returns 405; clients use PROPFIND for directory
@@ -1169,7 +1169,7 @@ on_copy(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
        than the generic 409 the ops.copy = AXL_ERR path would map
        to. MOVE doesn't do this today; it's a known follow-up. */
     if (ctx->ops.stat != NULL) {
-        AxlWebDavEntry self;
+        AxlFsEntry self;
         axl_memset(&self, 0, sizeof(self));
         if (ctx->ops.stat(ctx->user_data, src, &self) != AXL_OK) {
             resp->status_code = 404;

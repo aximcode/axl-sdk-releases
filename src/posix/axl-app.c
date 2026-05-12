@@ -45,8 +45,8 @@ static char  *mImagePath;  /* UTF-8 of LoadedImage->FilePath, NULL if unknown */
    forever (EFI_DP_NEXT advances by Length). */
 #define MAX_DP_NODES           64u
 
-static char *
-_decode_image_filepath(EFI_DEVICE_PATH_PROTOCOL *dp)
+char *
+_axl_decode_image_filepath(EFI_DEVICE_PATH_PROTOCOL *dp)
 {
     if (dp == NULL) {
         return NULL;
@@ -154,8 +154,8 @@ _decode_image_filepath(EFI_DEVICE_PATH_PROTOCOL *dp)
    device-path protocol installed, or no shell mapping covers the
    handle. The caller falls back to the prefix-less @p file_path
    in that case. */
-static char *
-_prepend_volume_mapping(void *device_handle, const char *file_path)
+char *
+_axl_prepend_volume_mapping(void *device_handle, const char *file_path)
 {
     if (device_handle == NULL || file_path == NULL) {
         return NULL;
@@ -373,11 +373,11 @@ _axl_args_init(void *image_handle)
        why a `cd \` in startup.nsh used to be required for sidecar
        discovery; the prefix makes it unnecessary. */
     if (!EFI_ERROR(status) && li != NULL && li->FilePath != NULL) {
-        mImagePath = _decode_image_filepath(
+        mImagePath = _axl_decode_image_filepath(
             (EFI_DEVICE_PATH_PROTOCOL *)li->FilePath);
         if (mImagePath != NULL && li->DeviceHandle != NULL) {
             char *with_volume =
-                _prepend_volume_mapping(li->DeviceHandle, mImagePath);
+                _axl_prepend_volume_mapping(li->DeviceHandle, mImagePath);
             if (with_volume != NULL) {
                 axl_free(mImagePath);
                 mImagePath = with_volume;
@@ -450,4 +450,48 @@ const char *
 axl_app_image_path(void)
 {
     return mImagePath;
+}
+
+int
+axl_app_boot_path(
+    const char *relative_path,
+    char       *out,
+    size_t      out_size)
+{
+    if (relative_path == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+    if (mImagePath == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Find the ':' marking the end of the volume label in
+       mImagePath. The decoded form is "<vol>:<path>" where <vol>
+       is "fs0" / "fs1" / ... — anything before the first ':' is
+       the prefix we want to keep, plus the ':' itself. */
+    const char *colon = axl_strchr(mImagePath, ':');
+    if (colon == NULL) {
+        /* Image path has no volume prefix — happens on network
+           boot, RAM-disk-with-no-source-volume, etc. Refuse rather
+           than silently producing a path that won't resolve. */
+        return AXL_ERR;
+    }
+    size_t prefix_len = (size_t)(colon - mImagePath) + 1;  /* include ':' */
+
+    /* Skip leading separators in relative_path so the joined path
+       has exactly one backslash between prefix and tail.
+       axl_fs accepts forward slashes too, but the canonical UEFI
+       form is backslash; we emit that. */
+    const char *rel = relative_path;
+    while (*rel == '\\' || *rel == '/') {
+        rel++;
+    }
+
+    /* out = <volume-prefix-with-colon> + '\\' + <rel> */
+    int n = axl_snprintf(out, out_size, "%.*s\\%s",
+                         (int)prefix_len, mImagePath, rel);
+    if (n < 0 || (size_t)n >= out_size) {
+        return AXL_ERR;
+    }
+    return AXL_OK;
 }

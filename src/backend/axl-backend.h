@@ -105,7 +105,9 @@ typedef struct {
     uint8_t   hour;
     uint8_t   minute;
     uint8_t   second;
+    uint8_t   daylight;           ///< raw EFI_TIME.Daylight bits (bit 0 = DST active)
     uint32_t  nanosecond;
+    int16_t   timezone_minutes;   ///< signed minutes from UTC; INT16_MIN if firmware reports EFI_UNSPECIFIED_TIMEZONE
 } AxlTime;
 
 /**

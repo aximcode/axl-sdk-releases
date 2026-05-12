@@ -149,43 +149,58 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 
 int
 axl_file_info(
-    const char  *path,
-    AxlFileInfo *info
+    const char *path,
+    AxlFsEntry *entry
     )
 {
     unsigned short *wide_path;
     int rc;
+    uint64_t size = 0, alloc_size = 0, mtime_unix = 0;
+    bool is_dir = false, read_only = false;
 
-    if (path == NULL || info == NULL) {
+    if (path == NULL || entry == NULL) {
         return AXL_ERR;
     }
+
+    /* Zero the whole struct up-front so even a careless caller that
+       skips the rc check sees a defined (empty) entry, not partial
+       stack from the backend. */
+    axl_memset(entry, 0, sizeof(*entry));
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
         return AXL_ERR;
     }
 
+    /* Backend's stat predates AxlFsEntry; bridges via temp scalars
+       and merges into the bitmask below. */
     rc = axl_backend_file_stat(
         (const unsigned short *)wide_path,
-        &info->size,
-        &info->alloc_size,
-        &info->mtime_unix,
-        &info->is_dir,
-        &info->read_only
-        );
+        &size, &alloc_size, &mtime_unix,
+        &is_dir, &read_only);
     axl_free(wide_path);
-    return rc;
+    if (rc != AXL_OK) return rc;
+
+    entry->struct_size = sizeof(*entry);
+    entry->version     = AXL_FS_ENTRY_VERSION;
+    /* Path-stat doesn't populate name (caller has the path). */
+    entry->size        = size;
+    entry->alloc_size  = alloc_size;
+    entry->mtime_unix  = mtime_unix;
+    entry->attributes  = (is_dir    ? AXL_FS_ATTR_DIRECTORY : 0u)
+                       | (read_only ? AXL_FS_ATTR_READ_ONLY : 0u);
+    return AXL_OK;
 }
 
 bool
 axl_file_is_dir(const char *path)
 {
-    AxlFileInfo info;
+    AxlFsEntry entry;
 
-    if (axl_file_info(path, &info) != AXL_OK) {
+    if (axl_file_info(path, &entry) != AXL_OK) {
         return false;
     }
-    return info.is_dir;
+    return axl_fs_entry_is_dir(&entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +449,7 @@ axl_dir_open(const char *path)
 }
 
 bool
-axl_dir_read(AxlDir *dir, AxlDirEntry *entry)
+axl_dir_read(AxlDir *dir, AxlFsEntry *entry)
 {
     size_t buf_size;
     int rc;
@@ -461,13 +476,19 @@ axl_dir_read(AxlDir *dir, AxlDirEntry *entry)
     uint64_t attribute;
     unsigned short *filename;
 
-    axl_memcpy(&file_size, dir->buf + 8, sizeof(uint64_t));
+    axl_memcpy(&file_size, dir->buf + 8,  sizeof(uint64_t));
     axl_memcpy(&attribute, dir->buf + 72, sizeof(uint64_t));
     filename = (unsigned short *)(dir->buf + 80);
 
-    entry->size       = file_size;
-    entry->mtime_unix = axl_backend_efi_time_to_unix(dir->buf + 56);
-    entry->is_dir     = (attribute & 0x10) != 0;  /* EFI_FILE_DIRECTORY */
+    entry->struct_size = sizeof(*entry);
+    entry->version     = AXL_FS_ENTRY_VERSION;
+    entry->size        = file_size;
+    entry->alloc_size  = 0;
+    entry->mtime_unix  = axl_backend_efi_time_to_unix(dir->buf + 56);
+    /* EFI attribute → AXL attribute bits. EFI_FILE_DIRECTORY is
+       0x10, READ_ONLY 0x01, etc. — AXL constants chosen identical
+       so this is a literal mask copy. */
+    entry->attributes  = (uint32_t)(attribute & 0x37u);
 
     /* Convert UCS-2 filename to UTF-8 */
     char *utf8 = axl_ucs2_to_utf8(filename);
@@ -533,7 +554,7 @@ dir_walk_recursive(
                       && (root[root_len - 1] == '/'
                           || root[root_len - 1] == '\\'));
 
-    AxlDirEntry entry;
+    AxlFsEntry  entry;
     int         rc = 0;
     while (rc == 0 && axl_dir_read(dir, &entry)) {
         if (axl_strcmp(entry.name, ".") == 0
@@ -550,7 +571,7 @@ dir_walk_recursive(
         rc = fn(full_path, &entry, user);
         if (rc != 0) break;
 
-        if (entry.is_dir && levels_remaining > 1) {
+        if (axl_fs_entry_is_dir(&entry) && levels_remaining > 1) {
             rc = dir_walk_recursive(full_path, fn, user, levels_remaining - 1);
             /* Treat "couldn't open subdir" as a soft skip — the
                caller asked for a walk, not a strict tree-must-be-
@@ -728,10 +749,10 @@ axl_volume_get_label_by_handle(
 
 int
 axl_dir_list_json(
-    const AxlDirEntry *entries,
-    size_t             count,
-    char              *buf,
-    size_t             buf_size)
+    const AxlFsEntry *entries,
+    size_t            count,
+    char             *buf,
+    size_t            buf_size)
 {
     size_t pos = 0;
     int    n;
@@ -759,7 +780,7 @@ axl_dir_list_json(
             "{\"name\":\"%s\",\"size\":%llu,\"dir\":%s}",
             entries[i].name,
             (unsigned long long)entries[i].size,
-            entries[i].is_dir ? "true" : "false");
+            axl_fs_entry_is_dir(&entries[i]) ? "true" : "false");
 
         if (n < 0 || (size_t)n >= buf_size - pos) {
             return AXL_ERR;

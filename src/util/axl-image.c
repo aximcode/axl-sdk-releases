@@ -18,10 +18,12 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-image-internal.h"
 #include <axl/axl-image.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-log.h>
+#include <axl/axl-sys.h>     /* gImageHandle pulled in for self lookup */
 
 AXL_LOG_DOMAIN("image");
 
@@ -108,4 +110,118 @@ axl_image_unload(
     }
     axl_free(img);
     return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Public — enumeration + self introspection
+// ---------------------------------------------------------------------------
+
+extern EFI_HANDLE gImageHandle;   /* set by the runtime at startup */
+
+/* Fill @p out for the loaded image at @p handle. The decoded
+   filepath is heap-allocated via _axl_decode_image_filepath /
+   _axl_prepend_volume_mapping; ownership transfers into
+   @p out_owned_path so the caller can free after the consumer
+   callback returns. Returns AXL_OK / AXL_ERR. */
+static int
+fill_image_info(
+    EFI_HANDLE     handle,
+    AxlImageInfo  *out,
+    char         **out_owned_path)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    EFI_GUID                   li_guid = gEfiLoadedImageProtocolGuid;
+    EFI_STATUS                 status =
+        axl_bs()->HandleProtocol(handle, &li_guid, (void **)&li);
+    if (EFI_ERROR(status) || li == NULL || li->ImageBase == NULL) {
+        return AXL_ERR;
+    }
+
+    out->base = li->ImageBase;
+    out->size = (size_t)li->ImageSize;
+    out->path = NULL;
+    *out_owned_path = NULL;
+
+    if (li->FilePath != NULL) {
+        char *decoded = _axl_decode_image_filepath(
+            (EFI_DEVICE_PATH_PROTOCOL *)li->FilePath);
+        if (decoded != NULL && li->DeviceHandle != NULL) {
+            char *with_volume =
+                _axl_prepend_volume_mapping(li->DeviceHandle, decoded);
+            if (with_volume != NULL) {
+                axl_free(decoded);
+                decoded = with_volume;
+            }
+        }
+        *out_owned_path = decoded;
+        out->path       = decoded;
+    }
+    return AXL_OK;
+}
+
+int
+axl_image_enumerate(
+    AxlImageIterFn  cb,
+    void           *ctx)
+{
+    if (cb == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_GUID    li_guid       = gEfiLoadedImageProtocolGuid;
+    UINTN       handle_count  = 0;
+    EFI_HANDLE *handles       = NULL;
+    EFI_STATUS  status        = axl_bs()->LocateHandleBuffer(
+        ByProtocol, &li_guid, NULL, &handle_count, &handles);
+    if (EFI_ERROR(status) || handles == NULL) {
+        return AXL_ERR;
+    }
+
+    int rc = AXL_OK;
+    for (UINTN i = 0; i < handle_count; i++) {
+        AxlImageInfo info       = { 0 };
+        char        *owned_path = NULL;
+        if (fill_image_info(handles[i], &info, &owned_path) != AXL_OK) {
+            continue;
+        }
+        int cb_rc = cb(&info, ctx);
+        axl_free(owned_path);
+        if (cb_rc != 0) {
+            rc = cb_rc;
+            break;
+        }
+    }
+
+    axl_bs()->FreePool(handles);
+    return rc;
+}
+
+int
+axl_image_self_get_range(
+    void   **out_base,
+    size_t  *out_size)
+{
+    if (out_base == NULL) {
+        return AXL_ERR;
+    }
+    *out_base = NULL;
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+    if (gImageHandle == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    EFI_GUID                   li_guid = gEfiLoadedImageProtocolGuid;
+    EFI_STATUS                 status =
+        axl_bs()->HandleProtocol(gImageHandle, &li_guid, (void **)&li);
+    if (EFI_ERROR(status) || li == NULL) {
+        return AXL_ERR;
+    }
+    *out_base = li->ImageBase;
+    if (out_size != NULL) {
+        *out_size = (size_t)li->ImageSize;
+    }
+    return AXL_OK;
 }

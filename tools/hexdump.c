@@ -121,7 +121,7 @@ static int
 run_hexdump(AxlArgs *a)
 {
     AxlStream  *file;
-    AxlFileInfo fi;
+    AxlFsEntry fi;
     uint64_t    file_size;
     bool        has_length;
     uint8_t     buf[16];

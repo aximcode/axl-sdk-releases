@@ -112,3 +112,25 @@ axl_time_get_us(void)
        needing the internal backend header. */
     return axl_backend_get_monotonic_us();
 }
+
+int
+axl_time_realtime(AxlRealtime *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    AxlTime t = { 0 };
+    if (axl_backend_get_time(&t) != AXL_OK) {
+        return AXL_ERR;
+    }
+    out->year             = t.year;
+    out->month            = t.month;
+    out->day              = t.day;
+    out->hour             = t.hour;
+    out->minute           = t.minute;
+    out->second           = t.second;
+    out->nanosecond       = t.nanosecond;
+    out->timezone_minutes = t.timezone_minutes;
+    out->flags            = (t.daylight & 0x01) ? AXL_TIME_FLAG_DAYLIGHT : 0;
+    return AXL_OK;
+}

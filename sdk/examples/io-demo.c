@@ -12,13 +12,13 @@
 static int
 io_demo_print_entry(
     const char         *full_path,
-    const AxlDirEntry  *entry,
+    const AxlFsEntry  *entry,
     void               *user
     )
 {
     (void)full_path;
     (void)user;
-    if (entry->is_dir) {
+    if (axl_fs_entry_is_dir(entry)) {
         axl_printf("  [DIR]  %s\n", entry->name);
     } else {
         axl_printf("  %5llu  %s\n",
@@ -109,13 +109,13 @@ main(int argc, char **argv)
 
     /* ---- 7. File info ---- */
 
-    AxlFileInfo info;
+    AxlFsEntry info;
     rc = axl_file_info("test.txt", &info);
     if (rc == AXL_OK) {
         axl_printf("test.txt info: size=%llu dir=%s ro=%s\n",
                    (unsigned long long)info.size,
-                   info.is_dir ? "yes" : "no",
-                   info.read_only ? "yes" : "no");
+                   axl_fs_entry_is_dir(&info) ? "yes" : "no",
+                   axl_fs_entry_is_read_only(&info) ? "yes" : "no");
     }
 
     /* ---- 8. Directory operations ---- */

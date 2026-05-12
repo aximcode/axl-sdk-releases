@@ -205,6 +205,8 @@ LIB_SOURCES = \
     src/stream/axl-stream-file.c \
     src/stream/axl-stream-text.c \
     src/fs/axl-fs.c \
+    src/fs/axl-fs-provider.c \
+    src/fs/axl-device-path.c \
     src/util/axl-path.c \
     src/util/axl-hexdump.c \
     src/util/axl-time.c \
@@ -214,6 +216,7 @@ LIB_SOURCES = \
     src/util/axl-port.c \
     src/util/axl-boot.c \
     src/util/axl-image.c \
+    src/util/axl-cpu.c \
     src/util/axl-mem-phys.c \
     src/util/axl-watchdog.c \
     src/util/axl-rng.c \
@@ -915,7 +918,7 @@ TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \
         AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
-        AxlTestCpuIdle AxlTestRuntime AxlTestXml
+        AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -947,6 +950,7 @@ $(eval $(call BUILD_TEST,AxlTestEvent,axl-test-event))
 $(eval $(call BUILD_TEST,AxlTestCpuIdle,axl-test-cpu-idle))
 $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 $(eval $(call BUILD_TEST,AxlTestXml,axl-test-xml))
+$(eval $(call BUILD_TEST,AxlTestFsProvider,axl-test-fs-provider))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)

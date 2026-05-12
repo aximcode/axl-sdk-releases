@@ -1789,6 +1789,38 @@ Integration:
 
 ---
 
+## EFI Encapsulation — public-API hygiene (Future)
+
+Three-phase plan to eliminate `EFI_*` / `gBS` / `gRT` / `EFIAPI` /
+`#include <uefi/...>` from all axl-sdk consumer code, including
+spec-protocol publishers. Full design in
+[AXL-EFI-Encapsulation-Plan.md](AXL-EFI-Encapsulation-Plan.md);
+audit baseline captured there.
+
+- **Phase A** (v0.18.0, ~1 day) — uefi-devkit crashhandler's
+  `report.c` migrates to `axl_nvstore_*` + `axl_fs_*` + new
+  helpers `axl_app_boot_open`, `axl_image_get_base`. No new SDK
+  abstractions invented; existing primitives nobody reached for.
+- **Phase B** (v0.18.0 or v0.18.1, ~1.5–2.5 days) — new
+  `<axl/axl-cpu.h>` with typed `AxlCpuException` context; thunks
+  internally over `EFI_CPU_ARCH_PROTOCOL`'s
+  `RegisterInterruptHandler`. Crashhandler exception path drops
+  all `EFI_*` references.
+- **Phase C** (v0.19.0, ~1.5 weeks) — new
+  `<axl/axl-fs-provider.h>` with consumer-supplied vtable +
+  SDK-emitted `EFI_FILE_PROTOCOL` / `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`
+  thunks + UCS-2 ↔ UTF-8 boundary marshalling. axl-webfs's
+  `src/mount/` rewrites against the new abstraction; ~148 EFI
+  hits → 0. Second FS-provider consumer (HTTP-mirror, compressed
+  bundle, mock-fs for tests) becomes a ~50-LOC project.
+
+After all three: consumers `#include <axl.h>` and write zero
+`EFI_*` identifiers in any source file, even for drivers,
+protocols, and spec-interface publishing. `<uefi/...>` becomes
+transitive-only.
+
+---
+
 ## API Hygiene — Return Value Conventions (Future)
 
 The public API surface mixes return-value shapes that pre-date a

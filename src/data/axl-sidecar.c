@@ -77,7 +77,7 @@ axl_sidecar_open_file(
        problem" from "authoring problem." TOCTOU window between the
        info call and the load is theoretical on a single-threaded
        UEFI system without concurrent FS mutators. */
-    AxlFileInfo finfo;
+    AxlFsEntry finfo;
     if (axl_file_info(path, &finfo) != AXL_OK) {
         return AXL_SIDECAR_FILE_MISSING;
     }

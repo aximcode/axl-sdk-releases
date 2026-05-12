@@ -222,9 +222,9 @@ grep_stream(
 // ---------------------------------------------------------------------------
 
 static int
-grep_walk_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+grep_walk_cb(const char *full_path, const AxlFsEntry *entry, void *user)
 {
-    if (!entry->is_dir) {
+    if (!axl_fs_entry_is_dir(entry)) {
         GrepWalkCtx *c = (GrepWalkCtx *)user;
         c->total += grep_stream(c->pattern, full_path, true);
     }

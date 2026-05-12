@@ -94,8 +94,17 @@ mkdir -p "$PREFIX/bin" \
 AXL_VERSION=$(cat "$SDK_DIR/VERSION")
 
 for arch in "${ARCHES[@]}"; do
-    local_prefix="out/native-$arch"
-    log_info "Building ($arch, gcc)..."
+    # Build into a BUILD-mode-segregated prefix so install.sh's
+    # RELEASE artifacts don't poison the in-tree DEBUG cache that
+    # `make ARCH=$arch tests` (default BUILD=DEBUG) reuses. Sharing
+    # the prefix used to silently produce a mixed-flag libaxl.a:
+    # the .o cache key includes only the .c timestamp, not the
+    # BUILD mode, so a RELEASE-built axl-mem.o would survive into
+    # a subsequent DEBUG build and the alloc-fill / fence machinery
+    # would be missing — visible as the test_debug_features 0xDA
+    # flake.
+    local_prefix="out/native-$arch-release"
+    log_info "Building ($arch, gcc, RELEASE)..."
     make -C "$LIBAXL_DIR" \
         ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
         ${AXL_TLS:+AXL_TLS=$AXL_TLS} \

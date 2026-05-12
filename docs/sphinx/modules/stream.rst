@@ -18,3 +18,13 @@ AxlFs — filesystem operations
 -----------------------------
 
 .. doxygenfile:: axl-fs.h
+
+AxlFsProvider — publish a UEFI-visible filesystem
+-------------------------------------------------
+
+.. doxygenfile:: axl-fs-provider.h
+
+AxlDevicePath — UEFI device-path constructors
+---------------------------------------------
+
+.. doxygenfile:: axl-device-path.h

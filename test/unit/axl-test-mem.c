@@ -157,14 +157,28 @@ test_debug_features(void)
     bool all_da;
     size_t i;
 
-    // Alloc fill: fresh malloc'd memory should be 0xDA
+    // Alloc fill: fresh malloc'd memory should be 0xDA. Failure
+    // here is almost always a stale RELEASE-mode axl-mem.o being
+    // reused in a DEBUG build (the .o cache key doesn't include
+    // BUILD mode); see scripts/install.sh's BUILD-segregated
+    // prefix for the install-side guard.
     p = (uint8_t *)axl_malloc(32);
     all_da = true;
+    size_t bad_index = 0;
+    uint8_t bad_value = 0;
     for (i = 0; i < 32; i++) {
         if (p[i] != 0xDA) {
             all_da = false;
+            bad_index = i;
+            bad_value = p[i];
             break;
         }
+    }
+    if (!all_da) {
+        axl_printf("    (debug-fill failure: byte[%zu]=0x%02x; "
+                   "likely stale RELEASE-mode .o in libaxl.a — "
+                   "try `make clean && make`)\n",
+                   bad_index, bad_value);
     }
     test_check(all_da, "debug: alloc fill 0xDA");
     axl_free(p);

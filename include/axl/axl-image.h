@@ -98,6 +98,74 @@ axl_image_unload(
     AxlImage  *img   ///< image handle from axl_image_load
 );
 
+/**
+ * @brief Snapshot of a loaded image as visible to the firmware.
+ *
+ * Returned by `axl_image_enumerate`'s callback and
+ * `axl_image_self_get_range`. The string fields point into runtime-
+ * owned storage that's valid for the duration of the callback (or
+ * until the next call for `_self_get_range`); copy if you need it
+ * longer.
+ */
+typedef struct {
+    void       *base;   ///< image load address in memory
+    size_t      size;   ///< image size in bytes
+    const char *path;   ///< UTF-8 path (e.g. "fs0:\\drivers\\foo.efi"), or NULL
+                        ///< if the firmware doesn't expose it
+} AxlImageInfo;
+
+/**
+ * @brief Iterator callback for `axl_image_enumerate`.
+ *
+ * @return 0 to continue iteration, non-zero to stop. The non-zero
+ *     value is returned to the `axl_image_enumerate` caller.
+ */
+typedef int (*AxlImageIterFn)(
+    const AxlImageInfo *info,
+    void               *ctx
+);
+
+/**
+ * @brief Walk every currently-loaded image, invoking @p cb once per image.
+ *
+ * Backend-neutral abstraction over UEFI's
+ * `LocateHandleBuffer(EFI_LOADED_IMAGE_PROTOCOL)` + per-handle
+ * `HandleProtocol`. The callback receives a layout-stable
+ * `AxlImageInfo` — consumer code never sees `EFI_LOADED_IMAGE_PROTOCOL`.
+ *
+ * @p info->path may be NULL for images whose firmware FilePath
+ * couldn't be decoded (e.g. synthetic loads or in-memory images).
+ * Callers that use the path for display should fall back to a
+ * placeholder.
+ *
+ * @return AXL_OK if the walk completed, the callback's non-zero
+ *     value if it stopped early, or AXL_ERR on enumeration failure.
+ */
+int
+axl_image_enumerate(
+    AxlImageIterFn  cb,
+    void           *ctx
+);
+
+/**
+ * @brief Get the base address and size of the currently-running image.
+ *
+ * Convenience over `axl_image_enumerate` when the caller only wants
+ * the self image's range — used for fault attribution and similar
+ * "where am I in memory" checks. Equivalent to walking
+ * `axl_image_enumerate` and matching the entry whose path equals
+ * `axl_app_image_path()`, but cheaper.
+ *
+ * @return AXL_OK on success (@p out_base and @p out_size populated);
+ *     AXL_ERR if firmware doesn't expose the loaded-image protocol
+ *     for the current image (extremely unusual).
+ */
+int
+axl_image_self_get_range(
+    void   **out_base,   ///< [out] image base load address
+    size_t  *out_size    ///< [out] image size in bytes (NULL allowed)
+);
+
 #ifdef __cplusplus
 }
 #endif

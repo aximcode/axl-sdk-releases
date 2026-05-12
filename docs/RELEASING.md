@@ -18,18 +18,27 @@ helper, has burned us before.
   ./test/integration/test-cpu-idle.sh
   ```
 
-- Both archs build clean against `BUILD=RELEASE`:
+- Both archs build clean against `BUILD=RELEASE`. Use a separate
+  `PREFIX` so the RELEASE-flagged `.o` files don't shadow the
+  in-tree DEBUG cache the integration tests above reuse — the
+  `.o` cache key is the `.c` timestamp only, not the `BUILD`
+  mode, so a same-prefix RELEASE compile leaves `.o` files newer
+  than the `.c` source and a subsequent default `make` reuses
+  them with the wrong flags. Symptom: the
+  `debug: alloc fill 0xDA` test fails (axl-mem.o built without
+  `-DAXL_MEM_DEBUG`). `scripts/install.sh` uses the `-release`
+  prefix internally for the same reason.
 
   ```sh
-  make ARCH=x64 BUILD=RELEASE
-  make ARCH=aa64 BUILD=RELEASE
+  make ARCH=x64  BUILD=RELEASE PREFIX=out/native-x64-release
+  make ARCH=aa64 BUILD=RELEASE PREFIX=out/native-aa64-release
   ```
 
 - TLS-enabled build is green if you touched anything in `src/net/`
   (release.yml hardcodes `AXL_TLS=1` for the published packages):
 
   ```sh
-  AXL_TLS=1 make ARCH=x64 BUILD=RELEASE
+  AXL_TLS=1 make ARCH=x64 BUILD=RELEASE PREFIX=out/native-x64-release
   ```
 
 ## Cut the release

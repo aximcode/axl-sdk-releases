@@ -82,27 +82,89 @@ axl_file_is_dir(
 typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx);
 
 // ---------------------------------------------------------------------------
-// File metadata (stat)
+// Open-mode flags + attribute bitmask
 // ---------------------------------------------------------------------------
 
-/// File metadata (UEFI EFI_FILE_INFO equivalent).
-typedef struct {
-    uint64_t  size;         ///< file size in bytes
-    uint64_t  alloc_size;   ///< physical allocation size on disk
-    uint64_t  mtime_unix;   ///< modification time, Unix epoch seconds (0 = unknown)
-    bool      is_dir;       ///< true if directory
-    bool      read_only;    ///< true if read-only attribute set
-} AxlFileInfo;
+/// Open-mode flags for `axl_fopen` (axl-stream) and the
+/// `<axl/axl-fs-provider.h>` `open` callback.
+///
+/// READ (0x1) and WRITE (0x2) are bit-identical to the
+/// corresponding `EFI_FILE_MODE_*` constants; CREATE is **renumbered**
+/// (0x4 here vs `0x8000000000000000` for `EFI_FILE_MODE_CREATE`).
+/// The SDK thunk at the AxlFsProvider boundary translates explicitly.
+#define AXL_FS_OPEN_READ    0x1u   ///< open for reading
+#define AXL_FS_OPEN_WRITE   0x2u   ///< open for writing (requires READ)
+#define AXL_FS_OPEN_CREATE  0x4u   ///< create if missing (requires WRITE)
+
+/// File / directory attribute bits — mirror EFI_FILE_* attribute
+/// bits in axl shape. Used in `AxlFsEntry.attributes` and the
+/// `attributes` parameter to the fs-provider open callback.
+#define AXL_FS_ATTR_READ_ONLY   0x01u
+#define AXL_FS_ATTR_HIDDEN      0x02u
+#define AXL_FS_ATTR_SYSTEM      0x04u
+#define AXL_FS_ATTR_DIRECTORY   0x10u
+#define AXL_FS_ATTR_ARCHIVE     0x20u
+
+// ---------------------------------------------------------------------------
+// AxlFsEntry — file / directory metadata
+// ---------------------------------------------------------------------------
+
+/// Current `AxlFsEntry.version` value emitted by the SDK. Bumped
+/// when the struct gains a new field. Forward-compat: callers test
+/// `entry.struct_size >= offsetof(AxlFsEntry, new_field) +
+/// sizeof(new_field)` before reading anything added in version > 1.
+#define AXL_FS_ENTRY_VERSION  1
 
 /**
- * @brief Get file metadata. Wraps UEFI EFI_FILE_INFO.
+ * @brief Canonical file / directory metadata.
+ *
+ * One struct, three uses:
+ *  - `axl_file_info(path, &entry)` — path-based stat.
+ *  - `axl_dir_read(dir, &entry)` — next directory entry; `name`
+ *    populated with the basename only.
+ *  - `<axl/axl-fs-provider.h>` callbacks `get_info`, `read_dir`,
+ *    `set_info` — provider authors fill / read this same struct.
+ *
+ * Pre-Phase-C this was three different structs (`AxlFileInfo`,
+ * `AxlDirEntry`, `AxlFsProviderInfo`) carrying the same data in
+ * different shapes; collapsed in Phase C cleanup.
+ */
+typedef struct {
+    uint32_t struct_size;     ///< sizeof(AxlFsEntry) at write time
+    uint32_t version;         ///< AXL_FS_ENTRY_VERSION at write time
+    char     name[256];       ///< basename UTF-8; empty for path-stat / root
+    uint64_t size;            ///< file size in bytes (0 for directories)
+    uint64_t alloc_size;      ///< physical size on disk; 0 if unknown
+    uint64_t mtime_unix;      ///< modification time, Unix epoch seconds (0 = unknown)
+    uint32_t attributes;      ///< AXL_FS_ATTR_* bitmask
+} AxlFsEntry;
+
+/// Convenience: test the DIRECTORY attribute bit.
+static inline bool
+axl_fs_entry_is_dir(const AxlFsEntry *e)
+{
+    return e != NULL && (e->attributes & AXL_FS_ATTR_DIRECTORY) != 0u;
+}
+
+/// Convenience: test the READ_ONLY attribute bit.
+static inline bool
+axl_fs_entry_is_read_only(const AxlFsEntry *e)
+{
+    return e != NULL && (e->attributes & AXL_FS_ATTR_READ_ONLY) != 0u;
+}
+
+/**
+ * @brief Get file metadata for a path. Wraps UEFI EFI_FILE_INFO.
+ *
+ * `entry->name` is populated with the basename; the rest of the
+ * fields hold the file's stat data.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
 axl_file_info(
-    const char  *path, ///< file path (UTF-8)
-    AxlFileInfo *info  ///< [out] receives file metadata
+    const char  *path,  ///< file path (UTF-8)
+    AxlFsEntry  *entry  ///< [out] receives file metadata
 );
 
 // ---------------------------------------------------------------------------
@@ -199,14 +261,6 @@ axl_dir_rmdir(
 
 typedef struct AxlDir AxlDir;
 
-/// Directory entry returned by axl_dir_read.
-typedef struct {
-    char      name[256];  ///< filename (UTF-8, not full path)
-    uint64_t  size;       ///< file size in bytes (0 for directories)
-    uint64_t  mtime_unix; ///< modification time, Unix epoch seconds (0 = unknown)
-    bool      is_dir;     ///< true if this entry is a directory
-} AxlDirEntry;
-
 /**
  * @brief Open a directory for iteration.
  *
@@ -220,12 +274,16 @@ axl_dir_open(
 /**
  * @brief Read the next directory entry.
  *
+ * `entry->name` is populated with the entry's basename;
+ * `entry->attributes` carries the kind bits
+ * (`AXL_FS_ATTR_DIRECTORY` for sub-dirs, etc.).
+ *
  * @return true if an entry was read, false at end of directory.
  */
 bool
 axl_dir_read(
-    AxlDir      *dir,   ///< directory handle
-    AxlDirEntry *entry  ///< [out] receives entry
+    AxlDir     *dir,   ///< directory handle
+    AxlFsEntry *entry  ///< [out] receives entry
 );
 
 /**
@@ -240,7 +298,7 @@ axl_dir_close(
  * @brief Per-entry callback for axl_dir_walk.
  *
  * @param full_path  full path to the entry (root + separator + name)
- * @param entry      the AxlDirEntry, including name, size, is_dir
+ * @param entry      the AxlFsEntry, including name, size, attributes
  * @param user       opaque user pointer passed through from caller
  *
  * Return codes:
@@ -249,9 +307,9 @@ axl_dir_close(
  *   - <0 stop with error (propagated)
  */
 typedef int (*AxlDirWalkFn)(
-    const char         *full_path,
-    const AxlDirEntry  *entry,
-    void               *user
+    const char        *full_path,
+    const AxlFsEntry  *entry,
+    void              *user
 );
 
 /**
@@ -295,10 +353,10 @@ axl_dir_walk(
  */
 int
 axl_dir_list_json(
-    const AxlDirEntry *entries,  ///< array of directory entries
-    size_t             count,    ///< number of entries
-    char              *buf,      ///< output buffer
-    size_t             buf_size  ///< output buffer size
+    const AxlFsEntry *entries,  ///< array of directory entries
+    size_t            count,    ///< number of entries
+    char             *buf,      ///< output buffer
+    size_t            buf_size  ///< output buffer size
 );
 
 // ---------------------------------------------------------------------------

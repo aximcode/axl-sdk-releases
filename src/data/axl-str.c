@@ -950,18 +950,58 @@ axl_utf8_to_ucs2(const char *s)
 size_t
 axl_utf8_to_ucs2_buf(const char *src, unsigned short *dst, size_t dst_count)
 {
-    size_t i = 0;
-
+    /* Real UTF-8 → UCS-2 (BMP) decoder — mirrors axl_utf8_to_ucs2's
+       allocating cousin. The earlier `(unsigned char)src[i]` cast was
+       a Latin-1 shortcut that silently corrupted any non-ASCII name
+       it touched (e.g., "résumé.txt" → "r\xC3\xA9sum\xC3\xA9.txt"
+       smeared across CHAR16 cells). The fs-provider thunks and any
+       code-page-aware filename consumer need the real thing. */
     if (src == NULL || dst == NULL || dst_count == 0) {
         return 0;
     }
 
-    while (src[i] != '\0' && i + 1 < dst_count) {
-        dst[i] = (unsigned short)(unsigned char)src[i];
-        i++;
+    #define IS_CONT(b) (((b) & 0xC0) == 0x80)
+
+    const uint8_t *in = (const uint8_t *)src;
+    size_t         out_i = 0;
+
+    /* Always reserve room for the terminating NUL. */
+    while (*in != 0 && out_i + 1 < dst_count) {
+        uint32_t cp;
+        size_t   advance;
+
+        if ((*in & 0x80) == 0) {
+            cp = *in;
+            advance = 1;
+        } else if ((*in & 0xE0) == 0xC0 && IS_CONT(in[1])) {
+            cp = ((uint32_t)(in[0] & 0x1F) << 6) |
+                 ((uint32_t)(in[1] & 0x3F));
+            advance = 2;
+        } else if ((*in & 0xF0) == 0xE0 && IS_CONT(in[1]) && IS_CONT(in[2])) {
+            cp = ((uint32_t)(in[0] & 0x0F) << 12) |
+                 ((uint32_t)(in[1] & 0x3F) << 6) |
+                 ((uint32_t)(in[2] & 0x3F));
+            advance = 3;
+        } else if ((*in & 0xF8) == 0xF0 && IS_CONT(in[1]) &&
+                   IS_CONT(in[2]) && IS_CONT(in[3])) {
+            /* Above-BMP. UCS-2 can't represent it; skip silently to
+               match the allocating cousin's behavior. */
+            in += 4;
+            continue;
+        } else {
+            /* Invalid byte — skip, match allocating cousin. */
+            in += 1;
+            continue;
+        }
+
+        dst[out_i++] = (unsigned short)cp;
+        in += advance;
     }
-    dst[i] = 0;
-    return i;
+    dst[out_i] = 0;
+
+    #undef IS_CONT
+
+    return out_i;
 }
 
 // ---------------------------------------------------------------------------

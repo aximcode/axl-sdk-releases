@@ -3,6 +3,100 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.18.0 — 2026-05-12
+
+Phases A + B + C of the EFI-encapsulation plan
+(`docs/AXL-EFI-Encapsulation-Plan.md`). Consumers of axl-sdk can
+now write zero `EFI_*` identifiers across crash-handler /
+boot-volume / image-introspection (Phase A), CPU-exception
+handlers (Phase B), and filesystem publishers (Phase C). The
+filesystem-entry struct surface is unified — one `AxlFsEntry`
+replaces the four near-duplicates (`AxlDirEntry`, `AxlFileInfo`,
+`AxlFsProviderInfo`, `AxlWebDavEntry`). Plus a build-system fix
+that retires the long-standing `debug: alloc fill 0xDA` flake.
+
+### Changed
+
+- **Filesystem-entry struct unification.** `AxlDirEntry`,
+  `AxlFileInfo`, `AxlFsProviderInfo`, and `AxlWebDavEntry` were
+  four near-identical structs carrying file/directory metadata.
+  Collapsed into a single canonical `AxlFsEntry` (in
+  `<axl/axl-fs.h>`) with the union of fields:
+  `struct_size + version + name + size + alloc_size + mtime_unix +
+  attributes`. Used everywhere — `axl_file_info`, `axl_dir_read`,
+  `axl_dir_walk` callbacks, `axl_dir_list_json`, the
+  `<axl/axl-fs-provider.h>` `get_info` / `read_dir` / `set_info`
+  callbacks, and the `<axl/axl-http-server.h>` WebDAV
+  `list_dir` / `stat` callbacks. Two convenience accessors
+  (`axl_fs_entry_is_dir`, `axl_fs_entry_is_read_only`) replace
+  the old `bool is_dir` / `bool read_only` field shape — the
+  attribute bitmask carries the same data plus four more bits
+  (HIDDEN, SYSTEM, ARCHIVE) without growing the struct.
+- **`AXL_FS_OPEN_*` and `AXL_FS_ATTR_*` constants** moved from
+  `<axl/axl-fs-provider.h>` to `<axl/axl-fs.h>`. They're shared
+  between the consumer (read) and publisher (callback) sides.
+- **Pre-1.0 API churn**, no back-compat typedefs — consumers
+  rebuild against the new shape per `feedback_change_apis_freely`.
+
+### Added
+
+- **`<axl/axl-fs-provider.h>`** — backend-neutral
+  filesystem-publisher abstraction. Phase C of the
+  EFI-encapsulation plan. Lets a consumer publish a UEFI-visible
+  filesystem (`fsN:` mapping; Shell `dir` / `cd` / `mkdir` /
+  `LoadImage` work against it) without writing a single `EFI_*`
+  identifier.
+  Consumer fills an `AxlFsProvider` vtable in pure UTF-8 +
+  snake_case + `AxlFsStatus` terms; `axl_fs_provider_publish`
+  synthesizes the matching `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` +
+  `EFI_FILE_PROTOCOL` vtables, marshals UCS-2 ↔ UTF-8 at the
+  boundary, lays out `EFI_FILE_INFO` / `EFI_FILE_SYSTEM_INFO`
+  trailers in caller-supplied buffers (with probe-then-resize
+  `EFI_BUFFER_TOO_SMALL` semantics), maps `AxlFsStatus` → spec
+  `EFI_STATUS` codes, and installs both protocols on a fresh
+  handle. `axl_fs_provider_unpublish` force-closes every
+  outstanding `AxlFsProviderFile` (so AXL_SERVICE_DRIVER teardown
+  is clean even with stale UEFI consumer pointers — they get
+  `EFI_DEVICE_ERROR` on next call). 32 unit tests pin the
+  contract, including an end-to-end UCS-2/UTF-8 round-trip
+  against `résumé.txt` + `日本語.bin` filenames.
+- **`<axl/axl-device-path.h>`** — surfaces the vendor device-path
+  constructor (`axl_device_path_make_vendor`) consumers used to
+  hand-roll. Allocates a two-node chain (HW_VENDOR_DP + END
+  terminator) ready for `axl_protocol_register("device-path", ...)`.
+- **`sdk/examples/memfs.c`** — worked example: read-only RAM-disk
+  filesystem published via `axl_fs_provider_publish` in ~190 LOC,
+  including all callbacks. Compares favorably with the ~1500 LOC
+  of EFI plumbing axl-webfs's `src/mount/` carried before the
+  Phase C migration.
+
+### Fixed
+
+- **`axl_utf8_to_ucs2_buf` now decodes multi-byte UTF-8.** Earlier
+  implementation cast bytes through Latin-1
+  (`dst[i] = (unsigned short)src[i]`), silently corrupting any
+  filename outside ASCII (`résumé.txt` smeared across CHAR16 cells
+  as `r\xC3\xA9sum\xC3\xA9.txt`). The fs-provider thunks need the
+  real decoder for the `EFI_FILE_INFO` UCS-2 trailer round-trip
+  to work; while there, the allocating cousin
+  `axl_utf8_to_ucs2` was already correct so this brings the two
+  into parity. Five new unit tests pin the multi-byte encode +
+  decode path.
+
+- **Path-helper dogfooding.** `sdk/examples/memfs.c` and the
+  fs-provider unit-test mock both rolled their own basename loops
+  (`while (*path == '/') path++`); switched to
+  `axl_path_get_basename` so the example we ship doesn't teach
+  consumers to reinvent SDK primitives.
+
+- **Round-trip dogfooding test.** New `test_volume_enumerate_round_trip`
+  in `axl-test-fs-provider.c` proves the *consumer* side of
+  `<axl/axl-fs.h>` (`axl_volume_enumerate`,
+  `axl_volume_get_label_by_handle`) sees fs-provider publications
+  transparently: publish a mock with `default_label = "MockFs"`,
+  walk volumes, locate by handle, retrieve label, expect "MockFs".
+  Three new assertions.
+
 ## 0.17.1 — 2026-05-11
 
 ### Fixed

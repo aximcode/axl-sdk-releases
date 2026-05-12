@@ -817,8 +817,8 @@ axl_driver_locate(
 
     int rc = -1;
     for (size_t i = 0; i < n_cand; i++) {
-        AxlFileInfo info;
-        if (axl_file_info(candidates[i], &info) == AXL_OK && !info.is_dir) {
+        AxlFsEntry info;
+        if (axl_file_info(candidates[i], &info) == AXL_OK && !axl_fs_entry_is_dir(&info)) {
             size_t len = axl_strlen(candidates[i]);
             if (len + 1 > out_size) {
                 /* Path doesn't fit in caller buffer; treat as error
@@ -904,8 +904,8 @@ driver_try_candidates(
     )
 {
     for (size_t i = 0; i < n_cand; i++) {
-        AxlFileInfo info;
-        if (axl_file_info(candidates[i], &info) != AXL_OK || info.is_dir) {
+        AxlFsEntry info;
+        if (axl_file_info(candidates[i], &info) != AXL_OK || axl_fs_entry_is_dir(&info)) {
             axl_debug("  miss: %s", candidates[i]);
             continue;
         }
@@ -1068,10 +1068,10 @@ axl_driver_ensure(
 // ---------------------------------------------------------------------------
 
 static int
-driver_load_cb(const char *full_path, const AxlDirEntry *entry, void *user)
+driver_load_cb(const char *full_path, const AxlFsEntry *entry, void *user)
 {
     DriverLoadCtx *c = (DriverLoadCtx *)user;
-    if (entry->is_dir || !axl_fnmatch(c->pattern, entry->name)) {
+    if (axl_fs_entry_is_dir(entry) || !axl_fnmatch(c->pattern, entry->name)) {
         return AXL_OK;
     }
     AxlDriverHandle drv;

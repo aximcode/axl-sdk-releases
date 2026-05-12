@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <axl/axl-fs.h>          /* AxlFsEntry — used by webdav callbacks */
 #include <axl/axl-hash-table.h>
 #include <axl/axl-json.h>
 
@@ -894,22 +895,12 @@ axl_http_server_add_upload_route(
 // `axl_http_response_set_content_range` to advertise the slice.
 // ---------------------------------------------------------------------------
 
-/**
- * @brief One filesystem entry as PROPFIND sees it.
- *
- * The consumer fills these in from `AxlWebDavOps.list_dir` and
- * `_stat`. `name` is the basename (no slashes); `is_dir` controls
- * the resourcetype emitted in the PROPFIND XML; `size` and
- * `mtime_unix` populate `<D:getcontentlength>` and
- * `<D:getlastmodified>`. mtime_unix == 0 means "unknown" and the
- * SDK omits the property.
- */
-typedef struct {
-    char     name[256];      ///< basename (no path components)
-    bool     is_dir;
-    uint64_t size;           ///< file size; ignored for directories
-    uint64_t mtime_unix;     ///< POSIX seconds; 0 = unknown (omit property)
-} AxlWebDavEntry;
+/* The PROPFIND backing's filesystem entry travels in the canonical
+   `AxlFsEntry` (defined in `<axl/axl-fs.h>`). The consumer fills
+   `name`, `size`, `mtime_unix`, and the `AXL_FS_ATTR_DIRECTORY`
+   bit in `attributes`; the SDK reads those four fields to emit
+   PROPFIND XML (resourcetype / getcontentlength / getlastmodified).
+   mtime_unix == 0 means "unknown" and the SDK omits the property. */
 
 /**
  * @brief Consumer-supplied filesystem callback table.
@@ -941,12 +932,12 @@ typedef struct {
 typedef struct {
     /// PROPFIND backing — list children of a directory.
     int  (*list_dir)(void *user, const char *path,
-                     AxlWebDavEntry *out, size_t max,
+                     AxlFsEntry *out, size_t max,
                      size_t *count);
 
     /// Stat — for PROPFIND on a single resource.
     int  (*stat)(void *user, const char *path,
-                 AxlWebDavEntry *out);
+                 AxlFsEntry *out);
 
     /// Streaming read — drives axl_http_response_set_streamer for GET.
     int  (*read_open)(void *user, const char *path,

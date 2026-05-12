@@ -158,8 +158,8 @@ axl_path_companion(const char *anchor, const char *name)
 static bool
 path_file_exists(const char *path)
 {
-    AxlFileInfo fi;
-    return path != NULL && axl_file_info(path, &fi) == AXL_OK && !fi.is_dir;
+    AxlFsEntry fi;
+    return path != NULL && axl_file_info(path, &fi) == AXL_OK && !axl_fs_entry_is_dir(&fi);
 }
 
 char *

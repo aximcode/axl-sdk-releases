@@ -215,7 +215,7 @@ test_file(void)
                "file: cross-directory rename refused");
     /* Source must still exist — verifies the refusal happened before
        any backend mutation. */
-    AxlFileInfo finfo_src;
+    AxlFsEntry finfo_src;
     test_check(axl_file_info("fs0:\\axl_rn_x.tmp", &finfo_src) == AXL_OK,
                "file: cross-dir refusal left source in place");
     axl_file_delete("fs0:\\axl_rn_x.tmp");
@@ -230,14 +230,14 @@ test_file(void)
                "file: rename to basename-only new_path");
     axl_file_delete("fs0:\\axl_rn_b2.tmp");
 
-    /* --- AxlFileInfo.mtime_unix surfaces UEFI ModificationTime.
+    /* --- AxlFsEntry.mtime_unix surfaces UEFI ModificationTime.
        After writing a file, axl_file_info should fill mtime_unix
        with a non-zero Unix epoch timestamp (the firmware's clock
        value at write time). Used by WebDAV PROPFIND so clients
        like macOS Finder can decide if a cached entry needs
        re-fetch. */
     axl_file_set_contents("fs0:\\axl_mt.tmp", "data", 4);
-    AxlFileInfo finfo;
+    AxlFsEntry finfo;
     test_check(axl_file_info("fs0:\\axl_mt.tmp", &finfo) == AXL_OK,
                "file: info on test file");
     test_check(finfo.mtime_unix > 0,
@@ -256,7 +256,7 @@ test_file(void)
                len == 5 && test_memcmp(contents, "alpha", 5) == 0,
                "file: move same-dir preserved content");
     axl_free(contents);
-    AxlFileInfo finfo_mv;
+    AxlFsEntry finfo_mv;
     test_check(axl_file_info("fs0:\\axl_mv_a.tmp", &finfo_mv) != AXL_OK,
                "file: move same-dir removed source");
     axl_file_delete("fs0:\\axl_mv_a2.tmp");
@@ -297,13 +297,13 @@ test_file(void)
     axl_free(contents);
     axl_file_delete("fs0:\\axl_ow_dst.tmp");
 
-    /* AxlDirEntry.mtime_unix also populated by the dir-walk path. */
+    /* AxlFsEntry.mtime_unix also populated by the dir-walk path. */
     axl_file_set_contents("fs0:\\axl_md.tmp", "more", 4);
     AxlDir *dir = axl_dir_open("fs0:\\");
     test_check(dir != NULL, "dir: open fs0:\\");
     bool saw_md_with_mtime = false;
     if (dir != NULL) {
-        AxlDirEntry de;
+        AxlFsEntry de;
         while (axl_dir_read(dir, &de)) {
             if (axl_strcmp(de.name, "axl_md.tmp") == 0 &&
                 de.mtime_unix > 0)

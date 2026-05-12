@@ -321,6 +321,55 @@ test_utf8_ucs2(void)
     // NULL safety
     test_check(axl_utf8_to_ucs2(NULL) == NULL, "utf8_to_ucs2(NULL): returns NULL");
     test_check(axl_ucs2_to_utf8(NULL) == NULL, "ucs2_to_utf8(NULL): returns NULL");
+
+    /* axl_utf8_to_ucs2_buf — the buffer-backed cousin. Used by the
+       fs-provider thunk hot path (no allocation per Open / GetInfo).
+       The original implementation cast bytes through Latin-1 and
+       silently corrupted any non-ASCII filename; pin the multi-byte
+       decode here so future regressions surface immediately. */
+    {
+        unsigned short buf[16];
+        size_t         n;
+
+        /* ASCII fits and round-trips. */
+        n = axl_utf8_to_ucs2_buf("ABC", buf, 16);
+        test_check(n == 3 &&
+                   buf[0] == 'A' && buf[1] == 'B' &&
+                   buf[2] == 'C' && buf[3] == 0,
+                   "utf8_to_ucs2_buf: ASCII");
+
+        /* 2-byte sequence: U+00E9 'é' = 0xC3 0xA9. */
+        n = axl_utf8_to_ucs2_buf("r\xC3\xA9sum\xC3\xA9", buf, 16);
+        test_check(n == 6 &&
+                   buf[0] == 'r' && buf[1] == 0x00E9 &&
+                   buf[2] == 's' && buf[3] == 'u' &&
+                   buf[4] == 'm' && buf[5] == 0x00E9 &&
+                   buf[6] == 0,
+                   "utf8_to_ucs2_buf: résumé");
+
+        /* 3-byte sequence: U+65E5 '日', U+672C '本', U+8A9E '語'. */
+        n = axl_utf8_to_ucs2_buf("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",
+                                 buf, 16);
+        test_check(n == 3 &&
+                   buf[0] == 0x65E5 && buf[1] == 0x672C &&
+                   buf[2] == 0x8A9E && buf[3] == 0,
+                   "utf8_to_ucs2_buf: 日本語");
+
+        /* dst_count truncation: 4 cells means at most 3 chars + NUL. */
+        n = axl_utf8_to_ucs2_buf("ABCDEF", buf, 4);
+        test_check(n == 3 &&
+                   buf[0] == 'A' && buf[1] == 'B' &&
+                   buf[2] == 'C' && buf[3] == 0,
+                   "utf8_to_ucs2_buf: dst_count truncation");
+
+        /* Round trip through ucs2_to_utf8_buf: "résumé" → CHAR16 →
+           UTF-8 byte-for-byte. */
+        n = axl_utf8_to_ucs2_buf("r\xC3\xA9sum\xC3\xA9", buf, 16);
+        char back[32];
+        size_t bn = axl_ucs2_to_utf8_buf(buf, back, sizeof(back));
+        test_check(bn == 8 && axl_strcmp(back, "r\xC3\xA9sum\xC3\xA9") == 0,
+                   "utf8↔ucs2 round-trip via _buf: résumé");
+    }
 }
 
 // ---------------------------------------------------------------------------

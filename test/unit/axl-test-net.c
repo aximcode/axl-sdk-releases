@@ -1653,7 +1653,7 @@ test_dav_copy(void *user, const char *src, const char *dst,
 }
 
 static int
-test_dav_stat(void *user, const char *path, AxlWebDavEntry *out)
+test_dav_stat(void *user, const char *path, AxlFsEntry *out)
 {
     (void)user;
     void *v = axl_hash_table_lookup(m_dav_fs, path);
@@ -1669,20 +1669,20 @@ test_dav_stat(void *user, const char *path, AxlWebDavEntry *out)
         }
     }
     axl_strlcpy(out->name, base, sizeof(out->name));
-    out->is_dir     = is_dir;
+    out->attributes = (is_dir) ? AXL_FS_ATTR_DIRECTORY : 0u;
     out->size       = is_dir ? 0 : 42;       /* fake file size */
     out->mtime_unix = 1762456800;            /* 2025-11-06T19:20:00Z */
     return AXL_OK;
 }
 
-/* Foreach helper: collect children of `parent` into the AxlWebDavEntry
+/* Foreach helper: collect children of `parent` into the AxlFsEntry
    array. A child is any key that starts with `parent` + (optional /),
    contains exactly one more path segment, and isn't the parent
    itself. */
 typedef struct {
     const char       *parent;
     size_t            parent_len;
-    AxlWebDavEntry   *out;
+    AxlFsEntry   *out;
     size_t            max;
     size_t            count;
 } DavListCtx;
@@ -1715,16 +1715,16 @@ test_dav_list_collect(const void *key, void *value, void *data)
     }
     if (*child == '\0') return;
 
-    AxlWebDavEntry *e = &ctx->out[ctx->count++];
+    AxlFsEntry *e = &ctx->out[ctx->count++];
     axl_strlcpy(e->name, child, sizeof(e->name));
-    e->is_dir     = dir;
+    e->attributes = (dir) ? AXL_FS_ATTR_DIRECTORY : 0u;
     e->size       = dir ? 0 : 42;
     e->mtime_unix = 1762456800;
 }
 
 static int
 test_dav_list_dir(void *user, const char *path,
-                  AxlWebDavEntry *out, size_t max, size_t *count)
+                  AxlFsEntry *out, size_t max, size_t *count)
 {
     (void)user;
     DavListCtx ctx = {

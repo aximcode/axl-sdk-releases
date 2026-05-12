@@ -20,6 +20,8 @@
 #ifndef AXL_APP_H
 #define AXL_APP_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -69,6 +71,30 @@ axl_app_argv0(void);
  */
 const char *
 axl_app_image_path(void);
+
+/**
+ * @brief Build a path on the boot volume the current image was loaded from.
+ *
+ * Concatenates the volume prefix from `axl_app_image_path()` (e.g.
+ * `"fs0:"`) with @p relative_path so the result is a fully-qualified
+ * path the rest of the AXL filesystem API understands. Convenience
+ * for tools that want to write logs / reports / sidecars next to
+ * their `.efi` without parsing the image path themselves.
+ *
+ * Path-separator and `\` are normalized — both `"crash-report.txt"`
+ * and `"\\crash-report.txt"` produce e.g. `"fs0:\\crash-report.txt"`.
+ *
+ * @return AXL_OK on success (@p out is NUL-terminated); AXL_ERR if
+ *     the image source has no filesystem prefix (network boot, RAM
+ *     disk with no source volume), the output buffer is too small,
+ *     or @p out / @p relative_path is NULL.
+ */
+int
+axl_app_boot_path(
+    const char *relative_path, ///< path relative to boot-volume root (with or without leading '\\')
+    char       *out,           ///< output buffer
+    size_t      out_size       ///< capacity of @p out in bytes
+);
 
 #ifdef __cplusplus
 }

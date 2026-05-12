@@ -176,6 +176,12 @@ axl_backend_get_time(
     time->minute     = efi_time.Minute;
     time->second     = efi_time.Second;
     time->nanosecond = efi_time.Nanosecond;
+    time->daylight   = efi_time.Daylight;
+    /* UEFI's EFI_UNSPECIFIED_TIMEZONE (2047) becomes our INT16_MIN
+       sentinel so consumers can branch cleanly. */
+    time->timezone_minutes = (efi_time.TimeZone == 2047)
+        ? INT16_MIN
+        : (int16_t)efi_time.TimeZone;
     return AXL_OK;
 }
 
