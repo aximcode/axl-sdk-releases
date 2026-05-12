@@ -161,6 +161,7 @@ axl_http_server_add_routes(AxlHttpServer *s, ...)
 
     int rc = AXL_OK;
     for (;;) {
+        // NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized)
         const char *method = va_arg(ap, const char *);
         if (method == NULL) {
             /* Sentinel: end of list. */

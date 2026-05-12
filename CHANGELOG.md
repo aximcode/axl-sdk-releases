@@ -3,6 +3,26 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.17.1 — 2026-05-11
+
+### Fixed
+
+- **clang-tidy CI gate cleared.** v0.17.0 shipped artifacts
+  successfully (Release + Docs workflows green) but the CI
+  workflow's clang-tidy step failed on three findings — release
+  was published before that gate fired, hence the patch bump.
+  `src/data/axl-xml-writer.c:84,116` — added explicit
+  `default: break;` to the body-escape and attribute-escape
+  character switches (both intentionally only replace a known
+  sub-alphabet; `bugprone-switch-missing-default-case`).
+  `src/net/axl-http-route.c:164` — added
+  `// NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized)` on
+  the first `va_arg` of `axl_http_server_add_routes`; the
+  analyzer loses track of `va_start` through the `for(;;)` +
+  `va_arg` macro expansion, no early-return shape to hoist per
+  `feedback_clang_tidy_valist_false_positive`. No runtime
+  behavior change.
+
 ## 0.17.0 — 2026-05-11
 
 ### Added

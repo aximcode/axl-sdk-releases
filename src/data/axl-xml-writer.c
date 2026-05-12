@@ -85,6 +85,7 @@ append_escaped_text(AxlXmlWriter *w, const char *s, size_t n)
         case '<': rep = "&lt;";  break;
         case '>': rep = "&gt;";  break;
         case '&': rep = "&amp;"; break;
+        default: break;
         }
         if (rep != NULL) {
             if (i > start) {
@@ -117,6 +118,7 @@ append_escaped_attr(AxlXmlWriter *w, const char *s)
         case '<': rep = "&lt;";   break;
         case '&': rep = "&amp;";  break;
         case '"': rep = "&quot;"; break;
+        default: break;
         }
         if (rep != NULL) {
             append(w, rep);
