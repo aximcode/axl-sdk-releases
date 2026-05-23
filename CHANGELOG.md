@@ -3,6 +3,24 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.19.1 — 2026-05-23
+
+### Fixed
+
+- **clang-tidy CI gate cleared.** v0.19.0 shipped artifacts
+  successfully (Release + Docs workflows green) but the CI
+  workflow's clang-tidy step failed with one finding — same
+  shape as the v0.18.0→v0.18.1 sequence.
+  `src/stream/axl-stream.c:118` (`clang-analyzer-deadcode.DeadStores`):
+  the CRLF-expansion branch of `console_expand_into` assigned
+  `last_cu = '\r'` immediately before the loop tail wrote
+  `last_cu = '\n'` (the value of `cp`), so the `'\r'` assignment
+  was unobservable. Dropped the dead store; left a comment
+  explaining why the CRLF-state contract is preserved via the
+  subsequent next-line assignment. Behavior is unchanged
+  (back-to-back bare-LF still expands; `\r\n` still suppresses
+  the expansion).
+
 ## 0.19.0 — 2026-05-13
 
 ### Added

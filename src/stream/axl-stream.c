@@ -115,7 +115,13 @@ console_transcode_crlf(
         if (cp == '\n' && last_cu != '\r') {
             if (j >= out_cap) { *overflowed = true; break; }
             dst[j++] = '\r';
-            last_cu = '\r';
+            /* No `last_cu = '\r'` here — the assignment is unread
+             * (line below immediately sets `last_cu = '\n'`), and
+             * clang-tidy's dead-store check is a hard CI gate. The
+             * CRLF-state contract is preserved via that next-line
+             * assignment: subsequent bare-LF input still triggers
+             * the `last_cu != '\r'` branch, subsequent `\r\n` input
+             * still suppresses the expansion. */
         }
         if (j >= out_cap) { *overflowed = true; break; }
         dst[j++] = (unsigned short)cp;
