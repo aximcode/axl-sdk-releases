@@ -61,6 +61,37 @@ axl_image_load(
 );
 
 /**
+ * @brief Set load options on a loaded image before starting it.
+ *
+ * Mirrors @ref axl_driver_set_load_options for the image-level API:
+ * installs @p data as the loaded image's
+ * `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions` so the started image sees
+ * it via the same surface a shell launch would expose
+ * (@ref axl_app_argc / @ref axl_app_argv on the loaded side, or the
+ * raw byte buffer via @ref axl_driver_get_load_options_raw).
+ *
+ * The data is copied internally — caller's buffer can be freed after.
+ * The copy is owned by AXL and released by @ref axl_image_unload (or
+ * by a subsequent set on the same handle, which replaces the previous
+ * copy). Pass NULL data (or size == 0) to clear load options and free
+ * any previous copy. Call between @ref axl_image_load and
+ * @ref axl_image_start.
+ *
+ * Encoding: pass-through. UEFI shells encode argv as UCS-2 strings;
+ * programmatic launchers can pass arbitrary bytes — the started image
+ * is responsible for interpreting the buffer.
+ *
+ * @return AXL_OK on success, AXL_ERR on bad arguments, alloc failure,
+ *     or firmware protocol error.
+ */
+int
+axl_image_set_load_options(
+    AxlImage    *img,    ///< image handle from axl_image_load
+    const void  *data,   ///< option bytes (copied; NULL to clear)
+    size_t       size    ///< option size in bytes
+);
+
+/**
  * @brief Start a loaded image and wait for it to return.
  *
  * Transfers control to the image's entry point. Returns when the

@@ -73,6 +73,7 @@ AXL SDK
    guides/lifecycle
    guides/coding-style
    guides/sdk
+   guides/shared-driver
    guides/porting
    guides/releasing
    guides/roadmap

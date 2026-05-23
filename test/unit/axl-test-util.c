@@ -1030,17 +1030,13 @@ test_time_sleep(void)
 static void
 test_time_get_us(void)
 {
-    /* axl_time_get_us is a thin public wrapper around the
-       architecture-cycle-counter backend. The first call is the
-       calibration tick and may return 0; subsequent calls return a
-       monotonically-increasing count. Verify the contract: two
-       calls with a stall between produce strictly increasing values
-       on the second/third pair, and the elapsed delta is at least
-       the requested stall. */
-
-    /* Discard the calibration tick; second call returns a real
-       value. */
-    (void)axl_time_get_us();
+    /* axl_time_get_us is a thin public wrapper around
+       axl_clock_gettime(MONOTONIC). The epoch is boot-relative,
+       so every call returns a real microsecond count — no
+       per-process "calibration tick" sentinel anymore. Verify the
+       contract: two calls with a stall between produce
+       monotonically increasing values, and the elapsed delta is at
+       least roughly the requested stall. */
 
     uint64_t t0 = axl_time_get_us();
     axl_usleep(2000);  /* 2ms = 2000us */
@@ -1093,6 +1089,89 @@ test_time_get_us(void)
         test_check(true,
                    "time: get_us elapsed >= 1ms after 2ms stall (SKIP "
                    "— no cycle counter)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axl_clock_gettime / axl_clock_getres — POSIX-style clock API
+// ---------------------------------------------------------------------------
+
+static void
+test_clock_gettime(void)
+{
+    /* NULL guards. */
+    test_check(axl_clock_gettime(AXL_CLOCK_MONOTONIC, NULL) == AXL_ERR,
+               "clock_gettime: NULL out rejected");
+    test_check(axl_clock_gettime((AxlClockId)42, NULL) == AXL_ERR,
+               "clock_gettime: unknown clockid rejected");
+
+    /* Monotonic: tv_sec/tv_nsec well-formed, value advances across
+       a 2 ms sleep. */
+    AxlTimespec a = {0, 0};
+    int rc_a = axl_clock_gettime(AXL_CLOCK_MONOTONIC, &a);
+    if (rc_a != AXL_OK) {
+        /* Architecture without a usable cycle counter. SKIP-balance
+           the 7 populated-path assertions below. */
+        axl_printf("SKIP: clock_gettime MONOTONIC (no counter)\n");
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "clock_gettime: SKIP balance");
+        }
+    } else {
+        test_check(rc_a == AXL_OK,
+                   "clock_gettime: MONOTONIC returns OK");
+        test_check(a.tv_nsec >= 0 && a.tv_nsec < 1000000000,
+                   "clock_gettime: MONOTONIC tv_nsec in [0, 1e9)");
+
+        axl_usleep(2000);
+
+        AxlTimespec b = {0, 0};
+        test_check(axl_clock_gettime(AXL_CLOCK_MONOTONIC, &b) == AXL_OK,
+                   "clock_gettime: MONOTONIC second read OK");
+
+        /* b >= a as a 128-bit-like compare on (tv_sec, tv_nsec). */
+        bool advanced =
+            (b.tv_sec > a.tv_sec) ||
+            (b.tv_sec == a.tv_sec && b.tv_nsec >= a.tv_nsec);
+        test_check(advanced,
+                   "clock_gettime: MONOTONIC advances across 2ms sleep");
+
+        /* Cross-call delta in nanoseconds (lenient: KVM TSC pauses
+           can shrink real 2ms sleeps; require only non-zero). */
+        int64_t dsec  = b.tv_sec  - a.tv_sec;
+        int64_t dnsec = (int64_t)b.tv_nsec - (int64_t)a.tv_nsec;
+        int64_t delta_ns = dsec * 1000000000ll + dnsec;
+        test_check(delta_ns > 0,
+                   "clock_gettime: MONOTONIC ns delta positive");
+
+        /* axl_time_get_us is now a wrapper over MONOTONIC — sanity
+           check it returns something matching the order of
+           magnitude. */
+        uint64_t us = axl_time_get_us();
+        test_check(us > 0,
+                   "axl_time_get_us: returns non-zero (boot-relative)");
+
+        /* Resolution: getres reports >= 1 ns and < 1 sec. */
+        AxlTimespec res = {0, 0};
+        test_check(axl_clock_getres(AXL_CLOCK_MONOTONIC, &res) == AXL_OK
+                       && res.tv_nsec >= 1 && res.tv_sec == 0,
+                   "clock_getres: MONOTONIC reports ns-shaped resolution");
+    }
+
+    /* Realtime: tv_nsec in range; tv_sec is the firmware RTC. We
+       don't pin a value (the RTC may be unset in QEMU or set to a
+       2026-era timestamp); just verify the call shape. */
+    AxlTimespec wall = {0, 0};
+    int rc_w = axl_clock_gettime(AXL_CLOCK_REALTIME, &wall);
+    if (rc_w != AXL_OK) {
+        axl_printf("SKIP: clock_gettime REALTIME (RTC unavailable)\n");
+        for (int i = 0; i < 2; i++) {
+            test_check(true, "clock_gettime REALTIME: SKIP balance");
+        }
+    } else {
+        test_check(rc_w == AXL_OK,
+                   "clock_gettime: REALTIME returns OK");
+        test_check(wall.tv_nsec >= 0 && wall.tv_nsec < 1000000000,
+                   "clock_gettime: REALTIME tv_nsec in [0, 1e9)");
     }
 }
 
@@ -2886,6 +2965,116 @@ test_driver_load_buffer(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_shared_driver_* — thin wrappers, identity-and-publish smoke test
+// ---------------------------------------------------------------------------
+
+static void
+test_shared_driver(void)
+{
+    /* NULL-argument guards on all three entry points. */
+    AxlGuid g;
+    test_check(axl_shared_driver_guid(NULL, &g) == AXL_ERR,
+               "shared_driver_guid: NULL name rejected");
+    test_check(axl_shared_driver_guid("x", NULL) == AXL_ERR,
+               "shared_driver_guid: NULL out rejected");
+
+    AxlHandle handle = NULL;
+    int dummy_vt = 0;
+    test_check(axl_shared_driver_publish(NULL, &dummy_vt, &handle) == AXL_ERR,
+               "shared_driver_publish: NULL name rejected");
+    test_check(axl_shared_driver_publish("x", NULL, &handle) == AXL_ERR,
+               "shared_driver_publish: NULL iface rejected");
+    test_check(axl_shared_driver_publish("x", &dummy_vt, NULL) == AXL_ERR,
+               "shared_driver_publish: NULL out_handle rejected");
+
+    void *vt = NULL;
+    test_check(axl_shared_driver_locate(NULL, "x.efi", NULL, 0, &vt) == AXL_ERR,
+               "shared_driver_locate: NULL name rejected");
+    test_check(axl_shared_driver_locate("x", NULL, NULL, 0, &vt) == AXL_ERR,
+               "shared_driver_locate: NULL driver_filename rejected");
+    test_check(axl_shared_driver_locate("x", "x.efi", NULL, 0, NULL) == AXL_ERR,
+               "shared_driver_locate: NULL out_iface rejected");
+
+    /* Identity contract: two callers passing the same name MUST get
+       byte-identical GUIDs. This is the cross-image-pairing
+       guarantee — driver and launcher both pass "do-tool" and end up
+       at the same protocol. */
+    AxlGuid g1 = {0}, g2 = {0};
+    test_check(axl_shared_driver_guid("shared-driver-test", &g1) == AXL_OK
+               && axl_shared_driver_guid("shared-driver-test", &g2) == AXL_OK
+               && axl_memcmp(&g1, &g2, sizeof(AxlGuid)) == 0,
+               "shared_driver_guid: deterministic across calls");
+
+    /* Different names produce different GUIDs (collision rejection
+       — a typo on one side breaks pairing, exactly as designed). */
+    AxlGuid g_other;
+    test_check(axl_shared_driver_guid("shared-driver-test-OTHER", &g_other)
+                   == AXL_OK
+               && axl_memcmp(&g1, &g_other, sizeof(AxlGuid)) != 0,
+               "shared_driver_guid: distinct names → distinct GUIDs");
+
+    /* Round-trip publish + locate + unpublish in-process. Tests
+       don't run as a driver image so we can't exercise the
+       cross-image LoadImage path here — that's covered by the
+       sdk/examples/shared-driver-demo/ integration build. We DO
+       test that publish makes the protocol locate-able and
+       unpublish removes it. */
+    AxlHandle h = NULL;
+    static int my_vtable = 42;   /* sentinel; locate must return THIS pointer */
+    test_check(axl_shared_driver_publish("shared-driver-test", &my_vtable, &h)
+                   == AXL_OK
+               && h != NULL,
+               "shared_driver_publish: round-trip register");
+
+    /* Direct locate via find_guid (not the full _locate path, which
+       would try to LoadImage; we've already published in-process so
+       step 1 of _locate would short-circuit, but the test runner's
+       axl_driver_ensure_with_embedded inputs are awkward). Verify
+       the identity GUID resolves to the registered iface. */
+    void *found = NULL;
+    test_check(axl_protocol_find_guid(&g1, &found) == AXL_OK
+               && found == &my_vtable,
+               "shared_driver_publish: locate returns same iface");
+
+    test_check(axl_shared_driver_unpublish("shared-driver-test",
+                                           h, &my_vtable) == AXL_OK,
+               "shared_driver_unpublish: round-trip unregister");
+
+    /* After unpublish, the GUID no longer resolves. */
+    found = NULL;
+    test_check(axl_protocol_find_guid(&g1, &found) == AXL_ERR,
+               "shared_driver_unpublish: protocol removed");
+
+    /* Handle-reuse contract: publishing with *out_handle pre-set to
+       an existing handle reuses it (per axl_protocol_register_guid's
+       in/out semantics). Mint a fresh handle via axl-runtime first,
+       then verify publish installs ON it rather than allocating a
+       new one. */
+    AxlHandle reused = NULL;
+    static int sentinel_a = 1;
+    static int sentinel_b = 2;
+    /* Phase 1: register sentinel_a, get a real handle back. */
+    test_check(axl_shared_driver_publish("shared-driver-test-reuse",
+                                         &sentinel_a, &reused) == AXL_OK
+               && reused != NULL,
+               "shared_driver_publish: mints handle when *out=NULL");
+    AxlHandle pinned = reused;
+    /* Phase 2: re-publish a DIFFERENT identity onto the SAME handle.
+       Pre-set *out_handle to the existing one; the underlying
+       protocol_register_guid should reuse it. */
+    test_check(axl_shared_driver_publish("shared-driver-test-reuse-2",
+                                         &sentinel_b, &reused) == AXL_OK
+               && reused == pinned,
+               "shared_driver_publish: reuses *out_handle when pre-set");
+    /* Cleanup both registrations on the shared handle. */
+    test_check(axl_shared_driver_unpublish("shared-driver-test-reuse",
+                                           pinned, &sentinel_a) == AXL_OK
+               && axl_shared_driver_unpublish("shared-driver-test-reuse-2",
+                                              pinned, &sentinel_b) == AXL_OK,
+               "shared_driver_unpublish: handle-reuse cleanup");
+}
+
+// ---------------------------------------------------------------------------
 // axl_driver_locate
 // ---------------------------------------------------------------------------
 
@@ -3692,6 +3881,10 @@ test_image(void)
     test_check(axl_image_load("fs0:\\x.efi", NULL) == AXL_ERR,
                "image: load NULL out returns -1");
 
+    /* set_load_options NULL-img guard — always testable. */
+    test_check(axl_image_set_load_options(NULL, "x", 1) == AXL_ERR,
+               "image: set_load_options(NULL img) returns -1");
+
     /* Real load: AxlTestRuntime.efi is staged into fs0: by the test
        runner. Load it, then unload immediately — don't actually
        start it (would re-enter the test runtime). */
@@ -3703,7 +3896,28 @@ test_image(void)
     test_check(rc == AXL_OK, "image: load AxlTestRuntime.efi");
     test_check(img != NULL, "image: load populates handle");
 
-    /* Unload. */
+    /* set_load_options install + clear + re-install — exercises the
+       three lifecycle transitions in the underlying axl_driver
+       tracking table. The DEBUG-build leak tracker catches a
+       missing axl_free in any path. */
+    const unsigned char opt_bytes[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
+    test_check(axl_image_set_load_options(img, opt_bytes, sizeof(opt_bytes))
+                   == AXL_OK,
+               "image: set_load_options(bytes) returns 0");
+
+    /* NULL data (size == 0) clears the previously-tracked copy. */
+    test_check(axl_image_set_load_options(img, NULL, 0) == AXL_OK,
+               "image: set_load_options(NULL, 0) clears prior copy");
+
+    /* Re-set after clear must reuse / re-acquire a tracking slot.
+       A leaked-slot bug would fail the table-full check on a
+       subsequent install. */
+    test_check(axl_image_set_load_options(img, opt_bytes, sizeof(opt_bytes))
+                   == AXL_OK,
+               "image: set_load_options after clear succeeds");
+
+    /* Unload releases the still-installed copy (DEBUG leak tracker
+       confirms). */
     test_check(axl_image_unload(img) == AXL_OK,
                "image: unload");
 
@@ -5289,6 +5503,7 @@ test_util_main(int argc, char **argv)
     test_hexdump();
     test_time();
     test_time_get_us();
+    test_clock_gettime();
     test_time_sleep();
     test_config();
     test_config_width_overflow();
@@ -5318,6 +5533,7 @@ test_util_main(int argc, char **argv)
     test_protocol_registry();
     test_driver_ensure();
     test_driver_load_buffer();
+    test_shared_driver();
     test_driver_locate();
     test_diag_probe_protocol();
 

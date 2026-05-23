@@ -58,6 +58,21 @@ axl_image_load(
 }
 
 int
+axl_image_set_load_options(
+    AxlImage    *img,
+    const void  *data,
+    size_t       size
+    )
+{
+    if (img == NULL || img->handle == NULL) {
+        return AXL_ERR;
+    }
+    /* Underlying driver handle owns the tracking-table slot; the
+       copy is released by axl_image_unload → axl_driver_unload. */
+    return axl_driver_set_load_options(img->handle, data, size);
+}
+
+int
 axl_image_start(
     AxlImage  *img,
     int       *exit_code

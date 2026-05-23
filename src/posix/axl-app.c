@@ -213,21 +213,122 @@ _axl_prepend_volume_mapping(void *device_handle, const char *file_path)
         }
     }
     /* Concatenate "<map>" + file_path. The mapping ends with ':'
-       (e.g. "fs0:") and the FILEPATH typically starts with '\\',
-       so the joined form "fs0:\\app.efi" is a valid shell-resolvable
-       absolute path. */
+       (e.g. "fs0:"). FILEPATH device-path nodes usually carry the
+       leading "\\" (giving "fs0:\app.efi" after the join), but when
+       the shell loaded the image via a cwd-relative name (e.g.
+       startup.nsh: `fs0:app.efi` rather than `fs0:\app.efi`) the
+       firmware encodes the FILEPATH as a bare basename. In that
+       case the unsweetened concatenation would produce
+       "fs0:app.efi" — which the shell accepts as a load target but
+       breaks `axl_path_get_dirname`, since there's no separator
+       between volume and filename. That in turn breaks
+       `axl_path_companion`-based sidecar discovery: dirname returns
+       empty and the joined companion is a bare name with no
+       volume anchor.
+
+       Insert a `\` separator when neither side carries one. This
+       only fires on the bare-basename case; absolute FILEPATHs are
+       unchanged. */
     size_t map_len = axl_strlen(map_utf8);
     size_t fp_len  = axl_strlen(file_path);
-    char  *joined  = axl_malloc(map_len + fp_len + 1);
+    /* Insert a '\' between map and file_path unless one side
+       already carries a separator. The colon at the end of the map
+       (e.g. "fs0:") does NOT count as a separator for
+       dirname/basename purposes — sidecar discovery's path math
+       expects an explicit slash. */
+    bool map_ends_sep = map_len > 0
+        && (map_utf8[map_len - 1] == '\\' || map_utf8[map_len - 1] == '/');
+    bool fp_starts_sep = fp_len > 0
+        && (file_path[0] == '\\' || file_path[0] == '/');
+    int  need_sep = (map_ends_sep || fp_starts_sep) ? 0 : 1;
+    size_t total = map_len + (need_sep ? 1 : 0) + fp_len;
+    char  *joined  = axl_malloc(total + 1);
     if (joined == NULL) {
         axl_free(map_utf8);
         return NULL;
     }
-    axl_memcpy(joined,           map_utf8,  map_len);
-    axl_memcpy(joined + map_len, file_path, fp_len);
-    joined[map_len + fp_len] = '\0';
+    size_t pos = 0;
+    axl_memcpy(joined + pos, map_utf8, map_len);
+    pos += map_len;
+    if (need_sep) {
+        joined[pos++] = '\\';
+    }
+    axl_memcpy(joined + pos, file_path, fp_len);
+    pos += fp_len;
+    joined[pos] = '\0';
     axl_free(map_utf8);
     return joined;
+}
+
+/* Walk LoadedImage->FilePath into a volume-prefixed UTF-8 path; if
+   the handle has no FilePath, recurse into LoadedImage->ParentHandle.
+   The parent walk is what makes buffer-loaded images (drivers
+   embedded into a launcher via `axl_driver_ensure_with_embedded`'s
+   step-4) inherit a sidecar-discovery anchor — the firmware sets
+   `FilePath = NULL` on `LoadImage(SourceBuffer=...)`, but the
+   ParentHandle still points back to the launcher whose own FilePath
+   IS set.
+
+   Depth-bounded at 8 levels to defend against pathological parent
+   chains; real chains are typically depth 1 (shell → app) or 2
+   (shell → launcher → embedded driver).
+
+   Returns a heap-owned UTF-8 string, or NULL when no ancestor in
+   the chain has a usable FilePath. */
+static char *
+_capture_image_path(EFI_HANDLE handle)
+{
+    if (handle == NULL) {
+        return NULL;
+    }
+
+    EFI_HANDLE current = handle;
+    for (int depth = 0; depth < 8 && current != NULL; depth++) {
+        EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+        EFI_GUID li_guid = gEfiLoadedImageProtocolGuid;
+        EFI_STATUS st = gBS->HandleProtocol(current, &li_guid,
+                                            (void **)&li);
+        if (EFI_ERROR(st) || li == NULL) {
+            return NULL;
+        }
+        if (li->FilePath != NULL) {
+            char *decoded = _axl_decode_image_filepath(
+                (EFI_DEVICE_PATH_PROTOCOL *)li->FilePath);
+            if (decoded == NULL) {
+                return NULL;
+            }
+            if (li->DeviceHandle != NULL) {
+                char *with_volume = _axl_prepend_volume_mapping(
+                    li->DeviceHandle, decoded);
+                if (with_volume != NULL) {
+                    axl_free(decoded);
+                    return with_volume;
+                }
+                /* Volume-mapping unavailable (no Shell protocol, BDS
+                   context, etc.): fall back to the FILEPATH suffix.
+                   It's cwd-relative but the caller's argv[0] path
+                   still has a chance, and step-3 (bare-name-in-cwd)
+                   in the sidecar resolver doesn't need a prefix. */
+            }
+            return decoded;
+        }
+        /* No FilePath on this image — walk up. The firmware sets
+           ParentHandle to the image that called LoadImage; for an
+           embedded driver that's the launcher. */
+        current = (EFI_HANDLE)li->ParentHandle;
+    }
+    return NULL;
+}
+
+/* Public-internal: drivers reach this from `axl_driver_init` (their
+   CRT path skips `_axl_args_init`). See header for semantics. */
+void
+_axl_init_image_path(void *image_handle)
+{
+    if (mImagePath != NULL) {
+        return;
+    }
+    mImagePath = _capture_image_path((EFI_HANDLE)image_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,38 +456,9 @@ _axl_args_init(void *image_handle)
         }
     }
 
-    /* Capture the canonical image-load path from LoadedImage->FilePath
-       — orthogonal to argv[0]. argv[0] is whatever the shell typed,
-       which is often a basename (e.g. startup.nsh's
-       'fs0:\app.efi' may surface as just 'app.efi' depending on the
-       shell). The device-path source is reliable regardless of how
-       the shell was invoked, which makes it the right anchor for
-       sidecar discovery via axl_path_companion.
-
-       Two stages: first the FILEPATH-derived suffix (e.g. "\app.efi"),
-       then prepend the shell mapping for LoadedImage->DeviceHandle
-       (e.g. "fs0:") so the resulting path is volume-absolute and
-       resolves regardless of the shell's current directory. Without
-       the prefix, the FILEPATH alone is root-relative — its dirname
-       lookup lands on "\\" which the shell resolves against cwd, not
-       against the volume the .efi was actually loaded from. This is
-       why a `cd \` in startup.nsh used to be required for sidecar
-       discovery; the prefix makes it unnecessary. */
-    if (!EFI_ERROR(status) && li != NULL && li->FilePath != NULL) {
-        mImagePath = _axl_decode_image_filepath(
-            (EFI_DEVICE_PATH_PROTOCOL *)li->FilePath);
-        if (mImagePath != NULL && li->DeviceHandle != NULL) {
-            char *with_volume =
-                _axl_prepend_volume_mapping(li->DeviceHandle, mImagePath);
-            if (with_volume != NULL) {
-                axl_free(mImagePath);
-                mImagePath = with_volume;
-            }
-            /* prepend-failure path leaves mImagePath at the FILEPATH
-               suffix; better than nothing — the argv[0] fallback in
-               axl_resolve_data_file still has a chance. */
-        }
-    }
+    /* Capture the canonical image-load path. Shared between apps
+       (this path) and drivers (axl_driver_init); see _capture_image_path. */
+    mImagePath = _capture_image_path((EFI_HANDLE)image_handle);
 
     /* Fallback: no LoadOptions at all (e.g. a DXE driver invoked via BDS
      * with no arg payload). Give the app a sane argc=1 / argv[0]="app". */

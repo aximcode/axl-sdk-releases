@@ -209,7 +209,11 @@ cat > "$PREFIX/lib/cmake/axl/axl-config.cmake" << 'CMAKE_SUPPORT'
 #
 # Usage (preferred):
 #   find_package(axl REQUIRED)
-#   axl_add_app(myapp myapp.c)
+#   axl_add_app(myapp myapp.c)                  # → myapp.efi
+#   axl_add_driver(myDxe myDxe.c)               # → myDxe.efi (DriverEntry, subsystem 11)
+#   axl_add_app(my-launcher launcher.c          # launcher embeds the driver:
+#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
+#   )                                           # → my-launcher.efi (with .incbin'd blob)
 #
 # Also works via explicit include:
 #   include(/usr/lib/cmake/axl/axl-config.cmake)
@@ -258,65 +262,163 @@ set(AXL_C_FLAGS
     -DAXL_BACKEND_NATIVE
 )
 
-function(axl_add_app TARGET)
-    set(SOURCES ${ARGN})
+# Internal helper: build a TARGET.efi from C sources, optional embedded
+# blobs, and a chosen image type (app / driver). Most consumers reach
+# this via axl_add_app or axl_add_driver — call _axl_build_efi directly
+# only if you need behavior neither wrapper exposes.
+function(_axl_build_efi TARGET TYPE)
+    cmake_parse_arguments(_AXL "" "" "SOURCES;EMBEDS" ${ARGN})
 
-    set(CRT0_OBJS
-        "${AXL_GCC_CRT0}" "${AXL_RELOC_OBJ}"
-        "${AXL_DEBUG_OBJ}" "${AXL_CRT0_NATIVE}")
+    # Type → subsystem code + CRT0 wiring.
+    #   app:    asm CRT0 → _AxlEntry (C CRT0 axl-crt0-native.o) → main
+    #   driver: asm CRT0 → _AxlEntry (aliased to user's entry via --defsym=DriverEntry)
+    if(TYPE STREQUAL "app")
+        set(_SUBSYSTEM 10)
+        set(_CRT0_OBJS "${AXL_GCC_CRT0}" "${AXL_RELOC_OBJ}"
+                       "${AXL_DEBUG_OBJ}" "${AXL_CRT0_NATIVE}")
+        set(_LD_DEFSYM "")
+    elseif(TYPE STREQUAL "driver")
+        set(_SUBSYSTEM 11)
+        set(_CRT0_OBJS "${AXL_GCC_CRT0}" "${AXL_RELOC_OBJ}" "${AXL_DEBUG_OBJ}")
+        set(_LD_DEFSYM "--defsym=_AxlEntry=DriverEntry")
+    else()
+        message(FATAL_ERROR "_axl_build_efi: unknown type '${TYPE}' (expected 'app' or 'driver')")
+    endif()
 
-    # Compile sources to ELF .o
-    set(ALL_OBJS ${CRT0_OBJS})
-    foreach(SRC ${SOURCES})
+    # Compile C sources to ELF .o. Use TARGET-prefixed object names so
+    # the same source file can be compiled into multiple targets without
+    # output collisions.
+    set(_ALL_OBJS ${_CRT0_OBJS})
+    foreach(SRC ${_AXL_SOURCES})
         get_filename_component(SRC_NAME ${SRC} NAME_WE)
         get_filename_component(SRC_ABS ${SRC} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-        set(OBJ "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}.o")
+        set(OBJ "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.${SRC_NAME}.o")
         add_custom_command(
             OUTPUT ${OBJ}
             COMMAND ${AXL_CROSS}gcc ${AXL_C_FLAGS} ${AXL_GCC_ARCH}
                     -isystem ${AXL_INCLUDE_DIR}
                     -c ${SRC_ABS} -o ${OBJ}
             DEPENDS ${SRC_ABS}
-            COMMENT "gcc: ${SRC}"
+            COMMENT "gcc: ${TARGET} ← ${SRC}"
         )
-        list(APPEND ALL_OBJS ${OBJ})
+        list(APPEND _ALL_OBJS ${OBJ})
     endforeach()
 
-    set(SO_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.so")
-    set(EFI_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi")
+    # EMBEDS: each entry is `PATH` or `PATH=name`. For each, emit a tiny
+    # .s sidecar containing .incbin, then assemble it and add to the
+    # link. The symbol convention (axl_embedded_<name>{,_end}) matches
+    # what <axl/axl-embed.h>'s AXL_EMBED_DECLARE expects — same as
+    # `axl-cc --embed`.
+    foreach(SPEC ${_AXL_EMBEDS})
+        if(SPEC MATCHES "^(.*)=([^=]+)$")
+            set(_EMBED_PATH "${CMAKE_MATCH_1}")
+            set(_EMBED_SYM  "${CMAKE_MATCH_2}")
+        else()
+            set(_EMBED_PATH "${SPEC}")
+            get_filename_component(_EMBED_BASE "${_EMBED_PATH}" NAME_WE)
+            string(REGEX REPLACE "[^a-zA-Z0-9_]" "_" _EMBED_SYM "${_EMBED_BASE}")
+        endif()
+        if(NOT IS_ABSOLUTE "${_EMBED_PATH}")
+            set(_EMBED_PATH "${CMAKE_CURRENT_BINARY_DIR}/${_EMBED_PATH}")
+        endif()
+        if(NOT _EMBED_SYM MATCHES "^[a-zA-Z_][a-zA-Z0-9_]*$")
+            message(FATAL_ERROR
+                "axl: embed symbol '${_EMBED_SYM}' is not a valid C identifier — "
+                "pass EMBEDS path=name explicitly")
+        endif()
 
-    # Link to ELF shared object. --no-warn-rwx-segments suppresses a
-    # false-positive linker warning — the .so is an intermediate consumed
-    # by objcopy → PE/COFF, no OS loads it, and the resulting .efi has
-    # properly split per-section permissions.
+        set(_EMBED_S "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.embed_${_EMBED_SYM}.s")
+        set(_EMBED_O "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.embed_${_EMBED_SYM}.o")
+
+        # Generated at CMake configure time — content depends only on
+        # the path string, not on any build-time inputs.
+        file(WRITE "${_EMBED_S}"
+"    .section .rodata
+    .balign 8
+    .globl axl_embedded_${_EMBED_SYM}
+    .globl axl_embedded_${_EMBED_SYM}_end
+axl_embedded_${_EMBED_SYM}:
+    .incbin \"${_EMBED_PATH}\"
+axl_embedded_${_EMBED_SYM}_end:
+
+    .section .note.GNU-stack, \"\", %progbits
+")
+
+        add_custom_command(
+            OUTPUT ${_EMBED_O}
+            COMMAND ${AXL_CROSS}gcc -c ${_EMBED_S} -o ${_EMBED_O}
+            DEPENDS ${_EMBED_S} ${_EMBED_PATH}
+            COMMENT "embed: ${TARGET} ← ${_EMBED_PATH} (axl_embedded_${_EMBED_SYM})"
+        )
+        list(APPEND _ALL_OBJS ${_EMBED_O})
+    endforeach()
+
+    set(_SO_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.so")
+    set(_EFI_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi")
+
     add_custom_command(
-        OUTPUT ${SO_FILE}
+        OUTPUT ${_SO_FILE}
         COMMAND ${AXL_CROSS}ld -nostdlib -shared -Bsymbolic
-                --no-warn-rwx-segments
+                --no-warn-rwx-segments --no-undefined
+                ${_LD_DEFSYM}
                 -T ${AXL_EFI_LDS}
-                -o ${SO_FILE}
-                ${ALL_OBJS}
+                -o ${_SO_FILE}
+                ${_ALL_OBJS}
                 ${AXL_LIB_DIR}/libaxl.a
-        DEPENDS ${ALL_OBJS}
+        DEPENDS ${_ALL_OBJS}
         COMMENT "ld: ${TARGET}.so"
     )
 
-    # Convert to PE/COFF + patch debug directory
     add_custom_command(
-        OUTPUT ${EFI_FILE}
+        OUTPUT ${_EFI_FILE}
         COMMAND ${AXL_CROSS}objcopy
                 -j .text -j .sdata -j .data -j .dynamic -j .dynsym
                 -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir
-                --output-target=${AXL_PE_TARGET} --subsystem=10
-                ${SO_FILE} ${EFI_FILE}
-        COMMAND ${AXL_PE_SET_DEBUG} ${EFI_FILE}
-        DEPENDS ${SO_FILE}
+                --output-target=${AXL_PE_TARGET} --subsystem=${_SUBSYSTEM}
+                ${_SO_FILE} ${_EFI_FILE}
+        COMMAND ${AXL_PE_SET_DEBUG} ${_EFI_FILE}
+        DEPENDS ${_SO_FILE}
         COMMENT "objcopy+pe-set-debug: ${TARGET}.efi"
     )
 
-    add_custom_target(${TARGET} ALL
-        DEPENDS ${EFI_FILE}
+    add_custom_target(${TARGET} ALL DEPENDS ${_EFI_FILE})
+endfunction()
+
+# Public: build an application image (subsystem APPLICATION, main()).
+#
+#   axl_add_app(myapp myapp.c)
+#   axl_add_app(my-launcher launcher.c
+#       EMBEDS ${CMAKE_CURRENT_BINARY_DIR}/myDxe.efi=my_driver
+#   )
+#
+# EMBEDS entries each take the form `path` or `path=name`. Each blob is
+# wrapped in a .incbin sidecar and linked into the app; consumer code
+# reaches it via <axl/axl-embed.h>'s AXL_EMBED_DECLARE / DATA / SIZE.
+function(axl_add_app TARGET)
+    cmake_parse_arguments(_AXL_ADD "" "" "EMBEDS" ${ARGN})
+    _axl_build_efi(${TARGET} "app"
+        SOURCES ${_AXL_ADD_UNPARSED_ARGUMENTS}
+        EMBEDS  ${_AXL_ADD_EMBEDS}
     )
+    # Re-export the .efi path so a launcher can EMBED it without
+    # re-deriving the path.
+    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
+        PARENT_SCOPE)
+endfunction()
+
+# Public: build a DXE-style driver image (subsystem BOOT_SERVICE_DRIVER,
+# DriverEntry). Used for the "shared driver" pattern where a launcher
+# loads + LocateProtocol's into a resident driver image.
+#
+#   axl_add_driver(my-dxe my-dxe.c)
+#   axl_add_app(my-launcher launcher.c
+#       EMBEDS ${my-dxe_EFI_PATH}=my_driver
+#   )
+#   add_dependencies(my-launcher my-dxe)
+function(axl_add_driver TARGET)
+    _axl_build_efi(${TARGET} "driver" SOURCES ${ARGN})
+    set(${TARGET}_EFI_PATH "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.efi"
+        PARENT_SCOPE)
 endfunction()
 CMAKE_SUPPORT
 
@@ -654,7 +756,15 @@ SO_FILE="$TMPDIR/output.so"
 # --no-warn-rwx-segments: the .so is just an intermediate consumed by
 # objcopy → PE/COFF; no OS loads it, so the linker's RWX warning is a
 # false positive (the .efi has properly split per-section permissions).
-run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic --no-warn-rwx-segments \
+# --no-undefined: ld(1) with `-shared` silently accepts unresolved
+# symbols by default — they become zero/garbage at runtime (UEFI
+# binaries are statically self-contained; there's no dynamic loader
+# to resolve them post-link). Force a hard link error instead so
+# missing-symbol bugs surface at build time rather than as
+# RIP-points-at-nonsense crashes in the field. The AXL library's own
+# build already uses this flag; consumer-facing axl-cc was missing it.
+run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
+    --no-warn-rwx-segments --no-undefined \
     -T "$EFI_LDS" \
     ${LDFLAGS_EXTRA[@]+"${LDFLAGS_EXTRA[@]}"} \
     -o "$SO_FILE" \

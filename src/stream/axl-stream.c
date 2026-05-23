@@ -19,11 +19,18 @@
 
 AXL_LOG_DOMAIN("io");
 
-typedef struct {
-    AxlStream  *stream;
-    int        count;
-    int        error;
-} FprintfCtx;
+/* Stack scratch capacity for the buffered printf family. Defined
+   here so the console-write transcoder can size its UCS-2 stack
+   buffer against the same number — buffered-printf flushes are the
+   dominant caller of console_write, and sizing the transcoder's
+   stack to (2 * this + 1) UCS-2 units guarantees the fast path
+   never spills to heap for a normal print line. */
+#define AXL_PRINTF_STACK_BUFFER  512
+
+/* (FprintfCtx removed in the buffered-printf rewrite below — every
+   print path now uses BufferedPrintCtx so axl_vformat's per-chunk
+   callbacks accumulate into a stack scratch buffer instead of hitting
+   axl_write per chunk.) */
 
 // ---------------------------------------------------------------------------
 // Stream allocation
@@ -39,84 +46,138 @@ axl_stream_new(void)
 // Console backend
 // ---------------------------------------------------------------------------
 
-/**
- * Expand bare \n to \r\n in a UCS-2 string for UEFI ConOut.
- * Returns a new allocation, or NULL on failure.
- */
-static unsigned short *
-console_expand_newlines(const unsigned short *src)
+/* UTF-8 → UCS-2 transcode with inline CRLF expansion. Writes up to
+   dst_cap-1 code units (reserving one slot for the trailing NUL).
+   Returns the number of code units written excluding the NUL.
+   Sets *overflowed = true if input couldn't fully fit (count of
+   code units written hits the cap before input exhausts); the
+   trailing NUL is still placed.
+
+   Above-BMP UTF-8 sequences (4-byte) and invalid bytes are silently
+   skipped — matches axl_utf8_to_ucs2's behavior so existing callers
+   see no change in what reaches the console.
+
+   CRLF state is per-call only: a bare '\n' picks up a preceding '\r'
+   if the immediately-prior emitted UCS-2 unit in this same call is
+   not '\r'. (Callers splitting a logical line across two
+   console_write calls accept that the second call's leading '\n'
+   gets its own '\r' — same as the old console_expand_newlines path.) */
+static size_t
+console_transcode_crlf(
+    const uint8_t  *in,
+    size_t          count,
+    unsigned short *dst,
+    size_t          dst_cap,
+    bool           *overflowed
+    )
 {
-    size_t extra = 0;
-    size_t src_len = 0;
-    for (size_t i = 0; src[i] != 0; i++) {
-        if (src[i] == '\n' && (i == 0 || src[i - 1] != '\r')) {
-            extra++;
+    #define IS_CONT(b) (((b) & 0xC0) == 0x80)
+
+    *overflowed = false;
+    if (dst_cap == 0) {
+        return 0;
+    }
+    const size_t out_cap = dst_cap - 1;  /* reserve NUL slot */
+
+    size_t   i = 0;
+    size_t   j = 0;
+    uint16_t last_cu = 0;
+
+    while (i < count) {
+        uint32_t cp;
+        uint8_t  b = in[i];
+
+        if ((b & 0x80) == 0) {
+            cp = b;
+            i += 1;
+        } else if ((b & 0xE0) == 0xC0 && i + 1 < count && IS_CONT(in[i + 1])) {
+            cp = ((uint32_t)(in[i + 0] & 0x1F) << 6)
+               |  (uint32_t)(in[i + 1] & 0x3F);
+            i += 2;
+        } else if ((b & 0xF0) == 0xE0 && i + 2 < count
+                   && IS_CONT(in[i + 1]) && IS_CONT(in[i + 2])) {
+            cp = ((uint32_t)(in[i + 0] & 0x0F) << 12)
+               | ((uint32_t)(in[i + 1] & 0x3F) << 6)
+               |  (uint32_t)(in[i + 2] & 0x3F);
+            i += 3;
+        } else if ((b & 0xF8) == 0xF0 && i + 3 < count
+                   && IS_CONT(in[i + 1]) && IS_CONT(in[i + 2])
+                   && IS_CONT(in[i + 3])) {
+            /* Above-BMP — UCS-2 can't represent; skip. */
+            i += 4;
+            continue;
+        } else {
+            /* Invalid lead. Skip one byte and rescan. */
+            i += 1;
+            continue;
         }
-        src_len++;
+
+        if (cp == '\n' && last_cu != '\r') {
+            if (j >= out_cap) { *overflowed = true; break; }
+            dst[j++] = '\r';
+            last_cu = '\r';
+        }
+        if (j >= out_cap) { *overflowed = true; break; }
+        dst[j++] = (unsigned short)cp;
+        last_cu = (uint16_t)cp;
     }
 
-    if (extra == 0) {
-        return NULL;
-    }
-    unsigned short *out = axl_malloc((src_len + extra + 1) * sizeof(unsigned short));
-    if (out == NULL) {
-        axl_warning(
-            "console_expand_newlines: OOM allocating %zu UCS-2 chars",
-            src_len + extra + 1
-            );
-        return NULL;
-    }
+    dst[j] = 0;
 
-    size_t j = 0;
-    for (size_t i = 0; src[i] != 0; i++) {
-        if (src[i] == '\n' && (i == 0 || src[i - 1] != '\r')) {
-            out[j++] = '\r';
-        }
-        out[j++] = src[i];
-    }
-    out[j] = 0;
-    return out;
+    #undef IS_CONT
+    return j;
 }
+
+/* Stack budget covers every flush from the buffered-printf family.
+   2 * AXL_PRINTF_STACK_BUFFER + 1 UCS-2 units handles the worst case
+   (every input byte expands to '\r' + '\n' — all-bare-\n input);
+   UTF-8 multi-byte sequences only contract from there. Callers
+   writing larger buffers directly (raw axl_fwrite to stdout) spill
+   to a single heap alloc sized for their worst case. */
+#define CONSOLE_WRITE_STACK_UCS2  (2 * AXL_PRINTF_STACK_BUFFER + 1)
 
 static axl_ssize_t
 console_write(void *ctx, const void *data, size_t count)
 {
-    unsigned short *wide;
-    char *tmp;
-
     (void)ctx;
 
     if (count == 0) {
         return 0;
     }
 
-    /* Need NUL-terminated string for axl_utf8_to_ucs2 */
-    tmp = (char *)axl_malloc(count + 1);
-    if (tmp == NULL) {
-        axl_warning(
-            "console_write: OOM allocating %zu-byte temp buffer",
-            count + 1
-            );
-        return -1;
-    }
-    axl_memcpy(tmp, data, count);
-    tmp[count] = '\0';
+    unsigned short  stack_buf[CONSOLE_WRITE_STACK_UCS2];
+    unsigned short *out      = stack_buf;
+    size_t          out_cap  = CONSOLE_WRITE_STACK_UCS2;
+    unsigned short *heap_buf = NULL;
 
-    wide = axl_utf8_to_ucs2(tmp);
-    axl_free(tmp);
-    if (wide == NULL) {
-        return -1;
+    bool overflowed = false;
+    (void)console_transcode_crlf((const uint8_t *)data, count,
+                                 out, out_cap, &overflowed);
+
+    if (overflowed) {
+        /* Single oversized call (e.g. raw axl_fwrite of a large
+           buffer to stdout). Worst case: every input byte becomes
+           "\r\n" — 2*count UCS-2 units + 1 NUL. */
+        size_t heap_cap = count * 2 + 1;
+        heap_buf = (unsigned short *)axl_malloc(heap_cap * sizeof(unsigned short));
+        if (heap_buf == NULL) {
+            axl_warning(
+                "console_write: OOM allocating %zu UCS-2 chars",
+                heap_cap
+                );
+            return -1;
+        }
+        (void)console_transcode_crlf((const uint8_t *)data, count,
+                                     heap_buf, heap_cap, &overflowed);
+        /* heap_cap is the absolute worst case — a second overflow
+           is unreachable; ignore the flag. */
+        out = heap_buf;
     }
 
-    /* UEFI ConOut expects \r\n — expand bare \n */
-    unsigned short *expanded = console_expand_newlines(wide);
-    if (expanded != NULL) {
-        axl_free(wide);
-        wide = expanded;
+    axl_backend_console_write(out);
+    if (heap_buf != NULL) {
+        axl_free(heap_buf);
     }
-
-    axl_backend_console_write(wide);
-    axl_free(wide);
     return (axl_ssize_t)count;
 }
 
@@ -990,42 +1051,130 @@ axl_fflush(AxlStream *s)
 
 // ---------------------------------------------------------------------------
 // Printf family
+//
+// Formatting is buffered into a stack scratch buffer before the
+// single axl_write() call that hits the underlying stream. Pre-
+// buffering matters because axl_vformat emits one callback per
+// literal run + per format specifier — a typical line has 10–20
+// emissions, and the alternative (write per emission) means 10–20
+// trips through transcode, the ConOut OutputString hot path, AND
+// any installed tee handler. Caps-list dumps (`do capId` with
+// ~125 caps × ~15 emissions/line) measured ~9–19 ms of avoidable
+// overhead from that fragmentation alone.
+//
+// Buffer sizing: 512 bytes covers the single-line consumer prints
+// the SDK is built around (cdump rows, sysid one-liners, log
+// messages). On overflow the scratch fills and we fall through to
+// the legacy per-chunk path so very long prints still produce
+// complete output — at the cost of the same overhead the buffered
+// path was added to avoid. Consumers emitting > 512 bytes per call
+// are rare; if a real consumer hits the slow path frequently the
+// fix is to split into smaller prints, not to grow this buffer.
+//
+// AXL_PRINTF_STACK_BUFFER is defined at the top of this file.
 // ---------------------------------------------------------------------------
 
-static void
-fprintf_write(const char *data, size_t len, void *ctx)
-{
-    FprintfCtx *fc = (FprintfCtx *)ctx;
-    axl_ssize_t n;
+typedef struct {
+    char        *buf;
+    size_t       cap;
+    size_t       len;
+    int          overflowed;
+    /* On overflow, switch to direct-write mode and stream chunks
+       straight to fallback_stream. fallback_count tracks total
+       written; fallback_error mirrors the FprintfCtx convention. */
+    AxlStream   *fallback_stream;
+    int          fallback_count;
+    int          fallback_error;
+} BufferedPrintCtx;
 
-    if (fc->error) {
+static void
+buffered_print_write(const char *data, size_t len, void *ctx)
+{
+    BufferedPrintCtx *bp = (BufferedPrintCtx *)ctx;
+
+    if (bp->overflowed) {
+        /* Direct-write fallback path — drains everything past the
+           stack buffer's capacity straight to the stream. */
+        if (bp->fallback_error) {
+            return;
+        }
+        axl_ssize_t n = axl_write(bp->fallback_stream, data, len);
+        if (n < 0) {
+            bp->fallback_error = 1;
+        } else {
+            bp->fallback_count += (int)n;
+        }
         return;
     }
 
-    n = axl_write(fc->stream, data, len);
-    if (n < 0) {
-        fc->error = 1;
-    } else {
-        fc->count += (int)n;
+    size_t room = bp->cap - bp->len;
+    if (len <= room) {
+        /* Fast path — accumulate into the stack buffer. */
+        for (size_t i = 0; i < len; i++) {
+            bp->buf[bp->len + i] = data[i];
+        }
+        bp->len += len;
+        return;
     }
+
+    /* Overflow: flush whatever we have, then enter direct-write
+       mode for the rest of this chunk and every chunk to come. */
+    bp->overflowed = 1;
+    if (bp->len > 0) {
+        axl_ssize_t n = axl_write(bp->fallback_stream, bp->buf, bp->len);
+        if (n < 0) {
+            bp->fallback_error = 1;
+            return;
+        }
+        bp->fallback_count = (int)n;
+        bp->len = 0;
+    }
+    axl_ssize_t n = axl_write(bp->fallback_stream, data, len);
+    if (n < 0) {
+        bp->fallback_error = 1;
+    } else {
+        bp->fallback_count += (int)n;
+    }
+}
+
+/* Drain whatever the buffered path accumulated, returning the
+   total byte count or -1 on any write error. */
+static int
+buffered_print_flush(BufferedPrintCtx *bp)
+{
+    if (bp->overflowed) {
+        return bp->fallback_error ? -1 : bp->fallback_count;
+    }
+    if (bp->len == 0) {
+        return 0;
+    }
+    axl_ssize_t n = axl_write(bp->fallback_stream, bp->buf, bp->len);
+    if (n < 0) {
+        return -1;
+    }
+    return (int)n;
 }
 
 int
 axl_vfprintf(AxlStream *s, const char *fmt, va_list ap)
 {
-    FprintfCtx fc;
+    char scratch[AXL_PRINTF_STACK_BUFFER];
+    BufferedPrintCtx bp = {
+        .buf             = scratch,
+        .cap             = sizeof scratch,
+        .len             = 0,
+        .overflowed      = 0,
+        .fallback_stream = s,
+        .fallback_count  = 0,
+        .fallback_error  = 0,
+    };
 
     if (s == NULL || fmt == NULL) {
         return -1;
     }
 
-    fc.stream = s;
-    fc.count  = 0;
-    fc.error  = 0;
-
-    axl_vformat(fprintf_write, &fc, fmt, ap);
-
-    return fc.error ? -1 : fc.count;
+    axl_vformat(buffered_print_write, &bp, fmt, ap);
+    return buffered_print_flush(&bp);
 }
 
 int
@@ -1043,43 +1192,51 @@ axl_fprintf(AxlStream *s, const char *fmt, ...)
 int
 axl_print(const char *fmt, ...)
 {
-    va_list args;
-    FprintfCtx fc;
+    char scratch[AXL_PRINTF_STACK_BUFFER];
+    BufferedPrintCtx bp = {
+        .buf             = scratch,
+        .cap             = sizeof scratch,
+        .len             = 0,
+        .overflowed      = 0,
+        .fallback_stream = axl_stdout,
+        .fallback_count  = 0,
+        .fallback_error  = 0,
+    };
 
     if (axl_stdout == NULL || fmt == NULL) {
         return -1;
     }
 
-    fc.stream = axl_stdout;
-    fc.count  = 0;
-    fc.error  = 0;
-
+    va_list args;
     va_start(args, fmt);
-    axl_vformat(fprintf_write, &fc, fmt, args);
+    axl_vformat(buffered_print_write, &bp, fmt, args);
     va_end(args);
-
-    return fc.error ? -1 : fc.count;
+    return buffered_print_flush(&bp);
 }
 
 int
 axl_printerr(const char *fmt, ...)
 {
-    va_list args;
-    FprintfCtx fc;
+    char scratch[AXL_PRINTF_STACK_BUFFER];
+    BufferedPrintCtx bp = {
+        .buf             = scratch,
+        .cap             = sizeof scratch,
+        .len             = 0,
+        .overflowed      = 0,
+        .fallback_stream = axl_stderr,
+        .fallback_count  = 0,
+        .fallback_error  = 0,
+    };
 
     if (axl_stderr == NULL || fmt == NULL) {
         return -1;
     }
 
-    fc.stream = axl_stderr;
-    fc.count  = 0;
-    fc.error  = 0;
-
+    va_list args;
     va_start(args, fmt);
-    axl_vformat(fprintf_write, &fc, fmt, args);
+    axl_vformat(buffered_print_write, &bp, fmt, args);
     va_end(args);
-
-    return fc.error ? -1 : fc.count;
+    return buffered_print_flush(&bp);
 }
 
 /* axl_fopen lives in axl-stream-file.c (the file backend).

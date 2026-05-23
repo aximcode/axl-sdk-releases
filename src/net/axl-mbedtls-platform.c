@@ -90,44 +90,29 @@ mbedtls_platform_fprintf(void *stream, const char *fmt, ...)
 }
 
 // ---------------------------------------------------------------------------
-// Time: mbedTLS needs time() for certificate validation
+// Time: mbedTLS needs time() for certificate validation. Delegate to
+// axl_clock_gettime(REALTIME) so there's exactly one EFI_TIME →
+// Unix-seconds Gregorian conversion in the codebase.
 // ---------------------------------------------------------------------------
-
-static int
-is_leap_year(int year)
-{
-    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-}
-
-static int
-days_in_month(int month, int year)
-{
-    static const int dm[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    if (month == 2 && is_leap_year(year)) {
-        return 29;
-    }
-    return dm[month - 1];
-}
 
 long long
 time(long long *timer)
 {
-    long long result = 0;
-    EFI_TIME t;
+    long long   result = 0;
+    AxlTimespec ts;
 
-    if (gRT != NULL &&
-        axl_efi_call(gRT->GetTime, 2, &t, NULL) == 0 &&
-        t.Year >= 1970)
-    {
-        long long days = 0;
-        for (int y = 1970; y < t.Year; y++) {
-            days += is_leap_year(y) ? 366 : 365;
-        }
-        for (int m = 1; m < t.Month; m++) {
-            days += days_in_month(m, t.Year);
-        }
-        days += t.Day - 1;
-        result = days * 86400LL + t.Hour * 3600LL + t.Minute * 60LL + t.Second;
+    if (axl_clock_gettime(AXL_CLOCK_REALTIME, &ts) == AXL_OK
+        && ts.tv_sec >= 0) {
+        /* mbedTLS expects Unix seconds; pre-1970 timestamps would
+           confuse certificate-validity arithmetic, so clamp to 0
+           (matches the previous behavior which gated on
+           t.Year >= 1970 before doing any conversion). The new
+           tv_sec >= 0 check is slightly stricter — it also rejects
+           1970-01-01 dates that go negative after a positive
+           tz_minutes offset is subtracted — but the difference is
+           a fraction of a day on the epoch boundary, harmless for
+           certificate validity windows that span years. */
+        result = (long long)ts.tv_sec;
     }
 
     if (timer != NULL) {

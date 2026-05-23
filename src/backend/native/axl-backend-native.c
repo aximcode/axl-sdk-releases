@@ -216,72 +216,205 @@ read_counter_freq(void)
 }
 #endif
 
-/* High-resolution monotonic-us, calibration semantics:
+/* High-resolution monotonic clock — POSIX-style clock_gettime
+   shape, backed by the architecture's cycle counter.
 
-   - 0 means "uninitialized" — the next call will calibrate.
-   - The first call's RETURN value reflects elapsed time during
-     calibration itself (a few microseconds plus the 10ms Stall on
-     x86) so callers don't have to handle a special "0 on first
-     call" case.
-   - On platforms where the cycle counter is too slow to give us
-     microsecond resolution (counter freq < 1 MHz), we leave
-     `ticks_per_us` at the no-resolution sentinel and every call
-     after returns 0. Better to surface "no fractional" than emit
-     wildly-wrong values from a 1-tick-per-call fallback.
+   Counter frequency:
 
-   UEFI is single-threaded at TPL_APPLICATION so we don't need
-   atomics around the static state. RDTSC isn't serializing — for
-   microsecond-resolution log timestamps, the few-cycle OoO window
-   is invisible. The x86 path assumes invariant TSC (Nehalem+ /
-   all server CPUs); pre-2008 laptops would see drift under DVFS. */
-#define AXL_MONOTONIC_NO_RESOLUTION  ((uint64_t)~0ULL)
+   - aarch64: read CNTFRQ_EL0 (architectural register). Every UEFI
+     process reads the same value; no calibration needed.
+   - x86_64: calibrate against a 10 ms gBS->Stall on first call, then
+     publish the result on a fresh UEFI handle carrying our private
+     AXL_TSC_FREQ_PROTOCOL_GUID. Subsequent processes within the same
+     boot LocateProtocol → read the cached freq, no re-calibration.
+     The interface struct is allocated from EfiBootServicesData pool
+     (lives until ExitBootServices), so it survives the publishing
+     image being unloaded. Process-local memo avoids repeated
+     LocateProtocol on hot paths.
+
+   Frequency = 0 means "no usable counter" — clock_gettime returns
+   AXL_ERR for AXL_CLOCK_MONOTONIC. (Earlier "below 1 MHz" giveup is
+   gone: the new ns-precision shape can report whatever resolution
+   the counter has via axl_clock_getres.)
+
+   UEFI is single-threaded at TPL_APPLICATION so no atomics around
+   the static memo. RDTSC isn't serializing — the few-cycle OoO
+   window is invisible at nanosecond+ resolution. The x86 path
+   assumes invariant TSC (Nehalem+ / all server CPUs); pre-2008
+   client CPUs that scaled TSC with DVFS would drift, not targeted. */
+
+#if defined(__x86_64__)
+/* {f7a3c5e1-2b91-4d8c-9e57-3a6f8b1c2d4e} — private to axl-sdk for
+   per-boot TSC-frequency caching. Layout: a single uint64_t holding
+   the calibrated ticks-per-second. */
+static const EFI_GUID AXL_TSC_FREQ_PROTOCOL_GUID = {
+    0xf7a3c5e1, 0x2b91, 0x4d8c,
+    {0x9e, 0x57, 0x3a, 0x6f, 0x8b, 0x1c, 0x2d, 0x4e}
+};
+
+typedef struct {
+    uint64_t freq_hz;
+} AxlTscFreqInterface;
+#endif
+
+static uint64_t
+get_counter_freq_hz(void)
+{
+#if defined(__aarch64__)
+    return read_counter_freq();
+#elif defined(__x86_64__)
+    static uint64_t memo = 0;
+    if (memo != 0) {
+        return memo;
+    }
+
+    /* Already published by an earlier process? Sanity-bound the
+       cached value before trusting it — a buggy or hostile prior
+       publisher could land any uint64_t here, and the gettime
+       arithmetic `(ticks % freq) * 1e9` would overflow if freq is
+       extreme. Bounds chosen to cover every real CPU AXL targets:
+       1 MHz floor rejects pathologically-slow counters; 100 GHz
+       ceiling is well above any current or near-future TSC. */
+    AxlTscFreqInterface *iface = NULL;
+    EFI_STATUS status = gBS->LocateProtocol(
+        (EFI_GUID *)&AXL_TSC_FREQ_PROTOCOL_GUID,
+        NULL,
+        (void **)&iface);
+    if (!EFI_ERROR(status) && iface != NULL
+        && iface->freq_hz >= 1000000ull
+        && iface->freq_hz <= 100000000000ull) {
+        memo = iface->freq_hz;
+        return memo;
+    }
+
+    /* First publisher: calibrate via 10ms Stall. */
+    uint64_t before = read_cycle_counter();
+    gBS->Stall(10000);
+    uint64_t after  = read_cycle_counter();
+    uint64_t diff   = after - before;
+    if (diff == 0) {
+        return 0;   /* no usable counter */
+    }
+    uint64_t freq = diff * 100;   /* 10ms → *100 = ticks/sec */
+
+    /* Publish for future processes. Allocate from boot-services
+       pool so the interface survives image unload (the AXL leak
+       tracker would free axl_malloc'd memory at image exit). A
+       failure here just means subsequent processes re-calibrate —
+       not fatal. */
+    void *pool = NULL;
+    if (!EFI_ERROR(gBS->AllocatePool(EfiBootServicesData,
+                                     sizeof(AxlTscFreqInterface), &pool))
+        && pool != NULL) {
+        ((AxlTscFreqInterface *)pool)->freq_hz = freq;
+        EFI_HANDLE pub_handle = NULL;
+        gBS->InstallProtocolInterface(
+            &pub_handle,
+            (EFI_GUID *)&AXL_TSC_FREQ_PROTOCOL_GUID,
+            EFI_NATIVE_INTERFACE,
+            pool);
+        /* If InstallProtocolInterface fails the pool allocation
+           leaks for the rest of the boot — acceptable, this is the
+           calibration path not a hot path. */
+    }
+
+    memo = freq;
+    return memo;
+#else
+    return 0;
+#endif
+}
+
+/* days_from_civil is defined further down (used by both
+   axl_backend_clock_gettime and axl_backend_efi_time_to_unix). */
+static int64_t
+days_from_civil(uint32_t y, uint32_t m, uint32_t d);
+
+/* Single source of truth for converting a Gregorian civil date +
+   time-of-day + signed timezone offset to Unix seconds. Returns a
+   signed result so consumers reading pre-epoch values (rare; only
+   meaningful for clock_gettime(REALTIME) when the RTC is set to a
+   pre-1970 date) preserve them. File-timestamp consumers clamp at
+   the call site.
+
+   The @p tz_minutes argument uses the AXL convention: real signed
+   minutes east of UTC, or INT16_MIN to mean "unspecified — treat
+   as already-UTC." EFI's 0x07FF sentinel must be translated to
+   INT16_MIN by the caller (axl_backend_get_time does this for
+   AxlTime; axl_backend_efi_time_to_unix does it inline). */
+static int64_t
+civil_to_unix_seconds(uint32_t year,
+                      uint32_t month,
+                      uint32_t day,
+                      uint32_t hour,
+                      uint32_t minute,
+                      uint32_t second,
+                      int16_t  tz_minutes)
+{
+    int64_t days = days_from_civil(year, month, day);
+    int64_t secs = days * 86400
+                 + (int64_t)hour   * 3600
+                 + (int64_t)minute * 60
+                 + (int64_t)second;
+    if (tz_minutes != INT16_MIN) {
+        secs -= (int64_t)tz_minutes * 60;
+    }
+    return secs;
+}
+
+int
+axl_backend_clock_gettime(AxlClockId clockid, AxlTimespec *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    out->tv_sec  = 0;
+    out->tv_nsec = 0;
+
+    if (clockid == AXL_CLOCK_MONOTONIC) {
+#if defined(__x86_64__) || defined(__aarch64__)
+        uint64_t freq = get_counter_freq_hz();
+        if (freq == 0) {
+            return AXL_ERR;
+        }
+        uint64_t ticks = read_cycle_counter();
+        out->tv_sec  = (int64_t)(ticks / freq);
+        /* (ticks % freq) < freq ≤ ~2^32 in practice, so the multiply
+           by 1e9 fits in u64 without overflow. */
+        out->tv_nsec = (int32_t)(((ticks % freq) * 1000000000ull) / freq);
+        return AXL_OK;
+#else
+        return AXL_ERR;
+#endif
+    }
+
+    if (clockid == AXL_CLOCK_REALTIME) {
+        AxlTime t;
+        if (axl_backend_get_time(&t) != AXL_OK) {
+            return AXL_ERR;
+        }
+        out->tv_sec  = civil_to_unix_seconds(
+            t.year, t.month, t.day,
+            t.hour, t.minute, t.second,
+            t.timezone_minutes);
+        out->tv_nsec = (int32_t)t.nanosecond;
+        return AXL_OK;
+    }
+
+    return AXL_ERR;
+}
 
 uint64_t
 axl_backend_get_monotonic_us(void)
 {
-#if defined(__x86_64__) || defined(__aarch64__)
-    static uint64_t base_count   = 0;
-    static uint64_t ticks_per_us = 0;  /* 0 = uninit, sentinel = giveup */
-
-    if (ticks_per_us == AXL_MONOTONIC_NO_RESOLUTION) {
+    /* Thin wrapper over axl_backend_clock_gettime for backwards
+       compatibility with backend consumers that haven't been
+       migrated. */
+    AxlTimespec ts;
+    if (axl_backend_clock_gettime(AXL_CLOCK_MONOTONIC, &ts) != AXL_OK) {
         return 0;
     }
-
-    if (ticks_per_us == 0) {
-        /* Set base_count BEFORE calibration so the first call returns
-           the calibration interval itself (a useful non-zero value)
-           rather than 0. */
-        base_count = read_cycle_counter();
-#if defined(__aarch64__)
-        uint64_t freq = read_counter_freq();
-        if (freq < 1000000u) {
-            /* Counter is too slow to give us microsecond resolution.
-               Surface that as "no fractional" rather than emit
-               misleadingly-scaled values. */
-            ticks_per_us = AXL_MONOTONIC_NO_RESOLUTION;
-            return 0;
-        }
-        ticks_per_us = freq / 1000000u;
-#else  /* x86_64: calibrate via 10ms Stall. */
-        uint64_t before = base_count;
-        gBS->Stall(10000);
-        uint64_t after  = read_cycle_counter();
-        uint64_t diff   = after - before;
-        if (diff < 10000u) {
-            /* Counter advanced fewer than 10000 ticks in 10ms — less
-               than 1 MHz. Below microsecond resolution. */
-            ticks_per_us = AXL_MONOTONIC_NO_RESOLUTION;
-            return 0;
-        }
-        ticks_per_us = diff / 10000u;
-#endif
-    }
-
-    uint64_t now = read_cycle_counter();
-    return (now - base_count) / ticks_per_us;
-#else
-    return 0;
-#endif
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 // ===================================================================
@@ -724,18 +857,17 @@ axl_backend_efi_time_to_unix(const void *efi_time_16)
         return 0;
     }
 
-    int64_t days = days_from_civil(year, month, day);
-    if (days < 0) {
-        return 0;
-    }
-    int64_t secs = days * 86400 + (int64_t)hour * 3600 +
-                   (int64_t)minute * 60 + (int64_t)second;
-    /* EFI_UNSPECIFIED_TIMEZONE (0x07FF = 2047) means "no TZ info" —
-       treat as UTC. Otherwise subtract the offset (TZ is minutes
-       east of UTC, so local - tz = UTC). */
-    if (tz_minutes != 0x07FF) {
-        secs -= (int64_t)tz_minutes * 60;
-    }
+    /* Normalize EFI's 0x07FF "unspecified timezone" sentinel to the
+       AXL-side INT16_MIN convention before handing off to the
+       shared converter. */
+    int16_t axl_tz = (tz_minutes == 0x07FF)
+                     ? INT16_MIN
+                     : tz_minutes;
+    int64_t secs = civil_to_unix_seconds(
+        year, month, day, hour, minute, second, axl_tz);
+    /* File-timestamp use case has no representation for pre-epoch
+       values — clamp negative results to 0 (matches the previous
+       behavior of axl_backend_efi_time_to_unix). */
     return secs < 0 ? 0 : (uint64_t)secs;
 }
 

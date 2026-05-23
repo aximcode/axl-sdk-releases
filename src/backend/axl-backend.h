@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-time.h>   /* AxlTimespec for axl_backend_clock_gettime */
 
 // ===================================================================
 // UEFI types and table pointers
@@ -140,6 +141,23 @@ axl_backend_get_time(
  */
 uint64_t
 axl_backend_get_monotonic_us(void);
+
+/**
+ * @brief Backend primitive for @ref axl_clock_gettime.
+ *
+ * Single entry point for both monotonic and wallclock reads. The
+ * native backend handles cycle-counter calibration (with per-boot
+ * caching via a UEFI protocol on x86) and the
+ * EFI_TIME → Unix-seconds Gregorian conversion.
+ *
+ * @return AXL_OK on success, AXL_ERR on bad arguments or hardware /
+ *     firmware error.
+ */
+int
+axl_backend_clock_gettime(
+    AxlClockId    clockid,   ///< clock to read
+    AxlTimespec  *out        ///< [out] populated on success
+);
 
 // ===================================================================
 // Low-level platform I/O (for AxlIpmi, future AxlPci/AxlSpd)

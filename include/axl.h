@@ -59,6 +59,7 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-embed.h>
 #include <axl/axl-service.h>
+#include <axl/axl-shared-driver.h>
 #include <axl/axl-efi-status.h>
 #include <axl/axl-image.h>
 #include <axl/axl-mem-phys.h>

@@ -40,4 +40,21 @@ _axl_decode_image_filepath(EFI_DEVICE_PATH_PROTOCOL *dp);
 char *
 _axl_prepend_volume_mapping(void *device_handle, const char *file_path);
 
+/**
+ * Initialize the per-image sidecar-discovery anchor (`axl_app_image_path`)
+ * for an image whose CRT0 didn't run `_axl_args_init`. Specifically:
+ * DXE drivers go through `axl_driver_init`, not the application CRT,
+ * so they reach this entry point to capture their LoadedImage->FilePath.
+ *
+ * Idempotent — a follow-up call after `_axl_args_init` is a no-op.
+ *
+ * The walk falls back to LoadedImage->ParentHandle when the current
+ * image has no FilePath (the common case for buffer-loaded driver
+ * images: `axl_driver_load_buffer` and `axl_driver_ensure_with_embedded`'s
+ * step-4 embedded-blob path). This makes sidecar autodiscovery work
+ * for embedded drivers by anchoring on the launcher's path.
+ */
+void
+_axl_init_image_path(void *image_handle);
+
 #endif /* AXL_IMAGE_INTERNAL_H */

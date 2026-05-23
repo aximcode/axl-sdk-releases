@@ -81,36 +81,61 @@ axl_time_format(char *buf, size_t buf_size)
 }
 
 // ---------------------------------------------------------------------------
-// Monotonic counter
+// POSIX-style clock_gettime
+// ---------------------------------------------------------------------------
+
+int
+axl_clock_gettime(AxlClockId clockid, AxlTimespec *out)
+{
+    return axl_backend_clock_gettime(clockid, out);
+}
+
+int
+axl_clock_getres(AxlClockId clockid, AxlTimespec *out_res)
+{
+    if (out_res == NULL) {
+        return AXL_ERR;
+    }
+    if (clockid != AXL_CLOCK_MONOTONIC && clockid != AXL_CLOCK_REALTIME) {
+        return AXL_ERR;
+    }
+    /* Both clocks report 1 ns nominal resolution. The MONOTONIC
+       counter is finer-grained in hardware (sub-ns on a 3 GHz TSC)
+       but `struct timespec` is ns-quantized, so 1 ns is the
+       smallest representable. The REALTIME RTC is typically
+       second-granularity in firmware; the nanosecond field in
+       EFI_TIME is best-effort. Consumers that need true measured
+       resolution should benchmark via repeated gettime calls.
+
+       Intentionally NO calibration here: clock_getres must be
+       cheap and side-effect-free, so we don't probe the backend. */
+    out_res->tv_sec  = 0;
+    out_res->tv_nsec = 1;
+    return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Monotonic convenience wrappers
 // ---------------------------------------------------------------------------
 
 uint64_t
 axl_time_get_ms(void)
 {
-    AxlTime time;
-
-    if (axl_backend_get_time(&time) != AXL_OK) {
+    AxlTimespec ts;
+    if (axl_clock_gettime(AXL_CLOCK_MONOTONIC, &ts) != AXL_OK) {
         return 0;
     }
-
-    /* Convert to ms since midnight — not truly monotonic across days
-       but sufficient for elapsed-time measurement within a session. */
-    uint64_t ms = 0;
-    ms += (uint64_t)time.hour * 3600000;
-    ms += (uint64_t)time.minute * 60000;
-    ms += (uint64_t)time.second * 1000;
-    ms += (uint64_t)(time.nanosecond / 1000000);
-    return ms;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
 uint64_t
 axl_time_get_us(void)
 {
-    /* Thin pass-through to the backend cycle-counter. Lives here
-       (rather than as a backend stub) so consumer code reaches
-       it through the public <axl/axl-time.h> surface without
-       needing the internal backend header. */
-    return axl_backend_get_monotonic_us();
+    AxlTimespec ts;
+    if (axl_clock_gettime(AXL_CLOCK_MONOTONIC, &ts) != AXL_OK) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 int

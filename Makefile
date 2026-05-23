@@ -222,6 +222,7 @@ LIB_SOURCES = \
     src/util/axl-rng.c \
     src/util/axl-protocol.c \
     src/util/axl-driver.c \
+    src/util/axl-shared-driver.c \
     src/util/axl-diag.c \
     src/util/axl-config.c \
     src/util/axl-subcommand.c \

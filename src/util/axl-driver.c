@@ -9,6 +9,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-image-internal.h"   /* _axl_init_image_path */
 #include <axl/axl-driver.h>
 #include <axl/axl-efi-status.h>
 #include <axl/axl-mem.h>
@@ -651,6 +652,13 @@ axl_driver_init(
     gRT = gST->RuntimeServices;
 
     axl_stream_init();
+
+    /* Populate the per-image sidecar-discovery anchor. Apps reach
+       this via _axl_args_init from the CRT; drivers must go through
+       here because the driver CRT path doesn't parse argv. Includes
+       a ParentHandle fallback for buffer-loaded drivers — see
+       axl-image-internal.h for the contract. */
+    _axl_init_image_path((void *)image_handle);
 }
 
 // ---------------------------------------------------------------------------
