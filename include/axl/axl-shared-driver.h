@@ -144,6 +144,51 @@ axl_shared_driver_locate(
 );
 
 /**
+ * @brief Tear down a shared-driver: uninstall its protocol and unload
+ *     its image.
+ *
+ * Symmetric counterpart to @ref axl_shared_driver_publish, callable
+ * from a launcher (or any image OTHER than the driver itself).
+ *
+ * Resolution:
+ *
+ *   1. Derive the protocol GUID via @ref axl_shared_driver_guid.
+ *   2. @c LocateHandleBuffer(ByProtocol, ...) finds the image handle
+ *      that installed the protocol. Since `axl_shared_driver_publish`
+ *      installs on the driver's `gImageHandle` (when the consumer
+ *      leaves @c *out_handle null), the protocol lives on exactly one
+ *      handle: the driver's loaded-image handle.
+ *   3. @ref axl_driver_unload releases the AXL-tracked LoadOptions
+ *      copy (if any) and calls `gBS->UnloadImage`. The driver's
+ *      registered unload callback (via `AXL_DRIVER`) runs as part of
+ *      UnloadImage — that's where the driver's own cleanup happens
+ *      (`axl_shared_driver_unpublish` + any consumer-side free).
+ *
+ * After this returns, the next @ref axl_shared_driver_locate will
+ * fall through to disk / embed because LocateProtocol misses.
+ *
+ * Safe to call when the driver isn't loaded — returns AXL_OK because
+ * the post-condition (driver not resident) already holds.
+ *
+ * **MUST NOT** be called from inside the driver image itself; UEFI's
+ * UnloadImage semantics on a self-executing image are undefined. The
+ * driver-side use case is served by @ref axl_shared_driver_unpublish
+ * already.
+ *
+ * Typical use case: a launcher's `--reload` developer flag that
+ * forces a fresh driver image to load on the next invocation,
+ * skipping the resident-driver short-circuit.
+ *
+ * @return AXL_OK on success or when the driver wasn't loaded;
+ *     AXL_ERR if LocateHandleBuffer returned a handle but the
+ *     subsequent unload failed.
+ */
+int
+axl_shared_driver_unload(
+    const char *name   ///< shared-driver identity (same name passed to publish/locate)
+);
+
+/**
  * @brief Locate a shared-driver vtable, passing config to the driver.
  *
  * Like @ref axl_shared_driver_locate but also installs @p load_options

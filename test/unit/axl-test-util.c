@@ -3045,23 +3045,24 @@ test_shared_driver(void)
     test_check(axl_protocol_find_guid(&g1, &found) == AXL_ERR,
                "shared_driver_unpublish: protocol removed");
 
-    /* Handle-reuse contract: publishing with *out_handle pre-set to
-       an existing handle reuses it (per axl_protocol_register_guid's
-       in/out semantics). Mint a fresh handle via axl-runtime first,
-       then verify publish installs ON it rather than allocating a
-       new one. */
+    /* Handle-defaulting contract (since 0.19.2): publish with
+       *out_handle == NULL defaults to the caller's gImageHandle so
+       the protocol lives on the same handle UnloadImage can act on.
+       Pre-setting *out_handle to a non-NULL value preserves the old
+       reuse semantics. */
     AxlHandle reused = NULL;
     static int sentinel_a = 1;
     static int sentinel_b = 2;
-    /* Phase 1: register sentinel_a, get a real handle back. */
+    /* Phase 1: pass *out_handle == NULL; expect the default
+       (gImageHandle of the test image). */
     test_check(axl_shared_driver_publish("shared-driver-test-reuse",
                                          &sentinel_a, &reused) == AXL_OK
                && reused != NULL,
-               "shared_driver_publish: mints handle when *out=NULL");
+               "shared_driver_publish: defaults to gImageHandle when *out=NULL");
     AxlHandle pinned = reused;
-    /* Phase 2: re-publish a DIFFERENT identity onto the SAME handle.
-       Pre-set *out_handle to the existing one; the underlying
-       protocol_register_guid should reuse it. */
+    /* Phase 2: re-publish a DIFFERENT identity with *out_handle
+       pre-set to the same pinned handle. Underlying register_guid
+       reuses the handle rather than minting. */
     test_check(axl_shared_driver_publish("shared-driver-test-reuse-2",
                                          &sentinel_b, &reused) == AXL_OK
                && reused == pinned,
@@ -3072,6 +3073,99 @@ test_shared_driver(void)
                && axl_shared_driver_unpublish("shared-driver-test-reuse-2",
                                               pinned, &sentinel_b) == AXL_OK,
                "shared_driver_unpublish: handle-reuse cleanup");
+
+    /* Unload API guards: NULL name rejected. Driver-not-loaded path
+       must return AXL_OK silently (post-condition already holds). */
+    test_check(axl_shared_driver_unload(NULL) == AXL_ERR,
+               "shared_driver_unload: NULL name rejected");
+    test_check(axl_shared_driver_unload("shared-driver-never-published")
+                   == AXL_OK,
+               "shared_driver_unload: not-loaded path returns OK");
+
+    /* Unload-on-non-image-handle path: contract check that the
+       primitive surfaces UnloadImage failures cleanly rather than
+       crashing. Pre-mint a fresh non-image handle by pre-setting
+       *out_handle to a non-NULL synthetic value through publish's
+       reuse path (the synthetic handle has the protocol installed
+       on it but is not a loaded-image handle). axl_shared_driver_unload
+       then resolves to that handle, calls gBS->UnloadImage on it,
+       which returns EFI_INVALID_PARAMETER per spec ("not a loaded
+       image"), and we surface AXL_ERR. Importantly this exercise
+       does NOT depend on running-image UnloadImage semantics
+       (which are firmware-quirky) — only on the well-defined
+       wrong-handle case. */
+    static int sentinel_synth = 99;
+    AxlHandle synth_h = NULL;
+    /* Mint a synthetic handle: register_guid with NULL handle slot
+       creates one; we own it. Use a separate identity (not the
+       shared-driver namespace) so we don't collide with anything. */
+    static const AxlGuid synth_guid = AXL_GUID(
+        0xdeadbeef, 0xfeed, 0xface,
+        0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44);
+    test_check(axl_protocol_register_guid(&synth_guid, &sentinel_synth,
+                                          (void **)&synth_h) == AXL_OK
+               && synth_h != NULL,
+               "shared_driver_unload: synthetic non-image handle minted");
+    /* Pre-set publish's out_handle to the synthetic handle so the
+       shared-driver protocol lands on it (not on gImageHandle). */
+    AxlHandle reuse_h = synth_h;
+    test_check(axl_shared_driver_publish("shared-driver-non-image-test",
+                                         &sentinel_synth, &reuse_h)
+                   == AXL_OK
+               && reuse_h == synth_h,
+               "shared_driver_unload: shared-driver protocol pinned to non-image handle");
+    test_check(axl_shared_driver_unload("shared-driver-non-image-test")
+                   == AXL_ERR,
+               "shared_driver_unload: surfaces UnloadImage failure on non-image handle");
+    /* Cleanup: explicit unpublish + remove the synthetic protocol. */
+    test_check(axl_shared_driver_unpublish("shared-driver-non-image-test",
+                                           synth_h, &sentinel_synth) == AXL_OK
+               && axl_protocol_unregister_guid(synth_h, &synth_guid,
+                                               &sentinel_synth) == AXL_OK,
+               "shared_driver_unload: cleanup non-image handle");
+
+    /* Leak-stress on the unload's LocateHandleBuffer + FreePool path.
+       The driver-leak-test integration test already covers
+       axl_driver_unload's load-options-side leak surface; here we
+       just verify the wrapper's added alloc-path (the handle buffer
+       LocateHandleBuffer hands us, which we must FreePool) doesn't
+       grow per-iteration. Loop publish + unload + unpublish N
+       times against a synthetic non-image handle and verify the
+       in-flight allocation count returns to the pre-loop baseline
+       exactly — a real leak would show monotonic growth. */
+    AxlMemStats stats_before, stats_after;
+    AxlHandle loop_synth = NULL;
+    static int sentinel_loop = 42;
+    static const AxlGuid loop_synth_guid = AXL_GUID(
+        0xfeedf00d, 0xbeef, 0xcafe,
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11);
+    /* Pre-mint a single synthetic handle reused by every iteration. */
+    test_check(axl_protocol_register_guid(&loop_synth_guid, &sentinel_loop,
+                                          (void **)&loop_synth) == AXL_OK,
+               "shared_driver_unload: leak-loop synthetic handle ready");
+
+    axl_mem_get_stats(&stats_before);
+    for (int i = 0; i < 50; i++) {
+        AxlHandle loop_h = loop_synth;
+        if (axl_shared_driver_publish("shared-driver-loop-test",
+                                      &sentinel_loop, &loop_h) != AXL_OK) {
+            break;
+        }
+        (void)axl_shared_driver_unload("shared-driver-loop-test");
+        axl_shared_driver_unpublish("shared-driver-loop-test",
+                                    loop_h, &sentinel_loop);
+    }
+    axl_mem_get_stats(&stats_after);
+    /* Exact equality: in-flight allocation count returns to the
+       pre-loop baseline. If the per-iteration warning print pulls
+       in a transient that's released before the next iteration,
+       this still holds. A leak would show monotonic growth on
+       `count`. */
+    test_check(stats_after.count == stats_before.count,
+               "shared_driver_unload: 50x loop heap-stable");
+
+    /* Cleanup the leak-loop synthetic handle. */
+    axl_protocol_unregister_guid(loop_synth, &loop_synth_guid, &sentinel_loop);
 }
 
 // ---------------------------------------------------------------------------

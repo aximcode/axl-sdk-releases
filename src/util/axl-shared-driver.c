@@ -5,18 +5,25 @@
     Convenience layer for the "thin launcher + resident driver"
     pattern — see @c <axl/axl-shared-driver.h> for the consumer API.
 
-    The three exported functions are thin wrappers over existing
+    The exported functions are thin wrappers over existing
     primitives:
 
-      - publish   = axl_protocol_register_guid + axl_guid_v5(name)
+      - publish   = axl_protocol_register_guid + axl_guid_v5(name);
+                    defaults `*out_handle` to the driver's
+                    `gImageHandle` so `unload` can resolve the
+                    image-bearing handle via LocateHandleBuffer
       - unpublish = axl_protocol_unregister_guid + same GUID
       - locate    = axl_driver_ensure_with_embedded
                   + axl_protocol_find_guid + same GUID
+      - unload    = LocateHandleBuffer(ByProtocol, GUID)
+                  + axl_driver_unload (which fires the driver's
+                  registered unload callback, which calls unpublish)
 
     The only state owned by this file is the namespace UUID used to
     derive consumer identities. Everything else is composed.
 **/
 
+#include "../backend/axl-backend.h"     /* gBS, EFI_HANDLE, ByProtocol */
 #include <axl/axl-shared-driver.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-log.h>
@@ -62,9 +69,19 @@ axl_shared_driver_publish(
         return AXL_ERR;
     }
     /* axl_protocol_register_guid takes void** for the handle — null
-       in-slot means "create new handle", non-null means "reuse".
-       We pass *out_handle through unchanged so consumers that want
-       to pin their own handle can do so by pre-setting *out_handle. */
+       in-slot means "create a new handle", non-null means "use this
+       one". We default to the driver's own image handle (gImageHandle,
+       declared by axl-backend / axl-uefi-extra) so the protocol lives
+       on the same handle UnloadImage can act on; that is what makes
+       axl_shared_driver_unload able to locate and unload the driver
+       by name (LocateHandleBuffer → image handle → UnloadImage).
+       Consumers that want a separate handle can pre-set *out_handle
+       to a specific value (or to a non-null sentinel like a fresh
+       axl_protocol_register_guid output) and this default is
+       skipped. */
+    if (*out_handle == NULL) {
+        *out_handle = (AxlHandle)gImageHandle;
+    }
     int rc = axl_protocol_register_guid(&guid, iface, (void **)out_handle);
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_publish: install failed for '%s'",
@@ -91,6 +108,54 @@ axl_shared_driver_unpublish(
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_unpublish: uninstall failed for '%s'",
                     name);
+    }
+    return rc;
+}
+
+int
+axl_shared_driver_unload(
+    const char *name
+    )
+{
+    if (name == NULL) {
+        return AXL_ERR;
+    }
+    AxlGuid guid;
+    if (axl_shared_driver_guid(name, &guid) != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    /* Find the image handle that installed the protocol. publish
+       defaults to gImageHandle, so there's exactly one handle for
+       the GUID — but ask for the buffer form so we can free it
+       cleanly even on the edge case of zero (driver not loaded). */
+    UINTN          handle_count = 0;
+    EFI_HANDLE    *handles      = NULL;
+    EFI_STATUS     status       = axl_bs()->LocateHandleBuffer(
+        ByProtocol, (EFI_GUID *)&guid, NULL, &handle_count, &handles);
+    if (EFI_ERROR(status) || handle_count == 0 || handles == NULL) {
+        /* Not resident — post-condition (driver not loaded) already
+           holds. axl_setenv-style return: success when the work was
+           a no-op because the desired state is already in effect. */
+        return AXL_OK;
+    }
+
+    EFI_HANDLE driver_handle = handles[0];
+    if (handle_count > 1) {
+        /* Defensive: publish defaults to gImageHandle so only one
+           handle should carry the protocol. Log and use the first
+           handle anyway — the others would be stale state we can't
+           safely guess about. */
+        axl_warning("axl_shared_driver_unload: '%s' resolved %lu handles, "
+                    "expected 1; unloading the first only",
+                    name, (unsigned long)handle_count);
+    }
+    axl_bs()->FreePool(handles);
+
+    int rc = axl_driver_unload((AxlDriverHandle)driver_handle);
+    if (rc != AXL_OK) {
+        axl_warning("axl_shared_driver_unload: axl_driver_unload "
+                    "failed for '%s'", name);
     }
     return rc;
 }

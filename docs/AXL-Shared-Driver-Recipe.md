@@ -7,19 +7,24 @@ amortize startup cost (LoadImage, parsing sidecar data, opening
 firmware protocols) over the boot rather than paying it on every
 shell invocation.
 
-Three small helpers in [`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h)
+Four small helpers in [`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h)
 wrap the underlying lifecycle:
 
 - `axl_shared_driver_publish(name, iface, &handle)` — driver-side, in
   DriverEntry. Derives the identity GUID from `name` via
   `axl_guid_v5` against the SDK's shared-driver namespace, then
-  publishes the consumer's vtable on a fresh UEFI handle.
+  publishes the consumer's vtable on the driver's `gImageHandle`
+  (so a launcher can `LocateHandleBuffer` it for teardown).
 - `axl_shared_driver_unpublish(name, handle, iface)` — driver-side,
   in the unload callback.
 - `axl_shared_driver_locate(name, driver_filename, embed, embed_len,
   &iface)` — launcher-side, in `int main`. Ensures the driver is
   loaded (resident → on-disk → embedded blob), then resolves the
   vtable.
+- `axl_shared_driver_unload(name)` — launcher-side. Symmetric
+  teardown counterpart to publish — `LocateHandleBuffer` → the
+  driver's image handle → `UnloadImage`. Used by `--reload`-style
+  developer flags and crash-recovery scenarios.
 
 No new AXL type is introduced: the consumer owns its vtable struct
 and the AXL_DRIVER / `int main` CRT wiring. These three functions
@@ -243,6 +248,44 @@ axl-cc or the helpers; both pass `--no-undefined`.
 The [`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/)
 example demonstrates this exact pattern with a small
 `shared-driver-demo-format.{c,h}` TU compiled into both images.
+
+## Reload / teardown
+
+Drop the resident driver from outside its own image — useful for a
+launcher's `--reload` developer flag (pick up a freshly-built
+driver `.efi` without a firmware reboot) or for crash-recovery
+scenarios where you want to discard a driver that's in a bad
+state:
+
+```c
+if (consumer_wants_reload) {
+    /* Returns AXL_OK if driver wasn't resident (post-condition
+     * "not loaded" already holds). On success the next locate
+     * call falls through LocateProtocol's short-circuit and
+     * does a fresh LoadImage. */
+    axl_shared_driver_unload(MY_TOOL_NAME);
+}
+MyToolVtable *vt = NULL;
+axl_shared_driver_locate(MY_TOOL_NAME, /* ... */, (void **)&vt);
+return vt->do_run(argc, argv);
+```
+
+Resolution: `axl_shared_driver_unload` derives the protocol GUID
+from `name`, calls `LocateHandleBuffer(ByProtocol, ...)` to find
+the driver's image handle (publish installs on the driver's
+`gImageHandle`, so the protocol-bearing handle IS the
+loaded-image handle), then `axl_driver_unload` → `gBS->UnloadImage`,
+which fires the driver's registered unload callback (which calls
+`axl_shared_driver_unpublish` to remove the protocol install).
+The driver's pages get freed; the next launcher invocation pays
+the full LoadImage cost again.
+
+**Must not be called from inside the driver image itself.**
+`gBS->UnloadImage` on a self-executing image is undefined behavior
+(the image's pages get freed mid-stack-frame). The driver-side
+teardown path is `axl_shared_driver_unpublish` from the driver's
+unload callback; the launcher-side teardown is
+`axl_shared_driver_unload`. They are not interchangeable.
 
 ## Performance properties
 

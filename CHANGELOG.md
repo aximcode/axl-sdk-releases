@@ -3,6 +3,40 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.19.2 — 2026-05-23
+
+### Added
+
+- **`axl_shared_driver_unload(name)`** — launcher-side teardown
+  primitive in `<axl/axl-shared-driver.h>`. Resolves the driver's
+  protocol-bearing handle via `LocateHandleBuffer(ByProtocol,
+  GUID)`, then `axl_driver_unload` (which fires the driver's
+  registered unload callback → `axl_shared_driver_unpublish` runs
+  → image pages freed). Returns AXL_OK when the driver isn't
+  loaded — post-condition "driver not resident" already holds.
+  **Must not be called from inside the driver image itself**;
+  `gBS->UnloadImage` on a self-executing image is undefined.
+  Symmetric counterpart to `axl_shared_driver_publish` for
+  `--reload`-style developer flags and crash-recovery
+  scenarios. Demo `sdk/examples/shared-driver-demo/` extended
+  with `--reload` to exercise the pattern.
+
+### Changed
+
+- **`axl_shared_driver_publish` now defaults `*out_handle` to the
+  driver's `gImageHandle` when the consumer passes in NULL.**
+  Previously a fresh handle was minted via
+  `InstallProtocolInterface`, which made the protocol-bearing
+  handle distinct from the loaded-image handle — and that
+  separation meant the new `axl_shared_driver_unload` couldn't
+  resolve a single handle to feed `UnloadImage`. The change is
+  effectively invisible to existing consumers: the published
+  handle's identity isn't read externally except to pass back to
+  `axl_shared_driver_unpublish`. Consumers that pin a specific
+  handle by pre-setting `*out_handle` to a non-NULL value retain
+  the old reuse semantics; only the NULL-default behavior
+  changed.
+
 ## 0.19.1 — 2026-05-23
 
 ### Fixed

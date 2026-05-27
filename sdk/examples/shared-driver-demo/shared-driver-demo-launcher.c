@@ -42,6 +42,21 @@ main(int argc, char **argv)
      * `ld --no-undefined` would catch it at link time. */
     demo_print_banner("starting");
 
+    /* --reload (or -r): unload the resident driver before locating.
+     * Skips the LocateProtocol short-circuit on the next call,
+     * forcing a fresh LoadImage from the on-disk path (or the
+     * embedded blob if no disk copy is present). Useful for dev
+     * iteration after rebuilding the driver image without having
+     * to reboot the firmware. */
+    for (int i = 1; i < argc; i++) {
+        if (axl_strcmp(argv[i], "--reload") == 0
+            || axl_strcmp(argv[i], "-r") == 0) {
+            (void)axl_shared_driver_unload(SHARED_DRIVER_DEMO_NAME);
+            demo_print_banner("driver unloaded; next locate will reload");
+            break;
+        }
+    }
+
     SharedDriverDemoVtable *vt = NULL;
 
     /* One call wraps the cold-and-warm paths:
