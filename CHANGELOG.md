@@ -3,6 +3,21 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.20.1 — 2026-05-29
+
+### Fixed
+
+- **Packaged C++ artifacts.** The 0.20.0 `.deb`/`.rpm` shipped a
+  C-only tree — `axl-c++` and `libaxl-cxx.a` were silently absent
+  because the release runner lacked the ARM bare-metal toolchain
+  and `install.sh` ran in auto (build-if-present) mode. The release
+  workflow now installs the pinned toolchain, stages with `--cpp`
+  (require mode — hard-fails if the toolchain is missing rather than
+  silently dropping C++), and the package smoke test asserts
+  `libaxl-cxx.a` (both arches) is present and links a C++ example to
+  a PE32+ EFI binary. C-only consumers are unaffected. Adds
+  `sdk/examples/hello.cpp`.
+
 ## 0.20.0 — 2026-05-29
 
 This release adds three new public modules (AxlMath, AxlPixmap,
