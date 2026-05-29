@@ -198,6 +198,31 @@ axl_ttf_free(
 }
 
 // ===================================================================
+// Public API — built-in font
+// ===================================================================
+
+/* Built-in DejaVu Sans subset, defined in
+ * src/gfx/fonts/font-dejavu-default.c.  Both symbols (and the loaded
+ * AxlTtf below) are dropped by --gc-sections from any binary that
+ * never references axl_ttf_default. */
+extern const unsigned char axl_ttf_dejavu_default_data[];
+extern const unsigned int  axl_ttf_dejavu_default_data_len;
+
+AxlTtf *
+axl_ttf_default(void)
+{
+    /* Lazy one-time load; the static byte array outlives the process
+     * so the zero-copy AxlTtf is safe to share and never free.
+     * Single-threaded UEFI boot services — no locking needed. */
+    static AxlTtf *cached = NULL;
+    if (cached == NULL) {
+        cached = axl_ttf_load(axl_ttf_dejavu_default_data,
+                              axl_ttf_dejavu_default_data_len);
+    }
+    return cached;
+}
+
+// ===================================================================
 // Public API — measurement
 // ===================================================================
 

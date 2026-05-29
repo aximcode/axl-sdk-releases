@@ -44,7 +44,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <axl/axl-gfx.h>
+#include <axl/axl-gfx-types.h>
 #include <axl/axl-macros.h>
 
 #ifdef __cplusplus
@@ -102,6 +102,39 @@ void
 axl_ttf_free(
     AxlTtf  *ttf   ///< font to free, or NULL
     );
+
+// ===================================================================
+// Built-in font
+// ===================================================================
+
+/// Return a shared, ready-to-use built-in TrueType font.
+///
+/// Backed by a subset of DejaVu Sans compiled into `libaxl.a`,
+/// covering ASCII + Latin-1 (U+0020..U+00FF) plus common
+/// typographic punctuation: en/em dash (U+2013/U+2014), curly
+/// quotes (U+2018..U+201D), bullet (U+2022), and ellipsis
+/// (U+2026).  Sufficient for Western-European UI text without the
+/// consumer bundling a font asset.
+///
+/// The font is loaded once on the first successful call and
+/// cached; every call returns the **same** handle.  The caller
+/// does **not** own it:
+/// do NOT pass the result to `axl_ttf_free` (the backing bytes are
+/// static and the handle is shared process-wide).  Mirrors the
+/// ownership model of `axl_gfx_default_font`.
+///
+/// First-call load is not reentrant (it performs the one-time
+/// parse + allocation); subsequent calls are read-only.  This
+/// matches the single-threaded UEFI boot-services model.
+///
+/// The embedded font data is dropped by `--gc-sections` from any
+/// binary that never references this function, so consumers that
+/// load their own font pay no size cost.
+///
+/// @return shared `AxlTtf *` (never freed by the caller), or NULL
+///         if the one-time load fails (allocation failure).
+AxlTtf *
+axl_ttf_default(void);
 
 // ===================================================================
 // Measurement

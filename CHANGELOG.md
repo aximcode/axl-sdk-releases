@@ -3,6 +3,75 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.21.0 — 2026-05-29
+
+### Added
+
+- **`axl_ttf_default()`** — a shared, built-in TrueType font (a ~23 KB
+  DejaVu Sans subset: ASCII + Latin-1 + common typographic
+  punctuation) so consumers get vector text without bundling a font
+  asset. Caller does not own it (mirrors `axl_gfx_default_font`).
+  Dropped by `--gc-sections` when unreferenced, so consumers that load
+  their own font pay no size cost. DejaVu's Bitstream Vera license is
+  vendored and documented in `THIRD_PARTY.md` (stb_image / stb_truetype
+  are now documented there too).
+
+- **AxlGfx gradients (Phase G5)** — `<axl/axl-gfx-gradient.h>`:
+  `AxlGfxGradient` (linear axis or radial center+radius),
+  `axl_gfx_gradient_add_stop` (up to 16 stops, alpha interpolated), and
+  `axl_gfx_fill_rect_gradient`. Per-pixel sampling with clamped
+  offsets; per-channel sRGB interpolation. Path / rounded-rect gradient
+  fills are planned follow-ups.
+
+- **`axl_pci_next_unfiltered()`** — enumeration variant that does NOT
+  skip 0x0000 phantom slots (see Changed), for the rare consumer that
+  needs raw config space.
+
+### Changed
+
+- **AxlGfx header layout.** `<axl/axl-gfx.h>` is now a thin umbrella
+  over focused sub-headers — `axl-gfx-types.h`, `-surface.h`, `-draw.h`,
+  `-path.h`, `-gradient.h` (plus `axl-font.h` / `axl-truetype.h` /
+  `axl-pixmap.h`). `#include <axl/axl-gfx.h>` is unchanged for
+  consumers; no function/type renames. Fixes a gap where `<axl.h>` did
+  not surface AxlTtf / AxlPixmap — it now pulls the whole 2D library.
+
+- **`axl_pci_format_name` renders VID:DID uppercase** (`%04X`), matching
+  lspci / pci-ids / vendor-tool convention; lowercase was the outlier.
+  The lspci and netinfo tools render PCI VID:DID uppercase to match.
+  USB (`axl_usb_ids_format_name`) stays lowercase per lsusb convention;
+  PCI bus addresses stay lowercase.
+
+- **AxlArgs accepts negative-number positionals and POSIX `--`.**
+  `-<digit>` / `-.<digit>` (e.g. `-1`, `-.5`) are treated as positionals
+  rather than unknown flags, and a bare `--` ends option parsing for the
+  current node (everything after is positional). Both are additive — the
+  affected tokens previously errored, so no working invocation changes.
+
+- **`axl_pci_next` skips 0x0000 phantom slots by default.** Some chipsets
+  return all-zero config reads for disconnected slots/functions instead
+  of all-ones, producing bogus 0000:0000 devices. Both 0x0000 and
+  0xFFFF are reserved "no device" vendor IDs and are now skipped; use
+  `axl_pci_next_unfiltered` to opt back in.
+
+### Fixed
+
+- **Stack out-of-bounds write in `axl_pci_addr_parse`** (security): an
+  over-long address such as `"1:2:3:4.5"` wrote one element past the
+  4-element `parts[]` array before returning an error, corrupting
+  adjacent stack on hostile input. Now bounds-guarded.
+
+- **`--help` alignment.** Positional argument help text now aligns in a
+  fixed column with the flag / `-h` lines regardless of argument-name
+  length (was a drifting, fixed-pad layout).
+
+### Internal
+
+- Static-analyzer cleanups (two `clang-analyzer` ArrayBound findings,
+  one a real bug — see above), and a sweep removing downstream-consumer
+  product names from example code and design docs (hardware-vendor
+  names the library targets, e.g. the Dell IPMI transport, are kept).
+
 ## 0.20.1 — 2026-05-29
 
 ### Fixed

@@ -254,7 +254,13 @@ axl_pci_addr_parse(const char *s, AxlPciAddr *out)
         bool is_final_sep = (*p == '.');
         p++;
         if (is_final_sep) {
-            /* func is next; one more parse then must hit EOF. */
+            /* func is next; one more parse then must hit EOF. Reject
+               an over-long address (>4 fields, e.g. "1:2:3:4.5")
+               before indexing — n_parts is already 4 here, so the
+               write would overflow parts[]. */
+            if (n_parts >= 4) {
+                return AXL_ERR;
+            }
             int fn = parse_hex_field(p, 5, &parts[n_parts]);
             if (fn < 0) return AXL_ERR;
             p += fn;
@@ -859,14 +865,27 @@ axl_pci_dump(
 
 static bool
 function_present(
-    AxlPciAddr  a
+    AxlPciAddr  a,
+    bool        include_zero_vid
     )
 {
     uint16_t vid;
     if (axl_pci_read_config_16(a, PCI_VENDOR_ID_OFFSET, &vid) != 0) {
         return false;
     }
-    return vid != 0xFFFF;
+    /* 0xFFFF is the bus-level "no device" sentinel for an absent slot.
+       0x0000 is also a reserved vendor ID (never assigned by PCI-SIG);
+       some chipsets return all-zero config reads for disconnected
+       slots/functions instead of all-ones, producing "phantom"
+       0000:0000 devices. The default walk treats both as absent.
+       axl_pci_next_unfiltered opts back into seeing 0x0000 slots. */
+    if (vid == 0xFFFF) {
+        return false;
+    }
+    if (vid == 0x0000 && !include_zero_vid) {
+        return false;
+    }
+    return true;
 }
 
 /* Static cursor returned to callers. Reused across calls. The
@@ -891,9 +910,10 @@ skip_to_next_dev(
     cursor.dev++;
 }
 
-AxlPciAddr *
-axl_pci_next(
-    AxlPciAddr  *prev
+static AxlPciAddr *
+pci_next_impl(
+    AxlPciAddr  *prev,
+    bool         include_zero_vid
     )
 {
     if (axl_pci_ensure_init() != 0) {
@@ -956,7 +976,7 @@ axl_pci_next(
 
     /* Walk forward until a present function is found. */
     for (;;) {
-        if (function_present(cursor)) {
+        if (function_present(cursor, include_zero_vid)) {
             /* On func 0, read the header-type byte and remember
                whether this is multi-function. The caller gets func 0
                first; the next call's advance honours the flag. */
@@ -1005,6 +1025,25 @@ axl_pci_next(
             cursor.func = 0;
         }
     }
+}
+
+AxlPciAddr *
+axl_pci_next(
+    AxlPciAddr  *prev
+    )
+{
+    /* Default: skip both 0xFFFF (absent) and 0x0000 (phantom) slots. */
+    return pci_next_impl(prev, false);
+}
+
+AxlPciAddr *
+axl_pci_next_unfiltered(
+    AxlPciAddr  *prev
+    )
+{
+    /* Opt-in: skip only 0xFFFF, so 0x0000 phantom slots are visible.
+       For the rare consumer that must enumerate raw config space. */
+    return pci_next_impl(prev, true);
 }
 
 // ---------------------------------------------------------------------------

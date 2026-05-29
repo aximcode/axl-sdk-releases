@@ -641,12 +641,15 @@ axl_pci_ids_format_name(
        they know to be cautious. */
     const char *vname = axl_pci_ids_vendor_name(ids, vid);
     if (vname == NULL) {
-        return axl_snprintf(buf, buflen, "%04x:%04x",
+        /* Uppercase hex is the established convention for PCI
+           vendor:device rendering (lspci, pci-ids dumps, vendor
+           diagnostic tools) — lowercase was the outlier. */
+        return axl_snprintf(buf, buflen, "%04X:%04X",
                             (unsigned)vid, (unsigned)did);
     }
     const char *dname = axl_pci_ids_device_name(ids, vid, did);
     if (dname == NULL) {
-        return axl_snprintf(buf, buflen, "%s Device %04x",
+        return axl_snprintf(buf, buflen, "%s Device %04X",
                             vname, (unsigned)did);
     }
     return axl_snprintf(buf, buflen, "%s %s", vname, dname);

@@ -1803,7 +1803,7 @@ setter). Remaining work:
 - **WebDAV W6 (class-2 verbs)** — PROPPATCH / LOCK / UNLOCK request
   bodies become implementable with the reader. Gated on a consumer
   asking.
-- **Dell delldiagslinux port** — `stout::XmlSink` migrates to
+- **Downstream Linux-diagnostics port** — `stout::XmlSink` migrates to
   `AxlXmlWriter`; `pugi::xml_document` consumers in
   `systemconfig/*` and every module's `configuration.cpp` migrate
   to the pull-token reader. Pre-1.0 axl-sdk Linux port is the
@@ -3285,7 +3285,7 @@ End-to-end re-tested via the axl-webfs PUT loop. All passed
       - Both ICMP ping and TCP/80 + TCP/443 connect attempts to
         iDRAC's `169.254.1.1` produce 100% packet loss / "login
         request failed."
-      - `delldiagslinux` libredfish on the same hardware works
+      - a downstream Linux libredfish on the same hardware works
         fine from a booted Linux (kernel `cdc_rndis`) — so iDRAC
         backend IS responsive; the gap is purely in our UEFI
         RNDIS data plane.

@@ -496,7 +496,7 @@ diag_show_pci_nics(void)
 
         char id_buf[160];
         if (axl_pci_format_name(vid, did, id_buf, sizeof(id_buf)) <= 0) {
-            axl_snprintf(id_buf, sizeof(id_buf), "%04x:%04x", vid, did);
+            axl_snprintf(id_buf, sizeof(id_buf), "%04X:%04X", vid, did);
         }
 
         char class_buf[80];

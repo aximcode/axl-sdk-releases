@@ -58,7 +58,7 @@
  * }
  * @endcode
  *
- * **Nested verbs** (`do <category> <verb>` shape):
+ * **Nested verbs** (`mytool <category> <verb>` shape):
  *
  * @code
  * static const AxlArgsNode bios_verbs[] = {
@@ -77,13 +77,13 @@
  *
  * int main(int argc, char **argv) {
  *     return axl_args_run(argc, argv, &(AxlArgsNode){
- *         .name = "do", .help = "Hardware diagnostic CLI",
+ *         .name = "mytool", .help = "Hardware diagnostic CLI",
  *         .verbs = top_verbs,
  *     });
  * }
  * @endcode
  *
- * **Branch with a default handler** — the `do bios` → "print
+ * **Branch with a default handler** — the `mytool bios` → "print
  * summary" pattern. Same node sets BOTH `verbs` and `handler`;
  * the handler runs only when no sub-verb is supplied.
  *
@@ -98,16 +98,31 @@
  *     .name    = "bios",
  *     .help    = "BIOS / SMBIOS subcommands",
  *     .verbs   = bios_verbs,
- *     .handler = bios_info,    // fires when 'do bios' has no sub-verb
+ *     .handler = bios_info,    // fires when 'mytool bios' has no sub-verb
  * };
  * @endcode
  *
  * `--help` and `-h` are always recognised and recurse naturally —
- * `do --help` shows the top tree, `do bios --help` shows just the
+ * `mytool --help` shows the top tree, `mytool bios --help` shows just the
  * bios subtree. Unknown flags / verbs / out-of-range typed args
  * produce an error message qualified by the full breadcrumb
- * (`do bios: unknown verb 'flarble'`) and the auto-generated usage,
+ * (`mytool bios: unknown verb 'flarble'`) and the auto-generated usage,
  * exit non-zero, no handler invocation.
+ *
+ * **Negative-number positionals.** A token of the form `-<digit>` or
+ * `-.<digit>` (e.g. `-1`, `-.5`) is treated as a positional, not a
+ * flag — numeric short-flags can't be registered, so there's no
+ * ambiguity. This lets handlers receive negative numeric operands
+ * directly (`mytool add .10 -1`).
+ *
+ * **`--` end-of-options.** A bare `--` token ends option parsing for
+ * the *current* node: it is consumed, and every following token is a
+ * positional unconditionally (flags, `-h`, and the bare `help` word
+ * are no longer special). At a branch the next token still selects a
+ * verb; the chosen sub-command then parses its own argv slice fresh,
+ * so `--` does not propagate across levels (matches git/cargo
+ * scoping). Use it for positionals that start with `-`
+ * (`mytool trust -- -dashfile.efi`).
  *
  * **Flag and `user_data` visibility across levels.** Flags declared
  * on a parent node are visible to descendant handlers via the same
@@ -264,7 +279,7 @@ typedef void (*AxlPreRunFunc)(AxlArgs *args);
  *     Same dispatch as Branch when the user supplies a verb;
  *     when no verb is supplied (just branch-level flags or no
  *     args at all), `handler` runs as the no-verb default. Useful
- *     for the `do bios` → "print summary" pattern (`bios` has
+ *     for the `mytool bios` → "print summary" pattern (`bios` has
  *     subverbs but defaults to a summary action). Positionals
  *     still MUST be NULL — the handler runs with parsed flags
  *     only. An unknown verb still errors; the handler is not a
@@ -291,7 +306,7 @@ struct AxlArgsNode {
     /// usage examples, environment-variable list, or anything
     /// that doesn't fit on the single-line help summary.
     /// Per-node: each level's `--help` uses its own prolog;
-    /// `do --help` shows the root node's, `do bios --help` shows
+    /// `mytool --help` shows the root node's, `mytool bios --help` shows
     /// the bios node's. NULL = nothing printed (default).
     ///
     /// Whitespace policy: printed verbatim, then the framework

@@ -674,6 +674,122 @@ test_draw_alpha_modulates(void)
 }
 
 // ---------------------------------------------------------------------------
+// Built-in default font (axl_ttf_default)
+// ---------------------------------------------------------------------------
+
+/* UTF-8 literals used as coverage probes. U+4E00 (CJK 一) is the
+ * absent-codepoint baseline: it is NOT in the DejaVu subset, so it
+ * measures the font's .notdef advance. Coverage is proven by a
+ * codepoint's advance differing from this baseline in the direction
+ * its real glyph dictates (gaps chosen large enough that pixel
+ * rounding cannot flip the inequality). */
+#define U_EACUTE   "\xC3\xA9"      /* é  U+00E9 — same advance as 'e' */
+#define U_COPY     "\xC2\xA9"      /* ©  U+00A9 — Latin-1, wide (>notdef) */
+#define U_DEGREE   "\xC2\xB0"      /* °  U+00B0 — Latin-1, narrow (<notdef) */
+#define U_EMDASH   "\xE2\x80\x94"  /* —  U+2014 — full em, very wide */
+#define U_ENDASH   "\xE2\x80\x93"  /* –  U+2013 — half em, narrow (<notdef) */
+#define U_ELLIPSIS "\xE2\x80\xA6"  /* …  U+2026 — wide */
+#define U_LQUOTE   "\xE2\x80\x98"  /* '  U+2018 — left single quote, narrow */
+#define U_ABSENT   "\xE4\xB8\x80"  /* 一 U+4E00 — absent → .notdef baseline */
+
+static void
+test_default_returns_non_null(void)
+{
+    test_check(axl_ttf_default() != NULL,
+               "default: axl_ttf_default() returns non-NULL");
+}
+
+static void
+test_default_is_singleton(void)
+{
+    /* Shared handle — repeated calls return the SAME pointer, never
+     * re-parse. Caller must not free it. */
+    test_check(axl_ttf_default() == axl_ttf_default(),
+               "default: repeated calls return the same handle");
+}
+
+static void
+test_default_ascii_renders(void)
+{
+    AxlTtf *f = axl_ttf_default();
+    test_check(axl_ttf_measure(f, "Hello", 16.0f) > 0,
+               "default: ASCII 'Hello' measures > 0");
+}
+
+static void
+test_default_latin1_eacute_maps_real_glyph(void)
+{
+    /* é (U+00E9) shares 'e' advance in DejaVu — proves it maps to the
+     * eacute glyph, not a fallback that would advance differently. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_e  = axl_ttf_measure(f, "e",      16.0f);
+    uint32_t w_ea = axl_ttf_measure(f, U_EACUTE, 16.0f);
+    test_check(w_ea > 0 && w_ea == w_e,
+               "default: é advance equals 'e' (Latin-1 glyph present)");
+}
+
+static void
+test_default_latin1_present_vs_notdef(void)
+{
+    /* © is much wider than .notdef; ° is narrower. Both differ from
+     * the absent-baseline, so neither is falling back to .notdef. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_absent = axl_ttf_measure(f, U_ABSENT, 16.0f);
+    uint32_t w_copy   = axl_ttf_measure(f, U_COPY,   16.0f);
+    uint32_t w_degree = axl_ttf_measure(f, U_DEGREE, 16.0f);
+    test_check(w_copy > w_absent,
+               "default: © wider than .notdef (Latin-1 present)");
+    test_check(w_degree < w_absent,
+               "default: ° narrower than .notdef (Latin-1 present)");
+}
+
+static void
+test_default_punct_emdash_wide(void)
+{
+    /* Em-dash spans a full em — far wider than an ASCII hyphen. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_hyphen = axl_ttf_measure(f, "-",      16.0f);
+    uint32_t w_emdash = axl_ttf_measure(f, U_EMDASH, 16.0f);
+    test_check(w_emdash > w_hyphen,
+               "default: em-dash wider than hyphen (punctuation present)");
+}
+
+static void
+test_default_punct_endash_present(void)
+{
+    /* En-dash advance is below .notdef — an absent en-dash would
+     * instead measure the (wider) .notdef baseline. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_absent = axl_ttf_measure(f, U_ABSENT, 16.0f);
+    uint32_t w_endash = axl_ttf_measure(f, U_ENDASH, 16.0f);
+    test_check(w_endash < w_absent,
+               "default: en-dash narrower than .notdef (punctuation present)");
+}
+
+static void
+test_default_punct_curly_quote_present(void)
+{
+    /* Curly quotes are far narrower than .notdef — an absent quote
+     * would instead measure the (wider) .notdef baseline. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_absent = axl_ttf_measure(f, U_ABSENT, 16.0f);
+    uint32_t w_quote  = axl_ttf_measure(f, U_LQUOTE, 16.0f);
+    test_check(w_quote < w_absent,
+               "default: curly quote narrower than .notdef (punctuation present)");
+}
+
+static void
+test_default_punct_ellipsis_wide(void)
+{
+    /* '…' is a single wide glyph — wider than one '.'. */
+    AxlTtf *f = axl_ttf_default();
+    uint32_t w_dot      = axl_ttf_measure(f, ".",        16.0f);
+    uint32_t w_ellipsis = axl_ttf_measure(f, U_ELLIPSIS, 16.0f);
+    test_check(w_ellipsis > w_dot,
+               "default: ellipsis wider than '.' (punctuation present)");
+}
+
+// ---------------------------------------------------------------------------
 // Suite entry point
 // ---------------------------------------------------------------------------
 
@@ -732,6 +848,16 @@ test_truetype_main(
     test_draw_color_propagates();
     test_draw_alpha_modulates();
     test_draw_negative_coords_no_crash();
+
+    test_default_returns_non_null();
+    test_default_is_singleton();
+    test_default_ascii_renders();
+    test_default_latin1_eacute_maps_real_glyph();
+    test_default_latin1_present_vs_notdef();
+    test_default_punct_emdash_wide();
+    test_default_punct_endash_present();
+    test_default_punct_curly_quote_present();
+    test_default_punct_ellipsis_wide();
 
     return test_print_results();
 }

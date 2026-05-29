@@ -1064,7 +1064,7 @@ axl_fflush(AxlStream *s)
 // literal run + per format specifier — a typical line has 10–20
 // emissions, and the alternative (write per emission) means 10–20
 // trips through transcode, the ConOut OutputString hot path, AND
-// any installed tee handler. Caps-list dumps (`do capId` with
+// any installed tee handler. Caps-list dumps (`mytool capId` with
 // ~125 caps × ~15 emissions/line) measured ~9–19 ms of avoidable
 // overhead from that fragmentation alone.
 //

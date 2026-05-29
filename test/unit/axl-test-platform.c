@@ -179,6 +179,36 @@ test_pci_enumerate(void)
 }
 
 static void
+test_pci_next_unfiltered(void)
+{
+    /* The unfiltered walk works and enumerates. On QEMU it yields the
+       SAME devices as the default filtered walk — verifying the
+       shared-impl refactor preserved enumeration.
+
+       NOTE: the *behavioral difference* (filtered skips 0x0000 phantom
+       slots, unfiltered does not) is NOT exercised here: QEMU reports
+       absent slots as 0xFFFF, never 0x0000, so no phantom functions
+       exist to skip. The 0x0000-skip is a chipset quirk verified on
+       hardware (the Spark-EVT platform that motivated it), not in
+       QEMU — asserting it here would pass vacuously. */
+    AxlPciAddr *p = NULL;
+    size_t filtered = 0;
+    while ((p = axl_pci_next(p)) != NULL && filtered <= 4096) {
+        filtered++;
+    }
+    AxlPciAddr *q = NULL;
+    size_t unfiltered = 0;
+    while ((q = axl_pci_next_unfiltered(q)) != NULL && unfiltered <= 4096) {
+        unfiltered++;
+    }
+    test_check(unfiltered > 0,
+               "pci: unfiltered walk finds at least one device");
+    test_check(unfiltered <= 4096, "pci: unfiltered walk terminates");
+    test_check(unfiltered == filtered,
+               "pci: filtered and unfiltered agree on QEMU (no phantom slots)");
+}
+
+static void
 test_pci_read_config(void)
 {
     /* The host bridge at 00:00.0 always responds. Read its
@@ -293,6 +323,11 @@ test_pci_addr_parse_format(void)
     test_check(axl_pci_addr_parse("0.0",      &a) == AXL_ERR, "pci addr_parse: 2 fields");
     test_check(axl_pci_addr_parse(":0:0.0",   &a) == AXL_ERR, "pci addr_parse: leading sep");
     test_check(axl_pci_addr_parse("0:0:0.0:", &a) == AXL_ERR, "pci addr_parse: trailing junk");
+    /* >4 fields: the final-separator parse previously indexed
+       parts[4] (a stack OOB write) before returning AXL_ERR. Must
+       reject cleanly without overflowing. */
+    test_check(axl_pci_addr_parse("1:2:3:4.5", &a) == AXL_ERR,
+               "pci addr_parse: >4 fields rejected (no stack overflow)");
     test_check(axl_pci_addr_parse("xx:0.0",   &a) == AXL_ERR, "pci addr_parse: non-hex");
     test_check(axl_pci_addr_parse(NULL,       &a) == AXL_ERR, "pci addr_parse: NULL string");
 
@@ -1080,10 +1115,32 @@ test_pci_format_name(void)
         int rc = axl_pci_ids_format_name(h, 0xCAFE, 0x0001,
                                          buf, sizeof(buf));
         /* Without a vendor entry, output must be numeric — must not
-           leak the device name. */
-        test_check(rc > 0 && axl_strcmp(buf, "cafe:0001") == 0,
-                   "pci format_name: vendor-unknown short-circuits "
-                   "even when device entry would have hit");
+           leak the device name. Hex is UPPERCASE to match lspci /
+           pci-ids dumps / legacy Dell tooling conventions. */
+        test_check(rc > 0 && axl_strcmp(buf, "CAFE:0001") == 0,
+                   "pci format_name: vendor-unknown numeric fallback "
+                   "is uppercase VID:DID");
+        axl_pci_ids_close(h);
+    }
+
+    /* Case 5: vendor known, device unknown → "<vendor> Device <DID>"
+       with UPPERCASE hex. Fixture has the vendor but not the queried
+       device. */
+    {
+        static const char fixture[] =
+            "{ schema: 1,\n"
+            "  vendors: [{ id: 0xABCD, name: 'AcmeCorp' }],\n"
+            "  devices: [],\n"
+            "}\n";
+        AxlPciIds *h = NULL;
+        test_check(axl_pci_ids_open_from_buffer(
+                       fixture, axl_strlen(fixture), &h) == AXL_SIDECAR_OK,
+                   "pci format_name: vendor-only fixture loads");
+        int rc = axl_pci_ids_format_name(h, 0xABCD, 0xBEEF,
+                                         buf, sizeof(buf));
+        test_check(rc > 0 && axl_strcmp(buf, "AcmeCorp Device BEEF") == 0,
+                   "pci format_name: device-unknown fallback is "
+                   "'<vendor> Device <uppercase DID>'");
         axl_pci_ids_close(h);
     }
 
@@ -1107,17 +1164,17 @@ test_pci_format_name(void)
                "pci format_name: 8086:29C0 == 'Intel Corporation Q35 Host Bridge'");
 
     /* Case 2: vendor known, device unknown — formatter inserts
-       'Device <DID hex>' with lowercase 4-wide zero-padded hex. */
+       'Device <DID hex>' with UPPERCASE 4-wide zero-padded hex. */
     n = axl_pci_format_name(0x8086, 0xDEAD, buf, sizeof(buf));
     test_check(n > 0
                && axl_strcmp(buf,
-                   "Intel Corporation Device dead") == 0,
-               "pci format_name: 8086:DEAD == 'Intel Corporation Device dead'");
+                   "Intel Corporation Device DEAD") == 0,
+               "pci format_name: 8086:DEAD == 'Intel Corporation Device DEAD'");
 
-    /* Case 3: vendor unknown — fully numeric, no name material. */
+    /* Case 3: vendor unknown — fully numeric, uppercase. */
     n = axl_pci_format_name(0xDEAD, 0xBEEF, buf, sizeof(buf));
-    test_check(n > 0 && axl_strcmp(buf, "dead:beef") == 0,
-               "pci format_name: unknown vendor == 'VID:DID'");
+    test_check(n > 0 && axl_strcmp(buf, "DEAD:BEEF") == 0,
+               "pci format_name: unknown vendor == 'VID:DID' (uppercase)");
 }
 
 // ---------------------------------------------------------------------------
@@ -3311,6 +3368,7 @@ test_platform_main(int argc, char **argv)
 
     /* AxlPci */
     test_pci_enumerate();
+    test_pci_next_unfiltered();
     test_pci_read_config();
     test_pci_find_by_class();
     test_pci_find_by_vid_did();

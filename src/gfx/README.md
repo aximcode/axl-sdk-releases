@@ -143,6 +143,30 @@ strokes await a future batch. Math primitives (`sqrt`, `sin`, `cos`,
 `AxlMath <math.html>`_ module so the path rasterizer stays
 libm-free.
 
+## Gradients
+
+`AxlGfxGradient` is an opaque, reusable gradient object — linear
+(color axis from one point to another) or radial (offset by distance
+from a center). Add up to `AXL_GFX_GRADIENT_MAX_STOPS` color stops in
+any order; the offset `t` is normalized to `[0, 1]` and clamped, so
+the end stops extend flat beyond the axis / radius. Colors are
+interpolated per channel (including alpha) between adjacent stops.
+
+```c
+AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 100);
+axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RGB(0x4a, 0x90, 0xd9));
+axl_gfx_gradient_add_stop(g, 1.0f, AXL_GFX_RGB(0x1c, 0x3f, 0x6b));
+axl_gfx_fill_rect_gradient(10, 10, 200, 100, g);   /* vertical fade */
+axl_gfx_gradient_free(g);
+```
+
+Geometry is in the active draw target's coordinate space, and fills
+honor the clip stack + target + alpha blending like every other
+primitive. Sampling is per-pixel at the pixel center; interpolation
+is linear in stored (sRGB) bytes — gamma-correct interpolation is a
+future refinement. Path and rounded-rect gradient fills are planned
+follow-ups; the current entry point is `axl_gfx_fill_rect_gradient`.
+
 ## Clipping
 
 `axl-gfx` maintains a 16-deep clip stack. Pushing a clip rect
@@ -216,6 +240,17 @@ axl-gfx ships two bitmap fonts. Both are codepoint-sorted with
 
 Linker garbage collection drops the fonts that aren't referenced, so
 consumers pay only for the fonts they actually draw with.
+
+For *vector* text, `axl_ttf_default()` returns a shared, built-in
+DejaVu Sans subset (ASCII + Latin-1 + common typographic
+punctuation) so consumers don't have to bundle a TTF asset — see the
+`AxlTtf <truetype.html>`_ page. It is likewise gc-dropped when
+unreferenced.
+
+```c
+AxlTtf *f = axl_ttf_default();             /* shared; do not free */
+axl_ttf_draw(f, 20, 40, "Café — 21°C", 16.0f, AXL_GFX_WHITE);
+```
 
 ### Adding a font
 

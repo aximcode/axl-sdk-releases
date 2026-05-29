@@ -197,14 +197,14 @@ print_vendor_device(
                paste it elsewhere. */
             const char *vname = axl_pci_vendor_name(vid);
             if (vname != NULL) {
-                axl_printf(" [%04x:%04x]\n", (unsigned)vid, (unsigned)did);
+                axl_printf(" [%04X:%04X]\n", (unsigned)vid, (unsigned)did);
             } else {
                 axl_printf("\n");
             }
             return;
         }
     }
-    axl_printf(" [%04x:%04x]\n", (unsigned)vid, (unsigned)did);
+    axl_printf(" [%04X:%04X]\n", (unsigned)vid, (unsigned)did);
 }
 
 static void
@@ -278,10 +278,10 @@ print_subsystem(
     const char *sname = opt_numeric ? NULL
                                     : axl_pci_subsys_name(svid, sdid);
     if (sname != NULL) {
-        axl_printf("\tSubsystem: %s [%04x:%04x]\n",
+        axl_printf("\tSubsystem: %s [%04X:%04X]\n",
                    sname, (unsigned)svid, (unsigned)sdid);
     } else {
-        axl_printf("\tSubsystem: %04x:%04x\n",
+        axl_printf("\tSubsystem: %04X:%04X\n",
                    (unsigned)svid, (unsigned)sdid);
     }
 }

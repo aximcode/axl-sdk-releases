@@ -195,7 +195,7 @@ RTTI (`typeid` / `dynamic_cast`), `<string>` / `<vector>` /
 `<stdexcept>`, `thread_local`, `<format>`.  All require
 libstdc++/libsupc++ symbols not available in our freestanding
 link.  Validated end-to-end in CPP1.3–1.5; matches every serious
-UEFI-C++ project's experience (Dell ePSA's `-fno-exceptions
+UEFI-C++ project's experience (the standard `-fno-exceptions
 -fno-rtti` config).  Usable freestanding subset: `<array>`,
 `<span>`, `<string_view>`, `<type_traits>`, `<utility>`,
 `<initializer_list>`, `<new>`, `<optional>`, `<variant>`,

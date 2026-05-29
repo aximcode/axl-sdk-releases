@@ -30,6 +30,52 @@ compatible Apache 2.0 terms; see the mbedtls LICENSE file for details.
 
 No modifications have been made to the vendored mbedtls source.
 
+## stb (stb_image, stb_truetype)
+
+- **Source:** https://github.com/nothings/stb
+- **Versions shipped:** `stb_image` v2.30, `stb_truetype` v1.26
+- **Vendored path in source tree:** `deps/stb/{stb_image.h,stb_truetype.h}`
+- **Copyright:** Sean Barrett
+- **License:** Dual-licensed under
+  [MIT](https://spdx.org/licenses/MIT.html) **OR**
+  [the Unlicense / public domain](https://spdx.org/licenses/Unlicense.html),
+  at the recipient's option.
+- **Full license text:** at the foot of each header (no separate
+  file — the dual-license block ships inline with the source).
+
+The two single-header libraries are `#include`d by `AxlPixmap`
+(image decode: PNG/JPG/GIF/BMP) and `AxlTtf` (TrueType glyph
+rasterization), so they are statically compiled into **every**
+`libaxl.a` regardless of build flags — unlike mbedtls, which is
+gated behind `AXL_TLS=1`. Being public-domain-or-MIT, stb imposes
+no attribution obligation on redistributed binaries; this entry is
+documentary. No source modifications.
+
+## DejaVu Sans — built-in default font
+
+- **Source:** https://dejavu-fonts.github.io/ (DejaVu Sans)
+- **Subset shipped:** ASCII + Latin-1 (U+0020..U+00FF) plus common
+  typographic punctuation (U+2013/2014 dashes, U+2018..201D quotes,
+  U+2022 bullet, U+2026 ellipsis) — ~23 KB.
+- **Vendored path in source tree:** byte array in
+  `src/gfx/fonts/font-dejavu-default.c`
+- **Copyright:** Bitstream Vera Fonts © 2003 Bitstream, Inc.;
+  DejaVu changes dedicated to the public domain; Arev-derived
+  glyphs © Tavmjong Bah.
+- **License:** [Bitstream Vera license](https://spdx.org/licenses/Bitstream-Vera.html)
+  (permissive) for the Bitstream-origin glyphs; public domain for
+  the DejaVu changes.
+- **Full license text:** `third_party/dejavu/LICENSE`
+
+The subset is returned by `axl_ttf_default()` and is compiled into
+`libaxl.a`, but `--gc-sections` drops it from any binary that never
+calls `axl_ttf_default` (consumers that load their own font pay no
+size cost). **Unlike stb, the Bitstream Vera license requires the
+copyright/permission notice to accompany redistributed binaries**,
+so redistributors must carry `third_party/dejavu/LICENSE`. The
+subset was produced with `pyftsubset` (no glyph outlines modified);
+see the regeneration recipe in `font-dejavu-default.c`.
+
 ## EDK2 — RamDiskDxe.efi
 
 - **Source:** https://github.com/tianocore/edk2 — `MdeModulePkg/Universal/Disk/RamDiskDxe/`

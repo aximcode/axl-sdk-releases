@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install the ARM bare-metal AArch64 GNU toolchain used by axl-c++
-# for cross-compiling C++ to UEFI.  Pinned to the version Dell ePSA
-# uses (delldiags/source/src/EPSA/Include.mak) so axl-sdk-built C++
-# and Dell-built C++ share an ABI.
+# for cross-compiling C++ to UEFI.  Pinned to a version a downstream
+# UEFI-C++ diagnostics consumer also uses so axl-sdk-built C++ and
+# consumer-built C++ share an ABI.
 #
 # Idempotent: if the pinned version is already installed at the
 # expected /opt path, the script exits successfully without touching

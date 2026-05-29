@@ -286,7 +286,8 @@ case "$ARCH" in
           # register allocator may clobber it, leading to post-
           # ExitBootServices OS-side corruption that's hard to trace.
           # Matches the convention used by ARM bare-metal UEFI builds
-          # (e.g. Dell ePSA's aarch64-none-elf-gcc invocation).
+          # (e.g. a downstream UEFI-C++ consumer's aarch64-none-elf-gcc
+          # invocation).
           GCC_ARCH="-ffixed-x18"
           EFI_LDS="$SDK_DIR/lib/axl/elf_aarch64_efi.lds"
           GCC_CRT0="$LIB_DIR/axl-crt0-gcc-aarch64.o"

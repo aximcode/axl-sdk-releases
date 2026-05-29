@@ -488,7 +488,7 @@ UEFI applications come in two shapes:
 
    static const AxlSubcommand commands[] = {
        { "bios",  do_bios,  "[test|pci|irq|slot|emb]",
-         "do bios test  — run BIOS POST self-test\n" },
+         "mytool bios test  — run BIOS POST self-test\n" },
        { "sysid", do_sysid, "[hexValue]", NULL },
    };
 
@@ -497,7 +497,7 @@ UEFI applications come in two shapes:
    {
        return axl_subcommand_dispatch(commands,
            sizeof(commands) / sizeof(commands[0]),
-           argc, argv, "do");
+           argc, argv, "mytool");
    }
    ```
 

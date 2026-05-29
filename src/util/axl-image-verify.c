@@ -167,7 +167,7 @@ locate_certificate_table(
 // constructed/primitive bits, multi-byte tags, indefinite-length
 // encodings (which DER forbids anyway), or anything beyond the encodings
 // Authenticode actually emits. Strings outside PrintableString / UTF8String
-// are reported as NULL CN — the consumer's `do trust` displays "(unknown)"
+// are reported as NULL CN — callers typically display "(unknown)"
 // rather than risking a malformed-string crash. All bounds checks widen
 // to size_t to defeat pointer-overflow on hostile inputs.
 // ---------------------------------------------------------------------------

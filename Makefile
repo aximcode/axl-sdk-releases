@@ -328,9 +328,11 @@ LIB_SOURCES = \
     src/gfx/axl-truetype.c \
     src/gfx/axl-pixmap.c \
     src/gfx/axl-gfx-path.c \
+    src/gfx/axl-gfx-gradient.c \
     src/math/axl-math.c \
     src/gfx/fonts/font-edk2-laffstd.c \
     src/gfx/fonts/font-unifont-16.c \
+    src/gfx/fonts/font-dejavu-default.c \
     src/input/axl-input.c \
     src/smbus/axl-smbus.c \
     src/smbus/axl-smbus-hc.c \

@@ -2319,7 +2319,7 @@ static void
 test_subcommand_dispatch(void)
 {
     static const AxlSubcommand cmds[] = {
-        { "bios",  sub_bios,   "[test|pci]",  "do bios test  — run POST self-test\n" },
+        { "bios",  sub_bios,   "[test|pci]",  "mytool bios test  — run POST self-test\n" },
         { "sysid", sub_sysid,  "[hexValue]",  NULL  },
         { "crash", sub_crash,  "trigger",     NULL  },
     };
@@ -2327,10 +2327,10 @@ test_subcommand_dispatch(void)
 
     /* exact match → fn invoked, return value passed through */
     {
-        char *argv[] = { (char *)"do", (char *)"bios", (char *)"--flag", (char *)"v" };
+        char *argv[] = { (char *)"mytool", (char *)"bios", (char *)"--flag", (char *)"v" };
         g_sub_calls = 0;
         g_sub_last_arg0 = NULL;
-        int rc = axl_subcommand_dispatch(cmds, count, 4, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 4, argv, "mytool");
         test_check(rc == 42, "subcommand: dispatch returns fn's rc");
         test_check(g_sub_calls == 1, "subcommand: fn called exactly once");
         /* argv shifted so the subcommand sees its own name as argv[0] */
@@ -2342,60 +2342,60 @@ test_subcommand_dispatch(void)
 
     /* "help" alone → returns 0, no fn invoked */
     {
-        char *argv[] = { (char *)"do", (char *)"help" };
+        char *argv[] = { (char *)"mytool", (char *)"help" };
         g_sub_calls = 0;
-        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "mytool");
         test_check(rc == 0, "subcommand: help returns 0");
         test_check(g_sub_calls == 0, "subcommand: help doesn't invoke any fn");
     }
 
     /* "-h" / "--help" both → help (no fn invoked) */
     {
-        char *argv1[] = { (char *)"do", (char *)"-h" };
-        char *argv2[] = { (char *)"do", (char *)"--help" };
+        char *argv1[] = { (char *)"mytool", (char *)"-h" };
+        char *argv2[] = { (char *)"mytool", (char *)"--help" };
         g_sub_calls = 0;
-        test_check(axl_subcommand_dispatch(cmds, count, 2, argv1, "do") == 0,
+        test_check(axl_subcommand_dispatch(cmds, count, 2, argv1, "mytool") == 0,
                    "subcommand: -h returns 0");
-        test_check(axl_subcommand_dispatch(cmds, count, 2, argv2, "do") == 0,
+        test_check(axl_subcommand_dispatch(cmds, count, 2, argv2, "mytool") == 0,
                    "subcommand: --help returns 0");
         test_check(g_sub_calls == 0, "subcommand: -h/--help no fn invocations");
     }
 
     /* "help <cmd>" prints command help, returns 0 */
     {
-        char *argv[] = { (char *)"do", (char *)"help", (char *)"bios" };
-        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "do");
+        char *argv[] = { (char *)"mytool", (char *)"help", (char *)"bios" };
+        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "mytool");
         test_check(rc == 0, "subcommand: help <cmd> returns 0");
     }
 
     /* "help <unknown>" returns -1 */
     {
-        char *argv[] = { (char *)"do", (char *)"help", (char *)"nonsense" };
-        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "do");
+        char *argv[] = { (char *)"mytool", (char *)"help", (char *)"nonsense" };
+        int rc = axl_subcommand_dispatch(cmds, count, 3, argv, "mytool");
         test_check(rc == -1, "subcommand: help <unknown> returns -1");
     }
 
     /* unknown command → -1 */
     {
-        char *argv[] = { (char *)"do", (char *)"frobnicate" };
+        char *argv[] = { (char *)"mytool", (char *)"frobnicate" };
         g_sub_calls = 0;
-        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "mytool");
         test_check(rc == -1, "subcommand: unknown command returns -1");
         test_check(g_sub_calls == 0, "subcommand: unknown doesn't invoke any fn");
     }
 
     /* typo close to "sysid" → still -1 but the "did you mean" path runs */
     {
-        char *argv[] = { (char *)"do", (char *)"sysud" };
-        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
+        char *argv[] = { (char *)"mytool", (char *)"sysud" };
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "mytool");
         test_check(rc == -1, "subcommand: close typo returns -1");
         /* No way to capture stderr text here; just exercise the path. */
     }
 
     /* argc < 2 → help, returns 0 */
     {
-        char *argv[] = { (char *)"do" };
-        int rc = axl_subcommand_dispatch(cmds, count, 1, argv, "do");
+        char *argv[] = { (char *)"mytool" };
+        int rc = axl_subcommand_dispatch(cmds, count, 1, argv, "mytool");
         test_check(rc == 0, "subcommand: no args returns 0 (help)");
     }
 
@@ -2410,26 +2410,26 @@ test_subcommand_dispatch(void)
 
     /* return -7 from crash subcommand passes through */
     {
-        char *argv[] = { (char *)"do", (char *)"crash" };
-        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "do");
+        char *argv[] = { (char *)"mytool", (char *)"crash" };
+        int rc = axl_subcommand_dispatch(cmds, count, 2, argv, "mytool");
         test_check(rc == -7, "subcommand: negative rc passes through");
     }
 
     /* Empty table behaves: help only */
     {
-        char *argv[] = { (char *)"do" };
-        int rc = axl_subcommand_dispatch(NULL, 0, 1, argv, "do");
+        char *argv[] = { (char *)"mytool" };
+        int rc = axl_subcommand_dispatch(NULL, 0, 1, argv, "mytool");
         test_check(rc == 0, "subcommand: empty table + no args returns 0");
-        char *argv2[] = { (char *)"do", (char *)"anything" };
-        int rc2 = axl_subcommand_dispatch(NULL, 0, 2, argv2, "do");
+        char *argv2[] = { (char *)"mytool", (char *)"anything" };
+        int rc2 = axl_subcommand_dispatch(NULL, 0, 2, argv2, "mytool");
         test_check(rc2 == -1, "subcommand: empty table + unknown returns -1");
     }
 
     /* Public print fns shouldn't crash on edge cases */
-    axl_subcommand_print_help(cmds, count, "do");
-    axl_subcommand_print_help(NULL, 0, "do");
-    axl_subcommand_print_command_help(&cmds[0], "do");
-    axl_subcommand_print_command_help(NULL, "do");
+    axl_subcommand_print_help(cmds, count, "mytool");
+    axl_subcommand_print_help(NULL, 0, "mytool");
+    axl_subcommand_print_command_help(&cmds[0], "mytool");
+    axl_subcommand_print_command_help(NULL, "mytool");
     test_check(true, "subcommand: print fns don't crash");
 }
 #pragma GCC diagnostic pop
@@ -4272,6 +4272,19 @@ args_single_handler(AxlArgs *a)
     return 7;
 }
 
+/* Captures the verbose flag + first positional + positional count,
+   for the negative-positional / end-of-options tests. */
+static int
+args_neg_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_bool  = axl_args_get_bool(a, "verbose");
+    cap->pos_count  = axl_args_get_pos_count(a);
+    cap->pos0       = axl_args_get_pos(a, 0);
+    return 0;
+}
+
 /* Dedicated capture for the CHOICE positional — reads the named
    "field" positional via axl_args_get_string so the test can pin
    the exact value that landed in the handler. */
@@ -4624,6 +4637,108 @@ test_args_single_handler_mode(void)
                "args: single-handler positional[0] = 'file1.txt'");
 }
 
+/* Leaf app with flags + the negative-positional capture handler. */
+static int
+run_neg(ArgsCapture *cap, int argc, char **argv)
+{
+    AxlArgsNode app = {
+        .name      = "argstest",
+        .help      = "negative-positional mode",
+        .flags     = args_flags,
+        .handler   = args_neg_handler,
+        .user_data = cap,
+    };
+    return axl_args_run(argc, argv, &app);
+}
+
+static void
+test_args_negative_positionals(void)
+{
+    /* (a) -<digit> is a positional, not an unknown flag. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"-1" };
+        int rc = run_neg(&cap, 2, argv);
+        test_check(rc == 0 && cap.calls == 1, "args: '-1' reaches handler (not flag error)");
+        test_check(cap.pos_count == 1 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "-1") == 0,
+                   "args: '-1' captured as positional");
+    }
+    /* '.-1' starts with '.', already positional — guard it stays so. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)".-1" };
+        run_neg(&cap, 2, argv);
+        test_check(cap.pos0 != NULL && axl_strcmp(cap.pos0, ".-1") == 0,
+                   "args: '.-1' captured as positional");
+    }
+    /* (a) -.<digit> (negative decimal) is a positional too. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"-.5" };
+        run_neg(&cap, 2, argv);
+        test_check(cap.pos0 != NULL && axl_strcmp(cap.pos0, "-.5") == 0,
+                   "args: '-.5' captured as positional");
+    }
+    /* A real flag and a negative positional coexist. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"-v", (char *)"-1" };
+        run_neg(&cap, 3, argv);
+        test_check(cap.seen_bool, "args: '-v -1' parses -v as the flag");
+        test_check(cap.pos_count == 1 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "-1") == 0,
+                   "args: '-v -1' keeps -1 positional");
+    }
+    /* (b) POSIX '--' end-of-options: the marker is consumed, the rest
+           is positional unconditionally. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"--", (char *)"-1" };
+        run_neg(&cap, 3, argv);
+        test_check(cap.pos_count == 1 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "-1") == 0,
+                   "args: '-- -1' makes -1 positional ('--' not counted)");
+    }
+    /* (b) after '--', even a registered flag name is positional. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"--", (char *)"-v" };
+        run_neg(&cap, 3, argv);
+        test_check(!cap.seen_bool && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "-v") == 0,
+                   "args: '-- -v' treats -v as positional, not the flag");
+    }
+    /* (b) '--' also disables help detection. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"--", (char *)"--help" };
+        run_neg(&cap, 3, argv);
+        test_check(cap.calls == 1 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "--help") == 0,
+                   "args: '-- --help' is positional, not help");
+    }
+    /* -h before any '--' still triggers help (handler must NOT run). */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"-h", (char *)"-1" };
+        int rc = run_neg(&cap, 3, argv);
+        test_check(rc == 0 && cap.calls == 0,
+                   "args: '-h -1' still parses -h as the help flag");
+    }
+    /* (b) at a BRANCH, '--' suppresses flags/help at that level but the
+           following token still selects a verb, which parses its own
+           slice fresh (no '--' propagation). */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"argstest", (char *)"--",
+                         (char *)"show", (char *)"0x53" };
+        int rc = run_args(&cap, 4, argv);
+        test_check(rc == 0 && cap.calls == 1 && cap.seen_uint == 0x53,
+                   "args: '-- show 0x53' still dispatches the verb after --");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Nested AxlArgs — branch verbs, parent-flag visibility, breadcrumbs
 // ---------------------------------------------------------------------------
@@ -4706,7 +4821,7 @@ static int
 run_nested(NestedCapture *cap, int argc, char **argv)
 {
     AxlArgsNode root = {
-        .name      = "do",
+        .name      = "mytool",
         .help      = "nested verb test root",
         .flags     = root_flags,
         .verbs     = nested_top_verbs,
@@ -4719,7 +4834,7 @@ static void
 test_args_nested_2level_dispatch(void)
 {
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"pci", (char *)"read16",
+    char *argv[] = { (char *)"mytool", (char *)"pci", (char *)"read16",
                      (char *)"0x10" };
     int rc = run_nested(&cap, 4, argv);
     test_check(rc == 0, "nested args: 2-level dispatch returns 0");
@@ -4736,7 +4851,7 @@ test_args_nested_parent_flag_visible_at_leaf(void)
     /* Root-declared --host and --verbose must be readable from the
        leaf via the same accessors that read the leaf's own args. */
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"--host=bmc.local", (char *)"-v",
+    char *argv[] = { (char *)"mytool", (char *)"--host=bmc.local", (char *)"-v",
                      (char *)"pci", (char *)"read16", (char *)"0x20" };
     int rc = run_nested(&cap, 6, argv);
     test_check(rc == 0, "nested args: root flags + nested verb dispatches");
@@ -4753,7 +4868,7 @@ test_args_nested_3level_dispatch(void)
     /* do -> deep -> inner -> leaf, with --scope declared at the
        middle level and read by the deepest handler. */
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"deep",
+    char *argv[] = { (char *)"mytool", (char *)"deep",
                      (char *)"inner", (char *)"--scope=mid", (char *)"leaf" };
     int rc = run_nested(&cap, 5, argv);
     test_check(rc == 0, "nested args: 3-level dispatch returns 0");
@@ -4831,18 +4946,94 @@ buf_offset_of(AxlStream *buf, const char *needle)
     return SIZE_MAX;
 }
 
+/* Column (0-based byte offset within the line) at which @p needle
+   appears on the first line whose content starts with @p line_prefix.
+   SIZE_MAX if no such line, or needle absent from it. Used to assert
+   help-text alignment without hand-counting padding spaces. */
+static size_t
+help_col(AxlStream *buf, const char *line_prefix, const char *needle)
+{
+    size_t      n = 0;
+    const char *b = (const char *)axl_bufdata(buf, &n);
+    if (b == NULL || n == 0) {
+        return SIZE_MAX;
+    }
+    size_t pl = axl_strlen(line_prefix);
+    size_t nl = axl_strlen(needle);
+    size_t line_start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i == n || b[i] == '\n') {
+            size_t line_len = i - line_start;
+            if (line_len >= pl
+                && axl_memcmp(b + line_start, line_prefix, pl) == 0) {
+                for (size_t j = line_start; j + nl <= i; j++) {
+                    if (axl_memcmp(b + j, needle, nl) == 0) {
+                        return j - line_start;
+                    }
+                }
+                return SIZE_MAX;
+            }
+            line_start = i + 1;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static const AxlArgDesc align_pos[] = {
+    { .name = "mode",      .type = AXL_ARG_STRING, .required = true,
+      .help = "Mode selector" },
+    { .name = "blinkRate", .type = AXL_ARG_STRING, .required = true,
+      .help = "Blink rate" },
+    {0}
+};
+
+static void
+test_args_help_alignment(void)
+{
+    /* The help-text column must be identical across the -h line and
+       every positional line, regardless of positional-name length.
+       Previously print_positional_line padded a fixed number of
+       spaces after a variable-length name, so the column drifted. */
+    ArgsCapture cap = { 0 };
+    AxlStream  *buf = NULL;
+    char *argv[] = { (char *)"argstest", (char *)"-h" };
+    AxlArgsNode app = {
+        .name        = "argstest",
+        .help        = "alignment test",
+        .flags       = args_flags,
+        .positionals = align_pos,
+        .handler     = args_single_handler,
+        .user_data   = &cap,
+    };
+    AxlStream *saved = capture_stdout(&buf);
+    axl_args_run(2, argv, &app);
+    axl_stdout = saved;   /* restore before asserting; read buf first */
+    size_t c_mode  = help_col(buf, "  <mode>",      "Mode selector");
+    size_t c_blink = help_col(buf, "  <blinkRate>", "Blink rate");
+    size_t c_help  = help_col(buf, "  -h,",         "Show this help");
+    axl_fclose(buf);
+
+    test_check(c_mode != SIZE_MAX && c_blink != SIZE_MAX
+               && c_help != SIZE_MAX,
+               "args help: -h and both positional lines found");
+    test_check(c_mode == c_blink,
+               "args help: positional help columns align across name lengths");
+    test_check(c_mode == c_help,
+               "args help: positional help column matches the -h line");
+}
+
 static void
 test_args_nested_unknown_verb_at_branch(void)
 {
     /* Branch should reject unknown verb at its own level with an
        error prefixed by the full breadcrumb path. */
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"pci", (char *)"flarble" };
+    char *argv[] = { (char *)"mytool", (char *)"pci", (char *)"flarble" };
 
     AxlStream *buf = NULL;
     AxlStream *saved = capture_stdout(&buf);
     int rc = run_nested(&cap, 3, argv);
-    bool has_breadcrumb = buf_contains(buf, "do pci: unknown verb");
+    bool has_breadcrumb = buf_contains(buf, "mytool pci: unknown verb");
     bool has_token      = buf_contains(buf, "flarble");
     restore_stdout(saved, buf);
 
@@ -4851,7 +5042,7 @@ test_args_nested_unknown_verb_at_branch(void)
     test_check(cap.deep_calls == 0,
                "nested args: deep handler did not run on shallow rejection");
     test_check(has_breadcrumb,
-               "nested args: error message includes 'do pci:' breadcrumb");
+               "nested args: error message includes 'mytool pci:' breadcrumb");
     test_check(has_token,
                "nested args: error message names the rejected verb");
 }
@@ -4859,15 +5050,15 @@ test_args_nested_unknown_verb_at_branch(void)
 static void
 test_args_nested_branch_help_lists_subverbs(void)
 {
-    /* `do pci --help` triggers help at the pci branch level and the
+    /* `mytool pci --help` triggers help at the pci branch level and the
        output names the subverbs of that branch (not the root). */
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"pci", (char *)"--help" };
+    char *argv[] = { (char *)"mytool", (char *)"pci", (char *)"--help" };
 
     AxlStream *buf = NULL;
     AxlStream *saved = capture_stdout(&buf);
     int rc = run_nested(&cap, 3, argv);
-    bool has_branch_path = buf_contains(buf, "do pci");
+    bool has_branch_path = buf_contains(buf, "mytool pci");
     bool has_subverb     = buf_contains(buf, "read16");
     bool has_root_only   = buf_contains(buf, "deep");
     restore_stdout(saved, buf);
@@ -4901,7 +5092,7 @@ test_args_nested_misconfigured_node_rejected(void)
 }
 
 // ---------------------------------------------------------------------------
-// Branch + default handler — `do bios` with no sub-verb runs handler
+// Branch + default handler — `mytool bios` with no sub-verb runs handler
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -4950,7 +5141,7 @@ static int
 run_bdh(BranchDefaultCapture *cap, int argc, char **argv)
 {
     AxlArgsNode root = {
-        .name      = "do",
+        .name      = "mytool",
         .help      = "branch+default test root",
         .verbs     = bdh_top_verbs,
         .user_data = cap,
@@ -4961,14 +5152,14 @@ run_bdh(BranchDefaultCapture *cap, int argc, char **argv)
 static void
 test_args_branch_default_fires_on_no_verb(void)
 {
-    /* `do bios` with no further verb invokes the default handler.
+    /* `mytool bios` with no further verb invokes the default handler.
        info_calls AND default_calls both go up because the same fn
        is referenced as both the explicit verb and the default. */
     BranchDefaultCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"bios" };
+    char *argv[] = { (char *)"mytool", (char *)"bios" };
     int rc = run_bdh(&cap, 2, argv);
     test_check(rc == 0,
-               "branch+default: 'do bios' with no sub-verb returns 0");
+               "branch+default: 'mytool bios' with no sub-verb returns 0");
     test_check(cap.default_calls == 1,
                "branch+default: default handler fired once");
     test_check(cap.test_calls == 0,
@@ -4981,7 +5172,7 @@ test_args_branch_default_subverb_still_recurses(void)
     /* Explicit sub-verb still recurses normally; default handler
        does NOT also fire. */
     BranchDefaultCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"bios", (char *)"test" };
+    char *argv[] = { (char *)"mytool", (char *)"bios", (char *)"test" };
     int rc = run_bdh(&cap, 3, argv);
     test_check(rc == 0, "branch+default: explicit sub-verb returns 0");
     test_check(cap.test_calls == 1,
@@ -4996,12 +5187,12 @@ test_args_branch_default_unknown_verb_still_errors(void)
     /* Unknown sub-verb is still an error — default handler is NOT
        a catch-all. */
     BranchDefaultCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"bios", (char *)"flarble" };
+    char *argv[] = { (char *)"mytool", (char *)"bios", (char *)"flarble" };
 
     AxlStream *buf = NULL;
     AxlStream *saved = capture_stdout(&buf);
     int rc = run_bdh(&cap, 3, argv);
-    bool has_breadcrumb = buf_contains(buf, "do bios: unknown verb");
+    bool has_breadcrumb = buf_contains(buf, "mytool bios: unknown verb");
     restore_stdout(saved, buf);
 
     test_check(rc != 0,
@@ -5018,7 +5209,7 @@ test_args_branch_default_sees_branch_flags(void)
     /* --quiet declared on the bios branch must reach the default
        handler when no sub-verb is supplied. */
     BranchDefaultCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"bios", (char *)"-q" };
+    char *argv[] = { (char *)"mytool", (char *)"bios", (char *)"-q" };
     int rc = run_bdh(&cap, 3, argv);
     test_check(rc == 0,
                "branch+default: branch-level flags before default OK");
@@ -5034,7 +5225,7 @@ test_args_branch_no_handler_still_shows_help(void)
     /* Regression: a branch WITHOUT a default handler keeps the
        v0.8.0 behavior of showing help on no-verb. */
     NestedCapture cap = { 0 };
-    char *argv[] = { (char *)"do", (char *)"pci" };
+    char *argv[] = { (char *)"mytool", (char *)"pci" };
 
     AxlStream *buf = NULL;
     AxlStream *saved = capture_stdout(&buf);
@@ -5139,6 +5330,8 @@ test_args(void)
     test_args_compact_short_group_rejected();
     test_args_extra_positional_rejected();
     test_args_single_handler_mode();
+    test_args_negative_positionals();
+    test_args_help_alignment();
     test_args_nested_2level_dispatch();
     test_args_nested_parent_flag_visible_at_leaf();
     test_args_nested_3level_dispatch();
@@ -5244,7 +5437,7 @@ test_args_help_prolog_epilog(void)
     /* Per-node prolog/epilog: each level has its own. The bios-node
        strings use distinctive markers ("BIOS-PROLOG-XYZZY" /
        "BIOS-EPILOG-PLUGH") so the per-node test below can prove
-       'do bios --help' uses these and NOT the root node's. */
+       'mytool bios --help' uses these and NOT the root node's. */
     static const AxlArgsNode bios_node = {
         .name        = "bios",
         .help        = "BIOS / SMBIOS subcommands",

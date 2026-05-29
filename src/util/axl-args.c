@@ -50,7 +50,7 @@ typedef struct {
 
 struct AxlArgs {
     const AxlArgsNode *node;          ///< the node being parsed at this level
-    const char        *path;          ///< full breadcrumb ("do bios pci"), borrowed
+    const char        *path;          ///< full breadcrumb ("mytool bios pci"), borrowed
     AxlArgs           *parent;        ///< enclosing level, NULL at root
 
     /* Linear arrays of parsed slots: one per descriptor in
@@ -502,7 +502,12 @@ print_flag_line(const AxlArgDesc *d)
                     const char *suffix = " (case-insensitive)";
                     size_t      slen   = axl_strlen(suffix);
                     if (off + slen + 1 < sizeof(choice_hint)) {
-                        for (size_t i = 0; i < slen; i++) {
+                        /* Per-iteration bound is redundant given the
+                           guard above, but makes the safety explicit
+                           for the static analyzer. */
+                        for (size_t i = 0;
+                             i < slen && off + 1 < sizeof(choice_hint);
+                             i++) {
                             choice_hint[off++] = suffix[i];
                         }
                         choice_hint[off] = '\0';
@@ -525,14 +530,21 @@ print_positional_line(const AxlArgDesc *d)
 {
     const char *suffix = (d->type == AXL_ARG_MULTI) ? "..." : "";
     const char *req    = d->required ? "" : " (optional)";
-    axl_print("  <%s>%s              %s%s\n",
-              d->name, suffix,
+    /* Left-justify "<name>suffix" in a fixed-width field so the help
+       column is constant regardless of name length — and lands at the
+       same column (26) as the flag lines and the "-h, --help" line
+       (`  ` + 22-wide field + `  ` gap). Names longer than the field
+       overflow and push their help right, same as long flag names. */
+    char name_buf[40];
+    axl_snprintf(name_buf, sizeof name_buf, "<%s>%s", d->name, suffix);
+    axl_print("  %-22s  %s%s\n",
+              name_buf,
               d->help != NULL ? d->help : "",
               req);
 }
 
 /* Render help for one node. @p path is the breadcrumb used in the
-   "Usage:" line ("do bios" rather than "bios"). */
+   "Usage:" line ("mytool bios" rather than "bios"). */
 static void
 print_help_for(const AxlArgsNode *node, const char *path)
 {
@@ -707,6 +719,29 @@ consume_positional(AxlArgs *a, const char *value)
     return true;
 }
 
+/* A token is a flag iff it starts with '-', isn't a bare "-", and
+   isn't a negative number ("-1", "-.5"). A numeric short-flag can't
+   be registered (slot_by_short needs a C-identifier char), so
+   treating leading-dash-then-digit as a positional is unambiguous —
+   and lets consumers pass negative numeric operands (calculator
+   expressions, signed offsets) without escaping. The "--"
+   end-of-options marker is handled by the caller, before this
+   check. */
+static bool
+token_is_flag(const char *arg)
+{
+    if (arg[0] != '-' || arg[1] == '\0') {
+        return false;
+    }
+    if (axl_isdigit((unsigned char)arg[1])) {
+        return false;
+    }
+    if (arg[1] == '.' && axl_isdigit((unsigned char)arg[2])) {
+        return false;
+    }
+    return true;
+}
+
 static int
 parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
 {
@@ -831,7 +866,7 @@ validate_node_shape(const AxlArgsNode *node, const char *path)
        - leaf only: a normal handler-bearing terminal node.
        - branch only: a category that always requires a sub-verb.
        - branch + leaf: a category whose handler is the no-verb
-         default ("do bios" with no further verb invokes the
+         default ("mytool bios" with no further verb invokes the
          handler with parsed branch-level flags). The first non-
          flag still must match a verb; only the no-verb path
          falls through to the default handler. */
@@ -883,6 +918,7 @@ args_run_internal(int argc, char **argv,
     int  rc          = 0;
     bool parse_error = false;
     int  i           = 1;   /* skip argv[0] (program/verb name) */
+    bool end_of_opts = false;  /* set by the POSIX "--" marker */
 
     /* Branches: first non-flag positional is the verb name. Once
        found, recurse with the remaining argv slice. */
@@ -892,28 +928,39 @@ args_run_internal(int argc, char **argv,
 
     while (i < argc) {
         const char *arg = argv[i];
-        if (is_help_flag(arg)) {
-            print_help_for(node, path_buf);
-            free_args(a);
-            return 0;
-        }
-        /* Bare `help` is a help synonym only at branches before a
-           verb is selected (so `grep help file` still searches for
-           the word "help" in a leaf). */
-        if (node_is_branch(node) && axl_strcmp(arg, "help") == 0) {
-            print_help_for(node, path_buf);
-            free_args(a);
-            return 0;
-        }
-        if (arg[0] == '-' && arg[1] != '\0') {
-            int consumed = parse_flag_token(a, i, argc, argv);
-            if (consumed < 0) {
-                parse_error = true;
-                rc = 1;
-                goto out;
+        /* Once "--" is seen, every remaining token is positional —
+           no help detection, no flag parsing. */
+        if (!end_of_opts) {
+            if (is_help_flag(arg)) {
+                print_help_for(node, path_buf);
+                free_args(a);
+                return 0;
             }
-            i += consumed;
-            continue;
+            /* Bare `help` is a help synonym only at branches before a
+               verb is selected (so `grep help file` still searches for
+               the word "help" in a leaf). */
+            if (node_is_branch(node) && axl_strcmp(arg, "help") == 0) {
+                print_help_for(node, path_buf);
+                free_args(a);
+                return 0;
+            }
+            /* POSIX end-of-options marker: consume "--" and treat the
+               rest as positional unconditionally. */
+            if (arg[0] == '-' && arg[1] == '-' && arg[2] == '\0') {
+                end_of_opts = true;
+                i++;
+                continue;
+            }
+            if (token_is_flag(arg)) {
+                int consumed = parse_flag_token(a, i, argc, argv);
+                if (consumed < 0) {
+                    parse_error = true;
+                    rc = 1;
+                    goto out;
+                }
+                i += consumed;
+                continue;
+            }
         }
         if (node_is_branch(node)) {
             const AxlArgsNode *child = find_verb(node, arg);

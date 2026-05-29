@@ -1853,6 +1853,256 @@ test_transform_identity_ops_preserve(void)
 }
 
 // ---------------------------------------------------------------------------
+// Gradients (G5)
+// ---------------------------------------------------------------------------
+
+static void
+test_gradient_new_non_null(void)
+{
+    AxlGfxGradient *lin = axl_gfx_gradient_linear_new(0, 0, 0, 100);
+    AxlGfxGradient *rad = axl_gfx_gradient_radial_new(10, 10, 10);
+    test_check(lin != NULL, "gradient: linear_new returns non-NULL");
+    test_check(rad != NULL, "gradient: radial_new returns non-NULL");
+    axl_gfx_gradient_free(lin);
+    axl_gfx_gradient_free(rad);
+}
+
+static void
+test_gradient_add_stop_errors(void)
+{
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 10);
+    test_check(axl_gfx_gradient_add_stop(NULL, 0.0f, AXL_GFX_RED) == AXL_ERR,
+               "gradient: add_stop(NULL) returns AXL_ERR");
+    test_check(axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RED) == AXL_OK,
+               "gradient: add_stop on valid gradient returns AXL_OK");
+    /* Fill to the cap, then one past it. */
+    int rc = AXL_OK;
+    for (int i = 1; i < AXL_GFX_GRADIENT_MAX_STOPS; i++) {
+        rc = axl_gfx_gradient_add_stop(g, (float)i / AXL_GFX_GRADIENT_MAX_STOPS,
+                                       AXL_GFX_BLUE);
+    }
+    test_check(rc == AXL_OK,
+               "gradient: filling to MAX_STOPS stays AXL_OK");
+    test_check(axl_gfx_gradient_add_stop(g, 0.5f, AXL_GFX_GREEN) == AXL_ERR,
+               "gradient: add_stop past MAX_STOPS returns AXL_ERR");
+    axl_gfx_gradient_free(g);
+}
+
+static void
+test_gradient_free_null_safe(void)
+{
+    /* free(NULL) must be a safe no-op: the allocator/state stays
+       intact, proven by a subsequent successful allocation. */
+    axl_gfx_gradient_free(NULL);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 1, 1);
+    test_check(g != NULL,
+               "gradient: free(NULL) is a safe no-op (allocation still works after)");
+    axl_gfx_gradient_free(g);
+}
+
+static void
+test_gradient_single_stop_uniform(void)
+{
+    /* One stop → every filled pixel is exactly that color, regardless
+       of position or sampling convention. */
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(8, 8);
+    AxlGfxPixel     bg = {0x00, 0x00, 0x00, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 8);
+    axl_gfx_gradient_add_stop(g, 0.5f, AXL_GFX_GREEN);
+
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_fill_rect_gradient(0, 0, 8, 8, g);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    test_check(rc == AXL_OK, "gradient: single-stop fill returns AXL_OK");
+    test_check(p[0].green == 0xFF && p[0].red == 0 && p[0].blue == 0,
+               "gradient: single-stop (0,0) is exactly the stop color");
+    test_check(p[7 * 8 + 7].green == 0xFF && p[7 * 8 + 7].red == 0,
+               "gradient: single-stop (7,7) is exactly the stop color");
+    axl_gfx_gradient_free(g);
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_no_stops_noop(void)
+{
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(4, 4);
+    AxlGfxPixel     bg = {0x11, 0x22, 0x33, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 4);
+
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_fill_rect_gradient(0, 0, 4, 4, g);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    test_check(rc == AXL_OK, "gradient: no-stops fill returns AXL_OK");
+    test_check(p[0].blue == 0x11 && p[0].green == 0x22 && p[0].red == 0x33,
+               "gradient: no-stops fill leaves pixels untouched");
+    axl_gfx_gradient_free(g);
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_fill_null_returns_err(void)
+{
+    AxlGfxBuffer *b = axl_gfx_buffer_new(4, 4);
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_fill_rect_gradient(0, 0, 4, 4, NULL);
+    axl_gfx_target_buffer(NULL);
+    test_check(rc == AXL_ERR, "gradient: fill with NULL gradient returns AXL_ERR");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_fill_zero_dim_noop(void)
+{
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(4, 4);
+    AxlGfxPixel     bg = {0x00, 0x00, 0x00, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 4);
+    axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RED);
+
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_fill_rect_gradient(0, 0, 0, 4, g);   /* w == 0 */
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    test_check(rc == AXL_OK, "gradient: zero-width fill returns AXL_OK");
+    test_check(p[0].red == 0,
+               "gradient: zero-width fill is a no-op (pixel untouched)");
+    axl_gfx_gradient_free(g);
+    axl_gfx_buffer_free(b);
+}
+
+/* Build a vertical red→blue linear gradient over a 4xH buffer and
+   return it filled (caller frees). Axis runs (0,0)→(0,axis_h). */
+static AxlGfxBuffer *
+build_vertical_red_blue(uint32_t h, float axis_h)
+{
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(4, h);
+    AxlGfxPixel     bg = {0x00, 0x00, 0x00, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, axis_h);
+    axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RED);
+    axl_gfx_gradient_add_stop(g, 1.0f, AXL_GFX_BLUE);
+    axl_gfx_target_buffer(b);
+    axl_gfx_fill_rect_gradient(0, 0, 4, (int32_t)h, g);
+    axl_gfx_target_buffer(NULL);
+    axl_gfx_gradient_free(g);
+    return b;
+}
+
+static void
+test_gradient_linear_vertical_endpoints(void)
+{
+    AxlGfxBuffer *b = build_vertical_red_blue(100, 100.0f);
+    AxlGfxPixel  *p = axl_gfx_buffer_pixels(b);
+    AxlGfxPixel   top = p[0 * 4 + 0];
+    AxlGfxPixel   bot = p[99 * 4 + 0];
+    test_check(top.red > 200 && top.blue < 55,
+               "gradient: linear top end is mostly red");
+    test_check(bot.blue > 200 && bot.red < 55,
+               "gradient: linear bottom end is mostly blue");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_linear_monotonic_and_conserved(void)
+{
+    AxlGfxBuffer *b = axl_gfx_buffer_new(4, 100);
+    AxlGfxBuffer *b2 = build_vertical_red_blue(100, 100.0f);
+    axl_gfx_buffer_free(b);
+    AxlGfxPixel  *p = axl_gfx_buffer_pixels(b2);
+    AxlGfxPixel   hi = p[10 * 4 + 0];   /* near top  (more red) */
+    AxlGfxPixel   lo = p[90 * 4 + 0];   /* near bottom (more blue) */
+    AxlGfxPixel   mid = p[50 * 4 + 0];
+    test_check(hi.red > lo.red,
+               "gradient: red decreases top→bottom (monotonic)");
+    test_check(lo.blue > hi.blue,
+               "gradient: blue increases top→bottom (monotonic)");
+    /* red↔blue interpolation: channels sum to ~255 (green stays 0). */
+    int sum = (int)mid.red + (int)mid.blue;
+    test_check(sum >= 250 && sum <= 256,
+               "gradient: mid red+blue conserves ~255 (linear interp)");
+    test_check(mid.green == 0,
+               "gradient: mid green stays 0 (no spurious channel)");
+    axl_gfx_buffer_free(b2);
+}
+
+static void
+test_gradient_linear_clamp_beyond_axis(void)
+{
+    /* Axis ends at y=10 but the rect is 20 tall: pixels below y=10
+       clamp to the last stop (blue). */
+    AxlGfxBuffer *b = build_vertical_red_blue(20, 10.0f);
+    AxlGfxPixel  *p = axl_gfx_buffer_pixels(b);
+    AxlGfxPixel   below = p[18 * 4 + 0];
+    /* t clamps to exactly 1.0 here → the boundary guard returns the
+       last stop verbatim, so the color is EXACTLY blue (no lerp). */
+    test_check(below.blue == 0xFF && below.green == 0 && below.red == 0,
+               "gradient: pixels past axis end are exactly the last stop (blue)");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_three_stops_bracket_selection(void)
+{
+    /* red@0 → green@0.5 → blue@1.0 over a 100px vertical axis.  The
+       lower half must interpolate red↔green (no blue), the upper half
+       green↔blue (no red).  Pins that sample_stops_ selects the
+       correct adjacent pair, not just the endpoints. */
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(4, 100);
+    AxlGfxPixel     bg = {0x00, 0x00, 0x00, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_linear_new(0, 0, 0, 100);
+    axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RED);
+    axl_gfx_gradient_add_stop(g, 0.5f, AXL_GFX_GREEN);
+    axl_gfx_gradient_add_stop(g, 1.0f, AXL_GFX_BLUE);
+
+    axl_gfx_target_buffer(b);
+    axl_gfx_fill_rect_gradient(0, 0, 4, 100, g);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    AxlGfxPixel  lower = p[25 * 4 + 0];   /* t≈0.255 → red/green pair */
+    AxlGfxPixel  upper = p[75 * 4 + 0];   /* t≈0.755 → green/blue pair */
+    test_check(lower.blue < 30 && lower.red > 50 && lower.green > 50,
+               "gradient: 3-stop lower half mixes red/green (no blue)");
+    test_check(upper.red < 30 && upper.blue > 50 && upper.green > 50,
+               "gradient: 3-stop upper half mixes green/blue (no red)");
+    axl_gfx_gradient_free(g);
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_gradient_radial_center_vs_edge(void)
+{
+    AxlGfxBuffer   *b = axl_gfx_buffer_new(20, 20);
+    AxlGfxPixel     bg = {0x00, 0x00, 0x00, 0xFF};
+    axl_gfx_buffer_clear(b, bg);
+    AxlGfxGradient *g = axl_gfx_gradient_radial_new(10, 10, 10);
+    axl_gfx_gradient_add_stop(g, 0.0f, AXL_GFX_RED);   /* center */
+    axl_gfx_gradient_add_stop(g, 1.0f, AXL_GFX_BLUE);  /* edge */
+
+    axl_gfx_target_buffer(b);
+    axl_gfx_fill_rect_gradient(0, 0, 20, 20, g);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    AxlGfxPixel  center = p[10 * 20 + 10];
+    AxlGfxPixel  corner = p[0 * 20 + 0];   /* dist ~14 > radius → clamp blue */
+    test_check(center.red > 200 && center.blue < 55,
+               "gradient: radial center is mostly red");
+    test_check(corner.blue > 200 && corner.red < 55,
+               "gradient: radial corner (beyond radius) clamps to blue");
+    axl_gfx_gradient_free(g);
+    axl_gfx_buffer_free(b);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1975,6 +2225,19 @@ test_gfx_main(
     test_transform_path_translate_paints_at_offset();
     test_transform_rotate_then_translate();
     test_transform_identity_ops_preserve();
+
+    test_gradient_new_non_null();
+    test_gradient_add_stop_errors();
+    test_gradient_free_null_safe();
+    test_gradient_single_stop_uniform();
+    test_gradient_no_stops_noop();
+    test_gradient_fill_null_returns_err();
+    test_gradient_fill_zero_dim_noop();
+    test_gradient_linear_vertical_endpoints();
+    test_gradient_linear_monotonic_and_conserved();
+    test_gradient_linear_clamp_beyond_axis();
+    test_gradient_three_stops_bracket_selection();
+    test_gradient_radial_center_vs_edge();
 
     return test_print_results();
 }

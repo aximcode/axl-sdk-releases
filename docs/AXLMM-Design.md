@@ -121,8 +121,8 @@ Established by Phase 1 validation; documented here for the record.
 
 **Compilers:**
 - AArch64: `aarch64-none-elf-g++` 14.3.Rel1 (ARM developer.arm.com
-  bare-metal cross).  Version-pinned to match Dell ePSA's choice so
-  axl-sdk-built and Dell-built C++ share an ABI.
+  bare-metal cross).  Version-pinned to match a downstream UEFI-C++
+  consumer's choice so axl-sdk-built and consumer-built C++ share an ABI.
 - X64: host `g++` (matches axl-cc's host-gcc convention)
 - The Linux-ABI cross (`aarch64-linux-gnu-g++`) is NOT viable — its
   libstdc++ headers pull hosted typedefs from `<bits/c++config.h>`

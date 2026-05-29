@@ -39,7 +39,7 @@ Per the 2026-05-12 audit (axl-sdk v0.17.1):
 | `axl-webfs/src/mount/webfs-file.c` | 117 | `EFI_FILE_PROTOCOL` vtable | Phase C |
 | `axl-webfs/src/mount/webfs-mount.c` | 14 | `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` publish + vendor device path | Phase C |
 | `axl-webfs/src/mount/webfs-internal.h` | 14 | EFIAPI thunk prototypes + embedded protocol structs | Phase C |
-| `delldiags/source/src/axl-utils/` | 0 (clean) | — | already clean |
+| (a downstream diagnostics consumer's utils tree) | 0 (clean) | — | already clean |
 
 Phase 0 (the `AXL_DRIVER` + `AxlHandle` migration in commit
 `2186f5a` on uefi-devkit) is shipped. Everything below is forward

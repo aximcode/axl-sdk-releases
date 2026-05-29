@@ -784,22 +784,22 @@ static const AxlArgsNode top_verbs[] = {
 
 int main(int argc, char **argv) {
     return axl_args_run(argc, argv, &(AxlArgsNode){
-        .name = "do", .help = "Hardware diagnostic CLI",
+        .name = "mytool", .help = "Hardware diagnostic CLI",
         .flags = root_flags,
         .verbs = top_verbs,
     });
 }
 ```
 
-`do bios test` invokes the leaf with the breadcrumb in scope; if
-the user types `do bios flarble`, the error reads
-`do bios: unknown verb 'flarble'`. `do bios --help` recurses into
+`mytool bios test` invokes the leaf with the breadcrumb in scope; if
+the user types `mytool bios flarble`, the error reads
+`mytool bios: unknown verb 'flarble'`. `mytool bios --help` recurses into
 the bios subtree's auto-generated help.
 
 ### Branch with a default handler
 
 A node can set BOTH `verbs` and `handler` — the handler runs only
-when no sub-verb is supplied. Useful for the `do bios` → "print
+when no sub-verb is supplied. Useful for the `mytool bios` → "print
 summary" pattern where a category has subverbs but also wants a
 default action:
 
@@ -814,18 +814,18 @@ static const AxlArgsNode bios_node = {
     .name    = "bios",
     .help    = "BIOS / SMBIOS subcommands",
     .verbs   = bios_verbs,
-    .handler = bios_info,    // fires on 'do bios' with no sub-verb
+    .handler = bios_info,    // fires on 'mytool bios' with no sub-verb
 };
 ```
 
 Dispatch is unambiguous: a verb argument that matches a child
 recurses into it; a verb argument that matches none errors as
-`do bios: unknown verb 'flarble'` (the handler is **not** a
+`mytool bios: unknown verb 'flarble'` (the handler is **not** a
 catch-all); no verb argument at all invokes the handler with the
 branch's parsed flags. Branch+handler nodes still cannot have
 positionals — the first non-flag is structurally the verb name.
 
-In `do bios --help` output, the verb whose handler matches the
+In `mytool bios --help` output, the verb whose handler matches the
 default is annotated `(default)` so users see which sub-verb the
 no-arg form is equivalent to.
 
@@ -852,9 +852,9 @@ Errors are prefixed with the full breadcrumb path so users know
 exactly which level rejected their input:
 
 ```
-do bios test: 'foo' for --slot is not a valid integer
-do pci: unknown verb 'flarble'
-do: unknown flag --verbosee
+mytool bios test: 'foo' for --slot is not a valid integer
+mytool pci: unknown verb 'flarble'
+mytool: unknown flag --verbosee
 ```
 
 ### Lifetime

@@ -7,12 +7,36 @@ AxlGfx — Graphics
 API Reference
 -------------
 
-AxlGfx
-~~~~~~
+The ``<axl/axl-gfx.h>`` umbrella pulls in all of the sub-headers
+below; include it for the whole 2D library, or include a sub-header
+directly for just that slice.
 
-.. doxygenfile:: axl-gfx.h
+Types — ``<axl/axl-gfx-types.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-AxlFont
-~~~~~~~
+.. doxygenfile:: axl-gfx-types.h
+
+Surface — ``<axl/axl-gfx-surface.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-surface.h
+
+Drawing — ``<axl/axl-gfx-draw.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-draw.h
+
+Paths — ``<axl/axl-gfx-path.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-path.h
+
+Gradients — ``<axl/axl-gfx-gradient.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-gradient.h
+
+AxlFont — ``<axl/axl-font.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. doxygenfile:: axl-font.h

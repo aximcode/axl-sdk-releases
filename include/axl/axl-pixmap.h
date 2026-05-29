@@ -47,7 +47,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <axl/axl-gfx.h>
+#include <axl/axl-gfx-surface.h>
 #include <axl/axl-macros.h>
 
 #ifdef __cplusplus

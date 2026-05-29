@@ -342,15 +342,37 @@ axl_pci_class_string_fmt(
  * caller-allocated AxlPciAddr) restarts iteration silently. The
  * caller never owns the cursor's storage.
  *
- * Empty slots (vendor ID 0xFFFF) are skipped. Single-function
- * devices are detected via the header-type byte and their
- * functions 1–7 are skipped.
+ * Empty slots are skipped: both vendor ID 0xFFFF (the bus "no
+ * device" sentinel) and 0x0000 (a reserved vendor ID — some chipsets
+ * return all-zero config reads for disconnected slots, producing
+ * "phantom" 0000:0000 devices). Single-function devices are detected
+ * via the header-type byte and their functions 1–7 are skipped.
+ *
+ * Use @ref axl_pci_next_unfiltered if you need to see 0x0000 slots.
  *
  * @return pointer to the next populated function, or NULL when
  *     enumeration is complete (or MCFG is unavailable).
  */
 AxlPciAddr *
 axl_pci_next(
+    AxlPciAddr  *prev   ///< previous result, or NULL to start
+);
+
+/**
+ * @brief Like @ref axl_pci_next, but does NOT skip 0x0000 phantom
+ *     slots (only 0xFFFF absent slots are skipped).
+ *
+ * Opt-in for the rare consumer that must enumerate raw config space
+ * including slots a quirky chipset reports as 0000:0000. Most callers
+ * want @ref axl_pci_next, which filters phantoms by default. Shares
+ * the same static cursor as @ref axl_pci_next — do not interleave the
+ * two within a single walk.
+ *
+ * @return pointer to the next responding function (vendor ID
+ *     != 0xFFFF), or NULL when enumeration is complete.
+ */
+AxlPciAddr *
+axl_pci_next_unfiltered(
     AxlPciAddr  *prev   ///< previous result, or NULL to start
 );
 
