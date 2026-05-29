@@ -20,7 +20,14 @@ AXL_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 
 ifeq ($(ARCH),aa64)
   CROSS      = aarch64-linux-gnu-
-  GCC_ARCH   = -mno-outline-atomics
+  # -mno-outline-atomics: keep atomic ops inline (avoids unresolved
+  # __aarch64_ldadd* helper-function references in freestanding builds).
+  # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves x18 as
+  # the platform register; gcc's register allocator must not use it
+  # or post-ExitBootServices OS-side state gets corrupted. Library
+  # objects must respect this just as much as user code, since library
+  # functions called from a user app would otherwise clobber x18.
+  GCC_ARCH   = -mno-outline-atomics -ffixed-x18
   EFI_LDS    = scripts/elf_aarch64_efi.lds
   PE_TARGET  = pei-aarch64-little
 else
@@ -34,6 +41,27 @@ CC         = $(CROSS)gcc
 LD_ELF     = $(CROSS)ld
 AR         = $(CROSS)ar
 OBJCOPY    = $(CROSS)objcopy
+
+# C++ toolchain — only consulted when AXL_CPP=1.  AArch64 uses ARM's
+# bare-metal "none-elf" cross because the Linux-ABI cross's libstdc++
+# headers pull hosted typedefs from <bits/c++config.h> (see
+# docs/ROADMAP.md axlmm spec).  X64 uses host g++ (same convention as
+# axl-cc's host gcc).  Pinned version matches Dell ePSA per CPP1
+# validation findings.
+ifdef AXL_CPP
+  ifeq ($(ARCH),aa64)
+    ARM_TOOLCHAIN ?= /opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
+    CXX = $(ARM_TOOLCHAIN)/bin/aarch64-none-elf-g++
+    ifeq ($(wildcard $(CXX)),)
+      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-arm-toolchain.sh)
+    endif
+  else
+    CXX = g++
+    ifeq ($(shell command -v g++ 2>/dev/null),)
+      $(error AXL_CPP=1 needs g++ in PATH)
+    endif
+  endif
+endif
 
 # Common flags for the EFI link step. The .so we produce here is just
 # an intermediate consumed by objcopy → PE/COFF; no OS ever loads it,
@@ -51,6 +79,7 @@ LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined
 CFLAGS_BASE = -std=gnu2x \
               -ffreestanding -fshort-wchar \
               -fno-stack-protector -fno-builtin \
+              -fno-math-errno -fno-trapping-math \
               -fno-omit-frame-pointer \
               -fpic $(GCC_ARCH) \
               -Wall \
@@ -67,6 +96,22 @@ ifeq ($(BUILD),RELEASE)
 else
   CFLAGS_BUILD = -Og -g -gdwarf -DAXL_MEM_DEBUG \
                  -ffunction-sections -fdata-sections
+endif
+
+# C++ flag set for libaxl-cxx.a (and any future C++ source under src/).
+# Matches the hard defaults baked into axl-cc's C++ path — no
+# exceptions, no RTTI, no thread-safe statics, C++20 minimum.  See
+# docs/ROADMAP.md "axlmm Toolchain" section.
+ifdef AXL_CPP
+CXXFLAGS_BASE = -std=c++20 \
+                -ffreestanding -fshort-wchar \
+                -fno-stack-protector -fno-builtin \
+                -fno-omit-frame-pointer \
+                -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+                -fpic $(GCC_ARCH) \
+                -Wall \
+                -DAXL_BACKEND_NATIVE
+CXXFLAGS      = $(CXXFLAGS_BASE) $(CFLAGS_BUILD)
 endif
 
 ifeq ($(ARCH),aa64)
@@ -145,7 +190,7 @@ endef
 # ===================================================================
 
 CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD
-INCLUDES   = -Iinclude -Isrc/backend
+INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend
 
 # ===================================================================
 # Optional TLS support (AXL_TLS=1)
@@ -279,6 +324,14 @@ LIB_SOURCES = \
     src/net/axl-socket-client.c \
     src/net/axl-websocket.c \
     src/gfx/axl-gfx.c \
+    src/gfx/axl-font.c \
+    src/gfx/axl-truetype.c \
+    src/gfx/axl-pixmap.c \
+    src/gfx/axl-gfx-path.c \
+    src/math/axl-math.c \
+    src/gfx/fonts/font-edk2-laffstd.c \
+    src/gfx/fonts/font-unifont-16.c \
+    src/input/axl-input.c \
     src/smbus/axl-smbus.c \
     src/smbus/axl-smbus-hc.c \
     src/smbus/axl-smbus-i2c.c \
@@ -297,6 +350,7 @@ LIB_SOURCES = \
     src/spd/axl-spd-ids.c \
     src/posix/axl-app.c \
     src/runtime/axl-atexit.c \
+    src/runtime/axl-cxxabi.c \
     src/runtime/axl-registry.c \
     src/runtime/axl-runtime.c \
     src/runtime/axl-signal.c
@@ -357,6 +411,18 @@ endif
 
 BUILDDIR   = $(PREFIX)/build
 LIB_OBJS   = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(LIB_SOURCES)))
+
+# libaxl-cxx.a contents — built only when AXL_CPP=1.  Pure-C consumers
+# never see this archive.  Contents must keep C-linkage symbols out
+# (those go in axl-cxxabi.c → libaxl.a).
+LIB_CXX_SOURCES = src/runtime/axl-cxxabi-ops.cpp
+LIB_CXX_OBJS    = $(patsubst %.cpp,$(BUILDDIR)/%.o,$(notdir $(LIB_CXX_SOURCES)))
+
+ifdef AXL_CPP
+LIBAXL_CXX_TARGET = $(PREFIX)/lib/libaxl-cxx.a
+else
+LIBAXL_CXX_TARGET =
+endif
 
 # ===================================================================
 # AXL_TLS state-change detection
@@ -426,16 +492,19 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset
+.PHONY: all clean clean-tools hello gfx-demo input-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
 .DEFAULT_GOAL := all
 
-all: check-version $(PREFIX)/lib/libaxl.a $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
+all: check-version $(PREFIX)/lib/libaxl.a $(LIBAXL_CXX_TARGET) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
 	@echo ""
 	@echo "  AXL library built (gcc, $(ARCH))"
 	@echo "  Library:  $(PREFIX)/lib/libaxl.a"
+ifdef AXL_CPP
+	@echo "  C++ lib:  $(PREFIX)/lib/libaxl-cxx.a"
+endif
 	@echo "  Headers:  include/axl.h"
 	@echo ""
 
@@ -499,6 +568,15 @@ $(BUILDDIR)/%.o: src/net/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/gfx/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(BUILDDIR)/%.o: src/gfx/fonts/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/math/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/input/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(BUILDDIR)/%.o: src/smbios/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -526,6 +604,13 @@ $(BUILDDIR)/%.o: src/posix/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/runtime/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# C++ pattern for src/runtime/*.cpp.  Only reachable when AXL_CPP=1
+# (the only .cpp source in libaxl-cxx.a today lives here).
+ifdef AXL_CPP
+$(BUILDDIR)/%.o: src/runtime/%.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+endif
+
 $(BUILDDIR)/%.o: src/crt0/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -551,6 +636,15 @@ $(PE_SET_DEBUG): scripts/pe-set-debug.c | $(BUILDDIR)
 $(PREFIX)/lib/libaxl.a: $(LIB_OBJS) | $(PREFIX)/lib
 	@rm -f $@
 	$(AR) rcs $@ $^
+
+# libaxl-cxx.a — companion archive for axl-cc's C++ path.  Same
+# stale-member-eviction discipline as libaxl.a.  Built only when
+# AXL_CPP=1; pure-C builds never reach this rule.
+ifdef AXL_CPP
+$(PREFIX)/lib/libaxl-cxx.a: $(LIB_CXX_OBJS) | $(PREFIX)/lib
+	@rm -f $@
+	$(AR) rcs $@ $^
+endif
 
 $(BUILDDIR):
 	mkdir -p $@
@@ -582,6 +676,19 @@ $(PREFIX)/gfx-demo.efi: $(BUILDDIR)/gfx-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-demo.o,$@)
 
 $(BUILDDIR)/gfx-demo.o: sdk/examples/gfx-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build input-demo.efi example
+# ===================================================================
+
+input-demo: $(PREFIX)/input-demo.efi
+	@echo "  Built: $(PREFIX)/input-demo.efi"
+
+$(PREFIX)/input-demo.efi: $(BUILDDIR)/input-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/input-demo.o,$@)
+
+$(BUILDDIR)/input-demo.o: sdk/examples/input-demo.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -919,7 +1026,9 @@ TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \
         AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
-        AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider
+        AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider \
+        AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath \
+        AxlTestInput
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -952,6 +1061,11 @@ $(eval $(call BUILD_TEST,AxlTestCpuIdle,axl-test-cpu-idle))
 $(eval $(call BUILD_TEST,AxlTestRuntime,axl-test-runtime))
 $(eval $(call BUILD_TEST,AxlTestXml,axl-test-xml))
 $(eval $(call BUILD_TEST,AxlTestFsProvider,axl-test-fs-provider))
+$(eval $(call BUILD_TEST,AxlTestGfx,axl-test-gfx))
+$(eval $(call BUILD_TEST,AxlTestTruetype,axl-test-truetype))
+$(eval $(call BUILD_TEST,AxlTestPixmap,axl-test-pixmap))
+$(eval $(call BUILD_TEST,AxlTestMath,axl-test-math))
+$(eval $(call BUILD_TEST,AxlTestInput,axl-test-input))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)

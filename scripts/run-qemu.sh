@@ -16,6 +16,11 @@
 #                         hostfwd ports forever.
 #   --raw                 Show full serial log (including firmware boot)
 #   --screenshot FILE     Capture framebuffer screenshot (PNG/PPM)
+#   --gpu                 Wire a virtual GPU device into the machine
+#                         so the guest firmware exposes a GOP for any
+#                         axl_gfx_*-using app. Required on AARCH64
+#                         (`virt` machine has no default display);
+#                         harmless on X64. --screenshot implies this.
 #   --net                 Enable user-mode networking (virtio-net)
 #   --hostfwd H:G         Forward host port H to guest port G (repeatable)
 #   --extra FILE          Stage additional .efi file on disk (repeatable)
@@ -69,6 +74,12 @@ ARCH="X64"
 TIMEOUT=15
 RAW=false
 SCREENSHOT=""
+# --gpu wires a virtual GPU device into the QEMU machine so the guest
+# firmware (OVMF) initializes a GOP for axl_gfx_*.  Needed for any
+# AARCH64 visual demo — the `virt` machine has no default display
+# device.  Harmless on X64 (q35 already provides GOP); the extra
+# device is a no-op there.  --screenshot implies --gpu automatically.
+ENABLE_GPU=false
 NET=false
 NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrides
 HOSTFWDS=()
@@ -123,6 +134,7 @@ while [[ $# -gt 0 ]]; do
         --timeout)    TIMEOUT="$2"; shift 2 ;;
         --raw)        RAW=true; shift ;;
         --screenshot) SCREENSHOT="$2"; shift 2 ;;
+        --gpu)        ENABLE_GPU=true; shift ;;
         --net)        NET=true; shift ;;
         --bridges)    BRIDGES=true; shift ;;
         --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
@@ -180,6 +192,13 @@ Options:
                            port leaks)
   --raw                    Show full serial log (including firmware boot)
   --screenshot FILE        Capture framebuffer screenshot (PNG/PPM)
+                           Implies --gpu.
+  --gpu                    Wire a virtual GPU device into the machine
+                           so the firmware initializes a GOP for any
+                           axl_gfx_*-using app. Required for AARCH64
+                           visual demos (the `virt` machine has no
+                           default display device). Harmless on X64
+                           (q35 already provides GOP).
   --net                    Enable user-mode networking (virtio-net)
   --bridges                Add a small PCI bridge tree (one PCIe root
                            port + a virtio-rng device behind it) AND a
@@ -881,6 +900,20 @@ cpu_summary() {
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 
+# --gpu / --screenshot: wire a virtual GPU device.  AARCH64's `virt`
+# machine has no default display device, so axl_gfx_* + any other
+# GOP-using app reports "no display" until one is added.  X64's q35
+# already provides a display via OVMF; the extra device is a no-op
+# there but keeps screenshots / framebuffer-capture consistent across
+# arches.  --screenshot triggers this implicitly because the
+# `screendump` monitor command needs a framebuffer to read.
+if [[ "$ENABLE_GPU" == "true" || -n "$SCREENSHOT" ]]; then
+    case "$ARCH" in
+        X64)     CMD+=(-device VGA) ;;
+        AARCH64) CMD+=(-device virtio-gpu-pci) ;;
+    esac
+fi
+
 # --bridges: matching topology to test/integration/common-test.sh so
 # tools that walk PCI bridges (lspci -t, sysinfo --pci, ...) and USB
 # hubs (lsusb -t) can be smoke-tested interactively against the same
@@ -1310,7 +1343,8 @@ fi
 # Screenshot mode
 if [[ -n "$SCREENSHOT" ]]; then
     MONSOCK="$TMPDIR/monitor.sock"
-    CMD+=(-serial "file:$LOG" -display none -device VGA)
+    # GPU device already wired above (--screenshot implies --gpu).
+    CMD+=(-serial "file:$LOG" -display none)
     CMD+=(-monitor "unix:$MONSOCK,server,nowait")
 
     set +e
@@ -1332,12 +1366,34 @@ if [[ -n "$SCREENSHOT" ]]; then
     set -e
 
     if [[ -f "$TMPDIR/screenshot.ppm" ]]; then
-        if command -v convert &>/dev/null; then
-            convert "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
-        else
+        # QEMU's `screendump` always writes PPM. Convert to the format
+        # implied by the destination extension. PPM destinations skip
+        # conversion; PNG/JPG/etc. try ImageMagick, then Pillow, then
+        # error out (refuse to ship a misnamed PPM as a PNG).
+        ext="${SCREENSHOT##*.}"
+        ext="${ext,,}"  # lowercase
+        if [[ "$ext" == "ppm" ]]; then
             cp "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
+            echo "Screenshot saved: $SCREENSHOT"
+        elif command -v convert &>/dev/null; then
+            convert "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
+            echo "Screenshot saved: $SCREENSHOT"
+        elif python3 -c 'import PIL' 2>/dev/null; then
+            python3 -c '
+import sys
+from PIL import Image
+Image.open(sys.argv[1]).save(sys.argv[2])
+' "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
+            echo "Screenshot saved: $SCREENSHOT"
+        else
+            # Bail rather than silently mislabel a PPM as PNG.
+            echo "ERROR: --screenshot $SCREENSHOT requires ImageMagick (convert) or Python Pillow for .${ext} output" >&2
+            echo "       install one of:  dnf install ImageMagick   |   pip install pillow" >&2
+            echo "       or use a .ppm destination to skip conversion" >&2
+            cp "$TMPDIR/screenshot.ppm" "${SCREENSHOT%.*}.ppm"
+            echo "Raw PPM saved instead: ${SCREENSHOT%.*}.ppm" >&2
+            exit 1
         fi
-        echo "Screenshot saved: $SCREENSHOT"
     else
         echo "WARNING: screenshot capture failed" >&2
     fi

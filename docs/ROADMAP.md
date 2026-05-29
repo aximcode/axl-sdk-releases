@@ -1067,16 +1067,149 @@ Byte-oriented ring buffer (kfifo-inspired) with three API layers:
 - [x] Bitmap font renderer (8x16 VGA font, scalable)
 - [x] Text drawing API (axl_gfx_draw_text)
 
-### Phase G2: AGL (AximCode Graphics Library) — not started, separate project
+### Phase G2: AGT (AximCode GUI Toolkit) — design done, not started
 
-GTK-like widget toolkit built on AxlGfx. Would be a separate repo.
-Blocked on a consumer need (SoftBMC local UI is the first candidate,
-but SoftBMC hasn't migrated to AXL yet — see Phase 10).
+C++ widget toolkit built FOX-shape on top of `axl` + `axlmm` +
+`axl-gfx` + new `axl-input`. Separate repo (`aximcode/agt`).
+**Design doc: [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md)** — supersedes
+the earlier 4-bullet stub.
 
-- [ ] Basic widgets: label, button, panel, list
-- [ ] Layout engine (vertical/horizontal box)
-- [ ] Input handling (keyboard + pointer via UEFI protocols)
-- [ ] Theming / color scheme support
+Stack (3-library FOX-shape, with substrate discipline rules that
+keep a future 4-library GTK-shape toolkit possible on the same
+substrate):
+
+```
+vendor C++ app → AGT (C++) → axlmm + axl-gfx + axl-input → axl
+                              [aximcode/agt]   [axl-sdk core]
+```
+
+Phased plan (see [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md) §"Implementation plan"):
+
+- **Phase 0 (axl-sdk, 2–4 wks)** — substrate work:
+  - [ ] `axl-gfx` gap closure: clipping, double-buffer, alpha
+        blending, line/outline, font metrics API (vblank-aware
+        present deferred — UEFI GOP exposes no vblank API and AGT
+        v0.1 has no animation consumer; see
+        [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md))
+  - [ ] New `axl-input` module (`src/input/`, `<axl/axl-input.h>`):
+        unified `AxlInputEvent` type shipped in Phase 0g.  Source
+        registration reuses `axl-loop`'s existing pattern — mouse
+        via `axl_input_attach_mouse` (wraps `axl_loop_add_event` +
+        `EFI_SIMPLE_POINTER_PROTOCOL`), keyboard via
+        `axl_input_attach_key` (wraps `axl_loop_add_key_press`).
+        No parallel event queue — DRY with axl-loop's dispatch
+        machinery.
+- **Phase 1 (axl-sdk, 1–2 wks)** — CPP1 toolchain validation
+  (priority raised; AGT depends on it)
+- **Phase 2 (parallel, 2–3 mo)** — AGT bootstrap in `aximcode/agt`
+  + axlmm CPP2-4 in axl-sdk
+- **Phase 3** — first C++ consumer integration
+- **Phase 0z (axl-sdk, ~1 day)** — module documentation sweep:
+  `src/gfx/README.md`, new `src/input/README.md`, Sphinx pages
+  (`gfx.rst` + new `input.rst`), `src/data/README.md` for
+  `axl_utf8_decode`.  Runs after Phase 0 substrate work completes,
+  before Phase 1 — batched at end of Phase 0 so docs catch final
+  API shapes, not intermediate ones.
+
+Substrate discipline rules (axl-gfx + axl-input stay pure C and
+paradigm-agnostic) are documented in
+[`AGT-Design.md` §"Substrate discipline rules"](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md#substrate-discipline-rules).
+
+### Phase G3+: GNOME-shape AGT successor — planned future track
+
+A second widget toolkit alongside (not replacing) AGT, realizing
+the full GNOME 4-library stack on the same `axl-gfx` + `axl-input`
+substrate. Triggered when a C widget consumer emerges or a C++
+consumer asks for GObject-style runtime features. **Design:
+[`AGT-Design.md` §"Future track"](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md#future-track-gnome-shape-agt-successor).**
+
+- **Phase G3 (axl-sdk)** — `axl-object`: GObject-equivalent C
+  primitive (type registration, signals, properties, ref counting,
+  weak refs). Sits beside `axl-gfx` / `axl-input` in axl-sdk core.
+- **Phase G4 (new repo)** — C widget toolkit, GTK-shape, on
+  `axl-object`. Signal-driven dispatch; properties for state.
+- **Phase G5 (new repo)** — C++ wrapper of G4, gtkmm-shape.
+  Depends on G4 + `axlmm`.
+
+Phase G3-G5 specs are written when triggered, not in advance.
+Today's only commitment toward this track is the substrate
+discipline rules above.
+
+### Phase R: axl-display — Network display protocol
+
+A network protocol that lets remote processes drive the UEFI display
+server. Server (`axl-display`) sits in `src/display/` as a peer to
+`axl-gfx` / `axl-input`; client library (`libaxl-display`) is a
+hosted-build target with TBD location when implementation starts.
+X-shaped (client/server boundary is the network boundary).
+Extension-first: a small core covers remote drawing and input
+events; the VNC-shape screen-mirror capability lives in a `mirror`
+extension so both use cases run on the same wire.
+
+**Design doc: [`AXL-Display-Design.md`](AXL-Display-Design.md)**.
+
+Stack:
+
+```
+remote client → libaxl-display (host)
+                  │ TCP
+                  ▼
+              axl-display server (axl-sdk)
+                  │
+                  ▼
+              axl-gfx + axl-input + axl-loop
+```
+
+Phased plan (see
+[`AXL-Display-Design.md` §"Phased plan"](AXL-Display-Design.md#phased-plan)):
+
+- **Phase R0** — wire framing (TLV), connection handshake + server
+  capability advertisement, tag interning, async reply correlation,
+  error-reply framing, graceful disconnect, Layer-0 bind discipline
+  (localhost default; `--bind`/`--allowlist` for network exposure).
+- **Phase R1a** — minimal drawing subset for end-to-end demo:
+  `fill_rect` + `draw_text` + `present_screen` + GC color/font.
+  Built-in fonts only, screen drawable only. Client prototype draws
+  "Hello from axl-display" to a QEMU UEFI box.
+- **Phase R2** — input event channel via `axl-input`,
+  `select_input` subscription, server→client event records. Lands
+  before R1b so the first interactive demo arrives early.
+- **Phase R1b** — full drawing surface: off-screen drawables, clip
+  stack, line / polyline / rect-outline, put_image / get_image,
+  multi-drawable present.
+- **Phase R3** — first non-trivial extension to validate the
+  framework (candidate: `font/upload`).
+- **Phase R4** — `mirror` extension (VNC-shape capability):
+  `get_region`, dirty-rect tracking, damage events,
+  `inject_input` synth via a new `axl-input` injection primitive.
+  Reference RFB-shape viewer.
+- **Phase R5** — auth hardening: MIT-MAGIC-COOKIE-shape (Layer 1)
+  shipped with NVRAM storage + console-print + runtime rotation +
+  session idle timeout; PSK challenge-response (Layer 2)
+  designed + stubbed; input-injection audit log (opt-in).
+- **Phase R6** — client library polish (`libaxl-display` 1.0),
+  Python + Rust bindings, `axl-display-viewer` reference CLI.
+
+Sequencing notes:
+
+- Phase R is **independent of and parallel to** Phase G (AGT).
+  Protocol serializes `axl-gfx`, which is already shipped;
+  doesn't need AGT or axlmm.
+- Lower priority than Phase 1 (axlmm CPP1 validation) and Phase 2
+  (AGT bootstrap) since both have closer consumers. Pick up
+  opportunistically or when a real remote-display consumer
+  emerges.
+
+Substrate discipline rules carry over verbatim from AGT — `axl-
+display` adds nothing to `axl-gfx` / `axl-input`. Document in
+[`AXL-Display-Design.md` §"Layering"](AXL-Display-Design.md#layering).
+
+Security model is BMC-virtual-console-shaped, not desktop-X11.
+v0.1 defaults to localhost bind; network exposure is an explicit
+operator choice; cookie + PSK layered on as Phase R5 ships. mTLS is
+buildable on `axl-tls` but deferred indefinitely (UEFI cert
+operational burden). See
+[`AXL-Display-Design.md` §"Authentication & security"](AXL-Display-Design.md#authentication--security).
 
 ---
 
@@ -1433,6 +1566,37 @@ of the pattern. Likely candidates:
 
 ---
 
+## Rich UI Exploration (Future — planning only)
+
+Path to a UEFI UI substrate rich enough to host modern JS toolkits
+(Preact / lit-html shape). Two engines intended to compose: Lexbor
+(HTML/CSS) + QuickJS (JS runtime), with an AxlGfx 2D upgrade as
+prerequisite for the rendering prototype. WebAssembly (WAMR) is
+documented as a deferred alternative but NOT committed.
+
+**Plan lives in [AXL-Rich-UI-Plan.md](AXL-Rich-UI-Plan.md).** Phases:
+
+- **Phase Gx** — `axl_gfx_fill_rect_i` signed-coord variant (~1h, AGT-requested opportunistic add)
+- **Phase G1** — stb_truetype vector text into AxlGfx (~1wk, prereq for A2; also unblocks AGT TTF labels)
+- **Phase G2** — stb_image PNG/JPG decode into AxlGfx (~3d, prereq for A2; also unblocks AGT image widgets)
+- **Phase G3** — path rasterizer + AA (API shape resolved with AGT; G3a hand-rolled vs G3b Blend2D deferred to A2)
+- **Phase G4–G13** — full 2D library follow-ups (transforms, gradients, blur+shadows, glyph cache, stroke styling, display list, path clip, multi-line text, pattern fill, blend modes; demand-driven)
+- **Phase M1–M10** — AxlMath follow-ups (atan2, pow/exp/log, Vec2/Mat3, easing, clamp/min/max, bit math, sat arith, geometry helpers, wrap, constants; M3 is hard prereq for G4)
+- **Spike A1** — Lexbor compiles + parses HTML inside UEFI (1-2h, throwaway)
+- **Spike C1** — QuickJS compiles + evals ES2020 inside UEFI (1-2h, throwaway)
+- **Phase A2** — HTML/CSS layout + paint prototype (multi-month, gated on A1)
+- **Phase C2** — QuickJS bindings to AxlGfx/Input/Net/Fs (multi-month, gated on C1)
+- **Phase A3** — A+C convergence: DOM bindings + Preact-on-UEFI (multi-month, after A2+C2)
+
+G1/G2/Gx unblock AGT's widget rendering on AGT's own schedule
+(additive `AgtDrawContext::draw_text_ttf` virtual per the
+2026-05-28 cross-session handoff). Hard decision gate after A1+C1:
+no multi-month A2/C2 investments until the viability spikes
+report back. See plan doc for kill criteria and exit criteria per
+phase.
+
+---
+
 ## Platform Abstraction (Future — coreboot support)
 
 Separate UEFI-specific code from platform-agnostic code so AXL can
@@ -1524,126 +1688,100 @@ P4 (3-5 days). Total: ~2-3 weeks.
 
 ---
 
-## C++ Bindings — `axlmm` (Future)
+## C++ Bindings — `axlmm`
 
-Sibling C++ wrapper library over the C public surface, modeled on
-GLib's `glibmm`. The C library remains canonical; `axlmm` is a
-thin, optional layer for consumers who prefer C++ ergonomics
-(RAII, exceptions, range-based for, `std::string_view`) without
-requiring the C surface to grow C++-aware.
+Sibling C++ wrapper layer over the C public surface, modeled on
+GLib's `glibmm`.  Adds C++ ergonomics (RAII, type-safe `Status`,
+range-for, `std::expected`) without changing what the C library
+does.  axlmm is a thin wrapper, not a parallel implementation —
+every operation routes to the underlying C function.
 
-**Why a sibling library, not a rewrite:**
-- Most UEFI tooling is plain C; the C library carries no C++
-  toolchain, runtime, or ABI cost for those consumers.
-- C++ consumers (UEFI test harnesses, vendor diagnostic tools that
-  already use C++, future axl-sdk-built apps with richer object
-  models) get an idiomatic surface without losing access to the C
-  primitives.
-- GLib/glibmm precedent — independently versioned, additive, never
-  blocks the C library's release cadence.
+**Design doc: [`AXLMM-Design.md`](AXLMM-Design.md).**  All API
+decisions (naming, error model, handle ownership, status enum,
+iteration, format, header layout, testing, packaging) are settled
+there.  This section is the phase tracker pointing back at it.
 
-**Scope (in):**
-- RAII wrappers for handle-bearing types: AxlStream, AxlEvent,
-  AxlCancellable, AxlHashTable, AxlArray, AxlList, AxlSlist,
-  AxlQueue, AxlStrBuf, AxlHttpServer, AxlHttpClient, AxlPciIds,
-  AxlUsbIds, AxlSpdIds, AxlSidecar, AxlArena, AxlBufPool,
-  AxlRingBuf, AxlRadixTree, AxlCache.
-- `std::string_view` / `std::span<const std::byte>` friendly
-  overloads where the C API takes `const char *, size_t` or
-  `const void *, size_t`.
-- Exception-throwing variants (`axlmm::Exception` derived from
-  `std::runtime_error`) of the error-returning C functions, gated
-  per call site (the underlying C function stays available for
-  consumers that prefer error codes).
-- Range-based-for adapters for the `_foreach` / `_iter` /
-  `_next`-cursor APIs (AxlPci cursor, AxlUsb cursor, AxlHashTable
-  iter, AxlArray iter, AxlSidecar foreach).
-- Type-safe wrappers for the variadic format APIs (`axl_printf`
-  family) using parameter packs.
+### Status
 
-**Scope (out — non-goals):**
-- No STL allocator integration. AxlMem stays the allocation root;
-  `axlmm` containers wrap AxlArray/AxlHashTable rather than
-  re-implementing `std::vector`/`std::unordered_map` over AxlMem.
-- No rewrite of any C internals. `axlmm` is consumer-only headers
-  + a small linkable shim where exception translation needs a
-  hidden symbol.
-- No template-heavy headers — UEFI binary size matters. Templates
-  used sparingly (handles, span overloads); no header-only
-  generic-algorithms library.
-- No runtime polymorphism for handle types — the C API's opaque
-  pointer model maps to a single `class` per type, not an
-  inheritance hierarchy.
-- No coroutine / `std::future` integration in the first cut. The
-  AXL async model is callback-based; bridging it to coroutines is
-  a separate larger design (revisit if a consumer asks).
+**Phase 1 (toolchain + C++ ABI runtime): SHIPPED 2026-05-28.**
+The C++ toolchain is validated end-to-end on both X64 and AARCH64;
+consumers can compile `.cpp` source via `axl-cc` (or the
+`axl-c++` wrapper) and the result links cleanly against
+`libaxl-cxx.a` (operator new/delete + `__cxa_pure_virtual`) plus
+`libaxl.a` (which now contains `__cxa_atexit` + `__dso_handle` +
+the `.init_array` walker).  See
+[`AXLMM-Design.md` §"Toolchain & constraints"](AXLMM-Design.md#toolchain--constraints).
 
-**Toolchain:**
-- New `axl-c++` driver (or `axl-cc --lang=cpp`) — same flag
-  surface as `axl-cc`, invokes `g++` for compilation, otherwise
-  identical link flow. Build-gated by `AXL_CPP=1` at SDK install
-  time so the C-only install stays minimal.
-- Headers under `include/axlmm/*.hpp`. Umbrella `<axlmm.hpp>`
-  mirroring `<axl.h>`. Namespace `axlmm`.
-- Shipped as a separate package: `axl-sdk-cpp.deb` /
-  `axl-sdk-cpp.rpm` depending on `axl-sdk`. The base `axl-sdk`
-  package never grows a libstdc++ runtime dependency.
-- Unit tests under `test/unit/axlmm-test-*.cpp`, run by the same
-  `test-axl.sh` ratchet (separate count tier so the C-side
-  ratchet isn't perturbed).
+**Phase CPP1.7 onward (wrapper class library): DEFERRED pending
+AGT consumer validation.**  Designing wrappers without a real
+consumer risks wrapping the wrong things or wrapping them wrong.
+glibmm came after glib had four years of consumer evolution; we
+should let AGT show us actual usage patterns before committing.
+See [`AXLMM-Design.md` §"Implementation status"](AXLMM-Design.md#implementation-status).
 
-### Phase CPP1: Foundation + handle-bearing wrappers
+### Phase tracker
 
-- [ ] `axl-c++` toolchain driver (or `axl-cc --lang=cpp`)
-- [ ] `<axlmm/handle.hpp>` — common RAII handle template
-      (move-only, configurable deleter)
-- [ ] `<axlmm/exception.hpp>` — `axlmm::Exception` base + per-status
-      derived types (`CancelledError`, `NoMemoryError`, etc.)
-- [ ] First wrapper pass: AxlStream, AxlEvent, AxlCancellable,
-      AxlStrBuf, AxlArena
-- [ ] Build-gate `AXL_CPP=1` in `scripts/install.sh`; new package
-      target in release flow
-- [ ] `sdk/examples/hello.cpp` builds via `axl-c++` and prints to
-      a wrapped AxlStream
+**Phase 1 — toolchain + ABI runtime (DONE 2026-05-28):**
+- [x] **CPP1.0** — minimal hello.cpp with classes / virtuals /
+      polymorphism builds + runs in UEFI (commit `ce3d6e6`)
+- [x] **CPP1.1** — global ctor/dtor wired through
+      `src/runtime/axl-cxxabi.c` + `_axl_init` (commit `ce3d6e6`)
+- [x] **CPP1.2** — `operator new`/`delete` (scalar / array / sized
+      / placement) routed through `axl_malloc`/`axl_free`
+- [x] **CPP1.3** — exceptions CONFIRMED BROKEN (libsupc++ surface
+      unresolvable); axlmm spec drops exception variants
+- [x] **CPP1.4** — RTTI CONFIRMED BROKEN (`__dynamic_cast` +
+      typeinfo vtables unresolvable); axlmm spec drops
+      `dynamic_cast`
+- [x] **CPP1.5** — header-only libstdc++ subset confirmed usable
+      (`<array>` `<span>` `<string_view>` `<type_traits>`
+      `<utility>` `<initializer_list>` `<new>`); AARCH64 needs
+      `aarch64-none-elf` toolchain headers, not
+      `aarch64-linux-gnu`
+- [x] **CPP1.6** — toolchain bring-up: `install-arm-toolchain.sh`,
+      `libaxl-cxx.a` build path, `src/runtime/axl-cxxabi-ops.cpp`,
+      `axl-cc` extension dispatch, `axl-c++` wrapper, install.sh
+      auto-detect of C++ toolchain (commits `fa2b636`, `6f833cc`,
+      `9a3d32a`, `e02f9b8`)
+- [x] **Side-effect fix** — `-ffixed-x18` added to library +
+      axl-cc + CMake AARCH64 builds; latent UEFI-ABI bug surfaced
+      during toolchain investigation (commit `3a8fecb`)
 
-### Phase CPP2: Containers + iteration
+**Phase 2 — wrapper class library (DEFERRED pending AGT
+validation):**
+- [ ] **CPP1.7a** — Foundation + AxlStream: `<axlmm.hpp>`
+      umbrella, `<axlmm/status.hpp>`,
+      `<axlmm/detail/handle.hpp>`, `<axlmm/stream.hpp>`, tests,
+      `sdk/examples/hello.cpp`.  AxlStream chosen as the first
+      wrapper because it stresses the design pattern (factory +
+      sticky-error + method dispatch) before applying it to
+      4 more types.
+- [ ] **CPP1.7b** — AxlEvent + AxlCancellable wrappers
+- [ ] **CPP1.7c** — AxlStrBuf + AxlArena wrappers
+- [ ] **CPP2** — Containers: AxlArray / AxlList / AxlSlist /
+      AxlQueue / AxlHashTable wrappers + range-for support;
+      AxlSidecar / AxlPci / AxlUsb cursor adapters;
+      `std::string_view` + `std::span` overloads across CPP1
+      surface
+- [ ] **CPP3** — Networking + format: AxlHttpServer / AxlHttpClient
+      wrappers; AxlTcp / AxlUdp socket wrappers; format-API
+      revisited (if a consumer asks)
+- [ ] **CPP4** — Polish: Sphinx docs for `<axlmm/*.hpp>`,
+      cross-arch CI coverage, migration recipe doc
 
-- [ ] AxlArray, AxlList, AxlSlist, AxlQueue, AxlHashTable wrappers
-      with `begin()`/`end()` and range-for support
-- [ ] AxlSidecar foreach adapter
-- [ ] AxlPci / AxlUsb cursor adapters (range-for over enumeration)
-- [ ] `std::string_view` + `std::span` overloads across the
-      Phase CPP1 surface
+### When deferral lifts
 
-### Phase CPP3: Networking + format
+The trigger is **AGT existing as a real consumer** that can
+validate which axlmm shapes pay off.  When that happens, this doc
+gets a status flip ("DEFERRED" → "in progress") and CPP1.7a is the
+first commit.  The design decisions in
+[`AXLMM-Design.md`](AXLMM-Design.md) are the spec; revisit only if
+AGT's actual patterns invalidate them.
 
-- [ ] AxlHttpServer / AxlHttpClient wrappers (route registration
-      via lambdas with capture-friendly storage)
-- [ ] AxlTcp / AxlUdp socket wrappers
-- [ ] Type-safe `axlmm::format` / `axlmm::print` parameter-pack
-      wrappers over `axl_printf` family
+In the meantime, AGT and any other C++ consumer can call the C API
+directly with `AXL_AUTOPTR` for RAII — no axlmm dependency
+required.  See [`AXLMM-Design.md` §"Why axlmm exists"](AXLMM-Design.md#why-axlmm-exists-and-what-it-isnt).
 
-### Phase CPP4: Polish
-
-- [ ] Sphinx documentation generation for `<axlmm/*.hpp>` (Doxygen
-      already supports C++; needs Breathe pages alongside the C
-      module pages)
-- [ ] Cross-arch CI coverage (X64 + AARCH64 axlmm test build)
-- [ ] Migration recipe doc: "porting a C consumer to axlmm" with
-      before/after examples
-
-**Open questions (defer until CPP1 lands):**
-- Coroutine bridge for async APIs — `co_await`-able wrappers
-  around AxlCancellable-aware async ops. Probably worth it
-  eventually but a real consumer should drive the design.
-- C++20 `std::expected` vs. exceptions for the error-returning
-  variants — exceptions are the GLib precedent; `expected` is
-  closer to the underlying C semantics. Likely both, with the
-  caller picking per call site.
-- libstdc++ in a UEFI environment — exception unwinding, RTTI,
-  and `std::string` allocation all have caveats in firmware.
-  CPP1 must validate the toolchain end-to-end before CPP2 commits
-  to STL types in the public headers.
 
 ---
 

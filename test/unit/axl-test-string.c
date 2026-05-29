@@ -373,6 +373,113 @@ test_utf8_ucs2(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_utf8_decode — per-codepoint iterator
+// ---------------------------------------------------------------------------
+
+static void
+test_utf8_decode(void)
+{
+    uint32_t  cp;
+    size_t    n;
+
+    /* End-of-string sentinel: returns 0 on NUL byte. */
+    n = axl_utf8_decode("", &cp);
+    test_check(n == 0, "utf8_decode: empty string returns 0");
+
+    /* NULL safety: both arguments. */
+    n = axl_utf8_decode(NULL, &cp);
+    test_check(n == 0, "utf8_decode: NULL s returns 0");
+    n = axl_utf8_decode("A", NULL);
+    test_check(n == 0, "utf8_decode: NULL out_codepoint returns 0");
+
+    /* 1-byte sequence: ASCII. */
+    n = axl_utf8_decode("A", &cp);
+    test_check(n == 1 && cp == 0x41, "utf8_decode: 'A' (1-byte) == U+0041");
+
+    /* 2-byte sequence: U+00E9 é = 0xC3 0xA9. */
+    n = axl_utf8_decode("\xC3\xA9", &cp);
+    test_check(n == 2 && cp == 0x00E9, "utf8_decode: 'é' (2-byte) == U+00E9");
+
+    /* 3-byte sequence: U+2500 ─ (box horizontal) = 0xE2 0x94 0x80. */
+    n = axl_utf8_decode("\xE2\x94\x80", &cp);
+    test_check(n == 3 && cp == 0x2500,
+               "utf8_decode: '─' (3-byte) == U+2500");
+
+    /* 3-byte sequence: U+4E2D 中 = 0xE4 0xB8 0xAD. */
+    n = axl_utf8_decode("\xE4\xB8\xAD", &cp);
+    test_check(n == 3 && cp == 0x4E2D,
+               "utf8_decode: '中' (3-byte) == U+4E2D");
+
+    /* 4-byte sequence (above BMP): U+1F600 😀 = 0xF0 0x9F 0x98 0x80. */
+    n = axl_utf8_decode("\xF0\x9F\x98\x80", &cp);
+    test_check(n == 4 && cp == 0x1F600,
+               "utf8_decode: '😀' (4-byte) == U+1F600 (above BMP)");
+
+    /* Invalid: orphan continuation byte → return 1, cp=0xFFFD. */
+    n = axl_utf8_decode("\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: orphan continuation byte → 1 byte + U+FFFD");
+
+    /* Invalid: truncated 2-byte sequence (0xC3 with no continuation). */
+    n = axl_utf8_decode("\xC3", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: truncated 2-byte at EOS → 1 byte + U+FFFD");
+
+    /* Invalid: 2-byte lead followed by non-continuation. */
+    n = axl_utf8_decode("\xC3X", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: 2-byte lead + non-continuation → 1 byte + U+FFFD");
+
+    /* Invalid: 0xFF (never valid as a UTF-8 lead byte). */
+    n = axl_utf8_decode("\xFF", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: 0xFF lead byte → 1 byte + U+FFFD");
+
+    /* Overlong 2-byte encoding of U+0000 (0xC0 0x80, "Modified UTF-8").
+       Must be rejected to prevent NUL-smuggling attacks via UTF-8. */
+    n = axl_utf8_decode("\xC0\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: overlong 2-byte U+0000 (\\xC0\\x80) → 1 byte + U+FFFD");
+
+    /* Overlong 3-byte encoding of an ASCII codepoint. */
+    n = axl_utf8_decode("\xE0\x80\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: overlong 3-byte → 1 byte + U+FFFD");
+
+    /* UTF-16 surrogate U+D800 encoded as 3 bytes (0xED 0xA0 0x80).
+       Surrogates are not valid Unicode scalars and must be rejected. */
+    n = axl_utf8_decode("\xED\xA0\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: UTF-16 surrogate U+D800 → 1 byte + U+FFFD");
+
+    /* 4-byte encoding above Unicode maximum (U+110000 = 0xF4 0x90 0x80 0x80).
+       Anything beyond U+10FFFF is invalid. */
+    n = axl_utf8_decode("\xF4\x90\x80\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: out-of-range U+110000 → 1 byte + U+FFFD");
+
+    /* Overlong 4-byte (0xF0 0x80 0x80 0x80 encodes U+0000 in 4 bytes). */
+    n = axl_utf8_decode("\xF0\x80\x80\x80", &cp);
+    test_check(n == 1 && cp == 0xFFFD,
+               "utf8_decode: overlong 4-byte → 1 byte + U+FFFD");
+
+    /* Iteration over a mixed string: "A中Z" = 1 + 3 + 1 = 5 bytes. */
+    {
+        const char *p = "A\xE4\xB8\xAD" "Z";
+        uint32_t    cps[8] = {0};
+        size_t      i = 0;
+        size_t      consumed;
+        while ((consumed = axl_utf8_decode(p, &cps[i])) > 0) {
+            p += consumed;
+            i++;
+        }
+        test_check(i == 3, "utf8_decode iter: 'A中Z' yields 3 codepoints");
+        test_check(cps[0] == 0x41 && cps[1] == 0x4E2D && cps[2] == 0x5A,
+                   "utf8_decode iter: codepoints are A, 中, Z");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Base64 tests
 // ---------------------------------------------------------------------------
 
@@ -1427,6 +1534,7 @@ test_strbuf_main(
     test_strbuf_overwrite();
     test_asprintf();
     test_utf8_ucs2();
+    test_utf8_decode();
     test_base64();
     test_strlcpy();
     test_strlcat();

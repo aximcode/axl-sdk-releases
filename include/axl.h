@@ -87,6 +87,7 @@
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
 #include <axl/axl-gfx.h>
+#include <axl/axl-input.h>
 #include <axl/axl-smbios.h>
 #include <axl/axl-smbus.h>
 #include <axl/axl-ipmi.h>

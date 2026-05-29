@@ -871,6 +871,99 @@ axl_strv_equal(const char *const *strv1, const char *const *strv2)
 }
 
 // ---------------------------------------------------------------------------
+// UTF-8 iterator
+// ---------------------------------------------------------------------------
+
+size_t
+axl_utf8_decode(
+    const char  *s,
+    uint32_t    *out_codepoint
+    )
+{
+    if (s == NULL || out_codepoint == NULL) {
+        return 0;
+    }
+
+    const uint8_t b0 = (uint8_t)s[0];
+    if (b0 == 0) {
+        return 0;
+    }
+
+    #define UTF8_IS_CONT(b) (((b) & 0xC0) == 0x80)
+
+    /* 1-byte: 0xxxxxxx (U+0000..U+007F) */
+    if (b0 < 0x80) {
+        *out_codepoint = b0;
+        return 1;
+    }
+
+    /* 2-byte: 110xxxxx 10xxxxxx (U+0080..U+07FF) */
+    if ((b0 & 0xE0) == 0xC0) {
+        uint8_t b1 = (uint8_t)s[1];
+        if (!UTF8_IS_CONT(b1)) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        uint32_t cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(b1 & 0x3F);
+        /* Reject overlong encodings (codepoints < 0x80 encoded in 2 bytes). */
+        if (cp < 0x80) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        *out_codepoint = cp;
+        return 2;
+    }
+
+    /* 3-byte: 1110xxxx 10xxxxxx 10xxxxxx (U+0800..U+FFFF, except surrogates) */
+    if ((b0 & 0xF0) == 0xE0) {
+        uint8_t b1 = (uint8_t)s[1];
+        uint8_t b2 = (uint8_t)(b1 ? s[2] : 0);
+        if (!UTF8_IS_CONT(b1) || !UTF8_IS_CONT(b2)) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        uint32_t cp = ((uint32_t)(b0 & 0x0F) << 12) |
+                      ((uint32_t)(b1 & 0x3F) << 6)  |
+                      ((uint32_t)(b2 & 0x3F));
+        /* Reject overlong + UTF-16 surrogates (D800..DFFF must never appear). */
+        if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        *out_codepoint = cp;
+        return 3;
+    }
+
+    /* 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (U+10000..U+10FFFF) */
+    if ((b0 & 0xF8) == 0xF0) {
+        uint8_t b1 = (uint8_t)s[1];
+        uint8_t b2 = (uint8_t)(b1 ? s[2] : 0);
+        uint8_t b3 = (uint8_t)(b2 ? s[3] : 0);
+        if (!UTF8_IS_CONT(b1) || !UTF8_IS_CONT(b2) || !UTF8_IS_CONT(b3)) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        uint32_t cp = ((uint32_t)(b0 & 0x07) << 18) |
+                      ((uint32_t)(b1 & 0x3F) << 12) |
+                      ((uint32_t)(b2 & 0x3F) << 6)  |
+                      ((uint32_t)(b3 & 0x3F));
+        /* Reject overlong + out-of-range (Unicode max is U+10FFFF). */
+        if (cp < 0x10000 || cp > 0x10FFFF) {
+            *out_codepoint = 0xFFFD;
+            return 1;
+        }
+        *out_codepoint = cp;
+        return 4;
+    }
+
+    /* Invalid lead byte (0xF8..0xFF, or orphan continuation 0x80..0xBF). */
+    *out_codepoint = 0xFFFD;
+    return 1;
+
+    #undef UTF8_IS_CONT
+}
+
+// ---------------------------------------------------------------------------
 // UTF-8 -> UCS-2
 // ---------------------------------------------------------------------------
 

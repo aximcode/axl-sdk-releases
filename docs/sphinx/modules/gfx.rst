@@ -7,4 +7,12 @@ AxlGfx — Graphics
 API Reference
 -------------
 
+AxlGfx
+~~~~~~
+
 .. doxygenfile:: axl-gfx.h
+
+AxlFont
+~~~~~~~
+
+.. doxygenfile:: axl-font.h

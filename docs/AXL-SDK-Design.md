@@ -145,16 +145,89 @@ dependencies.
 These use a different subsystem value in the PE/COFF header and
 the driver provides its own entry point (no axl-crt0).
 
-### C++ bindings (planned, not yet shipped)
+### C++ support
 
-A sibling C++ wrapper library — `axlmm`, modeled on glibmm — is
-on the roadmap (see [`ROADMAP.md` §"C++ Bindings — `axlmm` (Future)"](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/ROADMAP.md#c-bindings--axlmm-future)).
-The C library stays canonical; `axlmm` ships as a separate
-package (`axl-sdk-cpp.deb` / `.rpm`) so plain C consumers carry
-no libstdc++ runtime cost. A new `axl-c++` toolchain driver
-mirrors `axl-cc` but invokes `g++`. Headers under
-`include/axlmm/*.hpp`, namespace `axlmm`, build-gated by
-`AXL_CPP=1` at install time.
+axl-sdk supports C++ consumers as a first-class build target.
+Shipped 2026-05-28; see commit history under `src/runtime/axl-cxxabi*`
+and `scripts/axl-cc`.  Two pieces live together:
+
+1. **Toolchain.** `axl-c++` (alias for `axl-cc -x c++`) compiles
+   `.cpp` source with the freestanding-UEFI C++ flag set baked
+   in: `-std=c++20 -fno-exceptions -fno-rtti
+   -fno-threadsafe-statics -ffreestanding -fshort-wchar`, plus the
+   per-arch additions (`-ffixed-x18` on AArch64, `-mno-red-zone`
+   on X64).  `axl-cc` itself dispatches by file extension — `.c`
+   → gcc, `.cpp`/`.cc`/`.cxx` → g++ — so mixed-language
+   projects work with one driver.  Consumers can also use
+   `axl-cc -c` for compile-only (build their own `.a` libraries)
+   and pass pre-built `.o` / `.a` files to the linker.
+
+2. **C++ ABI runtime** (`libaxl-cxx.a`).  Provides the freestanding
+   pieces of the Itanium C++ ABI that the compiler emits
+   references to: operator `new` / `delete` (all forms, routing
+   through `axl_malloc` / `axl_free`) and `__cxa_pure_virtual`.
+   Companion symbols `__cxa_atexit` (routes through `axl_atexit`),
+   `__dso_handle`, and the `.init_array` walker live in `libaxl.a`
+   (`src/runtime/axl-cxxabi.c`) so they're always present even
+   for pure-C apps that incidentally link a C++ helper from a
+   library.  See [`AXL-Lifecycle.md` §2.1.1](AXL-Lifecycle.md)
+   for static-initializer timing.
+
+**AArch64 needs the ARM bare-metal toolchain**
+(`aarch64-none-elf-g++`, ARM developer.arm.com, pinned to
+14.3.Rel1).  Run `scripts/install-arm-toolchain.sh` to fetch +
+verify + extract the ~96 MB tarball to `/opt/`.
+`scripts/install.sh` auto-detects the toolchain at standard paths
+and builds C++ support when present (no `--cpp` opt-in required).
+The Linux-ABI cross (`aarch64-linux-gnu-g++`) is NOT viable —
+its libstdc++ headers pull hosted typedefs.
+
+**Single package.**  `libaxl-cxx.a` + `axl-c++` + axlmm headers
+ship in the regular `axl-sdk.deb` / `.rpm` (no `-cpp` subpackage).
+`libaxl-cxx.a` doesn't link libstdc++ (the freestanding subset we
+support is header-only), so there's no runtime dependency
+escalation; the size delta is ~80 KB against a multi-MB base.
+Pure-C consumers can ignore the extra files — they pay no runtime
+cost.
+
+**Forbidden C++ features in axl-sdk-targeted code:** exceptions,
+RTTI (`typeid` / `dynamic_cast`), `<string>` / `<vector>` /
+`<stdexcept>`, `thread_local`, `<format>`.  All require
+libstdc++/libsupc++ symbols not available in our freestanding
+link.  Validated end-to-end in CPP1.3–1.5; matches every serious
+UEFI-C++ project's experience (Dell ePSA's `-fno-exceptions
+-fno-rtti` config).  Usable freestanding subset: `<array>`,
+`<span>`, `<string_view>`, `<type_traits>`, `<utility>`,
+`<initializer_list>`, `<new>`, `<optional>`, `<variant>`,
+`<expected>` (C++23) + header-only pieces of `<algorithm>` /
+`<numeric>` / `<functional>`.  See
+[`AXLMM-Design.md` §"Toolchain & constraints"](AXLMM-Design.md#toolchain--constraints)
+for the full list.
+
+#### Wrapper-class library (`axlmm`) — design done, implementation deferred
+
+A sibling C++ wrapper library — `axlmm`, modeled on glibmm —
+adds ergonomic enhancements (RAII handles, sticky error chains,
+`std::expected` factories, range-for adapters) on top of the C
+API.  **Implementation is deferred indefinitely until a real C++
+consumer surfaces usage patterns that inform the wrapper design**;
+the spec is captured in [`AXLMM-Design.md`](AXLMM-Design.md) so
+implementation can resume from a known starting point.
+Reasoning: glibmm came after glib had four years of consumer
+evolution; designing `axlmm` wrappers without a real consumer
+risks wrapping the wrong things.
+
+#### First C++ consumer: AGT
+
+The AGT widget toolkit
+([`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md),
+separate repo `aximcode/agt`) builds in C++ on top of axl-sdk's
+shipped C++ toolchain.  **AGT calls the axl-sdk C API directly**
+— no `axlmm` wrapper dependency in v0.1.  `extern "C"`
+declarations in axl-sdk headers make C++ → C calls zero-ceremony;
+`AXL_AUTOPTR(Type)` (a GCC cleanup attribute macro) gives RAII
+for owned C handles.  AGT's actual usage patterns will inform any
+future axlmm implementation.
 
 ### Async-op cancellation
 

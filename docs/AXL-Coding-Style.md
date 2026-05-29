@@ -18,13 +18,33 @@ the `include/axl/` boundary.
 |---------|-----------|---------|-----------------|
 | Functions | `axl_snake_case` | `axl_hash_table_new` | `g_hash_table_new` |
 | Types | `AxlPascalCase` (no suffix) | `AxlHashTable` | `GHashTable` |
-| Macros/constants | `AXL_SCREAMING_CASE` | `AXL_CFG_BOOL` | `G_DEFINE_TYPE` |
+| Macros/constants | `AXL_<MODULE>_SCREAMING_CASE` | `AXL_MATH_PI`, `AXL_GFX_BLACK`, `AXL_CFG_BOOL` | `G_DEFINE_TYPE` |
 | Enum values | `AXL_SCREAMING_CASE` | `AXL_IO_READ` | `G_IO_STATUS_NORMAL` |
 | Struct members | `snake_case` | `stream->ctx` | `string->str` |
 | Local variables | `snake_case` | `char *line` | |
 | Parameters | `snake_case` | `const char *key` | |
 | Static/file scope | `snake_case` | `static bool verbose` | |
 | Static const tables | `snake_case` (no `k`-prefix) | `static const AxlArgsNode verbs[]` | |
+
+### Module-prefix all public macros
+
+Public macros and named constants take a module prefix between
+`AXL_` and the rest of the name — `AXL_MATH_PI`, `AXL_GFX_BLACK`,
+`AXL_INPUT_BUTTON_LEFT`, `AXL_FONT_MONOSPACE`.  This applies to
+all module-scoped macros in public headers, including math
+constants (`AXL_MATH_PI`, `AXL_MATH_TWO_PI`, etc.), color palette
+entries (`AXL_GFX_RED`), bitfield masks (`AXL_INPUT_MOD_SHIFT`),
+and tunables.
+
+The only exception is project-wide infrastructure that doesn't
+belong to any module — `AXL_OK` / `AXL_ERR` (umbrella status),
+`AXL_APP` (entry-point macro).  These live in `<axl/axl-macros.h>`
+and don't need a module prefix because no module owns them.
+
+Module-prefixed names make grep + IDE-jump and "which header
+defines this?" trivial, and prevent the kind of bare-`AXL_PI`
+collision an unrelated module would have introduced if it ever
+needed a `PI`-named constant.
 
 ## Types — Standard C Only in Public API
 

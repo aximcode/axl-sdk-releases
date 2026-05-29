@@ -41,6 +41,31 @@ helper, has burned us before.
   AXL_TLS=1 make ARCH=x64 BUILD=RELEASE PREFIX=out/native-x64-release
   ```
 
+- **clang-tidy is clean locally.** The CI workflow's `lint` job
+  runs `clang-tidy` with `WarningsAsErrors: '*'`; the unit /
+  integration suites above don't exercise it. This step has been
+  the post-tag failure mode TWICE in a row (v0.18.0 → v0.18.1,
+  v0.19.0 → v0.19.1): Release published artifacts cleanly, then
+  CI flagged a finding and required a follow-up patch release.
+  Run the same command CI runs before tagging, so any findings
+  surface BEFORE the artifacts are public:
+
+  ```sh
+  rm -f compile_commands.json
+  bear -- make tests tools
+  find src -name '*.c' \
+      -not -path '*/backend/*' \
+      -not -name 'axl-mbedtls-platform.c' \
+      -print0 \
+    | xargs -0 clang-tidy -p . -quiet
+  echo "exit=$?"   # must be 0
+  ```
+
+  Fix any errors and re-run. If the only findings are warnings
+  (not errors), CI is fine — `WarningsAsErrors: '*'` in
+  `.clang-tidy` only escalates the checks the config enables; the
+  `2 warnings generated` lines per file are noise.
+
 ## Cut the release
 
 ### 1. Bump the version
@@ -261,6 +286,35 @@ gh release view vX.Y.Z --repo aximcode/axl-sdk-releases
 Should show the release page with `axl-sdk.deb`, `axl-sdk.rpm`,
 `axl-sdk-tools-{x64,aa64}.tar.gz`,
 `axl-sdk-host-tools.{tar.gz,deb}`, and `SHA256SUMS` attached.
+
+The `.deb` / `.rpm` packages include the full C and C++ surface
+when CI builds with the ARM bare-metal toolchain cached
+(`scripts/install-arm-toolchain.sh`).  Specifically, each
+package contains:
+
+- C bits (always): `axl-cc` driver, `libaxl.a` per arch,
+  `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
+  CMake config, pkg-config, JSON5 sidecars.
+- C++ bits (when toolchain present at build time): `axl-c++`
+  driver, `libaxl-cxx.a` per arch.  `libaxl-cxx.a` doesn't link
+  libstdc++ so there's no runtime-dependency escalation on the
+  package — pure-C consumers can ignore the extra files.
+
+CI cache invalidation: the ARM toolchain tarball is keyed on
+its pinned version (`14.3.rel1` at writing).  Bump the pin in
+`scripts/install-arm-toolchain.sh` to force a re-fetch.  Verify
+both packages contain `libaxl-cxx.a` after a release build:
+
+```sh
+dpkg-deb -c axl-sdk_*_amd64.deb | grep libaxl-cxx
+rpm -qpl axl-sdk-*.x86_64.rpm | grep libaxl-cxx
+```
+
+If `libaxl-cxx.a` is missing, the build host either didn't have
+the ARM bare-metal toolchain available or `install.sh`'s
+auto-detect failed.  See
+[`AXL-SDK-Design.md` §"C++ support"](AXL-SDK-Design.md) for the
+toolchain story.
 
 ### 8. Get back on `main`
 

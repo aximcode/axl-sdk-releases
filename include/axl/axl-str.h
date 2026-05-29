@@ -709,6 +709,44 @@ axl_strv_equal(
 );
 
 // ---------------------------------------------------------------------------
+// UTF-8 iteration
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Decode one UTF-8 codepoint from a string.
+ *
+ * Reads up to 4 bytes from @a s, decodes the leading codepoint into
+ * @a *out_codepoint, and returns the number of bytes consumed.
+ *
+ * Behavior:
+ *   - End of string (s == NULL or *s == '\0'): returns 0; leaves
+ *     *out_codepoint untouched.  Use this as the iteration sentinel.
+ *   - Well-formed 1/2/3/4-byte sequence: returns 1/2/3/4 with the
+ *     codepoint in the appropriate range (U+0000..U+10FFFF).
+ *   - Invalid lead byte, truncated continuation, or out-of-range
+ *     codepoint: returns 1 and sets *out_codepoint = 0xFFFD
+ *     (REPLACEMENT CHARACTER).  Caller advances by 1 to resynchronize.
+ *
+ * Iteration pattern:
+ *
+ *     const char *p = text;
+ *     uint32_t    cp;
+ *     size_t      n;
+ *     while ((n = axl_utf8_decode(p, &cp)) > 0) {
+ *         use(cp);
+ *         p += n;
+ *     }
+ *
+ * @return number of bytes consumed (1-4), or 0 at end of string /
+ *         on NULL inputs.
+ */
+size_t
+axl_utf8_decode(
+    const char  *s,              ///< UTF-8 source (NUL-terminated)
+    uint32_t    *out_codepoint   ///< [out] decoded codepoint, or 0xFFFD on invalid
+);
+
+// ---------------------------------------------------------------------------
 // UTF-8 <-> UCS-2 conversion
 // ---------------------------------------------------------------------------
 

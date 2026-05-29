@@ -61,6 +61,41 @@ $ axl-cc hello.c -o hello.efi    # 11KB binary, zero external deps
 Include `<axl.h>` for the full API, or individual headers for specific
 modules (e.g., `<axl/axl-mem.h>`, `<axl/axl-net.h>`).
 
+### C++ also works
+
+axl-sdk ships first-class C++ support: pass `.cpp` to `axl-cc` (or
+use the `axl-c++` alias) and the same library works from C++ with
+RAII handles via `AXL_AUTOPTR`, type-safe enums, and `<span>` /
+`<string_view>` / `<expected>` for ergonomic API boundaries.
+
+```cpp
+#include <axl.h>
+
+int main(int, char **) {
+    AXL_AUTOPTR(AxlLoop) loop = axl_loop_new();   // auto-freed at scope exit
+    axl_printf("Hello from C++!\n");
+    return 0;
+}
+```
+
+```
+$ axl-c++ hello.cpp -o hello.efi
+```
+
+Compile-time hard defaults: `-std=c++20 -fno-exceptions -fno-rtti
+-fno-threadsafe-statics` (freestanding-UEFI link can't satisfy
+libsupc++).  Usable libstdc++ subset is header-only: `<array>`,
+`<span>`, `<string_view>`, `<type_traits>`, `<utility>`, `<optional>`,
+`<variant>`, `<expected>`, etc.  AArch64 needs the ARM bare-metal
+`aarch64-none-elf-g++` toolchain — `scripts/install-arm-toolchain.sh`
+fetches it.
+
+See [`AXL-SDK-Design.md` §"C++ support"](docs/AXL-SDK-Design.md) +
+[`AXLMM-Design.md` §"Toolchain & constraints"](docs/AXLMM-Design.md)
+for the full subset and forbidden-features list.  The
+[AGT widget toolkit](https://github.com/aximcode/agt) is the first
+C++ consumer.
+
 ## AXL Library API
 
 | Category | Functions | GLib equivalent |

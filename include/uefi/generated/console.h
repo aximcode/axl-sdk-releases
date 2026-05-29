@@ -110,6 +110,81 @@ typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
  EFI_EVENT                             WaitForKey;
 } EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
 
+typedef struct _EFI_SIMPLE_POINTER_MODE {
+ UINT64                    ResolutionX;
+ UINT64                    ResolutionY;
+ UINT64                    ResolutionZ;
+ BOOLEAN                   LeftButton;
+ BOOLEAN                   RightButton;
+} EFI_SIMPLE_POINTER_MODE;
+
+typedef struct _EFI_SIMPLE_POINTER_STATE {
+ INT32                  RelativeMovementX;
+ INT32                  RelativeMovementY;
+ INT32                  RelativeMovementZ;
+ BOOLEAN                LeftButton;
+ BOOLEAN                RightButton;
+} EFI_SIMPLE_POINTER_STATE;
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_SIMPLE_POINTER_RESET) (
+ IN EFI_SIMPLE_POINTER_PROTOCOL              *This,
+ IN BOOLEAN                                  ExtendedVerification
+ );
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_SIMPLE_POINTER_GET_STATE) (
+ IN EFI_SIMPLE_POINTER_PROTOCOL              *This,
+ OUT EFI_SIMPLE_POINTER_STATE                *State
+ );
+
+typedef struct _EFI_SIMPLE_POINTER_PROTOCOL {
+ EFI_SIMPLE_POINTER_RESET                    Reset;
+ EFI_SIMPLE_POINTER_GET_STATE                GetState;
+ EFI_EVENT                                   WaitForInput;
+ void  *Mode;
+} EFI_SIMPLE_POINTER_PROTOCOL;
+
+typedef struct _EFI_ABSOLUTE_POINTER_MODE {
+ UINT64                     AbsoluteMinX;
+ UINT64                     AbsoluteMinY;
+ UINT64                     AbsoluteMinZ;
+ UINT64                     AbsoluteMaxX;
+ UINT64                     AbsoluteMaxY;
+ UINT64                     AbsoluteMaxZ;
+ UINT32                     Attributes;
+} EFI_ABSOLUTE_POINTER_MODE;
+
+typedef struct _EFI_ABSOLUTE_POINTER_STATE {
+    UINT64                 CurrentX;
+    UINT64                 CurrentY;
+    UINT64                 CurrentZ;
+    UINT32                 ActiveButtons;
+   } EFI_ABSOLUTE_POINTER_STATE;
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_ABSOLUTE_POINTER_RESET) (
+ IN EFI_ABSOLUTE_POINTER_PROTOCOL            *This,
+ IN BOOLEAN                                  ExtendedVerification
+ );
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_ABSOLUTE_POINTER_GET_STATE) (
+ IN EFI_ABSOLUTE_POINTER_PROTOCOL            *This,
+ OUT EFI_ABSOLUTE_POINTER_STATE              *State
+ );
+
+typedef struct _EFI_ABSOLUTE_POINTER_PROTOCOL {
+ EFI_ABSOLUTE_POINTER_RESET                     Reset;
+ EFI_ABSOLUTE_POINTER_GET_STATE                 GetState;
+ EFI_EVENT                                      WaitForInput;
+ EFI_ABSOLUTE_POINTER_MODE                      *Mode;
+} EFI_ABSOLUTE_POINTER_PROTOCOL;
+
 typedef struct _EFI_PIXEL_BITMASK {
   UINT32              RedMask;
   UINT32              GreenMask;

@@ -8,3 +8,18 @@
 Diagnostics:
   UnusedIncludes: None
   MissingIncludes: None
+
+# Provide the project's -I paths to clangd as a baseline so newly-
+# added headers without a parent .c entry in compile_commands.json
+# still resolve <axl/...> + <src/backend/...> + deps/* includes.
+# Mirrors the INCLUDES variable in Makefile (line 192) plus the TLS
+# / net additions (line 199-201). Safe to apply globally — these
+# paths don't conflict with any other file group; clangd merges
+# them with whatever compile_commands.json provides.
+CompileFlags:
+  Add:
+    - -Iinclude
+    - -Isrc/backend
+    - -Ideps/mbedtls/include
+    - -Isrc/net
+    - -Iinclude/compat

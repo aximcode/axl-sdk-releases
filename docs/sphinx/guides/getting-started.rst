@@ -93,6 +93,86 @@ EFI binary, and boots QEMU with OVMF::
 
 You should see ``Hello from UEFI!`` on the QEMU console.
 
+C++ Quickstart
+--------------
+
+axl-sdk ships first-class C++ support: pass ``.cpp`` to
+``axl-cc`` and it dispatches to ``g++`` automatically, or use the
+``axl-c++`` alias (which forces C++ mode for every source
+regardless of extension).
+
+Create ``hello.cpp``:
+
+.. code-block:: cpp
+
+    #include <axl.h>
+
+    int main(int, char **) {
+        AXL_AUTOPTR(AxlLoop) loop = axl_loop_new();   // RAII; freed at scope exit
+        axl_printf("Hello from C++!\n");
+        return 0;
+    }
+
+Build::
+
+    axl-c++ hello.cpp -o hello.efi
+    # or equivalently:
+    axl-cc hello.cpp -o hello.efi
+
+The C++ toolchain bakes in the freestanding-UEFI flag set:
+``-std=c++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics``
+plus per-arch additions (``-ffixed-x18`` on AArch64,
+``-mno-red-zone`` on X64).  These are hard defaults — consumers
+can't opt in to exceptions or RTTI because the freestanding link
+won't satisfy libsupc++ symbols.
+
+**AArch64 needs the ARM bare-metal toolchain**
+(``aarch64-none-elf-g++``).  axl-sdk ships an installer::
+
+    ./scripts/install-arm-toolchain.sh
+
+Fetches + sha256-verifies + extracts the pinned tarball to
+``/opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf/``.
+Idempotent — re-running on an already-installed system exits
+cleanly.  ``install.sh`` auto-detects this path and builds C++
+support when the toolchain is present.
+
+**Usable libstdc++ subset** (all header-only — no link dependency):
+
+- Always-freestanding: ``<type_traits>``, ``<utility>``,
+  ``<initializer_list>``, ``<new>``, ``<bit>``, ``<concepts>``,
+  ``<compare>``, ``<source_location>``, ``<cstddef>``,
+  ``<cstdint>``, ``<limits>``
+- Practically usable: ``<array>``, ``<span>``, ``<string_view>``,
+  ``<tuple>``, ``<optional>``, ``<variant>``, ``<expected>``
+  (C++23), header-only subsets of ``<algorithm>`` /
+  ``<numeric>`` / ``<functional>``
+
+**Forbidden** (require libsupc++/libstdc++ symbols we don't have):
+exceptions (``throw`` / ``catch``), RTTI (``typeid`` /
+``dynamic_cast``), ``<string>`` / ``<vector>`` / ``<unordered_map>``
+/ ``<stdexcept>``, ``thread_local``, ``<format>``.  See
+:doc:`axlmm-design` for the full constraint list + rationale.
+
+Mixed C/C++ projects work naturally — pass any combination of
+``.c`` and ``.cpp`` sources to ``axl-cc`` and the right compiler
+is invoked per file::
+
+    axl-cc app.cpp legacy.c helpers.cpp -o app.efi
+
+For staged builds where you ship your own static library, use
+``axl-cc -c`` for compile-only mode + ``ar rcs`` to archive +
+pass the ``.a`` to a final ``axl-cc`` link::
+
+    axl-cc -c lib1.cpp -o lib1.o
+    axl-cc -c lib2.cpp -o lib2.o
+    ar rcs libfoo.a lib1.o lib2.o
+    axl-cc app.cpp libfoo.a -o app.efi
+
+The `AGT widget toolkit <https://github.com/aximcode/agt>`_ is
+the first C++ consumer using this pattern (ships ``libagt.a``
+that consumer apps link against via ``axl-c++``).
+
 Next Steps
 ----------
 

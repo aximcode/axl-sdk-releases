@@ -4,6 +4,7 @@ build/
 out/
 deps/*
 !deps/mbedtls
+!deps/stb
 *.pyc
 __pycache__/
 tests/.last-pass-count

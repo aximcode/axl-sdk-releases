@@ -3,6 +3,73 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.20.0 — 2026-05-29
+
+This release adds three new public modules (AxlMath, AxlPixmap,
+AxlTtf), an AxlInput event module, a full C++ toolchain, and a
+broad 2D upgrade to AxlGfx. Pre-1.0, so the new gfx/input surface
+may still move in subsequent releases.
+
+### Added
+
+- **C++ support.** New `axl-c++` compiler driver and `libaxl-cxx.a`
+  per arch (operator `new`/`delete`, `__cxa_pure_virtual`). The
+  runtime now walks `.init_array` so C++ static initializers run
+  before `main`. `axl-cc` dispatches by file extension; `install.sh`
+  auto-detects the ARM bare-metal C++ toolchain (no opt-in flag).
+  `libaxl-cxx.a` does not link libstdc++, so pure-C consumers incur
+  no new runtime dependency. AArch64 library, `axl-cc`, and CMake
+  invocations now pass `-ffixed-x18`.
+
+- **AxlMath** — new module `<axl/axl-math.h>`. libm-free
+  `axl_sin`/`cos`/`sqrt`/`floor`/`ceil`/`fabs`/`fmod`/`ln`/`exp`/
+  `pow`/`atan`/`atan2`/`asin`/`acos`; `axl_lerp` + a 9-function
+  easing palette; `clamp`/`min`/`max`/`remap`/`step`/`smoothstep`;
+  bit math (`clz`/`ctz`/`popcount`/`log2i`/`round_up_pow2`);
+  saturated arithmetic (`sat_add_u8`/`sat_sub_u8`/`sat_mul_u16`);
+  geometry helpers (rect/segment/circle); `AxlVec2` + `AxlMat3`
+  linear algebra; math constants. Compile-time hardware fast paths
+  for sqrt/floor/ceil/fabs and an FMA Horner evaluation are gated
+  on the target `-march`.
+
+- **AxlPixmap** — new module. Image decode via stb_image
+  (PNG/JPG/GIF/BMP).
+
+- **AxlTtf** — new module. Vector text via stb_truetype, including
+  glyph rasterization (`axl_ttf_draw`).
+
+- **AxlInput** — new module `<axl/axl-input.h>`. Input event types
+  attached to the event loop via the source pattern:
+  `axl_input_attach_mouse` (EFI_SIMPLE_POINTER_PROTOCOL),
+  `axl_input_attach_key`, `axl_input_attach_touch`.
+
+- **AxlGfx 2D upgrade.** Line / rect-outline / polyline primitives
+  (Bresenham); alpha compositing with RGB convenience macros and a
+  named color palette; double-buffering (`AxlGfxBuffer` + draw-target
+  redirect) and `axl_gfx_get_current_target()` to save/restore the
+  active target across nested callers; push/pop clipping-rectangle
+  stack applied to fill/blit/draw_text; `AxlGfxPath` with scanline
+  `fill_path` + `fill_rounded_rect`; an affine transform stack
+  integrated path-side; `axl_gfx_fill_rect_i` (signed-coordinate
+  variant for off-screen widget rendering). Font handling refactored
+  into an `AxlFont`/`AxlGlyph` abstraction with font-metrics queries
+  for text layout; GNU Unifont 16.0.04 added as a second built-in
+  font; text rendering is now UTF-8-first (`axl_utf8_decode`).
+
+- **`axl-cc -c`** (compile-only) plus `.o`/`.a` pass-through, for
+  staged/multi-file builds.
+
+- **`run-qemu.sh --gpu`** flag with arch-aware GPU device wiring;
+  `--screenshot` now honors the destination extension (PIL fallback
+  for PNG).
+
+### Changed
+
+- **All public macros now carry a module prefix.** Math macros were
+  renamed accordingly (e.g. `AXL_MATH_PI`); bare `AXL_`-prefixed
+  names are reserved for project-wide infrastructure. Consumers using
+  the previous unprefixed math macros must update to the new names.
+
 ## 0.19.2 — 2026-05-23
 
 ### Added

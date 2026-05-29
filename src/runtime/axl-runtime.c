@@ -14,6 +14,7 @@
 #include "../backend/axl-backend.h"
 #include "../posix/axl-app-internal.h"
 #include "axl-atexit-internal.h"
+#include "axl-cxxabi-internal.h"
 #include "axl-registry-internal.h"
 #include "axl-signal-internal.h"
 #include <axl/axl-runtime.h>
@@ -138,6 +139,11 @@ _axl_init(void *image_handle, void *system_table)
     _axl_registry_init();
     _axl_atexit_init();
     _axl_args_init(image_handle);
+
+    /* C++ global constructors fire last, after the rest of the
+     * runtime is up so ctors may use axl_printf / axl_malloc / etc.
+     * No-op for pure-C apps (empty .init_array). */
+    _axl_cxxabi_run_init_array();
 }
 
 void

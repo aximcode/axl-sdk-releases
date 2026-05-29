@@ -222,6 +222,18 @@
     {"name": "EFI_INPUT_READ_KEY",           "kind": "funcptr"},
     {"name": "EFI_SIMPLE_TEXT_INPUT_PROTOCOL", "kind": "struct"},
 
+    {"name": "EFI_SIMPLE_POINTER_MODE",       "kind": "struct"},
+    {"name": "EFI_SIMPLE_POINTER_STATE",      "kind": "struct"},
+    {"name": "EFI_SIMPLE_POINTER_RESET",      "kind": "funcptr"},
+    {"name": "EFI_SIMPLE_POINTER_GET_STATE",  "kind": "funcptr"},
+    {"name": "EFI_SIMPLE_POINTER_PROTOCOL",   "kind": "struct"},
+
+    {"name": "EFI_ABSOLUTE_POINTER_MODE",         "kind": "struct"},
+    {"name": "EFI_ABSOLUTE_POINTER_STATE",        "kind": "struct"},
+    {"name": "EFI_ABSOLUTE_POINTER_RESET",        "kind": "funcptr"},
+    {"name": "EFI_ABSOLUTE_POINTER_GET_STATE",    "kind": "funcptr"},
+    {"name": "EFI_ABSOLUTE_POINTER_PROTOCOL",     "kind": "struct"},
+
     {"name": "EFI_PIXEL_BITMASK",                         "kind": "struct"},
     {"name": "EFI_GRAPHICS_PIXEL_FORMAT",                  "kind": "enum"},
     {"name": "EFI_GRAPHICS_OUTPUT_MODE_INFORMATION",       "kind": "struct"},

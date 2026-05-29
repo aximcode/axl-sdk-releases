@@ -18,13 +18,33 @@ SDK_DIR="$(dirname "$SCRIPT_DIR")"
 PREFIX="$SDK_DIR/out"
 LIBAXL_DIR="$SDK_DIR"
 BUILD_ARCHS="all"
+# C++ support mode: "auto" (default — build if toolchain present, skip
+# silently otherwise), "require" (--cpp: fail loud if missing), "skip"
+# (--no-cpp: don't build even if present).
+CPP_MODE="auto"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)      PREFIX="$2"; shift 2 ;;
         --arch)        BUILD_ARCHS="$2"; shift 2 ;;
+        --cpp)         CPP_MODE="require"; shift ;;
+        --no-cpp)      CPP_MODE="skip"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--prefix DIR] [--arch x64|aa64|all]"
+            cat <<HELP
+Usage: $0 [--prefix DIR] [--arch x64|aa64|all] [--cpp|--no-cpp]
+
+C++ support is built automatically when the C++ toolchain is
+present (aarch64-none-elf-g++ at /opt for AArch64, host g++ for
+x64). Otherwise the install is C-only — no warning, no error.
+
+  --cpp       Require C++ support; fail loud if toolchain missing.
+              Useful in CI / scripted setups where pure-C is wrong.
+  --no-cpp    Skip C++ support even if the toolchain is present.
+              Useful for minimal C-only installs.
+
+To acquire the AArch64 C++ toolchain (96 MB tarball under /opt):
+  ./scripts/install-arm-toolchain.sh
+HELP
             exit 0 ;;
         *)
             echo "Unknown option: $1" >&2
@@ -46,6 +66,31 @@ for tool in gcc ld ar objcopy; do
         exit 1
     fi
 done
+
+# C++ toolchain detection.  In "auto" mode the absence of the
+# toolchain is silent — pure-C consumers see no diagnostics for a
+# feature they didn't ask for.  In "require" mode (--cpp) the same
+# absence is a hard error with the install instruction.  "skip"
+# (--no-cpp) bypasses detection entirely.
+ARM_GXX="/opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-g++"
+BUILD_CPP=0
+if [[ "$CPP_MODE" != "skip" ]]; then
+    cpp_missing=""
+    if ! command -v g++ &>/dev/null; then
+        cpp_missing="g++ not found in PATH (needed for x64 C++ builds)"
+    elif [[ ! -x "$ARM_GXX" ]]; then
+        cpp_missing="ARM bare-metal g++ not found at $ARM_GXX"
+    fi
+    if [[ -z "$cpp_missing" ]]; then
+        BUILD_CPP=1
+        log_info "C++ toolchain detected — will build libaxl-cxx.a + install axl-c++"
+    elif [[ "$CPP_MODE" == "require" ]]; then
+        log_error "$cpp_missing"
+        log_error "Run scripts/install-arm-toolchain.sh first, or omit --cpp."
+        exit 1
+    fi
+    # auto-mode + missing toolchain: silently fall through to C-only
+fi
 
 # Resolve architectures
 case "$BUILD_ARCHS" in
@@ -108,12 +153,16 @@ for arch in "${ARCHES[@]}"; do
     make -C "$LIBAXL_DIR" \
         ARCH="$arch" PREFIX="$local_prefix" BUILD=RELEASE \
         ${AXL_TLS:+AXL_TLS=$AXL_TLS} \
+        $( [[ "$BUILD_CPP" == "1" ]] && echo "AXL_CPP=1" ) \
         -j "$(nproc)" 2>&1 | tail -3
 
     mkdir -p "$PREFIX/lib/axl/$arch"
     cp "$LIBAXL_DIR/$local_prefix/lib/libaxl.a"              "$PREFIX/lib/axl/$arch/"
     cp "$LIBAXL_DIR/$local_prefix/build/axl-crt0-native.o"   "$PREFIX/lib/axl/$arch/"
     cp "$LIBAXL_DIR/$local_prefix/build/axl-crt0-minimal.o"  "$PREFIX/lib/axl/$arch/"
+    if [[ "$BUILD_CPP" == "1" ]]; then
+        cp "$LIBAXL_DIR/$local_prefix/lib/libaxl-cxx.a"      "$PREFIX/lib/axl/$arch/"
+    fi
 
     # GCC needs: assembly CRT0, reloc object, linker script
     if [[ "$arch" == "aa64" ]]; then
@@ -243,7 +292,10 @@ if(AXL_ARCH STREQUAL "x64")
     set(AXL_GCC_CRT0 "${AXL_LIB_DIR}/axl-crt0-gcc-x86_64.o")
 elseif(AXL_ARCH STREQUAL "aa64")
     set(AXL_CROSS "aarch64-linux-gnu-")
-    set(AXL_GCC_ARCH "")
+    # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves x18
+    # as the platform register; without this gcc may clobber it,
+    # leading to post-ExitBootServices OS-side corruption.
+    set(AXL_GCC_ARCH -ffixed-x18)
     set(AXL_PE_TARGET "pei-aarch64-little")
     set(AXL_EFI_LDS "${AXL_SDK_DIR}/lib/axl/elf_aarch64_efi.lds")
     set(AXL_GCC_CRT0 "${AXL_LIB_DIR}/axl-crt0-gcc-aarch64.o")
@@ -428,395 +480,17 @@ log_info "Installed axl-config.cmake"
 # Generate axl-cc
 # ---------------------------------------------------------------------------
 
-cat > "$PREFIX/bin/axl-cc" << 'NATIVE_WRAPPER'
-#!/bin/bash
-# axl-cc — compile C source to UEFI .efi binary
-set -euo pipefail
-
-# `cd -P` resolves symlinks physically — when axl-cc is invoked
-# through /bin/axl-cc on a distro where /bin is a symlink to
-# /usr/bin (Fedora/Arch/etc., usrmerge), plain `cd` preserves the
-# logical /bin path and SDK_DIR resolves to / instead of /usr.
-# The result is --version printing "unknown" (and worse, missing
-# include/lib lookups) under sudo or any other invocation that
-# hits the /bin alias.
-SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
-SDK_DIR="$(dirname "$SCRIPT_DIR")"
-
-ARCH="x64"
-TYPE="app"
-BUILD="release"
-RUNTIME="full"
-ENTRY=""
-OUTPUT=""
-VERBOSE=false
-RUN=false
-RUN_ARGS=()
-SOURCES=()
-CFLAGS_EXTRA=()
-EMBEDS=()
-SERVICE_NAME=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --arch)     ARCH="$2"; shift 2 ;;
-        --type)     TYPE="$2"; shift 2 ;;
-        --entry)    ENTRY="$2"; shift 2 ;;
-        --debug)    BUILD="debug"; shift ;;
-        --release)  BUILD="release"; shift ;;
-        --minimal-runtime) RUNTIME="minimal"; shift ;;
-        --embed)    EMBEDS+=("$2"); shift 2 ;;
-        --service)  SERVICE_NAME="$2"; shift 2 ;;
-        --run)      RUN=true; shift
-                    # Remaining args after --run are passed to run-qemu.sh
-                    while [[ $# -gt 0 ]]; do
-                        RUN_ARGS+=("$1"); shift
-                    done ;;
-        -o)         OUTPUT="$2"; shift 2 ;;
-        --verbose|-v) VERBOSE=true; shift ;;
-        -I|-D|-include)
-            CFLAGS_EXTRA+=("$1" "$2"); shift 2 ;;
-        -I*|-D*|-W*|-Wno-*)
-            CFLAGS_EXTRA+=("$1"); shift ;;
-        -f*)
-            CFLAGS_EXTRA+=("$1"); shift ;;
-        --version)
-            VER=$(cat "$SDK_DIR/share/axl/version" 2>/dev/null || echo "unknown")
-            DATE=$(cat "$SDK_DIR/share/axl/build-date" 2>/dev/null || echo "unknown")
-            echo "axl-cc $VER (gcc, built $DATE)"
-            exit 0 ;;
-        -h|--help)
-            cat <<HELP
-axl-cc -- compile C source to UEFI binary (.efi)
-
-Usage: axl-cc [OPTIONS] source.c [source2.c ...] [-o output.efi]
-       axl-cc [OPTIONS] source.c --run [run-qemu args...]
-
-Options:
-  --arch x64|aa64       Target architecture (default: x64)
-  --type app|driver|runtime  Image type (default: app)
-  --entry NAME          Custom entry point for drivers
-  --debug               Debug build (-Og, DWARF, leak tracking)
-  --release             Release build (-Os, DWARF, no leak tracking) [default]
-  --minimal-runtime     Link against axl-crt0-minimal.o (no registry,
-                        no atexit, no signal notify, no default loop).
-                        App-type only. See docs/AXL-Lifecycle.md §10.4.
-  --embed PATH[=NAME]   Embed an arbitrary binary blob (driver .efi,
-                        CA bundle, static config, anything) into the
-                        output. Generates the .incbin sidecar and
-                        links it. NAME defaults to the basename of
-                        PATH with non-identifier chars replaced by '_'.
-                        Symbols emitted: axl_embedded_<NAME>{,_end} —
-                        match <axl/axl-embed.h>'s AXL_EMBED_DECLARE.
-                        Repeatable.
-  --service NAME        Single-source-file AxlService build. Compiles
-                        the input twice — once as a driver image
-                        (-DAXL_SERVICE_BUILD_DRIVER, output
-                        NAME-dxe.efi) and once as an app embedding
-                        the driver (output NAME.efi). Pair with the
-                        AXL_SERVICE(svc) macro in the source. -o is
-                        ignored; output goes to NAME{,-dxe}.efi in
-                        the current directory.
-  --run                 Build and run in QEMU (remaining args passed to run-qemu.sh)
-  -o FILE               Output filename (default: <source>.efi)
-  -I DIR                Add include search path
-  -DNAME[=VALUE]        Define preprocessor macro
-  -Wfoo / -Wno-foo      Warning flags
-  -ffoo                 Compiler flags
-  -v, --verbose         Print compiler/linker commands
-  --version             Show version and build info
-  -h, --help            Show this help
-
-Examples:
-  axl-cc hello.c -o hello.efi
-  axl-cc --debug hello.c -o hello.efi
-  axl-cc hello.c --run
-  axl-cc hello.c --run --net --timeout 30
-  axl-cc --embed mydriver.efi=my_driver launch.c -o launch.efi
-  axl-cc --embed isrgrootx1.pem=ca_bundle myapp.c -o myapp.efi
-  axl-cc --service my-service service.c
-
-Toolchain: gcc
-HELP
-            exit 0 ;;
-        *)      SOURCES+=("$1"); shift ;;
-    esac
-done
-
-if [[ ${#SOURCES[@]} -eq 0 ]]; then
-    echo "Usage: axl-cc [OPTIONS] source.c [-o output.efi]  (try --help)" >&2
-    exit 1
-fi
-
-for src in "${SOURCES[@]}"; do
-    if [[ ! -f "$src" ]]; then
-        echo "ERROR: source file not found: $src" >&2
-        exit 1
-    fi
-done
-
-# --service NAME: dual-compile the source into a driver image AND a
-# launcher app that embeds it. The source uses AXL_SERVICE(svc) which
-# emits DriverEntry under -DAXL_SERVICE_BUILD_DRIVER and main()
-# otherwise. axl-cc reinvokes itself twice with appropriate flags.
-if [[ -n "$SERVICE_NAME" ]]; then
-    # NAME must match the svc identifier passed to AXL_SERVICE(svc) —
-    # both sides need to agree on the embed symbol axl_embedded_<NAME>.
-    if ! [[ "$SERVICE_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
-        echo "ERROR: --service: NAME must be a C identifier (matches the AXL_SERVICE(svc) macro arg): '$SERVICE_NAME'" >&2
-        exit 1
-    fi
-    fwd=("--arch" "$ARCH")
-    [[ "$BUILD"   == "debug" ]]   && fwd+=("--debug")
-    [[ "$RUNTIME" == "minimal" ]] && fwd+=("--minimal-runtime")
-    [[ "$VERBOSE" == "true" ]]    && fwd+=("--verbose")
-    for x in ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}; do
-        fwd+=("$x")
-    done
-
-    # Pass 1: driver image
-    "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
-        --type driver -DAXL_SERVICE_BUILD_DRIVER \
-        "${SOURCES[@]}" -o "${SERVICE_NAME}-dxe.efi" \
-        || { echo "ERROR: --service: driver build failed" >&2; exit 1; }
-
-    # Pass 2: launcher app, embedding the driver from pass 1
-    exec "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
-        --embed "${SERVICE_NAME}-dxe.efi=${SERVICE_NAME}" \
-        "${SOURCES[@]}" -o "${SERVICE_NAME}.efi"
-fi
-
-[[ -z "$OUTPUT" ]] && OUTPUT="${SOURCES[0]%.c}.efi"
-
-LIB_DIR="$SDK_DIR/lib/axl/$ARCH"
-if [[ ! -d "$LIB_DIR" ]]; then
-    echo "ERROR: no SDK libraries for arch '$ARCH' in $LIB_DIR" >&2
-    exit 1
-fi
-
-# Image type → entry + CRT0
-case "$TYPE" in
-    app)     ENTRY="${ENTRY:-_AxlEntry}" ;;
-    driver)  ENTRY="${ENTRY:-DriverEntry}" ;;
-    runtime) ENTRY="${ENTRY:-DriverEntry}" ;;
-    *)  echo "ERROR: unknown type '$TYPE' (use: app, driver, runtime)" >&2; exit 1 ;;
-esac
-
-run_cmd() {
-    if [[ "$VERBOSE" == "true" ]]; then
-        echo "+ $*" >&2
-    fi
-    "$@"
-}
-
-# Build mode flags. Both modes carry DWARF debug info — release
-# trades only the leak tracking and goes to -Os, debug stays at
-# -Og + AXL_MEM_DEBUG. The .efi itself stays slim either way (debug
-# DWARF lives in the side-by-side .debug file referenced by the PE
-# debug data directory; pe-set-debug wires this up at link time).
-if [[ "$BUILD" == "debug" ]]; then
-    OPT_FLAGS="-Og -g -gdwarf -DAXL_MEM_DEBUG"
-else
-    OPT_FLAGS="-Os -g -gdwarf -DNDEBUG"
-fi
-
-if [[ "$VERBOSE" == "true" ]]; then
-    echo "[axl-cc] arch=$ARCH type=$TYPE build=$BUILD toolchain=gcc entry=$ENTRY output=$OUTPUT" >&2
-fi
-
-TMPDIR="/tmp/axl-cc-$$"
-mkdir -p "$TMPDIR"
-
-# Architecture-specific settings
-case "$ARCH" in
-    x64)  CROSS=""; PE_TARGET="pei-x86-64"
-          GCC_ARCH="-mno-red-zone -march=x86-64"
-          EFI_LDS="$SDK_DIR/lib/axl/elf_x86_64_efi.lds"
-          GCC_CRT0="$LIB_DIR/axl-crt0-gcc-x86_64.o" ;;
-    aa64) CROSS="aarch64-linux-gnu-"; PE_TARGET="pei-aarch64-little"
-          GCC_ARCH=""
-          EFI_LDS="$SDK_DIR/lib/axl/elf_aarch64_efi.lds"
-          GCC_CRT0="$LIB_DIR/axl-crt0-gcc-aarch64.o" ;;
-esac
-
-RELOC_OBJ="$LIB_DIR/axl-reloc.o"
-DEBUG_INFO_OBJ="$LIB_DIR/axl-debug-info.o"
-PE_SET_DEBUG="$SDK_DIR/bin/pe-set-debug"
-
-# Compile
-OBJS=()
-for src in "${SOURCES[@]}"; do
-    obj="$TMPDIR/$(basename "${src%.c}").o"
-
-    run_cmd ${CROSS}gcc \
-        -ffreestanding -fshort-wchar -fno-builtin \
-        -fno-stack-protector -fno-omit-frame-pointer -fpic $GCC_ARCH \
-        -ffunction-sections -fdata-sections \
-        $OPT_FLAGS -Wall \
-        -DAXL_BACKEND_NATIVE \
-        -isystem "$SDK_DIR/include/axl-sdk" \
-        ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
-        -c "$src" -o "$obj" || { echo "ERROR: compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
-
-    OBJS+=("$obj")
-done
-
-# --embed: generate a tiny .s sidecar per blob and assemble it. The
-# emitted symbols (axl_embedded_<name>{,_end}) match the convention
-# <axl/axl-embed.h>'s AXL_EMBED_DECLARE / DATA / SIZE expects.
-for spec in ${EMBEDS[@]+"${EMBEDS[@]}"}; do
-    if [[ "$spec" == *"="* ]]; then
-        embed_path="${spec%%=*}"
-        embed_sym="${spec#*=}"
-    else
-        embed_path="$spec"
-        embed_base="$(basename "$embed_path")"
-        embed_base="${embed_base%%.*}"
-        embed_sym="$(printf '%s' "$embed_base" | sed 's/[^a-zA-Z0-9_]/_/g')"
-    fi
-
-    if [[ ! -f "$embed_path" ]]; then
-        echo "ERROR: --embed: file not found: $embed_path" >&2
-        rm -rf "$TMPDIR"; exit 1
-    fi
-    if ! [[ "$embed_sym" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
-        echo "ERROR: --embed: derived symbol '$embed_sym' is not a valid C identifier; pass --embed PATH=name explicitly" >&2
-        rm -rf "$TMPDIR"; exit 1
-    fi
-    # .incbin's argument is a quoted string literal; reject characters
-    # that would break out of it (", \) or split it across lines (\n,
-    # \r, NUL, other ctrl chars). Practically rare on UEFI build paths,
-    # but the filter is paranoia, not a soft limit — finish the job.
-    if [[ "$embed_path" == *[$'\x00-\x1f\x7f"\\']* ]]; then
-        echo "ERROR: --embed: path contains characters that can't be embedded in .incbin: $embed_path" >&2
-        rm -rf "$TMPDIR"; exit 1
-    fi
-
-    # Resolve to absolute so the path is independent of the invocation CWD
-    [[ "$embed_path" != /* ]] && embed_path="$PWD/$embed_path"
-
-    embed_s="$TMPDIR/embed_${embed_sym}.s"
-    cat > "$embed_s" <<EMBED_S
-    .section .rodata
-    .balign 8
-    .globl axl_embedded_${embed_sym}
-    .globl axl_embedded_${embed_sym}_end
-axl_embedded_${embed_sym}:
-    .incbin "${embed_path}"
-axl_embedded_${embed_sym}_end:
-
-    .section .note.GNU-stack, "", %progbits
-EMBED_S
-
-    embed_o="$TMPDIR/embed_${embed_sym}.o"
-    run_cmd ${CROSS}gcc -c "$embed_s" -o "$embed_o" \
-        || { echo "ERROR: --embed: assembly failed for $embed_path" >&2; rm -rf "$TMPDIR"; exit 1; }
-    OBJS+=("$embed_o")
-done
-
-# Link
-# App:    asm CRT0 → _AxlEntry (C CRT0 axl-crt0-native.o) → main
-# App (--minimal-runtime):
-#         asm CRT0 → _AxlEntry (C CRT0 axl-crt0-minimal.o) → main
-#         Minimal CRT0 skips registry/atexit/signal/default-loop setup.
-# Driver: asm CRT0 → _AxlEntry (aliased to user's $ENTRY via --defsym)
-#
-# Drivers can't link a C CRT0 (they pull in main()) and don't define
-# _AxlEntry directly, so we tell the linker that _AxlEntry is just
-# another name for the user's entry function (e.g. DriverEntry). This
-# keeps the asm CRT0's relocation step in the call path.
-LDFLAGS_EXTRA=()
-if [[ "$TYPE" == "app" ]]; then
-    if [[ "$RUNTIME" == "minimal" ]]; then
-        C_CRT0="$LIB_DIR/axl-crt0-minimal.o"
-    else
-        C_CRT0="$LIB_DIR/axl-crt0-native.o"
-    fi
-    CRT0_OBJS="$GCC_CRT0 $RELOC_OBJ $DEBUG_INFO_OBJ $C_CRT0"
-else
-    if [[ "$RUNTIME" == "minimal" ]]; then
-        echo "ERROR: --minimal-runtime is app-type only (use on --type app)" >&2
-        rm -rf "$TMPDIR"
-        exit 1
-    fi
-    CRT0_OBJS="$GCC_CRT0 $RELOC_OBJ $DEBUG_INFO_OBJ"
-    LDFLAGS_EXTRA+=("--defsym=_AxlEntry=$ENTRY")
-fi
-
-# PE/COFF subsystem code: 10=APPLICATION, 11=BOOT_SERVICE_DRIVER, 12=RUNTIME_DRIVER.
-# Loaded via the wrong path the firmware misroutes the entry point, leading to
-# crashes (KVM emulation failure / silent dispatch failures).
-case "$TYPE" in
-    app)     SUBSYSTEM=10 ;;
-    driver)  SUBSYSTEM=11 ;;
-    runtime) SUBSYSTEM=12 ;;
-esac
-
-SO_FILE="$TMPDIR/output.so"
-# --no-warn-rwx-segments: the .so is just an intermediate consumed by
-# objcopy → PE/COFF; no OS loads it, so the linker's RWX warning is a
-# false positive (the .efi has properly split per-section permissions).
-# --no-undefined: ld(1) with `-shared` silently accepts unresolved
-# symbols by default — they become zero/garbage at runtime (UEFI
-# binaries are statically self-contained; there's no dynamic loader
-# to resolve them post-link). Force a hard link error instead so
-# missing-symbol bugs surface at build time rather than as
-# RIP-points-at-nonsense crashes in the field. The AXL library's own
-# build already uses this flag; consumer-facing axl-cc was missing it.
-run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
-    --no-warn-rwx-segments --no-undefined \
-    -T "$EFI_LDS" \
-    ${LDFLAGS_EXTRA[@]+"${LDFLAGS_EXTRA[@]}"} \
-    -o "$SO_FILE" \
-    $CRT0_OBJS \
-    "${OBJS[@]}" \
-    "$LIB_DIR/libaxl.a" || { echo "ERROR: linking failed" >&2; rm -rf "$TMPDIR"; exit 1; }
-
-run_cmd ${CROSS}objcopy \
-    -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-    -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir \
-    --output-target="$PE_TARGET" --subsystem=$SUBSYSTEM \
-    "$SO_FILE" "$OUTPUT" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }
-
-# Patch PE debug directory with module name
-"$PE_SET_DEBUG" "$OUTPUT" "$(basename "$OUTPUT")" || {
-    echo "ERROR: pe-set-debug failed" >&2; rm -rf "$TMPDIR"; exit 1;
-}
-
-# Keep the ELF .so alongside the .efi (has DWARF symbols for addr2line/debugging)
-cp "$SO_FILE" "${OUTPUT%.efi}.so"
-
-rm -rf "$TMPDIR"
-echo "$OUTPUT"
-
-# --run: launch in QEMU
-if [[ "$RUN" == "true" ]]; then
-    # Find run-qemu.sh relative to the SDK or in the source tree
-    RUN_SCRIPT=""
-    if [[ -f "$SDK_DIR/scripts/run-qemu.sh" ]]; then
-        RUN_SCRIPT="$SDK_DIR/scripts/run-qemu.sh"
-    elif [[ -f "$SCRIPT_DIR/../../scripts/run-qemu.sh" ]]; then
-        RUN_SCRIPT="$SCRIPT_DIR/../../scripts/run-qemu.sh"
-    fi
-
-    if [[ -z "$RUN_SCRIPT" ]]; then
-        echo "ERROR: run-qemu.sh not found (--run requires the AXL source tree)" >&2
-        exit 1
-    fi
-
-    # Map axl-cc arch names to run-qemu arch names
-    case "$ARCH" in
-        x64)  QEMU_ARCH="X64" ;;
-        aa64) QEMU_ARCH="AARCH64" ;;
-        *)    QEMU_ARCH="$ARCH" ;;
-    esac
-
-    exec "$RUN_SCRIPT" --arch "$QEMU_ARCH" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "$OUTPUT"
-fi
-NATIVE_WRAPPER
-
-chmod +x "$PREFIX/bin/axl-cc"
+# Install axl-cc — standalone bash script lives at scripts/axl-cc.
+# Until 2026-05-28 this was a ~390-line heredoc embedded here, which
+# made the script hard to review, hard to iterate on (edit-then-
+# install round-trip), and invisible to shellcheck. Extracting it
+# cost nothing and gained all those.
+install -m 755 "$LIBAXL_DIR/scripts/axl-cc" "$PREFIX/bin/axl-cc"
 log_info "Installed axl-cc"
+if [[ "$BUILD_CPP" == "1" ]]; then
+    install -m 755 "$LIBAXL_DIR/scripts/axl-c++" "$PREFIX/bin/axl-c++"
+    log_info "Installed axl-c++"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

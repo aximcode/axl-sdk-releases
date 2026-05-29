@@ -225,6 +225,30 @@ making direct UEFI protocol calls.
   `axl_str_from_w`) exist only for UEFI interop. Consumer code should
   not need them.
 
+### Per-codepoint iteration
+
+`axl_utf8_decode` walks a UTF-8 string one Unicode codepoint at a
+time. It is the UTF-8-first walker for new code that needs to inspect
+characters (e.g. text rendering, syntax highlighting). The existing
+`axl_utf8_to_ucs2` / `axl_utf8_to_ucs2_buf` helpers remain for UEFI
+protocol interop where a CHAR16 buffer is required.
+
+```c
+const char *p = "Hello, 世界!";
+uint32_t    cp;
+size_t      n;
+while ((n = axl_utf8_decode(p, &cp)) > 0) {
+    use(cp);   // U+0048, U+0065, ..., U+4E16, U+754C, U+0021
+    p += n;
+}
+```
+
+Well-formed 1/2/3/4-byte sequences decode to U+0000..U+10FFFF.
+Malformed leads, truncated continuations, overlong encodings, surrogate
+codepoints, and out-of-range values all return 1 with
+`*out_codepoint = 0xFFFD` (REPLACEMENT CHARACTER) — the caller advances
+by 1 byte to resynchronize. End of string (NULL or `\0`) returns 0.
+
 ### Case-Insensitive Operations
 
 `axl_strcasecmp`, `axl_strcasestr`, and `axl_strncasecmp` fold

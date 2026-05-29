@@ -25,6 +25,7 @@ AXL SDK
    :caption: Modules
 
    modules/mem
+   modules/math
    modules/format
    modules/str
    modules/string
@@ -54,6 +55,9 @@ AXL SDK
    modules/watchdog
    modules/rng
    modules/gfx
+   modules/truetype
+   modules/pixmap
+   modules/input
    modules/smbios
    modules/acpi
    modules/pci
@@ -74,6 +78,8 @@ AXL SDK
    guides/coding-style
    guides/sdk
    guides/shared-driver
+   guides/axlmm-design
+   guides/display-design
    guides/porting
    guides/releasing
    guides/roadmap

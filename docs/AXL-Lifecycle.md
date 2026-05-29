@@ -94,12 +94,15 @@ _AxlEntry  (CRT0 entry stub, src/crt0/)
   │    ├─ initialize memory, console, backend
   │    ├─ install shell-break notify → sets g_axl_interrupted
   │    ├─ initialize tier-1 resource registry
-  │    └─ initialize atexit registry
+  │    ├─ initialize atexit registry
+  │    └─ walk .init_array → fires C++ global constructors
   │    (UEFI watchdog / livelock guard: deferred — see §10.2)
   ├─ _axl_get_args() → argc/argv
   ├─ main(argc, argv)                             ← app runs here
   └─ _axl_cleanup()                               → re-enters runtime
        ├─ run atexit callbacks in reverse order
+       │  (includes C++ static destructors registered via
+       │   __cxa_atexit, which routes through axl_atexit)
        ├─ axl_loop_free(default_loop) if one was created
        ├─ sweep tier-1 registry (close leaked events/loops/...)
        └─ memory leak report (AXL_MEM_DEBUG)
@@ -109,6 +112,32 @@ The **runtime** owns: the break notify, the atexit registry, the
 tier-1 resource registry, the watchdog timer. Those live from
 `_axl_init` through `_axl_cleanup`. CRT0 invokes the runtime at
 both boundaries but holds none of the state itself.
+
+### 2.1.1 C++ static initializer timing
+
+UEFI doesn't run `.init_array` automatically — the firmware loader
+just transfers control to `_AxlEntry` and lets the binary handle
+its own startup. axl-sdk's `_axl_init` walks the array as its last
+step, so C++ global constructors fire **after** memory / console /
+registry / atexit are all live.  This means a `static MyClass thing;`
+declaration in a `.cpp` source can safely call `axl_malloc`,
+`axl_printf`, `axl_atexit`, etc. from its constructor.
+
+C++ destructors register via `__cxa_atexit`, which the runtime
+routes through `axl_atexit` — so `static` dtors and explicit
+`axl_atexit` callbacks share the same LIFO drain during
+`_axl_cleanup`.  See `src/runtime/axl-cxxabi.c` for the shims.
+
+Pure-C apps pay zero cost: the `.init_array` walk loop body never
+executes (the linker-script-emitted bounds are equal when no C++
+source contributes a static initializer), and `__cxa_atexit` is
+only referenced from compiler-generated C++ code.  The
+`axl-cxxabi.o` symbols ship in `libaxl.a`; archive selection means
+they're only pulled in when something references them.
+
+For the full C++ subset / toolchain story (which freestanding
+libstdc++ headers work, what's forbidden, axl-c++ vs axl-cc) see
+[`AXLMM-Design.md` §"Toolchain & constraints"](AXLMM-Design.md#toolchain--constraints).
 
 The **default loop is *not* eagerly created** — it is a lazy
 singleton inside the runtime, materialized the first time any
