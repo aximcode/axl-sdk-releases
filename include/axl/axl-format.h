@@ -87,6 +87,59 @@ axl_format(
     ...                      ///< format arguments
 ) __attribute__((format(printf, 3, 4)));
 
+/**
+ * Minimum @p bufsz for axl_dtoa: the shortest decimal representation
+ * of any IEEE-754 double needs at most 17 significant digits; +1 for
+ * the NUL terminator axl_dtoa writes.
+ */
+#define AXL_DTOA_BUF_MIN  18
+
+/**
+ * @brief Shortest round-trippable decimal digits of a double (Grisu2).
+ *
+ * Converts the finite double @p value to the *shortest* string of
+ * decimal digits that, when read back, reproduces @p value exactly
+ * (round-trip). This is the engine behind %f / %e / %g and the
+ * primitive a consumer needs to serialize a double without losing
+ * precision.
+ *
+ * Output is split into three pieces so the caller can render any C
+ * float format from one conversion:
+ *   - @p buf receives the significant digits as ASCII '0'..'9', with
+ *     no sign, no decimal point, and no exponent. NUL-terminated.
+ *   - @p out_decpt receives the position of the decimal point measured
+ *     in digits from the start of @p buf: the value's magnitude is
+ *     `0.<digits> x 10^(*out_decpt)` ... equivalently
+ *     `<digits-as-integer> x 10^(*out_decpt - ndigits)`. So *out_decpt
+ *     is the count of digits that belong to the left of the decimal
+ *     point (it may be <= 0 or > ndigits). Examples: 1.5 -> "15",
+ *     decpt 1; 0.001 -> "1", decpt -2; 100.0 -> "1", decpt 3.
+ *   - @p out_neg receives true for a negative @p value (including
+ *     -0.0), false otherwise.
+ *
+ * Zero yields "0" with @p *out_decpt == 1. The result is the
+ * canonical shortest form: trailing zeros are not emitted (100.0 is
+ * "1" with decpt 3, not "100").
+ *
+ * @p value MUST be finite. NaN and +/-infinity are NOT handled here
+ * (callers detect them first — `v != v` for NaN, `|v| > DBL_MAX` for
+ * infinity); passing one returns 0.
+ *
+ * No allocation, no libm, no libc. Uses a ~1.3KB cached-powers table.
+ *
+ * @return number of digits written to @p buf (>= 1), or 0 on error
+ *         (@p buf NULL, @p bufsz < AXL_DTOA_BUF_MIN, or @p value
+ *         non-finite). @p out_decpt / @p out_neg may be NULL to skip.
+ */
+int
+axl_dtoa(
+    double   value,       ///< finite value to convert
+    char    *buf,         ///< [out] digit buffer (>= AXL_DTOA_BUF_MIN bytes)
+    size_t   bufsz,       ///< size of @p buf
+    int     *out_decpt,   ///< [out] decimal-point position (NULL OK)
+    int     *out_neg      ///< [out] 1 if negative (NULL OK)
+);
+
 #ifdef __cplusplus
 }
 #endif

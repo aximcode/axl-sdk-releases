@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-gfx-types.h>
+#include <axl/axl-math.h>
 #include <axl/axl-macros.h>
 
 #ifdef __cplusplus
@@ -228,6 +229,161 @@ axl_ttf_draw(
     const char   *utf8,         ///< [in] NUL-terminated UTF-8 string
     float         px_size,      ///< pixel height
     AxlGfxPixel   color         ///< text color (alpha honored on buffer targets)
+    );
+
+/// Draw a UTF-8 string through a transform (rotation, shear,
+/// non-uniform scale) — the general-transform counterpart to
+/// `axl_ttf_draw`'s axis-aligned fast path.
+///
+/// The glyphs are laid out on the baseline starting at the **local
+/// origin (0, 0)** at @a px_size pixel height (advances + kerning in
+/// local pixels, exactly as `axl_ttf_draw` lays them out).  The
+/// transform @a m then maps that local pixel space into the draw
+/// target: its translation places the baseline origin, and its linear
+/// part applies any rotation / shear / extra scale.  So
+/// `axl_transform_translate(x, y)` reproduces `axl_ttf_draw(x, y, …)`,
+/// and `axl_transform_multiply(axl_transform_rotate(a),
+/// axl_transform_translate(x, y))` draws a baseline rotated by `a`
+/// about `(x, y)` (rotate first, then translate — cairo order).
+///
+/// Unlike `axl_ttf_draw` (which composites cached coverage bitmaps and
+/// cannot rotate), this pulls each glyph's vector outline, transforms
+/// the control points, and fills it through the analytic path
+/// rasterizer — so it is anti-aliased at any angle.  It is
+/// correspondingly heavier per call (no glyph-bitmap cache); keep using
+/// `axl_ttf_draw` for upright text.
+///
+/// The active graphics transform (`axl_gfx_translate` et al.) composes
+/// on top: the effective mapping is `CTM × m`.  With the default
+/// identity CTM the mapping is just @a m.  Honors the active clip stack
+/// (including `axl_gfx_push_clip_quad`) and draw target; @a color alpha
+/// is modulated by glyph coverage and blended on buffer targets.
+///
+/// Invalid UTF-8 renders as U+FFFD; absent codepoints render as
+/// `.notdef`.
+///
+/// @return AXL_OK on success.  AXL_ERR if @a font, @a utf8, or @a m is
+///         NULL, @a px_size is <= 0, on allocation failure, or the
+///         active target is the screen and GOP is unavailable.
+int
+axl_ttf_draw_transform(
+    AxlTtf              *font,     ///< [in] font
+    const char          *utf8,     ///< [in] NUL-terminated UTF-8 string
+    float                px_size,  ///< local baseline pixel height (> 0)
+    const AxlTransform  *m,        ///< [in] local-space → target transform
+    AxlGfxPixel          color     ///< text color (alpha honored on buffer targets)
+    );
+
+// ===================================================================
+// Boxed / multi-line text (G11)
+// ===================================================================
+
+/// Horizontal alignment of each wrapped line within the box.
+///
+/// These values occupy the low bits of the @a flags argument to
+/// `axl_ttf_draw_box`; select exactly one (LEFT is the zero default).
+/// The remaining bits are reserved for future layout flags (e.g.
+/// vertical alignment, mid-word breaking) so the `flags` argument
+/// stays source-compatible as the box layout grows.
+#define AXL_TTF_ALIGN_LEFT    0x0u   ///< align each line to the box left edge (default)
+#define AXL_TTF_ALIGN_CENTER  0x1u   ///< center each line horizontally in the box
+#define AXL_TTF_ALIGN_RIGHT   0x2u   ///< align each line to the box right edge
+#define AXL_TTF_ALIGN_MASK    0x3u   ///< mask selecting the horizontal-alignment field
+
+/// Draw word-wrapped UTF-8 text inside a rectangle.
+///
+/// Lays the text out into lines and draws each line with
+/// `axl_ttf_draw`, building purely on the existing measurement +
+/// glyph primitives (no shaping, no external dependency).
+///
+/// **Layout rules**
+///   - **Hard breaks:** every `\n` ends the current line and starts a
+///     new one.  Consecutive newlines therefore produce blank lines,
+///     and a trailing `\n` produces a trailing blank line (each `\n`
+///     starts a line).  `\r` and `\t` are treated as whitespace.
+///   - **Word wrap:** within a hard line, text is broken on runs of
+///     whitespace (space / tab / CR).  Words are kept whole; a line
+///     grows greedily while the rendered width of its content is
+///     `<= w`.  Whitespace runs are break opportunities — leading and
+///     trailing whitespace on a wrapped line is not rendered, but
+///     whitespace *interior* to a line is preserved.
+///   - **Grapheme safety:** breaks only ever fall on whitespace, never
+///     inside a multi-byte UTF-8 sequence.  (Full UAX-29 grapheme
+///     segmentation — e.g. ZWJ emoji — is a consumer-layer / FreeType
+///     concern; the lean tier breaks on whitespace + codepoint
+///     boundaries.)
+///   - **Over-wide word:** a single word wider than @a w is **not
+///     split**; it is placed on its own line and overflows the box's
+///     right edge.  The overflow is clipped to the box when drawn (see
+///     clipping below); `axl_ttf_measure_box` reports the true
+///     (possibly `> w`) width so callers can detect it.
+///   - **Line advance:** baselines step by
+///     `ascent + descent + line_gap` (the `axl_ttf_metrics`
+///     line-height).  The first baseline is at `y + ascent`, so line
+///     @a i occupies vertical span `[y + i*line_height,
+///     y + i*line_height + ascent + descent]`.
+///
+/// **Alignment** is selected by @a flags (`AXL_TTF_ALIGN_*`); each
+/// line is shifted independently within @a w.
+///
+/// **Clipping:** the box `(x, y, w, h)` is pushed onto the clip stack
+/// (intersected with any active clip) for the duration of the draw, so
+/// content is clamped to the rectangle — horizontally over-wide words
+/// are cut at the right edge and a final line taller than the
+/// remaining height is cut at the bottom.  Lines that start fully
+/// below the box are skipped entirely.  Use `axl_ttf_measure_box`
+/// first if you need to size the box to the text.
+///
+/// (@a x, @a y) is the box's top-left corner and may be negative.
+///
+/// @return AXL_OK on success.  AXL_ERR if @a ttf is NULL, @a utf8 is
+///         NULL, @a px_size is <= 0, the active target is the screen
+///         and GOP is unavailable, or the clip stack is full.
+int
+axl_ttf_draw_box(
+    AxlTtf       *ttf,          ///< [in] font
+    int32_t       x,            ///< box left edge (may be negative)
+    int32_t       y,            ///< box top edge (may be negative)
+    uint32_t      w,            ///< box width in pixels (wrap width)
+    uint32_t      h,            ///< box height in pixels (vertical clip)
+    const char   *utf8,         ///< [in] NUL-terminated UTF-8 string
+    float         px_size,      ///< pixel height
+    AxlGfxPixel   color,        ///< text color (alpha honored on buffer targets)
+    uint32_t      flags         ///< AXL_TTF_ALIGN_* (other bits reserved, pass 0)
+    );
+
+/// Measure word-wrapped UTF-8 text for layout-before-draw.
+///
+/// Runs the identical line-breaking algorithm as `axl_ttf_draw_box`
+/// for wrap width @a w (the same hard-break, word-wrap, over-wide-word
+/// rules) without drawing, and reports the resulting block geometry.
+/// Alignment does not affect geometry, so there is no @a flags
+/// argument.
+///
+/// Outputs (each pointer may be NULL to skip it):
+///   - @a out_width:  widest rendered line in pixels.  May exceed @a w
+///     when an unbreakable word overflows; 0 for empty input.
+///   - @a out_height: total block height in pixels, rounded up —
+///     `ceil(line_count * (ascent + descent + line_gap))`.  0 for
+///     empty input.
+///   - @a out_lines:  number of rendered lines (including blank lines
+///     from `\n`).  0 for empty input ("" or NULL-equivalent yields
+///     no lines).
+///
+/// Does NOT require GOP — pure measurement.
+///
+/// @return AXL_OK on success (outputs written).  AXL_ERR if @a ttf is
+///         NULL, @a utf8 is NULL, or @a px_size is <= 0 (outputs
+///         untouched on error).
+int
+axl_ttf_measure_box(
+    AxlTtf       *ttf,          ///< [in] font
+    uint32_t      w,            ///< wrap width in pixels
+    const char   *utf8,         ///< [in] NUL-terminated UTF-8 string
+    float         px_size,      ///< pixel height
+    uint32_t     *out_width,    ///< [out] widest line width, px (NULL OK)
+    uint32_t     *out_height,   ///< [out] total block height, px (NULL OK)
+    uint32_t     *out_lines     ///< [out] rendered line count (NULL OK)
     );
 
 // ===================================================================

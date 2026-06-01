@@ -52,6 +52,7 @@ test_button_bits_distinct(void)
 static void
 test_modifier_bits_distinct(void)
 {
+    /* Side-agnostic masks remain pairwise disjoint. */
     test_check((AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_CTRL) == 0 &&
                (AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_ALT)  == 0 &&
                (AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_META) == 0 &&
@@ -59,6 +60,58 @@ test_modifier_bits_distinct(void)
                (AXL_INPUT_MOD_CTRL  & AXL_INPUT_MOD_META) == 0 &&
                (AXL_INPUT_MOD_ALT   & AXL_INPUT_MOD_META) == 0,
                "modifier bitfield: shift/ctrl/alt/meta pairwise disjoint");
+}
+
+static void
+test_modifier_lr_and_masks(void)
+{
+    /* Each L/R bit is a distinct single bit. */
+    uint32_t lr[] = {
+        AXL_INPUT_MOD_LSHIFT, AXL_INPUT_MOD_RSHIFT,
+        AXL_INPUT_MOD_LCTRL,  AXL_INPUT_MOD_RCTRL,
+        AXL_INPUT_MOD_LALT,   AXL_INPUT_MOD_RALT,
+        AXL_INPUT_MOD_LMETA,  AXL_INPUT_MOD_RMETA,
+        AXL_INPUT_MOD_CAPS_LOCK, AXL_INPUT_MOD_NUM_LOCK,
+        AXL_INPUT_MOD_SCROLL_LOCK,
+    };
+    uint32_t seen = 0;
+    bool all_single = true, all_distinct = true;
+    for (size_t i = 0; i < sizeof lr / sizeof lr[0]; i++) {
+        if (lr[i] == 0 || (lr[i] & (lr[i] - 1)) != 0) {
+            all_single = false;   /* not a single power-of-two bit */
+        }
+        if (seen & lr[i]) {
+            all_distinct = false;
+        }
+        seen |= lr[i];
+    }
+    test_check(all_single, "modifier: every L/R + lock bit is a single bit");
+    test_check(all_distinct, "modifier: L/R + lock bits mutually disjoint");
+
+    /* Side-agnostic masks are exactly the OR of their two sides. */
+    test_check(AXL_INPUT_MOD_SHIFT ==
+                   (AXL_INPUT_MOD_LSHIFT | AXL_INPUT_MOD_RSHIFT) &&
+               AXL_INPUT_MOD_CTRL ==
+                   (AXL_INPUT_MOD_LCTRL | AXL_INPUT_MOD_RCTRL) &&
+               AXL_INPUT_MOD_ALT ==
+                   (AXL_INPUT_MOD_LALT | AXL_INPUT_MOD_RALT) &&
+               AXL_INPUT_MOD_META ==
+                   (AXL_INPUT_MOD_LMETA | AXL_INPUT_MOD_RMETA),
+               "modifier: SHIFT/CTRL/ALT/META masks = OR of L/R sides");
+
+    /* A mask matches its own side but not a different modifier. */
+    test_check((AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_LSHIFT) != 0 &&
+               (AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_RSHIFT) != 0 &&
+               (AXL_INPUT_MOD_SHIFT & AXL_INPUT_MOD_LCTRL)  == 0,
+               "modifier: SHIFT mask matches either shift, not ctrl");
+
+    /* Locks are disjoint from the held-modifier masks. */
+    uint32_t held = AXL_INPUT_MOD_SHIFT | AXL_INPUT_MOD_CTRL |
+                    AXL_INPUT_MOD_ALT | AXL_INPUT_MOD_META;
+    uint32_t locks = AXL_INPUT_MOD_CAPS_LOCK | AXL_INPUT_MOD_NUM_LOCK |
+                     AXL_INPUT_MOD_SCROLL_LOCK;
+    test_check((held & locks) == 0,
+               "modifier: lock bits disjoint from held-modifier bits");
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +310,7 @@ test_input_main(
     test_input_type_values_distinct();
     test_button_bits_distinct();
     test_modifier_bits_distinct();
+    test_modifier_lr_and_masks();
     test_event_struct_field_init();
     test_event_designated_init();
 

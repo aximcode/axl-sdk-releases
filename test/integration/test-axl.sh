@@ -30,6 +30,11 @@ make -C "$PROJECT_DIR" \
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
 TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput)
+# Debug override: TEST_APPS_ONLY="AxlTestGfx AxlTestTruetype" runs a subset
+# (skips the cross-test ratchet — for fast local iteration only).
+if [ -n "${TEST_APPS_ONLY:-}" ]; then
+    read -r -a TEST_APPS <<< "$TEST_APPS_ONLY"
+fi
 
 for app in "${TEST_APPS[@]}"; do
     test_add_efi "$NATIVE_DIR/$app.efi"

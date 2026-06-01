@@ -36,6 +36,7 @@
 #ifndef AXL_CPU_H
 #define AXL_CPU_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
@@ -57,25 +58,25 @@ extern "C" {
  */
 typedef enum {
     /* x86-64 exception kinds — register on x64 only. */
-    AXL_CPU_EXCEPTION_DIVIDE_ERROR    = 1,   ///< x64 #DE
-    AXL_CPU_EXCEPTION_DEBUG           = 2,   ///< x64 #DB
-    AXL_CPU_EXCEPTION_OVERFLOW        = 3,   ///< x64 #OF
-    AXL_CPU_EXCEPTION_BOUND           = 4,   ///< x64 #BR
-    AXL_CPU_EXCEPTION_INVALID_OPCODE  = 5,   ///< x64 #UD
-    AXL_CPU_EXCEPTION_DEVICE_NA       = 6,   ///< x64 #NM
-    AXL_CPU_EXCEPTION_DOUBLE_FAULT    = 7,   ///< x64 #DF
-    AXL_CPU_EXCEPTION_SEGMENT_NP      = 8,   ///< x64 #NP
-    AXL_CPU_EXCEPTION_STACK_FAULT     = 9,   ///< x64 #SS
-    AXL_CPU_EXCEPTION_GP_FAULT        = 10,  ///< x64 #GP
-    AXL_CPU_EXCEPTION_PAGE_FAULT      = 11,  ///< x64 #PF
-    AXL_CPU_EXCEPTION_FP_ERROR        = 12,  ///< x64 #MF
-    AXL_CPU_EXCEPTION_ALIGNMENT_CHECK = 13,  ///< x64 #AC
-    AXL_CPU_EXCEPTION_SIMD            = 14,  ///< x64 #XM
+    AXL_CPU_EXCEPTION_DIVIDE_ERROR    = 1,   ///< x64 \#DE
+    AXL_CPU_EXCEPTION_DEBUG           = 2,   ///< x64 \#DB
+    AXL_CPU_EXCEPTION_OVERFLOW        = 3,   ///< x64 \#OF
+    AXL_CPU_EXCEPTION_BOUND           = 4,   ///< x64 \#BR
+    AXL_CPU_EXCEPTION_INVALID_OPCODE  = 5,   ///< x64 \#UD
+    AXL_CPU_EXCEPTION_DEVICE_NA       = 6,   ///< x64 \#NM
+    AXL_CPU_EXCEPTION_DOUBLE_FAULT    = 7,   ///< x64 \#DF
+    AXL_CPU_EXCEPTION_SEGMENT_NP      = 8,   ///< x64 \#NP
+    AXL_CPU_EXCEPTION_STACK_FAULT     = 9,   ///< x64 \#SS
+    AXL_CPU_EXCEPTION_GP_FAULT        = 10,  ///< x64 \#GP
+    AXL_CPU_EXCEPTION_PAGE_FAULT      = 11,  ///< x64 \#PF
+    AXL_CPU_EXCEPTION_FP_ERROR        = 12,  ///< x64 \#MF
+    AXL_CPU_EXCEPTION_ALIGNMENT_CHECK = 13,  ///< x64 \#AC
+    AXL_CPU_EXCEPTION_SIMD            = 14,  ///< x64 \#XM
 
     /* AArch64 exception kinds — register on aa64 only.
        aa64 collapses x64-style traps into broad classes; the
-       SYNCHRONOUS umbrella covers what x64 splits across #UD /
-       #GP / #PF / #AC. Consumers that want finer detail on aa64
+       SYNCHRONOUS umbrella covers what x64 splits across \#UD /
+       \#GP / \#PF / \#AC. Consumers that want finer detail on aa64
        inspect `ESR_EL1.EC` inside the callback. */
     AXL_CPU_EXCEPTION_SYNCHRONOUS     = 15,  ///< aa64 synchronous-exception umbrella
     AXL_CPU_EXCEPTION_SERROR          = 16,  ///< aa64 SError
@@ -121,10 +122,10 @@ typedef enum {
  *
  * **Field semantics:**
  *  - `fault_address` — meaningful for memory-access faults
- *    (x64 #PF = CR2; aa64 sync = FAR_EL1). Zero for kinds where
- *    no fault address applies (#DE, #GP without memory, #UD, ...).
+ *    (x64 \#PF = CR2; aa64 sync = FAR_EL1). Zero for kinds where
+ *    no fault address applies (\#DE, \#GP without memory, \#UD, ...).
  *  - `error_code` — exception-specific:
- *    x64 #PF / #GP / #DF / #NP / #SS / #AC carry an error code
+ *    x64 \#PF / \#GP / \#DF / \#NP / \#SS / \#AC carry an error code
  *    pushed by the CPU; for other kinds, 0.
  *    aa64 carries `ESR_EL1` here so consumers can recover
  *    finer-grained classification on synchronous exceptions
@@ -213,6 +214,157 @@ int
 axl_cpu_unregister_exception(
     AxlCpuExceptionKind kind
 );
+
+// ---------------------------------------------------------------------------
+// Instruction-set feature detection + SIMD dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Detected CPU instruction-set features.
+ *
+ * Filled once from `CPUID` (x86) on first query and cached. Fields
+ * for the other architecture are always `false` — read `neon` on
+ * aarch64, the x86 fields on x86. These report what the CPU *can
+ * execute*; for AVX, "can execute" still requires a one-time state
+ * enable (see `axl_cpu_enable_avx`) before the YMM registers are
+ * usable without a \#UD fault.
+ *
+ * Most consumers want `axl_cpu_simd_tier` (a single ordered value
+ * for kernel dispatch) rather than these individual bits.
+ */
+typedef struct {
+    /* --- x86: SIMD (all false on non-x86) --- */
+    bool sse2;    ///< SSE2 (always present on x86-64; firmware enables XMM state)
+    bool sse3;    ///< SSE3
+    bool ssse3;   ///< SSSE3 (PSHUFB — byte shuffles)
+    bool sse41;   ///< SSE4.1 (PMOVZX / PBLENDVB / ROUNDPS — no state enable needed)
+    bool sse42;   ///< SSE4.2 (also CRC32 instruction)
+    bool fma;     ///< FMA3 fused multiply-add
+    bool xsave;   ///< XSAVE/XGETBV/XSETBV present (precondition for enabling AVX)
+    bool avx;     ///< AVX (256-bit) — usable only after axl_cpu_enable_avx()
+    bool avx2;    ///< AVX2 (256-bit integer) — usable only after enable
+    bool avx512f;   ///< AVX-512 Foundation — usable only after axl_cpu_enable_avx512()
+    bool avx512dq;  ///< AVX-512 Doubleword/Quadword
+    bool avx512bw;  ///< AVX-512 Byte/Word
+    bool avx512vl;  ///< AVX-512 Vector Length extensions
+    bool avx512cd;  ///< AVX-512 Conflict Detection
+    bool avx512vnni; ///< AVX-512 Vector Neural Network Instructions
+    /* --- x86: crypto / hashing --- */
+    bool aes;        ///< AES-NI (AESENC/AESDEC ...)
+    bool pclmulqdq;  ///< carry-less multiply (GHASH / GCM)
+    bool sha;        ///< SHA-NI (SHA1/SHA256 round instructions)
+    bool vaes;       ///< vectorized AES (VEX/EVEX-encoded AES on 256/512-bit)
+    bool vpclmulqdq; ///< vectorized carry-less multiply
+    /* --- x86: bit-manipulation / misc --- */
+    bool popcnt;  ///< POPCNT instruction
+    bool bmi1;    ///< BMI1 (ANDN, BLSR, TZCNT ...)
+    bool bmi2;    ///< BMI2 (BZHI, PDEP, PEXT, MULX ...)
+    bool lzcnt;   ///< LZCNT (leading-zero count; ABM)
+    bool movbe;   ///< MOVBE (load/store with byte swap)
+    bool f16c;    ///< F16C (half-precision float <-> single convert)
+    bool adx;     ///< ADX (ADCX/ADOX multiprecision add)
+    bool rdrand;  ///< RDRAND (on-chip RNG)
+    bool rdseed;  ///< RDSEED (seed-grade on-chip RNG)
+    /* --- aarch64 (all false on non-aarch64 targets) --- */
+    bool neon;     ///< AdvSIMD/NEON (always present on ARMv8-A baseline)
+    bool fp16;     ///< half-precision floating point (FEAT_FP16)
+    bool atomics;  ///< Large System Extensions (FEAT_LSE atomic instructions)
+    bool crc32;    ///< CRC32 instructions (FEAT_CRC32)
+    bool aes_a64;  ///< AES instructions (FEAT_AES)
+    bool pmull;    ///< polynomial multiply long (FEAT_PMULL — GHASH)
+    bool sha1;     ///< SHA1 instructions (FEAT_SHA1)
+    bool sha2;     ///< SHA-256 instructions (FEAT_SHA256)
+    bool sha512;   ///< SHA-512 instructions (FEAT_SHA512)
+    bool sha3;     ///< SHA3 instructions (FEAT_SHA3)
+    bool dotprod;  ///< dot-product instructions (FEAT_DotProd)
+    bool sve;      ///< Scalable Vector Extension (FEAT_SVE)
+} AxlCpuFeatures;
+
+/**
+ * @brief SIMD dispatch tier — a single ordered value naming the best
+ *     usable kernel.
+ *
+ * Monotonic: a higher value is a strict superset of the work a lower
+ * one can do, so a dispatcher picks the highest tier for which it has
+ * a kernel. AVX2 is only reported once `axl_cpu_enable_avx` has
+ * succeeded — querying the tier never changes CPU state on its own.
+ */
+typedef enum {
+    AXL_SIMD_SCALAR   = 0,  ///< no SIMD (not expected on our targets)
+    AXL_SIMD_BASELINE = 1,  ///< 128-bit: SSE2 (x86) or NEON (aarch64); always available
+    AXL_SIMD_SSE41    = 2,  ///< x86 SSE4.1 — 128-bit, richer pixel ops; detection only
+    AXL_SIMD_AVX2     = 3,  ///< x86 AVX2 — 256-bit; requires axl_cpu_enable_avx()
+} AxlSimdTier;
+
+/**
+ * @brief Query detected CPU features (cached after first call).
+ *
+ * Pure detection — never changes CPU state. The returned pointer is
+ * to SDK-owned static storage valid for the program's lifetime;
+ * never NULL.
+ *
+ * @return pointer to the cached feature set.
+ */
+const AxlCpuFeatures *
+axl_cpu_features(void);
+
+/**
+ * @brief Enable AVX (YMM) register state so AVX/AVX2 instructions run
+ *     without a \#UD fault.
+ *
+ * UEFI firmware enables SSE state (the calling convention needs XMM)
+ * but does **not** enable AVX state, so AVX instructions trap until a
+ * CPL0 caller sets `CR4.OSXSAVE` and the AVX bits in `XCR0`. A UEFI
+ * application runs at CPL0, so it may do this itself; this routine
+ * performs the sequence (CPUID-gated) once and is idempotent.
+ *
+ * **Per-logical-processor.** `CR4`/`XCR0` are per-CPU; code that runs
+ * AVX kernels on application processors (via MP services) must call
+ * this on each AP as well as the BSP.
+ *
+ * No-op returning `false` when the CPU lacks AVX (or on non-x86),
+ * leaving `axl_cpu_simd_tier` at `AXL_SIMD_SSE41`/`BASELINE`.
+ *
+ * @return `true` if AVX is usable after the call (already-enabled
+ *     counts), `false` if the CPU has no AVX to enable.
+ */
+bool
+axl_cpu_enable_avx(void);
+
+/**
+ * @brief Enable AVX-512 (opmask + ZMM) register state.
+ *
+ * The AVX-512 counterpart to `axl_cpu_enable_avx`: sets `CR4.OSXSAVE`
+ * and the `XCR0` bits for x87 + SSE + AVX **and** the AVX-512 state
+ * components (opmask, ZMM_Hi256, Hi16_ZMM), so EVEX-encoded AVX-512
+ * instructions run without a \#UD. Implies AVX enable. Gated on the CPU
+ * advertising AVX-512F and the XSAVE state components being supported;
+ * idempotent; per-logical-processor (same caveat as
+ * `axl_cpu_enable_avx`).
+ *
+ * Note: `axl_cpu_simd_tier` tops out at `AXL_SIMD_AVX2` — that is the
+ * widest tier AXL's own kernels use. AVX-512 is exposed for consumers
+ * who write their own AVX-512 code: check `avx512f` et al. in
+ * `axl_cpu_features`, call this to enable, then run.
+ *
+ * @return `true` if AVX-512 is usable after the call (already-enabled
+ *     counts), `false` if the CPU has no AVX-512 to enable (or non-x86).
+ */
+bool
+axl_cpu_enable_avx512(void);
+
+/**
+ * @brief The best SIMD tier usable *right now* for kernel dispatch.
+ *
+ * x86: `AXL_SIMD_AVX2` if AVX2 is present **and** enabled (call
+ * `axl_cpu_enable_avx` first), else `AXL_SIMD_SSE41` if SSE4.1 is
+ * present, else `AXL_SIMD_BASELINE` (SSE2, always). aarch64:
+ * `AXL_SIMD_BASELINE` (NEON). Does not change CPU state.
+ *
+ * @return the highest currently-usable `AxlSimdTier`.
+ */
+AxlSimdTier
+axl_cpu_simd_tier(void);
 
 #ifdef __cplusplus
 }

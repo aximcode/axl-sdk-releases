@@ -643,6 +643,206 @@ test_snprintf(void)
     test_check(buf[5] == '\0', "snprintf: NUL terminates on truncation");
 }
 
+static void
+test_snprintf_float(void)
+{
+    char buf[64];
+
+    /* Default precision is 6 (C standard). */
+    axl_snprintf(buf, sizeof(buf), "%f", 3.5);
+    test_check(axl_strcmp(buf, "3.500000") == 0,
+               "snprintf %f: default precision is 6 decimals");
+
+    /* Explicit precision. */
+    axl_snprintf(buf, sizeof(buf), "%.3f", 3.5);
+    test_check(axl_strcmp(buf, "3.500") == 0,
+               "snprintf %.3f: honors explicit precision");
+
+    /* Zero precision drops the decimal point entirely. */
+    axl_snprintf(buf, sizeof(buf), "%.0f", 7.0);
+    test_check(axl_strcmp(buf, "7") == 0,
+               "snprintf %.0f: no decimal point at precision 0");
+
+    /* Rounding at the precision boundary. Use values whose nearest
+       double is unambiguously on one side — a no-libm formatter (no
+       arbitrary-precision Grisu/Ryu) cannot promise mathematical-ideal
+       behavior on exact ties or representation-boundary values like
+       1.005 (stored as 1.00499...), so we don't assert those. */
+    axl_snprintf(buf, sizeof(buf), "%.1f", 3.14159);
+    test_check(axl_strcmp(buf, "3.1") == 0,
+               "snprintf %.1f: rounds down when below the boundary");
+    axl_snprintf(buf, sizeof(buf), "%.1f", 3.96);
+    test_check(axl_strcmp(buf, "4.0") == 0,
+               "snprintf %.1f: rounds up and carries into integer part");
+    axl_snprintf(buf, sizeof(buf), "%.0f", 2.7);
+    test_check(axl_strcmp(buf, "3") == 0,
+               "snprintf %.0f: rounds 2.7 up to 3");
+    axl_snprintf(buf, sizeof(buf), "%.0f", 2.3);
+    test_check(axl_strcmp(buf, "2") == 0,
+               "snprintf %.0f: rounds 2.3 down to 2");
+
+    /* Rounding that carries into the integer part. */
+    axl_snprintf(buf, sizeof(buf), "%.1f", 9.99);
+    test_check(axl_strcmp(buf, "10.0") == 0,
+               "snprintf %.1f: rounding carries into integer part");
+
+    /* Negative values keep the sign. */
+    axl_snprintf(buf, sizeof(buf), "%.3f", -7.25);
+    test_check(axl_strcmp(buf, "-7.250") == 0,
+               "snprintf %f: negative values carry a leading minus");
+
+    /* Zero. */
+    axl_snprintf(buf, sizeof(buf), "%.2f", 0.0);
+    test_check(axl_strcmp(buf, "0.00") == 0,
+               "snprintf %f: zero formats with the requested decimals");
+
+    /* Plus and space flags on a positive value. */
+    axl_snprintf(buf, sizeof(buf), "%+.1f", 4.5);
+    test_check(axl_strcmp(buf, "+4.5") == 0,
+               "snprintf %+f: plus flag prefixes positive values");
+    axl_snprintf(buf, sizeof(buf), "% .1f", 4.5);
+    test_check(axl_strcmp(buf, " 4.5") == 0,
+               "snprintf % f: space flag prefixes positive values");
+
+    /* Width with right- and left-justification. */
+    axl_snprintf(buf, sizeof(buf), "%8.2f", 3.14);
+    test_check(axl_strcmp(buf, "    3.14") == 0,
+               "snprintf %8.2f: right-justifies within width");
+    axl_snprintf(buf, sizeof(buf), "%-8.2f", 3.14);
+    test_check(axl_strcmp(buf, "3.14    ") == 0,
+               "snprintf %-8.2f: left-justifies within width");
+
+    /* Zero-padding to width. */
+    axl_snprintf(buf, sizeof(buf), "%08.2f", 3.14);
+    test_check(axl_strcmp(buf, "00003.14") == 0,
+               "snprintf %08.2f: zero-pads to width");
+    axl_snprintf(buf, sizeof(buf), "%08.2f", -3.14);
+    test_check(axl_strcmp(buf, "-0003.14") == 0,
+               "snprintf %08.2f: zero-pad keeps sign ahead of zeros");
+
+    /* A larger integer part. */
+    axl_snprintf(buf, sizeof(buf), "%.2f", 12345.6789);
+    test_check(axl_strcmp(buf, "12345.68") == 0,
+               "snprintf %f: multi-digit integer part with rounding");
+
+    /* %F is the upper-case alias — same numeric output. */
+    axl_snprintf(buf, sizeof(buf), "%.1F", 2.5);
+    test_check(axl_strcmp(buf, "2.5") == 0,
+               "snprintf %F: upper-case alias formats identically");
+
+    /* Mixed with other conversions in one call (arg consumption stays
+       in sync — the bug a missing %f handler would have caused). */
+    axl_snprintf(buf, sizeof(buf), "%d:%.2f:%s", 7, 1.5, "x");
+    test_check(axl_strcmp(buf, "7:1.50:x") == 0,
+               "snprintf: %f consumes exactly one double in a mixed call");
+
+    /* High precision: the Grisu2-backed %f honors the requested
+       fractional width exactly (no cap). 1.0 is exact, so beyond its
+       single significant digit the fraction is all zeros. */
+    axl_snprintf(buf, sizeof(buf), "%.25f", 1.0);
+    test_check(axl_strcmp(buf, "1.0000000000000000000000000") == 0,
+               "snprintf %.25f: honors full requested precision (25 zeros)");
+
+    /* Negative zero prints WITHOUT a sign (documented divergence from
+       glibc, which prints -0.000000). Pin the chosen behavior. */
+    double neg_zero = -0.0;
+    axl_snprintf(buf, sizeof(buf), "%.1f", neg_zero);
+    test_check(axl_strcmp(buf, "0.0") == 0,
+               "snprintf %f: negative zero prints without a sign");
+
+    /* NaN and +/-infinity — built without -ffast-math, so the
+       dval!=dval and dval>DBL_MAX detections hold. Construct them
+       without libm via arithmetic the compiler can't fold away. */
+    volatile double zero = 0.0;
+    volatile double big  = 1.0e308;
+    double nan_val = zero / zero;
+    double inf_val = big * 10.0;        /* overflows to +inf */
+    axl_snprintf(buf, sizeof(buf), "%f", nan_val);
+    test_check(axl_strcmp(buf, "nan") == 0,
+               "snprintf %f: NaN prints \"nan\"");
+    axl_snprintf(buf, sizeof(buf), "%f", inf_val);
+    test_check(axl_strcmp(buf, "inf") == 0,
+               "snprintf %f: positive overflow prints \"inf\"");
+    axl_snprintf(buf, sizeof(buf), "%f", -inf_val);
+    test_check(axl_strcmp(buf, "-inf") == 0,
+               "snprintf %f: negative infinity prints \"-inf\"");
+    axl_snprintf(buf, sizeof(buf), "%+f", inf_val);
+    test_check(axl_strcmp(buf, "+inf") == 0,
+               "snprintf %+f: plus flag prefixes +inf");
+}
+
+static void
+test_snprintf_exp_g(void)
+{
+    char buf[64];
+
+    /* %e — scientific, default precision 6, exponent >= 2 digits. */
+    axl_snprintf(buf, sizeof(buf), "%e", 0.0);
+    test_check(axl_strcmp(buf, "0.000000e+00") == 0,
+               "snprintf %e: zero -> 0.000000e+00");
+    axl_snprintf(buf, sizeof(buf), "%e", 31415.9);
+    test_check(axl_strcmp(buf, "3.141590e+04") == 0,
+               "snprintf %e: 31415.9 -> 3.141590e+04");
+    axl_snprintf(buf, sizeof(buf), "%.2e", 31415.9);
+    test_check(axl_strcmp(buf, "3.14e+04") == 0,
+               "snprintf %.2e: honors precision");
+    axl_snprintf(buf, sizeof(buf), "%e", 0.00042);
+    test_check(axl_strcmp(buf, "4.200000e-04") == 0,
+               "snprintf %e: small value gets negative exponent");
+    axl_snprintf(buf, sizeof(buf), "%.0e", 95.0);
+    test_check(axl_strcmp(buf, "1e+02") == 0,
+               "snprintf %.0e: rounds 95 up across the decade to 1e+02");
+    axl_snprintf(buf, sizeof(buf), "%E", 31415.9);
+    test_check(axl_strcmp(buf, "3.141590E+04") == 0,
+               "snprintf %E: upper-case exponent marker");
+    axl_snprintf(buf, sizeof(buf), "%e", 1e100);
+    test_check(axl_strcmp(buf, "1.000000e+100") == 0,
+               "snprintf %e: 3-digit exponent");
+
+    /* %g — shortest of %e/%f, trailing zeros trimmed, default P=6. */
+    axl_snprintf(buf, sizeof(buf), "%g", 0.1);
+    test_check(axl_strcmp(buf, "0.1") == 0,
+               "snprintf %g: 0.1 -> 0.1 (shortest, no trailing zeros)");
+    axl_snprintf(buf, sizeof(buf), "%g", 100000.0);
+    test_check(axl_strcmp(buf, "100000") == 0,
+               "snprintf %g: 100000 -> 100000 (fixed, no point)");
+    axl_snprintf(buf, sizeof(buf), "%g", 1000000.0);
+    test_check(axl_strcmp(buf, "1e+06") == 0,
+               "snprintf %g: 1e6 -> 1e+06 (exp >= P switches to scientific)");
+    axl_snprintf(buf, sizeof(buf), "%g", 0.0001);
+    test_check(axl_strcmp(buf, "0.0001") == 0,
+               "snprintf %g: 1e-4 stays fixed");
+    axl_snprintf(buf, sizeof(buf), "%g", 0.00001);
+    test_check(axl_strcmp(buf, "1e-05") == 0,
+               "snprintf %g: 1e-5 (exp < -4 switches to scientific)");
+    axl_snprintf(buf, sizeof(buf), "%g", 3.14);
+    test_check(axl_strcmp(buf, "3.14") == 0,
+               "snprintf %g: 3.14 -> 3.14");
+    axl_snprintf(buf, sizeof(buf), "%g", 0.0);
+    test_check(axl_strcmp(buf, "0") == 0,
+               "snprintf %g: zero -> 0");
+    axl_snprintf(buf, sizeof(buf), "%.3g", 3.14159);
+    test_check(axl_strcmp(buf, "3.14") == 0,
+               "snprintf %.3g: 3 significant digits");
+    axl_snprintf(buf, sizeof(buf), "%.2g", 0.00012345);
+    test_check(axl_strcmp(buf, "0.00012") == 0,
+               "snprintf %.2g: 2 sig digits, fixed form");
+    axl_snprintf(buf, sizeof(buf), "%G", 1000000.0);
+    test_check(axl_strcmp(buf, "1E+06") == 0,
+               "snprintf %G: upper-case exponent marker");
+    axl_snprintf(buf, sizeof(buf), "%g", 1.5);
+    test_check(axl_strcmp(buf, "1.5") == 0,
+               "snprintf %g: 1.5 -> 1.5");
+
+    /* %g width + flags route through the same padding path as %f. */
+    axl_snprintf(buf, sizeof(buf), "%10.3g", 3.14159);
+    test_check(axl_strcmp(buf, "      3.14") == 0,
+               "snprintf %10.3g: right-justified within width");
+    axl_snprintf(buf, sizeof(buf), "%-10.3g|", 3.14159);
+    test_check(axl_strcmp(buf, "3.14      |") == 0,
+               "snprintf %-10.3g: left-justified within width");
+}
+
 // ---------------------------------------------------------------------------
 // Number parsing tests
 // ---------------------------------------------------------------------------
@@ -1468,6 +1668,87 @@ test_format_bytes(void)
                "format_bytes: buffer NUL-terminated even on truncation");
 }
 
+/* Assert axl_dtoa produces exactly @a digits with decimal-point
+   position @a decpt and sign @a neg for @a value. */
+static void
+check_dtoa(double value, const char *digits, int decpt, int neg,
+           const char *label)
+{
+    char buf[AXL_DTOA_BUF_MIN];
+    int  dp = -999, ng = -1;
+    int  n = axl_dtoa(value, buf, sizeof(buf), &dp, &ng);
+    bool ok = n == (int)axl_strlen(digits)
+              && axl_strcmp(buf, digits) == 0
+              && dp == decpt
+              && ng == neg;
+    test_check(ok, label);
+}
+
+static void
+test_dtoa(void)
+{
+    /* Shortest round-trippable digits + decimal-point position.
+       decpt = number of digits left of the point: value magnitude is
+       <digits-as-int> x 10^(decpt - ndigits). */
+    check_dtoa(0.0,    "0", 1, 0, "dtoa: 0.0 -> \"0\" decpt 1");
+    check_dtoa(1.0,    "1", 1, 0, "dtoa: 1.0 -> \"1\" decpt 1");
+    check_dtoa(1.5,    "15", 1, 0, "dtoa: 1.5 -> \"15\" decpt 1");
+    check_dtoa(100.0,  "1", 3, 0, "dtoa: 100.0 -> \"1\" decpt 3 (no trailing zeros)");
+    check_dtoa(0.5,    "5", 0, 0, "dtoa: 0.5 -> \"5\" decpt 0");
+    check_dtoa(0.001,  "1", -2, 0, "dtoa: 0.001 -> \"1\" decpt -2");
+    check_dtoa(0.1,    "1", 0, 0, "dtoa: 0.1 -> \"1\" decpt 0 (shortest, not 0.1000..)");
+    check_dtoa(0.3,    "3", 0, 0, "dtoa: 0.3 -> \"3\" decpt 0");
+    check_dtoa(1234.5, "12345", 4, 0, "dtoa: 1234.5 -> \"12345\" decpt 4");
+
+    /* Sign, including negative zero. */
+    check_dtoa(-1.5,   "15", 1, 1, "dtoa: -1.5 keeps digits, neg flag set");
+    check_dtoa(-0.0,   "0", 1, 1, "dtoa: -0.0 -> \"0\" with neg flag set");
+
+    /* Round-trip-critical values that distinguish shortest from naive.
+       1.0/3.0 is the nearest double to 1/3; its shortest form is
+       0.3333333333333333 (16 threes). */
+    check_dtoa(1.0 / 3.0, "3333333333333333", 0, 0,
+               "dtoa: 1/3 -> 16 threes (shortest round-trip)");
+    /* 2^53 + 1 is not representable; 2^53 is, exactly. */
+    check_dtoa(9007199254740992.0, "9007199254740992", 16, 0,
+               "dtoa: 2^53 exact integer");
+
+    /* Powers of ten and two stay short. */
+    check_dtoa(1e20, "1", 21, 0, "dtoa: 1e20 -> \"1\" decpt 21");
+    check_dtoa(1024.0, "1024", 4, 0, "dtoa: 1024 -> \"1024\" decpt 4");
+
+    /* Magnitude extremes — these exercise the cached-powers table at
+       both ends (top/bottom indices) and drive the fractional digit
+       loop to its deepest realistic point, validating the hand-
+       transcribed table end-to-end. */
+    check_dtoa(1.7976931348623157e308, "17976931348623157", 309, 0,
+               "dtoa: DBL_MAX shortest digits + decpt 309");
+    check_dtoa(2.2250738585072014e-308, "22250738585072014", -307, 0,
+               "dtoa: DBL_MIN (smallest normal) shortest digits + decpt -307");
+    check_dtoa(5e-324, "5", -323, 0,
+               "dtoa: smallest subnormal -> \"5\" decpt -323");
+
+    /* Argument validation: NULL buf, undersized buf, non-finite. */
+    char small[4];
+    test_check(axl_dtoa(1.5, NULL, AXL_DTOA_BUF_MIN, NULL, NULL) == 0,
+               "dtoa: NULL buf returns 0");
+    test_check(axl_dtoa(1.5, small, sizeof(small), NULL, NULL) == 0,
+               "dtoa: undersized buf returns 0");
+    char buf[AXL_DTOA_BUF_MIN];
+    double zero = 0.0;
+    double nan_v = zero / zero;       /* not finite */
+    double inf_v = 1e308 * 10.0;      /* +inf */
+    test_check(axl_dtoa(nan_v, buf, sizeof(buf), NULL, NULL) == 0,
+               "dtoa: NaN returns 0 (caller handles non-finite)");
+    test_check(axl_dtoa(inf_v, buf, sizeof(buf), NULL, NULL) == 0,
+               "dtoa: +inf returns 0");
+
+    /* NULL out params are allowed (just the digit string wanted). */
+    int n = axl_dtoa(42.0, buf, sizeof(buf), NULL, NULL);
+    test_check(n == 2 && axl_strcmp(buf, "42") == 0,
+               "dtoa: NULL out_decpt/out_neg OK; digits still written");
+}
+
 static void
 test_format(void)
 {
@@ -1544,6 +1825,9 @@ test_strbuf_main(
     test_memcpy();
     test_memset();
     test_snprintf();
+    test_snprintf_float();
+    test_snprintf_exp_g();
+    test_dtoa();
     test_format_bytes();
     test_strtou64();
     test_strtou64_with_offset();

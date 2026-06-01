@@ -48,11 +48,15 @@ typedef enum {
 /**
  * AxlInputKey:
  *
- * Keyboard input. Mirrors UEFI EFI_INPUT_KEY layout.
+ * Keyboard input. `scan_code` / `unicode_char` mirror UEFI
+ * EFI_INPUT_KEY; `modifiers` carries the normalized held-modifier and
+ * lock state (AXL_INPUT_MOD_* bits from <axl/axl-input.h>), or 0 when
+ * the platform can't report it (no SimpleTextInputEx / serial).
  */
 typedef struct {
     uint16_t scan_code;    ///< function/arrow key scan code (0 for printable chars)
     uint16_t unicode_char; ///< printable character (0 for special keys)
+    uint32_t modifiers;    ///< AXL_INPUT_MOD_* held + lock state (0 if unavailable)
 } AxlInputKey;
 
 /// Return from callback to keep the source active.

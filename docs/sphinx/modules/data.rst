@@ -37,6 +37,16 @@ AxlRadixTree
 
 .. doxygenfile:: axl-radix-tree.h
 
+AxlNTree
+~~~~~~~~
+
+.. doxygenfile:: axl-ntree.h
+
+AxlTree
+~~~~~~~
+
+.. doxygenfile:: axl-tree.h
+
 AxlRingBuf
 ~~~~~~~~~~
 

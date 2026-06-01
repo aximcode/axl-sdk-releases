@@ -72,10 +72,15 @@ Event kinds shipped in v0.1:
 | `AXL_INPUT_TOUCH_UP` | touch | contact end (non-zero → 0) |
 | `AXL_INPUT_TOUCH_MOVE` | touch | active contact, position changed |
 
-Modifier bits (`AXL_INPUT_MOD_SHIFT` / `CTRL` / `ALT` / `META`) and
-`AXL_INPUT_KEY_UP` events require `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`
-— deferred until a consumer asks. For v0.1, `modifiers == 0` and only
-`KEY_DOWN` fires.
+`KEY_DOWN` events carry modifier + lock state in `modifiers`:
+held `SHIFT` / `CTRL` / `ALT` / `META` (left/right-distinct bits plus
+side-agnostic masks — `AXL_INPUT_MOD_SHIFT == LSHIFT | RSHIFT`) and
+`CAPS_LOCK` / `NUM_LOCK` / `SCROLL_LOCK`. These come from
+`EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`; when the firmware doesn't publish
+it (e.g. a serial console), `modifiers == 0` — treat absent modifiers
+as "none". Only `KEY_DOWN` fires: UEFI delivers no key-up or
+standalone-modifier events. (The live keyboard read is exercised on
+real hardware, not in the QEMU serial test harness.)
 
 ## Usage
 

@@ -11,9 +11,11 @@
 #define AXL_GFX_PATH_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-gfx-types.h>
+#include <axl/axl-gfx-gradient.h>   /* gradient-fill variants below */
 
 #ifdef __cplusplus
 extern "C" {
@@ -140,10 +142,11 @@ axl_gfx_path_close(
 ///
 /// Uses even-odd fill rule for nested subpaths.  Edges are anti-
 /// aliased: pixels straddling the path boundary are blended into
-/// the active draw target via their fractional coverage (4x4
-/// supersampled in the current implementation).  Honors the
+/// the active draw target via their exact fractional coverage
+/// (computed by an analytic scanline rasterizer).  Honors the
 /// active clip stack and draw target; alpha-blends on buffer
-/// targets where supported.
+/// targets where supported.  Open subpaths are implicitly closed
+/// for filling.
 ///
 /// @return AXL_OK on success.  AXL_ERR if @a p is NULL, the path
 ///         is empty, or the active target is the screen and GOP
@@ -154,19 +157,92 @@ axl_gfx_fill_path(
     AxlGfxPixel        color   ///< fill color
     );
 
-/// Stroke the outline of @a p with @a color and width @a w.
+/// Fill @a p with a gradient instead of a solid color.
 ///
-/// Width is honored as a 1-pixel-thick edge regardless of @a w
-/// in the current implementation (proper thick-line rendering
-/// awaits a future batch).  Honors clip + draw target.
+/// Identical rasterization to `axl_gfx_fill_path` (even-odd,
+/// anti-aliased, honors clip + draw target), except each covered
+/// pixel takes its color from @a g sampled at that pixel
+/// (`axl_gfx_gradient_sample`) modulated by edge coverage. A gradient
+/// with no stops paints nothing.
 ///
-/// @return AXL_OK on success.  AXL_ERR if @a p is NULL or the
+/// @return AXL_OK on success.  AXL_ERR if @a p is NULL / empty, @a g
+///         is NULL, or the active target is the screen and GOP is
+///         unavailable.
+int
+axl_gfx_fill_path_gradient(
+    const AxlGfxPath      *p,   ///< [in] path to fill
+    const AxlGfxGradient  *g    ///< [in] gradient to sample
+    );
+
+/// Line-cap style for the open ends of a stroked subpath.
+typedef enum {
+    AXL_GFX_CAP_BUTT   = 0,  ///< flush square end exactly at the endpoint (default)
+    AXL_GFX_CAP_ROUND  = 1,  ///< semicircular end, radius = width/2
+    AXL_GFX_CAP_SQUARE = 2,  ///< square end projecting width/2 past the endpoint
+} AxlGfxLineCap;
+
+/// Line-join style for the corners between stroked segments.
+typedef enum {
+    AXL_GFX_JOIN_MITER = 0,  ///< sharp projected corner, clamped by miter_limit (default)
+    AXL_GFX_JOIN_ROUND = 1,  ///< rounded corner, radius = width/2
+    AXL_GFX_JOIN_BEVEL = 2,  ///< flat chamfered corner
+} AxlGfxLineJoin;
+
+/// Stroke styling for `axl_gfx_stroke_path_ex`.  A zero-initialized
+/// value is a valid CSS-style default (butt caps, miter joins) once
+/// @a width is set.
+typedef struct {
+    float           width;        ///< stroke width in pixels (<= 0: no-op)
+    AxlGfxLineCap   cap;          ///< end-cap style (open subpaths + dash ends)
+    AxlGfxLineJoin  join;         ///< corner style between segments
+    float           miter_limit;  ///< max miterLength/strokeWidth = 1/sin(θ/2) (SVG/Canvas); <= 0 → default 10
+    const float    *dashes;       ///< on/off dash lengths in pixels, alternating on,off,…; NULL = solid
+    size_t          n_dashes;     ///< number of entries in @a dashes (0 = solid; odd repeats to even, SVG-style)
+    float           dash_offset;  ///< phase: distance into the pattern at each subpath start
+} AxlGfxStrokeStyle;
+
+/// Stroke the outline of @a p with @a color and explicit @a style.
+///
+/// The stroke is anti-aliased (shares the path fill rasterizer) and
+/// honors width, caps (butt / round / square), and joins (miter with
+/// @a miter_limit / round / bevel).  Miters that exceed the limit fall
+/// back to a bevel.  Closed subpaths are joined all round (no caps);
+/// open subpaths are capped at both ends.
+///
+/// When @a style->dashes is non-NULL with @a n_dashes > 0, each
+/// subpath is split into on/off intervals by the dash pattern (each
+/// "on" interval is stroked as its own capped open piece, honoring the
+/// @a cap style at its ends).  @a dash_offset shifts the pattern start.
+/// An empty / all-zero / negative pattern (or one with no element long
+/// enough to advance) strokes solid.  On a closed subpath the dashes at
+/// the start/end seam are not merged (each is capped) — a minor
+/// fidelity gap vs SVG; the FreeType backend handles it.
+///
+/// Honors the active clip stack and draw target.  @a style->width <= 0
+/// is a no-op success.
+///
+/// @return AXL_OK on success (including the no-op width <= 0 case).
+///         AXL_ERR if @a p or @a style is NULL, on allocation failure,
+///         or the active target is the screen and GOP is unavailable.
+int
+axl_gfx_stroke_path_ex(
+    const AxlGfxPath         *p,      ///< [in] path to stroke
+    AxlGfxPixel               color,  ///< stroke color
+    const AxlGfxStrokeStyle  *style   ///< [in] cap / join / width / miter
+    );
+
+/// Stroke @a p with @a color and width @a w — convenience wrapper
+/// over `axl_gfx_stroke_path_ex` with the default style (butt caps,
+/// miter joins, miter limit 10).
+///
+/// @return AXL_OK on success (including the no-op @a w <= 0 case).
+///         AXL_ERR if @a p is NULL, on allocation failure, or the
 ///         active target is the screen and GOP is unavailable.
 int
 axl_gfx_stroke_path(
     const AxlGfxPath  *p,      ///< [in] path to stroke
     AxlGfxPixel        color,  ///< stroke color
-    float              w       ///< stroke width in pixels (currently 1)
+    float              w       ///< stroke width in pixels
     );
 
 /// Fill a rectangle with rounded corners — immediate-mode helper.
@@ -191,6 +267,26 @@ axl_gfx_fill_rounded_rect(
     int32_t      h,        ///< height in pixels (<= 0: no-op)
     float        radius,   ///< corner radius (clamped to min(w,h)/2)
     AxlGfxPixel  color     ///< fill color
+    );
+
+/// Fill a rounded rectangle with a gradient instead of a solid color.
+///
+/// Same geometry/clamping/AA as `axl_gfx_fill_rounded_rect`; each
+/// pixel (straight bands and anti-aliased corners alike) takes its
+/// color from @a g sampled at that pixel. A gradient with no stops
+/// paints nothing.
+///
+/// @return AXL_OK on success (including the @a w/@a h <= 0 no-op).
+///         AXL_ERR if @a g is NULL or the active target is the screen
+///         and GOP is unavailable.
+int
+axl_gfx_fill_rounded_rect_gradient(
+    int32_t                x,        ///< left edge (may be negative)
+    int32_t                y,        ///< top edge (may be negative)
+    int32_t                w,        ///< width in pixels (<= 0: no-op)
+    int32_t                h,        ///< height in pixels (<= 0: no-op)
+    float                  radius,   ///< corner radius (clamped to min(w,h)/2)
+    const AxlGfxGradient  *g         ///< [in] gradient to sample
     );
 
 #ifdef __cplusplus

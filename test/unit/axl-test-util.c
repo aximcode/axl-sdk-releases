@@ -4,6 +4,7 @@
 
 #include "axl-test.h"
 #include <axl/axl-smbios.h>
+#include <axl/axl-sort.h>
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -3954,6 +3955,109 @@ test_cpu_register_exception(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_cpu_features / simd_tier / enable_avx
+//
+// Assertions are arch-NEUTRAL (vacuously satisfied on the inapplicable
+// architecture) so X64 and AARCH64 run the same number of checks — the
+// suite requires identical per-arch counts.  They are also CPU-MODEL
+// neutral: only the implication chains and the SSE2/NEON baseline
+// guarantee are asserted, never "AVX is present" (qemu64 in CI has no
+// AVX; -cpu host does).
+// ---------------------------------------------------------------------------
+
+static void
+test_cpu_features(void)
+{
+    const AxlCpuFeatures *f = axl_cpu_features();
+    test_check(f != NULL, "cpu_features: returns non-NULL");
+    test_check(axl_cpu_features() == f, "cpu_features: cached (stable pointer)");
+
+    /* Exactly one 128-bit baseline ISA — SSE2 on x86, NEON on aarch64 —
+       and the two are mutually exclusive across our target arches. */
+    test_check(f != NULL && (f->sse2 || f->neon),
+               "cpu_features: a 128-bit baseline ISA is present");
+    test_check(f != NULL && (f->sse2 != f->neon),
+               "cpu_features: exactly one of sse2/neon (arch-exclusive)");
+
+    /* Capability implication chains — hold on any real CPU model, and
+       vacuously on the arch where the antecedent is false. */
+    test_check(f != NULL && (!f->avx2  || f->avx),   "cpu_features: avx2 => avx");
+    test_check(f != NULL && (!f->avx   || f->xsave), "cpu_features: avx => xsave");
+    test_check(f != NULL && (!f->sse42 || f->sse41), "cpu_features: sse4.2 => sse4.1");
+    test_check(f != NULL && (!f->fma   || f->avx),   "cpu_features: fma => avx");
+}
+
+static void
+test_cpu_simd_tier(void)
+{
+    const AxlCpuFeatures *f = axl_cpu_features();
+    AxlSimdTier t = axl_cpu_simd_tier();
+    test_check(t >= AXL_SIMD_BASELINE,
+               "simd_tier: at least BASELINE on our targets");
+    /* A NEON-only (aarch64) target never exceeds the 128-bit baseline. */
+    test_check(!f->neon || t == AXL_SIMD_BASELINE,
+               "simd_tier: NEON-only target caps at BASELINE");
+    /* The AVX2 tier requires the AVX2 capability (necessary condition,
+       model-neutral) — and is never reported before enable_avx() makes
+       the YMM state live, which this test has not yet called. */
+    test_check(t != AXL_SIMD_AVX2 || f->avx2,
+               "simd_tier: AVX2 tier requires the avx2 capability");
+}
+
+static void
+test_cpu_enable_avx(void)
+{
+    const AxlCpuFeatures *f = axl_cpu_features();
+    bool ok = axl_cpu_enable_avx();
+    /* Enabling succeeds iff the CPU actually has AVX to enable. */
+    test_check(ok == f->avx, "enable_avx: succeeds iff CPU has AVX");
+    test_check(axl_cpu_enable_avx() == ok, "enable_avx: idempotent");
+    /* NEON-only (aarch64) target has no AVX to enable. */
+    test_check(!f->neon || !ok, "enable_avx: false on NEON-only target");
+    /* Tier is consistent with the post-enable state on THIS cpu: `ok`
+       is this processor's enable result, and simd_tier() reads the live
+       CR4/XCR0 state, so the two must agree. */
+    AxlSimdTier t = axl_cpu_simd_tier();
+    test_check((f->avx2 && ok) ? (t == AXL_SIMD_AVX2)
+                               : (t <= AXL_SIMD_SSE41),
+               "enable_avx: tier matches this-cpu avx2-enabled state");
+}
+
+static void
+test_cpu_features_extended(void)
+{
+    /* Catalog implication chains — hold on any real CPU model, vacuous
+       on the arch where the antecedent is false (so identical count on
+       both arches). */
+    const AxlCpuFeatures *f = axl_cpu_features();
+    /* x86 AVX-512 sub-features imply the Foundation, which implies AVX. */
+    test_check(!f->avx512dq   || f->avx512f, "feat: avx512dq => avx512f");
+    test_check(!f->avx512bw   || f->avx512f, "feat: avx512bw => avx512f");
+    test_check(!f->avx512vl   || f->avx512f, "feat: avx512vl => avx512f");
+    test_check(!f->avx512cd   || f->avx512f, "feat: avx512cd => avx512f");
+    test_check(!f->avx512vnni || f->avx512f, "feat: avx512vnni => avx512f");
+    test_check(!f->avx512f    || f->avx,     "feat: avx512f => avx");
+    /* aarch64 field encodings: PMULL is the >=2 level of the AES field,
+       SHA512 the >=2 level of the SHA2 field. */
+    test_check(!f->pmull  || f->aes_a64, "feat: pmull => aes (aarch64)");
+    test_check(!f->sha512 || f->sha2,    "feat: sha512 => sha2 (aarch64)");
+}
+
+static void
+test_cpu_enable_avx512(void)
+{
+    const AxlCpuFeatures *f = axl_cpu_features();
+    bool e5 = axl_cpu_enable_avx512();
+    /* Only succeeds on a CPU that actually has AVX-512F. */
+    test_check(!e5 || f->avx512f, "enable_avx512: success implies avx512f");
+    test_check(axl_cpu_enable_avx512() == e5, "enable_avx512: idempotent");
+    /* Enabling AVX-512 state implies AVX (YMM) state is also live. */
+    test_check(!e5 || axl_cpu_enable_avx(), "enable_avx512: implies AVX enabled");
+    /* NEON-only (aarch64) target has no AVX-512. */
+    test_check(!f->neon || !e5, "enable_avx512: false on NEON-only target");
+}
+
+// ---------------------------------------------------------------------------
 // AxlImage — load + unload of a known test EFI on fs0:
 // ---------------------------------------------------------------------------
 
@@ -5752,6 +5856,257 @@ test_args_get_uint_offset(void)
 }
 
 // ---------------------------------------------------------------------------
+// Sort Tests (axl_qsort / axl_qsort_with_data — introsort)
+// ---------------------------------------------------------------------------
+
+static int
+sort_cmp_int(const void *a, const void *b)
+{
+    int va = *(const int *)a;
+    int vb = *(const int *)b;
+
+    if (va < vb) { return -1; }
+    if (va > vb) { return 1; }
+    return 0;
+}
+
+static int
+sort_cmp_int_data(const void *a, const void *b, void *user_data)
+{
+    int va = *(const int *)a;
+    int vb = *(const int *)b;
+    int descending = *(int *)user_data;
+    int rc;
+
+    if (va < vb) { rc = -1; }
+    else if (va > vb) { rc = 1; }
+    else { rc = 0; }
+
+    return descending ? -rc : rc;
+}
+
+// Deterministic LCG so the "large random" case is reproducible.
+static uint32_t
+sort_lcg(uint32_t *state)
+{
+    *state = (*state * 1103515245u) + 12345u;
+    return *state;
+}
+
+static bool
+sort_is_ascending(const int *a, size_t n)
+{
+    for (size_t i = 1; i < n; i++) {
+        if (a[i - 1] > a[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_qsort_basic(void)
+{
+    int a[] = { 5, 3, 8, 1, 9, 2, 7, 4, 6, 0 };
+    size_t n = sizeof(a) / sizeof(a[0]);
+
+    axl_qsort(a, n, sizeof(a[0]), sort_cmp_int);
+
+    bool ok = true;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != (int)i) {
+            ok = false;
+        }
+    }
+    test_check(ok, "qsort: 0..9 fully ordered");
+}
+
+static void
+test_qsort_already_sorted(void)
+{
+    int a[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    size_t n = sizeof(a) / sizeof(a[0]);
+
+    axl_qsort(a, n, sizeof(a[0]), sort_cmp_int);
+
+    bool ok = (a[0] == 1 && a[7] == 8 && sort_is_ascending(a, n));
+    test_check(ok, "qsort: already-sorted stays sorted");
+}
+
+static void
+test_qsort_reverse(void)
+{
+    int a[] = { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
+    size_t n = sizeof(a) / sizeof(a[0]);
+
+    axl_qsort(a, n, sizeof(a[0]), sort_cmp_int);
+
+    bool ok = (a[0] == 0 && a[n - 1] == 9 && sort_is_ascending(a, n));
+    test_check(ok, "qsort: reverse-sorted becomes ascending");
+}
+
+static void
+test_qsort_all_equal(void)
+{
+    int a[] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+    size_t n = sizeof(a) / sizeof(a[0]);
+
+    axl_qsort(a, n, sizeof(a[0]), sort_cmp_int);
+
+    bool ok = true;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != 7) {
+            ok = false;
+        }
+    }
+    test_check(ok, "qsort: all-equal preserved (no corruption)");
+}
+
+static void
+test_qsort_edge_sizes(void)
+{
+    int empty[1] = { 42 };
+    int one[1] = { 99 };
+    int two_a[2] = { 2, 1 };
+    int two_b[2] = { 1, 2 };
+
+    // nmemb 0 and 1 are no-ops; must not touch memory or crash.
+    axl_qsort(empty, 0, sizeof(int), sort_cmp_int);
+    test_check(empty[0] == 42, "qsort: nmemb 0 is a no-op");
+
+    axl_qsort(one, 1, sizeof(int), sort_cmp_int);
+    test_check(one[0] == 99, "qsort: nmemb 1 is a no-op");
+
+    axl_qsort(two_a, 2, sizeof(int), sort_cmp_int);
+    test_check(two_a[0] == 1 && two_a[1] == 2, "qsort: 2 elements swapped");
+
+    axl_qsort(two_b, 2, sizeof(int), sort_cmp_int);
+    test_check(two_b[0] == 1 && two_b[1] == 2, "qsort: 2 elements kept");
+}
+
+static void
+test_qsort_null_guards(void)
+{
+    int a[] = { 3, 1, 2 };
+
+    // Each of these must be a safe no-op (no crash, array untouched).
+    axl_qsort(NULL, 3, sizeof(int), sort_cmp_int);
+    axl_qsort(a, 3, sizeof(int), NULL);
+    axl_qsort(a, 3, 0, sort_cmp_int);
+
+    bool ok = (a[0] == 3 && a[1] == 1 && a[2] == 2);
+    test_check(ok, "qsort: NULL/zero-size guards leave input untouched");
+}
+
+static void
+test_qsort_large_random(void)
+{
+    enum { N = 4096 };
+    static int a[N];
+    uint32_t state = 0x1234abcdu;
+
+    for (size_t i = 0; i < N; i++) {
+        // Narrow value range (0..255) exercises duplicate handling in the
+        // partition. Values stay well-distributed, so median-of-three keeps
+        // recursion balanced — this is the quicksort/insertion path, not the
+        // heapsort fallback (see test_qsort_heapsort_fallback for that).
+        a[i] = (int)(sort_lcg(&state) % 256u);
+    }
+
+    axl_qsort(a, N, sizeof(a[0]), sort_cmp_int);
+
+    test_check(sort_is_ascending(a, N), "qsort: 4096 random ints ascending");
+}
+
+static void
+test_qsort_heapsort_fallback(void)
+{
+    // A large mostly-equal array drives the Lomuto partition into maximally
+    // unbalanced splits (each level peels off only the pivot), so recursion
+    // depth blows past the 2*log2(n) limit and introsort bails to its
+    // heapsort fallback. The distinct sentinels among the duplicates must
+    // still come out correctly ordered through that path — in particular the
+    // three large values exercise heapsort's ordering of distinct keys.
+    enum { N = 128 };
+    static int a[N];
+
+    for (size_t i = 0; i < N; i++) {
+        a[i] = 100;
+    }
+    a[3]  = 1;    // small sentinels — sort to the front
+    a[70] = 2;
+    a[120] = 3;
+    a[40] = 200;  // large distinct sentinels — heapsort must order these
+    a[41] = 150;
+    a[42] = 120;
+
+    axl_qsort(a, N, sizeof(a[0]), sort_cmp_int);
+
+    // Expected: [1, 2, 3, 100 x122, 120, 150, 200]
+    bool ok = sort_is_ascending(a, N);
+    if (a[0] != 1 || a[1] != 2 || a[2] != 3) { ok = false; }
+    if (a[125] != 120 || a[126] != 150 || a[127] != 200) { ok = false; }
+    for (size_t i = 3; i <= 124; i++) {
+        if (a[i] != 100) { ok = false; }
+    }
+    test_check(ok, "qsort: heapsort fallback orders distinct sentinels");
+}
+
+typedef struct {
+    int      key;
+    uint8_t  pad[80]; // > mem_swap chunk (64) to exercise chunked + tail swap
+} SortBig;
+
+static int
+sort_cmp_big(const void *a, const void *b)
+{
+    return sort_cmp_int(&((const SortBig *)a)->key, &((const SortBig *)b)->key);
+}
+
+static void
+test_qsort_large_elements(void)
+{
+    enum { N = 50 };
+    static SortBig a[N];
+    uint32_t state = 0xdeadbeefu;
+
+    for (size_t i = 0; i < N; i++) {
+        a[i].key = (int)(sort_lcg(&state) % 1000u);
+        a[i].pad[0] = (uint8_t)a[i].key;   // tie payload to key
+        a[i].pad[79] = (uint8_t)(a[i].key ^ 0xFF);
+    }
+
+    axl_qsort(a, N, sizeof(SortBig), sort_cmp_big);
+
+    bool ok = true;
+    for (size_t i = 0; i < N; i++) {
+        // Sorted by key AND payload moved intact with its element.
+        if (a[i].pad[0] != (uint8_t)a[i].key) { ok = false; }
+        if (a[i].pad[79] != (uint8_t)(a[i].key ^ 0xFF)) { ok = false; }
+        if (i > 0 && a[i - 1].key > a[i].key) { ok = false; }
+    }
+    test_check(ok, "qsort: 80-byte elements move payload intact, ordered");
+}
+
+static void
+test_qsort_with_data_descending(void)
+{
+    int a[] = { 5, 3, 8, 1, 9, 2, 7, 4, 6, 0 };
+    size_t n = sizeof(a) / sizeof(a[0]);
+    int descending = 1;
+
+    axl_qsort_with_data(a, n, sizeof(a[0]), sort_cmp_int_data, &descending);
+
+    bool ok = true;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != (int)(9 - i)) {
+            ok = false;
+        }
+    }
+    test_check(ok, "qsort_with_data: descending 9..0");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -5784,6 +6139,11 @@ test_util_main(int argc, char **argv)
     test_app_boot_path();
     test_image_enumerate();
     test_cpu_register_exception();
+    test_cpu_features();
+    test_cpu_simd_tier();
+    test_cpu_enable_avx();
+    test_cpu_features_extended();
+    test_cpu_enable_avx512();
     test_image();
     test_image_verify_signature();
     test_image_verify_cn_extract();
@@ -5823,6 +6183,16 @@ test_util_main(int argc, char **argv)
     test_shared_driver();
     test_driver_locate();
     test_diag_probe_protocol();
+    test_qsort_basic();
+    test_qsort_already_sorted();
+    test_qsort_reverse();
+    test_qsort_all_equal();
+    test_qsort_edge_sizes();
+    test_qsort_null_guards();
+    test_qsort_large_random();
+    test_qsort_heapsort_fallback();
+    test_qsort_large_elements();
+    test_qsort_with_data_descending();
 
     return test_print_results();
 }

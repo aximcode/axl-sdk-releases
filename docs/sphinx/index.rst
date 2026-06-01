@@ -40,6 +40,7 @@ AXL SDK
    modules/config
    modules/subcommand
    modules/path
+   modules/sort
    modules/loop
    modules/task
    modules/event
@@ -48,6 +49,7 @@ AXL SDK
    modules/net
    modules/tls
    modules/sys
+   modules/cpu
    modules/port
    modules/boot
    modules/image
@@ -56,6 +58,7 @@ AXL SDK
    modules/rng
    modules/gfx
    modules/truetype
+   modules/display-list
    modules/pixmap
    modules/input
    modules/smbios

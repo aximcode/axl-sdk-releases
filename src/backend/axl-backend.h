@@ -684,13 +684,14 @@ axl_backend_console_read_key(
     );
 
 /**
- * @brief Read a keystroke from ConIn including shift-state info.
+ * @brief Read a keystroke from ConIn including modifier/lock state.
  *
- * Uses SimpleTextInputEx if available; falls back to ReadKeyStroke
- * (with @p shift_state always set to 0) when the firmware doesn't
- * publish ConsoleInHandle's ex protocol. The latter is what raw
- * serial consoles deliver — TerminalDxe carries no shift bits over
- * the wire — so a 0 result there is correct, not lossy.
+ * Uses SimpleTextInputEx if available, translating its KeyShiftState +
+ * KeyToggleState into normalized AXL_INPUT_MOD_* bits; falls back to
+ * ReadKeyStroke (with @p modifiers always 0) when the firmware doesn't
+ * publish ConsoleInHandle's ex protocol. The latter is what raw serial
+ * consoles deliver — TerminalDxe carries no shift bits over the wire —
+ * so a 0 result there is correct, not lossy.
  *
  * @return AXL_OK on success, AXL_ERR on error or no key available.
  */
@@ -698,7 +699,7 @@ int
 axl_backend_console_read_key_ex(
     uint16_t  *scan_code,     ///< (out) scan code (0 for printable)
     uint16_t  *unicode_char,  ///< (out) unicode character (0 for special)
-    uint32_t  *shift_state    ///< (out) KeyShiftState bits (0 if unavailable)
+    uint32_t  *modifiers      ///< (out) AXL_INPUT_MOD_* bits (0 if unavailable)
     );
 
 /**

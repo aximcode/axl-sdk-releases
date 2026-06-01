@@ -86,6 +86,60 @@ apply this internally when both the target is a buffer and the source
 alpha is non-zero and non-opaque. Screen targets degrade to opaque
 draws — render to a back-buffer first for translucent overlays.
 
+The constant-color source-over fill (a translucent `fill_rect` onto a
+buffer) is **SIMD-accelerated** via `axl_cpu_simd_tier()` — an AVX2,
+SSE2 (the x86-64 baseline, so every x86 build benefits), or NEON row
+kernel, bit-identical to the scalar formula above (the `/255` uses the
+exact `(Y + (Y>>8) + 1) >> 8` identity, valid because the numerator is
+≤ 255²+127). The separable PDF blend modes below stay on the scalar
+path. See the ``AxlCpu <cpu.html>``_ module for the dispatch machinery.
+
+### Gamma-correct (linear-light) compositing
+
+By default compositing happens in gamma-encoded sRGB (free, matches
+Cairo/Blend2D). `axl_gfx_set_gamma_correct(true)` switches buffer-target
+alpha/coverage compositing to **linear light** — decode src+dst
+sRGB→linear, blend, re-encode — which is the physically correct way to
+mix light. It removes the "dark fringe" on anti-aliased text and path
+edges (thin text keeps its weight) and corrects the brightness of
+translucent overlays and fades. It's a module-global flag (save/restore
+via `axl_gfx_get_gamma_correct`, off by default), costs two small lazily
+-built LUTs, and applies uniformly under every compositing primitive.
+The sRGB transfer functions are exposed as `axl_gfx_srgb_to_linear` /
+`axl_gfx_linear_to_srgb` for consumers doing their own color math.
+Gradient color ramps also honor the flag (interpolated in linear light
+for even, dark-dip-free transitions). The remaining sRGB-only paths are
+the separable PDF blend *functions* (multiply/screen/…).
+
+### Blend modes
+
+`axl_gfx_set_blend_mode(mode)` selects how subsequent draws composite —
+the standard separable blend functions on top of source-over:
+
+| Mode | Effect |
+|------|--------|
+| `AXL_GFX_BLEND_OVER` | normal source-over (default) |
+| `AXL_GFX_BLEND_MULTIPLY` | darken: `Cb·Cs/255` |
+| `AXL_GFX_BLEND_SCREEN` | lighten: `255−(255−Cb)(255−Cs)/255` |
+| `AXL_GFX_BLEND_OVERLAY` | contrast (multiply or screen per backdrop) |
+| `AXL_GFX_BLEND_DARKEN` / `_LIGHTEN` | per-channel min / max |
+| `AXL_GFX_BLEND_ADD` | additive, clamped to 255 |
+
+It is module-global graphics state (like the draw target and clip
+stack); every compositing primitive on a **buffer target** honors it —
+fills, gradients, lines, text (bitmap + vector), and
+`axl_gfx_blit_transform` — *including opaque draws* (an opaque source under
+`MULTIPLY` still multiplies). Save/restore with `axl_gfx_get_blend_mode`
+and reset to `AXL_GFX_BLEND_OVER` for normal drawing. The raw-copy
+`axl_gfx_blit` and screen (GOP) targets are exempt (no compositing).
+`axl_gfx_blend_ex(dst, src, mode)` exposes the pure per-pixel math.
+
+```c
+axl_gfx_set_blend_mode(AXL_GFX_BLEND_MULTIPLY);
+axl_gfx_fill_rect(0, 0, w, h, shadow);   // multiplies onto the backdrop
+axl_gfx_set_blend_mode(AXL_GFX_BLEND_OVER);
+```
+
 ## Drawing Primitives
 
 | Primitive | Function | Notes |
@@ -97,11 +151,15 @@ draws — render to a back-buffer first for translucent overlays.
 | Line | `axl_gfx_draw_line` | Bresenham, signed origins, inclusive endpoints |
 | Polyline | `axl_gfx_draw_polyline` | Connected segments through `AxlGfxPoint[]` |
 | Path fill | `axl_gfx_fill_path` | 4x4-supersampled even-odd rasterizer; see "Paths" below |
-| Path stroke | `axl_gfx_stroke_path` | 1-px line segments along the path |
+| Path stroke | `axl_gfx_stroke_path` / `_ex` | width-`w` anti-aliased stroke; caps butt/round/square, joins miter/round/bevel, dashes (`AxlGfxStrokeStyle`); offset geometry filled non-zero — see `axl-gfx-stroke.c` |
 | Blit | `axl_gfx_blit` | Copy a pixel buffer onto the target |
+| Pattern fill | `axl_gfx_fill_pattern` | Tile an `AxlGfxBuffer` over a rect; `AxlGfxRepeat` BOTH/X/Y/NONE (CSS `background-repeat`), anchored at the origin, honors clip + blend + per-texel alpha |
+| Color parse | `axl_gfx_color_parse` | CSS hex string → `AxlGfxPixel` (`#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`) |
 | Capture | `axl_gfx_capture` | Read screen region into a buffer |
 | Text | `axl_gfx_draw_text` | UTF-8, bitmap-font-driven, integer-scaled |
 | Text (vector) | `axl_ttf_draw` | UTF-8, TTF/OTF, fractional `px_size`; see `AxlTtf <truetype.html>`_ |
+| Text (boxed) | `axl_ttf_draw_box` / `axl_ttf_measure_box` | word-wrapped multi-line text in a rect; `\n` hard breaks, `AXL_TTF_ALIGN_*` alignment, box clip; `measure_box` for layout-before-draw |
+| Display list | `axl_gfx_display_list_new` / `axl_gfx_dl_*` / `axl_gfx_display_list_replay` | record draw ops into a retained, replayable command buffer; introspect via `_count` / `_op_at`; see ``AxlGfxDisplayList <display-list.html>``_ |
 
 Lines, outlines, signed-coord fills, and polylines accept signed
 coordinates so partly off-screen geometry is expressible directly
@@ -188,6 +246,73 @@ you want them to apply to.
 `axl_gfx_reset_clip()` empties the stack (useful for error recovery
 or app teardown); pair `push`/`pop` for normal widget-tree operation.
 
+### Non-axis-aligned (quad) clip
+
+`axl_gfx_push_clip_quad(const AxlGfxPointF q[4])` pushes a convex
+**quadrilateral** clip — the rotated/sheared counterpart to
+`axl_gfx_push_clip`. The four corners are in device/target space (any
+winding); the new region is intersected with the current top of stack,
+and `axl_gfx_pop_clip` pops it like any other. Every primitive honors
+it (fills, paths, text, blits). `axl_gfx_get_clip` still reports the
+axis-aligned bounding box. Use it to clip content inside a rotated
+panel.
+
+### Arbitrary-shape (path) clip
+
+`axl_gfx_push_clip_path(const AxlGfxPath *path)` clips to the filled
+interior of any path — concave, self-intersecting, or multi-contour
+(holed) — the foundation for CSS `clip-path`. Unlike the convex quad
+clip, it rasterizes the path (even-odd) to an 8-bit coverage **mask**
+over its device bounding box; subsequent draws are confined to the
+shape ∩ the previous clip. Hard-edged (a pixel is kept at ≥ 50%
+coverage). The path is taken in its current device coordinates (CTM not
+re-applied, as with `push_clip_quad`). Pop frees the mask. Every
+primitive honors it; on a screen target it falls to a per-pixel path
+(compose into a back-buffer for speed).
+
+## Transform-Aware Rendering
+
+For toolkits that own their own coordinate model (Qt/GTK-style), the
+`AxlTransform` (AxlMath, 3×3 double, row-major, cairo layout —
+`x' = m[0]·x + m[1]·y + m[2]`) is the currency for rotation / shear /
+non-uniform scale. Build one with the value helpers — no matrix code or
+trig at the call site:
+
+```c
+AxlTransform m = axl_transform_multiply(
+    axl_transform_rotate(angle),       // rotate about the origin first…
+    axl_transform_translate(cx, cy));  // …then place at (cx, cy)
+```
+
+(`axl_transform_identity` / `_translate` / `_scale` / `_rotate` /
+`_shear` / `_multiply` / `_invert`; `multiply(a, b)` applies `a` first,
+then `b` — cairo `cairo_matrix_multiply` order. Apply one with
+`axl_transform_map_point` / `_map_vector` — combine `_invert` +
+`_map_point` to map a device point back to local space for
+**hit-testing**.)
+
+Two primitives consume it; both compose on top of the active graphics
+transform (`axl_gfx_translate` et al.), so the effective map is
+`CTM × m` (just `m` under the default identity CTM):
+
+| What | Function | Notes |
+|------|----------|-------|
+| Vector text | `axl_ttf_draw_transform(font, utf8, px_size, &m, color)` | glyph outlines filled through `m`; anti-aliased at any angle. `m = translate(x, y)` reproduces `axl_ttf_draw`. Keep `axl_ttf_draw` for upright text (cached, faster). |
+| Image | `axl_gfx_blit_transform(src, &m)` | `m` maps source pixels into the target; bilinear-sampled (smooth under rotation/scale), source alpha honored. |
+| Clip region | `axl_gfx_push_clip_rect_transformed(rect, &m)` | clips to a rect mapped through `m` — the convex-quad clip without packing corners by hand. |
+
+Both drawing primitives are **perspective-correct for a projective `m`**
+(e.g. one from `axl_transform_quad_to_quad`): the blit inverse-maps each
+pixel through the full homography, and vector text flattens its glyph
+curves in local space before projecting (since a projective map sends
+lines to lines).  An affine `m` takes an exact, cheaper fast path.
+Geometry is assumed to stay in front of the transform's horizon (the
+same precondition as `axl_transform_map_rect`).
+
+Both honor the clip stack (including `push_clip_quad`), draw target, and
+alpha — they are paradigm-agnostic: AXL never holds the matrix, the
+caller hands it in per call.
+
 ## Double-Buffering
 
 Off-screen `AxlGfxBuffer` objects let widgets composite into a
@@ -211,6 +336,88 @@ axl_gfx_buffer_free(buf);
 it's the unconditional "swap" step. While a buffer target is active,
 the clip stack and alpha compositing apply against the buffer's pixel
 array using buffer-local coordinates.
+
+### Present pipeline (direct framebuffer + dirty rectangles)
+
+`axl_gfx_buffer_present` writes the back-buffer straight to the GOP
+linear framebuffer (`FrameBufferBase`) when one is available, honoring
+the panel's `PixelFormat` and scan-line stride. Because `AxlGfxPixel`
+is stored BGRA — matching the common GOP "BGR" format — each row is a
+single `memcpy`; an "RGB" panel gets a per-pixel red/blue swap. The
+present path is **write-only**: it never reads VRAM (uncached MMIO
+reads are catastrophically slow), so all compositing must stay in the
+RAM buffer. Panels with no linear framebuffer (`PixelBitMask`,
+`PixelBltOnly`, or a zero `FrameBufferBase`) transparently fall back to
+GOP `Blt`. The pure conversion is exposed as `axl_gfx_pack_pixel(px,
+order)` for callers writing their own framebuffer code.
+
+For incremental redraws — a moving cursor, one updated widget — present
+only what changed instead of the whole buffer:
+
+```c
+// Push just a sub-region.
+axl_gfx_buffer_present_rect(buf, dst_x, dst_y, src_x, src_y, w, h);
+
+// Or accumulate damage as you draw, then flush the union in one call.
+axl_gfx_buffer_clear_damage(buf);
+axl_gfx_target_buffer(buf);
+    axl_gfx_fill_rect(40, 40, 16, 16, AXL_GFX_RED);
+axl_gfx_target_buffer(NULL);
+axl_gfx_buffer_add_damage(buf, (AxlGfxClip){40, 40, 16, 16});
+axl_gfx_buffer_present_damage(buf, screen_x, screen_y);   // flushes + clears
+```
+
+`axl_gfx_buffer_add_damage` unions each dirty rect (clamped to the
+buffer) into a per-buffer bounding box; `axl_gfx_buffer_present_damage`
+flushes exactly that box to the screen and clears it for the next
+frame. `axl_gfx_buffer_get_damage` reports the current box (empty when
+clean). Presenting only the dirty region cuts present bandwidth by
+10–100× for typical UI updates.
+
+## Effects: Blur
+
+`axl_gfx_buffer_blur(buf, radius)` softens an off-screen buffer in
+place with a separable triangular-kernel blur (the standard
+single-pass Gaussian approximation), clamp-to-edge so borders don't
+darken. All four channels are blurred, **including alpha**, so it
+works on an alpha/shadow mask as well as on color content. `radius 0`
+is a no-op; the kernel is normalized (total intensity is preserved).
+
+The per-axis convolution is **SIMD-accelerated** via runtime dispatch
+on `axl_cpu_simd_tier()` — an AVX2 (256-bit, x86), SSE4.1 (x86), or
+NEON (AArch64) kernel, falling back to scalar on older CPUs. Every
+vectorized path is **bit-identical** to the scalar reference (only the
+per-tap multiply-accumulate is vectorized; the edge clamp and the
+final rounding divide stay scalar), so output never depends on which
+CPU ran it. On x86 the AVX2 path needs YMM state, which the dispatcher
+enables via `axl_cpu_enable_avx()` — see the
+``AxlCpu <cpu.html>``_ module for the detection/enable details.
+
+```c
+AxlGfxBuffer *b = axl_gfx_buffer_new(w, h);
+axl_gfx_target_buffer(b);
+    /* ... render a shape ... */
+axl_gfx_target_buffer(NULL);
+axl_gfx_buffer_blur(b, 8);            /* CSS filter: blur(8px) */
+axl_gfx_buffer_present(b, 0, 0);
+axl_gfx_buffer_free(b);
+```
+
+`axl_gfx_draw_shadow(src, x, y, color, radius)` builds a soft drop
+shadow on top of the blur: the shape comes from `src`'s alpha channel
+(so it works for boxes, rounded rects, or anti-aliased text), tinted
+with `color`, blurred by `radius`, and composited into the active
+target at (x, y) — pass `x + offset_x, y + offset_y` to offset the
+shadow. Draw the real content on top afterward.
+
+```c
+// `card` is a buffer with the widget rendered into it (alpha = shape)
+axl_gfx_draw_shadow(card, card_x + 2, card_y + 4,
+                    AXL_GFX_RGBA(0, 0, 0, 0x60), 8);  // soft offset shadow
+axl_gfx_buffer_present(card, card_x, card_y);          // content on top
+```
+
+See the `AxlGfx effects <gfx.html>`_ API reference.
 
 ## Text Rendering
 
@@ -250,6 +457,27 @@ unreferenced.
 ```c
 AxlTtf *f = axl_ttf_default();             /* shared; do not free */
 axl_ttf_draw(f, 20, 40, "Café — 21°C", 16.0f, AXL_GFX_WHITE);
+```
+
+`axl_ttf_draw` rasterizes glyphs with horizontal subpixel positioning
+(quarter-pixel) and caches the results per font, keyed on
+`(codepoint, px_size, subpixel offset)` with LRU eviction. The cache
+is entirely internal — no API change — so repeated text redraws (the
+common UI case) skip the rasterizer after the first frame. Glyphs at
+whole-pixel pen positions render identically to the un-cached path.
+
+For paragraphs, `axl_ttf_draw_box` wraps UTF-8 into a rectangle:
+greedy whitespace word-wrap, hard `\n` breaks, baselines advancing by
+the `axl_ttf_metrics` line-height, and horizontal alignment via
+`AXL_TTF_ALIGN_{LEFT,CENTER,RIGHT}`. A word wider than the box takes
+its own line and overflows (clipped to the box, which is pushed onto
+the clip stack for the draw). `axl_ttf_measure_box` runs the same
+layout without drawing — reporting line count plus the block width and
+height — so a widget can size itself before painting.
+
+```c
+axl_ttf_draw_box(f, 20, 40, 200, 120, paragraph, 16.0f,
+                 AXL_GFX_WHITE, AXL_TTF_ALIGN_LEFT);
 ```
 
 ### Adding a font

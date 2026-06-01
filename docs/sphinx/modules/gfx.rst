@@ -36,6 +36,14 @@ Gradients — ``<axl/axl-gfx-gradient.h>``
 
 .. doxygenfile:: axl-gfx-gradient.h
 
+Effects — ``<axl/axl-gfx-effects.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-effects.h
+
+The retained display list lives on its own page — see
+:doc:`display-list`.
+
 AxlFont — ``<axl/axl-font.h>``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

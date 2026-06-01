@@ -215,6 +215,7 @@ LIB_SOURCES = \
     src/mem/axl-intrinsics.c \
     src/mem/axl-arena.c \
     src/format/axl-format.c \
+    src/format/axl-dtoa.c \
     src/log/axl-log.c \
     src/log/axl-log-ring.c \
     src/log/axl-log-file.c \
@@ -240,6 +241,8 @@ LIB_SOURCES = \
     src/data/axl-xml-parse.c \
     src/data/axl-cache.c \
     src/data/axl-radix-tree.c \
+    src/data/axl-ntree.c \
+    src/data/axl-tree.c \
     src/data/axl-ring-buf.c \
     src/data/axl-digest.c \
     src/data/axl-digest-md5.c \
@@ -272,6 +275,7 @@ LIB_SOURCES = \
     src/util/axl-config.c \
     src/util/axl-subcommand.c \
     src/util/axl-args.c \
+    src/util/axl-sort.c \
     src/util/axl-console.c \
     src/util/axl-image-verify.c \
     src/smbios/axl-smbios.c \
@@ -328,7 +332,11 @@ LIB_SOURCES = \
     src/gfx/axl-truetype.c \
     src/gfx/axl-pixmap.c \
     src/gfx/axl-gfx-path.c \
+    src/gfx/axl-gfx-stroke.c \
+    src/gfx/axl-gfx-rasterize.c \
     src/gfx/axl-gfx-gradient.c \
+    src/gfx/axl-gfx-effects.c \
+    src/gfx/axl-gfx-display-list.c \
     src/math/axl-math.c \
     src/gfx/fonts/font-edk2-laffstd.c \
     src/gfx/fonts/font-unifont-16.c \
@@ -494,7 +502,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo input-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset
+.PHONY: all clean clean-tools hello gfx-demo input-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -678,6 +686,53 @@ $(PREFIX)/gfx-demo.efi: $(BUILDDIR)/gfx-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-demo.o,$@)
 
 $(BUILDDIR)/gfx-demo.o: sdk/examples/gfx-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build gfx-present-selftest.efi — GOP present-pipeline round-trip
+# test (G17 + G18).  Run under scripts/run-qemu.sh --gpu by
+# test/integration/test-gfx-present-qemu.sh; not part of the
+# -nographic unit suite (no GOP there).
+# ===================================================================
+
+gfx-present-selftest: $(PREFIX)/gfx-present-selftest.efi
+	@echo "  Built: $(PREFIX)/gfx-present-selftest.efi"
+
+$(PREFIX)/gfx-present-selftest.efi: $(BUILDDIR)/gfx-present-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-present-selftest.o,$@)
+
+$(BUILDDIR)/gfx-present-selftest.o: test/integration/gfx-present-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build cpu-simd-selftest.efi — AxlCpu feature detection + AVX
+# state-enable path, run under a chosen QEMU CPU model by
+# test/integration/test-cpu-simd-qemu.sh (CI's qemu64 has no AVX, so
+# the CR4/XSETBV path needs an AVX-capable model to exercise).
+# ===================================================================
+
+cpu-simd-selftest: $(PREFIX)/cpu-simd-selftest.efi
+	@echo "  Built: $(PREFIX)/cpu-simd-selftest.efi"
+
+$(PREFIX)/cpu-simd-selftest.efi: $(BUILDDIR)/cpu-simd-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-simd-selftest.o,$@)
+
+$(BUILDDIR)/cpu-simd-selftest.o: test/integration/cpu-simd-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build gfx-simd-selftest.efi — validate + benchmark the SIMD blur
+# kernel (bit-exact vs scalar reference + speedup) under a chosen QEMU
+# CPU model.  Driven by test/integration/test-gfx-simd-qemu.sh.
+# ===================================================================
+
+gfx-simd-selftest: $(PREFIX)/gfx-simd-selftest.efi
+	@echo "  Built: $(PREFIX)/gfx-simd-selftest.efi"
+
+$(PREFIX)/gfx-simd-selftest.efi: $(BUILDDIR)/gfx-simd-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-simd-selftest.o,$@)
+
+$(BUILDDIR)/gfx-simd-selftest.o: test/integration/gfx-simd-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

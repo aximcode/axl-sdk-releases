@@ -58,9 +58,22 @@ static uint8_t
 lerp_u8_(
     uint8_t  a,
     uint8_t  b,
-    float    t
+    float    t,
+    bool     linear   /* interpolate in linear light (G15b)? */
     )
 {
+    if (linear) {
+        /* Decode the endpoints to linear light, interpolate, re-encode —
+           so the ramp's brightness is perceptually even (no dark dip
+           between colors).  Only color channels use this; alpha is
+           linear coverage and is always interpolated plainly. */
+        float la = axl_gfx_srgb_to_linear(a);
+        float lb = axl_gfx_srgb_to_linear(b);
+        float lv = la + (lb - la) * t;
+        if (lv < 0.0f) lv = 0.0f;
+        if (lv > 1.0f) lv = 1.0f;
+        return axl_gfx_linear_to_srgb(lv);
+    }
     float v = (float)a + ((float)b - (float)a) * t;
     if (v < 0.0f) {
         v = 0.0f;
@@ -93,11 +106,14 @@ sample_stops_(
             float local = (span > 0.0f) ? (t - lo) / span : 0.0f;
             AxlGfxPixel a = g->stops[i].color;
             AxlGfxPixel b = g->stops[i + 1].color;
+            /* Color channels honor gamma-correct mode (linear ramp);
+               alpha is coverage and always interpolates plainly. */
+            bool linear = axl_gfx_get_gamma_correct();
             AxlGfxPixel out;
-            out.blue  = lerp_u8_(a.blue,  b.blue,  local);
-            out.green = lerp_u8_(a.green, b.green, local);
-            out.red   = lerp_u8_(a.red,   b.red,   local);
-            out.alpha = lerp_u8_(a.alpha, b.alpha, local);
+            out.blue  = lerp_u8_(a.blue,  b.blue,  local, linear);
+            out.green = lerp_u8_(a.green, b.green, local, linear);
+            out.red   = lerp_u8_(a.red,   b.red,   local, linear);
+            out.alpha = lerp_u8_(a.alpha, b.alpha, local, false);
             return out;
         }
     }
@@ -245,6 +261,24 @@ axl_gfx_gradient_free(
 }
 
 // ===================================================================
+// Public API — sampling
+// ===================================================================
+
+AxlGfxPixel
+axl_gfx_gradient_sample(
+    const AxlGfxGradient  *g,
+    int32_t                x,
+    int32_t                y
+    )
+{
+    if (g == NULL || g->n_stops == 0) {
+        AxlGfxPixel transparent = { 0, 0, 0, 0 };
+        return transparent;
+    }
+    return sample_stops_(g, offset_at_(g, x, y));
+}
+
+// ===================================================================
 // Public API — fill
 // ===================================================================
 
@@ -277,7 +311,7 @@ axl_gfx_fill_rect_gradient(
     for (int64_t py = y; py < y_end; py++) {
         for (int64_t px = x; px < x_end; px++) {
             AxlGfxPixel color =
-                sample_stops_(g, offset_at_(g, (int32_t)px, (int32_t)py));
+                axl_gfx_gradient_sample(g, (int32_t)px, (int32_t)py);
             axl_gfx_fill_rect_i((int32_t)px, (int32_t)py, 1, 1, color);
         }
     }

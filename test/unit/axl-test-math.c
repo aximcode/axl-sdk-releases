@@ -1202,162 +1202,468 @@ test_vec2_normalize(void)
 }
 
 static void
-test_mat3_identity(void)
+test_vec2_geometry(void)
 {
-    AxlMat3 I = axl_mat3_identity();
+    test_check(vec2_near_(axl_vec2_lerp(axl_vec2(0, 0), axl_vec2(10, 20), 0.5),
+                          axl_vec2(5, 10), 1e-15),
+               "vec2: lerp midpoint → (5,10)");
+    test_check(near_(axl_vec2_distance(axl_vec2(0, 0), axl_vec2(3, 4)), 5.0, 1e-12),
+               "vec2: distance (0,0)-(3,4) == 5");
+    test_check(vec2_near_(axl_vec2_perp(axl_vec2(1, 0)), axl_vec2(0, 1), 1e-15),
+               "vec2: perp (1,0) == (0,1)");
+    test_check(near_(axl_vec2_cross(axl_vec2(1, 0), axl_vec2(0, 1)), 1.0, 1e-15),
+               "vec2: cross (1,0)×(0,1) == 1 (CCW)");
+    test_check(near_(axl_vec2_cross(axl_vec2(1, 0), axl_vec2(2, 0)), 0.0, 1e-15),
+               "vec2: cross parallel == 0");
+    test_check(vec2_near_(axl_vec2_rotate(axl_vec2(1, 0), AXL_MATH_HALF_PI),
+                          axl_vec2(0, 1), 1e-6),
+               "vec2: rotate (1,0) by π/2 == (0,1)");
+    test_check(near_(axl_vec2_angle(axl_vec2(0, 1)), AXL_MATH_HALF_PI, 1e-9),
+               "vec2: angle (0,1) == π/2");
+    test_check(near_(axl_vec2_angle(axl_vec2(0, 0)), 0.0, 1e-15),
+               "vec2: angle (0,0) == 0 (safe)");
+    /* reflect (1,-1) across the x-axis (unit normal (0,1)) → (1,1). */
+    test_check(vec2_near_(axl_vec2_reflect(axl_vec2(1, -1), axl_vec2(0, 1)),
+                          axl_vec2(1, 1), 1e-15),
+               "vec2: reflect (1,-1) across x-axis → (1,1)");
+    /* project (3,4) onto (1,0) → (3,0); onto zero → (0,0). */
+    test_check(vec2_near_(axl_vec2_project(axl_vec2(3, 4), axl_vec2(1, 0)),
+                          axl_vec2(3, 0), 1e-15),
+               "vec2: project (3,4) onto x-axis → (3,0)");
+    test_check(vec2_near_(axl_vec2_project(axl_vec2(3, 4), axl_vec2(0, 0)),
+                          axl_vec2(0, 0), 1e-15),
+               "vec2: project onto zero → (0,0) (safe)");
+}
+
+static void
+test_transform_inverse_det_xvector(void)
+{
+    /* transform_vector applies the linear part only (ignores translation). */
+    test_check(vec2_near_(axl_transform_map_vector(axl_transform_translate(5, 7),
+                                                    axl_vec2(1, 1)),
+                          axl_vec2(1, 1), 1e-15),
+               "transform: transform_vector ignores translation");
+    test_check(vec2_near_(axl_transform_map_vector(axl_transform_scale(2, 3),
+                                                    axl_vec2(1, 1)),
+                          axl_vec2(2, 3), 1e-15),
+               "transform: transform_vector scales");
+    /* determinant. */
+    test_check(near_(axl_transform_determinant(axl_transform_scale(2, 3)), 6.0, 1e-12),
+               "transform: det(scale(2,3)) == 6");
+    test_check(near_(axl_transform_determinant(axl_transform_identity()), 1.0, 1e-15),
+               "transform: det(identity) == 1");
+    test_check(near_(axl_transform_determinant(axl_transform_scale(0.0, 5.0)), 0.0, 1e-15),
+               "transform: det(singular) == 0");
+    /* inverse round-trips a point: inv(m(p)) == p. */
+    AxlTransform m = axl_transform_multiply(axl_transform_translate(5, 7),
+                             axl_transform_rotate(AXL_MATH_HALF_PI));
+    AxlTransform inv;
+    test_check(axl_transform_invert(m, &inv), "transform: inverse non-singular → true");
+    AxlVec2 p = axl_vec2(3.0, -2.0);
+    AxlVec2 rt = axl_transform_map_point(inv, axl_transform_map_point(m, p));
+    test_check(vec2_near_(rt, p, 1e-9), "transform: inverse round-trips a point");
+    AxlTransform dummy;
+    test_check(!axl_transform_invert(axl_transform_scale(0.0, 1.0), &dummy),
+               "transform: inverse(singular) → false");
+
+    /* Sheared inverse: full m·inv == identity (not just a single point —
+       exercises the off-diagonal adjugate terms). */
+    AxlTransform sh = axl_transform_multiply(axl_transform_scale(2.0, 3.0), axl_transform_shear(0.3, 0.7));
+    AxlTransform shi;
+    test_check(axl_transform_invert(sh, &shi), "transform: inverse(sheared) → true");
+    AxlTransform sp = axl_transform_multiply(sh, shi);
+    test_check(near_(sp.m[0], 1, 1e-9) && near_(sp.m[4], 1, 1e-9) &&
+               near_(sp.m[8], 1, 1e-9) && near_(sp.m[1], 0, 1e-9) &&
+               near_(sp.m[2], 0, 1e-9) && near_(sp.m[3], 0, 1e-9) &&
+               near_(sp.m[5], 0, 1e-9) && near_(sp.m[6], 0, 1e-9) &&
+               near_(sp.m[7], 0, 1e-9),
+               "transform: sheared m·inv == identity (full matrix)");
+
+    /* Non-affine matrix (non-zero bottom row) exercises the m6/m7
+       adjugate terms the affine cases never reach. det = -2. */
+    AxlTransform proj = { .m = { 2.0, 1.0, 3.0,  0.0, 2.0, 1.0,  1.0, 0.5, 1.0 } };
+    AxlTransform pinv;
+    test_check(axl_transform_invert(proj, &pinv), "transform: inverse(non-affine) → true");
+    AxlTransform pp = axl_transform_multiply(proj, pinv);
+    test_check(near_(pp.m[0], 1, 1e-9) && near_(pp.m[4], 1, 1e-9) &&
+               near_(pp.m[8], 1, 1e-9) && near_(pp.m[1], 0, 1e-9) &&
+               near_(pp.m[2], 0, 1e-9) && near_(pp.m[3], 0, 1e-9) &&
+               near_(pp.m[5], 0, 1e-9) && near_(pp.m[6], 0, 1e-9) &&
+               near_(pp.m[7], 0, 1e-9),
+               "transform: non-affine m·inv == identity (m6/m7 adjugate)");
+}
+
+static void
+test_transform_identity(void)
+{
+    AxlTransform I = axl_transform_identity();
     AxlVec2 p = axl_vec2(3.7, -1.2);
-    test_check(vec2_near_(axl_mat3_transform_point(I, p), p, 1e-15),
-               "mat3: identity * p == p");
+    test_check(vec2_near_(axl_transform_map_point(I, p), p, 1e-15),
+               "transform: identity * p == p");
 }
 
 static void
-test_mat3_translate(void)
+test_transform_translate(void)
 {
-    AxlMat3 T = axl_mat3_translate(3.0, 4.0);
-    test_check(vec2_near_(axl_mat3_transform_point(T, axl_vec2(0.0, 0.0)),
+    AxlTransform T = axl_transform_translate(3.0, 4.0);
+    test_check(vec2_near_(axl_transform_map_point(T, axl_vec2(0.0, 0.0)),
                           axl_vec2(3.0, 4.0), 1e-15),
-               "mat3: translate origin");
-    test_check(vec2_near_(axl_mat3_transform_point(T, axl_vec2(1.0, 1.0)),
+               "transform: translate origin");
+    test_check(vec2_near_(axl_transform_map_point(T, axl_vec2(1.0, 1.0)),
                           axl_vec2(4.0, 5.0), 1e-15),
-               "mat3: translate (1,1) by (3,4)");
+               "transform: translate (1,1) by (3,4)");
     /* Two translations compose by addition. */
-    AxlMat3 U = axl_mat3_translate(-1.0, 2.0);
-    AxlMat3 TU = axl_mat3_mul(T, U);
-    test_check(vec2_near_(axl_mat3_transform_point(TU, axl_vec2(0.0, 0.0)),
+    AxlTransform U = axl_transform_translate(-1.0, 2.0);
+    AxlTransform TU = axl_transform_multiply(T, U);
+    test_check(vec2_near_(axl_transform_map_point(TU, axl_vec2(0.0, 0.0)),
                           axl_vec2(2.0, 6.0), 1e-15),
-               "mat3: translate(3,4) ∘ translate(-1,2) == translate(2,6)");
+               "transform: translate(3,4) ∘ translate(-1,2) == translate(2,6)");
 }
 
 static void
-test_mat3_scale(void)
+test_transform_scale(void)
 {
-    AxlMat3 S = axl_mat3_scale(2.0, 3.0);
-    test_check(vec2_near_(axl_mat3_transform_point(S, axl_vec2(1.0, 1.0)),
+    AxlTransform S = axl_transform_scale(2.0, 3.0);
+    test_check(vec2_near_(axl_transform_map_point(S, axl_vec2(1.0, 1.0)),
                           axl_vec2(2.0, 3.0), 1e-15),
-               "mat3: scale (1,1) by (2,3) → (2,3)");
-    test_check(vec2_near_(axl_mat3_transform_point(S, axl_vec2(0.0, 0.0)),
+               "transform: scale (1,1) by (2,3) → (2,3)");
+    test_check(vec2_near_(axl_transform_map_point(S, axl_vec2(0.0, 0.0)),
                           axl_vec2(0.0, 0.0), 1e-15),
-               "mat3: scale fixes origin");
+               "transform: scale fixes origin");
     /* Scale by (1,1) is identity. */
-    AxlMat3 S1 = axl_mat3_scale(1.0, 1.0);
-    test_check(vec2_near_(axl_mat3_transform_point(S1, axl_vec2(5.0, 7.0)),
+    AxlTransform S1 = axl_transform_scale(1.0, 1.0);
+    test_check(vec2_near_(axl_transform_map_point(S1, axl_vec2(5.0, 7.0)),
                           axl_vec2(5.0, 7.0), 1e-15),
-               "mat3: scale(1,1) == identity");
+               "transform: scale(1,1) == identity");
 }
 
 static void
-test_mat3_rotate(void)
+test_transform_rotate(void)
 {
     /* Tolerance 1e-6: rotation uses axl_sin/axl_cos (documented
      * ~1e-7 accurate); 10× margin matches the existing sin/cos
      * test convention. */
     AxlVec2 x_axis = axl_vec2(1.0, 0.0);
     /* Rotate (1,0) by 0 → (1,0). */
-    test_check(vec2_near_(axl_mat3_transform_point(axl_mat3_rotate(0.0),
+    test_check(vec2_near_(axl_transform_map_point(axl_transform_rotate(0.0),
                                                    x_axis),
                           axl_vec2(1.0, 0.0), 1e-6),
-               "mat3: rotate by 0 → identity on (1,0)");
+               "transform: rotate by 0 → identity on (1,0)");
     /* Rotate (1,0) by π/2 → (0,1) (counter-clockwise). */
-    test_check(vec2_near_(axl_mat3_transform_point(
-                              axl_mat3_rotate(AXL_MATH_HALF_PI),
+    test_check(vec2_near_(axl_transform_map_point(
+                              axl_transform_rotate(AXL_MATH_HALF_PI),
                               x_axis),
                           axl_vec2(0.0, 1.0), 1e-6),
-               "mat3: rotate (1,0) by π/2 → (0,1)");
+               "transform: rotate (1,0) by π/2 → (0,1)");
     /* Rotate (1,0) by π → (-1,0). */
-    test_check(vec2_near_(axl_mat3_transform_point(
-                              axl_mat3_rotate(AXL_MATH_PI),
+    test_check(vec2_near_(axl_transform_map_point(
+                              axl_transform_rotate(AXL_MATH_PI),
                               x_axis),
                           axl_vec2(-1.0, 0.0), 1e-6),
-               "mat3: rotate (1,0) by π → (-1,0)");
+               "transform: rotate (1,0) by π → (-1,0)");
     /* Origin is fixed by rotation — exactly, since cos/sin
      * multiplied by 0 is 0 regardless of accuracy. */
-    test_check(vec2_near_(axl_mat3_transform_point(
-                              axl_mat3_rotate(0.5),
+    test_check(vec2_near_(axl_transform_map_point(
+                              axl_transform_rotate(0.5),
                               axl_vec2(0.0, 0.0)),
                           axl_vec2(0.0, 0.0), 1e-15),
-               "mat3: rotation fixes origin");
+               "transform: rotation fixes origin");
 }
 
 static void
-test_mat3_mul(void)
+test_transform_mul(void)
 {
-    AxlMat3 I = axl_mat3_identity();
-    AxlMat3 T = axl_mat3_translate(2.0, 3.0);
+    AxlTransform I = axl_transform_identity();
+    AxlTransform T = axl_transform_translate(2.0, 3.0);
     /* I * T == T (verified via two points — origin exercises the
      * translation column, (5, 7) exercises the 2×2 sub-matrix too). */
-    AxlMat3 IT = axl_mat3_mul(I, T);
-    test_check(vec2_near_(axl_mat3_transform_point(IT, axl_vec2(0.0, 0.0)),
+    AxlTransform IT = axl_transform_multiply(I, T);
+    test_check(vec2_near_(axl_transform_map_point(IT, axl_vec2(0.0, 0.0)),
                           axl_vec2(2.0, 3.0), 1e-15),
-               "mat3: I * T == T (origin transform)");
-    test_check(vec2_near_(axl_mat3_transform_point(IT, axl_vec2(5.0, 7.0)),
+               "transform: I * T == T (origin transform)");
+    test_check(vec2_near_(axl_transform_map_point(IT, axl_vec2(5.0, 7.0)),
                           axl_vec2(7.0, 10.0), 1e-15),
-               "mat3: I * T == T (off-origin transform)");
+               "transform: I * T == T (off-origin transform)");
     /* T * I == T — same two probes. */
-    AxlMat3 TI = axl_mat3_mul(T, I);
-    test_check(vec2_near_(axl_mat3_transform_point(TI, axl_vec2(0.0, 0.0)),
+    AxlTransform TI = axl_transform_multiply(T, I);
+    test_check(vec2_near_(axl_transform_map_point(TI, axl_vec2(0.0, 0.0)),
                           axl_vec2(2.0, 3.0), 1e-15),
-               "mat3: T * I == T (origin transform)");
-    test_check(vec2_near_(axl_mat3_transform_point(TI, axl_vec2(5.0, 7.0)),
+               "transform: T * I == T (origin transform)");
+    test_check(vec2_near_(axl_transform_map_point(TI, axl_vec2(5.0, 7.0)),
                           axl_vec2(7.0, 10.0), 1e-15),
-               "mat3: T * I == T (off-origin transform)");
+               "transform: T * I == T (off-origin transform)");
     /* Compose translate-after-scale: scale by 2 first, then
      * translate by (10, 0).  Point (1, 1) → (2, 2) → (12, 2). */
-    AxlMat3 M = axl_mat3_mul(axl_mat3_translate(10.0, 0.0),
-                             axl_mat3_scale(2.0, 2.0));
-    test_check(vec2_near_(axl_mat3_transform_point(M, axl_vec2(1.0, 1.0)),
+    AxlTransform M = axl_transform_multiply(axl_transform_scale(2.0, 2.0),
+                             axl_transform_translate(10.0, 0.0));
+    test_check(vec2_near_(axl_transform_map_point(M, axl_vec2(1.0, 1.0)),
                           axl_vec2(12.0, 2.0), 1e-12),
-               "mat3: translate(10,0) ∘ scale(2,2) on (1,1) → (12,2)");
+               "transform: translate(10,0) ∘ scale(2,2) on (1,1) → (12,2)");
 }
 
 static void
-test_mat3_associativity(void)
+test_transform_associativity(void)
 {
     /* Matrix multiplication IS associative: (A * B) * C == A * (B * C).
      * Pin it as a regression guard — the property protects both the
      * index math and the composition direction in a single shot. */
-    AxlMat3 A = axl_mat3_rotate(0.3);
-    AxlMat3 B = axl_mat3_scale(2.0, 1.5);
-    AxlMat3 C = axl_mat3_translate(4.0, -2.0);
-    AxlMat3 left  = axl_mat3_mul(axl_mat3_mul(A, B), C);
-    AxlMat3 right = axl_mat3_mul(A, axl_mat3_mul(B, C));
+    AxlTransform A = axl_transform_rotate(0.3);
+    AxlTransform B = axl_transform_scale(2.0, 1.5);
+    AxlTransform C = axl_transform_translate(4.0, -2.0);
+    AxlTransform left  = axl_transform_multiply(axl_transform_multiply(A, B), C);
+    AxlTransform right = axl_transform_multiply(A, axl_transform_multiply(B, C));
     AxlVec2 p     = axl_vec2(1.5, -0.7);
-    test_check(vec2_near_(axl_mat3_transform_point(left,  p),
-                          axl_mat3_transform_point(right, p),
+    test_check(vec2_near_(axl_transform_map_point(left,  p),
+                          axl_transform_map_point(right, p),
                           1e-12),
-               "mat3: (A*B)*C == A*(B*C) (associativity)");
+               "transform: (A*B)*C == A*(B*C) (associativity)");
 }
 
 static void
-test_mat3_rotate_large_angle(void)
+test_transform_rotate_large_angle(void)
 {
     /* Large-angle input exercises axl_sin's range reduction.  At
      * x=1e6 axl_sin is good to ~1e-3 per test_sin_large_magnitude,
      * so use that tolerance here. */
-    test_check(vec2_near_(axl_mat3_transform_point(
-                              axl_mat3_rotate(1.0e6),
+    test_check(vec2_near_(axl_transform_map_point(
+                              axl_transform_rotate(1.0e6),
                               axl_vec2(1.0, 0.0)),
                           axl_vec2(0.93675212, -0.35000710), 1e-3),
-               "mat3: rotate(1e6) handles huge angle");
+               "transform: rotate(1e6) handles huge angle");
     /* Rotation by 2π should land back on the input (within sin/cos
      * accuracy).  Pins both periodicity and rotation correctness. */
-    test_check(vec2_near_(axl_mat3_transform_point(
-                              axl_mat3_rotate(AXL_MATH_TWO_PI),
+    test_check(vec2_near_(axl_transform_map_point(
+                              axl_transform_rotate(AXL_MATH_TWO_PI),
                               axl_vec2(1.0, 0.0)),
                           axl_vec2(1.0, 0.0), 1e-6),
-               "mat3: rotate(2π) on (1,0) → (1,0) (full period)");
+               "transform: rotate(2π) on (1,0) → (1,0) (full period)");
 }
 
 static void
-test_mat3_rotate_then_translate(void)
+test_transform_rotate_then_translate(void)
 {
     /* Real-world composition: rotate (1,0) by π/2 then translate
      * by (10, 0).  Should land at (10, 1).  Tolerance 1e-6 for
-     * the same sin/cos accuracy reason as test_mat3_rotate. */
-    AxlMat3 M = axl_mat3_mul(axl_mat3_translate(10.0, 0.0),
-                             axl_mat3_rotate(AXL_MATH_HALF_PI));
-    test_check(vec2_near_(axl_mat3_transform_point(M, axl_vec2(1.0, 0.0)),
+     * the same sin/cos accuracy reason as test_transform_rotate. */
+    AxlTransform M = axl_transform_multiply(axl_transform_rotate(AXL_MATH_HALF_PI),
+                             axl_transform_translate(10.0, 0.0));
+    test_check(vec2_near_(axl_transform_map_point(M, axl_vec2(1.0, 0.0)),
                           axl_vec2(10.0, 1.0), 1e-6),
-               "mat3: translate(10,0) ∘ rotate(π/2) on (1,0) → (10,1)");
+               "transform: translate(10,0) ∘ rotate(π/2) on (1,0) → (10,1)");
+}
+
+// ---------------------------------------------------------------------------
+// Projective transforms — Phase 2 (perspective, quad_to_quad, map_rect/quad,
+// classification)
+// ---------------------------------------------------------------------------
+
+static void
+test_transform_perspective(void)
+{
+    /* perspective(0,0) is the identity. */
+    test_check(axl_transform_is_identity(axl_transform_perspective(0.0, 0.0)),
+               "transform: perspective(0,0) == identity");
+    AxlTransform p = axl_transform_perspective(0.1, 0.2);
+    test_check(near_(p.m[6], 0.1, 1e-15) && near_(p.m[7], 0.2, 1e-15) &&
+               near_(p.m[8], 1.0, 1e-15),
+               "transform: perspective sets bottom row [px py 1]");
+    /* map_point divides by w = 0.1*x + 0.2*y + 1; at (1,1) w = 1.3. */
+    AxlVec2 q = axl_transform_map_point(p, axl_vec2(1.0, 1.0));
+    test_check(vec2_near_(q, axl_vec2(1.0 / 1.3, 1.0 / 1.3), 1e-12),
+               "transform: perspective map_point divides by w");
+    test_check(axl_transform_classify(p) == AXL_TRANSFORM_PROJECTIVE,
+               "transform: perspective classifies PROJECTIVE");
+    test_check(!axl_transform_is_affine(p),
+               "transform: perspective is not affine");
+    /* Affine map_point stays bit-exact (w == 1, divide is a no-op). */
+    test_check(vec2_near_(axl_transform_map_point(axl_transform_translate(3, 4),
+                                                  axl_vec2(1, 1)),
+                          axl_vec2(4, 5), 0.0),
+               "transform: affine map_point is exact (no divide error)");
+}
+
+static void
+test_transform_classify(void)
+{
+    test_check(axl_transform_classify(axl_transform_identity())
+               == AXL_TRANSFORM_IDENTITY, "classify: identity -> IDENTITY");
+    test_check(axl_transform_classify(axl_transform_translate(3, 4))
+               == AXL_TRANSFORM_TRANSLATE, "classify: translate -> TRANSLATE");
+    test_check(axl_transform_classify(axl_transform_scale(2, 3))
+               == AXL_TRANSFORM_SCALE, "classify: scale -> SCALE");
+    /* diagonal linear + translation is still SCALE. */
+    test_check(axl_transform_classify(
+                   axl_transform_multiply(axl_transform_scale(2, 3),
+                                          axl_transform_translate(5, 6)))
+               == AXL_TRANSFORM_SCALE, "classify: scale∘translate -> SCALE");
+    test_check(axl_transform_classify(axl_transform_rotate(0.5))
+               == AXL_TRANSFORM_AFFINE, "classify: rotate -> AFFINE");
+    test_check(axl_transform_classify(axl_transform_shear(0.3, 0.0))
+               == AXL_TRANSFORM_AFFINE, "classify: shear -> AFFINE");
+    test_check(axl_transform_classify(axl_transform_perspective(0.1, 0.0))
+               == AXL_TRANSFORM_PROJECTIVE, "classify: perspective -> PROJECTIVE");
+    /* scale(1,1) is the identity, not SCALE. */
+    test_check(axl_transform_classify(axl_transform_scale(1, 1))
+               == AXL_TRANSFORM_IDENTITY, "classify: scale(1,1) -> IDENTITY");
+}
+
+static void
+test_transform_predicates(void)
+{
+    test_check(axl_transform_is_identity(axl_transform_identity()),
+               "is_identity: identity -> true");
+    test_check(!axl_transform_is_identity(axl_transform_translate(1, 0)),
+               "is_identity: translate -> false");
+    test_check(axl_transform_is_affine(axl_transform_rotate(0.7)),
+               "is_affine: rotate -> true");
+    test_check(!axl_transform_is_affine(axl_transform_perspective(0.2, 0.0)),
+               "is_affine: perspective -> false");
+    /* axis-aligned: diagonal OR anti-diagonal linear, non-perspective. */
+    test_check(axl_transform_is_axis_aligned(axl_transform_scale(2, 3)),
+               "is_axis_aligned: scale -> true");
+    test_check(axl_transform_is_axis_aligned(axl_transform_translate(5, 7)),
+               "is_axis_aligned: translate -> true");
+    test_check(axl_transform_is_axis_aligned(axl_transform_scale(1, -1)),
+               "is_axis_aligned: y-flip -> true");
+    /* exact 90° rotation (anti-diagonal) — hand-built to avoid trig fuzz. */
+    AxlTransform rot90 = { .m = { 0, -1, 0,  1, 0, 0,  0, 0, 1 } };
+    test_check(axl_transform_is_axis_aligned(rot90),
+               "is_axis_aligned: 90° rotation (anti-diagonal) -> true");
+    test_check(!axl_transform_is_axis_aligned(axl_transform_rotate(0.5)),
+               "is_axis_aligned: arbitrary rotation -> false");
+    test_check(!axl_transform_is_axis_aligned(axl_transform_shear(0.3, 0.0)),
+               "is_axis_aligned: shear -> false");
+    test_check(!axl_transform_is_axis_aligned(axl_transform_perspective(0.1, 0.0)),
+               "is_axis_aligned: perspective -> false");
+}
+
+static void
+test_transform_map_rect(void)
+{
+    /* Pure translation: exact, dimensions preserved. */
+    AxlRect t = axl_transform_map_rect(axl_transform_translate(5, 7),
+                                       (AxlRect){ 10, 20, 100, 50 });
+    test_check(near_(t.x, 15, 1e-12) && near_(t.y, 27, 1e-12) &&
+               near_(t.w, 100, 1e-12) && near_(t.h, 50, 1e-12),
+               "map_rect: translate is exact");
+    /* Scale about origin: corners (1,1)-(3,3) -> (2,3)-(6,9). */
+    AxlRect s = axl_transform_map_rect(axl_transform_scale(2, 3),
+                                       (AxlRect){ 1, 1, 2, 2 });
+    test_check(near_(s.x, 2, 1e-12) && near_(s.y, 3, 1e-12) &&
+               near_(s.w, 4, 1e-12) && near_(s.h, 6, 1e-12),
+               "map_rect: scale is exact");
+    /* 90° rotation swaps the extents (axis-aligned -> exact bbox). */
+    AxlTransform rot90 = { .m = { 0, -1, 0,  1, 0, 0,  0, 0, 1 } };
+    AxlRect r = axl_transform_map_rect(rot90, (AxlRect){ 0, 0, 2, 4 });
+    test_check(near_(r.x, -4, 1e-12) && near_(r.y, 0, 1e-12) &&
+               near_(r.w, 4, 1e-12) && near_(r.h, 2, 1e-12),
+               "map_rect: 90° rotation swaps extents, exact bbox");
+    /* Arbitrary rotation grows the AABB (conservative cover). */
+    AxlRect g = axl_transform_map_rect(axl_transform_rotate(0.5),
+                                       (AxlRect){ 0, 0, 2, 2 });
+    test_check(g.w > 2.0 && g.h > 2.0,
+               "map_rect: arbitrary rotation grows the AABB");
+    /* Output is normalized (non-negative w/h) even under a flip. */
+    AxlRect f = axl_transform_map_rect(axl_transform_scale(-1, 1),
+                                       (AxlRect){ 0, 0, 3, 5 });
+    test_check(f.w >= 0 && f.h >= 0 && near_(f.x, -3, 1e-12) &&
+               near_(f.w, 3, 1e-12) && near_(f.h, 5, 1e-12),
+               "map_rect: x-flip stays normalized");
+}
+
+static void
+test_transform_map_quad(void)
+{
+    AxlVec2 in[4]  = { axl_vec2(0, 0), axl_vec2(1, 0),
+                       axl_vec2(1, 1), axl_vec2(0, 1) };
+    AxlVec2 out[4];
+    axl_transform_map_quad(axl_transform_translate(10, 20), in, out);
+    test_check(vec2_near_(out[0], axl_vec2(10, 20), 1e-12) &&
+               vec2_near_(out[1], axl_vec2(11, 20), 1e-12) &&
+               vec2_near_(out[2], axl_vec2(11, 21), 1e-12) &&
+               vec2_near_(out[3], axl_vec2(10, 21), 1e-12),
+               "map_quad: translate maps all four corners");
+    /* in and out may alias. */
+    AxlVec2 buf[4] = { axl_vec2(0, 0), axl_vec2(2, 0),
+                       axl_vec2(2, 2), axl_vec2(0, 2) };
+    axl_transform_map_quad(axl_transform_scale(3, 3), buf, buf);
+    test_check(vec2_near_(buf[2], axl_vec2(6, 6), 1e-12),
+               "map_quad: in/out aliasing works");
+}
+
+static void
+test_transform_quad_to_quad(void)
+{
+    AxlVec2 unit[4] = { axl_vec2(0, 0), axl_vec2(1, 0),
+                        axl_vec2(1, 1), axl_vec2(0, 1) };
+    AxlTransform m;
+
+    /* Identity correspondence: an arbitrary quad onto itself. */
+    AxlVec2 q[4] = { axl_vec2(2, 3), axl_vec2(9, 4),
+                     axl_vec2(8, 11), axl_vec2(1, 10) };
+    test_check(axl_transform_quad_to_quad(q, q, &m),
+               "quad_to_quad: self-map succeeds");
+    bool self_ok = true;
+    for (int i = 0; i < 4; i++) {
+        if (!vec2_near_(axl_transform_map_point(m, q[i]), q[i], 1e-9)) {
+            self_ok = false;
+        }
+    }
+    test_check(self_ok, "quad_to_quad: self-map fixes every corner");
+
+    /* Unit square -> trapezoid (genuinely projective). */
+    AxlVec2 trap[4] = { axl_vec2(0, 0), axl_vec2(10, 0),
+                        axl_vec2(8, 10), axl_vec2(2, 10) };
+    test_check(axl_transform_quad_to_quad(unit, trap, &m),
+               "quad_to_quad: square->trapezoid succeeds");
+    bool trap_ok = true;
+    for (int i = 0; i < 4; i++) {
+        if (!vec2_near_(axl_transform_map_point(m, unit[i]), trap[i], 1e-9)) {
+            trap_ok = false;
+        }
+    }
+    test_check(trap_ok, "quad_to_quad: square->trapezoid maps every corner");
+    test_check(axl_transform_classify(m) == AXL_TRANSFORM_PROJECTIVE,
+               "quad_to_quad: trapezoid map is PROJECTIVE");
+
+    /* Unit square -> parallelogram (affine subset). */
+    AxlVec2 para[4] = { axl_vec2(0, 0), axl_vec2(2, 0),
+                        axl_vec2(3, 1), axl_vec2(1, 1) };
+    test_check(axl_transform_quad_to_quad(unit, para, &m),
+               "quad_to_quad: square->parallelogram succeeds");
+    test_check(axl_transform_is_affine(m),
+               "quad_to_quad: parallelogram map is affine");
+    bool para_ok = true;
+    for (int i = 0; i < 4; i++) {
+        if (!vec2_near_(axl_transform_map_point(m, unit[i]), para[i], 1e-9)) {
+            para_ok = false;
+        }
+    }
+    test_check(para_ok, "quad_to_quad: square->parallelogram maps every corner");
+
+    /* Concave (non-convex) simple quad still maps every corner — the
+     * closed form needs only a non-degenerate quad, not convexity. */
+    AxlVec2 concave[4] = { axl_vec2(0, 0), axl_vec2(4, 0),
+                           axl_vec2(1, 1), axl_vec2(0, 4) };
+    test_check(axl_transform_quad_to_quad(unit, concave, &m),
+               "quad_to_quad: square->concave quad succeeds");
+    bool concave_ok = true;
+    for (int i = 0; i < 4; i++) {
+        if (!vec2_near_(axl_transform_map_point(m, unit[i]), concave[i], 1e-9)) {
+            concave_ok = false;
+        }
+    }
+    test_check(concave_ok, "quad_to_quad: concave quad maps every corner");
+
+    /* Degenerate (collinear) source -> false, out untouched. */
+    AxlVec2 line[4] = { axl_vec2(0, 0), axl_vec2(1, 1),
+                        axl_vec2(2, 2), axl_vec2(3, 3) };
+    AxlTransform before = axl_transform_scale(7, 7);
+    AxlTransform keep = before;
+    test_check(!axl_transform_quad_to_quad(line, unit, &keep),
+               "quad_to_quad: degenerate source -> false");
+    test_check(keep.m[0] == before.m[0] && keep.m[4] == before.m[4],
+               "quad_to_quad: out untouched on failure");
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,14 +1973,23 @@ test_math_main(
     test_vec2_dot();
     test_vec2_length();
     test_vec2_normalize();
-    test_mat3_identity();
-    test_mat3_translate();
-    test_mat3_scale();
-    test_mat3_rotate();
-    test_mat3_mul();
-    test_mat3_associativity();
-    test_mat3_rotate_then_translate();
-    test_mat3_rotate_large_angle();
+    test_vec2_geometry();
+    test_transform_inverse_det_xvector();
+    test_transform_identity();
+    test_transform_translate();
+    test_transform_scale();
+    test_transform_rotate();
+    test_transform_mul();
+    test_transform_associativity();
+    test_transform_rotate_then_translate();
+    test_transform_rotate_large_angle();
+
+    test_transform_perspective();
+    test_transform_classify();
+    test_transform_predicates();
+    test_transform_map_rect();
+    test_transform_map_quad();
+    test_transform_quad_to_quad();
 
     test_point_in_rect();
     test_rect_intersect();

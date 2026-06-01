@@ -9,14 +9,16 @@
         against a real loaded font (ASCII subset of DejaVu Sans
         embedded as test/data/test-font-dejavu-ascii.h).
 
-    Glyph rasterization tests are deferred — axl_ttf_draw's pixel-
-    producing path lands in a follow-up batch.
+    Glyph rasterization tests (axl_ttf_draw's pixel-producing path)
+    and the G7 glyph-cache + subpixel-positioning guards follow the
+    measurement batches.
 **/
 
 #include "axl-test.h"
 
 #include <axl/axl-truetype.h>
 #include <axl/axl-gfx.h>
+#include <axl/axl-mem.h>
 
 #include "test-font-dejavu-ascii.h"
 
@@ -674,6 +676,646 @@ test_draw_alpha_modulates(void)
 }
 
 // ---------------------------------------------------------------------------
+// Glyph cache + subpixel positioning (G7)
+// ---------------------------------------------------------------------------
+//
+// The glyph cache is internal (no public API) — a transparent perf
+// layer behind axl_ttf_draw.  It cannot be observed directly, so the
+// tests assert the properties it must preserve when active:
+//   - repeated identical renders are byte-for-byte identical (a cache
+//     hit must return the exact pixels the first miss produced);
+//   - distinct sizes don't collapse to one bitmap (the px_size key
+//     dimension works);
+//   - a glyph re-rendered after the LRU has evicted it reproduces
+//     byte-for-byte (eviction frees safely; re-miss re-rasterizes
+//     correctly).
+// Subpixel positioning (the second G7 half) is exercised by the
+// multi-glyph string repeat test: later glyphs land at fractional pen
+// offsets, populating multiple subpixel bins, and must still round-
+// trip the cache identically.
+
+/* Render @a utf8 once into a fresh @a w x @a h buffer cleared to
+ * @a bg, with the draw target set/restored around the call. Caller
+ * frees the returned buffer. */
+static AxlGfxBuffer *
+render_to_buffer(
+    AxlTtf      *ttf,
+    uint32_t     w,
+    uint32_t     h,
+    int32_t      x,
+    int32_t      y,
+    const char  *utf8,
+    float        px,
+    AxlGfxPixel  color,
+    AxlGfxPixel  bg
+    )
+{
+    AxlGfxBuffer *b = axl_gfx_buffer_new(w, h);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    axl_ttf_draw(ttf, x, y, utf8, px, color);
+    axl_gfx_target_buffer(NULL);
+    return b;
+}
+
+/* Byte-exact pixel equality of two same-size buffers (all 4 channels). */
+static bool
+buffers_pixels_equal(
+    AxlGfxBuffer  *a,
+    AxlGfxBuffer  *b
+    )
+{
+    uint32_t aw = 0, ah = 0, bw = 0, bh = 0;
+    axl_gfx_buffer_get_info(a, &aw, &ah);
+    axl_gfx_buffer_get_info(b, &bw, &bh);
+    if (aw != bw || ah != bh) {
+        return false;
+    }
+    const AxlGfxPixel *pa = axl_gfx_buffer_pixels(a);
+    const AxlGfxPixel *pb = axl_gfx_buffer_pixels(b);
+    size_t n = (size_t)aw * ah;
+    for (size_t i = 0; i < n; i++) {
+        if (pa[i].blue  != pb[i].blue
+            || pa[i].green != pb[i].green
+            || pa[i].red   != pb[i].red
+            || pa[i].alpha != pb[i].alpha)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_cache_repeat_glyph_identical(void)
+{
+    /* Same glyph, same size, drawn twice: the second draw is a cache
+     * hit and must reproduce the first draw byte-for-byte. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+    AxlGfxBuffer *b1 = render_to_buffer(ttf, 40, 40, 5, 30, "H", 24.0f, white, bg);
+    AxlGfxBuffer *b2 = render_to_buffer(ttf, 40, 40, 5, 30, "H", 24.0f, white, bg);
+
+    test_check(buffers_pixels_equal(b1, b2),
+               "cache: repeated identical glyph render is byte-identical");
+
+    axl_gfx_buffer_free(b1);
+    axl_gfx_buffer_free(b2);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_cache_string_repeat_identical(void)
+{
+    /* Multi-glyph string: later glyphs land at fractional pen offsets
+     * (multiple subpixel bins).  Drawn twice it must be byte-identical
+     * — proves every subpixel bin round-trips the cache correctly. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+    AxlGfxBuffer *b1 = render_to_buffer(ttf, 200, 40, 5, 30,
+                                        "Hello, world!", 18.0f, white, bg);
+    AxlGfxBuffer *b2 = render_to_buffer(ttf, 200, 40, 5, 30,
+                                        "Hello, world!", 18.0f, white, bg);
+
+    test_check(buffers_pixels_equal(b1, b2),
+               "cache: repeated multi-glyph string render is byte-identical");
+
+    axl_gfx_buffer_free(b1);
+    axl_gfx_buffer_free(b2);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_cache_distinct_sizes_differ(void)
+{
+    /* A 48px 'H' must cover more pixels than a 16px 'H'.  If the
+     * px_size key dimension collapsed (every size sharing one cached
+     * bitmap) the counts would match — this catches that bug. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+    AxlGfxBuffer *b16 = render_to_buffer(ttf, 80, 80, 5, 60, "H", 16.0f, white, bg);
+    AxlGfxBuffer *b48 = render_to_buffer(ttf, 80, 80, 5, 60, "H", 48.0f, white, bg);
+
+    size_t n16 = count_non_bg_pixels(b16, 0, 0, 80, 80, bg);
+    size_t n48 = count_non_bg_pixels(b48, 0, 0, 80, 80, bg);
+
+    test_check(n48 > n16,
+               "cache: 48px glyph covers more pixels than 16px (size key distinct)");
+
+    axl_gfx_buffer_free(b16);
+    axl_gfx_buffer_free(b48);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_cache_eviction_preserves_correctness(void)
+{
+    /* Render 'H'@16 (reference).  Flood the cache with far more
+     * distinct sizes than its capacity, forcing the LRU to evict the
+     * 16px entry.  Re-render 'H'@16 — the re-miss must re-rasterize a
+     * byte-identical bitmap.  Catches eviction double-frees, stale
+     * slot dims, and "evicted slot still marked valid" bugs. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+    AxlGfxBuffer *ref = render_to_buffer(ttf, 40, 40, 5, 30, "H", 16.0f, white, bg);
+
+    /* 400 distinct sizes (step 0.05px > 1/64px quantum, so each maps to
+     * a distinct cache key) far exceeds any reasonable cache capacity. */
+    for (int i = 0; i < 400; i++) {
+        float px = 17.0f + (float)i * 0.05f;
+        AxlGfxBuffer *tmp = render_to_buffer(ttf, 60, 60, 5, 45, "H", px, white, bg);
+        axl_gfx_buffer_free(tmp);
+    }
+
+    AxlGfxBuffer *again = render_to_buffer(ttf, 40, 40, 5, 30, "H", 16.0f, white, bg);
+
+    test_check(buffers_pixels_equal(ref, again),
+               "cache: glyph re-rendered after LRU eviction is byte-identical");
+
+    axl_gfx_buffer_free(ref);
+    axl_gfx_buffer_free(again);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_cache_oom_fallback_still_draws(void)
+{
+    /* The lazy cache-struct allocation is the first allocation inside
+     * axl_ttf_draw.  Inject an OOM there: the draw must fall back to
+     * direct rasterization and still produce glyph pixels (degraded
+     * perf, correct output). */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxBuffer *b = axl_gfx_buffer_new(40, 40);
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+    axl_gfx_buffer_clear(b, bg);
+
+    axl_gfx_target_buffer(b);
+    axl_mem_fail_next_alloc(1);   /* fail the lazy GlyphCache allocation */
+    int rc = axl_ttf_draw(ttf, 5, 30, "H", 24.0f, white);
+    axl_gfx_target_buffer(NULL);
+
+    test_check(rc == AXL_OK,
+               "cache: draw returns AXL_OK when cache alloc fails (OOM fallback)");
+    size_t drawn = count_non_bg_pixels(b, 0, 0, 40, 40, bg);
+    test_check(drawn > 0,
+               "cache: OOM fallback still rasterizes glyph pixels directly");
+
+    axl_gfx_buffer_free(b);
+    axl_ttf_free(ttf);
+}
+
+// ---------------------------------------------------------------------------
+// Boxed / multi-line text + word wrap (G11)
+// ---------------------------------------------------------------------------
+//
+// measure_box runs the identical line-breaking algorithm as draw_box
+// without drawing, so the layout-rule assertions (line counts, wrap
+// points, over-wide-word handling, geometry) pin behavior via
+// measure_box; the draw_box tests then pin the pixel-level concerns
+// the geometry can't observe: alignment shift, vertical advance, and
+// box clipping.
+
+/* Leftmost column in @a buf (within full bounds) holding a pixel that
+ * differs from @a bg.  Returns buf_w (== "none found") if no pixel was
+ * modified. */
+static uint32_t
+leftmost_modified_col(
+    AxlGfxBuffer  *buf,
+    AxlGfxPixel    bg
+    )
+{
+    uint32_t buf_w = 0, buf_h = 0;
+    axl_gfx_buffer_get_info(buf, &buf_w, &buf_h);
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(buf);
+    for (uint32_t px = 0; px < buf_w; px++) {
+        for (uint32_t py = 0; py < buf_h; py++) {
+            const AxlGfxPixel *q = &p[py * buf_w + px];
+            if (q->blue != bg.blue || q->green != bg.green || q->red != bg.red) {
+                return px;
+            }
+        }
+    }
+    return buf_w;
+}
+
+/* Topmost row holding a modified pixel within the full buffer.
+ * Returns buf_h if none. */
+static uint32_t
+topmost_modified_row(
+    AxlGfxBuffer  *buf,
+    AxlGfxPixel    bg
+    )
+{
+    uint32_t buf_w = 0, buf_h = 0;
+    axl_gfx_buffer_get_info(buf, &buf_w, &buf_h);
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(buf);
+    for (uint32_t py = 0; py < buf_h; py++) {
+        for (uint32_t px = 0; px < buf_w; px++) {
+            const AxlGfxPixel *q = &p[py * buf_w + px];
+            if (q->blue != bg.blue || q->green != bg.green || q->red != bg.red) {
+                return py;
+            }
+        }
+    }
+    return buf_h;
+}
+
+// --- input validation -----------------------------------------------
+
+static void
+test_box_draw_null_ttf(void)
+{
+    test_check(axl_ttf_draw_box(NULL, 0, 0, 100, 100, "Hi", 16.0f,
+                                AXL_GFX_BLACK, AXL_TTF_ALIGN_LEFT) == AXL_ERR,
+               "draw_box: NULL ttf returns AXL_ERR");
+}
+
+static void
+test_box_draw_null_utf8(void)
+{
+    test_check(axl_ttf_draw_box(FAKE_TTF, 0, 0, 100, 100, NULL, 16.0f,
+                                AXL_GFX_BLACK, AXL_TTF_ALIGN_LEFT) == AXL_ERR,
+               "draw_box: NULL utf8 returns AXL_ERR");
+}
+
+static void
+test_box_draw_zero_px_size(void)
+{
+    test_check(axl_ttf_draw_box(FAKE_TTF, 0, 0, 100, 100, "Hi", 0.0f,
+                                AXL_GFX_BLACK, AXL_TTF_ALIGN_LEFT) == AXL_ERR,
+               "draw_box: px_size 0 returns AXL_ERR");
+}
+
+static void
+test_box_measure_null_ttf(void)
+{
+    uint32_t lines = 999;
+    int rc = axl_ttf_measure_box(NULL, 100, "Hi", 16.0f, NULL, NULL, &lines);
+    test_check(rc == AXL_ERR,
+               "measure_box: NULL ttf returns AXL_ERR");
+    test_check(lines == 999,
+               "measure_box: outputs untouched on error");
+}
+
+static void
+test_box_measure_null_utf8(void)
+{
+    test_check(axl_ttf_measure_box(FAKE_TTF, 100, NULL, 16.0f,
+                                   NULL, NULL, NULL) == AXL_ERR,
+               "measure_box: NULL utf8 returns AXL_ERR");
+}
+
+static void
+test_box_measure_zero_px_size(void)
+{
+    test_check(axl_ttf_measure_box(FAKE_TTF, 100, "Hi", 0.0f,
+                                   NULL, NULL, NULL) == AXL_ERR,
+               "measure_box: px_size 0 returns AXL_ERR");
+}
+
+static void
+test_box_measure_null_outputs_ok(void)
+{
+    /* All output pointers NULL is a valid "is this layout sound" probe. */
+    AxlTtf *ttf = load_test_font();
+    test_check(axl_ttf_measure_box(ttf, 100, "Hi", 16.0f,
+                                   NULL, NULL, NULL) == AXL_OK,
+               "measure_box: all-NULL outputs returns AXL_OK");
+    axl_ttf_free(ttf);
+}
+
+// --- line counting --------------------------------------------------
+
+static void
+test_box_measure_empty_is_zero_lines(void)
+{
+    AxlTtf *ttf = load_test_font();
+    uint32_t w = 999, h = 999, lines = 999;
+    int rc = axl_ttf_measure_box(ttf, 200, "", 16.0f, &w, &h, &lines);
+    test_check(rc == AXL_OK, "measure_box: empty string returns AXL_OK");
+    test_check(lines == 0, "measure_box: empty string is 0 lines");
+    test_check(w == 0, "measure_box: empty string width is 0");
+    test_check(h == 0, "measure_box: empty string height is 0");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_measure_single_line_no_wrap(void)
+{
+    /* A short string in a generous box stays one line, and its width
+     * equals the single-line measure of that string. */
+    AxlTtf *ttf = load_test_font();
+    const char *s = "Hello world";
+    uint32_t want_w = axl_ttf_measure(ttf, s, 16.0f);
+    uint32_t w = 0, lines = 0;
+    axl_ttf_measure_box(ttf, 10000, s, 16.0f, &w, NULL, &lines);
+    test_check(lines == 1, "measure_box: fits-in-box string is 1 line");
+    test_check(w == want_w, "measure_box: 1-line width equals measure()");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_measure_hard_newlines(void)
+{
+    /* Three \n-separated tokens in a generous box = 3 lines, widest
+     * line == widest token. */
+    AxlTtf *ttf = load_test_font();
+    uint32_t w = 0, lines = 0;
+    axl_ttf_measure_box(ttf, 10000, "a\nbb\nccc", 16.0f, &w, NULL, &lines);
+    uint32_t wc = axl_ttf_measure(ttf, "ccc", 16.0f);
+    test_check(lines == 3, "measure_box: two \\n yields 3 lines");
+    test_check(w == wc, "measure_box: widest line == widest \\n token");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_measure_trailing_newline(void)
+{
+    /* Each \n starts a new line, so a trailing \n yields a trailing
+     * blank line (documented decision). */
+    AxlTtf *ttf = load_test_font();
+    uint32_t lines = 0;
+    axl_ttf_measure_box(ttf, 10000, "a\n", 16.0f, NULL, NULL, &lines);
+    test_check(lines == 2, "measure_box: trailing \\n yields a blank line");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_measure_blank_line_preserved(void)
+{
+    /* Consecutive newlines produce a blank line between paragraphs. */
+    AxlTtf *ttf = load_test_font();
+    uint32_t lines = 0;
+    axl_ttf_measure_box(ttf, 10000, "a\n\nb", 16.0f, NULL, NULL, &lines);
+    test_check(lines == 3, "measure_box: \\n\\n preserves a blank line");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_measure_all_whitespace_is_one_blank_line(void)
+{
+    /* An all-whitespace hard line collapses to a single blank line
+     * (width 0), distinct from "" which yields 0 lines. Pins the
+     * documented empty-vs-blank boundary. */
+    AxlTtf *ttf = load_test_font();
+    uint32_t w = 999, lines = 999;
+    axl_ttf_measure_box(ttf, 200, "    ", 16.0f, &w, NULL, &lines);
+    test_check(lines == 1, "measure_box: all-whitespace is one blank line");
+    test_check(w == 0, "measure_box: all-whitespace blank line has width 0");
+    axl_ttf_free(ttf);
+}
+
+// --- wrap point (the <= fit boundary) -------------------------------
+
+static void
+test_box_wrap_fits_at_exact_width(void)
+{
+    /* "aaaa bbbb": with w == measure("aaaa bbbb") both words fit on
+     * one line (the fit test is <=). At one pixel narrower the second
+     * word wraps to a second line. This pins the boundary exactly. */
+    AxlTtf *ttf = load_test_font();
+    const char *s = "aaaa bbbb";
+    uint32_t exact = axl_ttf_measure(ttf, s, 16.0f);
+
+    uint32_t lines_fit = 0, lines_wrap = 0;
+    axl_ttf_measure_box(ttf, exact, s, 16.0f, NULL, NULL, &lines_fit);
+    axl_ttf_measure_box(ttf, exact - 1, s, 16.0f, NULL, NULL, &lines_wrap);
+
+    test_check(lines_fit == 1,
+               "measure_box: width == measure() keeps both words on one line");
+    test_check(lines_wrap == 2,
+               "measure_box: one pixel narrower wraps the second word");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_wrap_three_words(void)
+{
+    /* "aaaa bbbb cccc" with w == measure("aaaa bbbb") wraps after the
+     * second word: lines 0 = "aaaa bbbb", line 1 = "cccc". The widest
+     * rendered line is "aaaa bbbb", so out_width == w. */
+    AxlTtf *ttf = load_test_font();
+    uint32_t two = axl_ttf_measure(ttf, "aaaa bbbb", 16.0f);
+    uint32_t w = 0, lines = 0;
+    axl_ttf_measure_box(ttf, two, "aaaa bbbb cccc", 16.0f, &w, NULL, &lines);
+    test_check(lines == 2, "measure_box: 3 words wrap into 2 lines at the fit width");
+    test_check(w == two, "measure_box: widest line is the filled first line");
+    axl_ttf_free(ttf);
+}
+
+// --- over-wide word -------------------------------------------------
+
+static void
+test_box_overwide_word_overflows(void)
+{
+    /* A single word wider than the box is not split: it occupies one
+     * line and reports its true (over-width) width. */
+    AxlTtf *ttf = load_test_font();
+    const char *word = "WWWWWWWWWW";
+    uint32_t full = axl_ttf_measure(ttf, word, 16.0f);
+    uint32_t w = 0, lines = 0;
+    axl_ttf_measure_box(ttf, 1, word, 16.0f, &w, NULL, &lines);
+    test_check(lines == 1, "measure_box: over-wide word stays one line (not split)");
+    test_check(w == full, "measure_box: over-wide word reports its true width > box");
+    test_check(w > 1, "measure_box: reported width exceeds the box width");
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_overwide_word_wraps_to_own_line(void)
+{
+    /* "aa WWWWWWWWWW": with a box just wide enough for "aa", the long
+     * second word cannot fit after "aa" so it wraps to its own line
+     * (and overflows there). 2 lines; widest == the long word. */
+    AxlTtf *ttf = load_test_font();
+    uint32_t w_aa  = axl_ttf_measure(ttf, "aa", 16.0f);
+    uint32_t w_big = axl_ttf_measure(ttf, "WWWWWWWWWW", 16.0f);
+    uint32_t w = 0, lines = 0;
+    axl_ttf_measure_box(ttf, w_aa, "aa WWWWWWWWWW", 16.0f, &w, NULL, &lines);
+    test_check(lines == 2, "measure_box: long word wraps onto its own line");
+    test_check(w == w_big, "measure_box: widest line is the overflowing long word");
+    axl_ttf_free(ttf);
+}
+
+// --- geometry (height) ----------------------------------------------
+
+static void
+test_box_measure_height_matches_metrics(void)
+{
+    /* out_height == ceil(line_count * line_height) where line_height ==
+     * ascent + descent + line_gap. Use a 3-line block. */
+    AxlTtf *ttf = load_test_font();
+    float ascent = 0, descent = 0, line_gap = 0;
+    axl_ttf_metrics(ttf, 16.0f, &ascent, &descent, &line_gap);
+    float line_h = ascent + descent + line_gap;
+    uint32_t expect = (uint32_t)axl_ceili((double)(3.0f * line_h));
+
+    uint32_t h = 0, lines = 0;
+    axl_ttf_measure_box(ttf, 10000, "a\nb\nc", 16.0f, NULL, &h, &lines);
+    test_check(lines == 3, "measure_box: height test has 3 lines");
+    test_check(h == expect, "measure_box: height == ceil(lines * line_height)");
+    axl_ttf_free(ttf);
+}
+
+// --- draw: alignment shift ------------------------------------------
+
+static void
+test_box_draw_alignment_shifts(void)
+{
+    /* Same single short line in a wide box, drawn LEFT / CENTER /
+     * RIGHT. The leftmost modified column must increase strictly
+     * across the three: left-aligned hugs the left edge, right-aligned
+     * is pushed toward the right. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+    const char *s = "Hi";
+    const uint32_t BW = 200, BH = 40;
+
+    AxlGfxBuffer *bl = axl_gfx_buffer_new(BW, BH);
+    axl_gfx_buffer_clear(bl, bg);
+    axl_gfx_target_buffer(bl);
+    axl_ttf_draw_box(ttf, 0, 0, BW, BH, s, 18.0f, white, AXL_TTF_ALIGN_LEFT);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxBuffer *bc = axl_gfx_buffer_new(BW, BH);
+    axl_gfx_buffer_clear(bc, bg);
+    axl_gfx_target_buffer(bc);
+    axl_ttf_draw_box(ttf, 0, 0, BW, BH, s, 18.0f, white, AXL_TTF_ALIGN_CENTER);
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxBuffer *br = axl_gfx_buffer_new(BW, BH);
+    axl_gfx_buffer_clear(br, bg);
+    axl_gfx_target_buffer(br);
+    axl_ttf_draw_box(ttf, 0, 0, BW, BH, s, 18.0f, white, AXL_TTF_ALIGN_RIGHT);
+    axl_gfx_target_buffer(NULL);
+
+    uint32_t left_l = leftmost_modified_col(bl, bg);
+    uint32_t left_c = leftmost_modified_col(bc, bg);
+    uint32_t left_r = leftmost_modified_col(br, bg);
+
+    test_check(left_l < left_c, "draw_box: center shifts text right of left-align");
+    test_check(left_c < left_r, "draw_box: right shifts text right of center-align");
+
+    /* Pin the right-aligned start: its leftmost pixel sits near
+     * box_right - line_width (within an AA pixel of the expected
+     * origin), proving the shift magnitude, not just ordering. */
+    uint32_t lw = axl_ttf_measure(ttf, s, 18.0f);
+    uint32_t expect_r = BW - lw;
+    /* Two-sided bound: the right-aligned line's leftmost pixel sits
+     * within an AA pixel of box_right - line_width, pinning the shift
+     * magnitude (not just the ordering) from both directions. The
+     * first glyph's left side-bearing means the leftmost lit pixel is
+     * at or just right of the pen origin, never left of it. */
+    test_check(left_r + 2 >= expect_r && left_r <= expect_r + 4,
+               "draw_box: right-aligned text starts at box_right - width");
+
+    axl_gfx_buffer_free(bl);
+    axl_gfx_buffer_free(bc);
+    axl_gfx_buffer_free(br);
+    axl_ttf_free(ttf);
+}
+
+// --- draw: vertical advance + clip ----------------------------------
+
+static void
+test_box_draw_two_lines_advance(void)
+{
+    /* "a\nb" draws two glyphs in vertically separated bands. The
+     * second line's topmost pixel is roughly one line-height below the
+     * first line's. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+    float ascent = 0, descent = 0, line_gap = 0;
+    axl_ttf_metrics(ttf, 20.0f, &ascent, &descent, &line_gap);
+    float line_h = ascent + descent + line_gap;
+
+    AxlGfxBuffer *one = axl_gfx_buffer_new(60, 80);
+    axl_gfx_buffer_clear(one, bg);
+    axl_gfx_target_buffer(one);
+    axl_ttf_draw_box(ttf, 0, 0, 60, 80, "a", 20.0f, white, AXL_TTF_ALIGN_LEFT);
+    axl_gfx_target_buffer(NULL);
+    uint32_t top_one = topmost_modified_row(one, bg);
+
+    AxlGfxBuffer *two = axl_gfx_buffer_new(60, 80);
+    axl_gfx_buffer_clear(two, bg);
+    axl_gfx_target_buffer(two);
+    axl_ttf_draw_box(ttf, 0, 0, 60, 80, "\nb", 20.0f, white, AXL_TTF_ALIGN_LEFT);
+    axl_gfx_target_buffer(NULL);
+    uint32_t top_two = topmost_modified_row(two, bg);
+
+    /* "\nb" puts 'b' on the second line; its top is ~line_h below the
+     * first line's 'a'. Allow generous tolerance for glyph bearings. */
+    test_check(top_two > top_one + (uint32_t)(line_h / 2.0f),
+               "draw_box: a line below advances by ~line-height");
+    axl_gfx_buffer_free(one);
+    axl_gfx_buffer_free(two);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_draw_vertical_clip(void)
+{
+    /* A box only tall enough for one line, given three lines of text:
+     * nothing is drawn below the box bottom (clip honored). */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+    float ascent = 0, descent = 0, line_gap = 0;
+    axl_ttf_metrics(ttf, 16.0f, &ascent, &descent, &line_gap);
+    uint32_t box_h = (uint32_t)axl_ceili((double)(ascent + descent));
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(60, 120);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    axl_ttf_draw_box(ttf, 0, 0, 60, box_h, "a\nb\nc", 16.0f, white,
+                     AXL_TTF_ALIGN_LEFT);
+    axl_gfx_target_buffer(NULL);
+
+    /* No pixels at or below the box bottom edge. */
+    size_t below = count_non_bg_pixels(b, 0, box_h, 60, 120 - box_h, bg);
+    test_check(below == 0,
+               "draw_box: clips text below the box height");
+    /* First line still drew something inside the box. */
+    size_t inside = count_non_bg_pixels(b, 0, 0, 60, box_h, bg);
+    test_check(inside > 0,
+               "draw_box: first line renders inside the box");
+    axl_gfx_buffer_free(b);
+    axl_ttf_free(ttf);
+}
+
+static void
+test_box_draw_returns_ok(void)
+{
+    /* A normal wrapped draw onto a buffer target returns AXL_OK. */
+    AxlTtf *ttf = load_test_font();
+    AxlGfxPixel bg    = { 0x00, 0x00, 0x00, 0xFF };
+    AxlGfxPixel white = { 0xFF, 0xFF, 0xFF, 0xFF };
+    AxlGfxBuffer *b = axl_gfx_buffer_new(120, 80);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    int rc = axl_ttf_draw_box(ttf, 5, 5, 100, 70,
+                              "The quick brown fox jumps", 16.0f, white,
+                              AXL_TTF_ALIGN_LEFT);
+    axl_gfx_target_buffer(NULL);
+    test_check(rc == AXL_OK, "draw_box: normal wrapped draw returns AXL_OK");
+    size_t drawn = count_non_bg_pixels(b, 0, 0, 120, 80, bg);
+    test_check(drawn > 0, "draw_box: wrapped paragraph renders pixels");
+    axl_gfx_buffer_free(b);
+    axl_ttf_free(ttf);
+}
+
+// ---------------------------------------------------------------------------
 // Built-in default font (axl_ttf_default)
 // ---------------------------------------------------------------------------
 
@@ -802,7 +1444,7 @@ test_truetype_main(
     (void)argc;
     (void)argv;
 
-    test_print_header("AxlTtf G1");
+    test_print_header("AxlTtf G1+G7");
 
     test_load_null_bytes();
     test_load_zero_len();
@@ -848,6 +1490,35 @@ test_truetype_main(
     test_draw_color_propagates();
     test_draw_alpha_modulates();
     test_draw_negative_coords_no_crash();
+
+    test_cache_repeat_glyph_identical();
+    test_cache_string_repeat_identical();
+    test_cache_distinct_sizes_differ();
+    test_cache_eviction_preserves_correctness();
+    test_cache_oom_fallback_still_draws();
+
+    test_box_draw_null_ttf();
+    test_box_draw_null_utf8();
+    test_box_draw_zero_px_size();
+    test_box_measure_null_ttf();
+    test_box_measure_null_utf8();
+    test_box_measure_zero_px_size();
+    test_box_measure_null_outputs_ok();
+    test_box_measure_empty_is_zero_lines();
+    test_box_measure_single_line_no_wrap();
+    test_box_measure_hard_newlines();
+    test_box_measure_trailing_newline();
+    test_box_measure_blank_line_preserved();
+    test_box_measure_all_whitespace_is_one_blank_line();
+    test_box_wrap_fits_at_exact_width();
+    test_box_wrap_three_words();
+    test_box_overwide_word_overflows();
+    test_box_overwide_word_wraps_to_own_line();
+    test_box_measure_height_matches_metrics();
+    test_box_draw_alignment_shifts();
+    test_box_draw_two_lines_advance();
+    test_box_draw_vertical_clip();
+    test_box_draw_returns_ok();
 
     test_default_returns_non_null();
     test_default_is_singleton();

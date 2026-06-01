@@ -25,6 +25,7 @@
 #include <axl/axl-types.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-format.h>
+#include <axl/axl-math.h>
 #include <axl/axl-string.h>
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
@@ -41,10 +42,13 @@
 #include <axl/axl-xml.h>
 #include <axl/axl-cache.h>
 #include <axl/axl-radix-tree.h>
+#include <axl/axl-ntree.h>
+#include <axl/axl-tree.h>
 #include <axl/axl-ring-buf.h>
 #include <axl/axl-digest.h>
 #include <axl/axl-path.h>
 #include <axl/axl-hexdump.h>
+#include <axl/axl-sort.h>
 #include <axl/axl-time.h>
 #include <axl/axl-env.h>
 #include <axl/axl-sys.h>

@@ -11,6 +11,7 @@
 **/
 
 #include "axl-backend.h"
+#include <axl/axl-input.h>   /* AXL_INPUT_MOD_* — read_key_ex normalizes to these */
 #include <axl/axl-log.h>
 #include <stdarg.h>
 
@@ -1224,14 +1225,44 @@ axl_backend_console_read_key(
     return AXL_OK;
 }
 
+/* Translate an EFI_KEY_STATE (KeyShiftState + KeyToggleState) into
+ * normalized AXL_INPUT_MOD_* bits. Each side maps 1:1; the
+ * side-agnostic SHIFT/CTRL/ALT/META names are masks over their L/R
+ * bits, so no separate "collapse" step is needed. Bits are honored
+ * only when their respective *_VALID flag is set. */
+static uint32_t
+efi_keystate_to_axl_mods(
+    uint32_t  shift_state,
+    uint8_t   toggle_state
+    )
+{
+    uint32_t m = 0;
+    if (shift_state & EFI_SHIFT_STATE_VALID) {
+        if (shift_state & EFI_LEFT_SHIFT_PRESSED)    m |= AXL_INPUT_MOD_LSHIFT;
+        if (shift_state & EFI_RIGHT_SHIFT_PRESSED)   m |= AXL_INPUT_MOD_RSHIFT;
+        if (shift_state & EFI_LEFT_CONTROL_PRESSED)  m |= AXL_INPUT_MOD_LCTRL;
+        if (shift_state & EFI_RIGHT_CONTROL_PRESSED) m |= AXL_INPUT_MOD_RCTRL;
+        if (shift_state & EFI_LEFT_ALT_PRESSED)      m |= AXL_INPUT_MOD_LALT;
+        if (shift_state & EFI_RIGHT_ALT_PRESSED)     m |= AXL_INPUT_MOD_RALT;
+        if (shift_state & EFI_LEFT_LOGO_PRESSED)     m |= AXL_INPUT_MOD_LMETA;
+        if (shift_state & EFI_RIGHT_LOGO_PRESSED)    m |= AXL_INPUT_MOD_RMETA;
+    }
+    if (toggle_state & EFI_TOGGLE_STATE_VALID) {
+        if (toggle_state & EFI_CAPS_LOCK_ACTIVE)   m |= AXL_INPUT_MOD_CAPS_LOCK;
+        if (toggle_state & EFI_NUM_LOCK_ACTIVE)    m |= AXL_INPUT_MOD_NUM_LOCK;
+        if (toggle_state & EFI_SCROLL_LOCK_ACTIVE) m |= AXL_INPUT_MOD_SCROLL_LOCK;
+    }
+    return m;
+}
+
 int
 axl_backend_console_read_key_ex(
     uint16_t  *scan_code,
     uint16_t  *unicode_char,
-    uint32_t  *shift_state
+    uint32_t  *modifiers
     )
 {
-    /* Prefer SimpleTextInputEx so we get KeyShiftState. */
+    /* Prefer SimpleTextInputEx so we get modifier + lock state. */
     EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *simple_ex = get_simple_ex();
     if (simple_ex != NULL) {
         EFI_KEY_DATA  key_data;
@@ -1245,18 +1276,20 @@ axl_backend_console_read_key_ex(
         if (unicode_char != NULL) {
             *unicode_char = key_data.Key.UnicodeChar;
         }
-        if (shift_state != NULL) {
-            *shift_state = key_data.KeyState.KeyShiftState;
+        if (modifiers != NULL) {
+            *modifiers = efi_keystate_to_axl_mods(
+                key_data.KeyState.KeyShiftState,
+                key_data.KeyState.KeyToggleState);
         }
         return AXL_OK;
     }
 
-    /* Fallback: SimpleTextInput has no shift-state info. Report 0,
+    /* Fallback: SimpleTextInput has no modifier info. Report 0,
      * which is exactly what serial consoles deliver anyway (TerminalDxe
      * doesn't carry shift bits over the wire). */
     int rc = axl_backend_console_read_key(scan_code, unicode_char);
-    if (shift_state != NULL) {
-        *shift_state = 0;
+    if (modifiers != NULL) {
+        *modifiers = 0;
     }
     return rc;
 }
@@ -1280,11 +1313,12 @@ axl_backend_shell_break_flag(
 
 // ---------------------------------------------------------------------------
 // SimpleTextInputEx access (cached) — used to read keystrokes with their
-// KeyShiftState bits, which axl_backend_console_read_key_ex returns. The
-// loop reads ConsoleInHandle keys event-driven via WaitForKey/Ex; we just
-// need to reconstruct shift state on dispatch so it can recognize raw
-// serial Ctrl-C ({UnicodeChar=0x03, KeyShiftState=0}, what TerminalDxe
-// emits — see axl-loop.c's keypress dispatch).
+// KeyShiftState + KeyToggleState, which axl_backend_console_read_key_ex
+// normalizes into AXL_INPUT_MOD_* bits. The loop reads ConsoleInHandle
+// keys event-driven via WaitForKey/Ex; we need the modifier state on
+// dispatch so it can recognize raw serial Ctrl-C ({UnicodeChar=0x03,
+// no modifiers}, what TerminalDxe emits — see axl-loop.c's keypress
+// dispatch).
 //
 // We do NOT call SimpleTextInputEx::RegisterKeyNotify. Doing so puts
 // OVMF's ConSplitter into a TPL_NOTIFY-level key polling loop that

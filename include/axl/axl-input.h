@@ -73,10 +73,37 @@ typedef enum {
 #define AXL_INPUT_BUTTON_RIGHT   (1u << 1)
 #define AXL_INPUT_BUTTON_MIDDLE  (1u << 2)
 
-#define AXL_INPUT_MOD_SHIFT      (1u << 0)
-#define AXL_INPUT_MOD_CTRL       (1u << 1)
-#define AXL_INPUT_MOD_ALT        (1u << 2)
-#define AXL_INPUT_MOD_META       (1u << 3)
+// Keyboard modifier / lock state, reported in AxlInputEvent.modifiers
+// on KEY_DOWN events. Left/right variants are distinct bits; the
+// unmodified names (SHIFT/CTRL/ALT/META) are masks matching EITHER
+// side, so `mods & AXL_INPUT_MOD_SHIFT` works regardless of which
+// shift was held. META is the "logo" key (Windows / Command).
+//
+// modifiers is 0 when nothing is held OR when the platform can't
+// report modifier state (no EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL — e.g.
+// over a serial console) — treat absent modifiers as "none". Reported
+// only on KEY_DOWN; UEFI delivers no key-up / standalone-modifier
+// events.
+#define AXL_INPUT_MOD_LSHIFT      (1u << 0)
+#define AXL_INPUT_MOD_RSHIFT      (1u << 1)
+#define AXL_INPUT_MOD_LCTRL       (1u << 2)
+#define AXL_INPUT_MOD_RCTRL       (1u << 3)
+#define AXL_INPUT_MOD_LALT        (1u << 4)
+#define AXL_INPUT_MOD_RALT        (1u << 5)
+#define AXL_INPUT_MOD_LMETA       (1u << 6)
+#define AXL_INPUT_MOD_RMETA       (1u << 7)
+
+// Toggle-lock state (active/inactive), from the keyboard's
+// KeyToggleState. Like the held modifiers, 0 when unavailable.
+#define AXL_INPUT_MOD_CAPS_LOCK   (1u << 8)
+#define AXL_INPUT_MOD_NUM_LOCK    (1u << 9)
+#define AXL_INPUT_MOD_SCROLL_LOCK (1u << 10)
+
+// Side-agnostic masks — match either the left or right key.
+#define AXL_INPUT_MOD_SHIFT  (AXL_INPUT_MOD_LSHIFT | AXL_INPUT_MOD_RSHIFT)
+#define AXL_INPUT_MOD_CTRL   (AXL_INPUT_MOD_LCTRL  | AXL_INPUT_MOD_RCTRL)
+#define AXL_INPUT_MOD_ALT    (AXL_INPUT_MOD_LALT   | AXL_INPUT_MOD_RALT)
+#define AXL_INPUT_MOD_META   (AXL_INPUT_MOD_LMETA  | AXL_INPUT_MOD_RMETA)
 
 // ===================================================================
 // Event struct
@@ -151,14 +178,16 @@ axl_input_attach_mouse(
 /// Thin wrapper over `axl_loop_add_key_press` that translates each
 /// `AxlInputKey` (scan_code + unicode_char) into a unified
 /// `AxlInputEvent` (`type = AXL_INPUT_KEY_DOWN`, `keycode = scan_code`,
-/// `unicode = unicode_char`).  This lets callers register a single
-/// `AxlInputCallback` for mouse + keyboard + (future) touch instead
-/// of separate per-device callbacks.
+/// `unicode = unicode_char`, `modifiers = AXL_INPUT_MOD_*`).  This lets
+/// callers register a single `AxlInputCallback` for mouse + keyboard +
+/// (future) touch instead of separate per-device callbacks.
 ///
-/// Modifiers (shift / ctrl / alt / meta) and `AXL_INPUT_KEY_UP` events
-/// require `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL` — deferred until a
-/// consumer asks.  For v0.1, modifiers is always 0 and only KEY_DOWN
-/// fires.
+/// `event.modifiers` carries held shift/ctrl/alt/meta (left/right
+/// distinct, plus side-agnostic masks) and caps/num/scroll lock state
+/// when the firmware publishes `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`; it
+/// is 0 when modifiers can't be read (no ex protocol, e.g. serial).
+/// Only `AXL_INPUT_KEY_DOWN` fires — UEFI delivers no key-up or
+/// standalone-modifier events.
 ///
 /// Only one keyboard source per process for v0.1.
 ///

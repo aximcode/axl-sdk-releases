@@ -145,6 +145,28 @@ typedef struct {
     UINT8   KeyToggleState;
 } EFI_KEY_STATE;
 
+// EFI_KEY_STATE bit definitions (UEFI 2.11 §12.2.5). Hand-written
+// here alongside the EFI_KEY_STATE struct (SimpleTextInputEx is not
+// emitted by the spec-HTML generator; the struct above is hand-written
+// for the same reason). KeyShiftState is valid only when
+// EFI_SHIFT_STATE_VALID is set; KeyToggleState only when
+// EFI_TOGGLE_STATE_VALID is set.
+#define EFI_SHIFT_STATE_VALID       0x80000000u
+#define EFI_RIGHT_SHIFT_PRESSED     0x00000001u
+#define EFI_LEFT_SHIFT_PRESSED      0x00000002u
+#define EFI_RIGHT_CONTROL_PRESSED   0x00000004u
+#define EFI_LEFT_CONTROL_PRESSED    0x00000008u
+#define EFI_RIGHT_ALT_PRESSED       0x00000010u
+#define EFI_LEFT_ALT_PRESSED        0x00000020u
+#define EFI_RIGHT_LOGO_PRESSED      0x00000040u
+#define EFI_LEFT_LOGO_PRESSED       0x00000080u
+
+#define EFI_TOGGLE_STATE_VALID      0x80u
+#define EFI_KEY_STATE_EXPOSED       0x40u
+#define EFI_SCROLL_LOCK_ACTIVE      0x01u
+#define EFI_NUM_LOCK_ACTIVE         0x02u
+#define EFI_CAPS_LOCK_ACTIVE        0x04u
+
 typedef struct {
     EFI_INPUT_KEY  Key;
     EFI_KEY_STATE  KeyState;

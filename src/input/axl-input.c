@@ -218,7 +218,7 @@ key_dispatch_cb(
     ev.timestamp_us = axl_time_get_us();
     ev.keycode      = key.scan_code;
     ev.unicode      = key.unicode_char;
-    ev.modifiers    = 0;  /* EX protocol required for modifier state */
+    ev.modifiers    = key.modifiers;  /* AXL_INPUT_MOD_* (0 if no ConIn-Ex) */
     return ks->cb(&ev, ks->data);
 }
 

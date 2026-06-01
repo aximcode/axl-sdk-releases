@@ -57,7 +57,7 @@ helper, has burned us before.
       -not -path '*/backend/*' \
       -not -name 'axl-mbedtls-platform.c' \
       -print0 \
-    | xargs -0 clang-tidy -p . -quiet
+    | xargs -0 -n1 -P"$(nproc)" clang-tidy -p . -quiet
   echo "exit=$?"   # must be 0
   ```
 
@@ -65,6 +65,16 @@ helper, has burned us before.
   (not errors), CI is fine — `WarningsAsErrors: '*'` in
   `.clang-tidy` only escalates the checks the config enables; the
   `2 warnings generated` lines per file are noise.
+
+  **Run clang-tidy one file per process (`-n1`).** Passing many
+  TUs to a single `clang-tidy` invocation makes the path-sensitive
+  `clang-analyzer-*` checks (notably `security.ArrayBound`)
+  non-deterministic: the same clean tree intermittently reports
+  spurious out-of-bounds findings that vanish when each file is
+  analyzed alone with full budget. `-n1 -P"$(nproc)"` is
+  deterministic, parallel, and still catches real bugs (they
+  reproduce per-file). A bare `xargs -0 clang-tidy` (batched)
+  is the flaky form — don't use it.
 
 ## Cut the release
 

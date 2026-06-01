@@ -363,14 +363,15 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             return -1;
         }
 
-        /* Intrinsic keypress fired — read with shift state, intercept
-         * serial Ctrl-C (UnicodeChar=0x03 with KeyShiftState=0), drop
-         * everything else (no user source wants it). */
+        /* Intrinsic keypress fired — read with modifier state, intercept
+         * serial Ctrl-C (UnicodeChar=0x03 with no modifiers — a real
+         * keyboard Ctrl+C carries the CTRL bit, so modifiers != 0),
+         * drop everything else (no user source wants it). */
         if (event_to_source[fired_index] == (size_t)-3) {
             uint16_t scan = 0, uni = 0;
-            uint32_t shift = 0;
-            if (axl_backend_console_read_key_ex(&scan, &uni, &shift) == AXL_OK) {
-                if (uni == 0x03 && shift == 0) {
+            uint32_t mods = 0;
+            if (axl_backend_console_read_key_ex(&scan, &uni, &mods) == AXL_OK) {
+                if (uni == 0x03 && mods == 0) {
                     _axl_signal_on_break();
                     axl_loop_quit(loop);
                     return -1;
@@ -434,13 +435,13 @@ axl_loop_dispatch_event(AxlLoop *loop)
          * over a wire that carries no shift bits). Intercepted here so
          * a key source registered by the user doesn't have to know
          * about the convention. */
-        uint32_t shift = 0;
+        akey.modifiers = 0;
         if (axl_backend_console_read_key_ex(&akey.scan_code,
                                             &akey.unicode_char,
-                                            &shift) != AXL_OK) {
+                                            &akey.modifiers) != AXL_OK) {
             return;
         }
-        if (akey.unicode_char == 0x03 && shift == 0) {
+        if (akey.unicode_char == 0x03 && akey.modifiers == 0) {
             _axl_signal_on_break();
             axl_loop_quit(loop);
             return;

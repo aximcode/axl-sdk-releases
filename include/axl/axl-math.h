@@ -649,7 +649,9 @@ typedef struct AxlVec2 {
     double  y;
 } AxlVec2;
 
-/// 3x3 matrix — row-major, suitable for 2D affine transforms.
+/// 2D transform — 3×3 homography over `[x y 1]ᵀ` column vectors,
+/// row-major.  The single transform type for the library (the gfx CTM,
+/// the matrix toolkits hand to the transform-aware primitives, etc.).
 ///
 /// Stored as a flat 9-element array indexed:
 /// @code
@@ -657,13 +659,45 @@ typedef struct AxlVec2 {
 ///   [ m[3] m[4] m[5] ]
 ///   [ m[6] m[7] m[8] ]
 /// @endcode
-/// For affine transforms applied to `[x y 1]ᵀ` column vectors, the
-/// bottom row is `[0 0 1]` and the layout decodes as
+/// An affine transform has bottom row `[0 0 1]` and decodes as
 /// `[a b tx; c d ty; 0 0 1]` (scale/rotate in the 2×2 sub-matrix,
-/// translation in the last column).
-typedef struct AxlMat3 {
+/// translation in the last column); a non-trivial bottom row encodes
+/// perspective.
+typedef struct AxlTransform {
     double  m[9];
-} AxlMat3;
+} AxlTransform;
+
+/// Classification of a transform, derived from its contents (never
+/// stored / consumer-set).  Ordered by generality: each kind is a
+/// special case of the ones below it, and `axl_transform_classify`
+/// returns the most specific kind that fits.  Renderers and the
+/// mapping routines key fast paths off this (skip the perspective
+/// divide when not `PROJECTIVE`, use an axis-aligned blit when
+/// `SCALE`, etc.).
+typedef enum AxlTransformClass {
+    AXL_TRANSFORM_IDENTITY = 0,  ///< exactly the identity
+    AXL_TRANSFORM_TRANSLATE,     ///< identity linear part + translation
+    AXL_TRANSFORM_SCALE,         ///< axis-aligned scale (diagonal linear) + translation
+    AXL_TRANSFORM_AFFINE,        ///< general affine (rotation / shear); bottom row [0 0 1]
+    AXL_TRANSFORM_PROJECTIVE,    ///< non-trivial bottom row (perspective)
+} AxlTransformClass;
+
+/// Axis-aligned rectangle, defined by its top-left corner and
+/// width/height.  Negative `w` or `h` are treated as empty rects
+/// by all the helpers below — the canonical form normalizes to
+/// non-negative extents.
+///
+/// Edge semantics are HALF-OPEN: top/left included, bottom/right
+/// excluded (so adjacent rects don't both claim a shared edge).
+/// This is intentionally asymmetric with `AxlCircle`, which uses
+/// CLOSED intersection — rects are a tiling primitive, circles
+/// aren't, and each convention matches its respective domain.
+typedef struct AxlRect {
+    double  x;
+    double  y;
+    double  w;
+    double  h;
+} AxlRect;
 
 /// Construct a 2D vector / point from components.
 AxlVec2
@@ -721,27 +755,95 @@ axl_vec2_normalize(
     AxlVec2  v
     );
 
+/// Linear interpolation: `a + (b - a) * t`.  `t = 0` → @a a, `t = 1` →
+/// @a b.  `t` outside `[0, 1]` extrapolates (no clamp).
+AxlVec2
+axl_vec2_lerp(
+    AxlVec2  a,
+    AxlVec2  b,
+    double   t
+    );
+
+/// Euclidean distance between @a a and @a b — `|a - b|`.
+double
+axl_vec2_distance(
+    AxlVec2  a,
+    AxlVec2  b
+    );
+
+/// Left perpendicular: `(-v.y, v.x)` — @a v turned 90° (toward +y from
+/// +x).  `axl_vec2_perp((1, 0)) == (0, 1)`.  Negate for the right
+/// perpendicular.
+AxlVec2
+axl_vec2_perp(
+    AxlVec2  v
+    );
+
+/// 2D cross product (scalar z-component): `a.x*b.y - a.y*b.x`.
+///
+/// Equals `|a| * |b| * sin(θ)`: positive iff @a b is counter-clockwise
+/// from @a a, zero iff parallel.  The sign is the standard orientation
+/// test (twice the signed area of the triangle `0, a, b`).
+double
+axl_vec2_cross(
+    AxlVec2  a,
+    AxlVec2  b
+    );
+
+/// Rotate @a v by @a radians about the origin (column-vector
+/// `[c -s; s c]`, same convention as `axl_transform_rotate`).
+AxlVec2
+axl_vec2_rotate(
+    AxlVec2  v,
+    double   radians
+    );
+
+/// Angle of @a v from the +x axis, in radians `(-π, π]` — `atan2(v.y,
+/// v.x)`.  `axl_vec2_angle((0, 1)) == π/2`.  `(0, 0)` returns 0.
+double
+axl_vec2_angle(
+    AxlVec2  v
+    );
+
+/// Reflect @a v across the line through the origin with unit normal
+/// @a n: `v - 2*(v·n)*n`.  @a n MUST be unit length (normalize first);
+/// a non-unit normal scales the result.
+AxlVec2
+axl_vec2_reflect(
+    AxlVec2  v,
+    AxlVec2  n
+    );
+
+/// Vector projection of @a a onto @a b: `(a·b / b·b) * b` — the
+/// component of @a a parallel to @a b.  Zero-length @a b returns
+/// `(0, 0)` (safe default, matching `axl_vec2_normalize`).
+AxlVec2
+axl_vec2_project(
+    AxlVec2  a,
+    AxlVec2  b
+    );
+
 /// Identity matrix — leaves any transformed point unchanged.
 ///
 /// `[1 0 0; 0 1 0; 0 0 1]`.
-AxlMat3
-axl_mat3_identity(
+AxlTransform
+axl_transform_identity(
     void
     );
 
 /// Translation matrix.
 ///
-/// `axl_mat3_transform_point(axl_mat3_translate(3, 4), p)` equals
+/// `axl_transform_map_point(axl_transform_translate(3, 4), p)` equals
 /// `(p.x + 3, p.y + 4)`.
-AxlMat3
-axl_mat3_translate(
+AxlTransform
+axl_transform_translate(
     double  tx,
     double  ty
     );
 
 /// Non-uniform scale matrix.  `sx == sy == 1` is the identity scale.
-AxlMat3
-axl_mat3_scale(
+AxlTransform
+axl_transform_scale(
     double  sx,
     double  sy
     );
@@ -749,13 +851,13 @@ axl_mat3_scale(
 /// Rotation matrix.  Angle in radians.
 ///
 /// Always computes `[c -s; s c]` (the standard column-vector
-/// rotation matrix) — `axl_mat3_rotate(AXL_MATH_HALF_PI)` applied
+/// rotation matrix) — `axl_transform_rotate(AXL_MATH_HALF_PI)` applied
 /// to `(1, 0)` returns `(0, 1)` regardless of any downstream
 /// y-axis convention.  Whether that *visually* reads as CCW or
 /// CW depends on whether the framebuffer is y-up (math/SVG
 /// convention) or y-down (axl-gfx and stb-style rasterizers).
-AxlMat3
-axl_mat3_rotate(
+AxlTransform
+axl_transform_rotate(
     double  radians
     );
 
@@ -766,63 +868,179 @@ axl_mat3_rotate(
 /// shear angle (matches the CSS `skew()` convention: pass
 /// `axl_sin(angle)/axl_cos(angle)` for the angle form).
 ///
-/// `axl_mat3_transform_point(axl_mat3_skew(0.5, 0), (0, 1))`
+/// `axl_transform_map_point(axl_transform_shear(0.5, 0), (0, 1))`
 /// returns `(0.5, 1)` — y stays the same, x shifts by `0.5 * y`.
-AxlMat3
-axl_mat3_skew(
+AxlTransform
+axl_transform_shear(
     double  sx,
     double  sy
     );
 
-/// Matrix multiplication: `a * b`.
+/// Compose two transforms: the result applies @a a first, then @a b.
 ///
-/// Composition follows the column-vector convention: applying
-/// `axl_mat3_mul(A, B)` to a point is equivalent to applying B
-/// first, then A.  So:
+/// cairo `cairo_matrix_multiply` operand order — for column-vector
+/// points it is the matrix product `b · a`.  So:
 /// @code
-///   M = axl_mat3_mul(axl_mat3_translate(10, 0),
-///                    axl_mat3_rotate(AXL_MATH_HALF_PI));
+///   M = axl_transform_multiply(axl_transform_rotate(AXL_MATH_HALF_PI),
+///                              axl_transform_translate(10, 0));
 ///   // M rotates first, THEN translates by (10, 0)
 /// @endcode
-AxlMat3
-axl_mat3_mul(
-    AxlMat3  a,
-    AxlMat3  b
+/// NOTE: the operand order is cairo a-first as of v0.22.0 (pre-release);
+/// the predecessor `axl_mat3_mul(a, b)` applied `b` first.
+AxlTransform
+axl_transform_multiply(
+    AxlTransform  a,
+    AxlTransform  b
     );
 
-/// Apply matrix @a m to point @a p.
+/// Apply matrix @a m to point @a p, with perspective divide.
 ///
-/// Treats `p` as the column vector `[p.x p.y 1]ᵀ`; result's
-/// implicit `w` is 1 for affine matrices (no perspective divide).
+/// Treats `p` as the column vector `[p.x p.y 1]ᵀ`, computes
+/// `[x' y' w]ᵀ = m·p`, and returns `(x'/w, y'/w)`.  For an affine
+/// matrix the bottom row is `[0 0 1]` so `w` is exactly 1 and the
+/// divide is a no-op (results are bit-exact); a non-trivial bottom row
+/// (perspective) makes the divide meaningful.
 ///
-/// `axl_mat3_transform_point(axl_mat3_translate(3, 4), (1, 1))`
+/// `axl_transform_map_point(axl_transform_translate(3, 4), (1, 1))`
 /// returns `(4, 5)`.
 AxlVec2
-axl_mat3_transform_point(
-    AxlMat3  m,
+axl_transform_map_point(
+    AxlTransform  m,
     AxlVec2  p
+    );
+
+/// Apply only the linear part of @a m to @a v — the upper-left 2×2,
+/// ignoring translation.  Use for directions / deltas / sizes (a drag
+/// vector, a surface normal) that should rotate and scale but not
+/// shift.  `(m0*x + m1*y, m3*x + m4*y)`.
+AxlVec2
+axl_transform_map_vector(
+    AxlTransform  m,
+    AxlVec2  v
+    );
+
+/// Determinant of @a m (full 3×3).  For an affine matrix
+/// (`[0 0 1]` bottom row) this reduces to `m0*m4 - m1*m3`, the signed
+/// area scale of the linear part; zero iff @a m is singular
+/// (non-invertible / collapses to a line or point).
+double
+axl_transform_determinant(
+    AxlTransform  m
+    );
+
+/// Invert @a m.  Writes the inverse to @a out and returns true; returns
+/// false (leaving @a out unmodified) if @a m is singular (≈ zero
+/// determinant).
+///
+/// The inverse maps results back to inputs — e.g. converting a screen
+/// point to local coordinates by inverting the transform it was drawn
+/// with (hit-testing).  Computed by the adjugate / determinant for the
+/// general 3×3 case.
+bool
+axl_transform_invert(
+    AxlTransform   m,    ///< [in] matrix to invert
+    AxlTransform  *out   ///< [out] receives the inverse (untouched if singular)
+    );
+
+/// A perspective transform with bottom row `[px py 1]`.
+///
+/// Maps `(x, y)` to `(x, y) / (px*x + py*y + 1)` — the points where the
+/// denominator stays positive are foreshortened toward the origin as
+/// `px*x + py*y` grows.  `axl_transform_perspective(0, 0)` is the
+/// identity.  Compose with the affine builders via
+/// `axl_transform_multiply` to build a general projective map, or use
+/// `axl_transform_quad_to_quad` to derive one from corner
+/// correspondences.
+AxlTransform
+axl_transform_perspective(
+    double  px,   ///< x-weight of the perspective denominator (m[6])
+    double  py    ///< y-weight of the perspective denominator (m[7])
+    );
+
+/// Build the transform mapping one quad onto another (4 point
+/// correspondences) — the general projective map, exact for any
+/// non-degenerate simple quad (convex or concave; no general solver,
+/// closed form via the unit square).
+///
+/// Corners are matched by index in the order **top-left, top-right,
+/// bottom-right, bottom-left** (consistent winding for both quads):
+/// `map_point(result, src[i]) == dst[i]` for each `i`.  Use it to warp
+/// a source rectangle onto an arbitrary on-screen quadrilateral.
+///
+/// @return true on success; false (leaving @a out untouched) if @a src
+///         is degenerate (collinear / zero-area — not invertible).
+bool
+axl_transform_quad_to_quad(
+    const AxlVec2  src[4],   ///< [in] source corners (TL, TR, BR, BL)
+    const AxlVec2  dst[4],   ///< [in] destination corners (same order)
+    AxlTransform  *out       ///< [out] receives src→dst transform
+    );
+
+/// Map the four corners of axis-aligned rect @a r through @a m and
+/// return the **axis-aligned bounding box** of the result.
+///
+/// Exact when @a m is axis-aligned (`axl_transform_is_axis_aligned`);
+/// otherwise it is the tight AABB enclosing the (rotated / sheared /
+/// projected) image — a conservative cover, the usual input to a clip
+/// or dirty-region test.  A normalized rect (non-negative w/h) is
+/// returned.
+///
+/// Defined when @a r does not cross @a m's horizon — i.e. all four
+/// corners map with the same sign of `w` (always true for affine maps
+/// and for the rect→on-screen-quad warps `axl_transform_quad_to_quad`
+/// produces).  A projective @a m whose horizon line passes through
+/// @a r has no finite enclosing box, and the returned rect is
+/// meaningless; clip @a r to the front of the horizon first.
+AxlRect
+axl_transform_map_rect(
+    AxlTransform  m,
+    AxlRect       r
+    );
+
+/// Map four points through @a m (full perspective divide each), writing
+/// the images to @a out.  @a in and @a out may alias.  For clip-region
+/// and quad-corner work where the bounding box of `map_rect` is too
+/// loose.
+void
+axl_transform_map_quad(
+    AxlTransform   m,
+    const AxlVec2  in[4],    ///< [in] four source points
+    AxlVec2        out[4]    ///< [out] four mapped points
+    );
+
+/// Classify @a m by its contents (see `AxlTransformClass`).  Pure
+/// function of the matrix; uses a small tolerance so composed
+/// transforms classify as expected despite floating-point drift.
+AxlTransformClass
+axl_transform_classify(
+    AxlTransform  m
+    );
+
+/// True iff @a m is (within tolerance) the identity.
+bool
+axl_transform_is_identity(
+    AxlTransform  m
+    );
+
+/// True iff @a m maps every axis-aligned rectangle to an axis-aligned
+/// rectangle — i.e. non-perspective with a diagonal **or** anti-diagonal
+/// linear part (axis scales, 90° rotations, flips).  The condition under
+/// which `axl_transform_map_rect` is exact.
+bool
+axl_transform_is_axis_aligned(
+    AxlTransform  m
+    );
+
+/// True iff @a m is affine (bottom row `[0 0 1]`, no perspective) —
+/// equivalently `axl_transform_classify(m) != AXL_TRANSFORM_PROJECTIVE`.
+bool
+axl_transform_is_affine(
+    AxlTransform  m
     );
 
 // ===================================================================
 // Geometry helpers — rect, segment, circle
 // ===================================================================
-
-/// Axis-aligned rectangle, defined by its top-left corner and
-/// width/height.  Negative `w` or `h` are treated as empty rects
-/// by all the helpers below — the canonical form normalizes to
-/// non-negative extents.
-///
-/// Edge semantics are HALF-OPEN: top/left included, bottom/right
-/// excluded (so adjacent rects don't both claim a shared edge).
-/// This is intentionally asymmetric with `AxlCircle`, which uses
-/// CLOSED intersection — rects are a tiling primitive, circles
-/// aren't, and each convention matches its respective domain.
-typedef struct AxlRect {
-    double  x;
-    double  y;
-    double  w;
-    double  h;
-} AxlRect;
 
 /// Circle, defined by center and radius.  Negative radius is
 /// treated as a degenerate (always-false-intersect) circle.

@@ -109,7 +109,9 @@ axl_array_get_ptr(
 );
 
 /**
- * @brief Sort array elements in place using insertion sort.
+ * @brief Sort array elements in place (introsort, O(n log n)).
+ *
+ * Delegates to axl_qsort(). Not stable: equal elements may be reordered.
  */
 void
 axl_array_sort(
@@ -169,7 +171,10 @@ axl_array_set_size(
 );
 
 /**
- * @brief Sort array elements in place with a context-aware comparator.
+ * @brief Sort in place with a context-aware comparator (introsort).
+ *
+ * Delegates to axl_qsort_with_data(). Not stable: equal elements may be
+ * reordered.
  */
 void
 axl_array_sort_with_data(

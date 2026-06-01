@@ -289,6 +289,12 @@ axl_memmem(
  * Uses AXL's own printf engine (standard C format specifiers).
  * Always NUL-terminates if size > 0.
  *
+ * `%f`/`%F` are no-libm fixed-point: round-half-up (not glibc's
+ * half-to-even), accurate to ~15 significant digits, precision capped
+ * at 18 fractional digits; NaN prints "nan", overflow "inf", and
+ * `-0.0` prints without a sign. Fine for UI / diagnostics, not for
+ * bit-exact round-trip serialization of doubles.
+ *
  * @return number of bytes that would have been written (excluding NUL),
  *     regardless of buffer size (allows truncation detection).
  */

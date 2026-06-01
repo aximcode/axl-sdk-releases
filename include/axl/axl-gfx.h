@@ -16,6 +16,8 @@
       - `#include <axl/axl-gfx-draw.h>`    — primitives + bitmap text
       - `#include <axl/axl-gfx-path.h>`    — retained paths + fill/stroke
       - `#include <axl/axl-gfx-gradient.h>`— linear / radial gradients
+      - `#include <axl/axl-gfx-effects.h>` — blur (+ later shadows)
+      - `#include <axl/axl-gfx-display-list.h>` — retained/replayable command buffer
       - `#include <axl/axl-font.h>`        — bitmap font atlas
       - `#include <axl/axl-truetype.h>`    — vector text (TTF/OTF)
       - `#include <axl/axl-pixmap.h>`      — image decode (PNG/JPG/GIF/BMP)
@@ -39,8 +41,10 @@
 #include <axl/axl-gfx-draw.h>
 #include <axl/axl-gfx-path.h>
 #include <axl/axl-gfx-gradient.h>
+#include <axl/axl-gfx-effects.h>
 #include <axl/axl-font.h>
 #include <axl/axl-truetype.h>
 #include <axl/axl-pixmap.h>
+#include <axl/axl-gfx-display-list.h>
 
 #endif /* AXL_GFX_H */

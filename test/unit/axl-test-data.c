@@ -2134,6 +2134,606 @@ test_radix_tree_http_keys(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlNTree (n-ary tree) Tests
+// ---------------------------------------------------------------------------
+
+/* Concatenate a node's immediate children's (string) data into @out. */
+static void
+ntree_children_str(AxlNTree *parent, char *out)
+{
+    size_t k = 0;
+    for (AxlNTree *c = parent->children; c != NULL; c = c->next) {
+        for (const char *s = c->data; *s != '\0'; s++) {
+            out[k++] = *s;
+        }
+    }
+    out[k] = '\0';
+}
+
+typedef struct { char buf[64]; } NtSeq;
+
+/* Traverse collector: append node data to the running sequence. */
+static bool
+ntree_collect(AxlNTree *node, void *user)
+{
+    NtSeq *q = user;
+    size_t k = 0;
+    while (q->buf[k] != '\0') {
+        k++;
+    }
+    for (const char *s = node->data; *s != '\0'; s++) {
+        q->buf[k++] = *s;
+    }
+    q->buf[k] = '\0';
+    return false;   /* continue */
+}
+
+/* Collector that stops after the first node. */
+static bool
+ntree_collect_stop(AxlNTree *node, void *user)
+{
+    ntree_collect(node, user);
+    return true;   /* stop */
+}
+
+static void
+ntree_foreach_collect(AxlNTree *node, void *user)
+{
+    (void)ntree_collect(node, user);
+}
+
+static int ntree_free_calls;
+static void
+ntree_count_free(void *data)
+{
+    (void)data;
+    ntree_free_calls++;
+}
+
+/* Build the canonical test tree:
+ *   R -> [A -> [A1, A2], B, C -> [C1]]   (returns the root). */
+static AxlNTree *
+ntree_build_sample(void)
+{
+    AxlNTree *root = axl_ntree_new("R");
+    AxlNTree *a = axl_ntree_append_data(root, "A");
+    (void)axl_ntree_append_data(root, "B");
+    AxlNTree *c = axl_ntree_append_data(root, "C");
+    (void)axl_ntree_append_data(a, "A1");
+    (void)axl_ntree_append_data(a, "A2");
+    (void)axl_ntree_append_data(c, "C1");
+    return root;
+}
+
+static void
+test_ntree_build_navigate(void)
+{
+    AxlNTree *root = ntree_build_sample();
+    AxlNTree *a = axl_ntree_first_child(root);
+    AxlNTree *c = axl_ntree_last_child(root);
+
+    test_check(axl_ntree_n_children(root) == 3, "ntree: root has 3 children");
+    test_check(axl_ntree_n_children(a) == 2, "ntree: 'A' has 2 children");
+    test_check(axl_ntree_n_children(axl_ntree_nth_child(root, 1)) == 0,
+               "ntree: 'B' is a leaf");
+    test_check(axl_strcmp(a->data, "A") == 0, "ntree: first_child is 'A'");
+    test_check(axl_strcmp(c->data, "C") == 0, "ntree: last_child is 'C'");
+    test_check(axl_strcmp(axl_ntree_nth_child(root, 1)->data, "B") == 0,
+               "ntree: nth_child(1) is 'B'");
+    test_check(axl_ntree_nth_child(root, 3) == NULL,
+               "ntree: nth_child past end is NULL");
+    test_check(a->parent == root && a->next != NULL &&
+               axl_strcmp(a->next->data, "B") == 0,
+               "ntree: parent + next-sibling links wired");
+    test_check(a->next->prev == a && c->parent == root && c->next == NULL,
+               "ntree: prev/next/parent are consistent");
+
+    /* Insert ordering in a fresh parent: prepend / append / before / after. */
+    AxlNTree *p  = axl_ntree_new("P");
+    AxlNTree *n1 = axl_ntree_append_data(p, "1");      /* [1]       */
+    AxlNTree *n3 = axl_ntree_append_data(p, "3");      /* [1,3]     */
+    AxlNTree *n2 = axl_ntree_new("2");
+    test_check(axl_ntree_insert_after(p, n1, n2) == n2, "ntree: insert_after returns child");
+    /* [1,2,3] */
+    (void)axl_ntree_prepend_child(p, axl_ntree_new("0"));     /* [0,1,2,3]   */
+    (void)axl_ntree_insert_before(p, NULL, axl_ntree_new("4")); /* append [0..4] */
+    (void)axl_ntree_insert_before(p, n3, axl_ntree_new("x"));  /* before '3'   */
+    char order[64];
+    ntree_children_str(p, order);
+    test_check(axl_strcmp(order, "012x34") == 0, "ntree: insert ordering 012x34");
+
+    /* A node that already has a parent cannot be re-attached. */
+    test_check(axl_ntree_append_child(p, n1) == NULL,
+               "ntree: re-parenting an attached node is rejected");
+
+    axl_ntree_free(p);
+    axl_ntree_free(root);
+}
+
+static void
+test_ntree_query_traverse(void)
+{
+    AxlNTree *root = ntree_build_sample();
+    AxlNTree *a  = axl_ntree_first_child(root);
+    AxlNTree *a1 = axl_ntree_first_child(a);
+    AxlNTree *b  = axl_ntree_nth_child(root, 1);
+    AxlNTree *c  = axl_ntree_last_child(root);
+
+    /* Query. */
+    test_check(axl_ntree_get_root(a1) == root, "ntree: get_root from a leaf");
+    test_check(axl_ntree_depth(root) == 1 && axl_ntree_depth(a) == 2 &&
+               axl_ntree_depth(a1) == 3, "ntree: depth is 1-based");
+    test_check(axl_ntree_is_ancestor(root, a1) && axl_ntree_is_ancestor(a, a1),
+               "ntree: ancestors detected");
+    test_check(!axl_ntree_is_ancestor(a1, root) && !axl_ntree_is_ancestor(a, b),
+               "ntree: non-ancestors rejected (incl. self/siblings)");
+    test_check(axl_ntree_max_height(root) == 3 && axl_ntree_max_height(a) == 2 &&
+               axl_ntree_max_height(a1) == 1, "ntree: max_height");
+    test_check(axl_ntree_n_nodes(root, AXL_NTREE_ALL) == 7, "ntree: 7 nodes total");
+    test_check(axl_ntree_n_nodes(root, AXL_NTREE_LEAVES) == 4, "ntree: 4 leaves");
+    test_check(axl_ntree_n_nodes(root, AXL_NTREE_NON_LEAVES) == 3, "ntree: 3 internal");
+
+    /* Traverse orders (exact sequences). */
+    NtSeq q;
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_ALL, 0, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "RAA1A2BCC1") == 0, "ntree: pre-order");
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_POST_ORDER, AXL_NTREE_ALL, 0, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "A1A2ABC1CR") == 0, "ntree: post-order");
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_LEVEL_ORDER, AXL_NTREE_ALL, 0, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "RABCA1A2C1") == 0, "ntree: level-order");
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_IN_ORDER, AXL_NTREE_ALL, 0, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "A1AA2RBC1C") == 0, "ntree: in-order");
+
+    /* Flags filter. */
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_LEAVES, 0, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "A1A2BC1") == 0, "ntree: pre-order leaves only");
+
+    /* max_depth. */
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_ALL, 1, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "R") == 0, "ntree: max_depth 1 = root only");
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_ALL, 2, ntree_collect, &q);
+    test_check(axl_strcmp(q.buf, "RABC") == 0, "ntree: max_depth 2 = root + children");
+
+    /* Early stop. */
+    q.buf[0] = '\0';
+    axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_ALL, 0, ntree_collect_stop, &q);
+    test_check(axl_strcmp(q.buf, "R") == 0, "ntree: traverse stops on true");
+
+    /* children_foreach with flags. */
+    q.buf[0] = '\0';
+    axl_ntree_children_foreach(root, AXL_NTREE_ALL, ntree_foreach_collect, &q);
+    test_check(axl_strcmp(q.buf, "ABC") == 0, "ntree: children_foreach all");
+    q.buf[0] = '\0';
+    axl_ntree_children_foreach(root, AXL_NTREE_LEAVES, ntree_foreach_collect, &q);
+    test_check(axl_strcmp(q.buf, "B") == 0, "ntree: children_foreach leaves (only 'B')");
+
+    (void)c;
+    axl_ntree_free(root);
+}
+
+static void
+test_ntree_unlink_free(void)
+{
+    AxlNTree *root = ntree_build_sample();
+    AxlNTree *a = axl_ntree_first_child(root);
+    AxlNTree *b = axl_ntree_nth_child(root, 1);
+    AxlNTree *c = axl_ntree_last_child(root);
+
+    axl_ntree_unlink(b);
+    test_check(b->parent == NULL && b->prev == NULL && b->next == NULL,
+               "ntree: unlink detaches the node");
+    test_check(axl_ntree_n_children(root) == 2, "ntree: unlink drops child count");
+    test_check(a->next == c && c->prev == a, "ntree: unlink relinks siblings");
+    axl_ntree_unlink(b);   /* idempotent on a root */
+    axl_ntree_free(b);
+
+    /* free_full calls the destroy callback once per node in the subtree. */
+    ntree_free_calls = 0;
+    axl_ntree_free_full(root, ntree_count_free);
+    test_check(ntree_free_calls == 6, "ntree: free_full runs destroy per node (6 left)");
+
+    /* NULL-safety: frees are no-ops and queries return zero/NULL. */
+    axl_ntree_free(NULL);
+    axl_ntree_free_full(NULL, ntree_count_free);
+    test_check(axl_ntree_n_children(NULL) == 0 && axl_ntree_depth(NULL) == 0 &&
+               axl_ntree_get_root(NULL) == NULL &&
+               axl_ntree_max_height(NULL) == 0,
+               "ntree: NULL-safe queries return zero/NULL");
+}
+
+/* Concatenate iterator-visited node data (pre-order, filtered) into out. */
+static void
+ntree_iter_str(AxlNTree *root, AxlNTreeTraverseFlags flags, char *out)
+{
+    AxlNTreeIter it;
+    axl_ntree_iter_init(&it, root, flags);
+    size_t k = 0;
+    for (AxlNTree *n; (n = axl_ntree_iter_next(&it)) != NULL; ) {
+        for (const char *s = n->data; *s != '\0'; s++) {
+            out[k++] = *s;
+        }
+    }
+    out[k] = '\0';
+}
+
+static void
+test_ntree_iter(void)
+{
+    AxlNTree *root = ntree_build_sample();
+    char buf[64];
+
+    ntree_iter_str(root, AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "RAA1A2BCC1") == 0, "ntree_iter: pre-order all");
+    ntree_iter_str(root, AXL_NTREE_LEAVES, buf);
+    test_check(axl_strcmp(buf, "A1A2BC1") == 0, "ntree_iter: leaves only");
+    ntree_iter_str(root, AXL_NTREE_NON_LEAVES, buf);
+    test_check(axl_strcmp(buf, "RAC") == 0, "ntree_iter: internal only");
+
+    /* Single-node subtree. */
+    AxlNTree *solo = axl_ntree_new("S");
+    ntree_iter_str(solo, AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "S") == 0, "ntree_iter: single node");
+
+    /* Iterating from a non-root node stays inside that subtree. */
+    ntree_iter_str(axl_ntree_first_child(root), AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "AA1A2") == 0, "ntree_iter: bounded to subtree of 'A'");
+
+    /* NULL root -> immediately exhausted. */
+    AxlNTreeIter it;
+    axl_ntree_iter_init(&it, NULL, AXL_NTREE_ALL);
+    test_check(axl_ntree_iter_next(&it) == NULL, "ntree_iter: NULL root exhausted");
+
+    axl_ntree_free(solo);
+    axl_ntree_free(root);
+}
+
+// ---------------------------------------------------------------------------
+// AxlTree (AVL sorted map) Tests
+// ---------------------------------------------------------------------------
+
+static int
+tree_cmp_intptr(const void *a, const void *b, void *user)
+{
+    (void)user;
+    intptr_t x = (intptr_t)a, y = (intptr_t)b;
+    return (x > y) - (x < y);
+}
+
+static int
+tree_cmp_pint(const void *a, const void *b, void *user)
+{
+    (void)user;
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+typedef struct { intptr_t prev; bool ok; uint32_t count; } TreeOrderCtx;
+
+static bool
+tree_order_check(void *key, void *value, void *user)
+{
+    (void)value;
+    TreeOrderCtx *c = user;
+    intptr_t k = (intptr_t)key;
+    if (c->count > 0 && k <= c->prev) {
+        c->ok = false;
+    }
+    c->prev = k;
+    c->count++;
+    return false;
+}
+
+/* Ceil log2 helper for the AVL height bound. */
+static uint32_t
+ceil_log2(uint32_t n)
+{
+    uint32_t bits = 0;
+    while ((1u << bits) < n) {
+        bits++;
+    }
+    return bits;
+}
+
+static void
+test_tree_basic(void)
+{
+    AxlTree *t = axl_tree_new(tree_cmp_intptr, NULL);
+    test_check(t != NULL && axl_tree_nnodes(t) == 0, "tree: new is empty");
+
+    axl_tree_insert(t, (void *)3, (void *)30);
+    axl_tree_insert(t, (void *)1, (void *)10);
+    axl_tree_insert(t, (void *)2, (void *)20);
+    test_check(axl_tree_nnodes(t) == 3, "tree: 3 nodes after inserts");
+    test_check((intptr_t)axl_tree_lookup(t, (void *)2) == 20, "tree: lookup hit");
+    test_check(axl_tree_lookup(t, (void *)9) == NULL, "tree: lookup miss is NULL");
+
+    void *fk = NULL, *fv = NULL;
+    test_check(axl_tree_lookup_extended(t, (void *)1, &fk, &fv) &&
+               (intptr_t)fk == 1 && (intptr_t)fv == 10,
+               "tree: lookup_extended reports key+value");
+    test_check(!axl_tree_lookup_extended(t, (void *)9, &fk, &fv),
+               "tree: lookup_extended miss returns false");
+
+    /* foreach visits in ascending key order. */
+    TreeOrderCtx ctx = { 0, true, 0 };
+    axl_tree_foreach(t, tree_order_check, &ctx);
+    test_check(ctx.ok && ctx.count == 3, "tree: foreach is in ascending order");
+
+    /* insert of an existing key replaces the value, keeps node count. */
+    axl_tree_insert(t, (void *)2, (void *)99);
+    test_check(axl_tree_nnodes(t) == 3 &&
+               (intptr_t)axl_tree_lookup(t, (void *)2) == 99,
+               "tree: re-insert replaces value, not count");
+
+    /* NULL-safety. */
+    test_check(axl_tree_lookup(NULL, (void *)1) == NULL &&
+               axl_tree_nnodes(NULL) == 0 && axl_tree_height(NULL) == 0 &&
+               !axl_tree_remove(NULL, (void *)1),
+               "tree: NULL-safe queries");
+    axl_tree_free(NULL);
+    axl_tree_free(t);
+}
+
+static void
+test_tree_balance(void)
+{
+    const intptr_t N = 1000;
+    /* Tight AVL guard: max height < 1.5*log2(n) + 2 (AVL's true bound is
+     * ~1.44*log2(n+2)); a degenerate or mis-rotated tree blows past it. */
+    uint32_t bound = ceil_log2((uint32_t)N + 1u) * 3u / 2u + 2u;
+
+    /* Three pathological insert orders that would unbalance a plain BST. */
+    for (int mode = 0; mode < 3; mode++) {
+        AxlTree *t = axl_tree_new(tree_cmp_intptr, NULL);
+        for (intptr_t i = 0; i < N; i++) {
+            intptr_t key;
+            if (mode == 0) { key = i + 1; }                       /* ascending  */
+            else if (mode == 1) { key = N - i; }                  /* descending */
+            else { key = (i & 1) ? (N - i / 2) : (i / 2 + 1); }   /* zig-zag    */
+            axl_tree_insert(t, (void *)key, (void *)(key * 2));
+        }
+        test_check(axl_tree_nnodes(t) == (uint32_t)N,
+                   "tree: all stress keys inserted");
+        test_check(axl_tree_height(t) <= bound,
+                   "tree: AVL height stays O(log n) under adversarial order");
+
+        bool all_found = true;
+        for (intptr_t i = 1; i <= N; i++) {
+            if ((intptr_t)axl_tree_lookup(t, (void *)i) != i * 2) {
+                all_found = false;
+            }
+        }
+        test_check(all_found, "tree: every stress key looks up correctly");
+
+        TreeOrderCtx ctx = { 0, true, 0 };
+        axl_tree_foreach(t, tree_order_check, &ctx);
+        test_check(ctx.ok && ctx.count == (uint32_t)N,
+                   "tree: stress tree iterates fully sorted");
+        axl_tree_free(t);
+    }
+}
+
+static void
+test_tree_remove(void)
+{
+    AxlTree *t = axl_tree_new(tree_cmp_intptr, NULL);
+    for (intptr_t i = 1; i <= 15; i++) {
+        axl_tree_insert(t, (void *)i, (void *)(i * 10));
+    }
+
+    /* Remove a leaf, a one-child node, and a two-child node (the exact
+     * shapes depend on AVL balancing, but all three configurations are
+     * exercised across these removals of a 15-node tree). */
+    test_check(axl_tree_remove(t, (void *)1), "tree: remove leaf");
+    test_check(axl_tree_remove(t, (void *)8), "tree: remove internal (two-child)");
+    test_check(axl_tree_remove(t, (void *)15), "tree: remove edge");
+    test_check(!axl_tree_remove(t, (void *)8), "tree: re-remove returns false");
+    test_check(axl_tree_nnodes(t) == 12, "tree: node count after 3 removals");
+    test_check(axl_tree_lookup(t, (void *)8) == NULL, "tree: removed key gone");
+    test_check((intptr_t)axl_tree_lookup(t, (void *)7) == 70, "tree: neighbors intact");
+
+    /* Tree stays sorted + balanced after removals. */
+    uint32_t bound = ceil_log2(16u) * 3u / 2u + 2u;
+    test_check(axl_tree_height(t) <= bound, "tree: balanced after removals");
+    TreeOrderCtx ctx = { 0, true, 0 };
+    axl_tree_foreach(t, tree_order_check, &ctx);
+    test_check(ctx.ok && ctx.count == 12, "tree: sorted order preserved after removals");
+
+    /* Drain the rest. */
+    for (intptr_t i = 2; i <= 14; i++) {
+        if (i != 8) {
+            (void)axl_tree_remove(t, (void *)i);
+        }
+    }
+    test_check(axl_tree_nnodes(t) == 0 && axl_tree_height(t) == 0,
+               "tree: emptied to zero nodes / height");
+    axl_tree_free(t);
+
+    /* Delete-heavy stress: insert 1..500, remove every even key (exercises
+     * the delete-path rotations at scale), then verify the survivors stay
+     * balanced, sorted, and fully present. */
+    AxlTree *s = axl_tree_new(tree_cmp_intptr, NULL);
+    for (intptr_t i = 1; i <= 500; i++) {
+        axl_tree_insert(s, (void *)i, (void *)(i * 3));
+    }
+    for (intptr_t i = 2; i <= 500; i += 2) {
+        (void)axl_tree_remove(s, (void *)i);
+    }
+    test_check(axl_tree_nnodes(s) == 250, "tree: 250 odd keys remain after deletes");
+    test_check(axl_tree_height(s) <= ceil_log2(251u) * 3u / 2u + 2u,
+               "tree: balanced after 250 deletes");
+    bool odds_ok = true;
+    for (intptr_t i = 1; i <= 500; i++) {
+        void *v = axl_tree_lookup(s, (void *)i);
+        if (i & 1) {
+            if ((intptr_t)v != i * 3) { odds_ok = false; }
+        } else if (v != NULL) {
+            odds_ok = false;
+        }
+    }
+    test_check(odds_ok, "tree: odds present, evens gone after delete stress");
+    TreeOrderCtx sctx = { 0, true, 0 };
+    axl_tree_foreach(s, tree_order_check, &sctx);
+    test_check(sctx.ok && sctx.count == 250, "tree: sorted after delete stress");
+    axl_tree_free(s);
+}
+
+static int tree_key_frees;
+static int tree_val_frees;
+static void tree_key_free(void *k) { tree_key_frees++; axl_free(k); }
+static void tree_val_free(void *v) { tree_val_frees++; axl_free(v); }
+
+static int *
+heap_int(int v)
+{
+    int *p = axl_malloc(sizeof(int));
+    if (p != NULL) {
+        *p = v;
+    }
+    return p;
+}
+
+static void
+test_tree_insert_replace_destroy(void)
+{
+    tree_key_frees = 0;
+    tree_val_frees = 0;
+    AxlTree *t = axl_tree_new_full(tree_cmp_pint, NULL, tree_key_free, tree_val_free);
+
+    axl_tree_insert(t, heap_int(5), heap_int(100));   /* new entry */
+    test_check(tree_key_frees == 0 && tree_val_frees == 0,
+               "tree: first insert frees nothing");
+
+    /* insert on collision: keep OLD key (free the NEW key), replace value
+     * (free the OLD value). */
+    int probe = 5;
+    axl_tree_insert(t, heap_int(5), heap_int(200));
+    test_check(tree_key_frees == 1 && tree_val_frees == 1,
+               "tree: insert collision frees new key + old value");
+    test_check(*(int *)axl_tree_lookup(t, &probe) == 200,
+               "tree: insert collision updated the value");
+
+    /* replace on collision: free OLD key AND old value. */
+    axl_tree_replace(t, heap_int(5), heap_int(300));
+    test_check(tree_key_frees == 2 && tree_val_frees == 2,
+               "tree: replace collision frees old key + old value");
+
+    /* remove frees the surviving key + value. */
+    test_check(axl_tree_remove(t, &probe), "tree: remove found the entry");
+    test_check(tree_key_frees == 3 && tree_val_frees == 3,
+               "tree: remove frees key + value");
+
+    /* free drains remaining entries through the destructors. */
+    axl_tree_insert(t, heap_int(1), heap_int(10));
+    axl_tree_insert(t, heap_int(2), heap_int(20));
+    axl_tree_free(t);
+    test_check(tree_key_frees == 5 && tree_val_frees == 5,
+               "tree: free runs destructors on every remaining entry");
+}
+
+static void
+test_tree_bounds(void)
+{
+    AxlTree *t = axl_tree_new(tree_cmp_intptr, NULL);
+    axl_tree_insert(t, (void *)10, (void *)100);
+    axl_tree_insert(t, (void *)20, (void *)200);
+    axl_tree_insert(t, (void *)30, (void *)300);
+    axl_tree_insert(t, (void *)40, (void *)400);
+
+    test_check((intptr_t)axl_tree_lower_bound(t, (void *)20) == 200,
+               "tree: lower_bound exact key");
+    test_check((intptr_t)axl_tree_lower_bound(t, (void *)25) == 300,
+               "tree: lower_bound rounds up to 30");
+    test_check((intptr_t)axl_tree_lower_bound(t, (void *)5) == 100,
+               "tree: lower_bound below all -> smallest");
+    test_check(axl_tree_lower_bound(t, (void *)45) == NULL,
+               "tree: lower_bound above all -> NULL");
+
+    test_check((intptr_t)axl_tree_upper_bound(t, (void *)20) == 300,
+               "tree: upper_bound is strictly greater");
+    test_check((intptr_t)axl_tree_upper_bound(t, (void *)25) == 300,
+               "tree: upper_bound of gap -> 30");
+    test_check(axl_tree_upper_bound(t, (void *)40) == NULL,
+               "tree: upper_bound of max -> NULL");
+    axl_tree_free(t);
+
+    /* Empty (non-NULL) tree: both bounds are NULL. */
+    AxlTree *e = axl_tree_new(tree_cmp_intptr, NULL);
+    test_check(axl_tree_lower_bound(e, (void *)1) == NULL &&
+               axl_tree_upper_bound(e, (void *)1) == NULL,
+               "tree: bounds on empty tree are NULL");
+    axl_tree_free(e);
+}
+
+static void
+test_tree_iter(void)
+{
+    AxlTree *t = axl_tree_new(tree_cmp_intptr, NULL);
+    intptr_t ins[] = { 5, 1, 3, 2, 4 };
+    for (int i = 0; i < 5; i++) {
+        axl_tree_insert(t, (void *)ins[i], (void *)(ins[i] * 10));
+    }
+
+    AxlTreeIter it;
+    void *k, *v;
+    axl_tree_iter_init(&it, t);
+    intptr_t expect = 1;
+    bool ok = true;
+    int count = 0;
+    while (axl_tree_iter_next(&it, &k, &v)) {
+        if ((intptr_t)k != expect || (intptr_t)v != expect * 10) {
+            ok = false;
+        }
+        expect++;
+        count++;
+    }
+    test_check(ok && count == 5, "tree_iter: ascending key+value, full count");
+
+    /* NULL out-params are tolerated. */
+    axl_tree_iter_init(&it, t);
+    count = 0;
+    while (axl_tree_iter_next(&it, NULL, NULL)) {
+        count++;
+    }
+    test_check(count == 5, "tree_iter: NULL out-params tolerated");
+
+    /* Empty and NULL trees iterate to nothing. */
+    AxlTree *e = axl_tree_new(tree_cmp_intptr, NULL);
+    axl_tree_iter_init(&it, e);
+    test_check(!axl_tree_iter_next(&it, &k, &v), "tree_iter: empty tree exhausted");
+    axl_tree_iter_init(&it, NULL);
+    test_check(!axl_tree_iter_next(&it, &k, &v), "tree_iter: NULL tree exhausted");
+    axl_tree_free(e);
+    axl_tree_free(t);
+
+    /* Deep stack: 1000 nodes inserted descending still iterate ascending. */
+    AxlTree *big = axl_tree_new(tree_cmp_intptr, NULL);
+    for (intptr_t i = 1000; i >= 1; i--) {
+        axl_tree_insert(big, (void *)i, (void *)i);
+    }
+    axl_tree_iter_init(&it, big);
+    expect = 1;
+    ok = true;
+    count = 0;
+    while (axl_tree_iter_next(&it, &k, NULL)) {
+        if ((intptr_t)k != expect) {
+            ok = false;
+        }
+        expect++;
+        count++;
+    }
+    test_check(ok && count == 1000, "tree_iter: 1000-node deep iteration is sorted");
+    axl_tree_free(big);
+}
+
+// ---------------------------------------------------------------------------
 // Ring Buffer Tests
 // ---------------------------------------------------------------------------
 
@@ -2919,6 +3519,34 @@ test_oom_containers(void)
     test_check(r2 == AXL_ERR, "oom: axl_radix_tree_insert returns -1 on node alloc fail");
     axl_radix_tree_free(tr);
 
+    /* --- N-ary tree --- */
+
+    axl_mem_fail_next_alloc(1);
+    AxlNTree *nt = axl_ntree_new((void *)1);
+    test_check(nt == NULL, "oom: axl_ntree_new returns NULL on first-alloc fail");
+
+    nt = axl_ntree_new((void *)1);
+    test_check(nt != NULL, "oom: ntree reconstructed cleanly after failure");
+    axl_mem_fail_next_alloc(1);
+    AxlNTree *kid = axl_ntree_append_data(nt, (void *)2);
+    test_check(kid == NULL, "oom: axl_ntree_append_data returns NULL on node alloc fail");
+    test_check(axl_ntree_n_children(nt) == 0, "oom: no child attached on alloc failure");
+    axl_ntree_free(nt);
+
+    /* --- AVL tree --- */
+
+    axl_mem_fail_next_alloc(1);
+    AxlTree *avt = axl_tree_new(tree_cmp_intptr, NULL);
+    test_check(avt == NULL, "oom: axl_tree_new returns NULL on first-alloc fail");
+
+    avt = axl_tree_new(tree_cmp_intptr, NULL);
+    test_check(avt != NULL, "oom: tree reconstructed cleanly after failure");
+    axl_mem_fail_next_alloc(1);
+    axl_tree_insert(avt, (void *)1, (void *)2);
+    test_check(axl_tree_nnodes(avt) == 0,
+               "oom: tree insert leaves tree unchanged on node alloc fail");
+    axl_tree_free(avt);
+
     /* --- Ring buffer --- */
 
     axl_mem_fail_next_alloc(1);
@@ -3020,6 +3648,16 @@ test_data_main(int argc, char **argv)
     test_radix_tree_foreach();
     test_radix_tree_value_free();
     test_radix_tree_http_keys();
+    test_ntree_build_navigate();
+    test_ntree_query_traverse();
+    test_ntree_unlink_free();
+    test_ntree_iter();
+    test_tree_basic();
+    test_tree_balance();
+    test_tree_remove();
+    test_tree_insert_replace_destroy();
+    test_tree_bounds();
+    test_tree_iter();
     test_ring_buf();
     test_ring_buf_wrap();
     test_ring_buf_overwrite();

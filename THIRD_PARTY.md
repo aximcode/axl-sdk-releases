@@ -51,6 +51,34 @@ gated behind `AXL_TLS=1`. Being public-domain-or-MIT, stb imposes
 no attribution obligation on redistributed binaries; this entry is
 documentary. No source modifications.
 
+## FreeType (ftgrays — analytic rasterizer)
+
+- **Source:** https://gitlab.freedesktop.org/freetype/freetype
+- **Component shipped:** `src/smooth/ftgrays.c` (the "FreeType-smooth"
+  anti-aliased rasterizer) built in `STANDALONE_` mode, plus the
+  headers it needs (`include/freetype/ftimage.h`, `src/smooth/ftgrays.h`).
+- **Vendored path in source tree:**
+  `deps/freetype/{ftgrays.c,ftimage.h,ftgrays.h}`
+- **Copyright:** The FreeType Project (David Turner, Robert Wilhelm,
+  Werner Lemberg, and contributors)
+- **License:** Dual-licensed under the
+  [FreeType License (FTL)](https://spdx.org/licenses/FTL.html) **OR**
+  [GPL-2.0-or-later](https://spdx.org/licenses/GPL-2.0-or-later.html),
+  at the recipient's option. **AXL takes the FTL.**
+- **Full license text:** `deps/freetype/FTL.TXT` and
+  `deps/freetype/LICENSE.TXT`.
+
+`ftgrays.c` provides `AxlGfx`'s analytic path rasterizer
+(`axl_gfx_fill_path`, G14) via `axl-gfx-rasterize.c`, replacing the
+former 4x4 supersampler. It is compiled into **every** `libaxl.a`
+(not gated). **Unlike stb, the FTL carries a credit clause:**
+redistributions must acknowledge FreeType in their documentation —
+"Portions of this software are copyright © The FreeType Project
+(www.freetype.org). All rights reserved." Downstream products that
+ship `AxlGfx` path filling must reproduce that acknowledgment. No
+source modifications were made to the vendored files; the
+`STANDALONE_` integration shim lives in `src/gfx/axl-gfx-rasterize.c`.
+
 ## DejaVu Sans — built-in default font
 
 - **Source:** https://dejavu-fonts.github.io/ (DejaVu Sans)

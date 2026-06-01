@@ -3,6 +3,146 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.22.0 — 2026-05-31
+
+This release is the AGT dependency floor. It rounds out the 2D
+graphics stack (a retained display list, arbitrary-path and
+quad/transform clipping, multi-line text, stroking, blend modes, an
+analytic FreeType rasterizer, gamma-correct compositing, pattern fill,
+and a direct-framebuffer present path with dirty-rectangle damage), adds
+a new SIMD substrate (`AxlCpu` feature detection + AVX state-enable, with
+SIMD-dispatched blur and source-over blend kernels), consolidates all 2D
+transforms into a single 3×3 `AxlTransform` type, and adds the `AxlNTree`
+/ `AxlTree` containers, a shortest-round-trip `axl_dtoa`, and a standalone
+`axl_qsort`.
+
+### Added
+
+- **AxlCpu (new module, `<axl/axl-cpu.h>`).** Runtime SIMD feature
+  detection and CPU state management. `axl_cpu_simd_tier` reports a
+  per-CPU tier; a broad feature catalog covers SSE through AVX-512 plus
+  SHA-NI, AES, and bit-manipulation on x86, and AES/SHA/CRC32/FP16/
+  DotProd/SVE on aarch64. `axl_cpu_enable_avx` / `axl_cpu_enable_avx512`
+  arm the AVX state bits (CR4.OSXSAVE + XSETBV); SSE4.x / AES / SHA-NI
+  need no enable step.
+
+- **SIMD-accelerated AxlGfx kernels.** Buffer blur is SIMD-dispatched
+  (AVX2 / SSE4.1 / NEON, bit-exact with the scalar path, ~1.2x–1.9x).
+  Source-over blend fill is SIMD-dispatched (SSE2 / AVX2 / NEON,
+  ~7x–11x, bit-exact via the integer /255 trick). Both fall back to
+  scalar on CPUs without the feature.
+
+- **AxlGfx present pipeline (Phases G17/G18).** `axl_gfx_pack_pixel`
+  + `AxlGfxPixelOrder` pack a buffer into a framebuffer's native pixel
+  layout; the present path writes the framebuffer directly (BGRA memcpy
+  / RGBA swap) with a Blt fallback for bitmask / blt-only / unknown-FB
+  modes. Dirty-rectangle damage tracking lands via
+  `axl_gfx_buffer_present_rect` and per-buffer
+  `add_damage` / `present_damage` / `clear_damage` / `get_damage`. On
+  x86 the present uses non-temporal streaming stores (`_mm_stream` +
+  `SFENCE`) to avoid polluting the cache with write-only framebuffer
+  traffic.
+
+- **AxlGfx gamma-correct compositing (Phases G15/G15b).** Opt-in
+  linear-light blending via `axl_gfx_set_gamma_correct` /
+  `axl_gfx_get_gamma_correct` / `axl_gfx_reset_gamma_correct`, plus
+  public `axl_gfx_srgb_to_linear` / `axl_gfx_linear_to_srgb`. Gradient
+  ramps are gamma-corrected when the mode is enabled. Off by default —
+  existing sRGB-space output is unchanged unless a caller opts in.
+
+- **AxlGfx pattern fill (Phase G12).** `axl_gfx_fill_pattern` tiles a
+  source buffer across a destination region with `AxlGfxRepeat`
+  (repeat / reflect / pad).
+
+- **AxlGfx retained display list (Phase G9).** `axl_gfx_display_list`
+  records draw / gradient / transform ops for replay, with a textual
+  dump for inspection and testing.
+
+- **AxlGfx clipping (Phase G10 + transform).** `axl_gfx_push_clip_path`
+  (arbitrary-path clip), `axl_gfx_push_clip_quad` (convex-quad clip),
+  and `push_clip_rect_transformed` (perspective-correct transformed-rect
+  clip), honored by all writers.
+
+- **AxlGfx text (Phases G11, G7).** `axl_ttf_draw_box` for multi-line
+  text with word wrap; a glyph cache with horizontal subpixel
+  positioning; `axl_ttf_draw_affine` for rotated / sheared vector text.
+
+- **AxlGfx stroking (Phase G8).** Width-honoring stroke with round
+  joins / caps, configurable cap/join styles (`AxlGfxStrokeStyle`), and
+  dashed strokes. The stroker now lives in `src/gfx/axl-gfx-stroke.c`.
+
+- **AxlGfx blend modes (Phase G13).** Separable blend modes
+  (multiply / screen / overlay / darken / lighten / add) with
+  `axl_gfx_reset_blend_mode`.
+
+- **AxlGfx analytic rasterizer (Phase G14).** Anti-aliased path fills
+  via a vendored, standalone FreeType `ftgrays` rasterizer.
+
+- **AxlGfx transform-aware blit + color parsing.**
+  `axl_gfx_blit_affine` (bilinear, transform-aware image blit);
+  `axl_gfx_color_parse` parses CSS hex color strings
+  (`#RGB` / `#RGBA` / `#RRGGBB` / `#RRGGBBAA`) to an `AxlGfxPixel`.
+
+- **Drop shadow + buffer blur (Phase G6).** `axl_gfx_buffer_blur` and
+  `axl_gfx_draw_shadow`.
+
+- **Path + rounded-rect gradient fills (completes Phase G5).** The
+  follow-ups promised in 0.21.0 — gradients now fill arbitrary paths and
+  rounded rectangles, not just axis-aligned rectangles.
+
+- **AxlNTree + AxlTree containers.** `<axl/axl-ntree.h>` (generic n-ary
+  tree, the GLib `GNode` equivalent) and `<axl/axl-tree.h>` (balanced,
+  AVL-backed sorted map, the GLib `GTree` equivalent), both with
+  callback-free pull iterators. They reuse the existing
+  `AxlDestroyNotify` / `AxlCompareDataFunc` callback types.
+
+- **`axl_dtoa` (AxlFormat).** Shortest round-trippable double→decimal
+  conversion (Grisu2), with no precision cap. AxlFormat's `%f` is
+  rebuilt on it and `%e` / `%g` are added.
+
+- **`axl_qsort` (AxlSort).** A standalone introsort API;
+  `axl_array_sort` now delegates to it.
+
+- **AxlMath matrix/vector ops.** `mat3` inverse / determinant, `vec2`
+  geometry helpers, and affine↔mat3 converters. `<axl/axl-math.h>` is
+  now included directly from the `<axl.h>` umbrella (previously only
+  reachable transitively).
+
+- **AxlInput modifier state.** Keyboard modifier and lock state are
+  plumbed through to input events.
+
+### Changed
+
+- **One transform type — `AxlTransform`.** The 2D transform surface is
+  consolidated into a single 3×3 (projective) `AxlTransform`. The
+  separate `AxlGfxAffine` type is removed and multiplication now follows
+  cairo's a-first convention. Rasterization is perspective-correct for
+  blit and text. Callers that used the interim `AxlGfxAffine` API must
+  move to `AxlTransform`.
+
+### Fixed
+
+- **ftgrays pool-estimate underflow.** A `max_ex - min_ey` typo (should
+  be `-min_ex`) in the vendored FreeType rasterizer could hang or
+  corrupt `fill_path` on narrow-x / high-y bounding boxes (e.g. a glyph
+  or rect rotated high on the surface). The `FT_QNEW_ARRAY` shim is also
+  hardened against `size_t` overflow.
+
+- **Stroke dashing divide-by-zero.** Guarded the `dash_advance_` modulo
+  against a static-analyzer-flagged divide-by-zero.
+
+### Notes
+
+- **SIMD negative result (documented, not a regression).** The
+  `blit_transform` sampler was measured ~4.6x *slower* under AVX2 (the
+  per-pixel `set_pd` plus AVX/SSE transition costs dominate a gather +
+  put-bound kernel), so it is kept scalar. SIMD wins multi-pixel integer
+  kernels (blur, blend) and loses on per-pixel float / gather / put-bound
+  ones.
+
+- **Build/CI.** The CI `clang-tidy` lint runs one file per process to
+  stop intermittent `security.ArrayBound` false positives.
+
 ## 0.21.0 — 2026-05-29
 
 ### Added

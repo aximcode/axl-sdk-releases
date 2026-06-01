@@ -645,7 +645,7 @@ axl_sat_mul_u16(
 }
 
 // ===================================================================
-// Linear algebra — Vec2 + Mat3
+// Linear algebra — Vec2 + Transform
 // ===================================================================
 
 AxlVec2
@@ -723,46 +723,130 @@ axl_vec2_normalize(
     return (AxlVec2){ .x = v.x / len, .y = v.y / len };
 }
 
-AxlMat3
-axl_mat3_identity(
+AxlVec2
+axl_vec2_lerp(
+    AxlVec2  a,
+    AxlVec2  b,
+    double   t
+    )
+{
+    return (AxlVec2){ .x = a.x + (b.x - a.x) * t, .y = a.y + (b.y - a.y) * t };
+}
+
+double
+axl_vec2_distance(
+    AxlVec2  a,
+    AxlVec2  b
+    )
+{
+    double dx = a.x - b.x;
+    double dy = a.y - b.y;
+    return axl_sqrt(dx * dx + dy * dy);
+}
+
+AxlVec2
+axl_vec2_perp(
+    AxlVec2  v
+    )
+{
+    return (AxlVec2){ .x = -v.y, .y = v.x };
+}
+
+double
+axl_vec2_cross(
+    AxlVec2  a,
+    AxlVec2  b
+    )
+{
+    return a.x * b.y - a.y * b.x;
+}
+
+AxlVec2
+axl_vec2_rotate(
+    AxlVec2  v,
+    double   radians
+    )
+{
+    double c = axl_cos(radians);
+    double s = axl_sin(radians);
+    return (AxlVec2){ .x = c * v.x - s * v.y, .y = s * v.x + c * v.y };
+}
+
+double
+axl_vec2_angle(
+    AxlVec2  v
+    )
+{
+    if (v.x == 0.0 && v.y == 0.0) {
+        return 0.0;
+    }
+    return axl_atan2(v.y, v.x);
+}
+
+AxlVec2
+axl_vec2_reflect(
+    AxlVec2  v,
+    AxlVec2  n
+    )
+{
+    double d = 2.0 * (v.x * n.x + v.y * n.y);
+    return (AxlVec2){ .x = v.x - d * n.x, .y = v.y - d * n.y };
+}
+
+AxlVec2
+axl_vec2_project(
+    AxlVec2  a,
+    AxlVec2  b
+    )
+{
+    double bb = b.x * b.x + b.y * b.y;
+    if (bb == 0.0) {
+        return (AxlVec2){ .x = 0.0, .y = 0.0 };
+    }
+    double k = (a.x * b.x + a.y * b.y) / bb;
+    return (AxlVec2){ .x = b.x * k, .y = b.y * k };
+}
+
+AxlTransform
+axl_transform_identity(
     void
     )
 {
-    return (AxlMat3){ .m = {
+    return (AxlTransform){ .m = {
         1.0, 0.0, 0.0,
         0.0, 1.0, 0.0,
         0.0, 0.0, 1.0,
     }};
 }
 
-AxlMat3
-axl_mat3_translate(
+AxlTransform
+axl_transform_translate(
     double  tx,
     double  ty
     )
 {
-    return (AxlMat3){ .m = {
+    return (AxlTransform){ .m = {
         1.0, 0.0,  tx,
         0.0, 1.0,  ty,
         0.0, 0.0, 1.0,
     }};
 }
 
-AxlMat3
-axl_mat3_scale(
+AxlTransform
+axl_transform_scale(
     double  sx,
     double  sy
     )
 {
-    return (AxlMat3){ .m = {
+    return (AxlTransform){ .m = {
          sx, 0.0, 0.0,
         0.0,  sy, 0.0,
         0.0, 0.0, 1.0,
     }};
 }
 
-AxlMat3
-axl_mat3_rotate(
+AxlTransform
+axl_transform_rotate(
     double  radians
     )
 {
@@ -773,15 +857,15 @@ axl_mat3_rotate(
      * Applied to a column vector, rotates counter-clockwise. */
     double c = axl_cos(radians);
     double s = axl_sin(radians);
-    return (AxlMat3){ .m = {
+    return (AxlTransform){ .m = {
           c,  -s, 0.0,
           s,   c, 0.0,
         0.0, 0.0, 1.0,
     }};
 }
 
-AxlMat3
-axl_mat3_skew(
+AxlTransform
+axl_transform_shear(
     double  sx,
     double  sy
     )
@@ -791,27 +875,29 @@ axl_mat3_skew(
      *   [ sy 1  0 ]
      *   [ 0  0  1 ]
      * sx shears x as a function of y; sy shears y as a function of x. */
-    return (AxlMat3){ .m = {
+    return (AxlTransform){ .m = {
         1.0,  sx, 0.0,
          sy, 1.0, 0.0,
         0.0, 0.0, 1.0,
     }};
 }
 
-AxlMat3
-axl_mat3_mul(
-    AxlMat3  a,
-    AxlMat3  b
+AxlTransform
+axl_transform_multiply(
+    AxlTransform  a,
+    AxlTransform  b
     )
 {
-    /* Standard 3x3 matrix multiply: r[i,j] = Σ_k a[i,k] * b[k,j].
-     * Row-major index: r[i,j] = r.m[i*3 + j]. */
-    AxlMat3 r;
+    /* cairo-order composition: the result applies @a a first, then
+     * @a b.  For column-vector points that is the matrix product
+     * b · a — r[i,j] = Σ_k b[i,k] * a[k,j].  Row-major index:
+     * r[i,j] = r.m[i*3 + j]. */
+    AxlTransform r;
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
             double sum = 0.0;
             for (int k = 0; k < 3; k++) {
-                sum += a.m[i * 3 + k] * b.m[k * 3 + j];
+                sum += b.m[i * 3 + k] * a.m[k * 3 + j];
             }
             r.m[i * 3 + j] = sum;
         }
@@ -820,20 +906,266 @@ axl_mat3_mul(
 }
 
 AxlVec2
-axl_mat3_transform_point(
-    AxlMat3  m,
+axl_transform_map_point(
+    AxlTransform  m,
     AxlVec2  p
     )
 {
-    /* [ m[0] m[1] m[2] ]   [ p.x ]   [ m[0]*p.x + m[1]*p.y + m[2] ]
-     * [ m[3] m[4] m[5] ] * [ p.y ] = [ m[3]*p.x + m[4]*p.y + m[5] ]
-     * [ m[6] m[7] m[8] ]   [  1  ]   [ m[6]*p.x + m[7]*p.y + m[8] ]
-     * Affine input has bottom row [0 0 1] so we ignore the w
-     * component (always 1). */
+    /* [ m[0] m[1] m[2] ]   [ p.x ]   [ x' ]
+     * [ m[3] m[4] m[5] ] * [ p.y ] = [ y' ]   then divide by w.
+     * [ m[6] m[7] m[8] ]   [  1  ]   [ w  ]
+     * Affine input has bottom row [0 0 1] so w is exactly 1 — the
+     * `w != 1.0` guard skips the divide entirely (results bit-exact,
+     * and no division on the affine hot path).  A perspective row makes
+     * w != 1 and the divide meaningful.  A point on the horizon (w → 0)
+     * has no finite image; the divide then yields a non-finite result
+     * (inf / nan) by design — callers keep geometry in front of the
+     * horizon (the rect→on-screen-quad warps quad_to_quad builds never
+     * cross it). */
+    double x = m.m[0] * p.x + m.m[1] * p.y + m.m[2];
+    double y = m.m[3] * p.x + m.m[4] * p.y + m.m[5];
+    double w = m.m[6] * p.x + m.m[7] * p.y + m.m[8];
+    if (w != 1.0) {
+        x /= w;
+        y /= w;
+    }
+    return (AxlVec2){ .x = x, .y = y };
+}
+
+AxlVec2
+axl_transform_map_vector(
+    AxlTransform  m,
+    AxlVec2  v
+    )
+{
+    /* Linear part only — the upper-left 2x2; translation (m[2], m[5])
+     * is ignored. */
     return (AxlVec2){
-        .x = m.m[0] * p.x + m.m[1] * p.y + m.m[2],
-        .y = m.m[3] * p.x + m.m[4] * p.y + m.m[5],
+        .x = m.m[0] * v.x + m.m[1] * v.y,
+        .y = m.m[3] * v.x + m.m[4] * v.y,
     };
+}
+
+double
+axl_transform_determinant(
+    AxlTransform  m
+    )
+{
+    return m.m[0] * (m.m[4] * m.m[8] - m.m[5] * m.m[7])
+         - m.m[1] * (m.m[3] * m.m[8] - m.m[5] * m.m[6])
+         + m.m[2] * (m.m[3] * m.m[7] - m.m[4] * m.m[6]);
+}
+
+bool
+axl_transform_invert(
+    AxlTransform   m,
+    AxlTransform  *out
+    )
+{
+    if (out == NULL) {
+        return false;
+    }
+    double det = axl_transform_determinant(m);
+    if (det < 1e-12 && det > -1e-12) {
+        return false;   /* singular */
+    }
+    double id = 1.0 / det;
+    /* inverse = adjugate / det (cofactor matrix, transposed). */
+    AxlTransform r;
+    r.m[0] =  (m.m[4] * m.m[8] - m.m[5] * m.m[7]) * id;
+    r.m[1] = -(m.m[1] * m.m[8] - m.m[2] * m.m[7]) * id;
+    r.m[2] =  (m.m[1] * m.m[5] - m.m[2] * m.m[4]) * id;
+    r.m[3] = -(m.m[3] * m.m[8] - m.m[5] * m.m[6]) * id;
+    r.m[4] =  (m.m[0] * m.m[8] - m.m[2] * m.m[6]) * id;
+    r.m[5] = -(m.m[0] * m.m[5] - m.m[2] * m.m[3]) * id;
+    r.m[6] =  (m.m[3] * m.m[7] - m.m[4] * m.m[6]) * id;
+    r.m[7] = -(m.m[0] * m.m[7] - m.m[1] * m.m[6]) * id;
+    r.m[8] =  (m.m[0] * m.m[4] - m.m[1] * m.m[3]) * id;
+    *out = r;
+    return true;
+}
+
+/* Classification tolerance — absorbs floating-point drift from composed
+ * transforms while still distinguishing genuine structure (the smallest
+ * meaningful off-diagonal / perspective terms in practice are >> this). */
+#define TF_CLASSIFY_EPS  1e-9
+
+static inline bool
+tf_near_zero(double v)
+{
+    return v < TF_CLASSIFY_EPS && v > -TF_CLASSIFY_EPS;
+}
+
+static inline bool
+tf_near_one(double v)
+{
+    return tf_near_zero(v - 1.0);
+}
+
+/* True when the bottom row departs from [0 0 1] — i.e. @a m carries a
+ * perspective component (is not affine). */
+static inline bool
+tf_has_perspective(AxlTransform m)
+{
+    return !tf_near_zero(m.m[6]) || !tf_near_zero(m.m[7]) || !tf_near_one(m.m[8]);
+}
+
+AxlTransform
+axl_transform_perspective(
+    double  px,
+    double  py
+    )
+{
+    return (AxlTransform){ .m = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+         px,  py, 1.0,
+    }};
+}
+
+/* Homography mapping the unit-square corners (0,0),(1,0),(1,1),(0,1) to
+ * q[0..3] (Paul Heckbert, "Fundamentals of Texture Mapping and Image
+ * Warping").  Returns false if the quad is degenerate (collinear). */
+static bool
+square_to_quad(
+    const AxlVec2  q[4],
+    AxlTransform  *out
+    )
+{
+    double x0 = q[0].x, y0 = q[0].y;
+    double x1 = q[1].x, y1 = q[1].y;
+    double x2 = q[2].x, y2 = q[2].y;
+    double x3 = q[3].x, y3 = q[3].y;
+
+    double dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+    double dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+
+    /* The general (projective) form covers the parallelogram case too —
+     * a parallelogram has dx3 == dy3 == 0, which falls straight out as
+     * g == h == 0 with no special branch (and so no absolute-tolerance
+     * affine/projective split that could misfire at large coordinates).
+     * `den` vanishes only for a degenerate (collinear) quad. */
+    double den = dx1 * dy2 - dx2 * dy1;
+    if (tf_near_zero(den)) {
+        return false;   /* degenerate quad */
+    }
+    double iden = 1.0 / den;
+    double g = (dx3 * dy2 - dx2 * dy3) * iden;
+    double h = (dx1 * dy3 - dx3 * dy1) * iden;
+    double a = x1 - x0 + g * x1, b = x3 - x0 + h * x3, c = x0;
+    double d = y1 - y0 + g * y1, e = y3 - y0 + h * y3, f = y0;
+
+    *out = (AxlTransform){ .m = { a, b, c,  d, e, f,  g, h, 1.0 } };
+    return true;
+}
+
+bool
+axl_transform_quad_to_quad(
+    const AxlVec2  src[4],
+    const AxlVec2  dst[4],
+    AxlTransform  *out
+    )
+{
+    if (out == NULL) {
+        return false;
+    }
+    AxlTransform s2src, s2dst, src2s;
+    if (!square_to_quad(src, &s2src) || !square_to_quad(dst, &s2dst)) {
+        return false;
+    }
+    if (!axl_transform_invert(s2src, &src2s)) {
+        return false;   /* degenerate source */
+    }
+    /* src -> unit square (src2s) first, then unit square -> dst (s2dst);
+     * cairo a-first multiply(a, b) applies a first then b. */
+    *out = axl_transform_multiply(src2s, s2dst);
+    return true;
+}
+
+AxlRect
+axl_transform_map_rect(
+    AxlTransform  m,
+    AxlRect       r
+    )
+{
+    AxlVec2 c[4] = {
+        axl_transform_map_point(m, axl_vec2(r.x,       r.y)),
+        axl_transform_map_point(m, axl_vec2(r.x + r.w, r.y)),
+        axl_transform_map_point(m, axl_vec2(r.x + r.w, r.y + r.h)),
+        axl_transform_map_point(m, axl_vec2(r.x,       r.y + r.h)),
+    };
+    double minx = c[0].x, maxx = c[0].x;
+    double miny = c[0].y, maxy = c[0].y;
+    for (int i = 1; i < 4; i++) {
+        if (c[i].x < minx) { minx = c[i].x; }
+        if (c[i].x > maxx) { maxx = c[i].x; }
+        if (c[i].y < miny) { miny = c[i].y; }
+        if (c[i].y > maxy) { maxy = c[i].y; }
+    }
+    return (AxlRect){ .x = minx, .y = miny, .w = maxx - minx, .h = maxy - miny };
+}
+
+void
+axl_transform_map_quad(
+    AxlTransform   m,
+    const AxlVec2  in[4],
+    AxlVec2        out[4]
+    )
+{
+    /* in[i] is passed to map_point by value, so in == out aliasing is
+     * safe (each source point is read before its slot is overwritten). */
+    for (int i = 0; i < 4; i++) {
+        out[i] = axl_transform_map_point(m, in[i]);
+    }
+}
+
+AxlTransformClass
+axl_transform_classify(
+    AxlTransform  m
+    )
+{
+    if (tf_has_perspective(m)) {
+        return AXL_TRANSFORM_PROJECTIVE;
+    }
+    bool linear_identity = tf_near_one(m.m[0]) && tf_near_zero(m.m[1]) &&
+                           tf_near_zero(m.m[3]) && tf_near_one(m.m[4]);
+    if (linear_identity) {
+        return (tf_near_zero(m.m[2]) && tf_near_zero(m.m[5]))
+               ? AXL_TRANSFORM_IDENTITY : AXL_TRANSFORM_TRANSLATE;
+    }
+    if (tf_near_zero(m.m[1]) && tf_near_zero(m.m[3])) {
+        return AXL_TRANSFORM_SCALE;   /* diagonal linear part */
+    }
+    return AXL_TRANSFORM_AFFINE;
+}
+
+bool
+axl_transform_is_identity(
+    AxlTransform  m
+    )
+{
+    return axl_transform_classify(m) == AXL_TRANSFORM_IDENTITY;
+}
+
+bool
+axl_transform_is_axis_aligned(
+    AxlTransform  m
+    )
+{
+    if (tf_has_perspective(m)) {
+        return false;   /* perspective never preserves axis-alignment */
+    }
+    bool diagonal      = tf_near_zero(m.m[1]) && tf_near_zero(m.m[3]);
+    bool anti_diagonal = tf_near_zero(m.m[0]) && tf_near_zero(m.m[4]);
+    return diagonal || anti_diagonal;
+}
+
+bool
+axl_transform_is_affine(
+    AxlTransform  m
+    )
+{
+    return axl_transform_classify(m) != AXL_TRANSFORM_PROJECTIVE;
 }
 
 // ===================================================================

@@ -8,6 +8,8 @@ Headers:
 - `<axl/axl-slist.h>` — Singly-linked list
 - `<axl/axl-queue.h>` — FIFO queue
 - `<axl/axl-radix-tree.h>` — Radix tree (compact prefix tree, longest-prefix lookup)
+- `<axl/axl-ntree.h>` — N-ary tree (GLib GNode-style hierarchy, public node fields)
+- `<axl/axl-tree.h>` — Balanced sorted map (GLib GTree, AVL; ordered iteration + range queries)
 - `<axl/axl-ring-buf.h>` — Ring buffer (circular byte buffer, zero-copy, overwrite mode)
 - `<axl/axl-digest.h>` — Message digest checksums (MD5, SHA-1, SHA-256)
 - `<axl/axl-sidecar.h>` — Common JSON5 sidecar loader (used by
@@ -25,6 +27,8 @@ Headers:
 | AxlSList | Simple linked sequences | O(n) | O(1) prepend |
 | AxlQueue | FIFO/LIFO patterns | O(1) head/tail | O(1) push/pop |
 | AxlRadixTree | Prefix-match routing | O(k) by key | O(k) insert |
+| AxlNTree | Parent/child hierarchy | O(depth) navigate | O(1) child insert |
+| AxlTree | Sorted map + range queries | O(log n) by key | O(log n) insert |
 | AxlRingBuf | Streaming I/O, pipes | O(1) push/pop | O(1) |
 
 ## AxlHashTable
@@ -199,6 +203,102 @@ axl_queue_remove_all(&q, "first"); // removes all matches
 
 AxlList *node = axl_queue_find(&q, "second");
 ```
+
+## AxlNTree
+
+Generic **n-ary tree** (GLib `GNode` equivalent) for parent→children
+hierarchies — UI/device/file trees, a DOM, ACPI/SMBIOS structure. The
+**node is the subtree handle** (no separate container) and its fields are
+public, so traversal is a plain pointer walk:
+
+```c
+#include <axl.h>
+
+AxlNTree *root = axl_ntree_new("/");
+AxlNTree *etc  = axl_ntree_append_data(root, "etc");
+AxlNTree *bin  = axl_ntree_append_data(root, "bin");
+axl_ntree_append_data(etc, "hosts");
+
+for (AxlNTree *c = root->children; c != NULL; c = c->next)
+    axl_printf("%s\n", (const char *)c->data);          // etc, bin
+
+axl_ntree_traverse(root, AXL_NTREE_PRE_ORDER, AXL_NTREE_ALL, 0,
+                   visit_fn, ctx);                       // walk the tree
+
+axl_ntree_free(root);                                    // node + subtree
+// axl_ntree_free_full(root, free) also frees each node's data
+```
+
+Insertion (`append_child`/`prepend_child`/`insert_before`/`insert_after`)
+attaches an existing root node; `append_data` is the new+append shortcut.
+`axl_ntree_unlink` detaches a subtree (it becomes its own root). Counts
+and queries: `n_children`, `nth_child`, `depth` (root = 1), `max_height`,
+`n_nodes(flags)`, `is_ancestor`, `get_root`. Traversal supports
+pre/post/in/level order, an ALL/LEAVES/NON_LEAVES filter, a depth limit,
+and early stop (the callback returns `true`). Data is borrowed; the tree
+owns only its node objects. Single-threaded, no locking.
+
+For a **pull-style** walk without a callback, `AxlNTreeIter` is a
+stack-allocated pre-order cursor (uses the parent/sibling links — no
+internal stack, any depth):
+
+```c
+AxlNTreeIter it;
+axl_ntree_iter_init(&it, root, AXL_NTREE_ALL);
+for (AxlNTree *n; (n = axl_ntree_iter_next(&it)) != NULL; )
+    use(n->data);
+```
+
+This is the **structural hierarchy** container — distinct from
+`AxlRadixTree` (string-prefix lookup) and `AxlTree` (balanced sorted map).
+
+## AxlTree
+
+Balanced **sorted map** (GLib `GTree` equivalent, AVL-backed): ordered
+key→value storage with O(log n) insert/lookup/remove and — the reason to
+reach for it over `AxlHashTable` — **in-order iteration and range /
+nearest-key queries**. Opaque container; keys ordered by an
+`AxlCompareDataFunc`.
+
+```c
+#include <axl.h>
+
+static int cmp_int(const void *a, const void *b, void *user) {
+    (void)user; intptr_t x = (intptr_t)a, y = (intptr_t)b;
+    return (x > y) - (x < y);
+}
+
+AxlTree *t = axl_tree_new(cmp_int, NULL);
+axl_tree_insert(t, (void *)30, "thirty");
+axl_tree_insert(t, (void *)10, "ten");
+axl_tree_insert(t, (void *)20, "twenty");
+
+axl_tree_lookup(t, (void *)20);            // "twenty"
+axl_tree_lower_bound(t, (void *)15);       // value at key 20 (first >= 15)
+axl_tree_upper_bound(t, (void *)20);       // value at key 30 (first > 20)
+axl_tree_foreach(t, visit_fn, ctx);        // ascending key order
+
+axl_tree_free(t);
+// axl_tree_new_full(cmp, user, key_destroy, value_destroy) owns entries
+```
+
+`axl_tree_insert` keeps the existing key and replaces the value on a
+collision; `axl_tree_replace` swaps both (GTree semantics — destructors
+run on the dropped key/value). `nnodes` and `height` are O(1).
+
+For a **pull-style** walk without a callback, `AxlTreeIter` is a
+stack-allocated ascending-order cursor:
+
+```c
+AxlTreeIter it;
+void *k, *v;
+axl_tree_iter_init(&it, t);
+while (axl_tree_iter_next(&it, &k, &v))
+    use(k, v);          // ascending key order
+```
+
+Pick this for **ordered** keys / range scans; `AxlHashTable` for
+unordered O(1) maps, `AxlRadixTree` for string longest-prefix lookup.
 
 ## AxlStr — String Utilities
 

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/** @file axl-path.c
-    G3 — retained-mode path API + scanline rasterizer + immediate-
-    mode rounded-rect helper.
+/** @file axl-gfx-path.c
+    G3 — retained-mode path API + immediate-mode rounded-rect helper,
+    plus path fill (G14) and width stroke (G8a).
 
     Math primitives (sqrt, sin, cos, floor/ceil-to-int, fabs) come
     from <axl/axl-math.h> — same constraints (libm-free, freestanding
@@ -18,15 +18,13 @@
       - Arcs subdivide via the chord-vs-arc-midpoint deviation
         test, also recursive — no sin/cos in the inner loop.
         The arc's start point uses axl_sin / axl_cos.
-      - Fill rasterization is 4x4 supersampled — for each pixel we
-        sample 16 subpixel positions; coverage = (inside count)/16.
-        Edge intersections per scanline are computed by walking
-        the segment list and clipping each edge to the scanline.
-      - Even-odd fill rule (consistent with SVG `fill-rule:evenodd`
-        and Cairo's default).
-      - Stroke is 1-pixel-thick line segments via existing
-        axl_gfx_draw_line.  Real thick-line stroking awaits a
-        future batch.
+      - Fill rasterization is delegated to the analytic ftgrays
+        backend (axl-gfx-rasterize.c, G14) via axl_gfx_rasterize_fill;
+        the fill path uses the even-odd rule (SVG `fill-rule:evenodd`
+        / Cairo default).
+      - Stroke (G8a) builds an offset-geometry outline (a quad per
+        segment + a disc per vertex = round joins/caps) and fills it
+        non-zero through the same rasterizer.
       - fill_rounded_rect bypasses the path machinery and rasterizes
         the 4 corners + 4 edges directly using signed-distance
         coverage — faster than walking a 16-segment per-corner
@@ -47,15 +45,13 @@
 // Path data structure
 // ===================================================================
 
-/* Each PathPoint either starts a subpath (is_move=true) or extends
- * the current subpath via a line segment from the previous point. */
-typedef struct {
-    float  x, y;
-    bool   is_move;
-} PathPoint;
+/* Vertices are AxlGfxVertex (axl-gfx-internal.h): is_move=true starts
+ * a subpath; otherwise the vertex extends the current subpath via a
+ * line segment from the previous point.  The same type is consumed by
+ * the rasterizer (axl-gfx-rasterize.c). */
 
 struct AxlGfxPath {
-    PathPoint  *pts;
+    AxlGfxVertex  *pts;
     size_t      n;
     size_t      cap;
 
@@ -77,7 +73,7 @@ path_grow_(
         return true;
     }
     size_t new_cap = p->cap == 0 ? 16 : p->cap * 2;
-    PathPoint *new_pts = axl_realloc(p->pts, new_cap * sizeof *new_pts);
+    AxlGfxVertex *new_pts = axl_realloc(p->pts, new_cap * sizeof *new_pts);
     if (!new_pts) {
         return false;
     }
@@ -118,8 +114,8 @@ path_push_local_(
     bool         is_move
     )
 {
-    AxlMat3 M = axl_gfx_internal_current_transform();
-    AxlVec2 t = axl_mat3_transform_point(
+    AxlTransform M = axl_gfx_internal_current_transform();
+    AxlVec2 t = axl_transform_map_point(
                     M,
                     axl_vec2((double)x_local, (double)y_local));
     path_push_(p, (float)t.x, (float)t.y, is_move);
@@ -193,8 +189,8 @@ axl_gfx_path_move_to(
      * start.  If the active transform changes between move_to and
      * close, close still returns to the original (transformed) start
      * — matches HTML canvas semantics. */
-    AxlMat3 M = axl_gfx_internal_current_transform();
-    AxlVec2 t = axl_mat3_transform_point(
+    AxlTransform M = axl_gfx_internal_current_transform();
+    AxlVec2 t = axl_transform_map_point(
                     M, axl_vec2((double)x, (double)y));
     path_push_(p, (float)t.x, (float)t.y, true);
     p->subpath_x    = (float)t.x;
@@ -286,10 +282,10 @@ axl_gfx_path_curve_to(
      * Affine transforms commute with de Casteljau subdivision, so
      * subdividing in world space gives the same curve as subdividing
      * in local space then transforming each sampled point. */
-    AxlMat3 M = axl_gfx_internal_current_transform();
-    AxlVec2 tc1  = axl_mat3_transform_point(M, axl_vec2(c1x, c1y));
-    AxlVec2 tc2  = axl_mat3_transform_point(M, axl_vec2(c2x, c2y));
-    AxlVec2 tend = axl_mat3_transform_point(M, axl_vec2(x,   y));
+    AxlTransform M = axl_gfx_internal_current_transform();
+    AxlVec2 tc1  = axl_transform_map_point(M, axl_vec2(c1x, c1y));
+    AxlVec2 tc2  = axl_transform_map_point(M, axl_vec2(c2x, c2y));
+    AxlVec2 tend = axl_transform_map_point(M, axl_vec2(x,   y));
     float x0 = p->pen_x, y0 = p->pen_y;
     subdivide_cubic_(p, x0, y0,
                      (float)tc1.x,  (float)tc1.y,
@@ -399,95 +395,80 @@ axl_gfx_path_close(
 }
 
 // ===================================================================
-// Internal — bbox computation
+// Internal — fill via the analytic rasterizer (axl-gfx-rasterize.c)
 // ===================================================================
 
-static void
-path_bbox_(
-    const AxlGfxPath  *p,
-    int32_t           *x0, int32_t *y0,
-    int32_t           *x1, int32_t *y1
+/* Per-span sink for axl_gfx_rasterize_fill, shared by fill and stroke
+ * (declared in axl-gfx-internal.h).  Modulates the source alpha by
+ * ftgrays' 8-bit coverage and blits through axl_gfx_fill_rect_i, which
+ * applies the active clip stack, the current draw target, and alpha
+ * blending. */
+void
+axl_gfx_internal_fill_span(
+    int32_t  y,
+    int32_t  x,
+    int32_t  len,
+    uint8_t  coverage,
+    void    *user
     )
 {
-    if (p->n == 0) {
-        *x0 = *y0 = *x1 = *y1 = 0;
+    const AxlGfxFillSink *fs = (const AxlGfxFillSink *)user;
+    if (coverage == 0) {
         return;
     }
-    float min_x = p->pts[0].x, max_x = p->pts[0].x;
-    float min_y = p->pts[0].y, max_y = p->pts[0].y;
-    for (size_t i = 1; i < p->n; i++) {
-        if (p->pts[i].x < min_x) min_x = p->pts[i].x;
-        if (p->pts[i].x > max_x) max_x = p->pts[i].x;
-        if (p->pts[i].y < min_y) min_y = p->pts[i].y;
-        if (p->pts[i].y > max_y) max_y = p->pts[i].y;
+    if (fs->grad != NULL) {
+        /* Gradient varies per pixel — emit one pixel at a time. */
+        for (int32_t i = 0; i < len; i++) {
+            AxlGfxPixel out = axl_gfx_gradient_sample(fs->grad, x + i, y);
+            out.alpha = (uint8_t)(((uint32_t)out.alpha * coverage + 127u) / 255u);
+            if (out.alpha != 0) {
+                axl_gfx_fill_rect_i(x + i, y, 1, 1, out);
+            }
+        }
+    } else {
+        /* Solid: coverage is uniform across the span, so one rect
+         * blit covers the whole run. */
+        AxlGfxPixel out = fs->color;
+        out.alpha = (uint8_t)(((uint32_t)fs->color.alpha * coverage + 127u) / 255u);
+        if (out.alpha != 0) {
+            axl_gfx_fill_rect_i(x, y, len, 1, out);
+        }
     }
-    *x0 = (int32_t)axl_floori((double)min_x);
-    *y0 = (int32_t)axl_floori((double)min_y);
-    *x1 = (int32_t)axl_ceili((double)max_x);
-    *y1 = (int32_t)axl_ceili((double)max_y);
 }
 
-// ===================================================================
-// Internal — scanline rasterizer (4x4 supersample, even-odd rule)
-// ===================================================================
-
-/* Walk all line-segments in @a p; for each that crosses scanline
- * @a y, append the intersection's x-coordinate to @a out.  Skips
- * segments where one or both endpoints are exactly on the
- * scanline (handled by tilting slightly to avoid double-counting).
- *
- * Returns number of intersections written. */
-static size_t
-collect_intersections_(
+/* World-space vertex accessor — lets the stroker (axl-gfx-stroke.c)
+ * read path geometry without the AxlGfxPath struct definition. */
+const AxlGfxVertex *
+axl_gfx_internal_path_verts(
     const AxlGfxPath  *p,
-    double             y,
-    float             *out,
-    size_t             out_cap
+    size_t            *out_n
     )
 {
-    size_t n_out = 0;
-    for (size_t i = 1; i < p->n; i++) {
-        if (p->pts[i].is_move) {
-            continue;
-        }
-        double x0 = p->pts[i - 1].x, y0 = p->pts[i - 1].y;
-        double x1 = p->pts[i].x,     y1 = p->pts[i].y;
-        if (y0 == y1) {
-            continue;
-        }
-        /* Treat segments as a half-open interval [min_y, max_y) so
-         * shared vertices between two adjacent edges contribute
-         * exactly once. */
-        double ymin = y0 < y1 ? y0 : y1;
-        double ymax = y0 < y1 ? y1 : y0;
-        if (y < ymin || y >= ymax) {
-            continue;
-        }
-        double t = (y - y0) / (y1 - y0);
-        double x = x0 + t * (x1 - x0);
-        if (n_out < out_cap) {
-            out[n_out++] = (float)x;
-        }
+    if (!p) {
+        *out_n = 0;
+        return NULL;
     }
-    return n_out;
+    *out_n = p->n;
+    return p->pts;
 }
 
-static void
-sort_intersections_(
-    float   *xs,
-    size_t   n
+/* Shared fill entry. @a grad != NULL selects per-pixel gradient
+ * sampling; otherwise the solid @a color is used.  Uses the even-odd
+ * fill rule — the historical behavior of this public API.  Contours
+ * are implicitly closed by the rasterizer. */
+static int
+fill_path_paint_(
+    const AxlGfxPath      *p,
+    AxlGfxPixel            color,
+    const AxlGfxGradient  *grad
     )
 {
-    /* Insertion sort — n is small (handful of edges per scanline). */
-    for (size_t i = 1; i < n; i++) {
-        float v = xs[i];
-        size_t j = i;
-        while (j > 0 && xs[j - 1] > v) {
-            xs[j] = xs[j - 1];
-            j--;
-        }
-        xs[j] = v;
+    if (!p || p->n < 3) {
+        return AXL_ERR;
     }
+    AxlGfxFillSink fs = { color, grad };
+    return axl_gfx_rasterize_fill(p->pts, p->n, /*even_odd=*/true,
+                                  axl_gfx_internal_fill_span, &fs);
 }
 
 int
@@ -496,98 +477,20 @@ axl_gfx_fill_path(
     AxlGfxPixel        color
     )
 {
-    if (!p || p->n < 3) {
-        return AXL_ERR;
-    }
-
-    int32_t x0, y0, x1, y1;
-    path_bbox_(p, &x0, &y0, &x1, &y1);
-    if (x1 <= x0 || y1 <= y0) {
-        return AXL_ERR;
-    }
-
-    /* 4x4 supersampling — 4 subpixel rows × 4 subpixel cols. */
-    const int SS = 4;
-    const float subpixel_step = 1.0f / (float)SS;
-    const float subpixel_origin = 1.0f / ((float)SS * 2.0f);  /* 1/8 */
-
-    /* Scratch storage for per-scanline intersections.  64 is far
-     * beyond any realistic UI path (a rounded rect has 4 + arcs
-     * worth, well under 32). */
-    float xs[64];
-
-    for (int32_t py = y0; py < y1; py++) {
-        /* Per-pixel-row coverage accumulator.  Tracks how many of
-         * the 16 subsamples per pixel are inside the path. */
-        for (int32_t px = x0; px < x1; px++) {
-            int inside_count = 0;
-            for (int sub_row = 0; sub_row < SS; sub_row++) {
-                double yy = (double)py
-                            + (double)subpixel_origin
-                            + (double)sub_row * subpixel_step;
-                size_t n_xs = collect_intersections_(p, yy, xs, 64);
-                if (n_xs == 0) {
-                    continue;
-                }
-                sort_intersections_(xs, n_xs);
-
-                for (int sub_col = 0; sub_col < SS; sub_col++) {
-                    float xx = (float)px
-                               + subpixel_origin
-                               + (float)sub_col * subpixel_step;
-                    /* Even-odd: count how many intersections fall
-                     * left of xx; if odd, inside. */
-                    size_t left_count = 0;
-                    for (size_t i = 0; i < n_xs; i++) {
-                        if (xs[i] < xx) {
-                            left_count++;
-                        } else {
-                            break;
-                        }
-                    }
-                    if (left_count & 1u) {
-                        inside_count++;
-                    }
-                }
-            }
-            if (inside_count == 0) {
-                continue;
-            }
-            AxlGfxPixel out = color;
-            uint32_t cov_alpha = (uint32_t)color.alpha
-                                 * (uint32_t)inside_count;
-            /* Total subsamples = SS*SS = 16. */
-            out.alpha = (uint8_t)((cov_alpha + 8u) / 16u);
-            if (out.alpha != 0) {
-                axl_gfx_fill_rect_i(px, py, 1, 1, out);
-            }
-        }
-    }
-    return AXL_OK;
+    return fill_path_paint_(p, color, NULL);
 }
 
 int
-axl_gfx_stroke_path(
-    const AxlGfxPath  *p,
-    AxlGfxPixel        color,
-    float              w
+axl_gfx_fill_path_gradient(
+    const AxlGfxPath      *p,
+    const AxlGfxGradient  *g
     )
 {
-    (void)w;  /* width currently fixed at 1 px */
-    if (!p) {
+    if (g == NULL) {
         return AXL_ERR;
     }
-    for (size_t i = 1; i < p->n; i++) {
-        if (p->pts[i].is_move) {
-            continue;
-        }
-        int32_t sx = (int32_t)axl_floori((double)p->pts[i - 1].x + 0.5);
-        int32_t sy = (int32_t)axl_floori((double)p->pts[i - 1].y + 0.5);
-        int32_t ex = (int32_t)axl_floori((double)p->pts[i].x + 0.5);
-        int32_t ey = (int32_t)axl_floori((double)p->pts[i].y + 0.5);
-        axl_gfx_draw_line(sx, sy, ex, ey, color);
-    }
-    return AXL_OK;
+    AxlGfxPixel unused = { 0, 0, 0, 0 };
+    return fill_path_paint_(p, unused, g);
 }
 
 // ===================================================================
@@ -620,14 +523,18 @@ corner_coverage_(
     return (float)(r + 0.5 - dist);
 }
 
-int
-axl_gfx_fill_rounded_rect(
-    int32_t      x,
-    int32_t      y,
-    int32_t      w,
-    int32_t      h,
-    float        radius,
-    AxlGfxPixel  color
+/* Shared rounded-rect fill. @a grad != NULL selects per-pixel
+   gradient sampling (straight bands via fill_rect_gradient, corners
+   via axl_gfx_gradient_sample); otherwise solid @a color. */
+static int
+fill_rounded_rect_paint_(
+    int32_t                x,
+    int32_t                y,
+    int32_t                w,
+    int32_t                h,
+    float                  radius,
+    AxlGfxPixel            color,
+    const AxlGfxGradient  *grad
     )
 {
     if (w <= 0 || h <= 0) {
@@ -642,21 +549,27 @@ axl_gfx_fill_rounded_rect(
         radius = max_r;
     }
 
-    /* Zero-radius case: defer to plain fill_rect_i. */
+    /* Zero-radius case: defer to a plain rect fill. */
     if (radius < 0.5f) {
-        return axl_gfx_fill_rect_i(x, y, w, h, color);
+        return grad != NULL
+               ? axl_gfx_fill_rect_gradient(x, y, w, h, grad)
+               : axl_gfx_fill_rect_i(x, y, w, h, color);
     }
 
     int32_t r_int = (int32_t)axl_ceili((double)radius);
 
-    /* Center band (full-width, between corners vertically): plain fill. */
-    axl_gfx_fill_rect_i(x, y + r_int,
-                       w, h - 2 * r_int, color);
-    /* Top and bottom inner bands (between corner columns): plain fill. */
-    axl_gfx_fill_rect_i(x + r_int, y,
-                       w - 2 * r_int, r_int, color);
-    axl_gfx_fill_rect_i(x + r_int, y + h - r_int,
-                       w - 2 * r_int, r_int, color);
+    /* The three straight bands: solid fill, or per-pixel gradient. */
+    if (grad != NULL) {
+        axl_gfx_fill_rect_gradient(x, y + r_int, w, h - 2 * r_int, grad);
+        axl_gfx_fill_rect_gradient(x + r_int, y, w - 2 * r_int, r_int, grad);
+        axl_gfx_fill_rect_gradient(x + r_int, y + h - r_int,
+                                   w - 2 * r_int, r_int, grad);
+    } else {
+        axl_gfx_fill_rect_i(x, y + r_int, w, h - 2 * r_int, color);
+        axl_gfx_fill_rect_i(x + r_int, y, w - 2 * r_int, r_int, color);
+        axl_gfx_fill_rect_i(x + r_int, y + h - r_int,
+                            w - 2 * r_int, r_int, color);
+    }
 
     /* 4 corners — TL, TR, BL, BR.  For each, the curvature center
      * lies inside the rect at (corner_x + ±radius, corner_y + ±radius). */
@@ -689,8 +602,10 @@ axl_gfx_fill_rounded_rect(
                 if (cov == 0.0f) {
                     continue;
                 }
-                AxlGfxPixel out = color;
-                uint32_t a = (uint32_t)color.alpha * (uint32_t)(cov * 255.0f + 0.5f);
+                AxlGfxPixel out = grad != NULL
+                                  ? axl_gfx_gradient_sample(grad, px, py)
+                                  : color;
+                uint32_t a = (uint32_t)out.alpha * (uint32_t)(cov * 255.0f + 0.5f);
                 out.alpha = (uint8_t)((a + 127u) / 255u);
                 if (out.alpha != 0) {
                     axl_gfx_fill_rect_i(px, py, 1, 1, out);
@@ -700,4 +615,34 @@ axl_gfx_fill_rounded_rect(
     }
 
     return AXL_OK;
+}
+
+int
+axl_gfx_fill_rounded_rect(
+    int32_t      x,
+    int32_t      y,
+    int32_t      w,
+    int32_t      h,
+    float        radius,
+    AxlGfxPixel  color
+    )
+{
+    return fill_rounded_rect_paint_(x, y, w, h, radius, color, NULL);
+}
+
+int
+axl_gfx_fill_rounded_rect_gradient(
+    int32_t                x,
+    int32_t                y,
+    int32_t                w,
+    int32_t                h,
+    float                  radius,
+    const AxlGfxGradient  *g
+    )
+{
+    if (g == NULL) {
+        return AXL_ERR;
+    }
+    AxlGfxPixel unused = { 0, 0, 0, 0 };
+    return fill_rounded_rect_paint_(x, y, w, h, radius, unused, g);
 }

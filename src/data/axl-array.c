@@ -10,7 +10,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-array.h>
 #include <axl/axl-mem.h>
-#include <axl/axl-runtime.h>
+#include <axl/axl-sort.h>
 #include <axl/axl-str.h>
 
 AXL_LOG_DOMAIN("array");
@@ -178,46 +178,11 @@ axl_array_get_ptr(AxlArray *a, size_t index)
 void
 axl_array_sort(AxlArray *a, AxlCompareFunc compare)
 {
-    size_t    i;
-    size_t    j;
-    uint8_t  *tmp;
-    uint8_t  *ai;
-    uint8_t  *aj;
-
-    if (a == NULL || compare == NULL || a->length <= 1) {
+    if (a == NULL || compare == NULL) {
         return;
     }
 
-    /* Insertion sort — adequate for typical UEFI array sizes */
-    tmp = axl_malloc(a->element_size);
-    if (tmp == NULL) {
-        axl_warning("sort allocation failed");
-        return;
-    }
-
-    for (i = 1; i < a->length; i++) {
-        /* Sort is O(n^2); yield every 1024 outer iters so a large
-           sort stays Ctrl-C responsive. No-op on small arrays. */
-        if ((i & 0x3FF) == 0) {
-            axl_yield();
-        }
-        ai = a->buffer + i * a->element_size;
-        axl_memcpy(tmp, ai, a->element_size);
-
-        j = i;
-        while (j > 0) {
-            aj = a->buffer + (j - 1) * a->element_size;
-            if (compare(aj, tmp) <= 0) {
-                break;
-            }
-            axl_memcpy(aj + a->element_size, aj, a->element_size);
-            j--;
-        }
-
-        axl_memcpy(a->buffer + j * a->element_size, tmp, a->element_size);
-    }
-
-    axl_free(tmp);
+    axl_qsort(a->buffer, a->length, a->element_size, compare);
 }
 
 int
@@ -323,44 +288,10 @@ void
 axl_array_sort_with_data(AxlArray *a, AxlCompareDataFunc compare,
                          void *user_data)
 {
-    size_t    i;
-    size_t    j;
-    uint8_t  *tmp;
-    uint8_t  *ai;
-    uint8_t  *aj;
-
-    if (a == NULL || compare == NULL || a->length <= 1) {
+    if (a == NULL || compare == NULL) {
         return;
     }
 
-    /* Insertion sort — adequate for typical UEFI array sizes */
-    tmp = axl_malloc(a->element_size);
-    if (tmp == NULL) {
-        axl_warning("sort allocation failed");
-        return;
-    }
-
-    for (i = 1; i < a->length; i++) {
-        /* Sort is O(n^2); yield every 1024 outer iters so a large
-           sort stays Ctrl-C responsive. No-op on small arrays. */
-        if ((i & 0x3FF) == 0) {
-            axl_yield();
-        }
-        ai = a->buffer + i * a->element_size;
-        axl_memcpy(tmp, ai, a->element_size);
-
-        j = i;
-        while (j > 0) {
-            aj = a->buffer + (j - 1) * a->element_size;
-            if (compare(aj, tmp, user_data) <= 0) {
-                break;
-            }
-            axl_memcpy(aj + a->element_size, aj, a->element_size);
-            j--;
-        }
-
-        axl_memcpy(a->buffer + j * a->element_size, tmp, a->element_size);
-    }
-
-    axl_free(tmp);
+    axl_qsort_with_data(a->buffer, a->length, a->element_size, compare,
+                        user_data);
 }

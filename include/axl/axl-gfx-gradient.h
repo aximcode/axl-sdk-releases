@@ -107,6 +107,28 @@ axl_gfx_gradient_free(
     AxlGfxGradient  *g   ///< gradient to free, or NULL
     );
 
+/// Sample @a g at the center of pixel (@a x, @a y).
+///
+/// Returns the interpolated color the fill helpers would paint at that
+/// pixel (before coverage/AA is applied). The offset is computed the
+/// same way as the fill variants — axis projection for linear,
+/// distance/radius for radial, clamped to [0, 1]. Useful for custom
+/// painting and as the per-pixel source for path / rounded-rect fills.
+///
+/// Honors `axl_gfx_set_gamma_correct`: when on, the color ramp between
+/// stops is interpolated in **linear light** (perceptually even, no dark
+/// dip between colors); alpha always interpolates plainly (it's
+/// coverage, not a light value).
+///
+/// @return the sampled `AxlGfxPixel`; fully-transparent (alpha 0) if
+///         @a g is NULL or has no stops.
+AxlGfxPixel
+axl_gfx_gradient_sample(
+    const AxlGfxGradient  *g,   ///< [in] gradient to sample
+    int32_t                x,   ///< pixel x
+    int32_t                y    ///< pixel y
+    );
+
 /// Fill a rectangle with @a g, signed-coord variant.
 ///
 /// Geometry mirrors `axl_gfx_fill_rect_i`: (@a x, @a y) may be
