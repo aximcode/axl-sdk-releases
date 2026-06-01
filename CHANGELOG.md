@@ -3,6 +3,28 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.23.0 — 2026-06-01
+
+### Added
+
+- **`axl_gfx_blit_rect`** — blit a `w×h` sub-rectangle of a larger
+  source image to the active target. `src_stride` is the source's full
+  row width in pixels and `(src_x, src_y)` is the sub-rect's top-left, so
+  a consumer can blit one cell of a sprite sheet each frame without
+  CPU-copying the cell out first. Raw target coordinates (not
+  transform-aware), same pixel/alpha semantics and destination clipping
+  as `axl_gfx_blit`; returns `AXL_ERR` on NULL buffer or zero width/
+  height. `axl_gfx_blit` is now a thin wrapper over the same core
+  (`stride = w`, source origin `0,0`).
+
+- **`axl_json_get_object`** — navigate into a named nested object and
+  get back a sub-reader scoped to it (the object analog of
+  `axl_json_array_begin`). Chains for deeper paths and composes with all
+  the flat getters and `axl_json_array_begin`. Like array elements, the
+  sub-reader borrows the parent's token array (do not free it). Closes
+  the JSON reader's gap of having flat key getters + array iteration but
+  no named-nested-object navigation.
+
 ## 0.22.0 — 2026-05-31
 
 This release is the AGT dependency floor. It rounds out the 2D

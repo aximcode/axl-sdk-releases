@@ -621,6 +621,29 @@ For root-level arrays (`[{...}, {...}]`) use `axl_json_root_array_begin`
 instead. Element readers borrow the parent's token array — do not call
 `axl_json_free` on them.
 
+### Nested Objects
+
+The flat getters look up keys in the reader's *current* object.
+`axl_json_get_object` steps into a named child object and hands back a
+sub-reader scoped to it; chain calls to reach deeper paths.
+
+```c
+// Parse: {"server":{"host":"localhost","tls":{"port":443}}}
+AxlJsonReader server, tls;
+int64_t port = 0;
+if (axl_json_get_object(&r, "server", &server) &&
+    axl_json_get_object(&server, "tls", &tls)) {
+    axl_json_get_int(&tls, "port", &port);   // 443
+}
+```
+
+The sub-reader composes with every accessor — `axl_json_get_string` /
+`_int` / `_uint` / `_bool`, `axl_json_array_begin`, and
+`axl_json_get_object` itself all operate relative to the nested object.
+Like array elements, the sub-reader borrows the parent's token array:
+do not call `axl_json_free` on it, and it stays valid only while the
+parent reader lives.
+
 ### Round-Trip Transforms
 
 `axl_json_write_token` splices an already-parsed token into the

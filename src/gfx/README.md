@@ -153,6 +153,7 @@ axl_gfx_set_blend_mode(AXL_GFX_BLEND_OVER);
 | Path fill | `axl_gfx_fill_path` | 4x4-supersampled even-odd rasterizer; see "Paths" below |
 | Path stroke | `axl_gfx_stroke_path` / `_ex` | width-`w` anti-aliased stroke; caps butt/round/square, joins miter/round/bevel, dashes (`AxlGfxStrokeStyle`); offset geometry filled non-zero — see `axl-gfx-stroke.c` |
 | Blit | `axl_gfx_blit` | Copy a pixel buffer onto the target |
+| Blit sub-rect | `axl_gfx_blit_rect` | Copy a sub-rectangle of a wider source (`src_stride`, `src_x/y`) — e.g. one sprite-sheet cell — onto the target without copying it out first |
 | Pattern fill | `axl_gfx_fill_pattern` | Tile an `AxlGfxBuffer` over a rect; `AxlGfxRepeat` BOTH/X/Y/NONE (CSS `background-repeat`), anchored at the origin, honors clip + blend + per-texel alpha |
 | Color parse | `axl_gfx_color_parse` | CSS hex string → `AxlGfxPixel` (`#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`) |
 | Capture | `axl_gfx_capture` | Read screen region into a buffer |

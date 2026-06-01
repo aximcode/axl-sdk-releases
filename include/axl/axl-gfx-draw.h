@@ -32,7 +32,8 @@ extern "C" {
 //
 // NOT yet transform-aware (Phase G4 scope deferred to a follow-up):
 //   - `axl_gfx_fill_rect`, `axl_gfx_fill_rect_i`, `axl_gfx_draw_rect`,
-//     `axl_gfx_draw_line`, `axl_gfx_blit`, `axl_gfx_fill_rounded_rect`.
+//     `axl_gfx_draw_line`, `axl_gfx_blit`, `axl_gfx_blit_rect`,
+//     `axl_gfx_fill_rounded_rect`.
 //   - These render in raw target coordinates regardless of the
 //     active transform.  Consumers that need transformed rect /
 //     line drawing should build a path (`axl_gfx_path_move_to` +
@@ -90,6 +91,42 @@ axl_gfx_blit(
     uint32_t            y,       ///< destination top edge
     uint32_t            w,       ///< width in pixels
     uint32_t            h        ///< height in pixels
+    );
+
+/// Blit a w×h sub-rectangle of a larger source image to the active
+/// target.
+///
+/// Unlike `axl_gfx_blit` (which treats the whole buffer as one tight
+/// w×h image), this addresses a region of a wider source: @a src_stride
+/// is the source's full row width in pixels (e.g. a sprite sheet's
+/// width), and the sub-rect's top-left within the source is
+/// (@a src_x, @a src_y).  This lets a consumer blit one cell of a sprite
+/// sheet each frame without first CPU-copying the cell out.
+///
+/// `axl_gfx_blit(buf, x, y, w, h)` is exactly
+/// `axl_gfx_blit_rect(buf, w, 0, 0, x, y, w, h)`.
+///
+/// Raw target coordinates — NOT transform-aware (see the header note
+/// above); same pixel (BGRX) and source-alpha semantics as
+/// `axl_gfx_blit`.  The destination is clipped to the target bounds and
+/// the active clip stack.  It is the caller's responsibility that the
+/// source sub-rect lies within the source buffer — i.e.
+/// @a src_x + @a w <= @a src_stride and the buffer holds at least
+/// (@a src_y + @a h) * @a src_stride pixels; out-of-range values read
+/// past the source (matching the low-level contract).
+///
+/// @return AXL_OK on success; AXL_ERR if @a buffer is NULL, @a w or
+///         @a h is zero, or the GOP is unavailable on a screen target.
+int
+axl_gfx_blit_rect(
+    const AxlGfxPixel  *buffer,      ///< [in] source pixel buffer (full image)
+    uint32_t            src_stride,  ///< source row stride in pixels
+    uint32_t            src_x,       ///< sub-rect left in the source
+    uint32_t            src_y,       ///< sub-rect top in the source
+    uint32_t            dst_x,       ///< destination left edge
+    uint32_t            dst_y,       ///< destination top edge
+    uint32_t            w,           ///< sub-rect / blit width
+    uint32_t            h            ///< sub-rect / blit height
     );
 
 /// Draw a 1-pixel-wide line from (@a x0, @a y0) to (@a x1, @a y1).

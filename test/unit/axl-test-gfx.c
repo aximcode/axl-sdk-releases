@@ -4110,6 +4110,165 @@ test_clip_quad_blit_honors(void)
     axl_gfx_buffer_free(b);
 }
 
+/* Helper: pixel whose blue=col, green=row encodes its source position,
+ * so a blit can be verified by reading back coordinates. */
+static AxlGfxPixel
+pos_px(uint32_t col, uint32_t row)
+{
+    AxlGfxPixel px = { (uint8_t)col, (uint8_t)row, 0x00, 0xFF };
+    return px;
+}
+
+/* Fill @a buf (row stride @a stride, @a rows rows) so each pixel encodes
+ * its own (col, row) via pos_px — lets a blit be verified by coords. */
+static void
+fill_pos_grid(AxlGfxPixel *buf, uint32_t stride, uint32_t rows)
+{
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t c = 0; c < stride; c++) {
+            buf[r * stride + c] = pos_px(c, r);
+        }
+    }
+}
+
+static void
+test_blit_rect_equals_blit_for_full_rect(void)
+{
+    /* axl_gfx_blit_rect(buf, w, 0,0, x,y, w,h) must match axl_gfx_blit. */
+    AxlGfxPixel bg = {0x00, 0x00, 0x00, 0xFF};
+    AxlGfxPixel tight[4 * 4];
+    fill_pos_grid(tight, 4, 4);
+
+    AxlGfxBuffer *b1 = axl_gfx_buffer_new(4, 4);
+    AxlGfxBuffer *b2 = axl_gfx_buffer_new(4, 4);
+    axl_gfx_buffer_clear(b1, bg);
+    axl_gfx_buffer_clear(b2, bg);
+
+    axl_gfx_target_buffer(b1);
+    int rc1 = axl_gfx_blit(tight, 0, 0, 4, 4);
+    axl_gfx_target_buffer(b2);
+    int rc2 = axl_gfx_blit_rect(tight, 4, 0, 0, 0, 0, 4, 4);
+    axl_gfx_target_buffer(NULL);
+
+    test_check(rc1 == AXL_OK && rc2 == AXL_OK,
+               "blit_rect full: both return AXL_OK");
+
+    AxlGfxPixel *p1 = axl_gfx_buffer_pixels(b1);
+    AxlGfxPixel *p2 = axl_gfx_buffer_pixels(b2);
+    bool all_eq = true;
+    for (uint32_t i = 0; i < 4 * 4; i++) {
+        if (p1[i].blue != p2[i].blue || p1[i].green != p2[i].green ||
+            p1[i].red != p2[i].red || p1[i].alpha != p2[i].alpha) {
+            all_eq = false;
+        }
+    }
+    test_check(all_eq, "blit_rect full: pixel-identical to axl_gfx_blit");
+
+    axl_gfx_buffer_free(b1);
+    axl_gfx_buffer_free(b2);
+}
+
+static void
+test_blit_rect_interior_subrect(void)
+{
+    /* 8x8 strided source; extract the 3x2 sub-rect at (2,3) to dst (1,1). */
+    AxlGfxPixel bg = {0x00, 0x00, 0x00, 0xFF};
+    AxlGfxPixel src[8 * 8];
+    fill_pos_grid(src, 8, 8);
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 8);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_blit_rect(src, 8, 2, 3, 1, 1, 3, 2);
+    axl_gfx_target_buffer(NULL);
+
+    test_check(rc == AXL_OK, "blit_rect interior: returns AXL_OK");
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    /* dst (1+i, 1+j) == src (2+i, 3+j). */
+    test_check(px_eq(p, 8, 1, 1, pos_px(2, 3)),
+               "blit_rect interior: dst(1,1) is src(2,3)");
+    test_check(px_eq(p, 8, 3, 1, pos_px(4, 3)),
+               "blit_rect interior: dst(3,1) is src(4,3)");
+    test_check(px_eq(p, 8, 3, 2, pos_px(4, 4)),
+               "blit_rect interior: dst(3,2) is src(4,4)");
+    /* Pixels outside the destination rect stay bg. */
+    test_check(px_eq(p, 8, 0, 0, bg), "blit_rect interior: dst(0,0) untouched");
+    test_check(px_eq(p, 8, 4, 1, bg), "blit_rect interior: dst(4,1) past width untouched");
+    test_check(px_eq(p, 8, 1, 3, bg), "blit_rect interior: dst(1,3) past height untouched");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_blit_rect_honors_stride(void)
+{
+    /* stride=6 but blit width=2: row N of the sub-rect must come from
+     * source offset N*6, not N*2. Pins that src_stride (not w) strides
+     * the source. */
+    AxlGfxPixel bg = {0x00, 0x00, 0x00, 0xFF};
+    AxlGfxPixel src[6 * 3];
+    fill_pos_grid(src, 6, 3);
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(4, 4);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_blit_rect(src, 6, 0, 0, 0, 0, 2, 3);
+    axl_gfx_target_buffer(NULL);
+
+    test_check(rc == AXL_OK, "blit_rect stride: returns AXL_OK");
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    /* If stride were mistakenly w(2), dst(0,1) would read src linear idx
+     * 2 = src(2,0) (green 0). With stride 6 it is src(0,1) (green 1). */
+    test_check(px_eq(p, 4, 0, 1, pos_px(0, 1)),
+               "blit_rect stride: dst(0,1) is src(0,1) — wide stride honored");
+    test_check(px_eq(p, 4, 1, 2, pos_px(1, 2)),
+               "blit_rect stride: dst(1,2) is src(1,2)");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_blit_rect_target_edge_clip(void)
+{
+    /* Blit a 4x4 sub-rect at dst (6,6) of an 8x8 target: only the 2x2 at
+     * the corner fits; the rest is clipped without OOB. */
+    AxlGfxPixel bg = {0x00, 0x00, 0x00, 0xFF};
+    AxlGfxPixel src[8 * 8];
+    fill_pos_grid(src, 8, 8);
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 8);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    int rc = axl_gfx_blit_rect(src, 8, 0, 0, 6, 6, 4, 4);
+    axl_gfx_target_buffer(NULL);
+
+    test_check(rc == AXL_OK, "blit_rect edge clip: returns AXL_OK");
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    test_check(px_eq(p, 8, 6, 6, pos_px(0, 0)),
+               "blit_rect edge clip: dst(6,6) is src(0,0)");
+    test_check(px_eq(p, 8, 7, 7, pos_px(1, 1)),
+               "blit_rect edge clip: dst(7,7) is src(1,1)");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_blit_rect_negatives(void)
+{
+    AxlGfxPixel bg = {0x00, 0x00, 0x00, 0xFF};
+    AxlGfxPixel src[4 * 4];
+    for (uint32_t i = 0; i < 4 * 4; i++) { src[i] = bg; }
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(4, 4);
+    axl_gfx_buffer_clear(b, bg);
+    axl_gfx_target_buffer(b);
+    test_check(axl_gfx_blit_rect(NULL, 4, 0, 0, 0, 0, 4, 4) == AXL_ERR,
+               "blit_rect: NULL buffer -> AXL_ERR");
+    test_check(axl_gfx_blit_rect(src, 4, 0, 0, 0, 0, 0, 4) == AXL_ERR,
+               "blit_rect: zero width -> AXL_ERR");
+    test_check(axl_gfx_blit_rect(src, 4, 0, 0, 0, 0, 4, 0) == AXL_ERR,
+               "blit_rect: zero height -> AXL_ERR");
+    axl_gfx_target_buffer(NULL);
+    axl_gfx_buffer_free(b);
+}
+
 static void
 test_clip_quad_alpha_blend_honors(void)
 {
@@ -5580,6 +5739,11 @@ test_gfx_main(
     test_clip_quad_degenerate_clips_all();
     test_clip_quad_bbox_and_pop();
     test_clip_quad_blit_honors();
+    test_blit_rect_equals_blit_for_full_rect();
+    test_blit_rect_interior_subrect();
+    test_blit_rect_honors_stride();
+    test_blit_rect_target_edge_clip();
+    test_blit_rect_negatives();
     test_clip_quad_alpha_blend_honors();
     test_clip_quad_nested();
     test_clip_quad_bitmap_text_honors();

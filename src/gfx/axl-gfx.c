@@ -2025,6 +2025,60 @@ blt_buffer_to_video_quad(
     return status;
 }
 
+/* Shared core for axl_gfx_blit / axl_gfx_blit_rect: copy the w×h region
+ * whose top-left in the source is (src_x, src_y), from a source of row
+ * stride @a src_stride pixels, to (dst_x, dst_y) on the active target.
+ * The destination is clipped to the target bounds and the active clip
+ * stack; the clip-induced trim (src_dx, src_dy) is added to the source
+ * origin so the correct texels are read after clipping. The caller
+ * guarantees the source sub-rect lies within @a buffer.
+ *
+ * Lenient on zero w/h (no-op, returns AXL_OK) to preserve axl_gfx_blit's
+ * historical fill-family contract; the public axl_gfx_blit_rect wrapper
+ * layers the stricter zero-dim guard on top. */
+static int
+blit_impl(
+    const AxlGfxPixel  *buffer,
+    uint32_t            src_stride,
+    uint32_t            src_x,
+    uint32_t            src_y,
+    uint32_t            dst_x,
+    uint32_t            dst_y,
+    uint32_t            w,
+    uint32_t            h
+    )
+{
+    uint32_t src_dx, src_dy;
+
+    /* Buffer target: CPU memcpy rows. */
+    if (target_buf != NULL) {
+        if (dst_x >= target_buf->w || dst_y >= target_buf->h) {
+            return AXL_OK;
+        }
+        if (dst_x + w > target_buf->w) w = target_buf->w - dst_x;
+        if (dst_y + h > target_buf->h) h = target_buf->h - dst_y;
+        if (!clip_clamp_rect(&dst_x, &dst_y, &w, &h, &src_dx, &src_dy)) {
+            return AXL_OK;
+        }
+        buffer_blit_pixels(target_buf, buffer, src_x + src_dx, src_y + src_dy,
+                           src_stride, dst_x, dst_y, w, h);
+        return AXL_OK;
+    }
+
+    /* Screen target: GOP fast path. */
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (g == NULL) {
+        return AXL_ERR;
+    }
+    if (!clip_clamp_rect(&dst_x, &dst_y, &w, &h, &src_dx, &src_dy)) {
+        return AXL_OK;
+    }
+    EFI_STATUS status = blt_buffer_to_video_quad(
+        g, (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)buffer, src_stride,
+        src_x + src_dx, src_y + src_dy, dst_x, dst_y, w, h);
+    return (status == 0) ? AXL_OK : AXL_ERR;
+}
+
 int
 axl_gfx_blit(
     const AxlGfxPixel  *buffer,
@@ -2037,38 +2091,26 @@ axl_gfx_blit(
     if (buffer == NULL) {
         return AXL_ERR;
     }
-    /* Preserve original w as the source row stride before any
-       clip-induced shrinkage. */
-    uint32_t src_w = w;
-    uint32_t src_dx, src_dy;
+    /* Whole buffer is one tight w×h image: stride = w, source origin 0. */
+    return blit_impl(buffer, w, 0, 0, x, y, w, h);
+}
 
-    /* Buffer target: CPU memcpy rows. */
-    if (target_buf != NULL) {
-        if (x >= target_buf->w || y >= target_buf->h) {
-            return AXL_OK;
-        }
-        if (x + w > target_buf->w) w = target_buf->w - x;
-        if (y + h > target_buf->h) h = target_buf->h - y;
-        if (!clip_clamp_rect(&x, &y, &w, &h, &src_dx, &src_dy)) {
-            return AXL_OK;
-        }
-        buffer_blit_pixels(target_buf, buffer, src_dx, src_dy, src_w,
-                           x, y, w, h);
-        return AXL_OK;
-    }
-
-    /* Screen target: GOP fast path. */
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
-    if (g == NULL) {
+int
+axl_gfx_blit_rect(
+    const AxlGfxPixel  *buffer,
+    uint32_t            src_stride,
+    uint32_t            src_x,
+    uint32_t            src_y,
+    uint32_t            dst_x,
+    uint32_t            dst_y,
+    uint32_t            w,
+    uint32_t            h
+    )
+{
+    if (buffer == NULL || w == 0 || h == 0) {
         return AXL_ERR;
     }
-    if (!clip_clamp_rect(&x, &y, &w, &h, &src_dx, &src_dy)) {
-        return AXL_OK;
-    }
-    EFI_STATUS status = blt_buffer_to_video_quad(
-        g, (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)buffer, src_w,
-        src_dx, src_dy, x, y, w, h);
-    return (status == 0) ? AXL_OK : AXL_ERR;
+    return blit_impl(buffer, src_stride, src_x, src_y, dst_x, dst_y, w, h);
 }
 
 /* Bilinear-sample @a src at source coords (@a u, @a v) and composite

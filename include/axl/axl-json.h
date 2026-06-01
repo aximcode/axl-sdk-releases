@@ -231,6 +231,41 @@ axl_json_get_bool(
 );
 
 /**
+ * @brief Navigate into a named nested object.
+ *
+ * Looks up @p key in the reader's current object and, if its value is
+ * itself an object, fills @p out with a sub-reader scoped to that
+ * object. The flat getters (axl_json_get_string / _int / _uint / _bool),
+ * axl_json_array_begin, and axl_json_get_object itself all then operate
+ * relative to the nested object — so deeper paths are reached by
+ * chaining calls:
+ *
+ * @code
+ * // { "server": { "tls": { "port": 443 } } }
+ * AxlJsonReader server, tls;
+ * int64_t port = 0;
+ * if (axl_json_get_object(&r, "server", &server) &&
+ *     axl_json_get_object(&server, "tls", &tls)) {
+ *     axl_json_get_int(&tls, "port", &port);   // 443
+ * }
+ * @endcode
+ *
+ * @p out borrows the parent's token array (like an array element from
+ * axl_json_array_next): do NOT call axl_json_free on it, and it stays
+ * valid only until the parent reader is freed.
+ *
+ * @return true if @p key exists and is an object, false otherwise
+ *     (missing key, or value is not an object). On false, @p out is
+ *     left untouched.
+ */
+bool
+axl_json_get_object(
+    const AxlJsonReader *r,     ///< reader (object context)
+    const char          *key,   ///< key of the nested object field
+    AxlJsonReader       *out    ///< [out] borrowed sub-reader for the object
+);
+
+/**
  * @brief One-shot: parse + extract a string in one call.
  *
  * Handles allocation and cleanup internally.

@@ -71,6 +71,23 @@ find_value_token(const char *json, const jsmntok_t *tokens,
     return -1;
 }
 
+/* Point @out at the parent's token array rebased so token @idx becomes
+   its root (tokens[0]) — every accessor treats tokens[0] as the document
+   root, so this yields a reader scoped to that sub-value. No copy: @out
+   borrows the parent's storage (owns_tokens = false), so it must not be
+   freed and is valid only while the parent reader lives. The index math
+   accounts for `tokens` being typed int32_t* over a jsmntok_t array. */
+static void
+borrow_sub_reader(const AxlJsonReader *parent, int32_t idx,
+                  AxlJsonReader *out)
+{
+    out->json = parent->json;
+    out->json_len = parent->json_len;
+    out->tokens = &parent->tokens[idx * (int32_t)(sizeof(jsmntok_t) / sizeof(int32_t))];
+    out->token_count = parent->token_count - idx;
+    out->owns_tokens = false;
+}
+
 static bool
 decode_json_string(const char *src, size_t src_len,
                    char *dst, size_t dst_size)
@@ -405,6 +422,32 @@ axl_json_get_bool(const AxlJsonReader *ctx, const char *key, bool *value)
 }
 
 bool
+axl_json_get_object(const AxlJsonReader *ctx, const char *key,
+                    AxlJsonReader *out)
+{
+    int32_t vi;
+    const jsmntok_t *tok;
+
+    if (ctx == NULL || key == NULL || out == NULL) {
+        return false;
+    }
+
+    vi = find_value_token(ctx->json, (const jsmntok_t *)ctx->tokens,
+                          ctx->token_count, key);
+    if (vi < 0) {
+        return false;
+    }
+
+    tok = &((const jsmntok_t *)ctx->tokens)[vi];
+    if (tok->type != JSMN_OBJECT) {
+        return false;
+    }
+
+    borrow_sub_reader(ctx, vi, out);
+    return true;
+}
+
+bool
 axl_json_extract_string(const char *json, size_t len, const char *key,
                         char *value, size_t value_size)
 {
@@ -490,12 +533,8 @@ axl_json_array_next(AxlJsonArrayIter *iter, AxlJsonReader *element)
     tokens = (const jsmntok_t *)iter->reader->tokens;
     tok = &tokens[iter->pos];
 
-    /* Element borrows parent's token array at offset — no copy needed */
-    element->json = iter->reader->json;
-    element->json_len = iter->reader->json_len;
-    element->tokens = &iter->reader->tokens[iter->pos * (int32_t)(sizeof(jsmntok_t) / sizeof(int32_t))];
-    element->token_count = iter->reader->token_count - iter->pos;
-    element->owns_tokens = false;
+    /* Element borrows parent's token array rebased at this offset. */
+    borrow_sub_reader(iter->reader, iter->pos, element);
 
     /* Count tokens to skip(element + all its children) */
     skip_count = 1;

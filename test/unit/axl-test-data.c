@@ -671,6 +671,122 @@ test_json_parse(void)
 }
 
 // ---------------------------------------------------------------------------
+// JSON Nested-Object Navigation Tests
+// ---------------------------------------------------------------------------
+
+static void
+test_json_get_object(void)
+{
+    AxlJsonReader r;
+    AxlJsonReader server;
+    AxlJsonReader tls;
+    AxlJsonReader sub;
+    AxlJsonArrayIter it;
+    AxlJsonReader elem;
+    char    str_buf[64];
+    int64_t int_val;
+    bool    bool_val;
+    bool    ok;
+    int     n;
+
+    const char *json =
+        "{"
+          "\"name\":\"devkit\","
+          "\"server\":{"
+            "\"host\":\"localhost\","
+            "\"port\":8080,"
+            "\"tls\":{\"enabled\":true,\"port\":443},"
+            "\"aliases\":[\"a\",\"b\",\"c\"]"
+          "},"
+          "\"count\":3"
+        "}";
+
+    ok = axl_json_parse(json, axl_strlen(json), &r);
+    test_check(ok, "json get_object: parse");
+
+    // Navigate one level into a named nested object.
+    ok = axl_json_get_object(&r, "server", &server);
+    test_check(ok, "json get_object: nested object found");
+
+    ok = axl_json_get_string(&server, "host", str_buf, sizeof(str_buf));
+    test_check(ok && axl_strcmp(str_buf, "localhost") == 0,
+               "json get_object: get string on sub-reader");
+
+    ok = axl_json_get_int(&server, "port", &int_val);
+    test_check(ok && int_val == 8080,
+               "json get_object: get int on sub-reader");
+
+    // Deep navigation: server -> tls -> {enabled, port}.
+    ok = axl_json_get_object(&server, "tls", &tls);
+    test_check(ok, "json get_object: deep nested object found");
+
+    ok = axl_json_get_int(&tls, "port", &int_val);
+    test_check(ok && int_val == 443,
+               "json get_object: deep nested int (443)");
+
+    ok = axl_json_get_bool(&tls, "enabled", &bool_val);
+    test_check(ok && bool_val == true,
+               "json get_object: deep nested bool");
+
+    // Array nested inside a sub-object is reachable via array_begin.
+    ok = axl_json_array_begin(&server, "aliases", &it);
+    test_check(ok, "json get_object: array_begin on sub-reader");
+    n = 0;
+    while (axl_json_array_next(&it, &elem)) {
+        n++;
+    }
+    test_check(n == 3, "json get_object: nested array iterates 3 elements");
+
+    // Negative: missing key.
+    ok = axl_json_get_object(&r, "missing", &sub);
+    test_check(!ok, "json get_object: missing key returns false");
+
+    // Negative: key maps to a scalar, not an object.
+    ok = axl_json_get_object(&r, "name", &sub);
+    test_check(!ok, "json get_object: scalar value returns false");
+
+    // Negative: key maps to an array, not an object.
+    ok = axl_json_get_object(&server, "aliases", &sub);
+    test_check(!ok, "json get_object: array value returns false");
+
+    // A parent sibling after the nested object is still reachable.
+    ok = axl_json_get_int(&r, "count", &int_val);
+    test_check(ok && int_val == 3,
+               "json get_object: parent sibling after nested object");
+
+    // The sub-reader borrows the parent's tokens: freeing it does not
+    // release the parent's memory (no double-free) and leaves the parent
+    // reader fully usable. (Per contract, callers shouldn't free borrowed
+    // readers; this pins that doing so is at worst harmless.)
+    axl_json_free(&server);
+    ok = axl_json_get_string(&r, "name", str_buf, sizeof(str_buf));
+    test_check(ok && axl_strcmp(str_buf, "devkit") == 0,
+               "json get_object: parent usable after freeing borrowed sub-reader");
+    ok = axl_json_get_object(&r, "server", &server) &&
+         axl_json_get_int(&server, "port", &int_val);
+    test_check(ok && int_val == 8080,
+               "json get_object: parent re-navigable after borrowed free");
+
+    axl_json_free(&r);
+
+    // JSON5-parsed readers navigate identically.
+    const char *j5 =
+        "{ db: { url: 'pg://x', pool: { max: 16 } } }";
+    ok = axl_json_parse_flags(j5, axl_strlen(j5),
+                              AXL_JSON_PARSER_JSON5, &r);
+    test_check(ok, "json get_object: JSON5 parse");
+
+    ok = axl_json_get_object(&r, "db", &server) &&
+         axl_json_get_object(&server, "pool", &tls);
+    test_check(ok, "json get_object: JSON5 deep navigation");
+
+    ok = axl_json_get_int(&tls, "max", &int_val);
+    test_check(ok && int_val == 16, "json get_object: JSON5 deep int (16)");
+
+    axl_json_free(&r);
+}
+
+// ---------------------------------------------------------------------------
 // JSON5 Parse Tests
 // ---------------------------------------------------------------------------
 
@@ -3624,6 +3740,7 @@ test_data_main(int argc, char **argv)
     test_string();
     test_string_ascii();
     test_json_parse();
+    test_json_get_object();
     test_json5_parse();
     test_json_load_file();
     test_json_build();
