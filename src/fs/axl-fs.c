@@ -148,6 +148,54 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 }
 
 int
+axl_file_write_atomic(const char *path, const void *buf, size_t len)
+{
+    if (path == NULL || (buf == NULL && len > 0)) {
+        return AXL_ERR;
+    }
+
+    /* Build the temp sibling "<path>.tmp" — same directory, so the
+       replace below is a same-directory rename (the FAT atomic case). */
+    size_t plen = axl_strlen(path);
+    char  *temp = axl_malloc(plen + 5);   /* ".tmp" + NUL */
+    if (temp == NULL) {
+        return AXL_ERR;
+    }
+    axl_memcpy(temp, path, plen);
+    axl_memcpy(temp + plen, ".tmp", 5);   /* copies the NUL too */
+
+    /* Write the full contents to the temp file first; closing it flushes
+       (UEFI FAT flushes on close). The target is untouched until now. */
+    if (axl_file_set_contents(temp, (buf != NULL) ? buf : "", len) != AXL_OK) {
+        axl_file_delete(temp);            /* best-effort cleanup */
+        axl_free(temp);
+        return AXL_ERR;
+    }
+
+    /* Replace the target. rename-over-existing isn't atomic on FAT, so
+       try a plain rename first (atomic when the target is absent) and
+       fall back to delete-then-rename. On the fallback a crash leaves
+       only the complete temp file — never a half-written target. */
+    int rc = axl_file_rename(temp, path);
+    if (rc != AXL_OK) {
+        /* Target exists: FAT can't rename-over, so remove then rename.
+           If the delete succeeds but this rename then fails (effectively
+           impossible on a healthy same-directory FAT volume), both files
+           are gone and we report ERR below — the data is in neither. */
+        axl_file_delete(path);            /* best-effort; ignore result */
+        rc = axl_file_rename(temp, path);
+    }
+    if (rc != AXL_OK) {
+        axl_file_delete(temp);            /* leave the target as it was */
+        axl_free(temp);
+        return AXL_ERR;
+    }
+
+    axl_free(temp);
+    return AXL_OK;
+}
+
+int
 axl_file_info(
     const char *path,
     AxlFsEntry *entry

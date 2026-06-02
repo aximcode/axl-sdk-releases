@@ -32,6 +32,7 @@
 #include <axl/axl-fs.h>
 #include <axl/axl-fs-provider.h>
 #include <axl/axl-device-path.h>
+#include <axl/axl-file-view.h>
 #include <axl/axl-log.h>
 #include <axl/axl-hash-table.h>
 #include <axl/axl-array.h>
@@ -41,13 +42,19 @@
 #include <axl/axl-json.h>
 #include <axl/axl-xml.h>
 #include <axl/axl-cache.h>
+#include <axl/axl-page-cache.h>
 #include <axl/axl-radix-tree.h>
 #include <axl/axl-ntree.h>
 #include <axl/axl-tree.h>
+#include <axl/axl-rb-tree.h>
+#include <axl/axl-text-buffer.h>
+#include <axl/axl-piece-tree.h>
 #include <axl/axl-ring-buf.h>
 #include <axl/axl-digest.h>
 #include <axl/axl-path.h>
 #include <axl/axl-hexdump.h>
+#include <axl/axl-clipboard.h>
+#include <axl/axl-shm.h>
 #include <axl/axl-sort.h>
 #include <axl/axl-time.h>
 #include <axl/axl-env.h>

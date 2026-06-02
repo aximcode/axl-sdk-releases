@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /**
- * axl-shared-driver.h:
+ * @file axl-shared-driver.h
  *
  * Convenience layer for the "thin launcher + resident driver"
  * pattern — sibling to @c axl-service.h but for synchronous-RPC
@@ -75,7 +75,7 @@ axl_shared_driver_guid(
 /**
  * @brief Publish a shared-driver vtable from a driver image.
  *
- * Wraps @ref axl_protocol_register_guid: derives the GUID from
+ * Wraps @ref axl_protocol_register_guid — derives the GUID from
  * @p name via @ref axl_shared_driver_guid, installs @p iface on a new
  * UEFI handle (or @p *handle if non-NULL), returns the handle in
  * @p *handle.
@@ -117,7 +117,7 @@ axl_shared_driver_unpublish(
  * @brief Locate (or load + locate) a shared-driver vtable from a launcher.
  *
  * Composes @ref axl_driver_ensure_with_embedded and
- * @ref axl_protocol_find_guid:
+ * @ref axl_protocol_find_guid in three steps:
  *
  *   1. Derive the GUID via @ref axl_shared_driver_guid (from @p name).
  *   2. @c axl_driver_ensure_with_embedded ensures the driver is loaded
@@ -211,13 +211,13 @@ axl_shared_driver_unload(
  */
 int
 axl_shared_driver_locate_with_load_options(
-    const char           *name,
-    const char           *driver_filename,
-    const unsigned char  *embed_blob,
-    size_t                embed_len,
+    const char           *name,              ///< shared-driver identity
+    const char           *driver_filename,   ///< on-disk driver filename
+    const unsigned char  *embed_blob,        ///< embedded driver bytes
+    size_t                embed_len,         ///< length of @p embed_blob
     const void           *load_options,      ///< bytes to install (NULL → skip)
     size_t                load_options_size, ///< @p load_options length
-    void                **out_iface
+    void                **out_iface          ///< [out] receives the vtable pointer
 );
 
 #ifdef __cplusplus

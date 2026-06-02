@@ -514,6 +514,25 @@ typedef enum {
 } AxlEncoding;
 
 /**
+ * @brief Sniff a file's text encoding from a leading byte sample.
+ *
+ * Recognizes a UTF-8 BOM (EF BB BF), UTF-16 LE BOM (FF FE), and UTF-16
+ * BE BOM (FE FF); failing a BOM, applies a light BOM-less heuristic
+ * (interleaved NUL bytes ⇒ UCS-2 LE/BE) and otherwise reports UTF-8.
+ * @p out_has_bom (optional) is set true when a BOM was present, so a
+ * caller can round-trip it on save.
+ *
+ * @return the detected encoding (UCS-2 variants for UTF-16; UTF-8 is
+ *     the default).
+ */
+AxlEncoding
+axl_detect_encoding(
+    const void *prefix,        ///< leading bytes of the file
+    size_t      len,           ///< number of bytes available
+    bool       *out_has_bom    ///< [out, optional] BOM present
+);
+
+/**
  * @brief Set the wire-side encoding for a stream.
  *
  * Applies to the byte-I/O primitives — axl_read, axl_write,

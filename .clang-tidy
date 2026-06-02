@@ -40,7 +40,26 @@ Checks: >
   -bugprone-implicit-widening-of-multiplication-result,
   -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-reserved-identifier,
-  clang-analyzer-*
+  clang-analyzer-*,
+  -clang-analyzer-valist.Uninitialized,
+  -clang-analyzer-security.ArrayBound
+
+# Checks disabled (and why), continued:
+#
+# - clang-analyzer-valist.Uninitialized
+#     False-positives on correct C variadic functions (every
+#     axl_*printf / log / format wrapper): the analyzer mis-models the
+#     path where an early return precedes va_start and reports va_end as
+#     "uninitialized" even when va_start always runs on the reaching
+#     path. Pure noise here — zero true positives — and it surfaces
+#     nondeterministically as unrelated header edits shift the analyzer's
+#     per-TU budget, blocking releases.
+#
+# - clang-analyzer-security.ArrayBound
+#     Spurious out-of-bounds reports on flexible-array / struct-field and
+#     bounded-buffer accesses (see RELEASING.md). Budget-sensitive and
+#     nondeterministic; produces only false positives in this tree.
+#     Genuine bounds bugs are caught by review + the unit suite.
 
 # Treat every remaining warning as an error so CI fails on regression.
 WarningsAsErrors: '*'

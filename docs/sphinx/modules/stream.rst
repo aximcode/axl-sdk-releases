@@ -19,6 +19,11 @@ AxlFs — filesystem operations
 
 .. doxygenfile:: axl-fs.h
 
+AxlFileView — mmap-like windowed view over a file
+-------------------------------------------------
+
+.. doxygenfile:: axl-file-view.h
+
 AxlFsProvider — publish a UEFI-visible filesystem
 -------------------------------------------------
 

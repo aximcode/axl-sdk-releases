@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /**
- * axl-driver.h:
+ * @file axl-driver.h
  *
  * UEFI driver lifecycle — load, start, connect, disconnect, unload.
  * No GLib equivalent (UEFI-specific).

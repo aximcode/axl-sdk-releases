@@ -1007,6 +1007,223 @@ axl_cache_invalidate(cache, "gateway");
 axl_cache_invalidate_all(cache);
 ```
 
+## AxlPageCache — LRU Page Cache
+
+A fixed-capacity LRU cache of equal-sized pages backed by a
+caller-supplied fill function. Unlike AxlCache (TTL, string keys,
+copy-in/copy-out values), this is capacity-only, integer-indexed, and
+**zero-copy**: a lookup returns a borrowed pointer into the resident
+frame. On a miss the least-recently-used frame is evicted and refilled
+in place. It knows nothing about files — the fill function decides
+where the bytes come from — so it windows any large, randomly-addressed
+backing store where only the hot pages should stay resident. It is the
+mechanism behind [AxlFileView](../fs/README.md).
+
+```c
+// Frame size 4 KiB, 8 resident frames; fill from some backing store.
+static int64_t fill(void *user, size_t page, void *dst, size_t cap) {
+    return load_page(user, page, dst, cap);   // bytes written, or -1
+}
+
+AXL_AUTOPTR(AxlPageCache) pc = axl_page_cache_new(4096, 8, fill, backing);
+
+size_t valid = 0;
+const uint8_t *p = axl_page_cache_get(pc, page_index, &valid);
+// p points into a resident frame; valid until the next get/clear.
+
+AxlPageCacheStats st;
+axl_page_cache_stats(pc, &st);   // hits / misses / evictions / fills
+```
+
+**Multi-tenant mode.** `axl_page_cache_new_shared(page_size, max_frames)`
+makes a fill-less cache that several owners share: `axl_page_cache_fetch(pc,
+owner, page, fill, user, &valid)` keys frames by `(owner, page)` and takes
+the fill per call, so one bounded frame budget serves many backing stores
+at once (every open file in an editor). `axl_page_cache_drop_owner(pc,
+owner)` returns a closing owner's frames to the pool; eviction is global
+LRU across all owners. (The single-tenant `axl_page_cache_get` is this same
+primitive with the cache as its own owner.) `AxlFileView` /
+`AxlPieceTree`'s `*_open_cached` variants are built on it.
+
+## AxlTextBuffer — Editable Text Store
+
+A growable, editable byte buffer with an integral line index, tuned for
+an interactive text editor: load a file once, then many small
+inserts/deletes near a moving cursor, with O(log n) byte-offset ↔ line
+mapping queried every keystroke and once per visible line per frame.
+
+Storage is a **gap buffer** (O(1) amortized edits at the gap). The
+**line index** is a sorted array of newline offsets maintained
+incrementally on every edit — never a full rescan — so `line_of_offset`
+and `line_bounds` are binary searches. The store is byte-oriented:
+`'\n'` is the only special byte; UTF-8 / codepoint policy is the
+caller's. A gap buffer is not contiguous, so content is read out via
+`axl_text_buffer_get` rather than a pointer.
+
+```c
+AXL_AUTOPTR(AxlTextBuffer) tb = axl_text_buffer_new(0);
+axl_text_buffer_set_bytes(tb, "ab\ncd\nef", 8);   // 3 lines
+
+axl_text_buffer_insert(tb, 2, "X", 1);            // edit near the cursor
+size_t line = axl_text_buffer_line_of_offset(tb, 4);
+
+size_t start, end;
+axl_text_buffer_line_bounds(tb, line, &start, &end);   // [start,end) excl. '\n'
+
+char out[64];
+size_t n = axl_text_buffer_get(tb, start, end - start, out, sizeof(out));
+```
+
+For very large / out-of-core files, use **AxlPieceTree** below; the gap
+buffer is the memory-resident store.
+
+## AxlRBTree — Intrusive Augmented Red-Black Tree
+
+A generic, **intrusive** red-black tree: the caller embeds an
+`AxlRBNode` in its own struct (the tree never allocates nodes) and
+descends to the insertion point itself, so the same tree serves ordered
+maps, order-statistic trees, and weighted positional trees. An optional
+`recompute` callback maintains a cached subtree aggregate (size,
+byte/newline sums, …) across every structural change in O(log n).
+Distinct from **AxlTree** (a non-intrusive key→value AVL map); this is
+intrusive and augmentable. It is the substrate behind **AxlPieceTree**.
+Reimplemented under Apache-2.0 from the textbook algorithm — no GPL
+source. See `docs/AXL-RBTree-Design.md`.
+
+```c
+typedef struct { AxlRBNode node; int key; size_t sub_count; } Ent;
+static void recompute(AxlRBNode *n, void *u) {
+    Ent *e = AXL_RB_ENTRY(n, Ent, node);
+    e->sub_count = 1
+        + (n->left  ? AXL_RB_ENTRY(n->left,  Ent, node)->sub_count : 0)
+        + (n->right ? AXL_RB_ENTRY(n->right, Ent, node)->sub_count : 0);
+}
+
+AxlRBTree t;
+axl_rb_tree_init(&t, recompute, NULL);
+// caller descends to the slot, then links + rebalances:
+AxlRBNode **link = &t.root, *parent = NULL;
+while (*link) { parent = *link;
+    link = (e->key < AXL_RB_ENTRY(parent, Ent, node)->key)
+         ? &parent->left : &parent->right; }
+axl_rb_link_node(&e->node, parent, link);
+axl_rb_insert(&t, &e->node);     // recompute propagates the subtree sums
+```
+
+## AxlPieceTree — Out-of-Core Editable Buffer
+
+An **out-of-core, editable** text buffer for large files. The original
+file is never loaded whole — its bytes are read on demand through
+[AxlFileView](../fs/README.md) — while edits accumulate in an
+append-only add buffer. A balanced tree of pieces (spans into either
+source, held in an **AxlRBTree** augmented with subtree byte and newline
+sums) presents one logical document with O(log n) offset↔line mapping
+and O(log n) edits, so editing a multi-gigabyte file costs memory
+proportional to the edits, not the file. This is the structure VS Code
+calls a "piece tree." Line semantics match **AxlTextBuffer** exactly
+(interchangeable for a renderer). See `docs/AXL-PieceTree-Design.md`.
+
+```c
+AXL_AUTOPTR(AxlPieceTree) pt = axl_piece_tree_open("fs0:\\big.log", 0, 0);
+axl_piece_tree_insert(pt, 50000, "hello\n", 6);   // O(log n), no big copy
+
+char out[64];
+size_t n = axl_piece_tree_get(pt, 50000, 6, out, sizeof(out));
+size_t line = axl_piece_tree_line_of_offset(pt, 50000);
+axl_piece_tree_save(pt, "fs0:\\big.log");          // crash-safe, streamed
+
+size_t at, sel;                                    // unlimited by default
+axl_piece_tree_undo(pt, &at, &sel);                // &at/&sel locate the change
+axl_piece_tree_redo(pt, NULL, NULL);               // (out-params optional)
+```
+
+**Undo/redo is built in** and unlimited by default
+(`axl_piece_tree_set_undo_limit` to cap or disable). `undo`/`redo` report
+where the change landed (`affected_offset` + `affected_len` — non-zero to
+re-select restored text, zero for a net deletion) so the editor can place
+the caret/selection at the edit site. Because the original
+and add buffers are immutable/append-only, the bytes needed to reverse an
+edit are never discarded — undo records are tiny span deltas, not text
+copies. `axl_piece_tree_undo_group_begin`/`_end` (nestable) coalesce a run
+of edits into one undo step; *what* to group (keystroke runs, time gaps,
+cursor moves) is the editor's policy, applied on top of this mechanism.
+For the accumulate-until-break style, `axl_piece_tree_undo_checkpoint`
+slices consecutive edits into runs — the editor calls it at each boundary
+(a pause, a cursor jump, a type↔delete switch) for VS Code-like smart
+grouping, no begin/end bookkeeping.
+
+**Editor-substrate helpers** layer on top for a full editor:
+`axl_piece_tree_find` searches a byte substring across the virtual
+document (cross-piece) with case-insensitive / backward / whole-word
+flags, using the same Boyer–Moore–Horspool engine as `grep`
+(`axl_strstr_len` & friends); `axl_piece_tree_is_modified` is a save-point-aware dirty flag;
+`axl_piece_tree_apply_edits` applies a batch of original-coordinate edits
+(replace-all, multi-cursor) as one undo group; and the
+`axl_piece_tree_line_iter_*` iterator walks every line in one O(n) pass
+(`_line_iter_init_at` starts at a given line for a deep viewport).
+Caret support: `undo`/`redo` report the affected range, the
+`axl_piece_tree_cp_align` / `_cp_next` / `_cp_prev` helpers step UTF-8
+codepoint boundaries, and `axl_piece_tree_get_alloc` copies a range out as
+a fresh NUL-terminated buffer.
+For files that aren't plain UTF-8, `axl_piece_tree_load_encoded` detects
+the encoding (UTF-8 ± BOM, UTF-16 LE/BE), decodes to a UTF-8 document
+(plain UTF-8 stays out-of-core; others transcode in), and reports the
+encoding + BOM so `axl_piece_tree_save_encoded` round-trips them.
+`axl_piece_tree_detect_eol` classifies the line endings (LF / CRLF / CR /
+MIXED) and `axl_piece_tree_set_eol` makes save normalize every terminator
+to a chosen style while streaming (conversion without materializing the
+document); `line_bounds` and the line iterator exclude a CRLF's trailing
+`\r` so a renderer sees clean content. The document stays `\n`-indexed
+internally — only `\n` delimits lines for `line_count` / `line_of_offset`.
+`axl_piece_tree_set_read_only` freezes the buffer (insert / delete /
+apply_edits return `AXL_ERR`; reads, search, and save still work).
+`axl_piece_tree_backing_changed` reports whether the backing file's size
+or mtime changed on disk since open, so an out-of-core editor can detect
+an external edit (or deletion) and offer a reload. For many files at once,
+`axl_piece_tree_open_cached(path, cache)` opens out-of-core sharing a
+caller-owned [`AxlPageCache`](#axlpagecache--lru-page-cache) so one bounded
+frame budget covers every open document.
+
+**Saving over the open file (rebase).** There is deliberately no in-place
+"save over yourself": for an out-of-core document, overwriting the file it
+reads from would invalidate the resident `ORIGINAL`-piece offsets (and the
+add-buffer-relative undo log) mid-flight. So the consumer composes the
+existing primitives and chooses the policy:
+
+```c
+// Save over the open file — a rebase: write a sibling temp, drop the
+// document, move the temp into place, reopen. Undo history resets; the
+// reopened document is a clean, single-original-piece buffer (bounded).
+axl_piece_tree_save_encoded(pt, "fs0:\\F.savetmp", enc, bom);  // preserve encoding/EOL
+axl_piece_tree_free(pt);
+axl_file_move("fs0:\\F.savetmp", "fs0:\\F");
+pt = axl_piece_tree_load_encoded("fs0:\\F", 0, 0, &enc, &bom); // clean, not modified
+// (then axl_piece_tree_set_eol(pt, axl_piece_tree_detect_eol(pt)) to keep the EOL mode)
+
+// Save-As — keep editing: just save to a new path. The document and its
+// undo history are untouched; it is marked clean against the new file.
+axl_piece_tree_save_encoded(pt, "fs0:\\F-copy", enc, bom);
+```
+
+Use `save_encoded` + `load_encoded` (not the plain `save`/`open`) for the
+rebase so the file's encoding and BOM survive it; re-apply `set_eol` after
+the reopen if you converted line endings. (Both saves are crash-safe —
+they write to `<path>.tmp` and rename — so the sibling-temp name just needs
+to differ from the original.) Caret / scroll / selection / read-only state
+are the editor's to snapshot and restore around the free→move→reopen; undo
+necessarily resets (the add-buffer offsets it referenced are gone).
+
+```c
+AxlEncoding enc; bool bom;
+AXL_AUTOPTR(AxlPieceTree) doc = axl_piece_tree_load_encoded(
+    "fs0:\\notes.txt", 0, 0, &enc, &bom);   // detects + decodes
+size_t hit;
+if (axl_piece_tree_find(doc, "TODO", 4, 0, AXL_FIND_CASE_INSENSITIVE, &hit)) {
+    /* ... */
+}
+axl_piece_tree_save_encoded(doc, "fs0:\\notes.txt", enc, bom);  // same form back
+```
+
 ## AxlRadixTree — Radix Tree
 
 Compact prefix tree (radix tree) with string keys. Supports exact

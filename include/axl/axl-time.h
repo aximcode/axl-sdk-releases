@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /**
- * axl-time.h:
+ * @file axl-time.h
  *
  * Time utilities: ISO 8601 formatting, a POSIX-style
  * `clock_gettime`, monotonic counters, and a wallclock reader.

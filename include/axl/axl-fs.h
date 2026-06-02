@@ -59,6 +59,35 @@ axl_file_set_contents(
 );
 
 /**
+ * @brief Crash-safely write an entire buffer to a file.
+ *
+ * Writes @p buf to a temporary sibling ("<path>.tmp"), flushes it
+ * (close implies flush on the UEFI FAT driver), then replaces @p path
+ * with it via rename. Unlike axl_file_set_contents — which truncates
+ * the target and writes in place, so a power loss mid-write leaves the
+ * target half-written — this never modifies the target until the full,
+ * flushed contents exist in the temp file.
+ *
+ * On UEFI/FAT a rename cannot atomically replace an existing file, so
+ * when @p path already exists the replace is delete-then-rename: a power
+ * loss in that window leaves the target momentarily absent but the
+ * complete data still present in "<path>.tmp" (recoverable) — never a
+ * half-written target. The temp file is removed on any failure.
+ *
+ * @p path must be in a writable directory; the temp sibling is created
+ * in the same directory (same-directory rename is the FAT atomic case).
+ *
+ * @return AXL_OK on success, AXL_ERR on any failure (the target is left
+ *     untouched if the temp write fails).
+ */
+AXL_WARN_UNUSED int
+axl_file_write_atomic(
+    const char *path,  ///< target file path (UTF-8)
+    const void *buf,   ///< data to write
+    size_t      len    ///< data size in bytes
+);
+
+/**
  * @brief Check if a path refers to a directory.
  *
  * @return true if directory, false otherwise or on error.

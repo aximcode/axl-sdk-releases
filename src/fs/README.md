@@ -24,6 +24,42 @@ primitives.
 
 Header: `<axl/axl-fs.h>`
 
+## AxlFileView — mmap-like windowed view over a file
+
+`<axl/axl-file-view.h>` opens a file read-only and serves reads from a
+small LRU [page cache](../data/README.md) without ever loading the file
+whole — the out-of-core property real `mmap` would give, but as a
+software cache. (True MMU demand paging is unworkable in UEFI: a `#PF`
+handler would have to do blocking filesystem I/O outside the TPL model,
+and a FAT file has no physical backing to zero-copy map, so even a "real"
+`mmap` would copy each page in through the FS driver anyway.)
+
+Two access modes:
+
+- `axl_file_view_read(v, offset, out, len)` — copy a range out,
+  transparently spanning pages; clamped at EOF.
+- `axl_file_view_page(v, offset, &avail)` — borrow a zero-copy pointer
+  into the resident frame for the page containing `offset`, with `avail`
+  bytes valid before the page boundary. Walk boundaries by re-calling at
+  `offset + avail`. The pointer is valid until the next view call.
+
+```c
+AXL_AUTOPTR(AxlFileView) v = axl_file_view_open("fs0:\\big.log", 0, 16);
+size_t total = axl_file_view_size(v);
+
+char line[256];
+size_t got = axl_file_view_read(v, total - 256, line, sizeof(line));
+```
+
+Read-only; for windowing large files (logs, the original text of an
+out-of-core editor buffer). Header: `<axl/axl-file-view.h>`
+
+`axl_file_view_open_cached(path, cache)` opens a view that borrows a
+caller-owned shared [`AxlPageCache`](../data/README.md) instead of
+allocating its own frame pool, so many open files share one bounded set
+of resident pages (the view adopts the cache's power-of-two page size and,
+on close, returns only its own frames — the cache outlives it).
+
 ## AxlFsProvider — publish a UEFI-visible filesystem
 
 The flip side of `AxlFs`: instead of *consuming* a filesystem the

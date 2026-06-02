@@ -1539,6 +1539,55 @@ test_strcasestr(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_strrcasestr / axl_strrcasestr_len — reverse case-insensitive
+// ---------------------------------------------------------------------------
+
+static void
+test_strrcasestr(void)
+{
+    /* Finds the LAST (highest-offset) match, case-insensitively. */
+    char *p = axl_strrcasestr("ab AB Ab xy", "ab");
+    test_check(p != NULL && p == (char *)"ab AB Ab xy" + 6, "strrcasestr: highest match");
+    test_check(axl_strrcasestr("Hello World", "WORLD") != NULL, "strrcasestr: case diff");
+    test_check(axl_strrcasestr("abcdef", "xyz") == NULL, "strrcasestr: no match");
+    test_check(axl_strrcasestr("abc", "") != NULL, "strrcasestr: empty needle");
+    test_check(axl_strrcasestr(NULL, "a") == NULL, "strrcasestr: NULL haystack");
+    test_check(axl_strrcasestr("a", NULL) == NULL, "strrcasestr: NULL needle");
+    test_check(axl_strrcasestr("abc", "abcd") == NULL, "strrcasestr: needle longer than haystack");
+
+    /* Distinct from forward: forward returns the first, reverse the last. */
+    const char *hay = "One two ONE two oNe";
+    char *fwd = axl_strcasestr(hay, "one");
+    char *rev = axl_strrcasestr(hay, "one");
+    test_check(fwd == hay + 0 && rev == hay + 16,
+               "strrcasestr: returns last where strcasestr returns first");
+
+    /* Length-bounded: must not match past the slice end. */
+    {
+        const char buf[] = "xx ONE yy one zz";   /* "one" at 3 and 10 */
+        char *q = axl_strrcasestr_len(buf, 13, "ONE");   /* slice covers both */
+        test_check(q == buf + 10, "strrcasestr_len: last match within slice");
+
+        char *q2 = axl_strrcasestr_len(buf, 9, "one");   /* slice ends before 2nd */
+        test_check(q2 == buf + 3, "strrcasestr_len: bounded to first when slice short");
+
+        char *q3 = axl_strrcasestr_len(buf, 12, "one");  /* 2nd 'one' [10,13) exceeds 12 */
+        test_check(q3 == buf + 3, "strrcasestr_len: rejects match past slice end");
+
+        test_check(axl_strrcasestr_len(buf, -1, "ZZ") == buf + 14,
+                   "strrcasestr_len: -1 defaults to NUL-terminated");
+        test_check(axl_strrcasestr_len(buf, 16, "") == buf,
+                   "strrcasestr_len: empty needle returns haystack");
+        test_check(axl_strrcasestr_len(NULL, 4, "x") == NULL, "strrcasestr_len: NULL haystack");
+        test_check(axl_strrcasestr_len(buf, 4, NULL) == NULL, "strrcasestr_len: NULL needle");
+    }
+
+    /* BMH-length (>=4) needle works the same reversed. */
+    test_check(axl_strrcasestr("zzQUICKzzquickzz", "quick") == (char *)"zzQUICKzzquickzz" + 9,
+               "strrcasestr: long needle, highest match, case-insensitive");
+}
+
+// ---------------------------------------------------------------------------
 // axl_fnmatch
 // ---------------------------------------------------------------------------
 
@@ -1790,6 +1839,49 @@ test_format(void)
     test_check(axl_strcmp(cap.buf, "100%") == 0, "format: literal percent");
 }
 
+static void
+test_utf16(void)
+{
+    /* U+0041 'A', U+00E9 'é' (2-byte UTF-8), U+20AC '€' (3-byte),
+       U+1F600 😀 (4-byte UTF-8 / surrogate pair in UTF-16). */
+    static const uint16_t u16[] = { 0x0041, 0x00E9, 0x20AC, 0xD83D, 0xDE00 };
+    static const char     u8[]  = { 'A', (char)0xC3, (char)0xA9, (char)0xE2,
+                                    (char)0x82, (char)0xAC, (char)0xF0,
+                                    (char)0x9F, (char)0x98, (char)0x80 };
+
+    /* UTF-16 -> UTF-8 measure + convert. */
+    size_t need = axl_utf16_to_utf8(u16, 5, NULL, 0);
+    test_check(need == sizeof(u8), "utf16->utf8: measured length (surrogate pair)");
+    char out8[32];
+    size_t n = axl_utf16_to_utf8(u16, 5, out8, sizeof(out8));
+    test_check(n == sizeof(u8) && axl_memcmp(out8, u8, sizeof(u8)) == 0,
+               "utf16->utf8: surrogate pair -> 4-byte UTF-8");
+
+    /* UTF-8 -> UTF-16 measure + convert (round trip). */
+    size_t need16 = axl_utf8_to_utf16(u8, sizeof(u8), NULL, 0);
+    test_check(need16 == 5, "utf8->utf16: measured unit count");
+    uint16_t out16[16];
+    size_t u = axl_utf8_to_utf16(u8, sizeof(u8), out16, 16);
+    bool eq16 = (u == 5);
+    for (size_t i = 0; i < u; i++) {
+        if (out16[i] != u16[i]) { eq16 = false; }
+    }
+    test_check(eq16, "utf8->utf16: 4-byte UTF-8 -> surrogate pair");
+
+    /* Lone high surrogate -> U+FFFD (3-byte EF BF BD). */
+    static const uint16_t lone[] = { 0x0041, 0xD83D, 0x0042 };
+    n = axl_utf16_to_utf8(lone, 3, out8, sizeof(out8));
+    test_check(n == 5 && (uint8_t)out8[0] == 'A' && (uint8_t)out8[1] == 0xEF
+               && (uint8_t)out8[2] == 0xBF && (uint8_t)out8[3] == 0xBD
+               && (uint8_t)out8[4] == 'B',
+               "utf16->utf8: lone surrogate -> U+FFFD");
+
+    /* Clean truncation on a tight buffer (no partial sequence). */
+    char tiny[2];
+    n = axl_utf16_to_utf8(u16, 5, tiny, sizeof(tiny));   /* only 'A' fits (é needs 2) */
+    test_check(n == 1 && tiny[0] == 'A', "utf16->utf8: clean truncation at boundary");
+}
+
 // ---------------------------------------------------------------------------
 
 int
@@ -1840,9 +1932,11 @@ test_strbuf_main(
     test_str_to_narrow();
     test_str_to_edge_cases();
     test_strcasestr();
+    test_strrcasestr();
     test_fnmatch();
     test_wcs();
     test_format();
+    test_utf16();
 
     return test_print_results();
 }

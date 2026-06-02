@@ -35,11 +35,17 @@ AXL SDK
    modules/json
    modules/xml
    modules/cache
+   modules/page-cache
+   modules/text-buffer
+   modules/rb-tree
+   modules/piece-tree
    modules/radix-tree
    modules/ring-buf
    modules/config
    modules/subcommand
    modules/path
+   modules/clipboard
+   modules/shm
    modules/sort
    modules/loop
    modules/task

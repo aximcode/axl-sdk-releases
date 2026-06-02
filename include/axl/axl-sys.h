@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /**
- * axl-sys.h:
+ * @file axl-sys.h
  *
  * System operations — reset, device mapping refresh.
  * UEFI-specific, no GLib equivalent.

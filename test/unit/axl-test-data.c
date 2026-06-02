@@ -1981,6 +1981,678 @@ test_cache(void)
 }
 
 // ---------------------------------------------------------------------------
+// Page Cache Tests
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint64_t calls;        // total fill invocations
+    size_t   error_page;   // page that returns -1 (SIZE_MAX = none)
+    size_t   short_page;   // page that returns a short count (SIZE_MAX = none)
+    size_t   short_len;    // count returned for short_page
+} PcFill;
+
+// Deterministic synthetic fill: page p, byte i -> (p*31 + i). No file
+// needed, so this runs identically on both arches with no fs0: SKIP.
+static int64_t
+pc_fill(void *user, size_t page_index, void *dst, size_t cap)
+{
+    PcFill *s = (PcFill *)user;
+    s->calls++;
+    if (page_index == s->error_page) {
+        return -1;
+    }
+    size_t n = cap;
+    if (page_index == s->short_page && s->short_len < cap) {
+        n = s->short_len;
+    }
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = (uint8_t)(page_index * 31u + i);
+    }
+    return (int64_t)n;
+}
+
+static bool
+pc_page_matches(const uint8_t *p, size_t page_index, size_t len)
+{
+    if (p == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] != (uint8_t)(page_index * 31u + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_page_cache(void)
+{
+    PcFill st = { 0, (size_t)-1, (size_t)-1, 0 };
+    AxlPageCache *pc = axl_page_cache_new(64, 3, pc_fill, &st);
+    test_check(pc != NULL, "page_cache: new");
+    test_check(axl_page_cache_page_size(pc) == 64, "page_cache: page size reported");
+
+    size_t vlen = 0;
+    const uint8_t *p = (const uint8_t *)axl_page_cache_get(pc, 0, &vlen);
+    test_check(p != NULL && vlen == 64, "page_cache: get page 0 full valid_len");
+    test_check(pc_page_matches(p, 0, 64), "page_cache: page 0 content");
+
+    p = (const uint8_t *)axl_page_cache_get(pc, 5, &vlen);
+    test_check(pc_page_matches(p, 5, 64), "page_cache: page 5 content distinct");
+
+    // Resident re-get: a hit, no extra fill.
+    AxlPageCacheStats s;
+    axl_page_cache_stats(pc, &s);
+    uint64_t fills_before = s.fills;
+    (void)axl_page_cache_get(pc, 0, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == fills_before, "page_cache: resident re-get does no fill");
+    test_check(s.hits >= 1, "page_cache: hit counted");
+
+    // Fill the 3 frames {5, 0, 10} (recency oldest->newest: 5, 0, 10),
+    // then a 4th distinct page must evict the LRU (page 5).
+    (void)axl_page_cache_get(pc, 10, &vlen);
+    (void)axl_page_cache_get(pc, 20, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.evictions >= 1, "page_cache: eviction at capacity");
+
+    // LRU correctness: 0 and 10 stayed resident; 5 (the LRU) was evicted.
+    axl_page_cache_stats(pc, &s);
+    uint64_t f0 = s.fills;
+    (void)axl_page_cache_get(pc, 0, &vlen);
+    (void)axl_page_cache_get(pc, 10, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == f0, "page_cache: LRU kept recently-used pages 0 and 10");
+    (void)axl_page_cache_get(pc, 5, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == f0 + 1, "page_cache: LRU evicted the least-recently-used page (5)");
+
+    // Partial trailing page: short fill -> valid_len reflects it.
+    st.short_page = 7;
+    st.short_len = 20;
+    p = (const uint8_t *)axl_page_cache_get(pc, 7, &vlen);
+    test_check(p != NULL && vlen == 20, "page_cache: partial page valid_len");
+    test_check(pc_page_matches(p, 7, 20), "page_cache: partial page content");
+
+    // Fill error -> NULL.
+    st.error_page = 99;
+    vlen = 12345;
+    p = (const uint8_t *)axl_page_cache_get(pc, 99, &vlen);
+    test_check(p == NULL, "page_cache: fill error returns NULL");
+
+    // Clear drops residency + zeroes stats; next get refills.
+    axl_page_cache_clear(pc);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.hits == 0 && s.misses == 0 && s.evictions == 0 && s.fills == 0,
+               "page_cache: clear resets stats");
+    st.error_page = (size_t)-1;
+    st.short_page = (size_t)-1;
+    uint64_t calls_before = st.calls;
+    (void)axl_page_cache_get(pc, 0, &vlen);
+    test_check(st.calls == calls_before + 1, "page_cache: get after clear refills");
+
+    // Arg validation + NULL safety.
+    test_check(axl_page_cache_new(0, 3, pc_fill, &st) == NULL, "page_cache: zero page_size -> NULL");
+    test_check(axl_page_cache_new(64, 0, pc_fill, &st) == NULL, "page_cache: zero frames -> NULL");
+    test_check(axl_page_cache_new(64, 3, NULL, &st) == NULL, "page_cache: NULL fill -> NULL");
+    test_check(axl_page_cache_new(SIZE_MAX, 2, pc_fill, &st) == NULL, "page_cache: pool-size overflow -> NULL");
+    test_check(axl_page_cache_get(NULL, 0, &vlen) == NULL, "page_cache: get(NULL) -> NULL");
+    axl_page_cache_free(NULL);
+
+    axl_page_cache_free(pc);
+}
+
+// Owner-distinguishing fill: content = tag(*user) + page*31 + i, so the
+// same page index produces different bytes for different owners.
+static int64_t
+pc_owner_fill(void *user, size_t page_index, void *dst, size_t cap)
+{
+    uint8_t tag = *(const uint8_t *)user;
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < cap; i++) {
+        d[i] = (uint8_t)(tag + page_index * 31u + i);
+    }
+    return (int64_t)cap;
+}
+
+static bool
+pc_owner_matches(const uint8_t *p, uint8_t tag, size_t page_index, size_t len)
+{
+    if (p == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] != (uint8_t)(tag + page_index * 31u + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_page_cache_multitenant(void)
+{
+    uint8_t owner_a = 0xA0, owner_b = 0xB0;   // identity = &owner_a / &owner_b
+    size_t  vlen = 0;
+    AxlPageCacheStats s;
+
+    AxlPageCache *pc = axl_page_cache_new_shared(64, 4);
+    test_check(pc != NULL, "pc mt: new_shared");
+    test_check(axl_page_cache_page_size(pc) == 64, "pc mt: page size");
+    test_check(axl_page_cache_get(pc, 0, &vlen) == NULL && vlen == 0,
+               "pc mt: single-tenant get() unavailable on shared cache");
+
+    // Same page index, different owners -> distinct frames (no collision).
+    const uint8_t *pa = (const uint8_t *)axl_page_cache_fetch(pc, &owner_a, 0,
+                                                              pc_owner_fill, &owner_a, &vlen);
+    test_check(pa != NULL && vlen == 64 && pc_owner_matches(pa, 0xA0, 0, 64),
+               "pc mt: owner A page 0 content");
+    const uint8_t *pb = (const uint8_t *)axl_page_cache_fetch(pc, &owner_b, 0,
+                                                              pc_owner_fill, &owner_b, &vlen);
+    test_check(pb != NULL && pc_owner_matches(pb, 0xB0, 0, 64),
+               "pc mt: owner B page 0 distinct from A");
+
+    // Re-fetch A page 0 is a hit (no fill) and still A's content.
+    axl_page_cache_stats(pc, &s);
+    uint64_t fills0 = s.fills;
+    pa = (const uint8_t *)axl_page_cache_fetch(pc, &owner_a, 0, pc_owner_fill, &owner_a, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == fills0 && pc_owner_matches(pa, 0xA0, 0, 64),
+               "pc mt: A page 0 resident across tenants (hit)");
+
+    // drop_owner reclaims only A's frames; B's stay resident.
+    axl_page_cache_drop_owner(pc, &owner_a);
+    axl_page_cache_stats(pc, &s);
+    uint64_t fills1 = s.fills;
+    (void)axl_page_cache_fetch(pc, &owner_b, 0, pc_owner_fill, &owner_b, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == fills1, "pc mt: drop_owner(A) left B resident");
+    (void)axl_page_cache_fetch(pc, &owner_a, 0, pc_owner_fill, &owner_a, &vlen);
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == fills1 + 1, "pc mt: drop_owner(A) evicted A (refill)");
+
+    // NULL fill -> NULL.
+    test_check(axl_page_cache_fetch(pc, &owner_a, 0, NULL, NULL, &vlen) == NULL,
+               "pc mt: NULL fill -> NULL");
+    axl_page_cache_free(pc);
+
+    // Global LRU across tenants: 2 frames, A0 (older) + B0 fill them; a
+    // third fetch by owner B evicts the global LRU, which is owner A's page
+    // — one tenant's activity reclaims another's frame.
+    pc = axl_page_cache_new_shared(64, 2);
+    (void)axl_page_cache_fetch(pc, &owner_a, 0, pc_owner_fill, &owner_a, &vlen);  // clock 1
+    (void)axl_page_cache_fetch(pc, &owner_b, 0, pc_owner_fill, &owner_b, &vlen);  // clock 2
+    axl_page_cache_stats(pc, &s);
+    uint64_t fills2 = s.fills;
+    (void)axl_page_cache_fetch(pc, &owner_b, 1, pc_owner_fill, &owner_b, &vlen);  // evicts A0 (LRU)
+    axl_page_cache_stats(pc, &s);
+    test_check(s.evictions >= 1 && s.fills == fills2 + 1, "pc mt: global LRU eviction across tenants");
+    uint64_t fills3 = s.fills;
+    (void)axl_page_cache_fetch(pc, &owner_a, 0, pc_owner_fill, &owner_a, &vlen);  // A0 was evicted by B
+    axl_page_cache_stats(pc, &s);
+    test_check(s.fills == fills3 + 1, "pc mt: a tenant's fetch evicted another tenant's page");
+    axl_page_cache_free(pc);
+}
+
+// ---------------------------------------------------------------------------
+// RB Tree Tests (generic intrusive augmented red-black tree)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlRBNode node;
+    int       key;
+    long      val;
+    size_t    sub_count;   // augment: # nodes in subtree
+    long      sub_sum;     // augment: sum of val over subtree
+} RbEnt;
+
+#define RB_ENT(n) AXL_RB_ENTRY(n, RbEnt, node)
+
+static void
+rb_recompute(AxlRBNode *n, void *user)
+{
+    (void)user;
+    RbEnt *e = RB_ENT(n);
+    size_t c = 1;
+    long   s = e->val;
+    if (n->left != NULL) {
+        c += RB_ENT(n->left)->sub_count;
+        s += RB_ENT(n->left)->sub_sum;
+    }
+    if (n->right != NULL) {
+        c += RB_ENT(n->right)->sub_count;
+        s += RB_ENT(n->right)->sub_sum;
+    }
+    e->sub_count = c;
+    e->sub_sum = s;
+}
+
+/* Recursive RB-invariant checker: parent links, no red-red, equal black
+   height on all paths. Returns black height, sets *ok=false on any
+   violation. NULL is a black sentinel (height 1). */
+static int
+rb_check(const AxlRBNode *n, const AxlRBNode *parent, bool *ok)
+{
+    if (n == NULL) {
+        return 1;
+    }
+    if (n->parent != parent) {
+        *ok = false;
+    }
+    if (n->color == AXL_RB_RED) {
+        if ((n->left != NULL && n->left->color == AXL_RB_RED) ||
+            (n->right != NULL && n->right->color == AXL_RB_RED)) {
+            *ok = false;
+        }
+    }
+    int lh = rb_check(n->left, n, ok);
+    int rh = rb_check(n->right, n, ok);
+    if (lh != rh) {
+        *ok = false;
+    }
+    return lh + (n->color == AXL_RB_BLACK ? 1 : 0);
+}
+
+/* Brute-force augment check: cached aggregates must equal a fresh
+   bottom-up recomputation. */
+static void
+rb_aug_check(const AxlRBNode *n, bool *ok)
+{
+    if (n == NULL) {
+        return;
+    }
+    rb_aug_check(n->left, ok);
+    rb_aug_check(n->right, ok);
+    size_t c = 1;
+    long   s = RB_ENT(n)->val;
+    if (n->left != NULL) {
+        c += RB_ENT(n->left)->sub_count;
+        s += RB_ENT(n->left)->sub_sum;
+    }
+    if (n->right != NULL) {
+        c += RB_ENT(n->right)->sub_count;
+        s += RB_ENT(n->right)->sub_sum;
+    }
+    if (RB_ENT(n)->sub_count != c || RB_ENT(n)->sub_sum != s) {
+        *ok = false;
+    }
+}
+
+static bool
+rb_insert_key(AxlRBTree *t, RbEnt *e)
+{
+    AxlRBNode **link = &t->root;
+    AxlRBNode  *parent = NULL;
+    while (*link != NULL) {
+        parent = *link;
+        RbEnt *p = RB_ENT(parent);
+        if (e->key < p->key) {
+            link = &parent->left;
+        } else if (e->key > p->key) {
+            link = &parent->right;
+        } else {
+            return false;   // duplicate key
+        }
+    }
+    axl_rb_link_node(&e->node, parent, link);
+    axl_rb_insert(t, &e->node);
+    return true;
+}
+
+/* k-th smallest (0-based) via the sub_count augment. */
+static AxlRBNode *
+rb_select(AxlRBTree *t, size_t k)
+{
+    AxlRBNode *n = t->root;
+    while (n != NULL) {
+        size_t lc = (n->left != NULL) ? RB_ENT(n->left)->sub_count : 0;
+        if (k < lc) {
+            n = n->left;
+        } else if (k == lc) {
+            return n;
+        } else {
+            k -= lc + 1;
+            n = n->right;
+        }
+    }
+    return NULL;
+}
+
+static RbEnt rb_pool[300];
+static RbEnt rb_pool2[10];
+
+static void
+test_rb_tree(void)
+{
+    AxlRBTree t;
+    axl_rb_tree_init(&t, rb_recompute, NULL);
+    test_check(axl_rb_tree_empty(&t), "rbtree: empty after init");
+    test_check(axl_rb_first(&t) == NULL && axl_rb_last(&t) == NULL,
+               "rbtree: first/last NULL when empty");
+
+    // Insert 300 distinct keys via a deterministic LCG.
+    uint32_t lcg = 12345u;
+    size_t n = 0;
+    for (int attempts = 0; n < 300 && attempts < 100000; attempts++) {
+        lcg = lcg * 1103515245u + 12345u;
+        int key = (int)((lcg >> 8) % 100000u);
+        RbEnt *e = &rb_pool[n];
+        e->key = key;
+        e->val = (long)key * 2 + 1;
+        if (rb_insert_key(&t, e)) {
+            n++;
+        }
+    }
+    test_check(n == 300, "rbtree: inserted 300 distinct keys");
+
+    bool ok = true;
+    rb_check(t.root, NULL, &ok);
+    test_check(ok && t.root != NULL && t.root->color == AXL_RB_BLACK,
+               "rbtree: RB invariants hold after inserts");
+    ok = true;
+    rb_aug_check(t.root, &ok);
+    test_check(ok, "rbtree: augment correct after inserts");
+
+    // In-order ascending, visits all; collect for select cross-check.
+    static int inorder[300];
+    size_t cnt = 0;
+    int prev = -1;
+    bool sorted = true;
+    long total = 0;
+    for (AxlRBNode *it = axl_rb_first(&t); it != NULL; it = axl_rb_next(it)) {
+        RbEnt *e = RB_ENT(it);
+        if (e->key <= prev) {
+            sorted = false;
+        }
+        prev = e->key;
+        if (cnt < 300) {
+            inorder[cnt] = e->key;
+        }
+        total += e->val;
+        cnt++;
+    }
+    test_check(sorted, "rbtree: in-order traversal is ascending");
+    test_check(cnt == 300, "rbtree: in-order visits all 300");
+    test_check(RB_ENT(t.root)->sub_count == 300, "rbtree: root subtree count == n");
+    test_check(RB_ENT(t.root)->sub_sum == total, "rbtree: root subtree sum correct");
+
+    // axl_rb_last == in-order maximum.
+    test_check(RB_ENT(axl_rb_last(&t))->key == inorder[299], "rbtree: last == max key");
+
+    // select(k) matches in-order k-th.
+    bool sel_ok = true;
+    for (size_t k = 0; k < 300; k += 37) {
+        AxlRBNode *s = rb_select(&t, k);
+        if (s == NULL || RB_ENT(s)->key != inorder[k]) {
+            sel_ok = false;
+        }
+    }
+    test_check(sel_ok, "rbtree: select(k) matches in-order k-th (order statistic)");
+
+    // Erase every other inserted node; re-check invariants + augment.
+    for (size_t i = 0; i < 300; i += 2) {
+        axl_rb_erase(&t, &rb_pool[i].node);
+    }
+    ok = true;
+    rb_check(t.root, NULL, &ok);
+    test_check(ok && (t.root == NULL || t.root->color == AXL_RB_BLACK),
+               "rbtree: RB invariants hold after erase batch");
+    ok = true;
+    rb_aug_check(t.root, &ok);
+    test_check(ok, "rbtree: augment correct after erase batch");
+    size_t rem = 0;
+    for (AxlRBNode *it = axl_rb_first(&t); it != NULL; it = axl_rb_next(it)) {
+        rem++;
+    }
+    test_check(rem == 150, "rbtree: 150 remain after erasing 150");
+
+    // update_augment after an in-place payload change.
+    RbEnt *u = &rb_pool[1];   // odd index -> still present
+    long root_sum_before = RB_ENT(t.root)->sub_sum;
+    u->val += 1000;
+    axl_rb_update_augment(&t, &u->node);
+    ok = true;
+    rb_aug_check(t.root, &ok);
+    test_check(ok, "rbtree: augment correct after update_augment");
+    test_check(RB_ENT(t.root)->sub_sum == root_sum_before + 1000,
+               "rbtree: update_augment propagated to root");
+
+    // Erase all remaining down to empty.
+    AxlRBNode *it;
+    while ((it = axl_rb_first(&t)) != NULL) {
+        axl_rb_erase(&t, it);
+    }
+    test_check(axl_rb_tree_empty(&t), "rbtree: empty after erasing all");
+
+    // NULL recompute = plain balanced tree (no augmentation work).
+    AxlRBTree t2;
+    axl_rb_tree_init(&t2, NULL, NULL);
+    for (int i = 0; i < 10; i++) {
+        rb_pool2[i].key = (i * 7) % 11;   // distinct in 0..10
+        rb_pool2[i].val = i;
+        rb_insert_key(&t2, &rb_pool2[i]);
+    }
+    ok = true;
+    rb_check(t2.root, NULL, &ok);
+    test_check(ok, "rbtree: NULL recompute still balances correctly");
+    axl_rb_erase(&t2, &rb_pool2[3].node);
+    axl_rb_erase(&t2, &rb_pool2[7].node);
+    ok = true;
+    rb_check(t2.root, NULL, &ok);
+    size_t c2 = 0;
+    for (AxlRBNode *i2 = axl_rb_first(&t2); i2 != NULL; i2 = axl_rb_next(i2)) {
+        c2++;
+    }
+    test_check(ok && c2 == 8, "rbtree: NULL recompute erase keeps balance + count");
+}
+
+// ---------------------------------------------------------------------------
+// Text Buffer Tests
+// ---------------------------------------------------------------------------
+
+static bool
+tb_content_is(const AxlTextBuffer *tb, const char *expect)
+{
+    size_t elen = axl_strlen(expect);
+    if (axl_text_buffer_length(tb) != elen) {
+        return false;
+    }
+    char buf[256];
+    if (elen >= sizeof(buf)) {
+        return false;
+    }
+    size_t got = axl_text_buffer_get(tb, 0, elen, buf, sizeof(buf));
+    return got == elen && axl_memcmp(buf, expect, elen) == 0;
+}
+
+static void
+test_text_buffer(void)
+{
+    size_t st = 0, en = 0;
+
+    AxlTextBuffer *tb = axl_text_buffer_new(0);
+    test_check(tb != NULL, "text_buffer: new");
+
+    // Empty buffer is one line.
+    test_check(axl_text_buffer_length(tb) == 0, "text_buffer: empty length 0");
+    test_check(axl_text_buffer_line_count(tb) == 1, "text_buffer: empty line_count 1");
+    test_check(axl_text_buffer_line_of_offset(tb, 0) == 0, "text_buffer: empty line_of_offset 0");
+    test_check(axl_text_buffer_byte_at(tb, 0) == -1, "text_buffer: empty byte_at -1");
+    test_check(axl_text_buffer_line_bounds(tb, 0, &st, &en) == AXL_OK && st == 0 && en == 0,
+               "text_buffer: empty line 0 bounds [0,0)");
+    test_check(axl_text_buffer_line_bounds(tb, 1, &st, &en) == AXL_ERR,
+               "text_buffer: invalid line -> ERR");
+
+    // Single line.
+    test_check(axl_text_buffer_set_bytes(tb, "hello", 5) == AXL_OK, "text_buffer: set_bytes");
+    test_check(tb_content_is(tb, "hello"), "text_buffer: content hello");
+    test_check(axl_text_buffer_length(tb) == 5, "text_buffer: length 5");
+    test_check(axl_text_buffer_line_count(tb) == 1, "text_buffer: single line_count 1");
+    test_check(axl_text_buffer_byte_at(tb, 0) == 'h' && axl_text_buffer_byte_at(tb, 4) == 'o',
+               "text_buffer: byte_at");
+    test_check(axl_text_buffer_byte_at(tb, 5) == -1, "text_buffer: byte_at end -1");
+
+    // Multi-line.
+    test_check(axl_text_buffer_set_bytes(tb, "ab\ncd\nef", 8) == AXL_OK, "text_buffer: set multi-line");
+    test_check(axl_text_buffer_line_count(tb) == 3, "text_buffer: 3 lines");
+    test_check(axl_text_buffer_line_bounds(tb, 0, &st, &en) == AXL_OK && st == 0 && en == 2,
+               "text_buffer: line0 [0,2)");
+    test_check(axl_text_buffer_line_bounds(tb, 1, &st, &en) == AXL_OK && st == 3 && en == 5,
+               "text_buffer: line1 [3,5)");
+    test_check(axl_text_buffer_line_bounds(tb, 2, &st, &en) == AXL_OK && st == 6 && en == 8,
+               "text_buffer: line2 [6,8)");
+    test_check(axl_text_buffer_line_of_offset(tb, 0) == 0, "text_buffer: off0 -> line0");
+    test_check(axl_text_buffer_line_of_offset(tb, 2) == 0, "text_buffer: off2 (the '\\n') -> line0");
+    test_check(axl_text_buffer_line_of_offset(tb, 3) == 1, "text_buffer: off3 -> line1");
+    test_check(axl_text_buffer_line_of_offset(tb, 8) == 2, "text_buffer: off end -> line2");
+
+    // Trailing newline -> real empty last line.
+    test_check(axl_text_buffer_set_bytes(tb, "abc\n", 4) == AXL_OK, "text_buffer: set trailing nl");
+    test_check(axl_text_buffer_line_count(tb) == 2, "text_buffer: trailing nl -> 2 lines");
+    test_check(axl_text_buffer_line_bounds(tb, 1, &st, &en) == AXL_OK && st == 4 && en == 4,
+               "text_buffer: empty last line [4,4)");
+
+    // Consecutive newlines -> empty middle line.
+    test_check(axl_text_buffer_set_bytes(tb, "a\n\nb", 4) == AXL_OK, "text_buffer: set consecutive nl");
+    test_check(axl_text_buffer_line_count(tb) == 3, "text_buffer: consecutive nl -> 3 lines");
+    test_check(axl_text_buffer_line_bounds(tb, 1, &st, &en) == AXL_OK && st == 2 && en == 2,
+               "text_buffer: empty middle line [2,2)");
+
+    // Insert (no newline) + read across the gap.
+    test_check(axl_text_buffer_set_bytes(tb, "helloworld", 10) == AXL_OK, "text_buffer: reset");
+    test_check(axl_text_buffer_insert(tb, 5, " ", 1) == AXL_OK, "text_buffer: insert space");
+    test_check(tb_content_is(tb, "hello world"), "text_buffer: insert content");
+    test_check(axl_text_buffer_length(tb) == 11, "text_buffer: insert length 11");
+    char g[16];
+    size_t gn = axl_text_buffer_get(tb, 3, 5, g, sizeof(g));   // "lo wo" straddles the gap
+    test_check(gn == 5 && axl_memcmp(g, "lo wo", 5) == 0, "text_buffer: get across gap");
+    test_check(axl_text_buffer_byte_at(tb, 6) == 'w', "text_buffer: byte_at across gap");
+
+    // Insert with newlines updates the index incrementally.
+    test_check(axl_text_buffer_insert(tb, 5, "\nX\n", 3) == AXL_OK, "text_buffer: insert newlines");
+    test_check(tb_content_is(tb, "hello\nX\n world"), "text_buffer: insert-newlines content");
+    test_check(axl_text_buffer_line_count(tb) == 3, "text_buffer: insert-newlines line_count 3");
+    test_check(axl_text_buffer_line_bounds(tb, 0, &st, &en) == AXL_OK && st == 0 && en == 5,
+               "text_buffer: il line0 [0,5)");
+    test_check(axl_text_buffer_line_bounds(tb, 1, &st, &en) == AXL_OK && st == 6 && en == 7,
+               "text_buffer: il line1 [6,7)");
+    test_check(axl_text_buffer_line_bounds(tb, 2, &st, &en) == AXL_OK && st == 8 && en == 14,
+               "text_buffer: il line2 [8,14)");
+
+    // Prepend, append, and offset clamping.
+    test_check(axl_text_buffer_set_bytes(tb, "mid", 3) == AXL_OK, "text_buffer: reset mid");
+    test_check(axl_text_buffer_insert(tb, 0, "pre-", 4) == AXL_OK, "text_buffer: prepend");
+    test_check(axl_text_buffer_insert(tb, axl_text_buffer_length(tb), "-post", 5) == AXL_OK,
+               "text_buffer: append");
+    test_check(axl_text_buffer_insert(tb, 999, "!", 1) == AXL_OK, "text_buffer: insert clamps offset");
+    test_check(tb_content_is(tb, "pre-mid-post!"), "text_buffer: prepend/append/clamp content");
+
+    // Delete a range.
+    test_check(axl_text_buffer_set_bytes(tb, "hello world", 11) == AXL_OK, "text_buffer: reset for delete");
+    test_check(axl_text_buffer_delete(tb, 5, 6) == AXL_OK, "text_buffer: delete tail");
+    test_check(tb_content_is(tb, "hello"), "text_buffer: delete content");
+
+    // Delete spanning a newline collapses the two lines.
+    test_check(axl_text_buffer_set_bytes(tb, "ab\ncd", 5) == AXL_OK, "text_buffer: reset 2-line");
+    test_check(axl_text_buffer_line_count(tb) == 2, "text_buffer: pre-delete 2 lines");
+    test_check(axl_text_buffer_delete(tb, 1, 3) == AXL_OK, "text_buffer: delete across nl");
+    test_check(tb_content_is(tb, "ad"), "text_buffer: delete-across-nl content");
+    test_check(axl_text_buffer_line_count(tb) == 1, "text_buffer: delete merged to 1 line");
+
+    // Delete length clamping + offset past end is a no-op.
+    test_check(axl_text_buffer_set_bytes(tb, "abc", 3) == AXL_OK, "text_buffer: reset abc");
+    test_check(axl_text_buffer_delete(tb, 1, 999) == AXL_OK && tb_content_is(tb, "a"),
+               "text_buffer: delete len clamps");
+    test_check(axl_text_buffer_delete(tb, 999, 5) == AXL_OK && tb_content_is(tb, "a"),
+               "text_buffer: delete past end no-op");
+
+    // get truncation at cap and clamping at end.
+    test_check(axl_text_buffer_set_bytes(tb, "abcdef", 6) == AXL_OK, "text_buffer: reset abcdef");
+    char tr[4];
+    size_t tn = axl_text_buffer_get(tb, 0, 6, tr, 3);
+    test_check(tn == 3 && axl_memcmp(tr, "abc", 3) == 0, "text_buffer: get truncates at cap");
+    tn = axl_text_buffer_get(tb, 4, 100, tr, sizeof(tr));
+    test_check(tn == 2 && axl_memcmp(tr, "ef", 2) == 0, "text_buffer: get clamps at end");
+    test_check(axl_text_buffer_get(tb, 6, 5, tr, sizeof(tr)) == 0, "text_buffer: get at end -> 0");
+
+    // Many incremental edits keep the line index correct.
+    test_check(axl_text_buffer_set_bytes(tb, "", 0) == AXL_OK, "text_buffer: clear");
+    bool many_ok = true;
+    for (int i = 0; i < 100; i++) {
+        if (axl_text_buffer_insert(tb, axl_text_buffer_length(tb), "line\n", 5) != AXL_OK) {
+            many_ok = false;
+        }
+    }
+    test_check(many_ok, "text_buffer: 100 appends ok");
+    test_check(axl_text_buffer_line_count(tb) == 101, "text_buffer: 100 lines + empty tail = 101");
+    test_check(axl_text_buffer_line_bounds(tb, 50, &st, &en) == AXL_OK && st == 50u * 5u && en == 50u * 5u + 4u,
+               "text_buffer: line 50 bounds after many edits");
+    test_check(axl_text_buffer_line_of_offset(tb, 50u * 5u + 2u) == 50,
+               "text_buffer: line_of_offset after many edits");
+
+    axl_text_buffer_free(tb);
+
+    // NULL safety.
+    axl_text_buffer_free(NULL);
+    test_check(axl_text_buffer_length(NULL) == 0, "text_buffer: length(NULL) 0");
+    test_check(axl_text_buffer_line_count(NULL) == 1, "text_buffer: line_count(NULL) 1");
+    test_check(axl_text_buffer_byte_at(NULL, 0) == -1, "text_buffer: byte_at(NULL) -1");
+
+    // OOM: new() and a grow that must leave the buffer intact.
+    axl_mem_fail_next_alloc(1);
+    test_check(axl_text_buffer_new(64) == NULL, "text_buffer: OOM on new -> NULL");
+
+    AxlTextBuffer *small = axl_text_buffer_new(2);
+    test_check(small != NULL, "text_buffer: new small");
+    axl_mem_fail_next_alloc(1);
+    test_check(axl_text_buffer_insert(small, 0, "abcdefghij", 10) == AXL_ERR,
+               "text_buffer: insert grow OOM -> ERR");
+    test_check(axl_text_buffer_length(small) == 0, "text_buffer: buffer intact after grow OOM");
+    axl_text_buffer_free(small);
+}
+
+// get_alloc + UTF-8 codepoint nav parity with AxlPieceTree.
+static void
+test_text_buffer_nav(void)
+{
+    AxlTextBuffer *tb = axl_text_buffer_new(0);
+    (void)axl_text_buffer_set_bytes(tb, "hello world", 11);
+
+    char *s = axl_text_buffer_get_alloc(tb, 0, 5);
+    test_check(s != NULL && axl_strcmp(s, "hello") == 0, "tb get_alloc: exact range");
+    axl_free(s);
+    s = axl_text_buffer_get_alloc(tb, 6, 999);
+    test_check(s != NULL && axl_strcmp(s, "world") == 0, "tb get_alloc: clamped to length");
+    axl_free(s);
+    s = axl_text_buffer_get_alloc(tb, 50, 5);
+    test_check(s != NULL && s[0] == '\0', "tb get_alloc: past end -> empty");
+    axl_free(s);
+    test_check(axl_text_buffer_get_alloc(NULL, 0, 1) == NULL, "tb get_alloc: NULL -> NULL");
+
+    /* a(1) é(2) €(3) 𐍈(4) b(1): boundaries 0,1,3,6,10,11 */
+    const unsigned char mb[] = { 'a', 0xC3,0xA9, 0xE2,0x82,0xAC, 0xF0,0x90,0x8D,0x88, 'b' };
+    (void)axl_text_buffer_set_bytes(tb, (const char *)mb, sizeof(mb));
+    size_t b[] = { 0, 1, 3, 6, 10, 11 };
+    bool fwd = true, bwd = true;
+    for (size_t i = 0; i + 1 < sizeof(b) / sizeof(b[0]); i++) {
+        if (axl_text_buffer_cp_next(tb, b[i]) != b[i + 1]) {
+            fwd = false;
+        }
+        if (axl_text_buffer_cp_prev(tb, b[i + 1]) != b[i]) {
+            bwd = false;
+        }
+    }
+    test_check(fwd && axl_text_buffer_cp_next(tb, 11) == 11, "tb cp_next: walks boundaries");
+    test_check(bwd && axl_text_buffer_cp_prev(tb, 0) == 0, "tb cp_prev: walks boundaries");
+    test_check(axl_text_buffer_cp_align(tb, 4) == 3 && axl_text_buffer_cp_align(tb, 5) == 3
+               && axl_text_buffer_cp_align(tb, 6) == 6,
+               "tb cp_align: snaps mid-codepoint down");
+    axl_text_buffer_free(tb);
+}
+
+// ---------------------------------------------------------------------------
 // Radix Tree Tests
 // ---------------------------------------------------------------------------
 
@@ -3759,6 +4431,11 @@ test_data_main(int argc, char **argv)
     test_str_test();
     test_json_escape();
     test_cache();
+    test_page_cache();
+    test_page_cache_multitenant();
+    test_rb_tree();
+    test_text_buffer();
+    test_text_buffer_nav();
     test_radix_tree();
     test_radix_tree_prefix();
     test_radix_tree_edge_split();

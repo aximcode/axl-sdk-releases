@@ -66,9 +66,9 @@ axl_image_load(
  * Mirrors @ref axl_driver_set_load_options for the image-level API:
  * installs @p data as the loaded image's
  * `EFI_LOADED_IMAGE_PROTOCOL.LoadOptions` so the started image sees
- * it via the same surface a shell launch would expose
- * (@ref axl_app_argc / @ref axl_app_argv on the loaded side, or the
- * raw byte buffer via @ref axl_driver_get_load_options_raw).
+ * it via the same surface a shell launch would expose (the `argc` /
+ * `argv` the loaded image's `main` receives, or the raw byte buffer via
+ * @ref axl_driver_get_load_options_raw).
  *
  * The data is copied internally — caller's buffer can be freed after.
  * The copy is owned by AXL and released by @ref axl_image_unload (or

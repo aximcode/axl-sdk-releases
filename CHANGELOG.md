@@ -3,6 +3,181 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 0.24.0 — 2026-06-01
+
+### Added
+
+- **`AxlRBTree`** (`<axl/axl-rb-tree.h>`) — a generic, intrusive,
+  augmentable red-black tree. The caller embeds an `AxlRBNode` in its own
+  struct (the tree never allocates nodes) and descends to the insertion
+  point itself, so one tree serves ordered maps, order-statistic trees,
+  and weighted positional trees. An optional `recompute` callback keeps a
+  cached subtree aggregate (size, byte/newline sums, …) exact across
+  every edit in O(log n). Distinct from `AxlTree` (a non-intrusive
+  key→value AVL map). Clean-room Apache-2.0 implementation.
+
+- **`AxlPieceTree`** (`<axl/axl-piece-tree.h>`) — an out-of-core,
+  editable text buffer for large files. The original file is read on
+  demand through `AxlFileView` while edits accumulate in an append-only
+  add buffer; a piece tree (spans in an `AxlRBTree` augmented with
+  subtree byte/newline sums) gives O(log n) offset↔line mapping and
+  edits, so editing a multi-gigabyte file costs memory proportional to
+  the edits, not the file. Streaming crash-safe `axl_piece_tree_save`.
+  **Built-in unlimited undo/redo** (`axl_piece_tree_undo` / `_redo`,
+  configurable depth, nestable grouping, and `_undo_checkpoint` for
+  accumulate-until-break / VS Code-style smart grouping) — zero-copy
+  because the buffers are immutable/append-only. Line semantics match
+  `AxlTextBuffer`
+  (interchangeable for a renderer); for memory-resident buffers use
+  `AxlTextBuffer`.
+
+- **`AxlTextBuffer`** (`<axl/axl-text-buffer.h>`) — a growable, editable
+  byte buffer with an integral line index, for interactive text editing:
+  a gap buffer for O(1) amortized inserts/deletes at a moving cursor,
+  plus an incrementally-maintained newline index giving O(log n)
+  byte-offset ↔ line-number mapping (`axl_text_buffer_line_of_offset` /
+  `_line_bounds` / `_line_count`). Byte-oriented (`'\n'` is the only
+  special byte); content is read out via `axl_text_buffer_get`. Mirrors the
+  piece tree's caret surface — `axl_text_buffer_get_alloc` and
+  `axl_text_buffer_cp_align` / `_cp_next` / `_cp_prev` (UTF-8 navigation) —
+  so one editor renderer can drive both the small in-memory fields and the
+  large out-of-core document.
+
+- **`axl_file_write_atomic`** — crash-safe whole-file write: writes to a
+  temp sibling, flushes, then replaces the target by rename, so a power
+  loss never leaves the target half-written (the complete data is always
+  in either the target or `<path>.tmp`). Cleans up the temp on failure.
+  Builds on the existing `axl_file_rename` / `axl_file_delete`.
+
+- **`AxlPageCache`** (`<axl/axl-page-cache.h>`) — a fixed-capacity LRU
+  cache of equal-sized pages backed by a caller-supplied fill function.
+  Zero-copy: a lookup returns a borrowed pointer into the resident
+  frame; on a miss the least-recently-used frame is evicted and refilled
+  in place. Capacity-only and integer-indexed, distinct from the TTL,
+  string-keyed, copy-in/copy-out `AxlCache`. Windows any large,
+  randomly-addressed backing store where only the hot pages should stay
+  resident.
+
+- **`AxlFileView`** (`<axl/axl-file-view.h>`) — an mmap-like windowed
+  view over a file, built on `AxlPageCache` + `axl_pread`. The file is
+  never loaded whole; only the hot pages are resident. `axl_file_view_read`
+  copies a range out (spans pages, clamps at EOF) and `axl_file_view_page`
+  borrows a zero-copy pointer into one resident page. The software-cache
+  design is deliberate: MMU demand paging is unworkable in UEFI (a fault
+  handler would block on filesystem I/O outside the TPL model, and a FAT
+  file has no physical backing to zero-copy map), so a "real" mmap would
+  copy pages in through the FS driver anyway.
+
+- **`AxlPieceTree` editor substrate** — additions that turn the piece
+  tree into the backing store for a VS Code / Notepad++-class editor:
+  - **Search** — `axl_piece_tree_find(pt, needle, len, from, flags, *out)`
+    finds a byte substring across the virtual document (cross-piece),
+    with `AXL_FIND_CASE_INSENSITIVE` / `_BACKWARD` / `_WHOLE_WORD`. Backed
+    by the same Boyer–Moore–Horspool engine `grep` uses (sub-linear
+    average) — via `axl_strstr_len` / `axl_strcasestr_len` (forward) and
+    `axl_strrstr_len` / `axl_strrcasestr_len` (backward); a byte-exact
+    fallback preserves needles that contain a NUL.
+  - **Dirty tracking** — `axl_piece_tree_is_modified` is save-point aware
+    (cleared by save / load, set by edits, cleared again when undo/redo
+    returns to the saved state).
+  - **Batch edits** — `axl_piece_tree_apply_edits(pt, AxlEdit[], n)`
+    applies a set of original-coordinate edits as one undo group
+    (replace-all, multi-cursor, column edit).
+  - **Line iterator** — `axl_piece_tree_line_iter_init` / `_next`
+    (`AxlPieceLineIter`) for one O(n) pass over every line;
+    `axl_piece_tree_line_iter_init_at(pt, it, start_line)` starts deep in a
+    file in O(log n) (render a viewport without walking earlier lines).
+  - **Caret support** — `axl_piece_tree_undo` / `_redo` report the
+    affected range (`affected_offset` + `affected_len`, both optional) so
+    the editor can place the caret / re-select at the edit site;
+    `axl_piece_tree_cp_align` / `_cp_next` / `_cp_prev` step UTF-8
+    codepoint boundaries (caret left/right, click-to-offset snapping);
+    `axl_piece_tree_get_alloc` returns a malloc'd NUL-terminated copy of a
+    range (selection-copy / measurement).
+  - **Encoding-aware I/O** — `axl_piece_tree_load_encoded` detects a
+    file's encoding (UTF-8 ± BOM, UTF-16 LE/BE) and decodes to a UTF-8
+    document — plain UTF-8 stays out-of-core, others are transcoded
+    (surrogate-aware) into a memory-resident document — reporting the
+    detected encoding + BOM so `axl_piece_tree_save_encoded` can
+    round-trip them (crash-safe write; plain UTF-8 streams via
+    `axl_piece_tree_save`).
+  - **Line endings** — `axl_piece_tree_detect_eol` classifies the
+    document's terminators (`AXL_EOL_LF` / `CRLF` / `CR` / `MIXED`);
+    `axl_piece_tree_set_eol` makes save normalize every terminator to a
+    chosen style while streaming (line-ending conversion without
+    materializing); and `line_bounds` / the line iterator now exclude a
+    trailing `\r` of a CRLF pair so a renderer gets clean line content.
+  - **Read-only mode** — `axl_piece_tree_set_read_only` /
+    `_is_read_only` make insert / delete / apply_edits return AXL_ERR
+    without changing the document (reads, search, and save still work).
+  - **Backing-change detection** — `axl_piece_tree_backing_changed`
+    compares the backing file's current size / mtime against the values
+    captured at open, so an out-of-core editor can detect an external
+    change (or deletion) and offer a reload.
+  - **Shared page cache** — `axl_piece_tree_open_cached(path, cache)`
+    opens a document out-of-core borrowing a caller-owned shared
+    `AxlPageCache`, so one bounded frame budget serves many open files.
+  - **Save-over-self recipe** (documented, no new API) — saving over the
+    open out-of-core file is a rebase; the consumer composes
+    `save`→`free`→`axl_file_move`→`open` (undo resets, reopened document
+    is a bounded single piece), or Save-As to a new path (keeps undo).
+    See `src/data/README.md`.
+
+- **Multi-tenant `AxlPageCache`** — `axl_page_cache_new_shared` creates a
+  fill-less cache that several owners share through `axl_page_cache_fetch`
+  (keyed by `(owner, page_index)`, one global LRU, fill supplied per
+  call); `axl_page_cache_drop_owner` reclaims a closing owner's frames.
+  The single-tenant `axl_page_cache_get` is now the same primitive with
+  the cache as its own owner. `axl_file_view_open_cached(path, cache)`
+  opens a view that borrows a shared cache (dropping only its own frames
+  on close) — so an editor caps total resident pages across every open
+  file instead of giving each its own fixed pool.
+
+- **UTF-16 ↔ UTF-8 transcoding** (`<axl/axl-str.h>`) —
+  `axl_utf16_to_utf8` / `axl_utf8_to_utf16`: surrogate-aware,
+  length-counted (NUL is not a terminator), with a NULL-destination
+  measuring mode and clean truncation on a codepoint boundary. Unlike the
+  BMP-only UCS-2 helpers these handle U+10000..U+10FFFF.
+
+- **`axl_strrcasestr` / `axl_strrcasestr_len`** (`<axl/axl-str.h>`) —
+  reverse (last-occurrence) case-insensitive substring search, completing
+  the {forward, reverse} × {sensitive, insensitive} family (the missing
+  fourth corner — used by `AxlPieceTree`'s backward case-insensitive find).
+
+- **`axl_detect_encoding`** (`<axl/axl-stream.h>`) — sniff a text file's
+  encoding from a leading sample: UTF-8 / UTF-16 LE / UTF-16 BE BOM, then
+  a BOM-less interleaved-NUL heuristic, reporting whether a BOM was
+  present (so a caller can round-trip it on save).
+
+- **`AxlShm`** (`<axl/axl-shm.h>`) — boot-persistent named shared memory,
+  the UEFI analog of POSIX `shm_open` + `mmap` (or System V
+  `shmget`/`shmat`). `axl_shm_open(name, size, flags, &size)` creates or
+  opens a fixed-size region that **outlives the app that created it** and
+  is reachable by any later app in the same boot; `axl_shm_unlink` /
+  `axl_shm_exists` round it out. UEFI's single flat address space means
+  there is no map/attach step — the returned pointer *is* the region.
+  Volatile (boot-services RAM; gone at reboot / `ExitBootServices`) — not
+  NVRAM, no flash wear, capacity is system RAM. The name is hashed to a
+  GUID and the region published as a data-only protocol from
+  `EfiBootServicesData`, which survives image unload.
+
+- **`AxlClipboard`** (`<axl/axl-clipboard.h>`) — a cut / copy / paste
+  clipboard (UEFI has no system one). One owned byte buffer plus an
+  optional MIME type: `axl_clipboard_set` copies bytes in (OOM leaves the
+  prior clipboard intact), `axl_clipboard_get` borrows a pointer valid
+  until the next set/clear, and `axl_clipboard_clear` empties it.
+  Byte-oriented and content-agnostic (text, a UTF-16 region, a serialized
+  selection, an image). Backed by an `AxlShm` segment, so it is
+  **cross-app within a boot** — copy in one app, paste in another, with no
+  driver.
+
+- **`clip` / `paste` tools** — command-line clipboard front end
+  (pbcopy / pbpaste for UEFI): `some-tool | clip` copies stdin to the
+  clipboard (`-m` tags a MIME type, `--clear` empties it); `paste` writes
+  the clipboard to stdout (`--mime` prints the MIME type). Because the
+  clipboard is `AxlShm`-backed, `clip` and `paste` are separate
+  invocations that share it across the boot.
+
 ## 0.23.0 — 2026-06-01
 
 ### Added

@@ -240,6 +240,10 @@ LIB_SOURCES = \
     src/data/axl-xml-writer.c \
     src/data/axl-xml-parse.c \
     src/data/axl-cache.c \
+    src/data/axl-page-cache.c \
+    src/data/axl-text-buffer.c \
+    src/data/axl-rb-tree.c \
+    src/data/axl-piece-tree.c \
     src/data/axl-radix-tree.c \
     src/data/axl-ntree.c \
     src/data/axl-tree.c \
@@ -253,6 +257,7 @@ LIB_SOURCES = \
     src/stream/axl-stream-file.c \
     src/stream/axl-stream-text.c \
     src/fs/axl-fs.c \
+    src/fs/axl-file-view.c \
     src/fs/axl-fs-provider.c \
     src/fs/axl-device-path.c \
     src/util/axl-path.c \
@@ -278,6 +283,8 @@ LIB_SOURCES = \
     src/util/axl-sort.c \
     src/util/axl-console.c \
     src/util/axl-image-verify.c \
+    src/util/axl-clipboard.c \
+    src/util/axl-shm.c \
     src/smbios/axl-smbios.c \
     src/acpi/axl-acpi.c \
     src/acpi/axl-acpi-mcfg.c \
@@ -1085,7 +1092,7 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
         AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider \
         AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath \
-        AxlTestInput
+        AxlTestInput AxlTestFileView AxlTestPieceTree
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1123,12 +1130,14 @@ $(eval $(call BUILD_TEST,AxlTestTruetype,axl-test-truetype))
 $(eval $(call BUILD_TEST,AxlTestPixmap,axl-test-pixmap))
 $(eval $(call BUILD_TEST,AxlTestMath,axl-test-math))
 $(eval $(call BUILD_TEST,AxlTestInput,axl-test-input))
+$(eval $(call BUILD_TEST,AxlTestFileView,axl-test-file-view))
+$(eval $(call BUILD_TEST,AxlTestPieceTree,axl-test-piece-tree))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: all $(TOOL_EFIS)

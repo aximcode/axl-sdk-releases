@@ -259,7 +259,7 @@ axl_exp(
 double
 axl_pow(
     double  base,      ///< must be `>= 0`
-    double  exponent
+    double  exponent   ///< the exponent (any real)
     );
 
 // ===================================================================
@@ -1003,7 +1003,7 @@ axl_transform_map_rect(
 /// loose.
 void
 axl_transform_map_quad(
-    AxlTransform   m,
+    AxlTransform   m,        ///< transform to apply
     const AxlVec2  in[4],    ///< [in] four source points
     AxlVec2        out[4]    ///< [out] four mapped points
     );
@@ -1091,10 +1091,10 @@ axl_rect_union(
 ///          collinear-overlap matters.
 bool
 axl_segment_intersect(
-    AxlVec2   a1,
-    AxlVec2   a2,
-    AxlVec2   b1,
-    AxlVec2   b2,
+    AxlVec2   a1,   ///< first segment, endpoint 1
+    AxlVec2   a2,   ///< first segment, endpoint 2
+    AxlVec2   b1,   ///< second segment, endpoint 1
+    AxlVec2   b2,   ///< second segment, endpoint 2
     AxlVec2  *out  ///< optional, may be NULL
     );
 

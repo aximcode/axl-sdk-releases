@@ -268,6 +268,7 @@ ships these `.efi` binaries:
 | Tool       | Description |
 |------------|-------------|
 | `cat`      | Concatenate files to stdout (UEFI `cat(1)` equivalent). |
+| `clip`     | Copy stdin to the AXL clipboard (`pbcopy`-style) — `some-tool \| clip`, `-m` MIME tag, `--clear`. Cross-app within a boot (AxlShm-backed). |
 | `dmidecode`| SMBIOS / DMI table decoder (UEFI `dmidecode(8)` equivalent) — dumps every record or filter by `-t <type>`; single-value query via `-s <keyword>` (`bios-vendor`, `system-uuid`, etc.). |
 | `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
 | `find`     | Recursive file and directory finder — glob patterns (`--name '*.efi'`) and type filter (`--type f` or `d`). UEFI `find(1)` equivalent. |
@@ -279,6 +280,7 @@ ships these `.efi` binaries:
 | `memspd`   | DDR4/DDR5 SPD reader over the platform SMBus — `list` populated slots, `show <slot>` decoded fields, `decode <slot>` raw hex + decoded. JEDEC manufacturer codes resolved via `jedec.json5`. |
 | `mkrd`     | Create / list / destroy FAT16/FAT32 RAM disks in the UEFI Shell (`mkrd <label> [-s size]`, `-l`, `-d <label>`). Handy for staging files without writing to flash. |
 | `netinfo`  | Network interface diagnostics and ping — lists NICs with IP/MAC/link state, pings with `-c <count>`. UEFI `ifconfig`/`ping` equivalent. |
+| `paste`    | Print the AXL clipboard to stdout (`pbpaste`-style) — `paste > file`, `--mime` prints the MIME type. Reads what a separate `clip` stored in the same boot. |
 | `rfbrowse` | Redfish browser — connects to a BMC over HTTPS and walks resources interactively (shortcut verbs for `/Systems`, `/Managers`, etc., plus arbitrary paths). |
 | `sysinfo`  | System inventory summary — compact `cpu`, `mem`, `fw`, `smbios`, `arch` subsections. Use `dmidecode` for the full per-record dump. |
 

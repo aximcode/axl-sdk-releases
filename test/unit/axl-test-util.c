@@ -5,6 +5,8 @@
 #include "axl-test.h"
 #include <axl/axl-smbios.h>
 #include <axl/axl-sort.h>
+#include <axl/axl-clipboard.h>
+#include <axl/axl-shm.h>
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -6110,11 +6112,214 @@ test_qsort_with_data_descending(void)
 // Entry Point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Clipboard (D1)
+// ---------------------------------------------------------------------------
+
+static void
+test_clipboard(void)
+{
+    axl_clipboard_clear();   /* known-empty start (process-global) */
+
+    size_t      len = 99;
+    const char *mime = (const char *)1;
+    const void *p = axl_clipboard_get(&len, &mime);
+    test_check(p == NULL && len == 0 && mime == NULL, "clipboard: empty after clear");
+
+    /* set copies the bytes in (ownership) */
+    char src[] = "hello";
+    test_check(axl_clipboard_set(src, 5, NULL) == AXL_OK, "clipboard: set ok");
+    src[0] = 'X';            /* mutate source: stored copy must be unaffected */
+    p = axl_clipboard_get(&len, &mime);
+    test_check(p != NULL && len == 5 && axl_memcmp(p, "hello", 5) == 0,
+               "clipboard: get returns an owned copy of the bytes");
+    test_check(mime == NULL, "clipboard: no mime -> NULL");
+
+    /* mime stored + readable; out_mime optional */
+    test_check(axl_clipboard_set("data", 4, "text/plain") == AXL_OK, "clipboard: set with mime");
+    p = axl_clipboard_get(&len, &mime);
+    test_check(len == 4 && axl_memcmp(p, "data", 4) == 0 && mime != NULL
+               && axl_strcmp(mime, "text/plain") == 0, "clipboard: mime round-trips");
+    test_check(axl_clipboard_get(&len, NULL) != NULL, "clipboard: NULL out_mime allowed");
+
+    /* set replaces previous contents and drops the previous mime */
+    test_check(axl_clipboard_set("cd", 2, NULL) == AXL_OK, "clipboard: replace");
+    p = axl_clipboard_get(&len, &mime);
+    test_check(len == 2 && axl_memcmp(p, "cd", 2) == 0 && mime == NULL,
+               "clipboard: replacing without mime clears the old mime");
+
+    /* binary payload with an embedded NUL survives intact */
+    const unsigned char bin[] = { 0x00, 0x01, 0xFF, 0x00, 0x42 };
+    test_check(axl_clipboard_set(bin, sizeof(bin), "application/octet-stream") == AXL_OK,
+               "clipboard: set binary");
+    p = axl_clipboard_get(&len, &mime);
+    test_check(len == sizeof(bin) && axl_memcmp(p, bin, sizeof(bin)) == 0,
+               "clipboard: embedded NUL preserved");
+
+    /* invalid args leave the clipboard unchanged */
+    test_check(axl_clipboard_set(NULL, 5, NULL) == AXL_ERR, "clipboard: NULL data with len -> ERR");
+    p = axl_clipboard_get(&len, NULL);
+    test_check(len == sizeof(bin) && p != NULL, "clipboard: unchanged after invalid set");
+
+    /* OOM atomicity: a failed set leaves the prior clipboard intact. The
+       scratch image buffer is set's first allocation (before any shm call),
+       so failing it is deterministic and never touches the live segment. */
+    test_check(axl_clipboard_set("keep", 4, "m/keep") == AXL_OK, "clipboard: seed for OOM test");
+    axl_mem_fail_next_alloc(1);                          /* fail the image buffer */
+    test_check(axl_clipboard_set("lost", 4, NULL) == AXL_ERR,
+               "clipboard: set fails when the image buffer can't be allocated");
+    p = axl_clipboard_get(&len, &mime);
+    test_check(len == 4 && axl_memcmp(p, "keep", 4) == 0 && mime != NULL
+               && axl_strcmp(mime, "m/keep") == 0,
+               "clipboard: prior contents intact when set's allocation fails");
+
+    /* empty payload (NULL data, 0 len) is valid */
+    test_check(axl_clipboard_set(NULL, 0, NULL) == AXL_OK, "clipboard: empty set ok");
+    p = axl_clipboard_get(&len, &mime);
+    test_check(p == NULL && len == 0, "clipboard: empty payload reads back empty");
+
+    axl_clipboard_clear();
+    p = axl_clipboard_get(&len, &mime);
+    test_check(p == NULL && len == 0 && mime == NULL, "clipboard: clear empties");
+}
+
+/* Hand-build a clipboard segment to exercise the reader's robustness.
+   White-box: the layout is [u32 struct_size=16][u32 mime_len][u64 data_len]
+   [data][mime] (little-endian; both target arches are LE). */
+static uint8_t *
+craft_clip_segment(size_t data_len, size_t mime_len)
+{
+    (void)axl_clipboard_clear();
+    uint8_t *seg = (uint8_t *)axl_shm_open("axl/clipboard", 16 + data_len + mime_len,
+                                           AXL_SHM_CREATE, NULL);
+    if (seg == NULL) {
+        return NULL;
+    }
+    axl_memset(seg, 0, 16);
+    seg[0] = 16;                                   /* struct_size = 16 */
+    seg[4] = (uint8_t)mime_len;                    /* mime_len (small) */
+    seg[8] = (uint8_t)data_len;                    /* data_len (small) */
+    return seg;
+}
+
+static void
+test_clipboard_corrupt(void)
+{
+    /* A valid hand-built segment reads back, proving the layout matches. */
+    uint8_t *seg = craft_clip_segment(1, 3);
+    if (seg == NULL) {
+        axl_printf("SKIP: clipboard corrupt-segment test (shm unavailable)\n");
+        return;
+    }
+    seg[16] = 'A';
+    seg[17] = 'b'; seg[18] = 'c'; seg[19] = '\0';  /* mime "bc" (NUL-terminated) */
+    size_t len = 0;
+    const char *mime = NULL;
+    const void *p = axl_clipboard_get(&len, &mime);
+    test_check(p != NULL && len == 1 && axl_memcmp(p, "A", 1) == 0
+               && mime != NULL && axl_strcmp(mime, "bc") == 0,
+               "clipboard: hand-built segment reads back (layout sanity)");
+
+    /* The same segment without a terminating NUL in the MIME window must be
+       rejected (a corrupt/foreign segment must not OOB-scan via %s). */
+    seg = craft_clip_segment(1, 3);
+    seg[16] = 'A';
+    seg[17] = 'b'; seg[18] = 'c'; seg[19] = 'x';   /* mime "bcx" — no NUL */
+    len = 99;
+    mime = (const char *)1;
+    p = axl_clipboard_get(&len, &mime);
+    test_check(p == NULL && len == 0 && mime == NULL,
+               "clipboard: non-NUL-terminated MIME segment rejected as empty");
+    (void)axl_clipboard_clear();
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory (axl-shm)
+// ---------------------------------------------------------------------------
+
+#define SHM_A "axl/test/shm.a"
+#define SHM_B "axl/test/shm.b"
+
+static void
+test_shm(void)
+{
+    /* clean slate (a prior assertion in this boot may have created it) */
+    (void)axl_shm_unlink(SHM_A);
+    (void)axl_shm_unlink(SHM_B);
+
+    size_t sz = 12345;
+    test_check(axl_shm_open(SHM_A, 128, 0, &sz) == NULL,
+               "shm: open missing without CREATE -> NULL");
+    test_check(!axl_shm_exists(SHM_A, NULL), "shm: exists(missing) -> false");
+
+    /* create */
+    sz = 0;
+    uint8_t *p = (uint8_t *)axl_shm_open(SHM_A, 128, AXL_SHM_CREATE, &sz);
+    test_check(p != NULL && sz == 128, "shm: create returns region + size");
+    bool zeroed = true;
+    for (size_t i = 0; i < 128; i++) {
+        if (p[i] != 0) {
+            zeroed = false;
+        }
+    }
+    test_check(zeroed, "shm: freshly created region is zeroed");
+
+    /* write a pattern, reopen, confirm same pointer + persisted bytes */
+    for (size_t i = 0; i < 128; i++) {
+        p[i] = (uint8_t)(i * 7u + 3u);
+    }
+    size_t sz2 = 0;
+    uint8_t *p2 = (uint8_t *)axl_shm_open(SHM_A, 9999, 0, &sz2);  /* size ignored on existing */
+    test_check(p2 == p && sz2 == 128, "shm: reopen returns the same region + size");
+    bool same = true;
+    for (size_t i = 0; i < 128; i++) {
+        if (p2[i] != (uint8_t)(i * 7u + 3u)) {
+            same = false;
+        }
+    }
+    test_check(same, "shm: bytes persist across opens");
+
+    test_check(axl_shm_exists(SHM_A, &sz2) && sz2 == 128, "shm: exists(present) -> true + size");
+
+    /* CREATE on an existing segment returns it (ignores size); EXCL fails */
+    test_check(axl_shm_open(SHM_A, 64, AXL_SHM_CREATE, NULL) == p,
+               "shm: CREATE on existing returns it");
+    test_check(axl_shm_open(SHM_A, 64, AXL_SHM_CREATE | AXL_SHM_EXCL, NULL) == NULL,
+               "shm: CREATE|EXCL on existing -> NULL");
+
+    /* a different name is an independent segment */
+    uint8_t *pb = (uint8_t *)axl_shm_open(SHM_B, 64, AXL_SHM_CREATE, NULL);
+    test_check(pb != NULL && pb != p, "shm: distinct name -> distinct region");
+
+    /* unlink removes it; reopen misses; double-unlink is a no-op */
+    test_check(axl_shm_unlink(SHM_A) == AXL_OK, "shm: unlink");
+    test_check(!axl_shm_exists(SHM_A, NULL), "shm: gone after unlink");
+    test_check(axl_shm_open(SHM_A, 0, 0, NULL) == NULL, "shm: open after unlink -> NULL");
+    test_check(axl_shm_unlink(SHM_A) == AXL_OK, "shm: unlink(absent) -> OK");
+
+    /* recreate after unlink yields a fresh zeroed region */
+    uint8_t *p3 = (uint8_t *)axl_shm_open(SHM_A, 16, AXL_SHM_CREATE, &sz2);
+    test_check(p3 != NULL && sz2 == 16 && p3[0] == 0 && p3[15] == 0,
+               "shm: recreate after unlink is fresh + zeroed");
+
+    /* NULL-name guards */
+    test_check(axl_shm_open(NULL, 8, AXL_SHM_CREATE, NULL) == NULL, "shm: NULL name open -> NULL");
+    test_check(!axl_shm_exists(NULL, NULL), "shm: NULL name exists -> false");
+    test_check(axl_shm_unlink(NULL) == AXL_ERR, "shm: NULL name unlink -> ERR");
+
+    (void)axl_shm_unlink(SHM_A);
+    (void)axl_shm_unlink(SHM_B);
+}
+
 int
 test_util_main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     test_print_header("AxlUtil");
+
+    test_clipboard();
+    test_clipboard_corrupt();
+    test_shm();
 
     test_file();
     test_seek_tell();

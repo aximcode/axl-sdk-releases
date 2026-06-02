@@ -896,6 +896,69 @@ axl_path_resolve("fs0:/app", "../config/app.cfg",
 // resolved = "fs0:/config/app.cfg"
 ```
 
+## Shared memory (AxlShm)
+
+`<axl/axl-shm.h>` is the UEFI analog of POSIX `shm_open` + `mmap` (or
+System V `shmget`/`shmat`): a **named, fixed-size memory region that
+outlives the app that created it** and is reachable by any later app in
+the same boot. UEFI is one flat, identity-mapped address space, so there
+is no per-process mapping — `axl_shm_open` returns a pointer that *is* the
+region (map/attach collapse to nothing). The region lives in boot-services
+RAM, so it is volatile (gone at reboot / `ExitBootServices`) — not NVRAM,
+no flash wear, and its capacity is system RAM rather than the tiny
+firmware variable store.
+
+```c
+size_t sz;
+// First app: create + write.
+uint8_t *r = axl_shm_open("myapp/scratch", 4096, AXL_SHM_CREATE, &sz);
+r[0] = 0x42;
+
+// A later app in the same boot: open + read the same region.
+uint8_t *r2 = axl_shm_open("myapp/scratch", 0, 0, &sz);   // r2[0] == 0x42
+
+axl_shm_unlink("myapp/scratch");        // destroy when done
+```
+
+The name is hashed to a GUID (`axl_guid_v5`) and the region published as a
+UEFI protocol, so it resolves across images with no shared handle. The
+trick that makes it survive an image unload: the region is a *data-only*
+pool allocation (it never holds function pointers, which would dangle once
+the creating image is gone) from `EfiBootServicesData`, which the firmware
+does not reclaim on unload. Names are one global namespace (like POSIX
+`/name`) — prefix yours. Single-threaded: no locking; in the shell apps
+run one at a time.
+
+## Clipboard
+
+UEFI has no system clipboard, so an editor that wants copy/paste needs
+one. `AxlClipboard` is an owned byte buffer with an optional MIME type:
+`axl_clipboard_set` copies bytes in (replacing the previous contents),
+`axl_clipboard_get` borrows a pointer to them (valid until the next
+set/clear), and `axl_clipboard_clear` empties it. Byte-oriented and
+content-agnostic — store UTF-8 text, a UTF-16 region, a serialized
+selection, or an image, and tag it with a MIME type the paste side can
+check.
+
+```c
+axl_clipboard_set("hello", 5, "text/plain;charset=utf-8");
+
+size_t len;
+const char *mime;
+const void *data = axl_clipboard_get(&len, &mime);   // borrowed, len bytes
+// ... paste data[0..len) ...
+
+axl_clipboard_clear();
+```
+
+Header: `<axl/axl-clipboard.h>`
+
+The clipboard is backed by an [AxlShm](#shared-memory-axlshm) segment
+(`"axl/clipboard"`), so it is **cross-app within a boot**: copy in one app
+and paste in another, no driver. The `clip` and `paste` tools are the
+command-line front end (`some-tool | clip`, `paste > file`) — pbcopy /
+pbpaste for UEFI.
+
 ## Synchronization primitives
 
 AxlCompletion / AxlCancellable / axl_wait_* and the foundational

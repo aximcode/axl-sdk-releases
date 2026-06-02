@@ -265,3 +265,59 @@ axl_strcasestr_len(
 
     return NULL;
 }
+
+char *
+axl_strrcasestr_len(const char *haystack, long long haystack_len, const char *needle)
+{
+    if (haystack == NULL || needle == NULL) {
+        return NULL;
+    }
+
+    size_t n_len = axl_strlen(needle);
+    if (n_len == 0) {
+        return (char *)haystack;
+    }
+
+    size_t h_len = (haystack_len < 0)
+                 ? axl_strlen(haystack)
+                 : (size_t)haystack_len;
+
+    if (n_len > h_len) {
+        return NULL;
+    }
+
+    /* Reverse scan with per-byte case fold (mirror of axl_strrstr_len,
+       which is likewise a naive reverse walk — reverse search is the cold
+       direction, so it doesn't carry the forward path's BMH skip table). */
+    for (size_t i = h_len - n_len; ; i--) {
+        size_t k = 0;
+        while (k < n_len) {
+            unsigned char ch = (unsigned char)axl_tolower((unsigned char)haystack[i + k]);
+            unsigned char cn = (unsigned char)axl_tolower((unsigned char)needle[k]);
+            if (ch != cn) {
+                break;
+            }
+            k++;
+        }
+        if (k == n_len) {
+            return (char *)(haystack + i);
+        }
+        if (i == 0) {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+char *
+axl_strrcasestr(const char *haystack, const char *needle)
+{
+    if (haystack == NULL || needle == NULL) {
+        return NULL;
+    }
+    if (needle[0] == '\0') {
+        return (char *)(haystack + axl_strlen(haystack));
+    }
+    return axl_strrcasestr_len(haystack, (long long)axl_strlen(haystack), needle);
+}

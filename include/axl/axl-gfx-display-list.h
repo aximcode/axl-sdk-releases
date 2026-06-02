@@ -337,10 +337,10 @@ axl_gfx_dl_draw_rect(
 /// `axl_gfx_draw_polyline`).
 int
 axl_gfx_dl_draw_polyline(
-    AxlGfxDisplayList  *dl,
+    AxlGfxDisplayList  *dl,       ///< target display list
     const AxlGfxPoint  *points,   ///< [in] copied into the list
     size_t              count,    ///< number of points (>= 2)
-    AxlGfxPixel         color
+    AxlGfxPixel         color     ///< line color
     );
 
 /// Record `axl_gfx_blit`.  Copies @a w * @a h pixels from @a buffer.
@@ -348,12 +348,12 @@ axl_gfx_dl_draw_polyline(
 /// AXL_ERR if @a buffer is NULL or @a w / @a h is 0.
 int
 axl_gfx_dl_blit(
-    AxlGfxDisplayList  *dl,
+    AxlGfxDisplayList  *dl,       ///< target display list
     const AxlGfxPixel  *buffer,   ///< [in] copied into the list
-    uint32_t            x,
-    uint32_t            y,
-    uint32_t            w,
-    uint32_t            h
+    uint32_t            x,        ///< destination x (top-left)
+    uint32_t            y,        ///< destination y (top-left)
+    uint32_t            w,        ///< source width in pixels
+    uint32_t            h         ///< source height in pixels
     );
 
 /// Record a clear of the active draw target to @a color.
@@ -386,9 +386,9 @@ axl_gfx_dl_pop_clip(
 /// AXL_ERR if @a path is NULL.
 int
 axl_gfx_dl_fill_path(
-    AxlGfxDisplayList  *dl,
+    AxlGfxDisplayList  *dl,      ///< target display list
     const AxlGfxPath   *path,    ///< borrowed (caller-owned)
-    AxlGfxPixel         color
+    AxlGfxPixel         color    ///< fill color
     );
 
 /// Record `axl_gfx_stroke_path_ex`.  Borrows @a path; copies @a style
@@ -397,9 +397,9 @@ axl_gfx_dl_fill_path(
 /// AXL_ERR if @a path or @a style is NULL, or on allocation failure.
 int
 axl_gfx_dl_stroke_path(
-    AxlGfxDisplayList        *dl,
+    AxlGfxDisplayList        *dl,      ///< target display list
     const AxlGfxPath         *path,    ///< borrowed (caller-owned)
-    AxlGfxPixel               color,
+    AxlGfxPixel               color,   ///< stroke color
     const AxlGfxStrokeStyle  *style    ///< [in] copied (dashes deep-copied)
     );
 
@@ -421,13 +421,13 @@ axl_gfx_dl_fill_rounded_rect(
 /// AXL_ERR if @a font or @a text is NULL.
 int
 axl_gfx_dl_draw_text(
-    AxlGfxDisplayList  *dl,
+    AxlGfxDisplayList  *dl,      ///< target display list
     const AxlFont      *font,    ///< borrowed (caller-owned)
-    uint32_t            x,
-    uint32_t            y,
+    uint32_t            x,       ///< pen x (top-left of the text)
+    uint32_t            y,       ///< pen y (top-left of the text)
     const char         *text,    ///< [in] copied into the list
-    AxlGfxPixel         color,
-    uint32_t            scale
+    AxlGfxPixel         color,   ///< text color
+    uint32_t            scale    ///< integer pixel scale (1 = native)
     );
 
 /// Record `axl_ttf_draw` (vector text).  Borrows @a ttf; copies
@@ -436,13 +436,13 @@ axl_gfx_dl_draw_text(
 /// AXL_ERR if @a ttf or @a text is NULL.
 int
 axl_gfx_dl_draw_text_ttf(
-    AxlGfxDisplayList  *dl,
+    AxlGfxDisplayList  *dl,      ///< target display list
     AxlTtf             *ttf,     ///< borrowed (caller-owned)
-    int32_t             x,
-    int32_t             y,
+    int32_t             x,       ///< baseline origin x
+    int32_t             y,       ///< baseline origin y
     const char         *text,    ///< [in] copied into the list
-    float               px_size,
-    AxlGfxPixel         color
+    float               px_size, ///< text size in pixels (em height)
+    AxlGfxPixel         color    ///< text color
     );
 
 // ===================================================================
@@ -454,11 +454,11 @@ axl_gfx_dl_draw_text_ttf(
 /// AXL_ERR if @a dl or @a g is NULL.
 int
 axl_gfx_dl_fill_rect_gradient(
-    AxlGfxDisplayList     *dl,
-    int32_t                x,
-    int32_t                y,
-    int32_t                w,
-    int32_t                h,
+    AxlGfxDisplayList     *dl,     ///< target display list
+    int32_t                x,      ///< rect x (top-left)
+    int32_t                y,      ///< rect y (top-left)
+    int32_t                w,      ///< rect width
+    int32_t                h,      ///< rect height
     const AxlGfxGradient  *g       ///< borrowed (caller-owned)
     );
 
@@ -467,7 +467,7 @@ axl_gfx_dl_fill_rect_gradient(
 /// AXL_ERR if @a dl, @a path, or @a g is NULL.
 int
 axl_gfx_dl_fill_path_gradient(
-    AxlGfxDisplayList     *dl,
+    AxlGfxDisplayList     *dl,      ///< target display list
     const AxlGfxPath      *path,    ///< borrowed (caller-owned)
     const AxlGfxGradient  *g        ///< borrowed (caller-owned)
     );
@@ -477,12 +477,12 @@ axl_gfx_dl_fill_path_gradient(
 /// AXL_ERR if @a dl or @a g is NULL.
 int
 axl_gfx_dl_fill_rounded_rect_gradient(
-    AxlGfxDisplayList     *dl,
-    int32_t                x,
-    int32_t                y,
-    int32_t                w,
-    int32_t                h,
-    float                  radius,
+    AxlGfxDisplayList     *dl,      ///< target display list
+    int32_t                x,       ///< rect x (top-left)
+    int32_t                y,       ///< rect y (top-left)
+    int32_t                w,       ///< rect width
+    int32_t                h,       ///< rect height
+    float                  radius,  ///< corner radius in pixels
     const AxlGfxGradient  *g        ///< borrowed (caller-owned)
     );
 

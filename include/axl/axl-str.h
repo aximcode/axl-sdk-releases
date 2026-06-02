@@ -583,6 +583,38 @@ axl_strcasestr_len(
     const char *needle
 );
 
+/**
+ * @brief Case-insensitive last-occurrence substring search.
+ *
+ * The reverse counterpart of axl_strcasestr: finds the LAST occurrence of
+ * @a needle in @a haystack ignoring ASCII letter case. NULL-safe.
+ *
+ * @return pointer to the highest-offset match, or NULL if not found.
+ */
+char *
+axl_strrcasestr(
+    const char *haystack,  ///< string to search
+    const char *needle     ///< substring to find (case-insensitive)
+);
+
+/**
+ * @brief Length-bounded case-insensitive last-occurrence search.
+ *
+ * Like axl_strrcasestr but treats @a haystack as a byte slice of
+ * @a haystack_len bytes (no NUL terminator required); pass `-1` for
+ * NUL-terminated semantics. The case-insensitive, reverse analogue of
+ * axl_strstr_len — completes the {forward,reverse}×{sensitive,insensitive}
+ * search family (e.g. for a backward case-insensitive editor find).
+ *
+ * @return pointer to the highest-offset match, or NULL if not found.
+ */
+char *
+axl_strrcasestr_len(
+    const char *haystack,      ///< string to search
+    long long   haystack_len,  ///< max bytes to search (-1 for all)
+    const char *needle         ///< substring to find (case-insensitive)
+);
+
 // ---------------------------------------------------------------------------
 // String testing
 // ---------------------------------------------------------------------------
@@ -814,6 +846,49 @@ axl_ucs2_to_utf8_buf(
     const unsigned short *src,       ///< UCS-2 source string
     char                 *dst,       ///< destination UTF-8 buffer
     size_t                dst_size   ///< capacity of @a dst in bytes (including NUL)
+);
+
+// ---------------------------------------------------------------------------
+// UTF-16 <-> UTF-8 conversion (surrogate-aware, length-counted)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Convert length-counted UTF-16 to UTF-8.
+ *
+ * Unlike the UCS-2 helpers (BMP only), this decodes surrogate pairs
+ * (U+10000..U+10FFFF). Lone/invalid surrogates become U+FFFD. Operates
+ * on @p count host-endian 16-bit units (NUL is not a terminator — text
+ * may contain none); no terminator is written. If @p dst is NULL, no
+ * bytes are written and the required byte count is returned (sizing
+ * pass). Otherwise output is truncated cleanly at @p dst_size on a
+ * codepoint boundary (never a partial sequence).
+ *
+ * @return bytes written (or, when @p dst is NULL, bytes required).
+ */
+size_t
+axl_utf16_to_utf8(
+    const uint16_t *src,       ///< UTF-16 units (host endianness)
+    size_t          count,     ///< number of 16-bit units
+    char           *dst,       ///< destination, or NULL to measure
+    size_t          dst_size   ///< capacity of @p dst in bytes
+);
+
+/**
+ * @brief Convert length-counted UTF-8 to UTF-16 (surrogate-aware).
+ *
+ * Codepoints above the BMP are emitted as surrogate pairs. Invalid
+ * UTF-8 bytes become U+FFFD. If @p dst is NULL, returns the required
+ * unit count (sizing pass); otherwise truncates cleanly at @p dst_count
+ * on a codepoint boundary.
+ *
+ * @return units written (or, when @p dst is NULL, units required).
+ */
+size_t
+axl_utf8_to_utf16(
+    const char *src,        ///< UTF-8 bytes
+    size_t      len,        ///< number of bytes
+    uint16_t   *dst,        ///< destination, or NULL to measure
+    size_t      dst_count   ///< capacity of @p dst in 16-bit units
 );
 
 // ---------------------------------------------------------------------------

@@ -1596,6 +1596,96 @@ test_ferror_clearerr(void)
     axl_fclose(s);
 }
 
+static void
+test_file_write_atomic(void)
+{
+    const char *path = "fs0:\\axl_atomic_save";
+    const char *temp = "fs0:\\axl_atomic_save.tmp";
+    void       *contents = NULL;
+    size_t      len = 0;
+    AxlFsEntry  e;
+
+    /* Clean slate. */
+    axl_file_delete(path);
+    axl_file_delete(temp);
+
+    /* Create (target absent). */
+    test_check(axl_file_write_atomic(path, "hello world", 11) == AXL_OK,
+               "write_atomic: create new target");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == 11 && test_memcmp(contents, "hello world", 11) == 0,
+               "write_atomic: created content exact");
+    axl_free(contents);
+    contents = NULL;
+    test_check(axl_file_info(temp, &e) == AXL_ERR,
+               "write_atomic: temp removed after create");
+
+    /* Replace (target exists), different length. */
+    test_check(axl_file_write_atomic(path, "new", 3) == AXL_OK,
+               "write_atomic: replace existing target");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == 3 && test_memcmp(contents, "new", 3) == 0,
+               "write_atomic: replaced content exact");
+    axl_free(contents);
+    contents = NULL;
+    test_check(axl_file_info(temp, &e) == AXL_ERR,
+               "write_atomic: temp removed after replace");
+
+    /* Larger multi-KB payload roundtrip. */
+    static uint8_t big[8192];
+    for (size_t i = 0; i < sizeof(big); i++) {
+        big[i] = (uint8_t)(i * 13u + 7u);
+    }
+    test_check(axl_file_write_atomic(path, big, sizeof(big)) == AXL_OK,
+               "write_atomic: large payload");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == sizeof(big) && test_memcmp(contents, big, sizeof(big)) == 0,
+               "write_atomic: large payload content exact");
+    axl_free(contents);
+    contents = NULL;
+
+    /* Zero-length writes an empty file. */
+    test_check(axl_file_write_atomic(path, "", 0) == AXL_OK,
+               "write_atomic: zero length ok");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 0,
+               "write_atomic: zero length -> empty file");
+
+    /* Argument validation. */
+    test_check(axl_file_write_atomic(NULL, "x", 1) == AXL_ERR,
+               "write_atomic: NULL path -> AXL_ERR");
+    test_check(axl_file_write_atomic(path, NULL, 1) == AXL_ERR,
+               "write_atomic: NULL buf with len -> AXL_ERR");
+
+    axl_file_delete(path);
+}
+
+static void
+test_detect_encoding(void)
+{
+    bool bom = true;
+    test_check(axl_detect_encoding("\xEF\xBB\xBFhi", 5, &bom) == AXL_ENC_UTF8 && bom,
+               "detect: UTF-8 BOM");
+    bom = false;
+    test_check(axl_detect_encoding("hello world", 11, &bom) == AXL_ENC_UTF8 && !bom,
+               "detect: plain UTF-8 no BOM");
+    bom = false;
+    test_check(axl_detect_encoding("\xFF\xFEh\x00i\x00", 6, &bom) == AXL_ENC_UCS2_LE && bom,
+               "detect: UTF-16 LE BOM");
+    bom = false;
+    test_check(axl_detect_encoding("\xFE\xFF\x00h\x00i", 6, &bom) == AXL_ENC_UCS2_BE && bom,
+               "detect: UTF-16 BE BOM");
+    /* BOM-less heuristic: ASCII text as UTF-16 LE = lowbyte,0,lowbyte,0… */
+    static const char le[] = { 'h',0, 'e',0, 'l',0, 'l',0, 'o',0, ' ',0, 'w',0, 'd',0 };
+    bom = true;
+    test_check(axl_detect_encoding(le, sizeof(le), &bom) == AXL_ENC_UCS2_LE && !bom,
+               "detect: BOM-less UTF-16 LE heuristic");
+    static const char be[] = { 0,'h', 0,'e', 0,'l', 0,'l', 0,'o', 0,' ', 0,'w', 0,'d' };
+    test_check(axl_detect_encoding(be, sizeof(be), NULL) == AXL_ENC_UCS2_BE,
+               "detect: BOM-less UTF-16 BE heuristic");
+    test_check(axl_detect_encoding(NULL, 0, &bom) == AXL_ENC_UTF8,
+               "detect: empty -> UTF-8 default");
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1609,6 +1699,8 @@ test_io_main(int argc, char **argv)
     test_console();
     test_buffer();
     test_file();
+    test_file_write_atomic();
+    test_detect_encoding();
     test_printf();
     test_stdin();
     test_stdout_tee();

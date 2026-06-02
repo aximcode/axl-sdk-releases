@@ -349,6 +349,51 @@ axl_stream_get_encoding(AxlStream *s)
     return s->encoding;
 }
 
+AxlEncoding
+axl_detect_encoding(const void *prefix, size_t len, bool *out_has_bom)
+{
+    const uint8_t *p = (const uint8_t *)prefix;
+    if (out_has_bom != NULL) {
+        *out_has_bom = false;
+    }
+    if (p == NULL || len == 0) {
+        return AXL_ENC_UTF8;
+    }
+    /* BOM sniff. */
+    if (len >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) {
+        if (out_has_bom != NULL) { *out_has_bom = true; }
+        return AXL_ENC_UTF8;
+    }
+    if (len >= 2 && p[0] == 0xFF && p[1] == 0xFE) {
+        if (out_has_bom != NULL) { *out_has_bom = true; }
+        return AXL_ENC_UCS2_LE;
+    }
+    if (len >= 2 && p[0] == 0xFE && p[1] == 0xFF) {
+        if (out_has_bom != NULL) { *out_has_bom = true; }
+        return AXL_ENC_UCS2_BE;
+    }
+    /* BOM-less heuristic: ASCII-range text in UTF-16 has a NUL in every
+       other byte — odd positions for LE, even positions for BE. */
+    size_t n = (len < 512) ? len : 512;
+    size_t zero_even = 0, zero_odd = 0, n_even = 0, n_odd = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (i & 1) {
+            n_odd++;
+            if (p[i] == 0) { zero_odd++; }
+        } else {
+            n_even++;
+            if (p[i] == 0) { zero_even++; }
+        }
+    }
+    if (n_odd >= 2 && zero_odd * 4 >= n_odd * 3 && zero_even * 4 < n_even) {
+        return AXL_ENC_UCS2_LE;
+    }
+    if (n_even >= 2 && zero_even * 4 >= n_even * 3 && zero_odd * 4 < n_odd) {
+        return AXL_ENC_UCS2_BE;
+    }
+    return AXL_ENC_UTF8;
+}
+
 /* Encode a BMP code point (0..0xFFFF) as UTF-8 into @p out. Surrogate
    halves transcode as their 3-byte BMP shape (intentionally
    permissive — see header doc). Returns 1, 2, or 3. */

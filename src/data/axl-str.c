@@ -1203,6 +1203,111 @@ axl_ucs2_to_utf8_buf(
     return i;
 }
 
+size_t
+axl_utf16_to_utf8(const uint16_t *src, size_t count, char *dst, size_t dst_size)
+{
+    if (src == NULL) {
+        return 0;
+    }
+    size_t out = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t cp = src[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF) {                 /* high surrogate */
+            if (i + 1 < count && src[i + 1] >= 0xDC00 && src[i + 1] <= 0xDFFF) {
+                cp = 0x10000u + ((cp - 0xD800u) << 10) + (src[i + 1] - 0xDC00u);
+                i++;
+            } else {
+                cp = 0xFFFD;
+            }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {          /* lone low surrogate */
+            cp = 0xFFFD;
+        }
+        size_t need = (cp < 0x80) ? 1 : (cp < 0x800) ? 2 : (cp < 0x10000) ? 3 : 4;
+        if (dst != NULL) {
+            if (out + need > dst_size) {
+                break;                                      /* clean boundary */
+            }
+            if (cp < 0x80) {
+                dst[out++] = (char)cp;
+            } else if (cp < 0x800) {
+                dst[out++] = (char)(0xC0 | (cp >> 6));
+                dst[out++] = (char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                dst[out++] = (char)(0xE0 | (cp >> 12));
+                dst[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                dst[out++] = (char)(0x80 | (cp & 0x3F));
+            } else {
+                dst[out++] = (char)(0xF0 | (cp >> 18));
+                dst[out++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                dst[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                dst[out++] = (char)(0x80 | (cp & 0x3F));
+            }
+        } else {
+            out += need;
+        }
+    }
+    return out;
+}
+
+size_t
+axl_utf8_to_utf16(const char *src, size_t len, uint16_t *dst, size_t dst_count)
+{
+    if (src == NULL) {
+        return 0;
+    }
+    const uint8_t *s = (const uint8_t *)src;
+    size_t out = 0, i = 0;
+    while (i < len) {
+        uint8_t  b0 = s[i];
+        uint32_t cp;
+        size_t   n;
+        if (b0 < 0x80) {
+            cp = b0;
+            n = 1;
+        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < len && (s[i + 1] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(b0 & 0x1F) << 6) | (s[i + 1] & 0x3F);
+            n = 2;
+            if (cp < 0x80) { cp = 0xFFFD; }
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < len
+                   && (s[i + 1] & 0xC0) == 0x80 && (s[i + 2] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(s[i + 1] & 0x3F) << 6)
+                 | (s[i + 2] & 0x3F);
+            n = 3;
+            if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) { cp = 0xFFFD; }
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < len
+                   && (s[i + 1] & 0xC0) == 0x80 && (s[i + 2] & 0xC0) == 0x80
+                   && (s[i + 3] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[i + 1] & 0x3F) << 12)
+                 | ((uint32_t)(s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+            n = 4;
+            if (cp < 0x10000 || cp > 0x10FFFF) { cp = 0xFFFD; }
+        } else {
+            cp = 0xFFFD;
+            n = 1;
+        }
+        if (cp >= 0x10000) {
+            uint16_t hi = (uint16_t)(0xD800 + ((cp - 0x10000) >> 10));
+            uint16_t lo = (uint16_t)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+            if (dst != NULL) {
+                if (out + 2 > dst_count) { break; }
+                dst[out++] = hi;
+                dst[out++] = lo;
+            } else {
+                out += 2;
+            }
+        } else {
+            if (dst != NULL) {
+                if (out + 1 > dst_count) { break; }
+                dst[out++] = (uint16_t)cp;
+            } else {
+                out += 1;
+            }
+        }
+        i += n;
+    }
+    return out;
+}
+
 
 // ---------------------------------------------------------------------------
 // Number parsing
