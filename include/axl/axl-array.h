@@ -58,6 +58,36 @@ axl_array_append(
 );
 
 /**
+ * @brief Insert an element at @p index (value mode), shifting the rest right.
+ *
+ * @p index may equal the current length (equivalent to append).
+ * Matches g_array_insert_val.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure or if
+ *     @p index is past the end (> length).
+ */
+int
+axl_array_insert(
+    AxlArray   *a,       ///< array
+    size_t      index,   ///< position to insert at (0..length)
+    const void *element  ///< pointer to element data to copy (element_size bytes)
+);
+
+/**
+ * @brief Prepend an element (value mode) — insert at the front.
+ *
+ * Equivalent to axl_array_insert(a, 0, element). Matches
+ * g_array_prepend_val. O(n) (shifts all elements).
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
+ */
+int
+axl_array_prepend(
+    AxlArray   *a,      ///< array
+    const void *element ///< pointer to element data to copy (element_size bytes)
+);
+
+/**
  * @brief Get a pointer to the element at @p index (value mode).
  *
  * @return pointer into internal buffer, or NULL if out of range.
@@ -93,6 +123,35 @@ axl_array_clear(
  */
 int
 axl_array_append_ptr(
+    AxlArray *a,  ///< array
+    void     *ptr ///< pointer to store
+);
+
+/**
+ * @brief Insert a pointer at @p index (pointer mode), shifting the rest right.
+ *
+ * @p index may equal the current length (equivalent to append).
+ * Matches g_ptr_array_insert.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure or if
+ *     @p index is past the end (> length).
+ */
+int
+axl_array_insert_ptr(
+    AxlArray *a,      ///< array
+    size_t    index,  ///< position to insert at (0..length)
+    void     *ptr     ///< pointer to store
+);
+
+/**
+ * @brief Prepend a pointer (pointer mode) — insert at the front.
+ *
+ * Equivalent to axl_array_insert_ptr(a, 0, ptr). O(n).
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
+ */
+int
+axl_array_prepend_ptr(
     AxlArray *a,  ///< array
     void     *ptr ///< pointer to store
 );

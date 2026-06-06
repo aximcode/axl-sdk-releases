@@ -7,6 +7,8 @@
 #include <axl/axl-sort.h>
 #include <axl/axl-clipboard.h>
 #include <axl/axl-shm.h>
+#include <axl/axl-rand.h>
+#include <axl/axl-driver.h>   /* axl_protocol_install / _uninstall */
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -3064,7 +3066,7 @@ test_shared_driver(void)
                "shared_driver_publish: defaults to gImageHandle when *out=NULL");
     AxlHandle pinned = reused;
     /* Phase 2: re-publish a DIFFERENT identity with *out_handle
-       pre-set to the same pinned handle. Underlying register_guid
+       pre-set to the same pinned handle. Underlying install
        reuses the handle rather than minting. */
     test_check(axl_shared_driver_publish("shared-driver-test-reuse-2",
                                          &sentinel_b, &reused) == AXL_OK
@@ -3099,14 +3101,14 @@ test_shared_driver(void)
        wrong-handle case. */
     static int sentinel_synth = 99;
     AxlHandle synth_h = NULL;
-    /* Mint a synthetic handle: register_guid with NULL handle slot
+    /* Mint a synthetic handle: install with NULL handle slot
        creates one; we own it. Use a separate identity (not the
        shared-driver namespace) so we don't collide with anything. */
     static const AxlGuid synth_guid = AXL_GUID(
         0xdeadbeef, 0xfeed, 0xface,
         0xc0, 0xff, 0xee, 0x00, 0x11, 0x22, 0x33, 0x44);
-    test_check(axl_protocol_register_guid(&synth_guid, &sentinel_synth,
-                                          (void **)&synth_h) == AXL_OK
+    test_check(axl_protocol_install(&synth_guid, &sentinel_synth,
+                                    &synth_h) == AXL_OK
                && synth_h != NULL,
                "shared_driver_unload: synthetic non-image handle minted");
     /* Pre-set publish's out_handle to the synthetic handle so the
@@ -3123,7 +3125,7 @@ test_shared_driver(void)
     /* Cleanup: explicit unpublish + remove the synthetic protocol. */
     test_check(axl_shared_driver_unpublish("shared-driver-non-image-test",
                                            synth_h, &sentinel_synth) == AXL_OK
-               && axl_protocol_unregister_guid(synth_h, &synth_guid,
+               && axl_protocol_uninstall(synth_h, &synth_guid,
                                                &sentinel_synth) == AXL_OK,
                "shared_driver_unload: cleanup non-image handle");
 
@@ -3143,8 +3145,8 @@ test_shared_driver(void)
         0xfeedf00d, 0xbeef, 0xcafe,
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11);
     /* Pre-mint a single synthetic handle reused by every iteration. */
-    test_check(axl_protocol_register_guid(&loop_synth_guid, &sentinel_loop,
-                                          (void **)&loop_synth) == AXL_OK,
+    test_check(axl_protocol_install(&loop_synth_guid, &sentinel_loop,
+                                    &loop_synth) == AXL_OK,
                "shared_driver_unload: leak-loop synthetic handle ready");
 
     axl_mem_get_stats(&stats_before);
@@ -3168,7 +3170,7 @@ test_shared_driver(void)
                "shared_driver_unload: 50x loop heap-stable");
 
     /* Cleanup the leak-loop synthetic handle. */
-    axl_protocol_unregister_guid(loop_synth, &loop_synth_guid, &sentinel_loop);
+    axl_protocol_uninstall(loop_synth, &loop_synth_guid, &sentinel_loop);
 }
 
 // ---------------------------------------------------------------------------
@@ -5887,14 +5889,6 @@ sort_cmp_int_data(const void *a, const void *b, void *user_data)
     return descending ? -rc : rc;
 }
 
-// Deterministic LCG so the "large random" case is reproducible.
-static uint32_t
-sort_lcg(uint32_t *state)
-{
-    *state = (*state * 1103515245u) + 12345u;
-    return *state;
-}
-
 static bool
 sort_is_ascending(const int *a, size_t n)
 {
@@ -6005,14 +5999,14 @@ test_qsort_large_random(void)
 {
     enum { N = 4096 };
     static int a[N];
-    uint32_t state = 0x1234abcdu;
+    AXL_AUTOPTR(AxlRand) rng = axl_rand_new_seeded(0x1234abcdu);
 
     for (size_t i = 0; i < N; i++) {
         // Narrow value range (0..255) exercises duplicate handling in the
         // partition. Values stay well-distributed, so median-of-three keeps
         // recursion balanced — this is the quicksort/insertion path, not the
         // heapsort fallback (see test_qsort_heapsort_fallback for that).
-        a[i] = (int)(sort_lcg(&state) % 256u);
+        a[i] = axl_rand_int_range(rng, 0, 256);
     }
 
     axl_qsort(a, N, sizeof(a[0]), sort_cmp_int);
@@ -6070,10 +6064,10 @@ test_qsort_large_elements(void)
 {
     enum { N = 50 };
     static SortBig a[N];
-    uint32_t state = 0xdeadbeefu;
+    AXL_AUTOPTR(AxlRand) rng = axl_rand_new_seeded(0xdeadbeefu);
 
     for (size_t i = 0; i < N; i++) {
-        a[i].key = (int)(sort_lcg(&state) % 1000u);
+        a[i].key = axl_rand_int_range(rng, 0, 1000);
         a[i].pad[0] = (uint8_t)a[i].key;   // tie payload to key
         a[i].pad[79] = (uint8_t)(a[i].key ^ 0xFF);
     }
@@ -6311,6 +6305,275 @@ test_shm(void)
     (void)axl_shm_unlink(SHM_B);
 }
 
+// ---------------------------------------------------------------------------
+// AxlRand Tests
+//
+// Expected values are from the canonical xoshiro256**/SplitMix64 reference
+// (computed independently of this implementation) so the assertions pin the
+// documented stream rather than passing against whatever the impl happens to
+// produce. Seed-0x1234 stream words w0..w5:
+//   CF1350DCCA3DEBE9 ACC53B3FB46C231F 17D76A4D73642536
+//   E573FFDBE8DFBF83 9EAD861BFCAB7610 56D3D3FF75D17A51
+// ---------------------------------------------------------------------------
+
+static uint64_t
+double_bits(double d)
+{
+    uint64_t bits;
+    axl_memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
+
+static void
+test_rand_stream(void)
+{
+    static const uint64_t expect[6] = {
+        0xCF1350DCCA3DEBE9ULL, 0xACC53B3FB46C231FULL, 0x17D76A4D73642536ULL,
+        0xE573FFDBE8DFBF83ULL, 0x9EAD861BFCAB7610ULL, 0x56D3D3FF75D17A51ULL,
+    };
+    AXL_AUTOPTR(AxlRand) r = axl_rand_new_seeded(0x1234);
+    test_check(r != NULL, "rand: new_seeded -> non-NULL");
+    for (int i = 0; i < 6; i++) {
+        test_check(axl_rand_uint64(r) == expect[i],
+            "rand: uint64 stream matches reference");
+    }
+
+    // uint32 = high 32 bits of each fresh word, one word per call.
+    AXL_AUTOPTR(AxlRand) r2 = axl_rand_new_seeded(0x1234);
+    test_check(axl_rand_uint32(r2) == 0xCF1350DCU, "rand: uint32[0] = high32(w0)");
+    test_check(axl_rand_uint32(r2) == 0xACC53B3FU, "rand: uint32[1] = high32(w1)");
+    test_check(axl_rand_uint32(r2) == 0x17D76A4DU, "rand: uint32[2] = high32(w2)");
+
+    // Zero seed is non-degenerate (SplitMix64 expansion).
+    AXL_AUTOPTR(AxlRand) rz = axl_rand_new_seeded(0);
+    test_check(axl_rand_uint64(rz) == 0x99EC5F36CB75F2B4ULL,
+        "rand: zero seed -> non-degenerate reference word");
+}
+
+static void
+test_rand_derived(void)
+{
+    // double: top 53 bits of each fresh word -> [0,1). Pin exact bit patterns.
+    AXL_AUTOPTR(AxlRand) r = axl_rand_new_seeded(0x1234);
+    test_check(double_bits(axl_rand_double(r)) == 0x3FE9E26A1B9947BDULL,
+        "rand: double[0] exact bits");
+    test_check(double_bits(axl_rand_double(r)) == 0x3FE598A767F68D84ULL,
+        "rand: double[1] exact bits");
+
+    // boolean = bit 63 of each fresh word: 1 1 0 1 1 0 0 1.
+    AXL_AUTOPTR(AxlRand) rb = axl_rand_new_seeded(0x1234);
+    static const bool expb[8] = { true, true, false, true, true, false, false, true };
+    for (int i = 0; i < 8; i++) {
+        test_check(axl_rand_boolean(rb) == expb[i], "rand: boolean bit63 stream");
+    }
+
+    // bytes: little-endian emission of successive words.
+    static const uint8_t expbytes[10] = {
+        0xE9, 0xEB, 0x3D, 0xCA, 0xDC, 0x50, 0x13, 0xCF, 0x1F, 0x23,
+    };
+    AXL_AUTOPTR(AxlRand) ry = axl_rand_new_seeded(0x1234);
+    uint8_t buf[10];
+    axl_memset(buf, 0xAA, sizeof(buf));
+    axl_rand_bytes(ry, buf, sizeof(buf));
+    bool match = true;
+    for (int i = 0; i < 10; i++) {
+        if (buf[i] != expbytes[i]) { match = false; }
+    }
+    test_check(match, "rand: bytes little-endian stream matches reference");
+
+    // len == 0 is a no-op (buffer untouched).
+    uint8_t sentinel = 0x5A;
+    axl_rand_bytes(ry, &sentinel, 0);
+    test_check(sentinel == 0x5A, "rand: bytes len==0 is a no-op");
+}
+
+static void
+test_rand_reproducible(void)
+{
+    // Same seed -> identical sequences.
+    AXL_AUTOPTR(AxlRand) a = axl_rand_new_seeded(0xABCDEF);
+    AXL_AUTOPTR(AxlRand) b = axl_rand_new_seeded(0xABCDEF);
+    bool same = true;
+    for (int i = 0; i < 100; i++) {
+        if (axl_rand_uint64(a) != axl_rand_uint64(b)) { same = false; }
+    }
+    test_check(same, "rand: same seed -> identical 100-word streams");
+
+    // set_seed resets regardless of prior use: after reseeding, the
+    // stream matches a fresh generator with the same seed (b has advanced
+    // 100 words, so it is NOT the right reference here).
+    (void)axl_rand_uint64(a);  // advance a to an arbitrary position
+    axl_rand_set_seed(a, 0xABCDEF);
+    AXL_AUTOPTR(AxlRand) fresh = axl_rand_new_seeded(0xABCDEF);
+    test_check(axl_rand_uint64(a) == axl_rand_uint64(fresh),
+        "rand: set_seed resets the stream");
+
+    // copy duplicates position, then runs independently.
+    AXL_AUTOPTR(AxlRand) c = axl_rand_new_seeded(0x42);
+    (void)axl_rand_uint64(c);
+    (void)axl_rand_uint64(c);
+    AXL_AUTOPTR(AxlRand) d = axl_rand_copy(c);
+    test_check(d != NULL, "rand: copy -> non-NULL");
+    // Both at the same position: each yields the word at that position.
+    // Independent state, not shared — shared state would have made d's draw
+    // the word AFTER c's, so equality here proves both duplication and
+    // independence in one assertion.
+    uint64_t cv = axl_rand_uint64(c);
+    uint64_t dv = axl_rand_uint64(d);
+    test_check(cv == dv, "rand: copy resumes the identical stream independently");
+    test_check(axl_rand_copy(NULL) == NULL, "rand: copy(NULL) -> NULL");
+
+    // Smoke: the non-reproducible constructor plumbs entropy/clock and
+    // yields a usable generator (its values can't be pinned).
+    AXL_AUTOPTR(AxlRand) nd = axl_rand_new();
+    test_check(nd != NULL, "rand: new() (entropy-seeded) -> non-NULL");
+    (void)axl_rand_uint64(nd);
+}
+
+static void
+test_rand_ranges(void)
+{
+    // int_range: unbiased rejection; pin the first five [1,7) draws.
+    static const int32_t expdice[5] = { 4, 6, 5, 6, 3 };
+    AXL_AUTOPTR(AxlRand) r = axl_rand_new_seeded(0x1234);
+    bool dice_ok = true;
+    for (int i = 0; i < 5; i++) {
+        if (axl_rand_int_range(r, 1, 7) != expdice[i]) { dice_ok = false; }
+    }
+    test_check(dice_ok, "rand: int_range(1,7) matches reference");
+
+    // Bounds respected across many draws, including a negative range.
+    bool in_bounds = true;
+    for (int i = 0; i < 1000; i++) {
+        int32_t v = axl_rand_int_range(r, -10, 10);
+        if (v < -10 || v >= 10) { in_bounds = false; }
+    }
+    test_check(in_bounds, "rand: int_range(-10,10) stays in bounds");
+
+    // Full INT32 range (span > INT32_MAX) must not overflow/crash.
+    bool full_ok = true;
+    for (int i = 0; i < 1000; i++) {
+        int32_t v = axl_rand_int_range(r, INT32_MIN, INT32_MAX);
+        if (v == INT32_MAX) { full_ok = false; }  // exclusive upper bound
+    }
+    test_check(full_ok, "rand: int_range full INT32 span excludes end, no overflow");
+
+    // double in [0,1) across many draws.
+    bool d_ok = true;
+    for (int i = 0; i < 1000; i++) {
+        double v = axl_rand_double(r);
+        if (v < 0.0 || v >= 1.0) { d_ok = false; }
+    }
+    test_check(d_ok, "rand: double stays in [0,1)");
+
+    // double_range exact (pins the no-FMA two-step construction).
+    AXL_AUTOPTR(AxlRand) rr = axl_rand_new_seeded(0x1234);
+    test_check(double_bits(axl_rand_double_range(rr, 10.0, 20.0)) == 0x403216C1289FE66BULL,
+        "rand: double_range(10,20)[0] exact bits (no FMA)");
+    bool dr_ok = true;
+    for (int i = 0; i < 1000; i++) {
+        double v = axl_rand_double_range(rr, -5.0, 5.0);
+        if (v < -5.0 || v >= 5.0) { dr_ok = false; }
+    }
+    test_check(dr_ok, "rand: double_range stays in [begin,end)");
+
+    // Degenerate (empty) ranges return begin without drawing.
+    test_check(axl_rand_int_range(rr, 5, 5) == 5, "rand: int_range empty -> begin");
+    test_check(axl_rand_int_range(rr, 9, 3) == 9, "rand: int_range inverted -> begin");
+    test_check(axl_rand_double_range(rr, 2.5, 2.5) == 2.5,
+        "rand: double_range empty -> begin");
+}
+
+static void
+test_rand_global(void)
+{
+    // Global stream is the same engine; set_seed ties it to the reference.
+    axl_random_set_seed(0x1234);
+    test_check(axl_random_uint32() == 0xCF1350DCU, "rand: global uint32 = high32(w0)");
+
+    // set_seed resets the global stream regardless of prior use.
+    (void)axl_random_uint32();
+    (void)axl_random_double();
+    axl_random_set_seed(0x1234);
+    test_check(axl_random_uint32() == 0xCF1350DCU, "rand: global set_seed resets");
+
+    // Range/double bounds hold on the global stream too.
+    bool ok = true;
+    for (int i = 0; i < 500; i++) {
+        int32_t iv = axl_random_int_range(0, 6);
+        double  dv = axl_random_double();
+        double  rv = axl_random_double_range(100.0, 200.0);
+        if (iv < 0 || iv >= 6 || dv < 0.0 || dv >= 1.0 || rv < 100.0 || rv >= 200.0) {
+            ok = false;
+        }
+    }
+    test_check(ok, "rand: global int/double/double_range stay in bounds");
+    (void)axl_random_boolean();
+}
+
+// ---------------------------------------------------------------------------
+// AxlBytes adoption: axl_file_get_bytes + axl_clipboard_get_bytes.
+// ---------------------------------------------------------------------------
+
+static void
+test_file_get_bytes(void)
+{
+    const char data[] = "axl_file_get_bytes payload \x01\x02\x00\x03";  // embedded NUL
+    const size_t dlen = sizeof(data) - 1;
+    test_check(axl_file_set_contents("axl-fgb.tmp", data, dlen) == 0,
+        "file_get_bytes: write fixture");
+
+    AxlBytes *b = axl_file_get_bytes("axl-fgb.tmp");
+    test_check(b != NULL, "file_get_bytes: non-NULL");
+    size_t n = 0;
+    const uint8_t *p = axl_bytes_get_data(b, &n);
+    test_check(n == dlen, "file_get_bytes: size matches");
+    test_check(p != NULL && axl_memcmp(p, data, dlen) == 0,
+        "file_get_bytes: content matches (incl. embedded NUL)");
+    axl_bytes_unref(b);
+
+    // Empty file -> valid empty AxlBytes.
+    test_check(axl_file_set_contents("axl-fgb-empty.tmp", "", 0) == 0,
+        "file_get_bytes: write empty fixture");
+    AxlBytes *e = axl_file_get_bytes("axl-fgb-empty.tmp");
+    test_check(e != NULL && axl_bytes_get_size(e) == 0, "file_get_bytes: empty file -> size 0");
+    size_t en;
+    test_check(axl_bytes_get_data(e, &en) == NULL && en == 0,
+        "file_get_bytes: empty file -> get_data NULL");
+    axl_bytes_unref(e);
+
+    // Missing file -> NULL.
+    test_check(axl_file_get_bytes("does-not-exist.tmp") == NULL,
+        "file_get_bytes: missing file -> NULL");
+
+    (void)axl_file_delete("axl-fgb.tmp");
+    (void)axl_file_delete("axl-fgb-empty.tmp");
+}
+
+static void
+test_clipboard_get_bytes(void)
+{
+    test_check(axl_clipboard_set("first-payload", 13, "text/plain") == 0,
+        "clip_bytes: set first");
+
+    AxlBytes *snap = axl_clipboard_get_bytes();
+    test_check(snap != NULL && axl_bytes_get_size(snap) == 13, "clip_bytes: snapshot size 13");
+
+    // The key win: snapshot stays valid and unchanged across a later set
+    // that invalidates the borrowed axl_clipboard_get pointer.
+    test_check(axl_clipboard_set("totally-different-and-longer", 28, NULL) == 0,
+        "clip_bytes: set second (invalidates borrows)");
+    size_t n = 0;
+    const uint8_t *p = axl_bytes_get_data(snap, &n);
+    test_check(n == 13 && axl_memcmp(p, "first-payload", 13) == 0,
+        "clip_bytes: snapshot stable across later set");
+    axl_bytes_unref(snap);
+
+    // Cleared clipboard -> NULL.
+    axl_clipboard_clear();
+    test_check(axl_clipboard_get_bytes() == NULL, "clip_bytes: empty -> NULL");
+}
+
 int
 test_util_main(int argc, char **argv)
 {
@@ -6319,9 +6582,17 @@ test_util_main(int argc, char **argv)
 
     test_clipboard();
     test_clipboard_corrupt();
+    test_clipboard_get_bytes();
     test_shm();
 
+    test_rand_stream();
+    test_rand_derived();
+    test_rand_reproducible();
+    test_rand_ranges();
+    test_rand_global();
+
     test_file();
+    test_file_get_bytes();
     test_seek_tell();
     test_feof();
     test_file_delete();

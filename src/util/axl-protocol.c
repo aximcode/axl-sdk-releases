@@ -9,6 +9,7 @@
 #include "../backend/axl-backend.h"
 #include "axl-protocol-internal.h"
 #include <axl/axl-sys.h>
+#include <axl/axl-driver.h>   /* axl_protocol_install / _uninstall (the seam) */
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-log.h>
@@ -325,6 +326,12 @@ axl_protocol_enumerate(
     return axl_protocol_enumerate_guid((const AxlGuid *)guid, handles, count);
 }
 
+/* The name-based registry layer over the shared axl_protocol_install /
+   _uninstall primitive (which is the single place that talks to the backend
+   protocol seam). These add the protocol-NAME lookup; the GUID-based install
+   itself lives in axl-driver.h, so there is no GUID-based register_guid /
+   unregister_guid here anymore — call axl_protocol_install / _uninstall. */
+
 int
 axl_protocol_register(
     const char *name,
@@ -334,7 +341,6 @@ axl_protocol_register(
 {
     EFI_GUID        fallback;
     const EFI_GUID *guid;
-    EFI_STATUS      status;
 
     if (name == NULL || interface == NULL || handle == NULL) {
         return AXL_ERR;
@@ -345,13 +351,8 @@ axl_protocol_register(
         return AXL_ERR;
     }
 
-    status = axl_bs()->InstallProtocolInterface(
-        (EFI_HANDLE *)handle,
-        (EFI_GUID *)guid,
-        EFI_NATIVE_INTERFACE,
-        interface);
-
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    return axl_protocol_install((const AxlGuid *)guid, interface,
+                                (AxlHandle *)handle);
 }
 
 int
@@ -360,15 +361,14 @@ axl_protocol_register_multiple(
     ...
     )
 {
-    /* Can't forward variadics to InstallMultipleProtocolInterfaces,
-       so collect pairs into arrays (max 8) and call individually.
-       Use a two-pass approach: first install all, rollback on failure. */
+    /* Collect name/interface pairs into arrays (max 8), then install each via
+       the shared primitive; roll back on the first failure. (Can't forward
+       variadics to InstallMultipleProtocolInterfaces.) */
     va_list ap;
     EFI_GUID   guids[8];
     EFI_GUID   fallbacks[8];
     void      *ifaces[8];
     int        count = 0;
-    EFI_STATUS status;
 
     if (handle == NULL) {
         return AXL_ERR;
@@ -407,19 +407,14 @@ axl_protocol_register_multiple(
         return AXL_ERR;
     }
 
-    /* Install all protocols. Use individual InstallProtocolInterface calls
-       since we can't forward to the variadic Multi version. */
     for (int i = 0; i < count; i++) {
-        status = axl_bs()->InstallProtocolInterface(
-            (EFI_HANDLE *)handle,
-            &guids[i],
-            EFI_NATIVE_INTERFACE,
-            ifaces[i]);
-        if (EFI_ERROR(status)) {
-            /* Rollback: uninstall any we already installed */
+        if (axl_protocol_install((const AxlGuid *)&guids[i], ifaces[i],
+                                 (AxlHandle *)handle) != AXL_OK) {
+            /* Rollback: uninstall any we already installed (all on *handle). */
             for (int j = 0; j < i; j++) {
-                axl_bs()->UninstallProtocolInterface(
-                    *((EFI_HANDLE *)handle), &guids[j], ifaces[j]);
+                (void)axl_protocol_uninstall(*handle,
+                                             (const AxlGuid *)&guids[j],
+                                             ifaces[j]);
             }
             return AXL_ERR;
         }
@@ -437,7 +432,6 @@ axl_protocol_unregister(
 {
     EFI_GUID        fallback;
     const EFI_GUID *guid;
-    EFI_STATUS      status;
 
     if (handle == NULL || name == NULL || interface == NULL) {
         return AXL_ERR;
@@ -448,49 +442,6 @@ axl_protocol_unregister(
         return AXL_ERR;
     }
 
-    status = axl_bs()->UninstallProtocolInterface(
-        (EFI_HANDLE)handle,
-        (EFI_GUID *)guid,
-        interface);
-
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
-}
-
-int
-axl_protocol_register_guid(
-    const AxlGuid *guid,
-    void          *interface,
-    void         **handle
-    )
-{
-    if (guid == NULL || interface == NULL || handle == NULL) {
-        return AXL_ERR;
-    }
-
-    EFI_STATUS status = axl_bs()->InstallProtocolInterface(
-        (EFI_HANDLE *)handle,
-        (EFI_GUID *)guid,
-        EFI_NATIVE_INTERFACE,
-        interface);
-
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
-}
-
-int
-axl_protocol_unregister_guid(
-    void          *handle,
-    const AxlGuid *guid,
-    void          *interface
-    )
-{
-    if (handle == NULL || guid == NULL || interface == NULL) {
-        return AXL_ERR;
-    }
-
-    EFI_STATUS status = axl_bs()->UninstallProtocolInterface(
-        (EFI_HANDLE)handle,
-        (EFI_GUID *)guid,
-        interface);
-
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    return axl_protocol_uninstall((AxlHandle)handle, (const AxlGuid *)guid,
+                                  interface);
 }

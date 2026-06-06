@@ -378,7 +378,7 @@ axl_service_start_embedded(
  * order:
  *   1. axl_loop_detach_driver — stops the firmware notify-timer
  *   2. service teardown(user) — releases what setup built
- *   3. axl_protocol_unregister_guid — removes the marker protocol
+ *   3. axl_protocol_uninstall — removes the marker protocol
  *   4. axl_config_free — drops cached LoadOptions strings
  *   5. axl_loop_free
  *

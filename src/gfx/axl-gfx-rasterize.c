@@ -69,8 +69,15 @@ typedef void          *FT_Memory;
 /* ftgrays is distributed as a single .c compiled in STANDALONE_ mode
  * by #including it here (FreeType's documented integration path), the
  * same vendoring approach as stb_truetype in axl-truetype.c. */
+// Vendored FreeType source: suppress its cosmetic warnings (an unused
+// STANDALONE-path variable, a signed/unsigned assignment) rather than
+// editing upstream — functional AXL fixes in ftgrays.c are marked inline.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wpointer-sign"
 // NOLINTNEXTLINE(bugprone-suspicious-include)
 #include "../../deps/freetype/ftgrays.c"
+#pragma GCC diagnostic pop
 
 // ===================================================================
 // Marshalling AxlGfxVertex list -> FT_Outline, direct-mode render

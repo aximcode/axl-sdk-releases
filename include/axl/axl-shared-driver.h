@@ -75,7 +75,7 @@ axl_shared_driver_guid(
 /**
  * @brief Publish a shared-driver vtable from a driver image.
  *
- * Wraps @ref axl_protocol_register_guid — derives the GUID from
+ * Wraps @ref axl_protocol_install — derives the GUID from
  * @p name via @ref axl_shared_driver_guid, installs @p iface on a new
  * UEFI handle (or @p *handle if non-NULL), returns the handle in
  * @p *handle.
@@ -98,7 +98,7 @@ axl_shared_driver_publish(
 /**
  * @brief Unregister a shared-driver vtable from a driver image.
  *
- * Wraps @ref axl_protocol_unregister_guid. Call from the driver's
+ * Wraps @ref axl_protocol_uninstall. Call from the driver's
  * unload callback. After this returns the launcher's
  * @ref axl_shared_driver_locate will fail to resolve until a new
  * publish call.

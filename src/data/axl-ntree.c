@@ -190,6 +190,56 @@ axl_ntree_append_data(
     return node;
 }
 
+/* Shared validation for the move_* pair: returns true if repositioning
+ * @node under @parent relative to @sibling is legal. */
+static bool
+ntree_move_ok(
+    AxlNTree *parent,
+    AxlNTree *sibling,
+    AxlNTree *node
+    )
+{
+    if (parent == NULL || node == NULL || node == sibling) {
+        return false;
+    }
+    if (sibling != NULL && sibling->parent != parent) {
+        return false;
+    }
+    /* No cycles: can't move a node under itself or its own descendant. */
+    if (node == parent || axl_ntree_is_ancestor(node, parent)) {
+        return false;
+    }
+    return true;
+}
+
+AxlNTree *
+axl_ntree_move_after(
+    AxlNTree *parent,
+    AxlNTree *sibling,
+    AxlNTree *node
+    )
+{
+    if (!ntree_move_ok(parent, sibling, node)) {
+        return NULL;
+    }
+    axl_ntree_unlink(node);          /* detach; becomes a root for re-insert */
+    return axl_ntree_insert_after(parent, sibling, node);
+}
+
+AxlNTree *
+axl_ntree_move_before(
+    AxlNTree *parent,
+    AxlNTree *sibling,
+    AxlNTree *node
+    )
+{
+    if (!ntree_move_ok(parent, sibling, node)) {
+        return NULL;
+    }
+    axl_ntree_unlink(node);
+    return axl_ntree_insert_before(parent, sibling, node);
+}
+
 // ---------------------------------------------------------------------------
 // Navigate / query
 // ---------------------------------------------------------------------------
@@ -534,6 +584,40 @@ ntree_preorder_succ(
     return n->next;
 }
 
+/* Deepest-last descendant of @node (repeatedly follow the last child) —
+ * the first node in reverse pre-order under @node. */
+static AxlNTree *
+ntree_lastdeepest(
+    AxlNTree *node
+    )
+{
+    while (node->children != NULL) {
+        AxlNTree *c = node->children;
+        while (c->next != NULL) {
+            c = c->next;
+        }
+        node = c;
+    }
+    return node;
+}
+
+/* Reverse-pre-order successor: the node visited just BEFORE @node in
+ * forward pre-order. Mirror of ntree_preorder_succ. */
+static AxlNTree *
+ntree_preorder_pred(
+    AxlNTree *node,
+    AxlNTree *root
+    )
+{
+    if (node == root) {
+        return NULL;                 /* root is visited last — done */
+    }
+    if (node->prev != NULL) {
+        return ntree_lastdeepest(node->prev);  /* prev sibling's deepest-last */
+    }
+    return node->parent;             /* first child → its parent */
+}
+
 void
 axl_ntree_iter_init(
     AxlNTreeIter          *iter,
@@ -548,6 +632,20 @@ axl_ntree_iter_init(
     iter->current = NULL;
     iter->flags   = flags;
     iter->started = false;
+    iter->reverse = false;
+}
+
+void
+axl_ntree_iter_init_reverse(
+    AxlNTreeIter          *iter,
+    AxlNTree              *root,
+    AxlNTreeTraverseFlags  flags
+    )
+{
+    axl_ntree_iter_init(iter, root, flags);
+    if (iter != NULL) {
+        iter->reverse = true;
+    }
 }
 
 AxlNTree *
@@ -562,11 +660,12 @@ axl_ntree_iter_next(
         AxlNTree *n;
         if (!iter->started) {
             iter->started = true;
-            n = iter->root;
+            n = iter->reverse ? ntree_lastdeepest(iter->root) : iter->root;
         } else if (iter->current == NULL) {
             return NULL;             /* already exhausted */
         } else {
-            n = ntree_preorder_succ(iter->current, iter->root);
+            n = iter->reverse ? ntree_preorder_pred(iter->current, iter->root)
+                              : ntree_preorder_succ(iter->current, iter->root);
         }
         iter->current = n;           /* track real tree position (pre-filter) */
         if (n == NULL) {

@@ -47,10 +47,14 @@
 #include <axl/axl-ntree.h>
 #include <axl/axl-tree.h>
 #include <axl/axl-rb-tree.h>
+#include <axl/axl-find.h>
+#include <axl/axl-regex.h>
 #include <axl/axl-text-buffer.h>
 #include <axl/axl-piece-tree.h>
 #include <axl/axl-ring-buf.h>
 #include <axl/axl-digest.h>
+#include <axl/axl-hmac.h>
+#include <axl/axl-bytes.h>
 #include <axl/axl-path.h>
 #include <axl/axl-hexdump.h>
 #include <axl/axl-clipboard.h>
@@ -76,6 +80,7 @@
 #include <axl/axl-mem-phys.h>
 #include <axl/axl-watchdog.h>
 #include <axl/axl-rng.h>
+#include <axl/axl-rand.h>
 #include <axl/axl-diag.h>
 #include <axl/axl-config.h>
 #include <axl/axl-subcommand.h>
@@ -99,6 +104,7 @@
 #include <axl/axl-net-opts.h>
 #include <axl/axl-gfx.h>
 #include <axl/axl-input.h>
+#include <axl/axl-cursor.h>
 #include <axl/axl-smbios.h>
 #include <axl/axl-smbus.h>
 #include <axl/axl-ipmi.h>

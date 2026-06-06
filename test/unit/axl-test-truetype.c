@@ -1432,6 +1432,50 @@ test_default_punct_ellipsis_wide(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_ttf_mono_default — the built-in fixed-width face
+// ---------------------------------------------------------------------------
+
+static void
+test_mono_default_returns_non_null(void)
+{
+    test_check(axl_ttf_mono_default() != NULL,
+               "mono: axl_ttf_mono_default() returns non-NULL");
+}
+
+static void
+test_mono_default_is_singleton(void)
+{
+    test_check(axl_ttf_mono_default() == axl_ttf_mono_default(),
+               "mono: repeated calls return the same handle");
+}
+
+static void
+test_mono_default_distinct_from_default(void)
+{
+    /* A different face entirely from the proportional default. */
+    test_check(axl_ttf_mono_default() != axl_ttf_default(),
+               "mono: distinct handle from axl_ttf_default()");
+}
+
+static void
+test_mono_default_is_fixed_width(void)
+{
+    /* The defining property: every glyph advances by the same width, so a
+     * narrow 'i' and a wide 'M' measure identically — which the proportional
+     * default does NOT (proven by the contrast assertion). */
+    AxlTtf  *mono = axl_ttf_mono_default();
+    AxlTtf  *prop = axl_ttf_default();
+    uint32_t mi = axl_ttf_measure(mono, "i", 16.0f);
+    uint32_t mm = axl_ttf_measure(mono, "M", 16.0f);
+    uint32_t pi = axl_ttf_measure(prop, "i", 16.0f);
+    uint32_t pm = axl_ttf_measure(prop, "M", 16.0f);
+    test_check(mi > 0 && mi == mm,
+               "mono: 'i' and 'M' have equal advance (fixed-width)");
+    test_check(pi != pm,
+               "mono: proportional default has unequal 'i'/'M' (contrast)");
+}
+
+// ---------------------------------------------------------------------------
 // Suite entry point
 // ---------------------------------------------------------------------------
 
@@ -1529,6 +1573,11 @@ test_truetype_main(
     test_default_punct_endash_present();
     test_default_punct_curly_quote_present();
     test_default_punct_ellipsis_wide();
+
+    test_mono_default_returns_non_null();
+    test_mono_default_is_singleton();
+    test_mono_default_distinct_from_default();
+    test_mono_default_is_fixed_width();
 
     return test_print_results();
 }

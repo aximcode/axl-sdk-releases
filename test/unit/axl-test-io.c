@@ -190,7 +190,7 @@ test_file(void)
        which the FAT driver rejects because the FileName slot
        expects a basename. axl_file_rename now extracts the
        basename + verifies same-directory before delegating. */
-    axl_file_set_contents("fs0:\\axl_rn_src.tmp", "x", 1);
+    (void)axl_file_set_contents("fs0:\\axl_rn_src.tmp", "x", 1);
     test_check(axl_file_rename("fs0:\\axl_rn_src.tmp",
                                "fs0:\\axl_rn_dst.tmp") == AXL_OK,
                "file: rename with full-path new_path");
@@ -209,7 +209,7 @@ test_file(void)
        failing to find the target dir (which would mask a regression
        where the prefix check is silently deleted). */
     axl_dir_mkdir("fs0:\\axl_sub");
-    axl_file_set_contents("fs0:\\axl_rn_x.tmp", "y", 1);
+    (void)axl_file_set_contents("fs0:\\axl_rn_x.tmp", "y", 1);
     test_check(axl_file_rename("fs0:\\axl_rn_x.tmp",
                                "fs0:\\axl_sub\\axl_rn_x.tmp") != AXL_OK,
                "file: cross-directory rename refused");
@@ -224,7 +224,7 @@ test_file(void)
     /* Basename-only new_path (common from shell-style callers)
        continues to work — the same-dir check accepts no-separator
        new as "implicitly in old's directory". */
-    axl_file_set_contents("fs0:\\axl_rn_b.tmp", "z", 1);
+    (void)axl_file_set_contents("fs0:\\axl_rn_b.tmp", "z", 1);
     test_check(axl_file_rename("fs0:\\axl_rn_b.tmp",
                                "axl_rn_b2.tmp") == AXL_OK,
                "file: rename to basename-only new_path");
@@ -236,7 +236,7 @@ test_file(void)
        value at write time). Used by WebDAV PROPFIND so clients
        like macOS Finder can decide if a cached entry needs
        re-fetch. */
-    axl_file_set_contents("fs0:\\axl_mt.tmp", "data", 4);
+    (void)axl_file_set_contents("fs0:\\axl_mt.tmp", "data", 4);
     AxlFsEntry finfo;
     test_check(axl_file_info("fs0:\\axl_mt.tmp", &finfo) == AXL_OK,
                "file: info on test file");
@@ -247,7 +247,7 @@ test_file(void)
     /* --- axl_file_move: same-directory case falls through to rename
        (fast atomic-on-FAT path); cross-directory case does the
        copy+delete fallback that axl_file_rename refuses. */
-    axl_file_set_contents("fs0:\\axl_mv_a.tmp", "alpha", 5);
+    (void)axl_file_set_contents("fs0:\\axl_mv_a.tmp", "alpha", 5);
     test_check(axl_file_move("fs0:\\axl_mv_a.tmp",
                              "fs0:\\axl_mv_a2.tmp") == AXL_OK,
                "file: move same-dir succeeds");
@@ -263,7 +263,7 @@ test_file(void)
 
     /* Cross-directory move via copy+delete. */
     axl_dir_mkdir("fs0:\\axl_mv_sub");
-    axl_file_set_contents("fs0:\\axl_mv_x.tmp", "beta-x", 6);
+    (void)axl_file_set_contents("fs0:\\axl_mv_x.tmp", "beta-x", 6);
     test_check(axl_file_move("fs0:\\axl_mv_x.tmp",
                              "fs0:\\axl_mv_sub\\axl_mv_x.tmp") == AXL_OK,
                "file: move cross-dir succeeds");
@@ -285,8 +285,8 @@ test_file(void)
     /* Overwrite-if-exists semantics (POSIX rename-style). Pin the
        contract so consumers can rely on it. Same-directory and
        cross-directory both replace an existing destination. */
-    axl_file_set_contents("fs0:\\axl_ow_src.tmp", "new", 3);
-    axl_file_set_contents("fs0:\\axl_ow_dst.tmp", "OLD-DATA", 8);
+    (void)axl_file_set_contents("fs0:\\axl_ow_src.tmp", "new", 3);
+    (void)axl_file_set_contents("fs0:\\axl_ow_dst.tmp", "OLD-DATA", 8);
     test_check(axl_file_move("fs0:\\axl_ow_src.tmp",
                              "fs0:\\axl_ow_dst.tmp") == AXL_OK,
                "file: move same-dir overwrites existing dest");
@@ -298,7 +298,7 @@ test_file(void)
     axl_file_delete("fs0:\\axl_ow_dst.tmp");
 
     /* AxlFsEntry.mtime_unix also populated by the dir-walk path. */
-    axl_file_set_contents("fs0:\\axl_md.tmp", "more", 4);
+    (void)axl_file_set_contents("fs0:\\axl_md.tmp", "more", 4);
     AxlDir *dir = axl_dir_open("fs0:\\");
     test_check(dir != NULL, "dir: open fs0:\\");
     bool saw_md_with_mtime = false;

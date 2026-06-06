@@ -11,13 +11,17 @@
     `axl_gfx_fill_rect_i(px, py, 1, 1, color)` — the same plotting
     primitive the path rasterizer uses — so clipping, the active draw
     target (screen or buffer), and source-over blending are all
-    handled in one place.
+    handled in one place.  An opaque, unclipped, on-screen fill takes a
+    fast path that samples into a scratch buffer and `axl_gfx_blit`s it
+    once (one GOP Blt) — see `axl_gfx_fill_rect_gradient` — avoiding a
+    1x1 Blt per pixel on Blt-only GOPs.
 
     Interpolation is per-channel linear in the stored (sRGB) byte
     values, matching `axl_gfx_blend`.  Gamma-correct interpolation is
     a future refinement (would compose with axl_pow from AxlMath).
 **/
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <axl/axl-gfx-gradient.h>
@@ -303,8 +307,55 @@ axl_gfx_fill_rect_gradient(
         return AXL_OK;   /* documented no-op */
     }
 
-    /* 64-bit bounds: the header allows negative origins and arbitrary
-     * extents, so x + w / y + h could overflow int32. fill_rect_i
+    /* Fast path: an OPAQUE gradient filling an UNCLIPPED on-screen region.
+     * Render the samples into a flat pixel buffer and blit them in ONE GOP
+     * operation, instead of the per-pixel loop below — which on the screen
+     * target issues a 1x1 GOP Blt *per pixel*. On a Blt-only GOP (e.g.
+     * virtio-gpu) that is ~1M Blts for a full-screen gradient (minutes at
+     * 100% CPU). The samples are identical to the per-pixel path, so the
+     * result is unchanged; this only relocates the writes.
+     *
+     * Restricted to: opaque (so blit's overwrite matches the per-pixel
+     * composite), no active clip (axl_gfx_get_clip == AXL_ERR), non-negative
+     * origin, and the screen target (buffer targets already write RAM and
+     * keep the per-pixel path for exact behavior). Anything else, or OOM,
+     * falls through. */
+    bool grad_opaque = true;
+    for (int gi = 0; gi < g->n_stops; gi++) {
+        if (g->stops[gi].color.alpha != 0xFF) {
+            grad_opaque = false;
+            break;
+        }
+    }
+    AxlGfxClip clip_probe;
+    /* 64 Mpx cap (256 MiB scratch) — generous past any real GOP (8K ~33 Mpx)
+     * but bounds the malloc so (size_t)w*h*4 can't overflow for adversarial
+     * INT32-scale extents. Larger requests fall through to the per-pixel
+     * path, which clips each pixel and allocates nothing. */
+    if (grad_opaque && x >= 0 && y >= 0
+        && (uint64_t)w * (uint64_t)h <= (64u * 1024u * 1024u)
+        && axl_gfx_get_current_target() == NULL          /* screen target */
+        && axl_gfx_get_clip(&clip_probe) == AXL_ERR) {    /* no clip active */
+        AxlGfxPixel *row_px =
+            axl_malloc((size_t)w * (size_t)h * sizeof(AxlGfxPixel));
+        if (row_px != NULL) {
+            for (int32_t row = 0; row < h; row++) {
+                for (int32_t col = 0; col < w; col++) {
+                    row_px[(size_t)row * (size_t)w + (size_t)col] =
+                        axl_gfx_gradient_sample(g, x + col, y + row);
+                }
+            }
+            axl_gfx_blit(row_px, (uint32_t)x, (uint32_t)y,
+                         (uint32_t)w, (uint32_t)h);
+            axl_free(row_px);
+            return AXL_OK;
+        }
+        /* OOM → fall through to the per-pixel path. */
+    }
+
+    /* Per-pixel path (buffer targets, alpha gradients, clipped or negative
+     * origins, OOM). 64-bit bounds: the header allows negative origins and
+     * arbitrary extents, so x + w / y + h could overflow int32. fill_rect_i
      * clips each pixel, so out-of-range coords are harmless. */
     int64_t x_end = (int64_t)x + (int64_t)w;
     int64_t y_end = (int64_t)y + (int64_t)h;

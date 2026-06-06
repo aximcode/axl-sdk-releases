@@ -21,9 +21,27 @@
 #                         axl_gfx_*-using app. Required on AARCH64
 #                         (`virt` machine has no default display);
 #                         harmless on X64. --screenshot implies this.
+#   --gui / --display gtk Open a GTK window for the guest's GOP framebuffer
+#                         (implies --gpu; serial stays on this terminal).
+#                         Rides X11 forwarding (ssh -Y + XQuartz). NOTE:
+#                         GTK over remote X11 (e.g. XQuartz) often fails to
+#                         repaint the framebuffer — prefer --vnc-reverse.
+#   --vnc [N]             Serve VNC on display :N (default :1, TCP 5901);
+#                         connect a viewer in (tunnel the port if remote).
+#   --vnc-reverse HOST:PORT
+#                         Connect OUT to a VNC viewer running in listen
+#                         mode at HOST:PORT — the window auto-appears on
+#                         the client with no per-run reconnect. Best path
+#                         for live GOP viewing over SSH/Tailscale. All
+#                         three imply --gpu and have no timeout.
 #   --net                 Enable user-mode networking (virtio-net)
 #   --hostfwd H:G         Forward host port H to guest port G (repeatable)
 #   --extra FILE          Stage additional .efi file on disk (repeatable)
+#   --sendkey "K K ..."   With --screenshot: inject QEMU monitor key tokens
+#                         (e.g. "h i spc t h e r e", "ctrl-s", "ret") once
+#                         the app is up, then capture — for "screenshot the
+#                         app after input X". Repeatable; auto-adds a USB
+#                         keyboard on aarch64.
 #   --nsh FILE            Use custom startup.nsh instead of auto-generated
 #   --background          Launch QEMU in background, print PID
 #   --serial-log FILE     Save serial output to FILE
@@ -110,10 +128,18 @@ GDB_HALT=false
 DEBUGCON_LOG=""
 EFI_FILE=""
 EFI_ARGS=()
+SENDKEY_SEQ=""   # space-separated QEMU monitor key tokens to inject (--screenshot)
+SENDMOUSE_SEQ="" # space-separated "fx,fy[,click]" absolute-pointer moves (--screenshot, QMP)
 CPU_WARN=true
 CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
 CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
 INTERACTIVE=false
+# --display BACKEND (or --gui = gtk): open a real graphical window for the
+# guest's GOP framebuffer instead of running headless. Over SSH this rides
+# X11 forwarding (ssh -Y + an X server like XQuartz on the client), so the
+# window pops up on the client's screen. Implies --gpu. gtk is the only
+# backend the bundled QEMU builds with today.
+DISPLAY_BACKEND=""
 MOUNT_DIR=""
 MOUNT_TAG="hostfs"
 MEM="512M"            # guest RAM (also used for memory-backend-file size)
@@ -135,12 +161,28 @@ while [[ $# -gt 0 ]]; do
         --raw)        RAW=true; shift ;;
         --screenshot) SCREENSHOT="$2"; shift 2 ;;
         --gpu)        ENABLE_GPU=true; shift ;;
+        --display)    DISPLAY_BACKEND="$2"; shift 2 ;;
+        --gui)        DISPLAY_BACKEND="gtk"; shift ;;
+        --vnc)
+            # Optional display number (default :1 → TCP 5901). QEMU serves
+            # VNC; a viewer connects in (tunnel the port for a remote host).
+            if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+                DISPLAY_BACKEND="vnc=:$2"; shift 2
+            else
+                DISPLAY_BACKEND="vnc=:1"; shift
+            fi ;;
+        --vnc-reverse)
+            # HOST:PORT of a VNC viewer running in listen mode; QEMU
+            # connects OUT to it (auto-appears, no per-run reconnect).
+            DISPLAY_BACKEND="vnc=$2,reverse=on"; shift 2 ;;
         --net)        NET=true; shift ;;
         --bridges)    BRIDGES=true; shift ;;
         --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
+        --sendkey)    SENDKEY_SEQ+=" $2"; shift 2 ;;
+        --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
         --ipmi)       IPMI_INPROC=true; shift ;;
         --ipmi-extern) IPMI_EXTERN_SOCK="$2"; shift 2 ;;
@@ -199,6 +241,28 @@ Options:
                            visual demos (the `virt` machine has no
                            default display device). Harmless on X64
                            (q35 already provides GOP).
+  --gui / --display gtk    Open a GTK window for the guest's GOP
+                           framebuffer. Implies --gpu; guest serial
+                           stays on this terminal. Rides X11 forwarding
+                           (ssh -Y + an X server such as XQuartz). NOTE:
+                           QEMU's GTK over remote X11 frequently fails to
+                           repaint the framebuffer (the window opens but
+                           graphics don't update) — for SSH use prefer
+                           --vnc-reverse below.
+  --vnc [N]                Serve VNC on display :N (default :1, TCP
+                           5901). A viewer connects in; tunnel the port
+                           for a remote host
+                           (ssh -L 5901:localhost:5901 <host>).
+  --vnc-reverse HOST:PORT  Connect OUT to a VNC viewer running in listen
+                           mode at HOST:PORT (e.g. TigerVNC
+                           `vncviewer -listen PORT`, started with
+                           `-SecurityTypes None`). The window auto-
+                           appears on the client with no per-run
+                           reconnect — the best path for live GOP
+                           viewing over SSH / Tailscale.
+                           All display modes imply --gpu, have no
+                           timeout, and are mutually exclusive with
+                           --background / --screenshot / --interactive.
   --net                    Enable user-mode networking (virtio-net)
   --bridges                Add a small PCI bridge tree (one PCIe root
                            port + a virtio-rng device behind it) AND a
@@ -218,6 +282,17 @@ Options:
                            fallback. Implies --net.
   --hostfwd HOST:GUEST     Forward host port to guest (repeatable)
   --extra FILE             Stage additional .efi on disk (repeatable)
+  --sendkey "K K ..."      With --screenshot: inject QEMU monitor key
+                           tokens (space-separated; e.g.
+                           "h i spc t h e r e", "ctrl-s", "ret") after the
+                           app is up, then capture. Repeatable; auto-adds
+                           a USB keyboard on aarch64.
+  --sendmouse "fx,fy[,click]"
+                           With --screenshot: move the absolute pointer to
+                           screen-fraction (fx,fy) in [0,1] via QMP (a
+                           usb-tablet is auto-added), optionally pressing+
+                           releasing the left button (",click"). Injected
+                           after --sendkey, before capture. Repeatable.
   --qemu-arg STRING        Append literal STRING to the qemu command
                            line. Repeatable; multiple values accumulate
                            in order. Each STRING is shell-word-split,
@@ -375,6 +450,48 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     # The CPU-spike WARN line would interleave with whatever the user
     # is reading. Disable the sampler unconditionally in interactive.
     CPU_WARN=false
+fi
+
+# --display / --gui: open a graphical window for the guest's GOP
+# framebuffer. Validate the backend, imply --gpu (the window needs a
+# display device — essential on the aa64 `virt` machine, harmless on
+# x64), and reject the headless/capture modes it conflicts with.
+if [[ -n "$DISPLAY_BACKEND" ]]; then
+    case "$DISPLAY_BACKEND" in
+        gtk) ;;
+        vnc=*) ;;   # vnc=:N (serve) or vnc=HOST:PORT,reverse (connect to a listening viewer)
+        *)
+            echo "ERROR: --display: unsupported backend '$DISPLAY_BACKEND' (supported: gtk, vnc=...)" >&2
+            exit 1 ;;
+    esac
+    if [[ "$BACKGROUND" == "true" ]]; then
+        echo "ERROR: --display cannot be combined with --background" >&2
+        exit 1
+    fi
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        echo "ERROR: --display cannot be combined with --interactive" >&2
+        exit 1
+    fi
+    if [[ -n "$SCREENSHOT" ]]; then
+        echo "ERROR: --display cannot be combined with --screenshot" >&2
+        exit 1
+    fi
+    ENABLE_GPU=true
+    CPU_WARN=false   # the window is the output; spike WARN would just be noise
+    # The GTK window is an X11 client; over SSH it needs a forwarded
+    # display. Fail early with actionable guidance rather than QEMU's
+    # terse "Could not initialize GTK" / "cannot open display".
+    if [[ "$DISPLAY_BACKEND" == gtk && -z "${DISPLAY:-}" ]]; then
+        cat >&2 <<'EOF'
+ERROR: --display gtk needs an X11 display, but $DISPLAY is unset.
+  Over SSH: reconnect with X11 forwarding and an X server running on
+  your client, e.g. from a Mac with XQuartz open:
+      ssh -Y <thishost>
+  then re-run. (Verify with: echo $DISPLAY — should be set, e.g.
+  localhost:10.0.)
+EOF
+        exit 1
+    fi
 fi
 
 # --mount: validate host-side dependencies up-front so we fail loudly
@@ -764,7 +881,8 @@ else
         fi
         if [[ -n "$EFI_FILE" && -z "$SCREENSHOT" \
               && "$BACKGROUND" != "true" \
-              && "$INTERACTIVE" != "true" ]]; then
+              && "$INTERACTIVE" != "true" \
+              && -z "$DISPLAY_BACKEND" ]]; then
             echo "reset -s"
         fi
     } > "$STAGING/startup.nsh"
@@ -900,6 +1018,15 @@ cpu_summary() {
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 
+# Skip the firmware Boot Manager countdown before auto-booting the first
+# option (the UEFI shell). QEMU publishes this as the `etc/boot-menu-wait`
+# fw_cfg, sourced from `-boot splash-time=N` (ms); OVMF's
+# GetFrontPageTimeoutFromQemu() reads it and, when 0, boots immediately
+# (otherwise it defaults to ~5 s). Faster, more deterministic boots — and
+# the visual-capture timing no longer rides on a 5 s wait. Set
+# QEMU_BOOT_MENU_WAIT to a non-empty ms value to restore a countdown.
+CMD+=(-boot "splash-time=${QEMU_BOOT_MENU_WAIT:-0}")
+
 # --gpu / --screenshot: wire a virtual GPU device.  AARCH64's `virt`
 # machine has no default display device, so axl_gfx_* + any other
 # GOP-using app reports "no display" until one is added.  X64's q35
@@ -909,9 +1036,45 @@ CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 # `screendump` monitor command needs a framebuffer to read.
 if [[ "$ENABLE_GPU" == "true" || -n "$SCREENSHOT" ]]; then
     case "$ARCH" in
-        X64)     CMD+=(-device VGA) ;;
+        X64)
+            if [[ -n "$DISPLAY_BACKEND" ]]; then
+                # Live graphical window (--display/--gui): std VGA does NOT
+                # reliably mark direct linear-framebuffer writes dirty, so the
+                # GTK window shows stale pixels even though the GOP app drew
+                # correctly (a screendump still captures them — it reads the
+                # whole FB on demand). virtio-gpu's explicit RESOURCE_FLUSH /
+                # Blt model updates the live display properly. We keep std VGA
+                # for the headless --gpu / --screenshot paths (and the gfx
+                # present tests, which assert the x64 direct-FB GOP path).
+                CMD+=(-vga none -device virtio-gpu-pci)
+            else
+                CMD+=(-device VGA)
+            fi
+            ;;
         AARCH64) CMD+=(-device virtio-gpu-pci) ;;
     esac
+fi
+
+# --sendkey needs a keyboard.  X64's q35 has a PS/2 controller already;
+# the AARCH64 `virt` machine ships none, so add a USB keyboard so monitor
+# `sendkey` events reach the guest.
+if [[ -n "$SENDKEY_SEQ" && "$ARCH" == "AARCH64" ]]; then
+    CMD+=(-device "qemu-xhci,id=axl_kbd_xhci" -device "usb-kbd,bus=axl_kbd_xhci.0")
+fi
+
+# Live display (--display/--gui/--vnc...): add a RELATIVE usb-mouse so a pointer
+# actually works over the graphical session. Stock OVMF only binds a relative
+# boot mouse (UsbMouseDxe -> EFI_SIMPLE_POINTER); a usb-tablet's
+# EFI_ABSOLUTE_POINTER is never fed by OVMF (no backing) AND forces QEMU into
+# absolute VNC mode, which mis-routes the relative mouse — i.e. the tablet
+# yields NO usable pointer in pre-boot OVMF. Gated on a live display so plain
+# headless --screenshot baselines (which expect NO pointer) stay byte-stable.
+if [[ -n "$DISPLAY_BACKEND" ]]; then
+    CMD+=(-device "qemu-xhci,id=axl_mouse_xhci" -device "usb-mouse,bus=axl_mouse_xhci.0,id=axl_mouse")
+elif [[ -n "$SENDMOUSE_SEQ" ]]; then
+    # Headless QMP --sendmouse path keeps the absolute usb-tablet (legacy; note
+    # OVMF doesn't deliver discrete injected events either — see docs).
+    CMD+=(-device "qemu-xhci,id=axl_tablet_xhci" -device "usb-tablet,bus=axl_tablet_xhci.0,id=axl_tablet")
 fi
 
 # --bridges: matching topology to test/integration/common-test.sh so
@@ -1340,12 +1503,79 @@ HINT
     exit $?
 fi
 
+# Windowed mode — open a real graphical window for the guest's GOP
+# framebuffer (--display gtk / --gui). Over SSH the GTK window is an X11
+# client that rides the forwarded display, so it pops up on the client
+# (e.g. a Mac running XQuartz). The guest serial console still goes to
+# this terminal, so app text + the UEFI shell are readable here while the
+# graphics render in the window. Like interactive: no timeout, no ANSI
+# strip, no CPU sampler — the window stays up until the app resets or you
+# close it. gl=off keeps GTK on software surfaces (this QEMU is built
+# --disable-opengl, and GL over forwarded X11 is the thing that breaks).
+if [[ -n "$DISPLAY_BACKEND" ]]; then
+    if [[ "$DISPLAY_BACKEND" == gtk ]]; then
+        # gl=off keeps GTK on software surfaces (GL over forwarded X11 breaks).
+        CMD+=(-display "$DISPLAY_BACKEND,gl=off")
+        cat >&2 <<HINT
+[run-qemu] Windowed mode (gtk) — a QEMU window should open on your X server
+[run-qemu]   (DISPLAY=${DISPLAY:-}). Guest serial is on this terminal; graphics
+[run-qemu]   render in the window. Close the window (or Ctrl-C here) to quit.
+HINT
+    else
+        # VNC backend. Two shapes:
+        #   vnc=:N                     — serve VNC on TCP 5900+N (viewer connects in)
+        #   vnc=HOST:PORT,reverse      — connect out to a listening viewer at HOST:PORT
+        CMD+=(-display "$DISPLAY_BACKEND")
+        spec="${DISPLAY_BACKEND#vnc=}"
+        if [[ "$spec" == *,reverse* ]]; then
+            target="${spec%,reverse*}"
+            cat >&2 <<HINT
+[run-qemu] VNC reverse mode — connecting out to a listening viewer at $target.
+[run-qemu]   Start your viewer in listen mode first (e.g. TigerVNC
+[run-qemu]   'vncviewer -listen <port>'). Guest serial is on this terminal;
+[run-qemu]   graphics appear in the viewer. Ctrl-C here to quit.
+HINT
+        elif [[ "$spec" =~ ^:([0-9]+)$ ]]; then
+            n="${BASH_REMATCH[1]}"
+            cat >&2 <<HINT
+[run-qemu] VNC mode — QEMU serves VNC on display :$n (TCP $((5900 + n))).
+[run-qemu]   Connect a viewer; for a remote host, tunnel first, e.g.:
+[run-qemu]     ssh -L $((5900 + n)):localhost:$((5900 + n)) <thishost>
+[run-qemu]   then point your viewer at localhost:$n. Guest serial is on this
+[run-qemu]   terminal. Ctrl-C here to quit.
+HINT
+        else
+            echo "[run-qemu] VNC mode ($DISPLAY_BACKEND). Guest serial on this terminal; Ctrl-C to quit." >&2
+        fi
+    fi
+    CMD+=(-serial stdio
+          -no-reboot)
+
+    # QEMU may put this terminal into raw mode for the serial console;
+    # restore line discipline on any exit path, and reap helper daemons.
+    cleanup_cmd='rm -rf "'"$TMPDIR"'"; stty sane 2>/dev/null || true'
+    [[ -n "$SWTPM_PID" ]] && \
+        cleanup_cmd="kill $SWTPM_PID 2>/dev/null; $cleanup_cmd"
+    [[ -n "$VIRTIOFSD_PID" ]] && \
+        cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
+    trap "$cleanup_cmd" EXIT INT TERM
+
+    "${CMD[@]}"
+    exit $?
+fi
+
 # Screenshot mode
 if [[ -n "$SCREENSHOT" ]]; then
     MONSOCK="$TMPDIR/monitor.sock"
     # GPU device already wired above (--screenshot implies --gpu).
     CMD+=(-serial "file:$LOG" -display none)
     CMD+=(-monitor "unix:$MONSOCK,server,nowait")
+    # HMP `sendkey` covers keys, but HMP has no absolute-pointer move; the
+    # QMP `input-send-event` does. Add a QMP socket only when injecting mouse.
+    QMPSOCK="$TMPDIR/qmp.sock"
+    if [[ -n "$SENDMOUSE_SEQ" ]]; then
+        CMD+=(-qmp "unix:$QMPSOCK,server,nowait")
+    fi
 
     set +e
     "${CMD[@]}" &
@@ -1354,6 +1584,43 @@ if [[ -n "$SCREENSHOT" ]]; then
     WAIT=$((TIMEOUT - 3))
     [[ $WAIT -lt 5 ]] && WAIT=5
     sleep "$WAIT"
+
+    # --sendkey: inject key tokens via the monitor once the app is up, then
+    # let it settle/repaint before the dump.  Generous per-key delay (TCG is
+    # slow on aarch64) so no keystroke is dropped.
+    if [[ -n "$SENDKEY_SEQ" ]]; then
+        key_delay=0.4
+        [[ "$ARCH" == "AARCH64" ]] && key_delay=1.0
+        for key in $SENDKEY_SEQ; do
+            echo "sendkey $key" | socat -t 2 - "UNIX-CONNECT:$MONSOCK" >/dev/null 2>&1
+            sleep "$key_delay"
+        done
+        sleep 1.5   # let the app process + repaint before capture
+    fi
+
+    # --sendmouse: inject absolute-pointer moves via QMP after any keys.
+    # fx,fy are screen fractions in [0,1] → QEMU's abs axis range 0..32767
+    # (INPUT_EVENT_ABS_MAX), so the caller needn't know the guest resolution.
+    # A trailing ",click" presses+releases the left button at that point.
+    if [[ -n "$SENDMOUSE_SEQ" ]]; then
+        move_delay=0.4
+        [[ "$ARCH" == "AARCH64" ]] && move_delay=1.0
+        for m in $SENDMOUSE_SEQ; do
+            IFS=',' read -r fx fy click <<<"$m"
+            vx=$(awk "BEGIN{printf \"%d\", $fx*32767}")
+            vy=$(awk "BEGIN{printf \"%d\", $fy*32767}")
+            {
+                printf '%s\n' '{"execute":"qmp_capabilities"}'
+                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$vx}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$vy}}]}}"
+                if [[ "$click" == "click" ]]; then
+                    printf '%s\n' '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":true}}]}}'
+                    printf '%s\n' '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":false}}]}}'
+                fi
+            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+            sleep "$move_delay"
+        done
+        sleep 1.5   # let the app process the motion + repaint before capture
+    fi
 
     for try in 1 2 3; do
         echo "screendump $TMPDIR/screenshot.ppm" | \

@@ -8,7 +8,11 @@
       axl-cc grep.c -o grep.efi
 
     Usage:
-      grep [-i] [-n] [-c] [-r] [-v] [-h] pattern [file ...]
+      grep [-E] [-i] [-n] [-c] [-r] [-v] [-h] pattern [file ...]
+
+    -E interprets the pattern as an extended regular expression
+    (AxlRegex), like grep -E; without it the pattern is a literal
+    string matched via the fast Boyer-Moore-Horspool path.
 
     With no file arguments, reads from stdin — works as the right-hand
     side of a UEFI Shell pipe (`some-tool | grep pattern`) on shells
@@ -36,10 +40,16 @@ static bool show_line_numbers = false;
 static bool count_only = false;
 static bool invert_match = false;
 static bool show_progress = false;
+/* Non-NULL when -E was given: the pattern compiled once, searched per
+   line. NULL selects the literal (Boyer-Moore-Horspool) fast path. */
+static AxlRegex *regex = NULL;
 
 static const AxlArgDesc flags[] = {
     { .name = "ignore-case",   .short_name = 'i', .type = AXL_ARG_BOOL,
       .help = "Case-insensitive match" },
+    { .name = "extended-regexp", .short_name = 'E', .type = AXL_ARG_BOOL,
+      .help = "Interpret the pattern as an extended regular expression "
+              "(AxlRegex / grep -E style) instead of a literal string" },
     { .name = "line-number",   .short_name = 'n', .type = AXL_ARG_BOOL,
       .help = "Show line numbers" },
     { .name = "count",         .short_name = 'c', .type = AXL_ARG_BOOL,
@@ -185,10 +195,19 @@ grep_stream(
         }
 
         /* The line slice points into line_buf and is NOT NUL-
-           terminated; both matchers take an explicit length. */
-        bool match = case_insensitive
-                   ? (axl_strcasestr_len(line, (long long)len, pattern) != NULL)
-                   : (axl_strstr_len(line, (long long)len, pattern) != NULL);
+           terminated; both paths take an explicit length. ^ and $
+           anchor to the line because each line is searched on its own
+           (the trailing newline / CR is already excluded above). */
+        bool match;
+        if (regex != NULL) {
+            AxlMatch m;
+            match = axl_regex_search_buf(regex, line, len, 0,
+                                         AXL_REGEX_MATCH_DEFAULT, &m);
+        } else {
+            match = case_insensitive
+                  ? (axl_strcasestr_len(line, (long long)len, pattern) != NULL)
+                  : (axl_strstr_len(line, (long long)len, pattern) != NULL);
+        }
         /* `--invert-match` flips the predicate — print lines that
          * do NOT contain the pattern. Linux `grep -v` semantics. */
         bool emit = invert_match ? !match : match;
@@ -263,6 +282,21 @@ run_grep(AxlArgs *a)
     int         file_count = axl_args_get_pos_count(a);
     bool multi_file = (file_count > 1) || recursive || show_progress;
 
+    /* -E: compile the pattern once. Case folding is baked into the
+       compiled regex (so the per-line path needs no case branch). A
+       malformed pattern is a usage error — report where and exit 2,
+       matching grep's "trouble" exit code. */
+    if (axl_args_get_bool(a, "extended-regexp")) {
+        AxlRegexError err = { 0 };
+        uint32_t rflags = case_insensitive ? AXL_REGEX_CASELESS : AXL_REGEX_DEFAULT;
+        regex = axl_regex_new_full(pattern, rflags, &err);
+        if (regex == NULL) {
+            axl_printerr("grep: invalid regex at offset %zu: %s\n",
+                         err.offset, err.message ? err.message : "syntax error");
+            return 2;
+        }
+    }
+
     size_t total_matches = 0;
     if (file_count == 0) {
         /* No files supplied — read from stdin. Useful as the right-
@@ -278,6 +312,9 @@ run_grep(AxlArgs *a)
             }
         }
     }
+
+    axl_regex_free(regex);   /* NULL-safe; clean even on the literal path */
+    regex = NULL;
 
     return (total_matches > 0) ? 0 : 1;
 }

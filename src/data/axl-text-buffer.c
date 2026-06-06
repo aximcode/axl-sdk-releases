@@ -25,6 +25,7 @@
  */
 
 #include <axl/axl-text-buffer.h>
+#include <axl/axl-regex.h>
 
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -492,4 +493,72 @@ axl_text_buffer_line_bounds(const AxlTextBuffer *tb, size_t line,
         *end = (line < tb->nl_count) ? tb->nl[line] : tb_len(tb);
     }
     return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Search — AxlByteReader adapter over the gap buffer + the shared engine
+// ---------------------------------------------------------------------------
+
+static size_t
+tb_reader_length(const AxlByteReader *r)
+{
+    return tb_len((const AxlTextBuffer *)r->ctx);
+}
+
+static size_t
+tb_reader_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
+{
+    return axl_text_buffer_get((const AxlTextBuffer *)r->ctx, offset, len,
+                               (char *)buf, len);
+}
+
+/* Zero-copy peek: a range lying wholly on one side of the gap is
+   contiguous in the backing store; one straddling the gap is not (the
+   engine then falls back to the windowed read). The engine only peeks
+   in-bounds ranges, so offset + len never overflows the logical length. */
+static const char *
+tb_reader_peek(const AxlByteReader *r, size_t offset, size_t len)
+{
+    const AxlTextBuffer *tb = (const AxlTextBuffer *)r->ctx;
+    size_t gs = tb->gap_start;
+    if (offset + len <= gs) {
+        return tb->buf + offset;                    /* entirely before the gap */
+    }
+    if (offset >= gs) {
+        return tb->buf + offset + tb_gapsize(tb);    /* entirely after the gap */
+    }
+    return NULL;                                    /* straddles the gap */
+}
+
+bool
+axl_text_buffer_find(AxlTextBuffer *tb, const char *needle, size_t needle_len,
+                     size_t from_offset, uint32_t flags, AxlMatch *out)
+{
+    if (tb == NULL || needle == NULL || out == NULL) {
+        return false;
+    }
+    AxlByteReader reader = {
+        .length = tb_reader_length,
+        .read   = tb_reader_read,
+        .peek   = tb_reader_peek,
+        .ctx    = tb,
+    };
+    return axl_find_in_source(&reader, needle, needle_len, from_offset,
+                              flags, out);
+}
+
+bool
+axl_text_buffer_find_regex(AxlTextBuffer *tb, const AxlRegex *re,
+                           size_t from_offset, uint32_t match_flags, AxlMatch *out)
+{
+    if (tb == NULL || re == NULL || out == NULL) {
+        return false;
+    }
+    AxlByteReader reader = {
+        .length = tb_reader_length,
+        .read   = tb_reader_read,
+        .peek   = tb_reader_peek,
+        .ctx    = tb,
+    };
+    return axl_regex_search(re, &reader, from_offset, match_flags, out);
 }

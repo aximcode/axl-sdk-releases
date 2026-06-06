@@ -8,11 +8,11 @@
     The exported functions are thin wrappers over existing
     primitives:
 
-      - publish   = axl_protocol_register_guid + axl_guid_v5(name);
+      - publish   = axl_protocol_install + axl_guid_v5(name);
                     defaults `*out_handle` to the driver's
                     `gImageHandle` so `unload` can resolve the
                     image-bearing handle via LocateHandleBuffer
-      - unpublish = axl_protocol_unregister_guid + same GUID
+      - unpublish = axl_protocol_uninstall + same GUID
       - locate    = axl_driver_ensure_with_embedded
                   + axl_protocol_find_guid + same GUID
       - unload    = LocateHandleBuffer(ByProtocol, GUID)
@@ -68,7 +68,7 @@ axl_shared_driver_publish(
     if (axl_shared_driver_guid(name, &guid) != AXL_OK) {
         return AXL_ERR;
     }
-    /* axl_protocol_register_guid takes void** for the handle — null
+    /* axl_protocol_install takes void** for the handle — null
        in-slot means "create a new handle", non-null means "use this
        one". We default to the driver's own image handle (gImageHandle,
        declared by axl-backend / axl-uefi-extra) so the protocol lives
@@ -77,12 +77,12 @@ axl_shared_driver_publish(
        by name (LocateHandleBuffer → image handle → UnloadImage).
        Consumers that want a separate handle can pre-set *out_handle
        to a specific value (or to a non-null sentinel like a fresh
-       axl_protocol_register_guid output) and this default is
+       axl_protocol_install output) and this default is
        skipped. */
     if (*out_handle == NULL) {
         *out_handle = (AxlHandle)gImageHandle;
     }
-    int rc = axl_protocol_register_guid(&guid, iface, (void **)out_handle);
+    int rc = axl_protocol_install(&guid, iface, out_handle);
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_publish: install failed for '%s'",
                     name);
@@ -104,7 +104,7 @@ axl_shared_driver_unpublish(
     if (axl_shared_driver_guid(name, &guid) != AXL_OK) {
         return AXL_ERR;
     }
-    int rc = axl_protocol_unregister_guid(handle, &guid, iface);
+    int rc = axl_protocol_uninstall(handle, &guid, iface);
     if (rc != AXL_OK) {
         axl_warning("axl_shared_driver_unpublish: uninstall failed for '%s'",
                     name);

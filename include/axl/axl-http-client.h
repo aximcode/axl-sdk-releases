@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-hash-table.h>
+#include <axl/axl-bytes.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -265,6 +266,22 @@ axl_http_request_stream_file(
 void
 axl_http_client_response_free(
     AxlHttpClientResponse *resp  ///< response to free (NULL-safe)
+);
+
+/**
+ * @brief Take the response body as an AxlBytes snapshot.
+ *
+ * Copies the response body into a reference-counted AxlBytes the
+ * caller owns, so it can outlive axl_http_client_response_free and be
+ * passed to other subsystems (a parser, a hasher, a cache) as the
+ * shared byte-blob currency. The response itself is unchanged.
+ *
+ * @return a new AxlBytes (release with axl_bytes_unref), or NULL if
+ *     @p resp is NULL, the body is empty, or on allocation failure.
+ */
+AxlBytes *
+axl_http_client_response_get_bytes(
+    const AxlHttpClientResponse *resp  ///< response to snapshot
 );
 
 #ifdef AXL_HAVE_AUTOPTR

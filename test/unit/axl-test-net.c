@@ -1202,7 +1202,7 @@ on_streaming_put_test(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
             buf[i] = (uint8_t)(i & 0xFF);
         }
         const char *path = "fs0:\\axl_stream_put.tmp";
-        axl_file_set_contents(path, buf, size_param);
+        (void)axl_file_set_contents(path, buf, size_param);
         axl_free(buf);
         rc = axl_http_request_stream_file(c, "PUT", url_buf, path,
                                           "application/octet-stream",
@@ -3547,6 +3547,87 @@ test_socket_bind(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlBytes adoption: server set_bytes + client response get_bytes (pure,
+// no network).
+// ---------------------------------------------------------------------------
+
+static void
+test_http_response_set_bytes(void)
+{
+    AxlHttpResponse r;
+    axl_memset(&r, 0, sizeof(r));
+
+    const char payload[] = { 1, 2, 3, 0, 4 };  // embedded NUL
+    AxlBytes *b = axl_bytes_new(payload, sizeof(payload));
+    axl_http_response_set_bytes(&r, b, "application/octet-stream");
+
+    test_check(r.body != NULL && !r.body_static,
+        "set_bytes: installs an owned (copied) body");
+    test_check(r.body != axl_bytes_get_data(b, NULL),
+        "set_bytes: body is a copy, not the AxlBytes storage");
+    test_check(r.body_size == sizeof(payload), "set_bytes: body_size matches");
+    test_check(axl_memcmp(r.body, payload, sizeof(payload)) == 0,
+        "set_bytes: content matches (incl. embedded NUL)");
+    test_check(r.content_type != NULL
+        && axl_strcmp(r.content_type, "application/octet-stream") == 0,
+        "set_bytes: content_type captured");
+    test_check(r.status_code == 200, "set_bytes: defaults status to 200");
+
+    // The response owns its copy, so the caller may unref immediately.
+    axl_bytes_unref(b);
+    test_check(axl_memcmp(r.body, payload, sizeof(payload)) == 0,
+        "set_bytes: body survives input unref");
+    axl_free(r.body);
+
+    // NULL content_type preserves prior; empty AxlBytes -> empty body.
+    AxlHttpResponse r2;
+    axl_memset(&r2, 0, sizeof(r2));
+    r2.content_type = "text/plain";
+    AxlBytes *empty = axl_bytes_new(NULL, 0);
+    axl_http_response_set_bytes(&r2, empty, NULL);
+    test_check(r2.content_type != NULL && axl_strcmp(r2.content_type, "text/plain") == 0,
+        "set_bytes: NULL content_type preserves prior value");
+    test_check(r2.body_size == 0, "set_bytes: empty AxlBytes -> empty body");
+    axl_bytes_unref(empty);
+    if (r2.body != NULL && !r2.body_static) {
+        axl_free(r2.body);
+    }
+}
+
+static void
+test_http_client_response_get_bytes(void)
+{
+    AxlHttpClientResponse resp;
+    axl_memset(&resp, 0, sizeof(resp));
+    const char body[] = "response-body-\x00-with-nul-inside";
+    resp.body = axl_malloc(sizeof(body));
+    axl_memcpy(resp.body, body, sizeof(body));
+    resp.body_size = sizeof(body);
+
+    AxlBytes *b = axl_http_client_response_get_bytes(&resp);
+    test_check(b != NULL && axl_bytes_get_size(b) == sizeof(body),
+        "client get_bytes: size matches");
+    size_t n = 0;
+    const uint8_t *p = axl_bytes_get_data(b, &n);
+    test_check(p != NULL && axl_memcmp(p, body, sizeof(body)) == 0,
+        "client get_bytes: content matches (incl. embedded NUL)");
+
+    // Snapshot outlives the response body being freed.
+    axl_free(resp.body);
+    resp.body = NULL;
+    resp.body_size = 0;
+    test_check(axl_memcmp(axl_bytes_get_data(b, NULL), body, sizeof(body)) == 0,
+        "client get_bytes: snapshot survives response body free");
+    axl_bytes_unref(b);
+
+    // Empty / NULL.
+    test_check(axl_http_client_response_get_bytes(&resp) == NULL,
+        "client get_bytes: empty body -> NULL");
+    test_check(axl_http_client_response_get_bytes(NULL) == NULL,
+        "client get_bytes: NULL resp -> NULL");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -3664,6 +3745,8 @@ test_net_main(
     test_tcp_recv_async_rearm();
     test_http_round_trip();
     test_http_response_set_static();
+    test_http_response_set_bytes();
+    test_http_client_response_get_bytes();
     test_http_response_set_range();
     test_http_response_set_content_range();
     test_http_response_set_streamer();

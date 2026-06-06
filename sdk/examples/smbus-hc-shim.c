@@ -188,7 +188,6 @@ pci_cfg_write8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg,
 // ---------------------------------------------------------------------------
 
 static uint16_t                 mSmbBase;
-static EFI_HANDLE               mHandle;
 static EFI_I2C_MASTER_PROTOCOL  mProtocol;
 
 // ---------------------------------------------------------------------------
@@ -487,7 +486,7 @@ dump_smbios_type38(void)
 EFI_STATUS EFIAPI
 DriverEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
-    axl_driver_init(ImageHandle, SystemTable);
+    axl_driver_init(ImageHandle, (AxlSystemTable *)SystemTable);
 
     if (find_ich9_smbus() != 0) {
         axl_error("ICH9 SMBus controller not found — shim cannot attach");
@@ -501,14 +500,14 @@ DriverEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     mProtocol.StartRequest              = i2c_start_request;
     mProtocol.I2cControllerCapabilities = NULL;
 
-    EFI_GUID guid = EFI_I2C_MASTER_PROTOCOL_GUID;
-    mHandle = NULL;
-    EFI_STATUS s = gBS->InstallProtocolInterface(
-        &mHandle, &guid, EFI_NATIVE_INTERFACE, &mProtocol);
-    if (EFI_ERROR(s)) {
-        axl_error("InstallProtocolInterface failed: 0x%lx",
-                  (unsigned long)s);
-        return s;
+    /* Publish via the AXL driver-authoring surface — no gBS-> drop-down.
+       AxlGuid is layout-compatible with EFI_GUID, so the generated GUID
+       constant casts cleanly; a NULL handle gets a fresh one. */
+    EFI_GUID  guid   = EFI_I2C_MASTER_PROTOCOL_GUID;
+    AxlHandle handle = NULL;
+    if (axl_protocol_install((const AxlGuid *)&guid, &mProtocol, &handle) != AXL_OK) {
+        axl_error("axl_protocol_install(EFI_I2C_MASTER_PROTOCOL) failed");
+        return EFI_DEVICE_ERROR;
     }
 
     axl_info("SmbusHcShim: published EFI_I2C_MASTER_PROTOCOL "
@@ -521,7 +520,7 @@ DriverEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 EFI_STATUS EFIAPI
 DriverEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
-    axl_driver_init(ImageHandle, SystemTable);
+    axl_driver_init(ImageHandle, (AxlSystemTable *)SystemTable);
     axl_warning("SmbusHcShim is x86-only (ICH9 SMBus needs Intel chipset + I/O ports)");
     return EFI_UNSUPPORTED;
 }

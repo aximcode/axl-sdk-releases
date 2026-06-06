@@ -285,6 +285,30 @@ the macros section.
 | Strings | `char *` (UTF-8 everywhere) | Not `CHAR16` |
 | Empty lines | Allowed, no trailing whitespace | |
 
+## Parameter Ordering
+
+**Output (and in/out) parameters come last.** A function reads
+inputs-then-outputs: the `[out]` / `[in,out]` pointers a function *writes
+through* go at the end of the parameter list.
+
+```c
+// ✓ out `handle` last
+int axl_protocol_install(const AxlGuid *guid, void *iface, AxlHandle *handle);
+// ✗ out first
+int axl_protocol_install(AxlHandle *handle, const AxlGuid *guid, void *iface);
+```
+
+Two exceptions:
+
+- **A pure-input "subject" handle stays first.** When the first argument is
+  the object the function *operates on* (read, not written), it leads even
+  though it's a pointer/handle — e.g. `axl_protocol_uninstall(AxlHandle
+  handle, const AxlGuid *guid, void *iface)`: `handle` is the input subject,
+  not an output.
+- **Variadic functions** must place every fixed parameter — including an
+  out-param — before `...` (C requires it), so an out-handle leads when
+  followed by varargs: `axl_protocol_register_multiple(void **handle, ...)`.
+
 ## Return Value Conventions
 
 Pick the narrowest type that carries the actual information. Four

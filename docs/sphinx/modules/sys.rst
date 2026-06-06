@@ -32,6 +32,15 @@ AxlDriver
 
 .. doxygenfile:: axl-driver.h
 
+AxlEfiStatus (UEFI-spec return type + constants)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``<axl/axl-efi-status.h>`` — the ``EFI_STATUS`` return type and common
+Appendix-D constants for implementing UEFI-spec protocols without
+pulling in all of ``<uefi/axl-uefi.h>``.
+
+.. doxygenfile:: axl-efi-status.h
+
 AxlEmbed
 ~~~~~~~~
 

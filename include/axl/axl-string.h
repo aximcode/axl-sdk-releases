@@ -195,7 +195,7 @@ axl_string_overwrite(
  */
 const char *
 axl_string_str(
-    AxlString *b  ///< string builder
+    const AxlString *b  ///< string builder
 );
 
 /**

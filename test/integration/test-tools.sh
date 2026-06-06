@@ -58,6 +58,11 @@ echo "needle in haystack"  > "$TEST_STAGING/testdir/match.txt"
 echo "other content"       > "$TEST_STAGING/testdir/other.log"
 echo "sub file"            > "$TEST_STAGING/testdir/subdir/deep.txt"
 
+# Regex fixture for grep -E: three distinct lines, so a regex-only
+# pattern's output is unambiguous — a literal search for the same
+# pattern (e.g. "a.ple") would match nothing.
+printf 'apple pie\nbanana split\ncherry tart\n' > "$TEST_STAGING/regex_test.txt"
+
 # Multi-line file for cat formatting tests (3 content lines + 2 blank
 # runs to exercise -n line numbering and -s blank squeezing).
 printf 'first\nsecond\n\n\nthird\n' > "$TEST_STAGING/cat3.txt"
@@ -113,6 +118,13 @@ printf 'h\x00e\x00a\x00d\x00l\x00e\x00s\x00s\x00\n\x00' \
     # fixed buffer that would have truncated the line below the
     # match offset.
     echo "grep.efi NEEDLE grep_long.txt"
+    echo ""
+    echo "echo === TEST-GREP-REGEX ==="
+    # -E enables AxlRegex. 'a.ple' (dot = any char) matches "apple"; a
+    # literal "a.ple" would not — proves the regex path is live.
+    echo "grep.efi -E a.ple regex_test.txt"
+    # -E -i: case-insensitive regex 'BAN.NA' matches "banana".
+    echo "grep.efi -E -i BAN.NA regex_test.txt"
     echo ""
     echo "echo === TEST-FIND ==="
     echo "find.efi testdir"
@@ -261,6 +273,14 @@ check "grep-recursive-done"   "=== TEST-FIND ==="
 # read returns the full line (old fixed 1024-byte buffer would
 # have dropped everything past byte 1024).
 check "grep-longline-streamed" "AAAANEEDLE\|grep_long.txt:.*NEEDLE"
+
+# grep -E: regex '.' matches any char — 'a.ple' hits "apple pie" but a
+# literal "a.ple" matches nothing, so this line proves the regex path.
+check "grep-regex-dot"        "apple pie"
+# grep -E -i: case-insensitive regex 'BAN.NA' matches "banana split".
+check "grep-regex-icase"      "banana split"
+# Selectivity: the regex greps must not spill onto the non-matching line.
+check_absent_in_section "grep-regex-selective" "TEST-GREP-REGEX" "cherry tart"
 
 # find: should list entries in the test directory
 check "find-match-txt"        "match.txt"

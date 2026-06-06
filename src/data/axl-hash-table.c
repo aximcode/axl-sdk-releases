@@ -9,9 +9,11 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-log.h>
 #include <axl/axl-hash-table.h>
+#include <axl/axl-list.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 
@@ -52,10 +54,11 @@ struct AxlHashTable {
 
 // axl_str_hash and axl_str_equal are defined in axl-str.c
 
-size_t
-axl_direct_hash(const void *key)
+// Avalanche a raw integer into a well-distributed hash. Shared by the
+// pointer/int/int64/double hashers below.
+static size_t
+hash_finalize(size_t v)
 {
-    size_t v = (size_t)key;
 #if defined(MDE_CPU_X64) || defined(MDE_CPU_AARCH64)
     // splitmix64 finalizer
     v ^= v >> 30;
@@ -72,10 +75,61 @@ axl_direct_hash(const void *key)
     return v;
 }
 
+size_t
+axl_direct_hash(const void *key)
+{
+    return hash_finalize((size_t)key);
+}
+
 bool
 axl_direct_equal(const void *a, const void *b)
 {
     return a == b;
+}
+
+size_t
+axl_int_hash(const void *key)
+{
+    return hash_finalize((size_t)(uint32_t)*(const int *)key);
+}
+
+bool
+axl_int_equal(const void *a, const void *b)
+{
+    return *(const int *)a == *(const int *)b;
+}
+
+size_t
+axl_int64_hash(const void *key)
+{
+    return hash_finalize((size_t)(uint64_t)*(const int64_t *)key);
+}
+
+bool
+axl_int64_equal(const void *a, const void *b)
+{
+    return *(const int64_t *)a == *(const int64_t *)b;
+}
+
+size_t
+axl_double_hash(const void *key)
+{
+    double d = *(const double *)key;
+    uint64_t bits;
+    // Normalize -0.0 to +0.0 so the two (which compare equal under
+    // axl_double_equal) hash identically.
+    if (d == 0.0) {
+        bits = 0;
+    } else {
+        axl_memcpy(&bits, &d, sizeof(bits));
+    }
+    return hash_finalize((size_t)bits);
+}
+
+bool
+axl_double_equal(const void *a, const void *b)
+{
+    return *(const double *)a == *(const double *)b;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +205,90 @@ resize(struct AxlHashTable *table)
     table->bucket_count = new_count;
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GLib-parity bulk operations
+// ---------------------------------------------------------------------------
+
+bool
+axl_hash_table_add(AxlHashTable *h, void *key)
+{
+    return axl_hash_table_replace(h, key, key) == AXL_HASH_TABLE_NEW;
+}
+
+void
+axl_hash_table_remove_all(AxlHashTable *h)
+{
+    if (h == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < h->bucket_count; i++) {
+        hash_node *node = h->buckets[i];
+        while (node != NULL) {
+            hash_node *next = node->next;
+            free_key(h, node->key);
+            free_value(h, node->value);
+            axl_free(node);
+            node = next;
+        }
+        h->buckets[i] = NULL;
+    }
+    h->entry_count = 0;
+}
+
+void *
+axl_hash_table_find(
+    AxlHashTable         *h,
+    AxlHashTableFindFunc  predicate,
+    void                 *data
+    )
+{
+    if (h == NULL || predicate == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < h->bucket_count; i++) {
+        for (hash_node *node = h->buckets[i]; node != NULL; node = node->next) {
+            if (predicate(node->key, node->value, data)) {
+                return node->value;
+            }
+        }
+    }
+    return NULL;
+}
+
+AxlList *
+axl_hash_table_get_keys(AxlHashTable *h)
+{
+    AxlList *list = NULL;
+
+    if (h == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < h->bucket_count; i++) {
+        for (hash_node *node = h->buckets[i]; node != NULL; node = node->next) {
+            list = axl_list_prepend(list, node->key);
+        }
+    }
+    return list;
+}
+
+AxlList *
+axl_hash_table_get_values(AxlHashTable *h)
+{
+    AxlList *list = NULL;
+
+    if (h == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < h->bucket_count; i++) {
+        for (hash_node *node = h->buckets[i]; node != NULL; node = node->next) {
+            list = axl_list_prepend(list, node->value);
+        }
+    }
+    return list;
 }
 
 // ---------------------------------------------------------------------------

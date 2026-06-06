@@ -13,6 +13,7 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-efi-status.h>
 #include <axl/axl-mem.h>
+#include <axl/axl-atexit.h>   /* binding teardown: app-exit safety-net hook */
 #include <axl/axl-str.h>
 #include <axl/axl-path.h>
 #include <axl/axl-log.h>
@@ -611,6 +612,31 @@ axl_driver_connect_handle(
 }
 
 int
+axl_driver_disconnect_handle(
+    void *handle
+    )
+{
+    EFI_STATUS status;
+
+    if (handle == NULL) {
+        return AXL_ERR;
+    }
+
+    /* NULL DriverImageHandle / ChildHandle → disconnect all drivers and
+       all children from this controller. */
+    status = axl_bs()->DisconnectController(
+        (EFI_HANDLE)handle, NULL, NULL);
+
+    /* NOT_FOUND is OK — no driver was managing the handle (a no-op),
+       mirroring axl_driver_connect_handle. */
+    if (EFI_ERROR(status) && status != EFI_NOT_FOUND) {
+        return AXL_ERR;
+    }
+
+    return AXL_OK;
+}
+
+int
 axl_driver_set_unload(
     void *unload_fn
     )
@@ -1120,5 +1146,271 @@ axl_driver_load_dir(
     if (loaded_count != NULL) {
         *loaded_count = ctx.loaded;
     }
+    return AXL_OK;
+}
+
+// ===================================================================
+// Protocol publishing — public surface over the backend seam.
+// ===================================================================
+
+int
+axl_protocol_install(
+    const AxlGuid  *guid,
+    void           *iface,
+    AxlHandle      *handle
+    )
+{
+    if (handle == NULL || guid == NULL || iface == NULL) {
+        return AXL_ERR;
+    }
+    return axl_backend_install_protocol((void **)handle, guid, iface);
+}
+
+int
+axl_protocol_uninstall(
+    AxlHandle       handle,
+    const AxlGuid  *guid,
+    void           *iface
+    )
+{
+    if (handle == NULL || guid == NULL || iface == NULL) {
+        return AXL_ERR;
+    }
+    return axl_backend_uninstall_protocol(handle, guid, iface);
+}
+
+// ===================================================================
+// Driver Model binding (Type B) — the managed thunks + install.
+// ===================================================================
+//
+// AXL owns an AxlBindingRec per installed binding. The firmware-facing
+// EFI_DRIVER_BINDING_PROTOCOL and EFI_COMPONENT_NAME2_PROTOCOL are embedded
+// in it, so an EFIAPI thunk recovers the record from `This`: the binding is
+// the FIRST member (cast directly); name2 is recovered by offset. The record
+// is retained for the binding's lifetime (the firmware holds pointers into
+// it).
+
+#define AXL_DB_VERSION  0x10u   // default EFI_DRIVER_BINDING_PROTOCOL.Version
+
+typedef struct {
+    EFI_DRIVER_BINDING_PROTOCOL   binding;     // FIRST: thunks cast (rec *)This
+    EFI_COMPONENT_NAME2_PROTOCOL  name2;
+    AxlDriverBinding              db;          // copied descriptor
+    EFI_GUID                      binds;       // copied GUID value (open target)
+    unsigned short               *name_ucs2;   // driver name as CHAR16
+} AxlBindingRec;
+
+// Supported: OpenProtocol(BY_DRIVER) on `binds` as a test (this also reports
+// EFI_ALREADY_STARTED if we already manage the controller), close it, then
+// the optional consumer gate.
+static EFI_STATUS EFIAPI
+db_supported(EFI_DRIVER_BINDING_PROTOCOL *This, EFI_HANDLE ctrl,
+             EFI_DEVICE_PATH_PROTOCOL *rdp)
+{
+    (void)rdp;   // v1: no RemainingDevicePath (bus drivers are v2)
+    AxlBindingRec *r = (AxlBindingRec *)This;
+    void *iface = NULL;
+    EFI_STATUS s = axl_bs()->OpenProtocol(ctrl, &r->binds, &iface,
+                                          This->DriverBindingHandle, ctrl,
+                                          EFI_OPEN_PROTOCOL_BY_DRIVER);
+    if (s == EFI_ALREADY_STARTED) {
+        return EFI_ALREADY_STARTED;
+    }
+    if (EFI_ERROR(s)) {
+        return s;   // `binds` absent or not bindable here → unsupported
+    }
+    axl_bs()->CloseProtocol(ctrl, &r->binds, This->DriverBindingHandle, ctrl);
+    if (r->db.supported != NULL
+        && !r->db.supported((AxlHandle)ctrl, r->db.ctx)) {
+        return EFI_UNSUPPORTED;
+    }
+    return EFI_SUCCESS;
+}
+
+// Start: claim `binds` BY_DRIVER (tagging ownership, getting the interface),
+// hand it to the consumer; roll back the open if the consumer fails.
+static EFI_STATUS EFIAPI
+db_start(EFI_DRIVER_BINDING_PROTOCOL *This, EFI_HANDLE ctrl,
+         EFI_DEVICE_PATH_PROTOCOL *rdp)
+{
+    (void)rdp;
+    AxlBindingRec *r = (AxlBindingRec *)This;
+    void *iface = NULL;
+    EFI_STATUS s = axl_bs()->OpenProtocol(ctrl, &r->binds, &iface,
+                                          This->DriverBindingHandle, ctrl,
+                                          EFI_OPEN_PROTOCOL_BY_DRIVER);
+    if (EFI_ERROR(s)) {
+        return s;
+    }
+    int rc = r->db.start((AxlHandle)ctrl, iface, r->db.ctx);
+    if (rc != AXL_OK) {
+        axl_bs()->CloseProtocol(ctrl, &r->binds, This->DriverBindingHandle,
+                                ctrl);
+        return EFI_DEVICE_ERROR;
+    }
+    return EFI_SUCCESS;
+}
+
+// Stop: let the consumer tear down, then release the BY_DRIVER open.
+static EFI_STATUS EFIAPI
+db_stop(EFI_DRIVER_BINDING_PROTOCOL *This, EFI_HANDLE ctrl,
+        UINTN n_children, EFI_HANDLE *children)
+{
+    (void)n_children; (void)children;   // v1: device driver, no children
+    AxlBindingRec *r = (AxlBindingRec *)This;
+    int rc = r->db.stop((AxlHandle)ctrl, r->db.ctx);
+    axl_bs()->CloseProtocol(ctrl, &r->binds, This->DriverBindingHandle, ctrl);
+    return (rc == AXL_OK) ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+}
+
+static EFI_STATUS EFIAPI
+db_get_driver_name(EFI_COMPONENT_NAME2_PROTOCOL *This, CHAR8 *Language,
+                   CHAR16 **DriverName)
+{
+    // Intentionally permissive: return the one name for any requested
+    // language rather than gating on SupportedLanguages ("en"). The shell
+    // driver listing passes the current language and tolerates this; a strict
+    // CN2 probe of an unsupported language gets the name instead of
+    // EFI_UNSUPPORTED. Acceptable for a query-only, single-name v1.
+    (void)Language;
+    if (DriverName == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    AxlBindingRec *r = (AxlBindingRec *)((char *)This
+                       - __builtin_offsetof(AxlBindingRec, name2));
+    *DriverName = r->name_ucs2;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+db_get_controller_name(EFI_COMPONENT_NAME2_PROTOCOL *This,
+                       EFI_HANDLE ctrl, EFI_HANDLE child, CHAR8 *Language,
+                       CHAR16 **ControllerName)
+{
+    (void)This; (void)ctrl; (void)child; (void)Language; (void)ControllerName;
+    return EFI_UNSUPPORTED;   // v1: no per-controller names
+}
+
+// v1 tracks one binding per image handle. These hold the live record and its
+// axl_atexit handle so axl_driver_binding_uninstall can remove it explicitly
+// (the driver-unload path) and reject a duplicate install.
+static AxlBindingRec *g_db_rec;
+static uint32_t       g_db_atexit;
+
+// Shared teardown: uninstall the tracked binding's protocols and free the
+// record. Returns AXL_OK if the record was removed, AXL_ERR if there is none
+// or the firmware still references the binding.
+static int
+db_teardown(void)
+{
+    AxlBindingRec *r = g_db_rec;
+    if (r == NULL) {
+        return AXL_ERR;
+    }
+    EFI_HANDLE image = r->binding.DriverBindingHandle;
+    /* Uninstall the binding FIRST — it is the protocol the firmware can hold
+     * BY_DRIVER. If it is still referenced (a controller is bound), bail with
+     * BOTH protocols still installed and the record kept alive: freeing here
+     * would leave the EFIAPI thunks dangling into freed memory (a far worse,
+     * crash-on-next-ConnectController bug), and removing Component Name 2 first
+     * would briefly leave the binding nameless in the `drivers` listing.
+     * Disconnect the controller and retry. */
+    if (axl_protocol_uninstall(
+            (AxlHandle)image,
+            (const AxlGuid *)&EFI_DRIVER_BINDING_PROTOCOL_GUID,
+            &r->binding) != AXL_OK) {
+        return AXL_ERR;   // keep the record alive — the firmware still points at it
+    }
+    (void)axl_protocol_uninstall(
+        (AxlHandle)image,
+        (const AxlGuid *)&EFI_COMPONENT_NAME2_PROTOCOL_GUID, &r->name2);
+    axl_free(r->name_ucs2);
+    axl_free(r);
+    g_db_rec = NULL;
+    return AXL_OK;
+}
+
+// axl_atexit hook — the app-exit safety net. Driver unload does NOT drain
+// axl_atexit (only AXL_APP / CRT0 do), so a Type-B *driver* uninstalls its
+// binding explicitly via axl_driver_binding_uninstall; this covers the
+// app-style path where a binding outlives main.
+static void
+db_cleanup(void *p)
+{
+    (void)p;            // the record is tracked in g_db_rec
+    (void)db_teardown();
+}
+
+int
+axl_driver_binding_install(const AxlDriverBinding *db)
+{
+    if (db == NULL || db->name == NULL || db->binds == NULL
+        || db->start == NULL || db->stop == NULL) {
+        return AXL_ERR;
+    }
+    if (g_db_rec != NULL) {
+        return AXL_ERR;   // v1: one binding per image (the firmware would also
+                          // reject a duplicate EFI_DRIVER_BINDING_PROTOCOL)
+    }
+    AxlBindingRec *r = axl_calloc(1, sizeof(*r));
+    if (r == NULL) {
+        return AXL_ERR;
+    }
+    r->db = *db;
+    axl_memcpy(&r->binds, db->binds, sizeof(EFI_GUID));
+    r->name_ucs2 = axl_utf8_to_ucs2(db->name);
+    if (r->name_ucs2 == NULL) {
+        axl_free(r);
+        return AXL_ERR;
+    }
+
+    EFI_HANDLE image = gImageHandle;
+    r->binding.Supported           = db_supported;
+    r->binding.Start               = db_start;
+    r->binding.Stop                = db_stop;
+    r->binding.Version             = AXL_DB_VERSION;
+    r->binding.ImageHandle         = image;
+    r->binding.DriverBindingHandle = image;   // single binding on the image
+    r->name2.GetDriverName      = db_get_driver_name;
+    r->name2.GetControllerName  = db_get_controller_name;
+    r->name2.SupportedLanguages = (CHAR8 *)"en";
+
+    AxlHandle h = (AxlHandle)image;   // install onto the existing image handle
+    if (axl_protocol_install((const AxlGuid *)&EFI_DRIVER_BINDING_PROTOCOL_GUID,
+                             &r->binding, &h) != AXL_OK) {
+        axl_free(r->name_ucs2);
+        axl_free(r);
+        return AXL_ERR;
+    }
+    if (axl_protocol_install((const AxlGuid *)&EFI_COMPONENT_NAME2_PROTOCOL_GUID,
+                             &r->name2, &h) != AXL_OK) {
+        (void)axl_protocol_uninstall(
+            (AxlHandle)image,
+            (const AxlGuid *)&EFI_DRIVER_BINDING_PROTOCOL_GUID, &r->binding);
+        axl_free(r->name_ucs2);
+        axl_free(r);
+        return AXL_ERR;
+    }
+    // Track for explicit uninstall (driver-unload path) and register the
+    // app-exit safety-net hook. Driver unload must call
+    // axl_driver_binding_uninstall — axl_atexit only drains at app exit.
+    g_db_rec = r;
+    g_db_atexit = axl_atexit(db_cleanup, r);
+    return AXL_OK;
+}
+
+int
+axl_driver_binding_uninstall(void)
+{
+    if (g_db_rec == NULL) {
+        return AXL_ERR;   // nothing installed
+    }
+    uint32_t hook = g_db_atexit;
+    if (db_teardown() != AXL_OK) {
+        return AXL_ERR;   // still referenced — record kept alive by db_teardown
+    }
+    // Removed explicitly; drop the safety-net hook so it can't double-run.
+    axl_atexit_remove(hook);
+    g_db_atexit = 0;
     return AXL_OK;
 }

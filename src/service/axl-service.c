@@ -207,7 +207,7 @@ static AxlHandle         m_drv_handle;  /* this driver image's handle —
                                          * LocateHandleBuffer can recover it
                                          * from the GUID and unload. Seeded
                                          * to gImageHandle in init before the
-                                         * register_guid call so the install
+                                         * install call so the install
                                          * adds to the existing handle rather
                                          * than creating a sentinel. */
 static const AxlService *m_drv_svc;     /* descriptor pointer — the unload
@@ -246,7 +246,7 @@ _axl_service_driver_unload_stub(EFI_HANDLE image_handle)
     if (m_drv_handle != NULL && m_drv_svc != NULL) {
         AxlGuid g;
         if (axl_service_guid(m_drv_svc, &g) == AXL_OK) {
-            (void)axl_protocol_unregister_guid(m_drv_handle, &g,
+            (void)axl_protocol_uninstall(m_drv_handle, &g,
                                                (void *)m_drv_svc);
         }
         m_drv_handle = NULL;
@@ -324,10 +324,10 @@ _axl_service_driver_init(
      * Failure here aborts the load — without the protocol registration
      * the launcher's verify step would unload us anyway. */
     m_drv_handle = (AxlHandle)image_handle;
-    if (axl_protocol_register_guid(&svc_guid,
-                                   (void *)svc,
-                                   &m_drv_handle) != AXL_OK) {
-        axl_warning("AXL_SERVICE_DRIVER: protocol_register_guid failed");
+    if (axl_protocol_install(&svc_guid,
+                             (void *)svc,
+                             &m_drv_handle) != AXL_OK) {
+        axl_warning("AXL_SERVICE_DRIVER: protocol_install failed");
         if (m_drv_cfg != NULL) {
             axl_config_free(m_drv_cfg); m_drv_cfg = NULL;
         }
@@ -337,7 +337,7 @@ _axl_service_driver_init(
 
     m_drv_loop = axl_loop_new();
     if (m_drv_loop == NULL) {
-        (void)axl_protocol_unregister_guid(m_drv_handle, &svc_guid,
+        (void)axl_protocol_uninstall(m_drv_handle, &svc_guid,
                                            (void *)svc);
         m_drv_handle = NULL;
         if (m_drv_cfg != NULL) {
@@ -350,7 +350,7 @@ _axl_service_driver_init(
     if (axl_service_attach_driver(m_drv_loop, svc) != AXL_OK) {
         axl_loop_free(m_drv_loop);
         m_drv_loop = NULL;
-        (void)axl_protocol_unregister_guid(m_drv_handle, &svc_guid,
+        (void)axl_protocol_uninstall(m_drv_handle, &svc_guid,
                                            (void *)svc);
         m_drv_handle = NULL;
         if (m_drv_cfg != NULL) {

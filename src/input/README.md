@@ -52,12 +52,16 @@ typedef struct {
     uint32_t      keycode;         // raw scan code (key events)
     uint32_t      unicode;         // translated codepoint (0 if none)
     uint32_t      modifiers;       // AXL_INPUT_MOD_* bitmask
+    uint32_t      click_count;     // 1/2/3 = single/double/triple click (mouse buttons)
+    bool          dragging;        // held-button press has crossed the drag threshold
+    bool          repeat;          // synthetic held-button auto-repeat, not a fresh press
 } AxlInputEvent;
 ```
 
 Fields are populated based on `.type`; unused fields are zero. The
 pointer passed to the callback is valid only for the duration of the
-call — copy out anything you want to keep.
+call — copy out anything you want to keep. The last three fields are
+filled by the built-in recognizers (see *Recognizers* below).
 
 Event kinds shipped in v0.1:
 
@@ -70,7 +74,7 @@ Event kinds shipped in v0.1:
 | `AXL_INPUT_KEY_UP` | (deferred) | requires `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL` |
 | `AXL_INPUT_TOUCH_DOWN` | touch | first contact (active-buttons 0 → non-zero) |
 | `AXL_INPUT_TOUCH_UP` | touch | contact end (non-zero → 0) |
-| `AXL_INPUT_TOUCH_MOVE` | touch | active contact, position changed |
+| `AXL_INPUT_TOUCH_MOVE` | touch | position changed — including hover (no contact) |
 
 `KEY_DOWN` events carry modifier + lock state in `modifiers`:
 held `SHIFT` / `CTRL` / `ALT` / `META` (left/right-distinct bits plus
@@ -81,6 +85,14 @@ it (e.g. a serial console), `modifiers == 0` — treat absent modifiers
 as "none". Only `KEY_DOWN` fires: UEFI delivers no key-up or
 standalone-modifier events. (The live keyboard read is exercised on
 real hardware, not in the QEMU serial test harness.)
+
+**Ctrl+\<letter\> chords are device-dependent.** A physical keyboard
+reports them as the printable letter plus `AXL_INPUT_MOD_CTRL` (Ctrl+A →
+`'a'` + the Ctrl bit); a serial console (TerminalDxe) sends the folded
+C0 control byte (Ctrl+A → `0x01`) with `modifiers == 0`. Match both with
+`axl_input_ctrl_letter(unicode, modifiers)`, which collapses the two
+encodings into a single lowercase letter (and returns 0 for the four
+chords whose C0 codes are dedicated editing keys — Ctrl+H/I/J/M).
 
 ## Usage
 
@@ -130,7 +142,61 @@ int main(void) {
 Each `attach_*` returns the loop source ID (use with
 `axl_loop_remove_source` to detach), or 0 on failure: the protocol
 isn't available, a source of that kind is already attached, or
-arguments were NULL.
+arguments were NULL. Detach the mouse with `axl_input_detach_mouse`
+(frees the single-mouse slot and cancels any auto-repeat timer).
+
+## Recognizers: gestures, debounce, auto-repeat
+
+`axl_input_attach_mouse` and `axl_input_attach_key` run small built-in
+recognizers that annotate events and, where useful, synthesize new
+ones. All are pure functions over the event stream, so a consumer with
+its own stream (or a unit test) can run the same logic directly.
+
+- **Click gestures** annotate each mouse-button event in place:
+  `click_count` is 1 / 2 / 3 for single / double / triple click within
+  the multi-click window and movement threshold, and `dragging` latches
+  once a held-button press moves past the drag threshold (until release).
+  Tune with `axl_input_set_click_tuning(multi_click_ms, drag_px)`; run
+  the recognizer standalone with `axl_input_gesture_feed`.
+
+- **Held-button auto-repeat** synthesizes a `MOUSE_BUTTON_DOWN` (with
+  `repeat == true`) after a delay, then at an interval, while a button
+  stays held — for scrollbar arrows, spinners, press-and-hold. Off by
+  default; enable with `axl_input_set_button_repeat(delay_ms,
+  interval_ms)`. (Firmware does not auto-repeat *mouse* buttons, unlike
+  keys.)
+
+- **Keyboard debounce** drops a same-key `KEY_DOWN` that repeats faster
+  than a human would — the fix for a high-latency remote console (iDRAC
+  Virtual Console, IPMI SOL) where one keypress registers as held long
+  enough that firmware typematic fires it several times. Off by default;
+  enable with `axl_input_set_key_debounce(min_repeat_ms,
+  printable_only)`, or run it standalone with `axl_input_key_accept`.
+  Held-key *repeat itself* comes from firmware typematic (UEFI delivers
+  no key-up, so software can't synthesize it) — the debounce only
+  suppresses the spurious extras.
+
+## Modifier state on pointer events
+
+UEFI delivers keyboard modifier state (`KeyShiftState`) **only with a
+keystroke**, so "Shift held while scrolling" or "Ctrl held while
+clicking" would otherwise be invisible to a mouse callback. The substrate
+keeps a **live modifier state** and stamps it onto every pointer event
+(`ev->modifiers` on mouse + touch), so a consumer reads Shift+wheel /
+Ctrl+click directly. To stay current *between* character keystrokes the
+keyboard backend enables `EFI_KEY_STATE_EXPOSED`, which makes the
+firmware deliver modifier-only **partial keystrokes** on shift/ctrl/alt
+down+up; the substrate tracks those to update the live state and filters
+them out of the `KEY_DOWN` stream (a partial carries no character).
+
+Caveats: the live state is 0 until a keyboard source is attached
+(`axl_input_attach_key`) and the firmware publishes
+`EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL` — a serial console (no Ex protocol)
+reports no modifiers, so pointer events carry `modifiers == 0` there.
+Enabling `EFI_KEY_STATE_EXPOSED` also resets the caps/num/scroll-lock
+toggle LEDs (UEFI offers no read-modify-write for them). The partial-
+keystroke path is firmware-gated and validated on real hardware (the
+serial QEMU test harness has no Ex protocol to exercise it).
 
 ## Per-device notes
 
@@ -150,17 +216,24 @@ separate `AxlKeyCallback`. Callers who already have a key-only flow
 can keep using `axl_loop_add_key_press` directly.
 
 **Touch** (`axl_input_attach_touch`). Locates
-`EFI_ABSOLUTE_POINTER_PROTOCOL`. Positions are reported in the
-device's native `(CurrentX, CurrentY)` range — see
-`EFI_ABSOLUTE_POINTER_MODE`'s `AbsoluteMin`/`Max` for the coordinate
-system. Callers wanting screen pixels should rescale in the callback.
+`EFI_ABSOLUTE_POINTER_PROTOCOL`. Positions are **normalized** from the
+device's native `EFI_ABSOLUTE_POINTER_MODE` range into
+`[0, AXL_INPUT_ABS_RANGE)` on both axes, so the value is
+display-independent — the consumer maps it onto its own surface
+(`px = ev->x * surface_w / AXL_INPUT_ABS_RANGE`); `axl_input_abs_normalize`
+exposes the exact mapping. A `TOUCH_MOVE` fires whenever the position
+changes, **including hover** (no contact), so a pen / tablet / VNC
+absolute pointer that reports position without a button still drives a
+pointer; `buttons` on a move is the live contact state (0 on hover), so
+a drag is distinguishable from a hover.
 
 ### v0.1 constraints
 
 - Single source per device kind per process. Multi-device or hotplug
   support can be added when a consumer requires it.
-- Mouse / touch positions are not screen-clamped — the substrate
-  doesn't know what the consumer's coordinate system is.
+- Mouse positions are relative deltas accumulated from `(0, 0)` (not
+  screen-clamped — the substrate doesn't know the consumer's coordinate
+  system); touch positions are normalized to `[0, AXL_INPUT_ABS_RANGE)`.
 
 ## Visual demo
 

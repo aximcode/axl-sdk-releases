@@ -1,6 +1,15 @@
 AxlSubcommand — Multi-command CLI dispatch
 ===========================================
 
+.. warning::
+
+   **Deprecated.** Use :doc:`args` (``axl_args_run`` from
+   ``<axl/axl-args.h>``) instead — it handles flags, positionals, and
+   arbitrarily nested subcommands in one declarative ``AxlArgsNode``
+   tree. The ``axl_subcommand_*`` functions are marked
+   ``__attribute__((deprecated))`` and remain only for existing
+   consumers; new tools should not use them.
+
 Helper for UEFI applications that expose multiple distinct operations
 under a common executable (e.g. ``tool bios``, ``tool sysid``,
 ``tool crb`` ...). Pairs with :doc:`config` — each subcommand uses

@@ -387,7 +387,7 @@ axl_string_overwrite(AxlString *b, size_t pos, const char *s)
 }
 
 const char *
-axl_string_str(AxlString *b)
+axl_string_str(const AxlString *b)
 {
     if (b == NULL || b->buf == NULL) {
         return "";

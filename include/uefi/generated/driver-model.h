@@ -46,5 +46,29 @@ typedef struct _EFI_DRIVER_BINDING_PROTOCOL {
  EFI_HANDLE                                   DriverBindingHandle;
 } EFI_DRIVER_BINDING_PROTOCOL;
 
+typedef
+EFI_STATUS
+(EFIAPI *EFI_COMPONENT_NAME_GET_DRIVER_NAME) (
+  IN EFI_COMPONENT_NAME2_PROTOCOL            *This,
+  IN CHAR8                                   *Language,
+  OUT CHAR16                                 **DriverName
+  );
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_COMPONENT_NAME_GET_CONTROLLER_NAME) (
+  IN EFI_COMPONENT_NAME2_PROTOCOL               *This,
+  IN EFI_HANDLE                                 ControllerHandle,
+  IN EFI_HANDLE                                 ChildHandle OPTIONAL,
+  IN CHAR8                                      *Language,
+  OUT CHAR16                                    **ControllerName
+  );
+
+typedef struct _EFI_COMPONENT_NAME2_PROTOCOL {
+ EFI_COMPONENT_NAME_GET_DRIVER_NAME                GetDriverName;
+ EFI_COMPONENT_NAME_GET_CONTROLLER_NAME            GetControllerName;
+ CHAR8                                             *SupportedLanguages;
+} EFI_COMPONENT_NAME2_PROTOCOL;
+
 
 #endif /* AXL_UEFI_GEN_DRIVER_MODEL_H */

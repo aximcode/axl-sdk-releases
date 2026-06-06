@@ -107,6 +107,35 @@ pixmap_header_recognized(
 }
 
 // ===================================================================
+// Shared: stb RGBA frame -> AxlGfxBuffer (BGRA swizzle)
+// ===================================================================
+
+/* Build a fresh AxlGfxBuffer from one stb RGBA8 frame (@a w x @a h),
+ * swizzling RGBA -> BGRA to match AxlGfxPixel. Returns NULL on alloc
+ * failure. Does NOT free @a rgba (the caller owns the stb buffer). */
+static AxlGfxBuffer *
+pixmap_rgba_to_buffer(
+    const stbi_uc  *rgba,
+    uint32_t        w,
+    uint32_t        h
+    )
+{
+    AxlGfxBuffer *buf = axl_gfx_buffer_new(w, h);
+    if (!buf) {
+        return NULL;
+    }
+    AxlGfxPixel *pixels = axl_gfx_buffer_pixels(buf);
+    size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; i++) {
+        pixels[i].red   = rgba[i * 4 + 0];
+        pixels[i].green = rgba[i * 4 + 1];
+        pixels[i].blue  = rgba[i * 4 + 2];
+        pixels[i].alpha = rgba[i * 4 + 3];
+    }
+    return buf;
+}
+
+// ===================================================================
 // Public API
 // ===================================================================
 
@@ -162,22 +191,119 @@ axl_pixmap_decode(
         return NULL;
     }
 
-    AxlGfxBuffer *buf = axl_gfx_buffer_new((uint32_t)w, (uint32_t)h);
-    if (!buf) {
-        stbi_image_free(rgba);
+    AxlGfxBuffer *buf = pixmap_rgba_to_buffer(rgba, (uint32_t)w, (uint32_t)h);
+    stbi_image_free(rgba);
+    return buf;   /* NULL on alloc failure — the documented contract */
+}
+
+AxlPixmapAnim *
+axl_pixmap_decode_anim(
+    const uint8_t  *bytes,
+    size_t          len
+    )
+{
+    if (!bytes || len == 0) {
+        return NULL;
+    }
+    if (!pixmap_header_recognized(bytes, len)) {
         return NULL;
     }
 
-    /* Swizzle RGBA → BGRA into the AxlGfxBuffer. */
-    AxlGfxPixel *pixels = axl_gfx_buffer_pixels(buf);
-    size_t n = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < n; i++) {
-        pixels[i].red   = rgba[i * 4 + 0];
-        pixels[i].green = rgba[i * 4 + 1];
-        pixels[i].blue  = rgba[i * 4 + 2];
-        pixels[i].alpha = rgba[i * 4 + 3];
+    AxlPixmapAnim *anim = axl_calloc(1, sizeof(*anim));
+    if (!anim) {
+        return NULL;
     }
 
+    /* GIF is the only animated format stb decodes; for it, take the
+     * multi-frame path (which also handles a single-frame GIF as z == 1).
+     * Every other format is a single still frame. The full GIF8[79]a
+     * signature was already validated by pixmap_header_recognized; match it
+     * here too (not a 3-byte prefix) so the discriminator is unambiguous. */
+    bool is_gif = (len >= 6 && bytes[0] == 'G' && bytes[1] == 'I'
+                   && bytes[2] == 'F' && bytes[3] == '8'
+                   && (bytes[4] == '7' || bytes[4] == '9') && bytes[5] == 'a');
+
+    if (is_gif) {
+        int     *delays = NULL;
+        int      x = 0, y = 0, z = 0, comp = 0;
+        stbi_uc *all = stbi_load_gif_from_memory(bytes, (int)len, &delays,
+                                                 &x, &y, &z, &comp, 4);
+        if (!all || x <= 0 || y <= 0 || z <= 0) {
+            stbi_image_free(all);
+            axl_free(delays);
+            axl_free(anim);
+            return NULL;
+        }
+        anim->frames    = axl_calloc((size_t)z, sizeof(AxlGfxBuffer *));
+        anim->delays_ms = axl_calloc((size_t)z, sizeof(uint32_t));
+        if (!anim->frames || !anim->delays_ms) {
+            stbi_image_free(all);
+            axl_free(delays);
+            axl_pixmap_anim_free(anim);
+            return NULL;
+        }
+        /* Set n_frames only now the arrays exist: an earlier failure leaves
+         * it 0, so axl_pixmap_anim_free won't walk a NULL/short frames array;
+         * setting it here makes the free loop cover NULL slots a mid-loop
+         * per-frame failure leaves behind (axl_gfx_buffer_free is NULL-safe). */
+        anim->n_frames = (uint32_t)z;
+        size_t frame_px = (size_t)x * (size_t)y;
+        for (int f = 0; f < z; f++) {
+            anim->frames[f] = pixmap_rgba_to_buffer(all + (size_t)f * frame_px * 4,
+                                                    (uint32_t)x, (uint32_t)y);
+            if (!anim->frames[f]) {
+                stbi_image_free(all);
+                axl_free(delays);
+                axl_pixmap_anim_free(anim);
+                return NULL;
+            }
+            /* stb stores GIF delays already in milliseconds (10 x the
+             * file's centisecond value); pass through (may be 0). */
+            anim->delays_ms[f] = delays ? (uint32_t)delays[f] : 0;
+        }
+        stbi_image_free(all);
+        axl_free(delays);
+        return anim;
+    }
+
+    /* Static formats: a single frame, delay 0. */
+    int      x = 0, y = 0, comp = 0;
+    stbi_uc *rgba = stbi_load_from_memory(bytes, (int)len, &x, &y, &comp, 4);
+    if (!rgba) {
+        axl_free(anim);
+        return NULL;
+    }
+    anim->frames    = axl_calloc(1, sizeof(AxlGfxBuffer *));
+    anim->delays_ms = axl_calloc(1, sizeof(uint32_t));
+    if (!anim->frames || !anim->delays_ms) {
+        stbi_image_free(rgba);
+        axl_pixmap_anim_free(anim);
+        return NULL;
+    }
+    anim->n_frames   = 1;
+    anim->frames[0]  = pixmap_rgba_to_buffer(rgba, (uint32_t)x, (uint32_t)y);
     stbi_image_free(rgba);
-    return buf;
+    if (!anim->frames[0]) {
+        axl_pixmap_anim_free(anim);
+        return NULL;
+    }
+    return anim;
+}
+
+void
+axl_pixmap_anim_free(
+    AxlPixmapAnim  *anim
+    )
+{
+    if (!anim) {
+        return;
+    }
+    if (anim->frames) {
+        for (uint32_t i = 0; i < anim->n_frames; i++) {
+            axl_gfx_buffer_free(anim->frames[i]);   /* NULL-safe */
+        }
+        axl_free(anim->frames);
+    }
+    axl_free(anim->delays_ms);
+    axl_free(anim);
 }

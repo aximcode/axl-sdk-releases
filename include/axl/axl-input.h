@@ -58,7 +58,7 @@ typedef enum {
     AXL_INPUT_MOUSE_BUTTON_DOWN,///< Mouse button pressed (see .buttons)
     AXL_INPUT_MOUSE_BUTTON_UP,  ///< Mouse button released
     AXL_INPUT_MOUSE_WHEEL,      ///< Scroll wheel rotated (see .wheel_dx/dy)
-    AXL_INPUT_KEY_DOWN,         ///< Key pressed (see .keycode, .unicode)
+    AXL_INPUT_KEY_DOWN,         ///< Key pressed (see .keycode, .unicode, .modifiers; Ctrl+letter encoding below)
     AXL_INPUT_KEY_UP,           ///< Key released (where the platform reports it)
     AXL_INPUT_TOUCH_DOWN,       ///< Touch contact began at (.x, .y)
     AXL_INPUT_TOUCH_UP,         ///< Touch contact ended
@@ -95,6 +95,10 @@ typedef enum {
 
 // Toggle-lock state (active/inactive), from the keyboard's
 // KeyToggleState. Like the held modifiers, 0 when unavailable.
+// NOTE: attaching a keyboard source resets the caps/num/scroll-lock
+// state (UEFI has no GetState to preserve it — see
+// axl_backend_console_expose_modifiers). Lock changes made AFTER attach
+// are tracked; the pre-attach lock state is not recoverable.
 #define AXL_INPUT_MOD_CAPS_LOCK   (1u << 8)
 #define AXL_INPUT_MOD_NUM_LOCK    (1u << 9)
 #define AXL_INPUT_MOD_SCROLL_LOCK (1u << 10)
@@ -122,9 +126,185 @@ typedef struct {
     int32_t       wheel_dx;        ///< Horizontal wheel delta (notch ticks)
     int32_t       wheel_dy;        ///< Vertical wheel delta
     uint32_t      keycode;         ///< Raw scan code (key events)
-    uint32_t      unicode;         ///< Translated codepoint (0 if none)
+    uint32_t      unicode;         ///< Translated codepoint (0 if none) — see Ctrl+letter note below
     uint32_t      modifiers;       ///< Modifier state (AXL_INPUT_MOD_*)
+    uint32_t      click_count;     ///< Mouse-button events: 1/2/3 for single/double/triple click within the multi-click window+threshold; 0 otherwise
+    bool          dragging;        ///< Mouse events: true once a held-button press moves past the drag threshold, until release
+    bool          repeat;          ///< Mouse-button events: true if this is a synthetic held-button auto-repeat, not a fresh press
 } AxlInputEvent;
+
+// ===================================================================
+// Click gestures + held-button auto-repeat
+//
+// axl_input_attach_mouse runs a built-in recognizer that annotates each
+// event's `click_count` / `dragging` and, when enabled, synthesizes
+// held-button auto-repeat. Tunables are global (one pointer per process
+// for v0.1). Keyboard repeat is NOT here: UEFI delivers no key-up, so
+// repeat-while-held can't be synthesized — held-key repeat comes from
+// firmware typematic as repeated KEY_DOWN events.
+// ===================================================================
+
+/// Click-gesture recognizer state. A plain value type — zero-initialize
+/// (`AxlGesture g = {0};`) before the first feed. One instance per
+/// pointer stream. axl_input_attach_mouse keeps one internally; this is
+/// exposed so a consumer with its own event stream (or a unit test) can
+/// run the same recognition.
+typedef struct {
+    uint64_t  last_down_us;   ///< timestamp of the last BUTTON_DOWN
+    int32_t   last_down_x;    ///< x of the last BUTTON_DOWN
+    int32_t   last_down_y;    ///< y of the last BUTTON_DOWN
+    uint32_t  streak;         ///< current consecutive-click count
+    uint32_t  held;           ///< buttons currently held (AXL_INPUT_BUTTON_*)
+    int32_t   press_x;        ///< x where the current press began
+    int32_t   press_y;        ///< y where the current press began
+    bool      dragging;       ///< drag latched for the current press
+} AxlGesture;
+
+/// Feed one event through the recognizer, annotating `ev->click_count`
+/// and `ev->dragging` in place and updating @p g. Pure: it reads only
+/// `ev->type` / `timestamp_us` / `x` / `y` / `buttons`, so synthetic
+/// events drive it deterministically in tests. Uses the global tuning
+/// (axl_input_set_click_tuning).
+void
+axl_input_gesture_feed(
+    AxlGesture     *g,    ///< recognizer state (zero-initialized before first call)
+    AxlInputEvent  *ev    ///< [in,out] event to annotate
+);
+
+/// Set the multi-click window and drag threshold the recognizer uses.
+/// @p multi_click_ms is the largest gap between successive BUTTON_DOWNs
+/// that still counts as a double/triple click; @p drag_threshold_px is
+/// how far the pointer must move under a held button before `dragging`
+/// latches. Pass 0 for either to restore its default (400 ms / 4 px).
+void
+axl_input_set_click_tuning(
+    uint32_t  multi_click_ms,    ///< max inter-click gap in ms (0 = default 400)
+    int32_t   drag_threshold_px  ///< drag-latch distance in px (0 = default 4)
+);
+
+/// Enable held-pointer-button auto-repeat for axl_input_attach_mouse.
+/// While a button stays held, a synthetic MOUSE_BUTTON_DOWN (with
+/// `repeat == true`) is emitted after @p delay_ms, then every
+/// @p interval_ms — for scrollbar arrows, spinners, press-and-hold.
+/// @p delay_ms == 0 disables repeat (the default).
+void
+axl_input_set_button_repeat(
+    uint32_t  delay_ms,     ///< delay before the first repeat in ms (0 = disabled)
+    uint32_t  interval_ms   ///< gap between repeats in ms
+);
+
+// ===================================================================
+// Keyboard debounce / repeat suppression
+//
+// Over a high-latency remote console (iDRAC Virtual Console, IPMI SOL),
+// a single intended keypress can register as held long enough that the
+// firmware's typematic fires, so one character arrives several times.
+// UEFI offers no way to turn firmware typematic off, so the fix is a
+// software filter: drop a same-key KEY_DOWN that repeats faster than a
+// human would. Off by default; a consumer enables it for text entry.
+// ===================================================================
+
+/// Key-debounce recognizer state. Zero-initialize (`AxlKeyDebounce d =
+/// {0};`) before the first call; one per key stream. axl_input_attach_key
+/// keeps one internally; exposed for reuse / unit testing.
+typedef struct {
+    uint32_t  last_keycode;   ///< keycode of the last key seen
+    uint32_t  last_unicode;   ///< unicode of the last key seen
+    uint64_t  last_us;        ///< timestamp of the last key seen
+} AxlKeyDebounce;
+
+/// Decide whether to deliver @p ev (a KEY_DOWN). Returns true to deliver,
+/// false to drop it as a too-fast same-key repeat. Pure — reads only
+/// `ev->type` / `keycode` / `unicode` / `timestamp_us` and updates @p d —
+/// so synthetic events drive it in tests. Non-KEY_DOWN events always
+/// return true. Uses the global tuning (axl_input_set_key_debounce).
+bool
+axl_input_key_accept(
+    AxlKeyDebounce  *d,   ///< state (zero-initialized before first call)
+    AxlInputEvent   *ev   ///< [in] event to test (not modified)
+);
+
+/// Configure keyboard debounce. @p min_repeat_ms is the minimum gap below
+/// which a repeat of the *same* key is dropped; 0 disables (the default).
+/// When @p printable_only is true, the filter applies only to printable
+/// characters (unicode >= 0x20) — navigation/editing keys (arrows,
+/// Backspace, Delete, Page/Home/End, whose unicode is 0 or a control
+/// code) keep their firmware repeat, so held-key navigation still works.
+/// Recommended starting point: ~40 ms (above the ~20 ms USB typematic
+/// rate, below the ~60 ms human same-key minimum); tune from a capture.
+void
+axl_input_set_key_debounce(
+    uint32_t  min_repeat_ms,  ///< min same-key gap in ms (0 = disabled)
+    bool      printable_only  ///< true: exempt navigation/editing keys
+);
+
+/// Normalized coordinate span for absolute-pointer (touch) events.  A
+/// `TOUCH_*` event's `x` / `y` are rescaled from the device's native
+/// `EFI_ABSOLUTE_POINTER_MODE` `AbsoluteMin/Max` into `[0, AXL_INPUT_ABS_RANGE)`,
+/// so the value is display-independent: the consumer maps it onto its own
+/// surface (`px = x * surface_w / AXL_INPUT_ABS_RANGE`).  axl-input stays a
+/// sibling of axl-gfx with no dependency on it — it never learns the screen
+/// resolution; mapping to pixels is the (display-owning) caller's job.
+#define AXL_INPUT_ABS_RANGE 0x10000u
+
+/// Normalize a native absolute coordinate @p value (in the device's
+/// `[lo, hi]` range, from `EFI_ABSOLUTE_POINTER_MODE`) to `[0,
+/// AXL_INPUT_ABS_RANGE)`.  This is the exact mapping the touch source
+/// applies to each `TOUCH_*` event; exposed so it can be unit-tested and
+/// reused.  @p value is clamped to `[lo, hi]`; a degenerate range
+/// (`hi <= lo`) yields 0.
+int32_t
+axl_input_abs_normalize(int64_t value, uint64_t lo, uint64_t hi);
+
+// -------------------------------------------------------------------
+// Ctrl+letter encoding (KEY_DOWN) — there is NO single canonical form;
+// it depends on the UEFI console-input device, and a portable consumer
+// must handle BOTH. Verified empirically on QEMU OVMF (x64,
+// Ps2KeyboardDxe) and AAVMF (aa64, UsbKeyboardDxe) — see
+// test/integration/test-input-keys-qemu.sh.
+//
+//   * Physical keyboard (EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL): Ctrl+letter
+//     arrives as the PRINTABLE LETTER in `unicode` (Ctrl+A → 'a' =
+//     0x61) with AXL_INPUT_MOD_CTRL set in `modifiers`. It is NOT folded
+//     to a C0 control code. (Lock/toggle state may add CAPS/NUM/SCROLL
+//     bits, but no C0 fold occurs.)
+//
+//   * Serial console (TerminalDxe): the terminal transmits a raw C0
+//     byte, so Ctrl+letter arrives as the FOLDED C0 CONTROL CODE in
+//     `unicode` (Ctrl+A = 0x01 … Ctrl+Z = 0x1A) with `modifiers == 0`
+//     (serial has no Ex protocol and carries no shift state).
+//
+// Recommended detection (covers both paths). Fold case first so the
+// keyboard branch also catches Ctrl+letter delivered uppercase when
+// Shift / Caps Lock is active (terminals fold both Ctrl+A and
+// Ctrl+Shift+A to 0x01, so case-folding keeps the two paths consistent):
+//     uint32_t u = ev->unicode;
+//     if (u >= 'A' && u <= 'Z') u += 0x20;                     // fold case
+//     bool is_ctrl_letter =
+//         ((ev->modifiers & AXL_INPUT_MOD_CTRL) &&
+//          u >= 'a' && u <= 'z')                               // keyboard
+//      || (ev->unicode >= 0x01 && ev->unicode <= 0x1A);        // serial
+//     // 1-based letter index (A=1 … Z=26), valid ONLY when is_ctrl_letter:
+//     uint32_t n = (ev->unicode >= 0x01 && ev->unicode <= 0x1A)
+//                ? ev->unicode : (u - 'a' + 1);
+//
+// Do not assume one form: dropping the folded-C0 branch breaks the
+// serial console; dropping the letter+MOD_CTRL branch breaks the
+// physical keyboard.
+// -------------------------------------------------------------------
+
+/// Decode a Ctrl+\<letter\> chord from a KEY_DOWN event, collapsing the
+/// two device-dependent encodings documented above into a single letter
+/// so a consumer can match Ctrl-chord shortcuts portably.  Pass the
+/// event's `unicode` and `modifiers`.
+///
+/// @return the lowercase letter 'a'..'z' the chord names (Ctrl+A → 'a'),
+///         or 0 when the inputs are not a Ctrl+\<letter\> chord.  The four
+///         chords whose C0 codes double as dedicated editing keys —
+///         Ctrl+H / I / J / M (Backspace / Tab / LF / CR) — return 0, so
+///         a consumer never shadows those keys with a chord.
+char
+axl_input_ctrl_letter(uint32_t unicode, uint32_t modifiers);
 
 /// Callback signature for unified input events.  Return
 /// `AXL_SOURCE_CONTINUE` to keep the source active or
@@ -173,6 +353,16 @@ axl_input_attach_mouse(
     void              *data
     );
 
+/// Detach the mouse source previously attached with
+/// axl_input_attach_mouse. Removes the loop event source, cancels any
+/// pending held-button auto-repeat timer, and frees the
+/// single-mouse-per-process slot so a later axl_input_attach_mouse can
+/// succeed. NULL-safe and idempotent (no-op if no mouse is attached).
+void
+axl_input_detach_mouse(
+    AxlLoop  *loop  ///< the loop the mouse was attached to
+    );
+
 /// Register keyboard input as an event source on the loop.
 ///
 /// Thin wrapper over `axl_loop_add_key_press` that translates each
@@ -189,6 +379,11 @@ axl_input_attach_mouse(
 /// Only `AXL_INPUT_KEY_DOWN` fires — UEFI delivers no key-up or
 /// standalone-modifier events.
 ///
+/// For how a held Ctrl is encoded — it differs between the physical
+/// keyboard (letter + `AXL_INPUT_MOD_CTRL`) and the serial console
+/// (folded C0 control code, no modifiers) — see the Ctrl+letter note on
+/// `AxlInputEvent.unicode` above; a portable consumer must handle both.
+///
 /// Only one keyboard source per process for v0.1.
 ///
 /// @return source ID for axl_loop_remove_source, or 0 on failure
@@ -200,20 +395,34 @@ axl_input_attach_key(
     void              *data
     );
 
+/// Detach the keyboard source previously attached with
+/// axl_input_attach_key. Removes the loop event source and frees the
+/// single-keyboard-per-process slot so a later axl_input_attach_key can
+/// succeed — the mirror of axl_input_detach_mouse. Pass the same @a loop
+/// you gave axl_input_attach_key (the source is removed from it).
+/// Idempotent: a no-op if no keyboard is attached.
+void
+axl_input_detach_key(
+    AxlLoop  *loop  ///< the loop the keyboard was attached to
+    );
+
 /// Register touch input as an event source on the loop.
 ///
 /// Locates `EFI_ABSOLUTE_POINTER_PROTOCOL`, registers its
 /// `WaitForInput` event with the loop, and on each dispatch reads
 /// absolute position via `GetState`.  Emits `AXL_INPUT_TOUCH_DOWN`
 /// on first contact (ActiveButtons transition 0 → non-zero),
-/// `AXL_INPUT_TOUCH_UP` on contact end (non-zero → 0),
-/// `AXL_INPUT_TOUCH_MOVE` while contact is active and position
-/// changes.
+/// `AXL_INPUT_TOUCH_UP` on contact end (non-zero → 0), and
+/// `AXL_INPUT_TOUCH_MOVE` whenever the position changes — INCLUDING
+/// while no button is held (hover), so a pen / tablet / VNC-tablet that
+/// reports position without contact still drives a pointer.  (A bare
+/// touchscreen simply never emits the hover moves.)  `buttons` on a MOVE
+/// is the live `ActiveButtons` (0 on hover), so a consumer can tell a
+/// drag from a hover.
 ///
-/// Position is reported in the protocol's `(CurrentX, CurrentY)`
-/// range — see `EFI_ABSOLUTE_POINTER_MODE`'s AbsoluteMin/Max for
-/// the device's native coordinate system.  Callers wanting screen
-/// pixels should rescale in their callback.
+/// Position is normalized to `[0, AXL_INPUT_ABS_RANGE)` from the device's
+/// native `EFI_ABSOLUTE_POINTER_MODE` range — display-independent; the
+/// caller maps it onto its surface.  See `AXL_INPUT_ABS_RANGE`.
 ///
 /// Only one touch source per process for v0.1.
 ///

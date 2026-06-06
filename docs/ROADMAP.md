@@ -7,6 +7,22 @@ execution order.
 
 Legend: [x] done, [ ] pending, [-] in progress
 
+> **Shipped releases — CHANGELOG is the authority.**
+> [CHANGELOG.md](../CHANGELOG.md) is the source of truth for what has
+> actually shipped, per version. This file is phase-level *planning* and
+> intentionally lags the changelog; where the two disagree about whether
+> something landed, the changelog wins. The checkbox state in the older
+> sections below is not kept reconciled release-by-release.
+>
+> **Recently shipped (may not be reflected in the checkboxes below):**
+> v0.22.0 — gfx present pipeline, AxlCpu SIMD, AxlNTree/AxlTree, AxlTransform
+> consolidation; v0.23.0 — `axl_gfx_blit_rect`, nested JSON object reader;
+> v0.24.0 — AxlPieceTree editor substrate, AxlShm, cross-app clipboard;
+> v0.25.0 (pending tag) — shared find engine (`<axl/axl-find.h>`:
+> AxlByteReader / AxlMatch / `axl_find_in_source`, `axl_text_buffer_find`).
+> Unit tests now total **5321 both arches** (point-in-time counts quoted in
+> older sections below are historical).
+
 ---
 
 ## Library Phases (AXL-Design.md)
@@ -222,9 +238,16 @@ boot service drivers, and runtime drivers.
 - [x] Remove EDK2 header dependencies from unit tests
 - [x] Delete compat shim layer (12 files, -377 lines)
 - [x] Backend directory restructure (gnuefi/, native/ subdirs)
-- [ ] Type remaining BS slots for drivers (InstallProtocolInterface, etc.)
-- [ ] Add EFI_DRIVER_BINDING_PROTOCOL to protocols header
-- [ ] Shell argument parsing (EFI_SHELL_PARAMETERS_PROTOCOL)
+- [x] Type remaining BS slots for drivers (InstallProtocolInterface, etc.)
+      — Install/Reinstall/Uninstall/Open/InstallMultiple are typed in
+      `generated/tables.h` (one cosmetic typedef typo tracked in
+      `AXL-Driver-Authoring-Design.md` Phase 1).
+- [x] Add EFI_DRIVER_BINDING_PROTOCOL to protocols header
+      — present in `generated/driver-model.h`. Ergonomic driver-authoring
+      layer (`axl_protocol_install`, `AxlDriverBinding`) is designed in
+      `AXL-Driver-Authoring-Design.md`.
+- [x] Shell argument parsing (EFI_SHELL_PARAMETERS_PROTOCOL)
+      — wired in `src/posix/axl-app.c`.
 
 ### Phase N5: SDK integration — DONE
 - [x] Update `install.sh` to support native backend
@@ -1637,7 +1660,11 @@ Move direct UEFI calls behind new backend functions:
 - [ ] `axl_backend_create_event(type, callback, ctx, event)` — wraps
       gBS->CreateEvent/CloseEvent/CheckEvent/SignalEvent
 - [ ] `axl_backend_install_protocol(handle, guid, interface)` — wraps
-      gBS->InstallProtocolInterface/UninstallProtocolInterface
+      gBS->InstallProtocolInterface/UninstallProtocolInterface. The
+      *public* surface over this — `axl_protocol_install` — plus the
+      driver-binding ergonomics are designed in
+      `AXL-Driver-Authoring-Design.md` (Phase 1 builds both layers
+      together; `axl-fs-provider` already does this install internally).
 - [ ] `axl_backend_get_variable / set_variable` — wraps
       gRT->GetVariable/SetVariable
 - [ ] `axl_backend_exit(status)` — wraps gBS->Exit
@@ -3100,8 +3127,8 @@ End-to-end re-tested via the axl-webfs PUT loop. All passed
       SMBIOS 3.x §7.43.3); plus `axl_ipv6_format` sibling of
       `axl_ipv4_format` (RFC 5952 canonical form). dmidecode prints
       structured Redfish-over-IP fields, hex-dumps `interface_data`
-      and unrecognized protocol payloads. 2591/2591 unit tests both
-      arches; original entry kept below for posterity.
+      and unrecognized protocol payloads. (Shipped; unit-test total has
+      since grown to 5321/5321 both arches.)
 
 - [x] **OBSOLETE — `dmidecode --type 42` decode bodies.** Currently prints only
       the header (`Interface Type: Network Host Interface (0x40)`,
@@ -3756,7 +3783,7 @@ fine-grained thermal data from UEFI on these platforms.
       detect serial-console mode (or expose an env var); switch to
       flat output when set.
 
-- [ ] **Real-hardware test runner.** Today axl-sdk has 2565
+- [ ] **Real-hardware test runner.** Today axl-sdk has 5321
       ratcheted unit tests in QEMU. The QEMU↔real-Dell coverage gap
       is real (mkrd Load Error on the R6725 didn't reproduce in
       QEMU; `--no-load` semantics are hardware-dependent). A

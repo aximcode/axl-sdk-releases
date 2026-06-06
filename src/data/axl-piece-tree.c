@@ -18,6 +18,7 @@
  */
 
 #include <axl/axl-piece-tree.h>
+#include <axl/axl-regex.h>
 
 #include <axl/axl-rb-tree.h>
 #include <axl/axl-file-view.h>
@@ -1214,242 +1215,53 @@ axl_piece_tree_is_modified(const AxlPieceTree *pt)
 // Search
 // ---------------------------------------------------------------------------
 
-static bool
-is_word_byte(int b)
-{
-    return b >= 0 && (axl_isalnum(b) || b == '_');
-}
-
-static int
-pt_get_byte(AxlPieceTree *pt, size_t off)
-{
-    char c;
-    return (axl_piece_tree_get(pt, off, 1, &c, 1) == 1) ? (int)(unsigned char)c
-                                                        : -1;
-}
-
-static bool
-match_at(const char *hay, const char *needle, size_t m, bool ci)
-{
-    for (size_t i = 0; i < m; i++) {
-        unsigned char a = (unsigned char)hay[i];
-        unsigned char b = (unsigned char)needle[i];
-        if (a == b) {
-            continue;
-        }
-        if (ci && axl_tolower(a) == axl_tolower(b)) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool
-word_ok(AxlPieceTree *pt, size_t s, size_t m)
-{
-    int before = (s > 0) ? pt_get_byte(pt, s - 1) : -1;
-    int after = pt_get_byte(pt, s + m);
-    return !is_word_byte(before) && !is_word_byte(after);
-}
-
-#define FIND_STEP 4096u
-
-/* Whether the needle contains a NUL byte. The BMH str*str_len engine
-   treats the needle as a C string, so a NUL-bearing needle must take the
-   byte-exact fallback below. */
-static bool
-needle_has_nul(const char *needle, size_t m)
-{
-    for (size_t i = 0; i < m; i++) {
-        if (needle[i] == '\0') {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* First match offset in buf[from..got) (match must fit by got), or
-   SIZE_MAX. Delegates to grep's BMH engine (sub-linear average) unless the
-   needle has an embedded NUL, then a byte-exact scan. @p nt is a
-   NUL-terminated copy of @p needle (NULL when has_nul). */
+/* AxlByteReader adapter so the shared engine (axl_find_in_source) drives
+   the search. The document is virtual (pieces, not one contiguous
+   buffer), so there is no zero-copy peek — the engine windows via read,
+   which is what the old in-file scanner did anyway. */
 static size_t
-win_first(const char *buf, size_t got, size_t from, const char *needle,
-          const char *nt, size_t m, bool ci, bool has_nul)
+pt_reader_length(const AxlByteReader *r)
 {
-    if (has_nul) {
-        for (size_t j = from; j + m <= got; j++) {
-            if (match_at(buf + j, needle, m, ci)) {
-                return j;
-            }
-        }
-        return SIZE_MAX;
-    }
-    const char *hit = ci
-        ? axl_strcasestr_len(buf + from, (long long)(got - from), nt)
-        : axl_strstr_len(buf + from, (long long)(got - from), nt);
-    return (hit != NULL) ? (size_t)(hit - buf) : SIZE_MAX;
+    return axl_piece_tree_length((AxlPieceTree *)r->ctx);
 }
 
-/* Last match offset in buf[0..end) (match must fit by end), or SIZE_MAX. */
 static size_t
-win_last(const char *buf, size_t end, const char *needle, const char *nt,
-         size_t m, bool ci, bool has_nul)
+pt_reader_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
 {
-    if (m > end) {
-        return SIZE_MAX;
-    }
-    if (has_nul) {
-        for (size_t j = end - m + 1; j-- > 0; ) {
-            if (match_at(buf + j, needle, m, ci)) {
-                return j;
-            }
-        }
-        return SIZE_MAX;
-    }
-    const char *hit = ci
-        ? axl_strrcasestr_len(buf, (long long)end, nt)
-        : axl_strrstr_len(buf, (long long)end, nt);
-    return (hit != NULL) ? (size_t)(hit - buf) : SIZE_MAX;
-}
-
-static bool
-find_forward(AxlPieceTree *pt, const char *needle, size_t m, size_t from,
-             bool ci, bool ww, size_t *out)
-{
-    size_t L = axl_piece_tree_length(pt);
-    if (m == 0 || m > L) {
-        return false;
-    }
-    size_t last = L - m;
-    if (from > last) {
-        return false;
-    }
-    bool  has_nul = needle_has_nul(needle, m);
-    char *nt = NULL;
-    if (!has_nul) {
-        nt = axl_malloc(m + 1);
-        if (nt == NULL) {
-            return false;
-        }
-        axl_memcpy(nt, needle, m);
-        nt[m] = '\0';
-    }
-    size_t cap = m - 1 + FIND_STEP;
-    char *buf = axl_malloc(cap);
-    if (buf == NULL) {
-        axl_free(nt);
-        return false;
-    }
-    bool found = false;
-    size_t pos = from;
-    while (pos <= last) {
-        size_t want = (L - pos < cap) ? (L - pos) : cap;
-        size_t got = axl_piece_tree_get(pt, pos, want, buf, cap);
-        if (got < m) {
-            break;
-        }
-        /* First whole-word-acceptable match in the window (a match within
-           the window always satisfies pos+i <= last). */
-        size_t from_w = 0;
-        for (;;) {
-            size_t i = win_first(buf, got, from_w, needle, nt, m, ci, has_nul);
-            if (i == SIZE_MAX) {
-                break;
-            }
-            if (!ww || word_ok(pt, pos + i, m)) {
-                *out = pos + i;
-                found = true;
-                break;
-            }
-            from_w = i + 1;
-        }
-        if (found || got < want) {
-            break;
-        }
-        pos += got - (m - 1);
-    }
-    axl_free(buf);
-    axl_free(nt);
-    return found;
-}
-
-static bool
-find_backward(AxlPieceTree *pt, const char *needle, size_t m, size_t from,
-              bool ci, bool ww, size_t *out)
-{
-    size_t L = axl_piece_tree_length(pt);
-    if (m == 0 || m > L) {
-        return false;
-    }
-    size_t hi = (from > L - m) ? (L - m) : from;   /* highest start to test */
-    bool  has_nul = needle_has_nul(needle, m);
-    char *nt = NULL;
-    if (!has_nul) {
-        nt = axl_malloc(m + 1);
-        if (nt == NULL) {
-            return false;
-        }
-        axl_memcpy(nt, needle, m);
-        nt[m] = '\0';
-    }
-    size_t cap = m - 1 + FIND_STEP;
-    char *buf = axl_malloc(cap);
-    if (buf == NULL) {
-        axl_free(nt);
-        return false;
-    }
-    bool found = false;
-    size_t cur_end = hi + m;        /* exclusive upper bound of bytes to scan */
-    while (!found && cur_end >= m) {
-        size_t winpos = (cur_end > cap) ? (cur_end - cap) : 0;
-        size_t want = cur_end - winpos;
-        size_t got = axl_piece_tree_get(pt, winpos, want, buf, cap);
-        if (got >= m) {
-            /* Bound the scan so the highest reported start is <= hi. */
-            size_t end = got;
-            if (winpos + (got - m) > hi) {
-                end = (hi - winpos) + m;
-            }
-            for (;;) {
-                size_t i = win_last(buf, end, needle, nt, m, ci, has_nul);
-                if (i == SIZE_MAX) {
-                    break;
-                }
-                if (!ww || word_ok(pt, winpos + i, m)) {
-                    *out = winpos + i;
-                    found = true;
-                    break;
-                }
-                if (i + m - 1 < m) {        /* no lower match possible */
-                    break;
-                }
-                end = i + m - 1;            /* next match must end before i+m */
-            }
-        }
-        if (winpos == 0) {
-            break;
-        }
-        cur_end = winpos + (m - 1);   /* overlap to catch boundary-spanning */
-    }
-    axl_free(buf);
-    axl_free(nt);
-    return found;
+    return axl_piece_tree_get((AxlPieceTree *)r->ctx, offset, len, buf, len);
 }
 
 bool
 axl_piece_tree_find(AxlPieceTree *pt, const char *needle, size_t needle_len,
-                    size_t from_offset, uint32_t flags, size_t *out_offset)
+                    size_t from_offset, uint32_t flags, AxlMatch *out)
 {
-    if (pt == NULL || needle == NULL || out_offset == NULL) {
+    if (pt == NULL || needle == NULL || out == NULL) {
         return false;
     }
-    bool ci = (flags & AXL_FIND_CASE_INSENSITIVE) != 0;
-    bool ww = (flags & AXL_FIND_WHOLE_WORD) != 0;
-    if (flags & AXL_FIND_BACKWARD) {
-        return find_backward(pt, needle, needle_len, from_offset, ci, ww, out_offset);
+    AxlByteReader reader = {
+        .length = pt_reader_length,
+        .read   = pt_reader_read,
+        .peek   = NULL,            /* virtual document — windowed read only */
+        .ctx    = pt,
+    };
+    return axl_find_in_source(&reader, needle, needle_len, from_offset,
+                              flags, out);
+}
+
+bool
+axl_piece_tree_find_regex(AxlPieceTree *pt, const AxlRegex *re,
+                          size_t from_offset, uint32_t match_flags, AxlMatch *out)
+{
+    if (pt == NULL || re == NULL || out == NULL) {
+        return false;
     }
-    return find_forward(pt, needle, needle_len, from_offset, ci, ww, out_offset);
+    AxlByteReader reader = {
+        .length = pt_reader_length,
+        .read   = pt_reader_read,
+        .peek   = NULL,            /* virtual document — matcher materializes */
+        .ctx    = pt,
+    };
+    return axl_regex_search(re, &reader, from_offset, match_flags, out);
 }
 
 // ---------------------------------------------------------------------------

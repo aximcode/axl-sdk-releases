@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-bytes.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +68,30 @@ axl_clipboard_get(
     size_t      *out_len,   ///< [out] byte count (set to 0 when empty)
     const char **out_mime   ///< [out, optional] stored MIME type, or NULL
 );
+
+/**
+ * @brief Take a stable snapshot of the clipboard contents.
+ *
+ * Unlike axl_clipboard_get — which borrows a pointer that the next
+ * axl_clipboard_set / axl_clipboard_clear invalidates — this COPIES the
+ * bytes out into an AxlBytes the caller owns. The copy is what makes it
+ * stable: it stays valid regardless of later clipboard changes, so use
+ * this whenever you need to retain the payload past the next clipboard
+ * operation.
+ *
+ * The result is an AxlBytes (rather than a plain owned buffer) so it
+ * composes with the rest of the byte-blob APIs — a paste target can
+ * hand it to a parser, an undo entry, or several widgets, each taking
+ * its own reference instead of re-copying. (The clipboard itself does
+ * not need reference counting; that is a property of the shared type.)
+ *
+ * The MIME type is not included; use axl_clipboard_get for that.
+ *
+ * @return a new AxlBytes snapshot (release with axl_bytes_unref), or
+ *     NULL if the clipboard is empty or on allocation failure.
+ */
+AxlBytes *
+axl_clipboard_get_bytes(void);
 
 /**
  * @brief Empty the clipboard, freeing its contents.

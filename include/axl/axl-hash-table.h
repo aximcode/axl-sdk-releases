@@ -48,7 +48,9 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <axl/axl-types.h>
+#include <axl/axl-list.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +83,14 @@ typedef bool (*AxlHashTableForeachRemoveFunc)(
     void       *data   ///< opaque callback data
 );
 
+/// Predicate for axl_hash_table_find (GLib: GHRFunc).
+/// Return true when the entry is the one being searched for.
+typedef bool (*AxlHashTableFindFunc)(
+    const void *key,   ///< entry key
+    void       *value, ///< entry value
+    void       *data   ///< opaque callback data
+);
+
 // ---------------------------------------------------------------------------
 // Built-in hash and equality functions
 // ---------------------------------------------------------------------------
@@ -100,6 +110,24 @@ size_t axl_direct_hash(const void *key);
 
 /// Pointer equality. (GLib: g_direct_equal)
 bool axl_direct_equal(const void *a, const void *b);
+
+/// Hash the `int` pointed to by @p key. (GLib: g_int_hash)
+size_t axl_int_hash(const void *key);
+
+/// Equality of the `int`s pointed to by @p a and @p b. (GLib: g_int_equal)
+bool axl_int_equal(const void *a, const void *b);
+
+/// Hash the `int64_t` pointed to by @p key. (GLib: g_int64_hash)
+size_t axl_int64_hash(const void *key);
+
+/// Equality of the `int64_t`s pointed to by @p a and @p b. (GLib: g_int64_equal)
+bool axl_int64_equal(const void *a, const void *b);
+
+/// Hash the `double` pointed to by @p key. (GLib: g_double_hash)
+size_t axl_double_hash(const void *key);
+
+/// Equality of the `double`s pointed to by @p a and @p b. (GLib: g_double_equal)
+bool axl_double_equal(const void *a, const void *b);
 
 // ---------------------------------------------------------------------------
 // Construction and destruction
@@ -267,6 +295,30 @@ axl_hash_table_contains(
 );
 
 /**
+ * @brief Add a key to a set-style table (value is the key itself).
+ *
+ * Stores @p key with its value set to @p key, the GLib set idiom.
+ * Replaces any existing entry for an equal key (keeping the new key,
+ * like axl_hash_table_replace). Intended for set-style tables —
+ * tables created with axl_hash_table_new() (borrowed) or
+ * axl_hash_table_new_full() with a key destructor only. Do NOT use
+ * with a value_destroy callback: the value aliases the key, so a
+ * value destructor would double-free it. Likewise not meaningful for
+ * axl_hash_table_new_str() (copy_keys) tables — the stored value
+ * would alias the caller's key, not the table's internal copy.
+ *
+ * Matches g_hash_table_add().
+ *
+ * @return true if the key was newly added, false if it replaced an
+ *     existing entry or allocation failed.
+ */
+bool
+axl_hash_table_add(
+    AxlHashTable *h,    ///< hash table
+    void         *key   ///< key, also stored as the value
+);
+
+/**
  * @brief Remove an entry, calling key_destroy and value_destroy.
  *
  * Matches g_hash_table_remove().
@@ -277,6 +329,33 @@ bool
 axl_hash_table_remove(
     AxlHashTable *h,    ///< hash table
     const void   *key   ///< key to remove
+);
+
+/**
+ * @brief Remove every entry, calling key_destroy and value_destroy.
+ *
+ * Leaves the table empty and reusable (the bucket array is retained).
+ * Matches g_hash_table_remove_all().
+ */
+void
+axl_hash_table_remove_all(
+    AxlHashTable *h  ///< hash table (NULL-safe)
+);
+
+/**
+ * @brief Find the first value whose entry satisfies a predicate.
+ *
+ * Calls @p predicate for each entry (in unspecified order) until it
+ * returns true, then returns that entry's value. Matches
+ * g_hash_table_find().
+ *
+ * @return the matching value, or NULL if no entry matches.
+ */
+void *
+axl_hash_table_find(
+    AxlHashTable          *h,         ///< hash table
+    AxlHashTableFindFunc   predicate, ///< predicate, returns true on match
+    void                  *data       ///< opaque data passed to @p predicate
 );
 
 /**
@@ -370,6 +449,37 @@ axl_hash_table_foreach_remove(
     AxlHashTable                   *h,    ///< hash table
     AxlHashTableForeachRemoveFunc   func, ///< predicate
     void                           *data  ///< opaque data
+);
+
+/**
+ * @brief Collect all keys into a newly allocated list.
+ *
+ * The returned list holds the table's key pointers (borrowed — the
+ * keys themselves still belong to the table). Free only the list
+ * spine with axl_list_free(); do not free the keys through it. Order
+ * is unspecified. Best-effort under memory pressure: a list-node
+ * allocation failure drops that key silently rather than erroring.
+ * Matches g_hash_table_get_keys().
+ *
+ * @return a new AxlList of keys, or NULL if the table is empty.
+ */
+AxlList *
+axl_hash_table_get_keys(
+    AxlHashTable *h  ///< hash table
+);
+
+/**
+ * @brief Collect all values into a newly allocated list.
+ *
+ * The returned list holds the table's value pointers (borrowed).
+ * Free only the list spine with axl_list_free(). Order is
+ * unspecified. Matches g_hash_table_get_values().
+ *
+ * @return a new AxlList of values, or NULL if the table is empty.
+ */
+AxlList *
+axl_hash_table_get_values(
+    AxlHashTable *h  ///< hash table
 );
 
 // ---------------------------------------------------------------------------

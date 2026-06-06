@@ -137,6 +137,17 @@ axl_ttf_free(
 AxlTtf *
 axl_ttf_default(void);
 
+/// The shared, lazily-loaded built-in **monospace** TrueType font — a
+/// subset of DejaVu Sans Mono (same coverage as `axl_ttf_default`).  The
+/// fixed-width face for code / terminal text where glyphs must align in
+/// columns.  Same ownership + caching contract as `axl_ttf_default` (do
+/// NOT free it); dropped by `--gc-sections` when unreferenced.
+///
+/// @return shared `AxlTtf *` (never freed by the caller), or NULL on a
+///         one-time load failure.
+AxlTtf *
+axl_ttf_mono_default(void);
+
 // ===================================================================
 // Measurement
 // ===================================================================

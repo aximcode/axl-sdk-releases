@@ -21,3 +21,8 @@ AxlRuntime (default loop, yield, registry inspection)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. doxygenfile:: axl-runtime.h
+
+AxlApp (program invocation path)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-app.h

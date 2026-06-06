@@ -17,6 +17,7 @@
 #include <axl/axl-fs.h>          /* AxlFsEntry — used by webdav callbacks */
 #include <axl/axl-hash-table.h>
 #include <axl/axl-json.h>
+#include <axl/axl-bytes.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -446,6 +447,29 @@ axl_http_response_set_static(
     AxlHttpResponse *r,             ///< response
     const void      *body,          ///< pointer to read-only / static buffer
     size_t           size,          ///< size of @a body in bytes
+    const char      *content_type   ///< MIME type (borrowed); NULL = leave as-is
+);
+
+/**
+ * @brief Set the response body from an AxlBytes.
+ *
+ * Convenience for handlers that already hold their payload as an
+ * AxlBytes — a file read via axl_file_get_bytes, a cached blob,
+ * a slice. The bytes are COPIED into the response's owned body (the
+ * SDK frees that copy after the response is sent), so the caller may
+ * unref @a body immediately. This is not a zero-copy path: the
+ * contiguous-body send copies into the transmit buffer regardless, so
+ * for large payloads prefer axl_http_response_set_file /
+ * axl_http_response_set_streamer.
+ *
+ * @a content_type is borrowed (typically a string literal); NULL
+ * leaves the existing content-type unchanged. An empty @a body sends
+ * an empty payload.
+ */
+void
+axl_http_response_set_bytes(
+    AxlHttpResponse *r,             ///< response
+    const AxlBytes  *body,          ///< payload to copy in
     const char      *content_type   ///< MIME type (borrowed); NULL = leave as-is
 );
 

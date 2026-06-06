@@ -253,6 +253,11 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\bEFI__HANDLE\b", "EFI_HANDLE", text)
     # Spec has EFI_IMAGE_UNLOAD for LoadImage field — should be EFI_IMAGE_LOAD
     text = re.sub(r"EFI_IMAGE_UNLOAD(\s+LoadImage)", r"EFI_IMAGE_LOAD\1", text)
+    # Spec types the InstallMultipleProtocolInterfaces field with the
+    # UNINSTALL funcptr (identical signature, but wrong) — should be INSTALL
+    text = re.sub(
+        r"EFI_UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES(\s+InstallMultipleProtocolInterfaces)",
+        r"EFI_INSTALL_MULTIPLE_PROTOCOL_INTERFACES\1", text)
     text = re.sub(r"}\s*FI_DHCP4_PACKET\s*;", "} EFI_DHCP4_PACKET;", text)
 
     # Fix missing space: "typedef struct_NAME" → "typedef struct _NAME"

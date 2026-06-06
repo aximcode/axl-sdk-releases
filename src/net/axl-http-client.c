@@ -1172,6 +1172,15 @@ axl_http_client_response_free(AxlHttpClientResponse *resp)
     axl_free(resp);
 }
 
+AxlBytes *
+axl_http_client_response_get_bytes(const AxlHttpClientResponse *resp)
+{
+    if (resp == NULL || resp->body == NULL || resp->body_size == 0) {
+        return NULL;
+    }
+    return axl_bytes_new(resp->body, resp->body_size);
+}
+
 int
 axl_http_download(AxlHttpClient *c, const char *url,
                   const char *local_path)

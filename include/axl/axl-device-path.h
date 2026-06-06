@@ -30,7 +30,7 @@ extern "C" {
 /// Opaque handle to an EFI_DEVICE_PATH_PROTOCOL chain. The pointer
 /// returned by the constructors below is suitable to pass to
 /// `axl_protocol_register("device-path", ...)` or to
-/// `axl_protocol_register_guid(&EFI_DEVICE_PATH_PROTOCOL_GUID, ...)`.
+/// `axl_protocol_install(&EFI_DEVICE_PATH_PROTOCOL_GUID, ...)`.
 typedef struct AxlDevicePath AxlDevicePath;
 
 /**

@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-stream.h>   /* AxlEncoding */
+#include <axl/axl-find.h>     /* AxlFindFlags, AxlMatch, axl_find_in_source */
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,14 +46,6 @@ extern "C" {
 
 typedef struct AxlPieceTree AxlPieceTree;
 typedef struct AxlPageCache AxlPageCache;   /* <axl/axl-page-cache.h> */
-
-/// Flags for axl_piece_tree_find.
-typedef enum {
-    AXL_FIND_DEFAULT          = 0,
-    AXL_FIND_CASE_INSENSITIVE = 1u << 0,  ///< ASCII case fold
-    AXL_FIND_BACKWARD         = 1u << 1,  ///< search toward offset 0
-    AXL_FIND_WHOLE_WORD       = 1u << 2,  ///< match only at word boundaries
-} AxlFindFlags;
 
 /// Line-ending (EOL) style. LF / CRLF / CR are concrete terminators;
 /// AXL_EOL_MIXED is only ever *returned* by axl_piece_tree_detect_eol (a
@@ -314,14 +307,16 @@ axl_piece_tree_line_bounds(
  * @brief Search for a byte substring across the (virtual) document.
  *
  * Finds @p needle starting the scan at @p from_offset. Forward (default)
- * returns the lowest match offset >= @p from_offset; @c AXL_FIND_BACKWARD
- * returns the highest match offset <= @p from_offset. Matches spanning
+ * returns the lowest match with start >= @p from_offset; @c AXL_FIND_BACKWARD
+ * returns the highest match with start <= @p from_offset. Matches spanning
  * piece boundaries are handled. @c AXL_FIND_CASE_INSENSITIVE folds ASCII
  * case; @c AXL_FIND_WHOLE_WORD requires non-word bytes (anything but
  * `[A-Za-z0-9_]`) on both sides. Wrap-around is the caller's job.
  *
- * @return true and sets @p *out_offset on a match; false if not found
- *     (or @p needle_len is 0).
+ * Thin wrapper over axl_find_in_source (see @ref AxlByteReader).
+ *
+ * @return true and fills @p out on a match; false if not found (or
+ *     @p needle_len is 0).
  */
 AXL_WARN_UNUSED bool
 axl_piece_tree_find(
@@ -330,7 +325,30 @@ axl_piece_tree_find(
     size_t        needle_len,   ///< length of @p needle
     size_t        from_offset,  ///< where to start scanning
     uint32_t      flags,        ///< AxlFindFlags
-    size_t       *out_offset    ///< [out] match offset on success
+    AxlMatch     *out           ///< [out] match on success
+);
+
+/// Opaque compiled regex (see axl-regex.h).
+typedef struct AxlRegex AxlRegex;
+
+/**
+ * @brief Search the document for a compiled regular expression.
+ *
+ * Regex analog of axl_piece_tree_find. Because the document is virtual
+ * (out-of-core), the regex matcher materializes it into a temporary
+ * buffer — O(document) memory per call. For a single interactive
+ * "find next" that is fine; for find-all over a large document, read
+ * the searched range out once and use axl_regex_search_buf instead.
+ *
+ * @return true and fills @p out on a match; false otherwise.
+ */
+AXL_WARN_UNUSED bool
+axl_piece_tree_find_regex(
+    AxlPieceTree   *pt,           ///< piece tree
+    const AxlRegex *re,           ///< compiled regex
+    size_t          from_offset,  ///< where to start scanning
+    uint32_t        match_flags,  ///< AxlRegexMatchFlags
+    AxlMatch       *out           ///< [out] match on success
 );
 
 /**
@@ -640,9 +658,25 @@ axl_piece_tree_set_undo_limit(
 /**
  * @brief Begin an undo group; edits until the matching end undo together.
  *
- * Nestable — only the outermost begin/end pair forms the group. Use to
- * coalesce a run of keystrokes into a single undo step (the grouping
- * policy is the editor's; the mechanism is here).
+ * The explicit **atomic-transaction** bracket: every edit between this
+ * call and the matching axl_piece_tree_undo_group_end undoes/redoes as
+ * one step. Nestable — only the outermost begin/end pair forms the
+ * group (inner pairs are depth-counted, not separate groups). Reach for
+ * this when you apply several edits imperatively and want them atomic:
+ * a paste that deletes a selection then inserts, find-replace-all,
+ * multi-cursor edits, auto-indent-on-newline.
+ *
+ * Three tools, three jobs — don't confuse them:
+ *   - **_undo_group_begin / _end** (this) — bracket an explicit,
+ *     possibly-nested batch of imperative edits as one atomic step.
+ *   - **axl_piece_tree_apply_edits** — when you already hold the whole
+ *     batch as an AxlEdit[] (replace-all, multi-cursor): applies it as
+ *     ONE group with correct offset adjustment. Simpler than bracketing
+ *     by hand; prefer it when the edits are known up front.
+ *   - **axl_piece_tree_undo_checkpoint** — the *opposite* model:
+ *     accumulate-until-break keystroke coalescing (VS Code-style), where
+ *     consecutive edits merge until the editor declares a boundary. Use
+ *     for live typing, NOT for bracketing a transaction.
  */
 void
 axl_piece_tree_undo_group_begin(

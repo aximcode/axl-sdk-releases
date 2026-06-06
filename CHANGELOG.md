@@ -3,6 +3,199 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.0.0 — 2026-06-05
+
+First stable release. Since 0.24.0: a deferred surface compositor with a
+cursor and exact region algebra, a linear-time regular-expression engine,
+a first-class UEFI driver-authoring surface (Type-A protocol publishers and
+Type-B Driver Model bindings), `AxlBytes` / `AxlHmac` / `AxlRand`, GOP
+display-mode control, and a built-in monospace font — plus the one breaking
+cleanup below.
+
+### Added
+
+- **UEFI driver-authoring surface** (`<axl/axl-driver.h>`) — author UEFI
+  drivers in plain AXL C, with no EDK2 source tree and no raw EFI types in
+  the common path. `axl_protocol_install` / `axl_protocol_uninstall`
+  publish a protocol interface — the Type-A resident-service /
+  protocol-publisher driver. For full UEFI **Driver Model** (Type-B)
+  drivers, `AxlDriverBinding` + `axl_driver_binding_install` /
+  `axl_driver_binding_uninstall` manage the `EFI_DRIVER_BINDING_PROTOCOL`
+  mechanics for you — the EFIAPI `Supported`/`Start`/`Stop` thunks and the
+  `OpenProtocol(BY_DRIVER)` ownership bookkeeping — so you write three
+  callbacks against `AxlHandle`, no EFI types. `axl_driver_connect_handle`
+  / `axl_driver_disconnect_handle` drive a controller's bind / unbind.
+  Worked examples in `sdk/examples/{smbus-hc-shim,binding-driver}.c` and a
+  guide in `docs/AXL-Driver-Authoring-Guide.md`.
+
+- **GOP display-mode control** (`<axl/axl-gfx.h>`) — query and switch the
+  firmware's graphics output modes: `axl_gfx_mode_count`,
+  `axl_gfx_query_mode` (an `AxlGfxMode`'s index + dimensions),
+  `axl_gfx_current_mode`, `axl_gfx_find_mode` (by width × height),
+  `axl_gfx_set_mode` (switch), and `axl_gfx_max_mode` (pick the
+  largest-area mode — the usual "use the biggest display" call).
+
+- **`axl_ttf_mono_default`** (`<axl/axl-truetype.h>`) — a built-in
+  monospace font, the fixed-width companion to the bundled default
+  proportional face (no external font file required).
+
+- **`AxlCompositor`** (`<axl/axl-compositor.h>`) — a deferred,
+  retained-mode surface compositor (a wlroots-`wl_scene`-style scene
+  graph for UEFI GOP). Surfaces are nodes in a tree (`axl_surface_create`
+  / `_destroy`, `_move` / `_resize` / `_raise` / `_lower` /
+  `_set_parent`); each carries an off-screen buffer (`axl_surface_buffer`)
+  you draw into, and the compositor composites the tree to its output and
+  presents it (`axl_compositor_composite` / `_present`). Composition is
+  damage-driven and occlusion-aware: per-surface `axl_surface_damage`
+  accumulates an exact region, `axl_compositor_get_damage_region` reports
+  it, opaque surfaces (`axl_surface_set_opaque`) cull what is hidden
+  behind them, and only the damaged region is recomposited. Surfaces
+  support per-surface `axl_surface_set_opacity` (gamma-correct),
+  `axl_surface_set_per_pixel_alpha`, `axl_surface_set_backdrop_blur` (the
+  dialog veil), visibility, and absolute/output coordinate mapping
+  (`axl_surface_get_absolute` / `_to_output` / `_from_output`). A **seat**
+  routes input: `axl_compositor_pointer_event` hit-tests and dispatches to
+  the surface under the pointer (with an optional `axl_surface_set_input_region`),
+  `axl_compositor_pointer_grab` / `_pointer_grab_chain` / `_pointer_ungrab`
+  implement modal and popup-chain grabs, and
+  `axl_compositor_set_keyboard_focus` / `_key_event` route keys —
+  delivered to an `AxlSurfaceListener` (`axl_surface_set_listener`) whose
+  pointer callbacks carry the live keyboard modifiers and a click count.
+  **Frame callbacks** (`axl_surface_request_frame` + an attached frame
+  clock) throttle redraw to present.
+
+- **`AxlCursor`** (`<axl/axl-cursor.h>`) — a software mouse-cursor
+  compositor (the "never writes the scene" overlay): `axl_cursor_new` /
+  `_free`, a built-in arrow or a custom `axl_cursor_set_image`,
+  `_show` / `_hide`, and motion by absolute position (`axl_cursor_move`)
+  or relative delta (`axl_cursor_move_rel`). It composites the cursor as
+  the topmost overlay above any scene (the compositor wires it in
+  automatically) and offers a standalone save-under mode
+  (`axl_cursor_lift` / `_drop`) for direct-to-screen consumers that have
+  no compositor.
+
+- **`AxlGfxRegion`** (`<axl/axl-gfx-region.h>`) — exact banded
+  rectangle-set algebra (a pixman/X11-`miregion`-style region), the
+  substrate under the compositor's damage and occlusion tracking. A
+  region is a canonical, y-x-banded set of rectangles supporting
+  `axl_gfx_region_union` / `_subtract` / `_intersect` (and `_rect`
+  variants), `_translate`, `_bounds`, `_contains_point` /
+  `_intersects_rect`, `_equal`, and rectangle iteration
+  (`_num_rects` / `_get_rect`). Exact by construction, with an
+  `axl_gfx_region_is_lossy` flag for the bounded-storage fallback.
+
+- **Animated-image decode** — `axl_pixmap_decode_anim`
+  (`<axl/axl-pixmap.h>`) decodes a multi-frame GIF into an `AxlPixmapAnim`
+  (per-frame pixmaps + delays), freed with `axl_pixmap_anim_free`. Feeds
+  an animated-image widget driven by the compositor frame clock.
+
+- **`AxlNTree` move + reverse iteration** (`<axl/axl-ntree.h>`) —
+  `axl_ntree_move_after` / `_move_before` re-order a node among its
+  siblings without detaching and re-inserting, and
+  `axl_ntree_iter_init_reverse` walks children last-to-first (the order
+  the compositor needs for top-down hit-testing).
+
+- **Input: `axl_input_detach_key`** (`<axl/axl-input.h>`) — releases a
+  keyboard slot taken by a compositor key attach (the counterpart to the
+  attach), and pointer events now carry the live keyboard modifier state
+  so consumers can implement Shift+wheel / Ctrl+click.
+
+- **`AxlRegex`** (`<axl/axl-regex.h>`) — a regular-expression matcher
+  over the `axl-find.h` byte-source seam. A *compiled* pattern
+  (`axl_regex_new` → search many times) driven by a Thompson NFA / Pike
+  VM, so match time is linear (O(pattern × input)) for every pattern —
+  no catastrophic backtracking / "ReDoS". Supports literals, `.`, greedy
+  and lazy quantifiers, `^ $`, `|`, capture groups `( )`, classes
+  `[...]`/`[^...]`, and `\d \w \s` (+ negations); `axl_regex_search` /
+  `_search_buf` / `_search_captures`, `axl_regex_capture_count`, compile
+  flags `CASELESS`/`MULTILINE`/`DOTALL`, and an `ANCHORED` match flag.
+  `axl_text_buffer_find_regex` / `axl_piece_tree_find_regex` run a
+  compiled regex over those sources. Leftmost (Perl/`grep -P`) semantics;
+  backreferences are intentionally unsupported (they would force
+  backtracking). Verified on both arches incl. capture, anchored, flags,
+  compile-error, find-all, ReDoS, and OOM-injection paths.
+
+- **`grep -E`** — the `grep` tool gains `-E` / `--extended-regexp` to
+  match an AxlRegex pattern (the first consumer of the new engine);
+  without `-E` it keeps the literal Boyer-Moore-Horspool fast path. `-i`
+  composes (case-insensitive regex), and a malformed pattern reports its
+  offset and exits 2.
+
+- **AxlBytes adoption** — consumers of the new buffer type, all
+  additive (existing APIs unchanged):
+  - `axl_file_get_bytes` (`<axl/axl-fs.h>`) reads a whole file into an
+    `AxlBytes`, wrapping the read buffer with no extra copy.
+  - `axl_clipboard_get_bytes` (`<axl/axl-clipboard.h>`) returns a stable
+    snapshot of the clipboard that survives later `axl_clipboard_set` /
+    `_clear` — unlike the borrowed pointer from `axl_clipboard_get`,
+    which the next clipboard operation invalidates. (The shm-backed,
+    boot-persistent clipboard storage is unchanged.)
+  - `axl_http_response_set_bytes` (`<axl/axl-http-server.h>`) serves an
+    `AxlBytes` as the response body (copies into the owned body — the
+    contiguous send copies into the transmit buffer regardless, so use
+    `set_file` / `set_streamer` for large payloads), and
+    `axl_http_client_response_get_bytes` (`<axl/axl-http-client.h>`)
+    snapshots a response body into an `AxlBytes` that outlives the
+    response.
+
+- **`AxlBytes`** (`<axl/axl-bytes.h>`) — an immutable, reference-counted
+  byte buffer mirroring GLib's `GBytes`. A read-only `(data, size)` blob
+  shared across owners without copying: `axl_bytes_new` (copy) /
+  `_new_take` (own a heap block) / `_new_static` (borrow static data),
+  `_ref` / `_unref` (+ AUTOPTR), `_get_data` / `_get_size`, and
+  `_new_from_bytes` for a zero-copy sub-range that keeps its parent
+  alive. Content `axl_bytes_hash` / `_equal` / `_compare` (usable as
+  AxlHashTable key callbacks). The shared currency for data flowing
+  between subsystems — HTTP bodies, file contents, shared-memory
+  segments. Single-threaded refcount (UEFI BSP).
+
+- **`AxlHmac`** (`<axl/axl-hmac.h>`) — keyed-hash message
+  authentication (HMAC, RFC 2104) over the existing AxlChecksum digest
+  engine (MD5 / SHA-1 / SHA-256), mirroring GLib's `GHmac`. No
+  `AXL_TLS=1` / mbedTLS dependency. `axl_hmac_new` / `_update` /
+  `_get_string` / `_get_digest` / `_free` (+ AUTOPTR) and a one-shot
+  `axl_compute_hmac`. Keys longer than the 64-byte block are hashed
+  down per the RFC; empty keys are valid. For API tokens, signed
+  cookies, webhook signatures — prefer HMAC-SHA256 for new designs.
+  Verified against the RFC 2202 / 4231 test vectors.
+
+- **`AxlHashTable` / `AxlArray` GLib-parity functions.** Hash table:
+  `axl_hash_table_get_keys` / `_get_values` (borrowed-pointer
+  `AxlList`s), `_find` (first value matching a predicate), `_add`
+  (set idiom — value aliases the key), `_remove_all` (clear, keeping
+  the bucket array), and the built-in hashers/comparators
+  `axl_int_hash`/`_int_equal`, `axl_int64_hash`/`_int64_equal`,
+  `axl_double_hash`/`_double_equal` (the double hasher normalizes
+  -0.0 so it matches +0.0). Array: `axl_array_insert` / `_prepend`
+  (value mode) and `axl_array_insert_ptr` / `_prepend_ptr` (pointer
+  mode), matching `g_array_insert_val` / `g_ptr_array_insert`.
+
+- **`AxlRand`** (`<axl/axl-rand.h>`) — a deterministic, seedable
+  pseudo-random number generator mirroring GLib's `GRand`
+  (xoshiro256** seeded through SplitMix64). The complement to
+  `axl_rng_bytes` (`<axl/axl-rng.h>`), which draws hardware entropy
+  and has no reproducible mode: reach for `AxlRand` when you want
+  repeatable streams — test fixtures, sampling, retry-backoff jitter,
+  procedural graphics, shuffling. A given seed produces a
+  byte-identical stream on x86-64 and AArch64 (the output is a defined
+  64-bit word sequence; `uint32` is its high half, `double` uses the
+  53-bit construction, `double_range` avoids fused multiply-add, and
+  `bytes` is little-endian). `axl_rand_int_range` is unbiased
+  (rejection-sampled). Includes a process-global stream
+  (`axl_random_*`, mirroring `g_random_*`). NOT cryptographically
+  secure — use `axl_rng_bytes` for nonces, keys, and tokens.
+
+### Removed
+
+- **`axl_protocol_register_guid` / `axl_protocol_unregister_guid`**
+  (`<axl/axl-sys.h>`) — removed. They duplicated the newer
+  `axl_protocol_install` / `axl_protocol_uninstall`
+  (`<axl/axl-driver.h>`), hand-rolling the same raw firmware install over
+  a parallel path. Callers that registered a *bare GUID* should use
+  `axl_protocol_install(guid, iface, &handle)`; the name-based
+  `axl_protocol_register` / `_register_multiple` / `_unregister` family is
+  unchanged (it now sits on the same primitive).
+
 ## 0.24.0 — 2026-06-01
 
 ### Added

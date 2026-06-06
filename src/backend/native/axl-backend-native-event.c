@@ -356,3 +356,34 @@ axl_backend_event_register_protocol_notify(
                                          registration);
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
+
+int
+axl_backend_install_protocol(
+    void           **handle,
+    const void      *guid,
+    void            *iface
+    )
+{
+    /* InstallProtocolInterface allocates a fresh handle when *handle is
+       NULL and writes it back — the in/out contract maps directly. */
+    EFI_STATUS status = gBS->InstallProtocolInterface(
+        (EFI_HANDLE *)handle,
+        (EFI_GUID *)guid,
+        EFI_NATIVE_INTERFACE,
+        iface);
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
+int
+axl_backend_uninstall_protocol(
+    void            *handle,
+    const void      *guid,
+    void            *iface
+    )
+{
+    EFI_STATUS status = gBS->UninstallProtocolInterface(
+        (EFI_HANDLE)handle,
+        (EFI_GUID *)guid,
+        iface);
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}

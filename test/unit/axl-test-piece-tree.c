@@ -519,36 +519,36 @@ test_piece_tree_search(void)
     test_check(pt_content_is(pt, (const uint8_t *)"hello world", 11),
                "search: cross-piece content built");
 
-    size_t off = 999;
-    test_check(axl_piece_tree_find(pt, "hello", 5, 0, AXL_FIND_DEFAULT, &off) && off == 0,
+    AxlMatch off = { .start = 999 };
+    test_check(axl_piece_tree_find(pt, "hello", 5, 0, AXL_FIND_DEFAULT, &off) && off.start == 0 && off.length == 5,
                "search: 'hello' spans piece boundary");
-    test_check(axl_piece_tree_find(pt, "world", 5, 0, AXL_FIND_DEFAULT, &off) && off == 6,
+    test_check(axl_piece_tree_find(pt, "world", 5, 0, AXL_FIND_DEFAULT, &off) && off.start == 6,
                "search: 'world' spans piece boundary");
-    test_check(axl_piece_tree_find(pt, "lo wor", 6, 0, AXL_FIND_DEFAULT, &off) && off == 3,
+    test_check(axl_piece_tree_find(pt, "lo wor", 6, 0, AXL_FIND_DEFAULT, &off) && off.start == 3,
                "search: interior match");
     test_check(!axl_piece_tree_find(pt, "zzz", 3, 0, AXL_FIND_DEFAULT, &off),
                "search: not found");
     // case-insensitive
     test_check(!axl_piece_tree_find(pt, "HELLO", 5, 0, AXL_FIND_DEFAULT, &off),
                "search: case-sensitive miss");
-    test_check(axl_piece_tree_find(pt, "HELLO", 5, 0, AXL_FIND_CASE_INSENSITIVE, &off) && off == 0,
+    test_check(axl_piece_tree_find(pt, "HELLO", 5, 0, AXL_FIND_CASE_INSENSITIVE, &off) && off.start == 0,
                "search: case-insensitive hit");
     // forward from offset
-    test_check(axl_piece_tree_find(pt, "o", 1, 5, AXL_FIND_DEFAULT, &off) && off == 7,
+    test_check(axl_piece_tree_find(pt, "o", 1, 5, AXL_FIND_DEFAULT, &off) && off.start == 7,
                "search: forward from offset skips earlier match");
     // backward
-    test_check(axl_piece_tree_find(pt, "l", 1, 11, AXL_FIND_BACKWARD, &off) && off == 9,
+    test_check(axl_piece_tree_find(pt, "l", 1, 11, AXL_FIND_BACKWARD, &off) && off.start == 9,
                "search: backward finds highest match");
-    test_check(axl_piece_tree_find(pt, "o", 1, 5, AXL_FIND_BACKWARD, &off) && off == 4,
+    test_check(axl_piece_tree_find(pt, "o", 1, 5, AXL_FIND_BACKWARD, &off) && off.start == 4,
                "search: backward from offset");
     axl_piece_tree_free(pt);
 
     // whole-word
     pt = axl_piece_tree_new();
     (void)axl_piece_tree_insert(pt, 0, "hell hello world", 16);
-    test_check(axl_piece_tree_find(pt, "hell", 4, 0, AXL_FIND_WHOLE_WORD, &off) && off == 0,
+    test_check(axl_piece_tree_find(pt, "hell", 4, 0, AXL_FIND_WHOLE_WORD, &off) && off.start == 0,
                "search: whole-word matches standalone");
-    test_check(axl_piece_tree_find(pt, "hello", 5, 0, AXL_FIND_WHOLE_WORD, &off) && off == 5,
+    test_check(axl_piece_tree_find(pt, "hello", 5, 0, AXL_FIND_WHOLE_WORD, &off) && off.start == 5,
                "search: whole-word matches second word");
     test_check(!axl_piece_tree_find(pt, "wor", 3, 0, AXL_FIND_WHOLE_WORD, &off),
                "search: whole-word rejects substring of a word");
@@ -829,10 +829,10 @@ test_piece_tree_find_fuzz(void)
         uint32_t flags = (ci ? AXL_FIND_CASE_INSENSITIVE : 0)
                        | (ww ? AXL_FIND_WHOLE_WORD : 0)
                        | (bw ? AXL_FIND_BACKWARD : 0);
-        size_t got = 0;
+        AxlMatch got = { 0 };
         bool f = axl_piece_tree_find(pt, (const char *)nee, m, from, flags, &got);
         size_t exp = ref_find(img, ilen, nee, m, from, ci, ww, bw);
-        if (f ? (exp != got) : (exp != SIZE_MAX)) {
+        if (f ? (exp != got.start || got.length != m) : (exp != SIZE_MAX)) {
             ok = false;
         }
     }
@@ -848,16 +848,17 @@ test_piece_tree_find_fuzz(void)
         for (size_t k = 0; k < bm; k++) {
             bn[k] = img[at + k];
         }
-        size_t g = 0, e;
-        bool   f;
+        AxlMatch g = { 0 };
+        size_t   e;
+        bool     f;
         f = axl_piece_tree_find(pt, (const char *)bn, bm, 0, AXL_FIND_DEFAULT, &g);
         e = ref_find(img, ilen, bn, bm, 0, false, false, false);
-        if (!f || e != g) {
+        if (!f || e != g.start) {
             win_ok = false;
         }
         f = axl_piece_tree_find(pt, (const char *)bn, bm, ilen, AXL_FIND_BACKWARD, &g);
         e = ref_find(img, ilen, bn, bm, ilen, false, false, true);
-        if (!f || e != g) {
+        if (!f || e != g.start) {
             win_ok = false;
         }
     }
@@ -870,12 +871,12 @@ test_piece_tree_find_fuzz(void)
     const char with_nul[] = { 'a', '\0', 'b', 'c', '\0', 'b' };   /* a␀bc␀b */
     (void)axl_piece_tree_insert(pt, 0, with_nul, sizeof(with_nul));
     const char nul_needle[] = { '\0', 'b' };
-    size_t off = 999;
-    test_check(axl_piece_tree_find(pt, nul_needle, 2, 0, AXL_FIND_DEFAULT, &off) && off == 1,
+    AxlMatch off = { .start = 999 };
+    test_check(axl_piece_tree_find(pt, nul_needle, 2, 0, AXL_FIND_DEFAULT, &off) && off.start == 1,
                "search: embedded-NUL needle found (byte-exact fallback)");
-    test_check(axl_piece_tree_find(pt, nul_needle, 2, 2, AXL_FIND_DEFAULT, &off) && off == 4,
+    test_check(axl_piece_tree_find(pt, nul_needle, 2, 2, AXL_FIND_DEFAULT, &off) && off.start == 4,
                "search: embedded-NUL needle, forward from offset");
-    test_check(axl_piece_tree_find(pt, nul_needle, 2, 5, AXL_FIND_BACKWARD, &off) && off == 4,
+    test_check(axl_piece_tree_find(pt, nul_needle, 2, 5, AXL_FIND_BACKWARD, &off) && off.start == 4,
                "search: embedded-NUL needle, backward");
     axl_piece_tree_free(pt);
 }
@@ -1209,8 +1210,8 @@ test_piece_tree_read_only(void)
     /* reads / search / line queries still work */
     char buf[8];
     test_check(axl_piece_tree_get(pt, 0, 6, buf, sizeof(buf)) == 6, "ro: get still works");
-    size_t off = 0;
-    test_check(axl_piece_tree_find(pt, "cd", 2, 0, AXL_FIND_DEFAULT, &off) && off == 2,
+    AxlMatch off = { 0 };
+    test_check(axl_piece_tree_find(pt, "cd", 2, 0, AXL_FIND_DEFAULT, &off) && off.start == 2,
                "ro: find still works");
     size_t s = 0, e = 0;
     test_check(axl_piece_tree_line_bounds(pt, 0, &s, &e) == AXL_OK && s == 0 && e == 6,
@@ -1347,10 +1348,10 @@ test_piece_tree_save_over_self(void)
 
     /* edit: prepend a marker, delete "three" -> a known edited string */
     (void)axl_piece_tree_insert(pt, 0, "X ", 2);
-    size_t pos = 0;
+    AxlMatch pos = { 0 };
     test_check(axl_piece_tree_find(pt, "three", 5, 0, AXL_FIND_DEFAULT, &pos),
                "sos: located 'three'");
-    (void)axl_piece_tree_delete(pt, pos, 5);
+    (void)axl_piece_tree_delete(pt, pos.start, 5);
     const char *edited = "X line one\nline two\nline \n";
     size_t edited_len = axl_strlen(edited);   /* 26 */
     test_check(pt_content_is(pt, (const uint8_t *)edited, edited_len), "sos: edited content");

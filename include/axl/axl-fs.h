@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-bytes.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +43,23 @@ axl_file_get_contents(
     const char *path,  ///< file path (UTF-8)
     void      **buf,   ///< (out): file contents (caller frees with axl_free)
     size_t     *len    ///< (out): file size in bytes
+);
+
+/**
+ * @brief Read an entire file into an immutable AxlBytes.
+ *
+ * Like axl_file_get_contents but returns the contents as a
+ * reference-counted AxlBytes — the shareable currency for passing
+ * file data to parsers, hashers, or multiple readers without copying.
+ * The read buffer is wrapped without an extra copy (axl_bytes_new_take).
+ * An empty file yields a valid empty AxlBytes (size 0).
+ *
+ * @return a new AxlBytes (release with axl_bytes_unref), or NULL on
+ *     read error or allocation failure.
+ */
+AxlBytes *
+axl_file_get_bytes(
+    const char *path  ///< file path (UTF-8)
 );
 
 /**

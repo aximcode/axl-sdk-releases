@@ -30,6 +30,16 @@ typedef struct {
     uint64_t  framebuffer; ///< physical address (0 if BltOnly mode)
 } AxlGfxInfo;
 
+/// One enumerable GOP display mode (see axl_gfx_query_mode).  Geometry
+/// only — the pixel format is normalized by the present path, not the
+/// caller's concern when picking a resolution.
+typedef struct {
+    uint32_t  index;   ///< mode number — pass to axl_gfx_set_mode
+    uint32_t  width;   ///< horizontal resolution in pixels
+    uint32_t  height;  ///< vertical resolution in pixels
+    uint32_t  stride;  ///< pixels per scan line (>= width)
+} AxlGfxMode;
+
 /// 2D point at floating-point (sub-pixel) precision.
 ///
 /// The vocabulary type for geometry the caller supplies pre-transformed
@@ -100,6 +110,21 @@ axl_gfx_blend_ex(
     AxlGfxPixel      dst,   ///< destination / backdrop pixel
     AxlGfxPixel      src,   ///< source pixel (its alpha drives compositing)
     AxlGfxBlendMode  mode   ///< blend function to apply
+    );
+
+/// Source-over composite @a src over @a dst, honoring the active
+/// `axl_gfx_set_gamma_correct` setting.
+///
+/// Unlike `axl_gfx_blend` (a pure sRGB helper), this runs the over-
+/// composite in linear light when gamma-correct mode is on — the same
+/// path the drawing primitives use, so off-screen compositing (e.g. a
+/// compositor blending surfaces, or a translucent overlay) matches what
+/// the gamma-aware fills/blits produce. Always source-over; result alpha
+/// is 0xFF (the backdrop is treated as opaque).
+AxlGfxPixel
+axl_gfx_composite(
+    AxlGfxPixel  dst,   ///< destination / backdrop pixel
+    AxlGfxPixel  src    ///< source pixel (its alpha drives compositing)
     );
 
 /// Parse a CSS-style hex color string into an `AxlGfxPixel`.

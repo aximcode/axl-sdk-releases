@@ -320,7 +320,7 @@ crash the launcher on the first vtable call.
 protocols (`OpenProtocol` with a BY_DRIVER attribute), the unload
 callback must close them. Otherwise `axl_driver_unload` (or
 firmware-side `UnloadImage`) returns `EFI_ACCESS_DENIED`. Use
-`axl_protocol_register_guid` and `axl_protocol_unregister_guid` for
+`axl_protocol_install` and `axl_protocol_uninstall` for
 the published vtable — those don't have the BY_DRIVER hazard.
 
 **Dangling pointers after unload.** A launcher that calls

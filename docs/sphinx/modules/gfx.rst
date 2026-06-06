@@ -48,3 +48,18 @@ AxlFont — ``<axl/axl-font.h>``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. doxygenfile:: axl-font.h
+
+AxlCursor — ``<axl/axl-cursor.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-cursor.h
+
+AxlCompositor — ``<axl/axl-compositor.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-compositor.h
+
+AxlGfxRegion — ``<axl/axl-gfx-region.h>``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-gfx-region.h

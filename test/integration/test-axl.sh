@@ -29,11 +29,36 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
-TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree)
+TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion)
+# Tests deliberately NOT in the default run, each with a reason. The
+# guard below treats anything here as accounted-for.
+TEST_APPS_SKIP=(
+    AxlTestCpuIdle   # ~3s perf workload; run only by test-cpu-idle.sh
+)
+
 # Debug override: TEST_APPS_ONLY="AxlTestGfx AxlTestTruetype" runs a subset
 # (skips the cross-test ratchet — for fast local iteration only).
 if [ -n "${TEST_APPS_ONLY:-}" ]; then
     read -r -a TEST_APPS <<< "$TEST_APPS_ONLY"
+else
+    # Guard: every built AxlTest*.efi must be either in TEST_APPS (run) or
+    # TEST_APPS_SKIP (explicitly excluded). A newly added test that is wired
+    # into the Makefile but forgotten here would otherwise build but never
+    # run — silently dropping coverage. Make that a hard error instead.
+    for _efi in "$NATIVE_DIR"/AxlTest*.efi; do
+        [ -e "$_efi" ] || continue
+        _name="$(basename "$_efi" .efi)"
+        case " ${TEST_APPS[*]} ${TEST_APPS_SKIP[*]} " in
+            *" $_name "*) ;;
+            *)
+                echo "ERROR: $_name.efi is built but is in neither TEST_APPS" \
+                     "nor TEST_APPS_SKIP." >&2
+                echo "       Add it to one of those lists in" \
+                     "test/integration/test-axl.sh." >&2
+                exit 1
+                ;;
+        esac
+    done
 fi
 
 for app in "${TEST_APPS[@]}"; do

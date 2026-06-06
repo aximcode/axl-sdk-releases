@@ -87,7 +87,7 @@ axl_net_locate_sb(
 
     status = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
                     ByProtocol,
-                    sb_guid,
+                    (EFI_GUID *)sb_guid,   /* drop const: callee only reads it */
                     NULL,
                     &handle_count,
                     &handles
@@ -140,7 +140,7 @@ axl_net_locate_sb(
 
     status = axl_efi_call(axl_bs()->HandleProtocol, 3,
                     chosen,
-                    sb_guid,
+                    (EFI_GUID *)sb_guid,   /* drop const: callee only reads it */
                     (void **)sb
                     );
     if (!EFI_ERROR(status)) {

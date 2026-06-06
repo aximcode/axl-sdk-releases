@@ -39,10 +39,12 @@ AXL SDK
    modules/text-buffer
    modules/rb-tree
    modules/piece-tree
+   modules/find
    modules/radix-tree
    modules/ring-buf
    modules/config
    modules/subcommand
+   modules/args
    modules/path
    modules/clipboard
    modules/shm
@@ -62,6 +64,7 @@ AXL SDK
    modules/mem-phys
    modules/watchdog
    modules/rng
+   modules/rand
    modules/gfx
    modules/truetype
    modules/display-list
@@ -87,6 +90,7 @@ AXL SDK
    guides/coding-style
    guides/sdk
    guides/shared-driver
+   guides/driver-authoring
    guides/axlmm-design
    guides/display-design
    guides/porting

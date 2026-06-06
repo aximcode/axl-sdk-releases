@@ -33,6 +33,191 @@ extern "C" {
 /// Opaque handle to a loaded driver image.
 typedef void *AxlDriverHandle;
 
+// ===================================================================
+// Protocol publishing
+//
+// AXL-typed wrappers over the firmware's InstallProtocolInterface /
+// UninstallProtocolInterface. A driver (or any image) uses these to
+// publish a protocol interface other code can locate — the core of a
+// Type-A resident service / protocol-publisher driver. No <uefi/...>
+// include or gBS-> drop-down required: AxlHandle is EFI_HANDLE and
+// AxlGuid is binary-compatible with EFI_GUID.
+// ===================================================================
+
+/**
+ * @brief Install a protocol interface on a handle.
+ *
+ * Publishes @p iface under @p guid so other images can find it via the
+ * locate/handle APIs. To create a new handle for a fresh service, pass
+ * a pointer to a NULL handle: the firmware allocates one and writes it
+ * back through @p handle. To add another protocol to a handle you
+ * already own, pass that handle.
+ *
+ * The interface is borrowed, not copied: @p iface must stay valid until
+ * it is uninstalled. A resident driver that must outlive its own image
+ * unload should allocate the interface from a boot-services pool (so the
+ * AXL leak tracker doesn't reclaim it at image exit), not via
+ * `axl_malloc`.
+ *
+ * @code
+ * static AxlHandle  my_handle = NULL;   // fresh handle on first install
+ * static MyIface    iface     = { ... };
+ * axl_protocol_install(&MY_PROTOCOL_GUID, &iface, &my_handle);
+ * @endcode
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_protocol_install(
+    const AxlGuid  *guid,     ///< protocol GUID (non-NULL)
+    void           *iface,    ///< interface pointer to publish (non-NULL); borrowed, must outlive the install
+    AxlHandle      *handle    ///< [in,out] handle to install on; if `*handle` is NULL a fresh handle is allocated and written back. Must be non-NULL.
+);
+
+/**
+ * @brief Uninstall a protocol interface from a handle.
+ *
+ * Removes the @p guid / @p iface pairing previously installed with
+ * axl_protocol_install. Pass the same interface pointer that was
+ * installed. The firmware rejects the removal (AXL_ERR) if another
+ * image still has the protocol open; uninstall during clean unload,
+ * after dependents have closed it.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_protocol_uninstall(
+    AxlHandle       handle,   ///< handle the protocol was installed on (non-NULL)
+    const AxlGuid  *guid,     ///< protocol GUID (non-NULL)
+    void           *iface     ///< the same interface pointer passed to axl_protocol_install (non-NULL)
+);
+
+// ===================================================================
+// Driver Model binding — Type B (write a UEFI Driver Model driver)
+// ===================================================================
+//
+// A Type-B driver binds to controllers that expose a particular protocol
+// (PCI I/O, USB I/O, a custom bus protocol) — the standard UEFI Driver
+// Model. The fiddly mechanics are what AXL manages for you:
+//   - the EFIAPI Supported / Start / Stop thunks (marshalling
+//     EFI_HANDLE <-> AxlHandle and EFI_STATUS <-> int, hiding the calling
+//     convention);
+//   - the OpenProtocol(BY_DRIVER) / CloseProtocol ownership bookkeeping
+//     around `binds` — the load-bearing mechanic that tags controller
+//     ownership and prevents double-binding;
+//   - building and installing EFI_DRIVER_BINDING_PROTOCOL (Version,
+//     ImageHandle, DriverBindingHandle) + EFI_COMPONENT_NAME2_PROTOCOL.
+// You write three callbacks in pure AXL C — `AxlHandle`, no `EFI_HANDLE`,
+// no EFIAPI, no OpenProtocol dance.
+//
+// v1 scope is the 90% case: "this driver binds to controllers exposing
+// protocol X" (a device / function driver). Bus drivers
+// (`RemainingDevicePath`, child-handle creation, Stop's child buffer) are
+// deferred to v2; the raw EFI_DRIVER_BINDING_PROTOCOL stays available as the
+// escape hatch for them.
+
+/**
+ * @brief A UEFI Driver Model binding — what to bind to, plus the three
+ *        callbacks AXL drives for you.
+ *
+ * Fill this in and install it with axl_driver_binding_install from your
+ * AXL_DRIVER entry point. AXL **copies** the descriptor, so a stack or static
+ * AxlDriverBinding is fine — but @c name and the GUID @c binds points at are
+ * borrowed and must outlive the driver (string and GUID literals are the
+ * norm).
+ */
+typedef struct {
+    /// Human-readable driver name, surfaced via EFI_COMPONENT_NAME2_PROTOCOL
+    /// (the shell `drivers` listing). Required (non-NULL). Borrowed.
+    const char    *name;
+
+    /// The protocol GUID a controller must expose for this driver to manage
+    /// it. AXL opens it BY_DRIVER to test and claim ownership. Borrowed.
+    const AxlGuid *binds;
+
+    /// Optional extra gate (NULL = manage any controller exposing @c binds).
+    /// Called during Supported AFTER AXL has confirmed @c binds is present
+    /// and openable BY_DRIVER. Return true to manage @p controller. Keep it
+    /// side-effect-free — Supported is a pure query the firmware may run
+    /// against many controllers.
+    bool (*supported)(AxlHandle controller, void *ctx);
+
+    /// Start managing @p controller. AXL has already opened @c binds
+    /// BY_DRIVER (claiming ownership) and hands you the bound interface as
+    /// @p iface — cast it to the real protocol type (e.g.
+    /// `EFI_PCI_IO_PROTOCOL *`); operating it is the driver's job, the one
+    /// unavoidable raw-EFI-type touch. Initialise the device, publish any
+    /// child protocols. Return AXL_OK on success; on any other value AXL
+    /// rolls back (CloseProtocol) and reports failure to ConnectController.
+    int (*start)(AxlHandle controller, void *iface, void *ctx);
+
+    /// Stop managing @p controller (DisconnectController / driver unload).
+    /// Tear down what start built (uninstall child protocols, quiesce the
+    /// device). AXL closes @c binds afterward. Return AXL_OK on success.
+    int (*stop)(AxlHandle controller, void *ctx);
+
+    /// Borrowed context passed to every callback (NULL if unused). Shared
+    /// across all controllers this driver manages — key per-controller state
+    /// by @p controller.
+    void *ctx;
+} AxlDriverBinding;
+
+/**
+ * @brief Install a Driver Model binding (Type B) — call once from your
+ *        AXL_DRIVER entry point.
+ *
+ * Builds and installs an EFI_DRIVER_BINDING_PROTOCOL (with AXL's managed
+ * Supported / Start / Stop thunks) plus an EFI_COMPONENT_NAME2_PROTOCOL on
+ * the driver's own image handle, so the firmware's ConnectController drives
+ * your @p db callbacks against matching controllers. AXL copies @p db (see
+ * the lifetime note on AxlDriverBinding) and retains the binding record while
+ * it is installed.
+ *
+ * **Teardown:** a *driver* must call axl_driver_binding_uninstall from its
+ * unload callback — firmware-driven driver unload does NOT drain axl_atexit.
+ * AXL does register an axl_atexit hook as a safety net, but that fires only at
+ * app exit (AXL_APP / CRT0), so it covers an *app* that installs a binding,
+ * not a driver being unloaded.
+ *
+ * v1 installs **one binding per driver image** (on the image handle) — the
+ * "device driver binds to protocol X" case. A second call returns AXL_ERR
+ * (the firmware rejects a duplicate EFI_DRIVER_BINDING_PROTOCOL on the image
+ * handle). A driver that must bind several protocols from one image uses the
+ * raw EFI_DRIVER_BINDING_PROTOCOL escape hatch; multi-binding-per-image (one
+ * binding per fresh handle) is a planned follow-on.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad arguments (NULL @p db / @c name /
+ *     @c binds / @c start / @c stop) or installation failure.
+ */
+int
+axl_driver_binding_install(
+    const AxlDriverBinding  *db   ///< the binding descriptor (copied)
+);
+
+/**
+ * @brief Uninstall the Driver Model binding installed by
+ *        axl_driver_binding_install.
+ *
+ * Removes the EFI_DRIVER_BINDING_PROTOCOL + EFI_COMPONENT_NAME2_PROTOCOL from
+ * the image handle and frees the binding record. v1 tracks one binding per
+ * image, so this takes no argument — it removes that binding.
+ *
+ * **Call this from a driver's unload callback.** AXL also registers the same
+ * teardown via axl_atexit, but that fires only at app exit (AXL_APP / CRT0),
+ * NOT on firmware-driven driver unload — so a Type-B *driver* must uninstall
+ * its binding explicitly here, after disconnecting any controllers it manages
+ * (otherwise the firmware still references the binding and the uninstall
+ * fails). Apps that install a binding can rely on the axl_atexit hook instead.
+ * Calling this removes that hook, so it never double-runs.
+ *
+ * @return AXL_OK if the binding was uninstalled and freed; AXL_ERR if no
+ *     binding is installed, or if the firmware still references it (e.g. a
+ *     controller is still bound — disconnect it first). On the latter the
+ *     record is deliberately kept alive rather than freed-and-dangled.
+ */
+int
+axl_driver_binding_uninstall(void);
+
 /**
  * @brief Load a driver image from a file path.
  *
@@ -289,6 +474,31 @@ axl_driver_get_image_path(void);
 int
 axl_driver_connect_handle(
     void *handle  ///< handle to connect (from axl_protocol_register, etc.)
+);
+
+/**
+ * @brief Disconnect all drivers from a specific controller handle.
+ *
+ * Symmetric counterpart to axl_driver_connect_handle: triggers the Stop
+ * sequence of every driver currently managing @p handle (the firmware is
+ * asked to disconnect all drivers and all children). Use it to release a
+ * controller you bound — for example a Type-B `AxlDriverBinding` example
+ * tearing down the controller it drove, so its `stop` callback runs.
+ *
+ * Note the handle kinds differ from axl_driver_disconnect: that takes a
+ * loaded *driver-image* handle (from axl_driver_load) and detaches that
+ * driver from the devices it bound; this takes a *controller* handle and
+ * detaches the drivers bound to it. They are the two sides of the same
+ * relation.
+ *
+ * @return AXL_OK on success, including when no driver was managing the
+ *     handle (a no-op). EFI_NOT_FOUND is also mapped to AXL_OK as a
+ *     defensive symmetry with axl_driver_connect_handle; AXL_ERR on a NULL
+ *     handle or a real disconnect failure.
+ */
+int
+axl_driver_disconnect_handle(
+    void *handle  ///< controller handle to disconnect (non-NULL)
 );
 
 /**

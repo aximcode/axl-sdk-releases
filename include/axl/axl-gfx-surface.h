@@ -40,6 +40,69 @@ axl_gfx_get_info(
     );
 
 // ===================================================================
+// Display modes (GOP QueryMode / SetMode — boot-services only)
+// ===================================================================
+
+/// Number of display modes the GOP enumerates.
+///
+/// @return mode count, or 0 if headless / no GOP.
+uint32_t
+axl_gfx_mode_count(void);
+
+/// Query the geometry of mode @a index without switching to it.
+///
+/// @return AXL_OK on success, AXL_ERR if no GOP, @a index out of range
+///         (>= axl_gfx_mode_count()), @a out is NULL, or QueryMode failed.
+int
+axl_gfx_query_mode(
+    uint32_t     index,  ///< mode number in [0, axl_gfx_mode_count())
+    AxlGfxMode  *out     ///< [out] receives the mode geometry
+    );
+
+/// The currently-active mode index (its geometry matches axl_gfx_get_info()).
+///
+/// @return AXL_OK + *@a out_index set, or AXL_ERR if no GOP / @a out_index NULL.
+int
+axl_gfx_current_mode(
+    uint32_t  *out_index  ///< [out] receives the active mode number
+    );
+
+/// Find the first enumerated mode matching @a width x @a height.
+///
+/// @return AXL_OK + *@a out_index set, or AXL_ERR if no GOP, no matching
+///         mode, or @a out_index is NULL.
+int
+axl_gfx_find_mode(
+    uint32_t   width,      ///< desired horizontal resolution
+    uint32_t   height,     ///< desired vertical resolution
+    uint32_t  *out_index   ///< [out] receives the matching mode number
+    );
+
+/// Find the largest enumerated mode — greatest pixel area, ties broken by
+/// the wider mode.  The "use the full screen" pick (its `index` feeds
+/// `axl_gfx_set_mode`).
+///
+/// @return AXL_OK + *@a out, or AXL_ERR if no GOP, no modes, or @a out NULL.
+int
+axl_gfx_max_mode(
+    AxlGfxMode  *out   ///< [out] receives the largest mode
+    );
+
+/// Switch the display to mode @a index.
+///
+/// The framebuffer is reallocated — axl_gfx_get_info() reflects the new
+/// geometry afterward and any cached FrameBufferBase is stale — and the
+/// screen is cleared, so the caller MUST repaint.  Boot-services only
+/// (the GOP is gone after ExitBootServices).
+///
+/// @return AXL_OK on success, AXL_ERR if no GOP, @a index out of range,
+///         or SetMode failed.
+int
+axl_gfx_set_mode(
+    uint32_t  index  ///< mode number in [0, axl_gfx_mode_count())
+    );
+
+// ===================================================================
 // Off-screen buffers (double-buffered rendering)
 // ===================================================================
 

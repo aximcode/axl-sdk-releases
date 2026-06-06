@@ -420,7 +420,12 @@
     {"name": "EFI_DRIVER_BINDING_PROTOCOL_SUPPORTED", "kind": "funcptr"},
     {"name": "EFI_DRIVER_BINDING_PROTOCOL_START",     "kind": "funcptr"},
     {"name": "EFI_DRIVER_BINDING_PROTOCOL_STOP",      "kind": "funcptr"},
-    {"name": "EFI_DRIVER_BINDING_PROTOCOL",            "kind": "struct"}
+    {"name": "EFI_DRIVER_BINDING_PROTOCOL",            "kind": "struct"},
+    // Component Name 2 — the driver-name protocol AXL installs alongside the
+    // binding (the `name` field). The GET_*_NAME funcptrs are shared v1/v2.
+    {"name": "EFI_COMPONENT_NAME_GET_DRIVER_NAME",     "kind": "funcptr"},
+    {"name": "EFI_COMPONENT_NAME_GET_CONTROLLER_NAME", "kind": "funcptr"},
+    {"name": "EFI_COMPONENT_NAME2_PROTOCOL",           "kind": "struct"}
   ],
 
   "mp-services.h": [

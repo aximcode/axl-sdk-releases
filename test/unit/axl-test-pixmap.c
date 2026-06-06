@@ -13,6 +13,7 @@
 #include <axl/axl-gfx.h>
 
 #include "test-image-4x3-png.h"
+#include "test-anim-2frame-gif.h"
 
 /* Small invalid byte buffers for axl_pixmap_info / decode failure paths. */
 static const uint8_t too_short[4] = { 0x89, 0x50, 0x4e, 0x47 };
@@ -227,6 +228,96 @@ test_decode_buffer_pixel_bottom_right_is_brown(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_pixmap_decode_anim — multi-frame (animated GIF)
+// ---------------------------------------------------------------------------
+
+static void
+test_decode_anim_gif_frame_count(void)
+{
+    AxlPixmapAnim *a = axl_pixmap_decode_anim(test_anim_2frame_gif,
+                                              (size_t)test_anim_2frame_gif_len);
+    test_check(a != NULL, "anim: 2-frame GIF decodes to non-NULL");
+    if (a) {
+        test_check(a->n_frames == 2, "anim: GIF has 2 frames");
+        test_check(a->frames != NULL && a->delays_ms != NULL,
+                   "anim: frames + delays arrays non-NULL");
+    }
+    axl_pixmap_anim_free(a);
+}
+
+static void
+test_decode_anim_gif_delays(void)
+{
+    /* Frame delays were authored 100 ms / 200 ms; stb returns ms directly. */
+    AxlPixmapAnim *a = axl_pixmap_decode_anim(test_anim_2frame_gif,
+                                              (size_t)test_anim_2frame_gif_len);
+    if (a && a->n_frames == 2) {
+        test_check(a->delays_ms[0] == 100, "anim: frame 0 delay == 100 ms");
+        test_check(a->delays_ms[1] == 200, "anim: frame 1 delay == 200 ms");
+    } else {
+        test_check(false, "anim: delays — expected 2 frames");
+    }
+    axl_pixmap_anim_free(a);
+}
+
+static void
+test_decode_anim_gif_frame_pixels(void)
+{
+    /* Frame 0 is solid red (0xE0,0x10,0x10); frame 1 solid blue
+     * (0x10,0x10,0xE0). Each frame is a full 2x2 canvas (BGRA, alpha 0xFF). */
+    AxlPixmapAnim *a = axl_pixmap_decode_anim(test_anim_2frame_gif,
+                                              (size_t)test_anim_2frame_gif_len);
+    if (a && a->n_frames == 2) {
+        uint32_t w = 0, h = 0;
+        test_check(axl_gfx_buffer_get_info(a->frames[0], &w, &h) == AXL_OK
+                   && w == 2 && h == 2, "anim: frame 0 is 2x2");
+        AxlGfxPixel *f0 = axl_gfx_buffer_pixels(a->frames[0]);
+        AxlGfxPixel *f1 = axl_gfx_buffer_pixels(a->frames[1]);
+        if (f0 && f1) {
+            test_check(f0[0].red == 0xE0 && f0[0].green == 0x10
+                       && f0[0].blue == 0x10 && f0[0].alpha == 0xFF,
+                       "anim: frame 0 pixel is red");
+            test_check(f1[3].red == 0x10 && f1[3].green == 0x10
+                       && f1[3].blue == 0xE0 && f1[3].alpha == 0xFF,
+                       "anim: frame 1 pixel is blue");
+        } else {
+            test_check(false, "anim: frame pixels non-NULL");
+        }
+    } else {
+        test_check(false, "anim: pixels — expected 2 frames");
+    }
+    axl_pixmap_anim_free(a);
+}
+
+static void
+test_decode_anim_static_png_single_frame(void)
+{
+    /* A static image decodes to a single frame (delay 0): one entry point. */
+    AxlPixmapAnim *a = axl_pixmap_decode_anim(test_image_4x3_png,
+                                              (size_t)test_image_4x3_png_len);
+    test_check(a != NULL, "anim: static PNG decodes to non-NULL");
+    if (a) {
+        test_check(a->n_frames == 1, "anim: static PNG is 1 frame");
+        test_check(a->delays_ms[0] == 0, "anim: static frame delay == 0");
+        AxlGfxPixel *p = axl_gfx_buffer_pixels(a->frames[0]);
+        test_check(p != NULL && p[0].red == 0xFF && p[0].green == 0x00
+                   && p[0].blue == 0x00, "anim: static PNG (0,0) is red");
+    }
+    axl_pixmap_anim_free(a);
+}
+
+static void
+test_decode_anim_invalid(void)
+{
+    test_check(axl_pixmap_decode_anim(NULL, 100) == NULL, "anim: NULL bytes -> NULL");
+    test_check(axl_pixmap_decode_anim((const uint8_t *)"x", 0) == NULL,
+               "anim: zero len -> NULL");
+    test_check(axl_pixmap_decode_anim(garbage, sizeof garbage) == NULL,
+               "anim: garbage -> NULL");
+    axl_pixmap_anim_free(NULL);   /* NULL-safe */
+}
+
+// ---------------------------------------------------------------------------
 // Suite entry point
 // ---------------------------------------------------------------------------
 
@@ -261,6 +352,12 @@ test_pixmap_main(
     test_decode_buffer_has_correct_dimensions();
     test_decode_buffer_pixel_top_left_is_red();
     test_decode_buffer_pixel_bottom_right_is_brown();
+
+    test_decode_anim_gif_frame_count();
+    test_decode_anim_gif_delays();
+    test_decode_anim_gif_frame_pixels();
+    test_decode_anim_static_png_single_frame();
+    test_decode_anim_invalid();
 
     return test_print_results();
 }

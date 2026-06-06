@@ -479,7 +479,7 @@ typedef struct _EFI_BOOT_SERVICES {
     EFI_PROTOCOLS_PER_HANDLE       ProtocolsPerHandle;     // EFI 1.1+
     EFI_LOCATE_HANDLE_BUFFER       LocateHandleBuffer;     // EFI 1.1+
     EFI_LOCATE_PROTOCOL            LocateProtocol;         // EFI 1.1+
-  EFI_UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES  InstallMultipleProtocolInterfaces;    // EFI 1.1+
+  EFI_INSTALL_MULTIPLE_PROTOCOL_INTERFACES  InstallMultipleProtocolInterfaces;    // EFI 1.1+
   EFI_UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES UninstallMultipleProtocolInterfaces;   // EFI 1.1+*
 
     //

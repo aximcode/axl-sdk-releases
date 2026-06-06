@@ -231,16 +231,22 @@ axl_ntree_free(root);                                    // node + subtree
 
 Insertion (`append_child`/`prepend_child`/`insert_before`/`insert_after`)
 attaches an existing root node; `append_data` is the new+append shortcut.
-`axl_ntree_unlink` detaches a subtree (it becomes its own root). Counts
-and queries: `n_children`, `nth_child`, `depth` (root = 1), `max_height`,
-`n_nodes(flags)`, `is_ancestor`, `get_root`. Traversal supports
-pre/post/in/level order, an ALL/LEAVES/NON_LEAVES filter, a depth limit,
-and early stop (the callback returns `true`). Data is borrowed; the tree
-owns only its node objects. Single-threaded, no locking.
+`axl_ntree_unlink` detaches a subtree (it becomes its own root).
+`move_after`/`move_before` reposition an *already-attached* node (the
+`insert_*` twins, with a cycle guard) — place-above/place-below a sibling,
+reparent, or (with a NULL sibling) move to first/last; this is how a
+scene-graph raise/lower is built. Counts and queries: `n_children`,
+`nth_child`, `depth` (root = 1), `max_height`, `n_nodes(flags)`,
+`is_ancestor`, `get_root`. Traversal supports pre/post/in/level order, an
+ALL/LEAVES/NON_LEAVES filter, a depth limit, and early stop (the callback
+returns `true`). Data is borrowed; the tree owns only its node objects.
+Single-threaded, no locking.
 
 For a **pull-style** walk without a callback, `AxlNTreeIter` is a
 stack-allocated pre-order cursor (uses the parent/sibling links — no
-internal stack, any depth):
+internal stack, any depth); `axl_ntree_iter_init_reverse` walks the same
+nodes in reverse pre-order (topmost-first for a paint-order tree — the
+hit-test idiom):
 
 ```c
 AxlNTreeIter it;
@@ -1072,7 +1078,15 @@ axl_text_buffer_line_bounds(tb, line, &start, &end);   // [start,end) excl. '\n'
 
 char out[64];
 size_t n = axl_text_buffer_get(tb, start, end - start, out, sizeof(out));
+
+AxlMatch m;                                        // {start, length}
+if (axl_text_buffer_find(tb, "cd", 2, 0, AXL_FIND_DEFAULT, &m)) { /* m.start */ }
 ```
+
+`axl_text_buffer_find` mirrors `axl_piece_tree_find` (case-insensitive /
+backward / whole-word; matches that straddle the gap are handled) — both
+are thin wrappers over the shared `axl_find_in_source` engine
+(`<axl/axl-find.h>`).
 
 For very large / out-of-core files, use **AxlPieceTree** below; the gap
 buffer is the memory-resident store.
@@ -1144,19 +1158,31 @@ re-select restored text, zero for a net deletion) so the editor can place
 the caret/selection at the edit site. Because the original
 and add buffers are immutable/append-only, the bytes needed to reverse an
 edit are never discarded — undo records are tiny span deltas, not text
-copies. `axl_piece_tree_undo_group_begin`/`_end` (nestable) coalesce a run
-of edits into one undo step; *what* to group (keystroke runs, time gaps,
-cursor moves) is the editor's policy, applied on top of this mechanism.
-For the accumulate-until-break style, `axl_piece_tree_undo_checkpoint`
-slices consecutive edits into runs — the editor calls it at each boundary
-(a pause, a cursor jump, a type↔delete switch) for VS Code-like smart
-grouping, no begin/end bookkeeping.
+copies. Three undo-grouping tools, three distinct jobs:
+`axl_piece_tree_undo_group_begin`/`_end` (nestable, depth-counted) is the
+explicit **atomic-transaction** bracket — every edit between them undoes
+as one step; use it for imperative multi-edit ops (paste, find-replace-all,
+multi-cursor). `axl_piece_tree_apply_edits` does the same for a batch you
+already hold as an `AxlEdit[]` (one group, with offset adjustment) — prefer
+it when the edits are known up front. `axl_piece_tree_undo_checkpoint` is
+the *opposite* model: **accumulate-until-break** keystroke coalescing,
+where consecutive edits merge until the editor declares a boundary (a
+pause, a cursor jump, a type↔delete switch) for VS Code-like smart
+grouping — use it for live typing, not for bracketing a transaction.
+*What* to group is always the editor's policy; the buffer supplies the
+mechanism.
 
 **Editor-substrate helpers** layer on top for a full editor:
 `axl_piece_tree_find` searches a byte substring across the virtual
 document (cross-piece) with case-insensitive / backward / whole-word
-flags, using the same Boyer–Moore–Horspool engine as `grep`
-(`axl_strstr_len` & friends); `axl_piece_tree_is_modified` is a save-point-aware dirty flag;
+flags and reports an `AxlMatch` (`{start, length}`). It is a thin
+wrapper over the shared search engine `axl_find_in_source`
+(`<axl/axl-find.h>`), which runs Boyer–Moore–Horspool over an abstract
+`AxlByteReader` — the same engine `axl_text_buffer_find` uses, so a gap
+buffer and a piece tree share one matcher (windowing with overlap so a
+match straddling a piece boundary or the gap is never missed; a
+contiguous source is scanned in place via the reader's `peek`).
+`axl_piece_tree_is_modified` is a save-point-aware dirty flag;
 `axl_piece_tree_apply_edits` applies a batch of original-coordinate edits
 (replace-all, multi-cursor) as one undo group; and the
 `axl_piece_tree_line_iter_*` iterator walks every line in one O(n) pass
@@ -1217,12 +1243,74 @@ necessarily resets (the add-buffer offsets it referenced are gone).
 AxlEncoding enc; bool bom;
 AXL_AUTOPTR(AxlPieceTree) doc = axl_piece_tree_load_encoded(
     "fs0:\\notes.txt", 0, 0, &enc, &bom);   // detects + decodes
-size_t hit;
+AxlMatch hit;
 if (axl_piece_tree_find(doc, "TODO", 4, 0, AXL_FIND_CASE_INSENSITIVE, &hit)) {
-    /* ... */
+    /* hit.start / hit.length locate the match */
 }
 axl_piece_tree_save_encoded(doc, "fs0:\\notes.txt", enc, bom);  // same form back
 ```
+
+## AxlFind — Byte-Substring Search
+
+A Boyer-Moore-Horspool substring search that runs over an abstract
+**`AxlByteReader`** — a tiny function table over whatever holds the
+bytes. The one engine (`axl_find_in_source`) therefore drives a flat
+memory block (the built-in `AxlMemReader`), an **AxlTextBuffer** (gap
+buffer), and an **AxlPieceTree** (out-of-core piece table); the
+`axl_text_buffer_find` / `axl_piece_tree_find` wrappers just build the
+right reader. The reader pulls overlapping windows, so a match
+straddling the source's internal boundaries (a piece edge, the gap) is
+never missed; a contiguous source that supplies the optional `peek` is
+scanned in place with no copy. Forward and backward, case-insensitive,
+and whole-word variants. A hit is an `AxlMatch` — `start` + `length`,
+with the length carried explicitly so the same result shape fits
+variable-length matchers (see AxlRegex).
+
+```c
+AxlMemReader r;
+axl_mem_reader_init(&r, text, len);
+AxlMatch m;
+if (axl_find_in_source(&r.reader, "needle", 6, 0, AXL_FIND_DEFAULT, &m))
+    use(text + m.start, m.length);
+```
+
+## AxlRegex — Regular-Expression Matcher
+
+A **compiled-pattern** regular-expression matcher over the same
+`AxlByteReader` seam. Compile once with `axl_regex_new`, then search
+many times — the right shape for find-all loops and matching one
+pattern across many lines or buffers. The engine is a Thompson NFA /
+**Pike VM**, *not* a backtracker, so match time is O(pattern × input)
+for **every** pattern: there is no catastrophic ("ReDoS") blow-up.
+Backreferences are deliberately unsupported because they are not
+regular and would force backtracking.
+
+Supported: literals, `.`, greedy and lazy quantifiers
+(`* + ? *? +? ??`), anchors `^ $`, alternation `|`, grouping and
+capture `( )`, classes `[...]` / `[^...]` with ranges, and `\d \w \s`
+(plus negations). Matching is byte-oriented and leftmost (Perl /
+`grep -P` priority, not POSIX leftmost-longest). Compile flags:
+`CASELESS`, `MULTILINE`, `DOTALL`; an `ANCHORED` match flag pins the
+match to `from_offset`.
+
+```c
+AXL_AUTOPTR(AxlRegex) re = axl_regex_new("(\\w+)@(\\w+)", AXL_REGEX_DEFAULT);
+AxlMatch g[3];                                   // [0]=whole, [1]/[2]=groups
+AxlMemReader r;
+axl_mem_reader_init(&r, "contact bob@host now", 20);
+if (axl_regex_search_captures(re, &r.reader, 0, AXL_REGEX_MATCH_DEFAULT, g, 3)) {
+    /* g[0] = "bob@host", g[1] = "bob", g[2] = "host" */
+}
+```
+
+Find-all is the same loop literal find uses — re-search from
+`m.start + (m.length ? m.length : 1)`. The matcher needs a contiguous
+view of the scanned region: it uses the reader's zero-copy `peek` when
+available, otherwise materializes the region into a temporary buffer
+(O(region) per call — fine for editor-sized regions; for find-all over
+a large out-of-core document, read the range out once and search the
+buffer). The `axl_text_buffer_find_regex` / `axl_piece_tree_find_regex`
+wrappers run a compiled regex over those sources.
 
 ## AxlRadixTree — Radix Tree
 

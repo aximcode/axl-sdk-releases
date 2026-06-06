@@ -1,11 +1,21 @@
 # AXL EFI Encapsulation Plan
 
-**Status:** design — pre-Phase-A as of 2026-05-12.
+**Status:** design — pre-Phase-A as of 2026-05-12. Phase C **shipped**
+(`<axl/axl-fs-provider.h>`).
 **Trigger:** session-end audit (post-v0.17.1) of axl-sdk consumers
 for direct `EFI_*` / `gBS` / `gRT` / `EFIAPI` references.
 **Goal:** consumers of axl-sdk write zero `EFI_*` identifiers and
 never `#include <uefi/...>` — even when authoring drivers,
 publishing protocols, or implementing UEFI spec interfaces.
+
+> **Driver Model carried forward.** This plan's "authoring drivers"
+> goal was only partially built: Phase C's `axl-fs-provider`
+> (consumer-vtable → SDK EFIAPI-thunk publishing) covers the filesystem
+> case, but the UEFI **Driver Model** (`EFI_DRIVER_BINDING_PROTOCOL` —
+> `Supported`/`Start`/`Stop`) was never abstracted. That remaining piece
+> is designed in [`AXL-Driver-Authoring-Design.md`](AXL-Driver-Authoring-Design.md),
+> which reuses Phase C's thunk pattern for driver binding and adds the
+> public `axl_protocol_install` over Phase P2's `axl_backend_install_protocol`.
 
 ## Design principle
 

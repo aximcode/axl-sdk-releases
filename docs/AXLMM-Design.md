@@ -182,6 +182,23 @@ plus P0829 freestanding subset):
 - `thread_local` — needs `__tls_get_addr` / `__emutls_*`
   unresolvable.  UEFI is single-threaded anyway.
 
+**Heap & `new`:**
+
+- `operator new` / `new[]` (and the matching `delete`s) live in
+  `libaxl-cxx.a` (`src/runtime/axl-cxxabi-ops.cpp`) and route to
+  `axl_malloc` / `axl_free`, so C++ heap memory comes from the UEFI
+  `EfiBootServicesData` pool and is tracked by the same leak detector as
+  `axl_malloc`.  `axl-cc` auto-appends `libaxl-cxx.a` when it sees a `.cpp`.
+- **The throwing `new` returns NULL on failure — it does not throw.**  Built
+  `-fno-exceptions`, the allocating operators are `noexcept`, so there is no
+  `std::bad_alloc`; `new T` yields NULL when the pool is exhausted.  **Check
+  the result** — unlike hosted C++, you cannot rely on an exception.
+- **Placement new requires `#include <new>`.**  It allocates nothing (just
+  returns the pointer), so it is header-only in `<new>` — not provided by
+  `libaxl-cxx.a`.  The freestanding toolchain does not supply the placement
+  overload implicitly: `new (buf) T{...}` without `#include <new>` fails to
+  compile.  (`<new>` is in the always-freestanding header set above.)
+
 ## Design decisions
 
 ### Naming convention

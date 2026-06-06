@@ -29,8 +29,15 @@
 // ---------------------------------------------------------------------------
 //
 // Six required forms per Itanium C++ ABI § 3.2.6 + C++14 sized-delete.
-// Placement new (operator new(size_t, void*)) is header-only in <new>
-// and not provided here — it just returns the passed-in pointer.
+//
+// Placement new (operator new(size_t, void*)) is intentionally NOT here:
+// it allocates nothing — it just returns the passed-in pointer — so it is
+// header-only in <new> (`inline void *operator new(size_t, void *p) { return
+// p; }`). A consumer that writes `new (buf) T{...}` must therefore
+// `#include <new>`: the freestanding toolchain does NOT supply the placement
+// overload implicitly, so without the include the call fails to compile
+// ("no matching function for operator new(size_t, void*)"). It never reaches
+// axl_malloc.
 
 void *
 operator new(size_t sz) noexcept

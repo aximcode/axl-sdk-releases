@@ -1,8 +1,20 @@
 # axl-sdk — Rich UI exploration plan
 
-**Status:** planning. No commitment to ship. Document captures the
-intent, the prerequisite work, and the spike + prototype structure
-so the work can be picked up later without re-deriving it.
+**Status (refreshed 2026-06-02):** the AxlGfx + AxlMath
+rendering/math **prerequisites are SHIPPED** — G1–G15 (incl. G15b),
+G17, G18, and the full M1–M10 series, through tags v0.20.0–v0.22.0;
+only **G16** (LCD subpixel), **G19** (MP-Services raster, spike-gated),
+and **Phase G-FT** (full FreeType bundle) remain on the gfx side. The
+**HTML/CSS + QuickJS engine work (Paths A / C) is still planning** — the
+viability spikes (A1 Lexbor, C1 QuickJS) have not been run, so there is
+**no commitment to ship** the browser engine. (Separately, the AGT
+*editor* substrate — AxlPieceTree/AxlTextBuffer, AxlShm, AxlClipboard —
+shipped in v0.24.0; that is the editor track, not this rendering track,
+but it means the substrate-level clipboard noted as a platform gap below
+now exists for a future binding to expose.) Document captures the intent,
+the prerequisite work (now largely done), and the spike + prototype
+structure so the engine work can be picked up later without re-deriving
+it.
 
 ## Goal
 
@@ -534,13 +546,17 @@ descending leverage.
 > COMPLETE**, in its own `src/gfx/axl-gfx-stroke.c` (`8fb5d80d`,
 > matching Cairo/Skia/Qt/FT). **G13 (blend modes) is also SHIPPED
 > (`9e05226b`).** **G10 (arbitrary-path clip) is also SHIPPED**
-> (`axl_gfx_push_clip_path`). Genuinely remaining: **G12** (pattern
-> fill), **G15–G19**, plus **Phase G-FT** (only `ftgrays` is vendored
-> for G14; the full FreeType bundle is not). Entries below are kept as
-> the design record; see each phase's SHIPPED tag.
+> (`axl_gfx_push_clip_path`). **Update (2026-06-02): G12 (pattern fill),
+> G13 (blend modes), G15 + G15b (gamma), G17 (direct-FB present), and G18
+> (dirty-rect present) have all shipped since (through v0.22.0 and the
+> present pipeline).** Genuinely remaining now: **G16** (LCD subpixel —
+> lowest priority), **G19** (MP-Services raster — spike-gated), plus
+> **Phase G-FT** (only `ftgrays` is vendored for G14; the full FreeType
+> bundle is not). Entries below are kept as the design record; see each
+> phase's SHIPPED tag.
 >
 > **Update (2026-05-31): transform substrate consolidated + made
-> projective; tree containers added — all targeting v0.22.0.**
+> projective; tree containers added — all shipped in v0.22.0.**
 > - **One transform type.** `AxlMat3` (AxlMath) and `AxlGfxAffine` (gfx)
 >   are merged into a single `AxlTransform` (AxlMath, 3×3 double,
 >   projective-capable, **cairo a-first** multiply). The gfx CTM and the
@@ -619,7 +635,7 @@ API.  Replaces the AD4 "future opt-in" with committed work.  Sequence
 after the lean G8 (the lean tier must stand on its own first).
 ~mbedtls-scale (multi-session).
 
-Phase G9 *(SHIPPED — slice 1)* — **first-class display list /
+Phase G9 *(SHIPPED — slices 1 + 2)* — **first-class display list /
 scene graph**.  `<axl/axl-gfx-display-list.h>`: an `AxlGfxDisplayList`
 records draw ops via `axl_gfx_dl_*` appenders and replays them with
 `axl_gfx_display_list_replay` (invoking the immediate-mode
@@ -634,11 +650,11 @@ Slice 1 covers the AGT `AgtDrawContext` op set: fill_rect(_i),
 draw_line, draw_rect, draw_polyline, blit, clear, push/pop_clip,
 fill_path, stroke_path, fill_rounded_rect, draw_text, draw_text_ttf.
 Ops live in an AxlArray (value mode); replay is byte-identical to
-immediate mode (proven).  **Follow-up (slice 2):** gradient fills
+immediate mode (proven).  **Slice 2 *(SHIPPED)*:** gradient fills
 (rect/path/rounded-rect), the transform-stack ops
-(translate/scale/rotate/push/pop_transform), and an optional textual
-`dump` serialization.  Pairs with G4 (recorded transforms will
-compose cleanly).
+(translate/scale/rotate/push/pop_transform), and the textual `dump`
+serialization are all now recorded + replayed.  Pairs with G4 (recorded
+transforms compose cleanly).
 
 Phase G10 *(SHIPPED)* — **path-based clip**.
 `axl_gfx_push_clip_path(const AxlGfxPath *)` extends the clip stack to

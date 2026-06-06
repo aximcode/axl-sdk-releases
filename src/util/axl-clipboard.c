@@ -23,6 +23,7 @@
 #include <axl/axl-clipboard.h>
 
 #include <axl/axl-shm.h>
+#include <axl/axl-bytes.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>   /* axl_memcpy, axl_strlen */
 
@@ -159,6 +160,20 @@ axl_clipboard_get(size_t *out_len, const char **out_mime)
         *out_mime = mime;
     }
     return (h->data_len > 0) ? (const void *)data : NULL;
+}
+
+AxlBytes *
+axl_clipboard_get_bytes(void)
+{
+    size_t      len = 0;
+    const void *data = axl_clipboard_get(&len, NULL);
+
+    if (data == NULL || len == 0) {
+        return NULL;  // empty clipboard
+    }
+    // Snapshot copy: the resident segment can be unlinked by a later
+    // set/clear, so the returned AxlBytes owns its own stable copy.
+    return axl_bytes_new(data, len);
 }
 
 void

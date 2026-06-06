@@ -1,0 +1,254 @@
+/** @file axl-test-cursor.c
+    Unit tests for AxlCursor (software cursor compositor).
+
+    The unit harness is -nographic (no GOP), so the on-screen compositing
+    can't be inspected here — that's the GOP integration test's job, and
+    the spike validated it live. What IS deterministic without a screen:
+
+      - the Option-C invariant that the cursor NEVER modifies the bound
+        scene (it only reads it; the sprite is composited elsewhere and
+        presented). A trail/corruption bug would show as a changed scene.
+      - position tracking + clamp-to-scene.
+      - show/hide/lift/drop/set_image/attach state and NULL-safety.
+**/
+
+#include "axl-test.h"
+#include <axl/axl-cursor.h>
+#include <axl/axl-gfx.h>
+#include <axl/axl-input.h>
+
+/* The attach trampoline, exposed (no public header) so we can drive its
+   relative-pointer seed/delta tracking with synthetic events — the unit
+   harness has no input device to exercise it through axl_cursor_attach. */
+extern bool
+cursor_input_trampoline(const AxlInputEvent *ev, void *data);
+
+#define SW 100
+#define SH 60
+
+static void
+test_cursor_scene_unchanged(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    test_check(scene != NULL, "cursor: scene buffer created");
+    /* Deterministic scene content. */
+    axl_gfx_buffer_clear(scene, AXL_GFX_RGB(0x33, 0x66, 0x99));
+
+    /* Snapshot the scene pixels. */
+    AxlGfxPixel *px = axl_gfx_buffer_pixels(scene);
+    AxlGfxPixel  snap[SW * SH];
+    for (int i = 0; i < SW * SH; i++) {
+        snap[i] = px[i];
+    }
+
+    AxlCursor *c = axl_cursor_new(scene);
+    test_check(c != NULL, "cursor: created on a scene");
+    test_check(!axl_cursor_visible(c), "cursor: starts hidden");
+
+    axl_cursor_show(c);
+    test_check(axl_cursor_visible(c), "cursor: visible after show");
+
+    /* Move all around, including the corners (where the sprite clips). */
+    axl_cursor_move(c, 50, 30);
+    axl_cursor_move(c, 0, 0);
+    axl_cursor_move(c, SW - 1, SH - 1);
+    axl_cursor_move(c, 10, 5);
+    axl_cursor_lift(c);
+    axl_cursor_drop(c);
+    axl_cursor_hide(c);
+
+    /* The cursor must never have written into the scene. */
+    bool same = true;
+    for (int i = 0; i < SW * SH; i++) {
+        if (px[i].blue != snap[i].blue || px[i].green != snap[i].green
+            || px[i].red != snap[i].red || px[i].alpha != snap[i].alpha) {
+            same = false;
+            break;
+        }
+    }
+    test_check(same, "cursor: never modifies the bound scene (Option C)");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+static void
+test_cursor_position_clamp(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    AxlCursor    *c     = axl_cursor_new(scene);
+    int32_t x = -1, y = -1;
+
+    axl_cursor_move(c, 40, 25);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 40 && y == 25, "cursor: position tracks a move");
+
+    axl_cursor_move(c, -10, -10);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 0 && y == 0, "cursor: position clamps to (0,0)");
+
+    axl_cursor_move(c, 9999, 9999);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == SW - 1 && y == SH - 1, "cursor: position clamps to scene max");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+static void
+test_cursor_set_image(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    AxlCursor    *c     = axl_cursor_new(scene);
+
+    /* Restore the built-in arrow. */
+    test_check(axl_cursor_set_image(c, NULL, 0, 0) == AXL_OK,
+               "cursor: set_image(NULL) restores built-in arrow");
+
+    /* A custom RGBA sprite. */
+    AxlGfxBuffer *spr = axl_gfx_buffer_new(8, 8);
+    axl_gfx_buffer_clear(spr, AXL_GFX_RGBA(0xff, 0x00, 0x00, 0xff));
+    test_check(axl_cursor_set_image(c, spr, 4, 4) == AXL_OK,
+               "cursor: set_image(custom 8x8, hotspot 4,4) returns AXL_OK");
+    axl_gfx_buffer_free(spr);
+
+    test_check(axl_cursor_set_image(NULL, NULL, 0, 0) == AXL_ERR,
+               "cursor: set_image on NULL cursor returns AXL_ERR");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+static void
+test_cursor_move_rel(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    AxlCursor *c = axl_cursor_new(scene);
+    test_check(c != NULL, "move_rel: cursor created");
+    axl_cursor_show(c);
+
+    int32_t x = -1, y = -1;
+    axl_cursor_move(c, 50, 30);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 50 && y == 30, "move_rel: start at (50,30)");
+
+    /* A delta that overshoots the left edge clamps to 0. */
+    axl_cursor_move_rel(c, -80, 0);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 0 && y == 30, "move_rel: overshoot left clamps to x=0");
+
+    /* THE FIX: from the clamped edge, a small reverse delta moves
+       immediately — the cursor is NOT stuck (the bug was clamping a raw
+       accumulator, which would still read x=0 here). */
+    axl_cursor_move_rel(c, 10, 0);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 10 && y == 30, "move_rel: recovers from the edge at once (no stuck)");
+
+    /* Positive overshoot clamps to the far edge. */
+    axl_cursor_move_rel(c, 0, 1000);
+    axl_cursor_position(c, &x, &y);
+    test_check(y == SH - 1, "move_rel: overshoot down clamps to bottom");
+    axl_cursor_move_rel(c, 1000, 0);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == SW - 1, "move_rel: overshoot right clamps to right edge");
+
+    axl_cursor_move_rel(NULL, 1, 1);   /* NULL-safe no-op */
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+/* Drive the attach trampoline with synthetic events to lock in the
+   relative-pointer fix: the event carries the device's raw accumulated
+   position, so the cursor must move by the per-event delta and recover
+   from an edge even while that accumulator stays off-screen. */
+static void
+test_cursor_attach_tracking(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    AxlCursor *c = axl_cursor_new(scene);
+    test_check(c != NULL, "track: cursor created");
+    int32_t x = -1, y = -1;
+
+    AxlInputEvent ev = {0};
+    ev.type = AXL_INPUT_MOUSE_MOVE;
+
+    /* First event seeds the delta reference; position must not jump. */
+    ev.x = 50; ev.y = 30;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 0 && y == 0, "track: first event seeds, no jump");
+
+    /* Accumulator drifts far negative (remote pointer off-screen-left);
+       the cursor clamps to the left edge. */
+    ev.x = -200; ev.y = 30;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 0, "track: negative drift clamps to the left edge");
+
+    /* THE FIX: accumulator still negative (-190) but moved right by 10.
+       The old code fed the raw -190 to move() -> stayed clamped at 0
+       (stuck); moving by the +10 delta lands at x=10. */
+    ev.x = -190; ev.y = 30;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 10, "track: recovers from edge despite negative accumulator");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+static void
+test_cursor_null_safety(void)
+{
+    /* NULL scene selects direct-to-screen save-under mode, which needs a
+       live framebuffer. It returns a working cursor when one is present
+       and NULL when not; the actual on-screen capture/restore behavior is
+       covered by the GOP integration test (cursor-selftest.c). Adapt to
+       whichever the harness provides (one assertion either way, so the
+       cross-arch test count is stable). */
+    AxlCursor *sb = axl_cursor_new(NULL);
+    if (axl_gfx_available()) {
+        test_check(sb != NULL,
+                   "cursor: new(NULL scene) creates a save-under cursor with a framebuffer");
+        /* Must be safe to drive even where capture/present degrade. */
+        axl_cursor_show(sb);
+        axl_cursor_move(sb, 10, 10);
+        axl_cursor_hide(sb);
+        axl_cursor_free(sb);
+    } else {
+        test_check(sb == NULL,
+                   "cursor: new(NULL scene) returns NULL without a framebuffer");
+    }
+    test_check(!axl_cursor_visible(NULL), "cursor: visible(NULL) is false");
+
+    /* These must all be safe no-ops. */
+    axl_cursor_free(NULL);
+    axl_cursor_show(NULL);
+    axl_cursor_hide(NULL);
+    axl_cursor_move(NULL, 1, 1);
+    axl_cursor_lift(NULL);
+    axl_cursor_drop(NULL);
+    axl_cursor_position(NULL, NULL, NULL);
+    axl_cursor_detach(NULL, NULL);
+    test_check(axl_cursor_attach(NULL, NULL, NULL, NULL) == 0,
+               "cursor: attach(NULL) returns 0");
+}
+
+int
+test_cursor_main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    test_print_header("AxlCursor");
+
+    test_cursor_scene_unchanged();
+    test_cursor_position_clamp();
+    test_cursor_set_image();
+    test_cursor_move_rel();
+    test_cursor_attach_tracking();
+    test_cursor_null_safety();
+
+    return test_print_results();
+}
+
+AXL_APP(test_cursor_main)

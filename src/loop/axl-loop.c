@@ -295,11 +295,22 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         }
     }
 
-    /* 3. Build event array from non-idle active sources */
+    /* 3. Build event array from non-idle active sources.
+     *
+     * SOURCE_KEYPRESS is intentionally EXCLUDED: its EFI_EVENT is the Ex
+     * protocol's WaitForKeyEx, whose firmware notify (EDK2 UsbKbDxe /
+     * Ps2KeyboardDxe) DISCARDS modifier-only "partial" keystrokes and
+     * only signals for a full key. Waiting on it therefore (a) never
+     * wakes us on a held modifier and (b) silently drops the partial the
+     * moment WaitForEvent checks it — so live modifier state (Shift+wheel
+     * / Ctrl+click) could never be tracked. Keypress sources are instead
+     * drained by polling ReadKeyStrokeEx on the poll-timer tick below,
+     * which returns partials. */
     event_count = 0;
     for (i = 0; i < loop->source_count; i++) {
         if (loop->sources[i].active && loop->sources[i].event != NULL &&
-            loop->sources[i].type != SOURCE_IDLE) {
+            loop->sources[i].type != SOURCE_IDLE &&
+            loop->sources[i].type != SOURCE_KEYPRESS) {
             event_to_source[event_count] = i;
             event_array[event_count] = loop->sources[i].event;
             event_count++;
@@ -380,8 +391,32 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             return 1;
         }
 
-        /* Poll timer fired — just a periodic wakeup */
+        /* Poll timer fired — periodic wakeup, AND the drain point for
+         * keypress sources. WaitForKeyEx discards modifier-only partial
+         * keystrokes (see the event-array build above), so a keypress
+         * source is polled here instead: hand it to dispatch_event, which
+         * drains the firmware key queue via ReadKeyStrokeEx (a no-op when
+         * nothing is queued). Partials refresh live modifier state; full
+         * keys deliver a KEY_DOWN. Key latency is therefore bounded by the
+         * poll interval (POLL_INTERVAL_MS), imperceptible for input.
+         *
+         * NOTE: this drain runs only in the blocking run-loop path. The
+         * non-blocking dispatch path (driver mode via
+         * axl_loop_attach_driver, or any direct axl_loop_dispatch(loop,
+         * false)) does NOT poll keypress — SOURCE_KEYPRESS is excluded from
+         * the non-blocking CheckEvent loop too. No in-tree consumer pairs a
+         * keyboard source with non-blocking dispatch (driver loops are
+         * headless network services), so no key is ever stranded in
+         * practice. A future non-blocking keyboard consumer must drain
+         * keypress in the CheckEvent path as well. */
         if (event_to_source[fired_index] == (size_t)-1) {
+            for (size_t k = 0; k < loop->source_count; k++) {
+                if (loop->sources[k].active &&
+                    loop->sources[k].type == SOURCE_KEYPRESS) {
+                    loop->pending_source = (int)k;
+                    return 0;
+                }
+            }
             return 1;
         }
 
@@ -430,23 +465,42 @@ axl_loop_dispatch_event(AxlLoop *loop)
 
     /* Dispatch based on source type */
     if (src->type == SOURCE_KEYPRESS) {
-        /* Read with shift state so we can screen for serial Ctrl-C
-         * (UnicodeChar=0x03, KeyShiftState=0 — what TerminalDxe emits
-         * over a wire that carries no shift bits). Intercepted here so
-         * a key source registered by the user doesn't have to know
-         * about the convention. */
-        akey.modifiers = 0;
-        if (axl_backend_console_read_key_ex(&akey.scan_code,
-                                            &akey.unicode_char,
-                                            &akey.modifiers) != AXL_OK) {
-            return;
+        /* Drain ALL keys queued this tick. The wake path for keypress is
+         * the poll timer (WaitForKeyEx is not waited on — its firmware
+         * notify discards modifier-only partials; see next_event's
+         * event-array build), so we poll ReadKeyStrokeEx here, which
+         * returns every queued key INCLUDING partials. Draining one key
+         * per poll tick would cap throughput at 1 key / poll interval and
+         * lag fast typing / paste / typematic bursts, so loop until the
+         * firmware queue is empty.
+         *
+         * Read with shift state so we can screen for serial Ctrl-C
+         * (UnicodeChar=0x03, KeyShiftState=0 — what TerminalDxe emits over
+         * a wire that carries no shift bits). Intercepted here so a key
+         * source registered by the user doesn't have to know about it. */
+        cont = true;
+        for (;;) {
+            akey.modifiers = 0;
+            if (axl_backend_console_read_key_ex(&akey.scan_code,
+                                                &akey.unicode_char,
+                                                &akey.modifiers) != AXL_OK) {
+                break;   /* queue drained */
+            }
+            if (akey.unicode_char == 0x03 && akey.modifiers == 0) {
+                _axl_signal_on_break();
+                axl_loop_quit(loop);
+                return;
+            }
+            cont = src->fn.key_cb(akey, src->data);
+            if (src->id != dispatched_id) {
+                /* Callback removed this source and the slot was reused —
+                 * the new occupant owns its own lifecycle. Stop here. */
+                return;
+            }
+            if (!cont) {
+                break;   /* AXL_SOURCE_REMOVE — stop draining, run epilogue */
+            }
         }
-        if (akey.unicode_char == 0x03 && akey.modifiers == 0) {
-            _axl_signal_on_break();
-            axl_loop_quit(loop);
-            return;
-        }
-        cont = src->fn.key_cb(akey, src->data);
     } else {
         cont = src->fn.cb(src->data);
     }

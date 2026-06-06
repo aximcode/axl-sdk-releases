@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <axl/axl-atexit.h>     /* free the shared default font at exit */
 #include <axl/axl-gfx.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-math.h>
@@ -80,7 +81,13 @@ axl_ttf_stub_binary_(double x, double y)
 #define STBTT_STATIC
 
 #define STB_TRUETYPE_IMPLEMENTATION
+// stb_truetype is a single-header library: STB_TRUETYPE_IMPLEMENTATION
+// emits the whole API, most of which AXL doesn't call. Suppress the
+// vendored-code "defined but not used" noise rather than editing upstream.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "../../deps/stb/stb_truetype.h"
+#pragma GCC diagnostic pop
 
 // ===================================================================
 // Glyph cache configuration
@@ -270,18 +277,69 @@ axl_ttf_free(
 extern const unsigned char axl_ttf_dejavu_default_data[];
 extern const unsigned int  axl_ttf_dejavu_default_data_len;
 
+/* The lazily-loaded shared default font. File-static (not a function
+ * local) so the atexit hook below can release it. */
+static AxlTtf *g_default_ttf = NULL;
+
+/* Free the shared default font (handle + bounded glyph cache) at process
+ * exit. Without this, the singleton — intentionally never freed during
+ * the run — shows up as a flood of live allocations in the AXL_MEM_DEBUG
+ * leak report, drowning out genuine leaks. axl_atexit fires in LIFO at
+ * shutdown; this hook is registered on first use (early), so it runs
+ * after any consumer cleanup that might still draw text. */
+static void
+ttf_default_atexit(void *data)
+{
+    (void)data;
+    axl_ttf_free(g_default_ttf);   /* NULL-safe */
+    g_default_ttf = NULL;
+}
+
 AxlTtf *
 axl_ttf_default(void)
 {
-    /* Lazy one-time load; the static byte array outlives the process
-     * so the zero-copy AxlTtf is safe to share and never free.
-     * Single-threaded UEFI boot services — no locking needed. */
-    static AxlTtf *cached = NULL;
-    if (cached == NULL) {
-        cached = axl_ttf_load(axl_ttf_dejavu_default_data,
-                              axl_ttf_dejavu_default_data_len);
+    /* Lazy one-time load; the static byte array outlives the process so
+     * the zero-copy AxlTtf is safe to share. Single-threaded UEFI boot
+     * services — no locking needed. */
+    if (g_default_ttf == NULL) {
+        g_default_ttf = axl_ttf_load(axl_ttf_dejavu_default_data,
+                                     axl_ttf_dejavu_default_data_len);
+        if (g_default_ttf != NULL) {
+            axl_atexit(ttf_default_atexit, NULL);
+        }
     }
-    return cached;
+    return g_default_ttf;
+}
+
+/* Built-in DejaVu Sans MONO subset, defined in
+ * src/gfx/fonts/font-dejavu-mono.c — the fixed-width default face (the
+ * editor's). Dropped by --gc-sections from any binary that never
+ * references axl_ttf_mono_default. */
+extern const unsigned char axl_ttf_dejavu_mono_data[];
+extern const unsigned int  axl_ttf_dejavu_mono_data_len;
+
+static AxlTtf *g_default_mono_ttf = NULL;
+
+static void
+ttf_mono_default_atexit(void *data)
+{
+    (void)data;
+    axl_ttf_free(g_default_mono_ttf);   /* NULL-safe */
+    g_default_mono_ttf = NULL;
+}
+
+AxlTtf *
+axl_ttf_mono_default(void)
+{
+    /* Lazy one-time load, mirroring axl_ttf_default (see there). */
+    if (g_default_mono_ttf == NULL) {
+        g_default_mono_ttf = axl_ttf_load(axl_ttf_dejavu_mono_data,
+                                          axl_ttf_dejavu_mono_data_len);
+        if (g_default_mono_ttf != NULL) {
+            axl_atexit(ttf_mono_default_atexit, NULL);
+        }
+    }
+    return g_default_mono_ttf;
 }
 
 // ===================================================================

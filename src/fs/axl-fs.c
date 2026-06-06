@@ -104,6 +104,23 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
     return AXL_OK;
 }
 
+AxlBytes *
+axl_file_get_bytes(const char *path)
+{
+    void   *buf = NULL;
+    size_t  len = 0;
+
+    if (axl_file_get_contents(path, &buf, &len) != AXL_OK) {
+        return NULL;
+    }
+    // Hand the read buffer straight to AxlBytes — no second copy.
+    AxlBytes *b = axl_bytes_new_take(buf, len);
+    if (b == NULL) {
+        axl_free(buf);  // new_take failed (OOM) — don't leak the buffer
+    }
+    return b;
+}
+
 int
 axl_file_set_contents(const char *path, const void *buf, size_t len)
 {

@@ -1195,6 +1195,16 @@ axl_backend_console_wait_for_key(
     if (gST == NULL || gST->ConIn == NULL) {
         return NULL;
     }
+    /* Prefer the Ex protocol's WaitForKeyEx: with EFI_KEY_STATE_EXPOSED
+     * enabled (get_simple_ex) it also signals on modifier-only "partial"
+     * keystrokes, so live modifier state stays current for pointer-event
+     * stamping. read_key_ex reads via the same Ex protocol, so the wait and
+     * the read are paired. Falls back to the basic WaitForKey when there is
+     * no Ex protocol (e.g. a serial console). */
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = get_simple_ex();
+    if (ex != NULL && ex->WaitForKeyEx != NULL) {
+        return (AxlEventHandle)ex->WaitForKeyEx;
+    }
     return (AxlEventHandle)gST->ConIn->WaitForKey;
 }
 
@@ -1330,6 +1340,12 @@ axl_backend_shell_break_flag(
 static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *mSimpleEx       = NULL;
 static bool                                mSimpleExLooked = false;
 
+/* SetState is `void *` in the (hand-written) Ex protocol struct; this is its
+ * real signature (UEFI 2.11 §12.2.4). Used to enable EFI_KEY_STATE_EXPOSED. */
+typedef EFI_STATUS (EFIAPI *AxlInputExSetState)(
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *This,
+    UINT8                              *KeyToggleState);
+
 static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
 get_simple_ex(void)
 {
@@ -1342,6 +1358,35 @@ get_simple_ex(void)
         }
     }
     return mSimpleEx;
+}
+
+void
+axl_backend_console_expose_modifiers(void)
+{
+    /* Enable modifier-only "partial" keystrokes so live modifier state stays
+     * current between character keys (Shift+wheel, Ctrl+click). Best-effort:
+     * if SetState is unsupported the call fails harmlessly and modifiers just
+     * track the last full keystroke. The loop poll-reads these partials via
+     * ReadKeyStrokeEx — WaitForKeyEx discards them (see axl-loop.c).
+     *
+     * KNOWN LIMITATION — the caps/num/scroll-lock LEDs are reset here. EDK2's
+     * SetState (UsbKbDxe USBKeyboardSetState / Ps2KeyboardDxe) UNCONDITIONALLY
+     * clears NumLockOn/CapsOn/ScrollOn, then re-asserts only the lock bits in
+     * the passed KeyToggleState, then SetKeyLED(). We pass none (just VALID |
+     * EXPOSED), so all three reset. UEFI has NO GetState for toggle state, so
+     * the *initial* (pre-attach) lock state is unrecoverable — a read-modify-
+     * write is impossible. Mitigation is bounded to caching post-attach
+     * toggles, which buys nothing for the initial state. Because the loss is
+     * inherent to the protocol, this is called only when a keyboard source is
+     * attached (not for every app), and we accept it. Lock toggles made
+     * AFTER attach ARE tracked live (they arrive as partials and refresh the
+     * modifier state); only the pre-attach snapshot is lost. */
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = get_simple_ex();
+    if (ex != NULL && ex->SetState != NULL) {
+        AxlInputExSetState set_state = (AxlInputExSetState)ex->SetState;
+        UINT8 toggle = EFI_TOGGLE_STATE_VALID | EFI_KEY_STATE_EXPOSED;
+        (void)set_state(ex, &toggle);
+    }
 }
 
 AxlEventHandle

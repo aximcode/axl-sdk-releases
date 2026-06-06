@@ -647,6 +647,16 @@ composite(
     return out;
 }
 
+AxlGfxPixel
+axl_gfx_composite(
+    AxlGfxPixel  dst,
+    AxlGfxPixel  src
+    )
+{
+    /* Public, gamma-aware source-over (honors gamma_correct_current). */
+    return composite(dst, src, AXL_GFX_BLEND_OVER);
+}
+
 void
 axl_gfx_set_gamma_correct(
     bool  enable
@@ -1681,6 +1691,126 @@ axl_gfx_get_info(
     info->stride      = g->Mode->Info->PixelsPerScanLine;
     info->framebuffer = g->Mode->FrameBufferBase;
     return AXL_OK;
+}
+
+uint32_t
+axl_gfx_mode_count(void)
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (g == NULL || g->Mode == NULL) {
+        return 0;
+    }
+    return g->Mode->MaxMode;
+}
+
+int
+axl_gfx_query_mode(
+    uint32_t     index,
+    AxlGfxMode  *out
+    )
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (g == NULL || g->Mode == NULL || out == NULL
+        || index >= g->Mode->MaxMode) {
+        return AXL_ERR;
+    }
+
+    UINTN                                 size = 0;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi   = NULL;
+    EFI_STATUS status = g->QueryMode(g, index, &size, &mi);
+    if (status != 0 || mi == NULL) {
+        return AXL_ERR;
+    }
+
+    out->index  = index;
+    out->width  = mi->HorizontalResolution;
+    out->height = mi->VerticalResolution;
+    out->stride = mi->PixelsPerScanLine;
+
+    /* QueryMode allocates the info via AllocatePool; the caller owns it. */
+    axl_bs()->FreePool(mi);
+    return AXL_OK;
+}
+
+int
+axl_gfx_current_mode(
+    uint32_t  *out_index
+    )
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (g == NULL || g->Mode == NULL || out_index == NULL) {
+        return AXL_ERR;
+    }
+    *out_index = g->Mode->Mode;
+    return AXL_OK;
+}
+
+int
+axl_gfx_find_mode(
+    uint32_t   width,
+    uint32_t   height,
+    uint32_t  *out_index
+    )
+{
+    uint32_t n = axl_gfx_mode_count();
+    if (out_index == NULL || n == 0) {
+        return AXL_ERR;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        AxlGfxMode m;
+        if (axl_gfx_query_mode(i, &m) == AXL_OK
+            && m.width == width && m.height == height) {
+            *out_index = i;
+            return AXL_OK;
+        }
+    }
+    return AXL_ERR;
+}
+
+int
+axl_gfx_max_mode(
+    AxlGfxMode  *out
+    )
+{
+    uint32_t n = axl_gfx_mode_count();
+    if (out == NULL || n == 0) {
+        return AXL_ERR;
+    }
+    AxlGfxMode best = {0, 0, 0, 0};
+    bool       have = false;
+    for (uint32_t i = 0; i < n; i++) {
+        AxlGfxMode m;
+        if (axl_gfx_query_mode(i, &m) != AXL_OK) {
+            continue;
+        }
+        uint64_t area      = (uint64_t)m.width    * (uint64_t)m.height;
+        uint64_t best_area = (uint64_t)best.width * (uint64_t)best.height;
+        if (!have || area > best_area
+            || (area == best_area && m.width > best.width)) {
+            best = m;
+            have = true;
+        }
+    }
+    if (!have) {
+        return AXL_ERR;
+    }
+    *out = best;
+    return AXL_OK;
+}
+
+int
+axl_gfx_set_mode(
+    uint32_t  index
+    )
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (g == NULL || g->Mode == NULL || index >= g->Mode->MaxMode) {
+        return AXL_ERR;
+    }
+    /* SetMode reallocates the framebuffer + clears the screen; g->Mode->*
+       (Info, FrameBufferBase) reflect the new mode on return. */
+    EFI_STATUS status = g->SetMode(g, index);
+    return (status == 0) ? AXL_OK : AXL_ERR;
 }
 
 int

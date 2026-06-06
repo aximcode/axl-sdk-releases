@@ -3182,6 +3182,104 @@ test_ntree_iter(void)
     axl_ntree_free(root);
 }
 
+/* Concatenate REVERSE-pre-order iterator-visited data (filtered) into out. */
+static void
+ntree_iter_rev_str(AxlNTree *root, AxlNTreeTraverseFlags flags, char *out)
+{
+    AxlNTreeIter it;
+    axl_ntree_iter_init_reverse(&it, root, flags);
+    size_t k = 0;
+    for (AxlNTree *n; (n = axl_ntree_iter_next(&it)) != NULL; ) {
+        for (const char *s = n->data; *s != '\0'; s++) {
+            out[k++] = *s;
+        }
+    }
+    out[k] = '\0';
+}
+
+static void
+test_ntree_iter_reverse(void)
+{
+    AxlNTree *root = ntree_build_sample();  /* R->[A->[A1,A2], B, C->[C1]] */
+    char buf[64];
+
+    /* Exact reverse of forward pre-order "RAA1A2BCC1". */
+    ntree_iter_rev_str(root, AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "C1CBA2A1AR") == 0,
+               "ntree_iter_rev: reverse pre-order all (topmost-first)");
+    ntree_iter_rev_str(root, AXL_NTREE_LEAVES, buf);
+    test_check(axl_strcmp(buf, "C1BA2A1") == 0, "ntree_iter_rev: leaves reversed");
+    ntree_iter_rev_str(root, AXL_NTREE_NON_LEAVES, buf);
+    test_check(axl_strcmp(buf, "CAR") == 0, "ntree_iter_rev: internal reversed");
+
+    /* Bounded to a subtree, and the single-node / NULL cases. */
+    ntree_iter_rev_str(axl_ntree_first_child(root), AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "A2A1A") == 0, "ntree_iter_rev: bounded to subtree of 'A'");
+    AxlNTree *solo = axl_ntree_new("S");
+    ntree_iter_rev_str(solo, AXL_NTREE_ALL, buf);
+    test_check(axl_strcmp(buf, "S") == 0, "ntree_iter_rev: single node");
+    AxlNTreeIter it;
+    axl_ntree_iter_init_reverse(&it, NULL, AXL_NTREE_ALL);
+    test_check(axl_ntree_iter_next(&it) == NULL, "ntree_iter_rev: NULL root exhausted");
+
+    axl_ntree_free(solo);
+    axl_ntree_free(root);
+}
+
+static void
+test_ntree_move(void)
+{
+    char buf[64];
+
+    /* place-above / place-below a sibling. */
+    AxlNTree *r = axl_ntree_new("R");
+    AxlNTree *a = axl_ntree_append_data(r, "A");
+    (void)axl_ntree_append_data(r, "B");
+    AxlNTree *c = axl_ntree_append_data(r, "C");        /* R->[A,B,C] */
+    test_check(axl_ntree_move_after(r, a, c) == c, "ntree_move: after returns node");
+    ntree_children_str(r, buf);
+    test_check(axl_strcmp(buf, "ACB") == 0, "ntree_move: move_after(A) -> A,C,B");
+    (void)axl_ntree_move_before(r, a, c);
+    ntree_children_str(r, buf);
+    test_check(axl_strcmp(buf, "CAB") == 0, "ntree_move: move_before(A) -> C,A,B");
+
+    /* NULL sibling: after = first, before = last. */
+    (void)axl_ntree_move_before(r, NULL, c);            /* C to last */
+    ntree_children_str(r, buf);
+    test_check(axl_strcmp(buf, "ABC") == 0, "ntree_move: move_before(NULL) -> last");
+    (void)axl_ntree_move_after(r, NULL, c);             /* C to first */
+    ntree_children_str(r, buf);
+    test_check(axl_strcmp(buf, "CAB") == 0, "ntree_move: move_after(NULL) -> first");
+    axl_ntree_free(r);
+
+    /* Reparent: move B from under R to under A. */
+    AxlNTree *r2 = axl_ntree_new("R");
+    AxlNTree *a2 = axl_ntree_append_data(r2, "A");
+    AxlNTree *b2 = axl_ntree_append_data(r2, "B");
+    (void)axl_ntree_append_data(a2, "A1");              /* R->[A->[A1], B] */
+    test_check(axl_ntree_move_after(a2, NULL, b2) == b2, "ntree_move: reparent returns node");
+    test_check(b2->parent == a2, "ntree_move: reparent sets parent");
+    ntree_children_str(r2, buf);
+    test_check(axl_strcmp(buf, "A") == 0, "ntree_move: reparent removed B from R");
+    ntree_children_str(a2, buf);
+    test_check(axl_strcmp(buf, "BA1") == 0, "ntree_move: reparent put B first under A");
+
+    /* Cycle / bad-arg rejection — tree must be untouched. */
+    AxlNTree *a1 = axl_ntree_first_child(a2)->next;     /* A1 (B is first now) */
+    test_check(a1 != NULL && axl_strcmp(a1->data, "A1") == 0, "ntree_move: located A1");
+    test_check(axl_ntree_move_after(a1, NULL, a2) == NULL,
+               "ntree_move: rejects cycle (A under its descendant A1)");
+    test_check(axl_ntree_move_after(a2, NULL, a2) == NULL, "ntree_move: rejects node==parent");
+    test_check(axl_ntree_move_after(r2, b2, b2) == NULL, "ntree_move: rejects node==sibling");
+    test_check(axl_ntree_move_after(r2, a1, b2) == NULL,
+               "ntree_move: rejects sibling not a child of parent");
+    test_check(a2->parent == r2 && b2->parent == a2, "ntree_move: tree intact after rejects");
+    ntree_children_str(a2, buf);
+    test_check(axl_strcmp(buf, "BA1") == 0, "ntree_move: sibling order intact after rejects");
+
+    axl_ntree_free(r2);
+}
+
 // ---------------------------------------------------------------------------
 // AxlTree (AVL sorted map) Tests
 // ---------------------------------------------------------------------------
@@ -4389,6 +4487,490 @@ test_oom_containers(void)
 }
 
 // ---------------------------------------------------------------------------
+// GLib-parity additions: hash-table int/int64/double hash+equal,
+// add/remove_all/find/get_keys/get_values; array insert/prepend.
+// ---------------------------------------------------------------------------
+
+static void
+test_hash_typed_funcs(void)
+{
+    // int_equal / int64_equal / double_equal direct checks.
+    int ia = 7, ib = 7, ic = 9;
+    test_check(axl_int_equal(&ia, &ib), "int_equal: 7 == 7");
+    test_check(!axl_int_equal(&ia, &ic), "int_equal: 7 != 9");
+    test_check(axl_int_hash(&ia) == axl_int_hash(&ib), "int_hash: equal keys, equal hash");
+
+    int64_t la = 0x1122334455667788LL, lb = 0x1122334455667788LL, lc = -1;
+    test_check(axl_int64_equal(&la, &lb), "int64_equal: equal");
+    test_check(!axl_int64_equal(&la, &lc), "int64_equal: differ");
+    test_check(axl_int64_hash(&la) == axl_int64_hash(&lb), "int64_hash: equal keys, equal hash");
+
+    double da = 3.5, db = 3.5, dz = 0.0, dnz = -0.0;
+    test_check(axl_double_equal(&da, &db), "double_equal: 3.5 == 3.5");
+    test_check(axl_double_equal(&dz, &dnz), "double_equal: 0.0 == -0.0");
+    test_check(axl_double_hash(&dz) == axl_double_hash(&dnz),
+        "double_hash: -0.0 hashes as +0.0");
+
+    // int-keyed table round-trip.
+    AxlHashTable *t = axl_hash_table_new(axl_int_hash, axl_int_equal);
+    test_check(t != NULL, "int table: new");
+    int k1 = 100, k2 = 200, miss = 300;
+    axl_hash_table_insert(t, &k1, (void *)0xAA);
+    axl_hash_table_insert(t, &k2, (void *)0xBB);
+    test_check(axl_hash_table_lookup(t, &k1) == (void *)0xAA, "int table: lookup k1");
+    test_check(axl_hash_table_lookup(t, &k2) == (void *)0xBB, "int table: lookup k2");
+    test_check(axl_hash_table_lookup(t, &miss) == NULL, "int table: lookup missing");
+    axl_hash_table_free(t);
+}
+
+static void
+test_hash_add(void)
+{
+    AxlHashTable *t = axl_hash_table_new(axl_str_hash, axl_str_equal);
+    char a[] = "alpha";
+    char a2[] = "alpha";  // equal-but-distinct pointer
+    test_check(axl_hash_table_add(t, a), "add: new key -> true");
+    test_check(!axl_hash_table_add(t, a2), "add: existing key -> false");
+    test_check(axl_hash_table_contains(t, "alpha"), "add: key present");
+    test_check(axl_hash_table_size(t) == 1, "add: size 1 after dup add");
+    axl_hash_table_free(t);
+}
+
+static void
+test_hash_remove_all(void)
+{
+    AxlHashTable *t = axl_hash_table_new_str();
+    axl_hash_table_insert(t, "a", (void *)1);
+    axl_hash_table_insert(t, "b", (void *)2);
+    axl_hash_table_insert(t, "c", (void *)3);
+    test_check(axl_hash_table_size(t) == 3, "remove_all: 3 before");
+    axl_hash_table_remove_all(t);
+    test_check(axl_hash_table_size(t) == 0, "remove_all: 0 after");
+    test_check(!axl_hash_table_contains(t, "a"), "remove_all: 'a' gone");
+    // Reusable after clear.
+    axl_hash_table_insert(t, "d", (void *)4);
+    test_check(axl_hash_table_lookup(t, "d") == (void *)4, "remove_all: reusable");
+    axl_hash_table_remove_all(NULL);  // NULL-safe
+    axl_hash_table_free(t);
+}
+
+static bool
+find_value_is(const void *key, void *value, void *data)
+{
+    (void)key;
+    return value == data;
+}
+
+static void
+test_hash_find(void)
+{
+    AxlHashTable *t = axl_hash_table_new_str();
+    axl_hash_table_insert(t, "x", (void *)10);
+    axl_hash_table_insert(t, "y", (void *)20);
+    axl_hash_table_insert(t, "z", (void *)30);
+    test_check(axl_hash_table_find(t, find_value_is, (void *)20) == (void *)20,
+        "find: matching value returned");
+    test_check(axl_hash_table_find(t, find_value_is, (void *)999) == NULL,
+        "find: no match -> NULL");
+    test_check(axl_hash_table_find(NULL, find_value_is, NULL) == NULL,
+        "find: NULL table -> NULL");
+    axl_hash_table_free(t);
+}
+
+static void
+test_hash_get_keys_values(void)
+{
+    AxlHashTable *t = axl_hash_table_new_str();
+    axl_hash_table_insert(t, "a", (void *)1);
+    axl_hash_table_insert(t, "b", (void *)2);
+    axl_hash_table_insert(t, "c", (void *)3);
+
+    AxlList *keys = axl_hash_table_get_keys(t);
+    test_check(axl_list_length(keys) == 3, "get_keys: length 3");
+    // Order unspecified — check each expected key is present, value sum via list.
+    bool saw_a = false, saw_b = false, saw_c = false;
+    for (AxlList *l = keys; l != NULL; l = l->next) {
+        if (axl_strcmp((const char *)l->data, "a") == 0) { saw_a = true; }
+        if (axl_strcmp((const char *)l->data, "b") == 0) { saw_b = true; }
+        if (axl_strcmp((const char *)l->data, "c") == 0) { saw_c = true; }
+    }
+    test_check(saw_a && saw_b && saw_c, "get_keys: all keys present");
+    axl_list_free(keys);  // spine only; keys belong to the table
+
+    AxlList *values = axl_hash_table_get_values(t);
+    test_check(axl_list_length(values) == 3, "get_values: length 3");
+    size_t sum = 0;
+    for (AxlList *l = values; l != NULL; l = l->next) {
+        sum += (size_t)l->data;
+    }
+    test_check(sum == 6, "get_values: 1+2+3 == 6");
+    axl_list_free(values);
+
+    test_check(axl_hash_table_get_keys(NULL) == NULL, "get_keys: NULL table -> NULL");
+    axl_hash_table_free(t);
+}
+
+static void
+test_array_insert_prepend(void)
+{
+    // Value mode: insert at end, front, middle; verify order.
+    AxlArray *a = axl_array_new(sizeof(int));
+    int v;
+    v = 1; axl_array_append(a, &v);   // [1]
+    v = 3; axl_array_append(a, &v);   // [1,3]
+    v = 2; test_check(axl_array_insert(a, 1, &v) == AXL_OK, "insert: middle ok");  // [1,2,3]
+    v = 0; test_check(axl_array_prepend(a, &v) == AXL_OK, "prepend: front ok");    // [0,1,2,3]
+    v = 4; test_check(axl_array_insert(a, axl_array_len(a), &v) == AXL_OK,
+        "insert: at length == append");                                           // [0,1,2,3,4]
+
+    test_check(axl_array_len(a) == 5, "insert: length 5");
+    bool ordered = true;
+    for (int i = 0; i < 5; i++) {
+        if (*(int *)axl_array_get(a, (size_t)i) != i) { ordered = false; }
+    }
+    test_check(ordered, "insert/prepend: [0,1,2,3,4] in order");
+
+    // Out-of-range insert rejected, array unchanged.
+    v = 9;
+    test_check(axl_array_insert(a, 99, &v) == AXL_ERR, "insert: index>len -> ERR");
+    test_check(axl_array_len(a) == 5, "insert: length unchanged after ERR");
+    axl_array_free(a);
+
+    // Pointer mode.
+    AxlArray *p = axl_array_new(sizeof(void *));
+    axl_array_append_ptr(p, (void *)0xB);                 // [B]
+    test_check(axl_array_prepend_ptr(p, (void *)0xA) == AXL_OK, "prepend_ptr: ok");  // [A,B]
+    test_check(axl_array_insert_ptr(p, 2, (void *)0xC) == AXL_OK, "insert_ptr: end"); // [A,B,C]
+    test_check(axl_array_get_ptr(p, 0) == (void *)0xA, "ptr: [0]=A");
+    test_check(axl_array_get_ptr(p, 1) == (void *)0xB, "ptr: [1]=B");
+    test_check(axl_array_get_ptr(p, 2) == (void *)0xC, "ptr: [2]=C");
+    axl_array_free(p);
+
+    // Drive insert past the initial capacity so the realloc-during-shift
+    // path runs: prepend 40 ints, expect [39,38,...,0] reversed -> ascending
+    // read 0..39 from the tail. (INITIAL_CAPACITY is well under 40.)
+    AxlArray *g = axl_array_new(sizeof(int));
+    bool prepend_ok = true;
+    for (int i = 0; i < 40; i++) {
+        int x = i;
+        if (axl_array_prepend(g, &x) != AXL_OK) { prepend_ok = false; }
+    }
+    test_check(prepend_ok, "insert-grow: 40 prepends across realloc succeed");
+    test_check(axl_array_len(g) == 40, "insert-grow: length 40");
+    bool grow_ok = true;
+    for (int i = 0; i < 40; i++) {
+        // element 0 is the last prepended (39); element i is 39-i.
+        if (*(int *)axl_array_get(g, (size_t)i) != 39 - i) { grow_ok = false; }
+    }
+    test_check(grow_ok, "insert-grow: order intact across realloc");
+    axl_array_free(g);
+}
+
+static void
+test_hash_add_owned_set(void)
+{
+    // Canonical owned-key set: new_full with a key destructor, no value
+    // destructor. add() must not double-free, and the table owns the keys.
+    AxlHashTable *t = axl_hash_table_new_full(
+        axl_str_hash, axl_str_equal, axl_free_impl, NULL);
+    test_check(axl_hash_table_add(t, axl_strdup("one")), "owned-set: add 'one' new");
+    test_check(axl_hash_table_add(t, axl_strdup("two")), "owned-set: add 'two' new");
+    // Duplicate key: add replaces (keeping the new strdup, freeing the old).
+    test_check(!axl_hash_table_add(t, axl_strdup("one")), "owned-set: dup 'one' -> false");
+    test_check(axl_hash_table_size(t) == 2, "owned-set: size 2");
+    test_check(axl_hash_table_contains(t, "two"), "owned-set: contains 'two'");
+    axl_hash_table_free(t);  // frees the owned keys; no double-free
+}
+
+// ---------------------------------------------------------------------------
+// AxlHmac (RFC 2104) — expected values are the canonical RFC test vectors,
+// independent of this implementation.
+// ---------------------------------------------------------------------------
+
+static void
+test_hmac_rfc_vectors(void)
+{
+    // key="Jefe", msg="what do ya want for nothing?" — RFC 2202 / 4231.
+    const char *jefe = "Jefe";
+    const char *msg  = "what do ya want for nothing?";
+    size_t      kl   = 4;
+    size_t      ml   = 28;
+
+    char *md5 = axl_compute_hmac(AXL_CHECKSUM_MD5, jefe, kl, msg, ml);
+    test_check(md5 != NULL && axl_strcmp(md5, "750c783e6ab0b503eaa86e310a5db738") == 0,
+        "hmac: MD5 Jefe vector");
+    axl_free(md5);
+
+    char *sha1 = axl_compute_hmac(AXL_CHECKSUM_SHA1, jefe, kl, msg, ml);
+    test_check(sha1 != NULL &&
+        axl_strcmp(sha1, "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79") == 0,
+        "hmac: SHA1 Jefe vector");
+    axl_free(sha1);
+
+    char *sha256 = axl_compute_hmac(AXL_CHECKSUM_SHA256, jefe, kl, msg, ml);
+    test_check(sha256 != NULL && axl_strcmp(sha256,
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843") == 0,
+        "hmac: SHA256 Jefe vector");
+    axl_free(sha256);
+}
+
+static void
+test_hmac_edge_cases(void)
+{
+    // Key longer than the 64-byte block -> hashed down first.
+    uint8_t longkey[80];
+    axl_memset(longkey, 0xAA, sizeof(longkey));
+    uint8_t msg50[50];
+    axl_memset(msg50, 'x', sizeof(msg50));
+    char *lk = axl_compute_hmac(AXL_CHECKSUM_SHA256, longkey, sizeof(longkey),
+                                msg50, sizeof(msg50));
+    test_check(lk != NULL && axl_strcmp(lk,
+        "f38c5a07bcad2aa4f0b3d7a00fc2cd3779ef03b366fbab5230c19958fac1eb5f") == 0,
+        "hmac: SHA256 long-key (hashed) vector");
+    axl_free(lk);
+
+    // Exactly block-sized key (boundary, no hashing).
+    uint8_t key64[64];
+    axl_memset(key64, 0xBB, sizeof(key64));
+    char *k64 = axl_compute_hmac(AXL_CHECKSUM_SHA256, key64, sizeof(key64), "hi", 2);
+    test_check(k64 != NULL && axl_strcmp(k64,
+        "8d44220390018e84fdc833b80030721efe5eba614de5e1a52c42084fb54a925f") == 0,
+        "hmac: SHA256 64-byte key boundary");
+    axl_free(k64);
+
+    // Empty key, empty message.
+    char *e = axl_compute_hmac(AXL_CHECKSUM_SHA256, NULL, 0, "", 0);
+    test_check(e != NULL && axl_strcmp(e,
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad") == 0,
+        "hmac: SHA256 empty key + empty message");
+    axl_free(e);
+
+    // Unsupported type / invalid args.
+    test_check(axl_hmac_new((AxlChecksumType)999, "k", 1) == NULL,
+        "hmac: unsupported type -> NULL");
+    test_check(axl_hmac_new(AXL_CHECKSUM_SHA256, NULL, 5) == NULL,
+        "hmac: NULL key with len>0 -> NULL");
+}
+
+static void
+test_hmac_incremental(void)
+{
+    // Incremental update must equal one-shot over the same bytes.
+    AXL_AUTOPTR(AxlHmac) h = axl_hmac_new(AXL_CHECKSUM_SHA256, "key", 3);
+    axl_hmac_update(h, "what do ya ", 11);
+    axl_hmac_update(h, "want for ", 9);
+    axl_hmac_update(h, "nothing?", 8);
+    const char *inc = axl_hmac_get_string(h);
+
+    char *oneshot = axl_compute_hmac(AXL_CHECKSUM_SHA256, "key", 3,
+                                     "what do ya want for nothing?", 28);
+    test_check(oneshot != NULL && axl_strcmp(inc, oneshot) == 0,
+        "hmac: incremental == one-shot");
+
+    // get_string is idempotent (repeated calls, same pointer/value).
+    test_check(axl_hmac_get_string(h) == inc, "hmac: get_string idempotent pointer");
+
+    // Raw digest path matches the hex string (32 bytes for SHA-256).
+    uint8_t raw[32];
+    size_t  rlen = sizeof(raw);
+    axl_hmac_get_digest(h, raw, &rlen);
+    test_check(rlen == 32, "hmac: SHA256 digest length 32");
+    char hex[65];
+    static const char HX[] = "0123456789abcdef";
+    for (size_t i = 0; i < rlen; i++) {
+        hex[2 * i]     = HX[raw[i] >> 4];
+        hex[2 * i + 1] = HX[raw[i] & 0x0F];
+    }
+    hex[2 * rlen] = '\0';
+    test_check(axl_strcmp(hex, inc) == 0, "hmac: get_digest matches get_string");
+
+    axl_free(oneshot);
+
+    // MD5 get_digest exercises the 16-byte digest-length path.
+    AXL_AUTOPTR(AxlHmac) hm = axl_hmac_new(AXL_CHECKSUM_MD5, "Jefe", 4);
+    axl_hmac_update(hm, "what do ya want for nothing?", 28);
+    uint8_t md5raw[16];
+    size_t  mlen = sizeof(md5raw);
+    axl_hmac_get_digest(hm, md5raw, &mlen);
+    test_check(mlen == 16, "hmac: MD5 digest length 16");
+    // First two bytes of 750c... are 0x75, 0x0c.
+    test_check(md5raw[0] == 0x75 && md5raw[1] == 0x0c, "hmac: MD5 digest bytes");
+
+    // Truncating get_digest: small buffer gets *len bytes, *len reports full.
+    AXL_AUTOPTR(AxlHmac) ht = axl_hmac_new(AXL_CHECKSUM_SHA256, "Jefe", 4);
+    axl_hmac_update(ht, "what do ya want for nothing?", 28);
+    uint8_t small[10];
+    axl_memset(small, 0xEE, sizeof(small));
+    size_t slen = 10;
+    axl_hmac_get_digest(ht, small, &slen);
+    test_check(slen == 32, "hmac: truncated get_digest reports full length 32");
+    // First 10 bytes of 5bdcc146bf60754e6a04... = 5b dc c1 46 bf 60 75 4e 6a 04.
+    test_check(small[0] == 0x5b && small[9] == 0x04, "hmac: truncated get_digest first 10 bytes");
+}
+
+// ---------------------------------------------------------------------------
+// AxlBytes — immutable refcounted byte buffer (GBytes analog).
+// ---------------------------------------------------------------------------
+
+static void
+test_bytes_basic(void)
+{
+    char src[] = {1, 2, 3, 4, 5};
+    AxlBytes *b = axl_bytes_new(src, sizeof(src));
+    test_check(b != NULL, "bytes: new -> non-NULL");
+    test_check(axl_bytes_get_size(b) == 5, "bytes: size 5");
+
+    // new() copies — mutating the source must not change the buffer.
+    src[0] = 99;
+    size_t n;
+    const uint8_t *p = axl_bytes_get_data(b, &n);
+    test_check(n == 5, "bytes: get_data size 5");
+    test_check(p[0] == 1 && p[4] == 5, "bytes: copied, source mutation isolated");
+    axl_bytes_unref(b);
+
+    // Empty buffer.
+    AxlBytes *e = axl_bytes_new(NULL, 0);
+    test_check(e != NULL && axl_bytes_get_size(e) == 0, "bytes: empty new ok");
+    test_check(axl_bytes_get_data(e, &n) == NULL && n == 0, "bytes: empty data NULL");
+    axl_bytes_unref(e);
+
+    // Invalid: NULL data with non-zero size.
+    test_check(axl_bytes_new(NULL, 5) == NULL, "bytes: new(NULL,5) -> NULL");
+    test_check(axl_bytes_new_take(NULL, 5) == NULL, "bytes: new_take(NULL,5) -> NULL");
+
+    // NULL-safety.
+    test_check(axl_bytes_get_size(NULL) == 0, "bytes: get_size(NULL) 0");
+    test_check(axl_bytes_get_data(NULL, &n) == NULL && n == 0, "bytes: get_data(NULL) NULL");
+    axl_bytes_unref(NULL);
+}
+
+static void
+test_bytes_storage_flavors(void)
+{
+    // static: borrows, no copy — the data pointer is the literal.
+    static const char lit[] = "static-blob";
+    AxlBytes *s = axl_bytes_new_static(lit, sizeof(lit) - 1);
+    test_check(axl_bytes_get_data(s, NULL) == (const void *)lit,
+        "bytes: new_static borrows (no copy)");
+    axl_bytes_unref(s);
+
+    // take: owns the heap block, no copy — same pointer.
+    char *heap = axl_malloc(4);
+    heap[0] = 'A'; heap[1] = 'B'; heap[2] = 'C'; heap[3] = 'D';
+    AxlBytes *t = axl_bytes_new_take(heap, 4);
+    test_check(axl_bytes_get_data(t, NULL) == heap, "bytes: new_take owns (no copy)");
+    axl_bytes_unref(t);  // frees heap
+
+    // new_take(NULL, 0): valid empty buffer; unref must not free garbage.
+    AxlBytes *te = axl_bytes_new_take(NULL, 0);
+    test_check(te != NULL && axl_bytes_get_size(te) == 0, "bytes: new_take empty ok");
+    axl_bytes_unref(te);
+
+    // new_take(heap, 0): owns a heap block but is empty — normalized to the
+    // empty shape (get_data NULL), and the block is freed (no leak under
+    // AXL_MEM_DEBUG).
+    char *empty_heap = axl_malloc(8);
+    AxlBytes *th = axl_bytes_new_take(empty_heap, 0);
+    test_check(th != NULL && axl_bytes_get_data(th, NULL) == NULL,
+        "bytes: new_take(heap,0) -> empty shape, get_data NULL");
+    axl_bytes_unref(th);
+}
+
+static void
+test_bytes_refcount(void)
+{
+    char src[] = {9, 8, 7};
+    AxlBytes *b = axl_bytes_new(src, 3);
+    AxlBytes *b2 = axl_bytes_ref(b);
+    test_check(b2 == b, "bytes: ref returns same object");
+    axl_bytes_unref(b);  // refcount 2 -> 1, still alive
+    const uint8_t *p = axl_bytes_get_data(b2, NULL);
+    test_check(p[0] == 9 && p[2] == 7, "bytes: alive after one unref of two refs");
+    axl_bytes_unref(b2);  // -> 0, freed
+    test_check(axl_bytes_ref(NULL) == NULL, "bytes: ref(NULL) -> NULL");
+}
+
+static void
+test_bytes_slice(void)
+{
+    char src[] = {10, 11, 12, 13, 14, 15};
+    AxlBytes *parent = axl_bytes_new(src, 6);
+    const uint8_t *pp = axl_bytes_get_data(parent, NULL);
+
+    // Zero-copy slice: data points into the parent's storage.
+    AxlBytes *mid = axl_bytes_new_from_bytes(parent, 2, 3);  // {12,13,14}
+    test_check(axl_bytes_get_size(mid) == 3, "bytes: slice size 3");
+    const uint8_t *mp = axl_bytes_get_data(mid, NULL);
+    test_check(mp == pp + 2, "bytes: slice shares parent storage (zero-copy)");
+    test_check(mp[0] == 12 && mp[2] == 14, "bytes: slice content");
+
+    // Slice keeps the parent alive after the parent ref is dropped.
+    axl_bytes_unref(parent);
+    test_check(mp[0] == 12 && mp[2] == 14, "bytes: parent kept alive by slice");
+    axl_bytes_unref(mid);
+
+    // Bounds checks.
+    AxlBytes *p2 = axl_bytes_new(src, 6);
+    test_check(axl_bytes_new_from_bytes(p2, 4, 3) == NULL, "bytes: slice past end -> NULL");
+    test_check(axl_bytes_new_from_bytes(p2, 7, 0) == NULL, "bytes: slice offset>size -> NULL");
+    test_check(axl_bytes_new_from_bytes(NULL, 0, 0) == NULL, "bytes: slice(NULL) -> NULL");
+
+    // Whole-range slice returns a reference to the parent itself.
+    AxlBytes *whole = axl_bytes_new_from_bytes(p2, 0, 6);
+    test_check(whole == p2, "bytes: whole-range slice -> ref to parent");
+    axl_bytes_unref(whole);  // drop the extra ref
+
+    // Slice-of-a-slice: the parent chain is a linked list, each link
+    // holding one ref. Drop the intermediate; the grandchild keeps the
+    // whole chain alive.
+    AxlBytes *s1 = axl_bytes_new_from_bytes(p2, 1, 4);   // {11,12,13,14}
+    AxlBytes *s2 = axl_bytes_new_from_bytes(s1, 1, 2);   // {12,13}
+    const uint8_t *s2p = axl_bytes_get_data(s2, NULL);
+    test_check(axl_bytes_get_size(s2) == 2 && s2p[0] == 12 && s2p[1] == 13,
+        "bytes: slice-of-slice content");
+    axl_bytes_unref(s1);   // intermediate dropped; s2 holds it alive
+    axl_bytes_unref(p2);   // root dropped; chain still alive via s2
+    test_check(s2p[0] == 12 && s2p[1] == 13, "bytes: slice-of-slice keeps chain alive");
+    axl_bytes_unref(s2);   // releases s1 -> p2 in turn
+}
+
+static void
+test_bytes_compare(void)
+{
+    AxlBytes *a  = axl_bytes_new("abc", 3);
+    AxlBytes *a2 = axl_bytes_new("abc", 3);   // equal content, distinct object
+    AxlBytes *b  = axl_bytes_new("abd", 3);
+    AxlBytes *ab = axl_bytes_new("ab", 2);    // prefix of "abc"
+
+    test_check(axl_bytes_equal(a, a2), "bytes: equal same content");
+    test_check(!axl_bytes_equal(a, b), "bytes: not equal diff content");
+    test_check(!axl_bytes_equal(a, ab), "bytes: not equal diff size");
+    test_check(axl_bytes_hash(a) == axl_bytes_hash(a2), "bytes: equal content -> equal hash");
+
+    test_check(axl_bytes_compare(a, a2) == 0, "bytes: compare equal -> 0");
+    test_check(axl_bytes_compare(a, b) < 0, "bytes: 'abc' < 'abd'");
+    test_check(axl_bytes_compare(b, a) > 0, "bytes: 'abd' > 'abc'");
+    test_check(axl_bytes_compare(ab, a) < 0, "bytes: prefix 'ab' < 'abc'");
+
+    // Empty-buffer comparisons (size==0 edge paths).
+    AxlBytes *e1 = axl_bytes_new(NULL, 0);
+    AxlBytes *e2 = axl_bytes_new(NULL, 0);
+    test_check(axl_bytes_equal(e1, e2), "bytes: empty == empty");
+    test_check(axl_bytes_hash(e1) == axl_bytes_hash(e2), "bytes: empty hashes equal");
+    test_check(axl_bytes_compare(e1, e2) == 0, "bytes: empty compare 0");
+    test_check(axl_bytes_compare(e1, a) < 0, "bytes: empty < 'abc'");
+    test_check(axl_bytes_equal(NULL, NULL), "bytes: equal(NULL,NULL) true");
+    test_check(!axl_bytes_equal(a, NULL), "bytes: equal(a,NULL) false");
+
+    axl_bytes_unref(e1);
+    axl_bytes_unref(e2);
+    axl_bytes_unref(a);
+    axl_bytes_unref(a2);
+    axl_bytes_unref(b);
+    axl_bytes_unref(ab);
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -4407,8 +4989,23 @@ test_data_main(int argc, char **argv)
     test_hash_direct();
     test_hash_insert_vs_replace();
     test_hash_steal_copy_keys();
+    test_hash_typed_funcs();
+    test_hash_add();
+    test_hash_add_owned_set();
+    test_hash_remove_all();
+    test_hash_find();
+    test_hash_get_keys_values();
     test_array();
     test_array_extended();
+    test_array_insert_prepend();
+    test_hmac_rfc_vectors();
+    test_hmac_edge_cases();
+    test_hmac_incremental();
+    test_bytes_basic();
+    test_bytes_storage_flavors();
+    test_bytes_refcount();
+    test_bytes_slice();
+    test_bytes_compare();
     test_string();
     test_string_ascii();
     test_json_parse();
@@ -4446,6 +5043,8 @@ test_data_main(int argc, char **argv)
     test_ntree_query_traverse();
     test_ntree_unlink_free();
     test_ntree_iter();
+    test_ntree_iter_reverse();
+    test_ntree_move();
     test_tree_basic();
     test_tree_balance();
     test_tree_remove();

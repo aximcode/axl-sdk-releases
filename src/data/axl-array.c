@@ -126,6 +126,37 @@ axl_array_append(AxlArray *a, const void *element)
     return AXL_OK;
 }
 
+int
+axl_array_insert(AxlArray *a, size_t index, const void *element)
+{
+    if (a == NULL || element == NULL || index > a->length) {
+        return AXL_ERR;
+    }
+
+    if (ensure_capacity(a) != 0) {
+        return AXL_ERR;
+    }
+
+    // Shift [index, length) right by one slot. memmove, not memcpy —
+    // the source and destination ranges overlap.
+    if (index < a->length) {
+        axl_memmove(a->buffer + (index + 1) * a->element_size,
+                  a->buffer + index * a->element_size,
+                  (a->length - index) * a->element_size);
+    }
+
+    axl_memcpy(a->buffer + index * a->element_size, element, a->element_size);
+    a->length++;
+
+    return AXL_OK;
+}
+
+int
+axl_array_prepend(AxlArray *a, const void *element)
+{
+    return axl_array_insert(a, 0, element);
+}
+
 void *
 axl_array_get(AxlArray *a, size_t index)
 {
@@ -160,6 +191,18 @@ int
 axl_array_append_ptr(AxlArray *a, void *ptr)
 {
     return axl_array_append(a, &ptr);
+}
+
+int
+axl_array_insert_ptr(AxlArray *a, size_t index, void *ptr)
+{
+    return axl_array_insert(a, index, &ptr);
+}
+
+int
+axl_array_prepend_ptr(AxlArray *a, void *ptr)
+{
+    return axl_array_insert(a, 0, &ptr);
 }
 
 void *

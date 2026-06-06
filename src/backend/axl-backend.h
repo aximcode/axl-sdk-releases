@@ -656,6 +656,35 @@ axl_backend_event_register_protocol_notify(
     void           **registration   ///< (out) registration key
     );
 
+/**
+ * @brief Install a protocol interface on a handle.
+ *
+ * Portability seam under axl_protocol_install. If `*handle` is NULL a
+ * fresh handle is allocated and written back.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_install_protocol(
+    void           **handle,        ///< (in/out) handle; *handle == NULL allocates a fresh one
+    const void      *guid,          ///< protocol GUID (binary-compatible with EFI_GUID)
+    void            *iface          ///< interface pointer to publish
+    );
+
+/**
+ * @brief Uninstall a protocol interface from a handle.
+ *
+ * Portability seam under axl_protocol_uninstall.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_uninstall_protocol(
+    void            *handle,        ///< handle the protocol was installed on
+    const void      *guid,          ///< protocol GUID
+    void            *iface          ///< interface pointer that was installed
+    );
+
 // ===================================================================
 // Console input
 // ===================================================================
@@ -700,6 +729,19 @@ axl_backend_console_read_key_ex(
     uint16_t  *scan_code,     ///< (out) scan code (0 for printable)
     uint16_t  *unicode_char,  ///< (out) unicode character (0 for special)
     uint32_t  *modifiers      ///< (out) AXL_INPUT_MOD_* bits (0 if unavailable)
+    );
+
+/**
+ * @brief Enable EFI_KEY_STATE_EXPOSED on ConsoleInHandle's SimpleTextInputEx
+ *        so the firmware delivers modifier-only "partial" keystrokes (shift/
+ *        ctrl/alt down+up), keeping live modifier state current between
+ *        character keys. Best-effort + idempotent; a no-op when there is no
+ *        ex protocol (serial console). Resets the lock-toggle LEDs, so call
+ *        it only when keyboard input is actually consumed.
+ */
+void
+axl_backend_console_expose_modifiers(
+    void
     );
 
 /**

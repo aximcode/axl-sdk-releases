@@ -375,6 +375,86 @@ frame. `axl_gfx_buffer_get_damage` reports the current box (empty when
 clean). Presenting only the dirty region cuts present bandwidth by
 10–100× for typical UI updates.
 
+## Cursor Overlay
+
+GOP exposes no hardware cursor, so a sprite that tracks the pointer must
+be composited in software. `<axl/axl-cursor.h>` (`AxlCursor`) owns the
+one cursor on the screen and its position. It binds to the back-buffer
+"scene" being scanned out and touches only the cursor region: the old
+position is erased by re-presenting the clean scene there and the sprite
+is composited over the scene at the new position — no full-frame redraw.
+
+```c
+AxlGfxBuffer *scene = axl_gfx_buffer_new(w, h);   // your back-buffer
+AxlCursor *cur = axl_cursor_new(scene);           // built-in arrow, hidden
+axl_cursor_attach(cur, loop, on_input, &app);     // tracks the pointer
+// when you re-present a new frame, bracket it so the cursor stays on top:
+axl_cursor_lift(cur);
+axl_gfx_buffer_present(scene, 0, 0);
+axl_cursor_drop(cur);
+```
+
+`axl_cursor_set_image` swaps the sprite (a NULL sprite restores the
+built-in arrow); `axl_cursor_move` / `axl_cursor_move_rel` reposition the
+hotspot — drive a relative pointer (`EFI_SIMPLE_POINTER`) with
+`_move_rel` so the cursor clamps at a screen edge yet recovers the
+instant motion reverses. A NULL `scene` selects direct-to-screen
+"save-under" mode for consumers without a back-buffer. The cursor never
+routes input — hit-testing stays with the consumer, or with the
+compositor's seat below.
+
+## Compositor — Surfaces, Seat, and Cursor
+
+`<axl/axl-compositor.h>` (`AxlCompositor`) is a local, in-process
+compositor: per-surface back-buffers, a z-ordered surface **tree**,
+multi-surface present on the single framebuffer, and a **seat** (pointer
+routing, grabs, per-surface keyboard focus, the cursor overlay). It lets
+a toolkit stop faking window stacking with "reparent a child so it paints
+last" and gives a reusable windowing primitive for any app that wants
+stacked surfaces + input without a full widget set. The full design —
+why it is deliberately Wayland-shaped — is in the `AXL-Compositor-Design`
+doc.
+
+A **surface** is a CPU-backed rectangle the client draws into, with a
+position, visibility, opacity, an optional input region, and a place in a
+scene-graph tree: each surface has an optional parent, a child's position
+is relative to its parent, and stacking is tree pre-order (a node, then
+its children on top). Raising / moving / hiding / destroying a surface
+acts on its whole subtree.
+
+```c
+AxlCompositor *c = axl_compositor_new(1280, 800);
+AxlSurface *win = axl_surface_create(axl_compositor_root(c), 400, 300);
+axl_surface_move(win, 100, 80);
+axl_gfx_target_buffer(axl_surface_buffer(win));    // draw into the surface
+axl_gfx_fill_rect(0, 0, 400, 300, AXL_GFX_RGB(0x20, 0x40, 0x80));
+axl_gfx_target_buffer(NULL);
+axl_surface_damage(win, (AxlGfxClip){0, 0, 400, 300});
+axl_compositor_present(c);                          // composite + flush damage
+```
+
+`axl_compositor_present` composites every visible surface into one output
+buffer and flushes only the damaged region to the screen — it is the
+single atomicity barrier (one synchronous client, so there is no
+per-surface double-buffering to manage), and it keeps the cursor on top.
+
+The **seat** routes raw `axl-input` events. A surface installs an
+`AxlSurfaceListener` — the Wayland-`wl_pointer_listener`-shaped struct of
+surface-local callbacks (`enter` / `leave` / `motion` / `button` /
+`axis` / `key` / `focus_in` / `focus_out`) — via
+`axl_surface_set_listener`; this is the one seam a C++ toolkit bridges to
+virtual methods. `axl_compositor_pointer_event` hit-tests topmost-first
+(honoring the optional per-surface input region) and delivers to the
+surface under the pointer. `axl_compositor_pointer_grab` confines the
+pointer to a surface subtree — the menu / popup mechanism, dismissed by a
+press outside it — and `axl_compositor_set_keyboard_focus` +
+`axl_compositor_key_event` route keys to the focused surface. The
+compositor drives an `AxlCursor` as the topmost overlay, with per-surface
+cursor shapes via `axl_compositor_set_cursor_image` (a surface requests
+its shape from its `enter` callback). Wire real devices with
+`axl_compositor_attach_pointer` / `axl_compositor_attach_keyboard` on a
+caller-owned event loop.
+
 ## Effects: Blur
 
 `axl_gfx_buffer_blur(buf, radius)` softens an off-screen buffer in

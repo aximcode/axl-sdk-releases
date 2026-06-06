@@ -5419,6 +5419,66 @@ test_present_damage_null_buf_errors(void)
 }
 
 // ---------------------------------------------------------------------------
+// Display modes (GOP QueryMode / SetMode).  The -nographic unit suite has no
+// GOP, so the live enumerate/switch path is verified by the --gpu
+// gfx-mode-selftest; here we lock the NULL-arg + no-GOP contract (and stay
+// correct if a GOP IS present, e.g. a --gpu run reuses this binary).
+// ---------------------------------------------------------------------------
+
+static void
+test_display_modes_null_and_headless_contract(void)
+{
+    /* NULL-argument guards hold regardless of GOP state. */
+    test_check(axl_gfx_query_mode(0, NULL) == AXL_ERR,
+               "query_mode: NULL out -> AXL_ERR");
+    test_check(axl_gfx_current_mode(NULL) == AXL_ERR,
+               "current_mode: NULL out -> AXL_ERR");
+    test_check(axl_gfx_find_mode(640, 480, NULL) == AXL_ERR,
+               "find_mode: NULL out -> AXL_ERR");
+    test_check(axl_gfx_max_mode(NULL) == AXL_ERR,
+               "max_mode: NULL out -> AXL_ERR");
+
+    uint32_t   idx = 12345;
+    AxlGfxMode m;
+    uint32_t   n = axl_gfx_mode_count();
+    if (n == 0) {
+        /* -nographic: no GOP, every mode op fails safe. */
+        test_check(axl_gfx_query_mode(0, &m) == AXL_ERR,
+                   "query_mode: no GOP -> AXL_ERR");
+        test_check(axl_gfx_current_mode(&idx) == AXL_ERR,
+                   "current_mode: no GOP -> AXL_ERR");
+        test_check(axl_gfx_find_mode(640, 480, &idx) == AXL_ERR,
+                   "find_mode: no GOP -> AXL_ERR");
+        test_check(axl_gfx_max_mode(&m) == AXL_ERR,
+                   "max_mode: no GOP -> AXL_ERR");
+        test_check(axl_gfx_set_mode(0) == AXL_ERR,
+                   "set_mode: no GOP -> AXL_ERR");
+    } else {
+        /* A GOP is present: basic invariants + out-of-range rejection.
+           This branch asserts the SAME number of test_checks as the no-GOP
+           branch above, so the unit ratchet stays balanced across arches:
+           one arch's firmware exposes a headless GOP under -nographic and the
+           other reports no modes, so the two branches must count equally. */
+        test_check(axl_gfx_query_mode(0, &m) == AXL_OK && m.width > 0,
+                   "query_mode: mode 0 has a positive width");
+        test_check(axl_gfx_find_mode(m.width, m.height, &idx) == AXL_OK
+                   && idx < n,
+                   "find_mode: mode 0's dimensions are findable");
+        test_check(axl_gfx_query_mode(n, &m) == AXL_ERR,
+                   "query_mode: index == count -> AXL_ERR");
+        test_check(axl_gfx_current_mode(&idx) == AXL_OK && idx < n,
+                   "current_mode: in [0, count)");
+        /* The max mode is enumerable and no smaller (by area) than mode 0. */
+        AxlGfxMode mx, m0;
+        test_check(axl_gfx_max_mode(&mx) == AXL_OK && mx.index < n
+                   && axl_gfx_query_mode(0, &m0) == AXL_OK
+                   && (uint64_t)mx.width * mx.height
+                          >= (uint64_t)m0.width * m0.height,
+                   "max_mode: largest enumerable area");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // G12 — pattern fill / tile blit
 // ---------------------------------------------------------------------------
 
@@ -5992,6 +6052,7 @@ test_gfx_main(
     test_damage_null_safe();
     test_present_rect_null_buf_errors();
     test_present_damage_null_buf_errors();
+    test_display_modes_null_and_headless_contract();
 
     test_pattern_repeat_both();
     test_pattern_repeat_x();

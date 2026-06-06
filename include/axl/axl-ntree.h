@@ -217,6 +217,55 @@ axl_ntree_append_data(
 );
 
 // ---------------------------------------------------------------------------
+// Reorder / move — reposition an ALREADY-ATTACHED node (or root)
+// ---------------------------------------------------------------------------
+//
+// The insert_* calls above attach a *root* node; these reposition a node
+// that may already be in a tree, detaching it from its current spot first.
+// Same @a sibling == NULL semantics as the matching insert_* (after NULL =
+// first; before NULL = last), so the four common moves are:
+//   raise to top    : axl_ntree_move_before(parent, NULL, node)  /* last  */
+//   lower to bottom : axl_ntree_move_after (parent, NULL, node)  /* first */
+//   place above sib : axl_ntree_move_after (parent, sib,  node)
+//   place below sib : axl_ntree_move_before(parent, sib,  node)
+// Passing a @a parent different from @a node's current parent reparents it.
+// A move that would put @a node inside its own subtree (a cycle) is rejected.
+
+/**
+ * @brief Reposition @a node to sit immediately after @a sibling among
+ *        @a parent's children, detaching it from its current position first.
+ *
+ * @a sibling == NULL moves @a node to the first position.  No-op-safe if the
+ * node is already there.
+ *
+ * @return @a node, or NULL on bad arguments (NULL @a parent/@a node,
+ *         @a sibling not a child of @a parent, @a node == @a sibling,
+ *         or the move would create a cycle — @a node is @a parent or an
+ *         ancestor of @a parent).
+ */
+AxlNTree *
+axl_ntree_move_after(
+    AxlNTree *parent,   ///< destination parent
+    AxlNTree *sibling,  ///< child to position after (NULL = first)
+    AxlNTree *node      ///< node to move (may already be attached)
+);
+
+/**
+ * @brief Reposition @a node to sit immediately before @a sibling among
+ *        @a parent's children, detaching it from its current position first.
+ *
+ * @a sibling == NULL moves @a node to the last position.
+ *
+ * @return @a node, or NULL on bad arguments (see axl_ntree_move_after).
+ */
+AxlNTree *
+axl_ntree_move_before(
+    AxlNTree *parent,   ///< destination parent
+    AxlNTree *sibling,  ///< child to position before (NULL = last)
+    AxlNTree *node      ///< node to move (may already be attached)
+);
+
+// ---------------------------------------------------------------------------
 // Navigate / query
 // ---------------------------------------------------------------------------
 
@@ -351,6 +400,12 @@ axl_ntree_traverse(
  *   axl_ntree_iter_init(&it, root, AXL_NTREE_ALL);
  *   for (AxlNTree *n; (n = axl_ntree_iter_next(&it)) != NULL; ) { ... }
  *
+ * `axl_ntree_iter_init_reverse` walks the SAME nodes in the exact reverse
+ * of pre-order (deepest-last child first, a node after all its
+ * descendants) — i.e. topmost-first for a paint-order tree, the
+ * hit-test idiom: pull until the first node whose region contains the
+ * point, then stop.
+ *
  * Treat the fields as opaque. Restructuring the subtree (unlink / insert /
  * free) during iteration invalidates the iterator. For post/in/level
  * order, use axl_ntree_traverse.
@@ -360,6 +415,7 @@ typedef struct {
     AxlNTree              *current;  ///< private: last visited node
     AxlNTreeTraverseFlags  flags;    ///< private: node filter
     bool                   started;  ///< private: has iteration begun
+    bool                   reverse;  ///< private: reverse pre-order
 } AxlNTreeIter;
 
 /**
@@ -369,6 +425,20 @@ typedef struct {
  */
 void
 axl_ntree_iter_init(
+    AxlNTreeIter          *iter,   ///< [out] iterator to initialize
+    AxlNTree              *root,   ///< subtree root (boundary; not its siblings)
+    AxlNTreeTraverseFlags  flags   ///< ALL / LEAVES / NON_LEAVES
+);
+
+/**
+ * @brief Position @a iter to walk the subtree rooted at @a root in
+ *        **reverse pre-order** (the exact reverse of axl_ntree_iter_init) —
+ *        topmost-first for a paint-order tree.  Advance with
+ *        axl_ntree_iter_next, same as the forward iterator.
+ *        NULL @a root yields an immediately-exhausted iterator.
+ */
+void
+axl_ntree_iter_init_reverse(
     AxlNTreeIter          *iter,   ///< [out] iterator to initialize
     AxlNTree              *root,   ///< subtree root (boundary; not its siblings)
     AxlNTreeTraverseFlags  flags   ///< ALL / LEAVES / NON_LEAVES

@@ -27,9 +27,11 @@
 #ifndef AXL_TEXT_BUFFER_H
 #define AXL_TEXT_BUFFER_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-find.h>     /* AxlFindFlags, AxlMatch */
 
 #ifdef __cplusplus
 extern "C" {
@@ -237,6 +239,55 @@ size_t
 axl_text_buffer_cp_prev(
     const AxlTextBuffer *tb,     ///< buffer
     size_t               offset  ///< byte offset
+);
+
+/**
+ * @brief Search for a byte substring (mirror of axl_piece_tree_find).
+ *
+ * Finds @p needle starting the scan at @p from_offset. Forward (default)
+ * returns the lowest match with start >= @p from_offset; @c AXL_FIND_BACKWARD
+ * returns the highest match with start <= @p from_offset.
+ * @c AXL_FIND_CASE_INSENSITIVE folds ASCII case; @c AXL_FIND_WHOLE_WORD
+ * requires non-word bytes (anything but `[A-Za-z0-9_]`) on both sides.
+ * Matches that straddle the internal gap are handled. Wrap-around is the
+ * caller's job.
+ *
+ * Thin wrapper over axl_find_in_source (see @ref AxlByteReader).
+ *
+ * @return true and fills @p out on a match; false if not found (or
+ *     @p needle_len is 0).
+ */
+AXL_WARN_UNUSED bool
+axl_text_buffer_find(
+    AxlTextBuffer *tb,           ///< buffer
+    const char    *needle,       ///< bytes to find
+    size_t         needle_len,   ///< length of @p needle
+    size_t         from_offset,  ///< where to start scanning
+    uint32_t       flags,        ///< AxlFindFlags
+    AxlMatch      *out           ///< [out] match on success
+);
+
+/// Opaque compiled regex (see axl-regex.h).
+typedef struct AxlRegex AxlRegex;
+
+/**
+ * @brief Search the buffer for a compiled regular expression.
+ *
+ * Regex analog of axl_text_buffer_find. Uses the buffer's zero-copy
+ * peek when the searched span is contiguous (gap at the end — the
+ * common case after appends); otherwise the matcher materializes the
+ * buffer into a temporary, O(n) per call. For find-all over a large
+ * buffer, materialize once and use axl_regex_search_buf.
+ *
+ * @return true and fills @p out on a match; false otherwise.
+ */
+AXL_WARN_UNUSED bool
+axl_text_buffer_find_regex(
+    AxlTextBuffer  *tb,           ///< buffer
+    const AxlRegex *re,           ///< compiled regex
+    size_t          from_offset,  ///< where to start scanning
+    uint32_t        match_flags,  ///< AxlRegexMatchFlags
+    AxlMatch       *out           ///< [out] match on success
 );
 
 #ifdef AXL_HAVE_AUTOPTR

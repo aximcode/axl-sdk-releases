@@ -643,6 +643,31 @@ axl_http_response_set_text(AxlHttpResponse *r, const char *text)
 }
 
 void
+axl_http_response_set_bytes(
+    AxlHttpResponse *r,
+    const AxlBytes  *body,
+    const char      *content_type
+    )
+{
+    if (r == NULL || body == NULL) {
+        return;
+    }
+
+    size_t      n = 0;
+    const void *p = axl_bytes_get_data(body, &n);
+
+    /* p is NULL for an empty AxlBytes; pass a valid (zero-length)
+       pointer so set_body_copy's memcpy never sees NULL. */
+    set_body_copy(r, (p != NULL) ? p : "", n);   /* copies; frees any prior owned body */
+    if (content_type != NULL) {
+        r->content_type = content_type;
+    }
+    if (r->status_code == 0) {
+        r->status_code = 200;
+    }
+}
+
+void
 axl_http_response_set_status(AxlHttpResponse *r, size_t code)
 {
     if (r != NULL) {

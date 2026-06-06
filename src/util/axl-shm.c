@@ -19,7 +19,8 @@
 
 #include <axl/axl-shm.h>
 
-#include <axl/axl-sys.h>     /* AxlGuid, axl_guid_v5, axl_protocol_*_guid, AXL_GUID */
+#include <axl/axl-sys.h>     /* AxlGuid, axl_guid_v5, axl_protocol_*, AXL_GUID */
+#include <axl/axl-driver.h>  /* axl_protocol_install / _uninstall */
 #include <axl/axl-str.h>     /* axl_memset */
 #include "../backend/axl-backend.h"
 
@@ -94,7 +95,7 @@ axl_shm_open(const char *name, size_t size, uint32_t flags, size_t *out_size)
     nh->size = (uint64_t)size;
     nh->handle = NULL;
     axl_memset(SHM_PAYLOAD(nh), 0, size);
-    if (axl_protocol_register_guid(&guid, nh, &nh->handle) != AXL_OK) {
+    if (axl_protocol_install(&guid, nh, &nh->handle) != AXL_OK) {
         axl_backend_free(nh);
         return NULL;
     }
@@ -115,7 +116,7 @@ axl_shm_unlink(const char *name)
     if (h == NULL) {
         return AXL_OK;       /* already absent */
     }
-    if (axl_protocol_unregister_guid(h->handle, &guid, h) != AXL_OK) {
+    if (axl_protocol_uninstall(h->handle, &guid, h) != AXL_OK) {
         return AXL_ERR;
     }
     axl_backend_free(h);

@@ -110,93 +110,11 @@ kcs_wait_ibf_clear(KcsCtx *k)
     return -1;
 }
 
-/**
- * Spin until OBF is set (firmware has a byte ready for us) AND the
- * state is the one we expect. State mismatches return error immediately.
- */
-static int
-kcs_wait_obf_set(KcsCtx *k, uint8_t expected_state)
-{
-    uint8_t status;
-    size_t  iters = 0;
-    for (size_t elapsed = 0; elapsed < KCS_POLL_TIMEOUT_US;
-         elapsed += KCS_POLL_INTERVAL_US)
-    {
-        if (kcs_read_status(k, &status) != 0) {
-            return -1;
-        }
-        //
-        // ERROR state is fatal at any point — abort sequence required
-        // to recover, which we don't do here.
-        //
-        if ((status & KCS_STATE_MASK) == KCS_STATE_ERROR) {
-            axl_warning("KCS error state (status=0x%02x)", status);
-            return -1;
-        }
-        //
-        // The state field is only meaningful AFTER the BMC has
-        // committed its next byte (OBF=1). Before then the BMC may
-        // still be in the previous state (e.g., WRITE while it
-        // processes our final WRITE_END+data byte before flipping
-        // to READ). Don't bail on transient mismatches — Linux's
-        // ipmi_si state machine and the IPMI spec §9.10 figure 9-6
-        // both expect this transition window.
-        //
-        //
-        // Looking for OBF=1 in expected_state. Linux's ipmi_kcs_sm.c
-        // additionally flags state==expected with OBF=0 as "still
-        // working, keep polling" — same as our outer loop. The wrinkle
-        // we hit on one BMC observed during testing is OBF=1 going
-        // high with state still WRITE for ~ms before state catches up
-        // (status seen: 0x83 = WRITE + OBF + IBF). Wait for state to
-        // settle to expected rather than bailing immediately —
-        // matches Linux's approach of NOT treating the transient as
-        // fatal until error-recovery thresholds trip.
-        //
-        if ((status & KCS_OBF) && (status & KCS_STATE_MASK) == expected_state) {
-            return 0;
-        }
-        /* 100 us cadence: see note in kcs_wait_ibf_clear — too fine
-           for firmware timer resolution, so busy-wait is correct.
-           Yield every 100 iters (~10 ms) so Ctrl-C is observed
-           during a stuck-BMC 5 s poll. */
-        axl_backend_stall(KCS_POLL_INTERVAL_US);
-        if ((++iters % 100) == 0) {
-            axl_yield();
-        }
-    }
-    axl_error("KCS OBF-set timeout");
-    return -1;
-}
-
-/**
- * After we read a byte from the data port, the firmware expects us
- * to write KCS_CTRL_READ into the data port to prime the next byte.
- */
-static int
-kcs_read_byte(KcsCtx *k, uint8_t *byte)
-{
-    if (kcs_wait_obf_set(k, KCS_STATE_READ) != 0) {
-        return -1;
-    }
-    if (kcs_read_data(k, byte) != 0) {
-        return -1;
-    }
-    //
-    // Prime the next read unless the firmware has moved us to IDLE
-    // (which would mean "done, don't ask for more").
-    //
-    uint8_t status;
-    if (kcs_read_status(k, &status) != 0) {
-        return -1;
-    }
-    if ((status & KCS_STATE_MASK) == KCS_STATE_READ) {
-        if (kcs_write_data(k, KCS_CTRL_READ) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
+// An earlier response-read implementation lived here — a single-byte
+// read+prime helper (kcs_read_byte) and its OBF-set spin-wait
+// (kcs_wait_obf_set). Both were superseded by the inline read loop in
+// kcs_recv below (which handles the last-byte-arrives-in-IDLE corner
+// case), left unused by that refactor, and removed as dead code.
 
 // ---------------------------------------------------------------------------
 // Send-raw entry point (vtable method)

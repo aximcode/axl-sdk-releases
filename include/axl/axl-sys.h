@@ -498,39 +498,11 @@ axl_protocol_enumerate_guid(
     size_t         *count       ///< [out] number of handles
 );
 
-/**
- * @brief Register a protocol on a handle by GUID directly.
- *
- * Skips the name-registry name → GUID lookup. Used by AxlService's
- * AXL_SERVICE_DRIVER macro to publish a sentinel handle for the
- * service's identity GUID without going through `axl_protocol_register_name`
- * (which would pollute the per-image name table). Also useful for
- * consumers that already have a GUID and don't need the name layer.
- *
- * Creates a new handle if @p *handle is NULL.
- *
- * @return AXL_OK on success, AXL_ERR on error.
- */
-int
-axl_protocol_register_guid(
-    const AxlGuid *guid,       ///< protocol GUID
-    void          *interface,  ///< protocol interface to install
-    void         **handle      ///< [in/out] handle (NULL to create new)
-);
-
-/**
- * @brief Unregister a protocol by GUID directly.
- *
- * GUID-based counterpart to axl_protocol_unregister.
- *
- * @return AXL_OK on success, AXL_ERR on error.
- */
-int
-axl_protocol_unregister_guid(
-    void          *handle,     ///< handle from axl_protocol_register_guid
-    const AxlGuid *guid,       ///< protocol GUID
-    void          *interface   ///< interface to remove
-);
+/* Note: GUID-based install/uninstall (no name lookup) is the
+   axl_protocol_install / axl_protocol_uninstall primitive in
+   <axl/axl-driver.h> — the single surface over the backend protocol seam.
+   The former axl_protocol_register_guid / _unregister_guid duplicated it and
+   were removed; call axl_protocol_install / _uninstall directly. */
 
 /**
  * @brief Register multiple protocols on a handle atomically.

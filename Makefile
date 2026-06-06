@@ -224,6 +224,8 @@ LIB_SOURCES = \
     src/data/axl-str-base64.c \
     src/data/axl-str-scan.c \
     src/data/axl-str-compat.c \
+    src/data/axl-find.c \
+    src/data/axl-regex.c \
     src/data/axl-string.c \
     src/data/axl-str-wide.c \
     src/data/axl-hash-table.c \
@@ -252,6 +254,8 @@ LIB_SOURCES = \
     src/data/axl-digest-md5.c \
     src/data/axl-digest-sha1.c \
     src/data/axl-digest-sha256.c \
+    src/data/axl-hmac.c \
+    src/data/axl-bytes.c \
     src/stream/axl-stream.c \
     src/stream/axl-stream-buf.c \
     src/stream/axl-stream-file.c \
@@ -273,6 +277,7 @@ LIB_SOURCES = \
     src/util/axl-mem-phys.c \
     src/util/axl-watchdog.c \
     src/util/axl-rng.c \
+    src/util/axl-rand.c \
     src/util/axl-protocol.c \
     src/util/axl-driver.c \
     src/util/axl-shared-driver.c \
@@ -336,6 +341,9 @@ LIB_SOURCES = \
     src/net/axl-websocket.c \
     src/gfx/axl-gfx.c \
     src/gfx/axl-font.c \
+    src/gfx/axl-cursor.c \
+    src/gfx/axl-compositor.c \
+    src/gfx/axl-gfx-region.c \
     src/gfx/axl-truetype.c \
     src/gfx/axl-pixmap.c \
     src/gfx/axl-gfx-path.c \
@@ -348,7 +356,10 @@ LIB_SOURCES = \
     src/gfx/fonts/font-edk2-laffstd.c \
     src/gfx/fonts/font-unifont-16.c \
     src/gfx/fonts/font-dejavu-default.c \
+    src/gfx/fonts/font-dejavu-mono.c \
     src/input/axl-input.c \
+    src/input/axl-input-gesture.c \
+    src/input/axl-input-debounce.c \
     src/smbus/axl-smbus.c \
     src/smbus/axl-smbus-hc.c \
     src/smbus/axl-smbus-i2c.c \
@@ -509,7 +520,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo input-demo driver smbus-hc-shim radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -695,6 +706,59 @@ $(PREFIX)/gfx-demo.efi: $(BUILDDIR)/gfx-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.
 $(BUILDDIR)/gfx-demo.o: sdk/examples/gfx-demo.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# Build gfx-window.efi example (graphics showcase, holds on a key)
+gfx-window: $(PREFIX)/gfx-window.efi
+	@echo "  Built: $(PREFIX)/gfx-window.efi"
+
+$(PREFIX)/gfx-window.efi: $(BUILDDIR)/gfx-window.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-window.o,$@)
+
+$(BUILDDIR)/gfx-window.o: sdk/examples/gfx-window.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build pointer-demo.efi example (live mouse cursor, holds on a key)
+pointer-demo: $(PREFIX)/pointer-demo.efi
+	@echo "  Built: $(PREFIX)/pointer-demo.efi"
+
+$(PREFIX)/pointer-demo.efi: $(BUILDDIR)/pointer-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/pointer-demo.o,$@)
+
+$(BUILDDIR)/pointer-demo.o: sdk/examples/pointer-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build cursor-demo.efi example (AxlCursor consumer; holds on a key)
+cursor-demo: $(PREFIX)/cursor-demo.efi
+	@echo "  Built: $(PREFIX)/cursor-demo.efi"
+
+$(PREFIX)/cursor-demo.efi: $(BUILDDIR)/cursor-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cursor-demo.o,$@)
+
+$(BUILDDIR)/cursor-demo.o: sdk/examples/cursor-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build frame-anim-demo.efi — the E7 frame-clock animation recipe (one frame
+# callback per window driving a coordinator; AGT's adoption pattern).
+frame-anim-demo: $(PREFIX)/frame-anim-demo.efi
+	@echo "  Built: $(PREFIX)/frame-anim-demo.efi"
+
+$(PREFIX)/frame-anim-demo.efi: $(BUILDDIR)/frame-anim-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/frame-anim-demo.o,$@)
+
+$(BUILDDIR)/frame-anim-demo.o: sdk/examples/frame-anim-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build keytrace.efi — keyboard inter-arrival diagnostic for tuning the
+# key-debounce default (run over a real iDRAC session; serial/console
+# output, no graphics). See docs/AXL-Pointer-Cursor-Design.md sec 3.4.
+keytrace: $(PREFIX)/keytrace.efi
+	@echo "  Built: $(PREFIX)/keytrace.efi"
+
+$(PREFIX)/keytrace.efi: $(BUILDDIR)/keytrace.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/keytrace.o,$@)
+
+$(BUILDDIR)/keytrace.o: sdk/examples/keytrace.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # ===================================================================
 # Build gfx-present-selftest.efi — GOP present-pipeline round-trip
 # test (G17 + G18).  Run under scripts/run-qemu.sh --gpu by
@@ -709,6 +773,67 @@ $(PREFIX)/gfx-present-selftest.efi: $(BUILDDIR)/gfx-present-selftest.o $(CRT0_OB
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-present-selftest.o,$@)
 
 $(BUILDDIR)/gfx-present-selftest.o: test/integration/gfx-present-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build gfx-mode-selftest.efi — GOP display-mode enumerate/switch
+# round-trip.  Run under scripts/run-qemu.sh --gpu by
+# test/integration/test-gfx-mode-qemu.sh; not part of the -nographic
+# unit suite (no GOP there).
+# ===================================================================
+
+gfx-mode-selftest: $(PREFIX)/gfx-mode-selftest.efi
+	@echo "  Built: $(PREFIX)/gfx-mode-selftest.efi"
+
+$(PREFIX)/gfx-mode-selftest.efi: $(BUILDDIR)/gfx-mode-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-mode-selftest.o,$@)
+
+$(BUILDDIR)/gfx-mode-selftest.o: test/integration/gfx-mode-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build cursor-selftest.efi — AxlCursor on-screen compositing test.
+# Run under scripts/run-qemu.sh --gpu by
+# test/integration/test-cursor-qemu.sh; not part of the -nographic
+# unit suite (no GOP there, so on-screen compositing can't be seen).
+# ===================================================================
+
+cursor-selftest: $(PREFIX)/cursor-selftest.efi
+	@echo "  Built: $(PREFIX)/cursor-selftest.efi"
+
+$(PREFIX)/cursor-selftest.efi: $(BUILDDIR)/cursor-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cursor-selftest.o,$@)
+
+$(BUILDDIR)/cursor-selftest.o: test/integration/cursor-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build compositor-selftest.efi — AxlCompositor end-to-end present test.
+# Run under scripts/run-qemu.sh --gpu by
+# test/integration/test-compositor-qemu.sh (Phase C1).
+# ===================================================================
+
+compositor-selftest: $(PREFIX)/compositor-selftest.efi
+	@echo "  Built: $(PREFIX)/compositor-selftest.efi"
+
+$(PREFIX)/compositor-selftest.efi: $(BUILDDIR)/compositor-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/compositor-selftest.o,$@)
+
+$(BUILDDIR)/compositor-selftest.o: test/integration/compositor-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build compositor-bench.efi — present-path profile (E6 follow-on, §10).
+# Headless: scripts/run-qemu.sh compositor-bench.efi
+# ===================================================================
+
+compositor-bench: $(PREFIX)/compositor-bench.efi
+	@echo "  Built: $(PREFIX)/compositor-bench.efi"
+
+$(PREFIX)/compositor-bench.efi: $(BUILDDIR)/compositor-bench.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/compositor-bench.o,$@)
+
+$(BUILDDIR)/compositor-bench.o: test/integration/compositor-bench.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -885,6 +1010,20 @@ $(PREFIX)/SmbusHcShim.efi: $(BUILDDIR)/smbus-hc-shim.o $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_DRIVER,$(BUILDDIR)/smbus-hc-shim.o,$@)
 
 $(BUILDDIR)/smbus-hc-shim.o: sdk/examples/smbus-hc-shim.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build binding-driver.efi — canonical Type-B (UEFI Driver Model)
+# example: AxlDriverBinding driving Supported/Start/Stop
+# ===================================================================
+
+binding-driver: $(PREFIX)/binding-driver.efi
+	@echo "  Built: $(PREFIX)/binding-driver.efi"
+
+$(PREFIX)/binding-driver.efi: $(BUILDDIR)/binding-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/binding-driver.o,$@)
+
+$(BUILDDIR)/binding-driver.o: sdk/examples/binding-driver.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -1092,7 +1231,8 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestSmbus AxlTestIpmi AxlTestPlatform AxlTestEvent \
         AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider \
         AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath \
-        AxlTestInput AxlTestFileView AxlTestPieceTree
+        AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
+        AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1132,6 +1272,11 @@ $(eval $(call BUILD_TEST,AxlTestMath,axl-test-math))
 $(eval $(call BUILD_TEST,AxlTestInput,axl-test-input))
 $(eval $(call BUILD_TEST,AxlTestFileView,axl-test-file-view))
 $(eval $(call BUILD_TEST,AxlTestPieceTree,axl-test-piece-tree))
+$(eval $(call BUILD_TEST,AxlTestFind,axl-test-find))
+$(eval $(call BUILD_TEST,AxlTestDriver,axl-test-driver))
+$(eval $(call BUILD_TEST,AxlTestCursor,axl-test-cursor))
+$(eval $(call BUILD_TEST,AxlTestCompositor,axl-test-compositor))
+$(eval $(call BUILD_TEST,AxlTestGfxRegion,axl-test-gfx-region))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
