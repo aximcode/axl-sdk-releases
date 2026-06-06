@@ -790,7 +790,11 @@ comp_vis_build(AxlCompositor *c, CompVis *cv)
         goto fail;
     }
     size_t m = axl_array_len(cv->order);
-    AxlGfxRegion **vis = (m > 0) ? axl_malloc(m * sizeof(*vis)) : NULL;
+    /* Array of m region pointers. Spell the element as the explicit pointer
+       type, not sizeof(*vis): older clang-tidy's bugprone-sizeof-expression
+       flags sizeof of a pointer-to-aggregate *expression* (a real false
+       positive here — an array of pointers is exactly what we want). */
+    AxlGfxRegion **vis = (m > 0) ? axl_malloc(m * sizeof(AxlGfxRegion *)) : NULL;
     if (m > 0 && vis == NULL) {
         goto fail;
     }

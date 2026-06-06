@@ -8,7 +8,7 @@ helper, has burned us before.
 
 - You're on `main`, working tree clean, `git log origin/main..HEAD`
   shows the commits to ship.
-- The integration suite passes locally:
+- The integration suite passes locally. The quick smoke set:
 
   ```sh
   ./test/integration/test-axl.sh
@@ -17,6 +17,16 @@ helper, has burned us before.
   ./test/integration/test-http.sh
   ./test/integration/test-cpu-idle.sh
   ```
+
+  **But this list is a SUBSET of what CI runs** — `.github/workflows/ci.yml`
+  is the source of truth, and it runs more (e.g. `test-input-keys-qemu.sh`,
+  `test-yield-ctrlc.sh`, `test-axl-cc-service.sh`, the `clang-tidy` job, both
+  arches). Running only the five above can leave a CI-only failure undetected
+  until the tag. Either run every `*.sh` step listed in `ci.yml`, or — better
+  — rely on the §4b "watch CI on `main` before tagging" gate, which validates
+  the *exact* CI matrix. Some tests are deliberately local-only (they need a
+  QMP-pointer-injection-capable host the GitHub runners don't provide, e.g.
+  `test-input-modifiers-qemu.sh`); run those by hand before a release.
 
 - Both archs build clean against `BUILD=RELEASE`. Use a separate
   `PREFIX` so the RELEASE-flagged `.o` files don't shadow the
@@ -65,6 +75,15 @@ helper, has burned us before.
   (not errors), CI is fine — `WarningsAsErrors: '*'` in
   `.clang-tidy` only escalates the checks the config enables; the
   `2 warnings generated` lines per file are noise.
+
+  **Version skew — local-clean does NOT imply CI-clean.** CI installs
+  `clang-tidy` from Ubuntu apt (whatever `ubuntu-latest` ships). A *newer*
+  local clang-tidy can have refined check heuristics that silently pass code
+  an older CI clang-tidy flags — v1.0.0 hit exactly this: a correct
+  array-of-pointers `sizeof` was clean under local clang-tidy 21 but tripped
+  `bugprone-sizeof-expression` on CI's older build. Match CI's version if you
+  can (`apt-get install clang-tidy-<N>` for the version `ubuntu-latest` uses),
+  or treat the §4b CI-on-`main` run as the authoritative clang-tidy gate.
 
   **Run clang-tidy one file per process (`-n1`).** Passing many
   TUs to a single `clang-tidy` invocation makes the path-sensitive
@@ -130,6 +149,32 @@ git push origin main
 `main` must contain the release-metadata commit *before* the tag
 points at it; if you tag first and then push the branch, the
 release.yml workflow can race and check out the wrong commit.
+
+### 4b. Wait for CI to pass on `main` BEFORE tagging — the load-bearing gate
+
+**Do not tag until the CI workflow is green on the branch push.** The tag
+re-triggers the *same* CI + Release + Docs workflows; if CI is red on the
+branch it will be red on the tag too — except now `release.yml` has already
+published the artifacts and `gh release create` has run, so the tag can no
+longer be cleanly re-cut (see Recovery) and you're forced into a patch
+release. Validating on the branch first makes a red CI a 5-minute branch fix
+instead of a burned version number.
+
+```sh
+scripts/watch-release-runs.sh        # or: gh run watch <ci-run-id>
+```
+
+This matters most after a **long unpushed run**: if `main` is dozens of
+commits ahead of `origin/main`, CI has validated *none* of them, and the
+local prereq suite above is not a substitute — it is a strict subset of what
+CI runs. v1.0.0 shipped with a red CI for exactly this reason: ~100 commits
+were unpushed, and two CI-only failures (a `test-input-modifiers-qemu.sh`
+that can't run on headless runners, and a clang-tidy finding from a newer
+local clang-tidy than CI's) only surfaced on the tag. The fix that would
+have caught both: push `main` and watch CI *before* tagging.
+
+If CI is red on the branch, fix it on `main` as normal commits, let CI go
+green, and only then proceed to the tag.
 
 ### 5. Create and push the tag
 

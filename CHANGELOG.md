@@ -3,6 +3,23 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.0.1 — 2026-06-05
+
+Build/CI hygiene only — no API or behavior change from 1.0.0 (the 1.0.0
+artifacts are functionally identical). Fixes two CI-only failures that
+surfaced on the 1.0.0 tag:
+
+### Fixed
+
+- Compositor: spell a correct array-of-pointers allocation as
+  `sizeof(AxlGfxRegion *)` so CI's older clang-tidy stops raising a
+  `bugprone-sizeof-expression` false positive (the allocation size was
+  already correct).
+- CI: `test-input-modifiers-qemu.sh` no longer runs in CI — its QMP pointer
+  injection does not deliver on headless GitHub runners. It remains a local
+  pre-release check. `docs/RELEASING.md` gained a "watch CI green on `main`
+  before tagging" gate to catch this class of failure before a tag.
+
 ## 1.0.0 — 2026-06-05
 
 First stable release. Since 0.24.0: a deferred surface compositor with a
