@@ -333,6 +333,59 @@ test_regex_flags(void)
 }
 
 static void
+test_regex_interval(void)
+{
+    AxlMatch m;
+    // {n} exact count.
+    AXL_AUTOPTR(AxlRegex) ex = axl_regex_new("a{3}", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(ex, "aaaa", 4, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 3, "interval: a{3} matches exactly 3");
+    test_check(!axl_regex_search_buf(ex, "aa", 2, 0, AXL_REGEX_MATCH_ANCHORED, &m),
+               "interval: a{3} needs 3 (aa fails)");
+
+    // {n,m} range is greedy up to m.
+    AXL_AUTOPTR(AxlRegex) rg = axl_regex_new("a{2,4}", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(rg, "aaaaa", 5, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 4, "interval: a{2,4} greedy takes 4");
+    test_check(axl_regex_search_buf(rg, "aa", 2, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 2, "interval: a{2,4} accepts the min 2");
+    test_check(!axl_regex_search_buf(rg, "a", 1, 0, AXL_REGEX_MATCH_ANCHORED, &m),
+               "interval: a{2,4} rejects 1");
+
+    // {n,} unbounded lower bound.
+    AXL_AUTOPTR(AxlRegex) lo = axl_regex_new("a{2,}", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(lo, "aaaaaa", 6, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 6, "interval: a{2,} takes all >=2");
+
+    // {,m} optional up to m (lower bound 0).
+    AXL_AUTOPTR(AxlRegex) up = axl_regex_new("xa{,2}b", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(up, "xb", 2, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 2, "interval: a{,2} allows zero");
+    test_check(axl_regex_search_buf(up, "xaab", 4, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 4, "interval: a{,2} allows two");
+
+    // Interval on a char class (the GUID/MAC use case): 8 hex digits.
+    AXL_AUTOPTR(AxlRegex) hx = axl_regex_new("[0-9a-f]{8}", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(hx, "deadbeef!", 9, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 8, "interval: [0-9a-f]{8} matches a hex octet run");
+
+    // Interval on a group resolves to the last match (documented behavior).
+    AXL_AUTOPTR(AxlRegex) gr = axl_regex_new("(ab){2}", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(gr, "abab", 4, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 4, "interval: (ab){2} matches abab");
+
+    // A '{' that isn't a valid interval is a literal character.
+    AXL_AUTOPTR(AxlRegex) lit = axl_regex_new("a{b", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(lit, "a{b", 3, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 3, "interval: bare '{' is a literal");
+
+    // {0} matches empty (zero-width).
+    AXL_AUTOPTR(AxlRegex) zero = axl_regex_new("a{0}b", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(zero, "b", 1, 0, AXL_REGEX_MATCH_ANCHORED, &m)
+               && m.length == 1, "interval: a{0} matches empty");
+}
+
+static void
 test_regex_errors(void)
 {
     AxlRegexError err = { 0 };
@@ -451,6 +504,7 @@ test_find_main(int argc, char **argv)
     test_regex_battery();
     test_regex_captures();
     test_regex_anchored();
+    test_regex_interval();
     test_regex_flags();
     test_regex_errors();
     test_regex_reader_materialize();

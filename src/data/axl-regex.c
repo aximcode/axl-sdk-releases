@@ -179,10 +179,81 @@ static Node *parse_atom(Parser *s) {
     Node *n = node_new(s, N_LIT); n->ch = (uint8_t)pget(s); return n;
 }
 
+/* Deep-copy a subtree into the parser pool (so bounded-repetition `{n}`
+   desugaring can emit independent instances of the repeated atom). A capture
+   group inside the copy keeps its index — an interval-repeated group resolves
+   to its LAST match (POSIX-style), which is fine for the non-capturing
+   char-class / literal patterns intervals are normally used with. */
+static Node *node_clone(Parser *s, const Node *n) {
+    if (s->err || n == NULL) return node_new(s, N_EMPTY);
+    Node *c = node_new(s, n->kind);
+    if (s->err) return c;
+    c->ch = n->ch; c->cls = n->cls; c->greedy = n->greedy; c->group = n->group;
+    if (n->a) c->a = node_clone(s, n->a);
+    if (n->b) c->b = node_clone(s, n->b);
+    return c;
+}
+
+/* Parse a `{n}` / `{n,}` / `{n,m}` / `{,m}` interval. The caller has already
+   confirmed the next char is '{' and SAVED s->p; on any non-interval shape
+   this returns false (consuming input that the caller then rolls back), so a
+   literal '{' still parses as a plain character. Counts clamp to REP_MAX so
+   `a{999999}` can't blow up the AST. @hi == -1 means unbounded. */
+static bool parse_interval(Parser *s, int *lo, int *hi) {
+    enum { REP_MAX = 1024 };
+    pget(s);                              /* consume '{' */
+    int min = 0, max = 0, c;
+    bool hmin = false, hmax = false, comma = false;
+    while ((c = ppeek(s)) >= '0' && c <= '9') {
+        pget(s); hmin = true; min = min * 10 + (c - '0'); if (min > REP_MAX) min = REP_MAX;
+    }
+    if (ppeek(s) == ',') {
+        pget(s); comma = true;
+        while ((c = ppeek(s)) >= '0' && c <= '9') {
+            pget(s); hmax = true; max = max * 10 + (c - '0'); if (max > REP_MAX) max = REP_MAX;
+        }
+    }
+    if (ppeek(s) != '}') return false;    /* not an interval (e.g. a literal '{') */
+    pget(s);                              /* consume '}' */
+    if (!hmin && !hmax) return false;     /* {} or {,} — treat '{' literally */
+    if (!comma)     { *lo = min;            *hi = min; }   /* {n}   */
+    else if (!hmax) { *lo = hmin ? min : 0; *hi = -1;  }   /* {n,}  */
+    else            { *lo = hmin ? min : 0; *hi = max; }   /* {n,m} / {,m} */
+    if (*hi >= 0 && *hi < *lo) return false;               /* {3,1} invalid */
+    return true;
+}
+
+/* Concatenate two nodes (NULL-left returns right). */
+static Node *node_cat(Parser *s, Node *left, Node *right) {
+    if (!left) return right;
+    Node *c = node_new(s, N_CAT); c->a = left; c->b = right;
+    return c;
+}
+
 static Node *parse_repeat(Parser *s) {
     Node *a = parse_atom(s);
     for (;;) {
         int c = ppeek(s);
+        if (c == '{') {
+            const char *save = s->p;
+            int lo = 0, hi = 0;
+            if (!parse_interval(s, &lo, &hi)) { s->p = save; break; }
+            /* Desugar onto the existing quantifier compilation: `lo` required
+               copies, then either `a*` (unbounded) or `hi-lo` optional `a?`. */
+            Node *seq = NULL;
+            for (int i = 0; i < lo; i++) seq = node_cat(s, seq, node_clone(s, a));
+            if (hi < 0) {
+                Node *star = node_new(s, N_STAR); star->a = node_clone(s, a);
+                seq = node_cat(s, seq, star);
+            } else {
+                for (int i = lo; i < hi; i++) {
+                    Node *q = node_new(s, N_QUEST); q->a = node_clone(s, a);
+                    seq = node_cat(s, seq, q);
+                }
+            }
+            a = seq ? seq : node_new(s, N_EMPTY);   /* {0} matches empty */
+            continue;
+        }
         if (c != '*' && c != '+' && c != '?') break;
         pget(s);
         Kind k = (c == '*') ? N_STAR : (c == '+') ? N_PLUS : N_QUEST;

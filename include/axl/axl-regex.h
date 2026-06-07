@@ -19,12 +19,15 @@
     backtracking.
 
     Supported syntax: literals; `.`; greedy and lazy quantifiers
-    `* + ? *? +? ??`; anchors `^ $`; alternation `|`; grouping and
-    capture `( )`; character classes `[...]` / `[^...]` with `a-z`
-    ranges; the escapes `\d \w \s \D \W \S \n \t \r \f \v` and
-    backslash-escaped metacharacters. Bounded repetition `{n,m}` and
-    named groups are not in this version. Matching is byte-oriented and
-    leftmost (Perl / `grep -P` priority, not POSIX leftmost-longest).
+    `* + ? *? +? ??`; bounded repetition `{n}` / `{n,}` / `{n,m}` / `{,m}`
+    (counts clamp to 1024; a `{` that is not a valid interval is a literal);
+    anchors `^ $`; alternation `|`; grouping and capture `( )`; character
+    classes `[...]` / `[^...]` with `a-z` ranges; the escapes
+    `\d \w \s \D \W \S \n \t \r \f \v` and backslash-escaped metacharacters.
+    Bounded repetition desugars to the base quantifiers, so a capture group
+    repeated by an interval resolves to its last match. Named groups are not
+    in this version. Matching is byte-oriented and leftmost (Perl / `grep -P`
+    priority, not POSIX leftmost-longest).
 
     @code
     AXL_AUTOPTR(AxlRegex) re = axl_regex_new("[0-9]+", AXL_REGEX_DEFAULT);

@@ -465,6 +465,31 @@ axl_piece_tree_load_encoded(
 );
 
 /**
+ * @brief Load a text file detecting encoding, sharing a page cache.
+ *
+ * Like axl_piece_tree_load_encoded, but the common plain-UTF-8 / no-BOM
+ * out-of-core case borrows @p cache (created with axl_page_cache_new_shared)
+ * via axl_piece_tree_open_cached, so one bounded frame budget is shared
+ * across many open documents (an editor with many files). The page size
+ * comes from the cache. Every other case (UTF-8 BOM, UTF-16 LE/BE) is read
+ * resident and transcoded exactly as the uncached loader — the cache is
+ * unused for those, as they hold no file view.
+ *
+ * The cache is caller-owned and NOT freed when a document is freed; free it
+ * after every document sharing it is freed.
+ *
+ * @return new piece tree, or NULL on open / read / transcode / OOM failure
+ *     (also NULL when @p cache is NULL). Free with axl_piece_tree_free().
+ */
+AxlPieceTree *
+axl_piece_tree_load_encoded_cached(
+    const char   *path,        ///< file path (UTF-8)
+    AxlPageCache *cache,       ///< shared cache to borrow (caller-owned)
+    AxlEncoding  *out_enc,     ///< [out, optional] detected encoding
+    bool         *out_has_bom   ///< [out, optional] whether a BOM was present
+);
+
+/**
  * @brief Write the document to a file in a chosen encoding.
  *
  * Transcodes the (UTF-8) document to @p enc — one of @c AXL_ENC_UTF8,

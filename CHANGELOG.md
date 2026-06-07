@@ -3,6 +3,59 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.1.0 — 2026-06-07
+
+### Added
+
+- **`AxlMemRegion`** (`<axl/axl-mem-region.h>`) — a physical-memory region
+  map + fault-safe range access, layered on the raw `<axl/axl-mem-phys.h>`
+  primitives so a tool (e.g. a hex / live-memory editor) can let a user type
+  an **arbitrary** physical address without faulting the image. Classifies
+  the physical address space into typed regions (`AxlMemRegion` /
+  `AxlMemRegionType`: RAM / RESERVED / ACPI / MMIO / UNMAPPED) sourced from
+  the UEFI memory map overlaid with the PI **GCD** memory-space map (so MMIO
+  the EFI map omits — PCI BARs — is classified). `axl_mem_phys_region_at` /
+  `_region_count` / `_region_get` / `_region_refresh` enumerate it;
+  `axl_mem_phys_is_accessible` gates access (best-effort, no pre-boot fault
+  handler); an `AxlMemAccessPolicy` (`axl_mem_phys_get_policy` /
+  `_set_policy`) permits every mapped type by default and can be tightened
+  (RAM-only, read-only); and `axl_mem_phys_read_range` / `_write_range` do
+  bulk width- and alignment-aware access (1/2/4/8), refusing a misaligned or
+  inaccessible span with `AXL_ERR` instead of faulting.
+
+- **`AxlIoRegion`** (`<axl/axl-mem-region.h>`) — the I/O-port-space sibling of
+  `AxlMemRegion`. Classifies the x86 I/O port address space (`AxlIoRegion` /
+  `AxlIoRegionType`: IO / RESERVED / UNMAPPED) from the PI GCD I/O-space map
+  via `axl_io_region_at` / `_count` / `_get` / `_refresh`, with
+  `axl_io_is_accessible` and width-aware `axl_io_read_range` / `_write_range`
+  (1/2/4) over the existing `axl_io_port_*`. Classification works on any arch
+  (empty on AArch64); port access is x86-only (`AXL_ERR` elsewhere), and an
+  I/O read may have device side effects.
+
+- **`axl_loop_set_intercept_break`** / **`axl_loop_get_intercept_break`**
+  (`<axl/axl-loop.h>`) — control whether a bare Ctrl-C quits the loop, so a
+  GUI app can own the keystroke instead of the runtime exiting.
+
+- **`axl_piece_tree_load_encoded_cached`** (`<axl/axl-piece-tree.h>`) — load
+  a text file with encoding detection while sharing a page cache across
+  documents (the buffer-source path for an editor that opens many files).
+
+- **`AxlRegex` bounded repetition** (`<axl/axl-regex.h>`) — the matcher now
+  supports `{n}` / `{n,}` / `{n,m}` / `{,m}` interval quantifiers (desugared
+  to the base quantifiers; a repeated capture group resolves to its last
+  match, POSIX-style).
+
+### Changed
+
+- **`axl_sys_get_memory_size`** now sums the `AXL_MEM_REGION_RAM` regions of
+  the shared region map (one memory-map walk instead of its own). The total
+  is GCD-aware, so on firmware where the GCD reports usable system memory the
+  EFI map omits it is counted too — normally identical to the previous value
+  (pinned by a test on the reference platform).
+
+- **`run-qemu.sh`** gained `SHOT_WAIT` to decouple the pre-screenshot settle
+  delay from `--timeout` (steadier screenshot/GUI captures in tests).
+
 ## 1.0.1 — 2026-06-05
 
 Build/CI hygiene only — no API or behavior change from 1.0.0 (the 1.0.0

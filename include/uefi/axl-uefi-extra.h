@@ -381,6 +381,15 @@ static __attribute__((unused)) EFI_GUID gEfiCpuArchProtocolGuid =
     { 0x26baccb1, 0x6f42, 0x11d4,
       {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81} };
 
+// DXE Services Table GUID (PI spec DXE_SERVICES_TABLE_GUID). The spec macro
+// uses a flat 11-field initializer that the generator's GUID auto-extractor
+// (which expects the nested EFI_GUID form) skips, so it is defined by hand
+// here. AxlMemRegion looks this up in the EFI configuration table to reach
+// gDS->GetMemorySpaceMap (the GCD memory-space map).
+static __attribute__((unused)) EFI_GUID gEfiDxeServicesTableGuid =
+    { 0x05ad34ba, 0x6f02, 0x4214,
+      {0x95, 0x2e, 0x4d, 0xa0, 0x39, 0x8e, 0x2b, 0xb9} };
+
 static __attribute__((unused)) EFI_GUID gEfiShellProtocolGuid =
     { 0x6302d008, 0x7f9b, 0x4f30,
       {0x87, 0xac, 0x60, 0xc9, 0xfe, 0xf5, 0xda, 0x4e} };

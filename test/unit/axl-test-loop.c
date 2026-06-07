@@ -1173,6 +1173,32 @@ test_loop_attach_driver(void)
 // ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
+// Ctrl-C intercept flag (GUI apps deliver Ctrl+C instead of quitting)
+// ---------------------------------------------------------------------------
+
+static void
+test_intercept_break_flag(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) { test_fail("intercept_break: alloc"); return; }
+
+    test_check(axl_loop_intercept_break(loop),
+               "intercept_break: defaults to true (Ctrl-C quits)");
+    axl_loop_set_intercept_break(loop, false);
+    test_check(!axl_loop_intercept_break(loop),
+               "intercept_break: set false (Ctrl-C delivered to the app)");
+    axl_loop_set_intercept_break(loop, true);
+    test_check(axl_loop_intercept_break(loop),
+               "intercept_break: set back to true");
+
+    axl_loop_free(loop);
+    // NULL is a safe no-op / false.
+    axl_loop_set_intercept_break(NULL, false);
+    test_check(!axl_loop_intercept_break(NULL),
+               "intercept_break: NULL loop returns false");
+}
+
+// ---------------------------------------------------------------------------
 
 int
 test_loop_main(
@@ -1210,6 +1236,7 @@ test_loop_main(
     test_iterate_until_done();
     test_iterate_until_timeout();
     test_loop_attach_driver();
+    test_intercept_break_flag();
 
     return test_print_results();
 }

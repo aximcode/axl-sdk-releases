@@ -103,6 +103,7 @@ axl_loop_new_impl(const char *file, int line)
     loop->pending_source = -1;
     loop->defer_next_id = 1;
     loop->pubsub_next_sub_id = 1;
+    loop->intercept_break = true;   // serial Ctrl-C → quit (GUI apps opt out)
 
     axl_ring_buf_init_fixed(&loop->defer_ring, loop->defer_buf,
                           sizeof(loop->defer_buf), sizeof(DeferEntry),
@@ -220,6 +221,20 @@ axl_loop_is_running(AxlLoop *loop)
 }
 
 void
+axl_loop_set_intercept_break(AxlLoop *loop, bool intercept)
+{
+    if (loop != NULL) {
+        loop->intercept_break = intercept;
+    }
+}
+
+bool
+axl_loop_intercept_break(AxlLoop *loop)
+{
+    return loop != NULL ? loop->intercept_break : false;
+}
+
+void
 axl_loop_add_cleanup(AxlLoop *loop, AxlLoopCallback cb, void *data)
 {
     if (loop == NULL || cb == NULL || loop->cleanup_count >= AXL_MAX_SOURCES) {
@@ -262,8 +277,11 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
 
     loop->pending_source = -1;
 
-    /* 1. Check Ctrl-C */
-    if (axl_backend_shell_break_flag()) {
+    /* 1. Check Ctrl-C (the shell's ExecutionBreak).  Always drain it so the
+       signal doesn't latch, but only QUIT when the app still wants Ctrl-C to
+       mean quit — a GUI app that owns Ctrl+C (editor Copy) opts out and lets
+       the 0x03 keystroke reach its keypress source instead. */
+    if (axl_backend_shell_break_flag() && loop->intercept_break) {
         _axl_signal_on_break();
         axl_loop_quit(loop);
         return -1;
@@ -335,8 +353,9 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         event_array[event_count] = loop->poll_timer;
         event_count++;
 
-        /* Add shell break event for immediate Ctrl-C (if available) */
-        if (loop->break_event != NULL) {
+        /* Add shell break event for immediate Ctrl-C (if available, and the
+         * app still wants Ctrl-C to mean quit). */
+        if (loop->break_event != NULL && loop->intercept_break) {
             event_to_source[event_count] = (size_t)-2;
             event_array[event_count] = loop->break_event;
             event_count++;
@@ -382,7 +401,7 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             uint16_t scan = 0, uni = 0;
             uint32_t mods = 0;
             if (axl_backend_console_read_key_ex(&scan, &uni, &mods) == AXL_OK) {
-                if (uni == 0x03 && mods == 0) {
+                if (uni == 0x03 && mods == 0 && loop->intercept_break) {
                     _axl_signal_on_break();
                     axl_loop_quit(loop);
                     return -1;
@@ -486,11 +505,14 @@ axl_loop_dispatch_event(AxlLoop *loop)
                                                 &akey.modifiers) != AXL_OK) {
                 break;   /* queue drained */
             }
-            if (akey.unicode_char == 0x03 && akey.modifiers == 0) {
+            if (akey.unicode_char == 0x03 && akey.modifiers == 0
+                && loop->intercept_break) {
                 _axl_signal_on_break();
                 axl_loop_quit(loop);
                 return;
             }
+            // intercept_break off: 0x03 falls through to the app (a GUI editor
+            // maps Ctrl+C to Copy via axl_input_ctrl_letter's serial-fold).
             cont = src->fn.key_cb(akey, src->data);
             if (src->id != dispatched_id) {
                 /* Callback removed this source and the slot was reused —

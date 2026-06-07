@@ -1581,8 +1581,12 @@ if [[ -n "$SCREENSHOT" ]]; then
     "${CMD[@]}" &
     QEMU_PID=$!
 
-    WAIT=$((TIMEOUT - 3))
-    [[ $WAIT -lt 5 ]] && WAIT=5
+    # Pre-screenshot settle.  Decoupled from TIMEOUT so a caller can keep a
+    # safe kill-timeout but capture sooner: set SHOT_WAIT to the seconds the
+    # guest needs to boot + render (the visual suite tunes this).  Default =
+    # the old TIMEOUT-3 behaviour.
+    WAIT="${SHOT_WAIT:-$((TIMEOUT - 3))}"
+    [[ $WAIT -lt 3 ]] && WAIT=3
     sleep "$WAIT"
 
     # --sendkey: inject key tokens via the monitor once the app is up, then

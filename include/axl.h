@@ -78,6 +78,7 @@
 #include <axl/axl-efi-status.h>
 #include <axl/axl-image.h>
 #include <axl/axl-mem-phys.h>
+#include <axl/axl-mem-region.h>
 #include <axl/axl-watchdog.h>
 #include <axl/axl-rng.h>
 #include <axl/axl-rand.h>

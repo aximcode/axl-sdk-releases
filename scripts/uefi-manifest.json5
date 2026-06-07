@@ -446,6 +446,22 @@
     {"name": "EFI_MP_SERVICES_PROTOCOL",      "kind": "struct"}
   ],
 
+  // PI DXE Services — the GCD (Global Coherency Domain) memory-space map.
+  // Used by AxlMemRegion to classify the full physical address space
+  // (MMIO / non-existent ranges the EFI memory map omits). The DXE_SERVICES
+  // table is reached via gEfiDxeServicesTableGuid in the EFI config table
+  // (the GUID itself is hand-defined in axl-uefi-extra.h — its spec macro
+  // uses a flat initializer the GUID auto-extractor doesn't match).
+  "dxe-services.h": [
+    {"name": "EFI_GCD_MEMORY_TYPE",             "kind": "enum"},
+    {"name": "EFI_GCD_MEMORY_SPACE_DESCRIPTOR", "kind": "struct"},
+    {"name": "EFI_GET_MEMORY_SPACE_MAP",        "kind": "funcptr"},
+    {"name": "EFI_GCD_IO_TYPE",                 "kind": "enum"},
+    {"name": "EFI_GCD_IO_SPACE_DESCRIPTOR",     "kind": "struct"},
+    {"name": "EFI_GET_IO_SPACE_MAP",            "kind": "funcptr"},
+    {"name": "DXE_SERVICES",                    "kind": "struct"}
+  ],
+
   "smbios.h": [
     {"name": "EFI_SMBIOS_TYPE",              "kind": "typedef"},
     {"name": "EFI_SMBIOS_HANDLE",            "kind": "typedef"},

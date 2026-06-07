@@ -1623,9 +1623,9 @@ load_transcode(AxlEncoding enc, const unsigned char *body, size_t body_len)
     return pt;
 }
 
-AxlPieceTree *
-axl_piece_tree_load_encoded(const char *path, size_t page_size, size_t max_frames,
-                            AxlEncoding *out_enc, bool *out_has_bom)
+static AxlPieceTree *
+load_encoded_impl(const char *path, size_t page_size, size_t max_frames,
+                  AxlPageCache *cache, AxlEncoding *out_enc, bool *out_has_bom)
 {
     if (path == NULL) {
         return NULL;
@@ -1662,12 +1662,16 @@ axl_piece_tree_load_encoded(const char *path, size_t page_size, size_t max_frame
         *out_has_bom = has_bom;
     }
 
-    /* Plain UTF-8, no BOM: open out-of-core (no materialization). */
+    /* Plain UTF-8, no BOM: open out-of-core (no materialization). When a
+       shared cache is supplied, borrow it (page size comes from the cache);
+       otherwise allocate this document's own frame pool. */
     if (enc == AXL_ENC_UTF8 && !has_bom) {
-        return axl_piece_tree_open(path, page_size, max_frames);
+        return cache != NULL ? axl_piece_tree_open_cached(path, cache)
+                             : axl_piece_tree_open(path, page_size, max_frames);
     }
 
-    /* Otherwise read the whole file and transcode to UTF-8 in memory. */
+    /* Otherwise read the whole file and transcode to UTF-8 in memory — a
+       resident document with no file view, so the cache is unused here. */
     void  *raw = NULL;
     size_t raw_len = 0;
     if (axl_file_get_contents(path, &raw, &raw_len) != AXL_OK) {
@@ -1686,6 +1690,24 @@ axl_piece_tree_load_encoded(const char *path, size_t page_size, size_t max_frame
                                       raw_len - skip);
     axl_free(raw);
     return pt;
+}
+
+AxlPieceTree *
+axl_piece_tree_load_encoded(const char *path, size_t page_size, size_t max_frames,
+                            AxlEncoding *out_enc, bool *out_has_bom)
+{
+    return load_encoded_impl(path, page_size, max_frames, NULL,
+                             out_enc, out_has_bom);
+}
+
+AxlPieceTree *
+axl_piece_tree_load_encoded_cached(const char *path, AxlPageCache *cache,
+                                   AxlEncoding *out_enc, bool *out_has_bom)
+{
+    if (cache == NULL) {
+        return NULL;
+    }
+    return load_encoded_impl(path, 0, 0, cache, out_enc, out_has_bom);
 }
 
 int

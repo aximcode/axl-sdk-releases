@@ -1039,6 +1039,30 @@ Deferred to a future phase (both captured in
 - [ ] **Watchdog opt-in** (`axl_watchdog_enable(seconds)`) --
       library-livelock guard, not a signal mechanism. No concrete
       caller has asked for it yet.
+- [ ] **Robust (exception-handler-backed) physical-access fault gate
+      + real `setjmp`/`longjmp`.** `axl_mem_phys_is_accessible` /
+      `_read_range` / `_write_range` (`<axl/axl-mem-region.h>`) are
+      *best-effort* today: they gate on the region map, which stops the
+      common "address in an unmapped gap" fault but cannot survive a
+      firmware-protected page inside "RAM" or an MMIO abort. Making them
+      robust needs three pieces: **(1)** a real `setjmp`/`longjmp` — the
+      `include/compat/setjmp.h` shim is *declarations-only*, so write the
+      ~15-line callee-saved-register save/restore in asm for x86-64 **and**
+      AArch64; **(2)** a CPU exception handler installed via
+      `EFI_CPU_ARCH_PROTOCOL.RegisterInterruptHandler` for #PF/#GP (x86) and
+      the synchronous-abort vector (AArch64) that recovers by mutating the
+      saved `EFI_SYSTEM_CONTEXT` to `longjmp` out; **(3)** wrapping the actual
+      access in `read_range`/`write_range` so a fault returns `AXL_ERR`
+      instead of terminating the image. This is delicate systems code (a bug
+      is a hard firmware crash) for a rare-case gain — do it when a consumer
+      genuinely needs to survive protected/aborting pages, not speculatively.
+      **This is NOT C++ exceptions.** `throw`/`catch` additionally require the
+      Itanium C++ ABI unwinder (`_Unwind_RaiseException`, `__cxa_throw`, a
+      personality routine), `.eh_frame`/`.gcc_except_table` emission, and
+      compiling with `-fexceptions` (AXL builds `-fno-exceptions`, and
+      `axl-cxxabi.c` ships no unwinder) — a separate, larger port. The
+      `setjmp`/`longjmp` this item adds is reusable by C++ code as a manual
+      error-escape but does **not** run destructors.
 
 Design decisions locked in (see [design doc §7](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#7-what-we-are-not-doing), [§9](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#9-design-decisions-locked-in)):
 

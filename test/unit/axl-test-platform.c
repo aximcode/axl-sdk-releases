@@ -12,6 +12,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-spd.h>
 #include <axl/axl-usb.h>
+#include <uefi/axl-uefi.h>   /* gBS->GetMemoryMap for the get_memory_size check */
 
 #include "spd-ddr4-micron-8gb.h"
 #include "spd-ddr5-samsung-16gb.h"
@@ -2824,6 +2825,247 @@ test_mem_phys_round_trip(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_mem_phys_region_* + is_accessible + read_range / write_range
+// ---------------------------------------------------------------------------
+//
+// Drives the region map (EFI memory map merged with the GCD memory-space map)
+// and the fault-safe range layer against QEMU's real layout: a page from
+// axl_alloc_pages is a known identity-mapped RAM address; an address far above
+// installed RAM is a known UNMAPPED address. The assertion count is fixed
+// across arches (the alloc-fail SKIP path balances it), so the cross-arch
+// ratchet stays level even though the firmware layout differs.
+//
+#define MEM_REGION_TESTS  29
+#define MEM_UNMAPPED_HI   ((uintptr_t)0x0000400000000000ULL)  /* 64 TiB */
+
+static void
+test_mem_region(void)
+{
+    uint64_t pg = 0;
+    if (axl_alloc_pages(1, &pg) != AXL_OK || pg == 0) {
+        axl_printf("SKIP: mem_region (alloc_pages failed)\n");
+        for (int i = 0; i < MEM_REGION_TESTS; i++) {
+            test_check(true, "mem_region: SKIP balance");
+        }
+        return;
+    }
+    const uintptr_t ram = (uintptr_t)pg;   /* page-aligned, guaranteed RAM */
+
+    // --- Enumeration ---
+    size_t n = 0;
+    test_check(axl_mem_phys_region_count(NULL) == AXL_ERR,
+               "region_count: NULL out -> AXL_ERR");
+    test_check(axl_mem_phys_region_count(&n) == AXL_OK && n > 0,
+               "region_count: returns a non-empty map");
+    test_check(axl_mem_phys_region_get(0, NULL) == AXL_ERR,
+               "region_get: NULL out -> AXL_ERR");
+    AxlMemRegion tmp;
+    test_check(axl_mem_phys_region_get(n, &tmp) == AXL_ERR,
+               "region_get: index == count -> AXL_ERR");
+
+    bool     ordered = true;
+    size_t   ram_cnt = 0, mmio_cnt = 0;
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < n; i++) {
+        AxlMemRegion r;
+        if (axl_mem_phys_region_get(i, &r) != AXL_OK) { ordered = false; break; }
+        if (r.len == 0)                     ordered = false;
+        if ((uint64_t)r.base < prev_end)    ordered = false;   /* ascending, non-overlapping */
+        prev_end = (uint64_t)r.base + r.len;
+        if (r.type == AXL_MEM_REGION_RAM)   ram_cnt++;
+        if (r.type == AXL_MEM_REGION_MMIO)  mmio_cnt++;
+    }
+    test_check(ordered, "region map: ascending, non-overlapping, len>0");
+    test_check(ram_cnt >= 1, "region map: >=1 RAM region");
+    test_check(mmio_cnt >= 1, "region map: >=1 MMIO region (from GCD)");
+
+    // --- region_at classification ---
+    AxlMemRegion r;
+    test_check(axl_mem_phys_region_at(ram, NULL) == AXL_ERR,
+               "region_at: NULL out -> AXL_ERR");
+    test_check(axl_mem_phys_region_at(ram, &r) == AXL_OK
+               && r.type == AXL_MEM_REGION_RAM
+               && (uint64_t)r.base <= ram
+               && ram < (uint64_t)r.base + r.len,
+               "region_at: heap page is RAM, bounds bracket it");
+    test_check(axl_mem_phys_region_at(MEM_UNMAPPED_HI, &r) == AXL_OK
+               && r.type == AXL_MEM_REGION_UNMAPPED,
+               "region_at: address above RAM is UNMAPPED");
+
+    // --- is_accessible ---
+    test_check(axl_mem_phys_is_accessible(ram, 16, false),
+               "is_accessible: RAM read OK");
+    test_check(axl_mem_phys_is_accessible(ram, 16, true),
+               "is_accessible: RAM write OK");
+    test_check(!axl_mem_phys_is_accessible(MEM_UNMAPPED_HI, 16, false),
+               "is_accessible: UNMAPPED refused");
+    test_check(!axl_mem_phys_is_accessible(ram, 0, false),
+               "is_accessible: len 0 -> false");
+    test_check(!axl_mem_phys_is_accessible(UINTPTR_MAX - 3, 16, false),
+               "is_accessible: address-space overflow -> false");
+
+    // --- read_range / write_range (incl. the no-fault guards) ---
+    uint8_t src[16], dst[16];
+    for (int i = 0; i < 16; i++) { src[i] = (uint8_t)(0xA0 + i); dst[i] = 0; }
+    test_check(axl_mem_phys_read_range(ram, 16, NULL, 1) == AXL_ERR,
+               "read_range: NULL buf -> AXL_ERR");
+    test_check(axl_mem_phys_read_range(ram, 8, dst, 3) == AXL_ERR,
+               "read_range: bad width 3 -> AXL_ERR");
+    test_check(axl_mem_phys_read_range(ram, 6, dst, 4) == AXL_ERR,
+               "read_range: len not a multiple of width -> AXL_ERR");
+    test_check(axl_mem_phys_read_range(ram + 1, 8, dst, 4) == AXL_ERR,
+               "read_range: misaligned width-4 -> AXL_ERR (no fault)");
+    test_check(axl_mem_phys_read_range(MEM_UNMAPPED_HI, 16, dst, 1) == AXL_ERR,
+               "read_range: UNMAPPED span -> AXL_ERR (no fault)");
+    test_check(axl_mem_phys_write_range(ram, 16, src, 1) == AXL_OK,
+               "write_range: 16 bytes width-1 to RAM OK");
+    test_check(axl_mem_phys_read_range(ram, 16, dst, 1) == AXL_OK
+               && axl_memcmp(dst, src, 16) == 0,
+               "read_range: round-trips what write_range wrote");
+    for (int i = 0; i < 16; i++) dst[i] = 0;
+    test_check(axl_mem_phys_read_range(ram, 8, dst, 4) == AXL_OK
+               && axl_memcmp(dst, src, 8) == 0,
+               "read_range: width-4 aligned read matches");
+    test_check(axl_mem_phys_write_range(MEM_UNMAPPED_HI, 16, src, 1) == AXL_ERR,
+               "write_range: UNMAPPED span -> AXL_ERR (no fault)");
+    test_check(axl_mem_phys_write_range(ram, 8, src, 3) == AXL_ERR,
+               "write_range: bad width -> AXL_ERR");
+
+    // --- policy (least-limiting default + opt-in restriction) ---
+    AxlMemAccessPolicy pol;
+    test_check(axl_mem_phys_get_policy(NULL) == AXL_ERR,
+               "get_policy: NULL out -> AXL_ERR");
+    test_check(axl_mem_phys_get_policy(&pol) == AXL_OK
+               && pol.readable_types == AXL_MEM_ACCESS_ALL_MAPPED
+               && pol.writable_types == AXL_MEM_ACCESS_ALL_MAPPED,
+               "get_policy: default permits all mapped types");
+    AxlMemAccessPolicy deny = { .readable_types = 0, .writable_types = 0 };
+    axl_mem_phys_set_policy(&deny);
+    test_check(!axl_mem_phys_is_accessible(ram, 16, false),
+               "set_policy: empty mask denies RAM read");
+    axl_mem_phys_set_policy(NULL);   /* restore permissive default */
+    test_check(axl_mem_phys_is_accessible(ram, 16, false),
+               "set_policy(NULL): restores permissive default");
+
+    axl_free_pages(pg, 1);
+}
+
+// ---------------------------------------------------------------------------
+// axl_sys_get_memory_size — pins the usable-RAM byte total to an independent
+// EFI-memory-map walk, so the DRY refactor onto the region map can't silently
+// change the count.
+// ---------------------------------------------------------------------------
+
+static void
+test_get_memory_size(void)
+{
+    size_t map_size = 0, map_key = 0, desc_size = 0;
+    UINT32 desc_ver = 0;
+    if (gBS->GetMemoryMap(&map_size, NULL, &map_key, &desc_size, &desc_ver)
+            != EFI_BUFFER_TOO_SMALL || desc_size == 0) {
+        axl_printf("SKIP: get_memory_size (GetMemoryMap unavailable)\n");
+        test_check(true, "get_memory_size: SKIP balance");
+        test_check(true, "get_memory_size: SKIP balance");
+        return;
+    }
+    map_size += desc_size * 8;
+    uint8_t *map = axl_malloc(map_size);
+    test_check(map != NULL, "get_memory_size: map buffer allocated");
+    if (map == NULL) {
+        test_check(true, "get_memory_size: SKIP balance");
+        return;
+    }
+    uint64_t expected = 0;
+    if (gBS->GetMemoryMap(&map_size, (EFI_MEMORY_DESCRIPTOR *)map, &map_key,
+                          &desc_size, &desc_ver) == EFI_SUCCESS) {
+        for (size_t off = 0; off + desc_size <= map_size; off += desc_size) {
+            EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(map + off);
+            switch (d->Type) {
+            case EfiLoaderCode:        case EfiLoaderData:
+            case EfiBootServicesCode:  case EfiBootServicesData:
+            case EfiConventionalMemory:
+                expected += d->NumberOfPages * 4096ULL;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    axl_free(map);
+
+    uint64_t got = 0;
+    test_check(axl_sys_get_memory_size(&got) == AXL_OK && got == expected,
+               "get_memory_size: matches the EFI-map usable-RAM sum");
+}
+
+// ---------------------------------------------------------------------------
+// axl_io_region_* + is_io_accessible + io_read/write_range
+// ---------------------------------------------------------------------------
+//
+// The I/O-space sibling of the memory region map. Classification is cross-arch
+// (the GCD I/O map; typically empty on AArch64). Port access is x86-only, and
+// reading a port has side effects, so we assert only the classification + the
+// argument/gating contract (all deterministic AXL_OK/AXL_ERR on both arches) —
+// not a live port read. A port far above the 64 KiB port space is a known
+// UNMAPPED address.
+//
+#define IO_UNMAPPED_HI ((uintptr_t)0x0000000100000000ULL)  /* 4 GiB — beyond I/O space */
+
+static void
+test_io_region(void)
+{
+    size_t n = 0;
+    test_check(axl_io_region_count(NULL) == AXL_ERR,
+               "io_region_count: NULL out -> AXL_ERR");
+    test_check(axl_io_region_count(&n) == AXL_OK,
+               "io_region_count: returns a map");
+    test_check(axl_io_region_get(0, NULL) == AXL_ERR,
+               "io_region_get: NULL out -> AXL_ERR");
+    AxlIoRegion tmp;
+    test_check(axl_io_region_get(n, &tmp) == AXL_ERR,
+               "io_region_get: index == count -> AXL_ERR");
+
+    bool     ordered = true;
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < n; i++) {
+        AxlIoRegion r;
+        if (axl_io_region_get(i, &r) != AXL_OK) { ordered = false; break; }
+        if (r.len == 0)                  ordered = false;
+        if ((uint64_t)r.base < prev_end) ordered = false;
+        prev_end = (uint64_t)r.base + r.len;
+    }
+    test_check(ordered, "io_region map: ascending, non-overlapping, len>0");
+
+    AxlIoRegion r;
+    test_check(axl_io_region_at(0x60, NULL) == AXL_ERR,
+               "io_region_at: NULL out -> AXL_ERR");
+    test_check(axl_io_region_at(0x60, &r) == AXL_OK,
+               "io_region_at: returns a containing range");
+    test_check(axl_io_region_at(IO_UNMAPPED_HI, &r) == AXL_OK
+               && r.type == AXL_IO_REGION_UNMAPPED,
+               "io_region_at: port above I/O space is UNMAPPED");
+
+    test_check(!axl_io_is_accessible(IO_UNMAPPED_HI, 4, false),
+               "is_io_accessible: UNMAPPED port refused");
+    test_check(!axl_io_is_accessible(0x60, 0, false),
+               "is_io_accessible: len 0 -> false");
+
+    uint8_t buf[8] = {0};
+    test_check(axl_io_read_range(0x60, 4, NULL, 1) == AXL_ERR,
+               "io_read_range: NULL buf -> AXL_ERR");
+    test_check(axl_io_read_range(0x60, 4, buf, 3) == AXL_ERR,
+               "io_read_range: bad width 3 -> AXL_ERR");
+    test_check(axl_io_read_range(0x60, 6, buf, 4) == AXL_ERR,
+               "io_read_range: len not a multiple of width -> AXL_ERR");
+    test_check(axl_io_read_range(IO_UNMAPPED_HI, 4, buf, 1) == AXL_ERR,
+               "io_read_range: UNMAPPED span -> AXL_ERR");
+    test_check(axl_io_write_range(0x60, 4, buf, 3) == AXL_ERR,
+               "io_write_range: bad width -> AXL_ERR");
+    test_check(axl_io_write_range(IO_UNMAPPED_HI, 4, buf, 1) == AXL_ERR,
+               "io_write_range: UNMAPPED span -> AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
 // axl_watchdog_*
 // ---------------------------------------------------------------------------
 
@@ -3418,6 +3660,9 @@ test_platform_main(int argc, char **argv)
     /* R+3 */
     test_mem_phys();
     test_mem_phys_round_trip();
+    test_mem_region();
+    test_get_memory_size();
+    test_io_region();
     test_watchdog();
     test_rng();
 

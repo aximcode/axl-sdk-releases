@@ -1323,6 +1323,76 @@ test_piece_tree_open_cached(void)
     axl_file_delete(CACHED_PATH_B);
 }
 
+// ---- B2: encoding-aware load sharing a page cache ----
+
+#define ENCC_PATH_A "fs0:\\axl_pt_enccA.tmp"
+#define ENCC_PATH_B "fs0:\\axl_pt_enccB.tmp"
+#define ENCC_PATH_U "fs0:\\axl_pt_enccU.tmp"
+
+static void
+test_piece_tree_load_encoded_cached(void)
+{
+    /* Two plain-UTF-8 (no-BOM) files open out-of-core through ONE shared
+       cache; a UTF-16 file routes through the resident transcode branch,
+       which ignores the cache but must still decode correctly. */
+    if (axl_file_set_contents(ENCC_PATH_A, "alpha\nbeta\n", 11) != AXL_OK) {
+        axl_printf("SKIP: load_encoded_cached (fs0: not writable)\n");
+        return;
+    }
+    (void)axl_file_set_contents(ENCC_PATH_B, "one\ntwo\nthree\n", 14);
+    /* UTF-16 LE BOM "hi" */
+    const unsigned char u16le[] = { 0xFF, 0xFE, 'h', 0x00, 'i', 0x00 };
+    (void)axl_file_set_contents(ENCC_PATH_U, u16le, sizeof(u16le));
+
+    AxlPageCache *cache = axl_page_cache_new_shared(4096, 4);
+    test_check(cache != NULL, "load_encoded_cached: shared cache");
+
+    AxlEncoding ea = AXL_ENC_ASCII, eb = AXL_ENC_ASCII, eu = AXL_ENC_ASCII;
+    bool ba = true, bb = true, bu = false;
+    AxlPieceTree *a = axl_piece_tree_load_encoded_cached(ENCC_PATH_A, cache, &ea, &ba);
+    AxlPieceTree *b = axl_piece_tree_load_encoded_cached(ENCC_PATH_B, cache, &eb, &bb);
+    test_check(a != NULL && b != NULL, "load_encoded_cached: two docs share one cache");
+    test_check(ea == AXL_ENC_UTF8 && !ba, "load_encoded_cached: A utf8 no-bom");
+    test_check(eb == AXL_ENC_UTF8 && !bb, "load_encoded_cached: B utf8 no-bom");
+    test_check(pt_content_is(a, (const uint8_t *)"alpha\nbeta\n", 11),
+               "load_encoded_cached: A content via shared cache");
+    test_check(pt_content_is(b, (const uint8_t *)"one\ntwo\nthree\n", 14),
+               "load_encoded_cached: B content via shared cache");
+    test_check(!axl_piece_tree_is_modified(a) && !axl_piece_tree_is_modified(b),
+               "load_encoded_cached: both start clean");
+
+    /* edits stay independent across the shared frame pool */
+    test_check(axl_piece_tree_insert(a, 0, "X", 1) == AXL_OK, "load_encoded_cached: edit A");
+    test_check(pt_content_is(a, (const uint8_t *)"Xalpha\nbeta\n", 12),
+               "load_encoded_cached: A reflects edit");
+    test_check(pt_content_is(b, (const uint8_t *)"one\ntwo\nthree\n", 14),
+               "load_encoded_cached: B unaffected by A's edit");
+
+    /* UTF-16 resident branch decodes correctly through the cached entry */
+    AxlPieceTree *u = axl_piece_tree_load_encoded_cached(ENCC_PATH_U, cache, &eu, &bu);
+    test_check(u != NULL, "load_encoded_cached: utf16 via cached loader");
+    test_check(eu == AXL_ENC_UCS2_LE && bu, "load_encoded_cached: utf16le bom reported");
+    test_check(pt_content_is(u, (const uint8_t *)"hi", 2),
+               "load_encoded_cached: utf16 decoded to utf8");
+
+    /* NULL-arg rejection */
+    test_check(axl_piece_tree_load_encoded_cached(NULL, cache, NULL, NULL) == NULL,
+               "load_encoded_cached: NULL path -> NULL");
+    test_check(axl_piece_tree_load_encoded_cached(ENCC_PATH_A, NULL, NULL, NULL) == NULL,
+               "load_encoded_cached: NULL cache -> NULL");
+
+    axl_piece_tree_free(a);
+    test_check(pt_content_is(b, (const uint8_t *)"one\ntwo\nthree\n", 14),
+               "load_encoded_cached: B reads after sibling freed");
+    axl_piece_tree_free(b);
+    axl_piece_tree_free(u);
+    axl_page_cache_free(cache);   /* caller owns the shared cache */
+
+    axl_file_delete(ENCC_PATH_A);
+    axl_file_delete(ENCC_PATH_B);
+    axl_file_delete(ENCC_PATH_U);
+}
+
 // ---- A3: save-over-the-open-file (rebase) + Save-As recipes ----
 
 #define SOS_PATH "fs0:\\axl_pt_sos.tmp"
@@ -1419,6 +1489,7 @@ test_piece_tree_main(int argc, char **argv)
     test_piece_tree_read_only();
     test_piece_tree_backing_changed();
     test_piece_tree_open_cached();
+    test_piece_tree_load_encoded_cached();
     test_piece_tree_save_over_self();
 
     return test_print_results();

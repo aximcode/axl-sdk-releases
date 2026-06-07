@@ -138,6 +138,35 @@ axl_loop_is_running(
 );
 
 /**
+ * @brief Control whether a bare Ctrl-C quits the loop.
+ *
+ * By default (true) the loop treats a modifier-less Ctrl-C
+ * (`UnicodeChar == 0x03, KeyShiftState == 0` — what a serial/TerminalDxe
+ * console emits) and the shell break event as "quit the loop". A GUI app
+ * that wants Ctrl+C for its own use (an editor mapping it to Copy) sets
+ * this @c off: the 0x03 byte is then delivered to the app's keypress
+ * source instead, and the shell break event is ignored. The app is then
+ * responsible for its own exit affordance (a Quit command / Ctrl+Q).
+ *
+ * @note Modified-bit Ctrl+C (a real keyboard reporting the CTRL state)
+ *     was never intercepted and is unaffected by this flag.
+ */
+void
+axl_loop_set_intercept_break(
+    AxlLoop *loop,        ///< event loop
+    bool     intercept    ///< true (default) = Ctrl-C quits; false = deliver
+);
+
+/**
+ * @brief Query the Ctrl-C intercept flag (see
+ *     axl_loop_set_intercept_break).
+ */
+bool
+axl_loop_intercept_break(
+    AxlLoop *loop  ///< event loop
+);
+
+/**
  * @brief Add a cleanup callback fired on exit (FIFO order).
  */
 void

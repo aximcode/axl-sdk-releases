@@ -98,6 +98,11 @@ struct AxlLoop {
     // Event sources
     bool            running;
     bool            quit_requested;
+    /* When false, the loop does NOT treat a bare Ctrl-C (UnicodeChar=0x03,
+     * KeyShiftState=0) or the shell break event as "quit"; the 0x03 byte is
+     * delivered to the keypress source instead.  A GUI app (e.g. an editor
+     * that maps Ctrl+C to Copy) sets this off.  Default true. */
+    bool            intercept_break;
     LoopSource      sources[AXL_MAX_SOURCES];
     size_t          source_count;
     uint32_t        next_id;

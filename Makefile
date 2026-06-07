@@ -275,6 +275,7 @@ LIB_SOURCES = \
     src/util/axl-image.c \
     src/util/axl-cpu.c \
     src/util/axl-mem-phys.c \
+    src/util/axl-mem-region.c \
     src/util/axl-watchdog.c \
     src/util/axl-rng.c \
     src/util/axl-rand.c \

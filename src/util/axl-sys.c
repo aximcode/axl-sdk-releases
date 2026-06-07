@@ -8,6 +8,7 @@
 #include "../backend/axl-backend.h"
 #include "axl-protocol-internal.h"
 #include <axl/axl-sys.h>
+#include <axl/axl-mem-region.h>
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-fs.h>
@@ -181,65 +182,32 @@ axl_sys_get_memory_size(
     uint64_t *total_bytes
     )
 {
-    EFI_STATUS             status;
-    size_t                  map_size = 0;
-    size_t                  map_key;
-    size_t                  desc_size;
-    UINT32                 desc_ver;
-    uint8_t               *map = NULL;
-    uint64_t               total = 0;
-
     if (total_bytes == NULL) {
         return AXL_ERR;
     }
 
-    /* First call: get required size */
-    status = axl_bs()->GetMemoryMap(
-        &map_size, (EFI_MEMORY_DESCRIPTOR *)NULL,
-        &map_key, &desc_size, &desc_ver);
-
-    if (status != EFI_BUFFER_TOO_SMALL) {
+    /* Sum the usable-RAM regions from the shared physical region map
+       (axl-mem-region) rather than walking the EFI memory map a second
+       time. AXL_MEM_REGION_RAM covers the usable types this used to sum
+       directly (Loader, BootServices, Conventional) plus any GCD system
+       memory the EFI map omits — normally the same bytes. A unit test pins
+       the total to an independent EFI-map walk on the test platform. */
+    size_t count = 0;
+    if (axl_mem_phys_region_count(&count) != AXL_OK) {
         return AXL_ERR;
     }
 
-    /* Add slack for map growth between calls */
-    map_size += desc_size * 4;
-    map = (uint8_t *)axl_malloc(map_size);
-    if (map == NULL) {
-        axl_error(
-            "axl_sys_get_memory_size: OOM allocating %zu-byte memory map buffer",
-            map_size
-            );
-        return AXL_ERR;
-    }
-
-    status = axl_bs()->GetMemoryMap(
-        &map_size, (EFI_MEMORY_DESCRIPTOR *)map,
-        &map_key, &desc_size, &desc_ver);
-
-    if (EFI_ERROR(status)) {
-        axl_free(map);
-        return AXL_ERR;
-    }
-
-    /* Sum usable memory regions */
-    for (size_t off = 0; off < map_size; off += desc_size) {
-        EFI_MEMORY_DESCRIPTOR *desc = (EFI_MEMORY_DESCRIPTOR *)(map + off);
-
-        switch (desc->Type) {
-        case EfiLoaderCode:
-        case EfiLoaderData:
-        case EfiBootServicesCode:
-        case EfiBootServicesData:
-        case EfiConventionalMemory:
-            total += desc->NumberOfPages * 4096ULL;
-            break;
-        default:
-            break;
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        AxlMemRegion region;
+        if (axl_mem_phys_region_get(i, &region) != AXL_OK) {
+            return AXL_ERR;
+        }
+        if (region.type == AXL_MEM_REGION_RAM) {
+            total += region.len;
         }
     }
 
-    axl_free(map);
     *total_bytes = total;
     return AXL_OK;
 }

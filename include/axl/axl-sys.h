@@ -291,9 +291,14 @@ axl_sys_get_firmware_info(
 );
 
 /**
- * @brief Get total usable memory size in bytes.
+ * @brief Get total usable RAM in bytes.
  *
- * Queries the firmware memory map and sums all usable regions.
+ * Sums the @c AXL_MEM_REGION_RAM regions of the shared physical region map
+ * (`<axl/axl-mem-region.h>`) — usable system memory (conventional, loader,
+ * and boot-services memory). On firmware where the GCD reports system-memory
+ * ranges the EFI memory map omits, those count too, so this is the total
+ * physically-present usable RAM; in the common case the two sources agree
+ * (a unit test pins this equality on the test platform).
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */
