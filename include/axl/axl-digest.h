@@ -163,6 +163,60 @@ axl_compute_checksum_digest(
     size_t          out_len  ///< output buffer size
 );
 
+// ---------------------------------------------------------------------------
+// Rolling 32-bit checksums (CRC-32 / Adler-32)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Update a running CRC-32 (gzip / zlib / PNG polynomial).
+ *
+ * Computes the CRC-32 of @p data and folds it into @p crc, returning
+ * the new running value. Matches zlib's `crc32()` contract exactly:
+ * seed the first call with 0, chain the result through subsequent
+ * calls, and the final return is the CRC-32 of the concatenated input.
+ *
+ * @code
+ * uint32_t crc = axl_crc32(0, NULL, 0);   // 0 — the seed
+ * crc = axl_crc32(crc, part1, len1);
+ * crc = axl_crc32(crc, part2, len2);      // == CRC-32(part1 || part2)
+ * @endcode
+ *
+ * Reflected polynomial 0xEDB88320, as used by the gzip trailer.
+ * @p data may be NULL only when @p len is 0.
+ *
+ * @return the updated CRC-32 value.
+ */
+uint32_t
+axl_crc32(
+    uint32_t    crc,   ///< running CRC (0 to start)
+    const void *data,  ///< input bytes (may be NULL iff len == 0)
+    size_t      len    ///< number of bytes
+);
+
+/**
+ * @brief Update a running Adler-32 (RFC 1950 / zlib).
+ *
+ * Folds the Adler-32 of @p data into @p adler. Matches zlib's
+ * `adler32()` contract: seed the first call with 1, chain the result,
+ * and the final return is the Adler-32 of the concatenated input.
+ *
+ * @code
+ * uint32_t a = axl_adler32(1, NULL, 0);   // 1 — the seed
+ * a = axl_adler32(a, part1, len1);
+ * a = axl_adler32(a, part2, len2);        // == Adler-32(part1 || part2)
+ * @endcode
+ *
+ * @p data may be NULL only when @p len is 0.
+ *
+ * @return the updated Adler-32 value.
+ */
+uint32_t
+axl_adler32(
+    uint32_t    adler,  ///< running Adler-32 (1 to start)
+    const void *data,   ///< input bytes (may be NULL iff len == 0)
+    size_t      len     ///< number of bytes
+);
+
 #ifdef __cplusplus
 }
 #endif

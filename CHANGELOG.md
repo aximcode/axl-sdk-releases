@@ -3,6 +3,69 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.2.0 — 2026-06-08
+
+### Added
+
+- **`AxlCompress`** (`<axl/axl-compress.h>`) — DEFLATE/gzip/zlib codec
+  (`axl_compress`/`axl_decompress` + `axl_compress_writer`/`_reader` +
+  `axl_gzip_*` stream filters over `AxlStream`) backed by a vendored
+  `sdefl`/`sinfl`, with CRC-32/Adler-32 (`axl_crc32`/`axl_adler32`) in
+  AxlDigest. `tar -z` + transparent gzip auto-detect; the HF2.4 fixture
+  POST is gzipped.
+- **Hardware-fixture device replay** in `axl-emulate`: `--mac` (replay a
+  captured NIC MAC from `net.json`) and `--cpu-from-fixture` (replay CPU
+  identity from `cpu.json`: x86 vendor/family/model, aarch64 MIDR). New
+  generic `run-qemu.sh` primitives `--mac` / `--cpu` back them.
+- **HF4 SPD capture** — `mkfixture --spd` dumps SMBus DIMM SPD EEPROMs
+  to `spd/0xNN.bin` + decoded `spd.json`.
+- **`AxlTar`** (`<axl/axl-tar.h>`) — a POSIX **ustar** reader/writer
+  (create / list / extract over `AxlStream`), plus a new `tar` tool
+  (`tar c` / `t` / `x`, with `-z` gzip via AxlCompress). Archives are
+  padded to GNU tar's 10240-byte record boundary for compatibility.
+- **`AxlEdid`** (`<axl/axl-edid.h>`) — a pure VESA E-EDID base-block
+  parser (`axl_edid_parse` → vendor/product, preferred timing /
+  native mode, physical size) with no dependency on a live display.
+- **AxlGfx display / EDID accessors** (`<axl/axl-gfx.h>`) —
+  `axl_gfx_get_pixel_format` and raw-EDID `axl_gfx_get_edid`;
+  multi-output enumeration `axl_gfx_output_count` / `axl_gfx_output_get`;
+  and EDID-driven helpers `axl_gfx_set_native_mode`, `axl_gfx_get_dpi`,
+  `axl_gfx_scale_for_dpi`, and `axl_gfx_recommended_scale`. (EDID-present
+  paths are real-hardware-only; QEMU publishes no EDID.)
+- **HF2.3 device-manifest capture** in `mkfixture` — PCI (`pci.json`),
+  USB (`usb.json` + descriptors), network (`net.json`), video
+  (`video.json` + `edid/*.bin`), and NVMe (`nvme/<n>.json`) manifests,
+  plus an **HTTP write target** (`mkfixture` can POST the fixture as a
+  tarball to an `http(s)://` destination for disk-less capture).
+
+### Changed
+
+- **`run-qemu.sh` is now a generic, HF-agnostic launcher.** All
+  hardware-fixture *platform-identity injection* moved into `axl-emulate`
+  (the fixture layer), which builds the SMBIOS/ACPI/SPD/TPM QEMU device
+  args itself — and supervises `swtpm` — passing them through
+  `run-qemu.sh`'s `--qemu-arg`. This keeps the released, multi-project
+  run-qemu.sh CLI small and confines fixture knowledge to its one
+  consumer. See `docs/AXL-Hardware-Fixture-Design.md`.
+- `run-qemu.sh --qemu-arg` now appends each value as **one literal token
+  (no word-splitting)**, so a token may contain spaces (e.g. a device
+  spec with a space in a file path). Pass one `--qemu-arg` per token.
+
+### Removed
+
+- **`run-qemu.sh` hardware-fixture flags** `--smbios-file`,
+  `--acpi-table`, `--spd`, `--tpm`/`--tpm-state`/`--tpm-model`, and
+  `--ipmi`/`--ipmi-extern`/`--ipmi-prop`. These were only ever consumed
+  by `axl-emulate` and axl-sdk's own tests (no external project used
+  them); their behavior now lives in `axl-emulate`. Use
+  `axl-emulate <fixture>` for fixture replay.
+
+### Fixed
+
+- **`axl_dir_walk`** used a hardcoded `/` path separator, which broke
+  recursion on strict UEFI volumes (the `tar` tool surfaced it). It now
+  uses the volume's separator.
+
 ## 1.1.0 — 2026-06-07
 
 ### Added

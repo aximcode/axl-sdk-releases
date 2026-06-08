@@ -61,15 +61,21 @@ boot_efi_name() {
 }
 
 # --------------------------------------------------------------------------
-# build_qemu_base_cmd <arch> <qemu_bin> <mem> <vars_file>
+# build_qemu_base_cmd <arch> <qemu_bin> <mem> <vars_file> [cpu_override]
 # Outputs the base QEMU arguments (machine, CPU, memory, pflash) to stdout,
 # NUL-separated for safe consumption via mapfile -d ''.
 # Requires FW_CODE to be set by find_firmware() before calling.
 # Usage: mapfile -d '' -t cmd < <(build_qemu_base_cmd X64 /path/qemu 512M vars.fd)
+#
+# cpu_override (optional): replaces the default `-cpu` model with a
+# caller-supplied spec (HF4 --cpu-from-fixture replay, e.g.
+# "qemu64,vendor=GenuineIntel,family=6,model=42" on x86 or
+# "max,midr=0x410fd0b0" on aarch64). KVM stays enabled when usable — the
+# guest CPUID/MIDR is synthesised from the chosen model + overrides.
 # --------------------------------------------------------------------------
 
 build_qemu_base_cmd() {
-    local arch="$1" qemu_bin="$2" mem="$3" vars_file="$4"
+    local arch="$1" qemu_bin="$2" mem="$3" vars_file="$4" cpu_override="${5:-}"
 
     if [[ -z "${FW_CODE:-}" ]]; then
         log_error "build_qemu_base_cmd: FW_CODE not set (call find_firmware first)"
@@ -86,11 +92,14 @@ build_qemu_base_cmd() {
             # the device node but block read/write — `-enable-kvm` then
             # makes QEMU exit immediately with no diagnostic.
             if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-                printf '%s\0' "-enable-kvm" "-cpu" "host"
+                printf '%s\0' "-enable-kvm"
+                printf '%s\0' "-cpu" "${cpu_override:-host}"
+            elif [[ -n "$cpu_override" ]]; then
+                printf '%s\0' "-cpu" "$cpu_override"
             fi
             ;;
         AARCH64)
-            printf '%s\0' "-machine" "virt" "-cpu" "cortex-a57"
+            printf '%s\0' "-machine" "virt" "-cpu" "${cpu_override:-cortex-a57}"
             # NetworkPkg drivers (MnpDxe, Ip4Dxe, ...) gained a DEPEX on
             # gEfiRngProtocolGuid after the PixieFail CVE fix. The QEMU
             # virt machine has no hardware TRNG, so RngDxe's entry point

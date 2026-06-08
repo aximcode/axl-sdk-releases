@@ -15,12 +15,19 @@ Legend: [x] done, [ ] pending, [-] in progress
 > sections below is not kept reconciled release-by-release.
 >
 > **Recently shipped (may not be reflected in the checkboxes below):**
-> v0.22.0 — gfx present pipeline, AxlCpu SIMD, AxlNTree/AxlTree, AxlTransform
-> consolidation; v0.23.0 — `axl_gfx_blit_rect`, nested JSON object reader;
 > v0.24.0 — AxlPieceTree editor substrate, AxlShm, cross-app clipboard;
-> v0.25.0 (pending tag) — shared find engine (`<axl/axl-find.h>`:
-> AxlByteReader / AxlMatch / `axl_find_in_source`, `axl_text_buffer_find`).
-> Unit tests now total **5321 both arches** (point-in-time counts quoted in
+> v0.25.0 work (shared find engine `<axl/axl-find.h>`) merged forward;
+> **v1.0.0 (first stable release)** — AxlCompositor (deferred surface
+> compositor) + AxlCursor + AxlGfxRegion, AxlRegex (linear-time, ReDoS-free
+> regex), UEFI driver authoring (`axl_protocol_install` + `AxlDriverBinding`),
+> AxlBytes / AxlHmac / AxlRand; **v1.0.1** — CI/lint fixes;
+> **v1.1.0** — AxlMemRegion + AxlIoRegion (physical / I-O region map +
+> fault-safe range access over the EFI map + PI GCD), AxlRegex `{n,m}`
+> bounded repetition, `axl_loop_set_intercept_break`. The **AGT Phase-0
+> substrate** (compositor / cursor / `axl-input` / gfx gap closure / region
+> maps) has shipped — the AGT Phase 0 checkboxes below are now ticked.
+> A `scripts/cut-release.sh` automates the release cut (see docs/RELEASING.md).
+> Unit tests now total **6097 both arches** (point-in-time counts quoted in
 > older sections below are historical).
 
 ---
@@ -1132,20 +1139,23 @@ vendor C++ app → AGT (C++) → axlmm + axl-gfx + axl-input → axl
 
 Phased plan (see [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md) §"Implementation plan"):
 
-- **Phase 0 (axl-sdk, 2–4 wks)** — substrate work:
-  - [ ] `axl-gfx` gap closure: clipping, double-buffer, alpha
-        blending, line/outline, font metrics API (vblank-aware
-        present deferred — UEFI GOP exposes no vblank API and AGT
-        v0.1 has no animation consumer; see
-        [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md))
-  - [ ] New `axl-input` module (`src/input/`, `<axl/axl-input.h>`):
-        unified `AxlInputEvent` type shipped in Phase 0g.  Source
-        registration reuses `axl-loop`'s existing pattern — mouse
-        via `axl_input_attach_mouse` (wraps `axl_loop_add_event` +
-        `EFI_SIMPLE_POINTER_PROTOCOL`), keyboard via
-        `axl_input_attach_key` (wraps `axl_loop_add_key_press`).
-        No parallel event queue — DRY with axl-loop's dispatch
-        machinery.
+- **Phase 0 (axl-sdk) — DONE** (shipped through v1.1.0; far beyond the
+  original substrate scope — added a full deferred compositor, cursor,
+  region maps, and frame-clock animation):
+  - [x] `axl-gfx` gap closure: clipping (`axl_gfx_push_clip_*`), alpha /
+        blend modes, line/outline + path stroke, gradients, font metrics,
+        present pipeline (`axl_gfx_buffer_present_rect`), affine/transform
+        rendering, SIMD kernels. (vblank-aware present still deferred — UEFI
+        GOP exposes no vblank API; frame callbacks throttle to present
+        instead — see [`AGT-Design.md`](https://github.com/aximcode/agt/blob/main/docs/AGT-Design.md).) Plus **AxlCompositor**
+        (deferred surface scene graph), **AxlCursor**, **AxlGfxRegion**.
+  - [x] New `axl-input` module (`src/input/`, `<axl/axl-input.h>`): unified
+        `AxlInputEvent`; `axl_input_attach_mouse` / `_attach_key` /
+        `_detach_*` over `axl-loop`'s dispatch (no parallel queue); live
+        keyboard modifiers on pointer events; click-gesture recognizer.
+  - [x] **Region maps for the live-memory editor**: `AxlMemRegion` +
+        `AxlIoRegion` (`<axl/axl-mem-region.h>`) — classify physical /
+        I-O space + fault-safe range access (v1.1.0).
 - **Phase 1 (axl-sdk, 1–2 wks)** — CPP1 toolchain validation
   (priority raised; AGT depends on it)
 - **Phase 2 (parallel, 2–3 mo)** — AGT bootstrap in `aximcode/agt`
@@ -1349,6 +1359,10 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 - [x] memspd.efi — DDR4/DDR5 SPD reader on AxlSpd
       (Phase B3, JEDEC ids JSON5 sidecar via `axl_spd_ids_*`)
 - [x] cat.efi — concatenate files to stdout
+- [x] tar.efi — ustar create/list/extract on AxlTar (`<axl/axl-tar.h>`);
+      directories recurse, extract sanitizes member names (relativize +
+      UEFI separators + `..` guard). Compressed archives (`-z`) pending
+      AxlCompress (see below).
 
 ### Host Tools (scripts/)
 
@@ -1377,6 +1391,53 @@ UEFI command-line utilities built on AXL, plus host-side developer tools.
 
 ---
 
+## Compression — AxlCompress (Future, designed 2026-06-07)
+
+Follow-on to AxlTar / the `tar` tool / the HF2.4 HTTP write target. Today
+AxlTar is uncompressed-ustar-only; almost all real tar is gzip'd, and the
+HF2.4 fixture POST would shrink with gzip. There is currently **no
+DEFLATE encoder and no public CRC32/adler32** in AXL (an inflate
+*decoder* is bundled inside `deps/stb/stb_image.h` for PNG, but it is
+static/decode-only and entangled in stb).
+
+**Design (decided in discussion):**
+- New module `<axl/axl-compress.h>` in `src/data/` with an
+  `AxlCompressFormat` enum — `GZIP` / `ZLIB` / `DEFLATE_RAW` to start,
+  room for `LZ4` later. **zstd / xz deliberately deferred** (huge
+  encoders; not worth it for a UEFI tool until a real need appears).
+- **Vendor a compact public-domain single-header** for the codec —
+  `sdefl` + `sinfl` (≈1K lines, encode + decode, unlicense/MIT-0,
+  Apache-compatible) under `deps/`, mirroring the stb/freetype pattern.
+  (Chosen over untangling stb's decode-only inflate.)
+- **Architecture: stream filters over AxlStream, orthogonal to tar** —
+  `axl_gzip_reader(AxlStream*)` (reads compressed → plaintext) /
+  `axl_gzip_writer(AxlStream*)` (compresses on write, finalizes on
+  close). Then tar.gz / HTTP gzip / file compression / the fixture-POST
+  upload all compose for free. Plus one-shot helpers
+  `axl_compress(fmt, in, n, &out, &out_n, level)` / `axl_decompress(...)`.
+- **CRC32 + adler32 → AxlDigest** (`<axl/axl-digest.h>`) — gzip needs
+  CRC32, zlib needs adler32; both broadly useful beyond compression.
+- The **encoder is the real work** (decode is largely solved); vendoring
+  sdefl makes it tractable. Per-tool code size ~10–20 KB — acceptable.
+
+**Slices:**
+- [x] AxlCompress codec module (gzip/zlib/raw via vendored sdefl/sinfl) +
+      CRC32/adler32 in AxlDigest + stream filters + one-shot. Test-first:
+      pure round-trip + **GNU `gzip`/`gunzip` interop** (our output
+      gunzips; we inflate host gzip) — mirrors AxlTar's GNU-tar interop.
+      DONE: `<axl/axl-compress.h>` (`axl_compress`/`axl_decompress` +
+      `axl_compress_writer`/`_reader` + `axl_gzip_*`), `axl_crc32`/
+      `axl_adler32` in AxlDigest, vendored `deps/sdefl`. CRC/Adler verified
+      on decode; untrusted-input hardened (8-byte refill pad, gzip optional-
+      field skip, 512 MiB output cap).
+- [x] `tar -z` (gzip) + **gzip auto-detect** (magic `1f 8b`) on
+      list/extract so `tar -x` "just works" on a `.tar.gz`. DONE — full
+      GNU interop in test-tar-qemu.sh (`gzip -t` / `tar -tzf` / `tar -xzO`
+      out; host `.tar.gz` in via auto-detect).
+- [x] Optional: gzip the HF2.4 fixture-POST tarball (smaller upload).
+      DONE — mkfixture URL mode POSTs `application/gzip` (~9x smaller);
+      test-mkfixture-post-qemu.sh asserts `gzip -t` validity.
+
 ## Hardware Fixture Capture & Replay (Future)
 
 Vendor-neutral capture-and-replay of UEFI platform identity
@@ -1399,26 +1460,24 @@ on the existing virtiofsd handling.
 
 Full design: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md).
 
-### Phase HF1: run-qemu.sh low-level flags
+### Phase HF1: run-qemu.sh low-level flags — DONE (commit 773eebca)
 
-- [ ] `--smbios-file FILE` → `-smbios file=FILE`
-- [ ] `--acpi-table FILE` (repeatable) → `-acpitable file=FILE`
-- [ ] `--spd ADDR:FILE` (repeatable) → `memory-backend-file` +
-      `smbus-eeprom,memdev=` (depends on existing patched QEMU;
-      probe and error clearly when absent; aa64 warn-and-skip)
-- [ ] `--tpm` / `--tpm-state DIR` /
-      `--tpm-model tpm-tis|tpm-crb|tpm-tis-device`
-      → spawn swtpm (raw state passthrough; captured-fixture
-      seeding deferred to HF5) and wire `-tpmdev emulator` + tpm
-      device. Arch-aware default model
-      (tpm-tis on x64, tpm-tis-device on aa64; tpm-crb is x86-only).
-      swtpm absent on PATH ⇒ hard error with install hint.
-- [ ] **NOT a new flag**: IPMI is already covered by the existing
-      `--ipmi` / `--ipmi-extern` / `--ipmi-prop` in run-qemu.sh;
-      no `--ipmi-sim` alias added.
-- [ ] Hand-craft first fixture from the Proxmox dev VM
-      (`dmidecode --dump-bin`, `acpidump -b`) to validate replay
-      path before writing the capture tool.
+- [x] `--smbios-file FILE` → `-smbios file=FILE`
+- [x] `--acpi-table FILE` (repeatable) → `-acpitable file=FILE`
+- [x] `--spd ADDR:FILE` (repeatable) → `memory-backend-file` +
+      `smbus-eeprom,memdev=` (uses `scripts/qemu-patches/0001-smbus-eeprom-
+      add-memdev-link.patch`; errors clearly when absent; aa64 warn-and-skip)
+- [x] `--tpm` / `--tpm-state DIR` /
+      `--tpm-model tpm-tis|tpm-crb|tpm-tis-device` → spawn swtpm (raw state
+      passthrough; captured-fixture seeding deferred to HF5), wire
+      `-tpmdev emulator` + tpm device, arch-aware default model. swtpm absent
+      ⇒ hard error with install hint.
+- [x] **NOT a new flag**: IPMI is already covered by run-qemu.sh's existing
+      `--ipmi` / `--ipmi-extern` / `--ipmi-prop`.
+- [x] Replay path validated end-to-end by `test/integration/test-axl-emulate.sh`
+      (47 checks). HF1's own flag tests are in `test/integration/test-run-qemu-flags.sh`.
+      **GAP: that test is NOT yet wired into `.github/workflows/ci.yml`** — a quick
+      follow-up to CI-gate the HF1 flags.
 
 ### Phase HF2: mkfixture.efi (manifest-grade UEFI walks)
 
@@ -1448,30 +1507,54 @@ JSON manifests; HF2.3 adds alternative write targets.
       so tools can do one-shot config-table lookups without
       duplicating the EFI Configuration Table walk
 
-**HF2.3 — TODO** (manifest expansion):
-- [ ] Enumerate PCI via `EFI_PCI_IO_PROTOCOL`, write `pci.json`
-      (VID/DID/class/subsys/BARs) — manifest only, not replayed
-- [ ] Walk USB via `EFI_USB_IO_PROTOCOL` + `EFI_USB2_HC_PROTOCOL`,
-      write `usb.json` (topology, VID/PID, class/subclass/protocol,
-      strings) and per-device descriptor blobs in `usb/*.bin`
-- [ ] Walk GOP/EDID via `EFI_GRAPHICS_OUTPUT_PROTOCOL` +
-      `EFI_EDID_DISCOVERED_PROTOCOL`, write `video.json` (mode list,
-      current mode, FB base, pixel format) and `edid/*.bin` per
-      display; GPU option ROM (`gpu-rom/*.bin`) on-demand only
-- [ ] Network details: per-NIC MAC + link state via
-      `EFI_SIMPLE_NETWORK_PROTOCOL`, SR-IOV VF count from PCIe
-      extended config, write `net.json`
-- [ ] NVMe capture: per-controller Identify Controller / Identify
-      Namespace via `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`, write
-      `nvme/<bdf>.json` (manifest only — replay is HF9 patch
-      candidate)
+**HF2.3 — DONE** (manifest expansion): `fixture_format` bumped to
+`"HF2.3"`. Each captured manifest-only (not replayed; the device-replay
+flags land with HF4+). Exercised by `test-mkfixture-qemu.sh` against
+QEMU's emulated devices (capture run = `--mount --bridges --net --gpu`
+plus an `-device nvme`).
+- [x] Enumerate PCI (AxlPci / ECAM), write `pci.json`
+      (VID/DID/class/subsys/BARs/header type)
+- [x] Walk USB (AxlUsb `EFI_USB_IO` tree), write `usb.json` (topology
+      depth, VID/PID, class triplet, strings) + per-device raw
+      config-descriptor blobs in `usb/<bus>-<addr>.bin`
+- [x] Walk GOP (AxlGfx) + EDID, write `video.json` (mode list, current
+      mode, FB base, pixel format) and `edid/<n>.bin` per display.
+      `EFI_EDID_DISCOVERED_PROTOCOL` added manifest-first. GPU option
+      ROM deferred. (EDID-blob path real-HW-only — QEMU std VGA
+      publishes no EDID.)
+- [x] Network: per-NIC MAC + link state via `EFI_SIMPLE_NETWORK`,
+      deduped by permanent MAC, write `net.json`. (SR-IOV VF count
+      deferred — needs an SNP-handle→PCI-BDF correlation.)
+- [x] NVMe: per-controller Identify Controller + per active-namespace
+      Identify Namespace via `EFI_NVM_EXPRESS_PASS_THRU` (hand-written
+      in `axl-uefi-extra.h`), write `nvme/<n>.json` (manifest only —
+      replay is an HF9 patch candidate). Filename uses the enumeration
+      index; BDF correlation (BuildDevicePath) deferred.
 
-**HF2.4 — TODO** (alternative write targets):
-- [ ] Support write targets: local FS (`fs0:\fixtures\...`) is the
-      default and shipped in HF2.1; add virtiofs `--mount` and
-      HTTP POST
+The video/EDID slice spun off a reusable **EDID + AxlGfx display layer**:
+`<axl/axl-edid.h>` (pure parser) + `axl_gfx_get_pixel_format` /
+`get_edid` / `set_native_mode` / `get_dpi` / `output_count`+`output_get`.
 
-### Phase HF3: scripts/axl-emulate (replay wrapper)
+**HF2.4 — DONE** (alternative write targets):
+- [x] Local FS (`fs0:\fixtures\...`) — default, shipped in HF2.1; also
+      reachable over a virtiofs `--mount` (the dev loop).
+- [x] HTTP POST — when the destination is an `http(s)://` URL, mkfixture
+      touches no filesystem: every artifact is appended to an in-memory
+      ustar tarball (via the new AxlTar codec, `<axl/axl-tar.h>`) and
+      POSTed to the collector at the end, so a disk-less / net-only
+      machine captures straight over the network. Tested by
+      `test/integration/test-mkfixture-post-qemu.sh` (host collector +
+      QEMU user-net). Spun off the `tar` host tool and a fix to
+      `axl_dir_walk`'s path-separator handling on strict UEFI volumes.
+
+### Phase HF3: scripts/axl-emulate (replay wrapper) — DONE for HF2.1/2.2 fixtures
+
+`scripts/axl-emulate` exists and replays SMBIOS / ACPI / SPD / TPM fixtures
+through the HF1 run-qemu flags (auto-discovery + the ACPI denylist below are
+implemented; `test/integration/test-axl-emulate.sh`, 47 checks). The
+device-manifest artifacts from **HF2.3** (PCI/USB/video/net/NVMe) are
+capture-only for now and not yet consumed by replay — those land with HF4+
+(`--usb-shim`, `--edid`, `--gpu-rom`, `--cpu-from-fixture`, `--mac`).
 
 New Python tool, ships in host-tools tarball. Wraps `run-qemu.sh`
 rather than extending it — keeps run-qemu.sh focused on QEMU
@@ -1501,22 +1584,34 @@ axl-emulate <fixture-dir> [efi-file] [args...]
 - [ ] Pass-through `--` separator: anything after lands as
       additional run-qemu.sh args (compose with `--background`,
       `-i`, `--mount`, `--gdb`, etc.)
-- [ ] **Future-phase wiring (NOT in HF3 scope)** — `--usb-shim`
-      (HF4), `--edid` / `--gpu-rom` (HF4), `--cpu-from-fixture` /
-      `--mac` (HF4), TPM event-log seeding (HF5), Secure Boot /
-      boot-vars injection (HF6), Redfish mock spawn (HF7), IPMI
-      sim spawn (HF8) all land in axl-emulate as their phases ship.
+- [x] **HF4 device-replay knobs** — `--mac` (net.json permanent MAC →
+      run-qemu.sh `--net --mac`) and `--cpu-from-fixture` (cpu.json →
+      `--cpu`: x86 vendor/family/model/stepping, aarch64 MIDR via
+      `-cpu max,midr=`) DONE. Both opt-in; QEMU primitives `--mac` /
+      `--cpu` added to run-qemu.sh. Live e2e: `test-mac-replay-qemu.sh`
+      (CI) + `test-cpu-replay-qemu.sh` (x86 CI, aa64 local).
+- [ ] **Remaining future-phase wiring** — `--usb-shim` / `--edid` /
+      `--gpu-rom` (HF4 device replay, harder — QEMU EDID/ROM injection
+      is limited), TPM event-log seeding (HF5), Secure Boot / boot-vars
+      injection (HF6), Redfish mock spawn (HF7), IPMI sim spawn (HF8)
+      land in axl-emulate as their phases ship.
 
-### Phase HF4: SPD capture
+### Phase HF4: SPD capture — DONE
 
-- [ ] Add SPD walk to `mkfixture` (NOT extending `memspd`, which
+- [x] Add SPD walk to `mkfixture` (NOT extending `memspd`, which
       stays an inspection tool — same separation argument as
       sysinfo-vs-mkfixture). Dump every populated SMBus EEPROM at
-      0x50–0x57 to `spd/0xNN.bin`
-- [ ] Validate: capture on a real box, replay via Phase HF3
-      `--fixture` path, AxlSpd output should match bit-for-bit
-- [ ] Document SmbusHcShim.efi requirement on QEMU + native ICH/PCH
-      driver expectation on real Intel platforms
+      0x50–0x57 to `spd/0xNN.bin` (+ decoded `spd.json`). Opt-in via
+      `--spd` (default off; SMBus HC / I2C master protocol required).
+- [x] Validate: bit-for-bit against an injected DDR4 blob in the
+      patched-QEMU + SmbusHcShim rig (`test-mkfixture-spd-qemu.sh`,
+      local-only). Replay already wired: axl-emulate consumes
+      `spd/0xNN.bin` → `--spd 0xNN:FILE`.
+- [x] SmbusHcShim.efi requirement documented (design doc §"Optional
+      captures"); empty `spd/` on firmwares that hide the SMBus is
+      expected, not a bug.
+- Device *replay* knobs (`--mac` / `--edid` / `--cpu-from-fixture`)
+  remain future work in axl-emulate.
 
 ### Phase HF5: TPM capture & replay
 

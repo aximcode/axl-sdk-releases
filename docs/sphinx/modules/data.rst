@@ -80,3 +80,16 @@ its parent alive. The shared currency for data flowing between
 subsystems (HTTP bodies, file contents, shared-memory segments).
 
 .. doxygenfile:: axl-bytes.h
+
+AxlCompress
+~~~~~~~~~~~
+
+DEFLATE-family compression (RFC 1951) with gzip (RFC 1952) and zlib
+(RFC 1950) framing, backed by a vendored ``sdefl``/``sinfl`` codec.
+One-shot ``axl_compress`` / ``axl_decompress`` plus stream filters
+(``axl_compress_writer`` / ``axl_compress_reader`` and the
+``axl_gzip_*`` wrappers) over ``AxlStream`` — so ``tar.gz``, HTTP gzip,
+and file compression compose for free. Integrity (CRC-32 / Adler-32)
+is verified on decode via :doc:`AxlDigest <data>`.
+
+.. doxygenfile:: axl-compress.h

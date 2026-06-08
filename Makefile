@@ -254,12 +254,15 @@ LIB_SOURCES = \
     src/data/axl-digest-md5.c \
     src/data/axl-digest-sha1.c \
     src/data/axl-digest-sha256.c \
+    src/data/axl-digest-crc.c \
+    src/data/axl-compress.c \
     src/data/axl-hmac.c \
     src/data/axl-bytes.c \
     src/stream/axl-stream.c \
     src/stream/axl-stream-buf.c \
     src/stream/axl-stream-file.c \
     src/stream/axl-stream-text.c \
+    src/stream/axl-compress-stream.c \
     src/fs/axl-fs.c \
     src/fs/axl-file-view.c \
     src/fs/axl-fs-provider.c \
@@ -287,6 +290,7 @@ LIB_SOURCES = \
     src/util/axl-subcommand.c \
     src/util/axl-args.c \
     src/util/axl-sort.c \
+    src/util/axl-tar.c \
     src/util/axl-console.c \
     src/util/axl-image-verify.c \
     src/util/axl-clipboard.c \
@@ -353,6 +357,7 @@ LIB_SOURCES = \
     src/gfx/axl-gfx-gradient.c \
     src/gfx/axl-gfx-effects.c \
     src/gfx/axl-gfx-display-list.c \
+    src/gfx/axl-edid.c \
     src/math/axl-math.c \
     src/gfx/fonts/font-edk2-laffstd.c \
     src/gfx/fonts/font-unifont-16.c \
@@ -1283,7 +1288,7 @@ $(eval $(call BUILD_TEST,AxlTestGfxRegion,axl-test-gfx-region))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: all $(TOOL_EFIS)

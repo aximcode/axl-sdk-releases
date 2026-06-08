@@ -12,6 +12,7 @@
 #include "../backend/axl-backend.h"
 #include "axl-gfx-internal.h"
 #include <axl/axl-cpu.h>
+#include <axl/axl-edid.h>
 #include <axl/axl-font.h>
 #include <axl/axl-log.h>
 #include <axl/axl-math.h>
@@ -1693,6 +1694,87 @@ axl_gfx_get_info(
     return AXL_OK;
 }
 
+/* Map a GOP pixel format to the public AxlGfxPixelFormat. Returns false
+   for a value outside the spec's four formats (malformed firmware). */
+static bool
+gfx_map_pixel_format(
+    EFI_GRAPHICS_PIXEL_FORMAT  in,
+    AxlGfxPixelFormat         *out
+    )
+{
+    switch (in) {
+    case PixelRedGreenBlueReserved8BitPerColor:
+        *out = AXL_GFX_PIXEL_FORMAT_RGBX8;
+        return true;
+    case PixelBlueGreenRedReserved8BitPerColor:
+        *out = AXL_GFX_PIXEL_FORMAT_BGRX8;
+        return true;
+    case PixelBitMask:
+        *out = AXL_GFX_PIXEL_FORMAT_BITMASK;
+        return true;
+    case PixelBltOnly:
+        *out = AXL_GFX_PIXEL_FORMAT_BLT_ONLY;
+        return true;
+    default:
+        return false;
+    }
+}
+
+int
+axl_gfx_get_pixel_format(
+    AxlGfxPixelFormat  *out
+    )
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (out == NULL || g == NULL || g->Mode == NULL || g->Mode->Info == NULL) {
+        return AXL_ERR;
+    }
+    return gfx_map_pixel_format(g->Mode->Info->PixelFormat, out)
+           ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_gfx_get_pixel_bitmask(
+    AxlGfxPixelBitmask  *out
+    )
+{
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g = gop_get();
+    if (out == NULL || g == NULL || g->Mode == NULL || g->Mode->Info == NULL
+        || g->Mode->Info->PixelFormat != PixelBitMask) {
+        return AXL_ERR;
+    }
+    const EFI_PIXEL_BITMASK *pi = &g->Mode->Info->PixelInformation;
+    out->red_mask      = pi->RedMask;
+    out->green_mask    = pi->GreenMask;
+    out->blue_mask     = pi->BlueMask;
+    out->reserved_mask = pi->ReservedMask;
+    return AXL_OK;
+}
+
+int
+axl_gfx_get_edid(
+    const uint8_t  **bytes,
+    size_t          *len
+    )
+{
+    if (bytes == NULL || len == NULL) {
+        return AXL_ERR;
+    }
+    /* EFI_EDID_DISCOVERED_PROTOCOL is installed per display by the GOP
+       driver when the panel published EDID. Locate the first one — the
+       single-display answer; per-output EDID is the multi-output API's
+       job. Many GPUs / virtual displays never publish it. */
+    EFI_GUID guid = EFI_EDID_DISCOVERED_PROTOCOL_GUID;
+    EFI_EDID_DISCOVERED_PROTOCOL *edid = NULL;
+    EFI_STATUS st = axl_bs()->LocateProtocol(&guid, NULL, (void **)&edid);
+    if (st != 0 || edid == NULL || edid->Edid == NULL || edid->SizeOfEdid == 0) {
+        return AXL_ERR;
+    }
+    *bytes = edid->Edid;
+    *len   = edid->SizeOfEdid;
+    return AXL_OK;
+}
+
 uint32_t
 axl_gfx_mode_count(void)
 {
@@ -1811,6 +1893,144 @@ axl_gfx_set_mode(
        (Info, FrameBufferBase) reflect the new mode on return. */
     EFI_STATUS status = g->SetMode(g, index);
     return (status == 0) ? AXL_OK : AXL_ERR;
+}
+
+int
+axl_gfx_set_native_mode(void)
+{
+    /* Resolve the native mode index first; only switch once everything
+       checks out, so a failure never disturbs the current mode. */
+    const uint8_t *bytes = NULL;
+    size_t         len   = 0;
+    if (axl_gfx_get_edid(&bytes, &len) != AXL_OK) {
+        return AXL_ERR;
+    }
+    AxlEdidInfo info;
+    if (axl_edid_parse(bytes, len, &info) != AXL_OK
+        || info.native_width == 0 || info.native_height == 0) {
+        return AXL_ERR;
+    }
+    uint32_t idx = 0;
+    if (axl_gfx_find_mode(info.native_width, info.native_height, &idx)
+            != AXL_OK) {
+        return AXL_ERR;
+    }
+    return axl_gfx_set_mode(idx);
+}
+
+int
+axl_gfx_get_dpi(
+    uint32_t  *dpi_x,
+    uint32_t  *dpi_y
+    )
+{
+    const uint8_t *bytes = NULL;
+    size_t         len   = 0;
+    if (axl_gfx_get_edid(&bytes, &len) != AXL_OK) {
+        return AXL_ERR;
+    }
+    AxlEdidInfo info;
+    if (axl_edid_parse(bytes, len, &info) != AXL_OK) {
+        return AXL_ERR;
+    }
+    return axl_edid_dpi(&info, dpi_x, dpi_y);
+}
+
+int
+axl_gfx_scale_for_dpi(
+    uint32_t  dpi
+    )
+{
+    if (dpi >= 240) {
+        return 3;
+    }
+    if (dpi >= 144) {
+        return 2;
+    }
+    return 1;
+}
+
+int
+axl_gfx_recommended_scale(void)
+{
+    uint32_t dx = 0, dy = 0;
+    if (axl_gfx_get_dpi(&dx, &dy) != AXL_OK) {
+        return 1;  /* unknown DPI → no scaling */
+    }
+    /* Conservative: scale by the smaller axis so a non-square-pixel
+       panel doesn't get over-scaled. */
+    return axl_gfx_scale_for_dpi(dx < dy ? dx : dy);
+}
+
+size_t
+axl_gfx_output_count(void)
+{
+    EFI_GUID    guid    = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    size_t      n       = 0;
+    EFI_HANDLE *handles = NULL;
+    EFI_STATUS  st = axl_bs()->LocateHandleBuffer(ByProtocol, &guid, NULL,
+                                                  &n, &handles);
+    if (EFI_ERROR(st) || handles == NULL) {
+        return 0;
+    }
+    /* LocateHandleBuffer allocates with gBS->AllocatePool. */
+    axl_backend_free(handles);
+    return n;
+}
+
+int
+axl_gfx_output_get(
+    size_t         index,
+    AxlGfxOutput  *out
+    )
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_GUID    gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    size_t      n        = 0;
+    EFI_HANDLE *handles  = NULL;
+    EFI_STATUS  st = axl_bs()->LocateHandleBuffer(ByProtocol, &gop_guid, NULL,
+                                                  &n, &handles);
+    if (EFI_ERROR(st) || handles == NULL) {
+        return AXL_ERR;
+    }
+    if (index >= n) {
+        axl_backend_free(handles);
+        return AXL_ERR;
+    }
+
+    EFI_HANDLE                    h   = handles[index];
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+    int rc = AXL_ERR;
+    AxlGfxOutput o = {0};
+
+    if (!EFI_ERROR(axl_bs()->HandleProtocol(h, &gop_guid, (void **)&gop))
+        && gop != NULL && gop->Mode != NULL && gop->Mode->Info != NULL
+        && gfx_map_pixel_format(gop->Mode->Info->PixelFormat,
+                                &o.pixel_format)) {
+        o.width        = gop->Mode->Info->HorizontalResolution;
+        o.height       = gop->Mode->Info->VerticalResolution;
+        o.stride       = gop->Mode->Info->PixelsPerScanLine;
+        o.framebuffer  = gop->Mode->FrameBufferBase;
+        o.mode_count   = gop->Mode->MaxMode;
+        o.current_mode = gop->Mode->Mode;
+
+        /* EDID, if this display published it, lives on the SAME handle. */
+        EFI_GUID edid_guid = EFI_EDID_DISCOVERED_PROTOCOL_GUID;
+        EFI_EDID_DISCOVERED_PROTOCOL *edid = NULL;
+        if (!EFI_ERROR(axl_bs()->HandleProtocol(h, &edid_guid, (void **)&edid))
+            && edid != NULL && edid->Edid != NULL && edid->SizeOfEdid > 0) {
+            o.edid     = edid->Edid;
+            o.edid_len = edid->SizeOfEdid;
+        }
+        *out = o;
+        rc = AXL_OK;
+    }
+
+    axl_backend_free(handles);
+    return rc;
 }
 
 int

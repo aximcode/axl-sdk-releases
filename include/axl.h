@@ -6,9 +6,11 @@
  *
  * AXL — AximCode Library for UEFI.
  *
- * UEFI C library aimed at Linux systems C developers (glibc / GLib /
- * systemd / libcurl audience) who don't want to learn EDK2 to ship
- * a UEFI binary. UTF-8 everywhere, standard C types, snake_case
+ * UEFI C library — with first-class C++ support — aimed at Linux
+ * systems C and C++ developers (glibc / GLib / systemd / libcurl
+ * audience) who don't want to learn EDK2 to ship a UEFI binary. The
+ * C-shaped API is fully usable from C++ (libaxl-cxx.a, the axl-c++
+ * driver, RAII via AXL_AUTOPTR). UTF-8 everywhere, standard C types, snake_case
  * functions, PascalCase types — the API shape carried over directly
  * from GLib (AxlLoop ~= GMainLoop, AxlHashTable ~= GHashTable, etc).
  * Public API never returns or accepts EFI_* types.
@@ -55,11 +57,13 @@
 #include <axl/axl-digest.h>
 #include <axl/axl-hmac.h>
 #include <axl/axl-bytes.h>
+#include <axl/axl-compress.h>
 #include <axl/axl-path.h>
 #include <axl/axl-hexdump.h>
 #include <axl/axl-clipboard.h>
 #include <axl/axl-shm.h>
 #include <axl/axl-sort.h>
+#include <axl/axl-tar.h>
 #include <axl/axl-time.h>
 #include <axl/axl-env.h>
 #include <axl/axl-sys.h>
@@ -104,6 +108,7 @@
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
 #include <axl/axl-gfx.h>
+#include <axl/axl-edid.h>
 #include <axl/axl-input.h>
 #include <axl/axl-cursor.h>
 #include <axl/axl-smbios.h>

@@ -1,7 +1,8 @@
 # AXL
 
-AXL (AximCode Library) is a UEFI C library and SDK aimed at Linux
-systems C developers — the audience that already writes C against
+AXL (AximCode Library) is a UEFI C library — with first-class C++
+support — and SDK aimed at Linux systems C and C++ developers — the
+audience that already writes C or C++ against
 the kernel, glibc, and GLib but doesn't necessarily want to learn
 EDK2 conventions, the gnu-efi runtime, or the EFI_ / CHAR16 / PascalCase
 universe to ship a UEFI binary. AXL hides that and exposes the C API

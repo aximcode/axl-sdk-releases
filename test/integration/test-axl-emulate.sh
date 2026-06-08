@@ -70,7 +70,48 @@ cat > "$FIX_FULL/manifest.json" <<'EOF'
 }
 EOF
 
-trap 'rm -rf "$FIX_EMPTY" "$FIX_FULL"' EXIT
+# net.json (HF2.3 device manifest) — a NIC with a distinctive permanent
+# MAC so the --mac replay knob has something concrete to wire.
+cat > "$FIX_FULL/net.json" <<'EOF'
+{
+  "count": 1,
+  "nics": [
+    {
+      "index": 0,
+      "state": 1,
+      "if_type": 1,
+      "hw_address_size": 6,
+      "mac": "de:ad:be:ef:00:02",
+      "permanent_mac": "de:ad:be:ef:00:01",
+      "media_present": true
+    }
+  ]
+}
+EOF
+
+# cpu.json (HF2.2 manifest, x86_64) — distinctive family/model so the
+# --cpu-from-fixture replay knob has concrete identity to wire.
+cat > "$FIX_FULL/cpu.json" <<'EOF'
+{
+  "arch": "x86_64",
+  "vendor": "GenuineIntel",
+  "family": 6,
+  "model": 42,
+  "stepping": 7,
+  "brand": "Test CPU @ 3.00GHz"
+}
+EOF
+
+# An aarch64 cpu.json fixture for the MIDR-replay path.
+FIX_ARM="$(mktemp -d)"
+cat > "$FIX_ARM/cpu.json" <<'EOF'
+{
+  "arch": "aarch64",
+  "midr_el1": "0x410fd0b0"
+}
+EOF
+
+trap 'rm -rf "$FIX_EMPTY" "$FIX_FULL" "$FIX_ARM"' EXIT
 
 # --- syntax + help --------------------------------------------------------
 if python3 -c "compile(open('$AXL_EMULATE').read(), '$AXL_EMULATE', 'exec')" 2>/dev/null; then
@@ -102,7 +143,7 @@ check "nonexistent fixture dir errors with path" 1 \
 DRY_EMPTY=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" "$FIX_EMPTY" 2>&1 || true)
 DRY_EMPTY_ARGV=$(grep "^AXL_EMULATE_DRYRUN: " <<< "$DRY_EMPTY" || true)
 if [[ -n "$DRY_EMPTY_ARGV" ]]; then
-    if ! grep -q "smbios-file\|acpi-table\|--spd\|--tpm" <<< "$DRY_EMPTY_ARGV"; then
+    if ! grep -qE "(-smbios|-acpitable|smbus-eeprom|--tpm-state)" <<< "$DRY_EMPTY_ARGV"; then
         echo "PASS: empty fixture produces no fixture-related flags"
         PASS=$((PASS + 1))
     else
@@ -119,12 +160,13 @@ fi
 # --- smbios.bin discovery ------------------------------------------------
 DRY_FULL=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" "$FIX_FULL" 2>&1 || true)
 DRY_FULL_ARGV_SCOPED=$(grep "^AXL_EMULATE_DRYRUN: " <<< "$DRY_FULL" || true)
-if grep -qE "^AXL_EMULATE_DRYRUN: --smbios-file$" <<< "$DRY_FULL_ARGV_SCOPED" \
-   && grep -qE "^AXL_EMULATE_DRYRUN: $FIX_FULL/smbios.bin$" <<< "$DRY_FULL_ARGV_SCOPED"; then
-    echo "PASS: fixture/smbios.bin → --smbios-file <path>"
+# smbios.bin → -smbios file=PATH (emitted as --qemu-arg passthrough).
+if grep -qE "^AXL_EMULATE_DRYRUN: -smbios$" <<< "$DRY_FULL_ARGV_SCOPED" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: file=$FIX_FULL/smbios.bin$" <<< "$DRY_FULL_ARGV_SCOPED"; then
+    echo "PASS: fixture/smbios.bin → -smbios file=<path> (--qemu-arg)"
     PASS=$((PASS + 1))
 else
-    echo "FAIL: smbios.bin not wired to --smbios-file"
+    echo "FAIL: smbios.bin not wired to -smbios file="
     echo "  argv: $DRY_FULL_ARGV_SCOPED"
     FAIL=$((FAIL + 1))
 fi
@@ -134,7 +176,7 @@ fi
 # messages on stderr will mention dropped filenames, so a naive grep
 # would falsely match "mcfg.dat appears in output".
 DRY_FULL_ARGV=$(grep "^AXL_EMULATE_DRYRUN: " <<< "$DRY_FULL" || true)
-acpi_table_count=$(grep -cE "^AXL_EMULATE_DRYRUN: --acpi-table$" <<< "$DRY_FULL" || true)
+acpi_table_count=$(grep -cE "^AXL_EMULATE_DRYRUN: -acpitable$" <<< "$DRY_FULL" || true)
 if [[ "$acpi_table_count" -eq 2 ]] \
    && grep -qE "bert\.dat" <<< "$DRY_FULL_ARGV" \
    && grep -qE "waet\.dat" <<< "$DRY_FULL_ARGV" \
@@ -278,12 +320,16 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# --- spd/*.bin → --spd ADDR:FILE -----------------------------------------
-spd_arg_count=$(grep -cE "^AXL_EMULATE_DRYRUN: --spd$" <<< "$DRY_FULL" || true)
-if [[ "$spd_arg_count" -eq 2 ]] \
-   && grep -qE "0x50:$FIX_FULL/spd/0x50\.bin" <<< "$DRY_FULL" \
-   && grep -qE "0x51:$FIX_FULL/spd/0x51\.bin" <<< "$DRY_FULL"; then
-    echo "PASS: spd/0xNN.bin → --spd 0xNN:FILE"
+# --- spd/*.bin → -object memory-backend-file + -device smbus-eeprom ------
+# Emitted as --qemu-arg passthrough: one smbus-eeprom device per blob,
+# its memory-backend-file mem-path pointing at the captured blob.
+spd_dev_count=$(grep -cE "^AXL_EMULATE_DRYRUN: smbus-eeprom,address=0x5[01]," <<< "$DRY_FULL" || true)
+if [[ "$spd_dev_count" -eq 2 ]] \
+   && grep -qE "^AXL_EMULATE_DRYRUN: smbus-eeprom,address=0x50,memdev=axl_spd_50$" <<< "$DRY_FULL" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: smbus-eeprom,address=0x51,memdev=axl_spd_51$" <<< "$DRY_FULL" \
+   && grep -qE "mem-path=$FIX_FULL/spd/0x50\.bin," <<< "$DRY_FULL" \
+   && grep -qE "mem-path=$FIX_FULL/spd/0x51\.bin," <<< "$DRY_FULL"; then
+    echo "PASS: spd/0xNN.bin → smbus-eeprom + memory-backend-file (--qemu-arg)"
     PASS=$((PASS + 1))
 else
     echo "FAIL: SPD wiring incorrect"
@@ -291,20 +337,35 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# --- tpm/ subdirectory triggers --tpm-state ------------------------------
-if grep -qE "^AXL_EMULATE_DRYRUN: --tpm-state$" <<< "$DRY_FULL" \
-   && grep -qE "^AXL_EMULATE_DRYRUN: $FIX_FULL/tpm$" <<< "$DRY_FULL"; then
-    echo "PASS: tpm/ subdir → --tpm-state <path>"
+# --- tpm/ subdirectory wires the emulator-backend TPM (swtpm) ------------
+# axl-emulate spawns swtpm itself and wires QEMU's emulator TPM to its
+# control socket via --qemu-arg (x86 default model tpm-tis).
+if grep -qE "^AXL_EMULATE_DRYRUN: -tpmdev$" <<< "$DRY_FULL" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: emulator,id=axl_tpm,chardev=axl_tpmsock$" <<< "$DRY_FULL" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: tpm-tis,tpmdev=axl_tpm$" <<< "$DRY_FULL" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: socket,id=axl_tpmsock,path=" <<< "$DRY_FULL"; then
+    echo "PASS: tpm/ subdir → swtpm chardev + tpmdev emulator + tpm-tis"
     PASS=$((PASS + 1))
 else
-    echo "FAIL: tpm/ subdir did not trigger --tpm-state"
+    echo "FAIL: tpm/ subdir did not wire the emulator TPM"
     echo "  output: $DRY_FULL"
+    FAIL=$((FAIL + 1))
+fi
+
+# aarch64 uses tpm-tis-device (sysbus), not tpm-tis (ISA).
+DRY_TPM_AA64=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --arch AARCH64 "$FIX_FULL" 2>&1 || true)
+if grep -qE "^AXL_EMULATE_DRYRUN: tpm-tis-device,tpmdev=axl_tpm$" <<< "$DRY_TPM_AA64"; then
+    echo "PASS: tpm/ on aarch64 → tpm-tis-device"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: tpm/ on aarch64 did not use tpm-tis-device"
+    echo "  output: $DRY_TPM_AA64"
     FAIL=$((FAIL + 1))
 fi
 
 # --- positional efi-file forwards to run-qemu.sh -------------------------
 DUMMY_EFI="$(mktemp --suffix=.efi)"
-trap 'rm -rf "$FIX_EMPTY" "$FIX_FULL" "$FIX_SIG" "$FIX_STRICT" "$DUMMY_EFI"' EXIT
+trap 'rm -rf "$FIX_EMPTY" "$FIX_FULL" "$FIX_SIG" "$FIX_STRICT" "$DUMMY_EFI" "$FIX_ARM"' EXIT
 
 DRY_EFI=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" "$FIX_FULL" "$DUMMY_EFI" 2>&1 || true)
 if grep -qE "^AXL_EMULATE_DRYRUN: $DUMMY_EFI$" <<< "$DRY_EFI"; then
@@ -365,6 +426,89 @@ if [[ "$first_tok" == *"run-qemu.sh"* ]]; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: first DRYRUN token is not run-qemu.sh: '$first_tok'"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- HF4: --mac (replay captured NIC MAC from net.json) ------------------
+# Opt-in: without --mac, net.json is informational and no NIC is wired.
+if ! grep -qE "^AXL_EMULATE_DRYRUN: --mac$" <<< "$DRY_FULL"; then
+    echo "PASS: net.json alone does not wire a NIC (--mac is opt-in)"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: net.json leaked a --mac without the flag"
+    FAIL=$((FAIL + 1))
+fi
+
+# With --mac, the first NIC's permanent_mac is wired via --net + --mac.
+DRY_MAC=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --mac "$FIX_FULL" 2>&1 || true)
+DRY_MAC_ARGV=$(grep "^AXL_EMULATE_DRYRUN: " <<< "$DRY_MAC" || true)
+if grep -qE "^AXL_EMULATE_DRYRUN: --net$" <<< "$DRY_MAC_ARGV" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: --mac$" <<< "$DRY_MAC_ARGV" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: de:ad:be:ef:00:01$" <<< "$DRY_MAC_ARGV"; then
+    echo "PASS: --mac wires net.json permanent_mac via --net --mac"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --mac did not wire the captured NIC MAC"
+    echo "  argv: $DRY_MAC_ARGV"
+    FAIL=$((FAIL + 1))
+fi
+
+# --mac against a fixture with no net.json warns and skips (no --net).
+DRY_MAC_NONE=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --mac "$FIX_EMPTY" 2>&1 || true)
+if ! grep -qE "^AXL_EMULATE_DRYRUN: --mac$" <<< "$DRY_MAC_NONE" \
+   && grep -qE "no usable MAC" <<< "$DRY_MAC_NONE"; then
+    echo "PASS: --mac with no net.json warns and skips"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --mac with no net.json did not warn-and-skip"
+    echo "  output: $DRY_MAC_NONE"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- HF4: --cpu-from-fixture (replay captured CPU identity) ---------------
+# Opt-in: cpu.json alone does not set --cpu.
+if ! grep -qE "^AXL_EMULATE_DRYRUN: --cpu$" <<< "$DRY_FULL"; then
+    echo "PASS: cpu.json alone does not set --cpu (opt-in)"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: cpu.json leaked a --cpu without the flag"
+    FAIL=$((FAIL + 1))
+fi
+
+# x86_64 cpu.json → qemu64 with vendor/family/model/stepping overrides.
+DRY_CPU=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --cpu-from-fixture "$FIX_FULL" 2>&1 || true)
+DRY_CPU_ARGV=$(grep "^AXL_EMULATE_DRYRUN: " <<< "$DRY_CPU" || true)
+if grep -qE "^AXL_EMULATE_DRYRUN: --cpu$" <<< "$DRY_CPU_ARGV" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: qemu64,vendor=GenuineIntel,family=6,model=42,stepping=7$" <<< "$DRY_CPU_ARGV"; then
+    echo "PASS: --cpu-from-fixture wires x86 cpu.json → -cpu spec"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --cpu-from-fixture x86 spec wrong"
+    echo "  argv: $DRY_CPU_ARGV"
+    FAIL=$((FAIL + 1))
+fi
+
+# aarch64 cpu.json → max with the captured MIDR.
+DRY_CPU_ARM=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --cpu-from-fixture --arch AARCH64 "$FIX_ARM" 2>&1 || true)
+if grep -qE "^AXL_EMULATE_DRYRUN: --cpu$" <<< "$DRY_CPU_ARM" \
+   && grep -qE "^AXL_EMULATE_DRYRUN: max,midr=0x410fd0b0$" <<< "$DRY_CPU_ARM"; then
+    echo "PASS: --cpu-from-fixture wires aarch64 MIDR → -cpu max,midr"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --cpu-from-fixture aarch64 spec wrong"
+    echo "  output: $DRY_CPU_ARM"
+    FAIL=$((FAIL + 1))
+fi
+
+# No cpu.json → warn and keep the default model (no --cpu).
+DRY_CPU_NONE=$(AXL_EMULATE_DRYRUN=1 "$AXL_EMULATE" --cpu-from-fixture "$FIX_EMPTY" 2>&1 || true)
+if ! grep -qE "^AXL_EMULATE_DRYRUN: --cpu$" <<< "$DRY_CPU_NONE" \
+   && grep -qE "no usable identity" <<< "$DRY_CPU_NONE"; then
+    echo "PASS: --cpu-from-fixture with no cpu.json warns and skips"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --cpu-from-fixture with no cpu.json did not warn-and-skip"
+    echo "  output: $DRY_CPU_NONE"
     FAIL=$((FAIL + 1))
 fi
 

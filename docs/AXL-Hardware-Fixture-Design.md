@@ -261,14 +261,48 @@ extension; ships in the host-tools tarball alongside `run-qemu.sh`
 and `axl-cc`) — that consumes a fixture directory, translates it
 into the right run-qemu.sh primitives, and `exec`s run-qemu.sh.
 
-This is a **wrapper, not a duplicate**. run-qemu.sh stays the
-primitive layer (low-level QEMU launching, OVMF/firmware discovery,
-disk-image build, KVM acceleration, GDB stub, etc.) and exposes
-the per-artifact flags (`--smbios-file`, `--acpi-table`, `--spd`,
-`--tpm`, …) as primitives. axl-emulate is the persona that knows
-about the fixture *layout* — directory structure, ACPI denylist,
-manifest.json — and never duplicates run-qemu.sh's launching
-logic.
+**Architecture decision (revised 2026-06-08): HF-specific platform
+injection lives in `axl-emulate`, not `run-qemu.sh`.**
+
+`run-qemu.sh` is a **generic, HF-agnostic QEMU launcher**: firmware /
+OVMF discovery, disk-image build, KVM acceleration, serial/console,
+display (`--gpu`/`--vnc`/`--screenshot`), networking (`--net`/
+`--hostfwd`/`--mac`), the GDB stub, test plumbing (`--extra`/`--nsh`),
+and a generic `--qemu-arg` passthrough. It knows nothing about
+fixtures or captured platform identity.
+
+`axl-emulate` is the **hardware-fixture layer** and owns *all*
+platform-injection knowledge. It reads the fixture, builds the QEMU
+device arguments for SMBIOS / ACPI / SPD / TPM / CPU / IPMI itself, and
+hands them to `run-qemu.sh` via `--qemu-arg` (plus any HF-specific
+helper-daemon supervision, e.g. `swtpm`). The HF-specific, arch-aware
+validation (e.g. "warn-and-skip IPMI/SPD on AArch64") lives in
+`axl-emulate` too.
+
+**Why this boundary** (it reverses an earlier "run-qemu.sh owns the
+HF primitives" design): `run-qemu.sh` is a *released, multi-project*
+CLI — it ships in the host-tools `.deb`/`.rpm`/tarball and the sibling
+projects (AGT, axl-webfs, uefi-devkit) invoke it by path as a black
+box. Those consumers use **only** the generic launch/display/net/
+plumbing flags and **zero** HF flags; the entire HF concern has a
+single real consumer (`axl-emulate`) plus axl-sdk's own tests. Keeping
+platform-emulation knowledge out of `run-qemu.sh` keeps that public CLI
+small and stable, and confines fixture knowledge to the one tool whose
+job it is. `axl-emulate` **must ship in the host-tools `.deb`/`.rpm`/
+tarball** alongside `run-qemu.sh` (with a `/usr/bin/axl-emulate`
+wrapper) so released consumers get fixture replay — as of 2026-06-08
+the `build-host-tools` job in `release.yml` does NOT yet include it
+(the `SCRIPTS=(...)` list omits `axl-emulate`); adding it is part of
+this migration.
+
+Concretely, the per-artifact flags `--smbios-file` / `--acpi-table` /
+`--spd` / `--tpm*` / `--cpu` / `--ipmi*` are **being migrated off
+`run-qemu.sh`**: `axl-emulate` emits the equivalent `--qemu-arg`
+tokens directly (the QEMU-argument table below is exactly what it
+builds). `--mac` and `--cpu` are the boundary cases — `--mac` is a
+generic NIC knob that stays on `run-qemu.sh`; `--cpu` is a generic
+`-cpu` override that stays, while the *fixture→spec translation*
+(`cpu.json` → `qemu64,...` / `max,midr=`) lives in `axl-emulate`.
 
 ```
 axl-emulate <fixture-dir> [efi-file] [args...]
@@ -718,6 +752,12 @@ Suggested ordering, smallest viable slices first:
    first fixture from the Proxmox VM (`dmidecode --dump-bin`,
    `acpidump -b`) to validate the replay path before writing the
    capture tool. Smallest possible diff.
+   **(Superseded by the 2026-06-08 architecture revision above: these
+   HF-specific flags are being migrated off `run-qemu.sh` into
+   `axl-emulate`, which builds the equivalent QEMU args and passes them
+   via `--qemu-arg`. The flags shipped on `run-qemu.sh` first because it
+   was the smallest diff at the time; the boundary moved once the HF
+   surface outgrew a generic launcher.)**
 2. **Phase HF2** — `tools/mkfixture.c` (new dedicated tool;
    `mkfixture.efi`, mirroring `mkrd.efi` in the existing tools
    tree). Cheap UEFI-protocol walks: SMBIOS, ACPI, PCI manifest,
@@ -734,12 +774,15 @@ Suggested ordering, smallest viable slices first:
    `exec`s run-qemu.sh. Brought forward in front of HF2 so the
    replay structure is settled before the capture tool's output
    format hardens.
-4. **Phase HF4** — SPD capture: fold into `mkfixture` (preferred
-   over extending `memspd`, which stays an inspection tool — same
-   sysinfo-vs-mkfixture separation argument). Dump every populated
-   SMBus EEPROM at 0x50–0x57 to `spd/0xNN.bin`. Validate by
-   capturing on a real box and replaying via the Phase HF3 path;
-   AxlSpd output should match bit-for-bit.
+4. **Phase HF4** — SPD capture. **DONE** — folded into `mkfixture`
+   (`memspd` stays an inspection tool). `mkfixture --spd` walks
+   0x50–0x57 via AxlSpd and writes each raw EEPROM to `spd/0xNN.bin`
+   (the Phase HF3 replay contract) plus a decoded `spd.json`. Opt-in
+   (a SMBus HC / I2C master protocol must be published; many vendor
+   firmwares hide it). Validated bit-for-bit against an injected DDR4
+   blob in the patched-QEMU + SmbusHcShim rig
+   ([test/integration/test-mkfixture-spd-qemu.sh](../test/integration/test-mkfixture-spd-qemu.sh),
+   local-only — not CI-wired, same as `test-spd-qemu.sh`).
 5. **Phase HF5** — TPM capture and replay. Capture: PCR values,
    capabilities, full TCG event log via `EFI_TCG2_PROTOCOL`. Replay:
    spawn `swtpm` with seeded state, wire `-tpmdev emulator` +

@@ -12,6 +12,7 @@
 #define AXL_GFX_TYPES_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -197,6 +198,47 @@ typedef enum {
     AXL_GFX_PIXEL_BGRA = 0,  ///< blue, green, red, reserved (GOP "BGR")
     AXL_GFX_PIXEL_RGBA,      ///< red, green, blue, reserved (GOP "RGB")
 } AxlGfxPixelOrder;
+
+/// The display's actual GOP framebuffer pixel format, including the two
+/// formats AxlGfxPixelOrder can't represent.
+///
+/// Reported by `axl_gfx_get_pixel_format`.  AxlGfx normalizes everything
+/// to BGRA `AxlGfxPixel`s internally, so consumers don't *need* this to
+/// draw — it is for code that reasons about the raw framebuffer layout
+/// (screenshot export, direct-framebuffer writers, fixture capture).
+typedef enum {
+    AXL_GFX_PIXEL_FORMAT_RGBX8 = 0,  ///< 8-bit R,G,B + reserved (GOP PixelRedGreenBlueReserved8BitPerColor)
+    AXL_GFX_PIXEL_FORMAT_BGRX8,      ///< 8-bit B,G,R + reserved (GOP PixelBlueGreenRedReserved8BitPerColor)
+    AXL_GFX_PIXEL_FORMAT_BITMASK,    ///< arbitrary channel masks — read them via axl_gfx_get_pixel_bitmask
+    AXL_GFX_PIXEL_FORMAT_BLT_ONLY,   ///< no CPU-addressable framebuffer (GOP-Blt-only display)
+} AxlGfxPixelFormat;
+
+/// Per-channel bit masks for an `AXL_GFX_PIXEL_FORMAT_BITMASK` display
+/// (the GOP `PixelBitMask` case).  Each mask selects that channel's bits
+/// within the 32-bit pixel.
+typedef struct {
+    uint32_t  red_mask;        ///< bits carrying the red channel
+    uint32_t  green_mask;      ///< bits carrying the green channel
+    uint32_t  blue_mask;       ///< bits carrying the blue channel
+    uint32_t  reserved_mask;   ///< reserved / unused bits
+} AxlGfxPixelBitmask;
+
+/// One physical display, as enumerated by `axl_gfx_output_count` /
+/// `axl_gfx_output_get`.  Where the single-display accessors
+/// (`axl_gfx_get_info`, `axl_gfx_get_pixel_format`, `axl_gfx_get_edid`)
+/// report the active GOP, this describes each GOP individually — what a
+/// multi-monitor compositor needs to lay out and identify outputs.
+typedef struct {
+    uint32_t            width;         ///< horizontal resolution in pixels
+    uint32_t            height;        ///< vertical resolution in pixels
+    uint32_t            stride;        ///< pixels per scan line (>= width)
+    uint64_t            framebuffer;   ///< framebuffer physical address (0 if Blt-only)
+    AxlGfxPixelFormat   pixel_format;  ///< this output's raw GOP pixel format
+    uint32_t            mode_count;    ///< number of modes this output enumerates
+    uint32_t            current_mode;  ///< this output's active mode index
+    const uint8_t      *edid;          ///< borrowed EDID bytes, or NULL if none published
+    size_t              edid_len;      ///< EDID byte count (0 when @ref edid is NULL)
+} AxlGfxOutput;
 
 /// Pack an `AxlGfxPixel` into a 32-bit framebuffer word for @a order.
 ///

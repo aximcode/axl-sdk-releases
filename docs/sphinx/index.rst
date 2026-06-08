@@ -49,6 +49,7 @@ AXL SDK
    modules/clipboard
    modules/shm
    modules/sort
+   modules/tar
    modules/loop
    modules/task
    modules/event
@@ -66,6 +67,7 @@ AXL SDK
    modules/rng
    modules/rand
    modules/gfx
+   modules/edid
    modules/truetype
    modules/display-list
    modules/pixmap

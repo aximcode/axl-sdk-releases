@@ -39,6 +39,85 @@ axl_gfx_get_info(
     AxlGfxInfo  *info  ///< [out] receives display info
     );
 
+/// Get the display's actual GOP framebuffer pixel format.
+///
+/// AxlGfx normalizes pixels to BGRA internally; this exposes the raw
+/// format for consumers that reason about the framebuffer layout
+/// (screenshot export, direct writers, fixture capture).  For
+/// `AXL_GFX_PIXEL_FORMAT_BITMASK` the channel masks come from
+/// `axl_gfx_get_pixel_bitmask`.
+///
+/// @return AXL_OK on success, AXL_ERR if @a out is NULL or GOP is not
+///         available.
+int
+axl_gfx_get_pixel_format(
+    AxlGfxPixelFormat  *out  ///< [out] receives the pixel format
+    );
+
+/// Get the per-channel bit masks for a bitmask-format display.
+///
+/// Only meaningful when `axl_gfx_get_pixel_format` reports
+/// `AXL_GFX_PIXEL_FORMAT_BITMASK`; any other format returns AXL_ERR
+/// (the masks are implied by RGBX8/BGRX8 and undefined for Blt-only).
+///
+/// @return AXL_OK on success, AXL_ERR if @a out is NULL, GOP is not
+///         available, or the format is not bitmask.
+int
+axl_gfx_get_pixel_bitmask(
+    AxlGfxPixelBitmask  *out  ///< [out] receives the channel masks
+    );
+
+/// Get the active display's raw EDID bytes, if the firmware published an
+/// `EFI_EDID_DISCOVERED_PROTOCOL`.
+///
+/// Returns a borrowed pointer into firmware-owned memory valid for the
+/// life of the boot — the caller must NOT free it, and should copy if it
+/// needs to retain the bytes past driver teardown.  Decode with
+/// `axl_edid_parse` (`<axl/axl-edid.h>`).  Many displays / virtual GPUs
+/// (QEMU's std VGA) never publish EDID, so AXL_ERR is common and not an
+/// error condition.
+///
+/// @return AXL_OK with @a bytes / @a len set, or AXL_ERR if either out
+///         parameter is NULL or no EDID is available.
+int
+axl_gfx_get_edid(
+    const uint8_t  **bytes,  ///< [out] borrowed pointer to EDID bytes
+    size_t          *len     ///< [out] number of EDID bytes
+    );
+
+// ===================================================================
+// Multiple displays (one entry per GOP handle)
+// ===================================================================
+
+/// Number of physical display outputs (GOP handles) on the system.
+///
+/// The single-display accessors (`axl_gfx_get_info` etc.) report one
+/// active GOP; this counts every GOP the firmware published — what a
+/// multi-monitor consumer enumerates.
+///
+/// @return the output count, or 0 if there is no GOP at all.
+size_t
+axl_gfx_output_count(void);
+
+/// Describe display output @a index into @a out.
+///
+/// Fills geometry, pixel format, framebuffer base, mode count / current
+/// mode, and (if the panel published one) a borrowed pointer to its EDID
+/// bytes — the same firmware-owned, do-not-free, decode-with-
+/// `axl_edid_parse` contract as `axl_gfx_get_edid`.  Outputs are indexed
+/// `[0, axl_gfx_output_count())` in firmware handle order, stable within
+/// a boot.
+///
+/// @return AXL_OK with @a out populated, or AXL_ERR if @a out is NULL,
+///         @a index is out of range, the output's GOP could not be read,
+///         or its pixel format is unrecognized (@a out is untouched on
+///         error).
+int
+axl_gfx_output_get(
+    size_t         index,  ///< output index in [0, axl_gfx_output_count())
+    AxlGfxOutput  *out     ///< [out] receives the output description
+    );
+
 // ===================================================================
 // Display modes (GOP QueryMode / SetMode — boot-services only)
 // ===================================================================
@@ -101,6 +180,67 @@ int
 axl_gfx_set_mode(
     uint32_t  index  ///< mode number in [0, axl_gfx_mode_count())
     );
+
+/// Switch the display to the panel's native resolution.
+///
+/// Reads the display's EDID (`axl_gfx_get_edid`), decodes its preferred
+/// timing (Detailed Timing Descriptor #1 — the panel's native mode),
+/// finds the matching enumerated GOP mode, and switches to it. This is
+/// the correct "use the real panel resolution" pick — unlike
+/// `axl_gfx_max_mode`, which just takes the largest enumerated mode and
+/// can land on a scaled/letterboxed non-native resolution.
+///
+/// On success the framebuffer is reallocated and the screen cleared, so
+/// the caller MUST repaint (same contract as `axl_gfx_set_mode`).
+/// Boot-services only. Fails cleanly without switching when EDID is
+/// absent, so it is safe to attempt and fall back to `axl_gfx_max_mode`.
+///
+/// @return AXL_OK if the display was switched to its native mode;
+///         AXL_ERR if there is no GOP, no EDID, the EDID carries no
+///         native timing, no enumerated mode matches it, or SetMode
+///         failed (the current mode is unchanged in every failure case
+///         — the checks precede the switch).
+int
+axl_gfx_set_native_mode(void);
+
+/// Get the display's physical DPI from its EDID.
+///
+/// Reads EDID (`axl_gfx_get_edid`), decodes it, and derives dots-per-inch
+/// per axis from the native resolution and physical image size
+/// (`axl_edid_dpi`). Either out parameter may be NULL.
+///
+/// @return AXL_OK with the requested axes set; AXL_ERR if there is no
+///         GOP, no EDID, or the EDID lacks a usable resolution / image
+///         size (the out parameters are untouched on error).
+int
+axl_gfx_get_dpi(
+    uint32_t  *dpi_x,   ///< [out, optional] horizontal DPI
+    uint32_t  *dpi_y    ///< [out, optional] vertical DPI
+    );
+
+/// Map a DPI to a recommended integer UI scale factor.
+///
+/// A pure threshold function: `< 144` → 1 (standard), `144..239` → 2
+/// (HiDPI), `>= 240` → 3 (ultra-HiDPI). 144 is 1.5x the ~96 dpi
+/// baseline, the conventional point where integer 2x scaling wins.
+///
+/// @return the scale factor 1, 2, or 3.
+int
+axl_gfx_scale_for_dpi(
+    uint32_t  dpi    ///< dots per inch
+    );
+
+/// Recommend an integer UI scale factor for the active display.
+///
+/// Combines `axl_gfx_get_dpi` (taking the smaller axis, to avoid
+/// over-scaling) with `axl_gfx_scale_for_dpi`. When DPI can't be
+/// determined (no EDID — common in VMs) it returns 1: a sensible
+/// "no scaling" default rather than an error, so callers can use the
+/// result unconditionally.
+///
+/// @return the recommended scale factor (>= 1); 1 when DPI is unknown.
+int
+axl_gfx_recommended_scale(void);
 
 // ===================================================================
 // Off-screen buffers (double-buffered rendering)

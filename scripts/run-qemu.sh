@@ -100,24 +100,18 @@ SCREENSHOT=""
 ENABLE_GPU=false
 NET=false
 NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrides
+MAC_ADDR=""         # --mac XX:XX:XX:XX:XX:XX (HF4: replay a captured NIC MAC)
+CPU_SPEC=""         # --cpu SPEC (HF4: replay a captured CPU model, e.g. qemu64,family=6)
 HOSTFWDS=()
 EXTRA_FILES=()
-# --qemu-arg STRING: literal QEMU command-line tokens to append before
-# invocation. Repeatable; shell-word-split. Lets test scripts add
-# device emulation, debug knobs, or anything run-qemu.sh doesn't
-# expose natively, without forking the script. Each STRING is
-# split via bash word-splitting so a single --qemu-arg with a multi-
-# token string ("-device foo,bar=1") works as one logical addition.
+# --qemu-arg STRING: one literal QEMU command-line token, appended
+# verbatim (NOT word-split). Repeatable — pass one --qemu-arg per token,
+# e.g. `--qemu-arg -device --qemu-arg virtio-foo,bar=1`. Appending
+# verbatim (no word-split) is what lets a token contain spaces — e.g. a
+# device spec whose path has a space (`...,mem-path=/my dir/x.bin`) — so
+# programmatic callers like axl-emulate can inject HF device args safely.
 EXTRA_QEMU_ARGS=()
 
-# --ipmi / --ipmi-extern / --ipmi-prop: in-process or external IPMI
-# BMC simulator. Centralizes the device-shape choice (KCS at 0xCA0
-# is the canonical pairing — matches what test-ipmi-qemu.sh uses)
-# so every consumer doesn't reinvent it. x86-only; aa64 QEMU has
-# no IPMI device support today.
-IPMI_INPROC=false
-IPMI_EXTERN_SOCK=""
-IPMI_PROPS=()
 CUSTOM_NSH=""
 BACKGROUND=false
 SERIAL_LOG=""
@@ -145,14 +139,11 @@ MOUNT_TAG="hostfs"
 MEM="512M"            # guest RAM (also used for memory-backend-file size)
 BRIDGES=false         # --bridges adds a small PCI bridge tree (mirrors test runner)
 
-# Hardware-fixture replay (HF1 — see docs/AXL-Hardware-Fixture-Design.md
-# and ROADMAP "Hardware Fixture Capture & Replay").
-SMBIOS_FILE=""        # --smbios-file FILE          → -smbios file=FILE
-ACPI_TABLES=()        # --acpi-table FILE  (repeat) → -acpitable file=FILE
-SPD_BLOBS=()          # --spd ADDR:FILE   (repeat)  → memory-backend-file + smbus-eeprom
-TPM_ENABLE=false      # --tpm (or implied by --tpm-state / --tpm-model)
-TPM_STATE_DIR=""      # --tpm-state DIR            → swtpm --tpmstate dir=DIR
-TPM_MODEL=""          # --tpm-model tpm-tis|tpm-crb|tpm-tis-device (arch default)
+# Hardware-fixture platform-identity injection (SMBIOS / ACPI / SPD /
+# TPM / IPMI) is NOT handled here — it lives in scripts/axl-emulate,
+# which builds the QEMU device args from a fixture and passes them via
+# --qemu-arg. run-qemu.sh is a generic launcher. See the HF design doc's
+# 2026-06-08 architecture decision.
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -178,21 +169,14 @@ while [[ $# -gt 0 ]]; do
         --net)        NET=true; shift ;;
         --bridges)    BRIDGES=true; shift ;;
         --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
+        --mac)        MAC_ADDR="$2"; NET=true; shift 2 ;;
+        --cpu)        CPU_SPEC="$2"; shift 2 ;;
         --nic-no-rom) NIC_NO_ROM=true; NET=true; shift ;;
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
         --sendkey)    SENDKEY_SEQ+=" $2"; shift 2 ;;
         --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
-        --ipmi)       IPMI_INPROC=true; shift ;;
-        --ipmi-extern) IPMI_EXTERN_SOCK="$2"; shift 2 ;;
-        --ipmi-prop)  IPMI_PROPS+=("$2"); IPMI_INPROC=true; shift 2 ;;
-        --smbios-file) SMBIOS_FILE="$2"; shift 2 ;;
-        --acpi-table) ACPI_TABLES+=("$2"); shift 2 ;;
-        --spd)        SPD_BLOBS+=("$2"); shift 2 ;;
-        --tpm)        TPM_ENABLE=true; shift ;;
-        --tpm-state)  TPM_ENABLE=true; TPM_STATE_DIR="$2"; shift 2 ;;
-        --tpm-model)  TPM_ENABLE=true; TPM_MODEL="$2"; shift 2 ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
         --background) BACKGROUND=true; shift ;;
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
@@ -275,6 +259,14 @@ Options:
                            virtio-net-pci (default), e1000, e1000e,
                            rtl8139, pcnet, ne2k_pci. Use to test
                            driver-bundle coverage on NICs OVMF lacks.
+  --mac XX:XX:XX:XX:XX:XX  Set the NIC's hardware address (implies
+                           --net). HF4: replay a captured NIC MAC so the
+                           guest sees the fixtured machine's address.
+  --cpu SPEC               Override the guest CPU model (QEMU -cpu).
+                           HF4: replay a captured CPU identity, e.g.
+                           "qemu64,vendor=GenuineIntel,family=6,model=42"
+                           (x86) or "max,midr=0x410fd0b0" (aarch64).
+                           KVM stays on; CPUID/MIDR follow the spec.
   --nic-no-rom             Suppress QEMU's bundled iPXE option ROM
                            (passes romfile= to the -device line). Use
                            to force the "firmware lacks NIC driver"
@@ -293,79 +285,20 @@ Options:
                            usb-tablet is auto-added), optionally pressing+
                            releasing the left button (",click"). Injected
                            after --sendkey, before capture. Repeatable.
-  --qemu-arg STRING        Append literal STRING to the qemu command
-                           line. Repeatable; multiple values accumulate
-                           in order. Each STRING is shell-word-split,
-                           so "-device foo,bar=1" lands as one logical
-                           pair. NOTE: shell quoting is NOT honored —
-                           tokens with embedded spaces aren't supported
-                           via this flag (use one --qemu-arg per
-                           token; a per-token flag is the workaround).
-                           Useful for device emulation or debug knobs
+  --qemu-arg STRING        Append STRING to the qemu command line as ONE
+                           literal token (no word-splitting). Repeatable;
+                           pass one --qemu-arg per token, e.g.
+                           `--qemu-arg -device --qemu-arg virtio-foo`. A
+                           token MAY contain spaces (e.g. a device spec
+                           with a space in a file path) — it is preserved
+                           verbatim. Useful for device emulation or debug
+                           knobs
                            not natively exposed.
-  --ipmi                   Add an in-process IPMI BMC simulator
-                           (ipmi-bmc-sim + isa-ipmi-kcs at canonical
-                           KCS port 0xca2). Matches AxlIpmi's KCS
-                           default so axl_ipmi_session_new() opens
-                           the simulator without further wiring.
-                           Sim implements spec-standard commands;
-                           Chassis Identify and OEM commands return
-                           CC 0xC1. x86-only — warns and continues
-                           without IPMI on AArch64.
-  --ipmi-extern SOCK       Wire ipmi-bmc-extern to a Unix-domain
-                           socket. Caller is responsible for running
-                           an external BMC simulator (OpenIPMI
-                           ipmi-sim, pyghmi-bmcsim, ...) bound to
-                           SOCK. Lets consumers exercise full BMC
-                           behavior including OEM commands and
-                           Chassis Identify. x86-only.
-  --ipmi-prop K=V          Override an ipmi-bmc-sim property
-                           (mfg_id, product_id, fwrev1, fwrev2,
-                           device_id, guid, slave_addr). Repeatable.
-                           Implies --ipmi.
-  --smbios-file FILE       Hardware-fixture replay (HF1): inject a
-                           captured SMBIOS table blob via -smbios
-                           file=FILE so the guest sees the source
-                           platform's vendor/model/serial. Capture
-                           on Linux: dmidecode --dump-bin smbios.bin
-                           (root). NOTE: QEMU APPENDS the file to
-                           its auto-generated Type 0 (BIOS Info);
-                           consumers that pick the first Type 0 will
-                           see OVMF, not the captured BIOS vendor.
-                           Type 1+ override cleanly. Per-type
-                           override (-smbios type=0,vendor=...) is
-                           HF3's job when --fixture lands.
-                           See AXL-Hardware-Fixture-Design.md.
-  --acpi-table FILE        Hardware-fixture replay (HF1): append a
-                           captured ACPI table via -acpitable file=
-                           FILE. Repeatable. Capture on Linux:
-                           acpidump -b (root) writes per-table .dat
-                           files. WARNING: replaying topology-bound
-                           tables (MCFG, SPCR, SRAT, ...) confuses
-                           QEMU; HF3 will default-drop them — for
-                           now, hand-pick.
-  --spd ADDR:FILE          Hardware-fixture replay (HF1): attach a
-                           DDR SPD EEPROM blob to QEMU's SMBus at
-                           hex ADDR (e.g. 0x50). Repeatable.
-                           Requires the locally-patched QEMU at
-                           $QEMU_DIR (scripts/qemu-patches/0001-
-                           smbus-eeprom-add-memdev-link.patch);
-                           stock QEMU rejects the memdev= property.
-                           x86-only — warns and skips on AArch64.
-  --tpm                    Hardware-fixture replay (HF1): spawn an
-                           swtpm emulator backend (empty state) and
-                           wire -tpmdev emulator + tpm device. Arch
-                           default: tpm-tis on x64, tpm-tis-device
-                           on aa64. Requires swtpm on PATH (or set
-                           SWTPM=/path/to/swtpm).
-  --tpm-state DIR          Like --tpm but with DIR as swtpm's state
-                           directory (raw passthrough — DIR contents
-                           are swtpm-format NVChip files, NOT the
-                           captured tpm/ artifacts. Captured-fixture
-                           seeding is HF5's scope, not HF1).
-  --tpm-model NAME         Override the TPM device model. Choices:
-                           tpm-tis, tpm-crb (x64), tpm-tis-device
-                           (aa64). Implies --tpm.
+                           (Hardware-fixture platform injection —
+                           SMBIOS / ACPI / SPD / TPM / IPMI — is not a
+                           run-qemu.sh concern; use scripts/axl-emulate,
+                           which builds those device args from a fixture
+                           and passes them via --qemu-arg.)
   --nsh FILE               Use custom startup.nsh file
   --background             Launch QEMU in background, print PID
   --serial-log FILE        Save serial output to file (foreground:
@@ -540,128 +473,6 @@ EOF
         echo "ERROR: --mount needs a writable /dev/shm tmpfs (memory-backend-file)" >&2
         exit 1
     fi
-fi
-
-# Hardware-fixture replay (HF1) — validate file/dir args up-front so the
-# user gets an actionable error before we build the disk image, spawn
-# helper daemons, or hand off to QEMU. Mirrors the --mount precedent.
-if [[ -n "$SMBIOS_FILE" && ! -f "$SMBIOS_FILE" ]]; then
-    echo "ERROR: --smbios-file: '$SMBIOS_FILE' not found" >&2
-    exit 1
-fi
-
-if [[ ${#ACPI_TABLES[@]} -gt 0 ]]; then
-    for tbl in "${ACPI_TABLES[@]}"; do
-        if [[ ! -f "$tbl" ]]; then
-            echo "ERROR: --acpi-table: '$tbl' not found" >&2
-            exit 1
-        fi
-    done
-fi
-
-if [[ ${#SPD_BLOBS[@]} -gt 0 ]]; then
-    # Each entry is "ADDR:FILE". ADDR is a hex SMBus address (0x50–0x57
-    # canonical for DDR DIMMs; we don't constrain the range, the
-    # smbus-eeprom device will reject collisions or out-of-range values
-    # at QEMU realize-time). FILE must exist and be ≥4 KiB so QEMU's
-    # memory-backend-file with size=4096 has enough backing.
-    for entry in "${SPD_BLOBS[@]}"; do
-        if [[ "$entry" != *:* ]]; then
-            echo "ERROR: --spd expects ADDR:FILE (e.g., 0x50:spd.bin); got '$entry'" >&2
-            exit 1
-        fi
-        spd_addr="${entry%%:*}"
-        spd_file="${entry#*:}"
-        # SMBus is 7-bit addressing — 0x00–0x7F only. DDR DIMM SPD
-        # canonically lives at 0x50–0x57 but we accept the full
-        # 7-bit range (some boards expose temperature sensors at
-        # 0x18–0x1F, etc.). 0x80–0xFF would be silently rejected
-        # by smbus-eeprom at QEMU realize-time with a less helpful
-        # error — catch it here.
-        if [[ ! "$spd_addr" =~ ^0x[0-7][0-9a-fA-F]$ ]] && \
-           [[ ! "$spd_addr" =~ ^0x[0-9a-fA-F]$ ]]; then
-            echo "ERROR: --spd ADDR must be a 7-bit SMBus address (0x00–0x7F); got '$spd_addr'" >&2
-            exit 1
-        fi
-        if [[ ! -f "$spd_file" ]]; then
-            echo "ERROR: --spd: blob '$spd_file' not found" >&2
-            exit 1
-        fi
-    done
-fi
-
-# --tpm validation: locate swtpm (caller may override via SWTPM=) and
-# resolve the device model. State directory passthrough is raw — DIR
-# contents are swtpm-format NVChip files, NOT captured tpm/ artifacts.
-SWTPM_BIN=""
-if [[ "$TPM_ENABLE" == "true" ]]; then
-    # When SWTPM= is set, honor it exclusively — never silently fall
-    # through to other paths, otherwise the override is decorative
-    # and the user can't force the absent-swtpm error path for
-    # tests / portability checks.
-    if [[ -n "${SWTPM:-}" ]]; then
-        if [[ -x "$SWTPM" ]]; then
-            SWTPM_BIN="$SWTPM"
-        fi
-    else
-        for cand in \
-            "$(command -v swtpm 2>/dev/null)" \
-            /usr/bin/swtpm \
-            /usr/local/bin/swtpm
-        do
-            if [[ -n "$cand" && -x "$cand" ]]; then
-                SWTPM_BIN="$cand"
-                break
-            fi
-        done
-    fi
-    if [[ -z "$SWTPM_BIN" ]]; then
-        cat <<'EOF' >&2
-ERROR: --tpm requires swtpm, but it was not found.
-
-  Install:
-    Fedora/RHEL/Alma:  sudo dnf install swtpm-tools
-    Debian/Ubuntu:     sudo apt install swtpm
-    Arch:              sudo pacman -S swtpm
-
-  Or set SWTPM=/path/to/swtpm before running this script.
-EOF
-        exit 1
-    fi
-
-    if [[ -n "$TPM_STATE_DIR" ]]; then
-        if [[ ! -d "$TPM_STATE_DIR" ]]; then
-            echo "ERROR: --tpm-state: '$TPM_STATE_DIR' is not a directory" >&2
-            exit 1
-        fi
-        # swtpm writes NVChip files (tpm2-00.permall, ...) into the
-        # directory as the TPM's nonvolatile state evolves. A read-only
-        # DIR fails at swtpm-spawn time with a less clear error; catch
-        # it here.
-        if [[ ! -w "$TPM_STATE_DIR" ]]; then
-            echo "ERROR: --tpm-state: '$TPM_STATE_DIR' is not writable (swtpm needs to write NVChip state)" >&2
-            exit 1
-        fi
-    fi
-
-    # Arch-aware default model. tpm-tis and tpm-crb are x86-only in
-    # QEMU (ISA-bus and CRB at fixed MMIO); aa64 has only tpm-tis-device
-    # (sysbus). Auto-pick to match the active --arch unless the user
-    # overrode --tpm-model.
-    if [[ -z "$TPM_MODEL" ]]; then
-        case "$ARCH" in
-            X64)     TPM_MODEL="tpm-tis" ;;
-            AARCH64) TPM_MODEL="tpm-tis-device" ;;
-            *)       TPM_MODEL="tpm-tis" ;;
-        esac
-    fi
-    case "$TPM_MODEL" in
-        tpm-tis|tpm-crb|tpm-tis-device) ;;
-        *)
-            echo "ERROR: --tpm-model: unknown value '$TPM_MODEL' (choose tpm-tis, tpm-crb, or tpm-tis-device)" >&2
-            exit 1
-            ;;
-    esac
 fi
 
 EFI_NAME=""
@@ -1015,7 +826,7 @@ cpu_summary() {
 }
 
 # Build QEMU command
-mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd")
+mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd" "$CPU_SPEC")
 CMD+=(-drive "format=raw,file=$TMPDIR/disk.img")
 
 # Skip the firmware Boot Manager countdown before auto-booting the first
@@ -1133,117 +944,6 @@ if [[ -n "$DEBUGCON_LOG" ]]; then
           -global "isa-debugcon.iobase=0x402")
 fi
 
-# --smbios-file: inject a captured SMBIOS table blob. QEMU validates
-# the SMBIOS3 entry-point fingerprint at parse time; bad blobs surface
-# as "smbios: unrecognized entry" rather than silent acceptance.
-if [[ -n "$SMBIOS_FILE" ]]; then
-    CMD+=(-smbios "file=$SMBIOS_FILE")
-fi
-
-# --acpi-table: append captured ACPI tables. -acpitable is repeatable
-# in QEMU; one occurrence per file.
-if [[ ${#ACPI_TABLES[@]} -gt 0 ]]; then
-    for tbl in "${ACPI_TABLES[@]}"; do
-        CMD+=(-acpitable "file=$tbl")
-    done
-fi
-
-# --spd: attach captured SPD EEPROMs to QEMU's SMBus. Mirrors the
-# wiring in test/integration/common-test.sh's test_add_smbus_eeprom
-# helper. Depends on the locally-patched QEMU (scripts/qemu-patches/
-# 0001-smbus-eeprom-add-memdev-link.patch) which adds the memdev=
-# link property to smbus-eeprom; stock QEMU rejects the property.
-# x86-only — aa64 has no platform SMBus path here.
-if [[ ${#SPD_BLOBS[@]} -gt 0 ]]; then
-    if [[ "$ARCH" != "X64" ]]; then
-        echo "WARN: --spd not supported on $ARCH (skipping SPD wiring)" >&2
-    else
-        # Probe the active QEMU for the memdev= property. -device
-        # smbus-eeprom,help on stock QEMU prints only "address=" while
-        # the patched build also prints "memdev=<link<memory-backend>>".
-        # Skip the probe when running under DRYRUN — the test harness
-        # wants to assert the wired tokens without depending on the
-        # local QEMU build (CI may run flag tests without the patch).
-        spd_supported=true
-        if [[ "${QEMU_DRYRUN:-0}" != "1" ]]; then
-            if ! "$QEMU_BIN" -device smbus-eeprom,help 2>&1 | grep -q "memdev="; then
-                spd_supported=false
-            fi
-        fi
-        if [[ "$spd_supported" != "true" ]]; then
-            cat <<EOF >&2
-ERROR: --spd requires a QEMU with scripts/qemu-patches/
-  0001-smbus-eeprom-add-memdev-link.patch applied. The active QEMU
-  ($QEMU_BIN) does not advertise smbus-eeprom,memdev=.
-
-  Build a patched QEMU and point QEMU_DIR at install/bin/, or omit
-  --spd to run without SPD injection.
-EOF
-            exit 1
-        fi
-        for entry in "${SPD_BLOBS[@]}"; do
-            spd_addr="${entry%%:*}"
-            spd_file="${entry#*:}"
-            # id derives from the address (no 0x prefix) so repeated
-            # --spd flags produce distinct memory-backend / device IDs.
-            spd_id="axl_spd_${spd_addr#0x}"
-            CMD+=(
-                -object "memory-backend-file,id=$spd_id,mem-path=$spd_file,size=4096,share=off,readonly=on"
-                -device "smbus-eeprom,address=$spd_addr,memdev=$spd_id"
-            )
-        done
-    fi
-fi
-
-# --tpm: spawn swtpm (lifecycle modeled on virtiofsd below) and wire
-# QEMU's emulator-backend TPM to its control socket. State directory
-# is either user-supplied (--tpm-state DIR, raw passthrough) or fresh
-# under $TMPDIR. Captured-fixture seeding (tpm.json + event-log.bin →
-# swtpm NVChip format) is HF5's scope, not HF1.
-SWTPM_PID=""
-if [[ "$TPM_ENABLE" == "true" ]]; then
-    SWTPM_SOCK="$TMPDIR/swtpm-ctrl"
-    SWTPM_LOG="$TMPDIR/swtpm.log"
-    if [[ -n "$TPM_STATE_DIR" ]]; then
-        # Resolve to absolute — swtpm wants one for its --tpmstate dir=.
-        SWTPM_STATE="$(cd "$TPM_STATE_DIR" && pwd -P)"
-    else
-        SWTPM_STATE="$TMPDIR/tpm-state"
-        mkdir -p "$SWTPM_STATE"
-    fi
-
-    if [[ "${QEMU_DRYRUN:-0}" != "1" ]]; then
-        "$SWTPM_BIN" socket \
-            --tpmstate "dir=$SWTPM_STATE" \
-            --ctrl "type=unixio,path=$SWTPM_SOCK" \
-            --tpm2 \
-            --flags startup-clear \
-            --log "file=$SWTPM_LOG,level=1" \
-            > /dev/null 2>&1 &
-        SWTPM_PID=$!
-
-        # Wait for the daemon to create its control socket. swtpm is
-        # fast (~30 ms typical) — be lenient on slow hosts.
-        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-            [[ -S "$SWTPM_SOCK" ]] && break
-            sleep 0.1
-        done
-        if [[ ! -S "$SWTPM_SOCK" ]]; then
-            echo "ERROR: swtpm failed to start (no socket at $SWTPM_SOCK)" >&2
-            echo "--- swtpm log ---" >&2
-            cat "$SWTPM_LOG" >&2 || true
-            kill "$SWTPM_PID" 2>/dev/null || true
-            exit 1
-        fi
-    fi
-
-    CMD+=(
-        -chardev "socket,id=axl_tpmsock,path=$SWTPM_SOCK"
-        -tpmdev  "emulator,id=axl_tpm,chardev=axl_tpmsock"
-        -device  "${TPM_MODEL},tpmdev=axl_tpm"
-    )
-fi
-
 # --mount: spawn virtiofsd and wire the vhost-user-fs PCI device into
 # QEMU. The shared-memory backend (memory-backend-file with share=on
 # over /dev/shm) is mandatory — vhost-user requires the guest RAM be
@@ -1289,14 +989,13 @@ if [[ -n "$MOUNT_DIR" ]]; then
     )
 fi
 
-# If --mount and/or --tpm spawned helper daemons in foreground mode,
+# If --mount spawned a helper daemon (virtiofsd) in foreground mode,
 # extend the cleanup trap so they don't leak after QEMU exits.
 # Background mode emits the PIDs for the caller to manage instead
 # (see below).
 if [[ "$BACKGROUND" != "true" ]]; then
     helper_pids=()
     [[ -n "$VIRTIOFSD_PID" ]] && helper_pids+=("$VIRTIOFSD_PID")
-    [[ -n "$SWTPM_PID" ]]     && helper_pids+=("$SWTPM_PID")
     if [[ ${#helper_pids[@]} -gt 0 ]]; then
         # Pre-format the kill argument list with a literal space so
         # the trap doesn't depend on $IFS at trap-fire time. Using
@@ -1312,6 +1011,13 @@ fi
 
 # Networking
 if [[ "$NET" == "true" ]]; then
+    # Validate --mac up-front — QEMU's own error for a bad mac= is opaque.
+    if [[ -n "$MAC_ADDR" \
+          && ! "$MAC_ADDR" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        echo "ERROR: --mac: '$MAC_ADDR' is not a valid MAC address" \
+             "(expect XX:XX:XX:XX:XX:XX)" >&2
+        exit 1
+    fi
     NETDEV="user,id=net0"
     for fwd in "${HOSTFWDS[@]}"; do
         HOST_PORT="${fwd%%:*}"
@@ -1331,6 +1037,9 @@ if [[ "$NET" == "true" ]]; then
     # iPXE driver bundle is loaded from disk), set NIC_NO_ROM=true.
     NIC_MODEL_ACTUAL="${NIC_MODEL:-virtio-net-pci}"
     NIC_DEV="${NIC_MODEL_ACTUAL},netdev=net0"
+    if [[ -n "$MAC_ADDR" ]]; then
+        NIC_DEV="${NIC_DEV},mac=${MAC_ADDR}"
+    fi
     if [[ "${NIC_NO_ROM:-false}" == "true" ]]; then
         NIC_DEV="${NIC_DEV},romfile="
     fi
@@ -1339,49 +1048,13 @@ else
     CMD+=(-net none)
 fi
 
-# --ipmi / --ipmi-extern / --ipmi-prop: BMC simulator wiring. Both
-# in-process (ipmi-bmc-sim) and external (ipmi-bmc-extern) are
-# x86-only — aa64 QEMU has no IPMI device support today, so we warn
-# and proceed without IPMI rather than fail.
-if [[ "$IPMI_INPROC" == "true" || -n "$IPMI_EXTERN_SOCK" ]]; then
-    if [[ "$ARCH" != "X64" ]]; then
-        echo "WARN: --ipmi/--ipmi-extern not supported on $ARCH (skipping)" >&2
-    elif [[ -n "$IPMI_EXTERN_SOCK" ]]; then
-        # External: bmc=ipmi-bmc-extern,id=axl_bmc,chardev=axl_bmcsock
-        # backed by the caller-provided unix socket. Port 0xca2 is
-        # the canonical KCS data port AxlIpmi probes by default —
-        # matching test/integration/common-test.sh's helper so the
-        # transport opens cleanly.
-        CMD+=(-chardev "socket,id=axl_bmcsock,path=${IPMI_EXTERN_SOCK},reconnect=1"
-              -device   "ipmi-bmc-extern,id=axl_bmc,chardev=axl_bmcsock"
-              -device   "isa-ipmi-kcs,bmc=axl_bmc,ioport=0xca2")
-    else
-        # In-process: ipmi-bmc-sim with sane defaults; --ipmi-prop K=V
-        # overrides any of the spec-standard ipmi-bmc-sim properties.
-        # Port 0xca2 matches AxlIpmi's KCS default + the existing
-        # test-ipmi-qemu.sh wiring; consumers using --ipmi compose
-        # cleanly with axl_ipmi_session_new().
-        bmc_dev="ipmi-bmc-sim,id=axl_bmc"
-        for prop in "${IPMI_PROPS[@]}"; do
-            bmc_dev="${bmc_dev},${prop}"
-        done
-        CMD+=(-device "$bmc_dev"
-              -device "isa-ipmi-kcs,bmc=axl_bmc,ioport=0xca2")
-    fi
-fi
-
-# --qemu-arg passthrough: shell-word-split each accumulated STRING
-# into individual tokens and append. Single quotes / spaces in the
-# user-supplied string aren't honored as quoting (callers wanting
-# spaces inside a single token should pass it as one --qemu-arg
-# without surrounding quotes); this matches the "literal qemu CLI
-# tokens" contract documented in --help.
+# --qemu-arg passthrough: each accumulated value is one literal QEMU
+# token, appended verbatim (no word-splitting), so a token may contain
+# spaces — see the --qemu-arg contract in --help.
 if [[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]]; then
-    for arg in "${EXTRA_QEMU_ARGS[@]}"; do
-        # shellcheck disable=SC2206 — intentional word-split
-        toks=( $arg )
-        CMD+=( "${toks[@]}" )
-    done
+    # Append each token verbatim — no word-splitting, so a token may
+    # contain spaces (e.g. a device spec with a space in a file path).
+    CMD+=( "${EXTRA_QEMU_ARGS[@]}" )
 fi
 
 # QEMU_DRYRUN=1 prints the constructed CMD and exits without launching
@@ -1480,12 +1153,10 @@ HINT
     # QEMU puts the terminal into raw mode. If it dies abnormally
     # (segfault, OOM, killed by the user) the parent shell is left
     # without echo or line discipline. Restore on any exit path.
-    # Also kill virtiofsd / swtpm if --mount / --tpm spawned them
+    # Also kill virtiofsd if --mount spawned it
     # (otherwise they'll outlive the QEMU process and hold sockets
     # open).
     cleanup_cmd='rm -rf "'"$TMPDIR"'"; stty sane 2>/dev/null || true'
-    [[ -n "$SWTPM_PID" ]] && \
-        cleanup_cmd="kill $SWTPM_PID 2>/dev/null; $cleanup_cmd"
     [[ -n "$VIRTIOFSD_PID" ]] && \
         cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
     # On exit: reset DECSTBM scroll margins (\e[r), leave
@@ -1554,8 +1225,6 @@ HINT
     # QEMU may put this terminal into raw mode for the serial console;
     # restore line discipline on any exit path, and reap helper daemons.
     cleanup_cmd='rm -rf "'"$TMPDIR"'"; stty sane 2>/dev/null || true'
-    [[ -n "$SWTPM_PID" ]] && \
-        cleanup_cmd="kill $SWTPM_PID 2>/dev/null; $cleanup_cmd"
     [[ -n "$VIRTIOFSD_PID" ]] && \
         cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
     trap "$cleanup_cmd" EXIT INT TERM
@@ -1728,10 +1397,9 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     echo "SERIAL_LOG=$LOG"
     [[ -n "$SERIAL_SOCKET" ]] && echo "SERIAL_SOCKET=$SERIAL_SOCKET"
     [[ -n "$VIRTIOFSD_PID" ]] && echo "VIRTIOFSD_PID=$VIRTIOFSD_PID"
-    [[ -n "$SWTPM_PID" ]] && echo "SWTPM_PID=$SWTPM_PID"
     echo "TMPDIR=$TMPDIR"
     # Don't clean up — caller is responsible for killing QEMU (and
-    # virtiofsd / swtpm, when --mount / --tpm were used) and removing
+    # virtiofsd, when --mount was used) and removing
     # TMPDIR when done.
 
 # Normal foreground mode

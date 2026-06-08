@@ -4,6 +4,31 @@ Step-by-step for cutting an AXL release. The flow is opinionated and
 the order matters — running it out of order, or skipping the version
 helper, has burned us before.
 
+## TL;DR — the fast path
+
+```sh
+scripts/cut-release.sh X.Y.Z            # do it
+scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
+```
+
+`scripts/cut-release.sh` automates the whole cut below and **enforces the
+gate**: it bumps the version, dates the CHANGELOG, commits + pushes `main`,
+**waits for CI to go green on the release commit, and only then creates the
+tag** (a published tag can't be cleanly re-cut — see Recovery). Then it watches
+CI/Release/Docs and prints the published release. If CI fails on the release
+commit it stops *before* tagging and prints how to recover (fix on `main`, then
+`scripts/cut-release.sh X.Y.Z --resume`).
+
+The script does **not** run the heavy local prerequisite gate — CI on the
+release commit is the authoritative gate. That only works well if you **push
+small batches to `main` continuously** so CI has already validated the code
+before release day. Releasing a big pile of unpushed commits is what made v1.0.0
+ship with a red CI (≈100 commits had never been through CI). The rest of this
+doc is what the script does, and the manual fallback if you need it.
+
+To validate locally before pushing (optional fail-fast), run `scripts/lint.sh`
+(clang-tidy exactly as CI runs it) and the smoke suites below.
+
 ## Prerequisites
 
 - You're on `main`, working tree clean, `git log origin/main..HEAD`
@@ -57,18 +82,11 @@ helper, has burned us before.
   the post-tag failure mode TWICE in a row (v0.18.0 → v0.18.1,
   v0.19.0 → v0.19.1): Release published artifacts cleanly, then
   CI flagged a finding and required a follow-up patch release.
-  Run the same command CI runs before tagging, so any findings
-  surface BEFORE the artifacts are public:
+  Run it the same way CI does, before tagging, so any findings
+  surface BEFORE the artifacts are public — just use the wrapper:
 
   ```sh
-  rm -f compile_commands.json
-  bear -- make tests tools
-  find src -name '*.c' \
-      -not -path '*/backend/*' \
-      -not -name 'axl-mbedtls-platform.c' \
-      -print0 \
-    | xargs -0 -n1 -P"$(nproc)" clang-tidy -p . -quiet
-  echo "exit=$?"   # must be 0
+  scripts/lint.sh      # bear + clang-tidy, exactly as ci.yml's lint job
   ```
 
   Fix any errors and re-run. If the only findings are warnings
@@ -76,14 +94,17 @@ helper, has burned us before.
   `.clang-tidy` only escalates the checks the config enables; the
   `2 warnings generated` lines per file are noise.
 
-  **Version skew — local-clean does NOT imply CI-clean.** CI installs
-  `clang-tidy` from Ubuntu apt (whatever `ubuntu-latest` ships). A *newer*
-  local clang-tidy can have refined check heuristics that silently pass code
-  an older CI clang-tidy flags — v1.0.0 hit exactly this: a correct
-  array-of-pointers `sizeof` was clean under local clang-tidy 21 but tripped
-  `bugprone-sizeof-expression` on CI's older build. Match CI's version if you
-  can (`apt-get install clang-tidy-<N>` for the version `ubuntu-latest` uses),
-  or treat the §4b CI-on-`main` run as the authoritative clang-tidy gate.
+  **Version skew — local-clean does NOT imply CI-clean (unless versions
+  match).** CI now pins an explicit `clang-tidy-18` (in `ci.yml`) instead of
+  the floating `clang-tidy` package, and `scripts/lint.sh` prefers that same
+  version — so a clean `scripts/lint.sh` *does* mean a clean CI lint, provided
+  you have `clang-tidy-18` installed (`sudo apt-get install clang-tidy-18`; the
+  script warns and falls back if it's missing). This pin exists because a
+  *newer* local clang-tidy silently passed code an older CI clang-tidy flagged —
+  v1.0.0 hit exactly that (`bugprone-sizeof-expression` on a correct
+  array-of-pointers `sizeof`). When you intentionally move clang-tidy versions,
+  bump it in both `ci.yml` and `scripts/lint.sh` together. Either way, the §4b
+  CI-on-`main` run remains the authoritative gate.
 
   **Run clang-tidy one file per process (`-n1`).** Passing many
   TUs to a single `clang-tidy` invocation makes the path-sensitive

@@ -9,6 +9,8 @@
 #include <axl/axl-shm.h>
 #include <axl/axl-rand.h>
 #include <axl/axl-driver.h>   /* axl_protocol_install / _uninstall */
+#include <axl/axl-tar.h>
+#include <axl/axl-stream.h>
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -6574,6 +6576,188 @@ test_clipboard_get_bytes(void)
     test_check(axl_clipboard_get_bytes() == NULL, "clip_bytes: empty -> NULL");
 }
 
+// ---------------------------------------------------------------------------
+// AxlTar — ustar reader/writer round-trip over an in-memory stream
+// ---------------------------------------------------------------------------
+
+static size_t
+tar_read_all(AxlTarReader *r, char *out, size_t cap)
+{
+    size_t      total = 0;
+    axl_ssize_t n;
+    while (total < cap
+           && (n = axl_tar_reader_read(r, out + total, cap - total)) > 0) {
+        total += (size_t)n;
+    }
+    return total;
+}
+
+static void
+test_tar_roundtrip(void)
+{
+    AxlStream *buf = axl_bufopen();
+    test_check(buf != NULL, "tar: bufopen");
+    AxlTarWriter *w = axl_tar_writer_new(buf);
+    test_check(w != NULL, "tar: writer_new");
+
+    const char *j = "{\"a\":1}";                 /* 7 bytes */
+    const char  d[] = "FACP\x24\x00\x00\x00rest"; /* 13 bytes incl embedded NULs */
+    test_check(axl_tar_writer_add(w, "pci.json", 0644, j, 7) == AXL_OK,
+               "tar: add pci.json");
+    test_check(axl_tar_writer_add(w, "acpi/facp.dat", 0644, d, 13) == AXL_OK,
+               "tar: add acpi/facp.dat (subdir name)");
+    test_check(axl_tar_writer_add(w, "empty.bin", 0644, "", 0) == AXL_OK,
+               "tar: add zero-length entry");
+    test_check(axl_tar_writer_finish(w) == AXL_OK, "tar: finish");
+    axl_tar_writer_free(w);
+
+    /* finish() pads to GNU tar's 10240-byte record boundary so streamed
+       reads (tar -tzf over gzip) exit cleanly. Three small entries are
+       well under one record, so the whole archive must be exactly
+       10240 bytes. */
+    size_t tar_size = 0;
+    (void)axl_bufdata(buf, &tar_size);
+    test_check(tar_size == 10240,
+               "tar: archive padded to the 10240-byte record boundary");
+
+    axl_fseek(buf, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(buf);
+    test_check(r != NULL, "tar: reader_new");
+    AxlTarEntry e;
+    char        tmp[64];
+
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, "pci.json") == 0 && e.size == 7
+               && e.type == AXL_TAR_TYPE_FILE,
+               "tar: entry 1 name/size/type");
+    test_check(tar_read_all(r, tmp, sizeof tmp) == 7
+               && axl_memcmp(tmp, j, 7) == 0, "tar: entry 1 data");
+
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, "acpi/facp.dat") == 0 && e.size == 13,
+               "tar: entry 2 name/size");
+    test_check(tar_read_all(r, tmp, sizeof tmp) == 13
+               && axl_memcmp(tmp, d, 13) == 0,
+               "tar: entry 2 data (with embedded NULs)");
+
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, "empty.bin") == 0 && e.size == 0,
+               "tar: entry 3 zero-length");
+    test_check(tar_read_all(r, tmp, sizeof tmp) == 0,
+               "tar: entry 3 reads no data");
+
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: end-of-archive stops iteration");
+    axl_tar_reader_free(r);
+    axl_fclose(buf);
+}
+
+static void
+test_tar_long_name(void)
+{
+    AxlStream *buf = axl_bufopen();
+    AxlTarWriter *w = axl_tar_writer_new(buf);
+
+    /* 110-char dir + "/f.bin" = 116 chars: splits cleanly (name "f.bin"
+       <= 100, prefix 110 <= 155). */
+    char longname[160];
+    for (int i = 0; i < 110; i++) { longname[i] = 'a'; }
+    longname[110] = '/';
+    axl_memcpy(longname + 111, "f.bin", 5);
+    longname[116] = '\0';
+    test_check(axl_tar_writer_add(w, longname, 0644, "x", 1) == AXL_OK,
+               "tar: long-but-splittable name accepted");
+
+    /* 150-char single component (no '/') can't fit name(100) → rejected. */
+    char toolong[160];
+    for (int i = 0; i < 150; i++) { toolong[i] = 'b'; }
+    toolong[150] = '\0';
+    test_check(axl_tar_writer_add(w, toolong, 0644, "x", 1) == AXL_ERR,
+               "tar: unsplittable over-long name rejected");
+
+    axl_tar_writer_finish(w);
+    axl_tar_writer_free(w);
+
+    axl_fseek(buf, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(buf);
+    AxlTarEntry e;
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && axl_strcmp(e.name, longname) == 0,
+               "tar: long name round-trips via name/prefix split");
+    axl_tar_reader_free(r);
+    axl_fclose(buf);
+}
+
+static void
+test_tar_dir_entry(void)
+{
+    AxlStream *buf = axl_bufopen();
+    AxlTarWriter *w = axl_tar_writer_new(buf);
+    /* add_dir appends the trailing slash; pass it without one. */
+    test_check(axl_tar_writer_add_dir(w, "acpi", 0755) == AXL_OK,
+               "tar: add_dir ok");
+    test_check(axl_tar_writer_add(w, "acpi/facp.dat", 0644, "x", 1) == AXL_OK,
+               "tar: add file after dir");
+    test_check(axl_tar_writer_finish(w) == AXL_OK, "tar: finish (dir)");
+    axl_tar_writer_free(w);
+
+    axl_fseek(buf, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(buf);
+    AxlTarEntry e;
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.type == AXL_TAR_TYPE_DIR
+               && axl_strcmp(e.name, "acpi/") == 0
+               && e.size == 0,
+               "tar: dir entry round-trips (type DIR, trailing slash)");
+    test_check(axl_tar_reader_next(r, &e) == AXL_OK
+               && e.type == AXL_TAR_TYPE_FILE
+               && axl_strcmp(e.name, "acpi/facp.dat") == 0,
+               "tar: file entry after dir");
+    axl_tar_reader_free(r);
+    axl_fclose(buf);
+}
+
+static void
+test_tar_reader_rejects_bad(void)
+{
+    /* Non-header garbage / truncated input → AXL_ERR, no crash. */
+    AxlStream *buf = axl_bufopen();
+    char junk[100] = {1, 2, 3};
+    axl_write(buf, junk, sizeof junk);
+    axl_fseek(buf, 0, AXL_SEEK_SET);
+    AxlTarReader *r = axl_tar_reader_new(buf);
+    AxlTarEntry e;
+    test_check(axl_tar_reader_next(r, &e) == AXL_ERR,
+               "tar: garbage/truncated input rejected");
+    axl_tar_reader_free(r);
+    axl_fclose(buf);
+
+    /* A valid archive with one corrupted header byte → checksum fails. */
+    AxlStream *b2 = axl_bufopen();
+    AxlTarWriter *w = axl_tar_writer_new(b2);
+    axl_tar_writer_add(w, "f", 0644, "data", 4);
+    axl_tar_writer_finish(w);
+    axl_tar_writer_free(w);
+    size_t n = 0;
+    uint8_t *raw = (uint8_t *)axl_bufsteal(b2, &n);
+    axl_fclose(b2);
+    test_check(raw != NULL && n >= AXL_TAR_BLOCK, "tar: stole archive bytes");
+    raw[0] ^= 0xFF;  /* corrupt the name field → header checksum mismatch */
+    AxlStream *b3 = axl_bufopen();
+    axl_write(b3, raw, n);
+    axl_fseek(b3, 0, AXL_SEEK_SET);
+    AxlTarReader *r3 = axl_tar_reader_new(b3);
+    test_check(axl_tar_reader_next(r3, &e) == AXL_ERR,
+               "tar: corrupted header (bad checksum) rejected");
+    axl_tar_reader_free(r3);
+    axl_fclose(b3);
+    axl_free(raw);
+
+    /* NULL guards. */
+    test_check(axl_tar_writer_new(NULL) == NULL, "tar: writer_new(NULL) -> NULL");
+    test_check(axl_tar_reader_new(NULL) == NULL, "tar: reader_new(NULL) -> NULL");
+}
+
 int
 test_util_main(int argc, char **argv)
 {
@@ -6669,6 +6853,11 @@ test_util_main(int argc, char **argv)
     test_qsort_heapsort_fallback();
     test_qsort_large_elements();
     test_qsort_with_data_descending();
+
+    test_tar_roundtrip();
+    test_tar_long_name();
+    test_tar_dir_entry();
+    test_tar_reader_rejects_bad();
 
     return test_print_results();
 }

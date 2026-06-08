@@ -243,7 +243,9 @@
     {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE",    "kind": "funcptr"},
     {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE",      "kind": "funcptr"},
     {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT",           "kind": "funcptr"},
-    {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL",               "kind": "struct"}
+    {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL",               "kind": "struct"},
+
+    {"name": "EFI_EDID_DISCOVERED_PROTOCOL",               "kind": "struct"}
   ],
 
   "media.h": [

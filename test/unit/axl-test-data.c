@@ -4351,6 +4351,466 @@ test_checksum_get_digest(void)
 }
 
 static void
+test_crc32(void)
+{
+    /* Standard CRC-32 check value: "123456789" -> 0xCBF43926. */
+    test_check(axl_crc32(0, "123456789", 9) == 0xCBF43926u,
+               "crc32: check vector 123456789");
+
+    /* Empty input with the zero seed is the identity. */
+    test_check(axl_crc32(0, NULL, 0) == 0u,
+               "crc32: empty input, seed 0");
+
+    /* Well-known pangram vector. */
+    const char *fox = "The quick brown fox jumps over the lazy dog";
+    test_check(axl_crc32(0, fox, 43) == 0x414FA339u,
+               "crc32: pangram");
+
+    /* Chaining across calls equals the one-shot over the concatenation. */
+    uint32_t crc = axl_crc32(0, "123", 3);
+    crc = axl_crc32(crc, "456789", 6);
+    test_check(crc == 0xCBF43926u,
+               "crc32: incremental matches one-shot");
+
+    /* A zero-length chunk mid-stream must not change the running value. */
+    uint32_t a = axl_crc32(0, "12345", 5);
+    uint32_t b = axl_crc32(a, NULL, 0);
+    test_check(a == b, "crc32: zero-length chunk is a no-op");
+}
+
+static void
+test_adler32(void)
+{
+    /* Adler-32 of the empty string with the seed (1) is 1. */
+    test_check(axl_adler32(1, NULL, 0) == 1u,
+               "adler32: empty input, seed 1");
+
+    /* "Wikipedia" -> 0x11E60398 (the canonical RFC-1950 example). */
+    test_check(axl_adler32(1, "Wikipedia", 9) == 0x11E60398u,
+               "adler32: Wikipedia vector");
+
+    /* "abc": s1 = 1+97+98+99 = 295 (0x127), s2 = 98+196+295 = 589 (0x24D). */
+    test_check(axl_adler32(1, "abc", 3) == 0x024D0127u,
+               "adler32: abc vector");
+
+    /* Chaining equals the one-shot over the concatenation. */
+    uint32_t adv = axl_adler32(1, "Wiki", 4);
+    adv = axl_adler32(adv, "pedia", 5);
+    test_check(adv == 0x11E60398u,
+               "adler32: incremental matches one-shot");
+
+    /* A zero-length chunk mid-stream is a no-op. */
+    uint32_t x = axl_adler32(1, "hello", 5);
+    uint32_t y = axl_adler32(x, NULL, 0);
+    test_check(x == y, "adler32: zero-length chunk is a no-op");
+}
+
+// ---------------------------------------------------------------------------
+// AxlCompress — one-shot codec (gzip / zlib / raw DEFLATE)
+// ---------------------------------------------------------------------------
+
+/* 264-byte plaintext compressed by the HOST python gzip/zlib below.
+   Used for inbound interop (we must decode what real tools produce). */
+static const char canned_plain[] =
+    "AxlCompress interop: the quick brown fox jumps over the lazy"
+    " dog. AxlCompress interop: the quick brown fox jumps over th"
+    "e lazy dog. AxlCompress interop: the quick brown fox jumps o"
+    "ver the lazy dog. AxlCompress interop: the quick brown fox j"
+    "umps over the lazy dog. ";
+#define CANNED_PLAIN_LEN 264u
+
+/* gzip member with the FNAME flag set (the `gzip foo` CLI embeds the
+   original filename) — proves the decoder skips optional header fields. */
+static const uint8_t canned_gz_fname[] = {
+    0x1f, 0x8b, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x6f, 0x72,
+    0x69, 0x67, 0x2e, 0x74, 0x78, 0x74, 0x00, 0x73, 0xac, 0xc8, 0x71, 0xce,
+    0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e, 0x56, 0xc8, 0xcc, 0x2b, 0x49, 0x2d,
+    0xca, 0x2f, 0xb0, 0x52, 0x28, 0xc9, 0x48, 0x55, 0x28, 0x2c, 0xcd, 0x4c,
+    0xce, 0x56, 0x48, 0x2a, 0xca, 0x2f, 0xcf, 0x53, 0x48, 0xcb, 0xaf, 0x50,
+    0xc8, 0x2a, 0xcd, 0x2d, 0x28, 0x56, 0xc8, 0x2f, 0x4b, 0x2d, 0x02, 0x4b,
+    0xe7, 0x24, 0x56, 0x55, 0x2a, 0xa4, 0xe4, 0xa7, 0xeb, 0x29, 0x38, 0x0e,
+    0x0b, 0x13, 0x00, 0xa9, 0x74, 0x4d, 0xf9, 0x08, 0x01, 0x00, 0x00,
+};
+
+/* zlib stream (level 9 → 0x78 0xda header) of the same plaintext. */
+static const uint8_t canned_zlib[] = {
+    0x78, 0xda, 0x73, 0xac, 0xc8, 0x71, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d,
+    0x2e, 0x56, 0xc8, 0xcc, 0x2b, 0x49, 0x2d, 0xca, 0x2f, 0xb0, 0x52, 0x28,
+    0xc9, 0x48, 0x55, 0x28, 0x2c, 0xcd, 0x4c, 0xce, 0x56, 0x48, 0x2a, 0xca,
+    0x2f, 0xcf, 0x53, 0x48, 0xcb, 0xaf, 0x50, 0xc8, 0x2a, 0xcd, 0x2d, 0x28,
+    0x56, 0xc8, 0x2f, 0x4b, 0x2d, 0x02, 0x4b, 0xe7, 0x24, 0x56, 0x55, 0x2a,
+    0xa4, 0xe4, 0xa7, 0xeb, 0x29, 0x38, 0x0e, 0x0b, 0x13, 0x00, 0x71, 0x1e,
+    0x60, 0xcd,
+};
+
+/* Round-trip @p data through compress+decompress at @p fmt/@p level and
+   assert the output is byte-identical. Returns the compressed size (for
+   ratio checks) or (size_t)-1 on any failure. */
+static size_t
+roundtrip_compress(AxlCompressFormat fmt, int level,
+                   const void *data, size_t len, const char *label)
+{
+    void  *comp = NULL;
+    size_t comp_len = 0;
+    if (axl_compress(fmt, data, len, &comp, &comp_len, level) != AXL_OK) {
+        test_fail(label);
+        return (size_t)-1;
+    }
+    void  *plain = NULL;
+    size_t plain_len = 0;
+    int rc = axl_decompress(fmt, comp, comp_len, &plain, &plain_len);
+    bool ok = (rc == AXL_OK) && (plain_len == len)
+              && (len == 0 || axl_memcmp(plain, data, len) == 0);
+    test_check(ok, label);
+    axl_free(comp);
+    axl_free(plain);
+    return ok ? comp_len : (size_t)-1;
+}
+
+static void
+test_compress_roundtrip(void)
+{
+    const AxlCompressFormat fmts[] = {
+        AXL_COMPRESS_GZIP, AXL_COMPRESS_ZLIB, AXL_COMPRESS_DEFLATE_RAW
+    };
+    const char *names[] = { "gzip", "zlib", "raw" };
+
+    for (size_t i = 0; i < 3; i++) {
+        char lbl[64];
+        /* empty input */
+        axl_snprintf(lbl, sizeof(lbl), "compress %s: empty round-trip", names[i]);
+        roundtrip_compress(fmts[i], AXL_COMPRESS_LEVEL_DEFAULT, "", 0, lbl);
+
+        /* short text */
+        axl_snprintf(lbl, sizeof(lbl), "compress %s: short round-trip", names[i]);
+        roundtrip_compress(fmts[i], AXL_COMPRESS_LEVEL_DEFAULT,
+                           "hello, hello, hello", 19, lbl);
+
+        /* highly compressible → must shrink (5000 identical bytes) */
+        {
+            char *blob = axl_malloc(5000);
+            if (blob) {
+                axl_memset(blob, 'Z', 5000);
+                axl_snprintf(lbl, sizeof(lbl),
+                             "compress %s: compressible shrinks", names[i]);
+                size_t clen = roundtrip_compress(fmts[i],
+                                                 AXL_COMPRESS_LEVEL_DEFAULT,
+                                                 blob, 5000, lbl);
+                axl_snprintf(lbl, sizeof(lbl),
+                             "compress %s: ratio < 0.1 on 5000 Z", names[i]);
+                test_check(clen != (size_t)-1 && clen < 500, lbl);
+                axl_free(blob);
+            }
+        }
+
+        /* larger pseudo-random buffer (LCG) crossing block boundaries */
+        {
+            size_t n = 100000;
+            uint8_t *blob = axl_malloc(n);
+            if (blob) {
+                uint32_t s = 0x12345678u;
+                for (size_t k = 0; k < n; k++) {
+                    s = s * 1103515245u + 12345u;
+                    blob[k] = (uint8_t)(s >> 16);
+                }
+                axl_snprintf(lbl, sizeof(lbl),
+                             "compress %s: 100KB random round-trip", names[i]);
+                roundtrip_compress(fmts[i], AXL_COMPRESS_LEVEL_DEFAULT,
+                                   blob, n, lbl);
+                axl_free(blob);
+            }
+        }
+    }
+}
+
+static void
+test_compress_levels(void)
+{
+    const char *data = "level test level test level test level test";
+    roundtrip_compress(AXL_COMPRESS_GZIP, 0, data, 43, "compress: level 0 round-trip");
+    roundtrip_compress(AXL_COMPRESS_GZIP, 9, data, 43, "compress: level 9 round-trip");
+    /* out-of-range level is clamped, not rejected */
+    roundtrip_compress(AXL_COMPRESS_GZIP, 99, data, 43, "compress: level 99 clamped round-trip");
+}
+
+static void
+test_compress_gzip_framing(void)
+{
+    const char *data = "framing check framing check framing check";
+    size_t len = 41;
+    void  *gz = NULL;
+    size_t gz_len = 0;
+    if (axl_compress(AXL_COMPRESS_GZIP, data, len, &gz, &gz_len,
+                     AXL_COMPRESS_LEVEL_DEFAULT) != AXL_OK) {
+        test_fail("compress gzip framing: compress");
+        return;
+    }
+    const uint8_t *b = gz;
+    test_check(gz_len >= 18, "gzip framing: at least header+trailer");
+    test_check(b[0] == 0x1f && b[1] == 0x8b, "gzip framing: magic 1f 8b");
+    test_check(b[2] == 0x08, "gzip framing: CM = deflate (08)");
+
+    /* ISIZE trailer (last 4 bytes, little-endian) == uncompressed len. */
+    uint32_t isize = (uint32_t)b[gz_len - 4]
+                   | ((uint32_t)b[gz_len - 3] << 8)
+                   | ((uint32_t)b[gz_len - 2] << 16)
+                   | ((uint32_t)b[gz_len - 1] << 24);
+    test_check(isize == len, "gzip framing: ISIZE == input length");
+
+    /* CRC-32 trailer (4 bytes before ISIZE, little-endian) == crc of input. */
+    uint32_t crc = (uint32_t)b[gz_len - 8]
+                 | ((uint32_t)b[gz_len - 7] << 8)
+                 | ((uint32_t)b[gz_len - 6] << 16)
+                 | ((uint32_t)b[gz_len - 5] << 24);
+    test_check(crc == axl_crc32(0, data, len), "gzip framing: CRC-32 matches");
+    axl_free(gz);
+}
+
+static void
+test_compress_interop_inbound(void)
+{
+    /* Decode a real `gzip`-produced member (FNAME flag set). */
+    void  *out = NULL;
+    size_t out_len = 0;
+    int rc = axl_decompress(AXL_COMPRESS_GZIP, canned_gz_fname,
+                            sizeof(canned_gz_fname), &out, &out_len);
+    test_check(rc == AXL_OK && out_len == CANNED_PLAIN_LEN
+               && axl_memcmp(out, canned_plain, CANNED_PLAIN_LEN) == 0,
+               "compress interop: decode host gzip (skips FNAME)");
+    axl_free(out);
+
+    /* Decode a real zlib stream (0x78 0xda). */
+    out = NULL; out_len = 0;
+    rc = axl_decompress(AXL_COMPRESS_ZLIB, canned_zlib,
+                        sizeof(canned_zlib), &out, &out_len);
+    test_check(rc == AXL_OK && out_len == CANNED_PLAIN_LEN
+               && axl_memcmp(out, canned_plain, CANNED_PLAIN_LEN) == 0,
+               "compress interop: decode host zlib");
+    axl_free(out);
+}
+
+static void
+test_compress_errors(void)
+{
+    void  *out = NULL;
+    size_t out_len = 0;
+
+    /* Wrong magic for gzip. */
+    uint8_t bad_magic[20] = { 0x00, 0x00, 0x08 };
+    test_check(axl_decompress(AXL_COMPRESS_GZIP, bad_magic, sizeof(bad_magic),
+                              &out, &out_len) == AXL_ERR,
+               "compress error: gzip wrong magic rejected");
+
+    /* Truncated gzip (header only, no trailer). */
+    test_check(axl_decompress(AXL_COMPRESS_GZIP, canned_gz_fname, 12,
+                              &out, &out_len) == AXL_ERR,
+               "compress error: truncated gzip rejected");
+
+    /* Corrupt payload → CRC mismatch. Copy the canned member, flip a
+       body byte (well past the 19-byte header, before the 8-byte trailer). */
+    uint8_t corrupt[sizeof(canned_gz_fname)];
+    axl_memcpy(corrupt, canned_gz_fname, sizeof(canned_gz_fname));
+    corrupt[30] ^= 0xFF;
+    test_check(axl_decompress(AXL_COMPRESS_GZIP, corrupt, sizeof(corrupt),
+                              &out, &out_len) == AXL_ERR,
+               "compress error: corrupt gzip body caught (CRC/inflate)");
+
+    /* NULL output pointer. */
+    test_check(axl_compress(AXL_COMPRESS_GZIP, "x", 1, NULL, &out_len,
+                            AXL_COMPRESS_LEVEL_DEFAULT) == AXL_ERR,
+               "compress error: NULL out pointer rejected");
+
+    /* Forged gzip ISIZE claiming ~4 GiB → must be rejected by the
+       output cap before any giant allocation, not honored. */
+    uint8_t big_isize[sizeof(canned_gz_fname)];
+    axl_memcpy(big_isize, canned_gz_fname, sizeof(canned_gz_fname));
+    big_isize[sizeof(big_isize) - 4] = 0xFF;
+    big_isize[sizeof(big_isize) - 3] = 0xFF;
+    big_isize[sizeof(big_isize) - 2] = 0xFF;
+    big_isize[sizeof(big_isize) - 1] = 0xFF;
+    test_check(axl_decompress(AXL_COMPRESS_GZIP, big_isize, sizeof(big_isize),
+                              &out, &out_len) == AXL_ERR,
+               "compress error: forged 4 GiB ISIZE rejected (output cap)");
+
+    /* zlib with a corrupt body → Adler-32 mismatch. */
+    uint8_t zbad[sizeof(canned_zlib)];
+    axl_memcpy(zbad, canned_zlib, sizeof(canned_zlib));
+    zbad[20] ^= 0xFF;  /* flip a body byte (past the 2-byte header) */
+    test_check(axl_decompress(AXL_COMPRESS_ZLIB, zbad, sizeof(zbad),
+                              &out, &out_len) == AXL_ERR,
+               "compress error: corrupt zlib body caught (Adler/inflate)");
+
+    /* zlib with an invalid header (fails the %31 check). */
+    uint8_t zhdr[8] = { 0x78, 0x00, 0, 0, 0, 0, 0, 0 };  /* 0x7800 % 31 != 0 */
+    test_check(axl_decompress(AXL_COMPRESS_ZLIB, zhdr, sizeof(zhdr),
+                              &out, &out_len) == AXL_ERR,
+               "compress error: zlib bad header (%31) rejected");
+}
+
+// ---------------------------------------------------------------------------
+// AxlCompress — stream filters
+// ---------------------------------------------------------------------------
+
+/* Read an entire stream into a freshly allocated buffer. */
+static uint8_t *
+read_all_stream(AxlStream *s, size_t *out_len)
+{
+    AxlStream *acc = axl_bufopen();
+    if (acc == NULL) {
+        return NULL;
+    }
+    uint8_t tmp[1024];
+    for (;;) {
+        axl_ssize_t got = axl_read(s, tmp, sizeof(tmp));
+        if (got <= 0) {
+            break;
+        }
+        axl_write(acc, tmp, (size_t)got);
+    }
+    size_t      n   = 0;
+    const void *dat = axl_bufdata(acc, &n);
+    uint8_t    *buf = axl_malloc(n == 0 ? 1 : n);
+    if (buf != NULL && n != 0) {
+        axl_memcpy(buf, dat, n);
+    }
+    *out_len = n;
+    axl_fclose(acc);
+    return buf;
+}
+
+static void
+test_compress_writer(void)
+{
+    const char *data = "stream writer payload stream writer payload stream";
+    size_t len = 50;
+
+    /* Explicit finish: write through a gzip writer into a buffer sink,
+       then decode the sink and compare. */
+    AxlStream *sink = axl_bufopen();
+    AxlStream *w    = axl_gzip_writer(sink, AXL_COMPRESS_LEVEL_DEFAULT);
+    test_check(w != NULL, "compress writer: created");
+    if (w != NULL) {
+        axl_write(w, data, len);
+        int rc = axl_compress_writer_finish(w);
+        test_check(rc == AXL_OK, "compress writer: finish ok");
+
+        size_t      gzn = 0;
+        const void *gz  = axl_bufdata(sink, &gzn);
+        void       *plain = NULL;
+        size_t      pn = 0;
+        int drc = axl_decompress(AXL_COMPRESS_GZIP, gz, gzn, &plain, &pn);
+        test_check(drc == AXL_OK && pn == len
+                   && axl_memcmp(plain, data, len) == 0,
+                   "compress writer: sink holds valid gzip of input");
+        axl_free(plain);
+
+        /* finish is idempotent. */
+        test_check(axl_compress_writer_finish(w) == AXL_OK,
+                   "compress writer: finish idempotent");
+        axl_fclose(w);
+    }
+    axl_fclose(sink);
+
+    /* finish on a non-writer stream is rejected. */
+    AxlStream *plainbuf = axl_bufopen();
+    test_check(axl_compress_writer_finish(plainbuf) == AXL_ERR,
+               "compress writer: finish on non-writer rejected");
+    axl_fclose(plainbuf);
+
+    /* Implicit finalize on close: no explicit finish, fclose must flush
+       a valid stream to the sink. Sink is closed after the writer. */
+    AxlStream *sink2 = axl_bufopen();
+    AxlStream *w2    = axl_gzip_writer(sink2, AXL_COMPRESS_LEVEL_DEFAULT);
+    if (w2 != NULL) {
+        axl_write(w2, data, len);
+        axl_fclose(w2);  /* implicit finish */
+        size_t      gzn = 0;
+        const void *gz  = axl_bufdata(sink2, &gzn);
+        void       *plain = NULL;
+        size_t      pn = 0;
+        int drc = axl_decompress(AXL_COMPRESS_GZIP, gz, gzn, &plain, &pn);
+        test_check(drc == AXL_OK && pn == len
+                   && axl_memcmp(plain, data, len) == 0,
+                   "compress writer: fclose finalizes implicitly");
+        axl_free(plain);
+    }
+    axl_fclose(sink2);
+}
+
+static void
+test_compress_reader(void)
+{
+    const char *data = "stream reader payload, repeated. stream reader payload.";
+    size_t len = 55;
+
+    /* End-to-end through the stream layer: gzip writer -> buffer ->
+       gzip reader -> compare. */
+    AxlStream *mid = axl_bufopen();
+    AxlStream *w   = axl_gzip_writer(mid, AXL_COMPRESS_LEVEL_DEFAULT);
+    axl_write(w, data, len);
+    axl_compress_writer_finish(w);
+    axl_fclose(w);
+    axl_fseek(mid, 0, AXL_SEEK_SET);
+
+    AxlStream *r = axl_gzip_reader(mid);
+    test_check(r != NULL, "compress reader: created over gzip stream");
+    if (r != NULL) {
+        size_t   pn = 0;
+        uint8_t *plain = read_all_stream(r, &pn);
+        test_check(pn == len && plain != NULL
+                   && axl_memcmp(plain, data, len) == 0,
+                   "compress reader: round-trips writer output");
+        axl_free(plain);
+
+        /* Seekable: rewind and re-read the first few bytes. */
+        axl_fseek(r, 0, AXL_SEEK_SET);
+        char head[6] = {0};
+        axl_read(r, head, 5);
+        test_check(axl_memcmp(head, data, 5) == 0,
+                   "compress reader: seek SET re-reads plaintext");
+
+        /* End position equals the plaintext length. */
+        axl_fseek(r, 0, AXL_SEEK_END);
+        test_check(axl_ftell(r) == (int64_t)len,
+                   "compress reader: SEEK_END tell == plaintext length");
+        axl_fclose(r);
+    }
+    axl_fclose(mid);
+
+    /* Generic format param (zlib) also works. */
+    void  *zl = NULL;
+    size_t zln = 0;
+    axl_compress(AXL_COMPRESS_ZLIB, data, len, &zl, &zln,
+                 AXL_COMPRESS_LEVEL_DEFAULT);
+    AxlStream *zsrc = axl_bufopen();
+    axl_write(zsrc, zl, zln);
+    axl_fseek(zsrc, 0, AXL_SEEK_SET);
+    axl_free(zl);
+    AxlStream *zr = axl_compress_reader(AXL_COMPRESS_ZLIB, zsrc);
+    test_check(zr != NULL, "compress reader: zlib format param");
+    if (zr != NULL) {
+        size_t   pn = 0;
+        uint8_t *plain = read_all_stream(zr, &pn);
+        test_check(pn == len && plain != NULL
+                   && axl_memcmp(plain, data, len) == 0,
+                   "compress reader: zlib round-trips");
+        axl_free(plain);
+        axl_fclose(zr);
+    }
+    axl_fclose(zsrc);
+
+    /* A corrupt stream yields NULL at construction. */
+    AxlStream *bsrc = axl_bufopen();
+    uint8_t junk[32];
+    axl_memset(junk, 0x5A, sizeof(junk));
+    axl_write(bsrc, junk, sizeof(junk));
+    axl_fseek(bsrc, 0, AXL_SEEK_SET);
+    test_check(axl_gzip_reader(bsrc) == NULL,
+               "compress reader: corrupt gzip source yields NULL");
+    axl_fclose(bsrc);
+}
+
+static void
 test_checksum_type_length(void)
 {
     test_check(axl_checksum_type_get_length(AXL_CHECKSUM_MD5) == 16,
@@ -5073,6 +5533,15 @@ test_data_main(int argc, char **argv)
     test_checksum_sha256();
     test_checksum_incremental();
     test_checksum_get_digest();
+    test_crc32();
+    test_adler32();
+    test_compress_roundtrip();
+    test_compress_levels();
+    test_compress_gzip_framing();
+    test_compress_interop_inbound();
+    test_compress_errors();
+    test_compress_writer();
+    test_compress_reader();
     test_checksum_type_length();
 
     axl_printf("\n--- OOM Injection ---\n");

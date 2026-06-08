@@ -7,6 +7,7 @@
 
 #include "axl-test.h"
 
+#include <axl/axl-edid.h>
 #include <axl/axl-font.h>
 #include <axl/axl-gfx.h>
 #include <axl/axl-math.h>
@@ -5777,6 +5778,301 @@ test_gamma_gradient_ramp_linear(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlEdid — EDID base-block parser (pure; unit-tested against a canned
+// blob so the decode logic gets real coverage without a display)
+// ---------------------------------------------------------------------------
+
+/* Build a spec-faithful EDID 1.4 base block for a fictional 1920x1080
+   digital "DELL U2412M" panel. Bytes are placed at their EDID offsets
+   independently of the parser; byte 127 (checksum) is computed last so
+   the block validates. */
+static void
+make_test_edid(
+    uint8_t  e[128]
+    )
+{
+    for (int i = 0; i < 128; i++) { e[i] = 0; }
+    /* Header magic 00 FF FF FF FF FF FF 00. */
+    e[1] = e[2] = e[3] = e[4] = e[5] = e[6] = 0xFF;
+    /* Manufacturer "DEL" = (4<<10)|(5<<5)|12 = 0x10AC, big-endian. */
+    e[8] = 0x10; e[9] = 0xAC;
+    /* Product code 0x51A0 (LE), serial 0x04030201 (LE). */
+    e[10] = 0xA0; e[11] = 0x51;
+    e[12] = 0x01; e[13] = 0x02; e[14] = 0x03; e[15] = 0x04;
+    e[16] = 16;   /* week 16 */
+    e[17] = 33;   /* year 1990 + 33 = 2023 */
+    e[18] = 1; e[19] = 4;   /* EDID 1.4 */
+    e[20] = 0x80;           /* digital input (bit 7) */
+    e[21] = 52; e[22] = 32; /* max image size cm (not asserted) */
+
+    /* Detailed Timing Descriptor #1 at offset 54: 1920x1080,
+       pixel clock 148.5 MHz, image 477x268 mm. */
+    int d = 54;
+    e[d + 0] = 0x02; e[d + 1] = 0x3A;  /* clock 14850 (x10 kHz) = 148500 kHz, LE */
+    e[d + 2] = 0x80;  /* h active low  (1920 & 0xFF) */
+    e[d + 3] = 0x18;  /* h blank  low  (280  & 0xFF) */
+    e[d + 4] = 0x71;  /* hi nibbles: h active 7 (0x780), h blank 1 (0x118) */
+    e[d + 5] = 0x38;  /* v active low  (1080 & 0xFF) */
+    e[d + 6] = 0x2D;  /* v blank  low  (45) */
+    e[d + 7] = 0x40;  /* hi nibbles: v active 4 (0x438), v blank 0 */
+    e[d + 12] = 0xDD; /* h image size low (477 & 0xFF) */
+    e[d + 13] = 0x0C; /* v image size low (268 & 0xFF) */
+    e[d + 14] = 0x11; /* hi nibbles: h size 1 (0x1DD), v size 1 (0x10C) */
+
+    /* Monitor Name descriptor (0xFC) at offset 72: "DELL U2412M". */
+    int n = 72;
+    e[n + 3] = 0xFC;
+    const char *name = "DELL U2412M";
+    int k = 0;
+    for (; name[k]; k++) { e[n + 5 + k] = (uint8_t)name[k]; }
+    e[n + 5 + k] = 0x0A;
+    for (int j = n + 5 + k + 1; j < n + 18; j++) { e[j] = 0x20; }
+
+    /* Monitor Serial descriptor (0xFF) at offset 90: "ABC123". */
+    int s = 90;
+    e[s + 3] = 0xFF;
+    const char *ser = "ABC123";
+    k = 0;
+    for (; ser[k]; k++) { e[s + 5 + k] = (uint8_t)ser[k]; }
+    e[s + 5 + k] = 0x0A;
+    for (int j = s + 5 + k + 1; j < s + 18; j++) { e[j] = 0x20; }
+
+    /* Unused dummy descriptor at offset 108. */
+    e[108 + 3] = 0x10;
+
+    e[126] = 1;  /* extension count */
+
+    /* Checksum: all 128 bytes sum to 0 mod 256. */
+    unsigned sum = 0;
+    for (int i = 0; i < 127; i++) { sum += e[i]; }
+    e[127] = (uint8_t)((256u - (sum & 0xFFu)) & 0xFFu);
+}
+
+static void
+test_edid_parse_valid(void)
+{
+    uint8_t e[128];
+    make_test_edid(e);
+    AxlEdidInfo info;
+    test_check(axl_edid_parse(e, sizeof e, &info) == AXL_OK,
+               "edid: valid base block parses");
+    test_check(axl_strcmp(info.manufacturer, "DEL") == 0,
+               "edid: manufacturer == DEL");
+    test_check(info.product_code == 0x51A0, "edid: product_code == 0x51A0");
+    test_check(info.serial_number == 0x04030201u,
+               "edid: serial_number == 0x04030201");
+    test_check(info.manufacture_week == 16, "edid: week == 16");
+    test_check(info.manufacture_year == 2023, "edid: year == 2023");
+    test_check(info.version == 1 && info.revision == 4,
+               "edid: version 1.4");
+    test_check(info.digital, "edid: digital input");
+    test_check(info.native_width == 1920, "edid: native_width == 1920");
+    test_check(info.native_height == 1080, "edid: native_height == 1080");
+    test_check(info.native_pixel_clock_khz == 148500,
+               "edid: pixel clock == 148500 kHz");
+    test_check(info.image_width_mm == 477, "edid: image_width_mm == 477");
+    test_check(info.image_height_mm == 268, "edid: image_height_mm == 268");
+    test_check(info.extension_count == 1, "edid: extension_count == 1");
+    test_check(axl_strcmp(info.monitor_name, "DELL U2412M") == 0,
+               "edid: monitor_name == 'DELL U2412M'");
+    test_check(axl_strcmp(info.monitor_serial, "ABC123") == 0,
+               "edid: monitor_serial == 'ABC123'");
+}
+
+static void
+test_edid_dpi(void)
+{
+    uint8_t e[128];
+    make_test_edid(e);
+    AxlEdidInfo info;
+    (void)axl_edid_parse(e, sizeof e, &info);
+    uint32_t dx = 0, dy = 0;
+    /* 1920 * 25.4 / 477 = 102.2; 1080 * 25.4 / 268 = 102.4 → both 102. */
+    test_check(axl_edid_dpi(&info, &dx, &dy) == AXL_OK, "edid: dpi computes");
+    test_check(dx == 102, "edid: dpi_x == 102");
+    test_check(dy == 102, "edid: dpi_y == 102");
+    /* A zero-size EDID can't yield DPI. */
+    AxlEdidInfo zero = {0};
+    test_check(axl_edid_dpi(&zero, &dx, &dy) == AXL_ERR,
+               "edid: dpi errors on zero image size");
+}
+
+static void
+test_edid_rejects_bad(void)
+{
+    uint8_t e[128];
+    make_test_edid(e);
+    AxlEdidInfo info;
+    /* Corrupt a payload byte without fixing the checksum → reject. */
+    uint8_t saved = e[10];
+    e[10] = (uint8_t)(saved ^ 0xFF);
+    test_check(axl_edid_parse(e, sizeof e, &info) == AXL_ERR,
+               "edid: bad checksum rejected");
+    e[10] = saved;
+    test_check(axl_edid_parse(e, sizeof e, &info) == AXL_OK,
+               "edid: restored block valid again");
+    /* Bad header magic. */
+    e[0] = 0x01;
+    test_check(axl_edid_parse(e, sizeof e, &info) == AXL_ERR,
+               "edid: bad header magic rejected");
+    /* Short buffer. */
+    make_test_edid(e);
+    test_check(axl_edid_parse(e, 127, &info) == AXL_ERR,
+               "edid: buffer < 128 bytes rejected");
+    /* NULL args. */
+    test_check(axl_edid_parse(NULL, 128, &info) == AXL_ERR,
+               "edid: NULL edid rejected");
+    test_check(axl_edid_parse(e, 128, NULL) == AXL_ERR,
+               "edid: NULL out rejected");
+}
+
+// ---------------------------------------------------------------------------
+// AxlGfx pixel-format / EDID accessors. NULL-arg guards hold regardless
+// of GOP state; the available-vs-headless behavior is split into two
+// branches with EQUAL test_check counts so the cross-arch ratchet stays
+// balanced — x64 OVMF exposes a GOP even under -nographic while aa64
+// reports none (same split the modes contract test handles).
+// ---------------------------------------------------------------------------
+
+static void
+test_gfx_pixel_accessors_contract(void)
+{
+    AxlGfxPixelFormat  fmt = AXL_GFX_PIXEL_FORMAT_RGBX8;
+    AxlGfxPixelBitmask bm;
+    const uint8_t     *edid = NULL;
+    size_t             len  = 0;
+
+    /* NULL-argument guards — true on every platform. */
+    test_check(axl_gfx_get_pixel_format(NULL) == AXL_ERR,
+               "gfx: get_pixel_format rejects NULL out");
+    test_check(axl_gfx_get_pixel_bitmask(NULL) == AXL_ERR,
+               "gfx: get_pixel_bitmask rejects NULL out");
+    test_check(axl_gfx_get_edid(NULL, &len) == AXL_ERR,
+               "gfx: get_edid rejects NULL bytes");
+    test_check(axl_gfx_get_edid(&edid, NULL) == AXL_ERR,
+               "gfx: get_edid rejects NULL len");
+
+    if (axl_gfx_available()) {
+        /* A real GOP is present: the positive path resolves a valid
+           format; bitmask reads succeed iff the format is bitmask; an
+           EDID, if published, is at least a full base block. */
+        test_check(axl_gfx_get_pixel_format(&fmt) == AXL_OK
+                   && fmt <= AXL_GFX_PIXEL_FORMAT_BLT_ONLY,
+                   "gfx: get_pixel_format resolves a valid format");
+        test_check((axl_gfx_get_pixel_bitmask(&bm) == AXL_OK)
+                   == (fmt == AXL_GFX_PIXEL_FORMAT_BITMASK),
+                   "gfx: get_pixel_bitmask succeeds iff format is bitmask");
+        test_check(axl_gfx_get_edid(&edid, &len) != AXL_OK
+                   || (edid != NULL && len >= AXL_EDID_BLOCK_SIZE),
+                   "gfx: get_edid, when present, yields a full base block");
+    } else {
+        /* Headless (no GOP): every accessor fails safe. */
+        test_check(axl_gfx_get_pixel_format(&fmt) == AXL_ERR,
+                   "gfx: get_pixel_format AXL_ERR when no GOP");
+        test_check(axl_gfx_get_pixel_bitmask(&bm) == AXL_ERR,
+                   "gfx: get_pixel_bitmask AXL_ERR when no GOP");
+        test_check(axl_gfx_get_edid(&edid, &len) == AXL_ERR,
+                   "gfx: get_edid AXL_ERR when no GOP");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axl_gfx_set_native_mode contract. No display in QEMU publishes EDID,
+// so the native timing never resolves and the call reports AXL_ERR on
+// both arches — and, critically, must do so WITHOUT switching the mode
+// (the EDID checks precede SetMode). The positive switch-to-native path
+// is real-hardware-only (needs a panel with EDID). Two checks per
+// branch keep the cross-arch ratchet balanced.
+// ---------------------------------------------------------------------------
+
+static void
+test_gfx_native_mode_contract(void)
+{
+    uint32_t before = 0, after = 0;
+    bool had_mode = (axl_gfx_current_mode(&before) == AXL_OK);
+
+    test_check(axl_gfx_set_native_mode() == AXL_ERR,
+               "gfx: set_native_mode AXL_ERR when no EDID native timing");
+
+    if (had_mode) {
+        /* It failed before reaching SetMode, so the mode is untouched. */
+        test_check(axl_gfx_current_mode(&after) == AXL_OK && after == before,
+                   "gfx: failed set_native_mode left the mode unchanged");
+    } else {
+        test_check(axl_gfx_current_mode(&after) == AXL_ERR,
+                   "gfx: no GOP -> current_mode still AXL_ERR after attempt");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DPI / scale. axl_gfx_scale_for_dpi is pure (exact-value tested, arch-
+// independent); axl_gfx_get_dpi / recommended_scale are EDID glue, so
+// their EDID-present path is real-hardware-only — here we pin the
+// no-EDID contract (AXL_ERR / scale 1), identical on both arches.
+// ---------------------------------------------------------------------------
+
+static void
+test_gfx_scale_for_dpi(void)
+{
+    /* Threshold boundaries: <144 → 1, 144..239 → 2, >=240 → 3. */
+    test_check(axl_gfx_scale_for_dpi(0) == 1,   "scale_for_dpi: 0 -> 1");
+    test_check(axl_gfx_scale_for_dpi(96) == 1,  "scale_for_dpi: 96 -> 1");
+    test_check(axl_gfx_scale_for_dpi(143) == 1, "scale_for_dpi: 143 -> 1");
+    test_check(axl_gfx_scale_for_dpi(144) == 2, "scale_for_dpi: 144 -> 2");
+    test_check(axl_gfx_scale_for_dpi(200) == 2, "scale_for_dpi: 200 -> 2");
+    test_check(axl_gfx_scale_for_dpi(239) == 2, "scale_for_dpi: 239 -> 2");
+    test_check(axl_gfx_scale_for_dpi(240) == 3, "scale_for_dpi: 240 -> 3");
+    test_check(axl_gfx_scale_for_dpi(400) == 3, "scale_for_dpi: 400 -> 3");
+}
+
+static void
+test_gfx_dpi_contract(void)
+{
+    /* No EDID in QEMU → DPI unavailable on both arches. */
+    uint32_t dx = 7, dy = 7;
+    test_check(axl_gfx_get_dpi(&dx, &dy) == AXL_ERR,
+               "gfx: get_dpi AXL_ERR without EDID");
+    /* recommended_scale defaults to 1 (no scaling) when DPI is unknown. */
+    test_check(axl_gfx_recommended_scale() == 1,
+               "gfx: recommended_scale defaults to 1 without EDID");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-output enumeration. Unlike the EDID-gated helpers, this only
+// needs a GOP — so the positive path IS exercised on x64 (OVMF exposes a
+// GOP under -nographic) while aa64 takes the no-output branch. Balanced
+// check counts keep the cross-arch ratchet even.
+// ---------------------------------------------------------------------------
+
+static void
+test_gfx_output_contract(void)
+{
+    AxlGfxOutput o;
+    size_t       n = axl_gfx_output_count();
+
+    /* Guards — both arches. */
+    test_check(axl_gfx_output_get(0, NULL) == AXL_ERR,
+               "gfx: output_get rejects NULL out");
+    test_check(axl_gfx_output_get(n + 100, &o) == AXL_ERR,
+               "gfx: output_get rejects out-of-range index");
+
+    if (n > 0) {
+        test_check(axl_gfx_output_get(0, &o) == AXL_OK
+                   && o.width >= 1 && o.height >= 1 && o.stride >= o.width
+                   && o.pixel_format <= AXL_GFX_PIXEL_FORMAT_BLT_ONLY,
+                   "gfx: output_get(0) populates a valid output");
+        test_check(o.edid == NULL ? (o.edid_len == 0)
+                                  : (o.edid_len >= AXL_EDID_BLOCK_SIZE),
+                   "gfx: output EDID is NULL/empty or a full base block");
+    } else {
+        test_check(axl_gfx_output_get(0, &o) == AXL_ERR,
+                   "gfx: output_get(0) AXL_ERR when no outputs");
+        test_check(axl_gfx_output_count() == 0,
+                   "gfx: output_count 0 when no GOP");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -6068,6 +6364,16 @@ test_gfx_main(
     test_gamma_composite_lightens_midpoint();
     test_gamma_opaque_unaffected();
     test_gamma_gradient_ramp_linear();
+
+    test_edid_parse_valid();
+    test_edid_dpi();
+    test_edid_rejects_bad();
+
+    test_gfx_pixel_accessors_contract();
+    test_gfx_native_mode_contract();
+    test_gfx_scale_for_dpi();
+    test_gfx_dpi_contract();
+    test_gfx_output_contract();
 
     return test_print_results();
 }

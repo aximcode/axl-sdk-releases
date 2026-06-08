@@ -271,5 +271,10 @@ typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE           *Mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
+typedef struct _EFI_EDID_DISCOVERED_PROTOCOL {
+ UINT32                              SizeOfEdid;
+ UINT8                               *Edid;
+} EFI_EDID_DISCOVERED_PROTOCOL;
+
 
 #endif /* AXL_UEFI_GEN_CONSOLE_H */

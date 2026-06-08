@@ -619,6 +619,25 @@ dir_walk_recursive(
                       && (root[root_len - 1] == '/'
                           || root[root_len - 1] == '\\'));
 
+    /* Join children with the separator the root already uses, so the
+       composed path reopens on strict volumes. This historically
+       hardcoded '/', which yields a mixed-separator path (e.g.
+       "FS1:\sub/b.txt") on a backslash-rooted UEFI volume — VirtioFsDxe
+       and other strict providers then fail to open it. Pick the root's
+       last separator; with none present, infer '\' from a "VOL:" prefix
+       (UEFI volume root), else default to '/'. */
+    char sep   = '/';
+    bool found = false;
+    for (size_t i = root_len; i > 0 && !found; i--) {
+        char c = root[i - 1];
+        if (c == '/' || c == '\\') { sep = c; found = true; }
+    }
+    if (!found) {
+        for (size_t i = 0; i < root_len; i++) {
+            if (root[i] == ':') { sep = '\\'; break; }
+        }
+    }
+
     AxlFsEntry  entry;
     int         rc = 0;
     while (rc == 0 && axl_dir_read(dir, &entry)) {
@@ -628,10 +647,13 @@ dir_walk_recursive(
         }
 
         char full_path[AXL_DIR_WALK_PATH_MAX];
-        axl_snprintf(full_path, sizeof(full_path), "%s%s%s",
-                     root,
-                     has_sep ? "" : "/",
-                     entry.name);
+        if (has_sep) {
+            axl_snprintf(full_path, sizeof(full_path), "%s%s",
+                         root, entry.name);
+        } else {
+            axl_snprintf(full_path, sizeof(full_path), "%s%c%s",
+                         root, sep, entry.name);
+        }
 
         rc = fn(full_path, &entry, user);
         if (rc != 0) break;

@@ -123,10 +123,12 @@ fi
 
 # Extra QEMU wiring: a monitor socket for `sendkey` (both arches) and,
 # on aa64, a USB keyboard since the `virt` machine ships none.
-qemu_args=(--qemu-arg "-monitor unix:$MON,server,nowait")
+# One --qemu-arg per token: run-qemu.sh's --qemu-arg appends each value
+# verbatim (no word-splitting), so a flag + its value are two --qemu-arg's.
+qemu_args=(--qemu-arg -monitor --qemu-arg "unix:$MON,server,nowait")
 if [[ "$ARCH" == "AARCH64" ]]; then
-    qemu_args+=(--qemu-arg "-device qemu-xhci,id=axl_kbd_xhci")
-    qemu_args+=(--qemu-arg "-device usb-kbd,bus=axl_kbd_xhci.0")
+    qemu_args+=(--qemu-arg -device --qemu-arg "qemu-xhci,id=axl_kbd_xhci")
+    qemu_args+=(--qemu-arg -device --qemu-arg "usb-kbd,bus=axl_kbd_xhci.0")
 fi
 
 rm -f "$SOCK" "$MON"

@@ -130,11 +130,13 @@ fi
 # A usb-kbd is added on BOTH arches: QMP `input-send-event` key events
 # route to the USB HID keyboard, not the x64 q35 PS/2 controller (unlike
 # HMP `sendkey`), so the PS/2 default alone receives nothing here.
+# One --qemu-arg per token: run-qemu.sh appends each --qemu-arg value
+# verbatim (no word-splitting), so a flag + its value are two --qemu-arg's.
 qemu_args=(
-    --qemu-arg "-qmp unix:$QMP,server,nowait"
-    --qemu-arg "-device qemu-xhci,id=axl_hid_xhci"
-    --qemu-arg "-device usb-mouse,bus=axl_hid_xhci.0,id=axl_mouse"
-    --qemu-arg "-device usb-kbd,bus=axl_hid_xhci.0"
+    --qemu-arg -qmp    --qemu-arg "unix:$QMP,server,nowait"
+    --qemu-arg -device --qemu-arg "qemu-xhci,id=axl_hid_xhci"
+    --qemu-arg -device --qemu-arg "usb-mouse,bus=axl_hid_xhci.0,id=axl_mouse"
+    --qemu-arg -device --qemu-arg "usb-kbd,bus=axl_hid_xhci.0"
 )
 
 rm -f "$SOCK" "$QMP"

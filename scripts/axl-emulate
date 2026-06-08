@@ -23,7 +23,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -96,6 +100,8 @@ class Artifacts:
     spd: list[tuple[str, Path]] = field(default_factory=list)
     tpm_dir: Path | None = None
     manifest: dict[str, object] | None = None
+    nic_macs: list[str] = field(default_factory=list)  # net.json permanent MACs
+    cpu_spec: str | None = None  # cpu.json → QEMU -cpu override spec
 
 
 def acpi_signature(path: Path) -> str:
@@ -166,13 +172,93 @@ def discover_artifacts(fixture: Path) -> Artifacts:
                 file=sys.stderr,
             )
 
+    nic_macs = read_nic_macs(fixture / "net.json")
+    cpu_spec = read_cpu_spec(fixture / "cpu.json")
+
     return Artifacts(
         smbios=smbios if smbios.is_file() else None,
         acpi=acpi_tables,
         spd=spd_blobs,
         tpm_dir=tpm_dir if tpm_dir.is_dir() else None,
         manifest=manifest,
+        nic_macs=nic_macs,
+        cpu_spec=cpu_spec,
     )
+
+
+def read_nic_macs(net_json: Path) -> list[str]:
+    """Extract per-NIC hardware addresses from a captured net.json
+    (HF2.3 device manifest). Prefers each NIC's permanent_mac, falling
+    back to its current mac. Empty / all-zero / unreadable → []. The
+    --mac replay knob wires the first of these onto the QEMU NIC."""
+    if not net_json.is_file():
+        return []
+    try:
+        data = json.loads(net_json.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARN: net.json present but unreadable: {exc}", file=sys.stderr)
+        return []
+    # Tolerate a hand-edited net.json whose shape is off (valid JSON but
+    # not the expected {nics: [{...}]}) — warn and skip, never traceback.
+    if not isinstance(data, dict):
+        print("WARN: net.json is not a JSON object — ignoring", file=sys.stderr)
+        return []
+    nics = data.get("nics", [])
+    if not isinstance(nics, list):
+        return []
+    macs: list[str] = []
+    for nic in nics:
+        if not isinstance(nic, dict):
+            continue
+        mac = nic.get("permanent_mac") or nic.get("mac") or ""
+        mac = str(mac).strip()
+        # Skip empty / all-zero addresses — they can't identify a NIC.
+        if mac and set(mac) - {"0", ":"}:
+            macs.append(mac)
+    return macs
+
+
+def read_cpu_spec(cpu_json: Path) -> str | None:
+    """Translate a captured cpu.json (HF2.2 manifest) into a QEMU -cpu
+    spec for the --cpu-from-fixture replay knob. x86_64 → qemu64 with
+    vendor/family/model/stepping overrides; aarch64 → `max` with the
+    captured MIDR_EL1. Returns None (and warns) when cpu.json is
+    missing / malformed / an unsupported arch / carries no usable
+    identity, so replay proceeds on the default model."""
+    if not cpu_json.is_file():
+        return None
+    try:
+        data = json.loads(cpu_json.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARN: cpu.json present but unreadable: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print("WARN: cpu.json is not a JSON object — ignoring", file=sys.stderr)
+        return None
+
+    arch = str(data.get("arch", "")).lower()
+    if arch == "x86_64":
+        parts = ["qemu64"]
+        vendor = data.get("vendor")
+        if isinstance(vendor, str) and vendor:
+            parts.append(f"vendor={vendor}")
+        for key in ("family", "model", "stepping"):
+            val = data.get(key)
+            if isinstance(val, int):
+                parts.append(f"{key}={val}")
+        # Only meaningful if at least one identity field was present.
+        return ",".join(parts) if len(parts) > 1 else None
+    if arch == "aarch64":
+        midr = data.get("midr_el1")
+        if isinstance(midr, str) and midr:
+            return f"max,midr={midr}"
+        return None
+    print(
+        f"WARN: --cpu-from-fixture: unsupported cpu.json arch "
+        f"{arch!r} — no -cpu override",
+        file=sys.stderr,
+    )
+    return None
 
 
 def filter_acpi(
@@ -196,6 +282,63 @@ def filter_acpi(
     return kept, dropped
 
 
+def qarg(*tokens: str) -> list[str]:
+    """Wrap raw QEMU argv tokens as run-qemu.sh `--qemu-arg` pairs.
+    axl-emulate owns the QEMU device-token knowledge for the hardware
+    fixture (run-qemu.sh stays a generic launcher), so HF artifacts are
+    injected as `--qemu-arg <tok>` passthrough rather than dedicated
+    run-qemu.sh flags. e.g. qarg("-smbios", "file=x") -> ["--qemu-arg",
+    "-smbios", "--qemu-arg", "file=x"]."""
+    out: list[str] = []
+    for tok in tokens:
+        out.extend(["--qemu-arg", tok])
+    return out
+
+
+def tpm_model_for(arch: str | None) -> str:
+    """QEMU TPM device model by arch. tpm-tis is x86-only (ISA bus);
+    aarch64's virt machine takes tpm-tis-device (sysbus MMIO)."""
+    return "tpm-tis-device" if arch == "AARCH64" else "tpm-tis"
+
+
+def locate_swtpm() -> str | None:
+    """Find the swtpm binary (SWTPM= override, else PATH)."""
+    override = os.environ.get("SWTPM")
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    return shutil.which("swtpm")
+
+
+def spawn_swtpm(
+    swtpm: str, state_dir: Path, sock: str, log: str
+) -> subprocess.Popen[bytes]:
+    """Start a socket-backed swtpm over @state_dir, serving its control
+    interface on the unix socket @sock and writing diagnostics to @log
+    (surfaced if it fails to come up). Caller waits for the socket and is
+    responsible for teardown. Mirrors run-qemu.sh's prior lifecycle."""
+    return subprocess.Popen(
+        [
+            swtpm, "socket",
+            "--tpmstate", f"dir={state_dir}",
+            "--ctrl", f"type=unixio,path={sock}",
+            "--tpm2",
+            "--flags", "startup-clear",
+            "--log", f"file={log},level=1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _dump_file(path: str) -> None:
+    """Echo a log file to stderr (best-effort) for failure diagnostics."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            sys.stderr.write(fh.read())
+    except OSError:
+        pass
+
+
 def print_manifest_summary(manifest: dict[str, object]) -> None:
     """Print a one-line identity from the captured manifest so the
     user sees which machine the guest is impersonating. Tolerant
@@ -214,6 +357,10 @@ def build_run_qemu_args(
     keep_acpi: set[str],
     extra_drop_acpi: set[str],
     strict_acpi: bool,
+    replay_mac: bool,
+    replay_cpu: bool,
+    tpm_sock: str | None,
+    tpm_model: str | None,
     efi_file: Path | None,
     pass_through: list[str],
 ) -> list[str]:
@@ -225,14 +372,18 @@ def build_run_qemu_args(
     if arch is not None:
         args.extend(["--arch", arch])
 
+    # HF platform-identity injection is emitted as raw QEMU args via
+    # run-qemu.sh's --qemu-arg passthrough — run-qemu.sh is a generic
+    # launcher and does not know about fixtures (see the HF design doc's
+    # 2026-06-08 architecture decision).
     if artifacts.smbios is not None:
-        args.extend(["--smbios-file", str(artifacts.smbios)])
+        args += qarg("-smbios", f"file={artifacts.smbios}")
 
     warn_malformed_acpi(artifacts.acpi)
     denylist = (STRICT_DENYLIST if strict_acpi else DEFAULT_DENYLIST) | extra_drop_acpi
     kept, dropped = filter_acpi(artifacts.acpi, denylist, keep_acpi)
     for path in kept:
-        args.extend(["--acpi-table", str(path)])
+        args += qarg("-acpitable", f"file={path}")
     for path, sig in dropped:
         print(
             f"axl-emulate: dropping ACPI {sig} ({path.name}) — see design "
@@ -240,17 +391,79 @@ def build_run_qemu_args(
             file=sys.stderr,
         )
 
-    for addr, blob in artifacts.spd:
-        args.extend(["--spd", f"{addr}:{blob}"])
+    # SPD EEPROMs need the smbus-eeprom-with-memdev QEMU (x86-only chipset;
+    # the patched build). On aarch64 there is no ICH/PIIX4 SMBus to attach
+    # them to, so warn and skip rather than emit args QEMU will reject.
+    if artifacts.spd:
+        if arch == "AARCH64":
+            print(
+                f"WARN: skipping {len(artifacts.spd)} SPD blob(s) — SMBus "
+                "EEPROM replay is x86-only",
+                file=sys.stderr,
+            )
+        else:
+            # smbus-eeprom,memdev= is only accepted by a QEMU built with
+            # scripts/qemu-patches/0001-smbus-eeprom-add-memdev-link.patch;
+            # stock QEMU rejects the property at realize time. We can't
+            # probe here (run-qemu.sh owns QEMU discovery), so warn up-front.
+            print(
+                f"NOTE: wiring {len(artifacts.spd)} SPD EEPROM(s) — requires "
+                "a QEMU with the smbus-eeprom memdev patch (QEMU_DIR=...)",
+                file=sys.stderr,
+            )
+            for addr, blob in artifacts.spd:
+                # id derives from the address so repeated blobs get
+                # distinct memory-backend / device IDs.
+                spd_id = f"axl_spd_{addr[2:] if addr.startswith('0x') else addr}"
+                args += qarg(
+                    "-object",
+                    f"memory-backend-file,id={spd_id},mem-path={blob},"
+                    "size=4096,share=off,readonly=on",
+                    "-device",
+                    f"smbus-eeprom,address={addr},memdev={spd_id}",
+                )
 
-    if artifacts.tpm_dir is not None:
-        # HF1 contract: --tpm-state DIR is raw swtpm-format
-        # passthrough. HF5 will convert captured tpm/ artifacts
-        # (tpm.json + event-log.bin) into NVChip format before
-        # we get here. For HF3, an empty tpm/ subdir → swtpm
-        # initialises clean PCRs; a populated one is assumed
-        # already-converted (no-op until HF5).
-        args.extend(["--tpm-state", str(artifacts.tpm_dir)])
+    # HF4: replay the captured NIC hardware address. Opt-in (--mac),
+    # because adding a NIC changes the guest's device tree and most
+    # replays don't need one. QEMU takes a single --net NIC, so we wire
+    # the first captured MAC and warn if the fixture had more.
+    if replay_mac:
+        if artifacts.nic_macs:
+            args.extend(["--net", "--mac", artifacts.nic_macs[0]])
+            if len(artifacts.nic_macs) > 1:
+                print(
+                    f"WARN: --mac: net.json has {len(artifacts.nic_macs)} NICs; "
+                    f"wiring only the first ({artifacts.nic_macs[0]})",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "WARN: --mac requested but no usable MAC in net.json "
+                "(missing/empty) — no NIC wired",
+                file=sys.stderr,
+            )
+
+    # HF4: replay the captured CPU identity (cpu.json → -cpu override).
+    if replay_cpu:
+        if artifacts.cpu_spec is not None:
+            args.extend(["--cpu", artifacts.cpu_spec])
+        else:
+            print(
+                "WARN: --cpu-from-fixture requested but cpu.json had no "
+                "usable identity — keeping the default CPU model",
+                file=sys.stderr,
+            )
+
+    # TPM: axl-emulate spawns swtpm itself (see main) and wires QEMU's
+    # emulator-backend TPM to its control socket via --qemu-arg. The
+    # tpm/ subdir is the swtpm state dir (empty → clean PCRs; a populated
+    # one is assumed already in NVChip format — HF5 scope).
+    if artifacts.tpm_dir is not None and tpm_sock is not None:
+        args += qarg(
+            "-chardev", f"socket,id=axl_tpmsock,path={tpm_sock}",
+            "-tpmdev", "emulator,id=axl_tpm,chardev=axl_tpmsock",
+            "-device", f"{tpm_model},tpmdev=axl_tpm",
+        )
 
     if efi_file is not None:
         args.append(str(efi_file))
@@ -322,6 +535,19 @@ def parse_argv(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Reduce the denylist to MCFG only (keep everything else, even SPCR/SRAT/...).",
     )
+    parser.add_argument(
+        "--mac",
+        action="store_true",
+        help="Replay the captured NIC hardware address from net.json "
+             "(wires --net --mac on run-qemu.sh). HF4.",
+    )
+    parser.add_argument(
+        "--cpu-from-fixture",
+        action="store_true",
+        help="Replay the captured CPU identity from cpu.json "
+             "(wires --cpu on run-qemu.sh: x86 vendor/family/model, "
+             "aarch64 MIDR). HF4.",
+    )
     args = parser.parse_args(ours)
 
     if args.fixture_dir is None:
@@ -361,6 +587,23 @@ def main(argv: list[str]) -> int:
     if args.efi_file is not None:
         efi_file = Path(args.efi_file)
 
+    dryrun = os.environ.get("AXL_EMULATE_DRYRUN", "0") == "1"
+
+    # TPM plan: when a tpm/ subdir is present we spawn swtpm and wire its
+    # control socket into QEMU. Decide the socket path + model up front so
+    # the QEMU args reference the same socket the daemon will create. Under
+    # DRYRUN we use a placeholder path and never spawn.
+    tpm_sock: str | None = None
+    tpm_model: str | None = None
+    tpm_sock_dir: str | None = None
+    if artifacts.tpm_dir is not None:
+        tpm_model = tpm_model_for(args.arch)
+        if dryrun:
+            tpm_sock = "/tmp/axl-emulate-swtpm.sock"
+        else:
+            tpm_sock_dir = tempfile.mkdtemp(prefix="axl-emulate-tpm-")
+            tpm_sock = os.path.join(tpm_sock_dir, "swtpm-ctrl")
+
     run_qemu_args = build_run_qemu_args(
         fixture=fixture,
         artifacts=artifacts,
@@ -368,6 +611,10 @@ def main(argv: list[str]) -> int:
         keep_acpi={s.upper() for s in args.keep_acpi},
         extra_drop_acpi={s.upper() for s in args.drop_acpi},
         strict_acpi=args.strict_acpi,
+        replay_mac=args.mac,
+        replay_cpu=args.cpu_from_fixture,
+        tpm_sock=tpm_sock,
+        tpm_model=tpm_model,
         efi_file=efi_file,
         pass_through=pass_through,
     )
@@ -387,16 +634,58 @@ def main(argv: list[str]) -> int:
     # AXL_EMULATE_DRYRUN=1 mirrors run-qemu.sh's QEMU_DRYRUN
     # convention: print the constructed argv (one token per line,
     # prefixed with "AXL_EMULATE_DRYRUN: ") and exit without
-    # exec'ing. Useful for tests and for "what would axl-emulate
+    # running. Useful for tests and for "what would axl-emulate
     # actually run?" debugging.
-    if os.environ.get("AXL_EMULATE_DRYRUN", "0") == "1":
+    if dryrun:
         for token in cmd:
             print(f"AXL_EMULATE_DRYRUN: {token}")
         return 0
 
-    os.execv(str(run_qemu), cmd)
-    # Unreachable.
-    return 1
+    # No TPM → exec run-qemu.sh directly (no wrapper process needed).
+    if artifacts.tpm_dir is None:
+        os.execv(str(run_qemu), cmd)
+        return 1  # unreachable
+
+    # TPM → spawn swtpm, run run-qemu.sh as a child so we can tear the
+    # daemon down afterwards (can't exec — we'd lose the cleanup hook).
+    swtpm = locate_swtpm()
+    if swtpm is None:
+        print(
+            "ERROR: fixture has a tpm/ dir but swtpm was not found "
+            "(install swtpm, or set SWTPM=/path/to/swtpm)",
+            file=sys.stderr,
+        )
+        if tpm_sock_dir is not None:
+            shutil.rmtree(tpm_sock_dir, ignore_errors=True)
+        return 1
+    assert tpm_sock is not None and tpm_sock_dir is not None  # set with tpm_dir
+    swtpm_log = os.path.join(tpm_sock_dir, "swtpm.log")
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = spawn_swtpm(swtpm, artifacts.tpm_dir, tpm_sock, swtpm_log)
+        # Wait for swtpm to create its control socket (~30 ms typical).
+        deadline = time.monotonic() + 5.0
+        while not os.path.exists(tpm_sock) and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                print("ERROR: swtpm exited before creating its socket:",
+                      file=sys.stderr)
+                _dump_file(swtpm_log)
+                return 1
+            time.sleep(0.05)
+        if not os.path.exists(tpm_sock):
+            print(f"ERROR: swtpm did not create {tpm_sock} in time:",
+                  file=sys.stderr)
+            _dump_file(swtpm_log)
+            return 1
+        return subprocess.run(cmd).returncode
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(tpm_sock_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

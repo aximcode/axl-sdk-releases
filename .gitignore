@@ -6,6 +6,7 @@ deps/*
 !deps/mbedtls
 !deps/stb
 !deps/freetype
+!deps/sdefl
 *.pyc
 __pycache__/
 tests/.last-pass-count

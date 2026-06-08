@@ -665,4 +665,103 @@ typedef struct {
 } USB_DEVICE_PATH;
 #pragma pack()
 
+// ===================================================================
+// EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL (UEFI Spec 13.16)
+//
+// Hand-written because the spec HTML mixes the EFI_NVM_EXPRESS_COMMAND
+// struct with a bitfield sub-struct and inline #defines, and the
+// PassThru / command-packet blocks carry typos (`This` and
+// `TransferBuffer` are shown without their `*`). The GUID is already in
+// generated/guids.h. AXL uses Mode, PassThru, and GetNextNamespace for
+// fixture capture (Identify Controller / Namespace).
+// ===================================================================
+
+typedef struct _EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL
+    EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL;
+
+typedef struct {
+    UINT32  Attributes;    // EFI_NVM_EXPRESS_PASS_THRU_ATTRIBUTES_*
+    UINT32  IoAlign;       // required alignment of data buffers
+    UINT32  NvmeVersion;   // controller's NVMe spec version (BCD)
+} EFI_NVM_EXPRESS_PASS_THRU_MODE;
+
+// Command Dword 0: opcode in the low 8 bits (6 = Identify).
+typedef struct {
+    UINT32  Opcode         : 8;
+    UINT32  FusedOperation : 2;
+    UINT32  Reserved       : 22;
+} NVME_CDW0;
+
+typedef struct {
+    NVME_CDW0  Cdw0;
+    UINT8      Flags;
+    UINT32     Nsid;
+    UINT32     Cdw2;
+    UINT32     Cdw3;
+    UINT32     Cdw10;   // Identify: CNS (1 = controller, 0 = namespace)
+    UINT32     Cdw11;
+    UINT32     Cdw12;
+    UINT32     Cdw13;
+    UINT32     Cdw14;
+    UINT32     Cdw15;
+} EFI_NVM_EXPRESS_COMMAND;
+
+typedef struct {
+    UINT32  DW0;
+    UINT32  DW1;
+    UINT32  DW2;
+    UINT32  DW3;
+} EFI_NVM_EXPRESS_COMPLETION;
+
+typedef struct {
+    UINT64                       CommandTimeout;   // 100 ns units; 0 = none
+    VOID                        *TransferBuffer;
+    UINT32                       TransferLength;
+    VOID                        *MetadataBuffer;
+    UINT32                       MetadataLength;
+    UINT8                        QueueType;         // 0 = Admin, 1 = I/O
+    EFI_NVM_EXPRESS_COMMAND     *NvmeCmd;
+    EFI_NVM_EXPRESS_COMPLETION  *NvmeCompletion;
+} EFI_NVM_EXPRESS_PASS_THRU_COMMAND_PACKET;
+
+#define NVME_ADMIN_QUEUE          0x00
+#define NVME_ADMIN_IDENTIFY_OPC   0x06
+// EFI_NVM_EXPRESS_COMMAND.Flags bits — gate which command Dwords the
+// driver programs into the submission queue entry. Identify carries CNS
+// in Cdw10, so CDW10_VALID must be set or Cdw10 is dropped (the NSID
+// field is always programmed, no flag needed).
+#define NVME_CDW10_VALID          0x04
+
+typedef EFI_STATUS (EFIAPI *EFI_NVM_EXPRESS_PASS_THRU_PASSTHRU)(
+    IN     EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL        *This,
+    IN     UINT32                                     NamespaceId,
+    IN OUT EFI_NVM_EXPRESS_PASS_THRU_COMMAND_PACKET  *Packet,
+    IN     EFI_EVENT                                  Event OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_NVM_EXPRESS_PASS_THRU_GET_NEXT_NAMESPACE)(
+    IN     EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *This,
+    IN OUT UINT32                              *NamespaceId
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_NVM_EXPRESS_PASS_THRU_BUILD_DEVICE_PATH)(
+    IN  EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *This,
+    IN  UINT32                               NamespaceId,
+    OUT EFI_DEVICE_PATH_PROTOCOL           **DevicePath
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_NVM_EXPRESS_PASS_THRU_GET_NAMESPACE)(
+    IN  EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *This,
+    IN  EFI_DEVICE_PATH_PROTOCOL            *DevicePath,
+    OUT UINT32                              *NamespaceId
+    );
+
+struct _EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL {
+    EFI_NVM_EXPRESS_PASS_THRU_MODE                *Mode;
+    EFI_NVM_EXPRESS_PASS_THRU_PASSTHRU             PassThru;
+    EFI_NVM_EXPRESS_PASS_THRU_GET_NEXT_NAMESPACE   GetNextNamespace;
+    EFI_NVM_EXPRESS_PASS_THRU_BUILD_DEVICE_PATH    BuildDevicePath;
+    EFI_NVM_EXPRESS_PASS_THRU_GET_NAMESPACE        GetNamespace;
+};
+
 #endif /* AXL_UEFI_EXTRA_H */
