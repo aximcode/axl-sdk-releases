@@ -66,6 +66,17 @@ typedef enum {
 typedef enum {
     AXL_REGEX_MATCH_DEFAULT  = 0,
     AXL_REGEX_MATCH_ANCHORED = 1u << 0,  ///< match must start exactly at @p from_offset
+    /// Treat @p from_offset as MID-stream, not the start of the text: `^`
+    /// (and the start-anchor) does NOT match at @p from_offset (POSIX
+    /// `REG_NOTBOL`).  Multiline `^` after an embedded `\n` still matches.
+    /// For chunked / windowed scanning of a larger source: pass it on every
+    /// window except the one that begins at the true source start.
+    AXL_REGEX_MATCH_NOTBOL   = 1u << 1,
+    /// Treat the buffer end as MID-stream, not the end of the text: `$` (and
+    /// the end-anchor) does NOT match at @p len (POSIX `REG_NOTEOL`).
+    /// Multiline `$` before an embedded `\n` still matches.  For windowed
+    /// scanning: pass it on every window except the one ending at true EOF.
+    AXL_REGEX_MATCH_NOTEOL   = 1u << 2,
 } AxlRegexMatchFlags;
 
 /// Detail for a failed compile (optional out param of axl_regex_new_full).

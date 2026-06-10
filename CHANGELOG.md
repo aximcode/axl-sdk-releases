@@ -3,6 +3,23 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.4.0 — 2026-06-09
+
+### Added
+
+- **Regex `NOTBOL` / `NOTEOL` match flags** (`<axl/axl-regex.h>`) —
+  `AXL_REGEX_MATCH_NOTBOL` and `AXL_REGEX_MATCH_NOTEOL`, the POSIX
+  `REG_NOTBOL` / `REG_NOTEOL` semantics: treat `from_offset` / the end of
+  the buffer as **mid-stream** so `^` / `$` (and the start/end anchors) do
+  not match there, while a multiline `^` / `$` at an embedded `\n` still
+  does. This lets a consumer scan a larger source in **overlapping
+  windows** without `^` / `$` falsely binding at every window boundary —
+  e.g. an out-of-core hex/binary regex find. With neither flag set the
+  matcher behaves exactly as before. (Engine: the `I_BOL` / `I_EOL`
+  threads keep their original short-circuit, with `sp > 0` / `sp < len`
+  guards so a suppressed boundary anchor never reaches `in[sp-1]` /
+  `in[sp]`.)
+
 ## 1.3.1 — 2026-06-09
 
 ### Fixed

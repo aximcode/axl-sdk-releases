@@ -311,6 +311,36 @@ test_regex_anchored(void)
 }
 
 static void
+test_regex_notbol_noteol(void)
+{
+    AxlMatch m;
+    // `^` matches at the buffer start by default; NOTBOL treats from_offset as
+    // mid-stream so it does not (the chunked-scan fix).
+    AXL_AUTOPTR(AxlRegex) bol = axl_regex_new("^abc", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(bol, "abcXabc", 7, 0, 0, &m) && m.start == 0,
+               "notbol: ^abc matches the buffer start by default");
+    test_check(!axl_regex_search_buf(bol, "abcXabc", 7, 0, AXL_REGEX_MATCH_NOTBOL, &m),
+               "notbol: ^ does NOT match the buffer start under NOTBOL");
+    // Multiline `^` after an embedded \n still matches under NOTBOL.
+    AXL_AUTOPTR(AxlRegex) mbol = axl_regex_new("^b", AXL_REGEX_MULTILINE);
+    test_check(axl_regex_search_buf(mbol, "a\nb", 3, 0, AXL_REGEX_MATCH_NOTBOL, &m)
+               && m.start == 2,
+               "notbol: multiline ^ after \\n still matches under NOTBOL");
+
+    // `$` matches at the buffer end by default; NOTEOL suppresses it.
+    AXL_AUTOPTR(AxlRegex) eol = axl_regex_new("abc$", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(eol, "Xabc", 4, 0, 0, &m) && m.start == 1,
+               "noteol: abc$ matches the buffer end by default");
+    test_check(!axl_regex_search_buf(eol, "Xabc", 4, 0, AXL_REGEX_MATCH_NOTEOL, &m),
+               "noteol: $ does NOT match the buffer end under NOTEOL");
+    // Multiline `$` before an embedded \n still matches under NOTEOL.
+    AXL_AUTOPTR(AxlRegex) meol = axl_regex_new("a$", AXL_REGEX_MULTILINE);
+    test_check(axl_regex_search_buf(meol, "a\nb", 3, 0, AXL_REGEX_MATCH_NOTEOL, &m)
+               && m.start == 0,
+               "noteol: multiline $ before \\n still matches under NOTEOL");
+}
+
+static void
 test_regex_flags(void)
 {
     AXL_AUTOPTR(AxlRegex) ci = axl_regex_new("hello", AXL_REGEX_CASELESS);
@@ -504,6 +534,7 @@ test_find_main(int argc, char **argv)
     test_regex_battery();
     test_regex_captures();
     test_regex_anchored();
+    test_regex_notbol_noteol();
     test_regex_interval();
     test_regex_flags();
     test_regex_errors();

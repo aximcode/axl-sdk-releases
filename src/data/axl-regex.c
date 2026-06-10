@@ -455,6 +455,7 @@ typedef struct {
     size_t          len;
     int             nslots;
     bool            caseless, multiline, dotall;
+    bool            notbol, noteol;  /* from_offset is mid-stream / end is mid-stream */
     int            *seen;     /* [prog_len] last listid each pc was added */
     int             listid;
 } VM;
@@ -473,10 +474,12 @@ static void addthread(VM *vm, TList *l, int pc, const size_t *saved, size_t sp) 
         if (I->n < vm->nslots) s2[I->n] = sp;
         addthread(vm, l, pc + 1, s2, sp);
         break; }
-    case I_BOL: if (sp == 0 || (vm->multiline && vm->in[sp - 1] == '\n'))
+    case I_BOL: if ((sp == 0 && !vm->notbol)
+                    || (vm->multiline && sp > 0 && vm->in[sp - 1] == '\n'))
                     addthread(vm, l, pc + 1, saved, sp);
                 break;
-    case I_EOL: if (sp == vm->len || (vm->multiline && vm->in[sp] == '\n'))
+    case I_EOL: if ((sp == vm->len && !vm->noteol)
+                    || (vm->multiline && sp < vm->len && vm->in[sp] == '\n'))
                     addthread(vm, l, pc + 1, saved, sp);
                 break;
     default: {
@@ -491,11 +494,13 @@ static void addthread(VM *vm, TList *l, int pc, const size_t *saved, size_t sp) 
    the post-prefix entry. On match, fills result[0..nslots) (absolute
    offsets; SIZE_MAX = slot unset). */
 static bool vm_run(const AxlRegex *re, const uint8_t *in, size_t len, size_t from,
-                   bool anchored, size_t *result, int nslots) {
+                   bool anchored, bool notbol, bool noteol,
+                   size_t *result, int nslots) {
     VM vm = { re, in, len, nslots,
               (re->flags & AXL_REGEX_CASELESS) != 0,
               (re->flags & AXL_REGEX_MULTILINE) != 0,
               (re->flags & AXL_REGEX_DOTALL) != 0,
+              notbol, noteol,
               NULL, 0 };
     int plen = re->prog_len;
     vm.seen = axl_malloc((size_t)plen * sizeof(int));
@@ -565,7 +570,10 @@ static bool search_buf(const AxlRegex *re, const uint8_t *data, size_t len,
     int nslots = 2 * (re->ncap + 1);
     size_t result[MAX_SLOTS] = {0};
     bool anchored = (mf & AXL_REGEX_MATCH_ANCHORED) != 0;
-    if (!vm_run(re, data, len, from, anchored, result, nslots)) return false;
+    bool notbol   = (mf & AXL_REGEX_MATCH_NOTBOL)   != 0;
+    bool noteol   = (mf & AXL_REGEX_MATCH_NOTEOL)   != 0;
+    if (!vm_run(re, data, len, from, anchored, notbol, noteol, result, nslots))
+        return false;
 
     for (size_t g = 0; g < ng; g++) {
         size_t s = result[2 * g], e = result[2 * g + 1];
