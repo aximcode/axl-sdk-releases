@@ -449,8 +449,16 @@ parse_typed(ParsedArg *slot, const char *value, const char *path)
 // Help
 // ---------------------------------------------------------------------------
 
-static void
-print_flag_line(const AxlArgDesc *d)
+/* Cap on the aligned left-column width. Keys longer than this overflow and
+   push their help text right (same as an over-long flag/positional name),
+   so one long choice-list hint can't blow the whole column out. */
+#define HELP_KEY_MAX 24
+
+/* Build the left-column "key" for a flag into @p out — "-x, --name <hint>",
+   or "    --name <hint>" (4-space pad) when there is no short name, so
+   long-only flags line up under the short ones. Returns its length. */
+static size_t
+flag_key(const AxlArgDesc *d, char *out, size_t outsz)
 {
     char short_buf[8] = "    ";
     if (d->short_name != 0) {
@@ -520,27 +528,27 @@ print_flag_line(const AxlArgDesc *d)
         case AXL_ARG_U32: case AXL_ARG_U64:                value_hint = " <uint>";  break;
         case AXL_ARG_S64:                                  value_hint = " <int>";   break;
     }
-    axl_print("  %s --%-16s%s  %s\n",
-              short_buf, d->name, value_hint,
-              d->help != NULL ? d->help : "");
+    axl_snprintf(out, outsz, "%s--%s%s", short_buf, d->name, value_hint);
+    return axl_strlen(out);
 }
 
-static void
-print_positional_line(const AxlArgDesc *d)
+/* Build the left-column key for a positional into @p out: "<name>" (or
+   "<name>..." for a variadic). No "(optional)" suffix — the [<name>]
+   brackets in the Usage line already convey it. Returns its length. */
+static size_t
+positional_key(const AxlArgDesc *d, char *out, size_t outsz)
 {
     const char *suffix = (d->type == AXL_ARG_MULTI) ? "..." : "";
-    const char *req    = d->required ? "" : " (optional)";
-    /* Left-justify "<name>suffix" in a fixed-width field so the help
-       column is constant regardless of name length — and lands at the
-       same column (26) as the flag lines and the "-h, --help" line
-       (`  ` + 22-wide field + `  ` gap). Names longer than the field
-       overflow and push their help right, same as long flag names. */
-    char name_buf[40];
-    axl_snprintf(name_buf, sizeof name_buf, "<%s>%s", d->name, suffix);
-    axl_print("  %-22s  %s%s\n",
-              name_buf,
-              d->help != NULL ? d->help : "",
-              req);
+    axl_snprintf(out, outsz, "<%s>%s", d->name, suffix);
+    return axl_strlen(out);
+}
+
+/* Print one aligned help row: "  <key>  <help>", left-justifying @p key
+   to width @p w so every row in the block shares a help column. */
+static void
+print_help_row(const char *key, const char *help, int w)
+{
+    axl_print("  %-*s  %s\n", w, key, help != NULL ? help : "");
 }
 
 /* Render help for one node. @p path is the breadcrumb used in the
@@ -602,24 +610,50 @@ print_help_for(const AxlArgsNode *node, const char *path)
         axl_print("\n");
     }
 
-    bool any_flags = (node->flags != NULL && node->flags[0].name != NULL);
-    if (any_flags) {
-        axl_print("\nFlags:\n");
-        for (int i = 0; node->flags[i].name != NULL; i++) {
-            print_flag_line(&node->flags[i]);
-        }
-        axl_print("  -h, --help              Show this help\n");
-    } else {
-        axl_print("\n  -h, --help              Show this help\n");
-    }
-
-    if (node_is_leaf(node)
-        && node->positionals != NULL && node->positionals[0].name != NULL)
+    /* Options + arguments as ONE aligned list — no "Flags:" / "Arguments:"
+       section headers — so the help reads like a hand-written legacy usage
+       block: a Usage line, then positionals, flags, and a single terse
+       --help row, all sharing one help column. */
     {
-        axl_print("\nArguments:\n");
-        for (int i = 0; node->positionals[i].name != NULL; i++) {
-            print_positional_line(&node->positionals[i]);
+        bool any_flags = (node->flags != NULL && node->flags[0].name != NULL);
+        bool any_pos   = (!node_is_branch(node)
+                          && node->positionals != NULL
+                          && node->positionals[0].name != NULL);
+        char keybuf[96];
+
+        /* Pass 1: the common left-column width (capped; "-h, --help" is
+           always present so it sets the floor). */
+        int w = (int)axl_strlen("-h, --help");
+        if (any_pos) {
+            for (int i = 0; node->positionals[i].name != NULL; i++) {
+                int k = (int)positional_key(&node->positionals[i],
+                                            keybuf, sizeof keybuf);
+                if (k > w) w = k;
+            }
         }
+        if (any_flags) {
+            for (int i = 0; node->flags[i].name != NULL; i++) {
+                int k = (int)flag_key(&node->flags[i], keybuf, sizeof keybuf);
+                if (k > w) w = k;
+            }
+        }
+        if (w > HELP_KEY_MAX) w = HELP_KEY_MAX;
+
+        /* Pass 2: print the block (positionals, then flags, then --help). */
+        axl_print("\n");
+        if (any_pos) {
+            for (int i = 0; node->positionals[i].name != NULL; i++) {
+                positional_key(&node->positionals[i], keybuf, sizeof keybuf);
+                print_help_row(keybuf, node->positionals[i].help, w);
+            }
+        }
+        if (any_flags) {
+            for (int i = 0; node->flags[i].name != NULL; i++) {
+                flag_key(&node->flags[i], keybuf, sizeof keybuf);
+                print_help_row(keybuf, node->flags[i].help, w);
+            }
+        }
+        print_help_row("-h, --help", "Show this help", w);
     }
 
     if (node->help_epilog != NULL) {
@@ -665,7 +699,8 @@ is_help_flag(const char *tok)
 {
     return tok != NULL
         && (axl_strcmp(tok, "-h") == 0
-            || axl_strcmp(tok, "--help") == 0);
+            || axl_strcmp(tok, "--help") == 0
+            || axl_strcmp(tok, "?") == 0);   /* legacy-tool help alias */
 }
 
 static bool

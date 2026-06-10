@@ -646,6 +646,36 @@ axl_compositor_detach_pointer(
     AxlLoop        *loop   ///< the loop the pointer was attached to
 );
 
+/**
+ * @brief Drive the seat from an ABSOLUTE pointer (touch / digitizer / BMC remote-console
+ *        virtual mouse) via axl_input_attach_touch.
+ *
+ * The absolute source reports a normalized position (no relative deltas);
+ * this scales it onto the output and routes it as pointer motion / buttons,
+ * so a remote-console mouse or touchscreen drives the same cursor +
+ * hit-testing as a physical mouse. Complementary to
+ * axl_compositor_attach_pointer — attach both; whichever the firmware feeds
+ * drives the cursor. NULL-safe.
+ *
+ * @return the axl-loop source ID, or 0 on failure (NULL args, no absolute
+ *     pointer protocol, or a touch source already attached).
+ */
+uint32_t
+axl_compositor_attach_touch(
+    AxlCompositor  *c,     ///< compositor
+    AxlLoop        *loop   ///< caller-owned event loop
+);
+
+/**
+ * @brief Detach the seat's touch source from @p loop (inverse of
+ *        axl_compositor_attach_touch). NULL-safe and idempotent.
+ */
+void
+axl_compositor_detach_touch(
+    AxlCompositor  *c,     ///< compositor
+    AxlLoop        *loop   ///< the loop the touch source was attached to
+);
+
 // ---------------------------------------------------------------------------
 // The seat — pointer grabs + keyboard focus (Phase C5)
 // ---------------------------------------------------------------------------

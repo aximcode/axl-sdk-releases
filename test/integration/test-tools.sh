@@ -93,6 +93,13 @@ printf 'h\x00e\x00a\x00d\x00l\x00e\x00s\x00s\x00\n\x00' \
     echo "shorter line that does not match"
 } > "$TEST_STAGING/grep_long.txt"
 
+# Multi-hit file for grep flag coverage (-i / -n / -c). Two literal
+# lowercase "hello" (lines 1,4), one uppercase "HELLO" (line 2): so
+# `grep hello`   -> 2 hits, `grep -c hello` -> "2", `grep -i hello` -> 3
+# hits (the uppercase line appears only under -i).
+printf 'line one: hello world\nline two: HELLO WORLD\nline three: goodbye world\nline four: hello again\n' \
+    > "$TEST_STAGING/grep_multi.txt"
+
 # Startup script — run each tool and capture its output.
 # The host-side script checks the serial log for expected content.
 {
@@ -187,6 +194,51 @@ printf 'h\x00e\x00a\x00d\x00l\x00e\x00s\x00s\x00\n\x00' \
     echo "echo === TEST-MKRD-LIST ==="
     echo "mkrd.efi -l"
     echo ""
+    # --- flag-level coverage absorbed from uefi-devkit's test-shelltools.sh
+    #     (so that test can be retired without losing tool-flag coverage) ---
+    echo "echo === TEST-GREP-ICASE-START ==="
+    # -i: case-insensitive literal — the uppercase "HELLO WORLD" line only
+    # appears under -i (a plain `grep hello` would miss it).
+    echo "grep.efi -i hello grep_multi.txt"
+    echo "echo === TEST-GREP-ICASE-END ==="
+    echo ""
+    echo "echo === TEST-GREP-LINENUM-START ==="
+    echo "grep.efi -n hello grep_multi.txt"      # -n prefixes "1:" etc.
+    echo "echo === TEST-GREP-LINENUM-END ==="
+    echo ""
+    echo "echo === TEST-GREP-COUNT-START ==="
+    echo "grep.efi -c hello grep_multi.txt"      # -c prints just "2"
+    echo "echo === TEST-GREP-COUNT-END ==="
+    echo ""
+    echo "echo === TEST-FIND-NAME-START ==="
+    # Quoted so the UEFI shell doesn't wildcard-expand against cwd; find
+    # must apply the *.txt filter itself (match.txt in, other.log out).
+    echo "find.efi --name \"*.txt\" testdir"
+    echo "echo === TEST-FIND-NAME-END ==="
+    echo ""
+    echo "echo === TEST-FIND-TYPE-START ==="
+    echo "find.efi --type d testdir"             # dirs only: subdir in, match.txt out
+    echo "echo === TEST-FIND-TYPE-END ==="
+    echo ""
+    echo "echo === TEST-HEXDUMP-OFFSET-START ==="
+    echo "hexdump.efi -o 16 -n 32 testdata.txt"  # first addr column = 00000010
+    echo "echo === TEST-HEXDUMP-OFFSET-END ==="
+    echo ""
+    echo "echo === TEST-SYSINFO-FW-START ==="
+    # `sysinfo fw` is firmware-only: prints "=== Firmware ===" but NOT the
+    # "=== CPU ===" section the bare sysinfo emits.
+    echo "sysinfo.efi fw"
+    echo "echo === TEST-SYSINFO-FW-END ==="
+    echo ""
+    echo "echo === TEST-SYSINFO-ARCH-START ==="
+    echo "sysinfo.efi arch"                       # prints x64 / aa64
+    echo "echo === TEST-SYSINFO-ARCH-END ==="
+    echo ""
+    echo "echo === TEST-MKRD-DESTROY-START ==="
+    # testrd was created above (TEST-MKRD-POSITIONAL); tear it down.
+    echo "mkrd.efi -v -d testrd"
+    echo "echo === TEST-MKRD-DESTROY-END ==="
+    echo ""
     echo "echo === TEST-END ==="
     echo "reset -s"
 } | test_set_startup
@@ -234,6 +286,27 @@ check_absent_in_section() {
     else
         echo "  PASS: $name"
         PASS=$((PASS + 1))
+    fi
+}
+
+# Extract lines strictly between "=== TEST-<base>-START ===" and
+# "=== TEST-<base>-END ===" markers (for the bounded flag-coverage checks).
+section() {
+    awk -v s="=== TEST-$1-START ===" -v e="=== TEST-$1-END ===" \
+        'index($0,s){f=1;next} index($0,e){f=0} f' "$TEST_CLEAN_LOG"
+}
+check_in() {       # name, section-base, pattern — PASS if present in section
+    if section "$2" | grep -q "$3"; then
+        echo "  PASS: $1"; PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $1 (expected '$3' in TEST-$2)"; FAIL=$((FAIL + 1))
+    fi
+}
+check_not_in() {   # name, section-base, pattern — PASS if ABSENT from section
+    if section "$2" | grep -q "$3"; then
+        echo "  FAIL: $1 (unwanted '$3' in TEST-$2)"; FAIL=$((FAIL + 1))
+    else
+        echo "  PASS: $1"; PASS=$((PASS + 1))
     fi
 }
 
@@ -321,6 +394,29 @@ check "mkrd-autoload-success" \
     "RAM disk .testrd. created"
 check "mkrd-list-shows-testrd" \
     "testrd"
+
+# --- flag-level coverage absorbed from uefi-devkit test-shelltools.sh ---
+# grep -i: the uppercase "HELLO WORLD" line matches only case-insensitively
+check_in     "grep-icase"        GREP-ICASE    "HELLO WORLD"
+# grep -n: line-number prefix on the first match
+check_in     "grep-linenum"      GREP-LINENUM  "1:line one"
+# grep -c: bare count of the two literal-lowercase "hello" hits
+check_in     "grep-count"        GREP-COUNT    "^2$"
+# find --name "*.txt": includes match.txt, excludes the .log
+check_in     "find-name-txt"     FIND-NAME     "match.txt"
+check_not_in "find-name-no-log"  FIND-NAME     "other.log"
+# find --type d: lists the directory, not the files in it
+check_in     "find-type-dir"     FIND-TYPE     "subdir"
+check_not_in "find-type-no-file" FIND-TYPE     "match.txt"
+# hexdump -o 16: first address column reflects the start offset
+check_in     "hexdump-offset"    HEXDUMP-OFFSET "00000010:"
+# sysinfo fw: firmware-only section (no CPU section)
+check_in     "sysinfo-fw"        SYSINFO-FW    "=== Firmware ==="
+check_not_in "sysinfo-fw-no-cpu" SYSINFO-FW    "=== CPU ==="
+# sysinfo arch: prints the native arch tag
+check_in     "sysinfo-arch"      SYSINFO-ARCH  "$([[ $TEST_ARCH == AARCH64 ]] && echo aa64 || echo x64)"
+# mkrd -d: tears down the ramdisk created earlier
+check_in     "mkrd-destroy"      MKRD-DESTROY  "destroyed"
 
 # no memory leaks in any tool
 check "no-leaks"              "no leaks detected"

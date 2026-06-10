@@ -5132,6 +5132,126 @@ test_args_help_alignment(void)
                "args help: positional help column matches the -h line");
 }
 
+/* Terse legacy help: a leaf with optional positionals renders a Usage line
+   plus a clean aligned list — no "Arguments:" / "Flags:" section headers, no
+   "(optional)" suffix (the [<name>] brackets in Usage already convey it), and
+   a single aligned --help row. */
+static const AxlArgDesc terse_pos[] = {
+    { .name = "mode",      .type = AXL_ARG_STRING, .required = false,
+      .help = "0=Norm 1=Dump 2=SMBIOS" },
+    { .name = "blinkRate", .type = AXL_ARG_STRING, .required = false,
+      .help = "second argument" },
+    {0}
+};
+
+static void
+test_args_help_terse_format(void)
+{
+    ArgsCapture cap = { 0 };
+    char *argv[] = { (char *)"do", (char *)"sysid", (char *)"-h" };
+    AxlArgsNode sysid = {
+        .name = "sysid", .positionals = terse_pos,
+        .handler = args_single_handler, .user_data = &cap,
+    };
+    AxlArgsNode verbs[] = { sysid, {0} };
+    AxlArgsNode app = {
+        .name = "do", .verbs = verbs, .user_data = &cap,
+    };
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
+    int rc = axl_args_run(3, argv, &app);   /* do sysid -h */
+    bool has_usage   = buf_contains(buf, "Usage:");
+    bool has_args_hdr = buf_contains(buf, "Arguments:");
+    bool has_flags_hdr = buf_contains(buf, "Flags:");
+    bool has_optional = buf_contains(buf, "(optional)");
+    bool has_mode_help = buf_contains(buf, "0=Norm 1=Dump 2=SMBIOS");
+    size_t c_mode = help_col(buf, "  <mode>",      "0=Norm");
+    size_t c_help = help_col(buf, "  -h,",         "Show this help");
+    restore_stdout(saved, buf);
+
+    test_check(rc == 0, "args terse: -h returns 0");
+    test_check(cap.calls == 0, "args terse: -h did not invoke handler");
+    test_check(has_usage, "args terse: Usage line present");
+    test_check(!has_args_hdr, "args terse: no 'Arguments:' section header");
+    test_check(!has_flags_hdr, "args terse: no 'Flags:' section header (no flags)");
+    test_check(!has_optional, "args terse: no '(optional)' suffix on positionals");
+    test_check(has_mode_help, "args terse: positional help text still shown");
+    test_check(c_mode != SIZE_MAX && c_help != SIZE_MAX,
+               "args terse: positional + -h rows present");
+    test_check(c_mode == c_help,
+               "args terse: positional row aligns with the -h row");
+}
+
+/* "?" is a help alias matching the legacy tool: at the top level, at a branch,
+   and at a sub-verb leaf, a lone "?" prints the same help as -h/--help instead
+   of being consumed as a positional value (which used to error). */
+static void
+test_args_help_question_alias(void)
+{
+    /* (1) sub-verb leaf: `do sysid ?` -> sysid's help, handler not run. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"do", (char *)"sysid", (char *)"?" };
+        AxlArgsNode sysid = {
+            .name = "sysid", .positionals = terse_pos,
+            .handler = args_single_handler, .user_data = &cap,
+        };
+        AxlArgsNode verbs[] = { sysid, {0} };
+        AxlArgsNode app = { .name = "do", .verbs = verbs, .user_data = &cap };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(3, argv, &app);
+        bool has_usage   = buf_contains(buf, "Usage:");
+        bool has_sysid   = buf_contains(buf, "sysid");
+        bool has_invalid = buf_contains(buf, "invalid");
+        restore_stdout(saved, buf);
+        test_check(rc == 0, "args ?: `do sysid ?` returns 0");
+        test_check(cap.calls == 0, "args ?: `do sysid ?` did not run handler");
+        test_check(has_usage && has_sysid,
+                   "args ?: `do sysid ?` printed sysid help");
+        test_check(!has_invalid,
+                   "args ?: `do sysid ?` not treated as a positional value");
+    }
+    /* (2) branch top-level: `do ?` -> branch help (lists the verb). */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"do", (char *)"?" };
+        AxlArgsNode sysid = {
+            .name = "sysid", .positionals = terse_pos,
+            .handler = args_single_handler, .user_data = &cap,
+        };
+        AxlArgsNode verbs[] = { sysid, {0} };
+        AxlArgsNode app = { .name = "do", .verbs = verbs, .user_data = &cap };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(2, argv, &app);
+        bool has_usage = buf_contains(buf, "Usage:");
+        bool has_verb  = buf_contains(buf, "sysid");
+        restore_stdout(saved, buf);
+        test_check(rc == 0, "args ?: `do ?` returns 0");
+        test_check(has_usage && has_verb, "args ?: `do ?` printed branch help");
+    }
+    /* (3) plain leaf top-level: `tool ?` -> help, handler not run. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"tool", (char *)"?" };
+        AxlArgsNode app = {
+            .name = "tool", .positionals = terse_pos,
+            .handler = args_single_handler, .user_data = &cap,
+        };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        int rc = axl_args_run(2, argv, &app);
+        bool has_usage   = buf_contains(buf, "Usage:");
+        bool has_invalid = buf_contains(buf, "invalid");
+        restore_stdout(saved, buf);
+        test_check(rc == 0, "args ?: `tool ?` (leaf) returns 0");
+        test_check(cap.calls == 0, "args ?: `tool ?` (leaf) did not run handler");
+        test_check(has_usage && !has_invalid,
+                   "args ?: `tool ?` (leaf) printed help, not a value error");
+    }
+}
+
 static void
 test_args_nested_unknown_verb_at_branch(void)
 {
@@ -5442,6 +5562,8 @@ test_args(void)
     test_args_single_handler_mode();
     test_args_negative_positionals();
     test_args_help_alignment();
+    test_args_help_terse_format();
+    test_args_help_question_alias();
     test_args_nested_2level_dispatch();
     test_args_nested_parent_flag_visible_at_leaf();
     test_args_nested_3level_dispatch();

@@ -31,9 +31,17 @@ struct AxlCursor {
 
     int32_t        x, y;         // hotspot position (clamped to scene)
     bool           visible;      // show/hide intent
-    bool           lifted;       // inside a lift/drop bracket
+    bool           lifted;       // inside a lift/drop (fold) bracket
     bool           on_screen;    // currently composited
     int32_t        vx, vy, vw, vh;  // last drawn on-screen rect (for erase)
+
+    // Scene-bound atomic fold (Option C): a present folds the sprite INTO
+    // the bound scene as its top layer (so the caller's one scene flush
+    // carries the cursor — no separate erase/redraw to the GOP = no flicker),
+    // then unfolds to keep the scene byte-clean. `under` holds the saved
+    // pixels (packed at stride spr_w); fr* is the folded rect.
+    bool           folded;
+    int32_t        frx, fry, frw, frh;
 
     // axl_cursor_attach forwarding
     AxlInputCallback  fwd_cb;
@@ -76,6 +84,30 @@ clampi(int32_t v, int32_t lo, int32_t hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// The cursor's on-screen rect at the current position, clamped to the scene,
+// plus the matching offset into the sprite (sx,sy). Returns false when the
+// cursor is fully off-screen (nothing visible). Shared by the scratch-compose
+// draw (save-under) and the in-place scene fold (Option C).
+static bool
+cursor_rect(const AxlCursor *c, int32_t *vx, int32_t *vy, int32_t *vw,
+            int32_t *vh, int32_t *sx, int32_t *sy)
+{
+    int32_t tlx = c->x - c->hot_x;
+    int32_t tly = c->y - c->hot_y;
+    int32_t ax  = clampi(tlx, 0, c->scene_w);
+    int32_t ay  = clampi(tly, 0, c->scene_h);
+    int32_t ax2 = clampi(tlx + c->spr_w, 0, c->scene_w);
+    int32_t ay2 = clampi(tly + c->spr_h, 0, c->scene_h);
+    int32_t aw  = ax2 - ax;
+    int32_t ah  = ay2 - ay;
+    if (aw <= 0 || ah <= 0) {
+        return false;
+    }
+    *vx = ax; *vy = ay; *vw = aw; *vh = ah;
+    *sx = ax - tlx; *sy = ay - tly;
+    return true;
+}
+
 // Resize the owned sprite + scratch to w x h. Returns AXL_OK / AXL_ERR.
 static int
 ensure_sprite_size(AxlCursor *c, int32_t w, int32_t h)
@@ -86,11 +118,12 @@ ensure_sprite_size(AxlCursor *c, int32_t w, int32_t h)
     if (c->spr_w != w || c->spr_h != h || c->sprite == NULL) {
         AxlGfxPixel  *ns = axl_malloc((size_t)w * (size_t)h * sizeof(AxlGfxPixel));
         AxlGfxBuffer *nc = axl_gfx_buffer_new((uint32_t)w, (uint32_t)h);
-        // Save-under (Option B) needs a second sprite-sized buffer to hold
-        // the screen pixels captured under the cursor for restore-on-erase.
-        AxlGfxBuffer *nu = c->save_under ? axl_gfx_buffer_new((uint32_t)w, (uint32_t)h)
-                                         : NULL;
-        if (ns == NULL || nc == NULL || (c->save_under && nu == NULL)) {
+        // Both modes need a second sprite-sized buffer: save-under (Option B)
+        // holds the screen pixels captured under the cursor for restore-on-
+        // erase; the scene-bound (Option C) fold saves the scene pixels it
+        // overwrites so the unfold can restore them.
+        AxlGfxBuffer *nu = axl_gfx_buffer_new((uint32_t)w, (uint32_t)h);
+        if (ns == NULL || nc == NULL || nu == NULL) {
             axl_free(ns);
             if (nc != NULL) {
                 axl_gfx_buffer_free(nc);
@@ -138,69 +171,46 @@ load_builtin_arrow(AxlCursor *c)
     return AXL_OK;
 }
 
-// Composite the sprite over the scene at the current position and present
-// only the visible sub-rect. Records that rect for the next erase.
+static void unfold_from_scene(AxlCursor *c);   // restore a folded scene (below)
+
+// Save-under (Option B) draw: capture the screen pixels under the cursor into
+// `under` (the restore-on-erase truth, packed at stride spr_w), composite the
+// sprite over them in the `compose` scratch, and present that. Used only by
+// the direct-to-screen path; the scene-bound (Option C) path folds the sprite
+// into the bound scene in place instead (fold_into_scene / scene_present).
 static void
 draw(AxlCursor *c)
 {
-    int32_t tlx = c->x - c->hot_x;
-    int32_t tly = c->y - c->hot_y;
-    int32_t vx  = clampi(tlx, 0, c->scene_w);
-    int32_t vy  = clampi(tly, 0, c->scene_h);
-    int32_t vx2 = clampi(tlx + c->spr_w, 0, c->scene_w);
-    int32_t vy2 = clampi(tly + c->spr_h, 0, c->scene_h);
-    int32_t vw  = vx2 - vx;
-    int32_t vh  = vy2 - vy;
-    if (vw <= 0 || vh <= 0) {            // cursor fully off-screen
+    int32_t vx, vy, vw, vh, sx, sy;
+    if (!cursor_rect(c, &vx, &vy, &vw, &vh, &sx, &sy)) {  // fully off-screen
         c->on_screen = false;
         c->vw = c->vh = 0;
         return;
     }
-    int32_t sx = vx - tlx;               // offset into the sprite
-    int32_t sy = vy - tly;
 
     AxlGfxPixel *comp_px  = axl_gfx_buffer_pixels(c->compose);
-    if (comp_px == NULL) {
+    AxlGfxPixel *under_px = axl_gfx_buffer_pixels(c->under);
+    if (comp_px == NULL || under_px == NULL) {
         return;
     }
-
-    // Source of the pixels under the cursor: the bound scene (Option C),
-    // or a fresh capture of the screen (Option B / save-under). In save-
-    // under mode the captured pixels also become the restore-on-erase
-    // truth, packed at the top-left of `under` (stride = spr_w).
-    const AxlGfxPixel *src_px;
-    int32_t            src_stride, src_x0, src_y0;
-    if (c->save_under) {
-        AxlGfxPixel *under_px = axl_gfx_buffer_pixels(c->under);
-        if (under_px == NULL) {
+    if (vw == c->spr_w) {                // unclipped rows: one contiguous capture
+        if (axl_gfx_capture(under_px, (uint32_t)vx, (uint32_t)vy,
+                            (uint32_t)vw, (uint32_t)vh) != AXL_OK) {
             return;
         }
-        if (vw == c->spr_w) {            // unclipped rows: one contiguous capture
-            if (axl_gfx_capture(under_px, (uint32_t)vx, (uint32_t)vy,
-                                (uint32_t)vw, (uint32_t)vh) != AXL_OK) {
+    } else {                             // edge-clipped: capture row by row
+        for (int32_t j = 0; j < vh; j++) {
+            if (axl_gfx_capture(&under_px[j * c->spr_w], (uint32_t)vx,
+                                (uint32_t)(vy + j), (uint32_t)vw, 1) != AXL_OK) {
                 return;
             }
-        } else {                         // edge-clipped: capture row by row
-            for (int32_t j = 0; j < vh; j++) {
-                if (axl_gfx_capture(&under_px[j * c->spr_w], (uint32_t)vx,
-                                    (uint32_t)(vy + j), (uint32_t)vw, 1) != AXL_OK) {
-                    return;
-                }
-            }
         }
-        src_px = under_px; src_stride = c->spr_w; src_x0 = 0; src_y0 = 0;
-    } else {
-        AxlGfxPixel *scene_px = axl_gfx_buffer_pixels(c->scene);
-        if (scene_px == NULL) {
-            return;
-        }
-        src_px = scene_px; src_stride = c->scene_w; src_x0 = vx; src_y0 = vy;
     }
 
     for (int32_t j = 0; j < vh; j++) {
-        const AxlGfxPixel *srow = &src_px[(src_y0 + j) * src_stride + src_x0];
+        const AxlGfxPixel *srow = &under_px[j * c->spr_w];   // captured, packed
         const AxlGfxPixel *prow = &c->sprite[(sy + j) * c->spr_w + sx];
-        AxlGfxPixel       *crow = &comp_px[j * c->spr_w];   // compose stride = spr_w
+        AxlGfxPixel       *crow = &comp_px[j * c->spr_w];    // compose stride = spr_w
         for (int32_t i = 0; i < vw; i++) {
             crow[i] = (prow[i].alpha == 0) ? srow[i]
                                            : axl_gfx_blend(srow[i], prow[i]);
@@ -218,6 +228,14 @@ draw(AxlCursor *c)
 static void
 erase(AxlCursor *c)
 {
+    // If the cursor is folded into the scene (inside a lift/drop bracket),
+    // unfold first so we present the CLEAN scene region, not the baked-in
+    // sprite — otherwise a move/hide/set_image called between lift and drop
+    // would flush a ghost arrow to the GOP. No-op outside a bracket; save-
+    // under never folds.
+    if (c->folded) {
+        unfold_from_scene(c);
+    }
     if (c->on_screen && c->vw > 0 && c->vh > 0) {
         if (c->save_under) {
             axl_gfx_buffer_present_rect(c->under,
@@ -232,6 +250,132 @@ erase(AxlCursor *c)
         }
     }
     c->on_screen = false;
+}
+
+// --- Scene-bound (Option C) atomic fold ----------------------------------
+//
+// The flicker fix (see the struct comment): instead of presenting the cursor
+// to the GOP as a SEPARATE op from the scene (erase old / draw new, with a
+// gap where the screen shows no cursor), we composite the sprite INTO the
+// bound scene as its top layer, then let ONE scene flush carry it. This
+// mirrors how real software-cursor compositors work — wlroots
+// (wlr_output_render_software_cursors composites the cursor into the buffer
+// as the last layer before one commit) and Qt's direct-framebuffer QFbCursor
+// (cursor composited over the repainted scene, region flushed once). The
+// fold is transient: unfold_from_scene restores the saved pixels so the scene
+// stays byte-clean for the compositor's next partial-damage repaint.
+
+// Composite the sprite into the bound scene at the current position, saving
+// the overwritten scene pixels into `under` (packed, stride spr_w) so
+// unfold_from_scene can restore them. No-op (folded=false) when the cursor is
+// off-screen or the buffers are unavailable. Scene-bound only.
+static void
+fold_into_scene(AxlCursor *c)
+{
+    c->folded = false;
+    int32_t vx, vy, vw, vh, sx, sy;
+    if (!cursor_rect(c, &vx, &vy, &vw, &vh, &sx, &sy)) {
+        return;
+    }
+    AxlGfxPixel *scene_px = axl_gfx_buffer_pixels(c->scene);
+    AxlGfxPixel *under_px = axl_gfx_buffer_pixels(c->under);
+    if (scene_px == NULL || under_px == NULL) {
+        return;
+    }
+    for (int32_t j = 0; j < vh; j++) {
+        AxlGfxPixel       *drow = &scene_px[(vy + j) * c->scene_w + vx];
+        const AxlGfxPixel *prow = &c->sprite[(sy + j) * c->spr_w + sx];
+        AxlGfxPixel       *urow = &under_px[j * c->spr_w];   // packed save
+        for (int32_t i = 0; i < vw; i++) {
+            urow[i] = drow[i];                               // save scene pixel
+            if (prow[i].alpha != 0) {
+                drow[i] = axl_gfx_blend(drow[i], prow[i]);   // sprite over scene
+            }
+        }
+    }
+    c->frx = vx; c->fry = vy; c->frw = vw; c->frh = vh;
+    c->folded = true;
+}
+
+// Restore the scene pixels saved by fold_into_scene, leaving the bound scene
+// byte-identical to before the fold (Option C invariant).
+static void
+unfold_from_scene(AxlCursor *c)
+{
+    if (!c->folded) {
+        return;
+    }
+    c->folded = false;
+    AxlGfxPixel *scene_px = axl_gfx_buffer_pixels(c->scene);
+    AxlGfxPixel *under_px = axl_gfx_buffer_pixels(c->under);
+    if (scene_px == NULL || under_px == NULL) {
+        return;
+    }
+    for (int32_t j = 0; j < c->frh; j++) {
+        AxlGfxPixel       *drow = &scene_px[(c->fry + j) * c->scene_w + c->frx];
+        const AxlGfxPixel *urow = &under_px[j * c->spr_w];
+        for (int32_t i = 0; i < c->frw; i++) {
+            drow[i] = urow[i];
+        }
+    }
+}
+
+// Present a scene rect (clamped to the scene) straight to the GOP at the same
+// coordinates. With the cursor folded in, the folded region carries it;
+// elsewhere the scene is clean, so this also erases an old cursor position.
+static void
+present_scene_rect(AxlCursor *c, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    int32_t x2 = clampi(x + w, 0, c->scene_w);
+    int32_t y2 = clampi(y + h, 0, c->scene_h);
+    x = clampi(x, 0, c->scene_w);
+    y = clampi(y, 0, c->scene_h);
+    if (x2 <= x || y2 <= y) {
+        return;
+    }
+    axl_gfx_buffer_present_rect(c->scene, (uint32_t)x, (uint32_t)y,
+                                (uint32_t)x, (uint32_t)y,
+                                (uint32_t)(x2 - x), (uint32_t)(y2 - y));
+}
+
+// Scene-bound atomic (re)present of the cursor at its current position: fold
+// the sprite into the scene, then flush the cursor — plus the old footprint
+// when moving — in as few presents as possible (one union present when the
+// old and new rects overlap, so a small move never shows a cursor-less gap),
+// then unfold so the scene stays clean. Replaces the save-under erase()+draw()
+// pair for the scene-bound path.
+static void
+scene_present(AxlCursor *c)
+{
+    int32_t orx = c->vx, ory = c->vy, orw = c->vw, orh = c->vh;
+    bool    had_old = c->on_screen && orw > 0 && orh > 0;
+
+    fold_into_scene(c);
+    if (c->folded) {
+        int32_t nrx = c->frx, nry = c->fry, nrw = c->frw, nrh = c->frh;
+        bool overlap = had_old
+            && orx < nrx + nrw && nrx < orx + orw
+            && ory < nry + nrh && nry < ory + orh;
+        if (overlap) {                       // one atomic present over old∪new
+            int32_t x0 = orx < nrx ? orx : nrx;
+            int32_t y0 = ory < nry ? ory : nry;
+            int32_t x1 = orx + orw > nrx + nrw ? orx + orw : nrx + nrw;
+            int32_t y1 = ory + orh > nry + nrh ? ory + orh : nry + nrh;
+            present_scene_rect(c, x0, y0, x1 - x0, y1 - y0);
+        } else {
+            if (had_old) {                   // disjoint: erase old, draw new
+                present_scene_rect(c, orx, ory, orw, orh);
+            }
+            present_scene_rect(c, nrx, nry, nrw, nrh);
+        }
+        c->vx = nrx; c->vy = nry; c->vw = nrw; c->vh = nrh;
+        c->on_screen = true;
+    } else if (had_old) {                    // moved fully off-screen: erase old
+        present_scene_rect(c, orx, ory, orw, orh);
+        c->on_screen = false;
+        c->vw = c->vh = 0;
+    }
+    unfold_from_scene(c);
 }
 
 AxlCursor *
@@ -320,7 +464,7 @@ axl_cursor_set_image(AxlCursor *c, const AxlGfxBuffer *sprite,
         }
     }
     if (rc == AXL_OK && was_on) {
-        draw(c);
+        if (c->save_under) { draw(c); } else { scene_present(c); }
     }
     return rc;
 }
@@ -333,7 +477,7 @@ axl_cursor_show(AxlCursor *c)
     }
     c->visible = true;
     if (!c->lifted && !c->on_screen) {
-        draw(c);
+        if (c->save_under) { draw(c); } else { scene_present(c); }
     }
 }
 
@@ -345,7 +489,7 @@ axl_cursor_hide(AxlCursor *c)
     }
     c->visible = false;
     if (c->on_screen) {
-        erase(c);
+        erase(c);   // present clean scene over the cursor (both modes)
     }
 }
 
@@ -361,13 +505,20 @@ axl_cursor_move(AxlCursor *c, int32_t x, int32_t y)
     if (c == NULL) {
         return;
     }
-    if (c->on_screen) {
-        erase(c);
-    }
     c->x = clampi(x, 0, c->scene_w - 1);
     c->y = clampi(y, 0, c->scene_h - 1);
-    if (c->visible && !c->lifted) {
-        draw(c);
+    if (c->save_under) {
+        // Option B: erase the old rect, then draw the new via the scratch.
+        if (c->on_screen) {
+            erase(c);
+        }
+        if (c->visible && !c->lifted) {
+            draw(c);
+        }
+    } else if (c->visible && !c->lifted) {
+        scene_present(c);          // Option C: atomic erase-old + draw-new
+    } else if (c->on_screen) {
+        erase(c);                  // hidden/lifted: just remove the old cursor
     }
 }
 
@@ -403,10 +554,19 @@ axl_cursor_lift(AxlCursor *c)
     if (c == NULL || c->lifted) {
         return;
     }
-    if (c->on_screen) {
-        erase(c);
-    }
     c->lifted = true;
+    if (c->save_under) {
+        // Option B: no bound scene to fold into — erase to the GOP and let
+        // drop redraw (the legacy bracket; the compositor never uses this).
+        if (c->on_screen) {
+            erase(c);
+        }
+    } else if (c->visible && c->on_screen) {
+        // Option C: fold the sprite INTO the scene so the caller's damage
+        // flush carries the cursor in one present — no cursor-less gap. The
+        // GOP footprint is unchanged; only the scene is transiently dirtied.
+        fold_into_scene(c);
+    }
 }
 
 void
@@ -416,8 +576,12 @@ axl_cursor_drop(AxlCursor *c)
         return;
     }
     c->lifted = false;
-    if (c->visible && !c->on_screen) {
-        draw(c);
+    if (c->save_under) {
+        if (c->visible && !c->on_screen) {
+            draw(c);
+        }
+    } else {
+        unfold_from_scene(c);   // restore the scene; no-op if lift didn't fold
     }
 }
 

@@ -143,7 +143,10 @@ Each `attach_*` returns the loop source ID (use with
 `axl_loop_remove_source` to detach), or 0 on failure: the protocol
 isn't available, a source of that kind is already attached, or
 arguments were NULL. Detach the mouse with `axl_input_detach_mouse`
-(frees the single-mouse slot and cancels any auto-repeat timer).
+(frees the single-mouse slot and cancels any auto-repeat timer) and the
+touch / absolute pointer with `axl_input_detach_touch` (touch binds several
+loop sources, so it needs its own teardown rather than one
+`axl_loop_remove_source`).
 
 ## Recognizers: gestures, debounce, auto-repeat
 
@@ -167,8 +170,8 @@ its own stream (or a unit test) can run the same logic directly.
   keys.)
 
 - **Keyboard debounce** drops a same-key `KEY_DOWN` that repeats faster
-  than a human would — the fix for a high-latency remote console (iDRAC
-  Virtual Console, IPMI SOL) where one keypress registers as held long
+  than a human would — the fix for a high-latency remote console (a BMC
+  virtual console, IPMI SOL) where one keypress registers as held long
   enough that firmware typematic fires it several times. Off by default;
   enable with `axl_input_set_key_debounce(min_repeat_ms,
   printable_only)`, or run it standalone with `axl_input_key_accept`.
@@ -215,17 +218,42 @@ callback for mouse + keyboard + touch doesn't have to maintain a
 separate `AxlKeyCallback`. Callers who already have a key-only flow
 can keep using `axl_loop_add_key_press` directly.
 
-**Touch** (`axl_input_attach_touch`). Locates
-`EFI_ABSOLUTE_POINTER_PROTOCOL`. Positions are **normalized** from the
-device's native `EFI_ABSOLUTE_POINTER_MODE` range into
-`[0, AXL_INPUT_ABS_RANGE)` on both axes, so the value is
-display-independent — the consumer maps it onto its own surface
-(`px = ev->x * surface_w / AXL_INPUT_ABS_RANGE`); `axl_input_abs_normalize`
-exposes the exact mapping. A `TOUCH_MOVE` fires whenever the position
-changes, **including hover** (no contact), so a pen / tablet / VNC
-absolute pointer that reports position without a button still drives a
-pointer; `buttons` on a move is the live contact state (0 on hover), so
-a drag is distinguishable from a hover.
+**Touch / absolute pointer** (`axl_input_attach_touch`). Drives the seat
+from `EFI_ABSOLUTE_POINTER_PROTOCOL` — a touchscreen, pen / digitizer, VNC
+absolute pointer, or the virtual mouse a BMC remote console presents. On
+modern firmware (UEFI ≥ 2.30) the BIOS multiplexes pointer devices through
+`gST->ConsoleInHandle`, and that is where a remote-console pointer's events
+actually arrive — so `attach_touch` binds **every** absolute-pointer handle,
+**ConsoleInHandle first**, not a single located one. Each handle gets a
+`WaitForInput` event source (the efficient path — idle means no wakeups),
+plus a low-rate poll fallback for firmware whose `WaitForInput` never
+signals; a dispatch reads the first handle with data and stops (`GetState`
+consumes, so the sources never double-count). Tear it **all** down with
+`axl_input_detach_touch` — not a single `axl_loop_remove_source`, since it
+registers several sources. (The compositor wraps this as
+`axl_compositor_attach_touch`, scaling the normalized position onto the
+output and running the click/drag recognizer so an absolute pointer gets
+double-click + drag.)
+
+Positions are **normalized** from the device's native
+`EFI_ABSOLUTE_POINTER_MODE` range into `[0, AXL_INPUT_ABS_RANGE)` on both
+axes, so the value is display-independent — the consumer maps it onto its
+own surface (`px = ev->x * surface_w / AXL_INPUT_ABS_RANGE`);
+`axl_input_abs_normalize` exposes the exact mapping. A `TOUCH_MOVE` fires
+whenever the position changes, **including hover** (no contact), so a pen /
+tablet / VNC absolute pointer that reports position without a button still
+drives a pointer; `buttons` on a move is the live contact state (0 on
+hover), so a drag is distinguishable from a hover.
+
+Tune the read path with `axl_input_set_touch_config` when a given firmware
+misbehaves: pick the mechanism (`AXL_INPUT_TOUCH_EVENT_AND_POLL` default /
+`EVENT_ONLY` / `POLL_ONLY`), the poll interval (some BMC consoles flicker or
+stall the pointer protocol if polled too fast), and whether to bind only
+`ConsoleInHandle` (skipping a separate physical handle that would otherwise
+deliver the same device twice). To see what a platform actually exposes,
+`axl_input_probe_pointers` enumerates every simple / absolute pointer handle,
+flags the `ConsoleInHandle` aggregator, and runs a live event-vs-poll
+comparison — handy when a remote-console pointer "doesn't move."
 
 ### v0.1 constraints
 

@@ -252,8 +252,8 @@ Listed for design pressure on the core, not committed to:
 
 - `font/upload(glyphs[])` — client-side fonts uploaded as `AxlGlyph`
   arrays; server constructs an `AxlFont` and assigns a font-ref.
-- `cursor/set(image, hotspot)` — software cursor for displays
-  without hardware cursor support.
+- `cursor/set(image, hotspot)` — software cursor (UEFI GOP exposes no
+  hardware-cursor API, so the server composites it).
 - `shm/import_buffer(...)` — local-only (Unix socket transport)
   zero-copy pixel transfer. Not applicable to UEFI but reserved
   in case the client lib someday targets a different server.

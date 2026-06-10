@@ -375,6 +375,19 @@ test_attach_touch_protocol_available(void)
                "attach_touch: second attach returns 0 "
                "(only one touch source per process)");
 
+    /* Detach must free the single-source slot AND the protocol-notify source
+       (and the WaitForInput sources) so a fresh attach re-binds cleanly — a
+       regression guard for the handle-based re-resolve + protocol-notify rework
+       (the fix for the stale-interface #GP when the pointer driver is Stop()'d).
+       A botched detach (leaked notify source / unreset state) makes re-attach
+       fail here. */
+    axl_input_detach_touch(loop);
+    uint32_t id3 = axl_input_attach_touch(loop, unused_cb, NULL);
+    test_check(id3 != 0,
+               "attach_touch: re-attach after detach succeeds "
+               "(handle/notify re-bind lifecycle)");
+    axl_input_detach_touch(loop);
+
     axl_loop_free(loop);
 }
 

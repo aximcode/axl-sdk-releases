@@ -4,10 +4,12 @@
 /**
  * @file axl-cursor.h
  *
- * Software mouse-cursor compositor for axl-gfx. GOP exposes no hardware
- * cursor, so a sprite that tracks the pointer must be composited in
- * software — and since exactly one cursor owns the screen, that belongs
- * in one shared place rather than re-invented per consumer.
+ * Software mouse-cursor compositor for axl-gfx. GOP exposes no
+ * hardware-cursor API (the GPU usually has a cursor plane, but UEFI
+ * surfaces only a framebuffer + Blt — no portable way to drive it), so a
+ * sprite that tracks the pointer must be composited in software — and
+ * since exactly one cursor owns the screen, that belongs in one shared
+ * place rather than re-invented per consumer.
  *
  * The cursor is bound to the back-buffer "scene" being scanned out (the
  * source of truth for the pixels under it). Moving it touches only the
@@ -177,12 +179,24 @@ axl_cursor_position(
 );
 
 /**
- * @brief Lift the cursor before the consumer re-presents the scene.
+ * @brief Bracket-open: fold the cursor into the scene before the consumer
+ *        flushes it, so one present carries the cursor atomically.
  *
- * Restores the scene pixels under the cursor and marks it lifted, so a
- * subsequent `axl_gfx_buffer_present(scene, …)` is not overwritten by a
- * stale cursor. Pair with axl_cursor_drop after the present. A lift/drop
- * with no present in between is harmless. No-op if already lifted/hidden.
+ * For a bound scene (Option C), this composites the sprite INTO the scene as
+ * its top layer (saving the pixels it overwrites), so the consumer's
+ * `axl_gfx_buffer_present(scene, …)` — or the compositor's damage flush —
+ * presents scene+cursor in a SINGLE operation. This is the flicker fix: there
+ * is no separate erase/redraw to the GOP, so there is never an intermediate
+ * frame showing the scene without the cursor (the failure mode at low present
+ * rates). It mirrors how software-cursor compositors composite the cursor as
+ * the last layer before one commit (wlroots, Qt's QFbCursor).
+ *
+ * For save-under (NULL scene) there is no buffer to fold into, so this falls
+ * back to restoring the screen pixels under the cursor; axl_cursor_drop then
+ * redraws it after the present.
+ *
+ * Pair with axl_cursor_drop after the present. A lift/drop with no present in
+ * between is harmless. No-op if already lifted/hidden.
  */
 void
 axl_cursor_lift(
@@ -190,9 +204,11 @@ axl_cursor_lift(
 );
 
 /**
- * @brief Re-composite the cursor after the consumer re-presents the scene.
+ * @brief Bracket-close: counterpart to axl_cursor_lift.
  *
- * The counterpart to axl_cursor_lift. No-op if the cursor is hidden.
+ * For a bound scene, unfolds the cursor — restores the saved scene pixels so
+ * the scene is byte-clean for the next partial-damage repaint. For save-under,
+ * re-composites the cursor over the freshly-presented screen. No-op if hidden.
  */
 void
 axl_cursor_drop(

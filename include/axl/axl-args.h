@@ -102,12 +102,21 @@
  * };
  * @endcode
  *
- * `--help` and `-h` are always recognised and recurse naturally —
- * `mytool --help` shows the top tree, `mytool bios --help` shows just the
- * bios subtree. Unknown flags / verbs / out-of-range typed args
- * produce an error message qualified by the full breadcrumb
- * (`mytool bios: unknown verb 'flarble'`) and the auto-generated usage,
- * exit non-zero, no handler invocation.
+ * `--help`, `-h`, and a lone `?` are always recognised and recurse
+ * naturally — `mytool --help` shows the top tree, `mytool bios ?` shows
+ * just the bios subtree. `?` is a help alias for legacy-tool parity: any
+ * node that accepts a flag treats a bare `?` as `--help` for that node
+ * (after `--` it is an ordinary positional). Unknown flags / verbs /
+ * out-of-range typed args produce an error message qualified by the full
+ * breadcrumb (`mytool bios: unknown verb 'flarble'`) and the auto-generated
+ * usage, exit non-zero, no handler invocation.
+ *
+ * **Help format.** The generated help is terse: a `Usage:` line, then one
+ * aligned list of positionals, flags, and a single `-h, --help` row — no
+ * `Arguments:` / `Flags:` section headers and no `(optional)` suffix (the
+ * `[<name>]` brackets in the Usage line already mark optional positionals).
+ * The left column auto-sizes to the longest entry so it reads like a
+ * hand-written usage block.
  *
  * **Negative-number positionals.** A token of the form `-<digit>` or
  * `-.<digit>` (e.g. `-1`, `-.5`) is treated as a positional, not a
@@ -117,7 +126,7 @@
  *
  * **`--` end-of-options.** A bare `--` token ends option parsing for
  * the *current* node: it is consumed, and every following token is a
- * positional unconditionally (flags, `-h`, and the bare `help` word
+ * positional unconditionally (flags, `-h`, `?`, and the bare `help` word
  * are no longer special). At a branch the next token still selects a
  * verb; the chosen sub-command then parses its own argv slice fresh,
  * so `--` does not propagate across levels (matches git/cargo

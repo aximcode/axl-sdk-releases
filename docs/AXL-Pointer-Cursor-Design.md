@@ -38,8 +38,10 @@ doesn't smear or force a full-frame redraw. If each consumer drew its
 own cursor (as `sdk/examples/pointer-demo.c` does today — recompositing
 the whole background on every move), two consumers would fight over it
 and every one would re-implement the same save/restore dance, badly.
-GOP exposes **no hardware cursor**, so this is necessarily a software
-compositor — which is precisely why it belongs in one shared place.
+GOP exposes **no hardware-cursor API** (the GPU usually has a cursor
+plane, but UEFI surfaces only a framebuffer + Blt — no portable way to
+drive it), so this is necessarily a software compositor — which is
+precisely why it belongs in one shared place.
 
 ### 1.2 API sketch (contract — review before implementing)
 
@@ -119,6 +121,24 @@ existing `present_rect` + dirty-rect (G18) machinery, needs no pixel
 capture, and is cheap (two small rect presents per move). Most AXL gfx
 consumers already use a back-buffer, so this is the common path; Option B
 covers the direct-to-screen minority.
+
+> **Refinement (flicker fix, post-spike).** The naive Option C above
+> presents the erase (old rect) and the draw (new rect) as **two separate
+> GOP writes**, and the lift/drop bracket erased the cursor from the GOP,
+> flushed the scene, then redrew it. Both leave a brief frame where the
+> screen shows the scene *without* the cursor — invisible at fast event
+> rates but a visible flicker at a throttled poll (e.g. a 10 Hz BMC
+> remote-console pointer). The fix matches what real software-cursor
+> compositors do (wlroots `wlr_output_render_software_cursors`, Qt
+> `QFbCursor`): composite the cursor **into the scene as its top layer**,
+> then present **once** so scene+cursor land atomically. Concretely:
+> `axl_cursor_lift` *folds* the sprite into the bound scene (saving the
+> overwritten pixels) so the consumer's / compositor's single flush carries
+> it; `axl_cursor_drop` *unfolds* (restores the saved pixels) to keep the
+> scene byte-clean for the next partial-damage repaint; and a move presents
+> the `old∪new` region in one atomic present when the rects overlap. Option
+> B (save-under) keeps the two-write path — it has no scene buffer to fold
+> into and is the rarely-used direct-to-screen fallback.
 
 **What the spike must answer:**
 - Does Option C's two-small-rect present per move read clean (no tearing

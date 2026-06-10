@@ -196,7 +196,7 @@ axl_input_set_button_repeat(
 // ===================================================================
 // Keyboard debounce / repeat suppression
 //
-// Over a high-latency remote console (iDRAC Virtual Console, IPMI SOL),
+// Over a high-latency remote console (a BMC virtual console / IPMI SOL),
 // a single intended keypress can register as held long enough that the
 // firmware's typematic fires, so one character arrives several times.
 // UEFI offers no way to turn firmware typematic off, so the fix is a
@@ -424,16 +424,89 @@ axl_input_detach_key(
 /// native `EFI_ABSOLUTE_POINTER_MODE` range — display-independent; the
 /// caller maps it onto its surface.  See `AXL_INPUT_ABS_RANGE`.
 ///
-/// Only one touch source per process for v0.1.
+/// Binds EVERY handle publishing `EFI_ABSOLUTE_POINTER_PROTOCOL`,
+/// **ConsoleInHandle first** — on modern firmware (UEFI >= 2.30) the BIOS
+/// multiplexes pointers, including a BMC remote-console virtual mouse, through ConIn,
+/// and that is where live events arrive.  Each handle gets a `WaitForInput`
+/// event source (the efficient path), plus a low-rate poll fallback for
+/// firmware whose `WaitForInput` never signals — so the cursor works either
+/// way.  `GetState` consumes, so the readers never double-count.
 ///
-/// @return source ID for axl_loop_remove_source, or 0 on failure
-///         (NULL args, EFI_ABSOLUTE_POINTER_PROTOCOL not available,
-///         or a touch source already attached).
+/// Only one touch source per process for v0.1.  Tear it down with
+/// `axl_input_detach_touch` (NOT a single `axl_loop_remove_source`, since it
+/// registers several sources).
+///
+/// @return a non-zero source ID on success (the first source bound), or 0 on
+///         failure (NULL args, no absolute pointer, or already attached).
 uint32_t
 axl_input_attach_touch(
     AxlLoop           *loop,
     AxlInputCallback   cb,
     void              *data
+    );
+
+/// How `axl_input_attach_touch` reads the absolute pointer — tunable so a
+/// consumer can find what a given platform's firmware handles best.
+typedef enum {
+    AXL_INPUT_TOUCH_EVENT_AND_POLL = 0,  ///< WaitForInput sources + poll fallback (default)
+    AXL_INPUT_TOUCH_EVENT_ONLY,          ///< WaitForInput event sources only
+    AXL_INPUT_TOUCH_POLL_ONLY,           ///< GetState poll timer only
+} AxlInputTouchMethod;
+
+/// Configure the NEXT `axl_input_attach_touch` (a process-global setting; call
+/// before attaching).  Defaults: `EVENT_AND_POLL`, all handles, 30 ms poll.
+/// @param method            which read mechanism(s) to use.
+/// @param console_only      bind ONLY `gST->ConsoleInHandle` (skip the separate
+///                          physical handle — avoids double events if both
+///                          deliver the same device independently).
+/// @param poll_ms           poll-fallback interval (0 = keep the 30 ms default).
+void
+axl_input_set_touch_config(
+    AxlInputTouchMethod  method,
+    bool                 console_only,
+    uint32_t             poll_ms
+    );
+
+/// Set how many queued absolute-pointer states a single read drains, coalescing
+/// them to the LATEST position (a process-global setting; call before
+/// attaching).  Default 1 = read one state per dispatch (legacy behavior).
+///
+/// Some firmware — notably a BMC/remote-console virtual mouse — queues pointer
+/// states FIFO: a fast move enqueues many, and at one-read-per-poll the cursor
+/// drains the backlog slowly and lags seconds behind.  Raising this drains up
+/// to @p max_states per read and reports only the final position, so a slow,
+/// protocol-safe poll still catches up in one tick.  A value of 0 or 1 keeps
+/// the single-read behavior.
+///
+/// Coalescing reports only the last drained state's buttons, so a full press+
+/// release that lands entirely within one drained batch can be missed — fine
+/// for tracking, so keep the default (1) where click latency matters.
+void
+axl_input_set_touch_drain(
+    uint32_t  max_states   ///< max queued states to coalesce per read (0/1 = no coalesce)
+    );
+
+/// Detach the touch source: removes every WaitForInput event source + the poll
+/// fallback from @p loop and frees the single-touch-per-process slot so a later
+/// `axl_input_attach_touch` can succeed.  Pass the loop it was attached to.
+void
+axl_input_detach_touch(
+    AxlLoop  *loop
+    );
+
+/// Diagnostic: enumerate every pointer protocol the firmware publishes and
+/// report it to the console (`axl_printf`) and, if @p log_path is non-NULL, to
+/// that file.  For each of `EFI_SIMPLE_POINTER_PROTOCOL` and
+/// `EFI_ABSOLUTE_POINTER_PROTOCOL` it lists all handles, flags which is the
+/// `ConsoleInHandle` aggregator, whether `HandleProtocol(ConsoleInHandle, …)`
+/// succeeds, the device's mode (resolution / absolute range), and a live
+/// `GetState` result.  Use it to see which pointer path a given platform (real
+/// hardware, a BMC remote console, QEMU) actually exposes — call it BEFORE the
+/// GUI takes the framebuffer so the console output is visible.  Best-effort:
+/// silently does nothing if boot services are unavailable.
+void
+axl_input_probe_pointers(
+    const char *log_path   ///< optional file to also write the report to (NULL = console only)
     );
 
 #ifdef __cplusplus

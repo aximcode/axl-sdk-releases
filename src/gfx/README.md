@@ -377,21 +377,33 @@ clean). Presenting only the dirty region cuts present bandwidth by
 
 ## Cursor Overlay
 
-GOP exposes no hardware cursor, so a sprite that tracks the pointer must
-be composited in software. `<axl/axl-cursor.h>` (`AxlCursor`) owns the
+GOP exposes no hardware-cursor API (the GPU usually has a cursor plane,
+but UEFI surfaces only a framebuffer + Blt), so a sprite that tracks the
+pointer must be composited in software. `<axl/axl-cursor.h>` (`AxlCursor`) owns the
 one cursor on the screen and its position. It binds to the back-buffer
-"scene" being scanned out and touches only the cursor region: the old
-position is erased by re-presenting the clean scene there and the sprite
-is composited over the scene at the new position — no full-frame redraw.
+"scene" being scanned out and touches only the cursor region.
+
+The cursor is composited **into the scene as its top layer**, never
+presented as a separate GOP operation — the same approach real
+software-cursor compositors use (wlroots' `wlr_output_render_software_cursors`
+composites the cursor as the last layer before one commit; Qt's
+direct-framebuffer `QFbCursor` composites over the repainted scene and
+flushes the region once). A move folds the sprite in, presents the old∪new
+region **atomically** (one present, so a small move never shows a
+cursor-less gap), then unfolds to keep the scene byte-clean. This avoids the
+flicker you get when the cursor is erased then redrawn as two separate GOP
+writes — at low present rates (e.g. a throttled 10 Hz pointer poll) that gap
+is visible.
 
 ```c
 AxlGfxBuffer *scene = axl_gfx_buffer_new(w, h);   // your back-buffer
 AxlCursor *cur = axl_cursor_new(scene);           // built-in arrow, hidden
 axl_cursor_attach(cur, loop, on_input, &app);     // tracks the pointer
-// when you re-present a new frame, bracket it so the cursor stays on top:
-axl_cursor_lift(cur);
-axl_gfx_buffer_present(scene, 0, 0);
-axl_cursor_drop(cur);
+// when you re-present a new frame, bracket it so the cursor folds INTO the
+// flush — scene+cursor reach the screen in one present, atomically:
+axl_cursor_lift(cur);                             // fold sprite into scene
+axl_gfx_buffer_present(scene, 0, 0);              // one present carries both
+axl_cursor_drop(cur);                             // unfold (scene clean again)
 ```
 
 `axl_cursor_set_image` swaps the sprite (a NULL sprite restores the

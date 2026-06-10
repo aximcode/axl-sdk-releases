@@ -16,10 +16,15 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include <axl/axl-format.h>
+#include <axl/axl-fs.h>
 #include <axl/axl-input.h>
 #include <axl/axl-log.h>
 #include <axl/axl-loop.h>
+#include <axl/axl-stream.h>
+#include <axl/axl-str.h>
 #include <axl/axl-time.h>
+#include <axl/axl-wait.h>
 
 AXL_LOG_DOMAIN("input");
 
@@ -365,6 +370,288 @@ axl_input_locate_physical_pointer(EFI_GUID *guid)
     return iface;
 }
 
+// Max pointer interfaces a source binds (ConsoleInHandle + a few physical).
+#define AXL_MAX_POINTER_IFACES 8
+
+// Collect every interface publishing @p guid into @p out (cap @p max),
+// **ConsoleInHandle FIRST**.  On modern firmware (UEFI >= 2.30 — all current
+// servers) the BIOS multiplexes pointer devices, INCLUDING a BMC remote-console virtual
+// mouse, through gST->ConsoleInHandle, and that is where live events arrive
+// (verified on real hardware: event-driven WaitForInput delivers through ConIn while the
+// separate physical handle stays idle).  Binding every handle + reading
+// first-with-data means an idle/empty aggregator simply stays silent, so this is
+// robust across firmware that routes via ConIn (a BMC remote console) AND firmware that
+// exposes only a physical handle (some QEMU OVMF).  Returns the handle count.
+//
+// Collects HANDLES (not interface pointers): the interface is re-resolved per
+// dispatch (touch_resolve), so a driver Stop()/FreePool() that invalidates the
+// interface can't leave us calling through freed memory.  A handle is included
+// only if it currently publishes @p guid (HandleProtocol succeeds).
+static int
+collect_pointers(EFI_GUID *guid, EFI_HANDLE *out, int max)
+{
+    int        n      = 0;
+    EFI_HANDLE con_in = (axl_st() != NULL) ? axl_st()->ConsoleInHandle : NULL;
+    void      *iface  = NULL;
+    if (con_in != NULL
+        && axl_bs()->HandleProtocol(con_in, guid, &iface) == 0 && iface != NULL) {
+        out[n++] = con_in;
+    }
+    EFI_HANDLE *handles = NULL;
+    uint64_t    count   = 0;
+    if (axl_bs()->LocateHandleBuffer(ByProtocol, guid, NULL, &count, &handles) == 0
+        && handles != NULL) {
+        for (uint64_t i = 0; i < count && n < max; i++) {
+            if (handles[i] == con_in) continue;   // ConIn already added first
+            void *cand = NULL;
+            if (axl_bs()->HandleProtocol(handles[i], guid, &cand) == 0
+                && cand != NULL) {
+                out[n++] = handles[i];
+            }
+        }
+        axl_bs()->FreePool(handles);
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic probe — see what pointer protocols a platform actually exposes.
+// ---------------------------------------------------------------------------
+
+// A bounded line sink for axl_vformat.
+typedef struct { char *buf; size_t cap; size_t n; } ProbeLine;
+static void
+probe_line_writer(const char *data, size_t len, void *ctx)
+{
+    ProbeLine *s = (ProbeLine *)ctx;
+    for (size_t i = 0; i < len && s->n < s->cap - 1; i++) s->buf[s->n++] = data[i];
+    s->buf[s->n] = '\0';
+}
+
+// Append a formatted line to @p buf (bounded by @p cap, tracked by *@p len) AND
+// print it to the console, so the report shows live and is captured to a file.
+static void __attribute__((format(printf, 4, 5)))
+probe_emit(char *buf, size_t cap, size_t *len, const char *fmt, ...)
+{
+    char      line[256];
+    ProbeLine ls = { line, sizeof line, 0 };
+    va_list   ap;
+    va_start(ap, fmt);
+    axl_vformat(probe_line_writer, &ls, fmt, ap);
+    va_end(ap);
+
+    axl_print("%s", line);
+    if (*len < cap - 1) {
+        size_t room = cap - *len - 1;
+        size_t copy = (ls.n < room) ? ls.n : room;
+        for (size_t i = 0; i < copy; i++) buf[*len + i] = line[i];
+        *len += copy;
+        buf[*len] = '\0';
+    }
+}
+
+// Report every handle publishing @p guid: which is the ConsoleInHandle
+// aggregator, whether HandleProtocol succeeds, the mode, and a live GetState.
+static void
+probe_one_protocol(EFI_GUID *guid, const char *name, bool absolute,
+                   char *buf, size_t cap, size_t *len)
+{
+    EFI_HANDLE *handles = NULL;
+    uint64_t    count   = 0;
+    EFI_HANDLE  con_in  = axl_st()->ConsoleInHandle;
+
+    EFI_STATUS st = axl_bs()->LocateHandleBuffer(ByProtocol, guid, NULL,
+                                                 &count, &handles);
+    if (st != 0 || handles == NULL) {
+        probe_emit(buf, cap, len, "%s: none (LocateHandleBuffer=0x%llx)\n",
+                   name, (unsigned long long)st);
+        return;
+    }
+    probe_emit(buf, cap, len, "%s: %llu handle(s)\n", name,
+               (unsigned long long)count);
+    for (uint64_t i = 0; i < count; i++) {
+        bool  is_con_in = (handles[i] == con_in);
+        void *iface     = NULL;
+        EFI_STATUS hp   = axl_bs()->HandleProtocol(handles[i], guid, &iface);
+        probe_emit(buf, cap, len, "  [%llu] handle=0x%llx%s HandleProtocol=%s\n",
+                   (unsigned long long)i,
+                   (unsigned long long)(uintptr_t)handles[i],
+                   is_con_in ? " (ConsoleInHandle)" : "",
+                   (hp == 0 && iface) ? "OK" : "FAIL");
+        if (hp != 0 || !iface) continue;
+
+        if (absolute) {
+            EFI_ABSOLUTE_POINTER_PROTOCOL *ap =
+                (EFI_ABSOLUTE_POINTER_PROTOCOL *)iface;
+            EFI_ABSOLUTE_POINTER_MODE *m = ap->Mode;
+            if (m) {
+                probe_emit(buf, cap, len,
+                           "        mode: maxX=%llu maxY=%llu attr=0x%llx\n",
+                           (unsigned long long)m->AbsoluteMaxX,
+                           (unsigned long long)m->AbsoluteMaxY,
+                           (unsigned long long)m->Attributes);
+            }
+            EFI_ABSOLUTE_POINTER_STATE state;
+            EFI_STATUS gs = ap->GetState(ap, &state);
+            if (gs == 0) {
+                probe_emit(buf, cap, len,
+                           "        GetState=OK x=%llu y=%llu buttons=0x%x\n",
+                           (unsigned long long)state.CurrentX,
+                           (unsigned long long)state.CurrentY,
+                           state.ActiveButtons);
+            } else {
+                probe_emit(buf, cap, len, "        GetState=0x%llx (no data)\n",
+                           (unsigned long long)gs);
+            }
+        } else {
+            EFI_SIMPLE_POINTER_PROTOCOL *sp =
+                (EFI_SIMPLE_POINTER_PROTOCOL *)iface;
+            EFI_SIMPLE_POINTER_MODE *m = (EFI_SIMPLE_POINTER_MODE *)sp->Mode;
+            if (m) {
+                probe_emit(buf, cap, len,
+                           "        mode: resX=%llu resY=%llu hasL=%d hasR=%d\n",
+                           (unsigned long long)m->ResolutionX,
+                           (unsigned long long)m->ResolutionY,
+                           (int)m->LeftButton, (int)m->RightButton);
+            }
+            EFI_SIMPLE_POINTER_STATE state;
+            EFI_STATUS gs = sp->GetState(sp, &state);
+            if (gs == 0) {
+                probe_emit(buf, cap, len,
+                           "        GetState=OK dx=%d dy=%d L=%d R=%d\n",
+                           state.RelativeMovementX, state.RelativeMovementY,
+                           (int)state.LeftButton, (int)state.RightButton);
+            } else {
+                probe_emit(buf, cap, len, "        GetState=0x%llx (no data)\n",
+                           (unsigned long long)gs);
+            }
+        }
+    }
+    // Explicit ConsoleInHandle check (the multiplex path a BMC console uses).
+    void *cin = NULL;
+    EFI_STATUS chp = axl_bs()->HandleProtocol(con_in, guid, &cin);
+    probe_emit(buf, cap, len, "  ConsoleInHandle %s: %s\n", name,
+               (chp == 0 && cin) ? "PRESENT (multiplexed here)" : "absent");
+    axl_bs()->FreePool(handles);
+}
+
+void
+axl_input_probe_pointers(const char *log_path)
+{
+    if (axl_bs() == NULL || axl_st() == NULL) return;
+
+    static char buf[8192];
+    size_t len = 0;
+    buf[0] = '\0';
+
+    uint32_t rev = axl_st()->Hdr.Revision;
+    probe_emit(buf, sizeof buf, &len, "=== axl-input pointer probe ===\n");
+    probe_emit(buf, sizeof buf, &len,
+               "UEFI revision: %u.%u (0x%08x)  [>= 2.30: %s]\n",
+               rev >> 16, rev & 0xFFFF, rev,
+               rev >= 0x0002001E ? "yes" : "no");
+
+    EFI_GUID sp_guid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+    EFI_GUID ap_guid = EFI_ABSOLUTE_POINTER_PROTOCOL_GUID;
+    probe_one_protocol(&sp_guid, "EFI_SIMPLE_POINTER_PROTOCOL",   false,
+                       buf, sizeof buf, &len);
+    probe_one_protocol(&ap_guid, "EFI_ABSOLUTE_POINTER_PROTOCOL", true,
+                       buf, sizeof buf, &len);
+
+    // Method comparison on the ConsoleInHandle pointer(s): does the efficient
+    // EVENT-DRIVEN path (CheckEvent on WaitForInput, then GetState — what
+    // axl_loop_add_event relies on) actually deliver on this device, or must we
+    // POLL (GetState on a timer (a poll timer))?  Two separate windows so the
+    // two readers don't consume each other's data; the user moves the device in
+    // both.  This tells us empirically which mechanism the fix should use.
+    EFI_HANDLE con_in = axl_st()->ConsoleInHandle;
+    EFI_SIMPLE_POINTER_PROTOCOL   *sp = NULL;
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap = NULL;
+    (void)axl_bs()->HandleProtocol(con_in, &sp_guid, (void **)&sp);
+    (void)axl_bs()->HandleProtocol(con_in, &ap_guid, (void **)&ap);
+
+    int sp_evt = 0, ap_evt = 0, sp_poll = 0, ap_poll = 0;
+    const int PRINT_CAP = 6;   // lines per kind (the counts still tally all)
+
+    // [1/2] Event-driven: wait on WaitForInput via CheckEvent, then GetState.
+    probe_emit(buf, sizeof buf, &len,
+               "-- [1/2] EVENT-DRIVEN test: MOVE the mouse now (3s) --\n");
+    for (int t = 0; t < 60; t++) {
+        if (ap && ap->WaitForInput
+            && axl_bs()->CheckEvent(ap->WaitForInput) == 0) {
+            EFI_ABSOLUTE_POINTER_STATE s;
+            if (ap->GetState(ap, &s) == 0) {
+                if (ap_evt < PRINT_CAP)
+                    probe_emit(buf, sizeof buf, &len,
+                               "  evt abs: x=%llu y=%llu buttons=0x%x\n",
+                               (unsigned long long)s.CurrentX,
+                               (unsigned long long)s.CurrentY, s.ActiveButtons);
+                ap_evt++;
+            }
+        }
+        if (sp && sp->WaitForInput
+            && axl_bs()->CheckEvent(sp->WaitForInput) == 0) {
+            EFI_SIMPLE_POINTER_STATE s;
+            if (sp->GetState(sp, &s) == 0) {
+                if (sp_evt < PRINT_CAP)
+                    probe_emit(buf, sizeof buf, &len,
+                               "  evt simple: dx=%d dy=%d L=%d R=%d\n",
+                               s.RelativeMovementX, s.RelativeMovementY,
+                               (int)s.LeftButton, (int)s.RightButton);
+                sp_evt++;
+            }
+        }
+        axl_msleep(50);
+    }
+
+    // [2/2] Polling: GetState every tick (the polling method).
+    probe_emit(buf, sizeof buf, &len,
+               "-- [2/2] POLLING test: MOVE the mouse now (3s) --\n");
+    for (int t = 0; t < 60; t++) {
+        if (ap) {
+            EFI_ABSOLUTE_POINTER_STATE s;
+            if (ap->GetState(ap, &s) == 0) {
+                if (ap_poll < PRINT_CAP)
+                    probe_emit(buf, sizeof buf, &len,
+                               "  poll abs: x=%llu y=%llu buttons=0x%x\n",
+                               (unsigned long long)s.CurrentX,
+                               (unsigned long long)s.CurrentY, s.ActiveButtons);
+                ap_poll++;
+            }
+        }
+        if (sp) {
+            EFI_SIMPLE_POINTER_STATE s;
+            if (sp->GetState(sp, &s) == 0
+                && (s.RelativeMovementX || s.RelativeMovementY
+                    || s.LeftButton || s.RightButton)) {
+                if (sp_poll < PRINT_CAP)
+                    probe_emit(buf, sizeof buf, &len,
+                               "  poll simple: dx=%d dy=%d L=%d R=%d\n",
+                               s.RelativeMovementX, s.RelativeMovementY,
+                               (int)s.LeftButton, (int)s.RightButton);
+                sp_poll++;
+            }
+        }
+        axl_msleep(50);
+    }
+
+    probe_emit(buf, sizeof buf, &len,
+               "RESULT absolute: event-driven=%d polling=%d\n", ap_evt, ap_poll);
+    probe_emit(buf, sizeof buf, &len,
+               "RESULT simple:   event-driven=%d polling=%d\n", sp_evt, sp_poll);
+    bool any_evt  = (ap_evt > 0 || sp_evt > 0);
+    bool any_poll = (ap_poll > 0 || sp_poll > 0);
+    probe_emit(buf, sizeof buf, &len, "  -> %s\n",
+               any_evt  ? "EVENT-DRIVEN works (WaitForInput) — the efficient path"
+             : any_poll ? "event-driven DEAD; POLLING works — use a poll timer"
+                        : "no events seen (move during BOTH windows, then re-run)");
+    probe_emit(buf, sizeof buf, &len, "=== end probe ===\n");
+
+    if (log_path != NULL && len > 0) {
+        (void)axl_file_set_contents(log_path, buf, len);
+    }
+}
+
 uint32_t
 axl_input_attach_mouse(
     AxlLoop           *loop,
@@ -545,17 +832,61 @@ axl_input_detach_key(AxlLoop *loop)
 //                position continuously, so it drives a pointer.  `buttons`
 //                carries the live ActiveButtons (0 = hover, non-zero = drag).
 
+// Fallback poll interval (ms) — used ONLY on firmware whose WaitForInput never
+// signals; when the event path works (the common case, e.g. a BMC remote console) the
+// poll just finds "no data" cheaply (GetState consumes, so no double-emit).
+#define TOUCH_POLL_MS 30
+
 typedef struct {
     AxlInputCallback                cb;
     void                           *data;
-    EFI_ABSOLUTE_POINTER_PROTOCOL  *protocol;
-    int32_t                         last_x;
+    // Bind by HANDLE, not by a cached interface pointer: the providing driver
+    // (e.g. DellUsbMouseAbsolutePointerDxe) can be Stop()'d on USB re-enum /
+    // console reconnect — common over a BMC remote console — which uninstalls
+    // AND FreePool()s its EFI_ABSOLUTE_POINTER_PROTOCOL.  A cached interface
+    // would then dangle and the next GetState() would call through freed memory
+    // (a #GP).  We re-resolve the handle to its CURRENT interface every dispatch
+    // (HandleProtocol fails safely if the protocol is gone), and re-bind on
+    // (re)install via a protocol-notify source.
+    EFI_HANDLE                      handles[AXL_MAX_POINTER_IFACES]; ///< ConIn-first
+    int                             nproto;
+    int32_t                         last_x;         ///< native coords for change-detect
     int32_t                         last_y;
     bool                            contact_active;
+    AxlLoop                        *loop;
+    uint32_t                        source_ids[AXL_MAX_POINTER_IFACES]; ///< per-handle WaitForInput sources
+    int                             nsrc;
+    uint32_t                        poll_src;       ///< fallback poll timer (0 = none)
+    uint32_t                        notify_src;     ///< protocol-notify source: re-bind on (re)install (0 = none)
 } TouchSource;
 
 static TouchSource touch_state;
 static bool        touch_state_used = false;
+
+// Tunable touch-read config (axl_input_set_touch_config) — defaults match the
+// robust attach: all handles, event sources + poll fallback, 30 ms.
+static AxlInputTouchMethod g_touch_method       = AXL_INPUT_TOUCH_EVENT_AND_POLL;
+static bool                g_touch_console_only = false;
+static uint32_t            g_touch_poll_ms      = TOUCH_POLL_MS;
+// Max queued states a single read drains, coalescing to the latest position.
+// 1 = legacy single-read (default).  Higher collapses a firmware backlog so a
+// slow poll catches up (see axl_input_set_touch_drain).
+static uint32_t            g_touch_max_drain    = 1;
+
+void
+axl_input_set_touch_config(AxlInputTouchMethod method, bool console_only,
+                           uint32_t poll_ms)
+{
+    g_touch_method       = method;
+    g_touch_console_only = console_only;
+    g_touch_poll_ms      = (poll_ms == 0) ? TOUCH_POLL_MS : poll_ms;
+}
+
+void
+axl_input_set_touch_drain(uint32_t max_states)
+{
+    g_touch_max_drain = (max_states == 0) ? 1 : max_states;
+}
 
 // Map a native absolute coord into [0, AXL_INPUT_ABS_RANGE) using the
 // device's reported min/max.  Keeps axl-input display-agnostic (no GOP /
@@ -573,6 +904,25 @@ axl_input_abs_normalize(int64_t v, uint64_t lo, uint64_t hi)
                      / (hi - lo));
 }
 
+// Resolve a bound handle to its CURRENT absolute-pointer interface, or NULL if
+// the protocol is gone (the providing driver was Stop()'d, the handle was
+// destroyed, etc.).  HandleProtocol validates the handle against the firmware
+// handle database, so a stale handle returns an error rather than faulting —
+// this is what makes the per-dispatch call safe across driver teardown.
+// (EFI_ABSOLUTE_POINTER_PROTOCOL_GUID is a file-scope variable from the
+// generated GUID header; HandleProtocol takes a mutable EFI_GUID *.)
+static EFI_ABSOLUTE_POINTER_PROTOCOL *
+touch_resolve(EFI_HANDLE handle)
+{
+    void *iface = NULL;
+    if (handle != NULL
+        && axl_bs()->HandleProtocol(handle, &EFI_ABSOLUTE_POINTER_PROTOCOL_GUID,
+                                    &iface) == 0) {
+        return (EFI_ABSOLUTE_POINTER_PROTOCOL *)iface;
+    }
+    return NULL;
+}
+
 static bool
 touch_dispatch_cb(
     void  *data
@@ -581,14 +931,40 @@ touch_dispatch_cb(
     TouchSource                *tch = (TouchSource *)data;
     EFI_ABSOLUTE_POINTER_STATE  state;
 
-    EFI_STATUS st = tch->protocol->GetState(tch->protocol, &state);
-    if (st != 0) {
-        return AXL_SOURCE_CONTINUE;
+    // Read whichever bound handle has data FIRST (ConsoleInHandle first).
+    // GetState consumes one queued state, so by default we read exactly one per
+    // dispatch (no double-count between the per-handle event sources + the
+    // fallback poll).  When drain coalescing is enabled (g_touch_max_drain > 1)
+    // we keep reading — up to that many — and keep only the LAST state, so a
+    // firmware that queues states FIFO (a BMC virtual mouse) can't build a
+    // backlog that drains slowly: one dispatch collapses it to the live
+    // position.  (Buttons reflect only the last state — see the drain docs.)
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap   = NULL;
+    EFI_ABSOLUTE_POINTER_MODE     *mode = NULL;
+    for (uint32_t rd = 0; rd < g_touch_max_drain; rd++) {
+        EFI_ABSOLUTE_POINTER_STATE s;
+        bool got = false;
+        for (int i = 0; i < tch->nproto; i++) {
+            // Re-resolve to the CURRENT interface every read — never call
+            // through a cached pointer the providing driver may have freed.
+            EFI_ABSOLUTE_POINTER_PROTOCOL *p = touch_resolve(tch->handles[i]);
+            if (p == NULL) {
+                continue;   // protocol gone (driver Stop()'d) — skip, no stale call
+            }
+            if (p->GetState(p, &s) == 0) {
+                state = s;
+                ap    = p;
+                mode  = p->Mode;
+                got   = true;
+                break;
+            }
+        }
+        if (!got) {
+            break;   // every handle's queue is empty (or gone) — nothing to drain
+        }
     }
-
-    EFI_ABSOLUTE_POINTER_MODE *mode = tch->protocol->Mode;
-    if (mode == NULL) {
-        return AXL_SOURCE_CONTINUE;   /* spec requires Mode; be defensive */
+    if (ap == NULL || mode == NULL) {
+        return AXL_SOURCE_CONTINUE;   /* no data on any handle (Mode: be defensive) */
     }
 
     uint64_t now_us = axl_time_get_us();
@@ -647,6 +1023,65 @@ touch_dispatch_cb(
     return AXL_SOURCE_CONTINUE;
 }
 
+// (Re)bind the absolute-pointer handle set into touch_state: drop any existing
+// WaitForInput event sources (the firmware closes those events when a driver
+// stops, so they must not linger), re-enumerate the current handles
+// (ConsoleInHandle first, or only ConsoleInHandle in console-only mode), Reset
+// each device, and — outside POLL_ONLY mode — register a fresh WaitForInput
+// source per handle.  Used for the initial bind (attach) AND to re-bind after a
+// device (re)install (touch_notify_cb), so the cursor survives the USB re-enum /
+// console reconnect that frees the old interface.
+static void
+touch_rebind_(TouchSource *tch)
+{
+    for (int i = 0; i < tch->nsrc; i++) {
+        axl_loop_remove_source(tch->loop, tch->source_ids[i]);
+    }
+    tch->nsrc = 0;
+
+    if (g_touch_console_only) {
+        EFI_HANDLE con_in = (axl_st() != NULL) ? axl_st()->ConsoleInHandle : NULL;
+        tch->nproto = (con_in != NULL && touch_resolve(con_in) != NULL)
+                      ? (tch->handles[0] = con_in, 1) : 0;
+    } else {
+        tch->nproto = collect_pointers(&EFI_ABSOLUTE_POINTER_PROTOCOL_GUID,
+                                       tch->handles, AXL_MAX_POINTER_IFACES);
+    }
+
+    if (g_touch_method == AXL_INPUT_TOUCH_POLL_ONLY) {
+        // Poll-only still Resets the devices, but registers no event sources.
+        for (int i = 0; i < tch->nproto; i++) {
+            EFI_ABSOLUTE_POINTER_PROTOCOL *ap = touch_resolve(tch->handles[i]);
+            if (ap != NULL) { (void)ap->Reset(ap, false); }
+        }
+        return;
+    }
+    for (int i = 0; i < tch->nproto && tch->nsrc < AXL_MAX_POINTER_IFACES; i++) {
+        EFI_ABSOLUTE_POINTER_PROTOCOL *ap = touch_resolve(tch->handles[i]);
+        if (ap == NULL) {
+            continue;
+        }
+        (void)ap->Reset(ap, false);   // best-effort
+        if (ap->WaitForInput != NULL) {
+            uint32_t sid = axl_loop_add_event(tch->loop, ap->WaitForInput,
+                                              touch_dispatch_cb, tch);
+            if (sid != 0) {
+                tch->source_ids[tch->nsrc++] = sid;
+            }
+        }
+    }
+}
+
+// Protocol-notify: an absolute pointer was (re)installed — e.g. the USB mouse
+// re-enumerated and its absolute-pointer driver re-attached after a Stop().
+// Re-bind to the fresh handle/interface set so the cursor keeps working.
+static bool
+touch_notify_cb(void *data)
+{
+    touch_rebind_((TouchSource *)data);
+    return AXL_SOURCE_CONTINUE;   // keep watching for further (re)installs
+}
+
 uint32_t
 axl_input_attach_touch(
     AxlLoop           *loop,
@@ -663,25 +1098,72 @@ axl_input_attach_touch(
         return 0;
     }
 
-    EFI_GUID                       guid = EFI_ABSOLUTE_POINTER_PROTOCOL_GUID;
-    EFI_ABSOLUTE_POINTER_PROTOCOL *ap   =
-        (EFI_ABSOLUTE_POINTER_PROTOCOL *)axl_input_locate_physical_pointer(&guid);
-    if (ap == NULL) {
-        axl_debug("EFI_ABSOLUTE_POINTER_PROTOCOL not available "
-                  "(no touch / digitizer hardware)");
-        return 0;
-    }
-
-    (void)ap->Reset(ap, false);  /* best-effort */
-
     touch_state.cb             = cb;
     touch_state.data           = data;
-    touch_state.protocol       = ap;
     touch_state.last_x         = 0;
     touch_state.last_y         = 0;
     touch_state.contact_active = false;
+    touch_state.loop           = loop;
+    touch_state.nproto         = 0;
+    touch_state.nsrc           = 0;
+    touch_state.poll_src       = 0;
+    touch_state.notify_src     = 0;
     touch_state_used           = true;
 
-    return axl_loop_add_event(loop, ap->WaitForInput,
-                              touch_dispatch_cb, &touch_state);
+    // Bind the absolute-pointer handle(s), ConsoleInHandle first (where a BMC
+    // remote-console virtual mouse's events arrive on modern firmware): Reset
+    // each + (event mode) register a WaitForInput source.  Tunable via
+    // axl_input_set_touch_config (all handles vs ConsoleInHandle only, method).
+    touch_rebind_(&touch_state);
+    if (touch_state.nproto == 0) {
+        axl_debug("EFI_ABSOLUTE_POINTER_PROTOCOL not available "
+                  "(no touch / digitizer / remote-console pointer)");
+        touch_state_used = false;
+        return 0;
+    }
+
+    // Fallback poll for firmware whose WaitForInput never signals.  Skipped in
+    // EVENT_ONLY mode; never double-counts (GetState consumes — see
+    // touch_dispatch_cb).
+    if (g_touch_method != AXL_INPUT_TOUCH_EVENT_ONLY) {
+        touch_state.poll_src = axl_loop_add_timer(loop, g_touch_poll_ms,
+                                                  touch_dispatch_cb, &touch_state);
+    }
+
+    // Re-bind when an absolute pointer is (re)installed — USB re-enumeration /
+    // console reconnect over a BMC console Stop()s the providing driver, which
+    // frees its interface; without this the cursor would silently die after the
+    // device re-appears (and the per-dispatch re-resolve would only ever find a
+    // dead handle).  touch_notify_cb re-runs touch_rebind_ on each (re)install.
+    touch_state.notify_src = axl_loop_add_protocol_notify(
+        loop, &EFI_ABSOLUTE_POINTER_PROTOCOL_GUID, touch_notify_cb, &touch_state);
+
+    // Non-zero on success (first event source, else the poll timer, else the
+    // notify source) for the caller's "did it attach" check;
+    // axl_input_detach_touch() tears down all.
+    if (touch_state.nsrc > 0)       return touch_state.source_ids[0];
+    if (touch_state.poll_src != 0)  return touch_state.poll_src;
+    return touch_state.notify_src;
+}
+
+void
+axl_input_detach_touch(AxlLoop *loop)
+{
+    if (!touch_state_used) {
+        return;
+    }
+    for (int i = 0; i < touch_state.nsrc; i++) {
+        axl_loop_remove_source(loop, touch_state.source_ids[i]);
+    }
+    touch_state.nsrc = 0;
+    if (touch_state.poll_src != 0) {
+        axl_loop_remove_source(loop, touch_state.poll_src);
+        touch_state.poll_src = 0;
+    }
+    if (touch_state.notify_src != 0) {
+        // Owns its EFI_EVENT — remove_source closes it (axl_loop_add_protocol_notify).
+        axl_loop_remove_source(loop, touch_state.notify_src);
+        touch_state.notify_src = 0;
+    }
+    touch_state_used = false;
 }

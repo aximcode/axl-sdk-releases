@@ -255,11 +255,16 @@ fill_exc_from_context(
 // Generic thunk — firmware-facing entry point
 // ---------------------------------------------------------------------------
 
-/* Signature matches EFI_CPU_INTERRUPT_HANDLER — note no EFIAPI:
-   the spec's typedef declares this callback without it (unlike
-   the EFI_CPU_ARCH_PROTOCOL's vtable methods, which do carry
-   EFIAPI). */
-static void
+/* Must carry EFIAPI: the real EDK2 EFI_CPU_INTERRUPT_HANDLER typedef
+   (MdePkg/Include/Protocol/Cpu.h) is EFIAPI, and CpuDxe invokes the
+   registered handler with that convention. On x86_64 EFIAPI is ms_abi
+   (args in RCX/RDX) vs the System V default (RDI/RSI); without EFIAPI
+   the thunk reads InterruptType/SystemContext from the wrong registers,
+   mis-decodes the kind, returns early, and CommonExceptionHandler then
+   IRETs to the faulting instruction — re-firing the exception forever.
+   (AXL's generated cpu-arch.h drops the EFIAPI from the typedef; this
+   attribute restores the correct ABI at the one call site that matters.) */
+static void EFIAPI
 cpu_exception_thunk(
     EFI_EXCEPTION_TYPE  efi_type,
     EFI_SYSTEM_CONTEXT  sc)

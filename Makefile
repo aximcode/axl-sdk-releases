@@ -509,7 +509,7 @@ $(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, liba
 # producing baffling failures like "alloc fill 0xDA" tripping on
 # freshly-malloced memory. Blanket-wipe everything that could
 # reference the libaxl.a ABI; rebuilds are cheap.
-$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so)
+$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
 endif
 $(shell mkdir -p $(BUILDDIR) && echo $(TLS_STATE) > $(TLS_STATE_FILE))
 endif
@@ -526,7 +526,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1033,6 +1033,40 @@ $(BUILDDIR)/binding-driver.o: sdk/examples/binding-driver.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# CrashHandler — reference DXE driver that captures CPU exceptions to
+# NVRAM, + CrashTest, the app that deliberately faults to exercise it.
+# The driver is three TUs sharing drivers/crashhandler/crashhandler.h;
+# the binary-format contract lives in <axl/axl-crashrecord.h>.
+# -fno-omit-frame-pointer (already in CFLAGS_BASE) keeps the FP chain
+# the unwinder walks; the default DEBUG build's -g -gdwarf gives
+# rsod-decode.py the line info it resolves against.
+# ===================================================================
+CRASHHANDLER_OBJS = $(BUILDDIR)/crashhandler-entrypoint.o \
+                    $(BUILDDIR)/crashhandler-exception.o \
+                    $(BUILDDIR)/crashhandler-report.o
+
+crashhandler: $(PREFIX)/drivers/crashhandler.efi
+	@echo "  Built: $(PREFIX)/drivers/crashhandler.efi"
+
+$(PREFIX)/drivers/crashhandler.efi: $(CRASHHANDLER_OBJS) $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(CRASHHANDLER_OBJS),$@)
+
+$(BUILDDIR)/crashhandler-%.o: drivers/crashhandler/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -Idrivers/crashhandler -c $< -o $@
+
+$(PREFIX)/drivers:
+	@mkdir -p $@
+
+crashtest: $(PREFIX)/tools/crashtest.efi
+	@echo "  Built: $(PREFIX)/tools/crashtest.efi"
+
+$(PREFIX)/tools/crashtest.efi: $(BUILDDIR)/crashtest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+	$(call LINK_EFI_APP,$(BUILDDIR)/crashtest.o,$@)
+
+$(BUILDDIR)/crashtest.o: tools/crashtest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build radix-demo.efi example
 # ===================================================================
 
@@ -1291,8 +1325,8 @@ $(eval $(call BUILD_TEST,AxlTestGfxRegion,axl-test-gfx-region))
 TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
-tools: all $(TOOL_EFIS)
-	@echo "  Built $(words $(TOOL_NAMES)) tools"
+tools: all $(TOOL_EFIS) $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi
+	@echo "  Built $(words $(TOOL_NAMES)) tools + crashtest + crashhandler driver"
 
 # tool-sizes — print per-tool .efi size, sorted ascending.
 # Surfaces the selective-linking benefit: a tool that uses 5% of

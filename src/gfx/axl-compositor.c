@@ -92,6 +92,9 @@ struct AxlCompositor {
     int32_t        dev_seed_x, dev_seed_y;
     bool           dev_seeded;
     uint32_t       ptr_source;     // pointer axl-loop source id (0 = not attached)
+    uint32_t       touch_source;   // absolute-pointer (touch/BMC) source id (0 = not attached)
+    uint32_t       touch_buttons;  // last button mask from the absolute source (edge-detect)
+    AxlGesture     touch_gesture;  // click-count / drag recognizer for the absolute path
 
     // --- C5: grabs + keyboard focus ---
     AxlGrab        grab_stack[AXL_COMPOSITOR_GRAB_MAX];  // LIFO; [count-1] = active
@@ -984,9 +987,11 @@ axl_compositor_present(AxlCompositor *c)
     if (ok) {
         comp_vis_free(&cv);
     }
-    // C6: bracket the whole flush so the cursor stays the top overlay —
-    // lift restores the scene under it (and marks it for redraw), drop
-    // re-composites it over the freshly-presented rects. No-ops while hidden.
+    // C6: bracket the flush so the cursor is the top layer of THIS present,
+    // atomically. lift folds the sprite INTO the output (so the damage rects
+    // below carry it — no separate erase/redraw to the GOP, hence no flicker
+    // at low present rates); drop unfolds, leaving the output cursor-clean for
+    // the next partial-damage repaint. No-ops while the cursor is hidden.
     axl_cursor_lift(c->cursor);
     // Flush each disjoint damage rect (E2): sparse changes far apart on screen
     // present as small separate rects, not their spanning bounding box.
@@ -1342,6 +1347,77 @@ axl_compositor_detach_pointer(AxlCompositor *c, AxlLoop *loop)
     axl_input_detach_mouse(loop);
     c->ptr_source = 0;
     c->dev_seeded = false;
+}
+
+// Device trampoline for an ABSOLUTE pointer (touch / digitizer / BMC remote-console
+// virtual mouse): the source delivers a position already normalized to
+// [0, AXL_INPUT_ABS_RANGE); scale it straight onto the output and route it as a
+// pointer event (no relative seed/accumulate — absolute IS the position).
+static bool
+comp_touch_trampoline(const AxlInputEvent *ev, void *data)
+{
+    AxlCompositor *c = data;
+    switch (ev->type) {
+    case AXL_INPUT_TOUCH_MOVE:
+    case AXL_INPUT_TOUCH_DOWN:
+    case AXL_INPUT_TOUCH_UP: {
+        int64_t mw = (c->w > 0) ? (int64_t)c->w - 1 : 0;
+        int64_t mh = (c->h > 0) ? (int64_t)c->h - 1 : 0;
+        AxlInputEvent local = {0};
+        local.timestamp_us = ev->timestamp_us;
+        local.modifiers    = ev->modifiers;
+        local.x = (int32_t)((int64_t)ev->x * mw / (AXL_INPUT_ABS_RANGE - 1));
+        local.y = (int32_t)((int64_t)ev->y * mh / (AXL_INPUT_ABS_RANGE - 1));
+        // ActiveButtons: bit0 = contact (left), bit1 = alt (right — a remote
+        // console maps the alt/pen-side sensor to a right-click).  Derive the
+        // button event from the MASK, not the touch DOWN/UP/MOVE type: the
+        // absolute source only flags a 0<->non-zero contact transition, so a
+        // change *between* two non-zero masks (e.g. adding right while left is
+        // held) arrives as a MOVE — turn each per-button edge into a real
+        // BUTTON_DOWN/UP (pointer_event only updates buttons on those).
+        uint32_t btns = ((ev->buttons & 0x1u) ? AXL_INPUT_BUTTON_LEFT  : 0u)
+                      | ((ev->buttons & 0x2u) ? AXL_INPUT_BUTTON_RIGHT : 0u);
+        local.buttons = btns;
+        if (btns != c->touch_buttons) {
+            local.type = (btns & ~c->touch_buttons) ? AXL_INPUT_MOUSE_BUTTON_DOWN
+                                                    : AXL_INPUT_MOUSE_BUTTON_UP;
+            c->touch_buttons = btns;
+        } else {
+            local.type = AXL_INPUT_MOUSE_MOVE;
+        }
+        // Run the click/drag recognizer so the absolute path gets double-click +
+        // drag (the relative path gets these inside axl-input; the touch source
+        // emits raw events, so do it here).
+        axl_input_gesture_feed(&c->touch_gesture, &local);
+        axl_compositor_pointer_event(c, &local);
+        break;
+    }
+    default:
+        break;
+    }
+    return AXL_SOURCE_CONTINUE;
+}
+
+uint32_t
+axl_compositor_attach_touch(AxlCompositor *c, AxlLoop *loop)
+{
+    if (c == NULL || loop == NULL) {
+        return 0;
+    }
+    c->touch_buttons  = 0;                       // re-seed button edge-detection
+    c->touch_gesture  = (AxlGesture){0};         // re-seed the click recognizer
+    c->touch_source = axl_input_attach_touch(loop, comp_touch_trampoline, c);
+    return c->touch_source;
+}
+
+void
+axl_compositor_detach_touch(AxlCompositor *c, AxlLoop *loop)
+{
+    if (c == NULL || loop == NULL) {
+        return;
+    }
+    axl_input_detach_touch(loop);
+    c->touch_source = 0;
 }
 
 // --- C5: grabs + keyboard focus ------------------------------------------

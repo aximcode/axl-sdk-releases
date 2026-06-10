@@ -41,10 +41,33 @@ SHA=$(git rev-parse "${TARGET}^{commit}" 2>/dev/null) || {
     exit 2
 }
 
+# Which workflows must appear AND succeed before we render a verdict.
+# A tag push triggers CI + Release + Docs; their check suites are created
+# at slightly different times, so an early snapshot can contain only the
+# fast/finished ones (e.g. CI+Docs) while Release is still spinning up. If
+# we judged on that snapshot we would declare PASS before Release even
+# registered — exactly what burned the v1.2.0 cut. So we wait until every
+# EXPECTED workflow has a check suite AND none are still running.
+#
+# Non-tag targets (a branch HEAD / bare sha) don't trigger Release, so we
+# only expect CI + Docs there. Override either with EXPECT_WORKFLOWS.
+if [[ -n "${EXPECT_WORKFLOWS:-}" ]]; then
+    read -ra EXPECTED <<< "$EXPECT_WORKFLOWS"
+elif git rev-parse --verify --quiet "refs/tags/$TARGET" >/dev/null 2>&1; then
+    EXPECTED=(CI Release Docs)
+else
+    EXPECTED=(CI Docs)
+fi
+
+# Safety ceiling so a workflow that never triggers can't hang the cut.
+MAX_POLLS=${MAX_POLLS:-90}            # 90 * 60s = 90 min worst case
+
 echo "Watching $OWNER/$REPO @ ${SHA:0:12} (poll every ${INTERVAL}s, GraphQL)"
+echo "Expecting: ${EXPECTED[*]}"
 echo
 
 terminal=0
+poll=0
 while [[ $terminal -eq 0 ]]; do
     res=$(gh api graphql -f query="
     { repository(owner:\"$OWNER\",name:\"$REPO\") {
@@ -65,11 +88,30 @@ while [[ $terminal -eq 0 ]]; do
         echo "[$(date +%H:%M:%S)]"
         printf '  %s\n' "$res" | column -ts $'\t'
     fi
+
+    # Expected workflows that haven't registered a check suite yet.
+    present=$(echo "$res" | awk -F'\t' 'NF {print $1}')
+    missing=()
+    for w in "${EXPECTED[@]}"; do
+        grep -qxF "$w" <<< "$present" || missing+=("$w")
+    done
+    [[ ${#missing[@]} -gt 0 ]] && echo "  waiting for: ${missing[*]}"
     echo
 
-    if ! echo "$res" | grep -qE "QUEUED|IN_PROGRESS"; then
+    running=false
+    echo "$res" | grep -qE "QUEUED|IN_PROGRESS" && running=true
+
+    if ! $running && [[ ${#missing[@]} -eq 0 ]]; then
         terminal=1
         break
+    fi
+
+    poll=$((poll + 1))
+    if [[ $poll -ge $MAX_POLLS ]]; then
+        echo "FAIL — timed out after $poll polls; still pending/missing."
+        [[ ${#missing[@]} -gt 0 ]] && echo "       never appeared: ${missing[*]}"
+        echo "RELEASE_VERDICT: FAIL"
+        exit 1
     fi
     sleep "$INTERVAL"
 done

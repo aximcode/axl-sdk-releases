@@ -26,6 +26,13 @@ cursor_input_trampoline(const AxlInputEvent *ev, void *data);
 #define SW 100
 #define SH 60
 
+/* RGB equality (ignores alpha — blends force alpha to 0xFF). */
+static bool
+rgb_eq(AxlGfxPixel a, AxlGfxPixel b)
+{
+    return a.red == b.red && a.green == b.green && a.blue == b.blue;
+}
+
 static void
 test_cursor_scene_unchanged(void)
 {
@@ -67,6 +74,80 @@ test_cursor_scene_unchanged(void)
         }
     }
     test_check(same, "cursor: never modifies the bound scene (Option C)");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
+/* The flicker fix: axl_cursor_lift folds the sprite INTO the bound scene (so
+   the compositor's one damage flush carries the cursor — no separate erase/
+   redraw to the GOP), and axl_cursor_drop unfolds it byte-exact. This is the
+   only on-screen-compositing behavior the -nographic harness CAN observe,
+   because the fold lands in the bound back-buffer, not the GOP. */
+static void
+test_cursor_fold_atomic(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    test_check(scene != NULL, "fold: scene buffer created");
+    axl_gfx_buffer_clear(scene, AXL_GFX_RGB(0x33, 0x66, 0x99));
+
+    AxlGfxPixel *px = axl_gfx_buffer_pixels(scene);
+    AxlGfxPixel  snap[SW * SH];
+    for (int i = 0; i < SW * SH; i++) {
+        snap[i] = px[i];
+    }
+
+    AxlCursor *c = axl_cursor_new(scene);
+    test_check(c != NULL, "fold: cursor created");
+    axl_cursor_show(c);
+    const int32_t CX = 40, CY = 25;       /* hotspot = arrow top-left pixel */
+    axl_cursor_move(c, CX, CY);
+
+    /* A move keeps the scene byte-clean (Option C): it folds, presents, and
+       unfolds. So before lift the hotspot pixel is still the scene color. */
+    test_check(rgb_eq(px[CY * SW + CX], AXL_GFX_RGB(0x33, 0x66, 0x99)),
+               "fold: scene clean after a move (fold is transient)");
+
+    /* lift folds the sprite into the scene: the hotspot pixel becomes the
+       arrow outline color (opaque 0x101010 over the scene). */
+    axl_cursor_lift(c);
+    test_check(rgb_eq(px[CY * SW + CX], AXL_GFX_RGB(0x10, 0x10, 0x10)),
+               "fold: lift folds the arrow into the scene (atomic top layer)");
+
+    /* drop unfolds: the scene is restored byte-exact. */
+    axl_cursor_drop(c);
+    bool same = true;
+    for (int i = 0; i < SW * SH; i++) {
+        if (px[i].blue != snap[i].blue || px[i].green != snap[i].green
+            || px[i].red != snap[i].red || px[i].alpha != snap[i].alpha) {
+            same = false;
+            break;
+        }
+    }
+    test_check(same, "fold: drop unfolds, scene restored byte-exact");
+
+    /* Regression: hide() called BETWEEN lift and drop must unfold first, so
+       the scene is left clean (not folded-dirty). Without the unfold-in-erase
+       guard the arrow would stay baked into the scene until drop — and on a
+       real GOP, erase would have flushed that ghost to the screen. */
+    axl_cursor_show(c);
+    axl_cursor_move(c, CX, CY);
+    axl_cursor_lift(c);                   /* fold */
+    test_check(rgb_eq(px[CY * SW + CX], AXL_GFX_RGB(0x10, 0x10, 0x10)),
+               "fold: lifted (folded) before the mid-bracket hide");
+    axl_cursor_hide(c);                   /* erase must unfold the scene */
+    test_check(rgb_eq(px[CY * SW + CX], AXL_GFX_RGB(0x33, 0x66, 0x99)),
+               "fold: hide between lift/drop unfolds (scene clean, no ghost)");
+    axl_cursor_drop(c);                   /* unfold now a no-op */
+    same = true;
+    for (int i = 0; i < SW * SH; i++) {
+        if (px[i].blue != snap[i].blue || px[i].green != snap[i].green
+            || px[i].red != snap[i].red || px[i].alpha != snap[i].alpha) {
+            same = false;
+            break;
+        }
+    }
+    test_check(same, "fold: scene byte-exact after mid-bracket hide + drop");
 
     axl_cursor_free(c);
     axl_gfx_buffer_free(scene);
@@ -242,6 +323,7 @@ test_cursor_main(int argc, char **argv)
     test_print_header("AxlCursor");
 
     test_cursor_scene_unchanged();
+    test_cursor_fold_atomic();
     test_cursor_position_clamp();
     test_cursor_set_image();
     test_cursor_move_rel();

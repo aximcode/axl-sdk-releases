@@ -3,6 +3,66 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.3.0 — 2026-06-09
+
+### Added
+
+- **Absolute-pointer / touch seat** (`<axl/axl-input.h>`,
+  `<axl/axl-compositor.h>`) — a pre-boot app reached over a BMC remote
+  console (or fed by a touchscreen / digitizer) gets its pointer as
+  `EFI_ABSOLUTE_POINTER_PROTOCOL`, which modern firmware multiplexes
+  through `gST->ConsoleInHandle`. `axl_input_attach_touch` now binds every
+  absolute-pointer handle (ConsoleInHandle first) with a `WaitForInput`
+  event source per handle plus a poll fallback, and
+  `axl_compositor_attach_touch` / `axl_compositor_detach_touch` drive the
+  seat (cursor + hit-testing + double-click/drag) from it. New
+  `axl_input_detach_touch`, `axl_input_set_touch_config`
+  (`AxlInputTouchMethod`: event / poll / both, poll interval,
+  ConsoleInHandle-only), and an `axl_input_probe_pointers` diagnostic that
+  reports which pointer protocols a platform actually exposes.
+
+- **`AxlArgs` `?` help alias** (`<axl/axl-args.h>`) — a lone `?` at any
+  node that accepts a flag now prints that node's help, like `-h` /
+  `--help` (`tool ?`, `tool verb ?`), matching legacy CLIs. Previously `?`
+  was consumed as a positional value. After `--` it remains an ordinary
+  positional.
+
+- **`axl_input_set_touch_drain`** (`<axl/axl-input.h>`) — coalesce a
+  backlog of queued absolute-pointer states: one dispatch consumes up to N
+  states and reports only the latest position, so a slow protocol-safe
+  poll still catches up to a fast move on firmware (e.g. a BMC virtual
+  mouse) that queues states FIFO. Default 1 (legacy single-read).
+
+### Changed
+
+- **`AxlArgs` help is terser** (`<axl/axl-args.h>`) — the generated
+  `--help` / usage now renders as a `Usage:` line plus a single aligned
+  list of positionals, flags, and one `-h, --help` row, with the left
+  column auto-sized to the longest entry. Dropped the `Arguments:` and
+  `Flags:` section headers and the ` (optional)` suffix on optional
+  positionals (the `[<name>]` brackets in the Usage line already convey
+  it), so the output reads like a hand-written legacy usage block. Also
+  fixed the `-x,  --name` double space after the short flag. Affects every
+  axl-args consumer's help text; no API or parsing change.
+
+### Fixed
+
+- **`AxlCursor`** scene-bound present is now atomic: the sprite is
+  composited *into* the bound scene as its top layer and the `old∪new`
+  region is presented in a single GOP operation (then unfolded to keep the
+  scene byte-clean), instead of a separate erase-then-draw. This removes a
+  cursor-less intermediate frame that flickered at low present rates (e.g.
+  a throttled ~10 Hz BMC remote-console pointer).
+
+- **`AxlInput` use-after-free (#GP) on absolute-pointer re-enumeration** —
+  the touch path cached raw `EFI_ABSOLUTE_POINTER_PROTOCOL` interface
+  pointers; when the providing driver is `Stop()`'d (USB re-enum / console
+  reconnect over a BMC remote console) it `FreePool()`s its interface, so
+  the next `GetState()` called through freed memory. The seat now binds by
+  **handle**, re-resolves the interface via `HandleProtocol` each dispatch
+  (fails safely if the protocol is gone), and rebinds on re-install via a
+  protocol-notify source, so the cursor survives re-enumeration.
+
 ## 1.2.0 — 2026-06-08
 
 ### Added

@@ -442,7 +442,13 @@ def find_funcptr(name: str, blocks: list[str]) -> str | None:
                 result = text[typedef_pos:m.end() + close + 2]
             return result
 
-        # Format 1b: (*NAME) without EFIAPI -- callback pointers
+        # Format 1b: (*NAME) without EFIAPI in the spec text. UEFI/PI
+        # callbacks the firmware invokes across the ABI boundary are
+        # EFIAPI in EDK2 (the spec prose just omits it); inject it so
+        # x86_64 (EFIAPI == ms_abi) callers and callees agree. Omitting
+        # it silently mis-passes arguments — e.g. EFI_CPU_INTERRUPT_HANDLER
+        # got a garbled InterruptType, so registered exception handlers
+        # were never effectively dispatched. Matches Format 2 below.
         m = re.search(rf"\(\*\s*{re.escape(name)}\s*\)", text)
         if m:
             before = text[:m.start()]
@@ -463,7 +469,8 @@ def find_funcptr(name: str, blocks: list[str]) -> str | None:
                 result = text[typedef_pos:m.end() + close + 1] + ";"
             else:
                 result = text[typedef_pos:m.end() + close + 2]
-            return result
+            return re.sub(rf"\(\s*\*\s*{re.escape(name)}\s*\)",
+                          f"(EFIAPI *{name})", result, count=1)
 
         # Format 2: bare -- typedef\nRETURN\nNAME (
         # Require the match to be preceded by 'typedef' to avoid
