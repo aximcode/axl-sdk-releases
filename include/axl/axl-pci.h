@@ -478,7 +478,8 @@ typedef int (*AxlPciTreeFn)(
  * visited-bus bitmaps detect cycles, and a recursion-depth cap
  * (`AXL_PCI_TREE_MAX_DEPTH`) backstops pathological chains. Same
  * posture as `AXL_DP_MAX_NODES` for device-path iteration and the
- * cap-walk monotonic-progress guard.
+ * cap-walk self-loop / offset-range guards (which allow descending
+ * cap chains but still terminate on malformed ones).
  *
  * Not reentrant against axl_pci_next — the walker drives
  * `axl_pci_next` internally and they share a static cursor. The

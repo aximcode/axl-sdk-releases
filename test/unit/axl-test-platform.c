@@ -2622,6 +2622,106 @@ test_pci_capabilities(void)
     }
 }
 
+/* Walk the entire legacy cap chain from the head, bounding multi-hop cycles
+   (the iterator is stateless — the caller owns the iteration bound). Returns
+   the cap count; via *found, whether @p want_id appears ANYWHERE in the chain
+   (not just at the head); via *descended, whether the walk followed a
+   DESCENDING hop (a cap at a lower offset than the head) — the exact thing
+   the old monotonic guard wrongly rejected, and an arch-robust proof that
+   the full chain (not just the head) was enumerated. */
+static size_t
+pci_cap_chain_walk(AxlPciAddr a, uint8_t want_id, bool *found, bool *descended)
+{
+    size_t   n        = 0;
+    bool     hit      = false;
+    bool     went_down = false;
+    uint16_t head_off = 0;
+    uint16_t off = 0, id = 0;
+    while (axl_pci_cap_next(a, off, &off, &id) == AXL_OK) {
+        if (n == 0) {
+            head_off = off;
+        } else if (off < head_off) {
+            went_down = true;
+        }
+        if ((id & 0xFFu) == want_id) {
+            hit = true;
+        }
+        if (++n >= 64) {   /* >48 distinct slots in 0x40..0xFC is impossible */
+            break;
+        }
+    }
+    if (found != NULL) {
+        *found = hit;
+    }
+    if (descended != NULL) {
+        *descended = went_down;
+    }
+    return n;
+}
+
+static void
+test_pci_cap_chain_nonmonotonic(void)
+{
+    /* Regression: real PCIe cap lists are NOT monotonically increasing —
+       they routinely chain DOWNWARD. The old forward-progress guard
+       (next <= prev_off) rejected any descending hop, so the walk stopped
+       at the chain head and every deeper cap was invisible. The QEMU runner
+       injects a pcie-root-port + a virtio endpoint behind it, both with
+       descending multi-cap chains, so a correct walk enumerates the WHOLE
+       chain. Pre-fix each returned exactly one cap. Cap IDs: PCI-Express
+       0x10, MSI-X 0x11, bridge subsystem-IDs 0x0D. */
+
+    /* Root port (PCI-to-PCI bridge, class 0x060400): PCI-Express (head) ->
+       subsystem-IDs, descending — the SSID cap is only reachable if the
+       descending hop is followed. */
+    AxlPciAddr rp;
+    if (axl_pci_find_by_class(0x060400, 0, &rp) == AXL_OK) {
+        bool has_pcie = false, has_ssid = false, descended = false;
+        size_t n = pci_cap_chain_walk(rp, 0x10, &has_pcie, &descended);
+        (void)pci_cap_chain_walk(rp, 0x0D, &has_ssid, NULL);
+        test_check(n >= 2 && descended,
+                   "pci cap chain: root port walks a descending multi-cap chain");
+        test_check(has_pcie,
+                   "pci cap chain: root port exposes PCI-Express cap (0x10)");
+        test_check(has_ssid,
+                   "pci cap chain: root port exposes subsystem-IDs cap (0x0D) deep in chain");
+    } else {
+        test_check(true, "pci cap chain: SKIP — no pcie-root-port in topology");
+        test_check(true, "pci cap chain: SKIP balance");
+        test_check(true, "pci cap chain: SKIP balance");
+    }
+
+    /* virtio endpoint (vendor 0x1AF4): MSI-X (head) -> ... -> PCI-Express,
+       descending — PCI-Express is only reachable if the full descending
+       chain is walked. */
+    AxlPciAddr *it = NULL;
+    AxlPciAddr  ep = {0};
+    bool        have_ep = false;
+    while ((it = axl_pci_next(it)) != NULL) {
+        uint16_t vid = 0, off = 0, id = 0;
+        if (axl_pci_read_config_16(*it, 0x00, &vid) == 0 && vid == 0x1AF4
+            && axl_pci_cap_next(*it, 0, &off, &id) == AXL_OK) {
+            ep = *it;
+            have_ep = true;
+            break;
+        }
+    }
+    if (have_ep) {
+        bool has_msix = false, descended = false;
+        size_t n = pci_cap_chain_walk(ep, 0x11, &has_msix, &descended);
+        test_check(n >= 2,
+                   "pci cap chain: virtio endpoint enumerates >= 2 caps (not just head)");
+        test_check(descended,
+                   "pci cap chain: virtio endpoint walk follows a descending hop");
+        test_check(has_msix,
+                   "pci cap chain: virtio endpoint exposes MSI-X cap (0x11) at the head");
+    } else {
+        test_check(true, "pci cap chain: SKIP — no virtio endpoint with caps");
+        test_check(true, "pci cap chain: SKIP balance");
+        test_check(true, "pci cap chain: SKIP balance");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // axl_io_port_* (x86 only)
 // ---------------------------------------------------------------------------
@@ -3620,6 +3720,7 @@ test_platform_main(int argc, char **argv)
     test_pci_dump();
     test_pci_class_string();
     test_pci_capabilities();
+    test_pci_cap_chain_nonmonotonic();
     test_pci_tree_walker();
     test_pci_ids_db();
     test_pci_ids_length_macros();

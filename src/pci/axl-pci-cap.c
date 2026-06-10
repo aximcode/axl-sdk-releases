@@ -194,12 +194,16 @@ axl_pci_cap_next(
     if (next < 0x40 || next > 0xFC) {
         return AXL_ERR;
     }
-    /* Forward-progress guard. Spec doesn't formally require monotonic
-       cap offsets, but no real device chains backwards; a back-pointer
-       (next <= prev_off) is malformed and would loop the iter. Also
-       catches the all-1s self-loop (next == prev_off == 0xFC) on a
-       device that becomes absent mid-walk. */
-    if (next <= prev_off) {
+    /* Self-loop guard ONLY — NOT a monotonic guard. PCI/PCIe cap lists are
+       not required to ascend, and real hardware routinely chains DOWNWARD
+       (e.g. a QEMU pcie-root-port: 0x54 PCI-Express -> 0x48 subsystem-IDs;
+       a virtio endpoint: 0xDC MSI-X -> ... -> 0x40 PCI-Express). So allow
+       next < prev_off. Reject only next == prev_off: a pointer to the
+       current offset is the all-1s self-loop an absent device returns
+       (next == prev_off == 0xFC) and the one shape that would spin the
+       iter. Multi-hop cycles are the caller's iteration-bound concern —
+       this step is stateless. */
+    if (next == prev_off) {
         return AXL_ERR;
     }
     uint8_t cap_id;
@@ -239,12 +243,17 @@ axl_pci_ext_cap_next(
     if (off == 0) {
         return AXL_ERR;
     }
-    /* Forward-progress guard, mirror of the legacy-cap walk. A next
-       offset that doesn't move forward is malformed and would loop;
-       valid ext-cap offsets live in 0x100..0xFFC. The absent-device
-       all-1s case still terminates via the cap_id == PCIE_EXT_CAP_END
-       check below, but this catches mid-walk cycles too. */
-    if (prev_off != 0 && off <= prev_off) {
+    /* Like the legacy-cap walk, ext-cap lists may chain DOWNWARD, so do
+       NOT require monotonic offsets. Two terminations only:
+         - out of range: valid ext-cap offsets live in 0x100..0xFFC, so
+           anything outside ends the walk (covers the absent-device all-1s
+           next = 0xFFF; cap_id == PCIE_EXT_CAP_END below is a backstop);
+         - self-loop: next == current offset would spin the iter.
+       Multi-hop cycles remain the caller's iteration-bound concern. */
+    if (off < PCIE_FIRST_EXT_CAP || off > 0xFFCu) {
+        return AXL_ERR;
+    }
+    if (off == prev_off) {
         return AXL_ERR;
     }
 

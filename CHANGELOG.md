@@ -3,7 +3,23 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
-## 1.3.0 — 2026-06-09
+## 1.3.1 — 2026-06-09
+
+### Fixed
+
+- **`AxlPci` capability walk skipped descending chains** (`<axl/axl-pci.h>`)
+  — `axl_pci_cap_next` rejected any `next` pointer `<=` the current offset
+  on the false premise that cap lists ascend. Real hardware routinely
+  chains **downward** (a QEMU pcie-root-port: `0x54` PCI-Express → `0x48`
+  subsystem-IDs; a virtio endpoint: `0xDC` MSI-X → … → `0x40` PCI-Express),
+  so the iterator returned only the chain *head* and every deeper cap was
+  invisible — silently breaking any consumer that looks up a specific cap
+  (PCI-Express, bridge subsystem-IDs, MSI/MSI-X when not first). The guard
+  now rejects only a self-loop (`next == prev_off`, the all-1s case an
+  absent device returns) while allowing `next < prev_off`; out-of-range
+  (`< 0x40 || > 0xFC`) still terminates. `axl_pci_ext_cap_next` got the
+  same fix plus an explicit `0x100..0xFFC` range check. (Multi-hop cycles
+  remain the caller's iteration-bound concern — the step is stateless.)
 
 ### Added
 
