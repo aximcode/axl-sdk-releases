@@ -51,6 +51,13 @@ struct AxlCursor {
     // clamping the (possibly far-off-screen) absolute value.
     int32_t           track_x, track_y;   // last event's absolute coords
     bool              tracking;            // track_x/y seeded yet?
+    // Absolute pointer (touch / digitizer / remote-console virtual mouse):
+    // its coordinates ARE the position (mapped onto the scene), so once one
+    // arrives it is latched authoritative and relative motion stops moving
+    // the cursor for the lifetime of the attach.
+    bool              saw_absolute;        // an absolute event has been seen
+    bool              bound_mouse;         // axl_cursor_attach bound the relative source
+    bool              bound_touch;         // axl_cursor_attach bound the absolute source
 };
 
 // --- Built-in arrow (12x19). 'X' outline, '.' fill, ' ' transparent. ---
@@ -594,6 +601,22 @@ cursor_input_trampoline(const AxlInputEvent *ev, void *data)
 {
     AxlCursor *c = (AxlCursor *)data;
     switch (ev->type) {
+    // Absolute pointer (touchscreen / digitizer / remote-console virtual
+    // mouse / VNC usb-tablet): the coordinate IS the position, normalized to
+    // [0, AXL_INPUT_ABS_RANGE). Map it straight onto the scene extent (the
+    // same extent axl_cursor_move clamps to) and latch absolute authoritative.
+    case AXL_INPUT_TOUCH_DOWN:
+    case AXL_INPUT_TOUCH_UP:
+    case AXL_INPUT_TOUCH_MOVE:
+        if (!c->visible) {
+            axl_cursor_show(c);
+        }
+        c->saw_absolute = true;
+        axl_cursor_move(
+            c,
+            (int32_t)((int64_t)ev->x * (c->scene_w - 1) / (AXL_INPUT_ABS_RANGE - 1)),
+            (int32_t)((int64_t)ev->y * (c->scene_h - 1) / (AXL_INPUT_ABS_RANGE - 1)));
+        break;
     case AXL_INPUT_MOUSE_MOVE:
     case AXL_INPUT_MOUSE_BUTTON_DOWN:
     case AXL_INPUT_MOUSE_BUTTON_UP:
@@ -601,19 +624,24 @@ cursor_input_trampoline(const AxlInputEvent *ev, void *data)
         if (!c->visible) {
             axl_cursor_show(c);
         }
-        // ev->x/y is the device's raw accumulated position (unbounded,
-        // and over a remote relative pointer it can drift far past an
-        // edge). Move by the delta from the previous event so the cursor
-        // clamps at the edge yet recovers the instant motion reverses,
-        // instead of getting stuck. Seed the reference on the first event.
-        if (!c->tracking) {
-            c->track_x  = ev->x;
-            c->track_y  = ev->y;
-            c->tracking = true;
+        // Once an absolute device is driving, it owns position; the relative
+        // mouse then only contributes events (buttons / wheel) to the
+        // consumer's callback, never moving the cursor.
+        if (!c->saw_absolute) {
+            // ev->x/y is the device's raw accumulated position (unbounded,
+            // and over a remote relative pointer it can drift far past an
+            // edge). Move by the delta from the previous event so the cursor
+            // clamps at the edge yet recovers the instant motion reverses,
+            // instead of getting stuck. Seed the reference on the first event.
+            if (!c->tracking) {
+                c->track_x  = ev->x;
+                c->track_y  = ev->y;
+                c->tracking = true;
+            }
+            axl_cursor_move_rel(c, ev->x - c->track_x, ev->y - c->track_y);
+            c->track_x = ev->x;
+            c->track_y = ev->y;
         }
-        axl_cursor_move_rel(c, ev->x - c->track_x, ev->y - c->track_y);
-        c->track_x = ev->x;
-        c->track_y = ev->y;
         break;
     default:
         break;
@@ -625,13 +653,46 @@ cursor_input_trampoline(const AxlInputEvent *ev, void *data)
 uint32_t
 axl_cursor_attach(AxlCursor *c, AxlLoop *loop, AxlInputCallback cb, void *data)
 {
+    return axl_cursor_attach_ex(c, loop, cb, data, NULL);
+}
+
+uint32_t
+axl_cursor_attach_ex(AxlCursor *c, AxlLoop *loop, AxlInputCallback cb,
+                     void *data, const AxlCursorConfig *cfg)
+{
     if (c == NULL || loop == NULL) {
         return 0;
     }
-    c->fwd_cb   = cb;
-    c->fwd_data = data;
-    c->tracking = false;   // re-seed the delta reference on the first event
-    return axl_input_attach_mouse(loop, cursor_input_trampoline, c);
+    c->fwd_cb       = cb;
+    c->fwd_data     = data;
+    c->tracking     = false;   // re-seed the delta reference on the first event
+    c->saw_absolute = false;   // relative drives until an absolute event arrives
+    c->bound_mouse  = false;
+    c->bound_touch  = false;
+
+    bool bind_mouse = (cfg == NULL) || !cfg->skip_mouse;
+    bool bind_touch = (cfg == NULL) || !cfg->skip_touch;
+
+    // A non-NULL config applies its absolute-read settings process-globally
+    // before the touch attach reads them (see axl_input_set_touch_*).
+    if (cfg != NULL && bind_touch) {
+        axl_input_set_touch_config(cfg->touch_method, !cfg->touch_all_handles,
+                                   cfg->touch_poll_ms);
+        axl_input_set_touch_drain(cfg->touch_drain);
+    }
+
+    uint32_t mouse_src = 0, touch_src = 0;
+    if (bind_mouse) {
+        mouse_src = axl_input_attach_mouse(loop, cursor_input_trampoline, c);
+        c->bound_mouse = (mouse_src != 0);
+    }
+    if (bind_touch) {
+        touch_src = axl_input_attach_touch(loop, cursor_input_trampoline, c);
+        c->bound_touch = (touch_src != 0);
+    }
+    // Return a non-zero source ID on any success (prefer axl_cursor_detach to
+    // tear down — a single ID can't remove both sources).
+    return (mouse_src != 0) ? mouse_src : touch_src;
 }
 
 void
@@ -640,8 +701,16 @@ axl_cursor_detach(AxlCursor *c, AxlLoop *loop)
     if (c == NULL) {
         return;
     }
-    axl_input_detach_mouse(loop);
-    c->fwd_cb   = NULL;
-    c->fwd_data = NULL;
-    c->tracking = false;   // next attach re-seeds (attach resets too)
+    if (c->bound_mouse) {
+        axl_input_detach_mouse(loop);
+    }
+    if (c->bound_touch) {
+        axl_input_detach_touch(loop);
+    }
+    c->bound_mouse  = false;
+    c->bound_touch  = false;
+    c->fwd_cb       = NULL;
+    c->fwd_data     = NULL;
+    c->tracking     = false;   // next attach re-seeds (attach resets too)
+    c->saw_absolute = false;
 }

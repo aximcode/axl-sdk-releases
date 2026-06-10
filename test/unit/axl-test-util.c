@@ -5182,6 +5182,53 @@ test_args_help_terse_format(void)
                "args terse: positional row aligns with the -h row");
 }
 
+/* A UEFI text console has no UTF-8: any non-ASCII byte in generated help —
+   e.g. the U+2014 em-dash (E2 80 94) once used as the name/description
+   separator — renders as a white block. The auto-generated help must be pure
+   ASCII. Assert it for BOTH the root header and a sub-verb header, which share
+   the single renderer (print_help_for), and pin the exact ASCII separator. */
+static void
+test_args_help_ascii_only(void)
+{
+    ArgsCapture cap = { 0 };
+    AxlArgsNode sysid = {
+        .name = "sysid", .handler = args_single_handler,
+        .help = "System identity", .user_data = &cap,
+    };
+    AxlArgsNode verbs[] = { sysid, {0} };
+    AxlArgsNode app = {
+        .name = "do", .verbs = verbs,
+        .help = "Dell hardware-diagnostic CLI", .user_data = &cap,
+    };
+
+    AxlStream *buf = NULL;
+    AxlStream *saved = capture_stdout(&buf);
+    char *root_argv[] = { (char *)"do", (char *)"--help" };
+    axl_args_run(2, root_argv, &app);                 /* root header */
+    char *verb_argv[] = { (char *)"do", (char *)"sysid", (char *)"--help" };
+    axl_args_run(3, verb_argv, &app);                 /* sub-verb header */
+
+    /* Scan EVERY rendered byte for non-ASCII before restore closes buf. */
+    size_t      n = 0;
+    const unsigned char *b = (const unsigned char *)axl_bufdata(buf, &n);
+    bool all_ascii = (b != NULL && n > 0);
+    for (size_t i = 0; b != NULL && i < n; i++) {
+        if (b[i] >= 0x80) {
+            all_ascii = false;
+            break;
+        }
+    }
+    /* The exact ASCII separator renders in both headers (locks " - "). */
+    bool root_sep = buf_contains(buf, "do - Dell hardware-diagnostic CLI");
+    bool verb_sep = buf_contains(buf, "do sysid - System identity");
+    restore_stdout(saved, buf);
+
+    test_check(n > 0, "args ascii: help produced output");
+    test_check(all_ascii, "args ascii: generated help has no non-ASCII bytes");
+    test_check(root_sep, "args ascii: root header uses an ASCII '-' separator");
+    test_check(verb_sep, "args ascii: sub-verb header uses an ASCII '-' separator");
+}
+
 /* "?" is a help alias matching the legacy tool: at the top level, at a branch,
    and at a sub-verb leaf, a lone "?" prints the same help as -h/--help instead
    of being consumed as a positional value (which used to error). */
@@ -5563,6 +5610,7 @@ test_args(void)
     test_args_negative_positionals();
     test_args_help_alignment();
     test_args_help_terse_format();
+    test_args_help_ascii_only();
     test_args_help_question_alias();
     test_args_nested_2level_dispatch();
     test_args_nested_parent_flag_visible_at_leaf();

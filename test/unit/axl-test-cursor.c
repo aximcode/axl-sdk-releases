@@ -279,6 +279,56 @@ test_cursor_attach_tracking(void)
     axl_gfx_buffer_free(scene);
 }
 
+/* Drive the trampoline with synthetic ABSOLUTE (touch) events to lock in
+   the Task-2 contract: axl_cursor_attach now binds the absolute pointer too,
+   and the trampoline maps an absolute coordinate ([0, AXL_INPUT_ABS_RANGE))
+   straight onto the scene extent — no relative seed/accumulate. Once an
+   absolute event is seen it is authoritative: later relative motion no longer
+   moves the cursor. */
+static void
+test_cursor_attach_absolute(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(SW, SH);
+    AxlCursor *c = axl_cursor_new(scene);
+    test_check(c != NULL, "abs: cursor created");
+    int32_t x = -1, y = -1;
+
+    AxlInputEvent ev = {0};
+
+    /* Absolute origin maps to the scene origin. */
+    ev.type = AXL_INPUT_TOUCH_MOVE;
+    ev.x = 0; ev.y = 0;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 0 && y == 0, "abs: origin maps to (0,0)");
+    test_check(axl_cursor_visible(c), "abs: touch shows the cursor");
+
+    /* Absolute max maps to the far scene corner (scene_w-1, scene_h-1). */
+    ev.x = AXL_INPUT_ABS_RANGE - 1; ev.y = AXL_INPUT_ABS_RANGE - 1;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == SW - 1 && y == SH - 1, "abs: max maps to scene far corner");
+
+    /* Mid-range maps proportionally: 32768/65535 * 99 = 49, * 59 = 29. */
+    ev.x = AXL_INPUT_ABS_RANGE / 2; ev.y = AXL_INPUT_ABS_RANGE / 2;
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 49 && y == 29, "abs: mid maps proportionally onto the scene");
+
+    /* THE CONTRACT: absolute is now authoritative. A relative mouse move with
+       a large delta must NOT move the cursor away from the absolute position. */
+    ev.type = AXL_INPUT_MOUSE_MOVE;
+    ev.x = 0; ev.y = 0;            /* first relative event would seed... */
+    cursor_input_trampoline(&ev, c);
+    ev.x = 1000; ev.y = 1000;     /* ...and this delta would jump it, if relative drove */
+    cursor_input_trampoline(&ev, c);
+    axl_cursor_position(c, &x, &y);
+    test_check(x == 49 && y == 29, "abs: relative motion ignored once absolute seen");
+
+    axl_cursor_free(c);
+    axl_gfx_buffer_free(scene);
+}
+
 static void
 test_cursor_null_safety(void)
 {
@@ -328,6 +378,7 @@ test_cursor_main(int argc, char **argv)
     test_cursor_set_image();
     test_cursor_move_rel();
     test_cursor_attach_tracking();
+    test_cursor_attach_absolute();
     test_cursor_null_safety();
 
     return test_print_results();

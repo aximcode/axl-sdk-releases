@@ -216,16 +216,70 @@ axl_cursor_drop(
 );
 
 /**
- * @brief Track the physical pointer on a loop.
+ * @brief Which pointer sources axl_cursor_attach_ex binds, and how it reads
+ *        the absolute one.
  *
- * Attaches the mouse (via axl_input_attach_mouse), moving the cursor on
- * pointer motion and showing it, then forwarding every event to @p cb so
- * the consumer still does hit-testing / widget logic. The cursor's
- * position follows the event coordinates. The timer/source is added to
- * the caller-owned @p loop.
+ * Zero-initialize (`AxlCursorConfig cfg = {0};`) for the common case — bind
+ * BOTH pointers with library-default absolute-read settings — then override
+ * only what you need (e.g. `cfg.touch_drain = 8;`). The source flags are
+ * *skip* flags, and `touch_all_handles` is likewise an opt-OUT, precisely so
+ * the all-zero config matches the library defaults: bind both pointers,
+ * EVENT_AND_POLL, **ConsoleIn-only**, 30 ms poll, no coalesce.
  *
- * @return the mouse source ID (for axl_loop_remove_source /
- *     axl_cursor_detach), or 0 on failure.
+ * The cursor tracks both pointer kinds when both are bound: the absolute
+ * pointer (`EFI_ABSOLUTE_POINTER` — a touchscreen, a digitizer, or a
+ * remote-console / BMC virtual mouse, and QEMU's usb-tablet over VNC) reports
+ * a position directly. Once ANY absolute event arrives it is latched
+ * AUTHORITATIVE for cursor position for the lifetime of the attach: from then
+ * on relative-mouse motion no longer moves the cursor (it still reaches @p cb
+ * for button / wheel handling). Before the first absolute event — and forever
+ * on bare metal with no absolute device — the relative mouse drives position.
+ * Absolute coordinates are mapped onto the cursor's scene extent (the bound
+ * back-buffer's size, or the live GOP resolution in save-under / NULL-scene
+ * mode) — the same extent axl_cursor_move clamps to.
+ *
+ * The touch_* fields configure the absolute source exactly as
+ * axl_input_set_touch_config / axl_input_set_touch_drain do. Passing this
+ * config to axl_cursor_attach_ex applies them PROCESS-GLOBALLY (overwriting
+ * any prior axl_input_set_touch_* state, even for fields you left at their
+ * default) before binding the touch source. They are the levers for the
+ * remote-console "catch-up lag": some firmware queues absolute states FIFO and
+ * a one-read-per-poll drain trails a fast move, so raise touch_drain to
+ * coalesce the backlog to the latest position. See <axl/axl-input.h>.
+ */
+typedef struct {
+    bool                 skip_mouse;          ///< do NOT bind the relative pointer (default 0: bind it)
+    bool                 skip_touch;          ///< do NOT bind the absolute pointer (default 0: bind it)
+    AxlInputTouchMethod  touch_method;        ///< absolute read mechanism (0 = EVENT_AND_POLL)
+    bool                 touch_all_handles;   ///< bind ALL absolute handles, not just gST->ConsoleInHandle (default 0 = ConsoleIn-only; opt out only where the pointer is on a separate physical handle)
+    uint32_t             touch_poll_ms;       ///< absolute poll-fallback interval in ms (0 = 30 ms default)
+    uint32_t             touch_drain;         ///< coalesce up to N queued absolute states per read (0/1 = no coalesce)
+} AxlCursorConfig;
+
+/**
+ * @brief Track the physical pointer on a loop — both relative and absolute.
+ *
+ * Attaches the relative mouse (axl_input_attach_mouse) AND the absolute
+ * pointer (axl_input_attach_touch), moving the cursor on motion from either
+ * and showing it, then forwarding every event to @p cb so the consumer still
+ * does hit-testing / widget logic. The absolute source is authoritative for
+ * position once seen, so a remote-console / VNC / touch pointer tracks
+ * correctly (see AxlCursorConfig for the exact rule). Binds with the current
+ * process-global absolute-read settings — use axl_cursor_attach_ex to choose
+ * sources and set those settings in one call.
+ *
+ * @note Behavior change: this now ALSO binds the absolute pointer, claiming
+ *     the single process-wide absolute-pointer slot. Two consequences for
+ *     existing callers: (1) a single saved source ID no longer tears the
+ *     cursor down — use axl_cursor_detach (it removes both sources); (2) do
+ *     not combine with axl_compositor_attach_touch or a direct
+ *     axl_input_attach_touch in the same process — whichever binds the
+ *     absolute slot second gets 0. If another component owns the absolute
+ *     pointer, attach via axl_cursor_attach_ex with `cfg.skip_touch = true`.
+ *
+ * @return a non-zero source ID on success (a source for axl_loop_remove_source
+ *     — but prefer axl_cursor_detach, which tears down BOTH sources), or 0 if
+ *     neither source could be bound.
  */
 uint32_t
 axl_cursor_attach(
@@ -236,7 +290,37 @@ axl_cursor_attach(
 );
 
 /**
- * @brief Stop tracking the pointer (counterpart to axl_cursor_attach).
+ * @brief Track the physical pointer on a loop, choosing which source(s) to
+ *        bind and how to read the absolute one.
+ *
+ * Like axl_cursor_attach, but @p cfg selects the relative and/or absolute
+ * source and configures the absolute read path (method / ConsoleIn-only /
+ * poll interval / drain). A NULL @p cfg behaves exactly like
+ * axl_cursor_attach (bind both, current global touch settings, none applied).
+ * With a non-NULL @p cfg the touch_* fields are applied PROCESS-GLOBALLY
+ * before the absolute source is bound — including fields left at default — so
+ * a config built only to select sources still resets the global touch tunables
+ * to its (default) touch_* values; set them deliberately. The same
+ * single-absolute-slot caveat as axl_cursor_attach applies (use skip_touch
+ * when another component owns the absolute pointer).
+ *
+ * @return a non-zero source ID on success (prefer axl_cursor_detach to tear
+ *     down), or 0 if no requested source could be bound.
+ */
+uint32_t
+axl_cursor_attach_ex(
+    AxlCursor              *c,      ///< cursor
+    AxlLoop                *loop,   ///< event loop (caller-owned)
+    AxlInputCallback        cb,     ///< consumer callback for forwarded events (may be NULL)
+    void                   *data,   ///< opaque data for @p cb
+    const AxlCursorConfig  *cfg     ///< sources + absolute-read config (NULL = both, current settings)
+);
+
+/**
+ * @brief Stop tracking the pointer (counterpart to axl_cursor_attach /
+ *        axl_cursor_attach_ex).
+ *
+ * Detaches whichever of the relative and absolute sources this cursor bound.
  */
 void
 axl_cursor_detach(

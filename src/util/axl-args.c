@@ -557,7 +557,9 @@ static void
 print_help_for(const AxlArgsNode *node, const char *path)
 {
     if (node->help != NULL) {
-        axl_print("%s — %s\n\n", path, node->help);
+        /* ASCII '-' separator, not a Unicode em-dash: a UEFI text console has
+           no UTF-8, so U+2014 would render as a white block. */
+        axl_print("%s - %s\n\n", path, node->help);
     }
 
     if (node->help_prolog != NULL) {

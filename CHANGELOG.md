@@ -3,6 +3,76 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.5.0 — 2026-06-10
+
+### Fixed
+
+- **`AxlArgs` help is now pure ASCII** (`<axl/axl-args.h>`) — the
+  auto-generated tree-help header separated a node's name from its
+  description with a Unicode em-dash (`U+2014`), which renders as a white
+  block on a UEFI text console (no UTF-8). The separator is now an ASCII
+  `-` (e.g. `do - Dell hardware-diagnostic CLI`). The one renderer
+  (`print_help_for`) serves both the root header and every per-node /
+  sub-verb header, so all generated help is clean. A renderer test asserts
+  no non-ASCII byte appears in generated help (root + sub-verb).
+
+### Added
+
+- **`AxlCursor` tracks the absolute pointer too** (`<axl/axl-cursor.h>`)
+  — `axl_cursor_attach` now binds the absolute pointer
+  (`EFI_ABSOLUTE_POINTER` — a touchscreen / digitizer / BMC remote-console
+  virtual mouse, and QEMU's `usb-tablet` over VNC) in addition to the
+  relative mouse, so the convenience cursor path tracks a remote-console /
+  VNC pointer correctly instead of mis-tracking or lagging. Once any
+  absolute event is seen it is **authoritative** for cursor position (its
+  coordinate is mapped onto the scene); the relative mouse drives position
+  until then and afterward only contributes button / wheel events.
+  - New `axl_cursor_attach_ex(c, loop, cb, data, cfg)` + `AxlCursorConfig`
+    to choose which source(s) to bind (`skip_mouse` / `skip_touch`) and
+    configure the absolute read path (method / **ConsoleIn-only** / poll
+    interval / drain) in one call — a zero-initialized config binds both
+    with library defaults. `axl_cursor_detach` tears down whichever sources
+    were bound. **Behavior change:** existing callers gain the absolute
+    binding and claim the single process-wide absolute-pointer slot — a
+    saved source ID no longer fully tears the cursor down (use
+    `axl_cursor_detach`), and a consumer that separately binds the absolute
+    pointer (`axl_compositor_attach_touch` / `axl_input_attach_touch`)
+    should pass `cfg.skip_touch = true`.
+- **`pointer-tune-demo`** (`sdk/examples/pointer-tune-demo.c`) — a live
+  bench for the remote-console absolute-pointer "catch-up lag": drag a
+  pointer and retune every absolute-read lever at runtime with a keypress
+  — drain `N` (1/2/4/8/16), read method (EVENT_AND_POLL / EVENT_ONLY /
+  POLL_ONLY), poll interval (10/20/30/50 ms), and **ConsoleIn-only** — with
+  a HUD (live config, cursor position, abs/rel counts, events/sec) and a
+  fading trail that makes the lag appear under a single-read drain and
+  vanish once it coalesces. `make pointer-tune-demo`.
+
+### Changed
+
+- **Absolute-pointer capture now defaults to ConsoleIn-only**
+  (`<axl/axl-input.h>`) — `axl_input_set_touch_config`'s `console_only`
+  default flips from `false` (bind every `EFI_ABSOLUTE_POINTER` handle) to
+  `true` (bind only `gST->ConsoleInHandle`). On the firmware this matters
+  for — UEFI ≥ 2.30 that multiplexes pointers, including a BMC remote-console
+  virtual mouse, through ConIn — that one handle carries the live events, and
+  binding only it avoids double events from a separate physical handle that
+  mirrors the same device. So `axl_input_attach_touch`, the `AxlCursor`
+  attach path, and the compositor seat all default to ConsoleIn-only now.
+  A platform whose absolute pointer is published ONLY on a separate physical
+  handle must opt back in with `axl_input_set_touch_config(.., console_only =
+  false, ..)`, or, via `AxlCursorConfig`, `cfg.touch_all_handles = true`
+  (the cursor config field is the opt-OUT, so a zeroed config still gets the
+  new ConsoleIn-only default). Validated as the right path for the BMC
+  remote-console target; QEMU/OVMF can't distinguish the two (its only
+  absolute handle is the ConIn aggregator), so this is a real-hardware call.
+- **Backdrop-blur is cached** (compositor, the dialog veil) — a
+  full-screen backdrop-blur surface re-ran a whole-rect blur on every
+  present (any damage intersects it), pegging the CPU when content
+  animates behind a static veil. The blur is now cached per surface and
+  reused while the composited backdrop is byte-identical to the cached
+  pre-blur snapshot; a changed backdrop or radius recomputes. Internal
+  optimization — `axl_surface_set_backdrop_blur` is unchanged.
+
 ## 1.4.0 — 2026-06-09
 
 ### Added

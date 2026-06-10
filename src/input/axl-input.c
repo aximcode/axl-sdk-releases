@@ -863,10 +863,17 @@ typedef struct {
 static TouchSource touch_state;
 static bool        touch_state_used = false;
 
-// Tunable touch-read config (axl_input_set_touch_config) — defaults match the
-// robust attach: all handles, event sources + poll fallback, 30 ms.
+// Tunable touch-read config (axl_input_set_touch_config). Default: ConsoleIn-
+// only, event sources + poll fallback, 30 ms. ConsoleIn-only is the default
+// because on the firmware this matters for — UEFI >= 2.30 that multiplexes
+// pointers (a BMC remote-console virtual mouse) through gST->ConsoleInHandle —
+// that one handle is where the live events arrive, and binding ONLY it avoids
+// double events from a separate physical handle that mirrors the same device.
+// A platform whose absolute pointer is published ONLY on a separate physical
+// handle (not multiplexed through ConIn) must opt back into all-handles via
+// axl_input_set_touch_config(.., console_only=false, ..).
 static AxlInputTouchMethod g_touch_method       = AXL_INPUT_TOUCH_EVENT_AND_POLL;
-static bool                g_touch_console_only = false;
+static bool                g_touch_console_only = true;
 static uint32_t            g_touch_poll_ms      = TOUCH_POLL_MS;
 // Max queued states a single read drains, coalescing to the latest position.
 // 1 = legacy single-read (default).  Higher collapses a firmware backlog so a
@@ -929,7 +936,10 @@ touch_dispatch_cb(
     )
 {
     TouchSource                *tch = (TouchSource *)data;
-    EFI_ABSOLUTE_POINTER_STATE  state;
+    /* Zero-init: the `ap != NULL` guard below proves `state` was assigned
+       before use, but -O2 can't see the correlation and warns
+       -Wmaybe-uninitialized; the initializer silences the false positive. */
+    EFI_ABSOLUTE_POINTER_STATE  state = {0};
 
     // Read whichever bound handle has data FIRST (ConsoleInHandle first).
     // GetState consumes one queued state, so by default we read exactly one per

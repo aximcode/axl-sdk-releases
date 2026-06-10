@@ -526,7 +526,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -730,6 +730,16 @@ $(PREFIX)/pointer-demo.efi: $(BUILDDIR)/pointer-demo.o $(CRT0_OBJ) $(PREFIX)/lib
 	$(call LINK_EFI_APP,$(BUILDDIR)/pointer-demo.o,$@)
 
 $(BUILDDIR)/pointer-demo.o: sdk/examples/pointer-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build pointer-tune-demo.efi example (live absolute-pointer tuning bench)
+pointer-tune-demo: $(PREFIX)/pointer-tune-demo.efi
+	@echo "  Built: $(PREFIX)/pointer-tune-demo.efi"
+
+$(PREFIX)/pointer-tune-demo.efi: $(BUILDDIR)/pointer-tune-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/pointer-tune-demo.o,$@)
+
+$(BUILDDIR)/pointer-tune-demo.o: sdk/examples/pointer-tune-demo.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # Build cursor-demo.efi example (AxlCursor consumer; holds on a key)

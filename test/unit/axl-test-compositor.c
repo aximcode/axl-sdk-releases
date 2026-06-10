@@ -712,6 +712,84 @@ test_compositor_backdrop_blur(void)
     axl_compositor_free(c);
 }
 
+/* E10 cache invalidation: the backdrop-blur cache is content-addressed, so it
+   must NEVER serve a stale result. The existing test only ever blurs a STATIC
+   backdrop (exercises the hit path); this pins the two invalidation paths the
+   whole optimization rests on — a CHANGED backdrop re-blurs, and a RADIUS
+   change drops the cache and recomputes. (Against a naive "always reuse"
+   cache the "no stale" assertion fails; verified by sabotage during review.) */
+static void
+test_compositor_backdrop_blur_cache(void)
+{
+    const AxlGfxPixel BLK = AXL_GFX_RGB(0x00, 0x00, 0x00);
+    const AxlGfxPixel WHT = AXL_GFX_RGB(0xFF, 0xFF, 0xFF);
+    const uint32_t R = 6, R2 = 2;
+    const int32_t  X = 46, Y = 40;   /* just left of the SW/2 edge: the blurred
+                                        value differs sharply by pattern + radius */
+
+    AxlCompositor *c = axl_compositor_new(SW, SH);
+    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* backdrop */
+    AxlSurface *p = axl_surface_create(axl_compositor_root(c), SW, SH);  /* veil, top */
+
+    /* Transparent veil so the output IS the blurred backdrop (isolate the blur). */
+    AxlGfxPixel *pp = axl_gfx_buffer_pixels(axl_surface_buffer(p));
+    for (int i = 0; i < SW * SH; i++) { pp[i] = AXL_GFX_RGBA(0, 0, 0, 0); }
+    axl_surface_set_per_pixel_alpha(p, true);
+    axl_surface_set_backdrop_blur(p, R);
+
+    /* Helper: paint backdrop `b` as <left>|<right> halves at the SW/2 edge. */
+    #define PAINT_HALVES(surf_or_buf, left, right)                       \
+        do {                                                             \
+            axl_gfx_target_buffer(surf_or_buf);                          \
+            axl_gfx_fill_rect(0, 0, SW, SH, (left));                     \
+            axl_gfx_fill_rect(SW / 2, 0, SW / 2, SH, (right));           \
+            axl_gfx_target_buffer(NULL);                                 \
+        } while (0)
+
+    /* Pattern 1 (black|white): first present populates the cache. */
+    PAINT_HALVES(axl_surface_buffer(b), BLK, WHT);
+    axl_compositor_composite(c);
+
+    AxlGfxBuffer *ora1 = axl_gfx_buffer_new(SW, SH);
+    PAINT_HALVES(ora1, BLK, WHT);
+    axl_gfx_buffer_blur(ora1, R);
+    AxlGfxPixel *o1 = axl_gfx_buffer_pixels(ora1);
+    test_check(rgb_eq(scan_at(c, X, Y), o1[Y * SW + X]),
+               "bdblur cache: first present matches the pattern-1 oracle");
+
+    /* Pattern 2 (white|black) — a DIFFERENT backdrop under the veil. */
+    PAINT_HALVES(axl_surface_buffer(b), WHT, BLK);
+    axl_surface_damage(b, (AxlGfxClip){0, 0, SW, SH});
+    axl_compositor_composite(c);
+
+    AxlGfxBuffer *ora2 = axl_gfx_buffer_new(SW, SH);
+    PAINT_HALVES(ora2, WHT, BLK);
+    axl_gfx_buffer_blur(ora2, R);
+    AxlGfxPixel *o2 = axl_gfx_buffer_pixels(ora2);
+    test_check(!rgb_eq(o1[Y * SW + X], o2[Y * SW + X]),
+               "bdblur cache: pattern-1 vs pattern-2 oracles differ at the probe");
+    test_check(rgb_eq(scan_at(c, X, Y), o2[Y * SW + X]),
+               "bdblur cache: changed backdrop re-blurs (no stale cache served)");
+
+    /* Radius change must drop the cache and recompute at the new radius. */
+    axl_surface_set_backdrop_blur(p, R2);
+    axl_compositor_composite(c);
+    AxlGfxBuffer *ora3 = axl_gfx_buffer_new(SW, SH);
+    PAINT_HALVES(ora3, WHT, BLK);
+    axl_gfx_buffer_blur(ora3, R2);
+    AxlGfxPixel *o3 = axl_gfx_buffer_pixels(ora3);
+    test_check(!rgb_eq(o2[Y * SW + X], o3[Y * SW + X]),
+               "bdblur cache: radius R vs R2 oracles differ at the probe");
+    test_check(rgb_eq(scan_at(c, X, Y), o3[Y * SW + X]),
+               "bdblur cache: radius change recomputes at the new radius");
+
+    #undef PAINT_HALVES
+    axl_gfx_buffer_free(ora1);
+    axl_gfx_buffer_free(ora2);
+    axl_gfx_buffer_free(ora3);
+    axl_compositor_free(c);
+}
+
 /* E7 — frame callbacks (present throttling). The routing core
    (request_frame / dispatch_frame / has_pending_frames) is pure logic,
    testable with synthetic time and no loop. */
@@ -1941,6 +2019,7 @@ test_compositor_main(int argc, char **argv)
     test_compositor_occlusion_oom();
     test_compositor_occlusion_hoist();
     test_compositor_backdrop_blur();
+    test_compositor_backdrop_blur_cache();
     test_compositor_frame_callbacks();
     test_compositor_frame_clock();
     test_compositor_fuzz();

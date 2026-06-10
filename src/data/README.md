@@ -1291,8 +1291,11 @@ Supported: literals, `.`, greedy and lazy quantifiers
 capture `( )`, classes `[...]` / `[^...]` with ranges, and `\d \w \s`
 (plus negations). Matching is byte-oriented and leftmost (Perl /
 `grep -P` priority, not POSIX leftmost-longest). Compile flags:
-`CASELESS`, `MULTILINE`, `DOTALL`; an `ANCHORED` match flag pins the
-match to `from_offset`.
+`CASELESS`, `MULTILINE`, `DOTALL`. Match flags: `ANCHORED` pins the
+match to `from_offset`; `NOTBOL` / `NOTEOL` treat `from_offset` / the
+buffer end as mid-stream so `^` / `$` (and the start/end anchors) don't
+match there (POSIX `REG_NOTBOL` / `REG_NOTEOL`) — for scanning a larger
+source in overlapping windows without anchors firing at every boundary.
 
 ```c
 AXL_AUTOPTR(AxlRegex) re = axl_regex_new("(\\w+)@(\\w+)", AXL_REGEX_DEFAULT);

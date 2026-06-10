@@ -424,13 +424,15 @@ axl_input_detach_key(
 /// native `EFI_ABSOLUTE_POINTER_MODE` range — display-independent; the
 /// caller maps it onto its surface.  See `AXL_INPUT_ABS_RANGE`.
 ///
-/// Binds EVERY handle publishing `EFI_ABSOLUTE_POINTER_PROTOCOL`,
-/// **ConsoleInHandle first** — on modern firmware (UEFI >= 2.30) the BIOS
-/// multiplexes pointers, including a BMC remote-console virtual mouse, through ConIn,
-/// and that is where live events arrive.  Each handle gets a `WaitForInput`
-/// event source (the efficient path), plus a low-rate poll fallback for
-/// firmware whose `WaitForInput` never signals — so the cursor works either
-/// way.  `GetState` consumes, so the readers never double-count.
+/// By default (see `axl_input_set_touch_config`) binds ONLY
+/// `gST->ConsoleInHandle` — on modern firmware (UEFI >= 2.30) the BIOS
+/// multiplexes pointers, including a BMC remote-console virtual mouse, through
+/// ConIn, and that is where live events arrive.  With `console_only = false`
+/// it instead binds EVERY handle publishing `EFI_ABSOLUTE_POINTER_PROTOCOL`,
+/// ConsoleInHandle first.  Each bound handle gets a `WaitForInput` event source
+/// (the efficient path), plus a low-rate poll fallback for firmware whose
+/// `WaitForInput` never signals — so the cursor works either way.  `GetState`
+/// consumes, so the readers never double-count.
 ///
 /// Only one touch source per process for v0.1.  Tear it down with
 /// `axl_input_detach_touch` (NOT a single `axl_loop_remove_source`, since it
@@ -454,11 +456,17 @@ typedef enum {
 } AxlInputTouchMethod;
 
 /// Configure the NEXT `axl_input_attach_touch` (a process-global setting; call
-/// before attaching).  Defaults: `EVENT_AND_POLL`, all handles, 30 ms poll.
+/// before attaching).  Defaults: `EVENT_AND_POLL`, **ConsoleIn-only**, 30 ms
+/// poll.  ConsoleIn-only is the default because modern firmware (UEFI >= 2.30)
+/// multiplexes pointers — including a BMC remote-console virtual mouse —
+/// through `gST->ConsoleInHandle`, so that one handle carries the live events
+/// and binding only it avoids double events from a separate physical handle
+/// mirroring the same device.  A platform whose absolute pointer is published
+/// ONLY on a separate physical handle must pass `console_only = false`.
 /// @param method            which read mechanism(s) to use.
 /// @param console_only      bind ONLY `gST->ConsoleInHandle` (skip the separate
 ///                          physical handle — avoids double events if both
-///                          deliver the same device independently).
+///                          deliver the same device independently).  Default true.
 /// @param poll_ms           poll-fallback interval (0 = keep the 30 ms default).
 void
 axl_input_set_touch_config(

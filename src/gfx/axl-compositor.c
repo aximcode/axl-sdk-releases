@@ -21,6 +21,7 @@
 #include <axl/axl-loop.h>
 #include <axl/axl-time.h>
 #include <axl/axl-mem.h>
+#include <axl/axl-str.h>
 #include <axl/axl-array.h>
 #include <axl/axl-macros.h>
 
@@ -71,6 +72,16 @@ struct AxlSurface {
     // --- E10: backdrop blur (the dialog veil) — 0 = off ---
     uint32_t           backdrop_blur; // blur the composited backdrop under this
                                       // surface by this radius before blitting
+    // Blur cache: a full-rect backdrop blur is expensive and recurs on EVERY
+    // present.  When the composited backdrop under this surface is byte-
+    // identical to last time (a STATIC modal backdrop — the common case), skip
+    // the blur and reuse the prior result.  `blur_src_cache` = pre-blur source
+    // snapshot (the compare key); `blur_out_cache` = the blurred result to
+    // reuse; both sized blur_cache_w × blur_cache_h.  Freed with the surface;
+    // dropped when the radius changes.
+    AxlGfxBuffer      *blur_src_cache;
+    AxlGfxBuffer      *blur_out_cache;
+    uint32_t           blur_cache_w, blur_cache_h;
 };
 
 struct AxlCompositor {
@@ -115,6 +126,9 @@ struct AxlCompositor {
 
 // Frame-clock timer trampoline, defined in the E7 section below.
 static bool frame_tick(void *data);
+
+// Blur-cache drop (E10), defined in the compositing section below.
+static void blur_cache_drop(AxlSurface *s);
 
 // Seat helpers defined in the seat section below.
 static void seat_refocus(AxlCompositor *c);          // re-hit-test after a change
@@ -287,6 +301,8 @@ surf_free_recursive(AxlSurface *s)
         child = next;
     }
     axl_gfx_buffer_free(s->buf);
+    axl_gfx_buffer_free(s->blur_src_cache);   // E10 blur cache (NULL-safe)
+    axl_gfx_buffer_free(s->blur_out_cache);
     axl_free(s->input_clips);
     axl_free(s);
 }
@@ -511,6 +527,7 @@ axl_surface_set_backdrop_blur(AxlSurface *s, uint32_t radius)
         return;
     }
     s->backdrop_blur = radius;   // changes compositing → re-composite the rect
+    blur_cache_drop(s);          // a radius change invalidates the cached blur
     mark_damage(s->comp, surf_subtree_bounds(s));
 }
 
@@ -598,12 +615,31 @@ axl_surface_from_output(const AxlSurface *s, int32_t ox, int32_t oy,
 
 // --- compositing ----------------------------------------------------------
 
+// Drop @s's blur cache (radius change / teardown). NULL-safe.
+static void
+blur_cache_drop(AxlSurface *s)
+{
+    axl_gfx_buffer_free(s->blur_src_cache);   // axl_gfx_buffer_free is NULL-safe
+    axl_gfx_buffer_free(s->blur_out_cache);
+    s->blur_src_cache = NULL;
+    s->blur_out_cache = NULL;
+    s->blur_cache_w   = 0;
+    s->blur_cache_h   = 0;
+}
+
 // Blur the output region @r in place by @radius (E10 backdrop blur): extract
 // it to a scratch buffer, stack-blur, write back. On scratch-OOM the blur is
 // skipped (the surface is just un-frosted) — never fatal. The blur clamps at
 // @r's edges (the surface's own border).
+//
+// CACHE: a full-rect blur is expensive and recurs every present. When the
+// composited backdrop in @r is byte-identical to the last blur (a static modal
+// backdrop), reuse @s's stored blurred result instead of recomputing. The
+// compare is content-based, so it can never serve a stale blur: a changed
+// backdrop fails the memcmp and re-blurs. (The blur is the heavy multi-pass
+// cost; the per-frame memcmp + memcpy is a fraction of it.)
 static void
-blur_output_rect(AxlCompositor *c, AxlGfxClip r, uint32_t radius)
+blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, uint32_t radius)
 {
     if (r.w == 0 || r.h == 0 || radius == 0) {
         return;
@@ -614,19 +650,63 @@ blur_output_rect(AxlCompositor *c, AxlGfxClip r, uint32_t radius)
     }
     AxlGfxPixel *op = axl_gfx_buffer_pixels(c->output);
     AxlGfxPixel *tp = axl_gfx_buffer_pixels(tmp);
-    if (op != NULL && tp != NULL) {
-        for (uint32_t j = 0; j < r.h; j++) {
-            for (uint32_t i = 0; i < r.w; i++) {
-                tp[j * r.w + i] =
-                    op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i];
-            }
+    if (op == NULL || tp == NULL) {
+        axl_gfx_buffer_free(tmp);
+        return;
+    }
+    // Extract the backdrop region into the scratch (the blur source).
+    for (uint32_t j = 0; j < r.h; j++) {
+        for (uint32_t i = 0; i < r.w; i++) {
+            tp[j * r.w + i] =
+                op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i];
         }
-        (void)axl_gfx_buffer_blur(tmp, radius);
-        for (uint32_t j = 0; j < r.h; j++) {
-            for (uint32_t i = 0; i < r.w; i++) {
-                op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i] =
-                    tp[j * r.w + i];
+    }
+    const size_t bytes = (size_t)r.w * (size_t)r.h * sizeof(AxlGfxPixel);
+
+    // Cache hit: same dims + identical source → reuse the stored blurred result.
+    if (s->blur_out_cache != NULL && s->blur_src_cache != NULL
+        && s->blur_cache_w == r.w && s->blur_cache_h == r.h) {
+        AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
+        AxlGfxPixel *oc = axl_gfx_buffer_pixels(s->blur_out_cache);
+        if (sc != NULL && oc != NULL && axl_memcmp(sc, tp, bytes) == 0) {
+            for (uint32_t j = 0; j < r.h; j++) {
+                for (uint32_t i = 0; i < r.w; i++) {
+                    op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i] =
+                        oc[j * r.w + i];
+                }
             }
+            axl_gfx_buffer_free(tmp);
+            return;
+        }
+    }
+
+    // Cache miss: (re)size the cache to @r if needed, snapshot the source,
+    // blur, store the result. A snapshot/alloc failure just disables caching
+    // for this pass (still blurs correctly).
+    if (s->blur_cache_w != r.w || s->blur_cache_h != r.h) {
+        blur_cache_drop(s);
+        s->blur_src_cache = axl_gfx_buffer_new(r.w, r.h);
+        s->blur_out_cache = axl_gfx_buffer_new(r.w, r.h);
+        if (s->blur_src_cache != NULL && s->blur_out_cache != NULL) {
+            s->blur_cache_w = r.w;
+            s->blur_cache_h = r.h;
+        } else {
+            blur_cache_drop(s);
+        }
+    }
+    if (s->blur_src_cache != NULL) {
+        AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
+        if (sc != NULL) axl_memcpy(sc, tp, bytes);   // pre-blur snapshot (compare key)
+    }
+    (void)axl_gfx_buffer_blur(tmp, radius);
+    if (s->blur_out_cache != NULL) {
+        AxlGfxPixel *oc = axl_gfx_buffer_pixels(s->blur_out_cache);
+        if (oc != NULL) axl_memcpy(oc, tp, bytes);   // store blurred result
+    }
+    for (uint32_t j = 0; j < r.h; j++) {
+        for (uint32_t i = 0; i < r.w; i++) {
+            op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i] =
+                tp[j * r.w + i];
         }
     }
     axl_gfx_buffer_free(tmp);
@@ -654,7 +734,9 @@ surf_blit(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
     // Back-to-front compositing means everything below @s is already in the
     // output here, so blurring @r in place gives a true backdrop blur.
     if (s->backdrop_blur > 0) {
-        blur_output_rect(c, r, s->backdrop_blur);
+        // const cast: the blur cache is mutable per-surface scratch; surf_blit
+        // is otherwise read-only on @s.
+        blur_output_rect(c, (AxlSurface *)s, r, s->backdrop_blur);
     }
     for (uint32_t j = 0; j < r.h; j++) {
         AxlGfxPixel       *drow = &dp[(r.y + (int32_t)j) * (int32_t)c->w + r.x];
