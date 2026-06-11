@@ -27,7 +27,7 @@ on_key(AxlInputKey key, void *data)
     AxlLoop *loop = (AxlLoop *)data;
 
     if (key.unicode_char == 'q' || key.unicode_char == 'Q') {
-        axl_printf("\n  'q' pressed — quitting\n");
+        axl_printf("\n  'q' pressed - quitting\n");
         axl_loop_quit(loop);
         return AXL_SOURCE_REMOVE;
     }

@@ -57,7 +57,7 @@ static const AxlArgDesc flags[] = {
     { .name = "recursive",     .short_name = 'r', .type = AXL_ARG_BOOL,
       .help = "Recursive directory search" },
     { .name = "invert-match",  .short_name = 'v', .type = AXL_ARG_BOOL,
-      .help = "Invert match — print lines that do NOT contain the pattern "
+      .help = "Invert match - print lines that do NOT contain the pattern "
               "(matches Linux grep -v semantics)" },
     { .name = "show-progress",                    .type = AXL_ARG_BOOL,
       .help = "Print diagnostic notes (skipped binaries, "

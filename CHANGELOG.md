@@ -3,6 +3,23 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.5.1 — 2026-06-10
+
+### Fixed
+
+- **Console / log output is now pure ASCII** — Unicode punctuation in
+  emittable string literals (chiefly the em-dash `U+2014`, plus a few
+  arrows `U+2192`) drew as a white block on a UEFI text console. The
+  driver-locate debug line (`driver_try_candidates`: `hit: <path> —
+  attempting`) was the reported case; an audit found ~88 more across the
+  library, tools, and examples (log messages, `axl_printf` output, AxlArgs
+  `.help` strings). All replaced with ASCII (`-`, `->`). Comments are
+  untouched (never reach the console). Added `scripts/check-output-ascii.py`
+  — a C tokenizer that flags non-ASCII inside string/char literals (ignoring
+  comments; deliberate UTF-8 fixtures opt out with an inline `ascii-allow`
+  marker) — wired into CI's lint job and `make check-ascii`, with a `--fix`
+  mode, so this can't regress.
+
 ## 1.5.0 — 2026-06-10
 
 ### Fixed

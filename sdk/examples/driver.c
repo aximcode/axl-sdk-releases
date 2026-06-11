@@ -140,7 +140,7 @@ driver_main(
     }
     axl_printf("PASS: driver-protocol-find\n");
 
-    axl_info("ready — %s", mProtocol.description);
+    axl_info("ready - %s", mProtocol.description);
 
     return AXL_OK;
 
@@ -176,7 +176,7 @@ driver_unload(
 
     axl_free((void *)mProtocol.description);
 
-    axl_info("unloaded — checking for leaks");
+    axl_info("unloaded - checking for leaks");
     axl_mem_dump_leaks();
     axl_printf("PASS: driver-unload\n");
     return AXL_OK;

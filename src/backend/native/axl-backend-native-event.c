@@ -166,7 +166,7 @@ axl_backend_event_create_notify_timer(
         }
     }
     if (slot == NOTIFY_TIMER_TABLE_SIZE) {
-        axl_warning("notify-timer table full (%d slots) — "
+        axl_warning("notify-timer table full (%d slots) - "
                     "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
                     NOTIFY_TIMER_TABLE_SIZE);
         return AXL_ERR;

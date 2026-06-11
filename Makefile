@@ -526,7 +526,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -544,6 +544,9 @@ endif
 
 # Verify VERSION file and include/axl/axl-version.h agree. Use
 # scripts/bump-version.sh to update both atomically.
+check-ascii:
+	@python3 scripts/check-output-ascii.py
+
 check-version:
 	@file_ver=$$(cat VERSION); \
 	header_ver=$$(sed -n 's/^#define AXL_VERSION_STRING  *"\(.*\)".*/\1/p' include/axl/axl-version.h); \

@@ -132,7 +132,7 @@ axl_sidecar_check_schema(
        table. */
     uint64_t schema = 0;
     if (!axl_json_get_uint(r, "schema", &schema)) {
-        axl_warning("%s: 'schema' field missing — add 'schema: %llu' "
+        axl_warning("%s: 'schema' field missing - add 'schema: %llu' "
                     "to the file root (accepted: see module docstring)",
                     module_name,
                     (unsigned long long)accepted[0]);

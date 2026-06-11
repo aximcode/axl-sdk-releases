@@ -304,14 +304,14 @@ axl_net_ensure_drivers(void)
      * comment for the empirical evidence captured during development. */
     if (snp_after_core == 0) {
         axl_info(
-            "ensure_drivers: no SNP after core drivers — falling back to iPXE");
+            "ensure_drivers: no SNP after core drivers - falling back to iPXE");
         loaded_count += load_driver_list(
             net_drivers_ipxe,
             sizeof(net_drivers_ipxe) / sizeof(net_drivers_ipxe[0]));
         axl_driver_connect(NULL);
     } else {
         axl_info(
-            "ensure_drivers: SNP came up via core drivers (%zu handles) — skipping iPXE",
+            "ensure_drivers: SNP came up via core drivers (%zu handles) - skipping iPXE",
             snp_after_core);
     }
 
@@ -328,7 +328,7 @@ axl_net_ensure_drivers(void)
     axl_watchdog_disarm();
 
     size_t snp_after = net_count_snp();
-    axl_info("ensure_drivers: %zu drivers loaded, SNP handles %zu→%zu",
+    axl_info("ensure_drivers: %zu drivers loaded, SNP handles %zu->%zu",
              loaded_count, snp_before, snp_after);
 
     if (snp_after > 0) {
@@ -519,7 +519,7 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
         if (reg_st == EFI_SUCCESS) {
             cfg_event_registered = true;
         } else {
-            axl_debug("RegisterDataNotify(InterfaceInfo) returned 0x%llx — "
+            axl_debug("RegisterDataNotify(InterfaceInfo) returned 0x%llx - "
                       "falling back to tick-only poll",
                       (unsigned long long)reg_st);
             axl_bs()->CloseEvent(cfg_event);

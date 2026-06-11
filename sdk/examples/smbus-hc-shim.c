@@ -464,7 +464,7 @@ dump_smbios_type38(void)
 {
     AxlSmbiosHeader *hdr = axl_smbios_find(38);
     if (hdr == NULL) {
-        axl_warning("SMBIOS Type 38 not present — SSIF auto-detect will fail");
+        axl_warning("SMBIOS Type 38 not present - SSIF auto-detect will fail");
         return;
     }
     const uint8_t *raw = (const uint8_t *)hdr;
@@ -489,7 +489,7 @@ DriverEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     axl_driver_init(ImageHandle, (AxlSystemTable *)SystemTable);
 
     if (find_ich9_smbus() != 0) {
-        axl_error("ICH9 SMBus controller not found — shim cannot attach");
+        axl_error("ICH9 SMBus controller not found - shim cannot attach");
         return EFI_UNSUPPORTED;
     }
 

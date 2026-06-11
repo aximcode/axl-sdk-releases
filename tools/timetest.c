@@ -57,7 +57,7 @@ run_timetest(AxlArgs *a)
 
     /* Show 8 back-to-back log lines so the operator sees the
        timestamp's microsecond field actually advancing. */
-    axl_printf("\nEight consecutive axl_info calls — watch the .uuuuuu field:\n");
+    axl_printf("\nEight consecutive axl_info calls - watch the .uuuuuu field:\n");
     for (int i = 0; i < 8; i++) {
         axl_info("tick %d (mono=%llu us)",
                  i, (unsigned long long)axl_time_get_us());

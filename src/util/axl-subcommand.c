@@ -177,7 +177,7 @@ axl_subcommand_print_command_help(
     }
     axl_printf("%s %s", prog, entry->name);
     if (entry->summary != NULL && entry->summary[0] != '\0') {
-        axl_printf(" — %s", entry->summary);
+        axl_printf(" - %s", entry->summary);
     }
     axl_printf("\n\n");
     if (entry->usage != NULL && entry->usage[0] != '\0') {

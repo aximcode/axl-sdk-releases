@@ -252,7 +252,7 @@ cmd_probe(void)
                    (unsigned)d.firmware_minor,
                    (unsigned)d.manufacturer_id);
     } else {
-        axl_printf("  Get Device ID:      FAILED — transport selected but BMC not responding\n");
+        axl_printf("  Get Device ID:      FAILED - transport selected but BMC not responding\n");
     }
     return 0;
 }
@@ -641,7 +641,7 @@ AXL_TOOL_MAIN(ipmi)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name         = "ipmi",
-        .help         = "IPMI client — SMBIOS Type 38 auto-detect (override: --transport)",
+        .help         = "IPMI client - SMBIOS Type 38 auto-detect (override: --transport)",
         .flags        = flags,
         .verbs        = verbs,
         .pre_run      = ipmi_pre_run,

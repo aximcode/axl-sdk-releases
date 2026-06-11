@@ -662,7 +662,7 @@ axl_tcp_close(AxlTcp *sock)
     if (ctx == NULL ||
         axl_backend_event_create((AxlEventHandle *)&close_event) != AXL_OK)
     {
-        axl_warning("close: ctx/event alloc failed — abrupt teardown");
+        axl_warning("close: ctx/event alloc failed - abrupt teardown");
         if (ctx != NULL) {
             axl_free(ctx);
         }
@@ -682,7 +682,7 @@ axl_tcp_close(AxlTcp *sock)
     EFI_STATUS status = axl_efi_call(sock->tcp4->Close, 2,
                                      sock->tcp4, &ctx->close_token);
     if (EFI_ERROR(status)) {
-        axl_debug("close: Close() returned %llx — abrupt teardown",
+        axl_debug("close: Close() returned %llx - abrupt teardown",
                   (unsigned long long)status);
         finalize_close_ctx(ctx);
         return;
@@ -703,7 +703,7 @@ axl_tcp_close(AxlTcp *sock)
         if (ctx->source_id != 0) {
             return;
         }
-        axl_warning("close: cannot register close event on loop — sync fallback");
+        axl_warning("close: cannot register close event on loop - sync fallback");
     }
 
     /* Sync fallback (loop not running, or registration failed). 3 s

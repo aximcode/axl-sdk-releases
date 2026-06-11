@@ -226,7 +226,7 @@ op_get(AxlSmbus *s, BusOp *op)
     }
     axl_hexdump(NULL, buf, got, 16, 1);
     if (got < op->read_count) {
-        axl_printf("(only %zu of %zu bytes read — slave NACKed mid-stream)\n",
+        axl_printf("(only %zu of %zu bytes read - slave NACKed mid-stream)\n",
                    got, op->read_count);
     }
     op->rc = 0;
@@ -247,7 +247,7 @@ op_set(AxlSmbus *s, BusOp *op)
                    op->slave, op->reg, op->write_len);
         return;
     }
-    axl_printf("OK — wrote %zu byte(s) to slave 0x%02X reg 0x%02X\n",
+    axl_printf("OK - wrote %zu byte(s) to slave 0x%02X reg 0x%02X\n",
                op->write_len, op->slave, op->reg);
     op->rc = 0;
 }
@@ -412,7 +412,7 @@ do_set(
     bool force = axl_args_get_bool(a, "force");
     if (!force) {
         axl_printf("Refusing to write without --force.\n");
-        axl_printf("Writes can brick devices — confirm intent with --force.\n");
+        axl_printf("Writes can brick devices - confirm intent with --force.\n");
         return 2;
     }
 
@@ -472,7 +472,7 @@ static const AxlArgDesc probe_args[] = {
     { .name = "bus", .type = AXL_ARG_U32, .base = 0, .required = true,
       .help = "Bus index" },
     { .name = "range", .type = AXL_ARG_MULTI,
-      .help = "[first] [last] — optional address range "
+      .help = "[first] [last] - optional address range "
               "(default 0x03..0x77, or 0x00..0x7F with --all)" },
     {0}
 };
@@ -526,7 +526,7 @@ static const AxlArgDesc set_args[] = {
 
 static const AxlArgDesc set_flags[] = {
     { .name = "force", .short_name = 'f', .type = AXL_ARG_BOOL,
-      .help = "Confirm intent — writes can brick devices" },
+      .help = "Confirm intent - writes can brick devices" },
     {0}
 };
 

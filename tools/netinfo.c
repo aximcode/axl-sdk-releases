@@ -232,7 +232,7 @@ show_nic_drivers(const char *label)
         } else if (snp != NULL) {
             layer = "SNP"; image_label = snp;
         } else {
-            layer = "—"; image_label = "<no driver attached>";
+            layer = "-"; image_label = "<no driver attached>";
         }
 
         axl_printf("  NIC[%zu] handle=%p [%s] driver=%s\n",
@@ -288,7 +288,7 @@ ensure_net_drivers_warn(void)
         return 1;
     case AXL_NET_DRIVERS_NO_LINK:
         axl_printf("NetInfo: warning: drivers loaded but no NIC "
-                   "came up — is a NIC plugged in?\n");
+                   "came up - is a NIC plugged in?\n");
         return 1;
     default:
         axl_printf("NetInfo: warning: failed to bring up networking.\n");
@@ -594,7 +594,7 @@ do_ping(
         return 1;
     }
 
-    axl_printf("PING %s — %zu packets\n", target, count);
+    axl_printf("PING %s - %zu packets\n", target, count);
 
     size_t sent = 0;
     size_t received = 0;

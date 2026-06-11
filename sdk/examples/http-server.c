@@ -59,8 +59,8 @@ main(int argc, char **argv)
     }
 
     axl_printf("HTTP server on port 8080\n");
-    axl_printf("  GET  /version  — JSON version info\n");
-    axl_printf("  POST /echo     — echo request body\n");
+    axl_printf("  GET  /version  - JSON version info\n");
+    axl_printf("  POST /echo     - echo request body\n");
     axl_printf("Press Ctrl-C to stop.\n");
 
     axl_http_server_run(server);

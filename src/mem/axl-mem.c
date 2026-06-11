@@ -232,7 +232,7 @@ validate_fences(
     }
     if (*tail_fence(hdr) != AXL_FENCE_TAIL) {
         axl_error(
-            "%s: tail fence corrupt at %p(alloc %s:%llu, %llu bytes) — overflow",
+            "%s: tail fence corrupt at %p(alloc %s:%llu, %llu bytes) - overflow",
             caller, user_ptr(hdr), hdr->file, (unsigned long long)hdr->line, (unsigned long long)hdr->size
             );
         ok = false;
@@ -484,7 +484,7 @@ axl_mem_dump_leaks(
 
     idx = 0;
     for (cur = mAllocList; cur != NULL; cur = cur->next) {
-        axl_warning("  [%llu] %llu bytes at %p — %s:%llu",
+        axl_warning("  [%llu] %llu bytes at %p - %s:%llu",
                    (unsigned long long)idx, (unsigned long long)cur->size, user_ptr(cur), cur->file, (unsigned long long)cur->line);
         idx++;
     }

@@ -54,7 +54,7 @@ static const AxlArgDesc flags[] = {
     { .name = "vv",       .type = AXL_ARG_BOOL,
       .help = "Very verbose: same as -v plus per-interface row in default mode" },
     { .name = "tree",     .short_name = 't', .type = AXL_ARG_BOOL,
-      .help = "Tree view: bus → device → interface" },
+      .help = "Tree view: bus -> device -> interface" },
     { .name = "ids-file", .type = AXL_ARG_STRING,
       .help = "Path to usb-ids.json5 (default: companion to .efi or cwd)" },
     /* Use AXL_LOG_LEVEL=debug (or AXL_LOG_LEVEL=usb:debug) to enable
@@ -492,7 +492,7 @@ run_lsusb(
        wanted and the file isn't loaded. Stay polite — two lines max,
        suppressed when -n is set. */
     if (!opt_numeric && !g_ids_loaded) {
-        axl_printf("\n(usb-ids.json5 not loaded — vendor/device names unavailable.\n");
+        axl_printf("\n(usb-ids.json5 not loaded - vendor/device names unavailable.\n");
         axl_printf(" Stage axl-sdk's curated set next to lsusb.efi or pass --ids-file.)\n");
     }
     return 0;

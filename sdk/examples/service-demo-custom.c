@@ -302,7 +302,7 @@ main(int argc, char **argv)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name        = "service-demo-custom",
-        .help        = "AxlService demo — consumer-side AxlArgs + AxlConfig",
+        .help        = "AxlService demo - consumer-side AxlArgs + AxlConfig",
         .help_prolog =
             "Same shape as service-demo.efi (built via AXL_SERVICE) "
             "but with a hand-written main() that mixes the standard "

@@ -410,7 +410,7 @@ axl_driver_unload(
            rollback-path errors) get a generic message. */
         if (status == EFI_ACCESS_DENIED) {
             axl_warning("axl_driver_unload: UnloadImage(handle=%p) "
-                        "returned EFI_ACCESS_DENIED (0x%llx) — image "
+                        "returned EFI_ACCESS_DENIED (0x%llx) - image "
                         "still holds open protocol references; if your "
                         "service opens UEFI protocols in setup, ensure "
                         "teardown closes every one (axl_http_server_free, "
@@ -487,7 +487,7 @@ axl_driver_set_load_options(
         }
         if (slot == LOAD_OPTIONS_TABLE_SIZE) {
             axl_error("driver set_load_options: tracking table full "
-                      "(%d slots) — increase LOAD_OPTIONS_TABLE_SIZE",
+                      "(%d slots) - increase LOAD_OPTIONS_TABLE_SIZE",
                       LOAD_OPTIONS_TABLE_SIZE);
             axl_free(copy);
             return AXL_ERR;
@@ -943,7 +943,7 @@ driver_try_candidates(
             axl_debug("  miss: %s", candidates[i]);
             continue;
         }
-        axl_debug("  hit:  %s — attempting load", candidates[i]);
+        axl_debug("  hit:  %s - attempting load", candidates[i]);
 
         AxlDriverHandle drv = NULL;
         if (axl_driver_load(candidates[i], &drv) != 0 || drv == NULL) {

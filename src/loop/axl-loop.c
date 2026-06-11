@@ -52,7 +52,7 @@ add_source(AxlLoop *loop, SourceType type, AxlEventHandle event,
 
     if (src == NULL) {
         if (loop->source_count >= AXL_MAX_SOURCES) {
-            axl_error("add_source: AXL_MAX_SOURCES (%d) exhausted — "
+            axl_error("add_source: AXL_MAX_SOURCES (%d) exhausted - "
                       "registration failed (type=%d). Bump the limit "
                       "or audit callers leaking sources.",
                       AXL_MAX_SOURCES, (int)type);
@@ -164,7 +164,7 @@ axl_loop_free(AxlLoop *loop)
             !loop->sources[i].owns_event) {
             leaked_external++;
             axl_error("axl_loop_free: caller-owned event source id=%u "
-                      "still active — tear down the resource "
+                      "still active - tear down the resource "
                       "(socket/tcp/custom event) BEFORE freeing the "
                       "loop it was registered against",
                       loop->sources[i].id);
@@ -176,7 +176,7 @@ axl_loop_free(AxlLoop *loop)
     }
     if (leaked_external > 0) {
         axl_error("axl_loop_free: %zu caller-owned event source(s) "
-                  "still active — free will proceed but consumers may "
+                  "still active - free will proceed but consumers may "
                   "crash on next use",
                   leaked_external);
     }
@@ -191,7 +191,7 @@ axl_loop_free(AxlLoop *loop)
        cancels the timer + closes + frees the bridge context. */
     if (loop->driver_timer != NULL) {
         axl_warning("axl_loop_free: detaching abandoned driver-mode "
-                    "timer — DriverUnload should call "
+                    "timer - DriverUnload should call "
                     "axl_loop_detach_driver before axl_loop_free");
         axl_backend_event_close(loop->driver_timer);
         loop->driver_timer = NULL;
@@ -659,7 +659,7 @@ driver_dispatch_notify(void *ctx)
         }
     }
     if (drained == AXL_MAX_SOURCES * 2) {
-        axl_warning("driver_dispatch_notify: hit drain cap (%d) — a "
+        axl_warning("driver_dispatch_notify: hit drain cap (%d) - a "
                     "source callback may be re-arming an always-signaled "
                     "event; check notify-budget guidance",
                     AXL_MAX_SOURCES * 2);
@@ -677,7 +677,7 @@ axl_loop_attach_driver(AxlLoop *loop, uint64_t interval_ms)
 
     if (loop->driver_timer != NULL) {
         axl_warning("axl_loop_attach_driver: loop already attached "
-                    "— call axl_loop_detach_driver first");
+                    "- call axl_loop_detach_driver first");
         return AXL_ERR;
     }
 

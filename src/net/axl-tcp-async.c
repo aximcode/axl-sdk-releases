@@ -641,7 +641,7 @@ axl_tcp_send_async(
     // assignment.
     //
     if (sock->send_source > 0) {
-        axl_error("async send: previous send still pending — cancel first");
+        axl_error("async send: previous send still pending - cancel first");
         return AXL_ERR;
     }
 

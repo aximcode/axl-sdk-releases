@@ -139,17 +139,17 @@ axl_service_attach_driver(
                      : AXL_SERVICE_DEFAULT_TICK_MS;
 
     const char *nm = svc->name != NULL ? svc->name : "(unnamed)";
-    axl_debug("service '%s': attach_driver tick=%llu ms — setup ENTER",
+    axl_debug("service '%s': attach_driver tick=%llu ms - setup ENTER",
               nm, (unsigned long long)tick_ms);
     int rc = svc->setup(loop, svc->user);
     axl_debug("service '%s': setup EXIT rc=%d", nm, rc);
     if (rc != AXL_OK) {
-        axl_warning("service '%s': setup returned %d — not attaching", nm, rc);
+        axl_warning("service '%s': setup returned %d - not attaching", nm, rc);
         return rc;
     }
 
     if (axl_loop_attach_driver(loop, tick_ms) != AXL_OK) {
-        axl_warning("service '%s': attach_driver failed — running teardown",
+        axl_warning("service '%s': attach_driver failed - running teardown",
                     nm);
         axl_service_teardown(svc);
         return AXL_ERR;
@@ -395,7 +395,7 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
     const AxlService *svc = deploy->service;
     AxlGuid           svc_guid;
     if (axl_service_guid(svc, &svc_guid) != AXL_OK) {
-        axl_warning("service: start_embedded — descriptor missing name");
+        axl_warning("service: start_embedded - descriptor missing name");
         return AXL_ERR;
     }
 
@@ -449,7 +449,7 @@ axl_service_stop(const AxlServiceDeploy *deploy)
     }
     AxlGuid svc_guid;
     if (axl_service_guid(deploy->service, &svc_guid) != AXL_OK) {
-        axl_warning("service: stop — descriptor missing name");
+        axl_warning("service: stop - descriptor missing name");
         return AXL_ERR;
     }
     const char *nm = deploy->service->name;
@@ -468,14 +468,14 @@ axl_service_stop(const AxlServiceDeploy *deploy)
     if (count == 0) {
         /* Already stopped (or never launched). Idempotent success —
            callers that care can axl_service_is_running first. */
-        axl_debug("service '%s': stop — already stopped", nm);
+        axl_debug("service '%s': stop - already stopped", nm);
         axl_free(handles);
         return AXL_OK;
     }
 
     int rc = AXL_OK;
     for (size_t i = 0; i < count; i++) {
-        axl_debug("service '%s': stop — unloading image handle %p",
+        axl_debug("service '%s': stop - unloading image handle %p",
                   nm, handles[i]);
         if (axl_driver_unload((AxlDriverHandle)handles[i]) != AXL_OK) {
             /* axl_driver_unload already logged the raw EFI_STATUS plus

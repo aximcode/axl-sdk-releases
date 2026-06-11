@@ -295,7 +295,7 @@ buffer_present_region(
        old target, not the screen.  Common cause: forgot to call
        axl_gfx_target_buffer(NULL) before present. */
     if (target_buf != NULL) {
-        axl_debug("buffer present called while target_buf != NULL — "
+        axl_debug("buffer present called while target_buf != NULL - "
                   "did you forget axl_gfx_target_buffer(NULL)?");
     }
 

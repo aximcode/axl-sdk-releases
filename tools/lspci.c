@@ -529,7 +529,7 @@ run_lspci(
     if (!opt_numeric && !g_ids_loaded
         && (opt_verbose >= 1 || opt_tree))
     {
-        axl_printf("\n(pci-ids.json5 not loaded — vendor/device names unavailable.\n");
+        axl_printf("\n(pci-ids.json5 not loaded - vendor/device names unavailable.\n");
         axl_printf(" Stage axl-sdk's curated set or convert pci.ids via\n");
         axl_printf(" scripts/pci-ids-to-json5.py and place next to lspci.efi.)\n");
     }

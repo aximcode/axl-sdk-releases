@@ -642,8 +642,8 @@ axl_input_probe_pointers(const char *log_path)
     bool any_evt  = (ap_evt > 0 || sp_evt > 0);
     bool any_poll = (ap_poll > 0 || sp_poll > 0);
     probe_emit(buf, sizeof buf, &len, "  -> %s\n",
-               any_evt  ? "EVENT-DRIVEN works (WaitForInput) — the efficient path"
-             : any_poll ? "event-driven DEAD; POLLING works — use a poll timer"
+               any_evt  ? "EVENT-DRIVEN works (WaitForInput) - the efficient path"
+             : any_poll ? "event-driven DEAD; POLLING works - use a poll timer"
                         : "no events seen (move during BOTH windows, then re-run)");
     probe_emit(buf, sizeof buf, &len, "=== end probe ===\n");
 

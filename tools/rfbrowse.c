@@ -171,7 +171,7 @@ print_redfish_error(
     // Flat fallback: {"message":"..."}
     char msg[256];
     if (axl_json_get_string(&ctx, "message", msg, sizeof(msg))) {
-        axl_printf("rfbrowse: HTTP %zu — %s\n", status_code, msg);
+        axl_printf("rfbrowse: HTTP %zu - %s\n", status_code, msg);
     } else {
         axl_printf("rfbrowse: HTTP %zu\n", status_code);
     }

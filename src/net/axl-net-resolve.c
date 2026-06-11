@@ -62,7 +62,7 @@ axl_net_resolve(const char *hostname, AxlIPv4Address *addr)
                     &handle_count,
                     &handles);
     if (EFI_ERROR(status) || handle_count == 0) {
-        axl_warning("no DNS4 service binding — cannot resolve '%s'", hostname);
+        axl_warning("no DNS4 service binding - cannot resolve '%s'", hostname);
         return AXL_ERR;
     }
 

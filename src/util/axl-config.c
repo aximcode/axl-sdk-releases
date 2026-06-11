@@ -269,7 +269,7 @@ axl_config_new(
                                axl_strdup(descs[i].default_value));
             if (auto_apply(target, &descs[i], descs[i].default_value) != 0) {
                 axl_warning("config: default '%s'='%s' out of range for "
-                            "declared type — ignored",
+                            "declared type - ignored",
                             descs[i].key, descs[i].default_value);
             }
         }
@@ -666,7 +666,7 @@ axl_config_target_to_string(
                 val = (*(const bool *)field) ? "true" : "false";
             } else {
                 axl_warning("config: target_to_string: '%s' BOOL has "
-                            "field_size %zu, expected %zu — skipping",
+                            "field_size %zu, expected %zu - skipping",
                             d->key, d->field_size, sizeof(bool));
             }
             break;
@@ -679,7 +679,7 @@ axl_config_target_to_string(
                 v = *(const int64_t *)field;
             } else {
                 axl_warning("config: target_to_string: '%s' INT has "
-                            "field_size %zu, expected 4 or 8 — skipping",
+                            "field_size %zu, expected 4 or 8 - skipping",
                             d->key, d->field_size);
                 continue;
             }
@@ -700,7 +700,7 @@ axl_config_target_to_string(
                 v = *(const uint64_t *)field;
             } else {
                 axl_warning("config: target_to_string: '%s' UINT has "
-                            "field_size %zu, expected 1/2/4/8 — skipping",
+                            "field_size %zu, expected 1/2/4/8 - skipping",
                             d->key, d->field_size);
                 continue;
             }
@@ -722,7 +722,7 @@ axl_config_target_to_string(
                    a pointer to cfg-interned storage, not a memcpy. */
                 axl_warning("config: target_to_string: '%s' STRING has "
                             "field_size %zu, expected %zu (sizeof(char*)) "
-                            "— declare the target field as `const char *`, "
+                            "- declare the target field as `const char *`, "
                             "not a char buffer; skipping",
                             d->key, d->field_size, sizeof(char *));
             }

@@ -126,7 +126,7 @@ dump_smbios(
     uint8_t *table_end = NULL;
     if (axl_smbios_table_range(&table_start, &table_end) != 0) {
         axl_printerr("mkfixture: SMBIOS table not found in EFI "
-                     "Configuration Table — skipping smbios.bin\n");
+                     "Configuration Table - skipping smbios.bin\n");
         return 0; /* not fatal; some bare aa64 firmware ships none */
     }
     size_t table_size = (size_t)(table_end - table_start);
@@ -317,7 +317,7 @@ fixture_finish(
     /* Bring up networking (driver load + link + DHCP) before POSTing,
        same as fetch.efi — the HTTP client needs a configured IP. */
     if (axl_net_init(AXL_NET_NIC_AUTO, 10) != AXL_OK) {
-        axl_printerr("mkfixture: networking did not come up (link/DHCP) — "
+        axl_printerr("mkfixture: networking did not come up (link/DHCP) - "
                      "cannot POST fixture\n");
         axl_free(gz);
         return -1;
@@ -681,7 +681,7 @@ dump_esrt(
     if (esrt == NULL) {
         /* Not an error — many firmwares (especially OVMF in QEMU) don't
            publish ESRT. Skip silently with a one-line note. */
-        axl_printf("  esrt.json        (skipped — no ESRT in config table)\n");
+        axl_printf("  esrt.json        (skipped - no ESRT in config table)\n");
         return 0;
     }
 
@@ -1596,7 +1596,7 @@ dump_nvme_controller(
     }
 
     if (nvme_identify(nvme, 0, 1 /* CNS=controller */, buf) != AXL_OK) {
-        axl_printf("  nvme/%zu.json     (skipped — Identify Controller failed)\n",
+        axl_printf("  nvme/%zu.json     (skipped - Identify Controller failed)\n",
                    index);
         axl_free(raw);
         return 0;  /* not fatal: a quirky controller, skip it */
@@ -1666,7 +1666,7 @@ dump_nvme(
     if (axl_protocol_enumerate("nvme-passthru", &handles, &count) != AXL_OK
         || count == 0) {
         axl_free(handles);
-        axl_printf("  nvme/            (skipped — no NVMe controllers)\n");
+        axl_printf("  nvme/            (skipped - no NVMe controllers)\n");
         return 0;
     }
 
@@ -1947,7 +1947,7 @@ AXL_TOOL_MAIN(mkfixture)
 {
     return axl_args_run(argc, argv, &(AxlArgsNode){
         .name        = "mkfixture",
-        .help        = "Capture a UEFI hardware fixture (HF2 — see "
+        .help        = "Capture a UEFI hardware fixture (HF2 - see "
                        "docs/AXL-Hardware-Fixture-Design.md)",
         .flags       = capture_flags,
         .positionals = fixture_dir_arg,

@@ -68,7 +68,7 @@ main(int argc, char *argv[])
 
     /* Title + subtitle (anti-aliased vector text). */
     centered(f, cx, 116, "AXL Graphics", 68.0f, AXL_GFX_WHITE);
-    centered(f, cx, 162, "live GOP framebuffer — rendered by axl_gfx, viewed over QEMU",
+    centered(f, cx, 162, "live GOP framebuffer - rendered by axl_gfx, viewed over QEMU",
              24.0f, AXL_GFX_RGB(0x96, 0xa2, 0xc6));
 
     /* Three gradient swatches with captions. */

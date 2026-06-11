@@ -304,7 +304,7 @@ axl_cpu_register_exception(
 
     EFI_CPU_ARCH_PROTOCOL *p = cpu_arch();
     if (p == NULL) {
-        axl_warning("EFI_CPU_ARCH_PROTOCOL not published — "
+        axl_warning("EFI_CPU_ARCH_PROTOCOL not published - "
                     "exception monitoring unavailable");
         return AXL_ERR;
     }

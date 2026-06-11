@@ -233,7 +233,7 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
 
         AxlSmbus *smbus = axl_smbus_new();
         if (smbus == NULL) {
-            axl_warning("SSIF: no SMBus controller — cannot reach BMC");
+            axl_warning("SSIF: no SMBus controller - cannot reach BMC");
             return -1;
         }
         int rc = axl_ipmi_ssif_open(ops, smbus, slave);
@@ -243,10 +243,10 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
         return rc;
     }
     case IPMI_SMBIOS_IFACE_BT:
-        axl_info("SMBIOS Type 38: BT interface — not supported");
+        axl_info("SMBIOS Type 38: BT interface - not supported");
         return -1;
     case IPMI_SMBIOS_IFACE_SMIC:
-        axl_info("SMBIOS Type 38: SMIC interface — not supported");
+        axl_info("SMBIOS Type 38: SMIC interface - not supported");
         return -1;
     default:
         axl_warning("SMBIOS Type 38: unknown interface type %u",

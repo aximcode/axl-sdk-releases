@@ -53,7 +53,7 @@ static const AxlArgDesc flags[] = {
               "(matches Linux `cat -v`)" },
     { .name = "raw",                              .type = AXL_ARG_BOOL,
       .help = "Write through axl_stdout_raw (binary-clean pipes; "
-              "no UTF-8→UCS-2 console conversion)" },
+              "no UTF-8->UCS-2 console conversion)" },
     { .name = "encoding",      .short_name = 'e', .type = AXL_ARG_STRING,
       .help = "Force input encoding: utf8 | ucs2le | ucs2be | ascii "
               "(default: BOM-probe each input)" },

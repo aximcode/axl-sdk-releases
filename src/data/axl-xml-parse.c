@@ -1043,7 +1043,7 @@ axl_xml_reader_next(AxlXmlReader *r, AxlXmlToken *out)
         if (r->pos >= r->len) {
             /* EOF. */
             if (r->depth > 0) {
-                set_error(r, "unexpected EOF — unclosed element(s)");
+                set_error(r, "unexpected EOF - unclosed element(s)");
                 return false;
             }
             if (!r->root_emitted) {

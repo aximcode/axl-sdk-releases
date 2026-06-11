@@ -249,9 +249,9 @@ do_show(
     if (g_jedec_load_rc == AXL_SIDECAR_OK) {
         axl_printf("\n(JEDEC table loaded)\n");
     } else if (g_jedec_load_rc == AXL_SIDECAR_PARSE_ERROR) {
-        axl_printf("\n(JEDEC sidecar present but failed to parse — fix and retry)\n");
+        axl_printf("\n(JEDEC sidecar present but failed to parse - fix and retry)\n");
     } else {
-        axl_printf("\n(JEDEC table not loaded — pass --jedec-file to resolve vendor codes)\n");
+        axl_printf("\n(JEDEC table not loaded - pass --jedec-file to resolve vendor codes)\n");
     }
     return 0;
 }
@@ -268,7 +268,7 @@ do_decode(
         axl_printf("Slot 0x%02X: raw read failed\n", addr);
         return 2;
     }
-    axl_printf("Slot 0x%02X — %zu bytes captured\n\n", addr, raw_len);
+    axl_printf("Slot 0x%02X - %zu bytes captured\n\n", addr, raw_len);
     axl_hexdump(NULL, raw, raw_len, 16, 1);
     axl_printf("\n");
 
@@ -297,7 +297,7 @@ scan_visit(
 {
     (void)user;
     AxlSmbusTransport tk = axl_smbus_transport(s);
-    axl_printf("[%zu] %s controller — byte 0 at SPD addresses:\n",
+    axl_printf("[%zu] %s controller - byte 0 at SPD addresses:\n",
                index, axl_smbus_transport_string(tk));
     int responses = 0;
     for (uint8_t addr = AXL_SPD_ADDR_FIRST; addr <= AXL_SPD_ADDR_LAST; addr++) {

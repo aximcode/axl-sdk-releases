@@ -91,6 +91,6 @@ operator delete[](void *p, size_t /*sz*/) noexcept
 extern "C" void
 __cxa_pure_virtual(void)
 {
-    axl_print("[axl-cxxabi] __cxa_pure_virtual called — aborting\r\n");
+    axl_print("[axl-cxxabi] __cxa_pure_virtual called - aborting\r\n");
     axl_exit(1);
 }

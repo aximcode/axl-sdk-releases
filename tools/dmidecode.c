@@ -444,7 +444,7 @@ decode_host_interface(AxlSmbiosHeader *hdr)
 {
     AxlSmbiosHostInterface h;
     if (axl_smbios_read_host_interface(hdr, &h) != AXL_OK) {
-        axl_printf("\t(pre-3.0 host interface layout — not decoded)\n");
+        axl_printf("\t(pre-3.0 host interface layout - not decoded)\n");
         return;
     }
     axl_printf("\tInterface Type: %s (0x%02X)\n",

@@ -293,7 +293,7 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
     size_t produced = 0;
     int r = conn->stream_fn(conn->stream_ctx, payload, pay_cap, &produced);
     if (r != AXL_OK) {
-        axl_warning("stream: producer returned ERR mid-response — abrupt close");
+        axl_warning("stream: producer returned ERR mid-response - abrupt close");
         end_stream_state(conn);
         reset_connection(conn);
         return AXL_SOURCE_REMOVE;
@@ -310,7 +310,7 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
                Content-Length header was already sent.) */
             if (conn->stream_remaining > 0) {
                 axl_warning("stream: producer EOF with %zu bytes "
-                            "remaining of declared Content-Length — "
+                            "remaining of declared Content-Length - "
                             "client will see a truncated body",
                             conn->stream_remaining);
             }
@@ -370,7 +370,7 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
             send_len = conn->stream_remaining;
             conn->stream_remaining = 0;
             axl_warning("stream: producer overshot declared "
-                        "Content-Length — truncating");
+                        "Content-Length - truncating");
         }
     }
 
@@ -381,7 +381,7 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
                                 conn->server->loop, NULL,
                                 on_response_sent, conn);
     if (rc != AXL_OK) {
-        axl_warning("stream: send_async submit failed — abrupt close");
+        axl_warning("stream: send_async submit failed - abrupt close");
         end_stream_state(conn);
         reset_connection(conn);
     }
@@ -447,7 +447,7 @@ send_response(
        completes — but free-then-overwrite keeps the invariant
        trivially correct. */
     if (conn->tx_buf != NULL) {
-        axl_warning("send_response: stale tx_buf on conn — freeing");
+        axl_warning("send_response: stale tx_buf on conn - freeing");
         axl_free(conn->tx_buf);
         conn->tx_buf = NULL;
     }
@@ -522,7 +522,7 @@ send_response(
 
     void *combined = axl_malloc(total);
     if (combined == NULL) {
-        axl_error("send_response: alloc(%zu) failed — abrupt close", total);
+        axl_error("send_response: alloc(%zu) failed - abrupt close", total);
         reset_connection(conn);
         return;
     }
@@ -549,7 +549,7 @@ send_response(
     }
 
     if (rc != AXL_OK) {
-        axl_warning("send_response: submit failed — abrupt close");
+        axl_warning("send_response: submit failed - abrupt close");
         axl_free(conn->tx_buf);
         conn->tx_buf = NULL;
         reset_connection(conn);

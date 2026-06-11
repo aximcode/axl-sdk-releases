@@ -39,7 +39,7 @@ typedef struct {
 static const MemFile g_files[] = {
     { "hello.txt",  "Hello from memfs.efi!\n" },
     { "readme.md",  "# memfs\n\nA demo of <axl/axl-fs-provider.h>.\n" },
-    { "résumé.txt", "Non-ASCII filename test (UCS-2/UTF-8 boundary).\n" },
+    { "résumé.txt", "Non-ASCII filename test (UCS-2/UTF-8 boundary).\n" }, // ascii-allow: UCS-2/UTF-8 filename fixture
     { NULL, NULL }
 };
 
