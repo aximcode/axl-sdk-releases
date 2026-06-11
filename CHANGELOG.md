@@ -3,6 +3,24 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.7.1 — 2026-06-10
+
+### Fixed
+
+- **`axl_set_exit_status` now works under `--minimal-runtime`** — the v1.7.0
+  exit-status feature patched only the standard CRT0
+  (`axl-crt0-native.c`); the minimal entry point (`axl-crt0-minimal.c`,
+  linked by `axl-cc --minimal-runtime`) still collapsed `main`'s return to
+  `EFI_SUCCESS` / `EFI_ABORTED`, so a minimal-runtime tool that armed a status
+  and returned from `main` got `0x15` instead of the armed value. This is
+  exactly the thin-launcher case the feature's split-image note describes.
+  The minimal CRT0's return path now resolves through the same
+  `axl_backend_resolve_exit_status`, symmetric to the native one (it does NOT
+  route through `axl_exit`, which is unsound under the minimal runtime — no
+  `_axl_init`, so the cleanup registries are absent). `test-exit-status-qemu.sh`
+  now builds and asserts a `--minimal-runtime` selftest alongside the
+  full-runtime one (the gap that let this regress).
+
 ## 1.7.0 — 2026-06-10
 
 ### Added

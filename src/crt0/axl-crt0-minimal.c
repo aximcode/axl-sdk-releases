@@ -55,6 +55,14 @@ void _axl_args_free(void);
 
 void axl_stream_init(void);
 
+/* Resolve the exit status for a main() return code: a pending
+ * axl_set_exit_status wins verbatim, else rc maps 0 -> EFI_SUCCESS /
+ * nonzero -> EFI_ABORTED. Defined in the backend (libaxl.a); UINTN-width.
+ * The minimal CRT0 returns from main rather than calling axl_exit (which is
+ * unsound here — _axl_init never ran, so the cleanup registries are absent),
+ * so the armed status must be honored on THIS return path. */
+unsigned long long axl_backend_resolve_exit_status(int rc);
+
 #ifdef AXL_MEM_DEBUG
 void axl_mem_dump_leaks(void);
 #endif
@@ -86,5 +94,8 @@ _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     axl_mem_dump_leaks();
 #endif
 
-    return (rc == 0) ? EFI_SUCCESS : EFI_ABORTED;
+    /* A pending axl_set_exit_status (if any) overrides the rc->status map, so
+     * a `return N` from a minimal-runtime main yields an exact EFI_STATUS —
+     * symmetric to axl-crt0-native.c. */
+    return (EFI_STATUS)axl_backend_resolve_exit_status(rc);
 }

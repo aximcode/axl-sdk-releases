@@ -8,6 +8,15 @@
 #   make clean
 
 ARCH       ?= x64
+# Guard: only x64 / aa64 are valid. The toolchain block below is `ifeq aa64 ...
+# else <x64>`, so any other value (a typo, or run-qemu's uppercase ARCH=X64
+# passed straight to make) silently builds with the x64 toolchain into
+# out/native-<wrong>/ and links against absent libs. That masked a
+# clean-CI-only break behind a passing local run (the .efi already existed).
+# Fail loudly and consistently instead.
+ifeq ($(filter $(ARCH),x64 aa64),)
+  $(error invalid ARCH '$(ARCH)' -- must be 'x64' or 'aa64')
+endif
 PREFIX     ?= out/native-$(ARCH)
 TYPE       ?= app
 BUILD      ?= DEBUG
@@ -136,6 +145,16 @@ PE_SET_DEBUG = $(BUILDDIR)/pe-set-debug
 define LINK_EFI_APP
 	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
 	    -o $(2:.efi=.so) $(LINK_CRT0) $(1) $(PREFIX)/lib/libaxl.a
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
+	$(PE_SET_DEBUG) $(2)
+endef
+
+# Like LINK_EFI_APP but links the minimal CRT0 (axl-cc --minimal-runtime):
+# skips _axl_init (registry/atexit/signal). Used to test the minimal entry
+# point's exit-status return path.
+define LINK_EFI_APP_MINIMAL
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	    -o $(2:.efi=.so) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_MINIMAL_OBJ) $(1) $(PREFIX)/lib/libaxl.a
 	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(2:.efi=.so) $(2)
 	$(PE_SET_DEBUG) $(2)
 endef
@@ -526,7 +545,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -836,6 +855,15 @@ $(PREFIX)/exit-status-selftest.efi: $(BUILDDIR)/exit-status-selftest.o $(CRT0_OB
 
 $(BUILDDIR)/exit-status-selftest.o: test/integration/exit-status-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Same source, linked against the MINIMAL CRT0 (--minimal-runtime): the
+# thin-launcher case where main returns rather than calling axl_exit, so the
+# armed exit status must be honored on the return path.
+exit-status-selftest-minimal: $(PREFIX)/exit-status-selftest-minimal.efi
+	@echo "  Built: $(PREFIX)/exit-status-selftest-minimal.efi"
+
+$(PREFIX)/exit-status-selftest-minimal.efi: $(BUILDDIR)/exit-status-selftest.o $(CRT0_MINIMAL_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP_MINIMAL,$(BUILDDIR)/exit-status-selftest.o,$@)
 
 # ===================================================================
 # Build compositor-selftest.efi — AxlCompositor end-to-end present test.
