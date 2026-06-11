@@ -17,6 +17,10 @@
 #include <axl/axl-signal.h>
 #include <axl/axl-task.h>
 
+/* Internal backend header (test build passes -Isrc/backend): the exit-status
+ * resolver + disarm are internal, not public API. */
+#include "axl-backend.h"
+
 // ---------------------------------------------------------------------------
 // atexit: LIFO ordering
 // ---------------------------------------------------------------------------
@@ -206,6 +210,49 @@ test_signal_install_accepts_handler_and_null(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_set_exit_status: arm a verbatim EFI_STATUS that both exit paths (CRT0
+// return + axl_exit) honor. We can't actually gBS->Exit in-process, so test
+// the shared resolver the CRT0 + boot_exit paths both call. The end-to-end
+// %lasterror% passthrough is covered by test-exit-status-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static void
+test_exit_status_resolver(void)
+{
+    /* Unarmed: the legacy rc -> EFI_STATUS map (unchanged behavior). */
+    test_check(axl_backend_resolve_exit_status(0) == (uint64_t)AXL_EFI_SUCCESS,
+               "exit-status: unarmed rc 0 -> EFI_SUCCESS");
+    test_check(axl_backend_resolve_exit_status(1) == (uint64_t)AXL_EFI_ABORTED,
+               "exit-status: unarmed rc nonzero -> EFI_ABORTED");
+
+    /* Armed: a verbatim status wins for ANY rc — including a non-error-class
+       code (top bit clear), which the old path could never produce. */
+    axl_set_exit_status(0x34);
+    test_check(axl_backend_resolve_exit_status(0) == 0x34,
+               "exit-status: armed 0x34 returned verbatim for rc 0");
+    test_check(axl_backend_resolve_exit_status(1) == 0x34,
+               "exit-status: armed 0x34 overrides nonzero rc (not EFI_ABORTED)");
+    test_check(!AXL_EFI_ERROR(0x34),
+               "exit-status: 0x34 is non-error-class (top bit clear)");
+
+    /* An armed AXL_EFI_SUCCESS forces success even after a nonzero rc. */
+    axl_set_exit_status(AXL_EFI_SUCCESS);
+    test_check(axl_backend_resolve_exit_status(7) == (uint64_t)AXL_EFI_SUCCESS,
+               "exit-status: armed AXL_EFI_SUCCESS forces success over rc 7");
+
+    /* Error-class values pass through verbatim too. */
+    axl_set_exit_status(AXL_EFI_ACCESS_DENIED);
+    test_check(axl_backend_resolve_exit_status(0) == (uint64_t)AXL_EFI_ACCESS_DENIED,
+               "exit-status: armed error-class status returned verbatim");
+
+    /* CRITICAL: disarm so the pending status can't leak into THIS test
+       binary's own exit (CRT0 resolves it on return). */
+    axl_backend_clear_exit_status();
+    test_check(axl_backend_resolve_exit_status(1) == (uint64_t)AXL_EFI_ABORTED,
+               "exit-status: clear() disarms; legacy map restored");
+}
+
+// ---------------------------------------------------------------------------
 // axl_app_argv0 — runtime accessor for the captured invocation path
 // ---------------------------------------------------------------------------
 
@@ -326,6 +373,7 @@ test_runtime_main(
     test_interrupted_is_false_at_startup();
 
     test_signal_install_accepts_handler_and_null();
+    test_exit_status_resolver();
 
     test_app_argv0_is_stable();
     test_app_image_path_is_canonical();

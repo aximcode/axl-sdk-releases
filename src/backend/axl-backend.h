@@ -774,15 +774,48 @@ axl_backend_shell_break_event(
 /**
  * @brief Terminate the current image via gBS->Exit. Does not return.
  *
- * Convention: rc == 0 -> EFI_SUCCESS; any other value -> EFI_ABORTED.
- * The caller is expected to have already run _axl_cleanup; this
- * helper only bridges into the firmware exit service.
+ * Exit status is resolved by axl_backend_resolve_exit_status(rc): a pending
+ * axl_set_exit_status wins verbatim, else rc maps 0 -> EFI_SUCCESS / nonzero
+ * -> EFI_ABORTED. The caller is expected to have already run _axl_cleanup;
+ * this helper only bridges into the firmware exit service.
  */
 __attribute__((noreturn))
 void
 axl_backend_boot_exit(
     int rc
     );
+
+/**
+ * @brief Stash a pending verbatim exit status for this image (set by the
+ *     public axl_set_exit_status). Honored by both exit paths.
+ */
+void
+axl_backend_set_exit_status(
+    uint64_t status   ///< exact EFI_STATUS (UINTN-width) to exit with
+    );
+
+/**
+ * @brief Resolve the EFI_STATUS this image should exit with for @p rc.
+ *
+ * Returns the pending status set by axl_backend_set_exit_status if one is
+ * armed, else the legacy map (rc == 0 -> EFI_SUCCESS / nonzero -> EFI_ABORTED).
+ * Used by BOTH the CRT0 return path and axl_backend_boot_exit so the two
+ * agree. Returned as a UINTN-width integer (the caller, which has UEFI types,
+ * uses it as EFI_STATUS).
+ */
+uint64_t
+axl_backend_resolve_exit_status(
+    int rc
+    );
+
+/**
+ * @brief Disarm any pending exit status (internal / test isolation).
+ *
+ * Not public API. The unit test calls it after exercising the setter so a
+ * pending status can't leak into the test binary's own exit code.
+ */
+void
+axl_backend_clear_exit_status(void);
 
 // ===================================================================
 // MP Services (used by axl-task-pool.c)

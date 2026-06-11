@@ -526,7 +526,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -824,6 +824,17 @@ $(PREFIX)/cursor-selftest.efi: $(BUILDDIR)/cursor-selftest.o $(CRT0_OBJ) $(PREFI
 	$(call LINK_EFI_APP,$(BUILDDIR)/cursor-selftest.o,$@)
 
 $(BUILDDIR)/cursor-selftest.o: test/integration/cursor-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build exit-status-selftest.efi — arms an exact EFI_STATUS then returns
+# nonzero; test-exit-status-qemu.sh asserts the shell's %lasterror%.
+exit-status-selftest: $(PREFIX)/exit-status-selftest.efi
+	@echo "  Built: $(PREFIX)/exit-status-selftest.efi"
+
+$(PREFIX)/exit-status-selftest.efi: $(BUILDDIR)/exit-status-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/exit-status-selftest.o,$@)
+
+$(BUILDDIR)/exit-status-selftest.o: test/integration/exit-status-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

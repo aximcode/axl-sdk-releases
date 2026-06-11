@@ -5085,6 +5085,114 @@ test_args_case_insensitive(void)
     }
 }
 
+/* Opt-in compact DOS/legacy flag syntax (AxlArgsNode.compact_flags on the
+   root): colon values (-x:v, --name:v), attached short values (-xv, /xv), and
+   a `/` short-flag prefix (/x, /x:v). Flag VALUES keep their case. */
+static int
+args_compact_leaf(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_string = axl_args_get_string(a, "config");   /* -c */
+    cap->pos0        = axl_args_get_string(a, "out");       /* -o */
+    cap->seen_bool   = axl_args_get_bool(a, "verbose");     /* -v */
+    return 0;
+}
+static const AxlArgDesc args_compact_desc[] = {
+    { .name = "config",  .short_name = 'c', .type = AXL_ARG_STRING, .help = "cfg" },
+    { .name = "out",     .short_name = 'o', .type = AXL_ARG_STRING, .help = "out" },
+    { .name = "verbose", .short_name = 'v', .type = AXL_ARG_BOOL,   .help = "v" },
+    {0}
+};
+static int
+run_compact(ArgsCapture *cap, bool compact, int argc, char **argv)
+{
+    AxlArgsNode app = {
+        .name = "prog", .flags = args_compact_desc,
+        .handler = args_compact_leaf, .compact_flags = compact,
+        .user_data = cap,
+    };
+    return axl_args_run(argc, argv, &app);
+}
+
+static void
+test_args_compact_flags(void)
+{
+    /* compact_flags=true: every form yields config="<v>", value case kept. */
+    struct { const char *tok; const char *want; } forms[] = {
+        { "-c:yn",        "yn" },        /* short + colon            */
+        { "-cyn",         "yn" },        /* short + attached         */
+        { "/c:zz",        "zz" },        /* slash + colon            */
+        { "/czz",         "zz" },        /* slash + attached (/sVar) */
+        { "--config:val", "val" },       /* long + colon             */
+        { "-c:File.TXT",  "File.TXT" },  /* value keeps its case     */
+        { "-c:",          "" },          /* empty attached value     */
+    };
+    for (size_t k = 0; k < sizeof(forms) / sizeof(forms[0]); k++) {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"prog", (char *)forms[k].tok };
+        int rc = run_compact(&cap, true, 2, argv);
+        test_check(rc == 0 && cap.calls == 1 && cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, forms[k].want) == 0,
+                   "args compact: flag form parses with the right value");
+    }
+
+    /* -o:File.txt sets a second flag; /v is the bare short bool. */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"prog", (char *)"-o:File.txt", (char *)"/v" };
+        int rc = run_compact(&cap, true, 3, argv);
+        test_check(rc == 0 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "File.txt") == 0 && cap.seen_bool,
+                   "args compact: -o:File.txt + /v parse together");
+    }
+
+    /* Long `--name=value` splits on '=' even when ':' also appears in the
+       value (first separator wins; ':' inside the value is preserved). */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"prog", (char *)"--out=fs0:\\path:x" };
+        int rc = run_compact(&cap, true, 2, argv);
+        test_check(rc == 0 && cap.pos0 != NULL
+                   && axl_strcmp(cap.pos0, "fs0:\\path:x") == 0,
+                   "args compact: --out=value splits on '=' with ':' in value");
+    }
+
+    /* Default (compact_flags=false): the compact forms are REJECTED (opt-in).
+       `-c:yn` is a short-cluster error; `/czz` is a stray positional. */
+    {
+        ArgsCapture cap = { 0 };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        char *argv[] = { (char *)"prog", (char *)"-c:yn" };
+        int rc = run_compact(&cap, false, 2, argv);
+        restore_stdout(saved, buf);
+        test_check(rc != 0 && cap.calls == 0,
+                   "args strict: -c:yn rejected when compact_flags off");
+    }
+    {
+        ArgsCapture cap = { 0 };
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        char *argv[] = { (char *)"prog", (char *)"/czz" };
+        int rc = run_compact(&cap, false, 2, argv);
+        restore_stdout(saved, buf);
+        test_check(rc == 0 && cap.seen_string == NULL,
+                   "args strict: /czz is a positional (not -c) when off");
+    }
+
+    /* Default grammar is unaffected by the new field (regression guard). */
+    {
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"prog", (char *)"--config", (char *)"ok",
+                         (char *)"-v" };
+        int rc = run_compact(&cap, false, 4, argv);
+        test_check(rc == 0 && cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, "ok") == 0 && cap.seen_bool,
+                   "args strict: default grammar still parses (--config ok -v)");
+    }
+}
+
 /* Swap axl_stdout for an in-memory buffer so a test can assert on
    what the parser printed. Caller pairs with restore_stdout() in the
    same scope. Returns the saved original to restore. */
@@ -5713,6 +5821,7 @@ test_args(void)
     test_args_nested_parent_flag_visible_at_leaf();
     test_args_nested_3level_dispatch();
     test_args_case_insensitive();
+    test_args_compact_flags();
     test_args_nested_unknown_verb_at_branch();
     test_args_nested_branch_help_lists_subverbs();
     test_args_nested_misconfigured_node_rejected();

@@ -64,6 +64,21 @@ axl_exit(int rc)
     axl_backend_boot_exit(rc);
 }
 
+void
+axl_set_exit_status(AxlEfiStatus status)
+{
+    axl_backend_set_exit_status((uint64_t)status);
+}
+
+AXL_NORETURN void
+axl_exit_status(AxlEfiStatus status)
+{
+    axl_set_exit_status(status);
+    /* rc is ignored once a status is armed — boot_exit resolves to the
+     * verbatim status. */
+    axl_exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Internal hooks called by axl-loop.c / axl-runtime.c
 // ---------------------------------------------------------------------------

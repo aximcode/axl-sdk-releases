@@ -20,6 +20,11 @@ void _axl_init(void *image_handle, void *system_table);
 void _axl_get_args(int *argc, char ***argv);
 void _axl_cleanup(void);
 
+/* Resolve the exit status for a main() return code: a pending
+ * axl_set_exit_status wins verbatim, else rc maps 0 -> EFI_SUCCESS /
+ * nonzero -> EFI_ABORTED. Defined in the backend (libaxl.a); UINTN-width. */
+unsigned long long axl_backend_resolve_exit_status(int rc);
+
 /* User's application entry point */
 int main(int argc, char **argv);
 
@@ -41,5 +46,7 @@ _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     int rc = main(argc, argv);
 
     _axl_cleanup();
-    return (rc == 0) ? EFI_SUCCESS : EFI_ABORTED;
+    /* A pending axl_set_exit_status (if any) overrides the rc->status map,
+     * so a `return N` from main can yield an exact, verbatim EFI_STATUS. */
+    return (EFI_STATUS)axl_backend_resolve_exit_status(rc);
 }

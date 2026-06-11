@@ -352,6 +352,23 @@ struct AxlArgsNode {
     /// its own `choices_case_insensitive`. Node names display in their DECLARED
     /// case in `--help`; only the match is case-folded.
     bool                  case_insensitive;
+
+    /// When true ON THE ROOT NODE, the flag tokenizer also accepts a compact,
+    /// DOS / legacy-CLI option style tree-wide — for porting a CLI whose
+    /// scripts use colon and slash flags without hand-rolling a pre-stripper.
+    /// Opt-in; default false = strict GNU-style parsing (unchanged). Adds:
+    ///   - a colon value separator: `--name:value` (like `--name=value`) and
+    ///     `-x:value` (short flag + value);
+    ///   - an attached short value: `-xvalue` / `/xvalue` (== `-x value`);
+    ///   - a `/` flag prefix for single-char SHORT flags (DOS style): `/x`,
+    ///     `/x:value`, `/xvalue` — e.g. `/s`, `/sVarName`.
+    /// The default grammar (`--name=value`, `-x value`, `-x`) still works.
+    /// `/` introduces a SHORT flag only — there is no long `/name` form; use
+    /// `-` / `--` for long names. Flag *values* keep their case regardless.
+    /// NOTE: with this on, a token starting with `/` is parsed as a flag, so
+    /// don't enable it for a tool whose positionals begin with `/`. Like
+    /// `case_insensitive`, only the ROOT node's flag is consulted.
+    bool                  compact_flags;
 };
 
 // ---------------------------------------------------------------------------

@@ -1427,11 +1427,39 @@ axl_backend_event_signal(
 // App termination
 // ===================================================================
 
+// Pending verbatim exit status (armed by axl_set_exit_status). Per-image:
+// these live in this image's libaxl instance, alongside gImageHandle, so the
+// status applies to whichever image's CRT0 / axl_exit reads them.
+static bool       g_exit_status_armed = false;
+static EFI_STATUS g_exit_status       = EFI_SUCCESS;
+
+void
+axl_backend_set_exit_status(uint64_t status)
+{
+    g_exit_status       = (EFI_STATUS)status;
+    g_exit_status_armed = true;
+}
+
+void
+axl_backend_clear_exit_status(void)
+{
+    g_exit_status_armed = false;
+    g_exit_status       = EFI_SUCCESS;
+}
+
+uint64_t
+axl_backend_resolve_exit_status(int rc)
+{
+    if (g_exit_status_armed) {
+        return (uint64_t)g_exit_status;            // verbatim, including success
+    }
+    return (uint64_t)((rc == 0) ? EFI_SUCCESS : EFI_ABORTED);
+}
+
 void
 axl_backend_boot_exit(int rc)
 {
-    /* Map C-style rc to an EFI_STATUS the firmware can use. */
-    EFI_STATUS status = (rc == 0) ? EFI_SUCCESS : EFI_ABORTED;
+    EFI_STATUS status = (EFI_STATUS)axl_backend_resolve_exit_status(rc);
     gBS->Exit(gImageHandle, status, 0, NULL);
 
     /* gBS->Exit is specified as NORETURN for the image's own handle;

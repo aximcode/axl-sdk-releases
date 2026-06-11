@@ -121,6 +121,16 @@ args_root_case_insensitive(const AxlArgs *a)
     return a->node->case_insensitive;
 }
 
+// Compact DOS/legacy flag syntax is enabled tree-wide iff the ROOT opted in.
+static bool
+args_root_compact_flags(const AxlArgs *a)
+{
+    while (a->parent != NULL) {
+        a = a->parent;
+    }
+    return a->node->compact_flags;
+}
+
 static bool
 node_is_leaf(const AxlArgsNode *node)
 {
@@ -781,8 +791,14 @@ consume_positional(AxlArgs *a, const char *value)
    end-of-options marker is handled by the caller, before this
    check. */
 static bool
-token_is_flag(const char *arg)
+token_is_flag(const char *arg, bool compact)
 {
+    // Compact mode (opt-in): a `/`-prefixed token is a DOS-style short flag
+    // (`/s`, `/sVar`). A leading `/` is otherwise a positional, so this only
+    // diverts tokens for a tool that opted in (and has no `/`-path positionals).
+    if (compact && arg[0] == '/' && arg[1] != '\0') {
+        return true;
+    }
     if (arg[0] != '-' || arg[1] == '\0') {
         return false;
     }
@@ -796,21 +812,22 @@ token_is_flag(const char *arg)
 }
 
 static int
-parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
+parse_flag_token(AxlArgs *a, int i, int argc, char **argv, bool compact)
 {
     const char *arg = argv[i];
 
-    /* Long form. */
+    /* Long form (`--name`, `--name=value`, and with compact `--name:value`).
+       `/` never introduces a long flag — it's short-only (DOS style). */
     if (arg[0] == '-' && arg[1] == '-') {
         const char *key = arg + 2;
-        const char *eq  = NULL;
+        const char *sep = NULL;
         for (const char *p = key; *p != '\0'; p++) {
-            if (*p == '=') {
-                eq = p;
+            if (*p == '=' || (compact && *p == ':')) {   /* first sep wins */
+                sep = p;
                 break;
             }
         }
-        size_t key_len = (eq != NULL) ? (size_t)(eq - key) : axl_strlen(key);
+        size_t key_len = (sep != NULL) ? (size_t)(sep - key) : axl_strlen(key);
         ParsedArg *slot = slot_by_long(a, key, key_len);
         if (slot == NULL) {
             axl_print("%s: unknown flag --%.*s\n",
@@ -819,10 +836,10 @@ parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
         }
         const char *value = NULL;
         if (slot->desc->type == AXL_ARG_BOOL) {
-            value = (eq != NULL) ? (eq + 1) : "true";
+            value = (sep != NULL) ? (sep + 1) : "true";
         } else {
-            if (eq != NULL) {
-                value = eq + 1;
+            if (sep != NULL) {
+                value = sep + 1;
             } else if (i + 1 < argc) {
                 value = argv[i + 1];
             } else {
@@ -833,16 +850,23 @@ parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
         if (!parse_typed(slot, value, a->path)) {
             return -1;
         }
-        return (slot->desc->type == AXL_ARG_BOOL || eq != NULL) ? 1 : 2;
+        return (slot->desc->type == AXL_ARG_BOOL || sep != NULL) ? 1 : 2;
     }
 
-    /* Short form: -f or -f value. */
-    char shortc = arg[1];
+    /* Short form: prefix is arg[0] ('-' or, in compact mode, '/'); the flag
+       char is arg[1]. Default grammar: `-f` / `-f value`. With compact, an
+       attached value is allowed (`-fvalue`, `/fvalue`) with an optional `:`
+       separator (`-f:value`, `/f:value`). */
+    char        shortc   = arg[1];
+    const char *attached = NULL;          /* in-token value, or NULL */
     if (arg[2] != '\0') {
-        axl_print("%s: compact short-flag groups (-%c%c...) "
-                  "are not supported; use -%c -%c instead\n",
-                  a->path, shortc, arg[2], shortc, arg[2]);
-        return -1;
+        if (!compact) {
+            axl_print("%s: compact short-flag groups (-%c%c...) "
+                      "are not supported; use -%c -%c instead\n",
+                      a->path, shortc, arg[2], shortc, arg[2]);
+            return -1;
+        }
+        attached = (arg[2] == ':') ? arg + 3 : arg + 2;   /* -f:val or -fval */
     }
     ParsedArg *slot = slot_by_short(a, shortc);
     if (slot == NULL) {
@@ -850,7 +874,14 @@ parse_flag_token(AxlArgs *a, int i, int argc, char **argv)
         return -1;
     }
     if (slot->desc->type == AXL_ARG_BOOL) {
-        if (!parse_typed(slot, "true", a->path)) {
+        /* Bare bool -> "true"; `-v:false` / `-vfalse` -> the attached value. */
+        if (!parse_typed(slot, attached != NULL ? attached : "true", a->path)) {
+            return -1;
+        }
+        return 1;
+    }
+    if (attached != NULL) {
+        if (!parse_typed(slot, attached, a->path)) {
             return -1;
         }
         return 1;
@@ -1004,8 +1035,9 @@ args_run_internal(int argc, char **argv,
                 i++;
                 continue;
             }
-            if (token_is_flag(arg)) {
-                int consumed = parse_flag_token(a, i, argc, argv);
+            bool compact = args_root_compact_flags(a);
+            if (token_is_flag(arg, compact)) {
+                int consumed = parse_flag_token(a, i, argc, argv, compact);
                 if (consumed < 0) {
                     parse_error = true;
                     rc = 1;

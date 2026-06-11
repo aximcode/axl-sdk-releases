@@ -48,6 +48,7 @@
 #include <stdbool.h>
 
 #include <axl/axl-macros.h>
+#include <axl/axl-efi-status.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -102,9 +103,47 @@ axl_interrupted(void);
  * path, bypasses cleanup and leaks firmware resources; don't.
  *
  * Convention: rc == 0 -> EFI_SUCCESS, any other value -> EFI_ABORTED.
+ * To exit with a different, exact status, see axl_set_exit_status /
+ * axl_exit_status below.
  */
 AXL_NORETURN void
 axl_exit(int rc);
+
+/**
+ * @brief Set the EXACT status this image exits with, overriding the
+ *     `rc == 0 -> EFI_SUCCESS / nonzero -> EFI_ABORTED` convention.
+ *
+ * Once set, @p status is passed VERBATIM to the firmware (`gBS->Exit`) by
+ * BOTH of this image's exit paths — a normal `return` from `main` (via CRT0)
+ * and `axl_exit()` — including non-error-class codes (top bit clear, e.g.
+ * `0x34`). Cleanup is unaffected: atexit + the tier-1 resource sweep still
+ * run. The last call wins; pass `AXL_EFI_SUCCESS` to force a success exit even
+ * after a nonzero `main` return. Build error-class values with the
+ * `<axl/axl-efi-status.h>` helpers (`AXL_EFI_ENC_(n)`, `AXL_EFI_ABORTED`, …).
+ *
+ * @note Sets a process-global in the CALLING image's libaxl instance, honored
+ *     only by THAT image's exit. Under a thin-launcher + resident-driver split
+ *     (each image links its own libaxl), call this in the image whose
+ *     `main`/CRT0 returns to the firmware — the launcher — or plumb the value
+ *     back across your protocol and set it there. A call from the resident
+ *     driver sets the DRIVER's status, which the launcher's CRT0 never reads.
+ */
+void
+axl_set_exit_status(
+    AxlEfiStatus status   ///< exact EFI_STATUS to exit with (verbatim)
+);
+
+/**
+ * @brief Exit this image NOW with @p status verbatim, running cleanup.
+ *
+ * Equivalent to axl_set_exit_status(@p status) immediately followed by the
+ * blessed exit path (atexit LIFO + tier-1 sweep, then `gBS->Exit`). Does not
+ * return. The same split-image note as axl_set_exit_status applies.
+ */
+AXL_NORETURN void
+axl_exit_status(
+    AxlEfiStatus status   ///< exact EFI_STATUS to exit with (verbatim)
+);
 
 #ifdef __cplusplus
 }

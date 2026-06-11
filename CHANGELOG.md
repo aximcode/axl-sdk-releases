@@ -3,6 +3,34 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.7.0 — 2026-06-10
+
+### Added
+
+- **Exit with an arbitrary `EFI_STATUS`** (`<axl/axl-signal.h>`) —
+  `axl_set_exit_status(AxlEfiStatus)` and `AXL_NORETURN
+  axl_exit_status(AxlEfiStatus)`. The runtime otherwise collapses every
+  nonzero `main` return / `axl_exit(int)` to `EFI_ABORTED` (0x15); these let
+  a tool exit with a caller-chosen, **verbatim** status — including
+  non-error-class codes (top bit clear, e.g. `0x34`) — so the UEFI shell's
+  `%lasterror%` reflects the exact value (the `do err <N>` parity case). Both
+  exit paths honor it (a normal `return` from `main` via CRT0, and
+  `axl_exit`), and **cleanup is preserved** (atexit LIFO + tier-1 resource
+  sweep still run). The pending status is per-image (set in the calling
+  image's libaxl instance) — under a thin-launcher + resident-driver split,
+  call it in the image whose `main`/CRT0 returns to the firmware, or plumb
+  the value back; the docstring spells this out.
+- **Opt-in compact flag syntax** (`<axl/axl-args.h>`) — a new
+  `bool compact_flags` field on `AxlArgsNode`. Set on the root, the flag
+  tokenizer additionally accepts a DOS / legacy-CLI option style tree-wide:
+  a colon value separator (`--name:value`, `-x:value`), an attached short
+  value (`-xvalue`, `/xvalue`), and a `/` short-flag prefix (`/x`, `/x:value`,
+  `/sVarName`) — so a tool porting a legacy CLI can drop its hand-rolled
+  pre-stripper. Opt-in; default false = strict GNU-style parsing (unchanged).
+  `/` introduces a single-char short flag only (no long `/name`); flag values
+  keep their case. Only the root node's flag is consulted (like
+  `case_insensitive`).
+
 ## 1.6.0 — 2026-06-10
 
 ### Added
