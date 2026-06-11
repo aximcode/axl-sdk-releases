@@ -92,17 +92,33 @@ desc_count(const AxlArgDesc *list)
 }
 
 static const AxlArgsNode *
-find_verb(const AxlArgsNode *node, const char *name)
+find_verb(const AxlArgsNode *node, const char *name, bool ci)
 {
     if (node->verbs == NULL || name == NULL) {
         return NULL;
     }
     for (int i = 0; node->verbs[i].name != NULL; i++) {
-        if (axl_strcmp(node->verbs[i].name, name) == 0) {
+        // ci (set on the ROOT node) folds case for the verb-name match only;
+        // positional / flag values are matched elsewhere and keep their case.
+        int cmp = ci ? axl_strcasecmp(node->verbs[i].name, name)
+                     : axl_strcmp(node->verbs[i].name, name);
+        if (cmp == 0) {
             return &node->verbs[i];
         }
     }
     return NULL;
+}
+
+// Verb-name matching is case-insensitive tree-wide iff the ROOT node opted in.
+// The root AxlArgs has parent == NULL; walk up to read its node's flag, so a
+// nested level matches with the same policy as the top.
+static bool
+args_root_case_insensitive(const AxlArgs *a)
+{
+    while (a->parent != NULL) {
+        a = a->parent;
+    }
+    return a->node->case_insensitive;
 }
 
 static bool
@@ -1000,7 +1016,8 @@ args_run_internal(int argc, char **argv,
             }
         }
         if (node_is_branch(node)) {
-            const AxlArgsNode *child = find_verb(node, arg);
+            const AxlArgsNode *child = find_verb(node, arg,
+                                                 args_root_case_insensitive(a));
             if (child == NULL) {
                 axl_print("%s: unknown verb '%s'\n", path_buf, arg);
                 parse_error = true;

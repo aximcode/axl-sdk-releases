@@ -336,6 +336,22 @@ struct AxlArgsNode {
     /// appends a single trailing newline. Consumer should not
     /// include leading or trailing newlines.
     const char           *help_epilog;
+
+    /// When true ON THE ROOT NODE, verb / sub-verb name matching is
+    /// case-insensitive throughout the whole command tree: `do CDUMP`,
+    /// `do Cdump`, and `do cdump` all resolve a node declared `CDUMP`, and
+    /// likewise at every nested level (`do bios MAP` == `do BIOS map`). Only
+    /// the flag on the ROOT is consulted; setting it on an inner node has no
+    /// effect. Default false = exact-case matching (the existing behavior), so
+    /// existing tools are unaffected — opt in for a legacy CLI that is wholly
+    /// case-insensitive (e.g. the Dell `do` tool).
+    ///
+    /// ONLY verb-name matching is relaxed. Positional values, flag values, and
+    /// flag names keep their original case (`sysid D`, `-o:File.txt` pass
+    /// through verbatim); a positional declared `AXL_ARG_CHOICE` still honors
+    /// its own `choices_case_insensitive`. Node names display in their DECLARED
+    /// case in `--help`; only the match is case-folded.
+    bool                  case_insensitive;
 };
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,22 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.6.0 — 2026-06-10
+
+### Added
+
+- **Opt-in case-insensitive verb matching** (`<axl/axl-args.h>`) — a new
+  `bool case_insensitive` field on `AxlArgsNode`. When set **on the root
+  node**, verb / sub-verb name matching is case-folded throughout the whole
+  command tree (`do CDUMP` == `do Cdump` == `do cdump`; `do bios MAP` ==
+  `do BIOS map`), matching a legacy CLI that is wholly case-insensitive (the
+  Dell `do` tool). Default false = exact-case matching (unchanged), so
+  existing tools are unaffected. **Only verb names are relaxed** — positional
+  values, flag values, and flag names keep their original case (`sysid D`,
+  `-o:File.txt`); an `AXL_ARG_CHOICE` positional still honors its own
+  `choices_case_insensitive`. Node names display in their declared case in
+  `--help`; only the match is folded.
+
 ## 1.5.1 — 2026-06-10
 
 ### Fixed

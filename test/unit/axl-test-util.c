@@ -4988,6 +4988,103 @@ test_args_nested_3level_dispatch(void)
                "nested args: middle-level --scope reachable from deepest leaf");
 }
 
+/* Opt-in case-insensitive verb matching (AxlArgsNode.case_insensitive on the
+   root). Mirrors the legacy Dell `do` tool: verb / sub-verb names match in any
+   case tree-wide, while positional VALUES stay case-preserving. */
+static int
+args_ci_leaf(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_string = axl_args_get_string(a, "tag");   /* a positional value */
+    return 0;
+}
+
+static const AxlArgDesc args_ci_pos[] = {
+    { .name = "tag", .type = AXL_ARG_STRING, .required = false,
+      .help = "free value" },
+    {0}
+};
+static const AxlArgsNode args_ci_bios_verbs[] = {
+    { .name = "MAP", .handler = args_ci_leaf, .help = "memory map" },
+    {0}
+};
+static const AxlArgsNode args_ci_verbs[] = {
+    { .name = "CDUMP", .handler = args_ci_leaf, .positionals = args_ci_pos,
+      .help = "config dump" },
+    { .name = "bios", .verbs = args_ci_bios_verbs, .help = "bios category" },
+    {0}
+};
+
+/* Defined just below; used here for the case-sensitive negative case. */
+static AxlStream *capture_stdout(AxlStream **buf_out);
+static void       restore_stdout(AxlStream *saved, AxlStream *buf);
+static bool       buf_contains(AxlStream *buf, const char *needle);
+
+static void
+test_args_case_insensitive(void)
+{
+    AxlArgsNode app = {
+        .name = "do", .verbs = args_ci_verbs, .case_insensitive = true,
+    };
+
+    /* A root verb resolves in ANY case (CDUMP / Cdump / cdump). */
+    const char *forms[] = { "CDUMP", "Cdump", "cdump" };
+    for (int k = 0; k < 3; k++) {
+        ArgsCapture cap = { 0 };
+        app.user_data = &cap;
+        char *argv[] = { (char *)"do", (char *)forms[k] };
+        int rc = axl_args_run(2, argv, &app);
+        test_check(rc == 0 && cap.calls == 1,
+                   "args ci: root verb matches regardless of case");
+    }
+
+    /* Verb name folds, but the positional VALUE keeps its case. */
+    {
+        ArgsCapture cap = { 0 };
+        app.user_data = &cap;
+        char *argv[] = { (char *)"do", (char *)"cdump", (char *)"MixedCase" };
+        axl_args_run(3, argv, &app);
+        test_check(cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, "MixedCase") == 0,
+                   "args ci: positional value keeps its original case");
+    }
+
+    /* Case-folding propagates tree-wide: `BIOS map` -> bios -> MAP. */
+    {
+        ArgsCapture cap = { 0 };
+        app.user_data = &cap;
+        char *argv[] = { (char *)"do", (char *)"BIOS", (char *)"map" };
+        int rc = axl_args_run(3, argv, &app);
+        test_check(rc == 0 && cap.calls == 1,
+                   "args ci: sub-verb 'BIOS map' resolves bios->MAP tree-wide");
+    }
+
+    /* Default (case_insensitive=false): ONLY the exact case matches. */
+    AxlArgsNode app_cs = { .name = "do", .verbs = args_ci_verbs };
+    {
+        ArgsCapture cap = { 0 };
+        app_cs.user_data = &cap;
+        AxlStream *buf = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        char *argv[] = { (char *)"do", (char *)"cdump" };
+        int rc = axl_args_run(2, argv, &app_cs);
+        bool unknown = buf_contains(buf, "unknown verb 'cdump'");
+        restore_stdout(saved, buf);
+        test_check(rc != 0 && cap.calls == 0,
+                   "args cs: wrong-case 'cdump' does NOT match 'CDUMP'");
+        test_check(unknown, "args cs: reports unknown verb for the wrong case");
+    }
+    {
+        ArgsCapture cap = { 0 };
+        app_cs.user_data = &cap;
+        char *argv[] = { (char *)"do", (char *)"CDUMP" };
+        int rc = axl_args_run(2, argv, &app_cs);
+        test_check(rc == 0 && cap.calls == 1,
+                   "args cs: exact-case 'CDUMP' matches as before");
+    }
+}
+
 /* Swap axl_stdout for an in-memory buffer so a test can assert on
    what the parser printed. Caller pairs with restore_stdout() in the
    same scope. Returns the saved original to restore. */
@@ -5615,6 +5712,7 @@ test_args(void)
     test_args_nested_2level_dispatch();
     test_args_nested_parent_flag_visible_at_leaf();
     test_args_nested_3level_dispatch();
+    test_args_case_insensitive();
     test_args_nested_unknown_verb_at_branch();
     test_args_nested_branch_help_lists_subverbs();
     test_args_nested_misconfigured_node_rejected();
