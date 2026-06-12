@@ -930,6 +930,78 @@ touch_resolve(EFI_HANDLE handle)
     return NULL;
 }
 
+// Pulls the next queued absolute-pointer state into *out, returning true if
+// one was available (false = every bound handle's queue is empty / gone).
+// Decoupled from the firmware so the coalescing policy can be unit-tested
+// with a scripted state sequence (see axl_input_touch_coalesce).
+typedef bool (*AxlAbsReader)(void *ctx, EFI_ABSOLUTE_POINTER_STATE *out);
+
+// Drain up to @max_drain queued states via @read, coalescing a pure-motion
+// backlog to the latest position so a FIFO-queuing firmware (a BMC virtual
+// mouse) can't lag seconds behind — BUT stopping at the first state whose
+// contact-active differs from @baseline_active.  That edge state is kept as
+// the chosen one and processed this dispatch; the rest of the backlog drains
+// on later dispatches.  This is what keeps a press/release from being
+// coalesced away: motion compresses, button transitions never do.  With
+// @max_drain == 1 this reads exactly one state (legacy behavior).
+//
+// Returns the number of states read; 0 leaves *out untouched.  On a non-zero
+// return *out is the chosen state.
+uint32_t
+axl_input_touch_coalesce(
+    AxlAbsReader                read,
+    void                       *ctx,
+    bool                        baseline_active,
+    uint32_t                    max_drain,
+    EFI_ABSOLUTE_POINTER_STATE *out
+    )
+{
+    uint32_t n = 0;
+    for (uint32_t rd = 0; rd < max_drain; rd++) {
+        EFI_ABSOLUTE_POINTER_STATE s;
+        if (!read(ctx, &s)) {
+            break;   // every handle's queue is empty (or gone) — nothing to drain
+        }
+        *out = s;
+        n++;
+        if ((s.ActiveButtons != 0) != baseline_active) {
+            break;   // contact transition — keep it as the chosen state and stop,
+                     // so a press/release is never coalesced away (the rest of the
+                     // backlog drains on later dispatches)
+        }
+    }
+    return n;
+}
+
+// Reader ctx for the live firmware path: the bound handles plus the protocol
+// + mode of the most recent successful read (needed to normalize the chosen
+// state's coordinates).
+typedef struct {
+    TouchSource                   *tch;
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap;
+    EFI_ABSOLUTE_POINTER_MODE     *mode;
+} TouchReadCtx;
+
+static bool
+touch_read_next(void *vctx, EFI_ABSOLUTE_POINTER_STATE *out)
+{
+    TouchReadCtx *ctx = (TouchReadCtx *)vctx;
+    for (int i = 0; i < ctx->tch->nproto; i++) {
+        // Re-resolve to the CURRENT interface every read — never call through
+        // a cached pointer the providing driver may have freed.
+        EFI_ABSOLUTE_POINTER_PROTOCOL *p = touch_resolve(ctx->tch->handles[i]);
+        if (p == NULL) {
+            continue;   // protocol gone (driver Stop()'d) — skip, no stale call
+        }
+        if (p->GetState(p, out) == 0) {
+            ctx->ap   = p;
+            ctx->mode = p->Mode;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool
 touch_dispatch_cb(
     void  *data
@@ -942,38 +1014,17 @@ touch_dispatch_cb(
     EFI_ABSOLUTE_POINTER_STATE  state = {0};
 
     // Read whichever bound handle has data FIRST (ConsoleInHandle first).
-    // GetState consumes one queued state, so by default we read exactly one per
-    // dispatch (no double-count between the per-handle event sources + the
-    // fallback poll).  When drain coalescing is enabled (g_touch_max_drain > 1)
-    // we keep reading — up to that many — and keep only the LAST state, so a
-    // firmware that queues states FIFO (a BMC virtual mouse) can't build a
-    // backlog that drains slowly: one dispatch collapses it to the live
-    // position.  (Buttons reflect only the last state — see the drain docs.)
-    EFI_ABSOLUTE_POINTER_PROTOCOL *ap   = NULL;
-    EFI_ABSOLUTE_POINTER_MODE     *mode = NULL;
-    for (uint32_t rd = 0; rd < g_touch_max_drain; rd++) {
-        EFI_ABSOLUTE_POINTER_STATE s;
-        bool got = false;
-        for (int i = 0; i < tch->nproto; i++) {
-            // Re-resolve to the CURRENT interface every read — never call
-            // through a cached pointer the providing driver may have freed.
-            EFI_ABSOLUTE_POINTER_PROTOCOL *p = touch_resolve(tch->handles[i]);
-            if (p == NULL) {
-                continue;   // protocol gone (driver Stop()'d) — skip, no stale call
-            }
-            if (p->GetState(p, &s) == 0) {
-                state = s;
-                ap    = p;
-                mode  = p->Mode;
-                got   = true;
-                break;
-            }
-        }
-        if (!got) {
-            break;   // every handle's queue is empty (or gone) — nothing to drain
-        }
-    }
-    if (ap == NULL || mode == NULL) {
+    // GetState consumes one queued state, so by default we read exactly one
+    // per dispatch.  When drain coalescing is enabled (g_touch_max_drain > 1)
+    // axl_input_touch_coalesce collapses a motion backlog to the live position
+    // while stopping at any button transition so clicks survive.
+    TouchReadCtx rctx = { .tch = tch, .ap = NULL, .mode = NULL };
+    uint32_t got = axl_input_touch_coalesce(touch_read_next, &rctx,
+                                            tch->contact_active,
+                                            g_touch_max_drain, &state);
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap   = rctx.ap;
+    EFI_ABSOLUTE_POINTER_MODE     *mode = rctx.mode;
+    if (got == 0 || ap == NULL || mode == NULL) {
         return AXL_SOURCE_CONTINUE;   /* no data on any handle (Mode: be defensive) */
     }
 

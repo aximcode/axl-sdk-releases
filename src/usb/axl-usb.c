@@ -814,3 +814,85 @@ axl_usb_get_class(
     }
     return AXL_OK;
 }
+
+int
+axl_usb_get_device_info(AxlUsbAddr addr, AxlUsbDeviceInfo *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    if (ensure_init() != 0) {
+        return AXL_ERR;
+    }
+    Entry *e = find_entry(addr);
+    if (e == NULL) {
+        return AXL_ERR;
+    }
+    EFI_USB_DEVICE_DESCRIPTOR  desc = { 0 };
+    EFI_STATUS status = axl_efi_call(
+        e->io->UsbGetDeviceDescriptor, 2, e->io, &desc);
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+    out->bcd_usb            = desc.BcdUSB;
+    out->device_class       = desc.DeviceClass;
+    out->device_sub_class   = desc.DeviceSubClass;
+    out->device_protocol    = desc.DeviceProtocol;
+    out->num_configurations = desc.NumConfigurations;
+    return AXL_OK;
+}
+
+int
+axl_usb_get_num_endpoints(AxlUsbAddr addr, uint8_t *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    if (ensure_init() != 0) {
+        return AXL_ERR;
+    }
+    Entry *e = find_entry(addr);
+    if (e == NULL) {
+        return AXL_ERR;
+    }
+    EFI_USB_INTERFACE_DESCRIPTOR  desc = { 0 };
+    EFI_STATUS status = axl_efi_call(
+        e->io->UsbGetInterfaceDescriptor, 2, e->io, &desc);
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+    *out = desc.NumEndpoints;
+    return AXL_OK;
+}
+
+int
+axl_usb_get_port_info(AxlUsbAddr addr, uint8_t *parent_port,
+                      char *port_path, size_t port_path_len)
+{
+    if (ensure_init() != 0) {
+        return AXL_ERR;
+    }
+    Entry *e = find_entry(addr);
+    if (e == NULL) {
+        return AXL_ERR;
+    }
+    /* n_ports >= 1 by construction: slice_device_path rejects paths with
+       no USB node, and extract_port_chain always writes the leaf port. */
+    if (parent_port != NULL) {
+        *parent_port = e->ports[e->n_ports - 1];
+    }
+    if (port_path != NULL && port_path_len > 0) {
+        port_path[0] = '\0';
+        size_t pos = 0;
+        for (uint8_t i = 0; i < e->n_ports; i++) {
+            int w = axl_snprintf(port_path + pos, port_path_len - pos,
+                                 "%s%u", (i == 0) ? "" : ".",
+                                 (unsigned)e->ports[i]);
+            if (w < 0 || (size_t)w >= port_path_len - pos) {
+                break;   /* truncated — axl_snprintf already NUL-terminated */
+            }
+            pos += (size_t)w;
+        }
+    }
+    return AXL_OK;
+}

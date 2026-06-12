@@ -225,6 +225,21 @@ itself, or platforms without a binary package:
 then run `./scripts/install.sh --prefix /opt/axl-sdk` for the
 same FHS layout under `/opt/axl-sdk/`.
 
+`./scripts/install.sh` is the entry point even for an in-tree
+build: it compiles the library and stages a complete SDK under
+`./out` by default (`out/bin/axl-cc`, `out/lib/axl/<arch>/`,
+`out/include/`), so the driver to invoke is **`./out/bin/axl-cc`**.
+`scripts/axl-cc` is not a standalone driver — run from a raw
+checkout it fails with `no SDK libraries ... lib/axl/<arch>`
+because it resolves its SDK root to the repo top, where nothing is
+staged yet. Stage first, then use `out/bin/axl-cc` (or add it to
+`PATH`):
+
+```bash
+./scripts/install.sh --arch x64        # stages ./out
+./out/bin/axl-cc hello.c -o hello.efi
+```
+
 ### Host-side QEMU testing tooling
 
 For **downstream consumers** who want `run-qemu.sh` and friends

@@ -3,6 +3,59 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 1.8.0 — 2026-06-11
+
+### Added
+
+- **USB device-info, endpoint-count, and port-topology accessors**
+  (`<axl/axl-usb.h>`) — `axl_usb_get_device_info()` returns a curated
+  `AxlUsbDeviceInfo` (bcdUSB, device class/subclass/protocol,
+  bNumConfigurations); `axl_usb_get_num_endpoints()` returns an
+  interface's bNumEndpoints; `axl_usb_get_port_info()` surfaces the
+  hub-port chain AxlUsb already parses — the immediate parent-port plus
+  a `'.'`-joined root-first port path (e.g. `"4.1"`, `lsusb -t` shape).
+  Device-level fields are raw (a composite device's `device_class` is 0;
+  fall back to `axl_usb_get_class`), keeping policy in the consumer.
+  Requested by the SoftBMC port for its `/api/hwinfo/usb` route.
+- **Processor topology reader** (`<axl/axl-cpu.h>`) — `axl_cpu_topology()`
+  enumerates the machine's logical processors over
+  `EFI_MP_SERVICES_PROTOCOL`, filling a caller-sized, index-keyed
+  `AxlCpuProcessor` array with each processor's physical location
+  (package / core / thread) and status flags (bootstrap, enabled,
+  self-test healthy), plus decoupled total / enabled counts. Single
+  query-then-fill idiom (`out == NULL` reports counts only). On
+  single-processor firmware that does not publish MP services it reports
+  the uniprocessor floor (`total == enabled == 1`, no per-CPU entry)
+  rather than failing or fabricating status. Headless mechanism: a
+  consumer "CPU inventory" view formats the array itself, with no EFI
+  types in app code. Requested by the SoftBMC port (its `/api/hwinfo/cpu`
+  route, replacing a direct `EFI_MP_SERVICES_PROTOCOL` reach).
+
+### Fixed
+
+- **Absolute-pointer drain coalescing no longer drops clicks**
+  (`axl_input_set_touch_drain`) — the v1.7.1 drain kept only the *last* of the
+  states it read, so a full press+release (or a press buried behind a motion
+  backlog) that landed within one drained batch was coalesced away and the
+  click was lost. The drain now collapses only pure-motion runs and **stops at
+  any contact transition**, processing the press/release before continuing.
+  Motion compresses (killing the iDRAC/BMC "lags seconds behind" backlog),
+  button edges never do — so a consumer can raise the drain even where clicks
+  matter. The coalescing policy is now a unit-tested pure helper
+  (`axl_input_touch_coalesce`) driven by a scripted state sequence.
+- **`axl-cc --help` / `-h` printed `ar`'s usage instead of its own** — the
+  help text used an unquoted heredoc (`<<HELP`), so the backticked
+  `` `ar rcs` `` in the staged-build example ran as a command substitution
+  and `ar` printed its usage. The delimiter is now quoted (`<<'HELP'`).
+- **`EFI_PROCESSOR_INFORMATION` was undersized by its `ExtendedInformation`
+  tail** — the generated UEFI header modeled the member as `void *`
+  (8 bytes) instead of the spec's embedded `EXTENDED_PROCESSOR_INFORMATION`
+  union (24 bytes, wrapping `EFI_CPU_PHYSICAL_LOCATION2`), so the struct was 16 bytes
+  short of what EDK2-derived firmware writes through `GetProcessorInfo` — a
+  latent stack-buffer overflow for any caller passing the struct by value
+  (including the MP-services task-pool enumerator). The manifest now declares
+  the union so the struct carries its full firmware footprint.
+
 ## 1.7.1 — 2026-06-10
 
 ### Fixed

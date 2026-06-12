@@ -392,6 +392,135 @@ test_attach_touch_protocol_available(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_input_touch_coalesce — absolute-pointer drain policy
+//
+// Internal helper (no public header), exposed for this test. The drain
+// collapses a FIFO firmware backlog (iDRAC / BMC virtual mouse) to the live
+// position to kill seconds-long lag, but must STOP at a button transition so a
+// press/release is never coalesced away. Tested here with a scripted state
+// sequence — deterministic and firmware-free (QEMU/OVMF doesn't queue
+// absolute-pointer states, so a live demo can't exercise this).
+// ---------------------------------------------------------------------------
+
+typedef bool (*AxlAbsReader)(void *ctx, EFI_ABSOLUTE_POINTER_STATE *out);
+extern uint32_t axl_input_touch_coalesce(AxlAbsReader read, void *ctx,
+                                         bool baseline_active, uint32_t max_drain,
+                                         EFI_ABSOLUTE_POINTER_STATE *out);
+
+typedef struct {
+    const EFI_ABSOLUTE_POINTER_STATE *seq;
+    uint32_t                          n;
+    uint32_t                          pos;
+} ScriptedAbs;
+
+static bool
+scripted_abs_read(void *vctx, EFI_ABSOLUTE_POINTER_STATE *out)
+{
+    ScriptedAbs *s = (ScriptedAbs *)vctx;
+    if (s->pos >= s->n) {
+        return false;
+    }
+    *out = s->seq[s->pos++];
+    return true;
+}
+
+static EFI_ABSOLUTE_POINTER_STATE
+abs_state(uint64_t x, uint64_t y, uint32_t buttons)
+{
+    EFI_ABSOLUTE_POINTER_STATE s = {0};
+    s.CurrentX      = x;
+    s.CurrentY      = y;
+    s.ActiveButtons = buttons;
+    return s;
+}
+
+static void
+test_touch_coalesce(void)
+{
+    EFI_ABSOLUTE_POINTER_STATE out = {0};
+
+    /* Empty queue: reads nothing, leaves out untouched (per contract). */
+    {
+        out = abs_state(0xDEAD, 0xBEEF, 0);   // sentinel
+        ScriptedAbs s = { .seq = NULL, .n = 0, .pos = 0 };
+        uint32_t n = axl_input_touch_coalesce(scripted_abs_read, &s, false, 8, &out);
+        test_check(n == 0, "coalesce: empty queue reads 0");
+        test_check(out.CurrentX == 0xDEAD && out.CurrentY == 0xBEEF,
+                   "coalesce: empty queue leaves out untouched");
+    }
+
+    /* Pure-motion backlog coalesces to the LAST position. */
+    {
+        const EFI_ABSOLUTE_POINTER_STATE seq[] = {
+            abs_state(10, 10, 0), abs_state(20, 20, 0), abs_state(30, 30, 0),
+        };
+        ScriptedAbs s = { .seq = seq, .n = 3, .pos = 0 };
+        uint32_t n = axl_input_touch_coalesce(scripted_abs_read, &s, false, 8, &out);
+        test_check(n == 3, "coalesce: drains the whole motion backlog");
+        test_check(out.CurrentX == 30 && out.CurrentY == 30,
+                   "coalesce: motion coalesces to the latest position");
+    }
+
+    /* max_drain caps the read count (out is the last drained, not the newest). */
+    {
+        const EFI_ABSOLUTE_POINTER_STATE seq[] = {
+            abs_state(10, 10, 0), abs_state(20, 20, 0), abs_state(30, 30, 0),
+        };
+        ScriptedAbs s = { .seq = seq, .n = 3, .pos = 0 };
+        uint32_t n = axl_input_touch_coalesce(scripted_abs_read, &s, false, 2, &out);
+        test_check(n == 2, "coalesce: max_drain caps the read count");
+        test_check(out.CurrentX == 20, "coalesce: stops after max_drain states");
+    }
+
+    /* max_drain == 1: exactly one read (legacy single-read behavior). */
+    {
+        const EFI_ABSOLUTE_POINTER_STATE seq[] = {
+            abs_state(10, 10, 0), abs_state(20, 20, 0),
+        };
+        ScriptedAbs s = { .seq = seq, .n = 2, .pos = 0 };
+        uint32_t n = axl_input_touch_coalesce(scripted_abs_read, &s, false, 1, &out);
+        test_check(n == 1 && out.CurrentX == 10,
+                   "coalesce: max_drain==1 reads exactly one state");
+    }
+
+    /* Edge stop: a press transition is NOT coalesced past. With a held-motion
+       state queued AFTER the press, the drain must stop AT the press (the
+       chosen state is the DOWN, not the later held move). */
+    {
+        const EFI_ABSOLUTE_POINTER_STATE seq[] = {
+            abs_state(10, 10, 0),   // motion, no button (baseline)
+            abs_state(20, 20, 1),   // PRESS — the edge
+            abs_state(30, 30, 1),   // held drag after the press
+        };
+        ScriptedAbs s = { .seq = seq, .n = 3, .pos = 0 };
+        uint32_t n = axl_input_touch_coalesce(scripted_abs_read, &s, false, 8, &out);
+        test_check(n == 2, "coalesce: stops at the press transition (does not drain past)");
+        test_check(out.CurrentX == 20 && out.ActiveButtons != 0,
+                   "coalesce: chosen state IS the press, not the later held move");
+    }
+
+    /* Click survives: a DOWN then UP queued together must NOT collapse into a
+       single buttons==0 state (which would swallow the whole click). The first
+       drain stops at the DOWN; a second drain (now contact-active baseline)
+       stops at the UP — both edges observable across two dispatches. */
+    {
+        const EFI_ABSOLUTE_POINTER_STATE seq[] = {
+            abs_state(15, 15, 1),   // DOWN
+            abs_state(15, 15, 0),   // UP (same spot — a click)
+        };
+        ScriptedAbs s = { .seq = seq, .n = 2, .pos = 0 };
+
+        uint32_t n1 = axl_input_touch_coalesce(scripted_abs_read, &s, false, 8, &out);
+        test_check(n1 == 1 && out.ActiveButtons != 0,
+                   "coalesce: click DOWN is not swallowed (stops at the press)");
+
+        uint32_t n2 = axl_input_touch_coalesce(scripted_abs_read, &s, true, 8, &out);
+        test_check(n2 == 1 && out.ActiveButtons == 0,
+                   "coalesce: the following release is delivered on the next dispatch");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // axl_input_ctrl_letter — dual-encoding Ctrl+<letter> decode
 // ---------------------------------------------------------------------------
 
@@ -1074,6 +1203,7 @@ test_input_main(
     test_attach_touch_null_loop_returns_zero();
     test_attach_touch_null_cb_returns_zero();
     test_attach_touch_protocol_available();
+    test_touch_coalesce();
 
     test_ctrl_letter_serial_folded();
     test_ctrl_letter_keyboard_letter_plus_mod();

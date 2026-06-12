@@ -2078,6 +2078,135 @@ test_usb_tree_walker(void)
                "usb tree_walker: NULL fn rejected");
 }
 
+static void
+test_usb_get_device_info(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_device_info (no USB devices)\n");
+        for (int i = 0; i < 5; i++) {
+            test_check(true, "usb device_info: SKIP balance");
+        }
+        return;
+    }
+
+    /* Sentinel-fill so a stub that returns success without writing
+       can't slip past the populated checks. */
+    AxlUsbDeviceInfo info;
+    axl_memset(&info, 0xAA, sizeof(info));
+    int rc = axl_usb_get_device_info(*u, &info);
+    test_check(rc == AXL_OK, "usb device_info: succeeds on enumerated device");
+    test_check(info.num_configurations >= 1 && info.num_configurations <= 16,
+               "usb device_info: num_configurations in [1,16]");
+    test_check(info.bcd_usb >= 0x0100 && info.bcd_usb <= 0x0400,
+               "usb device_info: bcd_usb is a real USB version (1.0..4.0, not the sentinel)");
+
+    test_check(axl_usb_get_device_info(*u, NULL) == AXL_ERR,
+               "usb device_info: NULL out rejected");
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_device_info(bogus, &info) == AXL_ERR,
+               "usb device_info: unknown addr returns AXL_ERR");
+}
+
+static void
+test_usb_get_num_endpoints(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_num_endpoints (no USB devices)\n");
+        for (int i = 0; i < 4; i++) {
+            test_check(true, "usb num_endpoints: SKIP balance");
+        }
+        return;
+    }
+
+    uint8_t n = 0xEE;   /* sentinel: real interfaces declare far fewer */
+    int rc = axl_usb_get_num_endpoints(*u, &n);
+    test_check(rc == AXL_OK,
+               "usb num_endpoints: succeeds on enumerated interface");
+    test_check(n <= 30, "usb num_endpoints: count is sane (moved from sentinel)");
+
+    test_check(axl_usb_get_num_endpoints(*u, NULL) == AXL_ERR,
+               "usb num_endpoints: NULL out rejected");
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_num_endpoints(bogus, &n) == AXL_ERR,
+               "usb num_endpoints: unknown addr returns AXL_ERR");
+}
+
+static void
+test_usb_get_port_info(void)
+{
+    AxlUsbAddr *u = axl_usb_next(NULL);
+    if (u == NULL) {
+        axl_printf("SKIP: usb_get_port_info (no USB devices)\n");
+        for (int i = 0; i < 8; i++) {
+            test_check(true, "usb port_info: SKIP balance");
+        }
+        return;
+    }
+
+    /* First device: basic shape. */
+    uint8_t pp = 0xEE;   /* sentinel; real ports are small */
+    char    path[AXL_USB_PORT_PATH_MAX];
+    axl_memset(path, 0x7F, sizeof(path));
+    int rc = axl_usb_get_port_info(*u, &pp, path, sizeof(path));
+    test_check(rc == AXL_OK, "usb port_info: succeeds on enumerated device");
+    test_check(pp != 0xEE && pp < 128,
+               "usb port_info: parent_port populated and sane");
+    test_check(path[0] >= '0' && path[0] <= '9',
+               "usb port_info: port_path starts with a digit");
+
+    /* Both out-params NULL is a successful no-op. */
+    test_check(axl_usb_get_port_info(*u, NULL, NULL, 0) == AXL_OK,
+               "usb port_info: both-NULL is a no-op success");
+
+    /* A length-1 buffer can hold only the NUL; still succeeds. */
+    char tiny[1] = { 0x7F };
+    test_check(axl_usb_get_port_info(*u, NULL, tiny, sizeof(tiny)) == AXL_OK
+               && tiny[0] == '\0',
+               "usb port_info: 1-byte buffer truncates to NUL, still AXL_OK");
+
+    /* Unknown addr. */
+    AxlUsbAddr bogus = { .bus = 0xFF, .addr = 0xFF, .intf = 0xFF };
+    test_check(axl_usb_get_port_info(bogus, &pp, path, sizeof(path)) == AXL_ERR,
+               "usb port_info: unknown addr returns AXL_ERR");
+
+    /* Topology: the runner puts usb-tablet behind a usb-hub, so at least
+       one interface must report a multi-level "a.b" port path, and its
+       parent_port must equal that path's last component. */
+    bool found_nested = false;
+    bool parent_matches_tail = true;
+    AxlUsbAddr *w = NULL;
+    while ((w = axl_usb_next(w)) != NULL) {
+        uint8_t wp = 0;
+        char    wpath[AXL_USB_PORT_PATH_MAX] = { 0 };
+        if (axl_usb_get_port_info(*w, &wp, wpath, sizeof(wpath)) != AXL_OK) {
+            continue;
+        }
+        int last_dot = -1;
+        for (int k = 0; wpath[k] != '\0'; k++) {
+            if (wpath[k] == '.') {
+                last_dot = k;
+            }
+        }
+        if (last_dot >= 0) {
+            found_nested = true;
+            unsigned tail = 0;
+            for (const char *p = wpath + last_dot + 1;
+                 *p >= '0' && *p <= '9'; p++) {
+                tail = tail * 10u + (unsigned)(*p - '0');
+            }
+            if (tail != (unsigned)wp) {
+                parent_matches_tail = false;
+            }
+        }
+    }
+    test_check(found_nested,
+               "usb port_info: a hub-nested device reports a multi-level path");
+    test_check(parent_matches_tail,
+               "usb port_info: parent_port equals the path's last component");
+}
+
 // ---------------------------------------------------------------------------
 // AxlUsb — vendor/device-name database (Phase D)
 // ---------------------------------------------------------------------------
@@ -3682,6 +3811,60 @@ test_efi_find_config_table(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_cpu_topology — MP-services processor inventory
+//
+// The unit runner boots QEMU with the default single vCPU, so these
+// pin the deterministic *floor* and the argument mechanics: total ==
+// enabled == 1 holds whether the firmware publishes MP services
+// reporting one processor or omits it entirely (the contract's
+// uniprocessor floor). Exact multi-CPU topology (counts > 1, SMT /
+// multi-socket location, truncation) is pinned by the -smp
+// integration test test-cpu-topology-qemu.sh, which the single-CPU
+// unit harness cannot exercise.
+// ---------------------------------------------------------------------------
+
+static void
+test_cpu_topology(void)
+{
+    /* All out-params optional: a fully-NULL call must not crash and
+       must report success. */
+    test_check(axl_cpu_topology(NULL, NULL, NULL, 0, NULL) == AXL_OK,
+               "cpu_topology: all-NULL args succeed");
+
+    /* Counts-only query (out == NULL): counts are filled, out_n is 0. */
+    size_t total = 0, enabled = 0, out_n = 99;
+    int rc = axl_cpu_topology(&total, &enabled, NULL, 0, &out_n);
+    test_check(rc == AXL_OK, "cpu_topology: counts-only query succeeds");
+    test_check(total == 1, "cpu_topology: single-vCPU harness reports total == 1");
+    test_check(enabled == 1, "cpu_topology: single-vCPU harness reports enabled == 1");
+    test_check(out_n == 0, "cpu_topology: out == NULL leaves out_n == 0");
+
+    /* Fill into a real buffer. On this harness out_n is 0 (MP services
+       absent -> uniprocessor floor, no per-CPU entry) or 1 (MP services
+       present, processor 0 written); never more than total. */
+    AxlCpuProcessor procs[4];
+    axl_memset(procs, 0xAA, sizeof(procs));
+    total = enabled = out_n = 99;
+    rc = axl_cpu_topology(&total, &enabled, procs, 4, &out_n);
+    test_check(rc == AXL_OK, "cpu_topology: buffered query succeeds");
+    test_check(total == 1, "cpu_topology: buffered total == 1");
+    test_check(enabled == 1, "cpu_topology: buffered enabled == 1");
+    test_check(out_n <= 1, "cpu_topology: out_n never exceeds total");
+    /* If an entry was written it must be the enabled bootstrap
+       processor (QEMU's vCPU 0). The floor path writes nothing. */
+    test_check(out_n == 0 || (procs[0].bsp && procs[0].enabled),
+               "cpu_topology: written entry is the enabled BSP");
+
+    /* out_cap == 0 with a non-NULL buffer: counts still filled, nothing
+       written. */
+    total = 0; out_n = 99;
+    rc = axl_cpu_topology(&total, NULL, procs, 0, &out_n);
+    test_check(rc == AXL_OK, "cpu_topology: out_cap == 0 query succeeds");
+    test_check(total == 1, "cpu_topology: out_cap == 0 still fills total");
+    test_check(out_n == 0, "cpu_topology: out_cap == 0 writes nothing");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -3698,6 +3881,9 @@ test_platform_main(int argc, char **argv)
 
     /* axl_efi_find_config_table — generic config-table lookup */
     test_efi_find_config_table();
+
+    /* AxlCpu — processor topology (MP services) */
+    test_cpu_topology();
 
     /* AxlAcpi */
     test_acpi_revision();
@@ -3749,6 +3935,9 @@ test_platform_main(int argc, char **argv)
     test_usb_get_product();
     test_usb_get_serial();
     test_usb_tree_walker();
+    test_usb_get_device_info();
+    test_usb_get_num_endpoints();
+    test_usb_get_port_info();
     test_usb_ids_load_failure_modes();
     test_usb_ids_handle_buffer();
     test_usb_ids_foreach();

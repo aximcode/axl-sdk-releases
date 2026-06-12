@@ -681,3 +681,106 @@ axl_cpu_simd_tier(void)
     }
     return AXL_SIMD_SCALAR;
 }
+
+// ---------------------------------------------------------------------------
+// EFI_MP_SERVICES_PROTOCOL access (lazy locate + cache)
+// ---------------------------------------------------------------------------
+
+static EFI_MP_SERVICES_PROTOCOL *g_mp_services = NULL;
+
+/* Lazy-cache `EFI_MP_SERVICES_PROTOCOL`. Optional and commonly absent
+   on single-processor platforms; a NULL return is the documented
+   "no enumeration source" case, not an error. */
+static EFI_MP_SERVICES_PROTOCOL *
+mp_services(void)
+{
+    if (g_mp_services != NULL) {
+        return g_mp_services;
+    }
+    EFI_GUID guid = gEfiMpServicesProtocolGuid;
+    EFI_MP_SERVICES_PROTOCOL *p = NULL;
+    EFI_STATUS status = axl_bs()->LocateProtocol(&guid, NULL, (void **)&p);
+    if (EFI_ERROR(status) || p == NULL) {
+        return NULL;
+    }
+    g_mp_services = p;
+    return g_mp_services;
+}
+
+int
+axl_cpu_topology(
+    size_t           *total,
+    size_t           *enabled,
+    AxlCpuProcessor  *out,
+    size_t            out_cap,
+    size_t           *out_n
+    )
+{
+    if (out_n != NULL) {
+        *out_n = 0;
+    }
+
+    EFI_MP_SERVICES_PROTOCOL *mp = mp_services();
+    if (mp == NULL) {
+        /* Uniprocessor floor: no enumeration source, but the caller is
+           by definition running on at least the BSP. Report 1/1 and
+           write no per-processor entry (no status to characterize). */
+        if (total != NULL) {
+            *total = 1;
+        }
+        if (enabled != NULL) {
+            *enabled = 1;
+        }
+        return AXL_OK;
+    }
+
+    UINTN num_proc = 0;
+    UINTN num_enabled = 0;
+    EFI_STATUS status = mp->GetNumberOfProcessors(mp, &num_proc, &num_enabled);
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+
+    if (total != NULL) {
+        *total = (size_t)num_proc;
+    }
+    if (enabled != NULL) {
+        *enabled = (size_t)num_enabled;
+    }
+
+    if (out == NULL || out_cap == 0) {
+        return AXL_OK;
+    }
+
+    size_t write = ((size_t)num_proc < out_cap) ? (size_t)num_proc : out_cap;
+    for (size_t i = 0; i < write; i++) {
+        EFI_PROCESSOR_INFORMATION info;
+        AxlCpuProcessor *p = &out[i];
+
+        status = mp->GetProcessorInfo(mp, (UINTN)i, &info);
+        if (EFI_ERROR(status)) {
+            /* Keep the index aligned with the processor number: a slot
+               we could not read is written zeroed (not enabled, not
+               healthy) rather than skipped. */
+            p->package = 0;
+            p->core = 0;
+            p->thread = 0;
+            p->bsp = false;
+            p->enabled = false;
+            p->healthy = false;
+            continue;
+        }
+
+        p->package = info.Location.Package;
+        p->core = info.Location.Core;
+        p->thread = info.Location.Thread;
+        p->bsp = (info.StatusFlag & PROCESSOR_AS_BSP_BIT) != 0;
+        p->enabled = (info.StatusFlag & PROCESSOR_ENABLED_BIT) != 0;
+        p->healthy = (info.StatusFlag & PROCESSOR_HEALTH_STATUS_BIT) != 0;
+    }
+
+    if (out_n != NULL) {
+        *out_n = write;
+    }
+    return AXL_OK;
+}

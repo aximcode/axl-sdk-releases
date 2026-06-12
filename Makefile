@@ -545,7 +545,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -908,6 +908,22 @@ $(PREFIX)/cpu-simd-selftest.efi: $(BUILDDIR)/cpu-simd-selftest.o $(CRT0_OBJ) $(P
 	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-simd-selftest.o,$@)
 
 $(BUILDDIR)/cpu-simd-selftest.o: test/integration/cpu-simd-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build cpu-topology-selftest.efi — axl_cpu_topology() against an
+# explicit QEMU -smp layout, run by
+# test/integration/test-cpu-topology-qemu.sh (the single-vCPU unit
+# harness can't exercise multi-processor counts / location / fill).
+# ===================================================================
+
+cpu-topology-selftest: $(PREFIX)/cpu-topology-selftest.efi
+	@echo "  Built: $(PREFIX)/cpu-topology-selftest.efi"
+
+$(PREFIX)/cpu-topology-selftest.efi: $(BUILDDIR)/cpu-topology-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-topology-selftest.o,$@)
+
+$(BUILDDIR)/cpu-topology-selftest.o: test/integration/cpu-topology-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

@@ -437,6 +437,11 @@
     {"name": "PROCESSOR_AS_BSP_BIT",          "kind": "define"},
     {"name": "PROCESSOR_ENABLED_BIT",         "kind": "define"},
     {"name": "PROCESSOR_HEALTH_STATUS_BIT",   "kind": "define"},
+    // ExtendedInformation member of EFI_PROCESSOR_INFORMATION. Declaring
+    // it gives the struct its full firmware footprint: GetProcessorInfo
+    // writes the whole struct, so an undersized one overflows the
+    // caller's buffer.
+    {"name": "EXTENDED_PROCESSOR_INFORMATION", "kind": "union"},
     {"name": "EFI_PROCESSOR_INFORMATION",     "kind": "struct"},
     {"name": "EFI_MP_SERVICES_GET_NUMBER_OF_PROCESSORS", "kind": "funcptr"},
     {"name": "EFI_MP_SERVICES_GET_PROCESSOR_INFO", "kind": "funcptr"},

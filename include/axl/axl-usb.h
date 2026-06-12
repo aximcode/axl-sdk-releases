@@ -150,6 +150,115 @@ axl_usb_get_class(
     uint8_t     *prot    ///< [out, optional] protocol
 );
 
+/**
+ * @brief Curated device-level fields not covered by the per-interface
+ *     accessors.
+ *
+ * A projection of the standard device descriptor (one per physical
+ * device, shared by all its interfaces) — the fields an lsusb-style
+ * consumer wants beyond vendor/product ID (which `axl_usb_get_vid_pid`
+ * already covers). Not the full 18-byte wire structure.
+ */
+typedef struct {
+    uint16_t  bcd_usb;             ///< USB spec version, BCD (0x0200 = "2.0", 0x0110 = "1.1")
+    uint8_t   device_class;        ///< bDeviceClass; 0 on a composite device (class is per-interface)
+    uint8_t   device_sub_class;    ///< bDeviceSubClass
+    uint8_t   device_protocol;     ///< bDeviceProtocol
+    uint8_t   num_configurations;  ///< bNumConfigurations
+} AxlUsbDeviceInfo;
+
+/**
+ * @brief Read curated device-level descriptor fields for a USB device.
+ *
+ * Reads the device descriptor via
+ * `EFI_USB_IO_PROTOCOL.UsbGetDeviceDescriptor` and copies out the
+ * fields in @ref AxlUsbDeviceInfo. All interfaces of one physical
+ * device share these values (the descriptor is per-device, not
+ * per-interface).
+ *
+ * Fields are returned **raw**. In particular `device_class` is 0 on a
+ * composite device, where the class identity lives per interface — a
+ * consumer that wants a single "device class" should fall back to
+ * `axl_usb_get_class` when `device_class == 0`. Likewise `bcd_usb` is
+ * the raw BCD value; format it yourself (e.g. high byte `.` low byte as
+ * hex: 0x0200 -> "2.0", 0x0110 -> "1.1"). The library returns
+ * mechanism, not policy.
+ *
+ * @return AXL_OK on success (@p out fully populated), AXL_ERR if @p out
+ *     is NULL, @p addr is not a known interface, or the firmware fails
+ *     the descriptor read.
+ */
+int
+axl_usb_get_device_info(
+    AxlUsbAddr         addr,   ///< target interface (any interface of the device)
+    AxlUsbDeviceInfo  *out     ///< [out] populated on success
+);
+
+/**
+ * @brief Read the endpoint count of a USB interface.
+ *
+ * Reads `bNumEndpoints` from the interface descriptor via
+ * `EFI_USB_IO_PROTOCOL.UsbGetInterfaceDescriptor`. This is the count of
+ * non-control endpoints the interface declares (the control endpoint 0
+ * is implicit and not included, per USB 2.0 §9.6.5).
+ *
+ * @return AXL_OK on success, AXL_ERR if @p out is NULL, @p addr is not a
+ *     known interface, or the firmware fails the descriptor read.
+ */
+int
+axl_usb_get_num_endpoints(
+    AxlUsbAddr   addr,   ///< target interface
+    uint8_t     *out     ///< [out] bNumEndpoints
+);
+
+/// Maximum hub depth the topology walker descends, and the basis for
+/// the port-path buffer cap below. USB 2.0/3.x caps the bus depth at 5
+/// hubs between root and device (= 6 USB device-path nodes including the
+/// leaf), so 8 levels is generous headroom against malformed firmware
+/// paths. (Also used by axl_usb_tree_for_each, further down.)
+#define AXL_USB_TREE_MAX_DEPTH  8u
+
+/// Buffer cap for a port-path string: up to AXL_USB_TREE_MAX_DEPTH port
+/// numbers (3 digits each) joined by '.' separators, plus NUL. Sized
+/// 4 bytes/port (digit-triple + separator) + 1, one byte generous since
+/// the last port has no trailing separator.
+#define AXL_USB_PORT_PATH_MAX  ((AXL_USB_TREE_MAX_DEPTH * 4u) + 1u)
+
+/**
+ * @brief Read a USB device's hub-port location.
+ *
+ * Surfaces the port chain AxlUsb already parses from the device path
+ * (the same chain `axl_usb_tree_for_each` walks): the sequence of
+ * `ParentPortNumber` values from the root-hub port down to the port the
+ * device is plugged into on its immediate parent.
+ *
+ *  - @p parent_port — the port number on the device's **immediate**
+ *    parent (root hub or an intermediate hub); the last element of the
+ *    chain. This is what the app cannot derive on its own. For a device
+ *    attached directly to the root hub this equals the whole path.
+ *  - @p port_path — the full chain rendered as `'.'`-joined port
+ *    numbers, root first (e.g. `"4"` for a root-port device, `"4.1"`
+ *    for a device on port 1 of a hub on root port 4). Linux `lsusb -t`
+ *    / sysfs port-path shape. Always NUL-terminated; truncated
+ *    (snprintf-style) if @p port_path_len is too small — and truncation
+ *    is **not** reflected in the return value, so size with
+ *    @ref AXL_USB_PORT_PATH_MAX to never truncate.
+ *
+ * Both out-parameters are optional (pass NULL to skip either); passing
+ * NULL for both is a successful no-op.
+ *
+ * @return AXL_OK on success, AXL_ERR if @p addr is not a known
+ *     interface (the port chain is recovered at enumeration time, so a
+ *     known interface always has one — there is no firmware call here).
+ */
+int
+axl_usb_get_port_info(
+    AxlUsbAddr   addr,           ///< target interface
+    uint8_t     *parent_port,    ///< [out, optional] immediate-parent port number
+    char        *port_path,      ///< [out, optional] '.'-joined port chain, root first
+    size_t       port_path_len   ///< capacity of @p port_path in bytes (incl. NUL)
+);
+
 // ---------------------------------------------------------------------------
 // Class triplet decode (compiled-in tables)
 // ---------------------------------------------------------------------------
@@ -352,11 +461,8 @@ axl_usb_control_transfer(
 // Topology walk (Phase F — real hub-port chain)
 // ---------------------------------------------------------------------------
 
-/// Maximum hub depth the tree walker will descend. USB 2.0/3.x
-/// caps the bus depth at 5 hubs between root and device (= 6 USB
-/// device-path nodes including the leaf), so 8 levels is generous
-/// headroom against malformed firmware paths.
-#define AXL_USB_TREE_MAX_DEPTH  8u
+/* AXL_USB_TREE_MAX_DEPTH is defined up in the per-device-introspection
+   section (the port-path buffer cap needs it). */
 
 /**
  * @brief Per-node callback for axl_usb_tree_for_each.

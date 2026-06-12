@@ -366,6 +366,96 @@ axl_cpu_enable_avx512(void);
 AxlSimdTier
 axl_cpu_simd_tier(void);
 
+// ---------------------------------------------------------------------------
+// Processor topology (MP-services inventory)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief One logical processor's location and status.
+ *
+ * `package` / `core` / `thread` are the firmware-reported physical
+ * coordinates (`EFI_CPU_PHYSICAL_LOCATION`); together they identify
+ * where the logical processor sits in the package/core/SMT topology.
+ * The three booleans decode the MP-services status flags:
+ *  - `bsp` — this is the bootstrap processor (exactly one entry has
+ *    `bsp == true`).
+ *  - `enabled` — the processor is enabled and usable. Disabled
+ *    processors are still reported (so the count of entries matches
+ *    `total`), with `enabled == false`.
+ *  - `healthy` — firmware's built-in self test passed for this
+ *    processor. A `false` here on an `enabled` processor flags a
+ *    BIST failure worth surfacing.
+ */
+typedef struct {
+    uint32_t  package;   ///< physical package (socket) index
+    uint32_t  core;      ///< core index within the package
+    uint32_t  thread;    ///< hardware thread (SMT) index within the core
+    bool      bsp;       ///< bootstrap processor (exactly one is true)
+    bool      enabled;   ///< processor is enabled / usable
+    bool      healthy;   ///< firmware self-test passed
+} AxlCpuProcessor;
+
+/**
+ * @brief Enumerate the machine's logical processors and their status.
+ *
+ * Reads `EFI_MP_SERVICES_PROTOCOL` (the same data the task pool uses
+ * for AP fan-out) and reports, for every logical processor the
+ * firmware knows about, its physical location and status flags. This
+ * is the headless mechanism behind a consumer "CPU inventory" view;
+ * formatting and policy belong to the caller.
+ *
+ * **Counts vs. fill, decoupled.** `*total` and `*enabled` are always
+ * set to the true machine-wide counts regardless of @p out_cap, so a
+ * caller can query sizes first (pass `out == NULL`) and then size an
+ * array, or pass a generous buffer and detect truncation. `*out_n` is
+ * the number of entries written to @p out — always `min(*total,
+ * out_cap)`. When `*out_n < *total` the buffer was too small and the
+ * tail processors were not written; the counts are still accurate.
+ *
+ * **Dense, index-keyed.** `out[i]` describes firmware processor
+ * number `i` — the array index *is* the processor's identity, so a
+ * caller needs no separate id field. The bootstrap processor is
+ * whichever entry has `bsp == true` (index 0 on typical firmware, but
+ * not guaranteed). To keep the index aligned with the processor
+ * number the fill is never sparse: if the firmware fails to return
+ * info for a processor it claimed exists, that slot is written as a
+ * zeroed entry (`enabled == healthy == false`, location `{0,0,0}`)
+ * rather than skipped, and still counts toward `*out_n`.
+ *
+ * **Uniprocessor firmware.** `EFI_MP_SERVICES_PROTOCOL` is optional
+ * and commonly absent on single-processor platforms. When it is not
+ * published this reports the honest floor — `*total == *enabled == 1`
+ * with `*out_n == 0` (no per-processor entry written) — rather than
+ * failing or fabricating status bits, since the caller is by
+ * definition executing on at least the BSP but no enumeration source
+ * is available to characterize it. A caller seeing `*out_n == 0`
+ * alongside `*total >= 1` knows per-processor detail was unavailable.
+ *
+ * All out-parameters are optional (pass `NULL` to skip any). Passing
+ * `out == NULL` (or `out_cap == 0`) queries the counts without
+ * filling; `*out_n` is then 0.
+ *
+ * @param total    [out] total logical processors reported (optional).
+ * @param enabled  [out] count with the enabled flag set (optional).
+ * @param out      [out] caller array filled with up to @p out_cap
+ *                   entries, indexed by processor number; `NULL` to
+ *                   query counts only.
+ * @param out_cap  [in]  capacity of @p out, in entries.
+ * @param out_n    [out] entries written to @p out (optional).
+ *
+ * @return AXL_OK on success (including the uniprocessor-floor path);
+ *     AXL_ERR only if the MP-services protocol is published but its
+ *     machine-wide processor count cannot be read.
+ */
+int
+axl_cpu_topology(
+    size_t           *total,
+    size_t           *enabled,
+    AxlCpuProcessor  *out,
+    size_t            out_cap,
+    size_t           *out_n
+);
+
 #ifdef __cplusplus
 }
 #endif

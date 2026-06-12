@@ -39,11 +39,15 @@ typedef struct _EFI_CPU_PHYSICAL_LOCATION2 {
 
 #define PROCESSOR_HEALTH_STATUS_BIT 0x00000004
 
+typedef union _EXTENDED_PROCESSOR_INFORMATION {
+     EFI_CPU_PHYSICAL_LOCATION2     Location2;
+} EXTENDED_PROCESSOR_INFORMATION;
+
 typedef struct _EFI_PROCESSOR_INFORMATION {
   UINT64                            ProcessorId;
   UINT32                            StatusFlag;
   EFI_CPU_PHYSICAL_LOCATION         Location;
-  void  *ExtendedInformation;
+  EXTENDED_PROCESSOR_INFORMATION    ExtendedInformation;
 } EFI_PROCESSOR_INFORMATION;
 
 typedef

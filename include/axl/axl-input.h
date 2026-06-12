@@ -479,16 +479,18 @@ axl_input_set_touch_config(
 /// them to the LATEST position (a process-global setting; call before
 /// attaching).  Default 1 = read one state per dispatch (legacy behavior).
 ///
-/// Some firmware — notably a BMC/remote-console virtual mouse — queues pointer
-/// states FIFO: a fast move enqueues many, and at one-read-per-poll the cursor
-/// drains the backlog slowly and lags seconds behind.  Raising this drains up
-/// to @p max_states per read and reports only the final position, so a slow,
-/// protocol-safe poll still catches up in one tick.  A value of 0 or 1 keeps
-/// the single-read behavior.
+/// Some firmware — notably a BMC/remote-console virtual mouse (iDRAC) — queues
+/// pointer states FIFO: a fast move enqueues many, and at one-read-per-poll the
+/// cursor drains the backlog slowly and lags seconds behind.  Raising this
+/// drains up to @p max_states per read and reports only the final position, so
+/// a slow, protocol-safe poll still catches up in one tick.  A value of 0 or 1
+/// keeps the single-read behavior.
 ///
-/// Coalescing reports only the last drained state's buttons, so a full press+
-/// release that lands entirely within one drained batch can be missed — fine
-/// for tracking, so keep the default (1) where click latency matters.
+/// Coalescing collapses only pure-motion runs: the drain STOPS at any button
+/// (contact) transition and processes it before continuing, so a press or
+/// release is never coalesced away — a full click queued behind a motion
+/// backlog still produces its down/up.  Motion compresses, edges don't; it is
+/// therefore safe to raise this even where clicks matter.
 void
 axl_input_set_touch_drain(
     uint32_t  max_states   ///< max queued states to coalesce per read (0/1 = no coalesce)

@@ -70,7 +70,10 @@ while [[ $# -gt 0 ]]; do
             echo "axl-cc $VER (gcc, built $DATE)"
             exit 0 ;;
         -h|--help)
-            cat <<HELP
+            # Quoted delimiter: the body is literal — an unquoted <<HELP
+            # would run the backticked `ar rcs` in the examples as a
+            # command substitution (printing ar's usage instead of ours).
+            cat <<'HELP'
 axl-cc -- compile C or C++ source to UEFI binary (.efi)
 
 Usage: axl-cc [OPTIONS] source.c [source2.cpp ...] [-o output.efi]
