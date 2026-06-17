@@ -40,9 +40,15 @@ stream_upload_data(
             conn->upload_buf_len = 0;
             if (rc != 0) {
                 axl_warning("upload handler aborted during chunk flush");
-                conn->upload_resp.status_code = 500;
+                /* Respect a status the handler set before aborting (e.g.
+                   405 for a PUT to a read-only mount); default to 500
+                   only if it left the response untouched. Matches the
+                   clean-EOF path below. */
+                if (conn->upload_resp.status_code == 200) {
+                    conn->upload_resp.status_code = 500;
+                }
                 /* Force close-after-send. on_response_sent will run
-                   reset_connection AFTER the 500 hits the wire. */
+                   reset_connection AFTER the status hits the wire. */
                 conn->keep_alive = false;
                 send_response(conn, &conn->upload_resp);
                 return;
@@ -64,7 +70,9 @@ stream_upload_data(
         conn->upload_buf_len = 0;
         if (rc != 0) {
             axl_warning("upload handler aborted during final flush");
-            conn->upload_resp.status_code = 500;
+            if (conn->upload_resp.status_code == 200) {
+                conn->upload_resp.status_code = 500;
+            }
             conn->keep_alive = false;
             send_response(conn, &conn->upload_resp);
             return;

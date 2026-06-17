@@ -32,6 +32,22 @@ extern "C" {
 typedef struct AxlLoop AxlLoop;
 
 /**
+ * AxlSourceId:
+ *
+ * Opaque handle for a registered loop source, returned by the
+ * `axl_loop_add_*` functions and passed to `axl_loop_remove_source`.
+ * 0 is never a valid id (it means "no source").
+ *
+ * Ids are allocated from a single PROCESS-GLOBAL monotonic counter, so
+ * every live source across every loop has a distinct id. This is what
+ * makes a stale id (one that outlived its loop) safe to pass to
+ * `axl_loop_remove_source` on a different loop: it matches nothing, so
+ * the removal is a no-op rather than deleting an unrelated source.
+ * 64-bit so the counter never wraps in any realistic process lifetime.
+ */
+typedef uint64_t AxlSourceId;
+
+/**
  * AxlSourceType:
  *
  * Identifies the kind of event source in the loop.
@@ -267,12 +283,22 @@ axl_loop_run(
  * `axl_defer_call_later` to break it up across ticks.
  *
  * **Boot Services TPL ceiling.** `gBS->WaitForEvent` is unavailable
- * above `TPL_APPLICATION`, so the dispatch is non-blocking-only.
- * The sources you can use safely from driver mode are the same
- * sources `axl_loop_run` supports (timers, idle, raw events,
- * pubsub) — anything that would internally call `WaitForEvent`
- * (notably `axl_loop_iterate_until` with a non-zero timeout) is
- * not safe inside a source callback.
+ * above `TPL_APPLICATION`, so this tick's own dispatch is
+ * non-blocking-only. A nested blocking wait reached from a source
+ * callback — a synchronous network op (`axl_udp_send`,
+ * `axl_http_post`, a DNS lookup) or `axl_loop_iterate_until` with a
+ * timeout, both of which spin up a nested `axl_loop_run` — is still
+ * **safe**: the backend wait detects the raised TPL and falls back to
+ * a `CheckEvent` sweep instead of `WaitForEvent`, so it makes progress
+ * and returns rather than wedging. It becomes a **latency** concern
+ * instead of a safety one, but the blast radius is wide: the nested
+ * wait busy-holds `TPL_CALLBACK` for its whole duration (the
+ * notify-budget rule above), which stalls *every other connection
+ * serviced by the same pump*, not just the current one. A wait that
+ * carries a timeout self-limits to that deadline (the sync network ops
+ * all pass one); a deadline-less wait whose condition never resolves
+ * holds `TPL_CALLBACK` indefinitely — so always give such waits a
+ * timeout, keep them short, or gate the slow op off the driver pump.
  *
  * Typical period: 50 ms — frequent enough for a responsive HTTP
  * server, sparse enough to leave headroom. Pick lower for
@@ -319,7 +345,7 @@ axl_loop_detach_driver(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_timer(
     AxlLoop        *loop,        ///< event loop
     uint32_t        interval_ms, ///< timer interval in milliseconds
@@ -332,7 +358,7 @@ axl_loop_add_timer(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_timeout(
     AxlLoop        *loop,     ///< event loop
     uint32_t        delay_ms, ///< timeout delay in milliseconds
@@ -345,7 +371,7 @@ axl_loop_add_timeout(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_key_press(
     AxlLoop       *loop, ///< event loop
     AxlKeyCallback cb,   ///< key press callback
@@ -357,7 +383,7 @@ axl_loop_add_key_press(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_idle(
     AxlLoop        *loop, ///< event loop
     AxlLoopCallback cb,   ///< idle callback (fired every iteration before wait)
@@ -369,7 +395,7 @@ axl_loop_add_idle(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_protocol_notify(
     AxlLoop        *loop, ///< event loop
     void           *guid, ///< protocol GUID to watch (void* to avoid EFI_GUID in header)
@@ -387,7 +413,7 @@ axl_loop_add_protocol_notify(
  *
  * @return source ID for axl_loop_remove_source, or 0 on failure.
  */
-uint32_t
+AxlSourceId
 axl_loop_add_event(
     AxlLoop        *loop,   ///< event loop
     AxlEventHandle  event,  ///< event handle (from axl_event_handle or a firmware-owned EFI_EVENT)
@@ -400,8 +426,8 @@ axl_loop_add_event(
  */
 void
 axl_loop_remove_source(
-    AxlLoop  *loop,      ///< event loop
-    uint32_t  source_id  ///< ID returned by axl_loop_add_*
+    AxlLoop     *loop,      ///< event loop
+    AxlSourceId  source_id  ///< ID returned by axl_loop_add_*
 );
 
 // ---------------------------------------------------------------------------

@@ -674,6 +674,12 @@ axl_service_main(const AxlServiceDeploy *deploy, int argc, char **argv)
             .default_value = descs[i].default_value,
             .help          = descs[i].description,
             .choices       = descs[i].choices,
+            /* Propagate the option's numeric range so the synthesized CLI
+             * validates it (AxlArgDesc min/max are uint64_t, 0 = none — same
+             * convention as the config descriptor; signed bounds ride the cast,
+             * matching AxlArgDesc's documented signed-via-cast pattern). */
+            .min           = (uint64_t)descs[i].min,
+            .max           = (uint64_t)descs[i].max,
         };
     }
     flags[n_opts] = (AxlArgDesc){

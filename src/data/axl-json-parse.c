@@ -353,6 +353,26 @@ axl_json_get_string(const AxlJsonReader *ctx, const char *key,
 }
 
 bool
+axl_json_value_string(const AxlJsonReader *ctx, char *value, size_t value_size)
+{
+    const jsmntok_t *tok;
+
+    if (ctx == NULL || value == NULL || value_size == 0
+        || ctx->tokens == NULL || ctx->token_count < 1) {
+        return false;
+    }
+
+    tok = &((const jsmntok_t *)ctx->tokens)[0];
+    if (tok->type != JSMN_STRING) {
+        return false;
+    }
+
+    return decode_json_string(ctx->json + tok->start,
+                              (size_t)(tok->end - tok->start),
+                              value, value_size);
+}
+
+bool
 axl_json_get_int(const AxlJsonReader *ctx, const char *key, int64_t *value)
 {
     int32_t vi;

@@ -16,7 +16,7 @@
  * @endcode
  *
  * Supported options:
- *   "timeout.ms"      — per-operation timeout in milliseconds (default: "10000")
+ *   "timeout.ms"      — idle/per-phase timeout in ms, re-armed on progress (default: "10000")
  *   "keep.alive"      — connection reuse: "true" (default) or "false"
  *   "max.redirects"   — redirect limit (default: "5"), "0" to disable
  *   "tls.verify"      — certificate verification: "true" (default) or "false"
@@ -38,6 +38,12 @@ extern "C" {
 #endif
 
 typedef struct AxlHttpClient AxlHttpClient;
+
+/* Forward-declared: the async API drives the request on an AxlLoop (defined
+   in <axl/axl-loop.h>) and takes an optional AxlCancellable (in
+   <axl/axl-cancellable.h>); consumers of the async API include those. */
+typedef struct AxlLoop AxlLoop;
+typedef struct AxlCancellable AxlCancellable;
 
 typedef struct {
     size_t   status_code;
@@ -120,6 +126,85 @@ axl_http_post(
     size_t                 size,           ///< body size in bytes
     const char             *content_type,  ///< MIME type (e.g. "application/json")
     AxlHttpClientResponse  **out_resp      ///< receives response
+);
+
+/**
+ * AxlHttpClientDoneFn:
+ *
+ * Completion callback for the async HTTP requests. On success @p st is AXL_OK
+ * and @p resp is the response — the callback TAKES OWNERSHIP and MUST free it
+ * with axl_http_client_response_free(). On failure (transport error, timeout,
+ * or AXL_CANCELLED) @p st is the error code and @p resp is NULL. A non-2xx
+ * HTTP status is still AXL_OK with a non-NULL @p resp (inspect status_code).
+ */
+typedef void (*AxlHttpClientDoneFn)(
+    AxlHttpClientResponse *resp,  ///< response (callback owns it — free it), or NULL on failure
+    AxlStatus              st,    ///< AXL_OK, or an error / timeout / AXL_CANCELLED
+    void                  *user   ///< opaque context
+);
+
+/**
+ * @brief Asynchronous HTTP GET — the async peer of axl_http_get.
+ *
+ * Drives the whole request (DNS resolve, connect, TLS handshake, send,
+ * receive, redirects) as events on @p loop with NO nested loop, so it is safe
+ * from inside a loop callback or a resident driver-pump at raised TPL — where
+ * the sync axl_http_get nests an ephemeral loop (and now warns). @p cb fires
+ * exactly once on completion.
+ *
+ * Uses @p c's configuration (timeout, default headers, redirect limit, TLS
+ * verification) and connection state (keep-alive), exactly as the sync API.
+ * For https, axl_tls_init() must have been called once at startup. The sync
+ * axl_http_get is now a thin wrapper over this on a private ephemeral loop.
+ *
+ * **One in-flight request per client.** If a request is already running on
+ * @p c, this returns AXL_BUSY and @p cb does NOT fire — use a separate client
+ * for concurrency, or wait for the prior @p cb. Do NOT axl_http_client_free()
+ * @p c while a request is in flight; cancel via @p cancel (or wait for @p cb)
+ * first.
+ *
+ * **Fire-and-forget:** if @p cb is NULL the request still runs to completion
+ * and the response is freed internally — note this discards ALL post-
+ * initiation outcomes, including non-2xx responses and transport errors. Pass
+ * a minimal @p cb if you need to observe failures.
+ *
+ * @return AXL_OK if the request was initiated (@p cb WILL fire later);
+ *     AXL_BUSY if a request is already in flight; another error if it could
+ *     not start. @p cb fires later IFF this returns AXL_OK.
+ */
+int
+axl_http_get_async(
+    AxlHttpClient        *c,       ///< client (carries config + connection)
+    AxlLoop              *loop,    ///< loop to drive the request on
+    const char           *url,     ///< full URL string
+    AxlCancellable       *cancel,  ///< optional cancel token (NULL = uncancellable)
+    AxlHttpClientDoneFn   cb,      ///< completion callback, or NULL (fire-and-forget)
+    void                 *user     ///< opaque context for @p cb
+);
+
+/**
+ * @brief Asynchronous HTTP POST — the async peer of axl_http_post.
+ *
+ * See axl_http_get_async for the loop / ownership / one-in-flight (AXL_BUSY) /
+ * cancel / TLS / fire-and-forget contract. @p body is borrowed — it must stay
+ * valid until @p cb fires (it is not copied). Contiguous body only; there is
+ * no async streaming-body variant — use the sync axl_http_request_streaming
+ * for multi-chunk uploads.
+ *
+ * @return AXL_OK if the request was initiated (@p cb WILL fire later);
+ *     AXL_BUSY if a request is already in flight; another error otherwise.
+ */
+int
+axl_http_post_async(
+    AxlHttpClient        *c,             ///< client (carries config + connection)
+    AxlLoop              *loop,          ///< loop to drive the request on
+    const char           *url,           ///< full URL string
+    const void           *body,          ///< request body (borrowed until @p cb fires)
+    size_t                size,          ///< body size in bytes
+    const char           *content_type,  ///< MIME type (e.g. "application/json"), or NULL
+    AxlCancellable       *cancel,        ///< optional cancel token (NULL = uncancellable)
+    AxlHttpClientDoneFn   cb,             ///< completion callback, or NULL (fire-and-forget)
+    void                 *user           ///< opaque context for @p cb
 );
 
 /**

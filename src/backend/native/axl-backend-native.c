@@ -787,6 +787,36 @@ axl_backend_file_rename(
 }
 
 int
+axl_backend_file_set_size(
+    AxlFileHandle  handle,
+    uint64_t       size
+    )
+{
+    EFI_SHELL_PROTOCOL  *shell;
+    SHELL_FILE_HANDLE    fh = (SHELL_FILE_HANDLE)handle;
+    EFI_FILE_INFO       *info;
+    EFI_STATUS           status;
+
+    shell = get_shell();
+    if (shell == NULL || handle == NULL) {
+        return AXL_ERR;
+    }
+
+    /* GetFileInfo returns a fresh allocation we mutate and write back —
+       same SetFileInfo round-trip the rename path uses. The struct
+       (filename tail included) is preserved; only FileSize changes. */
+    info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
+    if (info == NULL) {
+        return AXL_ERR;
+    }
+    info->FileSize = size;
+    status = shell->SetFileInfo(fh, (CONST EFI_FILE_INFO *)info);
+    axl_backend_free(info);
+
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
+int
 axl_backend_file_mkdir(
     const unsigned short  *path
     )

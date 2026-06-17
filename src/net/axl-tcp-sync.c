@@ -39,7 +39,7 @@ typedef struct {
     EFI_TCP4_CLOSE_TOKEN  close_token;
     AxlTcp               *sock;
     AxlLoop              *loop;       /* set on the async path */
-    uint32_t              source_id;  /* set on the async path */
+    AxlSourceId           source_id;  /* set on the async path */
 } AxlTcpCloseCtx;
 
 // ---------------------------------------------------------------------------
@@ -109,6 +109,50 @@ on_sync_complete(AxlTcp *sock, AxlStatus status, void *data)
     return false;
 }
 
+/* 10 ms — matches the UDP sync wrapper's Poll-tick cadence (udp_sync_poll_tick). */
+#define AXL_TCP_SYNC_POLL_TICK_MS  10u
+
+/* Drive the TCP4 state machine while a sync wrapper's ephemeral loop is
+   blocked. In the foreground the firmware notify advances connect/send/recv
+   below TPL_APPLICATION and this tick is a cheap no-op (Poll() on an idle
+   socket). But when a sync TCP op runs at a raised TPL — called from inside
+   a driver-pump notify dispatched at TPL_CALLBACK — the loop's blocking wait
+   holds TPL_CALLBACK continuously and starves that notify, so nothing would
+   advance tcp4 and the op would stall to its full timeout. The periodic
+   Poll() drives it, exactly as the UDP sync wrapper does for UDP. The tick only
+   exists for the duration of the blocking wait (the wrapper removes it
+   before freeing the loop), so it adds no steady-state work. */
+static bool
+tcp_sync_poll_tick(void *data)
+{
+    EFI_TCP4_PROTOCOL *tcp4 = (EFI_TCP4_PROTOCOL *)data;
+    axl_efi_call(tcp4->Poll, 1, tcp4);
+    return AXL_SOURCE_CONTINUE;
+}
+
+/* Arm the Poll() tick on @p loop for @p tcp4 — but ONLY at a raised TPL,
+   where it is actually needed. At TPL_APPLICATION the firmware notify drives
+   the op for free, so installing a 10 ms timer there would just burn CPU
+   (a long foreground recv would wake 100×/s for nothing). Returns the tick's
+   source id, or 0 when not armed. Pair with tcp_sync_disarm_poll_tick. */
+static AxlSourceId
+tcp_sync_arm_poll_tick(AxlLoop *loop, EFI_TCP4_PROTOCOL *tcp4)
+{
+    if (!axl_backend_at_raised_tpl()) {
+        return 0;
+    }
+    return axl_loop_add_timer(loop, AXL_TCP_SYNC_POLL_TICK_MS,
+                              tcp_sync_poll_tick, tcp4);
+}
+
+static void
+tcp_sync_disarm_poll_tick(AxlLoop *loop, AxlSourceId poll_src)
+{
+    if (poll_src != 0) {
+        axl_loop_remove_source(loop, poll_src);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // axl_tcp_connect
 // ---------------------------------------------------------------------------
@@ -120,10 +164,13 @@ on_sync_cancel_timeout(void *data)
     return AXL_SOURCE_REMOVE;
 }
 
+#define AXL_TCP_CONNECT_TIMEOUT_DEFAULT_MS  10000u
+
 int
-axl_tcp_connect_via(const char *host, uint16_t port,
-                    const AxlIPv4Address *source_ip,
-                    AxlTcp **out_sock)
+axl_tcp_connect_timeout(const char *host, uint16_t port,
+                        const AxlIPv4Address *source_ip,
+                        size_t connect_timeout_ms,
+                        AxlTcp **out_sock)
 {
     if (host == NULL || out_sock == NULL) {
         return AXL_ERR;
@@ -142,15 +189,33 @@ axl_tcp_connect_via(const char *host, uint16_t port,
 
     SyncResult r = { .sock = NULL, .status = AXL_ERR, .done = false, .loop = loop };
 
-    if (axl_tcp_connect_async_via(host, port, source_ip, loop, cancel,
-                                  on_sync_complete, &r) != AXL_OK) {
+    AxlTcp *pending = NULL;
+    if (axl_tcp_connect_async_via_ex(host, port, source_ip, loop, cancel,
+                                     on_sync_complete, &r, &pending) != AXL_OK) {
         axl_cancellable_free(cancel);
         axl_loop_free(loop);
         return AXL_ERR;
     }
 
-    axl_loop_add_timeout(loop, 10000, on_sync_cancel_timeout, cancel);
+    /* Drive tcp4->Poll() while we block, so the connect advances even at a
+       raised TPL (see tcp_sync_poll_tick). pending->tcp4 is captured now,
+       while the socket is alive; the tick stops firing once the loop quits
+       on completion (which is also where a failed connect frees the sock),
+       so it never polls a freed tcp4. pending/tcp4 are non-NULL on the AXL_OK
+       return above; the guard degrades to no tick (not a crash) should a
+       future async-connect error path ever return OK without them. */
+    AxlSourceId poll_src = (pending != NULL && pending->tcp4 != NULL)
+                            ? tcp_sync_arm_poll_tick(loop, pending->tcp4)
+                            : 0;
+
+    /* 0 means "use the default", not "wait forever" — an unbounded connect
+       is rarely wanted, and a hung SYN would otherwise stall the loop. */
+    size_t ct = (connect_timeout_ms > 0)
+                    ? connect_timeout_ms : AXL_TCP_CONNECT_TIMEOUT_DEFAULT_MS;
+    axl_loop_add_timeout(loop, ct, on_sync_cancel_timeout, cancel);
     axl_loop_run(loop);
+
+    tcp_sync_disarm_poll_tick(loop, poll_src);
 
     /* axl_tcp_connect_async stamped sock->async_loop with this
        ephemeral loop. Clear it before the loop frees so a subsequent
@@ -170,6 +235,15 @@ axl_tcp_connect_via(const char *host, uint16_t port,
         return AXL_OK;
     }
     return AXL_ERR;
+}
+
+int
+axl_tcp_connect_via(const char *host, uint16_t port,
+                    const AxlIPv4Address *source_ip,
+                    AxlTcp **out_sock)
+{
+    /* Convenience form — the 10 s default connect timeout. */
+    return axl_tcp_connect_timeout(host, port, source_ip, 0, out_sock);
 }
 
 int
@@ -321,7 +395,11 @@ axl_tcp_accept(AxlTcp *listener, AxlTcp **out_client, size_t timeout_ms)
     if (timeout_ms > 0) {
         axl_loop_add_timeout(loop, timeout_ms, on_sync_cancel_timeout, cancel);
     }
+    /* Drive the listener's TCP4 so a pending accept advances at a raised
+       TPL too (see tcp_sync_poll_tick). */
+    AxlSourceId poll_src = tcp_sync_arm_poll_tick(loop, listener->tcp4);
     axl_loop_run(loop);
+    tcp_sync_disarm_poll_tick(loop, poll_src);
 
     /* Tear down the per-call accept state before freeing the loop.
        on_accept_complete's success path re-arms and returns CONTINUE
@@ -391,11 +469,21 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
     }
 
     axl_loop_add_timeout(loop, timeout_ms, on_sync_cancel_timeout, cancel);
+    /* Drive tcp4->Poll() so the send advances at a raised TPL too
+       (see tcp_sync_poll_tick). */
+    AxlSourceId poll_src = tcp_sync_arm_poll_tick(loop, sock->tcp4);
     axl_loop_run(loop);
+    tcp_sync_disarm_poll_tick(loop, poll_src);
 
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
     sock->async_loop = saved_loop;
+
+    /* on_send_complete / on_send_cancel already zero send_source /
+       send_cancel_source on every send path (so axl_tcp_send_in_flight stays
+       accurate). Even if one didn't, source ids are now process-globally
+       unique (axl-loop.c), so a stale id can't collide with another loop's
+       source — no post-teardown clearing needed here. */
 
     return r.status;
 }
@@ -442,11 +530,28 @@ axl_tcp_recv(AxlTcp *sock, void *buf, size_t *size, size_t timeout_ms)
     }
 
     axl_loop_add_timeout(loop, timeout_ms, on_sync_cancel_timeout, cancel);
+    /* Drive tcp4->Poll() so the recv advances at a raised TPL too
+       (see tcp_sync_poll_tick). */
+    AxlSourceId poll_src = tcp_sync_arm_poll_tick(loop, sock->tcp4);
     axl_loop_run(loop);
+    tcp_sync_disarm_poll_tick(loop, poll_src);
 
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
     sock->async_loop = saved_loop;
+
+    /* on_recv_complete's !keep branch can't zero recv_source/recv_cancel_source
+       (it must not touch a sock the callback may have freed), so they still
+       hold ids from the now-freed ephemeral loop. The cross-loop-removal hazard
+       this used to create (axl_tcp_close deleting a colliding id off the
+       restored outer loop) is gone — source ids are now process-globally unique
+       (axl-loop.c), so a stale id matches nothing on another loop. We still zero
+       them here (the sock is valid in this sync context) for a separate reason:
+       the NEXT sync recv on this sock checks recv_source > 0 and would otherwise
+       issue a needless tcp4->Cancel on the already-completed token
+       (axl_tcp_recv_async re-arm path). */
+    sock->recv_source        = 0;
+    sock->recv_cancel_source = 0;
 
     if (r.status == AXL_OK) {
         *size = axl_tcp_recv_get_size(sock);

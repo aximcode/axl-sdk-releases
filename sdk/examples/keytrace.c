@@ -98,7 +98,7 @@ main(int argc, char *argv[])
     KeyTrace t = {0};
     t.loop = axl_loop_new();
 
-    uint32_t kid = axl_input_attach_key(t.loop, on_key, &t);
+    AxlSourceId kid = axl_input_attach_key(t.loop, on_key, &t);
     if (kid == 0) {
         axl_printf("keytrace: no keyboard available.\n");
         axl_loop_free(t.loop);

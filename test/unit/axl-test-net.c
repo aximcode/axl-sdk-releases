@@ -9,6 +9,10 @@
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
 #include <axl/axl-http-core.h>
+#include <axl/axl-shell.h>
+#include <axl/axl-console-mirror.h>
+#include <axl/axl-file-view.h>   /* read-back of the edited file (rung 3) */
+#include <uefi/axl-uefi.h>   /* gST + console protocols for mirror-selftest */
 
 AXL_LOG_DOMAIN("test");
 
@@ -1308,6 +1312,11 @@ test_auth_callback(
         auth_out->role = AXL_ROUTE_AUTH;
         return 0;
     }
+    if (axl_strcmp(auth, "Bearer admin-token") == 0) {
+        auth_out->username = "admin";
+        auth_out->role = AXL_ROUTE_ADMIN;
+        return 0;
+    }
     return -1;
 }
 
@@ -2023,6 +2032,169 @@ on_ws_echo(
     return 0;
 }
 
+// Per-connection echo (add_websocket_ex): reply only to the sending client
+// via axl_ws_send, prefixed "ex:" so the test distinguishes it from a
+// broadcast. CONNECT reads the peer to prove the handle carries identity.
+static int
+on_ws_echo_ex(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        uint8_t peer[4] = { 0 };
+        if (axl_ws_conn_peer(conn, peer) == AXL_OK) {
+            axl_printf("WS-EX: connect peer=%u.%u.%u.%u\r\n",
+                       peer[0], peer[1], peer[2], peer[3]);
+        }
+        return 0;
+    }
+    if (event == AXL_WS_TEXT) {
+        char   reply[256];
+        int    n = (frame_size < 240) ? (int)frame_size : 240;
+        axl_snprintf(reply, sizeof(reply), "ex:%.*s", n, (const char *)frame);
+        axl_ws_send(conn, AXL_WS_TEXT, reply, axl_strlen(reply));
+    }
+    return 0;
+}
+
+// Server-initiated close from within a frame handler (axl_ws_conn_close):
+// regression guard for the "handler tears down the conn mid-dispatch" path —
+// process_websocket_data must not re-arm recv on the reset connection.
+static int
+on_ws_close(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)data;
+    if (event == AXL_WS_TEXT && frame_size == 3
+        && axl_memcmp(frame, "bye", 3) == 0) {
+        axl_ws_conn_close(conn);
+    }
+    return 0;
+}
+
+// Burst endpoint (ws-broadcast-over-TLS desync repro): on ANY client frame,
+// fire WS_BURST_N back-to-back ws_broadcast calls within one dispatch — exactly
+// what the console mirror does echoing one keystroke (>=3 ConOut ops). Each
+// frame carries a distinct, fixed-width payload so the client can assert all N
+// arrive in order, byte-exact, with the TLS stream intact (no desync). `data`
+// is the AxlHttpServer* (broadcast needs the server).
+#define WS_BURST_N  8
+static int
+on_ws_burst(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)conn;
+    (void)frame;
+    (void)frame_size;
+    AxlHttpServer *s = (AxlHttpServer *)data;
+    if (event == AXL_WS_TEXT || event == AXL_WS_BINARY) {
+        for (int i = 0; i < WS_BURST_N; i++) {
+            char msg[16];
+            /* Fixed 8-byte payload "WSBURSTn" — distinct per frame. */
+            axl_snprintf(msg, sizeof(msg), "WSBURST%d", i);
+            axl_http_server_ws_broadcast(s, "/ws-burst", msg, axl_strlen(msg));
+        }
+    }
+    return 0;
+}
+
+// Authenticated endpoint (add_websocket_ex + AXL_ROUTE_AUTH): echoes the
+// identity captured at upgrade, proving auth-on-upgrade + axl_ws_conn_auth.
+static int
+on_ws_auth(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_TEXT) {
+        AxlAuthInfo info;
+        char        reply[128];
+        if (axl_ws_conn_auth(conn, &info) == AXL_OK && info.username != NULL) {
+            axl_snprintf(reply, sizeof(reply), "user:%s", info.username);
+        } else {
+            axl_strlcpy(reply, "user:?", sizeof(reply));
+        }
+        axl_ws_send(conn, AXL_WS_TEXT, reply, axl_strlen(reply));
+    }
+    return 0;
+}
+
+// P1 greet-on-connect: a banner sent from AXL_WS_CONNECT must reach the
+// client AFTER the 101 (valid only because CONNECT now fires post-handshake).
+static int
+on_ws_greet(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        axl_ws_send(conn, AXL_WS_TEXT, "hi", 2);
+    }
+    return 0;
+}
+
+// P1 close-from-connect: calling axl_ws_conn_close from AXL_WS_CONNECT (then
+// returning AXL_OK) must not leave on_response_sent arming recv on the
+// torn-down conn — regression for the missing post-CONNECT active check.
+static int
+on_ws_connect_close(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        axl_ws_conn_close(conn);
+    }
+    return 0;   /* AXL_OK — close already requested */
+}
+
+// P1 reject-on-connect: returning AXL_ERR from AXL_WS_CONNECT must drop the
+// connection (the 101 was sent, then the socket closes; no further events).
+static int
+on_ws_reject(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)conn;
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        return AXL_ERR;   /* refuse the connection */
+    }
+    return 0;
+}
+
 static int
 run_serve_mode(void)
 {
@@ -2056,6 +2228,7 @@ run_serve_mode(void)
 
     /* Auth-protected route */
     axl_http_server_use_auth(s, test_auth_callback, NULL);
+    axl_http_server_set_auth_challenge(s, "Basic", "axl-test");
     axl_http_server_add_route_auth(s, "GET", "/secret", on_secret, NULL,
                                    AXL_ROUTE_AUTH);
 
@@ -2112,6 +2285,18 @@ run_serve_mode(void)
     /* WebSocket echo endpoint */
     ws_test_server = s;
     axl_http_server_add_websocket(s, "/ws-echo", on_ws_echo, NULL);
+    axl_http_server_add_websocket_ex(s, "/ws-echo-ex", on_ws_echo_ex, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-auth", on_ws_auth, NULL,
+                                     AXL_ROUTE_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-close", on_ws_close, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-greet", on_ws_greet, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-reject", on_ws_reject, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s, "/ws-connect-close", on_ws_connect_close,
+                                     NULL, AXL_ROUTE_NO_AUTH);
 
     axl_printf("HTTP server listening on port 8080\n");
     axl_printf("Routes: /api/version, /api/health, /plain, /echo, /client-test, /secret, /cached, /ws-echo, /rt/*\n");
@@ -2173,11 +2358,1110 @@ run_serve_tls_mode(void)
 
     axl_http_server_add_route(s, "GET", "/api/version", on_get_version, NULL);
     axl_http_server_add_route(s, "GET", "/plain",       on_get_plain,   NULL);
+    /* Per-connection WS over TLS — the inbound-frame-over-TLS regression
+       (wss client echo). on_ws_echo_ex replies per-client via axl_ws_send. */
+    axl_http_server_add_websocket_ex(s, "/ws-echo-ex", on_ws_echo_ex, NULL,
+                                     AXL_ROUTE_NO_AUTH);
 
     axl_printf("HTTPS server listening on port 8443\n");
     axl_printf("READY\n");
 
     return axl_http_server_run(s);
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS server driven by a RESIDENT driver-tick loop — "serve-tls-driver".
+//
+// Same TLS server as serve-tls, but instead of a top-level axl_loop_run it
+// uses axl_loop_attach_driver (the DXE-driver / AxlService dispatch: a
+// periodic timer notify at TPL_CALLBACK drains the loop) and idles the
+// foreground. This is the shape that exposed the TLS handshake stall — a
+// synchronous handshake nesting an ephemeral axl_loop_run cannot run at the
+// tick's raised TPL. With the async handshake it completes; the same curl
+// that times out against the buggy build gets a 200 here.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_tls_driver_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        return -1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8443);
+    if (loop == NULL || s == NULL
+        || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    axl_http_server_add_route(s, "GET", "/api/version", on_get_version, NULL);
+    axl_http_server_add_route(s, "GET", "/plain",       on_get_plain,   NULL);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    /* Drive the loop the way a resident DXE driver / AxlService does — a
+       periodic firmware timer at TPL_CALLBACK, NOT a foreground
+       axl_loop_run. The foreground then idles. */
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTPS server (resident driver-tick loop) on port 8443\n");
+    axl_printf("READY\n");
+
+    /* Idle: the driver tick pumps the loop in the background. */
+    for (;;) {
+        axl_msleep(1000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS + per-client WebSocket under a RESIDENT driver-tick loop —
+// "serve-tls-ws-driver".
+//
+// Regression for the WS-teardown wedge (SoftBMC console-mirror RemoteShell):
+// the same TLS server as serve-tls-driver, plus a PER_CLIENT WebSocket
+// endpoint (add_websocket_ex). A wss client connect + clean disconnect against
+// the pumped server used to WEDGE the whole loop — process_websocket_data's
+// WS_OP_CLOSE echo (and axl_ws_conn_close) did a SYNCHRONOUS axl_tls_write,
+// which spins a nested ephemeral axl_loop_run that cannot progress at the
+// tick's raised TPL (the adbf5461 / axl_tls_free hazard). The next HTTPS GET
+// then timed out. With the async-pong + FIN-conveys-close fix the loop keeps
+// serving after a WS connect/disconnect. Driven by test-ws-teardown-driver-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_tls_ws_driver_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        return -1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8443);
+    if (loop == NULL || s == NULL
+        || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    axl_http_server_add_route(s, "GET", "/api/version", on_get_version, NULL);
+    axl_http_server_add_route(s, "GET", "/plain",       on_get_plain,   NULL);
+    /* Per-client WebSocket endpoint — the console-mirror RemoteShell shape. */
+    axl_http_server_add_websocket_ex(s, "/ws-console", on_ws_echo_ex, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    /* Burst endpoint — the ws-broadcast-over-TLS desync repro: on any client
+       frame, fire WS_BURST_N back-to-back broadcasts within one dispatch. */
+    axl_http_server_add_websocket_ex(s, "/ws-burst", on_ws_burst, s,
+                                     AXL_ROUTE_NO_AUTH);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTPS+WS server (resident driver-tick loop) on port 8443\n");
+    axl_printf("READY\n");
+
+    /* Idle: the driver tick pumps the loop in the background. */
+    for (;;) {
+        axl_msleep(1000);
+    }
+}
+
+/* on_get_srv2 (the plain second server's handler) is defined later. */
+static int
+on_get_srv2(AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
+
+// ---------------------------------------------------------------------------
+// Consumer-emulator: the CANONICAL hazardous topology — "serve-hazard-driver".
+//
+// This is the SoftBMC execution model in one binary, combining every shape
+// that surfaced a wedge: HTTPS (8443) AND plain HTTP (8081) on ONE shared
+// loop (the adbf5461 second-server-dead-accept class), pumped from an
+// axl_loop_attach_driver tick at raised TPL (the d249a9b6 / e90b87e4 sync-at-
+// raised-TPL class), with a per-client WebSocket endpoint whose handlers do
+// async I/O and a broadcast-burst endpoint (the 4563aabf ws-over-TLS desync).
+// The unit suite only ever models one server on its own loop at TPL_APPLICATION;
+// this mode is the in-repo stand-in for the consumer that found those bugs.
+// Driven by test-consumer-emulator-qemu.sh, which probes liveness after each
+// scenario. See docs/AXL-Concurrency.md "Testing the model".
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_hazard_driver_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        return -1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s1   = axl_http_server_new(8443);   /* HTTPS, started first */
+    AxlHttpServer *s2   = axl_http_server_new(8081);   /* plain, started 2nd   */
+    if (loop == NULL || s1 == NULL || s2 == NULL
+        || axl_http_server_use_tls(s1, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    /* HTTPS server: a plain route (liveness probe target), a per-client WS
+       endpoint (handlers send/close), and a broadcast-burst endpoint. */
+    axl_http_server_add_route(s1, "GET", "/api/version", on_get_version, NULL);
+    axl_http_server_add_route(s1, "GET", "/plain",       on_get_plain,   NULL);
+    axl_http_server_add_websocket_ex(s1, "/ws-console", on_ws_echo_ex, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+    axl_http_server_add_websocket_ex(s1, "/ws-burst", on_ws_burst, s1,
+                                     AXL_ROUTE_NO_AUTH);
+    /* Plain second server on the SHARED loop — must still dispatch. */
+    axl_http_server_add_route(s2, "GET", "/plain", on_get_srv2, NULL);
+
+    if (axl_http_server_start(s1, loop) != 0
+        || axl_http_server_start(s2, loop) != 0) {
+        axl_printf("ERROR: failed to start servers on shared loop\n");
+        return -1;
+    }
+
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTPS(8443)+WS + plain HTTP(8081), shared driver-tick loop\n");
+    axl_printf("READY\n");
+
+    /* Idle: the driver tick pumps the loop in the background. */
+    for (;;) {
+        axl_msleep(1000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell coexistence spike — "serve-shell-coexist". The Console Mirror
+// linchpin: a foreground real Shell.efi (StartImage blocks) MUST coexist with
+// a background HTTP server pumped off a firmware timer (axl_loop_attach_driver,
+// the resident-driver model). We start a plain HTTP server on a loop, attach
+// the driver tick, then axl_shell_launch() — which blocks in the Shell. The
+// Shell sits at its prompt in WaitForEvent(ConIn), which lowers TPL and lets
+// the periodic timer fire and drain the loop. The harness curls /plain while
+// the Shell is foreground: a 200 proves the two coexist. The inner Shell never
+// gets input, so it never exits — the harness asserts on the curl and lets
+// QEMU time out.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_shell_coexist_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8080);
+    if (loop == NULL || s == NULL) {
+        axl_printf("ERROR: server setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(s, "GET", "/plain", on_get_plain, NULL);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    /* Pump the loop from a firmware periodic timer at TPL_CALLBACK — the
+       background HTTP heartbeat. The foreground then goes to the Shell. */
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTP server (driver-tick) on 8080; launching foreground Shell\n");
+    axl_printf("READY\n");
+
+    /* StartImage(Shell.efi) — blocks. The HTTP server keeps serving off
+       the timer the whole time. */
+    int exit_code = 0;
+    int rc = axl_shell_launch(&exit_code);
+    if (rc != AXL_OK) {
+        /* No Shell.efi staged on this runner: report so the harness can
+           SKIP-balance rather than read it as a coexistence failure. */
+        axl_printf("NO_SHELL\n");
+        return 0;
+    }
+
+    /* Reached only if the Shell exits (it won't in the unattended test). */
+    axl_loop_detach_driver(loop);
+    axl_printf("SHELL_EXITED %d\n", exit_code);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Console-mirror rung 5 (P3) — "serve-tls-shell-coexist". The deployment-
+// faithful SoftBMC shape, all three at once: the AxlConsoleMirror wrapping the
+// console, an HTTPS server pumped by axl_loop_attach_driver (TPL_CALLBACK), and
+// a real foreground child Shell.efi. Proves the TLS handshake completes under
+// the timer pump WHILE the mirrored Shell holds the foreground — the sharp
+// async-TLS-at-raised-TPL envelope combined with a blocked StartImage. The
+// harness curls HTTPS while the Shell is foreground; a 200 is the proof. The
+// inner Shell gets no input, so the app idles in the launcher; QEMU times out.
+// ---------------------------------------------------------------------------
+
+static void
+tls_coexist_sink(const char *bytes, size_t len, void *user)
+{
+    (void)bytes;
+    (void)len;
+    (void)user;   /* discard: rung 5 proves coexistence, not mirror content */
+}
+
+static int
+run_serve_tls_shell_coexist_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        axl_printf("NO_TLS\n");
+        return -1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8443);
+    if (loop == NULL || s == NULL
+        || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+    axl_http_server_add_route(s, "GET", "/plain", on_get_plain, NULL);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start TLS server on loop\n");
+        return -1;
+    }
+
+    /* Wrap the console (the child Shell runs mirrored), then pump the loop
+       from the firmware timer in the background. */
+    AxlConsoleMirror      *m   = NULL;
+    AxlConsoleMirrorConfig cfg = {
+        .sink = tls_coexist_sink, .user = NULL,
+        .cols = 80, .rows = 25, .passthrough_local = true,
+    };
+    if (axl_console_mirror_install(&m, &cfg) != AXL_OK) {
+        axl_printf("ERROR: mirror install failed\n");
+        return -1;
+    }
+
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTPS (driver-tick) on 8443 + mirror; launching foreground Shell\n");
+    axl_printf("READY\n");
+
+    /* Foreground: the real Shell, console mirrored, while HTTPS keeps serving
+       off the timer. Blocks (no input → never exits in the unattended test). */
+    int exit_code = 0;
+    if (axl_shell_launch(&exit_code) != AXL_OK) {
+        axl_printf("NO_SHELL\n");
+    }
+
+    axl_loop_detach_driver(loop);
+    axl_console_mirror_uninstall(m);
+    for (;;) {
+        axl_msleep(1000);
+    }
+    return 0;  /* unreachable */
+}
+
+// ---------------------------------------------------------------------------
+// Console-mirror self-test — "mirror-selftest". The positive AxlConsoleMirror
+// proof (install → wrap gST ConIn/ConOut → translate/inject → uninstall) run
+// in ITS OWN QEMU boot. It can't run in the combined unit boot: wrapping the
+// parent harness Shell's console wedges that Shell for the next binary (even
+// after a clean uninstall). Here we drive the wrapped console directly with a
+// capture sink, prove the VT translation + key injection, uninstall (restoring
+// the console), print results, then idle forever — never returning to the
+// (now-wedged) parent Shell. The harness greps the printed PASS lines.
+// ---------------------------------------------------------------------------
+
+static char   g_cm_cap[8192];
+static size_t g_cm_cap_len;
+
+static void
+cm_selftest_sink(const char *bytes, size_t len, void *user)
+{
+    (void)user;
+    for (size_t i = 0; i < len && g_cm_cap_len < sizeof(g_cm_cap) - 1; i++) {
+        g_cm_cap[g_cm_cap_len++] = bytes[i];
+    }
+    g_cm_cap[g_cm_cap_len] = '\0';
+}
+
+static int
+run_mirror_selftest_mode(void)
+{
+    AxlConsoleMirror      *m   = NULL;
+    AxlConsoleMirrorConfig cfg = {
+        .sink = cm_selftest_sink, .user = NULL,
+        .cols = 80, .rows = 25, .passthrough_local = false,
+    };
+
+    g_cm_cap_len = 0;
+    g_cm_cap[0]  = '\0';
+
+    int rc = axl_console_mirror_install(&m, &cfg);
+
+    bool dbl_blocked = false;
+    bool got_clear = false, got_cursor = false, got_sgr = false, got_text = false;
+    bool got_size = false;
+    bool inj_up = false, inj_x = false, inj_f2 = false;
+
+    if (rc == AXL_OK) {
+        EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = gST->ConOut;
+        EFI_SIMPLE_TEXT_INPUT_PROTOCOL  *in  = gST->ConIn;
+
+        AxlConsoleMirror *m2 = NULL;
+        dbl_blocked = (axl_console_mirror_install(&m2, &cfg) == AXL_ERR);
+
+        /* QueryMode on the CURRENT mode must report the remote size (this is
+           what `edit` queries to lay itself out). */
+        UINTN qc = 0, qr = 0;
+        out->QueryMode(out, (UINTN)out->Mode->Mode, &qc, &qr);
+        got_size = (qc == 80 && qr == 25);
+
+        out->ClearScreen(out);
+        out->SetCursorPosition(out, 4, 2);     /* col 4, row 2 -> ESC[3;5H */
+        out->SetAttribute(out, EFI_LIGHTRED);   /* fg 12 -> SGR 91 */
+        out->OutputString(out, (CHAR16 *)u"Hi");
+
+        got_clear  = (axl_strstr(g_cm_cap, "\x1b[2J\x1b[H") != NULL);
+        got_cursor = (axl_strstr(g_cm_cap, "\x1b[3;5H") != NULL);
+        got_sgr    = (axl_strstr(g_cm_cap, "\x1b[0;91;40m") != NULL);
+        got_text   = (axl_strstr(g_cm_cap, "Hi") != NULL);
+
+        EFI_INPUT_KEY k1 = {0}, k2 = {0}, k3 = {0};
+        axl_console_mirror_inject_text(m, "\x1b[A", 3);  /* Up  -> scan 0x01 */
+        axl_console_mirror_inject_text(m, "x", 1);        /* 'x' -> unicode    */
+        axl_console_mirror_inject_key(m, 0x0C, 0);        /* F2  -> scan 0x0C  */
+        inj_up = (in->ReadKeyStroke(in, &k1) == EFI_SUCCESS
+                  && k1.ScanCode == 0x01 && k1.UnicodeChar == 0);
+        inj_x  = (in->ReadKeyStroke(in, &k2) == EFI_SUCCESS
+                  && k2.ScanCode == 0 && k2.UnicodeChar == 'x');
+        inj_f2 = (in->ReadKeyStroke(in, &k3) == EFI_SUCCESS
+                  && k3.ScanCode == 0x0C && k3.UnicodeChar == 0);
+
+        axl_console_mirror_uninstall(m);  /* restores the console */
+    }
+
+    /* Console restored: axl_printf reaches the real serial console now. */
+    axl_printf("MIRROR_SELFTEST: install=%d\n", rc == AXL_OK);
+    axl_printf("MIRROR_SELFTEST: dbl_install_blocked=%d\n", dbl_blocked);
+    axl_printf("MIRROR_SELFTEST: query_size=%d\n", got_size);
+    axl_printf("MIRROR_SELFTEST: clear=%d\n", got_clear);
+    axl_printf("MIRROR_SELFTEST: cursor=%d\n", got_cursor);
+    axl_printf("MIRROR_SELFTEST: sgr=%d\n", got_sgr);
+    axl_printf("MIRROR_SELFTEST: text=%d\n", got_text);
+    axl_printf("MIRROR_SELFTEST: inject_up=%d\n", inj_up);
+    axl_printf("MIRROR_SELFTEST: inject_printable=%d\n", inj_x);
+    axl_printf("MIRROR_SELFTEST: inject_key_f2=%d\n", inj_f2);
+
+    bool all = (rc == AXL_OK) && dbl_blocked && got_size && got_clear
+               && got_cursor && got_sgr && got_text && inj_up && inj_x && inj_f2;
+    axl_printf("MIRROR_SELFTEST_DONE %s\n", all ? "PASS" : "FAIL");
+
+    /* Do NOT return to the parent Shell (wrapping its console wedged it).
+       Idle; the harness asserts on the printed lines and kills QEMU. */
+    for (;;) {
+        axl_msleep(1000);
+    }
+    return 0;  /* unreachable; satisfies non-void return */
+}
+
+// ---------------------------------------------------------------------------
+// Console-mirror `edit` ACCEPTANCE GATE — "mirror-edit" (design §6 rung 3).
+//
+// The headline proof: the Shell's full-screen interactive `edit` runs OVER the
+// mirror and actually saves a file — something a one-shot command shell can
+// never do. We install the mirror, launch a real child Shell.efi via
+// axl_shell_launch (foreground, blocks), and drive `edit` entirely through
+// injected keystrokes from a background firmware timer (fires at TPL_CALLBACK
+// while the child Shell idles in WaitForEvent): open the editor on a file, type
+// a line, F2-save, F3-exit, then `exit` the child Shell. When the child Shell
+// exits, axl_shell_launch returns; we uninstall, READ THE FILE BACK, and assert
+// it contains the typed line. The mirror sink corroborates the full-screen VT
+// framing (ClearScreen + cursor positioning). Needs a real Shell.efi staged.
+// ---------------------------------------------------------------------------
+
+#define EDIT_FILE_PATH  "fs0:\\mtxt.txt"
+#define EDIT_LINE       "hello mirror"
+
+static AxlConsoleMirror *g_edit_mirror;
+static EFI_EVENT         g_edit_timer;
+static volatile UINTN    g_edit_phase;
+static UINTN             g_edit_phase_tick;
+static UINT8             g_edit_csi;   /* CSI escape parser state for the sink */
+
+/* Full-screen framing seen in the sink (corroboration). */
+static volatile bool     g_edit_saw_clear;
+static volatile bool     g_edit_saw_cursor;
+
+/* Milestones the sink detects in edit's output to SYNC injection — robust to
+   variable Shell/editor startup time instead of fixed delays. Each is an
+   incremental substring match over the mirrored byte stream. */
+static volatile bool g_ms_prompt;   /* "\>"           — Shell prompt          */
+static volatile bool g_ms_editor;   /* "Ctrl-E"       — editor status bar up  */
+static volatile bool g_ms_savep;    /* "File to Save" — F2 save dialog open   */
+static size_t        g_mp_prompt, g_mp_editor, g_mp_savep;
+
+static void
+feed_needle(unsigned char b, const char *needle, size_t *pos, volatile bool *flag)
+{
+    if (b == (unsigned char)needle[*pos]) {
+        (*pos)++;
+        if (needle[*pos] == '\0') {
+            *flag = true;
+            *pos = 0;
+        }
+    } else {
+        *pos = (b == (unsigned char)needle[0]) ? 1 : 0;
+    }
+}
+
+/* Sink: (a) prove edit drove a full-screen redraw — a clear (ESC[..J) and a
+   cursor-position escape (ESC[..H) — and (b) detect the prompt / editor /
+   save-dialog milestones that gate injection. */
+static void
+edit_frame_sink(const char *bytes, size_t len, void *user)
+{
+    (void)user;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char b = (unsigned char)bytes[i];
+
+        feed_needle(b, "\\>",           &g_mp_prompt, &g_ms_prompt);
+        feed_needle(b, "Ctrl-E",        &g_mp_editor, &g_ms_editor);
+        feed_needle(b, "File to Save",  &g_mp_savep,  &g_ms_savep);
+
+        switch (g_edit_csi) {
+            case 0: if (b == 0x1B) { g_edit_csi = 1; } break;
+            case 1: g_edit_csi = (b == '[') ? 2 : 0; break;
+            default:  /* inside CSI: scan to the final byte */
+                if (b == 'J') {
+                    g_edit_saw_clear = true;   /* ESC[..J — clear screen */
+                    g_edit_csi = 0;
+                } else if (b == 'H' || b == 'f') {
+                    g_edit_saw_cursor = true;  /* ESC[..H — cursor position */
+                    g_edit_csi = 0;
+                } else if ((b >= '@' && b <= '~')) {
+                    g_edit_csi = 0;            /* some other final byte */
+                }
+                break;
+        }
+    }
+}
+
+/* Periodic (1s) injection driver. Milestone-gated: each phase waits for the
+   sink to observe the state edit is in before injecting the next keystrokes,
+   so it tolerates variable startup time. The two "settle" phases use a short
+   tick delay (no distinct on-screen milestone to wait for). */
+static void EFIAPI
+edit_inject_cb(EFI_EVENT ev, void *ctx)
+{
+    (void)ev;
+    (void)ctx;
+    AxlConsoleMirror *m = g_edit_mirror;
+    if (m == NULL) {
+        return;
+    }
+    switch (g_edit_phase) {
+        case 0:  /* wait for the Shell prompt, then open the editor */
+            if (g_ms_prompt) {
+                axl_console_mirror_inject_text(m, "edit " EDIT_FILE_PATH "\r",
+                                               5 + (sizeof(EDIT_FILE_PATH) - 1) + 1);
+                g_ms_editor  = false;
+                g_edit_phase = 1;
+            }
+            break;
+        case 1:  /* wait for the editor status bar, then type the line */
+            if (g_ms_editor) {
+                axl_console_mirror_inject_text(m, EDIT_LINE,
+                                               sizeof(EDIT_LINE) - 1);
+                g_edit_phase_tick = 0;
+                g_edit_phase = 2;
+            }
+            break;
+        case 2:  /* let the typed text settle, then F2 (Save) */
+            if (++g_edit_phase_tick >= 1) {
+                g_ms_savep = false;
+                axl_console_mirror_inject_key(m, 0x0C, 0);
+                g_edit_phase = 3;
+            }
+            break;
+        case 3:  /* wait for the "File to Save" dialog, then ENTER to commit */
+            if (g_ms_savep) {
+                axl_console_mirror_inject_text(m, "\r", 1);
+                g_edit_phase_tick = 0;
+                g_edit_phase = 4;
+            }
+            break;
+        case 4:  /* let the save settle, then F3 (Exit editor) */
+            if (++g_edit_phase_tick >= 2) {
+                g_ms_prompt = false;
+                axl_console_mirror_inject_key(m, 0x0D, 0);
+                g_edit_phase = 5;
+            }
+            break;
+        case 5:  /* wait for the Shell prompt again, then exit the child Shell */
+            if (g_ms_prompt) {
+                axl_console_mirror_inject_text(m, "exit\r", 5);
+                g_edit_phase = 6;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* Read the edited file back and report whether it holds the typed line. */
+static bool
+edit_file_has_line(void)
+{
+    AxlFileView *v = axl_file_view_open(EDIT_FILE_PATH, 0, 4);
+    if (v == NULL) {
+        return false;
+    }
+    size_t sz = axl_file_view_size(v);
+    if (sz == 0 || sz > 4096) {
+        axl_file_view_close(v);
+        return false;
+    }
+    char raw[4096];
+    size_t n = axl_file_view_read(v, 0, raw, sz);
+    axl_file_view_close(v);
+
+    /* UEFI `edit` saves new files as UTF-16LE (the "UNICODE" file type), so the
+       bytes are h\0e\0l\0l\0o\0... Strip NUL bytes to recover the ASCII text
+       (also a no-op for an ASCII file), then match. */
+    char ascii[4097];
+    size_t a = 0;
+    for (size_t i = 0; i < n && a < sizeof(ascii) - 1; i++) {
+        if (raw[i] != '\0') {
+            ascii[a++] = raw[i];
+        }
+    }
+    ascii[a] = '\0';
+    return axl_strstr(ascii, EDIT_LINE) != NULL;
+}
+
+static int
+run_mirror_edit_mode(void)
+{
+    AxlConsoleMirrorConfig cfg = {
+        .sink = edit_frame_sink, .user = NULL,
+        .cols = 80, .rows = 25, .passthrough_local = true,
+    };
+
+    g_edit_phase      = 0;
+    g_edit_phase_tick = 0;
+    g_edit_saw_clear  = false;
+    g_edit_saw_cursor = false;
+    g_edit_csi        = 0;
+    g_ms_prompt = g_ms_editor = g_ms_savep = false;
+    g_mp_prompt = g_mp_editor = g_mp_savep = 0;
+
+    if (axl_console_mirror_install(&g_edit_mirror, &cfg) != AXL_OK) {
+        axl_printf("MIRROR_EDIT: install=0\n");
+        axl_printf("MIRROR_EDIT_DONE FAIL\n");
+        for (;;) { axl_msleep(1000); }
+    }
+
+    /* Background injection heartbeat: a 1s periodic firmware timer at
+       TPL_CALLBACK, which fires while the child Shell idles in WaitForEvent. */
+    EFI_STATUS st = gBS->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                                     edit_inject_cb, NULL, &g_edit_timer);
+    if (!EFI_ERROR(st)) {
+        gBS->SetTimer(g_edit_timer, TimerPeriodic, 10000000);  /* 1s */
+    }
+
+    /* Foreground: launch the real child Shell. Blocks until it `exit`s (driven
+       by the injected sequence above). */
+    int exit_code = 0;
+    int launched  = axl_shell_launch(&exit_code);
+
+    /* Child Shell exited (or no Shell.efi). Stop injecting, restore console. */
+    if (g_edit_timer != NULL) {
+        gBS->SetTimer(g_edit_timer, TimerCancel, 0);
+        gBS->CloseEvent(g_edit_timer);
+        g_edit_timer = NULL;
+    }
+    bool saw_clear  = g_edit_saw_clear;
+    bool saw_cursor = g_edit_saw_cursor;
+    axl_console_mirror_uninstall(g_edit_mirror);
+    g_edit_mirror = NULL;
+
+    /* Console restored: read the file back and report. */
+    bool file_ok = (launched == AXL_OK) && edit_file_has_line();
+
+    axl_printf("MIRROR_EDIT: install=1\n");
+    axl_printf("MIRROR_EDIT: shell_launched=%d\n", launched == AXL_OK);
+    axl_printf("MIRROR_EDIT: saw_clear=%d\n", saw_clear);
+    axl_printf("MIRROR_EDIT: saw_cursor=%d\n", saw_cursor);
+    axl_printf("MIRROR_EDIT: file_saved=%d\n", file_ok);
+
+    bool all = (launched == AXL_OK) && saw_clear && saw_cursor && file_ok;
+    axl_printf("MIRROR_EDIT_DONE %s\n", all ? "PASS" : "FAIL");
+
+    for (;;) { axl_msleep(1000); }
+    return 0;  /* unreachable */
+}
+
+// ---------------------------------------------------------------------------
+// Console-mirror P1 GATE — "serve-ws-shell-inject" (the SoftBMC RemoteShell
+// shape end-to-end). Proves axl_console_mirror_inject_text wakes the foreground
+// Shell when the injection happens FROM A WS HANDLER running inside the
+// axl_loop_attach_driver dispatch (raised TPL) — not from a standalone timer
+// (the edit gate above already proved the timer path). This is the exact gap
+// the SoftBMC handoff flagged P1 against.
+//
+// A per-client WS endpoint's handler forwards every received text/binary frame
+// straight into axl_console_mirror_inject_text. A foreground child Shell.efi
+// (axl_shell_launch, blocks) idles in WaitForEvent(ConIn); the driver tick
+// pumps the loop, so the WS recv -> handler -> inject_text -> SignalEvent(
+// wait_key) all runs at TPL_CALLBACK. The harness's WS client sends a command
+// that writes a unique marker to a file, then `exit\r`. When the Shell exits,
+// axl_shell_launch returns; we read the file back. The marker present == the
+// injected keys drove the Shell (same deterministic assertion style as the
+// edit gate, but triggered from the pumped-loop WS handler). Needs a staged
+// Shell.efi; SKIP-balances via NO_SHELL otherwise.
+// ---------------------------------------------------------------------------
+
+#define P1_FILE_PATH  "fs0:\\p1inj.txt"
+#define P1_MARKER     "P1INJECTOK"
+
+static AxlConsoleMirror *g_p1_mirror;
+
+/* No-op sink: P1 asserts the inject->wake->execute path via file readback, not
+   mirrored output, so the sink content is irrelevant here. */
+static void
+p1_sink(const char *bytes, size_t len, void *user)
+{
+    (void)bytes;
+    (void)len;
+    (void)user;
+}
+
+/* WS handler: forward each received frame's bytes into the console mirror.
+   This runs inside the attach_driver loop dispatch (TPL_CALLBACK) — the P1
+   variable under test. */
+static int
+on_ws_console_inject(
+    AxlWsConn  *conn,
+    size_t      event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)conn;
+    (void)data;
+    if ((event == AXL_WS_TEXT || event == AXL_WS_BINARY)
+        && frame != NULL && frame_size > 0 && g_p1_mirror != NULL) {
+        axl_console_mirror_inject_text(g_p1_mirror, (const char *)frame,
+                                       frame_size);
+    }
+    return 0;
+}
+
+/* Read P1_FILE_PATH back and report whether it holds the marker. Mirrors
+   edit_file_has_line: the Shell may write the redirected file as UTF-16LE, so
+   strip NULs before matching. */
+static bool
+p1_file_has_marker(void)
+{
+    AxlFileView *v = axl_file_view_open(P1_FILE_PATH, 0, 4);
+    if (v == NULL) {
+        return false;
+    }
+    size_t sz = axl_file_view_size(v);
+    if (sz == 0 || sz > 4096) {
+        axl_file_view_close(v);
+        return false;
+    }
+    char raw[4096];
+    size_t n = axl_file_view_read(v, 0, raw, sz);
+    axl_file_view_close(v);
+
+    char ascii[4097];
+    size_t a = 0;
+    for (size_t i = 0; i < n && a < sizeof(ascii) - 1; i++) {
+        if (raw[i] != '\0') {
+            ascii[a++] = raw[i];
+        }
+    }
+    ascii[a] = '\0';
+    return axl_strstr(ascii, P1_MARKER) != NULL;
+}
+
+static int
+run_serve_ws_shell_inject_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8080);
+    if (loop == NULL || s == NULL) {
+        axl_printf("ERROR: server setup failed\n");
+        return -1;
+    }
+    /* Per-client WS endpoint that injects received frames into the mirror. */
+    axl_http_server_add_websocket_ex(s, "/ws-console", on_ws_console_inject,
+                                     NULL, AXL_ROUTE_NO_AUTH);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    AxlConsoleMirrorConfig cfg = {
+        .sink = p1_sink, .user = NULL,
+        .cols = 80, .rows = 25, .passthrough_local = true,
+    };
+    if (axl_console_mirror_install(&g_p1_mirror, &cfg) != AXL_OK) {
+        axl_printf("ERROR: mirror install failed\n");
+        return -1;
+    }
+
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTP+WS server (driver-tick) on 8080 + mirror; launching Shell\n");
+    axl_printf("READY\n");
+
+    /* Foreground: the real child Shell, console mirrored. Blocks until the
+       injected `exit` returns it. */
+    int exit_code = 0;
+    int launched  = axl_shell_launch(&exit_code);
+
+    axl_loop_detach_driver(loop);
+    axl_console_mirror_uninstall(g_p1_mirror);
+    g_p1_mirror = NULL;
+
+    if (launched != AXL_OK) {
+        /* No Shell.efi staged: SKIP-balance rather than read as a failure. */
+        axl_printf("NO_SHELL\n");
+        for (;;) { axl_msleep(1000); }
+    }
+
+    bool file_ok = p1_file_has_marker();
+    axl_printf("P1_INJECT: shell_launched=1\n");
+    axl_printf("P1_INJECT: file_marker=%d\n", file_ok);
+    axl_printf("P1_INJECT_DONE %s\n", file_ok ? "PASS" : "FAIL");
+
+    for (;;) { axl_msleep(1000); }
+    return 0;  /* unreachable */
+}
+
+// ---------------------------------------------------------------------------
+// Multi-server mode — "serve-multi" starts TWO plain HTTP servers on ONE
+// shared AxlLoop (8080 + 8081). Regression repro for the bug where only the
+// first-started server on a loop dispatched HTTP (SoftBMC's :443 + :80
+// redirect pattern). Both must answer.
+// ---------------------------------------------------------------------------
+
+static int
+on_get_srv2(
+    AxlHttpRequest *req,
+    AxlHttpResponse *resp,
+    void *data)
+{
+    (void)req;
+    (void)data;
+    axl_http_response_set_text(resp, "Hello from server2");
+    return 0;
+}
+
+static int
+run_serve_multi_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        axl_printf("ERROR: failed to create loop\n");
+        return -1;
+    }
+
+    AxlHttpServer *s1 = axl_http_server_new(8080);
+    AxlHttpServer *s2 = axl_http_server_new(8081);
+    if (s1 == NULL || s2 == NULL) {
+        axl_printf("ERROR: failed to create servers\n");
+        return -1;
+    }
+    axl_http_server_add_route(s1, "GET", "/plain", on_get_plain, NULL);
+    axl_http_server_add_route(s2, "GET", "/plain", on_get_srv2,  NULL);
+
+    if (axl_http_server_start(s1, loop) != 0
+        || axl_http_server_start(s2, loop) != 0) {
+        axl_printf("ERROR: failed to start servers on shared loop\n");
+        return -1;
+    }
+
+    axl_printf("HTTP servers on 8080 (s1) and 8081 (s2), shared loop\n");
+    axl_printf("READY\n");
+
+    return axl_loop_run(loop);
+}
+
+/* serve-davfs — mount an axl-fs-backed WebDAV file server with
+   axl_http_server_serve_fs: /dav read-write and /ro read-only, both
+   over a clean subtree of the (writable) boot volume. Drives the
+   full verb set + traversal-reject + readonly-405 from the host. */
+static int
+run_serve_davfs_common(bool tls)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    /* Fresh served subtree (disk image is rebuilt per run, so this
+       starts empty). */
+    axl_dir_mkdir("FS0:\\davroot");
+
+    void   *cert = NULL, *key = NULL;
+    size_t  cert_len = 0, key_len = 0;
+    if (tls) {
+        if (!axl_tls_available()) {
+            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            return -1;
+        }
+        if (axl_tls_init() != AXL_OK) {
+            axl_printf("ERROR: TLS init failed\n");
+            return -1;
+        }
+        if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                         &cert, &cert_len,
+                                         &key, &key_len) != 0) {
+            axl_printf("ERROR: cert generation failed\n");
+            return -1;
+        }
+    }
+
+    AxlHttpServer *s = axl_http_server_new(tls ? 8443 : 8080);
+    if (s == NULL) {
+        axl_printf("ERROR: failed to create server\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    if (tls) {
+        if (axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+            axl_printf("ERROR: TLS setup failed\n");
+            axl_http_server_free(s);
+            axl_free(cert);
+            axl_free(key);
+            return -1;
+        }
+        axl_free(cert);
+        axl_free(key);
+    }
+    if (axl_http_server_serve_fs(s, "/dav", "FS0:\\davroot", 0,
+                                 AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: serve_fs (rw) failed\n");
+        return -1;
+    }
+    if (axl_http_server_serve_fs(s, "/ro", "FS0:\\davroot",
+                                 AXL_SERVE_FS_READONLY,
+                                 AXL_ROUTE_NO_AUTH) != AXL_OK) {
+        axl_printf("ERROR: serve_fs (readonly) failed\n");
+        return -1;
+    }
+
+    /* Auth-gated mount: every verb (GET / PROPFIND / ... and the
+       streaming PUT) requires "Bearer test-token". Proves
+       serve_fs auth_flags gate the whole mount, including the upload
+       path that bypasses dispatch_request. */
+    axl_http_server_use_auth(s, test_auth_callback, NULL);
+    if (axl_http_server_serve_fs(s, "/auth", "FS0:\\davroot", 0,
+                                 AXL_ROUTE_AUTH) != AXL_OK) {
+        axl_printf("ERROR: serve_fs (auth) failed\n");
+        return -1;
+    }
+
+    /* Standalone authed upload routes exercise
+       axl_http_server_add_upload_route_auth directly: /upload-auth
+       needs any authenticated user (401 without), /upload-admin needs
+       the admin role (403 for a non-admin token). */
+    if (axl_http_server_add_upload_route_auth(s, "POST", "/upload-auth",
+                                              on_upload, NULL,
+                                              AXL_ROUTE_AUTH) != AXL_OK) {
+        axl_printf("ERROR: add_upload_route_auth (auth) failed\n");
+        return -1;
+    }
+    if (axl_http_server_add_upload_route_auth(s, "POST", "/upload-admin",
+                                              on_upload, NULL,
+                                              AXL_ROUTE_ADMIN) != AXL_OK) {
+        axl_printf("ERROR: add_upload_route_auth (admin) failed\n");
+        return -1;
+    }
+
+    /* A normal whole-body route (non-streaming): the body is accumulated
+       into conn->body and echoed back. Exercises the Content-Length /
+       chunked request-body accumulation path (distinct from the streaming
+       upload path the /dav PUT uses) — needed to prove large bodies that
+       span multiple TLS records are read to completion over HTTPS. */
+    axl_http_server_add_route(s, "POST", "/echo", on_echo, NULL);
+
+    axl_printf("WebDAV file server (%s): /dav (rw) + /ro (readonly) + "
+               "/auth (gated) + POST /echo over FS0:\\davroot\n",
+               tls ? "https" : "http");
+    axl_printf("READY\n");
+    return axl_http_server_run(s);
+}
+
+static int
+run_serve_davfs_mode(void)
+{
+    return run_serve_davfs_common(false);
+}
+
+static int
+run_serve_davfs_tls_mode(void)
+{
+    return run_serve_davfs_common(true);
+}
+
+/* serve-multi-tls — the SoftBMC shape: a TLS server (8443) started first,
+   a plain server (8081) started second, on ONE shared loop. The plain
+   second server must still dispatch. */
+static int
+run_serve_multi_tls_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        return -1;
+    }
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop *loop = axl_loop_new();
+    AxlHttpServer *s1 = axl_http_server_new(8443);   /* TLS, started first  */
+    AxlHttpServer *s2 = axl_http_server_new(8081);   /* plain, started 2nd  */
+    if (loop == NULL || s1 == NULL || s2 == NULL) {
+        axl_printf("ERROR: alloc failed\n");
+        return -1;
+    }
+    if (axl_http_server_use_tls(s1, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS setup failed\n");
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    axl_http_server_add_route(s1, "GET", "/plain", on_get_plain, NULL);
+    axl_http_server_add_route(s2, "GET", "/plain", on_get_srv2,  NULL);
+
+    if (axl_http_server_start(s1, loop) != 0
+        || axl_http_server_start(s2, loop) != 0) {
+        axl_printf("ERROR: failed to start servers on shared loop\n");
+        return -1;
+    }
+
+    axl_printf("TLS server on 8443 (s1) + plain server on 8081 (s2), shared loop\n");
+    axl_printf("READY\n");
+
+    return axl_loop_run(loop);
 }
 
 // ---------------------------------------------------------------------------
@@ -2524,6 +3808,86 @@ test_net_opts_validation(void)
                "net-opts: NULL opts -> AXL_ERR");
 }
 
+static void
+test_net_resolve_ptr_validation(void)
+{
+    /* Safe negatives only — these return on the input guard before any DNS4
+       protocol call, so they're deterministic with no network. The positive
+       PTR round-trip is exercised in the tap+dnsmasq integration harness
+       (a reverse zone is required, which SLIRP can't deterministically
+       provide). */
+    char buf[64];
+    AxlIPv4Address ip = { { 8, 8, 8, 8 } };
+
+    test_check(axl_net_resolve_ptr(NULL, buf, sizeof(buf)) == AXL_ERR,
+               "resolve_ptr: NULL ip -> AXL_ERR");
+    test_check(axl_net_resolve_ptr(&ip, NULL, sizeof(buf)) == AXL_ERR,
+               "resolve_ptr: NULL out -> AXL_ERR");
+    test_check(axl_net_resolve_ptr(&ip, buf, 0) == AXL_ERR,
+               "resolve_ptr: zero cap -> AXL_ERR");
+
+    /* get_dhcp_lease: NULL out returns on the guard before any protocol
+       call. The live lease read is exercised in net-diag mode. */
+    test_check(axl_net_get_dhcp_lease(0, NULL) == AXL_ERR,
+               "dhcp-lease: NULL out -> AXL_ERR");
+
+    /* ping_ex: NULL target / out return on the guard before any IP4 call.
+       The live probe (end-to-end IP4 setup/transmit/timeout) is exercised in
+       net-diag mode; SLIRP drops ICMP so it can only assert the probe COMPLETES
+       with NO_REPLY. ECHO_REPLY + responder/RTT and the TIME_EXCEEDED /
+       FRAG_NEEDED reply classification are real-hardware only. */
+    AxlPingResult pr;
+    test_check(axl_net_ping_ex(NULL, 1000, 64, false, 0, &pr) == AXL_ERR,
+               "ping_ex: NULL target -> AXL_ERR");
+    test_check(axl_net_ping_ex(&ip, 1000, 64, false, 0, NULL) == AXL_ERR,
+               "ping_ex: NULL out -> AXL_ERR");
+
+    /* sntp_query: NULL server / out return on the guard before any UDP call.
+       The live round-trip against a host SNTP responder is in test-sntp-qemu.sh. */
+    AxlSntpResult sr;
+    test_check(axl_sntp_query(NULL, 0, 1000, &sr) == AXL_ERR,
+               "sntp_query: NULL server -> AXL_ERR");
+    test_check(axl_sntp_query("10.0.2.2", 0, 1000, NULL) == AXL_ERR,
+               "sntp_query: NULL out -> AXL_ERR");
+
+    /* arp_list: NULL count returns on the guard before any protocol call. The
+       live cache read is exercised in net-diag mode. */
+    AxlArpEntry ae[2];
+    test_check(axl_net_arp_list(0, ae, 2, NULL) == AXL_ERR,
+               "arp_list: NULL count -> AXL_ERR");
+
+    /* get_link_stats: NULL out returns on the guard. The live read is in
+       net-diag mode. */
+    test_check(axl_net_get_link_stats(0, NULL) == AXL_ERR,
+               "link_stats: NULL out -> AXL_ERR");
+}
+
+static void
+test_ws_conn_api_validation(void)
+{
+    /* Safe negatives for the per-connection WebSocket API — each returns on
+       its NULL guard before touching any connection state. The live
+       per-client send + auth-on-upgrade behavior is exercised by the
+       /ws-echo-ex and /ws-auth endpoints in test-http.sh. */
+    char         payload[4] = "x";
+    AxlAuthInfo  info;
+    uint8_t      peer[4];
+
+    test_check(axl_http_server_add_websocket_ex(NULL, "/x", NULL, NULL,
+                                                AXL_ROUTE_NO_AUTH) == AXL_ERR,
+               "ws_ex: NULL server -> AXL_ERR");
+    test_check(axl_ws_send(NULL, AXL_WS_TEXT, payload, 1) == AXL_ERR,
+               "ws_send: NULL conn -> AXL_ERR");
+    test_check(axl_ws_conn_auth(NULL, &info) == AXL_ERR,
+               "ws_conn_auth: NULL conn -> AXL_ERR");
+    test_check(axl_ws_conn_peer(NULL, peer) == AXL_ERR,
+               "ws_conn_peer: NULL conn -> AXL_ERR");
+    test_check(axl_ws_conn_close(NULL) == AXL_ERR,
+               "ws_conn_close: NULL conn -> AXL_ERR");
+    test_check(axl_ws_conn_user_data(NULL) == NULL,
+               "ws_conn_user_data: NULL conn -> NULL");
+}
+
 // ---------------------------------------------------------------------------
 // IPv4 parse / format tests
 // ---------------------------------------------------------------------------
@@ -2724,6 +4088,404 @@ run_udp_echo_mode(const char *host, const char *port_str)
 
     axl_udp_close(sock);
     return (rc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Raised-TPL TCP mode — "tcp-connect-rtpl <host> <port>" does a sync TCP
+// connect + send + recv against a host echo server while at TPL_CALLBACK
+// (the level a sync TCP op reaches when called from inside a driver-pump
+// notify). Before the tcp4->Poll() tick landed in the sync TCP wrappers, the
+// loop's raised-TPL CheckEvent spin held TPL_CALLBACK and starved the TCP4
+// firmware notify, so the connect never advanced — it stalled to its full
+// timeout and FAILED. With the tick it advances and connects promptly, so the
+// return value cleanly separates fixed (AXL_OK) from broken (AXL_ERR/timeout).
+// Used by test-tcp-connect-rtpl-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_tcp_connect_rtpl_mode(const char *host, const char *port_str)
+{
+    uint16_t port;
+    if (axl_str_to_u16(port_str, 10, &port, NULL) != 0 || port == 0) {
+        axl_printf("TCP-RTPL: invalid port '%s'\n", port_str);
+        return 1;
+    }
+
+    /* Bring the stack up at TPL_APPLICATION before raising. */
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    const char *msg = "hello from UEFI";
+    char        rx_buf[256];
+    size_t      rx_len = sizeof(rx_buf) - 1;
+
+    axl_printf("TCP-RTPL: connecting to %s:%u at TPL_CALLBACK\n",
+               host, (unsigned)port);
+
+    /* Everything below runs at TPL_CALLBACK — the condition a sync TCP op
+       hits inside a driver-pump notify. The 4 s connect timeout means a
+       BROKEN build takes ~4 s here then fails; the fix returns in well
+       under that. */
+    EFI_TPL old = gBS->RaiseTPL(TPL_CALLBACK);
+
+    AxlTcp *sock = NULL;
+    int crc = axl_tcp_connect_timeout(host, port, NULL, 4000, &sock);
+
+    int src = AXL_ERR, rrc = AXL_ERR;
+    if (crc == AXL_OK && sock != NULL) {
+        src = axl_tcp_send(sock, msg, axl_strlen(msg), 4000);
+        rrc = axl_tcp_recv(sock, rx_buf, &rx_len, 4000);
+    }
+
+    gBS->RestoreTPL(old);
+
+    /* The headline assertion: the connect advanced at raised TPL. */
+    if (crc == AXL_OK) {
+        axl_printf("PASS: tcp-connect-raised-tpl\n");
+    } else {
+        axl_printf("FAIL: tcp-connect-raised-tpl (rc=%d)\n", crc);
+    }
+
+    /* Bonus: send + recv at raised TPL too (exercises those wrappers' ticks).
+       The host echo server replies "ECHO:<msg>". */
+    if (crc == AXL_OK && src == AXL_OK && rrc == AXL_OK && rx_len > 0) {
+        rx_buf[rx_len] = '\0';
+        axl_printf("TCP-RTPL: echo '%s'\n", rx_buf);
+        axl_printf("PASS: tcp-roundtrip-raised-tpl\n");
+    } else {
+        axl_printf("FAIL: tcp-roundtrip-raised-tpl (c=%d s=%d r=%d len=%zu)\n",
+                   crc, src, rrc, rx_len);
+    }
+
+    if (sock != NULL) {
+        axl_tcp_close(sock);
+    }
+    return (crc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Async HTTP client mode — "get-async <url>" / "post-async <url> <body>".
+//
+// The faithful SoftBMC-webhook topology: the async request is ISSUED from
+// inside a raised-TPL driver-pump tick (a one-shot loop timer kicks it; the
+// axl_loop_attach_driver pump dispatches that timer at TPL_CALLBACK), and the
+// whole request — resolve, connect, [TLS handshake], send, recv, redirects —
+// runs as events on that ONE loop with NO nested ephemeral loop. The sync
+// axl_http_get/post would nest a loop here and emit the "synchronous wait
+// invoked from inside a loop callback" warning; the async path must not.
+// Driven by test-http-async-qemu.sh, which asserts the body arrives via the
+// callback AND that no such warning appears. https adds axl_tls_init().
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlHttpClient *client;
+    AxlLoop       *loop;
+    const char    *method;
+    const char    *url;
+    const char    *body;
+    size_t         body_len;
+    bool           done;
+} HttpAsyncMode;
+
+static void
+http_async_mode_done(AxlHttpClientResponse *resp, AxlStatus st, void *user)
+{
+    HttpAsyncMode *m = (HttpAsyncMode *)user;
+
+    if (st == AXL_OK && resp != NULL) {
+        axl_printf("ASYNC-STATUS: %u\n", (unsigned)resp->status_code);
+        if (resp->body != NULL && resp->body_size > 0) {
+            /* The body is not guaranteed NUL-terminated — bound the print. */
+            axl_printf("ASYNC-BODY: %.*s\n",
+                       (int)resp->body_size, (const char *)resp->body);
+        } else {
+            axl_printf("ASYNC-BODY: <empty>\n");
+        }
+        axl_http_client_response_free(resp);
+        axl_printf("PASS: http-async-%s\n", m->method);
+    } else {
+        axl_printf("ASYNC-RC: %d\n", st);
+        axl_printf("FAIL: http-async-%s\n", m->method);
+    }
+    m->done = true;
+}
+
+/* One-shot timer callback (dispatched at raised TPL by the driver pump) that
+   initiates the async request — mirroring a webhook fired from a timer. */
+static bool
+http_async_mode_kick(void *user)
+{
+    HttpAsyncMode *m = (HttpAsyncMode *)user;
+    int rc;
+
+    if (axl_strcmp(m->method, "POST") == 0) {
+        rc = axl_http_post_async(m->client, m->loop, m->url,
+                                 m->body, m->body_len, "text/plain",
+                                 NULL, http_async_mode_done, m);
+    } else {
+        rc = axl_http_get_async(m->client, m->loop, m->url,
+                                NULL, http_async_mode_done, m);
+    }
+    if (rc != AXL_OK) {
+        axl_printf("ASYNC-INIT-RC: %d\n", rc);
+        axl_printf("FAIL: http-async-%s\n", m->method);
+        m->done = true;
+    }
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+run_http_async_mode(const char *method, const char *url, const char *body)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    bool https = axl_strncmp(url, "https://", 8) == 0;
+    if (https) {
+        if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
+            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            return 1;
+        }
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpClient *c    = axl_http_client_new();
+    if (loop == NULL || c == NULL) {
+        axl_printf("ERROR: loop/client alloc failed\n");
+        return 1;
+    }
+    /* Self-signed host cert in the integration test — skip chain validation. */
+    axl_http_client_set(c, "tls.verify", "false");
+
+    HttpAsyncMode m = {
+        .client   = c,
+        .loop     = loop,
+        .method   = method,
+        .url      = url,
+        .body     = body,
+        .body_len = (body != NULL) ? axl_strlen(body) : 0,
+        .done     = false,
+    };
+
+    /* Kick the request from a raised-TPL tick (see the header comment). */
+    axl_loop_add_timeout(loop, 300, http_async_mode_kick, &m);
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return 1;
+    }
+
+    axl_printf("READY\n");
+
+    /* Idle in the foreground; the driver pump advances the request. Bound the
+       wait (~30 s) so a wedge fails loudly instead of hanging the harness. */
+    for (int i = 0; i < 600 && !m.done; i++) {
+        axl_msleep(50);
+    }
+    if (!m.done) {
+        axl_printf("FAIL: http-async-timeout\n");
+    }
+
+    axl_loop_detach_driver(loop);
+    axl_http_client_free(c);
+    axl_loop_free(loop);
+    return m.done ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Raised-TPL SYNC GET — "get-sync-rtpl <url>". Phase 3 reimplemented the sync
+// axl_http_get as an ephemeral-loop wrapper over the async core; a blocking
+// loop at a raised TPL starves the TCP4 firmware notify, so the wrapper arms a
+// Poll tick over the client's current socket. This runs axl_http_get at
+// TPL_CALLBACK (the level a sync call reaches inside a driver-pump notify) and
+// asserts the body still arrives — i.e. the Poll tick drives it. Without the
+// tick the request would stall to the deadline and the body never prints.
+// ---------------------------------------------------------------------------
+
+static int
+run_get_sync_rtpl_mode(const char *url)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlHttpClient *c = axl_http_client_new();
+    if (c == NULL) {
+        axl_printf("ERROR: client alloc failed\n");
+        return 1;
+    }
+    /* Bound the op so a BROKEN build (no Poll progress) fails in a few seconds
+       rather than hanging the harness. */
+    axl_http_client_set(c, "timeout.ms", "8000");
+
+    axl_printf("RTPL-SYNC: GET %s at TPL_CALLBACK\n", url);
+
+    EFI_TPL old = gBS->RaiseTPL(TPL_CALLBACK);
+    AxlHttpClientResponse *resp = NULL;
+    int rc = axl_http_get(c, url, &resp);
+    gBS->RestoreTPL(old);
+
+    if (rc == AXL_OK && resp != NULL) {
+        axl_printf("RTPL-SYNC-STATUS: %u\n", (unsigned)resp->status_code);
+        if (resp->body != NULL && resp->body_size > 0) {
+            axl_printf("RTPL-SYNC-BODY: %.*s\n",
+                       (int)resp->body_size, (const char *)resp->body);
+        }
+        axl_http_client_response_free(resp);
+        axl_printf("PASS: http-get-sync-rtpl\n");
+    } else {
+        axl_printf("FAIL: http-get-sync-rtpl (rc=%d)\n", rc);
+    }
+
+    axl_http_client_free(c);
+    return (rc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// sntp-query mode — query a host-side SNTP responder (test-sntp-qemu.sh) and
+// print the result for the harness to grep. The mock responder returns a fixed
+// known Unix time, so unix_secs is deterministic.
+// ---------------------------------------------------------------------------
+
+static int
+run_sntp_query_mode(const char *host, const char *port_str)
+{
+    uint16_t port = 0;
+    if (axl_str_to_u16(port_str, 10, &port, NULL) != 0) {
+        axl_printf("SNTP: invalid port '%s'\n", port_str);
+        return 1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlSntpResult r;
+    int rc = axl_sntp_query(host, port, 5000, &r);
+    axl_printf("SNTP: rc=%d reachable=%d unix_secs=%lld offset_ms=%d\n",
+               rc, (int)r.reachable, (long long)r.unix_secs, r.offset_ms);
+    if (rc == AXL_OK && r.reachable) {
+        axl_printf("PASS: sntp-reachable\n");
+        axl_printf("PASS: sntp-unix-secs=%lld\n", (long long)r.unix_secs);
+    } else {
+        axl_printf("FAIL: sntp-query (rc=%d)\n", rc);
+    }
+    return (rc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// net-diag mode — exercise the DHCP-lease / reverse-DNS primitives against a
+// live (DHCP'd) network. Driven by test-netdiag-qemu.sh, which greps the
+// PASS:/FAIL: lines. SLIRP hands out a deterministic lease (10.0.2.15, gw/dns
+// 10.0.2.2/10.0.2.3), so the values are assertable; renew/release land here
+// next over a tap+dnsmasq server.
+// ---------------------------------------------------------------------------
+
+static int
+run_net_diag_mode(void)
+{
+    int nd_pass = 0;
+    int nd_fail = 0;
+#define ND_CHECK(cond, name)                                  \
+    do {                                                      \
+        if (cond) { axl_printf("PASS: %s\r\n", (name)); nd_pass++; } \
+        else      { axl_printf("FAIL: %s\r\n", (name)); nd_fail++; } \
+    } while (0)
+
+    axl_printf("=== net-diag mode ===\r\n");
+
+    /* The startup script ran DHCP already; make sure the stack is up for a
+       direct boot too (no-op if an address is already configured). */
+    axl_net_auto_init(0, 10);
+
+    AxlDhcpLease lease;
+    int rc = axl_net_get_dhcp_lease(0, &lease);
+    ND_CHECK(rc == AXL_OK, "dhcp-lease: get_dhcp_lease returns AXL_OK");
+    if (rc == AXL_OK) {
+        axl_printf("  lease: addr=%u.%u.%u.%u subnet=%u.%u.%u.%u "
+                   "router=%u.%u.%u.%u dns_count=%u dns0=%u.%u.%u.%u\r\n",
+                   lease.address[0], lease.address[1], lease.address[2], lease.address[3],
+                   lease.subnet[0], lease.subnet[1], lease.subnet[2], lease.subnet[3],
+                   lease.router[0], lease.router[1], lease.router[2], lease.router[3],
+                   (unsigned)lease.dns_count,
+                   lease.dns[0][0], lease.dns[0][1], lease.dns[0][2], lease.dns[0][3]);
+
+        static const uint8_t exp_addr[4]   = { 10, 0, 2, 15 };
+        static const uint8_t exp_router[4] = { 10, 0, 2, 2 };
+        ND_CHECK(axl_memcmp(lease.address, exp_addr, 4) == 0,
+                 "dhcp-lease: address == 10.0.2.15 (SLIRP lease)");
+        ND_CHECK(axl_memcmp(lease.router, exp_router, 4) == 0,
+                 "dhcp-lease: router == 10.0.2.2 (SLIRP gateway)");
+        ND_CHECK(lease.dns_count >= 1,
+                 "dhcp-lease: at least one DNS resolver");
+    }
+
+    /* ping_ex end-to-end over the live IP4 stack. SLIRP is a NAT that does NOT
+       answer ICMP echo (verified: even the gateway never replies), so under
+       QEMU every probe times out — the deterministic invariants are that the
+       probe COMPLETES cleanly (AXL_OK, no hang/crash through the IP4
+       setup/transmit/timeout path) and classifies as NO_REPLY. On real
+       hardware the gateway probe would be ECHO_REPLY (with responder + RTT)
+       and a real router/MTU bottleneck yields TIME_EXCEEDED / FRAG_NEEDED;
+       those are not reproducible here. The gateway check accepts ECHO_REPLY
+       too, so it stays correct if a future SLIRP gains ICMP support. */
+    AxlIPv4Address gw = { { 10, 0, 2, 2 } };
+    AxlPingResult  pr;
+    int prc = axl_net_ping_ex(&gw, 3000, 64, false, 0, &pr);
+    ND_CHECK(prc == AXL_OK, "ping_ex: probe completes (AXL_OK)");
+    ND_CHECK(prc == AXL_OK
+             && (pr.reply == AXL_PING_NO_REPLY
+                 || pr.reply == AXL_PING_ECHO_REPLY),
+             "ping_ex: gateway probe is NO_REPLY (SLIRP) or ECHO_REPLY (real ICMP)");
+
+    /* DF + a large payload still completes cleanly (path-MTU probe shape). */
+    AxlPingResult  prdf;
+    int prcdf = axl_net_ping_ex(&gw, 1500, 64, true, 1400, &prdf);
+    ND_CHECK(prcdf == AXL_OK,
+             "ping_ex: DF + large payload probe completes (AXL_OK)");
+
+    /* An unreachable host inside the subnet: nothing answers, on SLIRP or real
+       hardware — the probe completes with NO_REPLY. */
+    AxlIPv4Address dead = { { 10, 0, 2, 250 } };
+    AxlPingResult  pr2;
+    int prc2 = axl_net_ping_ex(&dead, 1500, 64, false, 0, &pr2);
+    ND_CHECK(prc2 == AXL_OK && pr2.reply == AXL_PING_NO_REPLY,
+             "ping_ex: unreachable host -> NO_REPLY (probe still completes)");
+
+    /* ARP neighbor cache. The call must succeed; the count is best-effort
+       (the cache only holds neighbors the firmware actually resolved). After
+       DHCP the gateway is typically present. */
+    AxlArpEntry arp[16];
+    size_t      arp_n = 0;
+    int arc = axl_net_arp_list(0, arp, 16, &arp_n);
+    ND_CHECK(arc == AXL_OK, "arp-list: returns AXL_OK");
+    axl_printf("  arp: %zu entries\r\n", arp_n);
+
+    /* After DHCP the guest has resolved the gateway, so the shared ARP cache
+       holds 10.0.2.2 with a non-zero MAC — proves the cache READ, not just
+       that the call returns. */
+    static const uint8_t gw_ip[4] = { 10, 0, 2, 2 };
+    bool arp_has_gw = false;
+    for (size_t i = 0; i < arp_n && i < 16; i++) {
+        axl_printf("  arp[%zu]: %u.%u.%u.%u -> %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                   i, arp[i].ip[0], arp[i].ip[1], arp[i].ip[2], arp[i].ip[3],
+                   arp[i].mac[0], arp[i].mac[1], arp[i].mac[2],
+                   arp[i].mac[3], arp[i].mac[4], arp[i].mac[5]);
+        bool mac_nz = (arp[i].mac[0] | arp[i].mac[1] | arp[i].mac[2]
+                       | arp[i].mac[3] | arp[i].mac[4] | arp[i].mac[5]) != 0;
+        if (axl_memcmp(arp[i].ip, gw_ip, 4) == 0 && mac_nz) {
+            arp_has_gw = true;
+        }
+    }
+    ND_CHECK(arp_has_gw, "arp-list: gateway 10.0.2.2 resolved in the cache");
+
+    /* Link stats. link_up is authoritative (the QEMU NIC's media is present);
+       speed/duplex/autoneg have no portable UEFI source and read as unknown. */
+    AxlNetLinkStats ls;
+    int lsrc = axl_net_get_link_stats(0, &ls);
+    ND_CHECK(lsrc == AXL_OK, "link-stats: returns AXL_OK");
+    ND_CHECK(lsrc == AXL_OK && ls.link_up, "link-stats: link is up");
+    axl_printf("  link: up=%d speed_bps=%llu duplex=%u autoneg=%d\r\n",
+               (int)ls.link_up, (unsigned long long)ls.speed_bps,
+               (unsigned)ls.duplex, (int)ls.autoneg);
+
+    axl_printf("=== net-diag Results: %d passed, %d failed ===\r\n",
+               nd_pass, nd_fail);
+#undef ND_CHECK
+    return (nd_fail == 0) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -3628,6 +5390,354 @@ test_http_client_response_get_bytes(void)
 }
 
 // ---------------------------------------------------------------------------
+// HTTP status line (reason-phrase table)
+// ---------------------------------------------------------------------------
+
+/* Internal helper from axl-http-core.c (declared in axl-net-internal.h,
+   which isn't on the default-build include path). */
+size_t http_build_status_line(char *buf, size_t buf_size, size_t status_code);
+
+static void
+test_http_status_line(void)
+{
+    char buf[64];
+
+    http_build_status_line(buf, sizeof(buf), 402);
+    test_check(axl_strcmp(buf, "HTTP/1.1 402 Payment Required\r\n") == 0,
+               "http status: 402 Payment Required");
+
+    /* Spot-check neighbors so the table edit didn't shift anything. */
+    http_build_status_line(buf, sizeof(buf), 401);
+    test_check(axl_strcmp(buf, "HTTP/1.1 401 Unauthorized\r\n") == 0,
+               "http status: 401 Unauthorized");
+    http_build_status_line(buf, sizeof(buf), 403);
+    test_check(axl_strcmp(buf, "HTTP/1.1 403 Forbidden\r\n") == 0,
+               "http status: 403 Forbidden");
+}
+
+static void
+test_http_auth_challenge(void)
+{
+    AxlHttpServer *s = axl_http_server_new(0);
+    test_check(s != NULL, "auth challenge: server created");
+    if (s == NULL) {
+        return;
+    }
+
+    test_check(axl_http_server_set_auth_challenge(NULL, "Basic", "r") == AXL_ERR,
+               "auth challenge: NULL server -> AXL_ERR");
+    test_check(axl_http_server_set_auth_challenge(s, "Basic", "axl") == AXL_OK,
+               "auth challenge: Basic + realm -> AXL_OK");
+    test_check(axl_http_server_set_auth_challenge(s, "Basic", NULL) == AXL_OK,
+               "auth challenge: no realm -> AXL_OK");
+    test_check(axl_http_server_set_auth_challenge(s, NULL, NULL) == AXL_OK,
+               "auth challenge: clear (NULL scheme) -> AXL_OK");
+    /* Header-injection guards. */
+    test_check(axl_http_server_set_auth_challenge(s, "Ba sic", "r") == AXL_ERR,
+               "auth challenge: scheme with space -> AXL_ERR");
+    test_check(axl_http_server_set_auth_challenge(s, "Basic", "a\r\nb") == AXL_ERR,
+               "auth challenge: realm with CRLF -> AXL_ERR");
+    test_check(axl_http_server_set_auth_challenge(s, "Basic", "a\"b") == AXL_ERR,
+               "auth challenge: realm with quote -> AXL_ERR");
+
+    axl_http_server_free(s);
+}
+
+// ---------------------------------------------------------------------------
+// Driver selection — bus-location decode + safe negatives
+//
+// _axl_net_bus_location is an internal helper (src/net/axl-net-driver-select.c)
+// exposed for unit testing; declared extern here since unit tests include
+// only <axl.h>. The synthetic device paths below exercise the real
+// trim + firmware DevicePathToText path with deterministic, exact-string
+// expectations. The live driver/bus accessors over a real NIC are covered
+// by test/integration/test-nic-qemu.sh (which the iPXE-last / OEM-child /
+// MediaPresent quirks are real-hardware-only for).
+// ---------------------------------------------------------------------------
+
+int _axl_net_bus_location(const void *device_path, char *out, size_t out_size);
+
+/* Append one device-path node {type,sub,len=4+paylen, payload} at @p off,
+   returning the new offset. */
+static size_t
+dp_append(uint8_t *buf, size_t off, uint8_t type, uint8_t sub,
+          const uint8_t *payload, uint16_t paylen)
+{
+    uint16_t len = (uint16_t)(4 + paylen);
+    buf[off + 0] = type;
+    buf[off + 1] = sub;
+    buf[off + 2] = (uint8_t)len;
+    buf[off + 3] = (uint8_t)(len >> 8);
+    if (paylen != 0 && payload != NULL) {
+        axl_memcpy(buf + off + 4, payload, paylen);
+    }
+    return off + len;
+}
+
+/* ACPI _HID PciRoot(0x0): HID = EISA_PNP_ID(0x0A03) = 0x0A0341D0, UID = 0. */
+static size_t
+dp_pci_root(uint8_t *buf, size_t off)
+{
+    static const uint8_t acpi[8] = { 0xD0, 0x41, 0x03, 0x0A, 0, 0, 0, 0 };
+    return dp_append(buf, off, 0x02, 0x01, acpi, sizeof(acpi));
+}
+
+/* PCI(device,function): struct order is {Function, Device}. */
+static size_t
+dp_pci(uint8_t *buf, size_t off, uint8_t device, uint8_t function)
+{
+    uint8_t pci[2] = { function, device };
+    return dp_append(buf, off, 0x01, 0x01, pci, sizeof(pci));
+}
+
+/* USB(port,interface): {ParentPortNumber, InterfaceNumber}. */
+static size_t
+dp_usb(uint8_t *buf, size_t off, uint8_t port, uint8_t iface)
+{
+    uint8_t usb[2] = { port, iface };
+    return dp_append(buf, off, 0x03, 0x05, usb, sizeof(usb));
+}
+
+/* MAC node — 32-byte MAC + 1-byte IfType (content irrelevant; trimmed). */
+static size_t
+dp_mac(uint8_t *buf, size_t off)
+{
+    static const uint8_t mac[33] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    return dp_append(buf, off, 0x03, 0x0B, mac, sizeof(mac));
+}
+
+static size_t
+dp_end(uint8_t *buf, size_t off)
+{
+    return dp_append(buf, off, 0x7F, 0xFF, NULL, 0);
+}
+
+static void
+test_bus_location(void)
+{
+    char loc[160];
+
+    /* PCI NIC: PciRoot/Pci/MAC -> trim the MAC tail. */
+    uint8_t pci[128];
+    size_t n = dp_pci_root(pci, 0);
+    n = dp_pci(pci, n, 0x03, 0x00);
+    n = dp_mac(pci, n);
+    (void)dp_end(pci, n);
+    test_check(_axl_net_bus_location(pci, loc, sizeof(loc)) == AXL_OK
+                   && axl_strcmp(loc, "PciRoot(0x0)/Pci(0x3,0x0)") == 0,
+               "bus_location: PCI NIC trims MAC tail");
+
+    /* USB NIC: PciRoot/Pci/USB/MAC -> keep the USB port, trim MAC. */
+    uint8_t usb[128];
+    n = dp_pci_root(usb, 0);
+    n = dp_pci(usb, n, 0x01, 0x00);
+    n = dp_usb(usb, n, 0x01, 0x00);
+    n = dp_mac(usb, n);
+    (void)dp_end(usb, n);
+    test_check(_axl_net_bus_location(usb, loc, sizeof(loc)) == AXL_OK
+                   && axl_strcmp(loc, "PciRoot(0x0)/Pci(0x1,0x0)/USB(0x1,0x0)") == 0,
+               "bus_location: USB NIC keeps USB port, trims MAC");
+
+    /* No network tail: the whole path IS the location. */
+    uint8_t notail[64];
+    n = dp_pci_root(notail, 0);
+    n = dp_pci(notail, n, 0x03, 0x00);
+    (void)dp_end(notail, n);
+    test_check(_axl_net_bus_location(notail, loc, sizeof(loc)) == AXL_OK
+                   && axl_strcmp(loc, "PciRoot(0x0)/Pci(0x3,0x0)") == 0,
+               "bus_location: no MAC tail -> whole path");
+
+    /* Argument validation. */
+    test_check(_axl_net_bus_location(NULL, loc, sizeof(loc)) == AXL_ERR,
+               "bus_location: NULL device path -> AXL_ERR");
+    test_check(_axl_net_bus_location(pci, NULL, sizeof(loc)) == AXL_ERR,
+               "bus_location: NULL out -> AXL_ERR");
+    test_check(_axl_net_bus_location(pci, loc, 0) == AXL_ERR,
+               "bus_location: zero out_size -> AXL_ERR");
+}
+
+/* axl_tcp_connect_timeout: a short connect timeout must bound the SYN wait on
+   a silently-dropped destination, instead of the 10 s default. Arg validation
+   needs no network; the timing guard needs an IP (as the suite's other socket
+   tests do). */
+static void
+test_connect_timeout(void)
+{
+    AxlTcp *s = NULL;
+    test_check(axl_tcp_connect_timeout(NULL, 80, NULL, 1000, &s) == AXL_ERR,
+               "connect_timeout: NULL host -> AXL_ERR");
+    test_check(axl_tcp_connect_timeout("10.0.2.99", 80, NULL, 1000, NULL) == AXL_ERR,
+               "connect_timeout: NULL out -> AXL_ERR");
+
+    /* 10.0.2.99 is unassigned in slirp's 10.0.2.0/24 subnet: the SYN goes
+       unanswered (no RST), so the AXL-side connect deadline is what ends the
+       wait. With a 1 s timeout the call must return in ~1 s, not the ~10 s the
+       old hardcoded default took. The >= 500 ms lower bound proves the
+       blackhole actually engaged the timeout (vs a vacuous fast-fail). */
+    axl_net_init(AXL_NET_NIC_AUTO, 10);
+    AxlTcp  *sock = NULL;
+    uint64_t t0 = axl_time_get_ms();
+    int      rc = axl_tcp_connect_timeout("10.0.2.99", 9999, NULL, 1000, &sock);
+    uint64_t elapsed = axl_time_get_ms() - t0;
+    test_check(rc == AXL_ERR,
+               "connect_timeout: silently-dropped host -> AXL_ERR");
+    test_check(elapsed >= 500 && elapsed < 5000,
+               "connect_timeout: 1s timeout honored (not the 10s default)");
+    if (sock != NULL) {
+        axl_tcp_close(sock);
+    }
+}
+
+static void
+test_driver_select_negatives(void)
+{
+    AxlNetDriverInfo di;
+    uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    test_check(axl_net_get_driver_info(NULL, &di) == AXL_ERR,
+               "get_driver_info: NULL mac -> AXL_ERR");
+    test_check(axl_net_get_driver_info(mac, NULL) == AXL_ERR,
+               "get_driver_info: NULL out -> AXL_ERR");
+
+    /* list_available_drivers: NULL count rejected; count-query succeeds. */
+    test_check(axl_net_list_available_drivers(NULL, NULL) == AXL_ERR,
+               "list_available_drivers: NULL count -> AXL_ERR");
+    size_t dcount = 0;
+    test_check(axl_net_list_available_drivers(NULL, &dcount) == AXL_OK,
+               "list_available_drivers: count query -> AXL_OK");
+
+    /* try_driver safe negatives — none load a driver into the shared boot.
+       NULL / empty / a name that can't be located all fail before LoadImage. */
+    AxlNetTryResult tr;
+    test_check(axl_net_try_driver(NULL, &tr) == AXL_ERR && !tr.found,
+               "try_driver: NULL name -> AXL_ERR, found=false");
+    test_check(axl_net_try_driver("", &tr) == AXL_ERR && !tr.found,
+               "try_driver: empty name -> AXL_ERR, found=false");
+    test_check(axl_net_try_driver("axl-no-such-nic-driver-xyz.efi", &tr) == AXL_ERR
+                   && !tr.found,
+               "try_driver: unlocatable name -> AXL_ERR, found=false");
+
+    /* connect_stack is idempotent and safe to call repeatedly. */
+    test_check(axl_net_connect_stack() == AXL_OK,
+               "connect_stack: returns AXL_OK");
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_resolve_async — deterministic IPv4-literal path (no network)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    bool            fired;
+    AxlIPv4Address  addr;
+    AxlStatus       st;
+    AxlLoop        *loop;
+} ResolveAsyncTestCtx;
+
+static void
+resolve_async_test_cb(const AxlIPv4Address *addr, AxlStatus st, void *user)
+{
+    ResolveAsyncTestCtx *c = (ResolveAsyncTestCtx *)user;
+    c->fired = true;
+    c->st    = st;
+    if (addr != NULL) {
+        c->addr = *addr;
+    }
+    axl_loop_quit(c->loop);
+}
+
+// An IPv4 literal needs no DNS, so this is deterministic and network-free. It
+// pins the async contract: the callback is ALWAYS deferred (never re-entrant
+// from the call), fires exactly once, and carries the parsed address.
+static void
+test_resolve_async_literal(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("resolve_async: loop alloc");
+        return;
+    }
+
+    ResolveAsyncTestCtx ctx = { .fired = false, .st = AXL_ERR, .loop = loop };
+    int rc = axl_net_resolve_async("127.0.0.1", loop, NULL,
+                                   resolve_async_test_cb, &ctx);
+
+    test_check(rc == AXL_OK, "resolve_async: literal initiated (AXL_OK)");
+    test_check(!ctx.fired,
+               "resolve_async: literal callback is deferred (not re-entrant)");
+
+    axl_loop_run(loop);
+
+    test_check(ctx.fired, "resolve_async: callback fired after loop run");
+    test_check(ctx.st == AXL_OK, "resolve_async: literal status AXL_OK");
+    test_check(ctx.addr.addr[0] == 127 && ctx.addr.addr[1] == 0 &&
+               ctx.addr.addr[2] == 0   && ctx.addr.addr[3] == 1,
+               "resolve_async: literal resolved to 127.0.0.1");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// axl_http_{get,post}_async — deterministic parameter-validation contract.
+//
+// The happy path needs a server (covered by test-http-async-qemu.sh). Here we
+// pin only the network-free guarantees: a rejected call returns an error and
+// the callback must NOT fire (the "AXL_OK iff cb fires later" contract). A
+// fired callback would flip async_cb_must_not_fire.
+// ---------------------------------------------------------------------------
+
+static void
+async_cb_must_not_fire(AxlHttpClientResponse *resp, AxlStatus st, void *user)
+{
+    (void)resp;
+    (void)st;
+    *(bool *)user = true;
+    if (resp != NULL) {
+        axl_http_client_response_free(resp);
+    }
+}
+
+static void
+test_http_async_param_validation(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("http-async: loop alloc");
+        return;
+    }
+
+    AxlHttpClient *c = axl_http_client_new();
+    if (c == NULL) {
+        test_fail("http-async: client alloc");
+        axl_loop_free(loop);
+        return;
+    }
+
+    bool fired = false;
+
+    /* NULL client / loop / url are rejected before any work — and the
+       callback must not fire (caller still owns everything). */
+    test_check(axl_http_get_async(NULL, loop, "http://h/", NULL,
+                                  async_cb_must_not_fire, &fired) == AXL_ERR,
+               "http-async: NULL client -> AXL_ERR");
+    test_check(axl_http_get_async(c, NULL, "http://h/", NULL,
+                                  async_cb_must_not_fire, &fired) == AXL_ERR,
+               "http-async: NULL loop -> AXL_ERR");
+    test_check(axl_http_get_async(c, loop, NULL, NULL,
+                                  async_cb_must_not_fire, &fired) == AXL_ERR,
+               "http-async: NULL url -> AXL_ERR");
+    test_check(axl_http_post_async(c, loop, NULL, "b", 1, "text/plain", NULL,
+                                   async_cb_must_not_fire, &fired) == AXL_ERR,
+               "http-async: POST NULL url -> AXL_ERR");
+
+    /* Drain the loop briefly: a buggy impl that deferred the callback
+       despite the error return would surface here. */
+    axl_loop_iterate_until(loop, NULL, 20 * 1000);
+    test_check(!fired, "http-async: rejected call never fires the callback");
+
+    axl_http_client_free(c);
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -3653,16 +5763,146 @@ test_net_main(
     }
 
     //
+    // "serve-tls-driver" -- HTTPS server driven by a resident driver-tick
+    // loop (axl_loop_attach_driver, TPL_CALLBACK) instead of a top-level
+    // axl_loop_run. Regression repro for the TLS handshake stalling when a
+    // resident AxlService loop dispatches accept (the synchronous handshake
+    // used to nest an ephemeral axl_loop_run that can't run at raised TPL).
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-driver") == 0) {
+        return run_serve_tls_driver_mode();
+    }
+
+    //
+    // "serve-tls-ws-driver" -- HTTPS + per-client WebSocket on a resident
+    // driver-tick loop. Regression repro for the WS-teardown wedge: a wss
+    // connect/disconnect against the pumped server used to wedge the loop
+    // (synchronous close-frame echo nesting an ephemeral loop at raised TPL).
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-ws-driver") == 0) {
+        return run_serve_tls_ws_driver_mode();
+    }
+
+    //
+    // "serve-hazard-driver" -- the consumer-emulator: HTTPS + WS + a plain
+    // second HTTP server on ONE shared loop, pumped from a driver tick at
+    // raised TPL. The canonical SoftBMC topology that surfaced the wedge /
+    // desync / dead-accept bug family. Driven by test-consumer-emulator-qemu.sh.
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-hazard-driver") == 0) {
+        return run_serve_hazard_driver_mode();
+    }
+
+    //
+    // "serve-shell-coexist" -- foreground real Shell.efi + background HTTP
+    // pumped by axl_loop_attach_driver. The Console Mirror concurrency spike.
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-shell-coexist") == 0) {
+        return run_serve_shell_coexist_mode();
+    }
+
+    //
+    // "serve-tls-shell-coexist" -- rung 5: mirror + HTTPS-on-attach_driver +
+    // foreground Shell (the SoftBMC-faithful HTTPS coexistence proof).
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-shell-coexist") == 0) {
+        return run_serve_tls_shell_coexist_mode();
+    }
+
+    //
+    // "mirror-selftest" -- AxlConsoleMirror positive proof in its own boot.
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "mirror-selftest") == 0) {
+        return run_mirror_selftest_mode();
+    }
+
+    //
+    // "mirror-edit" -- the `edit` acceptance gate (design §6 rung 3).
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "mirror-edit") == 0) {
+        return run_mirror_edit_mode();
+    }
+
+    //
+    // "serve-ws-shell-inject" -- P1 gate: inject_text from a WS handler in the
+    // attach_driver dispatch must wake the foreground Shell (SoftBMC RemoteShell).
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-ws-shell-inject") == 0) {
+        return run_serve_ws_shell_inject_mode();
+    }
+
+    //
+    // Check for "serve-multi" -- two plain servers on one shared loop
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-multi") == 0) {
+        return run_serve_multi_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-multi-tls") == 0) {
+        return run_serve_multi_tls_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-davfs") == 0) {
+        return run_serve_davfs_mode();
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-davfs-tls") == 0) {
+        return run_serve_davfs_tls_mode();
+    }
+
+    //
     // Check for "udp-echo" argument -- send UDP datagram to host
     //
     if (argc >= 4 && axl_strcmp(argv[1], "udp-echo") == 0) {
         return run_udp_echo_mode(argv[2], argv[3]);
     }
 
+    // Outbound sync TCP connect/send/recv at raised TPL — test-tcp-connect-rtpl-qemu.sh
+    if (argc >= 3 && axl_strcmp(argv[1], "get-async") == 0) {
+        return run_http_async_mode("GET", argv[2], NULL);
+    }
+
+    if (argc >= 4 && axl_strcmp(argv[1], "post-async") == 0) {
+        return run_http_async_mode("POST", argv[2], argv[3]);
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "get-sync-rtpl") == 0) {
+        return run_get_sync_rtpl_mode(argv[2]);
+    }
+
+    if (argc >= 4 && axl_strcmp(argv[1], "tcp-connect-rtpl") == 0) {
+        return run_tcp_connect_rtpl_mode(argv[2], argv[3]);
+    }
+
+    //
+    // "sntp-query <host> <port>" -- query a (mock) SNTP server
+    //
+    if (argc >= 4 && axl_strcmp(argv[1], "sntp-query") == 0) {
+        return run_sntp_query_mode(argv[2], argv[3]);
+    }
+
+    //
+    // "net-diag" -- exercise the DHCP-lease / reverse-DNS primitives
+    // against the live (DHCP'd) network. Driven by test-netdiag-qemu.sh.
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "net-diag") == 0) {
+        return run_net_diag_mode();
+    }
+
     //
     // Normal unit test mode
     //
     test_print_header("AxlTestNet");
+
+    //
+    // Driver selection — bus-location decode (synthetic) + safe negatives.
+    // Needs the firmware DevicePathToText protocol (always present under
+    // OVMF) but no NIC / driver load.
+    //
+    axl_printf("--- Driver Select ---\n");
+    test_bus_location();
+    test_driver_select_negatives();
+    test_connect_timeout();
 
     //
     // URL parsing (no network)
@@ -3695,6 +5935,8 @@ test_net_main(
     axl_printf("\n--- HTTP Core Parsing ---\n");
     test_http_find_header_end();
     test_http_parse_status();
+    test_http_status_line();
+    test_http_auth_challenge();
     test_http_parse_request();
     test_http_parse_headers();
     test_http_parse_range();
@@ -3713,6 +5955,8 @@ test_net_main(
     //
     axl_printf("\n--- AxlNetOpts ---\n");
     test_net_opts_validation();
+    test_net_resolve_ptr_validation();
+    test_ws_conn_api_validation();
 
     //
     // AxlInetAddress (no network)
@@ -3777,6 +6021,9 @@ test_net_main(
     axl_printf("\n--- SocketClient ---\n");
     test_socket_client_connect();
     test_socket_client_invalid();
+
+    test_resolve_async_literal();
+    test_http_async_param_validation();
 
     return test_print_results();
 }

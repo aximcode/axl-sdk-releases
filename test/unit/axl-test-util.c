@@ -3,14 +3,19 @@
 **/
 
 #include "axl-test.h"
+#include <axl/axl-debug.h>
 #include <axl/axl-smbios.h>
 #include <axl/axl-sort.h>
 #include <axl/axl-clipboard.h>
 #include <axl/axl-shm.h>
 #include <axl/axl-rand.h>
 #include <axl/axl-driver.h>   /* axl_protocol_install / _uninstall */
+#include <axl/axl-shell.h>    /* axl_shell_launch */
+#include <axl/axl-image.h>   /* axl_image_run */
+#include <axl/axl-console-mirror.h>
 #include <axl/axl-tar.h>
 #include <axl/axl-stream.h>
+#include <axl/axl-config-file.h>
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -384,6 +389,53 @@ test_smbios(void)
         mem_count++;
         if (mem_count > 1024) { break; }
     }
+
+    // Type 17 field decode — exact values from a SYNTHETIC record (real QEMU
+    // Type 17 values vary, so pin the new form_factor / width / rank decode
+    // against a crafted record of known bytes; SMBIOS 2.7+ length 0x22).
+    /* Non-const + 8-aligned: the reader takes a non-const AxlSmbiosHeader*
+       (read-only in practice) and dereferences uint16/uint32 members. */
+    static uint8_t synth_t17[] __attribute__((aligned(8))) = {
+        /* --- formatted area (0x22 bytes) --- */
+        0x11, 0x22, 0x10, 0x00,   /* Type=17, Length=0x22, Handle=0x0010      */
+        0x00, 0x00,               /* 0x04 MemoryArrayHandle                    */
+        0xFF, 0xFF,               /* 0x06 MemoryErrorInfoHandle = none         */
+        0x48, 0x00,               /* 0x08 TotalWidth = 72 (data + ECC)         */
+        0x40, 0x00,               /* 0x0A DataWidth  = 64                      */
+        0x00, 0x40,               /* 0x0C Size = 0x4000 = 16384 MB (bit15 clr) */
+        0x09,                     /* 0x0E FormFactor = 9 (DIMM)                */
+        0x00,                     /* 0x0F DeviceSet                            */
+        0x01,                     /* 0x10 DeviceLocator -> string 1            */
+        0x02,                     /* 0x11 BankLocator   -> string 2            */
+        0x1A,                     /* 0x12 MemoryType = 0x1A (DDR4)             */
+        0x00, 0x00,               /* 0x13 TypeDetail                           */
+        0xA0, 0x0F,               /* 0x15 Speed = 4000 MHz (0x0FA0)            */
+        0x00,                     /* 0x17 Manufacturer                         */
+        0x00,                     /* 0x18 SerialNumber                         */
+        0x00,                     /* 0x19 AssetTag                             */
+        0x00,                     /* 0x1A PartNumber                           */
+        0x02,                     /* 0x1B Attributes -> rank = 2               */
+        0x00, 0x00, 0x00, 0x00,   /* 0x1C ExtendedSize = 0                     */
+        0x40, 0x0F,               /* 0x20 ConfiguredClockSpeed                 */
+        /* --- string set: "DIMM_A", "BANK 0", double-NUL terminator --- */
+        'D','I','M','M','_','A', 0x00,
+        'B','A','N','K',' ','0', 0x00,
+        0x00
+    };
+    AxlSmbiosMemoryDevice smd;
+    axl_memset(&smd, 0, sizeof(smd));
+    test_check(axl_smbios_read_memory_device(
+                   (AxlSmbiosHeader *)synth_t17, &smd) == AXL_OK,
+               "smbios: read synthetic Type 17");
+    test_check(smd.form_factor == 0x09, "smbios: form_factor decodes to 9 (DIMM)");
+    test_check(smd.total_width == 72,   "smbios: total_width = 72 bits");
+    test_check(smd.data_width  == 64,   "smbios: data_width = 64 bits");
+    test_check(smd.rank == 2,           "smbios: rank = 2 (Attributes low nibble)");
+    test_check(smd.memory_type == 0x1A, "smbios: memory_type = DDR4");
+    test_check(smd.size_mb == 16384,    "smbios: size_mb = 16384");
+    test_check(smd.device_locator != NULL
+                   && axl_strcmp(smd.device_locator, "DIMM_A") == 0,
+               "smbios: device_locator = DIMM_A");
 
     // Wrong-type guard: read_processor should refuse a non-Type-4 header
     AxlSmbiosProcessorInfo pi_bad;
@@ -1512,6 +1564,112 @@ test_apply_fn(void *target, const char *key, const char *value)
 }
 
 static void
+test_config_file(void)
+{
+    /* Empty map: every lookup yields its caller default. */
+    AxlConfigFile *cf = axl_config_file_new();
+    test_check(cf != NULL, "config_file: new returns a map");
+    test_check(axl_strcmp(axl_config_file_get(cf, "absent", "fallback"),
+                          "fallback") == 0,
+               "config_file: missing string key returns default");
+    test_check(axl_config_file_get_uint(cf, "absent", 42) == 42,
+               "config_file: missing uint key returns default");
+    test_check(axl_config_file_get_int(cf, "absent", -7) == -7,
+               "config_file: missing int key returns default");
+    test_check(axl_config_file_get_bool(cf, "absent", true) == true,
+               "config_file: missing bool key returns default");
+
+    /* set / get round-trip + typed parsing. */
+    test_check(axl_config_file_set(cf, "name", "softbmc") == AXL_OK,
+               "config_file: set returns AXL_OK");
+    test_check(axl_strcmp(axl_config_file_get(cf, "name", ""), "softbmc") == 0,
+               "config_file: set value reads back");
+    axl_config_file_set(cf, "timeout", "900");
+    test_check(axl_config_file_get_uint(cf, "timeout", 0) == 900,
+               "config_file: get_uint parses a stored decimal");
+    axl_config_file_set(cf, "hexval", "0x1f");
+    test_check(axl_config_file_get_uint(cf, "hexval", 0) == 0x1f,
+               "config_file: get_uint parses 0x-hex");
+    axl_config_file_set(cf, "offset", "-12");
+    test_check(axl_config_file_get_int(cf, "offset", 0) == -12,
+               "config_file: get_int parses a negative");
+    axl_config_file_set(cf, "flag", "YES");
+    test_check(axl_config_file_get_bool(cf, "flag", false) == true,
+               "config_file: get_bool parses YES (case-insensitive)");
+    axl_config_file_set(cf, "flag2", "off");
+    test_check(axl_config_file_get_bool(cf, "flag2", true) == false,
+               "config_file: get_bool parses off");
+    axl_config_file_set(cf, "notnum", "abc");
+    test_check(axl_config_file_get_uint(cf, "notnum", 99) == 99,
+               "config_file: unparseable uint returns default");
+    test_check(axl_config_file_get_bool(cf, "notnum", false) == false,
+               "config_file: unparseable bool returns default");
+    axl_config_file_set(cf, "name", "renamed");
+    test_check(axl_strcmp(axl_config_file_get(cf, "name", ""), "renamed") == 0,
+               "config_file: set overwrites an existing key");
+    axl_config_file_free(cf);
+
+    /* Parse a file: comments, blanks, trimming, dotted keys, no-'=' line. */
+    const char *text =
+        "# a comment\n"
+        "\n"
+        "mode=handoff\n"
+        "  boot_timeout =  30  \n"
+        "ec.poll_interval_ms=5000\n"
+        "noeqline\n"
+        "empty=\n";
+    test_check(axl_file_set_contents("axl-cfgfile.tmp", text,
+                                     axl_strlen(text)) == AXL_OK,
+               "config_file: wrote test config file");
+    AxlConfigFile *lf = axl_config_file_load("axl-cfgfile.tmp");
+    test_check(lf != NULL, "config_file: load returns a map");
+    test_check(axl_strcmp(axl_config_file_get(lf, "mode", ""), "handoff") == 0,
+               "config_file: parsed a core key");
+    test_check(axl_config_file_get_uint(lf, "boot_timeout", 0) == 30,
+               "config_file: trimmed key+value parse (boot_timeout=30)");
+    test_check(axl_config_file_get_uint(lf, "ec.poll_interval_ms", 0) == 5000,
+               "config_file: parsed a dotted prefix.key as a flat key");
+    test_check(axl_strcmp(axl_config_file_get(lf, "empty", "X"), "") == 0,
+               "config_file: empty value stored as empty string");
+    test_check(axl_config_file_get(lf, "noeqline", NULL) == NULL,
+               "config_file: a line with no '=' is ignored");
+    test_check(axl_config_file_get(lf, "# a comment", NULL) == NULL,
+               "config_file: comment line is not a key");
+    axl_config_file_free(lf);
+
+    /* Missing file -> empty map (NOT NULL, NOT an error). */
+    AxlConfigFile *mf = axl_config_file_load("does-not-exist.cfg");
+    test_check(mf != NULL,
+               "config_file: missing file yields an empty map (not NULL)");
+    test_check(axl_config_file_get_uint(mf, "anything", 7) == 7,
+               "config_file: empty-from-missing map returns defaults");
+    axl_config_file_free(mf);
+
+    /* save -> load round-trip. */
+    AxlConfigFile *sf = axl_config_file_new();
+    axl_config_file_set(sf, "alpha", "one");
+    axl_config_file_set(sf, "beta", "2");
+    test_check(axl_config_file_save(sf, "axl-cfgsave.tmp") == AXL_OK,
+               "config_file: save returns AXL_OK");
+    axl_config_file_free(sf);
+    AxlConfigFile *rt = axl_config_file_load("axl-cfgsave.tmp");
+    test_check(rt != NULL
+               && axl_strcmp(axl_config_file_get(rt, "alpha", ""), "one") == 0
+               && axl_config_file_get_uint(rt, "beta", 0) == 2,
+               "config_file: save -> load round-trips values");
+    axl_config_file_free(rt);
+
+    /* NULL-safety: free(NULL) must not crash; the API stays usable after. */
+    test_check(axl_strcmp(axl_config_file_get(NULL, "k", "d"), "d") == 0,
+               "config_file: get on NULL map returns default");
+    axl_config_file_free(NULL);
+    AxlConfigFile *probe = axl_config_file_new();
+    test_check(probe != NULL,
+               "config_file: API usable after free(NULL)");
+    axl_config_file_free(probe);
+}
+
+static void
 test_config(void)
 {
     TestConfigTarget tgt;
@@ -1573,6 +1731,52 @@ test_config(void)
     /* Free NULL is safe */
     axl_config_free(NULL);
     test_check(true, "config: free(NULL) no crash");
+}
+
+/* The added min/max descriptor fields are SYNTHESIS-ONLY metadata (like
+ * short_name / choices): AxlConfig parsing must IGNORE them — no range
+ * clamping on set, and a value outside [min,max] stores + reads back verbatim.
+ * (The bounds are consumed by the axl_service_main AxlArgDesc synthesizer for
+ * CLI validation and by a downstream settings-UI builder, not by the parser.) */
+typedef struct {
+    int tab_width;
+} TestRangeTarget;
+
+static const AxlConfigDesc test_range_descs[] = {
+    { "tab_width", AXL_CFG_INT, "4", "Tab width",
+      offsetof(TestRangeTarget, tab_width), sizeof(int),
+      0, NULL, /* short_name, choices */
+      1, 16 },  /* min, max */
+    { 0 }
+};
+
+static void
+test_config_minmax_ignored_by_parsing(void)
+{
+    /* The descriptor carries the declared bounds (readable by consumers). */
+    test_check(test_range_descs[0].min == 1 && test_range_descs[0].max == 16,
+               "config range: descriptor carries min/max");
+
+    TestRangeTarget tgt;
+    axl_memset(&tgt, 0, sizeof(tgt));
+    AxlConfig *cfg = axl_config_new(test_range_descs, NULL, &tgt);
+    test_check(cfg != NULL, "config range: new");
+    test_check(tgt.tab_width == 4, "config range: default applied");
+
+    /* A value far ABOVE max is stored + auto-applied UNCHANGED (not clamped). */
+    test_check(axl_config_set(cfg, "tab_width", "999") == AXL_OK,
+               "config range: set out-of-range accepted (no clamp)");
+    test_check(tgt.tab_width == 999,
+               "config range: out-of-range value auto-applied verbatim");
+    test_check(axl_config_get_int(cfg, "tab_width") == 999,
+               "config range: out-of-range value read back verbatim");
+
+    /* A value BELOW min likewise stored verbatim. */
+    axl_config_set(cfg, "tab_width", "0");
+    test_check(tgt.tab_width == 0,
+               "config range: below-min value not clamped");
+
+    axl_config_free(cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,6 +2023,108 @@ test_config_descs_net_server(void)
     test_check(listen_ip_seen, "descs_net: SERVER mask emits 'listen-ip'");
     test_check(listen_ip_off == offsetof(AxlNetOpts, local_ip),
                "descs_net: listen-ip targets local_ip field (same as source-ip)");
+}
+
+/* The static (policy) descriptor group: emission shape + the round-trip
+   that proves the const-char* fields actually populate through AxlConfig's
+   pointer-based string auto-apply (an inline char[] would silently no-op —
+   the contract-review BLOCKER this test guards). */
+static void
+test_config_descs_net_static(void)
+{
+    typedef struct {
+        char             pad[8];
+        AxlNetStaticOpts net;
+    } HostOpts;
+
+    AxlConfigDesc out[16];
+    axl_memset(out, 0, sizeof(out));
+
+    size_t n = axl_config_descs_net_static(out, 16, offsetof(HostOpts, net));
+    test_check(n == 7, "descs_net_static: 7 entries");
+
+    /* Every emitted field is a string descriptor targeting a const char*
+       member at base + offsetof. */
+    bool mode_seen = false, ip_seen = false, dns_seen = false, host_seen = false;
+    const char *const *mode_choices = NULL;
+    for (size_t i = 0; i < n; i++) {
+        test_check(out[i].type == AXL_CFG_STRING,
+                   "descs_net_static: entry is AXL_CFG_STRING");
+        test_check(out[i].field_size == sizeof(const char *),
+                   "descs_net_static: field_size = sizeof(char*)");
+        if (axl_streql(out[i].key, "mode")) {
+            mode_seen = true; mode_choices = out[i].choices;
+        }
+        if (axl_streql(out[i].key, "ip")) {
+            ip_seen = true;
+            test_check(out[i].offset
+                           == offsetof(HostOpts, net) + offsetof(AxlNetStaticOpts, ip),
+                       "descs_net_static: ip targets AxlNetStaticOpts.ip");
+        }
+        if (axl_streql(out[i].key, "dns"))      { dns_seen = true; }
+        if (axl_streql(out[i].key, "hostname")) { host_seen = true; }
+    }
+    test_check(mode_seen && ip_seen && dns_seen && host_seen,
+               "descs_net_static: emits mode/ip/dns/hostname keys");
+    test_check(mode_choices != NULL
+                   && mode_choices[0] != NULL && mode_choices[1] != NULL
+                   && axl_streql(mode_choices[0], "dhcp")
+                   && axl_streql(mode_choices[1], "static")
+                   && mode_choices[2] == NULL,
+               "descs_net_static: mode choices = {dhcp, static}");
+
+    /* Round-trip through AxlConfig — the B1 guard. */
+    HostOpts tgt;
+    axl_memset(&tgt, 0, sizeof(tgt));
+    AXL_AUTOPTR(AxlConfig) cfg = axl_config_new(out, NULL, &tgt);
+    test_check(cfg != NULL, "descs_net_static: config new");
+    test_check(tgt.net.mode != NULL && axl_streql(tgt.net.mode, "dhcp"),
+               "descs_net_static: mode default 'dhcp' applied");
+    axl_config_set(cfg, "mode", "static");
+    axl_config_set(cfg, "ip", "10.0.0.5");
+    axl_config_set(cfg, "dns", "8.8.8.8");
+    test_check(tgt.net.mode != NULL && axl_streql(tgt.net.mode, "static"),
+               "descs_net_static: round-trip mode populated (B1)");
+    test_check(tgt.net.ip != NULL && axl_streql(tgt.net.ip, "10.0.0.5"),
+               "descs_net_static: round-trip ip populated");
+    test_check(tgt.net.dns != NULL && axl_streql(tgt.net.dns, "8.8.8.8"),
+               "descs_net_static: round-trip dns populated");
+}
+
+/* Static-net setters: arg validation (pure) + the hostname persist/read
+   round-trip (uses the NV store, available under OVMF). */
+static void
+test_net_static_setters(void)
+{
+    test_check(axl_net_set_dns(0, NULL, NULL) == AXL_ERR,
+               "set_dns: NULL primary -> AXL_ERR");
+
+    test_check(axl_net_set_hostname(NULL) == AXL_ERR,
+               "set_hostname: NULL -> AXL_ERR");
+    test_check(axl_net_set_hostname("") == AXL_ERR,
+               "set_hostname: empty -> AXL_ERR");
+
+    char hbuf[64] = "x";
+    test_check(axl_net_get_hostname(NULL, sizeof(hbuf)) == AXL_ERR,
+               "get_hostname: NULL buf -> AXL_ERR");
+    test_check(axl_net_get_hostname(hbuf, 0) == AXL_ERR,
+               "get_hostname: zero size -> AXL_ERR");
+
+    /* init_static arg validation: NULL cfg, and an unrecognized mode is
+       rejected (not silently treated as DHCP). */
+    test_check(axl_net_init_static(NULL, AXL_NET_NIC_AUTO, 0) == AXL_ERR,
+               "init_static: NULL cfg -> AXL_ERR");
+    AxlNetStaticOpts bogus = { .mode = "statc" };
+    test_check(axl_net_init_static(&bogus, AXL_NET_NIC_AUTO, 0) == AXL_ERR,
+               "init_static: unrecognized mode -> AXL_ERR");
+
+    /* Hostname persist/read round-trip. */
+    test_check(axl_net_set_hostname("axlhost") == AXL_OK,
+               "set_hostname: 'axlhost' -> AXL_OK");
+    char got[64] = { 0 };
+    test_check(axl_net_get_hostname(got, sizeof(got)) == AXL_OK
+                   && axl_streql(got, "axlhost"),
+               "get_hostname: round-trips 'axlhost'");
 }
 
 static void
@@ -4128,6 +4434,90 @@ test_image(void)
     /* Unload(NULL) is a no-op — return 0. */
     test_check(axl_image_unload(NULL) == AXL_OK,
                "image: unload(NULL) is a no-op");
+}
+
+// ---------------------------------------------------------------------------
+// axl_image_run — generic foreground launch guards. The positive path (load +
+// StartImage a real app) transfers the foreground and blocks, which would hang
+// the combined unit boot, so unit coverage here is safe negatives only
+// (own-validation + load-failure, neither of which reaches StartImage). The
+// blocking-launch path is exercised by axl_shell_launch in the shell-coexist /
+// edit / HTTPS integration tests, which run a real child Shell in isolation.
+// ---------------------------------------------------------------------------
+
+static void
+test_shell_launch(void)
+{
+    /* NULL path is rejected before any load/start, and the out param is
+       zeroed (never left holding stale caller data). */
+    int exit_code = 0xCAFE;
+    test_check(axl_image_run(NULL, "-nostartup", &exit_code) == AXL_ERR,
+               "image_run: NULL path returns -1");
+    test_check(exit_code == 0,
+               "image_run: NULL path zeroes out_exit_code");
+
+    /* A path that can't be loaded fails cleanly — load fails, so there is
+       no StartImage, no foreground transfer, nothing to hang the boot. */
+    test_check(axl_image_run("fs0:\\not-a-real-app.efi", NULL, NULL) == AXL_ERR,
+               "image_run: missing image returns -1");
+}
+
+// ---------------------------------------------------------------------------
+// AxlConsoleMirror (P1) — argument guards only.
+//
+// The positive path (install → swap gST + ReinstallProtocolInterface on
+// ConsoleInHandle → translate/inject → uninstall) CANNOT be exercised in the
+// combined unit boot: it wraps the very console the parent harness Shell is
+// using, and even a clean uninstall leaves that Shell unable to continue
+// startup.nsh — so the next test binary never launches. (Confirmed: AxlTestUtil
+// finishes, AxlTestLoop never boots, QEMU times out.) This is the firmware-
+// lifecycle hazard from feedback_uefi_firmware_test_hazards — the mirror is
+// correct for its real use (wrap, then launch a CHILD shell you own), but that
+// belongs in an isolated integration boot, not here.
+//
+// Full install/translate/inject coverage lives in
+// test/integration/test-console-mirror-qemu.sh (own QEMU boot, results printed
+// AFTER uninstall, then idle). Here: only safe negatives — guards that never
+// reach the gST surgery.
+// ---------------------------------------------------------------------------
+
+static void
+cm_noop_sink(const char *bytes, size_t len, void *user)
+{
+    (void)bytes;
+    (void)len;
+    (void)user;
+}
+
+static void
+test_console_mirror(void)
+{
+    AxlConsoleMirror      *m   = NULL;
+    AxlConsoleMirrorConfig cfg = {
+        .sink = cm_noop_sink, .user = NULL,
+        .cols = 80, .rows = 25, .passthrough_local = false,
+    };
+
+    /* Argument guards — none of these install, so the console is untouched. */
+    test_check(axl_console_mirror_install(NULL, &cfg) == AXL_ERR,
+               "console_mirror: install(NULL out) returns -1");
+    test_check(axl_console_mirror_install(&m, NULL) == AXL_ERR,
+               "console_mirror: install(NULL cfg) returns -1");
+    AxlConsoleMirrorConfig no_sink = cfg;
+    no_sink.sink = NULL;
+    test_check(axl_console_mirror_install(&m, &no_sink) == AXL_ERR,
+               "console_mirror: install(NULL sink) returns -1");
+    test_check(m == NULL,
+               "console_mirror: out stays NULL on rejected install");
+
+    /* NULL-safe teardown / accessors / injection. */
+    axl_console_mirror_uninstall(NULL);
+    axl_console_mirror_reset(NULL);
+    axl_console_mirror_set_size(NULL, 100, 40);
+    test_check(axl_console_mirror_inject_key(NULL, 0, 'x') == AXL_ERR,
+               "console_mirror: inject_key(NULL) returns -1");
+    test_check(axl_console_mirror_inject_text(NULL, "x", 1) == AXL_ERR,
+               "console_mirror: inject_text(NULL m) returns -1");
 }
 
 // ---------------------------------------------------------------------------
@@ -7135,11 +7525,129 @@ test_tar_reader_rejects_bad(void)
     test_check(axl_tar_reader_new(NULL) == NULL, "tar: reader_new(NULL) -> NULL");
 }
 
+static void
+test_status_enum_contract(void)
+{
+    /* AxlStatus numeric values are part of the public contract (callers may
+       compare against the literal integers). Pin every code so a reorder or
+       renumber is caught. New codes only ever extend the negative range. */
+    test_check(AXL_OK == 0,            "status: AXL_OK == 0");
+    test_check(AXL_ERR == -1,          "status: AXL_ERR == -1");
+    test_check(AXL_CANCELLED == -2,    "status: AXL_CANCELLED == -2");
+    test_check(AXL_TIMEOUT == -3,      "status: AXL_TIMEOUT == -3");
+    test_check(AXL_INVALID == -4,      "status: AXL_INVALID == -4");
+    test_check(AXL_NOT_FOUND == -5,    "status: AXL_NOT_FOUND == -5");
+    test_check(AXL_DENIED == -6,       "status: AXL_DENIED == -6");
+    test_check(AXL_UNSUPPORTED == -7,  "status: AXL_UNSUPPORTED == -7");
+    test_check(AXL_NO_RESOURCES == -8, "status: AXL_NO_RESOURCES == -8");
+    test_check(AXL_IO_ERROR == -9,     "status: AXL_IO_ERROR == -9");
+    /* Every richer code is a failure (negative) — callers treating "any
+       negative == error" must stay correct. */
+    test_check(AXL_NOT_FOUND < 0 && AXL_DENIED < 0 && AXL_UNSUPPORTED < 0
+               && AXL_NO_RESOURCES < 0 && AXL_IO_ERROR < 0 && AXL_INVALID < 0,
+               "status: all richer codes are negative (failure)");
+}
+
+static void
+test_status_efi_mapping(void)
+{
+    /* to_efi: representative EFI code per AxlStatus. */
+    test_check(axl_status_to_efi(AXL_OK) == AXL_EFI_SUCCESS,
+               "to_efi: OK -> SUCCESS");
+    test_check(axl_status_to_efi(AXL_INVALID) == AXL_EFI_INVALID_PARAMETER,
+               "to_efi: INVALID -> INVALID_PARAMETER");
+    test_check(axl_status_to_efi(AXL_NOT_FOUND) == AXL_EFI_NOT_FOUND,
+               "to_efi: NOT_FOUND -> NOT_FOUND");
+    test_check(axl_status_to_efi(AXL_DENIED) == AXL_EFI_ACCESS_DENIED,
+               "to_efi: DENIED -> ACCESS_DENIED");
+    test_check(axl_status_to_efi(AXL_UNSUPPORTED) == AXL_EFI_UNSUPPORTED,
+               "to_efi: UNSUPPORTED -> UNSUPPORTED");
+    test_check(axl_status_to_efi(AXL_NO_RESOURCES) == AXL_EFI_OUT_OF_RESOURCES,
+               "to_efi: NO_RESOURCES -> OUT_OF_RESOURCES");
+    test_check(axl_status_to_efi(AXL_IO_ERROR) == AXL_EFI_DEVICE_ERROR,
+               "to_efi: IO_ERROR -> DEVICE_ERROR");
+    test_check(axl_status_to_efi(AXL_TIMEOUT) == AXL_EFI_TIMEOUT,
+               "to_efi: TIMEOUT -> TIMEOUT");
+    test_check(axl_status_to_efi(AXL_CANCELLED) == AXL_EFI_ABORTED,
+               "to_efi: CANCELLED -> ABORTED");
+    test_check(axl_status_to_efi(AXL_ERR) == AXL_EFI_ABORTED,
+               "to_efi: generic ERR -> ABORTED");
+    /* Every failure maps to an EFI error; OK does not. */
+    test_check(!AXL_EFI_ERROR(axl_status_to_efi(AXL_OK)),
+               "to_efi: OK is not an EFI error");
+    test_check(AXL_EFI_ERROR(axl_status_to_efi(AXL_ERR)),
+               "to_efi: ERR is an EFI error");
+
+    /* from_efi: success/warning -> OK; mapped errors -> peer; else -> ERR. */
+    test_check(axl_status_from_efi(AXL_EFI_SUCCESS) == AXL_OK,
+               "from_efi: SUCCESS -> OK");
+    /* A warning has the top (error) bit clear, so it is not a failure. */
+    test_check(axl_status_from_efi((AxlEfiStatus)1) == AXL_OK,
+               "from_efi: a warning (top bit clear) -> OK");
+    test_check(axl_status_from_efi(AXL_EFI_ACCESS_DENIED) == AXL_DENIED,
+               "from_efi: ACCESS_DENIED -> DENIED");
+    test_check(axl_status_from_efi(AXL_EFI_NOT_FOUND) == AXL_NOT_FOUND,
+               "from_efi: NOT_FOUND -> NOT_FOUND");
+    test_check(axl_status_from_efi(AXL_EFI_SECURITY_VIOLATION) == AXL_ERR,
+               "from_efi: unmapped error -> generic ERR");
+
+    /* Round-trip is identity for codes with a 1:1 EFI peer. */
+    static const AxlStatus peers[] = {
+        AXL_OK, AXL_INVALID, AXL_NOT_FOUND, AXL_DENIED, AXL_UNSUPPORTED,
+        AXL_NO_RESOURCES, AXL_IO_ERROR, AXL_TIMEOUT, AXL_CANCELLED,
+    };
+    bool round_trips = true;
+    for (size_t i = 0; i < sizeof(peers) / sizeof(peers[0]); i++) {
+        if (axl_status_from_efi(axl_status_to_efi(peers[i])) != peers[i]) {
+            round_trips = false;
+        }
+    }
+    test_check(round_trips,
+               "status: from_efi(to_efi(x)) == x for 1:1-peer codes");
+}
+
+// ---------------------------------------------------------------------------
+// AXL_DEBUG_ASSERT Tests
+// ---------------------------------------------------------------------------
+
+static void
+test_debug_assert(void)
+{
+    size_t before = _axl_debug_assert_count();
+
+    /* A satisfied invariant must not fire. */
+    AXL_DEBUG_ASSERT(1 == 1);
+    AXL_DEBUG_ASSERT_MSG(before == before, "tautology");
+    test_check(_axl_debug_assert_count() == before,
+               "debug-assert: true condition does not fire");
+
+#ifdef NDEBUG
+    /* Under NDEBUG the macros compile out — a false condition is a no-op
+       and is not even evaluated. */
+    AXL_DEBUG_ASSERT(1 == 2);
+    test_check(_axl_debug_assert_count() == before,
+               "debug-assert: compiled out (no fire) under NDEBUG");
+#else
+    /* In a debug/test build a violated invariant fires exactly once and
+       CONTINUES (no abort/wedge — the next line still runs). */
+    AXL_DEBUG_ASSERT(1 == 2);
+    test_check(_axl_debug_assert_count() == before + 1,
+               "debug-assert: false condition fires once and continues");
+
+    AXL_DEBUG_ASSERT_MSG(0, "intentional test failure");
+    test_check(_axl_debug_assert_count() == before + 2,
+               "debug-assert: _MSG variant fires and continues");
+#endif
+}
+
 int
 test_util_main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     test_print_header("AxlUtil");
+
+    test_status_enum_contract();
+    test_status_efi_mapping();
 
     test_clipboard();
     test_clipboard_corrupt();
@@ -7182,6 +7690,8 @@ test_util_main(int argc, char **argv)
     test_cpu_features_extended();
     test_cpu_enable_avx512();
     test_image();
+    test_shell_launch();
+    test_console_mirror();
     test_image_verify_signature();
     test_image_verify_cn_extract();
     test_hexdump();
@@ -7190,6 +7700,7 @@ test_util_main(int argc, char **argv)
     test_clock_gettime();
     test_time_sleep();
     test_config();
+    test_config_minmax_ignored_by_parsing();
     test_config_width_overflow();
     test_config_parent();
     test_config_descs_append_basic();
@@ -7197,10 +7708,13 @@ test_util_main(int argc, char **argv)
     test_config_descs_append_capacity();
     test_config_descs_net_client();
     test_config_descs_net_server();
+    test_config_descs_net_static();
+    test_net_static_setters();
     test_config_descs_net_source_and_listen_share_field();
     test_config_descs_net_empty_kinds();
     test_config_descs_net_capacity();
     test_config_descs_net_round_trip();
+    test_config_file();
     test_config_multi();
     test_config_to_from_string();
     test_config_callback();
@@ -7230,6 +7744,8 @@ test_util_main(int argc, char **argv)
     test_qsort_heapsort_fallback();
     test_qsort_large_elements();
     test_qsort_with_data_descending();
+
+    test_debug_assert();
 
     test_tar_roundtrip();
     test_tar_long_name();

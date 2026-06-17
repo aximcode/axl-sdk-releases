@@ -102,8 +102,8 @@ struct AxlCompositor {
     // Device path (axl_compositor_attach_pointer): relative-delta seed.
     int32_t        dev_seed_x, dev_seed_y;
     bool           dev_seeded;
-    uint32_t       ptr_source;     // pointer axl-loop source id (0 = not attached)
-    uint32_t       touch_source;   // absolute-pointer (touch/BMC) source id (0 = not attached)
+    AxlSourceId    ptr_source;     // pointer axl-loop source id (0 = not attached)
+    AxlSourceId    touch_source;   // absolute-pointer (touch/BMC) source id (0 = not attached)
     uint32_t       touch_buttons;  // last button mask from the absolute source (edge-detect)
     AxlGesture     touch_gesture;  // click-count / drag recognizer for the absolute path
 
@@ -111,7 +111,7 @@ struct AxlCompositor {
     AxlGrab        grab_stack[AXL_COMPOSITOR_GRAB_MAX];  // LIFO; [count-1] = active
     uint32_t       grab_count;
     AxlSurface    *kbd_focus;       // keyboard-focus surface (NULL = none)
-    uint32_t       kbd_source;      // keyboard axl-loop source id (0 = not attached)
+    AxlSourceId    kbd_source;      // keyboard axl-loop source id (0 = not attached)
 
     // --- C6: the cursor (top overlay, bound to output, driven by the seat) ---
     AxlCursor     *cursor;
@@ -119,7 +119,7 @@ struct AxlCompositor {
     // --- E7: the frame clock (present throttling) ---
     AxlLoop       *frame_loop;       // loop the clock is attached to (NULL = none)
     uint32_t       frame_interval;   // tick period in ms
-    uint32_t       frame_timer;      // loop source id (0 = not armed)
+    AxlSourceId    frame_timer;      // loop source id (0 = not armed)
 };
 
 #define SURF(ntnode) ((AxlSurface *)(ntnode)->data)
@@ -1407,7 +1407,7 @@ comp_pointer_trampoline(const AxlInputEvent *ev, void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
-uint32_t
+AxlSourceId
 axl_compositor_attach_pointer(AxlCompositor *c, AxlLoop *loop)
 {
     if (c == NULL || loop == NULL) {
@@ -1480,7 +1480,7 @@ comp_touch_trampoline(const AxlInputEvent *ev, void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
-uint32_t
+AxlSourceId
 axl_compositor_attach_touch(AxlCompositor *c, AxlLoop *loop)
 {
     if (c == NULL || loop == NULL) {
@@ -1615,7 +1615,7 @@ comp_key_trampoline(const AxlInputEvent *ev, void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
-uint32_t
+AxlSourceId
 axl_compositor_attach_keyboard(AxlCompositor *c, AxlLoop *loop)
 {
     if (c == NULL || loop == NULL) {
@@ -1769,7 +1769,7 @@ frame_tick(void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
-uint32_t
+AxlSourceId
 axl_compositor_attach_frame_clock(AxlCompositor *c, AxlLoop *loop,
                                   uint32_t interval_ms)
 {

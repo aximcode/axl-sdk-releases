@@ -121,8 +121,8 @@ typedef struct {
     bool                          prev_right;
     AxlGesture                    gesture;       ///< click-count / drag recognizer
     AxlLoop                      *loop;          ///< loop (for repeat timers + detach)
-    uint32_t                      source_id;     ///< WaitForInput loop source (for detach)
-    uint32_t                      repeat_src;    ///< active held-button repeat timer (0 = none)
+    AxlSourceId                   source_id;     ///< WaitForInput loop source (for detach)
+    AxlSourceId                   repeat_src;    ///< active held-button repeat timer (0 = none)
     uint32_t                      repeat_button; ///< AXL_INPUT_BUTTON_* being repeated
 } MouseSource;
 
@@ -652,7 +652,7 @@ axl_input_probe_pointers(const char *log_path)
     }
 }
 
-uint32_t
+AxlSourceId
 axl_input_attach_mouse(
     AxlLoop           *loop,
     AxlInputCallback   cb,
@@ -736,7 +736,7 @@ typedef struct {
     AxlInputCallback  cb;
     void             *data;
     AxlKeyDebounce    debounce;   ///< repeat-suppression state (opt-in)
-    uint32_t          source_id;  ///< loop source id, for axl_input_detach_key
+    AxlSourceId       source_id;  ///< loop source id, for axl_input_detach_key
 } KeySource;
 
 static KeySource key_state;
@@ -770,7 +770,7 @@ key_dispatch_cb(
     return ks->cb(&ev, ks->data);
 }
 
-uint32_t
+AxlSourceId
 axl_input_attach_key(
     AxlLoop           *loop,
     AxlInputCallback   cb,
@@ -854,10 +854,10 @@ typedef struct {
     int32_t                         last_y;
     bool                            contact_active;
     AxlLoop                        *loop;
-    uint32_t                        source_ids[AXL_MAX_POINTER_IFACES]; ///< per-handle WaitForInput sources
+    AxlSourceId                     source_ids[AXL_MAX_POINTER_IFACES]; ///< per-handle WaitForInput sources
     int                             nsrc;
-    uint32_t                        poll_src;       ///< fallback poll timer (0 = none)
-    uint32_t                        notify_src;     ///< protocol-notify source: re-bind on (re)install (0 = none)
+    AxlSourceId                     poll_src;       ///< fallback poll timer (0 = none)
+    AxlSourceId                     notify_src;     ///< protocol-notify source: re-bind on (re)install (0 = none)
 } TouchSource;
 
 static TouchSource touch_state;
@@ -1124,7 +1124,7 @@ touch_rebind_(TouchSource *tch)
         }
         (void)ap->Reset(ap, false);   // best-effort
         if (ap->WaitForInput != NULL) {
-            uint32_t sid = axl_loop_add_event(tch->loop, ap->WaitForInput,
+            AxlSourceId sid = axl_loop_add_event(tch->loop, ap->WaitForInput,
                                               touch_dispatch_cb, tch);
             if (sid != 0) {
                 tch->source_ids[tch->nsrc++] = sid;
@@ -1143,7 +1143,7 @@ touch_notify_cb(void *data)
     return AXL_SOURCE_CONTINUE;   // keep watching for further (re)installs
 }
 
-uint32_t
+AxlSourceId
 axl_input_attach_touch(
     AxlLoop           *loop,
     AxlInputCallback   cb,

@@ -737,6 +737,33 @@ test_json_get_object(void)
     }
     test_check(n == 3, "json get_object: nested array iterates 3 elements");
 
+    // axl_json_value_string reads each bare-string array element's value.
+    ok = axl_json_array_begin(&server, "aliases", &it);
+    test_check(ok, "json value_string: array_begin aliases");
+    {
+        const char *want[] = { "a", "b", "c" };
+        int i = 0;
+        bool all = true;
+        while (axl_json_array_next(&it, &elem)) {
+            char vbuf[16] = { 0 };
+            if (!axl_json_value_string(&elem, vbuf, sizeof(vbuf))
+                || i >= 3 || axl_strcmp(vbuf, want[i]) != 0) {
+                all = false;
+            }
+            i++;
+        }
+        test_check(all && i == 3,
+                   "json value_string: reads each string element a/b/c");
+    }
+
+    // Negative: value_string on an object reader (server) is not a string.
+    test_check(!axl_json_value_string(&server, str_buf, sizeof(str_buf)),
+               "json value_string: object reader returns false");
+
+    // Negative: NULL args fail closed.
+    test_check(!axl_json_value_string(NULL, str_buf, sizeof(str_buf)),
+               "json value_string: NULL reader returns false");
+
     // Negative: missing key.
     ok = axl_json_get_object(&r, "missing", &sub);
     test_check(!ok, "json get_object: missing key returns false");

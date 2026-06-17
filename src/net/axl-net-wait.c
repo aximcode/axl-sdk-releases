@@ -19,32 +19,10 @@
 #define AXL_NET_POLL_TICK_US  10000ULL
 
 // ---------------------------------------------------------------------------
-// UDP4
+// UDP4 — the per-protocol wait helper is gone: axl_udp_send / _sendrecv now
+// wrap axl_udp_send_async / _recv_async on a private loop (which drives Poll
+// itself at a raised TPL), so nothing needs the standalone _axl_udp_wait.
 // ---------------------------------------------------------------------------
-
-static void
-udp_poll_tick(void *ctx)
-{
-    EFI_UDP4_PROTOCOL *udp4 = (EFI_UDP4_PROTOCOL *)ctx;
-    axl_efi_call(udp4->Poll, 1, udp4);
-}
-
-AxlStatus
-_axl_udp_wait(
-    EFI_UDP4_PROTOCOL *udp4,
-    EFI_EVENT          event,
-    uint64_t           timeout_us
-    )
-{
-    if (udp4 == NULL || event == NULL) {
-        return AXL_ERR;
-    }
-    return _axl_event_wait_timeout_with_tick(
-        (AxlEventHandle)event,
-        NULL, NULL,
-        udp_poll_tick, udp4,
-        AXL_NET_POLL_TICK_US, NULL, timeout_us);
-}
 
 // ---------------------------------------------------------------------------
 // TCP4

@@ -283,9 +283,11 @@ LIB_SOURCES = \
     src/stream/axl-stream-text.c \
     src/stream/axl-compress-stream.c \
     src/fs/axl-fs.c \
+    src/fs/axl-file-writer.c \
     src/fs/axl-file-view.c \
     src/fs/axl-fs-provider.c \
     src/fs/axl-device-path.c \
+    src/util/axl-debug.c \
     src/util/axl-path.c \
     src/util/axl-hexdump.c \
     src/util/axl-time.c \
@@ -295,7 +297,10 @@ LIB_SOURCES = \
     src/util/axl-port.c \
     src/util/axl-boot.c \
     src/util/axl-image.c \
+    src/util/axl-shell.c \
+    src/util/axl-console-mirror.c \
     src/util/axl-cpu.c \
+    src/util/axl-handle-iter.c \
     src/util/axl-mem-phys.c \
     src/util/axl-mem-region.c \
     src/util/axl-watchdog.c \
@@ -303,9 +308,11 @@ LIB_SOURCES = \
     src/util/axl-rand.c \
     src/util/axl-protocol.c \
     src/util/axl-driver.c \
+    src/util/axl-driver-info.c \
     src/util/axl-shared-driver.c \
     src/util/axl-diag.c \
     src/util/axl-config.c \
+    src/util/axl-config-file.c \
     src/util/axl-subcommand.c \
     src/util/axl-args.c \
     src/util/axl-sort.c \
@@ -326,6 +333,19 @@ LIB_SOURCES = \
     src/usb/axl-usb.c \
     src/usb/axl-usb-class.c \
     src/usb/axl-usb-ids.c \
+    src/block/axl-block.c \
+    src/nvme/axl-nvme-decode.c \
+    src/nvme/axl-nvme.c \
+    src/ata/axl-ata-decode.c \
+    src/ata/axl-ata.c \
+    src/scsi/axl-scsi-decode.c \
+    src/scsi/axl-scsi.c \
+    src/smart/axl-smart-normalize.c \
+    src/smart/axl-smart.c \
+    src/serial/axl-serial.c \
+    src/fv/axl-fv.c \
+    src/tpm/axl-tpm.c \
+    src/ramdisk/axl-ramdisk.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
     src/loop/axl-pubsub.c \
@@ -341,10 +361,14 @@ LIB_SOURCES = \
     src/net/axl-net-wait.c \
     src/net/axl-udp.c \
     src/net/axl-net-ping.c \
+    src/net/axl-net-sntp.c \
+    src/net/axl-net-arp.c \
+    src/net/axl-net-linkstats.c \
     src/net/axl-net-resolve.c \
     src/net/axl-net-interfaces.c \
     src/net/axl-net-addr.c \
     src/net/axl-net-dhcp.c \
+    src/net/axl-net-driver-select.c \
     src/net/axl-net-opts.c \
     src/net/axl-http-core.c \
     src/net/axl-http-server.c \
@@ -356,14 +380,23 @@ LIB_SOURCES = \
     src/net/axl-http-upload.c \
     src/net/axl-http-ws.c \
     src/net/axl-http-webdav.c \
+    src/net/axl-http-serve-fs.c \
     src/net/axl-http-client.c \
+    src/net/axl-http-client-async.c \
     src/net/axl-tls.c \
+    src/net/axl-pk-verify.c \
+    src/net/axl-jose.c \
+    src/net/axl-crypto-rng.c \
+    src/net/axl-aead.c \
+    src/net/axl-cipher.c \
+    src/net/axl-ecdh.c \
     src/net/axl-url.c \
     src/net/axl-inet-address.c \
     src/net/axl-socket.c \
     src/net/axl-socket-client.c \
     src/net/axl-websocket.c \
     src/gfx/axl-gfx.c \
+    src/gfx/axl-gfx-output.c \
     src/gfx/axl-font.c \
     src/gfx/axl-cursor.c \
     src/gfx/axl-compositor.c \
@@ -385,6 +418,7 @@ LIB_SOURCES = \
     src/input/axl-input.c \
     src/input/axl-input-gesture.c \
     src/input/axl-input-debounce.c \
+    src/input/axl-virtual-pointer.c \
     src/smbus/axl-smbus.c \
     src/smbus/axl-smbus-hc.c \
     src/smbus/axl-smbus-i2c.c \
@@ -416,6 +450,8 @@ MBEDTLS_SOURCES = \
     deps/mbedtls/library/base64.c \
     deps/mbedtls/library/bignum.c \
     deps/mbedtls/library/bignum_core.c \
+    deps/mbedtls/library/chacha20.c \
+    deps/mbedtls/library/chachapoly.c \
     deps/mbedtls/library/cipher.c \
     deps/mbedtls/library/cipher_wrap.c \
     deps/mbedtls/library/constant_time.c \
@@ -427,6 +463,7 @@ MBEDTLS_SOURCES = \
     deps/mbedtls/library/entropy.c \
     deps/mbedtls/library/error.c \
     deps/mbedtls/library/gcm.c \
+    deps/mbedtls/library/poly1305.c \
     deps/mbedtls/library/hkdf.c \
     deps/mbedtls/library/md.c \
     deps/mbedtls/library/oid.c \
@@ -545,7 +582,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-docs driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest http-plain-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -565,6 +602,11 @@ endif
 # scripts/bump-version.sh to update both atomically.
 check-ascii:
 	@python3 scripts/check-output-ascii.py
+
+# Verify every public header is wired into the Sphinx reference (catches a
+# new header landing without docs). Prose staleness is a workflow concern.
+check-docs:
+	@python3 scripts/check-doc-coverage.py
 
 check-version:
 	@file_ver=$$(cat VERSION); \
@@ -645,6 +687,33 @@ $(BUILDDIR)/%.o: src/pci/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/usb/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(BUILDDIR)/%.o: src/block/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/nvme/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/ata/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/scsi/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/smart/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/serial/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/fv/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/tpm/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/ramdisk/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(BUILDDIR)/%.o: src/smbus/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -715,7 +784,7 @@ $(PREFIX)/lib:
 hello: $(PREFIX)/hello.efi
 	@echo "  Built: $(PREFIX)/hello.efi"
 
-$(PREFIX)/hello.efi: $(BUILDDIR)/hello.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/hello.efi: $(BUILDDIR)/hello.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/hello.o,$@)
 
 $(BUILDDIR)/hello.o: sdk/examples/hello.c | $(BUILDDIR)
@@ -728,7 +797,7 @@ $(BUILDDIR)/hello.o: sdk/examples/hello.c | $(BUILDDIR)
 gfx-demo: $(PREFIX)/gfx-demo.efi
 	@echo "  Built: $(PREFIX)/gfx-demo.efi"
 
-$(PREFIX)/gfx-demo.efi: $(BUILDDIR)/gfx-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/gfx-demo.efi: $(BUILDDIR)/gfx-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-demo.o,$@)
 
 $(BUILDDIR)/gfx-demo.o: sdk/examples/gfx-demo.c | $(BUILDDIR)
@@ -738,7 +807,7 @@ $(BUILDDIR)/gfx-demo.o: sdk/examples/gfx-demo.c | $(BUILDDIR)
 gfx-window: $(PREFIX)/gfx-window.efi
 	@echo "  Built: $(PREFIX)/gfx-window.efi"
 
-$(PREFIX)/gfx-window.efi: $(BUILDDIR)/gfx-window.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/gfx-window.efi: $(BUILDDIR)/gfx-window.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-window.o,$@)
 
 $(BUILDDIR)/gfx-window.o: sdk/examples/gfx-window.c | $(BUILDDIR)
@@ -748,7 +817,7 @@ $(BUILDDIR)/gfx-window.o: sdk/examples/gfx-window.c | $(BUILDDIR)
 pointer-demo: $(PREFIX)/pointer-demo.efi
 	@echo "  Built: $(PREFIX)/pointer-demo.efi"
 
-$(PREFIX)/pointer-demo.efi: $(BUILDDIR)/pointer-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/pointer-demo.efi: $(BUILDDIR)/pointer-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/pointer-demo.o,$@)
 
 $(BUILDDIR)/pointer-demo.o: sdk/examples/pointer-demo.c | $(BUILDDIR)
@@ -758,7 +827,7 @@ $(BUILDDIR)/pointer-demo.o: sdk/examples/pointer-demo.c | $(BUILDDIR)
 pointer-tune-demo: $(PREFIX)/pointer-tune-demo.efi
 	@echo "  Built: $(PREFIX)/pointer-tune-demo.efi"
 
-$(PREFIX)/pointer-tune-demo.efi: $(BUILDDIR)/pointer-tune-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/pointer-tune-demo.efi: $(BUILDDIR)/pointer-tune-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/pointer-tune-demo.o,$@)
 
 $(BUILDDIR)/pointer-tune-demo.o: sdk/examples/pointer-tune-demo.c | $(BUILDDIR)
@@ -768,7 +837,7 @@ $(BUILDDIR)/pointer-tune-demo.o: sdk/examples/pointer-tune-demo.c | $(BUILDDIR)
 cursor-demo: $(PREFIX)/cursor-demo.efi
 	@echo "  Built: $(PREFIX)/cursor-demo.efi"
 
-$(PREFIX)/cursor-demo.efi: $(BUILDDIR)/cursor-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/cursor-demo.efi: $(BUILDDIR)/cursor-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/cursor-demo.o,$@)
 
 $(BUILDDIR)/cursor-demo.o: sdk/examples/cursor-demo.c | $(BUILDDIR)
@@ -779,7 +848,7 @@ $(BUILDDIR)/cursor-demo.o: sdk/examples/cursor-demo.c | $(BUILDDIR)
 frame-anim-demo: $(PREFIX)/frame-anim-demo.efi
 	@echo "  Built: $(PREFIX)/frame-anim-demo.efi"
 
-$(PREFIX)/frame-anim-demo.efi: $(BUILDDIR)/frame-anim-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/frame-anim-demo.efi: $(BUILDDIR)/frame-anim-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/frame-anim-demo.o,$@)
 
 $(BUILDDIR)/frame-anim-demo.o: sdk/examples/frame-anim-demo.c | $(BUILDDIR)
@@ -791,7 +860,7 @@ $(BUILDDIR)/frame-anim-demo.o: sdk/examples/frame-anim-demo.c | $(BUILDDIR)
 keytrace: $(PREFIX)/keytrace.efi
 	@echo "  Built: $(PREFIX)/keytrace.efi"
 
-$(PREFIX)/keytrace.efi: $(BUILDDIR)/keytrace.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/keytrace.efi: $(BUILDDIR)/keytrace.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/keytrace.o,$@)
 
 $(BUILDDIR)/keytrace.o: sdk/examples/keytrace.c | $(BUILDDIR)
@@ -807,7 +876,7 @@ $(BUILDDIR)/keytrace.o: sdk/examples/keytrace.c | $(BUILDDIR)
 gfx-present-selftest: $(PREFIX)/gfx-present-selftest.efi
 	@echo "  Built: $(PREFIX)/gfx-present-selftest.efi"
 
-$(PREFIX)/gfx-present-selftest.efi: $(BUILDDIR)/gfx-present-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/gfx-present-selftest.efi: $(BUILDDIR)/gfx-present-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-present-selftest.o,$@)
 
 $(BUILDDIR)/gfx-present-selftest.o: test/integration/gfx-present-selftest.c | $(BUILDDIR)
@@ -823,7 +892,7 @@ $(BUILDDIR)/gfx-present-selftest.o: test/integration/gfx-present-selftest.c | $(
 gfx-mode-selftest: $(PREFIX)/gfx-mode-selftest.efi
 	@echo "  Built: $(PREFIX)/gfx-mode-selftest.efi"
 
-$(PREFIX)/gfx-mode-selftest.efi: $(BUILDDIR)/gfx-mode-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/gfx-mode-selftest.efi: $(BUILDDIR)/gfx-mode-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-mode-selftest.o,$@)
 
 $(BUILDDIR)/gfx-mode-selftest.o: test/integration/gfx-mode-selftest.c | $(BUILDDIR)
@@ -839,7 +908,7 @@ $(BUILDDIR)/gfx-mode-selftest.o: test/integration/gfx-mode-selftest.c | $(BUILDD
 cursor-selftest: $(PREFIX)/cursor-selftest.efi
 	@echo "  Built: $(PREFIX)/cursor-selftest.efi"
 
-$(PREFIX)/cursor-selftest.efi: $(BUILDDIR)/cursor-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/cursor-selftest.efi: $(BUILDDIR)/cursor-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/cursor-selftest.o,$@)
 
 $(BUILDDIR)/cursor-selftest.o: test/integration/cursor-selftest.c | $(BUILDDIR)
@@ -850,7 +919,7 @@ $(BUILDDIR)/cursor-selftest.o: test/integration/cursor-selftest.c | $(BUILDDIR)
 exit-status-selftest: $(PREFIX)/exit-status-selftest.efi
 	@echo "  Built: $(PREFIX)/exit-status-selftest.efi"
 
-$(PREFIX)/exit-status-selftest.efi: $(BUILDDIR)/exit-status-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/exit-status-selftest.efi: $(BUILDDIR)/exit-status-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/exit-status-selftest.o,$@)
 
 $(BUILDDIR)/exit-status-selftest.o: test/integration/exit-status-selftest.c | $(BUILDDIR)
@@ -874,7 +943,7 @@ $(PREFIX)/exit-status-selftest-minimal.efi: $(BUILDDIR)/exit-status-selftest.o $
 compositor-selftest: $(PREFIX)/compositor-selftest.efi
 	@echo "  Built: $(PREFIX)/compositor-selftest.efi"
 
-$(PREFIX)/compositor-selftest.efi: $(BUILDDIR)/compositor-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/compositor-selftest.efi: $(BUILDDIR)/compositor-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/compositor-selftest.o,$@)
 
 $(BUILDDIR)/compositor-selftest.o: test/integration/compositor-selftest.c | $(BUILDDIR)
@@ -888,7 +957,7 @@ $(BUILDDIR)/compositor-selftest.o: test/integration/compositor-selftest.c | $(BU
 compositor-bench: $(PREFIX)/compositor-bench.efi
 	@echo "  Built: $(PREFIX)/compositor-bench.efi"
 
-$(PREFIX)/compositor-bench.efi: $(BUILDDIR)/compositor-bench.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/compositor-bench.efi: $(BUILDDIR)/compositor-bench.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/compositor-bench.o,$@)
 
 $(BUILDDIR)/compositor-bench.o: test/integration/compositor-bench.c | $(BUILDDIR)
@@ -904,7 +973,7 @@ $(BUILDDIR)/compositor-bench.o: test/integration/compositor-bench.c | $(BUILDDIR
 cpu-simd-selftest: $(PREFIX)/cpu-simd-selftest.efi
 	@echo "  Built: $(PREFIX)/cpu-simd-selftest.efi"
 
-$(PREFIX)/cpu-simd-selftest.efi: $(BUILDDIR)/cpu-simd-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/cpu-simd-selftest.efi: $(BUILDDIR)/cpu-simd-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-simd-selftest.o,$@)
 
 $(BUILDDIR)/cpu-simd-selftest.o: test/integration/cpu-simd-selftest.c | $(BUILDDIR)
@@ -920,10 +989,21 @@ $(BUILDDIR)/cpu-simd-selftest.o: test/integration/cpu-simd-selftest.c | $(BUILDD
 cpu-topology-selftest: $(PREFIX)/cpu-topology-selftest.efi
 	@echo "  Built: $(PREFIX)/cpu-topology-selftest.efi"
 
-$(PREFIX)/cpu-topology-selftest.efi: $(BUILDDIR)/cpu-topology-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/cpu-topology-selftest.efi: $(BUILDDIR)/cpu-topology-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-topology-selftest.o,$@)
 
 $(BUILDDIR)/cpu-topology-selftest.o: test/integration/cpu-topology-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build http-plain-selftest.efi — a plain-HTTP-only client that references no
+# TLS. With AXL_TLS=1 it must link WITHOUT mbedTLS (test-tls-strippable.sh).
+http-plain-selftest: $(PREFIX)/http-plain-selftest.efi
+	@echo "  Built: $(PREFIX)/http-plain-selftest.efi"
+
+$(PREFIX)/http-plain-selftest.efi: $(BUILDDIR)/http-plain-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/http-plain-selftest.o,$@)
+
+$(BUILDDIR)/http-plain-selftest.o: test/integration/http-plain-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -935,7 +1015,7 @@ $(BUILDDIR)/cpu-topology-selftest.o: test/integration/cpu-topology-selftest.c | 
 gfx-simd-selftest: $(PREFIX)/gfx-simd-selftest.efi
 	@echo "  Built: $(PREFIX)/gfx-simd-selftest.efi"
 
-$(PREFIX)/gfx-simd-selftest.efi: $(BUILDDIR)/gfx-simd-selftest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/gfx-simd-selftest.efi: $(BUILDDIR)/gfx-simd-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-simd-selftest.o,$@)
 
 $(BUILDDIR)/gfx-simd-selftest.o: test/integration/gfx-simd-selftest.c | $(BUILDDIR)
@@ -948,7 +1028,7 @@ $(BUILDDIR)/gfx-simd-selftest.o: test/integration/gfx-simd-selftest.c | $(BUILDD
 input-demo: $(PREFIX)/input-demo.efi
 	@echo "  Built: $(PREFIX)/input-demo.efi"
 
-$(PREFIX)/input-demo.efi: $(BUILDDIR)/input-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/input-demo.efi: $(BUILDDIR)/input-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/input-demo.o,$@)
 
 $(BUILDDIR)/input-demo.o: sdk/examples/input-demo.c | $(BUILDDIR)
@@ -1007,7 +1087,7 @@ $(BUILDDIR)/service-demo-dxe.o: sdk/examples/service-demo.c | $(BUILDDIR)
 # macro.
 $(eval $(call EMBED_BLOB,service_demo,$(PREFIX)/service_demo-dxe.efi))
 
-$(PREFIX)/service_demo.efi: $(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/service_demo.efi: $(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo),$@)
 
 $(BUILDDIR)/service-demo-app.o: sdk/examples/service-demo.c | $(BUILDDIR)
@@ -1032,7 +1112,7 @@ $(BUILDDIR)/service-demo-custom-dxe.o: sdk/examples/service-demo-custom.c | $(BU
 
 $(eval $(call EMBED_BLOB,service_demo_custom,$(PREFIX)/service_demo_custom-dxe.efi))
 
-$(PREFIX)/service_demo_custom.efi: $(BUILDDIR)/service-demo-custom-app.o $(BLOB_OBJ_service_demo_custom) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/service_demo_custom.efi: $(BUILDDIR)/service-demo-custom-app.o $(BLOB_OBJ_service_demo_custom) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/service-demo-custom-app.o $(BLOB_OBJ_service_demo_custom),$@)
 
 $(BUILDDIR)/service-demo-custom-app.o: sdk/examples/service-demo-custom.c | $(BUILDDIR)
@@ -1051,7 +1131,7 @@ embed-asset: $(PREFIX)/embed-asset.efi
 
 $(eval $(call EMBED_BLOB,greeting,sdk/examples/embed-asset.txt))
 
-$(PREFIX)/embed-asset.efi: $(BUILDDIR)/embed-asset.o $(BLOB_OBJ_greeting) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/embed-asset.efi: $(BUILDDIR)/embed-asset.o $(BLOB_OBJ_greeting) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/embed-asset.o $(BLOB_OBJ_greeting),$@)
 
 $(BUILDDIR)/embed-asset.o: sdk/examples/embed-asset.c | $(BUILDDIR)
@@ -1066,7 +1146,7 @@ $(BUILDDIR)/embed-asset.o: sdk/examples/embed-asset.c | $(BUILDDIR)
 driver-leak-test: $(PREFIX)/driver-leak-test.efi
 	@echo "  Built: $(PREFIX)/driver-leak-test.efi"
 
-$(PREFIX)/driver-leak-test.efi: $(BUILDDIR)/driver-leak-test.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/driver-leak-test.efi: $(BUILDDIR)/driver-leak-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/driver-leak-test.o,$@)
 
 $(BUILDDIR)/driver-leak-test.o: test/integration/driver-leak-test.c | $(BUILDDIR)
@@ -1128,7 +1208,7 @@ $(PREFIX)/drivers:
 crashtest: $(PREFIX)/tools/crashtest.efi
 	@echo "  Built: $(PREFIX)/tools/crashtest.efi"
 
-$(PREFIX)/tools/crashtest.efi: $(BUILDDIR)/crashtest.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+$(PREFIX)/tools/crashtest.efi: $(BUILDDIR)/crashtest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
 	$(call LINK_EFI_APP,$(BUILDDIR)/crashtest.o,$@)
 
 $(BUILDDIR)/crashtest.o: tools/crashtest.c | $(BUILDDIR)
@@ -1141,7 +1221,7 @@ $(BUILDDIR)/crashtest.o: tools/crashtest.c | $(BUILDDIR)
 radix-demo: $(PREFIX)/radix-demo.efi
 	@echo "  Built: $(PREFIX)/radix-demo.efi"
 
-$(PREFIX)/radix-demo.efi: $(BUILDDIR)/radix-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/radix-demo.efi: $(BUILDDIR)/radix-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/radix-demo.o,$@)
 
 $(BUILDDIR)/radix-demo.o: sdk/examples/radix-demo.c | $(BUILDDIR)
@@ -1154,7 +1234,7 @@ $(BUILDDIR)/radix-demo.o: sdk/examples/radix-demo.c | $(BUILDDIR)
 ring-buf-demo: $(PREFIX)/ring-buf-demo.efi
 	@echo "  Built: $(PREFIX)/ring-buf-demo.efi"
 
-$(PREFIX)/ring-buf-demo.efi: $(BUILDDIR)/ring-buf-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/ring-buf-demo.efi: $(BUILDDIR)/ring-buf-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/ring-buf-demo.o,$@)
 
 $(BUILDDIR)/ring-buf-demo.o: sdk/examples/ring-buf-demo.c | $(BUILDDIR)
@@ -1167,7 +1247,7 @@ $(BUILDDIR)/ring-buf-demo.o: sdk/examples/ring-buf-demo.c | $(BUILDDIR)
 event-demo: $(PREFIX)/event-demo.efi
 	@echo "  Built: $(PREFIX)/event-demo.efi"
 
-$(PREFIX)/event-demo.efi: $(BUILDDIR)/event-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/event-demo.efi: $(BUILDDIR)/event-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/event-demo.o,$@)
 
 $(BUILDDIR)/event-demo.o: sdk/examples/event-demo.c | $(BUILDDIR)
@@ -1180,7 +1260,7 @@ $(BUILDDIR)/event-demo.o: sdk/examples/event-demo.c | $(BUILDDIR)
 cancellable-demo: $(PREFIX)/cancellable-demo.efi
 	@echo "  Built: $(PREFIX)/cancellable-demo.efi"
 
-$(PREFIX)/cancellable-demo.efi: $(BUILDDIR)/cancellable-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/cancellable-demo.efi: $(BUILDDIR)/cancellable-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/cancellable-demo.o,$@)
 
 $(BUILDDIR)/cancellable-demo.o: sdk/examples/cancellable-demo.c | $(BUILDDIR)
@@ -1193,7 +1273,7 @@ $(BUILDDIR)/cancellable-demo.o: sdk/examples/cancellable-demo.c | $(BUILDDIR)
 runtime-demo: $(PREFIX)/runtime-demo.efi
 	@echo "  Built: $(PREFIX)/runtime-demo.efi"
 
-$(PREFIX)/runtime-demo.efi: $(BUILDDIR)/runtime-demo.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/runtime-demo.efi: $(BUILDDIR)/runtime-demo.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/runtime-demo.o,$@)
 
 $(BUILDDIR)/runtime-demo.o: sdk/examples/runtime-demo.c | $(BUILDDIR)
@@ -1206,7 +1286,7 @@ $(BUILDDIR)/runtime-demo.o: sdk/examples/runtime-demo.c | $(BUILDDIR)
 echo-server: $(PREFIX)/echo-server.efi
 	@echo "  Built: $(PREFIX)/echo-server.efi"
 
-$(PREFIX)/echo-server.efi: $(BUILDDIR)/echo-server.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/echo-server.efi: $(BUILDDIR)/echo-server.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/echo-server.o,$@)
 
 $(BUILDDIR)/echo-server.o: sdk/examples/echo-server.c | $(BUILDDIR)
@@ -1219,7 +1299,7 @@ $(BUILDDIR)/echo-server.o: sdk/examples/echo-server.c | $(BUILDDIR)
 tcp-echo-server: $(PREFIX)/tcp-echo-server.efi
 	@echo "  Built: $(PREFIX)/tcp-echo-server.efi"
 
-$(PREFIX)/tcp-echo-server.efi: $(BUILDDIR)/tcp-echo-server.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/tcp-echo-server.efi: $(BUILDDIR)/tcp-echo-server.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/tcp-echo-server.o,$@)
 
 $(BUILDDIR)/tcp-echo-server.o: sdk/examples/tcp-echo-server.c | $(BUILDDIR)
@@ -1232,7 +1312,7 @@ $(BUILDDIR)/tcp-echo-server.o: sdk/examples/tcp-echo-server.c | $(BUILDDIR)
 echo-client: $(PREFIX)/echo-client.efi
 	@echo "  Built: $(PREFIX)/echo-client.efi"
 
-$(PREFIX)/echo-client.efi: $(BUILDDIR)/echo-client.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/echo-client.efi: $(BUILDDIR)/echo-client.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/echo-client.o,$@)
 
 $(BUILDDIR)/echo-client.o: sdk/examples/echo-client.c | $(BUILDDIR)
@@ -1245,7 +1325,7 @@ $(BUILDDIR)/echo-client.o: sdk/examples/echo-client.c | $(BUILDDIR)
 echo-server-sync: $(PREFIX)/echo-server-sync.efi
 	@echo "  Built: $(PREFIX)/echo-server-sync.efi"
 
-$(PREFIX)/echo-server-sync.efi: $(BUILDDIR)/echo-server-sync.o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/echo-server-sync.efi: $(BUILDDIR)/echo-server-sync.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/echo-server-sync.o,$@)
 
 $(BUILDDIR)/echo-server-sync.o: sdk/examples/echo-server-sync.c | $(BUILDDIR)
@@ -1291,19 +1371,19 @@ axlk-bootconfig-server: $(PREFIX)/axlk-bootconfig-server.efi
 axlk-reqlog-server: $(PREFIX)/axlk-reqlog-server.efi
 	@echo "  Built: $(PREFIX)/axlk-reqlog-server.efi"
 
-$(PREFIX)/AxlKernelPoc.efi: $(KERNEL_POC_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/AxlKernelPoc.efi: $(KERNEL_POC_OBJS) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(KERNEL_POC_OBJS),$@)
 
-$(PREFIX)/axlk-echo-server.efi: $(AXLK_ECHO_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/axlk-echo-server.efi: $(AXLK_ECHO_OBJS) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(AXLK_ECHO_OBJS),$@)
 
-$(PREFIX)/axlk-hwinfo-server.efi: $(AXLK_HWINFO_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/axlk-hwinfo-server.efi: $(AXLK_HWINFO_OBJS) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(AXLK_HWINFO_OBJS),$@)
 
-$(PREFIX)/axlk-bootconfig-server.efi: $(AXLK_BOOTCFG_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/axlk-bootconfig-server.efi: $(AXLK_BOOTCFG_OBJS) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(AXLK_BOOTCFG_OBJS),$@)
 
-$(PREFIX)/axlk-reqlog-server.efi: $(AXLK_REQLOG_OBJS) $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a
+$(PREFIX)/axlk-reqlog-server.efi: $(AXLK_REQLOG_OBJS) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(AXLK_REQLOG_OBJS),$@)
 
 $(BUILDDIR)/axl-kernel-ctx-switch.o: $(KERNEL_CTX_SRC) | $(BUILDDIR)
@@ -1340,7 +1420,8 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestCpuIdle AxlTestRuntime AxlTestXml AxlTestFsProvider \
         AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
-        AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion
+        AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
+        AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1385,12 +1466,18 @@ $(eval $(call BUILD_TEST,AxlTestDriver,axl-test-driver))
 $(eval $(call BUILD_TEST,AxlTestCursor,axl-test-cursor))
 $(eval $(call BUILD_TEST,AxlTestCompositor,axl-test-compositor))
 $(eval $(call BUILD_TEST,AxlTestGfxRegion,axl-test-gfx-region))
+$(eval $(call BUILD_TEST,AxlTestCrypto,axl-test-crypto))
+$(eval $(call BUILD_TEST,AxlTestJose,axl-test-jose))
+$(eval $(call BUILD_TEST,AxlTestNvme,axl-test-nvme))
+$(eval $(call BUILD_TEST,AxlTestAta,axl-test-ata))
+$(eval $(call BUILD_TEST,AxlTestScsi,axl-test-scsi))
+$(eval $(call BUILD_TEST,AxlTestSmart,axl-test-smart))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar
+TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: all $(TOOL_EFIS) $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi
@@ -1430,7 +1517,7 @@ $(eval $(call EMBED_BLOB,ramdiskdxe,$(EMBEDDED_RAMDISK_SRC)))
 EMBEDDED_RAMDISK_OBJ = $(BLOB_OBJ_ramdiskdxe)
 
 define BUILD_TOOL
-$(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+$(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
 	$$(call LINK_EFI_APP,$(BUILDDIR)/$(1).o,$$@)
 
 $(BUILDDIR)/$(1).o: tools/$(1).c | $(BUILDDIR)
@@ -1444,7 +1531,7 @@ endef
 $(foreach t,$(filter-out mkrd,$(TOOL_NAMES)),$(eval $(call BUILD_TOOL,$(t))))
 
 $(PREFIX)/tools/mkrd.efi: $(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ) \
-                         $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+                         $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
 	$(call LINK_EFI_APP,$(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ),$@)
 
 $(BUILDDIR)/mkrd.o: tools/mkrd.c | $(BUILDDIR)
@@ -1482,7 +1569,7 @@ $(BUSYBOX_DIR):
 # build — it's small (KB) and lets `axl mkrd` work the same as
 # standalone mkrd.efi.
 $(BUSYBOX_EFI): $(BUSYBOX_OBJS) $(EMBEDDED_RAMDISK_OBJ) \
-                $(CRT0_OBJ) $(PREFIX)/lib/libaxl.a | $(PREFIX)
+                $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)
 	$(call LINK_EFI_APP,$(BUSYBOX_OBJS) $(EMBEDDED_RAMDISK_OBJ),$@)
 
 axl-busybox: all $(BUSYBOX_EFI)

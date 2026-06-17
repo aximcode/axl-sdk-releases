@@ -12,6 +12,11 @@
 #include <axl/axl-log.h>
 #include <axl/axl-spd.h>
 #include <axl/axl-usb.h>
+#include <axl/axl-block.h>
+#include <axl/axl-serial.h>
+#include <axl/axl-fv.h>
+#include <axl/axl-tpm.h>
+#include <axl/axl-ramdisk.h>
 #include <uefi/axl-uefi.h>   /* gBS->GetMemoryMap for the get_memory_size check */
 
 #include "spd-ddr4-micron-8gb.h"
@@ -156,6 +161,90 @@ test_acpi_read_facp(void)
        legacy 32-bit field is fine for QEMU OVMF. */
     test_check(facp.dsdt != 0 || facp.x_dsdt != 0,
                "acpi: FACP has a DSDT pointer");
+}
+
+static void
+test_acpi_fadt_children(void)
+{
+    /* DSDT and FACS hang off the FADT (FirmwareCtrl/Dsdt), not the
+       XSDT/RSDT, so a naive table walk misses them. axl_acpi_next /
+       _find must recover them so the walk is the complete table set
+       (parity with acpidump / EFI_ACPI_SDT_PROTOCOL.GetAcpiTable). */
+
+    /* DSDT is present on every ACPI platform (it is a real SDT with a
+       standard header + checksum). */
+    AxlAcpiHeader *dsdt = axl_acpi_find("DSDT");
+    test_check(dsdt != NULL, "acpi: DSDT surfaced (recovered from FADT)");
+    if (dsdt != NULL) {
+        test_check(axl_memcmp(dsdt->signature, "DSDT", 4) == 0,
+                   "acpi: DSDT signature matches");
+        test_check(axl_acpi_checksum_ok(dsdt),
+                   "acpi: DSDT checksum valid");
+    } else {
+        test_check(true, "acpi: DSDT detail SKIP balance");
+        test_check(true, "acpi: DSDT detail SKIP balance");
+    }
+
+    /* Both must appear in the unfiltered walk too (single source). */
+    bool           dsdt_in_walk = false;
+    bool           facs_in_walk = false;
+    AxlAcpiHeader *h            = NULL;
+    while ((h = axl_acpi_next(h)) != NULL) {
+        if (axl_memcmp(h->signature, "DSDT", 4) == 0) {
+            dsdt_in_walk = true;
+        }
+        if (axl_memcmp(h->signature, "FACS", 4) == 0) {
+            facs_in_walk = true;
+        }
+    }
+    test_check(dsdt_in_walk, "acpi: DSDT appears in axl_acpi_next walk");
+
+    AxlAcpiFacp facp;
+    bool        have_facp = (axl_acpi_read_facp(&facp) == AXL_OK);
+
+    /* The surfaced DSDT must be the exact table the FADT points to —
+       guards against an offset bug that lands on a different table. */
+    if (have_facp && dsdt != NULL) {
+        uint64_t want = facp.x_dsdt != 0 ? facp.x_dsdt : (uint64_t)facp.dsdt;
+        test_check((uint64_t)(uintptr_t)dsdt == want,
+                   "acpi: surfaced DSDT is the FADT's DSDT pointer");
+    } else {
+        test_check(true, "acpi: DSDT-pointer SKIP balance");
+    }
+
+    /* FACS is surfaced iff the FADT actually points to one — x86 OVMF
+       publishes a FACS, ARM AAVMF typically does not. Tie the
+       assertion to the FADT pointer so it is correct on both arches. */
+    bool has_facs = have_facp
+                    && (facp.firmware_ctrl != 0 || facp.x_firmware_ctrl != 0);
+    if (has_facs) {
+        test_check(axl_acpi_find("FACS") != NULL,
+                   "acpi: FACS surfaced when the FADT points to one");
+        test_check(facs_in_walk,
+                   "acpi: FACS appears in axl_acpi_next walk");
+    } else {
+        test_check(axl_acpi_find("FACS") == NULL,
+                   "acpi: no FACS surfaced when the FADT has none");
+        test_check(!facs_in_walk,
+                   "acpi: FACS absent from walk when the FADT has none");
+    }
+
+    /* Ordering: the FADT children come FIRST, FACS then DSDT, ahead of
+       the XSDT/RSDT tables — matching EFI_ACPI_SDT_PROTOCOL.GetAcpiTable
+       / acpidump, so consumers diffing against that oracle need no
+       reordering workaround. */
+    AxlAcpiHeader *t0 = axl_acpi_next(NULL);
+    if (has_facs) {
+        test_check(t0 != NULL && axl_memcmp(t0->signature, "FACS", 4) == 0,
+                   "acpi: FACS is first in the walk");
+        AxlAcpiHeader *t1 = (t0 != NULL) ? axl_acpi_next(t0) : NULL;
+        test_check(t1 != NULL && axl_memcmp(t1->signature, "DSDT", 4) == 0,
+                   "acpi: DSDT is second in the walk");
+    } else {
+        test_check(t0 != NULL && axl_memcmp(t0->signature, "DSDT", 4) == 0,
+                   "acpi: DSDT is first in the walk (no FACS)");
+        test_check(true, "acpi: FADT-order SKIP balance (no FACS)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2208,6 +2297,514 @@ test_usb_get_port_info(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlBlock — block-device enumeration + media descriptor
+// ---------------------------------------------------------------------------
+
+static void
+test_block_io(void)
+{
+    /* The runner always boots from a FAT32 raw disk image, so at least
+       one EFI_BLOCK_IO handle exists on both arches. This is a hard,
+       deterministic requirement — not a topology-gated SKIP. */
+    AxlHandle first = axl_block_next(NULL);
+    test_check(first != NULL, "block: next finds at least one device");
+
+    /* The walk terminates and stays bounded. */
+    size_t    count = 0;
+    AxlHandle h     = NULL;
+    while ((h = axl_block_next(h)) != NULL) {
+        count++;
+        if (count > 256) {
+            break;
+        }
+    }
+    test_check(count >= 1 && count <= 256, "block: next walks a bounded set");
+
+    /* Media descriptor on the first device. */
+    AxlBlockMedia m;
+    axl_memset(&m, 0xAB, sizeof(m));
+    test_check(axl_block_get_media(first, &m) == AXL_OK,
+               "block: get_media succeeds on first device");
+    test_check(m.block_size > 0 && (m.block_size & (m.block_size - 1)) == 0,
+               "block: block_size is a positive power of two");
+
+    /* The boot disk is a present, 512-byte-sector FAT image — at least
+       one enumerated device must report that shape with a computable
+       capacity. */
+    bool     found_512_present = false;
+    uint64_t cap_of_512        = 0;
+    h = NULL;
+    while ((h = axl_block_next(h)) != NULL) {
+        AxlBlockMedia mm;
+        if (axl_block_get_media(h, &mm) != AXL_OK) {
+            continue;
+        }
+        if (mm.media_present && mm.block_size == 512) {
+            found_512_present = true;
+            cap_of_512        = (mm.last_block + 1) * (uint64_t)mm.block_size;
+        }
+    }
+    test_check(found_512_present,
+               "block: a present device reports 512-byte logical blocks");
+    test_check(cap_of_512 >= 512,
+               "block: present 512-byte device has a computable capacity");
+
+    /* Error contract. */
+    test_check(axl_block_get_media(first, NULL) == AXL_ERR,
+               "block: get_media with NULL out returns AXL_ERR");
+    int local_marker = 0;
+    test_check(axl_block_get_media((AxlHandle)&local_marker, &m) == AXL_ERR,
+               "block: get_media on a non-block handle returns AXL_ERR");
+
+    /* Position-from-prev contract: a handle not in the cached set
+       restarts at the first device (no hidden shared cursor). */
+    test_check(axl_block_next((AxlHandle)&local_marker) == first,
+               "block: prev not in the set restarts at the first device");
+}
+
+// ---------------------------------------------------------------------------
+// AxlSerial — serial-port enumeration + line-setting / control readout
+// ---------------------------------------------------------------------------
+
+static void
+test_serial_io(void)
+{
+    /* The runner's firmware exposes the console UART as an
+       EFI_SERIAL_IO_PROTOCOL handle on both arches, so >=1 port is a
+       deterministic requirement (not a topology-gated SKIP). */
+    AxlHandle first = axl_serial_next(NULL);
+    test_check(first != NULL, "serial: next finds at least one port");
+
+    /* The walk terminates and stays bounded. */
+    size_t    count = 0;
+    AxlHandle h     = NULL;
+    while ((h = axl_serial_next(h)) != NULL) {
+        count++;
+        if (count > 64) {
+            break;
+        }
+    }
+    test_check(count >= 1 && count <= 64, "serial: next walks a bounded set");
+
+    /* Line settings on the first port. */
+    AxlSerialMode m;
+    axl_memset(&m, 0xAB, sizeof(m));
+    test_check(axl_serial_get_mode(first, &m) == AXL_OK,
+               "serial: get_mode succeeds on first port");
+    test_check(m.baud_rate >= 110 && m.baud_rate <= 12000000,
+               "serial: baud_rate is a plausible UART rate");
+    test_check(m.data_bits >= 5 && m.data_bits <= 8,
+               "serial: data_bits in 5..8");
+    test_check(m.parity <= 5, "serial: parity code in range");
+    test_check(m.stop_bits <= 3, "serial: stop_bits code in range");
+
+    /* Modem control/status lines. The bits themselves are platform
+       dependent, but the call must succeed on a real port. */
+    AxlSerialControl c;
+    axl_memset(&c, 0xAB, sizeof(c));
+    test_check(axl_serial_get_control(first, &c) == AXL_OK,
+               "serial: get_control succeeds on first port");
+
+    /* Error contract. */
+    test_check(axl_serial_get_mode(first, NULL) == AXL_ERR,
+               "serial: get_mode with NULL out returns AXL_ERR");
+    test_check(axl_serial_get_control(first, NULL) == AXL_ERR,
+               "serial: get_control with NULL out returns AXL_ERR");
+    int local_marker = 0;
+    test_check(axl_serial_get_mode((AxlHandle)&local_marker, &m) == AXL_ERR,
+               "serial: get_mode on a non-serial handle returns AXL_ERR");
+
+    /* Position-from-prev contract: a handle not in the cached set
+       restarts at the first port. */
+    test_check(axl_serial_next((AxlHandle)&local_marker) == first,
+               "serial: prev not in the set restarts at the first port");
+
+    /* --- Byte I/O (open / write / read) against the live firmware port --- */
+    AxlSerial *sp = NULL;
+    test_check(axl_serial_open(first, &sp) == AXL_OK && sp != NULL,
+               "serial: open the first port");
+    if (sp != NULL) {
+        /* Write through the real SerialIo->Write. The port is the shared
+           console UART, so write a bare CRLF: UEFI is single-threaded (this
+           completes before the next console print), and a newline-terminated
+           sequence forms its own blank line — it can't corrupt the harness's
+           start-anchored PASS:/FAIL: grep, and (unlike NULs) won't flip grep
+           to binary mode. NOT set_mode'd first — reconfiguring the console
+           port's baud would garble the test log; set_mode's positive path is
+           left to the SOL consumer (negative below). */
+        static const uint8_t probe_bytes[2] = { '\r', '\n' };
+        size_t wrote = 99;
+        test_check(axl_serial_write(sp, probe_bytes, sizeof(probe_bytes),
+                                    &wrote) == AXL_OK,
+                   "serial: write returns AXL_OK on the live port");
+        test_check(wrote == sizeof(probe_bytes),
+                   "serial: write transmitted all bytes");
+
+        /* Non-blocking read: nothing is being sent to us, so 0 bytes is the
+           expected normal result — and a clean AXL_OK (not an error). */
+        uint8_t rx[16];
+        size_t  got = 99;
+        test_check(axl_serial_read(sp, rx, sizeof(rx), &got) == AXL_OK,
+                   "serial: non-blocking read returns AXL_OK");
+        test_check(got <= sizeof(rx), "serial: read count within buffer");
+
+        axl_serial_close(sp);
+    }
+
+    /* Byte-I/O error contract (safe negatives — return on the guard before
+       any firmware call). */
+    static const uint8_t one[1] = { 0 };
+    uint8_t              rxb[4];
+    size_t               n = 0;
+    AxlSerialMode        zmode;
+    axl_memset(&zmode, 0, sizeof(zmode));
+    test_check(axl_serial_open(first, NULL) == AXL_ERR,
+               "serial: open NULL out -> AXL_ERR");
+    test_check(axl_serial_open((AxlHandle)&local_marker, &sp) == AXL_ERR,
+               "serial: open non-serial handle -> AXL_ERR");
+    test_check(axl_serial_write(NULL, one, 1, &n) == AXL_ERR,
+               "serial: write NULL port -> AXL_ERR");
+    test_check(axl_serial_read(NULL, rxb, sizeof(rxb), &n) == AXL_ERR,
+               "serial: read NULL port -> AXL_ERR");
+    test_check(axl_serial_set_mode(NULL, &zmode) == AXL_ERR,
+               "serial: set_mode NULL port -> AXL_ERR");
+    test_check(axl_serial_read_async(NULL, NULL, 10, NULL, NULL) == AXL_ERR,
+               "serial: read_async NULL args -> AXL_ERR");
+    axl_serial_close(NULL);   /* NULL-safe: the suite surviving is the assertion */
+}
+
+// ---------------------------------------------------------------------------
+// AxlFv — firmware-volume enumeration + attributes + file count
+// ---------------------------------------------------------------------------
+
+static void
+test_fv(void)
+{
+    /* OVMF publishes firmware volumes on both arches, so >=1 FV is a
+       deterministic requirement (not a topology-gated SKIP). */
+    AxlHandle first = axl_fv_next(NULL);
+    test_check(first != NULL, "fv: next finds at least one firmware volume");
+
+    /* The walk terminates and stays bounded. */
+    size_t    count = 0;
+    AxlHandle h     = NULL;
+    while ((h = axl_fv_next(h)) != NULL) {
+        count++;
+        if (count > 256) {
+            break;
+        }
+    }
+    test_check(count >= 1 && count <= 256, "fv: next walks a bounded set");
+
+    /* Attributes on the first volume. OVMF's FVs are readable. */
+    AxlFvAttributes a;
+    axl_memset(&a, 0xAB, sizeof(a));
+    test_check(axl_fv_get_attributes(first, &a) == AXL_OK,
+               "fv: get_attributes succeeds on first volume");
+    test_check(a.readable, "fv: first volume reports readable");
+
+    /* File count: succeeds on the first volume, and at least one
+       volume in the set holds files (OVMF FVs carry DXE drivers). */
+    size_t files_first = 0;
+    test_check(axl_fv_count_files(first, &files_first) == AXL_OK,
+               "fv: count_files succeeds on first volume");
+    bool found_files = false;
+    h = NULL;
+    while ((h = axl_fv_next(h)) != NULL) {
+        size_t n = 0;
+        if (axl_fv_count_files(h, &n) == AXL_OK && n > 0) {
+            found_files = true;
+        }
+    }
+    test_check(found_files, "fv: at least one volume has a nonzero file count");
+
+    /* Error contract. */
+    test_check(axl_fv_get_attributes(first, NULL) == AXL_ERR,
+               "fv: get_attributes with NULL out returns AXL_ERR");
+    test_check(axl_fv_count_files(first, NULL) == AXL_ERR,
+               "fv: count_files with NULL out returns AXL_ERR");
+    int local_marker = 0;
+    test_check(axl_fv_get_attributes((AxlHandle)&local_marker, &a) == AXL_ERR,
+               "fv: get_attributes on a non-FV handle returns AXL_ERR");
+    test_check(axl_fv_count_files((AxlHandle)&local_marker, &files_first) == AXL_ERR,
+               "fv: count_files on a non-FV handle returns AXL_ERR");
+
+    /* Position-from-prev contract: a handle not in the cached set
+       restarts at the first volume. */
+    test_check(axl_fv_next((AxlHandle)&local_marker) == first,
+               "fv: prev not in the set restarts at the first volume");
+}
+
+// ---------------------------------------------------------------------------
+// AxlTpm — TPM 2.0 presence + capability (TCG2 singleton)
+// ---------------------------------------------------------------------------
+
+static void
+test_tpm(void)
+{
+    /* NULL out is always an error, present or not. */
+    test_check(axl_tpm_get_capability(NULL) == AXL_ERR,
+               "tpm: get_capability with NULL out returns AXL_ERR");
+
+    AxlTpmCapability cap;
+    axl_memset(&cap, 0xAB, sizeof(cap));
+
+    if (axl_tpm_present()) {
+        /* Populated path: exercised by test-tpm-qemu.sh, which wires a
+           swtpm-backed TPM. Validates the hand-written capability
+           struct against a real GetCapability call. */
+        test_check(axl_tpm_get_capability(&cap) == AXL_OK,
+                   "tpm: get_capability succeeds when present");
+        test_check(cap.structure_version_major >= 1,
+                   "tpm: structure version major >= 1");
+        test_check(cap.manufacturer_id != 0,
+                   "tpm: manufacturer id populated");
+        test_check(cap.max_command_size > 0 && cap.max_response_size > 0,
+                   "tpm: command and response sizes populated");
+        test_check(cap.number_of_pcr_banks >= 1 && cap.number_of_pcr_banks <= 8,
+                   "tpm: pcr bank count is sane");
+        test_check(cap.active_pcr_banks != 0,
+                   "tpm: at least one active PCR bank");
+        /* Supported is a valid alg bitmask (only low-byte alg bits set)
+           that is a superset of the active banks. */
+        test_check(cap.supported_hash_algorithms != 0
+                   && (cap.supported_hash_algorithms & 0xFFFFFF00u) == 0
+                   && (cap.active_pcr_banks & ~cap.supported_hash_algorithms) == 0,
+                   "tpm: supported hash bitmap covers the active banks");
+    } else {
+        /* Absent path: the deterministic default under test-axl.sh
+           (QEMU has no TPM). Balance to the same 6 checks as the
+           populated branch. */
+        test_check(axl_tpm_get_capability(&cap) == AXL_ERR,
+                   "tpm: get_capability returns AXL_ERR when absent");
+        for (int i = 0; i < 6; i++) {
+            test_check(true, "tpm: SKIP balance (no TPM under default QEMU)");
+        }
+    }
+
+    /* Endorsement Key public read. NULL out_len is always an error. */
+    size_t      ek_len = 0;
+    AxlTpmEkAlg ek_alg = (AxlTpmEkAlg)0;
+    test_check(axl_tpm_read_ek_pub(NULL, 0, NULL, NULL) == AXL_ERR,
+               "tpm: read_ek_pub with NULL out_len -> AXL_ERR");
+
+    if (axl_tpm_present() && axl_tpm_ek_available()) {
+        /* Populated EK path (test-tpm-qemu.sh wires a swtpm). */
+        uint8_t ek[256];
+        test_check(axl_tpm_read_ek_pub(ek, sizeof(ek), &ek_len, &ek_alg) == AXL_OK,
+                   "tpm: read_ek_pub succeeds when EK present");
+        test_check(ek_alg == AXL_TPM_EK_ECC_P256 || ek_alg == AXL_TPM_EK_RSA2048,
+                   "tpm: read_ek_pub reports a known EK algorithm");
+        test_check((ek_alg == AXL_TPM_EK_ECC_P256 && ek_len == 64)
+                   || (ek_alg == AXL_TPM_EK_RSA2048 && ek_len == 256),
+                   "tpm: EK length matches its algorithm");
+        /* Size query reports the same length. */
+        size_t q = 0;
+        test_check(axl_tpm_read_ek_pub(NULL, 0, &q, NULL) == AXL_OK && q == ek_len,
+                   "tpm: read_ek_pub size query matches");
+        /* Too-small buffer fails closed with the required size. */
+        uint8_t small[8];
+        size_t  need = 0;
+        test_check(axl_tpm_read_ek_pub(small, sizeof(small), &need, NULL) == AXL_ERR
+                   && need == ek_len,
+                   "tpm: read_ek_pub too-small buffer -> AXL_ERR + required size");
+        /* Deterministic: a second read returns identical bytes. */
+        uint8_t ek2[256];
+        size_t  ek2_len = 0;
+        test_check(axl_tpm_read_ek_pub(ek2, sizeof(ek2), &ek2_len, NULL) == AXL_OK
+                   && ek2_len == ek_len
+                   && axl_memcmp(ek, ek2, ek_len) == 0,
+                   "tpm: read_ek_pub is deterministic within a boot");
+        /* Emit the EK so test-tpm-qemu.sh can compare it across boots. */
+        axl_printf("EK-PUB:%d:", (int)ek_alg);
+        for (size_t i = 0; i < ek_len; i++) {
+            axl_printf("%02x", ek[i]);
+        }
+        axl_printf("\n");
+    } else {
+        /* Absent EK path: the default under test-axl.sh (no TPM). */
+        uint8_t ek[8];
+        test_check(axl_tpm_ek_available() == false,
+                   "tpm: ek_available false without a TPM");
+        test_check(axl_tpm_read_ek_pub(ek, sizeof(ek), &ek_len, &ek_alg) == AXL_ERR,
+                   "tpm: read_ek_pub -> AXL_ERR without a TPM");
+        test_check(axl_tpm_read_ek_pub(NULL, 0, &ek_len, NULL) == AXL_ERR,
+                   "tpm: read_ek_pub size query -> AXL_ERR without a TPM");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AxlRamDisk — create / list / destroy over EFI_RAM_DISK_PROTOCOL
+// ---------------------------------------------------------------------------
+
+#define RD_TEST_LABEL  "AXLTESTRD"
+
+static size_t
+rd_count(void)
+{
+    size_t n = 0;
+    if (axl_ramdisk_list(NULL, 0, &n) != AXL_OK) {
+        return (size_t)-1;
+    }
+    return n;
+}
+
+static bool
+rd_find(
+    const char *label,
+    uint64_t   *size_out
+    )
+{
+    AxlRamDisk disks[16];
+    size_t     n = 0;
+    if (axl_ramdisk_list(disks, 16, &n) != AXL_OK) {
+        return false;
+    }
+    size_t shown = (n < 16) ? n : 16;
+    for (size_t i = 0; i < shown; i++) {
+        if (axl_strcmp(disks[i].label, label) == 0) {
+            if (size_out != NULL) {
+                *size_out = disks[i].size_bytes;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+test_ramdisk(void)
+{
+    /* Argument contract — arch-independent, no side effects (each is
+       rejected before touching the protocol or allocating). */
+    test_check(axl_ramdisk_create(NULL, 4, NULL) == AXL_ERR,
+               "ramdisk: NULL label rejected");
+    test_check(axl_ramdisk_create("RD", 0, NULL) == AXL_ERR,
+               "ramdisk: zero size rejected");
+    test_check(axl_ramdisk_create("RD", 99999, NULL) == AXL_ERR,
+               "ramdisk: oversize (>32768 MB) rejected");
+    test_check(axl_ramdisk_list(NULL, 0, NULL) == AXL_ERR,
+               "ramdisk: list with NULL count rejected");
+
+    if (axl_ramdisk_ensure_driver(NULL, 0, NULL) == AXL_OK) {
+        /* Firmware publishes EFI_RAM_DISK_PROTOCOL (OVMF/AAVMF): full
+           create -> list -> destroy round-trip. */
+        test_check(axl_ramdisk_ensure_driver(NULL, 0, NULL) == AXL_OK,
+                   "ramdisk: ensure_driver is idempotent when present");
+
+        size_t before = rd_count();
+        void  *dp     = NULL;
+        test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, &dp) == AXL_OK
+                   && dp != NULL,
+                   "ramdisk: create succeeds with a device path");
+
+        uint64_t sz = 0;
+        test_check(rd_find(RD_TEST_LABEL, &sz),
+                   "ramdisk: created disk appears in the list");
+        test_check(sz == (uint64_t)4 * 1024 * 1024,
+                   "ramdisk: listed size matches the 4 MB request");
+        test_check(rd_count() == before + 1,
+                   "ramdisk: list count grew by one");
+
+        /* Idempotent on the label: a second create is a no-op success. */
+        test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, NULL) == AXL_OK,
+                   "ramdisk: duplicate-label create is idempotent");
+        test_check(rd_count() == before + 1,
+                   "ramdisk: duplicate create added no new disk");
+
+        test_check(axl_ramdisk_destroy(RD_TEST_LABEL) == AXL_OK,
+                   "ramdisk: destroy succeeds");
+        test_check(!rd_find(RD_TEST_LABEL, NULL)
+                   && rd_count() == before,
+                   "ramdisk: destroyed disk is gone from the list");
+        test_check(axl_ramdisk_destroy(RD_TEST_LABEL) == AXL_ERR,
+                   "ramdisk: destroying a missing label returns AXL_ERR");
+    } else {
+        /* No RAM-disk protocol and no embedded blob (e.g. AAVMF/aa64):
+           create fails cleanly, list still works (reports none). Balance
+           to the same 10 checks as the round-trip branch. */
+        test_check(true, "ramdisk: ensure_driver reports no protocol (SKIP balance)");
+        test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, NULL) == AXL_ERR,
+                   "ramdisk: create returns AXL_ERR with no protocol");
+        size_t n = 99;
+        test_check(axl_ramdisk_list(NULL, 0, &n) == AXL_OK && n == 0,
+                   "ramdisk: list succeeds with zero disks when none exist");
+        for (int i = 0; i < 7; i++) {
+            test_check(true, "ramdisk: SKIP balance (no RAM-disk protocol)");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AxlRamDisk — register an arbitrary image buffer as a typed (disk/CD-ROM)
+// RAM disk, WITHOUT formatting (axl_ramdisk_register_image / _unregister).
+// ---------------------------------------------------------------------------
+
+#define RD_IMG_PAGES  1u   /* a 4 KB raw image is enough to round-trip a disk */
+
+static void
+test_ramdisk_register_image(void)
+{
+    /* Argument contract — arch-independent, rejected before the protocol
+       (and before @p image is ever dereferenced). Both kinds are valid;
+       only an out-of-range kind is refused. */
+    char  sentinel;        /* any non-NULL address; never read on these paths */
+    void *dp = NULL;
+    test_check(axl_ramdisk_register_image(NULL, 4096, AXL_RAMDISK_DISK, &dp) == AXL_ERR,
+               "ramdisk: register_image NULL image rejected");
+    test_check(axl_ramdisk_register_image(&sentinel, 0, AXL_RAMDISK_CDROM, &dp) == AXL_ERR,
+               "ramdisk: register_image zero size rejected");
+    test_check(axl_ramdisk_register_image(&sentinel, 4096, (AxlRamDiskKind)99, &dp) == AXL_ERR,
+               "ramdisk: register_image invalid kind rejected");
+    test_check(axl_ramdisk_unregister(NULL) == AXL_ERR,
+               "ramdisk: unregister NULL rejected");
+
+    if (axl_ramdisk_ensure_driver(NULL, 0, NULL) == AXL_OK) {
+        /* Protocol present (OVMF): register a page-aligned buffer verbatim
+           (no formatting) as a raw disk, connect, then unregister. This
+           exercises all of register_image's mechanics — protocol resolve,
+           Register with the type GUID, controller connect, device-path
+           return — and the caller-frees ownership contract.
+
+           The CD-ROM (AXL_RAMDISK_CDROM) connect path is NOT driven here:
+           it differs only in the type GUID, but the firmware's ISO9660 /
+           El Torito driver does not cleanly bind a synthetic RAM image
+           under QEMU (it needs real, valid El Torito media), so that path
+           is exercised by the consumer's integration test with a real
+           `.iso`. The DISK round-trip below covers the shared machinery. */
+        uint64_t phys = 0;
+        if (axl_alloc_pages(RD_IMG_PAGES, &phys) == AXL_OK && phys != 0) {
+            void *img = (void *)(uintptr_t)phys;
+            axl_memset(img, 0, (size_t)RD_IMG_PAGES * 4096);
+
+            void *dp_disk = NULL;
+            test_check(axl_ramdisk_register_image(img, (uint64_t)RD_IMG_PAGES * 4096,
+                       AXL_RAMDISK_DISK, &dp_disk) == AXL_OK && dp_disk != NULL,
+                       "ramdisk: register_image (disk) succeeds with a device path");
+            /* Unregister detaches the device and the firmware FREES the
+               device path, so dp_disk must not be reused after this. */
+            test_check(axl_ramdisk_unregister(dp_disk) == AXL_OK,
+                       "ramdisk: unregister (disk) succeeds");
+
+            /* Caller owns the buffer: we free it, not unregister. */
+            axl_free_pages(phys, RD_IMG_PAGES);
+        } else {
+            test_check(true, "ramdisk: register_image SKIP balance (page alloc failed)");
+            test_check(true, "ramdisk: register_image SKIP balance (page alloc failed)");
+        }
+    } else {
+        /* No protocol (AAVMF/aa64): register fails cleanly with the out
+           param cleared. Balance to the same 2 checks as the round-trip. */
+        char  img[64];
+        void *dpx = NULL;
+        test_check(axl_ramdisk_register_image(img, sizeof(img),
+                   AXL_RAMDISK_DISK, &dpx) == AXL_ERR && dpx == NULL,
+                   "ramdisk: register_image returns AXL_ERR with no protocol");
+        test_check(true, "ramdisk: register_image SKIP balance (no RAM-disk protocol)");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AxlUsb — vendor/device-name database (Phase D)
 // ---------------------------------------------------------------------------
 
@@ -3893,6 +4490,7 @@ test_platform_main(int argc, char **argv)
     test_acpi_read_mcfg();
     test_acpi_read_madt();
     test_acpi_read_facp();
+    test_acpi_fadt_children();
 
     /* AxlPci */
     test_pci_enumerate();
@@ -3938,6 +4536,12 @@ test_platform_main(int argc, char **argv)
     test_usb_get_device_info();
     test_usb_get_num_endpoints();
     test_usb_get_port_info();
+    test_block_io();
+    test_serial_io();
+    test_fv();
+    test_tpm();
+    test_ramdisk();
+    test_ramdisk_register_image();
     test_usb_ids_load_failure_modes();
     test_usb_ids_handle_buffer();
     test_usb_ids_foreach();

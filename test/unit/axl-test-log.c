@@ -238,6 +238,48 @@ test_ring_overflow(void)
 }
 
 /**
+  Test 7b: axl_log_ring_clear empties an attached ring in place, and the
+  ring keeps receiving new messages afterward (no detach/re-attach).
+**/
+static void
+test_ring_clear(void)
+{
+    AxlLogRing  *ring;
+    AxlLogEntry  entry;
+
+    ring = axl_log_ring_new(16, 128);
+    test_check(ring != NULL, "ring clear: allocated");
+    if (ring == NULL) {
+        return;
+    }
+    axl_log_ring_attach(ring);
+
+    axl_log(AXL_LOG_INFO, "rc", "before-1");
+    axl_log(AXL_LOG_INFO, "rc", "before-2");
+    test_check(axl_log_ring_count(ring) == 2, "ring clear: 2 before clear");
+
+    axl_log_ring_clear(ring);
+    test_check(axl_log_ring_count(ring) == 0, "ring clear: empty after clear");
+    test_check(!axl_log_ring_get(ring, 0, &entry),
+               "ring clear: get(0) fails on the emptied ring");
+
+    /* Still attached: new messages land in the ring. */
+    axl_log(AXL_LOG_INFO, "rc", "after-1");
+    test_check(axl_log_ring_count(ring) == 1,
+               "ring clear: ring still receives after clear");
+    test_check(axl_log_ring_get(ring, 0, &entry)
+               && test_strstr(entry.message, "after-1") != NULL,
+               "ring clear: newest entry is the post-clear message");
+
+    /* clear(NULL) must not crash, and must not disturb a real ring. */
+    axl_log_ring_clear(NULL);
+    test_check(axl_log_ring_count(ring) == 1,
+               "ring clear: clear(NULL) left the real ring intact");
+
+    axl_log_ring_free(ring);
+}
+
+/**
   Test 8: File handler writes to a file.
   Uses axl_file_get_contents for backend-agnostic verification.
 **/
@@ -495,6 +537,7 @@ test_log_main(int argc, char **argv)
     test_suppress_console();
     test_ring_buffer();
     test_ring_overflow();
+    test_ring_clear();
     test_file_handler();
     test_add_handler_overflow();
     test_axl_log_level_env();

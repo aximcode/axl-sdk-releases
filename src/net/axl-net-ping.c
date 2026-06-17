@@ -2,7 +2,13 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-net-ping.c
-    axl_net_ping — ICMP echo request over EFI_IP4_PROTOCOL.
+    axl_net_ping / axl_net_ping_ex — ICMP echo probes over EFI_IP4_PROTOCOL.
+
+    The shared core (ping_core) sends one ICMP echo with caller-chosen TTL,
+    Don't-Fragment, and payload size, then classifies the reply
+    (echo-reply / time-exceeded / unreachable / frag-needed) and reports the
+    responder's source IP — the substrate for traceroute and path-MTU
+    discovery. axl_net_ping is the plain "did it answer + RTT" wrapper.
 **/
 
 #include "axl-net-internal.h"
@@ -18,19 +24,15 @@ AXL_LOG_DOMAIN("net");
 // ICMP structures
 // ---------------------------------------------------------------------------
 
-#pragma pack(1)
-typedef struct {
-    uint8_t   type;
-    uint8_t   code;
-    uint16_t  checksum;
-    uint16_t  identifier;
-    uint16_t  sequence;
-    uint8_t   data[56];
-} IcmpEchoPacket;
-#pragma pack()
+#define ICMP_ECHO_REQUEST      8
+#define ICMP_ECHO_REPLY        0
+#define ICMP_DEST_UNREACHABLE  3
+#define ICMP_TIME_EXCEEDED     11
+#define ICMP_CODE_FRAG_NEEDED  4    /* type 3, code 4 */
 
-#define ICMP_ECHO_REQUEST  8
-#define ICMP_ECHO_REPLY    0
+#define ICMP_HDR_LEN           8u   /* type/code/cksum/id/seq */
+#define ICMP_DEFAULT_PAYLOAD   56u
+#define ICMP_MAX_PAYLOAD       1472u  /* 1500 MTU - 20 IP - 8 ICMP */
 
 // ---------------------------------------------------------------------------
 // ICMP checksum
@@ -62,12 +64,17 @@ icmp_checksum(
 }
 
 // ---------------------------------------------------------------------------
-// axl_net_ping
+// ping_core — one ICMP echo probe with explicit TTL / DF / payload, classifying
+// the reply. Shared by axl_net_ping and axl_net_ping_ex.
+//
+// Returns AXL_OK once the probe COMPLETES (inspect out->reply — a timeout is
+// AXL_OK with reply == AXL_PING_NO_REPLY); AXL_ERR only on bad args or a setup
+// failure (no IP4 stack, child/configure/transmit error).
 // ---------------------------------------------------------------------------
 
-int
-axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
-             size_t *out_rtt_ms)
+static int
+ping_core(AxlIPv4Address *target, size_t timeout_ms, uint8_t ttl,
+          bool dont_fragment, size_t payload_len, AxlPingResult *out)
 {
     EFI_STATUS                    status;
     EFI_HANDLE                   *handles;
@@ -83,16 +90,29 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     EFI_IP4_COMPLETION_TOKEN      tx_token;
     EFI_IP4_COMPLETION_TOKEN      rx_token;
     EFI_IP4_OVERRIDE_DATA         override;
-    IcmpEchoPacket                pkt;
+    uint8_t                       pkt[ICMP_HDR_LEN + ICMP_MAX_PAYLOAD];
+    size_t                        pkt_len;
     size_t                        elapsed;
     size_t                        timeout_us;
     EFI_IP4_FRAGMENT_DATA         fragment;
+    int                           rc = AXL_ERR;
 
-    if (target == NULL || out_rtt_ms == NULL) {
+    if (target == NULL || out == NULL) {
         return AXL_ERR;
     }
 
-    *out_rtt_ms = 0;
+    axl_memset(out, 0, sizeof(*out));
+    out->reply = AXL_PING_NO_REPLY;
+
+    if (ttl == 0) {
+        ttl = 64;
+    }
+    if (payload_len == 0) {
+        payload_len = ICMP_DEFAULT_PAYLOAD;
+    } else if (payload_len > ICMP_MAX_PAYLOAD) {
+        payload_len = ICMP_MAX_PAYLOAD;
+    }
+    pkt_len = ICMP_HDR_LEN + payload_len;
 
     //
     // Locate IP4 service binding
@@ -147,7 +167,7 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     ip4_config.AcceptAnyProtocol  = false;
     ip4_config.RawData            = false;
     ip4_config.UseDefaultAddress  = true;
-    ip4_config.TimeToLive         = 64;
+    ip4_config.TimeToLive         = ttl;
 
     status = axl_efi_call(ip4->Configure, 2, ip4, &ip4_config);
     if (EFI_ERROR(status)) {
@@ -164,34 +184,39 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     axl_backend_event_create((AxlEventHandle *)&tx_event);
     axl_backend_event_create((AxlEventHandle *)&rx_event);
     if (tx_event == NULL || rx_event == NULL) {
-        status = EFI_OUT_OF_RESOURCES;
-        goto done;
+        goto done;   /* rc is still AXL_ERR */
     }
 
     //
-    // Build ICMP echo request
+    // Build ICMP echo request: 8-byte header + payload, identifier "UN".
+    // type/code/checksum/id/seq are at offsets 0/1/2-3/4-5/6-7.
     //
-    axl_memset(&pkt, 0, sizeof(pkt));
-    pkt.type       = ICMP_ECHO_REQUEST;
-    pkt.code       = 0;
-    pkt.identifier = 0x554E;  // "UN" for AxlNet
-    pkt.sequence   = 1;
-    pkt.checksum   = icmp_checksum(&pkt, sizeof(pkt));
+    axl_memset(pkt, 0, pkt_len);
+    pkt[0] = ICMP_ECHO_REQUEST;      /* type */
+    pkt[1] = 0;                       /* code */
+    pkt[4] = 0x4E;                    /* identifier "UN" (0x554E), LE */
+    pkt[5] = 0x55;
+    pkt[6] = 1;                       /* sequence */
+    pkt[7] = 0;
+    uint16_t cksum = icmp_checksum(pkt, pkt_len);
+    pkt[2] = (uint8_t)(cksum & 0xFF);
+    pkt[3] = (uint8_t)(cksum >> 8);
 
     //
     // Prepare transmit
     //
-    fragment.FragmentLength = sizeof(pkt);
-    fragment.FragmentBuffer = &pkt;
+    fragment.FragmentLength = (uint32_t)pkt_len;
+    fragment.FragmentBuffer = pkt;
 
     axl_memset(&override, 0, sizeof(override));
-    override.Protocol   = 1;
-    override.TimeToLive = 64;
+    override.Protocol      = 1;
+    override.TimeToLive    = ttl;
+    override.DoNotFragment = dont_fragment;
 
     axl_memset(&tx_data, 0, sizeof(tx_data));
     axl_memcpy(&tx_data.DestinationAddress, target, sizeof(EFI_IPv4_ADDRESS));
     tx_data.OverrideData  = &override;
-    tx_data.TotalDataLength = sizeof(pkt);
+    tx_data.TotalDataLength = (uint32_t)pkt_len;
     tx_data.FragmentCount   = 1;
     tx_data.FragmentTable[0] = fragment;
 
@@ -224,6 +249,13 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     }
 
     //
+    // The probe is now in flight: whatever happens next (a reply, an ICMP
+    // error, or a timeout) the probe COMPLETED, so the call succeeds and the
+    // outcome is reported in out->reply.
+    //
+    rc = AXL_OK;
+
+    //
     // Wait for reply — loop because a spurious packet may arrive and
     // require a re-Receive. Each iteration waits for rx_event with the
     // remaining budget, charging elapsed against wall-clock. The IP4
@@ -245,26 +277,52 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
             rx_data = rx_token.Packet.RxData;
 
             //
-            // Check for ICMP echo reply
+            // Classify the ICMP message: echo-reply (reached), time-exceeded
+            // (a hop), or destination-unreachable (incl. frag-needed for PMTU).
             //
+            bool terminal = false;
             if (rx_data->Header->Protocol == 1 && rx_data->DataLength >= 8) {
-                uint8_t *icmp_hdr = (uint8_t *)rx_data->FragmentTable[0].FragmentBuffer;
-                if (icmp_hdr[0] == ICMP_ECHO_REPLY) {
-                    *out_rtt_ms = elapsed / 1000;
-                    if (*out_rtt_ms == 0) {
-                        *out_rtt_ms = 1;
-                    }
-
-                    axl_backend_event_signal((AxlEventHandle)rx_data->RecycleSignal);
-                    status = EFI_SUCCESS;
-                    goto done;
+                uint8_t *icmp = (uint8_t *)rx_data->FragmentTable[0].FragmentBuffer;
+                switch (icmp[0]) {
+                    case ICMP_ECHO_REPLY:
+                        out->reply = AXL_PING_ECHO_REPLY;
+                        terminal = true;
+                        break;
+                    case ICMP_TIME_EXCEEDED:
+                        out->reply = AXL_PING_TIME_EXCEEDED;
+                        terminal = true;
+                        break;
+                    case ICMP_DEST_UNREACHABLE:
+                        if (icmp[1] == ICMP_CODE_FRAG_NEEDED) {
+                            out->reply = AXL_PING_FRAG_NEEDED;
+                            /* type 3/code 4: next-hop MTU in bytes 6-7 (BE). */
+                            out->next_mtu =
+                                (uint16_t)((icmp[6] << 8) | icmp[7]);
+                        } else {
+                            out->reply = AXL_PING_UNREACHABLE;
+                        }
+                        terminal = true;
+                        break;
+                    default:
+                        break;
                 }
+            }
+
+            if (terminal) {
+                axl_memcpy(out->responder.addr,
+                           &rx_data->Header->SourceAddress, 4);
+                out->rtt_ms = elapsed / 1000;
+                if (out->rtt_ms == 0) {
+                    out->rtt_ms = 1;
+                }
+                axl_backend_event_signal((AxlEventHandle)rx_data->RecycleSignal);
+                goto done;
             }
 
             axl_backend_event_signal((AxlEventHandle)rx_data->RecycleSignal);
 
             //
-            // Not our reply, resubmit receive
+            // Not a terminal reply, resubmit receive
             //
             rx_token.Status = EFI_ABORTED;
             axl_efi_call(ip4->Receive, 2, ip4, &rx_token);
@@ -272,10 +330,9 @@ axl_net_ping(AxlIPv4Address *target, size_t timeout_ms,
     }
 
     //
-    // Timed out
+    // Timed out — out->reply stays AXL_PING_NO_REPLY.
     //
     axl_efi_call(ip4->Cancel, 2, ip4, &rx_token);
-    status = EFI_TIMEOUT;
 
 done:
     if (tx_event != NULL) {
@@ -288,5 +345,35 @@ done:
 
     axl_efi_call(ip4->Configure, 2, ip4, NULL);
     axl_efi_call(ip4_sb->DestroyChild, 2, ip4_sb, ip4_child);
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Public wrappers
+// ---------------------------------------------------------------------------
+
+int
+axl_net_ping(AxlIPv4Address *target, size_t timeout_ms, size_t *out_rtt_ms)
+{
+    if (out_rtt_ms == NULL) {
+        return AXL_ERR;
+    }
+    *out_rtt_ms = 0;
+
+    AxlPingResult res;
+    if (ping_core(target, timeout_ms, 64, false, 0, &res) != AXL_OK) {
+        return AXL_ERR;
+    }
+    if (res.reply != AXL_PING_ECHO_REPLY) {
+        return AXL_ERR;   /* timeout or an error reply — not "alive" */
+    }
+    *out_rtt_ms = res.rtt_ms;
+    return AXL_OK;
+}
+
+int
+axl_net_ping_ex(AxlIPv4Address *target, size_t timeout_ms, uint8_t ttl,
+                bool dont_fragment, size_t payload_len, AxlPingResult *out)
+{
+    return ping_core(target, timeout_ms, ttl, dont_fragment, payload_len, out);
 }

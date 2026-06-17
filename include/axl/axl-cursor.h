@@ -281,7 +281,7 @@ typedef struct {
  *     — but prefer axl_cursor_detach, which tears down BOTH sources), or 0 if
  *     neither source could be bound.
  */
-uint32_t
+AxlSourceId
 axl_cursor_attach(
     AxlCursor         *c,      ///< cursor
     AxlLoop           *loop,   ///< event loop (caller-owned)
@@ -307,7 +307,7 @@ axl_cursor_attach(
  * @return a non-zero source ID on success (prefer axl_cursor_detach to tear
  *     down), or 0 if no requested source could be bound.
  */
-uint32_t
+AxlSourceId
 axl_cursor_attach_ex(
     AxlCursor              *c,      ///< cursor
     AxlLoop                *loop,   ///< event loop (caller-owned)

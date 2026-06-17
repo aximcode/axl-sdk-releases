@@ -22,6 +22,7 @@
 #include <axl/axl-image.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-mem.h>
+#include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <axl/axl-sys.h>     /* gImageHandle pulled in for self lookup */
 
@@ -124,6 +125,44 @@ axl_image_unload(
         rc = axl_driver_unload(img->handle);
     }
     axl_free(img);
+    return rc;
+}
+
+int
+axl_image_run(
+    const char *path,
+    const char *args,
+    int        *out_exit_code
+    )
+{
+    if (out_exit_code != NULL) {
+        *out_exit_code = 0;
+    }
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+
+    AxlImage *img = NULL;
+    if (axl_image_load(path, &img) != AXL_OK || img == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Install @p args as UCS-2 LoadOptions (NUL-terminated, sized in bytes —
+       the UEFI command-line convention). set_load_options copies the buffer,
+       so the temporary is freed immediately. */
+    if (args != NULL && args[0] != '\0') {
+        size_t          n = axl_strlen(args);
+        unsigned short *w = axl_malloc((n + 1) * sizeof(unsigned short));
+        if (w != NULL) {
+            size_t chars = axl_utf8_to_ucs2_buf(args, w, n + 1);
+            axl_image_set_load_options(img, w,
+                                       (chars + 1) * sizeof(unsigned short));
+            axl_free(w);
+        }
+    }
+
+    int rc = axl_image_start(img, out_exit_code);   /* blocks */
+    axl_image_unload(img);
     return rc;
 }
 

@@ -125,6 +125,7 @@ EFI_ARGS=()
 SENDKEY_SEQ=""   # space-separated QEMU monitor key tokens to inject (--screenshot)
 SENDMOUSE_SEQ="" # space-separated "fx,fy[,click]" absolute-pointer moves (--screenshot, QMP)
 CPU_WARN=true
+CPU_REPORT=false     # --cpu-report: always print sampled mean/peak host CPU
 CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
 CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
 INTERACTIVE=false
@@ -138,6 +139,9 @@ MOUNT_DIR=""
 MOUNT_TAG="hostfs"
 MEM="512M"            # guest RAM (also used for memory-backend-file size)
 BRIDGES=false         # --bridges adds a small PCI bridge tree (mirrors test runner)
+TAP_IFACE=""          # --tap <ifname>: bridge the NIC to a host tap (real net)
+                      # instead of SLIRP user-mode (real DHCP/ICMP; needs the
+                      # tap pre-created + owned by the qemu user)
 
 # Hardware-fixture platform-identity injection (SMBIOS / ACPI / SPD /
 # TPM / IPMI) is NOT handled here — it lives in scripts/axl-emulate,
@@ -167,6 +171,7 @@ while [[ $# -gt 0 ]]; do
             # connects OUT to it (auto-appears, no per-run reconnect).
             DISPLAY_BACKEND="vnc=$2,reverse=on"; shift 2 ;;
         --net)        NET=true; shift ;;
+        --tap)        TAP_IFACE="$2"; NET=true; shift 2 ;;
         --bridges)    BRIDGES=true; shift ;;
         --nic-model)  NIC_MODEL="$2"; NET=true; shift 2 ;;
         --mac)        MAC_ADDR="$2"; NET=true; shift 2 ;;
@@ -193,6 +198,7 @@ while [[ $# -gt 0 ]]; do
         --gdb-halt)   GDB_HALT=true; shift ;;
         --debugcon)   DEBUGCON_LOG="$2"; shift 2 ;;
         --no-cpu-warn) CPU_WARN=false; shift ;;
+        --cpu-report) CPU_REPORT=true; shift ;;
         --cpu-threshold) CPU_THRESHOLD="$2"; shift 2 ;;
         --cpu-sustain) CPU_SUSTAIN="$2"; shift 2 ;;
         -i|--interactive) INTERACTIVE=true; shift ;;
@@ -247,7 +253,13 @@ Options:
                            All display modes imply --gpu, have no
                            timeout, and are mutually exclusive with
                            --background / --screenshot / --interactive.
-  --net                    Enable user-mode networking (virtio-net)
+  --net                    Enable user-mode (SLIRP) networking (virtio-net)
+  --tap IFACE              Real L2 networking over a pre-created host tap
+                           (implies --net) instead of SLIRP — gives the
+                           guest a real DHCP lease + working ICMP. The tap
+                           must already exist and be owned by the qemu user;
+                           scripts/netcfg-testnet.sh (in agt) sets up the
+                           tap + a dnsmasq DHCP server + NAT.
   --bridges                Add a small PCI bridge tree (one PCIe root
                            port + a virtio-rng device behind it) AND a
                            USB topology (qemu-xhci + usb-mouse + usb-hub
@@ -317,6 +329,12 @@ Options:
                            window (10 s X64 / 15 s AARCH64).
   --cpu-threshold CORES    Override spike threshold (default 1.5 cores).
   --cpu-sustain SECS       Override sustain duration (default 2 s).
+  --cpu-report             Always print a `CPU-REPORT:` line with the mean
+                           and peak host-CPU usage the sampler measured
+                           (in cores; 1.0 = one core), after the warm-up
+                           window. Useful for steady-state CPU regression
+                           tests (e.g. an idle server should stay well
+                           under one core).
   -i, --interactive        Attach the host TTY to QEMU's serial so the
                            user can type into the guest. Disables the
                            timeout, the CPU-spike sampler, and the
@@ -787,14 +805,15 @@ cpu_sampler() {
     BEGIN {
         system("sleep " warmup)
         prev = read_total(pid)
-        if (prev < 0) { print "0.00 0.00"; exit 0 }
-        peak = 0; streak = 0; streak_max = 0
+        if (prev < 0) { print "0.00 0.00 0.000"; exit 0 }
+        peak = 0; streak = 0; streak_max = 0; sum = 0; n = 0
         while (alive(pid)) {
             system("sleep " interval)
             cur = read_total(pid)
             if (cur < 0) break
             d = cur - prev; prev = cur
             cores = d / (hz * interval)
+            sum += cores; n++
             if (cores > peak) peak = cores
             if (cores >= thr) {
                 streak += interval
@@ -803,25 +822,39 @@ cpu_sampler() {
                 streak = 0
             }
         }
-        printf "%.2f %.2f\n", peak, streak_max
+        # peak (max 0.2s reading) sustain_max (longest >=thr streak, s) mean (avg cores)
+        printf "%.2f %.2f %.3f\n", peak, streak_max, (n > 0 ? sum / n : 0)
     }' > "$out"
 }
 
-# Print a CPU-spike summary if the sampler captured a sustained spike.
-# Reads "<peak> <sustain_max>" from the file written by cpu_sampler.
+# Print a CPU-spike summary if the sampler captured a sustained spike, and/or
+# (with --cpu-report) an always-on report of the sampled host-CPU usage.
+# Reads "<peak> <sustain_max> <mean>" from the file written by cpu_sampler
+# (1.0 = one host core saturated; measured after the boot warm-up window).
 cpu_summary() {
     local summary_file="$1"
-    [[ "$CPU_WARN" != "true" ]] && return 0
+    [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
     [[ ! -s "$summary_file" ]] && return 0
-    local peak sustain
-    read -r peak sustain < "$summary_file" || return 0
+    local peak sustain mean
+    read -r peak sustain mean < "$summary_file" || return 0
+    mean="${mean:-0.000}"
+
+    # Always-on report — a machine-greppable line consumers (e.g. the
+    # server-CPU regression test) parse. Goes to stdout, not stderr.
+    if [[ "$CPU_REPORT" == "true" ]]; then
+        printf "CPU-REPORT: mean %s cores, peak %s cores (after %ss warm-up)\n" \
+            "$mean" "$peak" "$CPU_WARMUP"
+    fi
+
     # awk for the comparison; $sustain and $CPU_SUSTAIN are floats.
-    local breached
-    breached=$(awk -v s="$sustain" -v t="$CPU_SUSTAIN" \
-        'BEGIN{print (s+0 >= t+0) ? "1" : "0"}')
-    if [[ "$breached" == "1" ]]; then
-        printf "WARN: CPU spike — peak %s cores, sustained ≥%s cores for %ss (threshold %ss)\n" \
-            "$peak" "$CPU_THRESHOLD" "$sustain" "$CPU_SUSTAIN" >&2
+    if [[ "$CPU_WARN" == "true" ]]; then
+        local breached
+        breached=$(awk -v s="$sustain" -v t="$CPU_SUSTAIN" \
+            'BEGIN{print (s+0 >= t+0) ? "1" : "0"}')
+        if [[ "$breached" == "1" ]]; then
+            printf "WARN: CPU spike — peak %s cores, sustained ≥%s cores for %ss (threshold %ss)\n" \
+                "$peak" "$CPU_THRESHOLD" "$sustain" "$CPU_SUSTAIN" >&2
+        fi
     fi
 }
 
@@ -1018,12 +1051,26 @@ if [[ "$NET" == "true" ]]; then
              "(expect XX:XX:XX:XX:XX:XX)" >&2
         exit 1
     fi
-    NETDEV="user,id=net0"
-    for fwd in "${HOSTFWDS[@]}"; do
-        HOST_PORT="${fwd%%:*}"
-        GUEST_PORT="${fwd##*:}"
-        NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
-    done
+    if [[ -n "$TAP_IFACE" ]]; then
+        # Real L2 networking over a pre-created host tap (script=no: run-qemu
+        # does NOT create/destroy it — see scripts/netcfg-testnet.sh, which
+        # owns the tap + a dnsmasq DHCP server + NAT). Gives the guest a real
+        # DHCP lease and working ICMP, unlike SLIRP. hostfwd is SLIRP-only and
+        # ignored here (use the tap subnet directly).
+        if ! ip link show "$TAP_IFACE" >/dev/null 2>&1; then
+            echo "ERROR: --tap '$TAP_IFACE' does not exist (create it first," \
+                 "e.g. scripts/netcfg-testnet.sh up)" >&2
+            exit 1
+        fi
+        NETDEV="tap,id=net0,ifname=${TAP_IFACE},script=no,downscript=no"
+    else
+        NETDEV="user,id=net0"
+        for fwd in "${HOSTFWDS[@]}"; do
+            HOST_PORT="${fwd%%:*}"
+            GUEST_PORT="${fwd##*:}"
+            NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
+        done
+    fi
     # Default NIC model is virtio-net-pci because OVMF has VirtioNetDxe
     # built in. --nic-model lets tests force other PCI NICs (e1000,
     # e1000e, rtl8139, pcnet, vmxnet3, ne2k_pci) to validate iPXE-driver
@@ -1419,7 +1466,7 @@ else
     ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
     WRAPPER_PID=$!
     QPID=""
-    if [[ "$CPU_WARN" == "true" ]]; then
+    if [[ "$CPU_WARN" == "true" || "$CPU_REPORT" == "true" ]]; then
         for _ in 1 2 3 4 5; do
             QPID=$(pgrep -P "$WRAPPER_PID" 2>/dev/null | head -1)
             [[ -n "$QPID" ]] && break

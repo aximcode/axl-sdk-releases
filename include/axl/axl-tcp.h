@@ -84,6 +84,36 @@ axl_tcp_connect_via(
 );
 
 /**
+ * @brief Connect via TCP4 with an explicit connect-phase timeout.
+ *
+ * The timeout-aware form of axl_tcp_connect_via: it bounds the SYN /
+ * handshake wait with @p connect_timeout_ms instead of the fixed 10 s
+ * default the simpler entry points use. A consumer talking to an
+ * operator-supplied endpoint (a webhook URL, a REST host) uses this so an
+ * unreachable target — a silently-dropped SYN — fails fast instead of
+ * stalling the caller's event loop for ~10 s. axl_tcp_connect and
+ * axl_tcp_connect_via are exactly this call with @p connect_timeout_ms = 0.
+ *
+ * @p connect_timeout_ms == 0 keeps the 10 s default (matching the
+ * send/recv convention where 0 means "the default", not "forever" — a
+ * connect with no deadline is rarely what a caller wants). The timeout is
+ * an AXL-side deadline: it fires on the loop and cancels the connect, so it
+ * bounds the wait regardless of how the underlying transport behaves.
+ *
+ * @return AXL_OK on success; AXL_ERR on failure, including a timeout
+ *     (the SYN was not answered within @p connect_timeout_ms) and "no
+ *     interface matches @p source_ip" when forced.
+ */
+int
+axl_tcp_connect_timeout(
+    const char            *host,               ///< IPv4 string or hostname (DNS resolved)
+    uint16_t               port,               ///< remote port number
+    const AxlIPv4Address  *source_ip,          ///< pin to this local station IP, or NULL to auto-pick
+    size_t                 connect_timeout_ms, ///< connect deadline in ms (0 = 10 s default)
+    AxlTcp               **out_sock            ///< receives the connected socket handle
+);
+
+/**
  * @brief Create a TCP4 listener on the given port.
  *
  * @return AXL_OK on success, AXL_ERR on failure.

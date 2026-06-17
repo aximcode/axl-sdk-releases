@@ -22,6 +22,11 @@
 
 AXL_LOG_DOMAIN("wait");
 
+/* Defined in src/loop/axl-loop.c. Forward-declared here because axl-loop's
+   internal header is src/loop-only; this is the re-entrancy query the guard
+   below uses. See docs/AXL-Loop-Reentrancy-Plan.md Item 1. */
+bool _axl_loop_in_callback(void);
+
 // ---------------------------------------------------------------------------
 // Macros
 // ---------------------------------------------------------------------------
@@ -126,10 +131,10 @@ _axl_event_wait_timeout_with_tick(
     WaitCtx        w;
     AxlLoop       *loop;
     AxlEventHandle cancel_event;
-    uint32_t       event_source;
-    uint32_t       timeout_source;
-    uint32_t       tick_source;
-    uint32_t       cancel_source;
+    AxlSourceId    event_source;
+    AxlSourceId    timeout_source;
+    AxlSourceId    tick_source;
+    AxlSourceId    cancel_source;
     uint64_t       tick_ms;
     uint64_t       timeout_ms;
     bool           need_tick;
@@ -143,6 +148,20 @@ _axl_event_wait_timeout_with_tick(
     /* Fast path: condition already holds. No loop, no allocation. */
     if (cond_fn != NULL && cond_fn(cond_ctx)) {
         return AXL_OK;
+    }
+
+    /* Re-entrancy guard (warn-first; docs/AXL-Loop-Reentrancy-Plan.md Item 1).
+       A blocking wait reached from inside a loop callback (an HTTP/WS handler,
+       a timer/source callback, a driver-pump tick) nests a NEW loop
+       re-entrantly — the bug class behind the SoftBMC wedges. The right answer
+       is the async API; this surfaces the call site loudly. It still PROCEEDS
+       (the raised-TPL fallback keeps it from hard-wedging) — a later phase
+       flips this to a hard AXL_BUSY once consumers are converted. */
+    if (_axl_loop_in_callback()) {
+        axl_warning("synchronous wait invoked from inside a loop callback: this "
+                    "nests an event loop re-entrantly. Use the async API "
+                    "(axl_*_async) instead. Proceeding for now; a future release "
+                    "will reject this with AXL_BUSY.");
     }
 
     loop = axl_loop_new();

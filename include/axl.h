@@ -24,6 +24,7 @@
 
 #include <axl/axl-version.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-debug.h>
 #include <axl/axl-types.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-format.h>
@@ -55,7 +56,9 @@
 #include <axl/axl-piece-tree.h>
 #include <axl/axl-ring-buf.h>
 #include <axl/axl-digest.h>
+#include <axl/axl-crypto.h>
 #include <axl/axl-hmac.h>
+#include <axl/axl-jose.h>
 #include <axl/axl-bytes.h>
 #include <axl/axl-compress.h>
 #include <axl/axl-path.h>
@@ -75,12 +78,24 @@
 #include <axl/axl-sidecar.h>
 #include <axl/axl-pci.h>
 #include <axl/axl-usb.h>
+#include <axl/axl-block.h>
+#include <axl/axl-nvme.h>
+#include <axl/axl-ata.h>
+#include <axl/axl-scsi.h>
+#include <axl/axl-smart.h>
+#include <axl/axl-serial.h>
+#include <axl/axl-fv.h>
+#include <axl/axl-tpm.h>
+#include <axl/axl-ramdisk.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-driver-info.h>
 #include <axl/axl-embed.h>
 #include <axl/axl-service.h>
 #include <axl/axl-shared-driver.h>
 #include <axl/axl-efi-status.h>
 #include <axl/axl-image.h>
+#include <axl/axl-shell.h>
+#include <axl/axl-console-mirror.h>
 #include <axl/axl-mem-phys.h>
 #include <axl/axl-mem-region.h>
 #include <axl/axl-watchdog.h>
@@ -88,6 +103,7 @@
 #include <axl/axl-rand.h>
 #include <axl/axl-diag.h>
 #include <axl/axl-config.h>
+#include <axl/axl-config-file.h>
 #include <axl/axl-subcommand.h>
 #include <axl/axl-args.h>
 #include <axl/axl-console.h>
@@ -170,12 +186,16 @@ void _axl_cleanup(void);
  * Not needed for SDK builds — the SDK provides axl-crt0-native.c
  * which bridges int main() to the UEFI entry point automatically.
  */
-/* Include UEFI types for AXL_APP / AXL_DRIVER macros — the
- * generated stubs need EFI_STATUS / EFIAPI / EFI_HANDLE /
- * EFI_SYSTEM_TABLE / EFI_SUCCESS / EFI_ABORTED at expansion time.
- * Consumer code that uses the macros doesn't need to reference
- * these names directly; the macro hides them. */
-#include <uefi/axl-uefi.h>
+/* The AXL_APP / AXL_DRIVER entry-point macros below emit firmware-ABI
+ * entry symbols, but express them entirely in AXL-native types
+ * (AxlEfiStatus, AxlHandle, AxlSystemTable *, AXLAPI) — all uefi-free —
+ * so the <axl.h> umbrella does NOT pull <uefi/...> and never leaks
+ * EFI_* into consumers. AxlEfiStatus is binary-compatible with
+ * EFI_STATUS and AxlHandle / AxlSystemTable * are pointer-ABI-identical
+ * to EFI_HANDLE / EFI_SYSTEM_TABLE *, so the emitted DriverEntry /
+ * _AxlEntry are byte-for-byte the firmware entry points. A consumer that
+ * genuinely needs spec UEFI types (publishing EFI_FILE_PROTOCOL, calling
+ * gBS->... directly) opts into <uefi/axl-uefi.h> explicitly. */
 
 /**
  * AXLAPI:
@@ -189,19 +209,19 @@ void _axl_cleanup(void);
  * the genuine escape-hatch case where a consumer registers a
  * firmware-called function outside the AXL helper surface.
  */
-#define AXLAPI EFIAPI
+#define AXLAPI AXL_EFI_ABI
 
 #define AXL_APP(main_func)                                            \
   int main_func(int, char **);                                        \
-  EFI_STATUS                                                          \
-  EFIAPI                                                              \
-  _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {  \
-    _axl_init(ImageHandle, SystemTable);                              \
+  AxlEfiStatus                                                        \
+  AXLAPI                                                              \
+  _AxlEntry(AxlHandle ImageHandle, AxlSystemTable *SystemTable) {     \
+    _axl_init((void *)ImageHandle, (void *)SystemTable);             \
     int _axl_argc; char **_axl_argv;                                  \
     _axl_get_args(&_axl_argc, &_axl_argv);                            \
     int _axl_rc = main_func(_axl_argc, _axl_argv);                   \
     _axl_cleanup();                                                    \
-    return (_axl_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                \
+    return (_axl_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;        \
   }
 
 /**
@@ -253,20 +273,18 @@ void _axl_cleanup(void);
   int entry_func(AxlHandle, AxlSystemTable *);                           \
   int unload_func(AxlHandle);                                            \
                                                                          \
-  static EFI_STATUS EFIAPI                                               \
-  _axl_driver_unload_stub(EFI_HANDLE _img) {                             \
-    int _rc = unload_func((AxlHandle)_img);                              \
-    return (_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                       \
+  static AxlEfiStatus AXLAPI                                             \
+  _axl_driver_unload_stub(AxlHandle _img) {                              \
+    int _rc = unload_func(_img);                                         \
+    return (_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;               \
   }                                                                      \
                                                                          \
-  EFI_STATUS EFIAPI                                                      \
-  DriverEntry(EFI_HANDLE _ImageHandle, EFI_SYSTEM_TABLE *_SystemTable) { \
-    axl_driver_init((AxlHandle)_ImageHandle,                             \
-                    (AxlSystemTable *)_SystemTable);                     \
+  AxlEfiStatus AXLAPI                                                    \
+  DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {    \
+    axl_driver_init(_ImageHandle, _SystemTable);                         \
     axl_driver_set_unload((void *)_axl_driver_unload_stub);              \
-    int _rc = entry_func((AxlHandle)_ImageHandle,                        \
-                         (AxlSystemTable *)_SystemTable);                \
-    return (_rc == 0) ? EFI_SUCCESS : EFI_ABORTED;                       \
+    int _rc = entry_func(_ImageHandle, _SystemTable);                    \
+    return (_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;               \
   }
 
 /**
@@ -317,10 +335,10 @@ void _axl_cleanup(void);
  * (publish-protocol-and-leave style). Pick one.
  */
 #define AXL_SERVICE_DRIVER(svc)                                            \
-  EFI_STATUS EFIAPI                                                        \
-  DriverEntry(EFI_HANDLE _ImageHandle, EFI_SYSTEM_TABLE *_SystemTable) {   \
-    return (EFI_STATUS)_axl_service_driver_init(                           \
-               (void *)_ImageHandle, (void *)_SystemTable, &(svc));        \
+  AxlEfiStatus AXLAPI                                                       \
+  DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {       \
+    return (AxlEfiStatus)_axl_service_driver_init(                          \
+               (void *)_ImageHandle, (void *)_SystemTable, &(svc));         \
   }
 
 /**

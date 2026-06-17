@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <axl/axl-sort.h>
 #include <axl/axl-runtime.h>
+#include "../runtime/axl-signal-internal.h"
 #include <axl/axl-str.h>
 
 #define INSERTION_THRESHOLD  16
@@ -60,7 +61,7 @@ sort_cmp(SortCtx *c, const void *a, const void *b)
     // A big sort can run long; yield occasionally so it stays Ctrl-C
     // responsive. 65536 comparisons between yields is negligible overhead.
     if ((++c->ops & 0xFFFFu) == 0) {
-        axl_yield();
+        _axl_poll_break();
     }
 
     return c->func_data != NULL

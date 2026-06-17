@@ -52,8 +52,8 @@ on_accept_complete(void *data)
        listener fields after cb — if cb returns false, it may have
        called axl_tcp_close on the listener (freeing it). */
     AxlLoop            *saved_loop       = listener->async_loop;
-    uint32_t            saved_accept_src = listener->accept_source;
-    uint32_t            saved_cancel_src = listener->accept_cancel_source;
+    AxlSourceId         saved_accept_src = listener->accept_source;
+    AxlSourceId         saved_cancel_src = listener->accept_cancel_source;
 
     axl_efi_call(listener->tcp4->Poll, 1, listener->tcp4);
 
@@ -296,8 +296,8 @@ on_recv_complete(void *data)
        axl_tcp_close on sock (freeing it). Contract for true: cb must
        NOT close sock. */
     AxlLoop        *saved_loop       = sock->async_loop;
-    uint32_t        saved_recv_src   = sock->recv_source;
-    uint32_t        saved_cancel_src = sock->recv_cancel_source;
+    AxlSourceId     saved_recv_src   = sock->recv_source;
+    AxlSourceId     saved_cancel_src = sock->recv_cancel_source;
 
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
@@ -599,6 +599,12 @@ axl_tcp_send_drop_sources(AxlTcp *sock)
     }
 }
 
+bool
+axl_tcp_send_in_flight(const AxlTcp *sock)
+{
+    return sock != NULL && sock->send_source > 0;
+}
+
 static bool
 on_send_cancel(void *data)
 {
@@ -641,8 +647,13 @@ axl_tcp_send_async(
     // assignment.
     //
     if (sock->send_source > 0) {
-        axl_error("async send: previous send still pending - cancel first");
-        return AXL_ERR;
+        /* One-send-in-flight: a prior send hasn't completed. Distinct AXL_BUSY
+           (not AXL_ERR) so a caller serializing its own sends can re-queue and
+           retry rather than treat it as a hard failure — symmetric with
+           axl_tls_write_async's floor. (All current callers test != AXL_OK, so
+           this is a strict refinement.) */
+        axl_debug("async send: previous send still pending - caller must serialize");
+        return AXL_BUSY;
     }
 
     sock->on_send    = cb;
@@ -800,14 +811,15 @@ on_connect_cancel(void *data)
 }
 
 int
-axl_tcp_connect_async_via(
-    const char            *host,
+axl_tcp_connect_addr_async(
+    const AxlIPv4Address  *dest,
     uint16_t               port,
     const AxlIPv4Address  *source_ip,
     AxlLoop               *loop,
     AxlCancellable        *cancel,
     AxlTcpCallback         cb,
-    void                  *data
+    void                  *data,
+    AxlTcp               **out_pending
     )
 {
     EFI_STATUS                    status;
@@ -821,17 +833,11 @@ axl_tcp_connect_async_via(
     AxlIPv4Address                remote_addr;
     AxlTcp                       *sock;
 
-    if (host == NULL || loop == NULL || cb == NULL) {
+    if (dest == NULL || loop == NULL || cb == NULL) {
         return AXL_ERR;
     }
 
-    //
-    // Resolve host to IP address
-    //
-    if (axl_net_resolve(host, &remote_addr) != AXL_OK) {
-        axl_error("async connect: cannot resolve '%s'", host);
-        return AXL_ERR;
-    }
+    remote_addr = *dest;
 
     //
     // Find TCP4 service binding. Auto-pick prefers an interface whose
@@ -985,7 +991,61 @@ axl_tcp_connect_async_via(
         /* Non-fatal if this fails — op runs uncancellable. */
     }
 
+    /* Hand the in-progress socket back so a sync wrapper can drive
+       tcp4->Poll() while its ephemeral loop blocks at a raised TPL. Set
+       only here, on the success path — every error return above already
+       tore the socket down. */
+    if (out_pending != NULL) {
+        *out_pending = sock;
+    }
+
     return AXL_OK;
+}
+
+int
+axl_tcp_connect_async_via_ex(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data,
+    AxlTcp               **out_pending
+    )
+{
+    AxlIPv4Address remote_addr;
+
+    if (host == NULL || loop == NULL || cb == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Resolve synchronously, then connect to the address. This is the
+       blocking shape the sync TCP wrappers want; the async HTTP client
+       avoids the nested resolve by calling axl_net_resolve_async followed
+       by axl_tcp_connect_addr_async directly. */
+    if (axl_net_resolve(host, &remote_addr) != AXL_OK) {
+        axl_error("async connect: cannot resolve '%s'", host);
+        return AXL_ERR;
+    }
+
+    return axl_tcp_connect_addr_async(&remote_addr, port, source_ip, loop,
+                                      cancel, cb, data, out_pending);
+}
+
+int
+axl_tcp_connect_async_via(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data
+    )
+{
+    return axl_tcp_connect_async_via_ex(host, port, source_ip, loop, cancel,
+                                        cb, data, NULL);
 }
 
 int

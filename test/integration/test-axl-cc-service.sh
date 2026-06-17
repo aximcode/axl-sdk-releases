@@ -72,6 +72,11 @@ test_add_efi "$DEMO_EFI"
     echo "@echo -off"
     echo "fs0:"
     echo "cd \\"
+    # Out-of-range --port (range [1,65535] declared on the config
+    # descriptor) must be rejected by the SYNTHESIZED CLI at parse time,
+    # before the service starts — proving axl_service_main propagated the
+    # descriptor's min/max into the AxlArgDesc it builds.
+    echo "service_demo.efi start --port 99999"
     echo "service_demo.efi start --detach"
     echo "reset -s"
 } | test_set_startup
@@ -100,10 +105,20 @@ if grep -qE "service-demo:.*setup: port=8080 verbose=0 name=demo" \
     opts_ok=1
 fi
 
-echo ""
-echo "Counts: setup=$setup_count FAIL=$fails round_trip_ok=$opts_ok"
+# The synthesized CLI must reject the out-of-range --port at parse time
+# (axl-args prints "... for --port exceeds max 65535") AND that run must
+# never reach setup. This proves the descriptor's min/max propagated into
+# the CLI — the positive behavior the unit test can't cover.
+range_ok=0
+if grep -qE "for --port exceeds max 65535" "$TEST_CLEAN_LOG" \
+        && ! grep -q "setup: port=99999" "$TEST_CLEAN_LOG"; then
+    range_ok=1
+fi
 
-if [[ $fails -eq 0 && $setup_count -ge 1 && $opts_ok -eq 1 ]]; then
+echo ""
+echo "Counts: setup=$setup_count FAIL=$fails round_trip_ok=$opts_ok range_ok=$range_ok"
+
+if [[ $fails -eq 0 && $setup_count -ge 1 && $opts_ok -eq 1 && $range_ok -eq 1 ]]; then
     echo "axl-cc --service test: OK"
     exit 0
 else

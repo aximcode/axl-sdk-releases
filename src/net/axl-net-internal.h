@@ -39,6 +39,30 @@ axl_net_locate_sb(
 );
 
 // ---------------------------------------------------------------------------
+// Driver-selection internals (axl-net-driver-select.c / axl-net-dhcp.c)
+// ---------------------------------------------------------------------------
+
+/// Reconnect the driver stack onto every SNP handle (per-handle
+/// ConnectController). Shared by axl_net_drivers_up (axl-net-dhcp.c) and
+/// axl_net_connect_stack (axl-net-driver-select.c).
+void
+_axl_net_connect_snp_handles(void);
+
+/// Render a NIC's bus location (PCI/USB device-path topology, with the
+/// MAC/IPv4/IPv6/VLAN network tail trimmed) into @p out. Always
+/// NUL-terminates; "" when the path has no hardware prefix or the
+/// firmware DevicePathToText protocol is unavailable. Exposed for unit
+/// testing against synthetic device paths.
+/// @return AXL_OK on success, AXL_ERR on NULL @p device_path / @p out or
+///     zero @p out_size.
+int
+_axl_net_bus_location(
+    const void *device_path,  ///< raw EFI device path
+    char       *out,          ///< [out] bus-location string
+    size_t      out_size      ///< capacity of @p out in bytes
+);
+
+// ---------------------------------------------------------------------------
 // HTTP Core — internal helpers (raw-buffer parsers are public, see
 // <axl/axl-http-core.h>; this file declares only the internal builders.)
 // ---------------------------------------------------------------------------
@@ -135,19 +159,6 @@ typedef struct {
 // AxlStatus: AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED
 // on Ctrl-C, AXL_ERR on internal failure.
 // ---------------------------------------------------------------------------
-
-/**
- * @brief Wait for a UDP4 completion event.
- *
- * @return AXL_OK on event, AXL_TIMEOUT on deadline, AXL_CANCELLED on
- *     Ctrl-C, AXL_ERR on internal failure.
- */
-AxlStatus
-_axl_udp_wait(
-    EFI_UDP4_PROTOCOL *udp4,        ///< UDP4 protocol (polled each tick)
-    EFI_EVENT          event,       ///< completion token's Event
-    uint64_t           timeout_us   ///< timeout in microseconds (0 = forever)
-);
 
 /**
  * @brief Wait for a TCP4 completion event.

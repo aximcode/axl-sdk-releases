@@ -213,5 +213,23 @@ typedef struct  _EFI_RAM_DISK_PROTOCOL {
   EFI_RAM_DISK_UNREGISTER_RAMDISK            Unregister;
 } EFI_RAM_DISK_PROTOCOL;
 
+typedef struct _EFI_BLOCK_IO_MEDIA {
+  UINT32                    MediaId;
+  BOOLEAN                   RemovableMedia;
+  BOOLEAN                   MediaPresent;
+  BOOLEAN                   LogicalPartition;
+  BOOLEAN                   ReadOnly;
+  BOOLEAN                   WriteCaching;
+  UINT32                    BlockSize;
+  UINT32                    IoAlign;
+  EFI_LBA                   LastBlock;
+
+   EFI_LBA                 LowestAlignedLba; //added in Revision 2
+   UINT32                  LogicalBlocksPerPhysicalBlock;
+//added in Revision 2
+UINT32 OptimalTransferLengthGranularity;
+// added in Revision 3
+} EFI_BLOCK_IO_MEDIA;
+
 
 #endif /* AXL_UEFI_GEN_MEDIA_H */

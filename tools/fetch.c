@@ -130,6 +130,19 @@ run_fetch(AxlArgs *a)
 {
     const char *url = axl_args_get_string(a, "url");
 
+    /* Enable TLS so https works — directly or via an http->https redirect.
+       axl_tls_init() both pulls mbedTLS in (the client's TLS path is otherwise
+       strippable — see axl-http-client-tls.h) and registers the client's TLS
+       ops. fetch references it unconditionally, so its binary always links
+       mbedTLS; the call is gated only on its RESULT being fatal: a plain-http
+       fetch in a non-TLS build (init fails) must still run, so we bail only
+       when this URL is already https. */
+    if (axl_tls_init() != AXL_OK
+        && url != NULL && axl_strncmp(url, "https://", 8) == 0) {
+        axl_printf("Fetch: https unavailable (build with AXL_TLS=1).\n");
+        return 1;
+    }
+
     /* Auto-load NIC drivers + DHCP so Fetch works from a bare UEFI
        shell. Static IPv4 setup is the firmware ifconfig layer's job
        (UEFI Shell `ifconfig` or axl_net_set_static_ip), not a

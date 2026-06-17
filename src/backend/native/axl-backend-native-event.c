@@ -307,6 +307,26 @@ axl_backend_event_set_timer(
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
+/* Spin cadence for the raised-TPL CheckEvent fallback in event_wait.
+   Short enough to keep latency low for an event the firmware signals
+   directly (a network tx/rx completion), while still yielding the CPU
+   between passes. */
+#define EVENT_WAIT_RAISED_TPL_SPIN_US  200ULL
+
+bool
+axl_backend_at_raised_tpl(void)
+{
+    /* Canonical read-current-TPL idiom: raise to the ceiling (always legal
+       from any TPL) and immediately restore — RaiseTPL returns the entry
+       level. gBS->WaitForEvent returns EFI_UNSUPPORTED above
+       TPL_APPLICATION, so event_wait uses this to pick its CheckEvent
+       fallback, and the sync TCP wrappers use it to install a Poll() tick
+       only when one is actually needed. */
+    EFI_TPL tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
+    gBS->RestoreTPL(tpl);
+    return tpl > TPL_APPLICATION;
+}
+
 int
 axl_backend_event_wait(
     size_t          count,
@@ -316,6 +336,33 @@ axl_backend_event_wait(
 {
     EFI_STATUS  status;
     UINTN       index;
+
+    /* gBS->WaitForEvent is unavailable above TPL_APPLICATION (it returns
+       EFI_UNSUPPORTED) — the case for any nested wait reached from a
+       driver-pump notify dispatched at TPL_CALLBACK. A caller looping on a
+       plain AXL_ERR there would spin forever and hard-wedge. Fall back to a
+       non-blocking CheckEvent sweep with a brief Stall between passes:
+       timer/tick events still signal (the timer DPC runs at TPL_HIGH_LEVEL,
+       preempting the spin), so a waiter's protocol-Poll() tick keeps
+       advancing and the awaited completion still lands. At
+       TPL_APPLICATION the code below runs a plain WaitForEvent. */
+    if (axl_backend_at_raised_tpl()) {
+        for (;;) {
+            for (size_t i = 0; i < count; i++) {
+                int rc = axl_backend_event_check(events[i]);
+                if (rc == 0) {
+                    *fired_index = i;
+                    return AXL_OK;
+                }
+                /* CheckEvent error (bad/closed handle) — mirror WaitForEvent,
+                   which aborts on a bad event in the set rather than looping. */
+                if (rc < 0) {
+                    return AXL_ERR;
+                }
+            }
+            axl_backend_stall(EVENT_WAIT_RAISED_TPL_SPIN_US);
+        }
+    }
 
     status = gBS->WaitForEvent((UINTN)count, (EFI_EVENT *)events, &index);
     if (EFI_ERROR(status)) {

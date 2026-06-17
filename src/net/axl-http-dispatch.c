@@ -192,6 +192,39 @@ axl_http_server_cache_invalidate(AxlHttpServer *s, const char *prefix)
 }
 
 // ---------------------------------------------------------------------------
+// Route authentication
+// ---------------------------------------------------------------------------
+
+/*
+ * Apply a route's auth_flags against the server auth callback. Shared
+ * by the normal dispatch path and the streaming-upload path (uploads
+ * never reach dispatch_request, so they call this directly before the
+ * first body byte). Returns 0 when authorized, else the HTTP error
+ * status to send: 401 when authentication is required but missing or
+ * fails, 403 when an admin route is presented a lesser role.
+ */
+size_t
+http_check_route_auth(AxlHttpServer *s, uint32_t auth_flags,
+                      AxlHttpRequest *req)
+{
+    if (auth_flags == AXL_ROUTE_NO_AUTH) {
+        return 0;
+    }
+    if (s->auth_cb == NULL) {
+        return 401;
+    }
+    AxlAuthInfo auth_info;
+    axl_memset(&auth_info, 0, sizeof(auth_info));
+    if (s->auth_cb(req, &auth_info, s->auth_data) != 0) {
+        return 401;
+    }
+    if ((auth_flags & AXL_ROUTE_ADMIN) && auth_info.role < AXL_ROUTE_ADMIN) {
+        return 403;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatch
 // ---------------------------------------------------------------------------
 
@@ -309,22 +342,10 @@ dispatch_request(
     //
     // Authentication check
     //
-    if (route->auth_flags != AXL_ROUTE_NO_AUTH) {
-        if (s->auth_cb == NULL) {
-            send_error_response(conn, 401);
-            return;
-        }
-        AxlAuthInfo auth_info;
-        axl_memset(&auth_info, 0, sizeof(auth_info));
-        if (s->auth_cb(&req, &auth_info, s->auth_data) != 0) {
-            send_error_response(conn, 401);
-            return;
-        }
-        if ((route->auth_flags & AXL_ROUTE_ADMIN) &&
-            auth_info.role < AXL_ROUTE_ADMIN) {
-            send_error_response(conn, 403);
-            return;
-        }
+    size_t auth_status = http_check_route_auth(s, route->auth_flags, &req);
+    if (auth_status != 0) {
+        send_error_response(conn, auth_status);
+        return;
     }
 
     //

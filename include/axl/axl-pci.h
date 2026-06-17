@@ -208,6 +208,11 @@ typedef enum {
     AXL_PCI_HEADER_TYPE_CARDBUS = 0x02,  ///< Type 2: CardBus bridge
 } AxlPciHeaderType;
 
+/// PCI base-class code for network controllers (the high byte of the
+/// 24-bit class). A function whose `base_class` is this is a NIC / network
+/// device; consumers (netcfg, netinfo) match on it instead of a literal.
+#define AXL_PCI_CLASS_NETWORK  0x02
+
 /**
  * @brief Read the configuration-space header type and multi-function bit.
  *

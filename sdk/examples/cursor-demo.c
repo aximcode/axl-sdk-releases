@@ -120,7 +120,7 @@ main(int argc, char *argv[])
     axl_cursor_show(d.cur);
 
     AxlLoop *loop = axl_loop_new();
-    uint32_t mid = axl_cursor_attach(d.cur, loop, on_input, &d);
+    AxlSourceId mid = axl_cursor_attach(d.cur, loop, on_input, &d);
     axl_printf("cursor-demo: attach mouse %s; %dx%d framebuffer.\n",
                mid ? "OK" : "skipped", (int)d.w, (int)d.h);
     axl_loop_add_key_press(loop, on_key, loop);

@@ -102,7 +102,9 @@ axl_defer_drain_internal(AxlLoop *loop)
         }
 
         if (!entry.cancelled && entry.fn != NULL) {
+            _axl_loop_cb_enter();
             entry.fn(entry.data);
+            _axl_loop_cb_leave();
         }
     }
 }

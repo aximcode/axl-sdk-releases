@@ -3,6 +3,769 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.0.0 — 2026-06-16
+
+### Added
+
+- **Storage health — AxlAta, AxlScsi, and the AxlSmart rollup**
+  (`<axl/axl-ata.h>`, `<axl/axl-scsi.h>`, `<axl/axl-smart.h>`): Phases 2-4 of
+  the storage-access family AxlNvme opened (`docs/AXL-Storage-Design.md`),
+  completing `smartctl`-for-UEFI across every transport. **AxlAta** reads
+  ATA/SATA identity + health over `EFI_ATA_PASS_THRU_PROTOCOL`: enumerate
+  devices (`axl_ata_next`), `axl_ata_identify`, `axl_ata_smart` (the pass/fail
+  verdict, temperature, power-on hours, reallocated sectors), the off-line
+  `axl_ata_self_test_start` / `_result`, and a raw `axl_ata_passthru`.
+  **AxlScsi** does the same over `EFI_EXT_SCSI_PASS_THRU_PROTOCOL`
+  (`axl_scsi_inquiry`, `axl_scsi_read_capacity`, `axl_scsi_health`, raw
+  `axl_scsi_passthru`). **AxlSmart** is the synthesis: `axl_storage_next` walks
+  NVMe controllers, then ATA/SATA, then SCSI back-to-back, and `axl_smart_health`
+  reports each as one normalized `AxlSmartHealth` (`axl_storage_get_location`
+  gives a stable per-transport key). Each typed reader delegates to pure
+  decoders (`axl_ata_decode_*` / `axl_scsi_decode_*` / `axl_smart_from_*`),
+  unit-tested against spec-faithful buffers with no device; absent fields carry
+  documented sentinels, never guesses. Read-and-health only. The `smart` tool is
+  a thin renderer over it.
+
+- **Driver / device / protocol discovery** (`<axl/axl-driver-info.h>`) — the
+  UEFI Shell `drivers` / `devices` / `dh` / `devtree` views as a read-only API,
+  the companion to lifecycle-authoring `<axl/axl-driver.h>`. Answers the
+  recurring "the NIC driver is on the box but unbound and I can't find it"
+  question. `axl_driver_list_loaded` enumerates loaded DriverBinding drivers;
+  `axl_handle_name` / `axl_protocol_guid_name` / `axl_net_protocol_name` name
+  handles + protocol GUIDs; `axl_pci_to_handle` + `axl_pci_driver_bound` map a
+  PCI function to its controller and report what manages it; `axl_driver_bind`
+  does a targeted ConnectController; and `axl_handle_list` / `_protocols` /
+  `_drivers` / `_children` / `_parents` are the handle/protocol enumeration
+  behind a Devices tab + parent/child devtree walk. One fixed-buffer truncation
+  contract (NULL to count; `count > cap` signals truncation). No EDK2 types in
+  the API.
+
+- **AxlConsoleMirror — real-Shell remote console** (`<axl/axl-console-mirror.h>`)
+  — wrap the firmware console (`gST->ConIn`/`ConOut`/`StdErr`) so a loop-owning
+  app can host the real UEFI Shell (or any console app) mirrored to + driven
+  from a remote terminal, including full-screen apps like `edit`.
+  `axl_console_mirror_install` swaps in wrappers that emit console output as a
+  terminal byte stream (UTF-8 + ANSI/VT) to a caller sink and push injected
+  input into the key queue; `axl_console_mirror_inject_key` / `_inject_text`
+  (the latter decodes xterm/VT escapes into UEFI keys), `_set_size`, `_reset`.
+  The physical console keeps working in parallel; the mirror creates no pump
+  (drive the loop in the background while the foreground app blocks). The
+  reusable firmware surgery — the sink-to-WebSocket bridge + RBAC are the
+  consumer's.
+
+- **AxlShell + generic foreground launch** (`<axl/axl-shell.h>`,
+  `<axl/axl-image.h>`) — `axl_image_run(path, args, &exit_code)` runs any
+  blocking UEFI app in the foreground and returns its exit code;
+  `axl_shell_launch(&exit_code)` is the Shell-specific policy over it (locate
+  `Shell.efi` across the conventional paths, run with `-nostartup` so a child
+  Shell from `startup.nsh` doesn't recurse). Pairs with AxlConsoleMirror to put
+  the real Shell behind a remote terminal.
+
+- **`axl_net_ping_ex` — TTL / Don't-Fragment ICMP probes** (`<axl/axl-net.h>`) —
+  one ICMP echo with explicit `ttl`, `dont_fragment`, and `payload_len`,
+  returning an `AxlPingResult` that classifies the reply (echo-reply /
+  time-exceeded / unreachable / frag-needed / no-reply), the responding hop, the
+  RTT, and a next-hop MTU. The building block for traceroute (increment TTL) and
+  path-MTU discovery (DF + large payload). The multi-hop / MTU reply types need
+  a real router, so they appear only on hardware.
+
+- **Network diagnostics — SNTP, ARP cache, link stats** (`<axl/axl-net.h>`) —
+  `axl_sntp_query` gets the time from an SNTP/NTP server over UDP (RFC 4330,
+  Unix seconds + local-RTC offset); `axl_net_arp_list` reads the firmware IPv4
+  neighbor cache (`arp -a`); `axl_net_get_link_stats` reports a NIC's media/link
+  state from SimpleNetwork (`link_up` authoritative; speed/duplex best-effort).
+
+- **`axl_net_resolve_ptr` — reverse DNS** (`<axl/axl-net.h>`) — the reverse of
+  `axl_net_resolve`: the `in-addr.arpa` PTR lookup for an IPv4 over DNS4. "No
+  PTR record" is a normal negative (`AXL_ERR`), matching the forward direction.
+
+- **`axl_net_get_dhcp_lease` — the active DHCP lease view** (`<axl/axl-net.h>`)
+  — read a NIC's live IP4Config2 config (address, mask, gateway, resolvers) into
+  an `AxlDhcpLease`. A purely local synchronous read with no round-trip, and it
+  persists across app exits (IP4Config2 is a resident DXE driver). A static-policy
+  or unleased NIC returns `AXL_ERR`. Lease lifetimes / granting server / domain
+  option are out of scope (IP4Config2 discards them on apply).
+
+- **Static-IP / DNS / hostname config layer** (`<axl/axl-net.h>`) — the ifconfig
+  policy group for an on-box network UI: `axl_net_set_dns` programs the
+  IP4Config2 resolver list (works on static + DHCP NICs); `axl_net_set_hostname`
+  / `axl_net_get_hostname` persist a hostname to an AXL non-volatile variable
+  (UEFI has no firmware hostname — this is the single source of truth an on-box
+  UI shares); and `axl_net_wait_ip_settled` polls IP4Config2 until an address
+  change actually takes (the diagnostic-correct replacement for a blind sleep,
+  with a strong "equals these octets" check that closes the read-back-old-IP
+  race).
+
+- **NIC driver-selection substrate** (`<axl/axl-net.h>`) — the "my NIC needs a
+  different driver" toolkit. `axl_net_get_driver_info` resolves, by MAC, which
+  driver image is bound to a NIC, at which layer (NII3.1 / NII / SNP), and the
+  NIC's stable PCI/USB location. `axl_net_list_available_drivers` enumerates the
+  NIC drivers staged under `drivers/<arch>/` on every mounted volume.
+  `axl_net_try_driver` loads + starts one driver, connects the stack, and
+  reports the MACs that newly came up — rolling the image back out on failure so
+  the next candidate starts clean (try iPXE last). `axl_net_connect_stack`
+  exposes the global ConnectController + per-SNP reconnect (for ARM64 firmware
+  that doesn't auto-connect).
+
+- **WebSocket per-connection API** (`<axl/axl-http-server.h>`) —
+  `axl_http_server_add_websocket_ex` registers an endpoint with the richer
+  `AxlWsConnHandler`, which receives the `AxlWsConn` each event is for: per-client
+  reply (`axl_ws_send`), identity captured at upgrade (`axl_ws_conn_auth`), peer
+  address (`axl_ws_conn_peer`), per-connection state (`axl_ws_conn_set_user_data`
+  / `_user_data`), explicit `axl_ws_conn_close`. `AXL_WS_CONNECT` fires after the
+  101 (a greeting is valid) and may reject the upgrade (return `AXL_ERR`); the
+  upgrade is gated by the route's auth flags. Replaces the broadcast-only
+  `AxlWsHandler` when a consumer must address individual clients.
+
+- **Serial byte I/O** (`<axl/axl-serial.h>`) — the read/write peer of the serial
+  *enumeration*: `axl_serial_open`, `axl_serial_set_mode` (baud / framing /
+  timeout), `axl_serial_write` / `axl_serial_read` (read is non-blocking; "no
+  bytes" is not an error), `axl_serial_read_async` (a loop-integrated polling
+  receive delivering bytes to a callback), `axl_serial_close`. The first time
+  AXL moves bytes over a serial port (the enumeration readers stay
+  descriptor-only).
+
+- **`AxlStatus` gains richer, mappable failure codes + EFI translators**
+  (`<axl/axl-macros.h>`, `<axl/axl-efi-status.h>`) — `AXL_INVALID`,
+  `AXL_NOT_FOUND`, `AXL_DENIED`, `AXL_UNSUPPORTED`, `AXL_NO_RESOURCES`,
+  `AXL_IO_ERROR` (−4..−9) give a blessed vocabulary for consumers that need to
+  distinguish or translate outcomes (e.g. a status→HTTP map) without coupling to
+  `EFI_*`. Additive: `AXL_ERR` remains the generic catch-all and any negative is
+  still failure. Two `static inline` translators ship alongside —
+  `axl_status_to_efi` / `axl_status_from_efi` — for a driver/protocol boundary
+  returning or consuming an `EFI_STATUS`; both are lossy by design (the enums are
+  deliberately not numerically aligned, so the generic bucket doesn't
+  round-trip).
+
+- **SMBIOS Type 17 exposes form factor, widths, and rank**
+  (`<axl/axl-smbios.h>`) — the memory-device record gains `form_factor` (e.g.
+  9 = DIMM, 0x0D = SODIMM), `total_width` (data + ECC bits), `data_width` (data
+  bits), and `rank`. The 0xFFFF "unknown" width is normalized to 0. Additive —
+  existing fields unchanged.
+
+- **Virtual pointer + scroll-wheel injection** (`<axl/axl-input.h>`) —
+  `axl_virtual_pointer_install(&vp, cfg)` publishes a synthetic
+  `EFI_ABSOLUTE_POINTER_PROTOCOL` (and, with `cfg.also_simple`, a relative
+  `EFI_SIMPLE_POINTER_PROTOCOL`) the caller drives:
+  `axl_virtual_pointer_inject(vp, x, y, buttons)` reports absolute motion +
+  buttons (clamped to the configured range, default = the active GOP resolution
+  so an RFB/VNC client maps 1:1), `axl_virtual_pointer_scroll(vp, dy)` injects
+  vertical wheel notches (needs `also_simple`), `axl_virtual_pointer_uninstall`
+  restores the console. Singleton. Lets a headless remote-KVM consumer drive the
+  firmware Setup browser with a mouse.
+
+- **`axl_tcp_connect_timeout` — bounded connect-phase wait** (`<axl/axl-tcp.h>`)
+  — the timeout-aware form of `axl_tcp_connect_via`: bound the SYN/handshake with
+  an explicit `connect_timeout_ms` instead of the fixed ~10 s, so an unreachable
+  host doesn't stall the loop for ten seconds. The timeout is an AXL-side
+  deadline that fires on the loop and cancels the connect; `axl_tcp_connect` /
+  `_via` are this call with `connect_timeout_ms == 0` (the 10 s default). The
+  HTTP client's connect phase uses it too.
+
+### Changed
+
+- **`<axl.h>` is now uefi-free — `AXL_APP` / `AXL_DRIVER` / `AXL_SERVICE_DRIVER`
+  emit AXL-native entry points.** The umbrella previously pulled
+  `<uefi/axl-uefi.h>`, leaking `EFI_STATUS` / `EFI_*` into every consumer — only
+  because the entry-point macros expanded to EFI types. They are rewritten in
+  AXL-native types (`AxlEfiStatus`, `AxlHandle`, `AxlSystemTable *`, `AXLAPI`),
+  all binary/ABI-compatible with their EFI peers, so the emitted firmware entry
+  symbols are byte-for-byte identical and nothing about loading or booting
+  changes. **Consumer note:** an app `main` body that referenced the EFI types
+  the umbrella used to leak must now include `<uefi/axl-uefi.h>` itself — the
+  public API never exposed them; the incidental leak just let some code compile
+  without the include.
+
+### Fixed
+
+- **A WebSocket broadcast burst over TLS no longer desyncs the stream.**
+  `axl_tls_write_async` ran `mbedtls_ssl_write` (which advances the TLS sequence
+  number) before the one-send-in-flight `axl_tcp_send_async`, so a second
+  back-to-back broadcast was encrypted then dropped — leaving the TLS state ahead
+  of the bytes on the wire and wedging the connection (deterministic on a single
+  console keystroke fanning out to ≥3 broadcasts). `axl_tls_write_async` now
+  returns `AXL_BUSY` before encrypting if a send is in flight, and a
+  per-connection outbound FIFO serializes all outbound WS frames (broadcast /
+  `ws_send` / PONG), enqueuing pre-encryption so a drop-on-overflow can't desync.
+
+- **A WebSocket teardown no longer wedges a driver-tick loop.** The WS frame
+  handlers did *synchronous* sends (the `WS_OP_CLOSE` echo, a PONG, an
+  `axl_ws_conn_close`), each spinning a nested ephemeral `AxlLoop` that can't
+  progress at the raised TPL of an `axl_loop_attach_driver` tick — an infinite
+  spin. PONGs now send asynchronously and the redundant CLOSE echo is dropped
+  (the TCP FIN conveys the close).
+
+- **Inbound WebSocket frames are no longer dropped over TLS, and `AXL_WS_CONNECT`
+  fires after the 101.** A WS upgrade over HTTPS could swallow the client's
+  frames, and the connect event fired before the 101 was sent (so a greeting
+  from it was lost). The TLS path now delivers inbound frames and defers CONNECT
+  until the 101 is on the wire (with CONNECT/DISCONNECT correctly paired on the
+  deferred-connect / failed-101 paths).
+
+- **The WebSocket 101 handshake now sends `Connection: Upgrade`** (RFC 6455).
+  The upgrade response omitted the header, which strict clients and proxies
+  require to complete the switch.
+
+- **AxlAta no longer drops every directly-attached SATA device.** The ATA
+  enumeration skipped devices on a controller port directly (the common
+  non-port-multiplier case), so `axl_ata_next` returned nothing on ordinary SATA
+  disks.
+
+### Changed
+
+- **The sync UDP API (`axl_udp_send`, `axl_udp_sendrecv`) now wraps the async
+  cores** (`axl_udp_send_async` / `axl_udp_recv_async`) on a private event loop,
+  for the same one-I/O-implementation consistency as the HTTP/TCP sync paths —
+  removing the duplicate transmit-token building and fragment-gathering. A
+  raised-TPL Poll tick drives the socket while the loop blocks (the standalone
+  `_axl_udp_wait` helper this replaced is deleted). Behavior is preserved
+  (datagram truncation to the caller's buffer, timeouts); one refinement: a sync
+  send now respects the socket's one-send-in-flight state.
+
+- **The sync HTTP client (`axl_http_get/post/put/delete/request`) now wraps the
+  async core** (one HTTP I/O implementation): each spins a private event loop,
+  runs `axl_http_*_async`, and harvests the response, instead of the old
+  standalone blocking `do_request`. Behavior is preserved (redirects, chunked
+  vs Content-Length, keep-alive, stale-connection retry, source.ip pinning) and
+  the sync calls still progress at a raised TPL (a Poll tick drives the client's
+  socket while the ephemeral loop blocks). The streaming variant
+  (`axl_http_request_streaming` / `_stream_file`) keeps its own I/O — there is
+  no async streaming peer. One **behavior refinement**: `timeout.ms` is now an
+  **idle/per-phase** bound (re-armed on progress: connect, handshake, send, each
+  recv) rather than a whole-operation ceiling — this preserves the old per-op
+  semantics so a slow-but-steadily-progressing large transfer no longer trips a
+  fixed deadline. Both the sync streaming path and the async core now share one
+  overflow-safe request-header builder, which also **retired a latent
+  stack-overflow** in the old `do_request` builder (the unsafe `len +=
+  axl_snprintf(buf + len, cap - len, ...)` idiom on a 2 KB stack buffer; same
+  class as the heap overflow the async builder fixed). No public API change.
+
+### Fixed
+
+- **HTTPS now works when the server is driven by a resident event loop**
+  (an AxlService / DXE driver-tick loop via `axl_loop_attach_driver`),
+  not only a top-level `axl_loop_run`. The TLS server handshake was
+  synchronous — it read with `axl_tcp_recv` and sent the close_notify
+  (`axl_tls_free`) with `axl_tcp_send`, each of which spins a nested
+  ephemeral `AxlLoop`. A nested loop cannot make progress at the raised
+  TPL of a driver-tick dispatch, so the handshake never produced a
+  ServerHello (curl hung, exit 28); and the ephemeral loop's source ids
+  collided with the outer loop's, silently killing the listener's accept
+  source after the first connection (the `adbf5461` hazard, re-exposed at
+  close). The accept callback now drives the handshake asynchronously on
+  the server's own loop via the new `axl_tls_handshake_async` (recv staged
+  + handshake output sent async), and `axl_tls_free` no longer performs a
+  blocking close_notify send (the advisory shutdown alert is generated but
+  not transmitted — HTTP framing plus the TCP FIN convey the close). Plain
+  HTTP was unaffected. Regression: `test-https-driver-qemu.sh` (AxlTestNet
+  `serve-tls-driver` — HTTPS under `axl_loop_attach_driver`); the
+  `axl_loop_run` path (`test-https.sh`) and the shared-loop multi-server
+  case (`test-http-multi-qemu.sh`) still pass. Reported by the axl-webfs
+  `serve --tls` resident driver.
+
+- **HTTP bodies larger than one TLS record (16 KiB) now transfer over
+  HTTPS instead of dropping the connection.** Three distinct bugs each
+  truncated or dropped any body that spanned more than one TLS record
+  (curl `rc=52`), in both directions and both transfer encodings:
+  (1) **request read** — TLS ciphertext was decrypted in place in the
+  same buffer that held the plaintext, so when one TCP read carried the
+  tail of one record plus the start of the next, decrypting the first
+  record's plaintext clobbered the next record's not-yet-consumed
+  ciphertext; reads now stage ciphertext in a dedicated buffer kept
+  separate from every plaintext buffer. (2) **response write** —
+  `axl_tls_write` / `axl_tls_write_async` issued a single
+  `mbedtls_ssl_write`, which emits at most one record, so a response
+  body over 16 KiB failed; the write now loops over records (the async
+  path accumulates them into one send). (3) **chunked decoding** — a
+  chunk whose data exceeded one receive buffer had its continuation
+  misparsed as a new chunk size-line; the decoder now carries the
+  in-progress chunk's remaining data length and trailing-CRLF state
+  across receives. Reported by the SoftBMC port (VirtualMedia image
+  uploads over HTTPS). Extends the single-segment fix in the previous
+  release.
+
+- **TLS upload no longer deadlocks when a TCP segment carries multiple
+  records.** A streaming-upload `PUT` over HTTPS with both
+  `Transfer-Encoding: chunked` and `Expect: 100-continue` (what `curl -T -`
+  sends by default) hung the client (curl rc=28). `on_conn_data` decrypted
+  exactly one TLS record per TCP read, then re-armed a transport recv — but
+  a single segment can carry several records (a chunked body's data chunk +
+  its `0\r\n\r\n` terminator), so the buffered terminator was never drained
+  and the server waited forever on bytes that had already arrived.
+  `axl_tls_read`-based reads now drain every buffered record (new
+  `axl_tls_pending`) before idling on the transport: the connection
+  receive loop iterates over all records a segment yields and owns a single
+  re-arm once the TLS buffer empties. As a side effect a TLS record split
+  across TCP reads is now reassembled rather than dropping the connection.
+  Plain HTTP was unaffected (one read = one segment) and is unchanged.
+  Reported by the SoftBMC port (`/dav` over HTTPS).
+
+- **Empty-body responses now carry `Content-Length: 0` on keep-alive
+  connections.** A response with no body but a body-permitting status —
+  notably `201 Created` from WebDAV `PUT`/`MKCOL`/`MOVE`/`COPY`, and an
+  empty `200` from `OPTIONS` — was sent with neither `Content-Length`
+  nor `Transfer-Encoding`, so a keep-alive client (davfs2, Finder,
+  Explorer, rclone) blocked waiting for a body that never arrived. It
+  only worked under `Connection: close` (EOF-delimited). `send_response`
+  now emits `Content-Length: 0` for any body-less, non-streaming
+  response whose status permits a body (everything except 1xx / 204 /
+  304), skipping it when the handler already set its own `Content-Length`
+  (a HEAD reports the entity length with an empty body — the two must
+  not collide). Reported by the SoftBMC port (`/dav` over keep-alive
+  HTTPS).
+
+- **A WebDAV PUT to a read-only mount now returns 405, not 500.** The
+  upload framework forced 500 on any chunk-handler abort, ignoring a
+  status the handler had set — so a PUT *with a body* to a mount whose
+  `write_open` is NULL got 500 while an empty-body PUT correctly got
+  405. The chunk-abort path now preserves a handler-set status (default
+  500 only if untouched), matching the clean-EOF path, and the WebDAV
+  PUT handler sets 405 for a NULL `write_open`.
+
+- **Multiple `axl_http_server` instances on one `AxlLoop` now each
+  dispatch.** A second server on a shared loop (e.g. a plain HTTP:80
+  redirect alongside a TLS HTTPS:443 server) would bind and accept TCP
+  but never produce a response once the first (TLS) server had handled a
+  connection. Root cause: the synchronous `axl_tcp_recv` used by the TLS
+  handshake registers its cancel source on an ephemeral loop; on the
+  completion path the sock kept that stale source id after the ephemeral
+  loop was freed, and a later `axl_tcp_close` removed the id from the
+  sock's (now restored to the shared) loop — deleting whatever source
+  shared that id, which was the second server's accept source. The sync
+  `axl_tcp_recv` / `axl_tcp_send` wrappers now clear the per-op source
+  ids after the ephemeral loop is freed (mirroring the accept/connect
+  wrappers). Reported by the SoftBMC port (HTTPS + HTTP-redirect).
+
+### Added
+
+- **Async HTTP client — `axl_http_get_async` / `axl_http_post_async`**
+  (`<axl/axl-http-client.h>`): the loop-integrated peers of the sync
+  `axl_http_get` / `axl_http_post`. The whole request (DNS resolve, TCP
+  connect, TLS handshake, send, receive, redirects) runs as events on a
+  caller-supplied `AxlLoop` with **no nested ephemeral loop**, so it is safe
+  to issue from inside a loop callback or a resident driver-pump tick at
+  raised TPL (`axl_loop_attach_driver`) — where the sync calls nest a loop
+  and trip the synchronous-wait re-entrancy warning. Contract: returns
+  `AXL_OK` ⇒ the callback fires later (never re-entrantly); `AXL_BUSY` if a
+  request is already in flight on the client (one in flight per client —
+  separate clients for concurrency); any other error ⇒ the callback does not
+  fire. The callback owns the response (non-2xx is success with a response);
+  `cb == NULL` is fire-and-forget. The body is borrowed until the callback
+  fires. https requires `axl_tls_init()`. Internally this is now the single
+  HTTP I/O implementation that the sync API will wrap (Option A) in a
+  follow-up. TLS is reached only through the strippable ops vtable, so a
+  plain-HTTP consumer still strips mbedTLS. Peer of the new
+  `axl_net_resolve_async` (the sync `axl_net_resolve` already wraps it).
+  Driven by `test-http-async-qemu.sh` (GET + POST, http + https, issued from
+  a raised-TPL driver tick, asserting zero re-entrancy warnings). Implements
+  Items 2–3 of `docs/AXL-Loop-Reentrancy-Plan.md`; tracker in
+  `docs/AXL-Async-HTTP-Plan.md`.
+
+- **`AXL_DEBUG_ASSERT` — debug-build invariant guards** (`<axl/axl-debug.h>`).
+  `AXL_DEBUG_ASSERT(expr)` / `AXL_DEBUG_ASSERT_MSG(expr, msg)` enforce an
+  internal invariant: loud, grep-able log (`AXL_DEBUG_ASSERT FAILED: …`)
+  plus a `_axl_debug_assert_count()` test hook on violation, compiled out
+  to `((void)0)` under `NDEBUG` (release). Catches a concurrency/lifecycle
+  fault at its cause in a debug or test build instead of as a downstream
+  symptom. Used internally to guard the TLS write-ordering invariant
+  (no seqno advance while a TCP send is in flight). See
+  `docs/AXL-Concurrency.md` § "Testing the model".
+
+- **AxlNvme — NVMe identity + SMART/health** (`<axl/axl-nvme.h>`): a
+  Platform Access module over `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL` (the
+  `smartctl`-for-NVMe the SDK lacked). Enumerate controllers
+  (`axl_nvme_next`) and namespaces, Identify Controller/Namespace, the
+  decoded SMART/Health log (`axl_nvme_smart` — healthy, temperature,
+  endurance used, power-on hours, data units, media errors), Device
+  Self-test (start + poll), and a raw admin pass-thru escape hatch that
+  exposes the NVMe Status Field. Read-and-health only: no destructive
+  typed command (Format/Sanitize/firmware-download stay raw-only). The
+  typed readers delegate to pure public decoders (`axl_nvme_decode_*`),
+  unit-tested against spec-faithful buffers with no device; the device
+  path is covered by `test-nvme-qemu.sh` (`-device nvme`). `tools/nvme`
+  is the dogfood renderer; `tools/mkfixture` now captures NVMe Identify
+  through this module. First of the storage-access family
+  (NVMe/ATA/SCSI + a normalized health rollup) in
+  `docs/AXL-Storage-Design.md`.
+
+- **JOSE — JWS / JWT / JWK** (`<axl/axl-jose.h>`, requires `AXL_TLS=1`):
+  signed-token verification and signing for API-token auth, OIDC/identity,
+  and signed configuration, built on AxlCrypto. JWS Compact sign + verify
+  (`axl_jws_sign` / `axl_jws_verify`), JWT registered-claim validation with
+  a caller-supplied clock (`axl_jwt_verify` — `exp`/`nbf` with leeway,
+  `iss`, `aud` string-or-array), and JWK / JWK-Set parse, `kid` lookup, and
+  public export (`axl_jwk_parse` / `axl_jwks_parse` / `axl_jwks_find` /
+  `axl_jwk_export_public`). Algorithms: ES256, ES384, RS256, PS256, HS256
+  (JWE is reserved for a later pull). Security model is allow-list-driven,
+  never header-`alg`-driven: verification takes a mandatory allow-list,
+  `none` is unrepresentable, the HMAC secret and public key are separate
+  key fields, and a symmetric+asymmetric allow-list is rejected — so the
+  RS256↔HS256 confusion is structurally impossible. The padding scheme is
+  bound to the allow-listed `alg`, so a PS256 (RSA-PSS) token never verifies
+  under RS256 (PKCS#1 v1.5) and vice versa. JWK import pins the EC curve
+  (P-256 / P-384, rejecting off-curve points) and a 2048-bit RSA floor.
+  Verified against the RFC 7515 A.1 (HS256) and A.3 (ES256) known-answer
+  vectors plus independently cross-checked ES384/PS256 vectors,
+  sign/verify round-trips, a rejection matrix, and JWK round-trips
+  (`test-jose-qemu.sh`, AXL_TLS=1; the unit suite covers the fail-closed
+  branch on both arches). `sdk/examples/jose-demo.c` dogfoods the full
+  lifecycle through the SDK consumer path (`test-jose-cc-qemu.sh`). Without
+  `AXL_TLS=1`, `axl_jose_available()` returns false and every call fails
+  closed.
+
+- **`axl_pk_keygen` / `axl_pk_key_sign` / `axl_pk_key_verify` gain
+  ECDSA P-384** (`<axl/axl-crypto.h>`, `AXL_PK_ECDSA_P384`, `AXL_TLS=1`):
+  the ECDSA hash follows the curve (P-256 → SHA-256, P-384 → SHA-384) and
+  the `AXL_PK_SIG_RAW` signature is r‖s = 96 bytes for P-384. Underpins
+  JOSE ES384.
+
+- **`axl_json_value_string`** (`<axl/axl-json.h>`) — read a JSON reader's
+  own value as a string (no key lookup), for a sub-reader returned by
+  `axl_json_array_next`. The only way to read a bare-string array element,
+  such as a member of a JWT `aud` array.
+
+- **`AxlConfigDesc` gains `.min` / `.max` numeric range metadata**
+  (`<axl/axl-config.h>`) — trailing `int64_t` bounds (0 = none, like
+  `AxlArgDesc`) that `axl_service_main` propagates into the CLI it
+  synthesizes from the descriptor table, so the flag validates its range
+  (and a settings-UI builder can size a spinner). Synthesis-only, like
+  `.short_name` / `.choices`: `AxlConfig` parsing ignores them (no
+  clamping on set). Additive — existing descriptor tables are
+  unaffected. `sdk/examples/service-demo.c` now declares a `[1,65535]`
+  port range, and `test-axl-cc-service.sh` asserts the synthesized CLI
+  rejects an out-of-range `--port` at parse time.
+
+- **HTTP `WWW-Authenticate` challenge on 401** (`<axl/axl-http-server.h>`)
+  — `axl_http_server_set_auth_challenge(s, scheme, realm)` makes a gated
+  route's 401 carry `WWW-Authenticate: <scheme> realm="<realm>"`, so
+  interactive clients (browsers, macOS Finder, Windows Explorer) prompt
+  for credentials instead of showing a bare 401. Previously the auth gate
+  only worked with clients that send credentials preemptively (`curl -u`,
+  davfs2 secrets). NULL scheme clears the challenge (the default,
+  preemptive-only behavior — backward compatible); scheme/realm are
+  rejected if they contain a quote or CR/LF (header-injection guard).
+  Requested by the axl-webfs port (`--auth` browser flow).
+
+- **base64url encode/decode** (`<axl/axl-str.h>`) —
+  `axl_base64url_encode` (RFC 4648 §5 URL-safe alphabet, unpadded) and
+  `axl_base64url_decode` (accepts `-`/`_`, tolerates missing padding,
+  rejects standard-base64 `+`/`/` and `=` so a standard-base64 string
+  won't silently decode; takes an explicit length, not NUL-terminated).
+  The encoding JWS/JWT/JWK and web tokens use; the groundwork for the
+  forthcoming `axl-jose` module.
+
+- **TPM 2.0 Endorsement Key public read** (`<axl/axl-tpm.h>`) —
+  `axl_tpm_read_ek_pub(buf, buf_size, out_len, out_alg)` plus
+  `axl_tpm_ek_available()`. Returns the EK public key's canonical bytes
+  (ECC P-256 point X||Y, or RSA-2048 modulus, big-endian) — a per-device,
+  hardware-rooted identity stable across reboots and `TPM2_Clear`, for
+  attestation / device enrollment / platform binding. The bytes are
+  returned raw (no baked-in hashing or policy) so the consumer can hash
+  them into its own domain-separated machine id. Derived with
+  `TPM2_CreatePrimary` in the endorsement hierarchy using the standard
+  TCG EK template (ECC P-256 first, RSA-2048 fallback), marshalled over
+  `EFI_TCG2_PROTOCOL.SubmitCommand` (the same protocol the capability
+  query uses) — deterministic, works on fTPMs with no EK certificate,
+  and persists nothing (the transient primary is flushed). The
+  `out`-buffer follows the size-query protocol (NULL `buf` queries the
+  size; too-small returns `AXL_ERR` with the required size).
+  `axl_tpm_ek_available()` is false when no TPM is present, so a consumer
+  can fall back (e.g. to the SMBIOS UUID). Requested by the SoftBMC port
+  (hardware-rooted machine identity; licensing policy stays in SoftBMC).
+
+- **Public-key signature verification** (`<axl/axl-crypto.h>`) —
+  `axl_pk_verify(alg, pubkey, pubkey_len, msg, msg_len, sig, sig_len)`
+  verifies a detached signature over a message against a public key the
+  consumer ships. A generic crypto primitive for signed firmware
+  updates, signed config blobs, or Secure-Boot-style image checks —
+  pure verification, with no signing side (the private key never ships).
+  `AXL_PK_ECDSA_P256` (ECDSA over NIST P-256 with SHA-256) is supported:
+  `pubkey` is a DER SubjectPublicKeyInfo, `sig` is a DER ECDSA
+  signature, and `msg` is hashed with SHA-256 internally. `AXL_PK_ED25519`
+  is reserved but unsupported by the current mbedTLS build (it needs PSA
+  crypto, which AXL does not enable) and returns `AXL_ERR`. Like
+  `<axl/axl-tls.h>`, the real implementation requires an `AXL_TLS=1`
+  build; without it verification fails closed and `axl_pk_available()`
+  returns false (use it to distinguish "not compiled in" from
+  "invalid"). Any non-`AXL_OK` result means "not verified, untrusted".
+  Requested by the SoftBMC port (signed-blob verification building
+  block; license policy stays entirely in SoftBMC).
+
+- **Public-key key handles: generation, signing, serialization**
+  (`<axl/axl-crypto.h>`) — the signing-side peer of `axl_pk_verify`. An
+  opaque `AxlPkKey` (private or public) created by `axl_pk_keygen`
+  (ECDSA P-256 or RSA-3072), `axl_pk_key_load_private` (PKCS#8 DER), or
+  `axl_pk_key_load_public` (SubjectPublicKeyInfo DER); serialized with
+  `axl_pk_key_get_private_der` / `_get_public_der`; used by
+  `axl_pk_key_sign` / `axl_pk_key_verify` (SHA-256 prehash) with
+  `axl_pk_key_alg` and `axl_pk_key_free` (zeroizes, `AXL_AUTOPTR`-able).
+  `AxlPkSigFormat` selects the ECDSA signature layout — `AXL_PK_SIG_RAW`
+  (fixed-width r||s, what SSH/JWS/COSE use) or `AXL_PK_SIG_DER` (the
+  X.509 form the raw-bytes `axl_pk_verify` consumes); ignored for RSA.
+  Lets a consumer make and persist a host/identity key, sign, and verify
+  peer signatures over AXL's API. Requires `AXL_TLS=1` (mbedTLS; RSA
+  keygen pulled in `MBEDTLS_GENPRIME`); without it all calls fail closed.
+  Requested by the SoftBMC port (SSH host key + user-auth signatures).
+
+- **Authenticated encryption (AEAD)** (`<axl/axl-crypto.h>`) —
+  `axl_aead_seal` / `axl_aead_open`, one-shot AEAD over `AxlAeadAlg`
+  (`AXL_AEAD_AES_128_GCM`, `AXL_AEAD_AES_256_GCM`,
+  `AXL_AEAD_CHACHA20_POLY1305`) with a 12-byte nonce and 16-byte tag
+  (`AXL_AEAD_NONCE_LEN` / `AXL_AEAD_TAG_LEN`). `seal` encrypts and tags
+  (ciphertext same length as plaintext, tag returned separately,
+  in-place aliasing allowed); `open` verifies before decrypting and
+  writes no plaintext on a bad tag (fail closed). The caller supplies a
+  fresh nonce per message — the API does not generate nonces. Requires
+  `AXL_TLS=1` (mbedTLS; ChaCha20-Poly1305 pulled in `MBEDTLS_CHACHA20_C`
+  / `_POLY1305_C` / `_CHACHAPOLY_C`); without it the calls fail closed.
+  Requested by the SoftBMC port (SSH transport cipher).
+
+- **AES-CTR stream cipher** (`<axl/axl-crypto.h>`) — a stateful
+  `AxlCipher`: `axl_cipher_ctr_new(alg, key, key_len, iv)` (AES-128/256,
+  16-byte initial counter), `axl_cipher_ctr_xcrypt` (encrypt or decrypt —
+  CTR is symmetric; in-place allowed; the keystream carries across calls
+  so a stream can be processed in arbitrary chunks), and
+  `axl_cipher_free` (`AXL_AUTOPTR`-able). For an SSH `aes*-ctr` transport
+  or any continuous keystream. Requires `AXL_TLS=1` (mbedTLS;
+  `MBEDTLS_CIPHER_MODE_CTR`); without it the constructor returns NULL and
+  xcrypt fails closed. Requested by the SoftBMC port.
+
+- **ECDH key agreement** (`<axl/axl-crypto.h>`) — ephemeral
+  Diffie-Hellman over `AxlEcdh`: `axl_ecdh_new(alg)` (NIST P-256 or
+  X25519), `axl_ecdh_get_public` (P-256 SEC1 point `0x04||X||Y`, or
+  X25519 32-byte u-coordinate), `axl_ecdh_compute` (32-byte shared
+  secret — P-256 X coordinate big-endian, X25519 little-endian per
+  RFC 7748), and `axl_ecdh_free` (zeroizes; `AXL_AUTOPTR`-able). For an
+  SSH key exchange (`ecdh-sha2-nistp256`, `curve25519-sha256`) or any
+  ephemeral-DH handshake; the raw secret must be run through a KDF before
+  use. Requires `AXL_TLS=1` (mbedTLS;
+  `MBEDTLS_ECP_DP_CURVE25519_ENABLED`); without it the constructor
+  returns NULL. Requested by the SoftBMC port.
+
+- **Free-form `key=value` config-file map** (`<axl/axl-config-file.h>`)
+  — `AxlConfigFile`: parse a `key=value` text file (`#` comments, blank
+  lines, values trimmed) into a flat string map with typed getters
+  (`axl_config_file_get` / `_get_uint` / `_get_int` / `_get_bool`) that
+  fall back to a caller default for any missing or unparseable key, plus
+  `_set` and `_save`. A missing file yields an empty map (not an error),
+  so every lookup returns its default. This is the open-vocabulary
+  counterpart to descriptor-bound `AxlConfig`, which validates keys
+  against a fixed table and rejects unknown ones — use `AxlConfigFile`
+  when keys aren't known at compile time (a module config where features
+  invent their own `prefix.key` names). Requested by the SoftBMC port
+  (its `Core/Config` module + `session_timeout`).
+
+- **`axl_log_ring_clear`** (`<axl/axl-log.h>`) — empty an attached log
+  ring in place, leaving it attached and ready to receive new messages
+  (no detach / free / recreate churn). NULL-safe. Requested by the
+  SoftBMC port (a dashboard "clear logs" / `DELETE /api/logs` action).
+  The `axl_log_ring_get` doc now also spells out that the returned
+  `message`/`domain` borrow the ring's single shared scratch buffer
+  (valid only until the next `get`), so a serializing loop must copy
+  each entry out and not log mid-iteration.
+
+- **Register a pre-populated image buffer as a typed RAM disk**
+  (`<axl/axl-ramdisk.h>`) — `axl_ramdisk_register_image(image, size,
+  AXL_RAMDISK_DISK | AXL_RAMDISK_CDROM, &dev_path)` registers a
+  page-aligned, caller-owned buffer via EFI_RAM_DISK_PROTOCOL **without
+  formatting** (the image carries its own filesystem) as either a raw
+  `gEfiVirtualDiskGuid` disk or an El Torito `gEfiVirtualCdGuid` CD-ROM,
+  then connects controllers so the firmware binds it and the device
+  becomes bootable. `axl_ramdisk_unregister(dev_path)` detaches it. The
+  backing memory is caller-owned: not copied, must outlive the
+  registration, and the caller frees its `axl_alloc_pages` buffer after
+  unregistering (contrast `axl_ramdisk_create` / `axl_ramdisk_destroy`,
+  which own and free the FAT disk they allocate). Requested by the
+  SoftBMC port (the VirtualMedia / "mount an uploaded ISO" feature).
+
+- **Filesystem-backed WebDAV file server** (`<axl/axl-http-server.h>`)
+  — `axl_http_server_serve_fs(s, prefix, fs_root, flags, auth_flags)`
+  mounts a mounted volume (or a subtree) as a read/write WebDAV server
+  in one call, plus `axl_fs_webdav_ops()` / `axl_fs_root_new` for
+  consumers that want to wrap or extend it. The generic `AxlWebDavOps`
+  glue maps every callback to an `<axl/axl-fs.h>` primitive (list →
+  `axl_dir_*`, stat → `axl_file_info`, GET → `AxlFileView`, PUT →
+  `AxlFileWriter`, MKCOL → `axl_dir_mkdir`, DELETE →
+  `axl_file_delete`/`rmdir`, MOVE → `axl_file_move`, COPY → streamed
+  read+write, recursive for deep collections), so a consumer no longer
+  hand-writes the ~13 callbacks. Traversal-contained: a `..` escaping
+  `fs_root` is rejected (404). Flags `AXL_SERVE_FS_READONLY` /
+  `NO_DELETE` / `NO_OVERWRITE` gate mutations (forbidden verbs answer
+  405; a refused overwrite is 409). The `auth_flags` argument
+  (`AXL_ROUTE_*`) gates the whole mount — including the streaming PUT —
+  via the server's auth callback. Requested by the SoftBMC port
+  (replaces ~474 lines of hand-rolled WebDAV).
+
+- **Auth-gated WebDAV and upload routes** (`<axl/axl-http-server.h>`)
+  — `axl_http_server_add_webdav_auth` and
+  `axl_http_server_add_upload_route_auth`, the `_auth` siblings of
+  `add_webdav` / `add_upload_route`. Streaming uploads bypass the
+  normal dispatch path, so their `auth_flags` were previously
+  unenforceable; the auth callback now runs before the first body byte
+  (a failed check is 401, an admin route presented a lesser role is
+  403). A WebDAV mount's PUT rides that same upload path, so the whole
+  mount is now gateable. Requested by the SoftBMC port (it can require
+  login/admin on `/dav` and on streaming-upload endpoints).
+
+- **GOP-inventory accessors** (`<axl/axl-gfx-surface.h>`,
+  `<axl/axl-gfx-types.h>`) — `AxlGfxOutput` gains `framebuffer_size`
+  (GOP `Mode->FrameBufferSize`, distinct from the base address);
+  `axl_gfx_output_query_mode(output_index, mode_index, AxlGfxOutputMode*)`
+  enumerates a *specific* output's modes (the existing
+  `axl_gfx_query_mode` reads only the active GOP, so a multi-monitor
+  consumer couldn't list a non-active output's modes), each mode
+  carrying its own `pixel_format`; and
+  `axl_gfx_output_get_pixel_bitmask(output_index, AxlGfxPixelBitmask*)`
+  reads a non-active output's channel masks (the per-output peer of
+  `axl_gfx_get_pixel_bitmask`). For faithful `/api/hwinfo/display`
+  reporting on real heterogeneous-GOP hardware. Requested by the
+  SoftBMC port.
+
+- **Streaming file writer** (`<axl/axl-fs.h>`) — `AxlFileWriter` /
+  `axl_file_writer_open` / `_write` / `_tell` / `_close`, the
+  out-of-core write peer of `AxlFileView`. Writes a file incrementally
+  without buffering the whole payload in RAM (a WebDAV PUT or a multi-GB
+  upload), unlike the whole-buffer `axl_file_set_contents`.
+  Replace/truncate-in-place by default; `AXL_FILE_WRITER_APPEND` and
+  `AXL_FILE_WRITER_EXCL` (create-only, for PUT `If-None-Match`) flags.
+  `_close` returns the final flush status (a failed flush must surface
+  as 5xx, not 201) and there is deliberately no AXL_AUTOPTR binding so
+  that status can't be silently dropped. Backed by a new
+  `axl_backend_file_set_size` (SetFileInfo truncate).
+
+- **FAT RAM disk library** (`<axl/axl-ramdisk.h>`) — the
+  create/list/destroy orchestration from the `mkrd` tool, promoted to a
+  reusable module so consumers don't copy it. `axl_ramdisk_create()`
+  allocates, FAT16/FAT32-formats, and registers a RAM disk via
+  `EFI_RAM_DISK_PROTOCOL` (idempotent on the label, returns the device
+  path); `axl_ramdisk_destroy()` unregisters and frees by label;
+  `axl_ramdisk_list()` enumerates registered RAM disks into
+  `AxlRamDisk[]`. `axl_ramdisk_ensure_driver()` wraps the
+  firmware→disk→embedded-RamDiskDxe fallback (the embedded blob is a
+  caller-supplied parameter, so `libaxl.a` carries no driver bytes).
+  `mkrd` is now a thin CLI over the module. Requested by the SoftBMC
+  port, whose VirtualMedia feature creates a RAM disk at startup. (The
+  registered device path embeds the backing physical address, which
+  varies run to run — an inherent limit, not something the API fixes.)
+
+### Changed
+
+- **BREAKING: loop source ids are now a 64-bit `AxlSourceId`, not
+  `uint32_t`.** The `axl_loop_add_*` / `axl_loop_remove_source` API, and
+  the source-id-returning wrappers (`axl_input_attach_{mouse,key,touch}`,
+  `axl_cursor_attach[_ex]`,
+  `axl_compositor_attach_{pointer,touch,keyboard,frame_clock}`), now use
+  `AxlSourceId` (a `uint64_t` typedef in `<axl/axl-loop.h>`; 0 still means
+  "no source"). Ids are also now drawn from a single **process-global**
+  monotonic counter rather than a per-loop one, so a stale id can never
+  collide with a source on another loop — closing the class of bug where
+  a sync wrapper's ephemeral-loop source id was later removed from a
+  different loop and silently deleted an unrelated source (the `adbf5461`
+  second-server-on-a-shared-loop dead-accept). 64-bit means the counter
+  never wraps in any realistic lifetime. **Consumer action:** store
+  returned source ids in `AxlSourceId` (or `uint64_t`), not `uint32_t` —
+  a `uint32_t` holder silently truncates once ids exceed 2^32 and then
+  fails to remove the source. Passing an id *into* `axl_loop_remove_source`
+  is unaffected. `axl_defer` / `axl_pubsub` handles are unchanged
+  (`uint32_t`, loop-local).
+
+- **`https` HTTP *client* consumers must now call `axl_tls_init()` once at
+  startup** before issuing `https://` requests. mbedTLS is now strippable
+  from plain-HTTP clients: the always-linked HTTP client no longer
+  statically references `axl_tls_*` (it routes through an ops vtable that
+  `axl_tls_init()` registers), so a consumer that only speaks `http://`
+  and never references TLS lets `ld --gc-sections` drop all of mbedTLS
+  (~280 KB) — a plain client drops from ~562 KB to ~228 KB. https clients
+  error clearly if `axl_tls_init()` wasn't called. `axl_http_server_use_tls`
+  already calls it, so servers are unaffected; the `fetch`/`rfbrowse`/
+  `mkfixture` tools call it automatically (and follow an `http`→`https`
+  redirect by initializing TLS unconditionally, fatal only when the URL
+  itself is https).
+
+- **`axl_acpi_next` / `axl_acpi_find` now surface the FADT's DSDT and
+  FACS** (`<axl/axl-acpi.h>`) — these hang off the FADT
+  (`FirmwareCtrl`/`Dsdt`), not the RSDT/XSDT, so the previous walk
+  omitted them. The catalog now folds them in (preferring the 64-bit
+  extended pointers) and yields them **first** — FACS then DSDT, ahead
+  of the RSDT/XSDT tables — matching the order
+  `EFI_ACPI_SDT_PROTOCOL.GetAcpiTable` / `acpidump` /
+  `/sys/firmware/acpi/tables` use, so a consumer diffing against that
+  oracle needs no reordering. The iteration is the complete table set.
+  The DSDT is a
+  normal SDT; the FACS is surfaced with only its `signature`/`length`
+  valid (it is not a standard SDT — `axl_acpi_checksum_ok` does not
+  apply). Lets the SoftBMC `/api/hwinfo/acpi` route drop its
+  FADT-pointer prologue. (`MAX_ACPI_TABLES` raised 64→128 with an
+  overflow warning so the late-appended children can't be silently
+  dropped on table-heavy servers.)
+
+### Added
+
+- **TPM 2.0 presence and capability** (`<axl/axl-tpm.h>`) —
+  `axl_tpm_present()` reports whether the firmware publishes the TCG2
+  protocol; `axl_tpm_get_capability()` calls `GetCapability` and
+  projects `EFI_TCG2_BOOT_SERVICE_CAPABILITY` into a typed
+  `AxlTpmCapability` (TPMPresentFlag, structure/protocol versions,
+  manufacturer ID, max command/response sizes, PCR-bank count, and the
+  supported + active hash-algorithm bitmasks). A singleton reader (no cursor):
+  the protocol is located once and cached. When the protocol is absent
+  it returns `AXL_ERR` and the consumer reports the TPM as not present
+  (the QEMU-default `{"present":false}` golden). The TCG2 protocol +
+  capability struct are hand-written in `axl-uefi-extra.h` (TCG-spec
+  types, not UEFI/PI); the GUID is pinned in `axl-tpm.c`. Requested by
+  the SoftBMC port for its `/api/hwinfo/tpm` route. The populated path
+  is validated by a new swtpm-backed integration test
+  (`test/integration/test-tpm-qemu.sh`).
+- **Firmware-volume enumeration** (`<axl/axl-fv.h>`) —
+  `axl_fv_next()` is a cursor over the firmware's
+  `EFI_FIRMWARE_VOLUME2_PROTOCOL` handles returning an `AxlHandle`;
+  `axl_fv_get_attributes()` decodes the volume's current read/write/lock
+  status into a typed `AxlFvAttributes`, and `axl_fv_count_files()`
+  reports the file count from a `GetNextFile` walk (clean end is
+  success; a hard read error part-way returns `AXL_ERR` rather than a
+  truncated count; an empty volume is `AXL_OK` with `0`). Same
+  image-lifetime handle cache and position-from-handle cursor as
+  AxlBlock / AxlSerial; device-path text reuses the existing
+  `axl_handle_get_protocol(h, "device-path", ...)`. Read-only inventory
+  probe — no file contents or sections are read. The FV2 protocol is
+  hand-written in `axl-uefi-extra.h` (the spec HTML's typedef is
+  mangled) and its GUID is pinned in `axl-fv.c`. Requested by the
+  SoftBMC port for its `/api/hwinfo/fv` route.
+- **Serial-port enumeration** (`<axl/axl-serial.h>`) —
+  `axl_serial_next()` is a cursor over the firmware's
+  `EFI_SERIAL_IO_PROTOCOL` handles returning an `AxlHandle`;
+  `axl_serial_get_mode()` reads the port's current line settings into a
+  typed `AxlSerialMode` (`baud_rate`, `data_bits`, `parity`,
+  `stop_bits`, `timeout`, `receive_fifo_depth` — `parity`/`stop_bits`
+  are raw enum codes the consumer names), and
+  `axl_serial_get_control()` decodes the modem control/status lines
+  (`cts`, `dsr`, `ri`, `dcd`, `hw_flow_control`) via the protocol's
+  GetControl. Same image-lifetime handle cache and position-from-handle
+  cursor as AxlBlock; device-path text reuses the existing
+  `axl_handle_get_protocol(h, "device-path", ...)`. Read-only
+  descriptor probe — no port is opened and no byte I/O is performed.
+  `SERIAL_IO_MODE` + `EFI_SERIAL_IO_PROTOCOL` are now generated from the
+  UEFI spec. Requested by the SoftBMC port for its `/api/hwinfo/serial`
+  route.
+- **Block-device enumeration** (`<axl/axl-block.h>`) —
+  `axl_block_next()` is a cursor over the firmware's
+  `EFI_BLOCK_IO_PROTOCOL` handles (disks, partitions, CD-ROMs, RAM
+  disks) returning an `AxlHandle`; `axl_block_get_media()` reads that
+  device's `EFI_BLOCK_IO_MEDIA` into a typed `AxlBlockMedia`
+  (`media_id`, `removable_media`, `media_present`, `logical_partition`,
+  `read_only`, `write_caching`, `block_size`, `last_block`). The handle
+  set is located once and cached for the image lifetime; position is
+  recovered from the handle the caller passes back, so independent
+  walks do not interfere. Device-path text reuses the existing
+  `axl_handle_get_protocol(h, "device-path", ...)` +
+  `axl_device_path_to_text()` — no new API. Fields are raw readouts
+  (geometry valid only when `media_present`); the consumer derives
+  capacity and device type. Requested by the SoftBMC port for its
+  `/api/hwinfo/storage` route. (`EFI_BLOCK_IO_MEDIA` is now generated
+  from the UEFI spec; the thin `EFI_BLOCK_IO_PROTOCOL` wrapper is
+  hand-written in `axl-uefi-extra.h` because the spec HTML's struct
+  closer carries a stray-space typo the generator can't match.)
+
 ## 1.8.0 — 2026-06-11
 
 ### Added

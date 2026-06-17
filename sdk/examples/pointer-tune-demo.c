@@ -120,7 +120,7 @@ typedef struct {
     /* Live absolute-read config (indices into the tables above). */
     uint32_t       drain_idx, method_idx, poll_idx;
     bool           console_only;
-    uint32_t       tid;         /* current touch source id (0 = none) */
+    AxlSourceId    tid;         /* current touch source id (0 = none) */
 
     /* Relative-pointer delta tracking: the mouse event carries the device's
        raw ACCUMULATED position (unbounded, and over a remote/VNC pointer it
@@ -544,7 +544,7 @@ main(int argc, char *argv[])
 
     /* Relative mouse stays attached for the whole run (contributes buttons /
        drives position on bare metal with no absolute device). */
-    uint32_t mid = axl_input_attach_mouse(d.loop, on_pointer, &d);
+    AxlSourceId mid = axl_input_attach_mouse(d.loop, on_pointer, &d);
 
     /* Bring up the absolute source at the initial config. */
     apply_touch(&d);

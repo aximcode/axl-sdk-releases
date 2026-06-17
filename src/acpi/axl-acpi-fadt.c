@@ -15,29 +15,8 @@
 
 AXL_LOG_DOMAIN("acpi");
 
-// ---------------------------------------------------------------------------
-// FADT field offsets (private)
-// ---------------------------------------------------------------------------
-
-/* Field offsets per ACPI 6.x spec §5.2.9. */
-#define FADT_OFF_FIRMWARE_CTRL    36u
-#define FADT_OFF_DSDT             40u
-#define FADT_OFF_SMI_CMD          48u
-#define FADT_OFF_ACPI_ENABLE      52u
-#define FADT_OFF_ACPI_DISABLE     53u
-#define FADT_OFF_PM1A_EVT_BLK     56u
-#define FADT_OFF_PM1B_EVT_BLK     60u
-#define FADT_OFF_PM1A_CNT_BLK     64u
-#define FADT_OFF_PM1B_CNT_BLK     68u
-#define FADT_OFF_PM1_EVT_LEN      88u
-#define FADT_OFF_PM1_CNT_LEN      89u
-#define FADT_OFF_IAPC_BOOT_ARCH  109u
-#define FADT_OFF_ARM_BOOT_ARCH   129u
-#define FADT_OFF_X_FIRMWARE_CTRL 132u
-#define FADT_OFF_X_DSDT          140u
-
-#define FADT_MIN_LEN_LEGACY  116u  /* ACPI 1.0 minimum */
-#define FADT_MIN_LEN_2_0     244u  /* ACPI 2.0 minimum (covers x_dsdt) */
+/* FADT field offsets (FADT_OFF_*) + minimum-length constants live in
+   axl-acpi-internal.h — shared with the table catalog in axl-acpi.c. */
 
 // ---------------------------------------------------------------------------
 // Unaligned little-endian read helpers

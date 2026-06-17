@@ -63,7 +63,9 @@ typedef struct {
 // Cached table catalog (built lazily on first use)
 // ---------------------------------------------------------------------------
 
-#define MAX_ACPI_TABLES  64
+/* Headroom over the ~40-60 tables a populated server publishes, with
+   room for the FADT's FACS + DSDT children folded in below. */
+#define MAX_ACPI_TABLES  128
 
 static bool             rsdp_done    = false;   /* RSDP located + validated */
 static bool             rsdp_failed  = false;
@@ -96,6 +98,35 @@ find_rsdp(
     return rsdp_10;
 }
 
+/* Append a table to the catalog, skipping NULL, duplicates, and
+   overflow. The single append site for every source — the XSDT/RSDT
+   walk and the FADT's children — so dedup and the cap are handled
+   once, and a too-small catalog warns rather than silently dropping. */
+static void
+catalog_append(
+    AxlAcpiHeader  *h
+    )
+{
+    if (h == NULL) {
+        return;
+    }
+    if (catalog_count >= MAX_ACPI_TABLES) {
+        static bool warned;
+        if (!warned) {
+            axl_warning("ACPI catalog full at %d entries; some tables omitted",
+                        MAX_ACPI_TABLES);
+            warned = true;
+        }
+        return;
+    }
+    for (size_t i = 0; i < catalog_count; i++) {
+        if (catalog[i] == h) {
+            return;   /* already catalogued */
+        }
+    }
+    catalog[catalog_count++] = h;
+}
+
 static void
 build_catalog_from_rsdt(
     uint32_t  rsdt_addr
@@ -108,10 +139,8 @@ build_catalog_from_rsdt(
     size_t entry_count = (rsdt->length - ACPI_HEADER_SIZE) / sizeof(uint32_t);
     const uint32_t *entries = (const uint32_t *)((const uint8_t *)rsdt
                                                   + ACPI_HEADER_SIZE);
-    for (size_t i = 0; i < entry_count && catalog_count < MAX_ACPI_TABLES; i++) {
-        if (entries[i] != 0) {
-            catalog[catalog_count++] = (AxlAcpiHeader *)(uintptr_t)entries[i];
-        }
+    for (size_t i = 0; i < entry_count; i++) {
+        catalog_append((AxlAcpiHeader *)(uintptr_t)entries[i]);
     }
 }
 
@@ -128,13 +157,99 @@ build_catalog_from_xsdt(
     /* XSDT entries are 64-bit but may be unaligned in some firmware —
        copy bytewise to avoid faults on architectures that care. */
     const uint8_t *raw = (const uint8_t *)xsdt + ACPI_HEADER_SIZE;
-    for (size_t i = 0; i < entry_count && catalog_count < MAX_ACPI_TABLES; i++) {
+    for (size_t i = 0; i < entry_count; i++) {
         uint64_t addr = 0;
         axl_memcpy(&addr, raw + i * sizeof(uint64_t), sizeof(uint64_t));
-        if (addr != 0) {
-            catalog[catalog_count++] = (AxlAcpiHeader *)(uintptr_t)addr;
+        catalog_append((AxlAcpiHeader *)(uintptr_t)addr);
+    }
+}
+
+/* FACS and DSDT are not XSDT/RSDT entries — they hang off the FADT
+   (FirmwareCtrl/X_FirmwareCtrl, Dsdt/X_Dsdt). Fold them into the catalog
+   so a single walk yields the complete table set, and place them FIRST
+   — FACS then DSDT, ahead of the XSDT/RSDT tables — matching
+   EFI_ACPI_SDT_PROTOCOL.GetAcpiTable / acpidump /
+   /sys/firmware/acpi/tables, so a consumer diffing against that oracle
+   needs no reordering. Prefer the 64-bit extended pointers (ACPI 2.0+),
+   falling back to the legacy 32-bit fields. Note FACS is not a standard
+   SDT — only its signature + length are meaningful (axl_acpi_checksum_ok
+   does not apply to it). */
+static void
+front_load_fadt_children(
+    void
+    )
+{
+    AxlAcpiHeader *fadt = NULL;
+    for (size_t i = 0; i < catalog_count; i++) {
+        if (catalog[i] != NULL
+            && axl_memcmp(catalog[i]->signature, "FACP", 4) == 0) {
+            fadt = catalog[i];
+            break;
         }
     }
+    if (fadt == NULL || fadt->length < FADT_OFF_DSDT + sizeof(uint32_t)) {
+        return;
+    }
+    const uint8_t *p = (const uint8_t *)fadt;
+
+    /* DSDT — prefer X_Dsdt (ACPI 2.0+), fall back to the 32-bit Dsdt. */
+    uint64_t dsdt = 0;
+    if (fadt->length >= FADT_OFF_X_DSDT + sizeof(uint64_t)) {
+        axl_memcpy(&dsdt, p + FADT_OFF_X_DSDT, sizeof(dsdt));
+    }
+    if (dsdt == 0) {
+        uint32_t dsdt32 = 0;
+        axl_memcpy(&dsdt32, p + FADT_OFF_DSDT, sizeof(dsdt32));
+        dsdt = dsdt32;
+    }
+
+    /* FACS — prefer X_FirmwareCtrl, fall back to FirmwareCtrl. Absent
+       (0) on platforms without a FACS (typical on ARM). */
+    uint64_t facs = 0;
+    if (fadt->length >= FADT_OFF_X_FIRMWARE_CTRL + sizeof(uint64_t)) {
+        axl_memcpy(&facs, p + FADT_OFF_X_FIRMWARE_CTRL, sizeof(facs));
+    }
+    if (facs == 0) {
+        uint32_t facs32 = 0;
+        axl_memcpy(&facs32, p + FADT_OFF_FIRMWARE_CTRL, sizeof(facs32));
+        facs = facs32;
+    }
+
+    /* Front-load order: FACS, then DSDT (oracle order). */
+    AxlAcpiHeader *children[2];
+    size_t         nchildren = 0;
+    if (facs != 0) {
+        children[nchildren++] = (AxlAcpiHeader *)(uintptr_t)facs;
+    }
+    if (dsdt != 0) {
+        children[nchildren++] = (AxlAcpiHeader *)(uintptr_t)dsdt;
+    }
+    if (nchildren == 0) {
+        return;
+    }
+
+    /* Rebuild the catalog: children first, then the existing tables in
+       XSDT/RSDT order, de-duplicated (a child the XSDT also named — not
+       expected — is listed once, at the front). */
+    AxlAcpiHeader *reordered[MAX_ACPI_TABLES];
+    size_t         n = 0;
+    for (size_t i = 0; i < nchildren; i++) {
+        reordered[n++] = children[i];
+    }
+    for (size_t i = 0; i < catalog_count && n < MAX_ACPI_TABLES; i++) {
+        bool is_child = false;
+        for (size_t j = 0; j < nchildren; j++) {
+            if (catalog[i] == children[j]) {
+                is_child = true;
+                break;
+            }
+        }
+        if (!is_child) {
+            reordered[n++] = catalog[i];
+        }
+    }
+    axl_memcpy(catalog, reordered, n * sizeof(catalog[0]));
+    catalog_count = n;
 }
 
 /* Locate + validate the RSDP. Captures `cached_revision` so callers
@@ -194,6 +309,11 @@ ensure_init(
     } else {
         build_catalog_from_rsdt(cached_rsdp->rsdt_address);
     }
+
+    /* Fold in the FADT's FACS + DSDT children (front of the catalog),
+       which the XSDT/RSDT does not list, so the catalog is the complete
+       table set in the oracle's order. */
+    front_load_fadt_children();
 
     if (catalog_count == 0) {
         axl_warning("RSDP found but RSDT/XSDT contains no entries");

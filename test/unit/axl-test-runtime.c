@@ -15,6 +15,7 @@
 #include <axl/axl-loop.h>
 #include <axl/axl-runtime.h>
 #include <axl/axl-signal.h>
+#include <axl/axl-sort.h>
 #include <axl/axl-task.h>
 
 /* Internal backend header (test build passes -Isrc/backend): the exit-status
@@ -177,6 +178,51 @@ test_yield_dispatches_ready_work(void)
 
     test_check(yield_tick_count == 1,
                "yield: dispatches pending idle work in one pass");
+}
+
+// Pseudo-random, definitely-unsorted fill so introsort does ~n log n
+// comparisons (> 65536) and trips axl_qsort's internal yield several times.
+static int g_yield_sort_arr[20000];
+
+static int
+yield_int_cmp(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+// Library code that yields for Ctrl-C responsiveness must NOT re-dispatch the
+// consumer's default loop (it observes the break flag via _axl_poll_break,
+// never re-entering the loop). The public axl_yield() keeps its documented
+// yield-as-scheduler behavior. axl_qsort over a large array trips its internal
+// yield many times; if that still dispatched, the registered idle would fire.
+static void
+test_library_yield_does_not_dispatch(void)
+{
+    AxlLoop *loop = axl_loop_default();
+    if (loop == NULL) {
+        test_fail("lib-yield: loop_default NULL");
+        return;
+    }
+
+    const size_t n = sizeof(g_yield_sort_arr) / sizeof(g_yield_sort_arr[0]);
+    for (size_t i = 0; i < n; i++) {
+        g_yield_sort_arr[i] = (int)((unsigned)i * 2654435761u);
+    }
+
+    yield_tick_count = 0;
+    axl_loop_add_idle(loop, yield_tick_cb, NULL);   /* one-shot idle */
+
+    axl_qsort(g_yield_sort_arr, n, sizeof(int), yield_int_cmp);
+
+    test_check(yield_tick_count == 0,
+               "library yield (axl_qsort) does NOT dispatch the default loop");
+
+    /* The idle never fired, so it is still registered. A DIRECT axl_yield()
+       must still dispatch it — the public contract is unchanged. */
+    axl_yield();
+    test_check(yield_tick_count == 1,
+               "direct axl_yield() still dispatches (public contract intact)");
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +415,7 @@ test_runtime_main(
 
     test_loop_default_is_stable();
     test_yield_dispatches_ready_work();
+    test_library_yield_does_not_dispatch();
 
     test_interrupted_is_false_at_startup();
 

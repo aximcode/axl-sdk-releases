@@ -5977,6 +5977,69 @@ test_gfx_pixel_accessors_contract(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlGfx GOP-inventory accessors: axl_gfx_output_query_mode (per-output mode
+// enumeration with each mode's pixel format), AxlGfxOutput.framebuffer_size,
+// and axl_gfx_output_get_pixel_bitmask (per-output channel masks). NULL/range
+// guards hold on every platform; the GOP-present vs headless behavior is
+// split into two branches with EQUAL test_check counts so the cross-arch
+// ratchet stays balanced (x64 OVMF exposes a GOP under -nographic, aa64
+// reports none — the same split the other GOP contract tests handle).
+// ---------------------------------------------------------------------------
+
+static void
+test_gfx_output_inventory_contract(void)
+{
+    AxlGfxOutputMode   m;
+    AxlGfxPixelBitmask bm;
+    AxlGfxOutput       o;
+
+    /* NULL / out-of-range guards — true on every platform. */
+    test_check(axl_gfx_output_query_mode(0, 0, NULL) == AXL_ERR,
+               "output_query_mode: NULL out -> AXL_ERR");
+    test_check(axl_gfx_output_get_pixel_bitmask(0, NULL) == AXL_ERR,
+               "output_get_pixel_bitmask: NULL out -> AXL_ERR");
+    test_check(axl_gfx_output_query_mode((size_t)-1, 0, &m) == AXL_ERR,
+               "output_query_mode: out-of-range output -> AXL_ERR");
+    test_check(axl_gfx_output_get_pixel_bitmask((size_t)-1, &bm) == AXL_ERR,
+               "output_get_pixel_bitmask: out-of-range output -> AXL_ERR");
+
+    if (axl_gfx_output_count() > 0) {
+        /* GOP present: output 0 describes itself; query_mode(0,0) yields
+           positive geometry, the queried index, and a valid format; the
+           per-output bitmask succeeds iff that output is a BitMask
+           display; an out-of-range mode is rejected; and a mapped
+           framebuffer reports a positive byte size. */
+        test_check(axl_gfx_output_get(0, &o) == AXL_OK && o.mode_count > 0,
+                   "output_get: output 0 has a positive mode_count");
+        test_check(axl_gfx_output_query_mode(0, 0, &m) == AXL_OK
+                   && m.index == 0 && m.width > 0
+                   && m.pixel_format <= AXL_GFX_PIXEL_FORMAT_BLT_ONLY,
+                   "output_query_mode: mode 0 has positive width + valid format");
+        test_check(axl_gfx_output_query_mode(0, o.mode_count, &m) == AXL_ERR,
+                   "output_query_mode: mode == count -> AXL_ERR");
+        test_check((axl_gfx_output_get_pixel_bitmask(0, &bm) == AXL_OK)
+                   == (o.pixel_format == AXL_GFX_PIXEL_FORMAT_BITMASK),
+                   "output_get_pixel_bitmask: succeeds iff output is bitmask");
+        test_check(o.framebuffer_size > 0
+                   || o.pixel_format == AXL_GFX_PIXEL_FORMAT_BLT_ONLY,
+                   "output_get: framebuffer_size positive for a mapped framebuffer");
+    } else {
+        /* Headless (no GOP): every inventory op fails safe. SAME count
+           (5) as the GOP-present branch so the ratchet stays balanced. */
+        test_check(axl_gfx_output_get(0, &o) == AXL_ERR,
+                   "output_get: no GOP -> AXL_ERR");
+        test_check(axl_gfx_output_query_mode(0, 0, &m) == AXL_ERR,
+                   "output_query_mode: no GOP -> AXL_ERR");
+        test_check(axl_gfx_output_query_mode(0, 1, &m) == AXL_ERR,
+                   "output_query_mode: no GOP, any mode -> AXL_ERR");
+        test_check(axl_gfx_output_get_pixel_bitmask(0, &bm) == AXL_ERR,
+                   "output_get_pixel_bitmask: no GOP -> AXL_ERR");
+        test_check(axl_gfx_output_count() == 0,
+                   "output_count: 0 when no GOP");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // axl_gfx_set_native_mode contract. No display in QEMU publishes EDID,
 // so the native timing never resolves and the call reports AXL_ERR on
 // both arches — and, critically, must do so WITHOUT switching the mode
@@ -6374,6 +6437,7 @@ test_gfx_main(
     test_gfx_scale_for_dpi();
     test_gfx_dpi_contract();
     test_gfx_output_contract();
+    test_gfx_output_inventory_contract();
 
     return test_print_results();
 }

@@ -233,12 +233,28 @@ typedef struct {
     uint32_t            height;        ///< vertical resolution in pixels
     uint32_t            stride;        ///< pixels per scan line (>= width)
     uint64_t            framebuffer;   ///< framebuffer physical address (0 if Blt-only)
+    uint64_t            framebuffer_size; ///< framebuffer byte size (GOP Mode->FrameBufferSize; firmware-reported, may exceed stride*height*bpp; 0 if Blt-only)
     AxlGfxPixelFormat   pixel_format;  ///< this output's raw GOP pixel format
     uint32_t            mode_count;    ///< number of modes this output enumerates
     uint32_t            current_mode;  ///< this output's active mode index
     const uint8_t      *edid;          ///< borrowed EDID bytes, or NULL if none published
     size_t              edid_len;      ///< EDID byte count (0 when @ref edid is NULL)
 } AxlGfxOutput;
+
+/// One mode of a specific display output, as enumerated by
+/// `axl_gfx_output_query_mode`.  The inventory-side peer of `AxlGfxMode`:
+/// where `AxlGfxMode` is geometry-only (the pixel format is the present
+/// path's concern when you are *picking* a resolution to draw at), this
+/// carries the mode's actual GOP pixel format — what a GOP-inventory
+/// reader reports per mode.  Read from the output's own GOP, so it is
+/// faithful even for an output that is not the active one.
+typedef struct {
+    uint32_t            index;         ///< mode number (matches the queried index)
+    uint32_t            width;         ///< horizontal resolution in pixels
+    uint32_t            height;        ///< vertical resolution in pixels
+    uint32_t            stride;        ///< pixels per scan line (>= width)
+    AxlGfxPixelFormat   pixel_format;  ///< this mode's raw GOP pixel format
+} AxlGfxOutputMode;
 
 /// Pack an `AxlGfxPixel` into a 32-bit framebuffer word for @a order.
 ///

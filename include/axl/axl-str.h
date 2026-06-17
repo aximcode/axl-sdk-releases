@@ -920,6 +920,40 @@ axl_base64_decode(
     size_t     *out_len   ///< (out): decoded data length
 );
 
+/**
+ * @brief Base64url-encode binary data (RFC 4648 §5, unpadded).
+ *
+ * The URL- and filename-safe alphabet (`-` and `_` instead of `+` and
+ * `/`) with no `=` padding — the encoding JWS/JWT/JWK and many web tokens
+ * use. Caller frees with axl_free().
+ *
+ * @return NUL-terminated base64url string, or NULL on failure.
+ */
+char *
+axl_base64url_encode(
+    const void *data,  ///< input bytes
+    size_t      len    ///< input length
+);
+
+/**
+ * @brief Decode a base64url string (RFC 4648 §5).
+ *
+ * Accepts the `-`/`_` alphabet and tolerates missing padding (the input
+ * length need not be a multiple of 4). Rejects standard-base64 `+`/`/`
+ * and any `=` padding, so a standard-base64 string will not silently
+ * decode. @p len is the input length (the string need not be
+ * NUL-terminated).
+ *
+ * @return AXL_OK on success, AXL_ERR on invalid input.
+ */
+int
+axl_base64url_decode(
+    const char *s,        ///< base64url input
+    size_t      len,      ///< input length in bytes
+    void      **out,      ///< (out): decoded data (caller frees with axl_free)
+    size_t     *out_len   ///< (out): decoded data length
+);
+
 // ---------------------------------------------------------------------------
 // Number parsing
 // ---------------------------------------------------------------------------

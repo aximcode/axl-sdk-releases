@@ -16,6 +16,12 @@ See [src/event/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main
 the event primitives themselves, and [src/loop/README.md](https://github.com/aximcode/axl-sdk-releases/blob/main/src/loop/README.md)
 for event-loop mechanics.
 
+**Re-entrancy / nesting** — the one recurring failure mode of this model,
+*blocking on a loop that is already running*, and its remediation are tracked
+in [`AXL-Loop-Reentrancy-Plan.md`](AXL-Loop-Reentrancy-Plan.md). How the model
+is kept honest under test (the topology that surfaced those bugs) is in
+[§ Testing the model](#testing-the-model) below.
+
 **Also see:** [`AXL-Lifecycle.md`](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md) — the runtime
 services that ship around `main` today (Phase A7, April 2026):
 lazy default loop, Linux-style signal handling, `axl_yield()` for
@@ -131,10 +137,63 @@ composition is needed. That's the right pressure valve for firmware.
 ### Where this breaks down
 
 Three-level async flows (`connect → TLS handshake → HTTP request`)
-become scope soup. The sync wrappers are the near-term answer. If a
+become scope soup. The sync wrappers are the right answer **for the
+no-loop case** (CLI tools — `fetch`, `netinfo`, ping — own no main
+loop, so a sync wrapper's throwaway loop *is* the only loop). If a
 concrete pain point surfaces later, a thin `AxlFuture` / promise
 layer on top of `AxlEvent` could compose them with `.then()` /
 `.all()`. Don't build it speculatively.
+
+**Superseded for long-running reactive services.** The original
+stance here — "the sync wrappers are the near-term answer" — held up
+for tools but proved to be the *pain point* for a service that runs a
+loop (a server, a resident driver pump). A sync wrapper called from a
+loop callback blocks on a loop that is already running, which nests an
+ephemeral loop and wedges; the SoftBMC port hit this repeatedly
+(`e90b87e4`, `d249a9b6`, `adbf5461`, the TLS resident-loop hang). The
+remediation — services are async-first; library code never implicitly
+re-enters the consumer's dispatch; sync APIs become self-protecting
+(loud `AXL_BUSY`, not a silent wedge) — is the subject of
+[`AXL-Loop-Reentrancy-Plan.md`](AXL-Loop-Reentrancy-Plan.md), which
+this section now defers to.
+
+## Extending the model: which APIs go async, and when
+
+The async HTTP/DNS/UDP work generalized into a reusable shape: **an op that
+*blocks waiting on external hardware/firmware completion* gets an async core
+driven on the caller's `AxlLoop`, and the sync entry point becomes a thin
+ephemeral-loop wrapper over it** (one I/O implementation, both faces public).
+The same pattern applies well beyond networking — but only to ops that actually
+*wait*. CPU-bound work (hashing, sort, JSON, formatting, table parsing, GOP
+Blt) has nothing to defer in a single-threaded environment; cooperative
+yielding (`_axl_poll_break`) is its only lever, and it is already wired.
+
+**Already split:** the whole net stack, and serial (`axl_serial_read_async`, a
+timer-poll source).
+
+**Candidates, by value — build each *on demand* (when a consumer needs it), the
+way the async HTTP client was un-deferred by SoftBMC's webhook. Do NOT build
+them speculatively (see "Where this breaks down" and the AxlFuture note).**
+
+| API | How it blocks today | Async shape | Demand |
+|---|---|---|---|
+| **IPMI / BMC** (`AxlIpmi`) | KCS/SSIF **busy-poll** the BMC (`axl_backend_stall` loop) for the response — ms to seconds | Pure Poll-tick reuse: submit, tick the KCS/SSIF FSM from a loop timer, callback on completion. No firmware event needed; same shape as the DNS4/TCP4 Poll ticks | **On SoftBMC's roadmap** — a BMC issuing/polling IPMI from an HTTP handler or timer hits the webhook's blocking-from-a-callback wall. Cleanest to build (no new infrastructure). |
+| **Storage** (`AxlNvme`/`AxlAta`/`AxlScsi`/`AxlBlock`) | PassThru passes `Event = NULL` (sync); BlockIo used over BlockIo2 | The PassThru protocols are async-capable via that `Event`; `EFI_BLOCK_IO2` has token/event reads. Submit with an event, register it on the loop, callback on completion | **On SoftBMC's roadmap.** Poster child: **device self-test** (runs for *minutes* — poll progress) + SMART polling + large reads, run on the service loop while it serves. |
+| **MP Services** (parallel AP dispatch) | `StartupAllAPs` blocking mode | Non-blocking mode takes a `WaitEvent` — register it, callback when all APs finish | Aspirational (a consumer fanning work across APs). Lower urgency: callers usually *want* to block until the fan-out completes. |
+| **USB transfers** (`AxlUsb`) | sync bulk/interrupt | `EFI_USB_IO` async interrupt transfers are callback-based | Niche — live device I/O (HID polling), not the enumeration AxlUsb mostly does. |
+| **TPM** (`AxlTpm`) | TCG2 submit/response | event/poll | Low — usually fast enough that blocking is fine. |
+
+**Not candidates (CPU-bound, no external wait):** mem, format, log, all of data
+(hash/sort/json/str/trees), gfx draw + compositor, smbios/acpi/pci/spd +
+usb-enumeration, rng, time, fs metadata, path.
+
+When one of these is built, mirror the net contract exactly: `AXL_OK` ⇒ the
+callback fires later (deferred, never re-entrant); one op in flight per
+handle → `AXL_BUSY`; the callback owns the result; the sync wrapper drives a
+Poll tick at raised TPL and clears any per-op loop state before freeing the
+ephemeral loop. See `src/net/axl-http-client-async.c` + `axl-tcp-async.c` for
+the reference implementation and [AXL-Async-HTTP-Plan.md](AXL-Async-HTTP-Plan.md)
+for the contract + review findings.
 
 ## Where the primitives live
 
@@ -148,6 +207,78 @@ This layout is intentional: each directory corresponds to one axis
 of the taxonomy. Adding a new concurrency primitive? Pick an axis.
 If it doesn't fit any of the four, reconsider whether the primitive
 earns its weight.
+
+## Testing the model
+
+The concurrency bugs that slipped past the unit suite and surfaced
+only when SoftBMC integrated — the WS-teardown wedge (`e90b87e4`),
+the WS-over-TLS stream desync (`4563aabf`), the second-server-on-a-
+shared-loop dead-accept (`adbf5461`), the TLS resident-loop handshake
+hang — share one trait: they live in an **execution topology the
+app-shaped tests don't model.** Unit tests run as a standalone app:
+one loop, `TPL_APPLICATION`, run-to-completion. SoftBMC runs the
+**resident-driver model** — the loop is pumped from an
+`axl_loop_attach_driver` tick at raised TPL (`TPL_CALLBACK`), several
+servers share one loop, and WS handlers themselves do I/O. Whole bug
+classes live only in that gap, so the one consumer that runs that
+shape became the de-facto integration test (the multi-day back-and-
+forth).
+
+The strategy is to model the topology in-repo and assert the
+invariants, so the SDK breaks first — not the consumer. Five parts:
+
+1. **Consumer-emulator harness** — `test-consumer-emulator-qemu.sh`
+   over the `AxlTestNet serve-hazard-driver` mode: HTTP **and** HTTPS
+   on ONE `attach_driver`-pumped shared loop, with a per-client WS
+   endpoint whose handlers send / broadcast / close. This is the
+   canonical hazardous shape (it combines what `serve-multi-tls` and
+   `serve-tls-ws-driver` exercise separately). New net/loop behavior
+   runs through it; most of the escaped bugs reproduce here.
+2. **Invariant asserts** — `AXL_DEBUG_ASSERT` (see
+   [include/axl/axl-debug.h](https://github.com/aximcode/axl-sdk-releases/blob/main/include/axl/axl-debug.h);
+   loud in debug/test builds, compiled out under `NDEBUG`) catches the
+   *cause* at the fault site instead of the symptom downstream:
+   - **re-entrancy** — a synchronous wait nested inside a loop callback
+     (the warn-guard `_axl_loop_in_callback()`, Loop-Reentrancy-Plan
+     Item 1);
+   - **TLS write ordering** — never advance the TLS sequence number
+     (`mbedtls_ssl_write`) while a TCP send is already in flight (the
+     `4563aabf` desync).
+
+   The `adbf5461` source-id collision was *also* first guarded this way,
+   but it has since been fixed at the root instead (see part 5) — a
+   reminder that an assert is a stopgap until the hazard can be made
+   unrepresentable.
+3. **Raised-TPL coverage** — the driver-pump harness exercises every
+   scenario at raised TPL, not just `TPL_APPLICATION`. This is the gap
+   most of the bugs hid in, and it is inherent to the `attach_driver`
+   harness above (no separate test axis needed).
+4. **Liveness watchdog** — every harness scenario ends with a probe
+   request, and the loop must answer it within a bounded time. These
+   bugs manifest as a *wedge*, so a positive liveness probe after each
+   scenario turns a hang into a named failure. (The unit harness
+   already names a stalled binary via `*** STALLED:` + the ratchet
+   "Culprit:" line; this is the integration-side equivalent.)
+5. **Make the hazard unrepresentable** — the deepest fix: eliminate the
+   bug class structurally rather than guard each instance. Concrete win:
+   loop source ids are now allocated from a single **process-global**
+   counter, not a per-loop one (`axl-loop.c`). Per-loop ids put the same
+   id on every loop, so an id outliving its loop could be removed from a
+   different loop and delete an unrelated source (the `adbf5461`
+   dead-accept). With globally-unique ids a stale id matches nothing on
+   another loop — the cross-loop removal is a no-op and the class is gone,
+   which let the sync wrappers' collision-guard id-clearing and its
+   asserts be removed (one recv clear remains, now purely next-recv
+   hygiene, not a collision guard). The same instinct drives the
+   [Loop-Reentrancy-Plan](AXL-Loop-Reentrancy-Plan.md): where a context
+   tolerates only async I/O (a handler under a running loop, a driver pump
+   at raised TPL), make sync I/O impossible or loud (Item 1 guard →
+   async-first handlers → flip to hard `AXL_BUSY`) rather than rely on a
+   test to catch it.
+
+Parts 1, 3, 4 are the test apparatus; parts 2 and 5 are the
+detection/design that the Loop-Reentrancy-Plan drives. Together they
+close the topology gap that made SoftBMC the integration test.
 
 ## Background reading
 

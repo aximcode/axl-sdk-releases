@@ -9,50 +9,62 @@
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-runtime.h>
+#include "../runtime/axl-signal-internal.h"
 #include <axl/axl-str.h>
+#include <axl/axl-format.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
 #include <axl/axl-config.h>
 #include "axl-net-internal.h"
+#include "axl-http-client-tls.h"
+#include "axl-http-client-internal.h"
 
 AXL_LOG_DOMAIN("http");
 
 // ---------------------------------------------------------------------------
-// Internal client structure
+// TLS indirection — see axl-http-client-tls.h. The client never references
+// axl_tls_* directly; axl_tls_init() registers these ops, so a plain-HTTP
+// consumer (no TLS reference) lets the linker strip mbedTLS entirely.
 // ---------------------------------------------------------------------------
 
-#define HTTP_CLIENT_RECV_BUF  8192
+static const AxlHttpClientTlsOps *g_http_tls_ops;
 
-struct AxlHttpClient {
-    AxlConfig      *config;
-    AxlTcp         *sock;
-    AxlTlsContext  *tls_ctx;
-    char           *connected_host;
-    uint16_t        connected_port;
-    AxlHashTable   *default_headers;
-    bool            tls_enabled;
-    bool            tls_verify;
-    bool            retry_attempted;
-    bool            keep_alive;
-    size_t          timeout_ms;
-    int             max_redirects;
-    /* Optional source-IPv4 (dotted-quad string). Empty / "0.0.0.0"
-       means auto-pick (skip 0.0.0.0 interfaces, prefer subnet match,
-       else first valid). */
-    char           *source_ip;
-    /* Persistent ciphertext staging buffer for TLS recv. Held here
-       (not on the stack of client_recv) so the BIO's stage_buf
-       pointer remains valid across calls — mbedtls reads ciphertext
-       from this buffer incrementally as the caller drains plaintext.
-       Keeping it separate from the caller's plaintext destination
-       avoids the buffer-aliasing class of bugs (mbedtls writing
-       plaintext over still-staged ciphertext). */
-    uint8_t         tls_rx_buf[HTTP_CLIENT_RECV_BUF];
-};
+void
+axl_http_client_set_tls_ops(const AxlHttpClientTlsOps *ops)
+{
+    g_http_tls_ops = ops;
+}
+
+const AxlHttpClientTlsOps *
+_axl_http_client_tls_ops(void)
+{
+    return g_http_tls_ops;
+}
+
+/* NULL-safe TLS free via the registered ops. A non-NULL ctx implies the ops
+   were registered (the ctx was created by ops->connect), so the guard is
+   belt-and-suspenders. */
+static void
+client_tls_free(AxlTlsContext *ctx)
+{
+    if (ctx != NULL && g_http_tls_ops != NULL) {
+        g_http_tls_ops->free(ctx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal client structure — struct AxlHttpClient + HTTP_CLIENT_RECV_BUF live
+// in axl-http-client-internal.h (shared with the async state machine).
+// ---------------------------------------------------------------------------
 
 static const AxlConfigDesc http_client_descs[] = {
-    { "timeout.ms",    AXL_CFG_UINT, "10000", "Per-operation timeout in ms",
+    { "timeout.ms",    AXL_CFG_UINT, "10000",
+      "Idle/per-phase timeout in ms - bounds each phase (connect, handshake, "
+      "send, each recv), re-armed on progress (not a whole-operation ceiling)",
       offsetof(struct AxlHttpClient, timeout_ms), sizeof(size_t) },
+    { "connect.timeout.ms", AXL_CFG_UINT, "0",
+      "Connect-phase timeout in ms (0 = inherit timeout.ms)",
+      offsetof(struct AxlHttpClient, connect_timeout_ms), sizeof(size_t) },
     { "keep.alive",    AXL_CFG_BOOL, "true", "Reuse TCP connections",
       offsetof(struct AxlHttpClient, keep_alive), sizeof(bool) },
     { "max.redirects", AXL_CFG_INT,  "5", "HTTP redirect limit",
@@ -63,13 +75,6 @@ static const AxlConfigDesc http_client_descs[] = {
       offsetof(struct AxlHttpClient, source_ip), sizeof(char *) },
     { 0 }
 };
-
-/* Foreach callback context for emitting extra headers into request buffer */
-typedef struct {
-    char   *buf;
-    size_t  buf_size;
-    size_t  len;
-} ReqHeaderCtx;
 
 static int
 http_client_apply(void *target, const char *key, const char *value)
@@ -84,6 +89,105 @@ http_client_apply(void *target, const char *key, const char *value)
     }
 
     return 0;  /* not handled — proceed with descriptor lookup */
+}
+
+// ---------------------------------------------------------------------------
+// Shared request-header builder (overflow-safe). axl_snprintf returns the
+// would-have-written count (C99), so the `len += axl_snprintf(buf + len,
+// cap - len, ...)` idiom underflows `cap - len` and writes OOB once `len`
+// passes `cap`. This bounded writer never writes past `cap` and records
+// truncation in `overflow` instead. Shared by the sync streaming path
+// (do_request) and the async core so there is ONE builder.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    char   *buf;
+    size_t  cap;
+    size_t  len;        /* bytes actually written, always <= cap */
+    bool    overflow;   /* a write was truncated */
+} ReqBuf;
+
+static void
+reqbuf_write(const char *data, size_t n, void *arg)
+{
+    ReqBuf *b = (ReqBuf *)arg;
+    for (size_t i = 0; i < n; i++) {
+        if (b->len < b->cap) {
+            b->buf[b->len++] = data[i];
+        } else {
+            b->overflow = true;
+        }
+    }
+}
+
+static void
+reqbuf_append(ReqBuf *b, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void
+reqbuf_append(ReqBuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    axl_vformat(reqbuf_write, b, fmt, ap);
+    va_end(ap);
+}
+
+static void
+reqbuf_emit_header(const void *key, void *value, void *data)
+{
+    reqbuf_append((ReqBuf *)data, "%s: %s\r\n",
+                  (const char *)key, (const char *)value);
+}
+
+int
+_axl_http_build_request(
+    char         *buf,
+    size_t        cap,
+    size_t       *out_len,
+    const char   *method,
+    const char   *full_path,
+    const char   *host,
+    size_t        content_length,
+    bool          chunked,
+    const char   *content_type,
+    bool          keep_alive,
+    AxlHashTable *default_headers,
+    AxlHashTable *extra_headers)
+{
+    ReqBuf b = { buf, cap, 0, false };
+
+    reqbuf_append(&b, "%s %s HTTP/1.1\r\n", method, full_path);
+    reqbuf_append(&b, "Host: %s\r\n", host);
+
+    bool has_body = chunked || content_length > 0;
+    if (chunked) {
+        reqbuf_append(&b, "Transfer-Encoding: chunked\r\n");
+    } else if (content_length > 0) {
+        reqbuf_append(&b, "Content-Length: %llu\r\n",
+                      (unsigned long long)content_length);
+    }
+    if (has_body && content_type != NULL) {
+        reqbuf_append(&b, "Content-Type: %s\r\n", content_type);
+    }
+
+    reqbuf_append(&b, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
+
+    if (default_headers != NULL) {
+        axl_hash_table_foreach(default_headers, reqbuf_emit_header, &b);
+    }
+    if (extra_headers != NULL) {
+        axl_hash_table_foreach(extra_headers, reqbuf_emit_header, &b);
+    }
+
+    reqbuf_append(&b, "\r\n");
+
+    if (b.overflow) {
+        axl_error("request headers exceed %zu bytes", cap);
+        return AXL_ERR;
+    }
+    *out_len = b.len;
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +225,7 @@ axl_http_client_free(AxlHttpClient *c)
     }
 
     if (c->tls_ctx != NULL) {
-        axl_tls_free(c->tls_ctx);
+        client_tls_free(c->tls_ctx);
     }
 
     if (c->sock != NULL) {
@@ -187,7 +291,7 @@ ensure_connected(
 
     /* Close existing connection */
     if (c->tls_ctx != NULL) {
-        axl_tls_free(c->tls_ctx);
+        client_tls_free(c->tls_ctx);
         c->tls_ctx = NULL;
     }
     if (c->sock != NULL) {
@@ -220,20 +324,28 @@ ensure_connected(
            string slot, mirroring the C-level (NULL || zero) contract
            on axl_tcp_connect_via. */
     }
-    if (axl_tcp_connect_via(host, port, src_p, &c->sock) != AXL_OK) {
+    /* Bound the connect phase too — not just send/recv. connect.timeout.ms
+       overrides; 0 inherits timeout.ms, so a caller that sets only
+       timeout.ms=2000 gets a 2 s connect bound instead of the old hardcoded
+       10 s (the surprise this knob fixes). */
+    size_t connect_ms = (c->connect_timeout_ms > 0)
+                            ? c->connect_timeout_ms : c->timeout_ms;
+    if (axl_tcp_connect_timeout(host, port, src_p, connect_ms, &c->sock) != AXL_OK) {
         return -1;
     }
 
     /* TLS handshake if enabled */
     if (c->tls_enabled) {
-        if (axl_tls_init() != AXL_OK) {
-            axl_error("TLS init failed for %s:%u", host, port);
+        if (g_http_tls_ops == NULL) {
+            axl_error("https requires TLS: call axl_tls_init() once at startup "
+                      "(and build with AXL_TLS=1) before issuing https:// "
+                      "requests");
             axl_tcp_close(c->sock);
             c->sock = NULL;
             return -1;
         }
 
-        c->tls_ctx = axl_tls_connect(c->sock, host);
+        c->tls_ctx = g_http_tls_ops->connect(c->sock, host);
         if (c->tls_ctx == NULL) {
             axl_error("TLS context creation failed for %s:%u", host, port);
             axl_tcp_close(c->sock);
@@ -248,9 +360,9 @@ ensure_connected(
             size_t  hs_len = sizeof(hs_buf);
             if (axl_tcp_recv(c->sock, hs_buf, &hs_len,
                              200) == AXL_OK && hs_len > 0) {
-                axl_tls_stage_data(c->tls_ctx, hs_buf, hs_len);
+                g_http_tls_ops->stage_data(c->tls_ctx, hs_buf, hs_len);
             }
-            int rc = axl_tls_handshake(c->tls_ctx);
+            int rc = g_http_tls_ops->handshake(c->tls_ctx);
             if (rc == 0) {
                 hs_done = true;
                 break;
@@ -261,7 +373,7 @@ ensure_connected(
         }
         if (!hs_done) {
             axl_warning("TLS handshake failed for %s:%u", host, port);
-            axl_tls_free(c->tls_ctx);
+            client_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
             axl_tcp_close(c->sock);
             c->sock = NULL;
@@ -283,7 +395,7 @@ static int
 client_send(AxlHttpClient *c, const void *data, size_t len)
 {
     if (c->tls_ctx != NULL) {
-        return axl_tls_write(c->tls_ctx, data, len);
+        return g_http_tls_ops->write(c->tls_ctx, data, len);
     }
     return axl_tcp_send(c->sock, data, len, c->timeout_ms);
 }
@@ -302,7 +414,7 @@ tls_drain(
     size_t got = 0;
     while (got < want) {
         size_t out = 0;
-        int    rc  = axl_tls_read(ctx, dst + got, want - got, &out);
+        int    rc  = g_http_tls_ops->read(ctx, dst + got, want - got, &out);
         if (rc == 0 && out > 0) {
             got += out;
             continue;
@@ -355,7 +467,7 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
             *len = 0;
             return 0;
         }
-        axl_tls_stage_data(c->tls_ctx, c->tls_rx_buf, raw_len);
+        g_http_tls_ops->stage_data(c->tls_ctx, c->tls_rx_buf, raw_len);
 
         got = tls_drain(c->tls_ctx, (uint8_t *)buf, want, &closed);
         *len = got;
@@ -365,24 +477,6 @@ client_recv(AxlHttpClient *c, void *buf, size_t *len)
         return 0;
     }
     return axl_tcp_recv(c->sock, buf, len, c->timeout_ms);
-}
-
-static void
-emit_extra_header(
-    const void *key,
-    void       *value,
-    void       *data)
-{
-    ReqHeaderCtx *ctx = (ReqHeaderCtx *)data;
-
-    if (ctx->len < ctx->buf_size) {
-        ctx->len += axl_snprintf(
-            ctx->buf + ctx->len,
-            ctx->buf_size - ctx->len,
-            "%s: %s\r\n",
-            (const char *)key,
-            (const char *)value);
-    }
 }
 
 /// Read a Transfer-Encoding: chunked response body.
@@ -521,7 +615,7 @@ read_chunked_body(
            record yet. Retry — `client_recv` returns -1 on real EOF /
            close-notify / TCP timeout, so this can't loop forever. */
         work_len += want;
-        axl_yield();
+        _axl_poll_break();
     }
 
     *out_body = body;
@@ -529,29 +623,25 @@ read_chunked_body(
     return 0;
 }
 
-/* Body framing: at most one of (contiguous) or (streamer) is set.
-   - body != NULL, body_size > 0  → contiguous body, Content-Length: body_size.
-   - streamer != NULL            → producer-callback body. If
-                                     stream_total_size == (size_t)-1 the
-                                     framing is Transfer-Encoding:
-                                     chunked; otherwise Content-Length:
-                                     stream_total_size with byte-count
-                                     verification at EOF.
-   - both NULL                    → no body. */
+/* Streaming-request I/O. The contiguous-body sync entry points
+   (axl_http_get/post/put/delete/request) now wrap the async core, so this path
+   serves ONLY axl_http_request_streaming — a producer-callback body framed as
+   Transfer-Encoding: chunked when @p stream_total_size == (size_t)-1, else
+   Content-Length: stream_total_size with byte-count verification at EOF.
+   Streaming bodies are a one-shot producer, so they are NOT replayed on a stale
+   connection and NOT redirect-followed (a 3xx is returned as-is for the caller
+   to re-issue with a fresh streamer). */
 static int
-do_request(
+do_streaming_request(
     AxlHttpClient          *c,
     const char             *method,
     const char             *url,
-    const void             *body,
-    size_t                  body_size,
     AxlRequestBodyStreamer  streamer,
     void                   *stream_ctx,
     size_t                  stream_total_size,
     const char             *content_type,
     AxlHashTable           *extra_headers,
-    AxlHttpClientResponse **resp,
-    size_t                  redirect_count)
+    AxlHttpClientResponse **resp)
 {
     AxlUrl                 *parsed;
     char                    req_buf[2048];
@@ -579,9 +669,10 @@ do_request(
 
     /* Enable TLS for HTTPS URLs */
     if (axl_strcmp(parsed->scheme, "https") == 0) {
-        if (!axl_tls_available()) {
+        if (g_http_tls_ops == NULL) {
             axl_url_free(parsed);
-            axl_error("HTTPS requires AXL_TLS=1 build");
+            axl_error("https requires TLS: build with AXL_TLS=1 and call "
+                      "axl_tls_init() once at startup");
             return -1;
         }
         c->tls_enabled = true;
@@ -610,69 +701,19 @@ do_request(
         axl_snprintf(full_path, sizeof(full_path), "%s", req_path);
     }
 
-    req_len = http_build_request_line(req_buf, sizeof(req_buf),
-                                      method, full_path);
-    req_len += axl_snprintf(req_buf + req_len, sizeof(req_buf) - req_len,
-                            "Host: %s\r\n", parsed->host);
+    /* Body framing: chunked when the total size is unknown ((size_t)-1), else
+       Content-Length: stream_total_size. */
+    bool   stream_chunked  = (stream_total_size == (size_t)-1);
+    size_t req_content_len = stream_chunked ? 0 : stream_total_size;
 
-    bool stream_chunked = false;
-    if (body != NULL && body_size > 0) {
-        req_len += axl_snprintf(req_buf + req_len,
-                                sizeof(req_buf) - req_len,
-                                "Content-Length: %llu\r\n",
-                                (unsigned long long)body_size);
-    } else if (streamer != NULL) {
-        if (stream_total_size == (size_t)-1) {
-            req_len += axl_snprintf(req_buf + req_len,
-                                    sizeof(req_buf) - req_len,
-                                    "Transfer-Encoding: chunked\r\n");
-            stream_chunked = true;
-        } else {
-            req_len += axl_snprintf(req_buf + req_len,
-                                    sizeof(req_buf) - req_len,
-                                    "Content-Length: %llu\r\n",
-                                    (unsigned long long)stream_total_size);
-        }
+    if (_axl_http_build_request(req_buf, sizeof(req_buf), &req_len,
+                                method, full_path, parsed->host,
+                                req_content_len, stream_chunked, content_type,
+                                c->keep_alive, c->default_headers,
+                                extra_headers) != AXL_OK) {
+        axl_url_free(parsed);
+        return -1;
     }
-    if ((body != NULL && body_size > 0) || streamer != NULL) {
-        if (content_type != NULL) {
-            req_len += axl_snprintf(req_buf + req_len,
-                                    sizeof(req_buf) - req_len,
-                                    "Content-Type: %s\r\n", content_type);
-        }
-    }
-
-    req_len += axl_snprintf(req_buf + req_len, sizeof(req_buf) - req_len,
-                            "Connection: %s\r\n",
-                            c->keep_alive ? "keep-alive" : "close");
-
-    /* Emit default headers (from "header.*" config) */
-    if (c->default_headers != NULL) {
-        ReqHeaderCtx def_ctx;
-        def_ctx.buf      = req_buf;
-        def_ctx.buf_size = sizeof(req_buf);
-        def_ctx.len      = req_len;
-
-        axl_hash_table_foreach(c->default_headers,
-                               emit_extra_header, &def_ctx);
-        req_len = def_ctx.len;
-    }
-
-    /* Emit extra per-request headers (override defaults) */
-    if (extra_headers != NULL) {
-        ReqHeaderCtx hdr_ctx;
-        hdr_ctx.buf      = req_buf;
-        hdr_ctx.buf_size = sizeof(req_buf);
-        hdr_ctx.len      = req_len;
-
-        axl_hash_table_foreach(extra_headers,
-                               emit_extra_header, &hdr_ctx);
-        req_len = hdr_ctx.len;
-    }
-
-    /* End of headers */
-    req_len += axl_snprintf(req_buf + req_len,
-                            sizeof(req_buf) - req_len, "\r\n");
 
     /* Send request (with auto-reconnect on stale connection).
        The retry path replays the header send — safe because the
@@ -683,7 +724,7 @@ do_request(
        retrying the header send is still safe here. */
     if (client_send(c, req_buf, req_len) != AXL_OK) {
         if (c->tls_ctx != NULL) {
-            axl_tls_free(c->tls_ctx);
+            client_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
         }
         axl_tcp_close(c->sock);
@@ -699,16 +740,9 @@ do_request(
         }
     }
 
-    /* Send body if present. Three modes: contiguous, streaming
-       with Content-Length, streaming with chunked transfer. */
-    if (body != NULL && body_size > 0) {
-        if (client_send(c, body, body_size) != AXL_OK) {
-            axl_url_free(parsed);
-            return -1;
-        }
-    } else if (streamer != NULL) {
-        /* 8 KiB pull buffer — same size class the upload-route
-           uses on the server side. Stack-resident. */
+    /* Send the streaming body — Content-Length or chunked transfer.
+       8 KiB pull buffer (same size class the upload route uses), stack-resident. */
+    {
         unsigned char chunk[8192];
         uint64_t bytes_sent = 0;
         for (;;) {
@@ -779,28 +813,8 @@ do_request(
     while (total_recv < sizeof(recv_buf)) {
         recv_len = sizeof(recv_buf) - total_recv;
         if (client_recv(c, recv_buf + total_recv, &recv_len) != 0) {
-            /*
-             * If this is the first recv (no data yet), the connection
-             * may have been reset between send and recv. Reconnect and
-             * retry the entire request.
-             */
-            if (total_recv == 0 && !c->retry_attempted &&
-                streamer == NULL)
-            {
-                /* Stale-connection retry: only safe when the body is
-                   contiguous (or absent). Streaming bodies have
-                   already drained their producer; we can't replay. */
-                axl_tcp_close(c->sock);
-                c->sock = NULL;
-                axl_free(c->connected_host);
-                c->connected_host = NULL;
-                c->retry_attempted = true;
-                axl_url_free(parsed);
-                return do_request(c, method, url, body, body_size,
-                                  streamer, stream_ctx, stream_total_size,
-                                  content_type, extra_headers,
-                                  resp, redirect_count);
-            }
+            /* A streaming body has already drained its one-shot producer, so we
+               can't replay the request on a stale connection — fail. */
             axl_url_free(parsed);
             return -1;
         }
@@ -848,38 +862,9 @@ do_request(
         return -1;
     }
 
-    /* Handle redirects. Streaming bodies can't be replayed, so a
-       redirect on a streaming request is reported as success at
-       the redirect status — caller decides whether to issue a
-       fresh request with a new streamer. */
-    if ((status_code == 301 || status_code == 302 ||
-         status_code == 307) &&
-        redirect_count < (size_t)c->max_redirects &&
-        streamer == NULL)
-    {
-        const char *location = (const char *)axl_hash_table_lookup(
-            resp_headers, "location");
-        if (location != NULL) {
-            char *redirect_url = axl_strdup(location);
-            axl_debug("redirect %llu -> %s",
-                      (unsigned long long)status_code, redirect_url);
-            axl_hash_table_free(resp_headers);
-            axl_url_free(parsed);
-
-            /* Close connection for redirect (new host possible) */
-            axl_tcp_close(c->sock);
-            c->sock = NULL;
-            axl_free(c->connected_host);
-            c->connected_host = NULL;
-
-            int rc = do_request(c, method, redirect_url, body,
-                                body_size, NULL, NULL, 0,
-                                content_type, extra_headers,
-                                resp, redirect_count + 1);
-            axl_free(redirect_url);
-            return rc;
-        }
-    }
+    /* Streaming requests are NOT redirect-followed (the one-shot producer can't
+       be replayed): a 3xx is returned as-is for the caller to re-issue with a
+       fresh streamer. */
 
     /* Read body. Two transports: Content-Length (size known up front)
        or Transfer-Encoding: chunked (size discovered chunk-by-chunk).
@@ -943,9 +928,10 @@ do_request(
             /* client_recv already goes through an ephemeral loop that
                observes Ctrl-C, but a rapid burst of small recvs could
                complete many iterations between break-event dispatches.
-               Yielding here dispatches the default loop and lets the
-               auto-exit handler fire promptly on a large download. */
-            axl_yield();
+               Poll the break flag here so the auto-exit handler fires
+               promptly on a large download — without re-dispatching the
+               consumer's loop (this runs inside their request call). */
+            _axl_poll_break();
         }
     }
 
@@ -998,17 +984,16 @@ do_request(
 // Public API
 // ---------------------------------------------------------------------------
 
+// The contiguous-body sync entry points are thin ephemeral-loop wrappers over
+// the async core (Option A — one I/O implementation). _axl_http_request_sync
+// (axl-http-client-async.c) spins a private loop, runs the async request, and
+// harvests the response. Only the streaming path below still uses do_request.
+
 int
 axl_http_get(AxlHttpClient *c, const char *url,
              AxlHttpClientResponse **out_resp)
 {
-    if (c == NULL || url == NULL) {
-        return AXL_ERR;
-    }
-
-    c->retry_attempted = false;
-    return do_request(c, "GET", url, NULL, 0, NULL, NULL, 0, NULL, NULL,
-                      out_resp, 0);
+    return _axl_http_request_sync(c, "GET", url, NULL, 0, NULL, NULL, out_resp);
 }
 
 int
@@ -1016,14 +1001,8 @@ axl_http_post(AxlHttpClient *c, const char *url, const void *body,
               size_t size, const char *content_type,
               AxlHttpClientResponse **out_resp)
 {
-    if (c == NULL || url == NULL) {
-        return AXL_ERR;
-    }
-
-    c->retry_attempted = false;
-    return do_request(c, "POST", url, body, (size_t)size,
-                      NULL, NULL, 0,
-                      content_type, NULL, out_resp, 0);
+    return _axl_http_request_sync(c, "POST", url, body, size, content_type,
+                                  NULL, out_resp);
 }
 
 int
@@ -1031,28 +1010,16 @@ axl_http_put(AxlHttpClient *c, const char *url, const void *body,
              size_t size, const char *content_type,
              AxlHttpClientResponse **out_resp)
 {
-    if (c == NULL || url == NULL) {
-        return AXL_ERR;
-    }
-
-    c->retry_attempted = false;
-    return do_request(c, "PUT", url, body, (size_t)size,
-                      NULL, NULL, 0,
-                      content_type, NULL, out_resp, 0);
+    return _axl_http_request_sync(c, "PUT", url, body, size, content_type,
+                                  NULL, out_resp);
 }
 
 int
 axl_http_delete(AxlHttpClient *c, const char *url,
                 AxlHttpClientResponse **out_resp)
 {
-    if (c == NULL || url == NULL) {
-        return AXL_ERR;
-    }
-
-    c->retry_attempted = false;
-    return do_request(c, "DELETE", url, NULL, 0,
-                      NULL, NULL, 0,
-                      NULL, NULL, out_resp, 0);
+    return _axl_http_request_sync(c, "DELETE", url, NULL, 0, NULL, NULL,
+                                  out_resp);
 }
 
 int
@@ -1061,14 +1028,11 @@ axl_http_request(AxlHttpClient *c, const char *method, const char *url,
                  const char *content_type, AxlHashTable *extra_headers,
                  AxlHttpClientResponse **out_resp)
 {
-    if (c == NULL || method == NULL || url == NULL) {
+    if (method == NULL) {
         return AXL_ERR;
     }
-
-    c->retry_attempted = false;
-    return do_request(c, method, url, body, (size_t)body_size,
-                      NULL, NULL, 0,
-                      content_type, extra_headers, out_resp, 0);
+    return _axl_http_request_sync(c, method, url, body, body_size, content_type,
+                                  extra_headers, out_resp);
 }
 
 /* Adapter that pulls the producer's bytes out of an AxlStream via
@@ -1142,10 +1106,8 @@ axl_http_request_streaming(AxlHttpClient *c, const char *method,
         }
         return AXL_ERR;
     }
-    c->retry_attempted = false;
-    int rc = do_request(c, method, url, NULL, 0,
-                        streamer, ctx, total_size,
-                        content_type, extra_headers, out_resp, 0);
+    int rc = do_streaming_request(c, method, url, streamer, ctx, total_size,
+                                  content_type, extra_headers, out_resp);
     /* Cleanup fires regardless of success — consumer doesn't need
        to thread free-on-error through every callsite. */
     if (cleanup_fn != NULL) {

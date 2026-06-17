@@ -21,6 +21,8 @@ Library / SDK foundations:
 - [AXL-Coding-Style.md](AXL-Coding-Style.md) · [AXL-Lifecycle.md](AXL-Lifecycle.md) · [AXL-Concurrency.md](AXL-Concurrency.md)
 - [AXLMM-Design.md](AXLMM-Design.md) — C++ (`libaxl-cxx`) bindings plan
 - [AXL-EFI-Encapsulation-Plan.md](AXL-EFI-Encapsulation-Plan.md) — public-API UEFI-type hygiene / portability
+- [AXL-Loop-Reentrancy-Plan.md](AXL-Loop-Reentrancy-Plan.md) — remediate blocking-on-a-running-loop (re-entrancy guard, deferred HTTP responses, async-first services, `axl_yield` split)
+- [AXL-vs-EDK2-Scope.md](AXL-vs-EDK2-Scope.md) — what we replace vs deliberately omit; audience-facing gap list
 - [AXL-Porting-Guide.md](AXL-Porting-Guide.md) · [RELEASING.md](RELEASING.md)
 
 Subsystems:
@@ -120,6 +122,17 @@ Heavyweight module; phased. AGT renders via `AgtFormBrowser` (out of scope here)
 - [ ] Write + default stores (gated; the dangerous phase)
 - [ ] Manifest: add HII IFR/package structs to `scripts/uefi-manifest.json5`
 
+### Storage access (NVMe / ATA / SCSI) + SMART — [AXL-Storage-Design.md](AXL-Storage-Design.md)
+Platform Access modules for device identity + health (the `smartctl` gap;
+`storelib`/RAID is a non-goal). Per-transport, read-first, with a raw
+pass-thru escape hatch and a normalized cross-transport health struct.
+- [x] Design doc + `axl-nvme.h` contract (contract-first reviewed)
+- [x] Phase 1 `AxlNvme` — Identify (Controller/Namespace) + SMART (Get Log Page 0x02) + Device Self-test + raw admin pass-thru; pure decoders unit-tested; `tools/nvme`; `mkfixture` refactored onto it; `test-nvme-qemu.sh` (`-device nvme`) in CI
+- [x] Phase 2 `AxlAta` — IDENTIFY DEVICE + SMART (READ DATA + THRESHOLDS) + self-test; pure decoders unit-tested; `tools/ata`; AtaPassThru struct hand-written; `test-ata-qemu.sh` (`ich9-ahci` + SATA disk) in CI. Fixed the directly-attached-SATA device-walk (PortMultiplierPort 0xFFFF sentinel collision)
+- [x] Phase 3 `AxlScsi` — INQUIRY (std + VPD 0x80 serial) + READ CAPACITY (16) + LOG SENSE health (IE page 0x2F + Temperature page 0x0D) + raw CDB pass-thru; pure decoders unit-tested; `tools/scsi`; ExtScsiPassThru struct hand-written; `test-scsi-qemu.sh` (`virtio-scsi` disk + CD) in CI. Walk filters phantom LUNs by INQUIRY peripheral qualifier. Self-test + VPD 0x83 deferred to the raw escape hatch
+- [x] Phase 4 `AxlSmart` + `tools/smart` — normalized `AxlSmartHealth` rollup over the union device walk (`axl_storage_next` across NVMe/ATA/SCSI) + `axl_smart_health` dispatch + pure per-transport normalizers (`axl_smart_from_*`, unit-tested) + `axl_storage_get_location` (NVMe device-path / ATA port.pmp / SCSI target:lun). `test-smart-qemu.sh` (one device per transport) in CI; NVMe+ATA health end-to-end, SCSI health real-hardware-only
+- Non-goals: RAID/HBA mgmt (storelib), block read/write, GPT, destructive typed commands (FORMAT/SANITIZE/fw-download)
+
 ---
 
 ## Open backlog
@@ -127,6 +140,15 @@ Heavyweight module; phased. AGT renders via `AgtFormBrowser` (out of scope here)
 Grouped, terse; **detail lives in the linked design doc or
 [ROADMAP-Archive.md](ROADMAP-Archive.md)**. Most are opportunistic / low-priority.
 
+- **Sync→async API split — build on demand** (→ [AXL-Concurrency.md § "Extending
+  the model"](AXL-Concurrency.md#extending-the-model-which-apis-go-async-and-when)):
+  the net stack's sync-wraps-async shape applies to any op that blocks on
+  hardware/firmware completion. Ranked candidates: **IPMI/BMC** (KCS/SSIF
+  busy-poll → loop Poll-tick; SoftBMC roadmap) and **storage** (NVMe/ATA/SCSI
+  PassThru `Event`, BlockIo2; self-test/SMART/large-read; SoftBMC roadmap) are
+  the near-term ones; MP-services (`StartupAllAPs` `WaitEvent`), USB async
+  transfers, and TPM are lower. Un-defer each when a consumer needs it — do not
+  build speculatively.
 - **Hardware-fixture capture — remaining phases** (→ [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md),
   Archive): TPM/PCR + TCG event-log capture/replay (swtpm); secure-boot + boot-var
   capture/inject; Redfish-mock capture/replay; in-band IPMI/KCS capture;

@@ -17,12 +17,18 @@
  * `<axl/axl-config.h>` to also pull the matching CLI / config
  * descriptors into a consumer's own table without copy-paste.
  *
- * **Out of scope by design**: setting a static IPv4 onto the NIC
- * (the `ifconfig`-equivalent layer). Call `axl_net_set_static_ip`
- * directly if a tool genuinely needs to mutate `IP4Config2`
- * policy — that's stateful system config, not a per-invocation
- * connection option. Source / listen IP selection (`local_ip`
- * below) is the connection-side knob and stays here.
+ * Two distinct option groups live here, matching axl-sdk's
+ * connection-vs-policy line:
+ *   - `AxlNetOpts` + `axl_config_descs_net` — per-invocation
+ *     **connection** options (which NIC, source/listen IP, port).
+ *     These bind sockets; they do not touch firmware state.
+ *   - `AxlNetStaticOpts` + `axl_config_descs_net_static` — the
+ *     **IP4Config2 policy** group (DHCP-vs-static, IP / mask /
+ *     gateway / DNS / hostname). This is the `ifconfig`-equivalent
+ *     layer that mutates stateful system config; it is kept a
+ *     separate struct + descriptor group precisely so the two
+ *     concepts don't blur. An on-box network-setup UI wants this
+ *     group; a one-shot fetch client wants only `AxlNetOpts`.
  *
  * IPv4 only for v1. An IPv6 / family-tagged variant is a clean
  * future addition.
@@ -138,6 +144,58 @@ typedef enum {
                                              | AXL_NET_OPT_LISTEN_IP)
 
 // ---------------------------------------------------------------------------
+// Static / policy options bag (the IP4Config2 "ifconfig" layer)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief IP4Config2 policy options — the on-box `ifconfig` form.
+ *
+ * The struct an ifconfig UI binds its Configure form to: pick
+ * DHCP-vs-static and, for static, the address / mask / gateway / DNS /
+ * hostname. Pair with `axl_config_descs_net_static` (in
+ * `<axl/axl-config.h>`) to emit the matching CLI / config descriptors
+ * without hand-authoring the form, and apply with `axl_net_init_static`.
+ *
+ * Fields are `const char *` (dotted-quad / name strings), NOT inline
+ * buffers — matching `AxlNetOpts.local_ip` and, crucially, AxlConfig's
+ * string auto-apply, which stores a **borrowed pointer** into the field
+ * (an inline `char[]` would silently fail to populate, or worse). So the
+ * normal flow is descriptor-driven: embed this struct, call
+ * `axl_config_descs_net_static`, and `axl_config_new` points each field
+ * at the interned config value. A consumer filling the struct by hand
+ * instead points the fields at its own buffers. Either way the pointed-at
+ * strings must outlive the `axl_net_init_static` call (the AxlConfig's
+ * lifetime, in the descriptor-driven case). `axl_net_init_static` parses
+ * them; NULL or "" means "unset / leave unchanged" for every field.
+ *
+ * Field semantics:
+ *   - `mode` — `"dhcp"` (the default; NULL/"" also means DHCP) or
+ *     `"static"`. The descriptor ships these as its `choices` so a UI can
+ *     render a two-value picker; note AxlConfig does not itself *enforce*
+ *     choices on the set path — `axl_net_init_static` is the validator and
+ *     rejects an unrecognized non-empty `mode`.
+ *   - `ip` / `netmask` / `gateway` — the static address (used only when
+ *     `mode == "static"`). `gateway` empty = no gateway.
+ *   - `dns` / `dns2` — primary / secondary resolver (applied on both the
+ *     DHCP and static paths when set — a static box and a DHCP box that
+ *     wants an override both set these). `dns` empty = leave the
+ *     firmware/DHCP-provided resolver in place (and `dns2` is then ignored
+ *     — no secondary without a primary).
+ *   - `hostname` — the box's hostname. Empty = leave unchanged. See
+ *     `axl_net_set_hostname` for what "set" means (a persisted value;
+ *     UEFI has no firmware-advertised hostname).
+ */
+typedef struct {
+    const char *mode;       ///< "dhcp" (default; NULL/"" = dhcp) or "static"
+    const char *ip;         ///< static IPv4 dotted-quad (mode = static)
+    const char *netmask;    ///< subnet mask (mode = static)
+    const char *gateway;    ///< default gateway; NULL/"" = none
+    const char *dns;        ///< primary DNS server; NULL/"" = leave as-is
+    const char *dns2;       ///< secondary DNS server; NULL/"" = none
+    const char *hostname;   ///< hostname; NULL/"" = leave unchanged
+} AxlNetStaticOpts;
+
+// ---------------------------------------------------------------------------
 // One-call bring-up
 // ---------------------------------------------------------------------------
 
@@ -179,6 +237,39 @@ int
 axl_net_init_from_opts(
     const AxlNetOpts *opts,        ///< options bag
     size_t            timeout_sec  ///< DHCP wait (0 = 10 s default)
+);
+
+/**
+ * @brief Apply an `AxlNetStaticOpts` policy bag — the one-call static
+ *     (or DHCP) bring-up matching the DHCP-only `axl_net_init`.
+ *
+ * Dispatches on `cfg->mode` (NULL/""/"dhcp" = DHCP; "static" = static; any
+ * other value is rejected with AXL_ERR rather than silently defaulting):
+ *   - `"static"` — loads drivers + waits for link (no DHCP), applies the
+ *     parsed ip / mask / gateway via `axl_net_set_static_ip`, then the
+ *     resolver(s) via `axl_net_set_dns` and the hostname via
+ *     `axl_net_set_hostname` when set, and waits for the new address to
+ *     settle (polling for it, so a subsequent `axl_net_get_ip_address`
+ *     read-back is valid).
+ *   - `"dhcp"` — runs DHCP via `axl_net_init`, then applies `dns` / `dns2`
+ *     / `hostname` if set (a DHCP box overriding its resolver / naming).
+ *
+ * Address read-back is implicit (as in `axl_net_init`): call
+ * `axl_net_get_ip_address` if you need the resolved IP. NULL/"" fields are
+ * skipped; `dns` empty skips the resolver set entirely (no `dns2` without a
+ * `dns`). Malformed dotted-quads in a `"static"` bag fail the call (AXL_ERR)
+ * rather than silently configuring a wrong address. @p nic_index accepts
+ * `AXL_NET_NIC_AUTO` (mapped to the first usable NIC).
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL @p cfg, an unrecognized
+ *     `mode`, a parse error, or a driver-load / link / DHCP / IP4Config2
+ *     failure.
+ */
+int
+axl_net_init_static(
+    const AxlNetStaticOpts *cfg,         ///< policy options bag
+    uint64_t                nic_index,   ///< AXL_NET_NIC_AUTO or 0-based NIC index
+    size_t                  timeout_sec  ///< DHCP wait (0 = 10 s default; ignored on static)
 );
 
 #ifdef __cplusplus

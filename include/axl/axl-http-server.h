@@ -732,6 +732,14 @@ axl_http_server_add_websocket(
 /**
  * @brief Broadcast data to all connected WebSocket clients on a path.
  *
+ * Each client's frame is queued on a per-connection outbound FIFO and sent
+ * one at a time (the transport is one-send-in-flight, and over TLS frames must
+ * serialize or the stream desyncs), so a burst of broadcasts is delivered
+ * in order without racing. Under sustained back-pressure (a slow client) the
+ * queue is bounded and drops the oldest *unsent* frames — lossy by design,
+ * which suits a live feed (a console mirror, a metrics stream); a consumer
+ * that needs every byte must apply its own flow control.
+ *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
 int
@@ -748,6 +756,10 @@ axl_http_server_ws_broadcast(
 
 typedef struct {
     const char  *username;
+    /// Caller-defined privilege level returned by the auth callback. A
+    /// route gated with AXL_ROUTE_ADMIN admits the request only when
+    /// `role >= AXL_ROUTE_ADMIN` (i.e. >= 2) — the route flag doubles as
+    /// the role threshold. Lower values authenticate but are not admin.
     size_t      role;
 } AxlAuthInfo;
 
@@ -762,9 +774,13 @@ typedef int (*AxlAuthCallback)(
     void           *data       ///< opaque caller data
 );
 
-#define AXL_ROUTE_NO_AUTH  0x00
-#define AXL_ROUTE_AUTH     0x01
-#define AXL_ROUTE_ADMIN    0x02
+/// Route auth flags, passed to every `*_auth` registration function.
+/// Any non-zero value requires the server's auth callback
+/// (`axl_http_server_use_auth`) to succeed — if NO callback is
+/// registered, a gated request is rejected 401 unconditionally.
+#define AXL_ROUTE_NO_AUTH  0x00  ///< open: no authentication
+#define AXL_ROUTE_AUTH     0x01  ///< any authenticated user (callback succeeds; 401 otherwise)
+#define AXL_ROUTE_ADMIN    0x02  ///< authenticated AND role >= AXL_ROUTE_ADMIN (403 otherwise)
 
 /**
  * @brief Register an authentication handler for the server.
@@ -776,6 +792,29 @@ axl_http_server_use_auth(
     AxlHttpServer   *s,    ///< server
     AxlAuthCallback cb,    ///< authentication callback
     void            *data  ///< opaque caller data
+);
+
+/**
+ * @brief Set the WWW-Authenticate challenge emitted on a 401.
+ *
+ * When @p scheme is set, every 401 the server returns carries
+ *   `WWW-Authenticate: <scheme> realm="<realm>"`
+ * (the realm param is omitted when @p realm is NULL), so interactive
+ * clients — browsers, macOS Finder, Windows Explorer — prompt for
+ * credentials instead of showing a bare 401. @p scheme is typically
+ * `"Basic"`. Passing a NULL @p scheme clears the challenge (the default:
+ * no header, which only works with clients that send credentials
+ * preemptively). @p scheme must contain no whitespace; neither argument
+ * may contain a quote or CR/LF (rejected to prevent header injection).
+ *
+ * @return AXL_OK on success; AXL_ERR on a NULL server, an invalid
+ *     scheme/realm, or allocation failure.
+ */
+int
+axl_http_server_set_auth_challenge(
+    AxlHttpServer *s,       ///< server
+    const char    *scheme,  ///< e.g. "Basic"; NULL clears the challenge
+    const char    *realm    ///< realm label, or NULL to omit the realm
 );
 
 /**
@@ -791,6 +830,175 @@ axl_http_server_add_route_auth(
     AxlHttpHandler handler,      ///< handler function
     void           *data,        ///< context passed to handler
     uint32_t       auth_flags    ///< AXL_ROUTE_* flags
+);
+
+// ---------------------------------------------------------------------------
+// WebSocket — per-connection API (authenticated / per-client endpoints)
+// ---------------------------------------------------------------------------
+//
+// The broadcast-only API above (axl_http_server_add_websocket +
+// ws_broadcast) fits a single shared feed to all clients. A per-client
+// endpoint — a web terminal, a per-user subscription — needs to know WHICH
+// client a frame came from, reply to just that client, and authenticate the
+// upgrade. This block adds that without breaking the broadcast API: register
+// with axl_http_server_add_websocket_ex instead, and the handler receives an
+// AxlWsConn handle.
+
+/// Opaque per-connection WebSocket handle (one per connected client),
+/// distinct from the per-endpoint registration. Passed to an
+/// AxlWsConnHandler and the axl_ws_* accessors below.
+typedef struct AxlWsConn AxlWsConn;
+
+/**
+ * @brief Per-connection WebSocket event callback.
+ *
+ * The richer sibling of AxlWsHandler: it additionally receives the
+ * AxlWsConn the event is for, enabling per-client reply (axl_ws_send),
+ * identity (axl_ws_conn_auth / axl_ws_conn_peer), and per-connection
+ * session state (axl_ws_conn_set_user_data). Registered via
+ * axl_http_server_add_websocket_ex.
+ *
+ * @p event is AXL_WS_CONNECT (stash session state now), AXL_WS_TEXT /
+ * AXL_WS_BINARY (a frame), or AXL_WS_DISCONNECT (tear session state down).
+ * @p conn is valid for the duration of the call, and for any later
+ * axl_ws_* call while the connection is open — but NOT after this handler
+ * returns from AXL_WS_DISCONNECT. @p data is the per-endpoint opaque from
+ * registration (shared by all clients on the path).
+ *
+ * AXL_WS_CONNECT fires AFTER the 101 handshake response has been sent, so
+ * an `axl_ws_send` from it (a greeting / banner) is valid. Returning
+ * AXL_ERR from AXL_WS_CONNECT rejects the connection — it is closed with no
+ * further events (no DISCONNECT). For AXL_WS_TEXT / _BINARY the return is
+ * currently ignored; call axl_ws_conn_close to drop a connection mid-stream.
+ *
+ * @return AXL_OK to keep the connection; AXL_ERR from CONNECT to reject it.
+ */
+typedef int (*AxlWsConnHandler)(
+    AxlWsConn  *conn,       ///< the client this event is for
+    size_t      event,      ///< AXL_WS_CONNECT / _TEXT / _BINARY / _DISCONNECT
+    const void *frame,      ///< frame data (NULL for CONNECT/DISCONNECT)
+    size_t      frame_size, ///< frame data size
+    void       *data        ///< per-endpoint opaque (from registration)
+);
+
+/**
+ * @brief Register a WebSocket endpoint with per-connection callbacks + auth.
+ *
+ * Like axl_http_server_add_websocket, but the handler is an
+ * AxlWsConnHandler (per-client handle) and the upgrade is gated by
+ * @p auth_flags exactly like an HTTP route: AXL_ROUTE_NO_AUTH opens it;
+ * AXL_ROUTE_AUTH / AXL_ROUTE_ADMIN run the server's auth callback
+ * (axl_http_server_use_auth) against the upgrade request and reject it
+ * 401 / 403 — no handshake — on failure, so an authenticated endpoint never
+ * completes the upgrade for an unauthorized client. On success the resolved
+ * AxlAuthInfo is attached to the connection (axl_ws_conn_auth).
+ *
+ * A given path is registered with EITHER this or add_websocket, not both.
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL @p s / @p path / @p handler,
+ *     the route table being full, or OOM.
+ */
+int
+axl_http_server_add_websocket_ex(
+    AxlHttpServer    *s,           ///< server
+    const char       *path,        ///< WebSocket endpoint path
+    AxlWsConnHandler  handler,     ///< per-connection event handler
+    void             *data,        ///< per-endpoint opaque
+    uint32_t          auth_flags   ///< AXL_ROUTE_NO_AUTH / _AUTH / _ADMIN
+);
+
+/**
+ * @brief Send a frame to one WebSocket client.
+ *
+ * The per-client counterpart of axl_http_server_ws_broadcast: delivers
+ * exactly to @p conn. @p opcode is AXL_WS_TEXT or AXL_WS_BINARY. Safe to
+ * call from within the handler — including AXL_WS_CONNECT (a greeting),
+ * which fires after the 101 — or from any later code holding a still-open
+ * @p conn (e.g. a terminal pump). NOT valid after that connection's
+ * AXL_WS_DISCONNECT handler has returned.
+ *
+ * Like axl_http_server_ws_broadcast, frames are queued on the connection's
+ * outbound FIFO and serialized over the one-send-in-flight transport, so
+ * back-to-back sends are delivered in order (and never desync TLS); the queue
+ * is bounded and drops oldest-unsent under sustained back-pressure.
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL @p conn / @p data, a bad
+ *     @p opcode, a closed / non-WebSocket connection, or a send failure.
+ */
+int
+axl_ws_send(
+    AxlWsConn  *conn,    ///< target client
+    size_t      opcode,  ///< AXL_WS_TEXT or AXL_WS_BINARY
+    const void *data,    ///< frame payload
+    size_t      size     ///< payload size in bytes
+);
+
+/**
+ * @brief Read the authenticated identity captured at upgrade.
+ *
+ * Fills @p out with the AxlAuthInfo resolved when the connection upgraded
+ * on an AXL_ROUTE_AUTH / _ADMIN endpoint. An AXL_ROUTE_NO_AUTH endpoint has
+ * no identity: returns AXL_ERR with @p out untouched.
+ *
+ * @return AXL_OK with @p out filled; AXL_ERR on NULL args or an
+ *     unauthenticated endpoint.
+ */
+int
+axl_ws_conn_auth(
+    AxlWsConn   *conn,   ///< connection
+    AxlAuthInfo *out     ///< [out] identity (username / role)
+);
+
+/**
+ * @brief Get the peer (client) IPv4 address of a WebSocket connection.
+ *
+ * Writes the 4 octets of the client's address into @p out (matching the
+ * AxlNetInterface.ipv4 byte layout).
+ *
+ * @return AXL_OK with @p out filled; AXL_ERR on NULL args or an
+ *     address that could not be determined.
+ */
+int
+axl_ws_conn_peer(
+    AxlWsConn *conn,    ///< connection
+    uint8_t    out[4]   ///< [out] client IPv4 (4 octets)
+);
+
+/**
+ * @brief Attach a per-connection user pointer (a session object).
+ *
+ * A slot for the consumer's own per-client state (a terminal session, a
+ * subscription set), distinct from the per-endpoint @p data shared by all
+ * clients on the path. Set it on AXL_WS_CONNECT, use it per frame, free it
+ * on AXL_WS_DISCONNECT — AXL never frees it (the consumer owns the lifetime).
+ */
+void
+axl_ws_conn_set_user_data(
+    AxlWsConn *conn,   ///< connection
+    void      *user    ///< consumer-owned pointer (AXL does not free it)
+);
+
+/**
+ * @brief Read the per-connection user pointer set by
+ *     axl_ws_conn_set_user_data (NULL if never set).
+ */
+void *
+axl_ws_conn_user_data(
+    AxlWsConn *conn    ///< connection
+);
+
+/**
+ * @brief Close a specific WebSocket connection (server-initiated).
+ *
+ * Sends a WebSocket close frame and tears the connection down; the
+ * handler's AXL_WS_DISCONNECT fires as usual. Use for a logout / idle
+ * timeout. @p conn is invalid after the disconnect handler returns.
+ *
+ * @return AXL_OK on success; AXL_ERR on a NULL / closed connection.
+ */
+int
+axl_ws_conn_close(
+    AxlWsConn *conn    ///< connection to close
 );
 
 // ---------------------------------------------------------------------------
@@ -895,6 +1103,32 @@ axl_http_server_add_upload_route(
     const char      *path,     ///< path pattern
     AxlUploadHandler handler,  ///< upload handler
     void            *data      ///< opaque caller data
+);
+
+/**
+ * @brief Register a streaming upload route with authentication requirements.
+ *
+ * Like `axl_http_server_add_upload_route`, but the route is gated by
+ * the server's authentication callback (`axl_http_server_use_auth`).
+ * The callback runs BEFORE a single body byte reaches the upload
+ * handler — a failed check sends 401 (or 403 when an `AXL_ROUTE_ADMIN`
+ * route is presented a lesser role) and the body is never streamed.
+ * Passing `AXL_ROUTE_NO_AUTH` is identical to the non-auth variant.
+ *
+ * Auth for uploads is necessarily header-based (cookie / Authorization
+ * / client address): the body is not materialized, so the auth
+ * callback sees a request whose `body` is NULL.
+ *
+ * @return AXL_OK on success, AXL_ERR on failure.
+ */
+int
+axl_http_server_add_upload_route_auth(
+    AxlHttpServer   *s,          ///< server
+    const char      *method,     ///< HTTP method
+    const char      *path,       ///< path pattern
+    AxlUploadHandler handler,    ///< upload handler
+    void            *data,       ///< opaque caller data
+    uint32_t         auth_flags  ///< AXL_ROUTE_* flags
 );
 
 // ---------------------------------------------------------------------------
@@ -1049,7 +1283,7 @@ typedef struct {
  * @brief Mount a WebDAV handler at @p prefix.
  *
  * Registers verb routes (OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE,
- * MKCOL, MOVE) under `<prefix>/<wildcard>` that drive @p ops. The @p ops
+ * MKCOL, MOVE, COPY) under `<prefix>/<wildcard>` that drive @p ops. The @p ops
  * table is COPIED into the server — caller may free / re-use the
  * struct after this returns. @p user_data is borrowed and must
  * outlive the server.
@@ -1066,6 +1300,151 @@ axl_http_server_add_webdav(
     const char          *prefix,    ///< URL prefix, e.g. "/dav"
     const AxlWebDavOps  *ops,       ///< callback table (copied)
     void                *user_data  ///< opaque, passed back to ops
+);
+
+/**
+ * @brief Mount a WebDAV handler with authentication requirements.
+ *
+ * Like `axl_http_server_add_webdav`, but @p auth_flags is applied to
+ * every verb route the mount registers — including the streaming PUT,
+ * which is gated before any body byte is read (see
+ * `axl_http_server_add_upload_route_auth`). The server's
+ * authentication callback (`axl_http_server_use_auth`) therefore gates
+ * the whole mount with no per-route glue. `AXL_ROUTE_NO_AUTH` leaves
+ * it open — identical to `axl_http_server_add_webdav`.
+ *
+ * @return AXL_OK on success, AXL_ERR on bad arguments or if the
+ *     server already has the maximum number of WebDAV mounts.
+ */
+int
+axl_http_server_add_webdav_auth(
+    AxlHttpServer       *s,
+    const char          *prefix,     ///< URL prefix, e.g. "/dav"
+    const AxlWebDavOps  *ops,        ///< callback table (copied)
+    void                *user_data,  ///< opaque, passed back to ops
+    uint32_t             auth_flags  ///< AXL_ROUTE_* flags applied to every verb route
+);
+
+// ---------------------------------------------------------------------------
+// Filesystem-backed WebDAV — the generic glue between add_webdav and
+// <axl/axl-fs.h>, so a consumer serving a mounted volume doesn't
+// hand-write the ~13 AxlWebDavOps callbacks.
+// ---------------------------------------------------------------------------
+
+/// Serve read-only: PUT / DELETE / MKCOL / MOVE / COPY are rejected
+/// with 405 Method Not Allowed; GET / HEAD / PROPFIND / OPTIONS work.
+#define AXL_SERVE_FS_READONLY     0x01u
+/// Reject the DELETE verb (405). Scope is literal: DELETE only. MOVE is
+/// still allowed (and a MOVE relocates, removing the source from its
+/// original path) — use AXL_SERVE_FS_READONLY for "nothing changes".
+#define AXL_SERVE_FS_NO_DELETE    0x02u
+/// PUT / MOVE / COPY must not replace an existing resource: an
+/// overwrite is refused. Enforced by a destination existence-check in
+/// the ops (PUT opens with exclusive-create; MOVE/COPY pre-stat the
+/// destination — `axl_file_move` itself replaces unconditionally, so it
+/// is never delegated the check). A refusal surfaces as 409 Conflict —
+/// the ops layer has no channel to return the RFC-ideal 412 in v1.
+#define AXL_SERVE_FS_NO_OVERWRITE 0x04u
+
+/**
+ * @brief A filesystem subtree bound to a WebDAV path-space.
+ *
+ * The `user_data` for `axl_fs_webdav_ops()`. Maps each relative WebDAV
+ * path onto a path within `fs_root` under the given access flags.
+ *
+ * Traversal containment (security guarantee): the request path is
+ * normalized against the mount root first — `.` / `..` components are
+ * resolved away and any `..` that would climb above the mount is
+ * rejected (404) — so the mapped path is always inside `fs_root`. A
+ * request like `/../../FS0:/secret` cannot escape the served subtree.
+ *
+ * Opaque; create with `axl_fs_root_new`, free with `axl_fs_root_free`.
+ */
+typedef struct AxlFsRoot AxlFsRoot;
+
+/**
+ * @brief Bind a filesystem subtree to serve via WebDAV.
+ *
+ * @p fs_root is an axl filesystem path — a volume root like `"FS0:"` or
+ * a subdirectory like `"FS0:\\share"` (a RAM-disk volume works too).
+ * Either separator works (`"FS0:/share"` too); a trailing separator is
+ * accepted and normalized away. The WebDAV root path `/` maps to
+ * `fs_root` itself, so `list_dir("/")` lists `fs_root`'s entries.
+ * The returned root is the `user_data` you pass to
+ * `axl_http_server_add_webdav` alongside `axl_fs_webdav_ops()`. It is
+ * borrowed by the mount, never freed by `add_webdav` — you free it once
+ * with `axl_fs_root_free` after every server using it is freed (it may
+ * back more than one mount).
+ *
+ * @return new root, or NULL on OOM / NULL @p fs_root.
+ */
+AxlFsRoot *
+axl_fs_root_new(
+    const char *fs_root,   ///< filesystem base path (e.g. "FS0:" or "FS0:\\share")
+    uint32_t    flags      ///< AXL_SERVE_FS_* access flags
+);
+
+/**
+ * @brief Free an AxlFsRoot. NULL-safe.
+ */
+void
+axl_fs_root_free(
+    AxlFsRoot *root
+);
+
+/**
+ * @brief The generic axl-fs-backed WebDAV callback table.
+ *
+ * Each callback maps to an `<axl/axl-fs.h>` primitive (list_dir →
+ * `axl_dir_*`, stat → `axl_file_info`, read → `axl_file_view`, write →
+ * `AxlFileWriter`, mkdir → `axl_dir_mkdir`, remove →
+ * `axl_file_delete`/`axl_dir_rmdir`, move → `axl_file_move`, copy →
+ * stream read+write / recursive). Pass it to
+ * `axl_http_server_add_webdav` with an `AxlFsRoot*` as `user_data`. A
+ * consumer that wants to wrap or extend the behavior can copy this
+ * table and override individual callbacks.
+ *
+ * The returned table is the full read-write set regardless of any
+ * AxlFsRoot flags — the flags are applied by `axl_http_server_serve_fs`,
+ * which drops the mutating callbacks from its own copy for READONLY /
+ * NO_DELETE. A consumer copying this table for the READONLY case should
+ * NULL the mutators itself (the handler returns 405 for a NULL op).
+ *
+ * @return pointer to a static, immutable ops table (do not free). All
+ *     state lives in the AxlFsRoot user_data, so the table is
+ *     re-entrant across mounts.
+ */
+const AxlWebDavOps *
+axl_fs_webdav_ops(void);
+
+/**
+ * @brief Mount a filesystem subtree as a WebDAV file server. One call.
+ *
+ * Equivalent to `axl_fs_root_new(fs_root, flags)` + a copy of
+ * `axl_fs_webdav_ops()` (with mutating callbacks dropped per the flags)
+ * registered via `axl_http_server_add_webdav` at @p prefix. The server
+ * owns the root and frees it on `axl_http_server_free`.
+ *
+ * The mount is traversal-contained: a request path is normalized and
+ * any `..` escaping @p fs_root is rejected (404), so the server can
+ * only ever touch files within @p fs_root (see AxlFsRoot).
+ *
+ * Auth/role gating is built in: @p auth_flags is applied to every verb
+ * route, including the streaming PUT, so the server's authentication
+ * callback (`axl_http_server_use_auth`) gates the whole mount. Pass
+ * `AXL_ROUTE_NO_AUTH` for an open mount, `AXL_ROUTE_AUTH` to require a
+ * logged-in user, or `AXL_ROUTE_ADMIN` to require the admin role.
+ *
+ * @return AXL_OK on success, AXL_ERR on bad arguments, OOM, or if the
+ *     server already has the maximum number of WebDAV mounts.
+ */
+int
+axl_http_server_serve_fs(
+    AxlHttpServer *s,
+    const char    *prefix,     ///< URL prefix, e.g. "/dav"
+    const char    *fs_root,    ///< filesystem base path (e.g. "FS0:")
+    uint32_t       flags,      ///< AXL_SERVE_FS_* access flags
+    uint32_t       auth_flags  ///< AXL_ROUTE_* flags; gates the whole mount
 );
 
 #ifdef __cplusplus

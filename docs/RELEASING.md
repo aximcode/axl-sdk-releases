@@ -95,16 +95,26 @@ To validate locally before pushing (optional fail-fast), run `scripts/lint.sh`
   `2 warnings generated` lines per file are noise.
 
   **Version skew — local-clean does NOT imply CI-clean (unless versions
-  match).** CI now pins an explicit `clang-tidy-18` (in `ci.yml`) instead of
-  the floating `clang-tidy` package, and `scripts/lint.sh` prefers that same
-  version — so a clean `scripts/lint.sh` *does* mean a clean CI lint, provided
-  you have `clang-tidy-18` installed (`sudo apt-get install clang-tidy-18`; the
-  script warns and falls back if it's missing). This pin exists because a
-  *newer* local clang-tidy silently passed code an older CI clang-tidy flagged —
-  v1.0.0 hit exactly that (`bugprone-sizeof-expression` on a correct
-  array-of-pointers `sizeof`). When you intentionally move clang-tidy versions,
-  bump it in both `ci.yml` and `scripts/lint.sh` together. Either way, the §4b
-  CI-on-`main` run remains the authoritative gate.
+  match).** CI pins **`clang-tidy-21`** by running the `lint` job inside an
+  **`ubuntu:26.04` container** (26.04 is the first Ubuntu whose apt ships
+  clang-tidy-21 natively; 24.04 tops out at 20). `scripts/lint.sh` pins the
+  same `CT_VERSION=21` — so a clean `scripts/lint.sh` *does* mean a clean CI
+  lint when your local clang-tidy is 21. Three ways to get a matching 21:
+  - **Ubuntu 26.04+:** `sudo apt-get install clang-tidy-21`.
+  - **EL/Fedora/macOS dev boxes:** the distro's current `clang-tidy` is often
+    already 21 — `scripts/lint.sh` detects that and uses it without warning
+    (it only warns on a *real* mismatch).
+  - **Any host:** run CI's exact lint in the same image —
+    `podman run --rm -v "$PWD":/src:ro ubuntu:26.04 …` (the container `ci.yml`'s
+    lint job uses), so local == CI byte-for-byte regardless of distro.
+
+  This pinning exists because a *newer* local clang-tidy silently passed code an
+  older CI clang-tidy flagged — v1.0.0 hit exactly that
+  (`bugprone-sizeof-expression` on a correct array-of-pointers `sizeof`). When
+  you intentionally move clang-tidy versions, bump it in both `ci.yml` (the
+  `clang-tidy-NN` install + invocation, and the `ubuntu:NN.NN` container if the
+  new version needs a newer base) and `scripts/lint.sh`'s `CT_VERSION` together.
+  Either way, the §4b CI-on-`main` run remains the authoritative gate.
 
   **Run clang-tidy one file per process (`-n1`).** Passing many
   TUs to a single `clang-tidy` invocation makes the path-sensitive

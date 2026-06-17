@@ -18,10 +18,27 @@
 AXL_LOG_DOMAIN("loop");
 
 // ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+/* Source ids come from a single PROCESS-GLOBAL monotonic counter, not a
+   per-loop one. Per-loop ids (each loop counting from 1) put the same id on
+   every loop, so a source id that outlived its loop — e.g. one registered on an
+   ephemeral sync-wrapper loop (axl_tcp_recv/send) — could be removed from a
+   DIFFERENT loop and silently delete an unrelated source: the adbf5461
+   second-server-dead-accept class. With a global counter a stale id never
+   matches a source on another loop, so the cross-loop removal is a harmless
+   no-op and the whole class is unrepresentable. AxlSourceId is 64-bit so the
+   counter never wraps in any realistic process lifetime (id consumption is per
+   source REGISTRATION, not per firing); 0 stays the "no source" sentinel and is
+   skipped on the (unreachable) wrap. Single-threaded UEFI: no locking needed. */
+static AxlSourceId g_next_source_id = 1;
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-static uint32_t
+static AxlSourceId
 add_source(AxlLoop *loop, SourceType type, AxlEventHandle event,
            bool owns_event, void *callback, void *data)
 {
@@ -62,7 +79,10 @@ add_source(AxlLoop *loop, SourceType type, AxlEventHandle event,
         loop->source_count++;
     }
 
-    src->id = loop->next_id++;
+    if (g_next_source_id == 0) {
+        g_next_source_id = 1;   /* skip the 0 sentinel (64-bit: never reached) */
+    }
+    src->id = g_next_source_id++;
     src->type = type;
     src->active = true;
     src->owns_event = owns_event;
@@ -99,7 +119,6 @@ axl_loop_new_impl(const char *file, int line)
         return NULL;
     }
 
-    loop->next_id = 1;
     loop->pending_source = -1;
     loop->defer_next_id = 1;
     loop->pubsub_next_sub_id = 1;
@@ -163,11 +182,11 @@ axl_loop_free(AxlLoop *loop)
             loop->sources[i].type == SOURCE_EVENT &&
             !loop->sources[i].owns_event) {
             leaked_external++;
-            axl_error("axl_loop_free: caller-owned event source id=%u "
+            axl_error("axl_loop_free: caller-owned event source id=%llu "
                       "still active - tear down the resource "
                       "(socket/tcp/custom event) BEFORE freeing the "
                       "loop it was registered against",
-                      loop->sources[i].id);
+                      (unsigned long long)loop->sources[i].id);
         }
         if (loop->sources[i].active && loop->sources[i].owns_event &&
             loop->sources[i].event != NULL) {
@@ -247,6 +266,40 @@ axl_loop_add_cleanup(AxlLoop *loop, AxlLoopCallback cb, void *data)
 }
 
 // ---------------------------------------------------------------------------
+// Loop-callback re-entrancy depth
+//
+// UEFI is single-threaded, so a single process-global depth tracks whether
+// control is currently inside ANY loop's dispatched callback (source, timer,
+// idle, keypress, or a drained deferred-work item). The synchronous wait
+// primitive (src/event/axl-wait.c) reads this to detect — and warn about — a
+// blocking wait invoked from within a loop callback, which nests a new loop
+// re-entrantly (the bug class in docs/AXL-Loop-Reentrancy-Plan.md). The
+// counter nests correctly: a callback that pumps another loop bumps it again.
+// ---------------------------------------------------------------------------
+
+static unsigned g_loop_cb_depth;
+
+void
+_axl_loop_cb_enter(void)
+{
+    g_loop_cb_depth++;
+}
+
+void
+_axl_loop_cb_leave(void)
+{
+    if (g_loop_cb_depth > 0) {
+        g_loop_cb_depth--;
+    }
+}
+
+bool
+_axl_loop_in_callback(void)
+{
+    return g_loop_cb_depth > 0;
+}
+
+// ---------------------------------------------------------------------------
 // Event primitives
 // ---------------------------------------------------------------------------
 
@@ -304,7 +357,10 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
         if (loop->sources[i].active &&
             loop->sources[i].type == SOURCE_IDLE) {
             has_idle = true;
-            if (!loop->sources[i].fn.cb(loop->sources[i].data)) {
+            _axl_loop_cb_enter();
+            bool keep_idle = loop->sources[i].fn.cb(loop->sources[i].data);
+            _axl_loop_cb_leave();
+            if (!keep_idle) {
                 loop->sources[i].active = false;
             }
             if (loop->quit_requested) {
@@ -460,7 +516,7 @@ axl_loop_dispatch_event(AxlLoop *loop)
     LoopSource      *src;
     bool             cont;
     AxlInputKey      akey;
-    uint32_t         dispatched_id;
+    AxlSourceId      dispatched_id;
 
     if (loop == NULL || loop->pending_source < 0) {
         return;
@@ -513,7 +569,9 @@ axl_loop_dispatch_event(AxlLoop *loop)
             }
             // intercept_break off: 0x03 falls through to the app (a GUI editor
             // maps Ctrl+C to Copy via axl_input_ctrl_letter's serial-fold).
+            _axl_loop_cb_enter();
             cont = src->fn.key_cb(akey, src->data);
+            _axl_loop_cb_leave();
             if (src->id != dispatched_id) {
                 /* Callback removed this source and the slot was reused —
                  * the new occupant owns its own lifecycle. Stop here. */
@@ -524,7 +582,9 @@ axl_loop_dispatch_event(AxlLoop *loop)
             }
         }
     } else {
+        _axl_loop_cb_enter();
         cont = src->fn.cb(src->data);
+        _axl_loop_cb_leave();
     }
 
     /* Slot reused during cb? Skip epilogue — touching the new
@@ -602,6 +662,13 @@ axl_loop_run(AxlLoop *loop)
 // TPL trapdoor this exists to dodge.
 // ---------------------------------------------------------------------------
 
+/* Consecutive full-budget driver ticks before the drain-cap diagnostic
+   escalates from debug (a normal burst) to a warning (sustained overload /
+   runaway). A single burst drains in a handful of ticks — bounded by the WS
+   outbound queue's depth / the per-tick budget — well under this, so a
+   legitimate redraw never trips the warning. */
+#define DRIVER_DRAIN_CAP_SUSTAINED_TICKS  20u
+
 static void
 driver_dispatch_notify(void *ctx)
 {
@@ -647,8 +714,7 @@ driver_dispatch_notify(void *ctx)
        the upper bound on event_count, so capping at 2× that lets a
        legitimate burst (accept + N×(recv+send) for the full source
        table) drain in one tick while still bounding pathological
-       runaway. Hitting the cap is logged so the consumer sees it
-       before the next mystery wedge. */
+       runaway. */
     int drained = 0;
     for (drained = 0; drained < AXL_MAX_SOURCES * 2; drained++) {
         if (axl_loop_dispatch(loop, /*blocking=*/false) != 0) {
@@ -658,11 +724,35 @@ driver_dispatch_notify(void *ctx)
             break;
         }
     }
+
+    /* Draining the full per-tick budget with work still pending is NORMAL
+       back-pressure: the rest is handled on the next tick(s), nothing is lost
+       and the loop does not wedge. A single busy tick happens whenever a
+       consumer fans out a burst (e.g. a full-screen console redraw broadcasting
+       many WS frames), so it's only traced at debug. Only a SUSTAINED run is a
+       real signal — a runaway callback re-arming an always-signaled event, or
+       output produced faster than it can drain — so warn ONCE when the streak
+       crosses the threshold, then stay quiet until it clears. (The WS outbound
+       queue's drop-oldest back-pressure already bounds a single burst to a few
+       ticks, well under the threshold.) */
     if (drained == AXL_MAX_SOURCES * 2) {
-        axl_warning("driver_dispatch_notify: hit drain cap (%d) - a "
-                    "source callback may be re-arming an always-signaled "
-                    "event; check notify-budget guidance",
-                    AXL_MAX_SOURCES * 2);
+        loop->drain_cap_streak++;
+        if (loop->drain_cap_streak == 1) {
+            axl_debug("driver_dispatch_notify: notify drain budget (%d) reached "
+                      "this tick - excess deferred to the next tick (normal "
+                      "under an output burst)",
+                      AXL_MAX_SOURCES * 2);
+        } else if (loop->drain_cap_streak == DRIVER_DRAIN_CAP_SUSTAINED_TICKS) {
+            axl_warning("driver_dispatch_notify: notify drain budget (%d) hit "
+                        "for %u consecutive ticks - sustained overload (a "
+                        "runaway callback re-arming an always-signaled event, "
+                        "or output produced faster than it drains). Coalesce "
+                        "output or raise the attach_driver tick rate.",
+                        AXL_MAX_SOURCES * 2,
+                        (unsigned)DRIVER_DRAIN_CAP_SUSTAINED_TICKS);
+        }
+    } else {
+        loop->drain_cap_streak = 0;
     }
 }
 
@@ -720,7 +810,7 @@ axl_loop_detach_driver(AxlLoop *loop)
 // Event sources
 // ---------------------------------------------------------------------------
 
-uint32_t
+AxlSourceId
 axl_loop_add_timer(AxlLoop *loop, uint32_t interval_ms,
                    AxlLoopCallback cb, void *data)
 {
@@ -745,7 +835,7 @@ axl_loop_add_timer(AxlLoop *loop, uint32_t interval_ms,
     return add_source(loop, SOURCE_TIMER, event, true, (void *)cb, data);
 }
 
-uint32_t
+AxlSourceId
 axl_loop_add_timeout(AxlLoop *loop, uint32_t delay_ms,
                      AxlLoopCallback cb, void *data)
 {
@@ -770,7 +860,7 @@ axl_loop_add_timeout(AxlLoop *loop, uint32_t delay_ms,
     return add_source(loop, SOURCE_TIMEOUT, event, true, (void *)cb, data);
 }
 
-uint32_t
+AxlSourceId
 axl_loop_add_key_press(AxlLoop *loop, AxlKeyCallback cb, void *data)
 {
     if (loop == NULL || cb == NULL) {
@@ -783,7 +873,7 @@ axl_loop_add_key_press(AxlLoop *loop, AxlKeyCallback cb, void *data)
                       false, (void *)cb, data);
 }
 
-uint32_t
+AxlSourceId
 axl_loop_add_idle(AxlLoop *loop, AxlLoopCallback cb, void *data)
 {
     if (loop == NULL || cb == NULL) {
@@ -793,7 +883,7 @@ axl_loop_add_idle(AxlLoop *loop, AxlLoopCallback cb, void *data)
     return add_source(loop, SOURCE_IDLE, NULL, false, (void *)cb, data);
 }
 
-uint32_t
+AxlSourceId
 axl_loop_add_protocol_notify(AxlLoop *loop, void *guid,
                              AxlLoopCallback cb, void *data)
 {
@@ -819,7 +909,7 @@ axl_loop_add_protocol_notify(AxlLoop *loop, void *guid,
     return add_source(loop, SOURCE_PROTOCOL, event, true, (void *)cb, data);
 }
 
-uint32_t
+AxlSourceId
 axl_loop_add_event(AxlLoop *loop, AxlEventHandle event,
                    AxlLoopCallback cb, void *data)
 {
@@ -832,7 +922,7 @@ axl_loop_add_event(AxlLoop *loop, AxlEventHandle event,
 }
 
 void
-axl_loop_remove_source(AxlLoop *loop, uint32_t source_id)
+axl_loop_remove_source(AxlLoop *loop, AxlSourceId source_id)
 {
     size_t i;
 
@@ -875,8 +965,8 @@ axl_loop_iterate_until(
 {
     bool     done_flag    = false;
     bool     timeout_flag = false;
-    uint32_t done_src     = 0;
-    uint32_t timeout_src  = 0;
+    AxlSourceId done_src    = 0;
+    AxlSourceId timeout_src = 0;
     int      rc           = -1;
 
     if (loop == NULL) {

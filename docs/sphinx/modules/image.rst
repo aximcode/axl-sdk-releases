@@ -29,3 +29,14 @@ integrity-check tooling. See ``include/axl/axl-image-verify.h``
 for the side-effect contract on the ``consult_db`` path.
 
 .. doxygenfile:: axl-image-verify.h
+
+AxlShell — launch a real UEFI Shell
+------------------------------------
+
+Find a ``Shell.efi`` and run it as a foreground child image
+(``StartImage`` blocks until it exits), with ``-nostartup`` so a
+child Shell launched *from* ``startup.nsh`` doesn't recurse. The
+AXL-ified form of the EDK2 ShellLauncher; pairs with
+:doc:`console-mirror` to host the real Shell over a remote terminal.
+
+.. doxygenfile:: axl-shell.h

@@ -52,52 +52,109 @@ process_chunked_data(
 
     while (pos < buf_len) {
         //
-        // Find chunk size line (hex digits followed by \r\n)
+        // Skip the trailing CRLF that follows a chunk's data. It can span
+        // recvs (the \r at the end of one buffer, the \n at the start of
+        // the next), so it is tracked as a 0..2 byte countdown.
         //
-        size_t line_start = pos;
-        size_t line_end = pos;
-        bool   found_crlf = false;
+        while (conn->chunk_crlf_pending > 0 && pos < buf_len) {
+            pos++;
+            conn->chunk_crlf_pending--;
+        }
+        if (conn->chunk_crlf_pending > 0) {
+            return;  /* need the rest of the CRLF from the next recv */
+        }
 
+        //
+        // Consume the in-progress chunk's data. A single chunk can be far
+        // larger than one recv buffer, so chunk_remaining carries the count
+        // still owed across recvs — without it, a continuation buffer would
+        // be misparsed as a new chunk size-line.
+        //
+        if (conn->chunk_remaining > 0) {
+            size_t avail = buf_len - pos;
+            size_t take  = (avail < conn->chunk_remaining)
+                           ? avail : conn->chunk_remaining;
+
+            if (conn->is_upload_stream) {
+                stream_upload_data(s, conn, buf + pos, take, false);
+                if (!conn->active) {
+                    return;  /* handler aborted */
+                }
+                conn->body_bytes_read += take;
+            } else {
+                if (conn->body_bytes_read + take > s->body_limit) {
+                    conn->chunked_done = true;
+                    conn->content_length = conn->body_bytes_read;
+                    return;
+                }
+                size_t needed = conn->body_bytes_read + take;
+                if (needed > conn->body_alloc) {
+                    size_t new_alloc = conn->body_alloc ? conn->body_alloc : 4096;
+                    while (new_alloc < needed) {
+                        new_alloc *= 2;
+                    }
+                    conn->body = grow_buffer(conn->body, conn->body_bytes_read,
+                                             new_alloc);
+                    if (conn->body == NULL) {
+                        conn->chunked_done = true;
+                        return;
+                    }
+                    conn->body_alloc = new_alloc;
+                }
+                axl_memcpy((uint8_t *)conn->body + conn->body_bytes_read,
+                           buf + pos, take);
+                conn->body_bytes_read += take;
+            }
+
+            pos += take;
+            conn->chunk_remaining -= take;
+            if (conn->chunk_remaining > 0) {
+                return;  /* more data owed; resume on the next recv */
+            }
+            conn->chunk_crlf_pending = 2;  /* skip the trailing \r\n */
+            continue;
+        }
+
+        //
+        // Parse the next chunk size-line (hex digits up to \r\n).
+        //
+        size_t line_end   = pos;
+        bool   found_crlf = false;
         while (line_end + 1 < buf_len) {
             if (buf[line_end] == '\r' && buf[line_end + 1] == '\n') {
                 found_crlf = true;
                 break;
             }
-
             line_end++;
         }
 
         if (!found_crlf) {
             //
-            // Incomplete chunk header — save the leftover bytes so they're
-            // prepended to the next recv's data.
+            // Incomplete size-line — save it so it's prepended to the next
+            // recv's data (see process_request_data's chunk_leftover path).
             //
-            size_t left = buf_len - line_start;
+            size_t left = buf_len - pos;
             if (left > 0 && left < sizeof(conn->chunk_leftover)) {
-                axl_memcpy(conn->chunk_leftover, buf + line_start, left);
+                axl_memcpy(conn->chunk_leftover, buf + pos, left);
                 conn->chunk_leftover_len = left;
             }
             break;
         }
 
         //
-        // Parse hex chunk size. axl_hex_parse_u64 stops at the first
-        // non-hex byte, which covers both chunk-extensions (`;...`)
-        // and an empty line — both are treated as end-of-size here.
+        // axl_hex_parse_u64 stops at the first non-hex byte, covering
+        // chunk-extensions (`;...`) and an empty line.
         //
         uint64_t parsed_size = 0;
         size_t   chunk_size  = 0;
-        if (axl_hex_parse_u64(buf + line_start,
-                              line_end - line_start,
-                              &parsed_size) >= 0) {
+        if (axl_hex_parse_u64(buf + pos, line_end - pos, &parsed_size) >= 0) {
             chunk_size = (size_t)parsed_size;
         }
-
-        pos = line_end + 2;  // skip \r\n after size line
+        pos = line_end + 2;  /* skip \r\n after the size-line */
 
         if (chunk_size == 0) {
             //
-            // Terminal chunk — done
+            // Terminal chunk — done.
             //
             conn->chunked_done = true;
             conn->content_length = conn->body_bytes_read;
@@ -108,75 +165,11 @@ process_chunked_data(
         }
 
         //
-        // Decoded chunk data available in buf starting at pos
+        // Arm the data-consumption state and loop back to consume it (the
+        // chunk_remaining branch above handles however much fits here, and
+        // carries the rest to the next recv).
         //
-        size_t available = buf_len - pos;
-        size_t copy_size = (available < chunk_size) ? available : chunk_size;
-
-        if (conn->is_upload_stream) {
-            //
-            // Upload streaming — pass decoded chunk data directly
-            //
-            if (copy_size > 0) {
-                stream_upload_data(s, conn, buf + pos, copy_size, false);
-                if (!conn->active) {
-                    return;  /* handler aborted */
-                }
-                conn->body_bytes_read += copy_size;
-                pos += copy_size;
-            }
-        } else {
-            //
-            // Normal buffering path
-            //
-            if (conn->body_bytes_read + chunk_size > s->body_limit) {
-                conn->chunked_done = true;
-                conn->content_length = conn->body_bytes_read;
-                return;
-            }
-
-            size_t needed = conn->body_bytes_read + chunk_size;
-            if (needed > conn->body_alloc) {
-                size_t new_alloc = conn->body_alloc;
-                if (new_alloc == 0) {
-                    new_alloc = 4096;
-                }
-
-                while (new_alloc < needed) {
-                    new_alloc *= 2;
-                }
-
-                conn->body = grow_buffer(conn->body, conn->body_bytes_read, new_alloc);
-                if (conn->body == NULL) {
-                    conn->chunked_done = true;
-                    return;
-                }
-
-                conn->body_alloc = new_alloc;
-            }
-
-            if (copy_size > 0) {
-                axl_memcpy((uint8_t *)conn->body + conn->body_bytes_read, buf + pos, copy_size);
-                conn->body_bytes_read += copy_size;
-                pos += copy_size;
-            }
-        }
-
-        //
-        // If we didn't get the full chunk in this buffer, we can't read
-        // more synchronously in the async model. Mark as not done and
-        // let the next recv callback continue.
-        //
-        if (copy_size < chunk_size) {
-            break;
-        }
-
-        //
-        // Skip trailing \r\n after chunk data
-        //
-        if (pos + 1 < buf_len && buf[pos] == '\r' && buf[pos + 1] == '\n') {
-            pos += 2;
-        }
+        conn->chunk_remaining = chunk_size;
     }
 }
 
@@ -259,6 +252,9 @@ process_request_data(
         conn->body_alloc = 0;
         conn->chunked = false;
         conn->chunked_done = false;
+        conn->chunk_remaining = 0;
+        conn->chunk_crlf_pending = 0;
+        conn->chunk_leftover_len = 0;
 
         //
         // Check for chunked transfer encoding
@@ -341,6 +337,25 @@ process_request_data(
                 if (mw_resp.headers != NULL) {
                     axl_hash_table_free(mw_resp.headers);
                 }
+                return;
+            }
+
+            //
+            // Auth gate. Uploads never reach dispatch_request, so its
+            // auth check never runs for them — enforce the route's
+            // auth_flags here, after middleware and before a single
+            // body byte is accepted. mw_req.body is NULL (uploads
+            // don't materialize the body), so only header-based auth
+            // (cookie / Authorization / client address) can gate an
+            // upload route. send_error_response force-closes, so the
+            // body bytes the client already pushed are discarded.
+            //
+            size_t auth_status =
+                http_check_route_auth(s, early_route->auth_flags, &mw_req);
+            if (auth_status != 0) {
+                axl_warning("upload %s %s rejected: auth (%zu)",
+                            conn->method, conn->path, auth_status);
+                send_error_response(conn, auth_status);
                 return;
             }
 

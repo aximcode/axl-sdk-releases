@@ -73,11 +73,13 @@ typedef bool (*AxlLoopCallback)(void *data);
 typedef bool (*AxlKeyCallback)(AxlInputKey key, void *data);
 ```
 
-Every `axl_loop_add_*` function returns a `uint32_t` source ID. Use it
-with `axl_loop_remove_source(loop, id)` to remove a source early:
+Every `axl_loop_add_*` function returns an `AxlSourceId` (a 64-bit handle;
+0 means failure). Ids come from a single process-global counter, so a stale
+id never collides with a source on another loop. Use it with
+`axl_loop_remove_source(loop, id)` to remove a source early:
 
 ```c
-uint32_t timer_id = axl_loop_add_timer(loop, 1000, on_tick, NULL);
+AxlSourceId timer_id = axl_loop_add_timer(loop, 1000, on_tick, NULL);
 // ...later...
 axl_loop_remove_source(loop, timer_id);  // stop the timer
 ```

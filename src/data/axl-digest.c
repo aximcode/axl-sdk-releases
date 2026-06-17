@@ -13,6 +13,7 @@
 #include <axl/axl-digest.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-runtime.h>
+#include "../runtime/axl-signal-internal.h"
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 
@@ -104,7 +105,7 @@ axl_checksum_update(AxlChecksum *cs, const void *data, size_t len)
         p      += chunk;
         remain -= chunk;
         if (remain > 0) {
-            axl_yield();
+            _axl_poll_break();
         }
     }
 }

@@ -32,6 +32,18 @@ AxlDriver
 
 .. doxygenfile:: axl-driver.h
 
+AxlDriverInfo (driver / device discovery)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Read-only discovery — the shell ``drivers`` / ``devices`` / "is this
+controller bound?" views as an API: enumerate loaded
+``EFI_DRIVER_BINDING_PROTOCOL`` drivers with names/versions/managed-device
+counts, name any handle (ComponentName2 → device-path), map a PCI address
+to its controller handle, query the bound driver, and bind a specific
+driver to a controller.
+
+.. doxygenfile:: axl-driver-info.h
+
 AxlEfiStatus (UEFI-spec return type + constants)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

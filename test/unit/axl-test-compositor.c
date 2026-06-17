@@ -944,7 +944,7 @@ test_compositor_frame_clock(void)
     AxlCompositor *c = axl_compositor_new(SW, SH);
     AxlSurface *a = axl_surface_create(axl_compositor_root(c), 10, 10);
 
-    uint32_t id = axl_compositor_attach_frame_clock(c, loop, 10);
+    AxlSourceId id = axl_compositor_attach_frame_clock(c, loop, 10);
     test_check(id != 0, "frame-clock: attached, non-zero source id");
 
     FrameClockRec r = {0};

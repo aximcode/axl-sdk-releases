@@ -526,6 +526,68 @@ test_base64(void)
 }
 
 // ---------------------------------------------------------------------------
+// base64url tests
+// ---------------------------------------------------------------------------
+
+static void
+test_base64url(void)
+{
+    char   *enc;
+    void   *dec;
+    size_t  dec_len;
+    int     ret;
+
+    // Encode is unpadded.
+    enc = axl_base64url_encode("Hello", 5);
+    test_check(enc != NULL && axl_strcmp(enc, "SGVsbG8") == 0,
+               "base64url: encode Hello = SGVsbG8 (no padding)");
+    axl_free(enc);
+
+    // URL-safe alphabet: bytes that map to indices 62/63 yield '-'/'_'.
+    {
+        uint8_t v[3] = { 0xFB, 0xFF, 0xFF };
+        enc = axl_base64url_encode(v, 3);
+        test_check(enc != NULL && axl_strcmp(enc, "-___") == 0,
+                   "base64url: '-'/'_' replace '+'/'/'");
+        axl_free(enc);
+    }
+
+    // Decode tolerates missing padding.
+    ret = axl_base64url_decode("SGVsbG8", 7, &dec, &dec_len);
+    test_check(ret == AXL_OK && dec_len == 5 && test_memcmp(dec, "Hello", 5) == 0,
+               "base64url: decode unpadded -> Hello");
+    axl_free(dec);
+
+    // Round-trip arbitrary binary (encoder -> decoder).
+    {
+        uint8_t bin[5] = { 0x14, 0xFB, 0x9C, 0x03, 0xD9 };
+        enc = axl_base64url_encode(bin, 5);
+        ret = axl_base64url_decode(enc, axl_strlen(enc), &dec, &dec_len);
+        test_check(ret == AXL_OK && dec_len == 5 && test_memcmp(dec, bin, 5) == 0,
+                   "base64url: binary round-trip");
+        axl_free(enc);
+        axl_free(dec);
+    }
+
+    // Reject standard-base64 '+' and '/' and any '=' padding.
+    test_check(axl_base64url_decode("SG+sbG8", 7, &dec, &dec_len) == AXL_ERR,
+               "base64url: reject '+'");
+    test_check(axl_base64url_decode("SG/sbG8", 7, &dec, &dec_len) == AXL_ERR,
+               "base64url: reject '/'");
+    test_check(axl_base64url_decode("SGVsbG8=", 8, &dec, &dec_len) == AXL_ERR,
+               "base64url: reject '=' padding");
+
+    // A length with remainder 1 is impossible.
+    test_check(axl_base64url_decode("SGVsb", 5, &dec, &dec_len) == AXL_ERR,
+               "base64url: reject remainder-1 length");
+
+    // Empty.
+    ret = axl_base64url_decode("", 0, &dec, &dec_len);
+    test_check(ret == AXL_OK && dec_len == 0, "base64url: decode empty");
+    axl_free(dec);
+}
+
+// ---------------------------------------------------------------------------
 // strlcpy / strlcat tests
 // ---------------------------------------------------------------------------
 
@@ -1909,6 +1971,7 @@ test_strbuf_main(
     test_utf8_ucs2();
     test_utf8_decode();
     test_base64();
+    test_base64url();
     test_strlcpy();
     test_strlcat();
     test_strlen();

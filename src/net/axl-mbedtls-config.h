@@ -66,6 +66,12 @@ int   axl_mbedtls_printf(const char *fmt, ...);
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
 #define MBEDTLS_RSA_C
 #define MBEDTLS_PKCS1_V15
+/* RSASSA-PSS (+ its MGF1) for JOSE PS256 — axl_pk_rsa_pss_sha256_*. */
+#define MBEDTLS_PKCS1_V21
+/* RSA key generation (axl_pk_keygen(AXL_PK_RSA)) needs prime generation.
+ * TLS itself never calls mbedtls_rsa_gen_key; this only compiles in
+ * mbedtls_mpi_gen_prime. */
+#define MBEDTLS_GENPRIME
 
 /* Force mbedtls to use its own bundled software inet_pton() in
  * x509_crt.c instead of trying to call the platform one. In our
@@ -81,6 +87,7 @@ int   axl_mbedtls_printf(const char *fmt, ...);
 #define MBEDTLS_ECP_C
 #define MBEDTLS_ECP_DP_SECP256R1_ENABLED
 #define MBEDTLS_ECP_DP_SECP384R1_ENABLED
+#define MBEDTLS_ECP_DP_CURVE25519_ENABLED  /* X25519 ECDH (axl_ecdh / SSH curve25519) */
 #define MBEDTLS_ECP_NIST_OPTIM
 #define MBEDTLS_ECDH_C
 #define MBEDTLS_ECDSA_C
@@ -90,6 +97,12 @@ int   axl_mbedtls_printf(const char *fmt, ...);
 #define MBEDTLS_GCM_C
 #define MBEDTLS_CIPHER_C
 #define MBEDTLS_CIPHER_MODE_CBC
+#define MBEDTLS_CIPHER_MODE_CTR  /* axl_cipher_ctr_* (e.g. SSH aes*-ctr) */
+/* AEAD for the axl_aead_* API (ChaCha20-Poly1305; AES-GCM via GCM_C
+ * above). Not used by the TLS 1.2 ciphersuites AXL negotiates. */
+#define MBEDTLS_CHACHA20_C
+#define MBEDTLS_POLY1305_C
+#define MBEDTLS_CHACHAPOLY_C
 
 /* Hashes */
 #define MBEDTLS_SHA224_C

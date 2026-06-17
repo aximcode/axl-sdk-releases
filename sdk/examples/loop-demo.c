@@ -15,8 +15,8 @@
 
 /** Shared state passed between callbacks. */
 typedef struct {
-    AxlLoop  *loop;
-    uint32_t  timer_id;
+    AxlLoop     *loop;
+    AxlSourceId  timer_id;
 } DemoCtx;
 
 /**

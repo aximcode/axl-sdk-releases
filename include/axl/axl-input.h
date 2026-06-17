@@ -326,9 +326,9 @@ typedef bool (*AxlInputCallback)(
 // axl-loop source ID (use with axl_loop_remove_source to detach), or
 // 0 on failure (loop / cb NULL, protocol not available, already attached).
 
-/* Forward-declared to avoid pulling axl-loop.h into every input
- * consumer; toolkits that use attach_* will already include axl-loop.h. */
-typedef struct AxlLoop AxlLoop;
+/* The attach_* functions return an AxlSourceId and operate on an AxlLoop,
+ * both defined in axl-loop.h — include it for the types. */
+#include <axl/axl-loop.h>
 
 /// Register mouse input as an event source on the loop.
 ///
@@ -346,7 +346,7 @@ typedef struct AxlLoop AxlLoop;
 /// @return source ID for axl_loop_remove_source, or 0 on failure
 ///         (NULL args, EFI_SIMPLE_POINTER_PROTOCOL not available,
 ///         or a mouse source is already attached).
-uint32_t
+AxlSourceId
 axl_input_attach_mouse(
     AxlLoop           *loop,
     AxlInputCallback   cb,
@@ -388,7 +388,7 @@ axl_input_detach_mouse(
 ///
 /// @return source ID for axl_loop_remove_source, or 0 on failure
 ///         (NULL args or a keyboard source already attached).
-uint32_t
+AxlSourceId
 axl_input_attach_key(
     AxlLoop           *loop,
     AxlInputCallback   cb,
@@ -440,7 +440,7 @@ axl_input_detach_key(
 ///
 /// @return a non-zero source ID on success (the first source bound), or 0 on
 ///         failure (NULL args, no absolute pointer, or already attached).
-uint32_t
+AxlSourceId
 axl_input_attach_touch(
     AxlLoop           *loop,
     AxlInputCallback   cb,
@@ -517,6 +517,98 @@ axl_input_detach_touch(
 void
 axl_input_probe_pointers(
     const char *log_path   ///< optional file to also write the report to (NULL = console only)
+    );
+
+// ---------------------------------------------------------------------------
+// Virtual pointer — INSTALL + DRIVE a synthetic pointer (the pointer twin of
+// axl_console_mirror_inject_key). Where axl_input_attach_* CONSUME an existing
+// pointer, this PUBLISHES one for the firmware UI to consume: a remote /
+// synthetic source (a VNC server's RFB PointerEvent, an automated UI test)
+// drives the firmware Setup browser / HII FrontPage when there is no physical
+// mouse (a headless server, QEMU -vga none).
+// ---------------------------------------------------------------------------
+
+/// An installed virtual pointer. Opaque; created by
+/// @ref axl_virtual_pointer_install, torn down by
+/// @ref axl_virtual_pointer_uninstall. Singleton: there is one console pointer
+/// to publish on, so a second install while one is live fails.
+typedef struct AxlVirtualPointer AxlVirtualPointer;
+
+/// Configuration for @ref axl_virtual_pointer_install.
+typedef struct {
+    uint32_t width;       ///< absolute X range [0,width); 0 = active GOP horizontal resolution
+    uint32_t height;      ///< absolute Y range [0,height); 0 = active GOP vertical resolution
+    bool     also_simple; ///< also publish EFI_SIMPLE_POINTER (relative) for legacy consumers
+} AxlVirtualPointerConfig;
+
+/// Install a virtual `EFI_ABSOLUTE_POINTER_PROTOCOL` the caller then drives.
+///
+/// The absolute range defaults to the active GOP resolution (so RFB /
+/// framebuffer pixel coordinates map 1:1); override via @p cfg. With
+/// @c also_simple a relative `EFI_SIMPLE_POINTER_PROTOCOL` is published too.
+///
+/// **Console routing (the part this solves once):** the firmware Setup browser
+/// / FrontPage reads the pointer the console aggregator (ConSplitter) publishes
+/// on `gST->ConsoleInHandle`, via `LocateProtocol` / `HandleProtocol`, NOT a
+/// blind handle. So install REPLACES the AbsolutePointer on
+/// `gST->ConsoleInHandle` (the same `ReinstallProtocolInterface`-on-ConsoleIn
+/// technique AxlConsoleMirror uses for `SimpleTextInputEx`), saving the
+/// original to restore on uninstall. If ConsoleInHandle has no AbsolutePointer
+/// (no ConSplitter aggregate), it installs a fresh one there. Either way the
+/// pointer the browser locates is the injected one.
+///
+/// @note The end-to-end "the Setup browser visually responds to the injected
+///     cursor" is a real-hardware / firmware-UI behavior; the substrate
+///     (install + route + inject + WaitForInput round-trip) is what is tested
+///     under QEMU.
+///
+/// @return AXL_OK on success (@p out set); AXL_ERR on NULL @p out, a pointer
+///     already installed (singleton), or a firmware install failure.
+int
+axl_virtual_pointer_install(
+    AxlVirtualPointer            **out,  ///< [out] receives the installed pointer
+    const AxlVirtualPointerConfig *cfg   ///< config (NULL = all defaults)
+    );
+
+/// Uninstall a virtual pointer and restore the console pointer state. NULL-safe.
+/// Always pair with @ref axl_virtual_pointer_install.
+void
+axl_virtual_pointer_uninstall(
+    AxlVirtualPointer *vp  ///< the pointer to remove (NULL = no-op)
+    );
+
+/// Inject one absolute pointer state.
+///
+/// @p x,y are clamped to `[0,width) x [0,height)`. @p buttons is a bitmask:
+/// bit0 = left/primary (mapped to the absolute pointer's TouchActive), bit1 =
+/// right (AltActive); other bits are ignored (EFI_ABSOLUTE_POINTER has no
+/// middle button). Updates the protocol's CurrentState and signals
+/// `WaitForInput` so a consumer blocked in `WaitForEvent` wakes and reads the
+/// new state via `GetState`. Coalescing identical states is fine.
+///
+/// @return AXL_OK on success; AXL_ERR on NULL @p vp.
+int
+axl_virtual_pointer_inject(
+    AxlVirtualPointer *vp,       ///< the installed pointer
+    uint32_t           x,        ///< absolute X (clamped to [0,width))
+    uint32_t           y,        ///< absolute Y (clamped to [0,height))
+    uint32_t           buttons   ///< button bitmask (bit0=left, bit1=right)
+    );
+
+/// Inject a vertical scroll-wheel delta.
+///
+/// Requires `cfg.also_simple` (the wheel lives on `EFI_SIMPLE_POINTER`'s
+/// `RelativeMovementZ`; `EFI_ABSOLUTE_POINTER` has no wheel). @p dy is in notch
+/// ticks (positive = scroll up / away, the sign your `MOUSE_WHEEL` consumer
+/// sees in `wheel_dy`). Accumulates until the next `GetState` and signals
+/// `WaitForInput`. There is no horizontal-wheel axis (EFI exposes only one).
+///
+/// @return AXL_OK on success; AXL_ERR on NULL @p vp or a pointer installed
+///     without `also_simple`.
+int
+axl_virtual_pointer_scroll(
+    AxlVirtualPointer *vp,  ///< the installed pointer (must have also_simple)
+    int32_t            dy   ///< vertical wheel delta in notch ticks
     );
 
 #ifdef __cplusplus

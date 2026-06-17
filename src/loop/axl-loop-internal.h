@@ -47,7 +47,7 @@ typedef enum {
 } SourceType;
 
 typedef struct {
-    uint32_t        id;
+    AxlSourceId     id;
     SourceType      type;
     bool            active;
     bool            owns_event;
@@ -105,7 +105,6 @@ struct AxlLoop {
     bool            intercept_break;
     LoopSource      sources[AXL_MAX_SOURCES];
     size_t          source_count;
-    uint32_t        next_id;
     int             pending_source;
     AxlEventHandle  break_event;
     AxlEventHandle  poll_timer;
@@ -134,6 +133,11 @@ struct AxlLoop {
     // drives axl_loop_dispatch from TPL_APPLICATION notify. NULL when
     // not attached. See axl_loop_attach_driver.
     AxlEventHandle  driver_timer;
+    // Consecutive driver ticks that drained their full per-tick budget. A
+    // single busy tick is normal back-pressure (a high-output burst); a
+    // sustained run signals a runaway callback or persistent overload. Used
+    // to gate the drain-cap diagnostic in driver_dispatch_notify.
+    uint32_t        drain_cap_streak;
 };
 
 // ---------------------------------------------------------------------------
@@ -145,5 +149,15 @@ void axl_defer_drain_internal(AxlLoop *loop);
 
 /// Free all subscribers and reset the topic table.
 void axl_pubsub_reset_internal(AxlLoop *loop);
+
+/// Loop-callback re-entrancy depth (defined in axl-loop.c). Bracket every
+/// dispatched user callback with enter()/leave(); the sync wait primitive
+/// reads _axl_loop_in_callback() to detect a blocking wait nested inside a
+/// callback. _axl_loop_in_callback() is also forward-declared by the sync
+/// wait primitive (src/event/axl-wait.c), which cannot include this
+/// src/loop-only header.
+void _axl_loop_cb_enter(void);
+void _axl_loop_cb_leave(void);
+bool _axl_loop_in_callback(void);
 
 #endif /* AXL_LOOP_INTERNAL_H */

@@ -130,6 +130,37 @@ axl_image_unload(
 );
 
 /**
+ * @brief Load an image, run it to completion, and unload it.
+ *
+ * The one-call form of the common "launch a foreground UEFI app and get
+ * its exit code" pattern: @ref axl_image_load + (optionally)
+ * @ref axl_image_set_load_options + @ref axl_image_start (which **blocks**
+ * until the image returns) + @ref axl_image_unload. Use it for any
+ * blocking UEFI application — a diagnostic tool, a vendor setup app, a
+ * recovery menu, or (via @ref axl_shell_launch) the UEFI Shell.
+ *
+ * @p args is a command-line string installed as the image's
+ * `LoadOptions`, encoded to UCS-2 the way a shell launch encodes a
+ * command line; pass NULL (or "") for none. The started image parses it
+ * as its arguments per the shell convention — whether to include a
+ * leading program name depends on that image's argv parser. The encoding
+ * buffer is internal; @p args may be freed after the call.
+ *
+ * Pair this with @ref axl_console_mirror_install to mirror the launched
+ * app's console to a remote terminal.
+ *
+ * @return AXL_OK if the image was started and has now returned (its exit
+ *     code is in @p out_exit_code); AXL_ERR if @p path is NULL or the
+ *     image could not be loaded.
+ */
+int
+axl_image_run(
+    const char *path,          ///< image path (UEFI shell syntax)
+    const char *args,          ///< command-line / LoadOptions (UTF-8), or NULL
+    int        *out_exit_code  ///< [out] image's exit code (NULL allowed)
+);
+
+/**
  * @brief Snapshot of a loaded image as visible to the firmware.
  *
  * Returned by `axl_image_enumerate`'s callback and

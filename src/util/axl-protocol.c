@@ -65,6 +65,8 @@ static const ProtocolEntry protocol_table[] = {
     { "shell",          &gEfiShellProtocolGuid },
     { "shell-params",   &gEfiShellParametersProtocolGuid },
     { "simple-network", &EFI_SIMPLE_NETWORK_PROTOCOL_GUID },
+    { "nii",            &gEfiNetworkInterfaceIdentifierProtocolGuid_31 },
+    { "nii-legacy",     &gEfiNetworkInterfaceIdentifierProtocolGuid },
     { "device-path",    &EFI_DEVICE_PATH_PROTOCOL_GUID },
     { "loaded-image",   &EFI_LOADED_IMAGE_PROTOCOL_GUID },
     { "simple-fs",      &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID },

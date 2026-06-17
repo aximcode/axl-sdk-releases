@@ -207,8 +207,8 @@ main(int argc, char *argv[])
     axl_gfx_target_buffer(NULL);
 
     AxlLoop *loop = axl_loop_new();
-    uint32_t mid = axl_input_attach_mouse(loop, on_pointer, &d);
-    uint32_t tid = axl_input_attach_touch(loop, on_pointer, &d);
+    AxlSourceId mid = axl_input_attach_mouse(loop, on_pointer, &d);
+    AxlSourceId tid = axl_input_attach_touch(loop, on_pointer, &d);
     axl_printf("pointer-demo: attach mouse %s, touch %s; %dx%d framebuffer.\n",
                mid ? "OK" : "skipped", tid ? "OK" : "skipped",
                (int)d.w, (int)d.h);

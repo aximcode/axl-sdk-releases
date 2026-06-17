@@ -20,6 +20,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # tests are sequential, not concurrent.
 _LAST_UPLOAD = {"len": 0, "head_hex": "", "tail_hex": ""}
 
+# Optional override for /redirect's Location, set from --redirect-base. Lets a
+# plain-http instance redirect into an https instance (cross-scheme redirect).
+_REDIRECT_BASE: str | None = None
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
@@ -58,6 +62,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
 
+    def do_POST(self):
+        # /echo returns the posted body verbatim — drives the async POST
+        # integration test (the UEFI guest asserts the echoed body arrives
+        # via the completion callback).
+        if self.path == "/echo":
+            cl = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(cl) if cl else b""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.send_header("Connection", "close")
+            self.end_headers()
+
     def do_GET(self):
         if self.path == "/last-upload":
             body = json.dumps(_LAST_UPLOAD).encode()
@@ -77,9 +99,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/redirect":
-            port = self.server.server_address[1]
+            # Default: redirect to /hello on this same (http) server. With
+            # --redirect-base set, redirect to {base}/hello instead — used to
+            # drive an http->https cross-scheme redirect in the https-client
+            # test (a plain-http server pointing at the https server).
+            if _REDIRECT_BASE is not None:
+                location = f"{_REDIRECT_BASE}/hello"
+            else:
+                port = self.server.server_address[1]
+                location = f"http://10.0.2.2:{port}/hello"
             self.send_response(302)
-            self.send_header("Location", f"http://10.0.2.2:{port}/hello")
+            self.send_header("Location", location)
             self.send_header("Connection", "close")
             self.end_headers()
         elif self.path == "/chunked":
@@ -131,5 +161,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Usage: host-server.py <port> [--tls <cert.pem> <key.pem>]
+    #                              [--redirect-base <scheme://host:port>]
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18081
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    if "--redirect-base" in sys.argv:
+        _REDIRECT_BASE = sys.argv[sys.argv.index("--redirect-base") + 1]
+    httpd = HTTPServer(("0.0.0.0", port), Handler)
+    if "--tls" in sys.argv:
+        import ssl
+
+        i = sys.argv.index("--tls")
+        cert, key = sys.argv[i + 1], sys.argv[i + 2]
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    httpd.serve_forever()

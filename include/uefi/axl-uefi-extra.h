@@ -440,6 +440,20 @@ static __attribute__((unused)) EFI_GUID gEfiSmbusHcProtocolGuid =
     { 0xe49d33ed, 0x513d, 0x4634,
       {0xb6, 0x98, 0x6f, 0x55, 0xaa, 0x75, 0x1c, 0x1b} };
 
+// EFI_NETWORK_INTERFACE_IDENTIFIER_PROTOCOL GUIDs — not lifted into
+// guids.h. UEFI driver-model NIC drivers (iPXE, vendor UNDI) install
+// one of these on the NIC controller handle; firmware-bundled SnpDxe
+// then binds to NII and produces SNP. AxlNet's driver-identity resolver
+// (axl_net_get_driver_info) walks past the SNP wrapper to the NII
+// installer to find the driver that actually owns the hardware. The
+// _31 GUID is the modern revision; the bare one is the legacy variant.
+static __attribute__((unused)) EFI_GUID gEfiNetworkInterfaceIdentifierProtocolGuid_31 =
+    { 0x1ACED566, 0x76ED, 0x4218,
+      {0xBC, 0x81, 0x76, 0x7F, 0x1F, 0x97, 0x7A, 0x89} };
+static __attribute__((unused)) EFI_GUID gEfiNetworkInterfaceIdentifierProtocolGuid =
+    { 0xE18541CD, 0xF755, 0x4F73,
+      {0x92, 0x8D, 0x64, 0x3C, 0x8A, 0x79, 0xB2, 0x29} };
+
 // ===================================================================
 // DELL_IPMI_TRANSPORT — Dell vendor IPMI protocol
 //
@@ -726,11 +740,21 @@ typedef struct {
 
 #define NVME_ADMIN_QUEUE          0x00
 #define NVME_ADMIN_IDENTIFY_OPC   0x06
+#define NVME_ADMIN_GET_LOG_PAGE   0x02   // Get Log Page (SMART/self-test)
+#define NVME_ADMIN_DEVICE_SELF_TEST 0x14 // Device Self-test
 // EFI_NVM_EXPRESS_COMMAND.Flags bits — gate which command Dwords the
 // driver programs into the submission queue entry. Identify carries CNS
 // in Cdw10, so CDW10_VALID must be set or Cdw10 is dropped (the NSID
-// field is always programmed, no flag needed).
+// field is always programmed, no flag needed). Get Log Page programs the
+// log id / length into Cdw10..11 likewise.
+#define NVME_CDW2_VALID           0x01
+#define NVME_CDW3_VALID           0x02
 #define NVME_CDW10_VALID          0x04
+#define NVME_CDW11_VALID          0x08
+#define NVME_CDW12_VALID          0x10
+#define NVME_CDW13_VALID          0x20
+#define NVME_CDW14_VALID          0x40
+#define NVME_CDW15_VALID          0x80
 
 typedef EFI_STATUS (EFIAPI *EFI_NVM_EXPRESS_PASS_THRU_PASSTHRU)(
     IN     EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL        *This,
@@ -762,6 +786,457 @@ struct _EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL {
     EFI_NVM_EXPRESS_PASS_THRU_GET_NEXT_NAMESPACE   GetNextNamespace;
     EFI_NVM_EXPRESS_PASS_THRU_BUILD_DEVICE_PATH    BuildDevicePath;
     EFI_NVM_EXPRESS_PASS_THRU_GET_NAMESPACE        GetNamespace;
+};
+
+// ===================================================================
+// EFI_ATA_PASS_THRU_PROTOCOL (UEFI Spec 13.10)
+//
+// Hand-written like the NVMe pass-thru: the GUID is in generated/guids.h,
+// but the manifest generator doesn't extract the protocol's funcptr web +
+// command/status blocks cleanly. AXL uses Mode, PassThru, GetNextPort, and
+// GetNextDevice for ATA/SATA identity + SMART (axl-ata).
+// ===================================================================
+
+typedef struct _EFI_ATA_PASS_THRU_PROTOCOL EFI_ATA_PASS_THRU_PROTOCOL;
+
+typedef struct {
+    UINT32  Attributes;   // EFI_ATA_PASS_THRU_ATTRIBUTES_*
+    UINT32  IoAlign;      // required alignment of data buffers
+} EFI_ATA_PASS_THRU_MODE;
+
+#define EFI_ATA_PASS_THRU_ATTRIBUTES_PHYSICAL  0x0001
+#define EFI_ATA_PASS_THRU_ATTRIBUTES_LOGICAL   0x0002
+
+// The 12-register ATA command / status task files (offsets are spec-fixed).
+typedef struct {
+    UINT8  Reserved1[2];
+    UINT8  AtaCommand;
+    UINT8  AtaFeatures;
+    UINT8  AtaSectorNumber;
+    UINT8  AtaCylinderLow;
+    UINT8  AtaCylinderHigh;
+    UINT8  AtaDeviceHead;
+    UINT8  AtaSectorNumberExp;
+    UINT8  AtaCylinderLowExp;
+    UINT8  AtaCylinderHighExp;
+    UINT8  AtaFeaturesExp;
+    UINT8  AtaSectorCount;
+    UINT8  AtaSectorCountExp;
+    UINT8  Reserved2[6];
+} EFI_ATA_COMMAND_BLOCK;
+
+typedef struct {
+    UINT8  Reserved1[2];
+    UINT8  AtaStatus;
+    UINT8  AtaError;
+    UINT8  AtaSectorNumber;
+    UINT8  AtaCylinderLow;
+    UINT8  AtaCylinderHigh;
+    UINT8  AtaDeviceHead;
+    UINT8  AtaSectorNumberExp;
+    UINT8  AtaCylinderLowExp;
+    UINT8  AtaCylinderHighExp;
+    UINT8  Reserved2;
+    UINT8  AtaSectorCount;
+    UINT8  AtaSectorCountExp;
+    UINT8  Reserved3[6];
+} EFI_ATA_STATUS_BLOCK;
+
+typedef UINT8 EFI_ATA_PASS_THRU_CMD_PROTOCOL;
+#define EFI_ATA_PASS_THRU_PROTOCOL_ATA_NON_DATA  0x02
+#define EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN   0x04
+#define EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_OUT  0x05
+#define EFI_ATA_PASS_THRU_PROTOCOL_DMA           0x06
+
+typedef UINT8 EFI_ATA_PASS_THRU_LENGTH;
+#define EFI_ATA_PASS_THRU_LENGTH_BYTES            0x80  // count is in bytes
+#define EFI_ATA_PASS_THRU_LENGTH_MASK             0x70
+#define EFI_ATA_PASS_THRU_LENGTH_NO_DATA_TRANSFER 0x00
+#define EFI_ATA_PASS_THRU_LENGTH_FEATURES         0x10
+#define EFI_ATA_PASS_THRU_LENGTH_SECTOR_COUNT     0x20
+
+typedef struct {
+    EFI_ATA_STATUS_BLOCK            *Asb;
+    EFI_ATA_COMMAND_BLOCK          *Acb;
+    UINT64                          Timeout;        // 100 ns units; 0 = none
+    VOID                           *InDataBuffer;
+    VOID                           *OutDataBuffer;
+    UINT32                          InTransferLength;
+    UINT32                          OutTransferLength;
+    EFI_ATA_PASS_THRU_CMD_PROTOCOL  Protocol;       // PIO_DATA_IN / NON_DATA ...
+    EFI_ATA_PASS_THRU_LENGTH        Length;         // how the length is counted
+} EFI_ATA_PASS_THRU_COMMAND_PACKET;
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_PASSTHRU)(
+    IN     EFI_ATA_PASS_THRU_PROTOCOL        *This,
+    IN     UINT16                             Port,
+    IN     UINT16                             PortMultiplierPort,
+    IN OUT EFI_ATA_PASS_THRU_COMMAND_PACKET  *Packet,
+    IN     EFI_EVENT                          Event OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_GET_NEXT_PORT)(
+    IN     EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN OUT UINT16                      *Port
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_GET_NEXT_DEVICE)(
+    IN     EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN     UINT16                       Port,
+    IN OUT UINT16                      *PortMultiplierPort
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_BUILD_DEVICE_PATH)(
+    IN  EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN  UINT16                       Port,
+    IN  UINT16                       PortMultiplierPort,
+    OUT EFI_DEVICE_PATH_PROTOCOL   **DevicePath
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_GET_DEVICE)(
+    IN  EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN  EFI_DEVICE_PATH_PROTOCOL    *DevicePath,
+    OUT UINT16                      *Port,
+    OUT UINT16                      *PortMultiplierPort
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_RESET_PORT)(
+    IN EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN UINT16                       Port
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ATA_PASS_THRU_RESET_DEVICE)(
+    IN EFI_ATA_PASS_THRU_PROTOCOL  *This,
+    IN UINT16                       Port,
+    IN UINT16                       PortMultiplierPort
+    );
+
+struct _EFI_ATA_PASS_THRU_PROTOCOL {
+    EFI_ATA_PASS_THRU_MODE               *Mode;
+    EFI_ATA_PASS_THRU_PASSTHRU            PassThru;
+    EFI_ATA_PASS_THRU_GET_NEXT_PORT       GetNextPort;
+    EFI_ATA_PASS_THRU_GET_NEXT_DEVICE     GetNextDevice;
+    EFI_ATA_PASS_THRU_BUILD_DEVICE_PATH   BuildDevicePath;
+    EFI_ATA_PASS_THRU_GET_DEVICE          GetDevice;
+    EFI_ATA_PASS_THRU_RESET_PORT          ResetPort;
+    EFI_ATA_PASS_THRU_RESET_DEVICE        ResetDevice;
+};
+
+// ===================================================================
+// EFI_EXT_SCSI_PASS_THRU_PROTOCOL (UEFI Spec 14.7)
+//
+// Hand-written like the ATA/NVMe pass-thru: the GUID is in
+// generated/guids.h, but the manifest generator doesn't extract the
+// protocol's funcptr web + request packet cleanly. AXL uses Mode,
+// PassThru, and GetNextTargetLun for SCSI identity + health (axl-scsi).
+// ===================================================================
+
+#ifndef TARGET_MAX_BYTES
+#define TARGET_MAX_BYTES  0x10
+#endif
+
+typedef struct _EFI_EXT_SCSI_PASS_THRU_PROTOCOL EFI_EXT_SCSI_PASS_THRU_PROTOCOL;
+
+typedef struct {
+    UINT32  AdapterId;
+    UINT32  Attributes;   // EFI_EXT_SCSI_PASS_THRU_ATTRIBUTES_*
+    UINT32  IoAlign;      // required alignment of data buffers
+} EFI_EXT_SCSI_PASS_THRU_MODE;
+
+#define EFI_EXT_SCSI_PASS_THRU_ATTRIBUTES_PHYSICAL     0x0001
+#define EFI_EXT_SCSI_PASS_THRU_ATTRIBUTES_LOGICAL      0x0002
+#define EFI_EXT_SCSI_PASS_THRU_ATTRIBUTES_NONBLOCKIO   0x0004
+
+// DataDirection
+#define EFI_EXT_SCSI_DATA_DIRECTION_READ           0
+#define EFI_EXT_SCSI_DATA_DIRECTION_WRITE          1
+#define EFI_EXT_SCSI_DATA_DIRECTION_BIDIRECTIONAL  2
+
+// HostAdapterStatus / TargetStatus (the two we test)
+#define EFI_EXT_SCSI_STATUS_HOST_ADAPTER_OK        0x00
+#define EFI_EXT_SCSI_STATUS_TARGET_GOOD            0x00
+#define EFI_EXT_SCSI_STATUS_TARGET_CHECK_CONDITION 0x02
+
+typedef struct {
+    UINT64  Timeout;          // 100 ns units; 0 = none
+    VOID   *InDataBuffer;
+    VOID   *OutDataBuffer;
+    VOID   *SenseData;
+    VOID   *Cdb;
+    UINT32  InTransferLength;  // in/out: requested -> actually transferred
+    UINT32  OutTransferLength; // in/out: requested -> actually transferred
+    UINT8   CdbLength;
+    UINT8   DataDirection;     // EFI_EXT_SCSI_DATA_DIRECTION_*
+    UINT8   HostAdapterStatus;
+    UINT8   TargetStatus;
+    UINT8   SenseDataLength;   // in/out: capacity -> length returned
+} EFI_EXT_SCSI_PASS_THRU_SCSI_REQUEST_PACKET;
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_PASSTHRU)(
+    IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL              *This,
+    IN     UINT8                                        *Target,
+    IN     UINT64                                        Lun,
+    IN OUT EFI_EXT_SCSI_PASS_THRU_SCSI_REQUEST_PACKET   *Packet,
+    IN     EFI_EVENT                                     Event OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_GET_NEXT_TARGET_LUN)(
+    IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+    IN OUT UINT8                           **Target,
+    IN OUT UINT64                           *Lun
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_BUILD_DEVICE_PATH)(
+    IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+    IN     UINT8                            *Target,
+    IN     UINT64                            Lun,
+    IN OUT EFI_DEVICE_PATH_PROTOCOL        **DevicePath
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_GET_TARGET_LUN)(
+    IN  EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+    IN  EFI_DEVICE_PATH_PROTOCOL         *DevicePath,
+    OUT UINT8                           **Target,
+    OUT UINT64                           *Lun
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_RESET_CHANNEL)(
+    IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_RESET_TARGET_LUN)(
+    IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+    IN UINT8                            *Target,
+    IN UINT64                            Lun
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_EXT_SCSI_PASS_THRU_GET_NEXT_TARGET)(
+    IN     EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This,
+    IN OUT UINT8                           **Target
+    );
+
+struct _EFI_EXT_SCSI_PASS_THRU_PROTOCOL {
+    EFI_EXT_SCSI_PASS_THRU_MODE                 *Mode;
+    EFI_EXT_SCSI_PASS_THRU_PASSTHRU              PassThru;
+    EFI_EXT_SCSI_PASS_THRU_GET_NEXT_TARGET_LUN  GetNextTargetLun;
+    EFI_EXT_SCSI_PASS_THRU_BUILD_DEVICE_PATH    BuildDevicePath;
+    EFI_EXT_SCSI_PASS_THRU_GET_TARGET_LUN       GetTargetLun;
+    EFI_EXT_SCSI_PASS_THRU_RESET_CHANNEL        ResetChannel;
+    EFI_EXT_SCSI_PASS_THRU_RESET_TARGET_LUN     ResetTargetLun;
+    EFI_EXT_SCSI_PASS_THRU_GET_NEXT_TARGET      GetNextTarget;
+};
+
+// ===================================================================
+// EFI_BLOCK_IO_PROTOCOL (UEFI Spec 13.9)
+//
+// Hand-written because the spec HTML's struct closer reads
+// `} EFI _BLOCK_IO_PROTOCOL;` (a stray space), so the manifest-driven
+// generator can't match it by name. The field-bearing media descriptor
+// (EFI_BLOCK_IO_MEDIA) IS generated into media.h; only this thin
+// protocol wrapper is hand-written. The four service entry points are
+// unused by AXL (block enumeration reads Media only), so they are kept
+// as opaque VOID * — correctly pointer-sized without four more funcptr
+// typedefs. The GUID is already in generated/guids.h.
+// ===================================================================
+
+typedef struct _EFI_BLOCK_IO_PROTOCOL {
+    UINT64              Revision;
+    EFI_BLOCK_IO_MEDIA *Media;
+    VOID               *Reset;        // EFI_BLOCK_RESET (unused by AXL)
+    VOID               *ReadBlocks;   // EFI_BLOCK_READ   (unused by AXL)
+    VOID               *WriteBlocks;  // EFI_BLOCK_WRITE  (unused by AXL)
+    VOID               *FlushBlocks;  // EFI_BLOCK_FLUSH  (unused by AXL)
+} EFI_BLOCK_IO_PROTOCOL;
+
+// ===================================================================
+// EFI_FIRMWARE_VOLUME2_PROTOCOL (PI Spec 1.8, Vol 3)
+//
+// Hand-written because the spec HTML's typedef is mangled
+// (`typedef struct_EFI_FIRMWARE_VOLUME_PROTOCOL {` with a glued tag and
+// the wrong name on the opener vs the `EFI_FIRMWARE_VOLUME2_PROTOCOL`
+// closer), so the manifest-driven generator can't match it. AXL uses
+// only GetVolumeAttributes (FV attribute bits) and GetNextFile + KeySize
+// (file-count loop); the other service entry points are kept opaque as
+// VOID * — correctly pointer-sized without their funcptr typedefs. The
+// GUID is not in generated/guids.h and is defined locally in axl-fv.c.
+// ===================================================================
+
+typedef UINT64 EFI_FV_ATTRIBUTES;
+typedef UINT8  EFI_FV_FILETYPE;       // EFI_FV_FILETYPE_ALL == 0x00
+typedef UINT32 EFI_FV_FILE_ATTRIBUTES;
+
+typedef struct _EFI_FIRMWARE_VOLUME2_PROTOCOL  EFI_FIRMWARE_VOLUME2_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_FV_GET_ATTRIBUTES)(
+    IN  CONST EFI_FIRMWARE_VOLUME2_PROTOCOL  *This,
+    OUT EFI_FV_ATTRIBUTES                    *FvAttributes
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_FV_GET_NEXT_FILE)(
+    IN     CONST EFI_FIRMWARE_VOLUME2_PROTOCOL  *This,
+    IN OUT VOID                                 *Key,
+    IN OUT EFI_FV_FILETYPE                       *FileType,
+    OUT    EFI_GUID                             *NameGuid,
+    OUT    EFI_FV_FILE_ATTRIBUTES               *Attributes,
+    OUT    UINTN                                *Size
+    );
+
+struct _EFI_FIRMWARE_VOLUME2_PROTOCOL {
+    EFI_FV_GET_ATTRIBUTES   GetVolumeAttributes;
+    VOID                   *SetVolumeAttributes;   // unused by AXL
+    VOID                   *ReadFile;              // unused by AXL
+    VOID                   *ReadSection;           // unused by AXL
+    VOID                   *WriteFile;             // unused by AXL
+    EFI_FV_GET_NEXT_FILE    GetNextFile;
+    UINT32                  KeySize;
+    EFI_HANDLE              ParentHandle;
+    VOID                   *GetInfo;               // unused by AXL
+    VOID                   *SetInfo;               // unused by AXL
+};
+
+// ===================================================================
+// EFI_TCG2_PROTOCOL (TCG EFI Protocol Specification, Family 2.0)
+//
+// Hand-written because the TCG2 protocol is defined in the TCG spec
+// (not a UEFI/PI spec we extract from). AXL uses only GetCapability;
+// the other entry points are kept opaque as VOID *. The capability
+// struct is NOT packed (matching the EDK2 definition) — it relies on
+// natural alignment. The GUID is defined locally in axl-tpm.c.
+// ===================================================================
+
+typedef struct {
+    UINT8  Major;
+    UINT8  Minor;
+} EFI_TCG2_VERSION;
+
+typedef struct {
+    UINT8             Size;                  // size of this structure
+    EFI_TCG2_VERSION  StructureVersion;
+    EFI_TCG2_VERSION  ProtocolVersion;
+    UINT32            HashAlgorithmBitmap;
+    UINT32            SupportedEventLogs;
+    BOOLEAN           TPMPresentFlag;
+    UINT16            MaxCommandSize;
+    UINT16            MaxResponseSize;
+    UINT32            ManufacturerID;
+    UINT32            NumberOfPcrBanks;      // valid when StructureVersion >= 1.1
+    UINT32            ActivePcrBanks;        // valid when StructureVersion >= 1.1
+} EFI_TCG2_BOOT_SERVICE_CAPABILITY;
+
+typedef struct _EFI_TCG2_PROTOCOL  EFI_TCG2_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_TCG2_GET_CAPABILITY)(
+    IN     EFI_TCG2_PROTOCOL                 *This,
+    IN OUT EFI_TCG2_BOOT_SERVICE_CAPABILITY  *ProtocolCapability
+    );
+
+// Pass a raw TPM2 command block through to the TPM and read the raw
+// response block back (used by axl-tpm's EK reader).
+typedef EFI_STATUS (EFIAPI *EFI_TCG2_SUBMIT_COMMAND)(
+    IN EFI_TCG2_PROTOCOL  *This,
+    IN UINT32              InputParameterBlockSize,
+    IN UINT8              *InputParameterBlock,
+    IN UINT32              OutputParameterBlockSize,
+    IN UINT8              *OutputParameterBlock
+    );
+
+struct _EFI_TCG2_PROTOCOL {
+    EFI_TCG2_GET_CAPABILITY   GetCapability;
+    VOID                     *GetEventLog;                  // unused by AXL
+    VOID                     *HashLogExtendEvent;           // unused by AXL
+    EFI_TCG2_SUBMIT_COMMAND   SubmitCommand;
+    VOID                     *GetActivePcrBanks;            // unused by AXL
+    VOID                     *SetActivePcrBanks;            // unused by AXL
+    VOID                     *GetResultOfSetActivePcrBanks; // unused by AXL
+};
+
+// ===================================================================
+// EFI_PCI_IO_PROTOCOL — only GetLocation is bound (AxlDriverInfo maps a
+// PCI address to its controller handle). The other members are width-
+// correct placeholders so GetLocation lands at the right offset; the
+// Mem/Io/Pci access members are 2-pointer sub-structs in the spec, hence
+// the pair placeholders. Trailing members past GetLocation are omitted —
+// AXL never reads them through this binding.
+// ===================================================================
+
+typedef struct _EFI_PCI_IO_PROTOCOL EFI_PCI_IO_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_PCI_IO_PROTOCOL_GET_LOCATION)(
+    IN  EFI_PCI_IO_PROTOCOL  *This,
+    OUT UINTN                *SegmentNumber,
+    OUT UINTN                *BusNumber,
+    OUT UINTN                *DeviceNumber,
+    OUT UINTN                *FunctionNumber
+    );
+
+struct _EFI_PCI_IO_PROTOCOL {
+    VOID                              *PollMem;
+    VOID                              *PollIo;
+    VOID                              *Mem_Read;   VOID *Mem_Write;  // ACCESS Mem
+    VOID                              *Io_Read;    VOID *Io_Write;   // ACCESS Io
+    VOID                              *Pci_Read;   VOID *Pci_Write;  // CONFIG Pci
+    VOID                              *CopyMem;
+    VOID                              *Map;
+    VOID                              *Unmap;
+    VOID                              *AllocateBuffer;
+    VOID                              *FreeBuffer;
+    VOID                              *Flush;
+    EFI_PCI_IO_PROTOCOL_GET_LOCATION   GetLocation;
+};
+
+// ===================================================================
+// EFI_ARP_PROTOCOL (UEFI 2.11 §29.2) — only Configure + Find are bound
+// (axl_net_arp_list reads the neighbor/ARP cache). GUIDs are in
+// generated/guids.h (EFI_ARP_PROTOCOL_GUID, EFI_ARP_SERVICE_BINDING_*).
+// Each Find entry is followed inline by HwAddressLength hardware-address
+// bytes then SwAddressLength software-address bytes; entries are
+// EntryLength apart.
+// ===================================================================
+
+typedef struct {
+    UINT16  SwAddressType;     // 0x0800 for IPv4
+    UINT8   SwAddressLength;
+    VOID   *StationAddress;
+    UINT32  EntryTimeOut;
+    UINT32  RetryCount;
+    UINT32  RetryTimeOut;
+} EFI_ARP_CONFIG_DATA;
+
+typedef struct {
+    UINT32  Size;
+    BOOLEAN DenyFlag;
+    BOOLEAN StaticFlag;
+    UINT16  HwAddressType;
+    UINT16  SwAddressType;
+    UINT8   HwAddressLength;
+    UINT8   SwAddressLength;
+} EFI_ARP_FIND_DATA;
+
+typedef struct _EFI_ARP_PROTOCOL EFI_ARP_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_ARP_CONFIGURE)(
+    IN EFI_ARP_PROTOCOL     *This,
+    IN EFI_ARP_CONFIG_DATA  *ConfigData OPTIONAL
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_ARP_FIND)(
+    IN  EFI_ARP_PROTOCOL    *This,
+    IN  BOOLEAN              BySwAddress,
+    IN  VOID                *AddressBuffer OPTIONAL,
+    OUT UINT32              *EntryLength OPTIONAL,
+    OUT UINT32              *EntryCount OPTIONAL,
+    OUT EFI_ARP_FIND_DATA  **Entries OPTIONAL,
+    IN  BOOLEAN              Refresh
+    );
+
+struct _EFI_ARP_PROTOCOL {
+    EFI_ARP_CONFIGURE  Configure;
+    VOID              *Add;        // unused by AXL
+    EFI_ARP_FIND       Find;
+    VOID              *Delete;     // unused
+    VOID              *Flush;      // unused
+    VOID              *Request;    // unused
+    VOID              *Cancel;     // unused
 };
 
 #endif /* AXL_UEFI_EXTRA_H */

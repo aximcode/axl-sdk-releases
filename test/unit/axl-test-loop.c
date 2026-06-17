@@ -5,6 +5,7 @@
 #include "axl-test.h"
 #include <axl/axl-log.h>
 #include <axl/axl-loop.h>
+#include <axl/axl-wait.h>
 #include <uefi/axl-uefi.h>
 
 // ---------------------------------------------------------------------------
@@ -283,7 +284,7 @@ static void
 test_remove_source(void)
 {
     AxlLoop *loop;
-    uint32_t tid;
+    AxlSourceId tid;
 
     remove_count = 0;
     loop = axl_loop_new();
@@ -371,7 +372,7 @@ static void
 test_timeout_cancellation(void)
 {
     AxlLoop *loop;
-    uint32_t cancel_id;
+    AxlSourceId cancel_id;
 
     cancelled_count = 0;
     loop = axl_loop_new();
@@ -986,7 +987,7 @@ iter_outer_tick_done_path(void *data)
          * callback. Also arm a repeating 30ms "side" source to verify
          * unrelated outer sources keep ticking. */
         axl_loop_add_timeout(ctx->outer, 50, iter_inner_producer, ctx->inner);
-        uint32_t side_id = axl_loop_add_timer(ctx->outer, 30,
+        AxlSourceId side_id = axl_loop_add_timer(ctx->outer, 30,
                                               iter_side_source_tick, ctx);
 
         ctx->iter_rc = axl_loop_iterate_until(ctx->outer, ctx->inner,
@@ -1171,6 +1172,149 @@ test_loop_attach_driver(void)
 }
 
 // ---------------------------------------------------------------------------
+// Raised-TPL safety of nested blocking waits
+//
+// A consumer's driver-pump (axl_loop_attach_driver) dispatches notifies at
+// TPL_CALLBACK. A callback that performs a SYNCHRONOUS axl-sdk network op
+// (axl_udp_send / axl_http_post / a DNS lookup) reaches a NESTED axl_loop_run
+// via the _axl_*_wait family (src/net/axl-net-wait.c -> src/event/axl-wait.c).
+// gBS->WaitForEvent returns EFI_UNSUPPORTED above TPL_APPLICATION, so before
+// the raised-TPL fix that nested loop spun forever and hard-wedged the server
+// (SoftBMC syslog-under-console-mirror wedge, 2026-06-16).
+//
+// These exercise that exact path with NO real network I/O: a blocking wait
+// nested at TPL_CALLBACK must make progress (the loop falls back to a
+// CheckEvent sweep + Stall instead of WaitForEvent) and return its normal
+// result. WITHOUT the fix each of these HANGS (infinite spin) — it cannot
+// fail "cleanly", so confirm RED by running this binary in ISOLATION
+// (TEST_APPS_ONLY=AxlTestLoop) and watching it stall, never in the full suite.
+// ---------------------------------------------------------------------------
+
+static bool
+raised_tpl_flip_cond(void *ctx)
+{
+    int *calls = (int *)ctx;
+    (*calls)++;
+    return *calls >= 3;   /* satisfied on the 3rd poll */
+}
+
+static void
+test_loop_wait_at_raised_tpl(void)
+{
+    /* 1. Pure timeout wait nested at TPL_CALLBACK completes — the timeout
+       timer fires and is observed via CheckEvent, not WaitForEvent. */
+    EFI_TPL   old = gBS->RaiseTPL(TPL_CALLBACK);
+    AxlStatus rc = axl_wait_ms(NULL, 20);
+    gBS->RestoreTPL(old);
+    test_check(rc == AXL_OK,
+               "loop: axl_wait_ms completes at TPL_CALLBACK (no WaitForEvent wedge)");
+
+    /* 2. Condition+tick wait nested at TPL_CALLBACK completes — the tick
+       source fires and polls the condition to satisfaction. */
+    int calls = 0;
+    old = gBS->RaiseTPL(TPL_CALLBACK);
+    rc = axl_wait_for(raised_tpl_flip_cond, &calls, NULL, 5000000);
+    gBS->RestoreTPL(old);
+    test_check(rc == AXL_OK,
+               "loop: axl_wait_for condition resolves at TPL_CALLBACK");
+    test_check(calls >= 3,
+               "loop: tick polled the condition at TPL_CALLBACK");
+}
+
+// ---------------------------------------------------------------------------
+// The faithful reproduction: a sync nested wait performed from INSIDE a
+// driver-pump notify (the SoftBMC scenario, minus the network protocol).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    bool       done;
+    AxlStatus  rc;
+} NestedWaitCtx;
+
+static bool
+nested_wait_from_pump(void *user)
+{
+    NestedWaitCtx *c = (NestedWaitCtx *)user;
+    if (!c->done) {
+        c->done = true;
+        c->rc = axl_wait_ms(NULL, 20);   /* nested loop, runs at TPL_CALLBACK */
+    }
+    return AXL_SOURCE_CONTINUE;
+}
+
+static void
+test_loop_sync_wait_from_driver_pump(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("sync-wait-pump: loop_new alloc failed");
+        return;
+    }
+
+    NestedWaitCtx ctx = { .done = false, .rc = AXL_ERR };
+    axl_loop_add_idle(loop, nested_wait_from_pump, &ctx);
+
+    test_check(axl_loop_attach_driver(loop, 20) == AXL_OK,
+               "sync-wait-pump: attach_driver");
+    gBS->Stall(200000);  /* 200 ms — a notify fires the idle cb at TPL_CALLBACK */
+    test_check(axl_loop_detach_driver(loop) == AXL_OK,
+               "sync-wait-pump: detach_driver");
+
+    test_check(ctx.done,
+               "sync-wait-pump: driver notify ran the callback");
+    test_check(ctx.rc == AXL_OK,
+               "sync-wait-pump: nested sync wait from a TPL_CALLBACK notify completes");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// Loop-callback re-entrancy marker (_axl_loop_in_callback) — substrate for the
+// sync-wait re-entrancy guard (docs/AXL-Loop-Reentrancy-Plan.md Item 1).
+//
+// _axl_loop_in_callback() is defined in axl-loop.c; forward-declared here
+// because the loop's internal header is src/loop-only.
+// ---------------------------------------------------------------------------
+
+bool _axl_loop_in_callback(void);
+
+static bool g_rtin_observed_in_cb;
+
+static bool
+rtin_observe_cb(void *data)
+{
+    g_rtin_observed_in_cb = _axl_loop_in_callback();
+    axl_loop_quit((AxlLoop *)data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_loop_in_callback_marker(void)
+{
+    test_check(!_axl_loop_in_callback(),
+               "in_callback: false at top level (not inside a dispatch)");
+
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("in_callback: loop_new alloc failed");
+        return;
+    }
+
+    g_rtin_observed_in_cb = false;
+    /* One-shot timeout: when its callback runs (dispatched by the loop),
+       _axl_loop_in_callback() must read true. */
+    axl_loop_add_timeout(loop, 5, rtin_observe_cb, loop);
+    axl_loop_run(loop);
+
+    test_check(g_rtin_observed_in_cb,
+               "in_callback: true inside a dispatched loop callback");
+    test_check(!_axl_loop_in_callback(),
+               "in_callback: false again after the loop returns");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 // Ctrl-C intercept flag (GUI apps deliver Ctrl+C instead of quitting)
@@ -1196,6 +1340,47 @@ test_intercept_break_flag(void)
     axl_loop_set_intercept_break(NULL, false);
     test_check(!axl_loop_intercept_break(NULL),
                "intercept_break: NULL loop returns false");
+}
+
+// ---------------------------------------------------------------------------
+// Source ids are PROCESS-globally unique, not per-loop
+// ---------------------------------------------------------------------------
+
+// Two fresh loops must hand out DISTINCT ids for their first source. Per-loop
+// ids (each loop counting from 1) made the same id live on every loop, so a
+// source id that outlived its loop (e.g. a freed ephemeral sync-wrapper loop)
+// could be removed from a DIFFERENT loop and silently delete an unrelated
+// source — the adbf5461 second-server-dead-accept class. A global counter makes
+// that cross-loop removal a harmless no-op.
+static void
+test_source_ids_globally_unique(void)
+{
+    AxlLoop *a = axl_loop_new();
+    AxlLoop *b = axl_loop_new();
+    if (a == NULL || b == NULL) {
+        test_fail("global-id: alloc");
+        axl_loop_free(a);
+        axl_loop_free(b);
+        return;
+    }
+
+    // The callbacks never fire (the loops are not run); we only inspect ids.
+    AxlSourceId id_a = axl_loop_add_idle(a, on_idle_count, NULL);
+    AxlSourceId id_b = axl_loop_add_idle(b, on_idle_count, NULL);
+
+    test_check(id_a != 0 && id_b != 0, "loop: source ids are nonzero");
+    test_check(id_a != id_b,
+               "loop: source ids unique across loops (no per-loop collision)");
+
+    // A stale cross-loop id can't match a source on the other loop, so removing
+    // it is a no-op; ids keep advancing from the single global counter.
+    axl_loop_remove_source(b, id_a);
+    AxlSourceId id_b2 = axl_loop_add_idle(b, on_idle_count, NULL);
+    test_check(id_b2 != id_a && id_b2 != id_b,
+               "loop: ids keep advancing globally after a cross-loop remove");
+
+    axl_loop_free(a);
+    axl_loop_free(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,7 +1421,11 @@ test_loop_main(
     test_iterate_until_done();
     test_iterate_until_timeout();
     test_loop_attach_driver();
+    test_loop_wait_at_raised_tpl();
+    test_loop_sync_wait_from_driver_pump();
+    test_loop_in_callback_marker();
     test_intercept_break_flag();
+    test_source_ids_globally_unique();
 
     return test_print_results();
 }

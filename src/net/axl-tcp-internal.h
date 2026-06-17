@@ -13,7 +13,9 @@
 #define AXL_TCP_INTERNAL_H
 
 #include "../backend/axl-backend.h"
+#include <axl/axl-inet-address.h>
 #include <axl/axl-tcp.h>
+#include <axl/axl-loop.h>   /* AxlSourceId */
 
 #define TCP_MAPPING_RETRIES   10                    // retries on EFI_NO_MAPPING
 #define TCP_MAPPING_DELAY     (1000 * 1000)         // 1s between retries
@@ -36,14 +38,14 @@ struct AxlTcp {
     /* accept */
     AxlTcpCallback  on_accept;
     void           *accept_data;
-    uint32_t        accept_source;
-    uint32_t        accept_cancel_source;
+    AxlSourceId     accept_source;
+    AxlSourceId     accept_cancel_source;
     EFI_TCP4_LISTEN_TOKEN       acc_token;
     /* recv */
     AxlTcpCallback  on_recv;
     void           *recv_data;
-    uint32_t        recv_source;
-    uint32_t        recv_cancel_source;
+    AxlSourceId     recv_source;
+    AxlSourceId     recv_cancel_source;
     EFI_TCP4_IO_TOKEN           rx_token;
     EFI_TCP4_RECEIVE_DATA       rx_data;
     void           *recv_buf;
@@ -52,16 +54,16 @@ struct AxlTcp {
     /* send */
     AxlTcpCallback  on_send;
     void           *send_data;
-    uint32_t        send_source;
-    uint32_t        send_cancel_source;
+    AxlSourceId     send_source;
+    AxlSourceId     send_cancel_source;
     EFI_TCP4_IO_TOKEN           tx_token;
     EFI_TCP4_TRANSMIT_DATA      tx_data;
     EFI_TCP4_FRAGMENT_DATA      tx_frag;
     /* connect */
     AxlTcpCallback  on_connect;
     void           *connect_data;
-    uint32_t        connect_source;
-    uint32_t        connect_cancel_source;
+    AxlSourceId     connect_source;
+    AxlSourceId     connect_cancel_source;
     EFI_TCP4_CONNECTION_TOKEN   conn_token;
 };
 
@@ -105,5 +107,48 @@ void axl_tcp_accept_drop_sources (AxlTcp *listener);
 void axl_tcp_connect_drop_sources(AxlTcp *sock);
 void axl_tcp_recv_drop_sources   (AxlTcp *sock);
 void axl_tcp_send_drop_sources   (AxlTcp *sock);
+
+/* Internal connect variant that also hands back the in-progress socket via
+   @p out_pending (NULL OK). The public axl_tcp_connect_async_via wraps this
+   with out_pending == NULL. The sync connect wrapper uses it to reach the
+   socket's tcp4 so it can drive Poll() while its ephemeral loop blocks at a
+   raised TPL (see tcp_sync_poll_tick in axl-tcp-sync.c). @p *out_pending is
+   set only on the AXL_OK return; on any error the socket is already torn
+   down, so it stays whatever the caller initialized it to (use NULL). */
+int
+axl_tcp_connect_async_via_ex(
+    const char            *host,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data,
+    AxlTcp               **out_pending
+    );
+
+/* Connect to an ALREADY-RESOLVED IPv4 address — the resolve-free core of
+   axl_tcp_connect_async_via_ex. The async HTTP client calls this after its
+   own axl_net_resolve_async so the whole request stays nest-free (the _via_ex
+   form resolves synchronously, nesting an ephemeral loop). Same out_pending
+   contract: set only on the AXL_OK return. */
+int
+axl_tcp_connect_addr_async(
+    const AxlIPv4Address  *dest,
+    uint16_t               port,
+    const AxlIPv4Address  *source_ip,
+    AxlLoop               *loop,
+    AxlCancellable        *cancel,
+    AxlTcpCallback         cb,
+    void                  *data,
+    AxlTcp               **out_pending
+    );
+
+/* True if an async send is currently in flight on @p sock (i.e. a prior
+   axl_tcp_send_async has not yet completed). axl_tcp_send_async is strictly
+   one-send-in-flight; callers that encrypt before sending (axl_tls_write_async)
+   must check this BEFORE doing irreversible work so they don't advance the TLS
+   sequence number for a record that would then be rejected and dropped. */
+bool axl_tcp_send_in_flight(const AxlTcp *sock);
 
 #endif /* AXL_TCP_INTERNAL_H */

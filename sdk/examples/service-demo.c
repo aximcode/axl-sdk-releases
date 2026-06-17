@@ -42,18 +42,19 @@ typedef struct {
 
 static DemoOpts g_opts;
 
-/* short_name + choices (the trailing AxlConfigDesc fields, ignored by
-   AxlConfig parsing) flow through axl_service_main's synthesizer into
-   the AxlArgDesc[] it builds for the `start` verb. They give the demo
-   a real-shaped CLI: `start -p 9090 -v --name foo` parses the same as
-   the long form, and `--name` is a CHOICE so `--name bogus` errors
-   out at parse time rather than getting stuffed into LoadOptions. */
+/* short_name + choices + min/max (the trailing AxlConfigDesc fields,
+   ignored by AxlConfig parsing) flow through axl_service_main's
+   synthesizer into the AxlArgDesc[] it builds for the `start` verb. They
+   give the demo a real-shaped CLI: `start -p 9090 -v --name foo` parses
+   the same as the long form, `--name` is a CHOICE so `--name bogus`
+   errors out at parse time, and `port` carries a [1,65535] range so
+   `--port 99999` is rejected at parse time rather than reaching setup. */
 static const char *const demo_names[] = { "demo", "alpha", "beta", NULL };
 static const AxlConfigDesc demo_descs[] = {
     { .key = "port",    .type = AXL_CFG_UINT,   .default_value = "8080",
       .description = "Listen port",
       .offset = offsetof(DemoOpts, port),    .field_size = sizeof(uint64_t),
-      .short_name = 'p' },
+      .short_name = 'p', .min = 1, .max = 65535 },
     { .key = "verbose", .type = AXL_CFG_BOOL,   .default_value = "false",
       .description = "Verbose mode",
       .offset = offsetof(DemoOpts, verbose), .field_size = sizeof(bool),

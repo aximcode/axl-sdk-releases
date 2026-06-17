@@ -35,10 +35,24 @@
  * compares against the literal integers (`rc == -2`) both work.
  */
 typedef enum {
-    AXL_OK        =  0,  ///< operation succeeded
-    AXL_ERR       = -1,  ///< operation failed (generic)
-    AXL_CANCELLED = -2,  ///< operation cancelled (AxlCancellable signalled or Ctrl-C)
-    AXL_TIMEOUT   = -3,  ///< operation deadline elapsed before completion
+    AXL_OK           =  0,  ///< operation succeeded
+    AXL_ERR          = -1,  ///< operation failed (generic)
+    AXL_CANCELLED    = -2,  ///< operation cancelled (AxlCancellable signalled or Ctrl-C)
+    AXL_TIMEOUT      = -3,  ///< operation deadline elapsed before completion
+    /* Richer, mappable failure codes — the blessed vocabulary for consumers
+       that need to distinguish or translate outcomes (e.g. a status->HTTP
+       map) without coupling to EFI_*. New codes only ever extend the negative
+       range; the numeric values are part of the contract. AXL_ERR remains the
+       generic catch-all — an API returns a specific code only where it
+       meaningfully discriminates, and callers must still treat ANY negative
+       value as failure. */
+    AXL_INVALID      = -4,  ///< invalid argument / malformed input
+    AXL_NOT_FOUND    = -5,  ///< requested entity does not exist
+    AXL_DENIED       = -6,  ///< permission / authorization denied
+    AXL_UNSUPPORTED  = -7,  ///< operation not supported here
+    AXL_NO_RESOURCES = -8,  ///< out of memory / handles / capacity
+    AXL_IO_ERROR     = -9,  ///< underlying device / transport I/O failure
+    AXL_BUSY         = -10, ///< resource temporarily unavailable (e.g. a prior async op still in flight) — retry later
 } AxlStatus;
 
 // ---------------------------------------------------------------------------

@@ -105,6 +105,111 @@ axl_file_write_atomic(
     size_t      len    ///< data size in bytes
 );
 
+// ---------------------------------------------------------------------------
+// AxlFileWriter — incremental (out-of-core) file writes
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Streaming file writer — the write peer of AxlFileView.
+ *
+ * Writes a file incrementally without buffering the whole payload in
+ * memory, the way `axl_file_view` reads out-of-core. This is what backs
+ * a WebDAV PUT or any large upload that can't fit
+ * `axl_file_set_contents`'s whole-buffer model (a BMC mounting a
+ * multi-GB ISO, say). Each `axl_file_writer_write` goes straight to the
+ * file; nothing is held in RAM between calls.
+ *
+ * Opaque handle; create with `axl_file_writer_open`, finalize with
+ * `axl_file_writer_close` (which flushes). Not thread-safe (UEFI is
+ * single-threaded for file I/O).
+ */
+typedef struct AxlFileWriter AxlFileWriter;
+
+/// Append to an existing file instead of replacing it: writes go at the
+/// current end of file rather than truncating it to empty first.
+#define AXL_FILE_WRITER_APPEND  0x01u
+/// Exclusive create: fail (return NULL) if @p path already exists.
+/// Backs a PUT with `If-None-Match: *` (create-only). Ignored together
+/// with APPEND would contradict; pass at most one of the two.
+#define AXL_FILE_WRITER_EXCL    0x02u
+
+/**
+ * @brief Open a file for incremental writing.
+ *
+ * Creates @p path if it does not exist. By default (flags 0) an existing
+ * file is truncated to empty first, so the writer replaces its contents
+ * (WebDAV PUT semantics) with no stale tail when the new content is
+ * shorter. With `AXL_FILE_WRITER_APPEND`, existing content is kept and
+ * writes go at the current end of file. With `AXL_FILE_WRITER_EXCL`,
+ * the open fails if @p path already exists.
+ *
+ * Not atomic: unlike `axl_file_write_atomic`, the target is written in
+ * place (truncated up front), so an aborted stream or a power loss
+ * mid-write leaves it partially written. Out-of-core streaming
+ * precludes the temp-file-then-rename trick — a caller that needs
+ * all-or-nothing must write to a temp path and rename on close itself.
+ *
+ * @return new writer, or NULL on open failure / OOM / EXCL-and-exists.
+ *     Free with `axl_file_writer_close`.
+ */
+AxlFileWriter *
+axl_file_writer_open(
+    const char *path,   ///< file path (UTF-8)
+    uint32_t    flags   ///< AXL_FILE_WRITER_* (0 = create / replace)
+);
+
+/**
+ * @brief Append @p len bytes to the writer.
+ *
+ * Writes straight through to the file. A short write (fewer bytes
+ * accepted by the firmware than requested) is reported as AXL_ERR and
+ * puts the writer in a failed state: subsequent writes return AXL_ERR
+ * without further I/O, and the file is left partially written — the
+ * caller should stop and `axl_file_writer_close` it. A failed write may
+ * already have advanced the file by some bytes.
+ *
+ * @return AXL_OK on success, AXL_ERR on write error, a prior failed
+ *     state, or NULL args.
+ */
+AXL_WARN_UNUSED int
+axl_file_writer_write(
+    AxlFileWriter *w,    ///< writer
+    const void    *buf,  ///< data to append
+    size_t         len   ///< number of bytes (0 is a no-op success)
+);
+
+/**
+ * @brief Bytes written through this writer so far.
+ *
+ * Total bytes accepted by successful `axl_file_writer_write` calls
+ * (plus the pre-existing length when opened with APPEND). Lets a PUT
+ * handler verify it received the advertised `Content-Length`.
+ *
+ * @return byte count, or 0 if @p w is NULL.
+ */
+uint64_t
+axl_file_writer_tell(
+    const AxlFileWriter *w   ///< writer
+);
+
+/**
+ * @brief Flush and close the writer, releasing it. NULL-safe.
+ *
+ * Closing flushes outstanding data to the underlying volume (UEFI FAT
+ * close implies flush). The writer is freed regardless of the flush
+ * result, so a PUT handler that needs durability MUST check this return
+ * (a failed flush means report 5xx, not 201). There is deliberately no
+ * AXL_AUTOPTR cleanup binding for AxlFileWriter: an implicit close would
+ * discard this load-bearing flush status. C++ callers close explicitly.
+ *
+ * @return AXL_OK on success (or @p w == NULL), AXL_ERR if the final
+ *     flush/close failed or the writer was already in a failed state.
+ */
+int
+axl_file_writer_close(
+    AxlFileWriter *w   ///< writer (NULL-safe)
+);
+
 /**
  * @brief Check if a path refers to a directory.
  *

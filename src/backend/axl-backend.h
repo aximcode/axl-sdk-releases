@@ -276,6 +276,20 @@ axl_backend_file_set_position(
     );
 
 /**
+ * @brief Set (truncate or extend) a file's size on an open handle.
+ *
+ * Updates the file length via SetFileInfo. Shrinking truncates; size
+ * 0 empties the file. The handle must be open for writing.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_file_set_size(
+    AxlFileHandle  handle,  ///< file handle (open for write)
+    uint64_t       size     ///< new file size in bytes
+    );
+
+/**
  * @brief Delete a file by UCS-2 path.
  *
  * @return AXL_OK on success, AXL_ERR on error.
@@ -625,6 +639,13 @@ axl_backend_event_set_timer(
 /**
  * @brief Wait for one of several events to fire (blocking).
  *
+ * Raised-TPL-safe: `gBS->WaitForEvent` is unavailable above
+ * `TPL_APPLICATION` (a nested wait reached from a driver-pump notify
+ * dispatched at `TPL_CALLBACK`), so above that level this falls back to a
+ * non-blocking `CheckEvent` sweep with a short `Stall` between passes
+ * rather than failing or wedging. At `TPL_APPLICATION` (the common
+ * foreground path) it falls through to a plain `WaitForEvent`.
+ *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
@@ -643,6 +664,22 @@ int
 axl_backend_event_check(
     AxlEventHandle  event  ///< event to check
     );
+
+/**
+ * @brief Whether the caller is executing above @c TPL_APPLICATION.
+ *
+ * @c gBS->WaitForEvent returns @c EFI_UNSUPPORTED above @c TPL_APPLICATION
+ * (a nested wait reached from a driver-pump notify at @c TPL_CALLBACK).
+ * @ref axl_backend_event_wait uses this to pick its non-blocking
+ * @c CheckEvent fallback; the sync network wrappers use it to install a
+ * protocol @c Poll() tick only when one is needed (the firmware notify
+ * already drives I/O at @c TPL_APPLICATION, so no tick — and no extra CPU
+ * — in the common foreground case). Cheap: one @c RaiseTPL / @c RestoreTPL.
+ *
+ * @return true if the current TPL is above @c TPL_APPLICATION.
+ */
+bool
+axl_backend_at_raised_tpl(void);
 
 /**
  * @brief Register for protocol install notification.

@@ -469,6 +469,16 @@ run_rfbrowse(AxlArgs *a)
     char base_url[256];
     build_base_url(base_url, sizeof(base_url), host);
 
+    /* Redfish is normally https. Enable TLS so https works directly or via an
+       http->https redirect (the client's TLS path is otherwise strippable —
+       see axl-http-client-tls.h). Bail only when the resolved URL is already
+       https: a plain http:// target (e.g. a mock) must still work in an
+       AXL_TLS=0 build, where axl_tls_init() fails. */
+    if (axl_tls_init() != AXL_OK && axl_strncmp(base_url, "https://", 8) == 0) {
+        axl_printf("rfbrowse: https requires an AXL_TLS=1 build.\n");
+        return 1;
+    }
+
     // Create and configure HTTP client
     AXL_AUTOPTR(AxlHttpClient) client = axl_http_client_new();
     if (client == NULL) {

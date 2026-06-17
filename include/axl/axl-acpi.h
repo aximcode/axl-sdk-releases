@@ -98,6 +98,19 @@ axl_acpi_find_next(
  * Pass NULL for the first call; pass the previous result for
  * subsequent calls. Returns NULL when there are no more.
  *
+ * The walk is the complete table set, like `acpidump` or
+ * EFI_ACPI_SDT_PROTOCOL.GetAcpiTable: it includes the FADT's DSDT and
+ * FACS children, which are not RSDT/XSDT entries (they hang off the
+ * FADT) and are recovered from it. They are yielded FIRST — FACS then
+ * DSDT (when present), ahead of the RSDT/XSDT tables — matching the
+ * order GetAcpiTable / `acpidump` / `/sys/firmware/acpi/tables` use, so
+ * a consumer diffing against that oracle needs no reordering.
+ * `axl_acpi_find` / `_find_next` see them too. Caveat: the FACS is not
+ * a standard System Description
+ * Table — only its `signature` and `length` are meaningful, and
+ * `axl_acpi_checksum_ok` does not apply to it (it has no whole-table
+ * checksum). The DSDT is a normal SDT with a valid header.
+ *
  * @return pointer to next table header, or NULL if no more.
  */
 AxlAcpiHeader *

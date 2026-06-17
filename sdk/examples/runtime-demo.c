@@ -281,7 +281,7 @@ iter_outer_tick(void *data)
         axl_printf("  arming inner-signal (+300ms) and side-source "
                    "(150ms repeating)\n");
         axl_loop_add_timeout(ctx->outer, 300, iter_inner_signal, ctx->inner);
-        uint32_t side_id = axl_loop_add_timer(ctx->outer, 150,
+        AxlSourceId side_id = axl_loop_add_timer(ctx->outer, 150,
                                               iter_side_tick, ctx);
 
         axl_printf("  entering iterate_until(1s timeout)\n");

@@ -17,6 +17,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-net.h>
+#include <axl/axl-loop.h>   /* AxlSourceId */
 
 AXL_LOG_DOMAIN("udp");
 
@@ -40,8 +41,8 @@ struct AxlUdp {
 
     /* Async receive state */
     AxlLoop                       *loop;
-    uint32_t                       loop_source;
-    uint32_t                       cancel_source;
+    AxlSourceId                    loop_source;
+    AxlSourceId                    cancel_source;
     AxlUdpCallback                 on_recv;
     void                          *on_recv_data;
     EFI_UDP4_COMPLETION_TOKEN      rx_token;
@@ -53,8 +54,8 @@ struct AxlUdp {
        on stack of the call. */
     bool                           tx_in_flight;
     AxlLoop                       *tx_loop;
-    uint32_t                       tx_source;
-    uint32_t                       tx_cancel_source;
+    AxlSourceId                    tx_source;
+    AxlSourceId                    tx_cancel_source;
     AxlUdpSendCallback             on_send;
     void                          *on_send_data;
     EFI_EVENT                      tx_event;
@@ -449,8 +450,70 @@ axl_udp_get_local_addr(
 }
 
 // ---------------------------------------------------------------------------
-// Public API: blocking send
+// Sync wrappers over the async cores (Option A — one I/O implementation).
+// Each spins a private loop, runs axl_udp_send_async / axl_udp_recv_async, and
+// harvests the result. A timeout cancellable bounds the wait; a Poll tick over
+// the socket drives the UDP4 state machine when the loop blocks at a raised TPL
+// (at TPL_APPLICATION the firmware notify advances the op for free). Mirrors the
+// TCP sync wrappers in axl-tcp-sync.c.
 // ---------------------------------------------------------------------------
+
+#define UDP_SEND_TIMEOUT_MS    (UDP_SEND_TIMEOUT_US / 1000)
+#define UDP_SYNC_POLL_TICK_MS  10u
+
+static bool
+on_udp_sync_cancel_timeout(void *data)
+{
+    axl_cancellable_cancel((AxlCancellable *)data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+udp_sync_poll_tick(void *data)
+{
+    EFI_UDP4_PROTOCOL *udp4 = (EFI_UDP4_PROTOCOL *)data;
+    axl_efi_call(udp4->Poll, 1, udp4);
+    return AXL_SOURCE_CONTINUE;
+}
+
+/* Arm the Poll tick only at a raised TPL, where the blocking loop starves the
+   firmware notify (see axl-tcp-sync.c tcp_sync_arm_poll_tick). Returns the tick
+   source id, or 0 when not armed. */
+static AxlSourceId
+udp_sync_arm_poll_tick(AxlLoop *loop, EFI_UDP4_PROTOCOL *udp4)
+{
+    if (!axl_backend_at_raised_tpl()) {
+        return 0;
+    }
+    return axl_loop_add_timer(loop, UDP_SYNC_POLL_TICK_MS, udp_sync_poll_tick, udp4);
+}
+
+static void
+udp_sync_disarm_poll_tick(AxlLoop *loop, AxlSourceId poll_src)
+{
+    if (poll_src != 0) {
+        axl_loop_remove_source(loop, poll_src);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API: blocking send (wraps axl_udp_send_async)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlStatus  st;
+    AxlLoop   *loop;
+} UdpSyncSendCtx;
+
+static bool
+on_udp_sync_send_done(AxlUdp *sock, AxlStatus st, void *user)
+{
+    (void)sock;
+    UdpSyncSendCtx *r = (UdpSyncSendCtx *)user;
+    r->st = st;
+    axl_loop_quit(r->loop);
+    return false;
+}
 
 int
 axl_udp_send(
@@ -461,68 +524,73 @@ axl_udp_send(
     size_t                len
     )
 {
-    if (sock == NULL || sock->udp4 == NULL || data == NULL || len == 0) {
+    /* dest=NULL is allowed iff the socket is connected; axl_udp_send_async
+       validates that (and every other arg), so don't duplicate the checks. */
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
         return AXL_ERR;
     }
-    /* dest=NULL is allowed iff socket is connected (RemoteAddress
-       configured); the EFI Transmit will use the configured peer. */
-    if (dest == NULL && !sock->peer_set) {
-        return AXL_ERR;
-    }
-
-    EFI_UDP4_SESSION_DATA session;
-    EFI_UDP4_SESSION_DATA *session_ptr = NULL;
-    if (dest != NULL) {
-        axl_memset(&session, 0, sizeof(session));
-        axl_memcpy(&session.DestinationAddress, dest, 4);
-        session.DestinationPort = port;
-        session_ptr = &session;
-    }
-
-    EFI_UDP4_FRAGMENT_DATA frag;
-    frag.FragmentLength = (uint32_t)len;
-    frag.FragmentBuffer = (void *)data;
-
-    EFI_UDP4_TRANSMIT_DATA tx;
-    axl_memset(&tx, 0, sizeof(tx));
-    tx.UdpSessionData  = session_ptr;
-    tx.GatewayAddress  = NULL;
-    tx.DataLength      = (uint32_t)len;
-    tx.FragmentCount   = 1;
-    tx.FragmentTable[0] = frag;
-
-    EFI_EVENT event = NULL;
-    EFI_STATUS status = axl_bs()->CreateEvent(0, 0, NULL, NULL, &event);
-    if (status != 0) {
+    AxlCancellable *cancel = axl_cancellable_new();
+    if (cancel == NULL) {
+        axl_loop_free(loop);
         return AXL_ERR;
     }
 
-    EFI_UDP4_COMPLETION_TOKEN token;
-    axl_memset(&token, 0, sizeof(token));
-    token.Event  = event;
-    token.Status = EFI_ABORTED;
-    token.Packet.TxData = &tx;
-
-    status = axl_efi_call(sock->udp4->Transmit, 2, sock->udp4, &token);
-    if (status != 0) {
-        axl_bs()->CloseEvent(event);
+    UdpSyncSendCtx r = { AXL_ERR, loop };
+    if (axl_udp_send_async(sock, dest, port, data, len, loop, cancel,
+                           on_udp_sync_send_done, &r) != AXL_OK) {
+        axl_cancellable_free(cancel);
+        axl_loop_free(loop);
         return AXL_ERR;
     }
 
-    if (_axl_udp_wait(sock->udp4, event, UDP_SEND_TIMEOUT_US) != 0) {
-        axl_efi_call(sock->udp4->Cancel, 2, sock->udp4, &token);
-        axl_bs()->CloseEvent(event);
-        return AXL_ERR;
-    }
+    axl_loop_add_timeout(loop, UDP_SEND_TIMEOUT_MS, on_udp_sync_cancel_timeout, cancel);
+    AxlSourceId poll = udp_sync_arm_poll_tick(loop, sock->udp4);
+    axl_loop_run(loop);
+    udp_sync_disarm_poll_tick(loop, poll);
 
-    int rc = (token.Status == 0) ? AXL_OK : AXL_ERR;
-    axl_bs()->CloseEvent(event);
-    return rc;
+    axl_cancellable_free(cancel);
+    axl_loop_free(loop);
+    return r.st;
 }
 
 // ---------------------------------------------------------------------------
 // Public API: blocking send-receive
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Public API: blocking send-receive (send wraps axl_udp_send, receive wraps a
+// one-shot axl_udp_recv_async).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlStatus  st;
+    AxlLoop   *loop;
+    void      *rx_buf;
+    size_t     rx_size;
+    size_t     rx_len;
+} UdpSyncRecvCtx;
+
+/* One-shot receive: copy the first datagram (truncated to rx_size, matching the
+   old inline copy) and stop. axl_udp_recv_async already gathered the fragments
+   into the contiguous @p data buffer for us. */
+static bool
+on_udp_sync_recv_done(AxlUdp *sock, AxlStatus st, const void *data, size_t len,
+                      const AxlIPv4Address *from, uint16_t from_port, void *user)
+{
+    (void)sock;
+    (void)from;
+    (void)from_port;
+    UdpSyncRecvCtx *r = (UdpSyncRecvCtx *)user;
+    r->st = st;
+    if (st == AXL_OK && data != NULL) {
+        size_t copy = (len < r->rx_size) ? len : r->rx_size;
+        axl_memcpy(r->rx_buf, data, copy);
+        r->rx_len = copy;
+    }
+    axl_loop_quit(r->loop);
+    return false;   /* one-shot — stop receiving */
+}
 
 int
 axl_udp_sendrecv(
@@ -546,63 +614,49 @@ axl_udp_sendrecv(
     *rx_len = 0;
 
     /* --- Transmit phase --- */
-    int rc = axl_udp_send(sock, dest, port, tx_data, tx_len);
-    if (rc != AXL_OK) {
+    if (axl_udp_send(sock, dest, port, tx_data, tx_len) != AXL_OK) {
         return AXL_ERR;
     }
 
-    /* --- Receive phase --- */
-    EFI_EVENT rx_event = NULL;
-    EFI_STATUS status = axl_bs()->CreateEvent(0, 0, NULL, NULL, &rx_event);
-    if (status != 0) {
+    /* --- Receive phase (one-shot async on a private loop) --- */
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        return AXL_ERR;
+    }
+    AxlCancellable *cancel = axl_cancellable_new();
+    if (cancel == NULL) {
+        axl_loop_free(loop);
         return AXL_ERR;
     }
 
-    EFI_UDP4_COMPLETION_TOKEN rx_token;
-    axl_memset(&rx_token, 0, sizeof(rx_token));
-    rx_token.Event  = rx_event;
-    rx_token.Status = EFI_ABORTED;
-    rx_token.Packet.RxData = NULL;
-
-    status = axl_efi_call(sock->udp4->Receive, 2, sock->udp4, &rx_token);
-    if (status != 0) {
-        axl_bs()->CloseEvent(rx_event);
+    UdpSyncRecvCtx r = { AXL_ERR, loop, rx_buf, rx_size, 0 };
+    if (axl_udp_recv_async(sock, loop, cancel, on_udp_sync_recv_done, &r) != AXL_OK) {
+        axl_cancellable_free(cancel);
+        axl_loop_free(loop);
         return AXL_ERR;
     }
 
-    if (_axl_udp_wait(sock->udp4, rx_event, timeout_ms * 1000) != 0) {
-        axl_efi_call(sock->udp4->Cancel, 2, sock->udp4, &rx_token);
-        axl_bs()->CloseEvent(rx_event);
-        return AXL_ERR;
-    }
+    axl_loop_add_timeout(loop, timeout_ms, on_udp_sync_cancel_timeout, cancel);
+    AxlSourceId poll = udp_sync_arm_poll_tick(loop, sock->udp4);
+    axl_loop_run(loop);
+    udp_sync_disarm_poll_tick(loop, poll);
 
-    if (rx_token.Status != 0 || rx_token.Packet.RxData == NULL) {
-        axl_bs()->CloseEvent(rx_event);
-        return AXL_ERR;
-    }
+    /* recv_async is a PERSISTENT re-arming receiver; our cb returned false, so
+       on_udp_recv_event removed the loop sources but left the socket's recv
+       state (sock->loop / rx_event / pending token) intact for an eventual
+       axl_udp_close. Tear it down here (idempotent — NULLs sock->loop) before
+       freeing the ephemeral loop, so the NEXT sendrecv's axl_udp_recv_async
+       doesn't see "recv already started". On a timeout, on_udp_recv_cancel
+       already cleared it; the second call is a safe no-op. */
+    udp_recv_drop_sources(sock);
+    axl_cancellable_free(cancel);
+    axl_loop_free(loop);
 
-    /* Copy fragment data to caller's buffer */
-    EFI_UDP4_RECEIVE_DATA *rx = rx_token.Packet.RxData;
-    size_t total = 0;
-    for (uint32_t i = 0; i < rx->FragmentCount; i++) {
-        size_t frag_len = rx->FragmentTable[i].FragmentLength;
-        size_t copy_len = (total + frag_len <= rx_size)
-            ? frag_len : (rx_size - total);
-        if (copy_len > 0) {
-            axl_memcpy((uint8_t *)rx_buf + total,
-                       rx->FragmentTable[i].FragmentBuffer, copy_len);
-        }
-        total += copy_len;
-        if (total >= rx_size) {
-            break;
-        }
+    if (r.st == AXL_OK) {
+        *rx_len = r.rx_len;
+        return AXL_OK;
     }
-    *rx_len = total;
-
-    /* Return buffer to firmware */
-    axl_bs()->SignalEvent(rx->RecycleSignal);
-    axl_bs()->CloseEvent(rx_event);
-    return AXL_OK;
+    return AXL_ERR;
 }
 
 // ---------------------------------------------------------------------------
@@ -658,8 +712,8 @@ on_udp_recv_event(void *data)
        must use these saved IDs and never deref sock. Contract for
        true: cb MUST NOT close sock (we re-arm Receive on it below). */
     AxlLoop  *saved_loop       = sock->loop;
-    uint32_t  saved_loop_src   = sock->loop_source;
-    uint32_t  saved_cancel_src = sock->cancel_source;
+    AxlSourceId  saved_loop_src   = sock->loop_source;
+    AxlSourceId  saved_cancel_src = sock->cancel_source;
 
     axl_efi_call(sock->udp4->Poll, 1, sock->udp4);
 
@@ -888,8 +942,8 @@ on_udp_send_event(void *data)
     AxlStatus           cb_status;
     /* Snapshot so cb may close sock from inside the callback. */
     AxlLoop  *saved_loop          = sock->tx_loop;
-    uint32_t  saved_tx_src        = sock->tx_source;
-    uint32_t  saved_tx_cancel_src = sock->tx_cancel_source;
+    AxlSourceId  saved_tx_src        = sock->tx_source;
+    AxlSourceId  saved_tx_cancel_src = sock->tx_cancel_source;
     EFI_EVENT saved_tx_event      = sock->tx_event;
 
     axl_efi_call(sock->udp4->Poll, 1, sock->udp4);

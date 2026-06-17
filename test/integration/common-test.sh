@@ -586,6 +586,40 @@ test_count_results() {
         ' "$TEST_LOG"
     fi
 
+    #
+    # Stalled-binary detection. Each unit binary prints a
+    # "=== <Suite> Tests ===" header and a "=== Results: ... ===" footer.
+    # A header with no footer before the next header (or end of log) means
+    # that binary hung or faulted mid-run — and in the combined suite a
+    # single hang starves every binary after it (one shared QEMU boot, one
+    # timeout). Surface the culprit loudly: a hung firmware/protocol test
+    # otherwise shows up only as an opaque "fewer tests ran" ratchet drop.
+    # (The outer "=== AXL ... Integration Tests (ARCH) ===" wrapper does not
+    # match the per-binary "... Tests ===" anchor, so it is not flagged.)
+    #
+    local stalled
+    stalled=$(awk '
+        match($0, /=== .+ Tests ===/) {
+            if (open != "") { print open }
+            name = $0
+            sub(/.*=== /, "", name)
+            sub(/ Tests ===.*/, "", name)
+            open = name
+        }
+        /=== Results:/ { open = "" }
+        END { if (open != "") print open }
+    ' "$TEST_CLEAN_LOG")
+
+    if [[ -n "$stalled" ]]; then
+        echo ""
+        echo "*** STALLED: the following test binary started but never"
+        echo "    produced a Results footer — it hung or faulted (likely an"
+        echo "    infinite loop or a firmware call that wedged); any binaries"
+        echo "    after it in the run were starved:"
+        local _s
+        while IFS= read -r _s; do echo "      - $_s"; done <<< "$stalled"
+    fi
+
     # Calculate elapsed time
     local end_time elapsed_ms elapsed_s elapsed_frac
     end_time=$(date +%s%N)
@@ -612,7 +646,11 @@ test_count_results() {
             if [[ $pass -lt $expected ]]; then
                 echo ""
                 echo "FAIL: expected at least $expected tests but only $pass ran"
-                echo "      (a test binary may have crashed partway through)"
+                if [[ -n "$stalled" ]]; then
+                    echo "      Culprit (no Results footer): $(echo "$stalled" | paste -sd, -)"
+                else
+                    echo "      (a test binary may have crashed partway through)"
+                fi
                 exit 1
             fi
         fi
@@ -625,5 +663,61 @@ test_count_results() {
         exit 0
     else
         exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Host-side result helpers (for tests that probe a server FROM the host with
+# curl, rather than parsing PASS/FAIL out of the guest serial log). These
+# replace the pass()/fail()/PASS/FAIL boilerplate each such test re-defined.
+# Use test_host_pass/_fail to tally, then test_host_summary at the end.
+# ---------------------------------------------------------------------------
+
+TEST_HOST_PASS=0
+TEST_HOST_FAIL=0
+
+test_host_pass() { echo "  PASS: $1"; TEST_HOST_PASS=$((TEST_HOST_PASS + 1)); }
+test_host_fail() { echo "  FAIL: $1"; TEST_HOST_FAIL=$((TEST_HOST_FAIL + 1)); }
+
+# Print the tally and return non-zero if any check failed (or none passed).
+# $1: a label for the line (e.g. the suite name + arch).
+test_host_summary() {
+    echo ""
+    printf "%s: %d passed, %d failed\n" "$1" "$TEST_HOST_PASS" "$TEST_HOST_FAIL"
+    [[ $TEST_HOST_FAIL -eq 0 && $TEST_HOST_PASS -gt 0 ]]
+}
+
+# Liveness watchdog: GET $1 and require HTTP $3 (default 200) within a bounded
+# time. The concurrency wedges this harness targets manifest as a loop that
+# stops dispatching, so a probe that times out (curl code 000) is the failure
+# signal — re-run after every scenario to convert a silent hang into a named
+# FAIL. $2 is the label. Honors CURL_OPTS if the caller set it.
+#   test_liveness_probe "https://127.0.0.1:18450/api/version" "loop alive after WS close"
+test_liveness_probe() {
+    local url="$1" label="$2" want="${3:-200}"
+    local opts=(-s --insecure -H "Connection: close" --max-time 10)
+    # set -u safe: ${CURL_OPTS+x} is empty when unset, so the length check
+    # (which would error under set -u on an unset array) only runs when set.
+    [[ -n "${CURL_OPTS+x}" && "${#CURL_OPTS[@]}" -gt 0 ]] && opts=("${CURL_OPTS[@]}")
+    local code
+    code=$(curl "${opts[@]}" -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || true)
+    if [[ "$code" == "$want" ]]; then
+        test_host_pass "liveness: $label (HTTP $code)"
+    else
+        test_host_fail "liveness: $label (got '$code', loop may be wedged)"
+    fi
+}
+
+# Fail if any AXL_DEBUG_ASSERT fired in the guest. The asserts log a distinct
+# marker (see include/axl/axl-debug.h); its presence means a debug-build
+# invariant was violated at its cause. Cleans the serial log first.
+test_refute_debug_assert() {
+    test_clean_log
+    if grep -q 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG"; then
+        test_host_fail "no AXL_DEBUG_ASSERT fired"
+        echo "    --- offending markers ---"
+        grep 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG" | sed 's/^/    /'
+    else
+        test_host_pass "no AXL_DEBUG_ASSERT fired (invariants held)"
     fi
 }

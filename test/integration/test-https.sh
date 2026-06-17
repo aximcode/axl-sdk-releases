@@ -97,6 +97,71 @@ else
     fail "TLS handshake not detected"
 fi
 
+# ---------------------------------------------------------------------------
+# WebSocket over TLS (wss): inbound client->server frames must reach the
+# handler. Regression for the TLS drain mis-routing decrypted WS frames into
+# header_buf (select_decrypt_buf checked !headers_done before is_websocket).
+# ---------------------------------------------------------------------------
+while IFS= read -r line; do
+    case "$line" in
+        "PASS:"*) pass "${line#PASS: }" ;;
+        "FAIL:"*) fail "${line#FAIL: }" ;;
+    esac
+done < <(python3 - "$HOST_PORT" << 'PYEOF'
+import sys, socket, ssl, base64, os, time
+
+port = int(sys.argv[1])
+try:
+    ctx = ssl._create_unverified_context()
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s = ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+except Exception as e:
+    print(f"FAIL: wss connect ({e})")
+    sys.exit(0)
+
+key = base64.b64encode(os.urandom(16)).decode()
+req = ("GET /ws-echo-ex HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+       f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+s.sendall(req.encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = s.recv(1024)
+    if not chunk:
+        break
+    resp += chunk
+status = resp.split(b"\r\n")[0].decode()
+if "101" not in status:
+    print(f"FAIL: wss handshake (got {status!r})")
+    sys.exit(0)
+print("PASS: wss handshake 101")
+
+# Send a masked text frame; the per-client handler must echo "ex:hello".
+msg = b"hello"
+frame = bytearray([0x81, 0x80 | len(msg)])
+mask = os.urandom(4)
+frame += mask + bytes(c ^ mask[i % 4] for i, c in enumerate(msg))
+s.sendall(frame)
+
+time.sleep(1)
+try:
+    data = s.recv(1024)
+except Exception as e:
+    data = b""
+    print(f"FAIL: wss recv ({e})")
+if len(data) >= 2:
+    plen = data[1] & 0x7F
+    payload = data[2:2 + plen]
+    if payload == b"ex:hello":
+        print("PASS: wss inbound frame delivered (echo 'ex:hello')")
+    else:
+        print(f"FAIL: wss echo wrong ({payload!r})")
+else:
+    print("FAIL: wss inbound frame dropped (no echo)")
+s.close()
+PYEOF
+)
+
 echo ""
 printf "HTTPS tests: %d passed, %d failed (%s)\n" "$PASS" "$FAIL" "$TEST_ARCH"
 

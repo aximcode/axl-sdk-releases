@@ -18,6 +18,7 @@
 
 #include <axl/axl-math.h>
 #include <axl/axl-gfx-types.h>
+#include <uefi/axl-uefi.h>   /* EFI_GRAPHICS_PIXEL_FORMAT */
 
 /* Opaque public types referenced below (full defs in the public
  * headers / axl-gfx-path.c). */
@@ -29,6 +30,16 @@ typedef struct AxlGfxGradient  AxlGfxGradient;
 /// to transform incoming vertices.
 AxlTransform
 axl_gfx_internal_current_transform(void);
+
+/// Map a GOP pixel format to the public AxlGfxPixelFormat.  Returns
+/// false for a value outside the spec's four formats (malformed
+/// firmware).  Defined in axl-gfx-output.c (the rasterizer-free GOP
+/// inventory TU) and shared with the active-GOP accessors in axl-gfx.c.
+bool
+axl_gfx_internal_map_pixel_format(
+    EFI_GRAPHICS_PIXEL_FORMAT  in,
+    AxlGfxPixelFormat         *out
+    );
 
 // ===================================================================
 // Analytic path rasterizer (G14 — FreeType ftgrays backend)

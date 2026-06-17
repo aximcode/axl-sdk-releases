@@ -72,6 +72,21 @@ typedef struct {
                                 ///< restriction. Trailing position keeps the
                                 ///< struct's existing zero-init layout
                                 ///< compatible.
+    int64_t     min;            ///< (numeric INT/UINT) inclusive lower bound,
+                                ///< 0 = none (each of min/max independently).
+                                ///< Like @c short_name / @c choices, AxlConfig
+                                ///< parsing IGNORES this; it exists so the
+                                ///< axl_service_main synthesizer can set the
+                                ///< matching AxlArgDesc bound (CLI range
+                                ///< validation + --help), and so a downstream
+                                ///< settings-UI builder can size a spinner.
+                                ///< Signed; cast to AxlArgDesc's uint64_t with
+                                ///< the same convention (a UINT bound must
+                                ///< still fit in int64_t — >= 2^63 is
+                                ///< unrepresentable here). Trailing position
+                                ///< keeps existing tables' zero-init valid.
+    int64_t     max;            ///< (numeric INT/UINT) inclusive upper bound,
+                                ///< 0 = none. See @c min.
 } AxlConfigDesc;
 
 // ---------------------------------------------------------------------------
@@ -358,6 +373,35 @@ axl_config_descs_net(
     size_t         cap,          ///< capacity of @p out in entries
     uint32_t       kinds,        ///< bitmask of AxlNetOptKind
     size_t         base_offset   ///< offsetof(consumer-Opts, AxlNetOpts-sub-struct)
+);
+
+/**
+ * @brief Emit the static-IP / DNS / hostname (IP4Config2 policy)
+ *     descriptors into a consumer-owned accumulator.
+ *
+ * The policy-group sibling of axl_config_descs_net: it injects the
+ * descriptors an on-box `ifconfig` UI hand-authors today — `mode`
+ * (a `"dhcp"`/`"static"` two-choice picker), `ip`, `netmask`,
+ * `gateway`, `dns`, `dns2`, `hostname` — bound to a consumer-embedded
+ * @c AxlNetStaticOpts (see <axl/axl-net-opts.h>). Each emitted
+ * descriptor's @c offset is added to @p base_offset (the @c offsetof of
+ * the embedded @c AxlNetStaticOpts), so AxlConfig auto-apply lands the
+ * parsed value in the right field. Unlike axl_config_descs_net there is
+ * no `kinds` selector — the policy form is taken as a whole.
+ *
+ * Writes 7 descriptors consecutively into @p out starting at index 0.
+ * Does NOT append a terminating zeroed entry — compose with
+ * axl_config_descs_append and terminate the combined table yourself.
+ *
+ * @return number of descriptors written (7). Returns 0 (no partial
+ *     write) and logs a warning via log domain @c "net" if @p cap is
+ *     too small or @p out is NULL.
+ */
+size_t
+axl_config_descs_net_static(
+    AxlConfigDesc *out,          ///< accumulator (caller-owned, written at [0..])
+    size_t         cap,          ///< capacity of @p out in entries (>= 7)
+    size_t         base_offset   ///< offsetof(consumer-Opts, AxlNetStaticOpts-sub-struct)
 );
 
 /**

@@ -143,3 +143,152 @@ axl_base64_decode(const char *b64, void **out, size_t *out_len)
     *out_len = (size_t)raw_len;
     return AXL_OK;
 }
+
+// ---------------------------------------------------------------------------
+// Base64url (RFC 4648 §5) — URL-safe alphabet, no padding
+// ---------------------------------------------------------------------------
+
+static const char b64url_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/* Decode a single base64url symbol, rejecting standard-base64 '+'/'/'
+   and '=' padding. Reuses the base64 table for the shared alphanumeric
+   range (the '+'/'/' entries there are never reached — caught first). */
+static uint8_t
+b64url_val(char ch)
+{
+    if (ch == '-') { return 62; }
+    if (ch == '_') { return 63; }
+    if (ch == '+' || ch == '/' || ch == '=') { return 0xFF; }
+    uint8_t u = (uint8_t)ch;
+    return (u < 128) ? b64_dec[u] : 0xFF;
+}
+
+char *
+axl_base64url_encode(const void *data, size_t len)
+{
+    const uint8_t *in;
+    size_t         full;
+    size_t         rem;
+    size_t         out_len;
+    char          *out;
+    size_t         i;
+    size_t         j;
+    uint32_t       trip;
+
+    if (data == NULL || len == 0) {
+        out = (char *)axl_malloc(1);
+        if (out != NULL) {
+            out[0] = '\0';
+        }
+        return out;
+    }
+
+    in   = (const uint8_t *)data;
+    full = len / 3;
+    rem  = len % 3;
+    /* Unpadded length: 4 chars per full triplet + (rem + 1) for the tail. */
+    out_len = full * 4 + (rem != 0 ? rem + 1 : 0);
+    out = (char *)axl_malloc(out_len + 1);
+    if (out == NULL) {
+        axl_warning("base64url_encode allocation failed");
+        return NULL;
+    }
+
+    j = 0;
+    for (i = 0; i + 2 < len; i += 3) {
+        trip = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[j++] = b64url_enc[(trip >> 18) & 0x3F];
+        out[j++] = b64url_enc[(trip >> 12) & 0x3F];
+        out[j++] = b64url_enc[(trip >>  6) & 0x3F];
+        out[j++] = b64url_enc[(trip      ) & 0x3F];
+    }
+    if (rem != 0) {
+        trip = (uint32_t)in[i] << 16;
+        if (rem == 2) {
+            trip |= (uint32_t)in[i+1] << 8;
+        }
+        out[j++] = b64url_enc[(trip >> 18) & 0x3F];
+        out[j++] = b64url_enc[(trip >> 12) & 0x3F];
+        if (rem == 2) {
+            out[j++] = b64url_enc[(trip >> 6) & 0x3F];
+        }
+    }
+
+    out[j] = '\0';
+    return out;
+}
+
+int
+axl_base64url_decode(const char *s, size_t len, void **out, size_t *out_len)
+{
+    size_t   full;
+    size_t   rem;
+    size_t   raw_len;
+    uint8_t *raw;
+    size_t   i;
+    size_t   j;
+
+    if (s == NULL || out == NULL || out_len == NULL) {
+        return AXL_ERR;
+    }
+    if (len == 0) {
+        *out = axl_malloc(1);
+        *out_len = 0;
+        return (*out != NULL) ? AXL_OK : AXL_ERR;
+    }
+
+    full = len / 4;
+    rem  = len % 4;
+    /* A remainder of 1 symbol is impossible in valid base64url. */
+    if (rem == 1) {
+        return AXL_ERR;
+    }
+    raw_len = full * 3 + (rem == 2 ? 1 : rem == 3 ? 2 : 0);
+    raw = (uint8_t *)axl_malloc(raw_len + 1);
+    if (raw == NULL) {
+        axl_warning("base64url_decode allocation failed");
+        return AXL_ERR;
+    }
+
+    j = 0;
+    i = 0;
+    /* Full 4-symbol groups -> 3 bytes. */
+    for (; i + 4 <= len; i += 4) {
+        uint8_t a = b64url_val(s[i]);
+        uint8_t b = b64url_val(s[i+1]);
+        uint8_t c = b64url_val(s[i+2]);
+        uint8_t d = b64url_val(s[i+3]);
+        if (a == 0xFF || b == 0xFF || c == 0xFF || d == 0xFF) {
+            axl_free(raw);
+            return AXL_ERR;
+        }
+        raw[j++] = (uint8_t)((a << 2) | (b >> 4));
+        raw[j++] = (uint8_t)((b << 4) | (c >> 2));
+        raw[j++] = (uint8_t)((c << 6) | d);
+    }
+    /* Unpadded tail: 2 symbols -> 1 byte, 3 symbols -> 2 bytes. */
+    if (rem == 2) {
+        uint8_t a = b64url_val(s[i]);
+        uint8_t b = b64url_val(s[i+1]);
+        if (a == 0xFF || b == 0xFF) {
+            axl_free(raw);
+            return AXL_ERR;
+        }
+        raw[j++] = (uint8_t)((a << 2) | (b >> 4));
+    } else if (rem == 3) {
+        uint8_t a = b64url_val(s[i]);
+        uint8_t b = b64url_val(s[i+1]);
+        uint8_t c = b64url_val(s[i+2]);
+        if (a == 0xFF || b == 0xFF || c == 0xFF) {
+            axl_free(raw);
+            return AXL_ERR;
+        }
+        raw[j++] = (uint8_t)((a << 2) | (b >> 4));
+        raw[j++] = (uint8_t)((b << 4) | (c >> 2));
+    }
+
+    *out = raw;
+    *out_len = raw_len;
+    return AXL_OK;
+}

@@ -17,6 +17,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-runtime.h>
+#include "../runtime/axl-signal-internal.h"
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
@@ -56,7 +57,7 @@ axl_file_get_contents(const char *path, void **buf, size_t *len)
 
     /* Firmware Read is uninterruptible, but a caller batching many
        file reads sees a yield between each. */
-    axl_yield();
+    _axl_poll_break();
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
@@ -135,7 +136,7 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 
     /* Yield at entry so a caller batching many whole-file writes
        stays Ctrl-C responsive between files. */
-    axl_yield();
+    _axl_poll_break();
 
     wide_path = axl_utf8_to_ucs2(path);
     if (wide_path == NULL) {
@@ -406,7 +407,7 @@ axl_file_move(const char *old_path, const char *new_path)
     char    buf[4096];
     bool    ok = true;
     for (;;) {
-        axl_yield();  /* keep Ctrl-C responsive on large copies */
+        _axl_poll_break();  /* keep Ctrl-C responsive on large copies */
         axl_ssize_t n = axl_read(src, buf, sizeof(buf));
         if (n < 0) {
             ok = false;

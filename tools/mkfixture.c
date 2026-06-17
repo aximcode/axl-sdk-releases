@@ -323,6 +323,15 @@ fixture_finish(
         return -1;
     }
 
+    /* Enable TLS so an https dest works directly or via an http->https
+       redirect (the client's TLS path is otherwise strippable — see
+       axl-http-client-tls.h). Bail only when the dest is already https. */
+    if (axl_tls_init() != AXL_OK && axl_strncmp(dest, "https://", 8) == 0) {
+        axl_printerr("mkfixture: https dest needs an AXL_TLS=1 build\n");
+        axl_free(gz);
+        return -1;
+    }
+
     AxlHttpClient *c = axl_http_client_new();
     if (c == NULL) {
         axl_printerr("mkfixture: out of memory creating HTTP client\n");
@@ -1463,156 +1472,59 @@ dump_video(
 }
 
 // ---------------------------------------------------------------------------
-// NVMe dump — nvme/<n>.json (Identify Controller + per-namespace Identify
-// via EFI_NVM_EXPRESS_PASS_THRU; manifest only — replay of Identify
-// responses is an HF9 QEMU-patch candidate)
+// NVMe dump — nvme/<n>.json (Identify Controller + per-namespace summary
+// via AxlNvme over EFI_NVM_EXPRESS_PASS_THRU; manifest only — replay of
+// Identify responses is an HF9 QEMU-patch candidate)
 // ---------------------------------------------------------------------------
 
-#define NVME_IDENTIFY_LEN  4096u
-
-/** Run one NVMe Identify command (CNS in @p cns: 1 = controller,
-    0 = namespace) for @p nsid into the @p buf (NVME_IDENTIFY_LEN bytes,
-    aligned to the controller's IoAlign). Admin queue. Returns AXL_OK on
-    a successful completion. */
-static int
-nvme_identify(
-    EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *nvme,
-    uint32_t                             nsid,
-    uint32_t                             cns,
-    void                                *buf
-    )
-{
-    EFI_NVM_EXPRESS_COMMAND    cmd = {0};
-    EFI_NVM_EXPRESS_COMPLETION cpl = {0};
-    cmd.Cdw0.Opcode = NVME_ADMIN_IDENTIFY_OPC;
-    cmd.Flags       = NVME_CDW10_VALID;  /* CNS lives in Cdw10 */
-    cmd.Nsid        = nsid;
-    cmd.Cdw10       = cns;
-
-    EFI_NVM_EXPRESS_PASS_THRU_COMMAND_PACKET pkt = {0};
-    pkt.CommandTimeout = 50000000ULL;  /* 5 s in 100 ns units */
-    pkt.TransferBuffer = buf;
-    pkt.TransferLength = NVME_IDENTIFY_LEN;
-    pkt.QueueType      = NVME_ADMIN_QUEUE;
-    pkt.NvmeCmd        = &cmd;
-    pkt.NvmeCompletion = &cpl;
-
-    return EFI_ERROR(nvme->PassThru(nvme, nsid, &pkt, NULL)) ? AXL_ERR : AXL_OK;
-}
-
-/** Copy a fixed-length space-padded ASCII identity field (NVMe SN/MN/FR)
-    out of an Identify buffer, trim trailing spaces, and JSON-escape it.
-    Caller frees. */
-static char *
-nvme_ascii_field(
-    const uint8_t *buf,
-    size_t         off,
-    size_t         len
-    )
-{
-    char tmp[64];
-    if (len > sizeof tmp - 1) { len = sizeof tmp - 1; }
-    for (size_t i = 0; i < len; i++) { tmp[i] = (char)buf[off + i]; }
-    tmp[len] = '\0';
-    while (len > 0 && tmp[len - 1] == ' ') { tmp[--len] = '\0'; }
-    return json_escape(tmp);
-}
-
-/** Build the namespaces[] body for one controller by walking
-    GetNextNamespace and issuing Identify Namespace per id. @p buf is the
-    shared aligned Identify scratch buffer. Sets *out_count. Returns a
-    freshly allocated body string (caller frees) or NULL on OOM. */
-static char *
-nvme_namespaces_json(
-    EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *nvme,
-    uint8_t                             *buf,
-    unsigned                            *out_count
-    )
-{
-    char    *body  = axl_strdup("");
-    unsigned count = 0;
-    *out_count = 0;
-    if (body == NULL) { return NULL; }
-
-    uint32_t nsid = 0xFFFFFFFFu;  /* spec: first call yields the first id */
-    while (count < 256 && nvme->GetNextNamespace(nvme, &nsid) == 0) {
-        if (nvme_identify(nvme, nsid, 0 /* CNS=namespace */, buf) != AXL_OK) {
-            continue;
-        }
-        /* NSZE: u64 @0. FLBAS: u8 @26 (active LBA format in low nibble).
-           LBA format table: 16 entries of 4 bytes @128; LBADS (log2 of
-           the LBA byte size) is bits 16-23 of the entry. */
-        uint64_t nsze = 0;
-        for (int i = 0; i < 8; i++) { nsze |= (uint64_t)buf[i] << (8 * i); }
-        /* GetNextNamespace walks every namespace ID up to the controller's
-           Nn (QEMU reports 256), most of them unallocated — an inactive
-           namespace Identifies as all-zero (NSZE 0). Record only the
-           allocated ones. */
-        if (nsze == 0) { continue; }
-        uint8_t  active = (uint8_t)(buf[26] & 0x0F);
-        const uint8_t *lbaf = buf + 128 + (size_t)active * 4;
-        uint32_t lbaf_val = (uint32_t)lbaf[0] | ((uint32_t)lbaf[1] << 8)
-                          | ((uint32_t)lbaf[2] << 16) | ((uint32_t)lbaf[3] << 24);
-        uint8_t  lbads = (uint8_t)((lbaf_val >> 16) & 0xFF);
-        uint64_t lba_size = (lbads < 64) ? (1ULL << lbads) : 0;
-
-        char *entry = axl_asprintf(
-            "%s%s    {\"nsid\": %u, \"size_blocks\": %llu, \"lba_size\": %llu}",
-            body,
-            (count == 0) ? "" : ",\n",
-            (unsigned)nsid,
-            (unsigned long long)nsze,
-            (unsigned long long)lba_size);
-        axl_free(body);
-        if (entry == NULL) { return NULL; }
-        body = entry;
-        count++;
-    }
-    *out_count = count;
-    return body;
-}
-
-/** Capture one controller's Identify data into nvme/<index>.json.
-    Returns AXL_OK on a written manifest, AXL_ERR on a hard error. The
-    filename uses the enumeration index — correlating to a PCI BDF would
-    need BuildDevicePath parsing, deferred. */
+/** Capture one controller's Identify + active-namespace summary into
+    nvme/<index>.json via AxlNvme. Returns 0 on a written manifest (or a
+    benign skip), -1 on a hard error. */
 static int
 dump_nvme_controller(
-    const char                          *dest,
-    EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL  *nvme,
-    size_t                               index
+    const char *dest,
+    AxlHandle   ctrl,
+    size_t      index
     )
 {
-    /* Identify buffers must meet the controller's IoAlign. Over-allocate
-       and align up. */
-    uint32_t align = (nvme->Mode != NULL && nvme->Mode->IoAlign > 1)
-                     ? nvme->Mode->IoAlign : 1;
-    uint8_t *raw = axl_malloc(NVME_IDENTIFY_LEN + align);
-    if (raw == NULL) { return -1; }
-    uint8_t *buf = raw;
-    if (align > 1) {
-        uintptr_t a = ((uintptr_t)raw + (align - 1)) & ~((uintptr_t)align - 1);
-        buf = (uint8_t *)a;
-    }
-
-    if (nvme_identify(nvme, 0, 1 /* CNS=controller */, buf) != AXL_OK) {
+    AxlNvmeController c;
+    if (axl_nvme_identify_controller(ctrl, &c) != AXL_OK) {
         axl_printf("  nvme/%zu.json     (skipped - Identify Controller failed)\n",
                    index);
-        axl_free(raw);
         return 0;  /* not fatal: a quirky controller, skip it */
     }
 
-    uint16_t vid    = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
-    uint16_t ssvid  = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
-    char    *sn     = nvme_ascii_field(buf, 4, 20);
-    char    *mn     = nvme_ascii_field(buf, 24, 40);
-    char    *fr     = nvme_ascii_field(buf, 64, 8);
+    /* Walk active namespaces. The firmware iterator can report every id up
+       to the controller's Nn (QEMU reports 256), most unallocated — an
+       inactive namespace reports size_blocks 0, so record only the rest. */
+    char    *body  = axl_strdup("");
+    unsigned count = 0;
+    if (body == NULL) { return -1; }
+    uint32_t nsid = 0;
+    while (count < 256 && (nsid = axl_nvme_namespace_next(ctrl, nsid)) != 0) {
+        AxlNvmeNamespace ns;
+        if (axl_nvme_identify_namespace(ctrl, nsid, &ns) != AXL_OK
+            || ns.size_blocks == 0) {
+            continue;
+        }
+        char *entry = axl_asprintf(
+            "%s%s    {\"nsid\": %u, \"size_blocks\": %llu, \"lba_size\": %u}",
+            body,
+            (count == 0) ? "" : ",\n",
+            (unsigned)ns.nsid,
+            (unsigned long long)ns.size_blocks,
+            ns.block_size);
+        axl_free(body);
+        if (entry == NULL) { return -1; }
+        body = entry;
+        count++;
+    }
 
-    unsigned ns_count = 0;
-    char    *ns_body  = nvme_namespaces_json(nvme, buf, &ns_count);
-    if (sn == NULL || mn == NULL || fr == NULL || ns_body == NULL) {
-        axl_free(sn); axl_free(mn); axl_free(fr); axl_free(ns_body);
-        axl_free(raw);
+    char *sn = json_escape(c.serial);
+    char *mn = json_escape(c.model);
+    char *fr = json_escape(c.firmware);
+    if (sn == NULL || mn == NULL || fr == NULL) {
+        axl_free(sn); axl_free(mn); axl_free(fr); axl_free(body);
         axl_printerr("mkfixture: out of memory composing nvme manifest\n");
         return -1;
     }
@@ -1629,9 +1541,8 @@ dump_nvme_controller(
         "%s\n"
         "  ]\n"
         "}\n",
-        (unsigned)vid, (unsigned)ssvid, sn, mn, fr, ns_count, ns_body);
-    axl_free(sn); axl_free(mn); axl_free(fr); axl_free(ns_body);
-    axl_free(raw);
+        (unsigned)c.pci_vid, (unsigned)c.pci_ssvid, sn, mn, fr, count, body);
+    axl_free(sn); axl_free(mn); axl_free(fr); axl_free(body);
     if (json == NULL) {
         axl_printerr("mkfixture: out of memory composing nvme manifest\n");
         return -1;
@@ -1643,7 +1554,7 @@ dump_nvme_controller(
         rc = fixture_write(dest, relpath, json, axl_strlen(json));
         if (rc == 0) {
             axl_printf("  nvme/%zu.json     %u namespace%s\n",
-                       index, ns_count, ns_count == 1 ? "" : "s");
+                       index, count, count == 1 ? "" : "s");
         }
     }
     axl_free(relpath);
@@ -1658,34 +1569,20 @@ dump_nvme(
 {
     ensure_controllers_connected();
 
-    (void)axl_protocol_register_name(
-        "nvme-passthru",
-        (const AxlGuid *)&EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL_GUID);
-    void  **handles = NULL;
-    size_t  count   = 0;
-    if (axl_protocol_enumerate("nvme-passthru", &handles, &count) != AXL_OK
-        || count == 0) {
-        axl_free(handles);
-        axl_printf("  nvme/            (skipped - no NVMe controllers)\n");
-        return 0;
-    }
-
-    int rc = 0;
-    for (size_t i = 0; i < count; i++) {
-        void *iface = NULL;
-        if (axl_handle_get_protocol(handles[i], "nvme-passthru", &iface)
-                != AXL_OK
-            || iface == NULL) {
-            continue;
-        }
-        if (dump_nvme_controller(
-                fixture_dir, (EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL *)iface, i)
-                != 0) {
+    AxlHandle ctrl  = NULL;
+    size_t    index = 0;
+    int       rc    = 0;
+    bool      any   = false;
+    while ((ctrl = axl_nvme_next(ctrl)) != NULL) {
+        any = true;
+        if (dump_nvme_controller(fixture_dir, ctrl, index) != 0) {
             rc = 1;
         }
+        index++;
     }
-
-    axl_free(handles);
+    if (!any) {
+        axl_printf("  nvme/            (skipped - no NVMe controllers)\n");
+    }
     return rc;
 }
 

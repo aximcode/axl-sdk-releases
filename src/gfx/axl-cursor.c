@@ -650,13 +650,13 @@ cursor_input_trampoline(const AxlInputEvent *ev, void *data)
                                : AXL_SOURCE_CONTINUE;
 }
 
-uint32_t
+AxlSourceId
 axl_cursor_attach(AxlCursor *c, AxlLoop *loop, AxlInputCallback cb, void *data)
 {
     return axl_cursor_attach_ex(c, loop, cb, data, NULL);
 }
 
-uint32_t
+AxlSourceId
 axl_cursor_attach_ex(AxlCursor *c, AxlLoop *loop, AxlInputCallback cb,
                      void *data, const AxlCursorConfig *cfg)
 {
@@ -681,7 +681,7 @@ axl_cursor_attach_ex(AxlCursor *c, AxlLoop *loop, AxlInputCallback cb,
         axl_input_set_touch_drain(cfg->touch_drain);
     }
 
-    uint32_t mouse_src = 0, touch_src = 0;
+    AxlSourceId mouse_src = 0, touch_src = 0;
     if (bind_mouse) {
         mouse_src = axl_input_attach_mouse(loop, cursor_input_trampoline, c);
         c->bound_mouse = (mouse_src != 0);

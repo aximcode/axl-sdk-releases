@@ -629,6 +629,18 @@ axl_smbios_read_memory_device(
     out->memory_type    = t->MemoryType;
     out->speed_mhz      = t->Speed;
 
+    /* FormFactor (0x0E), Total/Data width (0x08/0x0A) are in the minimum
+       Type 17 record (length >= 0x15), so always present. 0xFFFF is the
+       "unknown" sentinel for the widths — normalize to 0 (matching the
+       "0 if unknown" convention of the other fields). */
+    out->form_factor = t->FormFactor;
+    out->total_width = (t->TotalWidth == 0xFFFF) ? 0 : t->TotalWidth;
+    out->data_width  = (t->DataWidth  == 0xFFFF) ? 0 : t->DataWidth;
+
+    /* Rank: Attributes byte (0x1B), bits 3:0. Added in SMBIOS 2.6, so the
+       byte exists only when the record reaches it (length >= 0x1C). 0 = unknown. */
+    out->rank = (hdr->Length >= 0x1C) ? (uint8_t)(t->Attributes & 0x0F) : 0;
+
     /* Size: 0 = empty slot, 0x7FFF = use ExtendedSize (2.7+), else value
        in MB (bit 15 clear) or KB (bit 15 set). */
     if (t->Size == 0) {

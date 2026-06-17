@@ -54,6 +54,16 @@ Headers:
 | Share a loop across modules | `axl_loop_default()` |
 | Wait inside a callback without starving the outer loop | `axl_loop_iterate_until(loop, done, timeout_us)` |
 
+**Library re-entrancy guarantee.** `axl_yield()`, when a default loop exists,
+runs one non-blocking dispatch of it (the yield-as-scheduler idiom) — so it can
+fire *your* idle/timer/event callbacks. That is only ever invoked when *your*
+code calls `axl_yield()` directly. AXL's own long-running operations
+(`axl_qsort`, `axl_digest`, large `axl_fs` copies, the sync HTTP client, IPMI
+KCS polling) stay Ctrl-C responsive via an internal break-only poll
+(`_axl_poll_break`) that observes the interrupt **without** dispatching the
+loop — so a library call can never re-enter your callbacks from deep inside an
+unrelated operation.
+
 ## Interrupt lifecycle
 
 ```

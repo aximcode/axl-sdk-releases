@@ -53,34 +53,49 @@ axl_loop_default(void)
 // ---------------------------------------------------------------------------
 
 void
+_axl_poll_break(void)
+{
+    /* Observe Ctrl-C without touching the loop. The yield-only app (no
+     * event sources, no loops) and all in-library yields go through here:
+     * poll the shell break flag directly. */
+    if (axl_backend_shell_break_flag()) {
+        _axl_signal_on_break();
+    }
+
+    /* Default-policy exit: if Ctrl-C fired and no user handler is
+     * installed, the blessed behavior is to terminate cleanly at the next
+     * yield point. Apps that want to handle interrupts themselves must
+     * axl_signal_install before the first yield. */
+    if (g_axl_interrupted && !_axl_signal_has_handler()) {
+        axl_exit(1);
+    }
+}
+
+void
 axl_yield(void)
 {
     AxlLoop *loop = mDefaultLoop;
 
-    /* Phase 1: break detection. Poll the shell break flag directly
-     * when no default loop exists yet — otherwise a yield-only app
-     * (no event sources, no loops) would never see Ctrl-C. When the
-     * default loop IS live, axl_loop_dispatch below handles the
-     * check as part of its normal flow; we skip the direct poll to
-     * avoid double-clearing the UEFI break event. */
+    /* No default loop yet: break-poll + exit-policy only (a yield-only app
+     * would otherwise never see Ctrl-C). Identical to what library code does
+     * via _axl_poll_break. */
     if (loop == NULL) {
-        if (axl_backend_shell_break_flag()) {
-            _axl_signal_on_break();
-        }
-    } else {
-        /* Phase 2 (see docs/AXL-Lifecycle.md §3): dispatch any
-         * immediately-ready work on the default loop. One
-         * iteration only. */
-        int r = axl_loop_dispatch(loop, /*blocking=*/false);
-        if (r < 0) {
-            _axl_signal_on_break();
-        }
+        _axl_poll_break();
+        return;
     }
 
-    /* Default-policy exit: if Ctrl-C fired and no user handler is
-     * installed, the blessed behavior is to terminate cleanly at
-     * the next yield point. Apps that want to handle interrupts
-     * themselves must axl_signal_install before the first yield. */
+    /* Default loop is live — the app opted into the yield-as-scheduler idiom
+     * (docs/AXL-Lifecycle.md §2.4/§3): dispatch any immediately-ready work on
+     * it, one non-blocking iteration. axl_loop_dispatch checks the break flag
+     * itself (we skip the direct poll to avoid double-clearing the UEFI break
+     * event), returning < 0 on break.
+     *
+     * NOTE: in-library code must NOT reach this branch — it calls
+     * _axl_poll_break so it never re-dispatches the consumer's loop (firing
+     * their callbacks re-entrantly) from deep inside an unrelated operation. */
+    if (axl_loop_dispatch(loop, /*blocking=*/false) < 0) {
+        _axl_signal_on_break();
+    }
     if (g_axl_interrupted && !_axl_signal_has_handler()) {
         axl_exit(1);
     }

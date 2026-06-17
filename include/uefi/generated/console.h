@@ -276,5 +276,29 @@ typedef struct _EFI_EDID_DISCOVERED_PROTOCOL {
  UINT8                               *Edid;
 } EFI_EDID_DISCOVERED_PROTOCOL;
 
+typedef struct _SERIAL_IO_MODE {
+UINT32 ControlMask;
+
+   // current Attributes
+   UINT32            Timeout;
+   UINT64            BaudRate;
+   UINT32            ReceiveFifoDepth;
+   UINT32            DataBits;
+   UINT32            Parity;
+   UINT32            StopBits;
+} SERIAL_IO_MODE;
+
+typedef struct _EFI_SERIAL_IO_PROTOCOL {
+ UINT32                       Revision;
+ void  *Reset;
+ void  *SetAttributes;
+ void  *SetControl;
+ void  *GetControl;
+ void  *Write;
+ void  *Read;
+ SERIAL_IO_MODE               *Mode;
+ CONST EFI_GUID               *DeviceTypeGuid; // Revision 1.1
+} EFI_SERIAL_IO_PROTOCOL;
+
 
 #endif /* AXL_UEFI_GEN_CONSOLE_H */

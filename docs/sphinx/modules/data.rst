@@ -70,6 +70,12 @@ new designs.
 
 .. doxygenfile:: axl-hmac.h
 
+.. note::
+
+   For the full cryptography map — hashing, HMAC, randomness, image
+   verification, TLS, and public-key signature verification
+   (``<axl/axl-crypto.h>``) — see :doc:`crypto`.
+
 AxlBytes
 ~~~~~~~~
 

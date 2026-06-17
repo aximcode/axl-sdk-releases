@@ -255,6 +255,52 @@ deliver the same device twice). To see what a platform actually exposes,
 flags the `ConsoleInHandle` aggregator, and runs a live event-vs-poll
 comparison — handy when a remote-console pointer "doesn't move."
 
+## Virtual pointer (install + drive a synthetic pointer)
+
+Where `axl_input_attach_*` **consume** a pointer, `axl_virtual_pointer_*`
+**publish** one — the pointer twin of `axl_console_mirror_inject_key`. A
+remote / synthetic source (a VNC server's RFB `PointerEvent`, an automated UI
+test) drives the firmware Setup browser / HII FrontPage on a box with no
+physical mouse (a headless server, QEMU `-vga none`):
+
+```c
+AxlVirtualPointer *vp = NULL;
+axl_virtual_pointer_install(&vp, NULL);          // range = active GOP resolution
+// ... on each RFB PointerEvent (absolute pixel coords + button mask):
+axl_virtual_pointer_inject(vp, px, py, buttons); // bit0=left, bit1=right
+// ...
+axl_virtual_pointer_uninstall(vp);
+```
+
+`install` publishes an `EFI_ABSOLUTE_POINTER_PROTOCOL` (absolute coords map
+1:1 from framebuffer pixels; range defaults to the active GOP resolution, or
+set `cfg.width/height`), and with `cfg.also_simple` a relative
+`EFI_SIMPLE_POINTER_PROTOCOL` too. `inject` updates the protocol's
+`CurrentState` and signals `WaitForInput` so a consumer blocked in
+`WaitForEvent` wakes and reads it via `GetState`.
+`axl_virtual_pointer_scroll(vp, dy)` injects a wheel notch (on the
+`also_simple` SimplePointer's `RelativeMovementZ`, which `attach_mouse`
+decodes to `AXL_INPUT_MOUSE_WHEEL`); EFI exposes only one wheel axis.
+
+It also doubles as a **deterministic input-test driver**: because it's
+firmware-internal, it delivers pointer events where QMP `input-send-event`
+can't (headless CI runners). The input unit tests use it to drive the real
+consumption path — install a virtual pointer, `attach_touch` to it, inject a
+press/move/release, pump the loop, and assert the `TOUCH_DOWN/MOVE/UP` (and
+relative-move / button / wheel via the SimplePointer) arrive at the callback.
+
+The subtle part it solves once: the Setup browser reads the pointer the
+console aggregator (ConSplitter) publishes on `gST->ConsoleInHandle` (via
+`LocateProtocol` / `HandleProtocol`), not a blind handle. So `install`
+**replaces** the AbsolutePointer on `ConsoleInHandle`
+(`ReinstallProtocolInterface`, saving the original to restore on uninstall) —
+the same technique `AxlConsoleMirror` uses for `SimpleTextInputEx` so `edit`
+sees injected keys. Pair `axl_virtual_pointer_inject` (pointer) with
+`axl_console_mirror_inject_key` (keyboard) for the full remote "seat" under one
+WS endpoint. Singleton (one console pointer); the end-to-end "the browser
+visually responds" is real-hardware, while the install + route + inject +
+`WaitForInput` round-trip is what the unit test pins under QEMU.
+
 ### v0.1 constraints
 
 - Single source per device kind per process. Multi-device or hotplug

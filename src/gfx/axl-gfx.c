@@ -1694,32 +1694,6 @@ axl_gfx_get_info(
     return AXL_OK;
 }
 
-/* Map a GOP pixel format to the public AxlGfxPixelFormat. Returns false
-   for a value outside the spec's four formats (malformed firmware). */
-static bool
-gfx_map_pixel_format(
-    EFI_GRAPHICS_PIXEL_FORMAT  in,
-    AxlGfxPixelFormat         *out
-    )
-{
-    switch (in) {
-    case PixelRedGreenBlueReserved8BitPerColor:
-        *out = AXL_GFX_PIXEL_FORMAT_RGBX8;
-        return true;
-    case PixelBlueGreenRedReserved8BitPerColor:
-        *out = AXL_GFX_PIXEL_FORMAT_BGRX8;
-        return true;
-    case PixelBitMask:
-        *out = AXL_GFX_PIXEL_FORMAT_BITMASK;
-        return true;
-    case PixelBltOnly:
-        *out = AXL_GFX_PIXEL_FORMAT_BLT_ONLY;
-        return true;
-    default:
-        return false;
-    }
-}
-
 int
 axl_gfx_get_pixel_format(
     AxlGfxPixelFormat  *out
@@ -1729,7 +1703,7 @@ axl_gfx_get_pixel_format(
     if (out == NULL || g == NULL || g->Mode == NULL || g->Mode->Info == NULL) {
         return AXL_ERR;
     }
-    return gfx_map_pixel_format(g->Mode->Info->PixelFormat, out)
+    return axl_gfx_internal_map_pixel_format(g->Mode->Info->PixelFormat, out)
            ? AXL_OK : AXL_ERR;
 }
 
@@ -1960,77 +1934,6 @@ axl_gfx_recommended_scale(void)
     /* Conservative: scale by the smaller axis so a non-square-pixel
        panel doesn't get over-scaled. */
     return axl_gfx_scale_for_dpi(dx < dy ? dx : dy);
-}
-
-size_t
-axl_gfx_output_count(void)
-{
-    EFI_GUID    guid    = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    size_t      n       = 0;
-    EFI_HANDLE *handles = NULL;
-    EFI_STATUS  st = axl_bs()->LocateHandleBuffer(ByProtocol, &guid, NULL,
-                                                  &n, &handles);
-    if (EFI_ERROR(st) || handles == NULL) {
-        return 0;
-    }
-    /* LocateHandleBuffer allocates with gBS->AllocatePool. */
-    axl_backend_free(handles);
-    return n;
-}
-
-int
-axl_gfx_output_get(
-    size_t         index,
-    AxlGfxOutput  *out
-    )
-{
-    if (out == NULL) {
-        return AXL_ERR;
-    }
-
-    EFI_GUID    gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    size_t      n        = 0;
-    EFI_HANDLE *handles  = NULL;
-    EFI_STATUS  st = axl_bs()->LocateHandleBuffer(ByProtocol, &gop_guid, NULL,
-                                                  &n, &handles);
-    if (EFI_ERROR(st) || handles == NULL) {
-        return AXL_ERR;
-    }
-    if (index >= n) {
-        axl_backend_free(handles);
-        return AXL_ERR;
-    }
-
-    EFI_HANDLE                    h   = handles[index];
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
-    int rc = AXL_ERR;
-    AxlGfxOutput o = {0};
-
-    if (!EFI_ERROR(axl_bs()->HandleProtocol(h, &gop_guid, (void **)&gop))
-        && gop != NULL && gop->Mode != NULL && gop->Mode->Info != NULL
-        && gfx_map_pixel_format(gop->Mode->Info->PixelFormat,
-                                &o.pixel_format)) {
-        o.width        = gop->Mode->Info->HorizontalResolution;
-        o.height       = gop->Mode->Info->VerticalResolution;
-        o.stride       = gop->Mode->Info->PixelsPerScanLine;
-        o.framebuffer  = gop->Mode->FrameBufferBase;
-        o.mode_count   = gop->Mode->MaxMode;
-        o.current_mode = gop->Mode->Mode;
-
-        /* EDID, if this display published it, lives on the SAME handle. */
-        EFI_GUID edid_guid = EFI_EDID_DISCOVERED_PROTOCOL_GUID;
-        EFI_EDID_DISCOVERED_PROTOCOL *edid = NULL;
-        if (!EFI_ERROR(axl_bs()->HandleProtocol(h, &edid_guid, (void **)&edid))
-            && edid != NULL && edid->Edid != NULL && edid->SizeOfEdid > 0) {
-            o.edid     = edid->Edid;
-            o.edid_len = edid->SizeOfEdid;
-        }
-        *out = o;
-        rc = AXL_OK;
-    }
-
-    axl_backend_free(handles);
-    return rc;
 }
 
 int

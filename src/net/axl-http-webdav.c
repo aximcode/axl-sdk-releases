@@ -45,6 +45,10 @@ webdav_ctx_free(AxlWebDavCtx *ctx)
     if (ctx == NULL) {
         return;
     }
+    /* Server-owned user_data (e.g. serve_fs's AxlFsRoot) — release it. */
+    if (ctx->user_data_free != NULL && ctx->user_data != NULL) {
+        ctx->user_data_free(ctx->user_data);
+    }
     axl_free(ctx->prefix);
     axl_free(ctx);
 }
@@ -940,8 +944,13 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
         /* First chunk — open. */
         const char *rel = strip_prefix(ctx, req->path);
         if (rel == NULL || ctx->ops.write_open == NULL) {
+            /* No write_open (read-only mount) → PUT is Method Not
+               Allowed, matching the empty-body branch and the other
+               verbs. Set the status before aborting; the upload
+               framework now preserves a handler-set status. */
+            resp->status_code = (ctx->ops.write_open == NULL) ? 405 : 500;
             ctx->put_failed = true;
-            return AXL_ERR;  /* aborts the upload — sends 500 */
+            return AXL_ERR;
         }
         if (ctx->ops.write_open(ctx->user_data, rel, &ctx->put_ctx) != AXL_OK) {
             ctx->put_failed = true;
@@ -1214,7 +1223,8 @@ dav_route_dispatch(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
 static int
 register_verb(AxlHttpServer *s, const char *method,
               const char *path_pattern,
-              AxlHttpHandler handler, AxlWebDavCtx *ctx)
+              AxlHttpHandler handler, AxlWebDavCtx *ctx,
+              uint32_t auth_flags)
 {
     if (ctx->route_slot_count >=
         sizeof(ctx->route_slots) / sizeof(ctx->route_slots[0]))
@@ -1233,12 +1243,22 @@ register_verb(AxlHttpServer *s, const char *method,
                   method, path_pattern);
         return AXL_ERR;
     }
+    r->auth_flags = auth_flags;
     return AXL_OK;
 }
 
 int
 axl_http_server_add_webdav(AxlHttpServer *s, const char *prefix,
                            const AxlWebDavOps *ops, void *user_data)
+{
+    return axl_http_server_add_webdav_auth(s, prefix, ops, user_data,
+                                           AXL_ROUTE_NO_AUTH);
+}
+
+int
+axl_http_server_add_webdav_auth(AxlHttpServer *s, const char *prefix,
+                                const AxlWebDavOps *ops, void *user_data,
+                                uint32_t auth_flags)
 {
     if (s == NULL || prefix == NULL || prefix[0] != '/' ||
         ops == NULL) {
@@ -1299,23 +1319,26 @@ axl_http_server_add_webdav(AxlHttpServer *s, const char *prefix,
        should free the server. */
     s->webdav_ctxs[s->webdav_ctx_count++] = ctx;
 
-    if (register_verb(s, "OPTIONS",  pattern, on_options,     ctx) != AXL_OK ||
-        register_verb(s, "PROPFIND", pattern, on_propfind,    ctx) != AXL_OK ||
-        register_verb(s, "GET",      pattern, on_get_or_head, ctx) != AXL_OK ||
-        register_verb(s, "HEAD",     pattern, on_get_or_head, ctx) != AXL_OK ||
-        register_verb(s, "MKCOL",    pattern, on_mkcol,       ctx) != AXL_OK ||
-        register_verb(s, "DELETE",   pattern, on_delete,      ctx) != AXL_OK ||
-        register_verb(s, "MOVE",     pattern, on_move,        ctx) != AXL_OK ||
-        register_verb(s, "COPY",     pattern, on_copy,        ctx) != AXL_OK)
+    if (register_verb(s, "OPTIONS",  pattern, on_options,     ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "PROPFIND", pattern, on_propfind,    ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "GET",      pattern, on_get_or_head, ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "HEAD",     pattern, on_get_or_head, ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "MKCOL",    pattern, on_mkcol,       ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "DELETE",   pattern, on_delete,      ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "MOVE",     pattern, on_move,        ctx, auth_flags) != AXL_OK ||
+        register_verb(s, "COPY",     pattern, on_copy,        ctx, auth_flags) != AXL_OK)
     {
         return AXL_ERR;
     }
 
     /* PUT goes through the streaming upload route so multi-GB
        uploads bypass body_limit and never materialize the whole
-       request body in RAM. */
-    if (axl_http_server_add_upload_route(s, "PUT", pattern,
-                                         on_dav_upload, ctx) != AXL_OK)
+       request body in RAM. It carries the same auth_flags so the
+       mount is gated uniformly (the upload path enforces auth before
+       any body byte — see axl-http-request.c). */
+    if (axl_http_server_add_upload_route_auth(s, "PUT", pattern,
+                                              on_dav_upload, ctx,
+                                              auth_flags) != AXL_OK)
     {
         axl_error("webdav: failed to register PUT upload route");
         return AXL_ERR;

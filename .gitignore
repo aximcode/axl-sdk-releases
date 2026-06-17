@@ -40,3 +40,6 @@ DellXE7745/
 
 # Session handoff docs — working notes, not part of the published repo
 docs/handoffs/
+
+# Local-only docs (lab access, credentials-adjacent notes) — not distributable
+local/

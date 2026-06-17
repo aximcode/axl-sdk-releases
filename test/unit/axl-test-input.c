@@ -271,16 +271,16 @@ test_attach_mouse_protocol_available(void)
 
     /* Public-API registration: attach succeeds and is single-source. */
     AxlLoop *loop = axl_loop_new();
-    uint32_t id = axl_input_attach_mouse(loop, unused_cb, NULL);
+    AxlSourceId id = axl_input_attach_mouse(loop, unused_cb, NULL);
     test_check(id != 0, "attach_mouse: returns non-zero source ID");
-    uint32_t id2 = axl_input_attach_mouse(loop, unused_cb, NULL);
+    AxlSourceId id2 = axl_input_attach_mouse(loop, unused_cb, NULL);
     test_check(id2 == 0, "attach_mouse: second attach returns 0 "
                          "(only one mouse source per process)");
 
     /* Detach frees the single-mouse slot (and removes the caller-owned
        WaitForInput source) so later tests can re-attach. */
     axl_input_detach_mouse(loop);
-    uint32_t id3 = axl_input_attach_mouse(loop, unused_cb, NULL);
+    AxlSourceId id3 = axl_input_attach_mouse(loop, unused_cb, NULL);
     test_check(id3 != 0, "attach_mouse: re-attach succeeds after detach");
     axl_input_detach_mouse(loop);
 
@@ -318,11 +318,11 @@ test_attach_key_success_and_already_attached(void)
        Second attach must fail per the single-source-per-process
        limit (mirrors the mouse case). */
     AxlLoop *loop = axl_loop_new();
-    uint32_t id = axl_input_attach_key(loop, unused_cb, NULL);
+    AxlSourceId id = axl_input_attach_key(loop, unused_cb, NULL);
     test_check(id != 0,
                "attach_key: first attach returns non-zero source ID");
 
-    uint32_t id2 = axl_input_attach_key(loop, unused_cb, NULL);
+    AxlSourceId id2 = axl_input_attach_key(loop, unused_cb, NULL);
     test_check(id2 == 0,
                "attach_key: second attach returns 0 (single-source limit)");
 
@@ -330,7 +330,7 @@ test_attach_key_success_and_already_attached(void)
        mirror of the mouse case, and what the compositor seat handoff to a
        modal dialog's compositor relies on (C7). */
     axl_input_detach_key(loop);
-    uint32_t id3 = axl_input_attach_key(loop, unused_cb, NULL);
+    AxlSourceId id3 = axl_input_attach_key(loop, unused_cb, NULL);
     test_check(id3 != 0, "attach_key: re-attach succeeds after detach");
     axl_input_detach_key(loop);
 
@@ -365,12 +365,12 @@ test_attach_touch_protocol_available(void)
        pointer).  Verify attach succeeds and the single-source
        limit rejects a second attach. */
     AxlLoop *loop = axl_loop_new();
-    uint32_t id = axl_input_attach_touch(loop, unused_cb, NULL);
+    AxlSourceId id = axl_input_attach_touch(loop, unused_cb, NULL);
     test_check(id != 0,
                "attach_touch: returns non-zero source ID when "
                "EFI_ABSOLUTE_POINTER_PROTOCOL available (QEMU baseline)");
 
-    uint32_t id2 = axl_input_attach_touch(loop, unused_cb, NULL);
+    AxlSourceId id2 = axl_input_attach_touch(loop, unused_cb, NULL);
     test_check(id2 == 0,
                "attach_touch: second attach returns 0 "
                "(only one touch source per process)");
@@ -382,7 +382,7 @@ test_attach_touch_protocol_available(void)
        A botched detach (leaked notify source / unreset state) makes re-attach
        fail here. */
     axl_input_detach_touch(loop);
-    uint32_t id3 = axl_input_attach_touch(loop, unused_cb, NULL);
+    AxlSourceId id3 = axl_input_attach_touch(loop, unused_cb, NULL);
     test_check(id3 != 0,
                "attach_touch: re-attach after detach succeeds "
                "(handle/notify re-bind lifecycle)");
@@ -897,7 +897,7 @@ test_button_repeat(void)
     AxlLoop *loop = axl_loop_new();
     g_btn_repeat_count = 0;
     g_btn_total_down   = 0;
-    uint32_t id = axl_input_attach_mouse(loop, btn_repeat_cb, NULL);
+    AxlSourceId id = axl_input_attach_mouse(loop, btn_repeat_cb, NULL);
     test_check(id != 0, "button_repeat: attach succeeds");
 
     /* Signal the press (Left transition -> arms repeat), then pump the
@@ -1044,7 +1044,7 @@ test_pointer_carries_modifiers(void)
     g_modtest_calls = 0;
     g_saw_move = g_saw_button = g_saw_wheel = false;
     AxlLoop *loop = axl_loop_new();
-    uint32_t id = axl_input_attach_mouse(loop, modtest_cb, NULL);
+    AxlSourceId id = axl_input_attach_mouse(loop, modtest_cb, NULL);
     test_check(id != 0, "modtrack: mouse attach succeeds");
 
     axl_event_signal(wfi);
@@ -1144,7 +1144,7 @@ test_button_edge_carries_full_mask(void)
     g_down_mask = g_up_mask = 0;
     g_down_seen = g_up_seen = 0;
     AxlLoop *loop = axl_loop_new();
-    uint32_t id = axl_input_attach_mouse(loop, press_release_cb, NULL);
+    AxlSourceId id = axl_input_attach_mouse(loop, press_release_cb, NULL);
     test_check(id != 0, "button_mask: mouse attach succeeds");
 
     /* Dispatch the press, then (re-signal) the release — one GetState per
@@ -1168,6 +1168,341 @@ test_button_edge_carries_full_mask(void)
         (void)gBS->InstallProtocolInterface(&saved_h[k], &guid,
                                             EFI_NATIVE_INTERFACE, saved_i[k]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// axl_virtual_pointer_* — install + drive a synthetic EFI_ABSOLUTE_POINTER on
+// gST->ConsoleInHandle (where the firmware Setup browser reads it), inject a
+// state, and consume it exactly as the browser would (HandleProtocol +
+// GetState + WaitForInput). The browser's visual response is real-HW; this
+// pins the substrate round-trip under QEMU.
+// ---------------------------------------------------------------------------
+
+static void
+test_virtual_pointer(void)
+{
+    EFI_GUID apg = EFI_ABSOLUTE_POINTER_PROTOCOL_GUID;
+
+    /* NULL-safety. */
+    test_check(axl_virtual_pointer_install(NULL, NULL) == AXL_ERR,
+               "vptr: install(NULL out) -> AXL_ERR");
+    test_check(axl_virtual_pointer_inject(NULL, 0, 0, 0) == AXL_ERR,
+               "vptr: inject(NULL) -> AXL_ERR");
+    axl_virtual_pointer_uninstall(NULL);   /* must not crash */
+
+    /* Baseline: whatever AbsolutePointer (if any) ConSplitter aggregates on
+       ConsoleInHandle right now — the interface our install replaces. */
+    void *orig = NULL;
+    gBS->HandleProtocol(gST->ConsoleInHandle, &apg, &orig);
+
+    AxlVirtualPointer      *vp  = NULL;
+    AxlVirtualPointerConfig cfg = { .width = 800, .height = 600,
+                                    .also_simple = false };
+    test_check(axl_virtual_pointer_install(&vp, &cfg) == AXL_OK && vp != NULL,
+               "vptr: install returns AXL_OK");
+
+    /* Singleton: a second install is rejected. */
+    AxlVirtualPointer *vp2 = NULL;
+    test_check(axl_virtual_pointer_install(&vp2, NULL) == AXL_ERR && vp2 == NULL,
+               "vptr: second install rejected (singleton)");
+
+    /* Scroll requires also_simple (this vp was installed without it). */
+    test_check(axl_virtual_pointer_scroll(NULL, 1) == AXL_ERR,
+               "vptr: scroll(NULL) -> AXL_ERR");
+    test_check(axl_virtual_pointer_scroll(vp, 1) == AXL_ERR,
+               "vptr: scroll without also_simple -> AXL_ERR");
+
+    /* ConsoleInHandle's AbsolutePointer is now OURS (and != the original). */
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap = NULL;
+    test_check(!EFI_ERROR(gBS->HandleProtocol(gST->ConsoleInHandle, &apg,
+                                              (void **)&ap)) && ap != NULL,
+               "vptr: AbsolutePointer present on ConsoleInHandle after install");
+    test_check((void *)ap != orig,
+               "vptr: ConsoleInHandle AbsolutePointer replaced by ours");
+
+    /* Mode range matches cfg (1:1 pixel mapping -> max = dim - 1). */
+    test_check(ap->Mode != NULL
+                   && ap->Mode->AbsoluteMinX == 0 && ap->Mode->AbsoluteMinY == 0
+                   && ap->Mode->AbsoluteMaxX == 799
+                   && ap->Mode->AbsoluteMaxY == 599,
+               "vptr: Mode absolute range matches cfg (0..799 x 0..599)");
+
+    /* Nothing injected yet: GetState NOT_READY, WaitForInput not signaled. */
+    EFI_ABSOLUTE_POINTER_STATE st;
+    test_check(ap->GetState(ap, &st) == EFI_NOT_READY,
+               "vptr: GetState NOT_READY before inject");
+    test_check(ap->WaitForInput != NULL
+                   && gBS->CheckEvent(ap->WaitForInput) == EFI_NOT_READY,
+               "vptr: WaitForInput not signaled before inject");
+
+    /* Inject -> WaitForInput wakes, GetState returns the injected state. */
+    test_check(axl_virtual_pointer_inject(vp, 123, 45, 0x1) == AXL_OK,
+               "vptr: inject returns AXL_OK");
+    test_check(gBS->CheckEvent(ap->WaitForInput) == EFI_SUCCESS,
+               "vptr: WaitForInput signaled after inject");
+    EFI_STATUS gs = ap->GetState(ap, &st);
+    test_check(gs == EFI_SUCCESS && st.CurrentX == 123 && st.CurrentY == 45
+                   && (st.ActiveButtons & 0x1) != 0,
+               "vptr: GetState returns injected x=123 y=45 touch-active");
+
+    /* GetState is one-shot per inject. */
+    test_check(ap->GetState(ap, &st) == EFI_NOT_READY,
+               "vptr: GetState NOT_READY after consuming the state");
+
+    /* Out-of-range injection clamps to [0,w) x [0,h). */
+    test_check(axl_virtual_pointer_inject(vp, 9999, 9999, 0) == AXL_OK,
+               "vptr: inject out-of-range returns AXL_OK");
+    ap->GetState(ap, &st);
+    test_check(st.CurrentX == 799 && st.CurrentY == 599,
+               "vptr: out-of-range injection clamps to the Mode max");
+
+    /* Reset clears the pending state. */
+    test_check(ap->Reset(ap, FALSE) == EFI_SUCCESS, "vptr: Reset returns SUCCESS");
+    test_check(ap->GetState(ap, &st) == EFI_NOT_READY,
+               "vptr: GetState NOT_READY after Reset");
+
+    /* Uninstall restores the original ConsoleInHandle AbsolutePointer. */
+    axl_virtual_pointer_uninstall(vp);
+    void *after = NULL;
+    gBS->HandleProtocol(gST->ConsoleInHandle, &apg, &after);
+    test_check(after == orig,
+               "vptr: uninstall restores the original ConsoleInHandle AbsolutePointer");
+
+    /* Singleton slot freed -> a fresh install (default range) succeeds. */
+    AxlVirtualPointer *vp3 = NULL;
+    test_check(axl_virtual_pointer_install(&vp3, NULL) == AXL_OK,
+               "vptr: re-install after uninstall succeeds");
+    axl_virtual_pointer_uninstall(vp3);
+}
+
+// also_simple: publishes a relative EFI_SIMPLE_POINTER too; deltas come from
+// successive absolute injects.
+static void
+test_virtual_pointer_simple(void)
+{
+    EFI_GUID spg = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+    void    *orig_sp = NULL;
+    gBS->HandleProtocol(gST->ConsoleInHandle, &spg, &orig_sp);
+
+    AxlVirtualPointer      *vp  = NULL;
+    AxlVirtualPointerConfig cfg = { .width = 640, .height = 480,
+                                    .also_simple = true };
+    test_check(axl_virtual_pointer_install(&vp, &cfg) == AXL_OK && vp != NULL,
+               "vptr-sp: install with also_simple");
+
+    EFI_SIMPLE_POINTER_PROTOCOL *sp = NULL;
+    test_check(!EFI_ERROR(gBS->HandleProtocol(gST->ConsoleInHandle, &spg,
+                                              (void **)&sp)) && sp != NULL,
+               "vptr-sp: SimplePointer present on ConsoleInHandle");
+    test_check((void *)sp != orig_sp,
+               "vptr-sp: ConsoleInHandle SimplePointer replaced by ours");
+
+    EFI_SIMPLE_POINTER_STATE st;
+    test_check(sp->GetState(sp, &st) == EFI_NOT_READY,
+               "vptr-sp: GetState NOT_READY before inject");
+
+    /* First inject sets the baseline position + button level (no delta yet). */
+    axl_virtual_pointer_inject(vp, 100, 100, 0x1);
+    test_check(sp->GetState(sp, &st) == EFI_SUCCESS && st.LeftButton,
+               "vptr-sp: first inject reports the button level");
+
+    /* Second inject -> relative delta = new - previous. */
+    axl_virtual_pointer_inject(vp, 110, 130, 0x0);
+    EFI_STATUS gs = sp->GetState(sp, &st);
+    test_check(gs == EFI_SUCCESS
+                   && st.RelativeMovementX == 10 && st.RelativeMovementY == 30,
+               "vptr-sp: relative delta = +10, +30");
+    test_check(!st.LeftButton, "vptr-sp: button released in second state");
+    test_check(sp->GetState(sp, &st) == EFI_NOT_READY,
+               "vptr-sp: delta consumed (NOT_READY until next inject)");
+
+    /* Scroll wheel -> RelativeMovementZ (what attach_mouse decodes to
+       MOUSE_WHEEL / wheel_dy). */
+    test_check(axl_virtual_pointer_scroll(vp, 3) == AXL_OK,
+               "vptr-sp: scroll returns AXL_OK");
+    test_check(sp->GetState(sp, &st) == EFI_SUCCESS && st.RelativeMovementZ == 3,
+               "vptr-sp: scroll -> RelativeMovementZ = 3");
+    /* Notches accumulate until consumed. */
+    axl_virtual_pointer_scroll(vp, 2);
+    axl_virtual_pointer_scroll(vp, -1);
+    sp->GetState(sp, &st);
+    test_check(st.RelativeMovementZ == 1,
+               "vptr-sp: scroll deltas accumulate (2 + -1 = 1)");
+
+    axl_virtual_pointer_uninstall(vp);
+    void *after = NULL;
+    gBS->HandleProtocol(gST->ConsoleInHandle, &spg, &after);
+    test_check(after == orig_sp,
+               "vptr-sp: uninstall restores the original SimplePointer");
+}
+
+// End-to-end: install a virtual pointer, attach the REAL touch consumer to it,
+// inject a press/move/release, pump the loop, and assert the events arrive at
+// the callback through the full path (WaitForInput source -> GetState -> emit
+// -> recognizer). This is the pointer-delivery coverage QMP injection can't
+// provide on a headless runner — the virtual pointer is firmware-internal.
+typedef struct {
+    AxlInputType type[32];
+    int32_t      x[32];
+    int32_t      y[32];
+    uint32_t     click[32];
+    size_t       n;
+} EvLog;
+
+static bool
+ev_collect_cb(const AxlInputEvent *ev, void *data)
+{
+    EvLog *l = (EvLog *)data;
+    if (l->n < 32) {
+        l->type[l->n]  = ev->type;
+        l->x[l->n]     = ev->x;
+        l->y[l->n]     = ev->y;
+        l->click[l->n] = ev->click_count;
+        l->n++;
+    }
+    return true;   /* AXL_SOURCE_CONTINUE */
+}
+
+/* Drain every ready loop source (non-blocking) — process all events an inject
+   produced. */
+static void
+ev_pump(AxlLoop *loop)
+{
+    for (int i = 0; i < 64; i++) {
+        if (axl_loop_dispatch(loop, false) != 0) {
+            break;   /* nothing ready */
+        }
+    }
+}
+
+static bool
+ev_log_has(const EvLog *l, AxlInputType t)
+{
+    for (size_t i = 0; i < l->n; i++) {
+        if (l->type[i] == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+test_virtual_pointer_e2e_touch(void)
+{
+    AxlVirtualPointer      *vp  = NULL;
+    AxlVirtualPointerConfig cfg = { .width = 1000, .height = 1000,
+                                    .also_simple = false };
+    test_check(axl_virtual_pointer_install(&vp, &cfg) == AXL_OK && vp != NULL,
+               "vptr-e2e: install virtual abs pointer");
+
+    AxlLoop *loop = axl_loop_new();
+    EvLog    log  = { .n = 0 };
+    /* attach_touch binds gST->ConsoleInHandle first (console_only default) —
+       exactly where the virtual pointer lives. */
+    AxlSourceId src = axl_input_attach_touch(loop, ev_collect_cb, &log);
+    test_check(src != 0,
+               "vptr-e2e: attach_touch binds the virtual AbsolutePointer");
+
+    /* Press at (250,250), move to (750,500) held, release. */
+    axl_virtual_pointer_inject(vp, 250, 250, 0x1);
+    ev_pump(loop);
+    axl_virtual_pointer_inject(vp, 750, 500, 0x1);
+    ev_pump(loop);
+    axl_virtual_pointer_inject(vp, 750, 500, 0x0);
+    ev_pump(loop);
+
+    test_check(ev_log_has(&log, AXL_INPUT_TOUCH_DOWN),
+               "vptr-e2e: injected press -> TOUCH_DOWN delivered through the loop");
+    test_check(ev_log_has(&log, AXL_INPUT_TOUCH_MOVE),
+               "vptr-e2e: injected move -> TOUCH_MOVE delivered");
+    test_check(ev_log_has(&log, AXL_INPUT_TOUCH_UP),
+               "vptr-e2e: injected release -> TOUCH_UP delivered");
+
+    /* The injected position is normalized [0,AXL_INPUT_ABS_RANGE) from the Mode
+       range: x=750 of 1000 lands in the right half (> 0x8000). */
+    int32_t last_move_x = -1;
+    for (size_t i = 0; i < log.n; i++) {
+        if (log.type[i] == AXL_INPUT_TOUCH_MOVE) {
+            last_move_x = log.x[i];
+        }
+    }
+    test_check(last_move_x > (int32_t)(AXL_INPUT_ABS_RANGE / 2),
+               "vptr-e2e: TOUCH_MOVE x normalized to the right half (injected 750/1000)");
+
+    axl_input_detach_touch(loop);
+    axl_loop_free(loop);
+    axl_virtual_pointer_uninstall(vp);
+}
+
+// End-to-end relative pointer + WHEEL through the loop. attach_mouse prefers a
+// PHYSICAL (non-ConsoleIn) SimplePointer — and the test harness always has the
+// runner's usb-mouse — so it never binds the virtual one here (verified: on a
+// real headless deployment with no physical mouse, attach_mouse's fallback DOES
+// bind it). To get deterministic coverage of the inject -> WaitForInput
+// loop-wake -> GetState delivery of relative movement, buttons, and the scroll
+// wheel, drive OUR virtual SimplePointer directly as a loop event source — the
+// exact substrate path attach_mouse's MOUSE_WHEEL/MOVE/BUTTON decode sits on.
+typedef struct {
+    EFI_SIMPLE_POINTER_PROTOCOL *sp;
+    int32_t                      dx, dy, dz;
+    bool                         left;
+    int                          reads;
+} SpSink;
+
+static bool
+sp_sink_cb(void *data)
+{
+    SpSink *s = (SpSink *)data;
+    EFI_SIMPLE_POINTER_STATE st;
+    if (s->sp->GetState(s->sp, &st) == EFI_SUCCESS) {
+        s->dx  += st.RelativeMovementX;
+        s->dy  += st.RelativeMovementY;
+        s->dz  += st.RelativeMovementZ;
+        s->left = st.LeftButton;
+        s->reads++;
+    }
+    return true;   /* AXL_SOURCE_CONTINUE */
+}
+
+static void
+test_virtual_pointer_e2e_mouse(void)
+{
+    AxlVirtualPointer      *vp  = NULL;
+    AxlVirtualPointerConfig cfg = { .width = 800, .height = 600,
+                                    .also_simple = true };
+    test_check(axl_virtual_pointer_install(&vp, &cfg) == AXL_OK && vp != NULL,
+               "vptr-mouse: install virtual pointer with also_simple");
+
+    EFI_GUID spg = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+    EFI_SIMPLE_POINTER_PROTOCOL *sp = NULL;
+    test_check(!EFI_ERROR(gBS->HandleProtocol(gST->ConsoleInHandle, &spg,
+                                              (void **)&sp)) && sp != NULL,
+               "vptr-mouse: virtual SimplePointer on ConsoleInHandle");
+
+    AxlLoop *loop = axl_loop_new();
+    SpSink   sink = { .sp = sp };
+    AxlSourceId src  = axl_loop_add_event(loop, sp->WaitForInput, sp_sink_cb, &sink);
+    test_check(src != 0, "vptr-mouse: SimplePointer WaitForInput bound as a loop source");
+
+    axl_virtual_pointer_inject(vp, 100, 100, 0x1);   /* baseline + left down */
+    ev_pump(loop);
+    axl_virtual_pointer_inject(vp, 150, 130, 0x1);   /* relative move +50,+30 */
+    ev_pump(loop);
+    axl_virtual_pointer_scroll(vp, 4);               /* wheel +4 */
+    ev_pump(loop);
+
+    test_check(sink.reads >= 1,
+               "vptr-mouse: injects woke the loop via WaitForInput (GetState delivered)");
+    test_check(sink.dx == 50 && sink.dy == 30,
+               "vptr-mouse: relative movement delivered through the loop (+50,+30)");
+    test_check(sink.dz == 4,
+               "vptr-mouse: scroll wheel delivered through the loop (dz=4)");
+    test_check(sink.left,
+               "vptr-mouse: button level delivered through the loop");
+
+    axl_loop_remove_source(loop, src);
+    axl_loop_free(loop);
+    axl_virtual_pointer_uninstall(vp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1539,11 @@ test_input_main(
     test_attach_touch_null_cb_returns_zero();
     test_attach_touch_protocol_available();
     test_touch_coalesce();
+
+    test_virtual_pointer();
+    test_virtual_pointer_simple();
+    test_virtual_pointer_e2e_touch();
+    test_virtual_pointer_e2e_mouse();
 
     test_ctrl_letter_serial_folded();
     test_ctrl_letter_keyboard_letter_plus_mod();

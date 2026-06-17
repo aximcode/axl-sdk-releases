@@ -269,9 +269,10 @@ axl_http_server_add_static(AxlHttpServer *s, const char *prefix,
 // ---------------------------------------------------------------------------
 
 int
-axl_http_server_add_upload_route(AxlHttpServer *s, const char *method,
-                                const char *path,
-                                AxlUploadHandler handler, void *data)
+axl_http_server_add_upload_route_auth(AxlHttpServer *s, const char *method,
+                                      const char *path,
+                                      AxlUploadHandler handler, void *data,
+                                      uint32_t auth_flags)
 {
     HttpRoute *r = add_route_internal(s, method, path, NULL, data);
     if (r == NULL) {
@@ -283,7 +284,17 @@ axl_http_server_add_upload_route(AxlHttpServer *s, const char *method,
     r->is_upload = true;
     r->upload_handler = handler;
     r->handler = NULL;
+    r->auth_flags = auth_flags;
     return AXL_OK;
+}
+
+int
+axl_http_server_add_upload_route(AxlHttpServer *s, const char *method,
+                                const char *path,
+                                AxlUploadHandler handler, void *data)
+{
+    return axl_http_server_add_upload_route_auth(s, method, path, handler,
+                                                 data, AXL_ROUTE_NO_AUTH);
 }
 
 // ---------------------------------------------------------------------------

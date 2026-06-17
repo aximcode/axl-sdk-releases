@@ -630,7 +630,7 @@ axl_compositor_pointer_event(
  * @return the axl-loop source ID (for axl_loop_remove_source), or 0 on
  *     failure (NULL args, no pointer protocol, or a mouse already attached).
  */
-uint32_t
+AxlSourceId
 axl_compositor_attach_pointer(
     AxlCompositor  *c,     ///< compositor
     AxlLoop        *loop   ///< caller-owned event loop
@@ -660,7 +660,7 @@ axl_compositor_detach_pointer(
  * @return the axl-loop source ID, or 0 on failure (NULL args, no absolute
  *     pointer protocol, or a touch source already attached).
  */
-uint32_t
+AxlSourceId
 axl_compositor_attach_touch(
     AxlCompositor  *c,     ///< compositor
     AxlLoop        *loop   ///< caller-owned event loop
@@ -806,7 +806,7 @@ axl_compositor_key_event(
  * @return the axl-loop source ID (for axl_loop_remove_source), or 0 on
  *     failure (NULL args or a keyboard already attached).
  */
-uint32_t
+AxlSourceId
 axl_compositor_attach_keyboard(
     AxlCompositor  *c,     ///< compositor
     AxlLoop        *loop   ///< caller-owned event loop
@@ -974,7 +974,7 @@ axl_compositor_has_pending_frames(
  * @return a non-zero source id on success, or 0 on failure (NULL args / the
  *     timer could not be added).
  */
-uint32_t
+AxlSourceId
 axl_compositor_attach_frame_clock(
     AxlCompositor  *c,           ///< compositor
     AxlLoop        *loop,        ///< caller-owned event loop

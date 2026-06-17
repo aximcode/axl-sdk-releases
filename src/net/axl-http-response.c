@@ -181,6 +181,33 @@ on_response_sent(
         conn->chunked         = false;
         conn->chunked_done    = false;
 
+        /* Fire the deferred WebSocket CONNECT now that the 101 is on the
+           wire (P1): a greeting axl_ws_send from the handler is valid here,
+           and a handler returning AXL_ERR rejects the connection cleanly.
+           ws_connected (set only on an accepted CONNECT) gates DISCONNECT, so
+           a reject — or a 101 that never made it this far — fires no
+           DISCONNECT. */
+        if (conn->is_websocket && conn->ws_connect_pending) {
+            conn->ws_connect_pending = false;
+            int crc = AXL_OK;
+            if (conn->ws_conn_handler != NULL) {
+                crc = conn->ws_conn_handler((AxlWsConn *)conn, AXL_WS_CONNECT,
+                                            NULL, 0, conn->ws_data);
+            } else if (conn->ws_handler != NULL) {
+                crc = conn->ws_handler(AXL_WS_CONNECT, NULL, 0, conn->ws_data);
+            }
+            /* The handler may have closed the conn from within CONNECT
+               (axl_ws_conn_close -> reset_connection already ran). */
+            if (!conn->active) {
+                return AXL_SOURCE_REMOVE;
+            }
+            if (crc != AXL_OK) {
+                reset_connection(conn);   /* ws_connected unset -> no DISCONNECT */
+                return AXL_SOURCE_REMOVE;
+            }
+            conn->ws_connected = true;
+        }
+
         start_conn_recv(conn->server, conn);
     } else {
         reset_connection(conn);
@@ -388,6 +415,51 @@ stream_pump_next(AxlTcp *sock, AxlStatus status, void *data)
     return AXL_SOURCE_REMOVE;
 }
 
+/* RFC 9110 §6.4.1: a 1xx, 204, or 304 response carries no body and must
+   not carry Content-Length; every other status may have a body, so an
+   empty-body response on a keep-alive connection still needs an explicit
+   Content-Length: 0 to delimit it (without one the client blocks waiting
+   for a body that never arrives). */
+static bool
+status_allows_body(
+    size_t status_code
+    )
+{
+    return !(status_code / 100 == 1
+             || status_code == 204
+             || status_code == 304);
+}
+
+/* Case-insensitive scan of a response's custom header table for an
+   already-set Content-Length, so the auto-emitted zero-length delimiter
+   never duplicates one a handler set itself (e.g. a HEAD response that
+   reports the entity length with an empty body). */
+static void
+note_content_length(
+    const void *key,
+    void       *value,
+    void       *data
+    )
+{
+    (void)value;
+    if (axl_strcasecmp((const char *)key, "Content-Length") == 0) {
+        *(bool *)data = true;
+    }
+}
+
+static bool
+response_has_content_length(
+    const AxlHttpResponse *resp
+    )
+{
+    if (resp->headers == NULL) {
+        return false;
+    }
+    bool found = false;
+    axl_hash_table_foreach(resp->headers, note_content_length, &found);
+    return found;
+}
+
 void
 send_response(
     HttpConn        *conn,
@@ -421,11 +493,50 @@ send_response(
     } else if (resp->body != NULL && resp->body_size > 0) {
         header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
                  "Content-Length: %llu\r\n", (unsigned long long)resp->body_size);
+    } else if (status_allows_body(resp->status_code)
+               && !response_has_content_length(resp)) {
+        /* Empty body, no streamer, but the status permits one (201 from
+           WebDAV PUT/MKCOL/MOVE/COPY, an empty 200 from OPTIONS, …): a
+           keep-alive client needs an explicit zero-length delimiter or
+           it blocks waiting for a body. Skipped when a handler already
+           set its own Content-Length (HEAD reports the entity length
+           with an empty body) so the two never collide. */
+        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
+                 "Content-Length: 0\r\n");
     }
 
-    header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
-             "Connection: %s\r\n",
-             conn->keep_alive ? "keep-alive" : "close");
+    /* A 101 Switching Protocols response is an upgrade, not a keep-alive
+       reuse: RFC 6455 §4.2.2 (and RFC 7230 for any Upgrade) requires
+       "Connection: Upgrade". Emitting "keep-alive" here makes every
+       standard WebSocket client (websocket-client, browsers) reject the
+       handshake with "Invalid WebSocket Header". The upgrade handler keeps
+       conn->keep_alive = true so the socket is *held open* for framing —
+       that's the recv-rearm signal, distinct from the wire Connection
+       token, so it must not leak into this header. */
+    if (resp->status_code == 101) {
+        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
+                 "Connection: Upgrade\r\n");
+    } else {
+        header_len += axl_snprintf(header + header_len, sizeof(header) - header_len,
+                 "Connection: %s\r\n",
+                 conn->keep_alive ? "keep-alive" : "close");
+    }
+
+    /* Challenge interactive clients on a 401 when the server configured
+       one (axl_http_server_set_auth_challenge). Without it a 401 carries
+       no WWW-Authenticate and browsers/Finder never prompt for creds. */
+    if (resp->status_code == 401 && conn->server->auth_scheme != NULL) {
+        if (conn->server->auth_realm != NULL) {
+            header_len += axl_snprintf(header + header_len,
+                sizeof(header) - header_len,
+                "WWW-Authenticate: %s realm=\"%s\"\r\n",
+                conn->server->auth_scheme, conn->server->auth_realm);
+        } else {
+            header_len += axl_snprintf(header + header_len,
+                sizeof(header) - header_len,
+                "WWW-Authenticate: %s\r\n", conn->server->auth_scheme);
+        }
+    }
 
     /* Emit any custom response headers */
     if (resp->headers != NULL) {

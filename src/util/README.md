@@ -237,6 +237,94 @@ setup/teardown, foreground or driver-tick deployment), see
 [AxlService](../service/README.md) — the lifecycle wrapper over
 AxlLoop that composes axl-driver + axl-config + axl-loop.
 
+### Driver Discovery
+
+Where `axl-driver.h` *authors* and drives the driver lifecycle,
+`<axl/axl-driver-info.h>` is the read-only **discovery** side — the
+UEFI Shell `drivers` / "is this controller bound?" views as an API.
+The recurring real-world question is "the network driver is on the
+box, but it's not bound and I can't find it":
+
+```c
+AxlDriverInfo drivers[128];
+size_t n = 0;
+axl_driver_list_loaded(drivers, 128, &n);   // every DriverBinding driver
+for (size_t i = 0; i < n; i++) {
+    axl_printf("%-40s v%u  %u dev%s%s\n",
+               drivers[i].name, drivers[i].version, drivers[i].num_devices,
+               drivers[i].num_devices == 1 ? "" : "s",
+               drivers[i].is_network ? "  [network]" : "");
+}
+
+// Is a specific PCI function bound, and by which driver?
+AxlPciAddr nic = { .seg = 0, .bus = 2, .dev = 0, .func = 0 };
+bool bound = false;
+char drv[64];
+axl_pci_driver_bound(nic, &bound, drv, sizeof drv);
+
+// Bind a specific driver to a specific unbound controller.
+AxlHandle controller = NULL;
+axl_pci_to_handle(nic, &controller);
+axl_driver_bind(controller, drivers[i].handle);   // NULL driver = any
+```
+
+`axl_driver_list_loaded` reads each driver's ComponentName2 name,
+version, and managed-device count; `is_network` is true when the
+driver manages a network controller, its name looks network-ish, or
+(when idle) it claims an unbound network-class NIC. `axl_handle_name`
+names any handle (ComponentName2, else device-path text).
+`axl_pci_to_handle` maps a `AxlPciAddr` to its controller handle via
+`EFI_PCI_IO_PROTOCOL.GetLocation`. The bare `connect` / `disconnect`
+verbs already live in `axl-driver.h`
+(`axl_driver_connect_handle` / `_disconnect_handle`).
+
+For the **Devices tab** and the per-NIC **protocol-stack view** ("the
+drivers are present and the NIC is bound, but there's still no network
+— where is the stack broken?") the header adds four generic
+enumeration primitives, all sharing the fixed-buffer truncation
+contract of `axl_driver_list_loaded` (pass `out == NULL` to count,
+`*count` is the full total even when it exceeds `cap`):
+
+```c
+// Every handle (the shell `dh` list), or only those exposing a protocol.
+axl_handle_list(NULL, handles, cap, &n);          // all handles
+axl_handle_list(&snp_guid, handles, cap, &n);     // by-GUID subset
+
+// The reverse of axl_protocol_enumerate: the GUIDs a handle exposes.
+axl_handle_protocols(nic, guids, cap, &n);
+for (size_t i = 0; i < n && i < cap; i++) {
+    char name[24];
+    if (axl_net_protocol_name(&guids[i], name, sizeof name) == AXL_OK)
+        axl_printf("  %s\n", name);               // "Ip4Config2", ...
+}
+
+// Who manages this controller (BY_DRIVER); count 0 == unmanaged.
+axl_handle_drivers(controller, drivers, cap, &n);
+
+// The child controllers it produced (BY_CHILD_CONTROLLER) — for the
+// instance-level stack and the `devtree` descent.
+axl_handle_children(controller, kids, cap, &n);
+
+// devtree also walks upward — the parent(s) that produced a controller.
+axl_handle_parents(controller, parents, cap, &n);   // count 0 == a root
+```
+
+`axl_net_protocol_name` names just the networking stack (and rejects
+non-net GUIDs, so a caller can decide "is this a net protocol?");
+`axl_protocol_guid_name` is the broader Devices-tab namer — it consults
+the net table first, then the common device / driver / bus / console
+protocols (DevicePath, LoadedImage, DriverBinding, ComponentName2,
+SimpleFileSystem, BlockIo, DiskIo, PciIo, GraphicsOutput, SerialIo,
+UsbIo, NvmExpressPassThru, AtaPassThru, …), falling back to AXL_ERR so
+the caller formats the raw GUID for anything unrecognised.
+
+Where the stack lands is platform-dependent: on the QEMU/OVMF test
+platform the per-controller config protocols (`Ip4Config2`) sit on the
+**NIC/SNP controller handle itself**, while `ManagedNetwork` and the
+upper service-binding *instances* live on its **child** handles — so a
+complete stack view lists the controller's protocols *and* walks
+`axl_handle_children`.
+
 ### Image Lifecycle
 
 For loading and running arbitrary EFI images (not DXE drivers),
@@ -259,6 +347,25 @@ distinct piece is `axl_image_start`, which captures the image's
 exit status (`axl_driver_start` discards it because drivers aren't
 expected to exit cleanly). Forward slashes in the path are
 normalized to backslashes.
+
+For the common "launch a blocking foreground app and get its exit
+code" case, `axl_image_run` does load + (optional) args + start +
+unload in one call:
+
+```c
+int exit_code = 0;
+axl_image_run("fs0:\\tools\\diag.efi", "-v --quick", &exit_code);
+// blocks until diag.efi returns; `args` is encoded to UCS-2 LoadOptions
+```
+
+`StartImage` blocks — the launched app owns the foreground until it
+returns. This works for *any* blocking UEFI app (a diagnostic tool, a
+vendor setup app, a recovery menu). To host a real **UEFI Shell**
+specifically, `axl_shell_launch` (`<axl/axl-shell.h>`) is the thin
+Shell wrapper: it locates `Shell.efi` and runs it with `-nostartup`
+(so a child Shell launched from `startup.nsh` doesn't recurse). Pair
+either with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror
+the launched app's console to a remote terminal.
 
 ### Image Signature Inspection
 
@@ -645,6 +752,30 @@ axl_config_set(defaults, "port", "8080");
 AxlConfig *override = axl_config_new_with_parent(opts, defaults);
 // override inherits "port"="8080" until explicitly set
 ```
+
+### Free-form config files (AxlConfigFile)
+
+`AxlConfig` is descriptor-bound — it validates each key against a fixed
+table and *rejects* unknown keys. For the opposite case — a free-form
+`key=value` file whose keys aren't known at compile time (a module
+config where features invent their own `prefix.key` names) —
+`<axl/axl-config-file.h>` `AxlConfigFile` parses the file into a flat
+string map with typed getters that fall back to a caller default:
+
+```c
+AXL_AUTOPTR(AxlConfigFile) cf = axl_config_file_load("FS0:\\softbmc.cfg");
+uint64_t timeout = axl_config_file_get_uint(cf, "session_timeout", 900);
+const char *mode = axl_config_file_get(cf, "mode", "handoff");
+bool        dbg  = axl_config_file_get_bool(cf, "log.debug", false);
+axl_config_file_set(cf, "session_timeout", "1800");
+axl_config_file_save(cf, "FS0:\\softbmc.cfg");
+```
+
+A missing file yields an empty map (not an error), so every lookup
+returns its default. The format is ASCII `key=value`, one per line, with
+`#` comments, blank lines ignored, and values trimmed of surrounding
+whitespace. The `prefix.key` dot is just a naming convention — the map is
+flat; the caller joins the prefix.
 
 ## Command-Line Parsing (AxlArgs)
 

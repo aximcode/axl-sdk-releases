@@ -42,7 +42,7 @@ struct AxlAsync {
     size_t         max_slots;
     size_t         pending_count;
     uint32_t       next_handle;
-    uint32_t       idle_source_id;
+    AxlSourceId    idle_source_id;
 };
 
 // ---------------------------------------------------------------------------

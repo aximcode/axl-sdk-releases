@@ -327,6 +327,7 @@ status_reason_phrase(
     size_t code)
 {
     switch (code) {
+    case 101: return "Switching Protocols";
     case 200: return "OK";
     case 201: return "Created";
     case 204: return "No Content";
@@ -337,6 +338,7 @@ status_reason_phrase(
     case 307: return "Temporary Redirect";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
+    case 402: return "Payment Required";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";

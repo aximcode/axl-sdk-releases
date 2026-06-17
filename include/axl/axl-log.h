@@ -321,13 +321,34 @@ axl_log_ring_count(
 /**
  * @brief Retrieve an entry from a ring by index.
  *
+ * The filled `entry->message` / `entry->domain` point into the ring's
+ * single shared scratch buffer and are valid only until the NEXT call to
+ * `axl_log_ring_get` on the same ring — and the ring's write handler
+ * stages new messages into that same buffer. So when iterating a ring to
+ * serialize it, consume each entry (copy the strings out) before calling
+ * `get` again, and do NOT emit a log line mid-iteration (a stray
+ * `axl_debug()` inside the loop would overwrite the borrowed strings).
+ *
  * @return true if entry returned, false if index out of range.
  */
 bool
 axl_log_ring_get(
     AxlLogRing  *ring,   ///< ring to query
     size_t       index,  ///< entry index (0 = newest)
-    AxlLogEntry *entry   ///< filled with entry data
+    AxlLogEntry *entry   ///< filled with entry data (strings borrowed; see above)
+);
+
+/**
+ * @brief Drop all stored entries from a ring, leaving it attached.
+ *
+ * Empties the ring in place — it stays attached as a log handler and is
+ * immediately ready to receive new messages. Lets a consumer implement a
+ * "clear logs" action without the detach / free / recreate churn (and
+ * without re-attaching). NULL-safe.
+ */
+void
+axl_log_ring_clear(
+    AxlLogRing *ring  ///< ring to empty
 );
 
 // ---------------------------------------------------------------------------

@@ -189,6 +189,10 @@ typedef struct {
     uint32_t     size_mb;         ///< 0 if slot is empty
     uint16_t     speed_mhz;       ///< 0 if unknown
     uint8_t      memory_type;     ///< SMBIOS memory type (DDR4=0x1A, DDR5=0x22, ...)
+    uint8_t      form_factor;     ///< SMBIOS FormFactor code (Type 17 offset 0x0E; 9 = DIMM, 0x0D = SODIMM, ...)
+    uint16_t     total_width;     ///< Data + ECC width in bits (0 if unknown; the 0xFFFF "unknown" sentinel maps to 0)
+    uint16_t     data_width;      ///< Data width in bits, excluding ECC (0 if unknown)
+    uint8_t      rank;            ///< Number of ranks (Attributes offset 0x1B, bits 3:0; 0 if unknown / pre-2.6 record)
 } AxlSmbiosMemoryDevice;
 
 /**

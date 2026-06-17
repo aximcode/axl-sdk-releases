@@ -140,6 +140,27 @@ axl_tls_handshake(
 );
 
 /**
+ * @brief Perform or continue a TLS handshake, sending output asynchronously.
+ *
+ * Like axl_tls_handshake(), but any handshake output (e.g. the ServerHello
+ * flight) is flushed via an asynchronous send on @p loop instead of a
+ * blocking send. The blocking variant nests an ephemeral loop to complete
+ * the send, which cannot make progress when the handshake is itself being
+ * driven from inside a callback dispatched by a resident event loop (an
+ * AxlService driver). Pair this with an asynchronous recv on the same loop
+ * (stage the received ciphertext with axl_tls_stage_data() before calling)
+ * so the whole handshake runs on the caller's loop.
+ *
+ * @return 0 on success (handshake complete), 1 if more data is needed
+ *     (re-arm the recv and call again), -1 on error.
+ */
+int
+axl_tls_handshake_async(
+    AxlTlsContext *ctx,   ///< TLS context
+    AxlLoop       *loop   ///< loop to send handshake output on
+);
+
+/**
  * @brief Read decrypted data from a TLS connection.
  *
  * @return 0 on success, -1 on error, 1 if more data needed.
@@ -198,6 +219,24 @@ axl_tls_stage_data(
     AxlTlsContext *ctx,   ///< TLS context
     const void    *data,  ///< received TCP data
     size_t         len    ///< data length
+);
+
+/**
+ * @brief Whether decrypted/decryptable TLS application data is already
+ *        buffered, so the caller must drain it before idling on the
+ *        transport.
+ *
+ * One TCP segment can carry several TLS records. After axl_tls_read()
+ * returns one record's plaintext, more records from the same segment may
+ * remain staged — re-arming a transport recv then would block forever on
+ * bytes that have already arrived. Returns true when a further
+ * axl_tls_read() can make progress without new transport input.
+ *
+ * @return true if buffered TLS application data is pending.
+ */
+bool
+axl_tls_pending(
+    AxlTlsContext *ctx   ///< TLS context
 );
 
 /**

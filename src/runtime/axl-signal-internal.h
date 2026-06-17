@@ -28,4 +28,14 @@ void _axl_signal_on_break(void);
  *  exit (no handler) or let the caller unwind (handler present). */
 bool _axl_signal_has_handler(void);
 
+/** Observe Ctrl-C (the shell break flag) and honor the default-exit
+ *  policy, WITHOUT dispatching the default loop. This is what library
+ *  code wants when it "yields" inside a long operation: stay Ctrl-C
+ *  responsive, but never re-enter (re-dispatch) the consumer's event
+ *  loop from deep inside an unrelated call. The public axl_yield() does
+ *  this PLUS a non-blocking dispatch of the default loop (the documented
+ *  yield-as-scheduler contract); library code must use this instead so it
+ *  never fires consumer callbacks behind the consumer's back. */
+void _axl_poll_break(void);
+
 #endif /* AXL_SIGNAL_INTERNAL_H */

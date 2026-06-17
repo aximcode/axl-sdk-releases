@@ -84,6 +84,11 @@ check "--mount help text mentions virtiofs" 0 \
     "virtiofs" \
     "$RUN_QEMU" --help
 
+# --- --cpu-report ---------------------------------------------------------
+check "--help advertises --cpu-report" 0 \
+    "cpu-report" \
+    "$RUN_QEMU" --help
+
 # --- --qemu-arg passthrough -----------------------------------------------
 check "--help advertises --qemu-arg" 0 \
     "qemu-arg" \

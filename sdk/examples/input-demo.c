@@ -154,12 +154,12 @@ main(
     /* Create the loop and attach all three input sources.  Print
        success/failure to console so consumers can see what's wired. */
     AxlLoop *loop = axl_loop_new();
-    uint32_t mid = axl_input_attach_mouse(loop, on_input, &s);
-    uint32_t kid = axl_input_attach_key(loop, on_input, &s);
-    uint32_t tid = axl_input_attach_touch(loop, on_input, &s);
-    axl_printf("attach mouse: %s (id=%u)\n", mid ? "OK" : "skipped", (unsigned)mid);
-    axl_printf("attach key:   %s (id=%u)\n", kid ? "OK" : "skipped", (unsigned)kid);
-    axl_printf("attach touch: %s (id=%u)\n", tid ? "OK" : "skipped", (unsigned)tid);
+    AxlSourceId mid = axl_input_attach_mouse(loop, on_input, &s);
+    AxlSourceId kid = axl_input_attach_key(loop, on_input, &s);
+    AxlSourceId tid = axl_input_attach_touch(loop, on_input, &s);
+    axl_printf("attach mouse: %s (id=%llu)\n", mid ? "OK" : "skipped", (unsigned long long)mid);
+    axl_printf("attach key:   %s (id=%llu)\n", kid ? "OK" : "skipped", (unsigned long long)kid);
+    axl_printf("attach touch: %s (id=%llu)\n", tid ? "OK" : "skipped", (unsigned long long)tid);
 
     axl_gfx_draw_text(font, 20, 140,
         mid ? "[X] mouse attached (move the mouse)" : "[ ] mouse not available",

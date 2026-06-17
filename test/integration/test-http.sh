@@ -214,6 +214,13 @@ RESP=$(http_get "/secret")
 CODE=$(echo "$RESP" | tail -1)
 [[ "$CODE" == "401" ]] && pass "GET /secret no auth returns 401" || fail "GET /secret no auth (got $CODE)"
 
+# The 401 carries a WWW-Authenticate challenge (set via
+# axl_http_server_set_auth_challenge) so browsers/Finder prompt for creds.
+HDRS=$(curl "${CURL_OPTS[@]}" -i "${BASE_URL}/secret" 2>/dev/null || true)
+echo "$HDRS" | grep -qi 'WWW-Authenticate: Basic realm="axl-test"' \
+    && pass "GET /secret 401 carries WWW-Authenticate challenge" \
+    || fail "GET /secret 401 missing WWW-Authenticate challenge"
+
 # GET /secret with wrong token → 401
 RESP=$(curl "${CURL_OPTS[@]}" -w "\n%{http_code}" -H "Authorization: Bearer wrong" "${BASE_URL}/secret" 2>/dev/null || true)
 CODE=$(echo "$RESP" | tail -1)
@@ -1137,6 +1144,25 @@ if "101" not in status_line:
     sys.exit(0)
 print("PASS: ws handshake returns 101")
 
+# RFC 6455 §4.2.2: the 101 response MUST carry "Connection: Upgrade"
+# (not keep-alive) and the correct reason phrase, or standard WS clients
+# (websocket-client, every browser) reject the handshake with
+# "Invalid WebSocket Header". Exact-string asserts so a regression can't
+# slip back in behind a lenient substring match.
+if status_line == "HTTP/1.1 101 Switching Protocols":
+    print("PASS: ws 101 reason phrase is 'Switching Protocols'")
+else:
+    print(f"FAIL: ws 101 reason phrase (got {status_line!r})")
+
+header_block = resp.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+conn_vals = [ln.split(":", 1)[1].strip().lower()
+             for ln in header_block.split("\r\n")
+             if ln.lower().startswith("connection:")]
+if conn_vals == ["upgrade"]:
+    print("PASS: ws 101 sends 'Connection: Upgrade'")
+else:
+    print(f"FAIL: ws 101 Connection header (got {conn_vals})")
+
 # Verify accept key
 accept_input = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 expected_accept = base64.b64encode(hashlib.sha1(accept_input.encode()).digest()).decode()
@@ -1181,6 +1207,185 @@ try:
 except:
     pass
 s.close()
+PYEOF
+)
+
+# WebSocket per-connection API (add_websocket_ex): per-client send + auth.
+while IFS= read -r line; do
+    case "$line" in
+        "PASS:"*) pass "${line#PASS: }" ;;
+        "FAIL:"*) fail "${line#FAIL: }" ;;
+    esac
+done < <(python3 - "$HOST_PORT" << 'PYEOF'
+import sys, socket, base64, os, time
+
+port = int(sys.argv[1])
+
+def ws_open(path, auth=None):
+    """Open a WS upgrade to path; return (status_code:int, sock-or-None)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(("127.0.0.1", port))
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n")
+    if auth:
+        req += f"Authorization: {auth}\r\n"
+    req += "\r\n"
+    s.sendall(req.encode())
+    # Read the handshake response ONE BYTE at a time so we stop exactly at the
+    # header terminator and never swallow a server frame that follows the 101
+    # in the same TCP segment (e.g. a greet-on-connect banner) — otherwise the
+    # follow-up recv races segment coalescing and intermittently times out.
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        b1 = s.recv(1)
+        if not b1:
+            break
+        resp += b1
+    try:
+        status = int(resp.split(b" ")[1])
+    except Exception:
+        status = 0
+    return status, (s if status == 101 else (s.close() or None))
+
+def ws_send_text(s, msg):
+    b = msg.encode()
+    frame = bytearray([0x81, 0x80 | len(b)])
+    mask = os.urandom(4)
+    frame += mask + bytes(c ^ mask[i % 4] for i, c in enumerate(b))
+    s.sendall(frame)
+
+def ws_recv_text(s):
+    time.sleep(0.5)
+    data = s.recv(1024)
+    if len(data) < 2:
+        return None
+    plen = data[1] & 0x7F
+    return data[2:2 + plen].decode(errors="replace")
+
+# 1) Per-client echo via axl_ws_send (open endpoint).
+try:
+    st, s = ws_open("/ws-echo-ex")
+    if st != 101:
+        print(f"FAIL: ws-ex handshake (status {st})")
+    else:
+        print("PASS: ws-ex handshake 101")
+        ws_send_text(s, "hello")
+        r = ws_recv_text(s)
+        if r == "ex:hello":
+            print("PASS: ws-ex per-client send (got 'ex:hello')")
+        else:
+            print(f"FAIL: ws-ex per-client send (got {r!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-ex ({e})")
+
+# 2) Auth-gated upgrade: no credentials must be rejected (no 101).
+try:
+    st, s = ws_open("/ws-auth")
+    if st == 401:
+        print("PASS: ws-auth unauthorized upgrade rejected 401")
+    else:
+        print(f"FAIL: ws-auth unauth not rejected (status {st})")
+        if s:
+            s.close()
+except Exception as e:
+    print(f"FAIL: ws-auth unauth ({e})")
+
+# 3a) Server-initiated close from inside a frame handler (axl_ws_conn_close):
+#     the server must send a close frame and not hang / re-arm a reset conn.
+try:
+    st, s = ws_open("/ws-close")
+    if st != 101:
+        print(f"FAIL: ws-close handshake (status {st})")
+    else:
+        ws_send_text(s, "bye")
+        time.sleep(0.5)
+        data = s.recv(1024)
+        # A clean server close is either a WS close frame (0x88) or EOF.
+        if data == b"" or (len(data) >= 1 and (data[0] & 0x0F) == 0x8):
+            print("PASS: ws-close server-initiated close from handler")
+        else:
+            print(f"FAIL: ws-close unexpected reply ({data!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-close ({e})")
+
+# 3) Auth-gated upgrade with a valid token: 101 + identity surfaced.
+try:
+    st, s = ws_open("/ws-auth", auth="Bearer test-token")
+    if st != 101:
+        print(f"FAIL: ws-auth authorized handshake (status {st})")
+    else:
+        print("PASS: ws-auth authorized upgrade 101")
+        ws_send_text(s, "whoami")
+        r = ws_recv_text(s)
+        if r == "user:testuser":
+            print("PASS: ws-auth identity surfaced (got 'user:testuser')")
+        else:
+            print(f"FAIL: ws-auth identity (got {r!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-auth authorized ({e})")
+
+# 3b) Close-from-connect: axl_ws_conn_close called inside AXL_WS_CONNECT (then
+#     returning AXL_OK) must close cleanly and not wedge the server.
+try:
+    st, s = ws_open("/ws-connect-close")
+    if st != 101:
+        print(f"FAIL: ws-connect-close handshake (status {st})")
+    else:
+        time.sleep(0.5)
+        try:
+            data = s.recv(1024)
+        except Exception:
+            data = b""
+        if data == b"" or (len(data) >= 1 and (data[0] & 0x0F) == 0x8):
+            print("PASS: ws-connect-close closed cleanly from CONNECT")
+        else:
+            print(f"FAIL: ws-connect-close unexpected ({data!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-connect-close ({e})")
+
+# 4) Greet-on-connect: a banner sent from AXL_WS_CONNECT must arrive AFTER the
+#    101 (valid only because CONNECT now fires post-handshake). Read without
+#    sending anything first.
+try:
+    st, s = ws_open("/ws-greet")
+    if st != 101:
+        print(f"FAIL: ws-greet handshake (status {st})")
+    else:
+        r = ws_recv_text(s)
+        if r == "hi":
+            print("PASS: ws-greet banner from CONNECT (got 'hi')")
+        else:
+            print(f"FAIL: ws-greet banner (got {r!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-greet ({e})")
+
+# 5) Reject-on-connect: AXL_ERR from AXL_WS_CONNECT drops the connection. The
+#    101 is sent, then the socket closes — a follow-up recv sees EOF.
+try:
+    st, s = ws_open("/ws-reject")
+    if st != 101:
+        print(f"FAIL: ws-reject handshake (status {st})")
+    else:
+        time.sleep(0.5)
+        try:
+            data = s.recv(1024)
+        except Exception:
+            data = b""
+        if data == b"":
+            print("PASS: ws-reject closed after CONNECT returned AXL_ERR")
+        else:
+            print(f"FAIL: ws-reject not closed (got {data!r})")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-reject ({e})")
 PYEOF
 )
 

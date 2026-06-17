@@ -101,9 +101,9 @@ axl_gfx_output_count(void);
 
 /// Describe display output @a index into @a out.
 ///
-/// Fills geometry, pixel format, framebuffer base, mode count / current
-/// mode, and (if the panel published one) a borrowed pointer to its EDID
-/// bytes — the same firmware-owned, do-not-free, decode-with-
+/// Fills geometry, pixel format, framebuffer base and size, mode count /
+/// current mode, and (if the panel published one) a borrowed pointer to
+/// its EDID bytes — the same firmware-owned, do-not-free, decode-with-
 /// `axl_edid_parse` contract as `axl_gfx_get_edid`.  Outputs are indexed
 /// `[0, axl_gfx_output_count())` in firmware handle order, stable within
 /// a boot.
@@ -116,6 +116,49 @@ int
 axl_gfx_output_get(
     size_t         index,  ///< output index in [0, axl_gfx_output_count())
     AxlGfxOutput  *out     ///< [out] receives the output description
+    );
+
+/// Query the geometry and pixel format of mode @a mode_index of output
+/// @a output_index, without switching to it.
+///
+/// The per-output inventory peer of `axl_gfx_query_mode`, which can only
+/// read the *active* GOP.  Reads the named output's own GOP, so a
+/// multi-monitor consumer can enumerate the mode list of an output that
+/// is not the active one (a laptop panel and an external monitor
+/// enumerate different mode sets), and each mode carries its own
+/// `pixel_format` rather than the output's.
+///
+/// A conformant GOP only ever reports one of the four mapped pixel
+/// formats, so the "unrecognized format" failure is malformed-firmware
+/// only; an inventory walk over `[0, mode_count)` may treat an AXL_ERR
+/// on an in-range mode as "skip this mode and continue."
+///
+/// @return AXL_OK with @a out populated, or AXL_ERR if @a out is NULL,
+///         @a output_index is out of range, @a mode_index is `>=` that
+///         output's `mode_count`, the GOP could not be read, QueryMode
+///         failed, or the mode's pixel format is unrecognized.
+int
+axl_gfx_output_query_mode(
+    size_t             output_index,  ///< output index in [0, axl_gfx_output_count())
+    uint32_t           mode_index,    ///< mode number in [0, that output's mode_count)
+    AxlGfxOutputMode  *out            ///< [out] receives the mode description
+    );
+
+/// Get the per-channel bit masks for output @a output_index, when that
+/// output's active mode is a `PixelBitMask` display.
+///
+/// The per-output peer of `axl_gfx_get_pixel_bitmask` (which reads only
+/// the active GOP).  Only meaningful when the output's `pixel_format` is
+/// `AXL_GFX_PIXEL_FORMAT_BITMASK`; any other format returns AXL_ERR (the
+/// masks are implied by RGBX8/BGRX8 and undefined for Blt-only).
+///
+/// @return AXL_OK with @a out populated, or AXL_ERR if @a out is NULL,
+///         @a output_index is out of range, the GOP could not be read,
+///         or the output's format is not bitmask.
+int
+axl_gfx_output_get_pixel_bitmask(
+    size_t              output_index,  ///< output index in [0, axl_gfx_output_count())
+    AxlGfxPixelBitmask *out            ///< [out] receives the channel masks
     );
 
 // ===================================================================

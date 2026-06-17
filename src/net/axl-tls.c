@@ -30,6 +30,8 @@ int  axl_tls_server_set_cert(const void *c, size_t cl, const void *k, size_t kl)
 AxlTlsContext *axl_tls_accept(AxlTcp *s) { (void)s; return NULL; }
 AxlTlsContext *axl_tls_connect(AxlTcp *s, const char *h) { (void)s;(void)h; return NULL; }
 int  axl_tls_handshake(AxlTlsContext *c) { (void)c; return -1; }
+int  axl_tls_handshake_async(AxlTlsContext *c, AxlLoop *l)
+{ (void)c; (void)l; return -1; }
 int  axl_tls_read(AxlTlsContext *c, void *b, size_t s, size_t *o)
 { (void)c;(void)b;(void)s;(void)o; return -1; }
 int  axl_tls_write(AxlTlsContext *c, const void *d, size_t l)
@@ -40,6 +42,7 @@ int  axl_tls_write_async(AxlTlsContext *c, const void *d, size_t l,
 void axl_tls_free(AxlTlsContext *c) { (void)c; }
 void axl_tls_stage_data(AxlTlsContext *c, const void *d, size_t l)
 { (void)c;(void)d;(void)l; }
+bool axl_tls_pending(AxlTlsContext *c) { (void)c; return false; }
 
 #else /* AXL_HAVE_TLS */
 
@@ -48,8 +51,11 @@ void axl_tls_stage_data(AxlTlsContext *c, const void *d, size_t l)
 // ===================================================================
 
 #include "../backend/axl-backend.h"
+#include "axl-tcp-internal.h"   /* axl_tcp_send_in_flight */
+#include "axl-http-client-tls.h" /* register the HTTP client's TLS ops */
 #include <axl/axl-atexit.h>
 #include <axl/axl-log.h>
+#include <axl/axl-debug.h>
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/ctr_drbg.h>
@@ -93,9 +99,14 @@ struct AxlTlsContext {
     size_t               stage_len;
     size_t               stage_off;
 
-    /* Buffered output for handshake batching */
+    /* Buffered output for handshake batching and multi-record app writes.
+       out_cap is the current capacity of out_buf — normally
+       TLS_HANDSHAKE_BUF, but axl_tls_write_async temporarily points these
+       at a larger heap buffer when a single write spans multiple records
+       (a response body > one TLS record). */
     uint8_t             *out_buf;
     size_t               out_len;
+    size_t               out_cap;
     bool                 buffered_mode;
 };
 
@@ -109,8 +120,9 @@ tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
     AxlTlsContext *tc = (AxlTlsContext *)ctx;
 
     if (tc->buffered_mode) {
-        /* Accumulate handshake output for single TCP send */
-        if (tc->out_len + len > TLS_HANDSHAKE_BUF) {
+        /* Accumulate output for a single TCP send (handshake flight or a
+           multi-record app write). */
+        if (tc->out_len + len > tc->out_cap) {
             return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
         }
         axl_memcpy(tc->out_buf + tc->out_len, buf, len);
@@ -154,6 +166,20 @@ axl_tls_available(void)
     return true;
 }
 
+/* HTTP client TLS ops — registered with the client from axl_tls_init() so the
+   client never needs a static axl_tls_* reference. Field order/signatures
+   match AxlHttpClientTlsOps. */
+static const AxlHttpClientTlsOps g_http_client_tls_ops = {
+    .connect         = axl_tls_connect,
+    .free            = axl_tls_free,
+    .stage_data      = axl_tls_stage_data,
+    .handshake       = axl_tls_handshake,
+    .write           = axl_tls_write,
+    .read            = axl_tls_read,
+    .handshake_async = axl_tls_handshake_async,
+    .write_async     = axl_tls_write_async,
+};
+
 int
 axl_tls_init(void)
 {
@@ -196,6 +222,12 @@ axl_tls_init(void)
     }
 
     mbedtls_ssl_conf_rng(&g_tls_config, mbedtls_ctr_drbg_random, &g_ctr_drbg);
+
+    /* Wire the always-linked HTTP client to this (now-linked) TLS module, so
+       its https path works. A consumer that never calls axl_tls_init (or
+       axl_http_server_use_tls, which does) never reaches here, leaving the
+       client's ops NULL and letting --gc-sections strip mbedTLS. */
+    axl_http_client_set_tls_ops(&g_http_client_tls_ops);
 
     g_initialized = true;
     axl_atexit(axl_tls_cleanup_thunk, NULL);
@@ -515,6 +547,7 @@ axl_tls_accept(AxlTcp *sock)
         axl_free(ctx);
         return NULL;
     }
+    ctx->out_cap = TLS_HANDSHAKE_BUF;
     ctx->out_len = 0;
     ctx->buffered_mode = true;
 
@@ -571,6 +604,7 @@ axl_tls_connect(AxlTcp *sock, const char *hostname)
         axl_free(ctx);
         return NULL;
     }
+    ctx->out_cap = TLS_HANDSHAKE_BUF;
     ctx->out_len = 0;
     ctx->buffered_mode = true;
 
@@ -595,6 +629,31 @@ axl_tls_connect(AxlTcp *sock, const char *hostname)
 // ---------------------------------------------------------------------------
 // Handshake
 // ---------------------------------------------------------------------------
+
+/* Log a failed handshake at the right level. A failed CLIENT handshake is
+   NORMAL operation for a public TLS listener — browsers abort speculative /
+   preconnect sockets constantly, and a single page load can produce ~20 peer
+   fatal-alert failures. Demote those routine peer-driven terminations (peer
+   fatal alert, clean close-notify, EOF, reset) to debug; keep warning for codes
+   that smell like a local problem worth a human's attention. (Genuine local
+   misconfiguration — bad cert/key, no usable ciphersuite — already surfaces as
+   its own warning at setup time.) The custom BIO (tls_bio_recv) surfaces
+   SSL-level codes only — mbedTLS net_sockets isn't used — so a peer reset
+   arrives as CONN_EOF, not MBEDTLS_ERR_NET_CONN_RESET. */
+static void
+log_handshake_failure(int ret)
+{
+    switch (ret) {
+    case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:  /* peer sent a fatal alert */
+    case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:    /* peer closed cleanly */
+    case MBEDTLS_ERR_SSL_CONN_EOF:             /* peer hung up mid-handshake */
+        axl_debug("handshake terminated by peer: -0x%04x", (unsigned)-ret);
+        break;
+    default:
+        axl_warning("handshake failed: -0x%04x", (unsigned)-ret);
+        break;
+    }
+}
 
 int
 axl_tls_handshake(AxlTlsContext *ctx)
@@ -627,7 +686,7 @@ axl_tls_handshake(AxlTlsContext *ctx)
         return 1;  /* need more data */
     }
 
-    axl_warning("handshake failed: -0x%04x", (unsigned)-ret);
+    log_handshake_failure(ret);
     return -1;
 }
 
@@ -676,8 +735,20 @@ axl_tls_write(
         return AXL_ERR;
     }
 
-    int ret = mbedtls_ssl_write(&ctx->ssl, data, len);
-    return (ret == (int)len) ? AXL_OK : AXL_ERR;
+    /* mbedtls_ssl_write emits at most one record per call, so loop until
+       every byte is written (each call sends its record directly via the
+       non-buffered BIO). Without this a payload larger than one TLS record
+       — e.g. a client request body > 16 KiB — would be truncated. */
+    size_t off = 0;
+    while (off < len) {
+        int ret = mbedtls_ssl_write(&ctx->ssl,
+                                    (const uint8_t *)data + off, len - off);
+        if (ret <= 0) {
+            return AXL_ERR;
+        }
+        off += (size_t)ret;
+    }
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -719,23 +790,84 @@ axl_tls_write_async(
         return AXL_ERR;
     }
 
-    /* Encrypt into the buffered output */
+    /* Floor against TLS-stream desync (the ws-broadcast-over-TLS bug):
+       axl_tcp_send_async is strictly one-send-in-flight, and mbedtls_ssl_write
+       below ADVANCES the TLS write sequence number and emits an encrypted
+       record. If we encrypted now and the send were then rejected (a prior
+       send still pending), that record would be dropped with the seqno already
+       consumed — desyncing the stream and breaking the connection. So bail
+       BEFORE touching the SSL context when a send is in flight. Returns a
+       DISTINCT AXL_BUSY (not AXL_ERR) so a caller can re-queue/retry; the SSL
+       context is left untouched. Well-behaved callers serialize via their own
+       outbound queue (see the WS per-connection queue) and never hit this. */
+    if (axl_tcp_send_in_flight(ctx->sock)) {
+        return AXL_BUSY;
+    }
+
+    /* mbedtls_ssl_write emits at most one record (<= OUT_CONTENT_LEN
+       plaintext) per call, so a body larger than one record needs several
+       calls. Accumulate every record's ciphertext into one buffer and send
+       it in a single TCP write. For a write that fits in one record this
+       is the existing out_buf; for a larger one, point the accumulation at
+       a right-sized temporary so tls_bio_send doesn't overflow. */
+    uint8_t *saved_buf = ctx->out_buf;
+    size_t   saved_cap = ctx->out_cap;
+    uint8_t *big_buf    = NULL;
+
+    if (len > TLS_HANDSHAKE_BUF / 2) {
+        /* Worst-case ciphertext: plaintext + per-record framing overhead
+           (header + IV + AEAD tag, well under 128 B/record). */
+        size_t nrec = (len / MBEDTLS_SSL_OUT_CONTENT_LEN) + 1;
+        size_t cap  = len + nrec * 128 + 256;
+        big_buf = axl_malloc(cap);
+        if (big_buf == NULL) {
+            return AXL_ERR;
+        }
+        ctx->out_buf = big_buf;
+        ctx->out_cap = cap;
+    }
+
     ctx->buffered_mode = true;
     ctx->out_len = 0;
 
-    int ret = mbedtls_ssl_write(&ctx->ssl, data, len);
+    /* Invariant guard (the 4563aabf desync): we are about to advance the TLS
+       write sequence number via mbedtls_ssl_write, which is irreversible. The
+       floor above already returned AXL_BUSY if a TCP send were in flight, so
+       this must hold here. If a future edit reaches the seqno advance without
+       that floor, catch it at the cause — not as a downstream stream desync a
+       consumer's integration surfaces days later. */
+    AXL_DEBUG_ASSERT_MSG(!axl_tcp_send_in_flight(ctx->sock),
+                         "TLS seqno advance with a TCP send in flight");
+
+    /* Write all bytes, one record per mbedtls_ssl_write (it returns the
+       count written, which is capped at one record). */
+    size_t off = 0;
+    bool   ok  = true;
+    while (off < len) {
+        int ret = mbedtls_ssl_write(&ctx->ssl,
+                                    (const uint8_t *)data + off, len - off);
+        if (ret <= 0) {
+            ok = false;
+            break;
+        }
+        off += (size_t)ret;
+    }
 
     ctx->buffered_mode = false;
 
-    if (ret != (int)len || ctx->out_len == 0) {
-        ctx->out_len = 0;
-        return AXL_ERR;
-    }
-
-    /* Copy the encrypted data (out_buf is shared state) */
     size_t enc_len = ctx->out_len;
-    void *enc_copy = axl_memdup(ctx->out_buf, enc_len);
     ctx->out_len = 0;
+
+    void *enc_copy = (ok && enc_len > 0)
+                     ? axl_memdup(ctx->out_buf, enc_len)
+                     : NULL;
+
+    /* Restore the handshake-sized out_buf. */
+    if (big_buf != NULL) {
+        ctx->out_buf = saved_buf;
+        ctx->out_cap = saved_cap;
+        axl_free(big_buf);
+    }
 
     if (enc_copy == NULL) {
         return AXL_ERR;
@@ -760,6 +892,67 @@ axl_tls_write_async(
     return AXL_OK;
 }
 
+/* Flush the buffered handshake output (out_buf) asynchronously on @p loop,
+   taking ownership of a copy so the buffer can be reused immediately.
+   @p out_len is consumed only once the send is accepted, so a rejected
+   submission (e.g. a prior flight's send still in flight) leaves the
+   buffered bytes intact rather than dropping them. This assumes lock-step
+   handshake flights — true for a server handshake, where each flight
+   follows a client round-trip and the prior send has long drained. */
+static int
+handshake_flush_async(AxlTlsContext *ctx, AxlLoop *loop)
+{
+    if (!ctx->buffered_mode || ctx->out_len == 0) {
+        return AXL_OK;
+    }
+    size_t n    = ctx->out_len;
+    void  *copy = axl_memdup(ctx->out_buf, n);
+    if (copy == NULL) {
+        return AXL_ERR;
+    }
+    TlsWriteAsyncCtx *wctx = axl_new(TlsWriteAsyncCtx);
+    if (wctx == NULL) {
+        axl_free(copy);
+        return AXL_ERR;
+    }
+    wctx->user_cb   = NULL;
+    wctx->user_data = NULL;
+    wctx->enc_buf   = copy;
+    if (axl_tcp_send_async(ctx->sock, copy, n, loop, NULL,
+                           tls_write_async_done, wctx) != AXL_OK) {
+        axl_free(copy);
+        axl_free(wctx);
+        return AXL_ERR;   /* out_len left intact — bytes not lost */
+    }
+    ctx->out_len = 0;     /* consumed only on a successful submission */
+    return AXL_OK;
+}
+
+int
+axl_tls_handshake_async(AxlTlsContext *ctx, AxlLoop *loop)
+{
+    if (ctx == NULL || loop == NULL) {
+        return -1;
+    }
+
+    int ret = mbedtls_ssl_handshake(&ctx->ssl);
+
+    if (ret == 0) {
+        if (handshake_flush_async(ctx, loop) != AXL_OK) {
+            return -1;
+        }
+        ctx->buffered_mode = false;
+        return 0;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+        ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        return (handshake_flush_async(ctx, loop) == AXL_OK) ? 1 : -1;
+    }
+
+    log_handshake_failure(ret);
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
@@ -771,7 +964,20 @@ axl_tls_free(AxlTlsContext *ctx)
         return;
     }
 
+    /* Generate the close_notify alert into the output buffer, NOT onto the
+       wire: a synchronous send here (the default BIO path) spins an
+       ephemeral AxlLoop, which cannot make progress when the connection is
+       being torn down from inside a resident driver-tick loop (raised TPL)
+       — and that nested loop's source ids collide with the outer loop's
+       (the same hazard as commit adbf5461), silently killing the server's
+       accept source so no further connections are accepted. The alert is
+       advisory; the TCP FIN that follows (axl_tcp_close) plus HTTP's own
+       message framing convey the close. buffered_mode makes tls_bio_send
+       accumulate instead of send; the buffer is freed unsent below. */
+    ctx->buffered_mode = true;
+    ctx->out_len = 0;
     mbedtls_ssl_close_notify(&ctx->ssl);
+
     mbedtls_ssl_free(&ctx->ssl);
     axl_free(ctx->out_buf);
     axl_free(ctx);
@@ -796,6 +1002,23 @@ axl_tls_stage_data(
     ctx->stage_buf = (uint8_t *)data;
     ctx->stage_len = len;
     ctx->stage_off = 0;
+}
+
+bool
+axl_tls_pending(
+    AxlTlsContext *ctx
+    )
+{
+    if (ctx == NULL) {
+        return false;
+    }
+    /* More TLS records from the same TCP segment may still be staged
+       (stage_off < stage_len), or part of the current record may have
+       been decrypted but not yet read (get_bytes_avail). Either way a
+       further axl_tls_read can make progress without new transport
+       input, so the caller must drain before idling on the transport. */
+    return ctx->stage_off < ctx->stage_len
+        || mbedtls_ssl_get_bytes_avail(&ctx->ssl) > 0;
 }
 
 #endif /* AXL_HAVE_TLS */

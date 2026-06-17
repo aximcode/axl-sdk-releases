@@ -245,7 +245,10 @@
     {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT",           "kind": "funcptr"},
     {"name": "EFI_GRAPHICS_OUTPUT_PROTOCOL",               "kind": "struct"},
 
-    {"name": "EFI_EDID_DISCOVERED_PROTOCOL",               "kind": "struct"}
+    {"name": "EFI_EDID_DISCOVERED_PROTOCOL",               "kind": "struct"},
+
+    {"name": "SERIAL_IO_MODE",                            "kind": "struct"},
+    {"name": "EFI_SERIAL_IO_PROTOCOL",                    "kind": "struct"}
   ],
 
   "media.h": [
@@ -283,7 +286,9 @@
 
     {"name": "EFI_RAM_DISK_REGISTER_RAMDISK",   "kind": "funcptr"},
     {"name": "EFI_RAM_DISK_UNREGISTER_RAMDISK", "kind": "funcptr"},
-    {"name": "EFI_RAM_DISK_PROTOCOL",           "kind": "struct"}
+    {"name": "EFI_RAM_DISK_PROTOCOL",           "kind": "struct"},
+
+    {"name": "EFI_BLOCK_IO_MEDIA",              "kind": "struct"}
   ],
 
   "image.h": [

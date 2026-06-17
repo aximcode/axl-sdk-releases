@@ -2,12 +2,13 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-net-dhcp.c
-    Static IP configuration and DHCP auto-init:
-    axl_net_set_static_ip, axl_net_auto_init.
+    Static IP configuration, DHCP auto-init, and the DHCP lease view:
+    axl_net_set_static_ip, axl_net_auto_init, axl_net_get_dhcp_lease.
 **/
 
 #include "../backend/axl-backend.h"
 #include "../event/axl-wait-internal.h"
+#include "axl-net-internal.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
@@ -16,8 +17,15 @@
 #include <axl/axl-net.h>
 #include <axl/axl-wait.h>
 #include <axl/axl-watchdog.h>
+#include <axl/axl-nvstore.h>
 
 AXL_LOG_DOMAIN("net");
+
+/// Vendor namespace for AXL net non-volatile values (hostname).
+static const AxlGuid AXL_NET_NAMESPACE = AXL_GUID(
+    0x7a3e9c14, 0x2b5d, 0x4f86,
+    0x9c, 0x71, 0x3d, 0x8a, 0x6f, 0x21, 0xb4, 0x09);
+#define AXL_NET_NS  "axl-net"
 
 /* IP4Config2 types not in generated UEFI headers */
 typedef struct {
@@ -152,6 +160,250 @@ axl_net_set_static_ip(
                        (unsigned long long)status);
             /* Non-fatal — IP is configured, gateway is optional */
         }
+    }
+
+    return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// DNS / hostname / settle
+// ---------------------------------------------------------------------------
+
+/* Resolve the IP4Config2 protocol for a NIC index (clamps an
+   out-of-range index to the first NIC, matching set_static_ip/auto_init). */
+static EFI_IP4_CONFIG2_PROTOCOL *
+ip4cfg_for_nic(size_t nic_index)
+{
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_protocol_enumerate("ip4-config2", &handles, &count) != AXL_OK
+        || count == 0) {
+        if (handles != NULL) {
+            axl_free(handles);
+        }
+        return NULL;
+    }
+    size_t idx = (nic_index < count) ? nic_index : 0;
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+    axl_efi_call(axl_bs()->HandleProtocol, 3,
+        (EFI_HANDLE)handles[idx], &gEfiIp4Config2ProtocolGuid, (void **)&cfg);
+    axl_free(handles);
+    return cfg;
+}
+
+int
+axl_net_set_dns(size_t nic_index, const uint8_t dns[4], const uint8_t *dns2)
+{
+    if (dns == NULL) {
+        return AXL_ERR;
+    }
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_nic(nic_index);
+    if (cfg == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_IPv4_ADDRESS servers[2];
+    axl_memcpy(&servers[0], dns, 4);
+    size_t nserv = 1;
+    if (dns2 != NULL) {
+        axl_memcpy(&servers[1], dns2, 4);
+        nserv = 2;
+    }
+    EFI_STATUS st = axl_efi_call(cfg->SetData, 4, cfg,
+        Ip4Config2DataTypeDnsServer,
+        (size_t)(nserv * sizeof(EFI_IPv4_ADDRESS)), servers);
+    if (EFI_ERROR(st)) {
+        axl_warning("set_dns: SetData(DnsServer) failed: 0x%llx "
+                    "(DNS is read-only under DHCP policy)",
+                    (unsigned long long)st);
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
+int
+axl_net_set_hostname(const char *name)
+{
+    if (name == NULL || name[0] == '\0' || axl_strlen(name) > 63) {
+        return AXL_ERR;
+    }
+    axl_nvstore_register_namespace(AXL_NET_NS, &AXL_NET_NAMESPACE);
+    return axl_nvstore_set_str(AXL_NET_NS, "Hostname", name,
+                               AXL_NV_PERSISTENT | AXL_NV_BOOT);
+}
+
+int
+axl_net_get_hostname(char *buf, size_t size)
+{
+    if (buf == NULL || size == 0) {
+        return AXL_ERR;
+    }
+    buf[0] = '\0';
+    axl_nvstore_register_namespace(AXL_NET_NS, &AXL_NET_NAMESPACE);
+    char *stored = NULL;
+    if (axl_nvstore_get_str(AXL_NET_NS, "Hostname", &stored) != AXL_OK
+        || stored == NULL) {
+        return AXL_OK;   /* unset is a normal state: "" + AXL_OK */
+    }
+    axl_strlcpy(buf, stored, size);
+    axl_free(stored);
+    return AXL_OK;
+}
+
+/* Read the NIC's current StationAddress from IP4Config2 InterfaceInfo into
+   @p out (4 octets). Returns AXL_OK on success. */
+static int
+read_station_address(EFI_IP4_CONFIG2_PROTOCOL *cfg, uint8_t out[4])
+{
+    size_t info_size = 0;
+    EFI_STATUS st = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &info_size, NULL);
+    if (st != EFI_BUFFER_TOO_SMALL || info_size == 0) {
+        return AXL_ERR;
+    }
+    EFI_IP4_CONFIG2_INTERFACE_INFO *info = axl_backend_alloc(info_size);
+    if (info == NULL) {
+        return AXL_ERR;
+    }
+    st = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypeInterfaceInfo, &info_size, info);
+    if (EFI_ERROR(st)) {
+        axl_backend_free(info);
+        return AXL_ERR;
+    }
+    axl_memcpy(out, &info->StationAddress, 4);
+    axl_backend_free(info);
+    return AXL_OK;
+}
+
+#define AXL_NET_SETTLE_POLL_MS  50u
+
+int
+axl_net_wait_ip_settled(size_t nic_index, const uint8_t *expect_ipv4,
+                        size_t timeout_ms)
+{
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_nic(nic_index);
+    if (cfg == NULL) {
+        return AXL_ERR;
+    }
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    size_t budget = (timeout_ms > 0) ? timeout_ms : 1000;
+    size_t waited = 0;
+    for (;;) {
+        uint8_t station[4] = { 0 };
+        if (read_station_address(cfg, station) == AXL_OK) {
+            bool settled = (expect_ipv4 != NULL)
+                ? (axl_memcmp(station, expect_ipv4, 4) == 0)
+                : (axl_memcmp(station, zero4, 4) != 0);
+            if (settled) {
+                return AXL_OK;
+            }
+        }
+        if (waited >= budget) {
+            return AXL_ERR;
+        }
+        axl_msleep(AXL_NET_SETTLE_POLL_MS);
+        waited += AXL_NET_SETTLE_POLL_MS;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_get_dhcp_lease — the active DHCP-leased config, via IP4Config2
+// ---------------------------------------------------------------------------
+
+/* GetData a variable-size IP4Config2 data type into a freshly allocated
+   buffer (the two-call BUFFER_TOO_SMALL idiom). Caller frees via
+   axl_backend_free. Returns NULL (and *out_size unset) on any failure. */
+static void *
+ip4cfg_getdata(
+    EFI_IP4_CONFIG2_PROTOCOL    *cfg,
+    EFI_IP4_CONFIG2_DATA_TYPE    type,
+    size_t                      *out_size)
+{
+    size_t sz = 0;
+    EFI_STATUS st = axl_efi_call(cfg->GetData, 4, cfg, type, &sz, NULL);
+    if (st != EFI_BUFFER_TOO_SMALL || sz == 0) {
+        return NULL;
+    }
+    void *buf = axl_backend_alloc(sz);
+    if (buf == NULL) {
+        return NULL;
+    }
+    st = axl_efi_call(cfg->GetData, 4, cfg, type, &sz, buf);
+    if (EFI_ERROR(st)) {
+        axl_backend_free(buf);
+        return NULL;
+    }
+    *out_size = sz;
+    return buf;
+}
+
+int
+axl_net_get_dhcp_lease(size_t nic_index, AxlDhcpLease *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    axl_memset(out, 0, sizeof(*out));
+
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_nic(nic_index);
+    if (cfg == NULL) {
+        return AXL_ERR;
+    }
+
+    /* A "lease" requires a DHCP policy — a static NIC has no lease to view. */
+    uint32_t   policy = 0;
+    size_t     psz = sizeof(policy);
+    EFI_STATUS st = axl_efi_call(cfg->GetData, 4, cfg,
+        Ip4Config2DataTypePolicy, &psz, &policy);
+    if (EFI_ERROR(st) || policy != 1) {   /* 1 = DHCP (matches auto_init) */
+        return AXL_ERR;
+    }
+
+    /* Address / mask / default gateway from the live interface info. */
+    size_t info_size = 0;
+    EFI_IP4_CONFIG2_INTERFACE_INFO *info =
+        ip4cfg_getdata(cfg, Ip4Config2DataTypeInterfaceInfo, &info_size);
+    if (info == NULL || info_size < sizeof(*info)) {
+        if (info != NULL) {
+            axl_backend_free(info);
+        }
+        return AXL_ERR;
+    }
+
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    if (axl_memcmp(&info->StationAddress, zero4, 4) == 0) {
+        axl_backend_free(info);   /* DHCP policy but no address leased yet */
+        return AXL_ERR;
+    }
+
+    axl_memcpy(out->address, &info->StationAddress, 4);
+    axl_memcpy(out->subnet,  &info->SubnetMask, 4);
+
+    /* Default gateway = the route-table entry to 0.0.0.0/0. */
+    if (info->RouteTable != NULL) {
+        size_t routes = info->RouteTableSize;
+        for (size_t i = 0; i < routes; i++) {
+            if (axl_memcmp(&info->RouteTable[i].SubnetAddress, zero4, 4) == 0
+                && axl_memcmp(&info->RouteTable[i].SubnetMask, zero4, 4) == 0) {
+                axl_memcpy(out->router, &info->RouteTable[i].GatewayAddress, 4);
+                break;
+            }
+        }
+    }
+    axl_backend_free(info);
+
+    /* DHCP-provided resolver(s). */
+    size_t dns_size = 0;
+    EFI_IPv4_ADDRESS *dns =
+        ip4cfg_getdata(cfg, Ip4Config2DataTypeDnsServer, &dns_size);
+    if (dns != NULL) {
+        size_t n = dns_size / sizeof(EFI_IPv4_ADDRESS);
+        for (size_t i = 0; i < n && out->dns_count < 2; i++) {
+            axl_memcpy(out->dns[out->dns_count], &dns[i], 4);
+            out->dns_count++;
+        }
+        axl_backend_free(dns);
     }
 
     return AXL_OK;
@@ -362,8 +614,8 @@ ip4cfg_addr_acquired(void *ctx)
     return axl_net_get_ip_address(&addr) == AXL_OK;
 }
 
-static void
-net_connect_snp_handles(void)
+void
+_axl_net_connect_snp_handles(void)
 {
     /* Reconnect every SNP handle to make sure the MNP/IP/TCP/UDP stack
      * is bound on top of each NIC. axl_net_ensure_drivers() already ran
@@ -409,7 +661,7 @@ axl_net_drivers_up(void)
      * diagnostic distinction matters to tools that call ensure_drivers
      * directly. */
     axl_net_ensure_drivers();
-    net_connect_snp_handles();
+    _axl_net_connect_snp_handles();
 
     /* Wait for link-up (max 5s, condition polled by AxlWait at 100ms).
        Fast-path: if a link is already up, AxlWait returns AXL_OK without

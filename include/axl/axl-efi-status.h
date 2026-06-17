@@ -34,6 +34,7 @@
 #define AXL_EFI_STATUS_H
 
 #include <stdint.h>
+#include <axl/axl-macros.h>   /* AxlStatus (for the translation helpers below) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,23 @@ typedef uint64_t AxlEfiStatus;
  * caller specifically inspects warning values.
  */
 #define AXL_EFI_ERROR(s)       (((AxlEfiStatus)(s) & AXL_EFI_ERR_BIT_) != 0)
+
+/**
+ * @brief Firmware calling convention attribute (matches UEFI `EFIAPI`).
+ *
+ * The per-arch ABI the firmware uses to call entry points (DriverEntry,
+ * the app entry stub) and any function it invokes directly. Defined here —
+ * uefi-free — so `<axl.h>`'s `AXL_APP` / `AXL_DRIVER` entry-point macros can
+ * emit firmware-ABI entry symbols without pulling `<uefi/...>` into every
+ * consumer of the umbrella. Byte-for-byte identical to `EFIAPI`.
+ */
+#if defined(__x86_64__)
+#define AXL_EFI_ABI  __attribute__((ms_abi))
+#elif defined(__aarch64__)
+#define AXL_EFI_ABI  /* AARCH64 UEFI uses standard AAPCS64 */
+#else
+#error "Unsupported architecture -- AXL requires x86_64 or AARCH64"
+#endif
 
 /* ----- Success ------------------------------------------------ */
 
@@ -92,6 +110,75 @@ typedef uint64_t AxlEfiStatus;
 #define AXL_EFI_SECURITY_VIOLATION   AXL_EFI_ENC_(26)
 #define AXL_EFI_END_OF_MEDIA         AXL_EFI_ENC_(28)
 #define AXL_EFI_END_OF_FILE          AXL_EFI_ENC_(31)
+
+/* ----- AxlStatus <-> AxlEfiStatus translation -------------------------- */
+//
+// Explicit, best-effort mappers between AXL's int status convention
+// (AxlStatus: 0 = OK, negative = failure) and the firmware wire format
+// (AxlEfiStatus / EFI_STATUS). The two enums are deliberately NOT numerically
+// aligned — AxlStatus is a small, coarse, AXL-domain set while EFI carries 30+
+// codes, and AXL's released AXL_CANCELLED/AXL_TIMEOUT occupy the slots EFI's
+// INVALID/UNSUPPORTED would want — so a numeric "negate" trick would be wrong
+// for half the codes. These switches carry the translation instead: explicit,
+// stable across either enum growing, and the only robust anchor is the shared
+// AXL_OK == AXL_EFI_SUCCESS == 0 / "negative <=> AXL_EFI_ERROR set".
+//
+// Both directions are LOSSY by design: to_efi maps AXL's set onto a
+// representative EFI code (the generic AXL_ERR -> AXL_EFI_ABORTED); from_efi
+// collapses EFI's many codes onto AXL's set (unmapped errors -> AXL_ERR, any
+// non-error / warning -> AXL_OK). Codes with a 1:1 peer round-trip cleanly;
+// the generic/abort bucket does not (to_efi(AXL_ERR) -> ABORTED -> AXL_CANCELLED).
+
+/**
+ * @brief Map an AxlStatus to a representative firmware status code.
+ *
+ * For a driver/protocol boundary that must return an EFI_STATUS-shaped value.
+ * @return AXL_EFI_SUCCESS for AXL_OK; the matching AXL_EFI_* code where one
+ *     exists; AXL_EFI_ABORTED for the generic AXL_ERR / any unmapped code.
+ */
+static inline AxlEfiStatus
+axl_status_to_efi(AxlStatus s)
+{
+    switch (s) {
+    case AXL_OK:           return AXL_EFI_SUCCESS;
+    case AXL_CANCELLED:    return AXL_EFI_ABORTED;
+    case AXL_TIMEOUT:      return AXL_EFI_TIMEOUT;
+    case AXL_INVALID:      return AXL_EFI_INVALID_PARAMETER;
+    case AXL_NOT_FOUND:    return AXL_EFI_NOT_FOUND;
+    case AXL_DENIED:       return AXL_EFI_ACCESS_DENIED;
+    case AXL_UNSUPPORTED:  return AXL_EFI_UNSUPPORTED;
+    case AXL_NO_RESOURCES: return AXL_EFI_OUT_OF_RESOURCES;
+    case AXL_IO_ERROR:     return AXL_EFI_DEVICE_ERROR;
+    default:               return AXL_EFI_ABORTED;  /* AXL_ERR + any unmapped */
+    }
+}
+
+/**
+ * @brief Map a firmware status code to an AxlStatus.
+ *
+ * The inverse of axl_status_to_efi. Any non-error code (success or a warning —
+ * top bit clear) becomes AXL_OK; a recognized error maps to its AXL peer; any
+ * other error becomes the generic AXL_ERR.
+ *
+ * @return the AxlStatus peer; AXL_OK for success/warning; AXL_ERR for an
+ *     unmapped error.
+ */
+static inline AxlStatus
+axl_status_from_efi(AxlEfiStatus e)
+{
+    if (!AXL_EFI_ERROR(e)) {
+        return AXL_OK;   /* success or warning — not a failure */
+    }
+    if (e == AXL_EFI_INVALID_PARAMETER) return AXL_INVALID;
+    if (e == AXL_EFI_NOT_FOUND)         return AXL_NOT_FOUND;
+    if (e == AXL_EFI_ACCESS_DENIED)     return AXL_DENIED;
+    if (e == AXL_EFI_UNSUPPORTED)       return AXL_UNSUPPORTED;
+    if (e == AXL_EFI_OUT_OF_RESOURCES)  return AXL_NO_RESOURCES;
+    if (e == AXL_EFI_DEVICE_ERROR)      return AXL_IO_ERROR;
+    if (e == AXL_EFI_TIMEOUT)           return AXL_TIMEOUT;
+    if (e == AXL_EFI_ABORTED)           return AXL_CANCELLED;
+    return AXL_ERR;
+}
 
 #ifdef __cplusplus
 }

@@ -13,6 +13,7 @@
 #include "axl-ipmi-internal.h"
 #include <axl/axl-log.h>
 #include <axl/axl-runtime.h>
+#include "../runtime/axl-signal-internal.h"
 
 AXL_LOG_DOMAIN("ipmi-kcs");
 
@@ -103,7 +104,7 @@ kcs_wait_ibf_clear(KcsCtx *k)
            so Ctrl-C during a stuck-BMC 5 s poll is responsive. */
         axl_backend_stall(KCS_POLL_INTERVAL_US);
         if ((++iters % 100) == 0) {
-            axl_yield();
+            _axl_poll_break();
         }
     }
     axl_error("KCS IBF-clear timeout");

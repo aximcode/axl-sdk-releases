@@ -13,6 +13,7 @@
 AXL_LOG_DOMAIN("http");
 
 static bool on_accept_ready(AxlTcp *client, AxlStatus status, void *data);
+static bool on_tls_handshake_data(AxlTcp *sock, AxlStatus status, void *data);
 
 // ---------------------------------------------------------------------------
 // Configuration descriptors
@@ -127,6 +128,8 @@ axl_http_server_free(AxlHttpServer *s)
 
     axl_free(s->middleware);
     axl_free(s->mw_data);
+    axl_free(s->auth_scheme);
+    axl_free(s->auth_realm);
 
     if (s->cache != NULL) {
         axl_hash_table_free(s->cache);
@@ -242,6 +245,56 @@ axl_http_server_use_auth(AxlHttpServer *s, AxlAuthCallback cb, void *data)
 
     s->auth_cb = cb;
     s->auth_data = data;
+    return AXL_OK;
+}
+
+/* True if @p s contains any character in @p bad. */
+static bool
+str_has_any(const char *s, const char *bad)
+{
+    for (; *s != '\0'; s++) {
+        if (axl_strchr(bad, *s) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int
+axl_http_server_set_auth_challenge(AxlHttpServer *s, const char *scheme,
+                                   const char *realm)
+{
+    if (s == NULL) {
+        return AXL_ERR;
+    }
+    /* Reject characters that would break out of the header or its quoted
+       realm (CR/LF injection, an unescaped quote; whitespace in scheme). */
+    if (scheme != NULL && str_has_any(scheme, "\r\n \t\"")) {
+        return AXL_ERR;
+    }
+    if (realm != NULL && str_has_any(realm, "\r\n\"")) {
+        return AXL_ERR;
+    }
+
+    axl_free(s->auth_scheme);
+    axl_free(s->auth_realm);
+    s->auth_scheme = NULL;
+    s->auth_realm  = NULL;
+
+    if (scheme != NULL) {
+        s->auth_scheme = axl_strdup(scheme);
+        if (s->auth_scheme == NULL) {
+            return AXL_ERR;
+        }
+        if (realm != NULL) {
+            s->auth_realm = axl_strdup(realm);
+            if (s->auth_realm == NULL) {
+                axl_free(s->auth_scheme);
+                s->auth_scheme = NULL;
+                return AXL_ERR;
+            }
+        }
+    }
     return AXL_OK;
 }
 
@@ -416,6 +469,8 @@ on_accept_ready(
             s->conns[i].chunked        = false;
             s->conns[i].chunked_done   = false;
             s->conns[i].keep_alive     = false;
+            s->conns[i].tls_draining   = false;
+            s->conns[i].tls_rearm_wanted = false;
 
             s->conns[i].tls_ctx = NULL;
 
@@ -424,7 +479,11 @@ on_accept_ready(
             axl_debug("accepted connection from %s:%u", s->conns[i].client_addr, remote_port);
 
             //
-            // TLS handshake (if enabled)
+            // TLS handshake (if enabled) — run it ASYNCHRONOUSLY on the
+            // server's own loop. A blocking handshake (recv + send) nests
+            // ephemeral loops, which cannot make progress when accept is
+            // dispatched by a resident AxlService loop; the async path works
+            // under both a top-level axl_loop_run and a resident loop.
             //
             if (s->tls_enabled) {
                 AxlTlsContext *tls = axl_tls_accept(client);
@@ -435,42 +494,26 @@ on_accept_ready(
                     axl_tcp_close(client);
                     return true;  /* keep accepting more clients */
                 }
+                s->conns[i].tls_ctx        = tls;
 
-                /* Blocking handshake — recv data, feed to TLS, repeat */
-                int hs_result = -1;
-                for (int attempt = 0; attempt < 50; attempt++) {
-                    uint8_t hs_buf[4096];
-                    size_t  hs_len = sizeof(hs_buf);
-                    if (axl_tcp_recv(client, hs_buf,
-                                     &hs_len, 200) == AXL_OK && hs_len > 0) {
-                        axl_tls_stage_data(tls, hs_buf, hs_len);
-                    }
-                    int rc = axl_tls_handshake(tls);
-                    if (rc == 0) {
-                        hs_result = 0;
-                        break;
-                    }
-                    if (rc < 0) {
-                        break;
-                    }
-                    /* rc == 1: need more data, loop */
-                }
-
-                if (hs_result != 0) {
-                    axl_warning("TLS handshake failed for %s",
+                /* Receive the first handshake flight (the ClientHello);
+                   on_tls_handshake_data drives the handshake to completion. */
+                if (axl_tcp_recv_async(client, s->conns[i].tls_cipher_buf,
+                                       sizeof(s->conns[i].tls_cipher_buf),
+                                       s->loop, NULL, on_tls_handshake_data,
+                                       &s->conns[i]) != AXL_OK) {
+                    axl_warning("TLS handshake recv arm failed for %s",
                                s->conns[i].client_addr);
                     axl_tls_free(tls);
+                    s->conns[i].tls_ctx = NULL;
                     s->conns[i].active = false;
                     axl_tcp_close(client);
-                    return true;  /* keep accepting more clients */
                 }
-
-                s->conns[i].tls_ctx = tls;
-                axl_debug("TLS handshake complete for %s", s->conns[i].client_addr);
+                return true;  /* keep accepting; handshake continues async */
             }
 
             //
-            // Start receiving header data asynchronously
+            // Plain HTTP: start receiving header data asynchronously
             //
             start_conn_recv(s, &s->conns[i]);
             return true;  /* keep accepting */
@@ -483,4 +526,54 @@ on_accept_ready(
     axl_debug("no free connection slots, rejecting client");
     axl_tcp_close(client);
     return true;  /* keep accepting — next client may find a slot */
+}
+
+// ---------------------------------------------------------------------------
+// on_tls_handshake_data — async TLS server handshake, pumped by s->loop.
+//
+// Each call: stage the received ciphertext, advance the handshake (which
+// sends any ServerHello flight asynchronously on the same loop), and either
+// finish (hand off to start_conn_recv), ask for more data (re-arm recv), or
+// fail (close). This replaces the old blocking recv/send loop so the
+// handshake completes whether the loop is a top-level axl_loop_run or a
+// resident AxlService driver loop.
+// ---------------------------------------------------------------------------
+
+static bool
+on_tls_handshake_data(
+    AxlTcp    *sock,
+    AxlStatus  status,
+    void      *data
+    )
+{
+    HttpConn      *conn = (HttpConn *)data;
+    AxlHttpServer *s    = conn->server;
+
+    if (status != AXL_OK || !s->running || conn->tls_ctx == NULL) {
+        goto fail;
+    }
+
+    size_t bytes = axl_tcp_recv_get_size(sock);
+    if (bytes > 0) {
+        axl_tls_stage_data(conn->tls_ctx, conn->tls_cipher_buf, bytes);
+    }
+
+    int rc = axl_tls_handshake_async(conn->tls_ctx, s->loop);
+    if (rc == 0) {
+        /* Handshake complete — switch to normal request receive. */
+        axl_debug("TLS handshake complete for %s", conn->client_addr);
+        start_conn_recv(s, conn);
+        return false;   /* start_conn_recv arms its own recv */
+    }
+    if (rc > 0) {
+        return true;    /* need more handshake data — re-arm this recv */
+    }
+    axl_warning("TLS handshake failed for %s", conn->client_addr);
+
+fail:
+    /* Same teardown as a request-phase failure: reset_connection frees
+       tls_ctx, closes the socket, and zeroes the slot (and no-ops if the
+       slot is already inactive). */
+    reset_connection(conn);
+    return false;
 }

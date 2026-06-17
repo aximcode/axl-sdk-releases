@@ -206,6 +206,19 @@ axl_log_ring_count(AxlLogRing *ring)
     return axl_ring_buf_get_length(&ring->ring);
 }
 
+void
+axl_log_ring_clear(AxlLogRing *ring)
+{
+    if (ring == NULL) {
+        return;
+    }
+    /* Discard all stored entries. The ring stays attached as a log handler
+       (ring_handler keeps appending), so it's immediately reusable — no
+       detach/re-attach needed. The scratch buffer is staging-only and is
+       reset on the next get()/handler call, so it needs no clearing. */
+    axl_ring_buf_clear(&ring->ring);
+}
+
 bool
 axl_log_ring_get(AxlLogRing *ring, size_t index, AxlLogEntry *entry)
 {

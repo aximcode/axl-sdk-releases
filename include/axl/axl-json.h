@@ -195,6 +195,41 @@ axl_json_get_string(
 );
 
 /**
+ * @brief Read the reader's own value as a string (no key lookup).
+ *
+ * Unlike axl_json_get_string, which looks a key up inside an object, this
+ * decodes the value the reader is currently scoped to. It is meant for a
+ * sub-reader returned by axl_json_array_next (or axl_json_get_object),
+ * whose root token is itself a value — the only way to read a bare-string
+ * array element such as a member of a JWT `aud` array:
+ *
+ * @code
+ * // "aud": ["a", "b", "c"]
+ * AxlJsonArrayIter it; AxlJsonReader elem;
+ * if (axl_json_array_begin(&claims, "aud", &it)) {
+ *     while (axl_json_array_next(&it, &elem)) {
+ *         char a[128];
+ *         if (axl_json_value_string(&elem, a, sizeof(a)) && strcmp(a, want) == 0)
+ *             ...   // membership match
+ *     }
+ * }
+ * @endcode
+ *
+ * A top-level reader from axl_json_parse never qualifies — that parser
+ * rejects a bare-primitive document, so its root is always an object or
+ * array, never a string.
+ *
+ * @return true if the reader's value is a string (decoded into @p value),
+ *     false otherwise (not a string, empty reader, or NULL args).
+ */
+bool
+axl_json_value_string(
+    const AxlJsonReader *r,           ///< reader scoped to a value
+    char                *value,       ///< buffer for string value
+    size_t               value_size   ///< size of @a value buffer
+);
+
+/**
  * @brief Extract an integer value from a parsed JSON object.
  *
  * @return true if found, false if not found or not a number.

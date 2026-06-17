@@ -25,6 +25,7 @@ AXL SDK
    :caption: Modules
 
    modules/mem
+   modules/debug
    modules/math
    modules/format
    modules/str
@@ -57,11 +58,13 @@ AXL SDK
    modules/service
    modules/net
    modules/tls
+   modules/crypto
    modules/sys
    modules/cpu
    modules/port
    modules/boot
    modules/image
+   modules/console-mirror
    modules/mem-phys
    modules/watchdog
    modules/rng
@@ -76,6 +79,12 @@ AXL SDK
    modules/acpi
    modules/pci
    modules/usb
+   modules/block
+   modules/nvme
+   modules/serial
+   modules/fv
+   modules/tpm
+   modules/ramdisk
    modules/smbus
    modules/ipmi
    modules/spd

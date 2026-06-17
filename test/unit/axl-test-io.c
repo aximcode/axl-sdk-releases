@@ -3,6 +3,8 @@
 **/
 
 #include "axl-test.h"
+#include "axl-backend.h"   /* axl_backend_get_monotonic_us (raised-TPL timing) */
+#include <uefi/axl-uefi.h> /* gBS RaiseTPL/RestoreTPL, TPL_CALLBACK */
 
 static inline int
 test_memcmp(const void *a, const void *b, size_t n)
@@ -320,6 +322,83 @@ test_file(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlFileWriter — streaming/incremental writes
+// ---------------------------------------------------------------------------
+
+static void
+test_file_writer(void)
+{
+    const char *p = "fs0:\\axl_wr.tmp";
+    void       *buf;
+    size_t      len;
+
+    axl_file_delete(p);
+
+    /* Create + incremental write + close, then read back. */
+    AxlFileWriter *w = axl_file_writer_open(p, 0);
+    test_check(w != NULL, "writer: open creates a file");
+    int wr = AXL_ERR;
+    if (w != NULL) {
+        wr = axl_file_writer_write(w, "Hello, ", 7);
+        if (axl_file_writer_write(w, "world!", 6) != AXL_OK) {
+            wr = AXL_ERR;
+        }
+    }
+    test_check(wr == AXL_OK, "writer: incremental writes succeed");
+    test_check(w != NULL && axl_file_writer_tell(w) == 13,
+               "writer: tell reports 13 bytes written");
+    test_check(axl_file_writer_close(w) == AXL_OK, "writer: close flushes OK");
+
+    buf = NULL; len = 0;
+    test_check(axl_file_get_contents(p, &buf, &len) == AXL_OK
+               && len == 13 && axl_memcmp(buf, "Hello, world!", 13) == 0,
+               "writer: file content matches what was written");
+    axl_free(buf);
+
+    /* Reopen (flags 0) truncates to empty — shorter content, no tail. */
+    w = axl_file_writer_open(p, 0);
+    if (w != NULL) {
+        (void)axl_file_writer_write(w, "hi", 2);
+    }
+    test_check(axl_file_writer_close(w) == AXL_OK, "writer: reopen + close OK");
+    buf = NULL; len = 0;
+    test_check(axl_file_get_contents(p, &buf, &len) == AXL_OK
+               && len == 2 && axl_memcmp(buf, "hi", 2) == 0,
+               "writer: reopen truncates to empty (no stale tail)");
+    axl_free(buf);
+
+    /* APPEND keeps existing content and starts at EOF. */
+    w = axl_file_writer_open(p, AXL_FILE_WRITER_APPEND);
+    test_check(w != NULL && axl_file_writer_tell(w) == 2,
+               "writer: append opens at EOF (tell == 2)");
+    if (w != NULL) {
+        (void)axl_file_writer_write(w, "!!", 2);
+    }
+    (void)axl_file_writer_close(w);
+    buf = NULL; len = 0;
+    test_check(axl_file_get_contents(p, &buf, &len) == AXL_OK
+               && len == 4 && axl_memcmp(buf, "hi!!", 4) == 0,
+               "writer: append extends the file");
+    axl_free(buf);
+
+    /* EXCL fails on an existing file, succeeds when absent. */
+    test_check(axl_file_writer_open(p, AXL_FILE_WRITER_EXCL) == NULL,
+               "writer: EXCL fails when the file exists");
+    axl_file_delete(p);
+    w = axl_file_writer_open(p, AXL_FILE_WRITER_EXCL);
+    test_check(w != NULL, "writer: EXCL creates when the file is absent");
+    (void)axl_file_writer_close(w);
+
+    /* NULL-safety contract. */
+    test_check(axl_file_writer_close(NULL) == AXL_OK, "writer: close(NULL) is AXL_OK");
+    test_check(axl_file_writer_write(NULL, "x", 1) == AXL_ERR,
+               "writer: write(NULL) is AXL_ERR");
+    test_check(axl_file_writer_tell(NULL) == 0, "writer: tell(NULL) is 0");
+
+    axl_file_delete(p);
+}
+
+// ---------------------------------------------------------------------------
 // Printf via buffer tests
 // ---------------------------------------------------------------------------
 
@@ -581,6 +660,41 @@ test_console_read_key(void)
     axl_console_flush_input();
     axl_console_flush_input();
     test_check(true, "console flush_input: idempotent on empty queue");
+}
+
+// ---------------------------------------------------------------------------
+// axl_console_read_key at raised TPL
+//
+// A bounded read reaches axl_backend_event_wait, which above
+// TPL_APPLICATION cannot use gBS->WaitForEvent (EFI_UNSUPPORTED) — the case
+// when a consumer reads keys from inside an axl_loop_attach_driver pump
+// callback (dispatched at TPL_CALLBACK). Before the CheckEvent-sweep
+// fallback the wait collapsed and returned AXL_ERR INSTANTLY there; now it
+// honors the timeout. With no key injected the *result* is AXL_ERR either
+// way (timeout), so this pins the fix by asserting the call actually WAITED
+// roughly its budget rather than failing immediately.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_read_key_raised_tpl(void)
+{
+    AxlKey   k  = { 0 };
+    uint64_t t0 = axl_backend_get_monotonic_us();
+
+    EFI_TPL old = gBS->RaiseTPL(TPL_CALLBACK);
+    int     rc  = axl_console_read_key(40, &k);   /* 40 ms budget, no key */
+    gBS->RestoreTPL(old);
+
+    uint64_t elapsed = axl_backend_get_monotonic_us() - t0;
+
+    test_check(rc == AXL_ERR,
+               "console read_key: 40ms timeout at TPL_CALLBACK returns -1");
+    /* Pre-fix this is ~0 (instant WaitForEvent failure); post-fix it spins
+       to the timer at ~40 ms. A 20 ms floor cleanly separates the two
+       without flaking on jitter. */
+    test_check(elapsed >= 20000,
+               "console read_key: honored the timeout at TPL_CALLBACK "
+               "(raised-TPL WaitForEvent fallback waited, not instant-fail)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,6 +1813,7 @@ test_io_main(int argc, char **argv)
     test_console();
     test_buffer();
     test_file();
+    test_file_writer();
     test_file_write_atomic();
     test_detect_encoding();
     test_printf();
@@ -1706,6 +1821,7 @@ test_io_main(int argc, char **argv)
     test_stdout_tee();
     test_stderr_tee();
     test_console_read_key();
+    test_console_read_key_raised_tpl();
     test_stdout_raw();
     test_text_stream();
     test_encoding_default_passthrough();

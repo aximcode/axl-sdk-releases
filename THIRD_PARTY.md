@@ -51,6 +51,37 @@ gated behind `AXL_TLS=1`. Being public-domain-or-MIT, stb imposes
 no attribution obligation on redistributed binaries; this entry is
 documentary. No source modifications.
 
+## sdefl / sinfl (DEFLATE codec)
+
+- **Source:** https://github.com/vurtun/lib (`sdefl.h`, `sinfl.h`)
+- **Version shipped:** single-header, Copyright (c) 2020–2023 Micha
+  Mettke. Upstream is unversioned; vendored verbatim.
+- **Vendored path in source tree:** `deps/sdefl/{sdefl.h,sinfl.h}`
+- **Copyright:** Micha Mettke
+- **License:** Dual-licensed under
+  [MIT](https://spdx.org/licenses/MIT.html) **OR**
+  [the Unlicense / public domain](https://spdx.org/licenses/Unlicense.html),
+  at the recipient's option.
+- **Full license text:** at the foot of each header (`ALTERNATIVE A —
+  MIT License` / `ALTERNATIVE B — Public Domain`) — no separate file,
+  the dual-license block ships inline with the source (like stb).
+
+`sdefl.h` (encoder) and `sinfl.h` (decoder) provide the raw-DEFLATE
+(RFC 1951) core behind `AxlCompress` (`<axl/axl-compress.h>`, via
+`src/data/axl-compress.c`); AXL adds the gzip/zlib framing and
+CRC-32 / Adler-32 verification itself (`AxlDigest`), so only the
+`sdeflate` / `sinflate` raw cores are used. `AxlCompress` is compiled
+into **every** `libaxl.a` (not gated by any build flag), but
+`--gc-sections` drops it from any binary that never calls the compress
+API. Among the shipped tools, only `tar` (its `-z` gzip mode) and
+`mkfixture` (gzip HTTP POST of captured fixtures) link it in; every
+other tool GCs it out. Being MIT/public-domain, sdefl imposes no
+attribution obligation on redistributed binaries; this entry is
+documentary. The vendored headers are unmodified — the only build-time
+change is `#define SINFL_NO_SIMD` set by the consuming TU before
+including `sinfl.h`, keeping the decoder portable across freestanding
+x64 / aarch64 (no `<emmintrin.h>` / `<arm_neon.h>` dependency).
+
 ## FreeType (ftgrays — analytic rasterizer)
 
 - **Source:** https://gitlab.freedesktop.org/freetype/freetype
@@ -78,6 +109,14 @@ redistributions must acknowledge FreeType in their documentation —
 ship `AxlGfx` path filling must reproduce that acknowledgment. No
 source modifications were made to the vendored files; the
 `STANDALONE_` integration shim lives in `src/gfx/axl-gfx-rasterize.c`.
+
+Consumers that only **enumerate** displays do not incur the FTL: the
+GOP-inventory / mode-query accessors (`axl_gfx_output_count` / `_get` /
+`_query_mode` / `_get_pixel_bitmask`) live in their own translation unit
+(`src/gfx/axl-gfx-output.c`) with no path-rasterization code, so
+`--gc-sections` keeps `ftgrays` out of a binary that never calls a
+path-fill API. The FTL acknowledgment is required only of products that
+ship `AxlGfx` path filling.
 
 ## DejaVu Sans — built-in default font
 
@@ -149,3 +188,26 @@ under "mere aggregation" (GPL-2.0 §3) — no static linking into our
 binaries. The build is reproducible from the pinned commit; per
 GPL §3(b) the upstream URL + commit hash printed by
 `scripts/build-ipxe.sh` constitutes the "written offer" for source.
+
+## Not part of this distribution
+
+For the avoidance of doubt during license audits, the components listed
+above are the **complete** set of third-party code that AXL vendors and
+redistributes. `deps/` in a working tree may contain other directories
+— `deps/quickjs/`, `deps/lexbor/`, and the spec dirs
+`deps/{uefi,pi,acpi,shell}-spec/` — but these are **not** part of the
+SDK:
+
+- The `.gitignore` excludes everything under `deps/` except the four
+  vendored components (`mbedtls`, `stb`, `freetype`, `sdefl`), so
+  `deps/quickjs/` and `deps/lexbor/` are untracked local checkouts. No
+  AXL source or build rule references them; they are never compiled into
+  `libaxl.a`, never linked into any tool, and absent from every release
+  artifact.
+- `deps/*-spec/` are HTML/PDF specification documents downloaded by
+  `scripts/download-uefi-specs.py` purely as input to the header
+  generator (`scripts/generate-uefi-headers.py`). They are gitignored
+  reference material — not compiled code and not redistributed.
+
+If any of these is ever genuinely vendored and linked, it must be
+whitelisted in `.gitignore` and given an entry above.
