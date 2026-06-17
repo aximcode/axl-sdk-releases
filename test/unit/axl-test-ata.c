@@ -10,7 +10,9 @@
 **/
 
 #include <axl.h>
+#include <uefi/axl-uefi.h>      /* EFI_ATA_PASS_THRU_PROTOCOL */
 #include "axl-test.h"
+#include "axl-ata-internal.h"   /* struct AxlAtaDev, _axl_ata_exec (test seam) */
 
 static void
 put_le16(uint8_t *b, size_t off, uint16_t v)
@@ -205,6 +207,86 @@ test_self_test(void)
                "ata self-test: short buffer -> AXL_ERR");
 }
 
+// ---------------------------------------------------------------------------
+// IoAlign bounce — _axl_ata_exec must hand PassThru aligned Acb/Asb/data
+// ---------------------------------------------------------------------------
+//
+// AtaAtapiPassThru rejects ANY of Acb/Asb/data that violates Mode->IoAlign with
+// EFI_INVALID_PARAMETER before reaching the device. The caller's acb/asb are
+// stack-allocated, so a deep-stack caller could hand over a misaligned one
+// (the bug: a shallow caller passed by luck, SoftBMC's HTTP handler failed).
+// A fake protocol records the alignment of the issued packet and rejects any
+// violation exactly as the firmware does.
+
+static uint32_t g_fake_acb_mod  = 0xFFFFFFFFu;
+static uint32_t g_fake_asb_mod  = 0xFFFFFFFFu;
+static uint32_t g_fake_data_mod = 0xFFFFFFFFu;
+
+static EFI_STATUS EFIAPI
+fake_ata_passthru(EFI_ATA_PASS_THRU_PROTOCOL *This, UINT16 Port,
+                  UINT16 PortMultiplierPort,
+                  EFI_ATA_PASS_THRU_COMMAND_PACKET *Packet, EFI_EVENT Event)
+{
+    (void)Port;
+    (void)PortMultiplierPort;
+    (void)Event;
+    uint32_t align = This->Mode->IoAlign;
+    void *xfer = Packet->InDataBuffer ? Packet->InDataBuffer
+                                      : Packet->OutDataBuffer;
+    g_fake_acb_mod  = (uint32_t)((uintptr_t)Packet->Acb % align);
+    g_fake_asb_mod  = (uint32_t)((uintptr_t)Packet->Asb % align);
+    g_fake_data_mod = xfer ? (uint32_t)((uintptr_t)xfer % align) : 0;
+
+    /* Mimic AtaAtapiPassThru: reject any unaligned buffer up front. */
+    if (g_fake_acb_mod != 0 || g_fake_asb_mod != 0 || g_fake_data_mod != 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+    Packet->Asb->AtaStatus = 0x50;   /* DRDY | DSC, ERR clear -> AXL_OK */
+    return EFI_SUCCESS;
+}
+
+static void
+test_exec_ioalign(void)
+{
+    EFI_ATA_PASS_THRU_MODE     mode  = { .Attributes = 0, .IoAlign = 64 };
+    EFI_ATA_PASS_THRU_PROTOCOL proto = { 0 };
+    proto.Mode     = &mode;
+    proto.PassThru = fake_ata_passthru;
+
+    AxlAtaDev dev = { .p = &proto, .port = 0, .pmport = 0xFFFF };
+
+    /* Force the caller's acb/asb to a deliberately MISALIGNED address (an odd
+       offset is never aligned to an even IoAlign) — the exact deep-stack hazard
+       the raw-pointer path failed on. The fix must bounce all three through
+       IoAlign-satisfying buffers regardless of how the caller's landed. */
+    uint8_t acb_back[sizeof(EFI_ATA_COMMAND_BLOCK) + 1];
+    uint8_t asb_back[sizeof(EFI_ATA_STATUS_BLOCK) + 1];
+    uintptr_t acb_a = (uintptr_t)acb_back | 1u;   /* guaranteed odd */
+    uintptr_t asb_a = (uintptr_t)asb_back | 1u;
+    EFI_ATA_COMMAND_BLOCK *acb = (EFI_ATA_COMMAND_BLOCK *)acb_a;
+    EFI_ATA_STATUS_BLOCK  *asb = (EFI_ATA_STATUS_BLOCK *)asb_a;
+    axl_memset(acb, 0, sizeof(*acb));
+    acb->AtaCommand = 0xEC;   /* IDENTIFY */
+
+    test_check(((uintptr_t)acb % mode.IoAlign) != 0 &&
+               ((uintptr_t)asb % mode.IoAlign) != 0,
+               "ata exec: caller acb/asb are deliberately misaligned (test setup)");
+
+    g_fake_acb_mod = g_fake_asb_mod = g_fake_data_mod = 0xFFFFFFFFu;
+    uint8_t buf[512];   /* one ATA sector */
+    int rc = _axl_ata_exec(&dev, acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
+                           buf, sizeof(buf), asb);
+
+    test_check(g_fake_acb_mod == 0,
+               "ata exec: issued packet Acb satisfies IoAlign");
+    test_check(g_fake_asb_mod == 0,
+               "ata exec: issued packet Asb satisfies IoAlign");
+    test_check(g_fake_data_mod == 0,
+               "ata exec: issued packet data buffer satisfies IoAlign");
+    test_check(rc == AXL_OK,
+               "ata exec: command issues OK despite misaligned caller acb/asb");
+}
+
 static int
 test_ata_main(int argc, char **argv)
 {
@@ -216,6 +298,7 @@ test_ata_main(int argc, char **argv)
     test_identify();
     test_smart();
     test_self_test();
+    test_exec_ioalign();
 
     return test_print_results();
 }

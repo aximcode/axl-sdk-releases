@@ -1412,7 +1412,7 @@ $(BUILDDIR)/axlk-reqlog-server.o: $(KERNEL_POC_DIR)/test/axlk-reqlog-server.c | 
 # Build test applications (all modules)
 # ===================================================================
 
-TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data
+TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data -Isrc/ata
 
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \

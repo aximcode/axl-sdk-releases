@@ -80,6 +80,12 @@ AxlTestNet.efi post-async https://10.0.2.2:${TLS_PORT}/echo async-post-tls
 echo === TEST-GET-SYNC-RTPL ===
 AxlTestNet.efi get-sync-rtpl http://10.0.2.2:${PLAIN_PORT}/hello
 
+echo === TEST-GET-LARGE-SINGLE ===
+AxlTestNet.efi get-size http://10.0.2.2:${PLAIN_PORT}/large?size=1572864
+
+echo === TEST-GET-LARGE-SINGLE-HTTPS ===
+AxlTestNet.efi get-size https://10.0.2.2:${TLS_PORT}/large?size=1572864
+
 echo === TEST-END ===
 reset -s
 NSHEOF
@@ -123,6 +129,12 @@ check_count "async-post-tls" 1 "POST async https body echoed"
 check_count "PASS: http-async-GET" 2 "GET callbacks fired success (http + https)"
 check_count "PASS: http-async-POST" 2 "POST callbacks fired success (http + https)"
 
+# Large single-GET whole-body path (the v2.0.0 gBS->LoadImage-over-HTTP
+# regression: the async core capped a Content-Length body at 1 MiB). A 1.5 MiB
+# GET in one call must return the full, byte-exact body.
+check_count "GET-SIZE-BYTES: 1572864" 2 "large single GET returns the full 1.5 MiB body (http + https)"
+check_count "GET-SIZE-VERIFY: OK" 2 "large single GET body is byte-exact (http + https)"
+
 # The headline of the whole effort: NO nested-loop synchronous-wait warning.
 n_warn=$(grep -c "synchronous wait invoked from inside a loop callback" "$TEST_CLEAN_LOG" || true)
 if [[ "$n_warn" -eq 0 ]]; then
@@ -130,6 +142,30 @@ if [[ "$n_warn" -eq 0 ]]; then
     PASS=$((PASS + 1))
 else
     echo "  FAIL: $n_warn synchronous-wait warning(s) — async nested a loop"
+    FAIL=$((FAIL + 1))
+fi
+
+# Pre-existing v2.0.0 leak (NOT the regression): a raised-TPL sync GET with a
+# Connection: close response (every endpoint here closes) had req_drop_connection
+# take the ASYNC close path on the ephemeral loop, which is freed before the
+# close_event fires — leaking the socket + close-ctx and leaving a caller-owned
+# loop source active. The get-sync-rtpl + get-size modes both run axl_http_get at
+# TPL_CALLBACK, so a clean teardown must emit NEITHER the loop-free orphaned-source
+# error NOR an AxlMem leak.
+n_src=$(grep -c "caller-owned event source" "$TEST_CLEAN_LOG" || true)
+if [[ "$n_src" -eq 0 ]]; then
+    echo "  PASS: no orphaned caller-owned loop source (raised-TPL Connection: close close path)"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: $n_src caller-owned event source leak(s) — raised-TPL close went async"
+    FAIL=$((FAIL + 1))
+fi
+n_leak=$(grep -c "AxlMem leak" "$TEST_CLEAN_LOG" || true)
+if [[ "$n_leak" -eq 0 ]]; then
+    echo "  PASS: no AxlMem leak (raised-TPL Connection: close close path)"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: $n_leak AxlMem leak(s) — raised-TPL sync GET leaked the socket/close-ctx"
     FAIL=$((FAIL + 1))
 fi
 

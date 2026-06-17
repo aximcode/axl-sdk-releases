@@ -90,6 +90,24 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.startswith("/large"):
+            # A large, deterministic, single Content-Length body — byte i is
+            # (i & 0xFF). Drives the one-shot whole-body GET path (the
+            # gBS->LoadImage-over-AxlFsProvider regression: a >1 MiB GET was
+            # capped at 1 MiB in the async core). Size via ?size=N (default
+            # 1.5 MiB, comfortably over the old 1 MiB cap).
+            from urllib.parse import urlparse, parse_qs
+
+            q = parse_qs(urlparse(self.path).query)
+            n = int(q.get("size", ["1572864"])[0])
+            body = bytes((i & 0xFF) for i in range(n))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(n))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/hello":
             body = json.dumps({"message": "hello from host"}).encode()
             self.send_response(200)

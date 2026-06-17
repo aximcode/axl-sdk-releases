@@ -4283,6 +4283,19 @@ run_http_async_mode(const char *method, const char *url, const char *body)
         axl_printf("FAIL: http-async-timeout\n");
     }
 
+    /* Drain before teardown — modeling a real reactive consumer. The response
+       arrived via the callback, but a Connection: close response left an
+       in-flight async tcp4 Close registered on this loop; it finalizes on a
+       LATER pump tick (the firmware TCP4 timer runs while the pump yields TPL
+       between ticks — axl-tcp-sync.c's documented async-close contract). Tearing
+       the loop down the instant the response lands would free it with that close
+       still pending (the "caller-owned event source still active" warning + a
+       socket/close-ctx leak). A continuously-running service never hits this; a
+       one-shot must let the loop idle until the close drains. */
+    for (int i = 0; i < 20; i++) {
+        axl_msleep(50);
+    }
+
     axl_loop_detach_driver(loop);
     axl_http_client_free(c);
     axl_loop_free(loop);
@@ -4334,6 +4347,75 @@ run_get_sync_rtpl_mode(const char *url)
 
     axl_http_client_free(c);
     return (rc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Large single-GET mode — "get-size <url>". Reproduces the v2.0.0 regression
+// (gBS->LoadImage of a ~1 MB .efi over an AxlFsProvider-over-HTTP volume hung):
+// the async core capped a Content-Length response body at 1 MiB. This sync
+// axl_http_get of the whole body in ONE call, at TPL_CALLBACK (the consumer's
+// EFI_FILE_PROTOCOL.Read / LoadImage context), must return the FULL body. The
+// host /large endpoint serves a deterministic body (byte i == i & 0xFF), so we
+// verify size AND content (catches truncation/corruption, not just the cap).
+// ---------------------------------------------------------------------------
+
+static int
+run_get_size_mode(const char *url)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    if (axl_strncmp(url, "https://", 8) == 0) {
+        if (!axl_tls_available() || axl_tls_init() != AXL_OK) {
+            axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+            return 1;
+        }
+    }
+
+    AxlHttpClient *c = axl_http_client_new();
+    if (c == NULL) {
+        axl_printf("ERROR: client alloc failed\n");
+        return 1;
+    }
+    /* Generous bound — a large body legitimately takes longer, but a wedge
+       still fails the harness in time rather than hanging it. */
+    axl_http_client_set(c, "timeout.ms", "20000");
+
+    axl_printf("GET-SIZE: GET %s at TPL_CALLBACK\n", url);
+
+    EFI_TPL old = gBS->RaiseTPL(TPL_CALLBACK);
+    AxlHttpClientResponse *resp = NULL;
+    int rc = axl_http_get(c, url, &resp);
+    gBS->RestoreTPL(old);
+
+    int ret = 1;
+    if (rc == AXL_OK && resp != NULL) {
+        size_t n = resp->body_size;
+        const uint8_t *b = (const uint8_t *)resp->body;
+        size_t bad = (size_t)-1;
+        for (size_t i = 0; i < n; i++) {
+            if (b[i] != (uint8_t)(i & 0xFF)) {
+                bad = i;
+                break;
+            }
+        }
+        axl_printf("GET-SIZE-STATUS: %u\n", (unsigned)resp->status_code);
+        axl_printf("GET-SIZE-BYTES: %zu\n", n);
+        if (bad == (size_t)-1) {
+            axl_printf("GET-SIZE-VERIFY: OK\n");
+            axl_printf("PASS: http-get-size\n");
+            ret = 0;
+        } else {
+            axl_printf("GET-SIZE-VERIFY: CORRUPT@%zu\n", bad);
+            axl_printf("FAIL: http-get-size (corrupt)\n");
+        }
+        axl_http_client_response_free(resp);
+    } else {
+        axl_printf("GET-SIZE-RC: %d\n", rc);
+        axl_printf("FAIL: http-get-size (rc=%d)\n", rc);
+    }
+
+    axl_http_client_free(c);
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -5868,6 +5950,10 @@ test_net_main(
 
     if (argc >= 3 && axl_strcmp(argv[1], "get-sync-rtpl") == 0) {
         return run_get_sync_rtpl_mode(argv[2]);
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "get-size") == 0) {
+        return run_get_size_mode(argv[2]);
     }
 
     if (argc >= 4 && axl_strcmp(argv[1], "tcp-connect-rtpl") == 0) {

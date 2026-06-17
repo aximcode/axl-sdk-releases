@@ -86,8 +86,11 @@ _axl_http_build_request(
 
 /* Internal async request entry — the public axl_http_get_async/post_async and
    every sync wrapper funnel through this. Adds @p method + @p extra_headers
-   (borrowed until the callback) to the public async contract. Defined in
-   axl-http-client-async.c. */
+   (borrowed until the callback) to the public async contract. @p sync_close is
+   set ONLY by the sync wrapper: its loop is ephemeral, so a connection drop must
+   complete the close inline (clear async_loop → axl_tcp_close's loop-free
+   fallback) rather than register a close_event on a loop freed before it fires.
+   Defined in axl-http-client-async.c. */
 int
 _axl_http_request_async(
     AxlHttpClient        *c,
@@ -100,7 +103,8 @@ _axl_http_request_async(
     AxlHashTable         *extra_headers,
     AxlCancellable       *cancel,
     AxlHttpClientDoneFn   cb,
-    void                 *user);
+    void                 *user,
+    bool                  sync_close);
 
 /* Synchronous request — the single ephemeral-loop wrapper over the async core
    that all sync entry points (get/post/put/delete/request) share. Spins a

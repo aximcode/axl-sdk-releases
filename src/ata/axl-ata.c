@@ -9,9 +9,9 @@
     once with a two-level walk (LocateHandleBuffer -> GetNextPort ->
     GetNextDevice) and cached for the image lifetime; axl_ata_next returns
     opaque AxlAtaDev pointers into that cache. The typed readers (IDENTIFY,
-    SMART, self-test) issue a command via ata_exec() and hand the buffer to
-    the pure decoders in axl-ata-decode.c. ata_exec bounces data through an
-    IoAlign-satisfying buffer.
+    SMART, self-test) issue a command via _axl_ata_exec() and hand the buffer
+    to the pure decoders in axl-ata-decode.c. _axl_ata_exec bounces the command,
+    status, and data buffers through IoAlign-satisfying allocations.
 **/
 
 #include "../backend/axl-backend.h"
@@ -21,6 +21,7 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>     /* axl_memcpy / axl_memset */
 #include <axl/axl-ata.h>
+#include "axl-ata-internal.h"  /* struct AxlAtaDev, _axl_ata_exec */
 
 #define ATA_CMD_IDENTIFY        0xEC
 #define ATA_CMD_SMART           0xB0
@@ -37,12 +38,6 @@
    controller that never reports EFI_NOT_FOUND. A SATA port multiplier
    tops out at 15 devices; this is generous headroom. */
 #define ATA_MAX_DEVICES_PER_PORT  4096u
-
-struct AxlAtaDev {
-    EFI_ATA_PASS_THRU_PROTOCOL *p;
-    uint16_t                    port;
-    uint16_t                    pmport;
-};
 
 static struct AxlAtaDev *g_devs  = NULL;
 static size_t            g_count = 0;
@@ -175,34 +170,61 @@ axl_ata_get_address(const AxlAtaDev *dev, uint16_t *port, uint16_t *pmport)
 // Command execution
 // ---------------------------------------------------------------------------
 
+/* Allocate @p len bytes aligned to @p align (>= 1). Returns the aligned
+   pointer; stores the raw allocation base in @p *base (pass to axl_free).
+   Returns NULL on OOM (and sets *base NULL). */
+static void *
+ata_aligned_alloc(size_t len, uint32_t align, void **base)
+{
+    uint8_t *raw = axl_malloc(len + (align > 1 ? align : 0));
+    *base = raw;
+    if (raw == NULL || align <= 1) {
+        return raw;
+    }
+    uintptr_t a = ((uintptr_t)raw + (align - 1)) & ~((uintptr_t)align - 1);
+    return (void *)a;
+}
+
 /* Issue one task-file command. @p efi_proto is the EFI pass-thru protocol
    (PIO_DATA_IN / PIO_DATA_OUT / NON_DATA); the data direction is derived
-   from it. Bounces @p data through an IoAlign-satisfying buffer. Fills
-   @p asb (status block). Returns AXL_OK on transport success with the ATA
-   ERR bit clear. */
-static int
-ata_exec(const AxlAtaDev *d, EFI_ATA_COMMAND_BLOCK *acb, uint8_t efi_proto,
-         void *data, size_t data_len, EFI_ATA_STATUS_BLOCK *asb)
+   from it. Fills @p asb (status block). Returns AXL_OK on transport success
+   with the ATA ERR bit clear.
+
+   AtaAtapiPassThru (the EDK2 driver) rejects a command whose Acb, Asb, OR data
+   buffer is not aligned to Mode->IoAlign with EFI_INVALID_PARAMETER, before the
+   device is ever reached. The caller's acb/asb are typically stack-allocated,
+   so their alignment depends on the caller's stack depth — a shallow caller is
+   aligned by luck, a deep one (e.g. an HTTP handler several frames down) is not.
+   Bounce ALL THREE through IoAlign-satisfying buffers so the command issues
+   regardless of how the caller's buffers landed. */
+int
+_axl_ata_exec(const AxlAtaDev *d, EFI_ATA_COMMAND_BLOCK *acb, uint8_t efi_proto,
+              void *data, size_t data_len, EFI_ATA_STATUS_BLOCK *asb)
 {
     EFI_ATA_PASS_THRU_PROTOCOL *p = d->p;
     bool data_in  = (efi_proto == EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN);
     bool data_out = (efi_proto == EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_OUT);
+    uint32_t align = (p->Mode != NULL && p->Mode->IoAlign > 1)
+                         ? p->Mode->IoAlign : 1;
 
-    uint8_t *raw  = NULL;
-    uint8_t *xfer = NULL;
+    void *acb_base = NULL, *asb_base = NULL, *data_base = NULL;
+    EFI_ATA_COMMAND_BLOCK *acb_io =
+        ata_aligned_alloc(sizeof(*acb_io), align, &acb_base);
+    EFI_ATA_STATUS_BLOCK *asb_io =
+        ata_aligned_alloc(sizeof(*asb_io), align, &asb_base);
+    uint8_t *xfer = (data_len > 0)
+                        ? ata_aligned_alloc(data_len, align, &data_base)
+                        : NULL;
+    if (acb_io == NULL || asb_io == NULL || (data_len > 0 && xfer == NULL)) {
+        axl_free(acb_base);
+        axl_free(asb_base);
+        axl_free(data_base);
+        return AXL_ERR;
+    }
+
+    axl_memcpy(acb_io, acb, sizeof(*acb_io));   /* command in */
+    axl_memset(asb_io, 0, sizeof(*asb_io));
     if (data_len > 0) {
-        uint32_t align = (p->Mode != NULL && p->Mode->IoAlign > 1)
-                             ? p->Mode->IoAlign : 1;
-        raw = axl_malloc(data_len + align);
-        if (raw == NULL) {
-            return AXL_ERR;
-        }
-        xfer = raw;
-        if (align > 1) {
-            uintptr_t a = ((uintptr_t)raw + (align - 1))
-                          & ~((uintptr_t)align - 1);
-            xfer = (uint8_t *)a;
-        }
         if (data_out) {
             axl_memcpy(xfer, data, data_len);
         } else {
@@ -211,8 +233,8 @@ ata_exec(const AxlAtaDev *d, EFI_ATA_COMMAND_BLOCK *acb, uint8_t efi_proto,
     }
 
     EFI_ATA_PASS_THRU_COMMAND_PACKET pkt = { 0 };
-    pkt.Asb      = asb;
-    pkt.Acb      = acb;
+    pkt.Asb      = asb_io;
+    pkt.Acb      = acb_io;
     pkt.Timeout  = ATA_TIMEOUT_NS;
     pkt.Protocol = efi_proto;
     if (data_len > 0) {
@@ -231,12 +253,16 @@ ata_exec(const AxlAtaDev *d, EFI_ATA_COMMAND_BLOCK *acb, uint8_t efi_proto,
     EFI_STATUS s = axl_efi_call(p->PassThru, 5, p, d->port, d->pmport,
                                 &pkt, NULL);
 
+    axl_memcpy(asb, asb_io, sizeof(*asb));       /* status out */
+
     int rc = (!EFI_ERROR(s) && (asb->AtaStatus & ATA_STATUS_ERR) == 0)
                  ? AXL_OK : AXL_ERR;
     if (rc == AXL_OK && data_in && data_len > 0) {
         axl_memcpy(data, xfer, data_len);
     }
-    axl_free(raw);
+    axl_free(acb_base);
+    axl_free(asb_base);
+    axl_free(data_base);
     return rc;
 }
 
@@ -268,7 +294,7 @@ axl_ata_identify(AxlAtaDev *dev, AxlAtaIdentify *out)
     acb.AtaCommand     = ATA_CMD_IDENTIFY;
     acb.AtaSectorCount = 1;
     uint8_t buf[ATA_SECTOR_LEN];
-    if (ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
+    if (_axl_ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
                  buf, sizeof(buf), &asb) != AXL_OK) {
         return AXL_ERR;
     }
@@ -287,12 +313,12 @@ axl_ata_smart(AxlAtaDev *dev, AxlAtaSmart *out)
     uint8_t thresh[ATA_SECTOR_LEN];
 
     ata_smart_acb(&acb, ATA_SMART_READ_DATA, 0);
-    if (ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
+    if (_axl_ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
                  data, sizeof(data), &asb) != AXL_OK) {
         return AXL_ERR;
     }
     ata_smart_acb(&acb, ATA_SMART_READ_THRESH, 0);
-    if (ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
+    if (_axl_ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
                  thresh, sizeof(thresh), &asb) != AXL_OK) {
         return AXL_ERR;
     }
@@ -315,7 +341,7 @@ axl_ata_self_test_start(AxlAtaDev *dev, AxlAtaSelfTest kind)
     EFI_ATA_COMMAND_BLOCK acb = { 0 };
     EFI_ATA_STATUS_BLOCK  asb = { 0 };
     ata_smart_acb(&acb, ATA_SMART_EXEC_OFFLINE, subcmd);
-    return ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_ATA_NON_DATA,
+    return _axl_ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_ATA_NON_DATA,
                     NULL, 0, &asb);
 }
 
@@ -329,7 +355,7 @@ axl_ata_self_test_result(AxlAtaDev *dev, AxlAtaSelfTestResult *out)
     EFI_ATA_STATUS_BLOCK  asb = { 0 };
     uint8_t data[ATA_SECTOR_LEN];
     ata_smart_acb(&acb, ATA_SMART_READ_DATA, 0);
-    if (ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
+    if (_axl_ata_exec(dev, &acb, EFI_ATA_PASS_THRU_PROTOCOL_PIO_DATA_IN,
                  data, sizeof(data), &asb) != AXL_OK) {
         return AXL_ERR;
     }
@@ -372,7 +398,7 @@ axl_ata_passthru(AxlAtaDev *dev, const AxlAtaCmd *cmd, AxlAtaProtocol proto,
     acb.AtaCylinderLowExp  = cmd->lba_mid_exp;
     acb.AtaCylinderHighExp = cmd->lba_high_exp;
 
-    int rc = ata_exec(dev, &acb, efi_proto, data, data_len, &asb);
+    int rc = _axl_ata_exec(dev, &acb, efi_proto, data, data_len, &asb);
 
     if (out_result != NULL) {
         out_result->status       = asb.AtaStatus;

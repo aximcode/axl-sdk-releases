@@ -3,6 +3,57 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.0.1 — 2026-06-17
+
+### Fixed
+
+- **A large single HTTP GET (a whole multi-MB body in one `axl_http_get`) no
+  longer fails/wedges** (regression in v2.0.0). When the sync client started
+  wrapping the async core, the async receive path capped a Content-Length
+  response **body** at 1 MiB, so a ~1 MB single GET — e.g. `gBS->LoadImage`
+  reading a whole `.efi` over an AxlFsProvider-over-HTTP mount — returned
+  `AXL_ERR` mid-body, wedging the caller's read loop. The async core now
+  pre-reserves the response buffer to exactly the declared Content-Length in one
+  allocation (mirroring the pre-v2.0.0 path) and lets the body grow to its full
+  size, bounded only by a generous 256 MiB OOM-by-declaration ceiling; the old
+  1 MiB constant now correctly guards only header accumulation. Also hardened the
+  TLS receive path to complete a body even when the server coalesces the final
+  TLS record and the close-notify alert into one TCP segment. Regression test:
+  `test-http-async-qemu.sh` now GETs a 1.5 MiB body in one call (http + https)
+  and verifies it byte-for-byte. Reported by the axl-webfs mount driver.
+
+- **A raised-TPL sync HTTP GET with a `Connection: close` response no longer
+  leaks the socket** (pre-existing since v2.0.0). When the sync client wraps the
+  async core, the per-request connection drop ran `axl_tcp_close` from inside the
+  ephemeral loop's own dispatch; the async close registered a completion event on
+  that loop, which is freed the moment the request returns — so at a raised TPL
+  (the `gBS->LoadImage`-over-HTTP context, where the firmware notify is starved)
+  the close never finalized, orphaning a loop source and leaking the socket +
+  close context. `axl_tcp_close`'s synchronous fallback now completes the close
+  **loop-free** (drives `tcp4->Poll()` + polls the close event directly) whenever
+  it is reached from inside a loop callback, instead of spinning up a nested
+  `axl_loop_new()` — which both leaked the source and would re-introduce the
+  nested-loop re-entrancy warning the async model removed. The genuine async
+  close path (a persistent service loop) is unchanged; it drains between pump
+  ticks. Regression test: `test-http-async-qemu.sh` asserts a raised-TPL sync GET
+  leaves no orphaned loop source and no `AxlMem` leak.
+
+- **ATA/SATA SMART + IDENTIFY no longer fail intermittently from a deep call
+  stack** (`<axl/axl-ata.h>`, new in 2.0.0). `ata_exec()` aligned the data
+  buffer to the controller's `Mode->IoAlign` but passed the command (`Acb`) and
+  status (`Asb`) blocks as raw stack pointers. EDK2's
+  `EFI_ATA_PASS_THRU_PROTOCOL.PassThru` (AtaAtapiPassThru) requires **all three**
+  buffers to satisfy `IoAlign` and rejects an unaligned one with
+  `EFI_INVALID_PARAMETER` before the device is reached — so whether
+  `axl_ata_identify` / `axl_ata_smart` / `axl_ata_self_test_start` worked
+  depended on the caller's stack depth: a shallow caller (`smart` CLI) was
+  aligned by luck, a deep one (an HTTP request handler several frames down)
+  failed. The command/status/data buffers are now all bounced through
+  `IoAlign`-satisfying allocations. No API change. Regression test:
+  `axl-test-ata.c` drives `_axl_ata_exec` against a fake pass-thru with a
+  deliberately misaligned caller `Acb`/`Asb` and asserts the issued packet's
+  three buffers are all `% IoAlign == 0`. Reported by the SoftBMC storage module.
+
 ## 2.0.0 — 2026-06-16
 
 ### Added

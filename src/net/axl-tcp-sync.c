@@ -24,6 +24,16 @@
 
 AXL_LOG_DOMAIN("tcp");
 
+/* Forward-declared exactly as src/event/axl-wait.c does — _axl_loop_in_callback
+   lives in the src/loop-only axl-loop-internal.h, which src/net cannot include.
+   True when a loop is dispatching somewhere in this (single-threaded) call
+   stack; used to pick the loop-FREE close-completion below. */
+bool _axl_loop_in_callback(void);
+
+/* 10 ms Poll cadence between close-completion checks — matches the Tier-4
+   per-protocol wait helpers (axl-net-wait.c). */
+#define AXL_TCP_CLOSE_POLL_US  10000ULL
+
 typedef struct {
     AxlTcp    *sock;
     AxlStatus  status;
@@ -647,6 +657,34 @@ on_close_event(void *data)
     return AXL_SOURCE_REMOVE;
 }
 
+/* Loop-FREE close completion: drive tcp4->Poll() and poll the close_event
+   directly until it signals or the deadline passes. Unlike _axl_tcp_wait (which
+   spins up an ephemeral axl_loop_new() to multiplex event+timeout+tick), this
+   nests NO loop — so it is safe from inside a loop dispatch (a sync request's
+   ephemeral-loop callback, the connect-fail/cancel teardown) at a raised TPL:
+   it neither nests a second loop (the re-entrancy artifact the async effort
+   removed) nor leaves a close-event source on a loop that is freed before the
+   close completes (the leak). It dispatches no loop sources, so it cannot
+   re-enter the caller's loop either. The close is short-lived — a passive
+   Connection: close signals almost immediately; @p timeout_us only guards a
+   stuck active close. */
+static void
+close_wait_inline(EFI_TCP4_PROTOCOL *tcp4, EFI_EVENT close_event,
+                  uint64_t timeout_us)
+{
+    /* Bound by iteration count (timeout / poll cadence), not a wall clock, so a
+       failed monotonic read can never turn this into an unbounded spin. */
+    uint64_t max_iters = (timeout_us / AXL_TCP_CLOSE_POLL_US) + 1;
+    for (uint64_t i = 0; i < max_iters; i++) {
+        axl_efi_call(tcp4->Poll, 1, tcp4);
+        int rc = axl_backend_event_check((AxlEventHandle)close_event);
+        if (rc <= 0) {
+            return;  /* 0 = close completed; <0 = bad handle, don't spin */
+        }
+        axl_backend_stall(AXL_TCP_CLOSE_POLL_US);
+    }
+}
+
 void
 axl_tcp_close(AxlTcp *sock)
 {
@@ -814,7 +852,23 @@ axl_tcp_close(AxlTcp *sock)
     /* Sync fallback (loop not running, or registration failed). 3 s
        covers TIME_WAIT for active close; passive close signals
        immediately so the wait usually returns much sooner. */
-    (void)_axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
+    if (_axl_loop_in_callback()) {
+        /* A loop is already dispatching in this call stack — a sync request's
+           ephemeral-loop callback (axl-http-client-async.c clears async_loop on
+           the drop path), or the connect-fail/cancel teardown in
+           axl-tcp-async.c. The loop-based _axl_tcp_wait would axl_loop_new() a
+           SECOND loop nested in the first: the re-entrancy artifact the async
+           effort removed, plus a close-event source that outlives the ephemeral
+           loop (the leak). Complete the close loop-free instead. */
+        close_wait_inline(sock->tcp4, close_event, 3000ULL * 1000ULL);
+    } else {
+        /* No loop dispatching in this call stack (e.g. axl_http_client_free /
+           an explicit axl_tcp_close after a sync call has already returned):
+           the loop-based wait sleeps on WaitForEvent between Poll ticks rather
+           than busy-polling. (A sync request's OWN drop-close runs inside its
+           ephemeral loop's dispatch, so it takes the inline branch above.) */
+        (void)_axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
+    }
     finalize_close_ctx(ctx);
 }
 

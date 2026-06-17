@@ -40,9 +40,20 @@ AXL_LOG_DOMAIN("http");
 // Request state
 // ---------------------------------------------------------------------------
 
-/* Per-hop receive cap — a response whose headers (or, for the connection-close
-   case, whole body) exceed this is rejected rather than grown without bound. */
-#define HTTP_ASYNC_RX_MAX  (1u << 20)   /* 1 MiB */
+/* Header-accumulation cap — a response whose status line + headers don't end
+   (no CRLFCRLF) within this is rejected rather than grown without bound. Headers
+   are tiny in practice; this only fires on a malformed/hostile response. */
+#define HTTP_ASYNC_HDR_MAX  (1u << 20)   /* 1 MiB of headers = malformed */
+
+/* Whole-body sanity ceiling. A KNOWN Content-Length body is allowed to grow to
+   its declared size (the response buffer is pre-reserved to exactly that, so an
+   absurd declaration fails the one allocation cleanly — like the old sync
+   do_request's malloc(content_len)); this ceiling rejects an absurd declaration
+   up front and bounds the unknown-size (chunked) case. 256 MiB is far above any
+   realistic firmware image / API response the client fetches, so it does not
+   bite real use — it is purely an OOM-by-declaration guard. (The earlier 1 MiB
+   cap here silently truncated a ~1 MB gBS->LoadImage GET to an error.) */
+#define HTTP_ASYNC_BODY_MAX  (256u * 1024u * 1024u)
 
 typedef struct {
     AxlHttpClient        *client;
@@ -90,6 +101,8 @@ typedef struct {
     AxlSourceId           timeout_source;  /* IDLE deadline (re-armed on progress) */
     uint32_t              idle_ms;         /* the per-phase idle bound */
     bool                  finished;
+    bool                  sync_close;      /* sync wrapper: complete connection
+                                              drops inline (loop is ephemeral) */
 } HttpAsyncReq;
 
 /* req_process return codes. */
@@ -127,6 +140,20 @@ req_drop_connection(HttpAsyncReq *req)
         c->tls_ctx = NULL;
     }
     if (c->sock != NULL) {
+        /* A sync request drops the connection (Connection: close / error /
+           redirect) from INSIDE its ephemeral loop's dispatch. The async ops
+           stamped sock->async_loop with that loop, so axl_tcp_close would
+           register a close_event on it and return — but the loop is freed the
+           moment axl_loop_run unwinds (and at a raised TPL the firmware notify
+           is starved, so the event never fires first), orphaning the source and
+           leaking the socket + close-ctx. Clear async_loop so axl_tcp_close
+           takes its sync fallback, which (since we are in a loop callback)
+           completes the close loop-free — no nested loop, no orphaned source.
+           Genuine async requests keep the non-blocking async close on the
+           consumer's persistent loop (it drains there between pump ticks). */
+        if (req->sync_close) {
+            c->sock->async_loop = NULL;
+        }
         axl_tcp_close(c->sock);
         c->sock = NULL;
     }
@@ -336,7 +363,7 @@ req_process(HttpAsyncReq *req)
     if (req->header_end == 0) {
         size_t he = axl_http_find_header_end((char *)req->rx, req->rx_len);
         if (he == 0) {
-            return (req->rx_len >= HTTP_ASYNC_RX_MAX) ? REQ_ERROR : REQ_NEED_MORE;
+            return (req->rx_len >= HTTP_ASYNC_HDR_MAX) ? REQ_ERROR : REQ_NEED_MORE;
         }
         req->header_end = he;
 
@@ -380,6 +407,29 @@ req_process(HttpAsyncReq *req)
         req->chunked     = (te != NULL && axl_strcasecmp(te, "chunked") == 0);
         req->content_len = axl_http_get_content_length(req->resp_headers);
         req->have_framing = true;
+
+        /* For a known Content-Length: reject an absurd declaration up front, then
+           pre-reserve the response buffer to exactly header_end + content_len in
+           ONE allocation (so a huge-but-bogus length fails cleanly here rather
+           than growing by doubling, and a legitimate multi-MB body — e.g. a
+           gBS->LoadImage whole-image read — is NOT capped). */
+        if (!req->chunked && req->content_len > 0) {
+            if (req->content_len > HTTP_ASYNC_BODY_MAX) {
+                axl_error("response Content-Length %llu exceeds the %u-byte cap",
+                          (unsigned long long)req->content_len,
+                          (unsigned)HTTP_ASYNC_BODY_MAX);
+                return REQ_ERROR;
+            }
+            size_t want = req->header_end + req->content_len;
+            if (want > req->rx_cap) {
+                uint8_t *nb = axl_realloc(req->rx, want);
+                if (nb == NULL) {
+                    return REQ_ERROR;
+                }
+                req->rx     = nb;
+                req->rx_cap = want;
+            }
+        }
     }
 
     /* 2. Body completeness. */
@@ -393,13 +443,18 @@ req_process(HttpAsyncReq *req)
         if (rc == REQ_COMPLETE) {
             req->resp_body      = decoded;
             req->resp_body_size = dsize;
+        } else if (rc == REQ_NEED_MORE && req->rx_len >= HTTP_ASYNC_BODY_MAX) {
+            /* Chunked has no declared size — bound the accumulation. */
+            return REQ_ERROR;
         }
         return rc;
     }
 
     if (req->content_len > 0) {
+        /* The body grows to the declared Content-Length (the buffer was
+           pre-reserved + ceiling-checked at framing) — no separate cap. */
         if (body_avail < req->content_len) {
-            return (req->rx_len >= HTTP_ASYNC_RX_MAX) ? REQ_ERROR : REQ_NEED_MORE;
+            return REQ_NEED_MORE;
         }
         req->resp_body = axl_memdup(req->rx + req->header_end, req->content_len);
         if (req->resp_body == NULL) {
@@ -592,10 +647,18 @@ on_app_recv(AxlTcp *sock, AxlStatus status, void *data)
             if (rc == 1) {
                 break;          /* WANT_READ — staging drained */
             }
-            /* rc < 0: close-notify / mbedtls error. The connection is done, so
-               finish from what we have (a connection-close-framed body) or
-               replay/fail — either way the recv must not re-arm. */
-            on_recv_eof(req);
+            /* rc < 0: close-notify / mbedtls error. We've drained all the
+               plaintext the staged ciphertext yields, and the body may already
+               be complete — a server can coalesce the final TLS record and the
+               close-notify alert into ONE TCP segment, so this read sees the
+               close right after the last data we just appended. Check
+               completion FIRST (req_advance returns false once it completes /
+               fails / redirects); only a body that is still short here is a
+               genuine truncation (on_recv_eof). The recv must not re-arm either
+               way. */
+            if (req_advance(req)) {
+                on_recv_eof(req);
+            }
             return false;
         }
     } else {
@@ -967,7 +1030,7 @@ _axl_http_request_async(AxlHttpClient *c, AxlLoop *loop, const char *method,
                         const char *url, const void *body, size_t size,
                         const char *content_type, AxlHashTable *extra_headers,
                         AxlCancellable *cancel, AxlHttpClientDoneFn cb,
-                        void *user)
+                        void *user, bool sync_close)
 {
     if (c == NULL || loop == NULL || url == NULL || method == NULL) {
         return AXL_ERR;
@@ -982,6 +1045,7 @@ _axl_http_request_async(AxlHttpClient *c, AxlLoop *loop, const char *method,
     }
     req->client        = c;
     req->loop          = loop;
+    req->sync_close    = sync_close;
     req->cancel        = cancel;
     req->cb            = cb;
     req->user          = user;
@@ -1043,7 +1107,7 @@ axl_http_get_async(AxlHttpClient *c, AxlLoop *loop, const char *url,
                    AxlCancellable *cancel, AxlHttpClientDoneFn cb, void *user)
 {
     return _axl_http_request_async(c, loop, "GET", url, NULL, 0, NULL, NULL,
-                                   cancel, cb, user);
+                                   cancel, cb, user, false);
 }
 
 int
@@ -1052,7 +1116,7 @@ axl_http_post_async(AxlHttpClient *c, AxlLoop *loop, const char *url,
                     AxlCancellable *cancel, AxlHttpClientDoneFn cb, void *user)
 {
     return _axl_http_request_async(c, loop, "POST", url, body, size,
-                                   content_type, NULL, cancel, cb, user);
+                                   content_type, NULL, cancel, cb, user, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1182,7 @@ _axl_http_request_sync(AxlHttpClient *c, const char *method, const char *url,
     HttpSyncResult r = { .resp = NULL, .st = AXL_ERR, .loop = loop };
     if (_axl_http_request_async(c, loop, method, url, body, size, content_type,
                                 extra_headers, NULL, on_http_sync_done,
-                                &r) != AXL_OK) {
+                                &r, true) != AXL_OK) {
         axl_loop_free(loop);
         return AXL_ERR;
     }

@@ -141,12 +141,14 @@ suites), Sphinx renders the new APIs (`build-docs` exit 0, zero Sphinx
 warnings), `test-http-async-qemu.sh` ci-wired. **SoftBMC's consumer migration is
 complete and committed** (separate repo, built against this SDK working tree) —
 so the release coupling that held the axl-sdk commits is now satisfied.
-**Remaining:** push the axl-sdk commits + cut a release (a large v2.0.0 — the
-breaking `AxlSourceId` change — packaging everything since v1.8.0, so it needs a
-`git log v1.8.0..HEAD` ↔ CHANGELOG sweep first), then **phase 7** (the
-WARN→AXL_BUSY flip) in a FOLLOW-UP release once any other sync-net-in-callback
-consumers are surveyed/converted. **axl-sdk `main` is 12 commits ahead of
-`origin/main`, UNPUSHED — no push without explicit OK.**
+**SHIPPED in v2.0.0 (released 2026-06-16).** `cut-release.sh 2.0.0` published the
+release: release commit `a1e85e09` on `origin/main`, tag `v2.0.0`, CI + Release +
+Docs all green, 8 assets live on `aximcode/axl-sdk-releases`. The major bump is
+the breaking `AxlSourceId` change. The pre-cut `git log v1.8.0..HEAD` (114
+commits) ↔ CHANGELOG sweep backfilled the gaps (`816de4d3` — all 16 new public
+headers now documented). **Phase 7** (the WARN→`AXL_BUSY` flip) was evaluated and
+**rejected** — warn-only is the permanent state (see Loop-Reentrancy-Plan Item 1).
+The whole effort (phases 1–7) is complete and released; SoftBMC can pin `v2.0.0`.
 
 Verification gate per phase: TDD red→green, both arches, review before commit.
 
