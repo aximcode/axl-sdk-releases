@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=9 local-only=1
 # test-i2c-qemu.sh — exercise tools/i2c.efi against a canned SMBus
 # EEPROM (SPD blob at 0x50) under QEMU's ICH9 SMBus + SmbusHcShim.
 #

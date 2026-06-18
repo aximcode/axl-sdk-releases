@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=7 local-only=0
 # Driver-load LoadOptions leak regression.
 #
 # Boots driver-leak-test.efi which exercises:

@@ -11,23 +11,66 @@ scripts/cut-release.sh X.Y.Z            # do it
 scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
 ```
 
-`scripts/cut-release.sh` automates the whole cut below and **enforces the
-gate**: it bumps the version, dates the CHANGELOG, commits + pushes `main`,
-**waits for CI to go green on the release commit, and only then creates the
-tag** (a published tag can't be cleanly re-cut — see Recovery). Then it watches
-CI/Release/Docs and prints the published release. If CI fails on the release
-commit it stops *before* tagging and prints how to recover (fix on `main`, then
-`scripts/cut-release.sh X.Y.Z --resume`).
+`scripts/cut-release.sh` automates the cut: it bumps the version, dates the
+CHANGELOG, commits + pushes `main`, tags, and watches Release/Docs to the
+published release. By default it does **not** wait on CI (see the gate below).
 
-The script does **not** run the heavy local prerequisite gate — CI on the
-release commit is the authoritative gate. That only works well if you **push
-small batches to `main` continuously** so CI has already validated the code
-before release day. Releasing a big pile of unpushed commits is what made v1.0.0
-ship with a red CI (≈100 commits had never been through CI). The rest of this
-doc is what the script does, and the manual fallback if you need it.
+### The gate is LOCAL — run the suite before you cut
 
-To validate locally before pushing (optional fail-fast), run `scripts/lint.sh`
-(clang-tidy exactly as CI runs it) and the smoke suites below.
+**CI is no longer a per-push gate.** `ci.yml` runs only on a **major tag
+(`vX.0.0`)** or a manual `workflow_dispatch` — a rare cross-OS backstop, to keep
+Actions minutes for the runs that matter. The **authoritative pre-release gate
+is the full suite run locally**, which is fast in parallel:
+
+```sh
+make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
+./test/integration/run-integration.sh -j"$(nproc)"    # ~6-7x vs serial; 79/79 must pass
+scripts/lint.sh                                        # clang-tidy exactly as CI runs it
+```
+
+`run-integration.sh` discovers every `test-*.sh` (including the patched-QEMU /
+real-pointer `local-only` tests, which your dev box CAN run) and runs each in
+its own QEMU. Green here is the release gate. Then:
+
+```sh
+scripts/cut-release.sh X.Y.Z            # cut (no CI wait — local suite was the gate)
+scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
+scripts/cut-release.sh X.Y.Z --ci-gate  # opt back in: wait for a (manually-triggered) CI run
+```
+
+For a **major** release, trigger CI by hand first (Actions tab →
+`workflow_dispatch`, or it fires on the `vX.0.0` tag) for the fresh-OS backstop;
+`--ci-gate` makes the cut wait on it. The `--ci` flag on the runner excludes the
+`local-only` tests CI runners can't execute (patched-QEMU SMBus, usb-mouse
+pointer) — that's what CI runs.
+
+### GitHub Actions trigger policy
+
+**No workflow runs on a code push.** Push to `main` (or any branch) as much as
+you like — zero Actions minutes. The triggers are baked into the workflow files:
+
+| Workflow | What | Triggers on |
+|---|---|---|
+| **ci.yml** | build + QEMU integration + lint | major tag `vX.0.0`, or manual (`workflow_dispatch`) |
+| **docs.yml** | Doxygen/Sphinx → Cloudflare Pages | major tag `vX.0.0`, or manual |
+| **release.yml** | build + publish `.deb`/`.rpm`/tarballs | **every** release tag `v*` (it's the publish step), or manual |
+
+So: a normal push runs nothing; a **patch/minor** release tag runs only
+`release.yml` (publish); a **major** (`vX.0.0`) tag also runs CI + Docs as a
+cross-OS backstop. `cut-release.sh` tells its watcher which to expect, so a
+minor/patch cut doesn't hang waiting for CI/Docs.
+
+**Trigger a chain on demand** ("I specifically want it") — no push required:
+
+```sh
+scripts/run-ci.sh                 # dispatch + watch CI on origin/main
+scripts/run-ci.sh <branch|tag>    # on a specific ref
+scripts/run-ci.sh --docs          # dispatch the Docs deploy instead
+# or directly:  gh workflow run ci.yml --ref main   (Actions tab → Run workflow)
+```
+
+To change the policy, edit the `on:` block at the top of each workflow (each has
+a comment explaining its trigger).
 
 ## Prerequisites
 
@@ -181,31 +224,31 @@ git push origin main
 points at it; if you tag first and then push the branch, the
 release.yml workflow can race and check out the wrong commit.
 
-### 4b. Wait for CI to pass on `main` BEFORE tagging — the load-bearing gate
+### 4b. The gate is the LOCAL suite — CI no longer auto-runs on a push
 
-**Do not tag until the CI workflow is green on the branch push.** The tag
-re-triggers the *same* CI + Release + Docs workflows; if CI is red on the
-branch it will be red on the tag too — except now `release.yml` has already
-published the artifacts and `gh release create` has run, so the tag can no
-longer be cleanly re-cut (see Recovery) and you're forced into a patch
-release. Validating on the branch first makes a red CI a 5-minute branch fix
-instead of a burned version number.
+> **Updated policy** (was "wait for CI green before tagging"). CI does **not**
+> run on a push to `main` anymore (see "GitHub Actions trigger policy" above), so
+> there's nothing to wait for on the branch. The authoritative gate is the
+> **local** suite — run it before you cut:
+>
+> ```sh
+> ./test/integration/run-integration.sh -j"$(nproc)"   # 79/79 must pass
+> scripts/lint.sh                                       # clang-tidy as CI runs it
+> ```
 
-```sh
-scripts/watch-release-runs.sh        # or: gh run watch <ci-run-id>
-```
+For a **major** (`vX.0.0`) release you may want the cross-OS CI backstop *before*
+tagging — run `scripts/cut-release.sh X.Y.Z --ci-gate`, which dispatches CI on
+the release commit and waits for green before creating the tag. Without
+`--ci-gate`, the cut tags immediately (the local suite was the gate); for a major
+tag, CI + Docs then run automatically *on the tag* as a post-publish backstop,
+and `cut-release.sh` watches them.
 
-This matters most after a **long unpushed run**: if `main` is dozens of
-commits ahead of `origin/main`, CI has validated *none* of them, and the
-local prereq suite above is not a substitute — it is a strict subset of what
-CI runs. v1.0.0 shipped with a red CI for exactly this reason: ~100 commits
-were unpushed, and two CI-only failures (a `test-input-modifiers-qemu.sh`
-that can't run on headless runners, and a clang-tidy finding from a newer
-local clang-tidy than CI's) only surfaced on the tag. The fix that would
-have caught both: push `main` and watch CI *before* tagging.
-
-If CI is red on the branch, fix it on `main` as normal commits, let CI go
-green, and only then proceed to the tag.
+Why the change: the suite is run locally before every release anyway, so a
+per-push CI gate was redundant cost. The two CI-only failures that burned v1.0.0
+(a headless-runner pointer test, a clang-tidy version skew) are now handled
+structurally: the pointer test is `local-only` (excluded from CI), and
+`scripts/lint.sh` pins the exact CI clang-tidy version — run it locally and it
+matches CI byte-for-byte.
 
 ### 5. Create and push the tag
 

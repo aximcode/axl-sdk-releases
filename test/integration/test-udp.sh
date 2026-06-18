@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=13 local-only=0
 # AxlUdp integration test — boots QEMU with networking, sends a UDP
 # datagram to a host-side echo server, verifies the response.
 #
@@ -9,7 +10,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-UDP_HOST_PORT=19000
+UDP_HOST_PORT=$(test_port 0)
 
 # Build
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

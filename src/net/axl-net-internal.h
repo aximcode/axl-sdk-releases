@@ -48,6 +48,15 @@ axl_net_locate_sb(
 void
 _axl_net_connect_snp_handles(void);
 
+/// Copy the lease cached by a non-IP4Config2 bring-up (Dhcp4-SB / PXE BC) into
+/// @p out. Lets the IP4Config2-keyed readers (axl_net_get_ip_address /
+/// axl_net_get_dhcp_lease) report a result on firmware that lacks IP4Config2.
+/// @return true if a cached lease exists (and was copied); false otherwise.
+bool
+_axl_net_fallback_lease(
+    AxlDhcpLease *out
+);
+
 /// Render a NIC's bus location (PCI/USB device-path topology, with the
 /// MAC/IPv4/IPv6/VLAN network tail trimmed) into @p out. Always
 /// NUL-terminates; "" when the path has no hardware prefix or the

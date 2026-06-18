@@ -3,6 +3,90 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.1.0 — 2026-06-18
+
+### Added
+
+- **Launch the firmware-embedded UEFI Shell from a Firmware Volume** — present
+  a real UEFI Shell with no `Shell.efi` staged on any filesystem.
+  **`axl_shell_launch_fv(load_options, &exit)`** (`<axl/axl-shell.h>`) locates
+  the platform's built-in ShellPkg Shell in a readable FV and runs it in the
+  foreground (same blocking contract as `axl_shell_launch`).
+  **`axl_shell_locate()`** reports where a Shell is available —
+  `AXL_SHELL_FILE` (a staged `Shell.efi`), `AXL_SHELL_FIRMWARE` (FV-embedded),
+  or `AXL_SHELL_NONE` — without launching, for a consumer's availability flag.
+  The reusable primitive underneath, **`axl_image_run_fv_file(name_guid, args,
+  &exit)`** (`<axl/axl-image.h>`), loads + runs any
+  `EFI_FV_FILETYPE_APPLICATION` from a Firmware Volume by its FFS file name
+  GUID. The Shell search matches both `gUefiShellFileGuid`
+  (`7C04A583-…`, how OVMF/AAVMF and most platform FDFs name the embedded Shell)
+  and the ShellPkg `Shell.inf` FILE_GUID (`EA4BB293-…`). Verified under
+  OVMF/AAVMF (both embed the Shell as an FV application): the FV Shell launches
+  and holds the foreground while a background HTTP server keeps serving off the
+  driver tick. **Note:** the FV file name GUID is `gUefiShellFileGuid`, *not*
+  the `Shell.inf` module GUID a standalone `Shell.efi` binary carries — the
+  launcher matches both so it works regardless of how the firmware embeds it.
+- **IP4Config2-free network bring-up** — `axl_net_init` / `axl_net_auto_init`
+  now transparently fall back when the firmware lacks
+  `EFI_IP4_CONFIG2_PROTOCOL` (some OEM laptops, e.g. HP, ship a full
+  SNP/MNP/IP4/TCP4 + `Dhcp4ServiceBinding` stack but not the IP4Config2 policy
+  layer). The ladder: IP4Config2 → `EFI_DHCP4_SERVICE_BINDING`
+  (CreateChild→Configure→Start, child kept alive to hold the lease) →
+  `EFI_PXE_BASE_CODE_PROTOCOL.Dhcp` (last resort). The leased address is cached
+  so `axl_net_get_ip_address` / `axl_net_get_dhcp_lease` report it without
+  IP4Config2. **`axl_net_last_config_method()`** (new) returns which rung
+  succeeded (`AxlNetConfigMethod`: IP4CONFIG2 / DHCP4_SB / PXE_BC / NONE).
+  One-shot, in-process scope (matches SoftBmcDiag, the tool this lets netcfg
+  replace); durable cross-process config without IP4Config2 would need a
+  resident driver. The Dhcp4-SB/PXE paths are real-hardware-only — OVMF always
+  provides IP4Config2, so QEMU/CI can't trigger them.
+- **`axl_net_takeover_if_no_snp()`** (`<axl/axl-net.h>`) — orchestrated NIC
+  takeover, gated on zero SimpleNetwork handles: a no-op (returns AXL_OK) when
+  the firmware already exposes SNP, so it can't destroy a working stack; only
+  when SNP is absent does it load staged drivers and, if still absent,
+  disconnect the firmware drivers from network-class PCI controllers and
+  rebind. Added `EFI_PXE_BASE_CODE_PROTOCOL` to the generated UEFI headers.
+
+### Changed
+
+- **Produced `.efi` images now advertise NX-compatibility** (the `NX_COMPAT`
+  bit in the PE `DllCharacteristics`). The images were already linked W^X-clean
+  (R-X `.text`, RW non-executable `.data`); `pe-set-debug` now sets the bit so
+  firmware that enforces memory protection — the norm under Secure Boot —
+  applies it instead of warning on or rejecting the image. No source or
+  linker-script change; signing remains a downstream step. New `make
+  check-nx-compat` gate (`scripts/check-pe-nx.py`, wired into CI) asserts the
+  bit on a representative app + driver; `libaxl.a` now depends on the PE
+  post-processor so a `pe-set-debug` change relinks every dependent `.efi`.
+
+### Added
+
+- **RTC-write API: `axl_time_set_realtime()` and `axl_time_set_unix()`**
+  (`<axl/axl-time.h>`) — the write counterpart to `axl_time_realtime()`, over
+  `EFI_RUNTIME_SERVICES.SetTime`. `axl_time_set_realtime` programs an
+  `AxlRealtime` (fields interpreted identically to the read path, including the
+  `AXL_TIME_TZ_UNSPECIFIED` sentinel and the daylight flag);
+  `axl_time_set_unix` is the ergonomic NTP path — it splits Unix seconds (UTC)
+  to a calendar date and writes the RTC as UTC, rejecting pre-epoch and
+  beyond-year-9999 input up front. Backend-neutral via a new
+  `axl_backend_set_time`. Round-trip QEMU test: `test-time-qemu.sh` (sets a
+  known calendar time and a known Unix instant, reads each back via
+  `axl_time_realtime`, and restores the clock). Unblocks SoftBMC's Time/NTP
+  clock-set routes.
+
+- **MAC-keyed DHCP-lease accessor: `axl_net_get_dhcp_lease_by_mac()`**
+  (`<axl/axl-net.h>`) — the robust multi-NIC counterpart to
+  `axl_net_get_dhcp_lease(nic_index)`. The index form resolves the NIC via the
+  IP4Config2 handle buffer (a different index space than
+  `axl_net_list_interfaces` / `axl_net_get_link_stats`, which index
+  SimpleNetwork) and clamps an out-of-range index to handle 0, so a list-index
+  lookup can return the wrong NIC's lease on multi-NIC hosts. The by-MAC form
+  correlates IP4Config2 to the NIC by its SimpleNetwork MAC — the same way
+  `axl_net_list_interfaces` already resolves IPv4 — and returns AXL_ERR (no
+  clamp) for an unknown MAC. The `nic_index` form's doc now carries an explicit
+  index-space warning. Round-trip coverage in `test-netdiag-qemu.sh` (by-MAC
+  lease equals the index-0 lease byte-for-byte; unknown MAC -> AXL_ERR).
+
 ## 2.0.1 — 2026-06-17
 
 ### Fixed

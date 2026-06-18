@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=7 local-only=0
 # AxlService embedded-driver deployment integration test.
 #
 # Boots service_demo.efi (sdk/examples/service-demo.c, built via the

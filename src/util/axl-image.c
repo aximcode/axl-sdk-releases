@@ -19,6 +19,7 @@
 
 #include "../backend/axl-backend.h"
 #include "axl-image-internal.h"
+#include "../fv/axl-fv-internal.h"
 #include <axl/axl-image.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-mem.h>
@@ -128,6 +129,35 @@ axl_image_unload(
     return rc;
 }
 
+/* Install @p args as UCS-2 LoadOptions, StartImage (blocks), and unload —
+   the shared tail of axl_image_run and axl_image_run_fv_file. @p img is
+   always consumed (unloaded) regardless of outcome. */
+static int
+image_run_and_unload(
+    AxlImage    *img,
+    const char  *args,
+    int         *out_exit_code
+    )
+{
+    /* set_load_options copies the buffer, so the temporary is freed
+       immediately (NUL-terminated, sized in bytes — the UEFI command-line
+       convention). */
+    if (args != NULL && args[0] != '\0') {
+        size_t          n = axl_strlen(args);
+        unsigned short *w = axl_malloc((n + 1) * sizeof(unsigned short));
+        if (w != NULL) {
+            size_t chars = axl_utf8_to_ucs2_buf(args, w, n + 1);
+            axl_image_set_load_options(img, w,
+                                       (chars + 1) * sizeof(unsigned short));
+            axl_free(w);
+        }
+    }
+
+    int rc = axl_image_start(img, out_exit_code);   /* blocks */
+    axl_image_unload(img);
+    return rc;
+}
+
 int
 axl_image_run(
     const char *path,
@@ -146,24 +176,113 @@ axl_image_run(
     if (axl_image_load(path, &img) != AXL_OK || img == NULL) {
         return AXL_ERR;
     }
+    return image_run_and_unload(img, args, out_exit_code);
+}
 
-    /* Install @p args as UCS-2 LoadOptions (NUL-terminated, sized in bytes —
-       the UEFI command-line convention). set_load_options copies the buffer,
-       so the temporary is freed immediately. */
-    if (args != NULL && args[0] != '\0') {
-        size_t          n = axl_strlen(args);
-        unsigned short *w = axl_malloc((n + 1) * sizeof(unsigned short));
-        if (w != NULL) {
-            size_t chars = axl_utf8_to_ucs2_buf(args, w, n + 1);
-            axl_image_set_load_options(img, w,
-                                       (chars + 1) * sizeof(unsigned short));
-            axl_free(w);
-        }
+/* Build an FvFile device path: the FV handle's own device path with its
+   END node replaced by a MEDIA_PIWG_FW_FILE node carrying @p name_guid,
+   then a fresh END node. Suitable for gBS->LoadImage's DevicePath — the
+   firmware reads the file's PE32 section straight out of the FV.
+
+   Returns a gBS->AllocatePool buffer (caller FreePools), or NULL on any
+   failure (handle has no device path, malformed, OOM). */
+static EFI_DEVICE_PATH_PROTOCOL *
+fv_file_build_dp(
+    AxlHandle       fv_handle,
+    const AxlGuid  *name_guid
+    )
+{
+    EFI_DEVICE_PATH_PROTOCOL *fv_dp = NULL;
+    if (axl_bs()->HandleProtocol((EFI_HANDLE)fv_handle,
+                                 &EFI_DEVICE_PATH_PROTOCOL_GUID,
+                                 (void **)&fv_dp) != EFI_SUCCESS
+        || fv_dp == NULL)
+    {
+        return NULL;
+    }
+    size_t fv_dp_size = axl_device_path_size(fv_dp);
+    if (fv_dp_size < 4) {
+        return NULL;
+    }
+    size_t fv_dp_body = fv_dp_size - 4;   /* strip the trailing END node */
+
+    /* FW_FILE node (4-byte header + 16-byte GUID) + 4-byte END node. */
+    const size_t fw_node_size = 4 + sizeof(AxlGuid);
+    size_t       total        = fv_dp_body + fw_node_size + 4;
+
+    void *out = NULL;
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out) != EFI_SUCCESS
+        || out == NULL)
+    {
+        return NULL;
+    }
+    uint8_t *p = (uint8_t *)out;
+    axl_memcpy(p, fv_dp, fv_dp_body);
+    p += fv_dp_body;
+
+    /* MEDIA_PIWG_FW_FILE_DP node: MEDIA_DEVICE_PATH(0x04) / 0x06. */
+    p[0] = 0x04;
+    p[1] = 0x06;
+    p[2] = (uint8_t)(fw_node_size & 0xff);
+    p[3] = (uint8_t)((fw_node_size >> 8) & 0xff);
+    axl_memcpy(p + 4, name_guid, sizeof(AxlGuid));   /* EFI_GUID byte layout */
+    p += fw_node_size;
+
+    /* END node */
+    p[0] = 0x7f; p[1] = 0xff; p[2] = 4; p[3] = 0;
+
+    return (EFI_DEVICE_PATH_PROTOCOL *)out;
+}
+
+int
+axl_image_run_fv_file(
+    const AxlGuid  *name_guid,
+    const char     *args,
+    int            *out_exit_code
+    )
+{
+    if (out_exit_code != NULL) {
+        *out_exit_code = 0;
+    }
+    if (name_guid == NULL) {
+        return AXL_ERR;
     }
 
-    int rc = axl_image_start(img, out_exit_code);   /* blocks */
-    axl_image_unload(img);
-    return rc;
+    AxlHandle fv_handle = NULL;
+    if (_axl_fv_find_app_file(name_guid, &fv_handle) != AXL_OK) {
+        return AXL_ERR;   /* no readable FV carries the file */
+    }
+
+    EFI_DEVICE_PATH_PROTOCOL *dp = fv_file_build_dp(fv_handle, name_guid);
+    if (dp == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_HANDLE image  = NULL;
+    EFI_STATUS status = axl_bs()->LoadImage(
+        FALSE,           /* BootPolicy */
+        gImageHandle,    /* ParentImageHandle */
+        dp,              /* FvFile DevicePath */
+        NULL, 0,         /* firmware reads the section from the FV */
+        &image);
+    axl_bs()->FreePool(dp);
+
+    if (EFI_ERROR(status) || image == NULL) {
+        axl_warning("image_run_fv_file: LoadImage failed: 0x%llx",
+                    (unsigned long long)status);
+        return AXL_ERR;
+    }
+
+    /* Wrap the firmware EFI_HANDLE in an opaque AxlImage so the shared
+       tail (set options + StartImage + UnloadImage) handles it exactly
+       like a path-loaded image. */
+    AxlImage *img = axl_malloc(sizeof(*img));
+    if (img == NULL) {
+        axl_bs()->UnloadImage(image);
+        return AXL_ERR;
+    }
+    img->handle = (AxlDriverHandle)image;
+    return image_run_and_unload(img, args, out_exit_code);
 }
 
 // ---------------------------------------------------------------------------

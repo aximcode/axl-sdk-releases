@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=31 local-only=0
 # test-cpu-simd-qemu.sh — AxlCpu feature detection + AVX-enable path
 # across explicit QEMU CPU models (x86).
 #

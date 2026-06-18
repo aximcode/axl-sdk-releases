@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=17 local-only=0
 # test-http-multi-qemu.sh — two axl_http_server instances on ONE AxlLoop.
 #
 # Regression for the bug where a second server on a shared loop silently
@@ -26,8 +27,8 @@ export TEST_SKIP_RATCHET=1
 test_parse_args "$@"
 test_setup
 
-H_TLS=18443    # host -> guest 8443 (TLS server, started first)
-H_PLAIN=18091  # host -> guest 8081 (plain server, started second)
+H_TLS=$(test_port 0)    # host -> guest 8443 (TLS server, started first)
+H_PLAIN=$(test_port 1)  # host -> guest 8081 (plain server, started second)
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"

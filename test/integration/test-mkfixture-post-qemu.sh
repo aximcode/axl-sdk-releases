@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=13 local-only=0
 # test-mkfixture-post-qemu.sh -- end-to-end test for mkfixture's HTTP
 # write target (HF2.4): a disk-less / net-only capture that POSTs the
 # whole fixture as an in-memory ustar tarball to a collector.
@@ -18,7 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 MKFIXTURE="$PROJECT_DIR/out/native-x64/tools/mkfixture.efi"
-PORT=18472
+# This test drives run-qemu.sh directly (no common-test.sh), so it derives its
+# host port from TEST_PORT_BASE inline rather than via the test_port helper.
+# run-integration.sh exports a distinct base per worker; standalone falls back.
+PORT=$(( ${TEST_PORT_BASE:-18000} + 0 ))
 
 export TEST_SKIP_RATCHET=1
 PASS=0

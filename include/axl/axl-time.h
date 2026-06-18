@@ -225,6 +225,59 @@ axl_time_realtime(
     AxlRealtime *out
 );
 
+/**
+ * @brief Write the firmware real-time clock.
+ *
+ * Write counterpart to @ref axl_time_realtime — a backend-neutral
+ * wrap of `EFI_RUNTIME_SERVICES.SetTime`. The fields of @p in are
+ * interpreted identically to those @ref axl_time_realtime fills:
+ * `year` is the full year, `month` is 1-12, `day` is 1-31, and
+ * `timezone_minutes` is either a signed UTC offset in minutes or
+ * @ref AXL_TIME_TZ_UNSPECIFIED (mapped to UEFI's
+ * `EFI_UNSPECIFIED_TIMEZONE`). The @ref AXL_TIME_FLAG_DAYLIGHT bit
+ * of `flags` sets the firmware's daylight flag; `nanosecond` is
+ * passed through.
+ *
+ * The firmware validates the supplied values and may reject an
+ * out-of-range date/time or an unsupported field; such a rejection
+ * is reported as @ref AXL_ERR (the firmware does not partially apply
+ * the write). Note `nanosecond` is passed through verbatim but most
+ * firmware RTCs ignore it on a write (they advance once per second).
+ *
+ * @return AXL_OK on success, AXL_ERR if @p in is NULL or the
+ *     firmware reports a failure (EFI_INVALID_PARAMETER /
+ *     EFI_DEVICE_ERROR / EFI_UNSUPPORTED).
+ */
+int
+axl_time_set_realtime(
+    const AxlRealtime *in    ///< time to program into the RTC
+);
+
+/**
+ * @brief Set the firmware real-time clock from Unix seconds (UTC).
+ *
+ * The ergonomic path for clock-set-from-NTP: feed the
+ * `unix_secs` an SNTP query returns (see @c axl_sntp_query in
+ * <axl/axl-net.h>) straight in. @p unix_secs is split into a
+ * Gregorian calendar date internally and written with
+ * `timezone_minutes = 0` (UTC) and the daylight flag cleared, so
+ * the RTC ends up holding UTC.
+ *
+ * @p unix_secs must be non-negative (1970 or later) and fall within
+ * the range a UEFI RTC can represent (year <= 9999). A value outside
+ * that range is rejected with @ref AXL_ERR *before* any firmware
+ * call — the calendar `year` is a 16-bit field, so an out-of-range
+ * input is a caller error, not a silent wrap.
+ *
+ * @return AXL_OK on success, AXL_ERR if @p unix_secs is out of range
+ *     or the firmware reports a failure (see
+ *     @ref axl_time_set_realtime).
+ */
+int
+axl_time_set_unix(
+    int64_t unix_secs    ///< seconds since 1970-01-01 00:00:00 UTC
+);
+
 #ifdef __cplusplus
 }
 #endif

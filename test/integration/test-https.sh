@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=18 local-only=0
 # AxlTls HTTPS integration test — boots QEMU with TLS-enabled HTTP server,
 # validates with curl --insecure from the host.
 #
@@ -10,7 +11,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18443
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8443
 
 # Build with TLS

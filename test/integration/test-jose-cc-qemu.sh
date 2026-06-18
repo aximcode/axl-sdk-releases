@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-jose-cc-qemu.sh — dogfood axl-jose through the SDK consumer path.
 #
 # Proves a real consumer can use <axl/axl-jose.h>: stages an AXL_TLS=1 SDK,

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=22 local-only=0
 # axl-kernel K3 integration test — runs axlk-echo-server.efi inside
 # QEMU (axl-kernel process spawning a handler per connection), fires
 # three probes from the host via hostfwd, verifies each gets echoed.
@@ -13,7 +14,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=17000
+HOST_PORT=$(test_port 0)
 GUEST_PORT=7000
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

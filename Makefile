@@ -94,6 +94,10 @@ CFLAGS_BASE = -std=gnu2x \
               -Wall \
               -DAXL_BACKEND_NATIVE
 
+# pe-set-debug also stamps NX_COMPAT in DllCharacteristics (the images
+# are W^X-clean) for Secure-Boot / memory-protected firmware; verified
+# by `make check-nx-compat` (scripts/check-pe-nx.py).
+#
 # Both DEBUG and RELEASE emit DWARF debug info — the .efi PE/COFF
 # stays slim because objcopy only carries .dbgdir through, and
 # pe-set-debug points the debug data directory at the side-by-side
@@ -582,7 +586,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-docs driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest http-plain-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -603,10 +607,24 @@ endif
 check-ascii:
 	@python3 scripts/check-output-ascii.py
 
+# Every QEMU integration test must carry a `# test-meta:` header so it is
+# discovered + sharded by run-integration.sh (a new test can't silently escape
+# the suite). Run in CI's lint job alongside check-ascii.
+check-test-meta:
+	@bash test/integration/lib/discover.sh --lint
+
 # Verify every public header is wired into the Sphinx reference (catches a
 # new header landing without docs). Prose staleness is a workflow concern.
 check-docs:
 	@python3 scripts/check-doc-coverage.py
+
+# Verify the PE post-processor stamped NX_COMPAT (the produced images are
+# W^X-clean, so they must advertise NX compatibility for Secure-Boot /
+# memory-protected firmware). Builds one representative app + driver and checks
+# both — the bit is set uniformly by pe-set-debug, so a regression fails here.
+check-nx-compat: $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/SmbusHcShim.efi
+	@python3 scripts/check-pe-nx.py \
+	    $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/SmbusHcShim.efi
 
 check-version:
 	@file_ver=$$(cat VERSION); \
@@ -758,9 +776,14 @@ $(PE_SET_DEBUG): scripts/pe-set-debug.c | $(BUILDDIR)
 # so only the CURRENT $(LIB_OBJS) make it in. This is what the
 # "structural header change → make clean" warning in CLAUDE.md was
 # papering over.
-$(PREFIX)/lib/libaxl.a: $(LIB_OBJS) | $(PREFIX)/lib
+# Depends on $(PE_SET_DEBUG) (the PE post-processor) as well as the objects:
+# every .efi links libaxl.a, so making the archive depend on the tool means a
+# pe-set-debug change re-archives the lib and thereby forces every dependent
+# .efi to relink and re-run the post-processor (which stamps NX_COMPAT). The
+# tool is NOT archived — the recipe lists $(LIB_OBJS) explicitly, not $^.
+$(PREFIX)/lib/libaxl.a: $(LIB_OBJS) $(PE_SET_DEBUG) | $(PREFIX)/lib
 	@rm -f $@
-	$(AR) rcs $@ $^
+	$(AR) rcs $@ $(LIB_OBJS)
 
 # libaxl-cxx.a — companion archive for axl-cc's C++ path.  Same
 # stale-member-eviction discipline as libaxl.a.  Built only when
@@ -993,6 +1016,22 @@ $(PREFIX)/cpu-topology-selftest.efi: $(BUILDDIR)/cpu-topology-selftest.o $(LINK_
 	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-topology-selftest.o,$@)
 
 $(BUILDDIR)/cpu-topology-selftest.o: test/integration/cpu-topology-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build time-settime-selftest.efi — round-trip the RTC-write API
+# (axl_time_set_realtime / axl_time_set_unix) against OVMF's emulated
+# RTC, run by test/integration/test-time-qemu.sh (gRT->SetTime mutates
+# firmware state, so there is no unit-test seam for it).
+# ===================================================================
+
+time-settime-selftest: $(PREFIX)/time-settime-selftest.efi
+	@echo "  Built: $(PREFIX)/time-settime-selftest.efi"
+
+$(PREFIX)/time-settime-selftest.efi: $(BUILDDIR)/time-settime-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/time-settime-selftest.o,$@)
+
+$(BUILDDIR)/time-settime-selftest.o: test/integration/time-settime-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # Build http-plain-selftest.efi — a plain-HTTP-only client that references no

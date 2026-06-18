@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=swtpm est=1 local-only=0
 # test-axl-emulate.sh -- argument-parsing and fixture-translation
 # tests for scripts/axl-emulate.
 #

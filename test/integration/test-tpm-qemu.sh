@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=swtpm est=21 local-only=0
 # test-tpm-qemu.sh — axl_tpm_* against a swtpm-backed TPM 2.0.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).

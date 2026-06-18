@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # Test the canonical Type-B (UEFI Driver Model) example driver: loads it and
 # verifies the firmware actually drives the AxlDriverBinding lifecycle —
 # Supported -> Start (with the bound interface) -> Stop — against the

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=21 local-only=0
 # test-cpu-replay-qemu.sh — HF4: end-to-end CPU identity replay.
 #
 # A fixture cpu.json carrying a distinctive CPU identity, through

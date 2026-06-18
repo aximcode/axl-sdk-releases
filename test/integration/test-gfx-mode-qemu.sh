@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=both needs= est=11 local-only=0
 # test-gfx-mode-qemu.sh — GOP display-mode enumerate / switch round-trip.
 #
 # Auxiliary single-binary test (opt-out of the test-axl.sh ratchet).
@@ -21,7 +22,7 @@ PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 # Auxiliary; don't touch test-axl.sh's pass-count baseline.
 export TEST_SKIP_RATCHET=1
 
-WHICH="${1:-both}"
+if [ "${1:-}" = "--arch" ]; then WHICH="${2:-both}"; else WHICH="${1:-both}"; fi
 case "$WHICH" in
     X64)     ARCHES=(X64) ;;
     AARCH64) ARCHES=(AARCH64) ;;

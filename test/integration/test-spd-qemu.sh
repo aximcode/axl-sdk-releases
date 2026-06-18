@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=1
 # test-spd-qemu.sh — exercise AxlSpd's wire path against a custom SPD
 # blob attached at QEMU's SMBus 0x50.
 #

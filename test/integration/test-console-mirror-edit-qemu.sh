@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=16 local-only=0
 # test-console-mirror-edit-qemu.sh — the AxlConsoleMirror ACCEPTANCE GATE.
 #
 # Design §6 rung 3, the headline proof: the Shell's full-screen interactive

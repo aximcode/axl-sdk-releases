@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=17 local-only=0
 # test-shell-coexist-qemu.sh — Console Mirror concurrency linchpin.
 #
 # Proves the one thing the whole Console Mirror feature rests on: a real
@@ -26,7 +27,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18088
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

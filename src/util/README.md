@@ -7,7 +7,7 @@ Headers:
 
 - `<axl/axl-sys.h>` — System operations (reset, GUID, device map refresh)
 - `<axl/axl-env.h>` — Environment variables and working directory
-- `<axl/axl-time.h>` — Wall-clock time and monotonic timestamps
+- `<axl/axl-time.h>` — Wall-clock time (read + set the RTC) and monotonic timestamps
 - `<axl/axl-nvstore.h>` — Portable NVRAM key-value storage
 - `<axl/axl-boot.h>` — Boot-option management (Boot####/BootOrder/BootNext/BootCurrent)
 - `<axl/axl-port.h>` — x86 I/O port access (`in`/`out`)
@@ -363,9 +363,17 @@ returns. This works for *any* blocking UEFI app (a diagnostic tool, a
 vendor setup app, a recovery menu). To host a real **UEFI Shell**
 specifically, `axl_shell_launch` (`<axl/axl-shell.h>`) is the thin
 Shell wrapper: it locates `Shell.efi` and runs it with `-nostartup`
-(so a child Shell launched from `startup.nsh` doesn't recurse). Pair
-either with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror
-the launched app's console to a remote terminal.
+(so a child Shell launched from `startup.nsh` doesn't recurse).
+
+When nothing is staged, `axl_shell_launch_fv` runs the
+firmware-embedded Shell straight out of a Firmware Volume — no
+`Shell.efi` file needed — and `axl_shell_locate` reports where a Shell
+is available (`AXL_SHELL_FILE` / `AXL_SHELL_FIRMWARE` / `AXL_SHELL_NONE`)
+without launching one. The reusable primitive underneath is
+`axl_image_run_fv_file(name_guid, args, &exit)`, which loads + runs any
+`EFI_FV_FILETYPE_APPLICATION` by its FFS file GUID. Pair any of these
+with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror the
+launched app's console to a remote terminal.
 
 ### Image Signature Inspection
 

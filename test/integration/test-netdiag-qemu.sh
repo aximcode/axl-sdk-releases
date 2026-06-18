@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=18 local-only=0
 # test-netdiag-qemu.sh — AxlNet diagnostics against a live (DHCP'd) network.
 #
 # Boots AxlTestNet's `net-diag` mode, which brings up networking via DHCP

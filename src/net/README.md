@@ -121,7 +121,13 @@ control:
   Used by the DHCP path of `bring_up` internally. Event-driven
   via `EFI_IP4_CONFIG2_PROTOCOL.RegisterDataNotify` —
   sub-millisecond wakeup after DHCP completes (firmware that
-  doesn't support the notify falls back to a 1 s tick).
+  doesn't support the notify falls back to a 1 s tick). On firmware
+  that lacks IP4Config2 entirely (some OEM laptops), it falls back
+  to `Dhcp4ServiceBinding` then PXE Base Code DHCP, caching the
+  lease so `axl_net_get_ip_address` / `axl_net_get_dhcp_lease` still
+  report it; `axl_net_last_config_method()` says which path won.
+  (Those fallbacks are real-hardware-only — OVMF always has
+  IP4Config2.)
 - `axl_net_set_static_ip(nic, ip, netmask, gateway)` — raw
   IP4Config2 setter; static path of `bring_up` calls it after
   `drivers_up`.

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=15 local-only=0
 # test-https-driver-qemu.sh — HTTPS served by a RESIDENT driver-tick loop.
 #
 # Regression test for the TLS handshake stalling when axl_http_server is
@@ -20,7 +21,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18444
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8443
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

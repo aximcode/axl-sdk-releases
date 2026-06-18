@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # test-axl-cc-service.sh — end-to-end proof that `axl-cc --service`
 # produces a working launcher + driver pair from a single .c file.
 #

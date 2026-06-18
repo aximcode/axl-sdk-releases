@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=61 local-only=0
 # test-exit-status-qemu.sh -- end-to-end proof that axl_set_exit_status sets the
 # UEFI shell's %lasterror% to a caller-chosen, VERBATIM EFI_STATUS.
 #

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-ata-qemu.sh — AxlAta against an emulated AHCI/SATA disk.
 #
 # The unit suite (AxlAta) tests the pure decoders against fixed buffers.

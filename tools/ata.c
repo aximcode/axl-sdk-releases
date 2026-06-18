@@ -9,9 +9,10 @@
 
 #include <axl.h>
 
-int
-main(void)
+AXL_TOOL_MAIN(ata)
 {
+    (void)argc;
+    (void)argv;
     AxlAtaDev *dev = NULL;
     int        n = 0;
 

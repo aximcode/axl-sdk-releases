@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # test-shell-pipe.sh — verify axl_stdin works as the RHS of a UEFI
 # Shell `|` pipe. Exercises hexdump and grep with stdin input.
 #

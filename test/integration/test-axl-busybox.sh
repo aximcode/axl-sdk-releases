@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # axl busybox dispatch test — boots QEMU, runs axl.efi with a few
 # representative subcommands, verifies the dispatcher routes argv
 # correctly and each tool's body produces the same output it does as

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=9 local-only=0
 # test-console-mirror-qemu.sh — AxlConsoleMirror positive proof (P1/P2 core).
 #
 # Exercises the full mirror mechanism in its OWN QEMU boot: install (wrap gST

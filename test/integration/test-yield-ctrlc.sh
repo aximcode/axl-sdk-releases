@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=socat est=7 local-only=0
 # test-yield-ctrlc.sh — end-to-end proof that Ctrl-C routes through
 # the axl_yield → default-exit → atexit path for a UEFI app running
 # in QEMU.

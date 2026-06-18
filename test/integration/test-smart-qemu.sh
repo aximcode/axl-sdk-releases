@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-smart-qemu.sh — AxlSmart union walk + normalized health across transports.
 #
 # The unit suite (AxlSmart) tests the pure normalizers against constructed

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=16 local-only=0
 # tools/{fetch,netinfo} integration test — boots QEMU with user-mode
 # networking, runs each tool against a host-side Python HTTP server
 # (reused from test-http.sh), and validates the serial log output.
@@ -16,7 +17,7 @@ export TEST_SKIP_RATCHET=1
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18086
+HOST_PORT=$(test_port 0)
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"

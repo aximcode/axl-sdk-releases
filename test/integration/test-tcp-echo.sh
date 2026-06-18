@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=18 local-only=0
 # tcp-echo integration test — minimal TCP-only repro for axl_tcp_close
 # behavior under sequential connect/disconnect storm.
 #
@@ -34,7 +35,7 @@ done
 test_parse_args "${ARGS[@]}"
 test_setup
 
-HOST_PORT=17000
+HOST_PORT=$(test_port 0)
 GUEST_PORT=7000
 ECHO_PREFIX="msg"
 

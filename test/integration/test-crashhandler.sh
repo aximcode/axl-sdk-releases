@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=40 local-only=0
 # test-crashhandler.sh -- end-to-end test for the CrashHandler DXE driver
 # (drivers/crashhandler) + CrashTest app (tools/crashtest.c).
 #

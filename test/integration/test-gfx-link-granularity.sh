@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=1 local-only=0
 # test-gfx-link-granularity.sh — a display-mode-only consumer must NOT pull
 # the FreeType ftgrays rasterizer (and its FTL credit obligation).
 #

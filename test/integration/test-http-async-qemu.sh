@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=openssl est=23 local-only=0
 # test-http-async-qemu.sh — exercises the ASYNC HTTP client
 # (axl_http_get_async / axl_http_post_async).
 #
@@ -30,8 +31,8 @@ if ! command -v openssl >/dev/null 2>&1; then
     exit 0
 fi
 
-PLAIN_PORT=18090   # plain-http server
-TLS_PORT=18453     # https server
+PLAIN_PORT=$(test_port 0)   # plain-http server
+TLS_PORT=$(test_port 1)     # https server
 
 make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all tests 2>&1 | tail -3

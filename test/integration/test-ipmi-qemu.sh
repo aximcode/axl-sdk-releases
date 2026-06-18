@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # test-ipmi-qemu.sh — run AxlTestIpmi against QEMU's built-in BMC
 # simulator to exercise the real KCS transport.
 #

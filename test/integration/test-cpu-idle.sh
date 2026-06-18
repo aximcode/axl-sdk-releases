@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=49 local-only=0
 # test-cpu-idle.sh -- CPU-idle regression guard.
 #
 # Runs AxlTestCpuIdle.efi (six x 500ms event-driven waits = ~3s

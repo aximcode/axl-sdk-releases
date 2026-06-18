@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=socat est=18 local-only=1
 # test-input-modifiers-qemu.sh — prove that a HELD keyboard modifier is
 # stamped onto POINTER events through the real OVMF firmware path:
 # Ctrl+click and Shift+wheel.

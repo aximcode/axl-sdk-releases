@@ -46,9 +46,10 @@ print_smart(AxlHandle ctrl)
     }
 }
 
-int
-main(void)
+AXL_TOOL_MAIN(nvme)
 {
+    (void)argc;
+    (void)argv;
     AxlHandle ctrl = NULL;
     int       n = 0;
 

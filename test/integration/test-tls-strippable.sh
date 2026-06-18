@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=0 local-only=0
 # test-tls-strippable.sh — mbedTLS must be strippable for HTTP consumers that
 # never reference TLS.
 #

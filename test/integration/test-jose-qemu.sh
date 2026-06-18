@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-jose-qemu.sh — axl-jose (JWS/JWT/JWK) against a real mbedTLS.
 #
 # Auxiliary single-binary test (opt out of the test-axl.sh ratchet). The

@@ -1069,6 +1069,27 @@ test_time(void)
     test_check(has_t, "time: contains T separator");
 }
 
+/* RTC-write API (axl_time_set_realtime / axl_time_set_unix). Only the
+   SAFE-NEGATIVE paths are unit-tested here: the validation that returns
+   AXL_ERR *before* any gRT->SetTime call. The positive round-trip
+   mutates the shared-boot RTC (and depends on firmware accepting
+   SetTime), so it lives in the integration test test-time-qemu.sh —
+   per feedback_uefi_firmware_test_hazards (don't drive firmware-
+   mutating paths from the combined unit boot). */
+static void
+test_time_set(void)
+{
+    test_check(axl_time_set_realtime(NULL) == AXL_ERR,
+               "time: set_realtime(NULL) rejected");
+    test_check(axl_time_set_unix(-1) == AXL_ERR,
+               "time: set_unix(-1) rejected (pre-epoch)");
+    /* 253402300800 == 10000-01-01T00:00:00Z — first second past the
+       year a 16-bit RTC year can hold; rejected before any firmware
+       call. */
+    test_check(axl_time_set_unix((int64_t)253402300800LL) == AXL_ERR,
+               "time: set_unix(year 10000) rejected (out of range)");
+}
+
 static void
 test_time_sleep(void)
 {
@@ -4460,6 +4481,37 @@ test_shell_launch(void)
        no StartImage, no foreground transfer, nothing to hang the boot. */
     test_check(axl_image_run("fs0:\\not-a-real-app.efi", NULL, NULL) == AXL_ERR,
                "image_run: missing image returns -1");
+
+    /* axl_image_run_fv_file: NULL GUID is rejected before any FV walk or
+       LoadImage — a safe negative. The positive path StartImages a
+       firmware-embedded app and blocks the foreground (it would hang the
+       combined unit boot), so it is integration-only, exactly like the
+       axl_image_run / axl_shell_launch positive paths above. */
+    exit_code = 0xCAFE;
+    test_check(axl_image_run_fv_file(NULL, NULL, &exit_code) == AXL_ERR,
+               "image_run_fv_file: NULL guid returns AXL_ERR");
+    test_check(exit_code == 0,
+               "image_run_fv_file: NULL guid zeroes out_exit_code");
+
+    /* axl_shell_locate: read-only availability query (walks FVs + mounted
+       volumes, loads nothing) — safe in the combined boot. OVMF and AAVMF
+       both embed the ShellPkg Shell in a readable FV (FFS file GUID
+       gUefiShellFileGuid, type APPLICATION), so a Shell is always locatable
+       here. The unit ESP stages no file literally named Shell.efi (the boot
+       copy is BOOT<arch>.EFI), so the source is the firmware FV — unless a
+       runner happens to stage a real Shell.efi, in which case FILE wins and
+       we SKIP-balance the FIRMWARE assertion (keeping the per-arch count
+       constant). */
+    AxlShellSource src = axl_shell_locate();
+    test_check(src != AXL_SHELL_NONE,
+               "shell_locate: a Shell is available under OVMF/AAVMF");
+    if (src == AXL_SHELL_FILE) {
+        axl_printf("SKIP: shell_locate FIRMWARE (a Shell.efi file is staged)\n");
+        test_check(true, "shell_locate: SKIP balance (Shell.efi file staged)");
+    } else {
+        test_check(src == AXL_SHELL_FIRMWARE,
+                   "shell_locate: firmware-embedded Shell found (no file staged)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7696,6 +7748,7 @@ test_util_main(int argc, char **argv)
     test_image_verify_cn_extract();
     test_hexdump();
     test_time();
+    test_time_set();
     test_time_get_us();
     test_clock_gettime();
     test_time_sleep();

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=18 local-only=0
 # echo-server-sync integration test — runs the single-client sync
 # echo server inside UEFI, connects from the host via hostfwd, and
 # verifies one echo round-trip (guest-side serial log + host-side
@@ -11,7 +12,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=17001
+HOST_PORT=$(test_port 0)
 GUEST_PORT=7001
 ECHO_MESSAGE="hello-from-host"
 

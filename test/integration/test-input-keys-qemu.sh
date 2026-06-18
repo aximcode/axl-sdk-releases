@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=socat est=9 local-only=0
 # test-input-keys-qemu.sh — empirically pin the Ctrl+letter encoding that
 # axl-input delivers, across the two UEFI console-input paths.
 #

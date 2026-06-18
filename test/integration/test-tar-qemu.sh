@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=71 local-only=0
 # test-tar-qemu.sh -- end-to-end test for tools/tar.efi over virtiofs.
 #
 # Exercises the ustar tool against a virtiofs-mounted host directory:

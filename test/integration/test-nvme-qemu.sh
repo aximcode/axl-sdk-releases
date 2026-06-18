@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-nvme-qemu.sh — AxlNvme against an emulated NVMe controller.
 #
 # The unit suite (AxlNvme) tests the pure decoders against fixed buffers

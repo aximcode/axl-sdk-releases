@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=31 local-only=0
 # test-gfx-simd-qemu.sh — validate + benchmark the SIMD-dispatched blur
 # across explicit QEMU CPU models (x86).
 #

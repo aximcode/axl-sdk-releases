@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=21 local-only=0
 # test-net-config-qemu.sh — AxlNet static-config / DNS / hostname end-to-end.
 #
 # The AxlTestUtil unit suite covers the pure descriptor group + AxlConfig

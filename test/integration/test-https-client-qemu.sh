@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=openssl est=15 local-only=0
 # test-https-client-qemu.sh — exercises the HTTP CLIENT over https.
 #
 # This is the one TLS path the serve-tls suite doesn't cover: axl_tls_connect
@@ -26,8 +27,8 @@ if ! command -v openssl >/dev/null 2>&1; then
     exit 0
 fi
 
-HOST_PORT=18443    # https server
-PLAIN_PORT=18080   # plain-http redirector -> the https server (cross-scheme)
+HOST_PORT=$(test_port 0)    # https server
+PLAIN_PORT=$(test_port 1)   # plain-http redirector -> the https server (cross-scheme)
 
 make -C "$PROJECT_DIR" ARCH=x64 AXL_TLS=1 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
     all tools 2>&1 | tail -3

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=62 local-only=0
 # rfbrowse.efi integration test — boots QEMU, runs rfbrowse against a
 # Python mock Redfish server on the host, validates serial log output.
 #
@@ -9,7 +10,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-MOCK_PORT=18082
+MOCK_PORT=$(test_port 0)
 
 # Determine build output directory
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

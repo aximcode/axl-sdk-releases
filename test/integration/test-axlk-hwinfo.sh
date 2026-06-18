@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=20 local-only=0
 # axl-kernel K6 integration test — runs axlk-hwinfo-server.efi as
 # an axl-kernel process in QEMU, drives it with curl from the host
 # via hostfwd, verifies each endpoint returns valid JSON. This is
@@ -13,7 +14,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18080
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

@@ -39,4 +39,12 @@ child Shell launched *from* ``startup.nsh`` doesn't recurse. The
 AXL-ified form of the EDK2 ShellLauncher; pairs with
 :doc:`console-mirror` to host the real Shell over a remote terminal.
 
+When no ``Shell.efi`` is staged, ``axl_shell_launch_fv`` runs the
+firmware-embedded Shell straight out of a Firmware Volume (the
+ShellPkg application; layered on the reusable
+``axl_image_run_fv_file`` FV-file loader above), and
+``axl_shell_locate`` reports where a Shell is available
+(``AXL_SHELL_FILE`` / ``AXL_SHELL_FIRMWARE`` / ``AXL_SHELL_NONE``)
+without launching one.
+
 .. doxygenfile:: axl-shell.h

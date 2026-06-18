@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=20 local-only=0
 # test-mac-replay-qemu.sh — HF4: end-to-end NIC MAC replay.
 #
 # Proves the full chain: a fixture net.json carrying a distinctive

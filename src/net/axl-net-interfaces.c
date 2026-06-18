@@ -244,6 +244,16 @@ axl_net_get_ip_address(AxlIPv4Address *addr)
     }
 
     axl_backend_free(handles);
+
+    /* No IP4Config2-configured NIC. On firmware that lacks IP4Config2, a
+       Dhcp4-SB / PXE bring-up caches its lease — surface that address here so
+       this reader works on IP4Config2-free firmware too. */
+    AxlDhcpLease fb;
+    if (_axl_net_fallback_lease(&fb)) {
+        axl_memcpy(addr, fb.address, sizeof(EFI_IPv4_ADDRESS));
+        return AXL_OK;
+    }
+
     /* Quiet by design — this function is polled by axl_net_auto_init
        while waiting for DHCP, so a warning here would spam every second.
        Callers that care log their own message on final timeout. */

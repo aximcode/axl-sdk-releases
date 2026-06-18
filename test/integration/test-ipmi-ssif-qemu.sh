@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=9 local-only=0
 # test-ipmi-ssif-qemu.sh — exercise AxlIpmi's SSIF transport against
 # QEMU's BMC simulator via the SMBus IPMI device.
 #

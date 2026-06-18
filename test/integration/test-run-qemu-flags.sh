@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=1 local-only=0
 # test-run-qemu-flags.sh -- argument-parsing tests for run-qemu.sh.
 #
 # These run on the host (no QEMU), so they're cheap and live outside

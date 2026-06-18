@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=20 local-only=0
 # test-mkfixture-qemu.sh -- end-to-end test for tools/mkfixture.efi.
 #
 # Captures a fixture from a running OVMF guest into a virtiofs-mounted

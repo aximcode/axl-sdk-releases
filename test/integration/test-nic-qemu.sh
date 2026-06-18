@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=31 local-only=0
 # test-nic-qemu.sh — AxlNet driver-selection substrate against a real NIC.
 #
 # The AxlTestNet unit suite covers the bus-location trim against synthetic

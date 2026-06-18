@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=7 local-only=0
 # axl-kernel POC integration test — boots AxlKernelPoc.efi in QEMU,
 # verifies that ping-pong + stress tests pass.
 #

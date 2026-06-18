@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=16 local-only=0
 # test-ws-broadcast-tls-qemu.sh — rapid WS broadcast over TLS must not desync.
 #
 # Regression for the ws-broadcast-over-TLS stream-desync wedge (SoftBMC
@@ -23,7 +24,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18447
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8443
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

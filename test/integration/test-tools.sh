@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=9 local-only=0
 # AXL tool tests — boots QEMU and verifies each tool produces correct output.
 #
 # Usage: ./test/integration/test-tools.sh [--arch X64|AARCH64]

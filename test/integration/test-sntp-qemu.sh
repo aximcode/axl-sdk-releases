@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=15 local-only=0
 # test-sntp-qemu.sh — axl_sntp_query against a host-side mock SNTP server.
 #
 # Boots QEMU with SLIRP networking; the guest queries 10.0.2.2:<port> (SLIRP
@@ -13,7 +14,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-SNTP_HOST_PORT=19123
+SNTP_HOST_PORT=$(test_port 0)
 SNTP_UNIX_SECS=1700000000   # fixed, known time the mock serves
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

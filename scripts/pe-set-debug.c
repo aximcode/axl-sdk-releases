@@ -7,6 +7,10 @@
  *   2. Sets the PE data directory [6] (DEBUG) to point to it
  *   3. Patches the DebugDirEntry's RVA and file offset
  *   4. Writes the module name into the RSDS filename field
+ *   5. Sets the NX_COMPAT bit in DllCharacteristics (the images are built
+ *      W^X-clean — R-X .text, RW .data — so they should advertise NX
+ *      compatibility for firmware that enforces memory protection, which is
+ *      the norm under Secure Boot). Verified by scripts/check-pe-nx.py.
  *
  * Usage: pe-set-debug <file.efi> [module-name]
  *
@@ -27,9 +31,13 @@
 #define RSDS_SIGNATURE          0x53445352
 
 /* Offsets within PE32+ optional header (from start of optional header) */
+#define OPT64_DLLCHARACTERISTICS_OFF 70  /* offset of DllCharacteristics */
 #define OPT64_NUM_DATA_DIRS_OFF 108  /* offset of NumberOfRvaAndSizes */
 #define OPT64_DATA_DIR_OFF      112  /* offset of first DataDirectory entry */
 #define DATA_DIR_ENTRY_SIZE     8    /* {VirtualAddress, Size} */
+
+/* DllCharacteristics bit: image is compatible with NX / memory protection. */
+#define IMAGE_DLLCHARACTERISTICS_NX_COMPAT 0x0100
 
 /* Section header size */
 #define SECTION_HEADER_SIZE     40
@@ -64,6 +72,13 @@ w32(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)(v >> 8);
     p[2] = (uint8_t)(v >> 16);
     p[3] = (uint8_t)(v >> 24);
+}
+
+static void
+w16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v);
+    p[1] = (uint8_t)(v >> 8);
 }
 
 int
@@ -133,6 +148,13 @@ main(int argc, char **argv)
         free(data);
         return 1;
     }
+
+    /* Advertise NX-compatibility. The images are linked W^X-clean (R-X .text,
+       RW non-executable .data), so set IMAGE_DLLCHARACTERISTICS_NX_COMPAT so
+       firmware that enforces memory protection (the norm under Secure Boot)
+       applies it instead of warning on or rejecting the image. */
+    uint8_t *dllchar = opt + OPT64_DLLCHARACTERISTICS_OFF;
+    w16(dllchar, (uint16_t)(r16(dllchar) | IMAGE_DLLCHARACTERISTICS_NX_COMPAT));
 
     uint32_t num_dd = r32(opt + OPT64_NUM_DATA_DIRS_OFF);
     if (num_dd <= DEBUG_DIR_INDEX) {

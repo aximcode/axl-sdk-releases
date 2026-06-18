@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=20 local-only=0
 # test-webdav-fs-qemu.sh — axl_http_server_serve_fs end to end.
 #
 # Boots AxlTestNet.efi serve-davfs (an fs-backed WebDAV file server over a
@@ -19,7 +20,7 @@ export TEST_SKIP_RATCHET=1
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18090
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

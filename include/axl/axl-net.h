@@ -364,6 +364,29 @@ int
 axl_net_drivers_up(void);
 
 /**
+ * @brief Take over the NIC with staged drivers — only if the firmware
+ *     provides NO SimpleNetwork stack of its own.
+ *
+ * For OEM firmware that exposes its NIC only through proprietary drivers and
+ * publishes ZERO SimpleNetwork handles. This disconnects the firmware's
+ * controllers and connects AXL's staged drivers so a standard SNP/MNP/IP4/TCP4
+ * stack comes up, then reconnects the stack.
+ *
+ * Condition-gated by design: if any SimpleNetwork handle is already present
+ * — before, or after a plain @ref axl_net_ensure_drivers attempt — this is a
+ * NO-OP and returns AXL_OK. An over-eager takeover **destroys a working
+ * firmware stack** (observed: forcing iPXE + disconnect on a box that already
+ * had SNP killed networking), so the guard is the point: takeover runs only
+ * when there is provably nothing to lose.
+ *
+ * @return AXL_OK if a SimpleNetwork handle is present after the call (whether
+ *     it was already there — the no-op case — or the takeover brought one up);
+ *     AXL_ERR if no SNP handle exists even after the takeover attempt.
+ */
+int
+axl_net_takeover_if_no_snp(void);
+
+/**
  * @brief Bring up networking with a single call — drivers + DHCP or
  *     static IP + address read-back.
  *
@@ -551,18 +574,85 @@ typedef struct {
  * the leased address / mask / default gateway (from the interface's route
  * table) and the DHCP-provided resolver(s). A purely local, synchronous read
  * (no network round-trip). A NIC on a static policy, or one that has not yet
- * leased an address, is not a DHCP lease and returns AXL_ERR. @p nic_index is
- * a concrete index into the interface list (it does NOT accept
- * AXL_NET_NIC_AUTO).
+ * leased an address, is not a DHCP lease and returns AXL_ERR.
+ *
+ * @warning @p nic_index indexes the IP4Config2 handle buffer, which is NOT the
+ *     same index space as @ref axl_net_list_interfaces / @ref
+ *     axl_net_get_link_stats (those index the SimpleNetwork handle buffer, and
+ *     IP4Config2 lives on a child handle on some OEM firmware). An out-of-range
+ *     index is clamped to the first handle. On a multi-NIC box, passing a
+ *     list-index here can therefore return a different NIC's lease. Use
+ *     @ref axl_net_get_dhcp_lease_by_mac to look a lease up unambiguously by
+ *     the NIC's MAC (the stable key from @c AxlNetInterface.mac). It does NOT
+ *     accept AXL_NET_NIC_AUTO.
  *
  * @return AXL_OK with @p out filled; AXL_ERR on NULL @p out, a bad NIC index,
  *     no IP4Config2 on the NIC, a non-DHCP policy, or no leased address.
  */
 int
 axl_net_get_dhcp_lease(
-    size_t        nic_index,  ///< concrete NIC index (from axl_net_list_interfaces)
+    size_t        nic_index,  ///< IP4Config2-handle index (see @warning; not the SNP/list index)
     AxlDhcpLease *out         ///< [out] leased configuration
 );
+
+/**
+ * @brief Read a NIC's active DHCP-leased configuration, keyed by MAC.
+ *
+ * The robust counterpart to @ref axl_net_get_dhcp_lease for multi-NIC hosts:
+ * resolves the IP4Config2 instance by matching its SimpleNetwork MAC to @p mac
+ * (the same MAC correlation @ref axl_net_list_interfaces uses to fill its IPv4
+ * columns), so the result is correct regardless of IP4Config2-vs-SNP handle
+ * ordering. The reported fields and the DHCP-policy / leased-address
+ * preconditions are identical to @ref axl_net_get_dhcp_lease.
+ *
+ * @p mac is the stable key paired with @c AxlNetInterface.mac: iterate
+ * @ref axl_net_list_interfaces, then call this with a row's @c mac. Correlation
+ * is by exact 6-byte match and assumes MACs are unique; if two NICs share a MAC
+ * the first match in enumeration order wins. @p out is fully zeroed before any
+ * field is set, so on AXL_ERR every field reads 0.
+ *
+ * @return AXL_OK with @p out filled; AXL_ERR on NULL @p mac or @p out, no
+ *     IP4Config2 NIC carrying that MAC, a non-DHCP policy, or no leased address.
+ */
+int
+axl_net_get_dhcp_lease_by_mac(
+    const uint8_t  mac[6],  ///< NIC MAC (from AxlNetInterface.mac)
+    AxlDhcpLease  *out      ///< [out] leased configuration
+);
+
+// ---------------------------------------------------------------------------
+// Which mechanism brought the NIC up (IP4Config2-free bring-up ladder)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief How @ref axl_net_init / @ref axl_net_auto_init last configured a NIC.
+ *
+ * The standard path is the firmware's `EFI_IP4_CONFIG2_PROTOCOL` policy layer.
+ * Some OEM firmware (e.g. HP business laptops) ships a full network stack —
+ * SimpleNetwork, MNP/ARP/IP4/TCP4/UDP4 and `Dhcp4ServiceBinding` — but **no**
+ * IP4Config2. On such firmware the bring-up transparently falls back down a
+ * ladder; this enum records which rung succeeded so a consumer can surface it
+ * (e.g. "no IP4Config2 — configured via DHCP4-SB") instead of a mystery.
+ */
+typedef enum {
+    AXL_NET_CONFIG_NONE = 0,    ///< not configured (no bring-up has succeeded)
+    AXL_NET_CONFIG_IP4CONFIG2,  ///< via EFI_IP4_CONFIG2_PROTOCOL (the standard path)
+    AXL_NET_CONFIG_DHCP4_SB,    ///< via EFI_DHCP4_SERVICE_BINDING (no IP4Config2)
+    AXL_NET_CONFIG_PXE_BC,      ///< via EFI_PXE_BASE_CODE_PROTOCOL.Dhcp (last resort)
+} AxlNetConfigMethod;
+
+/**
+ * @brief The mechanism that configured the NIC on the last bring-up.
+ *
+ * Reflects the most recent @ref axl_net_init / @ref axl_net_auto_init /
+ * @ref axl_net_bring_up call in this process. @ref AXL_NET_CONFIG_NONE before
+ * any successful bring-up (or after one that failed). Process-global, not
+ * per-NIC — matches the single-NIC focus of the bring-up helpers.
+ *
+ * @return the active @ref AxlNetConfigMethod.
+ */
+AxlNetConfigMethod
+axl_net_last_config_method(void);
 
 // ---------------------------------------------------------------------------
 // Reverse DNS (PTR)

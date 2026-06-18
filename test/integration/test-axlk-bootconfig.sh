@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=19 local-only=0
 # axl-kernel second SoftBMC-port test — runs axlk-bootconfig-server
 # inside QEMU, drives it with curl from the host, verifies that it
 # successfully reads UEFI NVRAM variables (BootOrder, Boot####,
@@ -15,7 +16,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18081
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8081
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

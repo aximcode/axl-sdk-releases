@@ -122,6 +122,23 @@ axl_backend_get_time(
     );
 
 /**
+ * @brief Set the current date/time in firmware
+ *     (EFI_RUNTIME_SERVICES.SetTime).
+ *
+ * The write counterpart to @ref axl_backend_get_time. The AXL
+ * `INT16_MIN` timezone sentinel maps back to EFI's
+ * `EFI_UNSPECIFIED_TIMEZONE` (2047); `daylight` is passed through to
+ * `EFI_TIME.Daylight`. The firmware validates the fields.
+ *
+ * @return AXL_OK on success, AXL_ERR on NULL input or firmware
+ *     failure.
+ */
+int
+axl_backend_set_time(
+    const AxlTime  *time  ///< time to program into the RTC
+    );
+
+/**
  * @brief Read a high-resolution monotonic counter, in microseconds.
  *
  * Uses the architecture's cycle counter (x86 TSC / aarch64

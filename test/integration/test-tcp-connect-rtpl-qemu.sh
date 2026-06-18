@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=16 local-only=0
 # Raised-TPL sync-TCP integration test — boots QEMU with networking and
 # does a synchronous TCP connect + send + recv to a host-side echo server
 # while at TPL_CALLBACK (the level a sync TCP op reaches when called from
@@ -35,7 +36,7 @@ if [[ "$TEST_ARCH" == "AARCH64" ]]; then
     exit 0
 fi
 
-ECHO_HOST_PORT=19002
+ECHO_HOST_PORT=$(test_port 0)
 
 # Build library + test binaries
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

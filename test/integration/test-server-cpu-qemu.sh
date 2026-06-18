@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=48 local-only=0
 # Post-traffic server CPU regression test.
 #
 # Boots an HTTPS server driven by a RESIDENT driver-tick loop
@@ -31,7 +32,7 @@ if [[ "$TEST_ARCH" == "AARCH64" ]]; then
     exit 0
 fi
 
-HOST_PORT=18445
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8443
 REQUESTS=20
 SETTLE_SECS=3        # let connections (TIME_WAIT) drain before sampling

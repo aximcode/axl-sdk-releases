@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=10 local-only=0
 # test-pk-verify-qemu.sh — axl_pk_verify() ECDSA-P256 against a real mbedTLS.
 #
 # Auxiliary single-binary test (opt out of the test-axl.sh ratchet). The

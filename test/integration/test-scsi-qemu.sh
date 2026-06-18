@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=0
 # test-scsi-qemu.sh — AxlScsi against an emulated virtio-scsi disk + CD.
 #
 # The unit suite (AxlScsi) tests the pure decoders against fixed buffers.

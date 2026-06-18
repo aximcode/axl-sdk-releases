@@ -23,9 +23,10 @@ devtype_name(uint8_t t)
     }
 }
 
-int
-main(void)
+AXL_TOOL_MAIN(scsi)
 {
+    (void)argc;
+    (void)argv;
     AxlScsiDev *dev = NULL;
     int         n = 0;
 

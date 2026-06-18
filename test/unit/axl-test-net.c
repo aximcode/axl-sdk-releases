@@ -2662,6 +2662,64 @@ run_serve_shell_coexist_mode(void)
 }
 
 // ---------------------------------------------------------------------------
+// FV-embedded Shell coexistence — "serve-shell-fv-coexist". The no-file-staged
+// counterpart of serve-shell-coexist: instead of axl_shell_launch (which needs
+// a Shell.efi file), report axl_shell_locate() and launch the firmware-embedded
+// Shell out of a Firmware Volume via axl_shell_launch_fv. Under OVMF/AAVMF the
+// Shell lives in a readable FV (no file staged), so this is the real round-trip
+// proof: a 200 returned WHILE the FV Shell holds the foreground means
+// LoadImage+StartImage transferred control to the FV-embedded image, and the
+// driver-tick timer keeps pumping the background HTTP server underneath it.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_shell_fv_coexist_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8080);
+    if (loop == NULL || s == NULL) {
+        axl_printf("ERROR: server setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(s, "GET", "/plain", on_get_plain, NULL);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    if (axl_loop_attach_driver(loop, 10) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    /* Report where a Shell is locatable so the harness can assert FIRMWARE. */
+    axl_printf("LOCATE=%d\n", (int)axl_shell_locate());
+
+    axl_printf("HTTP server (driver-tick) on 8080; launching FV Shell\n");
+    axl_printf("READY\n");
+
+    /* StartImage(FV-embedded Shell) — blocks. The HTTP server keeps serving
+       off the timer the whole time. -nostartup avoids startup.nsh recursion. */
+    int exit_code = 0;
+    int rc = axl_shell_launch_fv("-nostartup", &exit_code);
+    if (rc != AXL_OK) {
+        /* No readable FV carries the Shell on this firmware: report so the
+           harness can SKIP-balance rather than read it as a coexistence
+           failure. */
+        axl_printf("NO_FV_SHELL\n");
+        return 0;
+    }
+
+    /* Reached only if the Shell exits (it won't in the unattended test). */
+    axl_loop_detach_driver(loop);
+    axl_printf("FV_SHELL_EXITED %d\n", exit_code);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Console-mirror rung 5 (P3) — "serve-tls-shell-coexist". The deployment-
 // faithful SoftBMC shape, all three at once: the AxlConsoleMirror wrapping the
 // console, an HTTPS server pumped by axl_loop_attach_driver (TPL_CALLBACK), and
@@ -3831,6 +3889,16 @@ test_net_resolve_ptr_validation(void)
     test_check(axl_net_get_dhcp_lease(0, NULL) == AXL_ERR,
                "dhcp-lease: NULL out -> AXL_ERR");
 
+    /* get_dhcp_lease_by_mac: NULL mac / NULL out return on the guard before
+       any protocol call. The live by-MAC read + unknown-MAC rejection are
+       exercised in net-diag mode. */
+    AxlDhcpLease lease_guard;
+    static const uint8_t mac_guard[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    test_check(axl_net_get_dhcp_lease_by_mac(NULL, &lease_guard) == AXL_ERR,
+               "dhcp-lease-by-mac: NULL mac -> AXL_ERR");
+    test_check(axl_net_get_dhcp_lease_by_mac(mac_guard, NULL) == AXL_ERR,
+               "dhcp-lease-by-mac: NULL out -> AXL_ERR");
+
     /* ping_ex: NULL target / out return on the guard before any IP4 call.
        The live probe (end-to-end IP4 setup/transmit/timeout) is exercised in
        net-diag mode; SLIRP drops ICMP so it can only assert the probe COMPLETES
@@ -4494,6 +4562,43 @@ run_net_diag_mode(void)
         ND_CHECK(lease.dns_count >= 1,
                  "dhcp-lease: at least one DNS resolver");
     }
+
+    /* by-MAC lease accessor. In the single-NIC QEMU profile the IP4Config2 and
+       SNP index spaces coincide, so the MAC-resolved lease must equal the
+       index-0 lease byte-for-byte (same NIC, two lookup paths). The decisive
+       difference from the index path is the unknown-MAC case: by-MAC must fail
+       cleanly rather than clamp to NIC 0. */
+    AxlNetInterface nd_ifaces[4];
+    size_t nd_nif = 4;
+    if (axl_net_list_interfaces(nd_ifaces, &nd_nif) == AXL_OK && nd_nif >= 1) {
+        AxlDhcpLease lease_mac;
+        int rcm = axl_net_get_dhcp_lease_by_mac(nd_ifaces[0].mac, &lease_mac);
+        ND_CHECK(rcm == AXL_OK,
+                 "dhcp-lease-by-mac: returns AXL_OK for eth0 MAC");
+        if (rcm == AXL_OK && rc == AXL_OK) {
+            ND_CHECK(axl_memcmp(&lease_mac, &lease, sizeof(lease)) == 0,
+                     "dhcp-lease-by-mac: matches index-0 lease byte-for-byte");
+        }
+        static const uint8_t bogus_mac[6] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+        AxlDhcpLease lease_bogus;
+        ND_CHECK(axl_net_get_dhcp_lease_by_mac(bogus_mac, &lease_bogus) == AXL_ERR,
+                 "dhcp-lease-by-mac: unknown MAC -> AXL_ERR (no clamp)");
+    }
+
+    /* Config method: OVMF provides IP4Config2, so the bring-up at the top of
+       this mode used the standard path (the IP4Config2-free Dhcp4-SB / PXE
+       fallbacks are real-HW-only — OVMF can't exercise them). */
+    ND_CHECK(axl_net_last_config_method() == AXL_NET_CONFIG_IP4CONFIG2,
+             "config-method: IP4Config2 path on OVMF");
+
+    /* NIC takeover must be a NO-OP when SNP is already present (OVMF has SNP) —
+       the guard that prevents destroying a working firmware stack. It must
+       return AXL_OK and leave networking intact. */
+    ND_CHECK(axl_net_takeover_if_no_snp() == AXL_OK,
+             "takeover: no-op AXL_OK when SNP present");
+    AxlIPv4Address post_takeover_addr;
+    ND_CHECK(axl_net_get_ip_address(&post_takeover_addr) == AXL_OK,
+             "takeover: networking still up after no-op takeover");
 
     /* ping_ex end-to-end over the live IP4 stack. SLIRP is a NAT that does NOT
        answer ICMP echo (verified: even the gateway never replies), so under
@@ -5881,6 +5986,15 @@ test_net_main(
     //
     if (argc >= 2 && axl_strcmp(argv[1], "serve-shell-coexist") == 0) {
         return run_serve_shell_coexist_mode();
+    }
+
+    //
+    // "serve-shell-fv-coexist" -- foreground FV-embedded Shell (no file staged)
+    // + background HTTP pumped by axl_loop_attach_driver. The axl_shell_launch_fv
+    // round-trip proof.
+    //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-shell-fv-coexist") == 0) {
+        return run_serve_shell_fv_coexist_mode();
     }
 
     //

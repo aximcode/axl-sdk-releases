@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs=openssl est=29 local-only=0
 # test-consumer-emulator-qemu.sh — the consumer-emulator harness.
 #
 # Models SoftBMC's execution topology in-repo so the SDK breaks first, not the
@@ -35,8 +36,8 @@ if [[ "$TEST_ARCH" == "AARCH64" ]]; then
     exit 0
 fi
 
-H_TLS=18450     # host -> guest 8443 (HTTPS)
-H_PLAIN=18451   # host -> guest 8081 (plain HTTP)
+H_TLS=$(test_port 0)     # host -> guest 8443 (HTTPS)
+H_PLAIN=$(test_port 1)   # host -> guest 8081 (plain HTTP)
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)
 _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"

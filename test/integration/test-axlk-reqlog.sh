@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=20 local-only=0
 # axl-kernel third SoftBMC-port test — runs axlk-reqlog-server inside
 # QEMU and drives it with curl from the host. Validates two things:
 #
@@ -18,7 +19,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18082
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8082
 RING_CAP=8
 MAX_CLIENTS=24

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=9 local-only=0
 # test-clip-paste.sh — cross-app clipboard proof. `clip` and `paste` are
 # separate image invocations within one boot; the clipboard is AXL shared
 # memory (axl-shm) in EfiBootServicesData pool + an installed protocol, so

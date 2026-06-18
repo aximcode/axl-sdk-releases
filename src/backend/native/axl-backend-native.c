@@ -186,6 +186,41 @@ axl_backend_get_time(
     return AXL_OK;
 }
 
+/**
+ * @brief Set the current date/time in firmware.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_set_time(
+    const AxlTime  *time  ///< time to program into the RTC
+    )
+{
+    EFI_TIME    efi_time = { 0 };
+    EFI_STATUS  status;
+
+    if (time == NULL) {
+        return AXL_ERR;
+    }
+
+    efi_time.Year       = time->year;
+    efi_time.Month      = time->month;
+    efi_time.Day        = time->day;
+    efi_time.Hour       = time->hour;
+    efi_time.Minute     = time->minute;
+    efi_time.Second     = time->second;
+    efi_time.Nanosecond = time->nanosecond;
+    efi_time.Daylight   = time->daylight;
+    /* Inverse of the GetTime mapping: our INT16_MIN "unspecified"
+       sentinel becomes EFI's EFI_UNSPECIFIED_TIMEZONE (2047). */
+    efi_time.TimeZone   = (time->timezone_minutes == INT16_MIN)
+        ? 2047
+        : time->timezone_minutes;
+
+    status = gRT->SetTime(&efi_time);
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
 /* High-resolution monotonic microseconds. The wallclock from
    gRT->GetTime is only second-resolution on most firmware (OVMF and
    most BMC firmware leave EFI_TIME.Nanosecond=0). Use the architecture's

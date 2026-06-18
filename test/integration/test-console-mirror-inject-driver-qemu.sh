@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=24 local-only=0
 # test-console-mirror-inject-driver-qemu.sh — the AxlConsoleMirror P1 GATE.
 #
 # Proves axl_console_mirror_inject_text wakes the FOREGROUND Shell when the
@@ -30,7 +31,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18446
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

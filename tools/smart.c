@@ -21,9 +21,10 @@ transport_name(AxlStorageTransport t)
     }
 }
 
-int
-main(void)
+AXL_TOOL_MAIN(smart)
 {
+    (void)argc;
+    (void)argv;
     AxlStorageDev *dev = NULL;
     int            n = 0;
 

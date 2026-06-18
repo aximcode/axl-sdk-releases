@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=8 local-only=0
 # Test the example DXE driver — loads it, verifies output, unloads it.
 #
 # Usage: ./test/integration/test-driver.sh [--arch X64|AARCH64]

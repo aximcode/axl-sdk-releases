@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=41 local-only=0
 # test-cpu-topology-qemu.sh — axl_cpu_topology() against explicit QEMU
 # -smp layouts.
 #

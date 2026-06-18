@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=17 local-only=0
 # test-ws-teardown-driver-qemu.sh — WS connect/disconnect must not wedge a
 # resident driver-tick loop.
 #
@@ -27,7 +28,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18445
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8443
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

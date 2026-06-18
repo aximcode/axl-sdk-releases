@@ -38,6 +38,10 @@ VERSION=""
 DRY_RUN=false
 ASSUME_YES=false
 RESUME=false
+CI_GATE=false   # CI now runs only on vX.0.0 tags / workflow_dispatch, NOT on
+                # every push, so the release gate is the LOCAL suite (see
+                # docs/RELEASING.md). --ci-gate opts back into waiting for a CI
+                # run on the release commit (e.g. one you triggered manually).
 RELEASES_REPO="aximcode/axl-sdk-releases"
 
 for arg in "$@"; do
@@ -45,6 +49,7 @@ for arg in "$@"; do
         --dry-run) DRY_RUN=true ;;
         --yes|-y)  ASSUME_YES=true ;;
         --resume)  RESUME=true ;;
+        --ci-gate) CI_GATE=true ;;
         -*)        echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
         *)
             if [[ -n "$VERSION" ]]; then
@@ -155,8 +160,13 @@ tag_and_publish() {
     git tag -a "$TAG" -m "$(make_tag_message)"
     git push origin "$TAG"
 
-    say "Watching CI + Release + Docs for $TAG"
-    if ! scripts/watch-release-runs.sh "$TAG"; then
+    # CI + Docs trigger only on a MAJOR tag (vX.0.0); every release tag triggers
+    # Release. Tell the watcher which to expect so a minor/patch cut doesn't hang
+    # waiting for CI/Docs that never run.
+    local expect="Release"
+    [[ "$VERSION" =~ ^[0-9]+\.0\.0$ ]] && expect="CI Release Docs"
+    say "Watching $expect for $TAG"
+    if ! EXPECT_WORKFLOWS="$expect" scripts/watch-release-runs.sh "$TAG"; then
         die "a release workflow did not succeed — see the output above and 'gh run list'"
     fi
 
@@ -174,7 +184,7 @@ if $RESUME; then
     [[ "$(cat VERSION)" == "$VERSION" ]] || die "VERSION is $(cat VERSION), not $VERSION — nothing to resume"
     [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main 2>/dev/null)" ]] \
         || die "HEAD != origin/main — push main first"
-    wait_for_ci "$(git rev-parse HEAD)" || die "CI is not green on origin/main HEAD"
+    $CI_GATE && { wait_for_ci "$(git rev-parse HEAD)" || die "CI is not green on origin/main HEAD"; }
     tag_and_publish "$(git rev-parse HEAD)"
     exit 0
 fi
@@ -222,17 +232,28 @@ git push origin main
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"
 
-if ! wait_for_ci "$REL_SHA"; then
-    cat >&2 <<EOF
+if $CI_GATE; then
+    # CI no longer auto-runs on a push, so trigger it on the release commit and
+    # wait for it before tagging.
+    say "Triggering CI on main (--ci-gate)"
+    gh workflow run ci.yml --ref main || die "could not dispatch ci.yml (gh auth / workflow name?)"
+    sleep 10   # let the dispatched run register before polling
+    if ! wait_for_ci "$REL_SHA"; then
+        cat >&2 <<EOF
 
 CI did NOT pass on the release commit — NOT tagging (a published tag can't be
 re-cut; see docs/RELEASING.md "Recovery"). The 'release: $TAG' commit is on
 origin/main. To recover:
   1. fix the failure on main (normal commits) and push;
   2. wait for CI to go green;
-  3. run:  scripts/cut-release.sh $VERSION --resume
+  3. run:  scripts/cut-release.sh $VERSION --resume --ci-gate
 EOF
-    exit 1
+        exit 1
+    fi
+else
+    note "CI gate SKIPPED — the LOCAL suite is the release gate now."
+    note "Run './test/integration/run-integration.sh -j\$(nproc)' before cutting"
+    note "(see docs/RELEASING.md). Pass --ci-gate to wait on a manual CI run."
 fi
 
 tag_and_publish "$REL_SHA"

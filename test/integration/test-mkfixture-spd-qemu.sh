@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=11 local-only=1
 # test-mkfixture-spd-qemu.sh — HF4: mkfixture SPD capture.
 #
 # Boots mkfixture.efi --spd against a canned DDR4 SPD blob attached at

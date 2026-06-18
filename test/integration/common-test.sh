@@ -52,7 +52,18 @@ test_parse_args() {
 
 test_setup() {
     TEST_START_TIME=$(date +%s%N)
-    TEST_TMPDIR=$(mktemp -d)
+    # Build the per-test scratch (a ~40 MB QEMU image + pflash vars) on a tmpfs
+    # when available — under the parallel pool, concurrent root-fs image builds
+    # are an I/O bottleneck that starves booting guests. When run-integration.sh
+    # set AXL_QEMU_TMPDIR, nest under it so the whole run's scratch is cleaned
+    # wholesale even if a SIGTERM skips our own trap below; else prefer /dev/shm.
+    _tt_base="${AXL_QEMU_TMPDIR:-}"
+    if [[ -z "$_tt_base" && -d /dev/shm && -w /dev/shm ]]; then _tt_base=/dev/shm; fi
+    if [[ -n "$_tt_base" ]]; then
+        TEST_TMPDIR=$(mktemp -d -p "$_tt_base" axl-ctest.XXXXXXXX)
+    else
+        TEST_TMPDIR=$(mktemp -d)
+    fi
     TEST_STAGING="$TEST_TMPDIR/staging"
     TEST_DISK="$TEST_TMPDIR/test.img"
     TEST_LOG="$TEST_TMPDIR/serial.log"
@@ -72,8 +83,9 @@ test_setup() {
     # Copy NVRAM template
     cp "$FW_VARS" "$TEST_NVRAM"
 
-    # Cleanup trap
-    trap 'test_cleanup' EXIT
+    # Cleanup trap. Include INT/TERM, not just EXIT: a `timeout` wrapper's
+    # SIGTERM would otherwise bypass EXIT and leak the (40 MB) scratch dir.
+    trap 'test_cleanup' EXIT INT TERM
 }
 
 test_cleanup() {
@@ -281,6 +293,18 @@ _test_nic_device() {
     else
         echo "e1000"
     fi
+}
+
+# Per-worker host-port allocation. run-integration.sh exports a distinct
+# TEST_PORT_BASE per concurrent worker so parallel tests never collide on a
+# host port; a standalone invocation falls back to a fixed base, preserving
+# today's behavior. A test derives each host port it needs as
+# `test_port <slot>` (slot 0, 1, 2, ...). The same TEST_PORT_BASE drives both
+# the host-side server and the value baked into the guest's startup.nsh, so the
+# two always agree within a single test run.
+: "${TEST_PORT_BASE:=18000}"
+test_port() {
+    echo $(( TEST_PORT_BASE + ${1:-0} ))
 }
 
 # Add port forwarding: test_add_port_forward HOST_PORT GUEST_PORT

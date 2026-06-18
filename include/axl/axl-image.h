@@ -29,6 +29,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-sys.h>     /* AxlGuid */
 
 #ifdef __cplusplus
 extern "C" {
@@ -158,6 +159,45 @@ axl_image_run(
     const char *path,          ///< image path (UEFI shell syntax)
     const char *args,          ///< command-line / LoadOptions (UTF-8), or NULL
     int        *out_exit_code  ///< [out] image's exit code (NULL allowed)
+);
+
+/**
+ * @brief Load + run an image embedded in a firmware volume, by file GUID.
+ *
+ * The FV-embedded counterpart of @ref axl_image_run: instead of a path on a
+ * mounted volume, it locates the firmware file whose name GUID is
+ * @p name_guid in a readable Firmware Volume (`EFI_FV2_READ_STATUS`),
+ * `LoadImage`s it directly out of the FV (no file staged on any
+ * filesystem), installs @p args as `LoadOptions`, `StartImage` (which
+ * **blocks** until the image returns), and unloads it. This is how a
+ * consumer runs a firmware-embedded tool — most notably the
+ * vendor-supplied UEFI Shell (see @ref axl_shell_launch_fv) — with nothing
+ * staged on disk.
+ *
+ * @p name_guid is the FFS file name GUID — an @ref AxlGuid (write it with the
+ * @ref AXL_GUID macro), the same value the firmware's file directory carries.
+ * Only files of type `EFI_FV_FILETYPE_APPLICATION` are matched. All readable
+ * FVs are searched and the first match wins; the order among multiple FVs
+ * carrying the same GUID is firmware-dependent and unspecified, so a consumer
+ * needing one specific FV's build should not rely on it (harmless for the
+ * Shell — every instance is equivalent).
+ *
+ * @p args is installed as the image's `LoadOptions`, UTF-8 encoded to UCS-2
+ * exactly as @ref axl_image_run does; pass NULL (or "") for none.
+ *
+ * Cleanup is atomic: on any failure after the image loads, it is unloaded
+ * before returning. @p out_exit_code is set to 0 up front, so it reads 0 on
+ * every failure path.
+ *
+ * @return AXL_OK if the file was found, started, and has now returned (its
+ *     exit code is in @p out_exit_code); AXL_ERR if @p name_guid is NULL,
+ *     no readable FV carries a matching application, or load/start failed.
+ */
+int
+axl_image_run_fv_file(
+    const AxlGuid  *name_guid,      ///< FFS file name GUID (see AXL_GUID)
+    const char     *args,           ///< command-line / LoadOptions (UTF-8), or NULL
+    int            *out_exit_code   ///< [out] image's exit code (NULL allowed)
 );
 
 /**

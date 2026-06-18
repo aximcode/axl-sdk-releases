@@ -34,6 +34,27 @@ format_uint(char *buf, size_t buf_size, unsigned val, size_t width)
     return width;
 }
 
+/**
+ * Inverse of the backend's days_from_civil (Howard Hinnant's
+ * civil_from_days, public domain): convert a count of days since the
+ * Unix epoch (1970-01-01) into a Gregorian year/month/day. Valid for
+ * the full proleptic Gregorian range; axl_time_set_unix only feeds it
+ * the post-epoch range it pre-validates.
+ */
+static void
+civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+{
+    z += 719468;
+    int64_t era  = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);                  // [0, 146096]
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);       // [0, 365]
+    unsigned mp  = (5 * doy + 2) / 153;                           // [0, 11]
+    *d = doy - (153 * mp + 2) / 5 + 1;                            // [1, 31]
+    *m = mp < 10 ? mp + 3 : mp - 9;                               // [1, 12]
+    *y = (int)((int64_t)yoe + era * 400 + (*m <= 2));
+}
+
 // ---------------------------------------------------------------------------
 // Public API — formatting
 // ---------------------------------------------------------------------------
@@ -158,4 +179,56 @@ axl_time_realtime(AxlRealtime *out)
     out->timezone_minutes = t.timezone_minutes;
     out->flags            = (t.daylight & 0x01) ? AXL_TIME_FLAG_DAYLIGHT : 0;
     return AXL_OK;
+}
+
+int
+axl_time_set_realtime(const AxlRealtime *in)
+{
+    if (in == NULL) {
+        return AXL_ERR;
+    }
+    AxlTime t = { 0 };
+    t.year             = in->year;
+    t.month            = in->month;
+    t.day              = in->day;
+    t.hour             = in->hour;
+    t.minute           = in->minute;
+    t.second           = in->second;
+    t.nanosecond       = in->nanosecond;
+    t.timezone_minutes = in->timezone_minutes;
+    t.daylight         = (in->flags & AXL_TIME_FLAG_DAYLIGHT) ? 1 : 0;
+    return axl_backend_set_time(&t);
+}
+
+int
+axl_time_set_unix(int64_t unix_secs)
+{
+    /* Reject pre-epoch and beyond-year-9999 up front — the calendar
+       year is a 16-bit field, so an out-of-range input is a caller
+       error rather than something to silently wrap. 253402300800 ==
+       10000-01-01T00:00:00Z. */
+    if (unix_secs < 0 || unix_secs >= 253402300800LL) {
+        return AXL_ERR;
+    }
+
+    /* unix_secs >= 0, so both quotient and remainder are non-negative
+       (no implementation-defined negative-modulo concern). */
+    int64_t days = unix_secs / 86400;
+    int64_t rem  = unix_secs % 86400;
+
+    int      y;
+    unsigned mo, d;
+    civil_from_days(days, &y, &mo, &d);
+
+    AxlRealtime rt = { 0 };
+    rt.year             = (uint16_t)y;
+    rt.month            = (uint8_t)mo;
+    rt.day              = (uint8_t)d;
+    rt.hour             = (uint8_t)(rem / 3600);
+    rt.minute           = (uint8_t)((rem % 3600) / 60);
+    rt.second           = (uint8_t)(rem % 60);
+    rt.nanosecond       = 0;
+    rt.flags            = 0;
+    rt.timezone_minutes = 0;  /* RTC ends up holding UTC */
+    return axl_time_set_realtime(&rt);
 }

@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=16 local-only=0
 # echo-client integration test — boots QEMU with networking, runs the
 # sync echo-client example against a host-side TCP echo server via
 # the SLIRP gateway at 10.0.2.2, verifies the round-trip.
@@ -10,7 +11,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-ECHO_HOST_PORT=19001
+ECHO_HOST_PORT=$(test_port 0)
 ECHO_MESSAGE="hello from UEFI"
 
 # Build library + the echo-client example

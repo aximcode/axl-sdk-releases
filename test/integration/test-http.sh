@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=35 local-only=0
 # AxlNet HTTP server integration test — boots QEMU with port forwarding,
 # starts the HTTP server inside UEFI, validates with curl from the host.
 #
@@ -9,7 +10,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18080
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 # Stage test app
@@ -49,7 +50,7 @@ echo "=== AxlNet HTTP Integration Test ($TEST_ARCH) ==="
 # The UEFI guest reaches it via QEMU gateway at 10.0.2.2.
 # ---------------------------------------------------------------------------
 
-HOST_SERVER_PORT=18081
+HOST_SERVER_PORT=$(test_port 1)
 HOST_SERVER_PID=0
 
 python3 "$(dirname "$0")/host-server.py" "$HOST_SERVER_PORT" &

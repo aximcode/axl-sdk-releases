@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=19 local-only=0
 # Driver-mode HTTP server integration test.
 #
 # Boots the example DXE driver `http-server-driver.efi` from the
@@ -21,7 +22,7 @@ source "$(dirname "$0")/common-test.sh"
 test_parse_args "$@"
 test_setup
 
-HOST_PORT=18097
+HOST_PORT=$(test_port 0)
 GUEST_PORT=8080
 
 declare -A _NATIVE_ARCH_MAP=([X64]=x64 [AARCH64]=aa64)

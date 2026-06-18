@@ -14,6 +14,8 @@
 #include <axl/axl-log.h>
 #include <axl/axl-sys.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-driver-info.h>
+#include <axl/axl-pci.h>
 #include <axl/axl-net.h>
 #include <axl/axl-wait.h>
 #include <axl/axl-watchdog.h>
@@ -32,6 +34,219 @@ typedef struct {
     EFI_IPv4_ADDRESS  Address;
     EFI_IPv4_ADDRESS  SubnetMask;
 } Ip4Config2ManualAddress;
+
+// ---------------------------------------------------------------------------
+// IP4Config2-free bring-up state (which mechanism configured the NIC + a
+// cached lease from a non-IP4Config2 path, so the IP4Config2-keyed readers
+// still report a result on firmware that lacks IP4Config2). Process-global,
+// matching the single-NIC scope of the bring-up helpers.
+// ---------------------------------------------------------------------------
+
+/* Set once per process by a successful fallback bring-up and never reset: the
+   readers consult it only when IP4Config2 is absent (the live IP4Config2 path
+   is always preferred), so a cached lease can never shadow a live result. */
+static AxlNetConfigMethod g_config_method = AXL_NET_CONFIG_NONE;
+static AxlDhcpLease       g_fallback_lease;
+static bool               g_have_fallback_lease = false;
+
+AxlNetConfigMethod
+axl_net_last_config_method(void)
+{
+    return g_config_method;
+}
+
+bool
+_axl_net_fallback_lease(AxlDhcpLease *out)
+{
+    if (!g_have_fallback_lease || out == NULL) {
+        return false;
+    }
+    *out = g_fallback_lease;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Path C — DHCP via EFI_DHCP4_SERVICE_BINDING (no IP4Config2)
+//
+// For OEM firmware that ships a full network stack (SNP/MNP/ARP/IP4/TCP4 +
+// Dhcp4ServiceBinding) but NOT the IP4Config2 policy layer EDK2 ifconfig and
+// axl-sdk normally drive. Mirrors SoftBmcDiag's DiagDhcp Path C, the path that
+// brought up the HP ZBook: CreateChild -> Configure -> Start (blocking) ->
+// read the lease off the completed child. The child is deliberately NOT
+// destroyed — that keeps the lease active for the life of the process (the
+// same one-shot persistence SoftBmcDiag relies on; durable cross-process
+// config without IP4Config2 needs a resident driver — out of scope here).
+// ---------------------------------------------------------------------------
+
+static int
+dhcp4_sb_bringup(void)
+{
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_protocol_enumerate("dhcp4-service-binding", &handles, &count) != AXL_OK
+        || count == 0) {
+        if (handles != NULL) {
+            axl_free(handles);
+        }
+        axl_debug("dhcp4_sb: no Dhcp4ServiceBinding handles");
+        return AXL_ERR;
+    }
+
+    /* SoftBmcDiag's proven retry schedule (worked on the ZBook). The arrays
+       are read by Configure and must outlive the call — keep them static. */
+    static UINT32 discover_timeout[] = { 4, 8, 16 };
+    static UINT32 request_timeout[]  = { 4, 8 };
+
+    int rc = AXL_ERR;
+    for (size_t i = 0; i < count && rc != AXL_OK; i++) {
+        EFI_SERVICE_BINDING_PROTOCOL *sb = NULL;
+        axl_efi_call(axl_bs()->HandleProtocol, 3,
+            (EFI_HANDLE)handles[i], &gEfiDhcp4ServiceBindingProtocolGuid,
+            (void **)&sb);
+        if (sb == NULL) {
+            continue;
+        }
+
+        EFI_HANDLE child = NULL;
+        EFI_STATUS st = axl_efi_call(sb->CreateChild, 2, sb, &child);
+        if (EFI_ERROR(st) || child == NULL) {
+            axl_debug("dhcp4_sb: CreateChild failed: 0x%llx",
+                      (unsigned long long)st);
+            continue;
+        }
+
+        EFI_DHCP4_PROTOCOL *dhcp4 = NULL;
+        axl_efi_call(axl_bs()->HandleProtocol, 3,
+            child, &gEfiDhcp4ProtocolGuid, (void **)&dhcp4);
+        if (dhcp4 == NULL) {
+            axl_efi_call(sb->DestroyChild, 2, sb, child);
+            continue;
+        }
+
+        EFI_DHCP4_CONFIG_DATA cfg;
+        axl_memset(&cfg, 0, sizeof(cfg));
+        cfg.DiscoverTryCount = 3;
+        cfg.DiscoverTimeout  = discover_timeout;
+        cfg.RequestTryCount  = 2;
+        cfg.RequestTimeout   = request_timeout;
+
+        st = axl_efi_call(dhcp4->Configure, 2, dhcp4, &cfg);
+        if (EFI_ERROR(st)) {
+            axl_debug("dhcp4_sb: Configure failed: 0x%llx",
+                      (unsigned long long)st);
+            axl_efi_call(sb->DestroyChild, 2, sb, child);
+            continue;
+        }
+
+        /* Blocking DHCP (no completion event) — uses the retry schedule above,
+           ~30 s worst case. */
+        st = axl_efi_call(dhcp4->Start, 2, dhcp4, (EFI_EVENT)NULL);
+        if (EFI_ERROR(st)) {
+            axl_debug("dhcp4_sb: Start failed: 0x%llx",
+                      (unsigned long long)st);
+            axl_efi_call(sb->DestroyChild, 2, sb, child);
+            continue;
+        }
+
+        EFI_DHCP4_MODE_DATA mode;
+        axl_memset(&mode, 0, sizeof(mode));
+        st = axl_efi_call(dhcp4->GetModeData, 2, dhcp4, &mode);
+        static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+        if (EFI_ERROR(st)
+            || axl_memcmp(&mode.ClientAddress, zero4, 4) == 0) {
+            axl_efi_call(sb->DestroyChild, 2, sb, child);
+            continue;
+        }
+
+        /* Cache the lease. DNS is not in EFI_DHCP4_MODE_DATA (it lives in the
+           reply packet's options); SoftBmcDiag's Path C did not surface it
+           either, so dns_count stays 0 here. */
+        axl_memset(&g_fallback_lease, 0, sizeof(g_fallback_lease));
+        axl_memcpy(g_fallback_lease.address, &mode.ClientAddress, 4);
+        axl_memcpy(g_fallback_lease.subnet,  &mode.SubnetMask, 4);
+        axl_memcpy(g_fallback_lease.router,  &mode.RouterAddress, 4);
+        g_have_fallback_lease = true;
+        axl_info("dhcp4_sb: leased %u.%u.%u.%u (no IP4Config2)",
+                 g_fallback_lease.address[0], g_fallback_lease.address[1],
+                 g_fallback_lease.address[2], g_fallback_lease.address[3]);
+        rc = AXL_OK;
+        /* Intentionally NOT DestroyChild — keep the lease active. */
+    }
+
+    axl_free(handles);
+    return rc;
+}
+
+/* Path D — DHCP via EFI_PXE_BASE_CODE_PROTOCOL.Dhcp(), the documented last
+   resort when neither IP4Config2 nor Dhcp4ServiceBinding is usable. Mirrors
+   SoftBmcDiag's Path D: for each IPv4 PXE instance, reuse an existing lease or
+   Start(IPv4) + Dhcp(); read the station IP/mask off Mode. IPv6 instances are
+   skipped. PXE is left started — like the Dhcp4 child, that keeps the address
+   active for the process. */
+static int
+pxe_bc_dhcp(void)
+{
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_protocol_enumerate("pxe-base-code", &handles, &count) != AXL_OK
+        || count == 0) {
+        if (handles != NULL) {
+            axl_free(handles);
+        }
+        axl_debug("pxe_bc: no PXE Base Code handles");
+        return AXL_ERR;
+    }
+
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    int rc = AXL_ERR;
+    for (size_t i = 0; i < count && rc != AXL_OK; i++) {
+        EFI_PXE_BASE_CODE_PROTOCOL *pxe = NULL;
+        axl_efi_call(axl_bs()->HandleProtocol, 3,
+            (EFI_HANDLE)handles[i], &gEfiPxeBaseCodeProtocolGuid, (void **)&pxe);
+        if (pxe == NULL || pxe->Mode == NULL) {
+            continue;
+        }
+
+        /* Already-running IPv4 instance with an address: just read it. */
+        if (pxe->Mode->Started) {
+            if (pxe->Mode->UsingIpv6) {
+                continue;   /* IPv4 only */
+            }
+        } else {
+            EFI_STATUS st = axl_efi_call(pxe->Start, 2, pxe, (BOOLEAN)0);
+            if (EFI_ERROR(st)) {
+                axl_debug("pxe_bc: Start failed: 0x%llx",
+                          (unsigned long long)st);
+                continue;
+            }
+        }
+
+        if (axl_memcmp(&pxe->Mode->StationIp, zero4, 4) != 0) {
+            /* Reuse the lease the firmware already has. */
+        } else {
+            EFI_STATUS st = axl_efi_call(pxe->Dhcp, 2, pxe, (BOOLEAN)0);
+            if (EFI_ERROR(st)
+                || axl_memcmp(&pxe->Mode->StationIp, zero4, 4) == 0) {
+                axl_debug("pxe_bc: Dhcp failed: 0x%llx",
+                          (unsigned long long)st);
+                continue;
+            }
+        }
+
+        axl_memset(&g_fallback_lease, 0, sizeof(g_fallback_lease));
+        axl_memcpy(g_fallback_lease.address, &pxe->Mode->StationIp, 4);
+        axl_memcpy(g_fallback_lease.subnet,  &pxe->Mode->SubnetMask, 4);
+        g_have_fallback_lease = true;
+        axl_info("pxe_bc: leased %u.%u.%u.%u (no IP4Config2/Dhcp4-SB)",
+                 g_fallback_lease.address[0], g_fallback_lease.address[1],
+                 g_fallback_lease.address[2], g_fallback_lease.address[3]);
+        rc = AXL_OK;
+        /* Leave PXE started — keep the address active. */
+    }
+
+    axl_free(handles);
+    return rc;
+}
 
 // ---------------------------------------------------------------------------
 // axl_net_bring_up — one-call DHCP-or-static bring-up + address read-back
@@ -338,19 +553,63 @@ ip4cfg_getdata(
     return buf;
 }
 
-int
-axl_net_get_dhcp_lease(size_t nic_index, AxlDhcpLease *out)
+/* Resolve the IP4Config2 protocol for the NIC carrying @p mac. Walks every
+   IP4Config2 handle and correlates by the SimpleNetwork MAC on the same handle
+   — the same MAC correlation axl_net_list_interfaces uses — so it's correct
+   regardless of IP4Config2-vs-SNP handle ordering (IP4Config2 lives on a child
+   handle on some OEM firmware). First exact 6-byte match wins. */
+static EFI_IP4_CONFIG2_PROTOCOL *
+ip4cfg_for_mac(const uint8_t mac[6])
 {
-    if (out == NULL) {
-        return AXL_ERR;
+    void  **handles = NULL;
+    size_t  count = 0;
+    if (axl_protocol_enumerate("ip4-config2", &handles, &count) != AXL_OK
+        || count == 0) {
+        if (handles != NULL) {
+            axl_free(handles);
+        }
+        return NULL;
     }
-    axl_memset(out, 0, sizeof(*out));
 
-    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_nic(nic_index);
-    if (cfg == NULL) {
-        return AXL_ERR;
+    EFI_IP4_CONFIG2_PROTOCOL *match = NULL;
+    for (size_t i = 0; i < count; i++) {
+        EFI_SIMPLE_NETWORK_PROTOCOL *snp = NULL;
+        axl_efi_call(axl_bs()->HandleProtocol, 3,
+            (EFI_HANDLE)handles[i], &EFI_SIMPLE_NETWORK_PROTOCOL_GUID,
+            (void **)&snp);
+        if (snp == NULL || snp->Mode == NULL) {
+            continue;
+        }
+        size_t mac_len = snp->Mode->HwAddressSize;
+        if (mac_len > 6) {
+            mac_len = 6;
+        }
+        /* Guard against a 0-length HwAddressSize: memcmp(.., 0) == 0 would
+           "match" any requested MAC and bind the first such handle. Real
+           Ethernet always reports 6; skip anything that can't be compared. */
+        if (mac_len == 0
+            || axl_memcmp(mac, &snp->Mode->CurrentAddress, mac_len) != 0) {
+            continue;
+        }
+        EFI_IP4_CONFIG2_PROTOCOL *cfg = NULL;
+        axl_efi_call(axl_bs()->HandleProtocol, 3,
+            (EFI_HANDLE)handles[i], &gEfiIp4Config2ProtocolGuid, (void **)&cfg);
+        if (cfg != NULL) {
+            match = cfg;
+            break;
+        }
     }
+    axl_free(handles);
+    return match;
+}
 
+/* Shared lease extraction: read the live IP4Config2 DHCP lease from @p cfg into
+   @p out. Backs both axl_net_get_dhcp_lease (handle index) and
+   axl_net_get_dhcp_lease_by_mac (MAC). Returns AXL_ERR for a non-DHCP policy or
+   an unleased NIC. @p out must already be zeroed by the caller. */
+static int
+lease_from_cfg(EFI_IP4_CONFIG2_PROTOCOL *cfg, AxlDhcpLease *out)
+{
     /* A "lease" requires a DHCP policy — a static NIC has no lease to view. */
     uint32_t   policy = 0;
     size_t     psz = sizeof(policy);
@@ -407,6 +666,38 @@ axl_net_get_dhcp_lease(size_t nic_index, AxlDhcpLease *out)
     }
 
     return AXL_OK;
+}
+
+int
+axl_net_get_dhcp_lease(size_t nic_index, AxlDhcpLease *out)
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    axl_memset(out, 0, sizeof(*out));
+
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_nic(nic_index);
+    if (cfg == NULL) {
+        /* No IP4Config2 — return the lease cached by an IP4Config2-free
+           bring-up (Dhcp4-SB / PXE BC), if any. */
+        return _axl_net_fallback_lease(out) ? AXL_OK : AXL_ERR;
+    }
+    return lease_from_cfg(cfg, out);
+}
+
+int
+axl_net_get_dhcp_lease_by_mac(const uint8_t mac[6], AxlDhcpLease *out)
+{
+    if (mac == NULL || out == NULL) {
+        return AXL_ERR;
+    }
+    axl_memset(out, 0, sizeof(*out));
+
+    EFI_IP4_CONFIG2_PROTOCOL *cfg = ip4cfg_for_mac(mac);
+    if (cfg == NULL) {
+        return AXL_ERR;   /* no NIC carries that MAC */
+    }
+    return lease_from_cfg(cfg, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +994,9 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
      * stricter get_ip_address() check that matches our contract.
      */
     if (axl_net_get_ip_address(&addr) == AXL_OK) {
+        if (g_config_method == AXL_NET_CONFIG_NONE) {
+            g_config_method = AXL_NET_CONFIG_IP4CONFIG2;
+        }
         return AXL_OK;
     }
 
@@ -720,7 +1014,22 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
     if (axl_protocol_enumerate("ip4-config2", &cfg_handles, &cfg_count) != AXL_OK
         || cfg_count == 0)
     {
-        axl_warning("no IP4Config2 protocol found");
+        /* No IP4Config2 policy layer (some OEM firmware, e.g. HP). Fall back
+           down the IP4Config2-free ladder: DHCP4-ServiceBinding, then PXE BC.
+           Sets g_config_method so axl_net_last_config_method() reports it. */
+        if (cfg_handles != NULL) {
+            axl_free(cfg_handles);
+        }
+        axl_info("no IP4Config2 - trying IP4Config2-free DHCP fallback");
+        if (dhcp4_sb_bringup() == AXL_OK) {
+            g_config_method = AXL_NET_CONFIG_DHCP4_SB;
+            return AXL_OK;
+        }
+        if (pxe_bc_dhcp() == AXL_OK) {
+            g_config_method = AXL_NET_CONFIG_PXE_BC;
+            return AXL_OK;
+        }
+        axl_warning("no IP4Config2 and no DHCP4-SB/PXE fallback succeeded");
         return AXL_ERR;
     }
 
@@ -796,10 +1105,82 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
     }
 
     if (wait_rc == AXL_OK) {
+        g_config_method = AXL_NET_CONFIG_IP4CONFIG2;
         axl_info("network ready");
         return AXL_OK;
     }
 
     axl_warning("DHCP timeout after %zu seconds", timeout);
     return AXL_ERR;
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_takeover_if_no_snp — orchestrated NIC takeover, gated on zero SNP
+// ---------------------------------------------------------------------------
+
+/* Disconnect the firmware drivers from every network-class PCI controller and
+   let AXL's staged drivers bind instead. Returns the number of controllers
+   re-driven. Network class = PCI base class 0x02; find_by_class matches the
+   full 24-bit class, so we wildcard-enumerate and filter on the base byte to
+   catch every network subclass (Ethernet, etc.). */
+static size_t
+takeover_pci_nics(void)
+{
+    size_t taken = 0;
+    AxlPciAddr addr;
+    for (uint16_t nth = 0;
+         axl_pci_find_by_class(0xFFFFFFu, nth, &addr) == AXL_OK;
+         nth++)
+    {
+        uint32_t class_code = 0;
+        if (axl_pci_get_class_code(addr, &class_code) != AXL_OK) {
+            continue;
+        }
+        if (((class_code >> 16) & 0xFFu) != AXL_PCI_CLASS_NETWORK) {
+            continue;
+        }
+        AxlHandle controller = NULL;
+        if (axl_pci_to_handle(addr, &controller) != AXL_OK || controller == NULL) {
+            continue;
+        }
+        /* Detach whatever (proprietary) driver the firmware bound, then let any
+           applicable staged driver take it. axl_driver_connect(NULL) below does
+           the recursive stack buildup (MNP/IP4/TCP4/Dhcp4 on the new SNP). */
+        axl_driver_disconnect_handle(controller);
+        axl_driver_connect_handle(controller);
+        taken++;
+    }
+    return taken;
+}
+
+int
+axl_net_takeover_if_no_snp(void)
+{
+    /* Guard: a takeover destroys a working firmware stack, so only act when the
+       firmware provides NO SimpleNetwork of its own. If SNP is already present,
+       this is a safe no-op. */
+    if (net_count_snp() > 0) {
+        axl_debug("takeover: SNP already present (%zu) - no-op", net_count_snp());
+        return AXL_OK;
+    }
+
+    /* First try the non-destructive path: load staged drivers + connect. On
+       many boxes this alone brings SNP up without disconnecting anything. */
+    axl_net_ensure_drivers();
+    _axl_net_connect_snp_handles();
+    if (net_count_snp() > 0) {
+        axl_info("takeover: SNP came up via staged drivers (no disconnect)");
+        return AXL_OK;
+    }
+
+    /* Still zero SNP: take over the network-class PCI controllers from the
+       firmware drivers, then rebuild the stack. */
+    size_t taken = takeover_pci_nics();
+    axl_driver_connect(NULL);             /* recursive connect-all stack buildup */
+    _axl_net_connect_snp_handles();
+
+    size_t snp_after = net_count_snp();
+    axl_info("takeover: re-drove %zu NIC(s), SNP handles now %zu",
+             taken, snp_after);
+    return (snp_after > 0) ? AXL_OK : AXL_ERR;
 }

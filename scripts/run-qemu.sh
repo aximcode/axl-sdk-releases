@@ -571,10 +571,27 @@ EOF
     fi
 fi
 
-# Set up temp directory
-TMPDIR=$(mktemp -d)
+# Set up temp directory. Prefer a tmpfs (/dev/shm) so the per-run ~40 MB disk
+# image + pflash vars are built in RAM rather than on the root filesystem —
+# under a parallel integration pool, concurrent root-fs image builds were an
+# I/O bottleneck that starved booting guests (empty serial output -> spurious
+# test failures). Override the base with AXL_QEMU_TMPDIR; otherwise fall back
+# to the default temp location when /dev/shm is missing/unwritable.
+_axl_tmp_base="${AXL_QEMU_TMPDIR:-}"
+if [[ -z "$_axl_tmp_base" && -d /dev/shm && -w /dev/shm ]]; then
+    _axl_tmp_base=/dev/shm
+fi
+if [[ -n "$_axl_tmp_base" ]]; then
+    TMPDIR=$(mktemp -d -p "$_axl_tmp_base" axl-qemu.XXXXXXXX)
+else
+    TMPDIR=$(mktemp -d)
+fi
 if [[ "$BACKGROUND" != "true" ]]; then
-    trap 'rm -rf "$TMPDIR"' EXIT
+    # Trap INT/TERM too, not just EXIT: when a caller wraps this script in
+    # `timeout`, the SIGTERM on expiry would otherwise bypass the EXIT trap and
+    # leak the (tmpfs- or disk-backed) temp dir. (8.6 GB of such leaks were
+    # found accumulating from timeout-killed integration runs.)
+    trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 fi
 
 STAGING="$TMPDIR/staging"
@@ -1038,7 +1055,7 @@ if [[ "$BACKGROUND" != "true" ]]; then
         for pid in "${helper_pids[@]}"; do
             kill_args+="${kill_args:+ }$pid"
         done
-        trap 'kill '"$kill_args"' 2>/dev/null; rm -rf "'"$TMPDIR"'"' EXIT
+        trap 'kill '"$kill_args"' 2>/dev/null; rm -rf "'"$TMPDIR"'"' EXIT INT TERM
     fi
 fi
 

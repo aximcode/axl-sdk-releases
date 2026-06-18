@@ -1,4 +1,5 @@
 #!/bin/bash
+# test-meta: arch=x64 needs= est=0 local-only=0
 # test-ipmi.sh — manual AxlIpmi hardware-in-the-loop runbook.
 #
 # Unlike test-axl.sh (unit tests in QEMU) or test-http.sh (QEMU loopback),

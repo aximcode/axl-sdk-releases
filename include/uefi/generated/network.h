@@ -899,6 +899,84 @@ typedef struct _EFI_DHCP4_PROTOCOL {
   EFI_DHCP4_PARSE                Parse;
 }  EFI_DHCP4_PROTOCOL;
 
+#define EFI_PXE_BASE_CODE_MAX_ARP_ENTRIES 8
+
+#define EFI_PXE_BASE_CODE_MAX_ROUTE_ENTRIES 8
+
+typedef struct _EFI_PXE_BASE_CODE_MODE {
+  BOOLEAN            Started;
+  BOOLEAN            Ipv6Available;
+  BOOLEAN            Ipv6Supported;
+  BOOLEAN            UsingIpv6;
+  BOOLEAN            BisSupported;
+  BOOLEAN            BisDetected;
+  BOOLEAN            AutoArp;
+  BOOLEAN            SendGUID;
+  BOOLEAN            DhcpDiscoverValid;
+  BOOLEAN            DhcpAckReceivd;
+  BOOLEAN            ProxyOfferReceived;
+  BOOLEAN            PxeDiscoverValid;
+  BOOLEAN            PxeReplyReceived;
+  BOOLEAN            PxeBisReplyReceived;
+  BOOLEAN            IcmpErrorReceived;
+  BOOLEAN            TftpErrorReceived;
+  BOOLEAN            MakeCallbacks;
+  UINT8              TTL;
+  UINT8              ToS;
+  EFI_IP_ADDRESS                 StationIp;
+  EFI_IP_ADDRESS                 SubnetMask;
+  void  *DhcpDiscover;
+  void  *DhcpAck;
+  void  *ProxyOffer;
+  void  *PxeDiscover;
+  void  *PxeReply;
+  void  *PxeBisReply;
+  void  *IpFilter;
+  UINT32                         ArpCacheEntries;
+  void  *ArpCache[EFI_PXE_BASE_CODE_MAX_ARP_ENTRIES];
+  UINT32                         RouteTableEntries;
+  void  *RouteTable[EFI_PXE_BASE_CODE_MAX_ROUTE_ENTRIES];
+  void  *IcmpError;
+  void  *TftpError;
+}   EFI_PXE_BASE_CODE_MODE;
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_PXE_BASE_CODE_START) (
+  IN EFI_PXE_BASE_CODE_PROTOCOL        *This,
+  IN BOOLEAN                           UseIpv6
+  );
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_PXE_BASE_CODE_STOP) (
+  IN EFI_PXE_BASE_CODE_PROTOCOL     *This
+  );
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_PXE_BASE_CODE_DHCP) (
+  IN EFI_PXE_BASE_CODE_PROTOCOL     *This,
+  IN BOOLEAN                        SortOffers
+  );
+
+typedef struct _EFI_PXE_BASE_CODE_PROTOCOL {
+  UINT64                            Revision;
+  EFI_PXE_BASE_CODE_START           Start;
+  EFI_PXE_BASE_CODE_STOP            Stop;
+  EFI_PXE_BASE_CODE_DHCP            Dhcp;
+  void  *Discover;
+  void  *Mtftp;
+  void  *UdpWrite;
+  void  *UdpRead;
+  void  *SetIpFilter;
+  void  *Arp;
+  void  *SetParameters;
+  void  *SetStationIp;
+  void  *SetPackets;
+  EFI_PXE_BASE_CODE_MODE            *Mode;
+}   EFI_PXE_BASE_CODE_PROTOCOL;
+
 typedef struct _EFI_UDP4_SESSION_DATA {
   EFI_IPv4_ADDRESS         SourceAddress;
   UINT16                   SourcePort;

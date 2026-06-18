@@ -406,6 +406,19 @@
     {"name": "EFI_DHCP4_PARSE",                     "kind": "funcptr"},
     {"name": "EFI_DHCP4_PROTOCOL",                  "kind": "struct"},
 
+    // PXE Base Code — last-resort DHCP fallback (axl_net IP4Config2-free
+    // bring-up ladder). Only Start/Dhcp/Stop + Mode->{Started,UsingIpv6,
+    // StationIp,SubnetMask} are used; the MODE struct's complex packet/cache
+    // tail is void*-substituted (harmless — the fields read precede it), and
+    // the unused protocol funcptrs (Discover/Mtftp/...) stay void* too.
+    {"name": "EFI_PXE_BASE_CODE_MAX_ARP_ENTRIES",   "kind": "define"},
+    {"name": "EFI_PXE_BASE_CODE_MAX_ROUTE_ENTRIES", "kind": "define"},
+    {"name": "EFI_PXE_BASE_CODE_MODE",              "kind": "struct"},
+    {"name": "EFI_PXE_BASE_CODE_START",             "kind": "funcptr"},
+    {"name": "EFI_PXE_BASE_CODE_STOP",              "kind": "funcptr"},
+    {"name": "EFI_PXE_BASE_CODE_DHCP",              "kind": "funcptr"},
+    {"name": "EFI_PXE_BASE_CODE_PROTOCOL",          "kind": "struct"},
+
     {"name": "EFI_UDP4_SESSION_DATA",               "kind": "struct"},
     {"name": "EFI_UDP4_FRAGMENT_DATA",               "kind": "struct"},
     {"name": "EFI_UDP4_RECEIVE_DATA",                "kind": "struct"},
