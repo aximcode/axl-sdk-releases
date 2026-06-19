@@ -102,3 +102,124 @@ axl_console_flush_input(
         /* discard */
     }
 }
+
+// ===================================================================
+// Text-console modes (SimpleTextOutput QueryMode / SetMode) — the
+// graphics-free peer of the AxlGfx display-mode API. Thin policy over the
+// backend's raw protocol access: bounds + signed-field guards, and the
+// inventory-walking find / max helpers that skip QueryMode failures.
+// ===================================================================
+
+uint32_t
+axl_console_text_mode_count(
+    void
+    )
+{
+    return axl_backend_console_text_mode_count();
+}
+
+int
+axl_console_text_query_mode(
+    uint32_t             index,
+    AxlConsoleTextMode  *out
+    )
+{
+    if (out == NULL || index >= axl_console_text_mode_count()) {
+        return AXL_ERR;
+    }
+    uint32_t cols = 0, rows = 0;
+    if (axl_backend_console_text_query_mode(index, &cols, &rows) != AXL_OK) {
+        return AXL_ERR;
+    }
+    out->index   = index;
+    out->columns = cols;
+    out->rows    = rows;
+    return AXL_OK;
+}
+
+int
+axl_console_text_current_mode(
+    uint32_t  *out_index
+    )
+{
+    if (out_index == NULL) {
+        return AXL_ERR;
+    }
+    int cur = axl_backend_console_text_current_mode();
+    /* -1 == no mode set; also reject a value the firmware reports outside
+       the enumerable range (malformed). */
+    if (cur < 0 || (uint32_t)cur >= axl_console_text_mode_count()) {
+        return AXL_ERR;
+    }
+    *out_index = (uint32_t)cur;
+    return AXL_OK;
+}
+
+int
+axl_console_text_find_mode(
+    uint32_t   columns,
+    uint32_t   rows,
+    uint32_t  *out_index
+    )
+{
+    if (out_index == NULL) {
+        return AXL_ERR;
+    }
+    uint32_t n = axl_console_text_mode_count();
+    for (uint32_t i = 0; i < n; i++) {
+        AxlConsoleTextMode m;
+        /* Skip modes whose QueryMode fails (a legal optional-mode reject). */
+        if (axl_console_text_query_mode(i, &m) == AXL_OK
+            && m.columns == columns && m.rows == rows) {
+            *out_index = i;   /* lowest-numbered match (ascending walk) */
+            return AXL_OK;
+        }
+    }
+    return AXL_ERR;
+}
+
+int
+axl_console_text_max_mode(
+    AxlConsoleTextMode  *out
+    )
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    uint32_t           n     = axl_console_text_mode_count();
+    bool               found = false;
+    AxlConsoleTextMode best  = { 0, 0, 0 };
+    for (uint32_t i = 0; i < n; i++) {
+        AxlConsoleTextMode m;
+        if (axl_console_text_query_mode(i, &m) != AXL_OK
+            || m.columns == 0 || m.rows == 0) {
+            continue;   /* skip QueryMode failures and degenerate geometry */
+        }
+        uint64_t area      = (uint64_t)m.columns * m.rows;
+        uint64_t best_area = (uint64_t)best.columns * best.rows;
+        /* Greatest area; ties -> more columns; full ties -> lowest index
+           (strict comparisons + ascending walk keep the first such mode). */
+        if (!found || area > best_area
+            || (area == best_area && m.columns > best.columns)) {
+            best  = m;
+            found = true;
+        }
+    }
+    if (!found) {
+        return AXL_ERR;
+    }
+    *out = best;
+    return AXL_OK;
+}
+
+int
+axl_console_text_set_mode(
+    uint32_t  index
+    )
+{
+    /* Range-check before the firmware call (count == 0 -> always rejects). */
+    if (index >= axl_console_text_mode_count()) {
+        return AXL_ERR;
+    }
+    return axl_backend_console_text_set_mode(index);
+}

@@ -95,6 +95,52 @@ axl_backend_console_get_attr(
     void
     );
 
+/**
+ * @brief Number of text-output modes the active console enumerates.
+ *
+ * @return `ConOut->Mode->MaxMode` clamped to non-negative, or 0 if there
+ *     is no output console.
+ */
+uint32_t
+axl_backend_console_text_mode_count(
+    void
+    );
+
+/**
+ * @brief Query the geometry of text-output mode @p index.
+ *
+ * @return AXL_OK with @p columns / @p rows set, or AXL_ERR if there is no
+ *     console or `QueryMode` rejected the mode.
+ */
+int
+axl_backend_console_text_query_mode(
+    uint32_t   index,    ///< mode number
+    uint32_t  *columns,  ///< [out] columns (non-NULL)
+    uint32_t  *rows      ///< [out] rows (non-NULL)
+    );
+
+/**
+ * @brief The active console's current text-output mode index.
+ *
+ * @return current `Mode->Mode`, or -1 if there is no console or no mode is
+ *     currently set.
+ */
+int
+axl_backend_console_text_current_mode(
+    void
+    );
+
+/**
+ * @brief Switch the active console to text-output mode @p index.
+ *
+ * @return AXL_OK on success, AXL_ERR if there is no console or `SetMode`
+ *     failed (the firmware leaves the mode unchanged on failure).
+ */
+int
+axl_backend_console_text_set_mode(
+    uint32_t  index  ///< mode number
+    );
+
 // ===================================================================
 // Time
 // ===================================================================

@@ -1038,6 +1038,22 @@ can't satisfy; or its GC needs `mmap`/`mprotect` for stack scanning.
 
 ## Spike G19 — MP-Services parallel rasterization (time-boxed)
 
+> **RESOLVED 2026-06-18 — the AP-offload question is answered (kill criteria
+> NOT triggered).** Run as the broader AP-pool-vs-BSP perf spike
+> (`AxlTaskPool` already provides the MP-Services worker pool, so no new
+> `spike/mp-rasterize` was needed). Real-HW result (Dell R6725, W=95):
+> compute-bound work scales **94.99×** (99% of the W ceiling); a bandwidth-bound
+> box blur — the proxy for plain rasterization — clears the **≥2×** bar at
+> **9.43×** but is NUMA/bandwidth-capped (and falls toward 3× as tiles shrink);
+> output is byte-identical and AP teardown is clean. So MP parallelism is
+> validated for **arithmetic-heavy** raster work but buys little for
+> bandwidth-bound blits — exactly as this spike predicted. The decision,
+> numbers, and the "what's deferred" table now live in
+> [AXL-Concurrency.md](AXL-Concurrency.md) ("AP offload"); reproduce on any box
+> with `make axbench`. **Remaining for Phase G19 proper:** wire the real GOP
+> rasterization path onto `AxlTaskPool` (an integration step, no longer gated on
+> proving the speedup).
+
 **Branch:** `spike/mp-rasterize`. Throwaway per [[spike-solutions]].
 Gates Phase G19 — confirm the speedup is real before building it in.
 

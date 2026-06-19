@@ -586,7 +586,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -922,6 +922,22 @@ $(BUILDDIR)/gfx-mode-selftest.o: test/integration/gfx-mode-selftest.c | $(BUILDD
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# Build console-text-mode-selftest.efi — text-console mode enumerate/
+# switch round-trip.  Run under scripts/run-qemu.sh --gpu by
+# test/integration/test-console-text-mode-qemu.sh (the -nographic unit
+# suite has a single-mode serial console, so it can't exercise a switch).
+# ===================================================================
+
+console-text-mode-selftest: $(PREFIX)/console-text-mode-selftest.efi
+	@echo "  Built: $(PREFIX)/console-text-mode-selftest.efi"
+
+$(PREFIX)/console-text-mode-selftest.efi: $(BUILDDIR)/console-text-mode-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/console-text-mode-selftest.o,$@)
+
+$(BUILDDIR)/console-text-mode-selftest.o: test/integration/console-text-mode-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build cursor-selftest.efi — AxlCursor on-screen compositing test.
 # Run under scripts/run-qemu.sh --gpu by
 # test/integration/test-cursor-qemu.sh; not part of the -nographic
@@ -1016,6 +1032,37 @@ $(PREFIX)/cpu-topology-selftest.efi: $(BUILDDIR)/cpu-topology-selftest.o $(LINK_
 	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-topology-selftest.o,$@)
 
 $(BUILDDIR)/cpu-topology-selftest.o: test/integration/cpu-topology-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build task-pool-mp-selftest.efi — multi-core AxlTaskPool race
+# regression. Run by test/integration/test-task-pool-mp-qemu.sh under
+# QEMU -smp 4 (single-core boots SKIP).
+# ===================================================================
+
+task-pool-mp-selftest: $(PREFIX)/task-pool-mp-selftest.efi
+	@echo "  Built: $(PREFIX)/task-pool-mp-selftest.efi"
+
+$(PREFIX)/task-pool-mp-selftest.efi: $(BUILDDIR)/task-pool-mp-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/task-pool-mp-selftest.o,$@)
+
+$(BUILDDIR)/task-pool-mp-selftest.o: test/integration/task-pool-mp-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build axbench.efi — real-hardware AP-pool benchmark tool. Measures
+# AxlTaskPool (AP offload) vs the BSP across 8 scenarios; writes a report
+# to stdout or a file. Ctrl-C aborts cleanly (test-axbench-ctrlc-qemu.sh).
+# Run: scripts/run-qemu.sh --qemu-arg -smp --qemu-arg N axbench.efi
+# ===================================================================
+
+axbench: $(PREFIX)/axbench.efi
+	@echo "  Built: $(PREFIX)/axbench.efi"
+
+$(PREFIX)/axbench.efi: $(BUILDDIR)/axbench.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/axbench.o,$@)
+
+$(BUILDDIR)/axbench.o: tools/axbench.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

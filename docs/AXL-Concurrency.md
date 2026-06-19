@@ -179,7 +179,7 @@ them speculatively (see "Where this breaks down" and the AxlFuture note).**
 |---|---|---|---|
 | **IPMI / BMC** (`AxlIpmi`) | KCS/SSIF **busy-poll** the BMC (`axl_backend_stall` loop) for the response — ms to seconds | Pure Poll-tick reuse: submit, tick the KCS/SSIF FSM from a loop timer, callback on completion. No firmware event needed; same shape as the DNS4/TCP4 Poll ticks | **On SoftBMC's roadmap** — a BMC issuing/polling IPMI from an HTTP handler or timer hits the webhook's blocking-from-a-callback wall. Cleanest to build (no new infrastructure). |
 | **Storage** (`AxlNvme`/`AxlAta`/`AxlScsi`/`AxlBlock`) | PassThru passes `Event = NULL` (sync); BlockIo used over BlockIo2 | The PassThru protocols are async-capable via that `Event`; `EFI_BLOCK_IO2` has token/event reads. Submit with an event, register it on the loop, callback on completion | **On SoftBMC's roadmap.** Poster child: **device self-test** (runs for *minutes* — poll progress) + SMART polling + large reads, run on the service loop while it serves. |
-| **MP Services** (parallel AP dispatch) | `StartupAllAPs` blocking mode | Non-blocking mode takes a `WaitEvent` — register it, callback when all APs finish | Aspirational (a consumer fanning work across APs). Lower urgency: callers usually *want* to block until the fan-out completes. |
+| **MP Services** (parallel AP dispatch) | `StartupAllAPs` blocking mode | Non-blocking mode takes a `WaitEvent` — register it, callback when all APs finish | Lower urgency: callers usually *want* to block until the fan-out completes. NB: the offload path (`AxlTaskPool`, `StartupThisAP`) is already non-blocking and **measured** — see "AP offload" below; this row is only about making the all-AP `StartupAllAPs` fan-out async. |
 | **USB transfers** (`AxlUsb`) | sync bulk/interrupt | `EFI_USB_IO` async interrupt transfers are callback-based | Niche — live device I/O (HID polling), not the enumeration AxlUsb mostly does. |
 | **TPM** (`AxlTpm`) | TCG2 submit/response | event/poll | Low — usually fast enough that blocking is fine. |
 
@@ -207,6 +207,44 @@ This layout is intentional: each directory corresponds to one axis
 of the taxonomy. Adding a new concurrency primitive? Pick an axis.
 If it doesn't fit any of the four, reconsider whether the primitive
 earns its weight.
+
+## AP offload (`AxlTaskPool`): what's measured, what's deferred
+
+`AxlTaskPool` (`src/task/axl-task-pool.c`) is the *offload* axis — an
+MP-Services AP (Application Processor) worker pool, spun up optionally when an
+app/loop initializes. Workers are persistent (`StartupThisAP` once per AP, then
+each spins on a volatile slot), so per-task dispatch is a lock-free cache-line
+handoff, **not** a per-task firmware call. AP tasks are AP-safe by construction:
+no Boot Services, no protocol calls, no `axl_print` — arena memory (`axl_arena_*`,
+lock-free bump) only.
+
+**Is offload worth it?** Measured on real hardware (Dell R6725, dual-socket,
+96 physical cores, **W = 95 AP workers**) with the `axbench` tool
+(`tools/axbench.c` — run it on any box to reproduce):
+
+| Dimension | Result | Takeaway |
+|---|---|---|
+| Dispatch latency | **192 ns/op** | Sub-µs cache-line handoff; the cost model is real, not a firmware round-trip |
+| Compute-bound | **94.99×** at 99% of the W-worker ceiling; break-even ≈ **16 rounds** of work/chunk | Large-grain compute-bound work scales ~linearly — a strong win |
+| Bandwidth-bound (box blur) | **9.43×** peak, falling to 3× for fine tiles | Memory-bound work is **NUMA/bandwidth-capped** — all cores share the memory controllers; parallelism buys far less |
+| BSP-participates (BSP takes a chunk too) | **slower** (54× vs 95×) | Keep the BSP orchestrating; pure-AP wins |
+
+**Decision: the pool as-is is the right tool for compute-bound, large-grain
+work. The richer machinery is deferred — build each piece on demand, when a
+concrete consumer needs it, not speculatively:**
+
+| Proposed addition | Verdict | Why |
+|---|---|---|
+| AP-safe **mutex/lock** | **Deferred** | Every workload that pays off here is pure arithmetic over caller-preallocated globals — zero shared mutable state, zero locks. No measured workload needs AP-side synchronization. |
+| Per-AP **thread stacks** / per-AP heap | **Deferred** | Tasks run on the AP's existing stack and touch only their own arg + arena. No measured workload needs AP-side allocation beyond the arena. |
+| Persistent **work queue** (enqueue-never-fails) | **Deferred** | Submit-gating on `axl_task_pool_available()` is adequate at steady state; a queue only pays when the producer outpaces all workers for sustained periods — not observed. |
+| **BSP-participates** model | **Rejected** | Measured slower on real HW (above). |
+
+When a workload appears that *does* need an AP-side lock or per-AP scratch (e.g.
+a task that mutates shared state or allocates), that's the signal to revisit —
+with `axbench` numbers for the new workload in hand. This closes the
+**Spike G19** gate (`AXL-Rich-UI-Plan.md`): MP parallelism is validated for
+compute-bound work; `StartupAllAPs` is available and AP teardown is clean.
 
 ## Testing the model
 

@@ -29,12 +29,33 @@ cpu_pause(void)
 // Internal types
 // ---------------------------------------------------------------------------
 
+/* Slot lifecycle, encoded in ONE word so every observer reads a single,
+   consistent value. The previous design used three separate volatile flags
+   (task/running/done); available() and submit() read them as three loads, so
+   a worker completing concurrently (done 0->1 then running 1->0) between the
+   `done` read and the `running` read made a just-completed slot look idle.
+   That let available() over-report and submit() clobber an unreaped
+   completion -> a dropped task -> hang. A single state word makes that torn
+   read structurally impossible.
+
+   Transitions (only the BSP does FREE<->SUBMITTED and DONE->FREE; only the
+   owning worker does SUBMITTED->DONE), so no observer ever sees a partial
+   slot:
+       FREE      --submit-->  SUBMITTED        (BSP)
+       SUBMITTED --worker-->  DONE             (owning AP)
+       DONE      --poll---->  FREE             (BSP) */
+typedef enum {
+    SLOT_FREE      = 0,   /* idle; calloc leaves slots here */
+    SLOT_SUBMITTED = 1,   /* task assigned, worker will run it */
+    SLOT_DONE      = 2     /* task complete, awaiting poll */
+} SlotState;
+
 typedef struct {
-    volatile uintptr_t   task;         /* AxlTaskProc cast to uintptr_t(0 = idle) */
+    volatile uint32_t    state;       /* SlotState — the single sync point */
+    AxlTaskProc          proc;        /* task fn (published before SUBMITTED) */
     void                *arg;
     AxlArena            *arena;
     AxlTaskComplete      on_complete;
-    volatile uint32_t    done;        /* 1 = task complete */
     volatile uint32_t    quit;        /* 1 = shutdown */
     volatile uint32_t    exited;      /* 1 = worker has exited */
     AxlTaskId            id;
@@ -70,13 +91,13 @@ worker_proc(
     slot = (WorkerSlot *)arg;
 
     while (!slot->quit) {
-        if (slot->task != 0) {
-            proc = (AxlTaskProc)(uintptr_t)slot->task;
-            slot->task = 0;
-            __sync_synchronize();          /* acquire — ensure arg/arena visible */
+        if (slot->state == SLOT_SUBMITTED) {
+            __sync_synchronize();          /* acquire — pair with submit's release
+                                              so proc/arg/arena are visible */
+            proc = slot->proc;
             proc(slot->arg, slot->arena);
-            __sync_synchronize();          /* release — ensure task results visible */
-            slot->done = 1;
+            __sync_synchronize();          /* release — task results visible before DONE */
+            slot->state = SLOT_DONE;
         }
         cpu_pause();
     }
@@ -230,15 +251,18 @@ axl_task_pool_submit(
         return id;
     }
 
-    /* Find idle worker */
+    /* Find a free slot. Only the BSP (this thread) moves slots FREE ->
+       SUBMITTED and DONE -> FREE, and a single state word means the read is
+       never torn, so a slot seen FREE here stays FREE until we fill it. */
     for (i = 0; i < pool->worker_count; i++) {
-        if (pool->slots[i].task == 0 && pool->slots[i].done == 0) {
+        if (pool->slots[i].state == SLOT_FREE) {
+            pool->slots[i].proc = proc;
             pool->slots[i].arg = arg;
             pool->slots[i].arena = arena;
             pool->slots[i].on_complete = on_complete;
             pool->slots[i].id = id;
-            __sync_synchronize();          /* release — ensure fields visible before task */
-            pool->slots[i].task = (uintptr_t)proc;
+            __sync_synchronize();          /* release — fields visible before SUBMITTED */
+            pool->slots[i].state = SLOT_SUBMITTED;
             return id;
         }
     }
@@ -262,14 +286,15 @@ axl_task_pool_poll(
 
     completed = 0;
     for (i = 0; i < pool->worker_count; i++) {
-        if (pool->slots[i].done) {
+        if (pool->slots[i].state == SLOT_DONE) {
             __sync_synchronize();          /* acquire — ensure task results visible */
             if (pool->slots[i].on_complete != NULL) {
                 pool->slots[i].on_complete(pool->slots[i].arg,
                                            pool->slots[i].arena);
             }
             pool->slots[i].on_complete = NULL;
-            pool->slots[i].done = 0;
+            __sync_synchronize();          /* release — reap (on_complete read arg) before FREE */
+            pool->slots[i].state = SLOT_FREE;
             completed++;
         }
     }
@@ -295,7 +320,9 @@ axl_task_pool_done(
 
     for (i = 0; i < pool->worker_count; i++) {
         if (pool->slots[i].id == id) {
-            return pool->slots[i].done != 0 || pool->slots[i].task == 0;
+            /* Complete once the slot reaches DONE (awaiting poll) or has been
+               reaped back to FREE; still SUBMITTED means in flight. */
+            return pool->slots[i].state != SLOT_SUBMITTED;
         }
     }
 
@@ -316,7 +343,7 @@ axl_task_pool_available(
 
     count = 0;
     for (i = 0; i < pool->worker_count; i++) {
-        if (pool->slots[i].task == 0 && pool->slots[i].done == 0) {
+        if (pool->slots[i].state == SLOT_FREE) {
             count++;
         }
     }

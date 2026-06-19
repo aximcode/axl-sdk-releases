@@ -83,6 +83,33 @@ if no key is buffered), `UINT64_MAX` blocks forever,
 anything else is a millisecond bound. Pair with
 `axl_console_flush_input()` before a prompt to eat type-ahead.
 
+### Text-console modes
+
+The same header exposes the text-output mode surface the UEFI Shell's
+`mode` command shows — enumerate the character-cell geometries the active
+console supports and switch between them (the graphics-free peer of the
+AxlGfx display-mode API):
+
+```c
+uint32_t n = axl_console_text_mode_count();
+for (uint32_t i = 0; i < n; i++) {
+    AxlConsoleTextMode m;
+    if (axl_console_text_query_mode(i, &m) == AXL_OK)   /* skip unsupported */
+        axl_printf("  mode %u: %ux%u\n", m.index, m.columns, m.rows);
+}
+AxlConsoleTextMode big;
+if (axl_console_text_max_mode(&big) == AXL_OK)
+    axl_console_text_set_mode(big.index);   /* clears the screen; repaint */
+```
+
+`axl_console_text_find_mode(columns, rows, &idx)` looks up a specific size
+and `axl_console_text_current_mode(&idx)` reports the active one. Only mode
+0 (80x25) is guaranteed; higher modes are optional and a conformant console
+may reject `QueryMode` on an in-range mode (real OVMF does, for one of its
+graphics-console modes) — the enumerating helpers skip those. These operate
+on the active console, so under an installed `AxlConsoleMirror` they reflect
+the mirror's fixed remote geometry until it is uninstalled.
+
 ## File Read/Write
 
 The simplest way to read or write files:

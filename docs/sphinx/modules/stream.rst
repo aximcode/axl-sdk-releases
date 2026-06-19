@@ -9,8 +9,16 @@ API Reference
 
 .. doxygenfile:: axl-stream.h
 
-AxlConsole — interactive console input
---------------------------------------
+AxlConsole — interactive console input + text-mode control
+----------------------------------------------------------
+
+Single-keystroke input with a timeout (``axl_console_read_key``), plus the
+text-output mode surface the UEFI Shell's ``mode`` command exposes:
+enumerate the character-cell geometries the active console supports
+(``axl_console_text_mode_count`` / ``query_mode`` / ``current_mode`` /
+``find_mode`` / ``max_mode``) and switch between them
+(``axl_console_text_set_mode``). The graphics-free peer of the AxlGfx
+display-mode API.
 
 .. doxygenfile:: axl-console.h
 

@@ -698,6 +698,77 @@ test_console_read_key_raised_tpl(void)
 }
 
 // ---------------------------------------------------------------------------
+// Text-console modes (SimpleTextOutput QueryMode / SetMode) — the
+// graphics-free peer of the AxlGfx display-mode API. The unit suite drives a
+// real, working ConOut (the harness output itself flows through it), so unlike
+// the headless-GOP gfx unit test there IS always a console with at least mode
+// 0 (UEFI guarantees 80x25). We assert the read-only enumerate path against
+// that live console; the live *switch* is verified in isolation by
+// test-console-text-mode-qemu.sh (a SetMode here would clear the serial
+// console mid-suite). The no-console robustness branch is defensive and not
+// reachable in an environment that has a console.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_text_modes(void)
+{
+    /* NULL-argument guards hold regardless of console state. */
+    test_check(axl_console_text_query_mode(0, NULL) == AXL_ERR,
+               "text_query_mode: NULL out -> AXL_ERR");
+    test_check(axl_console_text_current_mode(NULL) == AXL_ERR,
+               "text_current_mode: NULL out -> AXL_ERR");
+    test_check(axl_console_text_find_mode(80, 25, NULL) == AXL_ERR,
+               "text_find_mode: NULL out -> AXL_ERR");
+    test_check(axl_console_text_max_mode(NULL) == AXL_ERR,
+               "text_max_mode: NULL out -> AXL_ERR");
+
+    /* A working ConOut exists in the unit boot, so mode 0 (80x25) is present. */
+    uint32_t n = axl_console_text_mode_count();
+    test_check(n >= 1, "text_mode_count: at least mode 0 exists");
+
+    AxlConsoleTextMode m0 = { 0 };
+    test_check(axl_console_text_query_mode(0, &m0) == AXL_OK
+               && m0.index == 0 && m0.columns > 0 && m0.rows > 0,
+               "text_query_mode: mode 0 has positive geometry");
+
+    /* index == count is out of range. */
+    AxlConsoleTextMode oob;
+    test_check(axl_console_text_query_mode(n, &oob) == AXL_ERR,
+               "text_query_mode: index == count -> AXL_ERR");
+
+    /* The current mode is enumerable. */
+    uint32_t cur = 12345;
+    test_check(axl_console_text_current_mode(&cur) == AXL_OK && cur < n,
+               "text_current_mode: in [0, count)");
+
+    /* Mode 0's geometry round-trips through find_mode to a matching mode. */
+    uint32_t found = 12345;
+    AxlConsoleTextMode fm;
+    test_check(axl_console_text_find_mode(m0.columns, m0.rows, &found) == AXL_OK
+               && found < n
+               && axl_console_text_query_mode(found, &fm) == AXL_OK
+               && fm.columns == m0.columns && fm.rows == m0.rows,
+               "text_find_mode: mode 0's geometry is findable");
+
+    /* A geometry no console offers is not found. */
+    uint32_t miss = 12345;
+    test_check(axl_console_text_find_mode(1, 1, &miss) == AXL_ERR,
+               "text_find_mode: 1x1 -> AXL_ERR (no such mode)");
+
+    /* max_mode is enumerable and no smaller (by area) than mode 0. */
+    AxlConsoleTextMode mx;
+    test_check(axl_console_text_max_mode(&mx) == AXL_OK && mx.index < n
+               && (uint64_t)mx.columns * mx.rows
+                      >= (uint64_t)m0.columns * m0.rows,
+               "text_max_mode: largest enumerable area");
+
+    /* Out-of-range set is rejected and never switches the live console
+       (a real switch would clear the serial console mid-suite). */
+    test_check(axl_console_text_set_mode(n + 1000) == AXL_ERR,
+               "text_set_mode: out-of-range index -> AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
 // axl_stdout_raw — binary-out symmetric companion to axl_stdin
 // ---------------------------------------------------------------------------
 
@@ -1822,6 +1893,7 @@ test_io_main(int argc, char **argv)
     test_stderr_tee();
     test_console_read_key();
     test_console_read_key_raised_tpl();
+    test_console_text_modes();
     test_stdout_raw();
     test_text_stream();
     test_encoding_default_passthrough();

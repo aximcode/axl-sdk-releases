@@ -3,6 +3,56 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.2.0 — 2026-06-18
+
+### Added
+
+- **Text-console mode enumeration + selection** (`<axl/axl-console.h>`) — the
+  surface the UEFI Shell's `mode` command exposes, and the graphics-free peer
+  of the AxlGfx display-mode API. `axl_console_text_mode_count`,
+  `axl_console_text_query_mode`, `axl_console_text_current_mode`,
+  `axl_console_text_find_mode`, `axl_console_text_max_mode`, and
+  `axl_console_text_set_mode` enumerate the active console's character-cell
+  geometries (80x25, 100x31, ...) and switch between them, returning geometry
+  as `AxlConsoleTextMode {index, columns, rows}`. Robustness matches and
+  exceeds the GOP mode API: the signed `MaxMode`/`Mode` fields are guarded (a
+  non-positive count clamps to 0; an unset current mode `-1` or an
+  out-of-range current mode is surfaced as `AXL_ERR`, never a bogus index),
+  and the inventory-walking `find`/`max` helpers skip modes whose `QueryMode`
+  legally fails — which real OVMF/AAVMF exercise (their graphics console
+  reports an in-range text mode the firmware doesn't support). Verified by a
+  live enumerate + switch + restore round-trip under a virtual GPU
+  (`test-console-text-mode-qemu.sh`) on both arches; the `-nographic` unit
+  suite locks the enumerate + NULL-arg + bounds contract.
+- **`axbench` — AP-pool benchmark tool** (`tools/axbench.c`). Measures
+  `AxlTaskPool` (Application-Processor offload) vs the BSP across 8 scenarios
+  — topology, pool spin-up, dispatch latency, a compute-bound break-even
+  sweep, a granularity sweep, a bandwidth-bound (box-blur) sweep,
+  BSP-participates, and a summary verdict — adapting to the worker count and
+  writing the report to stdout or a file. Ctrl-C aborts cleanly (the
+  orchestration loops poll the shell break and tear down the AP workers + bench
+  buffers via an `axl_atexit` hook; `test-axbench-ctrlc-qemu.sh`). Real-HW
+  validated on a dual-socket 96-core box (W=95): 192 ns dispatch, compute-bound
+  ~95x at 99% of the worker ceiling, bandwidth-bound NUMA-capped at ~9x. The
+  decision it informed lives in `docs/AXL-Concurrency.md` ("AP offload").
+
+### Fixed
+
+- **`AxlTaskPool` torn-read race** in `axl_task_pool_available()` /
+  `axl_task_pool_submit()`. The slot's `task`/`done`/`running` flags were read
+  as three separate volatile loads, so a worker completing concurrently
+  (`done` 0→1 then `running` 1→0) between the `done` and `running` reads made a
+  just-completed slot read as idle — `available()` over-reported and `submit()`
+  could clobber an unreaped completion, dropping a task and hanging the caller's
+  wave (observed on a 95-AP machine). The three flags are now one atomic `state`
+  word (FREE/SUBMITTED/DONE), so the read is never torn: `available()` is exact
+  and `submit()` cannot clobber. Regression: `test-task-pool-mp-qemu.sh`
+  (QEMU `-smp 4`, 4000 waves).
+- **`AxlTaskPool` completion-store ordering race + `axl_task_pool_done()`
+  predicate** — a worker's result store could become visible after its
+  done-flag, and `done()` could report a mid-execution slot as finished; both
+  are now fenced/ordered correctly.
+
 ## 2.1.0 — 2026-06-18
 
 ### Added

@@ -144,6 +144,64 @@ axl_backend_console_get_attr(
     return 0;
 }
 
+uint32_t
+axl_backend_console_text_mode_count(
+    void
+    )
+{
+    if (gST == NULL || gST->ConOut == NULL || gST->ConOut->Mode == NULL) {
+        return 0;
+    }
+    /* MaxMode is INT32; a non-positive value means no usable modes. */
+    INT32 max = gST->ConOut->Mode->MaxMode;
+    return (max > 0) ? (uint32_t)max : 0;
+}
+
+int
+axl_backend_console_text_query_mode(
+    uint32_t   index,
+    uint32_t  *columns,
+    uint32_t  *rows
+    )
+{
+    if (gST == NULL || gST->ConOut == NULL || gST->ConOut->QueryMode == NULL
+        || columns == NULL || rows == NULL) {
+        return AXL_ERR;
+    }
+    UINTN      cols = 0, r = 0;
+    EFI_STATUS status =
+        gST->ConOut->QueryMode(gST->ConOut, (UINTN)index, &cols, &r);
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+    *columns = (uint32_t)cols;
+    *rows    = (uint32_t)r;
+    return AXL_OK;
+}
+
+int
+axl_backend_console_text_current_mode(
+    void
+    )
+{
+    if (gST == NULL || gST->ConOut == NULL || gST->ConOut->Mode == NULL) {
+        return -1;
+    }
+    return (int)gST->ConOut->Mode->Mode;   /* -1 when no mode is set */
+}
+
+int
+axl_backend_console_text_set_mode(
+    uint32_t  index
+    )
+{
+    if (gST == NULL || gST->ConOut == NULL || gST->ConOut->SetMode == NULL) {
+        return AXL_ERR;
+    }
+    EFI_STATUS status = gST->ConOut->SetMode(gST->ConOut, (UINTN)index);
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
 // ===================================================================
 // Time
 // ===================================================================
