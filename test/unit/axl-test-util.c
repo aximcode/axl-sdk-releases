@@ -4541,6 +4541,12 @@ cm_noop_sink(const char *bytes, size_t len, void *user)
     (void)user;
 }
 
+/* Test seam in src/util/axl-console-mirror.c (no public header): drive the
+   real inject_text decoder against a bare, un-installed mirror. */
+extern AxlConsoleMirror *_axl_console_mirror_new_for_test(void);
+extern bool _axl_console_mirror_test_pop_key(AxlConsoleMirror *m,
+                                             uint16_t *scan, uint16_t *unicode);
+
 static void
 test_console_mirror(void)
 {
@@ -4570,6 +4576,40 @@ test_console_mirror(void)
                "console_mirror: inject_key(NULL) returns -1");
     test_check(axl_console_mirror_inject_text(NULL, "x", 1) == AXL_ERR,
                "console_mirror: inject_text(NULL m) returns -1");
+
+    /* inject_text byte->key decode (the TerminalDxe-style decoder). Driven on
+       a bare, un-installed mirror via the test seam, so it never wraps the live
+       console (a full install wedges the combined unit boot — see the
+       AxlConsoleMirror note above). Regression for the terminal-Backspace bug:
+       xterm.js sends 0x7f (DEL) for the Backspace key, but UEFI backspace is
+       UnicodeChar 0x08 — so 0x7f must remap to 0x08 (the Delete *key* arrives
+       as the CSI 3~ escape and is decoded separately; not exercised here). */
+    AxlConsoleMirror *tm = _axl_console_mirror_new_for_test();
+    test_check(tm != NULL, "inject_text: bare test mirror constructed");
+    if (tm != NULL) {
+        uint16_t scan = 0xFFFF, uni = 0xFFFF;
+
+        /* A plain ASCII byte injects as that unicode char (frames the remap). */
+        axl_console_mirror_inject_text(tm, "a", 1);
+        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+                   && scan == 0 && uni == 'a',
+                   "inject_text: 'a' -> {ScanCode=0, UnicodeChar='a'}");
+
+        /* 0x08 (ASCII BS) already IS UEFI backspace — passes through. */
+        axl_console_mirror_inject_text(tm, "\x08", 1);
+        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+                   && scan == 0 && uni == 0x08,
+                   "inject_text: 0x08 -> {ScanCode=0, UnicodeChar=0x08} backspace");
+
+        /* THE FIX: 0x7f (terminal DEL = the Backspace key) must remap to UEFI
+           backspace 0x08, not pass through as a literal 0x7f. */
+        axl_console_mirror_inject_text(tm, "\x7f", 1);
+        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+                   && scan == 0 && uni == 0x08,
+                   "inject_text: 0x7f (terminal Backspace) -> UEFI backspace 0x08");
+
+        axl_free(tm);
+    }
 }
 
 // ---------------------------------------------------------------------------

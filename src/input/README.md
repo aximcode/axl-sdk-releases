@@ -203,13 +203,20 @@ serial QEMU test harness has no Ex protocol to exercise it).
 
 ## Per-device notes
 
-**Mouse** (`axl_input_attach_mouse`). Locates
-`EFI_SIMPLE_POINTER_PROTOCOL` via `LocateProtocol`. Cursor positions
-are accumulated relative deltas starting at `(0, 0)` — most firmware
-reports motion as deltas, not absolute screen coordinates. Callers
-wanting screen-bounded positions should clamp in the callback. Each
-dispatch may produce multiple discrete events (motion + button +
-wheel) from a single `GetState` call.
+**Mouse** (`axl_input_attach_mouse`). Drives the seat from
+`EFI_SIMPLE_POINTER_PROTOCOL`. Like `attach_touch` (below), it binds **every**
+SimplePointer handle **ConsoleInHandle first** — where a virtual pointer
+(`axl_virtual_pointer_*`) and a BMC remote-console mouse publish, and where live
+events arrive on firmware that multiplexes pointers through ConIn — each with a
+`WaitForInput` source, re-resolving the handle to its current interface every
+dispatch. (Earlier it bound a single located device that *skipped*
+ConsoleInHandle, so a virtual / remote-console pointer's move + wheel never
+reached the consumer.) Tear it **all** down with `axl_input_detach_mouse`, which
+removes every registered source. Cursor positions are accumulated relative
+deltas starting at `(0, 0)` — most firmware reports motion as deltas, not
+absolute screen coordinates. Callers wanting screen-bounded positions should
+clamp in the callback. Each dispatch may produce multiple discrete events
+(motion + button + wheel) from a single `GetState` call.
 
 **Keyboard** (`axl_input_attach_key`). Thin translator over
 `axl_loop_add_key_press` — the existing loop primitive does the

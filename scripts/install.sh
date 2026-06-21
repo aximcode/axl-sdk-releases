@@ -424,7 +424,7 @@ axl_embedded_${_EMBED_SYM}_end:
     add_custom_command(
         OUTPUT ${_EFI_FILE}
         COMMAND ${AXL_CROSS}objcopy
-                -j .text -j .sdata -j .data -j .dynamic -j .dynsym
+                -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym
                 -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir
                 --output-target=${AXL_PE_TARGET} --subsystem=${_SUBSYSTEM}
                 ${_SO_FILE} ${_EFI_FILE}

@@ -111,17 +111,30 @@ axl_input_live_modifiers(void)
 // — a name that doesn't exist.  Our generated header falls back to
 // `void *` because of that typo.  We cast at use site below.
 
+// Max pointer interfaces a source binds (ConsoleInHandle + a few physical).
+#define AXL_MAX_POINTER_IFACES 8
+
 typedef struct {
     AxlInputCallback              cb;
     void                         *data;
-    EFI_SIMPLE_POINTER_PROTOCOL  *protocol;
+    // Bound by HANDLE, ConsoleInHandle FIRST, and re-resolved to the current
+    // interface every dispatch — the same model as TouchSource.  A virtual
+    // pointer (and a BMC remote-console mouse) publishes its SimplePointer on
+    // gST->ConsoleInHandle; binding ConsoleInHandle-first is what delivers it.
+    // (The old single-interface bind via locate_physical_pointer SKIPPED
+    // ConsoleInHandle in favour of a physical device, so a virtual scroll /
+    // move never reached the consumer.)  Resolve-per-dispatch keeps a driver
+    // Stop()/FreePool() from leaving us calling through freed memory.
+    EFI_HANDLE                    handles[AXL_MAX_POINTER_IFACES]; ///< ConIn-first
+    int                           nproto;
     int32_t                       cursor_x;
     int32_t                       cursor_y;
     bool                          prev_left;
     bool                          prev_right;
     AxlGesture                    gesture;       ///< click-count / drag recognizer
     AxlLoop                      *loop;          ///< loop (for repeat timers + detach)
-    AxlSourceId                   source_id;     ///< WaitForInput loop source (for detach)
+    AxlSourceId                   source_ids[AXL_MAX_POINTER_IFACES]; ///< per-handle WaitForInput sources
+    int                           nsrc;
     AxlSourceId                   repeat_src;    ///< active held-button repeat timer (0 = none)
     uint32_t                      repeat_button; ///< AXL_INPUT_BUTTON_* being repeated
 } MouseSource;
@@ -213,6 +226,22 @@ disarm_repeat(MouseSource *ms)
 static MouseSource mouse_state;
 static bool        mouse_state_used = false;
 
+// Resolve a bound handle to its CURRENT simple-pointer interface, or NULL if
+// the protocol is gone (the providing driver was Stop()'d).  HandleProtocol
+// validates the handle against the firmware database, so a stale handle fails
+// safely rather than faulting — the simple-pointer twin of touch_resolve.
+static EFI_SIMPLE_POINTER_PROTOCOL *
+mouse_resolve(EFI_HANDLE handle)
+{
+    void *iface = NULL;
+    if (handle != NULL
+        && axl_bs()->HandleProtocol(handle, &EFI_SIMPLE_POINTER_PROTOCOL_GUID,
+                                    &iface) == 0) {
+        return (EFI_SIMPLE_POINTER_PROTOCOL *)iface;
+    }
+    return NULL;
+}
+
 static bool
 mouse_dispatch_cb(
     void  *data
@@ -221,9 +250,19 @@ mouse_dispatch_cb(
     MouseSource              *ms = (MouseSource *)data;
     EFI_SIMPLE_POINTER_STATE  state;
 
-    EFI_STATUS st = ms->protocol->GetState(ms->protocol, &state);
-    if (st != 0) {
-        /* No new data ready — keep source alive for next dispatch. */
+    /* Read whichever bound handle has data FIRST (ConsoleInHandle first, where
+       a virtual / BMC remote-console pointer lives), re-resolving the current
+       interface each dispatch.  GetState consumes one queued state per call. */
+    bool got = false;
+    for (int i = 0; i < ms->nproto; i++) {
+        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_resolve(ms->handles[i]);
+        if (sp != NULL && sp->GetState(sp, &state) == 0) {
+            got = true;
+            break;
+        }
+    }
+    if (!got) {
+        /* No new data on any handle — keep sources alive for next dispatch. */
         return AXL_SOURCE_CONTINUE;
     }
 
@@ -330,13 +369,17 @@ mouse_dispatch_cb(
 // NOT the aggregator (the physical device). Fall back to the aggregator,
 // then to LocateProtocol, when no separate physical handle exists.
 //
-// v0.1 attaches a single source; if several physical pointers exist
-// (USB mouse + PS/2) this takes the first enumerated — acceptable for now.
+// If several physical pointers exist (USB mouse + PS/2) this takes the first
+// enumerated.
 //
-// Non-static (no public header) so the input regression test can call it
-// directly: a dispatch-through-the-loop check can't tell which device was
-// bound when the QEMU platform also exposes a real pointer, but a direct
-// call can assert the returned interface is never the aggregator's.
+// NOTE: attach_mouse no longer binds via this helper — it now binds every
+// SimplePointer handle ConsoleInHandle-first (collect_pointers), like
+// attach_touch, so a virtual / BMC remote-console pointer published on
+// ConsoleInHandle is delivered (this helper deliberately SKIPS ConsoleInHandle
+// and so missed it). Retained as a utility — and called directly by the input
+// regression test, which asserts the prefer-physical / skip-aggregator
+// contract a single-located bind would need. Non-static (no public header) so
+// the test can reach it.
 void *
 axl_input_locate_physical_pointer(EFI_GUID *guid)
 {
@@ -369,9 +412,6 @@ axl_input_locate_physical_pointer(EFI_GUID *guid)
     }
     return iface;
 }
-
-// Max pointer interfaces a source binds (ConsoleInHandle + a few physical).
-#define AXL_MAX_POINTER_IFACES 8
 
 // Collect every interface publishing @p guid into @p out (cap @p max),
 // **ConsoleInHandle FIRST**.  On modern firmware (UEFI >= 2.30 — all current
@@ -668,36 +708,60 @@ axl_input_attach_mouse(
         return 0;
     }
 
-    EFI_GUID                     guid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
-    EFI_SIMPLE_POINTER_PROTOCOL *sp   =
-        (EFI_SIMPLE_POINTER_PROTOCOL *)axl_input_locate_physical_pointer(&guid);
-    if (sp == NULL) {
+    /* Bind every SimplePointer handle, ConsoleInHandle FIRST — where a virtual
+       pointer and a BMC remote-console mouse publish, and where the live events
+       arrive on modern firmware that multiplexes pointers through ConIn.  A
+       separate physical handle (some QEMU OVMF) is bound too, so an idle/empty
+       aggregator simply stays silent and the physical device still delivers.
+       This is the same model attach_touch uses (collect_pointers); the old
+       single-interface locate_physical_pointer bind SKIPPED ConsoleInHandle and
+       so never saw a virtual pointer. */
+    mouse_state.nproto = collect_pointers(&EFI_SIMPLE_POINTER_PROTOCOL_GUID,
+                                          mouse_state.handles,
+                                          AXL_MAX_POINTER_IFACES);
+    if (mouse_state.nproto == 0) {
         axl_debug("EFI_SIMPLE_POINTER_PROTOCOL not available "
                   "(headless / no mouse hardware)");
         return 0;
     }
 
-    /* Best-effort reset — clears any stale state from prior consumers.
-       Failure is non-fatal; the first GetState may return EFI_NOT_READY
-       which the dispatch callback handles. */
-    (void)sp->Reset(sp, false);
-
     mouse_state.cb            = cb;
     mouse_state.data          = data;
-    mouse_state.protocol      = sp;
     mouse_state.cursor_x      = 0;
     mouse_state.cursor_y      = 0;
     mouse_state.prev_left     = false;
     mouse_state.prev_right    = false;
     mouse_state.gesture       = (AxlGesture){0};
     mouse_state.loop          = loop;
+    mouse_state.nsrc          = 0;
     mouse_state.repeat_src    = 0;
     mouse_state.repeat_button = 0;
     mouse_state_used          = true;
 
-    mouse_state.source_id = axl_loop_add_event(loop, sp->WaitForInput,
-                                               mouse_dispatch_cb, &mouse_state);
-    return mouse_state.source_id;
+    /* Reset each device + register a WaitForInput source per handle. */
+    for (int i = 0; i < mouse_state.nproto
+                    && mouse_state.nsrc < AXL_MAX_POINTER_IFACES; i++) {
+        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_resolve(mouse_state.handles[i]);
+        if (sp == NULL) {
+            continue;
+        }
+        (void)sp->Reset(sp, false);   /* best-effort; first GetState may be NOT_READY */
+        if (sp->WaitForInput != NULL) {
+            AxlSourceId sid = axl_loop_add_event(loop, sp->WaitForInput,
+                                                 mouse_dispatch_cb, &mouse_state);
+            if (sid != 0) {
+                mouse_state.source_ids[mouse_state.nsrc++] = sid;
+            }
+        }
+    }
+    if (mouse_state.nsrc == 0) {
+        /* No handle exposed a usable WaitForInput — nothing to dispatch on. */
+        mouse_state_used = false;
+        return 0;
+    }
+    /* Return the first source id as the attach handle (non-zero == success);
+       detach removes every registered source. */
+    return mouse_state.source_ids[0];
 }
 
 void
@@ -707,10 +771,10 @@ axl_input_detach_mouse(AxlLoop *loop)
         return;
     }
     disarm_repeat(&mouse_state);
-    if (mouse_state.source_id != 0) {
-        axl_loop_remove_source(loop, mouse_state.source_id);
-        mouse_state.source_id = 0;
+    for (int i = 0; i < mouse_state.nsrc; i++) {
+        axl_loop_remove_source(loop, mouse_state.source_ids[i]);
     }
+    mouse_state.nsrc = 0;
     mouse_state_used = false;
 }
 

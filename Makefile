@@ -139,7 +139,7 @@ LINK_CRT0   = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ)
 # Tests/AXL_APP: asm CRT0 → _AxlEntry(from AXL_APP macro)
 LINK_CRT0_T = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
 
-OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
+OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
                    -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir
 
 # Host tool: patches PE debug data directory after objcopy
@@ -586,7 +586,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -625,6 +625,13 @@ check-docs:
 check-nx-compat: $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/SmbusHcShim.efi
 	@python3 scripts/check-pe-nx.py \
 	    $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/SmbusHcShim.efi
+
+# Verify the crt0 zeroes .bss itself (the linker emits .bss as a NOBITS PE
+# section; the UEFI loader is NOT trusted to zero-fill it — 576fd474 stuck the
+# mouse by relying on that). Firmware-independent: disassembles _start and
+# checks it loads both clear bounds (_bss / _bss_end). The current ARCH's crt0.
+check-bss-clear: $(GCC_CRT0)
+	@python3 scripts/check-bss-clear.py $(GCC_CRT0)
 
 check-version:
 	@file_ver=$$(cat VERSION); \
@@ -935,6 +942,22 @@ $(PREFIX)/console-text-mode-selftest.efi: $(BUILDDIR)/console-text-mode-selftest
 	$(call LINK_EFI_APP,$(BUILDDIR)/console-text-mode-selftest.o,$@)
 
 $(BUILDDIR)/console-text-mode-selftest.o: test/integration/console-text-mode-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build bss-probe.efi — measure + validate large-.bss handling (8 MiB
+# static array). Used by the .bss-section build experiment to confirm the
+# array is carried as an uninitialized PE section (tiny file) yet still
+# zero-filled + writable at runtime under the firmware loader.
+# ===================================================================
+
+bss-probe: $(PREFIX)/bss-probe.efi
+	@echo "  Built: $(PREFIX)/bss-probe.efi"
+
+$(PREFIX)/bss-probe.efi: $(BUILDDIR)/bss-probe.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/bss-probe.o,$@)
+
+$(BUILDDIR)/bss-probe.o: test/integration/bss-probe.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

@@ -823,7 +823,12 @@ axl_console_mirror_inject_text(AxlConsoleMirror *m, const char *bytes, size_t le
 
         /* UTF-8 → a single BMP unicode key (input is typically ASCII). */
         if (b < 0x80) {
-            inject_unicode(m, b);
+            /* Terminals (xterm.js) send 0x7f (DEL) for the Backspace key;
+               UEFI backspace is UnicodeChar 0x08, so remap it here — exactly
+               what TerminalDxe does for an incoming 0x7f. (The Delete *key*
+               arrives as the CSI "3~" escape and is decoded to SCAN_DELETE by
+               decode_escape; it never reaches this byte path.) */
+            inject_unicode(m, (b == 0x7f) ? 0x08 : b);
         } else if ((b & 0xE0) == 0xC0 && i + 1 < len) {
             uint16_t cp = (uint16_t)((b & 0x1F) << 6)
                         | (uint16_t)(bytes[i + 1] & 0x3F);
@@ -856,6 +861,39 @@ axl_console_mirror_inject_text(AxlConsoleMirror *m, const char *bytes, size_t le
         m->esc_len = 0;
     }
     return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Test seam (no public header). Exercises the REAL inject_text/inject_key
+// byte->key decoder without installing the mirror — install wraps the live
+// gST->ConIn/ConOut and wedges the combined unit boot (see the AxlConsoleMirror
+// test note in axl-test-util.c). Construct a bare, un-wrapped instance (ring +
+// esc state only; no console wrap, no g_mirror, no WaitForKey event so
+// ring_push won't SignalEvent), drive inject_* against its ring, and pop the
+// decoded keys. Free with axl_free. The console-mirror unit test calls these.
+// ---------------------------------------------------------------------------
+
+AxlConsoleMirror *
+_axl_console_mirror_new_for_test(void)
+{
+    return axl_calloc(1, sizeof(AxlConsoleMirror));
+}
+
+bool
+_axl_console_mirror_test_pop_key(AxlConsoleMirror *m, uint16_t *scan,
+                                 uint16_t *unicode)
+{
+    EFI_INPUT_KEY k;
+    if (m == NULL || !ring_pop(m, &k)) {
+        return false;
+    }
+    if (scan != NULL) {
+        *scan = k.ScanCode;
+    }
+    if (unicode != NULL) {
+        *unicode = k.UnicodeChar;
+    }
+    return true;
 }
 
 void

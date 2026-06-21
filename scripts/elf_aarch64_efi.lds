@@ -60,19 +60,37 @@ SECTIONS
    *(.fini_array)
    __fini_array_end = .;
 
-   /* the EFI loader doesn't seem to like a .bss section, so we stick
-      it all into .data: */
-   *(.sbss)
-   *(.scommon)
-   *(.dynbss)
-   *(.bss*)
-   *(COMMON)
    *(.rel.local)
   }
   .note.gnu.build-id : { *(.note.gnu.build-id) }
 
   _edata = .;
   _data_size = _edata - _etext;
+  . = ALIGN(4096);
+
+  /* Real uninitialized .bss. This output section holds only NOBITS inputs,
+     so it stays SHT_NOBITS; objcopy carries it (via -j .bss) into the PE as
+     an IMAGE_SCN_CNT_UNINITIALIZED_DATA section with SizeOfRawData == 0, so the
+     loader maps the span but it carries no file content. This replaces the
+     historical "fold .bss into .data" workaround, which materialized every
+     zero byte as literal file content (an N-byte static array added N bytes to
+     the .efi). The crt0 _start ZEROES [_bss, _bss_end) before any C code runs
+     (src/crt0/axl-crt0-gcc-*.S) — the loader's zero-fill is NOT relied upon
+     (fresh AllocatePages memory can be dirty; `make check-bss-clear` guards the
+     crt0 clear). _bss/_bss_end are the bounds the crt0 reads. Page-aligned so
+     it lands on its own PE section boundary. */
+  .bss (NOLOAD) :
+  {
+   _bss = .;
+   *(.sbss)
+   *(.scommon)
+   *(.dynbss)
+   *(.bss*)
+   *(COMMON)
+   . = ALIGN(16);
+   _bss_end = .;
+  }
+  _bss_size = _bss_end - _bss;
   . = ALIGN(4096);
   .dynamic  : { *(.dynamic) }
   . = ALIGN(4096);

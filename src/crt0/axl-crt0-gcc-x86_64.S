@@ -17,6 +17,20 @@ _start:
     pushq   %rcx                /* save ImageHandle (ms_abi arg1) */
     pushq   %rdx                /* save SystemTable (ms_abi arg2) */
 
+    /* Zero .bss before relocation / any C code. The linker emits .bss as a
+       real NOBITS section; the UEFI loader is NOT guaranteed to zero-fill it
+       (fresh AllocatePages memory can be dirty — relying on that booted
+       zero-init globals, e.g. axl-input's static MouseSource, with garbage).
+       A freestanding runtime must clear its own .bss. RIP-relative bounds work
+       pre-relocation; _bss is page-aligned and _bss_end is ALIGN(16). rdi/rcx/
+       rax are free — ImageHandle/SystemTable are saved on the stack. */
+    lea     _bss(%rip), %rdi
+    lea     _bss_end(%rip), %rcx
+    subq    %rdi, %rcx          /* rcx = byte count */
+    xorl    %eax, %eax
+    cld
+    rep stosb
+
     /* _axl_relocate(ImageBase, _DYNAMIC) — RIP-relative, works pre-reloc */
     lea     ImageBase(%rip), %rdi
     lea     _DYNAMIC(%rip), %rsi

@@ -233,7 +233,11 @@ test_attach_mouse_protocol_available(void)
        usb-mouse, once the firmware binds it). In that case the helper
        returns the real device — still != the aggregator — whereas the
        buggy LocateProtocol path would return the aggregator interface.
-       The same helper backs attach_mouse and attach_touch. */
+       NOTE: attach_mouse no longer binds via this helper — it binds every
+       SimplePointer handle ConsoleInHandle-first (collect_pointers), like
+       attach_touch, so a virtual / remote-console pointer on ConsoleInHandle
+       is delivered. This still exercises the helper's prefer-physical
+       contract (retained as a utility) and attach_mouse's registration. */
     EFI_GUID guid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
 
     /* The aggregator interface — what the buggy LocateProtocol returns. */
@@ -1434,14 +1438,12 @@ test_virtual_pointer_e2e_touch(void)
     axl_virtual_pointer_uninstall(vp);
 }
 
-// End-to-end relative pointer + WHEEL through the loop. attach_mouse prefers a
-// PHYSICAL (non-ConsoleIn) SimplePointer — and the test harness always has the
-// runner's usb-mouse — so it never binds the virtual one here (verified: on a
-// real headless deployment with no physical mouse, attach_mouse's fallback DOES
-// bind it). To get deterministic coverage of the inject -> WaitForInput
-// loop-wake -> GetState delivery of relative movement, buttons, and the scroll
-// wheel, drive OUR virtual SimplePointer directly as a loop event source — the
-// exact substrate path attach_mouse's MOUSE_WHEEL/MOVE/BUTTON decode sits on.
+// Substrate-level coverage of the inject -> WaitForInput loop-wake -> GetState
+// delivery of relative movement, buttons, and the scroll wheel: drive OUR
+// virtual SimplePointer directly as a loop event source. The full
+// attach_mouse path (which now binds ConsoleInHandle-first and so DOES bind the
+// virtual pointer) is covered by test_virtual_pointer_e2e_mouse_wheel below;
+// this isolates the GetState->delta decode from the binding.
 typedef struct {
     EFI_SIMPLE_POINTER_PROTOCOL *sp;
     int32_t                      dx, dy, dz;
@@ -1506,6 +1508,99 @@ test_virtual_pointer_e2e_mouse(void)
 }
 
 // ---------------------------------------------------------------------------
+// Virtual-pointer SCROLL surfaces as MOUSE_WHEEL through the REAL attach_mouse
+// consumer (not a direct WaitForInput sink). Regression for the
+// axl-sdk-vpointer-wheel-handoff: the virtual pointer publishes its
+// EFI_SIMPLE_POINTER on gST->ConsoleInHandle (where a BMC remote-console
+// mouse's events arrive), but attach_mouse used to bind via
+// locate_physical_pointer, which SKIPS ConsoleInHandle in favour of a physical
+// device — so a virtual scroll()/move never reached the consumer. attach_mouse
+// now binds ConsoleInHandle-first (like attach_touch), delivering both.
+//
+// An idle physical mock SimplePointer on a non-ConsoleIn handle makes the OLD
+// binding deterministically pick a non-virtual device on BOTH arches (x64 also
+// has the runner's usb-mouse; AAVMF would otherwise fall back to the virtual
+// one), so this fails RED on the unfixed path rather than passing by luck.
+// ---------------------------------------------------------------------------
+
+static int32_t g_vpw_wheel_dy;
+static int     g_vpw_wheel, g_vpw_move;
+static bool
+vpw_cb(const AxlInputEvent *ev, void *data)
+{
+    (void)data;
+    if (ev->type == AXL_INPUT_MOUSE_WHEEL) {
+        g_vpw_wheel_dy = ev->wheel_dy;
+        g_vpw_wheel++;
+    } else if (ev->type == AXL_INPUT_MOUSE_MOVE) {
+        g_vpw_move++;
+    }
+    return true;   /* AXL_SOURCE_CONTINUE */
+}
+
+static EFI_STATUS EFIAPI
+mock_sp_getstate_idle(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *st)
+{
+    (void)This;
+    (void)st;
+    return 6;   /* EFI_NOT_READY: present but never has data — a competitor that
+                   must not absorb the bind away from the virtual pointer. */
+}
+
+static void
+test_virtual_pointer_e2e_mouse_wheel(void)
+{
+    /* Idle physical mock on a non-ConsoleIn handle: the OLD attach_mouse
+       binding (locate_physical_pointer) picks this over the virtual pointer on
+       every arch, so without the fix the scroll/move is never delivered. */
+    EFI_GUID  guid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+    AxlEvent *wfi  = axl_event_new();
+    test_check(wfi != NULL, "vptr-wheel: fixture WaitForInput created");
+    static EFI_SIMPLE_POINTER_PROTOCOL phys;
+    phys.Reset        = mock_sp_reset;
+    phys.GetState     = mock_sp_getstate_idle;
+    phys.WaitForInput = axl_event_handle(wfi);
+    phys.Mode         = NULL;
+    EFI_HANDLE physh = NULL;
+    gBS->InstallProtocolInterface(&physh, &guid, EFI_NATIVE_INTERFACE, &phys);
+    test_check(physh != gST->ConsoleInHandle,
+               "vptr-wheel: idle physical mock on a non-ConsoleIn handle");
+
+    AxlVirtualPointer      *vp  = NULL;
+    AxlVirtualPointerConfig cfg = { .width = 800, .height = 600,
+                                    .also_simple = true };
+    test_check(axl_virtual_pointer_install(&vp, &cfg) == AXL_OK && vp != NULL,
+               "vptr-wheel: install virtual pointer with also_simple");
+
+    g_vpw_wheel = g_vpw_move = 0;
+    g_vpw_wheel_dy = 0;
+    AxlLoop    *loop = axl_loop_new();
+    AxlSourceId id   = axl_input_attach_mouse(loop, vpw_cb, NULL);
+    test_check(id != 0, "vptr-wheel: attach_mouse returns a valid source");
+
+    /* Two injects produce a relative move; then a scroll notch. Pump after
+       each so the WaitForInput source dispatches. */
+    axl_virtual_pointer_inject(vp, 100, 100, 0x0);   /* baseline */
+    ev_pump(loop);
+    axl_virtual_pointer_inject(vp, 140, 100, 0x0);   /* +40 in X -> MOUSE_MOVE */
+    ev_pump(loop);
+    test_check(axl_virtual_pointer_scroll(vp, +1) == AXL_OK,
+               "vptr-wheel: scroll(+1) accepted");
+    ev_pump(loop);
+
+    test_check(g_vpw_move >= 1,
+               "vptr-wheel: relative inject -> MOUSE_MOVE delivered to attach_mouse");
+    test_check(g_vpw_wheel >= 1 && g_vpw_wheel_dy == +1,
+               "vptr-wheel: scroll(+1) -> MOUSE_WHEEL wheel_dy==+1 to attach_mouse");
+
+    axl_input_detach_mouse(loop);
+    axl_loop_free(loop);
+    axl_virtual_pointer_uninstall(vp);
+    gBS->UninstallProtocolInterface(physh, &guid, &phys);
+    axl_event_free(wfi);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1544,6 +1639,7 @@ test_input_main(
     test_virtual_pointer_simple();
     test_virtual_pointer_e2e_touch();
     test_virtual_pointer_e2e_mouse();
+    test_virtual_pointer_e2e_mouse_wheel();
 
     test_ctrl_letter_serial_folded();
     test_ctrl_letter_keyboard_letter_plus_mod();

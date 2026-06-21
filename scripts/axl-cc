@@ -552,7 +552,7 @@ run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
     "$LIB_DIR/libaxl.a" || { echo "ERROR: linking failed" >&2; rm -rf "$TMPDIR"; exit 1; }
 
 run_cmd ${CROSS}objcopy \
-    -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
+    -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
     -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir \
     --output-target="$PE_TARGET" --subsystem=$SUBSYSTEM \
     "$SO_FILE" "$OUTPUT" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }

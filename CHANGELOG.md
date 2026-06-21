@@ -3,6 +3,70 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.2.1 — 2026-06-21
+
+### Fixed
+
+- **`axl_console_mirror_inject_text` now maps the terminal Backspace byte
+  (0x7f DEL) to UEFI backspace (0x08)**, so Backspace works in a browser-driven
+  UEFI shell. xterm.js (and most terminals) send 0x7f for the Backspace key,
+  but the decoder injected it as `UnicodeChar=0x7f`, which the shell ignores —
+  backspace did nothing. It now remaps 0x7f→0x08 in the ASCII path, exactly as
+  UEFI `TerminalDxe` does (the Delete *key* still arrives as the CSI `3~`
+  escape and decodes to `SCAN_DELETE`, unaffected). Regression test:
+  `inject_text: 0x7f (terminal Backspace) -> UEFI backspace 0x08` (a new test
+  seam drives the real decoder without installing the mirror). SoftBMC
+  RemoteShell needs no change.
+
+- **crt0 now zeroes `.bss` itself — fixes garbage zero-init globals on firmware
+  that doesn't zero NOBITS pages** (a regression from the `.bss`-as-NOBITS
+  change). That change relied on the UEFI loader to zero-fill the new
+  uninitialized `.bss` section, but the GCC crt0 never cleared it, so on
+  firmware that hands back dirty `AllocatePages` memory every zero-initialized
+  static booted with garbage — e.g. axl-input's `static MouseSource` →
+  pointer/scroll stuck (the keyboard path, with different state, survived). The
+  crt0 `_start` (the PE entry for every image — apps and drivers) now zeroes
+  `[_bss, _bss_end)` before relocation and any C code; the loader's zero-fill is
+  no longer relied upon. New firmware-independent guard `make check-bss-clear`
+  (disassembles `_start`, asserts it clears both bounds) wired into CI — it
+  fails deterministically if the clear is ever removed, unlike the boot probe
+  which only reflects one firmware's behavior. This also closes the real-HW
+  caveat noted on the original `.bss` change: correctness no longer depends on
+  loader zero-fill.
+
+- **`axl_input_attach_mouse` now delivers a virtual / BMC remote-console
+  pointer's motion and scroll wheel.** It bound a single `EFI_SIMPLE_POINTER`
+  via `axl_input_locate_physical_pointer`, which deliberately *skips*
+  `gST->ConsoleInHandle` — but that is exactly where a virtual pointer
+  (`axl_virtual_pointer_*`, `also_simple`) and a BMC remote-console mouse
+  publish, so `axl_virtual_pointer_scroll()` and relative motion never reached
+  an `attach_mouse` consumer (zero `AXL_INPUT_MOUSE_WHEEL` / `MOUSE_MOVE`
+  events), even though the AbsolutePointer/`attach_touch` twin worked.
+  `attach_mouse` now binds **every** SimplePointer handle **ConsoleInHandle
+  first** (`collect_pointers`, the same model `attach_touch` already used),
+  registers a `WaitForInput` source per handle, and re-resolves each handle's
+  interface per dispatch; `detach_mouse` removes them all. Unblocks SoftBMC
+  RemoteKvm mouse-wheel and AGT app wheel support. Regression:
+  `test_virtual_pointer_e2e_mouse_wheel`.
+
+### Changed
+
+- **Produced `.efi` images now carry `.bss` as a real uninitialized PE
+  section** instead of folding it into `.data`. The linker scripts
+  historically merged `.bss`/`COMMON` into the file-backed `.data` output
+  section (a stale "the EFI loader doesn't like a .bss section" workaround),
+  so every zero-initialized global was materialized as literal zero bytes in
+  the image — an N-byte static array added N bytes to the `.efi`. `.bss` is
+  now its own NOBITS output section emitted (via `objcopy -j .bss`) as an
+  `IMAGE_SCN_CNT_UNINITIALIZED_DATA` section with `SizeOfRawData == 0`; the
+  UEFI loader allocates and zero-fills it at load. Bss-heavy binaries shrink
+  for free (an 8 MiB-static-array probe: 8.5 MB → ~110 KB; `AxlTestNet`
+  −317 KB), with no change to typical small-bss binaries and no per-tool
+  discipline needed. Validated on OVMF + AAVMF (both arches): a probe asserts
+  the section is zero-initialized and writable at runtime, and the full unit
+  suite passes (6964/6964) since every binary uses the new layout.
+  Regression: `test-bss-probe-qemu.sh` (size ceiling + boot).
+
 ## 2.2.0 — 2026-06-18
 
 ### Added

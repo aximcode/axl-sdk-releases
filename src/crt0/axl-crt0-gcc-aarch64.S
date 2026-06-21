@@ -18,6 +18,23 @@ _start:
     mov     x29, sp
     stp     x0, x1, [sp, #16]      /* save ImageHandle, SystemTable */
 
+    /* Zero .bss before relocation / any C code (see the x86_64 crt0 for the
+       full rationale: the linker emits .bss as a NOBITS section and the UEFI
+       loader is NOT guaranteed to zero-fill it — relying on that booted
+       zero-init globals with garbage). PC-relative bounds work pre-relocation;
+       _bss is page-aligned and _bss_end is ALIGN(16), so the span is a multiple
+       of 8 — 8-byte stores are safe. x2/x3 are scratch; x0/x1 are on the
+       stack. */
+    adrp    x2, _bss
+    add     x2, x2, :lo12:_bss
+    adrp    x3, _bss_end
+    add     x3, x3, :lo12:_bss_end
+0:  cmp     x2, x3
+    b.hs    1f
+    str     xzr, [x2], #8
+    b       0b
+1:
+
     /* _axl_relocate(ImageBase, _DYNAMIC) — PC-relative, works pre-reloc */
     adrp    x0, ImageBase
     add     x0, x0, :lo12:ImageBase
