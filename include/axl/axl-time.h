@@ -240,7 +240,7 @@ axl_time_realtime(
  *
  * The firmware validates the supplied values and may reject an
  * out-of-range date/time or an unsupported field; such a rejection
- * is reported as @ref AXL_ERR (the firmware does not partially apply
+ * is reported as @c AXL_ERR (the firmware does not partially apply
  * the write). Note `nanosecond` is passed through verbatim but most
  * firmware RTCs ignore it on a write (they advance once per second).
  *
@@ -265,7 +265,7 @@ axl_time_set_realtime(
  *
  * @p unix_secs must be non-negative (1970 or later) and fall within
  * the range a UEFI RTC can represent (year <= 9999). A value outside
- * that range is rejected with @ref AXL_ERR *before* any firmware
+ * that range is rejected with @c AXL_ERR *before* any firmware
  * call — the calendar `year` is a 16-bit field, so an out-of-range
  * input is a caller error, not a silent wrap.
  *

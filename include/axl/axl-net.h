@@ -74,7 +74,7 @@ axl_net_ping(
 );
 
 /**
- * @brief Classification of an ICMP probe reply (see @ref axl_net_ping_ex).
+ * @brief Classification of an ICMP probe reply (see @c axl_net_ping_ex).
  */
 typedef enum {
     AXL_PING_NO_REPLY      = 0,  ///< no response within the timeout
@@ -85,7 +85,7 @@ typedef enum {
 } AxlPingReply;
 
 /**
- * @brief Result of an @ref axl_net_ping_ex probe.
+ * @brief Result of an @c axl_net_ping_ex probe.
  */
 typedef struct {
     AxlPingReply   reply;       ///< what came back (NO_REPLY on timeout)
@@ -124,7 +124,7 @@ axl_net_ping_ex(
 );
 
 /**
- * @brief Result of an @ref axl_sntp_query.
+ * @brief Result of an @c axl_sntp_query.
  */
 typedef struct {
     int64_t unix_secs;   ///< server time as Unix seconds (UTC); 0 if unreachable
@@ -373,7 +373,7 @@ axl_net_drivers_up(void);
  * stack comes up, then reconnects the stack.
  *
  * Condition-gated by design: if any SimpleNetwork handle is already present
- * — before, or after a plain @ref axl_net_ensure_drivers attempt — this is a
+ * — before, or after a plain @c axl_net_ensure_drivers attempt — this is a
  * NO-OP and returns AXL_OK. An over-eager takeover **destroys a working
  * firmware stack** (observed: forcing iPXE + disconnect on a box that already
  * had SNP killed networking), so the guard is the point: takeover runs only
@@ -577,12 +577,12 @@ typedef struct {
  * leased an address, is not a DHCP lease and returns AXL_ERR.
  *
  * @warning @p nic_index indexes the IP4Config2 handle buffer, which is NOT the
- *     same index space as @ref axl_net_list_interfaces / @ref
+ *     same index space as @c axl_net_list_interfaces / @c
  *     axl_net_get_link_stats (those index the SimpleNetwork handle buffer, and
  *     IP4Config2 lives on a child handle on some OEM firmware). An out-of-range
  *     index is clamped to the first handle. On a multi-NIC box, passing a
  *     list-index here can therefore return a different NIC's lease. Use
- *     @ref axl_net_get_dhcp_lease_by_mac to look a lease up unambiguously by
+ *     @c axl_net_get_dhcp_lease_by_mac to look a lease up unambiguously by
  *     the NIC's MAC (the stable key from @c AxlNetInterface.mac). It does NOT
  *     accept AXL_NET_NIC_AUTO.
  *
@@ -598,15 +598,15 @@ axl_net_get_dhcp_lease(
 /**
  * @brief Read a NIC's active DHCP-leased configuration, keyed by MAC.
  *
- * The robust counterpart to @ref axl_net_get_dhcp_lease for multi-NIC hosts:
+ * The robust counterpart to @c axl_net_get_dhcp_lease for multi-NIC hosts:
  * resolves the IP4Config2 instance by matching its SimpleNetwork MAC to @p mac
- * (the same MAC correlation @ref axl_net_list_interfaces uses to fill its IPv4
+ * (the same MAC correlation @c axl_net_list_interfaces uses to fill its IPv4
  * columns), so the result is correct regardless of IP4Config2-vs-SNP handle
  * ordering. The reported fields and the DHCP-policy / leased-address
- * preconditions are identical to @ref axl_net_get_dhcp_lease.
+ * preconditions are identical to @c axl_net_get_dhcp_lease.
  *
  * @p mac is the stable key paired with @c AxlNetInterface.mac: iterate
- * @ref axl_net_list_interfaces, then call this with a row's @c mac. Correlation
+ * @c axl_net_list_interfaces, then call this with a row's @c mac. Correlation
  * is by exact 6-byte match and assumes MACs are unique; if two NICs share a MAC
  * the first match in enumeration order wins. @p out is fully zeroed before any
  * field is set, so on AXL_ERR every field reads 0.
@@ -625,7 +625,7 @@ axl_net_get_dhcp_lease_by_mac(
 // ---------------------------------------------------------------------------
 
 /**
- * @brief How @ref axl_net_init / @ref axl_net_auto_init last configured a NIC.
+ * @brief How @c axl_net_init / @c axl_net_auto_init last configured a NIC.
  *
  * The standard path is the firmware's `EFI_IP4_CONFIG2_PROTOCOL` policy layer.
  * Some OEM firmware (e.g. HP business laptops) ships a full network stack —
@@ -644,12 +644,12 @@ typedef enum {
 /**
  * @brief The mechanism that configured the NIC on the last bring-up.
  *
- * Reflects the most recent @ref axl_net_init / @ref axl_net_auto_init /
- * @ref axl_net_bring_up call in this process. @ref AXL_NET_CONFIG_NONE before
+ * Reflects the most recent @c axl_net_init / @c axl_net_auto_init /
+ * @c axl_net_bring_up call in this process. @c AXL_NET_CONFIG_NONE before
  * any successful bring-up (or after one that failed). Process-global, not
  * per-NIC — matches the single-NIC focus of the bring-up helpers.
  *
- * @return the active @ref AxlNetConfigMethod.
+ * @return the active @c AxlNetConfigMethod.
  */
 AxlNetConfigMethod
 axl_net_last_config_method(void);

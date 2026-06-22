@@ -43,6 +43,39 @@
 extern "C" {
 #endif
 
+// ---------------------------------------------------------------------------
+// Constant-time comparison
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Compare two equal-length buffers in constant time.
+ *
+ * Runs in time that depends only on @p len, never on the byte values or
+ * on where the first difference is — it OR-accumulates the per-byte
+ * difference over the whole buffer with no early exit. Use it for EVERY
+ * secret-dependent comparison (MACs, auth tags, session tokens, password
+ * verifiers, SCRAM proofs); a plain `memcmp` leaks the match length
+ * through timing and enables byte-at-a-time forgery.
+ *
+ * Both buffers MUST be at least @p len bytes. Available in every build
+ * (no AXL_TLS required).
+ *
+ * Length is NOT part of the comparison. For a variable- or
+ * attacker-influenced secret (e.g. a session token), the caller MUST
+ * confirm both lengths equal the expected secret length BEFORE calling —
+ * otherwise an attacker supplying a 1-byte value has only 1 byte checked.
+ * Compare against a fixed expected length, never against the attacker's.
+ *
+ * @return true iff the two buffers are byte-for-byte equal. A @p len of
+ *     0 compares equal; a NULL buffer with @p len > 0 returns false.
+ */
+bool
+axl_consttime_equal(
+    const void *a,    ///< first buffer
+    const void *b,    ///< second buffer
+    size_t      len   ///< number of bytes to compare
+);
+
 /**
  * @brief Public-key signature algorithm selector.
  *
@@ -169,10 +202,10 @@ typedef struct AxlPkKey AxlPkKey;
 /**
  * @brief Generate a new key pair.
  *
- * @ref AXL_PK_ECDSA_P256 generates a NIST P-256 key; @ref AXL_PK_ECDSA_P384
- * a NIST P-384 key; @ref AXL_PK_RSA generates a 3072-bit RSA key (slower —
+ * @c AXL_PK_ECDSA_P256 generates a NIST P-256 key; @c AXL_PK_ECDSA_P384
+ * a NIST P-384 key; @c AXL_PK_RSA generates a 3072-bit RSA key (slower —
  * seconds on some firmware, but a one-time cost for a persisted host key).
- * @ref AXL_PK_ED25519 is unsupported and returns NULL.
+ * @c AXL_PK_ED25519 is unsupported and returns NULL.
  *
  * @return a new private key handle (caller frees with axl_pk_key_free),
  *     or NULL on failure / unsupported algorithm / TLS not compiled in.

@@ -58,6 +58,7 @@
 #include <axl/axl-digest.h>
 #include <axl/axl-crypto.h>
 #include <axl/axl-hmac.h>
+#include <axl/axl-scram.h>
 #include <axl/axl-jose.h>
 #include <axl/axl-bytes.h>
 #include <axl/axl-compress.h>
@@ -86,6 +87,7 @@
 #include <axl/axl-serial.h>
 #include <axl/axl-fv.h>
 #include <axl/axl-tpm.h>
+#include <axl/axl-hii.h>
 #include <axl/axl-ramdisk.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-driver-info.h>

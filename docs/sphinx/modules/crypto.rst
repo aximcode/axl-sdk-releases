@@ -35,6 +35,18 @@ signature verification).
      - ``<axl/axl-hmac.h>``
      - standalone
      - :doc:`data`
+   * - PBKDF2-HMAC-SHA256 (RFC 8018)
+     - ``<axl/axl-digest.h>``
+     - standalone
+     - :doc:`data`
+   * - Constant-time secret compare
+     - ``<axl/axl-crypto.h>``
+     - standalone
+     - below
+   * - SCRAM-SHA-256 server auth (RFC 7677)
+     - ``<axl/axl-scram.h>``
+     - standalone
+     - :doc:`scram`
    * - Cryptographic random bytes (``EFI_RNG_PROTOCOL``)
      - ``<axl/axl-rng.h>``
      - standalone

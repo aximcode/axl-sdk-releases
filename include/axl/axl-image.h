@@ -164,7 +164,7 @@ axl_image_run(
 /**
  * @brief Load + run an image embedded in a firmware volume, by file GUID.
  *
- * The FV-embedded counterpart of @ref axl_image_run: instead of a path on a
+ * The FV-embedded counterpart of @ref axl_image_run(): instead of a path on a
  * mounted volume, it locates the firmware file whose name GUID is
  * @p name_guid in a readable Firmware Volume (`EFI_FV2_READ_STATUS`),
  * `LoadImage`s it directly out of the FV (no file staged on any

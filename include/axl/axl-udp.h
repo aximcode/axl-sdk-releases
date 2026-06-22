@@ -253,12 +253,12 @@ axl_udp_set_broadcast(
  * call still blocks until the local Transmit completes (a few ms for a
  * datagram), so it is synchronous.
  *
- * Safe to call from an @ref axl_loop_attach_driver pump callback (at
+ * Safe to call from an @c axl_loop_attach_driver pump callback (at
  * `TPL_CALLBACK`): the nested completion wait is raised-TPL-safe. It
  * busy-holds `TPL_CALLBACK` for the brief Transmit, so it adds a small
  * latency spike to co-located work on the same pump but does not wedge.
  * For a non-blocking send that returns immediately and reports
- * completion via a callback, use @ref axl_udp_send_async (the caller
+ * completion via a callback, use @c axl_udp_send_async (the caller
  * must keep @p data alive until the callback fires).
  *
  * @p dest may be NULL only if the socket has been pinned to a peer

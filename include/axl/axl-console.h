@@ -56,7 +56,7 @@ typedef struct {
  * waits on the union of {ConIn WaitForKey, timer}, then reads one
  * keystroke. The timer is closed before return.
  *
- * **At raised TPL** (called from an @ref axl_loop_attach_driver pump
+ * **At raised TPL** (called from an @c axl_loop_attach_driver pump
  * callback at `TPL_CALLBACK`): the wait is raised-TPL-safe but
  * busy-holds `TPL_CALLBACK` until it returns. Pass a finite
  * @p timeout_ms so it self-limits; a `UINT64_MAX` block-forever read

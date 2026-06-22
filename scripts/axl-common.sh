@@ -309,10 +309,12 @@ EOF
 # Priority:
 #   1. Local EDK2 build (if EDK2_DIR is set)
 #   2. Previously extracted (cached next to firmware .fd)
-#   3. Extract from QEMU firmware .fd via uefiextract
+#   3. System-packaged Shell.efi (distro edk2 / qemu packages)
+#   4. Extract from QEMU firmware .fd via uefiextract
 #
 # Requires: find_firmware() must be called first (sets FW_CODE).
-# For extraction: uefiextract (from LongSoft/UEFITool) must be in $PATH.
+# Tiers 1-3 need no external tool; only tier 4 needs uefiextract
+# (from LongSoft/UEFITool) in $PATH.
 # --------------------------------------------------------------------------
 
 # Shell.efi GUID (same across all EDK2 builds)
@@ -345,9 +347,42 @@ find_shell_efi() {
         return 0
     fi
 
-    # 3. Extract from firmware .fd via uefiextract
+    # 3. System-packaged standalone Shell.efi (distro edk2 / qemu packages).
+    #    Restored after the UEFIExtract rewrite (ddcc63b6) dropped it: this is
+    #    the path that works where the distro ships a Shell but uefiextract is
+    #    NOT installed — the common consumer setup. Without it the ESP gets no
+    #    BOOTX64.EFI, so the disk boot option fails and (when a NIC is wired in)
+    #    PXE timeouts starve OVMF's internal-shell fallback before startup.nsh
+    #    runs. Tried before extraction: faster and needs no external tool.
+    local shell_paths=()
+    case "$arch" in
+        X64)
+            shell_paths=(
+                /usr/share/edk2/ovmf/Shell.efi
+                /usr/share/OVMF/Shell.efi
+                /usr/share/edk2/x64/Shell.efi
+                /usr/share/edk2-shell/x64/Shell.efi
+                /usr/share/qemu/edk2-x86_64-shell.efi
+            ) ;;
+        AARCH64)
+            shell_paths=(
+                /usr/share/edk2/aarch64/Shell.efi
+                /usr/share/AAVMF/Shell.efi
+                /usr/share/edk2-shell/aa64/Shell.efi
+                /usr/share/qemu/edk2-aarch64-shell.efi
+            ) ;;
+    esac
+    local sp
+    for sp in "${shell_paths[@]}"; do
+        if [[ -f "$sp" ]] && head -c2 "$sp" | grep -q "MZ"; then
+            echo "$sp"
+            return 0
+        fi
+    done
+
+    # 4. Extract from firmware .fd via uefiextract
     if ! command -v uefiextract &>/dev/null; then
-        log_warning "Shell.efi not found for $arch (install uefiextract from LongSoft/UEFITool to extract from firmware)"
+        log_warning "Shell.efi not found for $arch (install a distro UEFI Shell package — e.g. edk2-shell / qemu's edk2-*-shell.efi — or uefiextract from LongSoft/UEFITool to extract it from firmware)"
         return 1
     fi
 

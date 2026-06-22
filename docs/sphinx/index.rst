@@ -59,6 +59,7 @@ AXL SDK
    modules/net
    modules/tls
    modules/crypto
+   modules/scram
    modules/sys
    modules/cpu
    modules/port
@@ -84,6 +85,7 @@ AXL SDK
    modules/serial
    modules/fv
    modules/tpm
+   modules/hii
    modules/ramdisk
    modules/smbus
    modules/ipmi

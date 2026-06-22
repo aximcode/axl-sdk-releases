@@ -164,6 +164,38 @@ axl_compute_checksum_digest(
 );
 
 // ---------------------------------------------------------------------------
+// Password-based key derivation (PBKDF2)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Derive a key with PBKDF2-HMAC-SHA256 (RFC 8018 / RFC 2898).
+ *
+ * Stretches a password into @p out_len key bytes against a salt and an
+ * iteration count, using HMAC-SHA256 as the PRF. The standard primitive
+ * for storing a password verifier (e.g. SCRAM credentials,
+ * @ref axl-scram.h) or deriving a key from a passphrase: a high
+ * @p iterations makes brute-forcing the stored value expensive.
+ *
+ * Layered on the dependency-free @ref axl-hmac.h, so it works in every
+ * build (no AXL_TLS required). The output is deterministic and
+ * RFC-conformant regardless of how the library was configured.
+ *
+ * @return AXL_OK on success; AXL_INVALID if @p iterations is 0,
+ *     @p out_len is 0, @p out is NULL, or a length argument is non-zero
+ *     with a NULL buffer; AXL_ERR on an internal HMAC/allocation failure.
+ */
+AXL_WARN_UNUSED int
+axl_pbkdf2_hmac_sha256(
+    const uint8_t *password,      ///< password bytes (may be NULL iff password_len==0)
+    size_t         password_len,  ///< password length in bytes
+    const uint8_t *salt,          ///< salt bytes (may be NULL iff salt_len==0)
+    size_t         salt_len,      ///< salt length in bytes
+    uint32_t       iterations,    ///< PBKDF2 iteration count (>= 1)
+    uint8_t       *out,           ///< [out] derived key
+    size_t         out_len        ///< number of key bytes to derive
+);
+
+// ---------------------------------------------------------------------------
 // Rolling 32-bit checksums (CRC-32 / Adler-32)
 // ---------------------------------------------------------------------------
 

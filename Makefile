@@ -280,6 +280,7 @@ LIB_SOURCES = \
     src/data/axl-digest-crc.c \
     src/data/axl-compress.c \
     src/data/axl-hmac.c \
+    src/data/axl-pbkdf2.c \
     src/data/axl-bytes.c \
     src/stream/axl-stream.c \
     src/stream/axl-stream-buf.c \
@@ -349,6 +350,8 @@ LIB_SOURCES = \
     src/serial/axl-serial.c \
     src/fv/axl-fv.c \
     src/tpm/axl-tpm.c \
+    src/tpm/axl-tpm-seal.c \
+    src/hii/axl-hii.c \
     src/ramdisk/axl-ramdisk.c \
     src/loop/axl-loop.c \
     src/loop/axl-defer.c \
@@ -391,6 +394,8 @@ LIB_SOURCES = \
     src/net/axl-pk-verify.c \
     src/net/axl-jose.c \
     src/net/axl-crypto-rng.c \
+    src/net/axl-consttime.c \
+    src/net/axl-scram.c \
     src/net/axl-aead.c \
     src/net/axl-cipher.c \
     src/net/axl-ecdh.c \
@@ -734,6 +739,9 @@ $(BUILDDIR)/%.o: src/fv/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/tpm/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/hii/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/ramdisk/%.c | $(BUILDDIR)
@@ -1521,7 +1529,7 @@ $(BUILDDIR)/axlk-reqlog-server.o: $(KERNEL_POC_DIR)/test/axlk-reqlog-server.c | 
 # Build test applications (all modules)
 # ===================================================================
 
-TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data -Isrc/ata
+TEST_CFLAGS = $(CFLAGS) $(INCLUDES) -Itest/unit -Itest/data -Isrc/ata -Isrc/hii -Isrc/net
 
 TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestData AxlTestUtil AxlTestLoop AxlTestTask AxlTestNet \
@@ -1530,7 +1538,8 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
-        AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart
+        AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
+        AxlTestHii AxlTestAuth
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1581,6 +1590,8 @@ $(eval $(call BUILD_TEST,AxlTestNvme,axl-test-nvme))
 $(eval $(call BUILD_TEST,AxlTestAta,axl-test-ata))
 $(eval $(call BUILD_TEST,AxlTestScsi,axl-test-scsi))
 $(eval $(call BUILD_TEST,AxlTestSmart,axl-test-smart))
+$(eval $(call BUILD_TEST,AxlTestHii,axl-test-hii))
+$(eval $(call BUILD_TEST,AxlTestAuth,axl-test-auth))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)

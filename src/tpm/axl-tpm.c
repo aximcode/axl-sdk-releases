@@ -14,6 +14,7 @@
 
 #include "../backend/axl-backend.h"
 #include <uefi/axl-uefi.h>   /* EFI_TCG2_PROTOCOL (extra) */
+#include "axl-tpm-internal.h"   /* TpmWr/TpmRd cursors + shared TPM2 constants */
 #include <axl/axl-str.h>     /* axl_memset */
 #include <axl/axl-tpm.h>
 
@@ -101,20 +102,10 @@ axl_tpm_get_capability(
 // response, extract its `unique` field (ECC point X||Y, or RSA modulus),
 // and flush the transient primary handle. Deterministic per TPM.
 
-/* TPM2 constants (TCG TPM 2.0 Structures / EK Credential Profile). */
-#define TPM_ST_SESSIONS        0x8002u
-#define TPM_ST_NO_SESSIONS     0x8001u
-#define TPM_CC_CREATE_PRIMARY  0x00000131u
-#define TPM_CC_FLUSH_CONTEXT   0x00000165u
+/* EK-specific TPM2 constants (the shared cursors + algorithm/handle
+   constants live in axl-tpm-internal.h). */
 #define TPM_RH_ENDORSEMENT     0x4000000Bu
-#define TPM_RS_PW              0x40000009u
 #define TPM_ALG_RSA            0x0001u
-#define TPM_ALG_ECC            0x0023u
-#define TPM_ALG_SHA256         0x000Bu
-#define TPM_ALG_AES            0x0006u
-#define TPM_ALG_CFB            0x0043u
-#define TPM_ALG_NULL           0x0010u
-#define TPM_ECC_NIST_P256      0x0003u
 #define EK_OBJECT_ATTRIBUTES   0x000300B2u  /* fixedTPM|fixedParent|sensitive
                                                DataOrigin|adminWithPolicy|
                                                restricted|decrypt */
@@ -127,63 +118,6 @@ static const uint8_t EK_AUTH_POLICY[32] = {
     0xfd, 0x52, 0xd7, 0x6e, 0x06, 0x52, 0x0b, 0x64,
     0xf2, 0xa1, 0xda, 0x1b, 0x33, 0x14, 0x69, 0xaa
 };
-
-// ---- big-endian write cursor ----
-typedef struct {
-    uint8_t *p;
-    size_t   cap;
-    size_t   len;
-    bool     ok;
-} TpmWr;
-
-static void
-wr8(TpmWr *w, uint8_t v)
-{
-    if (w->len < w->cap) {
-        w->p[w->len++] = v;
-    } else {
-        w->ok = false;
-    }
-}
-static void wr16(TpmWr *w, uint16_t v) { wr8(w, (uint8_t)(v >> 8)); wr8(w, (uint8_t)v); }
-static void wr32(TpmWr *w, uint32_t v) { wr16(w, (uint16_t)(v >> 16)); wr16(w, (uint16_t)v); }
-static void
-wr_zeros(TpmWr *w, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        wr8(w, 0);
-    }
-}
-
-// ---- big-endian read cursor (bounds-checked) ----
-typedef struct {
-    const uint8_t *p;
-    size_t         len;
-    size_t         off;
-    bool           ok;
-} TpmRd;
-
-static uint8_t
-rd8(TpmRd *r)
-{
-    if (r->off < r->len) {
-        return r->p[r->off++];
-    }
-    r->ok = false;
-    return 0;
-}
-static uint16_t rd16(TpmRd *r) { uint16_t h = rd8(r); return (uint16_t)((h << 8) | rd8(r)); }
-static uint32_t rd32(TpmRd *r) { uint32_t h = rd16(r); return (h << 16) | rd16(r); }
-static void
-rd_skip(TpmRd *r, size_t n)
-{
-    if (r->off + n <= r->len) {
-        r->off += n;
-    } else {
-        r->ok  = false;
-        r->off = r->len;
-    }
-}
 
 /* Build the TCG EK template TPMT_PUBLIC for @p alg into @p w. */
 static void

@@ -283,7 +283,7 @@ axl_handle_children(
 /**
  * @brief Short name for a well-known UEFI protocol GUID (any kind).
  *
- * The Devices-tab counterpart to @ref axl_net_protocol_name: a broader table
+ * The Devices-tab counterpart to @ref axl_net_protocol_name(): a broader table
  * covering the common device / driver / bus / console protocols — DevicePath,
  * LoadedImage, DriverBinding, ComponentName2, SimpleFileSystem, BlockIo,
  * DiskIo, PciIo, GraphicsOutput, SerialIo, UsbIo, NvmExpressPassThru,
@@ -304,7 +304,7 @@ axl_protocol_guid_name(
 /**
  * @brief The parent controller(s) of a controller.
  *
- * The inverse of @ref axl_handle_children: scans the handle database for every
+ * The inverse of @ref axl_handle_children(): scans the handle database for every
  * controller that opened one of its protocols BY_CHILD_CONTROLLER with
  * @p controller as the child. Together with @ref axl_handle_children this is
  * the `devtree` parent/child walk. A @p count of 0 means @p controller is a

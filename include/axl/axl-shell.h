@@ -61,7 +61,7 @@ axl_shell_launch(
 /**
  * @brief Launch the firmware-embedded UEFI Shell out of a Firmware Volume.
  *
- * The no-file-staged counterpart of @ref axl_shell_launch: rather than
+ * The no-file-staged counterpart of @ref axl_shell_launch(): rather than
  * locating a `Shell.efi` file, it finds the platform's built-in UEFI Shell
  * — the EDK2 ShellPkg application, FILE_GUID
  * `EA4BB293-2D7F-4456-A681-1F22F42CD0BC` — in a readable Firmware Volume and

@@ -169,6 +169,73 @@ axl_tpm_read_ek_pub(
     AxlTpmEkAlg *out_alg    ///< [out] EK algorithm (may be NULL)
 );
 
+// ===================================================================
+// PCR-bound seal / unseal (secret-at-rest, gated on measured boot)
+// ===================================================================
+//
+// Seal a small secret to the TPM so it can only be recovered when the
+// selected PCRs hold the same values they had at seal time — i.e. only
+// under the same measured-boot state. The sealed blob is opaque
+// ciphertext the caller persists (e.g. in an EFI variable); it is
+// useless on another machine or after the measured state changes.
+//
+// The flow is the standard TPM2 sealing chain over
+// EFI_TCG2_PROTOCOL.SubmitCommand: a deterministic primary storage key
+// (SRK, recreated identically each boot) parents a keyedhash sealed-data
+// object whose authPolicy is a PolicyPCR digest over the chosen PCRs;
+// unsealing runs a policy session that the TPM only satisfies when the
+// live PCRs match. Use it for a TLS private key or similar small secret;
+// the TPM caps the payload (a few dozen bytes).
+
+/** Largest secret axl_tpm_seal accepts (TPM sealed-data limit). */
+#define AXL_TPM_SEAL_MAX_SECRET  128
+
+/**
+ * @brief Seal a secret under a PCR policy.
+ *
+ * Binds @p secret to the current values of the PCRs listed in @p pcrs
+ * (SHA-256 bank, indices 0..23) and returns an opaque sealed blob in
+ * @p out_blob that the caller persists and later passes to
+ * `axl_tpm_unseal`. The blob carries everything unseal needs (the sealed
+ * object and the PCR selection); the secret is never in it in the clear.
+ *
+ * @p out_blob is allocated with axl_malloc — free it with `axl_free`.
+ *
+ * @return AXL_OK on success; AXL_INVALID if @p secret / @p out_blob /
+ *     @p out_blob_len is NULL, @p secret_len is 0 or exceeds
+ *     AXL_TPM_SEAL_MAX_SECRET, or @p pcr_count is 0 or names a PCR > 23;
+ *     AXL_ERR if no TPM (`!axl_tpm_present()`) or a TPM command fails.
+ */
+AXL_WARN_UNUSED int
+axl_tpm_seal(
+    const uint8_t  *secret,        ///< secret bytes to seal
+    size_t          secret_len,    ///< secret length (1..AXL_TPM_SEAL_MAX_SECRET)
+    const uint32_t *pcrs,          ///< PCR indices to bind to (each 0..23)
+    size_t          pcr_count,     ///< number of PCRs in @p pcrs
+    uint8_t       **out_blob,      ///< [out] sealed blob (free with axl_free)
+    size_t         *out_blob_len   ///< [out] sealed blob length
+);
+
+/**
+ * @brief Unseal a blob produced by axl_tpm_seal.
+ *
+ * Recovers the secret only if the current PCR values satisfy the policy
+ * baked into the blob at seal time. The recovered secret is returned in
+ * @p out_secret, allocated with axl_malloc — free it with `axl_free`.
+ *
+ * @return AXL_OK on success; AXL_INVALID if an argument is NULL or the
+ *     blob is malformed; AXL_DENIED if the current PCRs do not satisfy the
+ *     seal-time policy (the firmware/measured state changed); AXL_ERR if
+ *     no TPM or a TPM command fails.
+ */
+AXL_WARN_UNUSED int
+axl_tpm_unseal(
+    const uint8_t *blob,            ///< sealed blob from axl_tpm_seal
+    size_t         blob_len,        ///< blob length
+    uint8_t      **out_secret,      ///< [out] recovered secret (free with axl_free)
+    size_t        *out_secret_len   ///< [out] recovered secret length
+);
+
 #ifdef __cplusplus
 }
 #endif

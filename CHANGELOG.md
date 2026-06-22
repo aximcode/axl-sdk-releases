@@ -3,6 +3,83 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.3.0 — 2026-06-22
+
+### Added
+
+- **`<axl/axl-tpm.h>` — PCR-bound TPM2 seal/unseal.** `axl_tpm_seal` /
+  `axl_tpm_unseal` seal a small secret (e.g. a TLS private key) to the
+  chosen SHA-256 PCRs and recover it only under the same measured-boot
+  state, over `EFI_TCG2_PROTOCOL.SubmitCommand`: `CreatePrimary`
+  (deterministic ECC SRK) -> `PCR_Read` (PolicyPCR digest computed in
+  software) -> `Create` (keyedhash sealed object) for seal; `Load` ->
+  `StartAuthSession` -> `PolicyPCR` -> `Unseal` for unseal, returning
+  `AXL_DENIED` when the measured state changed. The blob is opaque
+  ciphertext the caller persists. Validated against swtpm
+  (`test-tpm-seal-qemu.sh`); the shared TPM2 marshaling moved to an
+  internal header (`src/tpm/axl-tpm-internal.h`). Gates SoftBMC's
+  TLS-key-at-rest.
+
+- **Auth-hardening primitives: PBKDF2, constant-time compare, SCRAM-SHA-256.**
+  Three standalone (no-`AXL_TLS`) additions for password auth:
+  `axl_pbkdf2_hmac_sha256` (RFC 8018, in `<axl/axl-digest.h>`, layered on
+  `axl_hmac`); `axl_consttime_equal` (`<axl/axl-crypto.h>`) — OR-accumulate,
+  no early exit, for every secret/MAC/token compare; and a new
+  `<axl/axl-scram.h>` server-side **SCRAM-SHA-256** engine (RFC 5802 / 7677,
+  plain `n,,`, no channel binding): `axl_scram_sha256_derive` (enrollment →
+  `{salt, iterations, StoredKey, ServerKey}`, never the password) plus a
+  two-step `axl_scram_server_first` / `axl_scram_server_final` whose
+  serializable `AxlScramState` parks across the two HTTP requests of a login.
+  The proof is verified in constant time; a wrong proof or nonce returns
+  `AXL_DENIED` with no oracle. A matching client engine
+  (`axl_scram_client_first` / `_final` / `_verify`, with `AxlScramClientState`)
+  authenticates to a SCRAM server and verifies the server signature
+  (mutual auth) — for a client tool / agt / tests. Both sides are pinned to
+  the RFC 7677 `user`/`pencil` vector (byte-exact client-first, server-first,
+  client-final incl. proof, and server-final) and RFC 7914 PBKDF2 vectors,
+  plus a full client<->server round-trip; 25 unit assertions on both arches.
+  Unblocks SoftBMC's SCRAM browser login.
+
+- **`<axl/axl-hii.h>` — UEFI HII setup-form reader.** Enumerate the
+  platform's BIOS-Setup form sets and get/read/write their questions
+  without touching the raw HII protocols or decoding IFR. The module
+  locates the HII database/string/config-routing protocols, exports every
+  form package once, walks the IFR opcode stream into a cached typed model,
+  and projects each setting as an `AxlHiiQuestion` (ONE_OF, CHECKBOX,
+  NUMERIC, STRING — with per-type options / min-max-step / size). API:
+  `axl_hii_available`, `axl_hii_formset_count`, `axl_hii_formset_get`
+  (title, help, form-set GUID as an `AxlGuid`, and question count),
+  `axl_hii_question_get`, `axl_hii_question_read`, `axl_hii_question_write`,
+  `axl_hii_question_read_string`, `axl_hii_question_write_string`.
+  Integer values read/write via `GetVariable`/`SetVariable` for EFI-backed
+  stores, falling back to the config-routing/config-access path
+  (`ExtractConfig`→`ConfigToBlock` / `BlockToConfig`→`RouteConfig`) for
+  driver-private block stores; STRING questions use the `_string` pair,
+  which converts the `CHAR16` field at the question's offset to/from UTF-8.
+  The IFR struct
+  layouts are byte-packed hand-written types in `axl-uefi-extra.h` (cast
+  directly onto the raw firmware byte stream). Tested against live OVMF /
+  AAVMF HII in QEMU (enumeration, a known form set's ONE_OF + NUMERIC
+  projection, and a benign read→write→restore round-trip of the platform
+  resolution setting). Unblocks SoftBMC's remote BIOS-Setup tab.
+
+### Fixed
+
+- **`run-qemu.sh` boots the UEFI Shell again on hosts without
+  `uefiextract`.** A discovery rewrite (`ddcc63b6`) had reduced
+  `find_shell_efi` to a `uefiextract`-only chain, so a host that lacks
+  `uefiextract` staged no `EFI/BOOT/BOOTX64.EFI`; the disk boot option
+  then failed and — when a NIC was attached via `--qemu-arg` — OVMF's
+  IPv4/IPv6 PXE attempts timed out and starved the shell before
+  `startup.nsh` ran, so the run hung until `--timeout`. Restored the
+  system-package tier: `find_shell_efi` now searches the distro Shell
+  paths (`/usr/share/edk2/ovmf/Shell.efi`,
+  `/usr/share/edk2-shell/<arch>/Shell.efi`,
+  `/usr/share/qemu/edk2-*-shell.efi`, …) before the `uefiextract` tier,
+  so no external tool is needed where a distro ships a Shell. Fixes the
+  QEMU smoke test for consumers (e.g. axl-utils) that pass a virtio-net
+  NIC and a custom `--nsh`.
+
 ## 2.2.1 — 2026-06-21
 
 ### Fixed

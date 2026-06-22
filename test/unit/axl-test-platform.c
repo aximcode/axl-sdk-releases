@@ -2633,6 +2633,82 @@ test_tpm(void)
     }
 }
 
+/* PCR-bound seal / unseal. Argument validation runs in every build; the
+   real seal->unseal round-trip needs a TPM (swtpm via
+   test-tpm-seal-qemu.sh) and is SKIP-balanced when absent. */
+static void
+test_tpm_seal(void)
+{
+    static const uint8_t secret[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+    };
+    uint32_t pcrs[1] = { 7 };
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+
+    /* Argument validation (precedes any TPM call). */
+    test_check(axl_tpm_seal(NULL, sizeof secret, pcrs, 1, &blob, &blob_len)
+                   == AXL_INVALID,
+               "tpm seal: NULL secret -> AXL_INVALID");
+    test_check(axl_tpm_seal(secret, 0, pcrs, 1, &blob, &blob_len) == AXL_INVALID,
+               "tpm seal: zero length -> AXL_INVALID");
+    test_check(axl_tpm_seal(secret, AXL_TPM_SEAL_MAX_SECRET + 1, pcrs, 1,
+                            &blob, &blob_len) == AXL_INVALID,
+               "tpm seal: oversize secret -> AXL_INVALID");
+    test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 0, &blob, &blob_len)
+                   == AXL_INVALID,
+               "tpm seal: zero pcr_count -> AXL_INVALID");
+    uint32_t bad_pcr[1] = { 99 };
+    test_check(axl_tpm_seal(secret, sizeof secret, bad_pcr, 1, &blob, &blob_len)
+                   == AXL_INVALID,
+               "tpm seal: PCR index > 23 -> AXL_INVALID");
+    test_check(axl_tpm_unseal(NULL, 0, &blob, &blob_len) == AXL_INVALID,
+               "tpm unseal: NULL blob -> AXL_INVALID");
+
+    /* A structurally-valid blob carrying an out-of-range PCR index must be
+       rejected at parse time (it would otherwise drive an OOB write in the
+       PCR-selection bitmap). Magic+ver+pcr_count(1)+index(99)+empty pub/priv
+       TPM2Bs. */
+    static const uint8_t bad_pcr_blob[] = {
+        'A', 'T', 'S', '1', 1, 1, 99, 0, 0, 0, 0
+    };
+    uint8_t *bad_out = NULL;
+    size_t bad_out_len = 0;
+    test_check(axl_tpm_unseal(bad_pcr_blob, sizeof bad_pcr_blob,
+                              &bad_out, &bad_out_len) == AXL_INVALID,
+               "tpm unseal: blob with PCR index > 23 -> AXL_INVALID");
+
+    if (axl_tpm_present()) {
+        int rc = axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len);
+        test_check(rc == AXL_OK && blob != NULL && blob_len > 0,
+                   "tpm seal: succeeds when present");
+
+        uint8_t *got = NULL;
+        size_t got_len = 0;
+        int urc = (rc == AXL_OK)
+            ? axl_tpm_unseal(blob, blob_len, &got, &got_len) : AXL_ERR;
+        test_check(urc == AXL_OK, "tpm unseal: succeeds when present");
+        bool round = urc == AXL_OK && got_len == sizeof secret &&
+                     axl_memcmp(got, secret, sizeof secret) == 0;
+        test_check(round, "tpm seal/unseal round-trips the secret");
+        axl_printf("TPM-SEAL:%s\n", round ? "ok" : "bad");
+
+        if (blob != NULL) {
+            axl_free(blob);
+        }
+        if (got != NULL) {
+            axl_free(got);
+        }
+    } else {
+        test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len)
+                       == AXL_ERR,
+                   "tpm seal: AXL_ERR without a TPM");
+        test_check(true, "tpm seal: SKIP balance (no TPM)");
+        test_check(true, "tpm seal: SKIP balance (no TPM)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AxlRamDisk — create / list / destroy over EFI_RAM_DISK_PROTOCOL
 // ---------------------------------------------------------------------------
@@ -4540,6 +4616,7 @@ test_platform_main(int argc, char **argv)
     test_serial_io();
     test_fv();
     test_tpm();
+    test_tpm_seal();
     test_ramdisk();
     test_ramdisk_register_image();
     test_usb_ids_load_failure_modes();

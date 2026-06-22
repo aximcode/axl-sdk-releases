@@ -1239,4 +1239,292 @@ struct _EFI_ARP_PROTOCOL {
     VOID              *Cancel;     // unused
 };
 
+// ===================================================================
+// HII (Human Interface Infrastructure) — the SUBSET AxlHii (src/hii/)
+// needs to enumerate setup form sets, walk IFR opcodes, and read/write
+// question values.  Hand-written rather than manifest-generated because
+// the IFR structs are cast directly onto the raw on-disk IFR byte
+// stream, so they MUST be byte-packed (the auto-"unknown member -> void *"
+// rewrite in the generator would silently shift field offsets and corrupt
+// the parse), and because the UEFI 2.x spec HTML carries transcription
+// quirks (EFI_IFR_ONE_OF shows `*Question` — a pointer typo; it is
+// embedded — and EFI_IFR_VARSTORE_EFI drops a semicolon) that must be
+// corrected on transcription.  Definitions transcribed (and corrected)
+// from UEFI 2.11 §33 (deps/uefi-spec/33_Human_Interface_Infrastructure.html).
+// The protocol GUIDs are already in generated/guids.h.
+// ===================================================================
+
+typedef VOID    *EFI_HII_HANDLE;
+typedef CHAR16  *EFI_STRING;
+typedef UINT16   EFI_STRING_ID;
+typedef UINT16   EFI_QUESTION_ID;
+typedef UINT16   EFI_VARSTORE_ID;
+
+// --- HII package list / package headers (cast onto ExportPackageLists output) ---
+
+typedef struct {
+    EFI_GUID  PackageListGuid;
+    UINT32    PackageLength;
+} EFI_HII_PACKAGE_LIST_HEADER;
+
+typedef struct {
+    UINT32  Length : 24;   // size of the package (incl. this header)
+    UINT32  Type   : 8;    // EFI_HII_PACKAGE_*
+} EFI_HII_PACKAGE_HEADER;
+
+#define EFI_HII_PACKAGE_TYPE_ALL     0x00
+#define EFI_HII_PACKAGE_FORMS        0x02
+#define EFI_HII_PACKAGE_DEVICE_PATH  0x08
+#define EFI_HII_PACKAGE_END          0xDF
+
+// --- IFR opcode + flag + value-type constants ---
+
+#define EFI_IFR_FORM_SET_OP       0x0E
+#define EFI_IFR_ONE_OF_OP         0x05
+#define EFI_IFR_CHECKBOX_OP       0x06
+#define EFI_IFR_NUMERIC_OP        0x07
+#define EFI_IFR_ONE_OF_OPTION_OP  0x09
+#define EFI_IFR_STRING_OP         0x1C
+#define EFI_IFR_VARSTORE_OP       0x24
+#define EFI_IFR_VARSTORE_EFI_OP   0x26
+#define EFI_IFR_END_OP            0x29
+
+#define EFI_IFR_FLAG_READ_ONLY        0x01
+#define EFI_IFR_FLAG_CALLBACK         0x04
+#define EFI_IFR_FLAG_RESET_REQUIRED   0x10
+
+#define EFI_IFR_NUMERIC_SIZE    0x03
+#define EFI_IFR_NUMERIC_SIZE_1  0x00
+#define EFI_IFR_NUMERIC_SIZE_2  0x01
+#define EFI_IFR_NUMERIC_SIZE_4  0x02
+#define EFI_IFR_NUMERIC_SIZE_8  0x03
+
+#define EFI_IFR_TYPE_NUM_SIZE_8   0x00
+#define EFI_IFR_TYPE_NUM_SIZE_16  0x01
+#define EFI_IFR_TYPE_NUM_SIZE_32  0x02
+#define EFI_IFR_TYPE_NUM_SIZE_64  0x03
+#define EFI_IFR_TYPE_BOOLEAN      0x04
+
+// --- IFR structs (packed: cast directly onto the on-disk IFR stream) ---
+
+#pragma pack(1)
+
+typedef struct {
+    UINT8  OpCode;
+    UINT8  Length : 7;
+    UINT8  Scope  : 1;
+} EFI_IFR_OP_HEADER;
+
+typedef struct {
+    EFI_STRING_ID  Prompt;
+    EFI_STRING_ID  Help;
+} EFI_IFR_STATEMENT_HEADER;
+
+typedef struct {
+    EFI_IFR_STATEMENT_HEADER  Header;
+    EFI_QUESTION_ID           QuestionId;
+    EFI_VARSTORE_ID           VarStoreId;
+    union {
+        EFI_STRING_ID  VarName;
+        UINT16         VarOffset;
+    } VarStoreInfo;
+    UINT8                     Flags;
+} EFI_IFR_QUESTION_HEADER;
+
+// Scalar arms of EFI_IFR_TYPE_VALUE — enough to read a ONE_OF option's
+// value (the larger date/time/ref arms are unused by AxlHii).
+typedef union {
+    UINT8    u8;
+    UINT16   u16;
+    UINT32   u32;
+    UINT64   u64;
+    BOOLEAN  b;
+} EFI_IFR_TYPE_VALUE;
+
+typedef struct {
+    EFI_IFR_OP_HEADER  Header;
+    EFI_GUID           Guid;
+    EFI_STRING_ID      FormSetTitle;
+    EFI_STRING_ID      Help;
+    UINT8              Flags;
+    // EFI_GUID        ClassGuid[];  // trailing, variable count — unused
+} EFI_IFR_FORM_SET;
+
+typedef struct {
+    EFI_IFR_OP_HEADER  Header;
+    EFI_GUID           Guid;
+    EFI_VARSTORE_ID    VarStoreId;
+    UINT16             Size;
+    // UINT8           Name[];       // trailing ASCII, variable length
+} EFI_IFR_VARSTORE;
+
+typedef struct {
+    EFI_IFR_OP_HEADER  Header;
+    EFI_VARSTORE_ID    VarStoreId;
+    EFI_GUID           Guid;
+    UINT32             Attributes;
+    UINT16             Size;
+    // UINT8           Name[];       // trailing ASCII, variable length
+} EFI_IFR_VARSTORE_EFI;
+
+typedef struct {
+    EFI_IFR_OP_HEADER        Header;
+    EFI_IFR_QUESTION_HEADER  Question;   // embedded (spec HTML's `*Question` is a typo)
+    UINT8                    Flags;
+    union {
+        struct { UINT8  MinValue, MaxValue, Step; } u8;
+        struct { UINT16 MinValue, MaxValue, Step; } u16;
+        struct { UINT32 MinValue, MaxValue, Step; } u32;
+        struct { UINT64 MinValue, MaxValue, Step; } u64;
+    } data;
+} EFI_IFR_ONE_OF;
+
+typedef struct {
+    EFI_IFR_OP_HEADER        Header;
+    EFI_IFR_QUESTION_HEADER  Question;
+    UINT8                    Flags;
+} EFI_IFR_CHECKBOX;
+
+typedef struct {
+    EFI_IFR_OP_HEADER        Header;
+    EFI_IFR_QUESTION_HEADER  Question;
+    UINT8                    Flags;
+    union {
+        struct { UINT8  MinValue, MaxValue, Step; } u8;
+        struct { UINT16 MinValue, MaxValue, Step; } u16;
+        struct { UINT32 MinValue, MaxValue, Step; } u32;
+        struct { UINT64 MinValue, MaxValue, Step; } u64;
+    } data;
+} EFI_IFR_NUMERIC;
+
+typedef struct {
+    EFI_IFR_OP_HEADER        Header;
+    EFI_IFR_QUESTION_HEADER  Question;
+    UINT8                    MinSize;
+    UINT8                    MaxSize;
+    UINT8                    Flags;
+} EFI_IFR_STRING;
+
+typedef struct {
+    EFI_IFR_OP_HEADER   Header;
+    EFI_STRING_ID       Option;
+    UINT8               Flags;
+    UINT8               Type;
+    EFI_IFR_TYPE_VALUE  Value;
+} EFI_IFR_ONE_OF_OPTION;
+
+#pragma pack()
+
+// --- HII protocols (only the methods AxlHii uses; rest kept VOID *) ---
+
+typedef struct _EFI_HII_DATABASE_PROTOCOL  EFI_HII_DATABASE_PROTOCOL;
+typedef struct _EFI_HII_STRING_PROTOCOL    EFI_HII_STRING_PROTOCOL;
+typedef struct _EFI_HII_CONFIG_ROUTING_PROTOCOL EFI_HII_CONFIG_ROUTING_PROTOCOL;
+typedef struct _EFI_HII_CONFIG_ACCESS_PROTOCOL  EFI_HII_CONFIG_ACCESS_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_DATABASE_LIST_PACKS)(
+    IN     CONST EFI_HII_DATABASE_PROTOCOL  *This,
+    IN     UINT8                             PackageType,
+    IN     CONST EFI_GUID                   *PackageGuid,
+    IN OUT UINTN                            *HandleBufferLength,
+    OUT    EFI_HII_HANDLE                    *Handle
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_DATABASE_EXPORT_PACKS)(
+    IN     CONST EFI_HII_DATABASE_PROTOCOL  *This,
+    IN     EFI_HII_HANDLE                    Handle,
+    IN OUT UINTN                            *BufferSize,
+    OUT    EFI_HII_PACKAGE_LIST_HEADER      *Buffer
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_DATABASE_GET_PACK_HANDLE)(
+    IN  CONST EFI_HII_DATABASE_PROTOCOL  *This,
+    IN  EFI_HII_HANDLE                    PackageListHandle,
+    OUT EFI_HANDLE                       *DriverHandle
+    );
+
+struct _EFI_HII_DATABASE_PROTOCOL {
+    VOID                              *NewPackageList;       // unused
+    VOID                              *RemovePackageList;    // unused
+    VOID                              *UpdatePackageList;    // unused
+    EFI_HII_DATABASE_LIST_PACKS        ListPackageLists;
+    EFI_HII_DATABASE_EXPORT_PACKS      ExportPackageLists;
+    VOID                              *RegisterPackageNotify;   // unused
+    VOID                              *UnregisterPackageNotify; // unused
+    VOID                              *FindKeyboardLayouts;     // unused
+    VOID                              *GetKeyboardLayout;       // unused
+    VOID                              *SetKeyboardLayout;       // unused
+    EFI_HII_DATABASE_GET_PACK_HANDLE   GetPackageListHandle;
+};
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_GET_STRING)(
+    IN  CONST EFI_HII_STRING_PROTOCOL  *This,
+    IN  CONST CHAR8                    *Language,
+    IN  EFI_HII_HANDLE                  PackageList,
+    IN  EFI_STRING_ID                   StringId,
+    OUT EFI_STRING                      String,
+    IN OUT UINTN                       *StringSize,
+    OUT VOID                           *StringFontInfo OPTIONAL
+    );
+
+struct _EFI_HII_STRING_PROTOCOL {
+    VOID                *NewString;     // unused
+    EFI_HII_GET_STRING   GetString;
+    VOID                *SetString;     // unused
+    VOID                *GetLanguages;  // unused
+    VOID                *GetSecondaryLanguages;  // unused
+};
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_EXTRACT_CONFIG)(
+    IN  CONST EFI_HII_CONFIG_ROUTING_PROTOCOL  *This,
+    IN  CONST EFI_STRING                        Request,
+    OUT EFI_STRING                             *Progress,
+    OUT EFI_STRING                             *Results
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_BLOCK_TO_CONFIG)(
+    IN  CONST EFI_HII_CONFIG_ROUTING_PROTOCOL  *This,
+    IN  CONST EFI_STRING                        ConfigRequest,
+    IN  CONST UINT8                            *Block,
+    IN  CONST UINTN                             BlockSize,
+    OUT EFI_STRING                             *Config,
+    OUT EFI_STRING                             *Progress
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_CONFIG_TO_BLOCK)(
+    IN     CONST EFI_HII_CONFIG_ROUTING_PROTOCOL  *This,
+    IN     CONST EFI_STRING                        ConfigResp,
+    IN OUT UINT8                                  *Block,
+    IN OUT UINTN                                  *BlockSize,
+    OUT    EFI_STRING                             *Progress
+    );
+
+struct _EFI_HII_CONFIG_ROUTING_PROTOCOL {
+    EFI_HII_EXTRACT_CONFIG    ExtractConfig;
+    VOID                     *ExportConfig;   // unused
+    VOID                     *RouteConfig;    // unused (routing-level)
+    EFI_HII_BLOCK_TO_CONFIG   BlockToConfig;
+    EFI_HII_CONFIG_TO_BLOCK   ConfigToBlock;
+    VOID                     *GetAltCfg;      // unused
+};
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_ACCESS_EXTRACT_CONFIG)(
+    IN  CONST EFI_HII_CONFIG_ACCESS_PROTOCOL  *This,
+    IN  CONST EFI_STRING                       Request,
+    OUT EFI_STRING                            *Progress,
+    OUT EFI_STRING                            *Results
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_HII_ACCESS_ROUTE_CONFIG)(
+    IN  CONST EFI_HII_CONFIG_ACCESS_PROTOCOL  *This,
+    IN  CONST EFI_STRING                       Configuration,
+    OUT EFI_STRING                            *Progress
+    );
+
+struct _EFI_HII_CONFIG_ACCESS_PROTOCOL {
+    EFI_HII_ACCESS_EXTRACT_CONFIG  ExtractConfig;
+    EFI_HII_ACCESS_ROUTE_CONFIG    RouteConfig;
+    VOID                          *Callback;   // unused
+};
+
 #endif /* AXL_UEFI_EXTRA_H */
