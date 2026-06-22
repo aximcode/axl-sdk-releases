@@ -3,6 +3,31 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.3.1 — 2026-06-22
+
+### Fixed
+
+- **`run-qemu.sh` now stages a UEFI Shell with zero external
+  dependencies, so `startup.nsh` runs on a stock box even with a guest
+  NIC.** Previously, on a host with no EDK2 build, no distro Shell
+  package, and no `uefiextract` (e.g. a stock Ubuntu / WSL / CI box --
+  Ubuntu's `ovmf` ships no standalone Shell and `uefiextract` is not an
+  apt package), `find_shell_efi` found nothing, so no
+  `EFI/BOOT/BOOTX64.EFI` was staged, the disk boot failed, and a guest
+  NIC attached via `--qemu-arg` sent OVMF to PXE, whose IPv4/IPv6
+  timeouts consumed the whole `--timeout` budget before any shell ran.
+  The 2.3.0 distro-Shell tier did not help where no such package exists
+  (Ubuntu). Added a dependency-free extractor (`scripts/extract-fv-shell.py`,
+  Python stdlib only) that pulls the Shell PE32 out of the OVMF/AAVMF
+  firmware volume itself -- decompressing the LZMA-wrapped DXE volume and
+  walking the FV/FFS/section tree -- producing byte-identical output to
+  `uefiextract` with nothing to install. `find_shell_efi` now uses it
+  before falling back to `uefiextract`. The staged shell makes the ESP
+  disk boot (which OVMF orders before PXE) succeed, so `startup.nsh` runs
+  regardless of NIC/PXE. Verified with the consumer's exact smoke test
+  (virtio-net NIC via `--qemu-arg` + custom `--nsh`) on a host with the
+  distro Shell and `uefiextract` both removed.
+
 ## 2.3.0 — 2026-06-22
 
 ### Added

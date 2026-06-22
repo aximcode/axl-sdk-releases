@@ -380,21 +380,24 @@ find_shell_efi() {
         fi
     done
 
-    # 4. Extract from firmware .fd via uefiextract
-    if ! command -v uefiextract &>/dev/null; then
-        log_warning "Shell.efi not found for $arch (install a distro UEFI Shell package — e.g. edk2-shell / qemu's edk2-*-shell.efi — or uefiextract from LongSoft/UEFITool to extract it from firmware)"
-        return 1
-    fi
+    # 4. Extract Shell.efi from the firmware .fd. Tiers 1-3 found nothing
+    #    (no EDK2 build, no cache, no distro/qemu Shell package). The shell
+    #    ships inside every OVMF/AAVMF DXE firmware volume, so pull it out
+    #    ourselves with a dependency-free stdlib parser — this is the path
+    #    that works on a stock Ubuntu / WSL / CI box, where Ubuntu's `ovmf`
+    #    ships no standalone Shell and uefiextract is not an apt package.
+    #    uefiextract (LongSoft/UEFITool) stays as a fallback for firmware
+    #    our parser can't decode (e.g. Tiano-compressed volumes).
 
     # Build list of firmware images to try extraction from.
     # The active FW_CODE may not contain an extractable Shell.efi (some
-    # system-packaged builds use a format uefiextract can't parse), so
-    # also try the QEMU-bundled firmware as a fallback.
+    # system-packaged builds use a format our parser / uefiextract can't
+    # decode), so also try the QEMU-bundled firmware as a fallback.
     # QEMU_DIR may be unset if find_firmware/find_shell_efi is called
     # before find_qemu has populated it. Use the :- default to keep
     # `set -u` safe; with QEMU_DIR="" the qemu_share resolves to
     # "/share/qemu" which won't match any real path — fine, the
-    # function falls through to the system-package locations.
+    # function falls through to the other firmware candidate.
     local qemu_dir="${QEMU_DIR:-}"
     local qemu_share="${qemu_dir%/bin}/share/qemu"
     local fw_candidates=("$FW_CODE")
@@ -407,30 +410,49 @@ find_shell_efi() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    local extract_dir="$tmpdir/out"
-    local extracted=false
-    for fw_candidate in "${fw_candidates[@]}"; do
-        if uefiextract "$fw_candidate" "$_SHELL_GUID" -o "$extract_dir" >/dev/null 2>&1; then
-            extracted=true
-            break
-        fi
-        rm -rf "$extract_dir"
-    done
+    local pe_body=""
 
-    if [[ "$extracted" != "true" ]]; then
-        rm -rf "$tmpdir"
-        log_warning "Shell.efi extraction failed for $arch"
-        return 1
+    # 4a. Dependency-free extraction (preferred — no external tool).
+    local extractor="$(dirname "${BASH_SOURCE[0]}")/extract-fv-shell.py"
+    if [[ -f "$extractor" ]] && command -v python3 &>/dev/null; then
+        local fv_shell="$tmpdir/Shell.efi"
+        for fw_candidate in "${fw_candidates[@]}"; do
+            if python3 "$extractor" "$fw_candidate" -o "$fv_shell" 2>/dev/null \
+                && head -c2 "$fv_shell" | grep -q "MZ"; then
+                pe_body="$fv_shell"
+                break
+            fi
+        done
     fi
 
-    # Find the PE32 image section body (the actual Shell.efi binary)
-    local pe_body
-    pe_body=$(find "$extract_dir" -name "body.bin" -path "*PE32*" | head -1)
-
-    if [[ -z "$pe_body" ]] || ! head -c2 "$pe_body" | grep -q "MZ"; then
-        rm -rf "$tmpdir"
-        log_warning "Shell.efi not found in firmware image for $arch"
-        return 1
+    # 4b. Fall back to uefiextract for firmware our parser couldn't decode.
+    if [[ -z "$pe_body" ]]; then
+        if ! command -v uefiextract &>/dev/null; then
+            rm -rf "$tmpdir"
+            log_warning "Shell.efi not found for $arch (could not extract it from the firmware; install a distro UEFI Shell package — e.g. edk2-shell / qemu's edk2-*-shell.efi — or uefiextract from LongSoft/UEFITool)"
+            return 1
+        fi
+        local extract_dir="$tmpdir/out"
+        local extracted=false
+        for fw_candidate in "${fw_candidates[@]}"; do
+            if uefiextract "$fw_candidate" "$_SHELL_GUID" -o "$extract_dir" >/dev/null 2>&1; then
+                extracted=true
+                break
+            fi
+            rm -rf "$extract_dir"
+        done
+        if [[ "$extracted" != "true" ]]; then
+            rm -rf "$tmpdir"
+            log_warning "Shell.efi extraction failed for $arch"
+            return 1
+        fi
+        # Find the PE32 image section body (the actual Shell.efi binary)
+        pe_body=$(find "$extract_dir" -name "body.bin" -path "*PE32*" | head -1)
+        if [[ -z "$pe_body" ]] || ! head -c2 "$pe_body" | grep -q "MZ"; then
+            rm -rf "$tmpdir"
+            log_warning "Shell.efi not found in firmware image for $arch"
+            return 1
+        fi
     fi
 
     # Cache next to firmware for future use
