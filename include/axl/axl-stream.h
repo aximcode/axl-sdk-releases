@@ -687,6 +687,36 @@ axl_text_stream_wrap(
     AxlStream *src   ///< source byte stream (caller-owned)
 );
 
+/**
+ * @brief A fresh text-decoding view of standard input.
+ *
+ * Convenience for `axl_text_stream_wrap(axl_stdin)`: the returned stream
+ * transparently decodes the UEFI shell's UCS-2 pipe output (and BOM'd
+ * UTF-16 / UTF-8) to UTF-8, so `axl_readline()` on it reads piped text
+ * regardless of the shell's `|` encoding — no `|a` needed. `<`
+ * redirection and interactive input pass through unchanged. For raw
+ * bytes (no decoding), read `axl_stdin` directly.
+ *
+ * **The caller owns the returned stream** — close it with axl_fclose.
+ * A NEW wrapper is returned on every call (it is **not** cached): the
+ * wrapper buffers read-ahead bytes and a one-time encoding sniff, so a
+ * resident shared-driver must create a fresh one per dispatch and must
+ * not hold one across launcher invocations (a stale wrapper would
+ * replay a previous invocation's buffered input).
+ *
+ * **Construction reads stdin eagerly** to classify the encoding, so on
+ * an interactive stdin with no pending input this call blocks until the
+ * first input arrives — the same as reading `axl_stdin` directly. Create
+ * it at the point you are ready to read, not speculatively.
+ *
+ * @return a text-decoding read stream over stdin (free with axl_fclose),
+ *     or NULL on allocation failure. (axl_text_stream_wrap also returns
+ *     NULL for a write-only/NULL source, but axl_stdin is always
+ *     readable, so that path cannot trigger here.)
+ */
+AxlStream *
+axl_stdin_text(void);
+
 // ---------------------------------------------------------------------------
 // Buffer streams (in-memory, auto-growing)
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@
 **/
 
 #include "../backend/axl-backend.h"     /* gBS, EFI_HANDLE, ByProtocol */
+#include "../backend/axl-stdio-bridge.h" /* axl_backend_stdio_bridge_install */
 #include "axl-driver-internal.h"        /* _axl_driver_ensure_with_embedded_info */
 #include <axl/axl-shared-driver.h>
 #include <axl/axl-driver.h>
@@ -213,6 +214,15 @@ axl_shared_driver_locate_with_image_info(
                     driver_filename, name);
         return AXL_ERR;
     }
+
+    /* Driver is resident and the vtable resolved. Refresh the stdio
+       bridge so the resident driver's axl_stdin/axl_stdout reflect
+       THIS launcher invocation's shell handles (a piped/redirected
+       StdIn, in particular). Re-published on every locate so each
+       run carries its own handles; zero consumer code. A bridge
+       install failure is non-fatal to the locate contract (the vtable
+       resolved) — the driver simply falls back to EOF stdin. */
+    (void)axl_backend_stdio_bridge_install();
     return AXL_OK;
 }
 
@@ -246,4 +256,14 @@ axl_shared_driver_locate(
         name, driver_filename, embed_blob, embed_len,
         /* load_options */ NULL, 0,
         out_iface);
+}
+
+int
+axl_shared_driver_install_stdio_bridge(void)
+{
+    /* Thin export of the backend installer that axl_shared_driver_locate*
+       already calls on the auto-install path — the escape hatch for
+       launchers that resolve the resident driver themselves. See the
+       header docstring and docs/AXL-Shared-Driver-Recipe.md. */
+    return axl_backend_stdio_bridge_install();
 }

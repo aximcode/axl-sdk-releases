@@ -509,6 +509,17 @@ AxlFileHandle
 axl_backend_shell_stdout(void);
 
 /**
+ * @brief Get the SHELL_FILE_HANDLE for the running image's standard
+ *     error, as published by EFI_SHELL_PARAMETERS_PROTOCOL on this
+ *     image's handle.
+ *
+ * Symmetric with @ref axl_backend_shell_stdout. Returns NULL when the
+ * shell-params protocol isn't published on this image.
+ */
+AxlFileHandle
+axl_backend_shell_stderr(void);
+
+/**
  * @brief Get the current working directory.
  *
  * @return UCS-2 path (pointer to Shell-owned storage), or NULL.

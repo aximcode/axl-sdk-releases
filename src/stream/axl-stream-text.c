@@ -198,3 +198,12 @@ axl_text_stream_wrap(AxlStream *src)
 
     return s;
 }
+
+AxlStream *
+axl_stdin_text(void)
+{
+    /* Fresh wrapper each call (uncached): see the axl_stdin_text contract
+       in axl-stream.h — a resident driver must not reuse one across
+       launcher invocations. */
+    return axl_text_stream_wrap(axl_stdin);
+}

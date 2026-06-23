@@ -11,7 +11,11 @@
 **/
 
 #include "axl-backend.h"
-#include <axl/axl-input.h>   /* AXL_INPUT_MOD_* — read_key_ex normalizes to these */
+#include "axl-stdio-bridge.h"  /* AxlStdioBridge, bridge install/uninstall */
+#include <axl/axl-driver.h>    /* axl_protocol_install, axl_protocol_uninstall */
+#include <axl/axl-sys.h>       /* axl_protocol_find_guid */
+#include <axl/axl-atexit.h>    /* axl_atexit */
+#include <axl/axl-input.h>     /* AXL_INPUT_MOD_* — read_key_ex normalizes to these */
 #include <axl/axl-log.h>
 #include <stdarg.h>
 
@@ -1100,11 +1104,12 @@ axl_backend_shell_setenv(
  */
 static SHELL_FILE_HANDLE  mShellStdIn        = NULL;
 static SHELL_FILE_HANDLE  mShellStdOut       = NULL;
+static SHELL_FILE_HANDLE  mShellStdErr       = NULL;
 static bool               mShellStdProbed    = false;
 
 /* Shared probe — looks up EFI_SHELL_PARAMETERS_PROTOCOL once and
-   caches both StdIn and StdOut handles. Both helpers below trigger
-   the same probe on first call. */
+   caches StdIn, StdOut, and StdErr handles. All three helpers below
+   trigger the same probe on first call. */
 static void
 probe_shell_std_handles(void)
 {
@@ -1119,14 +1124,98 @@ probe_shell_std_handles(void)
     if (!EFI_ERROR(status) && sp != NULL) {
         mShellStdIn  = sp->StdIn;
         mShellStdOut = sp->StdOut;
+        mShellStdErr = sp->StdErr;
     }
+}
+
+// ===================================================================
+// Stdio-bridge — carries launcher shell handles across image boundary
+// ===================================================================
+
+/* uuid c8f517d7-36cc-458d-98d6-b116825e30bf — fixed identity of the
+   stdio-bridge protocol. */
+const AxlGuid AXL_STDIO_BRIDGE_GUID =
+    AXL_GUID(0xc8f517d7, 0x36cc, 0x458d,
+             0x98, 0xd6, 0xb1, 0x16, 0x82, 0x5e, 0x30, 0xbf);
+
+static AxlStdioBridge  mBridge;
+static AxlHandle       mBridgeHandle  = NULL;   /* install handle; NULL = not installed */
+static uint32_t        mBridgeAtexit  = 0;      /* atexit cookie; 0 = not yet registered */
+
+static void
+bridge_atexit(
+    void  *data
+    )
+{
+    (void)data;
+    axl_backend_stdio_bridge_uninstall();
+}
+
+int
+axl_backend_stdio_bridge_install(void)
+{
+    /* Capture THIS image's shell handles.  If we have none, nothing to
+       bridge — a successful no-op (e.g. not launched from a shell). */
+    AxlFileHandle in  = axl_backend_shell_stdin();
+    AxlFileHandle out = axl_backend_shell_stdout();
+    AxlFileHandle err = axl_backend_shell_stderr();
+    if (in == NULL && out == NULL && err == NULL) {
+        return AXL_OK;
+    }
+    /* Refresh: uninstall a stale one first (handles change per invocation). */
+    if (mBridgeHandle != NULL) {
+        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE_GUID, &mBridge);
+        mBridgeHandle = NULL;
+    }
+    mBridge.stdin_h        = in;
+    mBridge.stdout_h       = out;
+    mBridge.stderr_h       = err;
+    mBridge.launcher_image = (void *)gImageHandle;
+    /* The published interface is &mBridge — a static in THIS (launcher)
+       image. It MUST be uninstalled before the image unloads, or the
+       firmware protocol DB keeps a dangling pointer into freed image
+       memory. The bridge_atexit handler below guarantees that: CRT0 runs
+       atexit (-> uninstall) before returning the launcher image to firmware. */
+    if (axl_protocol_install(&AXL_STDIO_BRIDGE_GUID, &mBridge, &mBridgeHandle)
+        != AXL_OK) {
+        mBridgeHandle = NULL;
+        return AXL_ERR;
+    }
+    if (mBridgeAtexit == 0) {
+        mBridgeAtexit = axl_atexit(bridge_atexit, NULL);
+    }
+    return AXL_OK;
+}
+
+void
+axl_backend_stdio_bridge_uninstall(void)
+{
+    if (mBridgeHandle != NULL) {
+        axl_protocol_uninstall(mBridgeHandle, &AXL_STDIO_BRIDGE_GUID, &mBridge);
+        mBridgeHandle = NULL;
+    }
+}
+
+/* Live (uncached) lookup — only used on the no-local-shell-params (driver) path. */
+static AxlFileHandle
+bridge_lookup_stdin(void)
+{
+    void *iface = NULL;
+    if (axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) == AXL_OK
+        && iface != NULL) {
+        return ((AxlStdioBridge *)iface)->stdin_h;
+    }
+    return NULL;
 }
 
 AxlFileHandle
 axl_backend_shell_stdin(void)
 {
     probe_shell_std_handles();
-    return (AxlFileHandle)mShellStdIn;
+    if (mShellStdIn != NULL) {
+        return (AxlFileHandle)mShellStdIn;   /* app/launcher: own params */
+    }
+    return bridge_lookup_stdin();            /* driver: live bridge consult */
 }
 
 AxlFileHandle
@@ -1134,6 +1223,13 @@ axl_backend_shell_stdout(void)
 {
     probe_shell_std_handles();
     return (AxlFileHandle)mShellStdOut;
+}
+
+AxlFileHandle
+axl_backend_shell_stderr(void)
+{
+    probe_shell_std_handles();
+    return (AxlFileHandle)mShellStdErr;
 }
 
 const unsigned short *

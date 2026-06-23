@@ -9,7 +9,10 @@
 **/
 
 #include "axl-test.h"
+#include "axl-backend.h"     /* axl_backend_shell_std{in,out,err} */
+#include "axl-stdio-bridge.h"  /* AxlStdioBridge, AXL_STDIO_BRIDGE_GUID, install/uninstall */
 #include <axl/axl-log.h>
+#include <axl/axl-shared-driver.h>  /* axl_shared_driver_install_stdio_bridge */
 #include <axl/axl-spd.h>
 #include <axl/axl-usb.h>
 #include <axl/axl-block.h>
@@ -4538,6 +4541,75 @@ test_cpu_topology(void)
 }
 
 // ---------------------------------------------------------------------------
+// Shell std-handle probe (axl_backend_shell_stderr)
+// ---------------------------------------------------------------------------
+
+static void
+test_stdio_bridge_roundtrip(void)
+{
+    /* Install captures THIS image's shell handles (it's a shell app). */
+    axl_backend_stdio_bridge_install();
+    void *iface = NULL;
+    int rc = axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface);
+    test_check(rc == AXL_OK && iface != NULL, "stdio-bridge: found after install");
+    AxlStdioBridge *b = iface;
+    test_check(b->stdin_h == axl_backend_shell_stdin(),
+               "stdio-bridge: stdin_h is the launcher's StdIn");
+    test_check(b->stdout_h == axl_backend_shell_stdout(),
+               "stdio-bridge: stdout_h is the launcher's StdOut");
+
+    axl_backend_stdio_bridge_uninstall();
+    iface = NULL;
+    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) != AXL_OK,
+               "stdio-bridge: gone after uninstall");
+}
+
+// ---------------------------------------------------------------------------
+// Public escape-hatch installer (axl_shared_driver_install_stdio_bridge).
+//
+// Self-locating consumers that don't go through axl_shared_driver_locate*
+// call this to install the bridge themselves. Pins the public contract:
+// it returns AXL_OK and makes the bridge findable (same observable effect
+// as the backend installer the locate path uses). Does NOT read axl_stdin
+// — the cross-image read path is proved by test-driver-stdio-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static void
+test_public_install_stdio_bridge(void)
+{
+    /* This test binary is a shell app, so it has shell handles to bridge. */
+    int rc = axl_shared_driver_install_stdio_bridge();
+    test_check(rc == AXL_OK,
+               "install_stdio_bridge: returns AXL_OK under a shell launch");
+
+    void *iface = NULL;
+    test_check(axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) == AXL_OK
+                   && iface != NULL,
+               "install_stdio_bridge: bridge findable after public install");
+    AxlStdioBridge *b = iface;
+    test_check(b->stdin_h == axl_backend_shell_stdin(),
+               "install_stdio_bridge: stdin_h is the launcher's StdIn");
+
+    axl_backend_stdio_bridge_uninstall();
+}
+
+static void
+test_shell_std_handles(void)
+{
+    /* This test binary is launched as a UEFI Shell app, so it HAS
+       EFI_SHELL_PARAMETERS_PROTOCOL: its own stdin/stdout/stderr are
+       non-NULL and the getters agree across repeated calls (cached). */
+    AxlFileHandle in1  = axl_backend_shell_stdin();
+    AxlFileHandle out1 = axl_backend_shell_stdout();
+    AxlFileHandle err1 = axl_backend_shell_stderr();
+    test_check(in1  != NULL, "shell_stdin: non-NULL under a shell launch");
+    test_check(out1 != NULL, "shell_stdout: non-NULL under a shell launch");
+    test_check(err1 != NULL, "shell_stderr: non-NULL under a shell launch");
+    test_check(axl_backend_shell_stdin()  == in1,  "shell_stdin: stable (cached)");
+    test_check(axl_backend_shell_stderr() == err1, "shell_stderr: stable (cached)");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -4648,6 +4720,15 @@ test_platform_main(int argc, char **argv)
     test_spd_ids_format_name();
     test_spd_ids_singleton();
     test_spd_probe();
+
+    /* shell std handles */
+    test_shell_std_handles();
+
+    /* stdio-bridge round-trip */
+    test_stdio_bridge_roundtrip();
+
+    /* public escape-hatch installer */
+    test_public_install_stdio_bridge();
 
     return test_print_results();
 }

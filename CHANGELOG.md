@@ -3,6 +3,30 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.6.0 — 2026-06-23
+
+### Added
+
+- **Shared-driver stdio bridge.** `axl_shared_driver_locate` now
+  transparently bridges the launcher's StdIn into the resident driver, so a
+  driver verb's `axl_readline(axl_stdin)` reads the launcher's piped (`|a`)
+  / `<`-redirected / interactive input — no per-tool code required (an
+  internal stdio-bridge protocol is installed by `axl_shared_driver_locate`
+  and uninstalled on launcher exit via `axl_atexit`; the driver-side backend
+  getter consults it when the driver image has no shell parameters of its
+  own). Output redirection (`>`) already worked via the shell's ConOut
+  handoff; this release adds StdIn bridging and documents the full
+  transparent-stdio guarantee.
+- **`axl_shared_driver_install_stdio_bridge()` in `<axl/axl-shared-driver.h>`**
+  — public escape hatch that installs the same stdio bridge for launchers
+  that resolve the resident driver themselves (warm-path
+  `axl_protocol_find_guid`, `axl_driver_load_sibling`, an embedded-blob
+  fallback, a custom `--reload` chain) instead of through
+  `axl_shared_driver_locate*` (which still installs it automatically). Call
+  it once from the launcher before dispatch; returns `AXL_OK` on install or
+  when there are no shell handles to bridge, `AXL_ERR` only on install
+  failure. See `docs/AXL-Shared-Driver-Recipe.md`.
+
 ## 2.5.0 — 2026-06-23
 
 ### Added

@@ -358,6 +358,83 @@ talking through a UEFI protocol. Everything that works in an
   `axl_driver_ensure_with_embedded` and the driver-side
   `axl_driver_get_load_options_raw`.
 
+## Stdio is bridged automatically
+
+A resident driver verb's `axl_readline(axl_stdin)` and `axl_print(...)` /
+`axl_printf(...)` transparently reflect the *launcher's* console and
+redirects — no per-tool code required.
+
+When the launcher calls `axl_shared_driver_locate`, an internal
+stdio-bridge protocol is installed before dispatch. The driver-side
+backend stdin getter consults that protocol when the driver image has no
+shell parameters of its own (which it never does — it's a resident driver,
+not a shell invocation). This means:
+
+- **Interactive input** — the driver's `axl_readline(axl_stdin)` reads
+  from the same keyboard the user is typing at.
+- **`<` file redirect** — `my-tool.efi verb < input.txt` feeds `input.txt`
+  into the driver verb's `axl_readline` calls exactly as it would for any
+  shell app.
+- **`>` output redirect** — driver output already honors `>` via the
+  shell's `gST->ConOut` swap during the launcher window. `my-tool.efi verb
+  > out.txt` captures everything the driver verb prints.
+- **Piped input** — the UEFI Shell's default `|` pipe carries **UCS-2**,
+  not raw bytes. To read piped *text*, read through `axl_stdin_text()`
+  (a fresh `axl_text_stream_wrap(axl_stdin)`), which transparently decodes
+  UCS-2 (and BOM'd UTF-16/UTF-8) to UTF-8 — then `echo args | my-tool.efi
+  verb` works with the plain `|`:
+
+  ```c
+  AxlStream *in = axl_stdin_text();      /* fresh per dispatch; caller closes */
+  char *line = axl_readline(in);
+  /* ... use line ... */
+  axl_free(line);
+  axl_fclose(in);   /* closes the wrapper only — it does not own axl_stdin */
+  ```
+
+  Reading `axl_stdin` *raw* instead (no wrapper) gets UCS-2 bytes from a
+  default `|`; for that path use the shell's ASCII pipe `|a` (e.g.
+  `echo args |a my-tool.efi verb`). This is `axl_stdin`'s pre-existing
+  raw-byte contract — the same as any `axl_stdin` consumer — not a bridge
+  limitation. `<` redirection and interactive input need no wrapper for
+  ASCII, but `axl_stdin_text()` handles their encodings too. **Do not cache
+  the `axl_stdin_text()` stream across invocations** in a resident driver —
+  create a fresh one per dispatch (it buffers read-ahead + a one-time
+  encoding sniff).
+
+The bridge is uninstalled (via `axl_atexit`) when the launcher exits, so
+it does not outlive the invocation.
+
+### "I roll my own locate" — call the install explicitly
+
+The automatic install lives inside `axl_shared_driver_locate*`. If your
+launcher resolves the resident driver **some other way** — the warm
+fast-path (`axl_shared_driver_guid` + `axl_protocol_find_guid`),
+`axl_driver_load_sibling`, a hand-rolled embedded-blob fallback, or a
+custom `--reload` chain — then `locate` never runs and the bridge is
+**never installed**. The resident driver's `axl_stdin` stays EOF and
+`echo args | my-tool.efi verb` reads nothing.
+
+For that case, call the public escape hatch from the launcher, once,
+before dispatching into the driver:
+
+```c
+/* Launcher resolved the driver itself (no axl_shared_driver_locate). */
+MyToolVtable *vt = my_custom_resolve();
+
+/* Install the bridge so the resident driver sees THIS launcher's
+   piped / redirected / interactive StdIn. */
+axl_shared_driver_install_stdio_bridge();
+
+return vt->do_run(argc, argv);   /* driver reads via axl_stdin_text() */
+```
+
+It re-publishes on every call (so it's safe — and correct — to call on
+each launcher invocation), is auto-uninstalled at launcher exit, and is
+a no-op when the launcher has no shell handles of its own. Launchers
+that use `axl_shared_driver_locate*` must **not** call it — they already
+get the bridge for free.
+
 ## See also
 
 - [`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h) —

@@ -257,6 +257,39 @@ axl_shared_driver_locate_with_image_info(
     void                      **out_iface          ///< [out] receives the vtable pointer
 );
 
+/**
+ * @brief Bridge THIS launcher's shell StdIn into the resident driver
+ *     so the driver's @c axl_stdin reflects the launcher's piped /
+ *     redirected / interactive input.
+ *
+ * Call from the LAUNCHER image, before dispatching into the driver.
+ * Only needed by consumers that resolve the resident driver
+ * **themselves** — @ref axl_shared_driver_guid +
+ * @ref axl_protocol_find_guid (warm fast-path), @ref axl_driver_load_sibling,
+ * an embedded-blob fallback, etc. — instead of through
+ * @ref axl_shared_driver_locate (every @c axl_shared_driver_locate*
+ * variant already installs the bridge automatically, so launchers using
+ * those never call this).
+ *
+ * The driver image has no shell parameters of its own (it's a resident
+ * DXE driver, not a shell invocation), so without the bridge its
+ * @c axl_stdin is EOF and @c echo @c args @c | @c tool reads nothing.
+ * Output redirection (@c >) needs no bridge — it already works via the
+ * shell's @c ConOut handoff during the launcher window.
+ *
+ * Re-publishes on each call (every launcher invocation carries its own
+ * StdIn) and is auto-uninstalled at launcher exit via @c axl_atexit, so
+ * the bridge never outlives the invocation. Read piped text through
+ * @c axl_stdin_text() in the driver verb (the default @c | pipe carries
+ * UCS-2).
+ *
+ * @return AXL_OK when the bridge is installed, or when the caller has no
+ *     shell handles to bridge (nothing to do — e.g. not launched from a
+ *     shell); AXL_ERR only if the bridge-protocol install itself failed.
+ */
+int
+axl_shared_driver_install_stdio_bridge(void);
+
 #ifdef __cplusplus
 }
 #endif

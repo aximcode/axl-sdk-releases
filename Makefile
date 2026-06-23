@@ -603,7 +603,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test stdio-bridge-fix stdio-bridge-self service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1325,6 +1325,47 @@ $(PREFIX)/driver-identity-test.efi: $(BUILDDIR)/driver-identity-test.o $(LINK_CR
 	$(call LINK_EFI_APP,$(BUILDDIR)/driver-identity-test.o,$@)
 
 $(BUILDDIR)/driver-identity-test.o: test/integration/driver-identity-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build stdio-bridge-fix.efi (+ -driver.efi) — acceptance fixture for
+# the shared-driver stdio bridge. The driver image reads axl_stdin /
+# writes axl_stdout when the launcher dispatches a verb; the launcher
+# embeds the driver and locates it (which installs the stdio bridge).
+# Same dual-image embed pattern as service-demo.
+# ===================================================================
+
+stdio-bridge-fix: $(PREFIX)/stdio-bridge-fix.efi $(PREFIX)/stdio-bridge-driver.efi
+	@echo "  Built: $(PREFIX)/stdio-bridge-fix.efi + stdio-bridge-driver.efi"
+
+# Driver image — DXE driver (no CRT0), publishes the fixture vtable.
+$(PREFIX)/stdio-bridge-driver.efi: $(BUILDDIR)/stdio-bridge-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/stdio-bridge-driver.o,$@)
+
+$(BUILDDIR)/stdio-bridge-driver.o: test/integration/stdio-bridge-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Launcher app — embeds the driver via EMBED_BLOB. Embed symbol
+# axl_embedded_stdio_bridge_fix matches AXL_EMBED_DECLARE(stdio_bridge_fix).
+$(eval $(call EMBED_BLOB,stdio_bridge_fix,$(PREFIX)/stdio-bridge-driver.efi))
+
+$(PREFIX)/stdio-bridge-fix.efi: $(BUILDDIR)/stdio-bridge-launcher.o $(BLOB_OBJ_stdio_bridge_fix) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/stdio-bridge-launcher.o $(BLOB_OBJ_stdio_bridge_fix),$@)
+
+$(BUILDDIR)/stdio-bridge-launcher.o: test/integration/stdio-bridge-launcher.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Self-locating launcher — resolves the resident driver itself (warm
+# fast-path) and installs the bridge via the public escape hatch
+# axl_shared_driver_install_stdio_bridge. No embed: it relies on the
+# locate launcher above making the driver resident first.
+stdio-bridge-self: $(PREFIX)/stdio-bridge-self.efi
+	@echo "  Built: $(PREFIX)/stdio-bridge-self.efi"
+
+$(PREFIX)/stdio-bridge-self.efi: $(BUILDDIR)/stdio-bridge-self.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/stdio-bridge-self.o,$@)
+
+$(BUILDDIR)/stdio-bridge-self.o: test/integration/stdio-bridge-self.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
