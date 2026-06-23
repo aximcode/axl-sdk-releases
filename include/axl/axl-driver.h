@@ -33,6 +33,25 @@ extern "C" {
 /// Opaque handle to a loaded driver image.
 typedef void *AxlDriverHandle;
 
+/**
+ * @brief Caller-supplied identity for a buffer/embedded driver load.
+ *
+ * Passed to axl_driver_load_buffer_with_image_info (and the
+ * shared-driver `_with_image_info` locate) to give a memory-loaded
+ * image a real, renderable device path. A buffer load has no on-disk
+ * `DevicePath`, so the firmware would otherwise leave
+ * `LoadedImage->FilePath` and the handle's
+ * `gEfiLoadedImageDevicePathProtocol` interface NULL — which the
+ * aarch64 UEFI shell faults on while rendering (`dh -p` / `dh -v`).
+ * Every field is optional; AXL fills sensible non-NULL defaults so the
+ * resulting device path is never NULL.
+ */
+typedef struct {
+    const char    *file_name;     ///< MEDIA_FILEPATH leaf, e.g. "doDriver.efi"; NULL -> derived from the load's filename, else the app's basename
+    AxlHandle      device_handle; ///< optional: set LoadedImage->DeviceHandle; NULL -> left as the firmware set it
+    const AxlGuid *vendor_guid;   ///< optional Vendor() node prepended to the synthesized path; NULL -> omitted
+} AxlEmbeddedImageInfo;
+
 // ===================================================================
 // Protocol publishing
 //
@@ -232,13 +251,45 @@ axl_driver_load(
 );
 
 /**
+ * @brief Load a driver from the running app's own directory.
+ *
+ * Resolves @p file_name strictly within the directory the current
+ * application image was loaded from (derived from
+ * axl_app_image_path()), then loads it via axl_driver_load — so the
+ * loaded image gets a real on-disk MEDIA_FILEPATH device path (never
+ * NULL). Use this to load a companion driver staged next to the app
+ * while refusing to pick one up from anywhere else (an
+ * attacker-controlled volume root, another `fsN:`, a parent
+ * directory).
+ *
+ * @p file_name must be a bare filename: any `/`, `\\`, or `:` is
+ * rejected so the name cannot escape the app directory.
+ *
+ * @return AXL_OK on success (`*out_handle` is set); AXL_INVALID if
+ *     @p file_name contains a path separator or drive prefix; AXL_ERR
+ *     on NULL arguments or when the app has no filesystem image path
+ *     (network / RAM-disk boot); AXL_NOT_FOUND if the file is not
+ *     present in the app directory. `*out_handle` is set to NULL on
+ *     any failure.
+ */
+int
+axl_driver_load_sibling(
+    const char       *file_name,  ///< bare driver filename (no '/', '\\', or ':'), e.g. "doDriver.efi"
+    AxlDriverHandle  *out_handle  ///< [out] receives driver handle
+);
+
+/**
  * @brief Load a driver image from a memory buffer.
  *
  * Buffer-source counterpart to axl_driver_load. Calls
- * `gBS->LoadImage` with `SourceBuffer`/`SourceSize` and no
- * `DevicePath`, returning the resulting handle for use with
- * axl_driver_set_load_options, axl_driver_start, and
- * axl_driver_unload.
+ * `gBS->LoadImage` with `SourceBuffer`/`SourceSize`, then synthesizes
+ * a renderable device path for the loaded image (see
+ * axl_driver_load_buffer_with_image_info) so the image's
+ * `LoadedImage->FilePath` and the handle's
+ * `gEfiLoadedImageDevicePathProtocol` interface are never NULL. The
+ * synthesized leaf name defaults to the app's basename here; callers
+ * that want to name the driver (or set DeviceHandle / a Vendor GUID)
+ * use axl_driver_load_buffer_with_image_info.
  *
  * Used by tools that `.incbin` a companion driver into the app to
  * ship as a single binary. For the higher-level AxlService case use
@@ -246,10 +297,7 @@ axl_driver_load(
  * non-AxlService drivers that still need per-call LoadOptions or
  * explicit handle tracking.
  *
- * The driver is loaded but NOT started. The image's
- * `LoadedImage->FilePath` is left NULL; drivers that read FilePath
- * at startup (some Driver-Binding-style drivers do, notably iPXE)
- * will not work via this entry point — load them by path instead.
+ * The driver is loaded but NOT started.
  *
  * @return AXL_OK on success (`*out_handle` is set); AXL_ERR on
  *     argument validation failure or LoadImage failure
@@ -260,6 +308,38 @@ axl_driver_load_buffer(
     const unsigned char *buf,         ///< driver image bytes (must be non-NULL)
     size_t               len,         ///< length in bytes (must be > 0)
     AxlDriverHandle     *out_handle   ///< [out] driver handle for set_load_options/start/unload
+);
+
+/**
+ * @brief Load a driver from a memory buffer with a caller-set identity.
+ *
+ * Like axl_driver_load_buffer, but lets the caller populate the
+ * loaded image's identity via @p info so `dh -p` / `dh -v` show real
+ * values and the aarch64 shell does not fault on a NULL device path.
+ * After `gBS->LoadImage`, AXL reads the image's ImageBase/ImageSize
+ * back from EFI_LOADED_IMAGE_PROTOCOL and installs a device path of
+ * the form
+ * `[Vendor(info->vendor_guid)] / MemoryMapped(EfiBootServicesCode,
+ * ImageBase, ImageBase+ImageSize) / FilePath("\\<file_name>")`,
+ * setting both `LoadedImage->FilePath` (the FilePath portion) and the
+ * handle's `gEfiLoadedImageDevicePathProtocol` interface, plus
+ * `LoadedImage->DeviceHandle` when @p info supplies one.
+ *
+ * @p info may be NULL (equivalent to axl_driver_load_buffer). Any
+ * unset @p info field falls back to a non-NULL default; identity
+ * synthesis is best-effort — if it fails the driver still loads
+ * (AXL_OK) and a warning is logged, leaving the firmware's defaults.
+ *
+ * @return AXL_OK on success (`*out_handle` is set); AXL_ERR on
+ *     argument validation failure or LoadImage failure
+ *     (`*out_handle` is set to NULL).
+ */
+int
+axl_driver_load_buffer_with_image_info(
+    const unsigned char        *buf,        ///< driver image bytes (must be non-NULL)
+    size_t                      len,        ///< length in bytes (must be > 0)
+    const AxlEmbeddedImageInfo *info,       ///< loaded-image identity; NULL -> defaults
+    AxlDriverHandle            *out_handle  ///< [out] driver handle for set_load_options/start/unload
 );
 
 /**

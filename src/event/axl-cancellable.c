@@ -68,6 +68,15 @@ cancellable_is_live(const AxlCancellable *c, const char *op)
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/* Registry destructor wrapper (see _axl_registry_add) — frees the
+ * cancellable without the registry statically referencing
+ * axl_cancellable_free. */
+static void
+cancellable_registry_dtor(void *resource)
+{
+    axl_cancellable_free((AxlCancellable *)resource);
+}
+
 AxlCancellable *
 axl_cancellable_new_impl(const char *file, int line)
 {
@@ -90,7 +99,9 @@ axl_cancellable_new_impl(const char *file, int line)
     }
 
     c->magic = AXL_CANCELLABLE_MAGIC;
-    c->_registry_handle = _axl_registry_add(AXL_RES_CANCELLABLE, c, file, line);
+    c->_registry_handle =
+        _axl_registry_add(AXL_RES_CANCELLABLE, c, cancellable_registry_dtor,
+                          file, line);
     return c;
 }
 

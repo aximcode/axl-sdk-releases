@@ -47,6 +47,7 @@
 #include <stddef.h>
 
 #include <axl/axl-sys.h>
+#include <axl/axl-driver.h>   /* AxlEmbeddedImageInfo */
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,6 +219,42 @@ axl_shared_driver_locate_with_load_options(
     const void           *load_options,      ///< bytes to install (NULL → skip)
     size_t                load_options_size, ///< @p load_options length
     void                **out_iface          ///< [out] receives the vtable pointer
+);
+
+/**
+ * @brief Locate a shared-driver vtable with both config and a
+ *     caller-set loaded-image identity.
+ *
+ * Superset of @ref axl_shared_driver_locate_with_load_options: when
+ * the driver is loaded from the embedded blob, @p info is threaded
+ * down to the buffer load so the resulting image gets a non-NULL,
+ * renderable device path (see @ref axl_driver_load_buffer_with_image_info)
+ * — fixing the NULL `LoadedImage->FilePath` /
+ * `gEfiLoadedImageDevicePathProtocol` that makes the aarch64 shell
+ * fault under `dh -p` / `dh -v`.
+ *
+ * When @p info (or its @c file_name) is NULL the synthesized leaf name
+ * defaults to @p driver_filename, so even the plain
+ * @ref axl_shared_driver_locate already yields a non-NULL path. Use
+ * this variant only when you also need to set @c DeviceHandle or a
+ * Vendor() GUID, or to override the leaf name.
+ *
+ * Like the load-options variant, @p info / @p load_options apply only
+ * on a fresh load; both are skipped on the resident-driver
+ * short-circuit.
+ *
+ * @return AXL_OK on success, AXL_ERR on load/start/locate failure.
+ */
+int
+axl_shared_driver_locate_with_image_info(
+    const char                 *name,              ///< shared-driver identity
+    const char                 *driver_filename,   ///< on-disk driver filename
+    const unsigned char        *embed_blob,        ///< embedded driver bytes
+    size_t                      embed_len,         ///< length of @p embed_blob
+    const void                 *load_options,      ///< bytes to install (NULL → skip)
+    size_t                      load_options_size, ///< @p load_options length
+    const AxlEmbeddedImageInfo *info,              ///< loaded-image identity (NULL → defaults)
+    void                      **out_iface          ///< [out] receives the vtable pointer
 );
 
 #ifdef __cplusplus

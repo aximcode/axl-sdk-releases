@@ -540,9 +540,20 @@ SO_FILE="$TMPDIR/output.so"
 CXX_LIB_ARGS=()
 [[ "$HAS_CPP" == "true" ]] && CXX_LIB_ARGS+=("$LIB_DIR/libaxl-cxx.a")
 
+# --version-script localizes every symbol but the entry point. `-shared`
+# otherwise exports all globals into the dynamic symbol table and treats them
+# as --gc-sections roots, so dead-code elimination can't run and a trivial app
+# drags in the whole runtime (~110 KB). A UEFI image needs no exports, so
+# localizing cuts the .efi ~66%. Guarded so an SDK staged before this file
+# existed still links (just larger).
+VERSION_SCRIPT_ARGS=()
+EFI_VER="$SDK_DIR/lib/axl/efi-localize.ver"
+[[ -f "$EFI_VER" ]] && VERSION_SCRIPT_ARGS+=(--version-script "$EFI_VER")
+
 run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
-    --no-warn-rwx-segments --no-undefined \
+    --no-warn-rwx-segments --no-undefined --gc-sections \
     -T "$EFI_LDS" \
+    ${VERSION_SCRIPT_ARGS[@]+"${VERSION_SCRIPT_ARGS[@]}"} \
     ${LDFLAGS_EXTRA[@]+"${LDFLAGS_EXTRA[@]}"} \
     -o "$SO_FILE" \
     $CRT0_OBJS \

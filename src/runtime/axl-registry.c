@@ -13,10 +13,6 @@
 #include "axl-registry-internal.h"
 
 #include <axl/axl-array.h>
-#include <axl/axl-event.h>
-#include <axl/axl-loop.h>
-#include <axl/axl-cancellable.h>
-#include <axl/axl-task.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("registry");
@@ -28,6 +24,7 @@ AXL_LOG_DOMAIN("registry");
 typedef struct {
     AxlResKind   kind;
     void        *resource;
+    void       (*dtor)(void *resource);  /* per-entry free; see _axl_registry_add */
     const char  *file;
     int          line;
     uint64_t     seq;       /* 0 = dead slot (reusable); else insertion order */
@@ -58,6 +55,7 @@ uint32_t
 _axl_registry_add(
     AxlResKind   kind,
     void        *resource,
+    void       (*dtor)(void *resource),
     const char  *file,
     int          line
     )
@@ -77,6 +75,7 @@ _axl_registry_add(
         if (e->seq == 0) {
             e->kind     = kind;
             e->resource = resource;
+            e->dtor     = dtor;
             e->file     = file;
             e->line     = line;
             e->seq      = mNextSeq++;
@@ -87,6 +86,7 @@ _axl_registry_add(
     /* Append a fresh slot. */
     entry.kind     = kind;
     entry.resource = resource;
+    entry.dtor     = dtor;
     entry.file     = file;
     entry.line     = line;
     entry.seq      = mNextSeq++;
@@ -174,18 +174,17 @@ _axl_registry_sweep(void)
         axl_warning("sweep: %s leaked at %s:%d -- closing",
                     kind_name(newest->kind), newest->file, newest->line);
 
-        /* Mark dead before calling _free — the _free path calls back
-         * into _axl_registry_remove, which is then a safe no-op. */
-        AxlResKind  kind     = newest->kind;
-        void       *resource = newest->resource;
-        newest->seq          = 0;
-        newest->resource     = NULL;
+        /* Mark dead before calling the destructor — the _free path calls
+         * back into _axl_registry_remove, which is then a safe no-op. */
+        void       (*dtor)(void *) = newest->dtor;
+        void        *resource      = newest->resource;
+        newest->seq                = 0;
+        newest->resource           = NULL;
 
-        switch (kind) {
-        case AXL_RES_EVENT:       axl_event_free(resource);       break;
-        case AXL_RES_LOOP:        axl_loop_free(resource);        break;
-        case AXL_RES_CANCELLABLE: axl_cancellable_free(resource); break;
-        case AXL_RES_ARENA:       axl_arena_free(resource);       break;
+        /* Indirect call (see _axl_registry_add): the registry holds no
+         * static reference to axl_loop_free / axl_event_free / etc. */
+        if (dtor != NULL) {
+            dtor(resource);
         }
     }
 

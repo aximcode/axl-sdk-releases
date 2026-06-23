@@ -24,6 +24,7 @@
 **/
 
 #include "../backend/axl-backend.h"     /* gBS, EFI_HANDLE, ByProtocol */
+#include "axl-driver-internal.h"        /* _axl_driver_ensure_with_embedded_info */
 #include <axl/axl-shared-driver.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-log.h>
@@ -161,14 +162,15 @@ axl_shared_driver_unload(
 }
 
 int
-axl_shared_driver_locate_with_load_options(
-    const char           *name,
-    const char           *driver_filename,
-    const unsigned char  *embed_blob,
-    size_t                embed_len,
-    const void           *load_options,
-    size_t                load_options_size,
-    void                **out_iface
+axl_shared_driver_locate_with_image_info(
+    const char                 *name,
+    const char                 *driver_filename,
+    const unsigned char        *embed_blob,
+    size_t                      embed_len,
+    const void                 *load_options,
+    size_t                      load_options_size,
+    const AxlEmbeddedImageInfo *info,
+    void                      **out_iface
     )
 {
     if (name == NULL || driver_filename == NULL || out_iface == NULL) {
@@ -187,12 +189,15 @@ axl_shared_driver_locate_with_load_options(
        the resident-driver short-circuit (step 1) leaves the
        previously-installed options intact — consumers that need
        per-invocation args should send them through the vtable
-       call, not through LoadOptions. */
-    if (axl_driver_ensure_with_embedded(
+       call, not through LoadOptions. On the embedded path, @p info
+       (defaulting the leaf name to driver_filename) gives the loaded
+       image a non-NULL device path. */
+    if (_axl_driver_ensure_with_embedded_info(
             &guid, driver_filename,
             embed_blob, embed_len,
             /* override_name */ NULL,
-            load_options, load_options_size) != AXL_OK) {
+            load_options, load_options_size,
+            info) != AXL_OK) {
         axl_warning("axl_shared_driver_locate: failed to load '%s'",
                     driver_filename);
         return AXL_ERR;
@@ -209,6 +214,23 @@ axl_shared_driver_locate_with_load_options(
         return AXL_ERR;
     }
     return AXL_OK;
+}
+
+int
+axl_shared_driver_locate_with_load_options(
+    const char           *name,
+    const char           *driver_filename,
+    const unsigned char  *embed_blob,
+    size_t                embed_len,
+    const void           *load_options,
+    size_t                load_options_size,
+    void                **out_iface
+    )
+{
+    return axl_shared_driver_locate_with_image_info(
+        name, driver_filename, embed_blob, embed_len,
+        load_options, load_options_size,
+        /* info */ NULL, out_iface);
 }
 
 int

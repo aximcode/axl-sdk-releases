@@ -35,6 +35,19 @@ AXL_LOG_DOMAIN("runtime");
 static AxlLoop *mDefaultLoop;
 static bool     mCleanupRan;
 
+/* The default loop is the ONLY thing in the always-linked runtime that would
+ * otherwise drag the entire event-loop subsystem (axl_loop_dispatch / _free
+ * and their event-backend tail, ~8 KB .text + 6 KB .bss) into every image —
+ * even a trivial app that never creates a loop — because axl_yield() and
+ * _axl_cleanup() statically reference those functions behind a runtime
+ * `mDefaultLoop != NULL` guard the linker can't evaluate. Route those two
+ * calls through function pointers that are populated ONLY when the default
+ * loop is actually created. An app that never calls axl_loop_default() leaves
+ * them NULL, so the only static reference to axl_loop_dispatch/_free lives in
+ * axl_loop_default() itself, and --gc-sections drops the whole subsystem. */
+static int  (*mLoopDispatchFn)(AxlLoop *loop, bool blocking);
+static void (*mLoopFreeFn)(AxlLoop *loop);
+
 // ---------------------------------------------------------------------------
 // Default loop
 // ---------------------------------------------------------------------------
@@ -43,7 +56,10 @@ AxlLoop *
 axl_loop_default(void)
 {
     if (mDefaultLoop == NULL) {
-        mDefaultLoop = axl_loop_new();
+        mDefaultLoop    = axl_loop_new();
+        /* Arm the indirect hooks now the subsystem is in use anyway. */
+        mLoopDispatchFn = axl_loop_dispatch;
+        mLoopFreeFn     = axl_loop_free;
     }
     return mDefaultLoop;
 }
@@ -93,7 +109,9 @@ axl_yield(void)
      * NOTE: in-library code must NOT reach this branch — it calls
      * _axl_poll_break so it never re-dispatches the consumer's loop (firing
      * their callbacks re-entrantly) from deep inside an unrelated operation. */
-    if (axl_loop_dispatch(loop, /*blocking=*/false) < 0) {
+    /* Indirect call (see mLoopDispatchFn): a live mDefaultLoop implies
+     * axl_loop_default() ran, which armed the hook. */
+    if (mLoopDispatchFn != NULL && mLoopDispatchFn(loop, /*blocking=*/false) < 0) {
         _axl_signal_on_break();
     }
     if (g_axl_interrupted && !_axl_signal_has_handler()) {
@@ -183,8 +201,8 @@ _axl_cleanup(void)
     /* Explicitly free the default loop (if any) before sweep so its
      * registry entry unregisters cleanly; otherwise it'd appear as
      * a "leak" on every run. */
-    if (mDefaultLoop != NULL) {
-        axl_loop_free(mDefaultLoop);
+    if (mDefaultLoop != NULL && mLoopFreeFn != NULL) {
+        mLoopFreeFn(mDefaultLoop);
         mDefaultLoop = NULL;
     }
 

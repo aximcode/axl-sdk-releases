@@ -212,6 +212,8 @@ cp "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi
 # GCC linker scripts live next to the per-arch lib data.
 cp "$LIBAXL_DIR/scripts/elf_x86_64_efi.lds"  "$PREFIX/lib/axl/"
 cp "$LIBAXL_DIR/scripts/elf_aarch64_efi.lds" "$PREFIX/lib/axl/"
+# Linker version script: localizes symbols so --gc-sections shrinks the .efi.
+cp "$LIBAXL_DIR/scripts/efi-localize.ver"    "$PREFIX/lib/axl/"
 
 # Metadata — lives under share/ since it's arch-independent plain text
 # that axl-cc reads for --version output and sanity checks.

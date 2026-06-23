@@ -39,12 +39,21 @@ void _axl_registry_sweep(void);
 
 /** Register a resource. Returns a non-zero handle on success, 0 on
  *  failure (registry not initialized, allocation failure). Caller
- *  stores the handle in the resource struct for later remove. */
+ *  stores the handle in the resource struct for later remove.
+ *
+ *  @p dtor is the resource's free function (a thin wrapper over
+ *  axl_loop_free / axl_event_free / etc.). Storing it per entry —
+ *  rather than switching on @p kind in the sweep — keeps the
+ *  always-linked registry from statically referencing those frees, so a
+ *  --gc-sections build of an app that never creates that resource type
+ *  drops the whole subsystem. @p kind is retained only for the leak
+ *  diagnostic name. */
 uint32_t _axl_registry_add(
-    AxlResKind  kind,
-    void       *resource,
-    const char *file,
-    int         line
+    AxlResKind   kind,
+    void        *resource,
+    void       (*dtor)(void *resource),
+    const char  *file,
+    int          line
 );
 
 /** Remove a resource by handle. NULL-safe: handle==0 is accepted

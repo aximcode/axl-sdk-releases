@@ -99,6 +99,40 @@ AXL converts internally when calling UEFI APIs. The conversion
 functions are exposed for code that needs direct UEFI protocol
 interop (e.g., drivers using `<uefi/axl-uefi.h>`).
 
+## Memory Ownership — `axl_malloc` vs `AllocatePool`
+
+Dogfood the AXL allocator: **all ordinary heap allocation uses
+`axl_malloc` / `axl_free`** (and `AXL_AUTO_FREE` / `AXL_AUTOPTR` for
+scoped lifetimes). `axl_malloc` is leak-tracked and reclaimed at app
+exit, which is exactly what you want for working buffers, parsed
+structures, string builders, and anything whose lifetime ends with the
+program.
+
+Call the firmware allocator (`gBS->AllocatePool` / `AllocatePages` via
+`axl_bs()`) **only** when the memory must be owned by the firmware
+rather than by AXL — i.e. it must outlive the calling image or is
+handed to a UEFI service that retains it:
+
+- a device path passed to `gBS->LoadImage` as `DevicePath`;
+- a protocol interface (or its backing buffer) installed on a handle
+  via `InstallProtocolInterface` — especially on a **resident driver**
+  handle that outlives the launcher that installed it;
+- `LoadOptions` / `LoadedImage->FilePath` and similar firmware-read
+  fields.
+
+Using `axl_malloc` for those is a use-after-free: the leak tracker
+reclaims the block when the launcher exits while the firmware still
+references it. Conversely, memory the firmware allocated for you
+(`LocateHandleBuffer`, `ProtocolsPerHandle`, `QueryMode`,
+`GetMemoryMap`, `Usb*Descriptor`, …) must be released with
+`gBS->FreePool`, never `axl_free` — the two allocators are distinct
+pools. Never cross the streams: free firmware memory with `FreePool`
+and AXL memory with `axl_free`.
+
+The base layer is the exception that proves the rule: `src/mem/` and
+the native backend implement `axl_malloc` *on top of* `AllocatePages`,
+so they call the firmware allocator directly by necessity.
+
 ## File Naming
 
 | Element | Convention | Example |

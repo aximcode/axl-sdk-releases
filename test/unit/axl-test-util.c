@@ -3258,19 +3258,20 @@ test_driver_load_buffer(void)
 {
     AxlDriverHandle h = (AxlDriverHandle)0xdeadbeef;
 
-    /* Argument validation. *out_handle should not be touched on
-       early-return — exposes accidental writes through a stale
-       pointer. */
+    /* Argument validation. The documented contract clears *out_handle to
+       NULL on every failure (arg-validation and LoadImage alike), so the
+       caller can never use a stale leftover value. */
     test_check(axl_driver_load_buffer(NULL, 100, &h) == AXL_ERR,
                "driver_load_buffer: rejects NULL buf");
-    test_check(h == (AxlDriverHandle)0xdeadbeef,
-               "driver_load_buffer: NULL buf leaves *out_handle untouched");
+    test_check(h == NULL,
+               "driver_load_buffer: NULL buf clears *out_handle");
 
+    h = (AxlDriverHandle)0xdeadbeef;
     static const unsigned char any_byte = 0;
     test_check(axl_driver_load_buffer(&any_byte, 0, &h) == AXL_ERR,
                "driver_load_buffer: rejects zero len");
-    test_check(h == (AxlDriverHandle)0xdeadbeef,
-               "driver_load_buffer: zero len leaves *out_handle untouched");
+    test_check(h == NULL,
+               "driver_load_buffer: zero len clears *out_handle");
 
     test_check(axl_driver_load_buffer(&any_byte, 1, NULL) == AXL_ERR,
                "driver_load_buffer: rejects NULL out_handle");

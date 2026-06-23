@@ -109,6 +109,15 @@ fire_cleanups(AxlLoop *loop)
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/* Registry destructor wrapper — passed to _axl_registry_add so the registry
+ * sweep frees the loop without statically referencing axl_loop_free (lets
+ * --gc-sections drop the loop from apps that never create one). */
+static void
+loop_registry_dtor(void *resource)
+{
+    axl_loop_free((AxlLoop *)resource);
+}
+
 AxlLoop *
 axl_loop_new_impl(const char *file, int line)
 {
@@ -149,7 +158,8 @@ axl_loop_new_impl(const char *file, int line)
      * TPL_NOTIFY-level key polling loop and starve TCP4). */
     loop->keypress_event = axl_backend_console_wait_for_key();
 
-    loop->_registry_handle = _axl_registry_add(AXL_RES_LOOP, loop, file, line);
+    loop->_registry_handle =
+        _axl_registry_add(AXL_RES_LOOP, loop, loop_registry_dtor, file, line);
 
     return loop;
 }

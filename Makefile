@@ -82,8 +82,14 @@ endif
 # carries only that 5% in its .efi. Disabling this would balloon every
 # tool binary by 50–80% (each .o member of libaxl.a brought in for one
 # referenced symbol pulls every other symbol in that .o along with it).
+# --version-script localizes every symbol but the entry point. Without it
+# `-shared` exports all globals into the dynamic symbol table and treats them
+# as --gc-sections roots, defeating dead-code elimination (a hello-world pulled
+# the whole ~110 KB runtime). A UEFI image needs no exports, so localizing lets
+# --gc-sections drop unreferenced code — ~66% smaller .efi. See efi-localize.ver.
+EFI_VERSION_SCRIPT = scripts/efi-localize.ver
 LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined \
-              --gc-sections
+              --gc-sections --version-script=$(EFI_VERSION_SCRIPT)
 
 CFLAGS_BASE = -std=gnu2x \
               -ffreestanding -fshort-wchar \
@@ -591,7 +597,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1267,6 +1273,22 @@ $(PREFIX)/driver-leak-test.efi: $(BUILDDIR)/driver-leak-test.o $(LINK_CRT0) $(PR
 	$(call LINK_EFI_APP,$(BUILDDIR)/driver-leak-test.o,$@)
 
 $(BUILDDIR)/driver-leak-test.o: test/integration/driver-leak-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build driver-identity-test.efi — buffer-loads driver.efi and asserts
+# the loaded image has a non-NULL, renderable device path (so the aa64
+# shell's `dh -p` / `dh -v` does not fault). Integration target for the
+# embedded-image-identity synthesis in src/util/axl-driver.c.
+# ===================================================================
+
+driver-identity-test: $(PREFIX)/driver-identity-test.efi
+	@echo "  Built: $(PREFIX)/driver-identity-test.efi"
+
+$(PREFIX)/driver-identity-test.efi: $(BUILDDIR)/driver-identity-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/driver-identity-test.o,$@)
+
+$(BUILDDIR)/driver-identity-test.o: test/integration/driver-identity-test.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

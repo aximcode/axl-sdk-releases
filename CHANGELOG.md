@@ -3,6 +3,64 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.4.0 — 2026-06-22
+
+### Added
+
+- **`AxlEmbeddedImageInfo` + `axl_driver_load_buffer_with_image_info` /
+  `axl_shared_driver_locate_with_image_info`.** Let a caller give a
+  buffer/embedded driver load a real loaded-image identity (file name,
+  optional `DeviceHandle`, optional Vendor() GUID prefix). `<axl/axl-driver.h>`,
+  `<axl/axl-shared-driver.h>`.
+- **`axl_driver_load_sibling(file_name, &handle)`.** Loads a driver
+  restricted to the running app's own directory (resolved from
+  `axl_app_image_path()`); rejects any `file_name` containing `/`, `\\`,
+  or `:` (`AXL_INVALID`) so it cannot escape the app directory, and
+  returns `AXL_NOT_FOUND` if no such file is staged beside the app. The
+  on-disk load gives it a real `MEDIA_FILEPATH` device path. `<axl/axl-driver.h>`.
+
+### Fixed
+
+- **Buffer/embedded driver loads no longer leave a NULL device path, so
+  the aarch64 shell's `dh -p` / `dh -v` don't fault on them.**
+  `axl_driver_load_buffer` calls `gBS->LoadImage` with `DevicePath=NULL`,
+  which left `LoadedImage->FilePath` and the handle's
+  `gEfiLoadedImageDevicePathProtocol` interface NULL. The aarch64 shell
+  dereferences the device-path pointer while rendering the handle and
+  raised a `Synchronous Exception` (x64's DEBUG shell hit an assert
+  too). AXL now reads the image's `ImageBase`/`ImageSize` back from
+  `EFI_LOADED_IMAGE_PROTOCOL` and synthesizes a
+  `MemoryMapped(...)/FilePath("\\<name>")` device path, installing it as
+  the loaded-image device path and pointing `FilePath` at the file node.
+  The plain `axl_driver_load_buffer` and `axl_shared_driver_locate` get
+  this automatically (the leaf name defaults to the driver/app name), so
+  existing consumers are fixed with no source change. `axl_driver_load_buffer`
+  now also clears `*out_handle` to NULL on argument-validation failure,
+  matching its documented contract and the new `_with_image_info`/sibling
+  entry points.
+
+### Changed
+
+- **UEFI images are now ~⅔ smaller** — a trivial app dropped from ~91 KB to
+  ~30 KB. Two compounding causes are fixed: (1) `axl-cc` did not pass
+  `--gc-sections` at link, so consumer builds did no dead-code elimination at
+  all; and (2) every `.efi` links `ld -shared`, which exported every `axl_*`
+  symbol into the dynamic symbol table and made it a `--gc-sections` root, so
+  even where gc ran it could drop nothing. A UEFI image needs no exported
+  symbols (the firmware enters via the PE header), so a linker version script
+  (`scripts/efi-localize.ver`) now localizes everything but the entry point,
+  and `axl-cc` passes `--gc-sections`. Together they let dead code finally be
+  collected: `.text` ~50 KB → ~17 KB, `.dynsym` ~9.3 KB → 48 B. Applies to
+  every image type (app, driver, `--minimal-runtime`), both arches; validated
+  across the full unit suite, drivers, C++, and async/TLS network tools.
+- **The tier-1 resource registry stores a per-entry destructor** instead of
+  switching on resource kind, and the runtime calls the default event loop
+  through function pointers armed on first use. This removes the always-linked
+  registry/cleanup's static references to `axl_loop_free` / `axl_event_free` /
+  etc., so `--gc-sections` can now drop the entire event-loop subsystem
+  (~8 KB `.text` + 6 KB `.bss`) from an app that never creates a loop. Internal
+  refactor; no API or behavior change.
+
 ## 2.3.1 — 2026-06-22
 
 ### Fixed

@@ -36,6 +36,14 @@ struct AxlArena {
 // Public API
 // ---------------------------------------------------------------------------
 
+/* Registry destructor wrapper (see _axl_registry_add) — frees the arena
+ * without the registry statically referencing axl_arena_free. */
+static void
+arena_registry_dtor(void *resource)
+{
+    axl_arena_free((AxlArena *)resource);
+}
+
 AxlArena *
 axl_arena_new_impl(size_t capacity, const char *file, int line)
 {
@@ -62,7 +70,7 @@ axl_arena_new_impl(size_t capacity, const char *file, int line)
     arena->capacity = capacity;
     arena->offset = 0;
     arena->_registry_handle = _axl_registry_add(AXL_RES_ARENA, arena,
-                                                file, line);
+                                                arena_registry_dtor, file, line);
 
     return arena;
 }

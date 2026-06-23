@@ -97,6 +97,56 @@ test_install_null_safety(void)
 }
 
 // ---------------------------------------------------------------------------
+// Buffer-load identity + app-dir-restricted load: safe-negative validation.
+//
+// Only the errors AXL's own validation produces BEFORE any firmware call are
+// asserted here (NULL / 0 / a name that could escape the app directory, and a
+// well-formed-but-absent sibling). A real LoadImage of a bogus blob is NOT
+// exercised — on UEFI that faults rather than returning cleanly
+// (feedback_uefi_firmware_test_hazards). The positive round-trip + the exact
+// synthesized device-path string live in the QEMU integration test
+// (test-driver-identity-qemu.sh).
+// ---------------------------------------------------------------------------
+
+static void
+test_buffer_identity_and_sibling(void)
+{
+    AxlDriverHandle h     = (AxlDriverHandle)0x1;  // sentinel: must be cleared on reject
+    unsigned char   blob[4] = { 'M', 'Z', 0, 0 };
+
+    // axl_driver_load_buffer_with_image_info argument validation.
+    test_check(axl_driver_load_buffer_with_image_info(NULL, 4, NULL, &h) == AXL_ERR,
+               "load_buffer_with_image_info: NULL buffer returns AXL_ERR");
+    test_check(axl_driver_load_buffer_with_image_info(blob, 0, NULL, &h) == AXL_ERR,
+               "load_buffer_with_image_info: zero length returns AXL_ERR");
+    test_check(axl_driver_load_buffer_with_image_info(blob, 4, NULL, NULL) == AXL_ERR,
+               "load_buffer_with_image_info: NULL out_handle returns AXL_ERR");
+
+    // axl_driver_load_sibling argument validation.
+    h = (AxlDriverHandle)0x1;
+    test_check(axl_driver_load_sibling(NULL, &h) == AXL_ERR,
+               "load_sibling: NULL file_name returns AXL_ERR");
+    test_check(h == NULL,
+               "load_sibling: rejected call clears *out_handle");
+    test_check(axl_driver_load_sibling("doDriver.efi", NULL) == AXL_ERR,
+               "load_sibling: NULL out_handle returns AXL_ERR");
+
+    // Path-escape guard: a bare basename only — no separator or drive prefix.
+    test_check(axl_driver_load_sibling("sub/doDriver.efi", &h) == AXL_INVALID,
+               "load_sibling: '/' in name returns AXL_INVALID");
+    test_check(axl_driver_load_sibling("sub\\doDriver.efi", &h) == AXL_INVALID,
+               "load_sibling: backslash in name returns AXL_INVALID");
+    test_check(axl_driver_load_sibling("fs0:doDriver.efi", &h) == AXL_INVALID,
+               "load_sibling: ':' in name returns AXL_INVALID");
+
+    // A well-formed bare name not present in the app's own directory:
+    // resolution succeeds, the file lookup does not. (The test EFI's
+    // directory has no 'definitely-not-here.efi'.)
+    test_check(axl_driver_load_sibling("definitely-not-here.efi", &h) == AXL_NOT_FOUND,
+               "load_sibling: well-formed missing sibling returns AXL_NOT_FOUND");
+}
+
+// ---------------------------------------------------------------------------
 // Type-B Driver Model binding — a synthetic "bus" protocol on a test-created
 // controller, driven by the firmware's real ConnectController / Disconnect.
 // ---------------------------------------------------------------------------
@@ -662,6 +712,7 @@ test_driver_main(int argc, char **argv)
 
     test_install_fresh_handle();
     test_install_null_safety();
+    test_buffer_identity_and_sibling();
     test_driver_binding();
     test_disconnect_handle_contract();
     test_driver_info();

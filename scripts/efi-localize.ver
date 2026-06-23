@@ -1,0 +1,25 @@
+/*
+ * efi-localize.ver — linker version script for AXL UEFI images.
+ *
+ * Every .efi is linked with `ld -shared` (the intermediate ELF the
+ * objcopy → PE/COFF step consumes). By default `-shared` puts every
+ * global symbol in the dynamic symbol table and treats it as a
+ * GC-sections root, so --gc-sections can never drop unreferenced
+ * library code — a hello-world dragged in the whole runtime (~110 KB).
+ *
+ * A UEFI image needs NO exported symbols: the firmware finds its entry
+ * point through the PE header (AddressOfEntryPoint), and nothing ever
+ * resolves a .efi's symbols dynamically. Localizing everything but the
+ * entry symbol lets --gc-sections drop all unreferenced code/data,
+ * cutting a trivial image ~66% and collapsing the dynamic symbol table.
+ *
+ * `_start` (the crt0 entry on both x64 and aarch64) is kept global as a
+ * belt-and-suspenders anchor for the ELF entry point; everything else
+ * is local and therefore eligible for garbage collection.
+ */
+{
+    global:
+        _start;
+    local:
+        *;
+};

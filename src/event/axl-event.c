@@ -70,6 +70,14 @@ event_is_live(const AxlEvent *e, const char *op)
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/* Registry destructor wrapper (see _axl_registry_add) — frees the event
+ * without the registry statically referencing axl_event_free. */
+static void
+event_registry_dtor(void *resource)
+{
+    axl_event_free((AxlEvent *)resource);
+}
+
 AxlEvent *
 axl_event_new_impl(const char *file, int line)
 {
@@ -87,7 +95,8 @@ axl_event_new_impl(const char *file, int line)
     }
     e->is_set = false;
     e->magic = AXL_EVENT_MAGIC;
-    e->_registry_handle = _axl_registry_add(AXL_RES_EVENT, e, file, line);
+    e->_registry_handle =
+        _axl_registry_add(AXL_RES_EVENT, e, event_registry_dtor, file, line);
     return e;
 }
 
