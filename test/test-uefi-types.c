@@ -268,5 +268,5 @@ test_guid_equal(void)
 {
     EFI_GUID a = gEfiTcp4ProtocolGuid;
     EFI_GUID b = gEfiTcp4ProtocolGuid;
-    (void)axl_guid_equal(&a, &b);
+    (void)axl_efi_guid_equal(&a, &b);
 }

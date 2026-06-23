@@ -37,10 +37,14 @@ and the `AXL_GUID` macro for initialization:
 AxlGuid my_guid = AXL_GUID(0x12345678, 0xabcd, 0xef01,
     0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01);
 
-if (axl_guid_cmp(&a, &b) == 0) {
+if (axl_guid_equal(&a, &b)) {
     // GUIDs are equal
 }
 ```
+
+`axl_guid_equal(&a, &b)` is the readable equality test; `axl_guid_cmp(&a,
+&b)` is its strcmp-style counterpart (0 if equal, negative/positive for a
+stable byte-lexicographic ordering) for keying sorted containers.
 
 ### Firmware Globals
 

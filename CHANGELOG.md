@@ -3,6 +3,52 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.5.0 — 2026-06-23
+
+### Added
+
+- **`<axl/axl-fw.h>` — AxlFw raw firmware-image parser.** Parses a raw `.fd`
+  / SPI-flash image into an owned FV → FFS → section tree (`axl_fw_open` /
+  `axl_fw_close`, cursor walk `axl_fw_root` / `axl_fw_node_first_child` /
+  `axl_fw_node_next_sibling`, accessors `axl_fw_node_kind` / `_type` / `_guid`
+  / `_data` / `_offset`, and `axl_fw_find`). Decodes GUIDED-LZMA and
+  uncompressed COMPRESSION sections and nested firmware volumes. The offline,
+  raw-bytes sibling of the runtime `<axl/axl-fv.h>`; backend-free, so the same
+  source builds for UEFI and the host.
+- **`fwtool` — firmware-image inspection CLI** (`list` / `extract` / `find`),
+  built both as a UEFI app and as a host binary. The host build extracts the
+  UEFI Shell from an OVMF/AAVMF image byte-identically to the Python
+  `extract-fv-shell.py`, and is now the preferred Shell-extraction tier in the
+  run-qemu harness (shedding the python3 dependency where a C toolchain is
+  present; Python and `uefiextract` remain as fallbacks).
+- **`AXL_COMPRESS_LZMA` in `<axl/axl-compress.h>`** — LZMA "alone" (`.lzma` /
+  EDK2 GUIDED-LZMA) encode + decode, backed by the vendored public-domain
+  7-Zip LZMA SDK (`deps/lzma/`).
+- **`axl_guid_equal(a, b)` in `<axl/axl-sys.h>`** — readable GUID equality test
+  (the 2-arg wrapper over `axl_guid_cmp`). Plus EFI_GUID-typed
+  `axl_efi_guid_cmp` / `axl_efi_guid_equal` for pure-UEFI code (generated UEFI
+  header).
+- **`AXL_REGEX_BRE` in `<axl/axl-regex.h>`** — POSIX Basic-RE syntax (the
+  grouping / interval / alternation / `+` / `?` metacharacters in their
+  backslashed forms; bare forms literal), with the common GNU-BRE extensions.
+  Default stays ERE.
+- **`axl_memchr()` in `<axl/axl-str.h>`** — `memchr` semantics (first byte
+  equal to `c` in the first `n` bytes, or NULL).
+- **`sed` — stream-editor tool** (POSIX + common GNU): `s///` with flags and
+  alternate delimiters, line / `$` / `/re/` addresses and ranges with `!`,
+  hold space, `N` / `n` / `d` / `p` / `a` / `r` / `y`, and the `-n` / `-e` /
+  `-f` / `-s` / `-z` / `-E` options. Input reads are bounded (64 MiB/record)
+  for untrusted input; `-z` reads NUL-delimited records.
+
+### Changed
+
+- **BREAKING: `axl_guid_cmp` now returns `int`, strcmp-style** (0 if equal, a
+  negative/positive value for a stable byte-lexicographic ordering) instead of
+  `bool` (true on equal). The old boolean form silently inverted the reading of
+  every call site (`if (axl_guid_cmp(a, b))` meant "if equal"). Replace such
+  uses with the new `axl_guid_equal(a, b)`, or compare `== 0`. All in-tree
+  consumers were updated.
+
 ## 2.4.0 — 2026-06-22
 
 ### Added

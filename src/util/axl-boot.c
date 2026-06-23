@@ -14,7 +14,7 @@
 #include <axl/axl-nvstore.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-sys.h>     /* axl_guid_cmp */
+#include <axl/axl-sys.h>     /* axl_guid_equal */
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("boot");

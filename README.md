@@ -290,6 +290,7 @@ ships these `.efi` binaries:
 | `find`     | Recursive file and directory finder — glob patterns (`--name '*.efi'`) and type filter (`--type f` or `d`). UEFI `find(1)` equivalent. |
 | `grep`     | Pattern search across files — case-insensitive (`-i`), line numbers (`-n`), match count (`-c`), recursive (`-r`). UEFI `grep(1)` equivalent. |
 | `hexdump`  | Hex/ASCII file viewer (`xxd`-style) — seekable with `--offset`/`--length`. |
+| `sed`      | Stream editor — POSIX sed(1) plus common GNU extensions (`s y d D p P n N h H g G x b t : a i c r w q Q = l`, ranges/`$`/`0,/re/`/`first~step`, `-n -e -f -E -s -z`). BRE by default (`-E` for ERE), with the `\xHH` escape. UEFI `sed(1)` equivalent. |
 | `ipmi`     | Stripped-down `ipmitool` built on AxlIpmi: `info`, `chassis status`/`power on\|off\|cycle\|reset`, `sel list`, `sdr list`, `sensor`, `fru list`, and raw command passthrough (`raw <netfn> <cmd> ...`). |
 | `lspci`    | PCI/PCIe device lister (UEFI `lspci(8)` equivalent) — `-s` BDF filter, `-d` VID:DID filter, `-n` numeric, `-v`/`-vv`/`-vvv` verbose, `-x`/`-xx`/`-xxx` hex dump, `-t` tree (PCI bridge topology). Decodes vendor/device/class names from `pci-ids.json5` sidecar (vendors[] + classes[] in one file). |
 | `lsusb`    | USB device lister (UEFI `lsusb(8)` equivalent) — `-s BBB[:DDD]`, `-d VID[:PID]`, `-n` numeric, `-v`/`-vv` verbose (per-interface class triplet + iManufacturer/iProduct/iSerial), `-t` tree (real USB hub-port topology). Decodes vendor/device names from `usb-ids.json5`. |

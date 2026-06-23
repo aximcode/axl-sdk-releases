@@ -84,6 +84,7 @@ AXL SDK
    modules/nvme
    modules/serial
    modules/fv
+   modules/fw
    modules/tpm
    modules/hii
    modules/ramdisk

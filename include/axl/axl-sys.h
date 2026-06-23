@@ -64,11 +64,17 @@ typedef struct {
 } AxlGuid;
 
 /**
- * @brief Compare two GUIDs for equality.
+ * @brief Compare two GUIDs, strcmp-style.
  *
- * @return true if equal.
+ * Byte-lexicographic comparison over the 16-byte GUID image. The
+ * ordering is stable but otherwise has no semantic meaning; it exists
+ * so GUIDs can key sorted containers. For a plain equality test use
+ * axl_guid_equal().
+ *
+ * @return 0 if equal, a negative value if @p a sorts before @p b, a
+ *     positive value if @p a sorts after @p b.
  */
-static inline bool
+static inline int
 axl_guid_cmp(
     const AxlGuid *a,
     const AxlGuid *b)
@@ -77,10 +83,26 @@ axl_guid_cmp(
     const uint8_t *pb = (const uint8_t *)b;
     for (size_t i = 0; i < sizeof(AxlGuid); i++) {
         if (pa[i] != pb[i]) {
-            return false;
+            return pa[i] < pb[i] ? -1 : 1;
         }
     }
-    return true;
+    return 0;
+}
+
+/**
+ * @brief Test two GUIDs for equality.
+ *
+ * Thin wrapper over axl_guid_cmp() — the readable form for the common
+ * equality check.
+ *
+ * @return true if @p a and @p b are equal.
+ */
+static inline bool
+axl_guid_equal(
+    const AxlGuid *a,
+    const AxlGuid *b)
+{
+    return axl_guid_cmp(a, b) == 0;
 }
 
 /**

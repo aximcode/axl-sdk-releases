@@ -86,6 +86,7 @@
 #include <axl/axl-smart.h>
 #include <axl/axl-serial.h>
 #include <axl/axl-fv.h>
+#include <axl/axl-fw.h>
 #include <axl/axl-tpm.h>
 #include <axl/axl-hii.h>
 #include <axl/axl-ramdisk.h>

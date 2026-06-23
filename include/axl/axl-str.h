@@ -264,6 +264,19 @@ axl_memcmp(
 );
 
 /**
+ * @brief Find the first byte equal to @a c in the first @a n bytes. Like memchr().
+ *
+ * @return pointer to the matching byte, or NULL if @a c is not present
+ *     in @a s[0..n).
+ */
+void *
+axl_memchr(
+    const void *s,  ///< buffer to search
+    int         c,  ///< byte value to find (taken as unsigned char)
+    size_t      n   ///< byte count
+);
+
+/**
  * @brief Find the first occurrence of @p needle in @p haystack.
  *
  * Like the GNU `memmem` extension. Linear byte-by-byte scan;

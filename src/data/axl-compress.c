@@ -2,8 +2,8 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-compress.c
-    AxlCompress one-shot codec — gzip (RFC 1952), zlib (RFC 1950), and
-    raw DEFLATE (RFC 1951).
+    AxlCompress one-shot codec — gzip (RFC 1952), zlib (RFC 1950), raw
+    DEFLATE (RFC 1951), plus LZMA 'alone' (.lzma / EDK2 GUIDED-LZMA).
 
     The DEFLATE core is the vendored sdefl/sinfl single-header codec
     (deps/sdefl). AXL owns the container framing and the integrity
@@ -24,19 +24,14 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>  /* axl_memcpy */
 
+#include "axl-compress-internal.h"
+
 #define SDEFL_IMPLEMENTATION
 #include "../../deps/sdefl/sdefl.h"
 
 #define SINFL_NO_SIMD
 #define SINFL_IMPLEMENTATION
 #include "../../deps/sdefl/sinfl.h"
-
-/* Upper bound on a single decompressed buffer. Caps both the gzip
-   ISIZE-driven allocation (a forged ISIZE can't trigger a multi-GB
-   alloc) and the unknown-size grow loop for zlib/raw (a decompression
-   bomb can't expand without limit). 512 MiB is far beyond any fixture
-   or tar.gz this library handles in a UEFI context. */
-#define AXL_COMPRESS_MAX_OUTPUT  (512u * 1024u * 1024u)
 
 /* gzip header FLG bits (RFC 1952 §2.3.1). */
 #define GZ_FTEXT     0x01
@@ -139,6 +134,12 @@ axl_compress(AxlCompressFormat fmt, const void *in, size_t in_len,
     *out_len = 0;
     if ((in == NULL && in_len != 0) || in_len > (size_t)INT_MAX) {
         return AXL_ERR;
+    }
+
+    /* LZMA uses its own codec path — not DEFLATE-based. Dispatch before
+       deflate_raw() so the ~830 KiB sdefl state is never allocated for it. */
+    if (fmt == AXL_COMPRESS_LZMA) {
+        return axl_lzma_compress(in, in_len, out, out_len, level);
     }
 
     uint8_t *defl = NULL;
@@ -405,6 +406,8 @@ axl_decompress(AxlCompressFormat fmt, const void *in, size_t in_len,
         return decompress_zlib(p, in_len, out, out_len);
     case AXL_COMPRESS_DEFLATE_RAW:
         return inflate_grow(p, in_len, out, out_len);
+    case AXL_COMPRESS_LZMA:
+        return axl_lzma_decompress(p, in_len, out, out_len);
     default:
         return AXL_ERR;
     }

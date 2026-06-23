@@ -880,15 +880,24 @@ TYPES_H_EPILOGUE = """\
 // EFI_TEXT_ATTR -- commented out in spec, hand-written here
 #define EFI_TEXT_ATTR(fg, bg)  ((fg) | ((bg) << 4))
 
+// EFI_GUID-typed GUID compare/equality for pure-UEFI code (no
+// <axl/axl-sys.h>); the public AxlGuid versions are axl_guid_cmp() and
+// axl_guid_equal() in axl-sys.h.
 static inline int
-axl_guid_equal(const EFI_GUID *a, const EFI_GUID *b)
+axl_efi_guid_cmp(const EFI_GUID *a, const EFI_GUID *b)
 {
     const UINT8 *pa = (const UINT8 *)a;
     const UINT8 *pb = (const UINT8 *)b;
     for (UINTN i = 0; i < sizeof(EFI_GUID); i++) {
-        if (pa[i] != pb[i]) return 0;
+        if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
     }
-    return 1;
+    return 0;
+}
+
+static inline BOOLEAN
+axl_efi_guid_equal(const EFI_GUID *a, const EFI_GUID *b)
+{
+    return (BOOLEAN)(axl_efi_guid_cmp(a, b) == 0);
 }
 """
 

@@ -686,6 +686,20 @@ test_memset(void)
 }
 
 static void
+test_memchr(void)
+{
+    const char *s = "a.b.c";
+    test_check(axl_memchr(s, '.', 5) == s + 1, "memchr: first '.' at index 1");
+    test_check(axl_memchr(s, 'c', 5) == s + 4, "memchr: last byte");
+    test_check(axl_memchr(s, 'z', 5) == NULL,  "memchr: absent -> NULL");
+    test_check(axl_memchr(s, 'c', 4) == NULL,  "memchr: respects the length bound");
+    /* The byte value is taken as unsigned char (>127 is matchable). */
+    unsigned char hi[3] = { 0x00, 0xC3, 0x00 };
+    test_check(axl_memchr(hi, 0xC3, 3) == (char *)hi + 1, "memchr: matches a high byte");
+    test_check(axl_memchr(hi, 0x00, 0) == NULL, "memchr: zero length finds nothing");
+}
+
+static void
 test_snprintf(void)
 {
     char buf[32];
@@ -1979,6 +1993,7 @@ test_strbuf_main(
     test_strncmp();
     test_memcpy();
     test_memset();
+    test_memchr();
     test_snprintf();
     test_snprintf_float();
     test_snprintf_exp_g();

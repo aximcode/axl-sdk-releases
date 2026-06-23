@@ -219,7 +219,7 @@ endef
 # ===================================================================
 
 CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD
-INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend
+INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend -Ideps/lzma
 
 # ===================================================================
 # Optional TLS support (AXL_TLS=1)
@@ -285,6 +285,11 @@ LIB_SOURCES = \
     src/data/axl-digest-sha256.c \
     src/data/axl-digest-crc.c \
     src/data/axl-compress.c \
+    src/data/axl-compress-lzma.c \
+    deps/lzma/LzmaDec.c \
+    deps/lzma/LzmaEnc.c \
+    deps/lzma/LzFind.c \
+    deps/lzma/CpuArch.c \
     src/data/axl-hmac.c \
     src/data/axl-pbkdf2.c \
     src/data/axl-bytes.c \
@@ -355,6 +360,7 @@ LIB_SOURCES = \
     src/smart/axl-smart.c \
     src/serial/axl-serial.c \
     src/fv/axl-fv.c \
+    src/fw/axl-fw.c \
     src/tpm/axl-tpm.c \
     src/tpm/axl-tpm-seal.c \
     src/hii/axl-hii.c \
@@ -744,6 +750,9 @@ $(BUILDDIR)/%.o: src/serial/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/fv/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(BUILDDIR)/%.o: src/fw/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(BUILDDIR)/%.o: src/tpm/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -781,6 +790,9 @@ $(BUILDDIR)/%.o: src/crt0/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/crt0/%.S | $(BUILDDIR)
 	$(CC) $(CFLAGS_BASE) -c $< -o $@
 
+$(BUILDDIR)/%.o: deps/lzma/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DZ7_ST -c $< -o $@
+
 ifdef AXL_TLS
 $(BUILDDIR)/%.o: deps/mbedtls/library/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -789,6 +801,30 @@ endif
 # Host tool: pe-set-debug (built with host compiler, not cross-compiler)
 $(PE_SET_DEBUG): scripts/pe-set-debug.c | $(BUILDDIR)
 	$(HOSTCC) -Wall -O2 -o $@ $<
+
+# Host tool: fwtool (HOSTCC, native — NOT the cross/EFI toolchain).
+#
+# Reuses the SAME backend-free parser + LZMA sources as the UEFI fwtool.efi,
+# so a golden test (test/integration/test-fwtool-host.sh) can prove the C
+# parser decodes real OVMF/AAVMF byte-for-byte identically to the reference
+# scripts/extract-fv-shell.py. The shim header (-include) maps AXL's leaf
+# primitives (alloc/memcpy/...) onto libc; -DAXL_HOSTED selects fwtool.c's
+# libc I/O path. -ffunction-sections + --gc-sections drops the gzip/zlib +
+# LZMA-encoder paths (and their axl_crc32/CpuArch references) that the
+# decode-only extract path never reaches, so no extra symbols need shimming.
+# -DZ7_ST matches the UEFI LZMA build (single-thread, no pthread).
+FWTOOL_HOST = $(BUILDDIR)/fwtool-host
+FWTOOL_HOST_SRCS = tools/fwtool.c src/fw/axl-fw.c src/data/axl-compress.c \
+    src/data/axl-compress-lzma.c \
+    deps/lzma/LzmaDec.c deps/lzma/LzmaEnc.c deps/lzma/LzFind.c
+$(FWTOOL_HOST): $(FWTOOL_HOST_SRCS) tools/fwtool-host-shim.h | $(BUILDDIR)
+	$(HOSTCC) -Wall -O2 -DAXL_HOSTED -DZ7_ST \
+	    -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	    -include tools/fwtool-host-shim.h -Iinclude -Ideps/lzma \
+	    -o $@ $(FWTOOL_HOST_SRCS)
+
+.PHONY: fwtool-host
+fwtool-host: $(FWTOOL_HOST)
 
 # `ar rcs` inserts-or-replaces members matching by basename — if a
 # source file is renamed or removed, its .o stays in the archive
@@ -1561,7 +1597,7 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
         AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
-        AxlTestHii AxlTestAuth
+        AxlTestHii AxlTestAuth AxlTestFw
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1614,12 +1650,13 @@ $(eval $(call BUILD_TEST,AxlTestScsi,axl-test-scsi))
 $(eval $(call BUILD_TEST,AxlTestSmart,axl-test-smart))
 $(eval $(call BUILD_TEST,AxlTestHii,axl-test-hii))
 $(eval $(call BUILD_TEST,AxlTestAuth,axl-test-auth))
+$(eval $(call BUILD_TEST,AxlTestFw,axl-test-fw))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart
+TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
 tools: all $(TOOL_EFIS) $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi

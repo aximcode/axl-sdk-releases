@@ -29,6 +29,17 @@
     in this version. Matching is byte-oriented and leftmost (Perl / `grep -P`
     priority, not POSIX leftmost-longest).
 
+    The default syntax is ERE (POSIX Extended, like `grep -E`). Pass
+    @ref AXL_REGEX_BRE for POSIX Basic syntax (like `grep`/`sed`): the
+    grouping, interval, alternation, and `+`/`?` metacharacters are their
+    backslashed forms (`\( \) \{ \} \| \+ \?`) and the bare forms are
+    literal; `^` is an anchor only at the start of the expression (or a
+    `\(`/`\|` subexpression) and `$` only at the end, literal elsewhere.
+    `\| \+ \?` are honored as the common GNU-BRE extensions. The two ERE
+    capabilities the Pike VM lacks are absent from BRE too: no in-pattern
+    backreferences, and alternation is leftmost-first, not POSIX
+    leftmost-longest.
+
     @code
     AXL_AUTOPTR(AxlRegex) re = axl_regex_new("[0-9]+", AXL_REGEX_DEFAULT);
     AxlMatch m;
@@ -60,6 +71,7 @@ typedef enum {
     AXL_REGEX_CASELESS  = 1u << 0,  ///< ASCII case-insensitive matching
     AXL_REGEX_MULTILINE = 1u << 1,  ///< `^`/`$` also match at `\n` boundaries
     AXL_REGEX_DOTALL    = 1u << 2,  ///< `.` also matches `\n`
+    AXL_REGEX_BRE       = 1u << 3,  ///< POSIX Basic RE syntax (default is ERE)
 } AxlRegexFlags;
 
 /// Match-time options, passed per search.

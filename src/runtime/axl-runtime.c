@@ -147,7 +147,7 @@ axl_efi_find_config_table(
        it has to walk. */
     const EFI_GUID *efi_guid = (const EFI_GUID *)guid;
     for (size_t i = 0; i < axl_st()->NumberOfTableEntries; i++) {
-        if (axl_guid_equal(&axl_st()->ConfigurationTable[i].VendorGuid, efi_guid)) {
+        if (axl_efi_guid_equal(&axl_st()->ConfigurationTable[i].VendorGuid, efi_guid)) {
             return axl_st()->ConfigurationTable[i].VendorTable;
         }
     }

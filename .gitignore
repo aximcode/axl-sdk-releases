@@ -3,6 +3,7 @@ Conf/
 build/
 out/
 deps/*
+!deps/lzma
 !deps/mbedtls
 !deps/stb
 !deps/freetype

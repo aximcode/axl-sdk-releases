@@ -570,7 +570,7 @@ test_handle_enum(void)
                    "handle_protocols: populate count matches count-only total");
         bool has_dp = false;
         for (size_t i = 0; i < np2 && i < 64; i++) {
-            if (axl_guid_cmp(&g_penum[i], &GUID_DEVICE_PATH)) {
+            if (axl_guid_equal(&g_penum[i], &GUID_DEVICE_PATH)) {
                 has_dp = true;
             }
         }

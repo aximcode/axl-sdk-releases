@@ -579,7 +579,7 @@ axl_net_protocol_name(const AxlGuid *guid, char *out, size_t cap)
     };
 
     for (size_t i = 0; i < sizeof(net_names) / sizeof(net_names[0]); i++) {
-        if (axl_guid_cmp((const AxlGuid *)net_names[i].guid, guid)) {
+        if (axl_guid_equal((const AxlGuid *)net_names[i].guid, guid)) {
             axl_strlcpy(out, net_names[i].name, cap);
             return AXL_OK;
         }
@@ -730,7 +730,7 @@ axl_protocol_guid_name(const AxlGuid *guid, char *out, size_t cap)
     };
 
     for (size_t i = 0; i < sizeof(proto_names) / sizeof(proto_names[0]); i++) {
-        if (axl_guid_cmp((const AxlGuid *)proto_names[i].guid, guid)) {
+        if (axl_guid_equal((const AxlGuid *)proto_names[i].guid, guid)) {
             axl_strlcpy(out, proto_names[i].name, cap);
             return AXL_OK;
         }

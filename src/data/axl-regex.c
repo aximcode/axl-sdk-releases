@@ -70,6 +70,7 @@ typedef struct Node {
 typedef struct {
     const char *start, *p, *end;
     int         ngroups;     /* groups assigned so far */
+    bool        bre;         /* POSIX Basic RE syntax (AXL_REGEX_BRE) */
     bool        err;
     size_t      err_off;
     const char *err_msg;
@@ -107,6 +108,20 @@ static void parser_free_nodes(Parser *s) {
 }
 static int ppeek(Parser *s) { return s->p < s->end ? (unsigned char)*s->p : -1; }
 static int pget(Parser *s) { return s->p < s->end ? (unsigned char)*s->p++ : -1; }
+
+/* Metacharacter token layer for the BRE/ERE split. The grouping, interval,
+   alternation, and `+`/`?` metacharacters are bare in ERE (`(`, `{`, `|`, …)
+   but backslashed in BRE (`\(`, `\{`, `\|`, …) — with the bare forms literal.
+   at_meta() asks "does the input here start the meta `m`?" in the current
+   syntax; take_meta() consumes it (1 byte in ERE, 2 in BRE). The recursive
+   descent reads identically in both modes by going through these. The bytes
+   `m` routed through here are exactly the ones that invert: ( ) { } | + ? */
+static bool at_meta(Parser *s, char m) {
+    if (s->bre)
+        return s->p + 1 < s->end && s->p[0] == '\\' && s->p[1] == m;
+    return s->p < s->end && s->p[0] == m;
+}
+static void take_meta(Parser *s) { s->p += s->bre ? 2 : 1; }
 
 static Node *parse_alt(Parser *s);
 
@@ -146,22 +161,36 @@ static Node *parse_class(Parser *s) {
     return n;
 }
 
-static Node *parse_atom(Parser *s) {
-    int c = ppeek(s);
-    if (c == '(') {
-        pget(s);
+static Node *parse_atom(Parser *s, bool at_start) {
+    /* Grouping: `( )` in ERE, `\( \)` in BRE. */
+    if (at_meta(s, '(')) {
+        take_meta(s);
         int grp = ++s->ngroups;
         if (grp > MAX_GROUPS) { perr(s, "too many capture groups"); }
         Node *body = parse_alt(s);
-        if (ppeek(s) == ')') pget(s); else perr(s, "unbalanced parenthesis");
+        if (at_meta(s, ')')) take_meta(s); else perr(s, "unbalanced parenthesis");
         Node *g = node_new(s, N_GROUP); g->group = grp; g->a = body;
         return g;
     }
+    if (at_meta(s, ')')) { perr(s, "unbalanced parenthesis"); return node_new(s, N_EMPTY); }
+    int c = ppeek(s);
     if (c == '[') return parse_class(s);
     if (c == '.') { pget(s); return node_new(s, N_ANY); }
-    if (c == '^') { pget(s); return node_new(s, N_BOL); }
-    if (c == '$') { pget(s); return node_new(s, N_EOL); }
-    if (c == ')') { perr(s, "unbalanced parenthesis"); return node_new(s, N_EMPTY); }
+    if (c == '^') {
+        /* ERE: `^` is always an anchor. BRE: an anchor only at the start of
+           the expression/subexpression; a literal `^` anywhere else. */
+        pget(s);
+        if (!s->bre || at_start) return node_new(s, N_BOL);
+        Node *n = node_new(s, N_LIT); n->ch = (uint8_t)'^'; return n;
+    }
+    if (c == '$') {
+        /* ERE: `$` is always an anchor. BRE: an anchor only at the end of the
+           expression/subexpression (next is end-of-pattern, `\)`, or `\|`). */
+        pget(s);
+        if (!s->bre || s->p >= s->end || at_meta(s, ')') || at_meta(s, '|'))
+            return node_new(s, N_EOL);
+        Node *n = node_new(s, N_LIT); n->ch = (uint8_t)'$'; return n;
+    }
     if (c == '\\') {
         pget(s);
         int e = pget(s);
@@ -201,7 +230,7 @@ static Node *node_clone(Parser *s, const Node *n) {
    `a{999999}` can't blow up the AST. @hi == -1 means unbounded. */
 static bool parse_interval(Parser *s, int *lo, int *hi) {
     enum { REP_MAX = 1024 };
-    pget(s);                              /* consume '{' */
+    take_meta(s);                         /* consume '{' (ERE) or '\{' (BRE) */
     int min = 0, max = 0, c;
     bool hmin = false, hmax = false, comma = false;
     while ((c = ppeek(s)) >= '0' && c <= '9') {
@@ -213,8 +242,8 @@ static bool parse_interval(Parser *s, int *lo, int *hi) {
             pget(s); hmax = true; max = max * 10 + (c - '0'); if (max > REP_MAX) max = REP_MAX;
         }
     }
-    if (ppeek(s) != '}') return false;    /* not an interval (e.g. a literal '{') */
-    pget(s);                              /* consume '}' */
+    if (!at_meta(s, '}')) return false;   /* not an interval (e.g. a literal '{') */
+    take_meta(s);                         /* consume '}' (ERE) or '\}' (BRE) */
     if (!hmin && !hmax) return false;     /* {} or {,} — treat '{' literally */
     if (!comma)     { *lo = min;            *hi = min; }   /* {n}   */
     else if (!hmax) { *lo = hmin ? min : 0; *hi = -1;  }   /* {n,}  */
@@ -230,11 +259,11 @@ static Node *node_cat(Parser *s, Node *left, Node *right) {
     return c;
 }
 
-static Node *parse_repeat(Parser *s) {
-    Node *a = parse_atom(s);
+static Node *parse_repeat(Parser *s, bool at_start) {
+    Node *a = parse_atom(s, at_start);
     for (;;) {
-        int c = ppeek(s);
-        if (c == '{') {
+        /* Interval: `{n,m}` in ERE, `\{n,m\}` in BRE. */
+        if (at_meta(s, '{')) {
             const char *save = s->p;
             int lo = 0, hi = 0;
             if (!parse_interval(s, &lo, &hi)) { s->p = save; break; }
@@ -254,11 +283,17 @@ static Node *parse_repeat(Parser *s) {
             a = seq ? seq : node_new(s, N_EMPTY);   /* {0} matches empty */
             continue;
         }
-        if (c != '*' && c != '+' && c != '?') break;
-        pget(s);
-        Kind k = (c == '*') ? N_STAR : (c == '+') ? N_PLUS : N_QUEST;
+        /* `*` is bare in both syntaxes; `+` and `?` are bare in ERE and the
+           backslashed `\+` / `\?` in BRE (the common GNU-BRE extension). */
+        Kind k;
+        if (ppeek(s) == '*')      { pget(s);      k = N_STAR;  }
+        else if (at_meta(s, '+')) { take_meta(s); k = N_PLUS;  }
+        else if (at_meta(s, '?')) { take_meta(s); k = N_QUEST; }
+        else break;
         Node *q = node_new(s, k); q->a = a;
-        if (ppeek(s) == '?') { pget(s); q->greedy = false; }  /* lazy */
+        /* Lazy suffix `?` is an ERE-only convenience — POSIX BRE has no
+           non-greedy form, so don't consume a following `\?` as a modifier. */
+        if (!s->bre && ppeek(s) == '?') { pget(s); q->greedy = false; }
         a = q;
     }
     return a;
@@ -266,8 +301,10 @@ static Node *parse_repeat(Parser *s) {
 
 static Node *parse_cat(Parser *s) {
     Node *left = NULL;
-    while (ppeek(s) != -1 && ppeek(s) != '|' && ppeek(s) != ')') {
-        Node *r = parse_repeat(s);
+    bool first = true;   /* first atom of the branch — where a BRE `^` anchors */
+    while (ppeek(s) != -1 && !at_meta(s, '|') && !at_meta(s, ')')) {
+        Node *r = parse_repeat(s, first);
+        first = false;
         if (s->err) break;   /* r is pool-owned; freed in parser_free_nodes */
         if (!left) left = r;
         else { Node *c = node_new(s, N_CAT); c->a = left; c->b = r; left = c; }
@@ -277,8 +314,8 @@ static Node *parse_cat(Parser *s) {
 
 static Node *parse_alt(Parser *s) {
     Node *left = parse_cat(s);
-    while (ppeek(s) == '|') {
-        pget(s);
+    while (at_meta(s, '|')) {   /* `|` in ERE, `\|` in BRE (GNU extension) */
+        take_meta(s);
         Node *right = parse_cat(s);
         Node *a = node_new(s, N_ALT); a->a = left; a->b = right; left = a;
     }
@@ -406,6 +443,7 @@ axl_regex_new_full(const char *pattern, uint32_t flags, AxlRegexError *err)
     }
     Parser s = { 0 };
     s.start = pattern; s.p = pattern; s.end = pattern + axl_strlen(pattern);
+    s.bre = (flags & AXL_REGEX_BRE) != 0;
     Node *ast = parse_alt(&s);
     if (!s.err && s.p != s.end) perr(&s, "unexpected character");
     if (s.err) {

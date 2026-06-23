@@ -14,8 +14,9 @@
  * HTTP gzip, and file compression compose for free — is planned on top
  * of these.)
  *
- * Format coverage: GZIP, ZLIB, and raw DEFLATE. LZ4 may follow; zstd /
- * xz are deliberately out of scope (their encoders dwarf a UEFI tool).
+ * Format coverage: GZIP, ZLIB, raw DEFLATE, and LZMA "alone" (.lzma /
+ * GUIDED-LZMA). LZ4 may follow; zstd / xz are deliberately out of scope
+ * (their encoders dwarf a UEFI tool).
  *
  * @code
  * void  *gz;
@@ -45,7 +46,11 @@ extern "C" {
 typedef enum {
     AXL_COMPRESS_GZIP        = 0,  /**< gzip (RFC 1952): magic + CRC-32 + size */
     AXL_COMPRESS_ZLIB        = 1,  /**< zlib (RFC 1950): 2-byte header + Adler-32 */
-    AXL_COMPRESS_DEFLATE_RAW = 2   /**< bare DEFLATE (RFC 1951): no header/trailer */
+    AXL_COMPRESS_DEFLATE_RAW = 2,  /**< bare DEFLATE (RFC 1951): no header/trailer */
+    AXL_COMPRESS_LZMA        = 3   /**< LZMA "alone" (.lzma): 1-byte props + 4-byte
+                                        dict size + 8-byte uncompressed size + data.
+                                        Matches EDK2 GUIDED-LZMA (EE4E5898-…) and
+                                        Python lzma FORMAT_ALONE. Encode + decode. */
 } AxlCompressFormat;
 
 /**

@@ -731,7 +731,7 @@ thunk_get_info(
         return EFI_INVALID_PARAMETER;
     }
 
-    if (axl_guid_cmp((const AxlGuid *)info_type,
+    if (axl_guid_equal((const AxlGuid *)info_type,
                      (const AxlGuid *)&gEfiFileInfoGuid)) {
         AxlFsEntry info = {
             .struct_size = sizeof(info),
@@ -741,11 +741,11 @@ thunk_get_info(
         if (s != AXL_FS_OK) return status_to_efi(s);
         return write_efi_file_info(&info, buffer_size, buffer);
     }
-    if (axl_guid_cmp((const AxlGuid *)info_type,
+    if (axl_guid_equal((const AxlGuid *)info_type,
                      (const AxlGuid *)&gEfiFileSystemInfoGuid)) {
         return get_volume_info(self->pub, buffer_size, buffer);
     }
-    if (axl_guid_cmp((const AxlGuid *)info_type,
+    if (axl_guid_equal((const AxlGuid *)info_type,
                      (const AxlGuid *)&gEfiFileSystemVolumeLabelInfoIdGuid)) {
         return get_volume_label(self->pub, buffer_size, buffer);
     }
@@ -763,7 +763,7 @@ thunk_set_info(
     FileThunk *self = FILE_FROM_EFI(this);
     if (self->dead || self->pub == NULL) return EFI_DEVICE_ERROR;
     if (info_type == NULL || buffer == NULL) return EFI_INVALID_PARAMETER;
-    if (!axl_guid_cmp((const AxlGuid *)info_type,
+    if (!axl_guid_equal((const AxlGuid *)info_type,
                       (const AxlGuid *)&gEfiFileInfoGuid)) {
         return EFI_UNSUPPORTED;
     }

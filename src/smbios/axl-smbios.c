@@ -132,9 +132,9 @@ smbios_locate_entry_points(
 
     for (size_t i = 0; i < axl_st()->NumberOfTableEntries; i++) {
         EFI_GUID *guid = &axl_st()->ConfigurationTable[i].VendorGuid;
-        if (axl_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
+        if (axl_efi_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
             smbios3 = axl_st()->ConfigurationTable[i].VendorTable;
-        } else if (axl_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
+        } else if (axl_efi_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
             smbios2 = axl_st()->ConfigurationTable[i].VendorTable;
         }
     }
@@ -404,9 +404,9 @@ axl_smbios_version(
 
     for (size_t i = 0; i < axl_st()->NumberOfTableEntries; i++) {
         EFI_GUID *guid = &axl_st()->ConfigurationTable[i].VendorGuid;
-        if (axl_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
+        if (axl_efi_guid_equal(guid, &SMBIOS3_TABLE_GUID)) {
             smbios3 = axl_st()->ConfigurationTable[i].VendorTable;
-        } else if (axl_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
+        } else if (axl_efi_guid_equal(guid, &SMBIOS_TABLE_GUID)) {
             smbios2 = axl_st()->ConfigurationTable[i].VendorTable;
         }
     }

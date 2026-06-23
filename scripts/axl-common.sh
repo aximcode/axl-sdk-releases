@@ -412,9 +412,34 @@ find_shell_efi() {
     tmpdir=$(mktemp -d)
     local pe_body=""
 
-    # 4a. Dependency-free extraction (preferred — no external tool).
+    # 4a'. Native host fwtool — the C build of the AXL firmware parser
+    #      (byte-identical to the Python tier below, but with no python3
+    #      dependency). Preferred extractor; if the host toolchain can't
+    #      build it, this tier falls through cleanly to the Python (4a'')
+    #      and uefiextract (4b) tiers, so minimal hosts still work.
+    local scripts_dir project_root fwtool_host
+    scripts_dir="$(dirname "${BASH_SOURCE[0]}")"
+    project_root="$(cd "$scripts_dir/.." && pwd)"
+    fwtool_host="$project_root/out/native-x64/build/fwtool-host"
+    if [[ ! -x "$fwtool_host" ]]; then
+        make -C "$project_root" ARCH=x64 fwtool-host >/dev/null 2>&1 || true
+    fi
+    if [[ -x "$fwtool_host" ]]; then
+        local fv_shell="$tmpdir/Shell.efi"
+        for fw_candidate in "${fw_candidates[@]}"; do
+            if "$fwtool_host" extract "$fw_candidate" "$_SHELL_GUID" -o "$fv_shell" >/dev/null 2>&1 \
+                && head -c2 "$fv_shell" | grep -q "MZ"; then
+                pe_body="$fv_shell"
+                log_info "Extracted Shell.efi for $arch via native fwtool"
+                break
+            fi
+        done
+    fi
+
+    # 4a''. Dependency-free Python extraction (fallback when fwtool is
+    #       unavailable — e.g. a host with no C toolchain).
     local extractor="$(dirname "${BASH_SOURCE[0]}")/extract-fv-shell.py"
-    if [[ -f "$extractor" ]] && command -v python3 &>/dev/null; then
+    if [[ -z "$pe_body" ]] && [[ -f "$extractor" ]] && command -v python3 &>/dev/null; then
         local fv_shell="$tmpdir/Shell.efi"
         for fw_candidate in "${fw_candidates[@]}"; do
             if python3 "$extractor" "$fw_candidate" -o "$fv_shell" 2>/dev/null \

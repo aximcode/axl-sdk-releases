@@ -14,7 +14,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
-#include <axl/axl-sys.h>   /* axl_guid_cmp */
+#include <axl/axl-sys.h>   /* axl_guid_equal */
 
 AXL_LOG_DOMAIN("acpi");
 
@@ -23,7 +23,7 @@ AXL_LOG_DOMAIN("acpi");
 // ---------------------------------------------------------------------------
 
 /* Stored as AxlGuid (binary-compatible with EFI_GUID) so the lookup
-   uses axl_guid_cmp instead of a hand-rolled byte compare. */
+   uses axl_guid_equal instead of a hand-rolled byte compare. */
 static const AxlGuid ACPI_20_GUID = AXL_GUID(
     0x8868E871, 0xE4F1, 0x11D3,
     0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81);
@@ -88,10 +88,10 @@ find_rsdp(
 
     for (size_t i = 0; i < axl_st()->NumberOfTableEntries; i++) {
         const AxlGuid *g = (const AxlGuid *)&axl_st()->ConfigurationTable[i].VendorGuid;
-        if (axl_guid_cmp(g, &ACPI_20_GUID)) {
+        if (axl_guid_equal(g, &ACPI_20_GUID)) {
             return axl_st()->ConfigurationTable[i].VendorTable;
         }
-        if (rsdp_10 == NULL && axl_guid_cmp(g, &ACPI_10_GUID)) {
+        if (rsdp_10 == NULL && axl_guid_equal(g, &ACPI_10_GUID)) {
             rsdp_10 = axl_st()->ConfigurationTable[i].VendorTable;
         }
     }

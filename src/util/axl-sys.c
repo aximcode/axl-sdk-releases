@@ -301,7 +301,7 @@ vendor_match_cb(uint8_t type, uint8_t subtype, const void *node, void *user)
     if (type == HARDWARE_DEVICE_PATH && subtype == HW_VENDOR_DP) {
         VendorMatchCtx *c = (VendorMatchCtx *)user;
         const VENDOR_DEVICE_PATH *v = (const VENDOR_DEVICE_PATH *)node;
-        if (axl_guid_cmp((const AxlGuid *)&v->Guid, c->guid)) {
+        if (axl_guid_equal((const AxlGuid *)&v->Guid, c->guid)) {
             c->found = true;
             return 1;  /* stop */
         }

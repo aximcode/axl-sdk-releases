@@ -3030,19 +3030,25 @@ test_guid_v5(void)
                "guid_v5: returns AXL_OK on valid args");
     test_check(axl_guid_v5(&ns_a, "axl-test", &g2) == AXL_OK,
                "guid_v5: second call succeeds");
-    test_check(axl_guid_cmp(&g1, &g2),
+    test_check(axl_guid_equal(&g1, &g2),
                "guid_v5: deterministic — same inputs yield same GUID");
+    test_check(axl_guid_cmp(&g1, &g2) == 0,
+               "guid_cmp: equal GUIDs compare 0");
 
     /* Different name in same namespace -> different GUID. */
     test_check(axl_guid_v5(&ns_a, "axl-test-other", &g3) == AXL_OK,
                "guid_v5: different name accepted");
-    test_check(!axl_guid_cmp(&g1, &g3),
+    test_check(!axl_guid_equal(&g1, &g3),
                "guid_v5: distinct name yields distinct GUID");
+    test_check(axl_guid_cmp(&g1, &g3) != 0,
+               "guid_cmp: distinct GUIDs compare nonzero");
+    test_check((axl_guid_cmp(&g1, &g3) < 0) == (axl_guid_cmp(&g3, &g1) > 0),
+               "guid_cmp: antisymmetric sign");
 
     /* Same name in different namespace -> different GUID. */
     test_check(axl_guid_v5(&ns_b, "axl-test", &g4) == AXL_OK,
                "guid_v5: different namespace accepted");
-    test_check(!axl_guid_cmp(&g1, &g4),
+    test_check(!axl_guid_equal(&g1, &g4),
                "guid_v5: distinct namespace yields distinct GUID");
 
     /* RFC 4122 §4.3 shape: version 5 in high nibble of byte 6,
@@ -3084,12 +3090,12 @@ test_service_guid(void)
                "service_guid: returns AXL_OK with valid svc");
     test_check(axl_service_guid(&svc_a, &ga2) == AXL_OK,
                "service_guid: second call succeeds");
-    test_check(axl_guid_cmp(&ga, &ga2),
+    test_check(axl_guid_equal(&ga, &ga2),
                "service_guid: same descriptor yields same GUID");
 
     test_check(axl_service_guid(&svc_b, &gb) == AXL_OK,
                "service_guid: distinct name accepted");
-    test_check(!axl_guid_cmp(&ga, &gb),
+    test_check(!axl_guid_equal(&ga, &gb),
                "service_guid: distinct name yields distinct GUID");
 
     test_check(axl_service_guid(NULL, &dummy) == AXL_ERR,

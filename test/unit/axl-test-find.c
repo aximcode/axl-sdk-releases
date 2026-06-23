@@ -416,6 +416,109 @@ test_regex_interval(void)
 }
 
 static void
+test_regex_bre(void)
+{
+    AxlMatch m;
+    const uint32_t B = AXL_REGEX_BRE;
+    const uint32_t A = AXL_REGEX_MATCH_ANCHORED;
+
+    // BRE: the grouping / alternation / `+` / `?` / interval metacharacters
+    // are LITERAL in their bare form (the inverse of ERE).
+    AXL_AUTOPTR(AxlRegex) lp = axl_regex_new("a+b", B);
+    test_check(axl_regex_search_buf(lp, "a+b", 3, 0, A, &m) && m.length == 3,
+               "bre: bare '+' is literal (a+b)");
+    AXL_AUTOPTR(AxlRegex) lg = axl_regex_new("(x)", B);
+    test_check(axl_regex_search_buf(lg, "(x)", 3, 0, A, &m) && m.length == 3,
+               "bre: bare '( )' are literal");
+    AXL_AUTOPTR(AxlRegex) la = axl_regex_new("a|b", B);
+    test_check(axl_regex_search_buf(la, "a|b", 3, 0, A, &m) && m.length == 3,
+               "bre: bare '|' is literal");
+    AXL_AUTOPTR(AxlRegex) lb = axl_regex_new("a{2}", B);
+    test_check(axl_regex_search_buf(lb, "a{2}", 4, 0, A, &m) && m.length == 4,
+               "bre: bare '{2}' is literal");
+
+    // BRE: the backslashed forms are the metacharacters.
+    AXL_AUTOPTR(AxlRegex) bp = axl_regex_new("a\\+", B);
+    test_check(axl_regex_search_buf(bp, "aaa", 3, 0, A, &m) && m.length == 3,
+               "bre: '\\+' is one-or-more");
+    test_check(!axl_regex_search_buf(bp, "b", 1, 0, A, &m),
+               "bre: '\\+' needs at least one");
+    AXL_AUTOPTR(AxlRegex) bq = axl_regex_new("a\\?b", B);
+    test_check(axl_regex_search_buf(bq, "b", 1, 0, A, &m) && m.length == 1,
+               "bre: '\\?' makes the atom optional");
+    AXL_AUTOPTR(AxlRegex) bg = axl_regex_new("\\(ab\\)\\{2\\}", B);
+    test_check(axl_regex_capture_count(bg) == 1, "bre: '\\( \\)' is a capture group");
+    test_check(axl_regex_search_buf(bg, "abab", 4, 0, A, &m) && m.length == 4,
+               "bre: '\\( \\)' + '\\{2\\}' repeats the group");
+    AXL_AUTOPTR(AxlRegex) ba = axl_regex_new("a\\|b", B);
+    test_check(axl_regex_search_buf(ba, "b", 1, 0, A, &m) && m.length == 1,
+               "bre: '\\|' is alternation (GNU ext)");
+
+    // BRE: `^` anchors only at the start, `$` only at the end; literal elsewhere.
+    AXL_AUTOPTR(AxlRegex) cm = axl_regex_new("a^b", B);
+    test_check(axl_regex_search_buf(cm, "a^b", 3, 0, A, &m) && m.length == 3,
+               "bre: mid-pattern '^' is literal");
+    AXL_AUTOPTR(AxlRegex) dm = axl_regex_new("a$b", B);
+    test_check(axl_regex_search_buf(dm, "a$b", 3, 0, A, &m) && m.length == 3,
+               "bre: mid-pattern '$' is literal");
+    AXL_AUTOPTR(AxlRegex) sa = axl_regex_new("^a", B);
+    test_check(axl_regex_search_buf(sa, "aXa", 3, 0, 0, &m) && m.start == 0,
+               "bre: leading '^' still anchors");
+    AXL_AUTOPTR(AxlRegex) ea = axl_regex_new("a$", B);
+    test_check(axl_regex_search_buf(ea, "Xa", 2, 0, 0, &m) && m.start == 1,
+               "bre: trailing '$' still anchors");
+
+    // Corpus shapes: `^.\{N\}` and the `.*:<space>` head-strip.
+    AXL_AUTOPTR(AxlRegex) cd = axl_regex_new("^.\\{2\\}", B);
+    test_check(axl_regex_search_buf(cd, "abXX", 4, 0, A, &m) && m.length == 2,
+               "bre: '^.\\{2\\}' anchored any-two");
+    AXL_AUTOPTR(AxlRegex) hs = axl_regex_new(".*: ", B);
+    test_check(axl_regex_search_buf(hs, "Tag: X", 6, 0, 0, &m)
+               && m.start == 0 && m.length == 5,
+               "bre: '.*: ' greedy head strip (corpus s/.*:\\x20//)");
+
+    // ERE regression — the SAME backslash sequences invert under DEFAULT.
+    AXL_AUTOPTR(AxlRegex) ep = axl_regex_new("a+", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(ep, "aaa", 3, 0, A, &m) && m.length == 3,
+               "ere: bare '+' is one-or-more (unchanged)");
+    AXL_AUTOPTR(AxlRegex) el = axl_regex_new("a\\+", AXL_REGEX_DEFAULT);
+    test_check(axl_regex_search_buf(el, "a+", 2, 0, A, &m) && m.length == 2,
+               "ere: '\\+' is a literal '+' (unchanged)");
+
+    // A leading '*' (no preceding atom) is an ordinary character in both modes.
+    AXL_AUTOPTR(AxlRegex) ls = axl_regex_new("*ab", B);
+    test_check(axl_regex_search_buf(ls, "*ab", 3, 0, A, &m) && m.length == 3,
+               "bre: leading '*' is a literal");
+
+    // '\{n,m\}' range form (the comma-bearing parse_interval path) under BRE.
+    AXL_AUTOPTR(AxlRegex) rg = axl_regex_new("a\\{2,3\\}", B);
+    test_check(axl_regex_search_buf(rg, "aaaa", 4, 0, A, &m) && m.length == 3,
+               "bre: '\\{2,3\\}' is greedy up to 3");
+    test_check(axl_regex_search_buf(rg, "aa", 2, 0, A, &m) && m.length == 2,
+               "bre: '\\{2,3\\}' accepts the min 2");
+    test_check(!axl_regex_search_buf(rg, "a", 1, 0, A, &m),
+               "bre: '\\{2,3\\}' rejects 1");
+
+    // '\( \)' is a real capture group — verify the captured span, not just count.
+    AXL_AUTOPTR(AxlRegex) cg = axl_regex_new("\\(ab\\)c", B);
+    AxlMatch g[2];
+    AxlMemReader mr;
+    axl_mem_reader_init(&mr, "abc", 3);
+    test_check(axl_regex_search_captures(cg, &mr.reader, 0, AXL_REGEX_MATCH_DEFAULT, g, 2)
+               && g[1].start == 0 && g[1].length == 2,
+               "bre: '\\(ab\\)' captures the span 'ab'");
+
+    // '\|' alternation: the first alternative still matches, and ordering is
+    // leftmost-first (Perl priority) — 'foo' wins over 'foobar' at the same start.
+    AXL_AUTOPTR(AxlRegex) a1 = axl_regex_new("a\\|b", B);
+    test_check(axl_regex_search_buf(a1, "a", 1, 0, A, &m) && m.length == 1,
+               "bre: '\\|' first alternative matches");
+    AXL_AUTOPTR(AxlRegex) lf = axl_regex_new("\\(foo\\|foobar\\)", B);
+    test_check(axl_regex_search_buf(lf, "foobar", 6, 0, A, &m) && m.length == 3,
+               "bre: '\\|' is leftmost-first (foo wins)");
+}
+
+static void
 test_regex_errors(void)
 {
     AxlRegexError err = { 0 };
@@ -536,6 +639,7 @@ test_find_main(int argc, char **argv)
     test_regex_anchored();
     test_regex_notbol_noteol();
     test_regex_interval();
+    test_regex_bre();
     test_regex_flags();
     test_regex_errors();
     test_regex_reader_materialize();

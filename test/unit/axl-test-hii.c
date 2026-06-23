@@ -186,7 +186,7 @@ test_known_formset(void)
     AxlGuid expected = AXL_GUID(0x2a46715f, 0x3581, 0x4a55,
                                 0x8e, 0x73, 0x2b, 0x76,
                                 0x9a, 0xaa, 0x30, 0xc5);
-    test_check(axl_guid_cmp(&guid, &expected),
+    test_check(axl_guid_equal(&guid, &expected),
                "hii: 'RAM Disk Configuration' form-set GUID matches");
 
     AxlHiiQuestion one_of;
