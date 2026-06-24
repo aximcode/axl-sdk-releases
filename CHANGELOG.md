@@ -3,6 +3,21 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.6.1 — 2026-06-23
+
+### Fixed
+
+- **Shared-driver stdio bridge: use-after-free on a stale bridge.** A
+  resident driver's stdin consult dereferenced whatever bridge instance
+  `LocateProtocol` returned first. If a launcher exited without uninstalling
+  its bridge (any exit path that skips the CRT0 atexit uninstall), that stale
+  instance — older, so returned first — carried a dangling pipe
+  `SHELL_FILE_HANDLE`, and a subsequent warm pipe read `#GP`'d in the shell.
+  The driver-side lookup now enumerates every bridge instance, skips (and
+  uninstalls) any whose launcher image has exited via the `launcher_image`
+  liveness gate, and reads the newest live one — so a leaked bridge can no
+  longer crash a warm read.
+
 ## 2.6.0 — 2026-06-23
 
 ### Added

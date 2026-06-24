@@ -59,15 +59,16 @@ _native_arch="${_NATIVE_ARCH_MAP[$TEST_ARCH]:-x64}"
 
 make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-    stdio-bridge-fix stdio-bridge-self 2>&1 | tail -3
+    stdio-bridge-fix stdio-bridge-self stdio-bridge-leak 2>&1 | tail -3
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
 LAUNCHER="$NATIVE_DIR/stdio-bridge-fix.efi"
 SELF_LAUNCHER="$NATIVE_DIR/stdio-bridge-self.efi"
+LEAK_LAUNCHER="$NATIVE_DIR/stdio-bridge-leak.efi"
 
 # Skip-and-warn if the fixture could not be built/staged on this box
 # (matches the skip convention of the sibling driver tests).
-if [[ ! -f "$LAUNCHER" || ! -f "$SELF_LAUNCHER" ]]; then
+if [[ ! -f "$LAUNCHER" || ! -f "$SELF_LAUNCHER" || ! -f "$LEAK_LAUNCHER" ]]; then
     echo "WARN: stdio-bridge fixtures not built on this box; skipping."
     echo "Driver stdio-bridge test: SKIP"
     exit 0
@@ -75,6 +76,7 @@ fi
 
 test_add_efi "$LAUNCHER"
 test_add_efi "$SELF_LAUNCHER"
+test_add_efi "$LEAK_LAUNCHER"
 
 # Stage the < redirect input files. The first line is the value the
 # driver should echo back through the bridge. in2.txt feeds the
@@ -86,6 +88,22 @@ printf 'selfredir\nsecond line ignored\n' > "$TEST_STAGING/in2.txt"
     echo "@echo -off"
     echo "fs0:"
     echo "cd \\"
+    # STALE-BRIDGE / WARM-PATH USE-AFTER-FREE REGRESSION (consumer do.efi):
+    #   1. load the driver resident via a NON-stdin verb (clean launcher),
+    #   2. a leaker launcher installs the bridge with a PIPE StdIn then exits
+    #      WITHOUT uninstalling -> a STALE bridge whose stdin_h is a freed
+    #      pipe handle,
+    #   3. a warm self-locating launcher reads a pipe. The driver must SKIP
+    #      the stale (dead-launcher) bridge and read THIS launcher's input
+    #      ("warmpipe") instead of dereferencing the freed handle (#GP/#PF
+    #      in Shell.dll — the exact do.efi symptom).
+    # Runs FIRST so the stale instance is the OLDEST (returned first by a
+    # naive LocateProtocol) — the precise ordering that crashed do.efi.
+    echo "echo STALE_BEGIN"
+    echo "stdio-bridge-fix.efi emit"
+    echo "echo poison |a stdio-bridge-leak.efi"
+    echo "echo warmpipe |a stdio-bridge-self.efi echo"
+    echo "echo STALE_DONE"
     echo "echo PIPE_BEGIN"
     # `|a` is the UEFI shell's ASCII pipe: it feeds the LHS output to the
     # RHS StdIn as raw 8-bit bytes. The default `|` pipes UCS-2 (UTF-16LE),
@@ -145,6 +163,11 @@ self_pipe=$(self_section | grep -c '^GOT:selfhello$' || true)
 self_textpipe=$(self_section | grep -c '^GOT:selftext$' || true)
 self_redir=$(self_section | grep -c '^GOT:selfredir$' || true)
 
+# Stale-bridge regression: after a leaked (dead-launcher) bridge, the warm
+# read must produce THIS launcher's input — not crash on the freed handle.
+stale_warm=$(sed -n '/STALE_BEGIN/,/STALE_DONE/p' "$TEST_CLEAN_LOG" \
+    | grep -c '^GOT:warmpipe$' || true)
+
 # > probe — informational only. Disambiguate the source of DRIVEROUT:
 #   - between EMIT_BEGIN and TYPE_BEGIN  => printed to CONSOLE at the emit
 #     run; the `>` redirect did NOT capture the driver's StdOut.
@@ -160,6 +183,7 @@ printf "Results: pipe=%d textpipe=%d redir=%d noinput_eof=%d done=%d  (probe: em
     "$pipe" "$textpipe" "$redir" "$noinput" "$done_marker" "$emit_console" "$type_readback"
 printf "Self-locate (public install): pipe=%d textpipe=%d redir=%d\n" \
     "$self_pipe" "$self_textpipe" "$self_redir"
+printf "Stale-bridge warm read (no UAF): warmpipe=%d\n" "$stale_warm"
 
 # Record the > probe verdict explicitly for the task report.
 if [[ "$type_readback" -ge 1 ]]; then
@@ -173,7 +197,8 @@ fi
 # GREEN requires the three core cases: PIPE, < REDIRECT, no-regression EOF,
 # and that the shell reached STDIO_DONE (script ran to completion).
 if [[ "$pipe" -ge 1 && "$textpipe" -ge 1 && "$redir" -ge 1 && "$noinput" -ge 1 && "$done_marker" -ge 1 \
-      && "$self_pipe" -ge 1 && "$self_textpipe" -ge 1 && "$self_redir" -ge 1 ]]; then
+      && "$self_pipe" -ge 1 && "$self_textpipe" -ge 1 && "$self_redir" -ge 1 \
+      && "$stale_warm" -ge 1 ]]; then
     echo "Driver stdio-bridge test: OK"
     exit 0
 else

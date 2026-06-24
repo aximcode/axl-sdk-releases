@@ -13,7 +13,9 @@ typedef struct {
     AxlFileHandle  stdin_h;
     AxlFileHandle  stdout_h;
     AxlFileHandle  stderr_h;
-    void          *launcher_image;   /* EFI_HANDLE; reserved for a liveness check */
+    void          *launcher_image;   /* EFI_HANDLE; driver-side liveness gate — a
+                                        consult is skipped if this image has
+                                        exited (its stdin_h would be dangling) */
 } AxlStdioBridge;
 
 /* uuid c8f517d7-36cc-458d-98d6-b116825e30bf — fixed identity of the

@@ -1196,16 +1196,70 @@ axl_backend_stdio_bridge_uninstall(void)
     }
 }
 
-/* Live (uncached) lookup — only used on the no-local-shell-params (driver) path. */
+/* Is the bridge's launcher still a loaded image? The bridge interface
+   (&mBridge) and the StdIn handle it carries live in the launcher image; if
+   that launcher exited WITHOUT uninstalling, both are freed and reading
+   stdin_h would hand the shell a dangling SHELL_FILE_HANDLE (#GP in
+   Shell.dll). The atexit uninstall covers a normal `main` return / axl_exit,
+   but NOT gBS->Exit() (or a libc exit() routed to it) — a perfectly ordinary
+   termination that returns straight to firmware and skips CRT0 cleanup. So a
+   leaked instance is an expected case, not an exotic one. Gate every consult
+   on launcher_image still being present in the handle DB. A stale/garbage
+   handle value simply fails HandleProtocol and reports dead — the safe
+   answer. */
+static bool
+bridge_launcher_alive(
+    void  *launcher_image
+    )
+{
+    if (launcher_image == NULL) {
+        return false;
+    }
+    void *li = NULL;
+    EFI_GUID g = gEfiLoadedImageProtocolGuid;
+    return !EFI_ERROR(gBS->HandleProtocol(
+               (EFI_HANDLE)launcher_image, &g, &li))
+           && li != NULL;
+}
+
+/* Live (uncached) lookup — only used on the no-local-shell-params (driver)
+   path. Enumerates EVERY installed bridge instance and returns the StdIn of
+   the newest LIVE one (or NULL -> EOF when none are live), skipping any whose
+   launcher image has exited. A naive find-first dereferenced whatever
+   instance LocateProtocol returned first — when a prior launcher leaked a
+   stale bridge (older, so returned first), that was a freed pipe handle.
+   Stale instances are uninstalled in passing: a read intentionally self-heals
+   the firmware DB so leaks can't accumulate (UninstallProtocolInterface
+   matches the (guid, iface) pointer; it never dereferences the freed iface). */
 static AxlFileHandle
 bridge_lookup_stdin(void)
 {
-    void *iface = NULL;
-    if (axl_protocol_find_guid(&AXL_STDIO_BRIDGE_GUID, &iface) == AXL_OK
-        && iface != NULL) {
-        return ((AxlStdioBridge *)iface)->stdin_h;
+    EFI_GUID    guid    = *(EFI_GUID *)&AXL_STDIO_BRIDGE_GUID;
+    UINTN       count   = 0;
+    EFI_HANDLE *handles = NULL;
+    if (EFI_ERROR(gBS->LocateHandleBuffer(
+            ByProtocol, &guid, NULL, &count, &handles))
+        || count == 0 || handles == NULL) {
+        return NULL;
     }
-    return NULL;
+    AxlFileHandle live = NULL;
+    for (UINTN i = 0; i < count; i++) {
+        void *iface = NULL;
+        if (EFI_ERROR(gBS->HandleProtocol(handles[i], &guid, &iface))
+            || iface == NULL) {
+            continue;
+        }
+        AxlStdioBridge *b = (AxlStdioBridge *)iface;
+        if (!bridge_launcher_alive(b->launcher_image)) {
+            /* Dead launcher -> stale instance with a dangling stdin_h.
+               Drop it so it can't be returned again, then skip. */
+            gBS->UninstallProtocolInterface(handles[i], &guid, iface);
+            continue;
+        }
+        live = b->stdin_h;   /* DB order is oldest-first; newest live wins */
+    }
+    gBS->FreePool(handles);
+    return live;
 }
 
 AxlFileHandle
