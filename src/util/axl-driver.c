@@ -296,74 +296,112 @@ driver_build_image_dp(
     return (EFI_DEVICE_PATH_PROTOCOL *)out;
 }
 
-/* Per-handle table of synthesized loaded-image device paths, so
- * axl_driver_unload can uninstall the protocol interface AXL installed and
- * free the AllocatePool'd path. Without this, each load+unload cycle of a
- * buffer/embedded driver would leak the path and leave a stale protocol entry
- * on the handle that the firmware's own UnloadImage can't reclaim (it tries to
- * uninstall the original NULL interface, not ours). */
-#define IMAGE_DP_TABLE_SIZE 16
+/* Cross-image cleanup record for a synthesized loaded-image device path.
+ *
+ * A buffer/embedded load has no firmware device path, so
+ * driver_apply_image_identity synthesizes one, installs it as the handle's
+ * EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL, and points LoadedImage->FilePath at a
+ * standalone copy. axl_driver_unload must uninstall + free both BEFORE
+ * UnloadImage — otherwise the firmware's own unload matches its (stale/NULL)
+ * internal device-path pointer, not our interface, so ours is never removed
+ * and the handle survives carrying only the synth device path (it accumulates
+ * in `dh` on every load/unload cycle).
+ *
+ * The record lives ON the driver's image handle as a private protocol, NOT in
+ * a process-local table, because the shared-driver launcher pattern loads the
+ * driver in one (transient) image and unloads it from another: a per-image
+ * table in the loader is gone by unload time, so image_dp_release would find
+ * nothing and leak. Storing the record on the handle lets whichever image
+ * unloads the driver find and release it. The record and the device paths it
+ * owns are all firmware-pool allocations (AllocatePool), so they outlive the
+ * loader's exit.
+ *
+ * {d28ca292-1eb1-4972-b6d2-669f4346a6b2} — private to axl-sdk. */
+static const EFI_GUID AXL_IMAGE_DP_RECORD_GUID = {
+    0xd28ca292, 0x1eb1, 0x4972,
+    {0xb6, 0xd2, 0x66, 0x9f, 0x43, 0x46, 0xa6, 0xb2}
+};
+
 typedef struct {
-    EFI_HANDLE                handle;
     EFI_DEVICE_PATH_PROTOCOL *dp;        /* installed loaded-image device path */
     EFI_DEVICE_PATH_PROTOCOL *file_path; /* standalone copy set as li->FilePath */
-} ImageDpEntry;
-static ImageDpEntry mImageDpTable[IMAGE_DP_TABLE_SIZE];
+} AxlImageDpRecord;
+
+/* Uninstall the synthesized LoadedImageDevicePath from @p handle and free the
+ * device path + the standalone FilePath copy, returning the handle to its
+ * pre-synthesis state. Shared by image_dp_release (normal unload) and
+ * image_dp_track's failure rollback. Clears li->FilePath first so the firmware
+ * can't read/free a dangling pointer during UnloadImage. */
+static void
+image_dp_teardown(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
+                  EFI_DEVICE_PATH_PROTOCOL *file_path)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    if (axl_bs()->HandleProtocol(handle, &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+                                 (void **)&li) == EFI_SUCCESS && li != NULL) {
+        li->FilePath = NULL;
+    }
+    (void)axl_bs()->UninstallProtocolInterface(
+        handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp);
+    axl_bs()->FreePool(dp);
+    if (file_path != NULL) {
+        axl_bs()->FreePool(file_path);
+    }
+}
 
 static void
 image_dp_track(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
                EFI_DEVICE_PATH_PROTOCOL *file_path)
 {
-    for (size_t i = 0; i < IMAGE_DP_TABLE_SIZE; i++) {
-        if (mImageDpTable[i].handle == NULL) {
-            mImageDpTable[i].handle    = handle;
-            mImageDpTable[i].dp        = dp;
-            mImageDpTable[i].file_path = file_path;
-            return;
+    AxlImageDpRecord *rec = NULL;
+    if (axl_bs()->AllocatePool(EfiBootServicesData, sizeof(*rec),
+                               (void **)&rec) != EFI_SUCCESS || rec == NULL) {
+        rec = NULL;   /* AllocatePool may leave *rec untouched on failure */
+    } else {
+        rec->dp        = dp;
+        rec->file_path = file_path;
+        if (EFI_ERROR(axl_bs()->InstallProtocolInterface(
+                &handle, (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID,
+                EFI_NATIVE_INTERFACE, rec))) {
+            axl_bs()->FreePool(rec);
+            rec = NULL;
         }
     }
-    /* Table full: the path stays installed and would leak on unload. Bounded
-     * by the table size; warn rather than fail the (successful) load. */
-    axl_warning("driver load: image-dp table full; device path for handle "
-                "0x%llx will leak on unload",
-                (unsigned long long)(uintptr_t)handle);
+
+    /* Could not record the cleanup (OOM / install failure). Rather than leave
+     * an untracked synthesized device path installed — which would orphan the
+     * handle on unload, the very leak this record prevents — roll the identity
+     * back to firmware defaults. Best-effort: the handle simply loses its
+     * synthesized device path (only `dh -v` cosmetics degrade). */
+    if (rec == NULL) {
+        axl_warning("driver load: cannot record image-dp cleanup on handle "
+                    "0x%llx; rolling back synthesized device path",
+                    (unsigned long long)(uintptr_t)handle);
+        image_dp_teardown(handle, dp, file_path);
+    }
 }
 
 /* Uninstall + free the synthesized device path for @p handle, if any. Called
- * from axl_driver_unload BEFORE UnloadImage so our protocol entry is removed
- * cleanly (the firmware's own uninstall of the original NULL interface then
- * no-ops instead of mismatching). */
+ * from axl_driver_unload BEFORE UnloadImage so our protocol entries are removed
+ * cleanly (the firmware's own uninstall of its stale internal pointer then
+ * no-ops instead of mismatching). Works from any image — the record is read
+ * off the handle, not a process-local table. */
 static void
 image_dp_release(AxlDriverHandle handle)
 {
-    for (size_t i = 0; i < IMAGE_DP_TABLE_SIZE; i++) {
-        if (mImageDpTable[i].handle != (EFI_HANDLE)handle) {
-            continue;
-        }
-        EFI_DEVICE_PATH_PROTOCOL *dp        = mImageDpTable[i].dp;
-        EFI_DEVICE_PATH_PROTOCOL *file_path = mImageDpTable[i].file_path;
-
-        /* Clear li->FilePath (our standalone copy) before freeing so it can't
-         * dangle if the firmware reads/frees it during UnloadImage. */
-        EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
-        if (axl_bs()->HandleProtocol((EFI_HANDLE)handle,
-                                     &EFI_LOADED_IMAGE_PROTOCOL_GUID,
-                                     (void **)&li) == EFI_SUCCESS && li != NULL) {
-            li->FilePath = NULL;
-        }
-
-        (void)axl_bs()->UninstallProtocolInterface(
-            (EFI_HANDLE)handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp);
-        axl_bs()->FreePool(dp);
-        if (file_path != NULL) {
-            axl_bs()->FreePool(file_path);
-        }
-
-        mImageDpTable[i].handle    = NULL;
-        mImageDpTable[i].dp        = NULL;
-        mImageDpTable[i].file_path = NULL;
-        return;
+    AxlImageDpRecord *rec = NULL;
+    if (axl_bs()->HandleProtocol((EFI_HANDLE)handle,
+                                 (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID,
+                                 (void **)&rec) != EFI_SUCCESS || rec == NULL) {
+        return;   /* not a synthesized-device-path image — nothing to do */
     }
+
+    /* The record GUID is private and never opened via OpenProtocol, so this
+     * uninstall cannot be denied; freeing rec below is therefore safe. */
+    (void)axl_bs()->UninstallProtocolInterface(
+        (EFI_HANDLE)handle, (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID, rec);
+    image_dp_teardown((EFI_HANDLE)handle, rec->dp, rec->file_path);
+    axl_bs()->FreePool(rec);
 }
 
 /* Give a freshly buffer-loaded image a real identity so the shell never

@@ -603,7 +603,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1325,6 +1325,41 @@ $(PREFIX)/driver-identity-test.efi: $(BUILDDIR)/driver-identity-test.o $(LINK_CR
 	$(call LINK_EFI_APP,$(BUILDDIR)/driver-identity-test.o,$@)
 
 $(BUILDDIR)/driver-identity-test.o: test/integration/driver-identity-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build driver-parent-leak-test.efi — regression test for the
+# shared-driver cross-image "orphaned synthesized device path" leak.
+# The controller loads + starts the stdio-bridge-fix launcher (which
+# buffer-loads stdio-bridge-driver from its embedded blob then exits),
+# unloads the driver from a DIFFERENT image, and asserts no orphaned
+# LoadedImageDevicePath handle survives. Reuses the stdio-bridge
+# fixture, so it must be built alongside.
+# ===================================================================
+
+driver-parent-leak-test: $(PREFIX)/driver-parent-leak-test.efi stdio-bridge-fix
+	@echo "  Built: $(PREFIX)/driver-parent-leak-test.efi"
+
+$(PREFIX)/driver-parent-leak-test.efi: $(BUILDDIR)/driver-parent-leak-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/driver-parent-leak-test.o,$@)
+
+$(BUILDDIR)/driver-parent-leak-test.o: test/integration/driver-parent-leak-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build stdio-bridge-reap-test.efi — regression test for the
+# stdio-bridge dead-instance leak. Runs alongside stdio-bridge-leak.efi
+# (two shell-launched leakers) and asserts dead bridges are reaped (at
+# install and on axl_shared_driver_unload) rather than accumulating.
+# ===================================================================
+
+stdio-bridge-reap-test: $(PREFIX)/stdio-bridge-reap-test.efi stdio-bridge-leak
+	@echo "  Built: $(PREFIX)/stdio-bridge-reap-test.efi"
+
+$(PREFIX)/stdio-bridge-reap-test.efi: $(BUILDDIR)/stdio-bridge-reap-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/stdio-bridge-reap-test.o,$@)
+
+$(BUILDDIR)/stdio-bridge-reap-test.o: test/integration/stdio-bridge-reap-test.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

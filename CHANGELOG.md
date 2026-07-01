@@ -3,6 +3,33 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.6.2 — 2026-07-01
+
+### Fixed
+
+- **Shared-driver unload: cross-image synthesized-device-path leak.** A
+  shared-driver launcher (a transient `do.efi` that loads a resident
+  `doDriver.efi`) leaked a UEFI handle in `dh` on every unload/reload cycle.
+  A buffer/embedded `LoadImage` has no firmware device path, so AXL
+  synthesizes a `LoadedImageDevicePath` and must uninstall it before
+  `gBS->UnloadImage`. That cleanup used a process-local table populated by
+  the *loading* image, but in the launcher pattern a *different* image
+  unloads the driver — so the synthesized device path was never removed and
+  its now-image-less handle accumulated (`gBS->UnloadImage` still returned
+  `EFI_SUCCESS` and reclaimed the image itself, so it looked benign). The
+  cleanup record now lives on the driver's image handle as a private
+  protocol, so whichever image unloads the driver can find and release it.
+- **Shared-driver stdio bridge: dead instances no longer accumulate.** A
+  launcher that skips its CRT0 atexit uninstall — an `axl-cc
+  --minimal-runtime` image, or one that calls `gBS->Exit()` — left its stdio
+  bridge protocol installed, and each fresh launcher image couldn't see prior
+  images' handles, so the leaked bridges piled up in `dh` one per invocation.
+  Dead-launcher bridge instances are now reaped (via the `launcher_image`
+  liveness gate) at the start of every bridge install and in
+  `axl_shared_driver_unload`, so they can't accumulate regardless of how a
+  launcher terminates. (The `ea3b67d2` fix already made a stale bridge *safe*
+  to consult; this stops the handles themselves from leaking.)
+
 ## 2.6.1 — 2026-06-23
 
 ### Fixed

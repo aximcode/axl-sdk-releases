@@ -27,4 +27,12 @@ extern const AxlGuid AXL_STDIO_BRIDGE_GUID;
 int  axl_backend_stdio_bridge_install(void);
 void axl_backend_stdio_bridge_uninstall(void);
 
+/* Uninstall every bridge instance whose launcher image has exited. A launcher
+   that skips CRT0's atexit uninstall (--minimal-runtime, or gBS->Exit) leaves
+   its bridge installed; each fresh launcher image can't see prior images'
+   handles, so without an active sweep these dead instances accumulate. install
+   calls this before publishing; axl_shared_driver_unload calls it so `do -u`
+   clears the residual. Best-effort, cross-image, safe to call anytime. */
+void axl_backend_stdio_bridge_reap(void);
+
 #endif /* AXL_STDIO_BRIDGE_H */

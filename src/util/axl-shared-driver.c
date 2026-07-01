@@ -127,6 +127,14 @@ axl_shared_driver_unload(
         return AXL_ERR;
     }
 
+    /* Reap any stdio-bridge instances leaked by launchers that skipped their
+       atexit uninstall (--minimal-runtime / gBS->Exit). A thin `do -u` style
+       launcher installs no bridge itself, so this is the point that clears the
+       residual dead bridge left by the preceding dispatch — otherwise it
+       lingers in `dh` until the next install sweeps it. Cheap and cross-image;
+       runs whether or not the named driver is resident. */
+    axl_backend_stdio_bridge_reap();
+
     /* Find the image handle that installed the protocol. publish
        defaults to gImageHandle, so there's exactly one handle for
        the GUID — but ask for the buffer form so we can free it
