@@ -1379,6 +1379,63 @@ axl_backend_shell_execute(
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
+int
+axl_backend_shell_map_name(
+    void   *device_path,
+    char   *out,
+    size_t  out_size
+    )
+{
+    if (device_path == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->GetMapFromDevicePath == NULL) {
+        return AXL_UNSUPPORTED;
+    }
+
+    /* GetMapFromDevicePath advances the pointer past the matched volume
+       portion; pass a local copy so the caller's device path is untouched. */
+    EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
+    const unsigned short *map = (const unsigned short *)
+        shell->GetMapFromDevicePath(&dp);
+    if (map == NULL) {
+        return AXL_ERR;
+    }
+
+    /* `map` is one or more ';'-separated aliases in UCS-2, e.g. "FS1:;F1:".
+       Take the first "fs<digits>" token, lowercased, without the ':'. The
+       shell lists the friendliest (FSn:) alias first, but scanning for the
+       fs<n> token explicitly is robust to ordering. */
+    for (const unsigned short *p = map; *p != 0; ) {
+        const unsigned short *tok = p;
+        while (*p != 0 && *p != (unsigned short)';') {
+            p++;
+        }
+        size_t toklen = (size_t)(p - tok);
+        if (toklen >= 3
+            && (tok[0] == 'f' || tok[0] == 'F')
+            && (tok[1] == 's' || tok[1] == 'S')
+            && tok[2] >= '0' && tok[2] <= '9') {
+            size_t j = 0;
+            for (size_t k = 0; k < toklen && j + 1 < out_size; k++) {
+                unsigned short c = tok[k];
+                if (c == (unsigned short)':') {
+                    break;
+                }
+                out[j++] = (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+            }
+            out[j] = '\0';
+            return (j > 0) ? AXL_OK : AXL_ERR;
+        }
+        if (*p == (unsigned short)';') {
+            p++;
+        }
+    }
+    return AXL_ERR;   /* no fs<n> alias maps to this device path */
+}
+
 // ===================================================================
 // Wide-string operations (self-implemented — no external library)
 // ===================================================================

@@ -603,7 +603,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1782,6 +1782,22 @@ referenced symbols)\n" "$$libsz"
 EMBEDDED_RAMDISK_SRC = third_party/edk2/RamDiskDxe-$(ARCH).efi
 $(eval $(call EMBED_BLOB,ramdiskdxe,$(EMBEDDED_RAMDISK_SRC)))
 EMBEDDED_RAMDISK_OBJ = $(BLOB_OBJ_ramdiskdxe)
+
+# ===================================================================
+# Build volume-map-test.efi — regression test that axl_volume_enumerate
+# names volumes from the UEFI Shell fsN map, not the LocateHandle index.
+# Placed after EMBEDDED_RAMDISK_OBJ is defined (it links the vendored
+# RamDiskDxe blob, like mkrd, for the mkrd phase).
+# ===================================================================
+
+volume-map-test: $(PREFIX)/volume-map-test.efi
+	@echo "  Built: $(PREFIX)/volume-map-test.efi"
+
+$(PREFIX)/volume-map-test.efi: $(BUILDDIR)/volume-map-test.o $(EMBEDDED_RAMDISK_OBJ) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/volume-map-test.o $(EMBEDDED_RAMDISK_OBJ),$@)
+
+$(BUILDDIR)/volume-map-test.o: test/integration/volume-map-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 define BUILD_TOOL
 $(PREFIX)/tools/$(1).efi: $(BUILDDIR)/$(1).o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools

@@ -3,6 +3,25 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.6.3 — 2026-07-03
+
+### Fixed
+
+- **`axl_volume_enumerate` reported the wrong `fsN` mapping.** It named each
+  volume `fs<i>` from its position in `LocateHandle(SimpleFileSystem)` order,
+  which need not match the UEFI Shell's own `fsN` numbering. The two agreed
+  only by luck; any remap — a `mkrd` ramdisk, a USB hot-plug, or simply a
+  second mounted filesystem — desynced them, so the SDK bound the wrong
+  handle/device-path to a name and downstream tools printed the wrong type and
+  volume label for a filesystem (e.g. `fs3`/`fs4` swapped after `mkrd`).
+  `AxlVolume.name` now comes from the shell's device-path→map lookup
+  (lowercased `fsN`), so name, handle, and device path all refer to the same
+  volume the user and `map` / `vol fsN:` see; it falls back to the positional
+  name only for a volume the shell has not mapped yet. Volume-name matching in
+  the driver loader (`axl_driver_load_sibling` and friends) is now
+  case-insensitive to stay robust against the shell reporting `FSn:` while a
+  caller path uses `fsn:`.
+
 ## 2.6.2 — 2026-07-01
 
 ### Fixed

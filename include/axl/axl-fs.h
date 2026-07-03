@@ -543,7 +543,13 @@ axl_volume_get_label_by_handle(
 /// Volume descriptor for axl_volume_enumerate.
 typedef struct {
     void  *handle;       ///< opaque filesystem handle
-    char   name[16];    ///< stable name ("fs0", "fs1", ...)
+    char   name[16];    ///< the UEFI Shell's own alias for this volume,
+                        ///< lowercased ("fs0", "fs1", ...) — matches what
+                        ///< `map` / `vol fsN:` show, so name, handle, and
+                        ///< device_path all refer to the same volume. Falls
+                        ///< back to the LocateHandle index ("fs<i>") only when
+                        ///< the shell has no mapping for the volume (e.g. a
+                        ///< just-created ramdisk before the shell remaps).
     void  *device_path; ///< opaque EFI_DEVICE_PATH_PROTOCOL — caller may
                         ///< pass to axl_device_path_find / _for_each.
                         ///< The pointer is firmware-owned; callers
@@ -553,9 +559,10 @@ typedef struct {
 /**
  * @brief Enumerate mounted filesystem volumes.
  *
- * Fills @p out with up to @p max descriptors, each with a stable
- * name ("fs0", "fs1", ...) and an opaque handle. On return, @p count
- * receives the number of entries filled.
+ * Fills @p out with up to @p max descriptors, each naming the volume by the
+ * UEFI Shell's own fsN alias (see @ref AxlVolume) with a matching opaque
+ * handle and device path. On return, @p count receives the number of entries
+ * filled.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */

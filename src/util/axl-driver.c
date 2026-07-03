@@ -119,7 +119,13 @@ driver_build_file_dp(const char *path)
     }
     EFI_HANDLE vol_handle = NULL;
     for (size_t i = 0; i < n_vols; i++) {
-        if (axl_strcmp(volumes[i].name, vol_name) == 0) {
+        /* Case-insensitive: UEFI shell fs aliases are case-insensitive.
+           volumes[i].name is the lowercased shell alias ("fs0"), but
+           `vol_name` comes from a caller path — a user's is usually lowercase
+           ("fs0:") while axl_app_image_path (the source for
+           axl_driver_load_sibling) carries the shell's own case ("FS0:"), so an
+           exact match would miss that path. */
+        if (axl_strcasecmp(volumes[i].name, vol_name) == 0) {
             vol_handle = (EFI_HANDLE)volumes[i].handle;
             break;
         }

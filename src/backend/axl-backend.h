@@ -547,6 +547,26 @@ axl_backend_shell_execute(
     const unsigned short  *command  ///< UCS-2 command line
     );
 
+/**
+ * @brief Resolve the UEFI Shell filesystem alias (e.g. "fs3") for a
+ *        device path.
+ *
+ * Uses the shell's device-path -> map lookup so the returned name matches
+ * what the user and `map` / `vol fsN:` see, and tracks remaps (mkrd, USB
+ * hot-plug) — unlike a positional LocateHandle index. Writes the lowercased
+ * `fs<n>` alias WITHOUT the trailing ':' (e.g. "fs3") into @p out.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args or when the device path
+ *         has no `fs<n>` shell mapping; AXL_UNSUPPORTED when the backend has
+ *         no shell (callers then fall back to a positional name).
+ */
+int
+axl_backend_shell_map_name(
+    void   *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL for the volume
+    char   *out,          ///< [out] receives lowercased "fsN"
+    size_t  out_size      ///< capacity of @p out
+    );
+
 // ===================================================================
 // Wide-string operations
 // ===================================================================

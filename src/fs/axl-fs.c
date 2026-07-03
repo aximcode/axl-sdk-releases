@@ -908,13 +908,30 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
     for (size_t i = 0; i < num; i++) {
         if (out != NULL && filled < max) {
             out[filled].handle = handles[i];
-            axl_snprintf(out[filled].name, sizeof(out[filled].name),
-                         "fs%zu", i);
             /* device_path is firmware-owned — share the pointer.
                NULL on rare handles that don't publish a DP. */
             out[filled].device_path = NULL;
             (void)axl_handle_get_protocol(handles[i], "device-path",
                                          &out[filled].device_path);
+            /* Name from the UEFI Shell's fsN map, NOT the LocateHandle
+               index — the two orders diverge (a remap / mkrd / hot-plug
+               inserts a handle at a different position than the shell
+               assigns its alias), which previously bound the wrong
+               handle/device-path to a name. Fall back to the positional
+               name when there's no shell mapping (e.g. a just-created
+               ramdisk the shell hasn't remapped yet, or a non-shell
+               backend). The fallback shares the fsN namespace, so a
+               still-unmapped volume can transiently collide with a mapped
+               volume's name until the shell remaps — strictly better than
+               the old always-positional naming, and self-healing. */
+            if (out[filled].device_path == NULL
+                || axl_backend_shell_map_name(out[filled].device_path,
+                                              out[filled].name,
+                                              sizeof(out[filled].name))
+                       != AXL_OK) {
+                axl_snprintf(out[filled].name, sizeof(out[filled].name),
+                             "fs%zu", i);
+            }
         }
         filled++;
     }
