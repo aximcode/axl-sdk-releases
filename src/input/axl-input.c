@@ -250,9 +250,19 @@ mouse_dispatch_cb(
     MouseSource              *ms = (MouseSource *)data;
     EFI_SIMPLE_POINTER_STATE  state;
 
-    /* Read whichever bound handle has data FIRST (ConsoleInHandle first, where
-       a virtual / BMC remote-console pointer lives), re-resolving the current
-       interface each dispatch.  GetState consumes one queued state per call. */
+    /* Read whichever bound handle has data FIRST, re-resolving the current
+       interface each dispatch.  GetState consumes one queued state per call.
+       ms->handles is ordered physical devices first, ConsoleInHandle LAST
+       (see attach_mouse): reading a physical EFI_SIMPLE_POINTER before the
+       ConsoleInHandle aggregator is REQUIRED for the scroll wheel.  On
+       firmware that routes the pointer through the ConSplitter aggregator on
+       ConsoleInHandle, that aggregator's GetState CONSUMES the physical
+       child's queued state but drops RelativeMovementZ (the wheel) — so
+       reading ConsoleInHandle first silently eats every wheel notch while
+       still delivering buttons/motion.  Reading the physical handle first
+       captures the wheel; a virtual / BMC pointer published directly on
+       ConsoleInHandle is still read (it comes last, and the physical handles
+       are idle/NOT_READY when only the virtual pointer moved). */
     bool got = false;
     for (int i = 0; i < ms->nproto; i++) {
         EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_resolve(ms->handles[i]);
@@ -723,6 +733,24 @@ axl_input_attach_mouse(
         axl_debug("EFI_SIMPLE_POINTER_PROTOCOL not available "
                   "(headless / no mouse hardware)");
         return 0;
+    }
+
+    /* collect_pointers lists ConsoleInHandle FIRST (a virtual / BMC pointer
+       publishes there).  For the mouse we must READ it LAST: when the pointer
+       is routed through the ConSplitter aggregator on ConsoleInHandle, its
+       GetState consumes the physical child's state but drops the wheel
+       (RelativeMovementZ) — so reading it first eats every scroll notch.  Move
+       ConsoleInHandle to the end so mouse_dispatch_cb reads physical devices
+       (which carry the wheel) first and the aggregator/virtual pointer last.
+       attach_touch keeps ConsoleInHandle first — the AbsolutePointer aggregator
+       does not have this wheel-dropping issue. */
+    EFI_HANDLE con_in = (axl_st() != NULL) ? axl_st()->ConsoleInHandle : NULL;
+    if (con_in != NULL && mouse_state.nproto > 1
+        && mouse_state.handles[0] == con_in) {
+        for (int i = 0; i < mouse_state.nproto - 1; i++) {
+            mouse_state.handles[i] = mouse_state.handles[i + 1];
+        }
+        mouse_state.handles[mouse_state.nproto - 1] = con_in;
     }
 
     mouse_state.cb            = cb;

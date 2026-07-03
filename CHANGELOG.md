@@ -3,6 +3,24 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.6.4 — 2026-07-03
+
+### Fixed
+
+- **`axl_input_attach_mouse` dropped the scroll wheel on firmware that routes
+  the pointer through ConsoleInHandle.** `attach_mouse` binds every
+  `EFI_SIMPLE_POINTER` handle ConsoleInHandle-first (so a virtual / BMC
+  remote-console pointer is seen). But when the physical pointer is aggregated
+  onto ConsoleInHandle by the ConSplitter, reading that aggregator's
+  `GetState` first consumes the physical child's queued state while dropping
+  `RelativeMovementZ` — so buttons and motion arrived but every scroll notch
+  was silently eaten. The mouse now reads physical pointer handles before the
+  ConsoleInHandle aggregator (which carries the wheel), so `MOUSE_WHEEL`
+  events are delivered again; a virtual pointer published directly on
+  ConsoleInHandle is still read (it comes last, and the physical handles are
+  idle when only the virtual pointer moved). `attach_touch` is unchanged — the
+  AbsolutePointer aggregator has no equivalent wheel-dropping behavior.
+
 ## 2.6.3 — 2026-07-03
 
 ### Fixed
