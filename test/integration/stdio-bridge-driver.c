@@ -16,6 +16,7 @@
  */
 
 #include <axl.h>
+#include <axl/axl-signal.h>
 #include "stdio-bridge-fix.h"
 
 AXL_LOG_DOMAIN("stdio-bridge-fix");
@@ -71,6 +72,20 @@ fix_run(int argc, char **argv)
 
     if (axl_strcmp(argv[0], "emit") == 0) {
         axl_printf("DRIVEROUT\n");
+        return 0;
+    }
+
+    if (axl_strcmp(argv[0], "exitstatus") == 0) {
+        /* Arm an exact, non-collapsible status; the launcher must exit
+           with THIS value, proving cross-image reflection. 0x12345678 is
+           large + non-zero (never produced by rc=0 or the launcher's own
+           0x0 default) but has bit 63 CLEAR: the UEFI reference Shell
+           strips MAX_BIT from an error-class .efi exit status before
+           setting %lasterror% (ShellPkg RunCommand `Status & ~MAX_BIT`),
+           so an error-class value would arrive truncated. A success-class
+           value like this passes through verbatim. */
+        axl_set_exit_status((AxlEfiStatus)0x12345678ULL);
+        axl_printf("EXITSET\n");
         return 0;
     }
 

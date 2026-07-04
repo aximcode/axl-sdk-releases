@@ -54,6 +54,24 @@ extern "C" {
 #endif
 
 /**
+ * @brief The SDK-standard shared-driver entry vtable.
+ *
+ * A driver built with @c AXL_SHARED_DRIVER publishes this; a launcher
+ * built with @c AXL_SHARED_DRIVER_LAUNCHER (or calling
+ * @ref axl_shared_driver_run / @ref axl_shared_driver_dispatch) drives it.
+ * The single @c run entry has the canonical @c main signature, so once
+ * stdin and exit status are bridged by the SDK the cross-image contract
+ * is just "call an int(int,char**)". Consumers no longer define a custom
+ * vtable or protocol header.
+ *
+ * @c run receives the launcher's argv verbatim — @c argv[0] is the program
+ * name (as in @c int @c main); parse args/verb from @c argv[1].
+ */
+typedef struct {
+    int (*run)(int argc, char **argv);   ///< per-dispatch entry (== int main); argv[0] is the program name, verb/args from argv[1]
+} AxlSharedDriverVtable;
+
+/**
  * @brief Derive the protocol-identity GUID for a shared driver.
  *
  * @c axl_shared_publish / @c axl_shared_locate use this internally;
@@ -289,6 +307,79 @@ axl_shared_driver_locate_with_image_info(
  */
 int
 axl_shared_driver_install_stdio_bridge(void);
+
+/**
+ * @brief Apply a resident driver's armed exit status to THIS launcher.
+ *
+ * Call from the LAUNCHER, immediately after dispatching into the resident
+ * driver (i.e. after the driver's vtable call returns). If a driver verb
+ * armed an exact status via @c axl_set_exit_status(), that status was
+ * reflected across the stdio bridge into this launcher's pending-status
+ * cell; this drains it into the launcher's own @c axl_set_exit_status so
+ * the launcher's CRT0 returns it verbatim to the shell (`%lasterror%`).
+ *
+ * A no-op when the driver armed nothing this dispatch (the launcher then
+ * exits by its own @c main return code, per the normal convention). Only
+ * needed by launchers that dispatch into a resident driver and did NOT go
+ * through a future @c axl_shared_driver_dispatch wrapper.
+ *
+ * Does NOT clear a previously-armed launcher exit status — it only drains
+ * the bridge's pending cell into @c axl_set_exit_status when one is
+ * pending. A REPL-style launcher that dispatches repeatedly and wants
+ * strict per-dispatch semantics (this round's status only, not a stale one
+ * left over from an earlier round) should clear its own armed status
+ * between dispatches, or rely on the AXL_ERR return here to know nothing
+ * was applied this round.
+ *
+ * @return AXL_OK if a reflected status was applied; AXL_ERR if none was
+ *     pending (nothing to apply — not an error condition, just a signal).
+ */
+int
+axl_shared_driver_apply_exit_status(void);
+
+/**
+ * @brief Dispatch into a resident driver with stdio + exit-status bridged.
+ *
+ * Brackets the cross-image vtable call: installs the stdio bridge (so the
+ * driver's @c axl_stdin / stderr reflect THIS launcher), calls
+ * @c vt->run(argc, argv) — forwards @p argc / @p argv unchanged, so @c run()
+ * sees them exactly as the launcher's @c main did (@c argv[0] the program
+ * name, verb/args from @c argv[1]) — then applies any exit status the driver armed
+ * (@ref axl_shared_driver_apply_exit_status) so the launcher exits with it.
+ * For launchers that resolve the driver themselves; @ref axl_shared_driver_run
+ * calls this after resolving.
+ *
+ * @return the driver's @c run return code (the launcher should return it
+ *     from @c main); AXL_ERR if @p vt / @p vt->run is NULL.
+ */
+int
+axl_shared_driver_dispatch(
+    const AxlSharedDriverVtable *vt,    ///< resolved standard vtable
+    int                          argc,  ///< forwarded argc
+    char                       **argv   ///< forwarded argv
+);
+
+/**
+ * @brief Resolve a resident shared-driver and dispatch — the whole launcher.
+ *
+ * Composes @ref axl_shared_driver_locate (resident → on-disk → embedded)
+ * and @ref axl_shared_driver_dispatch. This IS a turnkey `int main` body:
+ * @c AXL_SHARED_DRIVER_LAUNCHER expands to a call to it. Pass
+ * @c embed_blob == NULL / @c embed_len == 0 for a thin (no-embed) launcher.
+ *
+ * @return the driver's exit code when it dispatched; a launcher-side error
+ *     (nonzero; also arms @c EFI_NOT_FOUND via axl_set_exit_status) when the
+ *     driver could not be located.
+ */
+int
+axl_shared_driver_run(
+    const char           *name,             ///< shared-driver identity
+    const char           *driver_filename,  ///< on-disk filename
+    const unsigned char  *embed_blob,       ///< embedded driver bytes (NULL → thin)
+    size_t                embed_len,        ///< length of @p embed_blob (0 → thin)
+    int                   argc,             ///< argc from main
+    char                **argv              ///< argv from main
+);
 
 #ifdef __cplusplus
 }

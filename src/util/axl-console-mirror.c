@@ -54,6 +54,14 @@ struct AxlConsoleMirror {
     EFI_SIMPLE_TEXT_INPUT_PROTOCOL     *orig_conin;
     EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *orig_coninex;
 
+    /* Saved gST->StdErr, exactly as found: NULL (no error console), the
+       same pointer as orig_conout (the common aliased case), or a
+       genuinely distinct protocol instance. Restored verbatim on
+       uninstall -- do NOT derive it from orig_conout, which is only
+       correct in the aliased case and would otherwise hand a caller's
+       real distinct StdErr (or an absent one) back as ConOut. */
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL    *orig_stderr;
+
     /* Wrapper protocol structs — gST/ConsoleInHandle point into these. */
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL     my_conout;
     EFI_SIMPLE_TEXT_INPUT_PROTOCOL      my_conin;
@@ -653,6 +661,7 @@ axl_console_mirror_install(AxlConsoleMirror **out, const AxlConsoleMirrorConfig 
 
     m->orig_conout = gST->ConOut;
     m->orig_conin  = gST->ConIn;
+    m->orig_stderr = gST->StdErr;
 
     /* ConOut wrapper: copy the original (preserves Mode), override methods. */
     if (m->orig_conout != NULL) {
@@ -720,9 +729,23 @@ axl_console_mirror_install(AxlConsoleMirror **out, const AxlConsoleMirrorConfig 
     }
 
     /* Swap gST pointers AFTER the reinstall (which can make ConSplitter
-       rewrite gST->ConIn). */
+       rewrite gST->ConIn). ConOut and StdErr are independent fields in
+       EFI_SYSTEM_TABLE (never unioned/aliased at the storage level, only
+       sometimes equal in value), so StdErr needs its own explicit
+       assignment even when it started out equal to ConOut. Route it
+       through the SAME wrapper instance as ConOut, not a separate
+       my_stderr -- one shared wrapper is enough to mirror both streams
+       and keeps the common aliased case from double-wrapping. */
     gST->ConOut = &m->my_conout;
     gST->ConIn  = &m->my_conin;
+    /* Repoint StdErr unconditionally, even when orig_stderr is NULL (no
+       error console at all) -- deliberate, not an oversight. Raw save/
+       restore is correct uniformly across the NULL / aliased-to-ConOut /
+       genuinely-distinct cases: a NULL original is restored verbatim on
+       uninstall (see orig_stderr field comment), and while installed, the
+       backend's console_write_err already falls back to ConOut when StdErr
+       is NULL, so routing a previously-absent StdErr through this wrapper
+       still reaches ConOut instead of silently discarding output. */
     gST->StdErr = &m->my_conout;
 
     m->atexit_handle = axl_atexit(mirror_atexit, m);
@@ -746,8 +769,11 @@ axl_console_mirror_uninstall(AxlConsoleMirror *m)
     }
     if (m->orig_conout != NULL) {
         gST->ConOut = m->orig_conout;
-        gST->StdErr = m->orig_conout;
     }
+    /* Restore StdErr to exactly what was saved -- NULL, aliased to
+       ConOut's original, or a distinct instance -- independent of the
+       ConOut restore above (see the orig_stderr field comment). */
+    gST->StdErr = m->orig_stderr;
     if (m->orig_conin != NULL) {
         gST->ConIn = m->orig_conin;
     }

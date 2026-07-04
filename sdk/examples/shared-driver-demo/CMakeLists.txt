@@ -5,41 +5,41 @@
 #   cmake --build .
 #
 # Produces two .efi files:
-#   shared-driver-demo-dxe.efi   resident driver image
-#   shared-driver-demo.efi       launcher (with the driver bytes
-#                                 embedded — single-binary
+#   shared-driver-demo-dxe.efi   resident driver image (AXL_SHARED_DRIVER)
+#   shared-driver-demo.efi       launcher (AXL_SHARED_DRIVER_LAUNCHER, with
+#                                 the driver bytes embedded — single-binary
 #                                 distribution).
 #
-# To run the demo under QEMU, copy shared-driver-demo.efi to a FAT
-# image alongside pci-ids.json5 (the SDK includes a copy under
-# share/) and boot the image; pass `shared-driver-demo.efi run` at
-# the shell. The driver image is NOT shipped separately — it's
-# baked into the launcher.
+# To run the demo under QEMU, copy shared-driver-demo.efi to a FAT image
+# and boot it; pass a verb at the shell, e.g.:
+#   shared-driver-demo.efi status
+#   echo hi | shared-driver-demo.efi echotext
+#   shared-driver-demo.efi stderr 2> err.txt
+# The driver image is NOT shipped separately — it's baked into the launcher.
 
 cmake_minimum_required(VERSION 3.16)
 project(shared-driver-demo C)
 
 find_package(axl REQUIRED)
 
-# Shared TU. Listed in BOTH the driver's and launcher's source lists
-# below — each image compiles + links its own copy of the symbols
-# defined here. This is the canonical shape for a non-trivial consumer
-# that has helper functions both halves of the application use.
-#
-# axl-cc enforces `ld --no-undefined`, so omitting this file from
-# either source list while still calling its functions surfaces as
-# a precise "undefined reference to `demo_print_banner'" build error
-# rather than a runtime crash on a corrupted call target.
-set(DEMO_SHARED_SOURCES shared-driver-demo-format.c)
+# Driver-only helper module (shared-driver-demo-format.c). In the earlier
+# custom-vtable version of this example this module was compiled into BOTH
+# the driver's and launcher's source lists — a real multi-TU consumer often
+# shares formatters/argv helpers across both halves; see
+# AXL-Shared-Driver-Recipe.md's "Sharing helpers between launcher and
+# driver" for that general pattern. The turnkey launcher below has no
+# custom code left to call a shared helper from — its entire int main is
+# the one AXL_SHARED_DRIVER_LAUNCHER macro invocation — so this module now
+# lives only in the driver's source list.
+set(DEMO_DRIVER_SOURCES shared-driver-demo-format.c)
 
 axl_add_driver(shared-driver-demo-dxe
     shared-driver-demo-driver.c
-    ${DEMO_SHARED_SOURCES}
+    ${DEMO_DRIVER_SOURCES}
 )
 
 axl_add_app(shared-driver-demo
     shared-driver-demo-launcher.c
-    ${DEMO_SHARED_SOURCES}
     EMBEDS ${shared-driver-demo-dxe_EFI_PATH}=shared_driver_demo
 )
 # The EMBEDS clause emits a file-DEPENDS on the driver's .efi, so

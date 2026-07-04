@@ -68,9 +68,18 @@ extern AxlStream *axl_stdin;
 extern AxlStream *axl_stdout_raw;
 
 /**
+ * **axl_stderr_raw** — binary sibling of axl_stderr. Writes via the shell
+ * StdErr handle (EFI_SHELL_PARAMETERS_PROTOCOL.StdErr), bypassing the
+ * UTF-8→UCS-2 console conversion, so a tool can emit raw diagnostic bytes
+ * under `2>`. Returns -1 when no shell StdErr handle is available.
+ */
+extern AxlStream *axl_stderr_raw;
+
+/**
  * @brief Initialize the standard stream globals.
  *
- * Sets up axl_stdout, axl_stderr, axl_stdin, and axl_stdout_raw.
+ * Sets up axl_stdout, axl_stderr, axl_stdin, axl_stdout_raw, and
+ * axl_stderr_raw.
  * Call once at startup (before any axl_print/axl_fprintf or
  * axl_read on axl_stdin). Invoked automatically by axl_runtime_init
  * — most consumers don't call it directly.

@@ -29,6 +29,7 @@
 #include <axl/axl-shared-driver.h>
 #include <axl/axl-driver.h>
 #include <axl/axl-log.h>
+#include <axl/axl-signal.h>             /* axl_set_exit_status */
 
 AXL_LOG_DOMAIN("shared-drv");
 
@@ -274,4 +275,65 @@ axl_shared_driver_install_stdio_bridge(void)
        launchers that resolve the resident driver themselves. See the
        header docstring and docs/AXL-Shared-Driver-Recipe.md. */
     return axl_backend_stdio_bridge_install();
+}
+
+int
+axl_shared_driver_apply_exit_status(void)
+{
+    uint64_t status = 0;
+    if (!axl_backend_bridge_take_exit_status(&status)) {
+        return AXL_ERR;   /* nothing pending — caller keeps its own rc */
+    }
+    axl_backend_set_exit_status(status);   /* arm on THIS (launcher) image */
+    return AXL_OK;
+}
+
+int
+axl_shared_driver_dispatch(
+    const AxlSharedDriverVtable *vt,
+    int                          argc,
+    char                       **argv
+    )
+{
+    if (vt == NULL || vt->run == NULL) {
+        return AXL_ERR;
+    }
+    /* Install the launcher-context bridge (stdin + exit-status channel),
+       run the verb in the driver image, then pull any status it armed onto
+       this launcher. apply is a no-op (AXL_ERR, ignored) when none armed. */
+    axl_shared_driver_install_stdio_bridge();
+    int rc = vt->run(argc, argv);
+    (void)axl_shared_driver_apply_exit_status();
+    return rc;
+}
+
+int
+axl_shared_driver_run(
+    const char           *name,
+    const char           *driver_filename,
+    const unsigned char  *embed_blob,
+    size_t                embed_len,
+    int                   argc,
+    char                **argv
+    )
+{
+    void *iface = NULL;
+    if (axl_shared_driver_locate(name, driver_filename,
+                                 embed_blob, embed_len, &iface) != AXL_OK
+        || iface == NULL) {
+        axl_warning("axl_shared_driver_run: failed to load driver '%s'",
+                    driver_filename);
+        axl_set_exit_status(AXL_EFI_NOT_FOUND);
+        return 1;
+    }
+    /* dispatch() installs the stdio bridge again here, on top of the one
+       locate() already installed above -- an intentional, harmless idempotent
+       refresh, not a bug. dispatch() MUST install for its OWN standalone
+       (resolve-it-yourself) callers, so run() reusing dispatch() (DRY) accepts
+       one redundant reap+reinstall rather than forking a locate-then-run-raw
+       path just to suppress it; the cost is negligible against the
+       locate/LoadImage work already on this path, and dispatch stays
+       self-contained for callers that skip locate entirely. */
+    return axl_shared_driver_dispatch((const AxlSharedDriverVtable *)iface,
+                                      argc, argv);
 }

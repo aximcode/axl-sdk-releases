@@ -184,7 +184,7 @@ print_console_timestamp(void)
 
     unsigned short wide[24];
     axl_utf8_to_ucs2_buf(buf, wide, 24);
-    axl_backend_console_write(wide);
+    axl_backend_console_write_err(wide);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +198,10 @@ log_dispatch(int level, const char *domain, const char *func,
     unsigned short wide[MSG_BUF_SIZE];
 
     // Console output
-    if (mConsoleEnabled && axl_st() != NULL && axl_st()->ConOut != NULL) {
+    if (mConsoleEnabled && axl_st() != NULL &&
+        (axl_st()->StdErr != NULL || axl_st()->ConOut != NULL)) {
         if (mConsoleColor && level <= AXL_LOG_TRACE) {
-            axl_backend_console_set_attr(mLevelColor[level]);
+            axl_backend_console_set_attr_err(mLevelColor[level]);
         }
 
         if (mConsoleTimestamp) {
@@ -208,13 +209,13 @@ log_dispatch(int level, const char *domain, const char *func,
         }
 
         if (level <= AXL_LOG_TRACE) {
-            axl_backend_console_write((const unsigned short *)mLevelPrefix[level]);
+            axl_backend_console_write_err((const unsigned short *)mLevelPrefix[level]);
         }
 
         if (domain != NULL) {
             unsigned short wide_domain[DOMAIN_LEN];
             axl_utf8_to_ucs2_buf(domain, wide_domain, DOMAIN_LEN);
-            axl_backend_console_write(wide_domain);
+            axl_backend_console_write_err(wide_domain);
 
             if (func != NULL && line > 0 && level >= AXL_LOG_DEBUG) {
                 /* Format :func:line */
@@ -252,9 +253,9 @@ log_dispatch(int level, const char *domain, const char *func,
 
                 unsigned short wide_loc[128];
                 axl_utf8_to_ucs2_buf(loc, wide_loc, 128);
-                axl_backend_console_write(wide_loc);
+                axl_backend_console_write_err(wide_loc);
             }
-            axl_backend_console_write((const unsigned short *)L": ");
+            axl_backend_console_write_err((const unsigned short *)L": ");
         } else if (func != NULL && line > 0 && level >= AXL_LOG_DEBUG) {
             char loc[128];
             size_t pos = 0;
@@ -289,15 +290,15 @@ log_dispatch(int level, const char *domain, const char *func,
 
             unsigned short wide_loc[128];
             axl_utf8_to_ucs2_buf(loc, wide_loc, 128);
-            axl_backend_console_write(wide_loc);
+            axl_backend_console_write_err(wide_loc);
         }
 
         axl_utf8_to_ucs2_buf(msg_buf, wide, MSG_BUF_SIZE);
-        axl_backend_console_write(wide);
-        axl_backend_console_write((const unsigned short *)L"\r\n");
+        axl_backend_console_write_err(wide);
+        axl_backend_console_write_err((const unsigned short *)L"\r\n");
 
         if (mConsoleColor) {
-            axl_backend_console_set_attr(DEFAULT_ATTR);
+            axl_backend_console_set_attr_err(DEFAULT_ATTR);
         }
     }
 

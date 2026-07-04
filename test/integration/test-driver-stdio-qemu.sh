@@ -131,6 +131,10 @@ printf 'selfredir\nsecond line ignored\n' > "$TEST_STAGING/in2.txt"
     echo "echo selftext | stdio-bridge-self.efi echotext"
     echo "stdio-bridge-self.efi echo < in2.txt"
     echo "echo SELF_DONE"
+    echo "echo ESTAT_BEGIN"
+    echo "stdio-bridge-self.efi exitstatus"
+    echo "echo ESTAT=%lasterror%"
+    echo "echo ESTAT_DONE"
     echo "echo STDIO_DONE"
     echo "reset -s"
 } | test_set_startup
@@ -168,6 +172,20 @@ self_redir=$(self_section | grep -c '^GOT:selfredir$' || true)
 stale_warm=$(sed -n '/STALE_BEGIN/,/STALE_DONE/p' "$TEST_CLEAN_LOG" \
     | grep -c '^GOT:warmpipe$' || true)
 
+# Cross-image exit-status reflection: the exitstatus verb arms 0x12345678
+# in the DRIVER image via axl_set_exit_status; the self-locating LAUNCHER
+# must exit with that exact status so the shell's %lasterror% reports it
+# back. 0x0 / Success means the status never left the driver image.
+# NOTE: 0x12345678 has bit 63 CLEAR on purpose. The reflection mechanism
+# carries the full uint64_t verbatim across the bridge, but the UEFI
+# reference Shell strips MAX_BIT (bit 63) from an error-class .efi exit
+# status before setting %lasterror% (ShellPkg RunCommand `Status &
+# ~MAX_BIT`), so an ENCODE_ERROR(n) status would arrive truncated here.
+# A success-class value survives verbatim, matching the real `do err <N>`
+# case (small-int codes).
+estat=$(sed -n '/ESTAT_BEGIN/,/ESTAT_DONE/p' "$TEST_CLEAN_LOG" \
+    | grep -c 'ESTAT=0x12345678' || true)
+
 # > probe — informational only. Disambiguate the source of DRIVEROUT:
 #   - between EMIT_BEGIN and TYPE_BEGIN  => printed to CONSOLE at the emit
 #     run; the `>` redirect did NOT capture the driver's StdOut.
@@ -184,6 +202,7 @@ printf "Results: pipe=%d textpipe=%d redir=%d noinput_eof=%d done=%d  (probe: em
 printf "Self-locate (public install): pipe=%d textpipe=%d redir=%d\n" \
     "$self_pipe" "$self_textpipe" "$self_redir"
 printf "Stale-bridge warm read (no UAF): warmpipe=%d\n" "$stale_warm"
+printf "Cross-image exit-status reflection: estat=%d\n" "$estat"
 
 # Record the > probe verdict explicitly for the task report.
 if [[ "$type_readback" -ge 1 ]]; then
@@ -198,7 +217,7 @@ fi
 # and that the shell reached STDIO_DONE (script ran to completion).
 if [[ "$pipe" -ge 1 && "$textpipe" -ge 1 && "$redir" -ge 1 && "$noinput" -ge 1 && "$done_marker" -ge 1 \
       && "$self_pipe" -ge 1 && "$self_textpipe" -ge 1 && "$self_redir" -ge 1 \
-      && "$stale_warm" -ge 1 ]]; then
+      && "$stale_warm" -ge 1 && "$estat" -ge 1 ]]; then
     echo "Driver stdio-bridge test: OK"
     exit 0
 else

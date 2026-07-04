@@ -120,6 +120,29 @@ axl_backend_console_write(
 }
 
 /**
+ * @brief Write a UCS-2 string to the error console. NULL-safe.
+ *
+ * Targets gST->StdErr so the UEFI shell's `2>` redirect (which swaps
+ * gST->StdErr, symmetric to `>` swapping gST->ConOut) captures it and a
+ * plain `>` does not. Falls back to gST->ConOut when StdErr is absent
+ * (minimal firmware / BDS).
+ */
+void
+axl_backend_console_write_err(
+    const unsigned short  *str
+    )
+{
+    if (gST == NULL || str == NULL) {
+        return;
+    }
+    if (gST->StdErr != NULL) {
+        gST->StdErr->OutputString(gST->StdErr, (CHAR16 *)str);
+    } else if (gST->ConOut != NULL) {
+        gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)str);
+    }
+}
+
+/**
  * @brief Set console text attribute (color/style).
  */
 void
@@ -128,6 +151,29 @@ axl_backend_console_set_attr(
     )
 {
     if (gST != NULL && gST->ConOut != NULL) {
+        gST->ConOut->SetAttribute(gST->ConOut, attr);
+    }
+}
+
+/**
+ * @brief Set the error console's text attribute (color/style).
+ *
+ * Targets gST->StdErr, symmetric to axl_backend_console_write_err(), so
+ * the escape bytes an ANSI/serial console (TerminalDxe) emits for
+ * SetAttribute land on the same sink as the text they color. Falls
+ * back to gST->ConOut when StdErr is absent (minimal firmware / BDS).
+ */
+void
+axl_backend_console_set_attr_err(
+    uint32_t  attr
+    )
+{
+    if (gST == NULL) {
+        return;
+    }
+    if (gST->StdErr != NULL) {
+        gST->StdErr->SetAttribute(gST->StdErr, attr);
+    } else if (gST->ConOut != NULL) {
         gST->ConOut->SetAttribute(gST->ConOut, attr);
     }
 }
@@ -1153,7 +1199,7 @@ bridge_atexit(
 
 /* Is the bridge's launcher still a loaded image? Forward decl — used by the
    reaper below and the read-path lookup. Definition follows. */
-static bool bridge_launcher_alive(void *launcher_image);
+static bool bridge_launcher_alive(void *launcher_image, void *recorded_proto);
 
 /* Uninstall every installed bridge instance whose launcher image has exited.
    Cross-image and best-effort: it enumerates the whole DB, so a live image can
@@ -1179,7 +1225,7 @@ bridge_reap_dead(void)
             continue;
         }
         AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (!bridge_launcher_alive(b->launcher_image)) {
+        if (!bridge_launcher_alive(b->launcher_image, b->launcher_image_proto)) {
             gBS->UninstallProtocolInterface(handles[i], &guid, iface);
         }
     }
@@ -1217,6 +1263,23 @@ axl_backend_stdio_bridge_install(void)
     mBridge.stdout_h       = out;
     mBridge.stderr_h       = err;
     mBridge.launcher_image = (void *)gImageHandle;
+    /* Record the launcher's OWN LoadedImage protocol pointer alongside its
+       handle. A recycled handle reused by firmware for a different-shaped
+       image yields a different LoadedImage pointer at liveness-check time,
+       narrowing the handle-reuse false-alive gap below — but see
+       bridge_launcher_alive() for why it doesn't fully close it. */
+    {
+        void     *li  = NULL;
+        EFI_GUID  lig = gEfiLoadedImageProtocolGuid;
+        if (!EFI_ERROR(gBS->HandleProtocol(
+                (EFI_HANDLE)gImageHandle, &lig, &li))) {
+            mBridge.launcher_image_proto = li;
+        } else {
+            mBridge.launcher_image_proto = NULL;
+        }
+    }
+    mBridge.pending_status = 0;
+    mBridge.has_pending    = false;
     /* The published interface is &mBridge — a static in THIS (launcher)
        image. It MUST be uninstalled before the image unloads, or the
        firmware protocol DB keeps a dangling pointer into freed image
@@ -1252,14 +1315,29 @@ axl_backend_stdio_bridge_uninstall(void)
    leaked instance is an expected case, not an exotic one. Gate every consult
    on launcher_image still being present in the handle DB. A stale/garbage
    handle value simply fails HandleProtocol and reports dead — the safe
-   answer. The one residual gap: UEFI recycles freed handle values, so if a
-   dead launcher's handle is later reused for a different LoadedImage-bearing
-   image, this reports a false "alive". The window is short and same-shape
-   launchers make it unlikely in practice; a fully robust gate would pair the
-   handle with a monotonic nonce checked against the LoadedImage instance. */
+   answer. UEFI recycles freed handle values, so a naive "is this handle a
+   loaded image" check would report a false "alive" if a dead launcher's
+   handle got reused for a different image.
+
+   Narrowed (not closed) by ALSO comparing the handle's CURRENT LoadedImage
+   protocol pointer against the one recorded at install: a handle reused by
+   a different-shaped image, or one where the handle slot recycles without
+   the loaded-image-data slot behind it, now yields a different pointer and
+   is correctly reported dead. It does NOT cover the dominant trigger — the
+   same launcher binary relaunched repeatedly via gBS->Exit — because the
+   freed handle slot and the freed loaded-image-data slot backing this
+   pointer are released by the same pool event and so tend to recycle
+   together; recorded_proto (itself read from possibly-recycled bridge
+   memory) can then spuriously match. bridge_find_live() below further
+   masks the residual by returning the NEWEST live instance, so on the
+   normal turnkey/dispatch path the current launcher's own (genuinely live)
+   bridge wins over a stale one. A fully-robust gate needs an active
+   per-dispatch liveness signal that doesn't live in the (recyclable)
+   bridge memory — future work, not done here. */
 static bool
 bridge_launcher_alive(
-    void  *launcher_image
+    void  *launcher_image,
+    void  *recorded_proto
     )
 {
     if (launcher_image == NULL) {
@@ -1269,17 +1347,20 @@ bridge_launcher_alive(
     EFI_GUID g = gEfiLoadedImageProtocolGuid;
     return !EFI_ERROR(gBS->HandleProtocol(
                (EFI_HANDLE)launcher_image, &g, &li))
-           && li != NULL;
+           && li != NULL
+           && li == recorded_proto;
 }
 
-/* Live (uncached) lookup — only used on the no-local-shell-params (driver)
-   path. Reaps stale instances first (self-heal: a naive find-first would
-   dereference whatever LocateProtocol returned first — a prior launcher's
-   leaked stale bridge is older, so returned first, and its stdin_h is a freed
-   pipe handle), then returns the StdIn of the newest LIVE survivor (or NULL ->
-   EOF when none are live). */
-static AxlFileHandle
-bridge_lookup_stdin(void)
+/* Live (uncached) bridge lookup — only used on the no-local-shell-params
+   (driver) path. Reaps stale instances first (self-heal: a naive find-first
+   would dereference whatever LocateProtocol returned first — a prior
+   launcher's leaked stale bridge is older, so returned first, and its
+   handles are freed), then returns the newest LIVE survivor's bridge
+   instance (or NULL when none are live). Shared by every per-stream lookup
+   below (stdin, stderr) so each just picks the field it needs off the same
+   live instance. */
+static AxlStdioBridge *
+bridge_find_live(void)
 {
     bridge_reap_dead();
 
@@ -1291,7 +1372,7 @@ bridge_lookup_stdin(void)
         || count == 0 || handles == NULL) {
         return NULL;
     }
-    AxlFileHandle live = NULL;
+    AxlStdioBridge *live = NULL;
     for (UINTN i = 0; i < count; i++) {
         void *iface = NULL;
         if (EFI_ERROR(gBS->HandleProtocol(handles[i], &guid, &iface))
@@ -1299,12 +1380,33 @@ bridge_lookup_stdin(void)
             continue;
         }
         AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (bridge_launcher_alive(b->launcher_image)) {
-            live = b->stdin_h;   /* DB order is oldest-first; newest live wins */
+        if (bridge_launcher_alive(b->launcher_image, b->launcher_image_proto)) {
+            live = b;   /* DB order is oldest-first; newest live wins */
         }
     }
     gBS->FreePool(handles);
     return live;
+}
+
+static AxlFileHandle
+bridge_lookup_stdin(void)
+{
+    AxlStdioBridge *b = bridge_find_live();
+    return (b != NULL) ? b->stdin_h : NULL;
+}
+
+static AxlFileHandle
+bridge_lookup_stdout(void)
+{
+    AxlStdioBridge *b = bridge_find_live();
+    return (b != NULL) ? b->stdout_h : NULL;
+}
+
+static AxlFileHandle
+bridge_lookup_stderr(void)
+{
+    AxlStdioBridge *b = bridge_find_live();
+    return (b != NULL) ? b->stderr_h : NULL;
 }
 
 AxlFileHandle
@@ -1321,14 +1423,20 @@ AxlFileHandle
 axl_backend_shell_stdout(void)
 {
     probe_shell_std_handles();
-    return (AxlFileHandle)mShellStdOut;
+    if (mShellStdOut != NULL) {
+        return (AxlFileHandle)mShellStdOut;  /* app/launcher: own params */
+    }
+    return bridge_lookup_stdout();           /* driver: live bridge consult */
 }
 
 AxlFileHandle
 axl_backend_shell_stderr(void)
 {
     probe_shell_std_handles();
-    return (AxlFileHandle)mShellStdErr;
+    if (mShellStdErr != NULL) {
+        return (AxlFileHandle)mShellStdErr;  /* app/launcher: own params */
+    }
+    return bridge_lookup_stderr();           /* driver: live bridge consult */
 }
 
 const unsigned short *
@@ -1813,6 +1921,37 @@ axl_backend_set_exit_status(uint64_t status)
 {
     g_exit_status       = (EFI_STATUS)status;
     g_exit_status_armed = true;
+
+    /* If THIS image is a resident driver (no shell params of its own) serving
+       a launcher dispatch, reflect the status into the launcher's bridge cell
+       so the launcher's apply/CRT0 returns it. A normal app/launcher (has
+       shell params) skips this and uses its own g_exit_status. */
+    probe_shell_std_handles();
+    if (mShellStdIn == NULL) {
+        /* Assumes SYNCHRONOUS dispatch (the shared-driver pattern has no
+           event loop): only one launcher is ever mid-dispatch at a time, so
+           bridge_find_live() unambiguously returns THAT launcher's bridge. */
+        AxlStdioBridge *b = bridge_find_live();
+        if (b != NULL) {
+            b->pending_status = status;
+            b->has_pending    = true;
+        }
+    }
+}
+
+bool
+axl_backend_bridge_take_exit_status(uint64_t *out)
+{
+    /* Read THIS (launcher) image's own bridge cell — the driver wrote it
+       through the installed protocol interface (== &mBridge here). */
+    if (mBridgeHandle == NULL || !mBridge.has_pending) {
+        return false;
+    }
+    if (out != NULL) {
+        *out = mBridge.pending_status;
+    }
+    mBridge.has_pending = false;
+    return true;
 }
 
 void

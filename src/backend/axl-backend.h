@@ -78,10 +78,31 @@ axl_backend_console_write(
     );
 
 /**
+ * @brief Write a UCS-2 string to the error console (gST->StdErr).
+ *        Falls back to gST->ConOut when StdErr is NULL. NULL-safe.
+ */
+void
+axl_backend_console_write_err(
+    const unsigned short  *str  ///< UCS-2 string to output
+    );
+
+/**
  * @brief Set console text attribute (color/style).
  */
 void
 axl_backend_console_set_attr(
+    uint32_t  attr  ///< attribute bitmask
+    );
+
+/**
+ * @brief Set the error console's text attribute (color/style).
+ *        Targets gST->StdErr so escape bytes emitted by ANSI/serial
+ *        consoles (TerminalDxe) land on the same sink as
+ *        axl_backend_console_write_err() output. Falls back to
+ *        gST->ConOut when StdErr is NULL. NULL-safe.
+ */
+void
+axl_backend_console_set_attr_err(
     uint32_t  attr  ///< attribute bitmask
     );
 
@@ -919,6 +940,9 @@ axl_backend_boot_exit(
 /**
  * @brief Stash a pending verbatim exit status for this image (set by the
  *     public axl_set_exit_status). Honored by both exit paths.
+ *
+ *     Also reflects into a live launcher's stdio-bridge cell when the
+ *     calling image is a resident driver (no shell params of its own).
  */
 void
 axl_backend_set_exit_status(

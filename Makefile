@@ -603,7 +603,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1413,6 +1413,39 @@ $(PREFIX)/stdio-bridge-leak.efi: $(BUILDDIR)/stdio-bridge-leak.o $(LINK_CRT0) $(
 	$(call LINK_EFI_APP,$(BUILDDIR)/stdio-bridge-leak.o,$@)
 
 $(BUILDDIR)/stdio-bridge-leak.o: test/integration/stdio-bridge-leak.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# io-streams — I/O-model redirect fixture tool.
+io-streams: $(PREFIX)/io-streams.efi
+	@echo "  Built: $(PREFIX)/io-streams.efi"
+
+$(PREFIX)/io-streams.efi: $(BUILDDIR)/io-streams.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/io-streams.o,$@)
+
+$(BUILDDIR)/io-streams.o: test/integration/io-streams.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build sd-ergo-launcher.efi (+ -driver.efi) — end-to-end fixture built
+# ENTIRELY from the turnkey AXL_SHARED_DRIVER / AXL_SHARED_DRIVER_LAUNCHER
+# macros (Phase 3 ergonomics). Same dual-image embed pattern as
+# stdio-bridge-fix, but the driver + launcher sources are just the three
+# app-logic functions + one macro invocation each.
+# ===================================================================
+
+sd-ergo: $(PREFIX)/sd-ergo-launcher.efi $(PREFIX)/sd-ergo-driver.efi
+	@echo "  Built: sd-ergo-launcher.efi + sd-ergo-driver.efi"
+
+$(PREFIX)/sd-ergo-driver.efi: $(BUILDDIR)/sd-ergo-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/sd-ergo-driver.o,$@)
+$(BUILDDIR)/sd-ergo-driver.o: test/integration/sd-ergo-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(eval $(call EMBED_BLOB,sd_ergo_driver,$(PREFIX)/sd-ergo-driver.efi))
+
+$(PREFIX)/sd-ergo-launcher.efi: $(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_ergo_driver) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_ergo_driver),$@)
+$(BUILDDIR)/sd-ergo-launcher.o: test/integration/sd-ergo-launcher.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================

@@ -32,6 +32,11 @@ main(int argc, char **argv)
         return 1;
     }
 
-    /* Skip argv[0] (launcher name) so argv[0] becomes the verb. */
+    /* Skip argv[0] (launcher name) so argv[0] becomes the verb. This fixture
+       predates the SDK-standard verbatim-argv contract (AxlSharedDriverVtable.run
+       gets argv[0] = program name, like `int main`) and uses its own private
+       FixVtable, so stripping argv[0] here is a local fixture convenience --
+       new consumers using AxlSharedDriverVtable get argv verbatim and parse
+       argv[1] for the verb. */
     return vt->run(argc - 1, argv + 1);
 }

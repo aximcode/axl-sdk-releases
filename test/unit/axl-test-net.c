@@ -2838,6 +2838,98 @@ cm_selftest_sink(const char *bytes, size_t len, void *user)
     g_cm_cap[g_cm_cap_len] = '\0';
 }
 
+/* Fake EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL standing in for a firmware StdErr
+   that is genuinely a distinct protocol instance from ConOut (some real
+   firmware wires a separate error-device splitter). Used only to give
+   axl_console_mirror_install/uninstall a non-NULL, non-aliased StdErr to
+   save/restore in the regression test below -- real no-op methods, NOT a
+   zeroed struct: axl_console_mirror_uninstall's own axl_info() call fires
+   AFTER restoring gST->StdErr, so log_dispatch's OutputString/SetAttribute
+   calls land on this object for real and must not be NULL function
+   pointers. */
+static EFI_STATUS EFIAPI
+fake_stderr_reset(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
+{
+    (void)This; (void)ext;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    (void)This; (void)String;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_test_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    (void)This; (void)String;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
+                       UINTN *Columns, UINTN *Rows)
+{
+    (void)This; (void)ModeNumber;
+    if (Columns != NULL) {
+        *Columns = 80;
+    }
+    if (Rows != NULL) {
+        *Rows = 25;
+    }
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
+{
+    (void)This; (void)ModeNumber;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_set_attribute(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
+{
+    (void)This; (void)Attribute;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_clear_screen(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
+{
+    (void)This;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_set_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
+{
+    (void)This; (void)Column; (void)Row;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+fake_stderr_enable_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
+{
+    (void)This; (void)Visible;
+    return EFI_SUCCESS;
+}
+
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL g_fake_stderr = {
+    .Reset             = fake_stderr_reset,
+    .OutputString      = fake_stderr_output_string,
+    .TestString        = fake_stderr_test_string,
+    .QueryMode         = fake_stderr_query_mode,
+    .SetMode           = fake_stderr_set_mode,
+    .SetAttribute      = fake_stderr_set_attribute,
+    .ClearScreen       = fake_stderr_clear_screen,
+    .SetCursorPosition = fake_stderr_set_cursor,
+    .EnableCursor      = fake_stderr_enable_cursor,
+    .Mode              = NULL,
+};
+
 static int
 run_mirror_selftest_mode(void)
 {
@@ -2854,7 +2946,7 @@ run_mirror_selftest_mode(void)
 
     bool dbl_blocked = false;
     bool got_clear = false, got_cursor = false, got_sgr = false, got_text = false;
-    bool got_size = false;
+    bool got_size = false, got_stderr = false;
     bool inj_up = false, inj_x = false, inj_f2 = false;
 
     if (rc == AXL_OK) {
@@ -2875,10 +2967,16 @@ run_mirror_selftest_mode(void)
         out->SetAttribute(out, EFI_LIGHTRED);   /* fg 12 -> SGR 91 */
         out->OutputString(out, (CHAR16 *)u"Hi");
 
+        /* Real production path (axl_printerr -> gST->StdErr, falling back to
+           ConOut only if StdErr is NULL): proves stderr text reaches the
+           mirror sink, not just ConOut. */
+        axl_printerr("StdErrMark");
+
         got_clear  = (axl_strstr(g_cm_cap, "\x1b[2J\x1b[H") != NULL);
         got_cursor = (axl_strstr(g_cm_cap, "\x1b[3;5H") != NULL);
         got_sgr    = (axl_strstr(g_cm_cap, "\x1b[0;91;40m") != NULL);
         got_text   = (axl_strstr(g_cm_cap, "Hi") != NULL);
+        got_stderr = (axl_strstr(g_cm_cap, "StdErrMark") != NULL);
 
         EFI_INPUT_KEY k1 = {0}, k2 = {0}, k3 = {0};
         axl_console_mirror_inject_text(m, "\x1b[A", 3);  /* Up  -> scan 0x01 */
@@ -2894,6 +2992,31 @@ run_mirror_selftest_mode(void)
         axl_console_mirror_uninstall(m);  /* restores the console */
     }
 
+    /* Regression test for the StdErr save/restore bug: simulate firmware
+       where StdErr is a genuinely distinct protocol instance from ConOut
+       (some real firmware wires a separate error-device splitter) using
+       g_fake_stderr. Prove install repoints BOTH to the (shared) wrapper
+       and uninstall restores the EXACT original StdErr pointer -- not
+       silently coerced to ConOut's original, which is what a naive
+       "gST->StdErr = orig_conout" restore does (invisible on firmware
+       where StdErr already aliases ConOut, which is why this needs a
+       synthetic distinct instance to catch). Its own install/uninstall
+       cycle so it can't perturb the assertions above. */
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *real_conout_before = gST->ConOut;
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *real_stderr_before = gST->StdErr;
+    gST->StdErr = &g_fake_stderr;
+
+    bool stderr_wrapped = false, stderr_restored = false;
+    AxlConsoleMirror *m3 = NULL;
+    if (axl_console_mirror_install(&m3, &cfg) == AXL_OK) {
+        stderr_wrapped = (gST->StdErr == gST->ConOut
+                          && gST->StdErr != &g_fake_stderr);
+        axl_console_mirror_uninstall(m3);
+        stderr_restored = (gST->StdErr == &g_fake_stderr
+                           && gST->ConOut == real_conout_before);
+    }
+    gST->StdErr = real_stderr_before;  /* true original back, regardless */
+
     /* Console restored: axl_printf reaches the real serial console now. */
     axl_printf("MIRROR_SELFTEST: install=%d\n", rc == AXL_OK);
     axl_printf("MIRROR_SELFTEST: dbl_install_blocked=%d\n", dbl_blocked);
@@ -2902,12 +3025,17 @@ run_mirror_selftest_mode(void)
     axl_printf("MIRROR_SELFTEST: cursor=%d\n", got_cursor);
     axl_printf("MIRROR_SELFTEST: sgr=%d\n", got_sgr);
     axl_printf("MIRROR_SELFTEST: text=%d\n", got_text);
+    axl_printf("MIRROR_SELFTEST: stderr_mirrored=%d\n", got_stderr);
+    axl_printf("MIRROR_SELFTEST: stderr_wrap=%d\n", stderr_wrapped);
+    axl_printf("MIRROR_SELFTEST: stderr_restore=%d\n", stderr_restored);
     axl_printf("MIRROR_SELFTEST: inject_up=%d\n", inj_up);
     axl_printf("MIRROR_SELFTEST: inject_printable=%d\n", inj_x);
     axl_printf("MIRROR_SELFTEST: inject_key_f2=%d\n", inj_f2);
 
     bool all = (rc == AXL_OK) && dbl_blocked && got_size && got_clear
-               && got_cursor && got_sgr && got_text && inj_up && inj_x && inj_f2;
+               && got_cursor && got_sgr && got_text && got_stderr
+               && stderr_wrapped && stderr_restored
+               && inj_up && inj_x && inj_f2;
     axl_printf("MIRROR_SELFTEST_DONE %s\n", all ? "PASS" : "FAIL");
 
     /* Do NOT return to the parent Shell (wrapping its console wedged it).

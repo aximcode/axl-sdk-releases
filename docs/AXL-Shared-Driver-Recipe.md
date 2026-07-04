@@ -7,34 +7,22 @@ amortize startup cost (LoadImage, parsing sidecar data, opening
 firmware protocols) over the boot rather than paying it on every
 shell invocation.
 
-Four small helpers in [`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h)
-wrap the underlying lifecycle:
+The turnkey path is two macros in [`<axl.h>`](../include/axl.h):
+`AXL_SHARED_DRIVER` on the driver side, `AXL_SHARED_DRIVER_LAUNCHER`
+(or the disk-only `AXL_SHARED_DRIVER_LAUNCHER_THIN`) on the launcher
+side. A driver collapses to three plain functions; a launcher
+collapses to one line. Both macros are built on
+[`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h)'s
+lower-level primitives — GUID derivation, publish/locate, the stdio
+bridge, exit-status reflection — which most consumers never call
+directly.
 
-- `axl_shared_driver_publish(name, iface, &handle)` — driver-side, in
-  DriverEntry. Derives the identity GUID from `name` via
-  `axl_guid_v5` against the SDK's shared-driver namespace, then
-  publishes the consumer's vtable on the driver's `gImageHandle`
-  (so a launcher can `LocateHandleBuffer` it for teardown).
-- `axl_shared_driver_unpublish(name, handle, iface)` — driver-side,
-  in the unload callback.
-- `axl_shared_driver_locate(name, driver_filename, embed, embed_len,
-  &iface)` — launcher-side, in `int main`. Ensures the driver is
-  loaded (resident → on-disk → embedded blob), then resolves the
-  vtable.
-- `axl_shared_driver_unload(name)` — launcher-side. Symmetric
-  teardown counterpart to publish — `LocateHandleBuffer` → the
-  driver's image handle → `UnloadImage`. Used by `--reload`-style
-  developer flags and crash-recovery scenarios.
-
-No new AXL type is introduced: the consumer owns its vtable struct
-and the AXL_DRIVER / `int main` CRT wiring. These three functions
-only hide the GUID-derivation convention and the
-`axl_driver_ensure_with_embedded` + `axl_protocol_find_guid`
-choreography. The distribution shape is a single `.efi` file: the
-driver bytes are linked into the launcher via `.incbin`.
-
-The full pattern lives at
-[`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/).
+This recipe leads with the turnkey shape (**Code shape** below). A
+consumer that needs to roll its own resolution — a REPL, a warm
+self-locate fast path that caches the vtable pointer, a `--reload`
+developer flag, or a custom multi-entry-point vtable instead of the
+standard single-`run` one — drops to the primitives directly; see
+**Advanced: rolling your own resolution** near the end.
 
 ## When to use
 
@@ -59,130 +47,161 @@ sits in memory and does nothing.
 
 ### Shared header
 
-The vtable struct is consumer-owned and must be #included by both
-images. Treat it as part of your tool's public contract:
+The only thing that must agree between the two images is the
+identity string — the GUID both halves derive from it
+(`axl_guid_v5` against the SDK's shared-driver namespace) is how the
+launcher finds the driver's published vtable. Put it in a small
+shared header so a typo on one side can't silently desync the pair:
 
 ```c
-// my-tool-protocol.h
-#define MY_TOOL_NAME  "my-tool"   // shared-driver identity
-
-typedef struct {
-    int (*verb_a)(int arg);
-    int (*verb_b)(const char *name);
-} MyToolVtable;
+// my-tool-shared.h
+#define MY_TOOL_NAME  "my-vendor/my-tool"   // shared-driver identity
 ```
+
+Unlike the manual pattern (see Advanced below), the turnkey path
+needs no consumer-owned vtable struct — the cross-image contract is
+the SDK's fixed `AxlSharedDriverVtable`, a single
+`int run(int argc, char **argv)` entry. If your two images also
+share other code (argv helpers, formatters), that's the "Sharing
+helpers" section further down; it's unrelated to this identity
+string.
 
 ### Driver side
 
-The driver publishes the vtable via `axl_shared_driver_publish` from
-its DriverEntry, after any per-boot setup work. Multi-source-file
-is fine — only the entry-point file needs `AXL_DRIVER`:
+Define three `static` functions — `init`, `run`, `unload` — FIRST,
+then invoke `AXL_SHARED_DRIVER` LAST:
 
 ```c
 // my-tool-dxe.c
 #include <axl.h>
-#include "my-tool-protocol.h"
+#include "my-tool-shared.h"
 
-static int do_verb_a(int arg) { /* ... */ return arg + 1; }
-static int do_verb_b(const char *name) { /* ... */ return 0; }
+static int my_init(void);
+static int my_run(int argc, char **argv);
+static int my_unload(void);
 
-static MyToolVtable gVtable;
-static AxlHandle    gPublishedHandle;
-
-static int my_main(AxlHandle h, AxlSystemTable *st) {
-    (void)h; (void)st;
-    gVtable.verb_a = do_verb_a;
-    gVtable.verb_b = do_verb_b;
-    return axl_shared_driver_publish(MY_TOOL_NAME, &gVtable,
-                                     &gPublishedHandle);
+static int my_init(void) {
+    /* One-time per-boot setup: sidecar loads, protocol opens,
+     * caches. Non-zero return aborts the driver load. */
+    return 0;
 }
 
-static int my_unload(AxlHandle h) {
-    (void)h;
-    return axl_shared_driver_unpublish(MY_TOOL_NAME,
-                                       gPublishedHandle, &gVtable);
+static int my_run(int argc, char **argv) {
+    /* This IS int main: argv[0] is the program name, verb/args
+     * start at argv[1] — exactly the launcher's own argv, verbatim. */
+    (void)argc; (void)argv;
+    return 0;
 }
 
-AXL_DRIVER(my_main, my_unload)
+static int my_unload(void) {
+    /* Teardown: close held protocols, free caches. */
+    return 0;
+}
+
+AXL_SHARED_DRIVER(MY_TOOL_NAME, my_init, my_run, my_unload)
 ```
+
+`AXL_SHARED_DRIVER` emits the driver image's entire
+`DriverEntry`/unload wiring: it calls `my_init` once, publishes the
+SDK's standard `AxlSharedDriverVtable{ .run = my_run }` under
+`MY_TOOL_NAME`, and on unload unpublishes before calling
+`my_unload`. No vtable definition, no
+`axl_shared_driver_publish`/`_unpublish` call, no `AXL_DRIVER` — the
+three functions above are the whole driver.
+
+**Static-first, macro-last — no exceptions.** The macro
+forward-declares all three functions with external linkage. A
+`static` *definition* written after that forward declaration fails
+to compile ("static declaration follows non-static declaration").
+Declaring (and defining) them `static` before the macro call, as
+above, sidesteps the ordering hazard entirely.
+
+**One DriverEntry-emitting macro per translation unit.**
+`AXL_SHARED_DRIVER`, `AXL_DRIVER`, and `AXL_SERVICE_DRIVER` each emit
+a `DriverEntry` symbol; a driver image uses exactly one.
 
 ### Launcher side
 
-The launcher calls `axl_shared_driver_locate`, which ensures the
-driver is loaded (resident → on-disk → embedded blob) and resolves
-the vtable in one call:
+The entire launcher `int main` is one macro invocation:
 
 ```c
 // my-tool.c
 #include <axl.h>
-#include <axl/axl-embed.h>
-#include "my-tool-protocol.h"
+#include "my-tool-shared.h"
 
-AXL_EMBED_DECLARE(my_tool_driver);
-
-int main(int argc, char **argv) {
-    MyToolVtable *vt = NULL;
-    if (axl_shared_driver_locate(MY_TOOL_NAME,
-                                 "myToolDxe.efi",
-                                 AXL_EMBED_DATA(my_tool_driver),
-                                 AXL_EMBED_SIZE(my_tool_driver),
-                                 (void **)&vt) != AXL_OK) {
-        axl_printf("my-tool: failed to load driver\n");
-        return 1;
-    }
-
-    /* Parse argv and dispatch into the resident driver. */
-    (void)argc; (void)argv;
-    return vt->verb_a(7);
-}
+AXL_SHARED_DRIVER_LAUNCHER(MY_TOOL_NAME, "myToolDxe.efi", my_tool_driver)
 ```
 
-After the first invocation, the driver image stays resident.
-Subsequent runs of `my-tool.efi` skip the LoadImage step entirely
-— `axl_driver_ensure_with_embedded` short-circuits at step 1 when
-`LocateProtocol(gMyToolGuid)` already succeeds.
+`my_tool_driver` is an `AXL_EMBED` symbol — the macro declares it
+internally, you don't need a separate `AXL_EMBED_DECLARE`. The build
+step that produces the embedded bytes is covered in Build below. At
+runtime the macro resolves the driver (resident → on-disk
+`myToolDxe.efi` → the embedded blob, first hit wins), installs the
+stdio bridge, calls `my_run(argc, argv)` with the launcher's argv
+**verbatim**, and reflects `my_run`'s return value — and any status
+it armed via `axl_set_exit_status` — as the launcher's own exit
+status.
 
-## Build
+For a disk-only launcher (no embedded fallback — smallest
+per-command transfer, at the cost of requiring `myToolDxe.efi` to
+already be reachable on a volume), drop the embed argument:
 
-Either the CMake helpers (preferred for non-trivial projects) or
-`axl-cc` directly.
+```c
+// my-tool.c
+#include <axl.h>
+#include "my-tool-shared.h"
 
-### CMake
-
-```cmake
-find_package(axl REQUIRED)
-
-axl_add_driver(myToolDxe myToolDxe.c)
-
-axl_add_app(myTool myTool.c
-    EMBEDS ${myToolDxe_EFI_PATH}=my_tool_driver
-)
-add_dependencies(myTool myToolDxe)
+AXL_SHARED_DRIVER_LAUNCHER_THIN(MY_TOOL_NAME, "myToolDxe.efi")
 ```
 
-The `${TARGET}_EFI_PATH` variable is set by `axl_add_driver` and
-`axl_add_app`; use it to pass the driver's output to a launcher's
-`EMBEDS` clause without re-deriving the path. The
-`add_dependencies` line is required so the launcher's embed step
-sees an up-to-date driver `.efi` on rebuild.
+### What the SDK owns
 
-The `EMBEDS` clause takes entries of the form `PATH=NAME` (the
-canonical form) or `PATH` (the embed symbol is derived from the
-file's basename). Multiple entries are supported. If a path
-itself contains `=`, the separator is the *last* `=` — i.e.
-`a=b.efi=my_blob` embeds the file `a=b.efi` under symbol
-`my_blob`. Paths containing `=` are rare in practice; if you hit
-one, use the explicit `PATH=NAME` form to remove ambiguity.
+Both macros are built from `<axl/axl-shared-driver.h>` primitives
+composed for you:
 
-### axl-cc
+- **Resolve.** `axl_shared_driver_run` (which
+  `AXL_SHARED_DRIVER_LAUNCHER`/`_THIN` call) tries, in order: an
+  already-resident driver (`LocateProtocol` short-circuit), then
+  on-disk `driver_filename`, then the embedded blob (skipped for
+  `_THIN`). First hit wins; nothing after it runs.
+- **Stdio bridge.** Installed automatically before `my_run` is
+  called, so the resident driver's `axl_stdin`/`axl_stderr` reflect
+  *this* launcher invocation's console and redirects — a resident
+  driver image otherwise has no shell parameters of its own to read.
+  Uninstalled at launcher exit (`axl_atexit`), so it never outlives
+  one invocation.
+- **Exit-status reflection.** A driver verb calling
+  `axl_set_exit_status(N)` (`<axl/axl-signal.h>`) — the same call any
+  `int main` app makes — has `N` cross the bridge and become the
+  launcher's own exit status, so `%lasterror%` after
+  `my-tool.efi verb` reflects what the *driver* decided, not just
+  `my_run`'s plain C return value.
 
-```bash
-# Driver first — produces myToolDxe.efi
-axl-cc --type driver myToolDxe.c -o myToolDxe.efi
+#### Per-stream behavior
 
-# Launcher second — embeds the driver, produces myTool.efi
-axl-cc --embed myToolDxe.efi=my_tool_driver myTool.c -o myTool.efi
-```
+| Stream | In the driver verb | Redirection honored |
+|---|---|---|
+| stdin, raw | `axl_stdin` — raw bytes (UCS-2 on the default `\|` pipe) | `<file`, `\|a` (ASCII pipe) |
+| stdin, text | `axl_stdin_text()` — decodes UCS-2 (and BOM'd UTF-16/UTF-8) to UTF-8; create fresh per dispatch, close with `axl_fclose` | `<file`, default `\|` pipe, interactive |
+| stdout, text | `axl_print`/`axl_printf` → `gST->ConOut` | `>file` |
+| stdout, raw | `axl_stdout_raw` → shell StdOut handle, binary | `>file` |
+| stderr, text | `axl_printerr`; diagnostics (`axl_log`/`axl_warning`) → `gST->StdErr` | `2>file`, **not** `>file` |
+| stderr, raw | `axl_stderr_raw` → shell StdErr handle, binary | `2>file`, **not** `>file` |
+
+Two caveats:
+
+1. **Shell `MAX_BIT` truncation.** The UEFI reference Shell
+   (`ShellPkg`'s `RunCommand`) strips bit 63 (`MAX_BIT`) from an
+   *error-class* `.efi` exit status before exposing it as
+   `%lasterror%` (`Status & ~MAX_BIT`). Small-int / success-class
+   statuses survive unchanged; an `ENCODE_ERROR(n)` status does not.
+   The full 64-bit value is still available to a programmatic
+   `EFI_STATUS` reader (e.g. `gBS->StartImage`'s return), so prefer
+   that when bit 63 matters to the caller.
+2. **Redirected output is shell-encoded, not UTF-8.** `>` produces
+   UCS-2 with a BOM; `>a` produces ASCII. Neither is UTF-8. A driver
+   verb that needs to write a UTF-8 file should use `axl_fopen`
+   directly rather than rely on shell redirection.
 
 ## Sharing helpers between launcher and driver
 
@@ -245,47 +264,62 @@ pointing at random low memory — diagnostically opaque, hard to
 correlate to "you forgot a .c file in your source list." Use
 axl-cc or the helpers; both pass `--no-undefined`.
 
-The [`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/)
-example demonstrates this exact pattern with a small
-`shared-driver-demo-format.{c,h}` TU compiled into both images.
+A consumer whose launcher keeps custom code — a `--reload` flag, a
+REPL, or any of the Advanced patterns below — lists a shared TU like
+this in both `axl_add_driver` and `axl_add_app`'s source lists, same
+as sketched above. The turnkey
+[`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/)
+example doesn't need this: its launcher's entire `int main` is the
+`AXL_SHARED_DRIVER_LAUNCHER` macro, so there's no launcher-side call
+site left to share a helper from — its `shared-driver-demo-format.c`
+lives in the driver's source list only. See the comment at the top of
+that example's `shared-driver-demo-format.h` for the full explanation.
 
-## Reload / teardown
+## Build
 
-Drop the resident driver from outside its own image — useful for a
-launcher's `--reload` developer flag (pick up a freshly-built
-driver `.efi` without a firmware reboot) or for crash-recovery
-scenarios where you want to discard a driver that's in a bad
-state:
+Either the CMake helpers (preferred for non-trivial projects) or
+`axl-cc` directly.
 
-```c
-if (consumer_wants_reload) {
-    /* Returns AXL_OK if driver wasn't resident (post-condition
-     * "not loaded" already holds). On success the next locate
-     * call falls through LocateProtocol's short-circuit and
-     * does a fresh LoadImage. */
-    axl_shared_driver_unload(MY_TOOL_NAME);
-}
-MyToolVtable *vt = NULL;
-axl_shared_driver_locate(MY_TOOL_NAME, /* ... */, (void **)&vt);
-return vt->do_run(argc, argv);
+### CMake
+
+```cmake
+find_package(axl REQUIRED)
+
+axl_add_driver(myToolDxe myToolDxe.c)
+
+axl_add_app(myTool myTool.c
+    EMBEDS ${myToolDxe_EFI_PATH}=my_tool_driver
+)
+add_dependencies(myTool myToolDxe)
 ```
 
-Resolution: `axl_shared_driver_unload` derives the protocol GUID
-from `name`, calls `LocateHandleBuffer(ByProtocol, ...)` to find
-the driver's image handle (publish installs on the driver's
-`gImageHandle`, so the protocol-bearing handle IS the
-loaded-image handle), then `axl_driver_unload` → `gBS->UnloadImage`,
-which fires the driver's registered unload callback (which calls
-`axl_shared_driver_unpublish` to remove the protocol install).
-The driver's pages get freed; the next launcher invocation pays
-the full LoadImage cost again.
+The `${TARGET}_EFI_PATH` variable is set by `axl_add_driver` and
+`axl_add_app`; use it to pass the driver's output to a launcher's
+`EMBEDS` clause without re-deriving the path. The
+`add_dependencies` line is required so the launcher's embed step
+sees an up-to-date driver `.efi` on rebuild.
 
-**Must not be called from inside the driver image itself.**
-`gBS->UnloadImage` on a self-executing image is undefined behavior
-(the image's pages get freed mid-stack-frame). The driver-side
-teardown path is `axl_shared_driver_unpublish` from the driver's
-unload callback; the launcher-side teardown is
-`axl_shared_driver_unload`. They are not interchangeable.
+The `EMBEDS` clause takes entries of the form `PATH=NAME` (the
+canonical form) or `PATH` (the embed symbol is derived from the
+file's basename). Multiple entries are supported. If a path
+itself contains `=`, the separator is the *last* `=` — i.e.
+`a=b.efi=my_blob` embeds the file `a=b.efi` under symbol
+`my_blob`. Paths containing `=` are rare in practice; if you hit
+one, use the explicit `PATH=NAME` form to remove ambiguity.
+
+### axl-cc
+
+```bash
+# Driver first — produces myToolDxe.efi
+axl-cc --type driver myToolDxe.c -o myToolDxe.efi
+
+# Launcher second — embeds the driver, produces myTool.efi
+axl-cc --embed myToolDxe.efi=my_tool_driver myTool.c -o myTool.efi
+```
+
+For `AXL_SHARED_DRIVER_LAUNCHER_THIN` (no embed), drop `--embed` and
+the driver `.efi` ships as a second file the launcher locates on
+disk instead.
 
 ## Performance properties
 
@@ -306,37 +340,50 @@ What it doesn't pay:
 
 For diagnostic scripts that invoke the same tool dozens of times
 across a session, this typically reduces aggregate runtime by an
-order of magnitude.
+order of magnitude. This holds whether the resolve step runs via
+the turnkey macros or the Advanced primitives directly — both go
+through the same `axl_driver_ensure_with_embedded` short-circuit.
 
 ## Hazards and contracts
 
-**Shared vtable struct layout.** The launcher and driver must
-agree on the protocol GUID *and* on the vtable struct layout. Put
-both in a shared header (`my-tool-protocol.h`) included by both
-build targets. ABI shifts on the consumer's side will silently
-crash the launcher on the first vtable call.
+**Shared vtable struct layout.** Only a concern if you've opted into
+the Advanced custom-vtable pattern (the turnkey path's vtable is the
+SDK's fixed `AxlSharedDriverVtable`, so there's no consumer-owned
+layout to drift). If you do roll a custom vtable, the launcher and
+driver must agree on its layout; put it in a shared header and
+rebuild both images together when it changes. ABI shifts on the
+consumer's side will silently crash the launcher on the first vtable
+call.
 
 **Held-protocol cleanup.** If the driver's setup opens UEFI
 protocols (`OpenProtocol` with a BY_DRIVER attribute), the unload
-callback must close them. Otherwise `axl_driver_unload` (or
-firmware-side `UnloadImage`) returns `EFI_ACCESS_DENIED`. Use
-`axl_protocol_install` and `axl_protocol_uninstall` for
-the published vtable — those don't have the BY_DRIVER hazard.
+function (`my_unload` above) must close them. Otherwise
+`axl_driver_unload` (or firmware-side `UnloadImage`) returns
+`EFI_ACCESS_DENIED`. Use `axl_protocol_install` and
+`axl_protocol_uninstall` for the published vtable — those don't
+have the BY_DRIVER hazard.
 
-**Dangling pointers after unload.** A launcher that calls
-`axl_driver_unload` (or sees the driver unloaded out from under it
-some other way) holds a stale `vt` pointer. Either keep the driver
-resident for the full boot session, or re-locate the protocol on
-every entry to the launcher.
+**Dangling pointers after unload.** Only a concern for the Advanced
+patterns that cache a resolved vtable pointer across multiple
+dispatches within one process (a warm self-locate fast path, a
+REPL). A turnkey launcher resolves and dispatches once per process
+and then exits, so it never observes a stale pointer. A caching
+consumer that calls `axl_driver_unload` (or otherwise sees the
+driver unloaded from under it) holds a stale `vt` pointer after
+that point — either keep the driver resident for the full boot
+session, or re-locate the protocol on every entry.
 
-**Identity.** The vtable GUID is derived from the `name` string
-both halves pass to the helpers (`axl_guid_v5` against the SDK's
-shared-driver namespace). Two consumers passing the same name will
-collide — pick something tool-specific (e.g. `"my-vendor/my-tool"`)
-rather than generic words. The derivation is deterministic so the
-driver and launcher always reach the same GUID; a name typo on one
-side silently breaks pairing, so keep the constant in a shared
-header (the `MY_TOOL_NAME` `#define` above).
+**Identity.** The vtable GUID is derived from the `name` string both
+halves pass — `AXL_SHARED_DRIVER`'s and
+`AXL_SHARED_DRIVER_LAUNCHER`'s first argument on the turnkey path, or
+every direct call to the primitives on the Advanced path
+(`axl_guid_v5` against the SDK's shared-driver namespace). Two
+consumers passing the same name will collide — pick something
+tool-specific (e.g. `"my-vendor/my-tool"`) rather than generic
+words. The derivation is deterministic so the driver and launcher
+always reach the same GUID; a name typo on one side silently breaks
+pairing, so keep the constant in a shared header (the `MY_TOOL_NAME`
+`#define` above).
 
 ## How this composes with other AXL primitives
 
@@ -355,65 +402,201 @@ talking through a UEFI protocol. Everything that works in an
   launcher runs comparable.
 - The launcher can pass per-invocation configuration through to
   the driver via the `load_options` parameter of
-  `axl_driver_ensure_with_embedded` and the driver-side
+  `axl_shared_driver_locate_with_load_options` /
+  `_with_image_info` and the driver-side
   `axl_driver_get_load_options_raw`.
 
-## Stdio is bridged automatically
+## Advanced: rolling your own resolution
 
-A resident driver verb's `axl_readline(axl_stdin)` and `axl_print(...)` /
-`axl_printf(...)` transparently reflect the *launcher's* console and
-redirects — no per-tool code required.
+Everything above is the default. Drop to the primitives directly
+only when you need something the turnkey macros don't give you:
 
-When the launcher calls `axl_shared_driver_locate`, an internal
-stdio-bridge protocol is installed before dispatch. The driver-side
-backend stdin getter consults that protocol when the driver image has no
-shell parameters of its own (which it never does — it's a resident driver,
-not a shell invocation). This means:
+- A **warm self-locate fast path** that resolves the vtable once and
+  caches the pointer across multiple dispatches in one process
+  (rather than re-resolving on every launcher invocation, which the
+  turnkey macros always do — it's cheap, but not free).
+- A **REPL-style launcher** that dispatches into the driver
+  repeatedly within one process lifetime.
+- A **`--reload` developer flag** that forces a fresh driver image on
+  the next invocation, bypassing the resident short-circuit — there's
+  no turnkey hook for this; it requires calling `axl_shared_driver_unload`
+  yourself.
+- A **custom, multi-entry-point vtable** instead of the standard
+  single-`run` `AxlSharedDriverVtable` — e.g. a tool whose driver-side
+  API is naturally several distinct functions rather than one verb
+  dispatcher.
 
-- **Interactive input** — the driver's `axl_readline(axl_stdin)` reads
-  from the same keyboard the user is typing at.
-- **`<` file redirect** — `my-tool.efi verb < input.txt` feeds `input.txt`
-  into the driver verb's `axl_readline` calls exactly as it would for any
-  shell app.
-- **`>` output redirect** — driver output already honors `>` via the
-  shell's `gST->ConOut` swap during the launcher window. `my-tool.efi verb
-  > out.txt` captures everything the driver verb prints.
-- **Piped input** — the UEFI Shell's default `|` pipe carries **UCS-2**,
-  not raw bytes. To read piped *text*, read through `axl_stdin_text()`
-  (a fresh `axl_text_stream_wrap(axl_stdin)`), which transparently decodes
-  UCS-2 (and BOM'd UTF-16/UTF-8) to UTF-8 — then `echo args | my-tool.efi
-  verb` works with the plain `|`:
+The [`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/)
+example demonstrates the turnkey macros above (**Code shape**), not
+the pattern below — reach for the custom-vtable pattern only when you
+actually need one of the four bullets above. The turnkey macros' own
+runnable, both-arches-tested proof is the `sd-ergo` fixture in
+`test/integration/`.
 
-  ```c
-  AxlStream *in = axl_stdin_text();      /* fresh per dispatch; caller closes */
-  char *line = axl_readline(in);
-  /* ... use line ... */
-  axl_free(line);
-  axl_fclose(in);   /* closes the wrapper only — it does not own axl_stdin */
-  ```
+### Custom vtable pattern
 
-  Reading `axl_stdin` *raw* instead (no wrapper) gets UCS-2 bytes from a
-  default `|`; for that path use the shell's ASCII pipe `|a` (e.g.
-  `echo args |a my-tool.efi verb`). This is `axl_stdin`'s pre-existing
-  raw-byte contract — the same as any `axl_stdin` consumer — not a bridge
-  limitation. `<` redirection and interactive input need no wrapper for
-  ASCII, but `axl_stdin_text()` handles their encodings too. **Do not cache
-  the `axl_stdin_text()` stream across invocations** in a resident driver —
-  create a fresh one per dispatch (it buffers read-ahead + a one-time
-  encoding sniff).
+The vtable struct is consumer-owned and must be `#include`d by both
+images. Treat it as part of your tool's public contract:
 
-The bridge is uninstalled (via `axl_atexit`) when the launcher exits, so
-it does not outlive the invocation.
+```c
+// my-tool-protocol.h
+#define MY_TOOL_NAME  "my-tool"   // shared-driver identity
 
-### "I roll my own locate" — call the install explicitly
+typedef struct {
+    int (*verb_a)(int arg);
+    int (*verb_b)(const char *name);
+} MyToolVtable;
+```
 
-The automatic install lives inside `axl_shared_driver_locate*`. If your
-launcher resolves the resident driver **some other way** — the warm
-fast-path (`axl_shared_driver_guid` + `axl_protocol_find_guid`),
-`axl_driver_load_sibling`, a hand-rolled embedded-blob fallback, or a
-custom `--reload` chain — then `locate` never runs and the bridge is
-**never installed**. The resident driver's `axl_stdin` stays EOF and
-`echo args | my-tool.efi verb` reads nothing.
+**Driver side** — publish the vtable via `axl_shared_driver_publish`
+from `DriverEntry`, after any per-boot setup work. Multi-source-file
+is fine — only the entry-point file needs `AXL_DRIVER`:
+
+```c
+// my-tool-dxe.c
+#include <axl.h>
+#include "my-tool-protocol.h"
+
+static int do_verb_a(int arg) { /* ... */ return arg + 1; }
+static int do_verb_b(const char *name) { /* ... */ return 0; }
+
+static MyToolVtable gVtable;
+static AxlHandle    gPublishedHandle;
+
+static int my_main(AxlHandle h, AxlSystemTable *st) {
+    (void)h; (void)st;
+    gVtable.verb_a = do_verb_a;
+    gVtable.verb_b = do_verb_b;
+    return axl_shared_driver_publish(MY_TOOL_NAME, &gVtable,
+                                     &gPublishedHandle);
+}
+
+static int my_unload(AxlHandle h) {
+    (void)h;
+    return axl_shared_driver_unpublish(MY_TOOL_NAME,
+                                       gPublishedHandle, &gVtable);
+}
+
+AXL_DRIVER(my_main, my_unload)
+```
+
+**Launcher side** — call `axl_shared_driver_locate`, which ensures
+the driver is loaded (resident → on-disk → embedded blob) and
+resolves the vtable in one call:
+
+```c
+// my-tool.c
+#include <axl.h>
+#include <axl/axl-embed.h>
+#include "my-tool-protocol.h"
+
+AXL_EMBED_DECLARE(my_tool_driver);
+
+int main(int argc, char **argv) {
+    MyToolVtable *vt = NULL;
+    if (axl_shared_driver_locate(MY_TOOL_NAME,
+                                 "myToolDxe.efi",
+                                 AXL_EMBED_DATA(my_tool_driver),
+                                 AXL_EMBED_SIZE(my_tool_driver),
+                                 (void **)&vt) != AXL_OK) {
+        axl_printf("my-tool: failed to load driver\n");
+        return 1;
+    }
+
+    /* Parse argv and dispatch into the resident driver. */
+    (void)argc; (void)argv;
+    return vt->verb_a(7);
+}
+```
+
+After the first invocation, the driver image stays resident.
+Subsequent runs of `my-tool.efi` skip the LoadImage step entirely
+— `axl_driver_ensure_with_embedded` short-circuits at step 1 when
+`LocateProtocol(gMyToolGuid)` already succeeds.
+
+Note this custom-vtable launcher does **not** get the stdio bridge
+or exit-status reflection for free — `axl_shared_driver_locate`
+installs the bridge (see below), but applying an armed exit status
+and dispatching through the standard vtable are separate steps you
+opt into explicitly, covered next.
+
+### The per-dispatch bracket: `axl_shared_driver_dispatch`
+
+If your driver publishes the *standard* `AxlSharedDriverVtable`
+(single `run(argc, argv)` entry) but you still want to control
+resolution yourself — a cached warm pointer, a REPL loop, a
+`--reload` chain — `axl_shared_driver_dispatch(vt, argc, argv)` is
+the bracket to call once you have a resolved `vt`:
+
+```c
+AxlSharedDriverVtable *vt = my_cached_or_resolved_vt();   /* however you found it */
+int rc = axl_shared_driver_dispatch(vt, argc, argv);
+```
+
+It installs the stdio bridge, calls `vt->run(argc, argv)` forwarding
+`argc`/`argv` unchanged, then applies any exit status the driver
+armed — the same three steps `axl_shared_driver_run` (and therefore
+`AXL_SHARED_DRIVER_LAUNCHER`) performs after its own resolve step.
+Use it whenever you resolve the vtable through a path other than
+`axl_shared_driver_locate*` but still want the bridge + exit-status
+behavior "for free" per dispatch.
+
+### Reload / teardown
+
+Drop the resident driver from outside its own image — useful for a
+launcher's `--reload` developer flag (pick up a freshly-built
+driver `.efi` without a firmware reboot) or for crash-recovery
+scenarios where you want to discard a driver that's in a bad
+state. This composes with either driver flavor above; the example
+below assumes a driver built with `AXL_SHARED_DRIVER` (standard
+vtable, from Code shape), driven by a launcher that wants manual
+control over the resident instance instead of the turnkey
+`AXL_SHARED_DRIVER_LAUNCHER`:
+
+```c
+if (consumer_wants_reload) {
+    /* Returns AXL_OK if driver wasn't resident (post-condition
+     * "not loaded" already holds). On success the next locate
+     * call falls through LocateProtocol's short-circuit and
+     * does a fresh LoadImage. */
+    axl_shared_driver_unload(MY_TOOL_NAME);
+}
+AxlSharedDriverVtable *vt = NULL;
+axl_shared_driver_locate(MY_TOOL_NAME, "myToolDxe.efi",
+                         AXL_EMBED_DATA(my_tool_driver),
+                         AXL_EMBED_SIZE(my_tool_driver),
+                         (void **)&vt);
+return axl_shared_driver_dispatch(vt, argc, argv);
+```
+
+Resolution: `axl_shared_driver_unload` derives the protocol GUID
+from `name`, calls `LocateHandleBuffer(ByProtocol, ...)` to find
+the driver's image handle (publish installs on the driver's
+`gImageHandle`, so the protocol-bearing handle IS the
+loaded-image handle), then `axl_driver_unload` → `gBS->UnloadImage`,
+which fires the driver's registered unload callback (which calls
+`axl_shared_driver_unpublish` to remove the protocol install).
+The driver's pages get freed; the next launcher invocation pays
+the full LoadImage cost again.
+
+**Must not be called from inside the driver image itself.**
+`gBS->UnloadImage` on a self-executing image is undefined behavior
+(the image's pages get freed mid-stack-frame). The driver-side
+teardown path is `axl_shared_driver_unpublish` from the driver's
+unload callback; the launcher-side teardown is
+`axl_shared_driver_unload`. They are not interchangeable.
+
+### Bridging stdio when you resolve the driver yourself
+
+Every `axl_shared_driver_locate*` variant (and, transitively,
+`axl_shared_driver_run`/`axl_shared_driver_dispatch`) installs the
+stdio bridge automatically. If your launcher resolves the resident
+driver **some other way** — the warm fast-path
+(`axl_shared_driver_guid` + `axl_protocol_find_guid`),
+`axl_driver_load_sibling`, a hand-rolled embedded-blob fallback — the
+bridge is **never installed** on that path. The resident driver's
+`axl_stdin` stays EOF and `echo args | my-tool.efi verb` reads
+nothing.
 
 For that case, call the public escape hatch from the launcher, once,
 before dispatching into the driver:
@@ -429,27 +612,71 @@ axl_shared_driver_install_stdio_bridge();
 return vt->do_run(argc, argv);   /* driver reads via axl_stdin_text() */
 ```
 
-It re-publishes on every call (so it's safe — and correct — to call on
-each launcher invocation), is auto-uninstalled at launcher exit, and is
-a no-op when the launcher has no shell handles of its own. Launchers
-that use `axl_shared_driver_locate*` must **not** call it — they already
+It re-publishes on every call (so it's safe — and correct — to call
+on each launcher invocation), is auto-uninstalled at launcher exit,
+and is a no-op when the launcher has no shell handles of its own.
+Launchers that use `axl_shared_driver_locate*`, `axl_shared_driver_run`,
+or `axl_shared_driver_dispatch` must **not** call it — they already
 get the bridge for free.
+
+### Applying exit status when you dispatch yourself
+
+`axl_shared_driver_dispatch` (and therefore
+`axl_shared_driver_run`/`AXL_SHARED_DRIVER_LAUNCHER`) already applies
+a driver's armed exit status automatically. If you call a resolved
+vtable's `run` directly instead of going through
+`axl_shared_driver_dispatch` — e.g. a REPL that dispatches many times
+per process and wants explicit control over when the reflected
+status lands — call `axl_shared_driver_apply_exit_status()`
+yourself, immediately after the dispatch call returns:
+
+```c
+int rc = vt->run(argc, argv);
+axl_shared_driver_apply_exit_status();   /* no-op if the driver armed nothing */
+return rc;
+```
+
+It does NOT clear a previously-applied launcher exit status — it
+only drains the bridge's pending cell into `axl_set_exit_status`
+when one is pending. A REPL-style launcher that wants strict
+per-dispatch semantics (this round's status only, not a stale one
+left over from an earlier round) should clear its own armed status
+between dispatches, or rely on the `AXL_ERR` return here to know
+nothing was applied this round.
+
+**EDK2 caveat:** the reflection itself carries the full `uint64_t`
+verbatim across the bridge, but see the shell `MAX_BIT` truncation
+caveat under "What the SDK owns" above — it applies here too.
 
 ## See also
 
+- [`<axl.h>`](../include/axl.h) — `AXL_SHARED_DRIVER`,
+  `AXL_SHARED_DRIVER_LAUNCHER`, `AXL_SHARED_DRIVER_LAUNCHER_THIN`
+  (the turnkey macros used above).
 - [`<axl/axl-shared-driver.h>`](../include/axl/axl-shared-driver.h) —
-  the three convenience helpers used above.
+  `AxlSharedDriverVtable` and the underlying primitives
+  (`axl_shared_driver_publish`/`_unpublish`/`_locate`/`_unload`/
+  `_dispatch`/`_run`, the stdio-bridge and exit-status functions)
+  used directly by the Advanced patterns.
 - [`<axl/axl-driver.h>`](../include/axl/axl-driver.h) — underlying
   driver lifecycle primitives (`axl_driver_ensure_with_embedded`
   etc.).
 - [`<axl/axl-embed.h>`](../include/axl/axl-embed.h) — link-time
   blob embedding (`AXL_EMBED_DECLARE` / `AXL_EMBED_DATA` /
-  `AXL_EMBED_SIZE`).
+  `AXL_EMBED_SIZE`); `AXL_SHARED_DRIVER_LAUNCHER` calls
+  `AXL_EMBED_DECLARE` internally, so a turnkey launcher doesn't
+  write it directly.
 - [`<axl/axl-service.h>`](../include/axl/axl-service.h) — sibling
   pattern for drivers that run a periodic event loop between
   invocations.
+- [`test/integration/sd-ergo-driver.c`](../test/integration/sd-ergo-driver.c) /
+  [`sd-ergo-launcher.c`](../test/integration/sd-ergo-launcher.c) —
+  the turnkey macros' own runnable, both-arches-tested proof
+  (stdin/stdout/exit-status round trip).
 - [`sdk/examples/shared-driver-demo/`](../sdk/examples/shared-driver-demo/)
-  — runnable pair (driver + launcher + shared header) that maps
-  one-to-one onto the recipe above.
+  — a thoroughly-commented teaching pair (driver + launcher + shared
+  identity header) built entirely from `AXL_SHARED_DRIVER` /
+  `AXL_SHARED_DRIVER_LAUNCHER`, exercising stdin/stdout/stderr and
+  exit-status from plain app-style verb code.
 - [`sdk/examples/driver.c`](../sdk/examples/driver.c) — canonical
   `AXL_DRIVER` shape (single-image example).

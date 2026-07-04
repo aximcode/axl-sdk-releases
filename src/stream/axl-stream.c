@@ -142,15 +142,18 @@ console_transcode_crlf(
    to a single heap alloc sized for their worst case. */
 #define CONSOLE_WRITE_STACK_UCS2  (2 * AXL_PRINTF_STACK_BUFFER + 1)
 
+/* Shared UTF-8 → UCS-2 CRLF transcode + stack/heap-overflow handling
+   for the text console sinks. ConOut and ConErr differ only in which
+   backend function receives the transcoded buffer, so @p emit carries
+   that difference in. Returns @p count on success, or -1 on heap
+   allocation failure servicing an oversized single call. */
 static axl_ssize_t
-console_write(void *ctx, const void *data, size_t count)
+console_write_via(
+    const void  *data,
+    size_t       count,
+    void       (*emit)(const unsigned short *)
+    )
 {
-    (void)ctx;
-
-    if (count == 0) {
-        return 0;
-    }
-
     unsigned short  stack_buf[CONSOLE_WRITE_STACK_UCS2];
     unsigned short *out      = stack_buf;
     size_t          out_cap  = CONSOLE_WRITE_STACK_UCS2;
@@ -168,7 +171,7 @@ console_write(void *ctx, const void *data, size_t count)
         heap_buf = (unsigned short *)axl_malloc(heap_cap * sizeof(unsigned short));
         if (heap_buf == NULL) {
             axl_warning(
-                "console_write: OOM allocating %zu UCS-2 chars",
+                "console_write_via: OOM allocating %zu UCS-2 chars",
                 heap_cap
                 );
             return -1;
@@ -180,11 +183,33 @@ console_write(void *ctx, const void *data, size_t count)
         out = heap_buf;
     }
 
-    axl_backend_console_write(out);
+    emit(out);
     if (heap_buf != NULL) {
         axl_free(heap_buf);
     }
     return (axl_ssize_t)count;
+}
+
+static axl_ssize_t
+console_write(void *ctx, const void *data, size_t count)
+{
+    (void)ctx;
+    if (count == 0) {
+        return 0;
+    }
+    return console_write_via(data, count, axl_backend_console_write);
+}
+
+/* stderr text sink — identical transcode to console_write but emits to
+   the error console so `2>` captures it (see axl_backend_console_write_err). */
+static axl_ssize_t
+console_write_err(void *ctx, const void *data, size_t count)
+{
+    (void)ctx;
+    if (count == 0) {
+        return 0;
+    }
+    return console_write_via(data, count, axl_backend_console_write_err);
 }
 
 static AxlStream mStdout = {
@@ -199,7 +224,7 @@ static AxlStream mStdout = {
 static AxlStream mStderr = {
     .ctx    = NULL,
     .read   = NULL,
-    .write  = console_write,
+    .write  = console_write_err,
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
@@ -244,6 +269,34 @@ static AxlStream mStdin = {
     .close  = NULL,
 };
 
+/* Shared raw-bytes write for the binary console sinks. axl_stdout_raw and
+   axl_stderr_raw differ only in which shell handle backs them, so @p get
+   carries that difference in (mirrors how console_write_via DRYs the text
+   sinks above). Returns -1 if @p get() reports no shell handle published —
+   there's no sensible fallback for binary bytes (the firmware console
+   would mangle them via CHAR16 conversion, which is exactly what this
+   path exists to avoid). */
+static axl_ssize_t
+console_write_raw_via(
+    const void  *data,
+    size_t       count,
+    AxlFileHandle (*get)(void)
+    )
+{
+    if (data == NULL || count == 0) {
+        return 0;
+    }
+    AxlFileHandle h = get();
+    if (h == NULL) {
+        return -1;
+    }
+    size_t n = count;
+    if (axl_backend_file_write(h, &n, data) != AXL_OK) {
+        return -1;
+    }
+    return (axl_ssize_t)n;
+}
+
 /**
  * Raw-bytes write to the shell's StdOut handle, bypassing the
  * UTF-8→UCS-2 console_write conversion. For binary output (a tool
@@ -259,18 +312,7 @@ static axl_ssize_t
 console_write_raw(void *ctx, const void *data, size_t count)
 {
     (void)ctx;
-    if (data == NULL || count == 0) {
-        return 0;
-    }
-    AxlFileHandle h = axl_backend_shell_stdout();
-    if (h == NULL) {
-        return -1;
-    }
-    size_t n = count;
-    if (axl_backend_file_write(h, &n, data) != AXL_OK) {
-        return -1;
-    }
-    return (axl_ssize_t)n;
+    return console_write_raw_via(data, count, axl_backend_shell_stdout);
 }
 
 static AxlStream mStdoutRaw = {
@@ -282,10 +324,31 @@ static AxlStream mStdoutRaw = {
     .close  = NULL,
 };
 
+/* stderr binary sink — identical to console_write_raw but over the shell
+   StdErr handle so `2>` captures the raw bytes (see axl_backend_shell_stderr,
+   which gains a driver-bridge fallback so this also works out of a resident
+   driver, not just a launched app). */
+static axl_ssize_t
+console_write_err_raw(void *ctx, const void *data, size_t count)
+{
+    (void)ctx;
+    return console_write_raw_via(data, count, axl_backend_shell_stderr);
+}
+
+static AxlStream mStderrRaw = {
+    .ctx    = NULL,
+    .read   = NULL,
+    .write  = console_write_err_raw,
+    .pread  = NULL,
+    .pwrite = NULL,
+    .close  = NULL,
+};
+
 AxlStream *axl_stdout     = NULL;
 AxlStream *axl_stderr     = NULL;
 AxlStream *axl_stdin      = NULL;
 AxlStream *axl_stdout_raw = NULL;
+AxlStream *axl_stderr_raw = NULL;
 
 void
 axl_stream_init(void)
@@ -294,6 +357,7 @@ axl_stream_init(void)
     axl_stderr     = &mStderr;
     axl_stdin      = &mStdin;
     axl_stdout_raw = &mStdoutRaw;
+    axl_stderr_raw = &mStderrRaw;
 }
 
 int

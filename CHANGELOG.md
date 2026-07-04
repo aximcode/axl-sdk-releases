@@ -3,6 +3,37 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.7.0 — 2026-07-04
+
+### Changed
+
+- **`axl_stderr` now writes the error console (`gST->StdErr`), not stdout.**
+  `2>` redirection captures stderr and a plain `>` no longer does — matching
+  POSIX. Diagnostic logging (`axl_log` / `axl_warning`) moved to stderr for
+  the same reason, so `tool > out.txt` keeps `out.txt` free of AXL log lines.
+  Scripts that scraped logs from a `>`-redirected file must use `2>`.
+
+### Added
+
+- **`axl_stderr_raw`** — binary stderr over the shell StdErr handle (sibling
+  of `axl_stdout_raw`); works in a resident shared-driver via the stdio bridge.
+- **`axl_shared_driver_apply_exit_status()` in `<axl/axl-shared-driver.h>`** — a
+  resident driver verb's `axl_set_exit_status(N)` is reflected across the stdio
+  bridge; the launcher calls this after dispatch to exit with `N` verbatim
+  (`%lasterror%`). Also: raw stdout now works in a resident driver via the
+  stdio bridge (sibling of the raw-stderr fallback).
+- **Turnkey shared-driver ergonomics** — `AxlSharedDriverVtable` (standard
+  `int run(int,char**)` entry, receiving the launcher's argv verbatim like
+  `int main`), the `AXL_SHARED_DRIVER(name,init,run,unload)` driver macro, the
+  `AXL_SHARED_DRIVER_LAUNCHER(name,file,embed)` and
+  `AXL_SHARED_DRIVER_LAUNCHER_THIN(name,file)` (no-embed, disk-only) launcher
+  macros, and `axl_shared_driver_dispatch` / `axl_shared_driver_run`. A
+  shared-driver launcher collapses to one macro and the driver to three
+  functions; the SDK owns resolve + stdio bridge + exit-status. Note: the UEFI
+  Shell truncates an error-class (`ENCODE_ERROR`) exit status to its low bits in
+  `%lasterror%` (small-int / success-class statuses survive intact). See
+  `docs/AXL-Shared-Driver-Recipe.md`.
+
 ## 2.6.4 — 2026-07-03
 
 ### Fixed

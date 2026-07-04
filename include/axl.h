@@ -291,6 +291,101 @@ void _axl_cleanup(void);
   }
 
 /**
+ * AXL_SHARED_DRIVER(name_str, init_fn, run_fn, unload_fn):
+ *   int init_fn(void)           — heavy per-boot setup; 0 = ok (else abort load)
+ *   int run_fn(int, char **)    — per-dispatch entry (== int main)
+ *   int unload_fn(void)         — teardown; 0 = ok
+ *
+ * Emits the driver image's DriverEntry/Unload: runs init_fn once, publishes
+ * the SDK-standard AxlSharedDriverVtable{.run=run_fn} under @p name_str; the
+ * unload path unpublishes then calls unload_fn. The consumer writes only the
+ * three functions — no vtable, no publish/unpublish, no AXL_DRIVER.
+ *
+ * Like `AXL_DRIVER`, this macro forward-declares @p init_fn / @p run_fn /
+ * @p unload_fn with external linkage. Define the three functions `static`
+ * FIRST, then invoke the macro LAST — a later non-static forward decl of
+ * an already-`static` name retains internal linkage (no error), but the
+ * reverse order (`static` definition after this macro's non-static forward
+ * decl) fails with "static declaration follows non-static declaration".
+ *
+ * @code
+ *   static int my_init(void);
+ *   static int my_run(int argc, char **argv);
+ *   static int my_unload(void);
+ *
+ *   static int my_init(void) {
+ *       // ... one-time per-boot setup ...
+ *       return 0;
+ *   }
+ *
+ *   static int my_run(int argc, char **argv) {
+ *       // ... per-dispatch entry, like int main ...
+ *       return 0;
+ *   }
+ *
+ *   static int my_unload(void) {
+ *       // ... teardown ...
+ *       return 0;
+ *   }
+ *
+ *   AXL_SHARED_DRIVER("my-driver", my_init, my_run, my_unload)
+ * @endcode
+ *
+ * Use AXL_SHARED_DRIVER xor AXL_DRIVER xor AXL_SERVICE_DRIVER per
+ * translation unit — each emits the image's single DriverEntry.
+ */
+#define AXL_SHARED_DRIVER(name_str, init_fn, run_fn, unload_fn)             \
+  int init_fn(void);                                                        \
+  int run_fn(int, char **);                                                 \
+  int unload_fn(void);                                                      \
+  static AxlSharedDriverVtable _axl_sd_vtable = { run_fn };                 \
+  static AxlHandle             _axl_sd_handle = NULL;                       \
+  static int _axl_sd_entry(AxlHandle _h, AxlSystemTable *_st) {             \
+    (void)_h; (void)_st;                                                    \
+    int _rc = init_fn();                                                    \
+    if (_rc != 0) { return _rc; }                                           \
+    return axl_shared_driver_publish((name_str), &_axl_sd_vtable,           \
+                                      &_axl_sd_handle);                     \
+  }                                                                         \
+  static int _axl_sd_unload(AxlHandle _h) {                                 \
+    (void)_h;                                                               \
+    if (_axl_sd_handle != NULL) {                                           \
+      axl_shared_driver_unpublish((name_str), _axl_sd_handle,               \
+                                   &_axl_sd_vtable);                        \
+    }                                                                       \
+    return unload_fn();                                                     \
+  }                                                                         \
+  AXL_DRIVER(_axl_sd_entry, _axl_sd_unload)
+
+/**
+ * AXL_SHARED_DRIVER_LAUNCHER(name_str, driver_filename, embed_symbol):
+ * The entire launcher `int main` — resolves the resident driver (resident →
+ * on-disk → embedded @p embed_symbol) and dispatches with stdio + exit-status
+ * bridged. @p embed_symbol is an AXL_EMBED name (the driver's .efi bytes
+ * linked in via the build's embed step).
+ */
+#define AXL_SHARED_DRIVER_LAUNCHER(name_str, driver_filename, embed_symbol) \
+  AXL_EMBED_DECLARE(embed_symbol);                                          \
+  int main(int argc, char **argv) {                                         \
+    return axl_shared_driver_run((name_str), (driver_filename),             \
+                                  AXL_EMBED_DATA(embed_symbol),             \
+                                  AXL_EMBED_SIZE(embed_symbol),             \
+                                  argc, argv);                              \
+  }
+
+/**
+ * AXL_SHARED_DRIVER_LAUNCHER_THIN(name_str, driver_filename):
+ * Like AXL_SHARED_DRIVER_LAUNCHER but NO embedded blob — loads the driver
+ * from disk only (resident → on-disk). Smallest per-command transfer.
+ */
+#define AXL_SHARED_DRIVER_LAUNCHER_THIN(name_str, driver_filename)          \
+  int main(int argc, char **argv) {                                         \
+    return axl_shared_driver_run((name_str), (driver_filename),             \
+                                  (const unsigned char *)NULL, 0, argc,     \
+                                  argv);                                    \
+  }
+
+/**
  * AXL_SERVICE_DRIVER:
  * @svc: an `AxlService` lvalue (typically a `static const`)
  *

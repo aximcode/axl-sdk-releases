@@ -161,14 +161,8 @@ axl_fclose(buf);
 
 ## Standard Streams
 
-`axl_stream_init` populates four globals:
-
-| Stream | Direction | Encoding | Backed by |
-|---|---|---|---|
-| `axl_stdout` | out | text (UTF-8 in → UCS-2 to console) | firmware console (ConOut) |
-| `axl_stderr` | out | text (same path as stdout) | firmware console |
-| `axl_stdin` | in | raw bytes | `EFI_SHELL_PARAMETERS_PROTOCOL.StdIn` |
-| `axl_stdout_raw` | out | raw bytes | `EFI_SHELL_PARAMETERS_PROTOCOL.StdOut` (direct WriteFile) |
+`axl_stream_init` populates five globals: `axl_stdout`, `axl_stderr`,
+`axl_stdin`, `axl_stdout_raw`, `axl_stderr_raw`.
 
 For shell pipe invocations (`tool1 | tool2`) the LHS output is
 captured by the shell into a stream that becomes the RHS's StdIn, so
@@ -176,9 +170,37 @@ captured by the shell into a stream that becomes the RHS's StdIn, so
 
 When the shell-params protocol isn't published (cross-volume
 launches, BDS contexts, non-Shell-2.0 launches), `axl_stdin` reads
-return EOF (0 bytes) and `axl_stdout_raw` writes return -1 — tools
-that opt in should fall back to a file argument or print a clear
-error.
+return EOF (0 bytes) and `axl_stdout_raw` / `axl_stderr_raw` writes
+return -1 — tools that opt in should fall back to a file argument or
+print a clear error. `axl_stderr` (text) has no such gap: it falls
+back to `gST->ConOut` when `gST->StdErr` is NULL, so diagnostics
+still land somewhere instead of going silent.
+
+### Standard streams and their sinks
+
+| Stream | Direction | Encoding | Sink |
+|---|---|---|---|
+| `axl_stdin` | in | raw bytes | shell **StdIn** handle (`EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`) — `<` / `\|` |
+| `axl_stdin_text()` | in | text (UTF-8, auto-sniffed) | `axl_text_stream_wrap` over `axl_stdin` — decodes the UCS-2 `\|` pipe to UTF-8 |
+| `axl_stdout` | out | text (UTF-8 in → UCS-2 out) | `gST->ConOut` — honors `>` / `>>` |
+| `axl_stderr` | out | text (UTF-8 in → UCS-2 out) | `gST->StdErr`, falling back to `gST->ConOut` when NULL — honors `2>` / `2>>` |
+| `axl_stdout_raw` | out | raw bytes | shell **StdOut** handle (direct `WriteFile`, bypasses the console) |
+| `axl_stderr_raw` | out | raw bytes | shell **StdErr** handle (direct `WriteFile`); sibling of `axl_stdout_raw` — also works in a resident shared-driver via the stdio bridge |
+
+Diagnostic logging (`axl_log`, `axl_warning`, including the level-color
+attribute) writes to `axl_stderr`, not `axl_stdout` — so `tool > out.txt`
+captures only the tool's own stdout text, with no AXL log lines mixed in.
+A script that used to scrape AXL diagnostics out of a `>`-redirected file
+must switch to `2>`.
+
+### Redirect-encoding boundary
+
+The UEFI shell — not AXL — owns the transcoding at a console redirect:
+`>` / `>>` write **UCS-2 with a leading BOM**, `>a` / `>>a` write **ASCII**.
+**Console redirection never produces a UTF-8 file**, regardless of what the
+tool wrote. A tool that needs an actual UTF-8 file must open one with
+`axl_fopen` and write to that stream directly — `tool > file.txt` is not a
+substitute.
 
 ### Output: text vs binary
 
