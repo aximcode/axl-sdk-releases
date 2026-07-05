@@ -294,7 +294,7 @@ fs_write_close(
        The flush status is unobservable through this void contract — a
        direct AxlFileWriter user checks axl_file_writer_close instead. */
     (void)aborted;
-    (void)axl_file_writer_close((AxlFileWriter *)ctx);
+    axl_file_writer_close((AxlFileWriter *)ctx);
 }
 
 // --- lifecycle (MKCOL / DELETE / MOVE / COPY) ---

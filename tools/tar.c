@@ -175,7 +175,7 @@ do_create(
                 rc = 1;
             } else {
                 if (verbose) { axl_printf("%s/\n", path); }
-                (void)axl_dir_walk(path, create_cb, &ctx, TAR_WALK_MAX_DEPTH);
+                axl_dir_walk(path, create_cb, &ctx, TAR_WALK_MAX_DEPTH);
                 if (ctx.err) { rc = 1; }
             }
         } else if (add_one_file(w, path, verbose) != 0) {
@@ -306,7 +306,7 @@ mkdir_parents(
         if (*p == '/' || *p == '\\') {
             char sep = *p;
             *p = '\0';
-            (void)axl_dir_mkdir(tmp);
+            axl_dir_mkdir(tmp);
             *p = sep;
         }
     }
@@ -430,7 +430,7 @@ do_extract(
 
         if (e.type == AXL_TAR_TYPE_DIR) {
             mkdir_parents(full);
-            (void)axl_dir_mkdir(full);
+            axl_dir_mkdir(full);
             if (verbose) { axl_printf("%s\n", full); }
         } else if (extract_file(r, full, verbose) != 0) {
             rc = 1;

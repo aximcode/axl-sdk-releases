@@ -89,7 +89,7 @@ main(int argc, char **argv)
 
     /* axl_shared_driver_unload reaps dead bridges even when the named driver
      * is not resident (the reap runs before the not-found early return). */
-    (void)axl_shared_driver_unload("stdio-bridge-fix");
+    axl_shared_driver_unload("stdio-bridge-fix");
 
     size_t after = count_bridges();
     axl_printf("INFO: BRIDGES_AFTER_UNLOAD=%zu\n", after);

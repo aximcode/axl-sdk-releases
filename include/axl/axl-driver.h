@@ -584,10 +584,10 @@ axl_driver_disconnect_handle(
 /**
  * @brief Find a driver file on disk without loading it.
  *
- * Walks the same search order axl_driver_ensure() uses (image's
- * `drivers/<arch>/`, image's own directory, image's `drivers/`,
- * other volumes' `drivers/<arch>/`) and writes the first matching
- * existing path to @p out.
+ * Walks the same search order axl_driver_ensure() uses (image's own
+ * directory, image's `drivers/<arch>/`, image's `drivers/`, other
+ * volumes' `drivers/<arch>/`) and writes the first matching existing
+ * path to @p out.
  *
  * Useful when the caller needs to control the LoadImage / StartImage
  * lifecycle directly — for example, to set load options between the
@@ -624,16 +624,19 @@ axl_driver_locate(
  * returns 0 immediately. Otherwise searches for @p driver_name and
  * loads + starts the first match found, in this order:
  *
- *   1. `drivers/<arch>/<driver_name>` on the volume the running image
+ *   1. `<image_dir>/<driver_name>` in the running image's own directory
+ *      (the sibling) — a co-located driver is the most specific intent
+ *      and wins over a stale copy elsewhere
+ *   2. `drivers/<arch>/<driver_name>` on the volume the running image
  *      booted from
- *   2. `<image_dir>/<driver_name>` in the running image's own directory
  *   3. `drivers/<driver_name>` at the running image's volume root
  *   4. `drivers/<arch>/<driver_name>` on every other mounted FAT volume
  *
  * The arch suffix is "x64" or "aa64", matching the running image's
- * architecture. After load+start, LocateProtocol is re-checked; if
- * the protocol still isn't registered, the driver is unloaded and
- * the function returns -1.
+ * architecture. After a candidate load+start, LocateProtocol is
+ * re-checked; if the protocol still isn't registered that candidate is
+ * unloaded and the search continues, ultimately returning
+ * `AXL_NOT_FOUND` if no candidate publishes it.
  *
  * Safe to call multiple times — repeats short-circuit at step 1.
  * EFI_ALREADY_STARTED on StartImage is treated as success.
@@ -658,8 +661,9 @@ axl_driver_locate(
  * call it with attacker-controlled @p driver_name values.
  *
  * @return AXL_OK if the protocol is registered (was already, or after
- *     loading the driver); AXL_ERR if the driver wasn't found, failed to
- *     load/start, or didn't register the protocol after starting.
+ *     loading the driver); AXL_NOT_FOUND if no candidate path yielded a
+ *     driver that loaded, started, and registered the protocol; AXL_ERR
+ *     only on a NULL @p protocol_guid or @p driver_name.
  */
 int
 axl_driver_ensure(
@@ -715,7 +719,9 @@ axl_driver_ensure(
  * verify provenance.
  *
  * @return AXL_OK if the protocol is registered (was already, or after
- *     loading); AXL_ERR if all four steps failed.
+ *     loading); AXL_NOT_FOUND if the disk search (and the embedded
+ *     fallback, when attempted) all failed to produce a registered
+ *     protocol; AXL_ERR only on a NULL @p protocol_guid or @p driver_name.
  */
 int
 axl_driver_ensure_with_embedded(

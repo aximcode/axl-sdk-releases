@@ -347,7 +347,7 @@ image_dp_teardown(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
                                  (void **)&li) == EFI_SUCCESS && li != NULL) {
         li->FilePath = NULL;
     }
-    (void)axl_bs()->UninstallProtocolInterface(
+    axl_bs()->UninstallProtocolInterface(
         handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp);
     axl_bs()->FreePool(dp);
     if (file_path != NULL) {
@@ -404,7 +404,7 @@ image_dp_release(AxlDriverHandle handle)
 
     /* The record GUID is private and never opened via OpenProtocol, so this
      * uninstall cannot be denied; freeing rec below is therefore safe. */
-    (void)axl_bs()->UninstallProtocolInterface(
+    axl_bs()->UninstallProtocolInterface(
         (EFI_HANDLE)handle, (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID, rec);
     image_dp_teardown((EFI_HANDLE)handle, rec->dp, rec->file_path);
     axl_bs()->FreePool(rec);
@@ -1136,16 +1136,10 @@ driver_build_candidates(
     char sub_buf[DRIVER_SUB_BUF];
 
     if (image_fs != NULL) {
-        /* 1: drivers/<arch>/<name> on the image's volume. */
-        if (axl_snprintf(sub_buf, sizeof(sub_buf),
-                         "/drivers/%s/%s", driver_arch, driver_name) > 0
-            && axl_path_build_uefi(image_fs, sub_buf,
-                                   path_buf, sizeof(path_buf)) == AXL_OK)
-        {
-            driver_append_candidate(candidates, n_cand, path_buf);
-        }
-
-        /* 2: <image_dir>/<name> in the running image's own directory. */
+        /* 1: <image_dir>/<name> in the running image's own directory
+           (the sibling). Tried first — a co-located driver is the most
+           specific intent and should win over a stale /drivers/<arch>/
+           copy from an older install. */
         AXL_AUTO_FREE char *image_path = axl_driver_get_image_path();
         if (image_path != NULL) {
             AXL_AUTO_FREE char *image_dir = axl_path_get_dirname(image_path);
@@ -1163,6 +1157,15 @@ driver_build_candidates(
             }
         }
 
+        /* 2: drivers/<arch>/<name> on the image's volume. */
+        if (axl_snprintf(sub_buf, sizeof(sub_buf),
+                         "/drivers/%s/%s", driver_arch, driver_name) > 0
+            && axl_path_build_uefi(image_fs, sub_buf,
+                                   path_buf, sizeof(path_buf)) == AXL_OK)
+        {
+            driver_append_candidate(candidates, n_cand, path_buf);
+        }
+
         /* 3: drivers/<name> at the volume root (no arch dir). */
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
                          "/drivers/%s", driver_name) > 0
@@ -1174,7 +1177,7 @@ driver_build_candidates(
 
         /* 3.5: <name> at the volume root. Covers the common case where
            the user drops the app and its driver side-by-side at fs0:\.
-           Candidate #2 (<image_dir>/<name>) misses this when the
+           Candidate #1 (<image_dir>/<name>) misses this when the
            image's own directory is just "\" or "/" — the join produces
            a doubled separator that some path normalizers reject. */
         if (axl_snprintf(sub_buf, sizeof(sub_buf),
@@ -1284,10 +1287,10 @@ driver_start_and_verify(
         /* Verbose identity line: name + handle + published protocol GUID
          * + ImageBase/ImageSize + the (now non-NULL) device-path text. */
         EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
-        (void)axl_bs()->HandleProtocol(
+        axl_bs()->HandleProtocol(
             (EFI_HANDLE)drv, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&li);
         EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
-        (void)axl_bs()->HandleProtocol(
+        axl_bs()->HandleProtocol(
             (EFI_HANDLE)drv, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID,
             (void **)&dp);
         AXL_AUTO_FREE char *dptext =
@@ -1522,7 +1525,7 @@ _axl_driver_ensure_with_embedded_info(
                 search_name, n_cand, n_cand == 1 ? "" : "s",
                 (override_name == NULL && embedded_buf != NULL)
                     ? " (embedded fallback also failed)" : "");
-    return AXL_ERR;
+    return AXL_NOT_FOUND;
 }
 
 int
@@ -1599,7 +1602,7 @@ axl_driver_load_dir(
        A missing directory is "not an error, just 0 loaded" per the
        previous contract; axl_dir_walk returns -1 for that case
        which we silently translate. */
-    (void)axl_dir_walk(dir_path, driver_load_cb, &ctx, 1);
+    axl_dir_walk(dir_path, driver_load_cb, &ctx, 1);
 
     if (loaded_count != NULL) {
         *loaded_count = ctx.loaded;
@@ -1779,7 +1782,7 @@ db_teardown(void)
             &r->binding) != AXL_OK) {
         return AXL_ERR;   // keep the record alive — the firmware still points at it
     }
-    (void)axl_protocol_uninstall(
+    axl_protocol_uninstall(
         (AxlHandle)image,
         (const AxlGuid *)&EFI_COMPONENT_NAME2_PROTOCOL_GUID, &r->name2);
     axl_free(r->name_ucs2);
@@ -1796,7 +1799,7 @@ static void
 db_cleanup(void *p)
 {
     (void)p;            // the record is tracked in g_db_rec
-    (void)db_teardown();
+    db_teardown();
 }
 
 int
@@ -1842,7 +1845,7 @@ axl_driver_binding_install(const AxlDriverBinding *db)
     }
     if (axl_protocol_install((const AxlGuid *)&EFI_COMPONENT_NAME2_PROTOCOL_GUID,
                              &r->name2, &h) != AXL_OK) {
-        (void)axl_protocol_uninstall(
+        axl_protocol_uninstall(
             (AxlHandle)image,
             (const AxlGuid *)&EFI_DRIVER_BINDING_PROTOCOL_GUID, &r->binding);
         axl_free(r->name_ucs2);

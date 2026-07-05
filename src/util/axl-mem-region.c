@@ -306,7 +306,7 @@ build_regions(void)
     g_region_count = tn;
     g_built = true;
     if (!g_cleanup_armed) {
-        (void)axl_atexit(region_cleanup, NULL);
+        axl_atexit(region_cleanup, NULL);
         g_cleanup_armed = true;
     }
     return AXL_OK;
@@ -578,7 +578,7 @@ build_io_regions(void)
         g_io_count = 0;
         g_io_built = true;
         if (!g_io_cleanup_armed) {
-            (void)axl_atexit(io_region_cleanup, NULL);
+            axl_atexit(io_region_cleanup, NULL);
             g_io_cleanup_armed = true;
         }
         return AXL_OK;
@@ -636,7 +636,7 @@ build_io_regions(void)
     g_io_count = tn;
     g_io_built = true;
     if (!g_io_cleanup_armed) {
-        (void)axl_atexit(io_region_cleanup, NULL);
+        axl_atexit(io_region_cleanup, NULL);
         g_io_cleanup_armed = true;
     }
     return AXL_OK;

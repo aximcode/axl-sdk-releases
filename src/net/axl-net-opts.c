@@ -275,7 +275,7 @@ axl_net_init_static(
         }
         /* Settle on the exact address we set (a stale prior address won't
            satisfy it), so a read-back is valid. */
-        (void)axl_net_wait_ip_settled(nic, ip, 0);
+        axl_net_wait_ip_settled(nic, ip, 0);
     } else {
         if (axl_net_init(nic_index, timeout_sec) != AXL_OK) {
             return AXL_ERR;

@@ -138,7 +138,7 @@ spd_bus_probe(
             {
                 /* Recovery failed — restore original MR11 best-effort
                  * and move on. */
-                (void)axl_smbus_write_byte(cand, addr, AXL_SPD_DDR5_MR11, mr11);
+                axl_smbus_write_byte(cand, addr, AXL_SPD_DDR5_MR11, mr11);
                 continue;
             }
             /* Recovery succeeded — fall through to MR1 verification. */

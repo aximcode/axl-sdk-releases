@@ -75,7 +75,7 @@ bench_n(uint32_t n)
     uint32_t made = build_scene(c, n, surfs);
 
     /* Prime: one full present consumes the create/move damage. */
-    (void)axl_compositor_present(c);
+    axl_compositor_present(c);
 
     /* Full composite (rebuild + full repaint) for scale. */
     uint64_t t0 = axl_time_get_us();
@@ -89,7 +89,7 @@ bench_n(uint32_t n)
     t0 = axl_time_get_us();
     for (uint32_t k = 0; k < ITERS; k++) {
         axl_surface_damage(first, (AxlGfxClip){2, 2, 4, 4});
-        (void)axl_compositor_present(c);
+        axl_compositor_present(c);
     }
     t1 = axl_time_get_us();
     uint64_t frame_us_x100 = ((t1 - t0) * 100u) / ITERS;   /* hundredths of us */

@@ -1184,6 +1184,18 @@ const AxlGuid AXL_STDIO_BRIDGE_GUID =
     AXL_GUID(0xc8f517d7, 0x36cc, 0x458d,
              0x98, 0xd6, 0xb1, 0x16, 0x82, 0x5e, 0x30, 0xbf);
 
+const AxlGuid AXL_DISPATCH_TOKEN_GUID =
+    AXL_GUID(0x02dd6813, 0xd275, 0x4734,
+             0x98, 0xf8, 0xc7, 0xf6, 0x03, 0x31, 0x95, 0x8d);
+
+/* Dedicated persistent handle the one dispatch-token cell is installed on.
+   The cell lives in pool memory (image-independent) and is never uninstalled —
+   infra that must outlive the images that use it, like the fixed bridge GUID
+   identity. The cell pointer isn't cached; every consult locates it fresh via
+   dispatch_cell() (cross-image-correct; a transient locate miss degrades to
+   safe EOF-fallback rather than a stale deref). */
+static AxlHandle         mDispatchHandle = NULL;
+
 static AxlStdioBridge  mBridge;
 static AxlHandle       mBridgeHandle  = NULL;   /* install handle; NULL = not installed */
 static uint32_t        mBridgeAtexit  = 0;      /* atexit cookie; 0 = not yet registered */
@@ -1197,9 +1209,46 @@ bridge_atexit(
     axl_backend_stdio_bridge_uninstall();
 }
 
-/* Is the bridge's launcher still a loaded image? Forward decl — used by the
-   reaper below and the read-path lookup. Definition follows. */
-static bool bridge_launcher_alive(void *launcher_image, void *recorded_proto);
+int
+axl_backend_dispatch_token_ensure(void)
+{
+    /* Already resident (this image or another) — reuse it. */
+    void *found = NULL;
+    if (axl_protocol_find_guid(&AXL_DISPATCH_TOKEN_GUID, &found) == AXL_OK
+        && found != NULL) {
+        return AXL_OK;
+    }
+    /* Create the singleton cell in pool memory on a fresh handle. */
+    void *mem = NULL;
+    if (EFI_ERROR(gBS->AllocatePool(EfiBootServicesData,
+                                    sizeof(AxlDispatchToken), &mem))
+        || mem == NULL) {
+        return AXL_ERR;
+    }
+    ((AxlDispatchToken *)mem)->current = 0;
+    mDispatchHandle = NULL;   /* NULL => allocate a fresh handle */
+    if (axl_protocol_install(&AXL_DISPATCH_TOKEN_GUID, mem, &mDispatchHandle)
+        != AXL_OK) {
+        gBS->FreePool(mem);
+        return AXL_ERR;
+    }
+    return AXL_OK;
+}
+
+/* Locate the live dispatch-token cell (any image's), or NULL if none. */
+static AxlDispatchToken *
+dispatch_cell(void)
+{
+    void *found = NULL;
+    if (axl_protocol_find_guid(&AXL_DISPATCH_TOKEN_GUID, &found) == AXL_OK) {
+        return (AxlDispatchToken *)found;
+    }
+    return NULL;
+}
+
+/* Is the bridge's launcher's dispatch still current? Forward decl — used by
+   the reaper below and the read-path lookup. Definition follows. */
+static bool bridge_launcher_alive(const AxlStdioBridge *b);
 
 /* Uninstall every installed bridge instance whose launcher image has exited.
    Cross-image and best-effort: it enumerates the whole DB, so a live image can
@@ -1225,7 +1274,7 @@ bridge_reap_dead(void)
             continue;
         }
         AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (!bridge_launcher_alive(b->launcher_image, b->launcher_image_proto)) {
+        if (!bridge_launcher_alive(b)) {
             gBS->UninstallProtocolInterface(handles[i], &guid, iface);
         }
     }
@@ -1235,6 +1284,14 @@ bridge_reap_dead(void)
 void
 axl_backend_stdio_bridge_reap(void)
 {
+    /* No active dispatch on this teardown path (do -u / unload): clear the
+       marker so EVERY installed bridge (all tokens != 0) is dead and reaped,
+       including a final leaked instance whose token still matches a stale
+       current. */
+    AxlDispatchToken *cell = dispatch_cell();
+    if (cell != NULL) {
+        cell->current = 0;
+    }
     bridge_reap_dead();
 }
 
@@ -1248,6 +1305,28 @@ axl_backend_stdio_bridge_install(void)
     AxlFileHandle err = axl_backend_shell_stderr();
     if (in == NULL && out == NULL && err == NULL) {
         return AXL_OK;
+    }
+    /* Fresh per-dispatch token: firmware-global monotonic, unique across
+       images (a per-image counter would collide). 0 is the "no dispatch"
+       sentinel; if the counter's first value of the boot is 0, re-call to
+       consume it and take the next value. Re-calling (not fabricating t=1)
+       is what keeps uniqueness: the counter advances, so no later dispatch
+       can be handed the same value. Terminates immediately — a monotonic
+       counter never returns 0 twice. */
+    uint64_t t = 0;
+    while (t == 0) {
+        gBS->GetNextMonotonicCount(&t);
+    }
+    /* Publish the token to the driver-resident cell BEFORE reaping, so the
+       reap-at-install below uses the NEW token as its liveness reference and
+       correctly sweeps prior leaked bridges (all bearing older tokens). No
+       resident driver => no cell => reap drops every not-yet-installed
+       instance, which is fine (nothing consults a bridge without a driver). */
+    {
+        AxlDispatchToken *cell = dispatch_cell();
+        if (cell != NULL) {
+            cell->current = t;
+        }
     }
     /* Sweep bridges leaked by prior launchers before publishing ours. Each
        launcher is a fresh image, so the mBridgeHandle refresh below only
@@ -1263,21 +1342,7 @@ axl_backend_stdio_bridge_install(void)
     mBridge.stdout_h       = out;
     mBridge.stderr_h       = err;
     mBridge.launcher_image = (void *)gImageHandle;
-    /* Record the launcher's OWN LoadedImage protocol pointer alongside its
-       handle. A recycled handle reused by firmware for a different-shaped
-       image yields a different LoadedImage pointer at liveness-check time,
-       narrowing the handle-reuse false-alive gap below — but see
-       bridge_launcher_alive() for why it doesn't fully close it. */
-    {
-        void     *li  = NULL;
-        EFI_GUID  lig = gEfiLoadedImageProtocolGuid;
-        if (!EFI_ERROR(gBS->HandleProtocol(
-                (EFI_HANDLE)gImageHandle, &lig, &li))) {
-            mBridge.launcher_image_proto = li;
-        } else {
-            mBridge.launcher_image_proto = NULL;
-        }
-    }
+    mBridge.token          = t;
     mBridge.pending_status = 0;
     mBridge.has_pending    = false;
     /* The published interface is &mBridge — a static in THIS (launcher)
@@ -1305,50 +1370,26 @@ axl_backend_stdio_bridge_uninstall(void)
     }
 }
 
-/* Is the bridge's launcher still a loaded image? The bridge interface
-   (&mBridge) and the StdIn handle it carries live in the launcher image; if
-   that launcher exited WITHOUT uninstalling, both are freed and reading
-   stdin_h would hand the shell a dangling SHELL_FILE_HANDLE (#GP in
-   Shell.dll). The atexit uninstall covers a normal `main` return / axl_exit,
-   but NOT gBS->Exit() (or a libc exit() routed to it) — a perfectly ordinary
-   termination that returns straight to firmware and skips CRT0 cleanup. So a
-   leaked instance is an expected case, not an exotic one. Gate every consult
-   on launcher_image still being present in the handle DB. A stale/garbage
-   handle value simply fails HandleProtocol and reports dead — the safe
-   answer. UEFI recycles freed handle values, so a naive "is this handle a
-   loaded image" check would report a false "alive" if a dead launcher's
-   handle got reused for a different image.
-
-   Narrowed (not closed) by ALSO comparing the handle's CURRENT LoadedImage
-   protocol pointer against the one recorded at install: a handle reused by
-   a different-shaped image, or one where the handle slot recycles without
-   the loaded-image-data slot behind it, now yields a different pointer and
-   is correctly reported dead. It does NOT cover the dominant trigger — the
-   same launcher binary relaunched repeatedly via gBS->Exit — because the
-   freed handle slot and the freed loaded-image-data slot backing this
-   pointer are released by the same pool event and so tend to recycle
-   together; recorded_proto (itself read from possibly-recycled bridge
-   memory) can then spuriously match. bridge_find_live() below further
-   masks the residual by returning the NEWEST live instance, so on the
-   normal turnkey/dispatch path the current launcher's own (genuinely live)
-   bridge wins over a stale one. A fully-robust gate needs an active
-   per-dispatch liveness signal that doesn't live in the (recyclable)
-   bridge memory — future work, not done here. */
+/* A bridge is live iff its per-dispatch token equals the driver-resident
+   AxlDispatchToken.current the launcher stamped this dispatch. The reference
+   lives in driver memory (not the freed, recyclable bridge), so this is robust
+   against the correlated pool recycling that defeated the old LoadedImage-proto
+   match. Reading b->token is a value compare on mapped memory — stdin_h and the
+   status cell are only touched AFTER a live match, preserving the v2.6.1 UAF
+   fix. current==0 (no active dispatch) or no cell => nothing is live. */
 static bool
 bridge_launcher_alive(
-    void  *launcher_image,
-    void  *recorded_proto
+    const AxlStdioBridge  *b
     )
 {
-    if (launcher_image == NULL) {
+    if (b == NULL) {
         return false;
     }
-    void *li = NULL;
-    EFI_GUID g = gEfiLoadedImageProtocolGuid;
-    return !EFI_ERROR(gBS->HandleProtocol(
-               (EFI_HANDLE)launcher_image, &g, &li))
-           && li != NULL
-           && li == recorded_proto;
+    AxlDispatchToken *cell = dispatch_cell();
+    if (cell == NULL || cell->current == 0) {
+        return false;
+    }
+    return b->token == cell->current;
 }
 
 /* Live (uncached) bridge lookup — only used on the no-local-shell-params
@@ -1380,7 +1421,7 @@ bridge_find_live(void)
             continue;
         }
         AxlStdioBridge *b = (AxlStdioBridge *)iface;
-        if (bridge_launcher_alive(b->launcher_image, b->launcher_image_proto)) {
+        if (bridge_launcher_alive(b)) {
             live = b;   /* DB order is oldest-first; newest live wins */
         }
     }
@@ -1868,7 +1909,7 @@ axl_backend_console_expose_modifiers(void)
     if (ex != NULL && ex->SetState != NULL) {
         AxlInputExSetState set_state = (AxlInputExSetState)ex->SetState;
         UINT8 toggle = EFI_TOGGLE_STATE_VALID | EFI_KEY_STATE_EXPOSED;
-        (void)set_state(ex, &toggle);
+        set_state(ex, &toggle);
     }
 }
 

@@ -85,7 +85,7 @@ compress_writer_close(void *vctx)
 {
     CompressWriterCtx *c = (CompressWriterCtx *)vctx;
     if (!c->finished) {
-        (void)writer_do_finish(c);  /* implicit finalize, best-effort */
+        writer_do_finish(c);  /* implicit finalize, best-effort */
     }
     axl_fclose(c->accum);           /* does NOT close c->sink */
     axl_free(c);

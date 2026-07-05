@@ -771,7 +771,7 @@ tls_write_async_done(AxlTcp *sock, AxlStatus status, void *data)
     axl_free(wctx->enc_buf);
     axl_free(wctx);
     if (cb != NULL) {
-        (void)cb(sock, status, cb_data);  /* TLS write is one-shot */
+        cb(sock, status, cb_data);  /* TLS write is one-shot */
     }
     return false;
 }

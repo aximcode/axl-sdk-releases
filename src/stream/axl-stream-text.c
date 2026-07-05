@@ -165,14 +165,14 @@ axl_text_stream_wrap(AxlStream *src)
 
     if (n >= 2 && probe[0] == 0xFFu && probe[1] == 0xFEu) {
         /* UTF-16 LE BOM consumed. */
-        (void)axl_stream_set_encoding(s, AXL_ENC_UCS2_LE);
+        axl_stream_set_encoding(s, AXL_ENC_UCS2_LE);
         if (n > 2) {
             axl_memcpy(c->pushback, probe + 2, n - 2);
             c->pushback_n = n - 2;
         }
     } else if (n >= 2 && probe[0] == 0xFEu && probe[1] == 0xFFu) {
         /* UTF-16 BE BOM consumed. */
-        (void)axl_stream_set_encoding(s, AXL_ENC_UCS2_BE);
+        axl_stream_set_encoding(s, AXL_ENC_UCS2_BE);
         if (n > 2) {
             axl_memcpy(c->pushback, probe + 2, n - 2);
             c->pushback_n = n - 2;
@@ -190,7 +190,7 @@ axl_text_stream_wrap(AxlStream *src)
            non-consuming since there's no BOM to swallow). */
         AxlEncoding sniffed = sniff_ucs2(probe, n);
         if (sniffed != AXL_ENC_UTF8) {
-            (void)axl_stream_set_encoding(s, sniffed);
+            axl_stream_set_encoding(s, sniffed);
         }
         axl_memcpy(c->pushback, probe, n);
         c->pushback_n = n;

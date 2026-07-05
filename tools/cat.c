@@ -108,7 +108,7 @@ static void
 out_write(const void *buf, size_t n)
 {
     if (n == 0) return;
-    (void)axl_write(out_sink, buf, n);
+    axl_write(out_sink, buf, n);
 }
 
 static void
@@ -269,7 +269,7 @@ cat_one(
         if (have_encoding) {
             saved_stdin_enc    = axl_stream_get_encoding(axl_stdin);
             restore_stdin_enc  = true;
-            (void)axl_stream_set_encoding(axl_stdin, enc);
+            axl_stream_set_encoding(axl_stdin, enc);
             in = axl_stdin;
         } else {
             in = axl_text_stream_wrap(axl_stdin);
@@ -287,7 +287,7 @@ cat_one(
         }
         owns_inner = true;
         if (have_encoding) {
-            (void)axl_stream_set_encoding(inner, enc);
+            axl_stream_set_encoding(inner, enc);
             in = inner;
         } else {
             in = axl_text_stream_wrap(inner);
@@ -309,7 +309,7 @@ cat_one(
         axl_fclose(inner);
     }
     if (restore_stdin_enc) {
-        (void)axl_stream_set_encoding(axl_stdin, saved_stdin_enc);
+        axl_stream_set_encoding(axl_stdin, saved_stdin_enc);
     }
     return 0;
 }

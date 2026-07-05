@@ -358,7 +358,7 @@ scenario_leak_event(const char *variant)
         const int n = 20;
         axl_printf("stress: allocating %d events (all deliberately leaked)\n", n);
         for (int i = 0; i < n; i++) {
-            (void)axl_event_new();
+            axl_event_new();
         }
         return 0;
     }

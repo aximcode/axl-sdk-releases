@@ -268,7 +268,7 @@ fixture_write(
         subdir[sublen] = '\0';
         char *dir = axl_path_join(dest, subdir);
         if (dir == NULL) { return -1; }
-        (void)axl_dir_mkdir(dir);
+        axl_dir_mkdir(dir);
         path = axl_path_join(dir, slash + 1);
         axl_free(dir);
     } else {
@@ -798,7 +798,7 @@ pci_bars_json(
     if (acc == NULL) { return NULL; }
     for (unsigned i = 0; i < nbars; i++) {
         uint32_t bar = 0;
-        (void)axl_pci_read_config_32(addr, (uint16_t)(0x10 + i * 4), &bar);
+        axl_pci_read_config_32(addr, (uint16_t)(0x10 + i * 4), &bar);
         char *next = axl_asprintf("%s%s\"0x%08x\"",
                                   acc, (i == 0) ? "" : ", ", (unsigned)bar);
         axl_free(acc);
@@ -827,12 +827,12 @@ dump_pci(
         }
 
         uint16_t vid = 0, did = 0;
-        (void)axl_pci_get_vid_did(*p, &vid, &did);
+        axl_pci_get_vid_did(*p, &vid, &did);
         uint32_t class_code = 0;
-        (void)axl_pci_get_class_code(*p, &class_code);
+        axl_pci_get_class_code(*p, &class_code);
         AxlPciHeaderType htype = AXL_PCI_HEADER_TYPE_NORMAL;
         bool             multi = false;
-        (void)axl_pci_get_header_type(*p, &htype, &multi);
+        axl_pci_get_header_type(*p, &htype, &multi);
 
         char addr_str[AXL_PCI_ADDR_STR_MAX];
         if (axl_pci_addr_format(*p, addr_str, sizeof addr_str) < 0) {
@@ -1003,9 +1003,9 @@ usb_walk_cb(
     UsbWalkCtx *c = (UsbWalkCtx *)vctx;
 
     uint16_t vid = 0, pid = 0;
-    (void)axl_usb_get_vid_pid(addr, &vid, &pid);
+    axl_usb_get_vid_pid(addr, &vid, &pid);
     uint8_t cls = 0, sub = 0, prot = 0;
-    (void)axl_usb_get_class(addr, &cls, &sub, &prot);
+    axl_usb_get_class(addr, &cls, &sub, &prot);
 
     char cname[AXL_USB_CLASS_NAME_MAX];
     if (axl_usb_class_string(cls, sub, prot, cname, sizeof cname) <= 0) {
@@ -1107,7 +1107,7 @@ dump_usb(
        callback only returns non-zero (1) on OOM, which sets ctx.oom.
        Per-device descriptor blobs go to usb/<bus>-<addr>.bin via
        fixture_write (which creates the usb/ subdir on demand). */
-    (void)axl_usb_tree_for_each(usb_walk_cb, &ctx);
+    axl_usb_tree_for_each(usb_walk_cb, &ctx);
 
     if (ctx.oom) {
         axl_free(ctx.body);
@@ -1157,7 +1157,7 @@ ensure_controllers_connected(
     static bool done = false;
     if (done) { return; }
     done = true;
-    (void)axl_driver_connect(NULL);
+    axl_driver_connect(NULL);
 }
 
 static const char *
@@ -1344,7 +1344,7 @@ capture_edid(
     const char *fixture_dir
     )
 {
-    (void)axl_protocol_register_name(
+    axl_protocol_register_name(
         "edid-discovered",
         (const AxlGuid *)&EFI_EDID_DISCOVERED_PROTOCOL_GUID);
     void  **handles = NULL;
@@ -1425,7 +1425,7 @@ dump_video(
     if (avail && axl_gfx_current_mode(&ci) == AXL_OK) { current = (int)ci; }
 
     AxlGfxInfo info = {0};
-    if (avail) { (void)axl_gfx_get_info(&info); }
+    if (avail) { axl_gfx_get_info(&info); }
 
     /* EDID first so video.json can report the blob count. */
     int edid_written = capture_edid(fixture_dir);

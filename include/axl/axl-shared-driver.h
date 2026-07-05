@@ -149,9 +149,10 @@ axl_shared_driver_unpublish(
  * (consumer-owned types, AXL doesn't validate the layout — same ABI
  * contract as @c axl-service.h cross-image data).
  *
- * @return AXL_OK on success, AXL_ERR if the driver fails to load /
- *     start, the protocol isn't published after start, or any
- *     argument is invalid.
+ * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
+ *     obtained -- not resolvable from any candidate path or the embedded
+ *     blob, or a driver loaded but didn't start / publish the expected
+ *     protocol; AXL_ERR on invalid arguments.
  */
 int
 axl_shared_driver_locate(
@@ -226,7 +227,10 @@ axl_shared_driver_unload(
  * Pass @c load_options == NULL or @c load_options_size == 0 to skip
  * the install — equivalent to calling @ref axl_shared_driver_locate.
  *
- * @return AXL_OK on success, AXL_ERR on load/start/locate failure.
+ * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
+ *     obtained -- not resolvable from any candidate path or the embedded
+ *     blob, or a driver loaded but didn't start / publish the expected
+ *     protocol; AXL_ERR on invalid arguments.
  */
 int
 axl_shared_driver_locate_with_load_options(
@@ -243,7 +247,7 @@ axl_shared_driver_locate_with_load_options(
  * @brief Locate a shared-driver vtable with both config and a
  *     caller-set loaded-image identity.
  *
- * Superset of @ref axl_shared_driver_locate_with_load_options: when
+ * Superset of @ref axl_shared_driver_locate_with_load_options -- when
  * the driver is loaded from the embedded blob, @p info is threaded
  * down to the buffer load so the resulting image gets a non-NULL,
  * renderable device path (see @ref axl_driver_load_buffer_with_image_info)
@@ -261,7 +265,10 @@ axl_shared_driver_locate_with_load_options(
  * on a fresh load; both are skipped on the resident-driver
  * short-circuit.
  *
- * @return AXL_OK on success, AXL_ERR on load/start/locate failure.
+ * @return AXL_OK on success; AXL_NOT_FOUND when a usable vtable can't be
+ *     obtained -- not resolvable from any candidate path or the embedded
+ *     blob, or a driver loaded but didn't start / publish the expected
+ *     protocol; AXL_ERR on invalid arguments.
  */
 int
 axl_shared_driver_locate_with_image_info(
@@ -273,6 +280,58 @@ axl_shared_driver_locate_with_image_info(
     size_t                      load_options_size, ///< @p load_options length
     const AxlEmbeddedImageInfo *info,              ///< loaded-image identity (NULL → defaults)
     void                      **out_iface          ///< [out] receives the vtable pointer
+);
+
+/**
+ * @brief Locate a shared-driver vtable, SIBLING-ONLY (version-pinned).
+ *
+ * Warm resident short-circuit; else cold-load @p driver_filename from the
+ * LAUNCHER's OWN directory only (@ref axl_driver_load_sibling) and start it —
+ * no /drivers, no volume-root, no cross-volume search. Hard-fails
+ * (AXL_NOT_FOUND) if the driver isn't staged beside the launcher. For
+ * version-pinned launchers that must pair with the exact driver co-staged with
+ * them. Thin by construction (no embedded-blob arg). Installs the stdio bridge
+ * like the other locate* variants.
+ *
+ * NOTE: pinning governs only the COLD path. Once ANY driver of this identity is
+ * resident, the warm short-circuit returns it regardless of version — the first
+ * cold load pins for the boot. (Same model as do.efi today.)
+ *
+ * @return AXL_OK; AXL_NOT_FOUND if no usable vtable is obtained -- not staged
+ *     beside the launcher, or it loaded but didn't start / publish the expected
+ *     protocol (uniform with the multi-path family); AXL_INVALID on a non-bare
+ *     @p driver_filename; AXL_ERR on invalid args or no filesystem anchor
+ *     (network / RAM-disk boot).
+ */
+int
+axl_shared_driver_locate_sibling(
+    const char  *name,              ///< shared-driver identity
+    const char  *driver_filename,   ///< bare on-disk driver filename (sibling of this image)
+    void       **out_iface          ///< [out] receives the vtable pointer
+);
+
+/**
+ * @brief Resolve a SIBLING-ONLY resident shared-driver and dispatch — the
+ *     whole launcher, version-pinned.
+ *
+ * Composes @ref axl_shared_driver_locate_sibling (resident short-circuit, else
+ * sibling-only cold-load) and @ref axl_shared_driver_dispatch. This IS a
+ * turnkey `int main` body: @c AXL_SHARED_DRIVER_LAUNCHER_SIBLING expands to a
+ * call to it. For version-pinned launchers that must hard-fail rather than
+ * fall back to /drivers or a cross-volume search when the paired driver isn't
+ * staged beside them.
+ *
+ * @return the driver's exit code when it dispatched; a launcher-side error
+ *     (nonzero; also arms @c EFI_NOT_FOUND via axl_set_exit_status) when the
+ *     driver could not be located (including the AXL_NOT_FOUND hard-fail from
+ *     @ref axl_shared_driver_locate_sibling).
+ */
+int
+axl_shared_driver_run_sibling(
+    const char  *name,              ///< shared-driver identity
+    const char  *driver_filename,   ///< bare on-disk driver filename (sibling of this image)
+    int          argc,              ///< argc from main
+    char       **argv               ///< argv from main
 );
 
 /**

@@ -338,7 +338,7 @@ region_degrade(AxlGfxRegion *r, AxlGfxClip bbox)
 {
     axl_array_clear(r->rects);
     if (!clip_empty(bbox)) {
-        (void)axl_array_append(r->rects, &bbox);
+        axl_array_append(r->rects, &bbox);
     }
     r->lossy = true;
 }
@@ -399,7 +399,7 @@ region_apply_rect(AxlGfxRegion *r, AxlGfxClip rect, RegionOp op)
         return AXL_ERR;
     }
     if (!clip_empty(rect)) {
-        (void)axl_array_append(tmp.rects, &rect);
+        axl_array_append(tmp.rects, &rect);
     }
     int rc = region_apply(r, &tmp, op);
     axl_array_free(tmp.rects);

@@ -185,18 +185,18 @@ kcs_send_raw(void *vctx,
             // wait IBF clear, write 0x00 to data; BMC responds with
             // status byte then enters IDLE.
             //
-            (void)kcs_wait_ibf_clear(k);
+            kcs_wait_ibf_clear(k);
             if (kcs_write_cmd(k, KCS_CTRL_GET_STATUS) != 0) {
                 return -1;
             }
-            (void)kcs_wait_ibf_clear(k);
+            kcs_wait_ibf_clear(k);
             /* Drain any stale OBF before issuing the abort data byte. */
             uint8_t s_after_cmd;
             if (kcs_read_status(k, &s_after_cmd) == 0
                 && (s_after_cmd & KCS_OBF))
             {
                 uint8_t drop;
-                (void)kcs_read_data(k, &drop);
+                kcs_read_data(k, &drop);
             }
             if (kcs_write_data(k, 0x00) != 0) {
                 return -1;
@@ -211,9 +211,9 @@ kcs_send_raw(void *vctx,
                 }
                 if (s_drain & KCS_OBF) {
                     uint8_t drop;
-                    (void)kcs_read_data(k, &drop);
+                    kcs_read_data(k, &drop);
                     if ((s_drain & KCS_STATE_MASK) == KCS_STATE_READ) {
-                        (void)kcs_write_data(k, KCS_CTRL_READ);
+                        kcs_write_data(k, KCS_CTRL_READ);
                     }
                 }
                 if ((s_drain & KCS_STATE_MASK) == KCS_STATE_IDLE) {
@@ -235,7 +235,7 @@ kcs_send_raw(void *vctx,
             uint8_t _s;                                               \
             if (kcs_read_status(k, &_s) == 0 && (_s & KCS_OBF)) {     \
                 uint8_t _drop;                                        \
-                (void)kcs_read_data(k, &_drop);                       \
+                kcs_read_data(k, &_drop);                       \
             }                                                         \
         } while (0)
 
@@ -315,7 +315,7 @@ kcs_send_raw(void *vctx,
             /* Final dummy byte per spec — some BMCs emit, others don't */
             if (status & KCS_OBF) {
                 uint8_t discard;
-                (void)kcs_read_data(k, &discard);
+                kcs_read_data(k, &discard);
             }
             break;
         }

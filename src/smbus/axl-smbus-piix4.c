@@ -445,7 +445,7 @@ piix4_read_block(void *vctx,
 
     /* Reset the block FIFO position by reading HOST_CNT (per spec). */
     uint8_t throwaway;
-    (void)io_r(p->base + PIIX4_REG_HOST_CNT, &throwaway);
+    io_r(p->base + PIIX4_REG_HOST_CNT, &throwaway);
 
     uint8_t addr_rw = (uint8_t)((slave << 1) | PIIX4_ADDR_READ);
     if (piix4_run(p, command, addr_rw, PIIX4_CMD_BLOCK_DATA) == 0) {
@@ -486,7 +486,7 @@ piix4_write_block(void *vctx,
 
     /* Reset block-FIFO index by reading HOST_CNT (spec). */
     uint8_t throwaway;
-    (void)io_r(p->base + PIIX4_REG_HOST_CNT, &throwaway);
+    io_r(p->base + PIIX4_REG_HOST_CNT, &throwaway);
 
     if (io_w(p->base + PIIX4_REG_HOST_DAT0, (uint8_t)len) == AXL_OK) {
         rc = 0;

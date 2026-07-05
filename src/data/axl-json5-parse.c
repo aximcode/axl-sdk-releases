@@ -560,7 +560,7 @@ axl_json5_parse_internal(const char *json, size_t len, AxlJsonReader *r)
 
     /* Trailing junk (post-root) is allowed only if it's whitespace
        or comments. */
-    (void)skip_ws(&p);
+    skip_ws(&p);
     if (p.pos != p.len) {
         axl_debug("trailing junk at %zu", p.pos);
         axl_free(p.tokens);

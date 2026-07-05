@@ -166,7 +166,7 @@ out:
      * Skip if we never moved off page 0 in the first place — saves a
      * redundant SMBus op. */
     if (cached_page != 0 || !page_known) {
-        (void)ddr5_select_page(smbus, addr, addr_mode, 0);
+        ddr5_select_page(smbus, addr, addr_mode, 0);
     }
 
     if (rc == 0) {

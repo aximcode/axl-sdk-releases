@@ -203,7 +203,7 @@ binding_unload(
     // Release the controller if it is still bound (the firmware's post-load
     // connect re-binds it; the shell may also have). Harmless (AXL_OK) if not.
     if (mController != NULL) {
-        (void)axl_driver_disconnect_handle(mController);
+        axl_driver_disconnect_handle(mController);
     }
 
     if (axl_driver_binding_uninstall() != AXL_OK) {
@@ -211,7 +211,7 @@ binding_unload(
     }
 
     if (mController != NULL) {
-        (void)axl_protocol_uninstall(mController, &gWidgetGuid, &mWidget);
+        axl_protocol_uninstall(mController, &gWidgetGuid, &mWidget);
         mController = NULL;
     }
 

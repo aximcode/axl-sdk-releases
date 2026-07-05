@@ -218,7 +218,7 @@ endef
 # Common configuration
 # ===================================================================
 
-CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD
+CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
 INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend -Ideps/lzma
 
 # ===================================================================
@@ -603,7 +603,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1363,6 +1363,21 @@ $(BUILDDIR)/stdio-bridge-reap-test.o: test/integration/stdio-bridge-reap-test.c 
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# Build stdio-bridge-liveness-test.efi — regression for the handle-reuse
+# false-alive: a bridge that fools the old LoadedImage-proto match must be
+# rejected by the per-dispatch token gate. Self-contained (no leaker helper).
+# ===================================================================
+
+stdio-bridge-liveness-test: $(PREFIX)/stdio-bridge-liveness-test.efi
+	@echo "  Built: $(PREFIX)/stdio-bridge-liveness-test.efi"
+
+$(PREFIX)/stdio-bridge-liveness-test.efi: $(BUILDDIR)/stdio-bridge-liveness-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/stdio-bridge-liveness-test.o,$@)
+
+$(BUILDDIR)/stdio-bridge-liveness-test.o: test/integration/stdio-bridge-liveness-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build stdio-bridge-fix.efi (+ -driver.efi) — acceptance fixture for
 # the shared-driver stdio bridge. The driver image reads axl_stdin /
 # writes axl_stdout when the launcher dispatches a verb; the launcher
@@ -1447,6 +1462,42 @@ $(PREFIX)/sd-ergo-launcher.efi: $(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_erg
 	$(call LINK_EFI_APP,$(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_ergo_driver),$@)
 $(BUILDDIR)/sd-ergo-launcher.o: test/integration/sd-ergo-launcher.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build sd-sibling-probe.efi + sd-sibling-driver-{a,b}.efi — RED fixture
+# for the sibling-locate hard-fail + default-search sibling-first reorder
+# (docs/superpowers/specs/2026-07-04-shared-driver-sibling-locate-design.md).
+# The probe is a plain shell app (public headers only, no embedded blob);
+# the SAME driver source is built twice with -DDRIVER_TAG=A / =B so the
+# probe can tell which copy of the driver a locate call resolved.
+# ===================================================================
+
+sd-sibling: $(PREFIX)/sd-sibling-probe.efi $(PREFIX)/sd-sibling-driver-a.efi $(PREFIX)/sd-sibling-driver-b.efi
+	@echo "  Built: sd-sibling-probe.efi + sd-sibling-driver-a.efi + sd-sibling-driver-b.efi"
+
+sd-sibling-probe: $(PREFIX)/sd-sibling-probe.efi
+	@echo "  Built: $(PREFIX)/sd-sibling-probe.efi"
+
+$(PREFIX)/sd-sibling-probe.efi: $(BUILDDIR)/sd-sibling-probe.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/sd-sibling-probe.o,$@)
+$(BUILDDIR)/sd-sibling-probe.o: test/integration/sd-sibling-probe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+sd-sibling-driver-a: $(PREFIX)/sd-sibling-driver-a.efi
+	@echo "  Built: $(PREFIX)/sd-sibling-driver-a.efi"
+
+$(PREFIX)/sd-sibling-driver-a.efi: $(BUILDDIR)/sd-sibling-driver-a.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/sd-sibling-driver-a.o,$@)
+$(BUILDDIR)/sd-sibling-driver-a.o: test/integration/sd-sibling-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DDRIVER_TAG=A -c $< -o $@
+
+sd-sibling-driver-b: $(PREFIX)/sd-sibling-driver-b.efi
+	@echo "  Built: $(PREFIX)/sd-sibling-driver-b.efi"
+
+$(PREFIX)/sd-sibling-driver-b.efi: $(BUILDDIR)/sd-sibling-driver-b.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/sd-sibling-driver-b.o,$@)
+$(BUILDDIR)/sd-sibling-driver-b.o: test/integration/sd-sibling-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DDRIVER_TAG=B -c $< -o $@
 
 # ===================================================================
 # Build SmbusHcShim.efi — DXE driver that publishes
@@ -1904,7 +1955,8 @@ axl-busybox: all $(BUSYBOX_EFI)
 # ===================================================================
 
 # ===================================================================
-# Automatic dependency tracking (generated by -MD -MF)
+# Automatic dependency tracking (per-object .d generated by -MD -MP; -MP adds
+# phony header rules so a deleted/renamed header doesn't break the build)
 # ===================================================================
 
 -include $(wildcard $(BUILDDIR)/*.d)

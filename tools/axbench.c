@@ -49,7 +49,7 @@ static void
 file_write_fn(const char *data, size_t len, void *ctx)
 {
     (void)ctx;
-    (void)axl_file_writer_write(g_writer, data, len);
+    axl_file_writer_write(g_writer, data, len);
 }
 
 /* rep: report line — goes to sink (file or stdout). */
@@ -196,7 +196,7 @@ drive_wave(AxlTaskPool *pool, AxlTaskProc proc, void *elems,
         if (single) {
             /* Single-core fallback: submit runs the task inline. */
             void *arg = (char *)elems + submitted * elem_size;
-            (void)axl_task_pool_submit(pool, proc, arg, NULL, NULL);
+            axl_task_pool_submit(pool, proc, arg, NULL, NULL);
             submitted++;
             done++;
             continue;
@@ -385,7 +385,7 @@ typedef struct {
 static void bsp_thunk(void *ctx)
 {
     ComputeCtx *c = (ComputeCtx *)ctx;
-    (void)run_bsp(c->chunks, c->n);
+    run_bsp(c->chunks, c->n);
 }
 
 static void pool_thunk(void *ctx)
@@ -408,7 +408,7 @@ static void blur_bsp_thunk(void *ctx)
     BlurCtx *b = (BlurCtx *)ctx;
     g_n_blur_tiles = blur_build_tiles(b->tile_h);
     axl_memset(g_dst, 0, IMG_W * g_img_h);
-    (void)blur_run_bsp();
+    blur_run_bsp();
 }
 
 static void blur_pool_thunk(void *ctx)
@@ -504,7 +504,7 @@ typedef struct { BenchChunk *chunks; size_t n; } CalCtx;
 static void cal_bsp_thunk(void *ctx)
 {
     CalCtx *c = (CalCtx *)ctx;
-    (void)run_bsp(c->chunks, c->n);
+    run_bsp(c->chunks, c->n);
 }
 
 static uint32_t
@@ -650,7 +650,7 @@ cleanup_atexit(void *unused)
     if (g_dst    != NULL) { axl_free(g_dst);    g_dst    = NULL; }
     if (g_src    != NULL) { axl_free(g_src);    g_src    = NULL; }
     if (g_chunks != NULL) { axl_free(g_chunks); g_chunks = NULL; }
-    if (g_writer != NULL) { (void)axl_file_writer_close(g_writer); g_writer = NULL; }
+    if (g_writer != NULL) { axl_file_writer_close(g_writer); g_writer = NULL; }
 }
 
 /* No-op handler: installing one disables axl_yield()'s default exit-on-break
@@ -699,7 +699,7 @@ main(int argc, char *argv[])
     /* Stop the AP workers on any exit path (Ctrl-C abort or normal return)
      * before the image unloads — see check_interrupt(). */
     g_pool = pool;
-    (void)axl_atexit(cleanup_atexit, NULL);
+    axl_atexit(cleanup_atexit, NULL);
     axl_signal_install(on_interrupt);   /* let check_interrupt() own the exit */
 
     size_t W = axl_task_pool_worker_count(pool);

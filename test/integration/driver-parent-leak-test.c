@@ -146,7 +146,7 @@ main(int argc, char **argv)
      * expected and fine — the driver is published during locate, before the
      * verb runs. What matters is that StartImage returns so the launcher is
      * auto-unloaded. */
-    (void)axl_driver_start(launcher);
+    axl_driver_start(launcher);
 
     /* 2. The driver must now be resident and discoverable by its GUID. */
     EFI_HANDLE drv = locate_driver_handle(&guid);

@@ -347,7 +347,7 @@ tcp_connect_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
     }
 
     if (ctx->cb != NULL) {
-        (void)ctx->cb(ctx->sock, status, ctx->data);  /* connect is one-shot */
+        ctx->cb(ctx->sock, status, ctx->data);  /* connect is one-shot */
     }
 
     axl_free(ctx);
@@ -464,7 +464,7 @@ tcp_send_bridge(AxlTcp *tcp, AxlStatus status, void *ctx_data)
     (void)tcp;
 
     if (ctx->cb != NULL) {
-        (void)ctx->cb(ctx->sock, status, ctx->data);  /* send is one-shot */
+        ctx->cb(ctx->sock, status, ctx->data);  /* send is one-shot */
     }
 
     axl_free(ctx);

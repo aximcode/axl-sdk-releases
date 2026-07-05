@@ -319,7 +319,7 @@ axl_cpu_register_exception(
        a previously-registered handler. We need that first when
        replacing, since registering a second handler over a live one
        fails with EFI_ALREADY_STARTED on some firmwares. */
-    (void)p->RegisterInterruptHandler(p, efi_type, NULL);
+    p->RegisterInterruptHandler(p, efi_type, NULL);
     EFI_STATUS status = p->RegisterInterruptHandler(p, efi_type,
                                                    cpu_exception_thunk);
     if (EFI_ERROR(status)) {
@@ -329,7 +329,7 @@ axl_cpu_register_exception(
            and find an empty slot (which would silently swallow
            the trap). Only after firmware-side teardown is
            guaranteed do we clear the slot. */
-        (void)p->RegisterInterruptHandler(p, efi_type, NULL);
+        p->RegisterInterruptHandler(p, efi_type, NULL);
         g_slots[kind].cb   = NULL;
         g_slots[kind].user = NULL;
         axl_warning("RegisterInterruptHandler(kind=%d) failed: 0x%lx",
@@ -367,7 +367,7 @@ axl_cpu_unregister_exception(AxlCpuExceptionKind kind)
 
     /* Tell the firmware first so the thunk can't fire after we
        clear the slot. */
-    (void)p->RegisterInterruptHandler(p, efi_type, NULL);
+    p->RegisterInterruptHandler(p, efi_type, NULL);
     g_slots[kind].cb   = NULL;
     g_slots[kind].user = NULL;
     return AXL_OK;

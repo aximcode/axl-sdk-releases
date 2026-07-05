@@ -160,7 +160,7 @@ console_write_via(
     unsigned short *heap_buf = NULL;
 
     bool overflowed = false;
-    (void)console_transcode_crlf((const uint8_t *)data, count,
+    console_transcode_crlf((const uint8_t *)data, count,
                                  out, out_cap, &overflowed);
 
     if (overflowed) {
@@ -176,7 +176,7 @@ console_write_via(
                 );
             return -1;
         }
-        (void)console_transcode_crlf((const uint8_t *)data, count,
+        console_transcode_crlf((const uint8_t *)data, count,
                                      heap_buf, heap_cap, &overflowed);
         /* heap_cap is the absolute worst case — a second overflow
            is unreachable; ignore the flag. */
@@ -770,7 +770,7 @@ axl_write(AxlStream *s, const void *buf, size_t count)
         AxlStream *t = s->tee;
         if (t->write != NULL) {
             if (t->encoding != AXL_ENC_UTF8) {
-                (void)write_transcode(t, buf, count);
+                write_transcode(t, buf, count);
             } else {
                 axl_ssize_t tn = t->write(t->ctx, buf, count);
                 if (tn < 0) {

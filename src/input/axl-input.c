@@ -412,13 +412,13 @@ axl_input_locate_physical_pointer(EFI_GUID *guid)
         if (iface == NULL && count > 0) {
             /* No separate physical handle — keep the old behaviour and
                use the first (the aggregator). */
-            (void)axl_bs()->HandleProtocol(handles[0], guid, &iface);
+            axl_bs()->HandleProtocol(handles[0], guid, &iface);
         }
         axl_bs()->FreePool(handles);
     }
     if (iface == NULL) {
         /* LocateHandleBuffer failed outright — last resort. */
-        (void)axl_bs()->LocateProtocol(guid, NULL, &iface);
+        axl_bs()->LocateProtocol(guid, NULL, &iface);
     }
     return iface;
 }
@@ -617,8 +617,8 @@ axl_input_probe_pointers(const char *log_path)
     EFI_HANDLE con_in = axl_st()->ConsoleInHandle;
     EFI_SIMPLE_POINTER_PROTOCOL   *sp = NULL;
     EFI_ABSOLUTE_POINTER_PROTOCOL *ap = NULL;
-    (void)axl_bs()->HandleProtocol(con_in, &sp_guid, (void **)&sp);
-    (void)axl_bs()->HandleProtocol(con_in, &ap_guid, (void **)&ap);
+    axl_bs()->HandleProtocol(con_in, &sp_guid, (void **)&sp);
+    axl_bs()->HandleProtocol(con_in, &ap_guid, (void **)&ap);
 
     int sp_evt = 0, ap_evt = 0, sp_poll = 0, ap_poll = 0;
     const int PRINT_CAP = 6;   // lines per kind (the counts still tally all)
@@ -698,7 +698,7 @@ axl_input_probe_pointers(const char *log_path)
     probe_emit(buf, sizeof buf, &len, "=== end probe ===\n");
 
     if (log_path != NULL && len > 0) {
-        (void)axl_file_set_contents(log_path, buf, len);
+        (void)axl_file_set_contents(log_path, buf, len);   /* nodiscard: best-effort */
     }
 }
 
@@ -773,7 +773,7 @@ axl_input_attach_mouse(
         if (sp == NULL) {
             continue;
         }
-        (void)sp->Reset(sp, false);   /* best-effort; first GetState may be NOT_READY */
+        sp->Reset(sp, false);   /* best-effort; first GetState may be NOT_READY */
         if (sp->WaitForInput != NULL) {
             AxlSourceId sid = axl_loop_add_event(loop, sp->WaitForInput,
                                                  mouse_dispatch_cb, &mouse_state);
@@ -1205,7 +1205,7 @@ touch_rebind_(TouchSource *tch)
         // Poll-only still Resets the devices, but registers no event sources.
         for (int i = 0; i < tch->nproto; i++) {
             EFI_ABSOLUTE_POINTER_PROTOCOL *ap = touch_resolve(tch->handles[i]);
-            if (ap != NULL) { (void)ap->Reset(ap, false); }
+            if (ap != NULL) { ap->Reset(ap, false); }
         }
         return;
     }
@@ -1214,7 +1214,7 @@ touch_rebind_(TouchSource *tch)
         if (ap == NULL) {
             continue;
         }
-        (void)ap->Reset(ap, false);   // best-effort
+        ap->Reset(ap, false);   // best-effort
         if (ap->WaitForInput != NULL) {
             AxlSourceId sid = axl_loop_add_event(tch->loop, ap->WaitForInput,
                                               touch_dispatch_cb, tch);

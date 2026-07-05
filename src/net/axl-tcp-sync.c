@@ -867,7 +867,7 @@ axl_tcp_close(AxlTcp *sock)
            the loop-based wait sleeps on WaitForEvent between Poll ticks rather
            than busy-polling. (A sync request's OWN drop-close runs inside its
            ephemeral loop's dispatch, so it takes the inline branch above.) */
-        (void)_axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
+        _axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
     }
     finalize_close_ctx(ctx);
 }

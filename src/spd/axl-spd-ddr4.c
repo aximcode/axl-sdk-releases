@@ -107,7 +107,7 @@ axl_spd_ddr4_read(
     }
 
     /* Lower 256 bytes — always accessible. */
-    (void)ddr4_set_page(smbus, false);   /* best-effort; ignore SPA failures */
+    ddr4_set_page(smbus, false);   /* best-effort; ignore SPA failures */
 
     size_t lower_len = cap < 256 ? cap : 256;
     for (size_t i = 0; i < lower_len; i++) {
@@ -137,12 +137,12 @@ axl_spd_ddr4_read(
                                     (uint8_t)i, &buf[256 + i]) != AXL_OK) {
                 /* Restore lower-page selection so subsequent reads from
                    neighbour SPDs see the right bytes. */
-                (void)ddr4_set_page(smbus, false);
+                ddr4_set_page(smbus, false);
                 *len = 256 + i;
                 return AXL_OK;
             }
         }
-        (void)ddr4_set_page(smbus, false);
+        ddr4_set_page(smbus, false);
         *len = 256 + upper_cap;
         return AXL_OK;
     }

@@ -109,7 +109,7 @@ _axl_net_bus_location(
     }
 
     BusCutCtx ctx = { .dp_base = device_path, .cut_off = 0, .found = false };
-    (void)axl_device_path_for_each(device_path, bus_cut_cb, &ctx);
+    axl_device_path_for_each(device_path, bus_cut_cb, &ctx);
 
     char *text = NULL;
     if (!ctx.found) {
@@ -196,7 +196,7 @@ resolve_driver_image_name(
         return axl_strdup("<unknown>");
     }
     ImgNameCtx ctx = { .image_name = NULL, .saw_fv_node = false };
-    (void)axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
+    axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
     if (ctx.image_name != NULL) {
         return ctx.image_name;
     }
@@ -280,7 +280,7 @@ resolve_bus_for_handle(
     if (EFI_ERROR(st) || dp == NULL) {
         return;  /* bus_location stays "" */
     }
-    (void)_axl_net_bus_location(dp, out->bus_location, sizeof(out->bus_location));
+    _axl_net_bus_location(dp, out->bus_location, sizeof(out->bus_location));
 }
 
 // ===========================================================================

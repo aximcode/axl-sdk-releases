@@ -15,16 +15,14 @@ typedef struct {
     AxlFileHandle  stdin_h;
     AxlFileHandle  stdout_h;
     AxlFileHandle  stderr_h;
-    void          *launcher_image;   /* EFI_HANDLE; driver-side liveness gate — a
-                                        consult is skipped if this image has
-                                        exited (its stdin_h would be dangling) */
-    void          *launcher_image_proto; /* EFI_LOADED_IMAGE_PROTOCOL* recorded at
-                                        install; liveness also requires the
-                                        handle's CURRENT LoadedImage protocol
-                                        pointer to still match this. Narrows
-                                        but does not eliminate the handle-reuse
-                                        false-alive — see bridge_launcher_alive()
-                                        for the residual risk and mitigation */
+    void          *launcher_image;   /* EFI_HANDLE; debug/identity only — no
+                                        longer the liveness gate (see token) */
+    uint64_t       token;            /* per-dispatch monotonic token (was
+                                        launcher_image_proto; same 8-byte
+                                        offset). The driver's liveness gate:
+                                        a bridge is live iff this equals the
+                                        driver-resident AxlDispatchToken.current
+                                        the launcher stamped this dispatch. */
     uint64_t       pending_status;   /* driver-armed exit status reflected here */
     bool           has_pending;      /* true when a driver armed a status this dispatch */
 } AxlStdioBridge;
@@ -32,6 +30,28 @@ typedef struct {
 /* uuid c8f517d7-36cc-458d-98d6-b116825e30bf — fixed identity of the
    stdio-bridge protocol. */
 extern const AxlGuid AXL_STDIO_BRIDGE_GUID;
+
+/* Driver-resident per-dispatch liveness reference. A resident driver installs
+   exactly one of these (install-if-absent) at publish time on a dedicated
+   persistent handle; each dispatch the launcher stamps the fresh token into
+   both its bridge and this cell. `current == 0` means "no active dispatch". */
+typedef struct {
+    uint64_t  current;
+} AxlDispatchToken;
+
+/* uuid 02dd6813-d275-4734-98f8-c7f60331958d — fixed identity of the
+   dispatch-token protocol. */
+extern const AxlGuid AXL_DISPATCH_TOKEN_GUID;
+
+/* Install the dispatch-token cell if none exists yet (idempotent, cross-image).
+   Called by a resident driver at publish. AXL_OK when the cell exists
+   afterward. CONTRACT: every resident shared-driver MUST reach this (the
+   AXL_SHARED_DRIVER macro / axl_shared_driver_publish do so automatically) —
+   a driver that publishes its vtable via raw axl_protocol_install without
+   calling this never creates the cell, so ALL bridge consults see no cell and
+   stdin/stderr/exit-status bridging silently degrades to EOF fallback (safe:
+   no crash, no wrong data, just no bridging). */
+int axl_backend_dispatch_token_ensure(void);
 
 /* Returns AXL_OK when the bridge is installed or there were no launcher
    shell handles to bridge (no-op); AXL_ERR if the protocol install failed. */

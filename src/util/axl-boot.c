@@ -86,7 +86,7 @@ read_global_variable(
     /* Size query — axl_nvstore_get returns -1 on EFI_BUFFER_TOO_SMALL
        but populates *size to the required length. */
     size_t needed = 0;
-    (void)axl_nvstore_get("global", key, NULL, &needed);
+    axl_nvstore_get("global", key, NULL, &needed);
     if (needed == 0) {
         return -1;
     }

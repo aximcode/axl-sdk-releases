@@ -396,7 +396,7 @@ parse_typed(ParsedArg *slot, const char *value, const char *path)
                     return false;
                 }
             }
-            (void)axl_array_append_ptr(slot->multi_values, (void *)value);
+            axl_array_append_ptr(slot->multi_values, (void *)value);
             slot->set = true;
             return true;
 
@@ -759,7 +759,7 @@ consume_positional(AxlArgs *a, const char *value)
                 return false;
             }
         }
-        (void)axl_array_append_ptr(a->variadic, (void *)value);
+        axl_array_append_ptr(a->variadic, (void *)value);
         ParsedArg *slot = slot_by_name_local(a, pos_list[n - 1].name);
         if (slot != NULL) {
             slot->set = true;
@@ -778,7 +778,7 @@ consume_positional(AxlArgs *a, const char *value)
             return false;
         }
     }
-    (void)axl_array_append_ptr(a->variadic, (void *)value);
+    axl_array_append_ptr(a->variadic, (void *)value);
     return true;
 }
 

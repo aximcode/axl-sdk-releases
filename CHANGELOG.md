@@ -3,6 +3,83 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.7.1 — 2026-07-04
+
+### Added
+
+- **Sibling-only shared-driver locate — version-pinned resolution.**
+  `axl_shared_driver_locate_sibling(name, driver_filename, out_iface)` (and its
+  turnkey wrappers `axl_shared_driver_run_sibling` + the
+  `AXL_SHARED_DRIVER_LAUNCHER_SIBLING(name, file)` macro) resolve a resident
+  driver, else cold-load the driver from the **launcher's own directory only**
+  and **hard-fail** (`AXL_NOT_FOUND`) if it isn't staged beside the launcher —
+  no `/drivers`, no volume-root, no cross-volume search. For thin launchers that
+  must pair with the exact driver co-staged with them (the two halves share a
+  cross-image vtable ABI, so a wrong-version driver is a silent-corruption
+  hazard). Pinning governs the cold path only: once a driver of that identity is
+  resident, the warm short-circuit returns it.
+
+### Added
+
+- **`axl-cc -c --depfile <dest>`** — writes Make dependency file(s) with
+  **absolute** dependency paths while compiling the *bare* source(s) unchanged
+  (objects stay bit-identical to a no-depfile compile). A plain forwarded
+  `-MMD -MF` emits compile-cwd-relative paths, which CMake's
+  `add_custom_command(DEPFILE …)` (CMP0116) resolves against the *binary* dir
+  and so misses — `--depfile` makes per-object header tracking work under CMake
+  without perturbing the Makefile↔CMake bit-parity that bare-source compilation
+  provides. One source → `<dest>` is the `.d` path; multiple sources →
+  `<dest>` is a directory and each object gets `<base>.d` inside it (one `.d`
+  per object, like gcc's bare `-MMD`; a single `-MF` file can't hold N).
+  Requires `-c`.
+
+### Changed
+
+- **`axl-cc` / `axl-c++` now forward compiler and linker flags they don't
+  consume, instead of mistaking them for source files.** Any single-dash flag
+  the driver doesn't recognize is passed to the compiler (both C and C++) —
+  e.g. `-O2`, `-g3`, `-pedantic`, and gcc dependency-generation flags
+  (`-MMD -MP -MF <f> -MT <t>` …), so per-object incremental builds can emit
+  `.d` files. Linker options pass through via `-Wl,<opt>[,<opt>…]` and
+  `-Xlinker <opt>`. An unrecognized `--long` option is now a clear
+  `unknown option` error rather than a "source file not found". (Previously
+  only `-I/-D/-W*/-f*/-std=*` reached the compiler and nothing reached the
+  linker.)
+- **Default shared-driver search now prefers the co-located sibling.**
+  `axl_shared_driver_locate` (and `axl_driver_ensure_with_embedded`) previously
+  tried `/drivers/<arch>/<name>` on the image's volume *before* the driver
+  staged beside the launcher, so a stale system-location copy could win. The
+  sibling (`<image_dir>/<name>`) is now the first candidate; `/drivers/<arch>/`,
+  volume-root, and other-volume locations follow as fallbacks.
+- **`axl_shared_driver_locate*` return `AXL_NOT_FOUND` (not `AXL_ERR`) whenever a
+  usable driver vtable can't be obtained** — not resolvable from any candidate
+  path or the embedded blob, or a driver that loads but doesn't start / publish
+  the expected protocol. `AXL_ERR` is now reserved for invalid arguments
+  (`axl_shared_driver_locate_sibling` also returns `AXL_INVALID` for a non-bare
+  filename). The `_sibling` and multi-path variants report the same code for the
+  same condition. Callers testing `!= AXL_OK` are unaffected.
+
+### Fixed
+
+- **Shared-driver stdio bridge: closed the handle-reuse false-alive in the
+  liveness gate.** The 2.7.0 gate compared a recorded
+  `EFI_LOADED_IMAGE_PROTOCOL*` stored in the bridge's own (freed, recyclable)
+  memory, so a relaunched thin launcher that exited via `gBS->Exit()` could
+  have its handle *and* that recorded pointer recycled together — spuriously
+  matching, letting a resident driver read a prior launcher's
+  stdin/stderr/exit-status (wrong *data*, never a crash — the 2.6.1
+  use-after-free was already fixed). The gate is now an active per-dispatch
+  monotonic token held in driver-resident memory: the driver installs a small
+  dispatch-token cell at publish, and each dispatch the launcher stamps a fresh
+  `GetNextMonotonicCount()` into both its bridge and that cell — a bridge is
+  live only when its token equals the cell's current value. Because the
+  reference lives outside the recyclable bridge, correlated pool recycling can
+  no longer forge a match. Internal only — no API change, and the
+  `AxlStdioBridge` layout is unchanged (the token reuses the former
+  recorded-pointer slot). A version-skewed shared-driver pair degrades to EOF
+  (no bridging), never wrong data; build both halves against the same SDK, as
+  before.
+
 ## 2.7.0 — 2026-07-04
 
 ### Changed

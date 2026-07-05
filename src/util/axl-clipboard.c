@@ -117,7 +117,7 @@ axl_clipboard_set(const void *data, size_t len, const char *mime)
     }
 
     /* Swap: drop the old segment, create the new one, copy the image in. */
-    (void)axl_shm_unlink(CLIP_SHM_NAME);
+    (void)axl_shm_unlink(CLIP_SHM_NAME);   /* nodiscard: intentionally ignored */
     void *seg = axl_shm_open(CLIP_SHM_NAME, img_size, AXL_SHM_CREATE, NULL);
     if (seg == NULL) {
         /* Out of persistent memory — best-effort restore the old content. */
@@ -179,5 +179,5 @@ axl_clipboard_get_bytes(void)
 void
 axl_clipboard_clear(void)
 {
-    (void)axl_shm_unlink(CLIP_SHM_NAME);
+    (void)axl_shm_unlink(CLIP_SHM_NAME);   /* nodiscard: intentionally ignored */
 }

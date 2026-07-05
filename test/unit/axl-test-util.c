@@ -3231,7 +3231,8 @@ test_driver_ensure(void)
 
     /* Short-circuit: pass a bogus driver name. If the short-circuit
      * works, the driver lookup never happens and we get 0. If it
-     * doesn't, the bogus name causes a search miss and we get -1. */
+     * doesn't, the bogus name causes a search miss and we get
+     * AXL_NOT_FOUND. */
     test_check(axl_driver_ensure(&simple_fs,
                                  "definitely-not-a-real-driver.efi") == 0,
                "driver_ensure: short-circuits when protocol registered");
@@ -3244,15 +3245,17 @@ test_driver_ensure(void)
 
     /* Missing protocol + missing driver: a GUID we know is not
      * registered in QEMU + a filename that doesn't exist anywhere
-     * on the disk. Should walk the search list, find nothing,
-     * return -1 without crashing. */
+     * on the disk. Should walk the search list, find nothing, and
+     * return AXL_NOT_FOUND (the granular rc — distinct from AXL_ERR,
+     * which is now reserved for bad-args / start-failure) without
+     * crashing. */
     static const AxlGuid never_registered = AXL_GUID(
         0xdeadbeef, 0xcafe, 0xbabe,
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef);
 
     test_check(axl_driver_ensure(&never_registered,
-                                 "no-such-driver-12345.efi") == -1,
-               "driver_ensure: returns -1 when driver not found");
+                                 "no-such-driver-12345.efi") == AXL_NOT_FOUND,
+               "driver_ensure: returns AXL_NOT_FOUND when driver not found");
 }
 
 // ---------------------------------------------------------------------------

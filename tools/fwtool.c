@@ -593,7 +593,7 @@ node_label(
         axl_snprintf(out, cap, "%s[%s]", kind_name(kind), gbuf);
     } else {
         size_t off = 0;
-        (void)axl_fw_node_offset(node, &off);
+        axl_fw_node_offset(node, &off);
         axl_snprintf(out, cap, "%s[0x%zx]", kind_name(kind), off);
     }
 }
@@ -622,7 +622,7 @@ find_node(
         }
         /* Also print offset and body size */
         size_t off = 0;
-        (void)axl_fw_node_offset(node, &off);
+        axl_fw_node_offset(node, &off);
         axl_printf(" off=0x%zx", off);
         const void *body;
         size_t      body_len;

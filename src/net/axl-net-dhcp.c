@@ -1003,7 +1003,7 @@ axl_net_auto_init(size_t nic_index, size_t dhcp_timeout_sec)
     /* drivers_up returns AXL_ERR if no link came up — auto_init still
        continues (older callers rely on the DHCP poll being attempted
        even on no-link paths to surface a clearer error). */
-    (void)axl_net_drivers_up();
+    axl_net_drivers_up();
 
     /*
      * Set DHCP policy via IP4Config2. We find the right handle,

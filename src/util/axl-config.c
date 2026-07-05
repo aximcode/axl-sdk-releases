@@ -385,7 +385,7 @@ axl_config_set(AxlConfig *cfg, const char *key, const char *value)
 
         /* Auto-apply uses stored copy (safe for STRING pointer fields).
          * The value was validated above so this can't fail; ignore rc. */
-        (void)auto_apply(cfg->target, desc, stored);
+        auto_apply(cfg->target, desc, stored);
     }
 
     return AXL_OK;

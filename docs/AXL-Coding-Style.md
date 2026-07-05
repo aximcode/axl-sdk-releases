@@ -466,6 +466,33 @@ caller really should look at the return value — every wait/event
 function, every operation that can leak resources on the failure
 path, every `axl_*_open` that needs paired `_close`.
 
+### Do not `(void)`-cast discarded call returns
+
+Do **not** write `(void)some_call();` to silence "I'm ignoring this
+return." It is pure decoration: the project enables no
+unused-return-value lint, and for an ordinary (non-`nodiscard`)
+function GCC never warns on an ignored return, cast or not. Just call
+the function:
+
+```c
+axl_array_append(arr, &item);   // yes — result intentionally ignored
+(void)axl_array_append(arr, &item);   // no — noise
+```
+
+The **one** exception: a call to an `AXL_WARN_UNUSED` / `[[nodiscard]]`
+function whose result you genuinely mean to ignore. There GCC's
+`-Wunused-result` fires and a `(void)` cast is the sanctioned
+suppression — keep it, and add a short trailing comment saying why the
+result is ignored:
+
+```c
+(void)axl_shm_unlink(name);   /* nodiscard: intentionally ignored */
+```
+
+If a `(void)` cast on a call does not silence a real `nodiscard`
+warning, it does not belong. (Unused-*parameter* casts —
+`(void)argc;` — are a different, valid idiom and stay.)
+
 ## Event Loop Callback Convention
 
 Callback return values control the **source**, not the loop:

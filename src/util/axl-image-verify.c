@@ -556,7 +556,7 @@ loadimage_dry_run_validate(
         rc = -1;
     }
     if (child != NULL && axl_bs()->UnloadImage != NULL) {
-        (void)axl_bs()->UnloadImage(child);
+        axl_bs()->UnloadImage(child);
     }
     return rc;
 }

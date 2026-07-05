@@ -386,6 +386,19 @@ void _axl_cleanup(void);
   }
 
 /**
+ * AXL_SHARED_DRIVER_LAUNCHER_SIBLING(name_str, driver_filename):
+ * Like AXL_SHARED_DRIVER_LAUNCHER_THIN but SIBLING-ONLY (version-pinned):
+ * hard-fails (no /drivers, no volume-root, no cross-volume search) if
+ * @p driver_filename isn't staged beside this launcher image. For launchers
+ * that must pair with the exact driver co-staged with them.
+ */
+#define AXL_SHARED_DRIVER_LAUNCHER_SIBLING(name_str, driver_filename)       \
+  int main(int argc, char **argv) {                                         \
+    return axl_shared_driver_run_sibling((name_str), (driver_filename),    \
+                                         argc, argv);                       \
+  }
+
+/**
  * AXL_SERVICE_DRIVER:
  * @svc: an `AxlService` lvalue (typically a `static const`)
  *

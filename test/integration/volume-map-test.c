@@ -178,7 +178,7 @@ main(int argc, char **argv)
 
     /* Phase 2 — mkrd: create a ramdisk, then re-check. The pre-existing
      * volumes must not swap. */
-    (void)axl_ramdisk_ensure_driver(AXL_EMBED_DATA(ramdiskdxe),
+    axl_ramdisk_ensure_driver(AXL_EMBED_DATA(ramdiskdxe),
                                     AXL_EMBED_SIZE(ramdiskdxe), NULL);
     void *dp = NULL;
     if (axl_ramdisk_create("VMAPTEST", 16, &dp) == AXL_OK) {
@@ -191,7 +191,7 @@ main(int argc, char **argv)
          * exact trigger in the report). assert_invariant re-checks each mapped
          * volume; the ramdisk itself is unmapped until the shell remaps on its
          * next command, so it falls back to a positional name and is skipped. */
-        (void)assert_invariant(sh, "after");
+        assert_invariant(sh, "after");
     } else {
         /* Ramdisk creation needs EFI_RAM_DISK_PROTOCOL; if the firmware lacks
          * it and the embedded RamDiskDxe won't load, skip the mkrd half rather

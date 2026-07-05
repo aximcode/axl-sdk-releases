@@ -90,6 +90,10 @@ axl_shared_driver_publish(
         axl_warning("axl_shared_driver_publish: install failed for '%s'",
                     name);
     }
+    /* Ensure the driver-resident dispatch-token cell exists so launchers can
+       stamp per-dispatch liveness tokens the bridge gate reads. Best-effort:
+       stdio bridging degrades to EOF fallback if this fails, never fatal. */
+    axl_backend_dispatch_token_ensure();
     return rc;
 }
 
@@ -202,15 +206,13 @@ axl_shared_driver_locate_with_image_info(
        call, not through LoadOptions. On the embedded path, @p info
        (defaulting the leaf name to driver_filename) gives the loaded
        image a non-NULL device path. */
-    if (_axl_driver_ensure_with_embedded_info(
-            &guid, driver_filename,
-            embed_blob, embed_len,
-            /* override_name */ NULL,
-            load_options, load_options_size,
-            info) != AXL_OK) {
+    int _rc = _axl_driver_ensure_with_embedded_info(
+        &guid, driver_filename, embed_blob, embed_len,
+        /* override_name */ NULL, load_options, load_options_size, info);
+    if (_rc != AXL_OK) {
         axl_warning("axl_shared_driver_locate: failed to load '%s'",
                     driver_filename);
-        return AXL_ERR;
+        return _rc;   /* was AXL_ERR — now AXL_NOT_FOUND when not found */
     }
 
     /* Defensive: axl_protocol_find_guid is documented to populate
@@ -221,7 +223,9 @@ axl_shared_driver_locate_with_image_info(
         axl_warning("axl_shared_driver_locate: '%s' loaded but "
                     "protocol for '%s' not published",
                     driver_filename, name);
-        return AXL_ERR;
+        /* Loaded but the vtable isn't there -> uniform AXL_NOT_FOUND (the
+           requested entity doesn't exist), matching locate_sibling. */
+        return AXL_NOT_FOUND;
     }
 
     /* Driver is resident and the vtable resolved. Refresh the stdio
@@ -231,7 +235,7 @@ axl_shared_driver_locate_with_image_info(
        run carries its own handles; zero consumer code. A bridge
        install failure is non-fatal to the locate contract (the vtable
        resolved) — the driver simply falls back to EOF stdin. */
-    (void)axl_backend_stdio_bridge_install();
+    axl_backend_stdio_bridge_install();
     return AXL_OK;
 }
 
@@ -265,6 +269,64 @@ axl_shared_driver_locate(
         name, driver_filename, embed_blob, embed_len,
         /* load_options */ NULL, 0,
         out_iface);
+}
+
+int
+axl_shared_driver_locate_sibling(
+    const char  *name,
+    const char  *driver_filename,
+    void       **out_iface
+    )
+{
+    if (name == NULL || driver_filename == NULL || out_iface == NULL) {
+        return AXL_ERR;
+    }
+    *out_iface = NULL;
+
+    AxlGuid guid;
+    if (axl_shared_driver_guid(name, &guid) != AXL_OK) {
+        return AXL_ERR;
+    }
+    /* Warm: resident driver of this identity already published — reuse it.
+       Pinning governs only the cold path; the first cold load pins the boot. */
+    void *warm = NULL;
+    if (axl_protocol_find_guid(&guid, &warm) == AXL_OK && warm != NULL) {
+        *out_iface = warm;
+        axl_backend_stdio_bridge_install();
+        return AXL_OK;
+    }
+    /* Cold: SIBLING-ONLY. Return the load rc verbatim so callers keep
+       AXL_NOT_FOUND ("not staged beside us") / AXL_INVALID. */
+    AxlDriverHandle h = NULL;
+    int lrc = axl_driver_load_sibling(driver_filename, &h);
+    if (lrc != AXL_OK) {
+        axl_warning("axl_shared_driver_locate_sibling: '%s' not staged "
+                    "beside the launcher", driver_filename);
+        return lrc;
+    }
+    if (axl_driver_start(h) != AXL_OK) {
+        axl_warning("axl_shared_driver_locate_sibling: start failed for '%s'",
+                    driver_filename);
+        axl_driver_unload(h);
+        /* Couldn't bring the sibling up -> no usable vtable. Uniform with the
+           multi-path family: AXL_NOT_FOUND means "the vtable isn't available",
+           whatever the cold-path reason. */
+        return AXL_NOT_FOUND;
+    }
+    if (axl_protocol_find_guid(&guid, out_iface) != AXL_OK
+        || *out_iface == NULL) {
+        axl_warning("axl_shared_driver_locate_sibling: '%s' loaded but "
+                    "protocol for '%s' not published", driver_filename, name);
+        /* Started but didn't publish -> unload to keep system state clean
+           (mirrors driver_start_and_verify), clear the out param, and report
+           AXL_NOT_FOUND (the vtable doesn't exist) to match the multi-path
+           family's fold. */
+        axl_driver_unload(h);
+        *out_iface = NULL;
+        return AXL_NOT_FOUND;
+    }
+    axl_backend_stdio_bridge_install();
+    return AXL_OK;
 }
 
 int
@@ -303,7 +365,7 @@ axl_shared_driver_dispatch(
        this launcher. apply is a no-op (AXL_ERR, ignored) when none armed. */
     axl_shared_driver_install_stdio_bridge();
     int rc = vt->run(argc, argv);
-    (void)axl_shared_driver_apply_exit_status();
+    axl_shared_driver_apply_exit_status();
     return rc;
 }
 
@@ -336,4 +398,24 @@ axl_shared_driver_run(
        self-contained for callers that skip locate entirely. */
     return axl_shared_driver_dispatch((const AxlSharedDriverVtable *)iface,
                                       argc, argv);
+}
+
+int
+axl_shared_driver_run_sibling(
+    const char  *name,
+    const char  *driver_filename,
+    int          argc,
+    char       **argv
+    )
+{
+    void *iface = NULL;
+    if (axl_shared_driver_locate_sibling(name, driver_filename, &iface) != AXL_OK
+        || iface == NULL) {
+        axl_warning("axl_shared_driver_run_sibling: failed to load '%s'",
+                    driver_filename);
+        axl_set_exit_status(AXL_EFI_NOT_FOUND);
+        return 1;
+    }
+    return axl_shared_driver_dispatch(
+        (const AxlSharedDriverVtable *)iface, argc, argv);
 }

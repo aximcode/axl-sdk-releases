@@ -22,7 +22,7 @@
  * }
  *
  * // Interruptible sleep:
- * (void)axl_wait_ms(NULL, 100);
+ * axl_wait_ms(NULL, 100);
  * @endcode
  */
 

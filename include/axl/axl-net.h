@@ -309,9 +309,10 @@ axl_net_auto_init(
  * Locates and loads `NetworkCommon.efi` plus a known list of NIC
  * drivers (Realtek, Intel/iPXE, Broadcom/iPXE, USB-CDC ECM/NCM,
  * USB-RNDIS, ASIX-USB) from the standard driver search path used by
- * axl_driver_ensure() — drivers/&lt;arch&gt;/&lt;name&gt; on the booted volume,
- * the image's own directory, drivers/&lt;name&gt; at the volume root, then
- * drivers/&lt;arch&gt;/&lt;name&gt; on every other mounted FAT volume. After
+ * axl_driver_ensure() — the image's own directory (the sibling) first,
+ * then drivers/&lt;arch&gt;/&lt;name&gt; on the booted volume, drivers/&lt;name&gt; at
+ * the volume root, then drivers/&lt;arch&gt;/&lt;name&gt; on every other mounted
+ * FAT volume. After
  * loading, ConnectController is run globally to wire the SNP/MNP/
  * IP4/TCP4 stack.
  *

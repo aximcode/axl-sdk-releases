@@ -28,7 +28,7 @@ main(int argc, char **argv)
     /* Plain http:// only — exercises the client's request path (which contains
        the now-indirected https branch) without ever referencing TLS. */
     AxlHttpClientResponse *resp = NULL;
-    (void)axl_http_get(client, "http://127.0.0.1/", &resp);
+    axl_http_get(client, "http://127.0.0.1/", &resp);
     axl_http_client_response_free(resp);
     return 0;
 }

@@ -465,7 +465,7 @@ axl_net_resolve_ptr(const AxlIPv4Address *ip, char *out, size_t cap)
     bool dns_completed = (_axl_dns_wait(dns4, dns_event, 5000000) == 0);
     if (!dns_completed) {
         axl_efi_call(dns4->Cancel, 2, dns4, &dns_token);
-        (void)_axl_dns_wait(dns4, dns_event, 100 * 1000);
+        _axl_dns_wait(dns4, dns_event, 100 * 1000);
     }
 
     int rc = AXL_ERR;

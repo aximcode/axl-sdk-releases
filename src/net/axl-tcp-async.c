@@ -74,7 +74,7 @@ on_accept_complete(void *data)
            pointing at stale callback data and leaking the acc event
            on close(). */
         axl_tcp_accept_drop_sources(listener);
-        (void)cb(NULL, AXL_ERR, cb_data);  /* fundamental accept failure — tearing down regardless */
+        cb(NULL, AXL_ERR, cb_data);  /* fundamental accept failure — tearing down regardless */
         return AXL_SOURCE_REMOVE;
     }
 
@@ -92,7 +92,7 @@ on_accept_complete(void *data)
            for the next connection and tearing down the UEFI token
            here would double-free if the user closed the listener in
            response. Match pre-bool behavior for these paths. */
-        (void)cb(NULL, AXL_ERR, cb_data);
+        cb(NULL, AXL_ERR, cb_data);
         goto rearm;
     }
 
@@ -101,7 +101,7 @@ on_accept_complete(void *data)
         axl_efi_call(new_tcp4->Configure, 2, new_tcp4, NULL);
         axl_efi_call(listener->tcp_sb->DestroyChild, 2, listener->tcp_sb, new_handle);
         /* Same reasoning as above — treat as transient. */
-        (void)cb(NULL, AXL_ERR, cb_data);
+        cb(NULL, AXL_ERR, cb_data);
         goto rearm;
     }
 
@@ -184,7 +184,7 @@ on_accept_cancel(void *data)
     void           *udata    = listener->accept_data;
 
     axl_tcp_accept_drop_sources(listener);
-    (void)cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
+    cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
 
@@ -409,7 +409,7 @@ on_recv_cancel(void *data)
     axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                  &sock->rx_token.CompletionToken);
     axl_tcp_recv_drop_sources(sock);
-    (void)cb(sock, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
+    cb(sock, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
 
@@ -577,7 +577,7 @@ on_send_complete(void *data)
     /* Drop BOTH completion and cancel sources — same reason as recv. */
     axl_tcp_send_drop_sources(sock);
 
-    (void)cb(sock, cb_status, cb_data);  /* send is one-shot; return value ignored */
+    cb(sock, cb_status, cb_data);  /* send is one-shot; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
 
@@ -615,7 +615,7 @@ on_send_cancel(void *data)
     axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                  &sock->tx_token.CompletionToken);
     axl_tcp_send_drop_sources(sock);
-    (void)cb(sock, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
+    cb(sock, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
 
@@ -774,11 +774,11 @@ on_connect_complete(void *data)
            async_loop here makes the close finalize inline. */
         sock->async_loop = NULL;
         axl_tcp_close(sock);
-        (void)cb(NULL, AXL_ERR, udata);  /* connect is one-shot; return value ignored */
+        cb(NULL, AXL_ERR, udata);  /* connect is one-shot; return value ignored */
         return AXL_SOURCE_REMOVE;
     }
 
-    (void)sock->on_connect(sock, 0, sock->connect_data);  /* connect is one-shot */
+    sock->on_connect(sock, 0, sock->connect_data);  /* connect is one-shot */
     return AXL_SOURCE_REMOVE;
 }
 
@@ -806,7 +806,7 @@ on_connect_cancel(void *data)
        so an async close_event source would be left dangling. */
     sock->async_loop = NULL;
     axl_tcp_close(sock);
-    (void)cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
+    cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
 

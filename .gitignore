@@ -2,6 +2,12 @@ Build/
 Conf/
 build/
 out/
+# Stray SDK staging when install.sh is run with --prefix . (default is ./out).
+# Root-anchored so real source dirs (include/axl/, share/*.json5) are unaffected.
+/bin/
+/lib/
+/include/axl-sdk/
+/share/axl/
 deps/*
 !deps/lzma
 !deps/mbedtls

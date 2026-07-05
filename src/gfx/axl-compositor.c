@@ -249,7 +249,7 @@ clear_rect(AxlCompositor *c, AxlGfxClip r, AxlGfxPixel color)
 static void
 mark_damage(AxlCompositor *c, AxlGfxClip screen_rect)
 {
-    (void)axl_gfx_region_union_rect(c->damage, clip_to_output(c, screen_rect));
+    axl_gfx_region_union_rect(c->damage, clip_to_output(c, screen_rect));
 }
 
 // --- compositor lifecycle -------------------------------------------------
@@ -698,7 +698,7 @@ blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, uint32_t radius)
         AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
         if (sc != NULL) axl_memcpy(sc, tp, bytes);   // pre-blur snapshot (compare key)
     }
-    (void)axl_gfx_buffer_blur(tmp, radius);
+    axl_gfx_buffer_blur(tmp, radius);
     if (s->blur_out_cache != NULL) {
         AxlGfxPixel *oc = axl_gfx_buffer_pixels(s->blur_out_cache);
         if (oc != NULL) axl_memcpy(oc, tp, bytes);   // store blurred result
@@ -1015,7 +1015,7 @@ backdrop_blur_expand(AxlCompositor *c, const AxlSurface *s)
         AxlGfxClip rect = clip_to_output(c, surf_screen_rect(s));
         if (rect.w > 0 && rect.h > 0
             && axl_gfx_region_intersects_rect(c->damage, rect)) {
-            (void)axl_gfx_region_union_rect(c->damage, rect);
+            axl_gfx_region_union_rect(c->damage, rect);
             found = true;
         }
     }
@@ -1743,7 +1743,7 @@ axl_compositor_dispatch_frame(AxlCompositor *c, uint64_t time_ms)
     }
     // Snapshot + clear the pending set, then fire — a re-request made inside a
     // callback sets has_frame again and so queues for the NEXT dispatch.
-    (void)frame_collect_clear(&c->root, snap);   // partial on OOM is fine
+    frame_collect_clear(&c->root, snap);   // partial on OOM is fine
     size_t n = axl_array_len(snap);
     for (size_t i = 0; i < n; i++) {
         FramePending *fp = axl_array_get(snap, i);

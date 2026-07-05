@@ -292,7 +292,7 @@ diag_show_pci_nics(void)
         if (((class_code >> 16) & 0xFF) != 0x02) continue;
 
         uint16_t vid = 0, did = 0;
-        (void)axl_pci_get_vid_did(*p, &vid, &did);
+        axl_pci_get_vid_did(*p, &vid, &did);
 
         char addr_buf[AXL_PCI_ADDR_STR_MAX];
         axl_pci_addr_format(*p, addr_buf, sizeof(addr_buf));
@@ -303,7 +303,7 @@ diag_show_pci_nics(void)
         }
 
         char class_buf[80];
-        (void)axl_pci_class_string(class_code, class_buf, sizeof(class_buf));
+        axl_pci_class_string(class_code, class_buf, sizeof(class_buf));
 
         axl_printf("  %-13s  %s  (%s)\n", addr_buf, id_buf, class_buf);
         any = true;
@@ -331,7 +331,7 @@ do_diag_verb(AxlArgs *a)
     diag_show_pci_nics();
 
     /* Driver bundle inventory — same shape as `list-bundle`. */
-    (void)do_list_bundle_verb(a);
+    do_list_bundle_verb(a);
 
     /* NIC handle table BEFORE driver-load attempt — shows what
      * firmware natively provides. */
@@ -475,7 +475,7 @@ do_list_verb(AxlArgs *a)
     /* Try to bring up drivers, but never gate `list` on the result —
      * showing zero interfaces when nothing's there is itself a useful
      * diagnostic. */
-    (void)ensure_net_drivers_warn();
+    ensure_net_drivers_warn();
 
     if (verbose && !no_load) {
         show_nic_drivers("NIC Drivers (after driver-load)");
@@ -578,7 +578,7 @@ static const AxlArgDesc config_flags[] = {
 static int
 do_config_verb(AxlArgs *a)
 {
-    (void)ensure_net_drivers_warn();
+    ensure_net_drivers_warn();
 
     AxlNetStaticOpts cfg = {
         .mode     = axl_args_get_string(a, "mode"),

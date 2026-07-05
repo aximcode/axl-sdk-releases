@@ -76,7 +76,7 @@ axl_file_writer_open(
             axl_backend_file_close(&handle);
             return NULL;
         }
-        (void)axl_backend_file_set_position(handle, 0);
+        axl_backend_file_set_position(handle, 0);
     }
 
     AxlFileWriter *w = axl_calloc(1, sizeof(*w));

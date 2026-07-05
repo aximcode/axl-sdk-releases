@@ -246,7 +246,7 @@ _axl_service_driver_unload_stub(EFI_HANDLE image_handle)
     if (m_drv_handle != NULL && m_drv_svc != NULL) {
         AxlGuid g;
         if (axl_service_guid(m_drv_svc, &g) == AXL_OK) {
-            (void)axl_protocol_uninstall(m_drv_handle, &g,
+            axl_protocol_uninstall(m_drv_handle, &g,
                                                (void *)m_drv_svc);
         }
         m_drv_handle = NULL;
@@ -337,7 +337,7 @@ _axl_service_driver_init(
 
     m_drv_loop = axl_loop_new();
     if (m_drv_loop == NULL) {
-        (void)axl_protocol_uninstall(m_drv_handle, &svc_guid,
+        axl_protocol_uninstall(m_drv_handle, &svc_guid,
                                            (void *)svc);
         m_drv_handle = NULL;
         if (m_drv_cfg != NULL) {
@@ -350,7 +350,7 @@ _axl_service_driver_init(
     if (axl_service_attach_driver(m_drv_loop, svc) != AXL_OK) {
         axl_loop_free(m_drv_loop);
         m_drv_loop = NULL;
-        (void)axl_protocol_uninstall(m_drv_handle, &svc_guid,
+        axl_protocol_uninstall(m_drv_handle, &svc_guid,
                                            (void *)svc);
         m_drv_handle = NULL;
         if (m_drv_cfg != NULL) {

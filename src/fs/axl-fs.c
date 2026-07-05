@@ -732,7 +732,7 @@ axl_volume_get_label(
     /* First call: size probe. The EFI_BUFFER_TOO_SMALL return is
        expected; we only care that info_size was populated. */
     size_t info_size = 0;
-    (void)file->GetInfo(file, &vol_label_guid, &info_size, NULL);
+    file->GetInfo(file, &vol_label_guid, &info_size, NULL);
 
     if (info_size == 0) {
         axl_backend_file_close(&fh);
@@ -801,7 +801,7 @@ axl_volume_get_label_by_handle(
     /* First call: size probe. Expected EFI_BUFFER_TOO_SMALL return;
        only info_size matters. */
     size_t info_size = 0;
-    (void)root->GetInfo(root, &vol_label_guid, &info_size, NULL);
+    root->GetInfo(root, &vol_label_guid, &info_size, NULL);
 
     if (info_size == 0) {
         root->Close(root);
@@ -911,7 +911,7 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
             /* device_path is firmware-owned — share the pointer.
                NULL on rare handles that don't publish a DP. */
             out[filled].device_path = NULL;
-            (void)axl_handle_get_protocol(handles[i], "device-path",
+            axl_handle_get_protocol(handles[i], "device-path",
                                          &out[filled].device_path);
             /* Name from the UEFI Shell's fsN map, NOT the LocateHandle
                index — the two orders diverge (a remap / mkrd / hot-plug

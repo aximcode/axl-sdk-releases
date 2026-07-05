@@ -267,7 +267,7 @@ axl_device_path_find(
     )
 {
     DpFindCtx ctx = { .type = type, .subtype = subtype, .match = NULL };
-    (void)axl_device_path_for_each(device_path, dp_find_cb, &ctx);
+    axl_device_path_for_each(device_path, dp_find_cb, &ctx);
     return ctx.match;
 }
 
@@ -316,7 +316,7 @@ axl_device_path_has_vendor(void *device_path, const AxlGuid *guid)
         return false;
     }
     VendorMatchCtx ctx = { .guid = guid, .found = false };
-    (void)axl_device_path_for_each(device_path, vendor_match_cb, &ctx);
+    axl_device_path_for_each(device_path, vendor_match_cb, &ctx);
     return ctx.found;
 }
 

@@ -568,14 +568,20 @@ if (axl_driver_ensure(&EfiRamDiskProtocolGuid,
 /* Protocol is now usable. */
 ```
 
-The search walks `drivers/<arch>/<name>` on the running image's own
-volume first, then the image's own directory, then the volume root,
-and finally every other mounted FAT volume. The first match is
+The search walks the running image's own directory first (a
+co-located driver is the most specific intent), then
+`drivers/<arch>/<name>` on the image's own volume, then the volume
+root, and finally every other mounted FAT volume. The first match is
 loaded and started; if it doesn't end up registering the requested
 protocol, the image is unloaded and the search continues. This
 lets tools work whether they're invoked from a bare UEFI shell, a
 boot menu, or a `startup.nsh` that has already eager-loaded the
 driver.
+
+For a launcher that must pair with an exact, version-pinned driver
+staged beside it (no fallback to `drivers/`, no cross-volume search),
+use `axl_shared_driver_locate_sibling` instead — see
+`docs/AXL-Shared-Driver-Recipe.md`.
 
 ### Tool Diagnostics
 

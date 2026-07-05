@@ -258,8 +258,8 @@ axl_udp_connect(
            fails the socket is unusable; consumer should close. */
         axl_memset(&sock->cfg.RemoteAddress, 0, 4);
         sock->cfg.RemotePort = 0;
-        (void)axl_efi_call(sock->udp4->Configure, 2, sock->udp4, NULL);
-        (void)axl_efi_call(sock->udp4->Configure, 2,
+        axl_efi_call(sock->udp4->Configure, 2, sock->udp4, NULL);
+        axl_efi_call(sock->udp4->Configure, 2,
                            sock->udp4, &sock->cfg);
         return AXL_ERR;
     }
@@ -368,7 +368,7 @@ axl_udp_set_broadcast(
            a subsequent set_broadcast(prev) would hit the idempotent
            early-return and leave EFI state unsynced with cfg. */
         sock->cfg.AcceptBroadcast = prev;
-        (void)axl_efi_call(sock->udp4->Configure, 2,
+        axl_efi_call(sock->udp4->Configure, 2,
                            sock->udp4, &sock->cfg);
         return AXL_ERR;
     }
@@ -727,7 +727,7 @@ on_udp_recv_event(void *data)
            sock — only touch the saved source IDs after. */
         cb_status = AXL_ERR;
         if (cb != NULL) {
-            (void)cb(sock, cb_status, NULL, 0, NULL, 0, cb_data);
+            cb(sock, cb_status, NULL, 0, NULL, 0, cb_data);
         }
         if (saved_loop_src != 0) {
             axl_loop_remove_source(saved_loop, saved_loop_src);
@@ -840,7 +840,7 @@ on_udp_recv_cancel(void *data)
        run). Cancel is terminal; return value ignored. */
     udp_recv_drop_sources(sock);
     if (cb != NULL) {
-        (void)cb(sock, AXL_CANCELLED, NULL, 0, NULL, 0, cb_data);
+        cb(sock, AXL_CANCELLED, NULL, 0, NULL, 0, cb_data);
     }
     return AXL_SOURCE_REMOVE;
 }
@@ -977,7 +977,7 @@ on_udp_send_event(void *data)
     }
 
     if (cb != NULL) {
-        (void)cb(sock, cb_status, cb_data);
+        cb(sock, cb_status, cb_data);
     }
     return AXL_SOURCE_REMOVE;
 }
@@ -991,7 +991,7 @@ on_udp_send_cancel(void *data)
 
     udp_send_drop_sources(sock);
     if (cb != NULL) {
-        (void)cb(sock, AXL_CANCELLED, cb_data);
+        cb(sock, AXL_CANCELLED, cb_data);
     }
     return AXL_SOURCE_REMOVE;
 }

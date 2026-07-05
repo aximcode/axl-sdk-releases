@@ -193,7 +193,7 @@ axl_log_ring_attach(AxlLogRing *ring)
         /* Best-effort attach. axl_log_ring_attach itself returns void
          * (changing it would ripple through every caller); a full
          * handler table just means no log messages reach the ring. */
-        (void)axl_log_add_handler(ring_handler, ring);
+        axl_log_add_handler(ring_handler, ring);
     }
 }
 

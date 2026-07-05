@@ -450,7 +450,7 @@ axl_tree_foreach(
     if (tree == NULL || func == NULL) {
         return;
     }
-    (void)node_foreach(tree->root, func, user);
+    node_foreach(tree->root, func, user);
 }
 
 /* Shared bound descent: find the leftmost node whose key satisfies the

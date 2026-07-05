@@ -154,6 +154,32 @@ already be reachable on a volume), drop the embed argument:
 AXL_SHARED_DRIVER_LAUNCHER_THIN(MY_TOOL_NAME, "myToolDxe.efi")
 ```
 
+### Version-pinned launcher (sibling-only)
+
+When the launcher must pair with the **exact** driver co-staged beside
+it — never a stale copy found elsewhere on the volume set — use the
+sibling-only variant. The two halves share a cross-image vtable ABI, so
+loading a wrong-version driver is a silent-corruption hazard, not a
+graceful failure.
+
+```c
+// my-tool.c
+#include <axl.h>
+#include "my-tool-shared.h"
+
+AXL_SHARED_DRIVER_LAUNCHER_SIBLING(MY_TOOL_NAME, "myToolDxe.efi")
+```
+
+This resolves a resident driver, else cold-loads `myToolDxe.efi` from
+the **launcher's own directory only** and **hard-fails** (`AXL_NOT_FOUND`)
+if it isn't staged beside the launcher — no `/drivers`, no volume-root,
+no cross-volume search. Call `axl_shared_driver_locate_sibling(name,
+driver_filename, &vt)` directly if you need the resolved vtable without
+the turnkey `int main` (e.g. a launcher that adds its own `--reload`/
+unload hatches). Pinning governs the cold path only: once a driver of
+that identity is resident, the warm short-circuit returns it regardless
+of version — the first cold load pins for the boot.
+
 ### What the SDK owns
 
 Both macros are built from `<axl/axl-shared-driver.h>` primitives
@@ -162,8 +188,12 @@ composed for you:
 - **Resolve.** `axl_shared_driver_run` (which
   `AXL_SHARED_DRIVER_LAUNCHER`/`_THIN` call) tries, in order: an
   already-resident driver (`LocateProtocol` short-circuit), then
-  on-disk `driver_filename`, then the embedded blob (skipped for
-  `_THIN`). First hit wins; nothing after it runs.
+  on-disk `driver_filename` (the co-located **sibling** beside the
+  launcher first, then `/drivers/<arch>/`, volume root, and other
+  volumes), then the embedded blob (skipped for `_THIN`). First hit
+  wins; nothing after it runs. On-disk failure returns `AXL_NOT_FOUND`.
+  For strict directory-pinning (sibling only, hard-fail), use the
+  sibling-only variant above.
 - **Stdio bridge.** Installed automatically before `my_run` is
   called, so the resident driver's `axl_stdin`/`axl_stderr` reflect
   *this* launcher invocation's console and redirects — a resident

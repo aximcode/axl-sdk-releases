@@ -148,7 +148,7 @@ axl_event_reset(AxlEvent *e)
     /* CheckEvent returns EFI_SUCCESS and clears the signalled state
        when the event is signalled, or EFI_NOT_READY when not --
        either way the event is unsignalled afterwards. */
-    (void)axl_backend_event_check(e->handle);
+    axl_backend_event_check(e->handle);
 }
 
 bool

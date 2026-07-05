@@ -339,7 +339,7 @@ list_function(
     }
 
     uint32_t class_code = 0;
-    (void)axl_pci_get_class_code(a, &class_code);
+    axl_pci_get_class_code(a, &class_code);
 
     print_bdf(a);
     axl_print(" ");
@@ -400,7 +400,7 @@ tree_print_cb(
        — full slash triplet blows out the right margin once a few
        layers of indent stack up. -n still wins (numeric class). */
     uint32_t class_code = 0;
-    (void)axl_pci_get_class_code(addr, &class_code);
+    axl_pci_get_class_code(addr, &class_code);
     if (opt_numeric) {
         axl_printf("%06x", (unsigned)class_code);
     } else {
@@ -475,7 +475,7 @@ run_lspci(
         g_ids_loaded = (axl_pci_ids_load(
                             axl_args_get_string(a, "ids-file"))
                         == AXL_SIDECAR_OK);
-        (void)axl_pci_class_load(NULL);
+        axl_pci_class_load(NULL);
     }
 
     const char *addr_str = axl_args_get_string(a, "addr");

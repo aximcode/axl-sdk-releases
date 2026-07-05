@@ -891,7 +891,7 @@ axl_ttf_draw_transform(
              * (space) glyph is skipped, so it can't turn the whole call
              * into AXL_ERR. */
             size_t pn = 0;
-            (void)axl_gfx_internal_path_verts(path, &pn);
+            axl_gfx_internal_path_verts(path, &pn);
             if (pn >= 3 && axl_gfx_fill_path(path, color) == AXL_ERR) {
                 rc = AXL_ERR;
             }

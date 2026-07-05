@@ -414,7 +414,7 @@ axl_protocol_register_multiple(
                                  (AxlHandle *)handle) != AXL_OK) {
             /* Rollback: uninstall any we already installed (all on *handle). */
             for (int j = 0; j < i; j++) {
-                (void)axl_protocol_uninstall(*handle,
+                axl_protocol_uninstall(*handle,
                                              (const AxlGuid *)&guids[j],
                                              ifaces[j]);
             }
