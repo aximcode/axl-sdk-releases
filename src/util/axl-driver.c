@@ -13,6 +13,7 @@
 #include "axl-driver-internal.h"  /* _axl_driver_ensure_with_embedded_info */
 #include <axl/axl-driver.h>
 #include <axl/axl-app.h>          /* axl_app_image_path (sibling resolution) */
+#include <axl/axl-env.h>          /* axl_getenv (path-searched-launch fallback) */
 #include <axl/axl-efi-status.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-atexit.h>   /* binding teardown: app-exit safety-net hook */
@@ -1372,6 +1373,69 @@ axl_driver_load_buffer_with_image_info(
                                     out_handle);
 }
 
+/* Fallback for a path-searched launch. Some UEFI shells set
+ * LoadedImage->FilePath to the bare command name (not the resolved
+ * \dir\name), so axl_app_image_path() loses the launcher's directory and the
+ * primary sibling lookup collapses to the volume root -> AXL_NOT_FOUND. Recover
+ * the launcher's real directory by re-running the shell's own `path` search for
+ * argv0, then load @p file_name from THAT directory — strictly beside the
+ * launcher the shell actually ran, so the sibling-only / version-pinning
+ * contract still holds (never a copy from anywhere but the launcher's own dir).
+ *
+ * Real-hardware-only: OVMF's EDK II Shell does not path-search .efi, so this
+ * path is verified on target hardware (see the R7725 probe in
+ * local/docs/handoff-sibling-locate-path-search.md), not in the QEMU suite.
+ * Returns AXL_NOT_FOUND when it cannot anchor (no argv0 / no %path% / launcher
+ * not on the path / driver not beside it). */
+static int
+load_sibling_via_shell_path(
+    const char       *file_name,
+    AxlDriverHandle  *out_handle
+    )
+{
+    const char *argv0 = axl_app_argv0();
+    const char *path  = axl_getenv("path");
+    if (argv0 == NULL || argv0[0] == '\0' || path == NULL) {
+        return AXL_NOT_FOUND;
+    }
+
+    /* The shell resolves a bare command by appending ".efi"; argv[0] is the
+     * name as typed ("do"). Search for "<argv0>.efi" unless it already ends
+     * in .efi. */
+    const char        *ext = axl_path_extension(argv0);
+    AXL_AUTO_FREE char *launcher_name = NULL;
+    if (ext != NULL && axl_strcasecmp(ext, "efi") == 0) {
+        launcher_name = axl_strdup(argv0);
+    } else {
+        size_t n = axl_strlen(argv0);
+        launcher_name = axl_malloc(n + 5);   /* ".efi" + NUL */
+        if (launcher_name != NULL) {
+            axl_memcpy(launcher_name, argv0, n);
+            axl_memcpy(launcher_name + n, ".efi", 5);
+        }
+    }
+    if (launcher_name == NULL) {
+        return AXL_ERR;
+    }
+
+    AXL_AUTO_FREE char *launcher_full = NULL;
+    if (axl_path_search(path, launcher_name, &launcher_full) != AXL_OK) {
+        return AXL_NOT_FOUND;   /* launcher not on %path% — can't anchor */
+    }
+
+    /* Driver strictly beside the launcher (same directory). */
+    AXL_AUTO_FREE char *driver_full = axl_path_companion(launcher_full, file_name);
+    if (driver_full == NULL) {
+        return AXL_ERR;
+    }
+    AxlFsEntry entry;
+    if (axl_file_info(driver_full, &entry) != AXL_OK
+        || axl_fs_entry_is_dir(&entry)) {
+        return AXL_NOT_FOUND;
+    }
+    return axl_driver_load(driver_full, out_handle);
+}
+
 int
 axl_driver_load_sibling(
     const char       *file_name,
@@ -1422,7 +1486,11 @@ axl_driver_load_sibling(
     /* Restrict to a real, present file in the app directory. */
     AxlFsEntry entry;
     if (axl_file_info(full, &entry) != AXL_OK || axl_fs_entry_is_dir(&entry)) {
-        return AXL_NOT_FOUND;
+        /* Primary miss. On a path-searched launch the image path can lack the
+         * launcher's directory (bare LoadedImage->FilePath), collapsing `full`
+         * to the volume root; recover the real directory from the shell `path`
+         * and load the driver from beside the launcher there. */
+        return load_sibling_via_shell_path(file_name, out_handle);
     }
 
     return axl_driver_load(full, out_handle);

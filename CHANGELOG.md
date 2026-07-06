@@ -3,6 +3,94 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.0 — 2026-07-06
+
+### Fixed
+
+- **`axl_shared_driver_locate_sibling` / `axl_driver_load_sibling` on a
+  path-searched launch.** When a launcher is found via the shell `path` (e.g.
+  bare `do sysid` from a different CWD), some firmware sets
+  `LoadedImage->FilePath` to just the matched command name, so
+  `axl_app_image_path()` loses the launcher's directory and the sibling lookup
+  collapsed to the volume root → `AXL_NOT_FOUND` (consumer symptom:
+  "doDriver.efi not found in this directory" though both are staged together).
+  The sibling resolver now falls back to re-running the shell's own `path`
+  search for `argv0` and loads the driver from **that** directory — strictly
+  beside the launcher the shell actually ran, preserving the sibling-only /
+  version-pinning contract (never a copy from an unrelated directory).
+  Real-hardware-only path (OVMF's shell doesn't path-search `.efi`); the
+  decomposable search logic is unit-tested, the end-to-end path-launch is
+  verified on target hardware.
+
+### Added
+
+- **`axl_path_search(search_list, name, out_path)`** (`<axl/axl-path.h>`) —
+  searches a `;`-separated PATH-style directory list for a file, returning the
+  first match (mirrors the UEFI Shell's `path` resolution). Backs the sibling
+  path-launch fallback above.
+- **`mkrd <label>` maps the RAM disk into the shell in ONE call — no `map -r`.**
+  A non-interactive `startup.nsh` on read-only boot media (the ePSA `last.nsh`
+  workflow) needs a writable volume it can select deterministically. `mkrd` now
+  assigns the disk a shell map name via `EFI_SHELL_PROTOCOL.SetMap` (which
+  targets the shell's *global* map, unlike a nested `Execute("map -r")`), so the
+  name is usable by the launching script immediately:
+  `mkrd RAMDISK` → `%RAMDISK%:` → write. By default it picks the lowest free
+  `fsN`; `-m <name>` pins a chosen name and **fails if that name is already in
+  use** (never clobbers). Either way it also sets shell var `%<label>%` to the
+  chosen name and prints a summary (label, size, mapping, backing device path).
+  Idempotent on the label. This mirrors the old EFI Toolkit `MKRAMDISK`, which
+  likewise took the map name as an argument. Switch with the bare `<name>:` /
+  `%<label>%:`, not `cd`.
+- **`axl_volume_set_map(device_path, name)` / `axl_volume_map_taken(name)`**
+  (`<axl/axl-fs.h>`) — assign a UEFI Shell map name to a device path (SetMap;
+  usable without `map -r`, even from a child image), and test whether a map name
+  is in use. Back the `mkrd` mapping above.
+- **`axl_volume_map_name(device_path, out, out_size)`** (`<axl/axl-fs.h>`) —
+  resolves the UEFI Shell's *actual* `fsN` alias for a device path via
+  `GetMapFromDevicePath` (never the synthesized LocateHandle index that
+  `axl_volume_enumerate`'s `.name` falls back to). For code that must read back
+  a caller-usable `fsN`.
+
+- **Interactive console line reader — `axl_console_readline` /
+  `axl_console_readline_ex`** (`<axl/axl-console.h>`). The line-level peer of
+  `axl_console_read_key`: reads keystrokes from the console, echoes printable
+  characters, erases on Backspace, and returns the accumulated UTF-8 text
+  (minus the CR/LF) on Enter. This is what a tool prompting a human needs
+  (`do -f`, a REPL, a `name? ` prompt) — `axl_stdin` / `axl_readline` are
+  shell-pipe/redirect readers and cannot line-edit the console. The `_ex` form
+  adds a character cap (`max_len`) and echo suppression (`echo = false`) for
+  password-style entry; the terminating newline is still echoed. The `timeout`
+  is a whole-line deadline (Ctrl-C aborts); a raised-TPL block-forever read is
+  discouraged for the same reason as `axl_console_read_key`.
+- **`axl_stdin_is_interactive()`** (`<axl/axl-stream.h>`) — true when the
+  shell's StdIn is an interactive console rather than a redirected file/pipe.
+  Detected via `EFI_SHELL_PROTOCOL.GetFileSize` (a file/pipe reports a size; the
+  console pseudo-file rejects the query). Works from a resident shared-driver
+  too (the stdio bridge carries the launcher's real StdIn handle).
+
+### Changed
+
+- **`axl_stdin` now routes prompt-vs-pipe automatically (POSIX tty semantics).**
+  When StdIn is redirected (`cmd | tool`, `tool < file`) `axl_stdin` /
+  `axl_readline` / `axl_stdin_text` read the captured bytes byte-for-byte, as
+  before. When StdIn is the **interactive console** they transparently fall back
+  to the new console line editor, so an interactive prompt "just works" with no
+  consumer change. **Behavior change:** a read of `axl_stdin` at an interactive
+  console now **blocks until Enter** (canonical, echoed, line-buffered) instead
+  of returning EOF immediately. Redirected and no-shell-params (BDS) contexts
+  are unchanged — the latter still returns EOF and never blocks on a keyboard.
+  This also applies to stdin-reading tools (`grep`, `cat`, `sed`, `hexdump`,
+  `clip`) invoked with no redirection: they now wait for a typed line at an
+  interactive console instead of seeing immediate EOF (matching POSIX
+  tty-vs-pipe semantics). Use `axl_console_read_key` for raw keystrokes with no
+  line assembly.
+
+  **Unattended scripts:** "interactive console" is not "a human is present." An
+  automated `startup.nsh` at boot has StdIn = the console but nobody typing, so a
+  bare stdin read (`do -f`, `grep`, …) blocks until the boot timeout rather than
+  returning EOF. In a script, redirect the input (`tool < in`) or gate the read
+  on `axl_stdin_is_interactive()` and skip it (read-if-piped-else-EOF).
+
 ## 2.7.1 — 2026-07-04
 
 ### Added

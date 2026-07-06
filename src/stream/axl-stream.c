@@ -12,6 +12,7 @@
 #include <axl/axl-string.h>
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
+#include <axl/axl-console.h>   /* axl_console_readline (interactive stdin fallback) */
 #include <axl/axl-fs.h>
 #include "axl-stream-internal.h"
 #include <axl/axl-format.h>
@@ -239,6 +240,97 @@ static AxlStream mStderr = {
  * line-buffered console modes), or -1 on error. A NULL stdin handle
  * is treated as "no input connected" and surfaces as 0 (EOF).
  */
+/* One pending interactive line, cooked by axl_console_readline and served
+   byte-for-byte to successive console_read calls. Reset whenever the stdin
+   handle changes (see console_read), so a resident driver servicing a new
+   launcher never serves a prior launcher's half-consumed line. */
+static char   *mStdinLine    = NULL;   /* heap: cooked line + '\n', or NULL */
+static size_t  mStdinLineLen = 0;      /* bytes to serve (excludes NUL)     */
+static size_t  mStdinLineOff = 0;      /* next unserved byte                */
+
+/* Interactivity verdict cached against the stdin handle it was computed for.
+   StdIn identity (console vs redirected file/pipe) is fixed per handle, so the
+   firmware probe runs only when the handle changes — not on every read. */
+static AxlFileHandle  mStdinVerdictHandle = NULL;
+static bool           mStdinVerdictInteractive = false;
+static bool           mStdinVerdictValid = false;
+
+static void
+reset_pending_stdin_line(void)
+{
+    if (mStdinLine != NULL) {
+        axl_free(mStdinLine);
+        mStdinLine = NULL;
+    }
+    mStdinLineLen = 0;
+    mStdinLineOff = 0;
+}
+
+/* Interactivity verdict for the current stdin handle, resolved once per handle
+   (the firmware probe is two shell calls). Shared by console_read and the
+   public axl_stdin_is_interactive() so both hit the cache. A changed handle (a
+   resident driver's bridge moving to a new launcher) invalidates the verdict
+   and drops any half-served cooked line from the previous handle. */
+static bool
+stdin_interactive_cached(void)
+{
+    AxlFileHandle h = axl_backend_shell_stdin();
+    if (!mStdinVerdictValid || h != mStdinVerdictHandle) {
+        mStdinVerdictHandle      = h;
+        mStdinVerdictInteractive = axl_backend_stdin_is_interactive();
+        mStdinVerdictValid       = true;
+        reset_pending_stdin_line();
+    }
+    return mStdinVerdictInteractive;
+}
+
+/* Interactive-console read path for axl_stdin: deliver canonical, echoed,
+   Enter-terminated lines (POSIX tty semantics) instead of raw byte reads of
+   the console pseudo-file — which the firmware does not present as a
+   byte-addressable file (that is the leading-CR / double-Enter / first-char
+   breakage this replaces). */
+static axl_ssize_t
+console_read_interactive(void *buf, size_t count)
+{
+    if (mStdinLine == NULL) {
+        /* axl_console_readline reads gST->ConIn (this image's own console),
+           which is the physical console the interactive StdIn handle refers
+           to — the same keyboard whether launched directly or via a resident
+           driver's stdio bridge (ConIn is a shared system-table global). */
+        char *line = NULL;
+        if (axl_console_readline(UINT64_MAX, &line) != AXL_OK) {
+            /* No console / Ctrl-C / OOM — none is retryable, so "no further
+               line" IS end-of-input for this stream. Return EOF (0), the
+               correct terminating signal for a line reader; -1 would imply a
+               transient error worth retrying, which none of these are. */
+            return 0;
+        }
+        size_t n = axl_strlen(line);
+        /* Re-append the newline the line reader strips, so downstream line
+           parsing (axl_readline) terminates as it does for piped input. One
+           extra byte grown once per typed line (human-paced) — not a hot path. */
+        char *withnl = axl_realloc(line, n + 2);
+        if (withnl == NULL) {
+            axl_free(line);
+            return 0;
+        }
+        withnl[n]     = '\n';
+        withnl[n + 1] = '\0';
+        mStdinLine    = withnl;
+        mStdinLineLen = n + 1;
+        mStdinLineOff = 0;
+    }
+
+    size_t avail = mStdinLineLen - mStdinLineOff;
+    size_t give  = (count < avail) ? count : avail;
+    axl_memcpy(buf, mStdinLine + mStdinLineOff, give);
+    mStdinLineOff += give;
+    if (mStdinLineOff >= mStdinLineLen) {
+        reset_pending_stdin_line();
+    }
+    return (axl_ssize_t)give;
+}
+
 static axl_ssize_t
 console_read(void *ctx, void *buf, size_t count)
 {
@@ -252,6 +344,12 @@ console_read(void *ctx, void *buf, size_t count)
            Surface as EOF rather than blocking on a keyboard the
            caller probably didn't expect. */
         return 0;
+    }
+    /* Resolve interactivity once per stdin handle (the probe is a firmware
+       call — see the per-read-cost review finding). */
+    if (stdin_interactive_cached()) {
+        /* StdIn is the console (typed, not redirected): line-cook it. */
+        return console_read_interactive(buf, count);
     }
     size_t n = count;
     if (axl_backend_file_read(h, &n, buf) != AXL_OK) {
@@ -358,6 +456,14 @@ axl_stream_init(void)
     axl_stdin      = &mStdin;
     axl_stdout_raw = &mStdoutRaw;
     axl_stderr_raw = &mStderrRaw;
+}
+
+bool
+axl_stdin_is_interactive(void)
+{
+    /* Same per-handle cache console_read uses, so a consumer polling this in a
+       loop pays the firmware probe only when the stdin handle changes. */
+    return stdin_interactive_cached();
 }
 
 int

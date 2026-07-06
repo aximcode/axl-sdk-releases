@@ -513,6 +513,31 @@ AxlFileHandle
 axl_backend_shell_stdin(void);
 
 /**
+ * @brief Is the shell's StdIn an interactive console (not a redirected
+ *     file or pipe)?
+ *
+ * Probes axl_backend_shell_stdin() with EFI_SHELL_PROTOCOL.GetFileSize:
+ * a redirected file or pipe reports a size (EFI_SUCCESS); the console
+ * pseudo-file rejects the query. Confirmed on OVMF/EDK2 across typed,
+ * `< file`, and `| pipe` launches. When GetFileSize fails, a second
+ * probe (GetFileInfo) must ALSO report no file for the verdict to be
+ * "interactive" — biasing an unfamiliar firmware toward the safe
+ * raw-byte path (a false "piped" only degrades a typed line to a raw
+ * console read; a false "interactive" would block a pipe on a keyboard).
+ *
+ * Returns false when no shell StdIn handle is published (BDS / non-shell
+ * contexts) — there is nothing to read interactively through the shell,
+ * and the stream layer surfaces those as EOF rather than blocking on a
+ * keyboard. Backs the public @ref axl_stdin_is_interactive predicate and
+ * axl_stdin's console-line-edit fallback.
+ *
+ * @return true if StdIn is the interactive console; false if redirected
+ *     or not connected.
+ */
+bool
+axl_backend_stdin_is_interactive(void);
+
+/**
  * @brief Get the SHELL_FILE_HANDLE for the running image's standard
  *     output, as published by EFI_SHELL_PARAMETERS_PROTOCOL on this
  *     image's handle.
@@ -586,6 +611,38 @@ axl_backend_shell_map_name(
     void   *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL for the volume
     char   *out,          ///< [out] receives lowercased "fsN"
     size_t  out_size      ///< capacity of @p out
+    );
+
+/**
+ * @brief Is a shell map name (e.g. "fs2:") currently in use?
+ *
+ * Consults EFI_SHELL_PROTOCOL.GetDevicePathFromMap. @p name must be
+ * ':'-terminated (the shell's mapping-name form).
+ *
+ * @return true if a mapping exists for @p name; false if not, or when there
+ *     is no shell / GetDevicePathFromMap.
+ */
+bool
+axl_backend_shell_map_exists(
+    const unsigned short  *name  ///< ':'-terminated UCS-2 mapping name
+    );
+
+/**
+ * @brief Assign a shell map name to a device path (EFI_SHELL_PROTOCOL.SetMap).
+ *
+ * Adds the mapping to the shell's GLOBAL map list — not a nested shell like
+ * Execute — so a name set from a child image is immediately usable by the
+ * launching shell/script without `map -r`. @p name must be ':'-terminated.
+ * The device path should carry a filesystem (connected) for the name to be
+ * usable as a volume.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args or SetMap failure;
+ *     AXL_UNSUPPORTED when the backend has no shell / SetMap.
+ */
+int
+axl_backend_shell_set_map(
+    void                  *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL
+    const unsigned short  *name          ///< ':'-terminated UCS-2 mapping name
     );
 
 // ===================================================================

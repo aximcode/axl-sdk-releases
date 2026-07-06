@@ -1460,6 +1460,50 @@ axl_backend_shell_stdin(void)
     return bridge_lookup_stdin();            /* driver: live bridge consult */
 }
 
+bool
+axl_backend_stdin_is_interactive(void)
+{
+    AxlFileHandle h = axl_backend_shell_stdin();
+    if (h == NULL) {
+        /* No shell StdIn wiring (BDS / non-shell context, or a driver
+           with no live bridge). Nothing to read interactively through
+           the shell — the stream layer surfaces this as EOF rather than
+           blocking on a keyboard, so report non-interactive to match. */
+        return false;
+    }
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->GetFileSize == NULL) {
+        return false;   /* can't probe → keep the safe raw-byte path */
+    }
+    /* A redirected file (`< f`) or pipe RHS (`|`) is a real file: GetFileSize
+       succeeds with a byte count. The console pseudo-file rejects the query.
+       Verified on OVMF/EDK2 across typed / `<` / `|`. */
+    UINT64     size = 0;
+    EFI_STATUS st   = shell->GetFileSize((SHELL_FILE_HANDLE)h, &size);
+    if (!EFI_ERROR(st)) {
+        return false;   /* has a byte size ⇒ redirected file/pipe */
+    }
+    /* GetFileSize failed. Bias toward the safe raw-byte path unless a SECOND,
+       independent probe corroborates "console": a real file also returns file
+       info, the console pseudo-file returns none. Requiring BOTH signals keeps
+       a GetFileSize-hostile firmware from misclassifying a pipe as interactive
+       — which would block on a keyboard instead of reading the piped bytes,
+       strictly worse than the byte path (a false "piped" only degrades to the
+       raw console read, it does not hang). */
+    if (shell->GetFileInfo == NULL) {
+        /* Can't obtain the corroborating signal — do NOT claim interactive on
+           the single failed probe (that would risk blocking a pipe on the
+           keyboard); fall back to the safe raw-byte path. */
+        return false;
+    }
+    EFI_FILE_INFO *fi = shell->GetFileInfo((SHELL_FILE_HANDLE)h);
+    if (fi != NULL) {
+        gBS->FreePool(fi);
+        return false;   /* has file info ⇒ treat as a file, not the console */
+    }
+    return true;   /* no size AND no file info ⇒ interactive console */
+}
+
 AxlFileHandle
 axl_backend_shell_stdout(void)
 {
@@ -1583,6 +1627,42 @@ axl_backend_shell_map_name(
         }
     }
     return AXL_ERR;   /* no fs<n> alias maps to this device path */
+}
+
+bool
+axl_backend_shell_map_exists(
+    const unsigned short  *name
+    )
+{
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->GetDevicePathFromMap == NULL || name == NULL) {
+        return false;
+    }
+    /* GetDevicePathFromMap returns the firmware-owned device path for the
+       mapping, or NULL if no such mapping exists. */
+    return shell->GetDevicePathFromMap((const CHAR16 *)name) != NULL;
+}
+
+int
+axl_backend_shell_set_map(
+    void                  *device_path,
+    const unsigned short  *name
+    )
+{
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->SetMap == NULL) {
+        return AXL_UNSUPPORTED;
+    }
+    if (device_path == NULL || name == NULL) {
+        return AXL_ERR;
+    }
+    /* SetMap adds the mapping to the shell's global map list (not a nested
+       shell like Execute), so a name set here by a child image is usable by
+       the launching shell/script immediately — no `map -r` needed. Requires a
+       ':'-terminated name; the caller supplies it. */
+    EFI_STATUS st = shell->SetMap(
+        (const EFI_DEVICE_PATH_PROTOCOL *)device_path, (const CHAR16 *)name);
+    return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
 }
 
 // ===================================================================

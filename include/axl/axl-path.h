@@ -122,6 +122,27 @@ axl_path_companion(
 );
 
 /**
+ * @brief Search a PATH-style directory list for a file, first match wins.
+ *
+ * Splits @p search_list on ';' (the UEFI Shell `path` separator) and, for
+ * each non-empty entry, tests whether joining @p name onto it names an
+ * existing regular file. Returns the first hit — mirroring how the shell
+ * resolves a bare command name against `path`. Empty entries are skipped.
+ *
+ * Caller frees @p out_path with axl_free.
+ *
+ * @return AXL_OK with @p out_path set to the full path of the first match;
+ *     AXL_NOT_FOUND if no entry contains @p name; AXL_ERR on NULL args or
+ *     allocation failure. @p out_path is set to NULL on any non-AXL_OK return.
+ */
+AXL_WARN_UNUSED int
+axl_path_search(
+    const char  *search_list,  ///< ';'-separated directory list (e.g. shell %path%)
+    const char  *name,         ///< filename to look for in each directory
+    char       **out_path      ///< [out] heap full path of the first match
+);
+
+/**
  * @brief Resolve a sidecar data file by trying override → companion → cwd.
  *
  * Standard lookup order for tools that ship optional sidecar JSON

@@ -941,3 +941,70 @@ axl_volume_enumerate(AxlVolume *out, size_t max, size_t *count)
     *count = (out != NULL) ? (filled < max ? filled : max) : filled;
     return AXL_OK;
 }
+
+/* Build a ':'-terminated UCS-2 shell mapping name from a bare/optionally
+   ':'-terminated UTF-8 name (e.g. "fs2" or "RD" -> "fs2:"/"RD:"). Caller
+   frees. NULL on OOM / empty. */
+static unsigned short *
+map_name_to_ucs2(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+    size_t n = axl_strlen(name);
+    if (name[n - 1] == ':') {
+        return axl_utf8_to_ucs2(name);   /* already terminated */
+    }
+    char *tmp = axl_malloc(n + 2);
+    if (tmp == NULL) {
+        return NULL;
+    }
+    axl_memcpy(tmp, name, n);
+    tmp[n]     = ':';
+    tmp[n + 1] = '\0';
+    unsigned short *w = axl_utf8_to_ucs2(tmp);
+    axl_free(tmp);
+    return w;
+}
+
+bool
+axl_volume_map_taken(const char *name)
+{
+    unsigned short *w = map_name_to_ucs2(name);
+    if (w == NULL) {
+        return false;
+    }
+    bool taken = axl_backend_shell_map_exists(w);
+    axl_free(w);
+    return taken;
+}
+
+int
+axl_volume_set_map(const void *device_path, const char *name)
+{
+    if (device_path == NULL) {
+        return AXL_ERR;
+    }
+    unsigned short *w = map_name_to_ucs2(name);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    int rc = axl_backend_shell_set_map((void *)device_path, w);
+    axl_free(w);
+    return rc;
+}
+
+int
+axl_volume_map_name(const void *device_path, char *out, size_t out_size)
+{
+    if (device_path == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+    /* Delegate to the shell-map lookup (GetMapFromDevicePath). Unlike the
+       enumerate path, there is NO positional fs<i> fallback here: a device
+       path the shell hasn't mapped returns AXL_ERR, so callers publishing a
+       usable fsN never emit a synthesized index. The backend takes a mutable
+       pointer (GetMapFromDevicePath advances a local copy); the caller's path
+       is not modified. */
+    return axl_backend_shell_map_name((void *)device_path, out, out_size);
+}

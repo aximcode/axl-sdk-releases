@@ -21,7 +21,16 @@
 #   echo textpipeinput | stdio-bridge-fix.efi echotext -> GOT:textpipeinput (TEXTPIPE, default |)
 #   stdio-bridge-fix.efi echo < in.txt       -> GOT:redirhello  (< REDIRECT)
 #   stdio-bridge-fix.efi emit > out.txt; type out.txt -> DRIVEROUT (> PROBE)
-#   stdio-bridge-fix.efi echo (no input)     -> GOT:<EOF>       (NO-REGRESSION)
+#   stdio-bridge-fix.efi echo < empty.txt    -> GOT:<EOF>       (NO-REGRESSION)
+#
+# NOTE: the NO-REGRESSION case redirects an EMPTY file, not "no input at
+# all". Since axl-sdk gained the interactive console line reader, a
+# NON-redirected axl_stdin read at an interactive console blocks for a
+# typed line (POSIX tty semantics) instead of returning EOF — so the old
+# `stdio-bridge-fix.efi echo` (no redirect) would now wait on the keyboard.
+# A redirected empty file still exercises the clean-EOF path deterministically
+# (a file is never interactive); the interactive line path is covered by
+# test-console-readline-qemu.sh.
 #
 # A second launcher, stdio-bridge-self.efi, mirrors a consumer that
 # resolves the resident driver ITSELF (warm fast-path: guid + find_guid,
@@ -83,6 +92,7 @@ test_add_efi "$LEAK_LAUNCHER"
 # self-locating launcher's redirect case.
 printf 'redirhello\nsecond line ignored\n' > "$TEST_STAGING/in.txt"
 printf 'selfredir\nsecond line ignored\n' > "$TEST_STAGING/in2.txt"
+: > "$TEST_STAGING/empty.txt"   # zero-byte file for the clean-EOF probe
 
 {
     echo "@echo -off"
@@ -120,7 +130,11 @@ printf 'selfredir\nsecond line ignored\n' > "$TEST_STAGING/in2.txt"
     echo "echo TYPE_BEGIN"
     echo "type out.txt"
     echo "echo NOINPUT_BEGIN"
-    echo "stdio-bridge-fix.efi echo"
+    # Empty redirected file -> clean EOF (a file is never interactive, so the
+    # console line-reader fallback does not engage). A non-redirected read at
+    # an interactive console now blocks for a typed line instead — that path
+    # is covered by test-console-readline-qemu.sh.
+    echo "stdio-bridge-fix.efi echo < empty.txt"
     # Self-locating launcher: resolves the resident driver itself (warm
     # fast-path) and installs the bridge via the public escape hatch
     # axl_shared_driver_install_stdio_bridge(). The driver is resident

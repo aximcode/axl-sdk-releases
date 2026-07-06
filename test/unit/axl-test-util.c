@@ -1548,6 +1548,107 @@ test_volume_enumerate(void)
                "vol enum: NULL count returns AXL_ERR");
 }
 
+static void
+test_volume_map_name(void)
+{
+    char buf[16];
+
+    /* Argument validation. */
+    test_check(axl_volume_map_name(NULL, buf, sizeof(buf)) == AXL_ERR,
+               "vol map name: NULL device_path returns AXL_ERR");
+    /* A non-NULL sentinel device path with a zero-size buffer is rejected
+       before any deref, so the sentinel is never dereferenced. */
+    test_check(axl_volume_map_name((const void *)(uintptr_t)0x1, buf, 0)
+                   == AXL_ERR,
+               "vol map name: zero out_size returns AXL_ERR");
+
+    /* Direct lookup for a real, shell-mapped volume returns its shell alias —
+       and NOT a synthesized LocateHandle index. fs0 is the boot volume in the
+       unit harness; axl_volume_enumerate named it "fs0" via the same shell map,
+       so the direct lookup must agree. */
+    AxlVolume vols[8];
+    size_t    filled = 0;
+    if (axl_volume_enumerate(vols, 8, &filled) == AXL_OK && filled > 0
+        && vols[0].device_path != NULL) {
+        buf[0] = '\0';
+        int rc = axl_volume_map_name(vols[0].device_path, buf, sizeof(buf));
+        test_check(rc == AXL_OK,
+                   "vol map name: resolves an enumerated volume's device path");
+        test_check(axl_strcmp(buf, vols[0].name) == 0,
+                   "vol map name: alias matches axl_volume_enumerate's name");
+    }
+}
+
+static void
+test_volume_map_ops(void)
+{
+    /* Existing/absent map names. fs0 is the boot volume in the unit harness. */
+    test_check(axl_volume_map_taken("fs0") == true,
+               "volume map: fs0 is taken");
+    test_check(axl_volume_map_taken("fs0:") == true,
+               "volume map: fs0: (colon form) is taken");
+    test_check(axl_volume_map_taken("axl-no-such-map") == false,
+               "volume map: absent name not taken");
+    test_check(axl_volume_map_taken(NULL) == false,
+               "volume map: NULL name not taken");
+
+    /* set_map arg validation. */
+    test_check(axl_volume_set_map(NULL, "X") == AXL_ERR,
+               "volume set_map: NULL device_path -> AXL_ERR");
+
+    /* Assign a fresh name to an existing volume's device path, then confirm the
+       shell now reports it as taken (SetMap round-trip; also proves a child's
+       SetMap reaches the shell map). */
+    AxlVolume vols[8];
+    size_t    filled = 0;
+    if (axl_volume_enumerate(vols, 8, &filled) == AXL_OK && filled > 0
+        && vols[0].device_path != NULL) {
+        test_check(axl_volume_map_taken("AXLTSTMAP") == false,
+                   "volume set_map: test name free before mapping");
+        test_check(axl_volume_set_map(vols[0].device_path, "AXLTSTMAP") == AXL_OK,
+                   "volume set_map: assigns a new name to a device path");
+        test_check(axl_volume_map_taken("AXLTSTMAP") == true,
+                   "volume set_map: name is taken after mapping");
+    }
+}
+
+/* axl_path_search — the decomposable core of the path-searched-launch sibling
+   fallback (the full path-launch scenario is real-HW-only; OVMF's shell can't
+   path-search .efi). Here we pin the search logic against staged files. */
+static void
+test_path_search(void)
+{
+    char *found = NULL;
+
+    /* Argument validation. */
+    test_check(axl_path_search(NULL, "x.tmp", &found) == AXL_ERR,
+               "path search: NULL list -> AXL_ERR");
+    test_check(axl_path_search("fs0:\\", NULL, &found) == AXL_ERR,
+               "path search: NULL name -> AXL_ERR");
+    test_check(axl_path_search("fs0:\\", "x.tmp", NULL) == AXL_ERR,
+               "path search: NULL out -> AXL_ERR");
+
+    /* Stage a probe file at the fs0 root, then find it via a multi-entry list
+       whose FIRST entry is a nonexistent dir — proving empty/miss entries are
+       skipped and the first real hit wins (the shell's path-search order). */
+    const char *fname = "axl_psearch.tmp";
+    test_check(axl_file_set_contents("fs0:\\axl_psearch.tmp", "x", 1) == AXL_OK,
+               "path search: stage probe file");
+
+    found = NULL;
+    int rc = axl_path_search("fsZ:\\nope;;fs0:\\", fname, &found);
+    test_check(rc == AXL_OK && found != NULL,
+               "path search: finds the file in a later path entry");
+    axl_free(found);
+
+    /* Absent name -> AXL_NOT_FOUND, out cleared. */
+    found = (char *)(uintptr_t)0xDEAD;
+    test_check(axl_path_search("fs0:\\", "axl_nope_zzz.tmp", &found)
+                   == AXL_NOT_FOUND,
+               "path search: absent name -> AXL_NOT_FOUND");
+    test_check(found == NULL, "path search: out NULLed on not-found");
+}
+
 // ---------------------------------------------------------------------------
 // Config tests
 // ---------------------------------------------------------------------------
@@ -7778,6 +7879,9 @@ test_util_main(int argc, char **argv)
     test_path_companion();
     test_dir_list_json();
     test_volume_enumerate();
+    test_volume_map_name();
+    test_volume_map_ops();
+    test_path_search();
     test_smbios();
     test_smbios_extras();
     test_nvstore_namespaces();

@@ -61,10 +61,10 @@ the primary console.
 
 ### Interactive console input
 
-`axl_stdin` (above) is shell-pipe input — bytes the shell captured
-from the left-hand side of a `|`. For interactive prompts where
-the tool needs to wait on a real keystroke (`y`/`n` confirmations,
-"press any key", arrow-key menus), use `<axl/axl-console.h>`:
+`<axl/axl-console.h>` covers two kinds of console input.
+
+For a single keystroke (`y`/`n` confirmations, "press any key",
+arrow-key menus):
 
 ```c
 #include <axl/axl-console.h>
@@ -82,6 +82,45 @@ Three timeout modes: `0` is non-blocking (returns -1 immediately
 if no key is buffered), `UINT64_MAX` blocks forever,
 anything else is a millisecond bound. Pair with
 `axl_console_flush_input()` before a prompt to eat type-ahead.
+
+For a whole line typed by a human (`do -f`, a REPL, a `name? `
+prompt), use `axl_console_readline` — it echoes printable keys,
+erases on Backspace, and returns the accumulated UTF-8 text (minus
+the CR/LF) on Enter:
+
+```c
+char *line = NULL;
+axl_print("Name: ");
+if (axl_console_readline(UINT64_MAX, &line) == 0) {
+    axl_printf("Hello, %s\n", line);   /* Enter already echoed a newline */
+    axl_free(line);
+}
+```
+
+`axl_console_readline_ex(timeout, max_len, echo, &line)` adds a
+character cap and echo suppression — pass `echo = false` for a
+password prompt (typed characters are hidden; the terminating
+newline is still echoed). The `timeout` is a whole-line deadline;
+on expiry (or Ctrl-C) the partial input is discarded and the call
+returns -1.
+
+**`axl_stdin` routes automatically.** `axl_stdin` reads the shell
+StdIn handle — captured pipe/redirect bytes for `cmd | tool` and
+`tool < file`. But when a command is typed with no redirection,
+StdIn *is* the console, so `axl_readline(axl_stdin)` /
+`axl_stdin_text()` transparently fall back to the same console
+line editor (`axl_stdin_is_interactive()` is the predicate). A
+prompt therefore "just works" whether piped or typed. One
+consequence of this POSIX tty-vs-pipe behavior: a read of
+`axl_stdin` at an interactive console now **blocks** until Enter
+(as a tty does) rather than returning EOF. Use `axl_console_read_key`
+for raw keystrokes with no line assembly.
+
+**Unattended scripts:** an interactive console does *not* mean a human
+is present. An automated `startup.nsh` at boot has StdIn = the console
+but nobody typing, so a bare stdin read blocks until the boot timeout.
+In a script, redirect (`tool < in`) or gate on
+`axl_stdin_is_interactive()` and skip the read when it would block.
 
 ### Text-console modes
 
@@ -166,7 +205,10 @@ axl_fclose(buf);
 
 For shell pipe invocations (`tool1 | tool2`) the LHS output is
 captured by the shell into a stream that becomes the RHS's StdIn, so
-`axl_read(axl_stdin, ...)` consumes the piped bytes.
+`axl_read(axl_stdin, ...)` consumes the piped bytes. When StdIn is
+instead an interactive console (no redirection), `axl_stdin` reads
+deliver canonical line-edited input — see *Interactive console
+input* above.
 
 When the shell-params protocol isn't published (cross-volume
 launches, BDS contexts, non-Shell-2.0 launches), `axl_stdin` reads
@@ -180,7 +222,7 @@ still land somewhere instead of going silent.
 
 | Stream | Direction | Encoding | Sink |
 |---|---|---|---|
-| `axl_stdin` | in | raw bytes | shell **StdIn** handle (`EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`) — `<` / `\|` |
+| `axl_stdin` | in | raw bytes (redirected) / line-cooked (interactive) | shell **StdIn** handle (`EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`) — `<` / `\|`, else console line editor |
 | `axl_stdin_text()` | in | text (UTF-8, auto-sniffed) | `axl_text_stream_wrap` over `axl_stdin` — decodes the UCS-2 `\|` pipe to UTF-8 |
 | `axl_stdout` | out | text (UTF-8 in → UCS-2 out) | `gST->ConOut` — honors `>` / `>>` |
 | `axl_stderr` | out | text (UTF-8 in → UCS-2 out) | `gST->StdErr`, falling back to `gST->ConOut` when NULL — honors `2>` / `2>>` |

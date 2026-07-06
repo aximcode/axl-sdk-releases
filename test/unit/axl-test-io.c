@@ -698,6 +698,69 @@ test_console_read_key_raised_tpl(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_console_readline — no-input contract paths. The unit runner injects no
+// keystrokes, so we can only pin the safe negatives (NULL out, non-blocking
+// empty queue, bounded-timeout-with-no-line). The full echoed/edited line
+// round-trip is keystroke-driven and lives in test-console-readline-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_readline_noinput(void)
+{
+    char *line = (char *)(uintptr_t)0xDEAD;   /* sentinel: must be set to NULL */
+
+    /* Drain any type-ahead (the Enter that launched the binary, startup.nsh
+       residue) so the non-blocking assertions below see a genuinely empty
+       queue rather than a stray buffered CR that would complete an empty line. */
+    axl_console_flush_input();
+
+    /* NULL out → -1 immediately, both forms. */
+    test_check(axl_console_readline(0, NULL) == AXL_ERR,
+               "console readline: NULL out rejected");
+    test_check(axl_console_readline_ex(0, 0, true, NULL) == AXL_ERR,
+               "console readline_ex: NULL out rejected");
+
+    /* Non-blocking with an empty ConIn queue → -1 and out set to NULL
+       (no complete line buffered). Must NOT block — a hang here would
+       starve the suite and trip the QEMU timeout. */
+    test_check(axl_console_readline(0, &line) == AXL_ERR,
+               "console readline: non-blocking empty queue returns -1");
+    test_check(line == NULL,
+               "console readline: out set to NULL on -1 (never stale)");
+
+    /* Bounded whole-line deadline: 50 ms with no line completing → -1,
+       exercising the timer leg end-to-end (a "block forever" regression
+       would hang the runner). */
+    line = (char *)(uintptr_t)0xDEAD;
+    test_check(axl_console_readline(50, &line) == AXL_ERR,
+               "console readline: 50ms deadline returns -1 (timer leg fires)");
+    test_check(line == NULL,
+               "console readline: out set to NULL on timeout");
+
+    /* _ex non-blocking empty queue, hidden echo, capped length → -1. */
+    line = (char *)(uintptr_t)0xDEAD;
+    test_check(axl_console_readline_ex(0, 8, false, &line) == AXL_ERR,
+               "console readline_ex: non-blocking empty queue returns -1");
+    test_check(line == NULL,
+               "console readline_ex: out set to NULL on -1");
+}
+
+// ---------------------------------------------------------------------------
+// axl_stdin_is_interactive — the predicate behind axl_stdin's console-line
+// fallback. The unit binaries launch from startup.nsh with NO input
+// redirection, so their shell StdIn is the console: interactive == true.
+// (The redirected/piped false cases are pinned by test-console-readline-qemu.sh
+// / test-shell-pipe.sh, which can actually apply `<` and `|`.)
+// ---------------------------------------------------------------------------
+
+static void
+test_stdin_is_interactive(void)
+{
+    test_check(axl_stdin_is_interactive() == true,
+               "stdin_is_interactive: true for a non-redirected console StdIn");
+}
+
+// ---------------------------------------------------------------------------
 // Text-console modes (SimpleTextOutput QueryMode / SetMode) — the
 // graphics-free peer of the AxlGfx display-mode API. The unit suite drives a
 // real, working ConOut (the harness output itself flows through it), so unlike
@@ -1893,6 +1956,8 @@ test_io_main(int argc, char **argv)
     test_stderr_tee();
     test_console_read_key();
     test_console_read_key_raised_tpl();
+    test_console_readline_noinput();
+    test_stdin_is_interactive();
     test_console_text_modes();
     test_stdout_raw();
     test_text_stream();

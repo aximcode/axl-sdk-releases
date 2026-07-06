@@ -22,6 +22,46 @@ if (axl_ramdisk_create("SCRATCH", 64, &dp) == AXL_OK) {
 }
 ```
 
+### Scriptable use from a non-interactive `.nsh`
+
+A read-only boot medium (a locked USB key / floppy image) can't hold a
+scratch file, so a `startup.nsh` makes a RAM disk and writes there. The
+snag is that a freshly created disk isn't in the shell's map, and its
+auto-assigned `fsN` is **not deterministic** — a script can't hard-code
+`fs5:`. `mkrd <LABEL>` solves both by **assigning the shell map name
+itself** (`EFI_SHELL_PROTOCOL.SetMap`), so the volume is usable in **one
+call, with no `map -r`**:
+
+```
+mkrd RAMDISK        # creates + maps to the next free fsN, sets %RAMDISK%
+%RAMDISK%:          # switch to it — the bare `fsN:` verb, NOT `cd`
+echo ... > last.nsh # write to the writable RAM disk
+
+mkrd SCRATCH -m RD  # or pin a name: maps as RD: (fails if RD: is taken)
+RD:                 # use it directly
+```
+
+Why this works where a plain create doesn't:
+
+- **`SetMap` targets the shell's *global* map**, so a name set by `mkrd`
+  (a child image) is visible to the launching script immediately — unlike
+  `EFI_SHELL_PROTOCOL.Execute("map -r")`, which runs a *nested* shell that
+  can't rebuild the parent's map. This is the same trick the old EFI
+  Toolkit `MKRAMDISK` used by taking the map name as an argument.
+- **`-m <name>` pins a name and fails if it's already in use** (never
+  clobbers an existing mapping); without it, the lowest free `fsN` is
+  chosen. `%<LABEL>%` is set to the chosen name either way.
+- **Switch with the bare `<name>:` / `%<LABEL>%:`, not `cd`.** In the UEFI
+  Shell a bare `fsN:` selects the filesystem; `cd` only moves within one.
+- Idempotent on the label — a `startup.nsh` may re-run `mkrd` each boot.
+- **Don't mix with a later `map -r`.** A subsequent `map -r` rebuilds the
+  shell map and may drop or renumber the `SetMap`'d name. The one-call
+  workflow above never runs `map -r`, so it's unaffected; just don't assume
+  the assigned name survives a later `map -r`.
+
+(`axl_volume_set_map` / `axl_volume_map_taken` in `<axl/axl-fs.h>` expose
+the mapping + name-in-use check for other callers.)
+
 `EFI_RAM_DISK_PROTOCOL` is optional in UEFI 2.6+ and absent on some
 firmware. `axl_ramdisk_ensure_driver` resolves it in order: already
 published → a `RamDiskDxe.efi` found on a mounted volume → an embedded

@@ -6,12 +6,25 @@
  * @brief The active console: interactive key input (single-keystroke read
  *        with timeout) and text-output mode enumeration / selection.
  *
- * `axl_stdin` (in axl-stream.h) is shell-pipe input only:
- * bytes the shell captured from the left-hand side of a `|`. Tools
- * that need to wait on a real keystroke (`y` / `n` prompts, "press
- * any key", arrow-key menus) reach for the SimpleTextInputProtocol
- * `ReadKeyStroke` path, which axl-console wraps with a timeout so
- * callers don't have to manage timer events by hand.
+ * Two kinds of console input live here:
+ *
+ *   - **Single keystroke** (`axl_console_read_key`) — for `y`/`n`
+ *     prompts, "press any key", arrow-key menus: one decoded keystroke
+ *     off the SimpleTextInputProtocol `ReadKeyStroke` path, wrapped with
+ *     a timeout so callers don't hand-manage timer events.
+ *   - **A whole line** (`axl_console_readline`) — the interactive,
+ *     echoed, Backspace-editable, Enter-terminated line a tool needs
+ *     when it prompts a human (`do -f`, a REPL, a "name? " prompt).
+ *
+ * This is distinct from `axl_stdin` / `axl_readline` (in axl-stream.h),
+ * which read the shell's StdIn *handle* — the bytes captured from the
+ * left of a `|` or from `< file`. When StdIn is redirected that is
+ * exactly right; but when a command is typed with no redirection StdIn
+ * *is* the console, which is not a byte-addressable file. `axl_readline`
+ * now bridges that gap automatically (see axl_stdin_is_interactive()):
+ * on an interactive StdIn it delegates to `axl_console_readline` so a
+ * prompt "just works" whether piped or typed. Call `axl_console_readline`
+ * directly when you always want the console (never the pipe).
  *
  * @code
  * AxlKey k;
@@ -27,6 +40,8 @@
 #define AXL_CONSOLE_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 #include <axl/axl-macros.h>
 
 #ifdef __cplusplus
@@ -83,6 +98,94 @@ axl_console_read_key(
 void
 axl_console_flush_input(
     void
+);
+
+/**
+ * @brief Read one line of interactive input from the console.
+ *
+ * The line-level peer of axl_console_read_key() — reads keystrokes
+ * from the active console (ConIn), echoes printable characters to
+ * ConOut, erases the last character on Backspace, and returns the
+ * accumulated text (WITHOUT the terminating CR/LF) when the user
+ * presses Enter. This is what a tool prompting a human wants; unlike
+ * `axl_readline` on `axl_stdin`, it targets the console unconditionally
+ * — never the shell pipe.
+ *
+ * **On Enter** a CRLF is echoed to ConOut (leaving the cursor at
+ * column 0 of the next line), so the caller's next output starts
+ * cleanly — do not print your own newline after the read.
+ *
+ * **Keys handled:** printable characters (accumulated + echoed),
+ * Backspace (erases the last character, echoing `\b \b`), and Enter
+ * (CR or LF — terminates). All other keys (arrows, Tab, Esc, Del,
+ * function keys, Ctrl-letter) are ignored: there is no mid-line
+ * cursor editing.
+ *
+ * On success @p out_line receives a heap-allocated, NUL-terminated
+ * UTF-8 string the caller must free with axl_free() (an immediate
+ * Enter yields ""). On any non-AXL_OK return @p out_line is set to NULL
+ * (never left holding a stale pointer — deliberately unlike the
+ * "@p out untouched on error" convention elsewhere in this header, so
+ * an ignored error can't feed a dangling free).
+ *
+ * @p timeout_ms is a **whole-line** deadline — the total budget to
+ * finish the line, not a per-keystroke bound:
+ *   - `0`          — non-blocking: returns a line only if a complete
+ *                    Enter-terminated line is already buffered.
+ *   - `UINT64_MAX` — block until the user presses Enter.
+ *   - any other    — allow at most @p timeout_ms for the whole line.
+ *
+ * **Timeout discards input.** UEFI ConIn cannot push keystrokes back,
+ * so on expiry (or the `0` no-complete-line case) every character read
+ * so far is consumed and permanently lost, and the call returns -1.
+ * This makes a short timeout unsuitable for polling a half-typed line —
+ * a caller that needs resumable / incremental input must use
+ * @ref axl_console_read_key and buffer the keystrokes itself. A pressed
+ * Ctrl-C (shell ExecutionBreak) also aborts with -1.
+ *
+ * **At raised TPL** (from a pump callback): pass a finite @p timeout_ms;
+ * a `UINT64_MAX` read busy-holds the TPL until Enter arrives, starving
+ * the pump — same caveat as @ref axl_console_read_key.
+ *
+ * Equivalent to @ref axl_console_readline_ex with an unbounded length
+ * and echo enabled.
+ *
+ * @return AXL_OK with @p out_line populated; -1 on timeout, Ctrl-C, no
+ *     console (ConIn unavailable), or allocation failure.
+ */
+AXL_WARN_UNUSED int
+axl_console_readline(
+    uint64_t   timeout_ms,   ///< 0 / UINT64_MAX / whole-line millisecond deadline
+    char     **out_line      ///< [out] heap UTF-8 line (caller frees); must be non-NULL
+);
+
+/**
+ * @brief Read one interactive line, with a length cap and echo control.
+ *
+ * The full form behind @ref axl_console_readline. Same key handling,
+ * Enter/CRLF echo, @p timeout_ms (whole-line deadline) and
+ * @p out_line ownership semantics; adds:
+ *   - @p max_len — maximum number of characters accepted into the line
+ *     (BMP code units, i.e. keystrokes). Keystrokes past the cap are
+ *     ignored (not echoed, not stored); Backspace and Enter still work.
+ *     `0` means unbounded. The returned UTF-8 string may exceed
+ *     @p max_len *bytes* when input contains multi-byte characters —
+ *     the cap counts characters, not bytes.
+ *   - @p echo — when false, typed characters are not echoed to ConOut
+ *     (password-style entry) and Backspace edits the buffer silently;
+ *     the terminating CRLF on Enter is **still** echoed so the next
+ *     prompt isn't glued to the hidden line. When true, behaves like
+ *     @ref axl_console_readline.
+ *
+ * @return AXL_OK with @p out_line populated; -1 on timeout, Ctrl-C, no
+ *     console (ConIn unavailable), or allocation failure.
+ */
+AXL_WARN_UNUSED int
+axl_console_readline_ex(
+    uint64_t   timeout_ms,   ///< 0 / UINT64_MAX / whole-line millisecond deadline
+    size_t     max_len,      ///< max characters accepted (0 = unbounded)
+    bool       echo,         ///< echo typed characters to ConOut (false = hidden)
+    char     **out_line      ///< [out] heap UTF-8 line (caller frees); must be non-NULL
 );
 
 // ===================================================================

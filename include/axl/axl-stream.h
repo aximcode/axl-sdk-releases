@@ -86,18 +86,60 @@ extern AxlStream *axl_stderr_raw;
  *
  * **axl_stdin** is backed by `EFI_SHELL_PARAMETERS_PROTOCOL.StdIn`
  * when the shell publishes it (the typical case for shell-launched
- * apps including the right-hand side of a `|` pipe). Reading from
- * axl_stdin then consumes the bytes the shell captured from the
- * left-hand side of the pipe.
+ * apps including the right-hand side of a `|` pipe). When StdIn is
+ * **redirected** — `cmd | tool`, `tool < file` — reading axl_stdin
+ * consumes those captured bytes, byte-for-byte.
+ *
+ * When StdIn is **interactive** (the command was typed with no
+ * redirection, so StdIn is the console itself), axl_stdin switches to
+ * canonical console line editing: a read blocks until the user presses
+ * Enter, then delivers the echoed, Backspace-edited line (with a
+ * trailing `\n`). This mirrors POSIX tty-vs-pipe behavior and is what
+ * lets `axl_readline` / `axl_stdin_text` serve an interactive prompt
+ * without the caller distinguishing the two cases (see
+ * axl_stdin_is_interactive()). To read raw console keystrokes with no
+ * line assembly, use axl_console_read_key() instead.
  *
  * If the shell-params protocol isn't published on this image
  * (cross-volume launches, BDS contexts, non-Shell-2.0 launches),
- * axl_stdin reads return EOF (0 bytes). Callers that need to
- * detect "stdin not connected" can issue a single zero-length
- * read and check the result.
+ * axl_stdin reads return EOF (0 bytes) — it does not fall back to the
+ * console, so a context that never expected a keyboard won't block.
+ * Callers that need to detect "stdin not connected" can issue a single
+ * zero-length read and check the result.
  */
 void
 axl_stream_init(void);
+
+/**
+ * @brief Is the shell's StdIn an interactive console rather than a
+ *        redirected file/pipe?
+ *
+ * True when a command was typed with no input redirection, so
+ * `EFI_SHELL_PARAMETERS_PROTOCOL.StdIn` is the console (not a
+ * byte-addressable file). False when StdIn is redirected (`| tool`,
+ * `tool < file`) — those cases carry a real file handle. Also false
+ * when no shell StdIn handle is published at all (BDS / non-shell
+ * contexts): there is nothing to read interactively through the shell.
+ *
+ * This is the predicate behind axl_stdin's automatic console-line-edit
+ * fallback (see axl_stream_init()). Consumers rarely need it —
+ * axl_readline already routes correctly — but it is useful for deciding
+ * whether to draw a prompt, or to switch to a hidden (password) read via
+ * axl_console_readline_ex(), which only makes sense interactively.
+ *
+ * **"interactive console" does NOT mean "a human is present."** An
+ * unattended `startup.nsh` at boot has StdIn = the console (so this
+ * returns true) but nobody at the keyboard — a bare `axl_stdin` /
+ * `axl_readline` read there blocks until the outer boot timeout instead
+ * of returning EOF. In an automated script, either redirect the input
+ * (`tool < in`) or gate the read on this predicate and skip it when it
+ * would block (read-if-piped-else-EOF).
+ *
+ * @return true if StdIn is an interactive console; false if redirected
+ *     or not connected.
+ */
+bool
+axl_stdin_is_interactive(void);
 
 /**
  * @brief Tee subsequent writes to @p extra alongside the console.
@@ -217,6 +259,9 @@ AXL_DEFINE_AUTOPTR_CLEANUP(AxlStream, axl_fclose)
  * Returns number of complete items read (may be less than count at
  * EOF or on error). Returns 0 on both EOF and error — use axl_read()
  * if you need to distinguish them (-1 = error, 0 = EOF).
+ *
+ * On `axl_stdin` in interactive mode reads are line-cooked and blocking
+ * (see axl_read() and axl_stream_init()), not raw keystrokes.
  */
 size_t
 axl_fread(
@@ -260,6 +305,10 @@ axl_fprintf(
  * single oversized line cannot exhaust memory.
  *
  * Caller frees with axl_free(). Returns NULL at EOF or on error.
+ *
+ * On `axl_stdin` in interactive mode this blocks on the console and
+ * returns line-buffered, echoed input — the automatic prompt-vs-pipe
+ * routing (see axl_stream_init(), axl_stdin_is_interactive()).
  */
 char *
 axl_readline(
@@ -703,8 +752,12 @@ axl_text_stream_wrap(
  * transparently decodes the UEFI shell's UCS-2 pipe output (and BOM'd
  * UTF-16 / UTF-8) to UTF-8, so `axl_readline()` on it reads piped text
  * regardless of the shell's `|` encoding — no `|a` needed. `<`
- * redirection and interactive input pass through unchanged. For raw
- * bytes (no decoding), read `axl_stdin` directly.
+ * redirection passes through unchanged. **Interactive** input arrives
+ * line-buffered and already UTF-8 (see axl_stream_init() and
+ * axl_stdin_is_interactive()), so it needs no decoding but is cooked,
+ * not raw. For raw redirected/piped bytes, read `axl_stdin` directly;
+ * for raw console keystrokes (no line assembly), use axl_console_read_key()
+ * — reading `axl_stdin` at an interactive console is line-cooked, not raw.
  *
  * **The caller owns the returned stream** — close it with axl_fclose.
  * A NEW wrapper is returned on every call (it is **not** cached): the
@@ -714,9 +767,9 @@ axl_text_stream_wrap(
  * replay a previous invocation's buffered input).
  *
  * **Construction reads stdin eagerly** to classify the encoding, so on
- * an interactive stdin with no pending input this call blocks until the
- * first input arrives — the same as reading `axl_stdin` directly. Create
- * it at the point you are ready to read, not speculatively.
+ * an interactive stdin this call blocks until the user enters the first
+ * line (Enter) — the same as reading `axl_stdin` directly. Create it at
+ * the point you are ready to read, not speculatively.
  *
  * @return a text-decoding read stream over stdin (free with axl_fclose),
  *     or NULL on allocation failure. (axl_text_stream_wrap also returns
@@ -769,6 +822,11 @@ axl_bufsteal(
 
 /**
  * @brief Read up to @a count bytes from stream at current position.
+ *
+ * On `axl_stdin` in interactive mode this is not raw: it blocks on the
+ * console and returns line-cooked, echoed bytes (a full line plus `\n`
+ * per Enter) — see axl_stream_init(). Use axl_console_read_key()
+ * for raw keystrokes.
  *
  * @return bytes read, 0 at EOF, -1 on error.
  */

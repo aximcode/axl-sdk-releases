@@ -392,7 +392,7 @@ check_absent_in_section "mkrd-positional-no-label-required" \
 # the always-on fallback. Either way, the protocol must end up live
 # and the ramdisk must appear in the listing.
 check "mkrd-autoload-success" \
-    "RAM disk .testrd. created"
+    "label.*: testrd"
 check "mkrd-list-shows-testrd" \
     "testrd"
 

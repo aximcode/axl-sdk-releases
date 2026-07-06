@@ -162,6 +162,46 @@ path_file_exists(const char *path)
     return path != NULL && axl_file_info(path, &fi) == AXL_OK && !axl_fs_entry_is_dir(&fi);
 }
 
+int
+axl_path_search(const char *search_list, const char *name, char **out_path)
+{
+    if (out_path != NULL) {
+        *out_path = NULL;
+    }
+    if (search_list == NULL || name == NULL || out_path == NULL) {
+        return AXL_ERR;
+    }
+
+    for (const char *seg = search_list; *seg != '\0'; ) {
+        const char *end = seg;
+        while (*end != '\0' && *end != ';') {
+            end++;
+        }
+        size_t seg_len = (size_t)(end - seg);
+        if (seg_len > 0) {   /* skip empty entries (e.g. leading/trailing ';') */
+            char *dir = axl_malloc(seg_len + 1);
+            if (dir == NULL) {
+                return AXL_ERR;
+            }
+            axl_memcpy(dir, seg, seg_len);
+            dir[seg_len] = '\0';
+
+            char *full = axl_path_join(dir, name);
+            axl_free(dir);
+            if (full == NULL) {
+                return AXL_ERR;
+            }
+            if (path_file_exists(full)) {
+                *out_path = full;   /* first match wins */
+                return AXL_OK;
+            }
+            axl_free(full);
+        }
+        seg = (*end == ';') ? end + 1 : end;
+    }
+    return AXL_NOT_FOUND;
+}
+
 char *
 axl_resolve_data_file(const char *override_path, const char *name)
 {

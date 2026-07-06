@@ -124,6 +124,15 @@ typedef CONST CHAR16 *(EFIAPI *EFI_SHELL_GET_MAP_FROM_DEVICE_PATH)(
     IN OUT EFI_DEVICE_PATH_PROTOCOL  **DevicePath
     );
 
+typedef EFI_DEVICE_PATH_PROTOCOL *(EFIAPI *EFI_SHELL_GET_DEVICE_PATH_FROM_MAP)(
+    IN CONST CHAR16  *Mapping
+    );
+
+typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_MAP)(
+    IN CONST EFI_DEVICE_PATH_PROTOCOL  *DevicePath,
+    IN CONST CHAR16                    *Mapping
+    );
+
 // ===================================================================
 // EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (UEFI Spec 2.x, §12.2)
 //
@@ -211,11 +220,11 @@ struct _EFI_SHELL_PROTOCOL {
     void                          *GetAlias;             // 2.2.5
     void                          *SetAlias;             // 2.2.6
     void                          *GetHelpText;          // 2.2.7
-    void                          *GetDevicePathFromMap; // 2.2.8
+    EFI_SHELL_GET_DEVICE_PATH_FROM_MAP GetDevicePathFromMap; // 2.2.8 (USED)
     EFI_SHELL_GET_MAP_FROM_DEVICE_PATH GetMapFromDevicePath; // 2.2.9 (USED)
     void                          *GetDevicePathFromFilePath; // 2.2.10
     void                          *GetFilePathFromDevicePath; // 2.2.11
-    void                          *SetMap;               // 2.2.12
+    EFI_SHELL_SET_MAP              SetMap;               // 2.2.12 (USED)
     EFI_SHELL_GET_CUR_DIR         GetCurDir;             // 2.2.13 (USED)
     EFI_SHELL_SET_CUR_DIR         SetCurDir;             // 2.2.14 (USED)
     void                          *OpenFileList;         // 2.2.15

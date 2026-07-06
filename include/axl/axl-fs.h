@@ -573,6 +573,65 @@ axl_volume_enumerate(
     size_t    *count   ///< [out] number of volumes found
 );
 
+/**
+ * @brief Resolve the UEFI Shell's fsN alias for a device path.
+ *
+ * Looks @p device_path up in the shell's volume map (GetMapFromDevicePath)
+ * and writes the lowercased `fsN` alias (no trailing `:`) to @p out. This is
+ * the shell's *actual* mapping — unlike axl_volume_enumerate()'s `.name`,
+ * it never falls back to a synthesized LocateHandle index. Use it when you
+ * must publish a caller-usable `fsN` (e.g. a freshly created RAM disk): a real
+ * alias, or a clean failure you can report — never a plausible-but-wrong index.
+ *
+ * @return AXL_OK with @p out set to the alias; AXL_ERR if @p device_path has no
+ *     shell mapping (not yet remapped, or no fs alias), or an argument is
+ *     invalid; AXL_UNSUPPORTED if the shell doesn't publish GetMapFromDevicePath.
+ *     @p out is left unchanged on any non-AXL_OK return.
+ */
+AXL_WARN_UNUSED int
+axl_volume_map_name(
+    const void *device_path,   ///< device path (from AxlVolume / axl_ramdisk_create)
+    char       *out,           ///< [out] receives the lowercased "fsN" alias
+    size_t      out_size       ///< capacity of @p out in bytes (including NUL)
+);
+
+/**
+ * @brief Is a UEFI Shell map name currently in use?
+ *
+ * @p name is the mapping name with or without a trailing `:` (e.g. `"fs2"` or
+ * `"fs2:"`, `"RD"` / `"RD:"`). Useful to reject a caller-requested name that
+ * is taken, or to scan for the next free `fsN`.
+ *
+ * @return true if the shell has a mapping for @p name; false otherwise (also
+ *     false with no shell, or @p name NULL/empty).
+ */
+bool
+axl_volume_map_taken(
+    const char *name   ///< mapping name, `:` optional
+);
+
+/**
+ * @brief Assign a UEFI Shell map name to a device path (SetMap).
+ *
+ * Adds @p name -> @p device_path to the shell's map. Unlike a firmware
+ * ConnectController + `map -r` cycle, this is usable by the launching
+ * shell/script **immediately, without `map -r`** — even when called from a
+ * child image (SetMap targets the shell's global map, not a nested shell).
+ * @p name may omit the trailing `:`. The device path must carry a filesystem
+ * (i.e. be connected — e.g. a RAM disk from @ref axl_ramdisk_create, which
+ * connects it) for the name to be usable as a volume.
+ *
+ * Pair with axl_volume_map_taken() to avoid clobbering an existing name.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args / SetMap failure;
+ *     AXL_UNSUPPORTED when there is no shell (SetMap unavailable).
+ */
+AXL_WARN_UNUSED int
+axl_volume_set_map(
+    const void *device_path,   ///< device path (e.g. from axl_ramdisk_create)
+    const char *name           ///< mapping name to assign, `:` optional
+);
+
 #ifdef __cplusplus
 }
 #endif
