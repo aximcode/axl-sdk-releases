@@ -33,13 +33,18 @@ itself** (`EFI_SHELL_PROTOCOL.SetMap`), so the volume is usable in **one
 call, with no `map -r`**:
 
 ```
-mkrd RAMDISK        # creates + maps to the next free fsN, sets %RAMDISK%
-%RAMDISK%:          # switch to it — the bare `fsN:` verb, NOT `cd`
+mkrd RAMDISK        # creates + maps as RAMDISK: (the label), sets %RAMDISK%
+%RAMDISK%:          # switch to it — the bare `<name>:` verb, NOT `cd`
 echo ... > last.nsh # write to the writable RAM disk
 
-mkrd SCRATCH -m RD  # or pin a name: maps as RD: (fails if RD: is taken)
+mkrd SCRATCH -a RD  # or override the alias: maps as RD: (fails if RD: is taken)
 RD:                 # use it directly
 ```
+
+**Label vs alias.** The positional `<LABEL>` is the FAT volume label *and* the
+shell var `%<LABEL>%`; the map **alias** (what you type to switch to it) defaults
+to the label — so `mkrd RD` gives you `RD:` with no `-a`. `-a <alias>` overrides
+the alias.
 
 Why this works where a plain create doesn't:
 
@@ -48,9 +53,18 @@ Why this works where a plain create doesn't:
   `EFI_SHELL_PROTOCOL.Execute("map -r")`, which runs a *nested* shell that
   can't rebuild the parent's map. This is the same trick the old EFI
   Toolkit `MKRAMDISK` used by taking the map name as an argument.
-- **`-m <name>` pins a name and fails if it's already in use** (never
-  clobbers an existing mapping); without it, the lowest free `fsN` is
-  chosen. `%<LABEL>%` is set to the chosen name either way.
+- **The alias defaults to the label**, falling back to the lowest free `fsN`
+  when the label matches the reserved `fs<digits>` namespace (so `mkrd fs2`
+  never shadows or clobbers a real `fs2` / the boot volume), is already in use
+  by another volume (never clobbers it), or is too long / has characters
+  outside `[A-Za-z0-9_-]`. `-a <alias>` overrides and fails if `<name>` is taken.
+  `%<LABEL>%` is set to the chosen alias either way.
+- **Idempotent on the label *and* its map.** A same-session re-run reuses the
+  disk's existing alias **in any form** (its label, an `fsN`, or a custom `-a`
+  name) — it does **not** drift to a new slot or leave a duplicate alias — and
+  republishes `%<LABEL>%` to it, so a defensive `startup.nsh` can call it every
+  boot. A `-a <alias>` on an already-mapped disk keeps the existing alias and
+  reports that `<name>` was not added.
 - **Switch with the bare `<name>:` / `%<LABEL>%:`, not `cd`.** In the UEFI
   Shell a bare `fsN:` selects the filesystem; `cd` only moves within one.
 - Idempotent on the label — a `startup.nsh` may re-run `mkrd` each boot.
@@ -59,8 +73,12 @@ Why this works where a plain create doesn't:
   workflow above never runs `map -r`, so it's unaffected; just don't assume
   the assigned name survives a later `map -r`.
 
-(`axl_volume_set_map` / `axl_volume_map_taken` in `<axl/axl-fs.h>` expose
-the mapping + name-in-use check for other callers.)
+(`axl_volume_set_map` / `axl_volume_map_taken` / `axl_volume_map_alias` /
+`axl_volume_unmap` in `<axl/axl-fs.h>` expose the mapping, the name-in-use
+check, the "what is this device mapped as" read-back, and mapping removal for
+other callers; `axl_ramdisk_find` returns a disk's device path by label.
+`mkrd -d` uses these to drop a destroyed disk's now-dangling shell alias so a
+later `<alias>:` can't dereference the freed device path.)
 
 `EFI_RAM_DISK_PROTOCOL` is optional in UEFI 2.6+ and absent on some
 firmware. `axl_ramdisk_ensure_driver` resolves it in order: already

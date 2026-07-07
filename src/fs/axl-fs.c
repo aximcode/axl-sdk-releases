@@ -995,6 +995,18 @@ axl_volume_set_map(const void *device_path, const char *name)
 }
 
 int
+axl_volume_unmap(const char *name)
+{
+    unsigned short *w = map_name_to_ucs2(name);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    int rc = axl_backend_shell_unmap(w);
+    axl_free(w);
+    return rc;
+}
+
+int
 axl_volume_map_name(const void *device_path, char *out, size_t out_size)
 {
     if (device_path == NULL || out == NULL || out_size == 0) {
@@ -1007,4 +1019,16 @@ axl_volume_map_name(const void *device_path, char *out, size_t out_size)
        pointer (GetMapFromDevicePath advances a local copy); the caller's path
        is not modified. */
     return axl_backend_shell_map_name((void *)device_path, out, out_size);
+}
+
+int
+axl_volume_map_alias(const void *device_path, char *out, size_t out_size)
+{
+    if (device_path == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+    /* Returns the FIRST alias verbatim (any form) — unlike map_name, which
+       filters to fs<n>. The backend takes a mutable pointer; the caller's
+       path is not modified. */
+    return axl_backend_shell_map_alias((void *)device_path, out, out_size);
 }

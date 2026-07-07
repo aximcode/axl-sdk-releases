@@ -596,6 +596,35 @@ axl_volume_map_name(
 );
 
 /**
+ * @brief Resolve the shell's current alias for a device path — ANY form.
+ *
+ * Like axl_volume_map_name, but returns the FIRST alias the shell lists for
+ * @p device_path (GetMapFromDevicePath) verbatim, minus the trailing `:`,
+ * whether it is an `fsN` name or a custom SetMap name (e.g. `RD`). Use it to
+ * ask "is this device already mapped, and as what?" — e.g. to make a
+ * re-create idempotent by reusing the existing mapping instead of adding a
+ * second alias. When you specifically need a usable `fsN` (and want a clean
+ * failure otherwise), use axl_volume_map_name instead.
+ *
+ * If a device path carries several aliases (e.g. both a custom name and an
+ * `fsN` after a `map -r`), which one is "first" is firmware-defined; a device
+ * with a single alias (the common case, e.g. a freshly SetMap'd RAM disk)
+ * always resolves to that alias. An alias longer than @p out_size is reported
+ * as AXL_ERR, never truncated.
+ *
+ * @return AXL_OK with @p out set to the alias; AXL_ERR if @p device_path has
+ *     no shell mapping or an argument is invalid; AXL_UNSUPPORTED if the shell
+ *     doesn't publish GetMapFromDevicePath. @p out is left unchanged on any
+ *     non-AXL_OK return.
+ */
+AXL_WARN_UNUSED int
+axl_volume_map_alias(
+    const void *device_path,   ///< device path (from AxlVolume / axl_ramdisk_create)
+    char       *out,           ///< [out] receives the alias, verbatim, no `:`
+    size_t      out_size       ///< capacity of @p out in bytes (including NUL)
+);
+
+/**
  * @brief Is a UEFI Shell map name currently in use?
  *
  * @p name is the mapping name with or without a trailing `:` (e.g. `"fs2"` or
@@ -630,6 +659,23 @@ AXL_WARN_UNUSED int
 axl_volume_set_map(
     const void *device_path,   ///< device path (e.g. from axl_ramdisk_create)
     const char *name           ///< mapping name to assign, `:` optional
+);
+
+/**
+ * @brief Remove a UEFI Shell map name (SetMap with a NULL device path).
+ *
+ * Deletes @p name from the shell's global map. Use it to drop a mapping whose
+ * backing device is going away — e.g. after destroying a RAM disk — so a later
+ * `<name>:` doesn't resolve to a freed device path. @p name may omit the
+ * trailing `:`. Removing a name that isn't mapped is reported by the shell as
+ * an error (harmless for best-effort cleanup).
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args / not-mapped / SetMap failure;
+ *     AXL_UNSUPPORTED when there is no shell (SetMap unavailable).
+ */
+AXL_WARN_UNUSED int
+axl_volume_unmap(
+    const char *name           ///< mapping name to delete, `:` optional
 );
 
 #ifdef __cplusplus

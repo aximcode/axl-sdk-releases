@@ -614,6 +614,39 @@ axl_backend_shell_map_name(
     );
 
 /**
+ * @brief The device path's FIRST shell alias — any form.
+ *
+ * Like axl_backend_shell_map_name but returns the first alias
+ * GetMapFromDevicePath lists (verbatim, minus the trailing ':') whether it is
+ * an `fs<n>` name or a custom SetMap name (e.g. "RD"). For "is this device
+ * mapped, and as what?" queries.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args or no mapping;
+ *         AXL_UNSUPPORTED when there is no shell.
+ */
+int
+axl_backend_shell_map_alias(
+    void   *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL for the volume
+    char   *out,          ///< [out] receives the first alias, verbatim, no ':'
+    size_t  out_size      ///< capacity of @p out
+    );
+
+/**
+ * @brief Remove a shell map alias (SetMap with a NULL device path).
+ *
+ * Deletes @p name from the shell's global map — used to drop a mapping whose
+ * backing device is going away (e.g. a RAM disk being destroyed), so a later
+ * `<name>:` doesn't dereference a freed device path.
+ *
+ * @return AXL_OK on success; AXL_ERR on bad args / SetMap failure;
+ *         AXL_UNSUPPORTED when there is no shell.
+ */
+int
+axl_backend_shell_unmap(
+    const unsigned short *name   ///< ':'-terminated mapping name to delete
+    );
+
+/**
  * @brief Is a shell map name (e.g. "fs2:") currently in use?
  *
  * Consults EFI_SHELL_PROTOCOL.GetDevicePathFromMap. @p name must be

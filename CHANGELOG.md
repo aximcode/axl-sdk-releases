@@ -3,6 +3,54 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.2 — 2026-07-07
+
+### Fixed
+
+- **`mkrd <label>` re-run is idempotent.** A same-session re-run reused the RAM
+  disk but assigned it a NEW mapping (its own prior alias read as "taken"),
+  drifting `%<label>%` and leaving a duplicate alias. It now reuses the disk's
+  existing mapping — reported as "reused" — so a `startup.nsh` can re-run it
+  each boot.
+- **`mkrd` is quiet by default.** Library `INFO`/`DEBUG` chatter (e.g. the
+  driver-ensure "loaded '<embedded>'" line) is suppressed unless `-v` is given.
+- **`mkrd` reports why auto-mapping failed** — it distinguishes "no
+  `EFI_SHELL_PROTOCOL` on this firmware" from "the shell rejected SetMap", and
+  notes the disk still exists (mount via `map -r`).
+- **`mkrd -d <label>` now removes the destroyed disk's shell map alias.**
+  Destroy freed the RAM disk's device path but left its `<alias>:` (or `fsN`)
+  in the shell's global map, dangling at freed memory — a later bare
+  `<alias>:` would dereference it. Destroy now captures the alias, unregisters
+  the disk, then unmaps the alias.
+
+### Changed
+
+- **`mkrd` maps a RAM disk under its LABEL by default** (behavior change).
+  `mkrd RD` now gives you `RD:` with no flag — the positional arg is the FAT
+  label, `%<label>%`, AND the default map alias. The default is guarded: the
+  label falls back to a free `fsN` (with a note) when it matches the reserved
+  `fs<digits>` namespace (so `mkrd fs0` never clobbers the boot volume; case-
+  and `:`-insensitive), is already in use by another volume, or is too long /
+  has characters outside `[A-Za-z0-9_-]`. Re-runs stay idempotent by reusing
+  the disk's current alias in any form (label / `fsN` / custom).
+- **`mkrd`: renamed `-m`/`--map` to `-a`/`--alias`** (the value is an alias
+  override, not a "map"). `-m` is removed. An explicit `-a fsN` (a reserved
+  name) is now a hard error rather than claiming a shell slot.
+- **`mkrd` with no arguments prints help** (previously a one-line error), and
+  no longer loads the RAM disk driver just to report a usage error.
+
+### Added
+
+- **`axl_volume_map_alias()`** (`<axl/axl-fs.h>`): resolve a device path's
+  current shell alias in ANY form (an `fsN` or a custom SetMap name), unlike
+  `axl_volume_map_name()` which returns only `fsN`. Returns `AXL_ERR` on an
+  over-long alias rather than a truncated one.
+- **`axl_volume_unmap()`** (`<axl/axl-fs.h>`): remove a shell map name (SetMap
+  with a NULL device path).
+- **`axl_ramdisk_find()`** (`<axl/axl-ramdisk.h>`): return a registered RAM
+  disk's device path by FAT label (the lookup `create`/`destroy` already did
+  internally, now exposed).
+
 ## 2.8.1 — 2026-07-06
 
 ### Fixed

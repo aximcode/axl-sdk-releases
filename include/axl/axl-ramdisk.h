@@ -134,6 +134,24 @@ axl_ramdisk_destroy(
 );
 
 /**
+ * @brief Find a registered RAM disk's device path by FAT label.
+ *
+ * Locates the RAM disk whose FAT label matches @p label (case-insensitive,
+ * trailing-padding-insensitive — the same match `axl_ramdisk_destroy` uses)
+ * and returns its firmware-owned device path. Useful to read a disk's current
+ * state (e.g. its shell alias via `axl_volume_map_alias`) before destroying it.
+ *
+ * @return AXL_OK with @p dev_path_out set (firmware-owned; do not free), or
+ *     AXL_ERR if no RAM disk with @p label exists or an argument is NULL. The
+ *     device path is valid until that disk is destroyed.
+ */
+int
+axl_ramdisk_find(
+    const char *label,         ///< FAT volume label to look up
+    void      **dev_path_out   ///< [out] firmware-owned device path (do not free)
+);
+
+/**
  * @brief List the registered RAM disks.
  *
  * Fills @p out with up to @p cap descriptors and writes the total to

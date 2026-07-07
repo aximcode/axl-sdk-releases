@@ -1629,6 +1629,47 @@ axl_backend_shell_map_name(
     return AXL_ERR;   /* no fs<n> alias maps to this device path */
 }
 
+int
+axl_backend_shell_map_alias(
+    void   *device_path,
+    char   *out,
+    size_t  out_size
+    )
+{
+    if (device_path == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->GetMapFromDevicePath == NULL) {
+        return AXL_UNSUPPORTED;
+    }
+
+    /* GetMapFromDevicePath advances the pointer; pass a local copy. */
+    EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)device_path;
+    const unsigned short *map = (const unsigned short *)
+        shell->GetMapFromDevicePath(&dp);
+    if (map == NULL) {
+        return AXL_ERR;
+    }
+
+    /* `map` is one or more ';'-separated aliases, e.g. "RAMDISK:;FS9:". Take
+       the FIRST token verbatim (minus the trailing ':') — any form, fs<n> or a
+       custom SetMap name. This is the "what is it mapped as" query, distinct
+       from map_name's fs<n>-only filter. */
+    const unsigned short *p = map;
+    size_t j = 0;
+    while (*p != 0 && *p != (unsigned short)';' && *p != (unsigned short)':') {
+        if (j + 1 >= out_size) {
+            return AXL_ERR;   /* alias longer than the buffer — don't return a
+                                 truncated, un-resolvable name as success */
+        }
+        out[j++] = (char)*p++;
+    }
+    out[j] = '\0';
+    return (j > 0) ? AXL_OK : AXL_ERR;
+}
+
 bool
 axl_backend_shell_map_exists(
     const unsigned short  *name
@@ -1662,6 +1703,24 @@ axl_backend_shell_set_map(
        ':'-terminated name; the caller supplies it. */
     EFI_STATUS st = shell->SetMap(
         (const EFI_DEVICE_PATH_PROTOCOL *)device_path, (const CHAR16 *)name);
+    return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
+}
+
+int
+axl_backend_shell_unmap(
+    const unsigned short  *name
+    )
+{
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL || shell->SetMap == NULL) {
+        return AXL_UNSUPPORTED;
+    }
+    if (name == NULL) {
+        return AXL_ERR;
+    }
+    /* SetMap with a NULL device path deletes the named mapping from the
+       shell's global map (UEFI Shell 2.2 EFI_SHELL_PROTOCOL.SetMap). */
+    EFI_STATUS st = shell->SetMap(NULL, (const CHAR16 *)name);
     return EFI_ERROR(st) ? AXL_ERR : AXL_OK;
 }
 

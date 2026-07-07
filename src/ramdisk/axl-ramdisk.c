@@ -174,6 +174,53 @@ labels_match(
     return axl_strcmp(ua, ub) == 0;
 }
 
+/* Find the firmware device path of a registered RAM disk by FAT @p label.
+   Returns AXL_OK and sets *dev_path_out (firmware-owned; do not free) on a
+   match, AXL_ERR otherwise. Shared by axl_ramdisk_create's idempotent lookup,
+   axl_ramdisk_find, and (via the latter) destroy-time alias cleanup. */
+static int
+find_ramdisk_dp(
+    const char *label,
+    void      **dev_path_out
+    )
+{
+    AxlVolume vols[RAMDISK_MAX_VOLUMES];
+    size_t    nvols = 0;
+    if (axl_volume_enumerate(vols, RAMDISK_MAX_VOLUMES, &nvols) != AXL_OK) {
+        return AXL_ERR;
+    }
+    for (size_t i = 0; i < nvols; i++) {
+        if (vols[i].device_path == NULL
+            || !is_ramdisk_dp(vols[i].device_path, NULL, NULL)) {
+            continue;
+        }
+        char *vol = axl_volume_get_label_by_handle(vols[i].handle);
+        if (vol == NULL) {
+            continue;
+        }
+        bool match = labels_match(label, vol);
+        axl_free(vol);
+        if (match) {
+            *dev_path_out = vols[i].device_path;
+            return AXL_OK;
+        }
+    }
+    return AXL_ERR;
+}
+
+int
+axl_ramdisk_find(
+    const char *label,
+    void      **dev_path_out
+    )
+{
+    if (label == NULL || dev_path_out == NULL) {
+        return AXL_ERR;
+    }
+    *dev_path_out = NULL;
+    return find_ramdisk_dp(label, dev_path_out);
+}
+
 // ---------------------------------------------------------------------------
 // FAT formatting (FAT16 for <=512 MB, FAT32 above)
 // ---------------------------------------------------------------------------
@@ -377,26 +424,12 @@ axl_ramdisk_create(
 
     /* Idempotent on the label: an existing RAM disk with this label
        wins, reporting its device path instead of allocating again. */
-    AxlVolume vols[RAMDISK_MAX_VOLUMES];
-    size_t    nvols = 0;
-    if (axl_volume_enumerate(vols, RAMDISK_MAX_VOLUMES, &nvols) == AXL_OK) {
-        for (size_t i = 0; i < nvols; i++) {
-            if (vols[i].device_path == NULL
-                || !is_ramdisk_dp(vols[i].device_path, NULL, NULL)) {
-                continue;
-            }
-            char *vol = axl_volume_get_label_by_handle(vols[i].handle);
-            if (vol != NULL) {
-                bool match = labels_match(label, vol);
-                axl_free(vol);
-                if (match) {
-                    if (dev_path_out != NULL) {
-                        *dev_path_out = vols[i].device_path;
-                    }
-                    return AXL_OK;
-                }
-            }
+    void *existing = NULL;
+    if (find_ramdisk_dp(label, &existing) == AXL_OK) {
+        if (dev_path_out != NULL) {
+            *dev_path_out = existing;
         }
+        return AXL_OK;
     }
 
     uint64_t disk_bytes = (uint64_t)size_mb * 1024 * 1024;
