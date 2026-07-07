@@ -243,6 +243,11 @@ axl_fopen(
 
 /**
  * @brief Close a stream and free resources. NULL-safe.
+ *
+ * If @p s has output buffering (axl_stream_set_buffering), any buffered
+ * bytes are flushed to the sink first, then the buffer is freed. A sink
+ * error during that final flush is not reported through this void return —
+ * call axl_fflush explicitly beforehand if you need to observe it.
  */
 void
 axl_fclose(
@@ -534,13 +539,214 @@ axl_feof(
 );
 
 /**
- * @brief Flush pending writes to the underlying file. NULL-safe.
+ * @brief Flush pending writes to the sink. NULL-safe.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * If @p s has output buffering (axl_stream_set_buffering), this drains the
+ * buffered bytes through the stream's write path — including any UTF-8 →
+ * UCS-2 transcode and tee — to the sink. Note a stream with a non-UTF-8
+ * encoding may still retain an *incomplete* trailing multi-byte unit in the
+ * transcoder until the completing bytes arrive; flush emits every complete
+ * unit but cannot invent the missing tail. It also invokes the underlying
+ * sink flush (e.g. a file backend's firmware cache flush) when present.
+ *
+ * @return AXL_OK on success, AXL_ERR on a sink write/flush error.
  */
 int
 axl_fflush(
     AxlStream *s  ///< stream
+);
+
+// ---------------------------------------------------------------------------
+// Output buffering (stdio setvbuf family)
+// ---------------------------------------------------------------------------
+
+/// Default buffer capacity used when axl_stream_set_buffering is given
+/// size 0 (and by axl_setlinebuf / axl_setbuf). Sized to hold a typical
+/// console line plus headroom without a per-line reallocation.
+#define AXL_STREAM_BUF_DEFAULT_SIZE  1024u
+
+/**
+ * @brief Output buffering mode for a stream — mirrors C stdio.
+ *
+ * Selects how axl_write / axl_print* / axl_fwrite coalesce writes before
+ * they reach the sink. This is an **output** policy only: as in C stdio,
+ * line buffering is defined for output, and AXL performs no input
+ * read-ahead, so the mode never affects reads.
+ */
+typedef enum {
+    AXL_STREAM_BUF_NONE = 0,  ///< unbuffered — every write goes straight to
+                              ///< the sink (stdio `_IONBF`). The AXL default.
+    AXL_STREAM_BUF_LINE,      ///< line-buffered — on each write, everything
+                              ///< through the last '\n' is flushed; a partial
+                              ///< trailing line is retained. If the buffer
+                              ///< fills before any '\n', the WHOLE buffer is
+                              ///< flushed (as stdio `_IOLBF` does) so writes
+                              ///< never stall for a newline that won't come.
+    AXL_STREAM_BUF_FULL,      ///< fully buffered — bytes are held until the
+                              ///< buffer fills, then flushed as a block
+                              ///< (stdio `_IOFBF`).
+} AxlStreamBuffering;
+
+/**
+ * @brief Set the output buffering mode for @p s.
+ *
+ * Controls how writes to @p s coalesce before hitting the sink. The buffer
+ * lives in axl_write, which axl_print / axl_printf / axl_fprintf and
+ * axl_fwrite all funnel through (the printf family formats into a scratch
+ * buffer then issues one axl_write), so every text-output entry point is
+ * coalesced uniformly. Buffering happens on the **raw byte stream before**
+ * any UTF-8 → UCS-2 transcode (axl_stream_set_encoding), so a UCS-2 console
+ * still coalesces correctly, and a tee (axl_stream_set_stdout_tee) sees the
+ * same bytes at flush time.
+ *
+ * **AXL streams are AXL_STREAM_BUF_NONE by default.** Unlike C stdio, AXL
+ * does NOT auto-select line/full buffering from tty-ness: a UEFI app can
+ * exit through a crt0 path that runs no atexit hook, so buffered output
+ * could be silently lost. Opt in explicitly, and **flush before you exit**
+ * — axl_fflush drains the buffer, and axl_fclose flushes then frees it.
+ * (Because axl_stdout / axl_stderr are process globals that are never
+ * fclosed, code that buffers them owns the final axl_fflush.)
+ *
+ * Under LINE / FULL a successful write returns the byte count **accepted
+ * into the buffer**, which does not mean the sink took them — a sink error
+ * surfaces at the later axl_fflush / axl_fclose and via axl_ferror, not at
+ * the buffered write. Do not treat a buffered write's return as durability.
+ *
+ * Switching mode first flushes any bytes already buffered under the old
+ * mode. A single write larger than the buffer first flushes any pending
+ * bytes (preserving order), then writes directly — buffering never
+ * truncates, splits, or reorders an over-size write.
+ *
+ * @param s     stream (NULL-safe — returns AXL_ERR).
+ * @param mode  one of AxlStreamBuffering.
+ * @param size  buffer capacity in bytes for LINE / FULL; 0 selects
+ *              AXL_STREAM_BUF_DEFAULT_SIZE. Ignored for NONE.
+ * @return AXL_OK on success; AXL_ERR on a NULL stream, a stream with no
+ *     write side, or an allocation failure (on alloc failure the stream
+ *     is left unbuffered — writes still go through, just uncoalesced).
+ */
+int
+axl_stream_set_buffering(
+    AxlStream          *s,     ///< stream to configure
+    AxlStreamBuffering  mode,  ///< buffering mode
+    size_t              size   ///< buffer size (0 = default; ignored for NONE)
+);
+
+/**
+ * @brief Current output buffering mode of @p s.
+ *
+ * @return the mode set by axl_stream_set_buffering, or AXL_STREAM_BUF_NONE
+ *     for an unconfigured or NULL stream.
+ */
+AxlStreamBuffering
+axl_stream_get_buffering(
+    AxlStream *s  ///< stream (NULL-safe)
+);
+
+/**
+ * @brief stdio `setvbuf()` shim over AxlStream.
+ *
+ * Thin wrapper over axl_stream_set_buffering for muscle memory. Like C
+ * `setvbuf` you would normally call it **before the first write**, though
+ * the underlying axl_stream_set_buffering also supports a mid-stream switch
+ * (it flushes the old buffer first).
+ *
+ * **The @p buf argument is ignored — pass NULL.** AXL always owns the
+ * buffer: a caller-supplied buffer whose lifetime must outlive the stream
+ * is a use-after-free hazard in RAII / UEFI code, so the borrow-a-buffer
+ * half of the C API is deliberately not honored (a debug build asserts
+ * @p buf is NULL to catch a mistaken hand-off). @p mode is the AXL enum,
+ * not the C `_IOFBF` / `_IOLBF` / `_IONBF` macros.
+ *
+ * @return AXL_OK on success, AXL_ERR on failure (see
+ *     axl_stream_set_buffering).
+ */
+int
+axl_setvbuf(
+    AxlStream          *s,     ///< stream
+    char               *buf,   ///< IGNORED — pass NULL (AXL owns the buffer)
+    AxlStreamBuffering  mode,  ///< buffering mode (AXL enum)
+    size_t              size   ///< buffer size (0 = default)
+);
+
+/**
+ * @brief stdio `setlinebuf()` shim — line-buffer @p s with a default-size
+ *     buffer. Equivalent to axl_stream_set_buffering(s, AXL_STREAM_BUF_LINE, 0).
+ *     Void like C: on allocation failure the stream is left unbuffered.
+ */
+void
+axl_setlinebuf(
+    AxlStream *s  ///< stream (NULL-safe)
+);
+
+/**
+ * @brief stdio `setbuf()` shim.
+ *
+ * Matches C `setbuf`'s `buf ? _IOFBF : _IONBF` selection: a non-NULL
+ * @p buf requests full buffering (default size), NULL requests
+ * unbuffered. **The @p buf pointer itself is ignored** (AXL owns the
+ * buffer) — only NULL-vs-non-NULL is consulted. Void like C: on
+ * allocation failure the stream is left unbuffered.
+ */
+void
+axl_setbuf(
+    AxlStream *s,   ///< stream (NULL-safe)
+    char      *buf  ///< NULL = unbuffered; non-NULL = full-buffered (ptr ignored)
+);
+
+// ---------------------------------------------------------------------------
+// Interactive / no-EOF source marking (line-discipline layer)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Mark @p s as an interactive / no-EOF source (or clear the mark).
+ *
+ * Interactive sources — a live console, an interactive socket REPL —
+ * deliver input one line at a time and never signal EOF while the peer is
+ * connected. Any code that reads them must treat a short read as a
+ * COMPLETE result and must not loop to fill a buffer, or it blocks forever
+ * waiting for bytes the user has not typed yet.
+ *
+ * The one place in AXL that would otherwise over-read such a source is
+ * axl_text_stream_wrap's construction-time encoding sniff (it reads a
+ * probe window to detect a BOM / headerless UCS-2). When the wrapped
+ * source is flagged interactive, that sniff is **skipped entirely** —
+ * interactive input is already UTF-8 and line-cooked, so there is no BOM
+ * or UCS-2 to classify — and the wrapper becomes a plain passthrough that
+ * returns one line per read.
+ *
+ * This is the **line-discipline** axis (C's `termios`/ICANON layer), which
+ * is orthogonal to buffering (axl_stream_set_buffering, C's `setvbuf`):
+ * one governs whether reads over-consume, the other how writes coalesce.
+ *
+ * `axl_stdin` reports interactivity **dynamically** via
+ * axl_stdin_is_interactive() (per console handle) and does not need this
+ * flag set — axl_text_stream_wrap consults that predicate for it. Set this
+ * on a caller-owned no-EOF byte stream you intend to wrap as text.
+ *
+ * The text wrapper returned by axl_text_stream_wrap **inherits** the source's
+ * effective interactive mark, so testing the wrapper (or wrapping it again)
+ * reports interactive too — not just the original source handle.
+ */
+void
+axl_stream_set_interactive(
+    AxlStream *s,           ///< stream to mark (NULL-safe no-op)
+    bool       interactive  ///< true = interactive/no-EOF; false = normal
+);
+
+/**
+ * @brief Whether @p s carries the interactive / no-EOF mark.
+ *
+ * Reflects the last axl_stream_set_interactive on @p s. This is the
+ * per-stream FLAG only; it does **not** consult axl_stdin_is_interactive()
+ * for the stdin console (that verdict is dynamic and handle-specific — use
+ * axl_stdin_is_interactive() directly for stdin).
+ *
+ * @return true if flagged interactive; false otherwise (including NULL).
+ */
+bool
+axl_stream_get_interactive(
+    AxlStream *s  ///< stream (NULL-safe)
 );
 
 // ---------------------------------------------------------------------------
@@ -720,6 +926,16 @@ axl_clearerr(
  * `axl_print` (UCS-2 after console conversion), or a binary tool
  * that wrote raw UTF-8 (passthrough).
  *
+ * **Interactive sources are short-circuited.** When @p src is an
+ * interactive / no-EOF source — `axl_stdin` on an interactive console
+ * (axl_stdin_is_interactive()), or any stream flagged via
+ * axl_stream_set_interactive() — the input is already UTF-8, line-cooked,
+ * and never returns EOF, so there is no BOM or UCS-2 to detect. The
+ * classifier probe is skipped entirely and the wrapper is a plain
+ * passthrough returning one line per read. (Probing it would block until
+ * a full probe window's worth of bytes arrived — a hang at the console.)
+ * Redirected / piped stdin is not interactive and is classified normally.
+ *
  * The wrapper does **not** take ownership of @p src — the caller is
  * responsible for closing both eventually.
  *
@@ -766,10 +982,14 @@ axl_text_stream_wrap(
  * not hold one across launcher invocations (a stale wrapper would
  * replay a previous invocation's buffered input).
  *
- * **Construction reads stdin eagerly** to classify the encoding, so on
- * an interactive stdin this call blocks until the user enters the first
- * line (Enter) — the same as reading `axl_stdin` directly. Create it at
- * the point you are ready to read, not speculatively.
+ * **Construction classifies the source encoding.** For redirected or
+ * piped stdin (`<`, `|`) it eager-reads a probe to detect a BOM or
+ * headerless UCS-2, so construction blocks until that input arrives.
+ * For **interactive** stdin there is nothing to classify (already
+ * UTF-8, no BOM, and the console never signals EOF), so NO eager read
+ * happens: construction returns immediately and the *first* read blocks
+ * until the user enters one line (Enter), then returns that line. Either
+ * way, create it at the point you are ready to read, not speculatively.
  *
  * @return a text-decoding read stream over stdin (free with axl_fclose),
  *     or NULL on allocation failure. (axl_text_stream_wrap also returns

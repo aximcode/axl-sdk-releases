@@ -1935,6 +1935,200 @@ test_detect_encoding(void)
 }
 
 // ---------------------------------------------------------------------------
+// Output buffering (axl_stream_set_buffering + setvbuf family)
+// ---------------------------------------------------------------------------
+
+static void
+test_stream_buffering(void)
+{
+    AxlStream  *s;
+    const void *data;
+    size_t      size;
+
+    /* Default is NONE — unchanged passthrough. */
+    s = axl_bufopen();
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_NONE,
+               "buffering: default mode is NONE");
+    axl_write(s, "ab", 2);
+    axl_bufdata(s, &size);
+    test_check(size == 2, "buffering: NONE writes through immediately");
+    axl_fclose(s);
+
+    /* LINE: held until '\n', flushed through the last '\n', partial retained. */
+    s = axl_bufopen();
+    test_check(axl_stream_set_buffering(s, AXL_STREAM_BUF_LINE, 64) == AXL_OK,
+               "buffering: set LINE returns AXL_OK");
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_LINE,
+               "buffering: get reflects LINE");
+    axl_write(s, "ab", 2);
+    axl_bufdata(s, &size);
+    test_check(size == 0, "buffering: LINE holds bytes with no newline");
+    axl_write(s, "c\nde", 4);
+    data = axl_bufdata(s, &size);
+    test_check(size == 4 && test_memcmp(data, "abc\n", 4) == 0,
+               "buffering: LINE flushes through last newline, retains partial");
+    axl_fflush(s);
+    data = axl_bufdata(s, &size);
+    test_check(size == 6 && test_memcmp(data, "abc\nde", 6) == 0,
+               "buffering: fflush drains the retained partial line");
+    axl_fclose(s);
+
+    /* LINE: buffer fills with no '\n' -> whole buffer flushed (no stall). */
+    s = axl_bufopen();
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_LINE, 4);
+    axl_write(s, "abcd", 4);
+    data = axl_bufdata(s, &size);
+    test_check(size == 4 && test_memcmp(data, "abcd", 4) == 0,
+               "buffering: LINE full buffer flushes without a newline");
+    axl_fclose(s);
+
+    /* FULL: held until full, then flushed as a block. */
+    s = axl_bufopen();
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 4);
+    axl_write(s, "ab", 2);
+    axl_bufdata(s, &size);
+    test_check(size == 0, "buffering: FULL holds until full");
+    axl_write(s, "cd", 2);
+    data = axl_bufdata(s, &size);
+    test_check(size == 4 && test_memcmp(data, "abcd", 4) == 0,
+               "buffering: FULL flushes a full block");
+    axl_fclose(s);
+
+    /* Over-size write flushes pending first (order preserved), then direct. */
+    s = axl_bufopen();
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 4);
+    axl_write(s, "xy", 2);
+    axl_write(s, "ABCDEFGH", 8);
+    data = axl_bufdata(s, &size);
+    test_check(size == 10 && test_memcmp(data, "xyABCDEFGH", 10) == 0,
+               "buffering: oversize write flushes pending then writes in order");
+    axl_fclose(s);
+
+    /* Mode switch flushes the old buffer. */
+    s = axl_bufopen();
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 64);
+    axl_write(s, "held", 4);
+    axl_bufdata(s, &size);
+    test_check(size == 0, "buffering: bytes pending under FULL");
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_NONE, 0);
+    data = axl_bufdata(s, &size);
+    test_check(size == 4 && test_memcmp(data, "held", 4) == 0,
+               "buffering: mode switch flushes the old buffer");
+    axl_fclose(s);
+
+    /* The axl_print* path is coalesced too — the buffer lives in axl_write. */
+    s = axl_bufopen();
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_LINE, 64);
+    axl_fprintf(s, "no newline yet");
+    axl_bufdata(s, &size);
+    test_check(size == 0, "buffering: axl_fprintf output held by LINE buffering");
+    axl_fprintf(s, " done\n");
+    data = axl_bufdata(s, &size);
+    test_check(size == 20 && test_memcmp(data, "no newline yet done\n", 20) == 0,
+               "buffering: axl_fprintf flushes on newline");
+    axl_fclose(s);
+
+    /* setvbuf / setlinebuf / setbuf shims. */
+    s = axl_bufopen();
+    test_check(axl_setvbuf(s, NULL, AXL_STREAM_BUF_FULL, 8) == AXL_OK,
+               "buffering: axl_setvbuf returns AXL_OK");
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_FULL,
+               "buffering: axl_setvbuf sets FULL");
+    axl_fclose(s);
+
+    s = axl_bufopen();
+    axl_setlinebuf(s);
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_LINE,
+               "buffering: axl_setlinebuf sets LINE");
+    axl_fclose(s);
+
+    s = axl_bufopen();
+    axl_setbuf(s, (char *)"ignored");
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_FULL,
+               "buffering: axl_setbuf(non-NULL) sets FULL");
+    axl_setbuf(s, NULL);
+    test_check(axl_stream_get_buffering(s) == AXL_STREAM_BUF_NONE,
+               "buffering: axl_setbuf(NULL) sets NONE");
+    axl_fclose(s);
+}
+
+static void
+test_stream_buffering_fclose_flush(void)
+{
+    /* fclose must flush buffered bytes even with no explicit axl_fflush. */
+    AxlStream *s = axl_fopen("fs0:\\axl_test_buf.tmp", "w");
+    test_check(s != NULL, "buffering: fopen w for fclose-flush");
+    if (s == NULL) {
+        return;
+    }
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 64);
+    axl_write(s, "buffered-tail", 13);
+    axl_fclose(s);   /* no explicit flush — close must drain */
+
+    s = axl_fopen("fs0:\\axl_test_buf.tmp", "r");
+    test_check(s != NULL, "buffering: reopen for fclose-flush verify");
+    char        buf[32];
+    axl_ssize_t n = (s != NULL) ? axl_read(s, buf, sizeof buf) : -1;
+    test_check(n == 13 && test_memcmp(buf, "buffered-tail", 13) == 0,
+               "buffering: fclose flushes buffered bytes to the sink");
+    axl_fclose(s);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive / no-EOF source marking (generalized text-wrap short-circuit)
+// ---------------------------------------------------------------------------
+
+static void
+test_stream_interactive_flag(void)
+{
+    /* set/get round-trip. */
+    AxlStream *s = axl_bufopen();
+    test_check(axl_stream_get_interactive(s) == false,
+               "interactive: default flag is false");
+    axl_stream_set_interactive(s, true);
+    test_check(axl_stream_get_interactive(s) == true,
+               "interactive: flag set true");
+    axl_stream_set_interactive(s, false);
+    test_check(axl_stream_get_interactive(s) == false,
+               "interactive: flag cleared");
+    axl_fclose(s);
+
+    /* 16 bytes of headerless UCS-2 LE ("hello!!!"): the wrap classifier
+       auto-detects and decodes this to UTF-8 — UNLESS the source is flagged
+       interactive, in which case the sniff is skipped and bytes pass raw. */
+    static const uint8_t ucs2le[16] = {
+        'h', 0, 'e', 0, 'l', 0, 'l', 0,
+        'o', 0, '!', 0, '!', 0, '!', 0,
+    };
+    char        rd[32];
+    axl_ssize_t n;
+
+    /* (1) Unflagged -> classified as UCS-2 LE -> decoded to "hello!!!". */
+    AxlStream *src = axl_bufopen();
+    axl_write(src, ucs2le, sizeof ucs2le);
+    AxlStream *txt = axl_text_stream_wrap(src);
+    n = axl_read(txt, rd, sizeof rd);
+    test_check(n == 8 && test_memcmp(rd, "hello!!!", 8) == 0,
+               "interactive: unflagged source is UCS-2-classified and decoded");
+    axl_fclose(txt);
+    axl_fclose(src);
+
+    /* (2) Flagged interactive -> sniff skipped -> raw passthrough (NULs kept). */
+    src = axl_bufopen();
+    axl_write(src, ucs2le, sizeof ucs2le);
+    axl_stream_set_interactive(src, true);
+    txt = axl_text_stream_wrap(src);
+    test_check(axl_stream_get_interactive(txt) == true,
+               "interactive: text wrapper inherits the source's interactive mark");
+    n = axl_read(txt, rd, sizeof rd);
+    test_check(n == (axl_ssize_t)sizeof ucs2le
+               && test_memcmp(rd, ucs2le, sizeof ucs2le) == 0,
+               "interactive: flagged source skips classification (raw passthrough)");
+    axl_fclose(txt);
+    axl_fclose(src);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1979,6 +2173,9 @@ test_io_main(int argc, char **argv)
     test_fgets();
     test_vfprintf();
     test_ferror_clearerr();
+    test_stream_buffering();
+    test_stream_buffering_fclose_flush();
+    test_stream_interactive_flag();
 
     return test_print_results();
 }

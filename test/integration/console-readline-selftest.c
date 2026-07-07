@@ -12,11 +12,15 @@
  *   5. axl_console_readline_ex(echo=0)→ "PASS4=[...]"   (hidden entry)
  *   6. axl_readline(axl_stdin)        → "FALLBACK=[...]" (transparent
  *                                        console line-editing fallback)
- *   7. Print "READLINE-DONE".
+ *   7. axl_readline(axl_stdin_text()) → "TEXTWRAP=[...]" (text-decoding view
+ *                                        of the console returns on ONE line)
+ *   8. Print "READLINE-DONE".
  *
- * Each interactive step uses a finite whole-line deadline so a mis-fed
- * key can never wedge the run indefinitely (the outer QEMU timeout is the
- * final backstop); on -1 it prints "LINEn=<TIMEOUT>" and continues.
+ * The axl_console_readline steps (LINE1-3, PASS4) use a finite whole-line
+ * deadline so a mis-fed key can never wedge the run indefinitely; on -1
+ * they print "LINEn=<TIMEOUT>" and continue. The axl_readline steps
+ * (FALLBACK, TEXTWRAP) read the cooked console with no per-line deadline,
+ * so for those the outer QEMU timeout is the only backstop.
  *
  * Run via test/integration/test-console-readline-qemu.sh.
  */
@@ -77,6 +81,29 @@ main(
         }
         axl_printf("FALLBACK=[%s]\n", fb);
         axl_free(fb);
+    }
+
+    /* Regression (v2.8.1): a text-decoding view of an interactive console
+       must return on ONE line. axl_stdin_text() = axl_text_stream_wrap(axl_stdin);
+       before the fix the wrapper's construction ran a fill-to-PROBE_SIZE (64B)
+       encoding sniff that — because the interactive console never returns EOF —
+       swallowed line after line and never returned for a short answer. Feed ONE
+       short line (< 64 bytes) and require the read to hand it back on a single
+       Enter. Flooding >= 64 bytes would MASK the bug, so the harness feeds one. */
+    AxlStream *tw = axl_stdin_text();
+    char      *tl = (tw != NULL) ? axl_readline(tw) : NULL;
+    if (tl == NULL) {
+        axl_print("TEXTWRAP=<EOF>\n");
+    } else {
+        size_t n = axl_strlen(tl);
+        if (n > 0 && tl[n - 1] == '\n') {
+            tl[n - 1] = '\0';
+        }
+        axl_printf("TEXTWRAP=[%s]\n", tl);
+        axl_free(tl);
+    }
+    if (tw != NULL) {
+        axl_fclose(tw);
     }
 
     /* Also confirm the predicate reports interactive on this console. */

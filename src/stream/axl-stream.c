@@ -14,6 +14,7 @@
 #include <axl/axl-stream.h>
 #include <axl/axl-console.h>   /* axl_console_readline (interactive stdin fallback) */
 #include <axl/axl-fs.h>
+#include <axl/axl-debug.h>   /* AXL_DEBUG_ASSERT (axl_setvbuf buf==NULL guard) */
 #include "axl-stream-internal.h"
 #include <axl/axl-format.h>
 #include <axl/axl-log.h>
@@ -845,17 +846,17 @@ axl_read(AxlStream *s, void *buf, size_t count)
     return n;
 }
 
-axl_ssize_t
-axl_write(AxlStream *s, const void *buf, size_t count)
+/* Write @p count bytes straight to the sink NOW — the un-buffered path.
+   Handles the caller-UTF-8 → wire-encoding transcode and the optional tee.
+   Returns the primary write's byte count, or -1 on primary error (tee
+   errors are swallowed — a broken log must not break console output). This
+   is the common sink for both direct writes and buffer flushes, so a
+   buffered stream transcodes and tees exactly as an unbuffered one does. */
+static axl_ssize_t
+stream_write_now(AxlStream *s, const void *buf, size_t count)
 {
     axl_ssize_t n;
 
-    if (s == NULL || s->write == NULL) {
-        return -1;
-    }
-    if (count == 0) {
-        return 0;
-    }
     if (s->encoding != AXL_ENC_UTF8) {
         n = write_transcode(s, buf, count);
     } else {
@@ -886,6 +887,127 @@ axl_write(AxlStream *s, const void *buf, size_t count)
         }
     }
     return n;
+}
+
+/* Flush the first @p k buffered bytes to the sink and retain the rest at
+   the front of wbuf. k==0 is a no-op. Returns AXL_OK / AXL_ERR.
+
+   The sink may accept fewer bytes than offered (a partial write — a file
+   backend on a near-full volume, or a transcode that failed part-way), so
+   this loops until all k bytes are written or the sink stops making
+   progress. On a stall it retains exactly the not-yet-written bytes at the
+   front of the buffer and returns AXL_ERR, so no byte is ever silently
+   dropped (unbuffered writes surface a short count to the caller; a
+   buffered flush must not lose the tail instead). */
+static int
+stream_flush_prefix(AxlStream *s, size_t k)
+{
+    size_t written = 0;
+    while (written < k) {
+        axl_ssize_t n = stream_write_now(s, s->wbuf + written, k - written);
+        if (n <= 0) {
+            /* No progress: retain everything from `written` on and fail.
+               stream_write_now already set s->err on a negative return. */
+            size_t rem = s->wbuf_len - written;
+            if (written > 0 && rem > 0) {
+                axl_memmove(s->wbuf, s->wbuf + written, rem);
+            }
+            s->wbuf_len = rem;
+            return AXL_ERR;
+        }
+        written += (size_t)n;
+    }
+    size_t rem = s->wbuf_len - k;
+    if (rem > 0) {
+        axl_memmove(s->wbuf, s->wbuf + k, rem);
+    }
+    s->wbuf_len = rem;
+    return AXL_OK;
+}
+
+/* Drain the whole pending buffer. */
+static int
+stream_flush_all(AxlStream *s)
+{
+    return stream_flush_prefix(s, s->wbuf_len);
+}
+
+/* Flush pending buffered output if there is any — a no-op for an
+   unbuffered or empty stream. Shared by axl_fflush / axl_fclose /
+   axl_stream_set_buffering so the "drain what the old mode holds" check
+   lives in one place. */
+static int
+stream_drain(AxlStream *s)
+{
+    if (s->buf_mode != AXL_STREAM_BUF_NONE && s->wbuf_len > 0) {
+        return stream_flush_all(s);
+    }
+    return AXL_OK;
+}
+
+/* Buffered write path (LINE / FULL). Appends to wbuf and flushes per the
+   mode's policy. Returns @p count (bytes accepted) or -1 on a flush error. */
+static axl_ssize_t
+stream_write_buffered(AxlStream *s, const void *buf, size_t count)
+{
+    /* A write at least as large as the buffer can't be coalesced: flush
+       what's pending (preserving order), then write it straight through. */
+    if (count >= s->wbuf_cap) {
+        if (stream_flush_all(s) != AXL_OK) {
+            return -1;
+        }
+        return stream_write_now(s, buf, count);
+    }
+    /* Make room if it won't fit alongside what's already pending. */
+    if (s->wbuf_len + count > s->wbuf_cap) {
+        if (stream_flush_all(s) != AXL_OK) {
+            return -1;
+        }
+    }
+    axl_memcpy(s->wbuf + s->wbuf_len, buf, count);
+    s->wbuf_len += count;
+
+    if (s->buf_mode == AXL_STREAM_BUF_LINE) {
+        /* Flush through the last '\n'; keep any partial trailing line. */
+        size_t through = 0;
+        for (size_t i = s->wbuf_len; i > 0; i--) {
+            if (s->wbuf[i - 1] == '\n') {
+                through = i;
+                break;
+            }
+        }
+        if (through > 0) {
+            if (stream_flush_prefix(s, through) != AXL_OK) {
+                return -1;
+            }
+        } else if (s->wbuf_len == s->wbuf_cap) {
+            /* Buffer full with no newline — flush it all so a newline that
+               never comes can't wedge the stream (matches stdio _IOLBF). */
+            if (stream_flush_all(s) != AXL_OK) {
+                return -1;
+            }
+        }
+    } else if (s->wbuf_len == s->wbuf_cap) {   /* FULL: flush a full block */
+        if (stream_flush_all(s) != AXL_OK) {
+            return -1;
+        }
+    }
+    return (axl_ssize_t)count;
+}
+
+axl_ssize_t
+axl_write(AxlStream *s, const void *buf, size_t count)
+{
+    if (s == NULL || s->write == NULL) {
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (s->buf_mode == AXL_STREAM_BUF_NONE) {
+        return stream_write_now(s, buf, count);
+    }
+    return stream_write_buffered(s, buf, count);
 }
 
 axl_ssize_t
@@ -948,6 +1070,11 @@ axl_fclose(AxlStream *s)
     if (s == NULL) {
         return;
     }
+    /* Drain buffered output before teardown, then free the buffer. A sink
+       error here can't be reported through this void return — a caller that
+       needs to observe it flushes explicitly first (see axl_fclose docs). */
+    (void)stream_drain(s);
+    axl_free(s->wbuf);
     if (s->close != NULL) {
         s->close(s->ctx);
     }
@@ -1264,10 +1391,108 @@ axl_fflush(AxlStream *s)
     if (s == NULL) {
         return AXL_OK;
     }
+    /* Drain any buffered output through the transcode/tee path first. */
+    if (stream_drain(s) != AXL_OK) {
+        return AXL_ERR;
+    }
     if (s->flush == NULL) {
         return AXL_OK;
     }
     return s->flush(s->ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Output buffering (axl_stream_set_buffering + setvbuf family)
+// ---------------------------------------------------------------------------
+
+int
+axl_stream_set_buffering(AxlStream *s, AxlStreamBuffering mode, size_t size)
+{
+    if (s == NULL || s->write == NULL) {
+        return AXL_ERR;
+    }
+    /* Flush anything pending under the old mode before switching. */
+    if (stream_drain(s) != AXL_OK) {
+        return AXL_ERR;
+    }
+    if (mode == AXL_STREAM_BUF_NONE) {
+        axl_free(s->wbuf);
+        s->wbuf     = NULL;
+        s->wbuf_cap = 0;
+        s->wbuf_len = 0;
+        s->buf_mode = AXL_STREAM_BUF_NONE;
+        return AXL_OK;
+    }
+    size_t cap = (size == 0) ? AXL_STREAM_BUF_DEFAULT_SIZE : size;
+    if (s->wbuf == NULL || s->wbuf_cap != cap) {
+        /* wbuf_len is 0 here (just flushed), so a realloc's copy is moot. */
+        uint8_t *nb = axl_realloc(s->wbuf, cap);
+        if (nb == NULL) {
+            /* Alloc failure: leave the stream unbuffered rather than half
+               configured — writes still go through, just uncoalesced. */
+            axl_free(s->wbuf);
+            s->wbuf     = NULL;
+            s->wbuf_cap = 0;
+            s->wbuf_len = 0;
+            s->buf_mode = AXL_STREAM_BUF_NONE;
+            return AXL_ERR;
+        }
+        s->wbuf     = nb;
+        s->wbuf_cap = cap;
+    }
+    s->wbuf_len = 0;
+    s->buf_mode = mode;
+    return AXL_OK;
+}
+
+AxlStreamBuffering
+axl_stream_get_buffering(AxlStream *s)
+{
+    return (s != NULL) ? s->buf_mode : AXL_STREAM_BUF_NONE;
+}
+
+int
+axl_setvbuf(AxlStream *s, char *buf, AxlStreamBuffering mode, size_t size)
+{
+    /* AXL always owns the buffer — a borrowed buffer that must outlive the
+       stream is a UAF hazard in RAII/UEFI code. Catch a mistaken hand-off
+       in debug builds; the pointer is ignored regardless. */
+    AXL_DEBUG_ASSERT(buf == NULL);
+    (void)buf;
+    return axl_stream_set_buffering(s, mode, size);
+}
+
+void
+axl_setlinebuf(AxlStream *s)
+{
+    (void)axl_stream_set_buffering(s, AXL_STREAM_BUF_LINE, 0);
+}
+
+void
+axl_setbuf(AxlStream *s, char *buf)
+{
+    /* Match C setbuf: non-NULL buf ⇒ full buffering, NULL ⇒ unbuffered.
+       The pointer itself is ignored (AXL owns the buffer). */
+    (void)axl_stream_set_buffering(
+        s, buf != NULL ? AXL_STREAM_BUF_FULL : AXL_STREAM_BUF_NONE, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive / no-EOF source marking
+// ---------------------------------------------------------------------------
+
+void
+axl_stream_set_interactive(AxlStream *s, bool interactive)
+{
+    if (s != NULL) {
+        s->interactive = interactive;
+    }
+}
+
+bool
+axl_stream_get_interactive(AxlStream *s)
+{
+    return (s != NULL) && s->interactive;
 }
 
 // ---------------------------------------------------------------------------

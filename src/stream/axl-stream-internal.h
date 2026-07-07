@@ -42,6 +42,21 @@ struct AxlStream {
        instead of recursing. Typical use: `-o:<file>` log option
        on a tool wired via axl_stream_set_stdout_tee. */
     AxlStream   *tee;
+    /* Output buffering (axl_stream_set_buffering / setvbuf family).
+       buf_mode defaults to AXL_STREAM_BUF_NONE (0), so an unconfigured
+       stream is unbuffered and writes pass straight through. wbuf is
+       lazily allocated when LINE/FULL is selected and freed on close /
+       switch back to NONE. wbuf_len bytes of raw (pre-transcode) output
+       are held pending a flush. */
+    AxlStreamBuffering  buf_mode;
+    uint8_t            *wbuf;
+    size_t              wbuf_cap;
+    size_t              wbuf_len;
+    /* Interactive / no-EOF source hint (axl_stream_set_interactive) —
+       when set, axl_text_stream_wrap skips its classify-time read-ahead
+       so an interactive source is never over-read. See the
+       line-discipline note in axl-stream.h. */
+    bool                interactive;
 };
 
 /* Allocate a stream with the default field initializers. Used by

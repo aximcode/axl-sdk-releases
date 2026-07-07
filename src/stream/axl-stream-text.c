@@ -24,6 +24,13 @@
       3. **Otherwise** → encoding stays UTF-8 (passthrough); probe
          bytes are pushed back so the caller sees them on next read.
 
+    **Interactive-stdin short-circuit:** when @p src is `axl_stdin` on an
+    interactive console (`axl_stdin_is_interactive`), classification is
+    skipped — the input is already UTF-8, line-cooked, and never returns
+    EOF, so eager-probing it would block until PROBE_SIZE bytes were
+    typed. The wrapper degrades to a UTF-8 passthrough that returns one
+    line per read. Redirected / piped stdin is classified normally.
+
     The headerless sniff is intentionally strict: it requires ALL
     high-byte positions to be NUL within the probe window. UTF-8 ASCII
     text never contains NULs, so the sniff cannot mis-classify normal
@@ -151,6 +158,26 @@ axl_text_stream_wrap(AxlStream *src)
     s->ctx   = c;
     s->read  = text_stream_read;
     s->close = text_stream_close;
+
+    /* Interactive / no-EOF sources are already UTF-8 and line-cooked: there
+       is no BOM and no headerless UCS-2 to classify, and — critically — they
+       never return EOF, so the fill-to-PROBE_SIZE sniff below would swallow
+       line after line and block until PROBE_SIZE bytes arrived (a hang at the
+       console). Skip the sniff entirely and return a UTF-8 passthrough that
+       reads one line per call straight from src (pushback is empty, so
+       text_stream_read just forwards); the wrapper inherits the interactive
+       mark so callers testing it (or wrapping it again) see the same. A source
+       is interactive if it is axl_stdin on an interactive console (a dynamic,
+       per-handle verdict) OR carries the axl_stream_set_interactive flag.
+       Redirected / piped stdin is NOT interactive — it reaches EOF, so the
+       sniff loop terminates and BOM / UCS-2 detection still runs for those.
+       (axl_stdin_is_interactive is only evaluated when src is axl_stdin, so a
+       NULL axl_stdin — pre-axl_stream_init — can't reach it.) */
+    if ((src == axl_stdin && axl_stdin_is_interactive())
+            || axl_stream_get_interactive(src)) {
+        axl_stream_set_interactive(s, true);
+        return s;
+    }
 
     /* Eager classification — read up to PROBE_SIZE bytes from src
        directly (the wrapper's read isn't wired through axl_read yet,

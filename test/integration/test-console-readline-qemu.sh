@@ -19,6 +19,8 @@
 #                                only in the result line, never echoed)
 #   feed "world\r"            -> FALLBACK=[world]     (axl_readline(axl_stdin)
 #                                line-cooked the interactive console)
+#   feed "hi\r"              -> TEXTWRAP=[hi]        (axl_stdin_text() returns on
+#                                ONE short line — the v2.8.1 over-read fix)
 #   plus                        INTERACTIVE=true
 #
 # The exact-match assertions inherently prove the bug is gone: a leading
@@ -159,12 +161,16 @@ feed_line 'ab\bc\r'   'LINE2='
 feed_line '\r'        'LINE3='
 feed_line 's3cret\r'  'PASS4='
 feed_line 'world\r'   'FALLBACK='
+# ONE short line (< PROBE_SIZE=64): axl_stdin_text() must return it on a single
+# Enter. Before the v2.8.1 fix the wrapper's eager sniff swallowed lines and this
+# marker never appeared (feeding >= 64 bytes would have masked the regression).
+feed_line 'hi\r'      'TEXTWRAP='
 
 wait_for "READLINE-DONE" 40 || { echo "ERROR: READLINE-DONE never appeared"; sed -n '1,120p' "$LOG"; exit 1; }
 
 echo ""
 echo "=== observed marker lines ==="
-grep -aE "READLINE-READY|LINE[0-9]=|PASS4=|FALLBACK=|INTERACTIVE=|READLINE-DONE" "$LOG" || true
+grep -aE "READLINE-READY|LINE[0-9]=|PASS4=|FALLBACK=|TEXTWRAP=|INTERACTIVE=|READLINE-DONE" "$LOG" || true
 echo ""
 
 fail=0
@@ -183,6 +189,7 @@ assert_line "LINE2=[ac]"
 assert_line "LINE3=[]"
 assert_line "PASS4=[s3cret]"
 assert_line "FALLBACK=[world]"
+assert_line "TEXTWRAP=[hi]"
 assert_line "INTERACTIVE=true"
 
 # Password must NOT have been echoed: the literal appears exactly once in

@@ -3,6 +3,39 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.1 — 2026-07-06
+
+### Fixed
+
+- **`axl_text_stream_wrap` / `axl_stdin_text()` hung on interactive stdin.**
+  The wrapper's construction-time encoding sniff looped `src->read` to fill a
+  64-byte probe (or reach EOF); the v2.8.0 interactive `axl_stdin` line-cooks
+  and never returns EOF at a console, so the sniff swallowed line after line
+  and never returned for a short typed answer (an interactive `do -f` read hung
+  after the first Enter). The wrapper now skips the sniff for an interactive
+  source and returns a UTF-8 passthrough; redirected / piped stdin still
+  classifies BOM / UCS-2 as before. Regression-tested end-to-end over a serial
+  console (feeds one short line, asserts it returns on a single Enter).
+
+### Added
+
+- **Output buffering (stdio `setvbuf` family).** `axl_stream_set_buffering()`
+  with `AxlStreamBuffering { NONE, LINE, FULL }`, plus C-compatible shims
+  `axl_setvbuf()` / `axl_setlinebuf()` / `axl_setbuf()` and
+  `axl_stream_get_buffering()`. Coalesces writes in `axl_write` (which the
+  `axl_print*` / `axl_fwrite` family all funnel through), ahead of any
+  UTF-8 → UCS-2 transcode and tee. Default stays `NONE` (unbuffered, unchanged
+  behavior): unlike C stdio, AXL does not auto-select buffering from tty-ness,
+  because a UEFI crt0 exit path may run no atexit hook — buffering is opt-in and
+  the caller owns the final `axl_fflush` (`axl_fclose` flushes then frees). See
+  `docs/AXL-Stream-Buffering-Design.md`.
+- **Interactive / no-EOF source marking.** `axl_stream_set_interactive()` /
+  `axl_stream_get_interactive()` — the line-discipline axis, orthogonal to
+  buffering. Marks a stream as line-cooked and never-EOF so
+  `axl_text_stream_wrap` skips its classify read-ahead for it (generalizing the
+  interactive-stdin fix above to any caller-owned no-EOF stream); the returned
+  text wrapper inherits the mark.
+
 ## 2.8.0 — 2026-07-06
 
 ### Fixed

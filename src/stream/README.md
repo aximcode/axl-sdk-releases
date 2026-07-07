@@ -182,6 +182,43 @@ if (f != NULL) {
 }
 ```
 
+## Output Buffering
+
+By default every AxlStream is **unbuffered** — each write goes straight to
+the sink (stdio `_IONBF`). Opt into coalescing with
+`axl_stream_set_buffering`, or the C-compatible `setvbuf` family:
+
+```c
+axl_setlinebuf(log);                             /* flush on each '\n'  */
+axl_stream_set_buffering(out, AXL_STREAM_BUF_FULL, 4096);  /* block-buffer */
+axl_setvbuf(out, NULL, AXL_STREAM_BUF_FULL, 4096);         /* same, C-shaped */
+
+axl_fprintf(out, "many small writes ...");       /* coalesced in the buffer */
+axl_fflush(out);                                 /* drain to the sink       */
+```
+
+| Mode | Flushes when | stdio |
+|---|---|---|
+| `AXL_STREAM_BUF_NONE` | every write (default) | `_IONBF` |
+| `AXL_STREAM_BUF_LINE` | a `'\n'` is written, or the buffer fills | `_IOLBF` |
+| `AXL_STREAM_BUF_FULL` | the buffer fills | `_IOFBF` |
+
+The buffer lives in `axl_write`, which `axl_print` / `axl_printf` /
+`axl_fprintf` / `axl_fwrite` all funnel through, so every text-output path
+is coalesced uniformly, ahead of any UTF-8 → UCS-2 transcode and tee.
+
+**Unlike C stdio, AXL does not auto-select buffering from tty-ness.** A
+UEFI app can exit through a crt0 path that runs no atexit hook, so
+auto-buffered output could be silently lost, and a line-buffered prompt
+before a read could stall unseen. Buffering is therefore strictly opt-in,
+and **you own the final flush**: `axl_fflush` drains, `axl_fclose` flushes
+then frees. Because `axl_stdout` / `axl_stderr` are never `fclose`d, code
+that buffers them must `axl_fflush` before it exits.
+
+This is orthogonal to the interactive/line-discipline axis (see the
+text-wrapper section): buffering governs how *writes* coalesce, the
+interactive mark governs whether *reads* over-consume.
+
 ## Buffer Streams
 
 In-memory streams for building data without files:
@@ -277,14 +314,28 @@ while ((line = axl_readline(in)) != NULL) {
 axl_fclose(in);    /* does NOT close the wrapped src */
 ```
 
-BOM detection happens lazily on the first read:
+Classification happens eagerly at construction — the wrapper reads a
+probe window from `src` to detect the encoding:
 
 | Leading bytes | Mode | Behavior |
 |---|---|---|
 | `FF FE`    | UTF-16 LE | BOM consumed, body transcoded to UTF-8 |
 | `FE FF`    | UTF-16 BE | BOM consumed, body transcoded to UTF-8 |
 | `EF BB BF` | UTF-8 BOM | BOM stripped, body returned verbatim |
+| interleaved NULs (≥16 B, no BOM) | headerless UCS-2 | body transcoded to UTF-8 |
 | anything else | passthrough | raw bytes returned as-is |
+
+**Interactive / no-EOF sources skip the probe.** The classify read fills
+its window until it sees enough bytes or EOF — which would hang on an
+interactive console, since typed input never signals EOF and the probe
+would swallow line after line waiting to fill. So when `src` is an
+interactive source — `axl_stdin` on an interactive console
+(`axl_stdin_is_interactive()`), or any stream you mark with
+`axl_stream_set_interactive(src, true)` — the probe is skipped entirely
+(the input is already UTF-8 and line-cooked, with no BOM or UCS-2 to
+detect) and the wrapper is a plain passthrough returning one line per
+read. Redirected / piped stdin reaches EOF, so it is classified normally.
+The returned wrapper inherits the interactive mark.
 
 Transcoding is incremental and bounded-memory regardless of source
 size — wrap a multi-MB pipe and read line by line. The wrapper holds
