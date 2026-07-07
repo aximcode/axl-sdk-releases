@@ -3,6 +3,34 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.3 — 2026-07-07
+
+### Changed
+
+- **`mkrd <label>` now maps a RAM disk so a bare `map` lists it immediately as a
+  native volume** — `FS<n>: Alias(s):<LABEL>:` — with no `map -r` (behavior
+  change). It makes two `SetMap` calls on the disk: the next-free `FS<n>` first
+  (the primary name `map` displays, since the shell shows the first-inserted name
+  as primary), then the volume `<LABEL>` (the `Alias(s):` column). Both `FS<n>:`
+  and `<LABEL>:` are usable paths. A plain `SetMap` of just the label (the prior
+  behavior) was *hidden* from `map` — a bare label matches none of the shell's
+  `FS#`/`BLK#`/`HD*`/`CD*`/`F*` display patterns.
+- **`mkrd` drops the `-a`/`--alias` option and the `%<label>%` env var**
+  (behavior change) — the label *is* the alias now, so neither is needed. The
+  label is set as the alias only when it is a clean map token; a reserved
+  `fs<digits>` label, an over-long one, one with characters outside
+  `[A-Za-z0-9_-]`, or one already mapped to another volume (which is never
+  clobbered) is skipped, and the disk is reachable as `FS<n>:` only, with a note.
+- **`mkrd -l` columns are now `MAPPING` / `LABEL/ALIAS` / `SIZE` / `FSTYPE`** —
+  `MAPPING` is the disk's `fsN` handle (or `(unmapped)`); `LABEL/ALIAS` is the
+  volume label, shown with a trailing `:` only when it is currently a live shell
+  alias (a `map -r` that dropped it shows the label plain); `SIZE` is `<n>MB`;
+  `FSTYPE` is `FAT16` / `FAT32`.
+- **`mkrd -d <label>` unmaps every shell name pointing at the destroyed disk**
+  (the `fsN` primary and the label alias), by re-reading the device's own map
+  name — so it removes only names that belong to that device, never another
+  volume's same-spelled entry.
+
 ## 2.8.2 — 2026-07-07
 
 ### Fixed

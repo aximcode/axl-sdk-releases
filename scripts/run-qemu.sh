@@ -654,6 +654,18 @@ if [[ -n "$CUSTOM_NSH" ]]; then
         exit 1
     fi
     cp "$CUSTOM_NSH" "$STAGING/startup.nsh"
+    # Power off when a non-interactive custom nsh finishes, so the run doesn't
+    # idle at the shell prompt until --timeout (the auto-generated app launch
+    # gets a `reset -s` for the same reason). Skipped for background /
+    # interactive / screenshot / display modes (those want QEMU to stay up), and
+    # skipped when the script already issues a reset (respect its own placement).
+    # Harmless for a script that hangs: the appended reset is never reached, so
+    # hang-to-timeout behavior is preserved.
+    if [[ -z "$SCREENSHOT" && "$BACKGROUND" != "true" \
+          && "$INTERACTIVE" != "true" && -z "$DISPLAY_BACKEND" ]] \
+       && ! grep -qiE '^[[:space:]]*reset([[:space:]]|$)' "$STAGING/startup.nsh"; then
+        printf '\nreset -s\n' >> "$STAGING/startup.nsh"
+    fi
 else
     {
         echo "@echo -off"
