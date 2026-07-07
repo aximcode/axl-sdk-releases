@@ -141,7 +141,7 @@ printf 'line one: hello world\nline two: HELLO WORLD\nline three: goodbye world\
     echo "sysinfo.efi"
     echo ""
     echo "echo === TEST-DMIDECODE-VERSION ==="
-    echo "dmidecode.efi -V"
+    echo "dmidecode.efi --smbios-version"
     echo ""
     echo "echo === TEST-DMIDECODE-BIOS ==="
     echo "dmidecode.efi -t 0"

@@ -108,6 +108,14 @@ main(int argc, char **argv)
         return (argc < 2) ? 1 : 0;
     }
 
+    /* The multiplexer's own version. Scoped to argv[1] so `axl mkrd --version`
+       still dispatches to mkrd (whose own wrapper answers it) rather than being
+       intercepted here. */
+    if (axl_streql(argv[1], "--version") || axl_streql(argv[1], "-V")) {
+        axl_printf("axl %s\n", axl_version());
+        return 0;
+    }
+
     for (size_t i = 0; i < TOOL_COUNT; i++) {
         if (axl_streql(argv[1], tools[i].name)) {
             /* Shift argv so the dispatched tool sees argv[0] = its

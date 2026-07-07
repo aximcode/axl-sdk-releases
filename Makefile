@@ -309,6 +309,7 @@ LIB_SOURCES = \
     src/util/axl-time.c \
     src/util/axl-env.c \
     src/util/axl-sys.c \
+    src/util/axl-version.c \
     src/util/axl-nvstore.c \
     src/util/axl-port.c \
     src/util/axl-boot.c \

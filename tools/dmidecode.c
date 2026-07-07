@@ -22,7 +22,8 @@
                                        chassis-manufacturer, chassis-version,
                                        chassis-serial-number, chassis-asset-tag
       dmidecode.efi -q               Quiet (fewer decorations)
-      dmidecode.efi -V               Print SMBIOS version + exit
+      dmidecode.efi --smbios-version Print SMBIOS spec version + exit
+      dmidecode.efi -V / --version   Print the dmidecode tool version + exit
 **/
 
 #include <axl.h>
@@ -35,7 +36,7 @@ static const AxlArgDesc flags[] = {
       .help = "Print a single named value (see --help for keywords)" },
     { .name = "quiet",   .short_name = 'q', .type = AXL_ARG_BOOL,
       .help = "Suppress section headers and blank lines" },
-    { .name = "version", .short_name = 'V', .type = AXL_ARG_BOOL,
+    { .name = "smbios-version", .type = AXL_ARG_BOOL,
       .help = "Print SMBIOS specification version and exit" },
     {0}
 };
@@ -361,13 +362,13 @@ print_roi_ip(const char *label, AxlSmbiosRedfishIpFormat format,
              const uint8_t addr[16])
 {
     char buf[40];  /* fits longest IPv6 form */
-    if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4
-        && axl_ipv4_format(addr, buf, sizeof(buf)) == AXL_OK)
-    {
-        axl_printf("\t%s: %s\n", label, buf);
-    } else if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV6
-               && axl_ipv6_format(addr, buf, sizeof(buf)) == AXL_OK)
-    {
+    bool ok = false;
+    if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV4) {
+        ok = (axl_ipv4_format(addr, buf, sizeof(buf)) == AXL_OK);
+    } else if (format == AXL_SMBIOS_REDFISH_IP_FORMAT_IPV6) {
+        ok = (axl_ipv6_format(addr, buf, sizeof(buf)) == AXL_OK);
+    }
+    if (ok) {
         axl_printf("\t%s: %s\n", label, buf);
     } else {
         axl_printf("\t%s: <unknown format>\n", label);
@@ -545,7 +546,7 @@ run_dmidecode(AxlArgs *a)
         return 1;
     }
 
-    if (axl_args_get_bool(a, "version")) {
+    if (axl_args_get_bool(a, "smbios-version")) {
         axl_printf("SMBIOS %u.%u present.\n", major, minor);
         return 0;
     }

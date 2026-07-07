@@ -32,6 +32,7 @@
 #include <axl/axl-array.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-log.h>
+#include <axl/axl-version.h>
 
 AXL_LOG_DOMAIN("args");
 
@@ -583,9 +584,10 @@ static void
 print_help_for(const AxlArgsNode *node, const char *path)
 {
     if (node->help != NULL) {
-        /* ASCII '-' separator, not a Unicode em-dash: a UEFI text console has
-           no UTF-8, so U+2014 would render as a white block. */
-        axl_print("%s - %s\n\n", path, node->help);
+        /* Header carries the SDK release version so `<tool> -h` self-identifies
+           the build. ASCII '-' separator, not a Unicode em-dash: a UEFI text
+           console has no UTF-8, so U+2014 would render as a white block. */
+        axl_print("%s %s - %s\n\n", path, axl_version(), node->help);
     }
 
     if (node->help_prolog != NULL) {

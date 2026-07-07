@@ -3,6 +3,27 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.5 — 2026-07-07
+
+### Added
+
+- **Every tool reports the SDK release version.** `<tool> --version` (and
+  `-V`) prints `<tool> <version>` and exits; the version is also shown in
+  `<tool> -h` help and stamped into the `AXL_DIAG` diagnostic dump. The stamp
+  is applied once at the `AXL_TOOL_MAIN` layer from the single-source
+  `AXL_VERSION_STRING`, so it covers every tool uniformly — those using the
+  `axl_args_run` parser and the custom-parser ones (storage tools, `sed`, the
+  `axl` busybox multiplexer) alike — and always matches the release version.
+- **`axl_version()`** (`<axl/axl-version.h>`) — runtime accessor returning the
+  linked library's SDK version string, so consumer apps and tools can report
+  the exact SDK build they link against.
+
+### Changed
+
+- **`dmidecode`: `-V`/`--version` now report the tool version** (matching every
+  other tool and the real `dmidecode`). The previous `-V` behavior — printing
+  the SMBIOS specification version — moved to `--smbios-version`.
+
 ## 2.8.4 — 2026-07-07
 
 ### Fixed

@@ -16,6 +16,7 @@
 #include <axl/axl-path.h>
 #include <axl/axl-str.h>
 #include <axl/axl-sys.h>
+#include <axl/axl-version.h>
 
 #define DIAG_VOLUMES_MAX  16
 
@@ -37,7 +38,7 @@ axl_diag_startup(
         return;
     }
 
-    axl_printf("--- AXL diag ---\n");
+    axl_printf("--- AXL diag (axl-sdk %s) ---\n", axl_version());
 
     /* (1) POSIX argv as it reached main, after axl-app.c parsed
      *     EFI_LOADED_IMAGE_PROTOCOL.LoadOptions. */

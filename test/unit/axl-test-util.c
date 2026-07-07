@@ -5996,7 +5996,7 @@ test_args_help_ascii_only(void)
     AxlArgsNode verbs[] = { sysid, {0} };
     AxlArgsNode app = {
         .name = "do", .verbs = verbs,
-        .help = "Dell hardware-diagnostic CLI", .user_data = &cap,
+        .help = "OEM hardware-diagnostic CLI", .user_data = &cap,
     };
 
     AxlStream *buf = NULL;
@@ -6016,9 +6016,12 @@ test_args_help_ascii_only(void)
             break;
         }
     }
-    /* The exact ASCII separator renders in both headers (locks " - "). */
-    bool root_sep = buf_contains(buf, "do - Dell hardware-diagnostic CLI");
-    bool verb_sep = buf_contains(buf, "do sysid - System identity");
+    /* The exact ASCII separator renders in both headers (locks " - "); the
+       header also carries the SDK version stamp between the name and the ' - '. */
+    bool root_sep = buf_contains(buf,
+        "do " AXL_VERSION_STRING " - OEM hardware-diagnostic CLI");
+    bool verb_sep = buf_contains(buf,
+        "do sysid " AXL_VERSION_STRING " - System identity");
     restore_stdout(saved, buf);
 
     test_check(n > 0, "args ascii: help produced output");

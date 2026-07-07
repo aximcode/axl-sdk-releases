@@ -164,10 +164,26 @@
  * dispatcher table is the source of truth for which names exist.
  */
 #ifdef AXL_BUSYBOX
-  #define AXL_TOOL_MAIN(name) int axl_tool_##name##_main(int argc, char **argv)
+  #define AXL_TOOL_ENTRY_(name) int axl_tool_##name##_main(int argc, char **argv)
 #else
-  #define AXL_TOOL_MAIN(name) int main(int argc, char **argv)
+  #define AXL_TOOL_ENTRY_(name) int main(int argc, char **argv)
 #endif
+
+/* Wrap the tool body with a uniform `--version` / `-V` pre-check so EVERY
+ * tool reports the SDK release version identically, whether or not it uses
+ * the axl_args_run parser. The tool's `{ ... }` block becomes the static body;
+ * the entry point answers a version request (printing "<name> <version>" and
+ * returning 0) before the body ever runs. `#name` is the tool stem passed to
+ * the macro (e.g. "mkrd"). */
+#define AXL_TOOL_MAIN(name)                                            \
+    static int _axl_tool_body_##name(int argc, char **argv);          \
+    AXL_TOOL_ENTRY_(name) {                                           \
+        if (axl_version_handle(#name, argc, argv)) {                   \
+            return 0;                                                  \
+        }                                                              \
+        return _axl_tool_body_##name(argc, argv);                     \
+    }                                                                  \
+    static int _axl_tool_body_##name(int argc, char **argv)
 
 // ---------------------------------------------------------------------------
 // AXL_APP — application entry point
