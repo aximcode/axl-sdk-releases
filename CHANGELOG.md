@@ -3,6 +3,29 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.4 — 2026-07-07
+
+### Fixed
+
+- **SSIF IPMI reaches the BMC on multi-bus ARM64 servers (Nvidia Grace).** The
+  SSIF opener bound the first I2C master and a single fixed slave address
+  (`raw >> 1`), so on servers that publish several I2C masters — the BMC on only
+  one — every BMC write NAKed ("SSIF write failed after 5 retries"). It now
+  probes every SMBus/I2C controller, tries each SMBIOS slave-address
+  interpretation (`as-is` / `>>1` / `<<1`), and claims the (controller, address)
+  pair that answers IPMI Get Device ID (a write ACK alone isn't enough — a full
+  write+read is required). The probe write fails fast; the read stays patient
+  (~3.8 s) for a slow BMC.
+
+### Changed
+
+- **SSIF multi-part writes are disabled on `EFI_I2C_MASTER_PROTOCOL`
+  transports.** The Nvidia Grace UEFI I2C driver hangs on multi-part SSIF
+  writes; a request larger than 32 B over an I2C master is now refused with a
+  clear error rather than wedging the bus. IPMI requests are almost always a few
+  bytes, so this is safe for the common path; multi-part reads (FRU/SDR) are
+  unaffected, and HC transports keep multi-part writes.
+
 ## 2.8.3 — 2026-07-07
 
 ### Changed

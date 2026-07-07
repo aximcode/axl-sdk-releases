@@ -79,6 +79,19 @@ int axl_ipmi_ssif_open(AxlIpmiTransportOps *ops,
                        AxlSmbus            *smbus,
                        uint8_t              slave_addr);
 
+/**
+ * Fail-fast IPMI Get Device ID round-trip on (@a smbus, @a addr), used by
+ * the SSIF opener to discover which controller and slave address actually
+ * host the BMC (multi-bus platforms like Nvidia Grace publish several I2C
+ * masters, and the SMBIOS slave-address encoding is ambiguous across
+ * platforms). Does NOT take ownership of @a smbus.
+ *
+ * A write ACK alone only proves *some* device is on the bus, so a full
+ * write AND read is required. Returns true iff the BMC answered Get Device
+ * ID with completion code 0x00.
+ */
+bool axl_ipmi_ssif_probe_get_device_id(AxlSmbus *smbus, uint8_t addr);
+
 int axl_ipmi_edkii_open(AxlIpmiTransportOps *ops);
 
 int axl_ipmi_dell_open(AxlIpmiTransportOps *ops);

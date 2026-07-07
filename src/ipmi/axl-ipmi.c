@@ -128,6 +128,66 @@ decode_kcs_ports(uint64_t base_addr,
 //
 #define SMBIOS_TYPE38_MIN_LEN  0x10
 
+// ---------------------------------------------------------------------------
+// SSIF BMC discovery — probe every SMBus/I2C controller for the BMC
+//
+// Grace-class ARM64 servers publish multiple I2C masters (one per bus); the
+// BMC lives on exactly one. The SMBIOS I2CSlaveAddress encoding is also
+// ambiguous across platforms (some publish the 7-bit address as-is, some the
+// 8-bit wire form with the R/W bit). So instead of binding the first
+// controller and a single fixed address, walk every controller and try each
+// address interpretation, claiming the pair that answers IPMI Get Device ID.
+// (The write+read requirement mirrors how robust IPMI stacks probe SSIF: a
+// write ACK alone only means a device is on the bus, not that it speaks IPMI.)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint8_t  raw6;        ///< SMBIOS Type 38 offset 6 (I2CSlaveAddress), verbatim
+    uint8_t  found_addr;  ///< winning 7-bit slave address (valid iff found)
+    bool     found;
+} SsifProbeState;
+
+// axl_smbus_new_with_probe probe: for one candidate controller, try each
+// address interpretation and claim it if the BMC answers Get Device ID.
+static bool
+ssif_bmc_probe(AxlSmbus *cand, void *user)
+{
+    SsifProbeState *st = (SsifProbeState *)user;
+
+    // Address candidates, most-likely first on Grace-class hardware:
+    //   raw6 as-is  (7-bit, e.g. 0x20 — the Grace-proven form),
+    //   raw6 >> 1   ("8-bit wire, strip R/W" — the legacy assumption, 0x10),
+    //   raw6 << 1   ("7-bit shifted into 8-bit" — the 8-bit-form fallback, 0x40).
+    // I2C SlaveAddress is 7-bit; mask and skip 0 / duplicates.
+    uint8_t cands[3] = {
+        st->raw6,
+        (uint8_t)(st->raw6 >> 1),
+        (uint8_t)(st->raw6 << 1),
+    };
+    for (size_t i = 0; i < 3; i++) {
+        uint8_t addr = cands[i] & 0x7f;
+        if (addr == 0) {
+            continue;
+        }
+        bool dup = false;
+        for (size_t j = 0; j < i; j++) {
+            if ((cands[j] & 0x7f) == addr) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (axl_ipmi_ssif_probe_get_device_id(cand, addr)) {
+            st->found_addr = addr;
+            st->found      = true;
+            return true;   // claim this controller
+        }
+    }
+    return false;
+}
+
 static int
 try_smbios_detect(AxlIpmiTransportOps *ops)
 {
@@ -224,19 +284,29 @@ try_smbios_detect(AxlIpmiTransportOps *ops)
     }
     case IPMI_SMBIOS_IFACE_SSIF: {
         //
-        // SMBIOS Type 38 I2CSlaveAddress is the 8-bit wire address
-        // (bit 0 = R/W). Shift out the R/W bit to get the 7-bit
-        // device address SMBus/I2C APIs expect.
+        // Discover the BMC's controller AND slave address by probing:
+        // walk every SMBus/I2C controller and try each interpretation of
+        // the SMBIOS I2CSlaveAddress, claiming the pair that answers IPMI
+        // Get Device ID. This handles multi-bus platforms (Nvidia Grace
+        // publishes several I2C masters) and the 7-/8-bit address ambiguity
+        // in one shot — binding the first controller with a fixed
+        // (raw >> 1) address reaches the wrong device on such hardware.
         //
-        uint8_t slave = (uint8_t)(raw[6] >> 1);
-        axl_info("SMBIOS Type 38: SSIF (slave=0x%02x)", (unsigned)slave);
+        SsifProbeState st = { .raw6 = raw[6], .found_addr = 0, .found = false };
+        axl_info("SMBIOS Type 38: SSIF (I2CSlaveAddress raw=0x%02x) - probing "
+                 "controllers", (unsigned)raw[6]);
 
-        AxlSmbus *smbus = axl_smbus_new();
-        if (smbus == NULL) {
-            axl_warning("SSIF: no SMBus controller - cannot reach BMC");
+        AxlSmbus *smbus = axl_smbus_new_with_probe(ssif_bmc_probe, &st);
+        if (smbus == NULL || !st.found) {
+            if (smbus != NULL) {
+                axl_smbus_free(smbus);
+            }
+            axl_warning("SSIF: no controller answered IPMI Get Device ID "
+                        "- BMC unreachable");
             return -1;
         }
-        int rc = axl_ipmi_ssif_open(ops, smbus, slave);
+
+        int rc = axl_ipmi_ssif_open(ops, smbus, st.found_addr);
         if (rc != 0) {
             axl_smbus_free(smbus);
         }

@@ -57,8 +57,9 @@ AXL_LOG_DOMAIN("ipmi-ssif");
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    AxlSmbus  *smbus;       ///< owned: freed by ssif_close
+    AxlSmbus  *smbus;                  ///< owned: freed by ssif_close
     uint8_t    slave_addr;
+    bool       allow_multipart_write;  ///< false on I2C-Master (Grace driver hangs)
 } SsifCtx;
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,22 @@ ssif_try_write(SsifCtx *s, const uint8_t *msg, size_t msg_len)
         return axl_smbus_write_block(
             s->smbus, s->slave_addr, SSIF_CMD_SINGLE_PART_WRITE,
             msg, msg_len);
+    }
+
+    if (!s->allow_multipart_write) {
+        //
+        // The Nvidia Grace UEFI I2C-Master driver hangs on multi-part SSIF
+        // writes, so refuse rather than wedge the bus. IPMI requests larger
+        // than 32 B are rare (Get Device ID / sensor reads are a few bytes),
+        // so single-part-only is safe for the common path; a caller needing a
+        // larger request over I2C-Master must chunk above this layer. Reads
+        // (which legitimately exceed 32 B — FRU, SDR) still reassemble
+        // multi-part below, unaffected.
+        //
+        axl_error("SSIF: %zu-byte request exceeds the single-part max and "
+                  "multi-part write is disabled on I2C-Master (Grace hang guard)",
+                  msg_len);
+        return -1;
     }
 
     //
@@ -114,6 +131,68 @@ ssif_write_with_retries(SsifCtx *s, const uint8_t *msg, size_t msg_len)
     }
     axl_error("SSIF write failed after %d retries", SSIF_WRITE_MAX_RETRIES);
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Controller / address probe (used by the opener's auto-detect)
+// ---------------------------------------------------------------------------
+
+// The probe visits many (controller, address) pairs, so a wrong one must fail
+// quickly — but the live BMC can be slow, so the READ stays patient (bounded).
+//   - WRITE fails fast: a wrong bus/address NAKs, so 2 tries is plenty (the
+//     live path's 5 retries are for a flaky *correct* bus, not discovery).
+//   - READ is patient but bounded: a slow BMC on Grace can take ~1.9 s after
+//     idle, so ~3.8 s of doubling backoff (60->1920 ms) covers it, while
+//     capping how long a write-ACKing non-IPMI device can stall the walk.
+#define SSIF_PROBE_WRITE_RETRIES  2
+#define SSIF_PROBE_READ_RETRIES   6
+
+bool
+axl_ipmi_ssif_probe_get_device_id(AxlSmbus *smbus, uint8_t addr)
+{
+    if (smbus == NULL) {
+        return false;
+    }
+
+    // Get Device ID: NetFn App (0x06) in the upper 6 bits (LUN 0), Cmd 0x01,
+    // no request data. Always single-part (a 2-byte request).
+    uint8_t msg[2] = { (uint8_t)(0x06 << 2), 0x01 };
+
+    bool wrote = false;
+    for (int w = 0; w < SSIF_PROBE_WRITE_RETRIES; w++) {
+        if (axl_smbus_write_block(smbus, addr, SSIF_CMD_SINGLE_PART_WRITE,
+                                  msg, sizeof(msg)) == AXL_OK) {
+            wrote = true;
+            break;
+        }
+        axl_msleep(SSIF_RETRY_DELAY_US / 1000);
+    }
+    if (!wrote) {
+        axl_debug("SSIF probe: no write ACK @ 0x%02x", (unsigned)addr);
+        return false;
+    }
+
+    // A write ACK only means a device is present — require a real Get Device
+    // ID response (completion code 0x00) to confirm it speaks IPMI.
+    uint8_t buf[SSIF_BLOCK_MAX + 2];
+    size_t  delay = SSIF_RETRY_DELAY_US;
+    for (int r = 0; r < SSIF_PROBE_READ_RETRIES; r++) {
+        axl_msleep(delay / 1000);
+        size_t cap = sizeof(buf);
+        if (axl_smbus_read_block(smbus, addr, SSIF_CMD_SINGLE_PART_READ,
+                                 buf, &cap) == AXL_OK && cap >= 3) {
+            // buf = [NetFn echo][Cmd echo][CompletionCode][data...].
+            bool ok = (buf[2] == 0x00);
+            axl_info("SSIF probe: %s @ 0x%02x (cc=0x%02x)",
+                     ok ? "BMC answered Get Device ID" : "non-IPMI response",
+                     (unsigned)addr, (unsigned)buf[2]);
+            return ok;
+        }
+        delay *= 2;
+    }
+    axl_debug("SSIF probe: write ACK but no IPMI response @ 0x%02x",
+              (unsigned)addr);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +418,13 @@ axl_ipmi_ssif_open(AxlIpmiTransportOps *ops,
     }
     s->smbus      = smbus;
     s->slave_addr = slave_addr;
+    //
+    // Multi-part SSIF writes hang the Nvidia Grace UEFI I2C-Master driver, so
+    // allow them only on firmware-owned HC transports. Multi-part *reads* still
+    // reassemble on any transport.
+    //
+    s->allow_multipart_write =
+        (axl_smbus_transport(smbus) != AXL_SMBUS_TRANSPORT_I2C);
 
     ops->kind     = AXL_IPMI_TRANSPORT_SSIF;
     ops->send_raw = ssif_send_raw;
