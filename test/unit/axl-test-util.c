@@ -5767,17 +5767,28 @@ test_args_compact_flags(void)
                    "args compact: --out=value splits on '=' with ':' in value");
     }
 
-    /* Default (compact_flags=false): the compact forms are REJECTED (opt-in).
-       `-c:yn` is a short-cluster error; `/czz` is a stray positional. */
+    /* Default (compact_flags=false) mode is getopt-style: `-abc` bundles, and a
+       value-taking short flag consumes the rest of the token (`-cVALUE`) or the
+       next argv (`-c VALUE`). There is NO ':' separator in this mode, so
+       `-c:yn` attaches the literal ":yn" as the value. (The DOS-ish ':'/'/'
+       forms remain opt-in via compact_flags, exercised above.) */
     {
         ArgsCapture cap = { 0 };
-        AxlStream *buf = NULL;
-        AxlStream *saved = capture_stdout(&buf);
         char *argv[] = { (char *)"prog", (char *)"-c:yn" };
         int rc = run_compact(&cap, false, 2, argv);
-        restore_stdout(saved, buf);
-        test_check(rc != 0 && cap.calls == 0,
-                   "args strict: -c:yn rejected when compact_flags off");
+        test_check(rc == 0 && cap.calls == 1 && cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, ":yn") == 0,
+                   "args getopt: -c:yn attaches literal ':yn' (no ':' split off)");
+    }
+    {
+        /* Bundle a bool with a trailing value flag: -vc yn == -v -c yn. */
+        ArgsCapture cap = { 0 };
+        char *argv[] = { (char *)"prog", (char *)"-vc", (char *)"yn" };
+        int rc = run_compact(&cap, false, 3, argv);
+        test_check(rc == 0 && cap.calls == 1 && cap.seen_bool
+                   && cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, "yn") == 0,
+                   "args getopt: -vc yn bundles -v and -c (value from next argv)");
     }
     {
         ArgsCapture cap = { 0 };

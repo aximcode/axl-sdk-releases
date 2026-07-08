@@ -151,6 +151,16 @@ run_find(AxlArgs *a)
         start_path = ".";
     }
 
+    /* The start path must exist. Without this, a nonexistent argument fell
+       into find_walk's single-file branch and was echoed verbatim (`find MIKE`
+       printed "MIKE" and reported success) — a real path that doesn't exist is
+       an error (exit 2), distinct from "searched, found nothing" (exit 1). */
+    AxlFsEntry start_info;
+    if (axl_file_info(start_path, &start_info) != AXL_OK) {
+        axl_printerr("find: '%s': no such file or directory\n", start_path);
+        return 2;
+    }
+
     size_t match_count = find_walk(start_path, name_pattern, type_filter);
 
     if (verbose) {

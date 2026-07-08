@@ -320,6 +320,39 @@ axl_console_text_set_mode(
     uint32_t  index  ///< mode number in [0, axl_console_text_mode_count())
 );
 
+// ===================================================================
+// Output pagination (the shell `-b` page-break convention)
+// ===================================================================
+
+/**
+ * @brief Enable or disable the shell's page-break (screen-at-a-time) mode.
+ *
+ * Paging is a **shell service**, not something the SDK reimplements. AXL
+ * tools write to the UEFI console (gST->ConOut), which the shell wraps;
+ * this call flips the shell's page-break switch
+ * (EFI_SHELL_PROTOCOL.EnablePageBreak / DisablePageBreak) so the shell
+ * itself paginates that output — its own `-- More --` prompt, key
+ * reading, screen geometry, and (crucially) its own redirect/interactive
+ * detection, so a redirected or piped stream is never paused.
+ *
+ * @ref axl_args_run recognizes a universal `-b` / `--page` option and
+ * toggles this on for the duration of a tool's run, so most tools get
+ * paging for free without declaring the flag — a tool that declares its
+ * own `-b` keeps it (the universal option defers). Tools rarely need to
+ * call this directly.
+ *
+ * **No-op when no page-break service is reachable:** the legacy EFI 1.x
+ * shell publishes SHELL_ENVIRONMENT rather than EFI_SHELL_PROTOCOL, and a
+ * non-shell context has no shell at all — in both, enabling is a silent
+ * no-op (output is simply not paginated). Safe to call in any context.
+ *
+ * @param enable  true to enable page break, false to disable.
+ */
+void
+axl_console_set_page_break(
+    bool  enable
+);
+
 #ifdef __cplusplus
 }
 #endif

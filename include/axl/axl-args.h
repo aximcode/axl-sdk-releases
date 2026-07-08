@@ -111,6 +111,16 @@
  * breadcrumb (`mytool bios: unknown verb 'flarble'`) and the auto-generated
  * usage, exit non-zero, no handler invocation.
  *
+ * **Universal `-b` / `--page`.** The UEFI shell's page-break convention is
+ * recognised for every tool (so it is never an "unknown flag") and wired to
+ * the shell's own screen-at-a-time paging via
+ * @ref axl_console_set_page_break for the duration of the run — no per-tool
+ * code. Each spelling defers independently to a tool that declares that
+ * exact flag: a tool's own short `-b` keeps `-b`, a tool's own `page` flag
+ * keeps `--page` (walking parents), and an unrelated same-named flag never
+ * revokes the other spelling. Consumed like `--help` before flag parsing;
+ * an ordinary positional after `--`.
+ *
  * **Help format.** The generated help is terse: a `Usage:` line, then one
  * aligned list of positionals, flags, and a single `-h, --help` row — no
  * `Arguments:` / `Flags:` section headers and no `(optional)` suffix (the
@@ -400,6 +410,31 @@ axl_args_run(
     int                    argc,
     char                 **argv,
     const AxlArgsNode     *root
+);
+
+/**
+ * @brief Remove @p argv[i] in place, shifting the tail down.
+ *
+ * The argv-surgery primitive for a hand-rolled pre-stripper: a tool that
+ * consumes its own flags before @ref axl_args_run (colon/slash options,
+ * capture markers, launcher directives) drops each matched slot with this,
+ * leaving a compacted `argv` the framework then parses cleanly.
+ *
+ * Shifts `argv[i+1 .. *argc-1]` down one, writes `NULL` at the new
+ * `argv[*argc-1]` so the vector stays NULL-terminated at its (now shorter)
+ * end, and decrements `*argc`. The dropped pointer is not freed — argv
+ * slots are borrowed (they point into the program's argument storage), so
+ * ownership is the caller's, unchanged.
+ *
+ * No-op (nothing changed) when @p argc or @p argv is NULL, or @p i is out
+ * of range `[0, *argc)` — so a scan that computes @p i from a not-found
+ * search can pass it through without a separate bounds check.
+ */
+void
+axl_argv_drop(
+    int    *argc,   ///< [in,out] argument count; decremented on a valid drop
+    char  **argv,   ///< argument vector, NULL-terminated at argv[*argc]
+    int     i       ///< index to remove; out-of-range is a no-op
 );
 
 // ---------------------------------------------------------------------------

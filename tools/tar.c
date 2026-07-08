@@ -49,12 +49,17 @@ static const AxlArgDesc flags[] = {
     { .name = "gzip",    .short_name = 'z', .type = AXL_ARG_BOOL,
       .help = "Compress (-c) / force-decompress (-t,-x) with gzip; "
               "list/extract auto-detect gzip regardless" },
+    { .name = "file",    .short_name = 'f', .type = AXL_ARG_STRING,
+      .help = "Archive file (GNU/BSD tar -f; alternative to the positional). "
+              "With -f the leading positional is treated as a member, not the "
+              "archive, so `tar -cf a.tar x y` works" },
     {0}
 };
 
 static const AxlArgDesc positional[] = {
-    { .name = "archive", .type = AXL_ARG_STRING, .required = true,
-      .help = "Archive file path" },
+    /* Not required: the archive may instead come from -f (GNU-tar style). */
+    { .name = "archive", .type = AXL_ARG_STRING,
+      .help = "Archive file path (or use -f)" },
     { .name = "files",   .type = AXL_ARG_MULTI,
       .help = "Files / directories to archive (with -c)" },
     {0}
@@ -120,18 +125,49 @@ create_cb(
     return 0;
 }
 
+/* Archive one path (file or directory tree) into @p w. Returns 0 on success,
+   1 on any error (with a message already printed). */
+static int
+tar_add_path(
+    AxlTarWriter *w,
+    const char   *path,
+    bool          verbose
+    )
+{
+    if (path == NULL) {
+        return 0;
+    }
+    if (axl_file_is_dir(path)) {
+        /* Recurse — a dir entry for the root, then each descendant.
+           axl_dir_walk composes child paths with the root's own
+           separator (UEFI-native), so they reopen on strict volumes. */
+        CreateCtx ctx = { .w = w, .verbose = verbose, .err = 0 };
+        if (axl_tar_writer_add_dir(w, path, 0755) != AXL_OK) {
+            axl_printerr("tar: cannot archive dir %s\n", path);
+            return 1;
+        }
+        if (verbose) { axl_printf("%s/\n", path); }
+        axl_dir_walk(path, create_cb, &ctx, TAR_WALK_MAX_DEPTH);
+        return ctx.err ? 1 : 0;
+    }
+    return (add_one_file(w, path, verbose) != 0) ? 1 : 0;
+}
+
 static int
 do_create(
     AxlArgs     *a,
     const char  *archive,
+    const char  *lead_file,   /* extra leading member (the "archive" positional
+                                 when -f named the archive), or NULL */
     bool         verbose,
     bool         gzip
     )
 {
     /* The named "archive" positional is fetched by name; get_pos indexes
-       only the variadic "files" tail. */
+       only the variadic "files" tail. With -f, lead_file carries the first
+       positional (which is a member, not the archive). */
     int pos_count = axl_args_get_pos_count(a);
-    if (pos_count < 1) {
+    if (pos_count < 1 && lead_file == NULL) {
         axl_printerr("tar: -c needs at least one file\n");
         return 1;
     }
@@ -162,23 +198,11 @@ do_create(
     }
 
     int rc = 0;
+    if (tar_add_path(w, lead_file, verbose) != 0) {
+        rc = 1;
+    }
     for (int i = 0; i < pos_count; i++) {
-        const char *path = axl_args_get_pos(a, i);
-        if (path == NULL) { continue; }
-        if (axl_file_is_dir(path)) {
-            /* Recurse — a dir entry for the root, then each descendant.
-               axl_dir_walk composes child paths with the root's own
-               separator (UEFI-native), so they reopen on strict volumes. */
-            CreateCtx ctx = { .w = w, .verbose = verbose, .err = 0 };
-            if (axl_tar_writer_add_dir(w, path, 0755) != AXL_OK) {
-                axl_printerr("tar: cannot archive dir %s\n", path);
-                rc = 1;
-            } else {
-                if (verbose) { axl_printf("%s/\n", path); }
-                axl_dir_walk(path, create_cb, &ctx, TAR_WALK_MAX_DEPTH);
-                if (ctx.err) { rc = 1; }
-            }
-        } else if (add_one_file(w, path, verbose) != 0) {
+        if (tar_add_path(w, axl_args_get_pos(a, i), verbose) != 0) {
             rc = 1;
         }
     }
@@ -465,13 +489,26 @@ run_tar(
         return 1;
     }
 
-    const char *archive = axl_args_get_string(a, "archive");
+    /* Archive source: -f <file> (GNU/BSD style) wins; else the positional.
+       When -f names the archive, the leading positional is a MEMBER, not the
+       archive (so `tar -cf a.tar x y` archives x and y). */
+    const char *fflag       = axl_args_get_string(a, "file");
+    const char *pos_archive = axl_args_get_string(a, "archive");
+    const char *archive;
+    const char *lead_file = NULL;
+    if (fflag != NULL && fflag[0] != '\0') {
+        archive   = fflag;
+        lead_file = pos_archive;
+    } else {
+        archive = pos_archive;
+    }
     if (archive == NULL || archive[0] == '\0') {
-        axl_printerr("tar: archive path required\n");
+        axl_printerr("tar: no archive specified (use -f <file> or a "
+                     "positional archive path)\n");
         return 1;
     }
 
-    if (create)  { return do_create(a, archive, verbose, gzip); }
+    if (create)  { return do_create(a, archive, lead_file, verbose, gzip); }
     if (list)    { return do_list(archive, verbose, gzip); }
     return do_extract(archive, axl_args_get_string(a, "dir"), verbose, gzip);
 }

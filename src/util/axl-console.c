@@ -127,6 +127,16 @@ axl_console_flush_input(
     }
 }
 
+void
+axl_console_set_page_break(
+    bool  enable
+    )
+{
+    /* Thin delegation to the shell's page-break service — see the header:
+       paging is the shell's job, our tools just write to ConOut. */
+    axl_backend_console_set_page_break(enable);
+}
+
 // ===================================================================
 // Interactive line input (axl_console_readline / _ex)
 // ===================================================================

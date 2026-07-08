@@ -40,6 +40,9 @@ static bool show_line_numbers = false;
 static bool count_only = false;
 static bool invert_match = false;
 static bool show_progress = false;
+/* Set when any named file could not be opened, so run_grep can exit 2
+   ("trouble") rather than reporting the failure as a plain "no match" (1). */
+static bool open_error = false;
 /* Non-NULL when -E was given: the pattern compiled once, searched per
    line. NULL selects the literal (Boyer-Moore-Horspool) fast path. */
 static AxlRegex *regex = NULL;
@@ -127,9 +130,10 @@ grep_stream(
     if (path != NULL) {
         src = axl_fopen(path, "r");
         if (src == NULL) {
-            if (show_progress) {
-                axl_printf("grep: cannot read '%s'\n", path);
-            }
+            /* Always report — a file we were asked to search but couldn't
+               open is an error, not a silent "no match". */
+            axl_printerr("grep: cannot open '%s'\n", path);
+            open_error = true;
             return 0;
         }
         owns_src = true;
@@ -316,6 +320,11 @@ run_grep(AxlArgs *a)
     axl_regex_free(regex);   /* NULL-safe; clean even on the literal path */
     regex = NULL;
 
+    /* grep(1) exit convention: 0 = matched, 1 = no match, 2 = trouble
+       (a file couldn't be opened, a bad regex — already returned above). */
+    if (open_error) {
+        return 2;
+    }
     return (total_matches > 0) ? 0 : 1;
 }
 

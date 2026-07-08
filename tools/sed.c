@@ -818,7 +818,11 @@ static bool input_open_next(Input *in)
         if (axl_strcmp(f, "-") == 0) { in->cur = axl_stdin; in->owns = false; }
         else {
             in->cur = axl_fopen(f, "r");
-            if (in->cur == NULL) { fail("can't read", f); exit_status = 2; continue; }
+            if (in->cur == NULL) {
+                axl_printerr("sed: cannot open '%s'\n", f);
+                exit_status = 2;
+                continue;
+            }
             in->owns = true;
         }
         if (!opt_null_data) {

@@ -27,6 +27,7 @@
 **/
 
 #include <axl/axl-args.h>
+#include <axl/axl-console.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-array.h>
@@ -863,10 +864,36 @@ parse_flag_token(AxlArgs *a, int i, int argc, char **argv, bool compact)
     const char *attached = NULL;          /* in-token value, or NULL */
     if (arg[2] != '\0') {
         if (!compact) {
-            axl_print("%s: compact short-flag groups (-%c%c...) "
-                      "are not supported; use -%c -%c instead\n",
-                      a->path, shortc, arg[2], shortc, arg[2]);
-            return -1;
+            /* Getopt-style short-flag bundle: `-abc` == `-a -b -c`. A run of
+               boolean flags may be followed by ONE value-taking flag, which
+               consumes the rest of the token (`-cffile`) or, if nothing is
+               attached, the next argv (`-cf file`). This is what makes the
+               familiar `tar -cf a.tar`, `tar -xzf a.tgz`, `grep -ic p f` work.
+               (Compact mode keeps its own `-fval` / `-f:val` grammar below.) */
+            for (const char *p = arg + 1; *p != '\0'; p++) {
+                ParsedArg *s = slot_by_short(a, *p);
+                if (s == NULL) {
+                    axl_print("%s: unknown flag -%c\n", a->path, *p);
+                    return -1;
+                }
+                if (s->desc->type == AXL_ARG_BOOL) {
+                    if (!parse_typed(s, "true", a->path)) {
+                        return -1;
+                    }
+                    continue;           /* keep bundling */
+                }
+                /* Value-taking flag ends the bundle. */
+                const char *rest = p + 1;
+                if (*rest != '\0') {
+                    return parse_typed(s, rest, a->path) ? 1 : -1;
+                }
+                if (i + 1 >= argc) {
+                    axl_print("%s: -%c requires a value\n", a->path, *p);
+                    return -1;
+                }
+                return parse_typed(s, argv[i + 1], a->path) ? 2 : -1;
+            }
+            return 1;                   /* all flags in the bundle were bool */
         }
         attached = (arg[2] == ':') ? arg + 3 : arg + 2;   /* -f:val or -fval */
     }
@@ -1037,6 +1064,20 @@ args_run_internal(int argc, char **argv,
                 i++;
                 continue;
             }
+            /* Universal page-break option: consume `-b` / `--page` and ask
+               the shell to paginate this run's output. Each spelling defers
+               INDEPENDENTLY to a tool that declares that exact flag — `-b`
+               to a tool's own short `b`, `--page` to a tool's own `page`
+               (walking parents) — so an unrelated same-named flag never
+               revokes the other spelling. axl_args_run disables paging on
+               return. */
+            if ((axl_strcmp(arg, "-b") == 0 && slot_by_short(a, 'b') == NULL)
+                || (axl_strcmp(arg, "--page") == 0
+                    && slot_by_name(a, "page") == NULL)) {
+                axl_console_set_page_break(true);
+                i++;
+                continue;
+            }
             bool compact = args_root_compact_flags(a);
             if (token_is_flag(arg, compact)) {
                 int consumed = parse_flag_token(a, i, argc, argv, compact);
@@ -1123,7 +1164,26 @@ out:
 int
 axl_args_run(int argc, char **argv, const AxlArgsNode *root)
 {
-    return args_run_internal(argc, argv, root, NULL, NULL);
+    int rc = args_run_internal(argc, argv, root, NULL, NULL);
+    /* A `-b` / `--page` anywhere on the command line enabled the shell's
+       page break for this run; clear it unconditionally so paging never
+       leaks past the tool (matters for a resident driver dispatching many
+       commands). Disabling when it was never enabled is a harmless no-op. */
+    axl_console_set_page_break(false);
+    return rc;
+}
+
+void
+axl_argv_drop(int *argc, char **argv, int i)
+{
+    if (argc == NULL || argv == NULL || i < 0 || i >= *argc) {
+        return;
+    }
+    for (int j = i; j < *argc - 1; j++) {
+        argv[j] = argv[j + 1];
+    }
+    argv[*argc - 1] = NULL;   /* keep the vector NULL-terminated at the new end */
+    --*argc;
 }
 
 // ---------------------------------------------------------------------------

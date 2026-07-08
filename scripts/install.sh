@@ -132,6 +132,7 @@ esac
 # unchanged.
 mkdir -p "$PREFIX/bin" \
          "$PREFIX/include/axl-sdk/axl" \
+         "$PREFIX/include/axl-sdk/compat" \
          "$PREFIX/include/axl-sdk/uefi/generated" \
          "$PREFIX/lib/axl" "$PREFIX/lib/cmake/axl" "$PREFIX/lib/pkgconfig" \
          "$PREFIX/share/axl"
@@ -189,7 +190,7 @@ Description: AximCode Library - GLib-inspired C library for UEFI (@AXL_ARCH@)
 URL: https://axl.aximcode.com
 Version: @AXL_VERSION@
 Libs: -L${libdir} -laxl
-Cflags: -I${includedir}
+Cflags: -I${includedir} -I${includedir}/compat
 PCEOF
 
     # Plain `axl.pc` so `pkg-config axl` works without an arch suffix.
@@ -208,6 +209,13 @@ cp "$LIBAXL_DIR/include/axl.h"                     "$PREFIX/include/axl-sdk/"
 cp "$LIBAXL_DIR/include/axl/"*.h                   "$PREFIX/include/axl-sdk/axl/"
 cp "$LIBAXL_DIR/include/uefi/"*.h                  "$PREFIX/include/axl-sdk/uefi/"
 cp "$LIBAXL_DIR/include/uefi/generated/"*.h        "$PREFIX/include/axl-sdk/uefi/generated/"
+# Hosted-libc shims (<string.h>, <stdlib.h>, ...) — the SAME headers the
+# library builds against (Makefile -Iinclude/compat). Consumers that include
+# them directly (a ported app) must get the SDK's freestanding shims, not host
+# glibc: the aa64 cross-gcc has no glibc at all (build fails without these),
+# and x64 must not silently borrow /usr/include. axl-cc adds this dir to
+# -isystem so `#include <string.h>` resolves here on every arch.
+cp "$LIBAXL_DIR/include/compat/"*.h                "$PREFIX/include/axl-sdk/compat/"
 
 # GCC linker scripts live next to the per-arch lib data.
 cp "$LIBAXL_DIR/scripts/elf_x86_64_efi.lds"  "$PREFIX/lib/axl/"
@@ -351,6 +359,7 @@ function(_axl_build_efi TARGET TYPE)
             OUTPUT ${OBJ}
             COMMAND ${AXL_CROSS}gcc ${AXL_C_FLAGS} ${AXL_GCC_ARCH}
                     -isystem ${AXL_INCLUDE_DIR}
+                    -isystem ${AXL_INCLUDE_DIR}/compat
                     -c ${SRC_ABS} -o ${OBJ}
             DEPENDS ${SRC_ABS}
             COMMENT "gcc: ${TARGET} ← ${SRC}"

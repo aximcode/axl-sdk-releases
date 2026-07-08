@@ -117,6 +117,23 @@ axl_backend_console_get_attr(
     );
 
 /**
+ * @brief Toggle the shell's page-break (screen-at-a-time) output mode.
+ *
+ * Delegates to EFI_SHELL_PROTOCOL.EnablePageBreak / DisablePageBreak. The
+ * shell's console logger wraps gST->ConOut, so enabling paginates AXL tool
+ * output — which writes to ConOut — with the shell's own prompt and key
+ * handling; the shell owns all geometry, interactivity, and redirect logic.
+ *
+ * No-op (nothing paginated) when no EFI_SHELL_PROTOCOL is reachable: the
+ * legacy EFI 1.x shell publishes SHELL_ENVIRONMENT instead, and a non-shell
+ * context has no pager at all. Paging is a shell service, not an SDK one.
+ */
+void
+axl_backend_console_set_page_break(
+    bool  enable    ///< true = enable page break, false = disable
+    );
+
+/**
  * @brief Number of text-output modes the active console enumerates.
  *
  * @return `ConOut->Mode->MaxMode` clamped to non-negative, or 0 if there
@@ -1020,8 +1037,8 @@ axl_backend_shell_break_event(
  *
  * Exit status is resolved by axl_backend_resolve_exit_status(rc): a pending
  * axl_set_exit_status wins verbatim, else rc maps 0 -> EFI_SUCCESS / nonzero
- * -> EFI_ABORTED. The caller is expected to have already run _axl_cleanup;
- * this helper only bridges into the firmware exit service.
+ * -> a small POSIX-style code (1..255). The caller is expected to have already
+ * run _axl_cleanup; this helper only bridges into the firmware exit service.
  */
 __attribute__((noreturn))
 void
@@ -1045,7 +1062,9 @@ axl_backend_set_exit_status(
  * @brief Resolve the EFI_STATUS this image should exit with for @p rc.
  *
  * Returns the pending status set by axl_backend_set_exit_status if one is
- * armed, else the legacy map (rc == 0 -> EFI_SUCCESS / nonzero -> EFI_ABORTED).
+ * armed, else maps rc == 0 -> EFI_SUCCESS / nonzero -> a small POSIX-style exit
+ * code (1..255, high bit clear) so the shell reports `%lasterror%=N` rather
+ * than collapsing every failure to EFI_ABORTED (0x15).
  * Used by BOTH the CRT0 return path and axl_backend_boot_exit so the two
  * agree. Returned as a UINTN-width integer (the caller, which has UEFI types,
  * uses it as EFI_STATUS).

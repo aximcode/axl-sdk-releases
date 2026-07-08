@@ -133,6 +133,25 @@ typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_MAP)(
     IN CONST CHAR16                    *Mapping
     );
 
+/* Shell Spec 2.2 §2.2.20-21 — the shell's page-break (screen-at-a-time
+   output) service. EnablePageBreak turns it on; the shell's console
+   logger then pauses ConOut after each screenful with its own prompt,
+   reading the continue/quit key itself, until DisablePageBreak. Because
+   AXL tools write to gST->ConOut (which the shell wraps), enabling this
+   paginates their output with zero SDK-side pager. No arguments — the
+   shell owns all the geometry/interactivity/redirect logic. (GetPageBreak,
+   §2.2.22, stays void* below: AXL force-disables on tool exit rather than
+   save/restore, so a page break can never leak into a later command.) */
+typedef VOID (EFIAPI *EFI_SHELL_ENABLE_PAGE_BREAK)(VOID);
+typedef VOID (EFIAPI *EFI_SHELL_DISABLE_PAGE_BREAK)(VOID);
+
+/* Shell Spec 2.2 §2.2.18 — TRUE while the shell is executing a script
+   (startup.nsh or a `.nsh` batch file), including for the duration of an
+   image the script launched. AXL uses it to suppress page break in batch
+   context: a script has no human to press the continue key, so paging
+   there would block the shell forever on a keystroke that never comes. */
+typedef BOOLEAN (EFIAPI *EFI_SHELL_BATCH_IS_ACTIVE)(VOID);
+
 // ===================================================================
 // EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (UEFI Spec 2.x, §12.2)
 //
@@ -230,10 +249,10 @@ struct _EFI_SHELL_PROTOCOL {
     void                          *OpenFileList;         // 2.2.15
     void                          *FreeFileList;         // 2.2.16
     void                          *RemoveDupInFileList;  // 2.2.17
-    void                          *BatchIsActive;        // 2.2.18
+    EFI_SHELL_BATCH_IS_ACTIVE      BatchIsActive;        // 2.2.18 (USED)
     void                          *IsRootShell;          // 2.2.19
-    void                          *EnablePageBreak;      // 2.2.20
-    void                          *DisablePageBreak;     // 2.2.21
+    EFI_SHELL_ENABLE_PAGE_BREAK    EnablePageBreak;      // 2.2.20 (USED)
+    EFI_SHELL_DISABLE_PAGE_BREAK   DisablePageBreak;     // 2.2.21 (USED)
     void                          *GetPageBreak;         // 2.2.22
     void                          *GetDeviceName;        // 2.2.23
     EFI_SHELL_GET_FILE_INFO        GetFileInfo;          // 2.2.24 (USED)

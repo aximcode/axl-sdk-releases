@@ -192,6 +192,14 @@ _axl_cleanup(void)
     }
     mCleanupRan = true;
 
+    /* Guarantee the shell's page break is off on every exit path. The
+     * universal `-b` handler (axl_args_run) enables it and clears it on
+     * normal return, but a handler that ends via axl_exit() bypasses that
+     * return — without this, an enabled page break would leak into the
+     * next shell command (a later script would then hang on -- More --).
+     * No-op when it was never enabled / no shell. */
+    axl_backend_console_set_page_break(false);
+
     /* atexit callbacks fire first — they may free resources that
      * would otherwise be caught (noisily) by the sweep. */
     _axl_atexit_run_all();

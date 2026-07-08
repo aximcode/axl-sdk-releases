@@ -195,6 +195,39 @@ axl_backend_console_get_attr(
     return 0;
 }
 
+void
+axl_backend_console_set_page_break(
+    bool  enable
+    )
+{
+    /* Paging is a shell service — the shell's console logger wraps ConOut,
+       so flipping this switch paginates our ConOut-bound output with no
+       SDK-side pager. get_shell() is NULL on the legacy EFI 1.x shell (it
+       publishes SHELL_ENVIRONMENT, not EFI_SHELL_PROTOCOL) and in a
+       non-shell context; both leave paging unavailable — a no-op. The
+       member NULL-checks guard a pre-page-break shell protocol revision. */
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell == NULL) {
+        return;
+    }
+    if (enable) {
+        /* Suppress paging inside a script (startup.nsh / `.nsh`): the shell
+           still pauses ConOut after each screenful even in batch context,
+           and with no human to press the continue key that hangs the run.
+           BatchIsActive() is TRUE for the whole time a script-launched image
+           executes, so gate on it. Interactive `-b` (BatchIsActive FALSE)
+           still pages normally. */
+        if (shell->BatchIsActive != NULL && shell->BatchIsActive()) {
+            return;
+        }
+        if (shell->EnablePageBreak != NULL) {
+            shell->EnablePageBreak();
+        }
+    } else if (shell->DisablePageBreak != NULL) {
+        shell->DisablePageBreak();
+    }
+}
+
 uint32_t
 axl_backend_console_text_mode_count(
     void
@@ -2288,7 +2321,23 @@ axl_backend_resolve_exit_status(int rc)
     if (g_exit_status_armed) {
         return (uint64_t)g_exit_status;            // verbatim, including success
     }
-    return (uint64_t)((rc == 0) ? EFI_SUCCESS : EFI_ABORTED);
+    if (rc == 0) {
+        return (uint64_t)EFI_SUCCESS;
+    }
+    /* Map a non-zero main() return to a small POSIX-style exit code (1..255,
+       high bit clear) so the shell surfaces it as `%lasterror%=N`. This
+       REPLACES the old EFI_ABORTED (0x15) collapse, which made every ordinary
+       failure — grep no-match, a bad flag, a missing file — read as an
+       "Aborted" crash and gave a script comparing `%lasterror% == 1` a value it
+       could never match. Consumers needing an exact / EFI_ERROR-detectable
+       status still arm one via axl_set_exit_status (the verbatim path above).
+       Mask to a byte so a stray large/negative rc can't emit a giant value or
+       alias down to 0 (a false success). */
+    unsigned code = (unsigned)rc & 0xFFu;
+    if (code == 0u) {
+        code = 1u;
+    }
+    return (uint64_t)code;
 }
 
 void

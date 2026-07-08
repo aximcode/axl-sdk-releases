@@ -3,6 +3,55 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.8 — 2026-07-08
+
+### Added
+
+- **Universal `-b` / `--page` page-break, delegated to the shell.** Every tool
+  built on `axl_args_run` now accepts the UEFI shell's page-break convention
+  (and a `--page` alias) — it is never an "unknown flag." Paging is a shell
+  service, not an SDK-side pager: AXL tools write to the console (`gST->ConOut`)
+  which the shell wraps, so the new `axl_console_set_page_break()`
+  (`<axl/axl-console.h>`) simply flips `EFI_SHELL_PROTOCOL.EnablePageBreak`. It
+  is suppressed inside a script (gated on `BatchIsActive`) so a `startup.nsh`
+  never hangs on a keystroke, and cleared on every tool-exit path so paging
+  can't leak into the next command. A tool that declares its own `-b` (or a
+  `page` flag) keeps it — each spelling defers independently.
+- **`axl_argv_drop()`** (`<axl/axl-args.h>`) — remove an element from `argv`
+  in place (shift down, NUL-terminate, decrement `argc`); NULL- and
+  bounds-safe. The argv-surgery primitive for a tool that pre-strips its own
+  flags before `axl_args_run`.
+
+### Fixed
+
+- **Consumers can `#include` the standard C headers (`<string.h>`, `<stdlib.h>`,
+  …) on every arch.** The SDK's `compat/` freestanding shims — the same ones the
+  library builds against — are now staged under `include/axl-sdk/compat/` and
+  put on the include search path for every consumer entry point (`axl-cc` C and
+  C++, the CMake package, and the pkg-config `Cflags`). Previously a consumer
+  that included a hosted-libc header failed to build for AArch64 (the cross-gcc
+  ships only freestanding headers) and on x86-64 only "worked" by silently
+  borrowing host glibc from `/usr/include` — which a freestanding UEFI SDK must
+  never do. Consumers using only `<axl.h>` / `<axl/*.h>` were unaffected.
+- **CLI tools report POSIX exit codes instead of "Aborted."** An unarmed
+  non-zero `main()` return now maps to a small code `1..255` (readable as
+  `%lasterror%`), no longer collapsing every failure to `EFI_ABORTED` (0x15).
+  Convention: `0` success, `1` negative result (no match / usage error), `2`
+  trouble (couldn't open a file).
+- **CLI tools explain *why* they failed.** `grep` / `cat` / `hexdump` / `sed` /
+  `find` now print `tool: cannot open 'path'` to stderr and exit 2 on a file
+  they can't open (previously: `grep` silently returned 0, `cat` a stray code,
+  `hexdump` wrote to stdout). `find <missing>` errors with a message instead of
+  echoing the bogus name.
+- **`mkrd` no longer clobbers `%path%`** — the map refresh snapshots and restores
+  it around the shell's `map -r`.
+- **`dmidecode`** groups records by ascending SMBIOS type (stable).
+
+### Changed
+
+- **`tar` accepts `-f`** (GNU/BSD style), and `axl_args` now supports getopt
+  short-flag bundling in default mode (`-cf a.tar`, `grep -ic pat f`).
+
 ## 2.8.7 — 2026-07-08
 
 ### Added

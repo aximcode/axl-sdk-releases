@@ -150,8 +150,8 @@ run_hexdump(AxlArgs *a)
     /* Open file */
     file = axl_fopen(path, "r");
     if (file == NULL) {
-        axl_printf("Hexdump: cannot open '%s'\n", path);
-        return 1;
+        axl_printerr("hexdump: cannot open '%s'\n", path);
+        return 2;
     }
 
     if (verbose) {

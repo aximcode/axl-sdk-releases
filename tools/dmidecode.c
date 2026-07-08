@@ -29,6 +29,31 @@
 #include <axl.h>
 #include <axl/axl-smbios.h>
 
+/* Cap on records collected for the type-sorted dump. Generous — even a large
+   server (hundreds of DIMMs + CPUs + slots) stays well under this; anything
+   past the cap is simply not re-emitted (the dump is still well-formed). */
+#define DMI_MAX_RECORDS  1024u
+
+/* A collected SMBIOS record + its original table position, so the (unstable)
+   axl_qsort can be given a stable tie-break and preserve handle order within a
+   type. */
+typedef struct {
+    AxlSmbiosHeader *hdr;
+    size_t           order;
+} DmiRecord;
+
+/* Order by SMBIOS type ascending, then by table position (stable tie-break). */
+static int
+dmi_record_cmp(const void *pa, const void *pb)
+{
+    const DmiRecord *a = (const DmiRecord *)pa;
+    const DmiRecord *b = (const DmiRecord *)pb;
+    if (a->hdr->Type != b->hdr->Type) {
+        return (int)a->hdr->Type - (int)b->hdr->Type;
+    }
+    return (a->order < b->order) ? -1 : (a->order > b->order) ? 1 : 0;
+}
+
 static const AxlArgDesc flags[] = {
     { .name = "type",    .short_name = 't', .type = AXL_ARG_STRING,
       .help = "Filter output to records of this SMBIOS type" },
@@ -568,9 +593,26 @@ run_dmidecode(AxlArgs *a)
         axl_printf("SMBIOS %u.%u present.\n\n", major, minor);
     }
 
+    /* Emit records grouped by ascending SMBIOS type (all Type 17 memory
+       devices together, etc.) rather than dmidecode(8)'s raw table order —
+       far easier to browse in a full dump. Collect the record pointers (the
+       table is static in memory, so they stay valid) with their table position,
+       then axl_qsort by (Type, table-position). The table-position tie-break
+       makes the otherwise-unstable introsort preserve handle order within a
+       type. */
+    DmiRecord records[DMI_MAX_RECORDS];
+    size_t n_records = 0;
     AxlSmbiosHeader *hdr = NULL;
+    while ((hdr = axl_smbios_next(hdr)) != NULL && n_records < DMI_MAX_RECORDS) {
+        records[n_records].hdr   = hdr;
+        records[n_records].order = n_records;
+        n_records++;
+    }
+    axl_qsort(records, n_records, sizeof(records[0]), dmi_record_cmp);
+
     size_t count = 0;
-    while ((hdr = axl_smbios_next(hdr)) != NULL) {
+    for (size_t i = 0; i < n_records; i++) {
+        hdr = records[i].hdr;
         if (filter_type >= 0 && hdr->Type != (uint8_t)filter_type) {
             continue;
         }

@@ -9,8 +9,10 @@
 
 #include "axl-test.h"
 
+#include <axl/axl-args.h>
 #include <axl/axl-atexit.h>
 #include <axl/axl-cancellable.h>
+#include <axl/axl-console.h>
 #include <axl/axl-event.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-runtime.h>
@@ -265,11 +267,21 @@ test_signal_install_accepts_handler_and_null(void)
 static void
 test_exit_status_resolver(void)
 {
-    /* Unarmed: the legacy rc -> EFI_STATUS map (unchanged behavior). */
+    /* Unarmed: rc 0 -> EFI_SUCCESS, and a nonzero rc -> a small POSIX-style
+       code (1..255, top bit clear) so the shell shows %lasterror%=N instead of
+       collapsing every failure to EFI_ABORTED. Masked to a byte. */
     test_check(axl_backend_resolve_exit_status(0) == (uint64_t)AXL_EFI_SUCCESS,
                "exit-status: unarmed rc 0 -> EFI_SUCCESS");
-    test_check(axl_backend_resolve_exit_status(1) == (uint64_t)AXL_EFI_ABORTED,
-               "exit-status: unarmed rc nonzero -> EFI_ABORTED");
+    test_check(axl_backend_resolve_exit_status(1) == 1,
+               "exit-status: unarmed rc 1 -> 1 (small-int, not EFI_ABORTED)");
+    test_check(axl_backend_resolve_exit_status(2) == 2,
+               "exit-status: unarmed rc 2 -> 2");
+    test_check(!AXL_EFI_ERROR(axl_backend_resolve_exit_status(1)),
+               "exit-status: unarmed nonzero is non-error-class (top bit clear)");
+    test_check(axl_backend_resolve_exit_status(256) == 1,
+               "exit-status: rc with a zero low byte maps to 1, never 0");
+    test_check(axl_backend_resolve_exit_status(-1) == 0xFF,
+               "exit-status: negative rc masks to 0xFF, not a giant value");
 
     /* Armed: a verbatim status wins for ANY rc — including a non-error-class
        code (top bit clear), which the old path could never produce. */
@@ -294,8 +306,8 @@ test_exit_status_resolver(void)
     /* CRITICAL: disarm so the pending status can't leak into THIS test
        binary's own exit (CRT0 resolves it on return). */
     axl_backend_clear_exit_status();
-    test_check(axl_backend_resolve_exit_status(1) == (uint64_t)AXL_EFI_ABORTED,
-               "exit-status: clear() disarms; legacy map restored");
+    test_check(axl_backend_resolve_exit_status(1) == 1,
+               "exit-status: clear() disarms; small-int map restored");
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +405,151 @@ test_app_image_path_is_canonical(void)
 }
 
 // ---------------------------------------------------------------------------
+// Universal -b / --page pagination flag
+// (axl_args_run recognizes it; axl_console_set_page_break toggles the mode)
+// ---------------------------------------------------------------------------
+
+static const char *g_page_pos = NULL;
+static bool        g_page_ran = false;
+
+static int
+page_pos_handler(AxlArgs *a)
+{
+    g_page_ran = true;
+    g_page_pos = axl_args_get_string(a, "path");
+    return 0;
+}
+
+static void
+test_universal_page_flag_stripped(void)
+{
+    /* A tool that does NOT declare -b: the framework must recognize the
+       universal page-break option, consume it, and leave the tool's
+       positional intact — never reject it as an unknown flag. */
+    static const AxlArgDesc pos[] = {
+        { .name = "path", .type = AXL_ARG_STRING, .required = true },
+        {0}
+    };
+    g_page_ran = false; g_page_pos = NULL;
+    char *argv[] = { (char *)"tool", (char *)"-b", (char *)"hello", NULL };
+    int rc = axl_args_run(3, argv, &(AxlArgsNode){
+        .name = "tool", .positionals = pos, .handler = page_pos_handler,
+    });
+    test_check(rc == 0, "page-flag: -b accepted (not unknown), handler ran");
+    test_check(g_page_ran, "page-flag: handler invoked");
+    test_check(g_page_pos != NULL && axl_strcmp(g_page_pos, "hello") == 0,
+               "page-flag: positional 'hello' survived -b stripping");
+    axl_console_set_page_break(false);   /* don't leak the mode into later tests */
+}
+
+static bool g_page_own_b  = false;
+static bool g_page_own_ran = false;
+
+static int
+page_own_b_handler(AxlArgs *a)
+{
+    g_page_own_ran = true;
+    g_page_own_b   = axl_args_get_bool(a, "basic");
+    return 0;
+}
+
+static void
+test_tool_own_b_flag_wins(void)
+{
+    /* A tool that declares its own -b keeps it: the universal page
+       option must DEFER, so an existing tool's -b is unaffected. */
+    static const AxlArgDesc flags[] = {
+        { .name = "basic", .short_name = 'b', .type = AXL_ARG_BOOL },
+        {0}
+    };
+    g_page_own_ran = false; g_page_own_b = false;
+    char *argv[] = { (char *)"tool", (char *)"-b", NULL };
+    int rc = axl_args_run(2, argv, &(AxlArgsNode){
+        .name = "tool", .flags = flags, .handler = page_own_b_handler,
+    });
+    test_check(rc == 0, "page-flag: tool with own -b dispatches");
+    test_check(g_page_own_ran, "page-flag: own-b handler invoked");
+    test_check(g_page_own_b,
+               "page-flag: tool's own -b set (universal option deferred)");
+    axl_console_set_page_break(false);
+}
+
+static void
+test_universal_b_survives_unrelated_page_flag(void)
+{
+    /* The two spellings defer INDEPENDENTLY: a tool that declares an
+       unrelated `page` flag (different short) must still get the universal
+       `-b` — `page` must not revoke `-b`, or the tool would see an "unknown
+       flag" error the feature promises never happens. */
+    static const AxlArgDesc flags[] = {
+        { .name = "page", .short_name = 'p', .type = AXL_ARG_STRING },
+        {0}
+    };
+    static const AxlArgDesc pos[] = {
+        { .name = "path", .type = AXL_ARG_STRING, .required = true },
+        {0}
+    };
+    g_page_ran = false; g_page_pos = NULL;
+    char *argv[] = { (char *)"tool", (char *)"-b", (char *)"hello", NULL };
+    int rc = axl_args_run(3, argv, &(AxlArgsNode){
+        .name = "tool", .flags = flags, .positionals = pos,
+        .handler = page_pos_handler,
+    });
+    test_check(rc == 0, "page-flag: -b accepted despite unrelated 'page' flag");
+    test_check(g_page_ran, "page-flag: independent-defer handler ran");
+    test_check(g_page_pos != NULL && axl_strcmp(g_page_pos, "hello") == 0,
+               "page-flag: -b stripped, positional survived (independent defer)");
+    axl_console_set_page_break(false);
+}
+
+// ---------------------------------------------------------------------------
+// axl_argv_drop — in-place argv slot removal (pre-stripper primitive)
+// ---------------------------------------------------------------------------
+
+static void
+test_argv_drop_semantics(void)
+{
+    /* Middle slot: {a,b,c} drop 1 -> {a,c}, argc 2, NULL-terminated. */
+    char *v1[] = { (char *)"a", (char *)"b", (char *)"c", NULL };
+    int n1 = 3;
+    axl_argv_drop(&n1, v1, 1);
+    test_check(n1 == 2, "argv_drop: middle -> argc 2");
+    test_check(axl_strcmp(v1[0], "a") == 0 && axl_strcmp(v1[1], "c") == 0,
+               "argv_drop: middle removed, tail shifted down");
+    test_check(v1[2] == NULL, "argv_drop: NULL-terminated at new end");
+
+    /* First slot. */
+    char *v2[] = { (char *)"a", (char *)"b", (char *)"c", NULL };
+    int n2 = 3;
+    axl_argv_drop(&n2, v2, 0);
+    test_check(n2 == 2 && axl_strcmp(v2[0], "b") == 0
+               && axl_strcmp(v2[1], "c") == 0 && v2[2] == NULL,
+               "argv_drop: first removed, tail shifted");
+
+    /* Last slot. */
+    char *v3[] = { (char *)"a", (char *)"b", (char *)"c", NULL };
+    int n3 = 3;
+    axl_argv_drop(&n3, v3, 2);
+    test_check(n3 == 2 && axl_strcmp(v3[0], "a") == 0
+               && axl_strcmp(v3[1], "b") == 0 && v3[2] == NULL,
+               "argv_drop: last removed");
+
+    /* Out-of-range index is a no-op (argc + slots unchanged). */
+    char *v4[] = { (char *)"a", (char *)"b", NULL };
+    int n4 = 2;
+    axl_argv_drop(&n4, v4, 2);    /* i == argc */
+    axl_argv_drop(&n4, v4, -1);   /* i < 0    */
+    test_check(n4 == 2 && axl_strcmp(v4[0], "a") == 0
+               && axl_strcmp(v4[1], "b") == 0,
+               "argv_drop: out-of-range index is a no-op");
+
+    /* NULL argc/argv are no-ops (no crash). */
+    axl_argv_drop(NULL, v4, 0);
+    axl_argv_drop(&n4, NULL, 0);
+    test_check(n4 == 2, "argv_drop: NULL argc/argv is a no-op");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -424,6 +581,12 @@ test_runtime_main(
 
     test_app_argv0_is_stable();
     test_app_image_path_is_canonical();
+
+    test_universal_page_flag_stripped();
+    test_tool_own_b_flag_wins();
+    test_universal_b_survives_unrelated_page_flag();
+
+    test_argv_drop_semantics();
 
     return test_print_results();
 }

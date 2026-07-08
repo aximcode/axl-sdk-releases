@@ -393,7 +393,10 @@ run_cat(AxlArgs *a)
         }
     }
 
-    return (errors > 0) ? 1 : 0;
+    /* Exit 2 on any file error (couldn't open / read) — a clean, consistent
+       "something failed" code across the tools, with the per-file reason
+       already printed to stderr by cat_one. */
+    return (errors > 0) ? 2 : 0;
 }
 
 AXL_TOOL_MAIN(cat)

@@ -18,7 +18,10 @@ enumerate the character-cell geometries the active console supports
 (``axl_console_text_mode_count`` / ``query_mode`` / ``current_mode`` /
 ``find_mode`` / ``max_mode``) and switch between them
 (``axl_console_text_set_mode``). The graphics-free peer of the AxlGfx
-display-mode API.
+display-mode API. ``axl_console_set_page_break`` toggles the shell's own
+screen-at-a-time output paging (the ``-b`` convention) — delegated to
+``EFI_SHELL_PROTOCOL``, not reimplemented — and ``axl_args_run`` wires a
+universal ``-b`` / ``--page`` option to it automatically.
 
 .. doxygenfile:: axl-console.h
 

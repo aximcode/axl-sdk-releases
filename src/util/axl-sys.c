@@ -12,6 +12,7 @@
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-fs.h>
+#include <axl/axl-env.h>
 #include <axl/axl-log.h>
 #include <axl/axl-digest.h>
 
@@ -86,7 +87,22 @@ axl_reset(int type)
 int
 axl_map_refresh(void)
 {
-    return axl_backend_shell_execute((const unsigned short *)L"map -r");
+    /* The shell's `map -r` regenerates the volume aliases — and on the old EFI
+       1.x shell it also REWRITES the `path` environment variable (replacing the
+       user's device-path-alias form with a fresh fsN form), silently clobbering
+       a search path the user set. Snapshot `path` first (axl_getenv returns an
+       OWNED copy, so it survives the rewrite — the backend's live GetEnv pointer
+       would not) and restore it after, so a map refresh (e.g. mkrd's) never
+       disturbs the user's environment. A no-op where map -r leaves path alone
+       (restoring the same value) and best-effort if the restore can't be
+       represented (path stays as map -r left it, never corrupted). */
+    char *saved_path = axl_getenv("path");
+    int rc = axl_backend_shell_execute((const unsigned short *)L"map -r");
+    if (saved_path != NULL) {
+        axl_setenv("path", saved_path, true);
+        axl_free(saved_path);
+    }
+    return rc;
 }
 
 // ---------------------------------------------------------------------------

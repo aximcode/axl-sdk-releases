@@ -485,6 +485,7 @@ for src in "${COMPILE_SOURCES[@]}"; do
             $OPT_FLAGS -Wall \
             -DAXL_BACKEND_NATIVE \
             -isystem "$SDK_DIR/include/axl-sdk" \
+            -isystem "$SDK_DIR/include/axl-sdk/compat" \
             ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
             ${DEP_ARGS[@]+"${DEP_ARGS[@]}"} \
             -c "$src" -o "$obj" || { echo "ERROR: C++ compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
@@ -496,6 +497,7 @@ for src in "${COMPILE_SOURCES[@]}"; do
             $OPT_FLAGS -Wall \
             -DAXL_BACKEND_NATIVE \
             -isystem "$SDK_DIR/include/axl-sdk" \
+            -isystem "$SDK_DIR/include/axl-sdk/compat" \
             ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
             ${DEP_ARGS[@]+"${DEP_ARGS[@]}"} \
             -c "$src" -o "$obj" || { echo "ERROR: compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
