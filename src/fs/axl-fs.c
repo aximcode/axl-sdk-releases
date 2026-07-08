@@ -156,6 +156,14 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 
     write_size = len;
     rc = axl_backend_file_write(handle, &write_size, buf);
+    /* set_contents replaces the WHOLE file, so truncate to exactly len —
+       otherwise a rewrite with a shorter buffer leaves the previous file's
+       tail behind (open with CREATE does not shrink an existing file). A
+       no-op when the file was not longer than len. */
+    if (rc == AXL_OK && axl_backend_file_set_size(handle, (uint64_t)len)
+                            != AXL_OK) {
+        rc = AXL_ERR;
+    }
     axl_backend_file_close(&handle);
 
     if (rc != AXL_OK) {
@@ -442,6 +450,17 @@ axl_dir_mkdir(const char *path)
 
     if (path == NULL) {
         return AXL_ERR;
+    }
+
+    /* The UEFI FAT create-directory primitive opens an existing entry instead
+       of failing, so it reports success both for an existing directory (which
+       we want to treat as idempotent — mkdir-p and WebDAV COPY-overwrite rely
+       on it) AND for a non-directory occupying the path (a silent conflict we
+       must reject). Resolve the ambiguity up front: an existing directory is
+       success, an existing non-directory is an error. */
+    AxlFsEntry existing;
+    if (axl_file_info(path, &existing) == AXL_OK) {
+        return axl_fs_entry_is_dir(&existing) ? AXL_OK : AXL_ERR;
     }
 
     wide_path = axl_utf8_to_ucs2(path);

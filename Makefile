@@ -238,6 +238,7 @@ endif
 
 LIB_SOURCES = \
     src/backend/native/axl-backend-native.c \
+    src/backend/native/axl-backend-native-efi1x.c \
     src/backend/native/axl-backend-native-event.c \
     src/backend/native/axl-backend-native-mp.c \
     src/mem/axl-mem.c \
@@ -604,7 +605,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest fs-path-selftest fs-read axbench
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -993,6 +994,23 @@ $(PREFIX)/console-text-mode-selftest.efi: $(BUILDDIR)/console-text-mode-selftest
 	$(call LINK_EFI_APP,$(BUILDDIR)/console-text-mode-selftest.o,$@)
 
 $(BUILDDIR)/console-text-mode-selftest.o: test/integration/console-text-mode-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build fs-path-selftest.efi — file-layer path resolution (fsN:-qualified,
+# root-relative, cwd-relative).  Run against BOTH shells by
+# test/integration/test-old-shell-qemu.sh: the modern EDK2 shell resolves
+# through EFI_SHELL_PROTOCOL, the old EFI 1.x shell through the backend's
+# own SHELL_ENVIRONMENT + EFI_FILE_PROTOCOL path.  Parity is the contract.
+# ===================================================================
+
+fs-path-selftest: $(PREFIX)/fs-path-selftest.efi
+	@echo "  Built: $(PREFIX)/fs-path-selftest.efi"
+
+$(PREFIX)/fs-path-selftest.efi: $(BUILDDIR)/fs-path-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/fs-path-selftest.o,$@)
+
+$(BUILDDIR)/fs-path-selftest.o: test/integration/fs-path-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -1499,6 +1517,31 @@ $(PREFIX)/sd-sibling-driver-b.efi: $(BUILDDIR)/sd-sibling-driver-b.o $(PREFIX)/l
 	$(call LINK_EFI_DRIVER,$(BUILDDIR)/sd-sibling-driver-b.o,$@)
 $(BUILDDIR)/sd-sibling-driver-b.o: test/integration/sd-sibling-driver.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -DDRIVER_TAG=B -c $< -o $@
+
+# ===================================================================
+# Build fs-read-probe.efi (launcher) + fs-read-driver.efi (resident driver)
+# — a resident-driver file-READ fixture. Proves a file stream read via
+# axl_fopen -> axl_text_stream_wrap -> axl_readline works the SAME from a
+# resident driver (no SHELL_INTERFACE on its LoadedImage) as from a standalone
+# app, on the old EFI 1.x shell. The shared read chain (fs-read-common.c) is
+# linked into BOTH so the two contexts run byte-identical code.
+# ===================================================================
+
+fs-read: $(PREFIX)/fs-read-probe.efi $(PREFIX)/fs-read-driver.efi
+	@echo "  Built: fs-read-probe.efi + fs-read-driver.efi"
+
+$(PREFIX)/fs-read-probe.efi: $(BUILDDIR)/fs-read-probe.o $(BUILDDIR)/fs-read-common.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/fs-read-probe.o $(BUILDDIR)/fs-read-common.o,$@)
+$(BUILDDIR)/fs-read-probe.o: test/integration/fs-read-probe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(PREFIX)/fs-read-driver.efi: $(BUILDDIR)/fs-read-driver.o $(BUILDDIR)/fs-read-common.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/fs-read-driver.o $(BUILDDIR)/fs-read-common.o,$@)
+$(BUILDDIR)/fs-read-driver.o: test/integration/fs-read-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/fs-read-common.o: test/integration/fs-read-common.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
 # Build SmbusHcShim.efi — DXE driver that publishes

@@ -42,6 +42,13 @@ axl_getenv(
 /**
  * @brief Set a shell environment variable.
  *
+ * On the old EFI 1.x shell (no programmatic SetEnv) this drives the shell's own
+ * `set` command via Execute, which imposes limits the modern shell does not:
+ * @p name must be a bare identifier (`[A-Za-z0-9_]`), and @p value cannot
+ * contain `"`, `%`, or a newline (they would break or inject the command) — such
+ * a value is refused with AXL_ERR rather than set incorrectly. Values with
+ * spaces are fine.
+ *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int

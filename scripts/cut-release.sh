@@ -206,6 +206,18 @@ if ! $ASSUME_YES && ! $DRY_RUN; then
 fi
 
 say "Bumping version + dating CHANGELOG"
+# From here until the release-metadata commit lands, the working tree carries an
+# UNCOMMITTED version bump. Restore it on any early exit — a SIGPIPE from a
+# truncated pager (`cut-release.sh X.Y.Z --dry-run | head`), a Ctrl-C, or any
+# `set -e` failure — so a half-finished run can't strand a stray bump that makes
+# the next cut abort on the clean-tree precondition. (The happy-path revert
+# below is not enough on its own: with `set -euo pipefail`, a SIGPIPE'd
+# `git diff` kills the script before it is reached.)
+restore_metadata() {
+    git checkout -- VERSION include/axl/axl-version.h CHANGELOG.md 2>/dev/null || true
+}
+trap restore_metadata EXIT INT TERM HUP
+
 scripts/bump-version.sh "$VERSION" >/dev/null
 TODAY="$(date +%Y-%m-%d)"
 # Date only the FIRST "## Unreleased" (the active section).
@@ -220,7 +232,8 @@ if $DRY_RUN; then
     git --no-pager diff -- VERSION include/axl/axl-version.h CHANGELOG.md
     note "DRY RUN — would: git commit -m 'release: $TAG' && git push origin main"
     note "DRY RUN — would: wait for CI green, then tag + push + watch + confirm"
-    git checkout -- VERSION include/axl/axl-version.h CHANGELOG.md
+    restore_metadata
+    trap - EXIT INT TERM HUP
     say "DRY RUN — reverted local edits; nothing pushed. Tree is clean."
     exit 0
 fi
@@ -228,6 +241,9 @@ fi
 say "Committing release metadata + pushing main"
 git add VERSION include/axl/axl-version.h CHANGELOG.md
 git commit -q -m "release: $TAG"
+# The bump is committed — there is nothing left to restore, and a later failure
+# (e.g. the push) must NOT roll the working tree back over the commit.
+trap - EXIT INT TERM HUP
 git push origin main
 REL_SHA="$(git rev-parse HEAD)"
 note "pushed release commit $REL_SHA"

@@ -3,6 +3,57 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.7 — 2026-07-08
+
+### Added
+
+- **File layer resolves `fsN:` and cwd-relative paths on the old EFI 1.x
+  shell.** That shell publishes no `EFI_SHELL_PROTOCOL`, so the whole
+  path-based file/directory API (`axl_fopen`, `axl_file_info`,
+  `axl_file_get_contents` / `axl_file_set_contents`, `axl_file_delete` /
+  `axl_file_rename`, `axl_dir_mkdir` / `axl_dir_rmdir` / `axl_dir_open`, and
+  `axl_get_current_dir` / `axl_getenv`) previously failed there — it could not
+  open any `fsN:`-qualified or relative path. The backend now resolves paths
+  itself through `SHELL_ENVIRONMENT` (`GetMap` + `CurDir`) and
+  `EFI_FILE_PROTOCOL`, reaching exact behavioral parity with the modern shell.
+  No API change; consumers that already worked on the modern shell now work on
+  the old one unchanged.
+- **`axl_setenv` / `axl_unsetenv` work on the old EFI 1.x shell.** That shell's
+  `SHELL_ENVIRONMENT` has no programmatic `SetEnv`, so both previously failed
+  there (even from a plain shell app). They now drive the shell's own `set`
+  command through the Execute service — the mechanism `mkrd` already uses for
+  `map -r` — so a consumer that reads a value into a shell variable (e.g. a
+  `-f<file> var` idiom) works on the old shell as it does on the modern one,
+  including from a resident driver. Old-shell-only limits (the `set` command
+  line can't carry them unmangled): the value cannot contain `"`, `^`, `%`, or a
+  newline, and the name must be a bare identifier (`[A-Za-z0-9_]`); such a call
+  returns `AXL_ERR` rather than setting a corrupted value. Values with spaces
+  are fine.
+
+### Changed
+
+- **`axl_dir_mkdir` is now idempotent for an existing directory.** It succeeds
+  when the path already exists *as a directory* (so `mkdir -p` and
+  copy-into-existing flows need no pre-check) and fails only when a
+  *non-directory* already occupies the path. Previously the UEFI FAT
+  create-directory primitive reported success in both cases — including the
+  silent-conflict case where a file was in the way. The docstring's old
+  "AXL_ERR if it already exists" wording is corrected to describe the
+  idempotent contract.
+
+### Fixed
+
+- **`axl_file_set_contents` truncates the target.** It documents "creates or
+  overwrites", but it opened the file with `CREATE` and wrote from offset 0
+  without shrinking, so rewriting an existing file with a *shorter* buffer left
+  the previous tail behind (`"hi"` over `"LONG-DATA"` produced `"hiNG-DATA"`).
+  It now truncates to exactly the written length. Shell-independent — the bug
+  was equally present on the modern shell.
+- **`cut-release.sh --dry-run` no longer strands its version bump.** The
+  version/CHANGELOG bump is now reverted on ANY early exit (via a trap), not
+  only the happy path, so a `--dry-run` piped into `head` (SIGPIPE) or any other
+  interruption can't leave the working tree bumped.
+
 ## 2.8.6 — 2026-07-07
 
 ### Added

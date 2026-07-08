@@ -186,6 +186,33 @@ test_file(void)
           "file: get/set roundtrip content");
     axl_free(contents);
 
+    /* set_contents replaces the ENTIRE file: rewriting with a SHORTER
+       buffer must truncate, not leave a stale tail. (Regression: the
+       impl wrote from offset 0 without shrinking the file, so "hi"
+       over "LONG-DATA" left "hiNG-DATA".) */
+    (void)axl_file_set_contents("fs0:\\axl_trunc.tmp", "LONG-DATA", 9);
+    test_check(axl_file_set_contents("fs0:\\axl_trunc.tmp", "hi", 2) == AXL_OK,
+          "file: set_contents shorter rewrite returns 0");
+    test_check(axl_file_get_contents("fs0:\\axl_trunc.tmp", &contents, &len)
+                   == AXL_OK
+               && len == 2 && test_memcmp(contents, "hi", 2) == 0,
+          "file: set_contents truncates to the new length");
+    axl_free(contents);
+    axl_file_delete("fs0:\\axl_trunc.tmp");
+
+    /* mkdir is idempotent on an existing DIRECTORY — WebDAV COPY-overwrite
+       and mkdir-p flows rely on that — but must REJECT a path already
+       occupied by a NON-directory rather than silently report success. */
+    test_check(axl_dir_mkdir("fs0:\\axl_md_dir") == AXL_OK,
+          "dir: mkdir creates a new directory");
+    test_check(axl_dir_mkdir("fs0:\\axl_md_dir") == AXL_OK,
+          "dir: mkdir on an existing directory is idempotent");
+    (void)axl_file_set_contents("fs0:\\axl_md_file", "x", 1);
+    test_check(axl_dir_mkdir("fs0:\\axl_md_file") != AXL_OK,
+          "dir: mkdir over an existing file is refused");
+    axl_file_delete("fs0:\\axl_md_file");
+    axl_dir_rmdir("fs0:\\axl_md_dir");
+
     /* --- axl_file_rename: full-path new_path acceptance.
        The UEFI shell backend used to stuff the entire new_path
        (including `fs0:\` prefix) into EFI_FILE_INFO.FileName,

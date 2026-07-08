@@ -423,14 +423,21 @@ static __attribute__((unused)) EFI_GUID gEfiShellInterfaceGuid =
       {0x8e, 0x57, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} };
 
 // EFI 1.x SHELL_ENVIRONMENT protocol — MINIMAL prefix, declared only as far as
-// GetMap (the 3rd member), which is all AXL reads. GetMap(Name) returns the
-// EFI_DEVICE_PATH the shell maps a name (e.g. L"fs1") to, or NULL — the reverse
-// of the modern GetMapFromDevicePath, and the only way to read the map on the
-// old shell (its map is not the EDK2 EFI_SHELL_PROTOCOL map). Members past
-// GetMap (AddCmd, AddProt, GetProt, CurDir, ...) are omitted: this struct is
-// only ever read through a firmware-owned pointer, never allocated by us, so a
-// short prefix is safe. Field order/types from the EFI Toolkit
-// EFI_SHELL_ENVIRONMENT.
+// CurDir (the 7th member), which is the last one AXL reads. Members past CurDir
+// (FileMetaArg, FreeFileList, NewShell) are omitted: this struct is only ever
+// read through a firmware-owned pointer, never allocated by us, so a short
+// prefix is safe. The three middle members AXL never calls are declared as
+// `void *` placeholders purely to get the later members at the right offsets.
+// Field order/types from the EFI Toolkit EFI_SHELL_ENVIRONMENT.
+//
+//   GetMap(Name)   returns the EFI_DEVICE_PATH the shell maps a name (e.g.
+//                  L"fs1") to, or NULL — the reverse of the modern
+//                  GetMapFromDevicePath, and the only way to read the map on
+//                  the old shell (its map is not the EDK2 EFI_SHELL_PROTOCOL
+//                  map). Declared `void *` return: the Toolkit header says
+//                  CHAR16 * but the shell returns a device path.
+//   CurDir(Dev)    returns the current directory of device `Dev`, or of the
+//                  current device when Dev is NULL, e.g. L"fs0:\\dir".
 typedef struct {
     /* The shellenv.h typedef declares ParentImageHandle as `EFI_HANDLE *`, but
        the EFI Toolkit's own ShellExecute wrapper (libefishell/misc.c) passes
@@ -440,8 +447,12 @@ typedef struct {
     EFI_STATUS (EFIAPI *Execute)(EFI_HANDLE   ParentImageHandle,
                                  CHAR16      *CommandLine,
                                  BOOLEAN      DebugOutput);
-    void   *GetEnv;
-    void *(EFIAPI *GetMap)(CHAR16 *Name);
+    CHAR16 *(EFIAPI *GetEnv)(CHAR16 *Name);
+    void   *(EFIAPI *GetMap)(CHAR16 *Name);
+    void    *AddCmd;
+    void    *AddProt;
+    void    *GetProt;
+    CHAR16 *(EFIAPI *CurDir)(CHAR16 *DeviceName);
 } EFI_SHELL_ENVIRONMENT;
 
 // ===================================================================

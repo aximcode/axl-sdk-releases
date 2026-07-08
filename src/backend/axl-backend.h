@@ -600,11 +600,13 @@ axl_backend_shell_execute(
  * Uses the shell's device-path -> map lookup so the returned name matches
  * what the user and `map` / `vol fsN:` see, and tracks remaps (mkrd, USB
  * hot-plug) — unlike a positional LocateHandle index. Writes the lowercased
- * `fs<n>` alias WITHOUT the trailing ':' (e.g. "fs3") into @p out.
+ * `fs<n>` alias WITHOUT the trailing ':' (e.g. "fs3") into @p out. On the old
+ * EFI 1.x shell (no EFI_SHELL_PROTOCOL) it reverse-looks-up the name through
+ * SHELL_ENVIRONMENT.GetMap, so it resolves once the disk is in the shell's map.
  *
- * @return AXL_OK on success; AXL_ERR on bad args or when the device path
- *         has no `fs<n>` shell mapping; AXL_UNSUPPORTED when the backend has
- *         no shell (callers then fall back to a positional name).
+ * @return AXL_OK on success; AXL_ERR on bad args, when the device path has no
+ *         `fs<n>` mapping, or when the backend has no shell at all (callers
+ *         then fall back to a positional name).
  */
 int
 axl_backend_shell_map_name(
@@ -621,8 +623,8 @@ axl_backend_shell_map_name(
  * an `fs<n>` name or a custom SetMap name (e.g. "RD"). For "is this device
  * mapped, and as what?" queries.
  *
- * @return AXL_OK on success; AXL_ERR on bad args or no mapping;
- *         AXL_UNSUPPORTED when there is no shell.
+ * @return AXL_OK on success; AXL_ERR on bad args, no mapping, or no shell
+ *         (the old EFI 1.x shell uses the SHELL_ENVIRONMENT.GetMap fallback).
  */
 int
 axl_backend_shell_map_alias(

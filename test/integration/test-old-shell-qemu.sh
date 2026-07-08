@@ -57,15 +57,20 @@ fi
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 NATIVE_DIR="$PROJECT_DIR/out/native-x64"
 
-# Build the fixtures: the sibling-locate probe + driver, and mkrd.
+# Build the fixtures: the sibling-locate probe + driver, mkrd, the file-layer
+# path-resolution selftest, and the resident-driver file-read + setenv fixture.
 make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
-    sd-sibling tools 2>&1 | tail -2
+    sd-sibling tools fs-path-selftest fs-read 2>&1 | tail -2
 
 PROBE="$NATIVE_DIR/sd-sibling-probe.efi"
 DRIVER_A="$NATIVE_DIR/sd-sibling-driver-a.efi"
 MKRD="$NATIVE_DIR/tools/mkrd.efi"
+FSSELF="$NATIVE_DIR/fs-path-selftest.efi"
+FSREAD_PROBE="$NATIVE_DIR/fs-read-probe.efi"
+FSREAD_DRIVER="$NATIVE_DIR/fs-read-driver.efi"
 
-if [[ ! -f "$PROBE" || ! -f "$DRIVER_A" || ! -f "$MKRD" ]]; then
+if [[ ! -f "$PROBE" || ! -f "$DRIVER_A" || ! -f "$MKRD" || ! -f "$FSSELF" \
+   || ! -f "$FSREAD_PROBE" || ! -f "$FSREAD_DRIVER" ]]; then
     echo "WARN: fixtures not built on this box; skipping."
     echo "old-shell test: SKIP"
     exit 0
@@ -73,6 +78,11 @@ fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+
+# Fixture files the file-layer selftest resolves (fs0:\dof_in.txt,
+# fs0:\sub\nested.txt — staged into place by --extra at boot).
+printf 'HELLO\n'  > "$WORK/dof_in.txt"
+printf 'NESTED\n' > "$WORK/nested.txt"
 
 # Run run-qemu.sh against the old shell with a custom startup.nsh, capturing
 # the serial log. $1 = nsh file, $2 = positional .efi, rest = extra args.
@@ -91,16 +101,22 @@ DRIVE="$TESTS_DIR/drive-serial.py"
 # interactive prompt = its FULL mode, where `map -r` generates the device-path
 # aliases that `map <name> fsN:` needs. This is the ONLY way to test the
 # label-alias path — under a startup.nsh (backward-compatible mode) those
-# aliases don't exist and the alias silently can't resolve. $1 = positional
-# .efi, rest = commands to type. Echoes the ANSI-stripped transcript.
+# aliases don't exist and the alias silently can't resolve. Leading
+# `--extra SRC:DST` pairs stage additional files; then $1 = positional .efi,
+# rest = commands to type. Echoes the ANSI-stripped transcript.
 run_old_shell_interactive() {
+    local extras=()
+    while [[ "$1" == "--extra" ]]; do
+        extras+=(--extra "$2"); shift 2
+    done
     local positional="$1"; shift
     local sock="$WORK/serial.sock"
     local nsh="$WORK/interactive.nsh"
     rm -f "$sock"
     printf '@echo -off\necho AXL-INTERACTIVE-READY\n' > "$nsh"
     timeout 60 "$RUN_QEMU" --arch X64 --shell "$OLD_SHELL" --background \
-        --serial-socket "$sock" --timeout 90 --nsh "$nsh" "$positional" \
+        --serial-socket "$sock" --timeout 90 --nsh "$nsh" \
+        "${extras[@]}" "$positional" \
         >/dev/null 2>&1
     # --ready "Shell>": wait for the interactive prompt before typing, so a
     # command can't land while the shell is still in startup.nsh (backward-
@@ -244,6 +260,158 @@ if echo "$INT_LOG" | grep -q 'No RAM disks found'; then
     test_host_pass "mkrd -d destroys the disk interactively (map cleaned)"
 else
     test_host_fail "mkrd -d destroys the disk interactively (map cleaned)"
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 4: file-layer path resolution (fsN:-qualified + cwd-relative). The
+# old shell has no EFI_SHELL_PROTOCOL, so the backend resolves paths itself
+# through SHELL_ENVIRONMENT (GetMap/CurDir) + EFI_FILE_PROTOCOL. The selftest
+# runs the SAME battery the modern shell passes; here we assert every check
+# passes (fail=0) plus a couple of critical relative-path lines by name.
+#
+# The selftest reports twice: a root-cwd battery (fs0:\) and a sub-cwd battery
+# (fs0:\sub) that pins relative resolution to the current directory. Relative
+# resolution rides on CurDir, whose value could in principle differ between
+# backward-compatible (startup.nsh) and interactive mode — so this runs in
+# BOTH modes (Scenario 4 = startup.nsh, Scenario 5 = interactive).
+# ---------------------------------------------------------------------------
+echo "=== old-shell file-layer path resolution (startup.nsh) ==="
+
+cat > "$WORK/fspath.nsh" <<'NSH'
+fs0:
+cd \
+echo FS_ROOT_BEGIN
+fs-path-selftest.efi
+cd \sub
+fs0:\fs-path-selftest.efi sub
+fs0:
+echo FS_DONE_MARKER
+reset -s
+NSH
+
+FS_LOG=$(run_old_shell "$WORK/fspath.nsh" "$FSSELF" \
+    --extra "$WORK/dof_in.txt:dof_in.txt" \
+    --extra "$WORK/nested.txt:sub/nested.txt")
+
+echo "$FS_LOG" | grep -aE 'FSSELF:(results|info-rel|get-rel|set-contents=)' \
+    | sed 's/^/  /'
+
+# Two "results" footers: root battery then sub battery. Both must be clean.
+if [[ $(echo "$FS_LOG" | grep -c 'FSSELF:results pass=29 fail=0') -eq 1 \
+   && $(echo "$FS_LOG" | grep -c 'FSSELF:results pass=7 fail=0') -eq 1 ]]; then
+    test_host_pass "file layer resolves all paths on the old shell (startup.nsh)"
+else
+    test_host_fail "file layer resolves all paths on the old shell (startup.nsh)"
+fi
+# Name the relative-resolution lines explicitly — they are the field symptom
+# (Mark's `do -f<relative>` scripts) and the RW-probe (`set-contents`).
+if echo "$FS_LOG" | grep -q '^FSSELF:info-rel=PASS'; then
+    test_host_pass "cwd-relative stat resolves (startup.nsh)"
+else
+    test_host_fail "cwd-relative stat resolves (startup.nsh)"
+fi
+if echo "$FS_LOG" | grep -q '^FSSELF:set-contents=PASS'; then
+    test_host_pass "writable-volume probe succeeds (startup.nsh; the RW: ro fix)"
+else
+    test_host_fail "writable-volume probe succeeds (startup.nsh; the RW: ro fix)"
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 5: the CurDir-dependent (relative-path) half of the battery driven
+# INTERACTIVELY, to prove relative resolution behaves the same in full mode as
+# under a startup.nsh. Only the sub-cwd battery is mode-DEPENDENT (it rides on
+# CurDir); the fsN:-qualified and root paths are mode-invariant and already
+# pinned deterministically by Scenario 4. Running just the 7-check sub battery
+# also keeps the interactive transcript short enough for drive-serial to
+# capture in full (a 30-line burst can outrun its per-command drain window).
+# ---------------------------------------------------------------------------
+echo "=== old-shell file-layer path resolution (interactive) ==="
+
+FS_INT_LOG=$(run_old_shell_interactive \
+    --extra "$WORK/dof_in.txt:dof_in.txt" \
+    --extra "$WORK/nested.txt:sub/nested.txt" \
+    "$FSSELF" \
+    "fs0:" "cd \\sub" "fs0:\\fs-path-selftest.efi sub" "fs0:" "reset -s")
+
+echo "$FS_INT_LOG" | grep -aE 'FSSELF:(results|sub-cwdrel)' | sed 's/^/  /'
+
+if echo "$FS_INT_LOG" | grep -q '^FSSELF:results pass=7 fail=0'; then
+    test_host_pass "cwd-relative battery resolves interactively (full mode)"
+else
+    test_host_fail "cwd-relative battery resolves interactively (full mode)"
+fi
+if echo "$FS_INT_LOG" | grep -q '^FSSELF:sub-cwdrel-get=PASS'; then
+    test_host_pass "cwd-relative read from a subdir cwd resolves (interactive)"
+else
+    test_host_fail "cwd-relative read from a subdir cwd resolves (interactive)"
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 6: file READ + setenv from a RESIDENT DRIVER (no SHELL_INTERFACE on
+# its LoadedImage). This is the `-f<file> var` consumer pattern (fopen ->
+# text-wrap -> readline -> setenv) that a standalone selftest can't cover — the
+# read runs in a driver context, and the setenv drives the old shell's `set`
+# command through Execute (the old shell has no programmatic SetEnv). The
+# launcher reads the same file standalone ("app") too, so read parity is
+# checked in one run. `dof_in.txt` holds a spaced line to prove the quoted
+# `set` carries the whole value.
+# ---------------------------------------------------------------------------
+echo "=== old-shell resident-driver file read + setenv ==="
+
+printf 'HELLO_LINE one two\n' > "$WORK/dof_line.txt"
+
+cat > "$WORK/fsread.nsh" <<'NSH'
+fs0:
+cd \
+echo FSREAD_BEGIN
+app\fs-read-probe.efi fs0:\dof_line.txt
+echo FSREAD_SHELL_APP
+set FSRVAR_app
+echo FSREAD_SHELL_DRV
+set FSRVAR_drv
+echo FSREAD_DONE_MARKER
+reset -s
+NSH
+
+FSREAD_LOG=$(run_old_shell "$WORK/fsread.nsh" "$FSREAD_PROBE" \
+    --extra "$WORK/dof_line.txt:dof_line.txt" \
+    --extra "$FSREAD_PROBE:app/fs-read-probe.efi" \
+    --extra "$FSREAD_DRIVER:app/fs-read-driver.efi")
+
+echo "$FSREAD_LOG" | grep -aE 'FSREAD:(app|drv)-(line|setenv|getenv)|FSRVAR_(app|drv)' \
+    | sed 's/^/  /'
+
+# 1. The driver read matches the standalone read (both the full spaced line).
+if echo "$FSREAD_LOG" | grep -q '^FSREAD:drv-line=\[HELLO_LINE one two\]$'; then
+    test_host_pass "resident driver reads the file stream (fopen+readline)"
+else
+    test_host_fail "resident driver reads the file stream (fopen+readline)"
+fi
+# 2. setenv from the driver succeeds (drives the shell's `set` via Execute with
+#    a SHELL_INTERFACE-bearing parent handle — a driver's own handle is rejected).
+if echo "$FSREAD_LOG" | grep -q '^FSREAD:drv-setenv=OK$'; then
+    test_host_pass "resident driver setenv succeeds on the old shell"
+else
+    test_host_fail "resident driver setenv succeeds on the old shell"
+fi
+if echo "$FSREAD_LOG" | grep -q '^FSREAD:drv-getenv=\[HELLO_LINE one two\]$'; then
+    test_host_pass "resident driver getenv reflects the value it just set"
+else
+    test_host_fail "resident driver getenv reflects the value it just set"
+fi
+# unset must DELETE the var (parity with the modern shell's empty-value SetEnv),
+# driven via the old shell's `set -d`, not leave an empty var behind.
+if echo "$FSREAD_LOG" | grep -q '^FSREAD:drv-unset=gone$'; then
+    test_host_pass "resident driver unsetenv deletes the var (set -d)"
+else
+    test_host_fail "resident driver unsetenv deletes the var (set -d)"
+fi
+# 3. The var the driver set is visible to the SHELL afterward (persisted past
+#    the launcher's exit) — the whole point of `do -f<file> var`.
+if echo "$FSREAD_LOG" | grep -qE '^\* +FSRVAR_drv : HELLO_LINE one two'; then
+    test_host_pass "driver-set var persists into the shell (do -f<file> var)"
+else
+    test_host_fail "driver-set var persists into the shell (do -f<file> var)"
 fi
 
 test_host_summary "old-shell test (X64)"

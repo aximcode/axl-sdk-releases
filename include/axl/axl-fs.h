@@ -388,9 +388,14 @@ axl_file_move(
 );
 
 /**
- * @brief Create a directory.
+ * @brief Create a directory (idempotent).
  *
- * @return AXL_OK on success, AXL_ERR on error (including if it already exists).
+ * Succeeds if @p path already exists AS A DIRECTORY (so mkdir-p and
+ * copy-into-existing flows need no pre-check), but fails if a non-directory
+ * already occupies @p path.
+ *
+ * @return AXL_OK if the directory was created or already exists; AXL_ERR if a
+ *     non-directory occupies @p path, or on any other error.
  */
 int
 axl_dir_mkdir(
@@ -583,10 +588,14 @@ axl_volume_enumerate(
  * must publish a caller-usable `fsN` (e.g. a freshly created RAM disk): a real
  * alias, or a clean failure you can report — never a plausible-but-wrong index.
  *
+ * On the old EFI 1.x shell (no GetMapFromDevicePath) it reverse-looks-up the
+ * name via SHELL_ENVIRONMENT.GetMap, so it resolves once the disk is in the
+ * shell's map (after `map -r`).
+ *
  * @return AXL_OK with @p out set to the alias; AXL_ERR if @p device_path has no
- *     shell mapping (not yet remapped, or no fs alias), or an argument is
- *     invalid; AXL_UNSUPPORTED if the shell doesn't publish GetMapFromDevicePath.
- *     @p out is left unchanged on any non-AXL_OK return.
+ *     shell mapping (not yet remapped, or no fs alias), an argument is invalid,
+ *     or the backend has no shell at all. @p out is left unchanged on any
+ *     non-AXL_OK return.
  */
 AXL_WARN_UNUSED int
 axl_volume_map_name(
@@ -612,10 +621,12 @@ axl_volume_map_name(
  * always resolves to that alias. An alias longer than @p out_size is reported
  * as AXL_ERR, never truncated.
  *
+ * On the old EFI 1.x shell (no GetMapFromDevicePath) it reverse-looks-up the
+ * name via SHELL_ENVIRONMENT.GetMap (fs<n> form).
+ *
  * @return AXL_OK with @p out set to the alias; AXL_ERR if @p device_path has
- *     no shell mapping or an argument is invalid; AXL_UNSUPPORTED if the shell
- *     doesn't publish GetMapFromDevicePath. @p out is left unchanged on any
- *     non-AXL_OK return.
+ *     no shell mapping, an argument is invalid, or the backend has no shell.
+ *     @p out is left unchanged on any non-AXL_OK return.
  */
 AXL_WARN_UNUSED int
 axl_volume_map_alias(

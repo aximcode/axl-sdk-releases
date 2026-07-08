@@ -11,6 +11,7 @@
 **/
 
 #include "axl-backend.h"
+#include "axl-backend-native-efi1x.h"  /* old EFI 1.x shell path resolution */
 #include "axl-stdio-bridge.h"  /* AxlStdioBridge, bridge install/uninstall */
 #include <axl/axl-driver.h>    /* axl_protocol_install, axl_protocol_uninstall */
 #include <axl/axl-sys.h>       /* axl_protocol_find_guid */
@@ -624,7 +625,16 @@ axl_backend_file_open(
 
     shell = get_shell();
     if (shell == NULL) {
-        return AXL_ERR;
+        /* Old EFI 1.x shell: resolve + open natively. The resulting
+           EFI_FILE_PROTOCOL* IS the handle — the same shape a
+           SHELL_FILE_HANDLE has on the modern shell, so the handle-based
+           ops below stay shell-agnostic. */
+        EFI_FILE_PROTOCOL *file = NULL;
+        if (axl_efi1x_file_open(path, mode, attributes, &file) != AXL_OK) {
+            return AXL_ERR;
+        }
+        *handle = (AxlFileHandle)file;
+        return AXL_OK;
     }
 
     status = shell->OpenFileByName((CHAR16 *)path, &fh, mode);
@@ -662,6 +672,10 @@ axl_backend_file_close(
     shell = get_shell();
     if (shell != NULL) {
         shell->CloseFile((SHELL_FILE_HANDLE)*handle);
+    } else {
+        /* Old EFI 1.x shell: the handle is an EFI_FILE_PROTOCOL*. */
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)*handle;
+        file->Close(file);
     }
     *handle = NULL;
     return AXL_OK;
@@ -683,17 +697,18 @@ axl_backend_file_read(
     EFI_STATUS           status;
     UINTN                usize;
 
-    if (size == NULL || buf == NULL) {
-        return AXL_ERR;
-    }
-
-    shell = get_shell();
-    if (shell == NULL) {
+    if (handle == NULL || size == NULL || buf == NULL) {
         return AXL_ERR;
     }
 
     usize = *size;
-    status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize, buf);
+    shell = get_shell();
+    if (shell != NULL) {
+        status = shell->ReadFile((SHELL_FILE_HANDLE)handle, &usize, buf);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->Read(file, &usize, buf);
+    }
     *size = usize;
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
@@ -714,18 +729,19 @@ axl_backend_file_write(
     EFI_STATUS           status;
     UINTN                usize;
 
-    if (size == NULL || buf == NULL) {
-        return AXL_ERR;
-    }
-
-    shell = get_shell();
-    if (shell == NULL) {
+    if (handle == NULL || size == NULL || buf == NULL) {
         return AXL_ERR;
     }
 
     usize = *size;
-    status = shell->WriteFile((SHELL_FILE_HANDLE)handle, &usize,
-                               (VOID *)buf);
+    shell = get_shell();
+    if (shell != NULL) {
+        status = shell->WriteFile((SHELL_FILE_HANDLE)handle, &usize,
+                                   (VOID *)buf);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->Write(file, &usize, (VOID *)buf);
+    }
     *size = usize;
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
@@ -745,16 +761,17 @@ axl_backend_file_get_position(
     EFI_STATUS           status;
     UINT64               efi_pos;
 
-    if (pos == NULL) {
+    if (handle == NULL || pos == NULL) {
         return AXL_ERR;
     }
 
     shell = get_shell();
-    if (shell == NULL) {
-        return AXL_ERR;
+    if (shell != NULL) {
+        status = shell->GetFilePosition((SHELL_FILE_HANDLE)handle, &efi_pos);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->GetPosition(file, &efi_pos);
     }
-
-    status = shell->GetFilePosition((SHELL_FILE_HANDLE)handle, &efi_pos);
     if (!EFI_ERROR(status)) {
         *pos = efi_pos;
     }
@@ -775,12 +792,17 @@ axl_backend_file_set_position(
     EFI_SHELL_PROTOCOL  *shell;
     EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL) {
+    if (handle == NULL) {
         return AXL_ERR;
     }
 
-    status = shell->SetFilePosition((SHELL_FILE_HANDLE)handle, pos);
+    shell = get_shell();
+    if (shell != NULL) {
+        status = shell->SetFilePosition((SHELL_FILE_HANDLE)handle, pos);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->SetPosition(file, pos);
+    }
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
@@ -803,11 +825,78 @@ axl_backend_file_delete(
 
     shell = get_shell();
     if (shell == NULL) {
-        return AXL_ERR;
+        /* Old EFI 1.x shell: open with write access, then Delete (which
+           closes the handle whether it succeeds or fails). Works for both
+           files and empty directories. */
+        EFI_FILE_PROTOCOL *file = NULL;
+        if (axl_efi1x_file_open(path,
+                                AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
+                                0, &file) != AXL_OK) {
+            return AXL_ERR;
+        }
+        status = file->Delete(file);
+        return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
 
     status = shell->DeleteFileByName((CHAR16 *)path);
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
+/* GetFileInfo for an already-open handle, shell-agnostic. On the modern shell
+   the handle is a SHELL_FILE_HANDLE and GetFileInfo allocates the EFI_FILE_INFO
+   for us; on the old shell it is an EFI_FILE_PROTOCOL* and we run the standard
+   size-probe-then-read GetInfo pair. Either way the result is an
+   axl_backend_alloc'd buffer the caller frees with axl_backend_free — the
+   shell's GetFileInfo uses the same firmware pool allocator. Returns NULL on
+   error. */
+static EFI_FILE_INFO *
+native_file_info(
+    AxlFileHandle  handle
+    )
+{
+    if (handle == NULL) {
+        return NULL;
+    }
+
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell != NULL) {
+        return (EFI_FILE_INFO *)shell->GetFileInfo((SHELL_FILE_HANDLE)handle);
+    }
+
+    EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+    EFI_GUID           guid = gEfiFileInfoGuid;
+    UINTN              sz   = 0;
+    EFI_STATUS         st   = file->GetInfo(file, &guid, &sz, NULL);
+    if (st != EFI_BUFFER_TOO_SMALL || sz == 0) {
+        return NULL;
+    }
+    EFI_FILE_INFO *info = (EFI_FILE_INFO *)axl_backend_alloc(sz);
+    if (info == NULL) {
+        return NULL;
+    }
+    st = file->GetInfo(file, &guid, &sz, info);
+    if (EFI_ERROR(st)) {
+        axl_backend_free(info);
+        return NULL;
+    }
+    return info;
+}
+
+/* SetFileInfo for an already-open handle, shell-agnostic (mirror of
+   native_file_info). */
+static EFI_STATUS
+native_set_file_info(
+    AxlFileHandle         handle,
+    const EFI_FILE_INFO  *info
+    )
+{
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell != NULL) {
+        return shell->SetFileInfo((SHELL_FILE_HANDLE)handle, info);
+    }
+    EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+    EFI_GUID           guid = gEfiFileInfoGuid;
+    return file->SetInfo(file, &guid, (UINTN)info->Size, (VOID *)info);
 }
 
 /**
@@ -824,13 +913,24 @@ axl_backend_file_get_size(
     UINT64               size;
     EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL) {
+    if (handle == NULL) {
         return -1;
     }
 
-    status = shell->GetFileSize((SHELL_FILE_HANDLE)handle, &size);
-    return EFI_ERROR(status) ? -1 : (int64_t)size;
+    shell = get_shell();
+    if (shell != NULL) {
+        status = shell->GetFileSize((SHELL_FILE_HANDLE)handle, &size);
+        return EFI_ERROR(status) ? -1 : (int64_t)size;
+    }
+
+    /* Old EFI 1.x shell: read it out of the file info. */
+    EFI_FILE_INFO *info = native_file_info(handle);
+    if (info == NULL) {
+        return -1;
+    }
+    int64_t result = (int64_t)info->FileSize;
+    axl_backend_free(info);
+    return result;
 }
 
 /**
@@ -843,29 +943,19 @@ axl_backend_file_is_dir(
     const unsigned short  *path  ///< UCS-2 path
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    SHELL_FILE_HANDLE    fh;
-    EFI_FILE_INFO       *info;
-    EFI_STATUS           status;
-    bool                 is_dir = false;
+    AxlFileHandle  handle = NULL;
+    bool           is_dir = false;
 
-    shell = get_shell();
-    if (shell == NULL) {
+    if (axl_backend_file_open(path, AXL_FILE_MODE_READ, 0, &handle) != AXL_OK) {
         return false;
     }
 
-    status = shell->OpenFileByName((CHAR16 *)path, &fh,
-                                    AXL_FILE_MODE_READ);
-    if (EFI_ERROR(status)) {
-        return false;
-    }
-
-    info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
+    EFI_FILE_INFO *info = native_file_info(handle);
     if (info != NULL) {
         is_dir = (info->Attribute & EFI_FILE_DIRECTORY) != 0;
         axl_backend_free(info);
     }
-    shell->CloseFile(fh);
+    axl_backend_file_close(&handle);
     return is_dir;
 }
 
@@ -875,8 +965,7 @@ axl_backend_file_rename(
     const unsigned short  *new_path
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    SHELL_FILE_HANDLE    fh;
+    AxlFileHandle        handle = NULL;
     EFI_FILE_INFO       *info;
     EFI_STATUS           status;
     size_t               new_len;
@@ -884,22 +973,21 @@ axl_backend_file_rename(
     EFI_FILE_INFO       *new_info;
     size_t               i;
 
-    shell = get_shell();
-    if (shell == NULL || old_path == NULL || new_path == NULL) {
+    if (old_path == NULL || new_path == NULL) {
         return AXL_ERR;
     }
 
-    /* Open the existing file */
-    status = shell->OpenFileByName((CHAR16 *)old_path, &fh,
-                                    AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE);
-    if (EFI_ERROR(status)) {
+    /* Open the existing file (shell-agnostic — resolves fsN:/relative). */
+    if (axl_backend_file_open(old_path,
+                              AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
+                              0, &handle) != AXL_OK) {
         return AXL_ERR;
     }
 
     /* Get current file info */
-    info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
+    info = native_file_info(handle);
     if (info == NULL) {
-        shell->CloseFile(fh);
+        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
 
@@ -910,7 +998,7 @@ axl_backend_file_rename(
     new_info = (EFI_FILE_INFO *)axl_backend_alloc(info_size);
     if (new_info == NULL) {
         axl_backend_free(info);
-        shell->CloseFile(fh);
+        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
 
@@ -921,10 +1009,10 @@ axl_backend_file_rename(
         new_info->FileName[i] = (CHAR16)new_path[i];
     }
 
-    status = shell->SetFileInfo(fh, (CONST EFI_FILE_INFO *)new_info);
+    status = native_set_file_info(handle, new_info);
     axl_backend_free(new_info);
     axl_backend_free(info);
-    shell->CloseFile(fh);
+    axl_backend_file_close(&handle);
 
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
@@ -935,25 +1023,22 @@ axl_backend_file_set_size(
     uint64_t       size
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    SHELL_FILE_HANDLE    fh = (SHELL_FILE_HANDLE)handle;
     EFI_FILE_INFO       *info;
     EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL || handle == NULL) {
+    if (handle == NULL) {
         return AXL_ERR;
     }
 
     /* GetFileInfo returns a fresh allocation we mutate and write back —
        same SetFileInfo round-trip the rename path uses. The struct
        (filename tail included) is preserved; only FileSize changes. */
-    info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
+    info = native_file_info(handle);
     if (info == NULL) {
         return AXL_ERR;
     }
     info->FileSize = size;
-    status = shell->SetFileInfo(fh, (CONST EFI_FILE_INFO *)info);
+    status = native_set_file_info(handle, info);
     axl_backend_free(info);
 
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
@@ -968,9 +1053,23 @@ axl_backend_file_mkdir(
     SHELL_FILE_HANDLE    fh;
     EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL || path == NULL) {
+    if (path == NULL) {
         return AXL_ERR;
+    }
+
+    shell = get_shell();
+    if (shell == NULL) {
+        /* Old EFI 1.x shell: Open with CREATE|DIRECTORY makes the directory
+           (and opens it); close the handle. */
+        EFI_FILE_PROTOCOL *dir = NULL;
+        if (axl_efi1x_file_open(path,
+                                AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE
+                                    | AXL_FILE_MODE_CREATE,
+                                EFI_FILE_DIRECTORY, &dir) != AXL_OK) {
+            return AXL_ERR;
+        }
+        dir->Close(dir);
+        return AXL_OK;
     }
 
     status = shell->CreateFile((CHAR16 *)path, EFI_FILE_DIRECTORY, &fh);
@@ -986,7 +1085,9 @@ axl_backend_file_rmdir(
     const unsigned short  *path
     )
 {
-    /* DeleteFileByName works for both files and empty directories */
+    /* DeleteFileByName works for both files and empty directories; the old
+       shell's file_delete opens with write access and calls Delete, which
+       likewise removes an empty directory. */
     return axl_backend_file_delete(path);
 }
 
@@ -1055,25 +1156,20 @@ axl_backend_file_stat(
     bool                  *read_only
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    SHELL_FILE_HANDLE    fh;
+    AxlFileHandle        handle = NULL;
     EFI_FILE_INFO       *info;
-    EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL || path == NULL) {
+    if (path == NULL) {
         return AXL_ERR;
     }
 
-    status = shell->OpenFileByName((CHAR16 *)path, &fh,
-                                    AXL_FILE_MODE_READ);
-    if (EFI_ERROR(status)) {
+    if (axl_backend_file_open(path, AXL_FILE_MODE_READ, 0, &handle) != AXL_OK) {
         return AXL_ERR;
     }
 
-    info = (EFI_FILE_INFO *)shell->GetFileInfo(fh);
+    info = native_file_info(handle);
     if (info == NULL) {
-        shell->CloseFile(fh);
+        axl_backend_file_close(&handle);
         return AXL_ERR;
     }
 
@@ -1094,7 +1190,7 @@ axl_backend_file_stat(
     }
 
     axl_backend_free(info);
-    shell->CloseFile(fh);
+    axl_backend_file_close(&handle);
     return AXL_OK;
 }
 
@@ -1111,7 +1207,8 @@ axl_backend_shell_getenv(
 
     shell = get_shell();
     if (shell == NULL) {
-        return NULL;
+        /* Old EFI 1.x shell: SHELL_ENVIRONMENT.GetEnv. */
+        return axl_efi1x_getenv(name);
     }
     return (const unsigned short *)shell->GetEnv((CONST CHAR16 *)name);
 }
@@ -1126,9 +1223,15 @@ axl_backend_shell_setenv(
     EFI_SHELL_PROTOCOL  *shell;
     EFI_STATUS           status;
 
-    shell = get_shell();
-    if (shell == NULL || name == NULL) {
+    if (name == NULL) {
         return AXL_ERR;
+    }
+
+    shell = get_shell();
+    if (shell == NULL) {
+        /* Old EFI 1.x shell: no SetEnv member — drive the shell's own `set`
+           command through Execute (the mkrd `map -r` pattern). */
+        return axl_efi1x_setenv(name, value, volatile_var);
     }
 
     status = shell->SetEnv((CONST CHAR16 *)name, (CONST CHAR16 *)value,
@@ -1533,7 +1636,8 @@ axl_backend_shell_getcwd(
 
     shell = get_shell();
     if (shell == NULL) {
-        return NULL;
+        /* Old EFI 1.x shell: SHELL_ENVIRONMENT.CurDir. */
+        return axl_efi1x_getcwd();
     }
     return (const unsigned short *)shell->GetCurDir(NULL);
 }
@@ -1555,8 +1659,6 @@ axl_backend_shell_chdir(
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
-static EFI_SHELL_ENVIRONMENT *get_shell_env(void);   /* defined below */
-
 int
 axl_backend_shell_execute(
     const unsigned short  *command
@@ -1577,138 +1679,26 @@ axl_backend_shell_execute(
        `map -r` here refreshes the very map the interactive shell resolves
        `fsN:` against (this is how the legacy mkramdisk mapped its disks: it
        drove the shell's own `map` command rather than any programmatic API). */
-    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
+    EFI_SHELL_ENVIRONMENT *se = axl_efi1x_shell_env();
     if (se != NULL && se->Execute != NULL) {
-        /* Handle by value, per the EFI Toolkit ShellExecute convention. */
-        EFI_STATUS status = se->Execute(gImageHandle, (CHAR16 *)command, FALSE);
+        /* Handle by value, per the EFI Toolkit ShellExecute convention. A
+           resident driver's own handle has no SHELL_INTERFACE and Execute
+           would reject it (EFI_INVALID_PARAMETER), so borrow a shell-launched
+           one. */
+        EFI_STATUS status = se->Execute(axl_efi1x_shell_parent(),
+                                        (CHAR16 *)command, FALSE);
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
     return AXL_ERR;
 }
 
 // ===================================================================
-// EFI 1.x shell map reverse-lookup
+// Shell map reverse-lookup
 //
-// The old EFI 1.x shell has no GetMapFromDevicePath (that is an EDK2
-// EFI_SHELL_PROTOCOL call). Its SHELL_ENVIRONMENT exposes only GetMap(name)
-// -> device_path — the reverse direction. To answer "what fsN is this device
-// path mapped as", we iterate fs0..fsN, GetMap each, and byte-compare the
-// returned device path. Used only when EFI_SHELL_PROTOCOL is absent.
+// On the old EFI 1.x shell these fall back to the SHELL_ENVIRONMENT-based
+// helpers in axl-backend-native-efi1x.c (GetMap has no reverse direction,
+// so those iterate fs0..fsN and byte-compare).
 // ===================================================================
-
-static EFI_SHELL_ENVIRONMENT  *mShellEnv = NULL;
-static bool                    mShellEnvLocated = false;
-
-static EFI_SHELL_ENVIRONMENT *
-get_shell_env(void)
-{
-    if (!mShellEnvLocated) {
-        mShellEnvLocated = true;
-        EFI_GUID guid = gEfiShellEnvironmentGuid;
-        gBS->LocateProtocol(&guid, NULL, (VOID **)&mShellEnv);
-    }
-    return mShellEnv;
-}
-
-/* Total device-path size in bytes, including the trailing END node. Bounded
-   walk; returns 0 on a malformed chain (Length < 4). */
-static size_t
-dp_total_bytes(const void *dp)
-{
-    const uint8_t *p = (const uint8_t *)dp;
-    size_t total = 0;
-    for (unsigned n = 0; n < 256 && p != NULL; n++) {
-        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
-        if (len < 4) {
-            return 0;
-        }
-        total += len;
-        if (p[0] == 0x7f) {   /* END node — included in the total */
-            break;
-        }
-        p += len;
-    }
-    return total;
-}
-
-static bool
-dp_bytes_equal(const void *a, const void *b)
-{
-    size_t sa = dp_total_bytes(a);
-    if (sa == 0 || sa != dp_total_bytes(b)) {
-        return false;
-    }
-    const uint8_t *pa = (const uint8_t *)a;
-    const uint8_t *pb = (const uint8_t *)b;
-    for (size_t i = 0; i < sa; i++) {
-        if (pa[i] != pb[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-#define AXL_EFI1X_FS_SCAN  64u
-
-/* Reverse-look-up @p device_path to its fs<n> name on the old EFI 1.x shell.
-   Writes LOWERCASE "fs<n>" (no colon) into @p out — matching how the old shell
-   itself displays the volume in `map` and its prompt, so a listing stays
-   consistent with the shell you're in (the modern shell's own path returns the
-   uppercase FS<n> it was SetMap'd with). Returns AXL_OK on a match, AXL_ERR
-   otherwise (no shell env, or no fs<n> maps to this path — e.g. the disk isn't
-   in the map yet because `map -r` hasn't run). */
-static int
-efi1x_map_fs_name_from_dp(
-    void   *device_path,
-    char   *out,
-    size_t  out_size
-    )
-{
-    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
-    if (se == NULL || se->GetMap == NULL || device_path == NULL
-        || out_size < 3) {
-        return AXL_ERR;
-    }
-    for (unsigned i = 0; i < AXL_EFI1X_FS_SCAN; i++) {
-        /* Query name "fs<i>" (the old shell stores lowercase; lookups are
-           case-insensitive). */
-        CHAR16   qname[8];
-        unsigned k = 0;
-        qname[k++] = (CHAR16)'f';
-        qname[k++] = (CHAR16)'s';
-        if (i >= 10) {
-            qname[k++] = (CHAR16)('0' + (i / 10));
-        }
-        qname[k++] = (CHAR16)('0' + (i % 10));
-        qname[k] = 0;
-
-        void *dp = se->GetMap(qname);
-        if (dp == NULL || !dp_bytes_equal(dp, device_path)) {
-            continue;
-        }
-        /* Match — build lowercase "fs<i>" (the old shell's own casing) in a
-           local, then copy only if the full name + NUL fits. Rejecting a
-           short buffer (rather than returning a truncated name as success)
-           matches the sibling map_alias truncation contract above. */
-        char     name[8];
-        unsigned j = 0;
-        name[j++] = 'f';
-        name[j++] = 's';
-        if (i >= 10) {
-            name[j++] = (char)('0' + (i / 10));
-        }
-        name[j++] = (char)('0' + (i % 10));
-        name[j] = '\0';
-        if ((size_t)j + 1 > out_size) {
-            return AXL_ERR;
-        }
-        for (unsigned c = 0; c <= j; c++) {
-            out[c] = name[c];
-        }
-        return AXL_OK;
-    }
-    return AXL_ERR;
-}
 
 int
 axl_backend_shell_map_name(
@@ -1723,7 +1713,10 @@ axl_backend_shell_map_name(
 
     EFI_SHELL_PROTOCOL *shell = get_shell();
     if (shell == NULL || shell->GetMapFromDevicePath == NULL) {
-        return AXL_UNSUPPORTED;
+        /* Old EFI 1.x shell: no GetMapFromDevicePath. The efi1x reverse lookup
+           yields exactly the lowercase fs<n> this function reports (resolves
+           only once the disk is in the shell's map, i.e. after `map -r`). */
+        return axl_efi1x_map_fs_name_from_dp(device_path, out, out_size);
     }
 
     /* GetMapFromDevicePath advances the pointer past the matched volume
@@ -1783,7 +1776,7 @@ axl_backend_shell_map_alias(
         /* Old EFI 1.x shell: no GetMapFromDevicePath. Reverse-look-up the
            disk's FS<n> through SHELL_ENVIRONMENT.GetMap instead. Resolves only
            once the disk is actually in the shell's map (after `map -r`). */
-        return efi1x_map_fs_name_from_dp(device_path, out, out_size);
+        return axl_efi1x_map_fs_name_from_dp(device_path, out, out_size);
     }
 
     /* GetMapFromDevicePath advances the pointer; pass a local copy. */
@@ -1827,20 +1820,9 @@ axl_backend_shell_map_exists(
     }
 
     /* Old EFI 1.x shell: no GetDevicePathFromMap. Ask SHELL_ENVIRONMENT.GetMap
-       instead — it wants the BARE name (no trailing ':'), so copy off the
-       colon the caller appended before querying. */
-    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
-    if (se == NULL || se->GetMap == NULL) {
-        return false;
-    }
-    CHAR16   bare[64];
-    unsigned i = 0;
-    while (name[i] != 0 && name[i] != (unsigned short)':' && i < 63) {
-        bare[i] = (CHAR16)name[i];
-        i++;
-    }
-    bare[i] = 0;
-    return se->GetMap(bare) != NULL;
+       instead (axl_efi1x_map_exists strips any ':' the caller appended and
+       tries the case foldings the old shell stores names in). */
+    return axl_efi1x_map_exists(name);
 }
 
 int
