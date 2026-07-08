@@ -3,6 +3,62 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.8.6 — 2026-07-07
+
+### Added
+
+- **`axl_shell_kind()`** (`<axl/axl-shell.h>`) — reports which command shell is
+  hosting the running image: `AXL_SHELL_KIND_UEFI` (the modern EDK2
+  `EFI_SHELL_PROTOCOL`), `AXL_SHELL_KIND_EFI_1X` (the older EFI 1.x shell, which
+  publishes `SHELL_ENVIRONMENT` / `SHELL_INTERFACE` instead), or
+  `AXL_SHELL_KIND_NONE`. It is the single branch point for behavior that differs
+  between the two shells.
+- **`axl_volume_alias_to_fsn()`** (`<axl/axl-fs.h>`) — add a named alias for an
+  already-mapped volume by driving the shell's own `map <alias> <fsN>:` command.
+  This is the map path for shells with no programmatic `SetMap` (the old EFI 1.x
+  shell); because it aliases an existing `fsN` it inherits a resolvable device
+  path where `SetMap`-by-device-path can't.
+
+### Fixed
+
+- **`mkrd -d` refreshes the shell map on the old shell.** Destroying a RAM disk
+  now drives `map -r` (via the shell's Execute service) after unregistering the
+  device, so the removed disk's `fsN` no longer lingers as a dangling entry
+  ("Invalid file system mapping on fsN"). Symmetric with create's map refresh.
+
+- **Shared-driver sibling-locate works with no `EFI_SHELL_PROTOCOL`.**
+  `axl_driver_load_sibling()` (and `axl_shared_driver_locate_sibling()`) now
+  resolve the version-pinned sibling driver from the launcher's own
+  `LoadedImage` device path — its directory and volume — instead of the shell's
+  device-path-to-map lookup. This makes the "thin launcher + resident driver"
+  pattern work on the older EFI 1.x shell and under BDS, where the shell map is
+  unavailable, in addition to the modern shell. The sibling-only / version-pinning
+  contract is unchanged (the driver must still be staged beside the launcher);
+  the shell `path` search is retained as a fallback for a path-searched launch
+  whose firmware left the launcher a bare command name.
+
+### Changed
+
+- **`mkrd` maps the RAM disk on the old shell with no manual `map -r`.** On the
+  older EFI 1.x shell there is no programmatic `SetMap`, but the shell exposes an
+  Execute service — so `mkrd <label>` now drives the shell's own `map -r` (the
+  way the legacy `mkramdisk` did) during create, leaving the disk immediately
+  usable as an `fsN` with no manual step, and **exits 0**. It previously returned
+  a non-zero status that surfaced as `EFI_ABORTED` (aborting a `mkrd X; …; X:`
+  script) and required the user to run `map -r` by hand. When run at the
+  interactive prompt it also aliases the label (`map <label> <fsN>:`), so both
+  `fsN:` and `<label>:` work; under a `startup.nsh` (the shell's
+  backward-compatible mode, where the device-path aliases the alias needs aren't
+  generated) it cleanly maps `fsN:` only. The modern-shell behavior (`SetMap` of
+  an `FS<n>` primary + label alias) is unchanged.
+- **`mkrd -l` resolves the mapping on the old shell too.** Its MAPPING column
+  shows the disk's `fsN` — reverse-looked-up through the EFI 1.x
+  `SHELL_ENVIRONMENT.GetMap` — instead of `(unmapped)`, and the LABEL/ALIAS
+  column shows the label with its colon (`FOOBAR:`) once the alias is set. It
+  renders in the old shell's own lowercase (`fs1:`) while the modern shell keeps
+  its uppercase `FS1:`, so the listing stays consistent with whichever shell is
+  in use.
+
 ## 2.8.5 — 2026-07-07
 
 ### Added

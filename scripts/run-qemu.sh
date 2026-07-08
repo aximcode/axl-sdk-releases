@@ -183,6 +183,7 @@ while [[ $# -gt 0 ]]; do
         --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
+        --shell)      SHELL_OVERRIDE="$2"; shift 2 ;;
         --background) BACKGROUND=true; shift ;;
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
         --serial-log-raw) SERIAL_LOG_RAW="$2"; shift 2 ;;
@@ -527,6 +528,16 @@ export QEMU_DIR
 find_firmware "$ARCH" || { echo "Firmware not found for $ARCH" >&2; exit 1; }
 SHELL_EFI=$(find_shell_efi "$ARCH") || true
 BOOT_NAME=$(boot_efi_name "$ARCH")
+
+# --shell FILE: boot a specific UEFI shell binary instead of the auto-found
+# EDK2 one (e.g. the old EFI 1.x "newshell" Shell106.efi, which has no
+# EDK2 EFI_SHELL_PROTOCOL). Tools are staged on the boot FAT via --extra and
+# run from the custom nsh, so this reproduces the old-shell environment.
+if [[ -n "${SHELL_OVERRIDE:-}" ]]; then
+    [[ -f "$SHELL_OVERRIDE" ]] || { echo "ERROR: --shell file not found: $SHELL_OVERRIDE" >&2; exit 1; }
+    SHELL_EFI="$SHELL_OVERRIDE"
+    echo "[run-qemu] using shell override: $SHELL_EFI" >&2
+fi
 
 # --mount: VirtioFsDxe needs to be in the guest. Modern OVMF/AAVMF
 # builds include it (the QEMU-bundled edk2-*-code.fd, recent EDK2

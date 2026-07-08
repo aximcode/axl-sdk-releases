@@ -4626,6 +4626,22 @@ test_shell_launch(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_shell_kind: which shell is hosting this image. The unit suite is
+// launched from startup.nsh under the modern EDK2 UEFI Shell, so
+// EFI_SHELL_PROTOCOL is present (the same protocol the file-I/O tests above
+// rely on) and the kind is AXL_SHELL_KIND_UEFI. The old EFI 1.x shell path
+// (AXL_SHELL_KIND_EFI_1X) is pinned by the Shell106 integration test — OVMF's
+// modern shell can't reproduce it here.
+// ---------------------------------------------------------------------------
+
+static void
+test_shell_kind(void)
+{
+    test_check(axl_shell_kind() == AXL_SHELL_KIND_UEFI,
+               "shell_kind: EDK2 shell present -> AXL_SHELL_KIND_UEFI");
+}
+
+// ---------------------------------------------------------------------------
 // AxlConsoleMirror (P1) — argument guards only.
 //
 // The positive path (install → swap gST + ReinstallProtocolInterface on
@@ -7900,6 +7916,7 @@ test_util_main(int argc, char **argv)
     test_cpu_enable_avx512();
     test_image();
     test_shell_launch();
+    test_shell_kind();
     test_console_mirror();
     test_image_verify_signature();
     test_image_verify_cn_extract();

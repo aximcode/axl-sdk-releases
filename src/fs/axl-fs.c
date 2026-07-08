@@ -995,6 +995,38 @@ axl_volume_set_map(const void *device_path, const char *name)
 }
 
 int
+axl_volume_alias_to_fsn(const char *alias, const char *fsn)
+{
+    if (alias == NULL || fsn == NULL || alias[0] == '\0' || fsn[0] == '\0') {
+        return AXL_ERR;
+    }
+    /* Drive the shell's own `map <alias> <fsn>:` command — the only way to add
+       a named alias on a shell (like the old EFI 1.x shell) that has no
+       programmatic SetMap. Unlike SetMap, this aliases an EXISTING fs mapping
+       (so it inherits its resolvable device path). Runs through
+       axl_backend_shell_execute, which uses EFI_SHELL_PROTOCOL.Execute on the
+       modern shell or SHELL_ENVIRONMENT.Execute on the old one.
+
+       The `> nul` redirect discards the map command's own output — including
+       the error line the old shell prints when the alias can't resolve (its
+       backward-compatible / startup.nsh mode, where the fsN has no device-path
+       alias). Execute's return still reflects success/failure, so the caller
+       can tell whether the alias actually took without the console noise. */
+    char cmd[96];
+    int n = axl_snprintf(cmd, sizeof(cmd), "map %s %s: > nul", alias, fsn);
+    if (n <= 0 || (size_t)n >= sizeof(cmd)) {
+        return AXL_ERR;
+    }
+    unsigned short *w = axl_utf8_to_ucs2(cmd);
+    if (w == NULL) {
+        return AXL_ERR;
+    }
+    int rc = axl_backend_shell_execute(w);
+    axl_free(w);
+    return rc;
+}
+
+int
 axl_volume_unmap(const char *name)
 {
     unsigned short *w = map_name_to_ucs2(name);

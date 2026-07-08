@@ -18,9 +18,12 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-sys.h>     /* AxlGuid, AXL_GUID */
 #include <axl/axl-log.h>
+#include "../backend/axl-backend.h"   /* axl_bs() (gBS) + UEFI types/GUIDs */
 #include "../fv/axl-fv-internal.h"
 
 AXL_LOG_DOMAIN("shell");
+
+extern EFI_HANDLE gImageHandle;   /* set by the runtime at startup */
 
 /* Well-known UEFI Shell FFS file name GUIDs to look for in firmware
    volumes, in search-preference order:
@@ -96,4 +99,41 @@ axl_shell_locate(void)
         }
     }
     return AXL_SHELL_NONE;
+}
+
+AxlShellKind
+axl_shell_kind(void)
+{
+    void *iface = NULL;
+
+    /* Modern EDK2 UEFI Shell first: it never publishes the legacy EFI 1.x
+       GUIDs, so a hit here is unambiguous and needs no further probing. */
+    EFI_GUID uefi_guid = gEfiShellProtocolGuid;
+    if (!EFI_ERROR(axl_bs()->LocateProtocol(&uefi_guid, NULL, &iface))
+        && iface != NULL) {
+        return AXL_SHELL_KIND_UEFI;
+    }
+
+    /* Old EFI 1.x shell: SHELL_ENVIRONMENT is installed globally, so a plain
+       LocateProtocol finds it whenever that shell is present. */
+    EFI_GUID env_guid = gEfiShellEnvironmentGuid;
+    iface = NULL;
+    if (!EFI_ERROR(axl_bs()->LocateProtocol(&env_guid, NULL, &iface))
+        && iface != NULL) {
+        return AXL_SHELL_KIND_EFI_1X;
+    }
+
+    /* Fallback: the old shell also installs SHELL_INTERFACE on each
+       shell-launched image handle — so probe our own handle in case the
+       global environment protocol isn't locatable on a given build. */
+    if (gImageHandle != NULL) {
+        EFI_GUID if_guid = gEfiShellInterfaceGuid;
+        iface = NULL;
+        if (!EFI_ERROR(axl_bs()->HandleProtocol(gImageHandle, &if_guid, &iface))
+            && iface != NULL) {
+            return AXL_SHELL_KIND_EFI_1X;
+        }
+    }
+
+    return AXL_SHELL_KIND_NONE;
 }

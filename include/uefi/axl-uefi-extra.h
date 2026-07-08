@@ -407,6 +407,43 @@ static __attribute__((unused)) EFI_GUID gEfiShellParametersProtocolGuid =
     { 0x752f3136, 0x4e16, 0x4fdc,
       {0xa2, 0x2a, 0xe5, 0xf4, 0x68, 0x12, 0xf4, 0xca} };
 
+// EFI 1.x shell (the EFI Toolkit "newshell") — predates the EDK2
+// EFI_SHELL_PROTOCOL and publishes neither of the two GUIDs above. It
+// installs SHELL_ENVIRONMENT globally (locatable via LocateProtocol) and
+// SHELL_INTERFACE on each shell-launched image handle. axl_shell_kind()
+// probes these to recognize the old shell; only the GUIDs are needed for
+// detection, not the (hand-written) protocol structs. Values from the EFI
+// Toolkit headers (SHELL_ENVIRONMENT_INTERFACE_PROTOCOL / SHELL_INTERFACE_PROTOCOL).
+static __attribute__((unused)) EFI_GUID gEfiShellEnvironmentGuid =
+    { 0x47c7b221, 0xc42a, 0x11d2,
+      {0x8e, 0x57, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} };
+
+static __attribute__((unused)) EFI_GUID gEfiShellInterfaceGuid =
+    { 0x47c7b223, 0xc42a, 0x11d2,
+      {0x8e, 0x57, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b} };
+
+// EFI 1.x SHELL_ENVIRONMENT protocol — MINIMAL prefix, declared only as far as
+// GetMap (the 3rd member), which is all AXL reads. GetMap(Name) returns the
+// EFI_DEVICE_PATH the shell maps a name (e.g. L"fs1") to, or NULL — the reverse
+// of the modern GetMapFromDevicePath, and the only way to read the map on the
+// old shell (its map is not the EDK2 EFI_SHELL_PROTOCOL map). Members past
+// GetMap (AddCmd, AddProt, GetProt, CurDir, ...) are omitted: this struct is
+// only ever read through a firmware-owned pointer, never allocated by us, so a
+// short prefix is safe. Field order/types from the EFI Toolkit
+// EFI_SHELL_ENVIRONMENT.
+typedef struct {
+    /* The shellenv.h typedef declares ParentImageHandle as `EFI_HANDLE *`, but
+       the EFI Toolkit's own ShellExecute wrapper (libefishell/misc.c) passes
+       the handle BY VALUE — `SE->Execute(ImageHandle, ...)` — so that is the
+       convention the shell actually implements. Mirror it: pass the handle,
+       not its address. */
+    EFI_STATUS (EFIAPI *Execute)(EFI_HANDLE   ParentImageHandle,
+                                 CHAR16      *CommandLine,
+                                 BOOLEAN      DebugOutput);
+    void   *GetEnv;
+    void *(EFIAPI *GetMap)(CHAR16 *Name);
+} EFI_SHELL_ENVIRONMENT;
+
 // ===================================================================
 // IPMI_PROTOCOL (EDK2 MdeModulePkg/Include/Protocol/IpmiProtocol.h)
 //

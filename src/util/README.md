@@ -373,7 +373,15 @@ When nothing is staged, `axl_shell_launch_fv` runs the
 firmware-embedded Shell straight out of a Firmware Volume — no
 `Shell.efi` file needed — and `axl_shell_locate` reports where a Shell
 is available (`AXL_SHELL_FILE` / `AXL_SHELL_FIRMWARE` / `AXL_SHELL_NONE`)
-without launching one. The reusable primitive underneath is
+without launching one. Where those two ask "can a Shell be *launched*",
+`axl_shell_kind()` asks "which Shell is *hosting* us right now" —
+returning `AXL_SHELL_KIND_UEFI` for the modern EDK2 Shell
+(`EFI_SHELL_PROTOCOL`), `AXL_SHELL_KIND_EFI_1X` for the old EFI 1.x shell
+(the EFI Toolkit "newshell", which publishes `SHELL_ENVIRONMENT` /
+`SHELL_INTERFACE` instead), or `AXL_SHELL_KIND_NONE` under BDS / a driver
+/ minimal firmware. It is the single branch point for behavior that
+differs between the two shells (e.g. whether a programmatic map injection
+is honored). The reusable primitive underneath the FV launchers is
 `axl_image_run_fv_file(name_guid, args, &exit)`, which loads + runs any
 `EFI_FV_FILETYPE_APPLICATION` by its FFS file GUID. Pair any of these
 with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror the
@@ -581,7 +589,12 @@ driver.
 For a launcher that must pair with an exact, version-pinned driver
 staged beside it (no fallback to `drivers/`, no cross-volume search),
 use `axl_shared_driver_locate_sibling` instead — see
-`docs/AXL-Shared-Driver-Recipe.md`.
+`docs/AXL-Shared-Driver-Recipe.md`. The sibling is located from the
+launcher's own `LoadedImage` device path (its directory + volume), so it
+resolves with no `EFI_SHELL_PROTOCOL` — working under the modern EDK2
+shell, the old EFI 1.x shell, and BDS alike. A shell `path` search is only
+consulted as a fallback for a path-searched launch whose firmware left the
+launcher's `FilePath` a bare command name.
 
 ### Tool Diagnostics
 

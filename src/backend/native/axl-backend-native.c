@@ -1555,21 +1555,159 @@ axl_backend_shell_chdir(
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
+static EFI_SHELL_ENVIRONMENT *get_shell_env(void);   /* defined below */
+
 int
 axl_backend_shell_execute(
     const unsigned short  *command
     )
 {
-    EFI_SHELL_PROTOCOL  *shell;
-    EFI_STATUS           status;
-
-    shell = get_shell();
-    if (shell == NULL || command == NULL) {
+    if (command == NULL) {
         return AXL_ERR;
     }
 
-    status = shell->Execute(NULL, (CHAR16 *)command, NULL, NULL);
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell != NULL) {
+        EFI_STATUS status = shell->Execute(NULL, (CHAR16 *)command, NULL, NULL);
+        return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    }
+
+    /* Old EFI 1.x shell: no EFI_SHELL_PROTOCOL. Run the command through the
+       SHELL_ENVIRONMENT protocol's Execute — the same in-shell context, so a
+       `map -r` here refreshes the very map the interactive shell resolves
+       `fsN:` against (this is how the legacy mkramdisk mapped its disks: it
+       drove the shell's own `map` command rather than any programmatic API). */
+    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
+    if (se != NULL && se->Execute != NULL) {
+        /* Handle by value, per the EFI Toolkit ShellExecute convention. */
+        EFI_STATUS status = se->Execute(gImageHandle, (CHAR16 *)command, FALSE);
+        return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    }
+    return AXL_ERR;
+}
+
+// ===================================================================
+// EFI 1.x shell map reverse-lookup
+//
+// The old EFI 1.x shell has no GetMapFromDevicePath (that is an EDK2
+// EFI_SHELL_PROTOCOL call). Its SHELL_ENVIRONMENT exposes only GetMap(name)
+// -> device_path — the reverse direction. To answer "what fsN is this device
+// path mapped as", we iterate fs0..fsN, GetMap each, and byte-compare the
+// returned device path. Used only when EFI_SHELL_PROTOCOL is absent.
+// ===================================================================
+
+static EFI_SHELL_ENVIRONMENT  *mShellEnv = NULL;
+static bool                    mShellEnvLocated = false;
+
+static EFI_SHELL_ENVIRONMENT *
+get_shell_env(void)
+{
+    if (!mShellEnvLocated) {
+        mShellEnvLocated = true;
+        EFI_GUID guid = gEfiShellEnvironmentGuid;
+        gBS->LocateProtocol(&guid, NULL, (VOID **)&mShellEnv);
+    }
+    return mShellEnv;
+}
+
+/* Total device-path size in bytes, including the trailing END node. Bounded
+   walk; returns 0 on a malformed chain (Length < 4). */
+static size_t
+dp_total_bytes(const void *dp)
+{
+    const uint8_t *p = (const uint8_t *)dp;
+    size_t total = 0;
+    for (unsigned n = 0; n < 256 && p != NULL; n++) {
+        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
+        if (len < 4) {
+            return 0;
+        }
+        total += len;
+        if (p[0] == 0x7f) {   /* END node — included in the total */
+            break;
+        }
+        p += len;
+    }
+    return total;
+}
+
+static bool
+dp_bytes_equal(const void *a, const void *b)
+{
+    size_t sa = dp_total_bytes(a);
+    if (sa == 0 || sa != dp_total_bytes(b)) {
+        return false;
+    }
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (size_t i = 0; i < sa; i++) {
+        if (pa[i] != pb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#define AXL_EFI1X_FS_SCAN  64u
+
+/* Reverse-look-up @p device_path to its fs<n> name on the old EFI 1.x shell.
+   Writes LOWERCASE "fs<n>" (no colon) into @p out — matching how the old shell
+   itself displays the volume in `map` and its prompt, so a listing stays
+   consistent with the shell you're in (the modern shell's own path returns the
+   uppercase FS<n> it was SetMap'd with). Returns AXL_OK on a match, AXL_ERR
+   otherwise (no shell env, or no fs<n> maps to this path — e.g. the disk isn't
+   in the map yet because `map -r` hasn't run). */
+static int
+efi1x_map_fs_name_from_dp(
+    void   *device_path,
+    char   *out,
+    size_t  out_size
+    )
+{
+    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
+    if (se == NULL || se->GetMap == NULL || device_path == NULL
+        || out_size < 3) {
+        return AXL_ERR;
+    }
+    for (unsigned i = 0; i < AXL_EFI1X_FS_SCAN; i++) {
+        /* Query name "fs<i>" (the old shell stores lowercase; lookups are
+           case-insensitive). */
+        CHAR16   qname[8];
+        unsigned k = 0;
+        qname[k++] = (CHAR16)'f';
+        qname[k++] = (CHAR16)'s';
+        if (i >= 10) {
+            qname[k++] = (CHAR16)('0' + (i / 10));
+        }
+        qname[k++] = (CHAR16)('0' + (i % 10));
+        qname[k] = 0;
+
+        void *dp = se->GetMap(qname);
+        if (dp == NULL || !dp_bytes_equal(dp, device_path)) {
+            continue;
+        }
+        /* Match — build lowercase "fs<i>" (the old shell's own casing) in a
+           local, then copy only if the full name + NUL fits. Rejecting a
+           short buffer (rather than returning a truncated name as success)
+           matches the sibling map_alias truncation contract above. */
+        char     name[8];
+        unsigned j = 0;
+        name[j++] = 'f';
+        name[j++] = 's';
+        if (i >= 10) {
+            name[j++] = (char)('0' + (i / 10));
+        }
+        name[j++] = (char)('0' + (i % 10));
+        name[j] = '\0';
+        if ((size_t)j + 1 > out_size) {
+            return AXL_ERR;
+        }
+        for (unsigned c = 0; c <= j; c++) {
+            out[c] = name[c];
+        }
+        return AXL_OK;
+    }
+    return AXL_ERR;
 }
 
 int
@@ -1642,7 +1780,10 @@ axl_backend_shell_map_alias(
 
     EFI_SHELL_PROTOCOL *shell = get_shell();
     if (shell == NULL || shell->GetMapFromDevicePath == NULL) {
-        return AXL_UNSUPPORTED;
+        /* Old EFI 1.x shell: no GetMapFromDevicePath. Reverse-look-up the
+           disk's FS<n> through SHELL_ENVIRONMENT.GetMap instead. Resolves only
+           once the disk is actually in the shell's map (after `map -r`). */
+        return efi1x_map_fs_name_from_dp(device_path, out, out_size);
     }
 
     /* GetMapFromDevicePath advances the pointer; pass a local copy. */
@@ -1675,13 +1816,31 @@ axl_backend_shell_map_exists(
     const unsigned short  *name
     )
 {
-    EFI_SHELL_PROTOCOL *shell = get_shell();
-    if (shell == NULL || shell->GetDevicePathFromMap == NULL || name == NULL) {
+    if (name == NULL) {
         return false;
     }
-    /* GetDevicePathFromMap returns the firmware-owned device path for the
-       mapping, or NULL if no such mapping exists. */
-    return shell->GetDevicePathFromMap((const CHAR16 *)name) != NULL;
+    EFI_SHELL_PROTOCOL *shell = get_shell();
+    if (shell != NULL && shell->GetDevicePathFromMap != NULL) {
+        /* GetDevicePathFromMap returns the firmware-owned device path for the
+           mapping, or NULL if no such mapping exists. */
+        return shell->GetDevicePathFromMap((const CHAR16 *)name) != NULL;
+    }
+
+    /* Old EFI 1.x shell: no GetDevicePathFromMap. Ask SHELL_ENVIRONMENT.GetMap
+       instead — it wants the BARE name (no trailing ':'), so copy off the
+       colon the caller appended before querying. */
+    EFI_SHELL_ENVIRONMENT *se = get_shell_env();
+    if (se == NULL || se->GetMap == NULL) {
+        return false;
+    }
+    CHAR16   bare[64];
+    unsigned i = 0;
+    while (name[i] != 0 && name[i] != (unsigned short)':' && i < 63) {
+        bare[i] = (CHAR16)name[i];
+        i++;
+    }
+    bare[i] = 0;
+    return se->GetMap(bare) != NULL;
 }
 
 int

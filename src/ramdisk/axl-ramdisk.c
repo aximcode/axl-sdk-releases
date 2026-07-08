@@ -586,6 +586,13 @@ axl_ramdisk_destroy(
         if (start != 0 && size > 0) {
             axl_free_pages(start, (size_t)((size + 4095) / 4096));
         }
+        /* Refresh the shell's volume map so the removed disk's now-dangling
+           fsN entry is dropped — symmetric with axl_ramdisk_create's refresh
+           after Register. Without this the shell keeps an fsN pointing at the
+           freed device ("Invalid file system mapping on fsN"). On the old EFI
+           1.x shell this drives `map -r` through SHELL_ENVIRONMENT.Execute; on
+           the modern shell it is the EFI_SHELL_PROTOCOL.Execute path. */
+        axl_map_refresh();
         return AXL_OK;
     }
     return AXL_ERR;   /* no RAM disk with that label */

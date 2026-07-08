@@ -79,6 +79,72 @@ typedef struct {
 // Public API
 // ---------------------------------------------------------------------------
 
+/* Given a volume's own device path and a file path string ("\dir\name.efi",
+ * either slash orientation), build a full file-on-volume device path: the
+ * volume DP with its END node stripped, one MEDIA_FILEPATH node for the
+ * (UCS-2, backslash-separated) file path, then a fresh END node. Suitable
+ * for gBS->LoadImage's DevicePath argument. AllocatePool'd (caller frees
+ * with gBS->FreePool), or NULL on any failure. Shared by driver_build_file_dp
+ * (volume resolved from an "fsN" name) and driver_build_sibling_dp (volume
+ * taken straight from the launcher's own LoadedImage->DeviceHandle). */
+static EFI_DEVICE_PATH_PROTOCOL *
+driver_append_file_to_vol_dp(
+    EFI_DEVICE_PATH_PROTOCOL *vol_dp,
+    const char               *file_part
+    )
+{
+    if (vol_dp == NULL || file_part == NULL || *file_part == '\0') {
+        return NULL;
+    }
+    size_t vol_dp_size = axl_device_path_size(vol_dp);
+    if (vol_dp_size < 4) return NULL;
+    /* Strip the volume DP's END node — we'll append our own. */
+    size_t vol_dp_body = vol_dp_size - 4;
+
+    /* Convert the file portion to UCS-2. UEFI file-path nodes store
+     * the path in UCS-2, with backslash separators, NUL-terminated. */
+    AXL_AUTO_FREE unsigned short *file_w = axl_utf8_to_ucs2(file_part);
+    if (file_w == NULL) return NULL;
+    size_t file_wlen = 0;
+    while (file_w[file_wlen] != 0) {
+        /* Normalize forward slashes to backslashes. */
+        if (file_w[file_wlen] == (unsigned short)'/') {
+            file_w[file_wlen] = (unsigned short)'\\';
+        }
+        file_wlen++;
+    }
+    /* Filepath node: 4-byte header + (wlen+1)*2 bytes of UCS-2 string.
+     * Length must fit in uint16_t. */
+    size_t file_node_size = 4 + (file_wlen + 1) * 2;
+    if (file_node_size > 0xFFFF) return NULL;
+
+    /* Total: stripped volume body + file node + 4-byte END node. */
+    size_t total = vol_dp_body + file_node_size + 4;
+
+    void *out = NULL;
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out)
+        != EFI_SUCCESS || out == NULL)
+    {
+        return NULL;
+    }
+    uint8_t *p = (uint8_t *)out;
+    axl_memcpy(p, vol_dp, vol_dp_body);
+    p += vol_dp_body;
+
+    /* MEDIA_FILEPATH_DP node */
+    p[0] = 0x04;                                    /* MEDIA_DEVICE_PATH */
+    p[1] = 0x04;                                    /* MEDIA_FILEPATH_DP */
+    p[2] = (uint8_t)(file_node_size & 0xff);
+    p[3] = (uint8_t)((file_node_size >> 8) & 0xff);
+    axl_memcpy(p + 4, file_w, (file_wlen + 1) * 2);
+    p += file_node_size;
+
+    /* END node */
+    p[0] = 0x7f; p[1] = 0xff; p[2] = 4; p[3] = 0;
+
+    return (EFI_DEVICE_PATH_PROTOCOL *)out;
+}
+
 /* Build a full file-on-volume device path from a UEFI path string
  * like "fs0:\drivers\x64\foo.efi". The result is suitable for
  * gBS->LoadImage's DevicePath argument — the firmware will then set
@@ -142,53 +208,85 @@ driver_build_file_dp(const char *path)
     {
         return NULL;
     }
-    size_t vol_dp_size = axl_device_path_size(vol_dp);
-    if (vol_dp_size < 4) return NULL;
-    /* Strip the volume DP's END node — we'll append our own. */
-    size_t vol_dp_body = vol_dp_size - 4;
 
-    /* Convert the file portion to UCS-2. UEFI file-path nodes store
-     * the path in UCS-2, with backslash separators, NUL-terminated. */
-    AXL_AUTO_FREE unsigned short *file_w = axl_utf8_to_ucs2(file_part);
-    if (file_w == NULL) return NULL;
-    size_t file_wlen = 0;
-    while (file_w[file_wlen] != 0) {
-        /* Normalize forward slashes to backslashes. */
-        if (file_w[file_wlen] == (unsigned short)'/') {
-            file_w[file_wlen] = (unsigned short)'\\';
+    return driver_append_file_to_vol_dp(vol_dp, file_part);
+}
+
+/* Build the sibling driver's device path straight from LoadedImage — no
+ * shell. Walks gImageHandle up the ParentHandle chain (bounded to 8, to
+ * cover a buffer-loaded launcher whose own FilePath is NULL) to the first
+ * image with a FilePath, then rebuilds "<launcher-dir>\<sibling_name>" on
+ * that image's own DeviceHandle (its volume). Because BOTH the directory
+ * and the volume come from the launcher's LoadedImage, the result is
+ * strictly beside the launcher the firmware actually ran — the
+ * sibling-only / version-pinning contract holds with no EFI_SHELL_PROTOCOL,
+ * so this resolves on the modern EDK2 shell, the old EFI 1.x shell, and BDS
+ * alike. It also covers a path-searched launch WHEN the firmware recorded a
+ * resolved FilePath; a shell that leaves FilePath a bare command name yields
+ * a volume-root path here that LoadImage rejects, and the caller's
+ * shell-`path` fallback recovers the real directory. AllocatePool'd (caller
+ * frees with gBS->FreePool), or NULL on any failure. */
+static EFI_DEVICE_PATH_PROTOCOL *
+driver_build_sibling_dp(const char *sibling_name)
+{
+    EFI_HANDLE                 cur = gImageHandle;
+    EFI_LOADED_IMAGE_PROTOCOL *li  = NULL;
+    for (int depth = 0; depth < 8 && cur != NULL; depth++) {
+        EFI_LOADED_IMAGE_PROTOCOL *cand = NULL;
+        if (axl_bs()->HandleProtocol(cur, &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+                                     (void **)&cand) != EFI_SUCCESS
+            || cand == NULL)
+        {
+            return NULL;
         }
-        file_wlen++;
+        if (cand->FilePath != NULL) {
+            li = cand;
+            break;
+        }
+        cur = (EFI_HANDLE)cand->ParentHandle;
     }
-    /* Filepath node: 4-byte header + (wlen+1)*2 bytes of UCS-2 string.
-     * Length must fit in uint16_t. */
-    size_t file_node_size = 4 + (file_wlen + 1) * 2;
-    if (file_node_size > 0xFFFF) return NULL;
+    if (li == NULL || li->DeviceHandle == NULL) {
+        return NULL;
+    }
 
-    /* Total: stripped volume body + file node + 4-byte END node. */
-    size_t total = vol_dp_body + file_node_size + 4;
+    /* The launcher's own path on its volume, e.g. "\EFI\Tools\do.efi". */
+    AXL_AUTO_FREE char *self = _axl_decode_image_filepath(
+        (EFI_DEVICE_PATH_PROTOCOL *)li->FilePath);
+    if (self == NULL) return NULL;
 
-    void *out = NULL;
-    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out)
-        != EFI_SUCCESS || out == NULL)
+    /* Directory = everything up to and including the last separator. When
+     * the launcher path carries no separator (a cwd-relative bare name),
+     * synthesize a leading backslash so the FILEPATH node is
+     * volume-absolute rather than a stray relative name. */
+    size_t self_len = axl_strlen(self);
+    size_t dir_len  = 0;
+    for (size_t i = 0; i < self_len; i++) {
+        if (self[i] == '\\' || self[i] == '/') {
+            dir_len = i + 1;
+        }
+    }
+    bool   need_lead = (dir_len == 0);
+    size_t sib_len   = axl_strlen(sibling_name);
+    AXL_AUTO_FREE char *full =
+        axl_malloc((need_lead ? 1 : 0) + dir_len + sib_len + 1);
+    if (full == NULL) return NULL;
+    size_t k = 0;
+    if (need_lead) {
+        full[k++] = '\\';
+    }
+    axl_memcpy(full + k, self, dir_len);
+    k += dir_len;
+    axl_memcpy(full + k, sibling_name, sib_len + 1);
+
+    EFI_DEVICE_PATH_PROTOCOL *vol_dp = NULL;
+    if (axl_bs()->HandleProtocol(li->DeviceHandle,
+                                 &EFI_DEVICE_PATH_PROTOCOL_GUID,
+                                 (void **)&vol_dp) != EFI_SUCCESS
+        || vol_dp == NULL)
     {
         return NULL;
     }
-    uint8_t *p = (uint8_t *)out;
-    axl_memcpy(p, vol_dp, vol_dp_body);
-    p += vol_dp_body;
-
-    /* MEDIA_FILEPATH_DP node */
-    p[0] = 0x04;                                    /* MEDIA_DEVICE_PATH */
-    p[1] = 0x04;                                    /* MEDIA_FILEPATH_DP */
-    p[2] = (uint8_t)(file_node_size & 0xff);
-    p[3] = (uint8_t)((file_node_size >> 8) & 0xff);
-    axl_memcpy(p + 4, file_w, (file_wlen + 1) * 2);
-    p += file_node_size;
-
-    /* END node */
-    p[0] = 0x7f; p[1] = 0xff; p[2] = 4; p[3] = 0;
-
-    return (EFI_DEVICE_PATH_PROTOCOL *)out;
+    return driver_append_file_to_vol_dp(vol_dp, full);
 }
 
 /* --------------------------------------------------------------------------
@@ -1461,6 +1559,31 @@ axl_driver_load_sibling(
         }
     }
 
+    /* Primary: shell-independent LoadedImage device-path load. The sibling's
+       directory and volume both come from THIS image's LoadedImage, so it
+       needs no EFI_SHELL_PROTOCOL — it works on the old EFI 1.x shell, BDS,
+       and path-searched launches uniformly, where the shell-based text path
+       below has nothing to anchor to. LoadImage validates existence, so a
+       driver not actually staged beside the launcher fails here and drops to
+       the fallback (preserving the sibling-only hard-fail contract). */
+    EFI_DEVICE_PATH_PROTOCOL *sib_dp = driver_build_sibling_dp(file_name);
+    if (sib_dp != NULL) {
+        EFI_HANDLE image = NULL;
+        EFI_STATUS st = axl_bs()->LoadImage(FALSE, gImageHandle, sib_dp,
+                                            NULL, 0, &image);
+        axl_bs()->FreePool(sib_dp);
+        if (!EFI_ERROR(st)) {
+            *out_handle = (AxlDriverHandle)image;
+            return AXL_OK;
+        }
+        axl_debug("sibling load: LoadedImage-DP load of '%s' failed: 0x%llx; "
+                  "falling back to shell path resolution", file_name,
+                  (unsigned long long)st);
+    }
+
+    /* Fallback: shell-based path resolution. Retained until the DP-primary
+       is confirmed to cover the path-searched-launch case on the modern
+       shell (then load_sibling_via_shell_path can retire). */
     const char *ip = axl_app_image_path();
     if (ip == NULL) {
         return AXL_ERR;  /* network / RAM-disk boot: no filesystem anchor */

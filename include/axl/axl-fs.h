@@ -662,6 +662,32 @@ axl_volume_set_map(
 );
 
 /**
+ * @brief Add a named alias for an already-mapped volume via the shell's `map`.
+ *
+ * Runs the shell's own `map <alias> <fsn>:` command (through the shell's
+ * Execute service), aliasing @p alias to the EXISTING mapping @p fsn (e.g.
+ * `"fs1"`). This is the path for shells with no programmatic SetMap — notably
+ * the old EFI 1.x shell — where @ref axl_volume_set_map is unavailable but the
+ * `map` command can alias one map name to another. Because it points at an
+ * existing `fsN` (which already has a resolvable device path), it succeeds
+ * where SetMap-by-device-path or aliasing an unresolvable handle would not.
+ *
+ * @p fsn must already be a live filesystem mapping (e.g. after `map -r` /
+ * @ref axl_ramdisk_create). @p alias may omit the trailing `:`. Both are
+ * interpolated into a `map` command line, so they must be plain map tokens —
+ * no whitespace, quotes, or redirection characters.
+ *
+ * @return AXL_OK if the `map` command was accepted; AXL_ERR on bad args or if
+ *     the shell rejected it (e.g. the mapping mode doesn't expose a resolvable
+ *     device path for @p fsn).
+ */
+AXL_WARN_UNUSED int
+axl_volume_alias_to_fsn(
+    const char *alias,   ///< new alias name to add, `:` optional
+    const char *fsn      ///< existing fs mapping to alias (e.g. "fs1"), no `:`
+);
+
+/**
  * @brief Remove a UEFI Shell map name (SetMap with a NULL device path).
  *
  * Deletes @p name from the shell's global map. Use it to drop a mapping whose

@@ -736,8 +736,12 @@ write_transcode(AxlStream *s, const void *buf, size_t count)
         uint8_t lead = (s->out_pending_n > 0) ? s->out_pending[0] : in[i];
         size_t  needed = utf8_lead_len(lead);
 
-        /* Gather the sequence: pending first, then input. */
-        uint8_t seq[4];
+        /* Gather the sequence: pending first, then input. `needed` is always
+           1..4 (utf8_lead_len maps every byte into that range), so seq[0] is
+           always written before it is read — but the analyzer can't constrain
+           the helper's return, so zero-init to keep clang-analyzer from
+           reporting a garbage read on the (unreachable) needed==0 path. */
+        uint8_t seq[4]       = {0};
         size_t  seq_n        = 0;
         size_t  from_pending = 0;
         size_t  from_input   = 0;

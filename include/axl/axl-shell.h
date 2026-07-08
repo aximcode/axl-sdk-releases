@@ -122,6 +122,41 @@ typedef enum {
 AxlShellSource
 axl_shell_locate(void);
 
+/**
+ * @brief Which command shell, if any, is hosting this image.
+ *
+ * Distinct from @ref AxlShellSource (where a shell could be *launched*
+ * from): this reports the shell *currently present in the firmware*, by
+ * the protocol it publishes. It is the single branch point for
+ * shell-dependent behavior that differs between the modern EDK2 shell and
+ * the old EFI 1.x shell — e.g. whether a programmatic map injection
+ * (`SetMap`) will be honored.
+ */
+typedef enum {
+    AXL_SHELL_KIND_NONE = 0,  ///< no shell protocol present (BDS, a driver, or minimal firmware)
+    AXL_SHELL_KIND_UEFI,    ///< the modern EDK2 UEFI Shell 2.x — `EFI_SHELL_PROTOCOL` is present
+    AXL_SHELL_KIND_EFI_1X   ///< the old EFI 1.x shell (EFI Toolkit "newshell") — `SHELL_ENVIRONMENT`/`SHELL_INTERFACE` is present
+} AxlShellKind;
+
+/**
+ * @brief Detect which command shell is hosting the running image.
+ *
+ * Probes, in order: `EFI_SHELL_PROTOCOL` (→ @ref AXL_SHELL_KIND_UEFI); then
+ * the EFI 1.x `SHELL_ENVIRONMENT` global protocol or the `SHELL_INTERFACE`
+ * protocol on this image's own handle (→ @ref AXL_SHELL_KIND_EFI_1X);
+ * otherwise @ref AXL_SHELL_KIND_NONE. The modern shell is checked first
+ * because a modern shell never publishes the legacy GUIDs, so the order is
+ * unambiguous.
+ *
+ * Read-only: a couple of `LocateProtocol`/`HandleProtocol` lookups, no
+ * side effects. The result reflects the firmware at call time; it does not
+ * change over a boot, so a caller may cache it.
+ *
+ * @return the hosting shell's @ref AxlShellKind.
+ */
+AxlShellKind
+axl_shell_kind(void);
+
 #ifdef __cplusplus
 }
 #endif

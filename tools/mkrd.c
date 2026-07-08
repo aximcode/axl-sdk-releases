@@ -43,6 +43,18 @@
     an fsN when the shell is unreachable (SetMap fails cleanly; the disk is still
     created — mount via `map -r`).
 
+    Old / no shell: the SetMap path above needs the EDK2 EFI_SHELL_PROTOCOL. The
+    old EFI 1.x shell has no programmatic SetMap for a custom name, but it does
+    expose SHELL_ENVIRONMENT.Execute — so axl_ramdisk_create drives the shell's
+    own `map -r` through it (the same way the legacy mkramdisk mapped its disks:
+    by running the shell's `map` command, not a private API). By the time mkrd
+    detects the non-UEFI shell via `axl_shell_kind()`, the disk is therefore
+    already enumerated as an `fsN`; mkrd reports that `fsN` (resolved via the
+    SHELL_ENVIRONMENT.GetMap reverse-lookup) and exits 0 — no manual `map -r`.
+    The custom label can't become a shell alias here (the old shell rejects
+    `map <name> <fsN>`), so the disk is reachable as its `fsN` only. If the
+    auto-`map -r` didn't take, mkrd falls back to naming the manual step.
+
     Label as alias: the LABEL doubles as the friendly alias when it is a clean
     map token. It is NOT set as an alias (the disk is reachable as `FS<n>:` only,
     with a note) when the label matches the reserved `fs<digits>` namespace, is
@@ -309,6 +321,56 @@ cli_create(
        library's choice). */
     const char *fs_type = (size_mb <= 512) ? "FAT16" : "FAT32";
 
+    /* Shells with no programmatic map — the old EFI 1.x shell (its
+       SHELL_ENVIRONMENT exposes only a read-only GetMap; no SetMap/AddMap)
+       or no shell at all — can't be handed an fsN/label name. Every map
+       call below routes through EFI_SHELL_PROTOCOL, which isn't present, so
+       skip them entirely: the disk is already created AND connected (its
+       BlockIo / SimpleFileSystem are published), so the shell enumerates it
+       as an fsN on the next `map -r`. Advise + exit 0 (a shell-less create
+       is a partial success — see the SetMap-rejected branch below for the
+       modern-shell counterpart). */
+    if (axl_shell_kind() != AXL_SHELL_KIND_UEFI) {
+        /* The old shell has no programmatic SetMap for a custom name, but
+           axl_ramdisk_create already drove the shell's own `map -r` (through
+           SHELL_ENVIRONMENT.Execute — the same mechanism the legacy mkramdisk
+           used), so the disk is already enumerated as an fsN. Report that fsN;
+           no manual `map -r` is needed. The custom label can't become a shell
+           alias here (the old shell's `map <name> <fsN>` is unsupported), so
+           the disk is reachable as its fsN only. */
+        AXL_AUTO_FREE char *dp_text = axl_device_path_to_text(dev_path);
+        char primary[MKRD_MAP_NAME_CAP];
+        bool mapped = (axl_volume_map_alias(dev_path, primary, sizeof(primary))
+                           == AXL_OK);
+        axl_printf("RAM disk created:\n");
+        axl_printf("  label   : %s\n", label);
+        axl_printf("  size    : %zu MB (%s)\n", size_mb, fs_type);
+        if (dp_text != NULL) {
+            axl_printf("  device  : %s\n", dp_text);
+        }
+        if (mapped) {
+            /* Also try to add the custom label as an alias of the fsN via the
+               shell's own `map <label> <fsN>:` command — works where the shell
+               exposes a resolvable device path for the fsN (an interactive
+               session), giving `<label>:` in addition to `fsN:`. */
+            bool aliased = (label_alias_reject_reason(label) == NULL)
+                && (axl_volume_alias_to_fsn(label, primary) == AXL_OK);
+            if (aliased) {
+                axl_printf("  mapping : %s: (alias %s:)\n", primary, label);
+                axl_printf("Ready: use  %s:  or  %s:  now - no 'map -r' needed.\n",
+                           primary, label);
+            } else {
+                axl_printf("  mapping : %s:\n", primary);
+                axl_printf("Ready: use  %s:  now - no 'map -r' needed.\n", primary);
+            }
+        } else {
+            /* Auto-map didn't take (no SHELL_ENVIRONMENT.Execute on this shell,
+               or the rescan missed the fresh disk) — name the manual step. */
+            axl_printf("Run 'map -r' to mount the disk (it appears as an fsN).\n");
+        }
+        return 0;
+    }
+
     /* Does this (possibly pre-existing) disk already carry a shell mapping? A
        fresh create does not touch the shell's global map, so map_alias resolves
        to AXL_ERR and we assign names below; a re-run of a still-mapped disk
@@ -353,7 +415,12 @@ cli_create(
             axl_printf("MkRd: RAM disk \"%s\" created (%zu MB %s) but could not "
                        "auto-map it as \"%s:\" - %s. The disk exists; run 'map -r' "
                        "to mount it.\n", label, size_mb, fs_type, primary, why);
-            return 1;
+            /* Exit 0: the disk WAS created (and connected) — a shell-less map
+               is a partial success, not a failure. A non-zero exit here reads
+               as EFI_ABORTED to a caller, aborting a `mkrd X; map -r; X:`
+               script at the first step; the advisory above already names the
+               `map -r` follow-up. */
+            return 0;
         }
         /* Second name = the LABEL, in the Alias(s) column — but only when it is
            a clean token AND not already mapped to another volume (SetMap does an
