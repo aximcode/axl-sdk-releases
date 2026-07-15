@@ -48,13 +48,19 @@
 extern "C" {
 #endif
 
-/// One decoded keystroke, in the shape the UEFI Simple Text Input
-/// Protocol delivers it. Exactly one of scan_code and unicode_char carries the user's intent: printable keys leave
-/// scan_code = 0; special keys (arrows, F-keys, Esc, Home/End, etc.)
-/// leave unicode_char = 0.
+/// One decoded keystroke. Exactly one of scan_code and unicode_char carries
+/// the user's intent: printable keys leave scan_code = 0; special keys (arrows,
+/// F-keys, Esc, Home/End, etc.) leave unicode_char = 0.
+///
+/// @a modifiers carries the shift/lock state at the moment of the keystroke
+/// (`AXL_INPUT_MOD_*` bits from `<axl/axl-input.h>`). It is populated from the
+/// console's Simple Text Input **Ex** protocol when present, and is 0 on
+/// consoles that don't publish it (a serial terminal / TerminalDxe carries no
+/// shift bits over the wire) — treat 0 as "no modifiers / unknown".
 typedef struct {
     uint16_t  scan_code;     ///< UEFI scan code (0 for printable keys)
     uint16_t  unicode_char;  ///< UCS-2 character (0 for special keys)
+    uint32_t  modifiers;     ///< AXL_INPUT_MOD_* shift/lock bits; 0 if unavailable
 } AxlKey;
 
 /**
@@ -77,6 +83,13 @@ typedef struct {
  * @p timeout_ms so it self-limits; a `UINT64_MAX` block-forever read
  * there spins until a key arrives, starving the pump — so don't
  * block-forever on input from a pump callback.
+ *
+ * Reads through the console's Simple Text Input **Ex** protocol when available
+ * (so @p out->modifiers reflects the shift/lock state), transparently falling
+ * back to the basic protocol (modifiers = 0) on consoles without it. A
+ * modifier-only "partial" keystroke (both scan_code and unicode_char 0, seen
+ * only when another layer has enabled modifier exposure) is drained so this
+ * always returns a real keystroke.
  *
  * @return AXL_OK on key read (with @p out populated), -1 on timeout,
  *     no console available, or backend error.

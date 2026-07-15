@@ -126,6 +126,13 @@ typedef struct {
     // move never reached the consumer.)  Resolve-per-dispatch keeps a driver
     // Stop()/FreePool() from leaving us calling through freed memory.
     EFI_HANDLE                    handles[AXL_MAX_POINTER_IFACES]; ///< ConIn-first
+    // Cached mode (axl_input_attach_mouse_ifaces): the caller took the pointer OUT
+    // of the handle database (e.g. axl_console_device take_pointer), so bind the
+    // supplied interfaces DIRECTLY and skip the per-dispatch HandleProtocol
+    // re-resolve (which would now fail).  Valid because the caller guarantees the
+    // interfaces outlive the attachment (their producers are not Stop()'d).
+    EFI_SIMPLE_POINTER_PROTOCOL  *ifaces[AXL_MAX_POINTER_IFACES];
+    bool                          cached;
     int                           nproto;
     int32_t                       cursor_x;
     int32_t                       cursor_y;
@@ -242,6 +249,14 @@ mouse_resolve(EFI_HANDLE handle)
     return NULL;
 }
 
+// The i-th bound pointer interface: a cached pointer for the ifaces-attach path
+// (the handle database no longer lists it), else re-resolved from its handle.
+static EFI_SIMPLE_POINTER_PROTOCOL *
+mouse_iface_at(MouseSource *ms, int i)
+{
+    return ms->cached ? ms->ifaces[i] : mouse_resolve(ms->handles[i]);
+}
+
 static bool
 mouse_dispatch_cb(
     void  *data
@@ -265,7 +280,7 @@ mouse_dispatch_cb(
        are idle/NOT_READY when only the virtual pointer moved). */
     bool got = false;
     for (int i = 0; i < ms->nproto; i++) {
-        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_resolve(ms->handles[i]);
+        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_iface_at(ms, i);
         if (sp != NULL && sp->GetState(sp, &state) == 0) {
             got = true;
             break;
@@ -702,6 +717,52 @@ axl_input_probe_pointers(const char *log_path)
     }
 }
 
+// Shared tail of both attach paths: mouse_state.nproto + the bound handles/ifaces
+// (+ .cached) must already be set. Inits per-session state, resets each device, and
+// registers a WaitForInput loop source per interface. Returns the first source id
+// (non-zero == success), 0 if none exposed a usable WaitForInput.
+static AxlSourceId
+mouse_attach_finish(AxlLoop *loop, AxlInputCallback cb, void *data)
+{
+    mouse_state.cb            = cb;
+    mouse_state.data          = data;
+    mouse_state.cursor_x      = 0;
+    mouse_state.cursor_y      = 0;
+    mouse_state.prev_left     = false;
+    mouse_state.prev_right    = false;
+    mouse_state.gesture       = (AxlGesture){0};
+    mouse_state.loop          = loop;
+    mouse_state.nsrc          = 0;
+    mouse_state.repeat_src    = 0;
+    mouse_state.repeat_button = 0;
+    mouse_state_used          = true;
+
+    /* Reset each device + register a WaitForInput source per interface. */
+    for (int i = 0; i < mouse_state.nproto
+                    && mouse_state.nsrc < AXL_MAX_POINTER_IFACES; i++) {
+        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_iface_at(&mouse_state, i);
+        if (sp == NULL) {
+            continue;
+        }
+        sp->Reset(sp, false);   /* best-effort; first GetState may be NOT_READY */
+        if (sp->WaitForInput != NULL) {
+            AxlSourceId sid = axl_loop_add_event(loop, sp->WaitForInput,
+                                                 mouse_dispatch_cb, &mouse_state);
+            if (sid != 0) {
+                mouse_state.source_ids[mouse_state.nsrc++] = sid;
+            }
+        }
+    }
+    if (mouse_state.nsrc == 0) {
+        /* No interface exposed a usable WaitForInput — nothing to dispatch on. */
+        mouse_state_used = false;
+        return 0;
+    }
+    /* Return the first source id as the attach handle (non-zero == success);
+       detach removes every registered source. */
+    return mouse_state.source_ids[0];
+}
+
 AxlSourceId
 axl_input_attach_mouse(
     AxlLoop           *loop,
@@ -753,43 +814,44 @@ axl_input_attach_mouse(
         mouse_state.handles[mouse_state.nproto - 1] = con_in;
     }
 
-    mouse_state.cb            = cb;
-    mouse_state.data          = data;
-    mouse_state.cursor_x      = 0;
-    mouse_state.cursor_y      = 0;
-    mouse_state.prev_left     = false;
-    mouse_state.prev_right    = false;
-    mouse_state.gesture       = (AxlGesture){0};
-    mouse_state.loop          = loop;
-    mouse_state.nsrc          = 0;
-    mouse_state.repeat_src    = 0;
-    mouse_state.repeat_button = 0;
-    mouse_state_used          = true;
+    mouse_state.cached = false;
+    return mouse_attach_finish(loop, cb, data);
+}
 
-    /* Reset each device + register a WaitForInput source per handle. */
-    for (int i = 0; i < mouse_state.nproto
-                    && mouse_state.nsrc < AXL_MAX_POINTER_IFACES; i++) {
-        EFI_SIMPLE_POINTER_PROTOCOL *sp = mouse_resolve(mouse_state.handles[i]);
-        if (sp == NULL) {
-            continue;
-        }
-        sp->Reset(sp, false);   /* best-effort; first GetState may be NOT_READY */
-        if (sp->WaitForInput != NULL) {
-            AxlSourceId sid = axl_loop_add_event(loop, sp->WaitForInput,
-                                                 mouse_dispatch_cb, &mouse_state);
-            if (sid != 0) {
-                mouse_state.source_ids[mouse_state.nsrc++] = sid;
-            }
-        }
-    }
-    if (mouse_state.nsrc == 0) {
-        /* No handle exposed a usable WaitForInput — nothing to dispatch on. */
-        mouse_state_used = false;
+AxlSourceId
+axl_input_attach_mouse_ifaces(
+    AxlLoop           *loop,
+    AxlInputCallback   cb,
+    void              *data,
+    void *const       *ifaces,
+    int                n
+    )
+{
+    if (loop == NULL || cb == NULL || ifaces == NULL || n <= 0) {
         return 0;
     }
-    /* Return the first source id as the attach handle (non-zero == success);
-       detach removes every registered source. */
-    return mouse_state.source_ids[0];
+    if (mouse_state_used) {
+        axl_warning("axl_input_attach_mouse_ifaces: already attached "
+                    "(only one mouse source per process for v0.1)");
+        return 0;
+    }
+
+    /* Bind the caller-supplied interfaces directly (they are no longer in the
+       handle database, so mouse_resolve cannot find them). No ConsoleInHandle
+       reorder: the caller (e.g. axl_console_device) supplies the pointers it
+       evicted, already in producer order. */
+    mouse_state.nproto = 0;
+    for (int i = 0; i < n && mouse_state.nproto < AXL_MAX_POINTER_IFACES; i++) {
+        if (ifaces[i] != NULL) {
+            mouse_state.ifaces[mouse_state.nproto++] =
+                (EFI_SIMPLE_POINTER_PROTOCOL *)ifaces[i];
+        }
+    }
+    if (mouse_state.nproto == 0) {
+        return 0;   /* all interfaces NULL — nothing to bind */
+    }
+    mouse_state.cached = true;
+    return mouse_attach_finish(loop, cb, data);
 }
 
 void

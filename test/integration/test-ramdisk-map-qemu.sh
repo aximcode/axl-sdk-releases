@@ -159,6 +159,17 @@ if sect MARK_CREATE MARK_MAP_CREATE | grep -aqE "^  var |%DEMO%"; then
 else
     ok "create emits no %<label>% env var"
 fi
+# The internal `map -r` (axl_map_refresh) must not dump the shell's mapping
+# table during create — mkrd prints its own summary. Only the EXPLICIT `map`
+# after MARK_MAP_CREATE should. On the modern shell EFI_SHELL_PROTOCOL.Execute
+# was already silent (nested shell, off-console), so this is a regression guard;
+# the visible leak was the old shell's in-context SHELL_ENVIRONMENT.Execute,
+# pinned in test-old-shell-qemu.sh. "Mapping table" is the EDK2 `map` header.
+if sect MARK_CREATE MARK_MAP_CREATE | grep -aqiF "Mapping table"; then
+    no "internal map -r leaked the mapping table into create output"
+else
+    ok "internal map -r stays silent during create (no mapping table)"
+fi
 
 # --- 2. CORE: bare `map` shows the disk as `FS<n>: Alias(s):DEMO:` (no map -r) ---
 sect MARK_MAP_CREATE MARK_USE | grep -aqE "FS[0-9]+: Alias\(s\):DEMO:" \

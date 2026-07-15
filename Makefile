@@ -219,7 +219,8 @@ endef
 # ===================================================================
 
 CFLAGS     = $(CFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
-INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend -Ideps/lzma
+INCLUDES   = -Iinclude -Iinclude/compat -Isrc/backend -Ideps/lzma \
+             -Ideps/libvterm/include
 
 # ===================================================================
 # Optional TLS support (AXL_TLS=1)
@@ -316,6 +317,12 @@ LIB_SOURCES = \
     src/util/axl-boot.c \
     src/util/axl-image.c \
     src/util/axl-shell.c \
+    src/util/axl-console-emit.c \
+    src/util/axl-console-input.c \
+    src/util/axl-console-term.c \
+    src/util/axl-console-device.c \
+    src/util/axl-console-tap.c \
+    src/util/axl-console-vt.c \
     src/util/axl-console-mirror.c \
     src/util/axl-cpu.c \
     src/util/axl-handle-iter.c \
@@ -463,7 +470,20 @@ LIB_SOURCES = \
     src/runtime/axl-cxxabi.c \
     src/runtime/axl-registry.c \
     src/runtime/axl-runtime.c \
-    src/runtime/axl-signal.c
+    src/runtime/axl-signal.c \
+    src/vterm/axl-vterm.c \
+    src/vterm/axl-console-screen.c \
+    deps/libvterm/src/vterm.c \
+    deps/libvterm/src/parser.c \
+    deps/libvterm/src/state.c \
+    deps/libvterm/src/pen.c \
+    deps/libvterm/src/encoding.c \
+    deps/libvterm/src/unicode.c \
+    deps/libvterm/src/keyboard.c \
+    deps/libvterm/src/mouse.c
+# deps/libvterm/src/screen.c is deliberately absent: AXL binds libvterm's
+# Layer 2, and Layer 3 maintains a cell grid the consuming widget already owns.
+# It is vendored (see deps/libvterm/README.md) but never compiled.
 
 ifdef AXL_TLS
 MBEDTLS_SOURCES = \
@@ -605,7 +625,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-test-meta check-docs check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest fs-path-selftest fs-read axbench
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -626,6 +646,29 @@ endif
 check-ascii:
 	@python3 scripts/check-output-ascii.py
 
+# A C++ translation unit's AXL_APP / AXL_DRIVER must emit UNMANGLED firmware
+# entry points (_AxlEntry / DriverEntry) — the driver link resolves them by
+# exact name (--defsym=_AxlEntry=DriverEntry), so a mangled symbol is an
+# undefined-reference link failure. C never triggers this (no name mangling)
+# and no C++ driver exists in the tree, so this compile+nm check is the only
+# thing guarding the AXL_ENTRY_LINKAGE `extern "C"` wrap. Host g++, .o only.
+check-cxx-entry:
+	@obj=$$(mktemp --suffix=.o); \
+	$(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat -c test/cxx-entry-linkage.cpp -o $$obj || \
+	  { echo "check-cxx-entry: FAIL — C++ fixture did not compile"; rm -f $$obj; exit 1; }; \
+	fail=0; \
+	for sym in _AxlEntry DriverEntry; do \
+	  if nm $$obj | grep -qE " T $$sym$$"; then \
+	    echo "check-cxx-entry: $$sym is unmangled (C linkage)"; \
+	  else \
+	    echo "check-cxx-entry: FAIL — $$sym is missing or name-mangled in C++ (needs AXL_ENTRY_LINKAGE)"; \
+	    nm $$obj | grep -i "$$sym" | sed 's/^/    /'; fail=1; \
+	  fi; \
+	done; \
+	rm -f $$obj; \
+	[ $$fail -eq 0 ] && echo "check-cxx-entry: clean"; \
+	exit $$fail
+
 # Every QEMU integration test must carry a `# test-meta:` header so it is
 # discovered + sharded by run-integration.sh (a new test can't silently escape
 # the suite). Run in CI's lint job alongside check-ascii.
@@ -636,6 +679,15 @@ check-test-meta:
 # new header landing without docs). Prose staleness is a workflow concern.
 check-docs:
 	@python3 scripts/check-doc-coverage.py
+
+# Verify library code routes UEFI protocol / boot-service calls through the
+# backend + axl_efi_call macro (the seam that keeps every UEFI touchpoint
+# enumerable and swappable), not by calling a protocol method pointer directly.
+# A per-file ratchet: fails only on a NEW raw call; existing debt is tracked in
+# the script's BASELINE and burned down opportunistically. See
+# scripts/check-dogfood.py.
+check-dogfood:
+	@python3 scripts/check-dogfood.py
 
 # Verify the PE post-processor stamped NX_COMPAT (the produced images are
 # W^X-clean, so they must advertise NX compatibility for Secure-Boot /
@@ -779,6 +831,11 @@ $(BUILDDIR)/%.o: src/posix/%.c | $(BUILDDIR)
 $(BUILDDIR)/%.o: src/runtime/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# axl-vterm: the second AxlConsoleOps producer, adapting vendored libvterm's
+# Layer 2. Standard INCLUDES already carries -Ideps/libvterm/include for <vterm.h>.
+$(BUILDDIR)/%.o: src/vterm/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # C++ pattern for src/runtime/*.cpp.  Only reachable when AXL_CPP=1
 # (the only .cpp source in libaxl-cxx.a today lives here).
 ifdef AXL_CPP
@@ -794,6 +851,12 @@ $(BUILDDIR)/%.o: src/crt0/%.S | $(BUILDDIR)
 
 $(BUILDDIR)/%.o: deps/lzma/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -DZ7_ST -c $< -o $@
+
+# Vendored libvterm (Layer 2 only). -Ideps/libvterm resolves the AXL compat
+# shim that vterm_internal.h pulls in; -Ideps/libvterm/src resolves the
+# internal headers and the generated .inc tables.
+$(BUILDDIR)/%.o: deps/libvterm/src/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -Ideps/libvterm -Ideps/libvterm/src -c $< -o $@
 
 ifdef AXL_TLS
 $(BUILDDIR)/%.o: deps/mbedtls/library/%.c | $(BUILDDIR)
@@ -1013,6 +1076,17 @@ $(PREFIX)/fs-path-selftest.efi: $(BUILDDIR)/fs-path-selftest.o $(LINK_CRT0) $(PR
 $(BUILDDIR)/fs-path-selftest.o: test/integration/fs-path-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# kbprobe.efi — keyboard event-timing probe + the F1/F3/F2 reader for the kbtune
+# bounce A/B (test-kbtune-bounce-qemu.sh, driven by run-qemu --holdkey).
+kbprobe: $(PREFIX)/kbprobe.efi
+	@echo "  Built: $(PREFIX)/kbprobe.efi"
+
+$(PREFIX)/kbprobe.efi: $(BUILDDIR)/kbprobe.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/kbprobe.o,$@)
+
+$(BUILDDIR)/kbprobe.o: test/integration/kbprobe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # ===================================================================
 # Build bss-probe.efi — measure + validate large-.bss handling (8 MiB
 # static array). Used by the .bss-section build experiment to confirm the
@@ -1142,20 +1216,17 @@ $(BUILDDIR)/task-pool-mp-selftest.o: test/integration/task-pool-mp-selftest.c | 
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
-# Build axbench.efi — real-hardware AP-pool benchmark tool. Measures
-# AxlTaskPool (AP offload) vs the BSP across 8 scenarios; writes a report
-# to stdout or a file. Ctrl-C aborts cleanly (test-axbench-ctrlc-qemu.sh).
-# Run: scripts/run-qemu.sh --qemu-arg -smp --qemu-arg N axbench.efi
+# axbench — real-hardware AP-pool benchmark tool. Measures AxlTaskPool
+# (AP offload) vs the BSP across 8 scenarios; writes a report to stdout or
+# a file. Ctrl-C aborts cleanly (test-axbench-ctrlc-qemu.sh). It is a
+# first-class tool (in TOOL_NAMES → tools/axbench.efi + devkit.conf, built
+# by BUILD_TOOL like every other tool); this is a convenience alias to
+# build just it. Run: scripts/run-qemu.sh --qemu-arg -smp --qemu-arg N \
+#   out/native-<arch>/tools/axbench.efi
 # ===================================================================
 
-axbench: $(PREFIX)/axbench.efi
-	@echo "  Built: $(PREFIX)/axbench.efi"
-
-$(PREFIX)/axbench.efi: $(BUILDDIR)/axbench.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
-	$(call LINK_EFI_APP,$(BUILDDIR)/axbench.o,$@)
-
-$(BUILDDIR)/axbench.o: tools/axbench.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+axbench: $(PREFIX)/tools/axbench.efi
+	@echo "  Built: $(PREFIX)/tools/axbench.efi"
 
 # ===================================================================
 # Build time-settime-selftest.efi — round-trip the RTC-write API
@@ -1593,6 +1664,114 @@ $(PREFIX)/drivers/crashhandler.efi: $(CRASHHANDLER_OBJS) $(PREFIX)/lib/libaxl.a 
 $(BUILDDIR)/crashhandler-%.o: drivers/crashhandler/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -Idrivers/crashhandler -c $< -o $@
 
+# console-device-smoke.efi — DEBUG-OVMF smoke consumer driver for
+# axl-console-device: installs the take-over device and renders its ops to a GOP
+# grid. LOCAL-ONLY (needs a GPU + DEBUG OVMF); see the file header for the run
+# recipe and test-console-device-qemu.sh.
+console-device-smoke: $(PREFIX)/drivers/console-device-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-smoke.efi"
+
+$(PREFIX)/drivers/console-device-smoke.efi: $(BUILDDIR)/console-device-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-smoke.o,$@)
+
+$(BUILDDIR)/console-device-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# console-device-restore-smoke.efi — same source, -DSELF_UNINSTALL_MS: takes over,
+# then after that many ms uninstalls the device so the re-tagged firmware console
+# comes back. Drives Scenario 2 of test-console-device-qemu.sh (uninstall-restore).
+console-device-restore-smoke: $(PREFIX)/drivers/console-device-restore-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-restore-smoke.efi"
+
+$(PREFIX)/drivers/console-device-restore-smoke.efi: $(BUILDDIR)/console-device-restore-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-restore-smoke.o,$@)
+
+$(BUILDDIR)/console-device-restore-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DSELF_UNINSTALL_MS=4000 -c $< -o $@
+
+# console-device-wide-smoke.efi — same source at a NON-80x25 advertised geometry
+# (SMOKE_COLS/SMOKE_ROWS, default 142x44) to exercise a wide take-over console
+# against the shell's ConsoleLogger. Built with -DAUTO_ALT=true to match axcon and
+# -DPRECACHE_SMALL to make the ConsoleLogger stale-RowsPerScreen bug DETERMINISTIC:
+# the driver forces the shell's ConsoleLogger to cache mode 0 (80x25) right before it
+# takes over at the taller grid, so absent the install-time SetMode re-sync in
+# axl_console_device.c the shell's history bound overflows on scroll every time
+# (ConsoleLogger.c:489 CpuDeadLoop). Without the forcing the assert is ~1-in-6
+# intermittent -- a poor regression guard. SMOKE_EXTRA appends further -D for ad-hoc
+# probing. Drives Scenario 3's geometry regression.
+SMOKE_COLS ?= 142
+SMOKE_ROWS ?= 44
+console-device-wide-smoke: $(PREFIX)/drivers/console-device-wide-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-wide-smoke.efi ($(SMOKE_COLS)x$(SMOKE_ROWS))"
+
+$(PREFIX)/drivers/console-device-wide-smoke.efi: $(BUILDDIR)/console-device-wide-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-wide-smoke.o,$@)
+
+$(BUILDDIR)/console-device-wide-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DGRID_COLS=$(SMOKE_COLS) -DGRID_ROWS=$(SMOKE_ROWS) -DAUTO_ALT=true -DPRECACHE_SMALL $(SMOKE_EXTRA) -c $< -o $@
+
+# console-device-input-smoke.efi — same source with -DTAKE_INPUT: the device also
+# becomes the sole ConInEx (evicts the raw keyboard) + runs the read loop, so a
+# --sendkey keystroke can ONLY reach the shell through our relay. Drives the input
+# scenario of test-console-device-qemu.sh (keys reach the shell -> our grid renders
+# the typed command's output; the evicted keyboard proves no double-delivery).
+console-device-input-smoke: $(PREFIX)/drivers/console-device-input-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-input-smoke.efi"
+
+$(PREFIX)/drivers/console-device-input-smoke.efi: $(BUILDDIR)/console-device-input-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-input-smoke.o,$@)
+
+$(BUILDDIR)/console-device-input-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DTAKE_INPUT $(SMOKE_EXTRA) -c $< -o $@
+
+# console-device-input-restore-smoke.efi — -DTAKE_INPUT + -DSELF_UNINSTALL_MS: takes
+# over BOTH output and input, then self-uninstalls, exercising the ConIn teardown
+# (DisconnectController-before-free for our ConInEx + re-admit the keyboard, the input
+# mirror of the e051c0db UAF fix) in REAL firmware. A ConIn teardown UAF would wedge
+# the uninstall before it drives the restored gST->ConOut, leaving the frame black
+# (the --restored check then FAILs). Closes the input-teardown coverage gap.
+console-device-input-restore-smoke: $(PREFIX)/drivers/console-device-input-restore-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-input-restore-smoke.efi"
+
+$(PREFIX)/drivers/console-device-input-restore-smoke.efi: $(BUILDDIR)/console-device-input-restore-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-input-restore-smoke.o,$@)
+
+$(BUILDDIR)/console-device-input-restore-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DSELF_UNINSTALL_MS=4000 -DTAKE_INPUT $(SMOKE_EXTRA) -c $< -o $@
+
+# console-device-wide-restore-smoke.efi — NON-80x25 (142x44) + -DSELF_UNINSTALL_MS:
+# takes over at a wide geometry, then self-uninstalls. Regression guard for the
+# ConSplitter mode-reconstruction assert (ConSplitter.c:2983 CpuDeadLoop under DEBUG
+# OVMF): re-adding GraphicsConsole while our single non-80x25 device is still a
+# fan-out member makes ConSplitterAddGraphicsOutputMode's SetMode fall through to the
+# 80x25 BaseMode and fail. axl_console_device_uninstall disconnects our device from
+# the aggregates BEFORE re-adding the firmware console, so the reconstruction sees
+# only firmware consoles. The 80x25 restore-smoke could not catch this (80x25 IS the
+# BaseMode). Drives the wide-restore scenario of test-console-device-qemu.sh.
+console-device-wide-restore-smoke: $(PREFIX)/drivers/console-device-wide-restore-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-wide-restore-smoke.efi ($(SMOKE_COLS)x$(SMOKE_ROWS))"
+
+$(PREFIX)/drivers/console-device-wide-restore-smoke.efi: $(BUILDDIR)/console-device-wide-restore-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-wide-restore-smoke.o,$@)
+
+$(BUILDDIR)/console-device-wide-restore-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DGRID_COLS=$(SMOKE_COLS) -DGRID_ROWS=$(SMOKE_ROWS) -DAUTO_ALT=true -DSELF_UNINSTALL_MS=4000 $(SMOKE_EXTRA) -c $< -o $@
+
+# console-device-cycle-smoke.efi — NON-80x25 (142x44), -DCYCLE_COUNT=3: take over ->
+# restore -> re-take-over three times in one boot (each ~1.2s). Guards the multi-cycle
+# path a single uninstall can't: a second uninstall, re-eviction of the just-restored
+# GraphicsConsole, and any cumulative ConSplitter state (the mode assert would fire on
+# every re-add). Leaves the console restored at the end; --restored proves the final
+# state is live and no cycle wedged.
+console-device-cycle-smoke: $(PREFIX)/drivers/console-device-cycle-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-cycle-smoke.efi ($(SMOKE_COLS)x$(SMOKE_ROWS), 3 cycles)"
+
+$(PREFIX)/drivers/console-device-cycle-smoke.efi: $(BUILDDIR)/console-device-cycle-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-cycle-smoke.o,$@)
+
+$(BUILDDIR)/console-device-cycle-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DGRID_COLS=$(SMOKE_COLS) -DGRID_ROWS=$(SMOKE_ROWS) -DAUTO_ALT=true -DCYCLE_COUNT=3 -DSELF_UNINSTALL_MS=1200 $(SMOKE_EXTRA) -c $< -o $@
+
 $(PREFIX)/drivers:
 	@mkdir -p $@
 
@@ -1813,7 +1992,7 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
         AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
-        AxlTestHii AxlTestAuth AxlTestFw
+        AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -1854,6 +2033,7 @@ $(eval $(call BUILD_TEST,AxlTestInput,axl-test-input))
 $(eval $(call BUILD_TEST,AxlTestFileView,axl-test-file-view))
 $(eval $(call BUILD_TEST,AxlTestPieceTree,axl-test-piece-tree))
 $(eval $(call BUILD_TEST,AxlTestFind,axl-test-find))
+$(eval $(call BUILD_TEST,AxlTestVterm,axl-test-vterm))
 $(eval $(call BUILD_TEST,AxlTestDriver,axl-test-driver))
 $(eval $(call BUILD_TEST,AxlTestCursor,axl-test-cursor))
 $(eval $(call BUILD_TEST,AxlTestCompositor,axl-test-compositor))
@@ -1872,11 +2052,11 @@ $(eval $(call BUILD_TEST,AxlTestFw,axl-test-fw))
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool
+TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
-tools: all $(TOOL_EFIS) $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi
-	@echo "  Built $(words $(TOOL_NAMES)) tools + crashtest + crashhandler driver"
+tools: all $(TOOL_EFIS) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/tools/fbcon.efi $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi
+	@echo "  Built $(words $(TOOL_NAMES)) tools + kbtune-drv + fbcon + crashtest + crashhandler driver"
 
 # tool-sizes — print per-tool .efi size, sorted ascending.
 # Surfaces the selective-linking benefit: a tool that uses 5% of
@@ -1947,6 +2127,58 @@ $(PREFIX)/tools/mkrd.efi: $(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ) \
 
 $(BUILDDIR)/mkrd.o: tools/mkrd.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# kbtune-drv — resident ConIn conditioning shim, paired with the kbtune tool.
+# Built as an EFI DRIVER (DriverEntry, subsystem 11) and staged in tools/ so the
+# kbtune launcher finds it as a SIBLING via axl_shared_driver_locate_sibling.
+# Not in TOOL_NAMES (it is a driver, not a busybox subcommand).
+kbtune-drv: $(PREFIX)/tools/kbtune-drv.efi
+	@echo "  Built: $(PREFIX)/tools/kbtune-drv.efi"
+
+$(PREFIX)/tools/kbtune-drv.efi: $(BUILDDIR)/kbtune-drv.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/kbtune-drv.o,$@)
+
+$(BUILDDIR)/kbtune-drv.o: tools/kbtune-drv.c tools/kbtune-shared.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# fbcon — graphical terminal take-over of the running Shell. Ships as ONE runnable
+# `fbcon.efi` APP (subsystem 10) that EMBEDS the resident take-over driver
+# (fbcon-drv.efi, subsystem 11) and loads it from memory -- so the user runs
+# `fbcon.efi` as a command instead of `load`-ing a driver. The launcher reaps any
+# prior resident instance (a driver can't self-unload; the separate launcher can),
+# then starts a fresh one. Same embed pattern as do.efi / mkrd. fbcon-drv is not
+# staged separately (it lives inside the app). Not in TOOL_NAMES (not a busybox verb).
+fbcon: $(PREFIX)/tools/fbcon.efi
+	@echo "  Built: $(PREFIX)/tools/fbcon.efi (launcher + embedded fbcon-drv)"
+
+# The resident take-over driver, embedded into the launcher below. Built as a build
+# intermediate (not staged in tools/) -- it ships only inside fbcon.efi.
+$(BUILDDIR)/fbcon-drv.efi: $(BUILDDIR)/fbcon-drv.o $(PREFIX)/lib/libaxl.a | $(BUILDDIR)
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/fbcon-drv.o,$@)
+
+$(BUILDDIR)/fbcon-drv.o: tools/fbcon-drv.c tools/fbcon-marker.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Embed the driver blob (emits axl_embedded_fbcon_drv{,_end} for AXL_EMBED_DECLARE).
+$(eval $(call EMBED_BLOB,fbcon_drv,$(BUILDDIR)/fbcon-drv.efi))
+
+$(PREFIX)/tools/fbcon.efi: $(BUILDDIR)/fbcon.o $(BLOB_OBJ_fbcon_drv) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+	$(call LINK_EFI_APP,$(BUILDDIR)/fbcon.o $(BLOB_OBJ_fbcon_drv),$@)
+
+$(BUILDDIR)/fbcon.o: tools/fbcon.c tools/fbcon-marker.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# kbtune-drv-test — hazard-safe lifecycle test for kbtune-drv (load / get-set /
+# unload-restore). Public headers only + tools/kbtune-shared.h for the config
+# contract (-Itools). Run in isolation by test-kbtune-driver-qemu.sh.
+kbtune-drv-test: $(PREFIX)/kbtune-drv-test.efi
+	@echo "  Built: $(PREFIX)/kbtune-drv-test.efi"
+
+$(PREFIX)/kbtune-drv-test.efi: $(BUILDDIR)/kbtune-drv-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/kbtune-drv-test.o,$@)
+
+$(BUILDDIR)/kbtune-drv-test.o: test/integration/kbtune-drv-test.c tools/kbtune-shared.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -Itools -c $< -o $@
 
 $(PREFIX)/tools:
 	@mkdir -p $@

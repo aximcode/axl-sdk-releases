@@ -293,6 +293,53 @@ test_attach_mouse_protocol_available(void)
     axl_event_free(wfi);
 }
 
+// axl_input_attach_mouse_ifaces — bind caller-supplied interfaces directly (the
+// pointer-take-over path, where the interfaces are no longer in the handle DB).
+static void
+test_attach_mouse_ifaces(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    test_check(loop != NULL, "attach_mouse_ifaces fixture: loop created");
+
+    /* A cached interface: never installed on a handle (that's the point). */
+    AxlEvent *wfi = axl_event_new();
+    test_check(wfi != NULL, "attach_mouse_ifaces: fixture WaitForInput created");
+    static EFI_SIMPLE_POINTER_PROTOCOL sp;
+    sp.Reset        = mock_sp_reset;
+    sp.GetState     = mock_sp_getstate;
+    sp.WaitForInput = axl_event_handle(wfi);
+    sp.Mode         = NULL;
+    void *ifaces[1] = { &sp };
+
+    /* Guards. */
+    test_check(axl_input_attach_mouse_ifaces(NULL, unused_cb, NULL, ifaces, 1) == 0,
+               "attach_mouse_ifaces: NULL loop returns 0");
+    test_check(axl_input_attach_mouse_ifaces(loop, NULL, NULL, ifaces, 1) == 0,
+               "attach_mouse_ifaces: NULL cb returns 0");
+    test_check(axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, NULL, 1) == 0,
+               "attach_mouse_ifaces: NULL ifaces returns 0");
+    test_check(axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, ifaces, 0) == 0,
+               "attach_mouse_ifaces: n<=0 returns 0");
+    void *all_null[2] = { NULL, NULL };
+    test_check(axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, all_null, 2) == 0,
+               "attach_mouse_ifaces: all-NULL interfaces returns 0");
+
+    /* Positive: binds the cached interface and is single-source. */
+    AxlSourceId id = axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, ifaces, 1);
+    test_check(id != 0, "attach_mouse_ifaces: returns non-zero source ID");
+    test_check(axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, ifaces, 1) == 0,
+               "attach_mouse_ifaces: second attach returns 0 (single mouse source)");
+
+    /* Detach frees the slot so a later attach (either flavor) succeeds. */
+    axl_input_detach_mouse(loop);
+    AxlSourceId id2 = axl_input_attach_mouse_ifaces(loop, unused_cb, NULL, ifaces, 1);
+    test_check(id2 != 0, "attach_mouse_ifaces: re-attach succeeds after detach");
+    axl_input_detach_mouse(loop);
+
+    axl_loop_free(loop);
+    axl_event_free(wfi);
+}
+
 // ---------------------------------------------------------------------------
 // axl_input_attach_key — registration error paths + success
 // ---------------------------------------------------------------------------
@@ -819,6 +866,47 @@ test_key_debounce(void)
     test_check(axl_input_key_accept(&d6, NULL), "debounce: NULL event accepts");
 
     axl_input_set_key_debounce(0, true);   /* reset for the rest of the suite */
+}
+
+// ---------------------------------------------------------------------------
+// Min-gap delivery gate (pure timing — deliver-now vs hold-until)
+// ---------------------------------------------------------------------------
+
+static void
+test_key_gate(void)
+{
+    /* Fresh gate: the first key of a stream is never held, whatever the gap. */
+    AxlKeyGate g = {0};
+    test_check(axl_input_key_gate_ready_at(&g, 20) == 0,
+               "gate: first key ready immediately (ready_at 0)");
+
+    /* Disabled (min_gap 0): always ready, even after a delivery. */
+    axl_input_key_gate_mark(&g, 100000);
+    test_check(axl_input_key_gate_ready_at(&g, 0) == 0,
+               "gate: min_gap 0 disables (ready_at 0)");
+
+    /* Primed with a 20 ms gap: next ready at last + 20 ms. */
+    AxlKeyGate g2 = {0};
+    axl_input_key_gate_mark(&g2, 100000);   /* delivered at t=100 ms */
+    test_check(axl_input_key_gate_ready_at(&g2, 20) == 120000,
+               "gate: ready_at = last_delivered + min_gap");
+    test_check(g2.primed, "gate: mark primes the gate");
+    test_check(g2.last_delivered_us == 100000, "gate: mark records timestamp");
+
+    /* Deliver/hold sequence: a key 5 ms later is held; one at exactly the gap
+       is ready (>= boundary is inclusive). */
+    uint64_t ready = axl_input_key_gate_ready_at(&g2, 20);
+    test_check(105000 < ready, "gate: a 5 ms-later key is held (now < ready_at)");
+    test_check(120000 >= ready, "gate: a key at exactly the gap is ready");
+
+    /* Advancing on the released key re-bases the next gap. */
+    axl_input_key_gate_mark(&g2, 120000);
+    test_check(axl_input_key_gate_ready_at(&g2, 20) == 140000,
+               "gate: mark re-bases the next window");
+
+    /* NULL-safe: never hold (never silently eat input); mark is a no-op. */
+    test_check(axl_input_key_gate_ready_at(NULL, 20) == 0, "gate: NULL state ready");
+    axl_input_key_gate_mark(NULL, 1000);   /* must not crash */
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,6 +1713,7 @@ test_input_main(
     test_attach_mouse_null_loop_returns_zero();
     test_attach_mouse_null_cb_returns_zero();
     test_attach_mouse_protocol_available();
+    test_attach_mouse_ifaces();
 
     test_attach_key_null_loop_returns_zero();
     test_attach_key_null_cb_returns_zero();
@@ -1653,6 +1742,7 @@ test_input_main(
     test_gesture_click_count();
     test_gesture_drag();
     test_key_debounce();
+    test_key_gate();
     test_button_repeat();
 
     test_modifier_tracking();

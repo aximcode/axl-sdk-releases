@@ -3,6 +3,101 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 2.9.0 — 2026-07-14
+
+A large release centered on a new **console subsystem**: a producer-agnostic
+console contract with three producers (firmware-tap, take-over device, VT-stream
+parser) and two consumers (a remote VT encoder and a local on-screen terminal),
+plus a server-side screen model for late-join repaint. Adds the `fbcon` graphical
+terminal and `kbtune` keyboard tuner, an input debounce/spacing layer, and a
+dogfooding lint gate. No breaking API changes.
+
+### Added
+
+- **`AxlConsoleOps` — a producer-agnostic console contract** (`<axl/axl-console-ops.h>`).
+  A structured op vtable (`clear_screen`, `set_cursor`, `output_text`, `set_pen`,
+  `erase`, `moverect`, `scrollrect`, `set_term_prop`, …) that any console
+  *producer* reports and any *consumer* renders — so one consumer binds three
+  different producers unchanged. Coordinates are 0-based, rects half-open; a
+  whole-pen snapshot (`set_pen`) and one extensible `set_term_prop` channel carry
+  rendition, cursor, alt-screen, and reverse-video state.
+- **`AxlVterm` — a VT/xterm byte-stream parser** (`<axl/axl-vterm.h>`), the second
+  producer, over a **vendored libvterm** (MIT, Layer 2 only; `screen.c` vendored
+  but never compiled). Coalesces libvterm's positioned glyphs into cursor-relative
+  runs and accumulates its incremental pen into a snapshot; restores SCOSC/SCORC
+  (`CSI s`/`CSI u`), adds `clear_scrollback` (`CSI 3J`), and bounds CSI arg count
+  (untrusted-input hardening). `axl_vterm_char_width` is the single wcwidth
+  authority shared by producer and consumer.
+- **`AxlConsoleTap` — the firmware-console producer** (`<axl/axl-console-tap.h>`),
+  the swap-strategy surgery split out of the mirror: wraps
+  `EFI_SIMPLE_TEXT_OUTPUT`, owns the `SIMPLE_TEXT_OUTPUT_MODE` the guest reads back
+  when `passthrough_local` is off, tracks the alternate screen (explicit or an
+  `auto_alt_screen` heuristic), and runs a key-injection ring. New
+  `axl_console_tap_get_size` reports the resolved (configured-or-physical)
+  geometry. Sanitizes control chars in `output_text` (escape-injection fix) and
+  folds `Ctrl+letter` on the Simple read like EDK2's ConSplitter.
+- **`AxlConsoleDevice` — the take-over producer** (`<axl/axl-console-device.h>`):
+  installs itself as the console (output-only), takes over the pointer so guest
+  apps run mouse-free, and relays remote input into the firmware key path with a
+  `key_filter` peek hook.
+- **`AxlConsoleTerm` — a local on-screen terminal** (`<axl/axl-console-term.h>`):
+  binds `AxlConsoleOps` straight into a cell grid drawn on the GOP (or an
+  offscreen `AxlGfxBuffer`), with a scrollback ring, mouse selection + clipboard
+  copy, reflow (`set_font`/`resize`/`set_bounds`/`set_palette`), per-cell damage
+  rendering, and an optional software mouse-cursor overlay.
+- **`AxlConsoleScreen` — a server-side screen model + snapshot serializer**
+  (`<axl/axl-console-screen.h>`): fed a VT stream, it maintains primary + alternate
+  cell grids and serializes the current screen as one self-contained, coalesced VT
+  repaint (`axl_console_screen_snapshot`) so a mid-session client repaints instead
+  of replaying a raw byte tail. **`axl_console_mirror_snapshot`** exposes the same
+  late-join repaint on the mirror, which composes an internal screen fed from its
+  own emitted stream.
+- **`AxlConsoleMirror` enhancements**: alt-screen control (explicit + auto) and
+  `input_capture`; owns `SIMPLE_TEXT_OUTPUT_MODE` when `passthrough_local` is off;
+  a golden-output test pins the emitted VT stream.
+- **`fbcon`** — a graphical terminal that takes over the UEFI shell on the GOP
+  (embeds the take-over driver as a runnable launcher; `Ctrl+\` restart, mouse
+  cursor sprite, `-d`/`-g` input-gate knobs).
+- **`kbtune`** — a keyboard-bounce tuner (GOP UI), plus an **input debounce +
+  min-gap delivery gate** in `<axl/axl-input.h>` (`axl_input_set_key_debounce`,
+  `AxlKeyGate` / `axl_input_key_gate_ready_at` / `_mark`) and
+  `axl_input_attach_mouse_ifaces`.
+- **`check-dogfood`** (`make check-dogfood`, in CI) — a per-file ratchet that keeps
+  library UEFI protocol / boot-service calls routed through the backend +
+  `axl_efi_call` seam, failing only on a new raw `proto->Method()` call.
+- **`axl_vsnprintf`** (`<axl/axl-str.h>`) — the `va_list` sibling of `axl_snprintf`.
+- **Console read-key unification**: `axl_console_read_key` runs on the Ex read path
+  and reports `AxlKey.modifiers`; `run-qemu.sh --boot-target` stages an app as
+  `\EFI\BOOT\BOOTx64.EFI`, and its CPU monitor now runs under `--screenshot` and
+  fails the run on a CPU spike.
+
+### Fixed
+
+- **auto_alt_screen** latched the alternate screen at boot and never left it; it
+  now enters on a backward cursor jump after a clear and leaves on a newline.
+- **console-device / fbcon**: guest `Ctrl+C` froze the display + mouse (render
+  loop quit); the read loop faulted (`#GP`) on real hardware after a keyboard
+  interface was evicted (now re-resolved each pass); a use-after-free on uninstall;
+  a ConSplitter mode assert and a ConsoleLogger dead-loop on a non-80x25 take-over.
+- **backend**: re-locate `EFI_SHELL_PROTOCOL` on each call to fix an
+  exit-under-resident-loop use-after-free.
+- **console**: a zero-length selection (a click with no drag) now selects nothing
+  instead of leaving a cell inverted; non-blocking `axl_console_read_key` reads
+  directly instead of via `CheckEvent`; the loop drains keypress sources in the
+  non-blocking dispatch path.
+- **docs**: fixed a Sphinx/Breathe build crash (a `###` heading in a doc comment)
+  that would have failed the Pages deploy, plus several broken `@ref` targets.
+
+### Changed
+
+- C++ `AXL_APP` / `AXL_DRIVER` now emit **unmangled** firmware entry points
+  (`_AxlEntry` / `DriverEntry`), guarded by a `check-cxx-entry` gate.
+- `axl_map_refresh` no longer echoes the `map -r` listing on either shell.
+
+### Dependencies
+
+- Vendored **libvterm** (MIT, neovim fork), Layer 2 only.
+
 ## 2.8.8 — 2026-07-08
 
 ### Added

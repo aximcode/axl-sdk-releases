@@ -98,7 +98,12 @@
 #include <axl/axl-efi-status.h>
 #include <axl/axl-image.h>
 #include <axl/axl-shell.h>
+#include <axl/axl-console-ops.h>
+#include <axl/axl-console-tap.h>
+#include <axl/axl-console-device.h>
 #include <axl/axl-console-mirror.h>
+#include <axl/axl-console-term.h>
+#include <axl/axl-console-screen.h>
 #include <axl/axl-mem-phys.h>
 #include <axl/axl-mem-region.h>
 #include <axl/axl-watchdog.h>
@@ -230,9 +235,28 @@ void _axl_cleanup(void);
  */
 #define AXLAPI AXL_EFI_ABI
 
+/**
+ * AXL_ENTRY_LINKAGE:
+ *
+ * Force C linkage on the firmware entry-point symbol a macro emits
+ * (`_AxlEntry` / `DriverEntry`). In a C++ translation unit the entry
+ * function would otherwise be name-mangled, so the linker — which
+ * resolves the image entry by its exact unmangled name (drivers link
+ * with `--defsym=_AxlEntry=DriverEntry`) — fails with an undefined
+ * `DriverEntry`. Expands to `extern "C"` under C++ and to nothing in
+ * C, so a C++ driver/app needs no hand-written `extern "C"` wrapper.
+ * It applies only to the emitted entry symbol; the consumer's own
+ * entry/unload functions keep normal (C++) linkage.
+ */
+#ifdef __cplusplus
+#define AXL_ENTRY_LINKAGE extern "C"
+#else
+#define AXL_ENTRY_LINKAGE
+#endif
+
 #define AXL_APP(main_func)                                            \
   int main_func(int, char **);                                        \
-  AxlEfiStatus                                                        \
+  AXL_ENTRY_LINKAGE AxlEfiStatus                                      \
   AXLAPI                                                              \
   _AxlEntry(AxlHandle ImageHandle, AxlSystemTable *SystemTable) {     \
     _axl_init((void *)ImageHandle, (void *)SystemTable);             \
@@ -298,7 +322,7 @@ void _axl_cleanup(void);
     return (_rc == 0) ? AXL_EFI_SUCCESS : AXL_EFI_ABORTED;               \
   }                                                                      \
                                                                          \
-  AxlEfiStatus AXLAPI                                                    \
+  AXL_ENTRY_LINKAGE AxlEfiStatus AXLAPI                                                    \
   DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {    \
     axl_driver_init(_ImageHandle, _SystemTable);                         \
     axl_driver_set_unload((void *)_axl_driver_unload_stub);              \
@@ -462,7 +486,7 @@ void _axl_cleanup(void);
  * (publish-protocol-and-leave style). Pick one.
  */
 #define AXL_SERVICE_DRIVER(svc)                                            \
-  AxlEfiStatus AXLAPI                                                       \
+  AXL_ENTRY_LINKAGE AxlEfiStatus AXLAPI                                                       \
   DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {       \
     return (AxlEfiStatus)_axl_service_driver_init(                          \
                (void *)_ImageHandle, (void *)_SystemTable, &(svc));         \

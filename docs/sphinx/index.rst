@@ -66,6 +66,7 @@ AXL SDK
    modules/boot
    modules/image
    modules/console-mirror
+   modules/vterm
    modules/mem-phys
    modules/watchdog
    modules/rng

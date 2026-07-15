@@ -49,7 +49,9 @@ static void
 file_write_fn(const char *data, size_t len, void *ctx)
 {
     (void)ctx;
-    axl_file_writer_write(g_writer, data, len);
+    /* Sink callback (void return) — a write error here can't be propagated;
+       it surfaces at axl_file_writer_close() in the finalize path. */
+    (void)axl_file_writer_write(g_writer, data, len);
 }
 
 /* rep: report line — goes to sink (file or stdout). */
@@ -662,11 +664,12 @@ on_interrupt(void)
 }
 
 /* =========================================================================
- * main
+ * main — AXL_TOOL_MAIN so axbench builds as a first-class tool (standalone
+ * tools/axbench.efi + a busybox-safe axl_tool_axbench_main), with the uniform
+ * --version / -V handling every other tool gets.
  * ========================================================================= */
 
-int
-main(int argc, char *argv[])
+AXL_TOOL_MAIN(axbench)
 {
     /* --- Argument parsing --- */
     if (argc > 2) {

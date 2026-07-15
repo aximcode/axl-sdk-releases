@@ -65,5 +65,7 @@ Checks: >
 WarningsAsErrors: '*'
 
 # Only lint our own source tree; ignore system headers, UEFI generated
-# headers, and the mbedtls submodule.
-HeaderFilterRegex: '^(?!.*(uefi/generated|deps/mbedtls)).*src/.*$'
+# headers, and the vendored third-party sources. deps/libvterm needs its own
+# entry because its internal headers live under deps/libvterm/src/, which the
+# trailing '.*src/.*' would otherwise match.
+HeaderFilterRegex: '^(?!.*(uefi/generated|deps/mbedtls|deps/libvterm)).*src/.*$'

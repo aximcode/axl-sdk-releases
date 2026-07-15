@@ -4,101 +4,81 @@
 /** @file axl-console-mirror.c
     Mirror the firmware console to a byte sink and inject remote input.
 
-    Wraps gST->ConIn/ConOut(/StdErr) and the ConsoleInHandle's
-    SimpleTextInputEx with AXL forwarders: ConOut operations are
-    translated to a VT/ANSI byte stream handed to a caller sink; injected
-    remote keys are pushed into a ring the wrapped ConIn returns, waking a
-    blocked Shell via the WaitForKey event.
+    A thin consumer of the console tap (src/util/axl-console-tap.c): the tap does
+    the firmware surgery and reports structured console operations, and this file
+    is the **VT encoder** that serializes those operations into the UTF-8 + ANSI/VT
+    byte stream an xterm-class terminal understands, handing it to a caller sink.
 
-    Ported from the EDK2 SoftBMC ConsoleWrapper, but simpler: the pump is
-    the consumer's loop (axl_loop_attach_driver dispatches it from a
-    firmware timer in the background), so the wrappers carry NO HTTP
-    polling and the mirror owns NO timer. The wrapped ConIn only injects
-    and falls through to the physical keyboard.
+    That split is the point: the VT wire format only exists to serialize a console
+    to a REMOTE consumer. A LOCAL renderer skips it and binds AxlConsoleOps straight
+    into its cell grid. See docs/AXL-Console-Mirror-Design.md and
+    <axl/axl-console-tap.h>.
 
-    Single global console ⇒ single mirror instance (a singleton guarded by
-    g_mirror); the wrappers recover state through it. An atexit hook
-    restores the console if the process exits without an explicit
-    uninstall.
+    Encoder-only state lives here: the sink, and the redundant-cursor dedup (a
+    full-screen app re-positions to the same cell to blink its cursor, which would
+    otherwise flood the wire with escapes).
 **/
 
 #include <axl/axl-console-mirror.h>
+#include <axl/axl-console-tap.h>
+#include <axl/axl-console-screen.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
-#include <axl/axl-atexit.h>
-#include <uefi/axl-uefi.h>
+#include "axl-console-vt.h"   /* shared pen->SGR encoder (DRY with axl-console-screen) */
 
 AXL_LOG_DOMAIN("conmirror");
 
-#define KEY_RING_SIZE   64
-#define ESC_BUF_SIZE    16
-
-// UEFI scan codes (UEFI 2.11 §12.3.3) — the subset full-screen apps use.
-#define SCAN_UP     0x01
-#define SCAN_DOWN   0x02
-#define SCAN_RIGHT  0x03
-#define SCAN_LEFT   0x04
-#define SCAN_HOME   0x05
-#define SCAN_END    0x06
-#define SCAN_INSERT 0x07
-#define SCAN_DELETE 0x08
-#define SCAN_PGUP   0x09
-#define SCAN_PGDN   0x0A
-#define SCAN_F1     0x0B
-/* SCAN_ESC (0x17) comes from <uefi/axl-uefi-extra.h>. */
+#define MIRROR_DEFAULT_COLS 80
+#define MIRROR_DEFAULT_ROWS 25
 
 struct AxlConsoleMirror {
-    /* Saved originals. */
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL    *orig_conout;
-    EFI_SIMPLE_TEXT_INPUT_PROTOCOL     *orig_conin;
-    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL  *orig_coninex;
+    AxlConsoleTap   *tap;    /* the surgery we consume */
 
-    /* Saved gST->StdErr, exactly as found: NULL (no error console), the
-       same pointer as orig_conout (the common aliased case), or a
-       genuinely distinct protocol instance. Restored verbatim on
-       uninstall -- do NOT derive it from orig_conout, which is only
-       correct in the aliased case and would otherwise hand a caller's
-       real distinct StdErr (or an absent one) back as ConOut. */
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL    *orig_stderr;
-
-    /* Wrapper protocol structs — gST/ConsoleInHandle point into these. */
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL     my_conout;
-    EFI_SIMPLE_TEXT_INPUT_PROTOCOL      my_conin;
-    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL   my_coninex;
-
-    EFI_EVENT  wait_key;
-    EFI_EVENT  wait_key_ex;
-
-    /* Key injection ring. */
-    EFI_INPUT_KEY ring[KEY_RING_SIZE];
-    UINTN         head;
-    UINTN         tail;
+    /* Late-join model: an internal screen fed from our own emitted VT, so
+       snapshot() can serialize the current screen for a newly-connected client. */
+    AxlConsoleScreen *screen;
 
     /* Config (copied). */
     AxlConsoleSinkFn sink;
     void            *user;
-    uint32_t         cols;
-    uint32_t         rows;
-    bool             passthrough;
 
-    /* Cursor-dedup state: the last position emitted via SetCursorPosition
-       (or 0,0 after ClearScreen). Used only to suppress redundant cursor
-       escapes; NOT advanced from text output (that heuristic drifts on
+    /* Cursor-dedup state: the last position EMITTED as an escape (or 0,0 after a
+       clear). Encoder-only — the tap separately maintains the true console cursor
+       in the Mode it owns. Not advanced from text output (that heuristic drifts on
        line-wrap and would falsely suppress a needed reposition). */
     int32_t cur_row;   /* -1 = unknown */
     int32_t cur_col;
-
-    /* inject_text escape-sequence parser state (split-call safe). */
-    char   esc_buf[ESC_BUF_SIZE];
-    size_t esc_len;
-    bool   in_esc;
-
-    uint32_t atexit_handle;
-    bool     reinstalled_ex;  /* did we ReinstallProtocolInterface ConInEx? */
 };
 
-static AxlConsoleMirror *g_mirror;  /* the one active instance */
+static AxlConsoleMirror *g_mirror;  /* one console => one mirror */
+
+/* Create the internal late-join screen model at @p cols x @p rows (0 -> default).
+   Returns NULL on allocation failure (the caller decides how to handle it). */
+static AxlConsoleScreen *
+mirror_new_screen(uint32_t cols, uint32_t rows)
+{
+    AxlConsoleScreen *s = NULL;
+    axl_console_screen_new(&s,
+                           rows != 0 ? rows : MIRROR_DEFAULT_ROWS,
+                           cols != 0 ? cols : MIRROR_DEFAULT_COLS);
+    return s;
+}
+
+/* Size the internal model to the tap's RESOLVED geometry — which resolves a
+   configured-0 axis to the physical console size — so a mirror installed (or
+   resized) with a 0 axis keeps the model matched to what the tap actually runs
+   at, not the 80x25 default. A 0 resolved axis (physical size unavailable) leaves
+   the model unchanged. */
+static void
+mirror_sync_screen_size(AxlConsoleMirror *m)
+{
+    uint32_t cols = 0, rows = 0;
+    axl_console_tap_get_size(m->tap, &cols, &rows);
+    if (cols != 0 && rows != 0) {
+        axl_console_screen_resize(m->screen, rows, cols);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Sink helpers
@@ -107,8 +87,17 @@ static AxlConsoleMirror *g_mirror;  /* the one active instance */
 static void
 emit(AxlConsoleMirror *m, const char *bytes, size_t len)
 {
-    if (m->sink != NULL && len > 0) {
+    if (len == 0) {
+        return;
+    }
+    if (m->sink != NULL) {
         m->sink(bytes, len, m->user);
+    }
+    /* Tee into the late-join model so snapshot() serializes the current screen.
+       The model re-parses our own VT — cheap at console volumes, and it keeps
+       alt-screen / cursor state in sync automatically (those escapes flow here). */
+    if (m->screen != NULL) {
+        axl_console_screen_feed(m->screen, (const uint8_t *)bytes, len);
     }
 }
 
@@ -118,520 +107,148 @@ emit_cstr(AxlConsoleMirror *m, const char *s)
     emit(m, s, axl_strlen(s));
 }
 
-/* Emit a UCS-2 string as UTF-8, chunked, no truncation. BMP only — the UEFI
-   console is UCS-2 (no surrogate pairs); a lone surrogate code unit would be
-   emitted as its 3-byte form, which the console never produces in practice. */
+// ---------------------------------------------------------------------------
+// The VT encoder — an AxlConsoleOps consumer. Turns structured console
+// operations into the xterm/VT byte stream handed to the caller's sink.
+// ---------------------------------------------------------------------------
+
 static void
-emit_ucs2(AxlConsoleMirror *m, const CHAR16 *s)
+vt_clear_screen(void *user)
 {
-    if (m->sink == NULL || s == NULL) {
-        return;
-    }
-    char   buf[256];
-    size_t n = 0;
-    for (; *s != 0; s++) {
-        unsigned c = (unsigned)*s;
-        char     tmp[3];
-        size_t   tn;
-        if (c < 0x80) {
-            tmp[0] = (char)c;
-            tn = 1;
-        } else if (c < 0x800) {
-            tmp[0] = (char)(0xC0 | (c >> 6));
-            tmp[1] = (char)(0x80 | (c & 0x3F));
-            tn = 2;
-        } else {
-            tmp[0] = (char)(0xE0 | (c >> 12));
-            tmp[1] = (char)(0x80 | ((c >> 6) & 0x3F));
-            tmp[2] = (char)(0x80 | (c & 0x3F));
-            tn = 3;
-        }
-        if (n + tn > sizeof(buf)) {
-            m->sink(buf, n, m->user);
-            n = 0;
-        }
-        for (size_t i = 0; i < tn; i++) {
-            buf[n++] = tmp[i];
-        }
-    }
-    if (n > 0) {
-        m->sink(buf, n, m->user);
-    }
+    AxlConsoleMirror *m = (AxlConsoleMirror *)user;
+    emit_cstr(m, "\x1b[2J\x1b[H");
+    m->cur_row = 0;   /* the terminal cursor is home; dedup tracks from here */
+    m->cur_col = 0;
 }
 
-/* UEFI text attribute → ANSI SGR "ESC[0;fg;bgm". 0..15 fg, 0..7 bg. */
 static void
-emit_attr(AxlConsoleMirror *m, UINTN attr)
+vt_set_cursor(void *user, int32_t row, int32_t col)
 {
-    /* UEFI fg 0-15 → ANSI SGR. 0-7 standard (30-37), 8-15 bright (90-97),
+    AxlConsoleMirror *m = (AxlConsoleMirror *)user;
+    /* Dedup: full-screen apps re-position to the same cell to blink the cursor;
+       suppress the redundant escape flood. */
+    if (row == m->cur_row && col == m->cur_col) {
+        return;
+    }
+    char buf[24];
+    int  n = axl_snprintf(buf, sizeof(buf), "\x1b[%u;%uH",
+                          (unsigned)(row + 1), (unsigned)(col + 1));
+    if (n > 0) {
+        emit(m, buf, (size_t)n);
+    }
+    m->cur_row = row;
+    m->cur_col = col;
+}
+
+static void
+vt_output_text(void *user, const char *utf8, size_t len)
+{
+    emit((AxlConsoleMirror *)user, utf8, len);
+}
+
+/* UEFI-indexed pen -> ANSI SGR "ESC[0;fg;bgm". fg 0..15, bg 0..7. This is the old
+   vt_set_attr body, unchanged, so the golden VT stream stays byte-identical. */
+static void
+vt_emit_indexed_sgr(AxlConsoleMirror *m, uint8_t fg, uint8_t bg)
+{
+    /* UEFI fg 0-15 -> ANSI SGR. 0-7 standard (30-37), 8-15 bright (90-97),
        EXCEPT index 14: ANSI bright-yellow (93) renders as lime/green on many
        terminals, so map UEFI "yellow" to plain 33 (matches the EDK2 original
-       — deliberate, do not "fix" to 93). */
+       - deliberate, do not "fix" to 93). */
     static const uint8_t fg_map[16] = {
         30, 34, 32, 36, 31, 35, 33, 37,
         90, 94, 92, 96, 91, 95, 33, 97
     };
     static const uint8_t bg_map[8] = { 40, 44, 42, 46, 41, 45, 43, 47 };
 
-    if (m->sink == NULL) {
-        return;
-    }
-    unsigned fg = (unsigned)(attr & 0x0F);
-    unsigned bg = (unsigned)((attr >> 4) & 0x07);
     char buf[20];
     int  n = axl_snprintf(buf, sizeof(buf), "\x1b[0;%u;%um",
-                          fg_map[fg], bg_map[bg]);
+                          fg_map[fg & 0x0F], bg_map[bg & 0x07]);
     if (n > 0) {
-        emit(m, buf, (size_t)n);
+        emit(m, buf, (size_t)n);   /* emit() feeds the model even when sink is NULL */
     }
 }
 
-// ---------------------------------------------------------------------------
-// Key ring
-// ---------------------------------------------------------------------------
-
-/* The ring is touched from two TPLs: injection runs from the consumer's
-   timer-pumped loop at TPL_CALLBACK; ReadKeyStroke runs from the foreground
-   Shell at TPL_APPLICATION. Raise to TPL_HIGH_LEVEL to make head/tail updates
-   atomic against that preemption (the re-entrancy lesson from the EDK2
-   wrapper, design §7). SignalEvent is callable at TPL_HIGH_LEVEL; the notify
-   just runs once TPL drops. */
-static bool
-ring_push(AxlConsoleMirror *m, EFI_INPUT_KEY key)
+/* Full SGR for a general pen (default / indexed / truecolour + style bits), via the
+   encoder shared with axl-console-screen. Reachable only from axl-vterm — the tap
+   always produces a both-indexed pen and takes the fast path in vt_set_pen. */
+static void
+vt_emit_full_sgr(AxlConsoleMirror *m, const AxlConsolePen *pen)
 {
-    EFI_TPL old  = gBS->RaiseTPL(TPL_HIGH_LEVEL);
-    UINTN   next = (m->head + 1) % KEY_RING_SIZE;
-    bool    ok   = (next != m->tail);
-    if (ok) {
-        m->ring[m->head] = key;
-        m->head = next;
-        if (m->wait_key != NULL) {
-            gBS->SignalEvent(m->wait_key);
-        }
-        if (m->wait_key_ex != NULL) {
-            gBS->SignalEvent(m->wait_key_ex);
-        }
-    }
-    gBS->RestoreTPL(old);
-    return ok;
+    char   buf[64];
+    size_t n = axl_console_pen_to_sgr(buf, sizeof(buf), pen);
+    emit(m, buf, n);
 }
 
-static bool
-ring_pop(AxlConsoleMirror *m, EFI_INPUT_KEY *key)
+/* The pen snapshot -> SGR. The tap only ever produces DEFAULT or INDEXED colours;
+   emit exactly the bytes the previous vt_set_attr(fg, bg) emitted for the indexed
+   case, so the golden stream does not move. The general path is reachable only from
+   axl-vterm. */
+static void
+vt_set_pen(void *user, const AxlConsolePen *pen)
 {
-    EFI_TPL old = gBS->RaiseTPL(TPL_HIGH_LEVEL);
-    bool    ok  = (m->head != m->tail);
-    if (ok) {
-        *key = m->ring[m->tail];
-        m->tail = (m->tail + 1) % KEY_RING_SIZE;
+    AxlConsoleMirror *m = (AxlConsoleMirror *)user;
+    if (pen->fg.kind == AXL_CONSOLE_COLOR_INDEXED &&
+        pen->bg.kind == AXL_CONSOLE_COLOR_INDEXED) {
+        vt_emit_indexed_sgr(m, pen->fg.idx, pen->bg.idx);
+        return;
     }
-    gBS->RestoreTPL(old);
-    return ok;
+    vt_emit_full_sgr(m, pen);
 }
 
 static void
-ring_drain(AxlConsoleMirror *m)
+vt_emit_dectcem(AxlConsoleMirror *m, bool visible)
 {
-    EFI_TPL old = gBS->RaiseTPL(TPL_HIGH_LEVEL);
-    m->head = 0;
-    m->tail = 0;
-    gBS->RestoreTPL(old);
+    emit_cstr(m, visible ? "\x1b[?25h" : "\x1b[?25l");
+}
+
+/* SetMode has no VT representation in this encoder (the remote terminal's size
+   is driven by the consumer's resize, not the guest's mode change). */
+static void
+vt_set_mode(void *user, uint32_t mode)
+{
+    (void)user;
+    (void)mode;
 }
 
 static void
-ring_resignal_if_more(AxlConsoleMirror *m)
+vt_emit_alt_screen(AxlConsoleMirror *m, bool enter)
 {
-    if (m->head != m->tail) {
-        if (m->wait_key != NULL) {
-            gBS->SignalEvent(m->wait_key);
-        }
-        if (m->wait_key_ex != NULL) {
-            gBS->SignalEvent(m->wait_key_ex);
-        }
+    emit_cstr(m, enter ? "\x1b[?1049h" : "\x1b[?1049l");
+}
+
+/* One dispatcher for every terminal property the VT wire can carry. Accept-and-
+   ignore anything else: the wire has no representation for the other props today. */
+static int
+vt_set_term_prop(void *user, AxlConsoleProp prop, const AxlConsoleValue *val)
+{
+    AxlConsoleMirror *m = (AxlConsoleMirror *)user;
+    switch (prop) {
+    case AXL_CONSOLE_PROP_CURSOR_VISIBLE:
+        vt_emit_dectcem(m, val->u.boolean);
+        return 1;
+    case AXL_CONSOLE_PROP_ALT_SCREEN:
+        vt_emit_alt_screen(m, val->u.boolean);
+        return 1;
+    default:
+        return 1;
     }
 }
+
+static const AxlConsoleOps vt_ops = {
+    .clear_screen  = vt_clear_screen,
+    .set_cursor    = vt_set_cursor,
+    .output_text   = vt_output_text,
+    .set_pen       = vt_set_pen,
+    .set_mode      = vt_set_mode,
+    .set_term_prop = vt_set_term_prop,
+    /* set_cell_rule: the mirror re-encodes to a VT wire and never rasterizes, so
+       cell width is the far-end terminal's problem. Deliberately unbound. */
+};
 
 // ---------------------------------------------------------------------------
-// ConOut wrappers
+// Public API — install a tap with this encoder bound, delegate the rest.
 // ---------------------------------------------------------------------------
-
-static EFI_STATUS EFIAPI
-wrap_out_reset(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN ext)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->passthrough && m->orig_conout != NULL) {
-        return m->orig_conout->Reset(m->orig_conout, ext);
-    }
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    EFI_STATUS st = EFI_SUCCESS;
-    if (m->passthrough && m->orig_conout != NULL) {
-        st = m->orig_conout->OutputString(m->orig_conout, String);
-    }
-    emit_ucs2(m, String);
-    return st;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_test_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->orig_conout != NULL) {
-        return m->orig_conout->TestString(m->orig_conout, String);
-    }
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
-                    UINTN *Columns, UINTN *Rows)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    EFI_STATUS st = EFI_SUCCESS;
-    if (m->orig_conout != NULL) {
-        st = m->orig_conout->QueryMode(m->orig_conout, ModeNumber, Columns, Rows);
-    }
-    /* Override ONLY the current mode's geometry with the remote terminal size
-       (so a full-screen app sizing itself via QueryMode(Mode->Mode) lays out
-       for the web terminal). Other mode numbers pass through unchanged so the
-       app's mode enumeration stays truthful, and an invalid ModeNumber keeps
-       its original error status. */
-    bool is_current = (m->orig_conout != NULL && m->orig_conout->Mode != NULL
-                       && ModeNumber == (UINTN)m->orig_conout->Mode->Mode);
-    if (!EFI_ERROR(st) && is_current && m->cols > 0 && m->rows > 0
-        && Columns != NULL && Rows != NULL) {
-        *Columns = m->cols;
-        *Rows    = m->rows;
-    }
-    return st;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->orig_conout != NULL) {
-        return m->orig_conout->SetMode(m->orig_conout, ModeNumber);
-    }
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_set_attribute(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->passthrough && m->orig_conout != NULL) {
-        m->orig_conout->SetAttribute(m->orig_conout, Attribute);
-    }
-    emit_attr(m, Attribute);
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_clear_screen(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    EFI_STATUS st = EFI_SUCCESS;
-    if (m->passthrough && m->orig_conout != NULL) {
-        st = m->orig_conout->ClearScreen(m->orig_conout);
-    }
-    emit_cstr(m, "\x1b[2J\x1b[H");
-    m->cur_row = 0;   /* cursor is now home; dedup tracks from here */
-    m->cur_col = 0;
-    return st;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_set_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Column, UINTN Row)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->passthrough && m->orig_conout != NULL) {
-        m->orig_conout->SetCursorPosition(m->orig_conout, Column, Row);
-    }
-    /* Dedup: full-screen apps re-position to the same cell to blink the
-       cursor; suppress the redundant escape flood. */
-    if ((int32_t)Row == m->cur_row && (int32_t)Column == m->cur_col) {
-        return EFI_SUCCESS;
-    }
-    char buf[24];
-    int  n = axl_snprintf(buf, sizeof(buf), "\x1b[%u;%uH",
-                          (unsigned)(Row + 1), (unsigned)(Column + 1));
-    if (n > 0) {
-        emit(m, buf, (size_t)n);
-    }
-    m->cur_row = (int32_t)Row;
-    m->cur_col = (int32_t)Column;
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_out_enable_cursor(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, BOOLEAN Visible)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->passthrough && m->orig_conout != NULL) {
-        m->orig_conout->EnableCursor(m->orig_conout, Visible);
-    }
-    emit_cstr(m, Visible ? "\x1b[?25h" : "\x1b[?25l");
-    return EFI_SUCCESS;
-}
-
-// ---------------------------------------------------------------------------
-// ConIn / ConInEx wrappers
-// ---------------------------------------------------------------------------
-
-static EFI_STATUS EFIAPI
-wrap_in_reset(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ext)
-{
-    (void)This;
-    (void)ext;
-    ring_drain(g_mirror);
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_in_read_key(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (ring_pop(m, Key)) {
-        ring_resignal_if_more(m);
-        return EFI_SUCCESS;
-    }
-    if (m->orig_conin != NULL) {
-        EFI_STATUS st = m->orig_conin->ReadKeyStroke(m->orig_conin, Key);
-        if (!EFI_ERROR(st)) {
-            return EFI_SUCCESS;
-        }
-    }
-    return EFI_NOT_READY;
-}
-
-static EFI_STATUS EFIAPI
-wrap_inex_reset(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ext)
-{
-    (void)This;
-    (void)ext;
-    ring_drain(g_mirror);
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_inex_read_key(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *KeyData)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    EFI_INPUT_KEY key;
-    if (ring_pop(m, &key)) {
-        ring_resignal_if_more(m);
-        axl_memset(KeyData, 0, sizeof(*KeyData));
-        KeyData->Key = key;
-        return EFI_SUCCESS;
-    }
-    if (m->orig_coninex != NULL) {
-        EFI_STATUS st = m->orig_coninex->ReadKeyStrokeEx(m->orig_coninex, KeyData);
-        if (!EFI_ERROR(st)) {
-            return EFI_SUCCESS;
-        }
-    }
-    return EFI_NOT_READY;
-}
-
-/* SetState is typed `void *` in the AXL ConInEx struct (the toggle-state
-   type isn't generated); take a void* and ignore it. */
-static EFI_STATUS EFIAPI
-wrap_inex_set_state(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *toggle_state)
-{
-    (void)This;
-    (void)toggle_state;
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_inex_register_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
-                          EFI_KEY_DATA *KeyData,
-                          EFI_KEY_NOTIFY_FUNCTION fn,
-                          void **NotifyHandle)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->orig_coninex != NULL && m->orig_coninex->RegisterKeyNotify != NULL) {
-        return m->orig_coninex->RegisterKeyNotify(m->orig_coninex, KeyData, fn,
-                                                  NotifyHandle);
-    }
-    if (NotifyHandle != NULL) {
-        *NotifyHandle = (void *)(uintptr_t)0x1;
-    }
-    return EFI_SUCCESS;
-}
-
-static EFI_STATUS EFIAPI
-wrap_inex_unregister_notify(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, void *handle)
-{
-    (void)This;
-    AxlConsoleMirror *m = g_mirror;
-    if (m->orig_coninex != NULL && m->orig_coninex->UnregisterKeyNotify != NULL) {
-        return m->orig_coninex->UnregisterKeyNotify(m->orig_coninex, handle);
-    }
-    return EFI_SUCCESS;
-}
-
-/* WaitForKey EVT_NOTIFY_WAIT callback: fires from WaitForEvent/CheckEvent when
-   a reader waits and the ring is empty — poll the physical keyboard so the
-   local keyboard keeps working under a foreground Shell. The push MUST signal
-   (via ring_push): unlike the EDK2 original we have no separate 10ms timer to
-   signal WaitForKey, so without the signal a polled physical key would sit in
-   the ring while WaitForEvent keeps returning "not signalled" and never wakes
-   the reader. Signalling a NOTIFY_WAIT event from inside its own wait-notify
-   only sets its signalled state (it does not re-invoke the notify), so there
-   is no recursion; the early-return on a non-empty ring prevents re-polling. */
-static void EFIAPI
-wait_key_cb(EFI_EVENT Event, void *Context)
-{
-    (void)Event;
-    (void)Context;
-    AxlConsoleMirror *m = g_mirror;
-    if (m == NULL || m->head != m->tail) {
-        return;  /* keys already pending */
-    }
-    if (m->orig_conin != NULL) {
-        EFI_INPUT_KEY k;
-        if (!EFI_ERROR(m->orig_conin->ReadKeyStroke(m->orig_conin, &k))) {
-            ring_push(m, k);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// inject_text — xterm/VT escape decoder
-// ---------------------------------------------------------------------------
-
-/* Decode an accumulated escape body (the bytes AFTER the leading ESC) to a
-   UEFI scan code, or 0 if not (yet) a recognized complete sequence. Sets
-   *complete=true once the body is a full sequence (recognized or not). */
-static uint16_t
-decode_escape(const char *body, size_t len, bool *complete)
-{
-    *complete = false;
-    if (len == 0) {
-        return 0;  /* just "ESC" so far */
-    }
-
-    if (body[0] == 'O') {
-        /* SS3: ESC O P..S → F1..F4 */
-        if (len < 2) {
-            return 0;
-        }
-        *complete = true;
-        switch (body[1]) {
-            case 'P': return SCAN_F1;        /* F1 */
-            case 'Q': return SCAN_F1 + 1;    /* F2 */
-            case 'R': return SCAN_F1 + 2;    /* F3 */
-            case 'S': return SCAN_F1 + 3;    /* F4 */
-            default:  return 0;
-        }
-    }
-
-    if (body[0] == '[') {
-        /* CSI: ESC [ params final. Final byte is 0x40..0x7E. */
-        size_t i = 1;
-        unsigned num = 0;
-        bool     have_num = false;
-        for (; i < len; i++) {
-            char c = body[i];
-            if (c >= '0' && c <= '9') {
-                num = num * 10 + (unsigned)(c - '0');
-                have_num = true;
-            } else if (c == ';') {
-                /* Modifier params follow — keep the FIRST number, ignore rest
-                   (e.g. ESC[1;5C ⇒ Ctrl+Right ⇒ base Right). */
-                while (i + 1 < len && body[i + 1] != '~'
-                       && !(body[i + 1] >= '@' && body[i + 1] <= 'Z')) {
-                    i++;
-                }
-            } else {
-                break;  /* final byte */
-            }
-        }
-        if (i >= len) {
-            return 0;  /* no final byte yet */
-        }
-        *complete = true;
-        char final = body[i];
-        switch (final) {
-            case 'A': return SCAN_UP;
-            case 'B': return SCAN_DOWN;
-            case 'C': return SCAN_RIGHT;
-            case 'D': return SCAN_LEFT;
-            case 'H': return SCAN_HOME;
-            case 'F': return SCAN_END;
-            case '~':
-                if (!have_num) {
-                    return 0;
-                }
-                switch (num) {
-                    case 1:  return SCAN_HOME;
-                    case 2:  return SCAN_INSERT;
-                    case 3:  return SCAN_DELETE;
-                    case 4:  return SCAN_END;
-                    case 5:  return SCAN_PGUP;
-                    case 6:  return SCAN_PGDN;
-                    case 15: return SCAN_F1 + 4;   /* F5 */
-                    case 17: return SCAN_F1 + 5;   /* F6 */
-                    case 18: return SCAN_F1 + 6;   /* F7 */
-                    case 19: return SCAN_F1 + 7;   /* F8 */
-                    case 20: return SCAN_F1 + 8;   /* F9 */
-                    case 21: return SCAN_F1 + 9;   /* F10 */
-                    case 23: return SCAN_F1 + 10;  /* F11 */
-                    case 24: return SCAN_F1 + 11;  /* F12 */
-                    default: return 0;
-                }
-            default: return 0;
-        }
-    }
-
-    /* ESC followed by something that isn't a CSI/SS3 introducer ⇒ the byte
-       is the bare Esc key; the introducer byte is handled by the caller. */
-    *complete = true;
-    return SCAN_ESC;
-}
-
-static void
-inject_unicode(AxlConsoleMirror *m, uint16_t ch)
-{
-    EFI_INPUT_KEY k = { .ScanCode = 0, .UnicodeChar = ch };
-    ring_push(m, k);
-}
-
-static void
-inject_scan(AxlConsoleMirror *m, uint16_t scan)
-{
-    EFI_INPUT_KEY k = { .ScanCode = scan, .UnicodeChar = 0 };
-    ring_push(m, k);
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-static void
-mirror_atexit(void *data)
-{
-    axl_console_mirror_uninstall((AxlConsoleMirror *)data);
-}
 
 int
 axl_console_mirror_install(AxlConsoleMirror **out, const AxlConsoleMirrorConfig *cfg)
@@ -651,107 +268,32 @@ axl_console_mirror_install(AxlConsoleMirror **out, const AxlConsoleMirrorConfig 
     if (m == NULL) {
         return AXL_ERR;
     }
-    m->sink        = cfg->sink;
-    m->user        = cfg->user;
-    m->cols        = cfg->cols;
-    m->rows        = cfg->rows;
-    m->passthrough = cfg->passthrough_local;
-    m->cur_row     = -1;
-    m->cur_col     = -1;
-
-    m->orig_conout = gST->ConOut;
-    m->orig_conin  = gST->ConIn;
-    m->orig_stderr = gST->StdErr;
-
-    /* ConOut wrapper: copy the original (preserves Mode), override methods. */
-    if (m->orig_conout != NULL) {
-        m->my_conout = *m->orig_conout;
-    }
-    m->my_conout.Reset             = wrap_out_reset;
-    m->my_conout.OutputString      = wrap_out_string;
-    m->my_conout.TestString        = wrap_out_test_string;
-    m->my_conout.QueryMode         = wrap_out_query_mode;
-    m->my_conout.SetMode           = wrap_out_set_mode;
-    m->my_conout.SetAttribute      = wrap_out_set_attribute;
-    m->my_conout.ClearScreen       = wrap_out_clear_screen;
-    m->my_conout.SetCursorPosition = wrap_out_set_cursor;
-    m->my_conout.EnableCursor      = wrap_out_enable_cursor;
-
-    /* ConIn wrapper. */
-    m->my_conin.Reset         = wrap_in_reset;
-    m->my_conin.ReadKeyStroke = wrap_in_read_key;
-
-    EFI_STATUS st = gBS->CreateEvent(EVT_NOTIFY_WAIT, TPL_CALLBACK,
-                                     wait_key_cb, NULL, &m->wait_key);
-    if (EFI_ERROR(st)) {
+    m->sink    = cfg->sink;
+    m->user    = cfg->user;
+    m->cur_row = -1;
+    m->cur_col = -1;
+    m->screen  = mirror_new_screen(cfg->cols, cfg->rows);
+    if (m->screen == NULL) {
         axl_free(m);
         return AXL_ERR;
     }
-    m->my_conin.WaitForKey = m->wait_key;
 
-    /* ConInEx wrapper. */
-    m->my_coninex.Reset               = (void *)wrap_inex_reset;
-    m->my_coninex.ReadKeyStrokeEx     = wrap_inex_read_key;
-    m->my_coninex.SetState            = (void *)wrap_inex_set_state;
-    m->my_coninex.RegisterKeyNotify   = wrap_inex_register_notify;
-    m->my_coninex.UnregisterKeyNotify = wrap_inex_unregister_notify;
-
-    st = gBS->CreateEvent(EVT_NOTIFY_WAIT, TPL_CALLBACK,
-                          wait_key_cb, NULL, &m->wait_key_ex);
-    if (EFI_ERROR(st)) {
-        gBS->CloseEvent(m->wait_key);
+    AxlConsoleTapConfig tcfg = {
+        .cols              = cfg->cols,
+        .rows              = cfg->rows,
+        .passthrough_local = cfg->passthrough_local,
+        .auto_alt_screen   = cfg->auto_alt_screen,
+        .input_capture     = cfg->input_capture,
+    };
+    if (axl_console_tap_install(&m->tap, &vt_ops, m, &tcfg) != AXL_OK) {
+        axl_console_screen_free(m->screen);
         axl_free(m);
         return AXL_ERR;
     }
-    m->my_coninex.WaitForKeyEx = m->wait_key_ex;
+    mirror_sync_screen_size(m);   /* match the model to the tap's resolved size */
 
-    /* Publish the singleton BEFORE swapping gST so the wrappers (which may
-       fire from a ReinstallProtocolInterface notify) see a live instance. */
     g_mirror = m;
-
-    /* Replace SimpleTextInputEx on ConsoleInHandle. The Shell's editor uses
-       HandleProtocol(ConsoleInHandle) directly, bypassing gST->ConIn — without
-       this, the keyboard is dead in `edit`. Best-effort: absence is non-fatal. */
-    EFI_GUID ex_guid = gEfiSimpleTextInputExProtocolGuid;
-    st = gBS->HandleProtocol(gST->ConsoleInHandle, &ex_guid,
-                             (void **)&m->orig_coninex);
-    if (!EFI_ERROR(st) && m->orig_coninex != NULL) {
-        st = gBS->ReinstallProtocolInterface(gST->ConsoleInHandle, &ex_guid,
-                                             m->orig_coninex, &m->my_coninex);
-        if (!EFI_ERROR(st)) {
-            m->reinstalled_ex = true;
-        } else {
-            axl_warning("console mirror: ConInEx reinstall failed (editor keys "
-                        "may not work)");
-        }
-    } else {
-        m->orig_coninex = NULL;
-    }
-
-    /* Swap gST pointers AFTER the reinstall (which can make ConSplitter
-       rewrite gST->ConIn). ConOut and StdErr are independent fields in
-       EFI_SYSTEM_TABLE (never unioned/aliased at the storage level, only
-       sometimes equal in value), so StdErr needs its own explicit
-       assignment even when it started out equal to ConOut. Route it
-       through the SAME wrapper instance as ConOut, not a separate
-       my_stderr -- one shared wrapper is enough to mirror both streams
-       and keeps the common aliased case from double-wrapping. */
-    gST->ConOut = &m->my_conout;
-    gST->ConIn  = &m->my_conin;
-    /* Repoint StdErr unconditionally, even when orig_stderr is NULL (no
-       error console at all) -- deliberate, not an oversight. Raw save/
-       restore is correct uniformly across the NULL / aliased-to-ConOut /
-       genuinely-distinct cases: a NULL original is restored verbatim on
-       uninstall (see orig_stderr field comment), and while installed, the
-       backend's console_write_err already falls back to ConOut when StdErr
-       is NULL, so routing a previously-absent StdErr through this wrapper
-       still reaches ConOut instead of silently discarding output. */
-    gST->StdErr = &m->my_conout;
-
-    m->atexit_handle = axl_atexit(mirror_atexit, m);
-
     *out = m;
-    axl_info("console mirror installed (%ux%u)", m->cols, m->rows);
     return AXL_OK;
 }
 
@@ -761,45 +303,16 @@ axl_console_mirror_uninstall(AxlConsoleMirror *m)
     if (m == NULL || g_mirror != m) {
         return;
     }
-
-    if (m->reinstalled_ex && m->orig_coninex != NULL) {
-        EFI_GUID ex_guid = gEfiSimpleTextInputExProtocolGuid;
-        gBS->ReinstallProtocolInterface(gST->ConsoleInHandle, &ex_guid,
-                                        &m->my_coninex, m->orig_coninex);
-    }
-    if (m->orig_conout != NULL) {
-        gST->ConOut = m->orig_conout;
-    }
-    /* Restore StdErr to exactly what was saved -- NULL, aliased to
-       ConOut's original, or a distinct instance -- independent of the
-       ConOut restore above (see the orig_stderr field comment). */
-    gST->StdErr = m->orig_stderr;
-    if (m->orig_conin != NULL) {
-        gST->ConIn = m->orig_conin;
-    }
-    if (m->wait_key != NULL) {
-        gBS->CloseEvent(m->wait_key);
-    }
-    if (m->wait_key_ex != NULL) {
-        gBS->CloseEvent(m->wait_key_ex);
-    }
-    if (m->atexit_handle != 0) {
-        axl_atexit_remove(m->atexit_handle);
-    }
-
+    axl_console_tap_uninstall(m->tap);
+    axl_console_screen_free(m->screen);
     g_mirror = NULL;
     axl_free(m);
-    axl_info("console mirror uninstalled");
 }
 
 int
 axl_console_mirror_inject_key(AxlConsoleMirror *m, uint16_t scan, uint16_t unicode)
 {
-    if (m == NULL) {
-        return AXL_ERR;
-    }
-    EFI_INPUT_KEY k = { .ScanCode = scan, .UnicodeChar = unicode };
-    return ring_push(m, k) ? AXL_OK : AXL_ERR;
+    return (m != NULL) ? axl_console_tap_inject_key(m->tap, scan, unicode) : AXL_ERR;
 }
 
 int
@@ -808,128 +321,28 @@ axl_console_mirror_inject_text(AxlConsoleMirror *m, const char *bytes, size_t le
     if (m == NULL || bytes == NULL) {
         return AXL_ERR;
     }
-
-    for (size_t i = 0; i < len; i++) {
-        unsigned char b = (unsigned char)bytes[i];
-
-        if (m->in_esc) {
-            /* Bare ESC followed by a CSI/SS3 introducer? keep accumulating;
-               otherwise the pending ESC is the Esc key and this byte restarts
-               normal handling. */
-            if (m->esc_len == 0 && b != '[' && b != 'O') {
-                inject_scan(m, SCAN_ESC);
-                m->in_esc = false;
-                /* fall through to handle b as a normal byte below */
-            } else {
-                if (m->esc_len < sizeof(m->esc_buf)) {
-                    m->esc_buf[m->esc_len++] = (char)b;
-                }
-                bool     complete = false;
-                uint16_t scan = decode_escape(m->esc_buf, m->esc_len, &complete);
-                if (complete) {
-                    if (scan != 0) {
-                        inject_scan(m, scan);
-                    }
-                    m->in_esc  = false;
-                    m->esc_len = 0;
-                } else if (m->esc_len >= sizeof(m->esc_buf)) {
-                    /* Overlong / unrecognized — drop to avoid wedging. */
-                    m->in_esc  = false;
-                    m->esc_len = 0;
-                }
-                continue;
-            }
-        }
-
-        if (b == 0x1B) {
-            m->in_esc  = true;
-            m->esc_len = 0;
-            continue;
-        }
-
-        /* UTF-8 → a single BMP unicode key (input is typically ASCII). */
-        if (b < 0x80) {
-            /* Terminals (xterm.js) send 0x7f (DEL) for the Backspace key;
-               UEFI backspace is UnicodeChar 0x08, so remap it here — exactly
-               what TerminalDxe does for an incoming 0x7f. (The Delete *key*
-               arrives as the CSI "3~" escape and is decoded to SCAN_DELETE by
-               decode_escape; it never reaches this byte path.) */
-            inject_unicode(m, (b == 0x7f) ? 0x08 : b);
-        } else if ((b & 0xE0) == 0xC0 && i + 1 < len) {
-            uint16_t cp = (uint16_t)((b & 0x1F) << 6)
-                        | (uint16_t)(bytes[i + 1] & 0x3F);
-            inject_unicode(m, cp);
-            i += 1;
-        } else if ((b & 0xF0) == 0xE0 && i + 2 < len) {
-            uint16_t cp = (uint16_t)((b & 0x0F) << 12)
-                        | (uint16_t)((bytes[i + 1] & 0x3F) << 6)
-                        | (uint16_t)(bytes[i + 2] & 0x3F);
-            inject_unicode(m, cp);
-            i += 2;
-        }
-        /* else: incomplete/invalid lead byte — skip. */
-    }
-
-    /* Flush any escape state that didn't complete within this call. Each
-       inject_text call is self-contained: xterm.js delivers a whole escape
-       sequence per keypress, so a sequence that is still open at end-of-call
-       is a bare Esc (its own write) or a truncated/garbled run. Treat the
-       leading ESC as the Esc key and re-inject the accumulated body bytes as
-       literal keys, rather than holding state into the next call — a held
-       partial would otherwise splice onto the next call's bytes and corrupt
-       that keystroke (e.g. a dropped final byte turning a later 'A' into Up). */
-    if (m->in_esc) {
-        inject_scan(m, SCAN_ESC);
-        for (size_t j = 0; j < m->esc_len; j++) {
-            inject_unicode(m, (unsigned char)m->esc_buf[j]);
-        }
-        m->in_esc  = false;
-        m->esc_len = 0;
-    }
-    return AXL_OK;
-}
-
-// ---------------------------------------------------------------------------
-// Test seam (no public header). Exercises the REAL inject_text/inject_key
-// byte->key decoder without installing the mirror — install wraps the live
-// gST->ConIn/ConOut and wedges the combined unit boot (see the AxlConsoleMirror
-// test note in axl-test-util.c). Construct a bare, un-wrapped instance (ring +
-// esc state only; no console wrap, no g_mirror, no WaitForKey event so
-// ring_push won't SignalEvent), drive inject_* against its ring, and pop the
-// decoded keys. Free with axl_free. The console-mirror unit test calls these.
-// ---------------------------------------------------------------------------
-
-AxlConsoleMirror *
-_axl_console_mirror_new_for_test(void)
-{
-    return axl_calloc(1, sizeof(AxlConsoleMirror));
-}
-
-bool
-_axl_console_mirror_test_pop_key(AxlConsoleMirror *m, uint16_t *scan,
-                                 uint16_t *unicode)
-{
-    EFI_INPUT_KEY k;
-    if (m == NULL || !ring_pop(m, &k)) {
-        return false;
-    }
-    if (scan != NULL) {
-        *scan = k.ScanCode;
-    }
-    if (unicode != NULL) {
-        *unicode = k.UnicodeChar;
-    }
-    return true;
+    return axl_console_tap_inject_text(m->tap, bytes, len);
 }
 
 void
 axl_console_mirror_set_size(AxlConsoleMirror *m, uint32_t cols, uint32_t rows)
 {
-    if (m == NULL) {
-        return;
+    if (m != NULL) {
+        axl_console_tap_set_size(m->tap, cols, rows);
+        /* Keep the late-join model in lockstep with the tap's RESOLVED size, so a
+           partial-zero resize (e.g. cols set, rows -> physical) tracks both axes
+           rather than dropping the whole resize on the 0. */
+        mirror_sync_screen_size(m);
     }
-    m->cols = cols;
-    m->rows = rows;
+}
+
+int
+axl_console_mirror_snapshot(AxlConsoleMirror *m, AxlConsoleScreenSink sink, void *user)
+{
+    if (m == NULL || sink == NULL) {
+        return AXL_ERR;
+    }
+    return axl_console_screen_snapshot(m->screen, sink, user);
 }
 
 void
@@ -938,11 +351,87 @@ axl_console_mirror_reset(AxlConsoleMirror *m)
     if (m == NULL) {
         return;
     }
-    ring_drain(m);
+    m->cur_row = -1;   /* forget the emitted-cursor dedup baseline */
+    m->cur_col = -1;
+    axl_console_tap_reset(m->tap);
+}
+
+void
+axl_console_mirror_enter_alt_screen(AxlConsoleMirror *m)
+{
+    if (m != NULL) {
+        axl_console_tap_enter_alt_screen(m->tap);
+    }
+}
+
+void
+axl_console_mirror_leave_alt_screen(AxlConsoleMirror *m)
+{
+    if (m != NULL) {
+        axl_console_tap_leave_alt_screen(m->tap);
+    }
+}
+
+bool
+axl_console_mirror_in_alt_screen(const AxlConsoleMirror *m)
+{
+    return m != NULL && axl_console_tap_in_alt_screen(m->tap);
+}
+
+// ---------------------------------------------------------------------------
+// Test seam (no public header). Builds a bare, un-installed mirror whose VT
+// encoder can be bound over a headless tap, so the emitted byte stream is
+// assertable without wrapping the live console (a real install wedges the
+// combined unit boot — see the AxlConsoleMirror note in axl-test-util.c).
+// ---------------------------------------------------------------------------
+
+AxlConsoleMirror *
+_axl_console_mirror_new_for_test(void)
+{
+    AxlConsoleMirror *m = axl_calloc(1, sizeof(*m));
+    if (m != NULL) {
+        m->cur_row = -1;
+        m->cur_col = -1;
+        m->screen  = mirror_new_screen(MIRROR_DEFAULT_COLS, MIRROR_DEFAULT_ROWS);
+    }
+    return m;
+}
+
+/* Bind this mirror's encoder to a (headless) tap and hand back the ops table +
+   context so the caller can drive the tap's wraps into it. */
+void
+_axl_console_mirror_test_bind(AxlConsoleMirror *m, AxlConsoleSinkFn sink, void *user,
+                              AxlConsoleTap *tap, const AxlConsoleOps **ops,
+                              void **ops_user)
+{
+    if (m == NULL) {
+        return;
+    }
+    m->tap     = tap;
+    m->sink    = sink;
+    m->user    = user;
     m->cur_row = -1;
     m->cur_col = -1;
-    m->in_esc  = false;
-    m->esc_len = 0;
-    /* Alt-screen enter/leave lands with the full-screen P2 work; until then
-       there is no alt-screen state to leave here. */
+    if (ops != NULL) {
+        *ops = &vt_ops;
+    }
+    if (ops_user != NULL) {
+        *ops_user = m;
+    }
 }
+
+AxlConsoleScreen *
+_axl_console_mirror_test_screen(AxlConsoleMirror *m)
+{
+    return (m != NULL) ? m->screen : NULL;
+}
+
+void
+_axl_console_mirror_test_free(AxlConsoleMirror *m)
+{
+    if (m != NULL) {
+        axl_console_screen_free(m->screen);
+        axl_free(m);
+    }
+}
+

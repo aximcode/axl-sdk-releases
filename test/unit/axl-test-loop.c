@@ -1172,6 +1172,77 @@ test_loop_attach_driver(void)
 }
 
 // ---------------------------------------------------------------------------
+// Keypress drain in the non-blocking dispatch path
+//
+// SOURCE_KEYPRESS is never in event_array (its WaitForKeyEx notify discards
+// modifier-only partials), so it is selected off the poll timer instead. That
+// selection used to live only in the BLOCKING branch of next_event, which two
+// real consumers never reach: a driver-mode pump (axl_loop_attach_driver — a
+// GUI hosting a blocking nested Shell) and any blocking loop that also has an
+// idle source (next_event routes `blocking && has_idle` through the same
+// CheckEvent path). Both stranded every keystroke in the firmware queue.
+// ---------------------------------------------------------------------------
+
+static int keypress_drain_calls;
+
+static bool
+on_keypress_drain(AxlInputKey key, void *data)
+{
+    (void)key;
+    (void)data;
+    keypress_drain_calls++;
+    return AXL_SOURCE_CONTINUE;
+}
+
+static void
+test_keypress_drain_non_blocking(void)
+{
+    AxlLoop *loop = axl_loop_new();
+    if (loop == NULL) {
+        test_fail("loop: keypress drain: loop_new alloc failed");
+        return;
+    }
+
+    keypress_drain_calls = 0;
+    AxlSourceId id = axl_loop_add_key_press(loop, on_keypress_drain, NULL);
+    test_check(id != 0, "loop: add_key_press returns a source id");
+
+    /* The poll timer is the drain tick. Let it expire, then ONE non-blocking
+       dispatch must select the keypress source (rc 0 = a source ran). The
+       firmware queue is empty here, so the callback itself never fires — what
+       is under test is that the source is reachable at all. */
+    gBS->Stall(20000);   /* > POLL_INTERVAL_MS (10) */
+    test_check(axl_loop_dispatch(loop, false) == 0,
+               "loop: non-blocking dispatch drains keypress on the poll tick");
+
+    test_check(keypress_drain_calls == 0,
+               "loop: empty key queue -> keypress callback not invoked");
+
+    /* ...and only once per tick. driver_dispatch_notify loops until dispatch
+       reports nothing pending, so a keypress source that reported itself ready
+       on every call would burn the whole per-tick budget every tick.
+       No Stall here on purpose: this asserts the poll timer has NOT re-armed,
+       which holds as long as the two dispatch calls above take under
+       POLL_INTERVAL_MS (microseconds on an empty queue). */
+    test_check(axl_loop_dispatch(loop, false) == 1,
+               "loop: keypress is not re-selected before the next poll tick");
+
+    /* The next tick re-arms it (the poll timer is periodic). */
+    gBS->Stall(20000);
+    test_check(axl_loop_dispatch(loop, false) == 0,
+               "loop: keypress is re-selected on the following poll tick");
+
+    /* A loop with no keypress source must not consume the poll timer: an
+       empty non-blocking dispatch still reports "nothing pending". */
+    axl_loop_remove_source(loop, id);
+    gBS->Stall(20000);
+    test_check(axl_loop_dispatch(loop, false) == 1,
+               "loop: no keypress source -> non-blocking dispatch stays idle");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
 // Raised-TPL safety of nested blocking waits
 //
 // A consumer's driver-pump (axl_loop_attach_driver) dispatches notifies at
@@ -1421,6 +1492,7 @@ test_loop_main(
     test_iterate_until_done();
     test_iterate_until_timeout();
     test_loop_attach_driver();
+    test_keypress_drain_non_blocking();
     test_loop_wait_at_raised_tpl();
     test_loop_sync_wait_from_driver_pump();
     test_loop_in_callback_marker();

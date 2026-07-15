@@ -320,6 +320,31 @@ axl_snprintf(
 ) __attribute__((format(printf, 3, 4)));
 
 /**
+ * @brief Format into a fixed buffer from a `va_list`. Like vsnprintf().
+ *
+ * The `va_list` sibling of @ref axl_snprintf, which is implemented on top
+ * of it. Same engine, same format specifiers, same `%f` caveats. Use this
+ * to build a printf-style wrapper of your own, or to satisfy a third-party
+ * library that expects a `vsnprintf`.
+ *
+ * @a args is consumed: as with vsnprintf(), the caller must `va_end` it and
+ * must not reuse it afterwards without `va_copy`.
+ *
+ * Writes nothing and returns 0 if @a buf is NULL or @a size is 0. Otherwise
+ * always NUL-terminates.
+ *
+ * @return number of bytes that would have been written (excluding NUL),
+ *     regardless of buffer size (allows truncation detection).
+ */
+int
+axl_vsnprintf(
+    char       *buf,   ///< output buffer
+    size_t      size,  ///< buffer size
+    const char *fmt,   ///< printf-style format string
+    va_list     args   ///< argument list; consumed
+) __attribute__((format(printf, 3, 0)));
+
+/**
  * @brief Format a byte count into a human-readable string.
  *
  * Picks the largest IEC binary unit (KiB / MiB / GiB / TiB) that

@@ -719,6 +719,55 @@ test_snprintf(void)
     test_check(buf[5] == '\0', "snprintf: NUL terminates on truncation");
 }
 
+// Thin varargs trampolines: axl_vsnprintf takes a va_list, so a test needs a
+// variadic caller to build one.
+static int
+vsn_call(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list args;
+    int     n;
+
+    va_start(args, fmt);
+    n = axl_vsnprintf(buf, size, fmt, args);
+    va_end(args);
+    return n;
+}
+
+static void
+test_vsnprintf(void)
+{
+    char buf[32];
+    int  n;
+
+    n = vsn_call(buf, sizeof(buf), "hello %s", "world");
+    test_check(n == 11, "vsnprintf: returns length");
+    test_check(axl_strcmp(buf, "hello world") == 0, "vsnprintf: formats string");
+
+    n = vsn_call(buf, sizeof(buf), "%d + %d = %d", 1, 2, 3);
+    test_check(n == 9, "vsnprintf: returns length for ints");
+    test_check(axl_strcmp(buf, "1 + 2 = 3") == 0, "vsnprintf: formats ints");
+
+    // Truncation: C99 semantics — return the would-be length, NUL-terminate.
+    n = vsn_call(buf, 6, "hello world");
+    test_check(n == 11, "vsnprintf: returns full length on truncation");
+    test_check(axl_strcmp(buf, "hello") == 0, "vsnprintf: truncates correctly");
+    test_check(buf[5] == '\0', "vsnprintf: NUL terminates on truncation");
+
+    // Guards: a NULL buffer or zero size writes nothing and reports 0.
+    n = vsn_call(NULL, 16, "x");
+    test_check(n == 0, "vsnprintf: NULL buf -> 0");
+
+    buf[0] = 'Z';
+    n = vsn_call(buf, 0, "x");
+    test_check(n == 0, "vsnprintf: zero size -> 0");
+    test_check(buf[0] == 'Z', "vsnprintf: zero size does not write");
+
+    // Exact fit: size == len + 1 stores the whole string.
+    n = vsn_call(buf, 6, "hello");
+    test_check(n == 5, "vsnprintf: exact fit returns length");
+    test_check(axl_strcmp(buf, "hello") == 0, "vsnprintf: exact fit stores all bytes");
+}
+
 static void
 test_snprintf_float(void)
 {
@@ -1995,6 +2044,7 @@ test_strbuf_main(
     test_memset();
     test_memchr();
     test_snprintf();
+    test_vsnprintf();
     test_snprintf_float();
     test_snprintf_exp_g();
     test_dtoa();

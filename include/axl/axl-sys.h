@@ -280,8 +280,14 @@ axl_reset(
 /**
  * @brief Rescan device-to-filesystem mappings.
  *
- * Equivalent to the Shell "map -r" command. Call after hot-plugging
- * a USB drive or after a driver installs a new filesystem.
+ * Runs the Shell "map -r" command for its rescan side effect. Call
+ * after hot-plugging a USB drive or after a driver installs a new
+ * filesystem. The command's device-mapping table is redirected to nul,
+ * so the rescan is silent: this is a refresh, not a listing (use the
+ * `map` tool to display the table). On the old EFI 1.x shell, where the
+ * command runs in-context rather than in a nested shell, that
+ * redirection is what stops `map -r` from printing over a caller's own
+ * output.
  *
  * @return AXL_OK on success, AXL_ERR on error.
  */

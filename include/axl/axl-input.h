@@ -238,6 +238,52 @@ axl_input_set_key_debounce(
     bool      printable_only  ///< true: exempt navigation/editing keys
 );
 
+// ===================================================================
+// Minimum inter-key delivery gate (rate-limit / spacing)
+//
+// Where the debounce filter DROPS a too-fast SAME-key repeat, the gate
+// SPACES OUT *all* keys: after a key is delivered, the next key is held
+// until at least `min_gap_ms` has elapsed, then released — so a burst
+// (typematic, or a laggy KVM releasing many key-ups at once) is metered
+// to at most one key per gap regardless of how greedily the consumer
+// reads. No key is dropped; they are delayed.
+//
+// This is PURE timing logic: it decides *when* the next key may be
+// delivered. The caller owns the held-key buffer and the one-shot
+// release timer (a resident ConIn wrap, or an AGT terminal loop) and
+// calls axl_input_key_gate_mark() when it actually releases a key.
+// `min_gap_ms == 0` disables the gate. Reused by the kbtune resident
+// shim and by `axterm` so both meter identically.
+// ===================================================================
+
+/// Min-gap gate state. Zero-initialize (`AxlKeyGate g = {0};`) before the
+/// first use; one instance per key stream.
+typedef struct {
+    uint64_t  last_delivered_us;  ///< timestamp of the last key released
+    bool      primed;             ///< a key has been delivered (gap applies only after the first)
+} AxlKeyGate;
+
+/// Earliest time (microseconds since boot) the next key may be delivered.
+/// Deliver the pending key when `now_us >= ` this value; otherwise hold it
+/// and arm a one-shot timer for the difference, re-checking on fire.
+///
+/// @return `g->last_delivered_us + min_gap_ms*1000`, or **0** (deliver
+///         immediately) when @p g is NULL, not yet primed (the first key of
+///         a stream is never held), or @p min_gap_ms is 0 (gate disabled).
+uint64_t
+axl_input_key_gate_ready_at(
+    const AxlKeyGate  *g,           ///< gate state (may be NULL -> 0)
+    uint32_t           min_gap_ms   ///< minimum inter-key spacing in ms (0 = disabled)
+);
+
+/// Advance the gate: record that a key was delivered at @p now_us. Call
+/// immediately after releasing a key the gate cleared. NULL-safe (no-op).
+void
+axl_input_key_gate_mark(
+    AxlKeyGate  *g,       ///< gate state
+    uint64_t     now_us   ///< delivery timestamp (microseconds since boot)
+);
+
 /// Normalized coordinate span for absolute-pointer (touch) events.  A
 /// `TOUCH_*` event's `x` / `y` are rescaled from the device's native
 /// `EFI_ABSOLUTE_POINTER_MODE` `AbsoluteMin/Max` into `[0, AXL_INPUT_ABS_RANGE)`,
@@ -351,6 +397,35 @@ axl_input_attach_mouse(
     AxlLoop           *loop,
     AxlInputCallback   cb,
     void              *data
+    );
+
+/// Register mouse input over CALLER-SUPPLIED pointer interfaces.
+///
+/// Identical to axl_input_attach_mouse except it polls the given
+/// `EFI_SIMPLE_POINTER_PROTOCOL` interfaces (passed as `void *`, cast
+/// internally) DIRECTLY on the loop timer, instead of locating them and
+/// re-resolving each dispatch via `HandleProtocol`.  This is for a
+/// consumer that has taken the pointer OUT of the handle database — e.g.
+/// @ref AxlConsoleDevice with `take_pointer=true`, whose evicted
+/// interfaces are no longer locatable but stay valid (their producing
+/// drivers are not stopped).  Feed
+/// @ref axl_console_device_pointer_iface for each of
+/// @ref axl_console_device_pointer_count.  Because the interfaces are
+/// cached (not re-resolved), a producer that is Stop()'d while attached
+/// would dangle — only use for interfaces whose lifetime the caller
+/// controls for the duration.  Same single-mouse-per-process slot as
+/// axl_input_attach_mouse (detach with @ref axl_input_detach_mouse).
+///
+/// @return source ID for axl_loop_remove_source, or 0 on failure (NULL
+///         loop/cb, @p n <= 0 or @p ifaces NULL, all ifaces NULL, or a
+///         mouse source is already attached).
+AxlSourceId
+axl_input_attach_mouse_ifaces(
+    AxlLoop           *loop,
+    AxlInputCallback   cb,
+    void              *data,
+    void *const       *ifaces,   ///< array of EFI_SIMPLE_POINTER_PROTOCOL* (as void*)
+    int                n         ///< count of @p ifaces (1..AXL_MAX_POINTER_IFACES)
     );
 
 /// Detach the mouse source previously attached with

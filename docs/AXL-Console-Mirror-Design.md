@@ -1,5 +1,9 @@
 # AXL Console Mirror — Design
 
+> Part of the **AXL Console** family — see `AXL-Console-Design.md` for the
+> umbrella (the `AxlConsoleOps` contract + how the producers and consumers
+> relate). This doc is the VT-wire **consumer** leaf.
+
 **Status:** IMPLEMENTED (2026-06-15) — all phases done; see §8. axl-sdk
 substrate that lets a loop-owning AXL application host the **real UEFI
 Shell** (or any blocking app) with its console transparently mirrored to
@@ -166,7 +170,16 @@ typedef struct {
     uint32_t         cols;            ///< remote terminal width  (e.g. 80)
     uint32_t         rows;            ///< remote terminal height (e.g. 25)
     bool             passthrough_local; ///< also write to the physical console (default true)
+    bool             auto_alt_screen;   ///< ClearScreen => enter alt-screen, scroll => leave
+    bool             input_capture;     ///< wrapped ConIn serves ONLY injected keys (default off = passthrough)
 } AxlConsoleMirrorConfig;
+
+/// Alt-screen (DECSET/DECRST 1049) — asserted by the wrapper, not received
+/// (SIMPLE_TEXT_OUTPUT can't express it). Explicit API, or the auto_alt_screen
+/// heuristic (ClearScreen enters; cursor scrolling past the last row leaves).
+void axl_console_mirror_enter_alt_screen(AxlConsoleMirror *m);
+void axl_console_mirror_leave_alt_screen(AxlConsoleMirror *m);
+bool axl_console_mirror_in_alt_screen(const AxlConsoleMirror *m);
 
 /// Install: save gST->ConIn/ConOut(/StdErr), swap in the wrappers, and
 /// route output to cfg->sink. From here the firmware (and any app the

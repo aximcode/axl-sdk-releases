@@ -611,6 +611,25 @@ axl_backend_shell_execute(
     );
 
 /**
+ * @brief Execute a shell command string with its console output swallowed.
+ *
+ * Runs @p command exactly as @ref axl_backend_shell_execute does, but
+ * temporarily points `gST->ConOut->OutputString` at a no-op for the duration,
+ * so text the command prints is discarded while its side effects run normally.
+ * Unlike a `> nul` redirect, the command is unaltered and runs in-context — on
+ * the old EFI 1.x shell that matters, because a redirect pushes the command
+ * into a sub-context and loses side effects the interactive shell needs (e.g.
+ * `map -r`'s device-path aliases). A no-op difference on the modern shell,
+ * whose nested Execute is already off-console.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_shell_execute_quiet(
+    const unsigned short  *command  ///< UCS-2 command line
+    );
+
+/**
  * @brief Resolve the UEFI Shell filesystem alias (e.g. "fs3") for a
  *        device path.
  *

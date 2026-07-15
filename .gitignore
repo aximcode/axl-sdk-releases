@@ -14,6 +14,7 @@ deps/*
 !deps/stb
 !deps/freetype
 !deps/sdefl
+!deps/libvterm
 *.pyc
 __pycache__/
 tests/.last-pass-count

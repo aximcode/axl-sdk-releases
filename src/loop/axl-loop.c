@@ -327,6 +327,7 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
     size_t          event_to_source[AXL_MAX_SOURCES + 3];
     size_t          fired_index;
     bool            has_idle;
+    int             keypress_src;   /* first active SOURCE_KEYPRESS, or -1 */
 
     if (loop == NULL) {
         return -1;
@@ -388,13 +389,20 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
      * wakes us on a held modifier and (b) silently drops the partial the
      * moment WaitForEvent checks it — so live modifier state (Shift+wheel
      * / Ctrl+click) could never be tracked. Keypress sources are instead
-     * drained by polling ReadKeyStrokeEx on the poll-timer tick below,
-     * which returns partials. */
+     * drained by polling ReadKeyStrokeEx on the poll-timer tick, in BOTH
+     * the blocking and the non-blocking branch below (keypress_src). */
     event_count = 0;
+    keypress_src = -1;
     for (i = 0; i < loop->source_count; i++) {
+        if (loop->sources[i].active &&
+            loop->sources[i].type == SOURCE_KEYPRESS) {
+            if (keypress_src < 0) {
+                keypress_src = (int)i;
+            }
+            continue;
+        }
         if (loop->sources[i].active && loop->sources[i].event != NULL &&
-            loop->sources[i].type != SOURCE_IDLE &&
-            loop->sources[i].type != SOURCE_KEYPRESS) {
+            loop->sources[i].type != SOURCE_IDLE) {
             event_to_source[event_count] = i;
             event_array[event_count] = loop->sources[i].event;
             event_count++;
@@ -407,8 +415,9 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
      * so axl_loop_run idles instead of busy-spinning. The yield-test
      * end-to-end test exercises exactly this path — main() calls
      * axl_loop_run on the default loop with no other sources to wait
-     * for Ctrl-C. */
-    if (event_count == 0 && !has_idle && !blocking) {
+     * for Ctrl-C. A keypress source counts as work even though it is
+     * not in event_array: the non-blocking branch polls it below. */
+    if (event_count == 0 && !has_idle && !blocking && keypress_src < 0) {
         return 1;
     }
 
@@ -483,24 +492,12 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
          * drains the firmware key queue via ReadKeyStrokeEx (a no-op when
          * nothing is queued). Partials refresh live modifier state; full
          * keys deliver a KEY_DOWN. Key latency is therefore bounded by the
-         * poll interval (POLL_INTERVAL_MS), imperceptible for input.
-         *
-         * NOTE: this drain runs only in the blocking run-loop path. The
-         * non-blocking dispatch path (driver mode via
-         * axl_loop_attach_driver, or any direct axl_loop_dispatch(loop,
-         * false)) does NOT poll keypress — SOURCE_KEYPRESS is excluded from
-         * the non-blocking CheckEvent loop too. No in-tree consumer pairs a
-         * keyboard source with non-blocking dispatch (driver loops are
-         * headless network services), so no key is ever stranded in
-         * practice. A future non-blocking keyboard consumer must drain
-         * keypress in the CheckEvent path as well. */
+         * poll interval (POLL_INTERVAL_MS), imperceptible for input. The
+         * non-blocking branch below drains on the same timer. */
         if (event_to_source[fired_index] == (size_t)-1) {
-            for (size_t k = 0; k < loop->source_count; k++) {
-                if (loop->sources[k].active &&
-                    loop->sources[k].type == SOURCE_KEYPRESS) {
-                    loop->pending_source = (int)k;
-                    return 0;
-                }
+            if (keypress_src >= 0) {
+                loop->pending_source = keypress_src;
+                return 0;
             }
             return 1;
         }
@@ -515,6 +512,27 @@ axl_loop_next_event(AxlLoop *loop, bool blocking)
             loop->pending_source = (int)event_to_source[i];
             return 0;
         }
+    }
+
+    /* Keypress drain for every caller that does not reach the blocking
+     * branch above: a driver-mode pump (axl_loop_attach_driver, which a GUI
+     * hosting a blocking nested Shell uses — see axterm), a direct
+     * axl_loop_dispatch(loop, false), and any BLOCKING loop that also has an
+     * idle source (`blocking && has_idle` falls through to here).
+     *
+     * Gated on the poll timer rather than on the source's own WaitForKeyEx
+     * for two reasons. (a) That event's firmware notify DISCARDS
+     * modifier-only partial keystrokes, so checking it would destroy the
+     * live modifier state the blocking path is careful to preserve.
+     * (b) CheckEvent on a periodic timer succeeds once per period, which
+     * bounds this to one drain per tick — dispatch_event then empties the
+     * whole queue. An always-ready keypress source would instead spin
+     * driver_dispatch_notify's "drain until nothing pending" loop to its
+     * per-tick budget on every tick. */
+    if (keypress_src >= 0 && loop->poll_timer != NULL &&
+        axl_backend_event_check(loop->poll_timer) == 0) {
+        loop->pending_source = keypress_src;
+        return 0;
     }
 
     return 1;

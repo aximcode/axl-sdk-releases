@@ -409,6 +409,22 @@ static __attribute__((unused)) EFI_GUID gEfiCpuArchProtocolGuid =
     { 0x26baccb1, 0x6f42, 0x11d4,
       {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81} };
 
+// Console-device marker GUIDs (EDK2 MdeModulePkg.dec, NOT UEFI/PI spec, so the
+// spec-HTML manifest generator can't emit them — hand-written here). ConSplitter's
+// ConOut/ConIn DriverBinding.Supported binds a controller handle on the presence
+// of these tags: a handle carrying gEfiConsoleOutDeviceGuid is fanned console
+// output, one carrying gEfiConsoleInDeviceGuid is aggregated for console input.
+// axl-console-device installs the Out tag on its own handle to join the fan-out,
+// and uninstalls it from the firmware console handles to evict them. The tag is a
+// pure marker: it is installed with a NULL interface.
+static __attribute__((unused)) EFI_GUID gEfiConsoleOutDeviceGuid =
+    { 0xd3b36f2c, 0xd551, 0x11d4,
+      {0x9a, 0x46, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d} };
+
+static __attribute__((unused)) EFI_GUID gEfiConsoleInDeviceGuid =
+    { 0xd3b36f2b, 0xd551, 0x11d4,
+      {0x9a, 0x46, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d} };
+
 // DXE Services Table GUID (PI spec DXE_SERVICES_TABLE_GUID). The spec macro
 // uses a flat 11-field initializer that the generator's GUID auto-extractor
 // (which expects the nested EFI_GUID form) skips, so it is defined by hand

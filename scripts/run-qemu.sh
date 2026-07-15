@@ -42,6 +42,9 @@
 #                         the app is up, then capture — for "screenshot the
 #                         app after input X". Repeatable; auto-adds a USB
 #                         keyboard on aarch64.
+#   --holdkey "QCODE:MS"  With --screenshot: hold a USB key down for MS ms via
+#                         QMP (reproduces UsbKbDxe typematic "bounce"). Auto-adds
+#                         a USB keyboard. Pair with --serial-log. Repeatable.
 #   --nsh FILE            Use custom startup.nsh instead of auto-generated
 #   --background          Launch QEMU in background, print PID
 #   --serial-log FILE     Save serial output to FILE
@@ -68,10 +71,11 @@
 #                         build that includes VirtioFsDxe (or a
 #                         standalone VirtioFsDxe.efi alongside the
 #                         firmware build). Default volume tag: hostfs.
-#   --no-cpu-warn         Disable the CPU-spike warning (on by default
-#                         in foreground mode; samples QEMU's host CPU
-#                         after the firmware-boot warm-up and prints
-#                         a WARN line if a spin gets through).
+#   --no-cpu-warn         Disable the CPU-spike check (on by default in the
+#                         default + --screenshot modes; samples QEMU's host
+#                         CPU after the firmware-boot warm-up and, on a
+#                         sustained spin, prints a WARN line AND fails the run
+#                         with exit 8 — guest failure/timeout take precedence).
 #   --cpu-threshold N     Spike threshold in cores (default 1.5).
 #   --cpu-sustain SECS    Sustain duration in seconds (default 2).
 #
@@ -121,13 +125,19 @@ GDB_PORT=""
 GDB_HALT=false
 DEBUGCON_LOG=""
 EFI_FILE=""
+BOOT_TARGET=false   # --boot-target: stage the app AS \EFI\BOOT\BOOTx64.EFI (the
+                    # default boot loader) instead of launching it from a shell's
+                    # startup.nsh — so there is NO parent shell above it. Matches
+                    # how a console-hosting app (axterm, SoftBMC) really ships.
 EFI_ARGS=()
 SENDKEY_SEQ=""   # space-separated QEMU monitor key tokens to inject (--screenshot)
 SENDMOUSE_SEQ="" # space-separated "fx,fy[,click]" absolute-pointer moves (--screenshot, QMP)
+HOLDKEY_SEQ=""   # space-separated "qcode:ms" held keypresses (--screenshot, QMP)
 CPU_WARN=true
 CPU_REPORT=false     # --cpu-report: always print sampled mean/peak host CPU
 CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
 CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
+CPU_SPIKE_EXIT=8     # distinct exit code for "sustained CPU spike" (vs guest fail/timeout)
 INTERACTIVE=false
 # --display BACKEND (or --gui = gtk): open a real graphical window for the
 # guest's GOP framebuffer instead of running headless. Over SSH this rides
@@ -181,8 +191,10 @@ while [[ $# -gt 0 ]]; do
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
         --sendkey)    SENDKEY_SEQ+=" $2"; shift 2 ;;
         --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
+        --holdkey)    HOLDKEY_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
+        --boot-target) BOOT_TARGET=true; shift ;;
         --shell)      SHELL_OVERRIDE="$2"; shift 2 ;;
         --background) BACKGROUND=true; shift ;;
         --serial-log) SERIAL_LOG="$2"; shift 2 ;;
@@ -298,6 +310,13 @@ Options:
                            usb-tablet is auto-added), optionally pressing+
                            releasing the left button (",click"). Injected
                            after --sendkey, before capture. Repeatable.
+  --holdkey "QCODE:MS"     With --screenshot: hold a USB key (QEMU qcode, e.g.
+                           "a") DOWN for MS milliseconds via QMP, then release.
+                           A held key past the firmware typematic delay makes
+                           UsbKbDxe synthesise auto-repeats — reproducing the
+                           KVM key "bounce". Auto-adds a USB keyboard (all
+                           arches). Pair with --serial-log to read the result.
+                           Repeatable.
   --qemu-arg STRING        Append STRING to the qemu command line as ONE
                            literal token (no word-splitting). Repeatable;
                            pass one --qemu-arg per token, e.g.
@@ -313,6 +332,10 @@ Options:
                            which builds those device args from a fixture
                            and passes them via --qemu-arg.)
   --nsh FILE               Use custom startup.nsh file
+  --boot-target            Stage the app AS \EFI\BOOT\BOOTx64.EFI so BdsDxe
+                           launches it directly — no parent shell, no
+                           startup.nsh. For a console-hosting app (axterm,
+                           SoftBMC); its child Shell is staged at \Shell.efi.
   --background             Launch QEMU in background, print PID
   --serial-log FILE        Save serial output to file (foreground:
                            ANSI-stripped clean transcript; background:
@@ -323,11 +346,15 @@ Options:
   --serial-socket PATH     (background mode) expose serial as a UNIX
                            socket so host scripts can inject input
                            (e.g. Ctrl-C via `printf '\x03' | socat ...`)
-  --no-cpu-warn            Disable CPU-spike warning. By default a
-                           sampler watches QEMU's host CPU and prints
-                           a WARN line if it sustains ≥1.5 cores for
-                           ≥2 s after the firmware-boot warm-up
-                           window (10 s X64 / 15 s AARCH64).
+  --no-cpu-warn            Disable the CPU-spike check. By default a sampler
+                           watches QEMU's host CPU and, if it sustains ≥1.5
+                           cores for ≥2 s after the firmware-boot warm-up
+                           window (10 s X64 / 15 s AARCH64), prints a WARN line
+                           AND fails the run with exit code 8 (distinct from a
+                           guest failure/timeout, which take precedence). The
+                           check runs in the default and --screenshot modes
+                           (not --interactive/--display/--background). This flag
+                           disables BOTH the warning and the fail-exit.
   --cpu-threshold CORES    Override spike threshold (default 1.5 cores).
   --cpu-sustain SECS       Override sustain duration (default 2 s).
   --cpu-report             Always print a `CPU-REPORT:` line with the mean
@@ -609,11 +636,23 @@ STAGING="$TMPDIR/staging"
 LOG="$TMPDIR/serial.log"
 
 mkdir -p "$STAGING/EFI/BOOT"
-if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
-    cp "$SHELL_EFI" "$STAGING/EFI/BOOT/$BOOT_NAME"
-fi
-if [[ -n "$EFI_FILE" ]]; then
-    cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+if [[ "$BOOT_TARGET" == "true" && -n "$EFI_FILE" ]]; then
+    # The app IS the boot loader: BdsDxe launches \EFI\BOOT\BOOTx64.EFI directly,
+    # so there is no parent shell and no startup.nsh runs. A console-hosting app
+    # that StartImages its own child Shell finds it via axl_shell_locate, so stage
+    # the shell at the volume root (\Shell.efi, search candidate 3.5) instead of
+    # the boot slot. (No staged file → the app falls back to the firmware FV shell.)
+    cp "$EFI_FILE" "$STAGING/EFI/BOOT/$BOOT_NAME"
+    if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
+        cp "$SHELL_EFI" "$STAGING/Shell.efi"
+    fi
+else
+    if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
+        cp "$SHELL_EFI" "$STAGING/EFI/BOOT/$BOOT_NAME"
+    fi
+    if [[ -n "$EFI_FILE" ]]; then
+        cp "$EFI_FILE" "$STAGING/$EFI_NAME"
+    fi
 fi
 
 # Auto-stage the vendor/device name sidecar so axl_pci_ids_load
@@ -739,8 +778,9 @@ else
             # Driver is in firmware — still rescan so fsN: appears.
             echo "map -r"
         fi
-        if [[ -z "$EFI_FILE" ]]; then
-            : # bare-shell mode: no app, no reset, just stay at prompt
+        if [[ -z "$EFI_FILE" || "$BOOT_TARGET" == "true" ]]; then
+            : # bare-shell mode, or --boot-target (BdsDxe launches the app as
+              # \EFI\BOOT\BOOTx64.EFI directly; this startup.nsh is never run).
         elif [[ "$IS_DRIVER" == "true" ]]; then
             echo "load $EFI_NAME"
         elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
@@ -871,6 +911,9 @@ cpu_sampler() {
 # (with --cpu-report) an always-on report of the sampled host-CPU usage.
 # Reads "<peak> <sustain_max> <mean>" from the file written by cpu_sampler
 # (1.0 = one host core saturated; measured after the boot warm-up window).
+# Returns CPU_SPIKE_EXIT when CPU_WARN is on and a sustained post-warm-up spike
+# was detected (so the caller can fail the run); 0 otherwise. --no-cpu-warn
+# (CPU_WARN=false) suppresses BOTH the WARN line and this non-zero return.
 cpu_summary() {
     local summary_file="$1"
     [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
@@ -894,8 +937,56 @@ cpu_summary() {
         if [[ "$breached" == "1" ]]; then
             printf "WARN: CPU spike — peak %s cores, sustained ≥%s cores for %ss (threshold %ss)\n" \
                 "$peak" "$CPU_THRESHOLD" "$sustain" "$CPU_SUSTAIN" >&2
+            return "$CPU_SPIKE_EXIT"
         fi
     fi
+    return 0
+}
+
+# --- CPU-monitor lifecycle (shared by the screenshot + default run branches) ---
+# Both branches launch/kill QEMU differently, so only the monitor lifecycle is
+# factored here (the launch code is deliberately left per-branch — it diverges too
+# much to share without obscuring it). cpu_monitor_start records the summary path +
+# sampler pid in globals; cpu_monitor_finish waits the sampler and summarizes,
+# returning the spike status.
+CPU_SUMMARY_FILE=""
+CPU_SAMPLER_PID=""
+
+# Resolve the QEMU child pid of a `( timeout ... qemu ) &` wrapper subshell.
+# Empty if not found within ~1s (caller decides any fallback).
+qemu_child_pid() {
+    local wrapper="$1" pid=""
+    local _
+    for _ in 1 2 3 4 5; do
+        pid=$(pgrep -P "$wrapper" 2>/dev/null | head -1)
+        [[ -n "$pid" ]] && break
+        sleep 0.2
+    done
+    printf '%s' "$pid"
+}
+
+# Start the background CPU sampler against a running QEMU pid. No-op (leaves the
+# globals empty) when both warn and report are off, or the pid is empty.
+cpu_monitor_start() {
+    local qpid="$1"
+    CPU_SUMMARY_FILE=""
+    CPU_SAMPLER_PID=""
+    [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
+    [[ -z "$qpid" ]] && return 0
+    CPU_SUMMARY_FILE="$TMPDIR/cpu-summary.txt"
+    cpu_sampler "$qpid" "$CPU_SUMMARY_FILE" &
+    CPU_SAMPLER_PID=$!
+}
+
+# Wait for the sampler (QEMU must already be dead/dying) and summarize. Returns
+# cpu_summary's status (CPU_SPIKE_EXIT on a breach, else 0). Safe when the monitor
+# never started. Callers must capture the status (`|| rc=$?`) under `set -e`.
+cpu_monitor_finish() {
+    if [[ -n "$CPU_SAMPLER_PID" ]]; then
+        wait "$CPU_SAMPLER_PID" 2>/dev/null || true
+    fi
+    [[ -z "$CPU_SUMMARY_FILE" ]] && return 0
+    cpu_summary "$CPU_SUMMARY_FILE"
 }
 
 # Build QEMU command
@@ -941,8 +1032,10 @@ fi
 
 # --sendkey needs a keyboard.  X64's q35 has a PS/2 controller already;
 # the AARCH64 `virt` machine ships none, so add a USB keyboard so monitor
-# `sendkey` events reach the guest.
-if [[ -n "$SENDKEY_SEQ" && "$ARCH" == "AARCH64" ]]; then
+# `sendkey` events reach the guest.  --holdkey needs a USB keyboard on EVERY
+# arch: the whole point is UsbKbDxe's typematic auto-repeat (a held key past the
+# repeat delay), which the PS/2 path does not model the same way.
+if [[ ( -n "$SENDKEY_SEQ" && "$ARCH" == "AARCH64" ) || -n "$HOLDKEY_SEQ" ]]; then
     CMD+=(-device "qemu-xhci,id=axl_kbd_xhci" -device "usb-kbd,bus=axl_kbd_xhci.0")
 fi
 
@@ -1323,19 +1416,27 @@ fi
 # Screenshot mode
 if [[ -n "$SCREENSHOT" ]]; then
     MONSOCK="$TMPDIR/monitor.sock"
-    # GPU device already wired above (--screenshot implies --gpu).
-    CMD+=(-serial "file:$LOG" -display none)
+    # GPU device already wired above (--screenshot implies --gpu). Serial goes to
+    # the internal log unless the caller asked for a persistent --serial-log (a
+    # serial-driven scenario like the kbtune bounce A/B reads it back).
+    CMD+=(-serial "file:${SERIAL_LOG:-$LOG}" -display none)
     CMD+=(-monitor "unix:$MONSOCK,server,nowait")
-    # HMP `sendkey` covers keys, but HMP has no absolute-pointer move; the
-    # QMP `input-send-event` does. Add a QMP socket only when injecting mouse.
+    # HMP `sendkey` covers key taps, but HMP has no absolute-pointer move and no
+    # key-hold; the QMP `input-send-event` does both. Add a QMP socket when
+    # injecting a mouse move or holding a key.
     QMPSOCK="$TMPDIR/qmp.sock"
-    if [[ -n "$SENDMOUSE_SEQ" ]]; then
+    if [[ -n "$SENDMOUSE_SEQ" || -n "$HOLDKEY_SEQ" ]]; then
         CMD+=(-qmp "unix:$QMPSOCK,server,nowait")
     fi
 
     set +e
     "${CMD[@]}" &
     QEMU_PID=$!
+    # Sample host CPU for the life of this QEMU (same monitor the default branch
+    # runs). A short SHOT_WAIT may kill QEMU before the warm-up clears -> no
+    # post-warm-up data, so no detection (fail-safe): give the guest enough
+    # SHOT_WAIT past the 10-15s warm-up to measure a spike.
+    cpu_monitor_start "$QEMU_PID"
 
     # Pre-screenshot settle.  Decoupled from TIMEOUT so a caller can keep a
     # safe kill-timeout but capture sooner: set SHOT_WAIT to the seconds the
@@ -1356,6 +1457,35 @@ if [[ -n "$SCREENSHOT" ]]; then
             sleep "$key_delay"
         done
         sleep 1.5   # let the app process + repaint before capture
+    fi
+
+    # --holdkey "qcode:ms": press a key DOWN, hold it for ms, then release — via
+    # QMP input-send-event (HMP `sendkey` can only tap). Holding a key past the
+    # firmware's typematic delay makes UsbKbDxe synthesise auto-repeats, which is
+    # exactly how a KVM's delayed key-up surfaces as a "bounce" at the shell — so
+    # this reproduces that bounce in QEMU. Each socat connection is a fresh QMP
+    # session, so capabilities must be re-negotiated on every call.
+    if [[ -n "$HOLDKEY_SEQ" ]]; then
+        for hk in $HOLDKEY_SEQ; do
+            IFS=':' read -r hk_code hk_ms <<<"$hk"
+            [[ -z "$hk_ms" ]] && hk_ms=500
+            # Validate before use: hk_ms is interpolated into awk, and a bad value
+            # would otherwise silently hold for 0 ms (a no-op tap).
+            if [[ -z "$hk_code" || ! "$hk_ms" =~ ^[0-9]+$ ]]; then
+                echo "[run-qemu] --holdkey: bad spec '$hk' (want QCODE:MS); skipping" >&2
+                continue
+            fi
+            {
+                printf '%s\n' '{"execute":"qmp_capabilities"}'
+                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":true,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}"
+            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+            sleep "$(awk "BEGIN{printf \"%.3f\", $hk_ms/1000}")"
+            {
+                printf '%s\n' '{"execute":"qmp_capabilities"}'
+                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":false,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}"
+            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+        done
+        sleep 1.5   # let the reader drain the synthesised repeats before capture
     fi
 
     # --sendmouse: inject absolute-pointer moves via QMP after any keys.
@@ -1392,6 +1522,13 @@ if [[ -n "$SCREENSHOT" ]]; then
     wait "$QEMU_PID" >/dev/null 2>&1
     set -e
 
+    # Summarize host CPU (WARN + optional CPU-REPORT). A sustained post-warm-up
+    # spike returns CPU_SPIKE_EXIT, surfaced as the run's exit below -- AFTER the
+    # PNG is written, and only when a capture/convert error (which outranks it)
+    # did not already fail the run.
+    cpu_spike_rc=0
+    cpu_monitor_finish || cpu_spike_rc=$?
+
     if [[ -f "$TMPDIR/screenshot.ppm" ]]; then
         # QEMU's `screendump` always writes PPM. Convert to the format
         # implied by the destination extension. PPM destinations skip
@@ -1413,7 +1550,8 @@ Image.open(sys.argv[1]).save(sys.argv[2])
 ' "$TMPDIR/screenshot.ppm" "$SCREENSHOT"
             echo "Screenshot saved: $SCREENSHOT"
         else
-            # Bail rather than silently mislabel a PPM as PNG.
+            # Bail rather than silently mislabel a PPM as PNG. A capture/convert
+            # error outranks a CPU spike.
             echo "ERROR: --screenshot $SCREENSHOT requires ImageMagick (convert) or Python Pillow for .${ext} output" >&2
             echo "       install one of:  dnf install ImageMagick   |   pip install pillow" >&2
             echo "       or use a .ppm destination to skip conversion" >&2
@@ -1421,8 +1559,13 @@ Image.open(sys.argv[1]).save(sys.argv[2])
             echo "Raw PPM saved instead: ${SCREENSHOT%.*}.ppm" >&2
             exit 1
         fi
+        # The PNG was written; now let a CPU spike fail the run (PNG kept).
+        exit "$cpu_spike_rc"
     else
+        # Capture failed: keep the historical soft exit (0). Nothing to mask -- the
+        # spike is not surfaced when there is no screenshot to accompany it.
         echo "WARNING: screenshot capture failed" >&2
+        exit 0
     fi
 
 # Background mode
@@ -1457,12 +1600,7 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     fi
     ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
     WRAPPER_PID=$!
-    QEMU_PID=""
-    for _ in 1 2 3 4 5; do
-        QEMU_PID=$(pgrep -P "$WRAPPER_PID" 2>/dev/null | head -1)
-        [[ -n "$QEMU_PID" ]] && break
-        sleep 0.2
-    done
+    QEMU_PID=$(qemu_child_pid "$WRAPPER_PID")
     if [[ -z "$QEMU_PID" ]]; then
         # Fall back to the wrapper PID. `kill $WRAPPER_PID` won't
         # propagate to a still-execing `timeout`+QEMU pair (they'd
@@ -1473,6 +1611,10 @@ elif [[ "$BACKGROUND" == "true" ]]; then
         # within tens of ms, so this branch is rare.
         QEMU_PID=$WRAPPER_PID
     fi
+    # No CPU monitor here: --background returns with QEMU still running (the caller
+    # owns its lifecycle), so there is no synchronous point to wait the sampler,
+    # summarize, or fail the run on a spike. A caller that wants CPU data in
+    # background mode should sample the emitted QEMU_PID itself.
 
     # Copy serial log path if requested
     if [[ -n "$SERIAL_LOG" ]]; then
@@ -1507,23 +1649,10 @@ else
     WRAPPER_PID=$!
     QPID=""
     if [[ "$CPU_WARN" == "true" || "$CPU_REPORT" == "true" ]]; then
-        for _ in 1 2 3 4 5; do
-            QPID=$(pgrep -P "$WRAPPER_PID" 2>/dev/null | head -1)
-            [[ -n "$QPID" ]] && break
-            sleep 0.2
-        done
+        QPID=$(qemu_child_pid "$WRAPPER_PID")
     fi
-    SUMMARY=""
-    SAMPLER_PID=""
-    if [[ -n "$QPID" ]]; then
-        SUMMARY="$TMPDIR/cpu-summary.txt"
-        cpu_sampler "$QPID" "$SUMMARY" &
-        SAMPLER_PID=$!
-    fi
+    cpu_monitor_start "$QPID"
     wait "$WRAPPER_PID" 2>/dev/null || true
-    if [[ -n "$SAMPLER_PID" ]]; then
-        wait "$SAMPLER_PID" 2>/dev/null || true
-    fi
 
     # Strip ANSI/DEC escape sequences and carriage returns. The param
     # byte class is the full CSI parameter range (ECMA-48 0x30-0x3F)
@@ -1577,7 +1706,11 @@ EOF
             grep -v "^Reset with"
     fi
 
-    # CPU-spike summary. Silent unless threshold breached. Runs after
-    # the serial output so the warning is the last thing the user sees.
-    [[ -n "$SUMMARY" ]] && cpu_summary "$SUMMARY"
+    # CPU-spike summary + optional CPU-REPORT. Runs after the serial output so a
+    # WARN is the last thing the user sees. A sustained post-warm-up spike exits
+    # CPU_SPIKE_EXIT -- but only here, AFTER the empty-log guest-failure check above
+    # (exit 1) has taken precedence.
+    cpu_spike_rc=0
+    cpu_monitor_finish || cpu_spike_rc=$?
+    exit "$cpu_spike_rc"
 fi

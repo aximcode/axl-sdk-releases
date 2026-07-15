@@ -657,7 +657,7 @@ test_stderr_tee(void)
 static void
 test_console_read_key(void)
 {
-    AxlKey k = { .scan_code = 0xCAFE, .unicode_char = 0xBEEF };
+    AxlKey k = { .scan_code = 0xCAFE, .unicode_char = 0xBEEF, .modifiers = 0xABCD };
 
     /* NULL out → -1 immediately. */
     test_check(axl_console_read_key(0, NULL) == AXL_ERR,
@@ -667,11 +667,13 @@ test_console_read_key(void)
        inject keystrokes, so the ConIn queue is empty here. */
     test_check(axl_console_read_key(0, &k) == AXL_ERR,
                "console read_key: non-blocking with empty queue returns -1");
-    /* Sentinels untouched on the -1 path (the impl writes them
-       only after the wait succeeds; verify it didn't clobber them
-       on the rejected path). */
-    test_check(k.scan_code == 0xCAFE && k.unicode_char == 0xBEEF,
-               "console read_key: out untouched on -1 (no console activity)");
+    /* Sentinels untouched on the -1 path (the impl writes scan/unicode/
+       modifiers only after the wait succeeds; verify it didn't clobber
+       them on the rejected path — incl. the modifiers field added when the
+       read moved to the Ex backend). */
+    test_check(k.scan_code == 0xCAFE && k.unicode_char == 0xBEEF
+               && k.modifiers == 0xABCD,
+               "console read_key: out (incl. modifiers) untouched on -1");
 
     /* Bounded timeout: 50 ms with no key arriving must return -1.
        The runner has no key injection, so this hits the timer

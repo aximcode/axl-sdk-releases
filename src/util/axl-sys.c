@@ -97,7 +97,18 @@ axl_map_refresh(void)
        (restoring the same value) and best-effort if the restore can't be
        represented (path stays as map -r left it, never corrupted). */
     char *saved_path = axl_getenv("path");
-    int rc = axl_backend_shell_execute((const unsigned short *)L"map -r");
+    /* `map -r` reloads the map (the side effect we want) AND dumps the full
+       device-mapping table (noise — a caller like mkrd already prints its own
+       summary). On the modern shell EFI_SHELL_PROTOCOL.Execute runs a nested,
+       off-console shell so the table never showed; on the old EFI 1.x shell
+       SHELL_ENVIRONMENT.Execute runs in-context and the table WAS visible.
+       Swallow the output at ConOut rather than with a `> nul` redirect: on the
+       old shell a redirect pushes `map -r` into a sub-context, so its
+       INTERACTIVE device-path-alias generation no longer reaches the parent and
+       a later `map <label> fsN:` silently fails to resolve. The quiet variant
+       runs the command verbatim and in-context, so the reload and its aliases
+       are intact and only the listing is dropped — uniform on both shells. */
+    int rc = axl_backend_shell_execute_quiet((const unsigned short *)L"map -r");
     if (saved_path != NULL) {
         axl_setenv("path", saved_path, true);
         axl_free(saved_path);

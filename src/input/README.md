@@ -29,6 +29,13 @@ the loop already exposes for any other UEFI event source:
   `axl_loop_add_event` around the protocol's `WaitForInput` event.
   The dispatch trampoline calls `GetState`, translates the result
   into one or more `AxlInputEvent` values, and invokes the callback.
+  `axl_input_attach_mouse_ifaces` is the mouse variant for a consumer
+  that has taken the pointer *out* of the handle database (e.g.
+  `axl_console_device` with `take_pointer=true`, which hides the
+  `EFI_SIMPLE_POINTER_PROTOCOL` from guest apps): it binds
+  caller-supplied interfaces directly rather than locating them, since
+  they are no longer discoverable — see that module's
+  `axl_console_device_pointer_iface`.
 - `axl_input_attach_key` wraps `axl_loop_add_key_press` (which
   internally registers `EFI_SIMPLE_TEXT_INPUT_PROTOCOL`'s
   `WaitForKey`) and translates each `AxlInputKey` into an
@@ -178,6 +185,15 @@ its own stream (or a unit test) can run the same logic directly.
   Held-key *repeat itself* comes from firmware typematic (UEFI delivers
   no key-up, so software can't synthesize it) — the debounce only
   suppresses the spurious extras.
+
+- **Min-gap delivery gate** (`AxlKeyGate`, `axl_input_key_gate_ready_at` /
+  `_mark`) is the sibling knob: where debounce *drops* a too-fast same-key
+  repeat, the gate *spaces out* all keys, holding the next key until at
+  least `min_gap_ms` has elapsed and then releasing it — so a burst is
+  metered to one key per gap however greedily the consumer reads, and no
+  key is lost. Pure timing: the caller owns the held-key buffer and the
+  one-shot release timer. Used by the `kbtune` resident console shim and
+  by `axterm` (AGT) so both meter identically.
 
 ## Modifier state on pointer events
 

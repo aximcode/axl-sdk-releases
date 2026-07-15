@@ -25,7 +25,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
-EFI="$PROJECT_DIR/out/native-x64/axbench.efi"
+EFI="$PROJECT_DIR/out/native-x64/tools/axbench.efi"
 
 export TEST_SKIP_RATCHET=1
 

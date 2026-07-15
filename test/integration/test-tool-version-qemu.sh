@@ -41,9 +41,10 @@ VERSION="$(cat "$PROJECT_DIR/VERSION")"
 make -C "$PROJECT_DIR" ARCH="$NATIVE" tools >/dev/null 2>&1 || true
 [[ -d "$TOOLS" ]] || { echo "ERROR: $TOOLS not built"; exit 1; }
 
-# Tools that intentionally do NOT carry the version stamp (dev/bench only,
-# they don't route through AXL_TOOL_MAIN). Everything else must.
-EXCLUDE="axbench crashtest"
+# Tools that intentionally do NOT carry the version stamp (dev/bench only, or
+# resident DRIVERS staged in tools/ that are loaded not run — no AXL_TOOL_MAIN
+# and no --version arg path). Everything else must carry the stamp.
+EXCLUDE="axbench crashtest kbtune-drv"
 
 # Collect the staged tool basenames (stem, no .efi).
 mapfile -t ALL < <(cd "$TOOLS" && ls *.efi 2>/dev/null | sed 's/\.efi$//' | sort)
@@ -100,7 +101,7 @@ echo "=== version string in use: $VERSION ==="
 missing=()
 for t in "${VERSIONED[@]}"; do
     # The tool's --version line must read exactly "<stem> <VERSION>".
-    if ! grep -aqE "^${t} ${VERSION}([[:space:]]|\$|\r)" "$LOG"; then
+    if ! grep -aqE "^${t} ${VERSION}([[:space:]]|$)" "$LOG"; then
         missing+=("$t")
     fi
 done
@@ -111,7 +112,7 @@ else
 fi
 
 # --- 2. Short flag -V works (mkrd) ---
-sect MARK_SHORTV MARK_HELP | grep -aqE "^mkrd ${VERSION}([[:space:]]|\$|\r)" \
+sect MARK_SHORTV MARK_HELP | grep -aqE "^mkrd ${VERSION}([[:space:]]|$)" \
     && ok "-V prints the version (mkrd $VERSION)" || no "-V did not print the version"
 
 # --- 3. Help output carries the version (framework tools) ---

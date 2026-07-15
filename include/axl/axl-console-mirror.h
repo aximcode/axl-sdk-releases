@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-console-screen.h>   /* AxlConsoleScreenSink, composed for snapshot() */
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,29 @@ typedef struct {
     uint32_t         cols;              ///< remote terminal width  (e.g. 80)
     uint32_t         rows;              ///< remote terminal height (e.g. 25)
     bool             passthrough_local; ///< also write to the physical console
+    bool             auto_alt_screen;   ///< best-effort bracket of the terminal alt-screen
+                                        ///< (see @ref axl_console_mirror_enter_alt_screen):
+                                        ///< ENTER on a backward cursor jump after a
+                                        ///< `ClearScreen` (a TUI repainting), LEAVE on a
+                                        ///< newline (linear flow). Safe to mirror a shell
+                                        ///< from boot. For a consumer hosting an opaque
+                                        ///< nested full-screen app; a consumer that owns
+                                        ///< its own TUI leaves this false and drives
+                                        ///< the explicit enter/leave API instead.
+    bool             input_capture;     ///< capture input exclusively: the wrapped
+                                        ///< ConIn/ConInEx serve ONLY the inject ring
+                                        ///< and never read the physical key queue.
+                                        ///< Default false = the physical keyboard
+                                        ///< passes through (today's behavior — a
+                                        ///< zeroed config is safe). Set true when
+                                        ///< another owner drains the firmware key
+                                        ///< queue and injects (AGT / axterm), so the
+                                        ///< nested shell can't steal/double its keys.
+                                        ///< (This is the opt-in inverse of the
+                                        ///< handoff's proposed `input_passthrough`:
+                                        ///< `input_capture = true` == that ask's
+                                        ///< `input_passthrough = false`, but
+                                        ///< zero-init keeps existing consumers safe.)
 } AxlConsoleMirrorConfig;
 
 /**
@@ -187,12 +211,93 @@ axl_console_mirror_set_size(
 );
 
 /**
+ * @brief Serialize the mirror's current screen as a self-contained VT repaint.
+ *
+ * The late-join counterpart to the live stream: when a new client connects
+ * mid-session it has missed everything already on screen. Rather than replay a
+ * raw byte tail (which cannot recover screen contents, the cursor, or the
+ * alternate-screen selection), call this to emit — through @p sink — one burst of
+ * VT bytes that, applied to a **blank terminal of the mirror's current size**,
+ * reproduces exactly what the console shows right now: the visible glyphs and
+ * colours, the cursor position and visibility, and the primary/alternate-screen
+ * state. Point @p sink at the new client, then join it to the live stream.
+ *
+ * The mirror keeps an internal @ref AxlConsoleScreen fed from the same VT stream
+ * it emits, so the repaint stays authoritative automatically — it tracks the
+ * geometry the mirror reports (@ref axl_console_mirror_set_size) and the
+ * alternate-screen transitions the mirror drives, with no consumer-side parallel
+ * parser to keep in sync. The output is coalesced (blank cells and rows emit
+ * nothing, so a mostly-empty 80x25 is a handful of bytes) and the model is left
+ * unchanged, so this may be called once per connecting client.
+ *
+ * Like the live stream, the snapshot reflects only what the mirror has observed
+ * since it was installed — it cannot reconstruct console content written before
+ * the tap was in place. See @ref axl_console_screen_snapshot for the underlying
+ * repaint format.
+ *
+ * @param m    mirror handle.
+ * @param sink receives the serialized VT bytes in one or more chunks; the
+ *     concatenation is the whole repaint. Structurally identical to
+ *     @ref AxlConsoleSinkFn, so one sink function serves both APIs.
+ * @param user opaque context passed back to @p sink.
+ * @return AXL_OK once the repaint has been handed to @p sink; AXL_ERR on a NULL
+ *     @p m / @p sink, in which case nothing is written to @p sink.
+ */
+int
+axl_console_mirror_snapshot(
+    AxlConsoleMirror     *m,     ///< mirror handle
+    AxlConsoleScreenSink  sink,  ///< receives the serialized repaint
+    void                 *user   ///< opaque context for the sink
+);
+
+/**
+ * @brief Enter the remote terminal's alternate screen (emits `ESC[?1049h`).
+ *
+ * The alt-screen is the off-scrollback buffer a full-screen app (a nested
+ * `edit`, a TUI) should paint into, so its full-screen clears and cursor
+ * addressing never dump into the terminal's scrollback history. Emits the
+ * DECSET 1049 enter sequence to the sink once; idempotent (a second call while
+ * already in the alt-screen emits nothing) and NULL-safe.
+ *
+ * Drive this explicitly when the consumer knows it is entering a full-screen
+ * mode, or set @ref AxlConsoleMirrorConfig::auto_alt_screen to infer it (enter on
+ * a backward cursor jump after a `ClearScreen`, leave on a newline).
+ */
+void
+axl_console_mirror_enter_alt_screen(
+    AxlConsoleMirror *m  ///< mirror handle (NULL-safe)
+);
+
+/**
+ * @brief Leave the remote terminal's alternate screen (emits `ESC[?1049l`).
+ *
+ * Restores the terminal's normal screen + scrollback. Emits the DECRST 1049
+ * leave sequence to the sink once; idempotent (a call while not in the
+ * alt-screen emits nothing) and NULL-safe.
+ */
+void
+axl_console_mirror_leave_alt_screen(
+    AxlConsoleMirror *m  ///< mirror handle (NULL-safe)
+);
+
+/**
+ * @brief Whether the mirror is currently in the alternate screen.
+ *
+ * @return true if inside the alt-screen (an enter has been emitted without a
+ *     matching leave); false otherwise, or when @p m is NULL.
+ */
+bool
+axl_console_mirror_in_alt_screen(
+    const AxlConsoleMirror *m  ///< mirror handle (NULL-safe)
+);
+
+/**
  * @brief Reset per-session mirror state. NULL-safe.
  *
- * Drains the key ring and clears cursor / escape-decoder tracking. Use
- * between Shell restarts or when a new client attaches so stale state
- * from the previous session doesn't bleed through. (Alt-screen
- * enter/leave arrives with the full-screen P2 work.)
+ * Drains the key ring, clears cursor / escape-decoder tracking, and leaves the
+ * alternate screen if in it (emits `ESC[?1049l`), so stale state from the
+ * previous session doesn't bleed through. Use between Shell restarts or when a
+ * new client attaches.
  */
 void
 axl_console_mirror_reset(

@@ -35,18 +35,23 @@ EFI_HANDLE            gImageHandle = NULL;
 // Shell protocol (cached on first file operation)
 // ===================================================================
 
-static EFI_SHELL_PROTOCOL  *mShell = NULL;
-static bool                 mShellLocated = false;
-
 static EFI_SHELL_PROTOCOL *
 get_shell(void)
 {
-    if (!mShellLocated) {
-        mShellLocated = true;
-        EFI_GUID guid = gEfiShellProtocolGuid;
-        gBS->LocateProtocol(&guid, NULL, (VOID **)&mShell);
+    /* Re-locate on EVERY call rather than caching the interface pointer.  A cached
+       EFI_SHELL_PROTOCOL dangles the moment Shell.efi unloads -- e.g. the user types
+       `exit` while a RESIDENT driver's loop is still running (fbcon).  The loop polls
+       the shell's Ctrl-C break every dispatch (axl_backend_shell_break_flag ->
+       shell->ExecutionBreak), so a stale cached pointer means the next poll derefs a
+       freed, poison-filled protocol and #GPs in CoreCheckEvent.  The shell uninstalls
+       its protocol on exit, so LocateProtocol then returns an error and callers safely
+       see NULL.  LocateProtocol is a cheap handle-DB lookup -- fine on the poll path. */
+    EFI_SHELL_PROTOCOL *shell = NULL;
+    EFI_GUID            guid  = gEfiShellProtocolGuid;
+    if (EFI_ERROR(gBS->LocateProtocol(&guid, NULL, (VOID **)&shell))) {
+        return NULL;
     }
-    return mShell;
+    return shell;
 }
 
 // ===================================================================
@@ -1723,6 +1728,46 @@ axl_backend_shell_execute(
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
     return AXL_ERR;
+}
+
+/* No-op stand-in for ConOut->OutputString, installed while a "quiet" shell
+   command runs so the command's text is dropped without a `> nul` redirect. */
+static EFI_STATUS EFIAPI
+swallow_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String)
+{
+    (void)This;
+    (void)String;
+    return EFI_SUCCESS;
+}
+
+int
+axl_backend_shell_execute_quiet(
+    const unsigned short  *command
+    )
+{
+    if (command == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Swallow console text by swapping only the OutputString slot of the live
+       ConOut (single-threaded UEFI, so no concurrency hazard) — Mode, cursor,
+       and attributes stay valid for a command that reads them. Callers invoke
+       ConOut->OutputString(ConOut, ...) through the pointer each time, never a
+       cached copy, so the swap takes effect and the restore is clean. The
+       command runs unaltered and in-context, unlike a `> nul` redirect. */
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *conout = axl_st()->ConOut;
+    EFI_TEXT_STRING saved = NULL;
+    if (conout != NULL) {
+        saved = conout->OutputString;
+        conout->OutputString = swallow_output_string;
+    }
+
+    int rc = axl_backend_shell_execute(command);
+
+    if (conout != NULL) {
+        conout->OutputString = saved;
+    }
+    return rc;
 }
 
 // ===================================================================

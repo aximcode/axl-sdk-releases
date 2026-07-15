@@ -66,18 +66,19 @@ axl_console_read_key(
         return AXL_ERR;
     }
 
-    if (timeout_ms == 0) {
-        /* Non-blocking: poll the event without waiting. */
-        if (axl_backend_event_check(key_evt) != 0) {
-            return AXL_ERR;
-        }
-    } else if (timeout_ms == UINT64_MAX) {
+    /* Only BLOCK when a timeout is requested. The non-blocking (0) case does
+       NOT poll the wait event — OVMF's ConSplitter does not report a queued key
+       through gBS->CheckEvent on WaitForKeyEx (it signals only via
+       WaitForEvent), so a CheckEvent gate silently drops real keys. The backend
+       read below is itself non-blocking (returns AXL_ERR on an empty queue), so
+       for timeout 0 we just read the queue directly — the authoritative check. */
+    if (timeout_ms == UINT64_MAX) {
         /* Block forever on the key event alone. */
         size_t fired = 0;
         if (axl_backend_event_wait(1, &key_evt, &fired) != AXL_OK) {
             return AXL_ERR;
         }
-    } else {
+    } else if (timeout_ms != 0) {
         /* Bounded wait: union of {key event, timer}. The timer event
            is closed unconditionally on return so a slow key path
            doesn't leak it. */
@@ -91,23 +92,35 @@ axl_console_read_key(
         size_t fired = 0;
         int rc = axl_backend_event_wait(2, events, &fired);
         axl_backend_event_close(timer);
-        if (rc != AXL_OK) {
-            return AXL_ERR;
-        }
-        if (fired == 1) {
-            /* Timer beat the key — timeout. */
-            return AXL_ERR;
+        if (rc != AXL_OK || fired == 1) {
+            return AXL_ERR;   /* wait failed, or the timer beat the key */
         }
     }
 
-    /* Key is available. Read it via the backend (non-blocking;
-       returns -1 only if the firmware lost it between event-fire
-       and read, which shouldn't happen but mirrors the backend
-       contract). */
-    out->scan_code    = 0;
-    out->unicode_char = 0;
-    return axl_backend_console_read_key(&out->scan_code,
-                                        &out->unicode_char);
+    /* Read via the Ex backend (Ex protocol when the console publishes it →
+       modifiers carry shift/lock state; transparent plain fallback with
+       modifiers 0 otherwise). The read is non-blocking and authoritative:
+       AXL_ERR means the queue is empty (or the firmware lost a signalled key).
+       A modifier-only "partial" keystroke (scan/char both 0 — delivered only
+       when another layer enabled EFI_KEY_STATE_EXPOSED) is not a real keystroke,
+       so drain past it. Write *out ONLY on success, so the timeout / empty-queue
+       path leaves it untouched (the -1 contract). */
+    uint16_t scan = 0;
+    uint16_t uni  = 0;
+    uint32_t mods = 0;
+    int rc = axl_backend_console_read_key_ex(&scan, &uni, &mods);
+    while (rc == AXL_OK && scan == 0 && uni == 0) {
+        scan = 0;
+        uni  = 0;
+        mods = 0;
+        rc = axl_backend_console_read_key_ex(&scan, &uni, &mods);
+    }
+    if (rc == AXL_OK) {
+        out->scan_code    = scan;
+        out->unicode_char = uni;
+        out->modifiers    = mods;
+    }
+    return rc;
 }
 
 void

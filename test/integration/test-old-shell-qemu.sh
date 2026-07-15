@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-meta: arch=X64 needs= est=95 local-only=1
+# test-meta: arch=x64 needs= est=95 local-only=1
 # test-old-shell — pins the SDK's old EFI 1.x shell support (no
 # EDK2 EFI_SHELL_PROTOCOL) against the real EFI Toolkit "newshell"
 # (Shell106.efi), which QEMU's bundled OVMF shell can't reproduce.
@@ -212,6 +212,18 @@ if echo "$MKRD_LOG" | grep -qiE "no 'map -r' needed"; then
     test_host_pass "mkrd reports the auto-mapped fsN ('no map -r needed')"
 else
     test_host_fail "mkrd reports the auto-mapped fsN ('no map -r needed')"
+fi
+# The internal `map -r` (axl_map_refresh, driven through SHELL_ENVIRONMENT.Execute
+# during create) must NOT dump the shell's "Device mapping table" to the console:
+# mkrd already prints its own detailed summary, so the table is redundant noise.
+# This nsh runs NO explicit `map`, so any "Device mapping table" in the log is
+# the refresh leaking — which it did before axl_map_refresh redirected `map -r`
+# to nul. (On the modern shell EFI_SHELL_PROTOCOL.Execute is already silent; this
+# old-shell path via SHELL_ENVIRONMENT.Execute was the visible one.)
+if echo "$MKRD_LOG" | grep -qiF 'Device mapping table'; then
+    test_host_fail "internal map -r stays silent (no redundant 'Device mapping table')"
+else
+    test_host_pass "internal map -r stays silent (no redundant 'Device mapping table')"
 fi
 # mkrd -l reverse-looks-up the fsN via SHELL_ENVIRONMENT.GetMap (the disk is in
 # the shell's map from the auto `map -r`): lowercase 'fs1:' (the old shell's own

@@ -73,3 +73,38 @@ axl_input_key_accept(
 
     return !drop;
 }
+
+// ---------------------------------------------------------------------------
+// Min-gap delivery gate (see axl-input.h). Where the debounce filter DROPS a
+// too-fast same-key repeat, the gate SPACES OUT all keys: after one is
+// delivered, the next is held until min_gap has elapsed. Pure — the caller
+// owns the held-key buffer and the release timer.
+// ---------------------------------------------------------------------------
+
+uint64_t
+axl_input_key_gate_ready_at(
+    const AxlKeyGate  *g,
+    uint32_t           min_gap_ms
+    )
+{
+    // The first key of a stream is never held, a disabled gate never holds,
+    // and a NULL gate never eats input: all report "ready now" (0), which is
+    // <= any now_us the caller compares against.
+    if (g == NULL || !g->primed || min_gap_ms == 0) {
+        return 0;
+    }
+    return g->last_delivered_us + (uint64_t)min_gap_ms * 1000u;
+}
+
+void
+axl_input_key_gate_mark(
+    AxlKeyGate  *g,
+    uint64_t     now_us
+    )
+{
+    if (g == NULL) {
+        return;
+    }
+    g->last_delivered_us = now_us;
+    g->primed            = true;
+}

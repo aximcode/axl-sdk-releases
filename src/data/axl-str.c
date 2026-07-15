@@ -241,7 +241,7 @@ axl_hex_parse_u64(
 }
 
 // ---------------------------------------------------------------------------
-// axl_snprintf — format into fixed buffer via axl_vformat
+// axl_vsnprintf / axl_snprintf — format into fixed buffer via axl_vformat
 // ---------------------------------------------------------------------------
 
 static void
@@ -257,9 +257,8 @@ snprintf_writer(const char *data, size_t len, void *arg)
 }
 
 int
-axl_snprintf(char *buf, size_t size, const char *fmt, ...)
+axl_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 {
-    va_list args;
     SnprintfCtx ctx;
 
     if (buf == NULL || size == 0) {
@@ -270,9 +269,7 @@ axl_snprintf(char *buf, size_t size, const char *fmt, ...)
     ctx.size = size;
     ctx.written = 0;
 
-    va_start(args, fmt);
     axl_vformat(snprintf_writer, &ctx, fmt, args);
-    va_end(args);
 
     if (ctx.written < size) {
         buf[ctx.written] = '\0';
@@ -281,6 +278,19 @@ axl_snprintf(char *buf, size_t size, const char *fmt, ...)
     }
 
     return (int)ctx.written;
+}
+
+int
+axl_snprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list args;
+    int     n;
+
+    va_start(args, fmt);
+    n = axl_vsnprintf(buf, size, fmt, args);
+    va_end(args);
+
+    return n;
 }
 
 // ---------------------------------------------------------------------------

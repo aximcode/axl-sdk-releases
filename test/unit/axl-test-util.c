@@ -12,6 +12,7 @@
 #include <axl/axl-driver.h>   /* axl_protocol_install / _uninstall */
 #include <axl/axl-shell.h>    /* axl_shell_launch */
 #include <axl/axl-image.h>   /* axl_image_run */
+#include <axl/axl-console-device.h>
 #include <axl/axl-console-mirror.h>
 #include <axl/axl-tar.h>
 #include <axl/axl-stream.h>
@@ -4668,11 +4669,137 @@ cm_noop_sink(const char *bytes, size_t len, void *user)
     (void)user;
 }
 
-/* Test seam in src/util/axl-console-mirror.c (no public header): drive the
-   real inject_text decoder against a bare, un-installed mirror. */
+/* Test seams (no public header). The console SURGERY lives in the tap, so its
+   seams are tap-side; the mirror's seam only binds its VT encoder over a headless
+   tap. Nothing here installs on the live console (a real install wedges the
+   combined unit boot — see the AxlConsoleMirror note above). */
+extern AxlConsoleTap *_axl_console_tap_new_for_test(void);
+extern void _axl_console_tap_test_setup(AxlConsoleTap *t, const AxlConsoleOps *ops,
+                                        void *user, uint32_t cols, uint32_t rows,
+                                        bool auto_alt, bool input_capture);
+extern void _axl_console_tap_test_conout_begin(AxlConsoleTap *t, bool passthrough);
+extern void _axl_console_tap_test_teardown(void);
+extern bool _axl_console_tap_test_pop_key(AxlConsoleTap *t, uint16_t *scan,
+                                          uint16_t *unicode);
+/* The wrapped ConInEx, with its function pointers wired but nothing installed
+   on gST/ConsoleInHandle — lets a test drive Register/UnregisterKeyNotify. */
+extern EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
+_axl_console_tap_test_coninex(AxlConsoleTap *t);
+extern void _axl_console_tap_test_clear(void);
+extern void _axl_console_tap_test_puts(const char *ascii);
+extern void _axl_console_tap_test_set_cursor(uint32_t col, uint32_t row);
+extern void _axl_console_tap_test_set_attr(uint32_t attr);
+extern void _axl_console_tap_test_enable_cursor(bool visible);
+extern void _axl_console_tap_test_set_stub_conin(AxlConsoleTap *t, bool always_key);
+extern int  _axl_console_tap_test_read_key(AxlConsoleTap *t);
+extern void _axl_console_tap_test_pump(AxlConsoleTap *t);
+extern bool _axl_console_tap_test_mode_owned(AxlConsoleTap *t);
+extern void _axl_console_tap_test_get_cursor(AxlConsoleTap *t, int32_t *col, int32_t *row);
+extern int32_t _axl_console_tap_test_get_attr(AxlConsoleTap *t);
+extern bool _axl_console_tap_test_get_cursor_visible(AxlConsoleTap *t);
+extern void _axl_console_tap_test_orig_cursor(int32_t *col, int32_t *row);
+
 extern AxlConsoleMirror *_axl_console_mirror_new_for_test(void);
-extern bool _axl_console_mirror_test_pop_key(AxlConsoleMirror *m,
-                                             uint16_t *scan, uint16_t *unicode);
+extern void _axl_console_mirror_test_bind(AxlConsoleMirror *m, AxlConsoleSinkFn sink,
+                                          void *user, AxlConsoleTap *tap,
+                                          const AxlConsoleOps **ops, void **ops_user);
+extern AxlConsoleScreen *_axl_console_mirror_test_screen(AxlConsoleMirror *m);
+extern void _axl_console_mirror_test_free(AxlConsoleMirror *m);
+
+/* axl-console-screen seams (no public header): read the model the mirror's
+   snapshot serializes. */
+extern bool _axl_console_screen_test_cell(const AxlConsoleScreen *s,
+        uint32_t row, uint32_t col, char *utf8_out, AxlConsolePen *pen_out);
+extern void _axl_console_screen_test_cursor(const AxlConsoleScreen *s,
+        uint32_t *row, uint32_t *col, bool *visible);
+extern bool _axl_console_screen_test_alt(const AxlConsoleScreen *s);
+extern void _axl_console_screen_test_geometry(const AxlConsoleScreen *s,
+        uint32_t *rows, uint32_t *cols);
+
+/* axl-console-device input-relay seams (no public header): drive the REAL
+   ConIn/ConInEx read + notify path against a bare, un-installed device. */
+extern AxlConsoleDevice *_axl_console_device_new_for_test(void);
+extern void _axl_console_device_test_begin(AxlConsoleDevice *d, bool take_input);
+extern EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *_axl_console_device_test_coninex(AxlConsoleDevice *d);
+extern bool _axl_console_device_test_feed_physical(AxlConsoleDevice *d,
+        bool (*filter)(void *, const void *), void *fuser,
+        uint16_t scan, uint16_t uni, uint32_t shift);
+extern EFI_SIMPLE_TEXT_INPUT_PROTOCOL *_axl_console_device_test_conin(AxlConsoleDevice *d);
+extern void _axl_console_device_test_end(AxlConsoleDevice *d);
+/* Pointer take-over seams: run the REAL per-handle evict (HandleProtocol -> cache ->
+   UninstallProtocolInterface) on a caller-supplied handle, and the REAL restore
+   (reinstall every cached interface), against a synthetic SimplePointer -- so the
+   database surgery is exercised without evicting the harness's live pointer. The
+   full LocateHandleBuffer-driven path is firmware-smoke-validated. */
+extern bool _axl_console_device_test_evict_one_pointer(AxlConsoleDevice *d, void *handle);
+extern void _axl_console_device_test_restore_pointer(AxlConsoleDevice *d);
+extern void _axl_console_device_test_install_proxy(AxlConsoleDevice *d);
+extern void _axl_console_device_test_uninstall_proxy(AxlConsoleDevice *d);
+extern int  _axl_console_device_test_proxy_forward(AxlConsoleDevice *d, void *state_out);
+extern bool _axl_console_device_test_add_evicted_conin(AxlConsoleDevice *d, void *handle);
+extern void _axl_console_device_test_read_tick(AxlConsoleDevice *d);
+
+/* axl-console-term seams (no public header): read the cell model + cursor. */
+extern bool _axl_console_term_test_cell(AxlConsoleTerm *t, uint32_t row, uint32_t col,
+                                        char *utf8_out, uint8_t *fg, uint8_t *bg);
+extern void _axl_console_term_test_cursor(AxlConsoleTerm *t, uint32_t *row, uint32_t *col);
+extern uint32_t _axl_console_term_test_scroll_off(AxlConsoleTerm *t);
+extern bool _axl_console_term_test_hist_cell(AxlConsoleTerm *t, uint32_t rows_back,
+                                             uint32_t col, char *utf8_out);
+extern void _axl_console_term_test_geometry(AxlConsoleTerm *t,
+        uint32_t *cols, uint32_t *rows, uint32_t *cw, uint32_t *ch,
+        uint32_t *bx, uint32_t *by, uint32_t *bw, uint32_t *bh);
+extern AxlGfxPixel _axl_console_term_test_palette(AxlConsoleTerm *t, uint32_t idx);
+extern void _axl_console_term_test_pointer(AxlConsoleTerm *t, int32_t *x, int32_t *y,
+                                           bool *visible);
+
+/* Capture sink: records the exact VT bytes the encoder emits. */
+static char   cm_cap[512];
+static size_t cm_cap_len;
+
+static void
+cm_cap_sink(const char *bytes, size_t len, void *user)
+{
+    (void)user;
+    for (size_t i = 0; i < len && cm_cap_len < sizeof(cm_cap) - 1; i++) {
+        cm_cap[cm_cap_len++] = bytes[i];
+    }
+    cm_cap[cm_cap_len] = '\0';
+}
+
+static void
+cm_cap_reset(void)
+{
+    cm_cap_len = 0;
+    cm_cap[0]  = '\0';
+}
+
+/* Build a headless tap with the mirror's VT encoder bound as its op consumer, so
+   driving the tap's wraps produces assertable bytes in cm_cap. */
+static AxlConsoleMirror *cm_enc;
+
+static AxlConsoleTap *
+cm_tap_begin(uint32_t cols, uint32_t rows, bool auto_alt, bool input_capture,
+             bool passthrough)
+{
+    AxlConsoleTap       *t        = _axl_console_tap_new_for_test();
+    const AxlConsoleOps *ops      = NULL;
+    void                *ops_user = NULL;
+    cm_enc = _axl_console_mirror_new_for_test();
+    _axl_console_mirror_test_bind(cm_enc, cm_cap_sink, NULL, t, &ops, &ops_user);
+    _axl_console_tap_test_setup(t, ops, ops_user, cols, rows, auto_alt, input_capture);
+    _axl_console_tap_test_conout_begin(t, passthrough);
+    return t;
+}
+
+static void
+cm_tap_end(AxlConsoleTap *t)
+{
+    _axl_console_tap_test_teardown();
+    axl_free(t);
+    _axl_console_mirror_test_free(cm_enc);
+    cm_enc = NULL;
+}
 
 static void
 test_console_mirror(void)
@@ -4703,40 +4830,1673 @@ test_console_mirror(void)
                "console_mirror: inject_key(NULL) returns -1");
     test_check(axl_console_mirror_inject_text(NULL, "x", 1) == AXL_ERR,
                "console_mirror: inject_text(NULL m) returns -1");
+    test_check(!axl_console_mirror_in_alt_screen(NULL), "console_mirror: in_alt(NULL) false");
+    axl_console_mirror_enter_alt_screen(NULL);   /* NULL-safe, no crash */
+    axl_console_mirror_leave_alt_screen(NULL);
 
-    /* inject_text byte->key decode (the TerminalDxe-style decoder). Driven on
-       a bare, un-installed mirror via the test seam, so it never wraps the live
-       console (a full install wedges the combined unit boot — see the
-       AxlConsoleMirror note above). Regression for the terminal-Backspace bug:
-       xterm.js sends 0x7f (DEL) for the Backspace key, but UEFI backspace is
-       UnicodeChar 0x08 — so 0x7f must remap to 0x08 (the Delete *key* arrives
-       as the CSI 3~ escape and is decoded separately; not exercised here). */
-    AxlConsoleMirror *tm = _axl_console_mirror_new_for_test();
-    test_check(tm != NULL, "inject_text: bare test mirror constructed");
-    if (tm != NULL) {
+    /* inject_text byte->key decode (the TerminalDxe-style decoder) now lives in
+       the tap. Driven on a bare, un-installed tap so it never wraps the live
+       console. Regression for the terminal-Backspace bug: xterm.js sends 0x7f
+       (DEL) for the Backspace key, but UEFI backspace is UnicodeChar 0x08 — so
+       0x7f must remap to 0x08 (the Delete *key* arrives as the CSI 3~ escape and
+       is decoded separately; not exercised here). */
+    AxlConsoleTap *tt = _axl_console_tap_new_for_test();
+    test_check(tt != NULL, "inject_text: bare test tap constructed");
+    test_check(axl_console_tap_inject_text(NULL, "x", 1) == AXL_ERR,
+               "console_tap: inject_text(NULL t) returns -1");
+    test_check(axl_console_tap_inject_key(NULL, 0, 'x') == AXL_ERR,
+               "console_tap: inject_key(NULL t) returns -1");
+    if (tt != NULL) {
         uint16_t scan = 0xFFFF, uni = 0xFFFF;
 
         /* A plain ASCII byte injects as that unicode char (frames the remap). */
-        axl_console_mirror_inject_text(tm, "a", 1);
-        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+        axl_console_tap_inject_text(tt, "a", 1);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
                    && scan == 0 && uni == 'a',
                    "inject_text: 'a' -> {ScanCode=0, UnicodeChar='a'}");
 
         /* 0x08 (ASCII BS) already IS UEFI backspace — passes through. */
-        axl_console_mirror_inject_text(tm, "\x08", 1);
-        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+        axl_console_tap_inject_text(tt, "\x08", 1);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
                    && scan == 0 && uni == 0x08,
                    "inject_text: 0x08 -> {ScanCode=0, UnicodeChar=0x08} backspace");
 
         /* THE FIX: 0x7f (terminal DEL = the Backspace key) must remap to UEFI
            backspace 0x08, not pass through as a literal 0x7f. */
-        axl_console_mirror_inject_text(tm, "\x7f", 1);
-        test_check(_axl_console_mirror_test_pop_key(tm, &scan, &uni)
+        axl_console_tap_inject_text(tt, "\x7f", 1);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
                    && scan == 0 && uni == 0x08,
                    "inject_text: 0x7f (terminal Backspace) -> UEFI backspace 0x08");
 
-        axl_free(tm);
+        /* A Ctrl+<letter> injects the LETTER plus the control shift state, which
+           is what a full-screen Ex reader (the Shell's `edit`) needs to map its
+           control commands. The SIMPLE ReadKeyStroke has no KeyState, so it must
+           FOLD the letter to its C0 code -- EDK2's ConSplitter does exactly this,
+           and without it the Shell's line editor sees the bare 'c' of a Ctrl+C
+           and inserts it. */
+        axl_console_tap_inject_key_ex(tt, 0, 'c',
+                                      EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == 0x03,
+                   "inject Ctrl+C ('c'+CTRL) -> Simple read folds to 0x03");
+
+        axl_console_tap_inject_key_ex(tt, 0, 'q',
+                                      EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == 0x11,
+                   "inject Ctrl+Q ('q'+CTRL) -> Simple read folds to 0x11");
+
+        /* No control modifier -> a plain letter is NOT folded (still inserted). */
+        axl_console_tap_inject_key_ex(tt, 0, 'c', 0, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == 'c',
+                   "inject plain 'c' (no CTRL) -> Simple read leaves it 'c'");
+
+        /* Uppercase letter + CTRL case-folds before folding: Ctrl+Shift+C -> 0x03. */
+        axl_console_tap_inject_key_ex(tt, 0, 'C',
+                                      EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == 0x03,
+                   "inject Ctrl+'C' (uppercase) -> Simple read folds to 0x03");
+
+        /* A non-letter + CTRL is left alone (only a..z fold). */
+        axl_console_tap_inject_key_ex(tt, 0, '5',
+                                      EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == '5',
+                   "inject Ctrl+'5' (non-letter) -> Simple read leaves it '5'");
+
+        /* An already-folded C0 code + CTRL is not double-folded (0x03 stays 0x03). */
+        axl_console_tap_inject_key_ex(tt, 0, 0x03,
+                                      EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED, 0);
+        test_check(_axl_console_tap_test_pop_key(tt, &scan, &uni)
+                   && scan == 0 && uni == 0x03,
+                   "inject already-folded 0x03 + CTRL -> Simple read leaves it 0x03");
+
+        axl_free(tt);
     }
+}
+
+// ---------------------------------------------------------------------------
+// AxlConsoleTap public-API guards. The tap is the new substrate entry point, so
+// pin its argument validation and NULL-safety (none of these install anything,
+// so the live console is untouched).
+// ---------------------------------------------------------------------------
+
+static void
+test_console_tap_guards(void)
+{
+    static const AxlConsoleOps null_ops = {0};   /* every callback optional */
+    AxlConsoleTap      *t   = NULL;
+    AxlConsoleTapConfig cfg = { .cols = 80, .rows = 25 };
+
+    test_check(axl_console_tap_install(NULL, &null_ops, NULL, &cfg) == AXL_ERR,
+               "console_tap: install(NULL out) returns -1");
+    test_check(axl_console_tap_install(&t, NULL, NULL, &cfg) == AXL_ERR,
+               "console_tap: install(NULL ops) returns -1");
+    test_check(axl_console_tap_install(&t, &null_ops, NULL, NULL) == AXL_ERR,
+               "console_tap: install(NULL cfg) returns -1");
+    test_check(t == NULL, "console_tap: out stays NULL on rejected install");
+
+    /* NULL-safe teardown / accessors. */
+    axl_console_tap_uninstall(NULL);
+    axl_console_tap_reset(NULL);
+    axl_console_tap_set_size(NULL, 100, 40);
+    axl_console_tap_enter_alt_screen(NULL);
+    axl_console_tap_leave_alt_screen(NULL);
+    test_check(!axl_console_tap_in_alt_screen(NULL),
+               "console_tap: in_alt_screen(NULL) is false");
+}
+
+/* The take-over device's install/connect/evict surgery wraps the LIVE console and
+   is validated under DEBUG OVMF (test-console-device-qemu.sh); its ops emission is
+   the shared engine, already covered by the tap tests above. What is unit-testable
+   here is the public surface's arg guards + the output-only contract (the input
+   relay is a later increment). */
+static void
+test_console_device_guards(void)
+{
+    static const AxlConsoleOps    null_ops = {0};
+    AxlConsoleDevice             *d   = NULL;
+    AxlConsoleDeviceConfig        cfg = { .cols = 80, .rows = 25 };
+
+    test_check(axl_console_device_install(NULL, &null_ops, NULL, &cfg) == AXL_ERR,
+               "console_device: install(NULL out) returns -1");
+    test_check(axl_console_device_install(&d, NULL, NULL, &cfg) == AXL_ERR,
+               "console_device: install(NULL ops) returns -1");
+    test_check(axl_console_device_install(&d, &null_ops, NULL, NULL) == AXL_ERR,
+               "console_device: install(NULL cfg) returns -1");
+    test_check(d == NULL, "console_device: out stays NULL on rejected install");
+
+    /* inject_* are NULL-safe; the injected-key path proper is covered headlessly in
+       test_console_device_input (a live install wedges the unit boot). */
+    test_check(axl_console_device_inject_key(NULL, 0, 'x') == AXL_ERR,
+               "console_device: inject_key(NULL) returns -1");
+    test_check(axl_console_device_inject_key_ex(NULL, 0, 3,
+                   AXL_CONSOLE_SHIFT_STATE_VALID, 0) == AXL_ERR,
+               "console_device: inject_key_ex(NULL) returns -1");
+    test_check(axl_console_device_inject_text(NULL, "x", 1) == AXL_ERR,
+               "console_device: inject_text(NULL) returns -1");
+
+    /* NULL-safe session / geometry / alt-screen accessors. */
+    axl_console_device_uninstall(NULL);
+    axl_console_device_reset(NULL);
+    axl_console_device_set_size(NULL, 100, 40);
+    axl_console_device_enter_alt_screen(NULL);
+    axl_console_device_leave_alt_screen(NULL);
+    test_check(!axl_console_device_in_alt_screen(NULL),
+               "console_device: in_alt_screen(NULL) is false");
+}
+
+// ---------------------------------------------------------------------------
+// Key-notify ownership under input_capture.
+//
+// EFI_SIMPLE_TEXT_INPUT_EX fires RegisterKeyNotify callbacks when a key is
+// INSERTED into the queue, independent of who reads. With input_capture the tap
+// owns the queue, so it must own the notify registry too -- otherwise the guest
+// (a nested Shell) gets its notifies from the *physical* keyboard it is no
+// longer supposed to see, and never from an injected key.
+//
+// The Shell's Ctrl+C monitor is the motivating consumer. EDK2 registers four
+// variants (ShellPkg ShellProtocol.c): UnicodeChar in {'c', 3} crossed with
+// {LEFT,RIGHT}_CONTROL_PRESSED, each with EFI_SHIFT_STATE_VALID, ScanCode 0 and
+// KeyToggleState 0. The match rule (MdeModulePkg IsKeyRegistered) is: ScanCode
+// and UnicodeChar must be equal, and a registered KeyShiftState / KeyToggleState
+// of 0 means "don't care" while a nonzero one must match EXACTLY.
+//
+// So an injected key must carry KeyState, which is why the ring holds
+// EFI_KEY_DATA rather than EFI_INPUT_KEY.
+// ---------------------------------------------------------------------------
+
+#define CTRL_C_SHIFT (EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED)
+
+static int          notify_calls;
+static EFI_KEY_DATA notify_last;
+
+static EFI_STATUS EFIAPI
+on_key_notify(EFI_KEY_DATA *kd)
+{
+    notify_calls++;
+    notify_last = *kd;
+    return EFI_SUCCESS;
+}
+
+/* A device key_filter that claims Shift+PgUp (SCAN 0x09) for the consumer. */
+static bool
+filter_shift_pgup(void *user, const void *key)
+{
+    (void)user;
+    const EFI_KEY_DATA *kd = key;
+    return kd->Key.ScanCode == 0x09
+        && (kd->KeyState.KeyShiftState
+            & (EFI_LEFT_SHIFT_PRESSED | EFI_RIGHT_SHIFT_PRESSED)) != 0;
+}
+
+/* Register `kd` and return the opaque handle, or NULL on failure. */
+static void *
+tap_register_notify(AxlConsoleTap *t, EFI_KEY_DATA kd)
+{
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_tap_test_coninex(t);
+    void                              *h  = NULL;
+
+    if (ex->RegisterKeyNotify(ex, &kd, on_key_notify, &h) != EFI_SUCCESS) {
+        return NULL;
+    }
+    return h;
+}
+
+static EFI_KEY_DATA
+key_data(uint16_t scan, uint16_t unicode, uint32_t shift, uint8_t toggle)
+{
+    EFI_KEY_DATA kd = {0};
+    kd.Key.ScanCode           = scan;
+    kd.Key.UnicodeChar        = unicode;
+    kd.KeyState.KeyShiftState = shift;
+    kd.KeyState.KeyToggleState = toggle;
+    return kd;
+}
+
+static void
+test_console_tap_key_notify(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, /*auto_alt=*/false,
+                                    /*input_capture=*/true, /*passthrough=*/false);
+
+    /* The Shell's real Ctrl+C registration: Key={0,3}, LEFT_CONTROL. */
+    void *h = tap_register_notify(t, key_data(0, 3, CTRL_C_SHIFT, 0));
+    test_check(h != NULL, "key_notify: RegisterKeyNotify returns a handle");
+
+    /* An injected Ctrl+C carrying the same KeyState fires it. */
+    notify_calls = 0;
+    test_check(axl_console_tap_inject_key_ex(t, 0, 3, CTRL_C_SHIFT, 0) == AXL_OK,
+               "key_notify: inject_key_ex accepts a modifier-bearing key");
+    test_check(notify_calls == 1, "key_notify: injected Ctrl+C fires the notify once");
+    test_check(notify_last.Key.UnicodeChar == 3,
+               "key_notify: callback receives UnicodeChar 3");
+    test_check(notify_last.KeyState.KeyShiftState == CTRL_C_SHIFT,
+               "key_notify: callback receives the injected KeyShiftState");
+
+    /* Same UnicodeChar, NO modifiers: the registered KeyShiftState is nonzero,
+       so IsKeyRegistered demands an exact match. A bare 0x03 must NOT fire. */
+    notify_calls = 0;
+    axl_console_tap_inject_key(t, 0, 3);
+    test_check(notify_calls == 0,
+               "key_notify: bare 0x03 without KeyState does not fire a ctrl-qualified notify");
+
+    /* A wholly different key does not fire it either. */
+    notify_calls = 0;
+    axl_console_tap_inject_key_ex(t, 0, 'a', CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 0, "key_notify: non-matching UnicodeChar does not fire");
+
+    /* The injected keys are still readable -- firing a notify must not consume
+       them. Three were pushed above; FIFO returns the first, the Ctrl+C. */
+    uint16_t scan = 0xFFFF, uni = 0xFFFF;
+    test_check(_axl_console_tap_test_pop_key(t, &scan, &uni) && uni == 3,
+               "key_notify: the notified key is still delivered to the reader");
+
+    /* Unregister: the same key no longer fires. */
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_tap_test_coninex(t);
+    test_check(ex->UnregisterKeyNotify(ex, h) == EFI_SUCCESS,
+               "key_notify: UnregisterKeyNotify accepts our handle");
+    notify_calls = 0;
+    axl_console_tap_inject_key_ex(t, 0, 3, CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 0, "key_notify: unregistered notify no longer fires");
+
+    cm_tap_end(t);
+}
+
+/* A registered KeyShiftState of 0 means "don't care" -- it must match a key
+   injected with any modifier state. This is the other half of IsKeyRegistered,
+   and getting it backwards would silently break plain-key notifies. */
+static void
+test_console_tap_key_notify_wildcard(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, /*input_capture=*/true, false);
+
+    void *h = tap_register_notify(t, key_data(0, 'q', 0, 0));
+    test_check(h != NULL, "key_notify: wildcard registration succeeds");
+
+    notify_calls = 0;
+    axl_console_tap_inject_key(t, 0, 'q');
+    test_check(notify_calls == 1, "key_notify: shift-state 0 matches an unmodified key");
+
+    notify_calls = 0;
+    axl_console_tap_inject_key_ex(t, 0, 'q', CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 1, "key_notify: shift-state 0 also matches a modified key");
+
+    /* ScanCode must always match, even under the wildcard. */
+    notify_calls = 0;
+    axl_console_tap_inject_key(t, 0x01 /*SCAN_UP*/, 0);
+    test_check(notify_calls == 0, "key_notify: a different ScanCode never matches");
+
+    cm_tap_end(t);
+}
+
+/* Without input_capture the tap is NOT the queue owner, so it must keep
+   forwarding registrations to the original ConInEx rather than serving them
+   itself -- SoftBMC depends on the physical keyboard behaving normally. In this
+   headless fixture orig_coninex is NULL, so the forward path falls through to
+   the documented stub; what we pin is that the LOCAL registry stayed empty, i.e.
+   an injected key fires nothing. */
+static void
+test_console_tap_key_notify_passthrough_not_owned(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, /*input_capture=*/false, false);
+
+    void *h = tap_register_notify(t, key_data(0, 3, CTRL_C_SHIFT, 0));
+    test_check(h != NULL, "key_notify: passthrough registration still returns a handle");
+
+    notify_calls = 0;
+    axl_console_tap_inject_key_ex(t, 0, 3, CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 0,
+               "key_notify: passthrough mode does not serve notifies from the tap's ring");
+
+    cm_tap_end(t);
+}
+
+/* inject_key_ex must reject a NULL tap like every other public entry point. */
+static void
+test_console_tap_inject_key_ex_guards(void)
+{
+    test_check(axl_console_tap_inject_key_ex(NULL, 0, 3, CTRL_C_SHIFT, 0) == AXL_ERR,
+               "key_notify: inject_key_ex(NULL) returns -1");
+}
+
+/* axl-console-device INPUT RELAY (increment 2). The device shares the
+   AxlConsoleInput engine with the tap, so this pins the DEVICE-specific wiring:
+   the take_input gate, that its ConIn/ConInEx read from the engine (Simple folds
+   Ctrl+letter, Ex returns raw), inject_text decode, and that the device owns the
+   key-notify registry. The firmware surgery (publish/evict/read-loop/teardown) is
+   the DEBUG-OVMF smoke's job; a live install wedges the unit boot. */
+static void
+test_console_device_input(void)
+{
+    /* take_input=false: the inject family is inert (output-only device). */
+    AxlConsoleDevice *off = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(off, /*take_input=*/false);
+    test_check(axl_console_device_inject_key(off, 0, 'x') == AXL_ERR,
+               "device_input: inject_key rejected when take_input=false");
+    test_check(axl_console_device_inject_key_ex(off, 0, 3, CTRL_C_SHIFT, 0) == AXL_ERR,
+               "device_input: inject_key_ex rejected when take_input=false");
+    test_check(axl_console_device_inject_text(off, "x", 1) == AXL_ERR,
+               "device_input: inject_text rejected when take_input=false");
+    _axl_console_device_test_end(off);
+
+    /* take_input=true: the device is the sole queue owner; reads come from us. */
+    AxlConsoleDevice                  *d  = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *ex = _axl_console_device_test_coninex(d);
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL    *in = _axl_console_device_test_conin(d);
+
+    /* Ex read returns the raw letter + KeyState (a full-screen app maps its own
+       Ctrl chords off this). */
+    test_check(axl_console_device_inject_key_ex(d, 0, 'c', CTRL_C_SHIFT, 0) == AXL_OK,
+               "device_input: inject_key_ex accepts a modifier-bearing key");
+    EFI_KEY_DATA kd = {0};
+    test_check(ex->ReadKeyStrokeEx(ex, &kd) == EFI_SUCCESS
+                   && kd.Key.UnicodeChar == 'c'
+                   && kd.KeyState.KeyShiftState == CTRL_C_SHIFT,
+               "device_input: Ex read is the raw letter + Ctrl state");
+
+    /* Simple read folds Ctrl+<letter> to its C0 code (Ctrl+C -> 0x03). */
+    test_check(axl_console_device_inject_key_ex(d, 0, 'c', CTRL_C_SHIFT, 0) == AXL_OK,
+               "device_input: inject Ctrl+C for the Simple read");
+    EFI_INPUT_KEY sk = {0};
+    test_check(in->ReadKeyStroke(in, &sk) == EFI_SUCCESS && sk.UnicodeChar == 0x03,
+               "device_input: Simple read folds Ctrl+C to 0x03");
+
+    /* Empty ring -> NOT_READY on both protocols. */
+    test_check(in->ReadKeyStroke(in, &sk) == EFI_NOT_READY,
+               "device_input: Simple read NOT_READY when empty");
+    test_check(ex->ReadKeyStrokeEx(ex, &kd) == EFI_NOT_READY,
+               "device_input: Ex read NOT_READY when empty");
+
+    /* inject_text decodes a byte run to keys read back in order. */
+    test_check(axl_console_device_inject_text(d, "hi\r", 3) == AXL_OK,
+               "device_input: inject_text accepts a byte run");
+    test_check(in->ReadKeyStroke(in, &sk) == EFI_SUCCESS && sk.UnicodeChar == 'h',
+               "device_input: inject_text -> 'h'");
+    test_check(in->ReadKeyStroke(in, &sk) == EFI_SUCCESS && sk.UnicodeChar == 'i',
+               "device_input: inject_text -> 'i'");
+    test_check(in->ReadKeyStroke(in, &sk) == EFI_SUCCESS && sk.UnicodeChar == '\r',
+               "device_input: inject_text -> CR");
+
+    /* The device owns the notify registry: the Shell's Ctrl+C break registers on
+       our ConInEx and must fire on an injected Ctrl+C. */
+    void         *h   = NULL;
+    EFI_KEY_DATA  reg = key_data(0, 3, CTRL_C_SHIFT, 0);
+    test_check(ex->RegisterKeyNotify(ex, &reg, on_key_notify, &h) == EFI_SUCCESS
+                   && h != NULL,
+               "device_input: RegisterKeyNotify returns a handle");
+    notify_calls = 0;
+    axl_console_device_inject_key_ex(d, 0, 3, CTRL_C_SHIFT, 0);
+    test_check(notify_calls == 1,
+               "device_input: injected Ctrl+C fires the registered notify once");
+    ex->ReadKeyStrokeEx(ex, &kd);   /* drain the queued key */
+    test_check(ex->UnregisterKeyNotify(ex, h) == EFI_SUCCESS,
+               "device_input: UnregisterKeyNotify accepts our handle");
+
+    /* key_filter (the read-loop peek): a filter that claims Shift+PgUp consumes it
+       (the shell's key ring never sees it); a plain key + a NULL filter forward. The
+       seam runs the device's real filter->gate->push path on a synthetic key and
+       reports whether it reached the ring. */
+    test_check(_axl_console_device_test_feed_physical(d, filter_shift_pgup, NULL,
+                   /*scan=*/0x09, /*uni=*/0,
+                   EFI_LEFT_SHIFT_PRESSED | EFI_SHIFT_STATE_VALID) == false,
+               "device key_filter: Shift+PgUp consumed (not forwarded to the shell)");
+    test_check(_axl_console_device_test_feed_physical(d, filter_shift_pgup, NULL,
+                   /*scan=*/0, /*uni=*/'x', /*shift=*/0) == true,
+               "device key_filter: a plain key is forwarded to the shell ring");
+    test_check(_axl_console_device_test_feed_physical(d, NULL, NULL, 0, 'y', 0) == true,
+               "device key_filter: NULL filter forwards everything");
+
+    _axl_console_device_test_end(d);
+}
+
+// ---------------------------------------------------------------------------
+// Pointer take-over (cfg.take_pointer): the device uninstalls SimplePointer(s)
+// from the handle database so a guest cannot locate one, caches the interfaces
+// for the consumer, and restores them on uninstall. Exercised here against a
+// SYNTHETIC pointer via the per-handle evict/restore seams (the harness's real
+// pointer stays untouched; the LocateHandleBuffer sweep is firmware-validated).
+// ---------------------------------------------------------------------------
+
+static EFI_STATUS EFIAPI
+ptr_mock_reset(EFI_SIMPLE_POINTER_PROTOCOL *This, BOOLEAN ext)
+{
+    (void)This; (void)ext;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+ptr_mock_getstate(EFI_SIMPLE_POINTER_PROTOCOL *This, EFI_SIMPLE_POINTER_STATE *st)
+{
+    (void)This;
+    if (st != NULL) {
+        st->RelativeMovementX = 42;   /* distinctive: proves the proxy relayed US */
+        st->RelativeMovementY = 0;
+        st->RelativeMovementZ = 0;
+        st->LeftButton        = FALSE;
+        st->RightButton       = FALSE;
+    }
+    return EFI_SUCCESS;
+}
+
+static void
+test_console_device_pointer_evict(void)
+{
+    EFI_GUID sp_guid = EFI_SIMPLE_POINTER_PROTOCOL_GUID;
+
+    /* A synthetic SimplePointer on a fresh handle stands in for a firmware mouse.
+       A real pointer handle carries other protocols (device path, USB I/O), so
+       install a keeper alongside it: uninstalling only the pointer must NOT destroy
+       the handle (UEFI frees a handle when its LAST protocol is removed), so restore
+       has a live handle to reinstall onto. */
+    static EFI_GUID keeper_guid =
+        { 0x5eeb0000, 0x1234, 0x5678, { 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44 } };
+    static int keeper = 0xC0FFEE;
+    static EFI_SIMPLE_POINTER_PROTOCOL mock;
+    mock.Reset    = ptr_mock_reset;
+    mock.GetState = ptr_mock_getstate;
+    mock.Mode     = NULL;
+    EFI_HANDLE ph = NULL;
+    test_check(gBS->InstallProtocolInterface(&ph, &keeper_guid, EFI_NATIVE_INTERFACE,
+                                             &keeper) == EFI_SUCCESS && ph != NULL,
+               "device_pointer: keeper protocol installs on a fresh handle");
+    test_check(gBS->InstallProtocolInterface(&ph, &sp_guid, EFI_NATIVE_INTERFACE,
+                                             &mock) == EFI_SUCCESS,
+               "device_pointer: synthetic SimplePointer installs on that handle");
+
+    /* Baseline: a guest CAN locate it on that handle. */
+    void *found = NULL;
+    test_check(gBS->HandleProtocol(ph, &sp_guid, &found) == EFI_SUCCESS && found == &mock,
+               "device_pointer: guest locates the pointer before take-over");
+
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/false);
+
+    /* Guards on the accessors before any eviction. */
+    test_check(axl_console_device_pointer_count(NULL) == 0,
+               "device_pointer: count(NULL) == 0");
+    test_check(axl_console_device_pointer_count(d) == 0,
+               "device_pointer: count == 0 before eviction");
+    test_check(axl_console_device_pointer_iface(NULL, 0) == NULL,
+               "device_pointer: iface(NULL) == NULL");
+
+    /* Evict: the pointer leaves the database (guest can no longer find it) and is
+       cached for the consumer. */
+    test_check(_axl_console_device_test_evict_one_pointer(d, ph) == true,
+               "device_pointer: evict removes the synthetic pointer");
+    found = NULL;
+    test_check(gBS->HandleProtocol(ph, &sp_guid, &found) != EFI_SUCCESS,
+               "device_pointer: guest CANNOT locate the pointer after eviction");
+    test_check(axl_console_device_pointer_count(d) == 1,
+               "device_pointer: one interface cached for the consumer");
+    test_check(axl_console_device_pointer_iface(d, 0) == &mock,
+               "device_pointer: cached iface is the evicted interface");
+    test_check(axl_console_device_pointer_iface(d, 1) == NULL,
+               "device_pointer: iface(out-of-range) == NULL");
+
+    /* Count SimplePointer handles now (mock evicted): the proxy install must add one. */
+    UINTN       pre_n = 0;
+    EFI_HANDLE *pre_h = NULL;
+    gBS->LocateHandleBuffer(ByProtocol, &sp_guid, NULL, &pre_n, &pre_h);
+    if (pre_h != NULL) { gBS->FreePool(pre_h); }
+
+    /* Interpose the yielding proxy: a guest now locates ONE more SimplePointer (the
+       proxy), and the proxy forwards the cached real pointer's movement. */
+    _axl_console_device_test_install_proxy(d);
+    UINTN       post_n = 0;
+    EFI_HANDLE *post_h = NULL;
+    gBS->LocateHandleBuffer(ByProtocol, &sp_guid, NULL, &post_n, &post_h);
+    if (post_h != NULL) { gBS->FreePool(post_h); }
+    test_check(post_n == pre_n + 1,
+               "device_pointer: proxy install adds one locatable SimplePointer");
+
+    EFI_SIMPLE_POINTER_STATE pst = {0};
+    int fr = _axl_console_device_test_proxy_forward(d, &pst);
+    test_check(fr == (int)EFI_SUCCESS && pst.RelativeMovementX == 42,
+               "device_pointer: proxy forwards the cached real pointer's movement");
+
+    /* Uninstall the proxy: the added SimplePointer goes away again. */
+    _axl_console_device_test_uninstall_proxy(d);
+    UINTN       gone_n = 0;
+    EFI_HANDLE *gone_h = NULL;
+    gBS->LocateHandleBuffer(ByProtocol, &sp_guid, NULL, &gone_n, &gone_h);
+    if (gone_h != NULL) { gBS->FreePool(gone_h); }
+    test_check(gone_n == pre_n,
+               "device_pointer: proxy uninstall removes the interposed SimplePointer");
+
+    /* Restore: the pointer returns to the database (a later guest finds it again). */
+    _axl_console_device_test_restore_pointer(d);
+    test_check(axl_console_device_pointer_count(d) == 0,
+               "device_pointer: cache cleared after restore");
+    found = NULL;
+    test_check(gBS->HandleProtocol(ph, &sp_guid, &found) == EFI_SUCCESS && found == &mock,
+               "device_pointer: guest locates the pointer again after restore");
+
+    _axl_console_device_test_end(d);
+    gBS->UninstallProtocolInterface(ph, &sp_guid, &mock);
+    gBS->UninstallProtocolInterface(ph, &keeper_guid, &keeper);
+}
+
+/* Synthetic evicted keyboard whose ReadKeyStrokeEx just counts calls (returns
+   NOT_READY = "no key", so the read loop probes it exactly once per tick). */
+static int g_synth_conin_reads;
+
+static EFI_STATUS EFIAPI
+synth_conin_reset(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, BOOLEAN ext)
+{
+    (void)This; (void)ext;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+synth_conin_readkeyex(EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This, EFI_KEY_DATA *kd)
+{
+    (void)This;
+    g_synth_conin_reads++;
+    if (kd != NULL) {
+        EFI_KEY_DATA zero = {0};
+        *kd = zero;
+    }
+    return EFI_NOT_READY;
+}
+
+/* Regression for the real-iDRAC #GP (dev_read_timer_cb calling a dangling
+   evicted-keyboard interface after the firmware keyboard reallocated/removed its
+   SimpleTextInputEx). The read loop must RE-RESOLVE each evicted handle per tick
+   rather than trust a cached pointer -- so once the Ex protocol is gone, a tick
+   must NOT call the (stale) interface. */
+static void
+test_console_device_read_loop_revalidate(void)
+{
+    EFI_GUID ex_guid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
+    static EFI_GUID keeper_guid =
+        { 0x5eeb0001, 0x1234, 0x5678, { 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x55 } };
+    static int keeper = 0xC0FFEE;
+    static EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL kb;
+    kb.Reset          = synth_conin_reset;
+    kb.ReadKeyStrokeEx = synth_conin_readkeyex;
+    kb.WaitForKeyEx   = NULL;
+    kb.SetState       = NULL;
+    kb.RegisterKeyNotify   = NULL;
+    kb.UnregisterKeyNotify = NULL;
+
+    /* A keeper protocol keeps the handle alive when we later remove only the Ex. */
+    EFI_HANDLE kh = NULL;
+    test_check(gBS->InstallProtocolInterface(&kh, &keeper_guid, EFI_NATIVE_INTERFACE,
+                                             &keeper) == EFI_SUCCESS && kh != NULL,
+               "read-loop: keeper installs on a fresh handle");
+    test_check(gBS->InstallProtocolInterface(&kh, &ex_guid, EFI_NATIVE_INTERFACE,
+                                             &kb) == EFI_SUCCESS,
+               "read-loop: synthetic keyboard SimpleTextInputEx installs");
+
+    AxlConsoleDevice *d = _axl_console_device_new_for_test();
+    _axl_console_device_test_begin(d, /*take_input=*/true);
+    test_check(_axl_console_device_test_add_evicted_conin(d, kh),
+               "read-loop: synthetic keyboard evicted into the read list");
+
+    /* Baseline: a tick resolves the handle and probes its Ex exactly once. */
+    g_synth_conin_reads = 0;
+    _axl_console_device_test_read_tick(d);
+    test_check(g_synth_conin_reads == 1, "read-loop: tick reads the evicted keyboard's Ex");
+
+    /* Now the firmware keyboard reallocates/removes its Ex (USB re-enum on real HW):
+       remove the protocol from the handle. A tick must re-resolve, find it gone, and
+       skip -- NOT call the stale cached pointer (which is the #GP on real HW). */
+    gBS->UninstallProtocolInterface(kh, &ex_guid, &kb);
+    g_synth_conin_reads = 0;
+    _axl_console_device_test_read_tick(d);
+    test_check(g_synth_conin_reads == 0,
+               "read-loop: tick re-resolves a removed keyboard and skips (no stale-pointer call)");
+
+    _axl_console_device_test_end(d);
+    gBS->UninstallProtocolInterface(kh, &keeper_guid, &keeper);
+}
+
+/* AxlConsoleTerm — the local AxlConsoleOps sink. This pins the cell model + op
+   translation (the on-screen counterpart to axl-console-mirror's VT wire). */
+static void
+test_console_term_output(void)
+{
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5 };   /* font NULL -> default */
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    test_check(t != NULL, "term: new(20x5) succeeds");
+
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+    test_check(ops != NULL && ops->output_text != NULL && u == (void *)t,
+               "term: ops vtable exposed + user is the instance");
+
+    /* set_pen(fg=2 green, bg=1 blue) then output 'Hi'. */
+    AxlConsolePen pen = { .fg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 2 },
+                          .bg = { .kind = AXL_CONSOLE_COLOR_INDEXED, .idx = 1 } };
+    ops->set_pen(u, &pen);
+    ops->output_text(u, "Hi", 2);
+
+    char c[5]; uint8_t fg = 0, bg = 0;
+    test_check(_axl_console_term_test_cell(t, 0, 0, c, &fg, &bg)
+                   && axl_strcmp(c, "H") == 0 && fg == 2 && bg == 1,
+               "term: output_text lands 'H' green-on-blue at (0,0)");
+    test_check(_axl_console_term_test_cell(t, 0, 1, c, &fg, &bg)
+                   && axl_strcmp(c, "i") == 0,
+               "term: output_text lands 'i' at (0,1)");
+
+    uint32_t cr = 99, cc = 99;
+    _axl_console_term_test_cursor(t, &cr, &cc);
+    test_check(cr == 0 && cc == 2, "term: cursor advanced to (0,2)");
+
+    /* CR/LF: carriage-return columns to 0, line-feed drops a row. */
+    ops->output_text(u, "\r\nX", 3);
+    _axl_console_term_test_cursor(t, &cr, &cc);
+    test_check(cr == 1 && cc == 1, "term: CR/LF moved to row 1, then 'X' -> col 1");
+    test_check(_axl_console_term_test_cell(t, 1, 0, c, &fg, &bg) && axl_strcmp(c, "X") == 0,
+               "term: 'X' at (1,0) after CR/LF");
+
+    /* clear_screen blanks + homes. */
+    ops->clear_screen(u);
+    _axl_console_term_test_cursor(t, &cr, &cc);
+    test_check(cr == 0 && cc == 0 && _axl_console_term_test_cell(t, 0, 0, c, &fg, &bg)
+                   && c[0] == '\0',
+               "term: clear_screen blanks (0,0) + homes the cursor");
+
+    axl_console_term_free(t);
+}
+
+/* Scrollback: lines that scroll off the top land in the history ring; scroll()
+   navigates it with clamping. */
+static void
+test_console_term_scrollback(void)
+{
+    AxlConsoleTermConfig cfg = { .cols = 8, .rows = 3, .scrollback_rows = 10 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+
+    /* Five lines "0".."4" through a 3-row screen: "0","1","2" scroll into history,
+       leaving "3","4" live (rows 0,1). */
+    ops->output_text(u, "0\r\n1\r\n2\r\n3\r\n4\r\n", 15);
+
+    char c[5];
+    test_check(_axl_console_term_test_cell(t, 0, 0, c, NULL, NULL) && axl_strcmp(c, "3") == 0,
+               "term-sb: live screen top is '3' after 5 lines");
+    test_check(_axl_console_term_test_hist_cell(t, 1, 0, c) && axl_strcmp(c, "2") == 0,
+               "term-sb: history row 1-back is '2' (most-recently scrolled off)");
+    test_check(_axl_console_term_test_hist_cell(t, 3, 0, c) && axl_strcmp(c, "0") == 0,
+               "term-sb: history row 3-back is '0' (oldest)");
+    test_check(!_axl_console_term_test_hist_cell(t, 4, 0, c),
+               "term-sb: only 3 lines in history (4-back is absent)");
+
+    /* scroll() clamps to [0, hist_fill]. */
+    axl_console_term_scroll(t, 2);
+    test_check(_axl_console_term_test_scroll_off(t) == 2, "term-sb: scroll(+2) -> off 2");
+    axl_console_term_scroll(t, 999);
+    test_check(_axl_console_term_test_scroll_off(t) == 3, "term-sb: scroll(+999) clamps to 3");
+    axl_console_term_scroll(t, -999);
+    test_check(_axl_console_term_test_scroll_off(t) == 0, "term-sb: scroll(-999) back to live (0)");
+
+    axl_console_term_free(t);
+}
+
+static bool
+term_px_is_rgb(AxlGfxPixel p, uint8_t r, uint8_t g, uint8_t b)
+{
+    return p.red == r && p.green == g && p.blue == b;
+}
+
+static void
+test_console_term_render(void)
+{
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+
+    AxlGfxBuffer *buf = axl_gfx_buffer_new(cw * 4, ch * 2);
+    test_check(buf != NULL, "term-render: offscreen target buffer allocated");
+
+    /* Magenta sentinel so we can prove render() actually paints the bg (palette[0] is
+       black -- a black-cleared buffer could not tell "painted" from "untouched"). */
+    axl_gfx_buffer_clear(buf, AXL_GFX_RGB(0xFF, 0x00, 0xFF));
+
+    AxlConsoleTermConfig cfg = { .cols = 4, .rows = 2, .target = buf };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+
+    ops->output_text(u, "A", 1);        /* fg=7 light-gray on bg=0 black at (0,0) */
+    axl_console_term_render(t);
+
+    AxlGfxPixel *px = axl_gfx_buffer_pixels(buf);
+    uint32_t     w  = cw * 4;
+
+    test_check(term_px_is_rgb(px[0], 0x00, 0x00, 0x00),
+               "term-render: cell (0,0) bg painted palette[bg=0] (black)");
+
+    /* The 'A' glyph drew at least one non-background pixel in cell (0,0). */
+    bool glyph = false;
+    for (uint32_t yy = 0; yy < ch && !glyph; yy++) {
+        for (uint32_t xx = 0; xx < cw; xx++) {
+            if (!term_px_is_rgb(px[yy * w + xx], 0x00, 0x00, 0x00)) { glyph = true; break; }
+        }
+    }
+    test_check(glyph, "term-render: 'A' glyph drew a foreground pixel in cell (0,0)");
+
+    /* A blank cell on the same (dirty) row is still bg-painted (sentinel overwritten). */
+    test_check(term_px_is_rgb(px[3 * cw], 0x00, 0x00, 0x00),
+               "term-render: blank cell (0,3) bg painted (magenta sentinel gone)");
+
+    /* render() cleared the dirty flags: re-sentinel, render again, cell (0,0) is
+       untouched (only the cursor caret at (0,1) repaints). */
+    axl_gfx_buffer_clear(buf, AXL_GFX_RGB(0xFF, 0x00, 0xFF));
+    axl_console_term_render(t);
+    test_check(term_px_is_rgb(px[0], 0xFF, 0x00, 0xFF),
+               "term-render: dirty flags cleared -> clean row not repainted");
+
+    axl_console_term_free(t);
+    axl_gfx_buffer_free(buf);
+}
+
+/* Scan the box under the cursor hotspot for any white (0xFF) fill pixel from the
+   built-in arrow sprite. The blank cells under it are black, so a white pixel present
+   == the arrow is composited there. The 12x19 box matches AxlCursor's private built-in
+   ARROW_W x ARROW_H (axl-cursor.c); the hotspot (tip) is the sprite's top-left. */
+static bool
+term_arrow_present(AxlGfxPixel *px, uint32_t stride, int32_t hx, int32_t hy)
+{
+    for (int32_t y = hy; y < hy + 19; y++) {
+        for (int32_t x = hx; x < hx + 12; x++) {
+            if (term_px_is_rgb(px[(uint32_t)y * stride + (uint32_t)x], 0xFF, 0xFF, 0xFF)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void
+test_console_term_mouse_cursor(void)
+{
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+    uint32_t       w    = cw * 4;
+    uint32_t       h    = ch * 4;
+
+    /* Off by default: no cursor, set_pointer is a no-op, render draws no arrow. */
+    AxlGfxBuffer        *nb  = axl_gfx_buffer_new(w, h);
+    AxlConsoleTermConfig cfg0 = { .cols = 4, .rows = 4, .target = nb };
+    AxlConsoleTerm      *t0   = axl_console_term_new(&cfg0);
+    bool    vis  = true;
+    int32_t cx   = 7, cy = 7;
+    _axl_console_term_test_pointer(t0, &cx, &cy, &vis);
+    test_check(!vis, "term-mouse: cursor hidden by default (mouse_cursor unset)");
+    axl_gfx_buffer_clear(nb, AXL_GFX_RGB(0x00, 0x00, 0x00));
+    axl_console_term_set_pointer(t0, 8, 8);
+    axl_console_term_render(t0);
+    test_check(!term_arrow_present(axl_gfx_buffer_pixels(nb), w, 8, 8),
+               "term-mouse: no arrow drawn when mouse_cursor is unset");
+    axl_console_term_free(t0);
+    axl_gfx_buffer_free(nb);
+
+    /* mouse_cursor on: set_pointer shows + positions the cursor; render composites the
+       arrow at the hotspot; hide_pointer removes it on the next render. */
+    AxlGfxBuffer        *buf = axl_gfx_buffer_new(w, h);
+    AxlConsoleTermConfig cfg  = { .cols = 4, .rows = 4, .target = buf, .mouse_cursor = true };
+    AxlConsoleTerm      *t    = axl_console_term_new(&cfg);
+
+    vis = true;
+    _axl_console_term_test_pointer(t, &cx, &cy, &vis);
+    test_check(!vis, "term-mouse: cursor starts hidden");
+
+    axl_gfx_buffer_clear(buf, AXL_GFX_RGB(0x00, 0x00, 0x00));
+    axl_console_term_set_pointer(t, 8, 8);
+    _axl_console_term_test_pointer(t, &cx, &cy, &vis);
+    test_check(vis && cx == 8 && cy == 8, "term-mouse: set_pointer shows + positions at (8,8)");
+
+    axl_console_term_render(t);
+    AxlGfxPixel *px = axl_gfx_buffer_pixels(buf);
+    test_check(term_arrow_present(px, w, 8, 8),
+               "term-mouse: render composites the arrow at the hotspot");
+
+    /* handle_pointer MOVE relocates the tracking cursor (the event-routed feed). The
+       new spot (20,40) is far enough that its arrow box does not overlap (8,8)'s. The
+       move itself (via set_pointer's drop) must UNFOLD the old arrow immediately -- so
+       assert the old spot is clean BEFORE any re-render, which is the real
+       ghost/unfold check (no buffer clear intervening to mask it). */
+    AxlInputEvent mv = { .type = AXL_INPUT_MOUSE_MOVE, .x = 20, .y = 40 };
+    axl_console_term_handle_pointer(t, &mv);
+    _axl_console_term_test_pointer(t, &cx, &cy, &vis);
+    test_check(vis && cx == 20 && cy == 40, "term-mouse: handle_pointer MOVE tracks to (20,40)");
+    test_check(!term_arrow_present(px, w, 8, 8),
+               "term-mouse: moving unfolds the old arrow (no ghost at the old spot)");
+    axl_console_term_render(t);
+    test_check(term_arrow_present(px, w, 20, 40),
+               "term-mouse: arrow follows the pointer to the new spot");
+
+    /* hide_pointer: next render leaves the cells clean where the arrow was. */
+    axl_console_term_hide_pointer(t);
+    _axl_console_term_test_pointer(t, &cx, &cy, &vis);
+    test_check(!vis, "term-mouse: hide_pointer hides the cursor");
+    axl_gfx_buffer_clear(buf, AXL_GFX_RGB(0x00, 0x00, 0x00));
+    axl_console_term_render(t);
+    test_check(!term_arrow_present(px, w, 20, 40),
+               "term-mouse: hidden cursor draws no arrow");
+
+    axl_console_term_free(t);
+    axl_gfx_buffer_free(buf);
+}
+
+static void
+test_console_term_reflow(void)
+{
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+
+    uint32_t cols, rows, cw0, ch0;
+    _axl_console_term_test_geometry(t, &cols, &rows, &cw0, &ch0, NULL, NULL, NULL, NULL);
+    test_check(cols == 20 && rows == 5, "term-reflow: initial geometry 20x5");
+
+    /* resize reallocs the grid; a subsequent op lands within the new bounds and the
+       widened far corner is addressable. */
+    axl_console_term_resize(t, 40, 10);
+    _axl_console_term_test_geometry(t, &cols, &rows, NULL, NULL, NULL, NULL, NULL, NULL);
+    test_check(cols == 40 && rows == 10, "term-reflow: resize(40,10) -> new geometry");
+    ops->output_text(u, "Z", 1);
+    char c[5];
+    test_check(_axl_console_term_test_cell(t, 0, 0, c, NULL, NULL) && axl_strcmp(c, "Z") == 0,
+               "term-reflow: output after resize lands in the new grid");
+    test_check(_axl_console_term_test_cell(t, 9, 39, c, NULL, NULL) && c[0] == '\0',
+               "term-reflow: far corner (9,39) exists and is blank after grow");
+
+    /* set_font swaps the cached cell metrics (synthetic font, doubled cell). */
+    AxlFont big = *axl_gfx_default_font();
+    big.cell_width  = (uint16_t)(cw0 * 2);
+    big.cell_height = (uint16_t)(ch0 * 2);
+    axl_console_term_set_font(t, &big);
+    uint32_t cw1, ch1;
+    _axl_console_term_test_geometry(t, NULL, NULL, &cw1, &ch1, NULL, NULL, NULL, NULL);
+    test_check(cw1 == cw0 * 2 && ch1 == ch0 * 2, "term-reflow: set_font updates cell metrics");
+
+    /* set_bounds updates render origin + extent. */
+    axl_console_term_set_bounds(t, 5, 7, 100, 50);
+    uint32_t bx, by, bw, bh;
+    _axl_console_term_test_geometry(t, NULL, NULL, NULL, NULL, &bx, &by, &bw, &bh);
+    test_check(bx == 5 && by == 7 && bw == 100 && bh == 50,
+               "term-reflow: set_bounds updates bounds");
+
+    /* set_palette swaps a colour the renderer would use. */
+    AxlGfxPixel pal[16];
+    for (uint32_t i = 0; i < 16; i++) { pal[i] = AXL_GFX_RGB(0, 0, 0); }
+    pal[1] = AXL_GFX_RGB(0x12, 0x34, 0x56);
+    axl_console_term_set_palette(t, pal);
+    AxlGfxPixel got = _axl_console_term_test_palette(t, 1);
+    test_check(term_px_is_rgb(got, 0x12, 0x34, 0x56), "term-reflow: set_palette swaps entry 1");
+
+    axl_console_term_free(t);
+}
+
+static void
+term_clipboard_string(char *out, size_t out_sz)
+{
+    size_t      len = 0;
+    const char *p   = axl_clipboard_get(&len, NULL);
+    if (p == NULL || len >= out_sz) { out[0] = '\0'; return; }
+    for (size_t i = 0; i < len; i++) { out[i] = ((const char *)p)[i]; }
+    out[len] = '\0';
+}
+
+static void
+test_console_term_selection(void)
+{
+    char out[32];
+
+    /* Single-row selection copies exactly the covered glyphs (cols 0..4 = "Hello"). */
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+
+    ops->output_text(u, "Hello", 5);
+    axl_console_term_selection_start(t, 0, 0);
+    axl_console_term_selection_extend(t, 4, 0);
+    test_check(axl_console_term_selection_copy(t) == AXL_OK,
+               "term-sel: copy of row-0 cols 0..4 succeeds");
+    term_clipboard_string(out, sizeof(out));
+    test_check(axl_strcmp(out, "Hello") == 0, "term-sel: single-row selection == 'Hello'");
+    axl_console_term_free(t);
+
+    /* Two-row selection joins rows with '\n' and trims trailing blanks. */
+    AxlConsoleTermConfig cfg2 = { .cols = 8, .rows = 3 };
+    t   = axl_console_term_new(&cfg2);
+    ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "AB\r\nCD", 6);
+    axl_console_term_selection_start(t, 0, 0);    /* col 0, row 0 */
+    axl_console_term_selection_extend(t, 1, 1);   /* col 1, row 1 */
+    test_check(axl_console_term_selection_copy(t) == AXL_OK, "term-sel: two-row copy succeeds");
+    term_clipboard_string(out, sizeof(out));
+    test_check(axl_strcmp(out, "AB\nCD") == 0,
+               "term-sel: two-row selection trims trailing blanks + joins with newline");
+
+    /* clear() drops the selection; copy then fails. */
+    axl_console_term_selection_clear(t);
+    test_check(axl_console_term_selection_copy(t) == AXL_ERR,
+               "term-sel: copy with no active selection fails");
+    axl_console_term_free(t);
+
+    /* A selected cell renders inverted (fg<->bg swapped). Select the blank cell (0,1)
+       so no glyph confuses the background check. */
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+    AxlGfxBuffer  *buf  = axl_gfx_buffer_new(cw * 2, ch);
+    AxlConsoleTermConfig cfg3 = { .cols = 2, .rows = 1, .target = buf };
+    AxlConsoleTerm      *t3   = axl_console_term_new(&cfg3);
+    void                *u3   = NULL;
+    const AxlConsoleOps *o3   = axl_console_term_ops(t3, &u3);
+    o3->output_text(u3, "X", 1);                  /* 'X' at (0,0); (0,1) stays blank */
+    axl_console_term_selection_start(t3, 0, 0);
+    axl_console_term_selection_extend(t3, 1, 0);  /* drag over cols 0..1 (non-empty) */
+    axl_console_term_render(t3);
+    AxlGfxPixel *px = axl_gfx_buffer_pixels(buf);
+    test_check(term_px_is_rgb(px[cw], 0xA8, 0xA8, 0xA8),
+               "term-sel: selected blank cell renders inverted bg (fg colour)");
+    axl_console_term_free(t3);
+    axl_gfx_buffer_free(buf);
+
+    /* A zero-length selection (a click with no drag: anchor == free end) must render
+       NOTHING -- otherwise a stray click paints a lone inverted cell (the char typed
+       there shows reverse-video). Only a drag highlights. */
+    AxlGfxBuffer  *cbuf = axl_gfx_buffer_new(cw * 2, ch);
+    AxlConsoleTermConfig cfg4 = { .cols = 2, .rows = 1, .target = cbuf };
+    AxlConsoleTerm      *t4   = axl_console_term_new(&cfg4);
+    void                *u4   = NULL;
+    const AxlConsoleOps *o4   = axl_console_term_ops(t4, &u4);
+    o4->output_text(u4, "X", 1);                  /* 'X' at (0,0), fg=7 on bg=0 black */
+    axl_console_term_selection_start(t4, 0, 0);
+    axl_console_term_selection_extend(t4, 0, 0);  /* click, no drag -> zero-length */
+    axl_console_term_render(t4);
+    AxlGfxPixel *cpx = axl_gfx_buffer_pixels(cbuf);
+    test_check(term_px_is_rgb(cpx[0], 0x00, 0x00, 0x00),
+               "term-sel: a zero-length selection (click) renders the cell NORMAL (bg black)");
+    test_check(axl_console_term_selection_copy(t4) == AXL_ERR,
+               "term-sel: copy of a zero-length selection fails (nothing selected)");
+    axl_console_term_free(t4);
+    axl_gfx_buffer_free(cbuf);
+}
+
+static int     s_term_zoom_calls;
+static int32_t s_term_zoom_delta;
+
+static void
+term_on_zoom(void *user, int32_t delta)
+{
+    (void)user;
+    s_term_zoom_calls++;
+    s_term_zoom_delta = delta;
+}
+
+static void
+test_console_term_interact(void)
+{
+    char out[32];
+
+    /* --- handle_hotkey ------------------------------------------------------ */
+    AxlConsoleTermConfig cfg = { .cols = 8, .rows = 3, .scrollback_rows = 10 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "0\r\n1\r\n2\r\n3\r\n4\r\n", 15);   /* 3 lines into history */
+
+    EFI_KEY_DATA pgup  = key_data(0x09, 0, EFI_SHIFT_STATE_VALID | EFI_LEFT_SHIFT_PRESSED, 0);
+    test_check(axl_console_term_handle_hotkey(t, &pgup) == true
+                   && _axl_console_term_test_scroll_off(t) == 3,
+               "term-int: Shift+PgUp consumed, scrolls back one page (rows)");
+    EFI_KEY_DATA pgdn = key_data(0x0A, 0, EFI_SHIFT_STATE_VALID | EFI_LEFT_SHIFT_PRESSED, 0);
+    test_check(axl_console_term_handle_hotkey(t, &pgdn) == true
+                   && _axl_console_term_test_scroll_off(t) == 0,
+               "term-int: Shift+PgDn consumed, scrolls forward to live");
+    EFI_KEY_DATA plain = key_data(0, 'a', 0, 0);
+    test_check(axl_console_term_handle_hotkey(t, &plain) == false,
+               "term-int: a plain key is not consumed");
+    axl_console_term_free(t);
+
+    /* Ctrl+Shift+C copies the selection. */
+    AxlConsoleTermConfig cfg2 = { .cols = 8, .rows = 2 };
+    t   = axl_console_term_new(&cfg2);
+    ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "Hi", 2);
+    axl_console_term_selection_start(t, 0, 0);
+    axl_console_term_selection_extend(t, 1, 0);
+    EFI_KEY_DATA copyk = key_data(0, 3,
+        EFI_SHIFT_STATE_VALID | EFI_LEFT_CONTROL_PRESSED | EFI_LEFT_SHIFT_PRESSED, 0);
+    test_check(axl_console_term_handle_hotkey(t, &copyk) == true,
+               "term-int: Ctrl+Shift+C consumed");
+    term_clipboard_string(out, sizeof(out));
+    test_check(axl_strcmp(out, "Hi") == 0, "term-int: Ctrl+Shift+C copied the selection");
+    axl_console_term_free(t);
+
+    /* --- handle_pointer ----------------------------------------------------- */
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+
+    /* Wheel (no Ctrl) scrolls; Ctrl+wheel zooms instead. */
+    AxlConsoleTermConfig cfg3 = { .cols = 8, .rows = 3, .scrollback_rows = 10,
+                                  .on_zoom = term_on_zoom };
+    t   = axl_console_term_new(&cfg3);
+    ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "0\r\n1\r\n2\r\n3\r\n4\r\n", 15);   /* hist_fill = 3 */
+
+    s_term_zoom_calls = 0;
+    AxlInputEvent wheel = { .type = AXL_INPUT_MOUSE_WHEEL, .wheel_dy = 2 };
+    axl_console_term_handle_pointer(t, &wheel);
+    test_check(_axl_console_term_test_scroll_off(t) == 2 && s_term_zoom_calls == 0,
+               "term-int: wheel scrolls back 2 rows, no zoom");
+
+    AxlInputEvent cwheel = { .type = AXL_INPUT_MOUSE_WHEEL, .wheel_dy = 1,
+                             .modifiers = AXL_INPUT_MOD_LCTRL };
+    axl_console_term_handle_pointer(t, &cwheel);
+    test_check(s_term_zoom_calls == 1 && s_term_zoom_delta == 1
+                   && _axl_console_term_test_scroll_off(t) == 2,
+               "term-int: Ctrl+wheel invokes on_zoom, does not scroll");
+    axl_console_term_free(t);
+
+    /* Drag: button-down then a dragging move selects a cell range; copy reflects it. */
+    AxlConsoleTermConfig cfg4 = { .cols = 8, .rows = 2 };
+    t   = axl_console_term_new(&cfg4);
+    ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "Hi", 2);
+    AxlInputEvent down = { .type = AXL_INPUT_MOUSE_BUTTON_DOWN,
+                           .buttons = AXL_INPUT_BUTTON_LEFT,
+                           .x = (int32_t)(cw / 2), .y = (int32_t)(ch / 2) };
+    axl_console_term_handle_pointer(t, &down);
+    AxlInputEvent move = { .type = AXL_INPUT_MOUSE_MOVE, .dragging = true,
+                           .x = (int32_t)(cw + cw / 2), .y = (int32_t)(ch / 2) };
+    axl_console_term_handle_pointer(t, &move);
+    AxlInputEvent up = { .type = AXL_INPUT_MOUSE_BUTTON_UP,
+                         .x = (int32_t)(cw + cw / 2), .y = (int32_t)(ch / 2) };
+    axl_console_term_handle_pointer(t, &up);   /* release AFTER a real drag: keep it */
+    test_check(axl_console_term_selection_copy(t) == AXL_OK, "term-int: drag+release keeps the selection");
+    term_clipboard_string(out, sizeof(out));
+    test_check(axl_strcmp(out, "Hi") == 0, "term-int: drag-select spans cols 0..1 == 'Hi'");
+    axl_console_term_free(t);
+
+    /* A plain click (button-down then up, no drag) must leave NO lingering selection
+       -- otherwise a stray click paints a permanently-inverted cell. */
+    AxlConsoleTermConfig cfg5 = { .cols = 8, .rows = 2 };
+    t   = axl_console_term_new(&cfg5);
+    ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "Hi", 2);
+    AxlInputEvent cdn = { .type = AXL_INPUT_MOUSE_BUTTON_DOWN, .buttons = AXL_INPUT_BUTTON_LEFT,
+                          .x = (int32_t)(cw / 2), .y = (int32_t)(ch / 2) };
+    AxlInputEvent cup = { .type = AXL_INPUT_MOUSE_BUTTON_UP,
+                          .x = (int32_t)(cw / 2), .y = (int32_t)(ch / 2) };
+    axl_console_term_handle_pointer(t, &cdn);
+    axl_console_term_handle_pointer(t, &cup);
+    test_check(axl_console_term_selection_copy(t) == AXL_ERR,
+               "term-int: a plain click (no drag) leaves no selection");
+    axl_console_term_free(t);
+}
+
+static void
+test_console_term_bounds(void)
+{
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+
+    /* A 4x2 grid rendered into a target, but bounds clip it to 2 cols x 1 row:
+       cells outside [0,2*cw) x [0,ch) must NOT be painted. */
+    AxlGfxBuffer *buf = axl_gfx_buffer_new(cw * 4, ch * 2);
+    axl_gfx_buffer_clear(buf, AXL_GFX_RGB(0xFF, 0x00, 0xFF));   /* magenta sentinel */
+    AxlConsoleTermConfig cfg = { .cols = 4, .rows = 2, .target = buf,
+                                 .x = 0, .y = 0, .w = cw * 2, .h = ch };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "ABCD\r\nE", 7);   /* row 0 = ABCD, row 1 = E (both dirty) */
+    axl_console_term_render(t);
+
+    AxlGfxPixel *px    = axl_gfx_buffer_pixels(buf);
+    uint32_t     w_px  = cw * 4;
+    test_check(term_px_is_rgb(px[0], 0x00, 0x00, 0x00),
+               "term-bounds: in-bounds cell (0,0) painted");
+    test_check(term_px_is_rgb(px[2 * cw], 0xFF, 0x00, 0xFF),
+               "term-bounds: cell past w (col 2) NOT painted (bounds clip)");
+    test_check(term_px_is_rgb(px[(size_t)ch * w_px], 0xFF, 0x00, 0xFF),
+               "term-bounds: row past h (row 1) NOT painted (bounds clip)");
+
+    /* pixel_to_cell rejects clicks outside the bounds. */
+    AxlInputEvent down = { .type = AXL_INPUT_MOUSE_BUTTON_DOWN,
+                           .buttons = AXL_INPUT_BUTTON_LEFT,
+                           .x = (int32_t)(cw * 3), .y = 0 };   /* col 3, outside w=2*cw */
+    axl_console_term_handle_pointer(t, &down);
+    test_check(axl_console_term_selection_copy(t) == AXL_ERR,
+               "term-bounds: click outside bounds starts no selection");
+
+    axl_console_term_free(t);
+    axl_gfx_buffer_free(buf);
+}
+
+static void
+test_console_term_autogeom(void)
+{
+    const AxlFont *font = axl_gfx_default_font();
+    uint32_t       cw   = font->cell_width;
+    uint32_t       ch   = font->cell_height;
+
+    /* Zeroed cols/rows derive geometry from the target buffer + font metrics. */
+    AxlGfxBuffer *buf = axl_gfx_buffer_new(cw * 10, ch * 4);
+    AxlConsoleTermConfig cfg = { .target = buf };   /* cols/rows = 0 -> auto */
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    uint32_t cols, rows;
+    _axl_console_term_test_geometry(t, &cols, &rows, NULL, NULL, NULL, NULL, NULL, NULL);
+    test_check(cols == 10 && rows == 4,
+               "term-auto: zeroed geometry derived from target buffer + font");
+    axl_console_term_free(t);
+    axl_gfx_buffer_free(buf);
+}
+
+static void
+test_console_term_resize_oom(void)
+{
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5, .scrollback_rows = 8 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+
+    /* Fail the 3rd alloc inside resize = the history reallocation (screen, dirty,
+       THEN history on a column change). The resize must roll back atomically so the
+       screen/history strides never mismatch (which would overflow on the next
+       scroll); geometry stays 20x5. */
+    axl_mem_fail_next_alloc(3);
+    axl_console_term_resize(t, 40, 10);
+    uint32_t cols, rows;
+    _axl_console_term_test_geometry(t, &cols, &rows, NULL, NULL, NULL, NULL, NULL, NULL);
+    test_check(cols == 20 && rows == 5,
+               "term-oom: resize history-alloc OOM leaves geometry unchanged (atomic)");
+
+    /* The ring is still 20-wide + consistent: scroll past the screen writes in-bounds
+       (a mismatched stride would corrupt the heap fence, caught at free). */
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+    ops->output_text(u, "0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n", 21);
+    char c[5];
+    test_check(_axl_console_term_test_hist_cell(t, 1, 0, c) && c[0] != '\0',
+               "term-oom: history ring consistent after rolled-back resize");
+
+    axl_console_term_free(t);
+}
+
+/* The public header exposes AXL-owned aliases for the KeyShiftState bits so a
+   tool that includes only <axl.h> can name the modifier inject_key_ex carries,
+   without reaching into the EDK2/UEFI headers. Pin each alias to its EFI_*
+   counterpart so the two can never drift. */
+static void
+test_console_tap_shift_state_aliases(void)
+{
+    test_check(AXL_CONSOLE_SHIFT_STATE_VALID == EFI_SHIFT_STATE_VALID,
+               "shift_alias: AXL_CONSOLE_SHIFT_STATE_VALID == EFI_SHIFT_STATE_VALID");
+    test_check(AXL_CONSOLE_RIGHT_SHIFT_PRESSED == EFI_RIGHT_SHIFT_PRESSED,
+               "shift_alias: AXL_CONSOLE_RIGHT_SHIFT_PRESSED == EFI_RIGHT_SHIFT_PRESSED");
+    test_check(AXL_CONSOLE_LEFT_SHIFT_PRESSED == EFI_LEFT_SHIFT_PRESSED,
+               "shift_alias: AXL_CONSOLE_LEFT_SHIFT_PRESSED == EFI_LEFT_SHIFT_PRESSED");
+    test_check(AXL_CONSOLE_RIGHT_CONTROL_PRESSED == EFI_RIGHT_CONTROL_PRESSED,
+               "shift_alias: AXL_CONSOLE_RIGHT_CONTROL_PRESSED == EFI_RIGHT_CONTROL_PRESSED");
+    test_check(AXL_CONSOLE_LEFT_CONTROL_PRESSED == EFI_LEFT_CONTROL_PRESSED,
+               "shift_alias: AXL_CONSOLE_LEFT_CONTROL_PRESSED == EFI_LEFT_CONTROL_PRESSED");
+    test_check(AXL_CONSOLE_RIGHT_ALT_PRESSED == EFI_RIGHT_ALT_PRESSED,
+               "shift_alias: AXL_CONSOLE_RIGHT_ALT_PRESSED == EFI_RIGHT_ALT_PRESSED");
+    test_check(AXL_CONSOLE_LEFT_ALT_PRESSED == EFI_LEFT_ALT_PRESSED,
+               "shift_alias: AXL_CONSOLE_LEFT_ALT_PRESSED == EFI_LEFT_ALT_PRESSED");
+}
+
+// ---------------------------------------------------------------------------
+// Alt-screen (explicit + auto heuristic) + input capture. The tap asserts the
+// alt-screen (SIMPLE_TEXT_OUTPUT cannot express it); the encoder emits 1049h/l.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_mirror_altscreen_input(void)
+{
+    /* --- Explicit alt-screen: emission + idempotency, via the mirror API. --- */
+    AxlConsoleTap *t = cm_tap_begin(80, 25, /*auto_alt=*/false,
+                                    /*input_capture=*/false, /*passthrough=*/false);
+    cm_cap_reset();
+    test_check(!axl_console_mirror_in_alt_screen(cm_enc), "altscreen: starts outside");
+    axl_console_mirror_enter_alt_screen(cm_enc);
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049h") == 0,
+               "altscreen: enter emits exactly ESC[?1049h");
+    test_check(axl_console_mirror_in_alt_screen(cm_enc), "altscreen: in_alt after enter");
+
+    cm_cap_reset();
+    axl_console_mirror_enter_alt_screen(cm_enc);   /* idempotent */
+    test_check(cm_cap[0] == '\0', "altscreen: second enter emits nothing");
+
+    cm_cap_reset();
+    axl_console_mirror_leave_alt_screen(cm_enc);
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049l") == 0,
+               "altscreen: leave emits exactly ESC[?1049l");
+    test_check(!axl_console_mirror_in_alt_screen(cm_enc), "altscreen: out after leave");
+
+    cm_cap_reset();
+    axl_console_mirror_leave_alt_screen(cm_enc);   /* idempotent */
+    test_check(cm_cap[0] == '\0', "altscreen: second leave emits nothing");
+    cm_tap_end(t);
+
+    /* --- Auto heuristic (bracket a full-screen app): a clear alone must NOT enter
+       (the mirror-from-boot latch bug); enter on a backward cursor jump after a
+       clear (a TUI repaint); leave on a newline (linear shell flow resumes).
+       Op-sequences are the real ones captured from `edit` on a 160x50 console. --- */
+    t = cm_tap_begin(160, /*rows=*/50, /*auto_alt=*/true, false, false);
+
+    /* (1) Boot / shell prompt: ClearScreen then a prompt at the top row is not a
+       full-screen app -- no ESC[?1049h may be emitted (this is the boot latch). */
+    cm_cap_reset();
+    _axl_console_tap_test_clear();
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("FS0:\\> ");
+    test_check(axl_strstr(cm_cap, "\x1b[?1049h") == NULL,
+               "auto: a clear + top-row prompt does NOT enter the alt-screen (no boot latch)");
+    test_check(!axl_console_tap_in_alt_screen(t), "auto: not in alt after a prompt clear");
+
+    /* (2) Full-screen app: clear, paint the title, drop to the status row (forward),
+       then jump BACK UP -- the backward jump is the TUI signal that enters. */
+    cm_cap_reset();
+    _axl_console_tap_test_clear();
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("UEFI Editor");   /* title bar, no newline */
+    _axl_console_tap_test_set_cursor(0, 49);     /* status row (forward, r 0->49) */
+    test_check(axl_strstr(cm_cap, "\x1b[?1049h") == NULL,
+               "auto: clear + forward addressing (title/status) does not enter yet");
+    _axl_console_tap_test_set_cursor(0, 1);      /* BACKWARD jump 49->1: TUI repaint */
+    test_check(axl_strstr(cm_cap, "\x1b[?1049h") != NULL,
+               "auto: a backward cursor jump after a clear enters the alt-screen");
+    test_check(axl_console_tap_in_alt_screen(t), "auto: in alt-screen after the backward jump");
+
+    /* (3) App exits: clear, the shell redraws its prompt (no newline yet -> still
+       in alt), then the first NEWLINE (a command runs) is linear flow -> leave. */
+    cm_cap_reset();
+    _axl_console_tap_test_clear();
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("FS0:\\> ver");   /* prompt echo, no newline */
+    test_check(axl_strstr(cm_cap, "\x1b[?1049l") == NULL,
+               "auto: a clear + prompt with no newline does not leave yet");
+    test_check(axl_console_tap_in_alt_screen(t), "auto: still in alt until linear flow resumes");
+    _axl_console_tap_test_puts("\r\n");          /* newline -> linear flow */
+    test_check(axl_strstr(cm_cap, "\x1b[?1049l") != NULL,
+               "auto: a newline (linear flow) leaves the alt-screen");
+    test_check(!axl_console_tap_in_alt_screen(t), "auto: left alt-screen on newline");
+    cm_tap_end(t);
+
+    /* (4) End-to-end mirror-from-boot: boot + cls + prompts stay OUT of the
+       alt-screen, and a full-screen app is bracketed by exactly one enter/leave. */
+    t = cm_tap_begin(160, 50, /*auto_alt=*/true, false, false);
+    cm_cap_reset();
+    _axl_console_tap_test_clear();                        /* boot clear */
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("FS0:\\> cls\r\n");        /* prompt + a command */
+    _axl_console_tap_test_clear();                        /* cls */
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("FS0:\\> ");               /* prompt */
+    test_check(axl_strstr(cm_cap, "\x1b[?1049h") == NULL,
+               "mirror-from-boot: boot + cls + prompt never enters the alt-screen");
+    test_check(!axl_console_tap_in_alt_screen(t), "mirror-from-boot: outside alt after boot/cls");
+
+    cm_cap_reset();
+    _axl_console_tap_test_clear();                        /* edit enters */
+    _axl_console_tap_test_set_cursor(0, 49);
+    _axl_console_tap_test_set_cursor(0, 1);               /* backward -> enter */
+    _axl_console_tap_test_clear();                        /* edit exits, clears */
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("FS0:\\> ver\r\n");        /* prompt + newline -> leave */
+    const char *he = axl_strstr(cm_cap, "\x1b[?1049h");
+    const char *le = axl_strstr(cm_cap, "\x1b[?1049l");
+    test_check(he != NULL && le != NULL && he < le,
+               "mirror-from-boot: one enter/leave pair brackets the full-screen app");
+    test_check(!axl_console_tap_in_alt_screen(t), "mirror-from-boot: ends outside the alt-screen");
+    cm_tap_end(t);
+
+    /* --- Input capture: true serves ONLY the inject ring. --- */
+    t = cm_tap_begin(80, 25, false, /*input_capture=*/true, false);
+    _axl_console_tap_test_set_stub_conin(t, /*always_key=*/true);
+    test_check(_axl_console_tap_test_read_key(t) != 0,
+               "input_capture: read returns NOT_READY (ignores physical key)");
+    axl_console_tap_inject_key(t, 0, 'x');
+    test_check(_axl_console_tap_test_read_key(t) == 0,
+               "input_capture: read serves an injected key");
+    test_check(_axl_console_tap_test_read_key(t) != 0,
+               "input_capture: ring drained -> NOT_READY again");
+    _axl_console_tap_test_pump(t);   /* the WaitForKey notify */
+    test_check(_axl_console_tap_test_read_key(t) != 0,
+               "input_capture: pump does not poll the physical keyboard");
+    cm_tap_end(t);
+
+    /* Sanity: capture off (default) DOES fall through to the physical key. */
+    t = cm_tap_begin(80, 25, false, /*input_capture=*/false, false);
+    _axl_console_tap_test_set_stub_conin(t, /*always_key=*/true);
+    test_check(_axl_console_tap_test_read_key(t) == 0,
+               "input_capture off: read falls through to the physical key");
+    cm_tap_end(t);
+}
+
+// ---------------------------------------------------------------------------
+// Control-character sanitization. EDK2's TerminalConOut.c substitutes '?' for any
+// char that is neither printable (>= 0x20) nor one of {NUL, BS, TAB, LF, CR}; a
+// literal ESC is emitted ONLY when the driver itself is writing a control string
+// (TerminalDevice->OutputEscChar). So a UEFI app CANNOT push raw VT through
+// OutputString. Forwarding ESC verbatim would both diverge from firmware
+// semantics and let an app printing a user-controlled string inject escapes into
+// the consumer's terminal (e.g. "\x1b[2J" clearing a remote xterm).
+// ---------------------------------------------------------------------------
+
+static void
+test_console_tap_sanitize(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, false, /*passthrough=*/false);
+
+    cm_cap_reset();
+    _axl_console_tap_test_puts("\x1b[2J");
+    test_check(axl_strcmp(cm_cap, "?[2J") == 0,
+               "sanitize: ESC becomes '?' (no escape injection through output_text)");
+
+    cm_cap_reset();
+    _axl_console_tap_test_puts("\x07x");   /* BEL */
+    test_check(axl_strcmp(cm_cap, "?x") == 0,
+               "sanitize: other C0 control chars become '?'");
+
+    cm_cap_reset();
+    _axl_console_tap_test_puts("a\bb\tc\rd\ne");
+    test_check(axl_strcmp(cm_cap, "a\bb\tc\rd\ne") == 0,
+               "sanitize: BS/TAB/CR/LF pass through (the EFI control chars)");
+
+    /* The substituted '?' is printable, so it advances the cursor like EDK2's does. */
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("\x1b");
+    int32_t col = -1, row = -1;
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 1 && row == 0,
+               "sanitize: the substituted '?' advances the cursor (EDK2 parity)");
+
+    cm_tap_end(t);
+}
+
+// ---------------------------------------------------------------------------
+// The tap must OWN its SIMPLE_TEXT_OUTPUT_MODE when it is the only console
+// writer. REGRESSION: install did `my_conout = *orig_conout`, which aliases the
+// ORIGINAL's Mode pointer; the original driver is the only thing that maintains
+// CursorRow/CursorColumn/Attribute/CursorVisible, so with passthrough_local=false
+// that state froze and a nested Shell scribbled over itself (AGT axterm P4 spike).
+// ---------------------------------------------------------------------------
+
+static void
+test_console_mirror_owned_mode(void)
+{
+    /* 80x4 so autowrap + scroll clamp are cheap to drive. */
+    AxlConsoleTap *t = cm_tap_begin(80, 4, false, false, /*passthrough=*/false);
+
+    test_check(_axl_console_tap_test_mode_owned(t),
+               "owned_mode: passthrough off -> tap owns its Mode, not the original's");
+
+    int32_t col = -1, row = -1;
+    _axl_console_tap_test_clear();
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 0 && row == 0, "owned_mode: ClearScreen homes the Mode cursor");
+
+    _axl_console_tap_test_set_cursor(5, 3);
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 5 && row == 3, "owned_mode: SetCursorPosition updates the Mode cursor");
+
+    /* Text must advance the cursor — the job GraphicsConsole used to do for us. */
+    _axl_console_tap_test_set_cursor(0, 0);
+    _axl_console_tap_test_puts("ab");
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 2 && row == 0, "owned_mode: printable text advances the column");
+
+    _axl_console_tap_test_puts("\r");
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 0 && row == 0, "owned_mode: CR homes the column");
+
+    _axl_console_tap_test_puts("\n");
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 0 && row == 1, "owned_mode: LF advances the row");
+
+    _axl_console_tap_test_set_cursor(79, 0);
+    _axl_console_tap_test_puts("xy");
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 1 && row == 1, "owned_mode: column autowraps onto the next row");
+
+    _axl_console_tap_test_set_cursor(0, 3);
+    _axl_console_tap_test_puts("\n\n");
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(row == 3, "owned_mode: row clamps at the last line (the console scrolls)");
+
+    _axl_console_tap_test_set_attr(0x1F);
+    test_check(_axl_console_tap_test_get_attr(t) == 0x1F,
+               "owned_mode: SetAttribute updates Mode.Attribute");
+    _axl_console_tap_test_enable_cursor(false);
+    test_check(!_axl_console_tap_test_get_cursor_visible(t),
+               "owned_mode: EnableCursor updates Mode.CursorVisible");
+
+    /* And the ORIGINAL's Mode is never touched — we never called into it. */
+    int32_t ocol = -1, orow = -1;
+    _axl_console_tap_test_orig_cursor(&ocol, &orow);
+    test_check(ocol == 0 && orow == 0,
+               "owned_mode: passthrough off never writes the original Mode");
+    cm_tap_end(t);
+
+    /* passthrough_local = true keeps aliasing the original's Mode (the SoftBMC
+       path — the real console driver maintains it). Unchanged behavior. */
+    t = cm_tap_begin(80, 25, false, false, /*passthrough=*/true);
+    test_check(!_axl_console_tap_test_mode_owned(t),
+               "owned_mode: passthrough on still aliases the original Mode");
+    cm_tap_end(t);
+}
+
+// ---------------------------------------------------------------------------
+// The tap as an AxlConsoleOps producer. Pins the three observable facts of the
+// widened contract: it declares its cell-boundary rule once at bind, it reports
+// SetAttribute as an INDEXED pen snapshot (not a raw fg/bg split), and it reports
+// the alternate screen as a term-prop rather than a dedicated op. Driven against a
+// custom probe vtable bound over a headless tap (never installs the live console).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlConsoleCellRule rule;
+    int                rule_calls;
+    AxlConsolePen      pen;
+    int                pen_calls;
+    bool               alt;
+    int                prop_calls;
+} TapOpsProbe;
+
+static void probe_cell_rule(void *u, AxlConsoleCellRule r)
+{
+    TapOpsProbe *p = u; p->rule = r; p->rule_calls++;
+}
+
+static void probe_set_pen(void *u, const AxlConsolePen *pen)
+{
+    TapOpsProbe *p = u; p->pen = *pen; p->pen_calls++;
+}
+
+static int probe_set_term_prop(void *u, AxlConsoleProp prop, const AxlConsoleValue *v)
+{
+    TapOpsProbe *p = u;
+    p->prop_calls++;
+    if (prop == AXL_CONSOLE_PROP_ALT_SCREEN) p->alt = v->u.boolean;
+    return 1;
+}
+
+static void
+test_tap_reports_one_cell_per_codepoint(void)
+{
+    TapOpsProbe probe = {0};
+    AxlConsoleOps ops = { .set_cell_rule = probe_cell_rule };
+    AxlConsoleTap *t = _axl_console_tap_new_for_test();
+    _axl_console_tap_test_setup(t, &ops, &probe, 80, 25, false, false);
+
+    test_check(probe.rule_calls == 1, "set_cell_rule reported exactly once");
+    test_check(probe.rule == AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT,
+               "tap is one-cell-per-codepoint");
+
+    _axl_console_tap_test_teardown();
+    axl_free(t);
+}
+
+static void
+test_tap_set_attribute_becomes_indexed_pen(void)
+{
+    TapOpsProbe probe = {0};
+    AxlConsoleOps ops = { .set_pen = probe_set_pen };
+    AxlConsoleTap *t = _axl_console_tap_new_for_test();
+    _axl_console_tap_test_setup(t, &ops, &probe, 80, 25, false, false);
+
+    /* UEFI attribute 0x1E = fg 0x0E (yellow), bg 0x1 (blue). */
+    _axl_console_tap_test_set_attr(0x1E);
+
+    test_check(probe.pen_calls == 1, "set_pen called once");
+    test_check(probe.pen.fg.kind == AXL_CONSOLE_COLOR_INDEXED, "fg is indexed");
+    test_check(probe.pen.fg.idx == 0x0E, "fg index 14");
+    test_check(probe.pen.bg.kind == AXL_CONSOLE_COLOR_INDEXED, "bg is indexed");
+    test_check(probe.pen.bg.idx == 0x01, "bg index 1");
+    test_check(!probe.pen.bold && !probe.pen.italic && !probe.pen.blink,
+               "tap never sets style bits");
+
+    _axl_console_tap_test_teardown();
+    axl_free(t);
+}
+
+static void
+test_tap_alt_screen_is_a_term_prop(void)
+{
+    TapOpsProbe probe = {0};
+    AxlConsoleOps ops = { .set_term_prop = probe_set_term_prop };
+    AxlConsoleTap *t = _axl_console_tap_new_for_test();
+    _axl_console_tap_test_setup(t, &ops, &probe, 80, 25, false, false);
+
+    axl_console_tap_enter_alt_screen(t);
+    test_check(probe.prop_calls == 1, "enter reported one prop");
+    test_check(probe.alt == true, "alt screen entered");
+
+    axl_console_tap_enter_alt_screen(t);
+    test_check(probe.prop_calls == 1, "enter is idempotent");
+
+    axl_console_tap_leave_alt_screen(t);
+    test_check(probe.prop_calls == 2, "leave reported one prop");
+    test_check(probe.alt == false, "alt screen left");
+
+    _axl_console_tap_test_teardown();
+    axl_free(t);
+}
+
+// ---------------------------------------------------------------------------
+// GOLDEN VT STREAM. Pins the exact bytes the encoder emits for a scripted run of
+// console calls. Acceptance guard for the tap split: SoftBMC's wire output must
+// stay byte-identical, and any encoder change must be deliberate.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_mirror_golden_vt(void)
+{
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, false, /*passthrough=*/false);
+    cm_cap_reset();
+
+    _axl_console_tap_test_clear();          /* ESC[2J ESC[H             */
+    _axl_console_tap_test_set_cursor(0, 0); /* deduped -> emits NOTHING */
+    _axl_console_tap_test_set_cursor(10, 5);/* ESC[6;11H (1-based)      */
+    _axl_console_tap_test_puts("Hi");       /* raw UTF-8                */
+    _axl_console_tap_test_set_attr(0x1F);   /* fg 15 -> 97, bg 1 -> 44  */
+    _axl_console_tap_test_enable_cursor(false); /* ESC[?25l             */
+    axl_console_mirror_enter_alt_screen(cm_enc);/* ESC[?1049h           */
+    axl_console_mirror_leave_alt_screen(cm_enc);/* ESC[?1049l           */
+
+    test_check(axl_strcmp(cm_cap,
+                          "\x1b[2J\x1b[H"
+                          "\x1b[6;11H"
+                          "Hi"
+                          "\x1b[0;97;44m"
+                          "\x1b[?25l"
+                          "\x1b[?1049h"
+                          "\x1b[?1049l") == 0,
+               "golden_vt: emitted stream is byte-identical to the pinned golden");
+    cm_tap_end(t);
+}
+
+/* The late-join snapshot: the mirror keeps an internal screen model fed from its
+   own emitted VT, and serializes it as a self-contained repaint. */
+static void
+test_console_mirror_snapshot(void)
+{
+    AxlConsoleTap    *t   = cm_tap_begin(80, 25, /*auto_alt=*/false, false,
+                                         /*passthrough=*/false);
+    AxlConsoleScreen *scr = _axl_console_mirror_test_screen(cm_enc);
+    test_check(scr != NULL, "mirror_snapshot: mirror owns an internal screen model");
+
+    test_check(axl_console_mirror_snapshot(NULL, cm_cap_sink, NULL) == AXL_ERR,
+               "mirror_snapshot: NULL mirror rejected");
+    test_check(axl_console_mirror_snapshot(cm_enc, NULL, NULL) == AXL_ERR,
+               "mirror_snapshot: NULL sink rejected");
+
+    /* Drive console content; the mirror tees its emitted VT into the model. */
+    _axl_console_tap_test_clear();
+    _axl_console_tap_test_set_cursor(5, 2);       /* col 5, row 2 */
+    _axl_console_tap_test_set_attr(0x04);         /* fg red */
+    _axl_console_tap_test_puts("HELLO");
+    _axl_console_tap_test_enable_cursor(false);   /* ESC[?25l */
+
+    /* The internal model tracks the content, cursor, and visibility. */
+    char          g[8] = {0};
+    AxlConsolePen pen  = {0};
+    test_check(_axl_console_screen_test_cell(scr, 2, 5, g, &pen) && axl_strcmp(g, "H") == 0,
+               "mirror_snapshot: internal screen has 'H' at (2,5)");
+    test_check(pen.fg.kind == AXL_CONSOLE_COLOR_INDEXED,
+               "mirror_snapshot: 'HELLO' carries an indexed foreground");
+    uint32_t cr = 0, cc = 0;
+    bool     vis = true;
+    _axl_console_screen_test_cursor(scr, &cr, &cc, &vis);
+    test_check(cr == 2 && cc == 10, "mirror_snapshot: cursor tracked at (2,10)");
+    test_check(!vis, "mirror_snapshot: cursor-hidden tracked");
+
+    /* Snapshot reproduces it: feed the repaint into a fresh screen. */
+    cm_cap_reset();
+    test_check(axl_console_mirror_snapshot(cm_enc, cm_cap_sink, NULL) == AXL_OK,
+               "mirror_snapshot: returns AXL_OK");
+    AxlConsoleScreen *chk = NULL;
+    axl_console_screen_new(&chk, 25, 80);
+    axl_console_screen_feed(chk, (const uint8_t *)cm_cap, cm_cap_len);
+    AxlConsolePen pen2 = {0};
+    test_check(_axl_console_screen_test_cell(chk, 2, 5, g, &pen2) && axl_strcmp(g, "H") == 0,
+               "mirror_snapshot: repaint reproduces 'H' at (2,5)");
+    test_check(pen2.fg.kind == AXL_CONSOLE_COLOR_INDEXED,
+               "mirror_snapshot: repaint round-trips the indexed foreground");
+    _axl_console_screen_test_cursor(chk, &cr, &cc, &vis);
+    test_check(cr == 2 && cc == 10 && !vis,
+               "mirror_snapshot: repaint reproduces cursor + hidden state");
+    axl_console_screen_free(chk);
+
+    /* set_size resizes the internal model to the tap's resolved geometry — the
+       reason this lives in the SDK and not a consumer-side parallel parser. */
+    axl_console_mirror_set_size(cm_enc, 40, 10);
+    uint32_t rows = 0, cols = 0;
+    _axl_console_screen_test_geometry(scr, &rows, &cols);
+    test_check(rows == 10 && cols == 40,
+               "mirror_snapshot: set_size resizes the internal screen");
+    uint32_t tcols = 0, trows = 0;
+    axl_console_tap_get_size(t, &tcols, &trows);
+    test_check(tcols == 40 && trows == 10,
+               "mirror_snapshot: tap_get_size reports the resolved geometry");
+
+    /* Alt-screen transitions flow into the model through the emitted stream. */
+    axl_console_mirror_enter_alt_screen(cm_enc);
+    test_check(_axl_console_screen_test_alt(scr),
+               "mirror_snapshot: enter_alt_screen tracked in the model");
+    axl_console_mirror_leave_alt_screen(cm_enc);
+    test_check(!_axl_console_screen_test_alt(scr),
+               "mirror_snapshot: leave_alt_screen tracked in the model");
+
+    cm_tap_end(t);
 }
 
 // ---------------------------------------------------------------------------
@@ -7929,6 +9689,34 @@ test_util_main(int argc, char **argv)
     test_shell_launch();
     test_shell_kind();
     test_console_mirror();
+    test_console_tap_guards();
+    test_console_device_guards();
+    test_console_tap_key_notify();
+    test_console_tap_key_notify_wildcard();
+    test_console_tap_key_notify_passthrough_not_owned();
+    test_console_tap_inject_key_ex_guards();
+    test_console_device_input();
+    test_console_device_pointer_evict();
+    test_console_device_read_loop_revalidate();
+    test_console_term_output();
+    test_console_term_scrollback();
+    test_console_term_render();
+    test_console_term_mouse_cursor();
+    test_console_term_reflow();
+    test_console_term_selection();
+    test_console_term_interact();
+    test_console_term_bounds();
+    test_console_term_autogeom();
+    test_console_term_resize_oom();
+    test_console_tap_shift_state_aliases();
+    test_console_mirror_altscreen_input();
+    test_console_tap_sanitize();
+    test_console_mirror_owned_mode();
+    test_tap_reports_one_cell_per_codepoint();
+    test_tap_set_attribute_becomes_indexed_pen();
+    test_tap_alt_screen_is_a_term_prop();
+    test_console_mirror_golden_vt();
+    test_console_mirror_snapshot();
     test_image_verify_signature();
     test_image_verify_cn_extract();
     test_hexdump();
