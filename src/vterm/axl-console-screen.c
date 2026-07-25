@@ -53,9 +53,23 @@ struct AxlConsoleScreen {
     AxlConsolePen pen;            /* current pen (the next glyph's rendition) */
 };
 
+/* The snapshot serializes ~rows*cols cells; without coalescing that fanned out as
+   one sink call (one WS frame) per cell — a cleared 80x25 with a non-default
+   background became ~2000 tiny frames. Route every emit through a buffering VT
+   sink that delivers the repaint to the caller's sink in SNAPSHOT_CHUNK-sized
+   pieces. Frame count drops from per-cell to per-chunk. */
+#define SNAPSHOT_CHUNK  (4u * 1024u)
+
+/* Byte-level run coalescing thresholds (bytes are secondary to frame count, so
+   these only fire on clear wins). A run of >= REP_RUN_MIN identical glyphs
+   collapses to one glyph + REP (CSI n b, repeat). A blank run of >= ECH_RUN_MIN
+   cells collapses to ECH + CUF (CSI n X erase-to-bg, CSI n C advance) — which,
+   unlike emitting N spaces, round-trips back to N *blank* cells, not N spaces. */
+#define REP_RUN_MIN  4u
+#define ECH_RUN_MIN  8u
+
 typedef struct {
-    AxlConsoleScreenSink sink;
-    void                *user;
+    AxlConsoleVtBuf vb;   /* buffering sink: per-cell writes -> few sink calls */
 } Emitter;
 
 // ---------------------------------------------------------------------------
@@ -310,19 +324,16 @@ static const AxlConsoleOps screen_ops = {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-int
-axl_console_screen_new(AxlConsoleScreen **out, uint32_t rows, uint32_t cols)
+AxlConsoleScreen *
+axl_console_screen_new(uint32_t rows, uint32_t cols)
 {
-    if (out != NULL) {
-        *out = NULL;
-    }
-    if (out == NULL || rows == 0 || cols == 0 || rows > INT32_MAX || cols > INT32_MAX) {
-        return AXL_ERR;
+    if (rows == 0 || cols == 0 || rows > INT32_MAX || cols > INT32_MAX) {
+        return NULL;
     }
 
     AxlConsoleScreen *s = axl_calloc(1, sizeof(*s));
     if (s == NULL) {
-        return AXL_ERR;
+        return NULL;
     }
     s->rows = rows;
     s->cols = cols;
@@ -333,20 +344,20 @@ axl_console_screen_new(AxlConsoleScreen **out, uint32_t rows, uint32_t cols)
         axl_free(s->primary);
         axl_free(s->alternate);
         axl_free(s);
-        return AXL_ERR;
+        return NULL;
     }
     s->active = s->primary;
 
     /* Binds the grid ops and fires set_cell_rule before returning. */
-    if (axl_vterm_new(&s->vt, (int32_t)rows, (int32_t)cols, &screen_ops, s) != AXL_OK) {
+    s->vt = axl_vterm_new((int32_t)rows, (int32_t)cols, &screen_ops, s);
+    if (s->vt == NULL) {
         axl_free(s->primary);
         axl_free(s->alternate);
         axl_free(s);
-        return AXL_ERR;
+        return NULL;
     }
 
-    *out = s;
-    return AXL_OK;
+    return s;
 }
 
 void
@@ -378,15 +389,41 @@ axl_console_screen_feed(AxlConsoleScreen *s, const uint8_t *bytes, size_t len)
 static void
 emit(Emitter *e, const char *bytes, size_t len)
 {
-    if (len > 0) {
-        e->sink(bytes, len, e->user);
-    }
+    axl_console_vt_buf_emit(&e->vb, bytes, len);   /* len==0 handled inside */
 }
 
 static void
 emit_cstr(Emitter *e, const char *str)
 {
     emit(e, str, axl_strlen(str));
+}
+
+/* REP (CSI Ps b): repeat the last emitted glyph @p count more times. Replay
+   putglyph's the same char with the current pen, so a run of identical cells
+   round-trips exactly. */
+static void
+emit_rep(Emitter *e, uint32_t count)
+{
+    char buf[16];
+    int  n = axl_snprintf(buf, sizeof(buf), "\x1b[%ub", (unsigned)count);
+    if (n > 0) {
+        emit(e, buf, (size_t)n);
+    }
+}
+
+/* A blank run: ECH (CSI Ps X) erases @p n cells to the current pen's background,
+   then CUF (CSI Ps C) advances the cursor past them. Round-trips to @p n blank
+   cells (len 0) — unlike emitting @p n spaces, which would replay as space
+   glyphs. */
+static void
+emit_ech_cuf(Emitter *e, uint32_t n)
+{
+    char buf[32];
+    int  k = axl_snprintf(buf, sizeof(buf), "\x1b[%uX\x1b[%uC",
+                          (unsigned)n, (unsigned)n);
+    if (k > 0) {
+        emit(e, buf, (size_t)k);
+    }
 }
 
 /* The pen snapshot -> a full SGR escape, via the encoder shared with the mirror. */
@@ -418,8 +455,27 @@ cell_emittable(const ScreenCell *cell)
     return !cell->cont && (cell->len > 0 || !pen_is_default(&cell->pen));
 }
 
+/* Two width-1 cells are run-mergeable when @p b is not a wide continuation and
+   carries the same glyph bytes and pen as @p a — the caller separately confirms
+   @p b is itself width-1 (its next cell is not a continuation). */
+static bool
+run_cell_eq(const ScreenCell *a, const ScreenCell *b)
+{
+    if (b->cont || a->len != b->len) {
+        return false;
+    }
+    for (uint8_t i = 0; i < a->len; i++) {
+        if (a->utf8[i] != b->utf8[i]) {
+            return false;
+        }
+    }
+    return pen_eq(&a->pen, &b->pen);
+}
+
 /* Repaint one grid: a coalesced clear+cell walk into @p e, tracking the last
-   emitted pen in @p *cur so a run of same-pen cells collapses under one SGR. */
+   emitted pen in @p *cur so a run of same-pen cells collapses under one SGR. A
+   run of identical width-1 cells further collapses to one glyph + REP (glyphs)
+   or ECH + CUF (blanks) instead of one write per cell. */
 static void
 emit_grid(Emitter *e, const AxlConsoleScreen *s, const ScreenCell *grid, AxlConsolePen *cur)
 {
@@ -441,24 +497,68 @@ emit_grid(Emitter *e, const AxlConsoleScreen *s, const ScreenCell *grid, AxlCons
         while ((int32_t)c <= last) {
             const ScreenCell *cell = &grid[r * s->cols + c];
             if (cell->cont) {
-                c++;
+                c++;   /* a stray continuation never starts a run */
                 continue;
             }
             if (!pen_eq(&cell->pen, cur)) {
                 emit_sgr(e, &cell->pen);
                 *cur = cell->pen;
             }
-            if (cell->len > 0) {
-                emit(e, cell->utf8, cell->len);
-            } else {
-                emit_cstr(e, " ");   /* a non-default-pen blank paints its background */
-            }
-            /* Skip a wide glyph's continuation half. */
+            /* A wide glyph re-advances the cursor by two on replay; never merge
+               a run across one. */
             if (c + 1 < s->cols && grid[r * s->cols + c + 1].cont) {
+                emit(e, cell->utf8, cell->len);
                 c += 2;
-            } else {
-                c++;
+                continue;
             }
+            /* Width-1 cell: measure the run of identical width-1 same-pen cells. */
+            uint32_t run_end = c + 1;
+            while ((int32_t)run_end <= last
+                   && run_cell_eq(cell, &grid[r * s->cols + run_end])
+                   && !(run_end + 1 < s->cols
+                        && grid[r * s->cols + run_end + 1].cont)) {
+                run_end++;
+            }
+            uint32_t n = run_end - c;   /* total identical cells, incl. this one */
+            if (cell->len > 0) {
+                emit(e, cell->utf8, cell->len);        /* the first glyph */
+                uint32_t rep = n - 1;                  /* identical cells still to paint */
+                /* Phantom-wrap guard (REP only). libvterm's REP advances the
+                   cursor PAST the run's final cell, and if that lands on the last
+                   column it arms the pending-wrap (autowrap defaults on) — the next
+                   emittable cell then linefeeds to the row below (a full-width box
+                   border '|---...---|' loses its closing corner / scrolls). An
+                   individual glyph write to the second-to-last column does NOT arm
+                   it. So when the run ends at cols-2 with an emittable cell still to
+                   follow, split the run's final cell out of the REP and write it
+                   literally — matching the individual-write cursor semantics. */
+                bool split_last = run_end == s->cols - 1
+                                  && (int32_t)run_end <= last
+                                  && rep > 0;
+                if (split_last) {
+                    rep -= 1;
+                }
+                if (rep >= REP_RUN_MIN) {
+                    emit_rep(e, rep);                  /* ...repeated */
+                } else {
+                    for (uint32_t k = 0; k < rep; k++) {
+                        emit(e, cell->utf8, cell->len);
+                    }
+                }
+                if (split_last) {
+                    emit(e, cell->utf8, cell->len);    /* final cell, literal (no phantom) */
+                }
+            } else {
+                /* Blank run — a non-default-pen blank paints its background. */
+                if (n >= ECH_RUN_MIN) {
+                    emit_ech_cuf(e, n);
+                } else {
+                    for (uint32_t k = 0; k < n; k++) {
+                        emit_cstr(e, " ");
+                    }
+                }
+            }
+            c = run_end;
         }
     }
 }
@@ -469,7 +569,13 @@ axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink
     if (s == NULL || sink == NULL) {
         return AXL_ERR;
     }
-    Emitter e = { sink, user };
+    Emitter e;
+    /* Buffer the per-cell writes into SNAPSHOT_CHUNK-sized sink calls. guard=false:
+       a snapshot is a single synchronous serialize, not a persistent buffer a tick
+       drains. On init failure emit() passes straight through to @p sink. The sink
+       signature matches AxlConsoleVtEmitFn (both const char*,size_t,void*). */
+    axl_console_vt_buf_init(&e.vb, (AxlConsoleVtEmitFn)sink, user,
+                            SNAPSHOT_CHUNK, /*guard=*/false);
     AxlConsolePen cur = {0};   /* tracks the last emitted pen (default after ESC[m) */
 
     if (s->reverse) {
@@ -497,6 +603,8 @@ axl_console_screen_snapshot(const AxlConsoleScreen *s, AxlConsoleScreenSink sink
     emit_cstr(&e, s->cursor_visible ? "\x1b[?25h" : "\x1b[?25l");
     emit_cup(&e, (uint32_t)s->cur_row, (uint32_t)s->cur_col);
 
+    axl_console_vt_buf_flush(&e.vb);     /* deliver the tail */
+    axl_console_vt_buf_dispose(&e.vb);
     return AXL_OK;
 }
 

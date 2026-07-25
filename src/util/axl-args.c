@@ -35,6 +35,8 @@
 #include <axl/axl-log.h>
 #include <axl/axl-version.h>
 
+#include "axl-version-internal.h"
+
 AXL_LOG_DOMAIN("args");
 
 // ---------------------------------------------------------------------------
@@ -586,9 +588,9 @@ print_help_for(const AxlArgsNode *node, const char *path)
 {
     if (node->help != NULL) {
         /* Header carries the SDK release version so `<tool> -h` self-identifies
-           the build. ASCII '-' separator, not a Unicode em-dash: a UEFI text
-           console has no UTF-8, so U+2014 would render as a white block. */
-        axl_print("%s %s - %s\n\n", path, axl_version(), node->help);
+           the build. Shared with axl_help_handle (non-framework tools) so the
+           two render an identical header line — see axl-version-internal.h. */
+        axl_tool_header_line(path, node->help);
     }
 
     if (node->help_prolog != NULL) {
@@ -630,6 +632,9 @@ print_help_for(const AxlArgsNode *node, const char *path)
         for (int i = 0; node->positionals != NULL
                         && node->positionals[i].name != NULL; i++) {
             const AxlArgDesc *d = &node->positionals[i];
+            if (d->hidden) {
+                continue;
+            }
             if (d->type == AXL_ARG_MULTI) {
                 axl_print(" [<%s>...]", d->name);
             } else if (d->required) {
@@ -657,6 +662,9 @@ print_help_for(const AxlArgsNode *node, const char *path)
         int w = (int)axl_strlen("-h, --help");
         if (any_pos) {
             for (int i = 0; node->positionals[i].name != NULL; i++) {
+                if (node->positionals[i].hidden) {
+                    continue;
+                }
                 int k = (int)positional_key(&node->positionals[i],
                                             keybuf, sizeof keybuf);
                 if (k > w) w = k;
@@ -664,22 +672,32 @@ print_help_for(const AxlArgsNode *node, const char *path)
         }
         if (any_flags) {
             for (int i = 0; node->flags[i].name != NULL; i++) {
+                if (node->flags[i].hidden) {
+                    continue;
+                }
                 int k = (int)flag_key(&node->flags[i], keybuf, sizeof keybuf);
                 if (k > w) w = k;
             }
         }
         if (w > HELP_KEY_MAX) w = HELP_KEY_MAX;
 
-        /* Pass 2: print the block (positionals, then flags, then --help). */
+        /* Pass 2: print the block (positionals, then flags, then --help).
+           .hidden entries are omitted entirely — parsed, but not user-facing. */
         axl_print("\n");
         if (any_pos) {
             for (int i = 0; node->positionals[i].name != NULL; i++) {
+                if (node->positionals[i].hidden) {
+                    continue;
+                }
                 positional_key(&node->positionals[i], keybuf, sizeof keybuf);
                 print_help_row(keybuf, node->positionals[i].help, w);
             }
         }
         if (any_flags) {
             for (int i = 0; node->flags[i].name != NULL; i++) {
+                if (node->flags[i].hidden) {
+                    continue;
+                }
                 flag_key(&node->flags[i], keybuf, sizeof keybuf);
                 print_help_row(keybuf, node->flags[i].help, w);
             }

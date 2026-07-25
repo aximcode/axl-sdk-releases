@@ -150,6 +150,69 @@ breakpoints or continue. You drive the rest interactively.
 
 ---
 
+## Profiling: `scripts/profile-qemu.sh`
+
+When QEMU is pegged at 100% and you want to know **where** the app is spinning
+— without adding any instrumentation — sample it. `profile-qemu.sh` boots the
+app under the `--gdb` stub, periodically interrupts the guest, records the call
+stack, symbolizes it against the app's DWARF (via `gdb-syms.py`), and reports
+where the CPU actually was. It is the "perf record/report" for a UEFI app.
+
+```bash
+./scripts/profile-qemu.sh [options] <app.efi> [app args...]
+```
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `--arch X64\|AARCH64` | `X64` | target arch (selects `out/native-<arch>`) |
+| `--samples N` | 200 | number of stack samples |
+| `--port N` | 1234 | GDB stub TCP port |
+| `--build-dir DIR` | `out/native-<arch>` | axl build dir holding the app's `.so` |
+| `--interval S` | 0.05 | seconds between samples |
+| `--out STEM` | `/tmp/axl-profile` | report path stem |
+| `--ovmf-build-dir DIR` | (none) | also symbolize firmware frames |
+| `--warmup S` | 90 | max wait for the app image to load (TCG boot is slow) |
+
+Two reports land at `<STEM>`:
+- `<STEM>.txt` — a flat profile (printed on completion): the hottest **leaf**
+  frames (where the CPU was executing) and the hottest **stacks** (including
+  callees).
+- `<STEM>.folded` — collapsed stacks for FlameGraph:
+  `flamegraph.pl < <STEM>.folded > profile.svg`.
+
+**Up-front verdict.** Before sampling, it measures QEMU's host CPU over a 2 s window and prints it in cores — a spinning TCG vCPU pegs ~1.0 core, an idle/HLT-bound guest sits near 0. So a run leads with e.g. `QEMU host CPU: 0.02 cores (idle / HLT-bound — not spinning)`, telling you whether there is even a spin to find before you read the stacks.
+
+**Reading the result.** A real spin shows a hot **app** leaf with a file:line:
+
+```
+Hot leaves (self — where the CPU was executing):
+  self%   count  function
+ 100.0%      40  spin_compute        <- the busy loop, at cpu-spin-fixture.c:73
+```
+
+An **idle** app (correctly HLT-bound on a firmware wait) shows a hot
+*unsymbolized* leaf and a note:
+
+```
+NOTE: the hottest frame is an unsymbolized address (firmware, not app code) —
+the guest is most likely idle / HLT-bound...
+```
+
+so a raw-address leaf is itself the "not spinning in your code" signal. Pass
+`--ovmf-build-dir <OvmfX64/DEBUG_GCC5/X64>` to name the firmware frames (e.g.
+`CoreWaitForEvent`) when you want to see exactly which firmware wait it parks in.
+
+**Notes.**
+- The guest runs under **TCG** (the `--gdb` stub disables KVM), so it is
+  slower than a normal run — pick an app duration that covers the sampling
+  window. Sampling is statistical: more samples sharpen the picture.
+- Reuses the same machinery as the rest of this doc (`run-qemu.sh --gdb
+  --background`, `--debugcon`, `gdb-syms.py`); the sampler itself is
+  `scripts/gdb-sample.py`, run under `gdb -batch`.
+- Firmware stacks unwind unreliably (no frame pointers in firmware); trust the
+  **leaf** line there, not the deep stack.
+
+
 ## Common breakpoints
 
 ### AXL code

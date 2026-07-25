@@ -45,7 +45,7 @@ report_append(const char *str)
 static const char *
 exception_name_ascii(uint8_t arch, uint32_t exception_type)
 {
-    if (arch == CRASH_ARCH_X64) {
+    if (arch == AXL_CRASH_ARCH_X64) {
         switch (exception_type) {
         case 0:  return "#DE (Divide Error)";
         case 1:  return "#DB (Debug)";
@@ -79,42 +79,42 @@ exception_name_ascii(uint8_t arch, uint32_t exception_type)
 static int
 append_single_crash_report(uint8_t *record, size_t record_size)
 {
-    CrashRecordHeader *hdr;
+    AxlCrashRecordHeader *hdr;
     uint8_t           *ptr;
-    CrashImageEntry   *fault_image;
-    CrashImageEntry   *images;
+    AxlCrashImageEntry   *fault_image;
+    AxlCrashImageEntry   *images;
     uint64_t          *frames;
     uint64_t           fault_addr;
     uint64_t           fault_offset;
     uint32_t           idx;
 
-    if (record_size < sizeof(CrashRecordHeader)) {
+    if (record_size < sizeof(AxlCrashRecordHeader)) {
         return AXL_ERR;
     }
 
-    hdr = (CrashRecordHeader *)record;
-    if (hdr->magic != CRASH_RECORD_MAGIC || hdr->version != CRASH_RECORD_VERSION) {
+    hdr = (AxlCrashRecordHeader *)record;
+    if (hdr->magic != AXL_CRASH_RECORD_MAGIC || hdr->version != AXL_CRASH_RECORD_VERSION) {
         return AXL_ERR;
     }
 
-    ptr = record + sizeof(CrashRecordHeader);
+    ptr = record + sizeof(AxlCrashRecordHeader);
 
     /* Get fault address from registers */
-    if (hdr->arch == CRASH_ARCH_X64) {
-        CrashRegsX64 *regs = (CrashRegsX64 *)ptr;
+    if (hdr->arch == AXL_CRASH_ARCH_X64) {
+        AxlCrashRegsX64 *regs = (AxlCrashRegsX64 *)ptr;
         fault_addr = regs->rip;
-        ptr += sizeof(CrashRegsX64);
+        ptr += sizeof(AxlCrashRegsX64);
     } else {
-        CrashRegsAarch64 *regs = (CrashRegsAarch64 *)ptr;
+        AxlCrashRegsAarch64 *regs = (AxlCrashRegsAarch64 *)ptr;
         fault_addr = regs->elr;
-        ptr += sizeof(CrashRegsAarch64);
+        ptr += sizeof(AxlCrashRegsAarch64);
     }
 
     /* Image table starts after registers */
-    fault_image = (CrashImageEntry *)ptr;
+    fault_image = (AxlCrashImageEntry *)ptr;
     fault_offset = (fault_image->base != 0) ? fault_addr - fault_image->base : 0;
     images = fault_image;  /* slot 0 = faulting image, rest = full table */
-    ptr += hdr->image_count * sizeof(CrashImageEntry);
+    ptr += hdr->image_count * sizeof(AxlCrashImageEntry);
 
     /* Stack frames */
     frames = (uint64_t *)ptr;
@@ -135,14 +135,14 @@ append_single_crash_report(uint8_t *record, size_t record_size)
     }
 
     REPORT_PRINT("Architecture: %s\r\n",
-        (hdr->arch == CRASH_ARCH_X64) ? "X64" : "AARCH64");
+        (hdr->arch == AXL_CRASH_ARCH_X64) ? "X64" : "AARCH64");
     report_append("\r\n");
 
     /* --- Registers --- */
     report_append("Registers:\r\n");
 
-    if (hdr->arch == CRASH_ARCH_X64) {
-        CrashRegsX64 *r = (CrashRegsX64 *)(record + sizeof(CrashRecordHeader));
+    if (hdr->arch == AXL_CRASH_ARCH_X64) {
+        AxlCrashRegsX64 *r = (AxlCrashRegsX64 *)(record + sizeof(AxlCrashRecordHeader));
 
         REPORT_PRINT("  RAX=%016lX  RBX=%016lX\r\n", (unsigned long)r->rax, (unsigned long)r->rbx);
         REPORT_PRINT("  RCX=%016lX  RDX=%016lX\r\n", (unsigned long)r->rcx, (unsigned long)r->rdx);
@@ -155,7 +155,7 @@ append_single_crash_report(uint8_t *record, size_t record_size)
         REPORT_PRINT("  RIP=%016lX  RFLAGS=%016lX\r\n", (unsigned long)r->rip, (unsigned long)r->rflags);
         REPORT_PRINT("  CR2=%016lX  ErrCode=%016lX\r\n", (unsigned long)r->cr2, (unsigned long)r->exception_data);
     } else {
-        CrashRegsAarch64 *r = (CrashRegsAarch64 *)(record + sizeof(CrashRecordHeader));
+        AxlCrashRegsAarch64 *r = (AxlCrashRegsAarch64 *)(record + sizeof(AxlCrashRecordHeader));
 
         REPORT_PRINT("  ELR=%016lX   SP=%016lX\r\n", (unsigned long)r->elr, (unsigned long)r->sp);
         REPORT_PRINT("  FP =%016lX   LR=%016lX\r\n", (unsigned long)r->fp, (unsigned long)r->lr);
@@ -260,7 +260,7 @@ process_crash_records(void)
 {
     uint8_t      slot_idx;
     size_t       slot_size;
-    uint8_t      record_buf[CRASH_RECORD_MAX_SIZE];
+    uint8_t      record_buf[AXL_CRASH_RECORD_MAX_SIZE];
     size_t       record_size;
     char         var_key[] = "CrashDump0";
     size_t       count;
@@ -283,7 +283,7 @@ process_crash_records(void)
 
     /* Append each non-empty slot into the accumulator. */
     count = 0;
-    for (slot = 0; slot < CRASH_DUMP_SLOTS; slot++) {
+    for (slot = 0; slot < AXL_CRASH_DUMP_SLOTS; slot++) {
         var_key[9] = '0' + (char)slot;
 
         record_size = sizeof(record_buf);

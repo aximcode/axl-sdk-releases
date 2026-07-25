@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-net-addr.c
-    IPv4 address parsing and formatting helpers.
+    IPv4 and MAC address parsing and formatting helpers.
 **/
 
 #include <axl/axl-str.h>
@@ -27,6 +27,52 @@ axl_ipv4_parse(const char *str, uint8_t octets[4])
     octets[1] = (uint8_t)b;
     octets[2] = (uint8_t)c;
     octets[3] = (uint8_t)d;
+    return AXL_OK;
+}
+
+/* Turn a CIDR prefix length (0..32) into a big-endian netmask. */
+static void
+prefix_to_mask(unsigned int n, uint8_t mask[4])
+{
+    uint32_t bits = n == 0 ? 0u : (0xFFFFFFFFu << (32u - n));
+    mask[0] = (uint8_t)(bits >> 24);
+    mask[1] = (uint8_t)(bits >> 16);
+    mask[2] = (uint8_t)(bits >> 8);
+    mask[3] = (uint8_t)(bits);
+}
+
+int
+axl_ipv4_parse_cidr(const char *str, uint8_t octets[4], uint8_t mask[4],
+                    bool *had_prefix)
+{
+    if (had_prefix != NULL) { *had_prefix = false; }
+    if (str == NULL || octets == NULL) { return AXL_ERR; }
+
+    const char *slash = axl_strchr(str, '/');
+    if (slash == NULL) {
+        return axl_ipv4_parse(str, octets);   /* bare address */
+    }
+
+    /* Split "addr/prefix" into a bounded local copy, parse each half. */
+    size_t addr_len = (size_t)(slash - str);
+    char addr[16];
+    if (addr_len >= sizeof addr) { return AXL_ERR; }
+    axl_memcpy(addr, str, addr_len);
+    addr[addr_len] = '\0';
+    if (axl_ipv4_parse(addr, octets) != AXL_OK) { return AXL_ERR; }
+
+    unsigned int n = 0;
+    int consumed = 0;
+    /* %u%n; reject empty ("/"), trailing garbage ("/24x"), and N>32. A valid
+     * prefix is at most 2 digits, so `consumed > 2` rejects over-long inputs
+     * ("/4294967328") independently of the scanner's own width — a 10-digit
+     * value that wraps to 32 must not slip through the `n > 32` check. */
+    if (axl_sscanf(slash + 1, "%u%n", &n, &consumed) != 1
+        || slash[1 + consumed] != '\0' || consumed > 2 || n > 32) {
+        return AXL_ERR;
+    }
+    if (mask != NULL) { prefix_to_mask(n, mask); }
+    if (had_prefix != NULL) { *had_prefix = true; }
     return AXL_OK;
 }
 
@@ -138,5 +184,43 @@ axl_ipv6_format(const uint8_t octets[16], char *buf, size_t size)
         pos += (size_t)n;
     }
 
+    return AXL_OK;
+}
+
+int
+axl_mac_format(const uint8_t mac[6], char *buf, size_t size)
+{
+    int n;
+
+    if (mac == NULL || buf == NULL || size == 0) {
+        return AXL_ERR;
+    }
+
+    n = axl_snprintf(buf, size, "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (n < 0 || (size_t)n >= size) {
+        return AXL_ERR;
+    }
+
+    return AXL_OK;
+}
+
+int
+axl_mac_parse(const char *str, uint8_t mac[6])
+{
+    if (str == NULL || mac == NULL) { return AXL_ERR; }
+
+    /* Dogfooded with axl_sscanf, same shape as axl_ipv4_parse: %x accepts
+     * 1-2 case-insensitive hex digits per octet, and the trailing %n lets
+     * us reject trailing garbage without an extra strlen. */
+    unsigned int b[6];
+    int          consumed = 0;
+    int n = axl_sscanf(str, "%x:%x:%x:%x:%x:%x%n",
+                       &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &consumed);
+    if (n != 6 || str[consumed] != '\0') { return AXL_ERR; }
+    for (size_t i = 0; i < 6; i++) {
+        if (b[i] > 0xFF) { return AXL_ERR; }
+        mac[i] = (uint8_t)b[i];
+    }
     return AXL_OK;
 }

@@ -12,6 +12,7 @@
 #include <axl/axl-shell.h>
 #include <axl/axl-console-mirror.h>
 #include <axl/axl-file-view.h>   /* read-back of the edited file (rung 3) */
+#include <axl/axl-9p.h>
 #include <uefi/axl-uefi.h>   /* gST + console protocols for mirror-selftest */
 
 AXL_LOG_DOMAIN("test");
@@ -490,7 +491,7 @@ test_tcp_echo(void)
                    "TCP echo match");
     }
 
-    axl_tcp_close(client);
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +590,7 @@ test_tcp_recv_async_rearm(void)
        stamps sock->async_loop with this loop, and axl_tcp_close calls
        axl_loop_remove_source on it during teardown. Freeing the loop
        first would dangle the pointer. */
-    axl_tcp_close(client);
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(ctx.loop);
 }
 
@@ -637,14 +638,14 @@ test_http_round_trip(void)
     //
     AxlLoop *loop = axl_loop_new();
     if (loop == NULL) {
-        axl_http_server_free(server);
+        axl_http_server_free(server, AXL_TEARDOWN_GRACEFUL);
         axl_printf("SKIP: Loop alloc failed\n");
         return;
     }
 
     ret = axl_http_server_start(server, loop);
     if (ret != 0) {
-        axl_http_server_free(server);
+        axl_http_server_free(server, AXL_TEARDOWN_GRACEFUL);
         axl_loop_free(loop);
         axl_printf("SKIP: HTTP server attach failed\n");
         return;
@@ -655,7 +656,7 @@ test_http_round_trip(void)
     //
     client = axl_http_client_new();
     if (client == NULL) {
-        axl_http_server_free(server);
+        axl_http_server_free(server, AXL_TEARDOWN_GRACEFUL);
         axl_loop_free(loop);
         axl_printf("SKIP: HTTP client alloc failed\n");
         return;
@@ -680,7 +681,7 @@ test_http_round_trip(void)
     test_pass("HTTP server/client creation");
 
     axl_http_client_free(client);
-    axl_http_server_free(server);
+    axl_http_server_free(server, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(loop);
 }
 
@@ -1850,7 +1851,7 @@ test_dav_write_chunk(void *vctx, const void *data, size_t len)
     return AXL_OK;
 }
 
-static void
+static int
 test_dav_write_close(void *vctx, bool aborted)
 {
     DavWriteCtx *w = vctx;
@@ -1858,8 +1859,15 @@ test_dav_write_close(void *vctx, bool aborted)
                 sizeof(m_dav_last_put_path));
     m_dav_last_put_len     = w->written;
     m_dav_last_put_aborted = aborted;
+    /* A target named "flush-fails*" stands in for a backend whose final
+       flush could not make the bytes durable — every chunk was accepted
+       and only the close fails. The integration test uses it to pin PUT
+       answering 500 rather than 201. Deliberately NOT registered in the
+       in-memory fs: a failed store must not become visible to PROPFIND. */
+    bool flush_fails =
+        axl_strncmp(w->target_path, "/flush-fails", 12) == 0;
     /* On clean EOF, register the new file in the in-memory fs. */
-    if (!aborted) {
+    if (!aborted && !flush_fails) {
         if (axl_hash_table_lookup(m_dav_fs, w->target_path) == NULL) {
             axl_hash_table_replace(m_dav_fs, axl_strdup(w->target_path),
                                    (void *)(uintptr_t)1);
@@ -1867,6 +1875,7 @@ test_dav_write_close(void *vctx, bool aborted)
     }
     axl_free(w->target_path);
     axl_free(w);
+    return flush_fails ? AXL_ERR : AXL_OK;
 }
 
 static const char *
@@ -2017,7 +2026,7 @@ static AxlHttpServer *ws_test_server = NULL;
 
 static int
 on_ws_echo(
-    size_t event,
+    AxlWsEvent event,
     const void *frame,
     size_t frame_size,
     void *data)
@@ -2038,7 +2047,7 @@ on_ws_echo(
 static int
 on_ws_echo_ex(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2053,6 +2062,48 @@ on_ws_echo_ex(
         return 0;
     }
     if (event == AXL_WS_TEXT) {
+        /* Oversized-frame guard (WS wedge regression): a payload whose framed
+           size exceeds the per-connection outbound byte budget must be REJECTED
+           (AXL_ERR) at axl_ws_send, not admitted and handed to the transport as
+           one giant Transmit. Report the rc on serial so the harness can assert
+           it, then keep replying normally to prove the server stays responsive. */
+        if (frame_size == 8 && axl_memcmp(frame, "OVERSIZE", 8) == 0) {
+            size_t   big = (600u * 1024u);   /* > WS_OUT_MAX_BYTES (512 KB) */
+            uint8_t *buf = axl_malloc(big);
+            if (buf != NULL) {
+                axl_memset(buf, 'Z', big);
+                int rc = axl_ws_send(conn, AXL_WS_BINARY, buf, big);
+                axl_printf("WS-OVERSIZE-RC:%d\r\n", rc);
+                axl_free(buf);
+            } else {
+                /* Distinct marker so the harness attributes a failed probe to
+                   OOM, not to a fix regression (an absent RC line looks like
+                   the reject silently vanished). */
+                axl_printf("WS-OVERSIZE-OOM\r\n");
+            }
+            return 0;
+        }
+        /* Multi-chunk transport guard (WS wedge fix, Part B): a 200 KB frame is
+           under the outbound budget (512 KB) but larger than the transport's
+           per-Transmit chunk (32 KB), so axl_tcp_send_async must chunk-chain it
+           (~7 Transmits) and still deliver the payload byte-exact. Fill with a
+           position-dependent pattern the client verifies, and report the rc on
+           serial. Guards correctness of the bounded-Transmit rewrite. */
+        if (frame_size == 8 && axl_memcmp(frame, "BIGFRAME", 8) == 0) {
+            size_t   big = (200u * 1024u);   /* > 32 KB chunk, < 512 KB budget */
+            uint8_t *buf = axl_malloc(big);
+            if (buf != NULL) {
+                for (size_t i = 0; i < big; i++) {
+                    buf[i] = (uint8_t)(i & 0xFF);
+                }
+                int rc = axl_ws_send(conn, AXL_WS_BINARY, buf, big);
+                axl_printf("WS-BIGFRAME-RC:%d\r\n", rc);
+                axl_free(buf);
+            } else {
+                axl_printf("WS-BIGFRAME-OOM\r\n");
+            }
+            return 0;
+        }
         char   reply[256];
         int    n = (frame_size < 240) ? (int)frame_size : 240;
         axl_snprintf(reply, sizeof(reply), "ex:%.*s", n, (const char *)frame);
@@ -2067,7 +2118,7 @@ on_ws_echo_ex(
 static int
 on_ws_close(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2090,7 +2141,7 @@ on_ws_close(
 static int
 on_ws_burst(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2115,7 +2166,7 @@ on_ws_burst(
 static int
 on_ws_auth(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2141,7 +2192,7 @@ on_ws_auth(
 static int
 on_ws_greet(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2161,7 +2212,7 @@ on_ws_greet(
 static int
 on_ws_connect_close(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2180,7 +2231,7 @@ on_ws_connect_close(
 static int
 on_ws_reject(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -2347,7 +2398,7 @@ run_serve_tls_mode(void)
 
     if (axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
         axl_printf("ERROR: TLS setup failed\n");
-        axl_http_server_free(s);
+        axl_http_server_free(s, AXL_TEARDOWN_GRACEFUL);
         axl_free(cert);
         axl_free(key);
         return -1;
@@ -2518,6 +2569,105 @@ run_serve_tls_ws_driver_mode(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// "serve-tls-ws-close-pendtx-driver" — regression for the graceful-close wedge
+// (docs/axl-sdk-console-reshape-snapshot-wedge-handoff.md in softbmc).
+//
+// A resident HTTPS+WS server pumped by axl_loop_attach_driver (TPL_CALLBACK)
+// sends a LARGE frame to each /ws-console client on connect. A client that reads
+// the 101, then sends a WS CLOSE WITHOUT draining, leaves the server holding
+// un-flushed outbound TCP data when process_websocket_data reset_connections the
+// conn at raised TPL. Before the fix, the graceful EFI_TCP4.Close() then spins in
+// firmware flushing that send buffer (its FIN/ACK needs the MNP timer to fire
+// below TPL_CALLBACK, which the pump holds) -> the loop hard-wedges (curl 000).
+// With the fix (abortive close at raised TPL) the RST discards the buffer and the
+// loop keeps serving. Driven by test-tcp-close-pendtx-driver-qemu.sh.
+// ---------------------------------------------------------------------------
+
+#define WS_PENDTX_FRAME_BYTES  (400u * 1024u)   /* > a socket window, < WS_OUT_MAX_BYTES */
+
+// On connect, push a large frame so the client's non-drain leaves the server
+// with un-flushed TX when it later resets the connection on the WS CLOSE.
+static int
+on_ws_pendtx(
+    AxlWsConn  *conn,
+    AxlWsEvent  event,
+    const void *frame,
+    size_t      frame_size,
+    void       *data)
+{
+    (void)frame;
+    (void)frame_size;
+    (void)data;
+    if (event == AXL_WS_CONNECT) {
+        uint8_t *buf = axl_malloc(WS_PENDTX_FRAME_BYTES);
+        if (buf != NULL) {
+            axl_memset(buf, 'Z', WS_PENDTX_FRAME_BYTES);
+            (void)axl_ws_send(conn, AXL_WS_BINARY, buf, WS_PENDTX_FRAME_BYTES);
+            axl_free(buf);
+        }
+    }
+    return 0;
+}
+
+static int
+run_serve_tls_ws_close_pendtx_driver_mode(void)
+{
+    if (!axl_tls_available()) {
+        axl_printf("ERROR: TLS not available (build with AXL_TLS=1)\n");
+        return -1;
+    }
+
+    axl_net_auto_init(SIZE_MAX, 10);
+    if (axl_tls_init() != AXL_OK) {
+        axl_printf("ERROR: TLS init failed\n");
+        return -1;
+    }
+
+    void  *cert = NULL, *key = NULL;
+    size_t cert_len = 0, key_len = 0;
+    if (axl_tls_generate_self_signed("AXL-Test", NULL, 0,
+                                     &cert, &cert_len, &key, &key_len) != 0) {
+        axl_printf("ERROR: cert generation failed\n");
+        return -1;
+    }
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s    = axl_http_server_new(8443);
+    if (loop == NULL || s == NULL
+        || axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
+        axl_printf("ERROR: TLS server setup failed\n");
+        axl_free(cert);
+        axl_free(key);
+        return -1;
+    }
+    axl_free(cert);
+    axl_free(key);
+
+    axl_http_server_add_route(s, "GET", "/api/version", on_get_version, NULL);
+    axl_http_server_add_websocket_ex(s, "/ws-console", on_ws_pendtx, NULL,
+                                     AXL_ROUTE_NO_AUTH);
+
+    if (axl_http_server_start(s, loop) != 0) {
+        axl_printf("ERROR: failed to start server on loop\n");
+        return -1;
+    }
+
+    /* 50 ms — SoftBMC's console-mirror driver cadence. */
+    if (axl_loop_attach_driver(loop, 50) != AXL_OK) {
+        axl_printf("ERROR: attach_driver failed\n");
+        return -1;
+    }
+
+    axl_printf("HTTPS+WS pending-TX close server (resident driver-tick loop) "
+               "on port 8443\n");
+    axl_printf("READY\n");
+
+    for (;;) {
+        axl_msleep(1000);
+    }
+}
+
 /* on_get_srv2 (the plain second server's handler) is defined later. */
 static int
 on_get_srv2(AxlHttpRequest *req, AxlHttpResponse *resp, void *data);
@@ -2640,6 +2790,17 @@ run_serve_shell_coexist_mode(void)
         axl_printf("ERROR: attach_driver failed\n");
         return -1;
     }
+
+    /* With a Shell.efi staged AND OVMF's FV Shell present, axl_shell_sources
+       must report BOTH independently — the case the file-first axl_shell_locate
+       collapses to FILE, hiding the FV. Emit the flags so the harness can pin
+       the un-masking (see test-shell-coexist-qemu.sh). */
+    AxlShellSources src = { 0 };
+    if (axl_shell_sources(&src) != AXL_OK) {
+        src = (AxlShellSources){ 0 };   /* query failed -> report no sources */
+    }
+    axl_printf("SOURCES:file=%d,fv=%d,fvn=%u\n",
+               (int)src.file, (int)src.fv, (unsigned)src.fv_count);
 
     axl_printf("HTTP server (driver-tick) on 8080; launching foreground Shell\n");
     axl_printf("READY\n");
@@ -2786,7 +2947,7 @@ run_serve_tls_shell_coexist_mode(void)
         .sink = tls_coexist_sink, .user = NULL,
         .cols = 80, .rows = 25, .passthrough_local = true,
     };
-    if (axl_console_mirror_install(&m, &cfg) != AXL_OK) {
+    if (axl_console_mirror_install(&cfg, &m) != AXL_OK) {
         axl_printf("ERROR: mirror install failed\n");
         return -1;
     }
@@ -2942,7 +3103,7 @@ run_mirror_selftest_mode(void)
     g_cm_cap_len = 0;
     g_cm_cap[0]  = '\0';
 
-    int rc = axl_console_mirror_install(&m, &cfg);
+    int rc = axl_console_mirror_install(&cfg, &m);
 
     bool dbl_blocked = false;
     bool got_clear = false, got_cursor = false, got_sgr = false, got_text = false;
@@ -2954,7 +3115,7 @@ run_mirror_selftest_mode(void)
         EFI_SIMPLE_TEXT_INPUT_PROTOCOL  *in  = gST->ConIn;
 
         AxlConsoleMirror *m2 = NULL;
-        dbl_blocked = (axl_console_mirror_install(&m2, &cfg) == AXL_ERR);
+        dbl_blocked = (axl_console_mirror_install(&cfg, &m2) == AXL_ERR);
 
         /* QueryMode on the CURRENT mode must report the remote size (this is
            what `edit` queries to lay itself out). */
@@ -3008,7 +3169,7 @@ run_mirror_selftest_mode(void)
 
     bool stderr_wrapped = false, stderr_restored = false;
     AxlConsoleMirror *m3 = NULL;
-    if (axl_console_mirror_install(&m3, &cfg) == AXL_OK) {
+    if (axl_console_mirror_install(&cfg, &m3) == AXL_OK) {
         stderr_wrapped = (gST->StdErr == gST->ConOut
                           && gST->StdErr != &g_fake_stderr);
         axl_console_mirror_uninstall(m3);
@@ -3237,7 +3398,7 @@ run_mirror_edit_mode(void)
     g_ms_prompt = g_ms_editor = g_ms_savep = false;
     g_mp_prompt = g_mp_editor = g_mp_savep = 0;
 
-    if (axl_console_mirror_install(&g_edit_mirror, &cfg) != AXL_OK) {
+    if (axl_console_mirror_install(&cfg, &g_edit_mirror) != AXL_OK) {
         axl_printf("MIRROR_EDIT: install=0\n");
         axl_printf("MIRROR_EDIT_DONE FAIL\n");
         for (;;) { axl_msleep(1000); }
@@ -3324,7 +3485,7 @@ p1_sink(const char *bytes, size_t len, void *user)
 static int
 on_ws_console_inject(
     AxlWsConn  *conn,
-    size_t      event,
+    AxlWsEvent      event,
     const void *frame,
     size_t      frame_size,
     void       *data)
@@ -3393,7 +3554,7 @@ run_serve_ws_shell_inject_mode(void)
         .sink = p1_sink, .user = NULL,
         .cols = 80, .rows = 25, .passthrough_local = true,
     };
-    if (axl_console_mirror_install(&g_p1_mirror, &cfg) != AXL_OK) {
+    if (axl_console_mirror_install(&cfg, &g_p1_mirror) != AXL_OK) {
         axl_printf("ERROR: mirror install failed\n");
         return -1;
     }
@@ -3523,7 +3684,7 @@ run_serve_davfs_common(bool tls)
     if (tls) {
         if (axl_http_server_use_tls(s, cert, cert_len, key, key_len) != AXL_OK) {
             axl_printf("ERROR: TLS setup failed\n");
-            axl_http_server_free(s);
+            axl_http_server_free(s, AXL_TEARDOWN_GRACEFUL);
             axl_free(cert);
             axl_free(key);
             return -1;
@@ -3900,7 +4061,7 @@ test_http_add_routes_variadic(void)
     rc = axl_http_server_add_routes(s, NULL);
     test_check(rc == AXL_OK, "add_routes: empty list returns AXL_OK");
 
-    axl_http_server_free(s);
+    axl_http_server_free(s, AXL_TEARDOWN_GRACEFUL);
 }
 
 // ---------------------------------------------------------------------------
@@ -4027,6 +4188,23 @@ test_net_resolve_ptr_validation(void)
     test_check(axl_net_get_dhcp_lease_by_mac(mac_guard, NULL) == AXL_ERR,
                "dhcp-lease-by-mac: NULL out -> AXL_ERR");
 
+    /* set_static_ip_by_mac: NULL mac / ip / netmask return on the guard
+       before any protocol call. A valid MAC would reconfigure live firmware
+       under this test binary (feedback_uefi_firmware_test_hazards), so the
+       unknown-MAC no-fallback contract is exercised in net-diag mode instead
+       (mirrors dhcp-lease-by-mac's unknown-MAC assertion), and the positive
+       round-trip -- does it configure the RIGHT NIC -- rides netload's
+       two-NIC BUG B integration boot (test-netload-qemu.sh), where driving
+       static config is already the point. */
+    static const uint8_t sip_ip_guard[4]      = { 192, 168, 1, 100 };
+    static const uint8_t sip_netmask_guard[4] = { 255, 255, 255, 0 };
+    test_check(axl_net_set_static_ip_by_mac(NULL, sip_ip_guard, sip_netmask_guard, NULL) == AXL_ERR,
+               "set-static-ip-by-mac: NULL mac -> AXL_ERR");
+    test_check(axl_net_set_static_ip_by_mac(mac_guard, NULL, sip_netmask_guard, NULL) == AXL_ERR,
+               "set-static-ip-by-mac: NULL ip -> AXL_ERR");
+    test_check(axl_net_set_static_ip_by_mac(mac_guard, sip_ip_guard, NULL, NULL) == AXL_ERR,
+               "set-static-ip-by-mac: NULL netmask -> AXL_ERR");
+
     /* ping_ex: NULL target / out return on the guard before any IP4 call.
        The live probe (end-to-end IP4 setup/transmit/timeout) is exercised in
        net-diag mode; SLIRP drops ICMP so it can only assert the probe COMPLETES
@@ -4040,10 +4218,10 @@ test_net_resolve_ptr_validation(void)
 
     /* sntp_query: NULL server / out return on the guard before any UDP call.
        The live round-trip against a host SNTP responder is in test-sntp-qemu.sh. */
-    AxlSntpResult sr;
-    test_check(axl_sntp_query(NULL, 0, 1000, &sr) == AXL_ERR,
+    AxlNetSntpResult sr;
+    test_check(axl_net_sntp_query(NULL, 0, 1000, &sr) == AXL_ERR,
                "sntp_query: NULL server -> AXL_ERR");
-    test_check(axl_sntp_query("10.0.2.2", 0, 1000, NULL) == AXL_ERR,
+    test_check(axl_net_sntp_query("10.0.2.2", 0, 1000, NULL) == AXL_ERR,
                "sntp_query: NULL out -> AXL_ERR");
 
     /* arp_list: NULL count returns on the guard before any protocol call. The
@@ -4052,10 +4230,119 @@ test_net_resolve_ptr_validation(void)
     test_check(axl_net_arp_list(0, ae, 2, NULL) == AXL_ERR,
                "arp_list: NULL count -> AXL_ERR");
 
+    /* Out-of-range nic must ERROR, not answer for a different NIC. Safe
+       negative: returns on our own bounds check before CreateChild. */
+    AxlArpEntry ae_oob[2];
+    size_t      ae_oob_n = 0;
+    test_check(axl_net_arp_list(SIZE_MAX - 1, ae_oob, 2, &ae_oob_n) == AXL_ERR,
+               "arp_list: out-of-range nic -> AXL_ERR");
+
     /* get_link_stats: NULL out returns on the guard. The live read is in
        net-diag mode. */
     test_check(axl_net_get_link_stats(0, NULL) == AXL_ERR,
                "link_stats: NULL out -> AXL_ERR");
+
+    /* Out-of-range nic must ERROR, not clamp. The `>= count -> 0` clamp is the
+       wrong-NIC bug: it silently answered for NIC 0. Safe negative -- returns
+       on our own bounds check before any firmware call. */
+    AxlNetLinkStats ls_oob;
+    test_check(axl_net_get_link_stats(SIZE_MAX - 1, &ls_oob) == AXL_ERR,
+               "link_stats: out-of-range nic -> AXL_ERR (no clamp to NIC 0)");
+}
+
+/* NIC registry contract, observed through the public API (tests never include
+   src/net/axl-net-internal.h). A standalone AxlTestNet boot with no NIC (e.g.
+   run-qemu.sh without --net) takes the SKIP branch, balanced against the
+   populated-path check count per the balancer rule. The ratcheted
+   test-axl.sh harness always attaches one live virtio NIC for AxlTestNet
+   (test_add_network_with_echo), so under that harness this call already
+   exercises the populated path directly. */
+static void
+test_nic_registry_contract(void)
+{
+    /* NULL count returns on the guard, at any NIC count. */
+    test_check(axl_net_list_interfaces(NULL, NULL) == AXL_ERR,
+               "list_interfaces: NULL count -> AXL_ERR");
+
+    size_t n = 0;
+    test_check(axl_net_list_interfaces(NULL, &n) == AXL_OK,
+               "list_interfaces: count query -> AXL_OK");
+
+    if (n == 0) {
+        axl_printf("SKIP: list_interfaces MACs unique (no NIC)\n");
+        axl_printf("SKIP: list_interfaces count == filled (no NIC)\n");
+        return;
+    }
+
+    AxlNetInterface *ifs = axl_calloc(n, sizeof *ifs);
+    if (ifs == NULL) {
+        axl_printf("SKIP: list_interfaces MACs unique (alloc failed)\n");
+        axl_printf("SKIP: list_interfaces count == filled (alloc failed)\n");
+        return;
+    }
+    size_t filled = n;
+    int rc = axl_net_list_interfaces(ifs, &filled);
+
+    /* Dedup: every MAC in the listing is unique. Pre-registry this fails --
+       a single NIC repeats across its SNP child handles. */
+    bool unique = (rc == AXL_OK);
+    for (size_t i = 0; unique && i < filled; i++) {
+        for (size_t j = i + 1; j < filled; j++) {
+            if (axl_memcmp(ifs[i].mac, ifs[j].mac, 6) == 0) {
+                unique = false;
+                break;
+            }
+        }
+    }
+    test_check(unique, "list_interfaces: every MAC is unique (one row per NIC)");
+
+    /* The count query must agree with what the fill actually produces. */
+    test_check(rc == AXL_OK && filled == n,
+               "list_interfaces: count query == filled count");
+
+    axl_free(ifs);
+}
+
+/* axl_net_list_interfaces_alloc: the allocating counterpart of
+   axl_net_list_interfaces, promoted from netload's local count/alloc/
+   re-query helper (formerly duplicated 4x across netload.c and netinfo.c).
+   Same live-NIC assumption and SKIP-balance shape as
+   test_nic_registry_contract above -- the ratcheted test-axl.sh harness
+   always attaches one live virtio NIC, so the populated path is exercised
+   directly under that harness. */
+static void
+test_net_list_interfaces_alloc_contract(void)
+{
+    /* NULL-arg negatives are safe at any NIC count -- they return on our
+       own guard before axl_net_list_interfaces is ever called. */
+    AxlNetInterface *ifs = NULL;
+    size_t count = 0;
+    test_check(axl_net_list_interfaces_alloc(NULL, &count) == AXL_ERR,
+               "list_interfaces_alloc: NULL out -> AXL_ERR");
+    test_check(axl_net_list_interfaces_alloc(&ifs, NULL) == AXL_ERR,
+               "list_interfaces_alloc: NULL count -> AXL_ERR");
+
+    /* Zero interfaces is a normal result, not a failure -- AXL_OK either way. */
+    ifs = NULL;
+    count = 0;
+    int rc = axl_net_list_interfaces_alloc(&ifs, &count);
+    test_check(rc == AXL_OK, "list_interfaces_alloc: AXL_OK");
+
+    if (count == 0) {
+        axl_printf("SKIP: list_interfaces_alloc non-NULL array (no NIC)\n");
+        axl_printf("SKIP: list_interfaces_alloc count matches list_interfaces (no NIC)\n");
+        return;
+    }
+
+    test_check(ifs != NULL, "list_interfaces_alloc: non-NULL array when count > 0");
+
+    /* Cross-check against the query-only axl_net_list_interfaces -- both
+       walk the same NIC registry, so the counts must agree. */
+    size_t n2 = 0;
+    test_check(axl_net_list_interfaces(NULL, &n2) == AXL_OK && n2 == count,
+               "list_interfaces_alloc: count matches list_interfaces");
+
+    axl_free(ifs);
 }
 
 static void
@@ -4216,6 +4503,216 @@ test_ipv4_parse_format(void)
 }
 
 // ---------------------------------------------------------------------------
+// MAC parse / format tests
+// ---------------------------------------------------------------------------
+
+static void
+test_mac_format_parse(void)
+{
+    uint8_t mac[6];
+    char    buf[24];
+
+    /* Format */
+    uint8_t addr[6] = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    test_check(axl_mac_format(addr, buf, sizeof buf) == AXL_OK,
+               "mac format: aa:bb:cc:dd:ee:ff");
+    test_check(axl_strcmp(buf, "aa:bb:cc:dd:ee:ff") == 0,
+               "mac format: string correct");
+
+    uint8_t zero[6] = { 0, 0, 0, 0, 0, 0 };
+    test_check(axl_mac_format(zero, buf, sizeof buf) == AXL_OK
+               && axl_strcmp(buf, "00:00:00:00:00:00") == 0,
+               "mac format: all zeros");
+
+    /* Format small buffer / NULL safety */
+    test_check(axl_mac_format(addr, buf, 17) == AXL_ERR,
+               "mac format: buffer one byte too small");
+    test_check(axl_mac_format(NULL, buf, sizeof buf) == AXL_ERR,
+               "mac format: NULL mac");
+    test_check(axl_mac_format(addr, NULL, sizeof buf) == AXL_ERR,
+               "mac format: NULL buf");
+    test_check(axl_mac_format(addr, buf, 0) == AXL_ERR,
+               "mac format: zero size");
+
+    /* Parse valid: lowercase, canonical two-digit octets */
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:ff", mac) == AXL_OK,
+               "mac parse: lowercase");
+    test_check(mac[0] == 0xaa && mac[1] == 0xbb && mac[2] == 0xcc
+               && mac[3] == 0xdd && mac[4] == 0xee && mac[5] == 0xff,
+               "mac parse: octets correct");
+
+    /* Parse valid: uppercase and mixed case (case-insensitive) */
+    test_check(axl_mac_parse("AA:BB:CC:DD:EE:FF", mac) == AXL_OK
+               && mac[0] == 0xaa && mac[5] == 0xff,
+               "mac parse: uppercase");
+    test_check(axl_mac_parse("Aa:bB:Cc:dD:eE:fF", mac) == AXL_OK
+               && mac[0] == 0xaa && mac[5] == 0xff,
+               "mac parse: mixed case");
+
+    /* Parse valid: 1-digit octets (matches the CLI --mac flag's long-
+       standing behavior -- each octet accepts 1 or 2 hex digits). */
+    test_check(axl_mac_parse("1:2:3:4:5:6", mac) == AXL_OK
+               && mac[0] == 1 && mac[1] == 2 && mac[2] == 3
+               && mac[3] == 4 && mac[4] == 5 && mac[5] == 6,
+               "mac parse: single-digit octets");
+
+    /* Parse valid: all zeros */
+    test_check(axl_mac_parse("00:00:00:00:00:00", mac) == AXL_OK
+               && mac[0] == 0 && mac[5] == 0,
+               "mac parse: all zeros");
+
+    /* Reject: wrong separator */
+    test_check(axl_mac_parse("aa-bb-cc-dd-ee-ff", mac) == AXL_ERR,
+               "mac parse: reject hyphen separator");
+    test_check(axl_mac_parse("aa.bb.cc.dd.ee.ff", mac) == AXL_ERR,
+               "mac parse: reject dot separator");
+    test_check(axl_mac_parse("aabbccddeeff", mac) == AXL_ERR,
+               "mac parse: reject bare hex run (no separator)");
+
+    /* Reject: wrong octet count */
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee", mac) == AXL_ERR,
+               "mac parse: reject 5 octets");
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:ff:00", mac) == AXL_ERR,
+               "mac parse: reject 7 octets");
+
+    /* Reject: non-hex digit */
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:zz", mac) == AXL_ERR,
+               "mac parse: reject non-hex digit");
+    test_check(axl_mac_parse("gg:bb:cc:dd:ee:ff", mac) == AXL_ERR,
+               "mac parse: reject non-hex first octet");
+
+    /* Reject: octet overflows a byte (3 hex digits) */
+    test_check(axl_mac_parse("aaa:bb:cc:dd:ee:ff", mac) == AXL_ERR,
+               "mac parse: reject 3-digit octet");
+
+    /* Reject: trailing garbage after the sixth octet */
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:ff:", mac) == AXL_ERR,
+               "mac parse: reject trailing colon");
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:ffX", mac) == AXL_ERR,
+               "mac parse: reject trailing garbage");
+
+    /* Reject: empty / NULL */
+    test_check(axl_mac_parse("", mac) == AXL_ERR,
+               "mac parse: reject empty string");
+    test_check(axl_mac_parse(NULL, mac) == AXL_ERR,
+               "mac parse: NULL str");
+    test_check(axl_mac_parse("aa:bb:cc:dd:ee:ff", NULL) == AXL_ERR,
+               "mac parse: NULL mac");
+
+    /* Format/parse roundtrip */
+    test_check(axl_mac_parse("12:34:56:78:9a:bc", mac) == AXL_OK, "mac roundtrip: parse");
+    test_check(axl_mac_format(mac, buf, sizeof buf) == AXL_OK
+               && axl_strcmp(buf, "12:34:56:78:9a:bc") == 0,
+               "mac roundtrip: format matches input");
+}
+
+static void
+test_ipv4_parse_cidr(void)
+{
+    uint8_t oct[4], mask[4];
+    bool    hp;
+
+    /* Bare address: octets set, had_prefix false, mask untouched. */
+    axl_memset(mask, 0xAB, 4);
+    test_check(axl_ipv4_parse_cidr("10.0.0.5", oct, mask, &hp) == AXL_OK,
+               "cidr: bare parses");
+    test_check(oct[0] == 10 && oct[1] == 0 && oct[2] == 0 && oct[3] == 5,
+               "cidr: bare octets");
+    test_check(hp == false, "cidr: bare has no prefix");
+    test_check(mask[0] == 0xAB, "cidr: bare leaves mask untouched");
+
+    /* /24 -> 255.255.255.0 */
+    test_check(axl_ipv4_parse_cidr("192.168.1.1/24", oct, mask, &hp) == AXL_OK,
+               "cidr: /24 parses");
+    test_check(hp == true, "cidr: /24 has prefix");
+    test_check(mask[0] == 255 && mask[1] == 255 && mask[2] == 255 && mask[3] == 0,
+               "cidr: /24 mask");
+
+    /* /0 -> 0.0.0.0, /32 -> 255.255.255.255, /1 -> 128.0.0.0 */
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/0", oct, mask, &hp) == AXL_OK
+               && mask[0] == 0 && mask[3] == 0, "cidr: /0 mask all-zero");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/32", oct, mask, &hp) == AXL_OK
+               && mask[0] == 255 && mask[3] == 255, "cidr: /32 mask all-ones");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/1", oct, mask, &hp) == AXL_OK
+               && mask[0] == 128 && mask[1] == 0, "cidr: /1 mask 128.0.0.0");
+
+    /* Rejections. */
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/33", oct, mask, &hp) == AXL_ERR,
+               "cidr: /33 rejected");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/", oct, mask, &hp) == AXL_ERR,
+               "cidr: trailing slash rejected");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/x", oct, mask, &hp) == AXL_ERR,
+               "cidr: non-numeric prefix rejected");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/24x", oct, mask, &hp) == AXL_ERR,
+               "cidr: digits-then-garbage prefix rejected");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/4294967328", oct, mask, &hp) == AXL_ERR,
+               "cidr: 10-digit prefix rejected (no wrap)");
+    test_check(axl_ipv4_parse_cidr("255.255.255.2555/24", oct, mask, &hp) == AXL_ERR,
+               "cidr: over-long address rejected");
+    test_check(axl_ipv4_parse_cidr("256.0.0.1/24", oct, mask, &hp) == AXL_ERR,
+               "cidr: bad octet rejected");
+    test_check(axl_ipv4_parse_cidr(NULL, oct, mask, &hp) == AXL_ERR,
+               "cidr: NULL str rejected");
+    test_check(axl_ipv4_parse_cidr("1.2.3.4/24", NULL, mask, &hp) == AXL_ERR,
+               "cidr: NULL octets rejected");
+
+    /* had_prefix may be NULL. */
+    test_check(axl_ipv4_parse_cidr("8.8.8.8/8", oct, mask, NULL) == AXL_OK
+               && mask[0] == 255 && mask[1] == 0, "cidr: NULL had_prefix ok");
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_driver_is_ipxe — filename heuristic (pure predicate, no network)
+// ---------------------------------------------------------------------------
+
+static void
+test_net_driver_is_ipxe(void)
+{
+    /* Recognized: the real driver names axl_net_ensure_drivers /
+       axl_net_try_driver actually see on staged volumes (see
+       net_drivers_ipxe[] in axl-net-dhcp.c), a full path, a bare
+       mid-word occurrence, and case variants — case folding is
+       ASCII-only, same as the axl_strcasestr this delegates to. */
+    test_check(axl_net_driver_is_ipxe("ipxe-intel.efi"),
+               "is_ipxe: ipxe-intel.efi recognized");
+    test_check(axl_net_driver_is_ipxe("ipxe-all.efidrv"),
+               "is_ipxe: ipxe-all.efidrv recognized");
+    test_check(axl_net_driver_is_ipxe("ipxe-broadcom.efi"),
+               "is_ipxe: ipxe-broadcom.efi recognized");
+    test_check(axl_net_driver_is_ipxe("IPXE.EFI"),
+               "is_ipxe: all-caps recognized");
+    test_check(axl_net_driver_is_ipxe("Ipxe-Intel.Efi"),
+               "is_ipxe: mixed case recognized");
+    test_check(axl_net_driver_is_ipxe("fs0:\\drivers\\x64\\ipxe-intel.efi"),
+               "is_ipxe: full path recognized");
+    test_check(axl_net_driver_is_ipxe("myIPXEdriver.efi"),
+               "is_ipxe: substring mid-word recognized");
+
+    /* Not recognized: real non-iPXE driver names, and a deliberate near-miss
+       that shares every letter of "ipxe" but not the contiguous substring
+       (i-p-x-e in that exact order) — pins this is a substring match, not
+       a letter-set / anagram check. */
+    test_check(!axl_net_driver_is_ipxe("Rtk.efi"),
+               "is_ipxe: Rtk.efi not recognized");
+    test_check(!axl_net_driver_is_ipxe("RtkUndiDxe.efi"),
+               "is_ipxe: RtkUndiDxe.efi not recognized");
+    test_check(!axl_net_driver_is_ipxe("UsbRndis.efi"),
+               "is_ipxe: UsbRndis.efi not recognized");
+    test_check(!axl_net_driver_is_ipxe("NetworkCommon.efi"),
+               "is_ipxe: NetworkCommon.efi not recognized");
+    test_check(!axl_net_driver_is_ipxe("pixel.efi"),
+               "is_ipxe: pixel.efi (same letters, wrong order) not recognized");
+    test_check(!axl_net_driver_is_ipxe(""),
+               "is_ipxe: empty string not recognized");
+
+    /* NULL-safe: axl_strcasestr is NULL-safe and this predicate inherits it
+       rather than adding its own guard — a bare "does this string look
+       like iPXE" question has an honest false answer for "no string". */
+    test_check(!axl_net_driver_is_ipxe(NULL),
+               "is_ipxe: NULL -> false");
+}
+
+// ---------------------------------------------------------------------------
 // UDP Echo Test Mode — "udp-echo <host> <port>" sends a test datagram
 // and prints the response. Used by test-udp.sh.
 // ---------------------------------------------------------------------------
@@ -4269,9 +4766,8 @@ run_udp_echo_mode(const char *host, const char *port_str)
     axl_printf("UDP-ECHO: sending to %s:%u\n", host, (unsigned)port);
 
     int rc = axl_udp_sendrecv(sock, &dest, port,
-                              msg, axl_strlen(msg),
-                              rx_buf, sizeof(rx_buf) - 1, &rx_len,
-                              5000);
+                              msg, axl_strlen(msg), 5000,
+                              rx_buf, sizeof(rx_buf) - 1, &rx_len);
 
     if (rc == AXL_OK && rx_len > 0) {
         rx_buf[rx_len] = '\0';
@@ -4353,9 +4849,267 @@ run_tcp_connect_rtpl_mode(const char *host, const char *port_str)
     }
 
     if (sock != NULL) {
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
     }
     return (crc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// 9P client mode — "9p-client <host> <port>" connects + attaches a 9P2000.L
+// session against a host p9-server.py, printing 9P-CONNECT-OK on success,
+// then reads /hello.txt (9P-READ:<contents>) and attempts a missing leaf in
+// an existing dir (9P-READ-MISSING-OK on a clean AXL_ERR), lists /dir
+// (9P-LIST:<name>:<size>,...), then writes a new file and reads it back
+// (WRITE-RB:<contents>), overwrites it a second time to exercise the
+// truncate-existing branch (TRUNC-RB:<contents>), then round-trips a
+// 20000-byte buffer through /big.txt to exercise the chunked Twrite loop
+// (MULTICHUNK-OK). Used by test-9p-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_9p_client_mode(const char *host, const char *port_str)
+{
+    uint16_t port;
+    if (axl_str_to_u16(port_str, 10, &port, NULL) != 0 || port == 0) {
+        axl_printf("9P-CLIENT-FAIL:port\n");
+        return 1;
+    }
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    Axl9pClient *c = NULL;
+    if (axl_9p_connect(host, port, "axl", "/", &c) != AXL_OK) {
+        axl_printf("9P-CLIENT-FAIL:connect\n");
+        return 1;
+    }
+    axl_printf("9P-CONNECT-OK\n");
+
+    AxlBytes *fb = NULL;
+    if (axl_9p_read_file(c, "/hello.txt", &fb) == AXL_OK && fb != NULL) {
+        size_t n = 0;
+        const uint8_t *d = axl_bytes_get_data(fb, &n);
+        axl_printf("9P-READ:%.*s\n", (int)n, (const char *)d);
+        axl_bytes_unref(fb);
+    } else {
+        axl_printf("9P-READ-FAIL\n");
+    }
+
+    /* Missing leaf in an existing dir: read_file must fail cleanly (no
+       hang, no crash) via the partial-Twalk path client_walk clunks. */
+    AxlBytes *fb2 = NULL;
+    if (axl_9p_read_file(c, "/dir/nope.txt", &fb2) != AXL_OK) {
+        axl_printf("9P-READ-MISSING-OK\n");
+    } else {
+        axl_printf("9P-READ-MISSING-FAIL\n");
+        axl_bytes_unref(fb2);
+    }
+
+    /* Non-root directory: this is the ONLY caller in the tree that reaches
+       join_child_path's non-root branch, so it carries the size too -- a
+       join bug ("/dira.txt") would otherwise leave the names right and
+       every size silently 0. */
+    AxlArray *entries = NULL;
+    if (axl_9p_list(c, "/dir", &entries) == AXL_OK && entries != NULL) {
+        axl_printf("9P-LIST:");
+        for (size_t i = 0; i < axl_array_len(entries); i++) {
+            AxlFsEntry *e = (AxlFsEntry *)axl_array_get(entries, i);
+            axl_printf("%s:%llu,", e->name, (unsigned long long)e->size);
+        }
+        axl_printf("\n");
+        axl_array_free(entries);
+    } else {
+        axl_printf("9P-LIST-FAIL\n");
+    }
+
+    /* Write a new file, then read it back to prove the round-trip. */
+    if (axl_9p_write_file(c, "/wtest.txt", "hello-9p-write", 14) == AXL_OK) {
+        AxlBytes *wb = NULL;
+        if (axl_9p_read_file(c, "/wtest.txt", &wb) == AXL_OK && wb != NULL) {
+            size_t n = 0;
+            const uint8_t *d = axl_bytes_get_data(wb, &n);
+            axl_printf("WRITE-RB: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(wb);
+        } else {
+            axl_printf("WRITE-RB-FAIL:readback\n");
+        }
+    } else {
+        axl_printf("WRITE-RB-FAIL:write\n");
+    }
+
+    /* Write /wtest.txt a SECOND time with shorter, distinct content. Proves
+       the walk-succeeds -> O_TRUNC-open branch, and that the old 14-byte
+       tail from the first write doesn't survive the shrink. */
+    if (axl_9p_write_file(c, "/wtest.txt", "trunc", 5) == AXL_OK) {
+        AxlBytes *tb = NULL;
+        if (axl_9p_read_file(c, "/wtest.txt", &tb) == AXL_OK && tb != NULL) {
+            size_t n = 0;
+            const uint8_t *d = axl_bytes_get_data(tb, &n);
+            axl_printf("TRUNC-RB: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(tb);
+        } else {
+            axl_printf("TRUNC-RB-FAIL:readback\n");
+        }
+    } else {
+        axl_printf("TRUNC-RB-FAIL:write\n");
+    }
+
+    /* Multi-chunk Twrite: 20000 bytes forces multiple Twrite iterations at
+       the default 8192 msize (chunk = msize - AXL_9P_TWRITE_HDR_LEN, ~8169).
+       Verify the round-trip by length + sampled bytes instead of dumping
+       20 KB to serial. */
+    {
+        const size_t big_len = 20000;
+        uint8_t *big = (uint8_t *)axl_malloc(big_len);
+        if (big != NULL) {
+            for (size_t i = 0; i < big_len; i++) {
+                big[i] = (uint8_t)('A' + (i % 26));
+            }
+            if (axl_9p_write_file(c, "/big.txt", big, big_len) == AXL_OK) {
+                AxlBytes *bb = NULL;
+                if (axl_9p_read_file(c, "/big.txt", &bb) == AXL_OK && bb != NULL) {
+                    size_t n = 0;
+                    const uint8_t *d = axl_bytes_get_data(bb, &n);
+                    bool ok = (n == big_len)
+                        && d[0]     == (uint8_t)('A' + (0     % 26))
+                        && d[8191]  == (uint8_t)('A' + (8191  % 26))
+                        && d[8192]  == (uint8_t)('A' + (8192  % 26))
+                        && d[19999] == (uint8_t)('A' + (19999 % 26));
+                    axl_printf(ok ? "MULTICHUNK-OK\n" : "MULTICHUNK-FAIL:mismatch\n");
+                    axl_bytes_unref(bb);
+                } else {
+                    axl_printf("MULTICHUNK-FAIL:readback\n");
+                }
+            } else {
+                axl_printf("MULTICHUNK-FAIL:write\n");
+            }
+            axl_free(big);
+        } else {
+            axl_printf("MULTICHUNK-FAIL:alloc\n");
+        }
+    }
+
+    /* mkdir: create then confirm via the marker (a real client would
+       axl_9p_list the parent, but the marker alone proves Tmkdir round-trips
+       and the harness stays consistent with the other steps' style). */
+    if (axl_9p_mkdir(c, "/newdir") == AXL_OK) {
+        axl_printf("MKDIR-OK: /newdir\n");
+    } else {
+        axl_printf("MKDIR-FAIL: /newdir\n");
+    }
+
+    /* remove: delete the file written above, confirm a subsequent read
+       now fails cleanly. */
+    axl_9p_remove(c, "/wtest.txt");
+    AxlBytes *rb = NULL;
+    if (axl_9p_read_file(c, "/wtest.txt", &rb) != AXL_OK) {
+        axl_printf("REMOVE-GONE: /wtest.txt\n");
+    } else {
+        axl_printf("REMOVE-FAIL: /wtest.txt still readable\n");
+        axl_bytes_unref(rb);
+    }
+
+    /* rename: write a fresh source (the earlier one was just removed),
+       rename it, then read back the destination. */
+    axl_9p_write_file(c, "/ren-src.txt", "hello-9p-write", 14);
+    if (axl_9p_rename(c, "/ren-src.txt", "/ren-dst.txt") == AXL_OK) {
+        AxlBytes *renb = NULL;
+        if (axl_9p_read_file(c, "/ren-dst.txt", &renb) == AXL_OK) {
+            size_t n;
+            const uint8_t *d = axl_bytes_get_data(renb, &n);
+            axl_printf("RENAME-RB: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(renb);
+        }
+    }
+
+    /* Cross-directory rename: the server answers Rlerror(EXDEV) rather than
+       moving the bytes itself (an unbounded synchronous copy on its loop), so
+       the CLIENT must degrade to copy-then-unlink the way every POSIX client
+       does. Proves three things at once: the destination has the source's
+       bytes, the source is gone, and the call reported success only because
+       both actually happened. */
+    axl_9p_write_file(c, "/dir/xdev-src.txt", "xdev-payload", 12);
+    if (axl_9p_rename(c, "/dir/xdev-src.txt", "/xdev-dst.txt") == AXL_OK) {
+        AxlBytes *xb = NULL;
+        if (axl_9p_read_file(c, "/xdev-dst.txt", &xb) == AXL_OK) {
+            size_t         n = 0;
+            const uint8_t *d = axl_bytes_get_data(xb, &n);
+            axl_printf("XDEV-RB: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(xb);
+        } else {
+            axl_printf("XDEV-FAIL: destination unreadable\n");
+        }
+        AxlBytes *sb = NULL;
+        if (axl_9p_read_file(c, "/dir/xdev-src.txt", &sb) != AXL_OK) {
+            axl_printf("XDEV-SRC-GONE\n");
+        } else {
+            axl_printf("XDEV-FAIL: source survived the move\n");
+            axl_bytes_unref(sb);
+        }
+    } else {
+        axl_printf("XDEV-FAIL: rename returned an error\n");
+    }
+
+    /* Cross-directory rename of a DIRECTORY must be refused outright, not
+       silently treated as a file by the copy-then-unlink fallback (the
+       directory guard in rename_xdev_copy, axl-9p-client.c). Pick endpoints
+       in different directories so the server bounces it to EXDEV the same
+       way it does for the file case above, then confirm the client refuses
+       the fallback rather than moving the tree. */
+    if (axl_9p_mkdir(c, "/dir/xsub") == AXL_OK) {
+        if (axl_9p_rename(c, "/dir/xsub", "/xsub") != AXL_OK) {
+            axl_printf("XDEV-DIR-REFUSED\n");
+        } else {
+            axl_printf("XDEV-FAIL: directory rename should have been refused\n");
+        }
+    } else {
+        axl_printf("XDEV-FAIL: mkdir /dir/xsub\n");
+    }
+
+    /* The EXDEV fallback REFUSES a destination that already exists, before
+       it reads or writes anything (rename_xdev_copy's leading walk-then-
+       clunk in axl-9p-client.c). rename(2)'s permission to clobber is only
+       safe because the replacement is atomic; copy-then-unlink is not, so a
+       session drop mid-copy would leave a REAL file truncated or half
+       written. The refusal is the whole guarantee, and the guarantee is not
+       "the call returned AXL_ERR" -- it is that BOTH files still hold their
+       original bytes afterwards. Distinct contents so neither read-back can
+       be satisfied by the other file's payload, and so a clobber that
+       happened to preserve the length is still visible.
+
+       The fixture is deliberately more permissive here (p9-server.py's own
+       docstring: it overwrites at the destination rather than answering
+       EEXIST), so if this guard were deleted the rename would SUCCEED and
+       destroy /xdst2.txt -- which is exactly why the assertion can fail. */
+    axl_9p_write_file(c, "/xdst2.txt",     "dst-original", 12);
+    axl_9p_write_file(c, "/dir/xsrc2.txt", "src-original", 12);
+    if (axl_9p_rename(c, "/dir/xsrc2.txt", "/xdst2.txt") != AXL_OK) {
+        axl_printf("XDEV-EXIST-REFUSED\n");
+    } else {
+        axl_printf("XDEV-FAIL: taken destination was overwritten\n");
+    }
+    {
+        AxlBytes *db = NULL;
+        AxlBytes *sb2 = NULL;
+        if (axl_9p_read_file(c, "/xdst2.txt", &db) == AXL_OK && db != NULL) {
+            size_t         n = 0;
+            const uint8_t *d = axl_bytes_get_data(db, &n);
+            axl_printf("XDEV-EXIST-DST: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(db);
+        } else {
+            axl_printf("XDEV-FAIL: destination unreadable after the refusal\n");
+        }
+        if (axl_9p_read_file(c, "/dir/xsrc2.txt", &sb2) == AXL_OK && sb2 != NULL) {
+            size_t         n = 0;
+            const uint8_t *d = axl_bytes_get_data(sb2, &n);
+            axl_printf("XDEV-EXIST-SRC: %.*s\n", (int)n, (const char *)d);
+            axl_bytes_unref(sb2);
+        } else {
+            axl_printf("XDEV-FAIL: source unreadable after the refusal\n");
+        }
+    }
+
+    axl_9p_disconnect(c);
+    axl_printf("9P-CLIENT-OK\n");
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4631,8 +5385,8 @@ run_sntp_query_mode(const char *host, const char *port_str)
 
     axl_net_auto_init(SIZE_MAX, 10);
 
-    AxlSntpResult r;
-    int rc = axl_sntp_query(host, port, 5000, &r);
+    AxlNetSntpResult r;
+    int rc = axl_net_sntp_query(host, port, 5000, &r);
     axl_printf("SNTP: rc=%d reachable=%d unix_secs=%lld offset_ms=%d\n",
                rc, (int)r.reachable, (long long)r.unix_secs, r.offset_ms);
     if (rc == AXL_OK && r.reachable) {
@@ -4642,6 +5396,52 @@ run_sntp_query_mode(const char *host, const char *port_str)
         axl_printf("FAIL: sntp-query (rc=%d)\n", rc);
     }
     return (rc == AXL_OK) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// axl_net_auto_init_opts / quarantine — validation only (no live reconfigure).
+// The live "brings a NIC online" assertions run in net-diag mode where a real
+// DHCP lease exists; here we pin the safe negatives and the zero-init defaults,
+// which need no NIC and cannot perturb live firmware state.
+// ---------------------------------------------------------------------------
+static void
+test_auto_init_opts_validation(void)
+{
+    /* NULL opts is rejected before anything is touched. */
+    test_check(axl_net_auto_init_opts(NULL, NULL) == AXL_ERR,
+               "auto_init_opts: NULL opts -> AXL_ERR");
+
+    /* Zero-init IS the documented default (AUTO NIC + DHCP + SWEEP_DIR): pin the
+       enum values so a reorder that silently changes what a zeroed struct means
+       fails here. */
+    test_check(AXL_NET_NIC_SEL_AUTO == 0 && AXL_NET_IP_DHCP == 0
+                   && AXL_NET_DRV_SWEEP_DIR == 0,
+               "auto_init_opts: zero-init == AUTO + DHCP + SWEEP_DIR");
+
+    /* A STATIC request missing its address/mask is rejected on validation,
+       BEFORE any firmware bring-up -- so this is a safe negative even when a NIC
+       is already up (the engine must not answer 'online' to a malformed static
+       request just because some DHCP lease exists). */
+    static const uint8_t ip[4]   = { 192, 168, 5, 5 };
+    AxlNetAutoOpts st_no_ip = { 0 };
+    st_no_ip.ip_mode = AXL_NET_IP_STATIC;   /* static_ipv4 left NULL */
+    test_check(axl_net_auto_init_opts(&st_no_ip, NULL) == AXL_ERR,
+               "auto_init_opts: STATIC without static_ipv4 -> AXL_ERR");
+    AxlNetAutoOpts st_no_mask = { 0 };
+    st_no_mask.ip_mode     = AXL_NET_IP_STATIC;
+    st_no_mask.static_ipv4 = ip;             /* static_mask left NULL */
+    test_check(axl_net_auto_init_opts(&st_no_mask, NULL) == AXL_ERR,
+               "auto_init_opts: STATIC without static_mask -> AXL_ERR");
+
+    /* Shared driver quarantine: clear is best-effort AXL_OK; the init helper
+       rejects a NULL descriptor and binds a real one. */
+    test_check(axl_net_clear_driver_quarantine() == AXL_OK,
+               "clear_driver_quarantine: AXL_OK (best-effort)");
+    test_check(axl_net_driver_quarantine_init(NULL) == AXL_ERR,
+               "driver_quarantine_init: NULL -> AXL_ERR");
+    AxlAttempt qa;
+    test_check(axl_net_driver_quarantine_init(&qa) == AXL_OK,
+               "driver_quarantine_init: binds the shared namespace");
 }
 
 // ---------------------------------------------------------------------------
@@ -4691,6 +5491,91 @@ run_net_diag_mode(void)
                  "dhcp-lease: at least one DNS resolver");
     }
 
+    /* BUG regression: auto_init's short-circuit must ask "is THIS NIC
+       already up", not "is ANY NIC up", for an explicit nic_index. The
+       auto_init(0, 10) call above already established a real lease on NIC
+       0 -- the only physical NIC in this profile -- so the first ordinal
+       PAST it is out of range. Pre-fix, the short-circuit was
+       axl_net_get_ip_address() (NIC-agnostic: "does ANY NIC have an IP")
+       ahead of any bounds check, so it answered AXL_OK for this
+       out-of-range NIC purely because NIC 0 already leased -- "configure
+       NIC 1" reported success having configured nothing. Derived from the
+       live NIC count, never hardcoded, so it holds at any NIC count. */
+    size_t nd_nic_count = 0;
+    if (axl_net_list_interfaces(NULL, &nd_nic_count) == AXL_OK && nd_nic_count > 0) {
+        ND_CHECK(axl_net_auto_init(nd_nic_count, 10) == AXL_ERR,
+                 "auto_init: explicit out-of-range nic -> AXL_ERR "
+                 "(no ANY-NIC short-circuit leak)");
+        ND_CHECK(axl_net_bring_up(nd_nic_count, NULL, NULL, NULL, 10, NULL) == AXL_ERR,
+                 "bring_up: explicit out-of-range nic -> AXL_ERR (DHCP path)");
+    }
+
+    /* BUG regression: axl_net_bring_up's addr_out must report the address
+       of the NIC it actually configured, not merely "some configured
+       NIC" (axl_net_get_ip_address, by design, answers "does ANY NIC have
+       an address" -- first configured IP4Config2 wins, which can be a
+       DIFFERENT NIC than the one requested on a multi-NIC box). Both calls
+       below short-circuit inside auto_init (NIC 0 is already up from the
+       earlier call), so they touch no live firmware state -- purely a
+       read-back check. This single-NIC profile canNOT discriminate a
+       wrong-NIC misattribution (there is only one NIC to misattribute to),
+       so it does not re-prove the multi-NIC bug; it pins that the new
+       registry-attributed read-back still reports the right address for
+       both an explicit ordinal and AXL_NET_NIC_AUTO, and that the two
+       agree with each other. */
+    static const uint8_t bu_exp_addr[4] = { 10, 0, 2, 15 };
+    AxlIPv4Address bu_addr0;
+    ND_CHECK(axl_net_bring_up(0, NULL, NULL, NULL, 10, &bu_addr0) == AXL_OK
+             && axl_memcmp(bu_addr0.addr, bu_exp_addr, 4) == 0,
+             "bring_up: explicit nic 0 addr_out == 10.0.2.15 "
+             "(registry-attributed read-back)");
+    AxlIPv4Address bu_addr_auto;
+    ND_CHECK(axl_net_bring_up(AXL_NET_NIC_AUTO, NULL, NULL, NULL, 10, &bu_addr_auto) == AXL_OK
+             && axl_memcmp(bu_addr_auto.addr, bu_exp_addr, 4) == 0,
+             "bring_up: AXL_NET_NIC_AUTO addr_out == 10.0.2.15 "
+             "(same NIC AUTO configured)");
+
+    /* axl_net_auto_init_opts -- the library form of `netload -a`. NIC 0 is
+       already up from the bring_up calls above, so the firmware-first pass
+       satisfies the request without loading anything (drivers_tried == 0): a
+       safe read-back like the bring_up checks, not a live reconfigure. The
+       SWEEP_DIR driver loop itself is real-driver territory, covered by
+       netload's integration suite. */
+    AxlNetAutoOpts opts0 = { 0 };   /* zero-init == AUTO + DHCP + SWEEP_DIR */
+    AxlNetBringUpResult res0;
+    int rc_opts0 = axl_net_auto_init_opts(&opts0, &res0);
+    ND_CHECK(rc_opts0 == AXL_OK && res0.online,
+             "auto_init_opts: zero-init brings a NIC online (firmware-first)");
+    ND_CHECK(rc_opts0 == AXL_OK && axl_memcmp(res0.ipv4, bu_exp_addr, 4) == 0,
+             "auto_init_opts: result address == 10.0.2.15");
+    ND_CHECK(rc_opts0 == AXL_OK && res0.have_nic,
+             "auto_init_opts: result names a specific NIC");
+    ND_CHECK(rc_opts0 == AXL_OK && res0.drivers_tried == 0,
+             "auto_init_opts: firmware-first won, no drivers swept");
+
+    /* Explicit ordinal 0 + DHCP resolves to the same already-up NIC. */
+    AxlNetAutoOpts opts_idx = { 0 };
+    opts_idx.nic_select = AXL_NET_NIC_SEL_INDEX;
+    opts_idx.nic_index  = 0;
+    AxlNetBringUpResult res_idx;
+    ND_CHECK(axl_net_auto_init_opts(&opts_idx, &res_idx) == AXL_OK
+                 && res_idx.online && res_idx.have_nic && res_idx.nic_index == 0,
+             "auto_init_opts: SEL_INDEX 0 -> online, nic_index 0");
+
+    /* Select by MAC (eth0's own MAC) -> the same NIC. Exercises MAC resolution. */
+    AxlNetInterface od_if[4];
+    size_t od_nif = 4;
+    if (axl_net_list_interfaces(od_if, &od_nif) == AXL_OK && od_nif >= 1) {
+        AxlNetAutoOpts opts_mac = { 0 };
+        opts_mac.nic_select = AXL_NET_NIC_SEL_MAC;
+        axl_memcpy(opts_mac.nic_mac, od_if[0].mac, 6);
+        AxlNetBringUpResult res_mac;
+        ND_CHECK(axl_net_auto_init_opts(&opts_mac, &res_mac) == AXL_OK
+                     && res_mac.online
+                     && axl_memcmp(res_mac.mac, od_if[0].mac, 6) == 0,
+                 "auto_init_opts: SEL_MAC resolves eth0 and reports its MAC");
+    }
+
     /* by-MAC lease accessor. In the single-NIC QEMU profile the IP4Config2 and
        SNP index spaces coincide, so the MAC-resolved lease must equal the
        index-0 lease byte-for-byte (same NIC, two lookup paths). The decisive
@@ -4712,6 +5597,77 @@ run_net_diag_mode(void)
         ND_CHECK(axl_net_get_dhcp_lease_by_mac(bogus_mac, &lease_bogus) == AXL_ERR,
                  "dhcp-lease-by-mac: unknown MAC -> AXL_ERR (no clamp)");
     }
+
+    /* AXL_NET_NIC_AUTO through the same registry resolver the explicit-index
+       calls above use. get_dhcp_lease carries no "already configured"
+       short-circuit (unlike auto_init), so this genuinely exercises
+       ip4cfg_for(AUTO) -> _axl_net_nic_resolve_ip4cfg's AUTO branch rather
+       than short-circuiting before ever reaching it. In the single-NIC QEMU
+       profile AUTO has only one candidate, so it must match the index-0
+       lease byte-for-byte. */
+    AxlDhcpLease lease_auto;
+    int rca = axl_net_get_dhcp_lease(AXL_NET_NIC_AUTO, &lease_auto);
+    ND_CHECK(rca == AXL_OK,
+             "dhcp-lease: AXL_NET_NIC_AUTO resolves (registry AUTO rule)");
+    if (rca == AXL_OK && rc == AXL_OK) {
+        ND_CHECK(axl_memcmp(&lease_auto, &lease, sizeof(lease)) == 0,
+                 "dhcp-lease: AUTO matches index-0 lease byte-for-byte");
+    }
+
+    /* Out-of-range must ERROR, not clamp to NIC 0. Safe negatives -- each
+       returns on our own bounds check before any firmware call
+       (feedback_uefi_firmware_test_hazards); a VALID index here would
+       reconfigure live firmware, which is why only the out-of-range case is
+       driven. SIZE_MAX-1 rather than SIZE_MAX: SIZE_MAX IS AXL_NET_NIC_AUTO
+       and means auto-select, not out-of-range. These run here (post-DHCP),
+       not in the default-suite validation function: a clamp to NIC 0
+       answering AXL_OK is only distinguishable from the correct AXL_ERR once
+       a real lease exists on NIC 0 for it to leak. */
+
+    /* Pins the contract, but does NOT discriminate a clamp: IP4Config2 makes
+       the DNS list read-only under the DHCP policy this NIC is on, so the
+       SetData fails on its own merits whichever NIC the index resolves to.
+       Kept as a real assertion (not a regression guard, and not a tautology
+       -- it does pin "out-of-range never succeeds"). */
+    static const uint8_t oob_dns[4] = { 10, 0, 2, 3 };
+    ND_CHECK(axl_net_set_dns(SIZE_MAX - 1, oob_dns, NULL) == AXL_ERR,
+             "set-dns: out-of-range nic -> AXL_ERR (no clamp to NIC 0)");
+
+    /* set_static_ip_by_mac has no ordinal to go out-of-range, so its
+       equivalent safe negative is a MAC that names no NIC -- same hazard as
+       above (a VALID MAC would reconfigure live firmware under this test
+       binary; feedback_uefi_firmware_test_hazards), so only the unknown-MAC
+       rejection is driven here. This is the decisive pin of the "no
+       fallback" contract: ip4cfg_for_mac must not silently resolve to some
+       OTHER NIC when the MAC it was asked for isn't present. */
+    static const uint8_t sip_bogus_mac[6] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x02 };
+    static const uint8_t sip_oob_ip[4]      = { 192, 168, 1, 100 };
+    static const uint8_t sip_oob_netmask[4] = { 255, 255, 255, 0 };
+    ND_CHECK(axl_net_set_static_ip_by_mac(sip_bogus_mac, sip_oob_ip, sip_oob_netmask, NULL) == AXL_ERR,
+             "set-static-ip-by-mac: unknown MAC -> AXL_ERR (no fallback)");
+
+    /* Genuine clamp regression guards -- both answered AXL_OK for NIC 0 under
+       the deleted `>= count -> 0` clamp, because NIC 0 has a real lease for a
+       clamp to leak. */
+    AxlDhcpLease oob_lease;
+    ND_CHECK(axl_net_get_dhcp_lease(SIZE_MAX - 1, &oob_lease) == AXL_ERR,
+             "dhcp-lease: out-of-range nic -> AXL_ERR (no clamp to NIC 0)");
+
+    /* expect_ipv4 = NULL is the documented "any non-zero address" mode, and is
+       what makes this discriminate: a clamp resolves NIC 0, whose station
+       address IS non-zero (the SLIRP lease), so the buggy path settles
+       immediately with AXL_OK. Passing a deliberately-wrong address instead
+       would mask the clamp -- it would time out on the mismatch either way. */
+    ND_CHECK(axl_net_wait_ip_settled(SIZE_MAX - 1, NULL, 1) == AXL_ERR,
+             "wait-ip-settled: out-of-range nic -> AXL_ERR (no clamp to NIC 0)");
+
+    /* test-netdiag-qemu.sh drives AxlTestNet.efi with argv[1] == "net-diag",
+       which returns out of test_net_main() via run_net_diag_mode() before
+       ever reaching the default suite's registration of this same check
+       (below), so that boot needs its own call to exercise the dedup
+       contract. Its PASS:/FAIL: lines feed this mode's own "FAIL:" grep in
+       test-netdiag-qemu.sh. */
+    test_nic_registry_contract();
 
     /* Config method: OVMF provides IP4Config2, so the bring-up at the top of
        this mode used the standard path (the IP4Config2-free Dhcp4-SB / PXE
@@ -4796,6 +5752,44 @@ run_net_diag_mode(void)
     axl_printf("  link: up=%d speed_bps=%llu duplex=%u autoneg=%d\r\n",
                (int)ls.link_up, (unsigned long long)ls.speed_bps,
                (unsigned)ls.duplex, (int)ls.autoneg);
+
+    /* Ordinal consistency: get_link_stats(i) and list_interfaces()[i] must
+       describe the SAME NIC. Before the registry they indexed different
+       spaces (and computed link_up by different rules), so agreement was
+       coincidence at NIC 0 and wrong beyond it. */
+    size_t lc_n = 0;
+    if (axl_net_list_interfaces(NULL, &lc_n) == AXL_OK && lc_n > 0) {
+        AxlNetInterface *lc_ifs = axl_calloc(lc_n, sizeof *lc_ifs);
+        if (lc_ifs != NULL) {
+            size_t lc_filled = lc_n;
+            if (axl_net_list_interfaces(lc_ifs, &lc_filled) == AXL_OK) {
+                bool agree = true;
+                for (size_t i = 0; i < lc_filled; i++) {
+                    AxlNetLinkStats st_i;
+                    if (axl_net_get_link_stats(i, &st_i) != AXL_OK
+                        || st_i.link_up != lc_ifs[i].link_up) {
+                        agree = false;
+                        break;
+                    }
+                }
+                ND_CHECK(agree,
+                    "ordinal: get_link_stats(i).link_up == list_interfaces()[i].link_up");
+            }
+            axl_free(lc_ifs);
+        }
+
+        /* The decisive ordinal guard, and the one that does NOT depend on
+           media detection: the first index PAST the last physical NIC must be
+           rejected. One physical NIC publishes 2-3 SNP child handles here, so
+           pre-registry get_link_stats indexed a 3-entry raw handle buffer and
+           happily answered AXL_OK for ordinal 1 and 2 -- SNP children of the
+           SAME NIC that list_interfaces does not expose. Post-registry only
+           ordinals [0, lc_n) exist. Derived from the live count, never
+           hardcoded, so it holds at any NIC count. */
+        AxlNetLinkStats st_past;
+        ND_CHECK(axl_net_get_link_stats(lc_n, &st_past) == AXL_ERR,
+            "ordinal: get_link_stats(nic_count) -> AXL_ERR (SNP child handles are not ordinals)");
+    }
 
     axl_printf("=== net-diag Results: %d passed, %d failed ===\r\n",
                nd_pass, nd_fail);
@@ -5028,7 +6022,7 @@ test_socket_client_connect(void)
     if (ret == 0) {
         test_check(axl_socket_get_type(sock) == AXL_SOCKET_STREAM,
                    "socket_client: type is stream");
-        axl_socket_free(sock);
+        axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
     }
 
     axl_socket_client_free(client);
@@ -5083,7 +6077,7 @@ test_socket_stream_echo(void)
     axl_socket_address_free(remote);
     test_check(ret == 0, "socket stream: connect");
     if (ret != 0) {
-        axl_socket_free(client);
+        axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
         return;
     }
 
@@ -5099,7 +6093,7 @@ test_socket_stream_echo(void)
                    "socket stream: echo match");
     }
 
-    axl_socket_free(client);
+    axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
 }
 
 static void
@@ -5131,7 +6125,7 @@ test_socket_datagram_send(void)
     test_check(axl_socket_send(sock, "test", 4, 0) == AXL_ERR,
                "socket datagram: send (stream-only) fails");
 
-    axl_socket_free(sock);
+    axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
 }
 
 static void
@@ -5157,7 +6151,7 @@ test_socket_get_addresses(void)
 
     test_check(ret == 0, "socket get_addresses: connect");
     if (ret != 0) {
-        axl_socket_free(client);
+        axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
         return;
     }
 
@@ -5177,7 +6171,7 @@ test_socket_get_addresses(void)
         axl_socket_address_free(remote_sa);
     }
 
-    axl_socket_free(client);
+    axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
 }
 
 static void
@@ -5200,7 +6194,7 @@ test_socket_type_errors(void)
         test_check(axl_socket_receive(stream, buf, &sz, 0) == AXL_ERR,
                    "socket type_errors: receive on unconnected fails");
 
-        axl_socket_free(stream);
+        axl_socket_free(stream, AXL_TEARDOWN_GRACEFUL);
     }
 
     /* listen on datagram -> error */
@@ -5208,7 +6202,7 @@ test_socket_type_errors(void)
     if (dgram != NULL) {
         test_check(axl_socket_listen(dgram, 9995) == AXL_ERR,
                    "socket type_errors: listen on datagram fails");
-        axl_socket_free(dgram);
+        axl_socket_free(dgram, AXL_TEARDOWN_GRACEFUL);
     }
 }
 
@@ -5272,7 +6266,7 @@ test_socket_udp_async_recv(void)
        port that slirp can NAT the reply back to. */
     if (axl_socket_bind(sock, 9990) != AXL_OK) {
         axl_printf("SKIP: socket UDP async recv (bind 9990 failed)\n");
-        axl_socket_free(sock);
+        axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
         return;
     }
 
@@ -5287,7 +6281,7 @@ test_socket_udp_async_recv(void)
     test_check(rc == AXL_OK, "socket UDP async: receive_async");
     if (rc != AXL_OK) {
         axl_loop_free(loop);
-        axl_socket_free(sock);
+        axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
         return;
     }
 
@@ -5318,7 +6312,7 @@ test_socket_udp_async_recv(void)
        the socket holding a dangling loop pointer and a stale source
        id; the subsequent close path would then access freed memory
        and crash inside UDP4 Cancel's token-event access. */
-    axl_socket_free(sock);
+    axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(loop);
 }
 
@@ -5617,10 +6611,10 @@ test_socket_bind(void)
     if (stream != NULL) {
         test_check(axl_socket_bind(stream, 9987) == AXL_ERR,
                    "socket bind: stream fails");
-        axl_socket_free(stream);
+        axl_socket_free(stream, AXL_TEARDOWN_GRACEFUL);
     }
 
-    axl_socket_free(sock);
+    axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
 }
 
 // ---------------------------------------------------------------------------
@@ -5755,7 +6749,7 @@ test_http_auth_challenge(void)
     test_check(axl_http_server_set_auth_challenge(s, "Basic", "a\"b") == AXL_ERR,
                "auth challenge: realm with quote -> AXL_ERR");
 
-    axl_http_server_free(s);
+    axl_http_server_free(s, AXL_TEARDOWN_GRACEFUL);
 }
 
 // ---------------------------------------------------------------------------
@@ -5899,7 +6893,7 @@ test_connect_timeout(void)
     test_check(elapsed >= 500 && elapsed < 5000,
                "connect_timeout: 1s timeout honored (not the 10s default)");
     if (sock != NULL) {
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
     }
 }
 
@@ -5930,6 +6924,17 @@ test_driver_select_negatives(void)
     test_check(axl_net_try_driver("axl-no-such-nic-driver-xyz.efi", &tr) == AXL_ERR
                    && !tr.found,
                "try_driver: unlocatable name -> AXL_ERR, found=false");
+    /* On a pre-LoadImage error the result carries no owned resources: the MAC
+       array and driver handle are both NULL and the count is 0, so the caller's
+       uniform `axl_free(tr.bound_nic_macs)` cleanup is a safe no-op. (The
+       populated alloc path — one small heap array of newly-bound MACs plus a
+       resident driver handle — needs a real driver load and is
+       consumer/real-hardware verified, not exercised here; see
+       feedback_uefi_firmware_test_hazards.) */
+    test_check(tr.bound_nic_macs == NULL && tr.driver == NULL
+                   && tr.bound_nic_count == 0 && tr.snp_handles_added == 0,
+               "try_driver: error path owns nothing (macs/driver NULL, count 0)");
+    axl_free(tr.bound_nic_macs);   /* NULL -> no-op; documents the free contract */
 
     /* connect_stack is idempotent and safe to call repeatedly. */
     test_check(axl_net_connect_stack() == AXL_OK,
@@ -6043,6 +7048,15 @@ test_http_async_param_validation(void)
                                    async_cb_must_not_fire, &fired) == AXL_ERR,
                "http-async: POST NULL url -> AXL_ERR");
 
+    /* Sync variants surface the specific AxlStatus on validation (A2a part 2):
+       bad args -> AXL_INVALID, not the generic AXL_ERR. Both paths reject
+       before any network work. */
+    AxlHttpClientResponse *sresp = NULL;
+    test_check(axl_http_get(NULL, "http://h/", &sresp) == AXL_INVALID,
+               "http-sync: NULL client -> AXL_INVALID");
+    test_check(axl_http_get(c, NULL, &sresp) == AXL_INVALID,
+               "http-sync: NULL url -> AXL_INVALID");
+
     /* Drain the loop briefly: a buggy impl that deferred the callback
        despite the error return would surface here. */
     axl_loop_iterate_until(loop, NULL, 20 * 1000);
@@ -6050,6 +7064,459 @@ test_http_async_param_validation(void)
 
     axl_http_client_free(c);
     axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// Port-releasing teardown — "serve-rebind <graceful|abortive>". Proves
+// axl_http_server_free(RESET) releases the listen port synchronously so an
+// immediate rebind on the same port succeeds even with an in-flight connection
+// and WITHOUT pumping the loop.
+//
+// The teardown + rebind run INSIDE a loop callback, so axl_loop_is_running() is
+// true — the exact condition under which the graceful axl_http_server_free
+// DEFERS its listener/conn finalization to the loop. Because the rebind runs
+// synchronously in the same callback (no loop tick between free and rebind):
+//   graceful -> the port is still held -> REBIND-RC != 0 (the SoftBMC re-exec bug)
+//   abortive -> RST + inline finalize -> port free -> REBIND-RC == 0
+// Driven by test-http-rebind-qemu.sh, which holds an in-flight connection open
+// across the teardown and (abortive) re-curls the rebound server.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AxlLoop       *loop;
+    AxlHttpServer *s1;
+    AxlHttpServer *s2;
+    bool           abortive;
+    int            rebind_rc;
+} RebindCtx;
+
+static bool
+rebind_quit_cb(void *data)
+{
+    axl_loop_quit(((RebindCtx *)data)->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+rebind_probe_cb(void *data)
+{
+    RebindCtx *c = (RebindCtx *)data;
+
+    /* Inside a loop callback: axl_loop_is_running(loop) is true, so a graceful
+       free defers finalization to this loop. We rebind synchronously here with
+       no intervening tick. */
+    if (c->abortive) {
+        axl_http_server_free(c->s1, AXL_TEARDOWN_RESET);
+    } else {
+        axl_http_server_free(c->s1, AXL_TEARDOWN_GRACEFUL);
+    }
+    c->s1 = NULL;
+
+    c->s2 = axl_http_server_new(8080);
+    if (c->s2 != NULL) {
+        axl_http_server_add_route(c->s2, "GET", "/plain", on_get_plain, NULL);
+        c->rebind_rc = axl_http_server_start(c->s2, c->loop);
+    } else {
+        c->rebind_rc = -1;
+    }
+    axl_printf("REBIND-RC:%d\n", c->rebind_rc);
+    axl_printf(c->rebind_rc == 0 ? "REBIND-OK\n" : "REBIND-FAIL\n");
+    axl_printf("READY2\n");
+
+    /* Keep serving the rebound server ~3 s so the host can curl it, then quit. */
+    axl_loop_add_timeout(c->loop, 3000, rebind_quit_cb, c);
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+run_serve_rebind_mode(const char *variant)
+{
+    RebindCtx c;
+    axl_memset(&c, 0, sizeof(c));
+    c.abortive = (axl_strcmp(variant, "abortive") == 0);
+
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    c.loop = axl_loop_new();
+    c.s1   = axl_http_server_new(8080);
+    if (c.loop == NULL || c.s1 == NULL) {
+        axl_printf("ERROR: rebind setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(c.s1, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(c.s1, c.loop) != 0) {
+        axl_printf("ERROR: rebind initial start failed\n");
+        return -1;
+    }
+
+    /* Fire the teardown+rebind ~2 s in — enough for the host to open an
+       in-flight connection first. */
+    axl_loop_add_timeout(c.loop, 2000, rebind_probe_cb, &c);
+    axl_printf("READY\n");
+    axl_loop_run(c.loop);
+
+    if (c.s2 != NULL) {
+        axl_http_server_free(c.s2, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(c.loop);
+    axl_printf("REBIND-DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// serve-rebind-load — the under-load port-release regression.
+//
+// Unlike serve-rebind (one accepted, delivered connection), this NEVER pumps
+// the accept loop before teardown: it starts the listener, prints READY, then
+// axl_msleep()s while the host opens SEVERAL connections. The firmware completes
+// their handshakes on its own periodic timer and queues them in the listen
+// socket's ACCEPT BACKLOG — established, but never delivered to on_accept_ready
+// (the loop never ran), so the server tracks NONE of them in s->conns. Then it
+// frees + rebinds :8080 synchronously with no pump.
+//
+// The backlog children hold PCBs on :8080. A correct abortive teardown must RST
+// + DestroyChild them synchronously, so:
+//   abortive (GREEN): REBIND-RC == 0 — port released even with a full backlog.
+//   abortive, unfixed (RED): REBIND-RC != 0 — backlog still holds the port.
+// Driven by test-http-rebind-load-qemu.sh, which opens the backlog on READY.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_rebind_load_mode(const char *variant)
+{
+    RebindCtx c;
+    axl_memset(&c, 0, sizeof(c));
+    c.abortive = (axl_strcmp(variant, "abortive") == 0);
+
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    c.loop = axl_loop_new();
+    c.s1   = axl_http_server_new(8080);
+    if (c.loop == NULL || c.s1 == NULL) {
+        axl_printf("ERROR: rebind-load setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(c.s1, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(c.s1, c.loop) != 0) {
+        axl_printf("ERROR: rebind-load initial start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+
+    /* Let the host's connections complete their handshakes into the firmware
+       accept backlog WITHOUT pumping our accept loop — nothing is delivered to
+       on_accept_ready, so the server tracks none of them. */
+    axl_msleep(4000);
+
+    /* Teardown + immediate synchronous rebind, NO loop pump — the code path the
+       backlog must not defeat. */
+    if (c.abortive) {
+        axl_http_server_free(c.s1, AXL_TEARDOWN_RESET);
+    } else {
+        axl_http_server_free(c.s1, AXL_TEARDOWN_GRACEFUL);
+    }
+    c.s1 = NULL;
+
+    c.s2 = axl_http_server_new(8080);
+    if (c.s2 != NULL) {
+        axl_http_server_add_route(c.s2, "GET", "/plain", on_get_plain, NULL);
+        c.rebind_rc = axl_http_server_start(c.s2, c.loop);
+    } else {
+        c.rebind_rc = -1;
+    }
+    axl_printf("REBIND-RC:%d\n", c.rebind_rc);
+    axl_printf(c.rebind_rc == 0 ? "REBIND-OK\n" : "REBIND-FAIL\n");
+    axl_printf("READY2\n");
+
+    /* Prove the rebound server actually serves on the reused port. */
+    if (c.s2 != NULL && c.rebind_rc == 0) {
+        axl_loop_add_timeout(c.loop, 3000, rebind_quit_cb, &c);
+        axl_loop_run(c.loop);
+        axl_http_server_free(c.s2, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(c.loop);
+    axl_printf("REBIND-DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// serve-rebind-churn — the pending-deferred-close port-release regression.
+//
+// serve-rebind-load exercises the accept BACKLOG (never-accepted connections).
+// This exercises the third port-holder category: connections that were accepted
+// and SERVED, then GRACEFULLY closed (Connection: close), whose close is still
+// in flight at teardown — its s->conns slot already freed, its AxlTcpCloseCtx /
+// on_close_event now owned by the LOOP, not the server. Those deferred closes
+// keep a PCB on the port until finalize_close_ctx runs (~2 s TIME_WAIT, needs a
+// pump), and hold a caller-owned loop source.
+//
+// It pumps briefly so the server accepts + serves + graceful-closes the host's
+// churn connections (leaving deferred closes in flight), then STOPS pumping and
+// frees + rebinds synchronously. A correct abortive teardown must finalize those
+// deferred closes synchronously and loop-free, so:
+//   abortive (GREEN): REBIND-RC == 0 AND axl_loop_free reports zero still-active
+//                     caller-owned sources.
+//   abortive, unfixed (RED): REBIND-RC != 0 and the deferred-close sources leak.
+// Driven by test-http-rebind-churn-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_rebind_churn_mode(const char *variant)
+{
+    RebindCtx c;
+    axl_memset(&c, 0, sizeof(c));
+    c.abortive = (axl_strcmp(variant, "abortive") == 0);
+
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    c.loop = axl_loop_new();
+    c.s1   = axl_http_server_new(8080);
+    if (c.loop == NULL || c.s1 == NULL) {
+        axl_printf("ERROR: rebind-churn setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(c.s1, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(c.s1, c.loop) != 0) {
+        axl_printf("ERROR: rebind-churn initial start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+
+    /* Pump ~1.2 s so the server accepts + serves + graceful-closes the host's
+       churn connections. Their closes go DEFERRED on the loop (TIME_WAIT ~2 s),
+       so when the pump stops they are still in flight. */
+    axl_loop_add_timeout(c.loop, 1200, rebind_quit_cb, &c);
+    axl_loop_run(c.loop);
+
+    /* Teardown + rebind synchronously, NO further pump — the deferred closes
+       are still in flight and must be finalized by the abortive free itself. */
+    if (c.abortive) {
+        axl_http_server_free(c.s1, AXL_TEARDOWN_RESET);
+    } else {
+        axl_http_server_free(c.s1, AXL_TEARDOWN_GRACEFUL);
+    }
+    c.s1 = NULL;
+
+    c.s2 = axl_http_server_new(8080);
+    if (c.s2 != NULL) {
+        axl_http_server_add_route(c.s2, "GET", "/plain", on_get_plain, NULL);
+        c.rebind_rc = axl_http_server_start(c.s2, c.loop);
+    } else {
+        c.rebind_rc = -1;
+    }
+    axl_printf("REBIND-RC:%d\n", c.rebind_rc);
+    axl_printf(c.rebind_rc == 0 ? "REBIND-OK\n" : "REBIND-FAIL\n");
+
+    /* Free the rebound server (no conns) and the loop with NO intervening pump.
+       axl_loop_free logs a "caller-owned event source still active" error for
+       every deferred close the abortive free failed to finalize. */
+    if (c.s2 != NULL) {
+        axl_http_server_free(c.s2, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(c.loop);
+    axl_printf("REBIND-DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// serve-rebind-multi — deferred-close finalize must be SCOPED to one listener.
+//
+// TWO servers (A :8080, B :8081) on ONE loop, the SoftBMC multi-server topology.
+// Both are pumped so both accumulate in-flight loop-deferred graceful closes.
+// Then ONLY server A is abortive-freed + rebound, with NO pump. The fix finalizes
+// A's deferred closes scoped by A's listener_id — it must NOT touch B's. Proof:
+//   - A's port :8080 rebinds immediately (REBIND-A-RC:0), and
+//   - server B is UNHARMED: after a pump (which finalizes B's deferred closes the
+//     normal way via on_close_event), B still serves on :8081, both A' and B
+//     answer 200, and axl_loop_free reports zero still-active sources.
+// A broken scope (finalizing B's ctxs during A's teardown) would double-finalize
+// B's closes when the loop later pumps on_close_event -> crash/hang/leak, and B
+// would not serve. Driven by test-http-rebind-multi-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static bool
+multi_quit_cb(void *data)
+{
+    axl_loop_quit((AxlLoop *)data);
+    return AXL_SOURCE_REMOVE;
+}
+
+static int
+run_serve_rebind_multi_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *a    = axl_http_server_new(8080);
+    AxlHttpServer *b    = axl_http_server_new(8081);
+    if (loop == NULL || a == NULL || b == NULL) {
+        axl_printf("ERROR: rebind-multi setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(a, "GET", "/plain", on_get_plain, NULL);
+    axl_http_server_add_route(b, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(a, loop) != 0 || axl_http_server_start(b, loop) != 0) {
+        axl_printf("ERROR: rebind-multi start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+
+    /* Pump ~1.2 s so BOTH servers serve + graceful-close the host's churn on
+       :8080 AND :8081 — deferred closes for both listeners now sit on the loop. */
+    axl_loop_add_timeout(loop, 1200, multi_quit_cb, loop);
+    axl_loop_run(loop);
+
+    /* Abortive-free ONLY server A + rebind :8080, NO pump. The finalize must
+       clear A's deferred closes (scoped by A's listener_id) and leave B's. */
+    axl_http_server_free(a, AXL_TEARDOWN_RESET);
+    AxlHttpServer *a2 = axl_http_server_new(8080);
+    int rc_a = -1;
+    if (a2 != NULL) {
+        axl_http_server_add_route(a2, "GET", "/plain", on_get_plain, NULL);
+        rc_a = axl_http_server_start(a2, loop);
+    }
+    axl_printf("REBIND-A-RC:%d\n", rc_a);
+    axl_printf(rc_a == 0 ? "REBIND-A-OK\n" : "REBIND-A-FAIL\n");
+    axl_printf("READY2\n");
+
+    /* Pump: B's deferred closes finalize the normal way (on_close_event); A' and B
+       both serve the host's verification GETs. If A's teardown had corrupted B's
+       deferred ctxs this pump would fault or B would stop serving. */
+    axl_loop_add_timeout(loop, 3000, multi_quit_cb, loop);
+    axl_loop_run(loop);
+
+    if (a2 != NULL) {
+        axl_http_server_free(a2, AXL_TEARDOWN_RESET);
+    }
+    axl_http_server_free(b, AXL_TEARDOWN_RESET);
+    axl_loop_free(loop);
+    axl_printf("MULTI-DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// socket-rebind-load — axl_socket_free(RESET) parity with the HTTP path.
+//
+// The BSD-style AxlSocket API is a veneer over AxlTcp. axl_socket_free(RESET)
+// must deliver the same port-releasing teardown as axl_http_server_free(RESET):
+// a stream-socket listener with a firmware accept backlog at teardown rebinds
+// immediately, no pump. Same reproduction as serve-rebind-load, via the socket
+// API: listen + arm async accept (a real async socket server), never pump, let
+// the host queue a backlog, then free + re-listen synchronously.
+//   abortive (GREEN): REBIND-RC == 0 — the wrapper reached axl_tcp_close(RESET).
+//   graceful (RED): REBIND-RC != 0 — the backlog still holds the port.
+// Driven by test-socket-rebind-load-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static bool
+socket_accept_noop_cb(AxlSocket *client, AxlStatus status, void *data)
+{
+    (void)data;
+    /* Never actually fires (the loop is not pumped before teardown); if it did,
+       release the accepted client rather than leak it. */
+    if (status == AXL_OK && client != NULL) {
+        axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
+    }
+    return true;   /* keep accepting */
+}
+
+static int
+run_socket_rebind_load_mode(const char *variant)
+{
+    bool abortive = (axl_strcmp(variant, "abortive") == 0);
+
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop   *loop = axl_loop_new();
+    AxlSocket *s1   = axl_socket_new(AXL_SOCKET_STREAM);
+    if (loop == NULL || s1 == NULL) {
+        axl_printf("ERROR: socket rebind-load setup failed\n");
+        return -1;
+    }
+    if (axl_socket_listen(s1, 8080) != AXL_OK) {
+        axl_printf("ERROR: socket listen failed\n");
+        return -1;
+    }
+    /* Arm async accept (a real async socket server) but never pump the loop, so
+       the host's connections queue in the firmware accept backlog undelivered. */
+    axl_socket_accept_async(s1, loop, socket_accept_noop_cb, NULL);
+    axl_printf("READY\n");
+
+    axl_msleep(4000);
+
+    /* Teardown + immediate synchronous re-listen, NO pump. */
+    if (abortive) {
+        axl_socket_free(s1, AXL_TEARDOWN_RESET);
+    } else {
+        axl_socket_free(s1, AXL_TEARDOWN_GRACEFUL);
+    }
+
+    AxlSocket *s2 = axl_socket_new(AXL_SOCKET_STREAM);
+    int rc = (s2 != NULL) ? axl_socket_listen(s2, 8080) : -1;
+    axl_printf("REBIND-RC:%d\n", rc);
+    axl_printf(rc == AXL_OK ? "REBIND-OK\n" : "REBIND-FAIL\n");
+    axl_printf("READY2\n");
+
+    if (s2 != NULL) {
+        axl_socket_free(s2, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(loop);
+    axl_printf("REBIND-DONE\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// serve-rebind-storm — AXL_TEARDOWN_RESET must RETURN BOUNDED under a
+// connect-storm. Unlike serve-rebind-load (a fixed backlog opened before
+// teardown), here the host hammers NEW connections continuously THROUGH the
+// free: the firmware keeps completing handshakes and refilling the accept
+// backlog while the drain runs. A drain that re-arms Accept and chases fresh
+// arrivals never converges and the free wedges. The free MUST quiesce new
+// accepts / bound itself and return.
+//
+// Brackets the free with FREE-START / FREE-DONE so the harness can measure its
+// wall-clock from the serial timestamps. Driven by test-http-rebind-storm-qemu.sh.
+// ---------------------------------------------------------------------------
+
+static int
+run_serve_rebind_storm_mode(void)
+{
+    axl_net_auto_init(SIZE_MAX, 10);
+
+    AxlLoop       *loop = axl_loop_new();
+    AxlHttpServer *s1   = axl_http_server_new(8080);
+    if (loop == NULL || s1 == NULL) {
+        axl_printf("ERROR: rebind-storm setup failed\n");
+        return -1;
+    }
+    axl_http_server_add_route(s1, "GET", "/plain", on_get_plain, NULL);
+    if (axl_http_server_start(s1, loop) != 0) {
+        axl_printf("ERROR: rebind-storm initial start failed\n");
+        return -1;
+    }
+    axl_printf("READY\n");
+
+    /* Host storms new connections from here through the free below. */
+    axl_msleep(4000);
+
+    axl_printf("FREE-START\n");
+    axl_http_server_free(s1, AXL_TEARDOWN_RESET);
+    axl_printf("FREE-DONE\n");
+
+    AxlHttpServer *s2 = axl_http_server_new(8080);
+    int rc = -1;
+    if (s2 != NULL) {
+        axl_http_server_add_route(s2, "GET", "/plain", on_get_plain, NULL);
+        rc = axl_http_server_start(s2, loop);
+    }
+    axl_printf("REBIND-RC:%d\n", rc);
+    axl_printf(rc == 0 ? "REBIND-OK\n" : "REBIND-FAIL\n");
+    if (s2 != NULL && rc == 0) {
+        axl_http_server_free(s2, AXL_TEARDOWN_RESET);
+    }
+    axl_loop_free(loop);
+    axl_printf("REBIND-DONE\n");
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -6062,6 +7529,30 @@ test_net_main(
     char **argv)
 {
     axl_info("AxlTestNet starting");
+
+    if (argc >= 3 && axl_strcmp(argv[1], "serve-rebind") == 0) {
+        return run_serve_rebind_mode(argv[2]);
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-rebind-storm") == 0) {
+        return run_serve_rebind_storm_mode();
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "serve-rebind-load") == 0) {
+        return run_serve_rebind_load_mode(argv[2]);
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "serve-rebind-churn") == 0) {
+        return run_serve_rebind_churn_mode(argv[2]);
+    }
+
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-rebind-multi") == 0) {
+        return run_serve_rebind_multi_mode();
+    }
+
+    if (argc >= 3 && axl_strcmp(argv[1], "socket-rebind-load") == 0) {
+        return run_socket_rebind_load_mode(argv[2]);
+    }
 
     //
     // Check for "serve" argument -- start HTTP server mode
@@ -6094,6 +7585,10 @@ test_net_main(
     // connect/disconnect against the pumped server used to wedge the loop
     // (synchronous close-frame echo nesting an ephemeral loop at raised TPL).
     //
+    if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-ws-close-pendtx-driver") == 0) {
+        return run_serve_tls_ws_close_pendtx_driver_mode();
+    }
+
     if (argc >= 2 && axl_strcmp(argv[1], "serve-tls-ws-driver") == 0) {
         return run_serve_tls_ws_driver_mode();
     }
@@ -6203,6 +7698,13 @@ test_net_main(
     }
 
     //
+    // "9p-client <host> <port>" -- 9P2000.L connect + attach round-trip
+    //
+    if (argc >= 4 && axl_strcmp(argv[1], "9p-client") == 0) {
+        return run_9p_client_mode(argv[2], argv[3]);
+    }
+
+    //
     // "sntp-query <host> <port>" -- query a (mock) SNTP server
     //
     if (argc >= 4 && axl_strcmp(argv[1], "sntp-query") == 0) {
@@ -6277,6 +7779,19 @@ test_net_main(
     //
     axl_printf("\n--- IPv4 Parse/Format ---\n");
     test_ipv4_parse_format();
+    test_ipv4_parse_cidr();
+
+    //
+    // MAC parse / format (no network)
+    //
+    axl_printf("\n--- MAC Parse/Format ---\n");
+    test_mac_format_parse();
+
+    //
+    // Driver selection — pure predicates (no network)
+    //
+    axl_printf("\n--- Driver Selection ---\n");
+    test_net_driver_is_ipxe();
 
     //
     // AxlNetOpts (no network — validation only)
@@ -6285,6 +7800,9 @@ test_net_main(
     test_net_opts_validation();
     test_net_resolve_ptr_validation();
     test_ws_conn_api_validation();
+    test_nic_registry_contract();
+    test_net_list_interfaces_alloc_contract();
+    test_auto_init_opts_validation();
 
     //
     // AxlInetAddress (no network)

@@ -120,11 +120,13 @@ static const AxlConfigDesc my_opts[] = {
 Option types:
 
 ```c
-#define AXL_CFG_BOOL    1   // "true"/"false"/"1"/"0"
-#define AXL_CFG_INT     2   // signed integer
-#define AXL_CFG_UINT    3   // unsigned integer
-#define AXL_CFG_STRING  4   // arbitrary string
-#define AXL_CFG_MULTI   5   // repeatable string (array)
+typedef enum {
+    AXL_CFG_BOOL   = 1,  // "true"/"false"/"1"/"0"
+    AXL_CFG_INT    = 2,  // signed integer
+    AXL_CFG_UINT   = 3,  // unsigned integer
+    AXL_CFG_STRING = 4,  // arbitrary string
+    AXL_CFG_MULTI  = 5   // repeatable string (array)
+} AxlConfigType;
 ```
 
 The `short` field (single char) enables command-line flag mapping:

@@ -504,7 +504,7 @@ static int my_main(AxlHandle h, AxlSystemTable *st) {
 static int my_unload(AxlHandle h) {
     (void)h;
     return axl_shared_driver_unpublish(MY_TOOL_NAME,
-                                       gPublishedHandle, &gVtable);
+                                       &gVtable, gPublishedHandle);
 }
 
 AXL_DRIVER(my_main, my_unload)

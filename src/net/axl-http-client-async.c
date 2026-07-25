@@ -154,7 +154,7 @@ req_drop_connection(HttpAsyncReq *req)
         if (req->sync_close) {
             c->sock->async_loop = NULL;
         }
-        axl_tcp_close(c->sock);
+        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
         c->sock = NULL;
     }
     axl_free(c->connected_host);
@@ -1163,20 +1163,20 @@ http_sync_poll_tick(void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
-int
+AxlStatus
 _axl_http_request_sync(AxlHttpClient *c, const char *method, const char *url,
                        const void *body, size_t size, const char *content_type,
                        AxlHashTable *extra_headers,
                        AxlHttpClientResponse **out_resp)
 {
     if (c == NULL || url == NULL || out_resp == NULL) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
     *out_resp = NULL;
 
     AxlLoop *loop = axl_loop_new();
     if (loop == NULL) {
-        return AXL_ERR;
+        return AXL_NO_RESOURCES;
     }
 
     HttpSyncResult r = { .resp = NULL, .st = AXL_ERR, .loop = loop };
@@ -1219,5 +1219,8 @@ _axl_http_request_sync(AxlHttpClient *c, const char *method, const char *url,
         *out_resp = r.resp;
         return AXL_OK;
     }
-    return AXL_ERR;   /* r.resp is NULL on every failure path */
+    /* Surface the specific computed status (AXL_TIMEOUT / AXL_CANCELLED /
+       AXL_ERR / ...) rather than collapsing to a generic AXL_ERR. r.resp is
+       NULL on every failure path. */
+    return r.st;
 }

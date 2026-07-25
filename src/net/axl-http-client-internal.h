@@ -111,8 +111,9 @@ _axl_http_request_async(
    private loop, runs the async request to completion (driving a Poll tick over
    the client's current socket when called at a raised TPL so it progresses
    there too), and harvests the response. Defined in axl-http-client-async.c.
-   Returns AXL_OK with @p *out_resp set, or an error (and @p *out_resp NULL). */
-int
+   Returns AXL_OK with @p *out_resp set, or a specific negative AxlStatus
+   (and @p *out_resp NULL). */
+AxlStatus
 _axl_http_request_sync(
     AxlHttpClient          *c,
     const char             *method,

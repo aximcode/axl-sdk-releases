@@ -256,6 +256,38 @@ typedef struct {
     void (*set_mode)(void *user, uint32_t mode);
 
     /**
+     * @brief The console grid changed size, in character cells.
+     *
+     * The companion to @c set_mode, which reports only the mode *number* — a
+     * consumer cannot size a remote terminal from that without a lookup it may
+     * not be able to perform (while a take-over device is installed the mode
+     * number means whatever that device says it means). This carries the
+     * geometry directly.
+     *
+     * Fired whenever @ref AxlConsoleDevice's advertised geometry changes, AFTER
+     * the change lands — so @ref axl_console_device_get_size already agrees with
+     * @c cols / @c rows by the time this runs, and a consumer may use either.
+     * That is a text-mode switch under
+     * @ref AxlConsoleDeviceConfig::passthrough_local (where the device mirrors
+     * the physical mode list, so one switch reshapes both co-painting consoles),
+     * and @ref axl_console_device_set_size on the evicting take-over path.
+     *
+     * NOT fired during `axl_console_device_install` — the firmware may re-mode
+     * the console while ConSplitter binds us, and delivering that would reach a
+     * handler before its caller holds the device pointer. Read the size once
+     * after installing and let this maintain it from there.
+     *
+     * **Runs inside the firmware's `SetMode` fan-out**, mid-iteration over
+     * ConSplitter's device list. A handler must not write to the console
+     * (`axl_printf`, `axl_warning`) or call back into `axl_console_*` — the
+     * aggregate's own mode state is half-updated at that point, and re-entering
+     * `SetMode` corrupts it. Record the size and do the work later.
+     *
+     * Optional. `axl-vterm` never calls it.
+     */
+    void (*resize)(void *user, uint32_t cols, uint32_t rows);
+
+    /**
      * @brief Erase a rectangle to the current pen's background.
      *
      * @c selective means DECSEL/DECSED: leave DECSCA-protected cells alone.

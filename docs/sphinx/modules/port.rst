@@ -1,5 +1,5 @@
-AxlPort — x86 I/O port access
-==============================
+AXL I/O Port — x86 I/O port access
+===================================
 
 Public wrappers around the x86 ``in`` / ``out`` instruction family
 for legacy hardware that hasn't moved to MMIO (CMOS, SuperIO, IPMI
@@ -11,4 +11,4 @@ wrong-arch usage fails at link time rather than silently no-op'ing.
 API Reference
 -------------
 
-.. doxygenfile:: axl-port.h
+.. doxygenfile:: axl-io-port.h

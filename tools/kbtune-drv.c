@@ -543,7 +543,7 @@ kbtune_drv_unload(AxlHandle image)
 {
     (void)image;
     if (g_handle != NULL) {
-        axl_shared_driver_unpublish(KBTUNE_SHARED_NAME, g_handle, &g_vtable);
+        axl_shared_driver_unpublish(KBTUNE_SHARED_NAME, &g_vtable, g_handle);
         g_handle = NULL;
     }
     uninstall_wrap(&g_instance);

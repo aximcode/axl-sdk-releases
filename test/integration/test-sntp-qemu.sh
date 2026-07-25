@@ -1,10 +1,10 @@
 #!/bin/bash
 # test-meta: arch=x64 needs= est=15 local-only=0
-# test-sntp-qemu.sh — axl_sntp_query against a host-side mock SNTP server.
+# test-sntp-qemu.sh — axl_net_sntp_query against a host-side mock SNTP server.
 #
 # Boots QEMU with SLIRP networking; the guest queries 10.0.2.2:<port> (SLIRP
 # forwards guest outbound UDP to the host), where a mock SNTP responder serves
-# a FIXED, known Unix time. The guest's axl_sntp_query must parse that exact
+# a FIXED, known Unix time. The guest's axl_net_sntp_query must parse that exact
 # value, proving the SNTP request/response round-trip + timestamp decode.
 #
 # Usage: ./test/integration/test-sntp-qemu.sh [--arch X64|AARCH64]
@@ -47,7 +47,7 @@ test_add_efi "$TEST_BUILD_DIR/AxlTestNet.efi"
 
 test_build_image
 
-echo "=== AxlSntp Integration Test ($TEST_ARCH) ==="
+echo "=== AxlNetSntp Integration Test ($TEST_ARCH) ==="
 
 # Start the host-side mock SNTP responder.
 SNTP_PID=0

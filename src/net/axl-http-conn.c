@@ -272,16 +272,16 @@ drive_tls_drain(
 
         uint8_t plain_buf[TLS_DRAIN_BATCH];
         size_t  plain_len = 0;
-        int rc = axl_tls_read(conn->tls_ctx, plain_buf, sizeof(plain_buf),
+        AxlTlsStatus rc = axl_tls_read(conn->tls_ctx, plain_buf, sizeof(plain_buf),
                               &plain_len);
-        if (rc == 1) {
+        if (rc == AXL_TLS_WANT_MORE) {
             /* WANT_READ: the staged ciphertext is an incomplete record;
                we need more from the transport. mbedTLS has copied what it
                consumed into its own buffer, so re-arming (which overwrites
                the staging buffer) is safe — it reassembles across reads. */
             break;
         }
-        if (rc < 0 || plain_len == 0) {
+        if (rc == AXL_TLS_ERR || plain_len == 0) {
             conn->tls_draining = false;
             reset_connection(conn);
             return;
@@ -392,8 +392,8 @@ dispatch_and_respond(
 // Connection cleanup
 // ---------------------------------------------------------------------------
 
-void
-reset_connection(HttpConn *conn)
+static void
+do_reset_connection(HttpConn *conn, bool abortive)
 {
     /* Re-entry guard: a DISCONNECT / upload-abort handler fired below may
        itself reach reset_connection (e.g. axl_ws_conn_close). active stays
@@ -455,7 +455,11 @@ reset_connection(HttpConn *conn)
         conn->tls_ctx = NULL;
     }
 
-    axl_tcp_close(conn->sock);
+    if (abortive) {
+        axl_tcp_close(conn->sock, AXL_TEARDOWN_RESET);
+    } else {
+        axl_tcp_close(conn->sock, AXL_TEARDOWN_GRACEFUL);
+    }
 
     axl_free(conn->method);
     axl_free(conn->path);
@@ -491,4 +495,16 @@ reset_connection(HttpConn *conn)
     AxlHttpServer *saved_server = conn->server;
     axl_memset(conn, 0, sizeof(*conn));
     conn->server = saved_server;
+}
+
+void
+reset_connection(HttpConn *conn)
+{
+    do_reset_connection(conn, false);
+}
+
+void
+reset_connection_abortive(HttpConn *conn)
+{
+    do_reset_connection(conn, true);
 }

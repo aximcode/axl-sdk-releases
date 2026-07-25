@@ -673,6 +673,13 @@ Note: AXL uses UTF-8 everywhere. No `L""` wide strings, no `CHAR16`.
 # For network apps:
 ./scripts/run-qemu.sh --net --hostfwd 17000:7000 myapp.efi
 
+# Better, for anything scripted: let the harness pick a host port that is
+# free right now and hold it, instead of hard-coding one. The choice comes
+# back as HOSTFWD_<guest-port>=<host-port>. This matters because QEMU
+# refuses the ENTIRE -netdev if any single hostfwd cannot bind, so a port
+# clash shows up as "the guest has no network" rather than "port busy".
+./scripts/run-qemu.sh --net --hostfwd auto:7000 --background myapp.efi
+
 # For apps that need a DXE driver staged on disk alongside:
 ./scripts/run-qemu.sh --extra MyDriverDxe.efi myapp.efi
 

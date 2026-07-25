@@ -70,7 +70,7 @@ axl_socket_client_connect(AxlSocketClient *client, AxlSocketAddress *addr,
 
     rc = axl_socket_connect(sock, addr);
     if (rc != 0) {
-        axl_socket_free(sock);
+        axl_socket_free(sock, AXL_TEARDOWN_GRACEFUL);
         return AXL_ERR;
     }
 

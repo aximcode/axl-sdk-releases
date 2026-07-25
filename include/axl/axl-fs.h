@@ -67,6 +67,15 @@ axl_file_get_bytes(
  *
  * Like g_file_set_contents().
  *
+ * Flushes before returning, so `AXL_OK` means the bytes are on the
+ * volume — not merely accepted by the firmware. That matters because
+ * closing a file cannot report a failure at all
+ * (`EFI_FILE_PROTOCOL.Close` is specified to return only
+ * `EFI_SUCCESS`), so a full volume, write-protected media or device
+ * error that surfaces when buffers are pushed out would otherwise be
+ * invisible. A caller replacing a good file with this one can rely on
+ * the status.
+ *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 AXL_WARN_UNUSED int
@@ -79,9 +88,12 @@ axl_file_set_contents(
 /**
  * @brief Crash-safely write an entire buffer to a file.
  *
- * Writes @p buf to a temporary sibling ("<path>.tmp"), flushes it
- * (close implies flush on the UEFI FAT driver), then replaces @p path
- * with it via rename. Unlike axl_file_set_contents — which truncates
+ * Writes @p buf to a temporary sibling ("<path>.tmp") and flushes it
+ * through to the volume, then replaces @p path with it via rename. The
+ * promote happens ONLY if that flush succeeded: a temp whose bytes never
+ * landed is deleted and @p path is left exactly as it was, rather than
+ * replaced by a file that may be empty or short. Unlike
+ * axl_file_set_contents — which truncates
  * the target and writes in place, so a power loss mid-write leaves the
  * target half-written — this never modifies the target until the full,
  * flushed contents exist in the temp file.
@@ -90,7 +102,17 @@ axl_file_set_contents(
  * when @p path already exists the replace is delete-then-rename: a power
  * loss in that window leaves the target momentarily absent but the
  * complete data still present in "<path>.tmp" (recoverable) — never a
- * half-written target. The temp file is removed on any failure.
+ * half-written target.
+ *
+ * The temp file is removed on failure ONLY when @p path exists at that
+ * point, so a failure never leaves the data in neither place. The test is
+ * deliberately "does the target exist now", not "did we delete it": when
+ * the replace got as far as removing the target and then could not
+ * rename, "<path>.tmp" is left holding the complete contents for
+ * recovery — and the same is true when @p path never existed and the
+ * rename simply failed, which also leaves a "<path>.tmp" behind. Keeping
+ * the only copy of the caller's data is worth the occasional stray temp;
+ * a caller that wants it gone can delete "<path>.tmp" itself.
  *
  * @p path must be in a writable directory; the temp sibling is created
  * in the same directory (same-directory rename is the FAT atomic case).
@@ -195,8 +217,11 @@ axl_file_writer_tell(
 /**
  * @brief Flush and close the writer, releasing it. NULL-safe.
  *
- * Closing flushes outstanding data to the underlying volume (UEFI FAT
- * close implies flush). The writer is freed regardless of the flush
+ * Closing flushes outstanding data to the underlying volume through the
+ * firmware's real flush primitive, then closes the handle. The flush is
+ * explicit and its status is checked: a close alone cannot report a
+ * failure, because EFI_FILE_PROTOCOL.Close is specified to return only
+ * EFI_SUCCESS. The writer is freed regardless of the flush
  * result, so a PUT handler that needs durability MUST check this return
  * (a failed flush means report 5xx, not 201). There is deliberately no
  * AXL_AUTOPTR cleanup binding for AxlFileWriter: an implicit close would
@@ -205,7 +230,7 @@ axl_file_writer_tell(
  * @return AXL_OK on success (or @p w == NULL), AXL_ERR if the final
  *     flush/close failed or the writer was already in a failed state.
  */
-int
+AXL_WARN_UNUSED int
 axl_file_writer_close(
     AxlFileWriter *w   ///< writer (NULL-safe)
 );
@@ -370,8 +395,11 @@ axl_file_rename(
  *
  * Failure modes (the fallback is NOT atomic — no rollback):
  *
- *   - Copy fails mid-stream → partial destination file exists;
- *     source is untouched. Caller can retry or clean up @p new_path.
+ *   - Copy fails mid-stream, or the destination cannot be flushed
+ *     through to the volume → partial destination file exists;
+ *     source is untouched. The source is deleted only after the copy
+ *     is known to have reached the media, so a failed flush never
+ *     costs both copies. Caller can retry or clean up @p new_path.
  *   - Copy succeeds but delete fails → both files exist. Caller
  *     can retry the delete.
  *
@@ -385,6 +413,83 @@ int
 axl_file_move(
     const char *old_path,  ///< current path (UTF-8)
     const char *new_path   ///< new path (UTF-8); may be in a different directory
+);
+
+/**
+ * @brief Set an existing file's length — the `truncate(2)` analog.
+ *
+ * Makes the file at @p path exactly @p size bytes long, whether that
+ * shrinks or grows it. A shrink discards the tail and leaves the
+ * surviving prefix byte-exact; `size == 0` empties the file. A @p size
+ * equal to the current length changes nothing, but is still fully
+ * checked — a missing path, a directory, or an unwritable volume fails
+ * rather than reporting a hollow success.
+ *
+ * Path-based only: there is no handle-based `ftruncate` form. Resizing
+ * an open `AxlStream` / `AxlFileWriter` in place is not offered — see
+ * the invalidation note below for what a resize does to objects already
+ * holding the file.
+ *
+ * The file must already exist: unlike axl_file_set_contents this never
+ * creates one, and a missing @p path is AXL_ERR. Directories are
+ * refused — UEFI derives a directory's size from its contents, and the
+ * spec has SetInfo either ignore a directory's FileSize outright or
+ * fail it.
+ *
+ * AXL_OK means the length was VERIFIED, not merely requested: the new
+ * length is re-read from the same open handle before returning. A
+ * filesystem that accepts the request and silently ignores it — a
+ * spec-conformant driver on a directory, or an
+ * `<axl/axl-fs-provider.h>` provider whose `set_info` only implements
+ * renames and attribute changes — yields AXL_ERR rather than a success
+ * that changed nothing.
+ *
+ * Bytes added by a grow read back as zero on the EDK2-derived FAT
+ * driver shipped by essentially all UEFI firmware, which physically
+ * writes the gap out. The UEFI spec does not require that, so a caller
+ * needing zeros on some other volume (a non-FAT driver, a custom
+ * `<axl/axl-fs-provider.h>` filesystem) must write them itself.
+ *
+ * That zero-fill also means growing is NOT a cheap metadata update: it
+ * is a real O(@p size) disk write that consumes the volume's free
+ * space. Growing by gigabytes writes gigabytes, and UEFI file I/O is
+ * synchronous, so a single-threaded caller stalls for the whole
+ * transfer. Bound @p size before handing this a length that came from
+ * untrusted input.
+ *
+ * Other limits: FAT caps a file at 4 GiB - 1, so a larger @p size
+ * fails; a read-only volume, a file carrying the read-only attribute,
+ * and a full volume all fail. Timestamps are PRESERVED, not bumped —
+ * the resize writes the file's existing (non-zero, therefore honored)
+ * times back through SetInfo, so unlike POSIX truncation this does not
+ * update the modification time.
+ *
+ * An open `AxlFileView` over the same file will USUALLY follow the resize
+ * — this is an AXL write path, so a view in the same PE image re-stats
+ * and drops its cached pages before its next read. That is best effort,
+ * not a guarantee: `AxlFileView` promises close-to-open consistency, so a
+ * view in another image, or one the caller pinned
+ * (`axl_file_view_set_pinned`), keeps the length it last observed.
+ * Re-open the view if it must see this resize. Raw handles opened
+ * elsewhere keep their positions, which a shrink can leave past end of
+ * file; there is no locking.
+ *
+ * @return AXL_OK once the file is verified to be @p size bytes long;
+ *     AXL_ERR on NULL @p path, a missing file, a directory, a read-only
+ *     or full volume, a length the filesystem cannot represent, a
+ *     resize the filesystem ignored, or any backend failure. AXL_ERR
+ *     does not distinguish these: a caller that must tell them apart
+ *     can pre-check existence, the DIRECTORY bit and the READ_ONLY bit
+ *     with axl_file_info, but cannot separate a full volume from an I/O
+ *     error. After AXL_ERR the file's length is unspecified — a grow
+ *     extends the file before zero-filling it, so a failure part-way
+ *     through leaves it longer than it started; re-read it with
+ *     axl_file_info if it matters.
+ */
+AXL_WARN_UNUSED int
+axl_file_truncate(
+    const char *path,  ///< file path (UTF-8)
+    uint64_t    size   ///< new file length in bytes
 );
 
 /**
@@ -523,13 +628,20 @@ axl_dir_list_json(
 /**
  * @brief Get the filesystem volume label for a path.
  *
+ * The label belongs to the volume, so every spelling of one volume
+ * answers the same: `"fs0:"`, `"fs0:\\"` and `"fs0:\\dir\\file.txt"` are
+ * equivalent, and @p path need not exist — an absent file resolves to
+ * its volume's label rather than failing. A path with no volume prefix
+ * is resolved against the current working directory; a path naming a
+ * volume too long to resolve fails rather than falling back to it.
+ *
  * Returns a UTF-8 copy of the label. Caller frees with axl_free().
  *
  * @return label string, or NULL on error.
  */
 char *
 axl_volume_get_label(
-    const char *path  ///< filesystem path (e.g., "fs0:", "fs1:\\")
+    const char *path  ///< any path on the volume (e.g., "fs0:", "fs1:\\")
 );
 
 /**
@@ -543,6 +655,75 @@ axl_volume_get_label(
 char *
 axl_volume_get_label_by_handle(
     void *handle  ///< filesystem handle from axl_protocol_enumerate
+);
+
+/**
+ * @brief Get total and free bytes for the volume containing a path.
+ *
+ * The intended use is a pre-flight check — "will this write fit?" —
+ * so the query is answered by the volume ROOT, not by @p path itself:
+ * @p path need not exist. `"fs0:"`, `"fs0:\\"` and
+ * `"fs0:\\EFI\\BOOT\\new.efi"` all report the same volume. A @p path
+ * with no volume prefix is resolved against the current working
+ * directory.
+ *
+ * Either out-parameter may be NULL to skip it; passing NULL for both
+ * asks for nothing and is an error. Only the figures you actually ask
+ * for affect the result, so a volume that knows its free space but not
+ * its total still answers a free-space-only query.
+ *
+ * Failure modes are kept distinguishable on purpose, in both
+ * directions. A caller sizing an upload must be able to tell "1 KB
+ * left, refuse" from "this volume cannot say, decide some other way"
+ * — and must equally be able to tell either of those from "that
+ * volume is broken". So a value is written **only** when it is a real
+ * figure reported by the volume, and a volume that *fails* the query
+ * is never reported as one that merely cannot answer. Nothing is ever
+ * zero-filled or left at a sentinel for the caller to recognise: on
+ * any non-AXL_OK return both out-parameters are untouched.
+ *
+ * A @p path that names a volume too long to resolve fails; it is never
+ * silently answered from the working directory, which would report a
+ * different volume's figures under a clean AXL_OK.
+ *
+ * @return AXL_OK with every requested figure written; AXL_UNSUPPORTED
+ *     if the volume has no filesystem information to give, or reports
+ *     a requested figure as unknown — out-params untouched; AXL_ERR on
+ *     a NULL / empty / both-out-NULL / over-long argument, a path whose
+ *     volume cannot be resolved or opened, an allocation failure, or a
+ *     device / media / corrupt-volume error — out-params untouched.
+ */
+AXL_WARN_UNUSED int
+axl_volume_get_space(
+    const char *path,       ///< any path on the volume (e.g. "fs0:", "fs0:\\dir\\f")
+    uint64_t   *total,      ///< [out] total bytes on the volume, or NULL
+    uint64_t   *free_bytes  ///< [out] bytes available for new data, or NULL
+);
+
+/**
+ * @brief Get total and free bytes for a volume by handle.
+ *
+ * Handle-based sibling of axl_volume_get_space, pairing with
+ * @ref axl_volume_get_label_by_handle. Use it with handles from
+ * @ref axl_volume_enumerate or `axl_protocol_enumerate("simple-fs", ...)`:
+ * a handle always names exactly one volume, whereas AxlVolume.name can
+ * fall back to a synthesized index that is not a usable shell path.
+ *
+ * Same contract as axl_volume_get_space in every other respect,
+ * including that both out-parameters are untouched unless AXL_OK is
+ * returned.
+ *
+ * @return AXL_OK with every requested figure written; AXL_UNSUPPORTED
+ *     if the volume has no filesystem information to give, or reports
+ *     a requested figure as unknown; AXL_ERR on a NULL / both-out-NULL
+ *     argument, a handle carrying no filesystem, an allocation failure,
+ *     or a device / media / corrupt-volume error.
+ */
+AXL_WARN_UNUSED int
+axl_volume_get_space_by_handle(
+    void     *handle,       ///< filesystem handle (AxlVolume.handle / axl_protocol_enumerate)
+    uint64_t *total,        ///< [out] total bytes on the volume, or NULL
+    uint64_t *free_bytes    ///< [out] bytes available for new data, or NULL
 );
 
 /// Volume descriptor for axl_volume_enumerate.

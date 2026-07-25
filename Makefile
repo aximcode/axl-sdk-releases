@@ -192,8 +192,14 @@ endef
 # Usage:  $(eval $(call EMBED_BLOB,greeting,sdk/examples/embed-asset.txt))
 #         link with: $(BLOB_OBJ_greeting)
 # C side: AXL_EMBED_DECLARE(greeting) — emits axl_embedded_greeting{,_end}.
+#
+# Also exposes the intermediate .s as $(BLOB_SRC_<name>) — a `clean-*`
+# recipe that reaps a call site's build products should use that
+# variable rather than hand-naming `embed-blob-<name>.s`, so the two
+# never drift apart if this naming ever changes.
 define EMBED_BLOB
 BLOB_OBJ_$(1) := $$(BUILDDIR)/embed-blob-$(1).o
+BLOB_SRC_$(1) := $$(BUILDDIR)/embed-blob-$(1).s
 
 $$(BUILDDIR)/embed-blob-$(1).s: $(2) | $$(BUILDDIR)
 	@: 'Tabs inside the single-quoted args below are load-bearing'
@@ -240,6 +246,7 @@ endif
 LIB_SOURCES = \
     src/backend/native/axl-backend-native.c \
     src/backend/native/axl-backend-native-efi1x.c \
+    src/backend/native/axl-backend-native-nosh.c \
     src/backend/native/axl-backend-native-event.c \
     src/backend/native/axl-backend-native-mp.c \
     src/mem/axl-mem.c \
@@ -303,6 +310,7 @@ LIB_SOURCES = \
     src/fs/axl-fs.c \
     src/fs/axl-file-writer.c \
     src/fs/axl-file-view.c \
+    src/fs/axl-file-gen.c \
     src/fs/axl-fs-provider.c \
     src/fs/axl-device-path.c \
     src/util/axl-debug.c \
@@ -313,7 +321,8 @@ LIB_SOURCES = \
     src/util/axl-sys.c \
     src/util/axl-version.c \
     src/util/axl-nvstore.c \
-    src/util/axl-port.c \
+    src/util/axl-attempt.c \
+    src/util/axl-io-port.c \
     src/util/axl-boot.c \
     src/util/axl-image.c \
     src/util/axl-shell.c \
@@ -323,6 +332,8 @@ LIB_SOURCES = \
     src/util/axl-console-device.c \
     src/util/axl-console-tap.c \
     src/util/axl-console-vt.c \
+    src/util/axl-console-vt-enc.c \
+    src/util/axl-console-tee.c \
     src/util/axl-console-mirror.c \
     src/util/axl-cpu.c \
     src/util/axl-handle-iter.c \
@@ -333,6 +344,7 @@ LIB_SOURCES = \
     src/util/axl-rand.c \
     src/util/axl-protocol.c \
     src/util/axl-driver.c \
+    src/util/axl-driver-deps.c \
     src/util/axl-driver-info.c \
     src/util/axl-shared-driver.c \
     src/util/axl-diag.c \
@@ -384,6 +396,14 @@ LIB_SOURCES = \
     src/task/axl-task-pool.c \
     src/task/axl-buf-pool.c \
     src/task/axl-async.c \
+    src/9p/axl-9p-codec.c \
+    src/9p/axl-9p-client.c \
+    src/9p/axl-9p-mount.c \
+    src/9p/axl-9p-server.c \
+    src/9p/axl-9p-server-ops.c \
+    src/9p/axl-9p-server-io-ops.c \
+    src/9p/axl-9p-server-ns-ops.c \
+    src/9p/axl-9p-server-fid.c \
     src/net/axl-tcp-sync.c \
     src/net/axl-tcp-async.c \
     src/net/axl-net-wait.c \
@@ -394,6 +414,7 @@ LIB_SOURCES = \
     src/net/axl-net-linkstats.c \
     src/net/axl-net-resolve.c \
     src/net/axl-net-interfaces.c \
+    src/net/axl-net-nic.c \
     src/net/axl-net-addr.c \
     src/net/axl-net-dhcp.c \
     src/net/axl-net-driver-select.c \
@@ -587,7 +608,15 @@ endif
 # `make clean*` and `make help` shouldn't trip the state-change wipe,
 # nor write the state file (we don't want a clean-tools call to alter
 # the recorded state and confuse the next real build).
-NONCLEAN_GOALS := $(filter-out clean clean-tools help check-version,$(or $(MAKECMDGOALS),all))
+# The pure-lint gates (check-ascii/-docs/-test-meta/-dogfood/-cxx-entry) build no
+# libaxl.a and leave no binary that could go stale against its ABI, but they run
+# WITHOUT AXL_TLS — so a bare `make check-ascii` after an AXL_TLS=1 build used to
+# read TLS_STATE=off, see the toggle, and WIPE the TLS tree (out/native-<arch>),
+# forcing a full rebuild. Exclude them (like clean/help) so a lint neither wipes
+# the tree nor rewrites the recorded state to confuse the next real build.
+NONCLEAN_GOALS := $(filter-out clean clean-tools help check-version \
+    check-ascii check-docs check-test-meta check-dogfood check-cxx-entry,\
+    $(or $(MAKECMDGOALS),all))
 
 ifneq ($(NONCLEAN_GOALS),)
 TLS_STATE := $(if $(AXL_TLS),on,off)
@@ -625,7 +654,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon
+.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -754,6 +783,9 @@ $(BUILDDIR)/%.o: src/event/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/task/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/%.o: src/9p/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILDDIR)/%.o: src/net/%.c | $(BUILDDIR)
@@ -1044,6 +1076,21 @@ $(BUILDDIR)/gfx-mode-selftest.o: test/integration/gfx-mode-selftest.c | $(BUILDD
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# console-reshape-selftest.efi - a passthrough take-over device must not hide
+# the physical console's text modes, and must reshape through them.
+# Driven by test/integration/test-console-reshape-qemu.sh.
+# ===================================================================
+
+console-reshape-selftest: $(PREFIX)/console-reshape-selftest.efi
+	@echo "  Built: $(PREFIX)/console-reshape-selftest.efi"
+
+$(PREFIX)/console-reshape-selftest.efi: $(BUILDDIR)/console-reshape-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/console-reshape-selftest.o,$@)
+
+$(BUILDDIR)/console-reshape-selftest.o: test/integration/console-reshape-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build console-text-mode-selftest.efi — text-console mode enumerate/
 # switch round-trip.  Run under scripts/run-qemu.sh --gpu by
 # test/integration/test-console-text-mode-qemu.sh (the -nographic unit
@@ -1101,6 +1148,22 @@ $(PREFIX)/bss-probe.efi: $(BUILDDIR)/bss-probe.o $(LINK_CRT0) $(PREFIX)/lib/liba
 	$(call LINK_EFI_APP,$(BUILDDIR)/bss-probe.o,$@)
 
 $(BUILDDIR)/bss-probe.o: test/integration/bss-probe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build boot-path-selftest.efi — self-relative file access with no shell.
+# Staged into the removable-media boot slot so BdsDxe launches it directly
+# (no shell at all); the same binary doubles as the shell-case regression
+# guard. Driven by test/integration/test-boot-path-qemu.sh.
+# ===================================================================
+
+boot-path-selftest: $(PREFIX)/boot-path-selftest.efi
+	@echo "  Built: $(PREFIX)/boot-path-selftest.efi"
+
+$(PREFIX)/boot-path-selftest.efi: $(BUILDDIR)/boot-path-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/boot-path-selftest.o,$@)
+
+$(BUILDDIR)/boot-path-selftest.o: test/integration/boot-path-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -1271,6 +1334,62 @@ $(BUILDDIR)/gfx-simd-selftest.o: test/integration/gfx-simd-selftest.c | $(BUILDD
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# Build 9p-mount-selftest.efi — mounts a host 9P share as a UEFI fsN:
+# volume (axl_9p_mount) and proves the mount end-to-end: reads the
+# server's seeded /hello.txt THROUGH the published volume and asserts
+# it byte-matches the raw-client oracle, then writes a new file
+# through the mount and confirms it landed by re-reading it over the
+# raw client. Run by test/integration/test-9p-qemu.sh.
+# ===================================================================
+
+9p-mount-selftest: $(PREFIX)/9p-mount-selftest.efi
+	@echo "  Built: $(PREFIX)/9p-mount-selftest.efi"
+
+$(PREFIX)/9p-mount-selftest.efi: $(BUILDDIR)/9p-mount-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/9p-mount-selftest.o,$@)
+
+$(BUILDDIR)/9p-mount-selftest.o: test/integration/9p-mount-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build 9p-server-selftest.efi — the GUEST half of the Axl9pServer
+# live-socket harness: seeds a small tree (on a RAM disk where the
+# firmware publishes EFI_RAM_DISK_PROTOCOL, on the boot volume
+# otherwise — QEMU takes the latter), exports it with
+# axl_9p_server_new + _listen, and pumps the loop until a deadline.
+# The assertions live on the host side, in
+# test/integration/p9-client.py; run by test-9p-server-qemu.sh.
+# ===================================================================
+
+9p-server-selftest: $(PREFIX)/9p-server-selftest.efi
+	@echo "  Built: $(PREFIX)/9p-server-selftest.efi"
+
+$(PREFIX)/9p-server-selftest.efi: $(BUILDDIR)/9p-server-selftest.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/9p-server-selftest.o,$@)
+
+$(BUILDDIR)/9p-server-selftest.o: test/integration/9p-server-selftest.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build flushfail-fs-driver.efi -- publishes the flush-failing
+# AxlFsProvider fixture and stays RESIDENT (a driver, so the publication
+# outlives the load), letting a TOOL be run against it from the same
+# shell. The fixture lives in test/unit because the unit tests are its
+# main consumer; this is the one integration image that needs it, hence
+# the extra -Itest/unit here and nowhere else.
+# Run by test/integration/test-flushfail-tools-qemu.sh.
+# ===================================================================
+
+flushfail-fs-driver: $(PREFIX)/flushfail-fs-driver.efi
+	@echo "  Built: $(PREFIX)/flushfail-fs-driver.efi"
+
+$(PREFIX)/flushfail-fs-driver.efi: $(BUILDDIR)/flushfail-fs-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/flushfail-fs-driver.o,$@)
+
+$(BUILDDIR)/flushfail-fs-driver.o: test/integration/flushfail-fs-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -Itest/unit -c $< -o $@
+
+# ===================================================================
 # Build input-demo.efi example
 # ===================================================================
 
@@ -1402,6 +1521,43 @@ $(BUILDDIR)/driver-leak-test.o: test/integration/driver-leak-test.c | $(BUILDDIR
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
+# Build image-path-test.efi + image-path-driver.efi — fixture for the
+# axl_app_image_path() synthetic-load contract: a buffer-loaded driver has
+# no file it was loaded from, so it must report NULL (and still resolve its
+# sidecar via the launcher that DID come from a file).
+# ===================================================================
+
+image-path-test: $(PREFIX)/image-path-test.efi $(PREFIX)/image-path-driver.efi
+	@echo "  Built: image-path-test.efi + image-path-driver.efi"
+
+$(PREFIX)/image-path-driver.efi: $(BUILDDIR)/image-path-driver.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/image-path-driver.o,$@)
+$(BUILDDIR)/image-path-driver.o: test/integration/image-path-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(PREFIX)/image-path-test.efi: $(BUILDDIR)/image-path-test.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/image-path-test.o,$@)
+$(BUILDDIR)/image-path-test.o: test/integration/image-path-test.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build axl-shell-launcher.efi — the test harness stages this as
+# \EFI\BOOT\BOOTX64.EFI in place of the Shell. It sibling-loads Shell.efi with
+# LoadOptions "-delay 0" so the EDK2 Shell skips its 5 s startup countdown,
+# reclaiming ~5 s of Stall per guest boot. Staged by run-qemu.sh / common-test.sh
+# via find_shell_launcher (scripts/axl-common.sh).
+# ===================================================================
+
+shell-launcher: $(PREFIX)/axl-shell-launcher.efi
+	@echo "  Built: $(PREFIX)/axl-shell-launcher.efi"
+
+$(PREFIX)/axl-shell-launcher.efi: $(BUILDDIR)/axl-shell-launcher.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/axl-shell-launcher.o,$@)
+
+$(BUILDDIR)/axl-shell-launcher.o: test/integration/axl-shell-launcher.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
 # Build driver-identity-test.efi — buffer-loads driver.efi and asserts
 # the loaded image has a non-NULL, renderable device path (so the aa64
 # shell's `dh -p` / `dh -v` does not fault). Integration target for the
@@ -1530,6 +1686,18 @@ $(PREFIX)/io-streams.efi: $(BUILDDIR)/io-streams.o $(LINK_CRT0) $(PREFIX)/lib/li
 $(BUILDDIR)/io-streams.o: test/integration/io-streams.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# cpu-spin-fixture — CPU busy-wait detector fixture (positive +
+# negative controls for the CPU-spike sampler). See the file header:
+# it busy-waits ON PURPOSE.
+cpu-spin-fixture: $(PREFIX)/cpu-spin-fixture.efi
+	@echo "  Built: $(PREFIX)/cpu-spin-fixture.efi"
+
+$(PREFIX)/cpu-spin-fixture.efi: $(BUILDDIR)/cpu-spin-fixture.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/cpu-spin-fixture.o,$@)
+
+$(BUILDDIR)/cpu-spin-fixture.o: test/integration/cpu-spin-fixture.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # ===================================================================
 # Build sd-ergo-launcher.efi (+ -driver.efi) — end-to-end fixture built
 # ENTIRELY from the turnkey AXL_SHARED_DRIVER / AXL_SHARED_DRIVER_LAUNCHER
@@ -1551,6 +1719,35 @@ $(eval $(call EMBED_BLOB,sd_ergo_driver,$(PREFIX)/sd-ergo-driver.efi))
 $(PREFIX)/sd-ergo-launcher.efi: $(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_ergo_driver) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
 	$(call LINK_EFI_APP,$(BUILDDIR)/sd-ergo-launcher.o $(BLOB_OBJ_sd_ergo_driver),$@)
 $(BUILDDIR)/sd-ergo-launcher.o: test/integration/sd-ergo-launcher.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# Build pin-svc-launcher.efi + pin-svc-driver-{good,shadow}.efi — fixture
+# for AxlServiceDeploy.driver_path (load exactly this file: no 4-path
+# search, no embedded fallback). The SAME driver source is built twice with
+# -DPIN_VARIANT so the harness can tell which copy actually came up; the
+# launcher embeds the SHADOW build, and the harness also stages the shadow
+# where the default search looks first.
+# ===================================================================
+
+pin-svc: $(PREFIX)/pin-svc-launcher.efi $(PREFIX)/pin-svc-driver-good.efi $(PREFIX)/pin-svc-driver-shadow.efi
+	@echo "  Built: pin-svc-launcher.efi + pin-svc-driver-{good,shadow}.efi"
+
+$(PREFIX)/pin-svc-driver-good.efi: $(BUILDDIR)/pin-svc-driver-good.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/pin-svc-driver-good.o,$@)
+$(BUILDDIR)/pin-svc-driver-good.o: test/integration/pin-svc-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DPIN_VARIANT='"good"' -c $< -o $@
+
+$(PREFIX)/pin-svc-driver-shadow.efi: $(BUILDDIR)/pin-svc-driver-shadow.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/pin-svc-driver-shadow.o,$@)
+$(BUILDDIR)/pin-svc-driver-shadow.o: test/integration/pin-svc-driver.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DPIN_VARIANT='"shadow"' -c $< -o $@
+
+$(eval $(call EMBED_BLOB,pin_svc_shadow,$(PREFIX)/pin-svc-driver-shadow.efi))
+
+$(PREFIX)/pin-svc-launcher.efi: $(BUILDDIR)/pin-svc-launcher.o $(BLOB_OBJ_pin_svc_shadow) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/pin-svc-launcher.o $(BLOB_OBJ_pin_svc_shadow),$@)
+$(BUILDDIR)/pin-svc-launcher.o: test/integration/pin-svc-launcher.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -1676,6 +1873,20 @@ $(PREFIX)/drivers/console-device-smoke.efi: $(BUILDDIR)/console-device-smoke.o $
 
 $(BUILDDIR)/console-device-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# console-device-passthrough-smoke.efi — same source, -DPASSTHROUGH_LOCAL: takes
+# over WITHOUT evicting the firmware consoles, so GraphicsConsole keeps painting the
+# local display while our grid still receives every op. Drives the passthrough
+# scenario of test-console-device-qemu.sh (the inverse of Scenario 1's clean-region
+# check: ink past the grid proves the local console is still alive).
+console-device-passthrough-smoke: $(PREFIX)/drivers/console-device-passthrough-smoke.efi
+	@echo "  Built: $(PREFIX)/drivers/console-device-passthrough-smoke.efi"
+
+$(PREFIX)/drivers/console-device-passthrough-smoke.efi: $(BUILDDIR)/console-device-passthrough-smoke.o $(PREFIX)/lib/libaxl.a | $(PREFIX)/drivers
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/console-device-passthrough-smoke.o,$@)
+
+$(BUILDDIR)/console-device-passthrough-smoke.o: test/integration/console-device-smoke.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DPASSTHROUGH_LOCAL -c $< -o $@
 
 # console-device-restore-smoke.efi — same source, -DSELF_UNINSTALL_MS: takes over,
 # then after that many ms uninstalls the device so the re-tagged firmware console
@@ -1992,11 +2203,11 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
         AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
-        AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm
+        AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
-tests: all $(TEST_EFIS)
+tests: all $(TEST_EFIS) $(PREFIX)/axl-shell-launcher.efi
 	@echo "  Built $(words $(TESTS)) test EFIs"
 
 # Helper: compile test source, link with libaxl, output .efi
@@ -2047,16 +2258,17 @@ $(eval $(call BUILD_TEST,AxlTestSmart,axl-test-smart))
 $(eval $(call BUILD_TEST,AxlTestHii,axl-test-hii))
 $(eval $(call BUILD_TEST,AxlTestAuth,axl-test-auth))
 $(eval $(call BUILD_TEST,AxlTestFw,axl-test-fw))
+$(eval $(call BUILD_TEST,AxlTest9p,axl-test-9p))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)
 # ===================================================================
 
-TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune
+TOOL_NAMES = hexdump fetch find grep sed cat sysinfo netinfo mkrd rfbrowse ipmi dmidecode memspd lspci lsusb mkfixture rndisfix timetest i2c clip paste tar nvme ata scsi smart fwtool axbench kbtune netload lsproto cut tr
 TOOL_EFIS  = $(patsubst %,$(PREFIX)/tools/%.efi,$(TOOL_NAMES))
 
-tools: all $(TOOL_EFIS) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/tools/fbcon.efi $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi
-	@echo "  Built $(words $(TOOL_NAMES)) tools + kbtune-drv + fbcon + crashtest + crashhandler driver"
+tools: all $(TOOL_EFIS) $(PREFIX)/tools/kbtune-drv.efi $(PREFIX)/tools/fbcon.efi $(PREFIX)/tools/crashtest.efi $(PREFIX)/drivers/crashhandler.efi $(PREFIX)/tools/9p.efi
+	@echo "  Built $(words $(TOOL_NAMES)) tools + kbtune-drv + fbcon + crashtest + crashhandler driver + 9p"
 
 # tool-sizes — print per-tool .efi size, sorted ascending.
 # Surfaces the selective-linking benefit: a tool that uses 5% of
@@ -2126,6 +2338,82 @@ $(PREFIX)/tools/mkrd.efi: $(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ) \
 	$(call LINK_EFI_APP,$(BUILDDIR)/mkrd.o $(EMBEDDED_RAMDISK_OBJ),$@)
 
 $(BUILDDIR)/mkrd.o: tools/mkrd.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# 9p -- 9P2000.L client/server launcher. A first-class tool with its
+# own recipe (not in TOOL_NAMES) because it links embedded DXE driver
+# blobs, which the busybox multiplexer's one-.o-per-tool rule cannot
+# express.
+#
+# 9p-serve-svc.c and 9p-mount-svc.c are each compiled TWICE, the
+# service-demo pattern: with -DAXL_SERVICE_BUILD_DRIVER into a driver
+# image (subsystem 11), and without it into the launcher. The driver
+# .efi files are BUILDDIR intermediates -- they ship only inside
+# 9p.efi, so nothing stages them separately.
+# ===================================================================
+9p: $(PREFIX)/tools/9p.efi
+	@echo "  Built: $(PREFIX)/tools/9p.efi (launcher + embedded serve/mount drivers)"
+
+NINEP_HDRS = tools/9p-common.h tools/9p-serve-svc.h tools/9p-mount-svc.h
+
+# Launcher objects.
+NINEP_APP_OBJS = $(BUILDDIR)/9p.o $(BUILDDIR)/9p-common.o \
+                 $(BUILDDIR)/9p-cmd-file.o $(BUILDDIR)/9p-cmd-serve.o \
+                 $(BUILDDIR)/9p-serve-app.o $(BUILDDIR)/9p-cmd-mount.o \
+                 $(BUILDDIR)/9p-mount-app.o
+
+# Intermediates that clean-tools must reap alongside NINEP_APP_OBJS.
+NINEP_DRV_OBJS = $(BUILDDIR)/9p-serve-dxe.o $(BUILDDIR)/9p-serve-dxe.efi \
+                 $(BUILDDIR)/9p-serve-dxe.so \
+                 $(BUILDDIR)/9p-mount-dxe.o $(BUILDDIR)/9p-mount-dxe.efi \
+                 $(BUILDDIR)/9p-mount-dxe.so
+
+$(BUILDDIR)/9p-serve-dxe.efi: $(BUILDDIR)/9p-serve-dxe.o $(PREFIX)/lib/libaxl.a | $(BUILDDIR)
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/9p-serve-dxe.o,$@)
+
+$(BUILDDIR)/9p-serve-dxe.o: tools/9p-serve-svc.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+$(BUILDDIR)/9p-serve-app.o: tools/9p-serve-svc.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/9p-cmd-serve.o: tools/9p-cmd-serve.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/9p-mount-dxe.efi: $(BUILDDIR)/9p-mount-dxe.o $(PREFIX)/lib/libaxl.a | $(BUILDDIR)
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/9p-mount-dxe.o,$@)
+
+$(BUILDDIR)/9p-mount-dxe.o: tools/9p-mount-svc.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+$(BUILDDIR)/9p-mount-app.o: tools/9p-mount-svc.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/9p-cmd-mount.o: tools/9p-cmd-mount.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/9p-common.o: tools/9p-common.c tools/9p-common.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Embed symbols axl_embedded_{serve,mount}9p_dxe match the matching
+# AXL_EMBED_DECLARE in 9p-cmd-serve.c / 9p-cmd-mount.c. The blob NAMEs
+# deliberately do not lead with a digit: AXL_EMBED_DECLARE token-pastes them
+# onto axl_embedded_, and a leading digit makes that paste a
+# preprocessing-number rather than plainly an identifier.
+$(eval $(call EMBED_BLOB,serve9p_dxe,$(BUILDDIR)/9p-serve-dxe.efi))
+$(eval $(call EMBED_BLOB,mount9p_dxe,$(BUILDDIR)/9p-mount-dxe.efi))
+
+$(PREFIX)/tools/9p.efi: $(NINEP_APP_OBJS) \
+                        $(BLOB_OBJ_serve9p_dxe) $(BLOB_OBJ_mount9p_dxe) \
+                        $(LINK_CRT0) $(PREFIX)/lib/libaxl.a | $(PREFIX)/tools
+	$(call LINK_EFI_APP,$(NINEP_APP_OBJS) \
+	                    $(BLOB_OBJ_serve9p_dxe) $(BLOB_OBJ_mount9p_dxe),$@)
+
+$(BUILDDIR)/9p.o: tools/9p.c $(NINEP_HDRS) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILDDIR)/9p-cmd-file.o: tools/9p-cmd-file.c tools/9p-common.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # kbtune-drv — resident ConIn conditioning shim, paired with the kbtune tool.
@@ -2246,5 +2534,29 @@ clean:
 clean-tools:
 	rm -f $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so
 	@for t in $(TOOL_NAMES); do rm -f $(BUILDDIR)/$$t.o; done
+	rm -f $(NINEP_APP_OBJS) $(NINEP_DRV_OBJS) \
+	      $(BLOB_OBJ_serve9p_dxe) $(BLOB_SRC_serve9p_dxe) \
+	      $(BLOB_OBJ_mount9p_dxe) $(BLOB_SRC_mount9p_dxe)
 	rm -f $(BUSYBOX_EFI) $(PREFIX)/axl.so
 	rm -rf $(BUSYBOX_DIR)
+
+# Verification driver for axl_service_reload (self-reload via the SDK built-in).
+reload-svc-dxe: $(PREFIX)/reload-svc-dxe.efi
+	@echo "  Built: $(PREFIX)/reload-svc-dxe.efi"
+
+$(PREFIX)/reload-svc-dxe.efi: $(BUILDDIR)/reload-svc-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/reload-svc-dxe.o,$@)
+
+$(BUILDDIR)/reload-svc-dxe.o: sdk/examples/reload-svc-dxe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Poisoned replacement (same service name, setup fails on purpose) — proves
+# axl_service_reload reports a start failure instead of a healthy hot-swap.
+reload-svc-fail-dxe: $(PREFIX)/reload-svc-fail-dxe.efi
+	@echo "  Built: $(PREFIX)/reload-svc-fail-dxe.efi"
+
+$(PREFIX)/reload-svc-fail-dxe.efi: $(BUILDDIR)/reload-svc-fail-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/reload-svc-fail-dxe.o,$@)
+
+$(BUILDDIR)/reload-svc-fail-dxe.o: sdk/examples/reload-svc-fail-dxe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@

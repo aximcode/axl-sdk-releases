@@ -14,11 +14,13 @@
 #include <axl/axl-fs.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>   /* axl_utf8_to_ucs2 */
+#include "axl-file-gen.h"
 
 struct AxlFileWriter {
     AxlFileHandle handle;
     uint64_t      written;   /* bytes written (includes initial size on APPEND) */
     bool          failed;    /* a write failed; further writes are rejected */
+    uint32_t      gen_key;   /* write registry slot for the target path */
 };
 
 AxlFileWriter *
@@ -58,6 +60,16 @@ axl_file_writer_open(
         return NULL;
     }
 
+    /* Bump HERE, not after the writer is built. The open above already
+       mutated the file -- it carries CREATE, and the replace branch below
+       truncates it to empty -- so every early return between this point
+       and the return of `w` leaves a file that changed. Bumping late meant
+       an OOM, or the append branch's set_position failure, left an open
+       view serving the pre-truncate length and bytes. Unconditional and
+       before the success check, same as every other write path. */
+    uint32_t gen_key = axl_file_gen_key(path);
+    axl_file_gen_bump_key(gen_key);
+
     uint64_t start = 0;
     if (append) {
         /* Continue from the current end of file. */
@@ -87,6 +99,7 @@ axl_file_writer_open(
     w->handle  = handle;
     w->written = start;
     w->failed  = false;
+    w->gen_key = gen_key;
     return w;
 }
 
@@ -109,6 +122,7 @@ axl_file_writer_write(
 
     size_t n  = len;
     int    rc = axl_backend_file_write(w->handle, &n, buf);
+    axl_file_gen_bump_key(w->gen_key);   /* a partial write still moved bytes */
     w->written += n;              /* count even a partial advance */
     if (rc != AXL_OK || n != len) {
         w->failed = true;
@@ -133,8 +147,14 @@ axl_file_writer_close(
     if (w == NULL) {
         return AXL_OK;
     }
+    /* Flush EXPLICITLY, then close. Close's own flush cannot report a
+       failure — EFI_FILE_PROTOCOL.Close is specified to return only
+       EFI_SUCCESS — so a durability-sensitive caller (a PUT handler
+       deciding 201 vs 5xx) would have had nothing to check. The real
+       flush primitive does report media/full/write-protected errors. */
     bool failed = w->failed;
-    int  rc     = axl_backend_file_close(&w->handle);   /* flush + close */
+    int  frc    = axl_backend_file_flush(w->handle);
+    int  rc     = axl_backend_file_close(&w->handle);
     axl_free(w);
-    return (failed || rc != AXL_OK) ? AXL_ERR : AXL_OK;
+    return (failed || frc != AXL_OK || rc != AXL_OK) ? AXL_ERR : AXL_OK;
 }

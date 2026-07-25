@@ -6136,6 +6136,55 @@ test_gfx_output_contract(void)
 }
 
 // ---------------------------------------------------------------------------
+// C++ RAII autoptr — AXL_AUTOPTR must free each gfx handle at scope exit.
+// Runtime proof: live-allocation count returns to baseline after the scope.
+// Each type is primed once (new+free) so any one-time global init is not
+// mistaken for a leak.
+// ---------------------------------------------------------------------------
+
+static void
+test_autoptr_gfx(void)
+{
+    AxlMemStats before, after;
+
+    axl_gfx_buffer_free(axl_gfx_buffer_new(16, 16));   /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlGfxBuffer) b = axl_gfx_buffer_new(16, 16);
+        test_check(b != NULL, "autoptr: buffer new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: buffer freed at scope exit");
+
+    axl_gfx_path_free(axl_gfx_path_new());             /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlGfxPath) p = axl_gfx_path_new();
+        test_check(p != NULL, "autoptr: path new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: path freed at scope exit");
+
+    axl_gfx_gradient_free(axl_gfx_gradient_linear_new(0, 0, 0, 100));   /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlGfxGradient) g = axl_gfx_gradient_linear_new(0, 0, 0, 100);
+        test_check(g != NULL, "autoptr: gradient new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: gradient freed at scope exit");
+
+    axl_gfx_display_list_free(axl_gfx_display_list_new());              /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlGfxDisplayList) dl = axl_gfx_display_list_new();
+        test_check(dl != NULL, "autoptr: display-list new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: display-list freed at scope exit");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -6438,6 +6487,8 @@ test_gfx_main(
     test_gfx_dpi_contract();
     test_gfx_output_contract();
     test_gfx_output_inventory_contract();
+
+    test_autoptr_gfx();
 
     return test_print_results();
 }

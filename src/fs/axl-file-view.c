@@ -15,6 +15,8 @@
 
 #include <axl/axl-file-view.h>
 
+#include "axl-file-gen.h"
+
 #include <axl/axl-page-cache.h>
 #include <axl/axl-fs.h>
 #include <axl/axl-stream.h>
@@ -28,12 +30,16 @@ AXL_LOG_DOMAIN("file-view");
 
 struct AxlFileView {
     AxlStream    *stream;
+    char         *path;        ///< own copy — needed to re-stat and re-open
     size_t        file_size;
     size_t        page_size;   ///< power of two
     size_t        page_mask;   ///< page_size - 1
     unsigned      page_shift;  ///< log2(page_size)
     AxlPageCache *cache;
     bool          owns_cache;  ///< true: free cache on close; false: borrowed (drop owner)
+    uint32_t      gen_key;     ///< this path's slot in the write registry
+    uint32_t      gen_seen;    ///< generation this view is in step with
+    bool          pinned;      ///< frozen: ignore writes (see the header)
 };
 
 static size_t
@@ -54,7 +60,7 @@ round_up_pow2(size_t v)
    into @p dst. The trailing page is short; pages never extend past EOF
    because the view clamps every offset before asking for a page. */
 static int64_t
-fv_fill(void *user, size_t page_index, void *dst, size_t cap)
+fv_fill(size_t page_index, void *dst, size_t cap, void *user)
 {
     AxlFileView *v = (AxlFileView *)user;
     size_t base = page_index << v->page_shift;
@@ -80,6 +86,14 @@ fv_fill(void *user, size_t page_index, void *dst, size_t cap)
 static AxlFileView *
 fv_make(const char *path, AxlPageCache *cache, bool owns)
 {
+    /* Sample the generation BEFORE the stat, never after. A write that
+       lands between the two then leaves gen_seen behind the registry and
+       costs one redundant re-stat on the first read; sampling after would
+       instead record the post-write generation against the pre-write
+       size, and that write would be lost for the life of the view. */
+    uint32_t gen_key  = axl_file_gen_key(path);
+    uint32_t gen_seen = axl_file_gen_read(gen_key);
+
     AxlFsEntry entry;
     if (axl_file_info(path, &entry) != AXL_OK) {
         axl_warning("file_view: cannot stat '%s'", path);
@@ -97,9 +111,19 @@ fv_make(const char *path, AxlPageCache *cache, bool owns)
         return NULL;
     }
 
+    v->path = axl_strdup(path);
+    if (v->path == NULL) {
+        axl_free(v);
+        if (owns) {
+            axl_page_cache_free(cache);
+        }
+        return NULL;
+    }
+
     v->stream = axl_fopen(path, "r");
     if (v->stream == NULL) {
         axl_warning("file_view: cannot open '%s'", path);
+        axl_free(v->path);
         axl_free(v);
         if (owns) {
             axl_page_cache_free(cache);
@@ -117,7 +141,60 @@ fv_make(const char *path, AxlPageCache *cache, bool owns)
     }
     v->cache = cache;
     v->owns_cache = owns;
+    v->gen_key = gen_key;
+    v->gen_seen = gen_seen;
     return v;
+}
+
+/* Bring @v into line with the file if any in-image write path has bumped
+   its generation since the last sync. This is the whole of the BEST-EFFORT
+   half of the consistency model on the read side (the guaranteed half is
+   close-to-open, and fv_make is where that is delivered): a hit costs one
+   load and one compare, so the overwhelmingly common "nothing wrote it"
+   case never touches the firmware.
+
+   On a move, EVERYTHING the view remembers about the file is suspect —
+   its cached pages, its length, and the open handle itself. The handle
+   is reopened rather than reused because the file may have been replaced
+   wholesale (axl_file_write_atomic renames a different file over this
+   path), in which case the old handle still refers to the file that was
+   moved aside.
+
+   Returns AXL_ERR when the file can no longer be opened. The view is not
+   destroyed in that case: it reports size 0, reads nothing, and keeps
+   answering AXL_ERR until the path exists again. That is what lets a
+   caller give the SAME answer to every read after the file vanished
+   rather than one answer on the first and another on the next. */
+static int
+fv_sync(AxlFileView *v)
+{
+    if (v->pinned) {
+        return AXL_OK;
+    }
+    uint32_t gen = axl_file_gen_read(v->gen_key);
+    if (gen == v->gen_seen && v->stream != NULL) {
+        return AXL_OK;
+    }
+    v->gen_seen = gen;
+
+    axl_page_cache_drop_owner(v->cache, v);
+    if (v->stream != NULL) {
+        axl_fclose(v->stream);
+        v->stream = NULL;
+    }
+
+    AxlFsEntry entry;
+    if (axl_file_info(v->path, &entry) != AXL_OK) {
+        v->file_size = 0;
+        return AXL_ERR;
+    }
+    v->stream = axl_fopen(v->path, "r");
+    if (v->stream == NULL) {
+        v->file_size = 0;
+        return AXL_ERR;
+    }
+    v->file_size = (size_t)entry.size;
+    return AXL_OK;
 }
 
 AxlFileView *
@@ -170,19 +247,50 @@ axl_file_view_close(AxlFileView *v)
     if (v->stream != NULL) {
         axl_fclose(v->stream);
     }
+    axl_free(v->path);
     axl_free(v);
 }
 
-size_t
-axl_file_view_size(const AxlFileView *v)
+int
+axl_file_view_refresh(AxlFileView *v)
 {
-    return (v != NULL) ? v->file_size : 0;
+    if (v == NULL) {
+        return AXL_ERR;
+    }
+    return fv_sync(v);
+}
+
+void
+axl_file_view_set_pinned(AxlFileView *v, bool pin)
+{
+    if (v == NULL) {
+        return;
+    }
+    v->pinned = pin;
+}
+
+size_t
+axl_file_view_size(AxlFileView *v)
+{
+    if (v == NULL) {
+        return 0;
+    }
+    /* Deliberately not const: the length is a property of the FILE, and a
+       view that answered from a length another writer has already
+       invalidated would hand its caller a clamp bound that is simply
+       wrong. fv_sync reports failure by zeroing file_size, which is the
+       honest answer for a file that is gone. */
+    if (fv_sync(v) != AXL_OK) {
+        return 0;
+    }
+    return v->file_size;
 }
 
 size_t
 axl_file_view_read(AxlFileView *v, size_t offset, void *out, size_t len)
 {
-    if (v == NULL || out == NULL || offset >= v->file_size) {
+    if (v == NULL || out == NULL || fv_sync(v) != AXL_OK
+        || offset >= v->file_size) {
         return 0;
     }
 
@@ -222,7 +330,7 @@ axl_file_view_page(AxlFileView *v, size_t offset, size_t *avail)
     if (avail != NULL) {
         *avail = 0;
     }
-    if (v == NULL || offset >= v->file_size) {
+    if (v == NULL || fv_sync(v) != AXL_OK || offset >= v->file_size) {
         return NULL;
     }
     size_t valid_len = 0;

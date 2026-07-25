@@ -88,8 +88,12 @@ typedef enum {
 // Architecture tag (for the register-snapshot union below)
 // ---------------------------------------------------------------------------
 
-#define AXL_CPU_ARCH_X64    1
-#define AXL_CPU_ARCH_AA64   2
+/// Architecture the register-snapshot union carries.
+typedef enum {
+    AXL_CPU_ARCH_UNKNOWN = 0,  ///< arch not determined (no snapshot available)
+    AXL_CPU_ARCH_X64     = 1,  ///< x86-64 (regs.x64 populated)
+    AXL_CPU_ARCH_AA64    = 2   ///< AArch64 (regs.aa64 populated)
+} AxlCpuArch;
 
 // ---------------------------------------------------------------------------
 // Exception context
@@ -135,7 +139,7 @@ typedef struct {
     uint32_t            struct_size;      ///< sizeof(AxlCpuException) as written by the SDK
     uint32_t            version;          ///< AXL_CPU_EXCEPTION_VERSION at emit time
     AxlCpuExceptionKind kind;
-    int                 arch;             ///< AXL_CPU_ARCH_X64 / _AA64
+    AxlCpuArch          arch;             ///< AXL_CPU_ARCH_X64 / _AA64 (UNKNOWN if none)
     uint64_t            fault_address;    ///< memory-fault address, or 0 if N/A
     uint64_t            instruction_ptr;  ///< RIP / ELR
     uint64_t            stack_ptr;        ///< RSP / SP

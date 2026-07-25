@@ -50,7 +50,7 @@ emit_desc(
     AxlConfigDesc *out,
     size_t         idx,
     const char    *key,
-    int            type,
+    AxlConfigType  type,
     const char    *default_value,
     const char    *description,
     size_t         field_offset,
@@ -245,8 +245,13 @@ axl_net_init_static(
         return AXL_ERR;
     }
 
-    /* Concrete index for the per-NIC setters (auto -> first NIC). */
-    size_t nic = (nic_index == AXL_NET_NIC_AUTO) ? 0 : (size_t)nic_index;
+    /* Concrete index for the per-NIC setters -- AUTO passes through
+       unmapped (SIZE_MAX, same as axl_net_init above) so it resolves
+       through the registry's AUTO ladder instead of being clamped to
+       NIC 0 here. See axl_net_get_dhcp_lease in axl-net.h for the
+       ladder every net API taking AXL_NET_NIC_AUTO resolves through. */
+    size_t nic = (nic_index == AXL_NET_NIC_AUTO)
+                     ? SIZE_MAX : (size_t)nic_index;
     bool   dns_attempted = false;
 
     if (is_static) {

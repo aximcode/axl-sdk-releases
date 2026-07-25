@@ -236,8 +236,8 @@ int
 axl_mem_phys_read_range(
     uintptr_t  phys,          ///< source physical address (multiple of @p access_width)
     size_t     len,           ///< bytes to read (multiple of @p access_width, > 0)
-    void      *buf,           ///< [out] destination buffer (>= @p len bytes)
-    uint32_t   access_width   ///< per-access width in bytes: 1, 2, 4, or 8
+    uint32_t   access_width,  ///< per-access width in bytes: 1, 2, 4, or 8
+    void      *buf            ///< [out] destination buffer (>= @p len bytes)
 );
 
 /**
@@ -266,7 +266,7 @@ axl_mem_phys_write_range(
 // The x86 I/O port address space (0x0000–0xFFFF) is a SEPARATE address space
 // from physical memory, accessed with IN/OUT instructions. The region map
 // classifies it from the PI GCD I/O-space map; the access helpers wrap
-// `axl-port.h`'s `axl_io_port_read/write`.
+// `axl-io-port.h`'s `axl_io_port_read/write`.
 //
 // **x86-only access.** Classification (region_at/count/get) works on any arch
 // (it just reflects what the GCD reports — typically empty on AArch64, which
@@ -369,8 +369,8 @@ int
 axl_io_read_range(
     uintptr_t  port,          ///< source I/O port
     size_t     len,           ///< ports to read (multiple of @p access_width, > 0)
-    void      *buf,           ///< [out] destination buffer (>= @p len bytes)
-    uint32_t   access_width   ///< per-access width: 1, 2, or 4
+    uint32_t   access_width,  ///< per-access width: 1, 2, or 4
+    void      *buf            ///< [out] destination buffer (>= @p len bytes)
 );
 
 /**

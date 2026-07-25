@@ -27,6 +27,7 @@
 #include <stdbool.h>
 
 #include <axl/axl-macros.h>
+#include <axl/axl-tcp.h>       /* AxlTeardown */
 
 #ifdef __cplusplus
 extern "C" {
@@ -112,14 +113,23 @@ axl_socket_new_from_tcp(
 
 /**
  * @brief Close and free a socket. NULL-safe.
+ *
+ * @p mode selects the teardown (see @ref AxlTeardown): `AXL_TEARDOWN_GRACEFUL`
+ * (orderly FIN, the default for ordinary shutdown) or `AXL_TEARDOWN_RESET`
+ * (abortive RST + synchronous loop-free finalize, so a stream-socket listen
+ * port is free on return even with connections in flight — the in-place
+ * server-upgrade / port hand-off case; the RST discards un-ACKed in-flight
+ * bytes). For a datagram socket both modes are identical — UDP has no graceful
+ * close to abort. RAII (`AXL_AUTOPTR`) cleanup always uses `AXL_TEARDOWN_GRACEFUL`.
  */
 void
 axl_socket_free(
-    AxlSocket *sock  ///< socket to free
+    AxlSocket   *sock,  ///< socket to free (NULL-safe)
+    AxlTeardown  mode   ///< AXL_TEARDOWN_GRACEFUL or AXL_TEARDOWN_RESET
 );
 
 #ifdef AXL_HAVE_AUTOPTR
-AXL_DEFINE_AUTOPTR_CLEANUP(AxlSocket, axl_socket_free)
+AXL_DEFINE_AUTOPTR_CLEANUP_ARG(AxlSocket, axl_socket_free, AXL_TEARDOWN_GRACEFUL)
 #endif
 
 // ---------------------------------------------------------------------------

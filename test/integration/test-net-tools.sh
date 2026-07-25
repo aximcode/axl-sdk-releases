@@ -76,6 +76,10 @@ fetch.efi http://10.0.2.2:${HOST_PORT}/no-such-thing
 echo === TEST-FETCH-REDIRECT ===
 fetch.efi http://10.0.2.2:${HOST_PORT}/redirect
 
+echo === TEST-FETCH-SAVE ===
+fetch.efi http://10.0.2.2:${HOST_PORT}/hello -o fetched.txt
+type fetched.txt
+
 echo === TEST-END ===
 reset -s
 NSHEOF
@@ -171,6 +175,25 @@ check_section "TEST-FETCH-404" "TEST-FETCH-REDIRECT" "fetch 404 returned (next m
 # fetch redirect: host-server.py replies 302 to /hello, which fetch's
 # redirect-following logic chases and prints the body.
 check_section "TEST-FETCH-REDIRECT" "hello from host" "fetch follows 302 to /hello"
+
+# fetch -o: the save path reported its OUTCOME BACKWARDS. AXL_OK is 0, so the
+# `if (!axl_file_set_contents(...))` guard ran the failure branch on every
+# successful write -- fetch announced "write 'x' failed" and still exited 0 for
+# a file it had just saved correctly. Assert both halves: the success line, and
+# that the failure line is absent for a save that plainly worked (the `type`
+# of the file in the same section proves the bytes are really there).
+check_section "TEST-FETCH-SAVE" "Saved [0-9]+ bytes to fetched.txt" \
+    "fetch -o reports the save it actually performed"
+check_section "TEST-FETCH-SAVE" "hello from host" \
+    "fetch -o wrote the body to the file"
+if sed -n "/=== TEST-FETCH-SAVE ===/,/^=== TEST-/p" "$TEST_CLEAN_LOG" \
+        | grep -q "write 'fetched.txt' failed"; then
+    echo "  FAIL: fetch -o must not report a failure for a save that worked"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS: fetch -o must not report a failure for a save that worked"
+    PASS=$((PASS + 1))
+fi
 
 echo ""
 printf "Results: %d passed, %d failed (%s)\n" "$PASS" "$FAIL" "$TEST_ARCH"

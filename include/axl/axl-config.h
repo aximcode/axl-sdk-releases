@@ -31,11 +31,14 @@ extern "C" {
 // Option types
 // ---------------------------------------------------------------------------
 
-#define AXL_CFG_BOOL    1   ///< "true"/"false"/"1"/"0"
-#define AXL_CFG_INT     2   ///< signed integer
-#define AXL_CFG_UINT    3   ///< unsigned integer
-#define AXL_CFG_STRING  4   ///< arbitrary string
-#define AXL_CFG_MULTI   5   ///< repeatable string (array)
+/// Value type of a config option (AxlConfigDesc::type).
+typedef enum {
+    AXL_CFG_BOOL   = 1,  ///< "true"/"false"/"1"/"0"
+    AXL_CFG_INT    = 2,  ///< signed integer
+    AXL_CFG_UINT   = 3,  ///< unsigned integer
+    AXL_CFG_STRING = 4,  ///< arbitrary string
+    AXL_CFG_MULTI  = 5   ///< repeatable string (array)
+} AxlConfigType;
 
 // ---------------------------------------------------------------------------
 // Descriptor table
@@ -55,7 +58,7 @@ extern "C" {
  */
 typedef struct {
     const char *key;            ///< dotted name (e.g. "timeout.ms")
-    int         type;           ///< AXL_CFG_BOOL, _INT, _UINT, _STRING, _MULTI
+    AxlConfigType type;         ///< AXL_CFG_BOOL, _INT, _UINT, _STRING, _MULTI
     const char *default_value;  ///< default as string (NULL = no default)
     const char *description;    ///< help text (logged in debug mode)
     size_t      offset;         ///< offsetof into target struct

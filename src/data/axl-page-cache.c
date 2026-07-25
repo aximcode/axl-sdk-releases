@@ -135,8 +135,8 @@ axl_page_cache_fetch(AxlPageCache *pc, const void *owner, size_t page_index,
         pc->stats.evictions++;
     }
 
-    int64_t got = fill(user, page_index,
-                       pc->pool + victim * pc->page_size, pc->page_size);
+    int64_t got = fill(page_index,
+                       pc->pool + victim * pc->page_size, pc->page_size, user);
     if (got < 0 || (size_t)got > pc->page_size) {
         /* Fill failed — leave the frame empty rather than stale. */
         f->occupied = false;

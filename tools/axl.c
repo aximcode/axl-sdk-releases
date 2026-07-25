@@ -36,6 +36,7 @@
    dispatch table below without per-tool headers. The names must
    match the .c filenames (and the AXL_TOOL_MAIN argument). */
 extern int axl_tool_cat_main(int argc, char **argv);
+extern int axl_tool_cut_main(int argc, char **argv);
 extern int axl_tool_dmidecode_main(int argc, char **argv);
 extern int axl_tool_fetch_main(int argc, char **argv);
 extern int axl_tool_find_main(int argc, char **argv);
@@ -44,6 +45,7 @@ extern int axl_tool_hexdump_main(int argc, char **argv);
 extern int axl_tool_i2c_main(int argc, char **argv);
 extern int axl_tool_ipmi_main(int argc, char **argv);
 extern int axl_tool_lspci_main(int argc, char **argv);
+extern int axl_tool_lsproto_main(int argc, char **argv);
 extern int axl_tool_lsusb_main(int argc, char **argv);
 extern int axl_tool_memspd_main(int argc, char **argv);
 extern int axl_tool_mkfixture_main(int argc, char **argv);
@@ -53,6 +55,7 @@ extern int axl_tool_rfbrowse_main(int argc, char **argv);
 extern int axl_tool_rndisfix_main(int argc, char **argv);
 extern int axl_tool_sysinfo_main(int argc, char **argv);
 extern int axl_tool_timetest_main(int argc, char **argv);
+extern int axl_tool_tr_main(int argc, char **argv);
 
 typedef int (*ToolFn)(int argc, char **argv);
 
@@ -65,6 +68,7 @@ typedef struct {
 /* Sorted alphabetically — order is what `axl --help` prints. */
 static const Tool tools[] = {
     { "cat",       axl_tool_cat_main,       "Concatenate and print files"        },
+    { "cut",       axl_tool_cut_main,       "Remove sections from each line"     },
     { "dmidecode", axl_tool_dmidecode_main, "Decode SMBIOS / DMI tables"         },
     { "fetch",     axl_tool_fetch_main,     "HTTP client (curl-style)"           },
     { "find",      axl_tool_find_main,      "Recursive file finder"              },
@@ -73,6 +77,7 @@ static const Tool tools[] = {
     { "i2c",       axl_tool_i2c_main,       "Low-level I2C / SMBus explorer"     },
     { "ipmi",      axl_tool_ipmi_main,      "IPMI / BMC command tool"            },
     { "lspci",     axl_tool_lspci_main,     "List PCI devices + bridges"         },
+    { "lsproto",   axl_tool_lsproto_main,   "List UEFI protocols by spec name"   },
     { "lsusb",     axl_tool_lsusb_main,     "List USB devices and topology"      },
     { "memspd",    axl_tool_memspd_main,    "Read DDR4 / DDR5 SPD via SMBus"     },
     { "mkfixture", axl_tool_mkfixture_main, "Build a test fixture image"        },
@@ -82,6 +87,7 @@ static const Tool tools[] = {
     { "rndisfix",  axl_tool_rndisfix_main,  "RNDIS NIC quirk handler"            },
     { "sysinfo",   axl_tool_sysinfo_main,   "Firmware / SMBIOS / memory inventory"},
     { "timetest",  axl_tool_timetest_main,  "Time / monotonic clock probes"      },
+    { "tr",        axl_tool_tr_main,        "Translate/squeeze/delete bytes"     },
 };
 
 #define TOOL_COUNT (sizeof(tools) / sizeof(tools[0]))

@@ -9,6 +9,7 @@
 #include <axl/axl-nvstore.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
+#include <axl/axl-sys.h>
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("nvstore");
@@ -125,11 +126,20 @@ axl_nvstore_register_namespace(
         return AXL_ERR;
     }
 
-    /* Already registered? Allow idempotent re-register with same token,
-       reject collision with different token. */
+    /* Already registered? Allow idempotent re-register with an
+       equal token, reject collision with a different one.
+
+       Compare the 16 GUID bytes, NOT the pointer: two translation
+       units in one image each keeping a private `static const AxlGuid`
+       for the same namespace is the obvious pattern (the API takes a
+       `const void *`), and a pointer compare rejected the second one —
+       leaving every get/set from that TU aimed at an unregistered
+       namespace. The first registration's pointer stays in the table,
+       so the lifetime contract is unchanged. */
     for (size_t i = 0; i < num_namespaces; i++) {
         if (axl_strcmp(name, namespaces[i].name) == 0) {
-            if (namespaces[i].guid == (const EFI_GUID *)backend_token) {
+            if (axl_guid_equal((const AxlGuid *)namespaces[i].guid,
+                               (const AxlGuid *)backend_token)) {
                 return AXL_OK;
             }
             axl_warning("namespace '%s' already registered with different token",

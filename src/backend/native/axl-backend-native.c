@@ -12,6 +12,7 @@
 
 #include "axl-backend.h"
 #include "axl-backend-native-efi1x.h"  /* old EFI 1.x shell path resolution */
+#include "axl-backend-native-nosh.h"   /* no shell at all (BDS boot option) */
 #include "axl-stdio-bridge.h"  /* AxlStdioBridge, bridge install/uninstall */
 #include <axl/axl-driver.h>    /* axl_protocol_install, axl_protocol_uninstall */
 #include <axl/axl-sys.h>       /* axl_protocol_find_guid */
@@ -638,6 +639,43 @@ axl_backend_io_write8(uint16_t port, uint8_t value)
 // File I/O (via EFI_SHELL_PROTOCOL)
 // ===================================================================
 
+/* True when NEITHER shell is present — a BDS boot option, a DXE driver on
+   minimal firmware. This is the ONLY condition under which the positional
+   fs<n> namespace may be used: it is measured to diverge from what a shell
+   calls the same volume, so handing a positional name to a live shell's
+   OpenFileByName would resolve a DIFFERENT volume. */
+static bool
+no_shell_at_all(
+    void
+    )
+{
+    return get_shell() == NULL && axl_efi1x_shell_env() == NULL;
+}
+
+/* Resolve + open @p path with no EFI_SHELL_PROTOCOL: through the old EFI 1.x
+   shell's map when that shell is live, else straight off the firmware's
+   SimpleFileSystem handles (a BDS boot option, where no shell exists at all).
+
+   Both produce an EFI_FILE_PROTOCOL *, which is the same handle shape a
+   SHELL_FILE_HANDLE has on the modern shell — so every handle-based op below
+   stays shell-agnostic. Shared by the open / delete / mkdir entry points,
+   which differ only in the mode and attributes they ask for.
+
+   @return AXL_OK with @p out set, or AXL_ERR. */
+static int
+no_shell_file_open(
+    const unsigned short  *path,
+    uint64_t               mode,
+    uint64_t               attributes,
+    EFI_FILE_PROTOCOL    **out
+    )
+{
+    if (!no_shell_at_all()) {
+        return axl_efi1x_file_open(path, mode, attributes, out);
+    }
+    return axl_nosh_file_open(path, mode, attributes, out);
+}
+
 /**
  * @brief Open a file by UCS-2 path.
  *
@@ -663,12 +701,13 @@ axl_backend_file_open(
 
     shell = get_shell();
     if (shell == NULL) {
-        /* Old EFI 1.x shell: resolve + open natively. The resulting
-           EFI_FILE_PROTOCOL* IS the handle — the same shape a
+        /* No modern shell: resolve + open natively (old shell's map, or
+           the raw SimpleFileSystem handles when there is no shell at all).
+           The resulting EFI_FILE_PROTOCOL* IS the handle — the same shape a
            SHELL_FILE_HANDLE has on the modern shell, so the handle-based
            ops below stay shell-agnostic. */
         EFI_FILE_PROTOCOL *file = NULL;
-        if (axl_efi1x_file_open(path, mode, attributes, &file) != AXL_OK) {
+        if (no_shell_file_open(path, mode, attributes, &file) != AXL_OK) {
             return AXL_ERR;
         }
         *handle = (AxlFileHandle)file;
@@ -785,6 +824,33 @@ axl_backend_file_write(
 }
 
 /**
+ * @brief Flush a file handle's pending data through to the volume.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int
+axl_backend_file_flush(
+    AxlFileHandle  handle  ///< file handle (open for write)
+    )
+{
+    EFI_SHELL_PROTOCOL  *shell;
+    EFI_STATUS           status;
+
+    if (handle == NULL) {
+        return AXL_ERR;
+    }
+
+    shell = get_shell();
+    if (shell != NULL) {
+        status = shell->FlushFile((SHELL_FILE_HANDLE)handle);
+    } else {
+        EFI_FILE_PROTOCOL *file = (EFI_FILE_PROTOCOL *)handle;
+        status = file->Flush(file);
+    }
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
+/**
  * @brief Get current file position.
  *
  * @return 0 on success, -1 on error.
@@ -863,13 +929,13 @@ axl_backend_file_delete(
 
     shell = get_shell();
     if (shell == NULL) {
-        /* Old EFI 1.x shell: open with write access, then Delete (which
+        /* No modern shell: open with write access, then Delete (which
            closes the handle whether it succeeds or fails). Works for both
            files and empty directories. */
         EFI_FILE_PROTOCOL *file = NULL;
-        if (axl_efi1x_file_open(path,
-                                AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
-                                0, &file) != AXL_OK) {
+        if (no_shell_file_open(path,
+                               AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
+                               0, &file) != AXL_OK) {
             return AXL_ERR;
         }
         status = file->Delete(file);
@@ -1097,13 +1163,13 @@ axl_backend_file_mkdir(
 
     shell = get_shell();
     if (shell == NULL) {
-        /* Old EFI 1.x shell: Open with CREATE|DIRECTORY makes the directory
+        /* No modern shell: Open with CREATE|DIRECTORY makes the directory
            (and opens it); close the handle. */
         EFI_FILE_PROTOCOL *dir = NULL;
-        if (axl_efi1x_file_open(path,
-                                AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE
-                                    | AXL_FILE_MODE_CREATE,
-                                EFI_FILE_DIRECTORY, &dir) != AXL_OK) {
+        if (no_shell_file_open(path,
+                               AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE
+                                   | AXL_FILE_MODE_CREATE,
+                               EFI_FILE_DIRECTORY, &dir) != AXL_OK) {
             return AXL_ERR;
         }
         dir->Close(dir);
@@ -1601,40 +1667,36 @@ axl_backend_shell_stdin(void)
     return bridge_lookup_stdin();            /* driver: live bridge consult */
 }
 
-bool
-axl_backend_stdin_is_interactive(void)
+/* Shared classifier behind the stdin/stdout interactive predicates: is the
+   given shell std handle the interactive CONSOLE, or a redirected file / pipe?
+   NULL handle (BDS / non-shell / no live bridge) → not interactive: the stream
+   layer surfaces that as EOF (stdin) or the raw byte path (stdout) rather than
+   blocking or mangling. */
+static bool
+handle_is_interactive_console(AxlFileHandle h)
 {
-    AxlFileHandle h = axl_backend_shell_stdin();
     if (h == NULL) {
-        /* No shell StdIn wiring (BDS / non-shell context, or a driver
-           with no live bridge). Nothing to read interactively through
-           the shell — the stream layer surfaces this as EOF rather than
-           blocking on a keyboard, so report non-interactive to match. */
         return false;
     }
     EFI_SHELL_PROTOCOL *shell = get_shell();
     if (shell == NULL || shell->GetFileSize == NULL) {
-        return false;   /* can't probe → keep the safe raw-byte path */
+        return false;   /* can't probe → keep the safe byte/raw path */
     }
-    /* A redirected file (`< f`) or pipe RHS (`|`) is a real file: GetFileSize
-       succeeds with a byte count. The console pseudo-file rejects the query.
-       Verified on OVMF/EDK2 across typed / `<` / `|`. */
+    /* A redirected file (`> f` / `< f`) or a pipe (`|`) is a real file:
+       GetFileSize succeeds with a byte count. The console pseudo-file rejects
+       the query. Verified on OVMF/EDK2 across typed / `<` / `>` / `|`. */
     UINT64     size = 0;
     EFI_STATUS st   = shell->GetFileSize((SHELL_FILE_HANDLE)h, &size);
     if (!EFI_ERROR(st)) {
         return false;   /* has a byte size ⇒ redirected file/pipe */
     }
-    /* GetFileSize failed. Bias toward the safe raw-byte path unless a SECOND,
+    /* GetFileSize failed. Bias toward the safe byte path unless a SECOND,
        independent probe corroborates "console": a real file also returns file
        info, the console pseudo-file returns none. Requiring BOTH signals keeps
-       a GetFileSize-hostile firmware from misclassifying a pipe as interactive
-       — which would block on a keyboard instead of reading the piped bytes,
-       strictly worse than the byte path (a false "piped" only degrades to the
-       raw console read, it does not hang). */
+       a GetFileSize-hostile firmware from misclassifying a file/pipe as
+       interactive — a false "piped" only degrades to the safe path, it does
+       not hang (stdin) or mangle (stdout). */
     if (shell->GetFileInfo == NULL) {
-        /* Can't obtain the corroborating signal — do NOT claim interactive on
-           the single failed probe (that would risk blocking a pipe on the
-           keyboard); fall back to the safe raw-byte path. */
         return false;
     }
     EFI_FILE_INFO *fi = shell->GetFileInfo((SHELL_FILE_HANDLE)h);
@@ -1643,6 +1705,18 @@ axl_backend_stdin_is_interactive(void)
         return false;   /* has file info ⇒ treat as a file, not the console */
     }
     return true;   /* no size AND no file info ⇒ interactive console */
+}
+
+bool
+axl_backend_stdin_is_interactive(void)
+{
+    return handle_is_interactive_console(axl_backend_shell_stdin());
+}
+
+bool
+axl_backend_stdout_is_interactive(void)
+{
+    return handle_is_interactive_console(axl_backend_shell_stdout());
 }
 
 AxlFileHandle
@@ -1708,7 +1782,15 @@ axl_backend_shell_execute(
 
     EFI_SHELL_PROTOCOL *shell = get_shell();
     if (shell != NULL) {
-        EFI_STATUS status = shell->Execute(NULL, (CHAR16 *)command, NULL, NULL);
+        /* ParentImageHandle is EFI_HANDLE* (not EFI_HANDLE) and the modern
+           EDK2 shell's Execute() dereferences it to seed the spawned
+           command's own LoadedImage->ParentHandle -- a NULL pointer here
+           (as opposed to a NULL *contents*) makes Execute() bail with
+           EFI_INVALID_PARAMETER before the command ever runs, on real
+           OVMF/EDK2 shells. Pass this image's own handle by address, the
+           same convention the old EFI 1.x branch below uses. */
+        EFI_STATUS status = shell->Execute(&gImageHandle, (CHAR16 *)command,
+                                           NULL, NULL);
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
 
@@ -1778,6 +1860,106 @@ axl_backend_shell_execute_quiet(
 // so those iterate fs0..fsN and byte-compare).
 // ===================================================================
 
+/* Total device-path size in bytes, including the trailing END node. Bounded
+   walk; returns 0 on a malformed chain (Length < 4). */
+static size_t
+dp_total_bytes(
+    const void  *dp
+    )
+{
+    const uint8_t *p = (const uint8_t *)dp;
+    size_t total = 0;
+    for (unsigned n = 0; n < 256 && p != NULL; n++) {
+        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
+        if (len < 4) {
+            return 0;
+        }
+        total += len;
+        if (p[0] == 0x7f) {   /* END node — included in the total */
+            break;
+        }
+        p += len;
+    }
+    return total;
+}
+
+bool
+axl_backend_dp_equal(
+    const void  *a,
+    const void  *b
+    )
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    size_t sa = dp_total_bytes(a);
+    if (sa == 0 || sa != dp_total_bytes(b)) {
+        return false;
+    }
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (size_t i = 0; i < sa; i++) {
+        if (pa[i] != pb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int
+axl_backend_volume_name_for_handle(
+    void   *device_handle,
+    char   *out,
+    size_t  out_size
+    )
+{
+    if (device_handle == NULL || out == NULL || out_size == 0) {
+        return AXL_ERR;
+    }
+
+    /* With no shell anywhere, name the volume positionally — matched on the
+       handle itself, which for a file-loaded image is exact where a
+       device-path comparison is merely careful. */
+    if (no_shell_at_all()) {
+        return axl_nosh_volume_name_for_handle(device_handle, out, out_size);
+    }
+
+    /* A shell is live, so its map is the ONLY naming that may be returned:
+       a path built from the name has to resolve through that same shell.
+       Falling back to the positional fs<n> here would be a correctness bug
+       for any volume the shell has not mapped (a fresh RAM disk, a hot-plug,
+       anything since the last `map -r`) — the two orders diverge, so the
+       name would resolve to a DIFFERENT volume. Report "unnamed" instead and
+       let the caller degrade to a prefix-less path. */
+    EFI_DEVICE_PATH_PROTOCOL *dp      = NULL;
+    EFI_GUID                  dp_guid = gEfiDevicePathProtocolGuid;
+    if (EFI_ERROR(gBS->HandleProtocol((EFI_HANDLE)device_handle, &dp_guid,
+                                      (VOID **)&dp))
+        || dp == NULL)
+    {
+        return AXL_ERR;
+    }
+    return axl_backend_shell_map_alias(dp, out, out_size);
+}
+
+/* Name a volume by device path when there is no modern shell: the old EFI 1.x
+   shell's map if that shell is live, else the positional fs<n>. Shared by the
+   map_name and map_alias lookups — with no shell there is no distinction
+   between "the fs<n> name" and "the first alias", since fs<n> is the only
+   name that exists. */
+static int
+shell_map_name_no_modern_shell(
+    void   *device_path,
+    char   *out,
+    size_t  out_size
+    )
+{
+    if (!no_shell_at_all()) {
+        return axl_efi1x_map_fs_name_from_dp(device_path, out, out_size);
+    }
+    return axl_nosh_map_fs_name_from_dp(device_path, out, out_size);
+}
+
 int
 axl_backend_shell_map_name(
     void   *device_path,
@@ -1794,7 +1976,7 @@ axl_backend_shell_map_name(
         /* Old EFI 1.x shell: no GetMapFromDevicePath. The efi1x reverse lookup
            yields exactly the lowercase fs<n> this function reports (resolves
            only once the disk is in the shell's map, i.e. after `map -r`). */
-        return axl_efi1x_map_fs_name_from_dp(device_path, out, out_size);
+        return shell_map_name_no_modern_shell(device_path, out, out_size);
     }
 
     /* GetMapFromDevicePath advances the pointer past the matched volume
@@ -1854,7 +2036,7 @@ axl_backend_shell_map_alias(
         /* Old EFI 1.x shell: no GetMapFromDevicePath. Reverse-look-up the
            disk's FS<n> through SHELL_ENVIRONMENT.GetMap instead. Resolves only
            once the disk is actually in the shell's map (after `map -r`). */
-        return axl_efi1x_map_fs_name_from_dp(device_path, out, out_size);
+        return shell_map_name_no_modern_shell(device_path, out, out_size);
     }
 
     /* GetMapFromDevicePath advances the pointer; pass a local copy. */

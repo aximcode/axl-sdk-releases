@@ -2539,6 +2539,86 @@ test_fv(void)
 }
 
 // ---------------------------------------------------------------------------
+// AxlFv — file enumeration + FvFile-GUID -> UI-name resolution
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    bool    found;
+    AxlGuid guid;
+    char    name[64];
+} FvNameProbe;
+
+/* Stop at the first file whose GUID resolves to a non-empty UI name. */
+static bool
+fv_name_probe_cb(const AxlGuid *guid, uint8_t type, void *ctx)
+{
+    (void)type;
+    FvNameProbe *p = (FvNameProbe *)ctx;
+    char nm[64];
+    if (axl_fv_find_file_name(guid, nm, sizeof nm) == AXL_OK && nm[0] != '\0') {
+        p->found = true;
+        p->guid  = *guid;
+        axl_strlcpy(p->name, nm, sizeof p->name);
+        return true;   /* stop the walk */
+    }
+    return false;
+}
+
+static void
+test_fv_names(void)
+{
+    /* Round-trip (no hardcoded OVMF specifics): independently enumerate files
+       via axl_fv_for_each_file, find one whose GUID resolves to a UI name, then
+       confirm the resolver returns the same non-empty, printable name. */
+    FvNameProbe p = { 0 };
+    AxlHandle   h = NULL;
+    while (!p.found && (h = axl_fv_next(h)) != NULL) {
+        axl_fv_for_each_file(h, fv_name_probe_cb, &p);
+    }
+    test_check(p.found, "fv name: at least one FV file resolves to a UI name");
+
+    if (p.found) {
+        bool printable = (p.name[0] != '\0');
+        for (size_t i = 0; p.name[i] != '\0'; i++) {
+            unsigned char c = (unsigned char)p.name[i];
+            if (c < 0x20 || c >= 0x7f) {
+                printable = false;
+            }
+        }
+        test_check(printable, "fv name: resolved name is printable ASCII");
+
+        char again[64];
+        test_check(axl_fv_find_file_name(&p.guid, again, sizeof again) == AXL_OK
+                   && axl_strcmp(again, p.name) == 0,
+                   "fv name: lookup is stable for the same GUID");
+    }
+
+    /* A GUID no volume contains resolves to NOT_FOUND (not a bogus name). */
+    AxlGuid absent;
+    axl_memset(&absent, 0xFF, sizeof absent);
+    char nm[64] = "x";
+    test_check(axl_fv_find_file_name(&absent, nm, sizeof nm) == AXL_NOT_FOUND,
+               "fv name: unknown GUID returns AXL_NOT_FOUND");
+    test_check(nm[0] == '\0', "fv name: out is cleared on NOT_FOUND");
+
+    /* Error contract. */
+    char buf[8];
+    test_check(axl_fv_find_file_name(NULL, buf, sizeof buf) == AXL_ERR,
+               "fv name: NULL guid returns AXL_ERR");
+    test_check(axl_fv_find_file_name(&absent, NULL, sizeof buf) == AXL_ERR,
+               "fv name: NULL out returns AXL_ERR");
+    test_check(axl_fv_find_file_name(&absent, buf, 0) == AXL_ERR,
+               "fv name: zero cap returns AXL_ERR");
+
+    /* for_each_file error contract. */
+    test_check(axl_fv_for_each_file(axl_fv_next(NULL), NULL, NULL) == AXL_ERR,
+               "fv name: for_each_file with NULL fn returns AXL_ERR");
+    int marker = 0;
+    test_check(axl_fv_for_each_file((AxlHandle)&marker, fv_name_probe_cb, &p) == AXL_ERR,
+               "fv name: for_each_file on a non-FV handle returns AXL_ERR");
+}
+
+// ---------------------------------------------------------------------------
 // AxlTpm — TPM 2.0 presence + capability (TCG2 singleton)
 // ---------------------------------------------------------------------------
 
@@ -2650,23 +2730,28 @@ test_tpm_seal(void)
     uint8_t *blob = NULL;
     size_t blob_len = 0;
 
-    /* Argument validation (precedes any TPM call). */
-    test_check(axl_tpm_seal(NULL, sizeof secret, pcrs, 1, &blob, &blob_len)
+    /* Argument validation (precedes any TPM call). A pre-dirtied AxlTpmError
+       must come back cleared on the arg-error path — no TPM command ran. */
+    AxlTpmError aerr = { (const char *)"dirty", 0xDEADu };
+    test_check(axl_tpm_seal(NULL, sizeof secret, pcrs, 1, &blob, &blob_len, &aerr)
                    == AXL_INVALID,
                "tpm seal: NULL secret -> AXL_INVALID");
-    test_check(axl_tpm_seal(secret, 0, pcrs, 1, &blob, &blob_len) == AXL_INVALID,
+    test_check(aerr.stage == NULL && aerr.tpm_rc == 0,
+               "tpm err: arg-error leaves the error record cleared");
+    test_check(axl_tpm_seal(secret, 0, pcrs, 1, &blob, &blob_len, NULL)
+                   == AXL_INVALID,
                "tpm seal: zero length -> AXL_INVALID");
     test_check(axl_tpm_seal(secret, AXL_TPM_SEAL_MAX_SECRET + 1, pcrs, 1,
-                            &blob, &blob_len) == AXL_INVALID,
+                            &blob, &blob_len, NULL) == AXL_INVALID,
                "tpm seal: oversize secret -> AXL_INVALID");
-    test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 0, &blob, &blob_len)
+    test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 0, &blob, &blob_len, NULL)
                    == AXL_INVALID,
                "tpm seal: zero pcr_count -> AXL_INVALID");
     uint32_t bad_pcr[1] = { 99 };
-    test_check(axl_tpm_seal(secret, sizeof secret, bad_pcr, 1, &blob, &blob_len)
+    test_check(axl_tpm_seal(secret, sizeof secret, bad_pcr, 1, &blob, &blob_len, NULL)
                    == AXL_INVALID,
                "tpm seal: PCR index > 23 -> AXL_INVALID");
-    test_check(axl_tpm_unseal(NULL, 0, &blob, &blob_len) == AXL_INVALID,
+    test_check(axl_tpm_unseal(NULL, 0, &blob, &blob_len, NULL) == AXL_INVALID,
                "tpm unseal: NULL blob -> AXL_INVALID");
 
     /* A structurally-valid blob carrying an out-of-range PCR index must be
@@ -2679,23 +2764,53 @@ test_tpm_seal(void)
     uint8_t *bad_out = NULL;
     size_t bad_out_len = 0;
     test_check(axl_tpm_unseal(bad_pcr_blob, sizeof bad_pcr_blob,
-                              &bad_out, &bad_out_len) == AXL_INVALID,
+                              &bad_out, &bad_out_len, NULL) == AXL_INVALID,
                "tpm unseal: blob with PCR index > 23 -> AXL_INVALID");
 
     if (axl_tpm_present()) {
-        int rc = axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len);
+        AxlTpmError serr = { (const char *)"dirty", 0xDEADu };
+        int rc = axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len,
+                              &serr);
         test_check(rc == AXL_OK && blob != NULL && blob_len > 0,
                    "tpm seal: succeeds when present");
+        test_check(serr.stage == NULL && serr.tpm_rc == 0,
+                   "tpm err: successful seal leaves the error record cleared");
 
         uint8_t *got = NULL;
         size_t got_len = 0;
         int urc = (rc == AXL_OK)
-            ? axl_tpm_unseal(blob, blob_len, &got, &got_len) : AXL_ERR;
+            ? axl_tpm_unseal(blob, blob_len, &got, &got_len, NULL) : AXL_ERR;
         test_check(urc == AXL_OK, "tpm unseal: succeeds when present");
         bool round = urc == AXL_OK && got_len == sizeof secret &&
                      axl_memcmp(got, secret, sizeof secret) == 0;
         test_check(round, "tpm seal/unseal round-trips the secret");
         axl_printf("TPM-SEAL:%s\n", round ? "ok" : "bad");
+
+        /* Corrupt the sealed private area (past the header) so the TPM rejects
+           it on load: proves a real TPM command failure surfaces its failing
+           stage + responseCode through AxlTpmError, not just a bare AXL_ERR. */
+        AxlTpmError cerr = { NULL, 0 };
+        int crc = AXL_OK;
+        if (rc == AXL_OK && blob != NULL && blob_len > 8) {
+            uint8_t *bad = axl_malloc(blob_len);
+            if (bad != NULL) {
+                axl_memcpy(bad, blob, blob_len);
+                bad[blob_len - 2] ^= 0xFFu;   /* deep in the private area */
+                uint8_t *bo = NULL;
+                size_t   bl = 0;
+                crc = axl_tpm_unseal(bad, blob_len, &bo, &bl, &cerr);
+                if (bo != NULL) {
+                    axl_free(bo);
+                }
+                axl_free(bad);
+            }
+        }
+        test_check(crc != AXL_OK, "tpm unseal: corrupted blob does not unseal");
+        test_check(cerr.stage != NULL && cerr.tpm_rc != 0,
+                   "tpm err: corrupted blob surfaces a failing stage + TPM rc");
+        axl_printf("TPM-ERR:%s rc=0x%x\n",
+                   cerr.stage != NULL ? cerr.stage : "(none)",
+                   (unsigned)cerr.tpm_rc);
 
         if (blob != NULL) {
             axl_free(blob);
@@ -2704,9 +2819,12 @@ test_tpm_seal(void)
             axl_free(got);
         }
     } else {
-        test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len)
-                       == AXL_ERR,
+        test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len,
+                                NULL) == AXL_ERR,
                    "tpm seal: AXL_ERR without a TPM");
+        test_check(true, "tpm seal: SKIP balance (no TPM)");
+        test_check(true, "tpm seal: SKIP balance (no TPM)");
+        test_check(true, "tpm seal: SKIP balance (no TPM)");
         test_check(true, "tpm seal: SKIP balance (no TPM)");
         test_check(true, "tpm seal: SKIP balance (no TPM)");
     }
@@ -2756,12 +2874,12 @@ test_ramdisk(void)
 {
     /* Argument contract — arch-independent, no side effects (each is
        rejected before touching the protocol or allocating). */
-    test_check(axl_ramdisk_create(NULL, 4, NULL) == AXL_ERR,
-               "ramdisk: NULL label rejected");
-    test_check(axl_ramdisk_create("RD", 0, NULL) == AXL_ERR,
-               "ramdisk: zero size rejected");
-    test_check(axl_ramdisk_create("RD", 99999, NULL) == AXL_ERR,
-               "ramdisk: oversize (>32768 MB) rejected");
+    test_check(axl_ramdisk_create(NULL, 4, NULL) == AXL_INVALID,
+               "ramdisk: NULL label rejected (AXL_INVALID)");
+    test_check(axl_ramdisk_create("RD", 0, NULL) == AXL_INVALID,
+               "ramdisk: zero size rejected (AXL_INVALID)");
+    test_check(axl_ramdisk_create("RD", 99999, NULL) == AXL_INVALID,
+               "ramdisk: oversize (>32768 MB) rejected (AXL_INVALID)");
     test_check(axl_ramdisk_list(NULL, 0, NULL) == AXL_ERR,
                "ramdisk: list with NULL count rejected");
 
@@ -2803,8 +2921,8 @@ test_ramdisk(void)
            create fails cleanly, list still works (reports none). Balance
            to the same 10 checks as the round-trip branch. */
         test_check(true, "ramdisk: ensure_driver reports no protocol (SKIP balance)");
-        test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, NULL) == AXL_ERR,
-                   "ramdisk: create returns AXL_ERR with no protocol");
+        test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, NULL) == AXL_UNSUPPORTED,
+                   "ramdisk: create returns AXL_UNSUPPORTED with no protocol");
         size_t n = 99;
         test_check(axl_ramdisk_list(NULL, 0, &n) == AXL_OK && n == 0,
                    "ramdisk: list succeeds with zero disks when none exist");
@@ -2829,12 +2947,12 @@ test_ramdisk_register_image(void)
        only an out-of-range kind is refused. */
     char  sentinel;        /* any non-NULL address; never read on these paths */
     void *dp = NULL;
-    test_check(axl_ramdisk_register_image(NULL, 4096, AXL_RAMDISK_DISK, &dp) == AXL_ERR,
-               "ramdisk: register_image NULL image rejected");
-    test_check(axl_ramdisk_register_image(&sentinel, 0, AXL_RAMDISK_CDROM, &dp) == AXL_ERR,
-               "ramdisk: register_image zero size rejected");
-    test_check(axl_ramdisk_register_image(&sentinel, 4096, (AxlRamDiskKind)99, &dp) == AXL_ERR,
-               "ramdisk: register_image invalid kind rejected");
+    test_check(axl_ramdisk_register_image(NULL, 4096, AXL_RAMDISK_DISK, &dp) == AXL_INVALID,
+               "ramdisk: register_image NULL image rejected (AXL_INVALID)");
+    test_check(axl_ramdisk_register_image(&sentinel, 0, AXL_RAMDISK_CDROM, &dp) == AXL_INVALID,
+               "ramdisk: register_image zero size rejected (AXL_INVALID)");
+    test_check(axl_ramdisk_register_image(&sentinel, 4096, (AxlRamDiskKind)99, &dp) == AXL_INVALID,
+               "ramdisk: register_image invalid kind rejected (AXL_INVALID)");
     test_check(axl_ramdisk_unregister(NULL) == AXL_ERR,
                "ramdisk: unregister NULL rejected");
 
@@ -2877,8 +2995,8 @@ test_ramdisk_register_image(void)
         char  img[64];
         void *dpx = NULL;
         test_check(axl_ramdisk_register_image(img, sizeof(img),
-                   AXL_RAMDISK_DISK, &dpx) == AXL_ERR && dpx == NULL,
-                   "ramdisk: register_image returns AXL_ERR with no protocol");
+                   AXL_RAMDISK_DISK, &dpx) == AXL_UNSUPPORTED && dpx == NULL,
+                   "ramdisk: register_image returns AXL_UNSUPPORTED with no protocol");
         test_check(true, "ramdisk: register_image SKIP balance (no RAM-disk protocol)");
     }
 }
@@ -3812,23 +3930,23 @@ test_mem_region(void)
     // --- read_range / write_range (incl. the no-fault guards) ---
     uint8_t src[16], dst[16];
     for (int i = 0; i < 16; i++) { src[i] = (uint8_t)(0xA0 + i); dst[i] = 0; }
-    test_check(axl_mem_phys_read_range(ram, 16, NULL, 1) == AXL_ERR,
+    test_check(axl_mem_phys_read_range(ram, 16, 1, NULL) == AXL_ERR,
                "read_range: NULL buf -> AXL_ERR");
-    test_check(axl_mem_phys_read_range(ram, 8, dst, 3) == AXL_ERR,
+    test_check(axl_mem_phys_read_range(ram, 8, 3, dst) == AXL_ERR,
                "read_range: bad width 3 -> AXL_ERR");
-    test_check(axl_mem_phys_read_range(ram, 6, dst, 4) == AXL_ERR,
+    test_check(axl_mem_phys_read_range(ram, 6, 4, dst) == AXL_ERR,
                "read_range: len not a multiple of width -> AXL_ERR");
-    test_check(axl_mem_phys_read_range(ram + 1, 8, dst, 4) == AXL_ERR,
+    test_check(axl_mem_phys_read_range(ram + 1, 8, 4, dst) == AXL_ERR,
                "read_range: misaligned width-4 -> AXL_ERR (no fault)");
-    test_check(axl_mem_phys_read_range(MEM_UNMAPPED_HI, 16, dst, 1) == AXL_ERR,
+    test_check(axl_mem_phys_read_range(MEM_UNMAPPED_HI, 16, 1, dst) == AXL_ERR,
                "read_range: UNMAPPED span -> AXL_ERR (no fault)");
     test_check(axl_mem_phys_write_range(ram, 16, src, 1) == AXL_OK,
                "write_range: 16 bytes width-1 to RAM OK");
-    test_check(axl_mem_phys_read_range(ram, 16, dst, 1) == AXL_OK
+    test_check(axl_mem_phys_read_range(ram, 16, 1, dst) == AXL_OK
                && axl_memcmp(dst, src, 16) == 0,
                "read_range: round-trips what write_range wrote");
     for (int i = 0; i < 16; i++) dst[i] = 0;
-    test_check(axl_mem_phys_read_range(ram, 8, dst, 4) == AXL_OK
+    test_check(axl_mem_phys_read_range(ram, 8, 4, dst) == AXL_OK
                && axl_memcmp(dst, src, 8) == 0,
                "read_range: width-4 aligned read matches");
     test_check(axl_mem_phys_write_range(MEM_UNMAPPED_HI, 16, src, 1) == AXL_ERR,
@@ -3956,13 +4074,13 @@ test_io_region(void)
                "is_io_accessible: len 0 -> false");
 
     uint8_t buf[8] = {0};
-    test_check(axl_io_read_range(0x60, 4, NULL, 1) == AXL_ERR,
+    test_check(axl_io_read_range(0x60, 4, 1, NULL) == AXL_ERR,
                "io_read_range: NULL buf -> AXL_ERR");
-    test_check(axl_io_read_range(0x60, 4, buf, 3) == AXL_ERR,
+    test_check(axl_io_read_range(0x60, 4, 3, buf) == AXL_ERR,
                "io_read_range: bad width 3 -> AXL_ERR");
-    test_check(axl_io_read_range(0x60, 6, buf, 4) == AXL_ERR,
+    test_check(axl_io_read_range(0x60, 6, 4, buf) == AXL_ERR,
                "io_read_range: len not a multiple of width -> AXL_ERR");
-    test_check(axl_io_read_range(IO_UNMAPPED_HI, 4, buf, 1) == AXL_ERR,
+    test_check(axl_io_read_range(IO_UNMAPPED_HI, 4, 1, buf) == AXL_ERR,
                "io_read_range: UNMAPPED span -> AXL_ERR");
     test_check(axl_io_write_range(0x60, 4, buf, 3) == AXL_ERR,
                "io_write_range: bad width -> AXL_ERR");
@@ -4126,10 +4244,10 @@ static void
 test_spd_decode_rejects_bogus(void)
 {
     AxlSpdInfo info;
-    test_check(axl_spd_decode(NULL, 256, &info) == AXL_ERR,
-               "spd: NULL buffer rejected");
-    test_check(axl_spd_decode(spd_ddr4_micron_8gb, 2, &info) == AXL_ERR,
-               "spd: short buffer rejected (len < 3)");
+    test_check(axl_spd_decode(NULL, 256, &info) == AXL_INVALID,
+               "spd: NULL buffer rejected (AXL_INVALID)");
+    test_check(axl_spd_decode(spd_ddr4_micron_8gb, 2, &info) == AXL_INVALID,
+               "spd: short buffer rejected (len < 3, AXL_INVALID)");
 }
 
 static void
@@ -4687,6 +4805,7 @@ test_platform_main(int argc, char **argv)
     test_block_io();
     test_serial_io();
     test_fv();
+    test_fv_names();
     test_tpm();
     test_tpm_seal();
     test_ramdisk();

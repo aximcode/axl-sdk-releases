@@ -997,7 +997,7 @@ test_button_repeat(void)
        fit in 500 ms; assert >= 3 so the check is robust under load and
        can't hang (fixed window, not a clock-race wait). */
     axl_event_signal(wfi);
-    (void)axl_loop_iterate_until(loop, NULL, 500000);   /* 500 ms */
+    axl_loop_iterate_until(loop, NULL, 500000);   /* 500 ms */
     test_check(g_btn_total_down >= 1, "button_repeat: the press fired");
     test_check(g_btn_repeat_count >= 3,
                "button_repeat: held button auto-repeats while down");
@@ -1140,7 +1140,7 @@ test_pointer_carries_modifiers(void)
     test_check(id != 0, "modtrack: mouse attach succeeds");
 
     axl_event_signal(wfi);
-    (void)axl_loop_iterate_until(loop, NULL, 50000);   /* drain the one dispatch */
+    axl_loop_iterate_until(loop, NULL, 50000);   /* drain the one dispatch */
 
     test_check(g_saw_move && g_mod_move == AXL_INPUT_MOD_LSHIFT,
                "modtrack: MOVE carries the live keyboard modifiers");
@@ -1242,9 +1242,9 @@ test_button_edge_carries_full_mask(void)
     /* Dispatch the press, then (re-signal) the release — one GetState per
        signal, since a consumed event source auto-clears. */
     axl_event_signal(wfi);
-    (void)axl_loop_iterate_until(loop, NULL, 50000);
+    axl_loop_iterate_until(loop, NULL, 50000);
     axl_event_signal(wfi);
-    (void)axl_loop_iterate_until(loop, NULL, 50000);
+    axl_loop_iterate_until(loop, NULL, 50000);
 
     test_check(g_down_seen == 1 && g_down_mask == AXL_INPUT_BUTTON_LEFT,
                "button_mask: DOWN carries the full current mask (LEFT held)");

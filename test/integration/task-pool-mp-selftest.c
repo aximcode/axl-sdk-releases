@@ -40,7 +40,7 @@ static Chunk g_chunks[N_CHUNKS];
 
 /* AP-safe: touches only its own chunk, no Boot Services / alloc / print. */
 static void
-stress_task(void *arg, AxlArena *arena)
+stress_task(AxlArena *arena, void *arg)
 {
     (void)arena;
     Chunk *c = (Chunk *)arg;

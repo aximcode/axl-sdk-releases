@@ -33,6 +33,7 @@
  * ========================================================================= */
 
 static AxlFileWriter *g_writer;   /* NULL = stdout */
+static bool           g_write_error;   /* set if a sink write ever failed */
 
 /* Write callback: emit to console char-by-char (no len-aware console API). */
 static void
@@ -49,9 +50,12 @@ static void
 file_write_fn(const char *data, size_t len, void *ctx)
 {
     (void)ctx;
-    /* Sink callback (void return) — a write error here can't be propagated;
-       it surfaces at axl_file_writer_close() in the finalize path. */
-    (void)axl_file_writer_write(g_writer, data, len);
+    /* Sink callback (void return) — a write error can't be propagated through
+       this contract, so capture it into g_write_error; the finalize path
+       reports it alongside the close status. */
+    if (axl_file_writer_write(g_writer, data, len) != AXL_OK) {
+        g_write_error = true;
+    }
 }
 
 /* rep: report line — goes to sink (file or stdout). */
@@ -135,7 +139,7 @@ typedef struct {
 } BenchChunk;
 
 static void
-bench_mix(void *arg, AxlArena *arena)
+bench_mix(AxlArena *arena, void *arg)
 {
     (void)arena;
     BenchChunk *c = (BenchChunk *)arg;
@@ -157,7 +161,7 @@ run_bsp(BenchChunk *chunks, size_t n)
 {
     uint64_t acc = 0;
     for (size_t i = 0; i < n; i++) {
-        bench_mix(&chunks[i], NULL);
+        bench_mix(NULL, &chunks[i]);
         acc ^= chunks[i].out;
     }
     return acc;
@@ -265,7 +269,7 @@ typedef struct {
 static BlurTile *g_tiles; /* heap-allocated in main() after sizing */
 
 static void
-blur_tile(void *arg, AxlArena *arena)
+blur_tile(AxlArena *arena, void *arg)
 {
     (void)arena;
     BlurTile *t = (BlurTile *)arg;
@@ -308,7 +312,7 @@ static uint64_t
 blur_run_bsp(void)
 {
     for (size_t i = 0; i < g_n_blur_tiles; i++) {
-        blur_tile(&g_tiles[i], NULL);
+        blur_tile(NULL, &g_tiles[i]);
     }
     uint64_t acc = 0;
     for (size_t i = 0; i < (size_t)IMG_W * g_img_h; i++) {
@@ -551,7 +555,7 @@ static BenchChunk *g_chunks; /* heap-allocated in main() after sizing */
 
 static volatile uint64_t g_lat_dummy;
 
-static void lat_task(void *arg, AxlArena *arena)
+static void lat_task(AxlArena *arena, void *arg)
 {
     (void)arena;
     /* Tiny arithmetic to prevent DCE; minimal work. */
@@ -611,7 +615,7 @@ run_bsp_part(AxlTaskPool *pool, BenchChunk *chunks, size_t n)
     /* BSP computes its portion while APs run. */
     uint64_t bsp_acc = 0;
     for (size_t i = ap_end; i < n; i++) {
-        bench_mix(&chunks[i], NULL);
+        bench_mix(NULL, &chunks[i]);
         bsp_acc ^= chunks[i].out;
     }
 
@@ -652,7 +656,12 @@ cleanup_atexit(void *unused)
     if (g_dst    != NULL) { axl_free(g_dst);    g_dst    = NULL; }
     if (g_src    != NULL) { axl_free(g_src);    g_src    = NULL; }
     if (g_chunks != NULL) { axl_free(g_chunks); g_chunks = NULL; }
-    if (g_writer != NULL) { axl_file_writer_close(g_writer); g_writer = NULL; }
+    if (g_writer != NULL) {
+        if (axl_file_writer_close(g_writer) != AXL_OK || g_write_error) {
+            axl_printerr("axbench: warning: benchmark output file did not write/flush cleanly\n");
+        }
+        g_writer = NULL;
+    }
 }
 
 /* No-op handler: installing one disables axl_yield()'s default exit-on-break
@@ -671,18 +680,31 @@ on_interrupt(void)
 
 AXL_TOOL_MAIN(axbench)
 {
+    /* -h/--help via the shared hook (this also fixes the old wart where "-h"
+       was opened as an OUTPUT FILE — the hook intercepts it first). --version/-V
+       is handled one layer up by AXL_TOOL_MAIN. axbench keeps its own tiny
+       [outfile] parse rather than the axl_args framework on purpose: it aborts
+       via axl_exit() on Ctrl-C, which would leak an axl_args_run parse state. */
+    if (axl_help_handle("axbench",
+            "AP task-pool micro-benchmark",
+            "axbench [outfile]",
+            argc, argv)) {
+        return 0;
+    }
+
     /* --- Argument parsing --- */
     if (argc > 2) {
         axl_printf("Usage: axbench [outfile]\r\n");
         return 2;
     }
+    const char *outfile = (argc == 2) ? argv[1] : NULL;
 
     g_writer = NULL;
-    if (argc == 2) {
-        g_writer = axl_file_writer_open(argv[1], 0);
+    if (outfile != NULL) {
+        g_writer = axl_file_writer_open(outfile, 0);
         if (!g_writer) {
             axl_printf("[axbench] WARNING: could not open '%s' for writing;"
-                       " falling back to stdout\r\n", argv[1]);
+                       " falling back to stdout\r\n", outfile);
         }
     }
 
@@ -1319,17 +1341,22 @@ AXL_TOOL_MAIN(axbench)
     rep("==========================================================\r\n");
 
     /* --- Finalize --- */
+    int report_rc = 0;
     if (g_writer) {
         int rc = axl_file_writer_close(g_writer);
         if (rc != AXL_OK) {
             axl_printf("[axbench] WARNING: file close/flush error (rc=%d)\r\n", rc);
+            /* The close is where the report becomes durable. A green exit
+               status here would tell a script the report is on disk when
+               it is not. */
+            report_rc = 1;
         } else {
-            axl_printf("[axbench] Report written to: %s\r\n", argv[1]);
+            axl_printf("[axbench] Report written to: %s\r\n", outfile);
         }
         g_writer = NULL;   /* closed here for the message; don't double-close */
     }
 
     cleanup_atexit(NULL);   /* frees pool + buffers (idempotent w/ atexit) */
     progress("[axbench] Done.\r\n");
-    return 0;
+    return report_rc;
 }

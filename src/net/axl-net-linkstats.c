@@ -25,30 +25,21 @@ axl_net_get_link_stats(size_t nic, AxlNetLinkStats *out)
     }
     axl_memset(out, 0, sizeof(*out));
 
-    EFI_HANDLE *handles = NULL;
-    size_t      hc      = 0;
-    EFI_STATUS  st      = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
-                                       ByProtocol,
-                                       &gEfiSimpleNetworkProtocolGuid,
-                                       NULL, &hc, &handles);
-    if (EFI_ERROR(st) || hc == 0 || handles == NULL) {
+    AxlNic *nics = NULL;
+    size_t  nnic = 0;
+    if (_axl_net_nics_build(&nics, &nnic) != AXL_OK || nnic == 0) {
+        _axl_net_nics_free(nics);
         return AXL_ERR;
     }
-    if (nic >= hc) {
-        axl_backend_free(handles);
-        return AXL_ERR;
-    }
-
-    EFI_SIMPLE_NETWORK_PROTOCOL *snp = NULL;
-    st = axl_efi_call(axl_bs()->HandleProtocol, 3, handles[nic],
-                      &gEfiSimpleNetworkProtocolGuid, (void **)&snp);
-    axl_backend_free(handles);
-    if (EFI_ERROR(st) || snp == NULL || snp->Mode == NULL) {
+    if (nic >= nnic) {
+        /* Out of range errors -- it does NOT clamp to NIC 0. */
+        _axl_net_nics_free(nics);
         return AXL_ERR;
     }
 
     /* Link state is authoritative; speed/duplex/autoneg have no portable
        SimpleNetwork source and stay 0 (see the header note). */
-    out->link_up = (!snp->Mode->MediaPresentSupported) || snp->Mode->MediaPresent;
+    out->link_up = nics[nic].link_up;
+    _axl_net_nics_free(nics);
     return AXL_OK;
 }

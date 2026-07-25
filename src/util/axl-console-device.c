@@ -17,6 +17,7 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-time.h>
 #include <uefi/axl-uefi.h>
+#include "../backend/axl-backend.h"   /* axl_backend_console_text_set_mode */
 
 #include "axl-console-emit.h"
 #include "axl-console-input.h"
@@ -30,6 +31,7 @@ AXL_LOG_DOMAIN("condev");
 #define DEVICE_DEFAULT_COLS   80   /* when cfg geometry is 0 and no physical size */
 #define DEVICE_DEFAULT_ROWS   25
 #define DEVICE_MAX_EVICTED    16   /* console-out handles we can re-tag on uninstall */
+#define DEVICE_MAX_MODES      32   /* physical text modes we mirror under passthrough */
 #define DEVICE_DEFAULT_POLL_MS 15  /* read_physical timer period when cfg is 0 */
 
 /* Our own console device path: HW Vendor node + End-Entire. Packed so the bytes
@@ -58,6 +60,26 @@ struct AxlConsoleDevice {
     AxlConsoleEmit                   emit;
     uint32_t                         cols;
     uint32_t                         rows;
+
+    /* Mirrored physical text modes (passthrough only; see snapshot_physical_modes).
+       Index-for-index with the console we co-paint, INCLUDING modes it reports as
+       unsupported (`usable` false) -- so a mode number means the same thing whether
+       or not we are installed. Empty (mode_count 0) in the take-over case, where we
+       own the geometry and advertise the single mode we were configured with. */
+    struct {
+        uint32_t  cols;
+        uint32_t  rows;
+        bool      usable;
+    }                                modes[DEVICE_MAX_MODES];
+    uint32_t                         mode_count;
+    bool                             passthrough;
+    /* True from allocation until install returns. ConSplitter's AddDevice ends in
+       ConsplitterSetConsoleOutMode, which unconditionally SetMode()s its preferred
+       mode (ConSplitter.c:2977) -- so our dev_set_mode CAN run during the connect
+       inside install, before the caller holds the AxlConsoleDevice *. Geometry
+       still updates; only the consumer-visible resize is withheld, so a resize
+       handler is never reached with a device pointer its caller cannot have yet. */
+    bool                             installing;
 
     bool                             take_input;
     bool                             installed;   /* our protocols are on my_handle */
@@ -175,9 +197,31 @@ dev_query_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber,
                UINTN *Columns, UINTN *Rows)
 {
     (void)This;
-    /* One mode (mode 0 = our advertised geometry). ConSplitter intersects this
-       against the other devices during AddDevice; a common mode is guaranteed. */
-    if (ModeNumber == 0 && Columns != NULL && Rows != NULL) {
+    /* A registration-notify dispatched from inside InstallMultipleProtocolInterfaces
+       can reach us before g_dev is assigned, and the failed-connect path clears it
+       before uninstalling -- both leave our protocol reachable with no device. */
+    if (g_dev == NULL || Columns == NULL || Rows == NULL) {
+        return EFI_UNSUPPORTED;
+    }
+
+    /* Passthrough: answer for the physical console we co-paint, mode for mode.
+       ConSplitter intersects the members' modes BY (Columns, Rows), so mirroring
+       is what keeps the aggregate's full list alive -- advertising one mode
+       collapses it to that geometry and strands every other physical mode. */
+    if (g_dev->passthrough && g_dev->mode_count > 0) {
+        if (ModeNumber >= (UINTN)g_dev->mode_count
+            || !g_dev->modes[ModeNumber].usable)
+        {
+            return EFI_UNSUPPORTED;   /* mirrors the physical console's own hole */
+        }
+        *Columns = g_dev->modes[ModeNumber].cols;
+        *Rows    = g_dev->modes[ModeNumber].rows;
+        return EFI_SUCCESS;
+    }
+
+    /* Take-over: one mode (mode 0 = our advertised geometry). We evicted the
+       firmware console, so the grid is ours to define. */
+    if (ModeNumber == 0) {
         *Columns = g_dev->cols;
         *Rows    = g_dev->rows;
         return EFI_SUCCESS;
@@ -189,6 +233,41 @@ static EFI_STATUS EFIAPI
 dev_set_mode(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN ModeNumber)
 {
     (void)This;
+    if (g_dev == NULL) {
+        return EFI_UNSUPPORTED;
+    }
+
+    /* Passthrough: ConSplitter fans SetMode to every member, so this runs in the
+       same breath as the physical console's own switch. Re-advertise to the new
+       geometry HERE -- if we do not, the two co-painting consoles end up on
+       different grids while each believes it agreed, and the consumer keeps
+       painting at the old size with nothing telling it otherwise. */
+    if (g_dev->passthrough && g_dev->mode_count > 0) {
+        if (ModeNumber >= (UINTN)g_dev->mode_count
+            || !g_dev->modes[ModeNumber].usable)
+        {
+            return EFI_UNSUPPORTED;
+        }
+        g_dev->cols = g_dev->modes[ModeNumber].cols;
+        g_dev->rows = g_dev->modes[ModeNumber].rows;
+        axl_console_emit_set_mode(&g_dev->emit, (uint32_t)ModeNumber);
+        /* SetMode clears the display -- the UEFI contract, and what the firmware
+           console we co-paint with does (GraphicsConsoleConOutSetMode). ConSplitter
+           does NOT do it for us: its TextOutSetMode only rewrites Mode + cursor
+           (ConSplitterGraphics.c:298). Without this the consumer's screen model
+           keeps the pre-reshape content and reinterprets it at the new geometry.
+           A shell's ConsoleLogger issues its own clear on top; clears are
+           idempotent, so the duplicate is harmless. */
+        axl_console_emit_clear_screen(&g_dev->emit);
+        /* After the geometry is live, so a consumer may read either this or
+           axl_console_device_get_size and see the same answer. Withheld during
+           install -- see AxlConsoleDevice::installing. */
+        if (!g_dev->installing) {
+            axl_console_emit_resize(&g_dev->emit, g_dev->cols, g_dev->rows);
+        }
+        return EFI_SUCCESS;
+    }
+
     if (ModeNumber != 0) {
         return EFI_UNSUPPORTED;
     }
@@ -413,14 +492,95 @@ resolve_geometry(AxlConsoleDevice *d, const AxlConsoleDeviceConfig *cfg)
     d->rows = (r != 0) ? r : DEVICE_DEFAULT_ROWS;
 }
 
+/* Mirror the physical console's text-mode list into d->modes.
+
+   Called under passthrough only, and BEFORE we publish -- at this point gST->ConOut
+   reports the console WITHOUT us (the firmware aggregate, or a shell's ConsoleLogger
+   wrapping it, which forwards QueryMode straight down), so its list is the one we
+   have to match. Once we are a member, that list is the intersection WITH us and
+   reading it back would be circular.
+
+   Modes are copied index-for-index, holes included: EDK2 leaves an unsupported mode
+   in place with 0x0 geometry (OVMF's mode 1 when 80x50 is absent), and a mode number
+   has to mean the same thing whether or not we are installed. Unusable entries
+   answer EFI_UNSUPPORTED from dev_query_mode, exactly as the physical console does.
+
+   Index stability is exact for modes 0 and 1 and best-effort above: ConSplitter
+   only special-cases the mode-1 hole (ConSplitter.c:2445) and starts its removal
+   walk at index 2 (ConSplitter.c:2365), so a hole at index >= 2 -- or any mode past
+   the DEVICE_MAX_MODES clamp -- loses its map entry and is dropped from the
+   aggregate, renumbering the modes above it. Stock GraphicsConsole only ever puts a
+   hole at index 1, so this is a caveat for exotic consoles rather than a live case.
+
+   Leaves mode_count 0 when the console cannot be enumerated, which falls the device
+   back to advertising its single resolved geometry -- the pre-mirroring behaviour. */
+static void
+snapshot_physical_modes(AxlConsoleDevice *d)
+{
+    d->mode_count = 0;
+
+    if (gST->ConOut == NULL || gST->ConOut->Mode == NULL
+        || gST->ConOut->QueryMode == NULL)
+    {
+        return;
+    }
+
+    INT32 max = gST->ConOut->Mode->MaxMode;
+    if (max <= 0) {
+        return;
+    }
+    uint32_t count = (uint32_t)max;
+    if (count > DEVICE_MAX_MODES) {
+        axl_warning("console device: %u text modes, mirroring the first %u "
+                    "(the rest drop out of the aggregate while we are installed)",
+                    count, (uint32_t)DEVICE_MAX_MODES);
+        count = DEVICE_MAX_MODES;
+    }
+
+    uint32_t usable = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        UINTN c = 0;
+        UINTN r = 0;
+        if (!EFI_ERROR(gST->ConOut->QueryMode(gST->ConOut, (UINTN)i, &c, &r))
+            && c > 0 && r > 0)
+        {
+            d->modes[i].cols   = (uint32_t)c;
+            d->modes[i].rows   = (uint32_t)r;
+            d->modes[i].usable = true;
+            usable++;
+        } else {
+            d->modes[i].cols   = 0;
+            d->modes[i].rows   = 0;
+            d->modes[i].usable = false;
+        }
+    }
+
+    /* All holes would advertise a mode list nothing can select; fall back. */
+    d->mode_count = (usable > 0) ? count : 0;
+}
+
 /* Build our SimpleTextOut + Mode + device path and install them on a fresh handle
    TOGETHER WITH gEfiConsoleOutDeviceGuid — we tag ourselves directly, so
    ConSplitter binds us with no ConOut-variable read. */
 static bool
 publish_console_device(AxlConsoleDevice *d)
 {
-    d->my_mode.MaxMode       = 1;
+    /* Passthrough mirrors the physical list so ConSplitter's by-geometry
+       intersection keeps every mode; the take-over case owns the grid and
+       advertises the one geometry it resolved. */
+    d->my_mode.MaxMode       = (d->passthrough && d->mode_count > 0)
+                                   ? (INT32)d->mode_count : 1;
     d->my_mode.Mode          = 0;
+    if (d->passthrough && d->mode_count > 0
+        && gST->ConOut != NULL && gST->ConOut->Mode != NULL)
+    {
+        /* Start on the mode the console is already in, so joining the fan-out
+           does not look like a mode change to anything above us. */
+        INT32 cur = gST->ConOut->Mode->Mode;
+        if (cur >= 0 && (uint32_t)cur < d->mode_count && d->modes[cur].usable) {
+            d->my_mode.Mode = cur;
+        }
+    }
     d->my_mode.Attribute     = 0x07;     /* light gray on black */
     d->my_mode.CursorColumn  = 0;
     d->my_mode.CursorRow     = 0;
@@ -921,8 +1081,8 @@ teardown_console_in(AxlConsoleDevice *d)
 // ---------------------------------------------------------------------------
 
 int
-axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
-                           void *user, const AxlConsoleDeviceConfig *cfg)
+axl_console_device_install(const AxlConsoleOps *ops, void *user,
+                           const AxlConsoleDeviceConfig *cfg, AxlConsoleDevice **out)
 {
     if (out != NULL) {
         *out = NULL;
@@ -934,6 +1094,20 @@ axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
         axl_warning("console device already installed");
         return AXL_ERR;
     }
+    /* Co-painting requires physical geometry. Two consoles drawing one screen must
+       agree on the grid: we advertise a single mode, ConSplitter intersects it with
+       GraphicsConsole's, and a size the firmware console does not share leaves the
+       aggregate describing a grid one of us is not drawing — which is also exactly
+       the stale-ConsoleLogger deadloop (RowsPerScreen) the eviction path needs its
+       SetMode re-sync to avoid. Refuse rather than half-work: a caller asking for
+       both wants something incoherent, and failing loudly beats a garbled local
+       display or a firmware hang. cols/rows 0 resolves to the physical mode. */
+    if (cfg->passthrough_local && (cfg->cols != 0 || cfg->rows != 0)) {
+        axl_warning("console device: passthrough_local requires physical geometry "
+                    "(cols/rows must be 0); refusing %ux%u",
+                    (unsigned)cfg->cols, (unsigned)cfg->rows);
+        return AXL_ERR;
+    }
 
     AxlConsoleDevice *d = axl_calloc(1, sizeof(*d));
     if (d == NULL) {
@@ -941,6 +1115,8 @@ axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
     }
     d->take_input    = cfg->take_input;
     d->take_pointer  = cfg->take_pointer;
+    d->passthrough   = cfg->passthrough_local;
+    d->installing    = true;
     d->read_physical = cfg->take_input && cfg->read_physical;
     d->input_poll_ms = cfg->input_poll_ms;
     d->debounce_ms   = cfg->debounce_ms;
@@ -948,6 +1124,14 @@ axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
     d->key_filter      = cfg->key_filter;
     d->key_filter_user = cfg->key_filter_user;
     resolve_geometry(d, cfg);
+
+    /* Co-painting: mirror the physical mode list so ConSplitter's by-geometry
+       intersection keeps every mode selectable. MUST run before we publish --
+       once we are a member of the aggregate, its list is the intersection with
+       ours and reading it back would be circular. */
+    if (d->passthrough) {
+        snapshot_physical_modes(d);
+    }
 
     /* Publish + connect + evict, then bind the engine to the owned Mode. */
     if (!publish_console_device(d)) {
@@ -999,7 +1183,15 @@ axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
         return AXL_ERR;
     }
 
-    evict_other_conout_devices(d);
+    /* Evict the firmware console-out devices so we are the SOLE console — unless the
+       consumer only OBSERVES the console and needs the local display to keep working
+       (passthrough_local), in which case ConSplitter simply fans to both of us. This
+       is the ONLY step that silences GraphicsConsole; steps 1-2 above (publish +
+       self-tag, ConnectController) are what deliver the op stream, and they ran
+       either way. */
+    if (!cfg->passthrough_local) {
+        evict_other_conout_devices(d);
+    }
 
     /* Become the SOLE console-in device (evict the raw keyboard), then start the
        optional physical read loop. A read-loop failure downgrades to inject-only
@@ -1033,21 +1225,35 @@ axl_console_device_install(AxlConsoleDevice **out, const AxlConsoleOps *ops,
        re-read QueryMode at our geometry, closing the window. We advertise one mode
        (0), which ConSplitter exposes post-eviction, so SetMode(0) maps to us. When
        nothing wraps gST->ConOut this is a harmless re-affirm of the current mode. */
-    if (gST->ConOut != NULL && gST->ConOut->Mode != NULL
+    /* Skipped under passthrough_local, deliberately. The staleness this defends
+       against is caused by the EVICTION changing the console geometry behind the
+       logger's back — and we did not evict. Our advertised mode is the physical one
+       (the guard above enforces that), so the aggregate geometry is unchanged and
+       there is nothing to re-sync. Forcing SetMode(0) anyway would be the riskier
+       choice: mode 0 of the co-painted aggregate is not ours to define, so a console
+       currently in a non-80x25 mode could be visibly resized by our arrival — the
+       opposite of "leave the local display alone", which is the whole point here. */
+    if (!cfg->passthrough_local
+        && gST->ConOut != NULL && gST->ConOut->Mode != NULL
         && gST->ConOut->SetMode != NULL) {
-        EFI_STATUS sm = gST->ConOut->SetMode(gST->ConOut, 0);
-        if (EFI_ERROR(sm)) {
+        /* Route through the backend's SetMode wrapper (gST->ConOut->SetMode(., 0))
+           rather than the raw protocol call. */
+        if (axl_backend_console_text_set_mode(0) != AXL_OK) {
             /* Can't happen in the take-over path (post-eviction MaxMode==1, mode 0
                valid, our dev_set_mode(0) returns success); but if it ever did, the
                stale-cache deadloop window would silently reopen -- make that
                observable rather than a mystery hang for the next debugger. */
-            axl_warning("console device: ConOut SetMode re-sync failed: 0x%llx",
-                        (unsigned long long)sm);
+            axl_warning("console device: ConOut SetMode re-sync failed");
         }
     }
 
     /* Report the cell rule once, now that our output path is the console. */
     axl_console_emit_report_cell_rule(&d->emit);
+
+    /* Everything the firmware might have re-mode'd us to during the connect has
+       landed in d->cols/d->rows by now, and the caller is about to hold the
+       device -- so resize ops from here on are safe to deliver. */
+    d->installing = false;
 
     *out = d;
     axl_info("console device installed (%ux%u, %u evicted)",
@@ -1074,9 +1280,10 @@ axl_console_device_uninstall(AxlConsoleDevice *d)
           member and SetMode()s the result. If OUR device is still a member, it
           advertises a single non-80x25 geometry (e.g. 160x50); the reconstruction
           picks a PreferMode neither device can honor, falls back to the 80x25
-          BaseMode, and — because our device has no 80x25 mode — that SetMode fails
-          too, tripping ASSERT(!EFI_ERROR) at ConSplitterAddGraphicsOutputMode
-          (ConSplitter.c:2983 -> CpuDeadLoop under DEBUG OVMF; a silent wedge under
+          BaseMode, and — because an EVICTING device advertises one non-80x25 mode
+          — that SetMode fails too, tripping ASSERT(!EFI_ERROR) at
+          (ConsplitterSetConsoleOutMode, ConSplitter.c:2983 -> CpuDeadLoop under
+          DEBUG OVMF; a silent wedge under
           RELEASE). Dropping ourselves first means GraphicsConsole is re-added into
           an aggregate that contains only firmware consoles, so a common mode exists.
           (fbcon at 160x50 tripped this on self-restore; the 80x25 restore smokes did
@@ -1169,8 +1376,36 @@ axl_console_device_set_size(AxlConsoleDevice *d, uint32_t cols, uint32_t rows)
     if (d == NULL) {
         return;
     }
+    /* Under passthrough the grid is not ours to set: the firmware console is
+       painting the same screen, and moving only our half of the agreement is the
+       desync this mode exists to avoid. Install already refuses an explicit
+       geometry for that reason; honouring one here would be the same bug arriving
+       later. Reshape through the text-mode API instead -- our mirrored mode list
+       makes axl_console_text_set_mode move BOTH consoles together. */
+    if (d->passthrough) {
+        axl_warning("console device: set_size ignored under passthrough_local "
+                    "(use axl_console_text_set_mode to reshape both consoles)");
+        return;
+    }
     d->cols = (cols != 0) ? cols : DEVICE_DEFAULT_COLS;
     d->rows = (rows != 0) ? rows : DEVICE_DEFAULT_ROWS;
+    /* The take-over path's only geometry change, so it is the one a consumer
+       binding `resize` needs here -- a mode switch cannot deliver it, the device
+       advertising exactly one mode. */
+    if (!d->installing) {
+        axl_console_emit_resize(&d->emit, d->cols, d->rows);
+    }
+}
+
+void
+axl_console_device_get_size(const AxlConsoleDevice *d, uint32_t *cols, uint32_t *rows)
+{
+    if (cols != NULL) {
+        *cols = (d != NULL) ? d->cols : 0;
+    }
+    if (rows != NULL) {
+        *rows = (d != NULL) ? d->rows : 0;
+    }
 }
 
 void

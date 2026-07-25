@@ -114,6 +114,8 @@ main(int argc, char *argv[])
     axl_gfx_buffer_free(scene);
 
     AxlKey k;
-    axl_console_read_key(UINT64_MAX, &k);   /* hold until a key */
+    if (axl_console_read_key(UINT64_MAX, &k) != AXL_OK) {
+        return 1;   /* no console input available */
+    }
     return 0;
 }

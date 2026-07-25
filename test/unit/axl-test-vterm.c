@@ -22,6 +22,7 @@
 #include <axl/axl-vterm.h>
 #include <axl/axl-console-ops.h>
 #include <axl/axl-console-screen.h>
+#include <axl/axl-console-vt-enc.h>
 #include <vterm.h>
 
 // ---------------------------------------------------------------------------
@@ -710,8 +711,8 @@ static void
 test_vterm_reports_width_resolved_cell_rule(void)
 {
     VtermProbe p = {0};
-    AxlVterm *v = NULL;
-    test_check(axl_vterm_new(&v, 25, 80, &probe_ops, &p) == AXL_OK, "new ok");
+    AxlVterm *v = axl_vterm_new(25, 80, &probe_ops, &p);
+    test_check(v != NULL, "new ok");
     test_check(p.rule_calls == 1, "set_cell_rule reported once");
     test_check(p.rule == AXL_CONSOLE_CELLS_WIDTH_RESOLVED, "axl-vterm is width-resolved");
     axl_vterm_free(v);
@@ -731,7 +732,7 @@ test_vterm_coalesces_glyphs_into_one_run(void)
 {
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
     axl_vterm_feed(v, "hello", 5);
     axl_vterm_flush(v);   /* if the adapter buffers, the API must expose a flush */
 
@@ -745,7 +746,7 @@ test_vterm_cursor_jump_flushes_the_run(void)
 {
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
     axl_vterm_feed(v, "ab" "\x1b" "[5;1Hcd", 10);
     axl_vterm_flush(v);
 
@@ -760,7 +761,7 @@ test_vterm_sgr_truecolor_becomes_rgb_pen(void)
 {
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
     axl_vterm_feed(v, "\x1b" "[38;2;10;20;30mX", 17);
     axl_vterm_flush(v);
 
@@ -777,7 +778,7 @@ test_vterm_declined_scrollrect_decomposes_to_moverect_and_erase(void)
     /* probe_ops_no_blit binds scrollrect (returning 0) and erase + moverect. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 3, 4, &probe_ops_no_blit, &p);
+    v = axl_vterm_new(3, 4, &probe_ops_no_blit, &p);
     axl_vterm_feed(v, "\x1b" "[3;1H\n", 7);   /* force a scroll at the last row */
     axl_vterm_flush(v);
 
@@ -796,7 +797,7 @@ test_vterm_accepted_scrollrect_suppresses_decomposition(void)
     /* probe_ops_blit binds scrollrect returning 1. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 3, 4, &probe_ops_blit, &p);
+    v = axl_vterm_new(3, 4, &probe_ops_blit, &p);
     axl_vterm_feed(v, "\x1b" "[3;1H\n", 7);
     axl_vterm_flush(v);
 
@@ -811,7 +812,7 @@ test_vterm_rejected_altscreen_prop_is_not_stored(void)
     /* probe_ops_reject_alt returns 0 from set_term_prop for ALT_SCREEN. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops_reject_alt, &p);
+    v = axl_vterm_new(25, 80, &probe_ops_reject_alt, &p);
     axl_vterm_feed(v, "\x1b" "[?1049h", 8);
     axl_vterm_feed(v, "\x1b" "[?1049l", 8);
     /* Both alt-screen transitions reach the consumer, so the prop is mapped and
@@ -838,7 +839,7 @@ test_vterm_csi_3j_clears_scrollback(void)
      * so a consumer owning a scrollback ring needs this to honour CSI 3J. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
 
     axl_vterm_feed(v, "\x1b" "[2J", 4);   /* ED 2 (whole screen) must NOT clear sb */
     axl_vterm_flush(v);
@@ -863,7 +864,7 @@ test_vterm_csi_argcount_overflow_is_bounded(void)
      * Untrusted-input hardening (serial / SOL). */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
 
     const char *seq = "\x1b" "[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20mZ";
     axl_vterm_feed(v, seq, axl_strlen(seq));
@@ -886,7 +887,7 @@ test_vterm_csi_keeps_first_16_args(void)
      * foreground came out green (last-wins), which this pins against. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
 
     const char *seq =
         "\x1b" "[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;31;32mZ";
@@ -916,7 +917,7 @@ test_vterm_sgr_arg_walk_bounded_at_16(void)
      * (see test_vterm_csi_keeps_first_16_args), which is what exposed the walk. */
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 25, 80, &probe_ops, &p);
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
 
     /* arg 16 (slot 15) is an underline (4) carrying a MORE flag with no in-count
      * sub-parameter; and a 38 alternative-palette selector as the last arg.
@@ -944,7 +945,7 @@ test_vterm_set_size_validates_and_flows(void)
 {
     VtermProbe p = {0};
     AxlVterm *v = NULL;
-    axl_vterm_new(&v, 3, 4, &probe_ops, &p);
+    v = axl_vterm_new(3, 4, &probe_ops, &p);
 
     /* Argument validation is deterministic and observable. */
     test_check(axl_vterm_set_size(NULL, 6, 4) == AXL_ERR, "NULL handle rejected");
@@ -987,14 +988,16 @@ extern void _axl_console_screen_test_geometry(const AxlConsoleScreen *s,
         uint32_t *rows, uint32_t *cols);
 
 typedef struct {
-    char   buf[8192];
+    char   buf[16384];
     size_t len;
+    size_t calls;   /* number of sink invocations — the "frame count" coalescing cuts */
 } ScreenCap;
 
 static void
 screen_cap_sink(const char *bytes, size_t len, void *user)
 {
     ScreenCap *c = user;
+    c->calls++;
     if (c->len + len < sizeof c->buf) {
         axl_memcpy(c->buf + c->len, bytes, len);
         c->len += len;
@@ -1063,14 +1066,11 @@ screens_identical(const AxlConsoleScreen *a, const AxlConsoleScreen *b,
 static void
 test_screen_new_validates_and_null_safety(void)
 {
-    AxlConsoleScreen *s = (AxlConsoleScreen *)0x1;
-    test_check(axl_console_screen_new(NULL, 25, 80) == AXL_ERR, "screen: NULL out rejected");
-    test_check(axl_console_screen_new(&s, 0, 80) == AXL_ERR, "screen: zero rows rejected");
-    test_check(s == NULL, "screen: out NULLed on failure");
-    test_check(axl_console_screen_new(&s, 25, 0) == AXL_ERR, "screen: zero cols rejected");
+    test_check(axl_console_screen_new(0, 80) == NULL, "screen: zero rows rejected");
+    test_check(axl_console_screen_new(25, 0) == NULL, "screen: zero cols rejected");
 
-    test_check(axl_console_screen_new(&s, 25, 80) == AXL_OK, "screen: valid new ok");
-    test_check(s != NULL, "screen: handle set on success");
+    AxlConsoleScreen *s = axl_console_screen_new(25, 80);
+    test_check(s != NULL, "screen: valid new ok");
 
     /* NULL-safety of the remaining entry points. */
     axl_console_screen_feed(NULL, (const uint8_t *)"x", 1);   /* no crash */
@@ -1095,7 +1095,7 @@ static void
 test_screen_feed_places_text(void)
 {
     AxlConsoleScreen *s = NULL;
-    axl_console_screen_new(&s, 3, 10);
+    s = axl_console_screen_new(3, 10);
 
     screen_feed_str(s, "Hi");
 
@@ -1118,7 +1118,7 @@ static void
 test_screen_snapshot_exact_vt(void)
 {
     AxlConsoleScreen *s = NULL;
-    axl_console_screen_new(&s, 2, 4);
+    s = axl_console_screen_new(2, 4);
     screen_feed_str(s, "\x1b[31mAB");   /* red fg, "AB" at (0,0),(0,1); cursor (0,2) */
 
     ScreenCap cap = {0};
@@ -1136,7 +1136,7 @@ static void
 test_screen_snapshot_blank_is_coalesced(void)
 {
     AxlConsoleScreen *s = NULL;
-    axl_console_screen_new(&s, 25, 80);
+    s = axl_console_screen_new(25, 80);
 
     ScreenCap cap = {0};
     axl_console_screen_snapshot(s, screen_cap_sink, &cap);
@@ -1154,7 +1154,7 @@ static void
 test_screen_snapshot_roundtrip_primary(void)
 {
     AxlConsoleScreen *a = NULL;
-    axl_console_screen_new(&a, 5, 20);
+    a = axl_console_screen_new(5, 20);
     /* clear+home; red "RED" at (0,0); CUP to (1,4); blue-bg (keeps red fg) "sky". */
     screen_feed_str(a, "\x1b[2J\x1b[H\x1b[31mRED\x1b[2;5H\x1b[44msky");
 
@@ -1163,7 +1163,7 @@ test_screen_snapshot_roundtrip_primary(void)
                "screen: snapshot ok");
 
     AxlConsoleScreen *b = NULL;
-    axl_console_screen_new(&b, 5, 20);
+    b = axl_console_screen_new(5, 20);
     axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
 
     char g[8] = {0};
@@ -1190,7 +1190,7 @@ static void
 test_screen_snapshot_roundtrip_alt(void)
 {
     AxlConsoleScreen *a = NULL;
-    axl_console_screen_new(&a, 5, 20);
+    a = axl_console_screen_new(5, 20);
     screen_feed_str(a, "\x1b[2J\x1b[H\x1b[33mprimary");   /* primary content */
     screen_feed_str(a, "\x1b[?1049h\x1b[2;2Halt");        /* enter alt, draw "alt" */
     test_check(_axl_console_screen_test_alt(a), "screen: A is on the alternate screen");
@@ -1199,7 +1199,7 @@ test_screen_snapshot_roundtrip_alt(void)
     axl_console_screen_snapshot(a, screen_cap_sink, &cap);
 
     AxlConsoleScreen *b = NULL;
-    axl_console_screen_new(&b, 5, 20);
+    b = axl_console_screen_new(5, 20);
     axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
 
     test_check(_axl_console_screen_test_alt(b), "screen: round-trip B enters the alternate screen");
@@ -1227,7 +1227,7 @@ static void
 test_screen_snapshot_roundtrip_out_of_alt(void)
 {
     AxlConsoleScreen *a = NULL;
-    axl_console_screen_new(&a, 5, 20);
+    a = axl_console_screen_new(5, 20);
     screen_feed_str(a, "\x1b[2J\x1b[HSHELL");        /* primary "SHELL" at row 0 */
     screen_feed_str(a, "\x1b[?1049h\x1b[2;2HTUI");   /* enter alt, draw "TUI" */
     screen_feed_str(a, "\x1b[?1049l");               /* LEAVE alt -> primary restored */
@@ -1241,7 +1241,7 @@ test_screen_snapshot_roundtrip_out_of_alt(void)
     axl_console_screen_snapshot(a, screen_cap_sink, &cap);
 
     AxlConsoleScreen *b = NULL;
-    axl_console_screen_new(&b, 5, 20);
+    b = axl_console_screen_new(5, 20);
     axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
 
     test_check(!_axl_console_screen_test_alt(b), "screen: round-trip B on the primary screen");
@@ -1258,7 +1258,7 @@ static void
 test_screen_snapshot_carries_reverse_video(void)
 {
     AxlConsoleScreen *a = NULL;
-    axl_console_screen_new(&a, 3, 5);
+    a = axl_console_screen_new(3, 5);
     screen_feed_str(a, "\x1b[?5h");   /* DECSCNM: whole-screen reverse video ON */
     test_check(_axl_console_screen_test_reverse(a), "screen: A has reverse video on");
 
@@ -1266,7 +1266,7 @@ test_screen_snapshot_carries_reverse_video(void)
     axl_console_screen_snapshot(a, screen_cap_sink, &cap);
 
     AxlConsoleScreen *b = NULL;
-    axl_console_screen_new(&b, 3, 5);
+    b = axl_console_screen_new(3, 5);
     axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
 
     test_check(_axl_console_screen_test_reverse(b),
@@ -1283,7 +1283,7 @@ static void
 test_screen_snapshot_roundtrip_wide(void)
 {
     AxlConsoleScreen *a = NULL;
-    axl_console_screen_new(&a, 3, 8);
+    a = axl_console_screen_new(3, 8);
     screen_feed_str(a, "\xe4\xb8\xad");   /* U+4E2D, a two-cell CJK ideograph */
 
     uint32_t cr = 99, cc = 99;
@@ -1294,7 +1294,7 @@ test_screen_snapshot_roundtrip_wide(void)
     axl_console_screen_snapshot(a, screen_cap_sink, &cap);
 
     AxlConsoleScreen *b = NULL;
-    axl_console_screen_new(&b, 3, 8);
+    b = axl_console_screen_new(3, 8);
     axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
 
     char g[8] = {0};
@@ -1317,7 +1317,7 @@ static void
 test_screen_wide_glyph_at_margin_is_bounded(void)
 {
     AxlConsoleScreen *s = NULL;
-    axl_console_screen_new(&s, 2, 4);
+    s = axl_console_screen_new(2, 4);
     screen_feed_str(s, "\x1b[?7l");               /* DECAWM off: no autowrap */
     screen_feed_str(s, "\x1b[2;4H");              /* park at the last row, last column */
     screen_feed_str(s, "\xe4\xb8\xad\xcc\x81");   /* U+4E2D (wide) + U+0301 (combining) */
@@ -1331,10 +1331,246 @@ test_screen_wide_glyph_at_margin_is_bounded(void)
 }
 
 static void
+test_screen_snapshot_rep_run_exact(void)
+{
+    /* A run of >= REP_RUN_MIN+1 identical glyphs collapses to one glyph + REP
+       (CSI n b), not one write per cell. Exact bytes (bucket B). */
+    AxlConsoleScreen *s = axl_console_screen_new(1, 10);
+    screen_feed_str(s, "\x1b[2J\x1b[Hxxxxxxxx\x1b[H");   /* 8 x's, cursor home */
+
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(s, screen_cap_sink, &cap);
+    test_check(axl_strcmp(cap.buf,
+                          "\x1b[2J\x1b[m\x1b[1;1Hx\x1b[7b\x1b[?25h\x1b[1;1H") == 0,
+               "screen: run of 8 glyphs -> 'x' + REP 7 (CSI 7 b)");
+    axl_console_screen_free(s);
+}
+
+static void
+test_screen_snapshot_rep_run_roundtrip(void)
+{
+    /* REP round-trips exactly: fed back through a fresh model, the run of glyphs
+       reproduces the same cells. */
+    AxlConsoleScreen *a = axl_console_screen_new(3, 20);
+    screen_feed_str(a, "\x1b[2J\x1b[H\x1b[32mgggggggggggg\x1b[2;3Hhi");   /* 12 g's + "hi" */
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(a, screen_cap_sink, &cap);
+
+    AxlConsoleScreen *b = axl_console_screen_new(3, 20);
+    axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
+    test_check(screens_identical(a, b, 3, 20),
+               "screen: glyph-run snapshot (REP) round-trips cell-exact");
+    axl_console_screen_free(a);
+    axl_console_screen_free(b);
+}
+
+static void
+test_screen_snapshot_ech_blank_run_roundtrip(void)
+{
+    /* A blank run with a non-default background collapses to ECH + CUF, which
+       round-trips to *blank* cells (len 0) — not space glyphs. */
+    AxlConsoleScreen *a = axl_console_screen_new(2, 20);
+    screen_feed_str(a, "\x1b[44m\x1b[2J\x1b[H");   /* blue bg, clear -> 40 blank bg cells */
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(a, screen_cap_sink, &cap);
+
+    AxlConsoleScreen *b = axl_console_screen_new(2, 20);
+    axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
+    test_check(screens_identical(a, b, 2, 20),
+               "screen: blank-bg-run snapshot (ECH+CUF) round-trips to blank cells");
+
+    /* The cell (0,0) is a blank (len 0) carrying the background, not a space. */
+    char g[8] = {0};
+    _axl_console_screen_test_cell(b, 0, 0, g, NULL);
+    test_check(g[0] == '\0',
+               "screen: ECH replay leaves a blank cell, not a ' ' glyph");
+    axl_console_screen_free(a);
+    axl_console_screen_free(b);
+}
+
+static void
+test_screen_snapshot_rep_margin_phantom(void)
+{
+    /* Regression: a REP'd glyph run ending at cols-2, with an emittable cell at
+       the last column, must not phantom-wrap that cell to the next row. */
+    AxlConsoleScreen *a = axl_console_screen_new(1, 10);
+    screen_feed_str(a, "\x1b[2J\x1b[Hxxxxxxxxxy");   /* 9 x (cols 0-8), y at col 9 */
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(a, screen_cap_sink, &cap);
+
+    AxlConsoleScreen *b = axl_console_screen_new(1, 10);
+    axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
+    test_check(screens_identical(a, b, 1, 10),
+               "screen: REP run ending at cols-2 keeps the following cell on-row");
+    char g[8] = {0};
+    _axl_console_screen_test_cell(b, 0, 9, g, NULL);
+    test_check(axl_strcmp(g, "y") == 0,
+               "screen: cell after a margin REP run lands at the last column");
+    axl_console_screen_free(a);
+    axl_console_screen_free(b);
+}
+
+static void
+test_screen_snapshot_box_border_roundtrip(void)
+{
+    /* The canonical full-width box border: a horizontal run that ends one short of
+       the right corner — the exact REP phantom trigger this feature must survive. */
+    AxlConsoleScreen *a = axl_console_screen_new(3, 20);
+    screen_feed_str(a, "\x1b[2J\x1b[H+------------------+");   /* + 18x- + (cols 0..19) */
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(a, screen_cap_sink, &cap);
+
+    AxlConsoleScreen *b = axl_console_screen_new(3, 20);
+    axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
+    test_check(screens_identical(a, b, 3, 20),
+               "screen: full-width box border round-trips (no REP phantom wrap)");
+    axl_console_screen_free(a);
+    axl_console_screen_free(b);
+}
+
+static void
+test_screen_snapshot_multichunk(void)
+{
+    /* Force the buffering auto-flush (SNAPSHOT_CHUNK, 4 KB): a large screen of
+       varied (non-run) content serializes to > one chunk, so the snapshot delivers
+       several sink calls yet still round-trips exactly. */
+    AxlConsoleScreen *a = axl_console_screen_new(60, 100);
+    screen_feed_str(a, "\x1b[2J\x1b[H");
+    for (int r = 0; r < 60; r++) {
+        char cup[16];
+        axl_snprintf(cup, sizeof(cup), "\x1b[%d;1H", r + 1);
+        screen_feed_str(a, cup);
+        char line[101];
+        for (int c = 0; c < 100; c++) {
+            /* Alternate glyphs so no run reaches REP_RUN_MIN — keeps bytes high. */
+            line[c] = (char)(((r + c) & 1) ? ('a' + ((r + c) % 26))
+                                           : ('A' + ((r * 3 + c) % 26)));
+        }
+        line[100] = '\0';
+        screen_feed_str(a, line);
+    }
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(a, screen_cap_sink, &cap);
+    test_check(cap.len > 4096, "screen: large varied snapshot exceeds one 4 KB chunk");
+    test_check(cap.calls >= 2,
+               "screen: multi-chunk snapshot delivers several sink calls (auto-flush)");
+
+    AxlConsoleScreen *b = axl_console_screen_new(60, 100);
+    axl_console_screen_feed(b, (const uint8_t *)cap.buf, cap.len);
+    test_check(screens_identical(a, b, 60, 100),
+               "screen: multi-chunk snapshot round-trips exactly");
+    axl_console_screen_free(a);
+    axl_console_screen_free(b);
+}
+
+static void
+test_screen_snapshot_frame_count_coalesced(void)
+{
+    /* The frame-count win: a fully-painted 80x25 used to emit ~one sink call per
+       cell (~2000). Buffered into SNAPSHOT_CHUNK pieces it is a small, bounded
+       number of calls. */
+    AxlConsoleScreen *s = axl_console_screen_new(25, 80);
+    screen_feed_str(s, "\x1b[2J\x1b[H");
+    for (int r = 0; r < 25; r++) {
+        char line[81];
+        for (int c = 0; c < 80; c++) {
+            line[c] = (char)('A' + ((r + c) % 26));
+        }
+        line[80] = '\0';
+        char cup[16];
+        axl_snprintf(cup, sizeof(cup), "\x1b[%d;1H", r + 1);
+        screen_feed_str(s, cup);
+        screen_feed_str(s, line);
+    }
+    ScreenCap cap = {0};
+    axl_console_screen_snapshot(s, screen_cap_sink, &cap);
+    test_check(cap.len > 1000, "screen: full 80x25 snapshot is substantial");
+    test_check(cap.calls <= 8,
+               "screen: full-screen snapshot coalesces to a handful of sink calls "
+               "(<= 8), not one per cell");
+    axl_console_screen_free(s);
+}
+
+// ---------------------------------------------------------------------------
+
+/* Counts sink invocations and concatenates bytes — the live-encoder equivalent
+   of ScreenCap, for the coalesce/flush assertions. */
+typedef struct {
+    char   buf[4096];
+    size_t len;
+    size_t calls;
+} EncCap;
+
+static void
+enc_cap_sink(const char *bytes, size_t len, void *user)
+{
+    EncCap *c = user;
+    c->calls++;
+    if (c->len + len < sizeof c->buf) {
+        axl_memcpy(c->buf + c->len, bytes, len);
+        c->len += len;
+        c->buf[c->len] = '\0';
+    }
+}
+
+static void
+test_vt_enc_coalesce_buffers_until_flush(void)
+{
+    EncCap cap = {0};
+    AxlConsoleVtEncConfig cfg = {
+        .sink = enc_cap_sink, .user = &cap, .cols = 80, .rows = 25, .coalesce = true
+    };
+    AxlConsoleVtEnc *e = axl_console_vt_enc_new(&cfg);
+    test_check(e != NULL, "vt-enc: coalesce encoder created");
+
+    void                *u  = NULL;
+    const AxlConsoleOps *ops = axl_console_vt_enc_ops(e, &u);
+    /* A keystroke echo's worth of ops: clear + cursor + text = 3 ops. */
+    ops->clear_screen(u);
+    ops->set_cursor(u, 2, 5);
+    ops->output_text(u, "hi", 2);
+    test_check(cap.calls == 0,
+               "vt-enc: coalesce buffers — no sink call before flush");
+
+    axl_console_vt_enc_flush(e);
+    test_check(cap.calls == 1,
+               "vt-enc: flush delivers the whole turn as ONE sink call");
+    /* clear_screen -> ESC[2J ESC[H ; set_cursor(2,5) -> ESC[3;6H ; "hi". */
+    test_check(axl_strcmp(cap.buf, "\x1b[2J\x1b[H\x1b[3;6Hhi") == 0,
+               "vt-enc: flushed bytes are the concatenated turn, in order");
+
+    /* A second flush with nothing buffered is a no-op (no extra call). */
+    axl_console_vt_enc_flush(e);
+    test_check(cap.calls == 1, "vt-enc: empty flush is a no-op");
+    axl_console_vt_enc_free(e);
+}
+
+static void
+test_vt_enc_no_coalesce_emits_per_op(void)
+{
+    EncCap cap = {0};
+    AxlConsoleVtEncConfig cfg = {
+        .sink = enc_cap_sink, .user = &cap, .cols = 80, .rows = 25, .coalesce = false
+    };
+    AxlConsoleVtEnc *e = axl_console_vt_enc_new(&cfg);
+    void                *u  = NULL;
+    const AxlConsoleOps *ops = axl_console_vt_enc_ops(e, &u);
+    ops->clear_screen(u);
+    ops->output_text(u, "hi", 2);
+    test_check(cap.calls >= 2,
+               "vt-enc: default (no coalesce) still emits per op");
+    axl_console_vt_enc_flush(e);   /* NULL-safe / no-op when not coalescing */
+    test_check(cap.calls >= 2, "vt-enc: flush is a no-op without coalesce");
+    axl_console_vt_enc_free(e);
+}
+
+// ---------------------------------------------------------------------------
+
+static void
 test_screen_resize(void)
 {
     AxlConsoleScreen *s = NULL;
-    axl_console_screen_new(&s, 3, 10);
+    s = axl_console_screen_new(3, 10);
     screen_feed_str(s, "\x1b[2J\x1b[Habc");
 
     test_check(axl_console_screen_resize(s, 5, 20) == AXL_OK, "screen: grow resize ok");
@@ -1409,6 +1645,15 @@ test_vterm_main(
     test_screen_snapshot_carries_reverse_video();
     test_screen_snapshot_roundtrip_wide();
     test_screen_wide_glyph_at_margin_is_bounded();
+    test_screen_snapshot_rep_run_exact();
+    test_screen_snapshot_rep_run_roundtrip();
+    test_screen_snapshot_rep_margin_phantom();
+    test_screen_snapshot_box_border_roundtrip();
+    test_screen_snapshot_multichunk();
+    test_screen_snapshot_ech_blank_run_roundtrip();
+    test_screen_snapshot_frame_count_coalesced();
+    test_vt_enc_coalesce_buffers_until_flush();
+    test_vt_enc_no_coalesce_emits_per_op();
     test_screen_resize();
 
     return test_print_results();

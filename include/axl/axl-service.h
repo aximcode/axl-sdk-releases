@@ -49,6 +49,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <axl/axl-config.h>
+#include <axl/axl-efi-status.h>  /* AxlEfiStatus (DriverEntry return width) */
 #include <axl/axl-loop.h>
 #include <axl/axl-sys.h>      /* AxlGuid */
 
@@ -286,9 +287,23 @@ axl_service_teardown(
  *
  * Not user API — call AXL_SERVICE_DRIVER instead.
  *
- * @return EFI_STATUS suitable to return from a firmware DriverEntry.
+ * **Returns the firmware's own status width.** `AxlEfiStatus` is
+ * 64-bit; every failure code carries the error bit
+ * (`0x8000000000000000`). Narrowing this to `int` — as the
+ * declaration did before v2.9.1 — silently strips that bit, so
+ * `AXL_EFI_ABORTED` reaches the firmware as `0x15`, `StartImage`
+ * reports success, and a service whose setup failed is treated as
+ * running by @ref axl_service_reload and by
+ * `axl_driver_start`. Keep this type as wide as the firmware's.
+ *
+ * @return AXL_EFI_SUCCESS when the service is attached and
+ *     dispatching; AXL_EFI_INVALID_PARAMETER for an incomplete
+ *     descriptor; AXL_EFI_OUT_OF_RESOURCES when the loop could not
+ *     be created; AXL_EFI_ABORTED when the identity protocol could
+ *     not be published or setup/attach failed. Suitable to return
+ *     directly from a firmware DriverEntry.
  */
-int /* EFI_STATUS */
+AxlEfiStatus
 _axl_service_driver_init(
     void             *image_handle,   ///< EFI_HANDLE for this driver image
     void             *system_table,   ///< EFI_SYSTEM_TABLE *
@@ -318,8 +333,26 @@ _axl_service_driver_init(
 typedef struct {
     const AxlService    *service;          ///< shared descriptor
     const unsigned char *driver_blob;      ///< embedded driver .efi bytes
+                                           ///< (optional when @c driver_path
+                                           ///< pins the image)
     size_t               driver_blob_len;  ///< length in bytes
-    const char          *driver_name;      ///< filename for disk-search fallback
+    const char          *driver_name;      ///< filename the disk search looks
+                                           ///< for (optional when
+                                           ///< @c driver_path pins the image)
+    const char          *driver_path;      ///< OPTIONAL: load exactly this file
+                                           ///< (e.g. "fs0:\\svc\\my-dxe.efi").
+                                           ///< NULL = the default
+                                           ///< search-then-embedded resolution.
+                                           ///< When set, neither the search nor
+                                           ///< the embedded blob is consulted,
+                                           ///< so a stale copy of
+                                           ///< @c driver_name elsewhere on the
+                                           ///< box cannot shadow the image the
+                                           ///< launcher staged. Because neither
+                                           ///< is consulted, @c driver_name and
+                                           ///< @c driver_blob are both unread
+                                           ///< on this path and neither is
+                                           ///< required.
 } AxlServiceDeploy;
 
 /**
@@ -358,11 +391,22 @@ typedef struct {
  * without re-loading. Use axl_service_is_running to detect
  * that case explicitly if your CLI wants to report "already serving".
  *
+ * **Pinning the image** (`deploy->driver_path`): with that field set,
+ * this routes through axl_driver_ensure_from_path instead — exactly
+ * one file, no 4-path search and no embedded fallback, so a stale
+ * `drivers/<arch>/<driver_name>` left by an older install cannot
+ * shadow the copy the launcher just staged. `driver_name`,
+ * `driver_blob` and `driver_blob_len` all feed the default resolution
+ * only, so none of them is read — or required — when a path is
+ * pinned; `service` and `driver_path` are the whole descriptor.
+ *
  * @return AXL_OK if the protocol is registered (was already, or after
- *     loading); AXL_ERR on serialize overflow, deploy descriptor
- *     incomplete, or driver-load failure.
+ *     loading); AXL_ERR on serialize overflow or an incomplete deploy
+ *     descriptor; AXL_NOT_FOUND when no candidate — the pinned path, or
+ *     the search plus the embedded blob — produced a registered
+ *     protocol.
  */
-int
+AxlStatus
 axl_service_start_embedded(
     const AxlServiceDeploy *deploy
 );
@@ -409,6 +453,94 @@ axl_service_start_embedded(
 int
 axl_service_stop(
     const AxlServiceDeploy *deploy
+);
+
+/**
+ * @brief In-place self-upgrade: replace this running service with a new
+ *     image, handing off its ports, and unload this one.
+ *
+ * Call this from **inside** a running `AXL_SERVICE_DRIVER` service (e.g. from
+ * an "/upgrade" request handler, on the service loop) to hot-swap the service
+ * to a new version with no reboot and — with an `AXL_TEARDOWN_RESET`
+ * @ref axl_http_server_free in your teardown — no port downtime:
+ *
+ *   1. Loads @p new_path as the replacement (validating it *before* anything is
+ *      released — a load failure tears down nothing).
+ *   2. Runs your @ref AxlServiceTeardown (release the listen ports; use the
+ *      abortive HTTP-server free so they are free on return).
+ *   3. Starts the replacement service driver, passing it this service's current
+ *      options AND a handoff (this image's handle + a signal event) via
+ *      LoadOptions. The replacement's `AXL_SERVICE_DRIVER` entry rebinds the
+ *      ports, comes up resident, and arms the handoff event on its own loop.
+ *   4. Detaches this service's driver loop and signals the handoff. The
+ *      replacement, from its own timer tick (this image now off-stack), unloads
+ *      this image and reclaims it.
+ *
+ * The old image is fully reclaimed; the new one keeps serving. This is the
+ * whole self-reload — no shell, no supervisor script, no reboot, safe on a
+ * read-only volume (see @ref axl_service_reload_buffer for a downloaded image).
+ *
+ * Requirements: the caller must be an `AXL_SERVICE_DRIVER`-hosted service (not
+ * the foreground launcher), and @p svc must be the running service. Your
+ * teardown must be **idempotent** and must NOT free the service loop (the
+ * framework owns it).
+ *
+ * Failure semantics: if the replacement cannot be **loaded** (bad path /
+ * corrupt image — the common upgrade failure), nothing is torn down and this
+ * service keeps running. Teardown happens only *after* a successful load (the
+ * ports must be released before the replacement binds them), so a replacement
+ * that loads but fails to **start** leaves this service down: its teardown has
+ * run and its loop is detached (it no longer serves), but this image stays
+ * resident and still publishes the service GUID (so @ref axl_service_is_running
+ * still reports true) until it is unloaded or the system resets.
+ *
+ * **`AXL_ERR` means — and only means — this service is now DOWN.** That is
+ * the one code a caller must treat as fatal (roll back and reset, or fall
+ * back to a watchdog). Every other non-OK code reports a failure that
+ * happened *before* anything was released, so the service is still serving
+ * and the caller can simply disarm the upgrade and carry on with zero
+ * downtime:
+ *
+ * | return | meaning | this service |
+ * |---|---|---|
+ * | `AXL_OK` | replacement resident, handoff armed | replaced, serving |
+ * | `AXL_INVALID` | NULL / not-the-running @p svc, NULL path or image | untouched, serving |
+ * | `AXL_NOT_FOUND` | the replacement could not be **loaded** | untouched, serving |
+ * | `AXL_NO_RESOURCES` | options would not serialize, handoff event / LoadOptions could not be installed | untouched, serving |
+ * | `AXL_ERR` | the replacement loaded but failed to **start** | **DOWN — fatal** |
+ *
+ * Source-compatible with the previous `int` signature and with any caller
+ * that only tests `!= AXL_OK`; what changed is that the pre-teardown
+ * failures no longer report `AXL_ERR` (they were indistinguishable from
+ * the fatal case before).
+ *
+ * @return AXL_OK once the replacement is resident and this image's unload is
+ *     armed (this call returns; the image is reclaimed shortly after by the
+ *     replacement); otherwise one of the codes in the table above.
+ */
+AxlStatus
+axl_service_reload(
+    const AxlService *svc,       ///< the running service (must be AXL_SERVICE_DRIVER-hosted)
+    const char       *new_path   ///< path to the replacement driver .efi (e.g. "fs0:\\svc-v2.efi")
+);
+
+/**
+ * @brief Like @ref axl_service_reload, but the replacement image comes from a
+ *     memory buffer instead of a file path.
+ *
+ * The read-only-volume / network-upgrade form: the new version is a driver
+ * image already in memory (downloaded over the network, decompressed, etc.),
+ * so nothing is read from — or written to — a filesystem. Otherwise identical
+ * to @ref axl_service_reload.
+ *
+ * @return the same as @ref axl_service_reload; AXL_INVALID additionally on a
+ *     NULL / zero-length @p image.
+ */
+AxlStatus
+axl_service_reload_buffer(
+    const AxlService *svc,       ///< the running service
+    const void       *image,     ///< replacement driver image bytes (PE/COFF .efi)
+    size_t            image_len  ///< image size in bytes
 );
 
 /**

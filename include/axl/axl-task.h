@@ -115,8 +115,8 @@ typedef uint32_t AxlTaskId;
  * no protocol calls, no axl_print. Use the arena for memory.
  */
 typedef void (*AxlTaskProc)(
-    void     *arg,  ///< caller-provided argument
-    AxlArena *arena ///< arena for AP-safe allocations (may be NULL)
+    AxlArena *arena, ///< arena for AP-safe allocations (may be NULL)
+    void     *arg    ///< caller-provided argument
 );
 
 /**
@@ -125,8 +125,8 @@ typedef void (*AxlTaskProc)(
  * Completion callback — runs on BSP during axl_task_pool_poll.
  */
 typedef void (*AxlTaskComplete)(
-    void     *arg,  ///< same argument from submit
-    AxlArena *arena ///< arena used by the task
+    AxlArena *arena, ///< arena used by the task
+    void     *arg    ///< same argument from submit
 );
 
 /**

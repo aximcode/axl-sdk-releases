@@ -128,7 +128,7 @@ typedef struct {
  *     @p pk that cannot sign (e.g. a public-only key), bad args, or TLS
  *     not compiled in.
  */
-int
+AXL_WARN_UNUSED int
 axl_jws_sign(
     const AxlJoseKey *key,          ///< signing key for @p alg
     AxlJoseAlg        alg,          ///< algorithm to sign with
@@ -159,7 +159,7 @@ axl_jws_sign(
  *     allow-list, bad signature, malformed token — not three segments —
  *     wrong key, or TLS not compiled in).
  */
-int
+AXL_WARN_UNUSED int
 axl_jws_verify(
     const char       *token,            ///< compact token
     size_t            token_len,        ///< token length in bytes
@@ -215,7 +215,7 @@ typedef struct {
  *     pass; AXL_ERR otherwise (any signature or claim failure, or TLS
  *     not compiled in).
  */
-int
+AXL_WARN_UNUSED int
 axl_jwt_verify(
     const char         *token,            ///< compact JWT
     size_t              token_len,        ///< token length in bytes

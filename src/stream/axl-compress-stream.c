@@ -49,7 +49,7 @@ writer_do_finish(CompressWriterCtx *c)
 
     void  *out = NULL;
     size_t out_len = 0;
-    if (axl_compress(c->fmt, data, n, &out, &out_len, c->level) != AXL_OK) {
+    if (axl_compress(c->fmt, data, n, c->level, &out, &out_len) != AXL_OK) {
         c->finish_rc = AXL_ERR;
         return AXL_ERR;
     }

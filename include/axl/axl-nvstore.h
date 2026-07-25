@@ -28,7 +28,9 @@
  * }
  *
  * extern const AxlGuid AXL_OEM_VENDOR_GUID;
- * axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID);
+ * if (axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID) != AXL_OK) {
+ *     return AXL_ERR;
+ * }
  * axl_nvstore_get("oem", "AssetTag", buf, &sz);
  * @endcode
  */
@@ -56,17 +58,36 @@ extern "C" {
  *
  * The backend token is opaque to consumers. On UEFI it is a
  * `const AxlGuid *` (vendor-GUID pointer); on other backends it
- * may be a path prefix or other identifier. The pointer must remain
- * valid for the lifetime of the program — the table stores the
- * pointer, not a copy.
+ * may be a path prefix or other identifier.
+ *
+ * **The pointed-to token must outlive the program.** The table stores
+ * the pointer, not a copy, and every later access through this
+ * namespace dereferences it — so a token on the stack, or in a heap
+ * block you later free, is a dangling read. Use a `static const
+ * AxlGuid` (or another object with static storage duration).
+ *
+ * Re-registering a name is **idempotent when the tokens are equal by
+ * VALUE** — two translation units that each keep their own
+ * `static const AxlGuid` holding the same GUID bytes both succeed, and
+ * both address the same storage. Only a genuine collision (same name,
+ * different GUID) is rejected. The first registration's pointer is the
+ * one kept, so it is that object which must satisfy the lifetime rule
+ * above.
  *
  * Built-in namespaces "global" and "app" are pre-registered and do
  * not need to be registered explicitly.
  *
- * @return AXL_OK on success, AXL_ERR if the namespace table is full or the
- *     name is already registered with a different token.
+ * The return is must-check: a rejected registration is silent at every
+ * later call site — the namespace simply stays unregistered and each
+ * get/set/delete/iter through it fails — so dropping this result turns
+ * a setup error into data that is never stored or never found.
+ *
+ * @return AXL_OK on success (including an idempotent re-register),
+ *     AXL_ERR if an argument is NULL, the name is empty or too long,
+ *     the namespace table is full, or the name is already registered
+ *     with a different token.
  */
-int
+AXL_WARN_UNUSED int
 axl_nvstore_register_namespace(
     const char *name,           ///< namespace name (UTF-8, copied)
     const void *backend_token   ///< opaque per-backend token

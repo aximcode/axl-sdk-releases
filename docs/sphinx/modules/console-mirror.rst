@@ -31,6 +31,47 @@ owns no pump or timer — the consumer drives the loop. See the design doc
 for the layering (substrate owns the mechanism; the consumer owns
 transport, RBAC, terminal size, and late-join policy).
 
+AxlConsoleVtEnc — the remote sink, usable on its own
+----------------------------------------------------
+
+The mirror is exactly two halves: :cpp:type:`AxlConsoleTap` (the firmware
+surgery) and :cpp:type:`AxlConsoleVtEnc` (the **VT encoder** that flattens
+:cpp:type:`AxlConsoleOps` onto the byte stream an xterm-class terminal
+understands). The encoder is public, so the *other* producer can use it too.
+
+That matters because the tap cannot serve every topology. The tap swaps the
+``gST`` console pointers, which works when the installer is the foreground and
+then ``StartImage``\ s a child shell, or runs at BDS — but **not** for a shell
+already sitting at its prompt, whose ``ConsoleLogger`` captured the original
+``ConOut`` before the swap. That case belongs to
+:cpp:func:`axl_console_device_install`, and pairing it with the encoder is how a
+resident driver mirrors an already-running console to a remote viewer:
+
+.. code-block:: c
+
+   AxlConsoleVtEncConfig ecfg = { .sink = to_ws, .user = conn };
+   AxlConsoleVtEnc *enc = axl_console_vt_enc_new(&ecfg);
+
+   void                *ops_user = NULL;
+   const AxlConsoleOps *ops      = axl_console_vt_enc_ops(enc, &ops_user);
+
+   AxlConsoleDeviceConfig dcfg = { .take_input = true, .read_physical = true,
+                                   .passthrough_local = true };
+   axl_console_device_install(ops, ops_user, &dcfg, &dev);
+
+   /* new viewer joins mid-session: repaint it, then join the live stream */
+   axl_console_vt_enc_snapshot(enc, to_ws, new_client);
+
+``passthrough_local`` above is the other half of that story. By default the
+take-over device **evicts** the firmware consoles so the consumer owns the
+framebuffer — right for a local renderer like ``fbcon``, wrong for a consumer
+that only *observes*: evicting blanks the local monitor and freezes anything
+sampling the GOP (a BMC's KVM stream, say). With ``passthrough_local`` the
+firmware console stays in the fan-out and paints alongside us. It requires
+physical geometry (``cols``/``rows`` must be 0) — two consoles drawing one
+screen have to agree on the grid — so a remote viewer adapts to the console's
+size rather than the other way round.
+
 AxlConsoleTap — the structured console underneath
 -------------------------------------------------
 
@@ -145,5 +186,9 @@ API Reference
 .. doxygenfile:: axl-console-term.h
 
 .. doxygenfile:: axl-console-mirror.h
+
+.. doxygenfile:: axl-console-vt-enc.h
+
+.. doxygenfile:: axl-console-tee.h
 
 .. doxygenfile:: axl-console-screen.h

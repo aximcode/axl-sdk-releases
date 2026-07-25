@@ -104,6 +104,29 @@ config_file_parse_line(
     axl_config_file_set(cf, key, value);
 }
 
+/* Shared by axl_config_file_load (file bytes) and axl_config_file_parse_string
+   (an in-memory NUL-terminated string): split @p buf/@p len into lines on
+   '\n', strip a trailing '\r', and hand each line to config_file_parse_line. */
+static void
+config_file_parse_buf(AxlConfigFile *cf, const char *buf, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        size_t start = i;
+        while (i < len && buf[i] != '\n') {
+            i++;
+        }
+        size_t end = i;          /* exclusive, at '\n' or EOF */
+        if (i < len) {
+            i++;                 /* consume '\n' */
+        }
+        if (end > start && buf[end - 1] == '\r') {
+            end--;               /* strip CRLF's '\r' */
+        }
+        config_file_parse_line(cf, buf + start, end - start);
+    }
+}
+
 AxlConfigFile *
 axl_config_file_load(const char *path)
 {
@@ -125,24 +148,20 @@ axl_config_file_load(const char *path)
         return cf;
     }
 
-    size_t i = 0;
-    while (i < len) {
-        size_t start = i;
-        while (i < len && buf[i] != '\n') {
-            i++;
-        }
-        size_t end = i;          /* exclusive, at '\n' or EOF */
-        if (i < len) {
-            i++;                 /* consume '\n' */
-        }
-        if (end > start && buf[end - 1] == '\r') {
-            end--;               /* strip CRLF's '\r' */
-        }
-        config_file_parse_line(cf, buf + start, end - start);
-    }
+    config_file_parse_buf(cf, buf, len);
 
     axl_free(buf);
     return cf;
+}
+
+int
+axl_config_file_parse_string(AxlConfigFile *cf, const char *text)
+{
+    if (cf == NULL || text == NULL) {
+        return AXL_ERR;
+    }
+    config_file_parse_buf(cf, text, axl_strlen(text));
+    return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -247,22 +266,40 @@ config_file_save_cb(const void *key, void *value, void *data)
     }
 }
 
-int
-axl_config_file_save(AxlConfigFile *cf, const char *path)
+/* Shared by axl_config_file_save (file) and axl_config_file_to_string
+   (caller buffer): build the full "key=value\n"-per-entry text. Returns a
+   new AxlString the caller frees with axl_string_free, or NULL on OOM /
+   NULL @p cf. */
+static AxlString *
+config_file_build_string(AxlConfigFile *cf)
 {
-    if (cf == NULL || path == NULL) {
-        return AXL_ERR;
+    if (cf == NULL) {
+        return NULL;
     }
 
     AxlString *out = axl_string_new("");
     if (out == NULL) {
-        return AXL_ERR;
+        return NULL;
     }
 
     ConfigFileSaveCtx ctx = { out, true };
     axl_hash_table_foreach(cf->map, config_file_save_cb, &ctx);
     if (!ctx.ok) {
         axl_string_free(out);
+        return NULL;
+    }
+    return out;
+}
+
+int
+axl_config_file_save(AxlConfigFile *cf, const char *path)
+{
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+
+    AxlString *out = config_file_build_string(cf);
+    if (out == NULL) {
         return AXL_ERR;
     }
 
@@ -270,4 +307,27 @@ axl_config_file_save(AxlConfigFile *cf, const char *path)
                                    axl_string_len(out));
     axl_string_free(out);
     return rc;
+}
+
+int
+axl_config_file_to_string(AxlConfigFile *cf, char *buf, size_t cap)
+{
+    if (buf == NULL || cap == 0) {
+        return AXL_ERR;
+    }
+
+    AxlString *out = config_file_build_string(cf);
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+
+    size_t len = axl_string_len(out);
+    if (len + 1 > cap) {
+        axl_string_free(out);
+        return AXL_ERR;   /* would not fit -- buf left unmodified */
+    }
+    axl_memcpy(buf, axl_string_str(out), len);
+    buf[len] = '\0';
+    axl_string_free(out);
+    return AXL_OK;
 }

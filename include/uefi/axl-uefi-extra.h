@@ -67,6 +67,10 @@ typedef EFI_STATUS (EFIAPI *EFI_SHELL_SET_FILE_POSITION)(
     IN UINT64             Position
     );
 
+typedef EFI_STATUS (EFIAPI *EFI_SHELL_FLUSH_FILE)(
+    IN SHELL_FILE_HANDLE  FileHandle
+    );
+
 typedef EFI_STATUS (EFIAPI *EFI_SHELL_GET_FILE_SIZE)(
     IN  SHELL_FILE_HANDLE  FileHandle,
     OUT UINT64            *Size
@@ -266,7 +270,7 @@ struct _EFI_SHELL_PROTOCOL {
     EFI_SHELL_DELETE_FILE_BY_NAME  DeleteFileByName;     // 2.2.32 (USED)
     EFI_SHELL_GET_FILE_POSITION    GetFilePosition;      // 2.2.33 (USED)
     EFI_SHELL_SET_FILE_POSITION    SetFilePosition;      // 2.2.34 (USED)
-    void                          *FlushFile;            // 2.2.35
+    EFI_SHELL_FLUSH_FILE           FlushFile;            // 2.2.35 (USED)
     void                          *FindFiles;            // 2.2.36
     void                          *FindFilesInDir;       // 2.2.37
     EFI_SHELL_GET_FILE_SIZE        GetFileSize;          // 2.2.38 (USED)
@@ -1147,15 +1151,18 @@ typedef struct _EFI_BLOCK_IO_PROTOCOL {
 // (`typedef struct_EFI_FIRMWARE_VOLUME_PROTOCOL {` with a glued tag and
 // the wrong name on the opener vs the `EFI_FIRMWARE_VOLUME2_PROTOCOL`
 // closer), so the manifest-driven generator can't match it. AXL uses
-// only GetVolumeAttributes (FV attribute bits) and GetNextFile + KeySize
-// (file-count loop); the other service entry points are kept opaque as
-// VOID * — correctly pointer-sized without their funcptr typedefs. The
-// GUID is not in generated/guids.h and is defined locally in axl-fv.c.
+// GetVolumeAttributes (FV attribute bits), GetNextFile + KeySize (file
+// enumeration), and ReadSection (pull a file's section, e.g. the UI name);
+// the remaining service entry points are kept opaque as VOID * — correctly
+// pointer-sized without their funcptr typedefs. The GUID is not in
+// generated/guids.h and is defined locally in axl-fv.c.
 // ===================================================================
 
 typedef UINT64 EFI_FV_ATTRIBUTES;
 typedef UINT8  EFI_FV_FILETYPE;       // EFI_FV_FILETYPE_ALL == 0x00
 typedef UINT32 EFI_FV_FILE_ATTRIBUTES;
+typedef UINT8  EFI_SECTION_TYPE;      // leaf/encapsulation section type
+#define EFI_SECTION_USER_INTERFACE  0x15  // body is a CHAR16 file name
 
 typedef struct _EFI_FIRMWARE_VOLUME2_PROTOCOL  EFI_FIRMWARE_VOLUME2_PROTOCOL;
 
@@ -1173,11 +1180,24 @@ typedef EFI_STATUS (EFIAPI *EFI_FV_GET_NEXT_FILE)(
     OUT    UINTN                                *Size
     );
 
+// If *Buffer is NULL on entry the firmware allocates the result via
+// AllocatePool (caller frees with FreePool); SectionInstance selects among
+// repeated sections of the same type (0 = first).
+typedef EFI_STATUS (EFIAPI *EFI_FV_READ_SECTION)(
+    IN     CONST EFI_FIRMWARE_VOLUME2_PROTOCOL  *This,
+    IN     CONST EFI_GUID                       *NameGuid,
+    IN     EFI_SECTION_TYPE                       SectionType,
+    IN     UINTN                                  SectionInstance,
+    IN OUT VOID                                 **Buffer,
+    IN OUT UINTN                                 *BufferSize,
+    OUT    UINT32                                *AuthenticationStatus
+    );
+
 struct _EFI_FIRMWARE_VOLUME2_PROTOCOL {
     EFI_FV_GET_ATTRIBUTES   GetVolumeAttributes;
     VOID                   *SetVolumeAttributes;   // unused by AXL
     VOID                   *ReadFile;              // unused by AXL
-    VOID                   *ReadSection;           // unused by AXL
+    EFI_FV_READ_SECTION     ReadSection;
     VOID                   *WriteFile;             // unused by AXL
     EFI_FV_GET_NEXT_FILE    GetNextFile;
     UINT32                  KeySize;

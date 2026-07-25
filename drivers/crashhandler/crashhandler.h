@@ -13,7 +13,7 @@
 extern AxlHandle               g_image_handle;
 
 /* Pre-allocated image table (filled during init, used during crash) */
-extern CrashImageEntry         g_image_table[CRASH_MAX_IMAGES];
+extern AxlCrashImageEntry         g_image_table[AXL_CRASH_MAX_IMAGES];
 extern uint32_t                g_image_count;
 
 /* GUIDs (binary-compatible with EFI_GUID; both halves of the

@@ -295,7 +295,7 @@ static void
 test_smbios(void)
 {
     AxlSmbiosHeader  *hdr;
-    unsigned short   *str;
+    uint16_t         *str;
 
     // Find BIOS Information (type 0)
     hdr = axl_smbios_find(0);
@@ -305,11 +305,11 @@ test_smbios(void)
     }
 
     // Get string index 1 (vendor)
-    str = (unsigned short *)axl_smbios_get_string(hdr, 1);
+    str = axl_smbios_get_string(hdr, 1);
     test_check(str != NULL && str[0] != L'\0', "smbios: get string 1 non-empty");
 
     // Index 0 returns empty
-    str = (unsigned short *)axl_smbios_get_string(hdr, 0);
+    str = axl_smbios_get_string(hdr, 0);
     test_check(str != NULL && str[0] == L'\0', "smbios: get string 0 empty");
 
     // Type enum: AXL_SMBIOS_TYPE_BIOS_INFO must equal bare 0
@@ -1549,6 +1549,127 @@ test_volume_enumerate(void)
                "vol enum: NULL count returns AXL_ERR");
 }
 
+// ---------------------------------------------------------------------------
+// axl_volume_get_space — real-firmware path/handle agreement.
+//
+// The deterministic figure-level coverage (exact bytes, the unknown
+// marker, per-figure gating) lives in AxlFsProvider's mock, which is the
+// only volume whose free space the suite controls. Here the boot volume
+// is a genuine FAT filesystem, so what is worth pinning is that the two
+// spellings answer identically and that the numbers are self-consistent.
+// ---------------------------------------------------------------------------
+
+static void
+test_volume_get_space(void)
+{
+    /* Distinctive fill so "untouched" is provable rather than assumed —
+       zero would be indistinguishable from a volume reporting empty. */
+    const uint64_t untouched = 0xD15EA5EDD15EA5EDull;
+    uint64_t total = untouched;
+    uint64_t avail = untouched;
+
+    /* Argument validation — runs everywhere, not part of the balance. */
+    test_check(axl_volume_get_space(NULL, &total, &avail) == AXL_ERR,
+               "vol space: NULL path returns AXL_ERR");
+    test_check(axl_volume_get_space("", &total, &avail) == AXL_ERR,
+               "vol space: empty path returns AXL_ERR");
+    test_check(axl_volume_get_space("fs0:", NULL, NULL) == AXL_ERR,
+               "vol space: asking for neither figure returns AXL_ERR");
+    test_check(axl_volume_get_space("axl-no-such-vol:", &total, &avail)
+                   == AXL_ERR,
+               "vol space: unresolvable volume returns AXL_ERR");
+
+    /* A volume name too long to represent must FAIL, not quietly fall
+       back to the working directory's volume. Answering a "will this
+       write fit?" question with a different volume's free bytes is the
+       exact confident-but-wrong result this API exists to prevent, and
+       it would look like a clean AXL_OK to the caller. 32 name chars
+       overflows the internal root buffer; shell map names really can be
+       arbitrary (axl_volume_set_map assigns them). */
+    test_check(axl_volume_get_space("abcdefghijklmnopqrstuvwxyz012345:",
+                                    &total, &avail) == AXL_ERR,
+               "vol space: over-long volume name fails, no cwd fallback");
+    test_check(axl_volume_get_label("abcdefghijklmnopqrstuvwxyz012345:")
+                   == NULL,
+               "vol label: over-long volume name fails, no cwd fallback");
+    test_check(total == untouched && avail == untouched,
+               "vol space: out params untouched on failure");
+
+    AxlVolume vols[8];
+    size_t    filled = 0;
+    if (axl_volume_enumerate(vols, 8, &filled) != AXL_OK || filled == 0) {
+        test_check(true, "vol space: no volumes enumerated - query SKIPPED");
+        test_check(true, "vol space: no volumes enumerated - total SKIPPED");
+        test_check(true, "vol space: no volumes enumerated - free SKIPPED");
+        test_check(true, "vol space: no volumes enumerated - handle SKIPPED");
+        test_check(true, "vol space: no volumes enumerated - agree SKIPPED");
+        test_check(true, "vol space: no volumes enumerated - absent SKIPPED");
+        return;
+    }
+
+    /* Asserted, NOT used as a gate: an earlier revision let a failing
+       query take the SKIP path, so a regression in the path spelling
+       would have kept the suite green at an unchanged ratchet total. */
+    char path[24];
+    axl_snprintf(path, sizeof(path), "%s:", vols[0].name);
+    test_check(axl_volume_get_space(path, &total, &avail) == AXL_OK,
+               "vol space: boot volume answers the path spelling");
+    test_check(total > 0,
+               "vol space: boot volume reports a non-zero total");
+    test_check(avail <= total,
+               "vol space: free space fits inside the total");
+
+    uint64_t h_total = untouched;
+    uint64_t h_avail = untouched;
+    test_check(axl_volume_get_space_by_handle(vols[0].handle,
+                                              &h_total, &h_avail) == AXL_OK,
+               "vol space: the same volume answers by handle");
+    test_check(h_total == total && h_avail == avail,
+               "vol space: path and handle spellings agree exactly");
+
+    /* The motivating use case: sizing a file that does not exist yet.
+       Naming an absent file must report its VOLUME, not fail. */
+    uint64_t a_total = untouched;
+    uint64_t a_avail = untouched;
+    char absent[64];
+    axl_snprintf(absent, sizeof(absent), "%s:\\axl-no-such-file.zzz",
+                 vols[0].name);
+    test_check(axl_volume_get_space(absent, &a_total, &a_avail) == AXL_OK
+                   && a_total == total && a_avail == avail,
+               "vol space: a not-yet-created file reports its volume");
+}
+
+// ---------------------------------------------------------------------------
+// axl_volume_get_label accepts every spelling of a volume it documents.
+//
+// Its docstring offers `"fs0:"` and `"fs1:\\"` as equivalents, but the
+// bare map name was passed straight to the shell's OpenFileByName, which
+// rejects it -- so the documented form returned NULL. All three spellings
+// name one volume and must yield one label.
+// ---------------------------------------------------------------------------
+
+static void
+test_volume_get_label_spellings(void)
+{
+    AXL_AUTO_FREE char *bare  = axl_volume_get_label("fs0:");
+    AXL_AUTO_FREE char *root  = axl_volume_get_label("fs0:\\");
+    AXL_AUTO_FREE char *file  = axl_volume_get_label("fs0:\\AxlTestUtil.efi");
+
+    test_check(root != NULL, "vol label: \"fs0:\\\" resolves");
+    test_check(bare != NULL, "vol label: bare \"fs0:\" resolves");
+    test_check(bare != NULL && root != NULL && axl_strcmp(bare, root) == 0,
+               "vol label: bare and root spellings give the same label");
+    test_check(file != NULL && root != NULL && axl_strcmp(file, root) == 0,
+               "vol label: a file path gives its volume's label");
+
+    /* The discriminator for "@p path need not exist": before the fix
+       an absent file resolved to NULL, because the path itself was
+       opened. The label belongs to the volume, so it must answer. */
+    AXL_AUTO_FREE char *absent = axl_volume_get_label("fs0:\\axl-no-such.zzz");
+    test_check(absent != NULL && root != NULL && axl_strcmp(absent, root) == 0,
+               "vol label: an absent path still gives its volume's label");
+}
+
 static void
 test_volume_map_name(void)
 {
@@ -1790,6 +1911,102 @@ test_config_file(void)
     test_check(probe != NULL,
                "config_file: API usable after free(NULL)");
     axl_config_file_free(probe);
+}
+
+/* axl_config_file_parse_string / axl_config_file_to_string: the in-memory
+   counterparts of axl_config_file_load/_save, for a caller (netload) whose
+   config text lives in an NVRAM variable rather than a file. */
+static void
+test_config_file_string_round_trip(void)
+{
+    /* parse_string: identical line grammar to axl_config_file_load, fed
+       from memory instead of a file. */
+    const char *text =
+        "# a comment\n"
+        "\n"
+        "mode=handoff\n"
+        "  boot_timeout =  30  \n"
+        "ec.poll_interval_ms=5000\n"
+        "noeqline\n"
+        "empty=\n";
+    AxlConfigFile *ps = axl_config_file_new();
+    test_check(axl_config_file_parse_string(ps, text) == AXL_OK,
+               "config_file: parse_string returns AXL_OK");
+    test_check(axl_strcmp(axl_config_file_get(ps, "mode", ""), "handoff") == 0,
+               "config_file: parse_string parsed a core key");
+    test_check(axl_config_file_get_uint(ps, "boot_timeout", 0) == 30,
+               "config_file: parse_string trimmed key+value (boot_timeout=30)");
+    test_check(axl_config_file_get_uint(ps, "ec.poll_interval_ms", 0) == 5000,
+               "config_file: parse_string parsed a dotted prefix.key");
+    test_check(axl_strcmp(axl_config_file_get(ps, "empty", "X"), "") == 0,
+               "config_file: parse_string empty value stored as empty string");
+    test_check(axl_config_file_get(ps, "noeqline", NULL) == NULL,
+               "config_file: parse_string ignores a line with no '='");
+    axl_config_file_free(ps);
+
+    /* parse_string: NULL-safety */
+    test_check(axl_config_file_parse_string(NULL, "k=v") == AXL_ERR,
+               "config_file: parse_string NULL cf -> AXL_ERR");
+    AxlConfigFile *nt = axl_config_file_new();
+    test_check(axl_config_file_parse_string(nt, NULL) == AXL_ERR,
+               "config_file: parse_string NULL text -> AXL_ERR");
+    axl_config_file_free(nt);
+
+    /* to_string: single key -> exact line (no ordering ambiguity with only
+       one entry in the map). */
+    AxlConfigFile *one = axl_config_file_new();
+    axl_config_file_set(one, "only", "val");
+    char buf[64];
+    test_check(axl_config_file_to_string(one, buf, sizeof buf) == AXL_OK,
+               "config_file: to_string single key returns AXL_OK");
+    test_check(axl_strcmp(buf, "only=val\n") == 0,
+               "config_file: to_string single key exact line");
+    axl_config_file_free(one);
+
+    /* to_string -> parse_string round-trip, multi-key. axl_config_file_save's
+       own docstring says entry order is unspecified, so pinning a full-buffer
+       exact match would test today's hash-table iteration order rather than
+       the documented contract -- axl_strstr per key is the honest tool here
+       (order really is undefined), backed by an exact round-trip check
+       through parse_string for the values themselves. */
+    AxlConfigFile *multi = axl_config_file_new();
+    axl_config_file_set(multi, "alpha", "one");
+    axl_config_file_set(multi, "beta", "2");
+    char mbuf[128];
+    test_check(axl_config_file_to_string(multi, mbuf, sizeof mbuf) == AXL_OK,
+               "config_file: to_string multi-key returns AXL_OK");
+    test_check(axl_strstr(mbuf, "alpha=one\n") != NULL,
+               "config_file: to_string multi-key contains alpha=one");
+    test_check(axl_strstr(mbuf, "beta=2\n") != NULL,
+               "config_file: to_string multi-key contains beta=2");
+    axl_config_file_free(multi);
+
+    AxlConfigFile *rt = axl_config_file_new();
+    test_check(axl_config_file_parse_string(rt, mbuf) == AXL_OK,
+               "config_file: round-trip parse_string(to_string(...)) AXL_OK");
+    test_check(axl_strcmp(axl_config_file_get(rt, "alpha", ""), "one") == 0
+               && axl_config_file_get_uint(rt, "beta", 0) == 2,
+               "config_file: to_string -> parse_string round-trips values");
+    axl_config_file_free(rt);
+
+    /* to_string: buffer too small is reported, not silently truncated -- a
+       sentinel proves buf is left unmodified on the AXL_ERR path. */
+    AxlConfigFile *big = axl_config_file_new();
+    axl_config_file_set(big, "longkey", "a-fairly-long-value-string");
+    char small[4] = { 'S', 'S', 'S', '\0' };
+    test_check(axl_config_file_to_string(big, small, sizeof small) == AXL_ERR,
+               "config_file: to_string too-small buffer -> AXL_ERR");
+    test_check(small[0] == 'S' && small[1] == 'S' && small[2] == 'S',
+               "config_file: to_string too-small buffer left unmodified");
+
+    /* to_string: NULL-safety / zero cap */
+    test_check(axl_config_file_to_string(NULL, buf, sizeof buf) == AXL_ERR,
+               "config_file: to_string NULL cf -> AXL_ERR");
+    test_check(axl_config_file_to_string(big, NULL, sizeof buf) == AXL_ERR,
+               "config_file: to_string NULL buf -> AXL_ERR");
+    test_check(axl_config_file_to_string(big, buf, 0) == AXL_ERR,
+               "config_file: to_string zero cap -> AXL_ERR");
+    axl_config_file_free(big);
 }
 
 static void
@@ -2594,6 +2811,107 @@ test_config_to_from_string(void)
     axl_config_free(dst7_cfg);
 }
 
+/* axl_config_target_to_string is the OTHER half of the same cross-binary
+   ABI: it reads directly from a caller's struct via offsetof, with no
+   AxlConfig instance involved (that's what axl_service_start_embedded
+   calls to fill LoadOptions from a launcher's own opts). The pair above
+   round-trips through an AxlConfig instance on the serialize side, which
+   exercises axl_config_to_string, not this function. Cover its BOOL
+   branch (both true and false), a plain uint64_t, a narrow uint16_t
+   field (the width auto_apply must not overrun), and a string. */
+static void
+test_config_target_to_string_round_trip(void)
+{
+    typedef struct {
+        bool        ro;
+        bool        verbose;
+        uint64_t    big;
+        uint16_t    port;
+        const char *name;
+    } Tgt;
+
+    static const AxlConfigDesc descs[] = {
+        { "ro",      AXL_CFG_BOOL,   "false", "Read-only",
+          offsetof(Tgt, ro),      sizeof(bool) },
+        { "verbose", AXL_CFG_BOOL,   "false", "Verbose",
+          offsetof(Tgt, verbose), sizeof(bool) },
+        { "big",     AXL_CFG_UINT,   "0",     "Big counter",
+          offsetof(Tgt, big),     sizeof(uint64_t) },
+        { "port",    AXL_CFG_UINT,   "0",     "Port",
+          offsetof(Tgt, port),    sizeof(uint16_t) },
+        { "name",    AXL_CFG_STRING, "",      "Name",
+          offsetof(Tgt, name),    sizeof(const char *) },
+        { 0 }
+    };
+
+    /* === Serialize directly from a populated struct - no AxlConfig
+       involved, matching how axl_service_start_embedded reads a
+       launcher's own opts before shipping them through LoadOptions. === */
+    Tgt src = {
+        .ro      = true,
+        .verbose = false,
+        .big     = 9876543210ULL,
+        .port    = 5640,
+        .name    = "9pexport",
+    };
+
+    char buf[256];
+    test_check(axl_config_target_to_string(descs, &src, buf, sizeof(buf))
+                   == AXL_OK,
+               "target_to_string: serializes AXL_OK");
+
+    /* === Decode through the normal AxlConfig + auto_apply path === */
+    Tgt dst;
+    axl_memset(&dst, 0, sizeof(dst));
+    AxlConfig *cfg = axl_config_new(descs, NULL, &dst);
+    test_check(cfg != NULL, "target_to_string: config new");
+
+    /* Poison the one field whose EXPECTED value is also its starting value.
+       dst is zeroed AND axl_config_new auto-applies every descriptor's
+       default, so `verbose` is already false here and "verbose == false"
+       below would pass even if the key were dropped from serialization
+       entirely -- the precise failure this assertion exists to catch. With
+       it flipped to true, only a correctly emitted-and-decoded "false" can
+       bring it back. The other fields need no such poison: their expected
+       values (true / 9876543210 / 5640 / "9pexport") all differ from the
+       defaults auto-apply left behind ("false" / "0" / "0" / ""). */
+    dst.verbose = true;
+
+    test_check(axl_config_from_string(cfg, buf) == AXL_OK,
+               "target_to_string: from_string decodes AXL_OK");
+
+    test_check(dst.ro == true,
+               "target_to_string: bool true round-trips");
+    test_check(dst.verbose == false,
+               "target_to_string: bool false round-trips");
+    test_check(dst.big == 9876543210ULL,
+               "target_to_string: uint64_t round-trips");
+    test_check(dst.port == 5640,
+               "target_to_string: uint16_t (narrow field) round-trips");
+    test_check(dst.name != NULL && axl_strcmp(dst.name, "9pexport") == 0,
+               "target_to_string: string round-trips");
+
+    /* === NULL/argument safety === */
+    test_check(axl_config_target_to_string(NULL, &src, buf, sizeof(buf))
+                   == AXL_ERR,
+               "target_to_string: NULL descs returns AXL_ERR");
+    test_check(axl_config_target_to_string(descs, NULL, buf, sizeof(buf))
+                   == AXL_ERR,
+               "target_to_string: NULL target returns AXL_ERR");
+    test_check(axl_config_target_to_string(descs, &src, NULL, sizeof(buf))
+                   == AXL_ERR,
+               "target_to_string: NULL out returns AXL_ERR");
+    test_check(axl_config_target_to_string(descs, &src, buf, 0) == AXL_ERR,
+               "target_to_string: zero out_size returns AXL_ERR");
+
+    char tiny[4];
+    test_check(axl_config_target_to_string(descs, &src, tiny, sizeof(tiny))
+                   == AXL_ERR,
+               "target_to_string: too-small buffer returns AXL_ERR");
+
+    axl_config_free(cfg);
+}
+
 static void
 test_config_callback(void)
 {
@@ -3081,6 +3399,65 @@ test_service_launch_embedded_validates(void)
 
     test_check(axl_service_start_embedded(NULL) == AXL_ERR,
                "service: launch_embedded(NULL) returns AXL_ERR");
+
+    /* A pinned deploy names exactly one file, so there is nothing to fall
+       back to and the embedded blob becomes optional. The distinguishing
+       assertion: the SAME blob-less descriptor that is rejected outright
+       above (AXL_ERR, "incomplete") is instead ATTEMPTED here and reports
+       AXL_NOT_FOUND — proof the pinned path was taken rather than the
+       search-plus-embedded one. */
+    AxlServiceDeploy d_pinned = {
+        .service     = &svc,
+        .driver_name = "x.efi",
+        .driver_path = "fs0:\\axl-test-no-such-pinned-driver.efi",
+    };
+    test_check(axl_service_start_embedded(&d_pinned) == AXL_NOT_FOUND,
+               "service: launch_embedded honours driver_path without a blob");
+
+    /* (That driver_path also suppresses the embedded fallback is not
+       decidable from a return code here — both routes report AXL_NOT_FOUND
+       for a 2-byte fake blob. test-service-pin-path-qemu.sh proves it with
+       a launcher whose embedded blob is a DIFFERENT build of the driver.) */
+
+    /* driver_name feeds the disk search and nothing else, so a pinned deploy
+       does not need it either: service + driver_path is the whole descriptor.
+       Same discriminator as above — ATTEMPTED (AXL_NOT_FOUND), not rejected
+       as incomplete (AXL_ERR). */
+    AxlServiceDeploy d_pinned_only = {
+        .service     = &svc,
+        .driver_path = "fs0:\\axl-test-no-such-pinned-driver.efi",
+    };
+    test_check(axl_service_start_embedded(&d_pinned_only) == AXL_NOT_FOUND,
+               "service: driver_path alone is a complete deploy descriptor");
+}
+
+// ---------------------------------------------------------------------------
+// axl_driver_ensure_from_path — the pinned sibling of
+// axl_driver_ensure_with_embedded: exactly one file, no search, no fallback.
+// ---------------------------------------------------------------------------
+
+static void
+test_driver_ensure_from_path(void)
+{
+    /* A GUID nothing publishes, so the step-1 short-circuit can't fire and
+       the pinned load is genuinely attempted. */
+    static const AxlGuid unpublished = AXL_GUID(
+        0x9e5a0c31, 0x77b4, 0x4d10,
+        0xa3, 0x62, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+
+    test_check(axl_driver_ensure_from_path(NULL, "fs0:\\x.efi", NULL, 0)
+                   == AXL_INVALID,
+               "ensure_from_path: NULL guid returns AXL_INVALID");
+    test_check(axl_driver_ensure_from_path(&unpublished, NULL, NULL, 0)
+                   == AXL_INVALID,
+               "ensure_from_path: NULL path returns AXL_INVALID");
+
+    /* Missing file: reports AXL_NOT_FOUND and, unlike the searching
+       variants, does not go looking anywhere else. */
+    test_check(axl_driver_ensure_from_path(
+                   &unpublished, "fs0:\\axl-test-no-such-pinned-driver.efi",
+                   NULL, 0) == AXL_NOT_FOUND,
+               "ensure_from_path: missing file returns AXL_NOT_FOUND");
 }
 
 static void
@@ -3209,6 +3586,83 @@ test_service_guid(void)
 }
 
 // ---------------------------------------------------------------------------
+// _axl_service_driver_init — the AXL_SERVICE_DRIVER shim's real entry.
+// Returns a firmware EFI_STATUS; the value must reach DriverEntry with
+// its error bit intact.
+// ---------------------------------------------------------------------------
+
+static void
+test_service_driver_init_status_width(void)
+{
+    /* Regression: the declaration used to be `int`, so every failure
+       return narrowed a 64-bit EFI_STATUS to 32 bits and dropped
+       EFI_ERROR_BIT — AXL_EFI_INVALID_PARAMETER (0x8000000000000002)
+       reached the firmware as 0x2, which EFI_ERROR() reads as SUCCESS.
+       StartImage then reported success for a service that never
+       attached, and axl_service_reload declared the hot-swap good.
+
+       Only the pre-firmware validation paths are exercised here: they
+       return before axl_driver_init touches gBS, so there is no
+       register/unregister lifecycle to wedge (see the firmware-test
+       hazard note in the workflow docs). */
+    AxlEfiStatus st_null = _axl_service_driver_init(NULL, NULL, NULL);
+    test_check(st_null == AXL_EFI_INVALID_PARAMETER,
+               "service driver_init: NULL svc returns AXL_EFI_INVALID_PARAMETER");
+    test_check(AXL_EFI_ERROR(st_null),
+               "service driver_init: NULL svc status keeps the EFI error bit");
+
+    static const AxlService svc_no_setup = { .name = "s0-no-setup" };
+    AxlEfiStatus st_no_setup =
+        _axl_service_driver_init(NULL, NULL, &svc_no_setup);
+    test_check(st_no_setup == AXL_EFI_INVALID_PARAMETER,
+               "service driver_init: NULL setup returns AXL_EFI_INVALID_PARAMETER");
+    test_check(AXL_EFI_ERROR(st_no_setup),
+               "service driver_init: NULL setup status keeps the EFI error bit");
+
+    static const AxlService svc_no_name = { .setup = service_test_setup };
+    AxlEfiStatus st_no_name =
+        _axl_service_driver_init(NULL, NULL, &svc_no_name);
+    test_check(st_no_name == AXL_EFI_INVALID_PARAMETER,
+               "service driver_init: NULL name returns AXL_EFI_INVALID_PARAMETER");
+    test_check(AXL_EFI_ERROR(st_no_name),
+               "service driver_init: NULL name status keeps the EFI error bit");
+}
+
+// ---------------------------------------------------------------------------
+// axl_service_reload return-code taxonomy. AXL_ERR is reserved for the ONE
+// fatal case — the replacement loaded but failed to start, so the service is
+// down. Every other non-OK code means the service is untouched and still
+// serving, which is what lets a caller disarm instead of cold-resetting a
+// healthy box.
+// ---------------------------------------------------------------------------
+
+static void
+test_service_reload_validates(void)
+{
+    /* Nothing in a foreground app is the running AXL_SERVICE_DRIVER service,
+       so each of these takes a caller-misuse exit. None of them may report
+       AXL_ERR: that code means "this service is DOWN", and here it never
+       started in the first place. */
+    AxlService svc = { .name = "reload-validate", .setup = service_test_setup };
+    static const unsigned char fake_image[4] = { 'M', 'Z', 0, 0 };
+
+    test_check(axl_service_reload(NULL, "fs0:\\x.efi") == AXL_INVALID,
+               "service reload: NULL svc returns AXL_INVALID");
+    test_check(axl_service_reload(&svc, NULL) == AXL_INVALID,
+               "service reload: NULL path returns AXL_INVALID");
+    test_check(axl_service_reload(&svc, "fs0:\\x.efi") == AXL_INVALID,
+               "service reload: not-the-running-service returns AXL_INVALID");
+
+    test_check(axl_service_reload_buffer(&svc, NULL, 0) == AXL_INVALID,
+               "service reload_buffer: NULL image returns AXL_INVALID");
+    test_check(axl_service_reload_buffer(&svc, fake_image, 0) == AXL_INVALID,
+               "service reload_buffer: zero length returns AXL_INVALID");
+    test_check(axl_service_reload_buffer(&svc, fake_image,
+                                         sizeof(fake_image)) == AXL_INVALID,
+               "service reload_buffer: not-the-running-service returns AXL_INVALID");
+}
+
+// ---------------------------------------------------------------------------
 // Protocol registry — register / find / enumerate / unregister round-trip
 // plus axl_protocol_register_name (custom name → consumer GUID binding).
 // ---------------------------------------------------------------------------
@@ -3294,7 +3748,7 @@ test_protocol_registry(void)
     axl_free(handles);
 
     // 11. Unregister round-trip
-    test_check(axl_protocol_unregister(handle_a, "axl-test-svc-A", &my_iface_a) == AXL_OK,
+    test_check(axl_protocol_unregister("axl-test-svc-A", &my_iface_a, handle_a) == AXL_OK,
                "protocol: unregister succeeds");
     found = NULL;
     test_check(axl_protocol_find("axl-test-svc-A", &found) != AXL_OK,
@@ -3311,7 +3765,7 @@ test_protocol_registry(void)
     test_check(axl_protocol_find("axl-test-svc-no-pin", &found_b) == AXL_OK
                && found_b == &my_iface_b,
                "protocol: find resolves un-pinned name via same FNV fallback");
-    test_check(axl_protocol_unregister(handle_b, "axl-test-svc-no-pin", &my_iface_b) == AXL_OK,
+    test_check(axl_protocol_unregister("axl-test-svc-no-pin", &my_iface_b, handle_b) == AXL_OK,
                "protocol: unregister succeeds for un-pinned name");
 }
 
@@ -3483,7 +3937,7 @@ test_shared_driver(void)
                "shared_driver_publish: locate returns same iface");
 
     test_check(axl_shared_driver_unpublish("shared-driver-test",
-                                           h, &my_vtable) == AXL_OK,
+                                           &my_vtable, h) == AXL_OK,
                "shared_driver_unpublish: round-trip unregister");
 
     /* After unpublish, the GUID no longer resolves. */
@@ -3515,9 +3969,9 @@ test_shared_driver(void)
                "shared_driver_publish: reuses *out_handle when pre-set");
     /* Cleanup both registrations on the shared handle. */
     test_check(axl_shared_driver_unpublish("shared-driver-test-reuse",
-                                           pinned, &sentinel_a) == AXL_OK
+                                           &sentinel_a, pinned) == AXL_OK
                && axl_shared_driver_unpublish("shared-driver-test-reuse-2",
-                                              pinned, &sentinel_b) == AXL_OK,
+                                              &sentinel_b, pinned) == AXL_OK,
                "shared_driver_unpublish: handle-reuse cleanup");
 
     /* Unload API guards: NULL name rejected. Driver-not-loaded path
@@ -3565,7 +4019,7 @@ test_shared_driver(void)
                "shared_driver_unload: surfaces UnloadImage failure on non-image handle");
     /* Cleanup: explicit unpublish + remove the synthetic protocol. */
     test_check(axl_shared_driver_unpublish("shared-driver-non-image-test",
-                                           synth_h, &sentinel_synth) == AXL_OK
+                                           &sentinel_synth, synth_h) == AXL_OK
                && axl_protocol_uninstall(synth_h, &synth_guid,
                                                &sentinel_synth) == AXL_OK,
                "shared_driver_unload: cleanup non-image handle");
@@ -3599,7 +4053,7 @@ test_shared_driver(void)
         }
         (void)axl_shared_driver_unload("shared-driver-loop-test");
         axl_shared_driver_unpublish("shared-driver-loop-test",
-                                    loop_h, &sentinel_loop);
+                                    &sentinel_loop, loop_h);
     }
     axl_mem_get_stats(&stats_after);
     /* Exact equality: in-flight allocation count returns to the
@@ -3794,7 +4248,8 @@ test_smbios_extras(void)
 
 /* These vendor GUIDs are fictitious — their only role is to give
    the registration test distinct backend tokens. AxlNvstore stores
-   the pointer, not the bytes, so the values never reach firmware. */
+   the pointer but matches on the 16 GUID bytes, so the values never
+   reach firmware. */
 static const AxlGuid TEST_VENDOR_A = AXL_GUID(
     0xA0000001, 0x0001, 0x0001,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01);
@@ -3821,7 +4276,30 @@ test_nvstore_namespaces(void)
     test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_A) == AXL_OK,
                "nvstore: re-register vendor-a (same token, idempotent)");
 
-    /* Re-register with a DIFFERENT token rejects. */
+    /* Re-register with a DIFFERENT OBJECT holding the SAME BYTES also
+       succeeds: two translation units each keeping a private
+       `static const AxlGuid` for one shared namespace is the obvious
+       pattern (the API takes a `const void *`), and matching by pointer
+       rejected the second one — leaving every get/set that TU made
+       pointed at an unregistered namespace.
+
+       The copy is filled at run time into a distinct static object so
+       no compiler/linker constant merging can hand it the same address
+       as TEST_VENDOR_A; that would let this test pass against the old
+       pointer compare. The address assertion below pins that premise. */
+    static AxlGuid vendor_a_copy;
+    axl_memcpy(&vendor_a_copy, &TEST_VENDOR_A, sizeof(vendor_a_copy));
+    test_check((const AxlGuid *)&vendor_a_copy != &TEST_VENDOR_A,
+               "nvstore: equal-bytes token is a genuinely distinct object");
+    test_check(axl_guid_equal(&vendor_a_copy, &TEST_VENDOR_A),
+               "nvstore: equal-bytes token really is byte-equal");
+    test_check(axl_nvstore_register_namespace("vendor-a", &vendor_a_copy) == AXL_OK,
+               "nvstore: re-register vendor-a (distinct object, equal bytes)");
+
+    /* Re-register with a DIFFERENT token rejects. Placed after the
+       equal-bytes re-register so it also proves that re-register did
+       not append a second "vendor-a" row — the lookup still finds the
+       original entry and still rejects a genuine GUID collision. */
     test_check(axl_nvstore_register_namespace("vendor-a", &TEST_VENDOR_B) == AXL_ERR,
                "nvstore: re-register vendor-a (different token) fails");
 
@@ -3841,6 +4319,280 @@ test_nvstore_namespaces(void)
     int g_rc = axl_nvstore_get("global", "SecureBoot", &sb, &sb_sz);
     test_check(g_rc == AXL_OK || g_rc == AXL_ERR,
                "nvstore: get(global, SecureBoot) returns 0 or -1");
+}
+
+// ---------------------------------------------------------------------------
+// AxlAttempt — breadcrumb / quarantine / bounded result log
+//
+// The crash paths are NOT exercised here and cannot be: the engine exists for
+// the case where a risky operation hangs or resets the box, and QEMU has no
+// way to stage that without wedging the run. What is covered is the
+// BOOKKEEPING — the durable state a real crash would leave behind, written
+// and read back explicitly. A genuine hang -> reset -> recover cycle is
+// real-hardware territory (see feedback_uefi_firmware_test_hazards).
+// ---------------------------------------------------------------------------
+
+static const AxlGuid TEST_ATTEMPT_GUID = AXL_GUID(
+    0xA7000003, 0x0003, 0x0003,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03);
+
+static void
+test_attempt(void)
+{
+    AxlAttempt at;
+
+    test_check(axl_attempt_init(NULL, "ns", &TEST_ATTEMPT_GUID) == AXL_ERR,
+               "attempt: init NULL descriptor -> AXL_ERR");
+    test_check(axl_attempt_init(&at, NULL, &TEST_ATTEMPT_GUID) == AXL_ERR,
+               "attempt: init NULL ns -> AXL_ERR");
+    test_check(axl_attempt_init(&at, "ns", NULL) == AXL_ERR,
+               "attempt: init NULL vendor -> AXL_ERR");
+
+    test_check(axl_attempt_init(&at, "axltest-attempt", &TEST_ATTEMPT_GUID) == AXL_OK,
+               "attempt: init registers the namespace");
+
+    /* The defaults ARE an on-disk format. Pin them: a consumer with state
+       already in NVRAM inherits these when it doesn't override, so a silent
+       change here orphans that state. */
+    test_check(axl_strcmp(at.trying_key, "Trying") == 0,
+               "attempt: default trying_key is Trying");
+    test_check(axl_strcmp(at.quarantine_key, "Quarantine") == 0,
+               "attempt: default quarantine_key is Quarantine");
+    test_check(axl_strcmp(at.log_key, "Log") == 0,
+               "attempt: default log_key is Log");
+    test_check(at.name_max == 64, "attempt: default name_max is 64");
+    test_check(at.quarantine_max == 1024, "attempt: default quarantine_max is 1024");
+    test_check(at.log_max == 2048, "attempt: default log_max is 2048");
+    test_check(at.flags == (AXL_NV_PERSISTENT | AXL_NV_BOOT),
+               "attempt: default flags are PERSISTENT|BOOT");
+
+    /* A failed init must leave an INERT descriptor, for EVERY failure reason.
+       Callers are entitled to ignore the return (every op is best-effort), so
+       a stack AxlAttempt left holding garbage would fault the box in the one
+       module whose job is to not do that. Inert means: ns is NULL and the
+       descriptor is disarmed, so a subsequent begin/end/etc. is a clean no-op
+       -- never a wild deref, and never a misdirected write (a NULL ns would
+       otherwise resolve to the GLOBAL namespace and silently write there).
+
+       Pre-fill each `bad`/`dirty` descriptor with 0xFF so "uninitialized"
+       means WILD values, not a happens-to-be-zero stack: that makes these
+       genuine tests of the init path. If init left the garbage in place, the
+       begin() below derefs a wild ns pointer -> #GP -> the boot dies right
+       here and NONE of the later assertions run. That the suite reaches its
+       Results footer at all is itself the proof of inertness. */
+
+    /* Reason 1: namespace-registration failure. "axltest-attempt" is already
+       bound to TEST_ATTEMPT_GUID above, so re-binding it to a different
+       vendor fails inside axl_nvstore_register_namespace. */
+    AxlAttempt bad;
+    axl_memset(&bad, 0xFF, sizeof bad);
+    test_check(axl_attempt_init(&bad, "axltest-attempt", &TEST_VENDOR_B) == AXL_ERR,
+               "attempt: init on a ns bound to another vendor -> AXL_ERR");
+    test_check(bad.ns == NULL && bad.name_max == 64 && bad.log_max == 2048,
+               "attempt: register-failed init is inert (ns NULL, fields filled)");
+    test_check(axl_attempt_begin(&bad, "x.efi") == false,
+               "attempt: begin on a register-failed descriptor is a safe no-op");
+    axl_attempt_end(&bad);   /* must not fault or delete anything */
+
+    /* Reason 2: NULL ns -- the argument-validation early return. This is the
+       path the register-first fix left uncovered: a valid `dirty` descriptor,
+       a NULL ns, AXL_ERR returned, and (before the fix) not one field written
+       so `dirty` stays 0xFF garbage. */
+    AxlAttempt dirty;
+    axl_memset(&dirty, 0xFF, sizeof dirty);
+    test_check(axl_attempt_init(&dirty, NULL, &TEST_ATTEMPT_GUID) == AXL_ERR,
+               "attempt: init NULL ns -> AXL_ERR (dirty struct)");
+    test_check(dirty.ns == NULL,
+               "attempt: NULL-ns init leaves an inert descriptor, not garbage");
+    test_check(axl_attempt_begin(&dirty, "x.efi") == false,
+               "attempt: begin on a NULL-ns-failed descriptor is a safe no-op");
+
+    /* Reason 3: NULL vendor -- same early return, other argument. */
+    axl_memset(&dirty, 0xFF, sizeof dirty);
+    test_check(axl_attempt_init(&dirty, "ns", NULL) == AXL_ERR,
+               "attempt: init NULL vendor -> AXL_ERR (dirty struct)");
+    test_check(dirty.ns == NULL,
+               "attempt: NULL-vendor init leaves an inert descriptor, not garbage");
+    test_check(axl_attempt_begin(&dirty, "x.efi") == false,
+               "attempt: begin on a NULL-vendor-failed descriptor is a safe no-op");
+    axl_attempt_end(&dirty);   /* must not fault */
+
+    /* NULL-safety on every entry point: these are the only error paths that
+       are OUR validation rather than the firmware's, so they're the only
+       negatives safe to assert. */
+    char nbuf[64];
+    test_check(axl_attempt_begin(NULL, "x.efi") == false,
+               "attempt: begin NULL descriptor -> false");
+    test_check(axl_attempt_begin(&at, NULL) == false,
+               "attempt: begin NULL name -> false");
+    test_check(axl_attempt_pending(NULL, nbuf, sizeof nbuf) == false,
+               "attempt: pending NULL descriptor -> false");
+    test_check(axl_attempt_pending(&at, NULL, sizeof nbuf) == false,
+               "attempt: pending NULL buffer -> false");
+    test_check(axl_attempt_pending(&at, nbuf, 0) == false,
+               "attempt: pending zero cap -> false");
+    test_check(axl_attempt_recover(NULL, nbuf, sizeof nbuf) == AXL_ERR,
+               "attempt: recover NULL descriptor -> AXL_ERR");
+    test_check(axl_attempt_recover(&at, NULL, sizeof nbuf) == AXL_ERR,
+               "attempt: recover NULL buffer -> AXL_ERR");
+    test_check(axl_attempt_is_quarantined(NULL, "x.efi") == false,
+               "attempt: is_quarantined NULL descriptor -> false");
+    test_check(axl_attempt_is_quarantined(&at, NULL) == false,
+               "attempt: is_quarantined NULL name -> false");
+    test_check(axl_attempt_quarantine_read(NULL, nbuf, sizeof nbuf) == false,
+               "attempt: quarantine_read NULL descriptor -> false");
+    test_check(axl_attempt_log_read(NULL, nbuf, sizeof nbuf) == false,
+               "attempt: log_read NULL descriptor -> false");
+    /* Void entry points must absorb NULL rather than fault. */
+    axl_attempt_end(NULL);
+    axl_attempt_clear(NULL);
+    axl_attempt_log(NULL, "x");
+    axl_attempt_log(&at, NULL);
+    axl_attempt_quarantine(NULL, "x");
+    axl_attempt_quarantine(&at, NULL);
+    test_check(true, "attempt: void entry points absorb NULL without faulting");
+
+    /* A name that can't be read back must not be written: axl_nvstore_get
+       fails outright (not truncates) on an over-long value, so the breadcrumb
+       would be one recovery could never see or clear. */
+    char toolong[80];
+    axl_memset(toolong, 'a', sizeof toolong - 1);
+    toolong[sizeof toolong - 1] = '\0';
+    test_check(axl_attempt_begin(&at, toolong) == false,
+               "attempt: begin refuses a name longer than name_max");
+
+    /* Everything below writes NVRAM. Firmware may refuse (read-only /
+       authenticated variable policy); skip cleanly rather than fail. */
+    axl_attempt_clear(&at);
+    if (!axl_attempt_begin(&at, "Aaa.efi")) {
+        axl_printf("SKIP: attempt round-trip (NVRAM write refused)\n");
+        /* Balance the 13 assertions in the populated branch. */
+        test_check(true, "attempt: SKIP balance 1");
+        test_check(true, "attempt: SKIP balance 2");
+        test_check(true, "attempt: SKIP balance 3");
+        test_check(true, "attempt: SKIP balance 4");
+        test_check(true, "attempt: SKIP balance 5");
+        test_check(true, "attempt: SKIP balance 6");
+        test_check(true, "attempt: SKIP balance 7");
+        test_check(true, "attempt: SKIP balance 8");
+        test_check(true, "attempt: SKIP balance 9");
+        test_check(true, "attempt: SKIP balance 10");
+        test_check(true, "attempt: SKIP balance 11");
+        test_check(true, "attempt: SKIP balance 12");
+        test_check(true, "attempt: SKIP balance 13");
+        return;
+    }
+
+    /* 1: the breadcrumb is durable and reads back exactly. */
+    nbuf[0] = '\0';
+    test_check(axl_attempt_pending(&at, nbuf, sizeof nbuf) &&
+               axl_strcmp(nbuf, "Aaa.efi") == 0,
+               "attempt: pending reads back the exact breadcrumb");
+
+    /* 2: end() erases it — the attempt returned, so there is no culprit. */
+    axl_attempt_end(&at);
+    test_check(axl_attempt_pending(&at, nbuf, sizeof nbuf) == false,
+               "attempt: end clears the breadcrumb");
+
+    /* 3: no breadcrumb means the last run completed — nothing to recover. */
+    test_check(axl_attempt_recover(&at, nbuf, sizeof nbuf) == 0,
+               "attempt: recover with no breadcrumb -> 0");
+    test_check(axl_attempt_is_quarantined(&at, "Aaa.efi") == false,
+               "attempt: a clean run quarantines nothing");
+
+    /* 4: a surviving breadcrumb IS the crash signal. This is the closest the
+       harness gets to a crash: the durable state a real hang would leave,
+       staged by hand. It does NOT exercise the hang itself. */
+    axl_attempt_begin(&at, "Aaa.efi");
+    nbuf[0] = '\0';
+    test_check(axl_attempt_recover(&at, nbuf, sizeof nbuf) == 1 &&
+               axl_strcmp(nbuf, "Aaa.efi") == 0,
+               "attempt: recover reports the surviving breadcrumb as the culprit");
+    test_check(axl_attempt_is_quarantined(&at, "Aaa.efi"),
+               "attempt: recover quarantines the culprit");
+    test_check(axl_attempt_pending(&at, nbuf, sizeof nbuf) == false,
+               "attempt: recover clears the breadcrumb (no re-blame next boot)");
+    test_check(axl_attempt_is_quarantined(&at, "Bbb.efi") == false,
+               "attempt: quarantine is per-name, not a global flag");
+
+    /* 5: the list renders as '\n'-separated lines, dedup'd. */
+    axl_attempt_quarantine(&at, "Aaa.efi");   /* already there */
+    axl_attempt_quarantine(&at, "Bbb.efi");
+    char qbuf[128];
+    test_check(axl_attempt_quarantine_read(&at, qbuf, sizeof qbuf) &&
+               axl_strcmp(qbuf, "Aaa.efi\nBbb.efi\n") == 0,
+               "attempt: quarantine_read renders dedup'd '\\n'-separated lines");
+
+    /* 6: the log is the caller's vocabulary, appended verbatim and dedup'd. */
+    axl_attempt_log(&at, "OK Aaa.efi");
+    axl_attempt_log(&at, "CRASH Bbb.efi");
+    axl_attempt_log(&at, "OK Aaa.efi");   /* duplicate -> ignored */
+    char lbuf[128];
+    test_check(axl_attempt_log_read(&at, lbuf, sizeof lbuf) &&
+               axl_strcmp(lbuf, "OK Aaa.efi\nCRASH Bbb.efi\n") == 0,
+               "attempt: log_read renders the caller's lines verbatim, dedup'd");
+
+    /* 7: a buffer too small to hold the value fails rather than truncating —
+       the same bound that makes over-long names unwritable. */
+    char tiny[4];
+    test_check(axl_attempt_log_read(&at, tiny, sizeof tiny) == false,
+               "attempt: log_read into an undersized buffer fails, never truncates");
+
+    /* 8: clear is the operator's "forget everything", including un-quarantining. */
+    axl_attempt_clear(&at);
+    test_check(axl_attempt_is_quarantined(&at, "Aaa.efi") == false,
+               "attempt: clear un-quarantines");
+    test_check(axl_attempt_log_read(&at, lbuf, sizeof lbuf) == false,
+               "attempt: clear empties the log");
+}
+
+// ---------------------------------------------------------------------------
+// axl_driver_load_dir_guarded — safe negatives only
+//
+// The positive path LOADS ARBITRARY FIRMWARE IMAGES, which is the exact
+// hazard the guard exists for and the exact thing that wedges a QEMU run.
+// Only our own pre-firmware validation is asserted here; the guarded sweep
+// itself is exercised by the netload integration test's seam and, for real
+// crashes, on hardware.
+// ---------------------------------------------------------------------------
+
+static void
+test_driver_load_dir_guarded(void)
+{
+    size_t n = 12345;
+    test_check(axl_driver_load_dir_guarded(NULL, "*.efi", NULL, &n) == AXL_ERR,
+               "load_dir_guarded: NULL dir -> AXL_ERR");
+    test_check(axl_driver_load_dir(NULL, "*.efi", &n) == AXL_ERR,
+               "load_dir: NULL dir -> AXL_ERR (unchanged contract)");
+
+    /* A missing directory is "not an error, just 0 loaded" — the contract
+       axl_driver_load_dir has always had. The guarded variant must not
+       change it, with or without a guard. */
+    n = 12345;
+    test_check(axl_driver_load_dir("fs0:\\axl-no-such-dir", "*.efi", &n) == AXL_OK &&
+               n == 0,
+               "load_dir: missing dir -> AXL_OK, 0 loaded");
+    n = 12345;
+    test_check(axl_driver_load_dir_guarded("fs0:\\axl-no-such-dir", "*.efi",
+                                           NULL, &n) == AXL_OK && n == 0,
+               "load_dir_guarded: NULL guard behaves exactly like load_dir");
+
+    AxlAttempt at;
+    if (axl_attempt_init(&at, "axltest-guard", &TEST_ATTEMPT_GUID) != AXL_OK) {
+        axl_printf("SKIP: load_dir_guarded live guard (namespace unavailable)\n");
+        /* Balance the 2 assertions in the populated branch. */
+        test_check(true, "load_dir_guarded: SKIP balance 1");
+        test_check(true, "load_dir_guarded: SKIP balance 2");
+        return;
+    }
+    n = 12345;
+    test_check(axl_driver_load_dir_guarded("fs0:\\axl-no-such-dir", "*.efi",
+                                           &at, &n) == AXL_OK && n == 0,
+               "load_dir_guarded: a guard doesn't change the missing-dir contract");
+    /* Recovery runs before the walk, so an empty sweep leaves no breadcrumb. */
+    char cul[64];
+    test_check(axl_attempt_pending(&at, cul, sizeof cul) == false,
+               "load_dir_guarded: an empty sweep leaves no breadcrumb outstanding");
 }
 
 // ---------------------------------------------------------------------------
@@ -4627,6 +5379,61 @@ test_shell_launch(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_shell_sources: report each Shell source independently (the FV-first
+// companion to the file-first axl_shell_locate). Deterministic under
+// OVMF/AAVMF, which both embed the ShellPkg Shell in a readable FV — so the
+// FV source is always present here, INDEPENDENTLY of whether a Shell.efi file
+// is staged (which axl_shell_locate would otherwise mask). The real
+// "a file AND the FV both exist" un-masking case is pinned end-to-end by
+// test-shell-coexist-qemu.sh (it stages a Shell.efi under OVMF).
+// ---------------------------------------------------------------------------
+
+static void
+test_shell_sources(void)
+{
+    /* Safe negative: NULL out is rejected without a query. */
+    test_check(axl_shell_sources(NULL) == AXL_ERR,
+               "shell_sources: NULL out returns AXL_ERR");
+
+    /* A completed query is AXL_OK even if it finds nothing. Poison the struct
+       first so every asserted field reflects a real write, not leftover stack. */
+    AxlShellSources s;
+    axl_memset(&s, 0xAB, sizeof(s));
+    test_check(axl_shell_sources(&s) == AXL_OK,
+               "shell_sources: query returns AXL_OK");
+
+    /* The un-masking guarantee: the firmware-embedded FV Shell is reported on
+       its own. OVMF/AAVMF always embed it, so fv is true here regardless of
+       any file — the exact availability axl_shell_locate hides once a file
+       exists. */
+    test_check(s.fv == true,
+               "shell_sources: FV Shell reported (OVMF/AAVMF embed it)");
+    test_check(s.fv_count >= 1,
+               "shell_sources: at least one Shell FV GUID matched");
+    test_check(s.fv == (s.fv_count > 0),
+               "shell_sources: fv == (fv_count > 0) invariant");
+
+    /* file_path is a valid C string, non-empty exactly when a file was found.
+       Both branches assert once, so the check count is arch-constant (no
+       SKIP-balance needed regardless of whether a runner staged a Shell.efi). */
+    if (s.file) {
+        test_check(s.file_path[0] != '\0',
+                   "shell_sources: file_path set when a file is present");
+    } else {
+        test_check(s.file_path[0] == '\0',
+                   "shell_sources: file_path empty when no file present");
+    }
+
+    /* The two APIs agree: axl_shell_locate is exactly the file-first
+       projection of the independent sources. Deterministic either way. */
+    AxlShellSource loc    = axl_shell_locate();
+    AxlShellSource expect = s.file ? AXL_SHELL_FILE
+                          : (s.fv ? AXL_SHELL_FIRMWARE : AXL_SHELL_NONE);
+    test_check(loc == expect,
+               "shell_sources: locate() == file-first projection of sources()");
+}
+
+// ---------------------------------------------------------------------------
 // axl_shell_kind: which shell is hosting this image. The unit suite is
 // launched from startup.nsh under the modern EDK2 UEFI Shell, so
 // EFI_SHELL_PROTOCOL is present (the same protocol the file-I/O tests above
@@ -4640,6 +5447,36 @@ test_shell_kind(void)
 {
     test_check(axl_shell_kind() == AXL_SHELL_KIND_UEFI,
                "shell_kind: EDK2 shell present -> AXL_SHELL_KIND_UEFI");
+}
+
+// ---------------------------------------------------------------------------
+// axl_shell_execute -- public wrapper over the internal shell-Execute bridge
+// (axl_backend_shell_execute) several AXL modules already use. The positive
+// path spawns a nested shell command via EFI_SHELL_PROTOCOL.Execute / the old
+// EFI 1.x SHELL_ENVIRONMENT.Execute -- untried from inside the combined unit
+// boot anywhere in this suite (axl_map_refresh, the nearest existing caller,
+// has no positive-path unit coverage either), so this stays a safe negative
+// only, per the same reasoning as axl_image_run/axl_shell_launch above.
+//
+// Real behavioral coverage: netload's run_shell_cmd now calls this function
+// directly, and test/integration/test-netload-qemu.sh's --diag/--dump/--dh
+// assertions already exercise that call on the modern shell under OVMF
+// (bucket C -- a behavior-preserving swap under an existing test). The old
+// EFI 1.x SHELL_ENVIRONMENT.Execute fallback underneath (shared with
+// axl_map_refresh, which mkrd drives) is pinned on real EFI Toolkit
+// firmware by test/integration/test-old-shell-qemu.sh -- but through
+// axl_map_refresh's call, not this new entry point specifically, since
+// nothing in this repo yet calls axl_shell_execute on the old shell. OVMF
+// cannot reproduce that shell, so this wrapper's OWN EFI 1.x path has no
+// QEMU coverage either way.
+// ---------------------------------------------------------------------------
+
+static void
+test_shell_execute(void)
+{
+    /* NULL is rejected before any UTF-8/UCS-2 conversion or shell call. */
+    test_check(axl_shell_execute(NULL) == AXL_ERR,
+               "shell_execute: NULL cmd -> AXL_ERR");
 }
 
 // ---------------------------------------------------------------------------
@@ -4801,6 +5638,250 @@ cm_tap_end(AxlConsoleTap *t)
     cm_enc = NULL;
 }
 
+/* --- The ops tee: one producer, N consumers ------------------------------------
+   The composition the ops contract could not express (a producer takes exactly one
+   AxlConsoleOps *), and the reason it belongs in the SDK rather than in each
+   consumer: two ops return NEGOTIATION, not status, so a naive forwarder silently
+   desyncs a consumer's grid. */
+typedef struct {
+    int  clears;
+    int  texts;
+    int  scrolls;         /* scrollrect calls RECEIVED (proves fan-out, not short-circuit) */
+    int  props;
+    bool accept_scroll;   /* what this consumer answers to scrollrect */
+    bool accept_prop;
+} TeeSpy;
+
+static void tee_spy_clear(void *user) { ((TeeSpy *)user)->clears++; }
+
+static void
+tee_spy_text(void *user, const char *u, size_t n)
+{
+    (void)u;
+    (void)n;
+    ((TeeSpy *)user)->texts++;
+}
+
+static int
+tee_spy_scrollrect(void *user, AxlConsoleRect rect, int32_t dn, int32_t rt)
+{
+    (void)rect;
+    (void)dn;
+    (void)rt;
+    TeeSpy *s = (TeeSpy *)user;
+    s->scrolls++;
+    return s->accept_scroll ? 1 : 0;
+}
+
+static int
+tee_spy_prop(void *user, AxlConsoleProp prop, const AxlConsoleValue *val)
+{
+    (void)prop;
+    (void)val;
+    TeeSpy *s = (TeeSpy *)user;
+    s->props++;
+    return s->accept_prop ? 1 : 0;
+}
+
+static const AxlConsoleOps TEE_SPY_OPS = {
+    .clear_screen  = tee_spy_clear,
+    .output_text   = tee_spy_text,
+    .scrollrect    = tee_spy_scrollrect,
+    .set_term_prop = tee_spy_prop,
+};
+
+static void
+test_console_ops_tee(void)
+{
+    /* Guards. */
+    test_check(axl_console_tee_ops(NULL, NULL) == NULL, "tee: ops(NULL) -> NULL");
+    axl_console_tee_free(NULL);   /* NULL-safe */
+    test_check(axl_console_tee_add(NULL, &TEE_SPY_OPS, NULL) == AXL_ERR,
+               "tee: add(NULL tee) -> -1");
+
+    AxlConsoleTee *t = axl_console_tee_new();
+    test_check(t != NULL, "tee: new -> instance");
+    test_check(axl_console_tee_add(t, NULL, NULL) == AXL_ERR, "tee: add(NULL ops) -> -1");
+
+    TeeSpy a = { .accept_scroll = true, .accept_prop = true };
+    TeeSpy b = { .accept_scroll = true, .accept_prop = true };
+    test_check(axl_console_tee_add(t, &TEE_SPY_OPS, &a) == AXL_OK, "tee: add first consumer");
+    test_check(axl_console_tee_add(t, &TEE_SPY_OPS, &b) == AXL_OK, "tee: add second consumer");
+    const size_t t_added = 2;   /* consumers in `t` so far; the cap check below fills up */
+
+    void                *tu  = NULL;
+    const AxlConsoleOps *ops = axl_console_tee_ops(t, &tu);
+    test_check(ops != NULL && tu == (void *)t, "tee: ops + context");
+
+    /* void ops reach EVERY consumer. */
+    ops->clear_screen(tu);
+    ops->output_text(tu, "x", 1);
+    test_check(a.clears == 1 && b.clears == 1, "tee: clear_screen fans to all");
+    test_check(a.texts == 1 && b.texts == 1, "tee: output_text fans to all");
+
+    /* scrollrect: all accept -> accepted, and BOTH were asked. */
+    AxlConsoleRect r = { 0 };
+    test_check(ops->scrollrect(tu, r, 1, 0) == 1, "tee: scrollrect accepted when all accept");
+    test_check(a.scrolls == 1 && b.scrolls == 1, "tee: scrollrect asks every consumer");
+
+    /* One declines -> the TEE must decline, or the accepting consumer scrolls while
+       the producer believes nothing moved and emits no damage to repair it. Every
+       consumer is still asked (no short-circuit), so the answer does not depend on
+       the order they were added in. */
+    b.accept_scroll = false;
+    test_check(ops->scrollrect(tu, r, 1, 0) == 0, "tee: scrollrect declined when any declines");
+    test_check(a.scrolls == 2 && b.scrolls == 2, "tee: no short-circuit on a decline");
+
+    /* A consumer that left scrollrect UNBOUND cannot scroll, so it counts as a
+       decline — otherwise the producer would skip the damage that consumer needs. */
+    AxlConsoleTee *t2 = axl_console_tee_new();
+    TeeSpy         c  = { .accept_scroll = true, .accept_prop = true };
+    static const AxlConsoleOps NOSCROLL_OPS = { .clear_screen = tee_spy_clear };
+    (void)axl_console_tee_add(t2, &TEE_SPY_OPS, &c);
+    (void)axl_console_tee_add(t2, &NOSCROLL_OPS, &c);
+    void                *tu2  = NULL;
+    const AxlConsoleOps *ops2 = axl_console_tee_ops(t2, &tu2);
+    test_check(ops2->scrollrect(tu2, r, 1, 0) == 0,
+               "tee: an unbound consumer scrollrect counts as declined");
+    axl_console_tee_free(t2);
+
+    /* set_term_prop follows the same all-must-accept rule. */
+    AxlConsoleValue on = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = true };
+    test_check(ops->set_term_prop(tu, AXL_CONSOLE_PROP_ALT_SCREEN, &on) == 1,
+               "tee: set_term_prop accepted when all accept");
+    b.accept_prop = false;
+    test_check(ops->set_term_prop(tu, AXL_CONSOLE_PROP_ALT_SCREEN, &on) == 0,
+               "tee: set_term_prop declined when any declines");
+    test_check(a.props == 2 && b.props == 2, "tee: set_term_prop asks every consumer");
+
+    /* The cap is a fixed array, so the refusal is what stops an add from writing past
+       it. Fill to exactly AXL_CONSOLE_TEE_MAX (2 are already in), then prove the next
+       one is refused AND that the accepted ones still all get called. */
+    TeeSpy fill = { .accept_scroll = true, .accept_prop = true };
+    for (size_t i = t_added; i < AXL_CONSOLE_TEE_MAX; i++) {
+        test_check(axl_console_tee_add(t, &TEE_SPY_OPS, &fill) == AXL_OK,
+                   "tee: add up to the cap succeeds");
+    }
+    test_check(axl_console_tee_add(t, &TEE_SPY_OPS, &fill) == AXL_ERR,
+               "tee: add past AXL_CONSOLE_TEE_MAX is refused");
+    fill.clears = 0;
+    a.clears    = 0;
+    ops->clear_screen(tu);
+    test_check(a.clears == 1 && fill.clears == (int)(AXL_CONSOLE_TEE_MAX - t_added),
+               "tee: a full tee fans to exactly its capacity, no more");
+
+    axl_console_tee_free(t);
+}
+
+/* --- The public VT encoder ----------------------------------------------------
+   The ops->VT serializer the mirror has always owned privately, exposed so the OTHER
+   producer (axl-console-device, the take-over strategy) can drive a remote terminal
+   too. A take-over console had no supported path to a byte stream before this: the
+   only public AxlConsoleOps consumer was axl-console-term, which rasterizes to a GOP
+   grid. The mirror is now tap+encoder, so these bytes and the mirror's are the same
+   code — test_console_mirror() and the altscreen/owned-mode tests below are the
+   byte-identity net for that refactor. */
+static void
+test_console_vt_enc(void)
+{
+    /* Guards. A sink is required: an encoder nobody can read is a misuse, and the
+       mirror has always rejected the same thing at install. */
+    test_check(axl_console_vt_enc_new(NULL) == NULL, "vt_enc: new(NULL cfg) -> NULL");
+    AxlConsoleVtEncConfig nosink = { .sink = NULL, .cols = 80, .rows = 25 };
+    test_check(axl_console_vt_enc_new(&nosink) == NULL, "vt_enc: new(NULL sink) -> NULL");
+    axl_console_vt_enc_free(NULL);          /* all NULL-safe, no crash */
+    axl_console_vt_enc_reset(NULL);
+    axl_console_vt_enc_set_size(NULL, 100, 40);
+    test_check(axl_console_vt_enc_ops(NULL, NULL) == NULL, "vt_enc: ops(NULL) -> NULL");
+    test_check(axl_console_vt_enc_snapshot(NULL, cm_cap_sink, NULL) == AXL_ERR,
+               "vt_enc: snapshot(NULL enc) -> -1");
+
+    AxlConsoleVtEncConfig cfg = { .sink = cm_cap_sink, .user = NULL,
+                                  .cols = 80, .rows = 25 };
+    AxlConsoleVtEnc *e = axl_console_vt_enc_new(&cfg);
+    test_check(e != NULL, "vt_enc: new -> instance");
+    test_check(axl_console_vt_enc_snapshot(e, NULL, NULL) == AXL_ERR,
+               "vt_enc: snapshot(NULL sink) -> -1");
+
+    void                *ops_user = NULL;
+    const AxlConsoleOps *ops      = axl_console_vt_enc_ops(e, &ops_user);
+    test_check(ops != NULL, "vt_enc: ops -> vtable");
+    test_check(ops_user == (void *)e, "vt_enc: ops context is the encoder");
+    /* ops(e, NULL) must not deref the out-param — a consumer that already knows the
+       context has no reason to ask for it again. */
+    test_check(axl_console_vt_enc_ops(e, NULL) == ops, "vt_enc: ops(e, NULL user) ok");
+
+    /* --- the wire format, exactly (these bytes are the mirror's, unchanged) --- */
+    cm_cap_reset();
+    ops->clear_screen(ops_user);
+    test_check(axl_strcmp(cm_cap, "\x1b[2J\x1b[H") == 0,
+               "vt_enc: clear_screen -> ESC[2J ESC[H");
+
+    cm_cap_reset();
+    ops->set_cursor(ops_user, 4, 9);
+    test_check(axl_strcmp(cm_cap, "\x1b[5;10H") == 0,
+               "vt_enc: set_cursor emits 1-based CUP");
+
+    /* Dedup: a full-screen app re-positions to the same cell to blink its cursor;
+       that must not flood the wire. */
+    cm_cap_reset();
+    ops->set_cursor(ops_user, 4, 9);
+    test_check(cm_cap_len == 0, "vt_enc: redundant set_cursor emits nothing");
+
+    /* reset() drops the dedup baseline, so the same position re-emits. */
+    axl_console_vt_enc_reset(e);
+    cm_cap_reset();
+    ops->set_cursor(ops_user, 4, 9);
+    test_check(axl_strcmp(cm_cap, "\x1b[5;10H") == 0,
+               "vt_enc: reset re-arms the cursor dedup");
+
+    cm_cap_reset();
+    ops->output_text(ops_user, "hi", 2);
+    test_check(axl_strcmp(cm_cap, "hi") == 0, "vt_enc: output_text passes bytes through");
+
+    /* Indexed pen -> the UEFI-mapped SGR. Index 14 maps to 33, NOT bright-yellow 93:
+       93 renders lime on many terminals and the EDK2 original chose 33. Pinning it
+       here so the refactor cannot quietly "fix" it. */
+    cm_cap_reset();
+    AxlConsolePen pen = { 0 };
+    pen.fg.kind = AXL_CONSOLE_COLOR_INDEXED; pen.fg.idx = 14;
+    pen.bg.kind = AXL_CONSOLE_COLOR_INDEXED; pen.bg.idx = 1;
+    ops->set_pen(ops_user, &pen);
+    test_check(axl_strcmp(cm_cap, "\x1b[0;33;44m") == 0,
+               "vt_enc: indexed pen -> SGR (UEFI 14 -> 33, not 93)");
+
+    /* Alt-screen and cursor visibility ride set_term_prop, and must be ACCEPTED
+       (return 1) or axl-vterm's grid desyncs from the parser. */
+    AxlConsoleValue on  = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = true };
+    AxlConsoleValue off = { .kind = AXL_CONSOLE_VALUE_BOOL, .u.boolean = false };
+    cm_cap_reset();
+    test_check(ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_ALT_SCREEN, &on) == 1,
+               "vt_enc: alt-screen prop accepted");
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049h") == 0, "vt_enc: alt-screen enter -> 1049h");
+    cm_cap_reset();
+    (void)ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_ALT_SCREEN, &off);
+    test_check(axl_strcmp(cm_cap, "\x1b[?1049l") == 0, "vt_enc: alt-screen leave -> 1049l");
+    cm_cap_reset();
+    (void)ops->set_term_prop(ops_user, AXL_CONSOLE_PROP_CURSOR_VISIBLE, &off);
+    test_check(axl_strcmp(cm_cap, "\x1b[?25l") == 0, "vt_enc: cursor hide -> DECTCEM l");
+
+    /* --- late join: the snapshot reproduces the CURRENT screen ---------------
+       The encoder feeds its own emitted VT into an internal screen model, so a
+       client that connects mid-session gets one self-contained repaint. Assert on
+       content rather than exact bytes (the repaint coalesces blanks). */
+    cm_cap_reset();
+    ops->clear_screen(ops_user);
+    ops->set_cursor(ops_user, 0, 0);
+    ops->output_text(ops_user, "LATE", 4);
+    cm_cap_reset();
+    test_check(axl_console_vt_enc_snapshot(e, cm_cap_sink, NULL) == AXL_OK,
+               "vt_enc: snapshot -> AXL_OK");
+    test_check(cm_cap_len > 0 && axl_strstr(cm_cap, "LATE") != NULL,
+               "vt_enc: snapshot repaints the on-screen text");
+
+    axl_console_vt_enc_free(e);
+}
+
 static void
 test_console_mirror(void)
 {
@@ -4811,13 +5892,13 @@ test_console_mirror(void)
     };
 
     /* Argument guards — none of these install, so the console is untouched. */
-    test_check(axl_console_mirror_install(NULL, &cfg) == AXL_ERR,
+    test_check(axl_console_mirror_install(&cfg, NULL) == AXL_ERR,
                "console_mirror: install(NULL out) returns -1");
-    test_check(axl_console_mirror_install(&m, NULL) == AXL_ERR,
+    test_check(axl_console_mirror_install(NULL, &m) == AXL_ERR,
                "console_mirror: install(NULL cfg) returns -1");
     AxlConsoleMirrorConfig no_sink = cfg;
     no_sink.sink = NULL;
-    test_check(axl_console_mirror_install(&m, &no_sink) == AXL_ERR,
+    test_check(axl_console_mirror_install(&no_sink, &m) == AXL_ERR,
                "console_mirror: install(NULL sink) returns -1");
     test_check(m == NULL,
                "console_mirror: out stays NULL on rejected install");
@@ -4960,13 +6041,28 @@ test_console_device_guards(void)
     AxlConsoleDevice             *d   = NULL;
     AxlConsoleDeviceConfig        cfg = { .cols = 80, .rows = 25 };
 
-    test_check(axl_console_device_install(NULL, &null_ops, NULL, &cfg) == AXL_ERR,
+    test_check(axl_console_device_install(&null_ops, NULL, &cfg, NULL) == AXL_ERR,
                "console_device: install(NULL out) returns -1");
-    test_check(axl_console_device_install(&d, NULL, NULL, &cfg) == AXL_ERR,
+    test_check(axl_console_device_install(NULL, NULL, &cfg, &d) == AXL_ERR,
                "console_device: install(NULL ops) returns -1");
-    test_check(axl_console_device_install(&d, &null_ops, NULL, NULL) == AXL_ERR,
+    test_check(axl_console_device_install(&null_ops, NULL, NULL, &d) == AXL_ERR,
                "console_device: install(NULL cfg) returns -1");
     test_check(d == NULL, "console_device: out stays NULL on rejected install");
+
+    /* passthrough_local co-paints with GraphicsConsole, so the two must agree on the
+       grid: an explicit geometry is refused rather than half-honoured (it would
+       garble the local display and re-open the ConsoleLogger stale-rows deadloop).
+       Rejected BEFORE any surgery, so this is safe to assert in the unit boot. */
+    AxlConsoleDeviceConfig pt_sized = { .passthrough_local = true, .cols = 142, .rows = 44 };
+    test_check(axl_console_device_install(&null_ops, NULL, &pt_sized, &d) == AXL_ERR,
+               "console_device: passthrough_local + explicit geometry rejected");
+    test_check(d == NULL, "console_device: out stays NULL on the passthrough geometry reject");
+    AxlConsoleDeviceConfig pt_cols = { .passthrough_local = true, .cols = 142 };
+    test_check(axl_console_device_install(&null_ops, NULL, &pt_cols, &d) == AXL_ERR,
+               "console_device: passthrough_local + explicit cols alone rejected");
+    AxlConsoleDeviceConfig pt_rows = { .passthrough_local = true, .rows = 44 };
+    test_check(axl_console_device_install(&null_ops, NULL, &pt_rows, &d) == AXL_ERR,
+               "console_device: passthrough_local + explicit rows alone rejected");
 
     /* inject_* are NULL-safe; the injected-key path proper is covered headlessly in
        test_console_device_input (a live install wedges the unit boot). */
@@ -4977,6 +6073,15 @@ test_console_device_guards(void)
                "console_device: inject_key_ex(NULL) returns -1");
     test_check(axl_console_device_inject_text(NULL, "x", 1) == AXL_ERR,
                "console_device: inject_text(NULL) returns -1");
+
+    /* get_size mirrors the tap's: NULL-safe, zeroes both outputs, and either output
+       pointer may be NULL. A passthrough consumer NEEDS this — its geometry is
+       whatever the physical console resolved to, and without a way to read it back
+       the consumer would size its screen model to a guessed 80x25. */
+    uint32_t gc = 7, gr = 9;
+    axl_console_device_get_size(NULL, &gc, &gr);
+    test_check(gc == 0 && gr == 0, "console_device: get_size(NULL) zeroes both outputs");
+    axl_console_device_get_size(NULL, NULL, NULL);   /* no crash on NULL outputs */
 
     /* NULL-safe session / geometry / alt-screen accessors. */
     axl_console_device_uninstall(NULL);
@@ -6463,8 +7568,7 @@ test_console_mirror_snapshot(void)
     cm_cap_reset();
     test_check(axl_console_mirror_snapshot(cm_enc, cm_cap_sink, NULL) == AXL_OK,
                "mirror_snapshot: returns AXL_OK");
-    AxlConsoleScreen *chk = NULL;
-    axl_console_screen_new(&chk, 25, 80);
+    AxlConsoleScreen *chk = axl_console_screen_new(25, 80);
     axl_console_screen_feed(chk, (const uint8_t *)cm_cap, cm_cap_len);
     AxlConsolePen pen2 = {0};
     test_check(_axl_console_screen_test_cell(chk, 2, 5, g, &pen2) && axl_strcmp(g, "H") == 0,
@@ -7817,6 +8921,61 @@ test_args_help_ascii_only(void)
     test_check(verb_sep, "args ascii: sub-verb header uses an ASCII '-' separator");
 }
 
+static int
+args_hidden_handler(AxlArgs *a)
+{
+    ArgsCapture *cap = (ArgsCapture *)axl_args_user_data(a);
+    cap->calls++;
+    cap->seen_string = axl_args_get_string(a, "_secret");
+    return 0;
+}
+
+/* A flag (or positional) marked .hidden is omitted from --help entirely but is
+   still parsed and delivered to the handler — the contract test/diagnostic
+   seams rely on. */
+static void
+test_args_hidden_flag(void)
+{
+    static const AxlArgDesc hflags[] = {
+        { .name = "shown",   .type = AXL_ARG_BOOL,
+          .help = "VISIBLE-HELP-TEXT" },
+        { .name = "_secret", .type = AXL_ARG_STRING, .hidden = true,
+          .help = "HIDDEN-HELP-TEXT" },
+        {0}
+    };
+    ArgsCapture cap = { 0 };
+    AxlArgsNode app = {
+        .name = "htool", .flags = hflags,
+        .handler = args_hidden_handler, .user_data = &cap,
+    };
+
+    /* (1) --help lists the visible flag but omits the hidden one. */
+    {
+        AxlStream *buf   = NULL;
+        AxlStream *saved = capture_stdout(&buf);
+        char *argv[] = { (char *)"htool", (char *)"--help" };
+        int rc = axl_args_run(2, argv, &app);
+        bool has_shown  = buf_contains(buf, "VISIBLE-HELP-TEXT");
+        bool has_secret = buf_contains(buf, "_secret")
+                          || buf_contains(buf, "HIDDEN-HELP-TEXT");
+        restore_stdout(saved, buf);
+        test_check(rc == 0, "args hidden: --help returns 0");
+        test_check(has_shown, "args hidden: visible flag shown in --help");
+        test_check(!has_secret, "args hidden: hidden flag omitted from --help");
+    }
+
+    /* (2) the hidden flag is still parsed and delivered to the handler. */
+    {
+        char *argv[] = { (char *)"htool", (char *)"--_secret", (char *)"xyzzy" };
+        int rc = axl_args_run(3, argv, &app);
+        test_check(rc == 0, "args hidden: hidden flag accepted (rc 0)");
+        test_check(cap.calls == 1, "args hidden: handler ran once");
+        test_check(cap.seen_string != NULL
+                   && axl_strcmp(cap.seen_string, "xyzzy") == 0,
+                   "args hidden: hidden flag value delivered to handler");
+    }
+}
+
 /* "?" is a help alias matching the legacy tool: at the top level, at a branch,
    and at a sub-verb leaf, a lone "?" prints the same help as -h/--help instead
    of being consumed as a positional value (which used to error). */
@@ -8200,6 +9359,7 @@ test_args(void)
     test_args_help_terse_format();
     test_args_help_ascii_only();
     test_args_help_question_alias();
+    test_args_hidden_flag();
     test_args_nested_2level_dispatch();
     test_args_nested_parent_flag_visible_at_leaf();
     test_args_nested_3level_dispatch();
@@ -9633,6 +10793,52 @@ test_debug_assert(void)
 #endif
 }
 
+/* C++ RAII autoptr — AXL_AUTOPTR must free the tar writer/reader and the
+   console terminal at scope exit. The tar objects borrow the stream (freed
+   separately); live-allocation count returning to baseline proves each
+   scope-exit free ran. */
+static void
+test_autoptr_util(void)
+{
+    /* tar writer */
+    AxlStream *ws = axl_bufopen();
+    test_check(ws != NULL, "autoptr: tar writer stream");
+    axl_tar_writer_free(axl_tar_writer_new(ws));   /* prime */
+    AxlMemStats before, after;
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlTarWriter) w = axl_tar_writer_new(ws);
+        test_check(w != NULL, "autoptr: tar writer new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: tar writer freed at scope exit");
+    axl_fclose(ws);
+
+    /* tar reader */
+    AxlStream *rs = axl_bufopen();
+    test_check(rs != NULL, "autoptr: tar reader stream");
+    axl_tar_reader_free(axl_tar_reader_new(rs));   /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlTarReader) r = axl_tar_reader_new(rs);
+        test_check(r != NULL, "autoptr: tar reader new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: tar reader freed at scope exit");
+    axl_fclose(rs);
+
+    /* console terminal */
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5 };
+    axl_console_term_free(axl_console_term_new(&cfg));   /* prime */
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlConsoleTerm) t = axl_console_term_new(&cfg);
+        test_check(t != NULL, "autoptr: console term new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: console term freed at scope exit");
+}
+
 int
 test_util_main(int argc, char **argv)
 {
@@ -9669,12 +10875,16 @@ test_util_main(int argc, char **argv)
     test_path_companion();
     test_dir_list_json();
     test_volume_enumerate();
+    test_volume_get_space();
+    test_volume_get_label_spellings();
     test_volume_map_name();
     test_volume_map_ops();
     test_path_search();
     test_smbios();
     test_smbios_extras();
     test_nvstore_namespaces();
+    test_attempt();
+    test_driver_load_dir_guarded();
     test_nvstore_roundtrip();
     test_boot();
     test_app_boot_path();
@@ -9687,7 +10897,11 @@ test_util_main(int argc, char **argv)
     test_cpu_enable_avx512();
     test_image();
     test_shell_launch();
+    test_shell_sources();
     test_shell_kind();
+    test_shell_execute();
+    test_console_ops_tee();
+    test_console_vt_enc();
     test_console_mirror();
     test_console_tap_guards();
     test_console_device_guards();
@@ -9741,8 +10955,10 @@ test_util_main(int argc, char **argv)
     test_config_descs_net_capacity();
     test_config_descs_net_round_trip();
     test_config_file();
+    test_config_file_string_round_trip();
     test_config_multi();
     test_config_to_from_string();
+    test_config_target_to_string_round_trip();
     test_config_callback();
     test_config_validation();
     test_config_setv();
@@ -9750,9 +10966,12 @@ test_util_main(int argc, char **argv)
     test_service_attach_driver();
     test_service_is_running();
     test_service_launch_embedded_validates();
+    test_driver_ensure_from_path();
     test_service_stop_validates();
     test_guid_v5();
     test_service_guid();
+    test_service_driver_init_status_width();
+    test_service_reload_validates();
     test_args();
     test_protocol_registry();
     test_driver_ensure();
@@ -9777,6 +10996,7 @@ test_util_main(int argc, char **argv)
     test_tar_long_name();
     test_tar_dir_entry();
     test_tar_reader_rejects_bad();
+    test_autoptr_util();
 
     return test_print_results();
 }

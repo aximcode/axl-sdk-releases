@@ -892,8 +892,8 @@ exposes an iteration primitive:
  *  or Ctrl-C. Does NOT set the loop's quit flag — the caller's
  *  outer run continues after this returns.
  *
- *  @return 0 on `done`, -1 on timeout, AXL_CANCELLED on Ctrl-C. */
-int axl_loop_iterate_until(
+ *  @return AXL_OK on `done`, AXL_TIMEOUT on timeout, AXL_CANCELLED on Ctrl-C. */
+AxlStatus axl_loop_iterate_until(
     AxlLoop  *loop,
     AxlEvent *done,         /* NULL = only timeout / cancel wakes */
     uint64_t  timeout_us);  /* 0 = wait forever */
@@ -948,7 +948,7 @@ uint32_t axl_atexit(AxlAtexitFn fn, void *data);
 void     axl_atexit_remove(uint32_t handle);
 
 /* axl-loop.h -- nested-wait primitive, see §5.6 */
-int axl_loop_iterate_until(
+AxlStatus axl_loop_iterate_until(
     AxlLoop  *loop,
     AxlEvent *done,        /* NULL = no done event */
     uint64_t  timeout_us); /* 0 = wait forever */

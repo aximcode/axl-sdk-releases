@@ -7,6 +7,7 @@
  * open() over a multi-page fs0: file and a save() round-trip. */
 
 #include "axl-test.h"
+#include "axl-test-flushfail-fs.h"
 
 #include <axl/axl-piece-tree.h>
 #include <axl/axl-page-cache.h>
@@ -1467,6 +1468,48 @@ test_piece_tree_save_over_self(void)
     axl_file_delete(SOS_PATH);
 }
 
+/* Regression: axl_piece_tree_save streamed the document to "<path>.tmp",
+   CLOSED it, and renamed the temp over the target -- promoting it on a close
+   whose status is unreportable (axl_backend_file_close returns AXL_OK
+   unconditionally; EFI_FILE_PROTOCOL.Close is specified to return only
+   EFI_SUCCESS). A full volume / write-protected media / device error
+   surfacing at flush time therefore replaced a good target file with a
+   temp whose bytes were never on the media, and reported AXL_OK.
+
+   The fixture volume accepts every write and fails only the flush, which is
+   exactly that case. Its oracle reads the backing store directly, so "the
+   target still holds what it held" is not asked of the same layer that
+   just lied about the save. */
+static void
+test_piece_tree_save_reports_a_failed_flush(void)
+{
+    if (!ff_fs_up()) {
+        axl_printf("SKIP: piece_tree save flush-fail (no shell map for the "
+                   "published volume)\n");
+        test_check(true, "pt flush-fail: save status SKIP balance");
+        test_check(true, "pt flush-fail: target SKIP balance");
+        test_check(true, "pt flush-fail: dirty SKIP balance");
+        return;
+    }
+
+    AxlPieceTree *pt    = axl_piece_tree_new();
+    bool          built = (pt != NULL
+                           && axl_piece_tree_insert(pt, 0, "clobber\n", 8)
+                                  == AXL_OK);
+
+    test_check(built
+               && ff_seed("doc", "keepme\n", 7)
+               && axl_piece_tree_save(pt, FF_PATH("doc")) == AXL_ERR,
+               "pt flush-fail: save whose flush fails returns AXL_ERR");
+    test_check(ff_content_is("doc", "keepme\n", 7),
+               "pt flush-fail: save did not promote the temp over the target");
+    test_check(pt != NULL && axl_piece_tree_is_modified(pt),
+               "pt flush-fail: a save that failed leaves the document dirty");
+
+    axl_piece_tree_free(pt);
+    ff_fs_down();
+}
+
 int
 test_piece_tree_main(int argc, char **argv)
 {
@@ -1491,6 +1534,7 @@ test_piece_tree_main(int argc, char **argv)
     test_piece_tree_open_cached();
     test_piece_tree_load_encoded_cached();
     test_piece_tree_save_over_self();
+    test_piece_tree_save_reports_a_failed_flush();
 
     return test_print_results();
 }

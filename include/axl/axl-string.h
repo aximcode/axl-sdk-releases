@@ -205,7 +205,7 @@ axl_string_str(
  */
 size_t
 axl_string_len(
-    AxlString *b  ///< string builder
+    const AxlString *b  ///< string builder
 );
 
 /**

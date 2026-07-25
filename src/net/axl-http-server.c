@@ -101,23 +101,32 @@ axl_http_server_new(uint16_t port)
     return axl_steal_pointer(&s);
 }
 
-void
-axl_http_server_free(AxlHttpServer *s)
+static void
+server_free_impl(AxlHttpServer *s, bool abortive)
 {
     if (s == NULL) {
         return;
     }
 
-    axl_debug("server free on port %u", (unsigned)s->port);
+    axl_debug("server free on port %u%s", (unsigned)s->port,
+              abortive ? " (abortive)" : "");
 
     if (s->listener != NULL) {
-        axl_tcp_close(s->listener);
+        if (abortive) {
+            axl_tcp_close(s->listener, AXL_TEARDOWN_RESET);
+        } else {
+            axl_tcp_close(s->listener, AXL_TEARDOWN_GRACEFUL);
+        }
     }
 
     if (s->conns != NULL) {
         for (size_t i = 0; i < s->max_conns; i++) {
             if (s->conns[i].active) {
-                reset_connection(&s->conns[i]);
+                if (abortive) {
+                    reset_connection_abortive(&s->conns[i]);
+                } else {
+                    reset_connection(&s->conns[i]);
+                }
             }
         }
         axl_free(s->conns);
@@ -152,6 +161,12 @@ axl_http_server_free(AxlHttpServer *s)
 
     axl_config_free(s->config);
     axl_free(s);
+}
+
+void
+axl_http_server_free(AxlHttpServer *s, AxlTeardown mode)
+{
+    server_free_impl(s, mode == AXL_TEARDOWN_RESET);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +459,7 @@ on_accept_ready(
     if (!s->running) {
         /* Server shutting down — stop accepting. */
         if (client != NULL) {
-            axl_tcp_close(client);
+            axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
         }
         return false;
     }
@@ -491,7 +506,7 @@ on_accept_ready(
                     axl_warning("TLS context creation failed for %s",
                                s->conns[i].client_addr);
                     s->conns[i].active = false;
-                    axl_tcp_close(client);
+                    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
                     return true;  /* keep accepting more clients */
                 }
                 s->conns[i].tls_ctx        = tls;
@@ -507,7 +522,7 @@ on_accept_ready(
                     axl_tls_free(tls);
                     s->conns[i].tls_ctx = NULL;
                     s->conns[i].active = false;
-                    axl_tcp_close(client);
+                    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
                 }
                 return true;  /* keep accepting; handshake continues async */
             }
@@ -524,7 +539,7 @@ on_accept_ready(
     // No free connection slots — reject the client
     //
     axl_debug("no free connection slots, rejecting client");
-    axl_tcp_close(client);
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
     return true;  /* keep accepting — next client may find a slot */
 }
 
@@ -558,14 +573,14 @@ on_tls_handshake_data(
         axl_tls_stage_data(conn->tls_ctx, conn->tls_cipher_buf, bytes);
     }
 
-    int rc = axl_tls_handshake_async(conn->tls_ctx, s->loop);
-    if (rc == 0) {
+    AxlTlsStatus rc = axl_tls_handshake_async(conn->tls_ctx, s->loop);
+    if (rc == AXL_TLS_OK) {
         /* Handshake complete — switch to normal request receive. */
         axl_debug("TLS handshake complete for %s", conn->client_addr);
         start_conn_recv(s, conn);
         return false;   /* start_conn_recv arms its own recv */
     }
-    if (rc > 0) {
+    if (rc == AXL_TLS_WANT_MORE) {
         return true;    /* need more handshake data — re-arm this recv */
     }
     axl_warning("TLS handshake failed for %s", conn->client_addr);

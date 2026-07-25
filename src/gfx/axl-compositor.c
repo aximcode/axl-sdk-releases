@@ -347,7 +347,7 @@ axl_compositor_output(AxlCompositor *c)
 // --- surfaces -------------------------------------------------------------
 
 AxlSurface *
-axl_surface_create(AxlSurface *parent, uint32_t w, uint32_t h)
+axl_surface_new(AxlSurface *parent, uint32_t w, uint32_t h)
 {
     if (parent == NULL || w == 0 || h == 0) {
         return NULL;
@@ -375,7 +375,7 @@ axl_surface_create(AxlSurface *parent, uint32_t w, uint32_t h)
 }
 
 void
-axl_surface_destroy(AxlSurface *s)
+axl_surface_free(AxlSurface *s)
 {
     if (s == NULL || s->node.parent == NULL) {
         return;   // NULL or the root (no parent)

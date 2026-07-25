@@ -66,7 +66,7 @@ service to the firmware notify-timer:
 
 ```c
 AxlLoop *loop = axl_loop_new();
-axl_service_attach_driver(loop, &my_service, 50);  /* 50 ms tick */
+axl_service_attach_driver(loop, &my_service);  /* tick = my_service.driver_tick_ms */
 /* ...firmware drives the loop until... */
 axl_service_detach_driver(loop, &my_service);
 axl_loop_free(loop);
@@ -109,6 +109,27 @@ Build:
 ```bash
 axl-cc --embed my-service-dxe.efi=my_driver launch.c -o launch.efi
 ```
+
+By default the driver image is resolved by name: the four-path search
+(`axl_driver_ensure`'s order), then the embedded blob. A launcher that
+staged its own driver and knows where it put it can skip all of that
+with `.driver_path`:
+
+```c
+d.driver_path = "fs0:\\svc\\my-service-dxe.efi";   /* exactly this file */
+```
+
+That routes through `axl_driver_ensure_from_path` — no search, no
+embedded fallback — so a stale `drivers/<arch>/my-service-dxe.efi`
+left by an older install cannot shadow the copy the launcher just
+staged. (It really can: a launcher sitting at the volume root has no
+usable image directory, so its own sibling is only search candidate
+#4 while `drivers/<arch>/` is #2.) `driver_name`, `driver_blob` and
+`driver_blob_len` all feed the default resolution only, so with a pin
+none of them is read — or required. `service` + `driver_path` is a
+complete deploy descriptor. Note `override_name` does NOT solve this: it substitutes
+a *name* into the same search, so it cannot separate two files that
+share a name.
 
 The symmetric stop verb is `axl_service_stop(&deploy)` — resolves
 the running image's handle via the protocol GUID and unloads it.
@@ -201,6 +222,61 @@ The wire format prefixes each `LoadOptions` payload with the
 buffer doesn't get misparsed as the AXL UTF-8 format. The
 driver-image macro logs and falls back to descriptor defaults
 on missing-magic.
+
+## Self-reload (in-place upgrade)
+
+`axl_service_reload(svc, new_path)` (and the memory-image
+`axl_service_reload_buffer(svc, image, len)`) hot-swap a running
+`AXL_SERVICE_DRIVER` service to a new version with no reboot and —
+if your teardown frees its server with `AXL_TEARDOWN_RESET` — no port
+downtime. Called from **inside** the service (e.g. an `/upgrade`
+handler on the service loop), it:
+
+  1. loads `new_path` as the replacement (validated *before*
+     anything is released — a load failure tears down nothing),
+  2. runs your teardown (releases the listen ports),
+  3. starts the replacement, handing it this image's handle + a
+     signal event via LoadOptions,
+  4. confirms the replacement actually published the service
+     protocol — `StartImage` succeeding is not proof it attached,
+     and this image still publishes the GUID itself, so the check
+     is "did the publisher *count* go up", not a plain
+     `LocateProtocol`,
+  5. detaches this loop and signals; the replacement rebinds the
+     ports, comes up resident, and — from its own timer tick, once
+     this image is off-stack — unloads and reclaims it.
+
+The handoff rides a second LoadOptions magic `AXLSVR1\0`, whose
+payload is `[magic][old-image-handle][event][config C-string]` —
+the replacement decodes the two handles, arms the event on its own
+loop, and reclaims the old image when it fires (never synchronously
+from the old image's stack, and never on a delay guess).
+
+Failure semantics: a load failure (bad path / corrupt image) tears
+down nothing and the service keeps running; a start failure after a
+successful load leaves the service down — teardown has run and the
+loop is detached (it no longer serves), but the image stays resident
+and still publishes the service GUID (`axl_service_is_running` still
+reports true) until it is unloaded or the system resets.
+
+The return code says which of those happened, so a caller does not
+have to conservatively roll back and cold-reset a box that never
+stopped serving. **`AXL_ERR` means — and only means — the service is
+DOWN**; every other non-OK code reports a failure that happened
+before anything was released:
+
+| return | meaning | this service |
+|---|---|---|
+| `AXL_OK` | replacement resident, handoff armed | replaced, serving |
+| `AXL_INVALID` | NULL / not-the-running `svc`, NULL path or image | untouched, serving |
+| `AXL_NOT_FOUND` | the replacement could not be **loaded** | untouched, serving |
+| `AXL_NO_RESOURCES` | options would not serialize, handoff event / LoadOptions could not be installed | untouched, serving |
+| `AXL_ERR` | the replacement loaded but failed to **start** | **DOWN — fatal** |
+
+Your teardown must be **idempotent** — the happy path runs it exactly
+once (the replacement's unload stub skips a second teardown), but the
+start-failure path can re-enter it from a later unload — and must
+not free the service loop.
 
 See `sdk/examples/service-demo.c` for the one-line `AXL_SERVICE`
 shape and `sdk/examples/service-demo-custom.c` for a hand-written

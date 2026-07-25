@@ -265,9 +265,11 @@ axl_udp_set_broadcast(
  * via axl_udp_connect (the configured peer is used). Otherwise
  * @p dest is required.
  *
- * @return AXL_OK on success, AXL_ERR on error or timeout.
+ * @return AXL_OK on success; AXL_CANCELLED if the 2-second send deadline
+ *     elapses first (the synchronous wrapper arms an internal timeout that
+ *     cancels the pending Transmit); AXL_ERR on a transmit or setup error.
  */
-int
+AxlStatus
 axl_udp_send(
     AxlUdp              *sock,  ///< socket
     const AxlIPv4Address *dest, ///< destination IPv4 address (NULL = use connected peer)
@@ -291,10 +293,10 @@ axl_udp_sendrecv(
     uint16_t                    port,      ///< destination port
     const void                 *tx_data,   ///< request payload
     size_t                      tx_len,    ///< request length
+    size_t                      timeout_ms,///< receive timeout in ms
     void                       *rx_buf,    ///< [out] response buffer
     size_t                      rx_size,   ///< response buffer capacity
-    size_t                     *rx_len,    ///< [out] bytes received
-    size_t                      timeout_ms ///< receive timeout in ms
+    size_t                     *rx_len     ///< [out] bytes received
 );
 
 /**

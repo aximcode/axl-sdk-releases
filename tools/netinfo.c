@@ -65,18 +65,16 @@ static const AxlArgDesc ping_pos[] = {
 static void
 show_nic_drivers(const char *label)
 {
+    AxlNetInterface *ifaces = NULL;
     size_t count = 0;
-    if (axl_net_list_interfaces(NULL, &count) != AXL_OK || count == 0) {
-        axl_printf("=== %s ===\n  (no network interfaces)\n\n", label);
-        return;
-    }
-
-    AxlNetInterface *ifaces = axl_calloc(count, sizeof(AxlNetInterface));
-    if (ifaces == NULL) {
+    if (axl_net_list_interfaces_alloc(&ifaces, &count) != AXL_OK) {
         axl_printf("=== %s ===\n  (out of memory)\n\n", label);
         return;
     }
-    axl_net_list_interfaces(ifaces, &count);
+    if (count == 0) {
+        axl_printf("=== %s ===\n  (no network interfaces)\n\n", label);
+        return;
+    }
 
     axl_printf("=== %s ===\n\n", label);
     for (size_t i = 0; i < count; i++) {
@@ -140,18 +138,16 @@ ensure_net_drivers_warn(void)
 static void
 show_interfaces(void)
 {
+    AxlNetInterface *ifaces = NULL;
     size_t count = 0;
-    if (axl_net_list_interfaces(NULL, &count) != AXL_OK || count == 0) {
-        axl_printf("No network interfaces found.\n");
-        return;
-    }
-
-    AxlNetInterface *ifaces = axl_calloc(count, sizeof(AxlNetInterface));
-    if (ifaces == NULL) {
+    if (axl_net_list_interfaces_alloc(&ifaces, &count) != AXL_OK) {
         axl_printf("NetInfo: out of memory\n");
         return;
     }
-    axl_net_list_interfaces(ifaces, &count);
+    if (count == 0) {
+        axl_printf("No network interfaces found.\n");
+        return;
+    }
 
     axl_printf("=== Network Interfaces ===\n\n");
     axl_printf("  %-4s %-18s %-6s %-16s %s\n",
@@ -165,10 +161,7 @@ show_interfaces(void)
 
         /* Format MAC */
         char mac_str[24];
-        axl_snprintf(mac_str, sizeof(mac_str),
-                     "%02x:%02x:%02x:%02x:%02x:%02x",
-                     iface->mac[0], iface->mac[1], iface->mac[2],
-                     iface->mac[3], iface->mac[4], iface->mac[5]);
+        axl_mac_format(iface->mac, mac_str, sizeof(mac_str));
 
         /* Format IP */
         char ip_str[20] = "-";
@@ -292,7 +285,9 @@ diag_show_pci_nics(void)
         if (((class_code >> 16) & 0xFF) != 0x02) continue;
 
         uint16_t vid = 0, did = 0;
-        axl_pci_get_vid_did(*p, &vid, &did);
+        if (axl_pci_get_vid_did(*p, &vid, &did) != AXL_OK) {
+            vid = did = 0;   /* unreadable ID -> display 0000:0000 */
+        }
 
         char addr_buf[AXL_PCI_ADDR_STR_MAX];
         axl_pci_addr_format(*p, addr_buf, sizeof(addr_buf));
@@ -537,6 +532,7 @@ do_try_verb(AxlArgs *a)
 
     if (!r.found) {
         axl_printf("  not found on the driver search path\n");
+        axl_free(r.bound_nic_macs);   /* NULL here; kept for a uniform cleanup */
         return 1;
     }
     axl_printf("  loaded=%s  SNP handles added=%u  link=%s\n",
@@ -544,10 +540,11 @@ do_try_verb(AxlArgs *a)
                r.snp_handles_added,
                r.link_up ? "up" : "down");
     for (size_t i = 0; i < r.bound_nic_count; i++) {
-        const uint8_t *m = r.bound_nic_macs[i];
-        axl_printf("  bound NIC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   m[0], m[1], m[2], m[3], m[4], m[5]);
+        char macbuf[18];
+        axl_mac_format(r.bound_nic_macs[i], macbuf, sizeof macbuf);
+        axl_printf("  bound NIC: %s\n", macbuf);
     }
+    axl_free(r.bound_nic_macs);   /* caller owns the MAC array */
     if (rc != AXL_OK) {
         axl_printf("  result: driver bound no NIC%s\n",
                    r.unloaded ? " (unloaded)" : "");

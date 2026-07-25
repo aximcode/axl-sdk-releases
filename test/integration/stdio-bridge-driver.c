@@ -110,7 +110,7 @@ driver_unload(AxlHandle h)
         return AXL_OK;
     }
     return axl_shared_driver_unpublish(STDIO_BRIDGE_FIX_NAME,
-                                       gPublishedHandle, &gVtable);
+                                       &gVtable, gPublishedHandle);
 }
 
 AXL_DRIVER(driver_main, driver_unload)

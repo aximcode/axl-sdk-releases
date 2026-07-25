@@ -62,10 +62,10 @@ typedef struct AxlPageCache AxlPageCache;
  * @return bytes written (0..cap), or -1 on error.
  */
 typedef int64_t (*AxlPageFillFunc)(
-    void   *user,        ///< opaque cookie from axl_page_cache_new
     size_t  page_index,  ///< page to fill
     void   *dst,         ///< frame buffer (cap bytes)
-    size_t  cap          ///< frame capacity == page size
+    size_t  cap,         ///< frame capacity == page size
+    void   *user         ///< opaque cookie from axl_page_cache_new
 );
 
 /// Cache counters (monotonic; reset by axl_page_cache_clear).

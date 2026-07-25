@@ -106,7 +106,24 @@ test_clean_log
 if [[ "$HAVE_SHELL" -eq 0 ]] || grep -q "NO_SHELL" "$TEST_CLEAN_LOG"; then
     skip "no Shell.efi staged — coexistence GET (1/2)"
     skip "no Shell.efi staged — coexistence GET (2/2)"
+    skip "no Shell.efi staged — sources un-masking (file+fv)"
 else
+    # Un-masking: a staged Shell.efi must NOT hide the firmware FV Shell.
+    # axl_shell_sources reports each independently — with the file staged AND
+    # OVMF's FV Shell present, both flags are set (whereas axl_shell_locate
+    # collapses to FILE and the FV becomes invisible). Only assertable when the
+    # firmware actually carries an FV Shell to un-mask (fv=1); else SKIP-balance.
+    SRC_LINE=$(grep -oE 'SOURCES:file=[01],fv=[01],fvn=[0-9]+' "$TEST_CLEAN_LOG" | head -1)
+    SRC_FILE=$(echo "$SRC_LINE" | sed -E 's/.*file=([01]).*/\1/')
+    SRC_FV=$(echo "$SRC_LINE" | sed -E 's/.*,fv=([01]).*/\1/')
+    if [[ "$SRC_FV" == "1" ]]; then
+        [[ "$SRC_FILE" == "1" ]] \
+            && pass "axl_shell_sources reports file AND fv (staged Shell.efi does not mask the FV)" \
+            || fail "axl_shell_sources missed the staged Shell.efi ('$SRC_LINE')"
+    else
+        skip "no FV Shell on this firmware — sources un-masking not exercisable ('$SRC_LINE')"
+    fi
+
     # The crux: HTTP must answer WHILE the foreground Shell blocks in
     # StartImage. The driver-tick timer pumps the loop during the Shell's
     # WaitForEvent. A 200 here proves shell + HTTP coexist.

@@ -34,6 +34,11 @@ bool _axl_loop_in_callback(void);
    per-protocol wait helpers (axl-net-wait.c). */
 #define AXL_TCP_CLOSE_POLL_US  10000ULL
 
+/* Inline wait cap for an ABORTIVE close. A RST completes with no TIME_WAIT, so
+   the completion event signals almost immediately; this only bounds a wedged
+   firmware. Much shorter than the graceful 3 s (which had to cover TIME_WAIT). */
+#define AXL_TCP_ABORT_WAIT_US  (1000ULL * 1000ULL)
+
 typedef struct {
     AxlTcp    *sock;
     AxlStatus  status;
@@ -45,12 +50,56 @@ typedef struct {
    token must outlive axl_tcp_close because EDK2 parks
    &ctx->close_token in Sock->CloseToken and dereferences it from
    SockConnClosed long after the call returns. See axl_tcp_close. */
-typedef struct {
+typedef struct AxlTcpCloseCtx {
     EFI_TCP4_CLOSE_TOKEN  close_token;
     AxlTcp               *sock;
     AxlLoop              *loop;       /* set on the async path */
     AxlSourceId           source_id;  /* set on the async path */
+    /* Deferred-close registry links (async path only). Every in-flight
+       loop-owned close is on g_deferred_closes so an abortive listener teardown
+       can find and finalize its own children's deferred closes synchronously.
+       reg_listener_id is the accepting listener's id (from sock->listener_id),
+       captured here because finalize frees sock. */
+    uint64_t                     reg_listener_id;
+    struct AxlTcpCloseCtx        *reg_prev;
+    struct AxlTcpCloseCtx        *reg_next;
 } AxlTcpCloseCtx;
+
+/* Monotonic listener id source (single-threaded UEFI, no lock). 0 is reserved
+   for "no listener" (client sockets), so ids start at 1. 64-bit — never wraps
+   in a realistic process, so a listener id can never alias a freed one. */
+static uint64_t g_next_listener_id = 1;
+
+/* Intrusive list of in-flight loop-deferred closes (single-threaded UEFI, no
+   lock). A ctx is linked when tcp_close_impl registers on_close_event and
+   unlinked in finalize_close_ctx — whether that runs from on_close_event or
+   from the abortive listener-teardown sweep. */
+static AxlTcpCloseCtx *g_deferred_closes;
+
+static void
+deferred_close_link(AxlTcpCloseCtx *ctx)
+{
+    ctx->reg_prev = NULL;
+    ctx->reg_next = g_deferred_closes;
+    if (g_deferred_closes != NULL) {
+        g_deferred_closes->reg_prev = ctx;
+    }
+    g_deferred_closes = ctx;
+}
+
+static void
+deferred_close_unlink(AxlTcpCloseCtx *ctx)
+{
+    if (ctx->reg_prev != NULL) {
+        ctx->reg_prev->reg_next = ctx->reg_next;
+    } else if (g_deferred_closes == ctx) {
+        g_deferred_closes = ctx->reg_next;
+    }
+    if (ctx->reg_next != NULL) {
+        ctx->reg_next->reg_prev = ctx->reg_prev;
+    }
+    ctx->reg_prev = ctx->reg_next = NULL;
+}
 
 // ---------------------------------------------------------------------------
 // Locate TCP4 service binding — thin wrapper over the generic
@@ -358,6 +407,7 @@ axl_tcp_listen_via(uint16_t port, const AxlIPv4Address *source_ip,
     sock->tcp_sb     = sb;
     sock->sb_handle  = sb_handle;
     sock->is_listener = true;
+    sock->listener_id = g_next_listener_id++;   /* unique; children inherit it */
 
     *out_listener = sock;
     axl_info("listening on port %u", port);
@@ -640,6 +690,9 @@ finalize_sock(AxlTcp *sock)
 static void
 finalize_close_ctx(AxlTcpCloseCtx *ctx)
 {
+    /* Drop from the deferred-close registry first (no-op for a sync-path ctx
+       that was never linked). Idempotent — a ctx is finalized exactly once. */
+    deferred_close_unlink(ctx);
     finalize_sock(ctx->sock);
     if (ctx->close_token.CompletionToken.Event != NULL) {
         axl_backend_event_close(
@@ -655,6 +708,35 @@ on_close_event(void *data)
     axl_loop_remove_source(ctx->loop, ctx->source_id);
     finalize_close_ctx(ctx);
     return AXL_SOURCE_REMOVE;
+}
+
+// Finalize every in-flight loop-deferred close spawned from @p listener,
+// synchronously and loop-free — the third port-holder category an abortive
+// listener teardown must clear (connections served then gracefully closed, whose
+// close went async and whose slot the server already dropped). Each such close
+// keeps a firmware PCB on the listen port and a caller-owned loop source until
+// its on_close_event fires (~TIME_WAIT, needs a pump). Here we remove the loop
+// source and finalize now: Configure(NULL)+DestroyChild in finalize_sock force-
+// drops the PCB even mid-graceful-close (dropping the un-ACKed FIN, which is the
+// intended trade for an immediate teardown — same as an abortive close). Scoped
+// by reg_listener so a sibling server on the same loop/NIC is untouched.
+static void
+finalize_listener_deferred_closes(AxlTcp *listener)
+{
+    AxlTcpCloseCtx *ctx = g_deferred_closes;
+    while (ctx != NULL) {
+        AxlTcpCloseCtx *next = ctx->reg_next;   /* snapshot: finalize unlinks ctx */
+        if (ctx->reg_listener_id == listener->listener_id) {
+            /* Drop the loop source before finalizing so on_close_event can never
+               fire against the freed ctx, and so it is gone from the loop (the
+               "zero caller-owned sources at loop_free" invariant). */
+            if (ctx->loop != NULL && ctx->source_id != 0) {
+                axl_loop_remove_source(ctx->loop, ctx->source_id);
+            }
+            finalize_close_ctx(ctx);
+        }
+        ctx = next;
+    }
 }
 
 /* Loop-FREE close completion: drive tcp4->Poll() and poll the close_event
@@ -685,11 +767,167 @@ close_wait_inline(EFI_TCP4_PROTOCOL *tcp4, EFI_EVENT close_event,
     }
 }
 
-void
-axl_tcp_close(AxlTcp *sock)
+// ---------------------------------------------------------------------------
+// Synchronous accept-backlog drain (abortive listener teardown only).
+//
+// A listen socket that is torn down under load holds the port through its
+// firmware ACCEPT BACKLOG: connections whose 3-way handshake the firmware
+// completed on its own periodic timer but that the app never pulled via Accept
+// (no loop pump between free and rebind). Those established children hold PCBs
+// on the listen port, and the plain listener close closes them GRACEFULLY (FIN
+// -> ~2 s TIME_WAIT) — so the port is not free on return, defeating the whole
+// point of the abortive path under concurrent load.
+//
+// Drain them here: pull each queued connection through the listener's already-
+// armed Accept token (tcp4->Poll drives the stack; event_check detects a
+// completion without the app loop) and RST it via the proven abortive close.
+// Bounded so a peer that keeps connecting during teardown cannot spin us
+// forever; the still-armed trailing Accept token is cancelled by the Phase-1
+// accept teardown in tcp_close_impl below.
+//
+// The caller (tcp_close_impl PHASE 0) Configure(NULL)s the listener BEFORE
+// calling this, so the firmware has stopped completing new handshakes and the
+// backlog is a frozen, finite set — this loop drains that set and converges,
+// rather than racing an ongoing inbound-SYN storm (which is what wedged the
+// RESET free before the quiesce was added). The <=DRAIN_MAX bound is a
+// belt-and-suspenders cap so the free returns even if some firmware keeps the
+// Accept path partly live after Configure(NULL).
+// ---------------------------------------------------------------------------
+
+#define AXL_TCP_BACKLOG_DRAIN_MAX   64u   ///< max backlog children pulled per teardown
+#define AXL_TCP_BACKLOG_POLL_TRIES  8u    ///< Poll attempts per pull before "backlog empty"
+
+// RST + DestroyChild one pulled backlog child. Wraps the bare firmware handle in
+// a throwaway AxlTcp and reuses axl_tcp_close(., AXL_TEARDOWN_RESET) (RST + inline finalize +
+// DestroyChild + free) so the child gets exactly the same port-releasing
+// teardown as a tracked connection, with none of its guarantees re-derived.
+static void
+drain_reset_child(AxlTcp *listener, EFI_HANDLE child_handle)
+{
+    EFI_TCP4_PROTOCOL *child_tcp4 = NULL;
+    if (axl_efi_call(axl_bs()->HandleProtocol, 3, child_handle,
+                     &gEfiTcp4ProtocolGuid, (void **)&child_tcp4) == EFI_SUCCESS
+        && child_tcp4 != NULL) {
+        AxlTcp *child = axl_calloc(1, sizeof(AxlTcp));
+        if (child != NULL) {
+            child->tcp4        = child_tcp4;
+            child->tcp_handle  = child_handle;
+            child->tcp_sb      = listener->tcp_sb;
+            child->sb_handle   = listener->sb_handle;
+            child->is_listener = false;
+            axl_tcp_close(child, AXL_TEARDOWN_RESET);
+            return;
+        }
+    }
+    /* Wrap failed (OOM / no protocol) — at least destroy the child so it does
+       not leak; DestroyChild alone still tears down its firmware PCB. */
+    axl_efi_call(listener->tcp_sb->DestroyChild, 2, listener->tcp_sb,
+                 child_handle);
+}
+
+static void
+drain_accept_backlog(AxlTcp *listener)
+{
+    if (listener == NULL || !listener->is_listener
+        || listener->tcp4 == NULL || listener->tcp_sb == NULL
+        || listener->acc_token.CompletionToken.Event == NULL) {
+        return;
+    }
+    EFI_EVENT ev = listener->acc_token.CompletionToken.Event;
+
+    for (unsigned drained = 0; drained < AXL_TCP_BACKLOG_DRAIN_MAX; drained++) {
+        bool completed = false;
+        for (unsigned p = 0; p < AXL_TCP_BACKLOG_POLL_TRIES; p++) {
+            axl_efi_call(listener->tcp4->Poll, 1, listener->tcp4);
+            /* event_check: 0 = signalled (a connection was accepted),
+               >0 = not ready, <0 = bad handle. */
+            if (axl_backend_event_check((AxlEventHandle)ev) == 0) {
+                completed = true;
+                break;
+            }
+            /* No stall after the last poll — we are about to give up on this
+               slot, so the final sleep would just delay teardown. */
+            if (p + 1 < AXL_TCP_BACKLOG_POLL_TRIES) {
+                axl_backend_stall(AXL_TCP_CLOSE_POLL_US);
+            }
+        }
+        if (!completed) {
+            break;  /* backlog drained (the trailing Accept token is cancelled
+                       by the Phase-1 accept teardown in tcp_close_impl). */
+        }
+
+        EFI_HANDLE child_handle = listener->acc_token.NewChildHandle;
+        EFI_STATUS acc_status   = listener->acc_token.CompletionToken.Status;
+
+        /* Re-arm the same token/event so the next queued connection can bind. */
+        axl_memset(&listener->acc_token, 0, sizeof(listener->acc_token));
+        listener->acc_token.CompletionToken.Event  = ev;
+        listener->acc_token.CompletionToken.Status = EFI_ABORTED;
+        axl_efi_call(listener->tcp4->Accept, 2, listener->tcp4,
+                     &listener->acc_token);
+
+        if (!EFI_ERROR(acc_status) && child_handle != NULL) {
+            drain_reset_child(listener, child_handle);
+        }
+    }
+}
+
+static void
+tcp_close_impl(AxlTcp *sock, bool abortive)
 {
     if (sock == NULL) {
         return;
+    }
+
+    /* A GRACEFUL EFI_TCP4.Close() at a raised TPL hard-wedges the loop when the
+       connection still has un-flushed outbound TCP data. Close() (AbortOnClose
+       FALSE) flushes the send buffer and drives the active-close FIN handshake
+       before completing; that transmit + its ACK need the MNP periodic timer to
+       fire BELOW TPL_CALLBACK. From a driver-pump notify (axl_loop_attach_driver
+       dispatches at TPL_CALLBACK) we hold that level, so the timer never fires,
+       the flush never completes, and Close() spins in firmware forever — one
+       core pegged, the loop dead, a reboot the only exit. (Phase 1 below cancels
+       our own tx TOKEN, but the bytes already handed to the TCP send buffer are
+       what Close() must still flush.)
+
+       An ABORTIVE close (RST) discards the send buffer and skips the handshake,
+       so it returns without a flush wait. A connection reset at a raised TPL is
+       an abandon anyway (reset_connection frees the outbound queue), so RST is
+       the correct teardown, not a downgrade. Listeners carry no outbound data
+       and must keep their graceful path (its Phase 0 backlog drain is gated on
+       an EXPLICIT abortive request), so scope this to connection sockets. The
+       foreground (TPL_APPLICATION) path is unchanged — there the MNP timer fires
+       and graceful Close() completes normally. */
+    if (!abortive && !sock->is_listener && axl_backend_at_raised_tpl()) {
+        abortive = true;
+    }
+
+    //
+    // PHASE 0 (abortive listener only): clear the two port-holder categories a
+    // plain listener close leaves behind, so the port is free on return even
+    // under churny load. BEFORE Phase 1 cancels the accept token:
+    //   (a) drain the firmware ACCEPT BACKLOG — queued-but-undelivered
+    //       connections with no app handle (see drain_accept_backlog);
+    //   (b) finalize this listener's in-flight loop-DEFERRED closes —
+    //       connections served then gracefully closed, whose close went async
+    //       and whose server slot is already gone (see
+    //       finalize_listener_deferred_closes).
+    // Together with Phase 1/2 (the listener itself) and the server's abortive
+    // reset of its live connections, that is every place a firmware PCB on this
+    // port can hide. No-op for a connection socket or when both are empty.
+    //
+    if (abortive && sock->is_listener) {
+        /* Quiesce NEW accepts FIRST: Configure(NULL) on the still-listening
+           socket stops the firmware completing fresh handshakes (post-reset SYNs
+           get RST, not queued), so the backlog stops refilling. Without this, a
+           peer hammering connections through the teardown refills the backlog as
+           fast as the drain empties it and the RESET free never converges (it
+           races the inbound SYN rate). With the accept path quiesced the backlog
+           is a FROZEN finite set the drain then clears; the drain is bounded, so
+           the free always returns even if a firmware keeps Accept partly live. */
+        axl_efi_call(sock->tcp4->Configure, 2, sock->tcp4, NULL);
+        drain_accept_backlog(sock);
+        finalize_listener_deferred_closes(sock);
     }
 
     //
@@ -820,13 +1058,27 @@ axl_tcp_close(AxlTcp *sock)
 
     ctx->sock                              = sock;
     ctx->close_token.CompletionToken.Event = close_event;
-    ctx->close_token.AbortOnClose          = false;
+    ctx->close_token.AbortOnClose          = abortive;
 
     EFI_STATUS status = axl_efi_call(sock->tcp4->Close, 2,
                                      sock->tcp4, &ctx->close_token);
     if (EFI_ERROR(status)) {
         axl_debug("close: Close() returned %llx - abrupt teardown",
                   (unsigned long long)status);
+        finalize_close_ctx(ctx);
+        return;
+    }
+
+    if (abortive) {
+        /* Abortive teardown: the RST completes with no TIME_WAIT, so finalize
+           synchronously and loop-free, then return with the port released.
+           close_wait_inline nests no loop and dispatches no sources, so this is
+           safe at a raised TPL and leaves no deferred close-event source on any
+           loop. Configure(NULL) in finalize is safe even if the completion event
+           lags: the RST already tore the PCB down, so there is no graceful FIN
+           for TcpFlushPcb to drop — the hazard that makes the default (graceful)
+           path defer finalization to a later loop tick. */
+        close_wait_inline(sock->tcp4, close_event, AXL_TCP_ABORT_WAIT_US);
         finalize_close_ctx(ctx);
         return;
     }
@@ -844,6 +1096,10 @@ axl_tcp_close(AxlTcp *sock)
             ctx
             );
         if (ctx->source_id != 0) {
+            /* Track this loop-deferred close so an abortive teardown of the
+               listener it was accepted from can finalize it synchronously. */
+            ctx->reg_listener_id = sock->listener_id;
+            deferred_close_link(ctx);
             return;
         }
         axl_warning("close: cannot register close event on loop - sync fallback");
@@ -870,6 +1126,12 @@ axl_tcp_close(AxlTcp *sock)
         _axl_tcp_wait(sock->tcp4, close_event, 3000ULL * 1000ULL);
     }
     finalize_close_ctx(ctx);
+}
+
+void
+axl_tcp_close(AxlTcp *sock, AxlTeardown mode)
+{
+    tcp_close_impl(sock, mode == AXL_TEARDOWN_RESET);
 }
 
 // ---------------------------------------------------------------------------

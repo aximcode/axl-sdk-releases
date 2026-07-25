@@ -26,7 +26,7 @@
  *
  * @code
  * AxlCompositor *c = axl_compositor_new(1280, 800);
- * AxlSurface *win = axl_surface_create(axl_compositor_root(c), 400, 300);
+ * AxlSurface *win = axl_surface_new(axl_compositor_root(c), 400, 300);
  * axl_surface_move(win, 100, 80);
  * axl_gfx_target_buffer(axl_surface_buffer(win));   // draw into it
  * axl_gfx_fill_rect(0, 0, 400, 300, AXL_GFX_RGB(0x20, 0x40, 0x80));
@@ -225,7 +225,7 @@ axl_compositor_occlusion_passes(
  *     dimensions.
  */
 AxlSurface *
-axl_surface_create(
+axl_surface_new(
     AxlSurface  *parent,   ///< parent surface (compositor root for top-level)
     uint32_t     w,        ///< width in pixels (> 0)
     uint32_t     h         ///< height in pixels (> 0)
@@ -241,7 +241,7 @@ axl_surface_create(
  * @c enter.
  */
 void
-axl_surface_destroy(
+axl_surface_free(
     AxlSurface  *s   ///< surface (NULL-safe)
 );
 

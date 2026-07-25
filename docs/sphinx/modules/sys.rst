@@ -32,6 +32,20 @@ AxlDriver
 
 .. doxygenfile:: axl-driver.h
 
+AxlDriverDeps (transitive driver-dependency resolution)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``<axl/axl-driver-deps.h>`` — parse a JSON5 sidecar declaring, per
+driver, the dependency driver(s) it needs co-resident, then walk a
+target's dependency subtree in dependencies-first order with cycle
+protection. The library owns the parse and the graph traversal; what
+"bring a dependency resident" means (load, breadcrumb, quarantine-check)
+stays with the caller via an ``AxlDriverDepVisitor``. The sidecar
+filename and schema tag are both parameters, so the on-disk format is
+caller-defined.
+
+.. doxygenfile:: axl-driver-deps.h
+
 AxlDriverInfo (driver / device discovery)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -97,8 +97,8 @@ main(int argc, char *argv[])
         axl_printf("COMPOSITOR-SELFTEST: 0 passed, 1 failed\n");
         return 1;
     }
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 40, 40); /* bottom */
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 40, 40); /* top */
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 40, 40); /* bottom */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 40, 40); /* top */
     axl_surface_move(a, 10, 10);   /* 10..50 */
     axl_surface_move(b, 30, 30);   /* 30..70, overlaps a on 30..50 */
     fill(a, 40, 40, RED);
@@ -136,7 +136,7 @@ main(int argc, char *argv[])
 
     /* C3: a translucent full-screen veil dims everything beneath it. The
        overlap pixel (GRN) must read back as GRN blended with the veil. */
-    AxlSurface *veil = axl_surface_create(axl_compositor_root(c), CW, CH);
+    AxlSurface *veil = axl_surface_new(axl_compositor_root(c), CW, CH);
     fill(veil, CW, CH, AXL_GFX_RGB(0x10, 0x10, 0x10));
     axl_surface_set_opacity(veil, 128);
     check(axl_compositor_present(c) == AXL_OK, "present veil returns AXL_OK");
@@ -148,10 +148,10 @@ main(int argc, char *argv[])
     /* C6: the cursor is the top overlay, driven by the seat pointer, with a
        per-surface shape. Use a solid surface + opaque sprite for determinism.
        Drop the veil and lay a solid CYAN surface on top as the scene. */
-    axl_surface_destroy(veil);
+    axl_surface_free(veil);
     const AxlGfxPixel CYAN = AXL_GFX_RGB(0x10, 0xE0, 0xE0);
     const AxlGfxPixel MAG  = AXL_GFX_RGB(0xFF, 0x00, 0xFF);
-    AxlSurface *cs = axl_surface_create(axl_compositor_root(c), 100, 80);
+    AxlSurface *cs = axl_surface_new(axl_compositor_root(c), 100, 80);
     axl_surface_move(cs, 10, 10);     /* abs 10..110 / 10..90 */
     fill(cs, 100, 80, CYAN);
     g_comp = c;

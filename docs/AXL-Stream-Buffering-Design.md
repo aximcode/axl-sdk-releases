@@ -73,7 +73,9 @@ reasons:
    coupling and decades of `fflush(stdout)` discipline; AXL has neither.
 
 So buffering is strictly opt-in and the caller owns the final flush
-(`axl_fflush`; `axl_fclose` flushes then frees). A future release could
+(`axl_fflush` — which on a file stream also pushes the firmware's cache
+through to the volume; `axl_fclose` drains and frees but never calls the
+sink's flush, so it is not a substitute). A future release could
 add the isatty-driven defaults *if* it also builds the flush-before-read
 coupling and flush-on-exit across all crt0 paths — that is a
 behavior-change (minor-version) undertaking, out of scope here.

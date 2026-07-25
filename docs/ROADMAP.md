@@ -29,6 +29,7 @@ Subsystems:
 - Drivers: [AXL-Driver-Authoring-Design.md](AXL-Driver-Authoring-Design.md) · [AXL-Driver-Authoring-Guide.md](AXL-Driver-Authoring-Guide.md) · [AXL-Shared-Driver-Recipe.md](AXL-Shared-Driver-Recipe.md) · [AXL-Network-Driver-Bundle-Design.md](AXL-Network-Driver-Bundle-Design.md)
 - Graphics / UI: [AXL-Compositor-Design.md](AXL-Compositor-Design.md) · [AXL-Pointer-Cursor-Design.md](AXL-Pointer-Cursor-Design.md) · [AXL-Display-Design.md](AXL-Display-Design.md) · [AXL-Transform-Design.md](AXL-Transform-Design.md) · [AXL-Rich-UI-Plan.md](AXL-Rich-UI-Plan.md)
 - Data: [AXL-PieceTree-Design.md](AXL-PieceTree-Design.md) · [AXL-RBTree-Design.md](AXL-RBTree-Design.md) · [AXL-Config-Design.md](AXL-Config-Design.md)
+- Networking: [2026-07-19-axl-9p-design.md](superpowers/specs/2026-07-19-axl-9p-design.md) — Axl9p 9P2000.L client + server + `fsN:` mount bridge
 - Hardware fixtures / test: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md) · [HW-Testing-Workflow.md](HW-Testing-Workflow.md)
 
 Active sub-projects (pre-code planning — see "Active sub-projects" below):
@@ -133,6 +134,20 @@ pass-thru escape hatch and a normalized cross-transport health struct.
 - [x] Phase 4 `AxlSmart` + `tools/smart` — normalized `AxlSmartHealth` rollup over the union device walk (`axl_storage_next` across NVMe/ATA/SCSI) + `axl_smart_health` dispatch + pure per-transport normalizers (`axl_smart_from_*`, unit-tested) + `axl_storage_get_location` (NVMe device-path / ATA port.pmp / SCSI target:lun). `test-smart-qemu.sh` (one device per transport) in CI; NVMe+ATA health end-to-end, SCSI health real-hardware-only
 - Non-goals: RAID/HBA mgmt (storelib), block read/write, GPT, destructive typed commands (FORMAT/SANITIZE/fw-download)
 
+### Axl9p — 9P2000.L client and server — [2026-07-19-axl-9p-design.md](superpowers/specs/2026-07-19-axl-9p-design.md)
+Both halves of the 9P2000.L wire over `AxlTcp`: a synchronous client (with a
+UEFI `fsN:` mount bridge) and an async server exporting an `AxlFs` subtree, so
+firmware can read a Linux host's files and a Linux host can `mount -t 9p` the
+firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
+- [x] Design doc + `axl-9p.h` contract, one internal codec shared by both halves so neither side can drift from the other's idea of the wire
+- [x] Phase 1 codec + client core — framing/encode/decode, `axl_9p_connect` (`Tversion`/`Tattach`, `msize` clamp), `axl_9p_read_file`, `axl_9p_list`; codec unit-tested in `AxlTest9p`; `test-9p-qemu.sh` drives a guest client against a host Python 9P2000.L server
+- [x] Phase 2 client write path — `axl_9p_write_file` (truncate-or-create, chunked), `axl_9p_mkdir`, `axl_9p_remove`, `axl_9p_rename`; chunked multi-`msize` round-trips pinned byte-exact
+- [x] Phase 3 client `mount` — `AxlFsProvider` bridge + `axl_9p_mount`/`_unmount` publishing a Shell-visible `fsN:`, `read_only` enforced in the bridge's vtable rather than documented; `9p-mount-selftest.efi` proves the volume end to end. The resident driver descoped to Phase 5
+- [x] Phase 4 server `Axl9pServer` — async on the caller's `AxlLoop`, `AxlFs` backend, per-connection fid table, all 15 handlers, a dispatch-level read-only gate, an FNV-1a `qid.path`, and bounded grow/`EXDEV` refusals that keep the single loop from stalling; `test-9p-server-qemu.sh` grades it on a host `p9-client.py`'s own stdout, functional plus adversarial (malformed + pipelined frames, 64-bit offsets, full fid table). Resident driver descoped to Phase 5
+- [x] Phase 5 `tools/9p` — one-shot `ls`/`get`/`put`, resident `serve`/`serve-stop` and `mount`/`umount` deploying the embedded `9p-{serve,mount}-dxe.efi` through `AxlService`, plus `status`; `test-9p-tool-qemu.sh` + `test-9p-tool-serve-qemu.sh` gate the launcher on both arches. Pulled Phase 4's deferred `EXDEV` copy-then-unlink fallback into `axl_9p_rename` (bounded: no directories, 32 MiB cap, refuses an existing destination)
+- Deviations from the design doc, recorded in its §12: `--listen-ip`/`--source-ip` not implemented (no library API takes a bind address); `9p` excluded from the busybox multiplexer (it links two embedded driver blobs); the headline `mount -t 9p` proof realized as an equivalent host Python client, with the kernel mount documented as manual and explicitly not claimed as tested
+- Non-goals for v1: 9P-over-TLS, virtio-9p transport, base 9P2000/`.u` dialects, `Tauth`, mount-side read caching
+
 ---
 
 ## Open backlog
@@ -163,8 +178,33 @@ Grouped, terse; **detail lives in the linked design doc or
   split + a coreboot/Linux backend for `libaxl-core.a`.
 - **C++ bindings (AxlMM)** (→ [AXLMM-Design.md](AXLMM-Design.md)): CPP1.7+ wrapper
   phases (Stream/Event/StrBuf/Arena, containers, networking, Sphinx docs).
-- **API hygiene:** `AxlTcpCb` `int status` → `AxlStatus`; other multi-outcome
-  return-value flips as audits surface them; AxlPubsub typed payloads.
+- **API hygiene** (→ [AXL-API-Consistency-Audit.md](AXL-API-Consistency-Audit.md), a
+  145-header audit — 12 categories, 6 prioritized batches): `AxlStatus` promotion +
+  security `AXL_WARN_UNUSED` (Batch A), C++ RAII autoptr gap incl. AxlGfxBuffer (B),
+  out-params-last param-order fixes incl. swapped void* pairs (C), constructor/
+  result-passing normalization + the `axl_queue_free` stack-corruption bug (D),
+  `axl_storage_*`/`axl_sntp_*` prefix splits (E), enum-flag/stdint/const tidy (F).
+  The audit's completeness critic flagged a second pass — now also DONE: axl-math.h +
+  gfx int-vs-void audited (defensible convention, carve-outs documented), axl-shm flags
+  enum-wrapped (F), the gfx handle-family autoptr gap closed (B), and axl-port renamed to
+  axl-io-port.h (guard/prefix/filename aligned). Remaining: only the consumer-repo update.
+- **Networking layering — POSIX-shaped substrate (revisit; do not build
+  speculatively):** today the real transport substrate is `AxlTcp`/`AxlUdp`
+  (async, loop/callback-driven over EFI_TCP4/UDP4) and `AxlSocket` is a *BSD-compat
+  veneer alongside* the protocols — HTTP/WS/9p build on `AxlTcp` directly, the
+  inverse of the POSIX "everything on sockets" layering. This is a deliberate
+  UEFI-appropriate choice (blocking sockets are a bad fit for single-threaded,
+  no-preempt, loop-pumped firmware — a blocking `accept()` in a resident driver
+  freezes the FW), but it has a real cost: transport features must be surfaced
+  *twice* (e.g. the `AXL_TEARDOWN_RESET` port-releasing close reached HTTP for
+  free but had to be re-exposed on the veneer via `axl_socket_free(., mode)` —
+  `b0b4aefa`). IF a future
+  socket-based server or a broader POSIX-compat push makes the veneer load-bearing,
+  reconsider whether `AxlSocket` should become the single substrate with `AxlTcp`
+  as its async engine (would require exposing the full async/abortive surface on
+  the socket API — i.e. it stops being "simple BSD"). No consumer needs this today
+  (only `sdk/examples` use `AxlSocket`); flagged so we do it on purpose, not by
+  drift. See `src/net/README.md` §abortive-teardown.
 - **Correctness / perf** (→ Archive §"Known Gaps"): a benchmark suite; AxlLoop
   fully event-driven driver mode (drop `driver_tick_ms`); async-TCP `Configure`
   retry non-blocking; `axl_yield()` API instrumentation; release-mode heap

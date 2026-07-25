@@ -110,7 +110,7 @@ Available readers:
 ## Reading the Spec Version
 
 ```c
-unsigned char major, minor;
+uint8_t major, minor;
 if (axl_smbios_version(&major, &minor) == 0) {
     axl_printf("SMBIOS %u.%u\n", major, minor);
 }

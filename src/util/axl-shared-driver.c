@@ -100,8 +100,8 @@ axl_shared_driver_publish(
 int
 axl_shared_driver_unpublish(
     const char  *name,
-    AxlHandle    handle,
-    void        *iface
+    void        *iface,
+    AxlHandle    handle
     )
 {
     if (name == NULL || handle == NULL || iface == NULL) {

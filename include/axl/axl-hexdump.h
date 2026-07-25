@@ -57,7 +57,7 @@ axl_hexdump_to_log(
  *
  * Requires AXL_LOG_DOMAIN() in the source file.
  */
-#define AxlHexDumpLog(Level, Name, Data, Size, BytesPerLine, GroupSize)  \
+#define axl_hexdump_log(Level, Name, Data, Size, BytesPerLine, GroupSize)  \
     axl_hexdump_to_log((Level), _AxlLogDomain, __func__, __LINE__,      \
                        (Name), (Data), (Size), (BytesPerLine), (GroupSize))
 

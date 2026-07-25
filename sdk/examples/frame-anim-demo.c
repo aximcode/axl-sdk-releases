@@ -195,7 +195,7 @@ main(int argc, char *argv[])
         return 1;
     }
     /* One full-screen opaque window surface; widgets would paint into it. */
-    d.win = axl_surface_create(axl_compositor_root(d.comp),
+    d.win = axl_surface_new(axl_compositor_root(d.comp),
                                (uint32_t)d.w, (uint32_t)d.h);
     if (d.win == NULL) {
         axl_printf("frame-anim-demo: surface alloc failed.\n");

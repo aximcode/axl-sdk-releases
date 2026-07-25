@@ -426,6 +426,32 @@ axl_piece_tree_line_iter_next(
     size_t           *end     ///< [out] line end (excludes '\n')
 );
 
+/**
+ * @brief Write the document to @p path as UTF-8, crash-safely.
+ *
+ * Streams the document to a temporary sibling ("<path>.tmp") — never
+ * materializing it in memory, however large it is — flushes that temp
+ * through to the volume, and only then renames it over @p path. The
+ * promote is conditional on the flush: a temp whose bytes never reached
+ * the media is deleted and @p path is left exactly as it was, so a full
+ * volume or write-protected media cannot replace a good document with a
+ * truncated one. Closing a file cannot report that on its own
+ * (`EFI_FILE_PROTOCOL.Close` is specified to return only
+ * `EFI_SUCCESS`), which is why the flush is explicit.
+ *
+ * On success the document becomes the save point:
+ * axl_piece_tree_is_modified turns false while the undo history is kept.
+ * On failure the document is left dirty — the save did not happen.
+ *
+ * Line endings follow axl_piece_tree_set_eol (verbatim by default).
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL args or a failed write /
+ *     flush (@p path untouched, temp removed). A failed rename is the
+ *     one exception to "untouched": FAT cannot rename over an existing
+ *     file, so the target is deleted first — if the retry then fails
+ *     too, @p path is gone and the complete document is left in
+ *     "<path>.tmp" for recovery rather than deleted as well.
+ */
 AXL_WARN_UNUSED int
 axl_piece_tree_save(
     AxlPieceTree *pt,    ///< piece tree

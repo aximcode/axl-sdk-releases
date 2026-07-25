@@ -110,7 +110,7 @@ owns nothing.
 
 ```c
 void axl_rb_tree_init(AxlRBTree *t, AxlRBRecompute recompute, void *user);
-bool axl_rb_tree_empty(const AxlRBTree *t);
+bool axl_rb_tree_is_empty(const AxlRBTree *t);
 
 /* Insertion is two steps so the caller controls the search:
    1. descend to find @parent and the &parent->left|right slot @link,

@@ -66,6 +66,31 @@ axl_queue_init(
 }
 
 void
+axl_queue_deinit(
+    AxlQueue *queue)
+{
+    /* Free the nodes and reset to empty, but not the struct itself. Same
+       operation as axl_queue_clear; distinct name is the teardown partner
+       for axl_queue_init (mirrors axl_ring_buf_init/_deinit). */
+    axl_queue_clear(queue);
+}
+
+void
+axl_queue_deinit_full(
+    AxlQueue         *queue,
+    AxlDestroyNotify  free_func)
+{
+    if (queue == NULL) {
+        return;
+    }
+
+    axl_list_free_full(queue->head, free_func);
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->length = 0;
+}
+
+void
 axl_queue_free(
     AxlQueue *queue)
 {
@@ -73,7 +98,7 @@ axl_queue_free(
         return;
     }
 
-    axl_list_free(queue->head);
+    axl_queue_deinit(queue);   /* free nodes; then the struct (heap only) */
     axl_free(queue);
 }
 
@@ -86,7 +111,7 @@ axl_queue_free_full(
         return;
     }
 
-    axl_list_free_full(queue->head, free_func);
+    axl_queue_deinit_full(queue, free_func);   /* free data + nodes */
     axl_free(queue);
 }
 

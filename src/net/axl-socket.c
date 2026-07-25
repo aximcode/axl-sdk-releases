@@ -87,7 +87,7 @@ axl_socket_new_from_tcp(AxlTcp *tcp)
 
     sock = axl_calloc(1, sizeof(*sock));
     if (sock == NULL) {
-        axl_tcp_close(tcp);
+        axl_tcp_close(tcp, AXL_TEARDOWN_GRACEFUL);
         return NULL;
     }
 
@@ -97,21 +97,34 @@ axl_socket_new_from_tcp(AxlTcp *tcp)
     return sock;
 }
 
-void
-axl_socket_free(AxlSocket *sock)
+static void
+socket_free_impl(AxlSocket *sock, bool abortive)
 {
     if (sock == NULL) {
         return;
     }
 
     if (sock->type == AXL_SOCKET_STREAM) {
-        axl_tcp_close(sock->tcp);
+        /* abortive: RST + synchronous loop-free finalize (backlog + pending
+           deferred closes) so a listen port is free on return. UDP has no
+           graceful close to abort, so its teardown is the same either way. */
+        if (abortive) {
+            axl_tcp_close(sock->tcp, AXL_TEARDOWN_RESET);
+        } else {
+            axl_tcp_close(sock->tcp, AXL_TEARDOWN_GRACEFUL);
+        }
     } else {
         axl_udp_close(sock->udp);
     }
 
     axl_free(sock->accept_ctx);
     axl_free(sock);
+}
+
+void
+axl_socket_free(AxlSocket *sock, AxlTeardown mode)
+{
+    socket_free_impl(sock, mode == AXL_TEARDOWN_RESET);
 }
 
 // ---------------------------------------------------------------------------

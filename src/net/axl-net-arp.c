@@ -22,6 +22,24 @@ axl_net_arp_list(size_t nic, AxlArpEntry *out, size_t cap, size_t *count)
     }
     *count = 0;
 
+    /* Resolve the ordinal to a MAC through the registry, then find the ARP
+       service binding carrying that MAC. The raw ARP-SB handle index is its
+       own enumeration -- unrelated to the SNP and IP4Config2 ones -- so
+       indexing it with a NIC ordinal named a different NIC. */
+    AxlNic *nics = NULL;
+    size_t  nnic = 0;
+    if (_axl_net_nics_build(&nics, &nnic) != AXL_OK || nnic == 0) {
+        _axl_net_nics_free(nics);
+        return AXL_ERR;
+    }
+    if (nic >= nnic) {
+        _axl_net_nics_free(nics);
+        return AXL_ERR;
+    }
+    uint8_t want_mac[6];
+    axl_memcpy(want_mac, nics[nic].mac, 6);
+    _axl_net_nics_free(nics);
+
     EFI_HANDLE *handles = NULL;
     size_t      hc      = 0;
     EFI_STATUS  st      = axl_efi_call(axl_bs()->LocateHandleBuffer, 5,
@@ -31,16 +49,25 @@ axl_net_arp_list(size_t nic, AxlArpEntry *out, size_t cap, size_t *count)
     if (EFI_ERROR(st) || hc == 0 || handles == NULL) {
         return AXL_ERR;
     }
-    if (nic >= hc) {
-        axl_backend_free(handles);
-        return AXL_ERR;
-    }
 
     EFI_SERVICE_BINDING_PROTOCOL *sb = NULL;
-    st = axl_efi_call(axl_bs()->HandleProtocol, 3, handles[nic],
-                      &gEfiArpServiceBindingProtocolGuid, (void **)&sb);
+    for (size_t i = 0; i < hc; i++) {
+        uint8_t mac[6];
+        if (!_axl_net_snp_mac(_axl_net_snp_on(handles[i]), mac)) {
+            continue;
+        }
+        if (axl_memcmp(mac, want_mac, 6) != 0) {
+            continue;
+        }
+        axl_efi_call(axl_bs()->HandleProtocol, 3, handles[i],
+                     &gEfiArpServiceBindingProtocolGuid, (void **)&sb);
+        if (sb != NULL) {
+            break;
+        }
+    }
     axl_backend_free(handles);
-    if (EFI_ERROR(st) || sb == NULL) {
+    if (sb == NULL) {
+        axl_warning("arp_list: no ARP service binding for nic %zu", nic);
         return AXL_ERR;
     }
 

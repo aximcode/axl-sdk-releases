@@ -244,6 +244,10 @@ axl_gfx_display_list_free(
     AxlGfxDisplayList  *dl   ///< list to free, or NULL
     );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlGfxDisplayList, axl_gfx_display_list_free)
+#endif
+
 /// Remove all recorded ops, freeing their owned data, while retaining
 /// the list's allocation for reuse.  Cheaper than free + new for a
 /// list rebuilt every frame.  Safe to call with NULL.

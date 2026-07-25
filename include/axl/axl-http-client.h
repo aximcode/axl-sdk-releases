@@ -104,9 +104,10 @@ axl_http_client_get(
 /**
  * @brief HTTP GET request.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; a specific negative AxlStatus on failure (e.g.
+ *     AXL_INVALID for bad args, AXL_TIMEOUT, AXL_CANCELLED, AXL_NO_RESOURCES).
  */
-int
+AxlStatus
 axl_http_get(
     AxlHttpClient          *c,         ///< client
     const char             *url,       ///< full URL string
@@ -116,9 +117,10 @@ axl_http_get(
 /**
  * @brief HTTP POST request.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; a specific negative AxlStatus on failure (e.g.
+ *     AXL_INVALID for bad args, AXL_TIMEOUT, AXL_CANCELLED, AXL_NO_RESOURCES).
  */
-int
+AxlStatus
 axl_http_post(
     AxlHttpClient          *c,             ///< client
     const char             *url,           ///< full URL string
@@ -210,9 +212,10 @@ axl_http_post_async(
 /**
  * @brief HTTP PUT request.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; a specific negative AxlStatus on failure (e.g.
+ *     AXL_INVALID for bad args, AXL_TIMEOUT, AXL_CANCELLED, AXL_NO_RESOURCES).
  */
-int
+AxlStatus
 axl_http_put(
     AxlHttpClient          *c,             ///< client
     const char             *url,           ///< full URL string
@@ -225,9 +228,10 @@ axl_http_put(
 /**
  * @brief HTTP DELETE request.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; a specific negative AxlStatus on failure (e.g.
+ *     AXL_INVALID for bad args, AXL_TIMEOUT, AXL_CANCELLED, AXL_NO_RESOURCES).
  */
-int
+AxlStatus
 axl_http_delete(
     AxlHttpClient          *c,         ///< client
     const char             *url,       ///< full URL string
@@ -237,9 +241,10 @@ axl_http_delete(
 /**
  * @brief Generic HTTP request with optional per-request headers.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; a specific negative AxlStatus on failure (e.g.
+ *     AXL_INVALID for bad args, AXL_TIMEOUT, AXL_CANCELLED, AXL_NO_RESOURCES).
  */
-int
+AxlStatus
 axl_http_request(
     AxlHttpClient          *c,              ///< client
     const char             *method,         ///< HTTP method ("GET", "POST", "PUT", "DELETE", etc.)

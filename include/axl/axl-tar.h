@@ -126,6 +126,10 @@ axl_tar_writer_free(
     AxlTarWriter  *w
 );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlTarWriter, axl_tar_writer_free)
+#endif
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
@@ -187,6 +191,10 @@ void
 axl_tar_reader_free(
     AxlTarReader  *r
 );
+
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlTarReader, axl_tar_reader_free)
+#endif
 
 #ifdef __cplusplus
 }

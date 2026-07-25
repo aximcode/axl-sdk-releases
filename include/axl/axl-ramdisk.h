@@ -105,11 +105,13 @@ axl_ramdisk_ensure_driver(
  * is why `axl_ramdisk_destroy` keys on it.) The returned device path is
  * firmware-owned and valid until this disk is destroyed.
  *
- * @return AXL_OK on success (or an existing same-label disk), AXL_ERR
- *     if the protocol is unavailable, @p size_mb is out of range,
- *     allocation fails, or registration fails.
+ * @return AXL_OK on success (or an existing same-label disk); otherwise a
+ *     specific negative AxlStatus: AXL_INVALID (@p label NULL or @p size_mb
+ *     out of range), AXL_UNSUPPORTED (no EFI_RAM_DISK_PROTOCOL),
+ *     AXL_NO_RESOURCES (backing allocation failed), AXL_IO_ERROR
+ *     (firmware Register failed).
  */
-int
+AxlStatus
 axl_ramdisk_create(
     const char *label,         ///< FAT volume label (uppercased, truncated to 11 chars)
     size_t      size_mb,       ///< disk size in MB (1..32768)
@@ -208,11 +210,12 @@ typedef enum {
  * Note it embeds the backing memory's physical address, so it is not
  * stable across boots; it is the handle you pass back to unregister.
  *
- * @return AXL_OK on success, or AXL_ERR if the protocol is unavailable,
- *     @p image is NULL, @p size_bytes is 0, @p kind is invalid, or
- *     registration fails.
+ * @return AXL_OK on success; otherwise a specific negative AxlStatus:
+ *     AXL_INVALID (@p image NULL, @p size_bytes 0, or @p kind invalid),
+ *     AXL_UNSUPPORTED (no EFI_RAM_DISK_PROTOCOL), AXL_IO_ERROR (firmware
+ *     Register failed).
  */
-int
+AxlStatus
 axl_ramdisk_register_image(
     void          *image,        ///< page-aligned image bytes (caller-owned; keep valid until unregister)
     uint64_t       size_bytes,   ///< image length in bytes

@@ -396,7 +396,7 @@ axl_string_str(const AxlString *b)
 }
 
 size_t
-axl_string_len(AxlString *b)
+axl_string_len(const AxlString *b)
 {
     if (b == NULL) {
         return 0;

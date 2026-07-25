@@ -427,9 +427,9 @@ axl_protocol_register_multiple(
 
 int
 axl_protocol_unregister(
-    void       *handle,
     const char *name,
-    void       *interface
+    void       *interface,
+    void       *handle
     )
 {
     EFI_GUID        fallback;

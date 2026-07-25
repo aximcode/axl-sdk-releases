@@ -55,6 +55,10 @@ commands over `EFI_TCG2_PROTOCOL.SubmitCommand`:
   returns `AXL_DENIED` if the measured state changed. Uses empty
   owner/parent authorization (the common firmware default); cross-boot
   unseal also needs a stable owner primary seed (no `TPM2_Clear` between).
+  On an `AXL_ERR`, pass an optional `AxlTpmError *` to learn which TPM2
+  command failed and its raw responseCode (e.g. an authorized owner
+  hierarchy failing the empty-auth `CreatePrimary`) — enough to diagnose a
+  real-hardware seal failure in one boot instead of guessing.
 
 The raw-command paths are validated against `swtpm` in QEMU
 (`test/integration/test-tpm-qemu.sh`, `test-tpm-seal-qemu.sh`); the

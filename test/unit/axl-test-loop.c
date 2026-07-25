@@ -1019,7 +1019,7 @@ test_iterate_until_done(void)
     axl_loop_add_timer(ctx.outer, 100, iter_outer_tick_done_path, &ctx);
     axl_loop_run(ctx.outer);
 
-    test_check(ctx.iter_rc == 0, "loop: iterate_until returns 0 on done");
+    test_check(ctx.iter_rc == AXL_OK, "loop: iterate_until returns AXL_OK on done");
     test_check(ctx.side_ticks > 0,
                "loop: iterate_until lets outer sources keep firing");
 
@@ -1064,7 +1064,7 @@ test_iterate_until_timeout(void)
     axl_loop_add_timer(ctx.outer, 100, iter_outer_tick_timeout_path, &ctx);
     axl_loop_run(ctx.outer);
 
-    test_check(ctx.iter_rc == -1, "loop: iterate_until returns -1 on timeout");
+    test_check(ctx.iter_rc == AXL_TIMEOUT, "loop: iterate_until returns AXL_TIMEOUT on timeout");
 
     axl_event_free(ctx.inner);
     axl_loop_free(ctx.outer);
@@ -1207,24 +1207,35 @@ test_keypress_drain_non_blocking(void)
     AxlSourceId id = axl_loop_add_key_press(loop, on_keypress_drain, NULL);
     test_check(id != 0, "loop: add_key_press returns a source id");
 
-    /* The poll timer is the drain tick. Let it expire, then ONE non-blocking
-       dispatch must select the keypress source (rc 0 = a source ran). The
-       firmware queue is empty here, so the callback itself never fires — what
-       is under test is that the source is reachable at all. */
+    /* The poll timer is the drain tick. Let it expire, then take TWO
+       non-blocking dispatches BACK-TO-BACK, capturing both results into locals
+       BEFORE asserting anything:
+         - the first selects the keypress source (rc 0 = a source ran) and
+           consumes the poll-timer signal;
+         - the second must find nothing (rc 1) — proving the source is gated on
+           the poll timer and re-selected only ONCE per tick, not on every call.
+           driver_dispatch_notify loops until dispatch reports nothing pending,
+           so an always-ready keypress source would burn the whole per-tick
+           budget every tick.
+       No Stall and NO test_check (serial I/O) between the two dispatches on
+       purpose: the "not re-armed yet" invariant holds only while under
+       POLL_INTERVAL_MS (10 ms) of wall-clock elapses between them. Two
+       consecutive gBS->CheckEvent calls run in microseconds, but a PASS line
+       printed to a slow serial console between them can exceed 10 ms and re-arm
+       the periodic timer — which is exactly what made this assertion flaky on
+       CI's slower (non-KVM) boot. Keeping all I/O out of the window makes it
+       boot-speed-independent (the two CheckEvent calls are microseconds apart,
+       far under the 10 ms period, on any boot). The firmware queue is empty here, so the
+       callback never fires — what is under test is that the source is reachable
+       at all, and gated to one drain per tick. */
     gBS->Stall(20000);   /* > POLL_INTERVAL_MS (10) */
-    test_check(axl_loop_dispatch(loop, false) == 0,
+    int first_dispatch  = axl_loop_dispatch(loop, false);
+    int second_dispatch = axl_loop_dispatch(loop, false);
+    test_check(first_dispatch == 0,
                "loop: non-blocking dispatch drains keypress on the poll tick");
-
     test_check(keypress_drain_calls == 0,
                "loop: empty key queue -> keypress callback not invoked");
-
-    /* ...and only once per tick. driver_dispatch_notify loops until dispatch
-       reports nothing pending, so a keypress source that reported itself ready
-       on every call would burn the whole per-tick budget every tick.
-       No Stall here on purpose: this asserts the poll timer has NOT re-armed,
-       which holds as long as the two dispatch calls above take under
-       POLL_INTERVAL_MS (microseconds on an empty queue). */
-    test_check(axl_loop_dispatch(loop, false) == 1,
+    test_check(second_dispatch == 1,
                "loop: keypress is not re-selected before the next poll tick");
 
     /* The next tick re-arms it (the poll timer is periodic). */

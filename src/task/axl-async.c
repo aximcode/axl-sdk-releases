@@ -51,26 +51,26 @@ struct AxlAsync {
 
 static void
 async_work_wrapper(
-    void     *arg,
-    AxlArena *arena
+    AxlArena *arena,
+    void     *arg
     )
 {
     AsyncSlot *slot = (AsyncSlot *)arg;
 
-    slot->work_fn(slot->data, arena);
+    slot->work_fn(arena, slot->data);
 }
 
 static void
 async_complete_wrapper(
-    void     *arg,
-    AxlArena *arena
+    AxlArena *arena,
+    void     *arg
     )
 {
     AsyncSlot *slot = (AsyncSlot *)arg;
     AxlAsync  *async = slot->async;
 
     if (!slot->cancelled && slot->done_cb != NULL) {
-        slot->done_cb(slot->data, arena);
+        slot->done_cb(arena, slot->data);
     }
 
     slot->active = false;

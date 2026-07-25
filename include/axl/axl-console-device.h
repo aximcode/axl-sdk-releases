@@ -88,6 +88,31 @@ typedef struct {
                                 ///< on a backward cursor jump after a ClearScreen, leave on
                                 ///< a newline. Same semantics as
                                 ///< AxlConsoleTapConfig::auto_alt_screen.
+    bool     passthrough_local; ///< keep the FIRMWARE consoles in the fan-out instead of
+                                ///< evicting them, so GraphicsConsole (and serial) carry on
+                                ///< painting the local display while we also receive every
+                                ///< op. Default false = sole console, which is right when
+                                ///< the consumer OWNS the framebuffer (it renders the grid
+                                ///< itself, so a co-painting GraphicsConsole would fight it).
+                                ///< Set true when the consumer only OBSERVES — mirroring the
+                                ///< console to a remote viewer — where evicting would blank
+                                ///< the local monitor and freeze anything sampling the GOP
+                                ///< (a BMC's KVM stream). REQUIRES physical geometry:
+                                ///< @a cols and @a rows must both be 0, or install fails.
+                                ///< Two consoles painting one screen must agree on the grid,
+                                ///< and advertising a size the firmware console does not
+                                ///< share re-opens the ConsoleLogger stale-scrollback
+                                ///< deadloop this mode otherwise avoids. Consequence: a
+                                ///< remote viewer adapts to the console's size, and
+                                ///< @ref axl_console_device_set_size is ignored here. To
+                                ///< honour a far-end resize WITHOUT leaving reader mode,
+                                ///< switch text modes: a passthrough device mirrors the
+                                ///< physical console's mode list, so
+                                ///< @ref axl_console_text_find_mode +
+                                ///< @ref axl_console_text_set_mode reshape BOTH consoles
+                                ///< together and the new geometry arrives on
+                                ///< @ref AxlConsoleOps::resize. Snapping to the firmware's
+                                ///< enumerated modes is a rounding, not a limit.
     bool     take_pointer;      ///< take over the pointer: at install, uninstall every real
                                 ///< EFI_SIMPLE_POINTER_PROTOCOL from the handle database and
                                 ///< interpose ONE yielding proxy in their place, so a guest
@@ -115,7 +140,9 @@ typedef struct {
  *
  * Publishes our SimpleTextOut + a Vendor device path + a self-installed
  * `gEfiConsoleOutDeviceGuid` tag on a fresh handle, connects it so ConSplitter fans
- * to us, then evicts the other console-out devices. `gST->ConOut`'s pointer value is
+ * to us, then evicts the other console-out devices — unless
+ * @ref AxlConsoleDeviceConfig::passthrough_local, which keeps them in the fan-out so
+ * the local display keeps painting. `gST->ConOut`'s pointer value is
  * never touched; no NVRAM write. Output is reported as @p ops. The device OWNS the
  * `SIMPLE_TEXT_OUTPUT_MODE` (cursor / attribute / visibility); caret rendering is the
  * consumer's job. Reports @ref AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT via
@@ -126,14 +153,16 @@ typedef struct {
  * overflows the logger's stale scrollback bound and it deadloops on scroll. This
  * routes a `clear_screen` op to the consumer at take-over (expected).
  *
- * @return AXL_OK (`*out` set) or AXL_ERR (bad args, already installed, surgery failed).
+ * @return AXL_OK (`*out` set) or AXL_ERR (bad args, already installed, surgery failed,
+ *     or @ref AxlConsoleDeviceConfig::passthrough_local combined with an explicit
+ *     @c cols / @c rows).
  */
 int
 axl_console_device_install(
-    AxlConsoleDevice             **out,   ///< [out] receives the device handle
     const AxlConsoleOps           *ops,   ///< consumer callbacks (borrowed; must outlive the device)
     void                          *user,  ///< opaque context passed back to every callback
-    const AxlConsoleDeviceConfig  *cfg    ///< configuration (copied)
+    const AxlConsoleDeviceConfig  *cfg,   ///< configuration (copied)
+    AxlConsoleDevice             **out    ///< [out] receives the device handle
 );
 
 /**
@@ -173,10 +202,42 @@ axl_console_device_inject_text(AxlConsoleDevice *dev, const char *bytes, size_t 
 
 /* --- Runtime geometry + session (output side) -------------------------------- */
 
-/** @brief Update advertised terminal size; wrapped QueryMode/Mode report it.
- *     0 = physical. NULL-safe. */
+/**
+ * @brief Update advertised terminal size; wrapped QueryMode/Mode report it.
+ *     0 = physical. NULL-safe.
+ *
+ * **Ignored (with a warning) under @ref AxlConsoleDeviceConfig::passthrough_local**,
+ * where the firmware console is painting the same screen and the grid is not ours
+ * alone to set — moving only our half of that agreement is the desync passthrough
+ * exists to avoid, which is also why install refuses an explicit geometry there.
+ * A co-painting consumer reshapes with @ref axl_console_text_set_mode instead: the
+ * device mirrors the physical mode list, so a switch moves BOTH consoles and reports
+ * the new size through @ref AxlConsoleOps::resize.
+ */
 void
 axl_console_device_set_size(AxlConsoleDevice *dev, uint32_t cols, uint32_t rows);
+
+/**
+ * @brief Read the device's resolved terminal geometry — the size our advertised
+ *     mode reports, i.e. what the guest lays itself out for.
+ *
+ * The configured @ref AxlConsoleDeviceConfig::cols / @c rows, with any axis left 0
+ * resolved to the physical console's size at install (and 80x25 if that was
+ * unavailable). **A @ref AxlConsoleDeviceConfig::passthrough_local consumer needs
+ * this:** passthrough forces geometry to physical, so the resolved size is not
+ * something the caller passed in, and a consumer that guessed 80x25 would size its
+ * screen model wrong. It also TRACKS a passthrough reshape — read it once after
+ * install and let @ref AxlConsoleOps::resize maintain it, or re-read it after a
+ * @ref axl_console_text_set_mode; both report the same geometry. NULL-safe (both outputs set to 0 when @p dev is NULL); either
+ * output pointer may be NULL to ignore that axis. Mirrors
+ * @ref axl_console_tap_get_size.
+ */
+void
+axl_console_device_get_size(
+    const AxlConsoleDevice *dev,   ///< device handle (NULL-safe)
+    uint32_t               *cols,  ///< [out] resolved width (may be NULL)
+    uint32_t               *rows   ///< [out] resolved height (may be NULL)
+);
 
 /** @brief Reset per-session state (key ring, cursor/escape tracking, leave
  *     alt-screen). NULL-safe. */

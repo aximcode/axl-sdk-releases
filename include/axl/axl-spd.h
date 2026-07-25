@@ -184,9 +184,12 @@ axl_spd_next(
  * @p out is populated; on failure @p out is left in an unspecified
  * state.
  *
- * @return AXL_OK on success, AXL_ERR if the slot is empty / unsupported / I/O error.
+ * @return AXL_OK on success (an unrecognised memory type also returns AXL_OK
+ *     with @p out zeroed, ddr_generation = 0); AXL_INVALID on NULL @p out,
+ *     AXL_UNSUPPORTED if no SMBus controller is present, AXL_NOT_FOUND if the
+ *     slot is empty.
  */
-int
+AxlStatus
 axl_spd_read(
     uint8_t      addr,   ///< 7-bit SMBus address (0x50..0x57)
     AxlSpdInfo  *out     ///< receives the decoded SPD on success
@@ -208,9 +211,10 @@ axl_spd_read(
  * @param cap   buffer capacity in bytes.
  * @param len   (out) bytes actually written.
  *
- * @return AXL_OK on success, AXL_ERR on transport error or empty slot.
+ * @return AXL_OK on success; AXL_INVALID on bad args, AXL_UNSUPPORTED if no
+ *     SMBus controller is present, AXL_NOT_FOUND if the slot is empty.
  */
-int
+AxlStatus
 axl_spd_dump_raw(
     uint8_t   addr,
     uint8_t  *buf,
@@ -228,10 +232,11 @@ axl_spd_dump_raw(
  * @param len   bytes available in @p buf.
  * @param out   (out) decoded info; zero-initialised by this call.
  *
- * @return AXL_OK on success, AXL_ERR if the memory type is unsupported or the
- *     buffer is too short for the detected generation.
+ * @return AXL_OK on success (an unrecognised memory type also returns AXL_OK
+ *     with @p out zeroed, ddr_generation = 0); AXL_INVALID on NULL args or a
+ *     buffer shorter than 3 bytes; otherwise the DDR4/DDR5 decoder's status.
  */
-int
+AxlStatus
 axl_spd_decode(
     const uint8_t  *buf,
     size_t          len,

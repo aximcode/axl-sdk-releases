@@ -128,8 +128,8 @@ axl_shared_driver_publish(
 int
 axl_shared_driver_unpublish(
     const char  *name,         ///< shared-driver identity
-    AxlHandle    handle,       ///< handle returned by @ref axl_shared_driver_publish
-    void        *iface         ///< the vtable pointer originally published
+    void        *iface,        ///< the vtable pointer originally published
+    AxlHandle    handle        ///< handle returned by @ref axl_shared_driver_publish
 );
 
 /**

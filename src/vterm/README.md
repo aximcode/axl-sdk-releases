@@ -104,10 +104,16 @@ terminal of the same size — reproduces the current screen, so the late joiner
 immediately sees what every existing viewer sees.
 
 It is the inverse of `axl-console-mirror`'s encoder and shares its pen→SGR
-encoder (`src/util/axl-console-vt.h`), so the two serializers cannot drift. The
-snapshot is **coalesced** — blank cells in the default background and fully-blank
-rows emit nothing, and consecutive cells sharing a pen collapse under one SGR — so
-a mostly-empty 80×25 screen is a handful of bytes, not ~2 KB of spaces. The model
+encoder and its buffering VT sink (`AxlConsoleVtBuf`, `src/util/axl-console-vt.h`),
+so the two serializers cannot drift. The snapshot is **coalesced** on two axes:
+the serialized bytes accumulate through `AxlConsoleVtBuf` and reach the caller's
+sink in a handful of large calls (not one per cell — a painted 80×25 was ~2000
+tiny calls, i.e. ~2000 WebSocket frames, before); blank cells in the default
+background and fully-blank rows emit nothing; consecutive cells sharing a pen
+collapse under one SGR; and a run of identical cells collapses to one glyph + REP
+(`CSI n b`) or, for a background-only blank run, ECH + CUF (`CSI n X` / `CSI n C`,
+which — unlike emitting N spaces — replays back to N *blank* cells). So a
+mostly-empty 80×25 screen is a handful of bytes in a handful of frames. The model
 owns a **primary and an alternate grid**, swapping on the guest's `DECSET/DECRST
 1049` exactly as this parser reports it, so the primary survives a full-screen app
 and a snapshot taken after it exits repaints the intact primary — not the stale

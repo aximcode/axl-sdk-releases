@@ -32,7 +32,7 @@ typedef struct {
  * Writes result into the SumWork struct (shared memory).
  */
 static void
-sum_task_proc(void *arg, AxlArena *arena)
+sum_task_proc(AxlArena *arena, void *arg)
 {
     SumWork *work = (SumWork *)arg;
     int sum = 0;
@@ -50,7 +50,7 @@ sum_task_proc(void *arg, AxlArena *arena)
  * Runs on the main thread during axl_task_pool_poll().
  */
 static void
-sum_task_complete(void *arg, AxlArena *arena)
+sum_task_complete(AxlArena *arena, void *arg)
 {
     SumWork *work = (SumWork *)arg;
 

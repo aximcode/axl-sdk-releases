@@ -111,7 +111,7 @@ axl_serial_next(
  * @return AXL_OK on success, AXL_ERR if @p handle does not publish
  *     the serial-I/O protocol or @p out is NULL.
  */
-int
+AXL_WARN_UNUSED int
 axl_serial_get_mode(
     AxlHandle      handle,   ///< handle from axl_serial_next
     AxlSerialMode *out       ///< [out] populated on success
@@ -126,7 +126,7 @@ axl_serial_get_mode(
  *     the serial-I/O protocol, the GetControl call fails, or @p out
  *     is NULL.
  */
-int
+AXL_WARN_UNUSED int
 axl_serial_get_control(
     AxlHandle         handle,   ///< handle from axl_serial_next
     AxlSerialControl *out       ///< [out] populated on success

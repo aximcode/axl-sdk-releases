@@ -191,6 +191,32 @@ axl_tpm_read_ek_pub(
 #define AXL_TPM_SEAL_MAX_SECRET  128
 
 /**
+ * @brief Diagnostic detail for a failed axl_tpm_seal / axl_tpm_unseal.
+ *
+ * A seal/unseal chains several TPM2 commands; on AXL_ERR the return code alone
+ * cannot say which one failed or why. Pass a pointer to one of these to learn
+ * the failing command and its raw TPM responseCode — enough to tell a
+ * hierarchy/auth problem (e.g. an authorized owner hierarchy failing an
+ * empty-auth `TPM2_CreatePrimary`) from a transport failure, in one boot.
+ *
+ * Both functions clear this on entry and fill it only on failure; on AXL_OK
+ * (or any AXL_INVALID caught before a TPM command — a NULL argument or a
+ * malformed blob) it is left `{ NULL, 0 }`.
+ */
+typedef struct {
+    /** Failing TPM2 command name — a static string such as
+     *  "TPM2_CreatePrimary" / "TPM2_Create" / "TPM2_Load" / "TPM2_Unseal", or
+     *  NULL if no TPM command reported a failure (a success, an argument/blob
+     *  rejection, or a rare local command-build/response-parse error). */
+    const char *stage;
+    /** The failing command's raw TPM responseCode. 0 when the failure was
+     *  local (command building or response parsing, no TPM-level code);
+     *  0xFFFFFFFF when the firmware's SubmitCommand itself failed (no TPM
+     *  response at all). Otherwise the verbatim TPM2 responseCode. */
+    uint32_t    tpm_rc;
+} AxlTpmError;
+
+/**
  * @brief Seal a secret under a PCR policy.
  *
  * Binds @p secret to the current values of the PCRs listed in @p pcrs
@@ -204,16 +230,18 @@ axl_tpm_read_ek_pub(
  * @return AXL_OK on success; AXL_INVALID if @p secret / @p out_blob /
  *     @p out_blob_len is NULL, @p secret_len is 0 or exceeds
  *     AXL_TPM_SEAL_MAX_SECRET, or @p pcr_count is 0 or names a PCR > 23;
- *     AXL_ERR if no TPM (`!axl_tpm_present()`) or a TPM command fails.
+ *     AXL_ERR if no TPM (`!axl_tpm_present()`) or a TPM command fails (see
+ *     @p err for which command and its responseCode).
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_tpm_seal(
     const uint8_t  *secret,        ///< secret bytes to seal
     size_t          secret_len,    ///< secret length (1..AXL_TPM_SEAL_MAX_SECRET)
     const uint32_t *pcrs,          ///< PCR indices to bind to (each 0..23)
     size_t          pcr_count,     ///< number of PCRs in @p pcrs
     uint8_t       **out_blob,      ///< [out] sealed blob (free with axl_free)
-    size_t         *out_blob_len   ///< [out] sealed blob length
+    size_t         *out_blob_len,  ///< [out] sealed blob length
+    AxlTpmError    *err            ///< [out] failing stage + TPM rc; NULL to ignore
 );
 
 /**
@@ -226,14 +254,16 @@ axl_tpm_seal(
  * @return AXL_OK on success; AXL_INVALID if an argument is NULL or the
  *     blob is malformed; AXL_DENIED if the current PCRs do not satisfy the
  *     seal-time policy (the firmware/measured state changed); AXL_ERR if
- *     no TPM or a TPM command fails.
+ *     no TPM or a TPM command fails (see @p err for which command and its
+ *     responseCode).
  */
-AXL_WARN_UNUSED int
+AXL_WARN_UNUSED AxlStatus
 axl_tpm_unseal(
     const uint8_t *blob,            ///< sealed blob from axl_tpm_seal
     size_t         blob_len,        ///< blob length
     uint8_t      **out_secret,      ///< [out] recovered secret (free with axl_free)
-    size_t        *out_secret_len   ///< [out] recovered secret length
+    size_t        *out_secret_len,  ///< [out] recovered secret length
+    AxlTpmError   *err              ///< [out] failing stage + TPM rc; NULL to ignore
 );
 
 #ifdef __cplusplus

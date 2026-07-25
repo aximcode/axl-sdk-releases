@@ -283,7 +283,10 @@ ships these `.efi` binaries:
 
 | Tool       | Description |
 |------------|-------------|
+| `9p`       | 9P2000.L client and server. `9p ls/get/put <host>[:port] <path>` for one-shot access; `9p serve <root>` exports a subtree so a Linux host can `mount -t 9p -otrans=tcp`; `9p mount <host>` publishes a remote export as a local `fsN:` volume. `serve` and `mount` run as resident drivers — stop them with `serve-stop` / `umount`. |
 | `cat`      | Concatenate files to stdout (UEFI `cat(1)` equivalent). |
+| `cut`      | Select sections from each line — bytes `-b`, characters (UTF-8 codepoints) `-c`, or fields `-f` split on `-d` DELIM (default TAB), with `-s` (only-delimited), `--complement`, `--output-delimiter`, `-z` (NUL-terminated). Reads files or stdin. Port of POSIX `cut(1)`. |
+| `tr`       | Translate, squeeze (`-s`), or delete (`-d`) bytes from stdin, with `-c` complement and `-t` truncate. SET syntax: ranges `a-z`, C escapes (`\n \t \\ \ooo`…), and POSIX `[:classes:]`. Byte-oriented like GNU `tr`. Port of POSIX `tr(1)`. |
 | `clip`     | Copy stdin to the AXL clipboard (`pbcopy`-style) — `some-tool \| clip`, `-m` MIME tag, `--clear`. Cross-app within a boot (AxlShm-backed). |
 | `dmidecode`| SMBIOS / DMI table decoder (UEFI `dmidecode(8)` equivalent) — dumps every record or filter by `-t <type>`; single-value query via `-s <keyword>` (`bios-vendor`, `system-uuid`, etc.). |
 | `fetch`    | HTTP/HTTPS client (curl-like) — `GET`/`POST`/`PUT`/`DELETE`/`HEAD` with custom headers, file upload (`-T`), and response-to-file (`-o`, `-O`). |
@@ -294,6 +297,7 @@ ships these `.efi` binaries:
 | `ipmi`     | Stripped-down `ipmitool` built on AxlIpmi: `info`, `chassis status`/`power on\|off\|cycle\|reset`, `sel list`, `sdr list`, `sensor`, `fru list`, and raw command passthrough (`raw <netfn> <cmd> ...`). |
 | `lspci`    | PCI/PCIe device lister (UEFI `lspci(8)` equivalent) — `-s` BDF filter, `-d` VID:DID filter, `-n` numeric, `-v`/`-vv`/`-vvv` verbose, `-x`/`-xx`/`-xxx` hex dump, `-t` tree (PCI bridge topology). Decodes vendor/device/class names from `pci-ids.json5` sidecar (vendors[] + classes[] in one file). |
 | `lsusb`    | USB device lister (UEFI `lsusb(8)` equivalent) — `-s BBB[:DDD]`, `-d VID[:PID]`, `-n` numeric, `-v`/`-vv` verbose (per-interface class triplet + iManufacturer/iProduct/iSerial), `-t` tree (real USB hub-port topology). Decodes vendor/device names from `usb-ids.json5`. |
+| `lsproto`  | UEFI protocol lister — names live protocols by their **canonical spec identifier** (`EFI_RAM_DISK_PROTOCOL`, not the Shell's short `RamDisk`), from a table generated with AXL's UEFI headers. Default lists every protocol present with its GUID + handle count; `<pattern>` filters the name; `-p <name\|guid>` shows a protocol's handles; `-H` groups by handle; `-u` shows only unnamed (vendor/OEM) GUIDs; `-a` dumps the full known dictionary; `-v` names handles; `-j` JSON; `--sort name\|guid\|count`. Answers "what's actually on this box, by spec name" — which `dh decode` (short labels, curated subset) can't. |
 | `memspd`   | DDR4/DDR5 SPD reader over the platform SMBus — `list` populated slots, `show <slot>` decoded fields, `decode <slot>` raw hex + decoded. JEDEC manufacturer codes resolved via `jedec.json5`. |
 | `mkrd`     | Create / list / destroy FAT16/FAT32 RAM disks in the UEFI Shell (`mkrd <label> [-s size]`, `-l`, `-d <label>`). Handy for staging files without writing to flash. |
 | `netinfo`  | Network interface diagnostics and ping — lists NICs with IP/MAC/link state, pings with `-c <count>`. UEFI `ifconfig`/`ping` equivalent. |

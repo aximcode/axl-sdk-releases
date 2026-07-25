@@ -71,8 +71,9 @@ static const char driver_arch[] = "aa64";
 #endif
 
 typedef struct {
-    const char *pattern;
-    size_t      loaded;
+    const char       *pattern;
+    const AxlAttempt *guard;   /* NULL = unprotected (the legacy contract) */
+    size_t            loaded;
 } DriverLoadCtx;
 
 // ---------------------------------------------------------------------------
@@ -530,7 +531,10 @@ driver_apply_image_identity(
     const char *file_name = (info != NULL && info->file_name != NULL)
                                 ? info->file_name : default_name;
     if (file_name == NULL || file_name[0] == '\0') {
-        const char *ip = axl_app_image_path();
+        /* Anchor, not axl_app_image_path: the loader may itself be a
+           buffer-loaded image with no file of its own, and any ancestor
+           basename beats the "driver.efi" placeholder below. */
+        const char *ip = _axl_app_image_anchor();
         const char *bn = (ip != NULL) ? driver_basename(ip) : NULL;
         file_name = (bn != NULL && bn[0] != '\0') ? bn : "driver.efi";
     }
@@ -765,6 +769,14 @@ axl_driver_connect(
         return AXL_ERR;
     }
 
+    /* The final TRUE (Recursive) is load-bearing, not cosmetic: it makes
+     * ConnectController cascade the ENTIRE driver subtree below each handle in
+     * one call, so a multi-level driver stack binds fully (e.g. a NIC:
+     * virtio-net -> SnpDxe -> MnpDxe -> ArpDxe -> Ip4Dxe -> Dhcp4Dxe, or a
+     * nested USB-network dependency chain). Consumers rely on this -- netload's
+     * firmware-first probe and dependency co-load both assume `connect -r`
+     * resolves arbitrary nesting depth. Do NOT drop it to FALSE (regression-
+     * guarded by test-netload-qemu.sh's --net firmware-first lease check). */
     for (UINTN i = 0; i < count; i++) {
         axl_bs()->ConnectController(handles[i], NULL, NULL, TRUE);
     }
@@ -1038,7 +1050,14 @@ axl_driver_get_image_path(void)
         &EFI_LOADED_IMAGE_PROTOCOL_GUID,
         (void **)&img);
 
-    if (EFI_ERROR(status) || img == NULL || img->FilePath == NULL) {
+    /* DeviceHandle gates this for the same reason it gates
+       axl_app_image_path: a buffer-loaded image has no file it came from,
+       and the MEDIA_FILEPATH node below is one AXL synthesized after the
+       load (driver_apply_image_identity) purely so the shell can render the
+       handle. Decoding it would hand back a volume-less "\<name>" naming no
+       real file. No source volume, no path. */
+    if (EFI_ERROR(status) || img == NULL || img->FilePath == NULL
+        || img->DeviceHandle == NULL) {
         return NULL;
     }
 
@@ -1534,7 +1553,7 @@ load_sibling_via_shell_path(
     return axl_driver_load(driver_full, out_handle);
 }
 
-int
+AxlStatus
 axl_driver_load_sibling(
     const char       *file_name,
     AxlDriverHandle  *out_handle
@@ -1583,8 +1602,10 @@ axl_driver_load_sibling(
 
     /* Fallback: shell-based path resolution. Retained until the DP-primary
        is confirmed to cover the path-searched-launch case on the modern
-       shell (then load_sibling_via_shell_path can retire). */
-    const char *ip = axl_app_image_path();
+       shell (then load_sibling_via_shell_path can retire). Anchor, not
+       axl_app_image_path: "beside the launcher" is an ancestor-directory
+       question, and a buffer-loaded launcher has no file of its own. */
+    const char *ip = _axl_app_image_anchor();
     if (ip == NULL) {
         return AXL_ERR;  /* network / RAM-disk boot: no filesystem anchor */
     }
@@ -1719,7 +1740,7 @@ _axl_driver_ensure_with_embedded_info(
     return AXL_NOT_FOUND;
 }
 
-int
+AxlStatus
 axl_driver_ensure_with_embedded(
     const AxlGuid       *protocol_guid,
     const char          *driver_name,
@@ -1736,7 +1757,45 @@ axl_driver_ensure_with_embedded(
         /* info */ NULL);
 }
 
-int
+AxlStatus
+axl_driver_ensure_from_path(
+    const AxlGuid *protocol_guid,
+    const char    *driver_path,
+    const void    *load_options,
+    size_t         load_options_size
+    )
+{
+    if (protocol_guid == NULL || driver_path == NULL) {
+        return AXL_INVALID;
+    }
+
+    /* Same step-1 short-circuit as the searching variants: an already
+     * published protocol is not ours to re-configure, so load_options is
+     * deliberately ignored on this path. */
+    if (driver_protocol_registered(protocol_guid) == AXL_OK) {
+        axl_debug("driver ensure_from_path: protocol already registered, "
+                  "skipping load of '%s'", driver_path);
+        return AXL_OK;
+    }
+
+    AxlDriverHandle drv = NULL;
+    if (axl_driver_load(driver_path, &drv) != AXL_OK || drv == NULL) {
+        axl_warning("driver ensure_from_path: cannot load pinned driver '%s'",
+                    driver_path);
+        return AXL_NOT_FOUND;
+    }
+
+    /* No search and no embedded fallback by construction: the caller named
+     * the one file it wants, so a failure here is the answer, not a reason
+     * to go looking. driver_start_and_verify unloads on failure. */
+    if (driver_start_and_verify(drv, protocol_guid, driver_path,
+                                load_options, load_options_size) != AXL_OK) {
+        return AXL_NOT_FOUND;
+    }
+    return AXL_OK;
+}
+
+AxlStatus
 axl_driver_ensure(
     const AxlGuid *protocol_guid,
     const char    *driver_name
@@ -1760,6 +1819,15 @@ driver_load_cb(const char *full_path, const AxlFsEntry *entry, void *user)
     if (axl_fs_entry_is_dir(entry) || !axl_fnmatch(c->pattern, entry->name)) {
         return AXL_OK;
     }
+    if (c->guard != NULL && axl_attempt_is_quarantined(c->guard, entry->name)) {
+        axl_warning("skipping quarantined driver: %s", entry->name);
+        return AXL_OK;
+    }
+    /* Breadcrumb BEFORE the load: if this image hangs or resets the box,
+       the surviving breadcrumb is the only thing that names it next boot. */
+    if (c->guard != NULL) {
+        axl_attempt_begin(c->guard, entry->name);
+    }
     AxlDriverHandle drv;
     if (axl_driver_load(full_path, &drv) == 0) {
         if (axl_driver_start(drv) == 0) {
@@ -1771,6 +1839,11 @@ driver_load_cb(const char *full_path, const AxlFsEntry *entry, void *user)
             axl_warning("failed to start: %s", entry->name);
         }
     }
+    /* Survived — load, start, connect and any unload are all inside the
+       breadcrumb window, since a hang in any of them is this driver's fault. */
+    if (c->guard != NULL) {
+        axl_attempt_end(c->guard);
+    }
     return AXL_OK;
 }
 
@@ -1780,12 +1853,41 @@ axl_driver_load_dir(
     const char *pattern,
     size_t     *loaded_count)
 {
+    return axl_driver_load_dir_guarded(dir_path, pattern, NULL, loaded_count);
+}
+
+int
+axl_driver_load_dir_guarded(
+    const char       *dir_path,
+    const char       *pattern,
+    const AxlAttempt *guard,
+    size_t           *loaded_count)
+{
     if (dir_path == NULL) {
         return AXL_ERR;
     }
 
+    /* Heal a prior crash first, so a driver that wedged the box last boot is
+       on the quarantine list before the walk below can reach it again. */
+    if (guard != NULL) {
+        /* Sized from the guard's own bound, not a fixed local: a breadcrumb
+           longer than the read buffer is not truncated, it is unreadable —
+           and an unreadable breadcrumb never recovers and never clears. */
+        char *culprit = (char *)axl_calloc(1, guard->name_max);
+        if (culprit == NULL) {
+            axl_warning("out of memory; skipping crash recovery for this sweep");
+        } else {
+            if (axl_attempt_recover(guard, culprit, guard->name_max) == 1) {
+                axl_warning("last run did not survive loading %s -- quarantining it",
+                            culprit);
+            }
+            axl_free(culprit);
+        }
+    }
+
     DriverLoadCtx ctx = {
         .pattern = (pattern != NULL) ? pattern : "*.efi",
+        .guard   = guard,
         .loaded  = 0,
     };
 

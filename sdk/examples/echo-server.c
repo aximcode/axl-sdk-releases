@@ -52,7 +52,7 @@ on_echo_sent(AxlSocket *sock, AxlStatus status, void *data)
 
     if (status != AXL_OK) {
         /* Send failed — peer likely gone. Close and stop. */
-        axl_socket_free(conn->sock);
+        axl_socket_free(conn->sock, AXL_TEARDOWN_GRACEFUL);
         axl_free(conn);
         return false;
     }
@@ -73,7 +73,7 @@ on_data(AxlSocket *sock, AxlStatus status, void *data)
 
     if (status != AXL_OK || len == 0) {
         axl_printf("  disconnected\n");
-        axl_socket_free(conn->sock);
+        axl_socket_free(conn->sock, AXL_TEARDOWN_GRACEFUL);
         axl_free(conn);
         return false;
     }
@@ -111,7 +111,7 @@ on_accept(AxlSocket *client, AxlStatus status, void *data)
 
     EchoConn *conn = axl_calloc(1, sizeof(EchoConn));
     if (conn == NULL) {
-        axl_socket_free(client);
+        axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
         return true;  /* keep listening */
     }
 
@@ -141,7 +141,7 @@ main(int argc, char **argv)
     listener = axl_socket_new(AXL_SOCKET_STREAM);
     if (listener == NULL || axl_socket_listen(listener, 7000) != AXL_OK) {
         axl_printf("error: cannot listen on port 7000\n");
-        axl_socket_free(listener);
+        axl_socket_free(listener, AXL_TEARDOWN_GRACEFUL);
         return 1;
     }
 
@@ -150,12 +150,12 @@ main(int argc, char **argv)
     loop = axl_loop_new();
     if (loop == NULL) {
         axl_printf("error: axl_loop_new failed\n");
-        axl_socket_free(listener);
+        axl_socket_free(listener, AXL_TEARDOWN_GRACEFUL);
         return 1;
     }
     if (axl_socket_accept_async(listener, loop, on_accept, NULL) != AXL_OK) {
         axl_printf("error: axl_socket_accept_async failed\n");
-        axl_socket_free(listener);
+        axl_socket_free(listener, AXL_TEARDOWN_GRACEFUL);
         axl_loop_free(loop);
         return 1;
     }
@@ -164,7 +164,7 @@ main(int argc, char **argv)
        axl_tcp_close drops the listener's still-armed accept source
        against this loop; the previous "free loop, then close" order
        left axl_tcp_close dereferencing freed loop memory. */
-    axl_socket_free(listener);
+    axl_socket_free(listener, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(loop);
     return 0;
 }

@@ -43,20 +43,33 @@ need "(retry" "$rout"
 [[ $rrc -eq 0 ]] || { echo "  FAIL: retry-recovered flaky test should exit 0"; fail=1; }
 [[ $fail -eq 0 ]] && echo "  PASS: transient failure retried -> PASS, exit 0"
 
-# --- per-worker TEST_PORT_BASE is distinct across concurrent workers ---
+# --- concurrent workers get distinct host-port bases ---
+# The runner no longer assigns TEST_PORT_BASE (a formula only keeps ONE
+# invocation self-consistent — see run_one). It must leave the variable
+# unset so each test claims its own base through common-test.sh, and those
+# claims must not collide across workers running at the same time. The stubs
+# source common-test.sh for real and hold their claim while the others run,
+# so the overlap is genuine rather than sequential reuse of one port.
 bstub=$(mktemp -d); bout=$(mktemp -d)
 for n in a b c; do
-    printf '#!/bin/bash\necho "$TEST_PORT_BASE" > "%s/$$.base"\nexit 0\n' "$bout" \
-        > "$bstub/test-base-$n-qemu.sh"
+    printf '#!/bin/bash\nsource "%s/common-test.sh"\necho "$TEST_PORT_BASE" > "%s/$$.base"\nsleep 2\nexit 0\n' \
+        "$PWD" "$bout" > "$bstub/test-base-$n-qemu.sh"
 done
 chmod +x "$bstub"/*.sh
-RUN_INTEGRATION_DIR="$bstub" ./run-integration.sh -j4 --timeout 5 >/dev/null 2>&1
+RUN_INTEGRATION_DIR="$bstub" ./run-integration.sh -j4 --timeout 20 >/dev/null 2>&1
+nbases=$(cat "$bout"/*.base 2>/dev/null | wc -l)
 ndistinct=$(cat "$bout"/*.base 2>/dev/null | sort -u | wc -l)
+inrange=$(awk '$1 >= 18000 && $1 <= 19999' "$bout"/*.base 2>/dev/null | wc -l)
 rm -rf "$bstub" "$bout"
-if [[ "$ndistinct" -eq 3 ]]; then
-    echo "  PASS: 3 workers got 3 distinct TEST_PORT_BASE values"
+if [[ "$nbases" -eq 3 && "$ndistinct" -eq 3 ]]; then
+    echo "  PASS: 3 concurrent workers claimed 3 distinct port bases"
 else
-    echo "  FAIL: expected 3 distinct port bases, got $ndistinct"; fail=1
+    echo "  FAIL: expected 3 distinct port bases, got $ndistinct of $nbases"; fail=1
+fi
+if [[ "$inrange" -eq 3 ]]; then
+    echo "  PASS: runner left TEST_PORT_BASE to the allocator (all in 18000-19999)"
+else
+    echo "  FAIL: $inrange/3 bases came from the allocator range"; fail=1
 fi
 
 # --- --shard i/K partitions the set: union == full, no overlap ---

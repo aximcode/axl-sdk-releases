@@ -208,7 +208,7 @@ run_rndisfix(AxlArgs *a)
     /* Make sure the NIC drivers (UsbRndis + NetworkCommon) are loaded
        and bound, so the RNDIS device is in the INITIALIZED state and
        will accept a SET message. */
-    if (axl_net_ensure_drivers() != AXL_OK) {
+    if (axl_net_ensure_drivers() != AXL_NET_DRIVERS_OK) {
         axl_printf("rndisfix: failed to bring up network drivers\n");
         return 1;
     }

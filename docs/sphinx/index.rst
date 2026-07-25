@@ -60,6 +60,8 @@ AXL SDK
    modules/tls
    modules/crypto
    modules/scram
+   modules/jose
+   modules/9p
    modules/sys
    modules/cpu
    modules/port
@@ -69,6 +71,8 @@ AXL SDK
    modules/vterm
    modules/mem-phys
    modules/watchdog
+   modules/crashrecord
+   modules/attempt
    modules/rng
    modules/rand
    modules/gfx
@@ -83,6 +87,9 @@ AXL SDK
    modules/usb
    modules/block
    modules/nvme
+   modules/ata
+   modules/scsi
+   modules/smart
    modules/serial
    modules/fv
    modules/fw

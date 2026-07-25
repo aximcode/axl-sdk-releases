@@ -168,6 +168,62 @@ un-does the take-over in three steps, and the *order* matters:
 
 ---
 
+## 3b. Co-painting (`passthrough_local`) and reshape
+
+Setting `passthrough_local` skips step 3 — we never remove the firmware
+consoles' tag, so ConSplitter fans output to **both** them and us. That is the
+mode a mirror wants: the local monitor keeps painting, a KVM stream sampling
+the GOP keeps working, and firmware Setup stays faithful, because we are a
+**reader** rather than an owner.
+
+The consequence is that the grid is no longer ours alone. Two consoles painting
+one screen have to agree on it, so install refuses an explicit `cols`/`rows`
+here and `axl_console_device_set_size` is ignored — a geometry only *we* moved
+is a desync, not a resize.
+
+**Mirroring the mode list.** ConSplitter intersects its members' text modes **by
+`(Columns, Rows)`**, not by index (`ConSplitterSyncOutputMode`,
+`ConSplitter.c:2411`). A device advertising the single geometry it happens to be
+in therefore constrains the aggregate to that geometry. Measured under OVMF, the
+failure is not a clean "no other mode" but a **half-switch**: a
+`gST->ConOut->SetMode` fans out, the physical console reshapes (100x31 → 80x25),
+our device answers `EFI_UNSUPPORTED` and keeps advertising the old size — the two
+co-painting consoles end up on different grids, each believing it agreed, and the
+consumer is told nothing.
+
+So a passthrough device **mirrors the physical console's mode list**,
+index-for-index, snapshotted before we publish (once we are a member, the
+aggregate's list is the intersection *with us* and reading it back would be
+circular). Holes are mirrored too: EDK2 leaves an unsupported mode in place with
+0x0 geometry (OVMF's mode 1 when 80x50 is absent), and a mode number has to mean
+the same thing whether or not we are installed.
+
+With that in place, reshape is just the ordinary public API —
+`axl_console_text_find_mode` + `axl_console_text_set_mode` — and it gets three
+things right by construction:
+
+- **Both consoles move together.** `ConSplitterTextOutSetMode` fans out to every
+  member with its own mapped index (`ConSplitter.c:4619`), so the physical
+  console and our device reshape in the same call.
+- **The ConsoleLogger re-syncs itself.** The stale-scrollback hazard of §3 step 4
+  is caused by geometry changing *without* a `SetMode` routed through
+  `gST->ConOut`. Here the reshape **is** such a SetMode, so
+  `ConsoleLoggerSetMode → ResetBuffers` re-reads `QueryMode` at the new geometry
+  for free. (This is why the reshape must go through the aggregate and not
+  straight at the physical console's `SimpleTextOut`: ConSplitter's own
+  `QueryMode` answers from a **cached** `TextOutQueryData`, `ConSplitter.c:4592`,
+  so a behind-its-back switch would leave the logger re-reading a stale size.)
+- **The consumer learns the new size.** `dev_set_mode` updates the advertised
+  geometry and then fires `AxlConsoleOps::resize` — after the update, so
+  `axl_console_device_get_size` already agrees and either source is valid.
+
+Snapping to the firmware's enumerated modes (80x25 / 100x31 / 128x40 / 160x53 on
+real hardware) is a rounding, not a limit: arbitrary geometry would mean owning
+the framebuffer, which is the take-over model.
+
+Regression: `test-console-reshape-qemu.sh` (20 checks, both arches) —
+RED was 6 failures, all of them the half-switch above.
+
 ## 4. Why the device model won (the dead ends, one line each)
 
 The take-over shape is settled; this is *why*, not a re-litigation. The full

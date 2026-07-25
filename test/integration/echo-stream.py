@@ -85,6 +85,19 @@ def run_tcp(bind: str, port: int) -> int:
 def run_udp(bind: str, port: int) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT so two INDEPENDENT unit-test runs can coexist on this
+    # port. Unlike every other host port in the harness this one cannot be
+    # allocated dynamically: the guest targets it as a compile-time constant
+    # (AXL_TEST_UDP_ECHO_PORT in test/unit/axl-test-net.c) and slirp delivers
+    # the datagram to host loopback on exactly that number, so there is
+    # nowhere to plumb a runtime choice through. Sharing the bind is safe
+    # here because the echo is stateless: the kernel steers each datagram to
+    # one of the bound sockets, whichever server receives it echoes back to
+    # the sender's address, and the reply reaches the VM it came from.
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass  # not Linux/BSD — single-runner behaviour, as before
     sock.bind((bind, port))
 
     def on_signal(_sig: int, _frame: object | None) -> None:

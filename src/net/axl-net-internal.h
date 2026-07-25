@@ -72,6 +72,151 @@ _axl_net_bus_location(
 );
 
 // ---------------------------------------------------------------------------
+// SNP MAC access — shared by axl-net-nic.c (registry build + dedup),
+// axl-net-arp.c (ordinal -> MAC -> ARP service binding), and axl-net-dhcp.c
+// (MAC -> IP4Config2 lookup). One rule, one place: the three call sites used
+// to guard HwAddressSize independently and drifted apart (axl-net-dhcp.c's
+// ip4cfg_for_mac clamped to a *prefix* match instead of rejecting a short
+// address), so a NIC that axl-net-nic.c's registry (and therefore
+// axl_net_list_interfaces) would skip could still resolve through
+// axl_net_get_dhcp_lease_by_mac -- two public APIs disagreeing about which
+// NICs exist.
+// ---------------------------------------------------------------------------
+
+/// SNP protocol on @p h, or NULL if the handle doesn't publish one.
+EFI_SIMPLE_NETWORK_PROTOCOL *
+_axl_net_snp_on(
+    EFI_HANDLE h   ///< handle to query
+);
+
+/**
+ * @brief Read an SNP handle's hardware address into @p out_mac[6].
+ *
+ * A handle reporting HwAddressSize < 6 cannot be keyed: a short/zero MAC
+ * compares equal to too much, so it would both collapse distinct NICs into
+ * one registry row (dedup) and match an arbitrary handle (MAC lookup).
+ * Skip those handles uniformly -- every MAC-keyed reader in axl-net enforces
+ * this same rule. HwAddressSize > 6 (e.g. InfiniBand) is fine; the leading 6
+ * bytes key it.
+ *
+ * @return true and fills @p out_mac on success; false (leaving @p out_mac
+ *     untouched) for a NULL @p snp, a NULL @p snp->Mode, or
+ *     HwAddressSize < 6.
+ */
+bool
+_axl_net_snp_mac(
+    EFI_SIMPLE_NETWORK_PROTOCOL *snp,       ///< SNP protocol (from _axl_net_snp_on)
+    uint8_t                      out_mac[6] ///< [out] hardware address
+);
+
+// ---------------------------------------------------------------------------
+// NIC registry (axl-net-nic.c) — the canonical per-physical-NIC model.
+//
+// LocateHandleBuffer(SimpleNetwork) returns one handle per SNP *child*, so a
+// single physical NIC commonly repeats 2-3x, and that enumeration diverges
+// from the IP4Config2 one in BOTH order and count. Indexing one with the
+// other's index lands config on the wrong NIC (real-HW symptom: a link-up NIC
+// never leases because DHCP went to a link-down sibling). The registry is the
+// single answer to "what NICs does this machine have": SNP handles deduped by
+// MAC, each correlated to its IP4Config2 handle by MAC, in stable enumeration
+// order — so a NIC index is a per-physical-NIC ordinal, consistent across
+// every net API.
+//
+// Built fresh per public call and freed when that call returns: NICs appear as
+// drivers load and connect, so a cached list would go stale exactly when it
+// matters.
+// ---------------------------------------------------------------------------
+
+/// One physical NIC. Internal — never exposed through include/axl/.
+typedef struct {
+    uint8_t     mac[6];         ///< hardware address (the stable key)
+    char        name[32];       ///< "eth<ordinal>"
+    bool        link_up;        ///< !MediaPresentSupported || MediaPresent
+    uint32_t    mtu;            ///< SNP Mode->MaxPacketSize
+    bool        has_ipv4;       ///< true when ipv4/netmask are valid
+    uint8_t     ipv4[4];        ///< station address (valid if has_ipv4)
+    uint8_t     netmask[4];     ///< subnet mask (valid if has_ipv4)
+    uint8_t     gateway[4];     ///< default gateway (valid if has_ipv4)
+    EFI_HANDLE  snp_handle;     ///< first SNP child handle publishing this MAC
+    EFI_HANDLE  ip4cfg_handle;  ///< IP4Config2 handle for this MAC, NULL if none
+} AxlNic;
+
+/**
+ * @brief Build the canonical per-physical-NIC list.
+ *
+ * Stable firmware-enumeration order; the ordinal is the array position.
+ * Zero NICs is success with @p *count == 0 and @p *out == NULL.
+ *
+ * @return AXL_OK on success (including zero NICs), AXL_ERR on NULL args or
+ *     allocation failure.
+ */
+int
+_axl_net_nics_build(
+    AxlNic **out,    ///< [out] allocated array, release with _axl_net_nics_free
+    size_t  *count   ///< [out] number of physical NICs
+);
+
+/// Release an array from _axl_net_nics_build. NULL is a no-op.
+void
+_axl_net_nics_free(
+    AxlNic *nics
+);
+
+/**
+ * @brief Resolve a NIC ordinal (explicit or AXL_NET_NIC_AUTO) to a concrete
+ *     registry ordinal, without touching IP4Config2.
+ *
+ * Implements the same rule _axl_net_nic_resolve_ip4cfg applies before it
+ * goes on to resolve a protocol pointer: AXL_NET_NIC_AUTO prefers the first
+ * link-up NIC with an IP4Config2, else the first NIC with one, else index 0
+ * (the placeholder _axl_net_nic_resolve_ip4cfg's positional fallback picks
+ * up next). An explicit index is bounds-checked — out of range resolves to
+ * @p count (never a clamp to NIC 0; that clamp was the wrong-NIC bug).
+ *
+ * Split out from _axl_net_nic_resolve_ip4cfg so a caller can resolve
+ * AXL_NET_NIC_AUTO to a concrete ordinal ONCE and reuse that SAME ordinal
+ * for both configuring a NIC and reading its state back afterward (e.g.
+ * axl_net_bring_up's addr_out) — two independent AUTO resolutions can
+ * disagree if link state shifts between them, while reusing one ordinal
+ * cannot.
+ *
+ * @return the resolved ordinal in [0, @p count); @p count itself if
+ *     unresolvable (@p nic_index out of range, @p count == 0, or @p nics
+ *     is NULL).
+ */
+size_t
+_axl_net_nic_resolve_index(
+    const AxlNic *nics,       ///< registry from _axl_net_nics_build
+    size_t        count,      ///< registry length
+    size_t        nic_index   ///< ordinal, or AXL_NET_NIC_AUTO
+);
+
+/**
+ * @brief Resolve a NIC ordinal to its IP4Config2 protocol.
+ *
+ * @p nic_index may be AXL_NET_NIC_AUTO (SIZE_MAX): resolved to an ordinal via
+ * _axl_net_nic_resolve_index (see its doc comment for the AUTO ladder). An
+ * explicit index is bounds-checked — out of range is an error, NOT a clamp to
+ * NIC 0 (that clamp was the wrong-NIC bug).
+ *
+ * When the selected NIC has no correlated IP4Config2 — or, under AUTO, when no
+ * NIC has one at all — falls back to the single positional handle, but only
+ * when there is exactly one NIC and exactly one IP4Config2 handle: the only
+ * case where the guess cannot be wrong. The guard, not the spelling of the
+ * index, is what makes it safe, so AUTO and an explicit index reach it
+ * identically. With 2+ NICs or 2+ IP4Config2 handles the fallback is refused
+ * (warns, returns NULL).
+ *
+ * @return the protocol, or NULL if unresolvable.
+ */
+EFI_IP4_CONFIG2_PROTOCOL *
+_axl_net_nic_resolve_ip4cfg(
+    const AxlNic *nics,       ///< registry from _axl_net_nics_build
+    size_t        count,      ///< registry length
+    size_t        nic_index   ///< ordinal, or AXL_NET_NIC_AUTO
+);
+
+// ---------------------------------------------------------------------------
 // HTTP Core — internal helpers (raw-buffer parsers are public, see
 // <axl/axl-http-core.h>; this file declares only the internal builders.)
 // ---------------------------------------------------------------------------

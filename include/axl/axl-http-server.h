@@ -18,6 +18,7 @@
 #include <axl/axl-hash-table.h>
 #include <axl/axl-json.h>
 #include <axl/axl-bytes.h>
+#include <axl/axl-tcp.h>        /* AxlTeardown */
 
 #ifdef __cplusplus
 extern "C" {
@@ -144,14 +145,36 @@ axl_http_server_new(
 
 /**
  * @brief Free an HTTP server and all resources.
+ *
+ * Graceful teardown: in-flight connections are closed with a FIN and,
+ * when a loop is still running, their firmware finalization is deferred
+ * to it. With `AXL_TEARDOWN_GRACEFUL` the listen port may therefore remain
+ * bound until those closes finalize on a later loop tick — fine for normal
+ * shutdown, but NOT when the caller is about to stop pumping the loop (e.g.
+ * block in `axl_image_run`) and needs the port immediately. For that, pass
+ * `AXL_TEARDOWN_RESET`.
+ *
+ * @p mode (see @ref AxlTeardown):
+ * - `AXL_TEARDOWN_GRACEFUL` — orderly FIN close of the listener and every
+ *   in-flight connection; deferred finalize; the polite default.
+ * - `AXL_TEARDOWN_RESET` — the port-releasing teardown: the listener and every
+ *   in-flight connection are closed abortively (TCP RST) and finalized
+ *   **synchronously and loop-free** (including draining the accept backlog and
+ *   finalizing pending deferred closes), so a fresh
+ *   @ref axl_http_server_new + @ref axl_http_server_start on the same port
+ *   succeeds **immediately with no loop pumping**, even with connections in
+ *   flight. For an in-place self-upgrade / port hand-off. The RST discards
+ *   un-ACKed in-flight response bytes — the intended trade — and leaves no
+ *   deferred close source behind. RAII cleanup uses `AXL_TEARDOWN_GRACEFUL`.
  */
 void
 axl_http_server_free(
-    AxlHttpServer *server  ///< server to free (NULL-safe)
+    AxlHttpServer *server,  ///< server to free (NULL-safe)
+    AxlTeardown    mode     ///< AXL_TEARDOWN_GRACEFUL or AXL_TEARDOWN_RESET
 );
 
 #ifdef AXL_HAVE_AUTOPTR
-AXL_DEFINE_AUTOPTR_CLEANUP(AxlHttpServer, axl_http_server_free)
+AXL_DEFINE_AUTOPTR_CLEANUP_ARG(AxlHttpServer, axl_http_server_free, AXL_TEARDOWN_GRACEFUL)
 #endif
 
 /**
@@ -699,10 +722,13 @@ axl_http_server_use_tls(
 // WebSocket (RFC 6455)
 // ---------------------------------------------------------------------------
 
-#define AXL_WS_CONNECT     0
-#define AXL_WS_TEXT        1
-#define AXL_WS_BINARY      2
-#define AXL_WS_DISCONNECT  3
+/// WebSocket event kind delivered to an AxlWsHandler / AxlWsConnHandler.
+typedef enum {
+    AXL_WS_CONNECT    = 0,  ///< connection opened (after the 101 handshake)
+    AXL_WS_TEXT       = 1,  ///< a text frame arrived
+    AXL_WS_BINARY     = 2,  ///< a binary frame arrived
+    AXL_WS_DISCONNECT = 3   ///< connection closed
+} AxlWsEvent;
 
 /**
  * @brief WebSocket event callback.
@@ -710,7 +736,7 @@ axl_http_server_use_tls(
  * @return AXL_OK on success, AXL_ERR on failure.
  */
 typedef int (*AxlWsHandler)(
-    size_t     event,       ///< one of AXL_WS_CONNECT, AXL_WS_TEXT, AXL_WS_BINARY, AXL_WS_DISCONNECT
+    AxlWsEvent  event,      ///< one of AXL_WS_CONNECT, AXL_WS_TEXT, AXL_WS_BINARY, AXL_WS_DISCONNECT
     const void *frame,      ///< frame data (NULL for CONNECT/DISCONNECT)
     size_t     frame_size,  ///< frame data size
     void       *data        ///< opaque caller data
@@ -875,7 +901,7 @@ typedef struct AxlWsConn AxlWsConn;
  */
 typedef int (*AxlWsConnHandler)(
     AxlWsConn  *conn,       ///< the client this event is for
-    size_t      event,      ///< AXL_WS_CONNECT / _TEXT / _BINARY / _DISCONNECT
+    AxlWsEvent  event,      ///< AXL_WS_CONNECT / _TEXT / _BINARY / _DISCONNECT
     const void *frame,      ///< frame data (NULL for CONNECT/DISCONNECT)
     size_t      frame_size, ///< frame data size
     void       *data        ///< per-endpoint opaque (from registration)
@@ -920,10 +946,15 @@ axl_http_server_add_websocket_ex(
  * Like axl_http_server_ws_broadcast, frames are queued on the connection's
  * outbound FIFO and serialized over the one-send-in-flight transport, so
  * back-to-back sends are delivered in order (and never desync TLS); the queue
- * is bounded and drops oldest-unsent under sustained back-pressure.
+ * is bounded and drops oldest-unsent under sustained back-pressure. A single
+ * frame whose framed size exceeds the per-connection outbound budget (512 KB)
+ * is REJECTED with AXL_ERR rather than admitted — chunk a larger payload into
+ * multiple sends yourself (one oversized frame could otherwise wedge the
+ * single-threaded server draining it through the transport).
  *
  * @return AXL_OK on success; AXL_ERR on NULL @p conn / @p data, a bad
- *     @p opcode, a closed / non-WebSocket connection, or a send failure.
+ *     @p opcode, a closed / non-WebSocket connection, a frame larger than the
+ *     outbound budget, or a send failure.
  */
 int
 axl_ws_send(
@@ -1186,6 +1217,25 @@ axl_http_server_add_upload_route_auth(
  *     (aborted=false) OR mid-upload TCP teardown (aborted=true).
  *     Same shape as AxlUploadHandler's clean-EOF/abort
  *     contract.
+ *
+ * `write_close` returns a status because the final flush is where a
+ * streaming write actually becomes durable, and nothing earlier can
+ * report that: every chunk may have been accepted and the last flush
+ * still fail on a full volume or write-protected media. On the clean-EOF
+ * call an `AXL_ERR` return makes PUT answer **500**, not 201 — a backend
+ * that cannot guarantee the bytes landed must say so here or the client
+ * records a stored file that does not exist. The return is IGNORED on
+ * the abort call (`aborted=true`), where the partial file is expected
+ * and no response is transmitted.
+ *
+ * **Wire `write_open` and `write_close` as a PAIR.** A vtable with a
+ * `write_open` but a NULL `write_close` still accepts uploads, and
+ * answers **201 Created** for every one that carried a body — the only
+ * place a durability failure can be reported is the call that is
+ * missing (an empty-body PUT answers 405 instead, since it cannot
+ * materialize the file without a close). The SDK's own
+ * `axl_http_serve_fs` backend fills or nulls the two together; a
+ * hand-written vtable is where the halves drift apart.
  */
 typedef struct {
     /// PROPFIND backing — list children of a directory.
@@ -1207,7 +1257,7 @@ typedef struct {
     /// Streaming write — drives the upload-route chunk handler for PUT.
     int  (*write_open)(void *user, const char *path, void **out_ctx);
     int  (*write_chunk)(void *ctx, const void *data, size_t len);
-    void (*write_close)(void *ctx, bool aborted);
+    int  (*write_close)(void *ctx, bool aborted);
 
     /// Lifecycle — MKCOL / DELETE / MOVE / COPY.
     int  (*mkdir)(void *user, const char *path);

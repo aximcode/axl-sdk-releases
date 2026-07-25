@@ -889,7 +889,14 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
                write ctx and report 201 (or 500 if write_chunk
                errored mid-stream). */
             if (ctx->put_ctx != NULL && ctx->ops.write_close != NULL) {
-                ctx->ops.write_close(ctx->put_ctx, false);
+                /* The final flush is where the write becomes durable, so
+                   its status counts toward put_failed BEFORE the status
+                   is chosen: every chunk can succeed and the close still
+                   fail on a full volume. Reporting 201 there would tell
+                   the client its data is stored when it is not. */
+                if (ctx->ops.write_close(ctx->put_ctx, false) != AXL_OK) {
+                    ctx->put_failed = true;
+                }
             }
             resp->status_code = ctx->put_failed ? 500 : 201;
             ctx->put_ctx    = NULL;
@@ -910,8 +917,12 @@ on_dav_upload(AxlHttpRequest *req, AxlHttpResponse *resp,
                     != AXL_OK)
                 {
                     resp->status_code = 409;
+                } else if (ctx->ops.write_close(empty_ctx, false) != AXL_OK) {
+                    /* Same durability contract as the chunked branch —
+                       an empty file that never reached the volume is
+                       still a failed PUT. */
+                    resp->status_code = 500;
                 } else {
-                    ctx->ops.write_close(empty_ctx, false);
                     resp->status_code = 201;
                 }
             }

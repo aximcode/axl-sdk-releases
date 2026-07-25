@@ -220,7 +220,8 @@ main(int argc, char **argv)
         return 1;
     }
 
-    axl_printf("memfs: published. Run `map -r` then `dir fsN:` "
-               "(N depends on what's already mounted).\n");
+    axl_printf("memfs: published. Run `dir fsN:` "
+               "(N depends on what's already mounted) -- publish assigns "
+               "the fsN: mapping automatically, no `map -r` needed.\n");
     return 0;
 }

@@ -270,6 +270,50 @@ static const AxlGuid g_mock_guid = AXL_GUID(
     0x12345678, 0xabcd, 0x4001,
     0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd);
 
+/* A second publication that DOES answer volume_info, so the volume
+   space query has a deterministic backing store to read. The tests
+   drive g_mock_space between calls to cover known / unknown figures;
+   g_mock_provider (no volume_info callback) covers the thunk's
+   synthesized (uint64_t)-1 "unknown" default. */
+static uint64_t    g_mock_space_total  = 0;
+static uint64_t    g_mock_space_free   = 0;
+static AxlFsStatus g_mock_space_status = AXL_FS_OK;
+
+static AxlFsStatus
+mock_volume_info(
+    void                    *backend_ctx,
+    AxlFsProviderVolumeInfo *out
+    )
+{
+    (void)backend_ctx;
+    if (g_mock_space_status != AXL_FS_OK) {
+        return g_mock_space_status;
+    }
+    out->read_only   = false;
+    out->volume_size = g_mock_space_total;
+    out->free_space  = g_mock_space_free;
+    out->block_size  = 512;
+    axl_strlcpy(out->label, "MockFs", sizeof(out->label));
+    return AXL_FS_OK;
+}
+
+static const AxlFsProvider g_mock_sized_provider = {
+    .struct_size   = sizeof(AxlFsProvider),
+    .version       = AXL_FS_PROVIDER_VERSION,
+    .open          = mock_open,
+    .close         = mock_close,
+    .read          = mock_read,
+    .read_dir      = mock_read_dir,
+    .seek          = mock_seek,
+    .get_info      = mock_get_info,
+    .volume_info   = mock_volume_info,
+    .default_label = "MockFs",
+};
+
+static const AxlGuid g_mock_sized_guid = AXL_GUID(
+    0x12345678, 0xabcd, 0x4002,
+    0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xce);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -543,7 +587,7 @@ test_device_path_make_vendor(void)
     AxlGuid g = AXL_GUID(0xdeadbeef, 0xcafe, 0x4002,
                          0x80, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55);
     AxlDevicePath *dp = NULL;
-    int rc = axl_device_path_make_vendor(&g, &dp);
+    int rc = axl_device_path_new_vendor(&g, &dp);
     test_check(rc == AXL_OK && dp != NULL,
                "device-path: make_vendor allocates");
 
@@ -566,9 +610,9 @@ test_device_path_make_vendor(void)
     uint16_t end_len = (uint16_t)(end[2] | (end[3] << 8));
     test_check(end_len == 4, "device-path: END node length=4");
 
-    test_check(axl_device_path_make_vendor(NULL, &dp) != AXL_OK,
+    test_check(axl_device_path_new_vendor(NULL, &dp) != AXL_OK,
                "device-path: rejects NULL guid");
-    test_check(axl_device_path_make_vendor(&g, NULL) != AXL_OK,
+    test_check(axl_device_path_new_vendor(&g, NULL) != AXL_OK,
                "device-path: rejects NULL out");
     axl_free(dp);
 }
@@ -622,6 +666,369 @@ test_volume_enumerate_round_trip(void)
 }
 
 // ---------------------------------------------------------------------------
+// axl_volume_get_space_by_handle — exact figures, and the distinction
+// between "reported" and "cannot report".
+//
+// The mock provider is the only volume in the suite whose free space we
+// control, so it is what pins the numbers. UINT64_MAX is the provider
+// layer's documented "unknown" marker (AxlFsProviderVolumeInfo) and must
+// surface as AXL_UNSUPPORTED, never as a plausible figure -- a caller
+// sizing an upload has to tell "no room" from "cannot say".
+// ---------------------------------------------------------------------------
+
+#define SPACE_UNTOUCHED  0xD15EA5EDD15EA5EDull
+
+static void
+test_volume_get_space(void)
+{
+    void *handle = NULL;
+    if (axl_fs_provider_publish(&g_mock_sized_provider, &g_mock_sized_guid,
+                                &handle) != AXL_OK) {
+        test_fail("fs-provider: get_space setup: publish failed");
+        return;
+    }
+
+    uint64_t total = SPACE_UNTOUCHED;
+    uint64_t avail = SPACE_UNTOUCHED;
+
+    /* Both figures known: exact pass-through, no rounding, no scaling. */
+    g_mock_space_total = 64ull * 1024 * 1024;
+    g_mock_space_free  = 12ull * 1024 * 1024 + 3;
+    test_check(axl_volume_get_space_by_handle(handle, &total, &avail) == AXL_OK,
+               "get_space: known figures return AXL_OK");
+    test_check(total == 64ull * 1024 * 1024,
+               "get_space: total is the volume's exact VolumeSize");
+    test_check(avail == 12ull * 1024 * 1024 + 3,
+               "get_space: free is the volume's exact FreeSpace");
+
+    /* Free unknown: a free-space query must fail, and must NOT write a
+       value -- the whole point is that the caller cannot mistake it for
+       a real figure. */
+    g_mock_space_free = (uint64_t)-1;
+    total = SPACE_UNTOUCHED;
+    avail = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(handle, &total, &avail)
+                   == AXL_UNSUPPORTED,
+               "get_space: unknown free space returns AXL_UNSUPPORTED");
+    test_check(avail == SPACE_UNTOUCHED && total == SPACE_UNTOUCHED,
+               "get_space: out params untouched on AXL_UNSUPPORTED");
+
+    /* ...but a caller that only asked for the total still gets it: only
+       the figures actually requested gate the result. */
+    total = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(handle, &total, NULL) == AXL_OK,
+               "get_space: total-only query unaffected by unknown free");
+    test_check(total == 64ull * 1024 * 1024,
+               "get_space: total-only query writes the total");
+
+    /* Symmetric case: total unknown, free known, free-only query. */
+    g_mock_space_total = (uint64_t)-1;
+    g_mock_space_free  = 4096;
+    avail = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(handle, NULL, &avail) == AXL_OK,
+               "get_space: free-only query unaffected by unknown total");
+    test_check(avail == 4096,
+               "get_space: free-only query writes the free space");
+    total = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(handle, &total, &avail)
+                   == AXL_UNSUPPORTED,
+               "get_space: unknown total fails a total+free query");
+
+    /* A volume that FAILS is not a volume that cannot say. A device
+       error must not be laundered into AXL_UNSUPPORTED -- the caller
+       distinguishes "decide some other way" from "this volume is
+       sick", and only one of those is worth retrying. */
+    g_mock_space_status = AXL_FS_ERR_IO;
+    total = SPACE_UNTOUCHED;
+    avail = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(handle, &total, &avail) == AXL_ERR,
+               "get_space: a device error is AXL_ERR, not AXL_UNSUPPORTED");
+    test_check(total == SPACE_UNTOUCHED && avail == SPACE_UNTOUCHED,
+               "get_space: out params untouched on a device error");
+
+    /* A volume that genuinely has no filesystem information is the
+       AXL_UNSUPPORTED case, and stays distinct from the above. */
+    g_mock_space_status = AXL_FS_ERR_UNSUPPORTED;
+    test_check(axl_volume_get_space_by_handle(handle, &total, &avail)
+                   == AXL_UNSUPPORTED,
+               "get_space: no filesystem information is AXL_UNSUPPORTED");
+    g_mock_space_status = AXL_FS_OK;
+
+    /* Argument validation. */
+    test_check(axl_volume_get_space_by_handle(NULL, &total, &avail) == AXL_ERR,
+               "get_space: NULL handle is AXL_ERR");
+    test_check(axl_volume_get_space_by_handle(handle, NULL, NULL) == AXL_ERR,
+               "get_space: asking for neither figure is AXL_ERR");
+
+    axl_fs_provider_unpublish(handle);
+
+    /* A provider with no volume_info callback at all: the thunk
+       synthesizes (uint64_t)-1 for both, which must read as
+       "cannot report", not as a full or empty volume. */
+    void *plain = NULL;
+    if (axl_fs_provider_publish(&g_mock_provider, &g_mock_guid, &plain)
+            != AXL_OK) {
+        test_fail("fs-provider: get_space setup: plain publish failed");
+        return;
+    }
+    total = SPACE_UNTOUCHED;
+    avail = SPACE_UNTOUCHED;
+    test_check(axl_volume_get_space_by_handle(plain, &total, &avail)
+                   == AXL_UNSUPPORTED,
+               "get_space: provider without volume_info is AXL_UNSUPPORTED");
+    test_check(total == SPACE_UNTOUCHED && avail == SPACE_UNTOUCHED,
+               "get_space: no-volume_info leaves out params untouched");
+    axl_fs_provider_unpublish(plain);
+
+    /* Don't leave the mock's volume figures parked on the "unknown"
+       marker for whatever test is appended after this one. */
+    g_mock_space_total  = 0;
+    g_mock_space_free   = 0;
+    g_mock_space_status = AXL_FS_OK;
+}
+
+// A provider that ACCEPTS a size change and ignores it — the fixture for
+// axl_file_truncate's post-resize re-read.
+//
+// <axl/axl-fs-provider.h> tells authors SetInfo exists for renames and
+// attribute changes; a provider written to that contract reads `in->name`
+// and `in->attributes`, never `in->size`, and returns AXL_FS_OK. Without
+// the re-read, axl_file_truncate would report AXL_OK for a resize that
+// never happened — on this whole class of volumes. The single assertion
+// below is what fails if the re-read in axl_file_truncate is removed;
+// the FAT-backed tests in AxlTestIO cannot catch that, because there the
+// size really does change.
+// ---------------------------------------------------------------------------
+
+#define LIAR_FILE_NAME  "f"
+#define LIAR_FILE_BODY  "abc"
+#define LIAR_FILE_SIZE  3u
+
+static bool
+liar_is_our_file(const char *path)
+{
+    char *base = axl_path_get_basename(path);
+    bool  ours = (base != NULL && axl_strcmp(base, LIAR_FILE_NAME) == 0);
+    axl_free(base);
+    return ours;
+}
+
+static AxlFsStatus
+liar_open(
+    void               *backend_ctx,
+    const char         *path,
+    unsigned            mode,
+    unsigned            attributes,
+    AxlFsProviderFile **out,
+    bool               *out_is_dir
+    )
+{
+    (void)backend_ctx;
+    (void)mode;
+    (void)attributes;
+    if (path == NULL || out == NULL || out_is_dir == NULL) {
+        return AXL_FS_ERR_INVALID;
+    }
+
+    bool root = (path[0] == '\0' || (path[0] == '/' && path[1] == '\0'));
+    if (!root && !liar_is_our_file(path)) {
+        return AXL_FS_ERR_NOT_FOUND;
+    }
+
+    AxlFsProviderFile *f = axl_calloc(1, sizeof(*f));
+    if (f == NULL) return AXL_FS_ERR_NO_MEMORY;
+    axl_strlcpy(f->path, path, sizeof(f->path));
+    f->is_root  = root;
+    f->is_dir   = root;
+    *out        = f;
+    *out_is_dir = root;
+    return AXL_FS_OK;
+}
+
+static AxlFsStatus
+liar_close(AxlFsProviderFile *file)
+{
+    if (file == NULL) return AXL_FS_ERR_INVALID;
+    axl_free(file);
+    return AXL_FS_OK;
+}
+
+static AxlFsStatus
+liar_read(AxlFsProviderFile *file, void *buf, size_t *inout_size)
+{
+    if (file == NULL || buf == NULL || inout_size == NULL) {
+        return AXL_FS_ERR_INVALID;
+    }
+    if (file->is_dir) return AXL_FS_ERR_IS_DIR;
+    size_t avail = (file->cursor < LIAR_FILE_SIZE)
+                 ? (LIAR_FILE_SIZE - file->cursor) : 0u;
+    size_t n = (*inout_size < avail) ? *inout_size : avail;
+    axl_memcpy(buf, LIAR_FILE_BODY + file->cursor, n);
+    file->cursor += n;
+    *inout_size = n;
+    return AXL_FS_OK;
+}
+
+static AxlFsStatus
+liar_read_dir(AxlFsProviderFile *file, AxlFsEntry *out, bool *out_end)
+{
+    if (file == NULL || out == NULL || out_end == NULL) {
+        return AXL_FS_ERR_INVALID;
+    }
+    if (!file->is_dir) return AXL_FS_ERR_NOT_DIR;
+    if (file->dir_index > 0) {
+        *out_end = true;
+        return AXL_FS_OK;
+    }
+    file->dir_index++;
+    *out_end = false;
+    out->struct_size = sizeof(*out);
+    out->version     = AXL_FS_ENTRY_VERSION;
+    axl_strlcpy(out->name, LIAR_FILE_NAME, sizeof(out->name));
+    out->size        = LIAR_FILE_SIZE;
+    out->mtime_unix  = 0;
+    out->attributes  = 0;
+    return AXL_FS_OK;
+}
+
+static AxlFsStatus
+liar_seek(AxlFsProviderFile *file, uint64_t position)
+{
+    if (file == NULL) return AXL_FS_ERR_INVALID;
+    if (file->is_dir) {
+        if (position != 0) return AXL_FS_ERR_UNSUPPORTED;
+        file->dir_index = 0;
+        return AXL_FS_OK;
+    }
+    file->cursor = (position == (uint64_t)-1)
+                 ? LIAR_FILE_SIZE : (size_t)position;
+    return AXL_FS_OK;
+}
+
+/* Always reports the file's ORIGINAL length — set_info never changed it. */
+static AxlFsStatus
+liar_get_info(AxlFsProviderFile *file, AxlFsEntry *out)
+{
+    if (file == NULL || out == NULL) return AXL_FS_ERR_INVALID;
+    out->struct_size = sizeof(*out);
+    out->version     = AXL_FS_ENTRY_VERSION;
+    out->mtime_unix  = 0;
+    if (file->is_root) {
+        out->name[0]    = '\0';
+        out->size       = 0;
+        out->attributes = AXL_FS_ATTR_DIRECTORY;
+    } else {
+        axl_strlcpy(out->name, LIAR_FILE_NAME, sizeof(out->name));
+        out->size       = LIAR_FILE_SIZE;
+        out->attributes = 0;
+    }
+    return AXL_FS_OK;
+}
+
+/* Success, but the size in @p in is dropped on the floor — the exact
+   rename-and-attributes-only implementation the header describes. */
+static AxlFsStatus
+liar_set_info(AxlFsProviderFile *file, const AxlFsEntry *in)
+{
+    if (file == NULL || in == NULL) return AXL_FS_ERR_INVALID;
+    return AXL_FS_OK;
+}
+
+static const AxlFsProvider g_liar_provider = {
+    .struct_size   = sizeof(AxlFsProvider),
+    .version       = AXL_FS_PROVIDER_VERSION,
+    .open          = liar_open,
+    .close         = liar_close,
+    .read          = liar_read,
+    .read_dir      = liar_read_dir,
+    .seek          = liar_seek,
+    .get_info      = liar_get_info,
+    .set_info      = liar_set_info,
+    .default_label = "LiarFs",
+};
+
+static const AxlGuid g_liar_guid = AXL_GUID(
+    0x12345678, 0xabcd, 0x4002,
+    0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xce);
+
+static void
+test_truncate_over_size_ignoring_provider(void)
+{
+    void *handle = NULL;
+    if (axl_fs_provider_publish(&g_liar_provider, &g_liar_guid, &handle)
+            != AXL_OK) {
+        test_fail("liar-fs: publish failed");
+        return;
+    }
+
+    /* Reach the publication by path the way any consumer would: find its
+       device path via axl_volume_enumerate, then give it a shell map name.
+       SetMap needs a shell, so the no-shell case is a legitimate SKIP. */
+    AxlVolume   vols[16];
+    size_t      n  = 0;
+    const void *dp = NULL;
+    if (axl_volume_enumerate(vols, 16, &n) == AXL_OK) {
+        for (size_t i = 0; i < n; i++) {
+            if (vols[i].handle == handle) {
+                dp = vols[i].device_path;
+                break;
+            }
+        }
+    }
+
+    const char *map  = "AXLLIAR";
+    const char *path = "AXLLIAR:\\" LIAR_FILE_NAME;
+    if (dp != NULL && axl_volume_set_map(dp, map) == AXL_OK) {
+        AxlFsEntry e;
+        test_check(axl_file_info(path, &e) == AXL_OK
+                   && e.size == LIAR_FILE_SIZE,
+                   "liar-fs: published file reachable by path, 3 bytes");
+        test_check(axl_file_truncate(path, 5) == AXL_ERR,
+                   "liar-fs: truncate over a size-ignoring set_info -> AXL_ERR");
+        test_check(axl_file_info(path, &e) == AXL_OK
+                   && e.size == LIAR_FILE_SIZE,
+                   "liar-fs: refused truncate left the length at 3");
+        test_check(axl_volume_unmap(map) == AXL_OK,
+                   "liar-fs: test mapping removed");
+    } else {
+        axl_printf("SKIP: liar-fs truncate (no shell map for the "
+                   "published volume)\n");
+        test_check(true, "liar-fs: truncate SKIP balance");
+        test_check(true, "liar-fs: truncate SKIP balance");
+        test_check(true, "liar-fs: truncate SKIP balance");
+        test_check(true, "liar-fs: truncate SKIP balance");
+    }
+
+    axl_fs_provider_unpublish(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Status-code numbering convention
+// ---------------------------------------------------------------------------
+
+/* AxlFsStatus follows the Axl<Module>Status convention: _OK == 0, every
+   error member strictly negative (matching AxlStatus). Pin the exact
+   values so a stray positive member is caught at test time. */
+static void
+test_status_codes_negative_convention(void)
+{
+    test_check(AXL_FS_OK == 0,
+               "status: AXL_FS_OK is 0");
+    test_check(AXL_FS_ERR_NOT_FOUND        == -1,  "status: NOT_FOUND == -1");
+    test_check(AXL_FS_ERR_ACCESS_DENIED    == -2,  "status: ACCESS_DENIED == -2");
+    test_check(AXL_FS_ERR_WRITE_PROTECTED  == -3,  "status: WRITE_PROTECTED == -3");
+    test_check(AXL_FS_ERR_NO_SPACE         == -4,  "status: NO_SPACE == -4");
+    test_check(AXL_FS_ERR_NOT_DIR          == -5,  "status: NOT_DIR == -5");
+    test_check(AXL_FS_ERR_IS_DIR           == -6,  "status: IS_DIR == -6");
+    test_check(AXL_FS_ERR_INVALID          == -7,  "status: INVALID == -7");
+    test_check(AXL_FS_ERR_NO_MEMORY        == -8,  "status: NO_MEMORY == -8");
+    test_check(AXL_FS_ERR_IO               == -9,  "status: IO == -9");
+    test_check(AXL_FS_ERR_UNSUPPORTED      == -10, "status: UNSUPPORTED == -10");
+    test_check(AXL_FS_ERR_END_OF_FILE      == -11, "status: END_OF_FILE == -11");
+    test_check(AXL_FS_ERR_VOLUME_CORRUPTED == -12, "status: VOLUME_CORRUPTED == -12");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -638,7 +1045,10 @@ test_fs_provider_main(int argc, char **argv)
     test_open_file_and_read();
     test_get_info_non_ascii();
     test_volume_enumerate_round_trip();
+    test_volume_get_space();
+    test_truncate_over_size_ignoring_provider();
     test_force_close_on_unpublish();
+    test_status_codes_negative_convention();
 
     return test_print_results();
 }

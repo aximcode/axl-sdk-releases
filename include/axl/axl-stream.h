@@ -52,10 +52,17 @@ extern AxlStream *axl_stdin;
 /**
  * **axl_stdout_raw** — sibling of axl_stdout for **binary output**.
  * Writes via `EFI_SHELL_PARAMETERS_PROTOCOL.StdOut->WriteFile`
- * directly, bypassing the UTF-8→UCS-2 conversion that axl_stdout
- * (and axl_print / axl_fprintf) does for console output. Use when a
- * tool needs bytes to traverse a pipe intact (dumping a RAM-disk
- * image, SPD blob, etc.).
+ * directly, bypassing the UTF-8→UCS-2 transcode that axl_stdout
+ * (and axl_print / axl_fprintf) applies. Use for **non-text** payloads
+ * that must survive byte-for-byte (dumping a RAM-disk image, an SPD
+ * blob, etc.) — the transcode would corrupt arbitrary bytes.
+ *
+ * NOTE: axl_stdout itself now pipes and redirects correctly. When
+ * stdout is a `|` pipe or a `>`/`>a` redirect, axl_stdout writes its
+ * transcoded UCS-2 to the same StdOut handle (the shell wires it for a
+ * pipe but does not swap gST->ConOut), so `tool | other`, `tool > f`
+ * and `tool >a f` all carry a tool's TEXT output. axl_stdout_raw is
+ * therefore only needed for BINARY output, not merely to pipe.
  *
  * Symmetric with axl_stdin (which is also raw bytes); axl_stdout
  * remains the text-output path.
@@ -248,6 +255,11 @@ axl_fopen(
  * bytes are flushed to the sink first, then the buffer is freed. A sink
  * error during that final flush is not reported through this void return —
  * call axl_fflush explicitly beforehand if you need to observe it.
+ *
+ * This drains the AXL-side buffer ONLY — it does not invoke the sink's own
+ * flush, so closing a file stream is NOT the durability point that
+ * axl_fflush is. A caller that must know the bytes reached the volume
+ * calls axl_fflush and checks it, then closes.
  */
 void
 axl_fclose(
@@ -549,6 +561,12 @@ axl_feof(
  * unit but cannot invent the missing tail. It also invokes the underlying
  * sink flush (e.g. a file backend's firmware cache flush) when present.
  *
+ * On a file stream opened for writing this reaches the firmware's real
+ * flush primitive, so AXL_OK means the bytes are on the volume — this is
+ * the durability point for a caller that must not report success before
+ * the data is safe. A stream opened read-only, or one whose sink has no
+ * flush of its own (a buffer stream), is a no-op success.
+ *
  * @return AXL_OK on success, AXL_ERR on a sink write/flush error.
  */
 int
@@ -603,14 +621,18 @@ typedef enum {
  * does NOT auto-select line/full buffering from tty-ness: a UEFI app can
  * exit through a crt0 path that runs no atexit hook, so buffered output
  * could be silently lost. Opt in explicitly, and **flush before you exit**
- * — axl_fflush drains the buffer, and axl_fclose flushes then frees it.
- * (Because axl_stdout / axl_stderr are process globals that are never
- * fclosed, code that buffers them owns the final axl_fflush.)
+ * — axl_fflush drains the buffer AND pushes the sink; axl_fclose drains the
+ * buffer and frees it but never calls the sink's flush, so it is not an
+ * equivalent. (Because axl_stdout / axl_stderr are process globals that are
+ * never fclosed, code that buffers them owns the final axl_fflush.)
  *
  * Under LINE / FULL a successful write returns the byte count **accepted
  * into the buffer**, which does not mean the sink took them — a sink error
- * surfaces at the later axl_fflush / axl_fclose and via axl_ferror, not at
- * the buffered write. Do not treat a buffered write's return as durability.
+ * surfaces at the later axl_fflush (or via axl_ferror), not at the
+ * buffered write. Do not treat a buffered write's return as durability,
+ * and do not expect axl_fclose to report one: on a file stream the
+ * firmware close cannot ( EFI_FILE_PROTOCOL.Close is specified to return
+ * only EFI_SUCCESS ). Check axl_fflush.
  *
  * Switching mode first flushes any bytes already buffered under the old
  * mode. A single write larger than the buffer first flushes any pending

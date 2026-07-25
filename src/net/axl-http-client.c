@@ -229,7 +229,7 @@ axl_http_client_free(AxlHttpClient *c)
     }
 
     if (c->sock != NULL) {
-        axl_tcp_close(c->sock);
+        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
     }
 
     axl_free(c->connected_host);
@@ -295,7 +295,7 @@ ensure_connected(
         c->tls_ctx = NULL;
     }
     if (c->sock != NULL) {
-        axl_tcp_close(c->sock);
+        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
         c->sock = NULL;
     }
 
@@ -340,7 +340,7 @@ ensure_connected(
             axl_error("https requires TLS: call axl_tls_init() once at startup "
                       "(and build with AXL_TLS=1) before issuing https:// "
                       "requests");
-            axl_tcp_close(c->sock);
+            axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
             c->sock = NULL;
             return -1;
         }
@@ -348,7 +348,7 @@ ensure_connected(
         c->tls_ctx = g_http_tls_ops->connect(c->sock, host);
         if (c->tls_ctx == NULL) {
             axl_error("TLS context creation failed for %s:%u", host, port);
-            axl_tcp_close(c->sock);
+            axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
             c->sock = NULL;
             return -1;
         }
@@ -375,7 +375,7 @@ ensure_connected(
             axl_warning("TLS handshake failed for %s:%u", host, port);
             client_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
-            axl_tcp_close(c->sock);
+            axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
             c->sock = NULL;
             return -1;
         }
@@ -727,7 +727,7 @@ do_streaming_request(
             client_tls_free(c->tls_ctx);
             c->tls_ctx = NULL;
         }
-        axl_tcp_close(c->sock);
+        axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
         c->sock = NULL;
         axl_free(c->connected_host);
         c->connected_host = NULL;
@@ -970,7 +970,7 @@ do_streaming_request(
             }
         }
         if (close_conn) {
-            axl_tcp_close(c->sock);
+            axl_tcp_close(c->sock, AXL_TEARDOWN_GRACEFUL);
             c->sock = NULL;
             axl_free(c->connected_host);
             c->connected_host = NULL;
@@ -989,14 +989,14 @@ do_streaming_request(
 // (axl-http-client-async.c) spins a private loop, runs the async request, and
 // harvests the response. Only the streaming path below still uses do_request.
 
-int
+AxlStatus
 axl_http_get(AxlHttpClient *c, const char *url,
              AxlHttpClientResponse **out_resp)
 {
     return _axl_http_request_sync(c, "GET", url, NULL, 0, NULL, NULL, out_resp);
 }
 
-int
+AxlStatus
 axl_http_post(AxlHttpClient *c, const char *url, const void *body,
               size_t size, const char *content_type,
               AxlHttpClientResponse **out_resp)
@@ -1005,7 +1005,7 @@ axl_http_post(AxlHttpClient *c, const char *url, const void *body,
                                   NULL, out_resp);
 }
 
-int
+AxlStatus
 axl_http_put(AxlHttpClient *c, const char *url, const void *body,
              size_t size, const char *content_type,
              AxlHttpClientResponse **out_resp)
@@ -1014,7 +1014,7 @@ axl_http_put(AxlHttpClient *c, const char *url, const void *body,
                                   NULL, out_resp);
 }
 
-int
+AxlStatus
 axl_http_delete(AxlHttpClient *c, const char *url,
                 AxlHttpClientResponse **out_resp)
 {
@@ -1022,7 +1022,7 @@ axl_http_delete(AxlHttpClient *c, const char *url,
                                   out_resp);
 }
 
-int
+AxlStatus
 axl_http_request(AxlHttpClient *c, const char *method, const char *url,
                  const void *body, size_t body_size,
                  const char *content_type, AxlHashTable *extra_headers,

@@ -408,7 +408,7 @@ test_jws_roundtrip(void)
 
     /* ES256 (generated key). */
     {
-        AxlPkKey *key = axl_pk_keygen(AXL_PK_ECDSA_P256);
+        AxlPkKey *key = axl_pk_key_new(AXL_PK_ECDSA_P256);
         test_check(key != NULL, "keygen: ECDSA P-256 -> key");
         AxlJoseKey jk = { .pk = key };
         char *tok = NULL;
@@ -444,7 +444,7 @@ test_jws_roundtrip(void)
 
     /* RS256 (generated key — slow keygen, but proves the RSA path). */
     {
-        AxlPkKey *key = axl_pk_keygen(AXL_PK_RSA);
+        AxlPkKey *key = axl_pk_key_new(AXL_PK_RSA);
         test_check(key != NULL, "keygen: RSA -> key");
         AxlJoseKey jk = { .pk = key };
         char *tok = NULL;
@@ -477,7 +477,7 @@ test_jws_roundtrip(void)
 
     /* ES384 (generated P-384 key). */
     {
-        AxlPkKey *key = axl_pk_keygen(AXL_PK_ECDSA_P384);
+        AxlPkKey *key = axl_pk_key_new(AXL_PK_ECDSA_P384);
         test_check(key != NULL, "keygen: ECDSA P-384 -> key");
         AxlJoseKey jk = { .pk = key };
         char *tok = NULL;
@@ -500,7 +500,7 @@ test_jws_roundtrip(void)
 
     /* PS256 (RSA-PSS, generated key). */
     {
-        AxlPkKey *key = axl_pk_keygen(AXL_PK_RSA);
+        AxlPkKey *key = axl_pk_key_new(AXL_PK_RSA);
         AxlJoseKey jk = { .pk = key };
         char *tok = NULL;
         test_check(key != NULL
@@ -522,8 +522,9 @@ test_jws_roundtrip(void)
            both verify — and a PS256 signature does not verify as RS256. */
         const AxlJoseAlg rs256[] = { AXL_JOSE_RS256 };
         char *ps = NULL;
-        axl_jws_sign(&jk, AXL_JOSE_PS256, (const uint8_t *)msg,
-                     axl_strlen(msg), &ps);
+        test_check(axl_jws_sign(&jk, AXL_JOSE_PS256, (const uint8_t *)msg,
+                                axl_strlen(msg), &ps) == AXL_OK,
+                   "ps256: sign ok");
         test_check(ps != NULL
                        && axl_jws_verify(ps, axl_strlen(ps), &jk, rs256, 1,
                                          &payload, &plen) == AXL_ERR,
@@ -678,7 +679,7 @@ test_jwk(void)
 {
     /* EC export round-trip: keygen -> export public JWK (with kid) ->
        re-parse -> verify a token the original key signed. */
-    AxlPkKey *key = axl_pk_keygen(AXL_PK_ECDSA_P256);
+    AxlPkKey *key = axl_pk_key_new(AXL_PK_ECDSA_P256);
     char     *jwk = axl_jwk_export_public(key, "k1");
     test_check(jwk != NULL, "jwk_export_public: EC -> JSON");
     test_check(jwk != NULL && axl_strstr(jwk, "\"kty\":\"EC\"") != NULL
@@ -701,8 +702,9 @@ test_jwk(void)
         const char  msg[] = "{\"rt\":1}";
         AxlJoseKey  sk = { .pk = key };
         char       *tok = NULL;
-        axl_jws_sign(&sk, AXL_JOSE_ES256, (const uint8_t *)msg,
-                     axl_strlen(msg), &tok);
+        test_check(axl_jws_sign(&sk, AXL_JOSE_ES256, (const uint8_t *)msg,
+                                axl_strlen(msg), &tok) == AXL_OK,
+                   "es256: sign ok");
         AxlJoseKey   vk = { .pk = reparsed };
         const AxlJoseAlg allow[] = { AXL_JOSE_ES256 };
         uint8_t     *pl = NULL; size_t pn = 0;
@@ -720,7 +722,7 @@ test_jwk(void)
 
     /* RSA export round-trip. */
     {
-        AxlPkKey *rsa = axl_pk_keygen(AXL_PK_RSA);
+        AxlPkKey *rsa = axl_pk_key_new(AXL_PK_RSA);
         char     *rjwk = axl_jwk_export_public(rsa, NULL);
         test_check(rjwk != NULL && axl_strstr(rjwk, "\"kty\":\"RSA\"") != NULL
                        && axl_strstr(rjwk, "\"n\"") != NULL
@@ -734,8 +736,9 @@ test_jwk(void)
         const char  msg[] = "{\"rt\":2}";
         AxlJoseKey  sk = { .pk = rsa };
         char       *tok = NULL;
-        axl_jws_sign(&sk, AXL_JOSE_RS256, (const uint8_t *)msg,
-                     axl_strlen(msg), &tok);
+        test_check(axl_jws_sign(&sk, AXL_JOSE_RS256, (const uint8_t *)msg,
+                                axl_strlen(msg), &tok) == AXL_OK,
+                   "rs256: sign ok");
         AxlJoseKey   vk = { .pk = rp };
         const AxlJoseAlg allow[] = { AXL_JOSE_RS256 };
         uint8_t *pl = NULL; size_t pn = 0;
@@ -752,8 +755,8 @@ test_jwk(void)
 
     /* JWK Set: parse + find by kid. */
     {
-        AxlPkKey *k1 = axl_pk_keygen(AXL_PK_ECDSA_P256);
-        AxlPkKey *k2 = axl_pk_keygen(AXL_PK_ECDSA_P256);
+        AxlPkKey *k1 = axl_pk_key_new(AXL_PK_ECDSA_P256);
+        AxlPkKey *k2 = axl_pk_key_new(AXL_PK_ECDSA_P256);
         char     *j1 = axl_jwk_export_public(k1, "key-1");
         char     *j2 = axl_jwk_export_public(k2, "key-2");
         AxlString *set = axl_string_new("{\"keys\":[");
@@ -793,7 +796,7 @@ test_jwk(void)
     /* P-384 EC export round-trip: keygen -> export JWK -> re-parse ->
        verify an ES384 token the original key signed. */
     {
-        AxlPkKey *p384 = axl_pk_keygen(AXL_PK_ECDSA_P384);
+        AxlPkKey *p384 = axl_pk_key_new(AXL_PK_ECDSA_P384);
         char     *jwk = axl_jwk_export_public(p384, NULL);
         test_check(jwk != NULL && axl_strstr(jwk, "\"crv\":\"P-384\"") != NULL,
                    "jwk_export_public: P-384 carries crv P-384");
@@ -804,8 +807,9 @@ test_jwk(void)
         const char  msg[] = "{\"rt\":384}";
         AxlJoseKey  sk = { .pk = p384 };
         char       *tok = NULL;
-        axl_jws_sign(&sk, AXL_JOSE_ES384, (const uint8_t *)msg,
-                     axl_strlen(msg), &tok);
+        test_check(axl_jws_sign(&sk, AXL_JOSE_ES384, (const uint8_t *)msg,
+                                axl_strlen(msg), &tok) == AXL_OK,
+                   "es384: sign ok");
         AxlJoseKey   vk = { .pk = rp };
         const AxlJoseAlg allow[] = { AXL_JOSE_ES384 };
         uint8_t *pl = NULL; size_t pn = 0;

@@ -191,14 +191,21 @@ for _ in $(seq 1 20); do
 done
 
 echo ""
-if grep -q "SHUTDOWN-MARKER" "$LOG"; then
-    echo "=== PASS: Ctrl-C routed through yield → auto-exit → atexit ==="
-    echo ""
-    grep -E "yield-test:|SHUTDOWN-MARKER|mem: no leaks" "$LOG" || true
-    exit 0
-else
+if ! grep -q "SHUTDOWN-MARKER" "$LOG"; then
     echo "=== FAIL: SHUTDOWN-MARKER never appeared ==="
     echo ""
     tail -40 "$LOG"
     exit 1
 fi
+# The default (no-handler) break path must print the universal interrupt
+# notice on stderr — proof every tool self-announces a Ctrl-C exit.
+if ! grep -qF "Interrupted (Ctrl-C)" "$LOG"; then
+    echo "=== FAIL: Ctrl-C shutdown ran but the 'Interrupted (Ctrl-C)' notice is missing ==="
+    echo ""
+    tail -40 "$LOG"
+    exit 1
+fi
+echo "=== PASS: Ctrl-C routed through yield → auto-exit → atexit, notice printed ==="
+echo ""
+grep -E "yield-test:|SHUTDOWN-MARKER|Interrupted \(Ctrl-C\)|mem: no leaks" "$LOG" || true
+exit 0

@@ -571,6 +571,26 @@ build_from_view(const char *path, AxlFileView *view)
         return NULL;
     }
     pt->view = view;
+    /* PIN the view, so orig_size and every piece offset are defined
+       against ONE length. An unpinned view re-stats after an AXL write to
+       the file made in this image -- INCLUDING this tree's own
+       axl_piece_tree_save, which
+       renames the temp over the path -- and every (start, length) pair in
+       the tree, plus the newline index built below, would then be indexing
+       a file they were not built over. Saving and carrying on editing is
+       the ordinary case, so this is required, not merely tidy.
+       axl_piece_tree_backing_changed is the deliberate, caller-driven way
+       to learn the file moved.
+
+       Note what the pin does NOT buy (see axl_file_view_set_pinned): it
+       freezes the LENGTH, not the bytes. AxlPageCache may evict a resident
+       page at any time -- certainly in the shared-cache case
+       axl_piece_tree_open_cached sets up -- and a re-fault reads the file
+       as it stands. So a tree whose backing file is rewritten under it can
+       still surface post-write bytes for original-text ranges it revisits.
+       That is what axl_piece_tree_backing_changed is for; nothing here
+       promises otherwise. */
+    axl_file_view_set_pinned(view, true);
     pt->orig_size = axl_file_view_size(view);
     axl_rb_tree_init(&pt->tree, pt_recompute, NULL);
     pt->undo_limit = SIZE_MAX;   /* unlimited history by default */
@@ -1226,7 +1246,7 @@ pt_reader_length(const AxlByteReader *r)
 }
 
 static size_t
-pt_reader_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
+pt_reader_read(const AxlByteReader *r, size_t offset, void *buf, size_t len)
 {
     return axl_piece_tree_get((AxlPieceTree *)r->ctx, offset, len, buf, len);
 }
@@ -1529,6 +1549,16 @@ axl_piece_tree_save(AxlPieceTree *pt, const char *path)
     }
 
     int ok = stream_document(pt, s);
+    /* Flush before the close, and before anything is promoted. axl_fclose
+       drains only the AXL-side buffer (stream_drain; it never calls the
+       stream's flush), and the firmware close under it cannot report a
+       failure — EFI_FILE_PROTOCOL.Close is specified to return only
+       EFI_SUCCESS. Renaming the temp over the target on an unflushed write
+       would replace a good document with one whose bytes a full volume or
+       write-protected media had silently dropped. */
+    if (ok == AXL_OK && axl_fflush(s) != AXL_OK) {
+        ok = AXL_ERR;
+    }
     axl_fclose(s);
 
     if (ok != AXL_OK) {

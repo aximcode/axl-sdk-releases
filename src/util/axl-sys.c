@@ -64,7 +64,7 @@ static const AxlGuid DEVICE_PATH_TO_TEXT_GUID = AXL_GUID(
     0x90, 0xcc, 0x55, 0x1a, 0x4e, 0x4a, 0x7f, 0x1c);
 
 void
-axl_reset(int type)
+axl_reset(AxlResetType type)
 {
     EFI_RESET_TYPE reset_type;
 

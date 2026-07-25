@@ -515,7 +515,7 @@ on_udp_sync_send_done(AxlUdp *sock, AxlStatus st, void *user)
     return false;
 }
 
-int
+AxlStatus
 axl_udp_send(
     AxlUdp        *sock,
     const AxlIPv4Address *dest,
@@ -599,10 +599,10 @@ axl_udp_sendrecv(
     uint16_t              port,
     const void           *tx_data,
     size_t                tx_len,
+    size_t                timeout_ms,
     void                 *rx_buf,
     size_t                rx_size,
-    size_t               *rx_len,
-    size_t                timeout_ms
+    size_t               *rx_len
     )
 {
     if (sock == NULL || sock->udp4 == NULL ||

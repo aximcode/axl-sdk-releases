@@ -209,6 +209,11 @@ typedef struct {
     const char  *default_value; ///< default for flags when unset, NULL = unset
     const char  *help;          ///< one-line description (shown in --help)
     bool         required;      ///< (positionals only) error if missing
+    /// Omit this flag/positional from `--help` output entirely (it is still
+    /// parsed and accepted normally). For internal test/diagnostic knobs that
+    /// would clutter a user-facing usage block — e.g. a tool's headless-test
+    /// seams. Hidden entries do not affect the help column width either.
+    bool         hidden;
     int          base;          ///< (numeric types) 0 (auto) | 10 | 16
     uint64_t     min;           ///< (numeric types) inclusive min, 0 = none
     uint64_t     max;           ///< (numeric types) inclusive max, 0 = none

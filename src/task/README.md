@@ -53,13 +53,13 @@ Submit work to an AP and get a callback on the BSP when it completes:
 AxlTaskPool *pool = axl_task_pool_new();
 
 // AP work function (runs on a worker core)
-void compute(void *arg, AxlArena *arena) {
+void compute(AxlArena *arena, void *arg) {
     Result *r = axl_arena_alloc(arena, sizeof(Result));
     r->crc = calculate_crc(arg);
 }
 
 // BSP completion callback (runs on main core)
-void on_done(void *arg, AxlArena *arena) {
+void on_done(AxlArena *arena, void *arg) {
     axl_printf("CRC computed on AP\n");
 }
 

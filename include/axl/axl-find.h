@@ -69,8 +69,8 @@ struct AxlByteReader {
     size_t (*read)(
         const AxlByteReader *r,
         size_t               offset,
-        size_t               len,
-        void                *buf
+        void                *buf,
+        size_t               len
     );
 
     /// OPTIONAL zero-copy fast path: if `[offset, offset + len)` is

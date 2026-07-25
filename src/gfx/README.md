@@ -436,7 +436,7 @@ acts on its whole subtree.
 
 ```c
 AxlCompositor *c = axl_compositor_new(1280, 800);
-AxlSurface *win = axl_surface_create(axl_compositor_root(c), 400, 300);
+AxlSurface *win = axl_surface_new(axl_compositor_root(c), 400, 300);
 axl_surface_move(win, 100, 80);
 axl_gfx_target_buffer(axl_surface_buffer(win));    // draw into the surface
 axl_gfx_fill_rect(0, 0, 400, 300, AXL_GFX_RGB(0x20, 0x40, 0x80));

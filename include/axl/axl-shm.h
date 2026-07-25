@@ -45,8 +45,11 @@
 extern "C" {
 #endif
 
-#define AXL_SHM_CREATE  0x1u   ///< create the segment if it does not exist
-#define AXL_SHM_EXCL    0x2u   ///< with CREATE, fail if it already exists
+/// Open flags for axl_shm_open — a bitmask OR'd into its uint32_t @p flags.
+typedef enum {
+    AXL_SHM_CREATE = 0x1u,  ///< create the segment if it does not exist
+    AXL_SHM_EXCL   = 0x2u   ///< with CREATE, fail if it already exists
+} AxlShmFlags;
 
 /**
  * @brief Open or create a named shared-memory segment.

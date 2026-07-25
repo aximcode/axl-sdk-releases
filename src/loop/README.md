@@ -326,7 +326,7 @@ But sometimes a source callback needs to wait on an async producer
 `axl_loop_iterate_until` on the outer loop directly:
 
 ```c
-int rc = axl_loop_iterate_until(
+AxlStatus rc = axl_loop_iterate_until(
     outer,             /* the caller's own loop */
     done_event,        /* NULL OK -- only timeout wakes */
     timeout_us);       /* 0 = wait forever */
@@ -334,8 +334,8 @@ int rc = axl_loop_iterate_until(
 
 Drives `outer` until `done` is signalled, the timeout elapses, or
 Ctrl-C. Does NOT set `outer->quit_requested`, so the enclosing
-`axl_loop_run` resumes normally afterwards. Returns 0 on done,
--1 on timeout, `AXL_CANCELLED` on interrupt. See
+`axl_loop_run` resumes normally afterwards. Returns `AXL_OK` on done,
+`AXL_TIMEOUT` on timeout, `AXL_CANCELLED` on interrupt. See
 [`docs/AXL-Lifecycle.md` §5.6](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#56-nested-wait-primitive-axl_loop_iterate_until).
 
 ## Default Loop (`axl_loop_default`)

@@ -23,10 +23,10 @@ devtype_name(uint8_t t)
     }
 }
 
-AXL_TOOL_MAIN(scsi)
+static int
+run_scsi(AxlArgs *a)
 {
-    (void)argc;
-    (void)argv;
+    (void)a;
     AxlScsiDev *dev = NULL;
     int         n = 0;
 
@@ -75,4 +75,13 @@ AXL_TOOL_MAIN(scsi)
         axl_printf("scsi: no SCSI devices found\n");
     }
     return 0;
+}
+
+AXL_TOOL_MAIN(scsi)
+{
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name    = "scsi",
+        .help    = "List SCSI/SAS logical units with identity, capacity + health",
+        .handler = run_scsi,
+    });
 }

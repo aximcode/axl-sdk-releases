@@ -327,6 +327,23 @@ axl_backend_at_raised_tpl(void)
     return tpl > TPL_APPLICATION;
 }
 
+uintptr_t
+axl_backend_enter_critical(void)
+{
+    /* TPL_NOTIFY sits above TPL_CALLBACK (the driver-pump dispatch level) and
+       above TPL_APPLICATION (a foreground console writer), so raising here makes
+       a short buffer update atomic against both. AllocatePool is still legal at
+       TPL_NOTIFY, so a guarded append that grows its buffer stays within the
+       rules. RaiseTPL returns the entry level for a strict LIFO restore. */
+    return (uintptr_t)gBS->RaiseTPL(TPL_NOTIFY);
+}
+
+void
+axl_backend_leave_critical(uintptr_t token)
+{
+    gBS->RestoreTPL((EFI_TPL)token);
+}
+
 int
 axl_backend_event_wait(
     size_t          count,

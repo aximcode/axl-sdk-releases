@@ -13,6 +13,7 @@
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
 #include <axl/axl-app.h>
+#include "axl-image-internal.h"   /* _axl_app_image_anchor */
 AXL_LOG_DOMAIN("path");
 
 #define MAX_COMPONENTS  64
@@ -222,8 +223,12 @@ axl_resolve_data_file(const char *override_path, const char *name)
        resolve. The image-path source reflects where UEFI actually
        loaded the binary from, so it works regardless of shell cwd or
        how the script wrote the invocation. Fall through to argv[0]
-       when no image path is available (synthetic load contexts). */
-    const char *anchors[2] = { axl_app_image_path(), axl_app_argv0() };
+       when no image path is available (synthetic load contexts). The
+       image-side value is the ANCHOR, not axl_app_image_path: a
+       buffer-loaded driver image has no file of its own (the public
+       accessor correctly reports NULL) but its data files live beside the
+       launcher that loaded it, which is what the anchor names. */
+    const char *anchors[2] = { _axl_app_image_anchor(), axl_app_argv0() };
     for (int i = 0; i < 2; i++) {
         if (anchors[i] == NULL) {
             continue;

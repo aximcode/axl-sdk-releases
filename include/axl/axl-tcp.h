@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include <axl/axl-macros.h>
+#include <axl/axl-inet-address.h>   /* AxlIPv4Address (used below); self-contained */
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,29 @@ extern "C" {
 typedef struct AxlLoop AxlLoop;
 typedef struct AxlTcp AxlTcp;
 typedef struct AxlCancellable AxlCancellable;
+
+/**
+ * @brief How to tear a connection or listener down.
+ *
+ * Selects the close semantics for @ref axl_tcp_close (and the layers built on
+ * it — @ref axl_socket_free, @ref axl_http_server_free):
+ *
+ * - `AXL_TEARDOWN_GRACEFUL`: orderly close (TCP FIN). Delivers un-ACKed
+ *   in-flight data, then finalizes — deferred to a later loop tick when a loop
+ *   is running, so the port is released after the close completes (~TIME_WAIT).
+ *   The correct, polite default for ordinary connection drops.
+ * - `AXL_TEARDOWN_RESET`: abortive close (TCP RST). **Discards un-ACKed
+ *   in-flight data** and finalizes **synchronously and loop-free** — including,
+ *   for a listener, draining the firmware accept backlog and finalizing its
+ *   connections' pending deferred closes — so the bound port is immediately
+ *   reusable with **no event-loop pumping**. For an in-place server upgrade /
+ *   port hand-off where the connections are being discarded anyway. The peer
+ *   sees a connection reset.
+ */
+typedef enum {
+    AXL_TEARDOWN_GRACEFUL = 0,   ///< orderly FIN close (default)
+    AXL_TEARDOWN_RESET           ///< abortive RST close, port free on return
+} AxlTeardown;
 
 // ---------------------------------------------------------------------------
 // Blocking TCP API
@@ -50,7 +74,7 @@ typedef struct AxlCancellable AxlCancellable;
  *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_connect(
     const char *host,      ///< IPv4 address string or hostname (DNS resolved)
     uint16_t   port,       ///< remote port number
@@ -75,7 +99,7 @@ axl_tcp_connect(
  * @return AXL_OK on success, AXL_ERR on failure (including "no
  *     interface matches @p source_ip" when forced).
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_connect_via(
     const char            *host,
     uint16_t               port,
@@ -104,7 +128,7 @@ axl_tcp_connect_via(
  *     (the SYN was not answered within @p connect_timeout_ms) and "no
  *     interface matches @p source_ip" when forced.
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_connect_timeout(
     const char            *host,               ///< IPv4 string or hostname (DNS resolved)
     uint16_t               port,               ///< remote port number
@@ -118,7 +142,7 @@ axl_tcp_connect_timeout(
  *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_listen(
     uint16_t port,           ///< local port to listen on
     AxlTcp   **out_listener  ///< receives the listener handle
@@ -135,7 +159,7 @@ axl_tcp_listen(
  * @return AXL_OK on success, AXL_ERR on failure (including "no
  *     interface has station IP @p source_ip" when forced).
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_listen_via(
     uint16_t              port,
     const AxlIPv4Address *source_ip,
@@ -153,7 +177,7 @@ axl_tcp_listen_via(
  *
  * @return AXL_OK on success, AXL_ERR on failure. timeout, or cancel.
  */
-int
+AXL_WARN_UNUSED int
 axl_tcp_accept(
     AxlTcp  *listener,    ///< listener from axl_tcp_listen
     AxlTcp  **out_client, ///< receives the accepted client socket
@@ -216,18 +240,19 @@ axl_tcp_poll(
  * the loop. Freeing the loop first leaves both paths dereferencing
  * freed memory.
  *
- * **`sock` outlives this call.** On the async path the AxlTcp struct
- * lives until the firmware signals close-complete. Callers must not
- * touch `sock` after `axl_tcp_close` returns; treat the pointer as
- * freed.
+ * **`sock` outlives this call (GRACEFUL only).** On the graceful async path
+ * the AxlTcp struct lives until the firmware signals close-complete. With
+ * @ref AXL_TEARDOWN_RESET the finalize is synchronous and `sock` is freed on
+ * return. Either way, do not touch `sock` after this returns.
  */
 void
 axl_tcp_close(
-    AxlTcp *sock  ///< socket to close (NULL-safe)
+    AxlTcp      *sock,  ///< socket to close (NULL-safe)
+    AxlTeardown  mode   ///< AXL_TEARDOWN_GRACEFUL (FIN) or AXL_TEARDOWN_RESET
 );
 
 #ifdef AXL_HAVE_AUTOPTR
-AXL_DEFINE_AUTOPTR_CLEANUP(AxlTcp, axl_tcp_close)
+AXL_DEFINE_AUTOPTR_CLEANUP_ARG(AxlTcp, axl_tcp_close, AXL_TEARDOWN_GRACEFUL)
 #endif
 
 /**

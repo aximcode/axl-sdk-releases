@@ -148,7 +148,7 @@ fail_loop:
     axl_loop_free(g_loop);
     g_loop = NULL;
 fail_server:
-    axl_http_server_free(g_server);
+    axl_http_server_free(g_server, AXL_TEARDOWN_GRACEFUL);
     g_server = NULL;
     return AXL_ERR;
 }
@@ -168,7 +168,7 @@ driver_unload(AxlHandle image)
     /* Server before loop — server holds events registered against
        the loop's source table. */
     if (g_server != NULL) {
-        axl_http_server_free(g_server);
+        axl_http_server_free(g_server, AXL_TEARDOWN_GRACEFUL);
         g_server = NULL;
     }
 

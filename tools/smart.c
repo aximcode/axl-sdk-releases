@@ -21,10 +21,10 @@ transport_name(AxlStorageTransport t)
     }
 }
 
-AXL_TOOL_MAIN(smart)
+static int
+run_smart(AxlArgs *a)
 {
-    (void)argc;
-    (void)argv;
+    (void)a;
     AxlStorageDev *dev = NULL;
     int            n = 0;
 
@@ -74,4 +74,13 @@ AXL_TOOL_MAIN(smart)
         axl_printf("smart: no storage devices found\n");
     }
     return 0;
+}
+
+AXL_TOOL_MAIN(smart)
+{
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name    = "smart",
+        .help    = "Scan all storage (NVMe/ATA/SCSI) for normalized health",
+        .handler = run_smart,
+    });
 }

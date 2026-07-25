@@ -713,7 +713,21 @@ axl_input_probe_pointers(const char *log_path)
     probe_emit(buf, sizeof buf, &len, "=== end probe ===\n");
 
     if (log_path != NULL && len > 0) {
-        (void)axl_file_set_contents(log_path, buf, len);   /* nodiscard: best-effort */
+        /* The probe's findings are already on screen; the file is a copy the
+           caller asked for. Nothing here can retry or roll back, and this
+           routine reports through the console rather than a return value --
+           so the status is CHECKED and turned into a notice, not discarded.
+           An operator who asked for a log and is about to go read it needs
+           to know it is not there (a failed flush now surfaces here, where
+           axl_file_set_contents used to report success for a file that
+           never reached the volume). */
+        if (axl_file_set_contents(log_path, buf, len) != AXL_OK) {
+            /* Console, not probe_emit: appending to the buffer whose write
+               just failed would report the failure only into the file that
+               does not exist. */
+            axl_print("NOTE: could not write the probe log to '%s'\n",
+                      log_path);
+        }
     }
 }
 

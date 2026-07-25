@@ -34,13 +34,10 @@ check "default arch"       "$(test_meta_field "$tmp/test-bare-qemu.sh" arch)"   
 check "default est"        "$(test_meta_field "$tmp/test-bare-qemu.sh" est)"        "20"
 check "default local-only" "$(test_meta_field "$tmp/test-bare-qemu.sh" local-only)" "0"
 
-# --- test_port (subshell-isolated: common-test.sh sets `set -euo pipefail`
-#     and sources axl-common.sh at load; keep those out of this selftest) ---
-check "test_port slot 0 (base 20400)" \
-  "$(TEST_PORT_BASE=20400 bash -c 'source ./common-test.sh; test_port 0')" "20400"
-check "test_port slot 5 (base 20400)" \
-  "$(TEST_PORT_BASE=20400 bash -c 'source ./common-test.sh; test_port 5')" "20405"
-check "test_port default base (standalone)" \
-  "$(bash -c 'source ./common-test.sh; test_port 0')" "18000"
+# test_port now lives in test-portalloc-selftest.sh, together with the
+# allocator it is built on. The old "default base (standalone) == 18000"
+# check went with it: a standalone run no longer has a fixed base, it claims
+# a verified-free one. TEST_PORT_BASE, when set explicitly, is still exact
+# arithmetic — that contract is asserted there.
 
 [[ $fail -eq 0 ]] && echo "discover selftest: OK" || { echo "discover selftest: FAILED"; exit 1; }

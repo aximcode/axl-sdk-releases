@@ -44,7 +44,7 @@ on_echo_sent(AxlTcp *sock, AxlStatus status, void *data)
 
     if (status != AXL_OK) {
         /* Send failed — peer likely gone. Close and stop. */
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         axl_free(conn);
         return false;
     }
@@ -63,7 +63,7 @@ on_data(AxlTcp *sock, AxlStatus status, void *data)
 
     if (status != AXL_OK || len == 0) {
         axl_printf("  disconnected\n");
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         axl_free(conn);
         return false;  /* tear down; safe to close above */
     }
@@ -97,7 +97,7 @@ on_accept(AxlTcp *client, AxlStatus status, void *data)
 
     EchoConn *conn = axl_calloc(1, sizeof(EchoConn));
     if (conn == NULL) {
-        axl_tcp_close(client);
+        axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
         return true;  /* keep listening — next client may find a slot */
     }
 
@@ -133,12 +133,12 @@ main(int argc, char **argv)
     loop = axl_loop_new();
     if (loop == NULL) {
         axl_printf("error: axl_loop_new failed\n");
-        axl_tcp_close(listener);
+        axl_tcp_close(listener, AXL_TEARDOWN_GRACEFUL);
         return 1;
     }
     if (axl_tcp_accept_async(listener, loop, NULL, on_accept, NULL) != AXL_OK) {
         axl_printf("error: axl_tcp_accept_async failed\n");
-        axl_tcp_close(listener);
+        axl_tcp_close(listener, AXL_TEARDOWN_GRACEFUL);
         axl_loop_free(loop);
         return 1;
     }
@@ -147,7 +147,7 @@ main(int argc, char **argv)
        the still-armed accept source against this loop, and the
        previous "free loop, then close" order left axl_tcp_close
        dereferencing freed loop memory. */
-    axl_tcp_close(listener);
+    axl_tcp_close(listener, AXL_TEARDOWN_GRACEFUL);
     axl_loop_free(loop);
     return 0;
 }

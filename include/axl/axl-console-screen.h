@@ -27,8 +27,7 @@
         axl_ws_send(user, bytes, len);   // ship to the browser terminal
     }
 
-    AxlConsoleScreen *scr;
-    axl_console_screen_new(&scr, 25, 80);
+    AxlConsoleScreen *scr = axl_console_screen_new(25, 80);
     // ... on every rx burst from the serial console:
     axl_console_screen_feed(scr, rx, rx_len);   // (still broadcast rx live too)
     // ... when a new viewer connects, before joining it to the live stream:
@@ -67,9 +66,12 @@ typedef struct AxlConsoleScreen AxlConsoleScreen;
  *
  * Called (possibly many times) during @ref axl_console_screen_snapshot with
  * consecutive chunks of the repaint stream; concatenating every chunk yields the
- * whole self-contained repaint. The bytes are UTF-8 text interleaved with ANSI/VT
- * control sequences, ready for an xterm.js / VT100 terminal, and are **only valid
- * for the duration of the call** — copy, do not retain the pointer. It has the
+ * whole self-contained repaint. A chunk boundary is a byte offset, not a token
+ * boundary — a single VT escape may be split across two calls — so feed the bytes
+ * to a streaming parser (or reassemble), never treat one call as a self-contained
+ * frame. The bytes are UTF-8 text interleaved with ANSI/VT control sequences,
+ * ready for an xterm.js / VT100 terminal, and are **only valid for the duration of
+ * the call** — copy, do not retain the pointer. It has the
  * same signature as the mirror's `AxlConsoleSinkFn` but is declared here so this
  * header need not depend on `axl-console-mirror.h`; the two are
  * structurally compatible, so one sink function serves both APIs.
@@ -92,15 +94,13 @@ typedef void (*AxlConsoleScreenSink)(
  * state a real terminal boots in, so a snapshot taken before any byte is fed is a
  * clean clear. Internally binds an @ref AxlVterm parser to the grid.
  *
- * @param out  [out] receives the new handle on success; set to NULL on failure.
  * @param rows terminal rows (must be > 0).
  * @param cols terminal columns (must be > 0).
- * @return AXL_OK on success (@p *out set); AXL_ERR on a NULL @p out, a zero
- *     @p rows / @p cols, or allocation failure.
+ * @return the new handle, or NULL on a zero @p rows / @p cols or allocation
+ *     failure.
  */
-int
+AxlConsoleScreen *
 axl_console_screen_new(
-    AxlConsoleScreen **out,   ///< [out] receives the handle
     uint32_t           rows,  ///< terminal rows (> 0)
     uint32_t           cols   ///< terminal columns (> 0)
 );

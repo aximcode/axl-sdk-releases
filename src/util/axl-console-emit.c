@@ -268,6 +268,14 @@ axl_console_emit_set_mode(AxlConsoleEmit *e, uint32_t mode_number)
 }
 
 void
+axl_console_emit_resize(AxlConsoleEmit *e, uint32_t cols, uint32_t rows)
+{
+    if (e->ops != NULL && e->ops->resize != NULL) {
+        e->ops->resize(e->user, cols, rows);
+    }
+}
+
+void
 axl_console_emit_clear_screen(AxlConsoleEmit *e)
 {
     /* A clear alone is NOT a full-screen app -- a shell `cls` clears then prints a

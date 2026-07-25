@@ -6,8 +6,9 @@
 
     Enumerates the handles publishing EFI_FIRMWARE_VOLUME2_PROTOCOL and
     reports each volume's GetVolumeAttributes status bits and a file
-    count from the GetNextFile walk. Read-only inventory probe — no file
-    contents or sections are read.
+    count from the GetNextFile walk. Also enumerates files by name GUID
+    and reads a file's user-interface section to resolve its GUID to a
+    human module name (axl_fv_find_file_name) — read-only throughout.
 
     The handle set is located once and cached for the image lifetime
     (the AxlBlock / AxlSerial model); `axl_fv_next` recovers its position
@@ -249,4 +250,102 @@ _axl_fv_find_app_file(
         }
     }
     return AXL_ERR;
+}
+
+/* Adapt the internal fv_walk callback (EFI types) to the public one. */
+typedef struct {
+    AxlFvFileFn  fn;
+    void        *ctx;
+} ForEachCtx;
+
+static bool
+for_each_adapter(
+    EFI_FV_FILETYPE  type,
+    const EFI_GUID  *name,
+    void            *ctx
+    )
+{
+    ForEachCtx *fe = (ForEachCtx *)ctx;
+    /* AxlGuid is binary-compatible with EFI_GUID (same field layout). */
+    return fe->fn((const AxlGuid *)name, (uint8_t)type, fe->ctx);
+}
+
+int
+axl_fv_for_each_file(
+    AxlHandle    handle,
+    AxlFvFileFn  fn,
+    void        *ctx
+    )
+{
+    if (fn == NULL) {
+        return AXL_ERR;
+    }
+    EFI_FIRMWARE_VOLUME2_PROTOCOL *fv = fv_proto(handle);
+    if (fv == NULL) {
+        return AXL_ERR;
+    }
+    ForEachCtx fe = { .fn = fn, .ctx = ctx };
+    return fv_walk(fv, for_each_adapter, &fe, NULL);
+}
+
+int
+axl_fv_find_file_name(
+    const AxlGuid *file_guid,
+    char          *out,
+    size_t         cap
+    )
+{
+    if (file_guid == NULL || out == NULL || cap == 0) {
+        return AXL_ERR;
+    }
+    out[0] = '\0';
+
+    /* AxlGuid is binary-compatible with EFI_GUID (same field layout). */
+    const EFI_GUID *name = (const EFI_GUID *)file_guid;
+
+    AxlHandle h = NULL;
+    while ((h = axl_fv_next(h)) != NULL) {
+        EFI_FIRMWARE_VOLUME2_PROTOCOL *fv = fv_proto(h);
+        if (fv == NULL || fv->ReadSection == NULL) {
+            continue;
+        }
+        /* *Buffer == NULL asks the firmware to AllocatePool the result; the UI
+           section body is a NUL-terminated CHAR16 string. EFI_NOT_FOUND (file
+           or UI section absent in this volume) just moves us to the next. */
+        void  *buf  = NULL;
+        UINTN  size = 0;
+        UINT32 auth = 0;
+        EFI_STATUS st = axl_efi_call(
+            fv->ReadSection, 7, fv, name,
+            (EFI_SECTION_TYPE)EFI_SECTION_USER_INTERFACE, (UINTN)0,
+            &buf, &size, &auth);
+        if (!EFI_ERROR(st) && buf != NULL) {
+            /* Only trust the CHAR16 string if its NUL falls within the returned
+               size — a malformed, unterminated section must not make the
+               converter over-read past the pool allocation. */
+            const unsigned short *u     = (const unsigned short *)buf;
+            size_t                units = (size_t)size / 2;
+            bool                  ok    = false;
+            for (size_t i = 0; i < units; i++) {
+                if (u[i] == 0) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (ok) {
+                axl_ucs2_to_utf8_buf(u, out, cap);
+            }
+            /* buf was AllocatePool'd by ReadSection (*Buffer==NULL above);
+               axl_backend_free is the backend's NULL-safe FreePool. */
+            axl_backend_free(buf);
+            if (ok && out[0] != '\0') {
+                return AXL_OK;
+            }
+            /* Empty or malformed UI section — keep looking in other volumes. */
+            out[0] = '\0';
+            continue;
+        }
+        axl_backend_free(buf);   /* NULL-safe */
+    }
+    return AXL_NOT_FOUND;
 }

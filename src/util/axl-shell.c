@@ -18,7 +18,9 @@
 #include <axl/axl-driver.h>
 #include <axl/axl-sys.h>     /* AxlGuid, AXL_GUID */
 #include <axl/axl-log.h>
-#include "../backend/axl-backend.h"   /* axl_bs() (gBS) + UEFI types/GUIDs */
+#include <axl/axl-str.h>     /* axl_utf8_to_ucs2 */
+#include <axl/axl-mem.h>     /* axl_free */
+#include "../backend/axl-backend.h"   /* axl_bs() (gBS) + UEFI types/GUIDs; axl_backend_shell_execute */
 #include "../fv/axl-fv-internal.h"
 
 AXL_LOG_DOMAIN("shell");
@@ -82,23 +84,73 @@ axl_shell_launch_fv(
     return AXL_ERR;
 }
 
-AxlShellSource
-axl_shell_locate(void)
+int
+axl_shell_execute(
+    const char *cmd
+    )
 {
-    /* Prefer a staged file — cheaper to launch and matches a consumer's own
-       deployed copy (the axl_shell_launch search path). */
-    char path[256];
-    if (axl_driver_locate("Shell.efi", path, sizeof(path)) == AXL_OK) {
-        return AXL_SHELL_FILE;
+    if (cmd == NULL) {
+        return AXL_ERR;
     }
-    /* Else look for the firmware-embedded Shell in a readable FV. */
+    unsigned short *ucs2 = axl_utf8_to_ucs2(cmd);
+    if (ucs2 == NULL) {
+        return AXL_ERR;
+    }
+    int rc = axl_backend_shell_execute(ucs2);
+    axl_free(ucs2);
+    return rc;
+}
+
+int
+axl_shell_sources(
+    AxlShellSources *out
+    )
+{
+    if (out == NULL) {
+        return AXL_ERR;
+    }
+    axl_memset(out, 0, sizeof(*out));
+
+    /* File source: a locatable `Shell.efi` (the axl_shell_launch search path).
+       axl_driver_locate fills out->file_path on success; force it empty on
+       failure so a partial write can't masquerade as a path. */
+    out->file = (axl_driver_locate("Shell.efi", out->file_path,
+                                   sizeof(out->file_path)) == AXL_OK);
+    if (!out->file) {
+        out->file_path[0] = '\0';
+    }
+
+    /* FV source: count how many of the known Shell file GUIDs a readable FV
+       carries. Reported INDEPENDENTLY of the file above — an FV-first consumer
+       can prefer the firmware Shell even when a foreign Shell.efi also exists
+       (the case the file-first axl_shell_locate masks). */
     for (size_t i = 0; i < SHELL_FV_GUID_COUNT; i++) {
         AxlHandle fv = NULL;
         if (_axl_fv_find_app_file(&SHELL_FV_GUIDS[i], &fv) == AXL_OK) {
-            return AXL_SHELL_FIRMWARE;
+            out->fv_count++;
         }
     }
-    return AXL_SHELL_NONE;
+    out->fv = (out->fv_count > 0);
+
+    return AXL_OK;
+}
+
+AxlShellSource
+axl_shell_locate(void)
+{
+    /* The file-first single verdict is exactly the file-first projection of
+       the independent sources — one code path keeps the two APIs consistent.
+       (The extra FV scan when a file exists is cheap: it walks firmware-volume
+       headers in memory, while the file search that both share walks mounted
+       filesystems and dominates the cost.) */
+    AxlShellSources s;
+    if (axl_shell_sources(&s) != AXL_OK) {
+        return AXL_SHELL_NONE;
+    }
+    if (s.file) {
+        return AXL_SHELL_FILE;
+    }
+    return s.fv ? AXL_SHELL_FIRMWARE : AXL_SHELL_NONE;
 }
 
 AxlShellKind

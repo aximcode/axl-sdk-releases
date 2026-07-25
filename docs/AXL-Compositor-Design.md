@@ -241,8 +241,8 @@ It is the natural precursor here, not a separate thing to design later:
 /* Surfaces — a tree (§2.1). parent == NULL → top-level (child of root).
    Position is relative to the parent; the subtree moves/raises/dies as
    one. create returns NULL on allocation failure (consumer handles it). */
-AxlSurface *axl_surface_create(AxlSurface *parent, uint32_t w, uint32_t h);
-void  axl_surface_destroy(AxlSurface *);               /* destroys the subtree */
+AxlSurface *axl_surface_new(AxlSurface *parent, uint32_t w, uint32_t h);
+void  axl_surface_free(AxlSurface *);               /* destroys the subtree */
 void  axl_surface_set_parent(AxlSurface *, AxlSurface *parent);
 void  axl_surface_move(AxlSurface *, int32_t x, int32_t y);  /* relative to parent */
 void  axl_surface_resize(AxlSurface *, uint32_t w, uint32_t h);  /* preserves overlap; damages old∪new */
@@ -373,7 +373,7 @@ of building it when a trigger arrives.
   now scheduled as enhancement phase **E3** (§9), on the `AxlGfxRegion`
   primitive (E1).
 - **Surface buffer budget → no hard cap; report OOM.**  Surfaces are
-  content-sized; `axl_surface_create` returns NULL on alloc failure and
+  content-sized; `axl_surface_new` returns NULL on alloc failure and
   the consumer handles it (same contract as `axl_malloc` /
   `axl_gfx_buffer_new`).  The compositor owns one full-screen output buffer
   buffer; everything else is content-sized.  Budget *policy* is the app's,
@@ -436,7 +436,7 @@ ratcheted.  Each phase stands alone and leaves the tree green.
 > firmware owns keymap/repeat). `axl_compositor_attach_keyboard`/`_detach`
 > over `axl_input_attach_key` (detach removes the loop source; a clean
 > re-attach needs an `axl_input_detach_key` follow-on in axl-input).
-> `axl_surface_destroy` purges the dying subtree from pointer focus,
+> `axl_surface_free` purges the dying subtree from pointer focus,
 > keyboard focus, and the grab stack without firing callbacks. No implicit
 > drag-grab (use an explicit grab on press); no serial-auth (one trusted
 > client). Unit-tested with synthetic events (grab confine/dismiss/inside-

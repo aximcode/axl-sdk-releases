@@ -26,6 +26,15 @@ struct AxlTcp {
     EFI_SERVICE_BINDING_PROTOCOL *tcp_sb;
     EFI_HANDLE                  sb_handle;
     bool                        is_listener;
+    /* Identifies the listener a socket belongs to: for a listener, its own
+       unique id; for an accepted connection, its accepting listener's id; 0 for
+       a client socket. Lets an abortive listener teardown find and finalize the
+       deferred (graceful, loop-owned) closes of its own children synchronously,
+       scoped to this listener (children share the NIC's service binding with
+       every other Tcp4 user, so sb_handle is too broad). A monotonic id, not a
+       pointer, so a freed-then-reused listener address can never alias-match a
+       stale child's deferred close. */
+    uint64_t                    listener_id;
 
     /* async state. Each op gets its own cancel_source so independent
        cancellables can coexist (e.g. concurrent recv + send with
@@ -51,11 +60,20 @@ struct AxlTcp {
     void           *recv_buf;
     size_t          recv_capacity;  /* buffer capacity — preserved across re-arms */
     size_t          recv_size;      /* bytes received last fire (see axl_tcp_recv_get_size) */
-    /* send */
+    /* send. A single async send is chunk-chained over the transport: the
+       caller's buffer is submitted as a sequence of bounded Transmits
+       (TCP_SEND_CHUNK_MAX each) so no one Transmit is unbounded — an
+       unbounded Transmit to a client that can't drain it monopolizes the
+       shared one-send-in-flight path and wedges the loop. send_ptr/total/off
+       track progress across chunks; the user callback fires once, after the
+       final chunk. */
     AxlTcpCallback  on_send;
     void           *send_data;
     AxlSourceId     send_source;
     AxlSourceId     send_cancel_source;
+    const uint8_t  *send_ptr;       /* caller's buffer (borrowed until done) */
+    size_t          send_total;     /* total bytes to send */
+    size_t          send_off;       /* bytes confirmed sent so far */
     EFI_TCP4_IO_TOKEN           tx_token;
     EFI_TCP4_TRANSMIT_DATA      tx_data;
     EFI_TCP4_FRAGMENT_DATA      tx_frag;

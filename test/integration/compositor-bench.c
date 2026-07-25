@@ -49,7 +49,7 @@ build_scene(AxlCompositor *c, uint32_t n, AxlSurface **surfs)
     AxlSurface *root = axl_compositor_root(c);
     uint32_t made = 0;
     for (uint32_t i = 0; i < n; i++) {
-        AxlSurface *s = axl_surface_create(root, 320, 240);
+        AxlSurface *s = axl_surface_new(root, 320, 240);
         if (s == NULL) {
             axl_printf("  (alloc failed at surface %u)\n", i);
             break;

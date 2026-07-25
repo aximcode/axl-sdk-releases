@@ -74,7 +74,6 @@ CALL_RE = re.compile(r"->\s*[A-Z][A-Za-z0-9_]*\s*\(")
 # number (run --update-baseline to regenerate this block).
 BASELINE: dict[str, int] = {
     "src/fs/axl-fs-provider.c": 1,
-    "src/fs/axl-fs.c": 9,
     "src/gfx/axl-gfx-output.c": 6,
     "src/gfx/axl-gfx.c": 14,
     "src/hii/axl-hii.c": 27,
@@ -87,7 +86,6 @@ BASELINE: dict[str, int] = {
     "src/mem/axl-mem.c": 2,
     "src/net/axl-mbedtls-platform.c": 1,
     "src/net/axl-net-dhcp.c": 4,
-    "src/net/axl-net-driver-select.c": 2,
     "src/net/axl-udp.c": 17,
     "src/posix/axl-app.c": 5,
     "src/ramdisk/axl-ramdisk.c": 4,

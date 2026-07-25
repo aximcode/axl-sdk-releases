@@ -3,8 +3,11 @@ Firmware-volume enumeration via `EFI_FIRMWARE_VOLUME2_PROTOCOL`.
 Header: `<axl/axl-fv.h>`. A read-only inventory probe over the
 firmware's Firmware Volume 2 handles — the FFS containers the
 platform's DXE drivers and other firmware files live in. It reports
-each volume's access attributes and file count; it does not read file
-contents or sections.
+each volume's access attributes and file count, enumerates the files
+by name GUID (`axl_fv_for_each_file`), and resolves a file GUID to its
+human module name via its user-interface section
+(`axl_fv_find_file_name`) — the runtime way to turn an FV-dispatched
+driver's `FvFile(<GUID>)` device path into a name like `Ip4Dxe`.
 
 Lazy on first call: AxlFv locates the FV2 handles once with
 `LocateHandleBuffer` and caches the set for the image lifetime. On

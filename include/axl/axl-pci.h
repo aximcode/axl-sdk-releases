@@ -176,7 +176,7 @@ axl_pci_dump(
  * @return AXL_OK on success (both fields populated), AXL_ERR if the function
  *     is absent or any bus error is encountered.
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_get_vid_did(
     AxlPciAddr   addr,   ///< target function
     uint16_t    *vid,    ///< [out] vendor ID
@@ -193,7 +193,7 @@ axl_pci_get_vid_did(
  *
  * @return AXL_OK on success, AXL_ERR on bus error.
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_get_class_code(
     AxlPciAddr   addr,    ///< target function
     uint32_t    *class_code  ///< [out] 24-bit class code
@@ -229,7 +229,7 @@ typedef enum {
  *
  * @return AXL_OK on success, AXL_ERR on bus error.
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_get_header_type(
     AxlPciAddr         addr,                 ///< target function
     AxlPciHeaderType  *type,                 ///< [out] header type (NULL allowed)
@@ -249,7 +249,7 @@ axl_pci_get_header_type(
  *     is absent, has a non-Type-0 header, or any bus error is
  *     encountered.
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_get_subsystem(
     AxlPciAddr   addr,    ///< target function (must be header-type 0)
     uint16_t    *svid,    ///< [out] subsystem vendor ID
@@ -438,7 +438,7 @@ typedef struct {
  * @return AXL_OK on success, AXL_ERR if @p addr is not a PCI-PCI bridge or any
  *     bus error is encountered.
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_bridge_info(
     AxlPciAddr      addr,   ///< target function
     AxlPciBridge   *out     ///< [out] primary/secondary/subordinate
@@ -597,7 +597,7 @@ axl_pci_ext_cap_id_str(
  *     (which may exceed @p buflen — in which case the buffer was
  *     truncated).
  */
-int
+AXL_WARN_UNUSED int
 axl_pci_vpd_read(
     AxlPciAddr   addr,         ///< target function
     const char   keyword[2],   ///< 2-char ASCII keyword (NOT nul-terminated)

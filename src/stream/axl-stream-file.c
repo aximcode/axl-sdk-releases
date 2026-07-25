@@ -18,11 +18,27 @@
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
 #include "axl-stream-internal.h"
+#include "../fs/axl-file-gen.h"
 AXL_LOG_DOMAIN("stream");
 
 typedef struct {
     AxlFileHandle  handle;
+    bool           writable;  /* opened for write: has state worth flushing */
+    uint32_t       gen_key;   /* write registry slot for this path (writable only) */
 } FileCtx;
+
+/* Record that this stream's file changed. THE choke point for stream
+   writes: every buffered write, printf, raw write and positional write in
+   AXL lands in file_write or file_pwrite, so one call in each is the whole
+   coverage — no per-caller bump to forget. The key is computed once at
+   axl_fopen, so this allocates nothing and cannot fail. */
+static void
+file_touched(FileCtx *f)
+{
+    if (f->writable) {
+        axl_file_gen_bump_key(f->gen_key);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // File vtable
@@ -36,6 +52,7 @@ file_write(void *ctx, const void *data, size_t count)
     int rc;
 
     rc = axl_backend_file_write(f->handle, &size, data);
+    file_touched(f);   /* even a failed write may have moved bytes */
     if (rc != 0) {
         axl_warning("write failed");
         return -1;
@@ -105,6 +122,7 @@ file_pwrite(void *ctx, const void *data, size_t count, size_t offset)
     }
 
     rc = axl_backend_file_write(f->handle, &size, data);
+    file_touched(f);   /* even a failed write may have moved bytes */
 
     axl_backend_file_set_position(f->handle, saved_pos);
 
@@ -167,10 +185,14 @@ static int
 file_flush(void *ctx)
 {
     FileCtx *f = (FileCtx *)ctx;
-    size_t zero = 0;
 
-    /* UEFI: WriteFile with size 0 flushes */
-    return axl_backend_file_write(f->handle, &zero, NULL);
+    /* A read-only handle holds no dirty state of ours, and the firmware
+       answers a flush on one with EFI_ACCESS_DENIED — so flushing a read
+       stream is a no-op success, the way stdio treats it. */
+    if (!f->writable) {
+        return AXL_OK;
+    }
+    return axl_backend_file_flush(f->handle);
 }
 
 static void
@@ -231,7 +253,16 @@ axl_fopen(const char *path, const char *mode)
         axl_backend_file_close(&handle);
         return NULL;
     }
-    f->handle = handle;
+    f->handle   = handle;
+    f->writable = (open_mode & AXL_FILE_MODE_WRITE) != 0u;
+    f->gen_key  = axl_file_gen_key(path);
+    if (f->writable) {
+        /* The open itself is a namespace change when the file did not
+           exist (write modes carry CREATE), so a reader that has been
+           watching an absent path learns about it here rather than on the
+           first byte written. */
+        axl_file_gen_bump_key(f->gen_key);
+    }
 
     /* For append mode, seek to end */
     if (mode[0] == 'a') {

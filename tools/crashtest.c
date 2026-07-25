@@ -234,6 +234,12 @@ print_help(void)
 int
 main(int argc, char **argv)
 {
+    /* --version/-V prints the stamp uniformly (crashtest uses a plain main, not
+       AXL_TOOL_MAIN, so it calls the hook directly); -h/--help and any other
+       -flag fall through to the full mode help below. */
+    if (axl_version_handle("crashtest", argc, argv)) {
+        return 0;
+    }
     if (argc < 2 || argv[1][0] == '-') {
         print_help();
         return 0;

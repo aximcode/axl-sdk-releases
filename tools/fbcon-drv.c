@@ -267,7 +267,7 @@ fbcon_entry(AxlHandle image, AxlSystemTable *st)
         .key_filter      = fbcon_hotkey,
         .key_filter_user = g_term,
     };
-    if (axl_console_device_install(&g_device, ops, ops_user, &dcfg) != AXL_OK) {
+    if (axl_console_device_install(ops, ops_user, &dcfg, &g_device) != AXL_OK) {
         axl_console_term_free(g_term);
         g_term = NULL;
         return 1;

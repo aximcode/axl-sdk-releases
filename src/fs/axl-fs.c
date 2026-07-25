@@ -21,8 +21,10 @@
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-fs.h>
+#include <axl/axl-path.h>
 #include <axl/axl-sys.h>
 #include "../stream/axl-stream-internal.h"
+#include "axl-file-gen.h"
 AXL_LOG_DOMAIN("fs");
 
 // ---------------------------------------------------------------------------
@@ -35,6 +37,23 @@ struct AxlDir {
 };
 
 #define AXL_DIR_WALK_PATH_MAX  512u
+
+/* Longest volume root we carry: name + ':' + separator + NUL. Shell map
+   names are short ("fs0:", "RD:"); a longer one is rejected outright
+   rather than truncated -- see volume_root_prefix. */
+#define AXL_VOLUME_ROOT_MAX  32u
+
+/* AxlFsProviderVolumeInfo documents (uint64_t)-1 as "unknown", and the
+   provider thunk synthesizes it for a provider with no volume_info
+   callback. Real firmware can report it too. It must never reach a
+   caller as a figure. */
+#define AXL_VOLUME_SPACE_UNKNOWN  ((uint64_t)-1)
+
+/* Sanity bound on the EFI_FILE_SYSTEM_INFO size a volume asks for. The
+   struct plus a UCS-2 label is well under 1 KB; the figure comes from
+   firmware or a third-party provider, so it is bounded before it
+   reaches malloc rather than trusted. */
+#define AXL_VOLUME_INFO_MAX  4096u
 
 // ---------------------------------------------------------------------------
 // Whole-file helpers
@@ -156,12 +175,28 @@ axl_file_set_contents(const char *path, const void *buf, size_t len)
 
     write_size = len;
     rc = axl_backend_file_write(handle, &write_size, buf);
+    /* The file has changed even if the write below reports a failure — a
+       short write still moved bytes. Tell any open reader unconditionally;
+       bumping only on success is how a reader ends up serving a file that
+       is neither the old one nor the one the caller was told failed. */
+    axl_file_gen_bump(path);
     /* set_contents replaces the WHOLE file, so truncate to exactly len —
        otherwise a rewrite with a shorter buffer leaves the previous file's
        tail behind (open with CREATE does not shrink an existing file). A
        no-op when the file was not longer than len. */
     if (rc == AXL_OK && axl_backend_file_set_size(handle, (uint64_t)len)
                             != AXL_OK) {
+        rc = AXL_ERR;
+    }
+    /* Flush EXPLICITLY, before the close. The close's own status is
+       unreportable — EFI_FILE_PROTOCOL.Close is specified to return only
+       EFI_SUCCESS, and axl_backend_file_close answers AXL_OK regardless —
+       so without this a full volume, write-protected media or device error
+       that only surfaces when the firmware pushes its buffers out would be
+       reported to the caller as a successful write. AXL_OK from here means
+       the bytes are on the volume, which is what axl_file_write_atomic
+       relies on before it replaces anything. */
+    if (rc == AXL_OK && axl_backend_file_flush(handle) != AXL_OK) {
         rc = AXL_ERR;
     }
     axl_backend_file_close(&handle);
@@ -190,8 +225,12 @@ axl_file_write_atomic(const char *path, const void *buf, size_t len)
     axl_memcpy(temp, path, plen);
     axl_memcpy(temp + plen, ".tmp", 5);   /* copies the NUL too */
 
-    /* Write the full contents to the temp file first; closing it flushes
-       (UEFI FAT flushes on close). The target is untouched until now. */
+    /* Write the full contents to the temp file first — and axl_file_set_contents
+       flushes before it reports, so AXL_OK here means the temp's bytes are
+       genuinely on the volume, not merely accepted by the firmware. That is
+       exactly what makes the replace below safe: promoting a temp whose write
+       had not actually landed would destroy a good target file in exchange for
+       one that may be empty or short. The target is untouched until now. */
     if (axl_file_set_contents(temp, (buf != NULL) ? buf : "", len) != AXL_OK) {
         axl_file_delete(temp);            /* best-effort cleanup */
         axl_free(temp);
@@ -204,15 +243,23 @@ axl_file_write_atomic(const char *path, const void *buf, size_t len)
        only the complete temp file — never a half-written target. */
     int rc = axl_file_rename(temp, path);
     if (rc != AXL_OK) {
-        /* Target exists: FAT can't rename-over, so remove then rename.
-           If the delete succeeds but this rename then fails (effectively
-           impossible on a healthy same-directory FAT volume), both files
-           are gone and we report ERR below — the data is in neither. */
+        /* Target exists: FAT can't rename-over, so remove then rename. */
         axl_file_delete(path);            /* best-effort; ignore result */
         rc = axl_file_rename(temp, path);
     }
     if (rc != AXL_OK) {
-        axl_file_delete(temp);            /* leave the target as it was */
+        /* Both renames failed. Drop the temp ONLY if the target survived:
+           then nothing was lost and the temp is litter. If the delete above
+           DID remove the target (effectively impossible on a healthy
+           same-directory FAT volume, but it is the case that matters),
+           the temp holds the only complete copy of the data and deleting
+           it would destroy the caller's file outright — leave it at
+           "<path>.tmp" to be recovered, which is what the sibling promote
+           site (axl_piece_tree_save) does for the identical situation. */
+        AxlFsEntry target;
+        if (axl_file_info(path, &target) == AXL_OK) {
+            axl_file_delete(temp);        /* target intact — temp is litter */
+        }
         axl_free(temp);
         return AXL_ERR;
     }
@@ -298,6 +345,7 @@ axl_file_delete(const char *path)
 
     rc = axl_backend_file_delete((const unsigned short *)wide_path);
     axl_free(wide_path);
+    axl_file_gen_bump(path);
     return rc;
 }
 
@@ -372,6 +420,11 @@ axl_file_rename(const char *old_path, const char *new_path)
         (const unsigned short *)wide_new);
     axl_free(wide_old);
     axl_free(wide_new);
+    /* BOTH names changed meaning: the old one no longer resolves and the
+       new one now names different content. A reader open on either has to
+       find out. */
+    axl_file_gen_bump(old_path);
+    axl_file_gen_bump(new_path);
     return rc;
 }
 
@@ -431,6 +484,16 @@ axl_file_move(const char *old_path, const char *new_path)
     }
 
     axl_fclose(src);
+    /* Flush the destination BEFORE the source is deleted below. axl_fclose is
+       not a durability point (it drains the AXL-side buffer through
+       stream_drain and never calls the stream's flush), and the close under it
+       cannot report anything — EFI_FILE_PROTOCOL.Close is specified to return
+       only EFI_SUCCESS. Without this a flush-only failure (full volume,
+       write-protected media, device error) would delete the source in exchange
+       for a copy that never landed: the file would be gone from both paths. */
+    if (ok && axl_fflush(dst) != AXL_OK) {
+        ok = false;
+    }
     axl_fclose(dst);
 
     if (!ok) {
@@ -440,6 +503,76 @@ axl_file_move(const char *old_path, const char *new_path)
         return AXL_ERR;
     }
     return axl_file_delete(old_path);
+}
+
+int
+axl_file_truncate(const char *path, uint64_t size)
+{
+    unsigned short *wide_path;
+    AxlFileHandle   handle = NULL;
+    AxlFsEntry      entry;
+    int             rc;
+
+    if (path == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Growing physically writes the added region on the FAT driver, so a
+       large resize is real I/O — yield first, like the other whole-file
+       operations, so a batching caller stays Ctrl-C responsive. */
+    _axl_poll_break();
+
+    /* Stat first: a missing file is an error (this never creates one),
+       and a directory is refused — UEFI derives a directory's size from
+       its contents, and the spec has SetInfo either ignore FileSize on a
+       directory or fail it, so pre-checking turns a driver-dependent
+       outcome into one clear refusal. */
+    if (axl_file_info(path, &entry) != AXL_OK) {
+        return AXL_ERR;
+    }
+    if (axl_fs_entry_is_dir(&entry)) {
+        return AXL_ERR;
+    }
+
+    wide_path = axl_utf8_to_ucs2(path);
+    if (wide_path == NULL) {
+        return AXL_ERR;
+    }
+
+    /* Deliberately no CREATE — the file must already exist. */
+    rc = axl_backend_file_open((const unsigned short *)wide_path,
+                               AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
+                               0, &handle);
+    axl_free(wide_path);
+    if (rc != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    rc = axl_backend_file_set_size(handle, size);
+    if (rc == AXL_OK) {
+        /* AXL_OK means VERIFIED, not merely requested. A filesystem may
+           accept a size-carrying SetInfo and change nothing — an
+           AxlFsProvider whose `set_info` only implements rename and
+           attribute changes ignores the size outright. Re-read the length
+           from the same open handle so a silent no-op can't pass for
+           success. */
+        int64_t actual = axl_backend_file_get_size(handle);
+        if (actual < 0 || (uint64_t)actual != size) {
+            rc = AXL_ERR;
+        }
+    }
+    /* The re-read above proves the driver ACCEPTED the new length; it reads
+       the same open handle, so it cannot prove the change reached the media.
+       Flush for that, before the close whose status is unreportable
+       (EFI_FILE_PROTOCOL.Close is specified to return only EFI_SUCCESS) --
+       otherwise "AXL_OK means VERIFIED" stops being true on exactly the
+       volumes where it matters. Same contract as axl_file_set_contents. */
+    if (rc == AXL_OK && axl_backend_file_flush(handle) != AXL_OK) {
+        rc = AXL_ERR;
+    }
+    axl_backend_file_close(&handle);
+    axl_file_gen_bump(path);
+    return rc;
 }
 
 int
@@ -470,6 +603,11 @@ axl_dir_mkdir(const char *path)
 
     rc = axl_backend_file_mkdir((const unsigned short *)wide_path);
     axl_free(wide_path);
+    /* A directory now occupies a name that did not resolve before. Nothing
+       views a directory today, but the registry keys the NAMESPACE, not
+       just file bytes, and a view left open on a path that has become a
+       directory must not keep serving the file that used to be there. */
+    axl_file_gen_bump(path);
     return rc;
 }
 
@@ -490,6 +628,7 @@ axl_dir_rmdir(const char *path)
 
     rc = axl_backend_file_rmdir((const unsigned short *)wide_path);
     axl_free(wide_path);
+    axl_file_gen_bump(path);
     return rc;
 }
 
@@ -710,6 +849,82 @@ axl_dir_walk(
 // Volume operations
 // ---------------------------------------------------------------------------
 
+/* Why three outcomes and not a bool: the caller may fall back to the
+   working directory ONLY when the path named no volume at all. A path
+   that named a volume we cannot represent must fail, because resolving
+   it against the cwd would answer confidently about a DIFFERENT volume
+   -- a "will this write fit?" caller would get another volume's free
+   bytes and a clean AXL_OK. */
+typedef enum {
+    VOLUME_PREFIX_OK,     /* @p out holds the volume root */
+    VOLUME_PREFIX_NONE,   /* no ':' — the path is relative to the cwd */
+    VOLUME_PREFIX_BAD     /* named a volume: empty or too long to hold */
+} VolumePrefixResult;
+
+/* "fs0:\EFI\x.efi" -> "fs0:\". The trailing separator is not cosmetic:
+   the shell's OpenFileByName rejects a bare map name ("fs0:") and opens
+   the root for "fs0:\". */
+static VolumePrefixResult
+volume_root_prefix(
+    const char *path,
+    char       *out,
+    size_t      out_size
+    )
+{
+    for (size_t i = 0; path[i] != '\0'; i++) {
+        if (path[i] == ':') {
+            if (i == 0 || i + 3 > out_size) {   /* name + ':' + '\' + NUL */
+                return VOLUME_PREFIX_BAD;
+            }
+            axl_strlcpy(out, path, i + 2);
+            out[i + 1] = '\\';
+            out[i + 2] = '\0';
+            return VOLUME_PREFIX_OK;
+        }
+    }
+    return VOLUME_PREFIX_NONE;
+}
+
+/**
+ * Reduce any path to the root of the volume it names.
+ *
+ * Both the label and the free-space queries are about the VOLUME, so
+ * they must answer the same for every spelling of it, and the caller is
+ * often asking about a file that does not exist yet ("will this upload
+ * fit?"). Opening the root rather than @p path itself gives both.
+ *
+ * A path with no volume prefix is resolved against the current working
+ * directory, which is the volume such a path would land on.
+ */
+static int
+volume_root_of(
+    const char *path,
+    char       *out,
+    size_t      out_size
+    )
+{
+    if (path[0] == '\0') {
+        return AXL_ERR;
+    }
+    switch (volume_root_prefix(path, out, out_size)) {
+    case VOLUME_PREFIX_OK:
+        return AXL_OK;
+    case VOLUME_PREFIX_BAD:
+        /* The path DID name a volume. Falling through to the cwd here
+           would silently answer about the wrong one. */
+        return AXL_ERR;
+    case VOLUME_PREFIX_NONE:
+        break;
+    }
+
+    AXL_AUTO_FREE char *cwd = axl_get_current_dir();
+    if (cwd == NULL) {
+        return AXL_ERR;
+    }
+    return (volume_root_prefix(cwd, out, out_size) == VOLUME_PREFIX_OK)
+           ? AXL_OK : AXL_ERR;
+}
+
 char *
 axl_volume_get_label(
     const char *path
@@ -722,16 +937,19 @@ axl_volume_get_label(
         return NULL;
     }
 
-    /* Convert path to UCS-2 for comparison */
-    unsigned short wpath[256];
-    size_t i;
-    for (i = 0; i < 255 && path[i] != '\0'; i++) {
-        wpath[i] = (unsigned short)(unsigned char)path[i];
+    /* Ask the volume ROOT, not @p path itself. The label belongs to the
+       volume, so every spelling of it ("fs0:", "fs0:\", "fs0:\dir\f")
+       must answer the same — and the bare map name the docstring
+       advertises is exactly the form the shell's OpenFileByName
+       rejects, so passing @p path through verbatim returned NULL for
+       the documented spelling. As a bonus the path need not exist. */
+    char root_path[AXL_VOLUME_ROOT_MAX];
+    if (volume_root_of(path, root_path, sizeof(root_path)) != AXL_OK) {
+        return NULL;
     }
-    wpath[i] = 0;
+    unsigned short wpath[AXL_VOLUME_ROOT_MAX];
+    axl_utf8_to_ucs2_buf(root_path, wpath, AXL_VOLUME_ROOT_MAX);
 
-    /* Open the file path — this uses the Shell protocol internally
-       to resolve "fs0:" to a filesystem handle and open the root */
     AxlFileHandle fh = NULL;
     if (axl_backend_file_open(wpath,
                               AXL_FILE_MODE_READ, 0, &fh) != AXL_OK) {
@@ -751,7 +969,7 @@ axl_volume_get_label(
     /* First call: size probe. The EFI_BUFFER_TOO_SMALL return is
        expected; we only care that info_size was populated. */
     size_t info_size = 0;
-    file->GetInfo(file, &vol_label_guid, &info_size, NULL);
+    axl_efi_call(file->GetInfo, 4, file, &vol_label_guid, &info_size, NULL);
 
     if (info_size == 0) {
         axl_backend_file_close(&fh);
@@ -765,7 +983,8 @@ axl_volume_get_label(
         return NULL;
     }
 
-    status = file->GetInfo(file, &vol_label_guid, &info_size, info_buf);
+    status = axl_efi_call(file->GetInfo, 4, file, &vol_label_guid,
+                          &info_size, info_buf);
     axl_backend_file_close(&fh);
 
     if (EFI_ERROR(status)) {
@@ -797,7 +1016,7 @@ axl_volume_get_label_by_handle(
     }
 
     /* Get SimpleFileSystem protocol from the handle */
-    status = axl_bs()->HandleProtocol(
+    status = axl_efi_call(axl_bs()->HandleProtocol, 3,
         (EFI_HANDLE)handle,
         (EFI_GUID *)&EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
         (void **)&fs);
@@ -806,7 +1025,7 @@ axl_volume_get_label_by_handle(
     }
 
     /* Open the root directory */
-    status = fs->OpenVolume(fs, &root);
+    status = axl_efi_call(fs->OpenVolume, 2, fs, &root);
     if (EFI_ERROR(status) || root == NULL) {
         return NULL;
     }
@@ -820,22 +1039,23 @@ axl_volume_get_label_by_handle(
     /* First call: size probe. Expected EFI_BUFFER_TOO_SMALL return;
        only info_size matters. */
     size_t info_size = 0;
-    root->GetInfo(root, &vol_label_guid, &info_size, NULL);
+    axl_efi_call(root->GetInfo, 4, root, &vol_label_guid, &info_size, NULL);
 
     if (info_size == 0) {
-        root->Close(root);
+        axl_efi_call(root->Close, 1, root);
         return NULL;
     }
 
     /* Allocate and read */
     uint8_t *info_buf = (uint8_t *)axl_malloc(info_size);
     if (info_buf == NULL) {
-        root->Close(root);
+        axl_efi_call(root->Close, 1, root);
         return NULL;
     }
 
-    status = root->GetInfo(root, &vol_label_guid, &info_size, info_buf);
-    root->Close(root);
+    status = axl_efi_call(root->GetInfo, 4, root, &vol_label_guid,
+                          &info_size, info_buf);
+    axl_efi_call(root->Close, 1, root);
 
     if (EFI_ERROR(status)) {
         axl_free(info_buf);
@@ -848,6 +1068,139 @@ axl_volume_get_label_by_handle(
     axl_free(info_buf);
 
     return label;
+}
+
+// ---------------------------------------------------------------------------
+// Volume space
+// ---------------------------------------------------------------------------
+
+/**
+ * Read VolumeSize / FreeSpace off an open EFI_FILE_PROTOCOL.
+ *
+ * Only writes an out-param when the volume reported a real figure, and
+ * only fails on the figures the caller actually asked for — a volume
+ * that knows its free space but not its total still answers a
+ * free-space-only query.
+ */
+static int
+volume_space_from_file(
+    EFI_FILE_PROTOCOL *file,
+    uint64_t          *total,
+    uint64_t          *free_bytes
+    )
+{
+    /* Size probe. Its STATUS is the interesting half, not just the
+       size: a volume that has no filesystem information to give says
+       EFI_UNSUPPORTED ("cannot report"), while a sick one says
+       EFI_DEVICE_ERROR / EFI_NO_MEDIA / EFI_VOLUME_CORRUPTED ("this
+       failed"). Both leave info_size at 0, so keying off the size
+       alone would launder a device error into "cannot report" -- the
+       one distinction this API exists to preserve. */
+    size_t     info_size = 0;
+    EFI_STATUS status    = axl_efi_call(file->GetInfo, 4, file,
+                                        &gEfiFileSystemInfoGuid,
+                                        &info_size, NULL);
+    if (status == EFI_UNSUPPORTED) {
+        return AXL_UNSUPPORTED;
+    }
+    if (status != EFI_BUFFER_TOO_SMALL
+        || info_size < SIZE_OF_EFI_FILE_SYSTEM_INFO
+        || info_size > AXL_VOLUME_INFO_MAX) {
+        /* Includes the nonsense cases: a "success" that returned no
+           buffer, and a size a sane filesystem never asks for (the
+           struct plus a label). Both come from firmware or a
+           third-party provider, so neither is trusted into malloc. */
+        return AXL_ERR;
+    }
+
+    uint8_t *info_buf = (uint8_t *)axl_malloc(info_size);
+    if (info_buf == NULL) {
+        return AXL_ERR;
+    }
+    status = axl_efi_call(file->GetInfo, 4, file,
+                          &gEfiFileSystemInfoGuid,
+                          &info_size, info_buf);
+    if (EFI_ERROR(status)) {
+        axl_free(info_buf);
+        return AXL_ERR;
+    }
+
+    const EFI_FILE_SYSTEM_INFO *fsi = (const EFI_FILE_SYSTEM_INFO *)info_buf;
+    uint64_t vol_size  = (uint64_t)fsi->VolumeSize;
+    uint64_t free_size = (uint64_t)fsi->FreeSpace;
+    axl_free(info_buf);
+
+    if ((total != NULL && vol_size == AXL_VOLUME_SPACE_UNKNOWN)
+        || (free_bytes != NULL && free_size == AXL_VOLUME_SPACE_UNKNOWN)) {
+        return AXL_UNSUPPORTED;
+    }
+    if (total != NULL) {
+        *total = vol_size;
+    }
+    if (free_bytes != NULL) {
+        *free_bytes = free_size;
+    }
+    return AXL_OK;
+}
+
+int
+axl_volume_get_space(
+    const char *path,
+    uint64_t   *total,
+    uint64_t   *free_bytes
+    )
+{
+    if (path == NULL || (total == NULL && free_bytes == NULL)) {
+        return AXL_ERR;
+    }
+
+    char root[AXL_VOLUME_ROOT_MAX];
+    if (volume_root_of(path, root, sizeof(root)) != AXL_OK) {
+        return AXL_ERR;
+    }
+
+    unsigned short wroot[AXL_VOLUME_ROOT_MAX];
+    axl_utf8_to_ucs2_buf(root, wroot, AXL_VOLUME_ROOT_MAX);
+
+    AxlFileHandle fh = NULL;
+    if (axl_backend_file_open(wroot,
+                              AXL_FILE_MODE_READ, 0, &fh) != AXL_OK) {
+        return AXL_ERR;
+    }
+    int rc = volume_space_from_file((EFI_FILE_PROTOCOL *)fh,
+                                    total, free_bytes);
+    axl_backend_file_close(&fh);
+    return rc;
+}
+
+int
+axl_volume_get_space_by_handle(
+    void     *handle,
+    uint64_t *total,
+    uint64_t *free_bytes
+    )
+{
+    if (handle == NULL || (total == NULL && free_bytes == NULL)) {
+        return AXL_ERR;
+    }
+
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
+    EFI_STATUS status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+        (EFI_HANDLE)handle,
+        (EFI_GUID *)&EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+        (void **)&fs);
+    if (EFI_ERROR(status) || fs == NULL) {
+        return AXL_ERR;
+    }
+
+    EFI_FILE_PROTOCOL *root = NULL;
+    status = axl_efi_call(fs->OpenVolume, 2, fs, &root);
+    if (EFI_ERROR(status) || root == NULL) {
+        return AXL_ERR;
+    }
+    int rc = volume_space_from_file(root, total, free_bytes);
+    axl_efi_call(root->Close, 1, root);
+    return rc;
 }
 
 // ---------------------------------------------------------------------------

@@ -31,8 +31,7 @@
     consumer never needs the region itself.
 
     @code
-    AxlVterm *v;
-    axl_vterm_new(&v, 25, 80, &my_grid_ops, my_grid);
+    AxlVterm *v = axl_vterm_new(25, 80, &my_grid_ops, my_grid);
     axl_vterm_feed(v, bytes, len);      // drives the ops
     axl_vterm_flush(v);                 // emit any coalesced run at a repaint boundary
     axl_vterm_free(v);
@@ -72,7 +71,7 @@ typedef struct AxlVterm AxlVterm;
  * @ref AxlConsoleOps's documented default of @ref AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT
  * will silently misdecode any run carrying a double-width or combining codepoint.
  * `set_cell_rule` is invoked **only on the success path** — a call that returns
- * AXL_ERR never touches @p ops.
+ * NULL never touches @p ops.
  *
  * Exactly one op fires before returning — `set_cell_rule`; no `set_cursor` or
  * `set_pen` is synthesized at creation. The consumer's grid should already be in
@@ -87,18 +86,16 @@ typedef struct AxlVterm AxlVterm;
  * such scroll. The only way to skip binding `erase` is to bind `scrollrect` and
  * have it accept (return non-zero for) every scroll.
  *
- * @param out  [out] receives the new handle on success; set to NULL on failure.
  * @param rows number of terminal rows (must be > 0; signed to match
  *     @ref AxlConsoleRect and libvterm's own `int` geometry).
  * @param cols number of terminal columns (must be > 0).
  * @param ops  consumer callbacks (retained by pointer; must outlive the handle).
  * @param user opaque context passed back to every callback.
- * @return AXL_OK on success (@p *out set); AXL_ERR on bad arguments (NULL @p out /
- *     @p ops, or non-positive @p rows / @p cols) or on allocation failure.
+ * @return the new handle, or NULL on bad arguments (NULL @p ops, or non-positive
+ *     @p rows / @p cols) or allocation failure.
  */
-int
+AxlVterm *
 axl_vterm_new(
-    AxlVterm           **out,   ///< [out] receives the handle
     int32_t              rows,   ///< terminal rows (> 0)
     int32_t              cols,   ///< terminal columns (> 0)
     const AxlConsoleOps *ops,    ///< consumer callbacks (retained by pointer)

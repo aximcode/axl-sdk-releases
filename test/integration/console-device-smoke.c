@@ -61,7 +61,10 @@
 #ifdef SELF_UNINSTALL_MS
 #include <axl/axl-time.h>
 #endif
-#if defined(SELF_UNINSTALL_MS) || defined(PRECACHE_SMALL)
+#ifdef PASSTHROUGH_LOCAL
+#include <axl/axl-time.h>
+#endif
+#if defined(SELF_UNINSTALL_MS) || defined(PRECACHE_SMALL) || defined(PASSTHROUGH_LOCAL)
 #include <uefi/axl-uefi.h>
 #endif
 
@@ -116,8 +119,11 @@ static AxlLoop          *g_loop;
 static bool     s_installed;   /* axl_console_device_install returned AXL_OK  */
 static bool     s_got_ops;     /* at least one output_text reached the grid   */
 
-#ifdef SELF_UNINSTALL_MS
-static uint64_t s_takeover_ms; /* monotonic ms at take-over; restore trigger base */
+#if defined(SELF_UNINSTALL_MS) || defined(PASSTHROUGH_LOCAL)
+static uint64_t s_takeover_ms; /* monotonic ms at take-over; restore/co-paint base */
+#endif
+#ifdef PASSTHROUGH_LOCAL
+static bool     s_copaint_written;  /* the one-shot wide-line probe has been emitted */
 #endif
 #ifdef CYCLE_COUNT
 static int      s_cycle;       /* completed take-over/restore cycles (regression) */
@@ -316,7 +322,15 @@ static int
 take_over_device(void)
 {
     AxlConsoleDeviceConfig cfg = {
+#ifdef PASSTHROUGH_LOCAL
+        /* Co-paint: we OBSERVE the console instead of owning it, so the firmware
+           GraphicsConsole stays in the fan-out and the local display keeps working.
+           Geometry MUST be 0 (physical) — install rejects an explicit size here,
+           because two consoles painting one screen have to agree on the grid. */
+        .cols = 0, .rows = 0, .passthrough_local = true,
+#else
         .cols = GRID_COLS, .rows = GRID_ROWS,
+#endif
         .auto_alt_screen = AUTO_ALT,
 #ifdef TAKE_INPUT
         .take_input = true, .read_physical = true,
@@ -324,7 +338,7 @@ take_over_device(void)
         .take_input = false,
 #endif
     };
-    return axl_console_device_install(&g_device, &GRID_OPS, NULL, &cfg);
+    return axl_console_device_install(&GRID_OPS, NULL, &cfg, &g_device);
 }
 
 static bool
@@ -406,6 +420,29 @@ blit_cb(void *data)
     }
     return AXL_SOURCE_CONTINUE;
 #else
+#ifdef PASSTHROUGH_LOCAL
+    /* Co-paint probe, emitted once a couple of seconds after take-over (past both
+       connect storms). Drive gST->ConOut DIRECTLY with lines WIDER than our 80-col
+       grid: ConSplitter fans them to us AND — if passthrough left it in the fan-out —
+       to the firmware GraphicsConsole. Our grid clamps at x<640; GraphicsConsole
+       paints the full width, so ink beyond x=660 can ONLY have come from it. That
+       makes the analyzer's clean-region check invert cleanly: black there means the
+       local console died (an eviction we did not ask for), ink means it is alive.
+       Deliberately not keystroke-driven — `ver` output is far too narrow to reach
+       x=660, so it could not tell co-painting from silence. */
+    if (!s_copaint_written && s_installed
+        && axl_time_get_ms() - s_takeover_ms >= 2000) {
+        s_copaint_written = true;
+        if (gST != NULL && gST->ConOut != NULL) {
+            for (int i = 0; i < 12; i++) {
+                gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)
+                    L"axl-console-device PASSTHROUGH co-paint probe: this line is "
+                    L"deliberately wider than the 80-column grid so the firmware "
+                    L"console paints past it\r\n");
+            }
+        }
+    }
+#endif
     /* Status bars kept fresh even when the grid is idle. */
     status_bar(0, s_installed ? AXL_GFX_GREEN : AXL_GFX_RED);
     status_bar(1, s_got_ops   ? AXL_GFX_GREEN : AXL_GFX_RED);
@@ -481,8 +518,11 @@ smoke_entry(AxlHandle image, AxlSystemTable *st)
         return 1;   /* status bar 0 stays red -> visible failure */
     }
     s_installed = true;
-#ifdef SELF_UNINSTALL_MS
-    s_takeover_ms = axl_time_get_ms();   /* restore trigger measures real time from here */
+#if defined(SELF_UNINSTALL_MS) || defined(PASSTHROUGH_LOCAL)
+    /* Restore trigger / co-paint probe both measure REAL time from here (a
+       pump-derived clock overshoots badly under DEBUG OVMF — see the restore
+       variant's note). */
+    s_takeover_ms = axl_time_get_ms();
 #endif
 
     g_loop = axl_loop_new();

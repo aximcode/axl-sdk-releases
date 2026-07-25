@@ -116,7 +116,7 @@ axl_rb_tree_init(AxlRBTree *t, AxlRBRecompute recompute, void *user)
 }
 
 bool
-axl_rb_tree_empty(const AxlRBTree *t)
+axl_rb_tree_is_empty(const AxlRBTree *t)
 {
     return t->root == NULL;
 }

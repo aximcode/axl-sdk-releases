@@ -162,8 +162,12 @@ if (axl_file_get_contents("fs0:/config.json", &data, &len) == AXL_OK) {
     axl_free(data);
 }
 
-// Write entire file
-axl_file_set_contents("fs0:/output.txt", buf, buf_len);
+// Write entire file. The status is must-check for a reason: it is AXL_OK
+// only once the bytes are flushed through to the volume, and a close can
+// never tell you that (EFI_FILE_PROTOCOL.Close returns only EFI_SUCCESS).
+if (axl_file_set_contents("fs0:/output.txt", buf, buf_len) != AXL_OK) {
+    // the file is NOT on disk — report it; don't carry on as if it were
+}
 ```
 
 ## Stream I/O
@@ -211,9 +215,22 @@ is coalesced uniformly, ahead of any UTF-8 → UCS-2 transcode and tee.
 UEFI app can exit through a crt0 path that runs no atexit hook, so
 auto-buffered output could be silently lost, and a line-buffered prompt
 before a read could stall unseen. Buffering is therefore strictly opt-in,
-and **you own the final flush**: `axl_fflush` drains, `axl_fclose` flushes
-then frees. Because `axl_stdout` / `axl_stderr` are never `fclose`d, code
-that buffers them must `axl_fflush` before it exits.
+and **you own the final flush**: `axl_fflush` drains the buffer *and*
+pushes the sink; `axl_fclose` drains and frees but never calls the sink's
+flush, so it is not a substitute (spelled out below). Because
+`axl_stdout` / `axl_stderr` are never `fclose`d, code that buffers them
+must `axl_fflush` before it exits.
+
+On a **file** stream `axl_fflush` does double duty: it drains the AXL-side
+buffer *and* pushes the firmware's own cache through to the volume, so a
+successful return is the point at which the bytes are durable. Flushing a
+stream opened read-only is a no-op success — there is nothing dirty behind
+it, and the firmware would otherwise refuse the call outright.
+
+`axl_fclose` is **not** an equivalent durability point: it drains the
+AXL-side buffer and frees it, but never invokes the sink's own flush. If
+you need to know the bytes reached the volume, `axl_fflush` and check it,
+*then* close.
 
 This is orthogonal to the interactive/line-discipline axis (see the
 text-wrapper section): buffering governs how *writes* coalesce, the
@@ -288,13 +305,27 @@ for text decoding):
 
 | Use case | API |
 |---|---|
-| Text output (the common case) | `axl_print` / `axl_printf` / `axl_write(axl_stdout, ...)` — UTF-8 in, UCS-2 to console, captured-as-UCS-2 by the shell on `>` / `|` |
-| Binary output (RAM-disk dump, captured SPD blob, etc.) | `axl_write(axl_stdout_raw, ...)` — raw bytes, bypasses the CHAR16 console path so they survive a pipe intact |
+| Text output (the common case) | `axl_print` / `axl_printf` / `axl_write(axl_stdout, ...)` — UTF-8 in, UCS-2 out; displays on the interactive console AND pipes/redirects correctly (see below) |
+| Binary output (RAM-disk dump, captured SPD blob, etc.) | `axl_write(axl_stdout_raw, ...)` — raw bytes, bypasses the UTF-8→UCS-2 transcode so arbitrary bytes survive byte-for-byte |
+
+`axl_stdout` picks its sink per invocation: the interactive console
+writes `gST->ConOut` (so the console subsystem — tap / mirror / device —
+sees the bytes), while a **non-interactive** stdout (a `|` pipe, or a
+`>` / `>a` redirect) writes the transcoded UCS-2 to the shell's
+`EFI_SHELL_PARAMETERS_PROTOCOL.StdOut` handle. That last part matters:
+the UEFI shell wires StdOut for a pipe but does NOT swap `gST->ConOut`,
+so a ConOut-only write would print to the screen instead of feeding the
+next stage. Because axl_stdout now does this, `tool | other`,
+`tool > f` and `tool >a f` all carry a tool's text output; the shell's
+handle wrapper supplies the leading BOM and any `>a` / `|a` ASCII
+downconversion.
 
 Don't use `axl_stdout_raw` for text; the firmware console only knows
-UCS-2, so writing raw 8-bit bytes to it (when no shell redirection
-is in play) would mangle the display. The raw path is only useful
-when the caller knows the shell wired their StdOut to a file or pipe.
+UCS-2, so writing raw 8-bit bytes to it (on the interactive path) would
+mangle the display, and it emits UTF-8 (not the shell's expected UCS-2)
+into a `>` / `>a` redirect. `axl_stdout_raw` is for **binary** payloads
+that must not be transcoded — not merely to make text pipe, which
+`axl_stdout` now does on its own.
 
 ## Text-Decoding Stream Wrapper
 

@@ -67,6 +67,10 @@ signature verification).
      - ``<axl/axl-crypto.h>``
      - needs ``AXL_TLS=1``
      - below
+   * - JOSE — JWS / JWT / JWK signed tokens
+     - ``<axl/axl-jose.h>``
+     - needs ``AXL_TLS=1``
+     - :doc:`jose`
 
 Public-key signature verification
 ---------------------------------

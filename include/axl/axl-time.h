@@ -257,7 +257,7 @@ axl_time_set_realtime(
  * @brief Set the firmware real-time clock from Unix seconds (UTC).
  *
  * The ergonomic path for clock-set-from-NTP: feed the
- * `unix_secs` an SNTP query returns (see @c axl_sntp_query in
+ * `unix_secs` an SNTP query returns (see @c axl_net_sntp_query in
  * <axl/axl-net.h>) straight in. @p unix_secs is split into a
  * Gregorian calendar date internally and written with
  * `timezone_minutes = 0` (UTC) and the daylight flag cleared, so

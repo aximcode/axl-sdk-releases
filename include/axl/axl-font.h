@@ -70,8 +70,11 @@ typedef struct {
 } AxlGlyph;
 
 /// Font type flags — mirrors PEG's PegFont uType bits where applicable.
-#define AXL_FONT_MONOSPACE  (1u << 0)  ///< every glyph's advance == cell_width
-#define AXL_FONT_VARIABLE   (1u << 1)  ///< proportional advance widths (per-glyph)
+/// A bitmask OR'd into AxlFont::flags (stored as uint32_t so future bits fit).
+typedef enum {
+    AXL_FONT_MONOSPACE = (1u << 0),  ///< every glyph's advance == cell_width
+    AXL_FONT_VARIABLE  = (1u << 1)   ///< proportional advance widths (per-glyph)
+} AxlFontFlags;
 /* Future: AXL_FONT_OUTLINE (2bpp), AXL_FONT_ANTIALIAS (4bpp) when a
  * consumer needs them.  The flag bits are reserved. */
 

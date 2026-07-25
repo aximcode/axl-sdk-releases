@@ -143,9 +143,9 @@ The **driver** (`fbcon-drv.c`) gives the running Shell a graphical terminal on t
 framebuffer:
 1. Resolve GOP + default font; compute cols×rows for the full screen.
 2. `term = axl_console_term_new(cfg)` (GOP target, full bounds).
-3. `axl_console_device_install(&dev, axl_console_term_ops(term, &u), u,
+3. `axl_console_device_install(axl_console_term_ops(term, &u), u,
    &{take_input=true, read_physical=true, key_filter=hotkey_thunk,
-     key_filter_user=term, cols, rows})`.
+     key_filter_user=term, cols, rows}, &dev)`.
 4. Attach a UEFI pointer (`axl-input` attach_mouse / SimplePointer) if present; pump
    its events into `axl_console_term_handle_pointer`. No pointer → output +
    keyboard only (graceful).

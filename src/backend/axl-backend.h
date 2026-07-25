@@ -355,6 +355,22 @@ axl_backend_file_write(
     );
 
 /**
+ * @brief Flush a file handle's pending data through to the volume.
+ *
+ * Pushes firmware-buffered writes to the media via the real flush
+ * primitive (the shell's FlushFile, or EFI_FILE_PROTOCOL.Flush on the
+ * old EFI 1.x path). @p handle must be open for writing — the firmware
+ * answers a read-only handle with EFI_ACCESS_DENIED, which surfaces
+ * here as AXL_ERR.
+ *
+ * @return AXL_OK on success, AXL_ERR on error.
+ */
+int
+axl_backend_file_flush(
+    AxlFileHandle  handle  ///< file handle (open for write)
+    );
+
+/**
  * @brief Get current file position.
  *
  * @return AXL_OK on success, AXL_ERR on error.
@@ -555,6 +571,24 @@ bool
 axl_backend_stdin_is_interactive(void);
 
 /**
+ * @brief Is the shell's StdOut an interactive console (not a redirected
+ *     file or pipe)?
+ *
+ * Symmetric with @ref axl_backend_stdin_is_interactive, probing
+ * axl_backend_shell_stdout() the same way. When false AND a shell StdOut
+ * handle is published, the text stdout sink writes UCS-2 to that handle so
+ * a `| pipe` carries the tool's output — the shell wires StdOut for a pipe
+ * but does NOT swap gST->ConOut, so a ConOut-only write never reaches the
+ * downstream stage. When true, the sink uses gST->ConOut so the console
+ * subsystem (tap / mirror / device) still sees the bytes.
+ *
+ * @return true if StdOut is the interactive console; false if redirected,
+ *     piped, or not connected.
+ */
+bool
+axl_backend_stdout_is_interactive(void);
+
+/**
  * @brief Get the SHELL_FILE_HANDLE for the running image's standard
  *     output, as published by EFI_SHELL_PARAMETERS_PROTOCOL on this
  *     image's handle.
@@ -667,6 +701,48 @@ axl_backend_shell_map_alias(
     void   *device_path,  ///< opaque EFI_DEVICE_PATH_PROTOCOL for the volume
     char   *out,          ///< [out] receives the first alias, verbatim, no ':'
     size_t  out_size      ///< capacity of @p out
+    );
+
+/**
+ * @brief Name the volume a device HANDLE represents, e.g. "FS0" or "fs0".
+ *
+ * The handle-keyed counterpart of @ref axl_backend_shell_map_alias, for the
+ * "what volume did this image come from" query — an image loaded from a file
+ * carries its volume as `EFI_LOADED_IMAGE_PROTOCOL.DeviceHandle`, and matching
+ * that handle by identity is exact where a device-path comparison is merely
+ * careful.
+ *
+ * Where a shell is live its map is the ONLY naming returned — verbatim, so a
+ * caller's path keeps the spelling the user sees, and a volume the shell has
+ * not mapped reports AXL_ERR rather than a positional name the shell would
+ * resolve to a different volume. Only with NO shell at all is the volume
+ * named positionally (`fs<n>`), matched on the handle by identity. Resolved
+ * on each call, so a name captured earlier cannot go stale against a remap.
+ *
+ * @return AXL_OK with the bare name (no trailing ':') in @p out; AXL_ERR on
+ *         bad args, or when nothing names the handle's volume — including a
+ *         live shell that has no mapping for it.
+ */
+int
+axl_backend_volume_name_for_handle(
+    void   *device_handle,  ///< opaque EFI_HANDLE for the volume
+    char   *out,            ///< [out] receives the volume name, no ':'
+    size_t  out_size        ///< capacity of @p out
+    );
+
+/**
+ * @brief Byte-compare two device paths, including their END nodes.
+ *
+ * Node-length-driven walk, bounded against a malformed chain (a node claiming
+ * Length < 4 would otherwise never advance). Two paths are equal when they are
+ * the same total size and identical byte for byte.
+ *
+ * @return true when both paths are well-formed and identical.
+ */
+bool
+axl_backend_dp_equal(
+    const void  *a,  ///< opaque EFI_DEVICE_PATH_PROTOCOL
+    const void  *b   ///< opaque EFI_DEVICE_PATH_PROTOCOL
     );
 
 /**
@@ -923,6 +999,40 @@ axl_backend_event_check(
  */
 bool
 axl_backend_at_raised_tpl(void);
+
+/**
+ * @brief Enter a brief critical section by raising to a serialization TPL.
+ *
+ * Raises to a level at or above @c TPL_CALLBACK and returns an opaque token to
+ * pass to @ref axl_backend_leave_critical. Bracket a short data-structure update
+ * (a pointer swap, a small append) that is shared between a foreground writer at
+ * @c TPL_APPLICATION and a driver-pump consumer dispatched at @c TPL_CALLBACK:
+ * while raised, neither the pump notify nor a lower-TPL writer can preempt, so the
+ * two never interleave. Keep the section short — no blocking, no I/O. Pairs
+ * strictly LIFO with @ref axl_backend_leave_critical (restore is a stack).
+ *
+ * The guard raises to @c TPL_NOTIFY (the highest TPL at which pool allocation is
+ * still legal, so a guarded buffer append may grow). The caller must therefore
+ * already be at or below @c TPL_NOTIFY — true of any console/loop path (they run
+ * at @c TPL_APPLICATION or @c TPL_CALLBACK); it is not a general above-NOTIFY lock.
+ *
+ * @return an opaque token holding the prior TPL, for @ref axl_backend_leave_critical.
+ */
+uintptr_t
+axl_backend_enter_critical(void);
+
+/**
+ * @brief Leave the critical section entered by @ref axl_backend_enter_critical.
+ *
+ * Restores the TPL captured in @p token. Must be called on the same call stack,
+ * LIFO, exactly once per @ref axl_backend_enter_critical.
+ *
+ * @param token the value @ref axl_backend_enter_critical returned.
+ */
+void
+axl_backend_leave_critical(
+    uintptr_t token   ///< token from axl_backend_enter_critical
+);
 
 /**
  * @brief Register for protocol install notification.

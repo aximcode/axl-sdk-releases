@@ -41,7 +41,7 @@ extern "C" {
  * @return AXL_OK on success, AXL_ERR if EFI_RNG_PROTOCOL is unavailable or
  *     the firmware reports an error.
  */
-int
+AXL_WARN_UNUSED int
 axl_rng_bytes(
     void   *out,   ///< destination buffer
     size_t  len    ///< number of bytes to fill

@@ -41,20 +41,37 @@ char *
 _axl_prepend_volume_mapping(void *device_handle, const char *file_path);
 
 /**
- * Initialize the per-image sidecar-discovery anchor (`axl_app_image_path`)
- * for an image whose CRT0 didn't run `_axl_args_init`. Specifically:
- * DXE drivers go through `axl_driver_init`, not the application CRT,
- * so they reach this entry point to capture their LoadedImage->FilePath.
+ * Capture the two per-image path values for an image whose CRT0 didn't run
+ * `_axl_args_init`. Specifically: DXE drivers go through `axl_driver_init`,
+ * not the application CRT, so they reach this entry point.
+ *
+ * Both are derived here because they answer different questions:
+ *
+ *   - `axl_app_image_path()` — the file THIS image was loaded from, or NULL
+ *     when there is none. A synthetic load context (a buffer load, whose
+ *     device path AXL synthesizes after the fact) has no such file, and the
+ *     public contract in `<axl/axl-app.h>` promises NULL for it.
+ *   - `_axl_app_image_anchor()` — the nearest image in the ParentHandle
+ *     chain that WAS loaded from a file. The directory anchor for sidecar
+ *     discovery: a buffer-loaded driver embedded into a launcher inherits
+ *     the launcher's directory, which is where its data files live.
+ *
+ * For an ordinary file-loaded image the two are the same string.
  *
  * Idempotent — a follow-up call after `_axl_args_init` is a no-op.
- *
- * The walk falls back to LoadedImage->ParentHandle when the current
- * image has no FilePath (the common case for buffer-loaded driver
- * images: `axl_driver_load_buffer` and `axl_driver_ensure_with_embedded`'s
- * step-4 embedded-blob path). This makes sidecar autodiscovery work
- * for embedded drivers by anchoring on the launcher's path.
  */
 void
 _axl_init_image_path(void *image_handle);
+
+/**
+ * The sidecar-discovery anchor described above. Borrowed pointer owned by
+ * the runtime; never freed by the caller. NULL when no image in the chain
+ * was loaded from a file (network / RAM-disk boot).
+ *
+ * Callers wanting "where is THIS image" want the public
+ * `axl_app_image_path()` instead — this one may name an ancestor.
+ */
+const char *
+_axl_app_image_anchor(void);
 
 #endif /* AXL_IMAGE_INTERNAL_H */

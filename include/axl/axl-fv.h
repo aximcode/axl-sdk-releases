@@ -114,6 +114,72 @@ axl_fv_count_files(
     size_t    *out       ///< [out] file count, populated on success
 );
 
+/**
+ * @brief Per-file callback for @ref axl_fv_for_each_file.
+ *
+ * @param file_guid  the file's name GUID (borrowed — copy if kept past return).
+ * @param file_type  the EFI_FV_FILETYPE (e.g. 0x07 DRIVER, 0x0B FIRMWARE_VOLUME_IMAGE).
+ * @param ctx        the opaque pointer passed to axl_fv_for_each_file.
+ * @return true to stop the walk early, false to continue.
+ */
+typedef bool (*AxlFvFileFn)(
+    const AxlGuid *file_guid,
+    uint8_t        file_type,
+    void          *ctx
+);
+
+/**
+ * @brief Enumerate every file in a firmware volume, by name GUID.
+ *
+ * The runtime sibling of AxlFw's offline tree walk: invokes @p fn once per
+ * FFS file in @p handle (all file types), giving each file's name GUID and
+ * type. Pair with @ref axl_fv_find_file_name to turn a GUID into a name.
+ *
+ * @param handle  a volume handle from @ref axl_fv_next.
+ * @param fn      per-file callback; must not be NULL. Return true to stop early.
+ * @param ctx     opaque pointer forwarded to @p fn.
+ * @return AXL_OK on a clean end-of-enumeration or an early stop (@p fn
+ *     returned true); AXL_ERR if @p handle does not publish the FV2 protocol,
+ *     @p fn is NULL, or the walk hits a hard read error.
+ */
+int
+axl_fv_for_each_file(
+    AxlHandle    handle,   ///< handle from axl_fv_next
+    AxlFvFileFn  fn,       ///< per-file callback
+    void        *ctx       ///< opaque pointer for @p fn
+);
+
+/**
+ * @brief Resolve a firmware-file GUID to its human UI name.
+ *
+ * Searches every live firmware volume for the FFS file named @p file_guid
+ * and reads its user-interface section (the `CHAR16` string a build tool
+ * stamps from a module's `.inf` name, e.g. "Ip4Dxe"), returning it as UTF-8.
+ * This is what turns an FV-embedded driver's raw `FvFile(<GUID>)` device-path
+ * text into a name a human recognizes — the missing half of @ref
+ * axl_handle_name for drivers whose image lives in a firmware volume.
+ *
+ * The first volume that both contains the file and carries a UI section for
+ * it wins. A file present but with no UI section, or a GUID no volume
+ * contains, reports AXL_NOT_FOUND (not AXL_ERR) — a normal "no name here"
+ * outcome the caller can fall back from.
+ *
+ * @param file_guid  the FFS file's name GUID (as it appears in an FvFile
+ *                   device-path node). Must not be NULL.
+ * @param out        [out] buffer for the NUL-terminated UTF-8 name; truncated
+ *                   to @p cap. Set to "" on any non-OK return. Must not be NULL.
+ * @param cap        capacity of @p out in bytes; must be > 0.
+ * @return AXL_OK and @p out set to the name; AXL_NOT_FOUND if no volume has
+ *     the file with a UI section; AXL_ERR on NULL @p file_guid / @p out,
+ *     zero @p cap, or a hard firmware read error.
+ */
+int
+axl_fv_find_file_name(
+    const AxlGuid *file_guid,   ///< FFS file name GUID to resolve
+    char          *out,         ///< [out] UTF-8 name, NUL-terminated
+    size_t         cap          ///< capacity of @p out in bytes
+);
+
 #ifdef __cplusplus
 }
 #endif

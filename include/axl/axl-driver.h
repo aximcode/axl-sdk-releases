@@ -25,6 +25,7 @@
 #include <stddef.h>
 
 #include <axl/axl-sys.h>
+#include <axl/axl-attempt.h>   /* AxlAttempt — axl_driver_load_dir_guarded */
 
 #ifdef __cplusplus
 extern "C" {
@@ -272,7 +273,7 @@ axl_driver_load(
  *     present in the app directory. `*out_handle` is set to NULL on
  *     any failure.
  */
-int
+AxlStatus
 axl_driver_load_sibling(
     const char       *file_name,  ///< bare driver filename (no '/', '\\', or ':'), e.g. "doDriver.efi"
     AxlDriverHandle  *out_handle  ///< [out] receives driver handle
@@ -537,7 +538,13 @@ axl_driver_get_load_options_raw(
  * Useful for finding companion files next to the driver.
  * Caller frees with axl_free().
  *
- * @return path string, or NULL if unavailable.
+ * Same contract as axl_app_image_path for the same condition: an image
+ * that was NOT loaded from a file — a buffer / memory load, whose device
+ * path AXL synthesizes after the fact — returns NULL rather than a
+ * volume-less path naming a file it never came from.
+ *
+ * @return path string, or NULL if this image was not loaded from a file
+ *     (or the loaded-image protocol carried no FILEPATH node).
  */
 char *
 axl_driver_get_image_path(void);
@@ -665,7 +672,7 @@ axl_driver_locate(
  *     driver that loaded, started, and registered the protocol; AXL_ERR
  *     only on a NULL @p protocol_guid or @p driver_name.
  */
-int
+AxlStatus
 axl_driver_ensure(
     const AxlGuid *protocol_guid,  ///< protocol GUID to look up (must be non-NULL)
     const char    *driver_name     ///< driver filename (e.g. "RamDiskDxe.efi")
@@ -723,7 +730,7 @@ axl_driver_ensure(
  *     fallback, when attempted) all failed to produce a registered
  *     protocol; AXL_ERR only on a NULL @p protocol_guid or @p driver_name.
  */
-int
+AxlStatus
 axl_driver_ensure_with_embedded(
     const AxlGuid       *protocol_guid,    ///< protocol GUID to look up (must be non-NULL)
     const char          *driver_name,      ///< canonical driver filename, e.g. "RamDiskDxe.efi"
@@ -735,12 +742,55 @@ axl_driver_ensure_with_embedded(
 );
 
 /**
+ * @brief Ensure a protocol-providing driver is loaded from **exactly one
+ *     named file** — no search, no embedded fallback.
+ *
+ * The pinned sibling of axl_driver_ensure_with_embedded. That
+ * function's 4-path search is a convenience; it is also a hazard when
+ * two copies of the same driver filename exist on the box, because the
+ * search order — not the caller — decides which one wins. A caller that
+ * staged the image it wants and knows where it put it says so here and
+ * takes the search out of the picture entirely. `override_name` does
+ * NOT cover this: it substitutes a *name* into the same search, so it
+ * cannot separate two files that share a name.
+ *
+ * Resolution:
+ *   1. `LocateProtocol(protocol_guid)` — short-circuit if the protocol
+ *      is already registered (same as the searching variants; the
+ *      already-published instance is not the caller's to re-configure,
+ *      so @p load_options is ignored on this path).
+ *   2. Load @p driver_path, install @p load_options if any, `StartImage`,
+ *      then verify the protocol got registered. If it did not, the image
+ *      is unloaded and this reports failure — it does not fall back to
+ *      anything.
+ *
+ * @return AXL_OK if the protocol is registered (was already, or after
+ *     loading @p driver_path); AXL_NOT_FOUND if @p driver_path could not
+ *     be loaded, failed to start, or started without registering the
+ *     protocol; AXL_INVALID on a NULL @p protocol_guid or
+ *     @p driver_path.
+ */
+AxlStatus
+axl_driver_ensure_from_path(
+    const AxlGuid *protocol_guid,     ///< protocol GUID to look up (must be non-NULL)
+    const char    *driver_path,       ///< exact path to the driver .efi, e.g. "fs0:\\drivers\\x64\\my-dxe.efi"
+    const void    *load_options,      ///< LoadOptions to install pre-Start (may be NULL)
+    size_t         load_options_size  ///< size of @p load_options in bytes (0 if NULL)
+);
+
+/**
  * @brief Load, start, and connect all .efi drivers in a directory.
  *
  * Scans @p dir_path for files matching @p pattern (glob, e.g. "*.efi").
  * Each matching file is loaded, started, and connected. On return,
  * @p loaded_count receives the number of drivers successfully started.
  * Pass NULL for @p pattern to match all .efi files.
+ *
+ * Loading an arbitrary .efi can hang or fault the box, and this
+ * function offers no protection against that: one bad driver in
+ * @p dir_path wedges the machine, and the next boot walks the same
+ * directory in the same order and wedges identically. Use
+ * axl_driver_load_dir_guarded() where that matters.
  *
  * @return AXL_OK on success (even if no drivers found), AXL_ERR on error.
  */
@@ -749,6 +799,43 @@ axl_driver_load_dir(
     const char *dir_path,      ///< directory to scan (UTF-8)
     const char *pattern,       ///< glob pattern (NULL = "*.efi")
     size_t     *loaded_count   ///< [out] number of drivers loaded (may be NULL)
+);
+
+/**
+ * @brief Load a directory of drivers under crash-culprit protection.
+ *
+ * axl_driver_load_dir() plus an AxlAttempt guard, which is what makes
+ * the sweep survivable: each driver is breadcrumbed by filename before
+ * it is loaded, so one that hangs or resets the box is identified and
+ * quarantined on the next boot and skipped from then on. The sweep then
+ * makes progress instead of dying in the same place every boot.
+ *
+ * With @p guard non-NULL, per matching file:
+ *   - already quarantined → skipped, not loaded, not counted;
+ *   - otherwise breadcrumbed, then loaded/started/connected, then the
+ *     breadcrumb is cleared.
+ *
+ * A crash left over from a previous boot is recovered once, up front,
+ * before the walk — so the culprit is on the quarantine list before the
+ * walk can reach it. Only the breadcrumb and the quarantine list are
+ * used; nothing is written to the guard's result log, since the outcome
+ * vocabulary belongs to the caller.
+ *
+ * @p guard must be an initialized AxlAttempt (see axl_attempt_init()) —
+ * the namespace and vendor GUID are the caller's, so two consumers
+ * sweeping different directories keep separate quarantine lists.
+ * Passing NULL is explicitly allowed and is exactly
+ * axl_driver_load_dir(): no breadcrumb, no skipping.
+ *
+ * @return AXL_OK on success (even if no drivers found or all were
+ *     quarantined), AXL_ERR on error.
+ */
+int
+axl_driver_load_dir_guarded(
+    const char       *dir_path,      ///< directory to scan (UTF-8)
+    const char       *pattern,       ///< glob pattern (NULL = "*.efi")
+    const AxlAttempt *guard,         ///< crash-culprit guard, or NULL for none
+    size_t           *loaded_count   ///< [out] number of drivers loaded (may be NULL)
 );
 
 #ifdef __cplusplus

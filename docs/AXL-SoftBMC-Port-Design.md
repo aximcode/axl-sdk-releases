@@ -140,7 +140,7 @@ regression here matters for embedded targets.
 | `ModuleManager.c` | SoftBMC's plugin/module system — app-level, keep |
 | `AlertEngine.c` + `AlertSmtp/Snmp/Syslog/Webhook.c` | app-level event/alert bus over AxlNet/UDP — keep |
 | `Auth.c`, `Session.c` | **port onto the dashboard session/RBAC mechanism** (GAP) |
-| `EcAccess.c`, `EcRegMap.c` | rehost on AXL I/O-port (`axl-port`) + AxlSmbus |
+| `EcAccess.c`, `EcRegMap.c` | rehost on AXL I/O-port (`axl-io-port`) + AxlSmbus |
 | `BuildInfo.c` | keep |
 
 ### 3.3 `Modules/Feature/*` — keep features; rehost hardware reads
@@ -150,7 +150,7 @@ regression here matters for embedded targets.
 | `HwInfo/` (Acpi, CpuInfo, Pci, Smbios, Usb, Storage, Tpm, Display, MemMap, FirmwareVol, Serial, UefiVars, Diagnostics) | AxlAcpi / AxlPci / AxlSmbios / AxlUsb / AxlGfx / AxlNvstore — **substrate already ships**; decode/diagnostics stay app-level |
 | `RemoteShell/` (`Vt100Parser`) | app + `axl-console`/shell |
 | `RemoteKvm/` (`RfbServer`, `RfbEncoding`, `RfbEncHextile`, `KeysymMap`) | **app-side RFB/VNC encoder** rides AxlGfx (capture) + the absolute-pointer/key seat (input inject) |
-| `Ec/EcModule` + `Hardware/Ec{Framework,Generic,Ite,Nuvoton}` | app EC chip drivers over `axl-port` + AxlSmbus |
+| `Ec/EcModule` + `Hardware/Ec{Framework,Generic,Ite,Nuvoton}` | app EC chip drivers over `axl-io-port` + AxlSmbus |
 | `BootConfig/`, `OsBoot/`, `PowerControl/` | AxlBoot, AxlImage (OS load), `axl_reset` (axl-sys) |
 | `Redfish/` (stub) | `axl_http` + `axl_json`; extract `axl_redfish_*` session helper only if depth warrants |
 | `UefiSetup/` (`HiiParse.c`) | **`axl-hii`** engine + AGT `AgtFormBrowser` (or keep web-rendered over the model) |

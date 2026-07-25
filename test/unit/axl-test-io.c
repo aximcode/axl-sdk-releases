@@ -3,6 +3,7 @@
 **/
 
 #include "axl-test.h"
+#include "axl-test-flushfail-fs.h"
 #include "axl-backend.h"   /* axl_backend_get_monotonic_us (raised-TPL timing) */
 #include <uefi/axl-uefi.h> /* gBS RaiseTPL/RestoreTPL, TPL_CALLBACK */
 
@@ -385,7 +386,7 @@ test_file_writer(void)
     /* Reopen (flags 0) truncates to empty — shorter content, no tail. */
     w = axl_file_writer_open(p, 0);
     if (w != NULL) {
-        (void)axl_file_writer_write(w, "hi", 2);
+        test_check(axl_file_writer_write(w, "hi", 2) == AXL_OK, "writer: reopen write ok");
     }
     test_check(axl_file_writer_close(w) == AXL_OK, "writer: reopen + close OK");
     buf = NULL; len = 0;
@@ -399,9 +400,9 @@ test_file_writer(void)
     test_check(w != NULL && axl_file_writer_tell(w) == 2,
                "writer: append opens at EOF (tell == 2)");
     if (w != NULL) {
-        (void)axl_file_writer_write(w, "!!", 2);
+        test_check(axl_file_writer_write(w, "!!", 2) == AXL_OK, "writer: append write ok");
     }
-    (void)axl_file_writer_close(w);
+    test_check(axl_file_writer_close(w) == AXL_OK, "writer: append close flushes ok");
     buf = NULL; len = 0;
     test_check(axl_file_get_contents(p, &buf, &len) == AXL_OK
                && len == 4 && axl_memcmp(buf, "hi!!", 4) == 0,
@@ -414,7 +415,7 @@ test_file_writer(void)
     axl_file_delete(p);
     w = axl_file_writer_open(p, AXL_FILE_WRITER_EXCL);
     test_check(w != NULL, "writer: EXCL creates when the file is absent");
-    (void)axl_file_writer_close(w);
+    test_check(axl_file_writer_close(w) == AXL_OK, "writer: EXCL-created close ok");
 
     /* NULL-safety contract. */
     test_check(axl_file_writer_close(NULL) == AXL_OK, "writer: close(NULL) is AXL_OK");
@@ -1936,6 +1937,300 @@ test_file_write_atomic(void)
     axl_file_delete(path);
 }
 
+/* axl_file_truncate — the truncate(2) analog. Pins the whole documented
+   contract: shrink keeps a byte-exact prefix, grow extends, size ==
+   current is a checked no-op, AXL_OK means the length was VERIFIED
+   (re-read from the handle), and the refusal cases (missing file,
+   directory, NULL path) never mutate anything. */
+static void
+test_file_truncate(void)
+{
+    const char *path = "fs0:\\axl_trunc_api.tmp";
+    const char *dir  = "fs0:\\axl_trunc_dir";
+    const char *gone = "fs0:\\axl_trunc_absent.tmp";
+    void       *contents = NULL;
+    size_t      len = 0;
+    AxlFsEntry  e;
+
+    axl_file_delete(path);
+    if (axl_file_set_contents(path, "abcdefghij", 10) != AXL_OK) {
+        test_fail("truncate: setup write failed");
+        return;
+    }
+
+    /* Shrink: the surviving prefix is byte-exact, the tail is gone. */
+    test_check(axl_file_truncate(path, 4) == AXL_OK,
+               "truncate: shrink returns AXL_OK");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 4,
+               "truncate: shrink -> info reports 4 bytes");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == 4 && test_memcmp(contents, "abcd", 4) == 0,
+               "truncate: shrink keeps a byte-exact prefix");
+    axl_free(contents);
+    contents = NULL;
+
+    /* size == current length: no change, still a full success. */
+    test_check(axl_file_truncate(path, 4) == AXL_OK,
+               "truncate: size == current length returns AXL_OK");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 4,
+               "truncate: size == current length leaves the file at 4");
+
+    /* Timestamps are preserved, not bumped (unlike POSIX truncation) —
+       the resize writes the file's existing times back through SetInfo.
+       FAT stores mtime at TWO-SECOND granularity, so this must wait out
+       a full bucket before resizing: without the stall a driver that DID
+       bump the time would write back the same second and the assertion
+       could never fail. Cheap enough once, and it is the only pin on the
+       docstring's "preserved, not bumped" claim. */
+    AxlFsEntry before;
+    if (axl_file_info(path, &before) != AXL_OK) {
+        test_fail("truncate: mtime setup stat failed");
+        return;
+    }
+    test_check(before.mtime_unix > 0,
+               "truncate: baseline mtime is a real timestamp");
+    axl_sleep(3);
+    test_check(axl_file_truncate(path, 3) == AXL_OK,
+               "truncate: shrink to 3 returns AXL_OK");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 3
+               && e.mtime_unix == before.mtime_unix,
+               "truncate: modification time preserved, not bumped");
+
+    /* size 0 empties the file. */
+    test_check(axl_file_truncate(path, 0) == AXL_OK,
+               "truncate: size 0 returns AXL_OK");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 0,
+               "truncate: size 0 empties the file");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == 0,
+               "truncate: emptied file reads back 0 bytes");
+    axl_free(contents);
+    contents = NULL;
+
+    /* Grow past the current length. The added region reads back as zeros
+       on the EDK2-derived FAT driver (it physically writes the gap out);
+       the docstring documents that as observed-not-guaranteed, and this
+       pins it for the driver we actually run on. */
+    if (axl_file_set_contents(path, "abcd", 4) != AXL_OK) {
+        test_fail("truncate: grow setup write failed");
+        return;
+    }
+    test_check(axl_file_truncate(path, 9) == AXL_OK,
+               "truncate: grow returns AXL_OK");
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 9,
+               "truncate: grow -> info reports 9 bytes");
+    test_check(axl_file_get_contents(path, &contents, &len) == AXL_OK
+               && len == 9 && test_memcmp(contents, "abcd\0\0\0\0\0", 9) == 0,
+               "truncate: grow keeps the prefix; EDK2 FAT zero-fills the gap "
+               "(observed driver behavior, not an API guarantee)");
+    axl_free(contents);
+    contents = NULL;
+
+    /* An AxlFileView caches the length at open, but axl_file_truncate is
+       an AXL write path: a view open on the file follows the resize
+       rather than serving the length it happened to open on. */
+    AxlFileView *view = axl_file_view_open(path, 0, 2);
+    test_check(view != NULL && axl_file_view_size(view) == 9,
+               "truncate: view opened over the 9-byte file reports 9");
+    test_check(axl_file_truncate(path, 2) == AXL_OK,
+               "truncate: shrink under an open view returns AXL_OK");
+    test_check(view != NULL && axl_file_view_size(view) == 2,
+               "truncate: the open view follows the shrink");
+    axl_file_view_close(view);
+    test_check(axl_file_info(path, &e) == AXL_OK && e.size == 2,
+               "truncate: shrink under an open view really shrank the file");
+
+    /* Missing file: refused, and NOT created. */
+    axl_file_delete(gone);
+    test_check(axl_file_truncate(gone, 5) == AXL_ERR,
+               "truncate: missing file -> AXL_ERR");
+    test_check(axl_file_info(gone, &e) == AXL_ERR,
+               "truncate: missing file was not created");
+
+    /* Directory: refused, and left intact. */
+    axl_dir_mkdir(dir);
+    test_check(axl_file_truncate(dir, 0) == AXL_ERR,
+               "truncate: directory -> AXL_ERR");
+    test_check(axl_file_info(dir, &e) == AXL_OK
+               && axl_fs_entry_is_dir(&e),
+               "truncate: refused directory still exists");
+    axl_dir_rmdir(dir);
+
+    /* NULL path is an error, not a crash. */
+    test_check(axl_file_truncate(NULL, 0) == AXL_ERR,
+               "truncate: NULL path -> AXL_ERR");
+
+    /* Not covered here: the read-only-attribute refusal. <axl/axl-fs.h>
+       exposes axl_fs_entry_is_read_only as a READER but no attribute
+       setter, so a test cannot mark a file read-only through the public
+       API — the gap is a limit of the API surface, not an oversight.
+       Same for the read-only-volume and volume-full paths, which need
+       media the QEMU harness does not provide. */
+
+    axl_file_delete(path);
+}
+
+/* Regression: axl_fflush on a FILE stream must reach a real firmware
+   flush and report AXL_OK. file_flush used to call
+   axl_backend_file_write(handle, &zero, NULL) on the premise that a
+   zero-length write flushes — the backend rejects a NULL buffer
+   outright, so EVERY axl_fflush on a file stream returned AXL_ERR and
+   every SDK consumer following the documented drain pattern got a
+   silent failure. */
+static void
+test_fflush(void)
+{
+    const char *path = "fs0:\\axl_fflush.tmp";
+    AxlStream  *s;
+    AxlStream  *peek;
+    char        buf[32];
+    axl_ssize_t n;
+
+    /* NULL stream: documented success. */
+    test_check(axl_fflush(NULL) == AXL_OK,
+               "fflush: NULL stream returns AXL_OK");
+
+    /* A stream with no flush callback (memory buffer) is a no-op
+       success — there is no sink behind it to push to. NULL-guarded
+       rather than early-returned so a setup failure costs one red
+       assertion, not a shifted assertion count on top of it. */
+    s = axl_bufopen();
+    n = (s != NULL) ? axl_write(s, "mem", 3) : -1;
+    test_check(n == 3, "fflush: buffer stream accepted 3 bytes");
+    test_check(s != NULL && axl_fflush(s) == AXL_OK,
+               "fflush: stream with no flush callback returns AXL_OK");
+    axl_fclose(s);
+
+    axl_file_delete(path);
+    s = axl_fopen(path, "w");
+    n = (s != NULL) ? axl_write(s, "durable", 7) : -1;
+    test_check(n == 7, "fflush: write stream accepted 7 bytes");
+    test_check(s != NULL && axl_fflush(s) == AXL_OK,
+               "fflush: write file stream returns AXL_OK");
+
+    /* Observable: an independent handle sees the flushed bytes while
+       the writer is still open. */
+    peek = axl_fopen(path, "r");
+    n = (peek != NULL) ? axl_read(peek, buf, sizeof(buf)) : -1;
+    test_check(n == 7 && test_memcmp(buf, "durable", 7) == 0,
+               "fflush: flushed bytes readable through a second handle");
+    axl_fclose(peek);
+
+    /* Buffered output: fflush drains the buffer through the sink AND
+       flushes the sink, both in one call. */
+    test_check(s != NULL
+               && axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 0) == AXL_OK,
+               "fflush: switch to full buffering returns AXL_OK");
+    n = (s != NULL) ? axl_write(s, "!", 1) : -1;
+    test_check(n == 1, "fflush: buffered write accepted 1 byte");
+    test_check(s != NULL && axl_fflush(s) == AXL_OK,
+               "fflush: buffered file stream returns AXL_OK");
+    peek = axl_fopen(path, "r");
+    n = (peek != NULL) ? axl_read(peek, buf, sizeof(buf)) : -1;
+    test_check(n == 8 && test_memcmp(buf, "durable!", 8) == 0,
+               "fflush: buffered bytes reached the file");
+    axl_fclose(peek);
+    axl_fclose(s);
+
+    /* A read-only file stream holds no dirty state, so flushing it is a
+       no-op success — NOT the firmware's EFI_ACCESS_DENIED, which is
+       what EFI_FILE_PROTOCOL.Flush answers on a read-only handle. */
+    s = axl_fopen(path, "r");
+    test_check(s != NULL && axl_fflush(s) == AXL_OK,
+               "fflush: read-only file stream returns AXL_OK");
+    axl_fclose(s);
+
+    axl_file_delete(path);
+}
+
+/* Regression: the whole-file write paths must not report success for bytes
+   that never reached the volume.
+ *
+ * axl_file_set_contents wrote, resized, and CLOSED -- and
+ * axl_backend_file_close returns AXL_OK unconditionally, because
+ * EFI_FILE_PROTOCOL.Close is specified to return only EFI_SUCCESS. There
+ * was no flush call anywhere in it, so a full volume / write-protected
+ * media / device error surfacing at flush time came back AXL_OK.
+ *
+ * axl_file_write_atomic then PROMOTED the temp file over the real one on
+ * that false success: the caller's original file was replaced by one whose
+ * contents may not be on the media. That is the data-loss case, and it is
+ * why the fixture's oracle reads the backing store directly.
+ *
+ * axl_file_move's copy fallback was the same shape one step worse -- it
+ * DELETED the source after an unchecked close, so a flush-only failure lost
+ * the file outright rather than merely misreporting it. */
+static void
+test_write_paths_report_a_failed_flush(void)
+{
+    if (!ff_fs_up()) {
+        /* No shell to map the published volume through, so it cannot be
+           reached by path at all. One balancer per assertion below. */
+        axl_printf("SKIP: flush-fail write paths (no shell map for the "
+                   "published volume)\n");
+        test_check(true, "flush-fail: set_contents SKIP balance");
+        test_check(true, "flush-fail: write_atomic status SKIP balance");
+        test_check(true, "flush-fail: write_atomic target SKIP balance");
+        test_check(true, "flush-fail: write_atomic temp SKIP balance");
+        test_check(true, "flush-fail: move status SKIP balance");
+        test_check(true, "flush-fail: move source SKIP balance");
+        test_check(true, "flush-fail: atomic recovery status SKIP balance");
+        test_check(true, "flush-fail: atomic recovery temp SKIP balance");
+        test_check(true, "flush-fail: truncate SKIP balance");
+        return;
+    }
+
+    test_check(ff_seed("sc", "old", 3)
+               && axl_file_set_contents(FF_PATH("sc"), "new", 3) == AXL_ERR,
+               "flush-fail: set_contents whose flush fails returns AXL_ERR");
+
+    test_check(ff_seed("wa", "keepme", 6)
+               && axl_file_write_atomic(FF_PATH("wa"), "clobber", 7) == AXL_ERR,
+               "flush-fail: write_atomic whose flush fails returns AXL_ERR");
+    test_check(ff_content_is("wa", "keepme", 6),
+               "flush-fail: write_atomic did not promote the temp over the target");
+    test_check(!ff_exists("wa.tmp"),
+               "flush-fail: write_atomic removed its temp file");
+
+    /* axl_file_truncate re-reads the length through the SAME open handle to
+       prove the driver took it -- which proves acceptance, not durability.
+       Its docstring promises AXL_OK means verified, so the flush counts too:
+       a metadata change that never reached the media is the same lie the
+       whole-file writers were telling. */
+    test_check(ff_seed("tr", "0123456789", 10)
+               && axl_file_truncate(FF_PATH("tr"), 4) == AXL_ERR,
+               "flush-fail: truncate whose flush fails returns AXL_ERR");
+
+    /* FF_NORENAME_PREFIX makes the fixture refuse the rename, which is what
+       puts axl_file_move on its stream-copy fallback -- the path that used
+       to delete the source after an unchecked close. */
+    test_check(ff_seed("mv", "payload", 7)
+               && axl_file_move(FF_PATH("mv"),
+                                FF_PATH(FF_NORENAME_PREFIX "dst")) == AXL_ERR,
+               "flush-fail: move's copy fallback returns AXL_ERR");
+    test_check(ff_content_is("mv", "payload", 7),
+               "flush-fail: move's copy fallback kept the source it could not copy");
+
+    /* Recovery policy at the PROMOTE step, which needs the opposite fixture:
+       the temp write must LAND so the rename is reached, and the rename must
+       be the thing that fails (FF_NORENAME_PREFIX). write_atomic then finds
+       the target already deleted by its own delete-then-rename fallback, and
+       the temp is the only complete copy in existence -- deleting it, which
+       is what "clean up on failure" used to do unconditionally, destroys the
+       caller's data outright. axl_piece_tree_save keeps its temp in exactly
+       this situation; the two promote sites now agree. */
+    ff_set_flush_ok(true);
+    test_check(ff_seed(FF_NORENAME_PREFIX "doc", "orig", 4)
+               && axl_file_write_atomic(FF_PATH(FF_NORENAME_PREFIX "doc"),
+                                        "replacement", 11) == AXL_ERR,
+               "flush-fail: write_atomic whose promote fails returns AXL_ERR");
+    test_check(ff_content_is(FF_NORENAME_PREFIX "doc.tmp", "replacement", 11),
+               "flush-fail: a promote that destroyed the target keeps the temp "
+               "holding the only complete copy");
+
+    ff_fs_down();
+}
+
 static void
 test_detect_encoding(void)
 {
@@ -2172,6 +2467,9 @@ test_io_main(int argc, char **argv)
     test_file();
     test_file_writer();
     test_file_write_atomic();
+    test_file_truncate();
+    test_fflush();
+    test_write_paths_report_a_failed_flush();
     test_detect_encoding();
     test_printf();
     test_stdin();

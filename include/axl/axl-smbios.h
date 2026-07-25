@@ -592,15 +592,15 @@ int axl_smbios_get_system_uuid(uint8_t out[16]);
 /**
  * @brief Get a string from an SMBIOS table's string area (UCS-2).
  *
- * Returns a pointer to a static 128-char unsigned short buffer — caller
+ * Returns a pointer to a static 128-char uint16_t buffer — caller
  * must use the value before the next call (not reentrant).
  *
- * @return pointer to static unsigned short buffer.
+ * @return pointer to static uint16_t buffer.
  */
-unsigned short *
+uint16_t *
 axl_smbios_get_string(
     AxlSmbiosHeader  *hdr,           ///< SMBIOS table header
-    unsigned char     string_index   ///< 1-based string index (0 returns empty string)
+    uint8_t     string_index   ///< 1-based string index (0 returns empty string)
 );
 
 /**
@@ -615,7 +615,7 @@ axl_smbios_get_string(
 const char *
 axl_smbios_get_string_utf8(
     AxlSmbiosHeader  *hdr,           ///< SMBIOS table header
-    unsigned char     string_index   ///< 1-based string index (0 returns "")
+    uint8_t     string_index   ///< 1-based string index (0 returns "")
 );
 
 /**
@@ -691,7 +691,7 @@ axl_smbios_entry_point(
  */
 AxlSmbiosHeader *
 axl_smbios_find(
-    unsigned char type  ///< SMBIOS table type (e.g. 0 for BIOS, 1 for System)
+    uint8_t type  ///< SMBIOS table type (e.g. 0 for BIOS, 1 for System)
 );
 
 /**
@@ -711,7 +711,7 @@ axl_smbios_find(
  */
 AxlSmbiosHeader *
 axl_smbios_find_next(
-    unsigned char     type,  ///< SMBIOS table type
+    uint8_t     type,  ///< SMBIOS table type
     AxlSmbiosHeader  *prev   ///< previous result (NULL to start from beginning)
 );
 
@@ -866,8 +866,8 @@ axl_smbios_chassis_class(
  */
 int
 axl_smbios_version(
-    unsigned char *major,  ///< written with major version (e.g. 3)
-    unsigned char *minor   ///< written with minor version (e.g. 1)
+    uint8_t *major,  ///< written with major version (e.g. 3)
+    uint8_t *minor   ///< written with minor version (e.g. 1)
 );
 
 #ifdef __cplusplus

@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <axl/axl-macros.h>        /* AXL_DEFINE_AUTOPTR_CLEANUP */
 #include <axl/axl-console-ops.h>
 #include <axl/axl-font.h>
 #include <axl/axl-gfx.h>
@@ -79,6 +80,10 @@ void
 axl_console_term_free(
     AxlConsoleTerm *t   ///< instance (NULL-safe)
 );
+
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlConsoleTerm, axl_console_term_free)
+#endif
 
 /**
  * @brief The @ref AxlConsoleOps sink to hand to a producer (e.g.

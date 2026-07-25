@@ -8,6 +8,15 @@ UEFI RSOD (Red Screen of Death) Decoder
 Parses UEFI exception handler output from EDK2 firmware and resolves
 crash addresses to source file/line/function using debug symbols.
 
+This is the SDK's zero-dependency lightweight decoder — pure stdlib Python
+that shells out to the system `gdb` / binutils, so it packages cleanly into
+the axl-sdk host-tools bundle with no pip install. For the full-featured tool
+(pyelftools/capstone symbolization, PE+PDB minidump analysis for MSVC crashes,
+LLDB integration, callsite-arg / tail-call reconstruction, and a web UI), use
+the standalone project: https://github.com/aximcode/rsod-decode — grab the
+self-contained `rsod.pyzw` from its Releases. The two are separate tools with
+different dependency footprints, not two copies of one thing.
+
 OVERVIEW
 --------
 When a UEFI application crashes, EDK2 firmware prints an exception dump
@@ -285,7 +294,17 @@ class RsodData:
         default_factory=lambda: list[tuple[int, str, int, int]]())
     registers: dict[str, int] = field(default_factory=lambda: dict[str, int]())
     stack_qwords: list[int] = field(default_factory=lambda: list[int]())
+    # (stack_address, value) pairs — the ADDRESSED stack dump, needed to walk a
+    # frame-pointer chain (following a saved-FP link means reading the value AT
+    # the address the FP points to). stack_qwords is values-only; this keeps the
+    # addresses so recover_backtrace_via_fp can reconstruct an ordered trace
+    # when the firmware printed no sNN frames.
+    stack_pairs: list[tuple[int, int]] = field(
+        default_factory=lambda: list[tuple[int, int]]())
     module_bases: dict[str, int] = field(default_factory=lambda: dict[str, int]())
+    # True when the backtrace was reconstructed by walking the FP chain (no
+    # firmware sNN frames) — the order is heuristic, so the report flags it.
+    recovered_via_fp: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -750,6 +769,124 @@ def register_image(spec: str, tc: Toolchain, quiet: bool = False) -> Image:
                  map_file=map_file, efi_path=file_path, pe_base=pe_base)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Frame-pointer chain unwinding
+#
+# When the firmware prints no ordered `sNN` frame list (common on Dell x64
+# RSODs — "Stack trace not available", only a raw stack dump), reconstruct an
+# ordered backtrace by walking the frame-pointer chain through the dumped
+# stack memory. Both AArch64 (x29) and x86-64 (rbp) use the same frame layout:
+# [FP] = caller's saved FP, [FP+8] = caller's return address. Ported from the
+# standalone rsod-decode's decoders/unwinding.py (the heavier DWARF/LLDB
+# unwinders there need pip deps and stay out of this zero-dep variant).
+# ═══════════════════════════════════════════════════════════════
+
+def _first_present(regs: dict, names: Tuple[str, ...]) -> Optional[int]:
+    """First register in @names that is present in @regs (value may be 0), else
+    None. Lets a fault at address 0 be distinguished from a missing register."""
+    for n in names:
+        if n in regs:
+            return regs[n]
+    return None
+
+
+# A stack window is at most a few MB; cap the reconstructed buffer so a stray
+# low-address match in the noisy serial log (the dump regexes are loose) can't
+# balloon it into hundreds of MB of zero-fill.
+_MAX_STACK_SPAN = 4 * 1024 * 1024
+
+
+def _build_stack_mem(pairs: List[Tuple[int, int]]) -> Tuple[int, bytes]:
+    """Assemble (address, value) stack pairs into one contiguous little-endian
+    buffer. Returns (base_address, bytes); gaps are zero-filled so a FP that
+    lands in an unsampled hole simply reads 0 and stops the walk. If the pairs
+    span more than _MAX_STACK_SPAN (stray outlier addresses), keep only the top
+    window — the FP frames live near the top of a stack dump."""
+    if not pairs:
+        return 0, b""
+    ordered = sorted(pairs)
+    hi = ordered[-1][0]
+    if hi - ordered[0][0] + 8 > _MAX_STACK_SPAN:
+        lo_cut = hi - _MAX_STACK_SPAN + 8
+        ordered = [p for p in ordered if p[0] >= lo_cut]
+    base = ordered[0][0]
+    end = ordered[-1][0] + 8
+    buf = bytearray(end - base)
+    for addr, val in ordered:
+        off = addr - base
+        if 0 <= off <= len(buf) - 8:
+            struct.pack_into("<Q", buf, off, val & 0xFFFFFFFFFFFFFFFF)
+    return base, bytes(buf)
+
+
+def _walk_fp_chain(
+    fp: int, first_ret: int, mem: bytes, base: int,
+    monotonic: bool, max_frames: int = 48,
+) -> List[int]:
+    """Follow a saved-FP linked list through @mem, returning ordered return
+    addresses (outermost-appended). @first_ret (LR / crash return) seeds frame
+    0 when non-zero. @monotonic requires each saved FP to increase (x86-64
+    stacks grow down, so a non-increasing rbp means a corrupt/looping chain)."""
+    end = base + len(mem)
+    out: List[int] = []
+    if first_ret:
+        out.append(first_ret)
+    cur = fp
+    for _ in range(max_frames):
+        if cur == 0 or cur < base or cur + 16 > end:
+            break
+        off = cur - base
+        saved_fp = struct.unpack_from("<Q", mem, off)[0]
+        saved_ret = struct.unpack_from("<Q", mem, off + 8)[0]
+        if saved_ret == 0:
+            break
+        out.append(saved_ret)
+        if monotonic and saved_fp <= cur:
+            break
+        cur = saved_fp
+    return out
+
+
+def recover_backtrace_via_fp(rsod: "RsodData") -> List[int]:
+    """Ordered return-address PCs reconstructed from the frame-pointer chain,
+    or [] when there is nothing to walk. Used only as a fallback when the RSOD
+    carried no `sNN` frame list. Frame 0 is the faulting PC (ELR / RIP)."""
+    base, mem = _build_stack_mem(rsod.stack_pairs)
+    if not mem:
+        return []
+    regs = rsod.registers
+    # The fault PC uses _first_present so a legitimate fault AT address 0 (a
+    # NULL call/jump — a real crash site) is kept, not mistaken for "absent".
+    if rsod.arch == "AARCH64":
+        fp = regs.get("FP") or regs.get("X29") or 0
+        lr = regs.get("LR") or 0
+        fault = _first_present(regs, ("ELR",))
+        monotonic = False           # AArch64 stack direction is ABI-defined but
+                                    # we don't assume it; the bounds check guards.
+    else:
+        # Dell x64 RSODs abbreviate the register names (BP/IP, no R prefix);
+        # accept both spellings.
+        fp = regs.get("RBP") or regs.get("BP") or 0
+        lr = 0                       # x86-64 has no link register; the first
+                                    # return comes from walking rbp.
+        fault = _first_present(regs, ("RIP", "IP"))
+        monotonic = True
+    if fp == 0:
+        return []
+    walked = _walk_fp_chain(fp, lr, mem, base, monotonic)
+    # Frame 0 is the crash site (ELR/RIP). Drop ONLY the first walked frame if
+    # it coincides with the fault PC (LR often equals it) — not all consecutive
+    # duplicates, so genuine tight recursion survives.
+    pcs: List[int] = []
+    if fault is not None:
+        pcs.append(fault)
+    for i, pc in enumerate(walked):
+        if i == 0 and pcs and pc == pcs[0]:
+            continue
+        pcs.append(pc)
+    return pcs
+
+
 def resolve_addr_to_image(addr: int, images: List[Image]) -> int:
     """Return index of image containing addr, or -1."""
     for i, img in enumerate(images):
@@ -1062,6 +1199,21 @@ _AARCH64_EC: Dict[int, str] = {
     0x3C: "BRK in AArch64",
 }
 
+# AARCH64 ESR ISS Data/Instruction Fault Status Code (ISS[5:0]) → meaning.
+# For a data/instruction abort this says *why* the access faulted (an
+# unmapped page is a translation fault; a write to read-only is a permission
+# fault; etc.) — far more actionable than "Data abort" alone.
+_AARCH64_DFSC: Dict[int, str] = {
+    0x00: "Address size fault, level 0", 0x01: "Address size fault, level 1",
+    0x02: "Address size fault, level 2", 0x03: "Address size fault, level 3",
+    0x04: "Translation fault, level 0",  0x05: "Translation fault, level 1",
+    0x06: "Translation fault, level 2",  0x07: "Translation fault, level 3",
+    0x09: "Access flag fault, level 1",  0x0A: "Access flag fault, level 2",
+    0x0B: "Access flag fault, level 3",  0x0D: "Permission fault, level 1",
+    0x0E: "Permission fault, level 2",   0x0F: "Permission fault, level 3",
+    0x10: "Synchronous external abort",  0x21: "Alignment fault",
+}
+
 
 def _diagnose_fault_addr(addr_str: str) -> str:
     """Interpret a fault address (CR2 or FAR) into a human description."""
@@ -1134,8 +1286,14 @@ def _diagnose_aarch64(data: RsodData) -> str:
             if desc:
                 parts.append(desc)
 
-            # Data/instruction abort — check FAR
+            # Data/instruction abort — decode the fault status code (why it
+            # faulted) from ISS[5:0], then interpret FAR.
             if ec in (0x24, 0x25, 0x20, 0x21):
+                mi = re.search(r"ISS 0x([0-9a-fA-F]+)", data.esr_decode)
+                if mi:
+                    dfsc = _AARCH64_DFSC.get(int(mi.group(1), 16) & 0x3F)
+                    if dfsc:
+                        parts.append(dfsc)
                 addr_diag = _diagnose_fault_addr(data.fault_addr)
                 if addr_diag:
                     parts.append(addr_diag)
@@ -1160,12 +1318,19 @@ def parse_rsod(text: str) -> RsodData:
     if re.search(r"^R[A-Z][A-Z0-9]*\s+-\s+[0-9a-fA-F]{8,16}", text, re.M):
         data.arch = "X64"
         _parse_x64(text, data)
-    # Format 2: Dell/vendor — "REG=HEXVALUE" registers or "sNN ADDR Module.efi +OFFSET" stack
-    elif re.search(r"^s\d+\s+[0-9a-fA-F]+\s+\S+\.efi\s+\+", text, re.M) \
-            or re.search(r"[A-Z]\d+=\s*[0-9a-fA-F]{12,}", text) \
-            or re.search(r"-->RIP\s", text) or re.search(r"LBRfr0\s", text):
-        # Detect X64 vs AARCH64 from register names
-        if re.search(r"\bR?[ABCD]X=|\bR?IP=|\bR?SI=|\bR?DI=|\bR?SP=|\bR?BP=|-->RIP\s|LBRfr0\s", text):
+    # Format 2: Dell/vendor — "REG=HEXVALUE" registers or "sNN ADDR Module.efi
+    # +OFFSET" stack. The sNN frames and the "--> PC/RIP" marker may be indented,
+    # and register values may carry a 0x prefix (e.g. "ELR=0x00000078...").
+    elif re.search(r"^\s*s\d+\s+[0-9a-fA-F]+\s+\S+\.efi\s+\+", text, re.M) \
+            or re.search(r"^\s*-->\s*(?:RIP|PC)\b", text, re.M) \
+            or re.search(r"\b[A-Z]{1,4}\d*=\s*(?:0x)?[0-9a-fA-F]{8,}", text) \
+            or re.search(r"LBRfr0\s", text):
+        # Detect X64 vs AARCH64 from register names. Check AArch64-distinctive
+        # names FIRST (X0-X30 / ELR / ESR / FAR / SPSR) — SP= and BP= are shared
+        # with x64 and must not decide the arch on their own.
+        if re.search(r"\b(?:X\d+|ELR|ESR|FAR|SPSR)=|Synchronous exception", text):
+            data.arch = "AARCH64"
+        elif re.search(r"\bR?[ABCD]X=|\bR?IP=|\bR?SI=|\bR?DI=|-->RIP\s|LBRfr0\s", text):
             data.arch = "X64"
         else:
             data.arch = "AARCH64"
@@ -1205,10 +1370,13 @@ def _parse_x64(text: str, data: RsodData):
         data.registers[m.group(1)] = int(m.group(2), 16)
 
     # Stack dump: lines of hex qwords
-    for m in re.finditer(r"^\s*>?\s*[0-9a-fA-F]+:\s+((?:[0-9a-fA-F]{16}\s*)+)", text, re.M):
-        for qw in m.group(1).split():
+    for m in re.finditer(r"^\s*>?\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{16}\s*)+)", text, re.M):
+        row_addr = int(m.group(1), 16)
+        for i, qw in enumerate(m.group(2).split()):
             if len(qw) >= 8:
-                data.stack_qwords.append(int(qw, 16))
+                val = int(qw, 16)
+                data.stack_qwords.append(val)
+                data.stack_pairs.append((row_addr + i * 8, val))
 
     data.cause = _diagnose_x64(data)
 
@@ -1255,10 +1423,13 @@ def _parse_aarch64(text: str, data: RsodData):
         data.registers[m.group(1)] = int(m.group(2), 16)
 
     # Stack dump
-    for m in re.finditer(r"^\s*>?\s*[0-9a-fA-F]+:\s+((?:[0-9a-fA-F]{16}\s*)+)", text, re.M):
-        for qw in m.group(1).split():
+    for m in re.finditer(r"^\s*>?\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{16}\s*)+)", text, re.M):
+        row_addr = int(m.group(1), 16)
+        for i, qw in enumerate(m.group(2).split()):
             if len(qw) >= 8:
-                data.stack_qwords.append(int(qw, 16))
+                val = int(qw, 16)
+                data.stack_qwords.append(val)
+                data.stack_pairs.append((row_addr + i * 8, val))
 
     data.cause = _diagnose_aarch64(data)
 
@@ -1298,8 +1469,9 @@ def _parse_dell_bios(text: str, data: RsodData):
     if m and m.group(1).strip() and not data.abort_desc:
         data.abort_desc = m.group(1).strip()
 
-    # Registers: any "NAME=HEXVALUE" pair (generic — handles unknown fields)
-    for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]*)=([0-9a-fA-F]{2,16})(?:\s|$|,)", text):
+    # Registers: any "NAME=HEXVALUE" pair (generic — handles unknown fields).
+    # The value may carry a 0x prefix (e.g. "ELR=0x00000078262A3B3C").
+    for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]*)=(?:0x)?([0-9a-fA-F]{2,16})(?:\s|$|,)", text):
         reg = m.group(1)
         try:
             val = int(m.group(2), 16)
@@ -1334,8 +1506,9 @@ def _parse_dell_bios(text: str, data: RsodData):
         if fault_pc_val != 0:
             data.stack_pcs.append(fault_pc_val)
 
-    # Stack trace: "sNN ADDR ModuleName +OFFSET" (any extension or none)
-    for m in re.finditer(r"^s(\d+)\s+([0-9a-fA-F]+)\s+(\S+)\s+\+([0-9a-fA-F]+)", text, re.M):
+    # Stack trace: "sNN ADDR ModuleName +OFFSET" (any extension or none). The
+    # frames may be indented (leading whitespace) in some serial captures.
+    for m in re.finditer(r"^\s*s(\d+)\s+([0-9a-fA-F]+)\s+(\S+)\s+\+([0-9a-fA-F]+)", text, re.M):
         pc = int(m.group(2), 16)
         mod_name = re.sub(r"\.(efi|dll|debug)$", "", m.group(3))
         offset = int(m.group(4), 16)
@@ -1350,9 +1523,11 @@ def _parse_dell_bios(text: str, data: RsodData):
     # Dell X64 format often has no sNN frames, only a raw dump
     for m in re.finditer(
             r"^\s*([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{16})\s", text, re.M):
+        row_addr = int(m.group(1), 16)
         qw = int(m.group(2), 16)
         if qw != 0:
             data.stack_qwords.append(qw)
+            data.stack_pairs.append((row_addr, qw))
 
     if not data.stack_pcs and data.fault_pc:
         data.stack_pcs.append(int(data.fault_pc, 16))
@@ -1588,7 +1763,10 @@ def emit_human(
     print()
 
     if frames:
-        print(bold("Stack trace:") + "\n")
+        _hdr = "Stack trace:"
+        if rsod.recovered_via_fp:
+            _hdr += "  (recovered via frame-pointer chain — order is heuristic)"
+        print(bold(_hdr) + "\n")
         for sf in frames:
             _emit_frame(sf, images, len(images) > 1)
             if detail and sf.frame == 0 and sf.image_idx >= 0:
@@ -1794,6 +1972,7 @@ def emit_json(
         ],
         "stack_trace": [_frame_dict(sf) for sf in frames],
         "registers": {k: f"0x{v:x}" for k, v in rsod.registers.items()},
+        "backtrace_recovered_via_fp": rsod.recovered_via_fp,
         "register_annotations": [_annot_dict(ra) for ra in reg_annots],
         "stack_scan": [_annot_dict(ra) for ra in stack_scan],
     }
@@ -1895,6 +2074,9 @@ def emit_markdown(
     # Stack trace table — deduplicate consecutive identical frames
     if frames:
         print("## Stack Trace\n")
+        if rsod.recovered_via_fp:
+            print("*Recovered by walking the frame-pointer chain (no firmware "
+                  "`sNN` frames) — frame order is heuristic.*\n")
         header = "| Frame | Function | Location | Offset | Address |"
         sep = "|-------|----------|----------|--------|---------|"
         if multi:
@@ -2174,6 +2356,10 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
     parser.add_argument("--ocr", metavar="IMAGE", help="OCR an RSOD photo (requires tesseract)")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--dump", action="store_true", help="Dump all symbols")
+    parser.add_argument("--fp-unwind", action="store_true", dest="fp_unwind",
+                        help="Force a frame-pointer-chain backtrace even when "
+                             "the firmware printed sNN frames (to compare or "
+                             "override them)")
 
     args = parser.parse_args()
 
@@ -2233,12 +2419,36 @@ For full documentation, run: python3 rsod-decode.py; pydoc3 rsod-decode
         emit_dump(images, tc)
         return
 
-    # Collect addresses
+    # Collect addresses.
+    # A REAL firmware frame list populates stack_frame_info; when there are no
+    # sNN frames the parsers still SEED stack_pcs with just the fault PC, so
+    # "stack_pcs is non-empty" is NOT the same as "has a backtrace". Gate the
+    # FP-chain recovery on the absence of a real frame list.
+    have_real_frames = bool(rsod.stack_frame_info) or len(rsod.stack_pcs) > 1
     addrs = []
+    recovered_via_fp = False
     if args.addr:
         addrs = [int(a, 16) for a in args.addr]
-    elif rsod.stack_pcs:
+    elif args.fp_unwind:
+        # Explicit override: reconstruct from the FP chain, ignoring any sNN
+        # frames the firmware printed. Fall back to the seed if nothing walks.
+        addrs = recover_backtrace_via_fp(rsod)
+        recovered_via_fp = bool(addrs)
+        if not addrs:
+            addrs = rsod.stack_pcs
+    elif have_real_frames:
         addrs = rsod.stack_pcs
+    else:
+        # No real frame list (at most the seeded fault PC) — reconstruct an
+        # ordered backtrace by walking the frame-pointer chain through the raw
+        # stack dump; keep the seed if the walk yields nothing.
+        fp_pcs = recover_backtrace_via_fp(rsod)
+        if fp_pcs:
+            addrs = fp_pcs
+            recovered_via_fp = True
+        else:
+            addrs = rsod.stack_pcs
+    rsod.recovered_via_fp = recovered_via_fp
 
     if not addrs and not rsod_text:
         print("Error: no addresses to decode", file=sys.stderr)

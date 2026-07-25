@@ -38,7 +38,7 @@ axl_pk_verify(AxlPkAlg alg,
     return AXL_ERR;
 }
 
-AxlPkKey *axl_pk_keygen(AxlPkAlg alg)
+AxlPkKey *axl_pk_key_new(AxlPkAlg alg)
 { (void)alg; return NULL; }
 AxlPkKey *axl_pk_key_load_private(const uint8_t *der, size_t len)
 { (void)der; (void)len; return NULL; }
@@ -356,7 +356,7 @@ key_alloc(void)
 }
 
 AxlPkKey *
-axl_pk_keygen(AxlPkAlg alg)
+axl_pk_key_new(AxlPkAlg alg)
 {
     mbedtls_ctr_drbg_context *rng = axl_crypto_rng();
     if (rng == NULL) {

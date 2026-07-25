@@ -26,8 +26,19 @@ the frame stays black. One assertion:
   painting. (That the frame was black DURING take-over is proven by the take-over
   scenario, which shares the identical install path.)
 
+PASSTHROUGH (--passthrough). The inverse of TAKE-OVER: the driver installs with
+passthrough_local=true, which skips the eviction, so GraphicsConsole should keep
+painting alongside us. It writes lines wider than our 80-col grid straight to
+gST->ConOut, so ink past x >= 660 can only be the firmware console's.
+  COPAINT: x >= CLEAN_X has content -> the local display survived our install.
+  LIVE:    the grid has content    -> we are receiving the ops too (without this,
+           a driver that never installed would pass COPAINT trivially).
+
+(--wide, --input and the --fbcon* modes are documented at their check functions.)
+
 Exit 0 on PASS, 1 on FAIL, 2 on usage error.
-Usage: analyze-console-device-shot.py [--restored] <png>
+Usage: analyze-console-device-shot.py [--restored|--wide|--input|--passthrough|
+       --fbcon|--fbcon-edit|--fbcon-ctrlc] <png>
 """
 
 from __future__ import annotations
@@ -135,6 +146,55 @@ def check_restored(img: Image.Image) -> int:
         return 0
     print("FAIL: the frame is (nearly) black after uninstall -- the firmware "
           "console was NOT restored, so its output goes nowhere")
+    return 1
+
+
+def check_passthrough(img: Image.Image) -> int:
+    """PASSTHROUGH mode: the exact inverse of check_takeover's clean assertion.
+
+    The passthrough driver installs with passthrough_local=true, which skips the
+    eviction step, so ConSplitter should fan console output to BOTH our 80x25 grid
+    and the firmware GraphicsConsole. It then drives gST->ConOut directly with lines
+    wider than 80 columns. Our grid clamps at x<640, so ink beyond CLEAN_X can only
+    have been painted by the firmware console -- which is precisely the evidence
+    check_takeover demands be ABSENT. Two assertions:
+      1. COPAINT: x >= CLEAN_X has real content -> GraphicsConsole is still in the
+         fan-out, i.e. the local display survived our install.
+      2. LIVE:    the grid region has content -> we are ALSO receiving the ops, so
+         this is a genuine co-paint and not simply a failed/absent install.
+    Assertion 2 is what makes assertion 1 meaningful: a driver that never installed
+    would leave the firmware console painting happily and pass assertion 1 alone."""
+    w, h = img.size
+    px = img.load()
+
+    if w <= CLEAN_X:
+        print(f"FAIL: framebuffer {w}x{h} too narrow for the x>{CLEAN_X} test")
+        return 1
+
+    copaint = count_nonblack(px, CLEAN_X, 0, w, h, stop_at=LIVE_MIN_PIXELS)
+    copaint_ok = copaint >= LIVE_MIN_PIXELS
+
+    live = count_nonblack(px, 0, 0, min(GRID_W, w), min(GRID_H, h),
+                          stop_at=LIVE_MIN_PIXELS)
+    live_ok = live >= LIVE_MIN_PIXELS
+
+    print(f"  framebuffer      : {w}x{h}")
+    print(f"  co-paint x>={CLEAN_X}  : {'>=' if copaint_ok else '<'} {LIVE_MIN_PIXELS} "
+          f"non-black px (need >= {LIVE_MIN_PIXELS})")
+    print(f"  grid content     : {'>=' if live_ok else '<'} {LIVE_MIN_PIXELS} "
+          f"non-black px (need >= {LIVE_MIN_PIXELS})")
+
+    if copaint_ok and live_ok:
+        print("PASS: passthrough co-paints -- the firmware console still paints the "
+              "local display AND our device still receives the ops")
+        return 0
+    if not copaint_ok:
+        print(f"FAIL: x>={CLEAN_X} is black -- the firmware console is NOT painting, "
+              "so passthrough_local did not keep it in the fan-out (the local "
+              "display would be dead)")
+    if not live_ok:
+        print("FAIL: the grid is (nearly) empty -- our device received no ops, so "
+              "any firmware painting proves nothing about passthrough")
     return 1
 
 
@@ -352,14 +412,14 @@ def check_fbcon_ctrlc(img: Image.Image) -> int:
 def main() -> int:
     args = sys.argv[1:]
     mode = "takeover"
-    if args and args[0] in ("--restored", "--wide", "--input", "--fbcon", "--fbcon-edit",
-                            "--fbcon-ctrlc"):
+    if args and args[0] in ("--restored", "--wide", "--input", "--passthrough",
+                            "--fbcon", "--fbcon-edit", "--fbcon-ctrlc"):
         mode = args[0][2:]
         args = args[1:]
     if len(args) != 1:
         print("usage: analyze-console-device-shot.py "
-              "[--restored|--wide|--input|--fbcon|--fbcon-edit|--fbcon-ctrlc] <png>",
-              file=sys.stderr)
+              "[--restored|--wide|--input|--passthrough|--fbcon|--fbcon-edit|"
+              "--fbcon-ctrlc] <png>", file=sys.stderr)
         return 2
 
     path = Path(args[0])
@@ -374,6 +434,8 @@ def main() -> int:
         return check_wide(img)
     if mode == "input":
         return check_input(img)
+    if mode == "passthrough":
+        return check_passthrough(img)
     if mode == "fbcon":
         return check_fbcon(img)
     if mode == "fbcon-edit":

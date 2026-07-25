@@ -86,12 +86,18 @@ extern "C" {
  *
  * Field semantics:
  *   - `nic_index` — `AXL_NET_NIC_AUTO` (the default) means
- *     auto-detect the first usable NIC; any other value is a 0-based
- *     index into the SNP handle list as returned by
- *     `axl_net_list_interfaces`. Used at bring-up time to pick which
- *     NIC to run DHCP against. Post-bring-up, prefer `local_ip`
- *     for routing — you can name the interface you want by its
- *     station IP without knowing its handle index.
+ *     auto-detect the first usable NIC; any other value is a
+ *     per-physical-NIC ordinal — the same index space as
+ *     `axl_net_list_interfaces` (one row per physical NIC) and every
+ *     other net API taking a NIC index. It is NOT a raw SimpleNetwork
+ *     handle index: a NIC commonly publishes 2-3 SNP child handles,
+ *     which are deduped by MAC into a single ordinal. Used at
+ *     bring-up time to pick which NIC to run DHCP against. The
+ *     ordinal is stable within a boot's topology, but a NIC appearing
+ *     (a driver loading and connecting) renumbers later ordinals — a
+ *     MAC never moves. Post-bring-up, prefer `local_ip` for routing —
+ *     you can name the interface you want by its station IP without
+ *     knowing its ordinal at all.
  *   - `local_ip` — IPv4 to bind the local end of the socket to.
  *     Empty string means "let the kernel pick" (`0.0.0.0`). For
  *     clients this is the outbound source IP (curl `--interface`);
@@ -258,8 +264,10 @@ axl_net_init_from_opts(
  * `axl_net_get_ip_address` if you need the resolved IP. NULL/"" fields are
  * skipped; `dns` empty skips the resolver set entirely (no `dns2` without a
  * `dns`). Malformed dotted-quads in a `"static"` bag fail the call (AXL_ERR)
- * rather than silently configuring a wrong address. @p nic_index accepts
- * `AXL_NET_NIC_AUTO` (mapped to the first usable NIC).
+ * rather than silently configuring a wrong address. @p nic_index also
+ * accepts `AXL_NET_NIC_AUTO` (see `axl_net_get_dhcp_lease` in
+ * `<axl/axl-net.h>` for the auto-selection ladder); an out-of-range
+ * explicit index is an error, never a clamp to NIC 0.
  *
  * @return AXL_OK on success; AXL_ERR on NULL @p cfg, an unrecognized
  *     `mode`, a parse error, or a driver-load / link / DHCP / IP4Config2

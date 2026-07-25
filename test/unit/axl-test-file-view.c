@@ -11,6 +11,8 @@
 #include <axl/axl-file-view.h>
 #include <axl/axl-page-cache.h>
 #include <axl/axl-fs.h>
+#include <axl/axl-str.h>
+#include <axl/axl-stream.h>
 #include <stdint.h>
 
 #define TEST_PATH   "fs0:\\axl_fileview_spike.tmp"
@@ -257,6 +259,181 @@ test_file_view_shared_cache(void)
     axl_file_delete(TEST_PATH2);
 }
 
+/* --- the two halves of the close-to-open consistency model ---
+ *
+ * GUARANTEED half: a freshly opened view sees current contents. One
+ * assertion below ("a view opened AFTER the write sees it") is the whole
+ * of it -- a view stats the file itself, so this cannot be defeated and
+ * needs no mechanism. It is asserted anyway so a regression is caught.
+ *
+ * BEST-EFFORT half, which is the rest of this function: a view that opened
+ * FIRST and is then asked to read after an unrelated writer moved the file
+ * underneath it. Not a guarantee to consumers (a foreign-image or non-AXL
+ * writer is invisible), but every AXL write path in this image is supposed
+ * to feed it, so this drives the file through each in turn -- whole-file,
+ * truncate, raw stream pwrite, the streaming writer, the atomic replace --
+ * and re-reads through the SAME view each time. A write path that forgets
+ * to record what it did shows up here as one failing assertion naming
+ * itself.
+ */
+
+#define COH_PATH   "fs0:\\axl_fv_coh.tmp"
+#define COH_OTHER  "fs0:\\axl_fv_other.tmp"
+
+/* Read the whole file through @v and compare it to @want EXACTLY (both
+ * the byte count and the bytes). Deliberately not a substring or prefix
+ * test: a stale view serving the old file's longer tail, or its shorter
+ * head, both have to fail. */
+static bool
+coh_is(AxlFileView *v, const char *want)
+{
+    char   buf[64];
+    size_t want_len = axl_strlen(want);
+    size_t got      = axl_file_view_read(v, 0, buf, sizeof(buf) - 1);
+
+    if (got != want_len || axl_file_view_size(v) != want_len) {
+        return false;
+    }
+    buf[got] = '\0';
+    return axl_strcmp(buf, want) == 0;
+}
+
+static void
+test_file_view_coherence(void)
+{
+    if (axl_file_set_contents(COH_PATH, "AAAA", 4) != AXL_OK) {
+        axl_printf("SKIP: file_view coherence (fs0: not writable)\n");
+        return;
+    }
+
+    AxlFileView *v = axl_file_view_open(COH_PATH, PAGE, FRAMES);
+    test_check(v != NULL, "fv coherence: open");
+    if (v == NULL) {
+        axl_file_delete(COH_PATH);
+        return;
+    }
+    test_check(coh_is(v, "AAAA"), "fv coherence: view starts at the seeded contents");
+
+    /* A fresh view has always seen current bytes -- keep it that way. */
+    test_check(axl_file_set_contents(COH_PATH, "BBBBBBBB", 8) == AXL_OK,
+               "fv coherence: set_contents rewrote the file");
+    AxlFileView *fresh = axl_file_view_open(COH_PATH, PAGE, FRAMES);
+    test_check(fresh != NULL && coh_is(fresh, "BBBBBBBB"),
+               "fv coherence: a view opened AFTER the write sees it");
+    axl_file_view_close(fresh);
+
+    /* The point of the exercise: the view that was open the whole time. */
+    test_check(coh_is(v, "BBBBBBBB"),
+               "fv coherence: axl_file_set_contents reaches an open view");
+
+    test_check(axl_file_truncate(COH_PATH, 3) == AXL_OK,
+               "fv coherence: truncate to 3");
+    test_check(coh_is(v, "BBB"),
+               "fv coherence: axl_file_truncate reaches an open view");
+
+    /* Raw positional write through a stream -- the path 9P's Twrite uses. */
+    AxlStream *s = axl_fopen(COH_PATH, "w");
+    test_check(s != NULL, "fv coherence: stream open for write");
+    if (s != NULL) {
+        test_check(axl_pwrite(s, "ZZ", 2, 0) == 2, "fv coherence: pwrite 2 bytes at 0");
+        test_check(axl_fflush(s) == AXL_OK, "fv coherence: stream flush");
+        axl_fclose(s);
+    }
+    test_check(coh_is(v, "ZZB"),
+               "fv coherence: axl_pwrite reaches an open view");
+
+    /* The streaming writer (WebDAV PUT / upload path). */
+    AxlFileWriter *w = axl_file_writer_open(COH_PATH, 0);
+    test_check(w != NULL, "fv coherence: file_writer open");
+    if (w != NULL) {
+        test_check(axl_file_writer_write(w, "WWWWW", 5) == AXL_OK,
+                   "fv coherence: file_writer wrote 5 bytes");
+        test_check(axl_file_writer_close(w) == AXL_OK, "fv coherence: file_writer close");
+    }
+    test_check(coh_is(v, "WWWWW"),
+               "fv coherence: axl_file_writer_write reaches an open view");
+
+    /* Atomic replace -- a different file is renamed OVER the one @v reads. */
+    test_check(axl_file_write_atomic(COH_PATH, "QQ", 2) == AXL_OK,
+               "fv coherence: write_atomic replaced the file");
+    test_check(coh_is(v, "QQ"),
+               "fv coherence: axl_file_write_atomic reaches an open view");
+
+    /* A pinned view is the deliberate opposite: its length and its
+       resident pages stop moving. Read it through once first, so page 0
+       IS resident -- that is the state the guarantee is about. */
+    AxlFileView *pinned = axl_file_view_open(COH_PATH, PAGE, FRAMES);
+    test_check(pinned != NULL, "fv coherence: open a view to pin");
+    axl_file_view_set_pinned(pinned, true);
+    test_check(coh_is(pinned, "QQ"),
+               "fv coherence: pinned view reads the file it opened on");
+    test_check(axl_file_set_contents(COH_PATH, "PPPPPPP", 7) == AXL_OK,
+               "fv coherence: rewrote the file under the pinned view");
+    test_check(coh_is(pinned, "QQ"),
+               "fv coherence: a pinned view keeps the length it observed");
+    test_check(axl_file_view_refresh(pinned) == AXL_OK,
+               "fv coherence: refresh on a pinned view reports OK");
+    test_check(coh_is(pinned, "QQ"),
+               "fv coherence: refresh does not override the pin");
+    axl_file_view_set_pinned(pinned, false);
+    test_check(coh_is(pinned, "PPPPPPP"),
+               "fv coherence: unpinning lets the next read catch up");
+    axl_file_view_close(pinned);
+
+    /* The unpinned view saw that same write. */
+    test_check(coh_is(v, "PPPPPPP"),
+               "fv coherence: the long-lived view tracked every write");
+
+    /* Deleted under the view: refresh has to say so rather than let an
+       empty read pass for EOF. */
+    test_check(axl_file_delete(COH_PATH) == AXL_OK, "fv coherence: deleted the file");
+    test_check(axl_file_view_refresh(v) != AXL_OK,
+               "fv coherence: refresh reports the file is gone");
+    test_check(axl_file_view_size(v) == 0, "fv coherence: a vanished file reports size 0");
+    static uint8_t gone[8];
+    test_check(axl_file_view_read(v, 0, gone, sizeof(gone)) == 0,
+               "fv coherence: a vanished file reads 0 bytes");
+    /* ... and keeps saying so, rather than alternating answers. */
+    test_check(axl_file_view_refresh(v) != AXL_OK,
+               "fv coherence: the second refresh reports the same thing");
+
+    /* Recreated at the same path: the view recovers rather than staying dead. */
+    test_check(axl_file_set_contents(COH_PATH, "RRR", 3) == AXL_OK,
+               "fv coherence: recreated the file");
+    test_check(axl_file_view_refresh(v) == AXL_OK,
+               "fv coherence: refresh recovers once the path exists again");
+    test_check(coh_is(v, "RRR"), "fv coherence: the recovered view reads the new file");
+
+    /* The key has to DISCRIMINATE. Every assertion above would ALSO pass
+       against a degenerate axl_file_gen_key that returned a constant --
+       over-invalidation is safe for correctness -- but that key would make
+       every write anywhere in the image re-stat and re-open every open
+       view, which is worse than the stat-per-read the whole mechanism
+       exists to avoid. So pin the negative: an unrelated basename must
+       leave this view completely alone. Observable through the cache
+       counters, since a re-sync drops the view's frames and the next read
+       has to fault the page back in. */
+    AxlFileViewStats st_before;
+    AxlFileViewStats st_after;
+    test_check(coh_is(v, "RRR"), "fv coherence: page is resident before the unrelated write");
+    axl_file_view_stats(v, &st_before);
+    test_check(axl_file_set_contents(COH_OTHER, "zzzz", 4) == AXL_OK,
+               "fv coherence: wrote a DIFFERENT basename");
+    test_check(coh_is(v, "RRR"), "fv coherence: the view still reads its own file");
+    axl_file_view_stats(v, &st_after);
+    test_check(st_after.preads == st_before.preads,
+               "fv coherence: an unrelated write triggers no re-read (the key discriminates)");
+    test_check(st_after.hits > st_before.hits,
+               "fv coherence: that read came from the still-resident page");
+    axl_file_delete(COH_OTHER);
+
+    test_check(axl_file_view_refresh(NULL) != AXL_OK, "fv coherence: refresh(NULL) = AXL_ERR");
+    axl_file_view_set_pinned(NULL, true);   /* NULL-safe */
+
+    axl_file_view_close(v);
+    axl_file_delete(COH_PATH);
+}
+
 int
 test_file_view_main(int argc, char **argv)
 {
@@ -265,6 +442,7 @@ test_file_view_main(int argc, char **argv)
 
     test_file_view();
     test_file_view_shared_cache();
+    test_file_view_coherence();
 
     return test_print_results();
 }

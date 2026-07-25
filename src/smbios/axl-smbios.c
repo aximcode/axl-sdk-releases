@@ -227,13 +227,13 @@ smbios_skip_entry(
 // axl_smbios_get_string (UCS-2, legacy)
 // ---------------------------------------------------------------------------
 
-unsigned short *
+uint16_t *
 axl_smbios_get_string(
     AxlSmbiosHeader  *hdr,
-    unsigned char     string_index
+    uint8_t     string_index
     )
 {
-    static unsigned short  buffer[128];
+    static uint16_t  buffer[128];
     char          *str;
     size_t         idx;
     size_t         i;
@@ -241,7 +241,7 @@ axl_smbios_get_string(
     buffer[0] = L'\0';
 
     if (hdr == NULL || string_index == 0) {
-        return (unsigned short *)buffer;
+        return buffer;
     }
 
     str = (char *)hdr + hdr->Length;
@@ -251,16 +251,16 @@ axl_smbios_get_string(
         }
         str++;
         if (*str == '\0') {
-            return (unsigned short *)buffer;
+            return buffer;
         }
     }
 
     for (i = 0; i < 127 && str[i] != '\0'; i++) {
-        buffer[i] = (unsigned short)str[i];
+        buffer[i] = (uint16_t)str[i];
     }
     buffer[i] = L'\0';
 
-    return (unsigned short *)buffer;
+    return buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ axl_smbios_get_string(
 const char *
 axl_smbios_get_string_utf8(
     AxlSmbiosHeader  *hdr,
-    unsigned char     string_index
+    uint8_t     string_index
     )
 {
     /* SMBIOS strings are NUL-terminated ASCII stored inline in the table
@@ -304,7 +304,7 @@ axl_smbios_get_string_utf8(
 
 AxlSmbiosHeader *
 axl_smbios_find(
-    unsigned char type
+    uint8_t type
     )
 {
     return axl_smbios_find_next(type, NULL);
@@ -312,7 +312,7 @@ axl_smbios_find(
 
 AxlSmbiosHeader *
 axl_smbios_find_next(
-    unsigned char     type,
+    uint8_t     type,
     AxlSmbiosHeader  *prev
     )
 {
@@ -395,8 +395,8 @@ axl_smbios_next(
 
 int
 axl_smbios_version(
-    unsigned char *major,
-    unsigned char *minor
+    uint8_t *major,
+    uint8_t *minor
     )
 {
     SMBIOS3_STRUCTURE_TABLE *smbios3 = NULL;

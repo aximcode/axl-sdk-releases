@@ -27,7 +27,7 @@
 
 #include <axl/axl-mem-region.h>
 #include <axl/axl-mem-phys.h>
-#include <axl/axl-port.h>      /* axl_io_port_read/write (x86) */
+#include <axl/axl-io-port.h>      /* axl_io_port_read/write (x86) */
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-sort.h>
@@ -473,8 +473,8 @@ range_args_ok(uintptr_t phys, size_t len, const void *buf, uint32_t w)
 }
 
 int
-axl_mem_phys_read_range(uintptr_t phys, size_t len, void *buf,
-                        uint32_t access_width)
+axl_mem_phys_read_range(uintptr_t phys, size_t len, uint32_t access_width,
+                        void *buf)
 {
     if (!range_args_ok(phys, len, buf, access_width)
         || !axl_mem_phys_is_accessible(phys, len, false)) {
@@ -753,7 +753,7 @@ io_range_args_ok(size_t len, const void *buf, uint32_t w)
 #endif /* x86 */
 
 int
-axl_io_read_range(uintptr_t port, size_t len, void *buf, uint32_t access_width)
+axl_io_read_range(uintptr_t port, size_t len, uint32_t access_width, void *buf)
 {
 #if defined(__x86_64__) || defined(__i386__)
     if (!io_range_args_ok(len, buf, access_width)

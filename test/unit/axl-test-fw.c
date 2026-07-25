@@ -951,7 +951,7 @@ test_fw_guided_lzma(void)
     size_t lzlen = 0;
     int rc = axl_compress(AXL_COMPRESS_LZMA, inner_sec_stream,
                           sizeof(inner_sec_stream),
-                          &lz, &lzlen, AXL_COMPRESS_LEVEL_DEFAULT);
+                          AXL_COMPRESS_LEVEL_DEFAULT, &lz, &lzlen);
     if (rc != AXL_OK || !lz) {
         test_check(false, "fw-lzma: axl_compress succeeded");
         return;
@@ -1344,6 +1344,24 @@ test_fw_erased_tail_terminates(void)
     axl_fw_close(img);
 }
 
+/* C++ RAII autoptr — AXL_AUTOPTR(AxlFwImage) must call axl_fw_close at scope
+   exit. Live-allocation count returns to baseline once the parsed image (and
+   its whole node tree) is torn down. */
+static void
+test_autoptr_fw(void)
+{
+    axl_fw_close(axl_fw_open(fixture_fv, fixture_fv_len));   /* prime */
+
+    AxlMemStats before, after;
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlFwImage) img = axl_fw_open(fixture_fv, fixture_fv_len);
+        test_check(img != NULL, "autoptr: fw open");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: fw image closed at scope exit");
+}
+
 /* ---------------------------------------------------------------------------
  * Entry point
  * ---------------------------------------------------------------------------
@@ -1371,6 +1389,7 @@ test_fw_main(int argc, char **argv)
     test_fw_guided_unknown_codec_raw();
     test_fw_guided_unknown_codec_opaque();
     test_fw_erased_tail_terminates();
+    test_autoptr_fw();
 
     return test_print_results();
 }

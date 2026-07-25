@@ -52,7 +52,7 @@ is_pow2(uint32_t v)
 }
 
 static uint32_t
-ring_readable(AxlRingBuf *rb)
+ring_readable(const AxlRingBuf *rb)
 {
     return rb->write_pos - rb->read_pos;
 }
@@ -84,7 +84,7 @@ ring_copy_in(
 
 static void
 ring_copy_out(
-    AxlRingBuf *rb,
+    const AxlRingBuf *rb,
     void       *dest,
     uint32_t    len,
     uint32_t    pos
@@ -355,7 +355,7 @@ axl_ring_buf_pop(
 
 uint32_t
 axl_ring_buf_peek(
-    AxlRingBuf *rb,
+    const AxlRingBuf *rb,
     void       *dest,
     uint32_t    len
     )
@@ -609,7 +609,7 @@ axl_ring_buf_peek_msg(
 }
 
 uint32_t
-axl_ring_buf_peek_msg_size(AxlRingBuf *rb)
+axl_ring_buf_peek_msg_size(const AxlRingBuf *rb)
 {
     if (rb == NULL) {
         return 0;
@@ -671,7 +671,7 @@ axl_ring_buf_pop_elem(
 
 int
 axl_ring_buf_peek_elem(
-    AxlRingBuf *rb,
+    const AxlRingBuf *rb,
     void       *dest
     )
 {
@@ -689,7 +689,7 @@ axl_ring_buf_peek_elem(
 
 int
 axl_ring_buf_peek_nth_elem(
-    AxlRingBuf *rb,
+    const AxlRingBuf *rb,
     uint32_t    index,
     void       *dest
     )
@@ -730,7 +730,7 @@ axl_ring_buf_set_nth_elem(
 }
 
 uint32_t
-axl_ring_buf_get_length(AxlRingBuf *rb)
+axl_ring_buf_get_length(const AxlRingBuf *rb)
 {
     if (rb == NULL) {
         return 0;
@@ -769,7 +769,7 @@ axl_ring_buf_get_writable(AxlRingBuf *rb)
 }
 
 uint32_t
-axl_ring_buf_get_capacity(AxlRingBuf *rb)
+axl_ring_buf_get_capacity(const AxlRingBuf *rb)
 {
     if (rb == NULL) {
         return 0;
@@ -779,7 +779,7 @@ axl_ring_buf_get_capacity(AxlRingBuf *rb)
 }
 
 bool
-axl_ring_buf_is_empty(AxlRingBuf *rb)
+axl_ring_buf_is_empty(const AxlRingBuf *rb)
 {
     if (rb == NULL) {
         return true;
@@ -789,7 +789,7 @@ axl_ring_buf_is_empty(AxlRingBuf *rb)
 }
 
 bool
-axl_ring_buf_is_full(AxlRingBuf *rb)
+axl_ring_buf_is_full(const AxlRingBuf *rb)
 {
     if (rb == NULL) {
         return false;

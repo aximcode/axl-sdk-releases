@@ -21,6 +21,9 @@
  *   - If no handler is installed, the default behavior is to
  *     terminate the app cleanly at the next axl_yield observation
  *     (runs _axl_cleanup, then gBS->Exit via axl_backend_boot_exit).
+ *     _axl_cleanup prints a one-line "Interrupted (Ctrl-C)" notice to
+ *     stderr on this default path (suppressed when a handler is
+ *     installed — that app owns its own interrupt messaging).
  *
  * @code
  * static volatile bool g_should_quit;

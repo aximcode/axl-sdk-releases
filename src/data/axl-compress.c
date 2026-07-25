@@ -125,7 +125,7 @@ deflate_raw(const void *in, size_t in_len, int level,
 
 int
 axl_compress(AxlCompressFormat fmt, const void *in, size_t in_len,
-             void **out, size_t *out_len, int level)
+             int level, void **out, size_t *out_len)
 {
     if (out == NULL || out_len == NULL) {
         return AXL_ERR;

@@ -23,6 +23,10 @@ AXL_LOG_DOMAIN("fs-provider");
 
 #define MAX_PATH_BYTES  512u
 
+/* Ceiling for the free-"fsN"-slot scan in publish_shell_map — mirrors
+   mkrd.c's MKRD_MAX_FS_SCAN (same shell-mapping problem, same bound). */
+#define FS_PROVIDER_MAX_FS_SCAN  256u
+
 // ===================================================================
 // Internal types
 // ===================================================================
@@ -54,9 +58,17 @@ struct Publication {
        as the opaque void *). */
     EFI_HANDLE                       handle;
 
-    /* Device-path allocated by axl_device_path_make_vendor; freed on
+    /* Device-path allocated by axl_device_path_new_vendor; freed on
        unpublish. */
     AxlDevicePath                   *device_path;
+
+    /* "fsN" shell mapping publish_shell_map assigned to device_path, or ""
+       if none was (no shell / no free slot). Unpublish must remove it
+       BEFORE freeing device_path below -- otherwise the shell's map table
+       is left holding a dangling pointer to freed memory, and a later
+       `dir`/`type fsN:` (or another axl_volume_enumerate walking every
+       mapped entry's device path) dereferences it. */
+    char                             shell_name[16];
 
     /* Open-file list (singly-anchored doubly-linked). Walked on
        unpublish to force-close + mark dead. Single-threaded
@@ -852,6 +864,56 @@ provider_validate(const AxlFsProvider *p)
     return AXL_OK;
 }
 
+/**
+ * @brief Assign a real "fsN:" shell mapping to a freshly-published volume.
+ *
+ * `axl_driver_connect_handle` (ConnectController) has no shell-map side
+ * effect for a handle that already carries its own
+ * EFI_SIMPLE_FILE_SYSTEM_PROTOCOL (there is no driver left to bind — we
+ * ARE the driver). The other lever, a `map -r` refresh, only works when
+ * typed at the shell's own interactive prompt: driving it programmatically
+ * via `EFI_SHELL_PROTOCOL.Execute("map -r")` spawns a NESTED shell
+ * instance that rescans and updates only ITS OWN throwaway map table, then
+ * discards it on exit — never the calling image's persistent one (see
+ * axl_volume_set_map's docstring). `SetMap` is the one shell-map primitive
+ * that writes the shell's persistent global map directly, so it is the
+ * only lever that fulfills axl_fs_provider_publish's own documented
+ * promise: a caller that publishes and immediately `dir`/`cd`/reads back
+ * gets a working name with no extra step. Best-effort: a driver/headless
+ * context with no shell (or no free slot) just leaves the volume unmapped,
+ * same as any other shell-only feature — callers still reach it via the
+ * returned handle / axl_protocol_enumerate.
+ *
+ * On success, writes the assigned name to @p pub->shell_name so unpublish
+ * can remove it later; left as "" (the calloc'd default) otherwise.
+ */
+static void
+publish_shell_map(Publication *pub)
+{
+    for (uint32_t i = 0; i < FS_PROVIDER_MAX_FS_SCAN; i++) {
+        char name[16];
+        axl_snprintf(name, sizeof(name), "fs%u", i);
+        if (!axl_volume_map_taken(name)) {
+            int rc = axl_volume_set_map(pub->device_path, name);
+            if (rc == AXL_OK) {
+                axl_strlcpy(pub->shell_name, name, sizeof(pub->shell_name));
+            } else if (rc == AXL_UNSUPPORTED) {
+                /* Expected in a headless/driver context (no EFI_SHELL_PROTOCOL
+                   locatable) -- not a fault, so no WARN. Best-effort, matching
+                   axl_driver_connect_handle above: the volume is still
+                   reachable via the returned handle / axl_protocol_enumerate,
+                   just not by an "fsN:" path. */
+                axl_debug("no shell present; volume left unmapped");
+            } else {
+                /* A shell IS present but rejected SetMap for this name --
+                   worth a WARN, unlike the plain no-shell case above. */
+                axl_warning("shell map assignment failed (SetMap rejected)");
+            }
+            return;
+        }
+    }
+}
+
 int
 axl_fs_provider_publish(
     const AxlFsProvider *provider,
@@ -871,7 +933,7 @@ axl_fs_provider_publish(
     pub->sfs.Revision   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_REVISION;
     pub->sfs.OpenVolume = thunk_open_volume;
 
-    if (axl_device_path_make_vendor(vendor_guid, &pub->device_path)
+    if (axl_device_path_new_vendor(vendor_guid, &pub->device_path)
             != AXL_OK) {
         axl_free(pub);
         return AXL_ERR;
@@ -887,8 +949,12 @@ axl_fs_provider_publish(
         return AXL_ERR;
     }
 
-    /* Make the freshly-installed FS visible without `map -r`. */
+    /* Best-effort: let any applicable driver bind (harmless no-op here since
+       the protocols are already fully installed — see publish_shell_map's
+       doc comment for why this alone does NOT make the volume reachable via
+       an "fsN:" path), then assign the real shell mapping that does. */
     axl_driver_connect_handle(pub->handle);
+    publish_shell_map(pub);
 
     *out_handle = pub->handle;
     return AXL_OK;
@@ -932,8 +998,18 @@ axl_fs_provider_unpublish(void *handle)
         f->pub = NULL;       /* break the dangling-pointer trap */
     }
 
-    axl_protocol_unregister(pub->handle, "simple-fs", &pub->sfs);
-    axl_protocol_unregister(pub->handle, "device-path", pub->device_path);
+    axl_protocol_unregister("simple-fs", &pub->sfs, pub->handle);
+    axl_protocol_unregister("device-path", pub->device_path, pub->handle);
+
+    /* Drop the shell mapping BEFORE freeing device_path below -- otherwise
+       the shell's map table is left holding a pointer into freed memory,
+       and a later `dir`/`type fsN:` (or another axl_volume_enumerate
+       walking every mapped entry's device path) dereferences it. */
+    if (pub->shell_name[0] != '\0' && axl_volume_unmap(pub->shell_name) != AXL_OK) {
+        /* Best-effort: the shell may already be gone (e.g. exiting alongside
+           this unpublish), in which case there is no map left to leak. */
+        axl_warning("shell map '%s' removal failed", pub->shell_name);
+    }
 
     pub->dead = true;
     axl_free(pub->device_path);

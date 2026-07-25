@@ -616,7 +616,7 @@ axlk_listen(uint16_t port)
     }
     int fd = fd_alloc(AXLK_FD_TCP_LISTENER, listener);
     if (fd < 0) {
-        axl_tcp_close(listener);
+        axl_tcp_close(listener, AXL_TEARDOWN_GRACEFUL);
         return -1;
     }
     return fd;
@@ -630,7 +630,7 @@ on_accept_complete(AxlTcp *client, AxlStatus status, void *data)
     if (status == AXL_OK && client != NULL) {
         int fd = fd_alloc(AXLK_FD_TCP_CONN, client);
         if (fd < 0) {
-            axl_tcp_close(client);
+            axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
         } else {
             result = fd;
         }
@@ -741,7 +741,7 @@ axlk_close(int fd)
         return;
     }
     if (s->tcp != NULL) {
-        axl_tcp_close(s->tcp);
+        axl_tcp_close(s->tcp, AXL_TEARDOWN_GRACEFUL);
     }
     fd_release(fd);
 }
@@ -966,7 +966,7 @@ axlk_run(AxlkProcMain entry, int argc, char **argv)
     /* Kernel-wide teardown: close any fds still open, then free loop. */
     for (int i = 1; i < AXLK_MAX_FDS; i++) {
         if (fd_table[i].kind != AXLK_FD_FREE && fd_table[i].tcp != NULL) {
-            axl_tcp_close(fd_table[i].tcp);
+            axl_tcp_close(fd_table[i].tcp, AXL_TEARDOWN_GRACEFUL);
             fd_table[i].kind = AXLK_FD_FREE;
             fd_table[i].tcp  = NULL;
         }

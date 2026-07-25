@@ -3,7 +3,7 @@
 
 Replies to any UDP request on the given port with a 48-byte NTP packet
 whose transmit timestamp is a FIXED, known Unix time — so the guest's
-parse (axl_sntp_query) is deterministic and the test can assert an exact
+parse (axl_net_sntp_query) is deterministic and the test can assert an exact
 value. Exits after 60 seconds or on SIGTERM.
 
 Usage: sntp-server.py <port> [unix_secs]

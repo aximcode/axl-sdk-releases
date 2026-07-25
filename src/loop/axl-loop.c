@@ -984,18 +984,18 @@ iterate_flag_cb(void *data)
     return AXL_SOURCE_REMOVE;
 }
 
-int
+AxlStatus
 axl_loop_iterate_until(
     AxlLoop  *loop,
     AxlEvent *done,
     uint64_t  timeout_us
     )
 {
-    bool     done_flag    = false;
-    bool     timeout_flag = false;
+    bool      done_flag    = false;
+    bool      timeout_flag = false;
     AxlSourceId done_src    = 0;
     AxlSourceId timeout_src = 0;
-    int      rc           = -1;
+    AxlStatus rc           = AXL_TIMEOUT;
 
     if (loop == NULL) {
         return AXL_CANCELLED;
@@ -1021,7 +1021,7 @@ axl_loop_iterate_until(
             axl_loop_dispatch_event(loop);
         }
     }
-    rc = done_flag ? 0 : -1;
+    rc = done_flag ? AXL_OK : AXL_TIMEOUT;
 
 cleanup:
     if (done_src != 0) {

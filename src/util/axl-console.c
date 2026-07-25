@@ -449,3 +449,28 @@ axl_console_text_set_mode(
     }
     return axl_backend_console_text_set_mode(index);
 }
+
+/* Console foreground color, captured lazily on the first set so reset can
+   restore whatever attribute the console had before we tinted it. */
+static uint32_t g_console_orig_attr;
+static bool     g_console_orig_saved;
+
+void
+axl_console_set_color(
+    AxlConsoleFg  fg
+    )
+{
+    if (!g_console_orig_saved) {
+        g_console_orig_attr = axl_backend_console_get_attr();
+        g_console_orig_saved = true;
+    }
+    /* Foreground on a black background (background bits are the high nibble). */
+    axl_backend_console_set_attr((uint32_t)fg);
+}
+
+void
+axl_console_reset_color(void)
+{
+    axl_backend_console_set_attr(g_console_orig_saved ? g_console_orig_attr
+                                                      : AXL_CONSOLE_FG_DEFAULT);
+}

@@ -30,6 +30,8 @@
 #define AXL_SHELL_H
 
 #include <axl/axl-macros.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +91,37 @@ axl_shell_launch_fv(
 );
 
 /**
+ * @brief Run a shell command line and wait for it to complete.
+ *
+ * Public wrapper over the same shell-Execute bridge several AXL modules
+ * already use internally (`axl-fs.c`'s alias mapping, `axl-ramdisk.c`'s
+ * `map -r` advisory, `axl-sys.c`'s PATH reload): converts @p cmd from UTF-8
+ * to UCS-2 and runs it via `EFI_SHELL_PROTOCOL.Execute` when the modern
+ * UEFI Shell is hosting this image. On the old EFI 1.x shell (no
+ * `EFI_SHELL_PROTOCOL`, only `SHELL_ENVIRONMENT`) it falls back to
+ * `SHELL_ENVIRONMENT.Execute` on the shell-launched parent handle, so the
+ * same call works on either shell — the fallback @ref axl_shell_kind()
+ * distinguishes but a naive `LocateProtocol(EFI_SHELL_PROTOCOL)` misses
+ * entirely.
+ *
+ * The command's own output goes wherever `Execute` sends it — the current
+ * console, same as running it interactively. This call does not capture or
+ * redirect it; embed a `>`/`>>a` redirect in @p cmd for that. It is a
+ * different mechanism than capturing THIS image's own stdout (see
+ * `axl_stream_set_stdout_tee` in `<axl/axl-stream.h>`).
+ *
+ * @return AXL_OK if the command was handed to a shell and executed
+ *     (regardless of the command's own exit status, which is not
+ *     surfaced); AXL_ERR if neither shell protocol is present (this image
+ *     was not launched from a UEFI shell), @p cmd is NULL, or the UTF-8 to
+ *     UCS-2 conversion failed.
+ */
+int
+axl_shell_execute(
+    const char *cmd   ///< shell command line (UTF-8)
+);
+
+/**
  * @brief Where a real UEFI Shell can be found, without launching it.
  *
  * The availability query behind @ref axl_shell_launch / @ref
@@ -121,6 +154,51 @@ typedef enum {
  */
 AxlShellSource
 axl_shell_locate(void);
+
+/**
+ * @brief Every place a real UEFI Shell is available, reported independently.
+ *
+ * The richer companion to @ref AxlShellSource: where that enum collapses to
+ * a single file-first verdict — a locatable `Shell.efi` file *masks* the
+ * firmware-embedded Shell entirely — this reports each source on its own, so
+ * a consumer with an FV-first policy (launch the firmware Shell by default,
+ * fall back to a file only where the firmware carries none) can see and
+ * prefer the FV even when a foreign `Shell.efi` also happens to exist.
+ *
+ * `fv` is exactly `fv_count > 0`; the count is how many of the known
+ * Shell FV file GUIDs matched a readable Firmware Volume (most firmware
+ * carries one, so 0 or 1 is typical).
+ */
+typedef struct {
+    bool     file;              ///< a `Shell.efi` file is locatable (launch via @ref axl_shell_launch)
+    char     file_path[256];    ///< path to that file; empty string ("") unless `file`
+    bool     fv;                ///< a readable Firmware Volume embeds the Shell (launch via @ref axl_shell_launch_fv)
+    uint32_t fv_count;          ///< how many known Shell FV file GUIDs matched a readable FV; `fv` == (`fv_count` > 0)
+} AxlShellSources;
+
+/**
+ * @brief Report every source a real UEFI Shell can be launched from.
+ *
+ * Unlike @ref axl_shell_locate (file-first, single verdict), this fills
+ * @p out with each source independently — a staged `Shell.efi` file (with
+ * its path) AND the firmware-embedded FV Shell (with a match count) — so an
+ * FV-first consumer can prefer the firmware Shell without the file masking
+ * it. Finding *nothing* is still a successful query: @p out is all-zero
+ * (`file` / `fv` false, `fv_count` 0, `file_path` empty) and the call
+ * returns `AXL_OK`.
+ *
+ * Read-only: it walks the firmware volumes and mounted volumes but loads
+ * nothing and has no side effects — the same walk (and cost) as
+ * @ref axl_shell_locate, so a consumer polling it for a UI flag should cache
+ * the result rather than call it on every refresh.
+ *
+ * @return `AXL_OK` once the query completes (even if no Shell is
+ *     available anywhere); `AXL_ERR` only if @p out is NULL.
+ */
+AXL_WARN_UNUSED int
+axl_shell_sources(
+    AxlShellSources *out   ///< [out] filled with each available Shell source
+);
 
 /**
  * @brief Which command shell, if any, is hosting this image.

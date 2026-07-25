@@ -192,6 +192,16 @@ _axl_cleanup(void)
     }
     mCleanupRan = true;
 
+    /* Universal Ctrl-C notice: if the run was interrupted and the app did not
+     * install its own handler (which owns its messaging), announce the break on
+     * every exit path — the default-policy axl_exit AND the loop-returns-then-
+     * main-returns path both funnel through here. stderr so a piped stdout stays
+     * clean. Printed before atexit/leak output so it leads the shutdown. */
+    if (g_axl_interrupted && !_axl_signal_has_handler()) {
+        axl_backend_console_write_err(
+            (const unsigned short *)L"\r\nInterrupted (Ctrl-C)\r\n");
+    }
+
     /* Guarantee the shell's page break is off on every exit path. The
      * universal `-b` handler (axl_args_run) enables it and clears it on
      * normal return, but a handler that ends via axl_exit() bypasses that

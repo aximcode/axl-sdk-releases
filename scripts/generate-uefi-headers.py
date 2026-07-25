@@ -803,6 +803,66 @@ def clean_guid_value(val: str) -> str | None:
     return val
 
 
+def guid_display_name(gname: str) -> str:
+    """Canonical spec identifier for a GUID macro name.
+
+    A protocol GUID's type name is the macro minus the trailing "_GUID"
+    (EFI_RAM_DISK_PROTOCOL_GUID -> EFI_RAM_DISK_PROTOCOL). Every other GUID
+    identifier has no shorter canonical form, so it keeps its full name
+    (EFI_ACPI_TABLE_GUID stays as-is).
+    """
+    if gname.endswith("_PROTOCOL_GUID"):
+        return gname[: -len("_GUID")]
+    return gname
+
+
+def write_guid_names(gnames: list[str], output_dir: Path) -> None:
+    """Emit generated/guid-names.h: a (GUID, canonical-name) table.
+
+    Backs axl_protocol_guid_name (and the `lsproto` tool) so a live handle's
+    protocol GUID resolves to the exact identifier the spec/headers use --
+    "EFI_RAM_DISK_PROTOCOL", not the Shell's short "RamDisk". Sorted by name.
+    """
+    entries = sorted(((g, guid_display_name(g)) for g in gnames),
+                     key=lambda e: e[1])
+
+    lines: list[str] = []
+    lines.append("// One (GUID, canonical-name) row per generated GUID, sorted")
+    lines.append("// by name. Included by exactly one .c file (static linkage).")
+    lines.append("typedef struct {")
+    lines.append("    const EFI_GUID *guid;   ///< pointer to the generated GUID")
+    lines.append("    const char     *name;   ///< canonical spec identifier")
+    lines.append("} AxlGuidNameRow;")
+    lines.append("")
+    lines.append("static const AxlGuidNameRow axl_guid_name_table[] = {")
+    for gname, display in entries:
+        lines.append(f'    {{ &{gname}, "{display}" }},')
+    lines.append("};")
+    lines.append("")
+    lines.append(f"#define AXL_GUID_NAME_TABLE_COUNT  {len(entries)}u")
+
+    (output_dir / "guid-names.h").write_text(
+        header_wrap("guid-names.h", "\n".join(lines),
+                    includes=["guids.h"],
+                    description="Runtime GUID -> canonical spec-name table."))
+
+
+def guid_names_from_header(guids_h: Path) -> list[str]:
+    """Parse the GUID macro names out of an already-generated guids.h.
+
+    Lets guid-names.h be regenerated from the checked-in guids.h without the
+    spec HTML (which is downloaded, not committed). Same second-order-generated
+    status as guids.h itself.
+    """
+    text = guids_h.read_text()
+    # Match every generated EFI_GUID static, not only *_GUID names, so this
+    # standalone path cannot silently drop a row the full run would emit
+    # (guid_display_name handles any suffix). Today all are *_GUID; this keeps
+    # the two paths in agreement if that ever changes.
+    return re.findall(r"^static __attribute__\(\(unused\)\) EFI_GUID "
+                      r"(\w+) =", text, re.MULTILINE)
+
+
 def extract_guids(blocks: list[str]) -> list[tuple[str, str]]:
     """Extract all GUID #defines and convert to static const."""
     guids: list[tuple[str, str]] = []
@@ -1103,7 +1163,20 @@ def main() -> int:
                     help="Scan source dirs for UEFI types not in manifest")
     ap.add_argument("--extra-header", type=Path, default=None,
                     help="Supplemental header providing types outside the manifest")
+    ap.add_argument("--guid-names-from", type=Path, default=None,
+                    help="Regenerate ONLY generated/guid-names.h from an "
+                         "existing guids.h (no spec HTML needed), then exit")
     args = ap.parse_args()
+
+    # Standalone guid-names.h regeneration from the checked-in guids.h. Kept
+    # spec-independent so the name table can be refreshed in any checkout; the
+    # full run below regenerates it too (write_guid_names), so the two agree.
+    if args.guid_names_from is not None:
+        gnames = guid_names_from_header(args.guid_names_from)
+        write_guid_names(gnames, args.output)
+        print(f"Wrote {args.output / 'guid-names.h'} "
+              f"({len(gnames)} GUIDs) from {args.guid_names_from}")
+        return 0
 
     # Filter to input dirs that exist (PI spec may not be downloaded yet)
     input_dirs = [d for d in args.input if d.is_dir()]
@@ -1308,6 +1381,9 @@ def main() -> int:
         header_wrap("guids.h", "\n".join(guid_lines),
                     includes=["types.h"],
                     description="All UEFI protocol GUIDs."))
+
+    # Runtime GUID -> canonical spec-name table (see write_guid_names).
+    write_guid_names([g for g, _ in guids], output_dir)
 
     # Write all.h umbrella with forward declarations
     all_lines: list[str] = []

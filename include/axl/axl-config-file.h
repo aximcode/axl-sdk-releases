@@ -66,6 +66,30 @@ axl_config_file_load(
 );
 
 /**
+ * @brief Parse `key=value` text already in memory into the map.
+ *
+ * Same line grammar as axl_config_file_load: lines are split on the first
+ * `=`, key and value are trimmed of surrounding whitespace, `#` comment
+ * lines and blank lines are skipped, and a line with no `=` is ignored. A
+ * later assignment of the same key overrides an earlier one within @p text,
+ * and overrides any value already present in @p cf.
+ *
+ * For a caller whose config text lives somewhere other than a filesystem
+ * (e.g. an NVRAM variable) -- the in-memory counterpart of
+ * axl_config_file_load. @p text is a NUL-terminated UTF-8 string with lines
+ * separated by `\n` (a trailing `\r` before the `\n` is stripped, same as
+ * the file loader). @p cf is NOT cleared first; parse into a freshly
+ * created axl_config_file_new() when a clean parse is wanted.
+ *
+ * @return AXL_OK on success, AXL_ERR on NULL @p cf / @p text.
+ */
+int
+axl_config_file_parse_string(
+    AxlConfigFile *cf,     ///< map to parse into
+    const char    *text    ///< key=value text (NUL-terminated, '\n'-separated lines)
+);
+
+/**
  * @brief Create an empty map (set-only / all-defaults).
  *
  * @return new empty map, or NULL on OOM.
@@ -182,6 +206,29 @@ int
 axl_config_file_save(
     AxlConfigFile *cf,    ///< map
     const char    *path   ///< destination file path
+);
+
+/**
+ * @brief Serialize the map as `key=value` text into a caller buffer.
+ *
+ * Same line grammar as axl_config_file_save: one `key=value\n` line per
+ * entry, entry order unspecified (the map is unordered). Round-trips
+ * through axl_config_file_parse_string.
+ *
+ * For a caller whose config text lives somewhere other than a filesystem
+ * (e.g. an NVRAM variable) -- the in-memory counterpart of
+ * axl_config_file_save. Truncation is reported, not silently accepted: if
+ * the serialized text (including the trailing NUL) would not fit in @p cap
+ * bytes, AXL_ERR is returned and @p buf is left unmodified.
+ *
+ * @return AXL_OK on success (@p buf is NUL-terminated); AXL_ERR on NULL
+ *     @p cf / @p buf, zero @p cap, or the text not fitting.
+ */
+int
+axl_config_file_to_string(
+    AxlConfigFile *cf,    ///< map to serialize
+    char          *buf,   ///< [out] destination buffer
+    size_t         cap    ///< capacity of @p buf in bytes
 );
 
 #ifdef __cplusplus

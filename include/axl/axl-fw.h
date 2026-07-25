@@ -58,6 +58,10 @@ axl_fw_close(
     AxlFwImage *img   ///< image from axl_fw_open (may be NULL)
 );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlFwImage, axl_fw_close)
+#endif
+
 /** @brief The root (AXL_FW_NODE_IMAGE) node, or NULL if @p img is NULL. */
 AxlFwNode *
 axl_fw_root(

@@ -247,7 +247,7 @@ fill_exc_from_context(
 #else
     (void)sc;
     (void)efi_type;
-    out->arch = 0;
+    out->arch = AXL_CPU_ARCH_UNKNOWN;
 #endif
 }
 

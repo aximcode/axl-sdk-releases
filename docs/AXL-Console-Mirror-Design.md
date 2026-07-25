@@ -96,7 +96,7 @@ dispatches the loop from a firmware periodic timer (the resident-driver
 model). So the run shape is:
 
 ```
-axl_console_mirror_install(&m, &cfg);     // wrap gST ConIn/ConOut
+axl_console_mirror_install(&cfg, &m);     // wrap gST ConIn/ConOut
 axl_loop_attach_driver(loop, tick_ms);    // network pumped by the timer, in the background
 status = axl_shell_launch();              // StartImage(Shell.efi) — blocks; Shell owns foreground
 axl_loop_detach_driver(loop);
@@ -184,7 +184,7 @@ bool axl_console_mirror_in_alt_screen(const AxlConsoleMirror *m);
 /// Install: save gST->ConIn/ConOut(/StdErr), swap in the wrappers, and
 /// route output to cfg->sink. From here the firmware (and any app the
 /// caller StartImages, incl. the Shell) talks to the wrappers.
-int  axl_console_mirror_install(AxlConsoleMirror **out, const AxlConsoleMirrorConfig *cfg);
+int  axl_console_mirror_install(const AxlConsoleMirrorConfig *cfg, AxlConsoleMirror **out);
 
 /// Restore the original console protocols. Always pair with install.
 void axl_console_mirror_uninstall(AxlConsoleMirror *m);

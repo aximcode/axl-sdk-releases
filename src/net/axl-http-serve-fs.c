@@ -209,6 +209,13 @@ fs_read_open(
     if (v == NULL) {
         return AXL_ERR;
     }
+    /* PIN the view for the life of the response. The Content-Length (and
+       any Range bounds) went out on the wire from the stat that preceded
+       this open; a view that grew or shrank mid-body would make the
+       framing a lie -- too few bytes hangs the client, too many corrupt
+       the next response on a keep-alive connection. HTTP's freshness unit
+       is the response, and this open is where it is taken. */
+    axl_file_view_set_pinned(v, true);
     FsReadCtx *c = axl_calloc(1, sizeof(*c));
     if (c == NULL) {
         axl_file_view_close(v);
@@ -284,17 +291,22 @@ fs_write_chunk(
     return axl_file_writer_write((AxlFileWriter *)ctx, data, len);
 }
 
-static void
+static int
 fs_write_close(
     void *ctx, bool aborted
     )
 {
     /* On a clean EOF or a mid-upload abort we close the same way; an
-       aborted PUT leaves the partial file (the next PUT truncates it).
-       The flush status is unobservable through this void contract — a
-       direct AxlFileWriter user checks axl_file_writer_close instead. */
-    (void)aborted;
-    axl_file_writer_close((AxlFileWriter *)ctx);
+       aborted PUT leaves the partial file (the next PUT truncates it), so a
+       non-OK close on the abort path is expected — and the caller ignores
+       our return there. On a clean EOF the status is load-bearing: it is
+       the only signal that the bytes did NOT reach the volume, and the SDK
+       turns it into 500 rather than 201. */
+    int close_rc = axl_file_writer_close((AxlFileWriter *)ctx);
+    if (!aborted && close_rc != AXL_OK) {
+        axl_warning("upload: final flush/close failed - stored file is incomplete");
+    }
+    return close_rc;
 }
 
 // --- lifecycle (MKCOL / DELETE / MOVE / COPY) ---
@@ -368,6 +380,15 @@ fs_copy_file(
     if (v == NULL) {
         return AXL_ERR;
     }
+    /* PIN the source. The loop below is written against ONE length taken
+       up front, so a source that moved mid-copy would produce a hybrid
+       file either way -- the pin makes that contract explicit instead of
+       implicit. It also keeps the copy off a pathological path: writing
+       the destination is itself a write, and a destination whose name
+       keys to the same generation slot as the source (a COPY that keeps
+       the filename, which is most of them) would otherwise have the
+       source view re-stat and re-open once per buffer. */
+    axl_file_view_set_pinned(v, true);
     AxlFileWriter *w = axl_file_writer_open(dstfs, 0);
     if (w == NULL) {
         axl_file_view_close(v);

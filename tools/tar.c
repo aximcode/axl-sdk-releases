@@ -220,6 +220,22 @@ do_create(
         }
         axl_fclose(gz);
     }
+    /* Flush the archive through to the volume BEFORE reporting. axl_fclose is
+       not a durability point -- it drains the AXL-side buffer and never calls
+       the stream's flush -- and the firmware close under it cannot report
+       anything, since EFI_FILE_PROTOCOL.Close is specified to return only
+       EFI_SUCCESS. Without this a full volume or write-protected media
+       produced a TRUNCATED ARCHIVE announced as a successful create, which is
+       the worst answer available: the operator moves on and discovers it when
+       they try to extract. Runs after the gzip finish above, which pushes the
+       trailer into this stream. The partial archive is left on the volume
+       rather than deleted, matching every other failure path here -- a
+       diagnosable artifact beats a vanished one. */
+    if (axl_fflush(out) != AXL_OK) {
+        axl_printerr("tar: flush %s failed (archive did not reach the "
+                     "volume)\n", archive);
+        rc = 1;
+    }
     axl_fclose(out);
     return rc;
 }
@@ -362,6 +378,18 @@ extract_file(
     }
     if (n < 0) {
         axl_printerr("tar: read error extracting %s\n", full);
+        rc = 1;
+    }
+    /* Same contract as do_create's archive: flush through to the volume and
+       CHECK it before reporting. axl_fclose drains the AXL-side buffer and
+       never calls the stream's flush, and the firmware close under it cannot
+       report anything (EFI_FILE_PROTOCOL.Close is specified to return only
+       EFI_SUCCESS) -- so without this an extract onto a full or
+       write-protected volume wrote truncated or empty files, listed them
+       under -v as if they were fine, and exited 0. */
+    if (rc == 0 && axl_fflush(of) != AXL_OK) {
+        axl_printerr("tar: flush %s failed (extracted file did not reach the "
+                     "volume)\n", full);
         rc = 1;
     }
     axl_fclose(of);

@@ -160,7 +160,7 @@ test_key_handle(void)
 {
 #ifdef AXL_HAVE_TLS
     // --- ECDSA P-256: live keygen + sign/verify round-trips ---
-    AxlPkKey *k = axl_pk_keygen(AXL_PK_ECDSA_P256);
+    AxlPkKey *k = axl_pk_key_new(AXL_PK_ECDSA_P256);
     test_check(k != NULL, "keygen: ECDSA P-256 -> key");
     test_check(axl_pk_key_alg(k) == AXL_PK_ECDSA_P256,
                "keygen: ECDSA key reports its alg");
@@ -254,7 +254,7 @@ test_key_handle(void)
                "key_alg: NULL -> reserved zero");
     test_check(axl_pk_key_load_public(pk_msg, pk_msg_len) == NULL,
                "load: garbage public DER -> NULL");
-    test_check(axl_pk_keygen(AXL_PK_ED25519) == NULL,
+    test_check(axl_pk_key_new(AXL_PK_ED25519) == NULL,
                "keygen: Ed25519 (unsupported) -> NULL");
 
     axl_pk_key_free(kp);
@@ -291,7 +291,7 @@ test_key_handle(void)
     axl_pk_key_free(r);
 
     // --- RSA live keygen (slower; proves the keygen path) ---
-    AxlPkKey *rk = axl_pk_keygen(AXL_PK_RSA);
+    AxlPkKey *rk = axl_pk_key_new(AXL_PK_RSA);
     test_check(rk != NULL && axl_pk_key_alg(rk) == AXL_PK_RSA,
                "keygen: RSA-3072 -> key");
     rl = sizeof(rsig);
@@ -303,7 +303,7 @@ test_key_handle(void)
     axl_pk_key_free(rk);
 #else
     // Without AXL_TLS the whole key-handle API fails closed.
-    test_check(axl_pk_keygen(AXL_PK_ECDSA_P256) == NULL,
+    test_check(axl_pk_key_new(AXL_PK_ECDSA_P256) == NULL,
                "keygen: NULL without AXL_TLS");
     test_check(axl_pk_key_load_private(pk_rsa3072_pkcs8,
                                        pk_rsa3072_pkcs8_len) == NULL,

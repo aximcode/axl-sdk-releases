@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <axl/axl-macros.h>        /* AXL_DEFINE_AUTOPTR_CLEANUP */
 #include <axl/axl-gfx-surface.h>   /* AxlGfxBuffer */
 #include <axl/axl-input.h>         /* AxlInputCallback */
 #include <axl/axl-loop.h>          /* AxlLoop */
@@ -87,6 +88,10 @@ void
 axl_cursor_free(
     AxlCursor  *c   ///< cursor (NULL-safe)
 );
+
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlCursor, axl_cursor_free)
+#endif
 
 /**
  * @brief Set the cursor sprite and hotspot.

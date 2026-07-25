@@ -105,6 +105,12 @@ axl_console_emit_set_attribute(AxlConsoleEmit *e, uint32_t attribute);
 void
 axl_console_emit_set_mode(AxlConsoleEmit *e, uint32_t mode_number);
 
+/** @brief Report a new grid size to the consumer (@ref AxlConsoleOps::resize).
+    Callers update their advertised geometry BEFORE calling, so a consumer that
+    reads the size instead of trusting the arguments sees the same answer. */
+void
+axl_console_emit_resize(AxlConsoleEmit *e, uint32_t cols, uint32_t rows);
+
 /** @brief ClearScreen: report @c clear_screen, home the owned Mode's cursor, and
  *     (if @c auto_alt_screen) arm the alt-screen enter — a following backward
  *     cursor jump is then read as a full-screen repaint. */

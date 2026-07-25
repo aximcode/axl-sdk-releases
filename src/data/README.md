@@ -193,6 +193,12 @@ FIFO queue with push/pop at both ends and peek. Can also be used as
 a stack (push/pop from the same end). Matches GLib's GQueue. Supports
 find, remove, and stack-allocated initialization.
 
+A heap queue (`axl_queue_new`) is torn down with `axl_queue_free`; a
+stack-allocated or embedded queue (`AXL_QUEUE_INIT` / `axl_queue_init`)
+is torn down with `axl_queue_deinit` (or `axl_queue_deinit_full` to also
+free element data). Calling `axl_queue_free` on a non-heap queue frees the
+struct pointer and corrupts the stack — use `deinit` for those.
+
 ```c
 AxlQueue q = AXL_QUEUE_INIT;    // stack-allocated
 axl_queue_push_tail(&q, "first");
@@ -203,6 +209,8 @@ axl_queue_remove(&q, "first");     // removes first match
 axl_queue_remove_all(&q, "first"); // removes all matches
 
 AxlList *node = axl_queue_find(&q, "second");
+
+axl_queue_deinit(&q);              // stack queue teardown (NOT axl_queue_free)
 ```
 
 ## AxlNTree
@@ -1028,7 +1036,7 @@ mechanism behind [AxlFileView](../fs/README.md).
 
 ```c
 // Frame size 4 KiB, 8 resident frames; fill from some backing store.
-static int64_t fill(void *user, size_t page, void *dst, size_t cap) {
+static int64_t fill(size_t page, void *dst, size_t cap, void *user) {
     return load_page(user, page, dst, cap);   // bytes written, or -1
 }
 

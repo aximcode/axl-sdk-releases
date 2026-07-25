@@ -400,7 +400,7 @@ axl_ramdisk_ensure_driver(
         NULL, 0) == 0 ? AXL_OK : AXL_ERR;
 }
 
-int
+AxlStatus
 axl_ramdisk_create(
     const char *label,
     size_t      size_mb,
@@ -413,13 +413,13 @@ axl_ramdisk_create(
     if (label == NULL
         || size_mb < RAMDISK_MIN_SIZE_MB
         || size_mb > RAMDISK_MAX_SIZE_MB) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
 
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
     if (axl_protocol_find("ram-disk", (void **)&rd_proto) != AXL_OK
         || rd_proto == NULL) {
-        return AXL_ERR;
+        return AXL_UNSUPPORTED;
     }
 
     /* Idempotent on the label: an existing RAM disk with this label
@@ -436,7 +436,7 @@ axl_ramdisk_create(
     size_t   pages      = (size_t)((disk_bytes + 4095) / 4096);
     uint64_t phys_addr  = 0;
     if (axl_alloc_pages(pages, &phys_addr) != AXL_OK) {
-        return AXL_ERR;
+        return AXL_NO_RESOURCES;
     }
 
     void *buf = (void *)(uintptr_t)phys_addr;
@@ -452,7 +452,7 @@ axl_ramdisk_create(
         NULL, &dev_path);
     if (EFI_ERROR(status)) {
         axl_free_pages(phys_addr, pages);
-        return AXL_ERR;
+        return AXL_IO_ERROR;
     }
 
     /* Let firmware bind the FAT driver, then refresh the volume map so
@@ -466,7 +466,7 @@ axl_ramdisk_create(
     return AXL_OK;
 }
 
-int
+AxlStatus
 axl_ramdisk_register_image(
     void          *image,
     uint64_t       size_bytes,
@@ -479,13 +479,13 @@ axl_ramdisk_register_image(
     }
     if (image == NULL || size_bytes == 0
         || (kind != AXL_RAMDISK_DISK && kind != AXL_RAMDISK_CDROM)) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
 
     EFI_RAM_DISK_PROTOCOL *rd_proto = NULL;
     if (axl_protocol_find("ram-disk", (void **)&rd_proto) != AXL_OK
         || rd_proto == NULL) {
-        return AXL_ERR;
+        return AXL_UNSUPPORTED;
     }
 
     /* The type GUID the firmware sees: an El Torito CD-ROM or a raw disk.
@@ -500,7 +500,7 @@ axl_ramdisk_register_image(
         (uint64_t)(uintptr_t)image, size_bytes,
         (EFI_GUID *)type_guid, NULL, &dev_path);
     if (EFI_ERROR(status)) {
-        return AXL_ERR;
+        return AXL_IO_ERROR;
     }
 
     /* Bind the firmware's block / FAT / ISO9660 drivers to the new device

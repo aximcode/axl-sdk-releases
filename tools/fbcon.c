@@ -59,6 +59,14 @@ main(int argc, char **argv)
     if (axl_version_handle("fbcon", argc, argv)) {
         return 0;
     }
+    /* -h/--help via the shared hook — fbcon is a launcher, not a framework
+       tool, so it answers help the same way it answers --version. */
+    if (axl_help_handle("fbcon",
+            "Framebuffer console take-over (resident driver)",
+            "fbcon [-d <ms>] [-g <ms>]",
+            argc, argv)) {
+        return 0;
+    }
 
     int reaped = reap_resident_fbcon();
     if (reaped > 0) {

@@ -27,6 +27,7 @@
 #include <axl/axl-path.h>
 #include <axl/axl-wait.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-fv.h>   /* axl_fv_find_file_name — name an FV-dispatched driver */
 #include <axl/axl-watchdog.h>
 #include <axl/axl-net.h>
 
@@ -150,8 +151,10 @@ _axl_net_bus_location(
 // ===========================================================================
 
 typedef struct {
-    char *image_name;   /* set if a MEDIA_FILEPATH node is found */
-    bool  saw_fv_node;
+    char    *image_name;    /* set if a MEDIA_FILEPATH node is found */
+    bool     saw_fv_node;
+    bool     have_fv_guid;  /* fv_guid captured from a MEDIA_FW_FILE node */
+    AxlGuid  fv_guid;       /* the FFS file GUID of an FV-dispatched image */
 } ImgNameCtx;
 
 static int
@@ -177,30 +180,108 @@ resolve_driver_cb(
     }
     if (subtype == DP_MEDIA_FW_FILE) {
         c->saw_fv_node = true;
+        /* Body is the 16-byte FFS file GUID (after the 4-byte node header);
+           capture it so the caller can resolve it to a module UI name. */
+        uint16_t node_len =
+            (uint16_t)EFI_DP_LENGTH((EFI_DEVICE_PATH_PROTOCOL *)node);
+        if (node_len >= 4 + (uint16_t)sizeof(AxlGuid)) {
+            axl_memcpy(&c->fv_guid, (const uint8_t *)node + 4, sizeof(AxlGuid));
+            c->have_fv_guid = true;
+        }
     }
     return 0;
 }
 
-/* Resolve a driver-image handle to a printable name. "<firmware volume>"
-   for FV-dispatched drivers, "<unknown>" when the image has no usable
-   file path. Caller frees. */
+/* Read a driver's EFI_COMPONENT_NAME2 human name (English, else its first
+   supported language) from an agent/driver-binding handle into @out. AXL_OK
+   if a non-empty name was written. Mirrors read_component_name() in
+   src/util/axl-driver-info.c (the dh/drivers path) -- kept local rather than
+   sharing across the util/net module boundary for ~15 lines. */
+static int
+read_driver_component_name(
+    EFI_HANDLE  h,
+    char       *out,
+    size_t      cap
+    )
+{
+    if (out == NULL || cap == 0) {
+        return AXL_ERR;
+    }
+    out[0] = '\0';
+    EFI_COMPONENT_NAME2_PROTOCOL *cn = NULL;
+    EFI_GUID cn_guid = gEfiComponentName2ProtocolGuid;
+    if (EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3, h, &cn_guid, (void **)&cn))
+        || cn == NULL || cn->GetDriverName == NULL) {
+        return AXL_ERR;
+    }
+    CHAR16 *name = NULL;
+    if (EFI_ERROR(axl_efi_call(cn->GetDriverName, 3, cn, (CHAR8 *)"en", &name))
+        || name == NULL) {
+        char *langs = cn->SupportedLanguages;
+        if (langs == NULL
+            || EFI_ERROR(axl_efi_call(cn->GetDriverName, 3, cn, (CHAR8 *)langs, &name))
+            || name == NULL) {
+            return AXL_ERR;
+        }
+    }
+    axl_ucs2_to_utf8_buf((const unsigned short *)name, out, cap);
+    return (out[0] != '\0') ? AXL_OK : AXL_ERR;
+}
+
+/* Resolve a driver-image handle to a printable name. Prefers the on-disk .efi
+   filename (best for a staged/filesystem driver), then the driver's
+   ComponentName2 human name, then — for an FV-dispatched driver with neither —
+   the module UI name read from its firmware volume (e.g. "Ip4Dxe"), and only
+   then the opaque "<firmware volume>" / "<unknown>". Caller frees. */
 static char *
 resolve_driver_image_name(
     EFI_HANDLE agent
     )
 {
+    bool    saw_fv       = false;
+    bool    have_fv_guid = false;
+    AxlGuid fv_guid;
     EFI_LOADED_IMAGE_PROTOCOL *img = NULL;
-    EFI_STATUS st = axl_efi_call(axl_bs()->HandleProtocol, 3,
-        agent, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&img);
-    if (EFI_ERROR(st) || img == NULL || img->FilePath == NULL) {
-        return axl_strdup("<unknown>");
+    bool have_img = !EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3,
+            agent, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&img))
+        && img != NULL;
+    if (have_img && img->FilePath != NULL)
+    {
+        ImgNameCtx ctx = { 0 };
+        axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
+        if (ctx.image_name != NULL) {
+            axl_debug("resolve: agent -> .efi filename '%s'", ctx.image_name);
+            return ctx.image_name;   /* .efi filename */
+        }
+        saw_fv       = ctx.saw_fv_node;
+        have_fv_guid = ctx.have_fv_guid;
+        if (have_fv_guid) {
+            fv_guid = ctx.fv_guid;
+        }
     }
-    ImgNameCtx ctx = { .image_name = NULL, .saw_fv_node = false };
-    axl_device_path_for_each(img->FilePath, resolve_driver_cb, &ctx);
-    if (ctx.image_name != NULL) {
-        return ctx.image_name;
+    char cn[128];
+    if (read_driver_component_name(agent, cn, sizeof cn) == AXL_OK) {
+        axl_debug("resolve: agent -> ComponentName2 '%s'", cn);
+        return axl_strdup(cn);       /* ComponentName2 human name */
     }
-    return axl_strdup(ctx.saw_fv_node ? "<firmware volume>" : "<unknown>");
+    /* FV-dispatched driver with no filename and no ComponentName2: name it from
+       the firmware volume's UI section instead of "<firmware volume>". This is
+       the common real-hardware case (an FV-dispatched SNP owner like Ip4Dxe). */
+    if (have_fv_guid) {
+        char fvname[128];
+        if (axl_fv_find_file_name(&fv_guid, fvname, sizeof fvname) == AXL_OK) {
+            axl_debug("resolve: agent -> FV UI name '%s'", fvname);
+            return axl_strdup(fvname);
+        }
+    }
+    /* Fell through to a placeholder: nothing produced a real name. Trace WHY,
+       so a real-hardware resolution mystery (e.g. a USB-UNDI NIC whose SNP is
+       owned by an FV-dispatched driver) is diagnosable without a debugger. */
+    axl_debug("resolve: agent -> placeholder (loaded_image=%d filepath=%d "
+              "saw_fv=%d fv_guid=%d componentname2=absent)",
+              (int)have_img, (int)(have_img && img->FilePath != NULL),
+              (int)saw_fv, (int)have_fv_guid);
+    return axl_strdup(saw_fv ? "<firmware volume>" : "<unknown>");
 }
 
 /* Find the BY_DRIVER agent that has @p protocol_guid open on @p handle
@@ -226,13 +307,45 @@ find_by_driver_agent(
             break;
         }
     }
-    axl_bs()->FreePool(entries);
+    axl_backend_free(entries);
     return result;
 }
 
-/* Resolve driver name + binding layer for one SNP handle. Walks NII3.1 ->
-   NII (legacy) -> SNP, first match wins — so the answer is the driver that
-   owns the hardware, not the SnpDxe shim on top. Leaves driver/layer
+/* Pure: does @handle expose @guid? (presence check, used to label the stack.) */
+static bool
+handle_has_protocol(EFI_HANDLE handle, EFI_GUID *guid)
+{
+    void *iface = NULL;
+    return !EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3, handle, guid, &iface));
+}
+
+/* Name the real NIC-owning driver by walking @handle's device path DOWN to the
+   BUS controller (PCI/USB) with LocateDevicePath, then taking THAT controller's
+   BY_DRIVER agent. This is the hardware driver -- crucial because a NIC whose
+   SNP sits on a child handle (e.g. VirtioNetDxe) has only the MNP *consumer* as
+   the SNP handle's BY_DRIVER agent, never the producer. Caller frees; NULL if
+   no bus controller is found along the path. */
+static char *
+find_bus_driver_name(EFI_HANDLE handle, EFI_GUID *bus_guid)
+{
+    EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
+    if (EFI_ERROR(axl_efi_call(axl_bs()->HandleProtocol, 3,
+            handle, &EFI_DEVICE_PATH_PROTOCOL_GUID, (void **)&dp)) || dp == NULL) {
+        return NULL;
+    }
+    EFI_DEVICE_PATH_PROTOCOL *walk = dp;   /* LocateDevicePath advances a copy */
+    EFI_HANDLE bus = NULL;
+    if (EFI_ERROR(axl_efi_call(axl_bs()->LocateDevicePath, 3, bus_guid, &walk, &bus))
+        || bus == NULL) {
+        return NULL;
+    }
+    return find_by_driver_agent(bus, bus_guid);
+}
+
+/* Resolve driver name + binding layer for one SNP handle. The LAYER labels the
+   stack (NII3.1 / NII / SNP by protocol presence); the NAME is the hardware/bus
+   driver that actually owns the NIC (via find_bus_driver_name), falling back to
+   the NII producer's BY_DRIVER agent for exotic topologies. Leaves driver/layer
    untouched (caller pre-zeroes) when nothing is bound. */
 static void
 resolve_driver_for_handle(
@@ -240,32 +353,36 @@ resolve_driver_for_handle(
     AxlNetDriverInfo *out
     )
 {
-    char *nii31 = find_by_driver_agent(
-        handle, &gEfiNetworkInterfaceIdentifierProtocolGuid_31);
-    char *niileg = (nii31 != NULL) ? NULL :
-        find_by_driver_agent(
-            handle, &gEfiNetworkInterfaceIdentifierProtocolGuid);
-    char *snp = (nii31 != NULL || niileg != NULL) ? NULL :
-        find_by_driver_agent(handle, &EFI_SIMPLE_NETWORK_PROTOCOL_GUID);
+    EFI_GUID nii31g = gEfiNetworkInterfaceIdentifierProtocolGuid_31;
+    EFI_GUID niig   = gEfiNetworkInterfaceIdentifierProtocolGuid;
+    EFI_GUID snpg   = EFI_SIMPLE_NETWORK_PROTOCOL_GUID;
+    EFI_GUID pcig   = gEfiPciIoProtocolGuid;
+    EFI_GUID usbg   = gEfiUsbIoProtocolGuid;
 
-    const char *name  = NULL;
-    const char *layer = "";
-    if (nii31 != NULL) {
-        name = nii31; layer = "NII3.1";
-    } else if (niileg != NULL) {
-        name = niileg; layer = "NII";
-    } else if (snp != NULL) {
-        name = snp; layer = "SNP";
-    }
+    const char *layer =
+        handle_has_protocol(handle, &nii31g) ? "NII3.1" :
+        handle_has_protocol(handle, &niig)   ? "NII"    :
+        handle_has_protocol(handle, &snpg)   ? "SNP"    : NULL;
 
-    if (name != NULL) {
+    /* Name: the hardware driver (PCI then USB bus controller), then fall back to
+       the NII producer's agent for topologies with no discoverable bus node.
+       The source that first yields a (possibly-placeholder) name wins; the
+       axl_debug lines trace which source that was so an unexpected
+       "<firmware volume>" on real hardware can be pinned to a layer. */
+    char *name = find_bus_driver_name(handle, &pcig);
+    const char *src = "pci-bus";
+    if (name == NULL) { name = find_bus_driver_name(handle, &usbg); src = "usb-bus"; }
+    if (name == NULL) { name = find_by_driver_agent(handle, &nii31g); src = "nii3.1-agent"; }
+    if (name == NULL) { name = find_by_driver_agent(handle, &niig); src = "nii-agent"; }
+    axl_debug("resolve: layer=%s source=%s name=%s",
+              layer ? layer : "(none)", name ? src : "(none)",
+              name ? name : "(unresolved)");
+
+    if (name != NULL && layer != NULL) {
         axl_strlcpy(out->driver, name, sizeof(out->driver));
         axl_strlcpy(out->layer, layer, sizeof(out->layer));
     }
-
-    axl_free(nii31);
-    axl_free(niileg);
-    axl_free(snp);
+    axl_free(name);
 }
 
 static void
@@ -482,19 +599,20 @@ path_has_separator(
     return false;
 }
 
-/* Recognize iPXE drivers by filename heuristic so the watchdog disarm
-   (and the documented load-last guidance) apply — same family
-   axl_net_ensure_drivers gates as the iPXE fallback. */
-static bool
-name_is_ipxe(
+/* Filename heuristic only -- see the header doc for the two obligations
+   (order last, disarm the watchdog) this recognition exists to support. */
+bool
+axl_net_driver_is_ipxe(
     const char *path_or_name
     )
 {
     return axl_strcasestr(path_or_name, "ipxe") != NULL;
 }
 
-/* Diff the post-connect SNP set against @p before, counting genuinely-new
-   handles and recording the first AXL_NET_TRY_MAX_MACS MACs + any link. */
+/* Diff the post-connect SNP set against @p before: count genuinely-new
+   handles, record EVERY new NIC's MAC into a heap array (no cap), and note
+   aggregate link. The MAC array is owned by the caller (freed via axl_free);
+   NULL when nothing new bound or on allocation failure. */
 static void
 attribute_new_snp(
     void           **before,
@@ -505,37 +623,56 @@ attribute_new_snp(
     void  **after = NULL;
     size_t  n_after = snp_snapshot(&after);
 
+    /* Pass 1: count genuinely-new handles (pure membership; no protocol open). */
+    for (size_t i = 0; i < n_after; i++) {
+        if (!handle_in_set(after[i], before, n_before)) {
+            r->snp_handles_added++;
+        }
+    }
+    if (r->snp_handles_added == 0) {
+        if (after != NULL) {
+            axl_free(after);
+        }
+        return;
+    }
+
+    /* One MAC slot per new handle; an unreadable Mode (vanishingly rare for a
+       just-enumerated SNP handle) keeps a zeroed slot so the array stays 1:1
+       with the count. On OOM the honest count survives; the MAC array does
+       not (bound_nic_count = 0, bound_nic_macs = NULL). */
+    r->bound_nic_macs = axl_malloc((size_t)r->snp_handles_added * 6);
+    if (r->bound_nic_macs == NULL) {
+        if (after != NULL) {
+            axl_free(after);
+        }
+        return;
+    }
+    axl_memset(r->bound_nic_macs, 0, (size_t)r->snp_handles_added * 6);
+
+    /* Pass 2: fill MACs + aggregate link for each new handle. */
+    size_t slot = 0;
     for (size_t i = 0; i < n_after; i++) {
         if (handle_in_set(after[i], before, n_before)) {
             continue;
         }
-        r->snp_handles_added++;
-
         EFI_SIMPLE_NETWORK_PROTOCOL *snp = NULL;
-        bool readable = (axl_efi_call(axl_bs()->HandleProtocol, 3,
-                             after[i], &EFI_SIMPLE_NETWORK_PROTOCOL_GUID,
-                             (void **)&snp) == EFI_SUCCESS
-                         && snp != NULL && snp->Mode != NULL);
-        if (readable && snp->Mode->MediaPresent) {
-            r->link_up = true;
-        }
-        /* Record one slot per new handle so bound_nic_count stays exactly
-           min(snp_handles_added, AXL_NET_TRY_MAX_MACS). If the handle's
-           Mode isn't readable (vanishingly rare for a just-enumerated SNP
-           handle), the slot keeps its zeroed MAC rather than skewing the
-           count. */
-        if (r->bound_nic_count < AXL_NET_TRY_MAX_MACS) {
-            if (readable) {
-                size_t mac_len = snp->Mode->HwAddressSize;
-                if (mac_len > 6) {
-                    mac_len = 6;
-                }
-                axl_memcpy(r->bound_nic_macs[r->bound_nic_count],
-                           &snp->Mode->CurrentAddress, mac_len);
+        if (axl_efi_call(axl_bs()->HandleProtocol, 3,
+                after[i], &EFI_SIMPLE_NETWORK_PROTOCOL_GUID,
+                (void **)&snp) == EFI_SUCCESS
+            && snp != NULL && snp->Mode != NULL)
+        {
+            if (snp->Mode->MediaPresent) {
+                r->link_up = true;
             }
-            r->bound_nic_count++;
+            size_t mac_len = snp->Mode->HwAddressSize;
+            if (mac_len > 6) {
+                mac_len = 6;
+            }
+            axl_memcpy(r->bound_nic_macs[slot], &snp->Mode->CurrentAddress, mac_len);
         }
+        slot++;
     }
+    r->bound_nic_count = slot;   /* == snp_handles_added */
 
     if (after != NULL) {
         axl_free(after);
@@ -584,7 +721,7 @@ axl_net_try_driver(
     }
 
     size_t exit_data_size = 0;
-    EFI_STATUS st = axl_bs()->StartImage(
+    EFI_STATUS st = axl_efi_call(axl_bs()->StartImage, 3,
         (EFI_HANDLE)drv, &exit_data_size, NULL);
     if (EFI_ERROR(st) && st != EFI_ALREADY_STARTED) {
         axl_warning("try_driver: StartImage failed for '%s': 0x%llx",
@@ -600,7 +737,7 @@ axl_net_try_driver(
 
     /* iPXE arms a 5-min boot-services watchdog; disarm it (recognized
        iPXE names only — see header). */
-    if (name_is_ipxe(load_path)) {
+    if (axl_net_driver_is_ipxe(load_path)) {
         axl_watchdog_disarm();
     }
 
@@ -619,5 +756,8 @@ axl_net_try_driver(
         r->unloaded = true;
         return AXL_ERR;
     }
+    /* Success: the driver stays resident — hand its handle back so a caller
+       running its own sweep can drop it after a failed downstream check. */
+    r->driver = (void *)drv;
     return AXL_OK;
 }

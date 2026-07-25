@@ -94,7 +94,7 @@ typedef struct {
  * @return AXL_OK on key read (with @p out populated), -1 on timeout,
  *     no console available, or backend error.
  */
-int
+AXL_WARN_UNUSED int
 axl_console_read_key(
     uint64_t   timeout_ms,   ///< 0 / UINT64_MAX / millisecond bound
     AxlKey    *out           ///< [out] decoded keystroke (must be non-NULL)
@@ -215,6 +215,15 @@ axl_console_readline_ex(
 // mirror is uninstalled, enumeration reflects the remote terminal size,
 // not the hardware's mode list. Boot-services console state; valid until
 // the firmware tears the console down.
+//
+// A take-over @ref AxlConsoleDevice behaves by which mode it is in. A
+// `passthrough_local` (co-painting) device MIRRORS the physical console's
+// mode list index-for-index, so enumeration and @ref
+// axl_console_text_set_mode work exactly as they would with no device
+// installed — and a switch reshapes BOTH consoles together, which is how a
+// co-painting consumer resizes without leaving reader mode. A take-over
+// (evicting) device owns the grid instead and advertises the single
+// geometry it was configured with.
 //
 // Robustness note: UEFI guarantees only mode 0 (80x25); higher modes are
 // optional and a conformant console may reject `QueryMode` on a mode that
@@ -365,6 +374,55 @@ void
 axl_console_set_page_break(
     bool  enable
 );
+
+/**
+ * @brief Foreground text colors for @ref axl_console_set_color.
+ *
+ * A small, terminal-portable palette (the standard 16-color console
+ * foreground set). Backgrounds are left black. The enumerator values are an
+ * implementation detail — always use the names. (Distinct from the
+ * producer-side pen model @c AxlConsoleColor in axl-console-ops.h: this is a
+ * direct foreground selector for a tool writing to the active console.)
+ */
+typedef enum {
+    AXL_CONSOLE_FG_DEFAULT = 0x07,  ///< light gray (the console default)
+    AXL_CONSOLE_FG_GRAY    = 0x08,  ///< dark gray (dim / de-emphasized)
+    AXL_CONSOLE_FG_RED     = 0x0C,  ///< bright red (errors / failures)
+    AXL_CONSOLE_FG_GREEN   = 0x0A,  ///< bright green (success)
+    AXL_CONSOLE_FG_YELLOW  = 0x0E,  ///< yellow (warnings / attention)
+    AXL_CONSOLE_FG_BLUE    = 0x09,  ///< bright blue
+    AXL_CONSOLE_FG_MAGENTA = 0x0D,  ///< bright magenta
+    AXL_CONSOLE_FG_CYAN    = 0x0B,  ///< bright cyan
+    AXL_CONSOLE_FG_WHITE   = 0x0F,  ///< bright white (emphasis)
+} AxlConsoleFg;
+
+/**
+ * @brief Set the console foreground text color.
+ *
+ * Subsequent console output (axl_printf, axl_puts, …) is drawn in @p fg on a
+ * black background until the next set_color or @ref axl_console_reset_color.
+ * The first call captures the console's original attribute so
+ * axl_console_reset_color can restore it exactly. On a monochrome or
+ * attribute-less console this is a silent no-op — text still prints, just
+ * uncolored, so callers never need to branch on console capability.
+ *
+ * @param fg  foreground color from @ref AxlConsoleFg.
+ */
+void
+axl_console_set_color(
+    AxlConsoleFg  fg
+);
+
+/**
+ * @brief Restore the console foreground color.
+ *
+ * Reverts to the attribute that was active before the first
+ * @ref axl_console_set_color call (or the console default if none was
+ * captured). Always pair a colored region with this so the shell prompt and
+ * later tools are not left tinted.
+ */
+void
+axl_console_reset_color(void);
 
 #ifdef __cplusplus
 }

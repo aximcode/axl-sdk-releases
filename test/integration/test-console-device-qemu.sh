@@ -91,6 +91,7 @@ RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 DRV_DIR="$PROJECT_DIR/out/native-x64/drivers"
 DRIVER="$DRV_DIR/console-device-smoke.efi"
 RESTORE_DRIVER="$DRV_DIR/console-device-restore-smoke.efi"
+PASSTHRU_DRIVER="$DRV_DIR/console-device-passthrough-smoke.efi"
 WIDE_DRIVER="$DRV_DIR/console-device-wide-smoke.efi"
 INPUT_DRIVER="$DRV_DIR/console-device-input-smoke.efi"
 INPUT_RESTORE_DRIVER="$DRV_DIR/console-device-input-restore-smoke.efi"
@@ -107,13 +108,15 @@ ANALYZER="$TESTS_DIR/analyze-console-device-shot.py"
 # truncated `tail`.
 if ! make -C "$PROJECT_DIR" ARCH=x64 ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} \
         console-device-smoke console-device-restore-smoke console-device-wide-smoke \
+        console-device-passthrough-smoke \
         console-device-input-smoke console-device-input-restore-smoke \
         console-device-wide-restore-smoke console-device-cycle-smoke fbcon 2>&1 | tail -20; then
     echo "console-device test: FAIL (driver build failed)"
     exit 1
 fi
 if [[ ! -f "$DRIVER" || ! -f "$RESTORE_DRIVER" || ! -f "$WIDE_DRIVER" \
-      || ! -f "$INPUT_DRIVER" || ! -f "$INPUT_RESTORE_DRIVER" || ! -f "$FBCON_DRIVER" ]]; then
+      || ! -f "$INPUT_DRIVER" || ! -f "$INPUT_RESTORE_DRIVER" || ! -f "$FBCON_DRIVER" \
+      || ! -f "$PASSTHRU_DRIVER" ]]; then
     echo "console-device test: FAIL (drivers not produced despite a clean build)"
     exit 1
 fi
@@ -232,6 +235,18 @@ run_scenario "take-over" "$DRIVER" 16 "v e r ret" "" \
 # established by Scenario 1, which shares the identical install path.
 run_scenario "restore" "$RESTORE_DRIVER" 18 "" "--restored" \
     "uninstall restored the firmware console (it paints again)"
+
+# Scenario 2b — passthrough (co-paint): the exact inverse of Scenario 1. Installing
+# with passthrough_local=true SKIPS the eviction, so ConSplitter should fan to BOTH
+# our grid and the firmware GraphicsConsole and the local display keeps working —
+# which is what a consumer that only MIRRORS the console needs (evicting would blank
+# the local monitor and freeze anything sampling the GOP, e.g. a BMC's KVM stream).
+# The driver drives gST->ConOut directly with lines wider than its 80-col grid, so
+# ink past x=660 can only be the firmware console's; no sendkey is needed (`ver` is
+# far too narrow to reach that region, so it could not discriminate). SHOT_WAIT
+# outlasts the driver's 2 s post-take-over probe delay.
+run_scenario "passthrough" "$PASSTHRU_DRIVER" 18 "" "--passthrough" \
+    "passthrough co-paints (local console alive + ops still delivered)"
 
 # Scenario 3 — non-80x25 geometry survives scrolling (deterministic regression for
 # the ConsoleLogger stale-RowsPerScreen bug). AGT's axcon hit an EDK2 ShellPkg

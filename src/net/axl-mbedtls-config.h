@@ -68,7 +68,7 @@ int   axl_mbedtls_printf(const char *fmt, ...);
 #define MBEDTLS_PKCS1_V15
 /* RSASSA-PSS (+ its MGF1) for JOSE PS256 — axl_pk_rsa_pss_sha256_*. */
 #define MBEDTLS_PKCS1_V21
-/* RSA key generation (axl_pk_keygen(AXL_PK_RSA)) needs prime generation.
+/* RSA key generation (axl_pk_key_new(AXL_PK_RSA)) needs prime generation.
  * TLS itself never calls mbedtls_rsa_gen_key; this only compiles in
  * mbedtls_mpi_gen_prime. */
 #define MBEDTLS_GENPRIME

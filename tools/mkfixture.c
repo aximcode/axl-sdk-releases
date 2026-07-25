@@ -308,8 +308,8 @@ fixture_finish(
        standard .tar.gz the collector can gunzip). */
     void  *gz     = NULL;
     size_t gz_len = 0;
-    if (axl_compress(AXL_COMPRESS_GZIP, bytes, n, &gz, &gz_len,
-                     AXL_COMPRESS_LEVEL_DEFAULT) != AXL_OK) {
+    if (axl_compress(AXL_COMPRESS_GZIP, bytes, n,
+                     AXL_COMPRESS_LEVEL_DEFAULT, &gz, &gz_len) != AXL_OK) {
         axl_printerr("mkfixture: gzip of fixture tarball failed\n");
         return -1;
     }
@@ -827,12 +827,16 @@ dump_pci(
         }
 
         uint16_t vid = 0, did = 0;
-        axl_pci_get_vid_did(*p, &vid, &did);
         uint32_t class_code = 0;
-        axl_pci_get_class_code(*p, &class_code);
         AxlPciHeaderType htype = AXL_PCI_HEADER_TYPE_NORMAL;
         bool             multi = false;
-        axl_pci_get_header_type(*p, &htype, &multi);
+        /* Skip any function whose config space can't be read in full — a
+           fixture entry with defaulted identity/class would be misleading. */
+        if (axl_pci_get_vid_did(*p, &vid, &did) != AXL_OK
+            || axl_pci_get_class_code(*p, &class_code) != AXL_OK
+            || axl_pci_get_header_type(*p, &htype, &multi) != AXL_OK) {
+            continue;
+        }
 
         char addr_str[AXL_PCI_ADDR_STR_MAX];
         if (axl_pci_addr_format(*p, addr_str, sizeof addr_str) < 0) {

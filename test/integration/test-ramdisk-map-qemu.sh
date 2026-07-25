@@ -276,8 +276,20 @@ sect MARK_QDEAD MARK_DONE | grep -aqF "Cannot find mapped device" \
     || no "GAMMA: still mapped after destroy (dangling alias)"
 
 # --- 11. Quiet by default; -v enables the protocol probe ---
-if sed -n '1,/MARK_VERBOSE/p' "$LOG" | grep -aqE '\[(INFO|DEBUG)\]'; then
+# Scope the check to GUEST output — between the first guest marker (MARK_NOARGS)
+# and MARK_VERBOSE. run-qemu writes host-side setup diagnostics (e.g.
+# find_shell_efi's "[INFO] Extracted Shell.efi ..." when the Shell is extracted
+# from firmware rather than found as a package) to its own stderr, which this
+# test folds into $LOG via `2>&1`. Those host logs precede the guest boot, so a
+# from-line-1 grep mistook them for guest library chatter — green locally (Shell
+# is a system package, no extraction) but red in CI (Shell is extracted).
+leaked=""
+if sed -n '/MARK_NOARGS/,/MARK_VERBOSE/p' "$LOG" | grep -aqE '\[(INFO|DEBUG)\]'; then
     no "library log chatter leaked without -v"
+    # Capture the offending lines; printed in the FAIL block below so they land
+    # inside run-integration's last-25-lines failure view (a CI-only failure has
+    # no other way to show the raw serial line and its source).
+    leaked=$(sed -n '/MARK_NOARGS/,/MARK_VERBOSE/p' "$LOG" | grep -anE '\[(INFO|DEBUG)\]')
 else
     ok "no [INFO]/[DEBUG] chatter without -v"
 fi
@@ -288,5 +300,9 @@ echo ""
 if [[ "$fail" -eq 0 ]]; then
     echo "=== PASS ($ARCH): mkrd fsN-primary + label-alias mapping verified ==="; exit 0
 else
+    if [[ -n "$leaked" ]]; then
+        echo "leaked [INFO]/[DEBUG] chatter (line:text):"
+        echo "$leaked" | sed 's/^/  /'
+    fi
     echo "=== FAIL ($ARCH) ==="; exit 1
 fi

@@ -1472,6 +1472,62 @@ test_queue(void)
     axl_queue_free(q);
 }
 
+/* Wrapper so axl_free (a macro) can be passed as an AxlDestroyNotify. */
+static void
+queue_free_data(void *p)
+{
+    axl_free(p);
+}
+
+/* Regression + contract for the stack/embedded teardown path. The trap the
+   API-consistency audit found: axl_queue_free calls axl_free(struct), which
+   corrupts a stack-initialized queue — so a stack queue must tear down with
+   axl_queue_deinit. We can't call axl_queue_free(&stack) to prove corruption
+   (UEFI has no memory-safety net — it would #GP), so we pin the SAFE path:
+   deinit frees the nodes (no leak), leaves the struct reusable, and _full also
+   frees element data. */
+static void
+test_queue_deinit(void)
+{
+    AxlMemStats before, after;
+
+    /* deinit: frees all nodes, does NOT free the struct (reusable in place). */
+    axl_mem_get_stats(&before);
+    AxlQueue sq = AXL_QUEUE_INIT;
+    axl_queue_push_tail(&sq, (void *)1);
+    axl_queue_push_tail(&sq, (void *)2);
+    axl_queue_push_tail(&sq, (void *)3);
+    test_check(axl_queue_get_length(&sq) == 3, "queue deinit: 3 elems pushed");
+    axl_queue_deinit(&sq);
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "queue deinit: frees all nodes (no leak)");
+    test_check(axl_queue_is_empty(&sq) && axl_queue_get_length(&sq) == 0,
+               "queue deinit: empty after deinit");
+    test_check(axl_queue_push_tail(&sq, (void *)7) == AXL_OK,
+               "queue deinit: struct reusable after deinit");
+    test_check((intptr_t)axl_queue_pop_head(&sq) == 7,
+               "queue deinit: reused queue works");
+    axl_queue_deinit(&sq);
+
+    axl_queue_deinit(NULL);   /* NULL-safe */
+
+    /* deinit_full: frees element data too, struct still not freed. */
+    axl_mem_get_stats(&before);
+    AxlQueue dq = AXL_QUEUE_INIT;
+    for (int i = 0; i < 3; i++) {
+        void *p = axl_malloc(16);
+        test_check(p != NULL, "queue deinit_full: data alloc");
+        axl_queue_push_tail(&dq, p);
+    }
+    axl_queue_deinit_full(&dq, queue_free_data);
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count,
+               "queue deinit_full: frees nodes AND element data (no leak)");
+    test_check(axl_queue_is_empty(&dq), "queue deinit_full: empty after");
+
+    axl_queue_deinit_full(NULL, queue_free_data);   /* NULL-safe */
+}
+
 // ---------------------------------------------------------------------------
 // Extended List Tests
 // ---------------------------------------------------------------------------
@@ -2021,7 +2077,7 @@ typedef struct {
 // Deterministic synthetic fill: page p, byte i -> (p*31 + i). No file
 // needed, so this runs identically on both arches with no fs0: SKIP.
 static int64_t
-pc_fill(void *user, size_t page_index, void *dst, size_t cap)
+pc_fill(size_t page_index, void *dst, size_t cap, void *user)
 {
     PcFill *s = (PcFill *)user;
     s->calls++;
@@ -2134,7 +2190,7 @@ test_page_cache(void)
 // Owner-distinguishing fill: content = tag(*user) + page*31 + i, so the
 // same page index produces different bytes for different owners.
 static int64_t
-pc_owner_fill(void *user, size_t page_index, void *dst, size_t cap)
+pc_owner_fill(size_t page_index, void *dst, size_t cap, void *user)
 {
     uint8_t tag = *(const uint8_t *)user;
     uint8_t *d = (uint8_t *)dst;
@@ -2355,7 +2411,7 @@ test_rb_tree(void)
 {
     AxlRBTree t;
     axl_rb_tree_init(&t, rb_recompute, NULL);
-    test_check(axl_rb_tree_empty(&t), "rbtree: empty after init");
+    test_check(axl_rb_tree_is_empty(&t), "rbtree: empty after init");
     test_check(axl_rb_first(&t) == NULL && axl_rb_last(&t) == NULL,
                "rbtree: first/last NULL when empty");
 
@@ -2451,7 +2507,7 @@ test_rb_tree(void)
     while ((it = axl_rb_first(&t)) != NULL) {
         axl_rb_erase(&t, it);
     }
-    test_check(axl_rb_tree_empty(&t), "rbtree: empty after erasing all");
+    test_check(axl_rb_tree_is_empty(&t), "rbtree: empty after erasing all");
 
     // NULL recompute = plain balanced tree (no augmentation work).
     AxlRBTree t2;
@@ -4479,7 +4535,7 @@ roundtrip_compress(AxlCompressFormat fmt, int level,
 {
     void  *comp = NULL;
     size_t comp_len = 0;
-    if (axl_compress(fmt, data, len, &comp, &comp_len, level) != AXL_OK) {
+    if (axl_compress(fmt, data, len, level, &comp, &comp_len) != AXL_OK) {
         test_fail(label);
         return (size_t)-1;
     }
@@ -4593,8 +4649,8 @@ test_lzma_roundtrip(void)
     {
         void  *c = NULL, *p = NULL;
         size_t cl = 0, pl = 0;
-        int rc = axl_compress(AXL_COMPRESS_LZMA, "", 0, &c, &cl,
-                              AXL_COMPRESS_LEVEL_DEFAULT);
+        int rc = axl_compress(AXL_COMPRESS_LZMA, "", 0,
+                              AXL_COMPRESS_LEVEL_DEFAULT, &c, &cl);
         test_check(rc == AXL_OK, "lzma roundtrip: empty compress ok");
         if (rc == AXL_OK) {
             rc = axl_decompress(AXL_COMPRESS_LZMA, c, cl, &p, &pl);
@@ -4609,8 +4665,8 @@ test_lzma_roundtrip(void)
     {
         void  *c = NULL, *p = NULL;
         size_t cl = 0, pl = 0;
-        int rc = axl_compress(AXL_COMPRESS_LZMA, "a", 1, &c, &cl,
-                              AXL_COMPRESS_LEVEL_DEFAULT);
+        int rc = axl_compress(AXL_COMPRESS_LZMA, "a", 1,
+                              AXL_COMPRESS_LEVEL_DEFAULT, &c, &cl);
         test_check(rc == AXL_OK, "lzma roundtrip: 1-byte compress ok");
         if (rc == AXL_OK) {
             rc = axl_decompress(AXL_COMPRESS_LZMA, c, cl, &p, &pl);
@@ -4631,8 +4687,8 @@ test_lzma_roundtrip(void)
                 in[i] = (uint8_t)(i & 0xFFu);
             void  *c = NULL, *p = NULL;
             size_t cl = 0, pl = 0;
-            int rc = axl_compress(AXL_COMPRESS_LZMA, in, len, &c, &cl,
-                                  AXL_COMPRESS_LEVEL_DEFAULT);
+            int rc = axl_compress(AXL_COMPRESS_LZMA, in, len,
+                                  AXL_COMPRESS_LEVEL_DEFAULT, &c, &cl);
             test_check(rc == AXL_OK, "lzma roundtrip: 64KB compress ok");
             if (rc == AXL_OK) {
                 rc = axl_decompress(AXL_COMPRESS_LZMA, c, cl, &p, &pl);
@@ -4722,8 +4778,8 @@ test_compress_gzip_framing(void)
     size_t len = 41;
     void  *gz = NULL;
     size_t gz_len = 0;
-    if (axl_compress(AXL_COMPRESS_GZIP, data, len, &gz, &gz_len,
-                     AXL_COMPRESS_LEVEL_DEFAULT) != AXL_OK) {
+    if (axl_compress(AXL_COMPRESS_GZIP, data, len,
+                     AXL_COMPRESS_LEVEL_DEFAULT, &gz, &gz_len) != AXL_OK) {
         test_fail("compress gzip framing: compress");
         return;
     }
@@ -4798,8 +4854,8 @@ test_compress_errors(void)
                "compress error: corrupt gzip body caught (CRC/inflate)");
 
     /* NULL output pointer. */
-    test_check(axl_compress(AXL_COMPRESS_GZIP, "x", 1, NULL, &out_len,
-                            AXL_COMPRESS_LEVEL_DEFAULT) == AXL_ERR,
+    test_check(axl_compress(AXL_COMPRESS_GZIP, "x", 1,
+                            AXL_COMPRESS_LEVEL_DEFAULT, NULL, &out_len) == AXL_ERR,
                "compress error: NULL out pointer rejected");
 
     /* Forged gzip ISIZE claiming ~4 GiB → must be rejected by the
@@ -4962,8 +5018,8 @@ test_compress_reader(void)
     /* Generic format param (zlib) also works. */
     void  *zl = NULL;
     size_t zln = 0;
-    axl_compress(AXL_COMPRESS_ZLIB, data, len, &zl, &zln,
-                 AXL_COMPRESS_LEVEL_DEFAULT);
+    axl_compress(AXL_COMPRESS_ZLIB, data, len,
+                 AXL_COMPRESS_LEVEL_DEFAULT, &zl, &zln);
     AxlStream *zsrc = axl_bufopen();
     axl_write(zsrc, zl, zln);
     axl_fseek(zsrc, 0, AXL_SEEK_SET);
@@ -5660,6 +5716,7 @@ test_data_main(int argc, char **argv)
     test_slist();
     test_list();
     test_queue();
+    test_queue_deinit();
     test_list_extended();
     test_slist_extended();
     test_queue_extended();

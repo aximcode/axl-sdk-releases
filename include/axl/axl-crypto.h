@@ -96,12 +96,12 @@ typedef enum {
     AXL_PK_RSA        = 2,   /**< RSA with PKCS#1 v1.5 over SHA-256
                                  (rsa-sha2-256). Keygen produces a 3072-bit
                                  key. Supported by the key-handle API
-                                 (axl_pk_keygen / _sign / _verify); NOT by
+                                 (axl_pk_key_new / _sign / _verify); NOT by
                                  the raw-bytes axl_pk_verify() below. */
     AXL_PK_ECDSA_P384 = 3    /**< ECDSA over NIST P-384 (secp384r1) with
                                  SHA-384 (the hash follows the curve). Like
                                  P-256 it is supported by the key-handle API
-                                 (axl_pk_keygen / _sign / _verify); NOT by
+                                 (axl_pk_key_new / _sign / _verify); NOT by
                                  the raw-bytes axl_pk_verify(). Its
                                  #AXL_PK_SIG_RAW signature is r||s = 96
                                  bytes (48-byte order each). */
@@ -165,7 +165,7 @@ axl_pk_available(void);
  *     NULL/zero-length key or signature, unsupported algorithm, or
  *     verification not compiled in (see axl_pk_available()).
  */
-int
+AXL_WARN_UNUSED int
 axl_pk_verify(
     AxlPkAlg       alg,         ///< signature algorithm
     const uint8_t *pubkey,      ///< public key bytes (encoding per @p alg)
@@ -187,13 +187,13 @@ axl_pk_verify(
 // section operates on.
 //
 // All of these require an AXL_TLS=1 build (mbedTLS); without it
-// axl_pk_keygen / _load_* return NULL and the operations return AXL_ERR
+// axl_pk_key_new / _load_* return NULL and the operations return AXL_ERR
 // (see axl_pk_available()).
 
 /**
  * @brief An opaque public-key key pair (or public-only key).
  *
- * Holds a private key (from axl_pk_keygen / axl_pk_key_load_private) or
+ * Holds a private key (from axl_pk_key_new / axl_pk_key_load_private) or
  * a public key only (from axl_pk_key_load_public). Free with
  * axl_pk_key_free().
  */
@@ -211,7 +211,7 @@ typedef struct AxlPkKey AxlPkKey;
  *     or NULL on failure / unsupported algorithm / TLS not compiled in.
  */
 AxlPkKey *
-axl_pk_keygen(
+axl_pk_key_new(
     AxlPkAlg  alg  ///< key algorithm to generate
 );
 
@@ -338,7 +338,7 @@ axl_pk_key_sign(
  *
  * @return AXL_OK if the signature is valid; AXL_ERR otherwise.
  */
-int
+AXL_WARN_UNUSED int
 axl_pk_key_verify(
     const AxlPkKey *key,      ///< verifying key
     const uint8_t  *msg,      ///< message bytes (NULL iff @p msg_len == 0)
@@ -401,7 +401,7 @@ typedef enum {
  * @return AXL_OK on success; AXL_ERR on bad args, a key/nonce/tag length
  *     mismatch, or TLS not compiled in.
  */
-int
+AXL_WARN_UNUSED int
 axl_aead_seal(
     AxlAeadAlg     alg,         ///< AEAD algorithm
     const uint8_t *key,         ///< key (length per @p alg)
@@ -430,7 +430,7 @@ axl_aead_seal(
  * @return AXL_OK if the tag is valid and decryption succeeded; AXL_ERR
  *     otherwise (bad tag, bad args, length mismatch, or TLS not built).
  */
-int
+AXL_WARN_UNUSED int
 axl_aead_open(
     AxlAeadAlg     alg,         ///< AEAD algorithm
     const uint8_t *key,         ///< key (length per @p alg)

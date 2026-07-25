@@ -10,8 +10,9 @@ Headers:
 - `<axl/axl-time.h>` — Wall-clock time (read + set the RTC) and monotonic timestamps
 - `<axl/axl-nvstore.h>` — Portable NVRAM key-value storage
 - `<axl/axl-boot.h>` — Boot-option management (Boot####/BootOrder/BootNext/BootCurrent)
-- `<axl/axl-port.h>` — x86 I/O port access (`in`/`out`)
+- `<axl/axl-io-port.h>` — x86 I/O port access (`in`/`out`)
 - `<axl/axl-driver.h>` — Driver binding and lifecycle
+- `<axl/axl-driver-deps.h>` — Transitive driver-dependency resolution over a JSON5 sidecar
 - `<axl/axl-image.h>` — Executable-image lifecycle (load/start/unload)
 - `<axl/axl-mem-phys.h>` — Physical-memory map/unmap + one-shot read/write
 - `<axl/axl-watchdog.h>` — Boot-services watchdog control
@@ -107,13 +108,32 @@ prefix):
 
 ```c
 extern const AxlGuid AXL_OEM_VENDOR_GUID;  // declared per-vendor
-axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID);
+if (axl_nvstore_register_namespace("oem", &AXL_OEM_VENDOR_GUID) != AXL_OK) {
+    return AXL_ERR;   // must-check: an unregistered namespace fails every access
+}
 axl_nvstore_get("oem", "AssetTag", buf, &sz);
 ```
 
+Registration is keyed by name and matched on the **GUID bytes**, not
+the token address, so two translation units that each keep their own
+`static const AxlGuid` for one shared namespace both register
+successfully and address the same storage — a rejected second
+registration used to leave that TU's reads and writes pointing at an
+unregistered namespace with only a log line to say so. Only a genuine
+collision (same name, different GUID) is refused. The *first*
+registration's pointer is the one the table keeps, and it must outlive
+the program: the table stores the pointer, not a copy.
+
+`axl_nvstore_register_namespace` is the one must-check
+(`AXL_WARN_UNUSED`) call in this module — the `get`/`set` family is
+deliberately not, because `get`'s size-query idiom returns an error by
+design and write sites are commonly best-effort.
+
 Other operations: `axl_nvstore_delete`, `axl_nvstore_iter` (walk
 all keys in a namespace), `axl_nvstore_get_attrs` (read AXL_NV_*
-flags without reading the value).
+flags without reading the value). All of them fail with `AXL_ERR` and
+a warning on an unregistered namespace — none of them silently
+succeeds.
 
 ### Boot Options
 
@@ -236,10 +256,110 @@ EFI_STATUS EFIAPI DriverEntry(EFI_HANDLE ImageHandle,
 
 See `sdk/examples/driver.c` for a complete example.
 
+### Surviving a Driver That Hangs the Box (AxlAttempt)
+
+Loading an arbitrary `.efi` is the riskiest thing a tool does. A bad
+driver does not politely return an error — it hangs or resets the
+machine. Nothing is written down, and the next boot walks the same
+directory in the same order and dies in the same place. That is an
+unbreakable boot loop with no record of what caused it.
+
+`<axl/axl-attempt.h>` breaks the loop with a durable breadcrumb: the
+name of the thing about to be tried is written to NVRAM *before* trying
+it. A breadcrumb that outlives its attempt is the culprit — the box
+never got back to erase it — so the next boot quarantines that name and
+skips it from then on.
+
+```c
+static const AxlGuid MY_GUID = AXL_GUID(0x11223344, ...);
+AxlAttempt at;
+axl_attempt_init(&at, "myloader", &MY_GUID);
+
+char culprit[64];
+if (axl_attempt_recover(&at, culprit, sizeof culprit) == 1) {
+    axl_printf("last boot died on %s -- quarantined\n", culprit);
+}
+axl_attempt_begin(&at, "Nic.efi");     // breadcrumb BEFORE the hazard
+int rc = axl_driver_load("fs0:\\drivers\\Nic.efi", &drv);
+axl_attempt_end(&at);                  // survived
+axl_attempt_log(&at, rc == 0 ? "OK Nic.efi" : "LOADFAIL Nic.efi");
+```
+
+The engine is storage-shaped, not policy-shaped: the caller supplies the
+namespace, the vendor GUID, the key names and the size bounds, so two
+consumers on one box cannot collide, and a consumer with state already
+on disk names it exactly and keeps it. Log lines are opaque — the
+outcome vocabulary and its rendering belong to the caller.
+
+Whole-directory sweeps get this without wiring it up by hand:
+`axl_driver_load_dir_guarded(dir, pattern, &at, &n)` is
+`axl_driver_load_dir` plus the guard — it recovers a prior crash up
+front, skips anything already quarantined, and breadcrumbs each driver
+by filename around its load. Passing `NULL` for the guard is exactly the
+unprotected `axl_driver_load_dir`.
+
+This is complementary to `<axl/axl-crashrecord.h>`, not an alternative.
+A crash handler dumps registers and a stack trace when an *exception*
+fires, which is far richer than a name — but a hang raises no exception
+and a reset runs no handler, so it captures nothing. The breadcrumb
+covers exactly the case the crash handler cannot see.
+
 For long-running services (cross-binary marshalling, structured
 setup/teardown, foreground or driver-tick deployment), see
 [AxlService](../service/README.md) — the lifecycle wrapper over
 AxlLoop that composes axl-driver + axl-config + axl-loop.
+
+### Loading Drivers in the Right Order (AxlDriverDeps)
+
+Some drivers only produce a usable device once another driver is already
+resident — a USB-NIC whose personality driver (RNDIS/CDC) must load
+first, an option-ROM that needs a bus shim. A staging tool loading
+`.efi` files one at a time cannot know that ordering from the binaries
+alone. `<axl/axl-driver-deps.h>` reads it from a small JSON5 *sidecar*
+that ships next to the drivers:
+
+```js
+{ schema: 1, drivers: [
+    { name: 'Nic.efi',  requires: [ 'Comp.efi' ] },
+    { name: 'Comp.efi', requires: [ 'SubComp.efi' ] }
+] }
+```
+
+`axl_driver_deps_load(dir, filename, schema_tag, &deps)` parses it (the
+filename and schema tag are parameters, so the on-disk format is
+caller-defined and no tool's file name is baked into the library), and
+`axl_driver_deps_walk(&deps, "Nic.efi", &visitor)` traverses the
+target's dependency subtree in dependencies-first (post-order) order,
+with its own cycle protection. The library owns *only* the parse and the
+traversal; what "bring a dependency resident" means — load, breadcrumb,
+quarantine-check, log — stays with the caller, supplied as an
+`AxlDriverDepVisitor`:
+
+```c
+static bool dep_enter(const char *dep, const char *parent, void *ctx) {
+    if (already_resident(dep)) return false;   // skip dep AND its subtree
+    return true;                               // descend + load
+}
+static void dep_load(const char *dep, const char *parent, void *ctx) {
+    axl_attempt_begin(&at, dep);               // breadcrumb THIS dep
+    load_driver_from((const char *)ctx, dep);  // ctx = directory
+    axl_attempt_end(&at);
+}
+
+AxlDriverDeps deps;
+if (axl_driver_deps_load(dir, "my-drivers.json5", "mytool",
+                         &deps) == AXL_SIDECAR_OK) {
+    AxlDriverDepVisitor v = { dep_enter, dep_load, (void *)dir };
+    axl_driver_deps_walk(&deps, "Nic.efi", &v);   // loads Comp's chain, each breadcrumbed
+}
+```
+
+Because `load` fires per dependency (not once for the whole subtree), a
+consumer can wrap each dependency in its own `AxlAttempt` breadcrumb, so
+a hang inside a co-loaded driver still pins exactly which one.
+`axl_driver_deps_is_required(&deps, name)` answers "is this a dependency
+driver (auto-loaded on demand) rather than a top-level pick?" for
+menu/candidate filtering.
 
 ### Driver Discovery
 
@@ -313,14 +433,20 @@ axl_handle_children(controller, kids, cap, &n);
 axl_handle_parents(controller, parents, cap, &n);   // count 0 == a root
 ```
 
-`axl_net_protocol_name` names just the networking stack (and rejects
-non-net GUIDs, so a caller can decide "is this a net protocol?");
-`axl_protocol_guid_name` is the broader Devices-tab namer — it consults
-the net table first, then the common device / driver / bus / console
-protocols (DevicePath, LoadedImage, DriverBinding, ComponentName2,
-SimpleFileSystem, BlockIo, DiskIo, PciIo, GraphicsOutput, SerialIo,
-UsbIo, NvmExpressPassThru, AtaPassThru, …), falling back to AXL_ERR so
-the caller formats the raw GUID for anything unrecognised.
+`axl_net_protocol_name` names just the networking stack in short labels
+(`"Tcp4"`, and rejects non-net GUIDs, so a caller can decide "is this a
+net protocol?"). `axl_protocol_guid_name` is the broad namer, and it
+returns the **canonical spec identifier** — the exact name the UEFI/PI
+headers use (`"EFI_RAM_DISK_PROTOCOL"`, `"EFI_SIMPLE_FILE_SYSTEM_PROTOCOL"`)
+— from a table generated with AXL's UEFI headers (~320 GUIDs, in
+`include/uefi/generated/guid-names.h`). A protocol GUID resolves to its
+type name (macro minus `_GUID`); a non-protocol GUID keeps its full
+`_GUID` name; an unknown GUID is AXL_ERR so the caller formats the raw
+value. `axl_protocol_name_count` + `axl_protocol_name_at` enumerate the
+whole table (the `lsproto -a` dictionary; a name → GUID reverse lookup).
+The `tools/lsproto` protocol lister is the thin renderer over this: it
+walks the live handle database and names each GUID this way — the spec
+spelling `dh decode`'s short curated labels don't give.
 
 Where the stack lands is platform-dependent: on the QEMU/OVMF test
 platform the per-controller config protocols (`Ip4Config2`) sit on the
@@ -373,7 +499,14 @@ When nothing is staged, `axl_shell_launch_fv` runs the
 firmware-embedded Shell straight out of a Firmware Volume — no
 `Shell.efi` file needed — and `axl_shell_locate` reports where a Shell
 is available (`AXL_SHELL_FILE` / `AXL_SHELL_FIRMWARE` / `AXL_SHELL_NONE`)
-without launching one. Where those two ask "can a Shell be *launched*",
+without launching one. `axl_shell_locate` is file-first: a locatable
+`Shell.efi` reports `AXL_SHELL_FILE` and *masks* the firmware FV Shell.
+A consumer with an **FV-first** policy (prefer the firmware Shell, fall
+back to a file only where the firmware carries none) calls
+`axl_shell_sources(&out)` instead — it fills `AxlShellSources` with each
+source independently (`file` + `file_path`, `fv` + `fv_count`), so the FV
+stays visible even when a foreign `Shell.efi` also exists. Where those
+ask "can a Shell be *launched*",
 `axl_shell_kind()` asks "which Shell is *hosting* us right now" —
 returning `AXL_SHELL_KIND_UEFI` for the modern EDK2 Shell
 (`EFI_SHELL_PROTOCOL`), `AXL_SHELL_KIND_EFI_1X` for the old EFI 1.x shell
@@ -381,7 +514,17 @@ returning `AXL_SHELL_KIND_UEFI` for the modern EDK2 Shell
 `SHELL_INTERFACE` instead), or `AXL_SHELL_KIND_NONE` under BDS / a driver
 / minimal firmware. It is the single branch point for behavior that
 differs between the two shells (e.g. whether a programmatic map injection
-is honored). The reusable primitive underneath the FV launchers is
+is honored). Where the launchers run a Shell as a *child image*,
+`axl_shell_execute("drivers")` runs one command line through the Shell
+that is already hosting you and waits for it to finish — the way to
+reach a shell built-in (`drivers`, `dh`, `map`) that has no protocol
+equivalent. It takes UTF-8, converts internally, and works on both shell
+generations: `EFI_SHELL_PROTOCOL.Execute` on the modern EDK2 Shell, with
+a fallback to the EFI 1.x `SHELL_ENVIRONMENT.Execute`. It returns
+`AXL_ERR` when no shell is hosting the image at all (BDS, a driver),
+which is the case to handle — the command simply cannot run there.
+
+The reusable primitive underneath the FV launchers is
 `axl_image_run_fv_file(name_guid, args, &exit)`, which loads + runs any
 `EFI_FV_FILETYPE_APPLICATION` by its FFS file GUID. Pair any of these
 with `AxlConsoleMirror` (`<axl/axl-console-mirror.h>`) to mirror the
@@ -585,6 +728,20 @@ protocol, the image is unloaded and the search continues. This
 lets tools work whether they're invoked from a bare UEFI shell, a
 boot menu, or a `startup.nsh` that has already eager-loaded the
 driver.
+
+When the caller already knows exactly which file it wants, the search
+is not a convenience but a hazard: two copies of the same driver
+filename on one box means the search order, not the caller, picks the
+winner. Note the order above — a launcher sitting at the volume root
+has no usable image directory, so its own root-level sibling is only
+candidate #4 while a stale `drivers/<arch>/<name>` is candidate #2 and
+wins. `axl_driver_ensure_from_path` takes the search out of the
+picture: it short-circuits on an already-registered protocol exactly
+like `axl_driver_ensure`, then loads, starts, and verifies **that one
+path** — no search, no embedded fallback. (`override_name` does not
+cover this: it substitutes a *name* into the same search, so it cannot
+separate two files that share a name.) `AxlServiceDeploy.driver_path`
+is the AxlService-level form of the same thing.
 
 For a launcher that must pair with an exact, version-pinned driver
 staged beside it (no fallback to `drivers/`, no cross-volume search),
@@ -808,6 +965,15 @@ returns its default. The format is ASCII `key=value`, one per line, with
 whitespace. The `prefix.key` dot is just a naming convention — the map is
 flat; the caller joins the prefix.
 
+The file is not the only place a `key=value` map can live.
+`axl_config_file_parse_string(cf, text)` parses text already in memory,
+and `axl_config_file_to_string(cf, buf, cap)` serializes the map back
+out to a caller buffer — the same grammar, no filesystem involved. That
+is what a config kept in an NVRAM variable (or received over the wire,
+or embedded in an image) needs: read the blob, parse it, edit the map
+with the same typed getters and setters, serialize it, write the blob
+back. `axl_config_file_load` / `_save` are these two plus file I/O.
+
 ## Command-Line Parsing (AxlArgs)
 
 Declarative CLI parser — the tool declares a static `AxlArgsNode`
@@ -1027,6 +1193,51 @@ numeric values, copy variadic-positional pointers if you need them
 past handler return. Never call `axl_args_get_*` from a loop
 callback that fires after the handler returns — extract everything
 into local state inside the handler first.
+
+### Hidden flags
+
+Set `.hidden = true` on a flag or positional to omit it from `--help`
+entirely — it is still parsed and accepted normally, and it does not affect
+the help column width. This is for internal test/diagnostic knobs that would
+clutter a user-facing usage block (e.g. a tool's headless-test seams):
+
+```c
+{ .name = "_hmap", .type = AXL_ARG_BOOL, .hidden = true,
+  .help = "dump SNP vs IP4Config2 handle order (test seam)" },  // dev-facing only
+```
+
+### Non-framework tools: the shared `--help` / `--version` hooks
+
+A few tools do not use `axl_args_run` — POSIX bundled-option parsers
+(`sed`), resident-driver launchers (`fbcon`), custom sub-command
+dispatchers (`fwtool`). They still answer `-h`/`--help` and
+`--version`/`-V` uniformly via two shared hooks in `<axl/axl-version.h>`:
+
+- `axl_version_handle(prog, argc, argv)` — invoked automatically by the
+  `AXL_TOOL_MAIN` macro, so *every* tool answers `--version`/`-V` with
+  `"<tool> <version>"` whether or not it uses the framework.
+- `axl_help_handle(prog, tagline, usage, argc, argv)` — the help partner,
+  called explicitly at the top of a non-framework tool's `main`. It prints
+  the SAME identity header the framework's `-h` renders
+  (`"<tool> <version> - <tagline>"`) followed by a `Usage:` synopsis, so
+  `<tool> -h` looks identical no matter which mechanism a tool uses. (It is
+  deliberately NOT in `AXL_TOOL_MAIN`: framework tools must keep their own
+  richer per-flag `-h`.)
+
+```c
+int
+main(int argc, char **argv)
+{
+    if (axl_help_handle("sed", "Stream editor (POSIX + GNU extensions)",
+                        "sed [-n] [-E] [-e script]... [file...]", argc, argv)) {
+        return 0;
+    }
+    /* ... tool's own option parsing ... */
+}
+```
+
+Both hooks share one source of truth for the header line, so the framework
+and hook renderings can never drift.
 
 ## Path Manipulation
 

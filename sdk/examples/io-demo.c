@@ -53,17 +53,28 @@ main(int argc, char **argv)
 
     /* ---- 3. Stream write ---- */
 
+    /* Writing: FLUSH and check it, then close. axl_fclose drains AXL's own
+       buffer but never calls the stream's flush, and closing a file cannot
+       report a failure at all (EFI_FILE_PROTOCOL.Close is specified to
+       return only EFI_SUCCESS) -- so a full volume or write-protected media
+       is invisible unless you ask. This is the pattern to copy for any
+       output whose loss would matter. */
     AxlStream *f = axl_fopen("test2.txt", "w");
     if (f) {
         for (int i = 1; i <= 5; i++) {
             axl_fprintf(f, "line %d\n", i);
         }
+        bool durable = (axl_fflush(f) == AXL_OK);
         axl_fclose(f);
-        axl_printf("wrote test2.txt with 5 lines\n");
+        axl_printf("wrote test2.txt with 5 lines: %s\n",
+                   durable ? "ok" : "FAILED (did not reach the volume)");
     }
 
     /* ---- 4. Stream read ---- */
 
+    /* Reading: a bare axl_fclose IS right here -- a read stream holds no
+       dirty state, so there is nothing to flush. Only the write above needs
+       the extra step. */
     f = axl_fopen("test2.txt", "r");
     if (f) {
         char buf[256];

@@ -32,6 +32,7 @@ TEST_QEMU_PID=0
 TEST_ECHO_PID=""
 TEST_ECHO_PORT=""
 TEST_UDP_ECHO_PID=""
+TEST_CPU_SPIKE=0
 
 # ---------------------------------------------------------------------------
 # Arg parsing
@@ -83,6 +84,15 @@ test_setup() {
     # Copy NVRAM template
     cp "$FW_VARS" "$TEST_NVRAM"
 
+    # CPU-spike policy — shared with run-qemu.sh via cpu_policy_init (axl-common.sh),
+    # which picks the KVM/TCG-aware threshold (0.5), warm-up and warn carve-out (see
+    # its comment for the measured rationale). TEST_CPU_* env vars override per run.
+    CPU_WARN="${TEST_CPU_WARN:-}"
+    CPU_THRESHOLD="${TEST_CPU_THRESHOLD:-}"
+    cpu_policy_init "$TEST_ARCH"
+    CPU_WARMUP="${TEST_CPU_WARMUP:-$CPU_WARMUP}"
+    CPU_SUSTAIN="${TEST_CPU_SUSTAIN:-$CPU_SUSTAIN}"
+
     # Cleanup trap. Include INT/TERM, not just EXIT: a `timeout` wrapper's
     # SIGTERM would otherwise bypass EXIT and leak the (40 MB) scratch dir.
     trap 'test_cleanup' EXIT INT TERM
@@ -93,6 +103,10 @@ test_cleanup() {
         kill "$TEST_QEMU_PID" 2>/dev/null || true
         wait "$TEST_QEMU_PID" 2>/dev/null || true
     fi
+    # Summarize the CPU sampler for background runs, where QEMU only dies
+    # here. Foreground runs already summarized in test_run_foreground; the
+    # call is a no-op once the monitor globals are cleared.
+    test_cpu_check || true
     if [[ -n "${TEST_ECHO_PID:-}" ]] && kill -0 "$TEST_ECHO_PID" 2>/dev/null; then
         kill "$TEST_ECHO_PID" 2>/dev/null || true
         wait "$TEST_ECHO_PID" 2>/dev/null || true
@@ -166,40 +180,13 @@ test_build_image() {
     local shell_efi
     shell_efi=$(find_shell_efi "$TEST_ARCH") || true
     if [[ -n "$shell_efi" && -f "$shell_efi" ]]; then
-        mkdir -p "$TEST_STAGING/EFI/BOOT"
-        cp "$shell_efi" "$TEST_STAGING/EFI/BOOT/$TEST_BOOT_NAME"
+        # Boot the Shell via the AXL launcher ("-delay 0", skips the 5 s startup
+        # countdown); see stage_boot_shell in axl-common.sh.
+        stage_boot_shell "$TEST_STAGING" "$TEST_ARCH" "$TEST_BOOT_NAME" "$shell_efi"
     fi
 
-    if [[ -n "${MKIMAGE_DIR:-}" && -f "$MKIMAGE_DIR/mkimage.py" ]]; then
-        "$MKIMAGE_DIR/mkimage.py" \
-            --source "$TEST_STAGING" \
-            --target "$TEST_DISK" \
-            --label TEST 2>/dev/null
-    else
-        # Fallback: create FAT32 image with standard tools.
-        # mcopy -s -p recurses and preserves attributes; passing
-        # individual top-level entries lets it auto-create the
-        # destination directory tree (per-file `mmd ::/EFI/BOOT`
-        # doesn't work because mmd refuses to create intermediate
-        # parents and the per-file loop hits set-e on the first
-        # unwritable nested file).
-        local size_kb
-        size_kb=$(du -sk "$TEST_STAGING" | cut -f1)
-        size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))  # round up to nearest MB
-        [[ $size_kb -lt 40960 ]] && size_kb=40960       # minimum 40MB
-        dd if=/dev/zero of="$TEST_DISK" bs=1K count="$size_kb" 2>/dev/null
-        mkfs.vfat -F 32 -n TEST "$TEST_DISK" >/dev/null 2>&1
-        # Recursive copy of every top-level entry under STAGING.
-        # `find -maxdepth 1` to enumerate top-level files and dirs,
-        # then mcopy -s for each (recursive). Run within STAGING so
-        # the destination paths come out at the FAT root.
-        (
-            cd "$TEST_STAGING" || exit 1
-            for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
-                mcopy -s -i "$TEST_DISK" "$entry" "::/" 2>/dev/null
-            done
-        )
-    fi
+    # Shared with run-qemu.sh — see qemu_stage_disk in axl-common.sh.
+    qemu_stage_disk "$TEST_STAGING" "$TEST_DISK" TEST || exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -260,20 +247,8 @@ test_build_qemu_cmd() {
     # DEBUG output (port 0x402) which scripts/gdb-syms.py needs to
     # recover module load addresses.
     if [[ -n "${TEST_QEMU_GDB:-}" ]]; then
-        # Strip -enable-kvm / -cpu host (mirroring run-qemu.sh): KVM
-        # is incompatible with single-stepping early-boot instructions,
-        # so the GDB stub falls back to TCG.
-        local _filtered=()
-        local _skip=0
-        for _arg in "${TEST_QEMU_CMD[@]}"; do
-            if [[ $_skip -gt 0 ]]; then _skip=$((_skip-1)); continue; fi
-            case "$_arg" in
-                -enable-kvm) ;;          # drop
-                -cpu)        _skip=1 ;;  # drop with its value
-                *)           _filtered+=("$_arg") ;;
-            esac
-        done
-        TEST_QEMU_CMD=("${_filtered[@]}")
+        # TCG fallback for single-stepping — shared with run-qemu.sh.
+        qemu_strip_kvm TEST_QEMU_CMD
         TEST_QEMU_CMD+=(-gdb "tcp::${TEST_QEMU_GDB}")
         log_info "QEMU GDB stub on tcp::${TEST_QEMU_GDB} (KVM disabled, TCG)"
     fi
@@ -295,23 +270,54 @@ _test_nic_device() {
     fi
 }
 
-# Per-worker host-port allocation. run-integration.sh exports a distinct
-# TEST_PORT_BASE per concurrent worker so parallel tests never collide on a
-# host port; a standalone invocation falls back to a fixed base, preserving
-# today's behavior. A test derives each host port it needs as
-# `test_port <slot>` (slot 0, 1, 2, ...). The same TEST_PORT_BASE drives both
-# the host-side server and the value baked into the guest's startup.nsh, so the
-# two always agree within a single test run.
-: "${TEST_PORT_BASE:=18000}"
+# Host-port allocation. A test derives each host port it needs as
+# `test_port <slot>` (slot 0, 1, 2, ...). The same value drives both the
+# host-side server and the number baked into the guest's startup.nsh, so the
+# two always agree within a single test run — which is why each slot is
+# resolved ONCE and cached for the life of the test.
+#
+# Two modes:
+#
+#   - TEST_PORT_BASE set explicitly  -> `TEST_PORT_BASE + slot`, verbatim.
+#     A caller that pins the base has a reason (reproducing a capture,
+#     matching a firewall rule) and owns the consequences.
+#
+#   - TEST_PORT_BASE unset (the norm) -> the base is claimed HERE, at source
+#     time, as a contiguous run of TEST_PORT_SLOTS ports that are verified
+#     free at that moment and held for the test's lifetime. This is what
+#     makes two INDEPENDENT suite runs safe: an arithmetic base only keeps
+#     one invocation self-consistent, and every invocation starts from the
+#     same constants.
+#
+# The claim is taken here, in the test's own shell, and NOT inside
+# test_port. Call sites are all `HOST_PORT=$(test_port 0)`, and a command
+# substitution runs in a subshell that exits immediately — a claim made
+# there would be released the instant it was granted. Claiming at source
+# time keeps every port held for as long as the test runs, and test_port
+# stays the pure arithmetic every call site already expects.
+TEST_PORT_SLOTS="${TEST_PORT_SLOTS:-4}"
+if [[ -z "${TEST_PORT_BASE:-}" ]]; then
+    axl_alloc_host_port TEST_PORT_BASE "$TEST_PORT_SLOTS" || exit 1
+fi
 test_port() {
     echo $(( TEST_PORT_BASE + ${1:-0} ))
 }
 
-# Add port forwarding: test_add_port_forward HOST_PORT GUEST_PORT
+# Add port forwarding: test_add_port_forward HOST GUEST [HOST GUEST ...]
+#
+# Every pair lands on the SAME netdev — call this once with all of them. A
+# second call would emit a second `-netdev id=net0` and QEMU would reject the
+# duplicate id, so a test needing two forwards passes four arguments rather
+# than calling twice.
 test_add_port_forward() {
+    local fwd=""
+    while [[ $# -ge 2 ]]; do
+        fwd+=",hostfwd=tcp::${1}-:${2}"
+        shift 2
+    done
     TEST_QEMU_CMD+=(
         -device "$(_test_nic_device),netdev=net0"
-        -netdev "user,id=net0,hostfwd=tcp::${1}-:${2}"
+        -netdev "user,id=net0${fwd}"
     )
 }
 
@@ -365,13 +371,13 @@ test_add_network_with_echo() {
     local echo_script
     echo_script="$(dirname "${BASH_SOURCE[0]}")/echo-stream.py"
 
-    # Pick a free host port for the echo server.
+    # Pick a free host port for the echo server. This used to bind port 0,
+    # read the kernel's choice and close again — which leaves the port
+    # unclaimed for the whole gap before echo-stream.py binds it, and draws
+    # from the ephemeral range where an outbound connection can take it.
+    # The allocator claims it and holds the claim until this shell exits.
     if [[ -z "${TEST_ECHO_PORT:-}" ]]; then
-        TEST_ECHO_PORT=$(python3 -c 'import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()')
+        axl_alloc_host_port TEST_ECHO_PORT || return 1
         export TEST_ECHO_PORT
     fi
 
@@ -509,18 +515,121 @@ test_run_foreground() {
     #
     [[ "$TEST_ARCH" == "AARCH64" ]] && timeout_sec=$((timeout_sec + 60))
 
+    # Backgrounded so the CPU sampler can attach to QEMU while it runs. The
+    # pipeline and the `|| true` (a non-zero guest exit is not a harness
+    # failure) are preserved exactly.
     if command -v ts &>/dev/null; then
-        timeout "$timeout_sec" "${TEST_QEMU_CMD[@]}" 2>&1 \
-            | ts -s '[%.s]' > "$TEST_LOG" || true
+        ( timeout "$timeout_sec" "${TEST_QEMU_CMD[@]}" 2>&1 \
+            | ts -s '[%.s]' > "$TEST_LOG" ) &
     else
-        timeout "$timeout_sec" "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 || true
+        ( timeout "$timeout_sec" "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 ) &
     fi
+    local _wrapper=$!
+    cpu_monitor_start "$(_test_qemu_pid)" "$TEST_TMPDIR"
+    wait "$_wrapper" 2>/dev/null || true
+    test_cpu_check || true
+    axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")" || true
+}
+
+# Resolve THIS test's QEMU pid. Matched by the test's own disk image path,
+# which is unique per TEST_TMPDIR — `pgrep -P` cannot be used through the
+# `timeout`+`ts` pipeline, and the comm check keeps the `timeout` wrapper
+# (whose argv also contains the path) from being mistaken for QEMU.
+_test_qemu_pid() {
+    local i pid comm
+    for i in 1 2 3 4 5; do
+        for pid in $(pgrep -f "$TEST_DISK" 2>/dev/null); do
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+            if [[ "$comm" == qemu-system* ]]; then
+                printf '%s' "$pid"
+                return 0
+            fi
+        done
+        sleep 0.2
+    done
+    printf ''
+}
+
+# Summarize the CPU sampler. WARNS but does NOT fail the test by default.
+#
+# The integration pool runs ~25 VMs concurrently and the 1.5-core threshold is
+# one that firmware boot legitimately brushes (measured: a large cluster of
+# short-lived guests peaks 1.4-1.65 cores, all of it inside the warm-up
+# window). Failing on that would make the suite flaky for a signal that is
+# advisory, so the default here is a WARN line plus TEST_CPU_SPIKE=1 — unlike
+# run-qemu.sh, which keeps failing with CPU_SPIKE_EXIT. Set
+# TEST_CPU_SPIKE_FAIL=1 to opt a specific test into failing.
+test_cpu_check() {
+    local rc=0
+    cpu_monitor_finish || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    TEST_CPU_SPIKE=1
+    if [[ "${TEST_CPU_SPIKE_FAIL:-0}" == "1" ]]; then
+        return "$rc"
+    fi
+    return 0
 }
 
 # Run QEMU in background. Sets TEST_QEMU_PID.
+#
+# QEMU's own stderr lands in TEST_LOG alongside the guest serial stream, so a
+# refused -netdev is visible here — but only if someone looks. Nothing did:
+# the test went straight to test_wait_for and reported "server did not start
+# within 60s" a minute later. Check the moment QEMU has had a chance to fail.
 test_run_background() {
-    "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 &
+    if [[ -n "${TEST_STDIN_FD:-}" ]]; then
+        "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 <&"$TEST_STDIN_FD" &
+    else
+        "${TEST_QEMU_CMD[@]}" > "$TEST_LOG" 2>&1 &
+    fi
     TEST_QEMU_PID=$!
+    local i
+    for i in $(seq 1 20); do
+        kill -0 "$TEST_QEMU_PID" 2>/dev/null || break   # died: log is final
+        grep -qa "Could not set up host forwarding rule" "$TEST_LOG" 2>/dev/null && break
+        sleep 0.1
+    done
+    if ! axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")"; then
+        return 1
+    fi
+    # TEST_QEMU_PID is QEMU itself here (no timeout wrapper), so the sampler
+    # can attach directly. test_cleanup summarizes once QEMU is killed.
+    cpu_monitor_start "$TEST_QEMU_PID" "$TEST_TMPDIR"
+}
+
+# ---------------------------------------------------------------------------
+# Guest console INPUT (background runs)
+# ---------------------------------------------------------------------------
+#
+# The harness is otherwise write-once: startup.nsh drives the guest and the
+# host only reads serial. That is enough for anything scriptable, but not for
+# the class of behavior a key press IS — a foreground server ended by Ctrl-C,
+# say, whose whole contract is what happens when a byte arrives on ConIn.
+#
+# test_enable_stdin routes QEMU's stdin from a FIFO this script holds open;
+# `-nographic` multiplexes the guest serial on stdio, so a byte written here
+# is delivered to the guest as a keystroke. QEMU's stdio chardev reserves
+# Ctrl-A (0x01) as its own escape prefix and passes everything else straight
+# through, so 0x03 arrives at ConIn as a real serial Ctrl-C.
+#
+# Call BEFORE test_run_background; the FIFO is opened read-WRITE on this end
+# so QEMU never sees EOF between writes (a write-only open would close after
+# each printf and QEMU would stop watching stdin).
+test_enable_stdin() {
+    local fifo="$TEST_TMPDIR/qemu-stdin.fifo"
+    rm -f "$fifo"
+    mkfifo "$fifo"
+    exec {TEST_STDIN_FD}<>"$fifo"
+}
+
+# test_send_stdin <printf-format>
+#
+# Write raw bytes to the guest console; the argument goes through
+# `printf '%b'`, so escapes like '\003' work. No-op-safe only after
+# test_enable_stdin — calling it without one is a harness bug, and the
+# `set -u` bare expansion below is what makes that loud instead of silent.
+test_send_stdin() {
+    printf '%b' "$1" >&"$TEST_STDIN_FD"
 }
 
 # Wait for a string to appear in the serial log (for background QEMU).
@@ -535,6 +644,9 @@ test_wait_for() {
         fi
         sleep 1
     done
+    # Timed out. Before the caller reports "the server never came up", say so
+    # if the guest never had a network to come up on.
+    axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")" || true
     return 1
 }
 
@@ -549,6 +661,45 @@ test_wait_for() {
 test_clean_log() {
     sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/^\[[0-9]+\.[0-9]+\] //' "$TEST_LOG" \
         | tr -d '\r' > "$TEST_CLEAN_LOG"
+}
+
+# test_slice_log <start-marker> <end-marker> <outfile>
+#
+# Extract the lines strictly between two exact-match `echo` markers in
+# TEST_CLEAN_LOG into <outfile>. Pass "" as <end-marker> to slice from
+# <start-marker> to the end of the log instead of to a second marker.
+#
+# For binding an assertion to the ONE command that must have produced a
+# line, when the same line (a repeated `status` label, say) can legally
+# appear more than once across a run — a whole-log grep would also be
+# satisfied by an earlier/later occurrence that proves nothing. Neither
+# marker line itself is included in the slice.
+#
+# A marker that is not in the log is a HARD error, not an empty slice:
+# renaming an `echo` marker in a startup.nsh without renaming it here would
+# otherwise silently turn every assertion bound to that slice into a no-op —
+# an absence check over zero lines passes, and a presence check fails with a
+# message that blames the tool rather than the harness. Returns 1 (fatal
+# under the `set -e` this file installs) after naming the missing marker.
+test_slice_log() {
+    local start="$1" end="$2" outfile="$3"
+    local m
+    for m in "$start" "$end"; do
+        [[ -z "$m" ]] && continue
+        if ! grep -Fxq "$m" "$TEST_CLEAN_LOG"; then
+            echo "  FAIL: test_slice_log: marker '$m' is not in the serial log" >&2
+            echo "        (the slice would be empty and every assertion over it vacuous)" >&2
+            return 1
+        fi
+    done
+    if [[ -z "$end" ]]; then
+        awk -v s="$start" '$0 == s { on = 1; next } on' \
+            "$TEST_CLEAN_LOG" > "$outfile"
+    else
+        awk -v s="$start" -v e="$end" \
+            '$0 == e { on = 0 } on; $0 == s { on = 1 }' \
+            "$TEST_CLEAN_LOG" > "$outfile"
+    fi
 }
 
 # Count PASS/FAIL from cleaned serial log, print results, exit with status

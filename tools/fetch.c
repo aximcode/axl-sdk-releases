@@ -279,8 +279,15 @@ run_fetch(AxlArgs *a)
         bool auto_name = axl_args_get_bool(a,"remote-name");
 
         if (out_file != NULL) {
-            if (!axl_file_set_contents(out_file, resp->body, resp->body_size)) {
+            /* AXL_OK is 0, so `!rc` reads as SUCCESS -- this pair used to be
+               inverted, announcing a failed write on every save that worked
+               and "Saved N bytes" on the ones that didn't. Compare against
+               AXL_OK explicitly and let a real failure reach the exit code:
+               a tool that could not write the file must not exit 0. */
+            if (axl_file_set_contents(out_file, resp->body, resp->body_size)
+                    != AXL_OK) {
                 axl_printf("Fetch: write '%s' failed\n", out_file);
+                exit_status = 1;
             } else if (!silent) {
                 axl_printf("Saved %u bytes to %s\n",
                            (unsigned)resp->body_size, out_file);
@@ -291,9 +298,10 @@ run_fetch(AxlArgs *a)
             if (url_rc == AXL_OK && parsed != NULL) {
                 const char *name = get_url_filename(parsed->path);
                 if (name != NULL && *name != '\0') {
-                    if (!axl_file_set_contents(name, resp->body,
-                                                resp->body_size)) {
+                    if (axl_file_set_contents(name, resp->body,
+                                              resp->body_size) != AXL_OK) {
                         axl_printf("Fetch: write '%s' failed\n", name);
+                        exit_status = 1;
                     } else if (!silent) {
                         axl_printf("Saved %u bytes to %s\n",
                                    (unsigned)resp->body_size, name);

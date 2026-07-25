@@ -464,18 +464,17 @@ static const VTermStateCallbacks adapter_cbs = {
 // Public API
 // ---------------------------------------------------------------------------
 
-int
-axl_vterm_new(AxlVterm **out, int32_t rows, int32_t cols,
+AxlVterm *
+axl_vterm_new(int32_t rows, int32_t cols,
               const AxlConsoleOps *ops, void *user)
 {
-    if (!out || !ops || rows <= 0 || cols <= 0) {
-        return AXL_ERR;
+    if (!ops || rows <= 0 || cols <= 0) {
+        return NULL;
     }
-    *out = NULL;
 
     AxlVterm *v = axl_new(AxlVterm);   /* zeroed: run inactive, pen default+clean */
     if (!v) {
-        return AXL_ERR;
+        return NULL;
     }
     v->ops  = ops;
     v->user = user;
@@ -484,7 +483,7 @@ axl_vterm_new(AxlVterm **out, int32_t rows, int32_t cols,
     v->vt = vterm_new_with_allocator(rows, cols, &vterm_allocator, NULL);
     if (!v->vt) {
         axl_free(v);
-        return AXL_ERR;
+        return NULL;
     }
     vterm_set_utf8(v->vt, 1);
     v->state = vterm_obtain_state(v->vt);
@@ -505,8 +504,7 @@ axl_vterm_new(AxlVterm **out, int32_t rows, int32_t cols,
         ops->set_cell_rule(user, AXL_CONSOLE_CELLS_WIDTH_RESOLVED);
     }
 
-    *out = v;
-    return AXL_OK;
+    return v;
 }
 
 void

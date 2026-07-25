@@ -97,7 +97,7 @@ static bool task_ran;
 static bool complete_fired;
 
 static void
-task_test_proc(void *arg, AxlArena *arena)
+task_test_proc(AxlArena *arena, void *arg)
 {
     size_t *result;
 
@@ -112,7 +112,7 @@ task_test_proc(void *arg, AxlArena *arena)
 }
 
 static void
-task_test_complete(void *arg, AxlArena *arena)
+task_test_complete(AxlArena *arena, void *arg)
 {
     complete_fired = true;
 }
@@ -281,7 +281,7 @@ static bool async_work_ran;
 static bool async_done_fired;
 
 static void
-async_test_work(void *data, AxlArena *arena)
+async_test_work(AxlArena *arena, void *data)
 {
     (void)arena;
     async_work_ran = true;
@@ -291,7 +291,7 @@ async_test_work(void *data, AxlArena *arena)
 }
 
 static void
-async_test_done(void *data, AxlArena *arena)
+async_test_done(AxlArena *arena, void *data)
 {
     (void)arena;
     async_done_fired = true;

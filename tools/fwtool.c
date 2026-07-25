@@ -720,6 +720,29 @@ usage(
 
 AXL_TOOL_MAIN(fwtool)
 {
+    /* -h/--help: fwtool dispatches its own sub-commands, so it answers help
+       through the shared hook (uniform header with every framework tool). The
+       host test build has no AXL backend, so it falls back to the plain
+       usage(). In the UEFI build --version/-V is handled one layer up by
+       AXL_TOOL_MAIN (the host build's AXL_TOOL_MAIN is a plain main with no
+       version handling — a test-only path). */
+#ifndef AXL_HOSTED
+    if (axl_help_handle("fwtool",
+            "Firmware image (.fd / SPI) FV/FFS explorer",
+            "fwtool list <image>\n"
+            "       fwtool extract <image> <guid> [-o outpath]\n"
+            "       fwtool find <image> <guid>",
+            argc, argv)) {
+        return 0;
+    }
+#else
+    if (argc >= 2 && (axl_strcmp(argv[1], "-h") == 0
+                      || axl_strcmp(argv[1], "--help") == 0)) {
+        usage();
+        return 0;
+    }
+#endif
+
     if (argc < 2) {
         usage();
         return 1;

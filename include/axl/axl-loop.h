@@ -450,10 +450,10 @@ axl_loop_remove_source(
  * Typical use: a source callback that needs to wait on an async
  * producer without starving the rest of the loop's timers.
  *
- * @return 0 if @a done was signalled, -1 on timeout, AXL_CANCELLED on
- *     Ctrl-C or invalid argument.
+ * @return AXL_OK if @a done was signalled; AXL_TIMEOUT if the deadline
+ *     elapsed first; AXL_CANCELLED on Ctrl-C or a NULL @a loop.
  */
-int
+AxlStatus
 axl_loop_iterate_until(
     AxlLoop  *loop,       ///< loop to drive (caller's outer loop, typically)
     AxlEvent *done,       ///< event to wait on (NULL = only timeout/cancel wakes)

@@ -107,7 +107,7 @@ axl_rb_tree_init(
  * @brief Whether the tree has no nodes.
  */
 bool
-axl_rb_tree_empty(
+axl_rb_tree_is_empty(
     const AxlRBTree *t  ///< tree
 );
 

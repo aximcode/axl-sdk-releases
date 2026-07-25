@@ -3,6 +3,350 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.0.0 — 2026-07-25
+
+> **Consumers must fully REBUILD against this release, not relink.** Two of
+> the changes below are invisible to the linker. A translation unit still
+> compiled against the old `int _axl_service_driver_init(...)` prototype
+> keeps truncating the firmware status with no diagnostic — the symbol name
+> is unchanged, so the link succeeds and the S0 bug survives in that object
+> file. Likewise, a TU compiled against the old `AxlServiceDeploy` allocates
+> a struct one pointer short, so the new library reads `driver_path` past
+> its end. Delete stale objects (and any staged copy of the SDK headers)
+> before rebuilding.
+
+### Added
+
+- **`AxlConsoleVtEnc`** (`<axl/axl-console-vt-enc.h>`) — the ops→VT
+  encoder, lifted out of `axl-console-mirror` and made public. It is the
+  **remote** counterpart to `axl_console_term_ops` (the local, cell-grid
+  consumer): bind it to any producer and get the UTF-8 + ANSI/VT byte
+  stream an xterm-class terminal wants, plus
+  `axl_console_vt_enc_snapshot` for late-join repaint. Previously this
+  code was private to the mirror, which hard-wires it to the **tap**
+  producer — so a take-over console (`axl_console_device_install`) had
+  no supported path to a remote terminal at all, the only public
+  `AxlConsoleOps` consumer being `axl-console-term`, which rasterizes
+  rather than serializes. `AxlConsoleMirror` is now literally tap +
+  encoder; its emitted bytes are unchanged (the op bodies were moved
+  verbatim and the existing mirror tests are the byte-identity net).
+- **`axl_console_device_get_size`** — read the device's resolved geometry,
+  mirroring `axl_console_tap_get_size`. Needed by a `passthrough_local`
+  consumer in particular: passthrough forces geometry to physical, so the
+  resolved size is not something the caller passed in, and a consumer
+  that assumed 80x25 would size its screen model wrong.
+- **`AxlConsoleTee`** (`<axl/axl-console-tee.h>`) — fan one producer's
+  `AxlConsoleOps` out to several consumers, so "render locally **and**
+  mirror remotely" becomes expressible (a producer binds exactly one
+  vtable). It is substrate rather than three lines in each consumer
+  because `scrollrect` and `set_term_prop` return **negotiation**, not
+  status: split across consumers the answers can disagree, and the naive
+  forwarder corrupts a grid silently. The tee answers accepted only when
+  every consumer accepted, and asks all of them (no short-circuit, so the
+  result cannot depend on add order). Declining is the safe direction
+  because it is recoverable — the producer redraws the rect as ordinary
+  damage, repairing consumers that scrolled and those that did not —
+  whereas a false "accepted" emits no damage and leaves the declining
+  consumer permanently wrong.
+- **`AxlConsoleDeviceConfig.passthrough_local`** — keep the firmware
+  consoles in the ConSplitter fan-out instead of evicting them, so
+  GraphicsConsole carries on painting the local display while the
+  consumer still receives every op. The default (evict) is right when the
+  consumer OWNS the framebuffer — it renders the grid itself, and a
+  co-painting GraphicsConsole would fight it — and wrong when the
+  consumer only OBSERVES, e.g. mirroring the console to a remote viewer,
+  where evicting blanks the local monitor and freezes anything sampling
+  the GOP. Requires physical geometry (`cols`/`rows` must both be 0):
+  two consoles painting one screen must agree on the grid, and an
+  explicit size is refused rather than half-honoured. Consequence:
+  geometry is pinned, so `axl_console_device_set_size` cannot honour a
+  far-end resize. Verified in DEBUG OVMF by a new `passthrough` scenario
+  in `test-console-device-qemu.sh`, the exact inverse of the take-over
+  scenario's clean-region check.
+- **`axl_driver_ensure_from_path`** (`<axl/axl-driver.h>`) — the pinned
+  sibling of `axl_driver_ensure_with_embedded`: short-circuit on an
+  already-registered protocol, otherwise load, start and verify
+  **exactly one named file**. No four-path search, no embedded
+  fallback. `override_name` did not cover this — it substitutes a
+  *name* into the same search, so it cannot separate two files that
+  share a name.
+- **`AxlServiceDeploy.driver_path`** — the AxlService-level form of the
+  same thing. With it set, `axl_service_start_embedded` loads exactly
+  that file, so a stale `drivers/<arch>/<driver_name>` from an older
+  install cannot shadow the image the launcher just staged. (It really
+  can: a launcher at the volume root has no usable image directory, so
+  its own sibling is only search candidate #4 while `drivers/<arch>/`
+  is #2 — reproduced under OVMF/X64 by
+  `test/integration/test-service-pin-path-qemu.sh`.) `driver_name`,
+  `driver_blob` and `driver_blob_len` all feed the default resolution
+  only, so none is read — or required — when a path is pinned.
+
+- **`AxlFileView`'s consistency model is now documented as close-to-open**
+  — the same guarantee NFS gives by default. A freshly opened view sees
+  the file's current contents, unconditionally and against any writer;
+  re-opening is how a caller gets fresh data. Whether a view that is
+  ALREADY OPEN notices a write is explicitly **best effort**, and callers
+  must not build on it. This is a documentation change: it names a model
+  the type always had, in place of the per-read coherence the header
+  previously implied.
+- **Best-effort coherence for an already-open view.** Every AXL write path
+  now records that it touched a file, and a view compares one integer per
+  access — re-stat'ing and dropping its cached pages only when the file it
+  reads actually moved. A read that follows no write costs a load and a
+  compare, not a firmware round trip. Covers `axl_file_set_contents`,
+  `axl_file_write_atomic`, `axl_file_truncate`, `axl_file_delete`,
+  `axl_file_rename`, `axl_file_move`, `axl_dir_mkdir`/`_rmdir`,
+  `AxlFileWriter`, every `axl_fwrite`/`axl_pwrite` on a file stream, and
+  the file log handler, for every `AxlFileView` consumer rather than just
+  the 9P server. Previously such a view reported the old length over the
+  old bytes indefinitely, with no error and nothing to check. It does NOT
+  fire for a writer in another PE image, a non-AXL writer, or the Shell —
+  hence best effort, and hence close-to-open as the guarantee.
+- `axl_file_view_refresh()` — run that best-effort check on demand. It
+  does not reveal a write the view could not otherwise see; its value is
+  the return, `AXL_ERR` if the file was deleted or renamed away, which is
+  the only way to tell that apart from an ordinary empty read (a vanished
+  file reports size 0).
+- `axl_file_view_set_pinned()` — turn the best-effort half off for one
+  view, for a consumer that has already committed to a length or to byte
+  offsets. Freezes the length the view **reports**; it is not a snapshot
+  of the bytes, and the header is explicit about why (`AxlPageCache` may
+  evict a resident page at any time, and UEFI has no file-snapshot
+  primitive).
+
+- **`cut` and `tr` tools** — POSIX `cut(1)` / `tr(1)` ports. The UEFI
+  Shell ships neither (nor `grep`/`sed`/`cat`), so a pipeline like
+  `tool | cut -f2 | tr a-z A-Z` had no building blocks. Both read stdin as
+  UCS-2 (`axl_stdin_text`), so they compose with the Shell's `|` pipes;
+  GNU-parity tested against the host tools.
+- **`lsproto` tool** — list the live UEFI protocols on a handle by their
+  canonical spec name (`EFI_RAM_DISK_PROTOCOL`, not the Shell's short
+  `RamDisk`), via a generated GUID→name table and an upgraded
+  `axl_protocol_guid_name`.
+- **`profile-qemu.sh` + `gdb-sample.py`** — a sampling profiler for AXL
+  apps under QEMU (via the `--gdb` stub): answers "QEMU is pegged at
+  100% — WHERE?" with `file:line`, and reports a host-CPU spin/idle
+  verdict. Shipped in the host-tools package.
+- **Shell-free file access for BDS boot-option apps** — the path resolver
+  and `axl_driver_load_sibling` now work with no `EFI_SHELL_PROTOCOL` at
+  all (device path built from the running image's own
+  `LoadedImage->DeviceHandle`), so an app launched directly as a boot
+  option — not from a shell — can still find files beside it.
+- **Co-painting console reshape** — a `passthrough_local` consumer can now
+  reshape through the physical text-mode list (`AxlConsoleOps::resize`),
+  so a co-painting consumer and GraphicsConsole stay in sync on geometry
+  rather than desyncing on a half-switched mode.
+- **Console output coalescing** — an `AxlConsoleVtBuf` buffering VT sink
+  plus `axl_console_vt_enc_flush()` and a `coalesce` flag, with snapshot
+  REP/ECH run-merging. A full-screen repaint that previously emitted a
+  per-cell flood of WebSocket frames now coalesces to a handful; a
+  consumer sets `coalesce=true` and flushes once per loop tick.
+- **`axl-shell-launcher`** (test harness, **opt-in**) — a tiny chainloader
+  that starts the EDK2 Shell with LoadOptions `-delay 0`, skipping its
+  5-second startup countdown (~5 s of `gBS->Stall` busy-wait per guest boot
+  across the QEMU suite). Enabled by `AXL_SHELL_LAUNCHER=1`; the default
+  boots the Shell directly (robust everywhere — the launcher chainloads
+  whatever Shell is staged, and a Shell that mismatches the firmware hangs
+  when started, so it is gated until validated for a given environment).
+
+### Breaking
+
+This release lands a public-API consistency audit (145 headers) that
+normalizes naming, return types, and parameter order across the surface.
+Most changes are source-compatible for callers that test `== AXL_OK`, but
+several require edits on rebuild — the highest-risk being the parameter-order
+changes, which can compile silently. See `docs/AXL-API-Consistency-Audit.md`.
+
+- **Header rename: `<axl/axl-port.h>` → `<axl/axl-io-port.h>`.** Update the
+  include; the old path is gone.
+- **Parameter-order normalization — some reorders compile silently.**
+  Out-params moved last; the reader/fill/task callback argument order was
+  canonicalized; and `axl_shared_driver_unpublish` now mirrors
+  `axl_shared_driver_publish`. Where the reordered arguments share a type
+  the compiler will NOT flag a stale call site — audit calls to these by
+  hand.
+- **`int` → `AxlStatus` return types on multi-outcome functions** — the
+  HTTP server/client, ramdisk, SPD, `axl_net_ensure_drivers`, and the TLS
+  path now return a typed `AxlStatus`. Tests against `AXL_OK` are
+  unchanged; code that stored the result in an `int` or compared it to a
+  literal `0`/`1` should move to the enum.
+- **`AxlFsStatus` renumbered to the negative-value convention** — compare
+  against the named constants, not the old numeric values.
+- **Constructors return the object, not `int` + out-param.** `axl_vterm_new`
+  and `axl_console_screen_new` now return `T*` (NULL on failure); the
+  `_new`/`_free` constructor/destructor naming is applied consistently.
+- **`axl_queue_deinit` split into `axl_queue_deinit` / `_deinit_full`** to
+  fix a stack-queue teardown footgun — pick the variant matching how the
+  queue was allocated.
+- **`AXL_WARN_UNUSED` added to security / must-check functions** — a
+  discarded return now warns, and a `-Werror` consumer build fails until
+  the result is checked.
+- **Enum-flag and const/type hygiene** — several flag params are now typed
+  enums and several pointer params gained `const`; a mismatched caller gets
+  a compile error.
+
+- **`axl_file_view_size` lost its `const`** — it is now
+  `size_t axl_file_view_size(AxlFileView *v)`. A caller holding a
+  `const AxlFileView *` gets a hard compile error, C++ consumers included.
+  The length is a property of the file, not of the view, and the call may
+  now perform a firmware stat plus a stream close/reopen when the file has
+  been written — so it can no longer be `const` and is no longer a
+  struct-field read. Note `axl_file_view_stats` deliberately keeps its
+  `const`: it reads counters and does not sync.
+- **`axl_file_view_page`'s borrowed pointer has a shorter life.** It was
+  documented as valid until the next call "that may evict (any read/page
+  call)"; `axl_file_view_size` and `axl_file_view_refresh` now run the
+  coherence check too, and that drops every frame the view holds. So
+  `p = axl_file_view_page(v, …); sz = axl_file_view_size(v); use(p);` was
+  legal before this release and is a use-after-invalidate now. The pointer
+  is valid only until the next call on the view, whichever it is.
+- **9P `Tfsync` on a bound-but-never-opened fid now answers
+  `Rlerror(EBADF)`** (was `Rfsync`). `fsync(2)` has no meaning without an
+  open file description, and `Tread`, `Treaddir` and `Twrite` already
+  refused the same fid. Wire-visible to a client that fsyncs a fid it
+  walked to but never opened.
+
+- **`AxlWebDavOps.write_close` is now `int (*)(void *ctx, bool aborted)`**
+  (was `void`). The final flush is where a streaming PUT becomes durable
+  and nothing earlier can report it, so the slot has to return a status:
+  `AXL_ERR` on the clean-EOF call makes PUT answer **500** instead of 201.
+  Implementors of the vtable must update their signature — a hand-written
+  backend outside this repo is the case that breaks, and one already did.
+  The return is ignored on the abort call. `write_open` and `write_close`
+  must be wired as a pair; a NULL close with a non-NULL open reports 201
+  for every upload that carried a body.
+
+### Changed
+
+- **`axl_service_reload` / `axl_service_reload_buffer` distinguish a
+  load failure from a start failure** and return `AxlStatus` instead of
+  `int`. Per the reload contract a load failure tears nothing down (the
+  service is still serving) while a start failure leaves the service
+  down — but both used to report `AXL_ERR`, so a caller had to
+  conservatively roll back and cold-reset even when the box was
+  healthy. `AXL_ERR` now means, and only means, "this service is DOWN":
+  `AXL_INVALID` (caller misuse), `AXL_NOT_FOUND` (replacement could not
+  be loaded) and `AXL_NO_RESOURCES` (serialize / handoff-event /
+  LoadOptions failure) all mean the service is untouched and still
+  serving. Source-compatible for any caller that tests `!= AXL_OK`; the
+  only observable change is which negative value those pre-teardown
+  failures report.
+
+- **QEMU harness de-duplicated** — `run-qemu.sh` and the integration
+  harness (`common-test.sh`) now share `qemu_strip_kvm`,
+  `qemu_stage_disk`, `cpu_policy_init`, and the Shell-staging helper from
+  `scripts/axl-common.sh`, so the two can no longer drift. `run-qemu.sh`'s
+  long-dead 1.5-core CPU-spike check is replaced by a working
+  0.5-core + warm-up + TCG-carve-out policy (opt out with `--no-cpu-warn`).
+
+### Fixed
+
+- **Tool text output now pipes.** `axl_stdout` (and `axl_print` /
+  `axl_printf` / `axl_write(axl_stdout, …)`) wrote only `gST->ConOut`,
+  which the UEFI shell swaps for a `>` / `>a` redirect but NOT for a `|`
+  pipe — so `tool | other` printed the producer's output to the SCREEN
+  and the downstream stage received nothing. `axl_stdout` now detects a
+  non-interactive stdout (the same `GetFileSize` probe `axl_stdin`
+  already uses) and writes its transcoded UCS-2 to the
+  `EFI_SHELL_PARAMETERS_PROTOCOL.StdOut` handle, so `tool | other`,
+  `tool | other | third`, and the ASCII operators `>a` / `|a` all carry a
+  tool's text output. The interactive console keeps the ConOut path so
+  the console subsystem (tap / mirror / device) still observes output.
+  `axl_stdout_raw` is now only for BINARY payloads, not for piping text.
+  Covered by the new `test-tool-redirect-pipe-qemu.sh` (all tools ×
+  `>` / `>a` / `|` / `|a`, plus the stdin-consumer filters).
+
+- **`_axl_service_driver_init` no longer truncates the firmware status.**
+  It was declared `int` while returning `EFI_INVALID_PARAMETER` /
+  `EFI_OUT_OF_RESOURCES` / `EFI_ABORTED`, so the 64-bit status lost
+  `EFI_ERROR_BIT` on the way out: `EFI_ABORTED` (`0x8000000000000015`)
+  reached `AXL_SERVICE_DRIVER`'s `DriverEntry` as `0x15`, which
+  `EFI_ERROR()` reads as **success**. A service whose `setup` returned
+  `AXL_ERR` was therefore reported to the firmware as started —
+  `StartImage` succeeded, `axl_driver_start` returned `AXL_OK`, and
+  `axl_service_reload` declared a healthy hot-swap for a service that
+  never attached (the old image had already released its ports). The
+  declaration and definition now carry `AxlEfiStatus`, and
+  `AXL_SERVICE_DRIVER`'s widening cast is gone. Source-compatible for
+  consumers — the macro is used exactly as before.
+- **`axl_app_image_path()` honours its documented NULL for synthetic load
+  contexts.** `<axl/axl-app.h>` has always promised NULL for "synthetic
+  load contexts that bypass the usual file-load path", but a
+  buffer-loaded driver got a decode of the `MemoryMapped(...)/FilePath`
+  device path AXL synthesizes after such a load (so the aarch64 shell can
+  render the handle) — a volume-less `"\<name>"` naming a file the image
+  was never loaded from, and, when the loader supplied no name, naming
+  the *launcher* instead. Anything writing to or loading from `<self>`
+  acted on the wrong path. The accessor now returns a path only when the
+  image really came from a file (a FilePath the firmware can resolve
+  against a source volume).
+- **`axl_driver_get_image_path()` gets the same treatment**, for the same
+  condition and the same reason: it read `LoadedImage->FilePath` directly
+  and decoded the synthesized node too. This cannot move the driver search
+  order — `driver_build_candidates` only calls it inside a branch that has
+  already matched `DeviceHandle` against an enumerated volume, which
+  implies the gate the fix adds.
+- **Sidecar discovery for buffer-loaded drivers works again.** The
+  ParentHandle fallback `<axl/axl-app.h>`'s internals documented had been
+  dead since AXL started synthesizing a device path for buffer loads: the
+  synthetic FilePath ended the walk before it reached the launcher, so
+  `axl_resolve_data_file` from inside an embedded driver found nothing.
+  The anchor is now derived separately from the image's own path and
+  walks past images with no file of their own.
+- **`axl_service_reload` verifies the replacement actually attached.**
+  `StartImage` succeeding is not proof; and the plain `LocateProtocol`
+  re-check `axl_driver_ensure_with_embedded` uses cannot work here
+  because the *old* image still publishes the service GUID. The reload
+  now counts the handles publishing that GUID before and after the
+  start and treats "no increase" as a start failure (unloading the
+  replacement). A failed enumeration disarms the check rather than
+  failing a reload that actually succeeded.
+
+- **Write paths reported success for bytes that never reached the volume.**
+  Closing a file cannot report a failure (`EFI_FILE_PROTOCOL.Close` is
+  specified to return only `EFI_SUCCESS`), so every path that relied on
+  close to flush was silently lossy on a full volume, write-protected
+  media or a device error. `axl_fflush` on a file stream was itself a
+  no-op that always failed. Fixed across `axl_fflush`,
+  `axl_file_set_contents`, `axl_file_write_atomic` (which was promoting a
+  temp over a good file on that false success), `axl_file_move` (which
+  deleted the source), `axl_file_truncate`, `axl_file_writer_close`,
+  `axl_piece_tree_save`, `axl_log_flush`, the 9P server's fid teardown
+  (`Tclunk` now answers `Rlerror(EIO)`), the WebDAV PUT handler, and the
+  `tar` / `sed` / `netload` / `fetch` tools.
+- `axl_file_write_atomic` deleted its temp file when the promote failed,
+  even when its own delete-then-rename fallback had already removed the
+  target — losing the data from both places. The temp is now kept
+  whenever the target did not survive.
+- **A graceful `EFI_TCP4.Close()` could wedge the driver loop.** At raised
+  TPL, with un-flushed TX, the firmware's graceful close spins forever
+  inside the driver pump. The close is now promoted to an abortive RST at
+  raised TPL, so a console reshape / teardown no longer hangs the server
+  (root-caused by reproducing it live plus a QEMU-monitor stack walk).
+- **`rsod-decode.py` reconstructs a backtrace when the firmware printed no
+  frames** — it walks the frame-pointer chain (`--fp-unwind` forces it),
+  cross-validated byte-identical against a real Dell AArch64 trace.
+- **`run-qemu.sh --serial-socket` no longer drops early output.** The
+  chardev now uses `wait=on`, so the guest blocks until the caller's
+  serial reader attaches; previously a fast app could print its
+  ready-marker before the reader connected and the caller would wait
+  forever (a latent race the removed Shell countdown had been masking).
+- **The pure-lint gates no longer trip the `AXL_TLS` state-change wipe.** A
+  bare `make check-ascii` (etc.) after an `AXL_TLS=1` build used to read
+  `TLS_STATE=off` and wipe the TLS tree, forcing a full rebuild; the
+  lint-only gates are now excluded from the wipe like `clean`/`help`.
+- **`find_shell_efi` stages a Shell that matches the firmware in use.** Since
+  v2.9.0 (`ab2b9762`) it preferred a distro/system-package `Shell.efi` over
+  extracting one from the active firmware. A packaged Shell that doesn't match
+  the firmware (e.g. EL10's `/usr/share/edk2/ovmf/Shell.efi` against the
+  qemu-10.0.0 OVMF) starts but **hangs before its banner**, so every
+  ambient-Shell QEMU boot hung (directly, or via the opt-in launcher; only
+  `--boot-target`, which uses the firmware's own internal Shell, was spared).
+  It now prefers extracting the firmware's own Shell (native fwtool → python →
+  uefiextract) and falls back to the distro package only when extraction is
+  impossible.
+
+
 ## 2.9.0 — 2026-07-14
 
 A large release centered on a new **console subsystem**: a producer-agnostic

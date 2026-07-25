@@ -226,7 +226,7 @@ axl_ring_buf_pop(
  */
 uint32_t
 axl_ring_buf_peek(
-    AxlRingBuf *rb,    ///< ring buffer
+    const AxlRingBuf *rb,  ///< ring buffer
     void       *dest,  ///< destination buffer
     uint32_t    len    ///< maximum bytes to peek
 );
@@ -346,7 +346,7 @@ axl_ring_buf_peek_msg(
  */
 uint32_t
 axl_ring_buf_peek_msg_size(
-    AxlRingBuf *rb  ///< ring buffer
+    const AxlRingBuf *rb  ///< ring buffer
 );
 
 // ===========================================================================
@@ -386,7 +386,7 @@ axl_ring_buf_pop_elem(
  */
 int
 axl_ring_buf_peek_elem(
-    AxlRingBuf *rb,   ///< ring buffer (must be in element mode)
+    const AxlRingBuf *rb,   ///< ring buffer (must be in element mode)
     void       *dest  ///< receives the element
 );
 
@@ -399,7 +399,7 @@ axl_ring_buf_peek_elem(
  */
 int
 axl_ring_buf_peek_nth_elem(
-    AxlRingBuf *rb,      ///< ring buffer (must be in element mode)
+    const AxlRingBuf *rb,      ///< ring buffer (must be in element mode)
     uint32_t    index,   ///< element index (0 = oldest)
     void       *dest    ///< receives the element
 );
@@ -428,7 +428,7 @@ axl_ring_buf_set_nth_elem(
  */
 uint32_t
 axl_ring_buf_get_length(
-    AxlRingBuf *rb  ///< ring buffer
+    const AxlRingBuf *rb  ///< ring buffer
 );
 
 // ===========================================================================
@@ -462,7 +462,7 @@ axl_ring_buf_get_writable(
  */
 uint32_t
 axl_ring_buf_get_capacity(
-    AxlRingBuf *rb  ///< ring buffer
+    const AxlRingBuf *rb  ///< ring buffer
 );
 
 /**
@@ -472,7 +472,7 @@ axl_ring_buf_get_capacity(
  */
 bool
 axl_ring_buf_is_empty(
-    AxlRingBuf *rb  ///< ring buffer
+    const AxlRingBuf *rb  ///< ring buffer
 );
 
 /**
@@ -482,7 +482,7 @@ axl_ring_buf_is_empty(
  */
 bool
 axl_ring_buf_is_full(
-    AxlRingBuf *rb  ///< ring buffer
+    const AxlRingBuf *rb  ///< ring buffer
 );
 
 /**

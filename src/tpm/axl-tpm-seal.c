@@ -83,18 +83,33 @@ patch_size(uint8_t *cmd, size_t pos, size_t total)
     cmd[pos + 3] = (uint8_t)total;
 }
 
+/* Record the first failing stage + TPM responseCode into @p err (NULL-safe).
+   First failure wins: a later cleanup submit (tpm_flush) can't overwrite it. */
+static void
+record_tpm_err(AxlTpmError *err, const char *stage, uint32_t rc)
+{
+    if (err != NULL && err->stage == NULL) {
+        err->stage = stage;
+        err->tpm_rc = rc;
+    }
+}
+
 /* Submit @p cmd; on a transport-level success position @p out_rd just past
    the 10-byte response header (with len = responseSize) and return the TPM
-   responseCode (0 == success). Returns ~0u on an EFI/parse error. */
+   responseCode (0 == success). Returns ~0u on an EFI/parse error. On any
+   failure, records @p stage + the code into @p err (both may be NULL — e.g.
+   tpm_flush, whose cleanup failures are not the operation's error). */
 static uint32_t
 tpm_submit(EFI_TCG2_PROTOCOL *p, const uint8_t *cmd, size_t cmd_len,
-           uint8_t *resp, size_t resp_cap, TpmRd *out_rd)
+           uint8_t *resp, size_t resp_cap, TpmRd *out_rd,
+           AxlTpmError *err, const char *stage)
 {
     axl_memset(resp, 0, resp_cap);
     EFI_STATUS st = axl_efi_call(p->SubmitCommand, 5, p,
                                  (UINT32)cmd_len, (uint8_t *)cmd,
                                  (UINT32)resp_cap, resp);
     if (EFI_ERROR(st)) {
+        record_tpm_err(err, stage, 0xFFFFFFFFu);   /* firmware SubmitCommand failed */
         return 0xFFFFFFFFu;
     }
     TpmRd r = { resp, resp_cap, 0, true };
@@ -102,10 +117,14 @@ tpm_submit(EFI_TCG2_PROTOCOL *p, const uint8_t *cmd, size_t cmd_len,
     uint32_t rsize = rd32(&r);      /* responseSize */
     uint32_t rc = rd32(&r);         /* responseCode */
     if (!r.ok || rsize < 10 || rsize > resp_cap) {
+        record_tpm_err(err, stage, 0xFFFFFFFFu);   /* malformed response header */
         return 0xFFFFFFFFu;
     }
     r.len = rsize;
     *out_rd = r;
+    if (rc != 0) {
+        record_tpm_err(err, stage, rc);             /* TPM-level command failure */
+    }
     return rc;
 }
 
@@ -151,7 +170,7 @@ tpm_flush(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, uint8_t *resp, size_t resp_cap,
     wr32(&f, handle);
     if (f.ok) {
         TpmRd r;
-        tpm_submit(p, cmd, f.len, resp, resp_cap, &r);
+        tpm_submit(p, cmd, f.len, resp, resp_cap, &r, NULL, NULL);
     }
 }
 
@@ -162,7 +181,8 @@ tpm_flush(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, uint8_t *resp, size_t resp_cap,
 /* TPM2_CreatePrimary of the ECC SRK in the owner hierarchy. */
 static bool
 create_srk(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
-           uint8_t *resp, size_t resp_cap, uint32_t *out_handle)
+           uint8_t *resp, size_t resp_cap, uint32_t *out_handle,
+           AxlTpmError *err)
 {
     uint8_t tpub[128];
     TpmWr t = { tpub, sizeof tpub, 0, true };
@@ -199,7 +219,8 @@ create_srk(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r) != 0) {
+    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                   "TPM2_CreatePrimary") != 0) {
         return false;
     }
     *out_handle = rd32(&r);       /* objectHandle */
@@ -210,7 +231,7 @@ create_srk(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
 static bool
 pcr_policy_digest(EFI_TCG2_PROTOCOL *p, const uint32_t *pcrs, size_t n,
                   uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap,
-                  uint8_t digest[32])
+                  uint8_t digest[32], AxlTpmError *err)
 {
     TpmWr c = { cmd, cmd_cap, 0, true };
     wr16(&c, TPM_ST_NO_SESSIONS);
@@ -224,7 +245,8 @@ pcr_policy_digest(EFI_TCG2_PROTOCOL *p, const uint32_t *pcrs, size_t n,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r) != 0) {
+    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                   "TPM2_PCR_Read") != 0) {
         return false;
     }
     rd32(&r);                     /* pcrUpdateCounter */
@@ -295,7 +317,8 @@ create_sealed(EFI_TCG2_PROTOCOL *p, uint32_t srk,
               const uint8_t *secret, size_t secret_len, const uint8_t policy[32],
               uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap,
               uint8_t *pub, size_t pub_cap, size_t *pub_len,
-              uint8_t *priv, size_t priv_cap, size_t *priv_len)
+              uint8_t *priv, size_t priv_cap, size_t *priv_len,
+              AxlTpmError *err)
 {
     uint8_t kh[128];
     TpmWr t = { kh, sizeof kh, 0, true };
@@ -329,7 +352,8 @@ create_sealed(EFI_TCG2_PROTOCOL *p, uint32_t srk,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r) != 0) {
+    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                   "TPM2_Create") != 0) {
         return false;
     }
     rd32(&r);                     /* parameterSize */
@@ -344,7 +368,7 @@ load_sealed(EFI_TCG2_PROTOCOL *p, uint32_t srk,
             const uint8_t *pub, size_t pub_len,
             const uint8_t *priv, size_t priv_len,
             uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap,
-            uint32_t *out_handle)
+            uint32_t *out_handle, AxlTpmError *err)
 {
     TpmWr c = { cmd, cmd_cap, 0, true };
     wr16(&c, TPM_ST_SESSIONS);
@@ -361,7 +385,7 @@ load_sealed(EFI_TCG2_PROTOCOL *p, uint32_t srk,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r) != 0) {
+    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err, "TPM2_Load") != 0) {
         return false;
     }
     *out_handle = rd32(&r);
@@ -371,7 +395,8 @@ load_sealed(EFI_TCG2_PROTOCOL *p, uint32_t srk,
 /* TPM2_StartAuthSession: an unbound, unsalted SHA-256 policy session. */
 static bool
 start_policy_session(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
-                     uint8_t *resp, size_t resp_cap, uint32_t *out_session)
+                     uint8_t *resp, size_t resp_cap, uint32_t *out_session,
+                     AxlTpmError *err)
 {
     uint8_t nonce[16];
     if (axl_rng_bytes(nonce, sizeof nonce) != AXL_OK) {
@@ -395,7 +420,8 @@ start_policy_session(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r) != 0) {
+    if (tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                   "TPM2_StartAuthSession") != 0) {
         return false;
     }
     *out_session = rd32(&r);
@@ -405,7 +431,8 @@ start_policy_session(EFI_TCG2_PROTOCOL *p, uint8_t *cmd, size_t cmd_cap,
 /* TPM2_PolicyPCR: bind the session to the live PCRs. */
 static bool
 policy_pcr(EFI_TCG2_PROTOCOL *p, uint32_t session, const uint32_t *pcrs, size_t n,
-           uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap)
+           uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap,
+           AxlTpmError *err)
 {
     TpmWr c = { cmd, cmd_cap, 0, true };
     wr16(&c, TPM_ST_NO_SESSIONS);
@@ -421,7 +448,8 @@ policy_pcr(EFI_TCG2_PROTOCOL *p, uint32_t session, const uint32_t *pcrs, size_t 
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    return tpm_submit(p, cmd, c.len, resp, resp_cap, &r) == 0;
+    return tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                      "TPM2_PolicyPCR") == 0;
 }
 
 /* TPM2_Unseal under the policy session. AXL_OK / AXL_DENIED (policy fail) /
@@ -429,7 +457,8 @@ policy_pcr(EFI_TCG2_PROTOCOL *p, uint32_t session, const uint32_t *pcrs, size_t 
 static int
 unseal_obj(EFI_TCG2_PROTOCOL *p, uint32_t sealed, uint32_t session,
            uint8_t *cmd, size_t cmd_cap, uint8_t *resp, size_t resp_cap,
-           uint8_t *out, size_t out_cap, size_t *out_len)
+           uint8_t *out, size_t out_cap, size_t *out_len,
+           AxlTpmError *err)
 {
     TpmWr c = { cmd, cmd_cap, 0, true };
     wr16(&c, TPM_ST_SESSIONS);
@@ -449,7 +478,8 @@ unseal_obj(EFI_TCG2_PROTOCOL *p, uint32_t sealed, uint32_t session,
     patch_size(cmd, sp, c.len);
 
     TpmRd r;
-    uint32_t rc = tpm_submit(p, cmd, c.len, resp, resp_cap, &r);
+    uint32_t rc = tpm_submit(p, cmd, c.len, resp, resp_cap, &r, err,
+                             "TPM2_Unseal");
     if (rc != 0) {
         return AXL_DENIED;        /* policy / authorization failure */
     }
@@ -472,16 +502,21 @@ unseal_obj(EFI_TCG2_PROTOCOL *p, uint32_t sealed, uint32_t session,
 // Public API
 // ===================================================================
 
-int
+AxlStatus
 axl_tpm_seal(
     const uint8_t  *secret,
     size_t          secret_len,
     const uint32_t *pcrs,
     size_t          pcr_count,
     uint8_t       **out_blob,
-    size_t         *out_blob_len
+    size_t         *out_blob_len,
+    AxlTpmError    *err
     )
 {
+    if (err != NULL) {
+        err->stage = NULL;
+        err->tpm_rc = 0;
+    }
     if (secret == NULL || pcrs == NULL || out_blob == NULL ||
         out_blob_len == NULL) {
         return AXL_INVALID;
@@ -504,9 +539,9 @@ axl_tpm_seal(
     uint8_t cmd[1024];
     uint8_t resp[4096];
     uint32_t srk = 0;
-    int rc = AXL_ERR;
+    AxlStatus rc = AXL_ERR;
 
-    if (!create_srk(p, cmd, sizeof cmd, resp, sizeof resp, &srk)) {
+    if (!create_srk(p, cmd, sizeof cmd, resp, sizeof resp, &srk, err)) {
         return AXL_ERR;
     }
 
@@ -515,10 +550,11 @@ axl_tpm_seal(
     uint8_t priv[1024];
     size_t pub_len = 0, priv_len = 0;
     if (pcr_policy_digest(p, pcrs, pcr_count, cmd, sizeof cmd, resp, sizeof resp,
-                          policy) &&
+                          policy, err) &&
         create_sealed(p, srk, secret, secret_len, policy,
                       cmd, sizeof cmd, resp, sizeof resp,
-                      pub, sizeof pub, &pub_len, priv, sizeof priv, &priv_len)) {
+                      pub, sizeof pub, &pub_len, priv, sizeof priv, &priv_len,
+                      err)) {
         size_t blen = 6 + pcr_count + pub_len + priv_len;
         uint8_t *blob = axl_malloc(blen);
         if (blob != NULL) {
@@ -548,14 +584,19 @@ axl_tpm_seal(
     return rc;
 }
 
-int
+AxlStatus
 axl_tpm_unseal(
     const uint8_t *blob,
     size_t         blob_len,
     uint8_t      **out_secret,
-    size_t        *out_secret_len
+    size_t        *out_secret_len,
+    AxlTpmError   *err
     )
 {
+    if (err != NULL) {
+        err->stage = NULL;
+        err->tpm_rc = 0;
+    }
     if (blob == NULL || out_secret == NULL || out_secret_len == NULL) {
         return AXL_INVALID;
     }
@@ -599,18 +640,20 @@ axl_tpm_unseal(
     uint8_t cmd[1024];
     uint8_t resp[4096];
     uint32_t srk = 0, sealed = 0, session = 0;
-    int rc = AXL_ERR;
+    AxlStatus rc = AXL_ERR;
 
-    if (create_srk(p, cmd, sizeof cmd, resp, sizeof resp, &srk) &&
+    if (create_srk(p, cmd, sizeof cmd, resp, sizeof resp, &srk, err) &&
         load_sealed(p, srk, pub, pub_len, priv, priv_len,
-                    cmd, sizeof cmd, resp, sizeof resp, &sealed) &&
-        start_policy_session(p, cmd, sizeof cmd, resp, sizeof resp, &session) &&
+                    cmd, sizeof cmd, resp, sizeof resp, &sealed, err) &&
+        start_policy_session(p, cmd, sizeof cmd, resp, sizeof resp, &session,
+                             err) &&
         policy_pcr(p, session, pcrs, pcr_count, cmd, sizeof cmd, resp,
-                   sizeof resp)) {
+                   sizeof resp, err)) {
         uint8_t secret[AXL_TPM_SEAL_MAX_SECRET];
         size_t secret_len = 0;
         int urc = unseal_obj(p, sealed, session, cmd, sizeof cmd, resp,
-                             sizeof resp, secret, sizeof secret, &secret_len);
+                             sizeof resp, secret, sizeof secret, &secret_len,
+                             err);
         if (urc == AXL_OK) {
             uint8_t *out = axl_malloc(secret_len);
             if (out != NULL) {

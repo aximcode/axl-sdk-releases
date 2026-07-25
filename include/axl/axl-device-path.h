@@ -52,7 +52,7 @@ typedef struct AxlDevicePath AxlDevicePath;
  *     is NULL or allocation fails.
  */
 AXL_WARN_UNUSED int
-axl_device_path_make_vendor(
+axl_device_path_new_vendor(
     const AxlGuid  *vendor_guid,  ///< identifies the vendor / instance
     AxlDevicePath **out           ///< [out] freshly-allocated chain
 );

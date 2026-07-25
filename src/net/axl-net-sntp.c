@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-net-sntp.c
-    axl_sntp_query — SNTP/NTP client (RFC 4330) over UDP.
+    axl_net_sntp_query — SNTP/NTP client (RFC 4330) over UDP.
 
     Sends a minimal client request and parses the server's transmit
     timestamp into Unix seconds; reports the local-clock offset
@@ -31,8 +31,8 @@ be32(const uint8_t *p)
 }
 
 int
-axl_sntp_query(const char *server, uint16_t port, size_t timeout_ms,
-               AxlSntpResult *out)
+axl_net_sntp_query(const char *server, uint16_t port, size_t timeout_ms,
+               AxlNetSntpResult *out)
 {
     if (server == NULL || out == NULL) {
         return AXL_ERR;
@@ -62,7 +62,7 @@ axl_sntp_query(const char *server, uint16_t port, size_t timeout_ms,
     size_t  rx_len = 0;
 
     int rc = axl_udp_sendrecv(sock, &dest, port, req, sizeof(req),
-                              resp, sizeof(resp), &rx_len, timeout_ms);
+                              timeout_ms, resp, sizeof(resp), &rx_len);
     axl_udp_close(sock);
 
     if (rc != AXL_OK || rx_len < SNTP_PKT_LEN) {

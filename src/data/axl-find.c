@@ -28,7 +28,7 @@ mem_length(const AxlByteReader *r)
 }
 
 static size_t
-mem_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
+mem_read(const AxlByteReader *r, size_t offset, void *buf, size_t len)
 {
     const AxlMemReader *m = (const AxlMemReader *)r->ctx;
     if (offset >= m->len) {
@@ -160,7 +160,7 @@ static int
 reader_byte_at(const AxlByteReader *r, size_t off)
 {
     char c;
-    return (r->read(r, off, 1, &c) == 1) ? (int)(unsigned char)c : -1;
+    return (r->read(r, off, &c, 1) == 1) ? (int)(unsigned char)c : -1;
 }
 
 static bool
@@ -214,7 +214,7 @@ find_forward(const AxlByteReader *r, size_t L, const char *needle,
     size_t pos = from;
     while (pos <= last) {
         size_t want = (L - pos < cap) ? (L - pos) : cap;
-        size_t got = r->read(r, pos, want, buf);
+        size_t got = r->read(r, pos, buf, want);
         if (got < m) {
             break;
         }
@@ -277,7 +277,7 @@ find_backward(const AxlByteReader *r, size_t L, const char *needle,
     while (!found && cur_end >= m) {
         size_t winpos = (cur_end > cap) ? (cur_end - cap) : 0;
         size_t want = cur_end - winpos;
-        size_t got = r->read(r, winpos, want, buf);
+        size_t got = r->read(r, winpos, buf, want);
         if (got >= m) {
             /* Bound the scan so the highest reported start is <= hi. */
             size_t end = got;

@@ -32,7 +32,7 @@
         .sink = to_ws, .user = conn, .cols = 80, .rows = 25,
         .passthrough_local = true,
     };
-    axl_console_mirror_install(&m, &cfg);
+    axl_console_mirror_install(&cfg, &m);
     axl_loop_attach_driver(loop, 10);    // HTTP/WS pumped in the background
     axl_shell_launch(NULL);              // real Shell in the foreground; blocks
     axl_loop_detach_driver(loop);
@@ -135,8 +135,8 @@ typedef struct {
  */
 int
 axl_console_mirror_install(
-    AxlConsoleMirror             **out,  ///< [out] receives the mirror handle
-    const AxlConsoleMirrorConfig  *cfg   ///< configuration (copied)
+    const AxlConsoleMirrorConfig  *cfg,  ///< configuration (copied)
+    AxlConsoleMirror             **out   ///< [out] receives the mirror handle
 );
 
 /**

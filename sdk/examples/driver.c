@@ -134,7 +134,7 @@ driver_main(
         // Roll back the install we just made — failed DriverEntry
         // means firmware will NOT call the unload callback, so we
         // own teardown of every visible side effect.
-        axl_protocol_unregister(mHandle, "example-svc", &mProtocol);
+        axl_protocol_unregister("example-svc", &mProtocol, mHandle);
         mHandle = NULL;
         goto fail;
     }
@@ -171,7 +171,7 @@ driver_unload(
     (void)image;
 
     if (mHandle != NULL) {
-        axl_protocol_unregister(mHandle, "example-svc", &mProtocol);
+        axl_protocol_unregister("example-svc", &mProtocol, mHandle);
     }
 
     axl_free((void *)mProtocol.description);

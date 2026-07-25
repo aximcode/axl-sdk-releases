@@ -139,7 +139,7 @@ typedef struct {
  *
  * @return AXL_OK on success; AXL_ERR on NULL args or a command failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_scsi_inquiry(
     AxlScsiDev     *dev,   ///< device from axl_scsi_next
     AxlScsiInquiry *out    ///< [out] populated on success
@@ -167,7 +167,7 @@ typedef struct {
  *
  * @return AXL_OK on success; AXL_ERR on NULL args or a command failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_scsi_read_capacity(
     AxlScsiDev      *dev,   ///< device from axl_scsi_next
     AxlScsiCapacity *out    ///< [out] populated on success
@@ -217,7 +217,7 @@ typedef struct {
  *
  * @return AXL_OK on success; AXL_ERR on NULL args or an IE-page command failure.
  */
-int
+AXL_WARN_UNUSED int
 axl_scsi_health(
     AxlScsiDev    *dev,   ///< device from axl_scsi_next
     AxlScsiHealth *out    ///< [out] populated on success

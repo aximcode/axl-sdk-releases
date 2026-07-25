@@ -506,7 +506,7 @@ tb_reader_length(const AxlByteReader *r)
 }
 
 static size_t
-tb_reader_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
+tb_reader_read(const AxlByteReader *r, size_t offset, void *buf, size_t len)
 {
     return axl_text_buffer_get((const AxlTextBuffer *)r->ctx, offset, len,
                                (char *)buf, len);

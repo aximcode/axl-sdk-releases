@@ -674,6 +674,26 @@ CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
 [[ "$CODE" == "201" ]] && pass "PUT empty body returns 201" \
                        || fail "PUT empty (got $CODE)"
 
+# PUT whose final flush/close FAILS. Every chunk was accepted, so nothing
+# sets put_failed along the way — the only signal is write_close's status.
+# The response must be 500: a 201 here tells the client its data is stored
+# when the backend could not make it durable (full volume, write-protected
+# media, device error). The test backend fails write_close for any target
+# whose name starts with "flush-fails"; nothing else about the upload
+# differs from the 201 case above.
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -d "never-lands" "${BASE_URL}/dav/flush-fails.bin" 2>/dev/null || true)
+[[ "$CODE" == "500" ]] && pass "PUT whose final flush fails returns 500, not 201" \
+                       || fail "PUT flush-failure (got $CODE, want 500)"
+
+# Same contract on the EMPTY-body PUT path — it closes through a separate
+# call site, and 6a's lesson was that one side of a pair gets missed.
+CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
+    -X PUT -H "Content-Length: 0" --data-binary "" \
+    "${BASE_URL}/dav/flush-fails-empty.bin" 2>/dev/null || true)
+[[ "$CODE" == "500" ]] && pass "empty-body PUT whose close fails returns 500" \
+                       || fail "empty PUT flush-failure (got $CODE, want 500)"
+
 # MOVE without Destination → 400.
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" \
     -X MOVE "${BASE_URL}/dav/moved-dir" 2>/dev/null || true)
@@ -1387,8 +1407,139 @@ try:
         s.close()
 except Exception as e:
     print(f"FAIL: ws-reject ({e})")
+
+# 6) Oversized-frame guard (WS wedge regression): the server, on an "OVERSIZE"
+#    trigger, attempts a 600 KB axl_ws_send whose framed size exceeds the
+#    per-connection outbound budget (512 KB). That send must be REJECTED at
+#    axl_ws_send (asserted on the server serial log by the bash block below,
+#    WS-OVERSIZE-RC:), never admitted and handed to the one-Transmit-in-flight
+#    transport as one giant send (the wedge). Here we assert the client half:
+#    the connection stays usable — after the oversized attempt a normal frame
+#    still echoes back. We drain any large binary frame a pre-fix (escape-hatch)
+#    server would have admitted before looking for the echo.
+try:
+    st, s = ws_open("/ws-echo-ex")
+    if st != 101:
+        print(f"FAIL: ws-oversize handshake (status {st})")
+    else:
+        s.settimeout(10)
+        ws_send_text(s, "OVERSIZE")
+        ws_send_text(s, "hello")
+        buf = b""
+        def _need(n):
+            global buf
+            while len(buf) < n:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+        def _read_frame():
+            global buf
+            _need(2)
+            plen = buf[1] & 0x7F
+            op = buf[0] & 0x0F
+            hdr = 2
+            if plen == 126:
+                _need(4); plen = int.from_bytes(buf[2:4], "big"); hdr = 4
+            elif plen == 127:
+                _need(10); plen = int.from_bytes(buf[2:10], "big"); hdr = 10
+            _need(hdr + plen)
+            pl = buf[hdr:hdr + plen]
+            buf = buf[hdr + plen:]
+            return op, bytes(pl)
+        echoed = False
+        try:
+            for _ in range(4):
+                op, pl = _read_frame()
+                if op == 0x1 and pl == b"ex:hello":
+                    echoed = True
+                    break
+        except Exception:
+            pass
+        if echoed:
+            print("PASS: ws-oversize server responsive after oversized-frame reject")
+        else:
+            print("FAIL: ws-oversize no echo after oversized frame (server wedged?)")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-oversize ({e})")
+
+# 7) Multi-chunk transport round-trip (WS wedge fix, Part B): a 200 KB frame is
+#    accepted (< 512 KB budget) but spans ~7 transport chunks (32 KB each), so
+#    axl_tcp_send_async must chunk-chain it and still deliver every byte in
+#    order. Send "BIGFRAME", read the whole binary frame, verify length + the
+#    position-dependent pattern (byte i == i & 0xFF). Byte-exact receipt proves
+#    the bounded-Transmit rewrite preserves correctness.
+try:
+    st, s = ws_open("/ws-echo-ex")
+    if st != 101:
+        print(f"FAIL: ws-bigframe handshake (status {st})")
+    else:
+        s.settimeout(15)
+        ws_send_text(s, "BIGFRAME")
+        rbuf = bytearray()
+        def _rneed(n):
+            while len(rbuf) < n:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise EOFError
+                rbuf.extend(chunk)
+        _rneed(2)
+        op = rbuf[0] & 0x0F
+        plen = rbuf[1] & 0x7F
+        hdr = 2
+        if plen == 126:
+            _rneed(4); plen = int.from_bytes(rbuf[2:4], "big"); hdr = 4
+        elif plen == 127:
+            _rneed(10); plen = int.from_bytes(rbuf[2:10], "big"); hdr = 10
+        _rneed(hdr + plen)
+        payload = bytes(rbuf[hdr:hdr + plen])
+        want = 200 * 1024
+        expect = bytes((i & 0xFF) for i in range(want))
+        if op != 0x2:
+            print(f"FAIL: ws-bigframe wrong opcode 0x{op:x}")
+        elif len(payload) != want:
+            print(f"FAIL: ws-bigframe length {len(payload)} != {want}")
+        elif payload != expect:
+            print("FAIL: ws-bigframe payload corrupted across transport chunks")
+        else:
+            print("PASS: ws-bigframe 200 KB frame byte-exact across transport chunks")
+        s.close()
+except Exception as e:
+    print(f"FAIL: ws-bigframe ({e})")
 PYEOF
 )
+
+# Oversized-frame guard — assert the REJECT on the server serial log. On the
+# "OVERSIZE" trigger the server attempted a 600 KB axl_ws_send; its framed size
+# exceeds the 512 KB outbound budget, so it must be rejected (negative rc) with
+# an over-budget warning — NOT admitted (rc 0) and handed to the transport as
+# one unbounded Transmit (the single-threaded-server wedge). Pre-fix escape
+# hatch admitted it and printed WS-OVERSIZE-RC:0.
+test_clean_log
+OVR_RC=$(grep -oE 'WS-OVERSIZE-RC:-?[0-9]+' "$TEST_CLEAN_LOG" | head -1 | sed 's/.*://')
+if grep -q 'WS-OVERSIZE-OOM' "$TEST_CLEAN_LOG"; then
+    fail "oversized WS probe could not allocate its 600 KB buffer (test-env OOM, not a fix regression)"
+elif [[ -n "$OVR_RC" && "$OVR_RC" -lt 0 ]]; then
+    pass "oversized WS frame rejected at axl_ws_send (rc=$OVR_RC)"
+else
+    fail "oversized WS frame not rejected (WS-OVERSIZE-RC='${OVR_RC:-<absent>}', want negative)"
+fi
+grep -q 'exceeds outbound budget' "$TEST_CLEAN_LOG" \
+    && pass "oversized WS frame logged an over-budget warning" \
+    || fail "oversized WS frame over-budget warning missing from serial log"
+
+# Multi-chunk transport round-trip — the 200 KB BIGFRAME send must be ACCEPTED
+# (rc 0) at axl_ws_send; the client-side check above proves it arrived
+# byte-exact after the transport chunk-chained it (~7 bounded Transmits).
+BIG_RC=$(grep -oE 'WS-BIGFRAME-RC:-?[0-9]+' "$TEST_CLEAN_LOG" | head -1 | sed 's/.*://')
+if grep -q 'WS-BIGFRAME-OOM' "$TEST_CLEAN_LOG"; then
+    fail "big-frame probe could not allocate its 200 KB buffer (test-env OOM)"
+elif [[ "$BIG_RC" == "0" ]]; then
+    pass "200 KB WS frame accepted by axl_ws_send (rc=0)"
+else
+    fail "200 KB WS frame not accepted (WS-BIGFRAME-RC='${BIG_RC:-<absent>}', want 0)"
+fi
 
 # ---------------------------------------------------------------------------
 # UEFI HTTP Client tests (UEFI fetches from host Python server)

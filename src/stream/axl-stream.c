@@ -149,6 +149,49 @@ console_transcode_crlf(
    backend function receives the transcoded buffer, so @p emit carries
    that difference in. Returns @p count on success, or -1 on heap
    allocation failure servicing an oversized single call. */
+/* Transcode UTF-8(+CRLF) into a UCS-2 buffer. On success @p *out points at the
+   NUL-terminated result (the caller's @p stack_buf, or a heap buffer returned
+   in @p *heap to free) and @p *out_len is the UCS-2 unit count before the NUL.
+   Returns false only on heap-allocation failure servicing an oversized call. */
+static bool
+console_transcode_alloc(
+    const void      *data,
+    size_t           count,
+    unsigned short  *stack_buf,
+    size_t           stack_cap,
+    unsigned short **out,
+    size_t          *out_len,
+    unsigned short **heap
+    )
+{
+    bool   overflowed = false;
+    size_t n = console_transcode_crlf((const uint8_t *)data, count,
+                                      stack_buf, stack_cap, &overflowed);
+    *heap = NULL;
+    if (overflowed) {
+        /* Single oversized call (e.g. raw axl_fwrite of a large buffer).
+           Worst case: every input byte becomes "\r\n" — 2*count units + NUL. */
+        size_t          heap_cap = count * 2 + 1;
+        unsigned short *hb = (unsigned short *)axl_malloc(heap_cap
+                                                          * sizeof(unsigned short));
+        if (hb == NULL) {
+            axl_warning("console_transcode_alloc: OOM allocating %zu UCS-2 chars",
+                        heap_cap);
+            return false;
+        }
+        /* heap_cap is the absolute worst case — a second overflow is
+           unreachable; ignore the flag. */
+        n     = console_transcode_crlf((const uint8_t *)data, count,
+                                       hb, heap_cap, &overflowed);
+        *heap = hb;
+        *out  = hb;
+    } else {
+        *out = stack_buf;
+    }
+    *out_len = n;
+    return true;
+}
+
 static axl_ssize_t
 console_write_via(
     const void  *data,
@@ -157,39 +200,81 @@ console_write_via(
     )
 {
     unsigned short  stack_buf[CONSOLE_WRITE_STACK_UCS2];
-    unsigned short *out      = stack_buf;
-    size_t          out_cap  = CONSOLE_WRITE_STACK_UCS2;
-    unsigned short *heap_buf = NULL;
+    unsigned short *out  = NULL;
+    unsigned short *heap = NULL;
+    size_t          len  = 0;
 
-    bool overflowed = false;
-    console_transcode_crlf((const uint8_t *)data, count,
-                                 out, out_cap, &overflowed);
-
-    if (overflowed) {
-        /* Single oversized call (e.g. raw axl_fwrite of a large
-           buffer to stdout). Worst case: every input byte becomes
-           "\r\n" — 2*count UCS-2 units + 1 NUL. */
-        size_t heap_cap = count * 2 + 1;
-        heap_buf = (unsigned short *)axl_malloc(heap_cap * sizeof(unsigned short));
-        if (heap_buf == NULL) {
-            axl_warning(
-                "console_write_via: OOM allocating %zu UCS-2 chars",
-                heap_cap
-                );
-            return -1;
-        }
-        console_transcode_crlf((const uint8_t *)data, count,
-                                     heap_buf, heap_cap, &overflowed);
-        /* heap_cap is the absolute worst case — a second overflow
-           is unreachable; ignore the flag. */
-        out = heap_buf;
+    if (!console_transcode_alloc(data, count, stack_buf,
+                                 CONSOLE_WRITE_STACK_UCS2, &out, &len, &heap)) {
+        return -1;
     }
-
     emit(out);
-    if (heap_buf != NULL) {
-        axl_free(heap_buf);
+    if (heap != NULL) {
+        axl_free(heap);
     }
     return (axl_ssize_t)count;
+}
+
+/* Text stdout to the shell's StdOut FILE handle, as UCS-2. This is the pipe
+   path: the UEFI shell wires EFI_SHELL_PARAMETERS_PROTOCOL.StdOut for a `|`
+   pipe but does NOT swap gST->ConOut, so a ConOut-only write never reaches the
+   downstream stage. Writing the transcoded UCS-2 to the handle lets the tool's
+   output traverse the pipe (and a `>`/`>a` redirect, whose handle carries the
+   same file), while the shell supplies the leading BOM / any `>a`|`|a` ASCII
+   downconversion its handle wrapper applies. Distinct from axl_stdout_raw,
+   which writes UNTRANSCODED bytes for binary payloads. */
+static axl_ssize_t
+console_write_shell_ucs2(
+    AxlFileHandle  h,
+    const void    *data,
+    size_t         count
+    )
+{
+    unsigned short  stack_buf[CONSOLE_WRITE_STACK_UCS2];
+    unsigned short *out  = NULL;
+    unsigned short *heap = NULL;
+    size_t          len  = 0;
+
+    if (!console_transcode_alloc(data, count, stack_buf,
+                                 CONSOLE_WRITE_STACK_UCS2, &out, &len, &heap)) {
+        return -1;
+    }
+    size_t want   = len * sizeof(unsigned short);
+    size_t nbytes = want;
+    int    rc     = axl_backend_file_write(h, &nbytes, out);
+    if (heap != NULL) {
+        axl_free(heap);
+    }
+    /* Report success ONLY if the whole transcoded buffer reached the handle:
+       axl_backend_file_write sets nbytes to what actually landed, and a caller
+       that got `count` back for a short write would believe output piped that
+       never did. (EDK2 WriteFile flags a short write as an error status, so rc
+       already catches the common case; the length check closes the rest.) */
+    return (rc == AXL_OK && nbytes == want) ? (axl_ssize_t)count : -1;
+}
+
+/* Per-handle cache of the stdout interactive verdict — mirror of the stdin
+   cache below. Without it a firmware GetFileSize probe would run on every
+   write, which the interactive printf loop cannot afford; the handle only
+   changes across a driver re-bridge, which re-probes. Defaults to
+   interactive (the safe ConOut path) until the first classification.
+   Keyed by the handle POINTER, exactly like stdin's cache — so a driver that
+   frees one bridge handle and gets a new one at the same address could serve
+   a stale verdict; accepted as consistent with the stdin cache, and moot for
+   an app (mShellStdOut is stable for the image's life). */
+static AxlFileHandle mStdoutVerdictHandle      = NULL;
+static bool          mStdoutVerdictInteractive = true;
+static bool          mStdoutVerdictValid       = false;
+
+static bool
+stdout_interactive_for(AxlFileHandle h)
+{
+    if (!mStdoutVerdictValid || h != mStdoutVerdictHandle) {
+        mStdoutVerdictHandle      = h;
+        mStdoutVerdictInteractive = axl_backend_stdout_is_interactive();
+        mStdoutVerdictValid       = true;
+    }
+    return mStdoutVerdictInteractive;
 }
 
 static axl_ssize_t
@@ -198,6 +283,22 @@ console_write(void *ctx, const void *data, size_t count)
     (void)ctx;
     if (count == 0) {
         return 0;
+    }
+    /* Non-interactive stdout (a `|` pipe or `>`/`>a` redirect) must reach the
+       shell's StdOut handle: for a pipe the shell wires that handle but leaves
+       gST->ConOut pointing at the console, so a ConOut write would print to the
+       screen instead of feeding the next stage. The interactive console keeps
+       the ConOut path so the console subsystem (tap / mirror / device) still
+       observes the bytes.
+       Asymmetry with stdin worth knowing: a GetFileSize-hostile firmware
+       classifies as non-interactive here and we WRITE UCS-2 to the handle. If
+       that handle is really the console, output still displays intact (UCS-2 to
+       a console handle is not mangled) but bypasses the tap/mirror/device
+       subsystem — a display-only degradation, never lost output. OVMF/EDK2
+       always provide GetFileSize, so this is a theoretical edge. */
+    AxlFileHandle h = axl_backend_shell_stdout();
+    if (h != NULL && !stdout_interactive_for(h)) {
+        return console_write_shell_ucs2(h, data, count);
     }
     return console_write_via(data, count, axl_backend_console_write);
 }

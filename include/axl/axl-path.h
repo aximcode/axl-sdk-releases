@@ -151,13 +151,17 @@ axl_path_search(
  *   1. If @p override_path is non-NULL and the file exists, use it.
  *   2. Companion path beside the running binary. Two anchors are
  *      tried in order:
- *        a. axl_app_image_path — canonical FILEPATH from
- *           EFI_LOADED_IMAGE_PROTOCOL. Reliable regardless of how
- *           the shell invoked the binary (basename vs full path,
- *           cwd-rooted vs absolute).
+ *        a. The canonical FILEPATH from EFI_LOADED_IMAGE_PROTOCOL —
+ *           reliable regardless of how the shell invoked the binary
+ *           (basename vs full path, cwd-rooted vs absolute). For an
+ *           image with no file of its own (a buffer-loaded driver, for
+ *           which axl_app_image_path correctly reports NULL) this walks
+ *           up the ParentHandle chain to the nearest image that DOES
+ *           have one — normally the launcher that loaded it, whose
+ *           directory is where the sidecar actually lives.
  *        b. axl_app_argv0 — the shell-supplied invocation
- *           string. Fallback for synthetic load contexts where the
- *           image path is unavailable.
+ *           string. Fallback when no image in the chain came from a
+ *           file (network / RAM-disk boot).
  *   3. @p name as-is (current working directory).
  *
  * Returns the first path that exists. Caller must axl_free() the

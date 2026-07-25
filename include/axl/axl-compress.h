@@ -21,8 +21,8 @@
  * @code
  * void  *gz;
  * size_t gz_len;
- * if (axl_compress(AXL_COMPRESS_GZIP, data, len, &gz, &gz_len,
- *                  AXL_COMPRESS_LEVEL_DEFAULT) == AXL_OK) {
+ * if (axl_compress(AXL_COMPRESS_GZIP, data, len,
+ *                  AXL_COMPRESS_LEVEL_DEFAULT, &gz, &gz_len) == AXL_OK) {
  *     // gz/gz_len is a complete .gz member; ships to disk or the wire.
  *     axl_free(gz);
  * }
@@ -84,9 +84,9 @@ axl_compress(
     AxlCompressFormat fmt,      ///< output framing
     const void       *in,       ///< input bytes (may be NULL iff in_len == 0)
     size_t            in_len,   ///< input length
+    int               level,    ///< 0..9, or AXL_COMPRESS_LEVEL_DEFAULT
     void            **out,      ///< [out] allocated compressed buffer (axl_free)
-    size_t           *out_len,  ///< [out] compressed length
-    int               level     ///< 0..9, or AXL_COMPRESS_LEVEL_DEFAULT
+    size_t           *out_len   ///< [out] compressed length
 );
 
 /**

@@ -16,6 +16,7 @@
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
 #include <uefi/axl-uefi.h>
+#include <uefi/generated/guid-names.h>   /* axl_guid_name_table (spec names) */
 
 AXL_LOG_DOMAIN("driverinfo");
 
@@ -692,50 +693,41 @@ axl_protocol_guid_name(const AxlGuid *guid, char *out, size_t cap)
         return AXL_ERR;
     }
 
-    /* The networking stack lives in axl_net_protocol_name; consult it first so
-       there is a single source of truth for the net names. */
-    if (axl_net_protocol_name(guid, out, cap) == AXL_OK) {
+    for (size_t i = 0; i < AXL_GUID_NAME_TABLE_COUNT; i++) {
+        if (!axl_guid_equal((const AxlGuid *)axl_guid_name_table[i].guid, guid)) {
+            continue;
+        }
+        /* Fail rather than truncate: a shortened name is not the canonical
+           identifier the caller will grep the headers for, and reporting it
+           as success would hide that. */
+        if (axl_strlen(axl_guid_name_table[i].name) + 1 > cap) {
+            return AXL_ERR;
+        }
+        axl_strlcpy(out, axl_guid_name_table[i].name, cap);
         return AXL_OK;
     }
-    out[0] = '\0';
-
-    /* The common device / driver / bus / console protocols a Devices view
-       shows. Same file-scope-static GUID symbols as elsewhere. */
-    static const struct {
-        const EFI_GUID *guid;
-        const char     *name;
-    } proto_names[] = {
-        { &gEfiDevicePathProtocolGuid,              "DevicePath"            },
-        { &gEfiDevicePathToTextProtocolGuid,        "DevicePathToText"      },
-        { &gEfiLoadedImageProtocolGuid,             "LoadedImage"           },
-        { &gEfiLoadedImageDevicePathProtocolGuid,   "LoadedImageDevicePath" },
-        { &gEfiDriverBindingProtocolGuid,           "DriverBinding"         },
-        { &gEfiComponentName2ProtocolGuid,          "ComponentName2"        },
-        { &gEfiSimpleFileSystemProtocolGuid,        "SimpleFileSystem"      },
-        { &gEfiBlockIoProtocolGuid,                 "BlockIo"               },
-        { &gEfiBlockIo2ProtocolGuid,                "BlockIo2"              },
-        { &gEfiDiskIoProtocolGuid,                  "DiskIo"                },
-        { &gEfiPciIoProtocolGuid,                   "PciIo"                 },
-        { &gEfiPciRootBridgeIoProtocolGuid,         "PciRootBridgeIo"       },
-        { &gEfiGraphicsOutputProtocolGuid,          "GraphicsOutput"        },
-        { &gEfiSimpleTextInputExProtocolGuid,       "SimpleTextInputEx"     },
-        { &gEfiSerialIoProtocolGuid,                "SerialIo"              },
-        { &gEfiSimplePointerProtocolGuid,           "SimplePointer"         },
-        { &gEfiAbsolutePointerProtocolGuid,         "AbsolutePointer"       },
-        { &gEfiUsbIoProtocolGuid,                   "UsbIo"                 },
-        { &gEfiUsb2HcProtocolGuid,                  "Usb2Hc"                },
-        { &gEfiNvmExpressPassThruProtocolGuid,      "NvmExpressPassThru"    },
-        { &gEfiAtaPassThruProtocolGuid,             "AtaPassThru"           },
-        { &gEfiNetworkInterfaceIdentifierProtocolGuid_31, "Nii"            },
-    };
-
-    for (size_t i = 0; i < sizeof(proto_names) / sizeof(proto_names[0]); i++) {
-        if (axl_guid_equal((const AxlGuid *)proto_names[i].guid, guid)) {
-            axl_strlcpy(out, proto_names[i].name, cap);
-            return AXL_OK;
-        }
-    }
     return AXL_ERR;
+}
+
+size_t
+axl_protocol_name_count(void)
+{
+    return AXL_GUID_NAME_TABLE_COUNT;
+}
+
+int
+axl_protocol_name_at(size_t index, const AxlGuid **guid, const char **name)
+{
+    if (index >= AXL_GUID_NAME_TABLE_COUNT) {
+        return AXL_ERR;
+    }
+    if (guid != NULL) {
+        *guid = (const AxlGuid *)axl_guid_name_table[index].guid;
+    }
+    if (name != NULL) {
+        *name = axl_guid_name_table[index].name;
+    }
+    return AXL_OK;
 }
 
 /* Does @p parent produce @p child — i.e. did @p child open one of @p parent's

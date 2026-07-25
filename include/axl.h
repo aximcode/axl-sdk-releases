@@ -73,7 +73,8 @@
 #include <axl/axl-sys.h>
 #include <axl/axl-cpu.h>
 #include <axl/axl-nvstore.h>
-#include <axl/axl-port.h>
+#include <axl/axl-attempt.h>
+#include <axl/axl-io-port.h>
 #include <axl/axl-boot.h>
 #include <axl/axl-acpi.h>
 #include <axl/axl-sidecar.h>
@@ -83,6 +84,7 @@
 #include <axl/axl-nvme.h>
 #include <axl/axl-ata.h>
 #include <axl/axl-scsi.h>
+#include <axl/axl-storage.h>
 #include <axl/axl-smart.h>
 #include <axl/axl-serial.h>
 #include <axl/axl-fv.h>
@@ -91,6 +93,7 @@
 #include <axl/axl-hii.h>
 #include <axl/axl-ramdisk.h>
 #include <axl/axl-driver.h>
+#include <axl/axl-driver-deps.h>
 #include <axl/axl-driver-info.h>
 #include <axl/axl-embed.h>
 #include <axl/axl-service.h>
@@ -102,6 +105,8 @@
 #include <axl/axl-console-tap.h>
 #include <axl/axl-console-device.h>
 #include <axl/axl-console-mirror.h>
+#include <axl/axl-console-vt-enc.h>
+#include <axl/axl-console-tee.h>
 #include <axl/axl-console-term.h>
 #include <axl/axl-console-screen.h>
 #include <axl/axl-mem-phys.h>
@@ -131,6 +136,7 @@
 #include <axl/axl-async.h>
 #include <axl/axl-net.h>
 #include <axl/axl-net-opts.h>
+#include <axl/axl-9p.h>
 #include <axl/axl-gfx.h>
 #include <axl/axl-edid.h>
 #include <axl/axl-input.h>
@@ -390,8 +396,8 @@ void _axl_cleanup(void);
   static int _axl_sd_unload(AxlHandle _h) {                                 \
     (void)_h;                                                               \
     if (_axl_sd_handle != NULL) {                                           \
-      axl_shared_driver_unpublish((name_str), _axl_sd_handle,               \
-                                   &_axl_sd_vtable);                        \
+      axl_shared_driver_unpublish((name_str), &_axl_sd_vtable,              \
+                                   _axl_sd_handle);                         \
     }                                                                       \
     return unload_fn();                                                     \
   }                                                                         \
@@ -485,10 +491,14 @@ void _axl_cleanup(void);
  * is the bare-bones macro for drivers that don't run a service
  * (publish-protocol-and-leave style). Pick one.
  */
+/* No cast on the returned status: _axl_service_driver_init already
+ * returns AxlEfiStatus. A widening cast here used to hide the fact
+ * that the callee narrowed to `int` first, stripping the EFI error
+ * bit and turning every setup failure into a "successful" load. */
 #define AXL_SERVICE_DRIVER(svc)                                            \
   AXL_ENTRY_LINKAGE AxlEfiStatus AXLAPI                                                       \
   DriverEntry(AxlHandle _ImageHandle, AxlSystemTable *_SystemTable) {       \
-    return (AxlEfiStatus)_axl_service_driver_init(                          \
+    return _axl_service_driver_init(                                        \
                (void *)_ImageHandle, (void *)_SystemTable, &(svc));         \
   }
 

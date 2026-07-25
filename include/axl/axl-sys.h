@@ -263,9 +263,12 @@ axl_device_path_to_text(
 // System control
 // ---------------------------------------------------------------------------
 
-#define AXL_RESET_COLD      0  ///< cold reset (full power cycle)
-#define AXL_RESET_WARM      1  ///< warm reset (CPU reset, memory preserved)
-#define AXL_RESET_SHUTDOWN  2  ///< power off
+/// How the system should be reset — the @p type argument to axl_reset.
+typedef enum {
+    AXL_RESET_COLD     = 0,  ///< cold reset (full power cycle)
+    AXL_RESET_WARM     = 1,  ///< warm reset (CPU reset, memory preserved)
+    AXL_RESET_SHUTDOWN = 2   ///< power off
+} AxlResetType;
 
 /**
  * @brief Reset or shut down the system.
@@ -274,7 +277,7 @@ axl_device_path_to_text(
  */
 void
 axl_reset(
-    int type  ///< AXL_RESET_COLD, AXL_RESET_WARM, or AXL_RESET_SHUTDOWN
+    AxlResetType type  ///< AXL_RESET_COLD, AXL_RESET_WARM, or AXL_RESET_SHUTDOWN
 );
 
 /**
@@ -485,9 +488,9 @@ axl_protocol_register(
  */
 int
 axl_protocol_unregister(
-    void       *handle,     ///< handle from axl_protocol_register
     const char *name,       ///< protocol name
-    void       *interface   ///< interface to remove
+    void       *interface,  ///< interface to remove
+    void       *handle      ///< handle from axl_protocol_register
 );
 
 /**

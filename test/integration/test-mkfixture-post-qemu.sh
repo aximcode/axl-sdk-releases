@@ -19,10 +19,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RUN_QEMU="$PROJECT_DIR/scripts/run-qemu.sh"
 MKFIXTURE="$PROJECT_DIR/out/native-x64/tools/mkfixture.efi"
-# This test drives run-qemu.sh directly (no common-test.sh), so it derives its
-# host port from TEST_PORT_BASE inline rather than via the test_port helper.
-# run-integration.sh exports a distinct base per worker; standalone falls back.
-PORT=$(( ${TEST_PORT_BASE:-18000} + 0 ))
+# This test drives run-qemu.sh directly (no common-test.sh), so it resolves its
+# own host port rather than via the test_port helper. An explicit
+# TEST_PORT_BASE still wins; otherwise claim one that is verified free now and
+# hold it for this shell's lifetime, so a second independent run of the suite
+# cannot land the collector on the same port.
+if [[ -n "${TEST_PORT_BASE:-}" ]]; then
+    PORT=$(( TEST_PORT_BASE + 0 ))
+else
+    source "$PROJECT_DIR/scripts/axl-common.sh"
+    axl_alloc_host_port PORT || exit 1
+fi
 
 export TEST_SKIP_RATCHET=1
 PASS=0

@@ -102,7 +102,7 @@ main(int argc, char **argv)
         }
 
         axl_printf("  disconnected\n");
-        axl_socket_free(client);
+        axl_socket_free(client, AXL_TEARDOWN_GRACEFUL);
     }
 
     axl_printf("echo-server-sync: shutting down\n");

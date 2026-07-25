@@ -78,6 +78,15 @@ typedef enum {
         if (*p) { free_func(*p); }                                      \
     }
 
+/* Like AXL_DEFINE_AUTOPTR_CLEANUP but for a destructor that takes a fixed
+ * second argument — e.g. a teardown-mode enum. Scope-exit cleanup always
+ * passes @p arg (destruction is graceful; a caller that wants a different
+ * mode calls the destructor explicitly). */
+#define AXL_DEFINE_AUTOPTR_CLEANUP_ARG(Type, free_func, arg)            \
+    static inline void _axl_autoptr_cleanup_##Type(Type **p) {          \
+        if (*p) { free_func(*p, (arg)); }                              \
+    }
+
 #define AXL_AUTOPTR(Type)  __attribute__((cleanup(_axl_autoptr_cleanup_##Type))) Type *
 
 // ---------------------------------------------------------------------------

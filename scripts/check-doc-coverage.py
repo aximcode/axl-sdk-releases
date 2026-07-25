@@ -36,24 +36,19 @@ SPHINX_DIR = ROOT / "docs" / "sphinx"
 
 # Headers that legitimately have no API-reference page.
 EXEMPT: set[str] = {
-    "axl.h",            # umbrella — includes every other public header
-    "axl-macros.h",     # AXL_APP / AXL_DRIVER entry glue + helper macros
-    "axl-types.h",      # foundational typedefs, pulled in everywhere
-    "axl-version.h",    # generated version constants
-    "axl-mem-impl.h",   # inline allocator impl detail behind axl-mem.h
+    "axl.h",             # umbrella — includes every other public header
+    "axl-macros.h",      # AXL_APP / AXL_DRIVER entry glue + helper macros
+    "axl-types.h",       # foundational typedefs, pulled in everywhere
+    "axl-version.h",     # generated version constants
+    "axl-mem-impl.h",    # inline allocator impl detail behind axl-mem.h
+    "axl-gfx.h",         # umbrella — includes every axl-gfx-*.h sub-header,
+                          # each of which is individually wired in modules/gfx.rst
 }
 
 # Tracked backlog: real public API not yet in the Sphinx reference. Pre-existing
 # at the time this gate was added; NOT a license to add more. Wire one in (give
 # it a `.. doxygenfile::` directive) and drop it from this set.
-TODO: set[str] = {
-    "axl-ata.h",
-    "axl-scsi.h",
-    "axl-smart.h",
-    "axl-gfx.h",
-    "axl-jose.h",
-    "axl-crashrecord.h",
-}
+TODO: set[str] = set()
 
 
 def referenced_headers() -> set[str]:

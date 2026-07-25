@@ -51,7 +51,7 @@ test_compositor_lifecycle(void)
     test_check(axl_gfx_buffer_get_info(axl_compositor_output(c), &w, &h) == AXL_OK
                && w == SW && h == SH, "compositor: output buffer is the right size");
 
-    AxlSurface *s = axl_surface_create(axl_compositor_root(c), 40, 30);
+    AxlSurface *s = axl_surface_new(axl_compositor_root(c), 40, 30);
     test_check(s != NULL, "compositor: surface created");
     int32_t x = -1, y = -1; uint32_t sw = 0, sh = 0;
     axl_surface_get_geometry(s, &x, &y, &sw, &sh);
@@ -61,10 +61,10 @@ test_compositor_lifecycle(void)
     test_check(axl_surface_buffer(s) != NULL, "compositor: surface has a buffer");
 
     /* NULL / root-guard safety. */
-    test_check(axl_surface_create(NULL, 10, 10) == NULL, "compositor: create(NULL parent)");
-    test_check(axl_surface_create(axl_compositor_root(c), 0, 10) == NULL,
+    test_check(axl_surface_new(NULL, 10, 10) == NULL, "compositor: create(NULL parent)");
+    test_check(axl_surface_new(axl_compositor_root(c), 0, 10) == NULL,
                "compositor: create(zero w)");
-    axl_surface_destroy(NULL);
+    axl_surface_free(NULL);
     axl_compositor_free(c);
 }
 
@@ -76,8 +76,8 @@ test_compositor_stacking(void)
     const AxlGfxPixel GRN = AXL_GFX_RGB(0x10, 0xE0, 0x10);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);  /* bottom */
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);  /* top    */
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);  /* bottom */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);  /* top    */
     axl_surface_move(a, 10, 10);   /* covers x,y 10..40 */
     axl_surface_move(b, 25, 25);   /* covers x,y 25..55, overlaps a on 25..40 */
     fill_surface(a, 30, 30, RED);
@@ -113,9 +113,9 @@ test_compositor_nested(void)
     const AxlGfxPixel YEL = AXL_GFX_RGB(0xE0, 0xE0, 0x10);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *parent = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *parent = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(parent, 20, 20);          /* parent abs 20..60 */
-    AxlSurface *child = axl_surface_create(parent, 20, 20);
+    AxlSurface *child = axl_surface_new(parent, 20, 20);
     axl_surface_move(child, 5, 5);             /* child abs = 25..45 (relative!) */
     fill_surface(parent, 40, 40, BLU);
     fill_surface(child, 20, 20, YEL);
@@ -132,7 +132,7 @@ test_compositor_nested(void)
     test_check(rgb_eq(scan_at(c, 60, 25), YEL), "nested: child followed the parent (relative pos)");
 
     /* Destroy the parent: the child dies with it; the area clears. */
-    axl_surface_destroy(parent);
+    axl_surface_free(parent);
     axl_compositor_composite(c);
     test_check(rgb_eq(scan_at(c, 52, 12), BG), "nested: destroying parent removes the subtree");
     test_check(rgb_eq(scan_at(c, 60, 25), BG), "nested: child gone with parent");
@@ -148,7 +148,7 @@ test_compositor_offedge(void)
     const AxlGfxPixel GRN = AXL_GFX_RGB(0x10, 0xE0, 0x10);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *s = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *s = axl_surface_new(axl_compositor_root(c), 30, 30);
     /* Left 15 cols red, right 15 cols green — so the source-column offset
        is observable. */
     axl_gfx_target_buffer(axl_surface_buffer(s));
@@ -179,8 +179,8 @@ test_compositor_raise_lower(void)
     const AxlGfxPixel GRN = AXL_GFX_RGB(0x10, 0xE0, 0x10);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
     axl_surface_move(b, 10, 10);   /* exactly over A — B created later, so on top */
     fill_surface(a, 30, 30, RED);
@@ -215,8 +215,8 @@ test_compositor_reparent(void)
     const AxlGfxPixel YEL = AXL_GFX_RGB(0xE0, 0xE0, 0x10);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), 40, 40);
-    AxlSurface *q = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), 40, 40);
+    AxlSurface *q = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(p, 20, 20);   /* P abs 20..60 */
     axl_surface_move(q, 5, 5);     /* Q abs 5..25 (top-level) */
     fill_surface(p, 40, 40, BLU);
@@ -250,8 +250,8 @@ test_compositor_occlusion(void)
     const AxlGfxPixel BLU = AXL_GFX_RGB(0x10, 0x10, 0xE0);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* full, bottom */
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), SW, SH);  /* full, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* full, bottom */
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), SW, SH);  /* full, top */
     fill_surface(b, SW, SH, BLU);
     fill_surface(a, SW, SH, RED);
 
@@ -270,7 +270,7 @@ test_compositor_occlusion(void)
        non-opaque, add a half-width opaque D on top. No full-cover opaque
        exists, so all three paint and both halves render correctly. */
     axl_surface_set_opaque(a, false);
-    AxlSurface *d = axl_surface_create(axl_compositor_root(c), SW / 2, SH);
+    AxlSurface *d = axl_surface_new(axl_compositor_root(c), SW / 2, SH);
     fill_surface(d, SW / 2, SH, GRN);
     axl_surface_set_opaque(d, true);
     axl_compositor_composite(c);
@@ -298,8 +298,8 @@ test_compositor_opacity(void)
     const AxlGfxPixel VEIL = AXL_GFX_RGB(0x10, 0x10, 0x10);  /* dim */
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* backdrop */
-    AxlSurface *v = axl_surface_create(axl_compositor_root(c), SW, SH);  /* veil, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* backdrop */
+    AxlSurface *v = axl_surface_new(axl_compositor_root(c), SW, SH);  /* veil, top */
     fill_surface(b, SW, SH, RED);
     fill_surface(v, SW, SH, VEIL);
 
@@ -355,8 +355,8 @@ test_compositor_per_pixel_alpha(void)
     const AxlGfxPixel GRN = AXL_GFX_RGB(0x20, 0xC0, 0x20);   /* opaque body     */
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* backdrop */
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), SW, SH);  /* top      */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* backdrop */
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), SW, SH);  /* top      */
     fill_surface(b, SW, SH, RED);
 
     /* Paint the top surface by raw pixel writes: a transparent field with one
@@ -399,7 +399,7 @@ static void
 test_compositor_damage(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(a, 10, 10);
     fill_surface(a, 20, 20, AXL_GFX_RGB(0x80, 0x80, 0x80));
 
@@ -444,8 +444,8 @@ static void
 test_compositor_damage_region(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 10, 10);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 10, 10);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 10, 10);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 10, 10);
     axl_surface_move(a, 0, 0);
     axl_surface_move(b, 60, 60);
     (void)axl_compositor_present(c);   /* consume create/move damage */
@@ -488,8 +488,8 @@ test_compositor_incremental_composite(void)
     const AxlGfxPixel RED = AXL_GFX_RGB(0xE0, 0x10, 0x10);
     const AxlGfxPixel BLU = AXL_GFX_RGB(0x10, 0x10, 0xE0);
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 10, 10);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 10, 10);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 10, 10);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 10, 10);
     axl_surface_move(a, 0, 0);
     axl_surface_move(b, 60, 60);
     fill_surface(a, 10, 10, RED);
@@ -525,8 +525,8 @@ test_compositor_partial_occlusion(void)
     const AxlGfxPixel RED = AXL_GFX_RGB(0xE0, 0x10, 0x10);
     const AxlGfxPixel BLU = AXL_GFX_RGB(0x10, 0x10, 0xE0);
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* full, bottom */
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);  /* corner, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* full, bottom */
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);  /* corner, top */
     axl_surface_move(a, 0, 0);
     fill_surface(b, SW, SH, BLU);
     fill_surface(a, 20, 20, RED);
@@ -557,9 +557,9 @@ test_compositor_occlusion_oom(void)
     bool ok = true;
     for (size_t n = 1; n <= 16 && ok; n++) {
         AxlCompositor *c = axl_compositor_new(SW, SH);
-        AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* full */
-        AxlSurface *a1 = axl_surface_create(axl_compositor_root(c), 20, 20); /* corner */
-        AxlSurface *a2 = axl_surface_create(axl_compositor_root(c), 20, 20); /* far corner */
+        AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* full */
+        AxlSurface *a1 = axl_surface_new(axl_compositor_root(c), 20, 20); /* corner */
+        AxlSurface *a2 = axl_surface_new(axl_compositor_root(c), 20, 20); /* far corner */
         axl_surface_move(a1, 0, 0);
         axl_surface_move(a2, 60, 40);
         fill_surface(b, SW, SH, BLU);
@@ -603,8 +603,8 @@ test_compositor_occlusion_hoist(void)
     const AxlGfxPixel RED = AXL_GFX_RGB(0xE0, 0x10, 0x10);
     const AxlGfxPixel BLU = AXL_GFX_RGB(0x10, 0x10, 0xE0);
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* full, bottom */
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);  /* corner, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* full, bottom */
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);  /* corner, top */
     axl_surface_move(a, 0, 0);
     fill_surface(b, SW, SH, BLU);
     fill_surface(a, 20, 20, RED);
@@ -651,8 +651,8 @@ test_compositor_backdrop_blur(void)
     const uint32_t R = 6;
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* backdrop */
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), SW, SH);  /* veil, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* backdrop */
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), SW, SH);  /* veil, top */
 
     /* Backdrop: a sharp vertical edge — left half black, right half white. */
     axl_gfx_target_buffer(axl_surface_buffer(b));
@@ -728,8 +728,8 @@ test_compositor_backdrop_blur_cache(void)
                                         value differs sharply by pattern + radius */
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), SW, SH);  /* backdrop */
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), SW, SH);  /* veil, top */
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);  /* backdrop */
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), SW, SH);  /* veil, top */
 
     /* Transparent veil so the output IS the blurred backdrop (isolate the blur). */
     AxlGfxPixel *pp = axl_gfx_buffer_pixels(axl_surface_buffer(p));
@@ -817,8 +817,8 @@ static void
 test_compositor_frame_callbacks(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 10, 10);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 10, 10);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 10, 10);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 10, 10);
 
     test_check(!axl_compositor_has_pending_frames(c),
                "frame: none pending initially");
@@ -867,7 +867,7 @@ test_compositor_frame_callbacks(void)
     /* Destroying a surface cancels its pending callback (no stale fire). */
     FrameRec re = {0};
     axl_surface_request_frame(a, frame_rec_cb, &re);
-    axl_surface_destroy(a);
+    axl_surface_free(a);
     test_check(!axl_compositor_has_pending_frames(c),
                "frame: destroy cancels the pending callback");
     axl_compositor_dispatch_frame(c, 5000);
@@ -942,7 +942,7 @@ test_compositor_frame_clock(void)
 {
     AxlLoop *loop = axl_loop_new();
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 10, 10);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 10, 10);
 
     AxlSourceId id = axl_compositor_attach_frame_clock(c, loop, 10);
     test_check(id != 0, "frame-clock: attached, non-zero source id");
@@ -1044,7 +1044,7 @@ test_surface_resize(void)
     const AxlGfxPixel BG  = AXL_GFX_RGB(0x00, 0x00, 0x00);
 
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *s = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *s = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(s, 10, 10);          /* abs 10..30 */
     fill_surface(s, 20, 20, RED);
     (void)axl_compositor_present(c);       /* consume the create/move damage */
@@ -1086,8 +1086,8 @@ static void
 test_surface_absolute(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), 50, 50);
-    AxlSurface *ch = axl_surface_create(p, 20, 20);
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), 50, 50);
+    AxlSurface *ch = axl_surface_new(p, 20, 20);
     axl_surface_move(p, 40, 30);    /* parent abs (40,30) */
     axl_surface_move(ch, 10, 10);   /* relative → child abs (50,40) */
 
@@ -1124,8 +1124,8 @@ static void
 test_seat_hittest(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);   /* abs 10..40 */
     axl_surface_move(b, 25, 25);   /* abs 25..55, overlaps a on 25..40 */
     Recorder ra = {0}, rb = {0};
@@ -1161,7 +1161,7 @@ static void
 test_seat_buttons_axis(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(a, 10, 10);
     Recorder ra = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1205,7 +1205,7 @@ static void
 test_seat_modifiers_clicks(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(a, 10, 10);
     Recorder ra = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1242,8 +1242,8 @@ test_seat_refocus(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
     /* a and b fully overlap at abs 10..40; b on top initially. */
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
     axl_surface_move(b, 10, 10);
     Recorder ra = {0}, rb = {0};
@@ -1276,9 +1276,9 @@ static void
 test_seat_refocus_lower_reparent(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *p = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *p = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(a, 10, 10);   /* abs 10..40 */
     axl_surface_move(b, 10, 10);   /* abs 10..40, over a */
     axl_surface_move(p, 60, 60);   /* abs 60..80, clear of the pointer */
@@ -1310,8 +1310,8 @@ static void
 test_seat_destroy_refocus(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
     axl_surface_move(b, 10, 10);   /* fully over a, on top */
     Recorder ra = {0}, rb = {0};
@@ -1324,7 +1324,7 @@ test_seat_destroy_refocus(void)
 
     /* Destroy the focused surface: the one beneath re-enters (no leave on the
        dead surface). */
-    axl_surface_destroy(b);
+    axl_surface_free(b);
     test_check(ra.enters == 1, "destroy: destroying focused b re-enters a beneath");
     test_check(ra.leaves == 0, "destroy: a only enters (was never focused before)");
 
@@ -1335,8 +1335,8 @@ static void
 test_seat_input_region(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 40, 40);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 40, 40);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(a, 10, 10);   /* abs 10..50 */
     axl_surface_move(b, 10, 10);   /* exactly over a, on top */
     Recorder ra = {0}, rb = {0};
@@ -1381,7 +1381,7 @@ static void
 test_seat_nulls(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
 
     /* A listener with NULL callback fields: the seat skips them (no crash),
@@ -1409,7 +1409,7 @@ static void
 test_seat_pointer_gating(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
     Recorder ra = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1417,7 +1417,7 @@ test_seat_pointer_gating(void)
     /* No pointer event has ever arrived: surface changes synthesize nothing
        (a stationary pointer needs a known position first — headless arches
        and pre-input startup must stay silent). */
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(b, 60, 50);
     test_check(ra.enters == 0, "gating: no enter before the first pointer event");
 
@@ -1433,9 +1433,9 @@ static void
 test_seat_hidden_parent(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *parent = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *parent = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(parent, 10, 10);            /* abs 10..50 */
-    AxlSurface *child = axl_surface_create(parent, 20, 20);
+    AxlSurface *child = axl_surface_new(parent, 20, 20);
     axl_surface_move(child, 5, 5);               /* abs 15..35 (parent-relative) */
     Recorder rc = {0};
     axl_surface_set_listener(child, &REC_LISTENER, &rc);
@@ -1467,9 +1467,9 @@ static void
 test_seat_grab(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a  = axl_surface_create(axl_compositor_root(c), 20, 20);
-    AxlSurface *m  = axl_surface_create(axl_compositor_root(c), 20, 20);  /* "menu" */
-    AxlSurface *mc = axl_surface_create(m, 20, 20);                        /* submenu child of m */
+    AxlSurface *a  = axl_surface_new(axl_compositor_root(c), 20, 20);
+    AxlSurface *m  = axl_surface_new(axl_compositor_root(c), 20, 20);  /* "menu" */
+    AxlSurface *mc = axl_surface_new(m, 20, 20);                        /* submenu child of m */
     axl_surface_move(a, 5, 5);     /* abs 5..25 */
     axl_surface_move(m, 40, 40);   /* abs 40..60 */
     axl_surface_move(mc, 0, 20);   /* rel → abs x 40..60, y 60..80 */
@@ -1518,7 +1518,7 @@ static void
 test_seat_grab_inside_click(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *m = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *m = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(m, 20, 20);
     Recorder rm = {0};
     axl_surface_set_listener(m, &REC_LISTENER, &rm);
@@ -1538,7 +1538,7 @@ static void
 test_seat_grab_dismiss_empty(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *m = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *m = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(m, 40, 40);   /* abs 40..60 */
     Recorder rm = {0};
     axl_surface_set_listener(m, &REC_LISTENER, &rm);
@@ -1561,9 +1561,9 @@ test_seat_grab_nested(void)
     AxlCompositor *c = axl_compositor_new(SW, SH);
     /* Outer grab a (big); inner grab b is a CHILD of a (so a's body is inside
        a's subtree but outside b's subtree). */
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 60, 60);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 60, 60);
     axl_surface_move(a, 5, 5);          /* abs 5..65 */
-    AxlSurface *b = axl_surface_create(a, 20, 20);
+    AxlSurface *b = axl_surface_new(a, 20, 20);
     axl_surface_move(b, 40, 40);        /* rel → abs 45..65 */
     Recorder ra = {0}, rb = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1600,8 +1600,8 @@ static void
 test_seat_grab_chain(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(a, 5, 5);     /* abs 5..25  (the menu)    */
     axl_surface_move(b, 50, 50);   /* abs 50..70 (its submenu) */
     Recorder ra = {0}, rb = {0};
@@ -1642,8 +1642,8 @@ static void
 test_seat_grab_lifo(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(a, 5, 5);     /* abs 5..25 */
     axl_surface_move(b, 50, 50);   /* abs 50..70 */
     Recorder ra = {0}, rb = {0};
@@ -1683,8 +1683,8 @@ static void
 test_seat_keyboard(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 20, 20);
     Recorder ra = {0}, rb = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
     axl_surface_set_listener(b, &REC_LISTENER, &rb);
@@ -1724,7 +1724,7 @@ static void
 test_seat_destroy_purges(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(a, 10, 10);
     Recorder ra = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1735,12 +1735,12 @@ test_seat_destroy_purges(void)
 
     /* Destroy the grabbing + keyboard-focused surface: seat state is purged,
        no callbacks on the dead surface, no crash. */
-    axl_surface_destroy(a);
+    axl_surface_free(a);
     test_check(axl_compositor_keyboard_focus(c) == NULL, "purge: destroy clears keyboard focus");
 
     /* The grab is gone: a fresh surface routes normally, with no stale-grab
        confinement and no dismiss callback firing. */
-    AxlSurface *b = axl_surface_create(axl_compositor_root(c), 30, 30);
+    AxlSurface *b = axl_surface_new(axl_compositor_root(c), 30, 30);
     axl_surface_move(b, 10, 10);
     Recorder rb = {0};
     axl_surface_set_listener(b, &REC_LISTENER, &rb);
@@ -1762,7 +1762,7 @@ static void
 test_seat_grab_nulls(void)
 {
     AxlCompositor *c = axl_compositor_new(SW, SH);
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 20, 20);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 20, 20);
     axl_surface_move(a, 5, 5);
     Recorder ra = {0};
     axl_surface_set_listener(a, &REC_LISTENER, &ra);
@@ -1796,7 +1796,7 @@ test_seat_cursor(void)
     AxlCursor *cur = axl_compositor_cursor(c);
     test_check(cur != NULL, "cursor: the compositor owns a cursor overlay");
 
-    AxlSurface *a = axl_surface_create(axl_compositor_root(c), 40, 40);
+    AxlSurface *a = axl_surface_new(axl_compositor_root(c), 40, 40);
     axl_surface_move(a, 10, 10);
     fill_surface(a, 40, 40, AXL_GFX_RGB(0xC0, 0x30, 0x30));
     axl_compositor_composite(c);
@@ -1932,7 +1932,7 @@ test_compositor_fuzz(void)
                 if (slot < 0) break;   /* pool full */
                 int pidx = (fz_next() & 1) ? idx : -1;   /* -1 = root */
                 AxlSurface *par = (pidx == -1) ? axl_compositor_root(c) : pool[pidx].s;
-                AxlSurface *ns = axl_surface_create(par, 1 + fz_next() % 30, 1 + fz_next() % 24);
+                AxlSurface *ns = axl_surface_new(par, 1 + fz_next() % 30, 1 + fz_next() % 24);
                 if (ns != NULL) {
                     axl_surface_move(ns, (int32_t)(fz_next() % SW), (int32_t)(fz_next() % SH));
                     pool[slot] = (FzSlot){ ns, pidx, true };
@@ -1958,7 +1958,7 @@ test_compositor_fuzz(void)
                 break;
             }
             case 7: if (idx >= 0) {   /* destroy a subtree */
-                axl_surface_destroy(pool[idx].s);
+                axl_surface_free(pool[idx].s);
                 fz_kill_subtree(pool, idx);
                 break;
             }

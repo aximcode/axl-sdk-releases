@@ -24,6 +24,7 @@
 
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-attempt.h>   /* AxlAttempt — shared driver-quarantine namespace */
 
 /* AxlIPv4Address (legacy IPv4 type) is declared in axl-inet-address.h
  * alongside AxlInetAddress / AxlSocketAddress. Pull that in first so
@@ -124,13 +125,13 @@ axl_net_ping_ex(
 );
 
 /**
- * @brief Result of an @c axl_sntp_query.
+ * @brief Result of an @c axl_net_sntp_query.
  */
 typedef struct {
     int64_t unix_secs;   ///< server time as Unix seconds (UTC); 0 if unreachable
     int32_t offset_ms;   ///< (server time - local RTC) in ms; 0 if the local clock is unknown
     bool    reachable;   ///< true if the server answered
-} AxlSntpResult;
+} AxlNetSntpResult;
 
 /**
  * @brief Query an SNTP/NTP server for the current time (RFC 4330).
@@ -146,11 +147,11 @@ typedef struct {
  *     @p server, no network, or a timeout (@p out->reachable == false).
  */
 int
-axl_sntp_query(
+axl_net_sntp_query(
     const char     *server,      ///< NTP server hostname or dotted-decimal IPv4
     uint16_t        port,        ///< UDP port (0 selects the standard 123)
     size_t          timeout_ms,  ///< response timeout in milliseconds
-    AxlSntpResult  *out          ///< [out] query result
+    AxlNetSntpResult  *out          ///< [out] query result
 );
 
 /**
@@ -165,20 +166,24 @@ typedef struct {
  * @brief Read the ARP (IPv4 neighbor) cache for a network interface.
  *
  * Lists the resolved IPv4<->MAC entries the firmware's ARP layer holds for
- * the @p nic'th ARP-capable interface — the UEFI equivalent of `arp -a` /
- * the neighbor table. Only Ethernet (6-byte MAC) / IPv4 (4-byte) entries are
- * reported.
+ * @p nic — the UEFI equivalent of `arp -a` / the neighbor table. Only
+ * Ethernet (6-byte MAC) / IPv4 (4-byte) entries are reported.
+ *
+ * @p nic is the same per-physical-NIC ordinal as @c axl_net_list_interfaces
+ * and every other net API taking a NIC index — not a raw ARP
+ * service-binding handle index (that enumerates independently of the NIC
+ * list, and can diverge from it in both order and count).
  *
  * @return AXL_OK on success — @p count is the total entry count (which may
  *     exceed @p cap, signalling truncation; @p out may be NULL to just
- *     count). AXL_ERR on NULL @p count, no ARP-capable interface at @p nic,
- *     or a firmware error. @note The cache only holds neighbors the firmware
- *     has actually resolved (e.g. the gateway after DHCP); a quiet link can
- *     legitimately return count == 0.
+ *     count). AXL_ERR on NULL @p count, @p nic out of range (no clamp to
+ *     NIC 0), or a firmware error. @note The cache only holds neighbors the
+ *     firmware has actually resolved (e.g. the gateway after DHCP); a quiet
+ *     link can legitimately return count == 0.
  */
 int
 axl_net_arp_list(
-    size_t       nic,     ///< ARP-capable interface index (0 = first)
+    size_t       nic,     ///< NIC ordinal (from axl_net_list_interfaces; 0 = first)
     AxlArpEntry *out,     ///< [out] caller array (NULL to just count)
     size_t       cap,     ///< capacity of @p out in entries
     size_t      *count    ///< [out] total entries found
@@ -195,10 +200,13 @@ typedef struct {
 } AxlNetLinkStats;
 
 /**
- * @brief Read physical-link stats for the @p nic'th SimpleNetwork interface.
+ * @brief Read physical-link stats for the @p nic'th interface.
  *
- * Reports @p link_up from the firmware's `EFI_SIMPLE_NETWORK_PROTOCOL` media
- * state — the reliably-available field.
+ * @p nic is the same per-physical-NIC ordinal as @c axl_net_list_interfaces
+ * (not a raw SimpleNetwork handle index — a NIC commonly exposes 2-3 child
+ * SNP handles, so those spaces differ). Reports @p link_up from the
+ * firmware's `EFI_SIMPLE_NETWORK_PROTOCOL` media state — the
+ * reliably-available field.
  *
  * @note UEFI exposes **no portable link-speed/duplex/auto-neg** surface:
  *     SimpleNetwork has no speed field, and where a driver reports it at all
@@ -207,12 +215,12 @@ typedef struct {
  *     (unknown), @p autoneg false — including under QEMU. Treat them as
  *     best-effort and @p link_up as authoritative.
  *
- * @return AXL_OK on success (@p out filled); AXL_ERR on NULL @p out or no
- *     SimpleNetwork interface at @p nic.
+ * @return AXL_OK on success (@p out filled); AXL_ERR on NULL @p out or
+ *     @p nic out of range (no clamp to NIC 0).
  */
 int
 axl_net_get_link_stats(
-    size_t           nic,   ///< SimpleNetwork interface index (0 = first)
+    size_t           nic,   ///< NIC ordinal (from axl_net_list_interfaces; 0 = first)
     AxlNetLinkStats *out    ///< [out] link stats
 );
 
@@ -279,29 +287,284 @@ axl_net_is_available(void);
 /**
  * @brief Bring up networking: load drivers, run DHCP, wait for IP.
  *
- * Performs a best-effort network initialization sequence:
+ * Short-circuits (returns immediately, touching no driver stack or firmware
+ * policy) when the target is already configured — but "the target" is a
+ * different question depending on how @p nic_index names the NIC:
+ *
+ *   - An explicit ordinal short-circuits ONLY if THAT NIC (per the
+ *     per-physical-NIC registry) already has an IPv4 address. Requesting
+ *     NIC 1 must not report success merely because NIC 0 already leased.
+ *   - AXL_NET_NIC_AUTO short-circuits if ANY NIC already has an IPv4
+ *     address — AUTO means "get me networking, I don't care which NIC",
+ *     so an already-up NIC genuinely satisfies the request, and re-running
+ *     DHCP would just burn @p dhcp_timeout_sec for nothing.
+ *
+ * Otherwise performs a best-effort network initialization sequence:
  * 1. Calls axl_net_ensure_drivers() to locate and load NIC drivers
  *    from the standard driver search path.
  * 2. Connects all SNP handles to trigger protocol stack creation.
- * 3. Selects a NIC (by @p nic_index, or first available if SIZE_MAX).
+ * 3. Resolves @p nic_index through the per-physical-NIC registry (see
+ *    axl_net_get_dhcp_lease for the AXL_NET_NIC_AUTO selection ladder).
  * 4. Waits up to @p dhcp_timeout_sec for an IPv4 address via DHCP.
  *
  * @return AXL_OK on success (IP address acquired), AXL_ERR on failure.
  */
 int
 axl_net_auto_init(
-    size_t nic_index,        ///< NIC index (SIZE_MAX = auto-select first)
+    size_t nic_index,        ///< NIC ordinal (from axl_net_list_interfaces),
+                             ///< or AXL_NET_NIC_AUTO to auto-select
     size_t dhcp_timeout_sec  ///< DHCP timeout in seconds (0 = 10s default)
+);
+
+// ---------------------------------------------------------------------------
+// axl_net_auto_init_opts — one options-driven "bring a NIC online" entry point
+// ---------------------------------------------------------------------------
+//
+// The library form of what `netload -a` does, minus netload's UI. One call
+// takes a NIC from cold (no driver, no IP) to configured, for every consumer
+// that wants networking: a resident service that comes up in auto mode and lets
+// the user reconfigure later, a one-shot "just DHCP me online", or a static-IP
+// bring-up on a chosen NIC. Zero-initialize AxlNetAutoOpts and set only what you
+// need; a zeroed struct is the common "get me online, crash-safe" case.
+
+/// How axl_net_auto_init_opts picks which NIC to configure.
+typedef enum {
+    AXL_NET_NIC_SEL_AUTO = 0,   ///< default: the AUTO ladder — first link-up NIC
+                                ///<   with an IP4Config2, else the first with one
+    AXL_NET_NIC_SEL_INDEX,      ///< the NIC at @c nic_index (list_interfaces ordinal)
+    AXL_NET_NIC_SEL_MAC,        ///< the NIC whose MAC == @c nic_mac (stable across
+                                ///<   reboots — what a config UI should store)
+} AxlNetNicSelect;
+
+/// How axl_net_auto_init_opts assigns an address.
+typedef enum {
+    AXL_NET_IP_DHCP = 0,        ///< default: DHCP
+    AXL_NET_IP_STATIC,          ///< static from @c static_ipv4 / @c static_mask / …
+} AxlNetIpMode;
+
+/// Whether axl_net_auto_init_opts requires a reachability check, not just an
+/// address, to call a NIC "up" — the sweep keeps trying drivers until one both
+/// configures AND passes the check.
+typedef enum {
+    AXL_NET_VERIFY_NONE = 0,    ///< default: an address (lease/static) is success
+    AXL_NET_VERIFY_REACHABLE,   ///< also require the @c ping_* / @c resolve_host checks
+} AxlNetVerify;
+
+/// Which drivers axl_net_auto_init_opts loads when firmware-first did not already
+/// bring a NIC up. Firmware-first (connecting NIC drivers the firmware already
+/// staged) runs FIRST in every strategy; this only selects what, if anything, is
+/// loaded afterward.
+typedef enum {
+    AXL_NET_DRV_SWEEP_DIR = 0,  ///< default: crash-safe sweep of every *.efi in
+                                ///<   @c sweep_dir, one at a time, stopping at the
+                                ///<   first NIC that comes up (what `netload -a` does)
+    AXL_NET_DRV_CURATED,        ///< a built-in list of common NIC drivers (the
+                                ///<   behavior of the 2-arg axl_net_auto_init)
+    AXL_NET_DRV_FIRMWARE_ONLY,  ///< no staging: only what the firmware already has
+} AxlNetDriverStrategy;
+
+/// Per-driver outcome reported to AxlNetAutoOpts.on_driver as the sweep runs.
+typedef enum {
+    AXL_NET_DRV_EV_UP = 0,        ///< this driver brought a NIC online (the win)
+    AXL_NET_DRV_EV_LINK_NO_LEASE, ///< a NIC linked but got no lease/address
+    AXL_NET_DRV_EV_NO_REACH,      ///< came online but a reachability check failed
+    AXL_NET_DRV_EV_NO_NIC,        ///< loaded/connected but bound no NIC (then unloaded)
+    AXL_NET_DRV_EV_LOAD_FAIL,     ///< load or start failed
+    AXL_NET_DRV_EV_SKIPPED_QUAR,  ///< skipped: on the shared quarantine list
+    AXL_NET_DRV_EV_TRYING,        ///< about to load/connect this candidate (fired BEFORE
+                                  ///<   the load, so a UI can show progress / warn of a
+                                  ///<   slow connect before it blocks); a result event
+                                  ///<   for the same driver follows
+} AxlNetDriverOutcome;
+
+/// One per-driver progress event (see AxlNetAutoOpts.on_driver). Every field is
+/// borrowed for the duration of the callback only — copy anything you keep.
+typedef struct {
+    const char         *driver;    ///< driver basename, or "firmware" for the
+                                   ///<   firmware-first pass
+    AxlNetDriverOutcome outcome;   ///< what happened with this driver
+    bool                have_nic;  ///< a NIC was attributed to this driver
+    uint8_t             mac[6];    ///< that NIC's MAC (valid iff @c have_nic)
+    bool                link_up;   ///< the NIC reported link (valid iff @c have_nic)
+    bool                have_ip;   ///< the NIC got an address
+    uint8_t             ipv4[4];   ///< that address (valid iff @c have_ip)
+    bool                is_dependency; ///< this @c driver is a co-loaded dependency,
+                                   ///<   not a swept candidate (@c outcome is UP or
+                                   ///<   LOAD_FAIL); a UI can label it distinctly
+} AxlNetDriverEvent;
+
+/// Callback shape for AxlNetAutoOpts.on_driver. @p ctx is opaque, passed through
+/// from AxlNetAutoOpts.on_driver_ctx.
+typedef void (*AxlNetDriverCb)(const AxlNetDriverEvent *ev, void *ctx);
+
+/// Options for axl_net_auto_init_opts. ZERO-INITIALIZE, then set only what you
+/// need: a zeroed struct means AUTO NIC + DHCP + firmware-first-then-SWEEP_DIR of
+/// the default driver directory. The struct is APPEND-ONLY — new fields are added
+/// at the end and default to 0, so a zero-initializing caller is never broken by
+/// a later field.
+typedef struct {
+    AxlNetNicSelect nic_select;        ///< 0 = AUTO
+    size_t          nic_index;         ///< SEL_INDEX: list_interfaces ordinal
+    uint8_t         nic_mac[6];        ///< SEL_MAC: target NIC's MAC
+
+    AxlNetIpMode    ip_mode;           ///< 0 = DHCP
+    const uint8_t  *static_ipv4;       ///< STATIC: 4 bytes (required)
+    const uint8_t  *static_mask;       ///< STATIC: 4 bytes (required)
+    const uint8_t  *static_gw;         ///< STATIC: 4 bytes, or NULL for none
+    const uint8_t  *dns1;              ///< STATIC: 4 bytes, or NULL
+    const uint8_t  *dns2;              ///< STATIC: 4 bytes, or NULL
+    size_t          dhcp_timeout_sec;  ///< DHCP: 0 = 10s default
+    size_t          dhcp_retries;      ///< DHCP: re-attempt a no-lease NIC up to this
+                                       ///<   many times (0/1 = a single attempt)
+
+    AxlNetDriverStrategy driver_strategy;  ///< 0 = SWEEP_DIR
+    const char          *sweep_dir;        ///< SWEEP_DIR: NULL = the default
+                                           ///<   `\drivers\<arch>` (with `\drivers` fallback)
+    bool                 load_deps;        ///< SWEEP_DIR: co-load each driver's declared
+                                           ///<   dependencies from the sweep dir's sidecar first
+    bool                 skip_firmware_first; ///< skip the firmware-first probe (step 1) and
+                                           ///<   go straight to the strategy — for a caller
+                                           ///<   that ran its own firmware-first pass
+
+    AxlNetVerify    verify;            ///< 0 = NONE (an address is success)
+    const uint8_t  *ping_ipv4;        ///< REACHABLE: ping this host (4 bytes), or NULL
+    bool            ping_gateway;     ///< REACHABLE: also ping the resolved gateway
+    const char     *resolve_host;     ///< REACHABLE: also require DNS resolution of this name
+
+    AxlNetDriverCb  on_driver;         ///< optional per-driver progress hook (NULL = none)
+    void           *on_driver_ctx;     ///< opaque, passed to @c on_driver
+} AxlNetAutoOpts;
+
+/// What axl_net_auto_init_opts configured. On AXL_OK, @c online is true and the
+/// NIC fields describe the result; on AXL_ERR only @c online (false) and the
+/// counters are meaningful.
+typedef struct {
+    bool     online;               ///< a NIC has an IPv4 address
+    bool     have_nic;             ///< the NIC below is a specific, known NIC (false
+                                   ///<   for the NIC-agnostic DHCP fallback ladders)
+    uint8_t  mac[6];               ///< the configured NIC's MAC (valid iff @c have_nic)
+    size_t   nic_index;            ///< its list_interfaces ordinal (valid iff @c have_nic)
+    uint8_t  ipv4[4];              ///< its IPv4 address (valid iff @c online)
+    char     via[64];              ///< "firmware" or the winning driver basename
+                                   ///<   ("" if unknown, e.g. an already-up NIC)
+    size_t   drivers_tried;        ///< drivers loaded/connected during the sweep
+    size_t   drivers_quarantined;  ///< drivers skipped because they are quarantined
+} AxlNetBringUpResult;
+
+/**
+ * @brief Bring a NIC online: firmware-first, then the chosen driver strategy,
+ *        then DHCP or static — one entry point for every "get on the network"
+ *        consumer.
+ *
+ * The library form of `netload -a`, without netload's findings table /
+ * interactive picker / save-replay. It:
+ *
+ * 1. FIRMWARE-FIRST (always): connects NIC drivers the firmware already staged
+ *    and checks whether that alone satisfies the request. Onboard/vendor NICs
+ *    usually come up here with nothing loaded — the common case on a server whose
+ *    vendor ships its own NIC drivers.
+ * 2. If not, ACQUIRES drivers per @p opts->driver_strategy:
+ *    - SWEEP_DIR: loads each `*.efi` in @p opts->sweep_dir one at a time under a
+ *      crash-culprit guard (see "Crash safety"), connecting and checking after
+ *      each and STOPPING at the first NIC that comes up. A driver that binds no
+ *      NIC is unloaded, so the box is not left carrying dead drivers.
+ *    - CURATED: loads a built-in list of common NIC drivers (the 2-arg
+ *      axl_net_auto_init behavior).
+ *    - FIRMWARE_ONLY: acquires nothing beyond step 1.
+ * 3. RESOLVES the NIC per @p opts->nic_select (AUTO ladder / ordinal / MAC).
+ * 4. ASSIGNS an address per @p opts->ip_mode (DHCP wait, or static).
+ * 5. VERIFIES per @p opts->verify: with AXL_NET_VERIFY_REACHABLE a NIC counts as
+ *    up only if the requested checks pass (ping @c ping_ipv4, ping the gateway,
+ *    resolve @c resolve_host) — the SWEEP_DIR sweep keeps trying drivers until
+ *    one both configures and is reachable. AXL_NET_VERIFY_NONE (default) treats
+ *    an address as success.
+ *
+ * With @p opts->load_deps, a SWEEP_DIR candidate's declared dependencies (from
+ * the sweep dir's driver-dependency sidecar) are co-loaded first — needed by a
+ * USB-RNDIS/CDC NIC whose driver depends on a companion.
+ *
+ * @par Crash safety — design to the hardware: a bad driver RSODs the box and it
+ *      does NOT auto-reboot
+ * The SWEEP_DIR path writes each driver's name to NVRAM before loading it,
+ * against ONE shared `axl-net` driver-quarantine namespace. If a driver hangs or
+ * resets the box, the operator power-cycles; the NEXT call sees the breadcrumb
+ * that outlived its load, moves that driver to the quarantine list, and skips it
+ * — so the sweep advances past the culprit instead of dying in the same place
+ * every boot. A crash-safe boot sweep can therefore require one manual reboot per
+ * bad driver to converge on first run; once converged, the quarantine persists.
+ * The quarantine is shared across every consumer of this engine — a driver that
+ * RSODs is bad for all of them — and is reset by
+ * axl_net_clear_driver_quarantine().
+ *
+ * @par Reconfigure later
+ * A resident consumer typically calls this once at startup with a zeroed @p opts
+ * (AUTO + DHCP + crash-safe sweep) to get online, then later re-drives a specific
+ * NIC — by MAC, DHCP or static — from a user's config by calling again with
+ * @c nic_select / @c ip_mode set. No separate tool run is required.
+ *
+ * @par Defaults
+ * A zero-initialized @p opts means AUTO NIC + DHCP +
+ * firmware-first-then-SWEEP_DIR of the default directory.
+ *
+ * @note On a box whose firmware NICs are all link-down (e.g. onboard NICs with
+ *     no cable) and the working NIC needs a staged driver, the firmware-first
+ *     DHCP attempt polls for @c dhcp_timeout_sec before the sweep runs. Lower
+ *     @c dhcp_timeout_sec if that first-attempt latency matters on such a box.
+ *
+ * @param opts  configuration; must not be NULL. Zero-initialize, then override.
+ * @param out   [out] what was configured, or NULL if not needed.
+ * @return AXL_OK if a NIC has an IPv4 address, AXL_ERR otherwise (including a
+ *     NULL @p opts, or a STATIC request missing @c static_ipv4 / @c static_mask).
+ */
+int
+axl_net_auto_init_opts(
+    const AxlNetAutoOpts *opts,   ///< configuration (not NULL)
+    AxlNetBringUpResult  *out     ///< [out] result, or NULL
+);
+
+/**
+ * @brief Reset the shared `axl-net` driver quarantine (retry every driver).
+ *
+ * Clears the crash-culprit breadcrumb, the quarantine list, AND the result log
+ * of the shared namespace that axl_net_auto_init_opts's SWEEP_DIR path uses, so a
+ * previously-quarantined driver is tried again on the next sweep. The library
+ * form of `netload --clear`; a consumer surfaces it as a "retry all NICs / clear
+ * quarantine" action. Best-effort — a namespace that was never written is a
+ * clean no-op.
+ *
+ * @return AXL_OK.
+ */
+int
+axl_net_clear_driver_quarantine(void);
+
+/**
+ * @brief Bind @p at to the shared `axl-net` driver-quarantine namespace.
+ *
+ * The same namespace axl_net_auto_init_opts's SWEEP_DIR path and
+ * axl_net_clear_driver_quarantine() use. A tool that renders quarantine state
+ * (e.g. `netload --list` / `--dump`) inits an AxlAttempt this way and reads or
+ * recovers it with the axl_attempt_* API, sharing ONE on-disk format with the
+ * engine. Most consumers never need this — use axl_net_auto_init_opts and
+ * axl_net_clear_driver_quarantine.
+ *
+ * @return AXL_OK, or AXL_ERR if @p at is NULL or the namespace could not
+ *     register.
+ */
+int
+axl_net_driver_quarantine_init(
+    AxlAttempt *at    ///< [out] descriptor to bind to the shared namespace
 );
 
 // ---------------------------------------------------------------------------
 // Driver auto-load
 // ---------------------------------------------------------------------------
 
-/// axl_net_ensure_drivers() return codes.
-#define AXL_NET_DRIVERS_OK         0   ///< SNP is registered (already, or after load)
-#define AXL_NET_DRIVERS_NOT_FOUND (-1) ///< no NIC drivers found on any mounted volume
-#define AXL_NET_DRIVERS_NO_LINK   (-2) ///< drivers loaded, but no SNP came up
+/// axl_net_ensure_drivers() outcome (Axl<Module>Status convention: OK=0, errors negative).
+typedef enum {
+    AXL_NET_DRIVERS_OK        =  0,  ///< SNP is registered (already, or after load)
+    AXL_NET_DRIVERS_NOT_FOUND = -1,  ///< no NIC drivers found on any mounted volume
+    AXL_NET_DRIVERS_NO_LINK   = -2   ///< drivers loaded, but no SNP came up
+} AxlNetDriversStatus;
 
 /**
  * @brief Ensure network drivers are loaded and SNP is up.
@@ -340,7 +603,7 @@ axl_net_auto_init(
  *     mounted volume; AXL_NET_DRIVERS_NO_LINK if drivers were loaded
  *     but no SNP came up (likely no NIC plugged in).
  */
-int
+AxlNetDriversStatus
 axl_net_ensure_drivers(void);
 
 /**
@@ -400,16 +663,47 @@ axl_net_takeover_if_no_snp(void);
  *     @p timeout_sec for a lease).
  *
  *   - @p static_ipv4 != NULL → static. Calls axl_net_drivers_up
- *     (load drivers + link wait, no DHCP timeout), then
- *     axl_net_set_static_ip with @p netmask (defaulting to
- *     `255.255.255.0` if NULL) and @p gateway (NULL = no gateway).
- *     Sleeps 500 ms after to let IP4Config2 apply the change — the
- *     firmware applies the policy + address asynchronously and a
- *     subsequent @c GetData can still report the prior state without
- *     the settle.
+ *     (load drivers + link wait, no DHCP timeout), then applies
+ *     @p static_ipv4 with @p netmask (defaulting to `255.255.255.0` if
+ *     NULL) and @p gateway (NULL = no gateway) — resolving @p nic_index
+ *     to the NIC and its IP4Config2 in a single step, so the NIC that is
+ *     configured is by construction the same one whose address is
+ *     reported back. Sleeps 500 ms after to let IP4Config2 apply the
+ *     change — the firmware applies the policy + address asynchronously
+ *     and a subsequent @c GetData can still report the prior state
+ *     without the settle.
  *
- * In either case, on success @p addr_out is populated via
- * axl_net_get_ip_address (skipped if @p addr_out is NULL).
+ * In either case, on success @p addr_out is populated with the address of the
+ * NIC this call actually acted on — @p nic_index itself, or, under
+ * AXL_NET_NIC_AUTO, the NIC the AUTO ladder resolved to. That NIC is resolved
+ * ONCE and identified by MAC (never by an ordinal, which a later NIC appearing
+ * would shift), so the reported address always belongs to the NIC that was
+ * configured. This is deliberately NOT the same as calling
+ * axl_net_get_ip_address afterward: that call is NIC-agnostic by design (it
+ * answers "does ANY NIC have an address," first configured IP4Config2 wins),
+ * which can name a DIFFERENT NIC than the one this call configured on a
+ * multi-NIC box. Skipped if @p addr_out is NULL.
+ *
+ * A configured NIC that has not taken its address yet is an ERROR, not a
+ * silent fall-back to whatever other NIC happens to be up — on a multi-NIC box
+ * that fall-back would be a wrong answer, so AXL_ERR is the honest one.
+ *
+ * The reported address is NIC-agnostic in exactly the three cases where there
+ * is genuinely no "NIC we picked" to attribute it to, and in all three there is
+ * provably no other NIC to confuse it with:
+ *   - an AXL_NET_NIC_AUTO request that short-circuited because some NIC was
+ *     already up: nothing was configured, and "any networking" is precisely
+ *     what AUTO asked for;
+ *   - firmware with no IP4Config2 at all, where bring-up falls down the
+ *     Dhcp4-SB / PXE ladder, which has no per-NIC handle to attribute to;
+ *   - firmware where the NIC cannot be correlated to an IP4Config2 instance,
+ *     which is only ever resolvable when the box has exactly one NIC and one
+ *     IP4Config2 handle — as seen by the registry the *configure* step built.
+ *     The read-back rebuilds, so a NIC appearing mid-call could in principle
+ *     widen that; the window is the same one the ordinal contract already
+ *     carries (see the note on @c axl_net_get_dhcp_lease).
+ * An explicit @p nic_index is always attributable — including when it
+ * short-circuits.
  *
  * Used by HTTP services (axl-webfs and similar), REST tools, and
  * one-shot fetch-style utilities — they all open with the same
@@ -419,12 +713,14 @@ axl_net_takeover_if_no_snp(void);
  *
  * @return AXL_OK on success (network up, IP acquired, @p addr_out
  *     populated if non-NULL); AXL_ERR if drivers couldn't be loaded,
- *     no NIC came up, DHCP timed out, or static-IP configuration
- *     failed.
+ *     no NIC came up, DHCP timed out, static-IP configuration failed,
+ *     or @p addr_out was requested and the configured NIC has no address
+ *     to report yet (rather than reporting another NIC's — see above).
  */
 int
 axl_net_bring_up(
-    size_t            nic_index,    ///< NIC index (SIZE_MAX = auto-select)
+    size_t            nic_index,    ///< NIC ordinal (from axl_net_list_interfaces),
+                                    ///< or AXL_NET_NIC_AUTO to auto-select
     const uint8_t    *static_ipv4,  ///< NULL = DHCP; non-NULL = 4-byte static IPv4
     const uint8_t    *netmask,      ///< 4-byte netmask (NULL = 255.255.255.0); ignored on DHCP path
     const uint8_t    *gateway,      ///< 4-byte gateway (NULL = none); ignored on DHCP path
@@ -437,13 +733,63 @@ axl_net_bring_up(
  *
  * Sets the IP4Config2 policy to static and assigns the given address,
  * subnet mask, and optional gateway. Pass NULL for @p gateway to
- * leave it unconfigured.
+ * leave it unconfigured. @p nic_index is the same per-physical-NIC registry
+ * ordinal as @c axl_net_list_interfaces / @c axl_net_get_link_stats, or
+ * AXL_NET_NIC_AUTO (see @c axl_net_get_dhcp_lease for the auto-selection
+ * ladder); out of range is an error, never a clamp to NIC 0. Use
+ * @c axl_net_set_static_ip_by_mac to name the NIC unambiguously by its MAC
+ * (the stable key from @c AxlNetInterface.mac) when the ordinal itself is
+ * uncertain — an ordinal is only stable while the NIC set is; a NIC
+ * appearing shifts later ordinals, a MAC never moves.
  *
- * @return AXL_OK on success, AXL_ERR on failure.
+ * @return AXL_OK on success; AXL_ERR on NULL @p ip / @p netmask, @p nic_index
+ *     unresolvable, or a SetData failure.
  */
 int
 axl_net_set_static_ip(
-    size_t         nic_index,   ///< NIC index (from axl_net_list_interfaces)
+    size_t         nic_index,   ///< NIC ordinal (from axl_net_list_interfaces), or AXL_NET_NIC_AUTO
+    const uint8_t  ip[4],       ///< IPv4 address
+    const uint8_t  netmask[4],  ///< subnet mask (e.g. {255,255,255,0})
+    const uint8_t *gateway      ///< gateway address (NULL = none)
+);
+
+/**
+ * @brief Configure a static IPv4 address on a NIC, keyed by MAC.
+ *
+ * The robust counterpart to @c axl_net_set_static_ip for multi-NIC hosts:
+ * resolves the IP4Config2 instance by matching its SimpleNetwork MAC to
+ * @p mac — the same MAC correlation @c axl_net_get_dhcp_lease_by_mac and
+ * @c axl_net_get_driver_info use — so the NIC that gets configured cannot
+ * drift from the caller's intent the way an ordinal can (an ordinal is only
+ * stable while the NIC set is: a NIC appearing shifts later ordinals, a MAC
+ * never moves). Semantics are otherwise identical to
+ * @c axl_net_set_static_ip: sets the IP4Config2 policy to static and
+ * assigns @p ip / @p netmask / @p gateway. Pass NULL for @p gateway to
+ * leave it unconfigured.
+ *
+ * @p mac is the stable key paired with @c AxlNetInterface.mac: iterate
+ * @c axl_net_list_interfaces, then call this with a row's @c mac. A @p mac
+ * that names no NIC is an error, full stop — this never falls back to
+ * configuring a DIFFERENT NIC, which on a multi-NIC box would silently
+ * mutate the wrong interface instead of reporting the miss.
+ *
+ * @note That strictness has a real cost worth knowing: this REQUIRES the
+ *     NIC's MAC to be reachable from its IP4Config2 handle. Some OEM
+ *     firmware publishes IP4Config2 on a child handle with no reachable
+ *     SimpleNetwork, so no MAC correlates and this returns AXL_ERR — where
+ *     @c axl_net_set_static_ip would still succeed, because the ordinal
+ *     path may fall back to the sole IP4Config2 handle when the box has
+ *     exactly one NIC and one such handle (the only case where a positional
+ *     guess cannot be wrong). Prefer this variant for stability against a
+ *     shifting NIC set; prefer @c axl_net_set_static_ip when you want that
+ *     single-NIC fallback.
+ *
+ * @return AXL_OK on success; AXL_ERR on NULL @p mac / @p ip / @p netmask,
+ *     no IP4Config2 NIC carrying that MAC, or a SetData failure.
+ */
+int
+axl_net_set_static_ip_by_mac(
+    const uint8_t  mac[6],      ///< NIC MAC (from AxlNetInterface.mac)
     const uint8_t  ip[4],       ///< IPv4 address
     const uint8_t  netmask[4],  ///< subnet mask (e.g. {255,255,255,0})
     const uint8_t *gateway      ///< gateway address (NULL = none)
@@ -456,15 +802,17 @@ axl_net_set_static_ip(
  * the missing setter beside axl_net_resolve (which only *queries* whatever
  * resolver is configured). Pass a secondary in @p dns2, or NULL for a
  * single resolver. Works on both the static and DHCP paths (a DHCP box can
- * override the leased resolver). @p nic_index is a concrete index into the
- * interface list (it does NOT accept AXL_NET_NIC_AUTO).
+ * override the leased resolver). @p nic_index is the same per-physical-NIC
+ * registry ordinal as @c axl_net_list_interfaces / @c axl_net_get_link_stats,
+ * or AXL_NET_NIC_AUTO (see @c axl_net_get_dhcp_lease for the auto-selection
+ * ladder); out of range is an error, never a clamp to NIC 0.
  *
- * @return AXL_OK on success; AXL_ERR on NULL @p dns, no IP4Config2 on the
- *     NIC, or a SetData failure.
+ * @return AXL_OK on success; AXL_ERR on NULL @p dns, @p nic_index
+ *     unresolvable, or a SetData failure.
  */
 int
 axl_net_set_dns(
-    size_t         nic_index,   ///< concrete NIC index (from axl_net_list_interfaces)
+    size_t         nic_index,   ///< NIC ordinal (from axl_net_list_interfaces), or AXL_NET_NIC_AUTO
     const uint8_t  dns[4],      ///< primary DNS server IPv4
     const uint8_t *dns2         ///< secondary DNS server IPv4 (NULL = none)
 );
@@ -525,16 +873,19 @@ axl_net_get_hostname(
  *   - NULL — wait until StationAddress is merely non-zero (any address taken),
  *     e.g. after kicking DHCP when the specific lease isn't known up front.
  *
- * @p nic_index is a concrete index (it does NOT accept AXL_NET_NIC_AUTO). A
- * settle is sub-second, so the @p timeout_ms == 0 default is a deliberately
- * short 1 s (not the 10 s DHCP-wait default).
+ * @p nic_index is the same per-physical-NIC registry ordinal as
+ * @c axl_net_list_interfaces / @c axl_net_get_link_stats, or
+ * AXL_NET_NIC_AUTO (see @c axl_net_get_dhcp_lease for the auto-selection
+ * ladder); out of range is an error, never a clamp to NIC 0. A settle is
+ * sub-second, so the @p timeout_ms == 0 default is a deliberately short 1 s
+ * (not the 10 s DHCP-wait default).
  *
- * @return AXL_OK once the address is observed; AXL_ERR on a bad NIC index /
- *     no IP4Config2, or if it has not settled within @p timeout_ms.
+ * @return AXL_OK once the address is observed; AXL_ERR on @p nic_index
+ *     unresolvable, or if it has not settled within @p timeout_ms.
  */
 int
 axl_net_wait_ip_settled(
-    size_t         nic_index,    ///< concrete NIC index (from axl_net_list_interfaces)
+    size_t         nic_index,    ///< NIC ordinal (from axl_net_list_interfaces), or AXL_NET_NIC_AUTO
     const uint8_t *expect_ipv4,  ///< 4 octets to wait for, or NULL = any non-zero
     size_t         timeout_ms    ///< max wait in ms (0 = 1 s default)
 );
@@ -577,22 +928,33 @@ typedef struct {
  * (no network round-trip). A NIC on a static policy, or one that has not yet
  * leased an address, is not a DHCP lease and returns AXL_ERR.
  *
- * @warning @p nic_index indexes the IP4Config2 handle buffer, which is NOT the
- *     same index space as @c axl_net_list_interfaces / @c
- *     axl_net_get_link_stats (those index the SimpleNetwork handle buffer, and
- *     IP4Config2 lives on a child handle on some OEM firmware). An out-of-range
- *     index is clamped to the first handle. On a multi-NIC box, passing a
- *     list-index here can therefore return a different NIC's lease. Use
- *     @c axl_net_get_dhcp_lease_by_mac to look a lease up unambiguously by
- *     the NIC's MAC (the stable key from @c AxlNetInterface.mac). It does NOT
- *     accept AXL_NET_NIC_AUTO.
+ * @p nic_index is the same per-physical-NIC registry ordinal as @c
+ *     axl_net_list_interfaces / @c axl_net_get_link_stats — resolved to its
+ *     IP4Config2 handle by MAC, not by directly indexing the IP4Config2
+ *     handle buffer (which enumerates independently of the NIC list and can
+ *     diverge from it in both order and count; IP4Config2 lives on a child
+ *     handle on some OEM firmware). An out-of-range explicit index is an
+ *     error, never a clamp to NIC 0 — on a multi-NIC box a clamp would
+ *     silently return a different NIC's lease. Use @c
+ *     axl_net_get_dhcp_lease_by_mac to look a lease up unambiguously by the
+ *     NIC's MAC (the stable key from @c AxlNetInterface.mac) when the ordinal
+ *     itself is uncertain.
  *
- * @return AXL_OK with @p out filled; AXL_ERR on NULL @p out, a bad NIC index,
- *     no IP4Config2 on the NIC, a non-DHCP policy, or no leased address.
+ * @p nic_index also accepts AXL_NET_NIC_AUTO, which selects, in order:
+ *     the first link-up NIC with an IP4Config2; else the first NIC with one;
+ *     else — ONLY when there is exactly one NIC and exactly one IP4Config2
+ *     handle, i.e. firmware where the MAC cannot be correlated — that single
+ *     handle positionally (the one-and-one guard is what makes the guess
+ *     unwrongable); else AXL_ERR. This is the same ladder every net API
+ *     taking AXL_NET_NIC_AUTO resolves through.
+ *
+ * @return AXL_OK with @p out filled; AXL_ERR on NULL @p out, @p nic_index
+ *     unresolvable, no IP4Config2 on the NIC, a non-DHCP policy, or no leased
+ *     address.
  */
 int
 axl_net_get_dhcp_lease(
-    size_t        nic_index,  ///< IP4Config2-handle index (see @warning; not the SNP/list index)
+    size_t        nic_index,  ///< NIC ordinal (from axl_net_list_interfaces), or AXL_NET_NIC_AUTO
     AxlDhcpLease *out         ///< [out] leased configuration
 );
 
@@ -697,6 +1059,26 @@ axl_ipv4_parse(
 );
 
 /**
+ * @brief Parse a dotted-decimal IPv4 address, optionally with a `/N` CIDR
+ *        prefix.
+ *
+ * Accepts `"A.B.C.D"` or `"A.B.C.D/N"` with @a N in 0..32. On success @p octets
+ * is always written; @p mask is written (and @p had_prefix set true) only when
+ * a `/N` suffix is present — a bare address leaves @p mask untouched so the
+ * caller's default mask survives.
+ *
+ * @return AXL_OK on success; AXL_ERR on malformed input, @a N > 32, or NULL
+ *     @p str / @p octets.
+ */
+int
+axl_ipv4_parse_cidr(
+    const char *str,        ///< IPv4 string, optionally `A.B.C.D/N`
+    uint8_t     octets[4],  ///< [out] the four octets (always written on AXL_OK)
+    uint8_t     mask[4],    ///< [out] derived netmask (written only when `/N` present)
+    bool       *had_prefix  ///< [out] true iff a `/N` was present (NULL to ignore)
+);
+
+/**
  * @brief Format an IPv4 address as a dotted-decimal string.
  *
  * Writes at most @p size bytes (including NUL). 16 bytes is always
@@ -751,6 +1133,47 @@ axl_ipv4_in_subnet(
     const uint8_t mask[4]
 );
 
+// ---------------------------------------------------------------------------
+// MAC address parsing / formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Format a MAC address as a colon-separated hex string.
+ *
+ * Writes lowercase hex octets separated by `:` — "aa:bb:cc:dd:ee:ff" — the
+ * rendering every @c AxlNetInterface.mac consumer in this SDK already prints.
+ * Writes at most @p size bytes (including NUL). 18 bytes is always
+ * sufficient ("xx:xx:xx:xx:xx:xx" + NUL).
+ *
+ * @return AXL_OK on success, AXL_ERR if buffer is too small or args are NULL.
+ */
+int
+axl_mac_format(
+    const uint8_t mac[6],  ///< six MAC octets
+    char         *buf,     ///< output buffer
+    size_t        size     ///< buffer size (18 bytes sufficient)
+);
+
+/**
+ * @brief Parse a colon-separated MAC address string.
+ *
+ * Accepts `"xx:xx:xx:xx:xx:xx"`: six hex octets (1 or 2 digits each,
+ * case-insensitive) separated by `:`. No other separator (`-`, `.`, a bare
+ * 12-hex-digit run) is accepted, and trailing garbage after the sixth octet
+ * is rejected. This is exactly the grammar netload's own `--mac` flag has
+ * always accepted, so an existing saved config or scripted invocation keeps
+ * working unchanged.
+ *
+ * @return AXL_OK on success, AXL_ERR on NULL args or malformed input (wrong
+ *     separator, wrong octet count, a non-hex digit, or an octet that
+ *     overflows a byte).
+ */
+int
+axl_mac_parse(
+    const char *str,   ///< MAC string (e.g. "aa:bb:cc:dd:ee:ff")
+    uint8_t     mac[6] ///< receives the six octets
+);
+
 // ===========================================================================
 //
 //  Network Interface Enumeration
@@ -763,7 +1186,8 @@ axl_ipv4_in_subnet(
 typedef struct {
     char     name[32];      ///< interface name ("eth0", "eth1", ...)
     uint8_t  mac[6];        ///< MAC address
-    bool     link_up;       ///< true if link is up
+    bool     link_up;       ///< link state (a NIC whose firmware lacks media
+                            ///< detection counts as up)
     uint32_t mtu;           ///< maximum transmission unit
     bool     has_ipv4;      ///< true if IPv4 is configured
     uint8_t  ipv4[4];       ///< IPv4 address (valid if has_ipv4)
@@ -773,6 +1197,11 @@ typedef struct {
 
 /**
  * @brief List available network interfaces.
+ *
+ * One row per PHYSICAL NIC. A single NIC publishes several SimpleNetwork
+ * child handles; they are deduped by MAC, so the row index is a
+ * per-physical-NIC ordinal shared with every other net API taking a
+ * @c nic_index.
  *
  * Fills @a out with up to @a *count interface descriptors.
  * On return, @a *count is set to the number of entries filled.
@@ -784,6 +1213,26 @@ int
 axl_net_list_interfaces(
     AxlNetInterface *out,   ///< output array (NULL to query count)
     size_t          *count  ///< [in/out] capacity / entries filled
+);
+
+/**
+ * @brief List available network interfaces into a heap-allocated array.
+ *
+ * The allocating counterpart of axl_net_list_interfaces(): does the
+ * count/alloc/re-query dance for you (query the count, axl_calloc the
+ * array, re-query to fill it) instead of every caller repeating it. On
+ * success @p out is a heap array of @p count entries that the caller frees
+ * with axl_free(); with zero interfaces present, @p out is set to NULL and
+ * @p count to 0 — still AXL_OK, since "no NICs" is a normal enumeration
+ * result, not a failure.
+ *
+ * @return AXL_OK on success (including zero interfaces); AXL_ERR on NULL
+ *     @p out / @p count or allocation failure.
+ */
+int
+axl_net_list_interfaces_alloc(
+    AxlNetInterface **out,    ///< [out] heap array, caller frees with axl_free
+    size_t           *count   ///< [out] number of interfaces
 );
 
 // ===========================================================================
@@ -921,8 +1370,44 @@ axl_net_list_available_drivers(
     size_t           *count   ///< [in/out] capacity / entries filled
 );
 
-/// Max NIC MACs reported in one AxlNetTryResult.
-#define AXL_NET_TRY_MAX_MACS  8
+/**
+ * @brief True if @p path_or_name is recognized as an iPXE driver.
+ *
+ * A filename heuristic — @p path_or_name matches if it contains "ipxe"
+ * as a case-insensitive substring (e.g. "ipxe-intel.efi",
+ * "ipxe-all.efidrv", "IPXE.EFI") — the same recognition
+ * axl_net_try_driver() applies internally to every candidate it loads.
+ *
+ * Exposed so a caller that loads NIC drivers ITSELF, outside
+ * axl_net_try_driver() (a driver-picker UI, a diagnostic sweep), can
+ * still honor the two obligations an iPXE candidate carries:
+ *
+ *   - **order it last.** iPXE's LoadImage hook breaks every subsequent
+ *     `.efi` load in the same session — a hazard no unload can undo —
+ *     so an iPXE candidate must always be tried after every other one.
+ *   - **disarm the watchdog once it's started.** iPXE arms a 5-minute
+ *     UEFI boot-services watchdog and its shutdown handler only
+ *     disarms when chaining into an OS (never the case for a
+ *     diagnostic tool), so the box resets minutes later unless the
+ *     caller calls axl_watchdog_disarm() itself.
+ *
+ * axl_net_try_driver() already does both of these for you — prefer it
+ * when your driver-load loop can. This predicate is for the callers
+ * that can't: they own their own load/start sequence but still need to
+ * order and disarm correctly around an iPXE candidate.
+ *
+ * @note Best-effort, same caveat as axl_net_try_driver(): an
+ *     iPXE-derived driver under an unrecognized filename (e.g. a
+ *     relabeled vendor build) is invisible to this check and gets
+ *     neither protection.
+ *
+ * @return true if @p path_or_name is recognized as an iPXE driver;
+ *     false otherwise, including for a NULL @p path_or_name.
+ */
+bool
+axl_net_driver_is_ipxe(
+    const char *path_or_name   ///< driver path or basename
+);
 
 /**
  * @brief Outcome of an axl_net_try_driver() attempt.
@@ -930,7 +1415,12 @@ axl_net_list_available_drivers(
  * Fully zeroed before the attempt and always populated when @p out is
  * non-NULL — including on AXL_ERR, so the caller can tell "driver not
  * found" from "loaded but bound no NIC". On an early-out error every
- * field reads false / 0.
+ * scalar reads false / 0 and both pointer fields are NULL.
+ *
+ * @note @c bound_nic_macs is heap-allocated by axl_net_try_driver() when
+ *     at least one NIC bound; the caller owns it and must release it with
+ *     axl_free(). It is NULL (nothing to free) whenever @c bound_nic_count
+ *     is 0, so `axl_free(out->bound_nic_macs)` is always safe.
  */
 typedef struct {
     bool     found;             ///< the driver file was located on the search path
@@ -943,18 +1433,28 @@ typedef struct {
     bool     unloaded;
     /// Count of NICs that newly produced an SNP handle as a result of
     /// this attempt — the honest attribution (the set of SNP handles
-    /// present after connect that were not present before). This is the
-    /// true count and may exceed AXL_NET_TRY_MAX_MACS; @c bound_nic_macs
-    /// holds the first AXL_NET_TRY_MAX_MACS of them.
+    /// present after connect that were not present before). Every
+    /// newly-bound NIC is recorded; there is no fixed cap.
     uint32_t snp_handles_added;
     bool     link_up;           ///< at least one newly-bound NIC reports media present
-    /// Number of MACs filled in @c bound_nic_macs — min(@c
-    /// snp_handles_added, AXL_NET_TRY_MAX_MACS). Equals @c
-    /// snp_handles_added unless more than AXL_NET_TRY_MAX_MACS NICs bound.
+    /// Number of MACs in @c bound_nic_macs. Equal to @c snp_handles_added
+    /// (unless the MAC array could not be allocated, in which case it is 0
+    /// while @c snp_handles_added still reports the honest count).
     size_t   bound_nic_count;
-    /// MACs of the NICs that newly produced an SNP handle (first
-    /// @c bound_nic_count entries valid).
-    uint8_t  bound_nic_macs[AXL_NET_TRY_MAX_MACS][6];
+    /// Heap array (caller frees via axl_free) of the MACs of the NICs that
+    /// newly produced an SNP handle — @c bound_nic_count entries, or NULL
+    /// when none bound. A NIC whose SNP mode was unreadable at diff time
+    /// keeps a zeroed 6-byte slot so the array stays 1:1 with the count.
+    uint8_t (*bound_nic_macs)[6];
+    /// Opaque handle (an @c AxlDriverHandle) of the freshly-loaded driver
+    /// image while it stays resident — non-NULL only when the attempt left
+    /// the driver loaded (the AXL_OK return). NULL whenever the image was
+    /// unloaded (every AXL_ERR path) or never loaded. A caller running its
+    /// own multi-driver sweep can axl_driver_unload() this to drop a driver
+    /// that bound a NIC but failed the caller's own downstream check,
+    /// keeping the next attempt on a clean slate; a caller that wants the
+    /// winner to stay bound simply ignores it.
+    void    *driver;
 } AxlNetTryResult;
 
 /**
@@ -970,22 +1470,35 @@ typedef struct {
  * (@c out->unloaded = true) so the next candidate can be tried from a
  * clean slate.
  *
+ * **Ownership.** On the AXL_OK return the driver stays resident and its
+ * handle is handed back in @c out->driver (an @c AxlDriverHandle) — a
+ * caller running its own sweep can axl_driver_unload() it to drop a
+ * driver that bound a NIC but failed a downstream check; a caller that
+ * wants the winner to remain simply ignores the field. Every AXL_ERR
+ * return leaves @c out->driver NULL (nothing to unload). The MAC list
+ * @c out->bound_nic_macs is heap-allocated (every newly-bound NIC is
+ * recorded, with no fixed cap) and owned by the caller: release it with
+ * axl_free(). It is NULL whenever @c bound_nic_count is 0, so
+ * `axl_free(out->bound_nic_macs)` is always safe — including on every
+ * error path.
+ *
  * @p path_or_name may be a full UEFI path or a bare filename; a bare
  * name is resolved through axl_driver_locate()'s search path (so a name
  * from axl_net_list_available_drivers() works directly).
  *
  * **iPXE must be tried LAST.** When @p path_or_name is *recognized* as
- * an iPXE driver — by filename heuristic, the same name list
- * axl_net_ensure_drivers uses — this disarms iPXE's 5-minute
- * boot-services watchdog for you. Detection is best-effort: an iPXE-
- * derived driver under an unrecognized filename (e.g. a relabeled vendor
- * build) gets neither the watchdog disarm nor any ordering protection.
- * Regardless, iPXE's LoadImage hook breaks subsequent `.efi` loads in
- * the same session — a hazard no unload can undo — so the *caller* must
- * order any iPXE attempt after every other candidate. On the failure
- * path the unload is still attempted, but its effect on an already-hooked
- * session is not guaranteed (hence @c out->unloaded means "unload
- * returned success", not "hook reverted").
+ * an iPXE driver — via axl_net_driver_is_ipxe(), the same filename
+ * heuristic exposed for callers with their own load loop — this disarms
+ * iPXE's 5-minute boot-services watchdog for you. Detection is
+ * best-effort: an iPXE-derived driver under an unrecognized filename
+ * (e.g. a relabeled vendor build) gets neither the watchdog disarm nor
+ * any ordering protection. Regardless, iPXE's LoadImage hook breaks
+ * subsequent `.efi` loads in the same session — a hazard no unload can
+ * undo — so the *caller* must order any iPXE attempt after every other
+ * candidate. On the failure path the unload is still attempted, but its
+ * effect on an already-hooked session is not guaranteed (hence
+ * @c out->unloaded means "unload returned success", not "hook
+ * reverted").
  *
  * **MediaPresent is advisory.** Some firmware misreports link state, so
  * @c link_up == false is *not* a failure: an attempt that adds an SNP

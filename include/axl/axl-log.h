@@ -392,7 +392,18 @@ void
 axl_log_file_detach(void);
 
 /**
- * @brief Flush the file handler's buffer to disk.
+ * @brief Push the file handler's buffered records through to the volume.
+ *
+ * Drains the in-memory buffer into the log file AND flushes the firmware's
+ * own buffers, so the records are on the media when this returns. Ordinary
+ * logging only does the first half — a synchronous media write every few
+ * kilobytes would make logging cost what the log is recording — so this is
+ * the call to make before anything that might not come back (a reset, a
+ * handoff, a risky operation whose log is the only evidence).
+ *
+ * Best-effort and therefore void: a failure here has no actor, since
+ * reporting a log failure through the log is a loop. No-op when no file
+ * handler is attached.
  */
 void
 axl_log_flush(void);

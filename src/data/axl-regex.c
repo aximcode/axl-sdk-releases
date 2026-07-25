@@ -647,7 +647,7 @@ static bool search_reader(const AxlRegex *re, const AxlByteReader *reader,
     /* Materialize the whole source (documented O(len) fallback). */
     uint8_t *buf = axl_malloc(len ? len : 1);
     if (buf == NULL) return false;
-    size_t got = reader->read(reader, 0, len, buf);
+    size_t got = reader->read(reader, 0, buf, len);
     bool r = search_buf(re, buf, got, from, mf, groups, ng);
     axl_free(buf);
     return r;

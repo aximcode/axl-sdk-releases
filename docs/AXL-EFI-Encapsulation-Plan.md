@@ -359,7 +359,7 @@ helper, UTF-8 / UCS-2 boundary marshalling.
      `AxlFsProviderInfo`).
    - `src/mount/webfs-mount.c` — manual `EFI_DEVICE_PATH_PROTOCOL`
      construction (`HW_VENDOR_DP` + END terminator) replaced by
-     `axl_device_path_make_vendor`. Manual protocol install
+     `axl_device_path_new_vendor`. Manual protocol install
      replaced by `axl_fs_provider_publish`.
    - `src/mount/webfs-cache.c`, `webfs-protocol.h`, `cmd-mount.c`
      — comment-level updates only; no logic change.
@@ -580,7 +580,7 @@ typedef struct {
 
 /**
  * Publish a filesystem on a new UEFI handle. Internally creates a
- * vendor device-path (axl_device_path_make_vendor), synthesizes
+ * vendor device-path (axl_device_path_new_vendor), synthesizes
  * EFI_SIMPLE_FILE_SYSTEM_PROTOCOL and EFI_FILE_PROTOCOL vtables
  * that forward into @p provider, installs both protocols on the
  * new handle, and returns an opaque handle the consumer can pass
@@ -670,7 +670,7 @@ typedef struct AxlDevicePath AxlDevicePath;
  * hand-roll a malloc + template-memcpy + GUID-fill.
  */
 int
-axl_device_path_make_vendor(
+axl_device_path_new_vendor(
     const AxlGuid  *vendor_guid,
     AxlDevicePath **out
 );

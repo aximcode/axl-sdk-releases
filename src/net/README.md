@@ -1,7 +1,7 @@
 TCP sockets, UDP sockets, socket abstraction layer, URL parsing, HTTP
 server, HTTP client, TLS, and network utilities (IPv4 address helpers,
 interface enumeration; diagnostics — ICMP ping + `axl_net_ping_ex`
-(traceroute / path-MTU), `axl_sntp_query` (SNTP time), `axl_net_arp_list`
+(traceroute / path-MTU), `axl_net_sntp_query` (SNTP time), `axl_net_arp_list`
 (neighbor cache), `axl_net_get_link_stats`).
 
 Individual headers can be included separately or use the umbrella
@@ -61,6 +61,65 @@ if (axl_net_bring_up(SIZE_MAX, ip, NULL, NULL, 0, &addr) != AXL_OK) {
     return -1;
 }
 ```
+
+### Options-driven bring-up (`axl_net_auto_init_opts`) — the crash-safe superset
+
+When a consumer wants what `netload -a` does — firmware-first, then a
+**crash-safe sweep** of a driver directory, then DHCP or static, with a
+config a user can change later — use `axl_net_auto_init_opts`. A
+resident service (SoftBMC and friends) comes up in auto mode, then
+re-drives a specific NIC by MAC on user request, all through one call:
+
+```c
+// Auto: firmware-first, then crash-safe sweep of \drivers\<arch>, DHCP.
+AxlNetAutoOpts opts = { 0 };            // zero-init == AUTO + DHCP + SWEEP_DIR
+AxlNetBringUpResult res;
+if (axl_net_auto_init_opts(&opts, &res) == AXL_OK) {
+    // res.online, res.mac, res.ipv4, res.via ("firmware" or the driver that won)
+}
+
+// Later: the user picks a NIC by MAC and a static address.
+AxlNetAutoOpts st = { 0 };
+st.nic_select  = AXL_NET_NIC_SEL_MAC;   axl_memcpy(st.nic_mac, chosen_mac, 6);
+st.ip_mode     = AXL_NET_IP_STATIC;     st.static_ipv4 = ip;  st.static_mask = mask;
+axl_net_auto_init_opts(&st, NULL);
+```
+
+`nic_select` is a mode (`AUTO` / `INDEX` / `MAC`), not a raw ordinal,
+so a zero-initialized struct genuinely means AUTO (not "NIC 0"); pick
+NICs by **MAC** in a UI, since ordinals shift as drivers load.
+`driver_strategy` chooses what is loaded after firmware-first —
+`SWEEP_DIR` (the default, `netload -a`'s crash-safe directory sweep),
+`CURATED` (the built-in list `axl_net_auto_init` uses), or
+`FIRMWARE_ONLY`. `SWEEP_DIR` also honors `load_deps` (co-load a
+candidate's declared dependencies from the sweep dir's
+`netload-drivers.json5` sidecar first — a USB-RNDIS/CDC NIC whose driver
+needs a companion) and `verify` (`REACHABLE` keeps trying drivers until
+one both configures **and** passes a ping/gateway/DNS reachability
+check, not just gets an address). An optional `on_driver` callback
+reports each driver the sweep touches — a `TRYING` event before each
+load, a result event after, and one per co-loaded dependency — so a tool
+can render its own findings (and warn of a slow connect) without that
+rendering living in the library.
+
+**`netload -a` IS this engine.** netload runs its own firmware-first
+probe and saved-config replay, then hands the staged sweep to
+`axl_net_auto_init_opts` (with `skip_firmware_first`) and renders its
+findings table from the `on_driver` callback — so netload's `-a`
+integration suite is the engine's end-to-end coverage.
+
+**Crash safety — design to the hardware.** On the target boxes a bad
+driver **RSODs the machine and it does not auto-reboot**. The SWEEP_DIR
+path breadcrumbs each driver to NVRAM before loading it, against ONE
+shared `axl-net` driver-quarantine namespace: after a power-cycle the
+next call quarantines the culprit and skips it, so the sweep advances
+past it instead of dying in the same place every boot. A crash-safe
+first run can therefore need one manual reboot per bad driver to
+converge; the quarantine then persists. The namespace is shared across
+every consumer of the engine — a driver that RSODs is bad for all of
+them — and is reset by `axl_net_clear_driver_quarantine()` (the library
+form of `netload --clear`). `netload` shares this exact namespace, so a
+driver it quarantines is one the engine also skips, and vice versa.
 
 ### Standard option helpers
 
@@ -129,8 +188,21 @@ control:
   (Those fallbacks are real-hardware-only — OVMF always has
   IP4Config2.)
 - `axl_net_set_static_ip(nic, ip, netmask, gateway)` — raw
-  IP4Config2 setter; static path of `bring_up` calls it after
-  `drivers_up`.
+  IP4Config2 setter; the static path of `bring_up` applies the same
+  configuration after `drivers_up`.
+  `axl_net_set_static_ip_by_mac(mac, ip, netmask, gateway)` is the
+  MAC-keyed sibling, paired with it exactly as
+  `axl_net_get_dhcp_lease_by_mac` is paired with
+  `axl_net_get_dhcp_lease`: an ordinal is only stable while the NIC set
+  is (a NIC appearing shifts later ordinals), a MAC never moves, so a
+  consumer holding an `AxlNetInterface.mac` across a driver-load event
+  should prefer the `_by_mac` spelling. The tradeoff is deliberate and
+  worth knowing: the `_by_mac` variants require a real MAC match and
+  error out otherwise, while the ordinal spellings can still fall back
+  to the sole IP4Config2 handle on single-NIC firmware where no MAC
+  correlates (OEM boxes that publish IP4Config2 on a child handle with
+  no reachable SNP). Name the NIC by MAC for stability; use the ordinal
+  spelling when you want that fallback.
 
 ## Static config / DNS / hostname (the `ifconfig` policy layer)
 
@@ -167,8 +239,21 @@ hand-authoring the form:
 
 ## NIC inventory + driver selection
 
+`axl_net_list_interfaces(out, &count)` is the base enumeration --
+query-then-fill, one row per physical NIC (deduped by MAC).
+`axl_net_list_interfaces_alloc(&out, &count)` is the allocating
+counterpart: it does the count/alloc/re-query dance for you and
+hands back a heap array (`axl_free` it) instead of making every
+caller repeat that dance by hand.
+
+`axl_mac_format(mac, buf, size)` / `axl_mac_parse(str, mac)` are the
+MAC-address counterpart to `axl_ipv4_format`/`axl_ipv4_parse`: format
+an `AxlNetInterface.mac` as `"aa:bb:cc:dd:ee:ff"`, or parse that same
+colon-separated form back into six bytes (case-insensitive, 1-2 hex
+digits per octet).
+
 For a local "pick the NIC / get an unknown box online / diagnose"
-tool, four accessors layer on top of `axl_net_list_interfaces`:
+tool, five accessors layer on top of `axl_net_list_interfaces`:
 
 - `axl_net_get_driver_info(mac, &info)` — the bound driver name +
   binding layer (`NII3.1` / `NII` / `SNP`) and a stable
@@ -183,18 +268,33 @@ tool, four accessors layer on top of `axl_net_list_interfaces`:
 - `axl_net_list_available_drivers(out, &count)` — the NIC-driver
   `.efi` / `.efidrv` files staged on `drivers/<arch>/` across mounted
   volumes, so a UI can offer "try X / Y / Z".
+- `axl_net_driver_is_ipxe(path_or_name)` — the filename heuristic
+  ("ipxe" substring, case-insensitive) that recognizes an iPXE
+  driver. `axl_net_try_driver` applies this internally; it's exposed
+  for a caller with its *own* load/start loop (a driver-picker UI, a
+  diagnostic sweep like `netload`'s) that still has to order an iPXE
+  candidate last and disarm the watchdog after starting it.
 - `axl_net_try_driver(path_or_name, &result)` — load + connect **one**
-  driver and report `{ snp_handles_added, link_up, bound_nic_macs[] }`,
-  unloading it again on failure so the next candidate starts clean.
-  Encapsulates the field hazards: iPXE's watchdog is disarmed (and
-  iPXE must be tried last — its `LoadImage` hook breaks later loads),
-  and `MediaPresent` is treated as advisory.
+  driver and report `{ snp_handles_added, link_up, bound_nic_macs,
+  driver }`, unloading it again on failure so the next candidate starts
+  clean. Every newly-bound NIC's MAC is recorded (the heap
+  `bound_nic_macs` array is caller-owned — free with `axl_free`; no
+  fixed cap), and on success the resident driver's handle is returned in
+  `result.driver` so a sweep can `axl_driver_unload` a driver that bound
+  a NIC but failed its own downstream check. Encapsulates the field
+  hazards: iPXE's watchdog is disarmed (and iPXE must be tried last —
+  its `LoadImage` hook breaks later loads), and `MediaPresent` is
+  treated as advisory.
 - `axl_net_connect_stack()` — the `ConnectController`-on-SNP step
   (for firmware that doesn't auto-connect), exposed so a "my NIC
   isn't showing up" action works without a full re-init.
 
-`tools/netinfo` dogfoods all four (`list -v` driver/bus columns,
-`list-bundle`, `try <driver>`).
+`tools/netinfo` dogfoods four of the five (`list -v` driver/bus
+columns, `list-bundle`, `try <driver>`); `tools/netload`'s driver
+sweep drives `axl_net_try_driver` for its per-driver load/connect/diff
+(breadcrumbed for crash recovery, ordered iPXE-last via
+`axl_net_driver_is_ipxe`, and unloading each non-winning driver through
+the returned `result.driver`).
 
 ## Socket Layer
 
@@ -493,6 +593,51 @@ axl_http_server_add_routes(s,
     "POST", "/echo",    on_echo,    NULL,
     NULL);   // sentinel — required
 ```
+
+#### Teardown: graceful vs. port-releasing
+
+Teardown takes an `AxlTeardown` mode. `axl_http_server_free(s,
+AXL_TEARDOWN_GRACEFUL)` closes in-flight connections *gracefully* (FIN) and,
+when a loop is still running, defers the firmware teardown
+(`Configure(NULL)` + `DestroyChild`) to a later loop tick — so the listen
+port may stay bound until those closes finalize. That is fine for ordinary
+shutdown, but not when the caller is about to **stop pumping the loop** (e.g.
+block in `axl_image_run` for an in-place self-upgrade) and needs the port
+back *now*.
+
+> A graceful *connection* close that runs at a **raised TPL** (a driver-pump
+> notify, `axl_loop_attach_driver` — not a foreground `axl_loop_run`) is
+> promoted to an abortive **RST**: a graceful `EFI_TCP4.Close()` there flushes
+> the send buffer + drives the FIN handshake, whose transmit completion needs the
+> MNP timer to fire below `TPL_CALLBACK`, which the pump holds — so it would spin
+> in firmware forever. A reset connection is an abandon anyway, so RST is the
+> correct teardown at that level (see `tcp_close_impl`). The foreground path is
+> unchanged (FIN).
+
+`axl_http_server_free(s, AXL_TEARDOWN_RESET)` is the port-releasing teardown: it
+RSTs the listener and every in-flight connection and finalizes **synchronously
+and loop-free** before returning, so a fresh `axl_http_server_new(port)` +
+`axl_http_server_start` on the same port succeeds **immediately with no loop
+pumping**, even with connections in flight. The RST discards un-ACKed
+in-flight bytes — the intended trade for a guaranteed, immediate port
+release.
+
+```c
+axl_http_server_free(s, AXL_TEARDOWN_RESET);  // port :443 free on return
+axl_image_run("fs0:\\new.efi", ...);           // child rebinds :443 immediately
+```
+
+`axl_tcp_close(listener, AXL_TEARDOWN_RESET)` is the transport-level primitive
+that does the real work: it RSTs the listener, drains its firmware **accept
+backlog**, and finalizes its connections' pending **deferred graceful closes** —
+every place a PCB can linger on the port — synchronously and loop-free. Anything
+that owns a TCP listener inherits the port-releasing teardown by tearing it down
+through that call with `AXL_TEARDOWN_RESET`. The HTTP server does (above); the
+BSD-style socket veneer exposes it as `axl_socket_free(sock, AXL_TEARDOWN_RESET)`
+(both modes are identical for a datagram socket — UDP has no graceful close to
+abort). UDP itself needs none of this: it is connectionless, so `axl_udp_close`
+already releases the port synchronously. RAII (`AXL_AUTOPTR`) cleanup always uses
+`AXL_TEARDOWN_GRACEFUL`.
 
 ### REST request helpers
 

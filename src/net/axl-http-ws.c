@@ -204,9 +204,20 @@ ws_outq_enqueue(HttpConn *conn, const void *frame, size_t len)
         return AXL_ERR;
     }
 
+    /* Reject a single frame larger than the whole outbound budget instead of
+       admitting it. The old escape hatch ("always allow a single frame larger
+       than the byte budget") handed a multi-MB frame to the one-Transmit-in-
+       flight transport as one giant send; a client that could not drain it
+       (slow read / mid-send close) then wedged the entire single-threaded
+       server. A frame this large is a caller bug — chunk the payload. */
+    if (len > WS_OUT_MAX_BYTES) {
+        axl_warning("ws: frame %zu B exceeds outbound budget %u B; dropping "
+                    "(chunk larger payloads)", len, WS_OUT_MAX_BYTES);
+        return AXL_ERR;
+    }
+
     /* Lossy back-pressure: drop the oldest droppable frame(s) until the new one
-       fits. Keep at least the in-flight head, and always allow a single frame
-       larger than the byte budget (drop down to the head, then admit it). */
+       fits within budget. Keep at least the in-flight head. */
     while ((conn->ws_out_count >= WS_OUT_MAX_FRAMES
             || conn->ws_out_bytes + len > WS_OUT_MAX_BYTES)
            && conn->ws_out_count > (conn->ws_out_inflight ? 1u : 0u)) {
@@ -535,9 +546,13 @@ process_websocket_data(
                frame — a blocking send here spins a nested ephemeral
                axl_loop_run that cannot progress at the raised TPL of a
                resident driver-tick loop (the adbf5461 / axl_tls_free
-               hazard), wedging the loop. The TCP FIN from axl_tcp_close
-               conveys the close (mirrors axl_tls_free dropping the
-               close_notify alert). */
+               hazard), wedging the loop. The transport teardown from
+               axl_tcp_close conveys the close (mirrors axl_tls_free
+               dropping the close_notify alert): a FIN in the foreground,
+               and — because a graceful Close() would itself wedge at a
+               raised TPL when un-drained TX is still buffered — an RST
+               under the driver pump (axl_tcp_close promotes a raised-TPL
+               connection close to abortive; see tcp_close_impl). */
             if (buf != data) {
                 axl_free(buf);
             }
@@ -546,7 +561,7 @@ process_websocket_data(
         } else if (hdr.opcode == WS_OP_TEXT || hdr.opcode == WS_OP_BINARY) {
             /* Dispatch to the per-connection handler (_ex) if registered,
                else the broadcast-style handler. */
-            size_t event = (hdr.opcode == WS_OP_TEXT)
+            AxlWsEvent event = (hdr.opcode == WS_OP_TEXT)
                 ? AXL_WS_TEXT : AXL_WS_BINARY;
             if (conn->ws_conn_handler != NULL) {
                 conn->ws_conn_handler((AxlWsConn *)conn, event, payload,

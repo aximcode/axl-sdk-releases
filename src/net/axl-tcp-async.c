@@ -110,6 +110,7 @@ on_accept_complete(void *data)
     sock->tcp_sb     = listener->tcp_sb;
     sock->sb_handle  = listener->sb_handle;
     sock->is_listener = false;
+    sock->listener_id = listener->listener_id;   /* for scoped deferred-close finalize */
 
     //
     // Call user callback. Return value controls re-arming: true keeps
@@ -550,6 +551,43 @@ axl_tcp_recv_async(
 
 // ---- send async ------------------------------------------------------------
 
+/* Bound on a single UEFI Transmit. A larger async send is split into a chain
+   of Transmits of at most this many bytes so no one Transmit is unbounded —
+   an unbounded Transmit that a slow / stalled client can't drain monopolizes
+   the shared one-send-in-flight path and wedges the single-threaded loop. */
+#define TCP_SEND_CHUNK_MAX  (32u * 1024u)
+
+/* Arm the next Transmit for the current send: submit
+   min(TCP_SEND_CHUNK_MAX, remaining) bytes from send_ptr + send_off, reusing
+   tx_token/tx_event. Returns the EFI Transmit status. Does NOT touch the loop
+   source — the caller owns source lifecycle. */
+static EFI_STATUS
+tcp_send_arm_chunk(AxlTcp *sock)
+{
+    size_t remaining = sock->send_total - sock->send_off;
+    size_t chunk     = (remaining < TCP_SEND_CHUNK_MAX)
+                       ? remaining : TCP_SEND_CHUNK_MAX;
+
+    sock->tx_frag.FragmentLength = (uint32_t)chunk;
+    sock->tx_frag.FragmentBuffer = (void *)(sock->send_ptr + sock->send_off);
+
+    axl_memset(&sock->tx_data, 0, sizeof(sock->tx_data));
+    sock->tx_data.Push             = true;
+    sock->tx_data.DataLength       = (uint32_t)chunk;
+    sock->tx_data.FragmentCount    = 1;
+    sock->tx_data.FragmentTable[0] = sock->tx_frag;
+
+    sock->tx_token.CompletionToken.Status = EFI_ABORTED;
+    sock->tx_token.Packet.TxData          = &sock->tx_data;
+
+    /* Clear any stale signal so the loop won't fire on_send_complete before
+       this Transmit actually completes. */
+    axl_backend_event_check(
+        (AxlEventHandle)sock->tx_token.CompletionToken.Event);
+
+    return axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
+}
+
 static bool
 on_send_complete(void *data)
 {
@@ -562,12 +600,35 @@ on_send_complete(void *data)
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
     status = sock->tx_token.CompletionToken.Status;
-    if (EFI_ERROR(status)) {
-        axl_error("async send failed: %llx", (unsigned long long)status);
-        cb_status = AXL_ERR;
+    if (!EFI_ERROR(status)) {
+        /* UEFI Transmit tokens are all-or-nothing per submission: this
+           completion means the whole submitted chunk was accepted. Advance
+           by exactly that chunk's length (recomputed from the pre-advance
+           offset — identical to what tcp_send_arm_chunk just submitted). */
+        size_t sent = sock->send_total - sock->send_off;
+        if (sent > TCP_SEND_CHUNK_MAX) {
+            sent = TCP_SEND_CHUNK_MAX;
+        }
+        sock->send_off += sent;
+
+        if (sock->send_off < sock->send_total) {
+            /* More to go — re-arm the next chunk on the SAME tx_event and keep
+               this loop source (AXL_SOURCE_CONTINUE); the user callback fires
+               only after the final chunk completes. */
+            status = tcp_send_arm_chunk(sock);
+            if (!EFI_ERROR(status)) {
+                return AXL_SOURCE_CONTINUE;
+            }
+            axl_error("async send: chunk re-arm failed at %zu/%zu: %llx",
+                      sock->send_off, sock->send_total,
+                      (unsigned long long)status);
+            /* fall through: report the re-arm failure as a send failure */
+        }
     } else {
-        cb_status = AXL_OK;
+        axl_error("async send failed: %llx", (unsigned long long)status);
     }
+
+    cb_status = EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 
     //
     // Remove loop source BEFORE calling user callback
@@ -660,6 +721,14 @@ axl_tcp_send_async(
     sock->send_data  = data;
     sock->async_loop = loop;
 
+    /* Chunk-chain state: the send is submitted as bounded Transmits (see
+       tcp_send_arm_chunk / on_send_complete). The caller's buffer is borrowed
+       until the whole send completes — the same lifetime the single-Transmit
+       path already required. */
+    sock->send_ptr   = (const uint8_t *)buf;
+    sock->send_total = size;
+    sock->send_off   = 0;
+
     //
     // Create the send event if not already created
     //
@@ -674,26 +743,10 @@ axl_tcp_send_async(
     }
 
     //
-    // Set up tx_frag, tx_data, tx_token
+    // Submit the first (possibly only) chunk. tcp_send_arm_chunk sets up
+    // tx_frag/tx_data/tx_token, clears any stale event signal, and Transmits.
     //
-    sock->tx_frag.FragmentLength = (uint32_t)size;
-    sock->tx_frag.FragmentBuffer = (void *)buf;
-
-    axl_memset(&sock->tx_data, 0, sizeof(sock->tx_data));
-    sock->tx_data.Push            = true;
-    sock->tx_data.DataLength      = (uint32_t)size;
-    sock->tx_data.FragmentCount   = 1;
-    sock->tx_data.FragmentTable[0] = sock->tx_frag;
-
-    sock->tx_token.CompletionToken.Status = EFI_ABORTED;
-    sock->tx_token.Packet.TxData          = &sock->tx_data;
-
-    /* Clear any stale signal from a previous synchronous send so the
-       loop does not fire the callback before this Transmit completes. */
-    axl_backend_event_check(
-        (AxlEventHandle)sock->tx_token.CompletionToken.Event);
-
-    status = axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
+    status = tcp_send_arm_chunk(sock);
     if (EFI_ERROR(status)) {
         axl_debug("async Transmit: %llx", (unsigned long long)status);
         return AXL_ERR;
@@ -773,7 +826,7 @@ on_connect_complete(void *data)
            dangling on the soon-to-be-freed loop. Clearing
            async_loop here makes the close finalize inline. */
         sock->async_loop = NULL;
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         cb(NULL, AXL_ERR, udata);  /* connect is one-shot; return value ignored */
         return AXL_SOURCE_REMOVE;
     }
@@ -805,7 +858,7 @@ on_connect_cancel(void *data)
        sync wrapper's ephemeral loop frees right after this returns,
        so an async close_event source would be left dangling. */
     sock->async_loop = NULL;
-    axl_tcp_close(sock);
+    axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
     cb(NULL, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
     return AXL_SOURCE_REMOVE;
 }
@@ -954,7 +1007,7 @@ axl_tcp_connect_addr_async(
     conn_event = NULL;
     if (axl_backend_event_create((AxlEventHandle *)&conn_event) != AXL_OK) {
         axl_error("async connect: cannot create event");
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         return AXL_ERR;
     }
 
@@ -964,7 +1017,7 @@ axl_tcp_connect_addr_async(
     status = axl_efi_call(tcp4->Connect, 2, tcp4, &sock->conn_token);
     if (EFI_ERROR(status)) {
         axl_error("async Connect: %llx", (unsigned long long)status);
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         return AXL_ERR;
     }
 
@@ -977,7 +1030,7 @@ axl_tcp_connect_addr_async(
     if (sock->connect_source == 0) {
         axl_error("async connect: cannot register event with loop");
         axl_efi_call(tcp4->Cancel, 2, tcp4, &sock->conn_token.CompletionToken);
-        axl_tcp_close(sock);
+        axl_tcp_close(sock, AXL_TEARDOWN_GRACEFUL);
         return AXL_ERR;
     }
 

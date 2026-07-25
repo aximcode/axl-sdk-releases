@@ -691,6 +691,42 @@ static void expand_rhs(Buf *b, const char *rhs, const AxlMatch *g, size_t ng)
 }
 
 /* Apply an `s` command to the pattern space. Returns true if any sub made. */
+/* Append one line to a `w` destination. THE one place sed writes a file --
+   shared by the `w` COMMAND and the s///w FLAG, which are the tool's only
+   file outputs (`out` is axl_stdout unconditionally; there is no -i). They
+   were two copies of the same code and duly drifted: one grew checks and
+   the other kept none, which is exactly the shape this routine exists to
+   make impossible.
+
+   Checks the writes AND the flush. axl_fclose drains the AXL-side buffer
+   but never calls the stream's flush, and the firmware close under it
+   cannot report anything (EFI_FILE_PROTOCOL.Close is specified to return
+   only EFI_SUCCESS), so a `w` file that lost its last line -- an OUTPUT of
+   the script, not a side note -- would be a wrong answer delivered
+   quietly. exit_status 2 is what sed already uses for "a file named by the
+   script could not be used". */
+static void
+write_w_file(const char *path, const char *data, size_t len)
+{
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    AxlStream *w = axl_fopen(path, "a");
+    if (w == NULL) {
+        fail("cannot open w file", path);
+        exit_status = 2;
+        return;
+    }
+    bool ok = (axl_write(w, data, len) == (axl_ssize_t)len)
+           && (axl_write(w, "\n", 1) == 1)
+           && (axl_fflush(w) == AXL_OK);
+    axl_fclose(w);
+    if (!ok) {
+        fail("write to w file failed", path);
+        exit_status = 2;
+    }
+}
+
 static bool do_subst(Cmd *c)
 {
     AxlRegex *re = c->re ? c->re : last_re;
@@ -737,10 +773,7 @@ static bool do_subst(Cmd *c)
     ps = out_b;
 
     if (c->s_print) emit_line(ps.p, ps.len);
-    if (c->s_wfile && c->s_wfile[0]) {
-        AxlStream *w = axl_fopen(c->s_wfile, "a");
-        if (w) { axl_write(w, ps.p, ps.len); axl_write(w, "\n", 1); axl_fclose(w); }
-    }
+    write_w_file(c->s_wfile, ps.p, ps.len);
     return true;
 }
 
@@ -1031,8 +1064,7 @@ static CycleResult run_cycle(Input *in)
             }
             break;
         }
-        case 'w': { AxlStream *w = axl_fopen(c->text, "a");
-                    if (w) { axl_write(w, ps.p, ps.len); axl_write(w, "\n", 1); axl_fclose(w); } break; }
+        case 'w': write_w_file(c->text, ps.p, ps.len); break;
         case '=': { char tmp[24]; axl_snprintf(tmp, sizeof tmp, "%ld", line_no); emit(tmp, axl_strlen(tmp)); emit_sep(); break; }
         case 'l': output_l(); break;
         case 'z': ps.len = 0; break;
@@ -1069,6 +1101,18 @@ restart:;
 
 AXL_TOOL_MAIN(sed)
 {
+    /* -h/--help: sed uses a POSIX bundled-option parser, not the axl_args
+       framework, so it answers help through the shared hook (uniform with
+       every framework tool's -h header). --version/-V is handled one layer up
+       by AXL_TOOL_MAIN. */
+    if (axl_help_handle("sed",
+            "Stream editor (POSIX sed + common GNU extensions)",
+            "sed [-n] [-E|-r] [-s] [-z] [-e script]... [-f file]... "
+            "[script] [file...]",
+            argc, argv)) {
+        return 0;
+    }
+
     Buf script = {0};
     bool have_script = false;
     char *files[256]; int nfiles = 0;

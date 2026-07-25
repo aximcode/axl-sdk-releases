@@ -313,6 +313,10 @@ axl_gfx_buffer_free(
     AxlGfxBuffer  *buf    ///< buffer to free, or NULL
     );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlGfxBuffer, axl_gfx_buffer_free)
+#endif
+
 /// Get buffer dimensions.
 ///
 /// @return AXL_OK on success, AXL_ERR if @a buf is NULL.

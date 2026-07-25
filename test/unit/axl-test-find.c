@@ -103,7 +103,7 @@ np_length(const AxlByteReader *r)
 }
 
 static size_t
-np_read(const AxlByteReader *r, size_t offset, size_t len, void *buf)
+np_read(const AxlByteReader *r, size_t offset, void *buf, size_t len)
 {
     const NoPeekReader *n = (const NoPeekReader *)r->ctx;
     if (offset >= n->len) {

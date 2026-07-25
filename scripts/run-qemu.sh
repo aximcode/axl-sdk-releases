@@ -35,7 +35,9 @@
 #                         for live GOP viewing over SSH/Tailscale. All
 #                         three imply --gpu and have no timeout.
 #   --net                 Enable user-mode networking (virtio-net)
-#   --hostfwd H:G         Forward host port H to guest port G (repeatable)
+#   --hostfwd H:G         Forward host port H to guest port G (repeatable).
+#                         H may be `auto` to have a verified-free host port
+#                         claimed for you and reported as HOSTFWD_<G>=<port>.
 #   --extra FILE          Stage additional .efi file on disk (repeatable)
 #   --sendkey "K K ..."   With --screenshot: inject QEMU monitor key tokens
 #                         (e.g. "h i spc t h e r e", "ctrl-s", "ret") once
@@ -45,6 +47,10 @@
 #   --holdkey "QCODE:MS"  With --screenshot: hold a USB key down for MS ms via
 #                         QMP (reproduces UsbKbDxe typematic "bounce"). Auto-adds
 #                         a USB keyboard. Pair with --serial-log. Repeatable.
+#   --reboot              A guest-initiated reset re-POSTs the same VM
+#                         (disk image + OVMF vars pflash persist) instead
+#                         of exiting QEMU. Off by default. Bound a reset
+#                         loop with --timeout.
 #   --nsh FILE            Use custom startup.nsh instead of auto-generated
 #   --background          Launch QEMU in background, print PID
 #   --serial-log FILE     Save serial output to FILE
@@ -95,6 +101,12 @@ source "$(dirname "$0")/axl-common.sh"
 ARCH="X64"
 TIMEOUT=15
 RAW=false
+# Sentinel echoed at the top of the staged startup.nsh so the non-raw output
+# filter knows where the app's output begins. It used to anchor on the Shell's
+# "...to continue." startup-countdown prompt, but the AXL shell launcher skips
+# that countdown (-delay 0), so this explicit marker replaces it (the countdown
+# prompt is kept as a fallback anchor for a launcher-less direct-Shell boot).
+APP_OUTPUT_SENTINEL="___AXL_APP_OUTPUT_BEGIN___"
 SCREENSHOT=""
 # --gpu wires a virtual GPU device into the QEMU machine so the guest
 # firmware (OVMF) initializes a GOP for axl_gfx_*.  Needed for any
@@ -107,6 +119,7 @@ NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrid
 MAC_ADDR=""         # --mac XX:XX:XX:XX:XX:XX (HF4: replay a captured NIC MAC)
 CPU_SPEC=""         # --cpu SPEC (HF4: replay a captured CPU model, e.g. qemu64,family=6)
 HOSTFWDS=()
+HOSTFWD_CHOSEN=()   # HOSTFWD_<guest>=<host> for each --hostfwd auto:<guest>
 EXTRA_FILES=()
 # --qemu-arg STRING: one literal QEMU command-line token, appended
 # verbatim (NOT word-split). Repeatable — pass one --qemu-arg per token,
@@ -115,6 +128,12 @@ EXTRA_FILES=()
 # device spec whose path has a space (`...,mem-path=/my dir/x.bin`) — so
 # programmatic callers like axl-emulate can inject HF device args safely.
 EXTRA_QEMU_ARGS=()
+# --reboot: let a guest-initiated reset re-POST the same VM (same disk
+# image, same OVMF vars pflash) instead of ending the run. OFF by
+# default — every mode except --screenshot passes -no-reboot, and
+# callers rely on "QEMU exited" as the observable signal that the guest
+# reset itself.
+REBOOT=false
 
 CUSTOM_NSH=""
 BACKGROUND=false
@@ -133,11 +152,10 @@ EFI_ARGS=()
 SENDKEY_SEQ=""   # space-separated QEMU monitor key tokens to inject (--screenshot)
 SENDMOUSE_SEQ="" # space-separated "fx,fy[,click]" absolute-pointer moves (--screenshot, QMP)
 HOLDKEY_SEQ=""   # space-separated "qcode:ms" held keypresses (--screenshot, QMP)
-CPU_WARN=true
-CPU_REPORT=false     # --cpu-report: always print sampled mean/peak host CPU
-CPU_THRESHOLD="1.5"   # cores; >=1.5 means a single vCPU pegged
-CPU_SUSTAIN="2"       # seconds at threshold to count as a spike
-CPU_SPIKE_EXIT=8     # distinct exit code for "sustained CPU spike" (vs guest fail/timeout)
+# CPU-spike detection knobs come from axl-common.sh; the KVM/TCG-aware threshold,
+# warm-up and warn carve-out are applied by cpu_policy_init "$ARCH" below (after
+# --arch is known). --cpu-threshold / --no-cpu-warn / --cpu-report still override,
+# because cpu_policy_init only fills a value a flag has not already set.
 INTERACTIVE=false
 # --display BACKEND (or --gui = gtk): open a real graphical window for the
 # guest's GOP framebuffer instead of running headless. Over SSH this rides
@@ -193,6 +211,7 @@ while [[ $# -gt 0 ]]; do
         --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
         --holdkey)    HOLDKEY_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
+        --reboot)     REBOOT=true; shift ;;
         --nsh)        CUSTOM_NSH="$2"; shift 2 ;;
         --boot-target) BOOT_TARGET=true; shift ;;
         --shell)      SHELL_OVERRIDE="$2"; shift 2 ;;
@@ -297,7 +316,17 @@ Options:
                            to force the "firmware lacks NIC driver"
                            scenario when validating staged-driver
                            fallback. Implies --net.
-  --hostfwd HOST:GUEST     Forward host port to guest (repeatable)
+  --hostfwd HOST:GUEST     Forward host port to guest (repeatable).
+                           HOST may be the literal `auto`, in which case a
+                           host port that is free RIGHT NOW is claimed for
+                           the life of this process and reported back as
+                           `HOSTFWD_<GUEST>=<port>` — on stdout alongside
+                           QEMU_PID= under --background, on stderr
+                           otherwise. Prefer this to hard-coding a port:
+                           QEMU refuses the ENTIRE -netdev if any single
+                           hostfwd cannot bind, so a port clash presents as
+                           "the guest has no network" rather than as a
+                           bind error.
   --extra FILE             Stage additional .efi on disk (repeatable)
   --sendkey "K K ..."      With --screenshot: inject QEMU monitor key
                            tokens (space-separated; e.g.
@@ -331,6 +360,19 @@ Options:
                            run-qemu.sh concern; use scripts/axl-emulate,
                            which builds those device args from a fixture
                            and passes them via --qemu-arg.)
+                           Caller tokens are appended LAST, so an
+                           explicit token overrides run-qemu's own
+                           default for any option QEMU resolves
+                           last-wins (-display, -action, ...).
+  --reboot                 Let a guest-initiated reset re-POST the same
+                           VM instead of exiting QEMU. The disk image
+                           and the OVMF vars pflash persist across the
+                           reset, so firmware-persistent state (NVRAM)
+                           carries over exactly as on real hardware.
+                           OFF by default: without it a guest reset ends
+                           the run, which callers use as the signal that
+                           a reset happened. A guest that resets in a
+                           loop is bounded by --timeout, not by QEMU.
   --nsh FILE               Use custom startup.nsh file
   --boot-target            Stage the app AS \EFI\BOOT\BOOTx64.EFI so BdsDxe
                            launches it directly — no parent shell, no
@@ -620,6 +662,18 @@ if [[ -z "$_axl_tmp_base" && -d /dev/shm && -w /dev/shm ]]; then
     _axl_tmp_base=/dev/shm
 fi
 if [[ -n "$_axl_tmp_base" ]]; then
+    # Defense-in-depth sweep: remove obviously-dead axl-qemu.* state dirs from
+    # prior runs (hard-killed, where the self-clean subshell never ran, or
+    # pre-fix background leaks) before creating a new one. A dir is swept only if
+    # it is BOTH older than 10 minutes AND has no live process referencing its
+    # path (a running guest or virtiofsd carries it in argv). The age guard is
+    # what makes this safe under the parallel integration pool: a dir in its
+    # brief create-then-stage window is seconds old, so it can never be mistaken
+    # for a leak and rm'd out from under a concurrent run.
+    while IFS= read -r local_d; do
+        [[ -n "$local_d" ]] || continue
+        pgrep -af -- "$local_d" >/dev/null 2>&1 || rm -rf "$local_d"
+    done < <(find "$_axl_tmp_base" -maxdepth 1 -type d -name 'axl-qemu.*' -mmin +10 2>/dev/null)
     TMPDIR=$(mktemp -d -p "$_axl_tmp_base" axl-qemu.XXXXXXXX)
 else
     TMPDIR=$(mktemp -d)
@@ -647,8 +701,11 @@ if [[ "$BOOT_TARGET" == "true" && -n "$EFI_FILE" ]]; then
         cp "$SHELL_EFI" "$STAGING/Shell.efi"
     fi
 else
+    # Boot the Shell via the AXL launcher ("-delay 0", skips the 5 s startup
+    # countdown); see stage_boot_shell in axl-common.sh. Falls back to booting
+    # the Shell directly if the launcher can't be built.
     if [[ -n "$SHELL_EFI" && -f "$SHELL_EFI" ]]; then
-        cp "$SHELL_EFI" "$STAGING/EFI/BOOT/$BOOT_NAME"
+        stage_boot_shell "$STAGING" "$ARCH" "$BOOT_NAME" "$SHELL_EFI"
     fi
     if [[ -n "$EFI_FILE" ]]; then
         cp "$EFI_FILE" "$STAGING/$EFI_NAME"
@@ -703,7 +760,9 @@ if [[ -n "$CUSTOM_NSH" ]]; then
         echo "ERROR: nsh file not found: $CUSTOM_NSH" >&2
         exit 1
     fi
-    cp "$CUSTOM_NSH" "$STAGING/startup.nsh"
+    # Prepend the app-output sentinel so the non-raw filter can find where the
+    # script's output begins (the launcher removes the old countdown anchor).
+    { echo "echo $APP_OUTPUT_SENTINEL"; cat "$CUSTOM_NSH"; } > "$STAGING/startup.nsh"
     # Power off when a non-interactive custom nsh finishes, so the run doesn't
     # idle at the shell prompt until --timeout (the auto-generated app launch
     # gets a `reset -s` for the same reason). Skipped for background /
@@ -781,12 +840,18 @@ else
         if [[ -z "$EFI_FILE" || "$BOOT_TARGET" == "true" ]]; then
             : # bare-shell mode, or --boot-target (BdsDxe launches the app as
               # \EFI\BOOT\BOOTx64.EFI directly; this startup.nsh is never run).
-        elif [[ "$IS_DRIVER" == "true" ]]; then
-            echo "load $EFI_NAME"
-        elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
-            echo "$EFI_NAME ${EFI_ARGS[*]}"
         else
-            echo "$EFI_NAME"
+            # Marker delimiting where the app's output begins, so the non-raw
+            # filter can strip the shell banner + mapping table above it (the
+            # launcher removes the old "...to continue." countdown anchor).
+            echo "echo $APP_OUTPUT_SENTINEL"
+            if [[ "$IS_DRIVER" == "true" ]]; then
+                echo "load $EFI_NAME"
+            elif [[ ${#EFI_ARGS[@]} -gt 0 ]]; then
+                echo "$EFI_NAME ${EFI_ARGS[*]}"
+            else
+                echo "$EFI_NAME"
+            fi
         fi
         if [[ -n "$EFI_FILE" && -z "$SCREENSHOT" \
               && "$BACKGROUND" != "true" \
@@ -797,197 +862,20 @@ else
     } > "$STAGING/startup.nsh"
 fi
 
-# Build disk image. Prefer mkimage when available (richer tooling,
-# UDF-bridge support); fall back to plain mtools when not (CI runners
-# without the mkimage repo cloned, contributors who haven't set
-# MKIMAGE_DIR, etc.). The fallback is the same recipe common-test.sh
-# uses — dd + mkfs.vfat + mcopy.
-if [[ -n "${MKIMAGE_DIR:-}" && -f "$MKIMAGE_DIR/mkimage.py" ]]; then
-    "$MKIMAGE_DIR/mkimage.py" --source "$STAGING" --target "$TMPDIR/disk.img" --label RUN > /dev/null 2>&1
-else
-    # Validate up-front so a missing tool surfaces with an install
-    # hint instead of dying silently under `set -e` after the next
-    # command's stderr lands in /dev/null.
-    missing=()
-    command -v mkfs.vfat >/dev/null 2>&1 || missing+=("mkfs.vfat (dosfstools)")
-    command -v mcopy     >/dev/null 2>&1 || missing+=("mcopy (mtools)")
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        cat >&2 <<EOF
-ERROR: disk-image build needs tools that are not installed:
-  - ${missing[*]}
-
-  Install:
-    Debian/Ubuntu:    sudo apt install dosfstools mtools
-    Fedora/RHEL:      sudo dnf install dosfstools mtools
-    Arch:             sudo pacman -S dosfstools mtools
-
-  Or set MKIMAGE_DIR=/path/to/mkimage to use the mkimage backend instead.
-EOF
-        exit 1
-    fi
-
-    size_kb=$(du -sk "$STAGING" | cut -f1)
-    size_kb=$(( (size_kb + 4096) / 1024 * 1024 ))   # round up to MB
-    [[ $size_kb -lt 40960 ]] && size_kb=40960        # min 40 MB
-    dd if=/dev/zero of="$TMPDIR/disk.img" bs=1K count="$size_kb" 2>/dev/null
-    # mkfs.vfat / mcopy errors are surfaced (not redirected to /dev/null) —
-    # if formatting or staging fails, the user sees why instead of a
-    # silent set -e exit.
-    mkfs.vfat -F 32 -n RUN "$TMPDIR/disk.img" >/dev/null
-    # Use mcopy -s for recursive copy. Pass top-level entries by name
-    # (no leading "./") so mcopy's destination path is clean and mtools
-    # creates the directory tree on the fly. The previous per-file
-    # loop produced "::/./EFI/..." paths that mtools refused to write.
-    (
-        cd "$STAGING" || exit 1
-        for entry in $(find . -maxdepth 1 -mindepth 1 -printf '%P\n'); do
-            mcopy -s -i "$TMPDIR/disk.img" "$entry" "::/"
-        done
-    )
-fi
+# Build disk image (shared with the integration harness — see
+# qemu_stage_disk in axl-common.sh: mkimage when MKIMAGE_DIR is set, else mtools).
+qemu_stage_disk "$STAGING" "$TMPDIR/disk.img" RUN || exit 1
 
 # Prepare NVRAM
 cp "$FW_VARS" "$TMPDIR/vars.fd"
 
-# CPU-spike sampler. Runs alongside QEMU sampling /proc/<pid>/stat
-# at 5 Hz after a warm-up window (firmware boot legitimately spins
-# while it walks PCI / loads drivers). Tracks peak host-CPU
-# consumption (in core-units, where 1.0 = one core saturated) and
-# the longest sustained-≥-threshold streak. Writes "<peak>
-# <sustain_max>" to the supplied summary file when QEMU exits.
-# Caller checks the summary against CPU_THRESHOLD / CPU_SUSTAIN
-# and emits a WARN line if breached.
-#
-# Warm-up is ARCH-dependent — TCG (AARCH64 default) is slower
-# through OVMF boot than KVM-X64.
-CPU_WARMUP=10
-[[ "$ARCH" == "AARCH64" ]] && CPU_WARMUP=15
+# CPU-spike sampler + monitor lifecycle live in scripts/axl-common.sh so
+# common-test.sh (a sibling that builds its own QEMU command and never calls this
+# script) gets the same check. cpu_policy_init picks the KVM/TCG-aware threshold +
+# warm-up + warn carve-out (one source of truth, shared with common-test.sh);
+# --cpu-threshold / --no-cpu-warn parsed above still override it.
+cpu_policy_init "$ARCH"
 
-cpu_sampler() {
-    local qpid="$1" out="$2"
-    local hz; hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    awk -v pid="$qpid" -v hz="$hz" -v interval=0.2 \
-        -v warmup="$CPU_WARMUP" -v thr="$CPU_THRESHOLD" '
-    function read_total(p,    line, n, after, f) {
-        if ((getline line < ("/proc/" p "/stat")) <= 0) {
-            close("/proc/" p "/stat"); return -1
-        }
-        close("/proc/" p "/stat")
-        n = index(line, ") ")
-        if (n == 0) return -1
-        split(substr(line, n+2), f, " ")
-        # post-comm fields: state(1) ppid(2) pgrp(3) session(4)
-        # tty_nr(5) tpgid(6) flags(7) minflt(8) cminflt(9)
-        # majflt(10) cmajflt(11) utime(12) stime(13) ...
-        return f[12] + f[13]
-    }
-    function alive(p) { return (system("kill -0 " p " 2>/dev/null") == 0) }
-    BEGIN {
-        system("sleep " warmup)
-        prev = read_total(pid)
-        if (prev < 0) { print "0.00 0.00 0.000"; exit 0 }
-        peak = 0; streak = 0; streak_max = 0; sum = 0; n = 0
-        while (alive(pid)) {
-            system("sleep " interval)
-            cur = read_total(pid)
-            if (cur < 0) break
-            d = cur - prev; prev = cur
-            cores = d / (hz * interval)
-            sum += cores; n++
-            if (cores > peak) peak = cores
-            if (cores >= thr) {
-                streak += interval
-                if (streak > streak_max) streak_max = streak
-            } else {
-                streak = 0
-            }
-        }
-        # peak (max 0.2s reading) sustain_max (longest >=thr streak, s) mean (avg cores)
-        printf "%.2f %.2f %.3f\n", peak, streak_max, (n > 0 ? sum / n : 0)
-    }' > "$out"
-}
-
-# Print a CPU-spike summary if the sampler captured a sustained spike, and/or
-# (with --cpu-report) an always-on report of the sampled host-CPU usage.
-# Reads "<peak> <sustain_max> <mean>" from the file written by cpu_sampler
-# (1.0 = one host core saturated; measured after the boot warm-up window).
-# Returns CPU_SPIKE_EXIT when CPU_WARN is on and a sustained post-warm-up spike
-# was detected (so the caller can fail the run); 0 otherwise. --no-cpu-warn
-# (CPU_WARN=false) suppresses BOTH the WARN line and this non-zero return.
-cpu_summary() {
-    local summary_file="$1"
-    [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
-    [[ ! -s "$summary_file" ]] && return 0
-    local peak sustain mean
-    read -r peak sustain mean < "$summary_file" || return 0
-    mean="${mean:-0.000}"
-
-    # Always-on report — a machine-greppable line consumers (e.g. the
-    # server-CPU regression test) parse. Goes to stdout, not stderr.
-    if [[ "$CPU_REPORT" == "true" ]]; then
-        printf "CPU-REPORT: mean %s cores, peak %s cores (after %ss warm-up)\n" \
-            "$mean" "$peak" "$CPU_WARMUP"
-    fi
-
-    # awk for the comparison; $sustain and $CPU_SUSTAIN are floats.
-    if [[ "$CPU_WARN" == "true" ]]; then
-        local breached
-        breached=$(awk -v s="$sustain" -v t="$CPU_SUSTAIN" \
-            'BEGIN{print (s+0 >= t+0) ? "1" : "0"}')
-        if [[ "$breached" == "1" ]]; then
-            printf "WARN: CPU spike — peak %s cores, sustained ≥%s cores for %ss (threshold %ss)\n" \
-                "$peak" "$CPU_THRESHOLD" "$sustain" "$CPU_SUSTAIN" >&2
-            return "$CPU_SPIKE_EXIT"
-        fi
-    fi
-    return 0
-}
-
-# --- CPU-monitor lifecycle (shared by the screenshot + default run branches) ---
-# Both branches launch/kill QEMU differently, so only the monitor lifecycle is
-# factored here (the launch code is deliberately left per-branch — it diverges too
-# much to share without obscuring it). cpu_monitor_start records the summary path +
-# sampler pid in globals; cpu_monitor_finish waits the sampler and summarizes,
-# returning the spike status.
-CPU_SUMMARY_FILE=""
-CPU_SAMPLER_PID=""
-
-# Resolve the QEMU child pid of a `( timeout ... qemu ) &` wrapper subshell.
-# Empty if not found within ~1s (caller decides any fallback).
-qemu_child_pid() {
-    local wrapper="$1" pid=""
-    local _
-    for _ in 1 2 3 4 5; do
-        pid=$(pgrep -P "$wrapper" 2>/dev/null | head -1)
-        [[ -n "$pid" ]] && break
-        sleep 0.2
-    done
-    printf '%s' "$pid"
-}
-
-# Start the background CPU sampler against a running QEMU pid. No-op (leaves the
-# globals empty) when both warn and report are off, or the pid is empty.
-cpu_monitor_start() {
-    local qpid="$1"
-    CPU_SUMMARY_FILE=""
-    CPU_SAMPLER_PID=""
-    [[ "$CPU_WARN" != "true" && "$CPU_REPORT" != "true" ]] && return 0
-    [[ -z "$qpid" ]] && return 0
-    CPU_SUMMARY_FILE="$TMPDIR/cpu-summary.txt"
-    cpu_sampler "$qpid" "$CPU_SUMMARY_FILE" &
-    CPU_SAMPLER_PID=$!
-}
-
-# Wait for the sampler (QEMU must already be dead/dying) and summarize. Returns
-# cpu_summary's status (CPU_SPIKE_EXIT on a breach, else 0). Safe when the monitor
-# never started. Callers must capture the status (`|| rc=$?`) under `set -e`.
-cpu_monitor_finish() {
-    if [[ -n "$CPU_SAMPLER_PID" ]]; then
-        wait "$CPU_SAMPLER_PID" 2>/dev/null || true
-    fi
-    [[ -z "$CPU_SUMMARY_FILE" ]] && return 0
-    cpu_summary "$CPU_SUMMARY_FILE"
-}
 
 # Build QEMU command
 mapfile -d '' -t CMD < <(build_qemu_base_cmd "$ARCH" "$QEMU_BIN" "$MEM" "$TMPDIR/vars.fd" "$CPU_SPEC")
@@ -1076,17 +964,7 @@ fi
 # many of the early boot instructions — drop -enable-kvm/-cpu host
 # from the base cmd and fall back to TCG when --gdb is requested.
 if [[ -n "$GDB_PORT" ]]; then
-    NEW_CMD=()
-    skip=0
-    for arg in "${CMD[@]}"; do
-        if [[ $skip -gt 0 ]]; then skip=$((skip-1)); continue; fi
-        case "$arg" in
-            -enable-kvm) ;;                 # drop
-            -cpu)        skip=1 ;;          # drop with its value
-            *)           NEW_CMD+=("$arg") ;;
-        esac
-    done
-    CMD=("${NEW_CMD[@]}")
+    qemu_strip_kvm CMD          # TCG fallback — KVM can't single-step early boot
     CMD+=(-gdb "tcp::$GDB_PORT")
     if [[ "$GDB_HALT" == "true" ]]; then
         CMD+=(-S)
@@ -1201,7 +1079,20 @@ if [[ "$NET" == "true" ]]; then
         for fwd in "${HOSTFWDS[@]}"; do
             HOST_PORT="${fwd%%:*}"
             GUEST_PORT="${fwd##*:}"
+            # `auto` asks the harness for a host port that is verified free
+            # right now and claimed for this process's lifetime, instead of
+            # the caller hard-coding one and hoping. The chosen port is
+            # reported back as HOSTFWD_<guest>=<host>.
+            if [[ "$HOST_PORT" == "auto" ]]; then
+                axl_alloc_host_port HOST_PORT || exit 1
+                HOSTFWD_CHOSEN+=("HOSTFWD_${GUEST_PORT}=${HOST_PORT}")
+            fi
             NETDEV="$NETDEV,hostfwd=tcp::${HOST_PORT}-:${GUEST_PORT}"
+        done
+        # Non-machine-readable modes get it on stderr; --background repeats
+        # it on stdout next to QEMU_PID= where scripts already parse.
+        for _hf in "${HOSTFWD_CHOSEN[@]}"; do
+            echo "[run-qemu] $_hf" >&2
         done
     fi
     # Default NIC model is virtio-net-pci because OVMF has VirtioNetDxe
@@ -1228,14 +1119,36 @@ else
     CMD+=(-net none)
 fi
 
+# Final append, called by every launch path immediately before QEMU
+# starts (and by the QEMU_DRYRUN dump below).
+#
 # --qemu-arg passthrough: each accumulated value is one literal QEMU
 # token, appended verbatim (no word-splitting), so a token may contain
 # spaces — see the --qemu-arg contract in --help.
-if [[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]]; then
-    # Append each token verbatim — no word-splitting, so a token may
-    # contain spaces (e.g. a device spec with a space in a file path).
-    CMD+=( "${EXTRA_QEMU_ARGS[@]}" )
-fi
+#
+# These land LAST, after the per-mode defaults each branch below adds
+# (-serial / -display / -monitor / -qmp / -nographic / -no-reboot), so
+# a caller's explicit token beats run-qemu's default for every option
+# QEMU resolves last-wins. Without that, `--qemu-arg -action
+# --qemu-arg reboot=reset` could never undo -no-reboot and no consumer
+# could test what its firmware does on the NEXT boot. Options QEMU
+# treats as additive (-device, -drive, -netdev, -chardev, -smbios,
+# and the monitor family) are unaffected by the position.
+finalize_qemu_cmd() {
+    # --reboot: let a guest-initiated reset re-POST the same VM instead
+    # of ending the run. -no-reboot is shorthand for `-action
+    # reboot=shutdown`; `-action reboot=reset` is its explicit inverse,
+    # and the later token wins. Placed before the caller's own tokens
+    # so an explicit --qemu-arg still overrides it.
+    if [[ "$REBOOT" == "true" ]]; then
+        CMD+=(-action reboot=reset)
+    fi
+    if [[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]]; then
+        # Append each token verbatim — no word-splitting, so a token may
+        # contain spaces (e.g. a device spec with a space in a file path).
+        CMD+=( "${EXTRA_QEMU_ARGS[@]}" )
+    fi
+}
 
 # QEMU_DRYRUN=1 prints the constructed CMD and exits without launching
 # qemu. Useful for argument-shape regression tests and for "what
@@ -1244,6 +1157,7 @@ fi
 # tests can grep for token literals (commas in -device strings, etc.)
 # without escaping.
 if [[ "${QEMU_DRYRUN:-0}" == "1" ]]; then
+    finalize_qemu_cmd
     for tok in "${CMD[@]}"; do
         printf 'QEMU_DRYRUN: %s\n' "$tok"
     done
@@ -1350,6 +1264,7 @@ HINT
         cleanup_cmd="$cleanup_cmd; printf '\\e[r\\e[?1049l\\e[?1004h\\e[?2004h' >&2"
     trap "$cleanup_cmd" EXIT INT TERM
 
+    finalize_qemu_cmd
     "${CMD[@]}"
     exit $?
 fi
@@ -1409,6 +1324,7 @@ HINT
         cleanup_cmd="kill $VIRTIOFSD_PID 2>/dev/null; $cleanup_cmd"
     trap "$cleanup_cmd" EXIT INT TERM
 
+    finalize_qemu_cmd
     "${CMD[@]}"
     exit $?
 fi
@@ -1430,6 +1346,7 @@ if [[ -n "$SCREENSHOT" ]]; then
     fi
 
     set +e
+    finalize_qemu_cmd
     "${CMD[@]}" &
     QEMU_PID=$!
     # Sample host CPU for the life of this QEMU (same monitor the default branch
@@ -1584,21 +1501,75 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # later kill/screenshot still works.
     if [[ -n "$SERIAL_SOCKET" ]]; then
         # Serial as a UNIX socket the host can open to read output AND
-        # write input. -no-shutdown so the guest's own Exit doesn't
-        # force QEMU to tear down before we've drained the log. Drop
-        # -nographic (it implies serial=stdio) in favour of an
-        # explicit chardev binding.
+        # write input. Drop -nographic (it implies serial=stdio) in
+        # favour of an explicit chardev binding.
+        #
+        # No -no-shutdown here (an earlier version of this comment
+        # claimed one, and never passed it): the caller reads the
+        # socket LIVE while the guest runs, so there is no post-mortem
+        # log to drain and nothing to keep QEMU alive for. Keeping the
+        # guest's own Exit fatal is what lets callers use "QEMU is
+        # gone" as the end-of-run signal.
         rm -f "$SERIAL_SOCKET"
+        # wait=on: block the guest until the caller connects its serial reader,
+        # so no early output is lost. Callers launch QEMU here, then connect a
+        # socat reader a beat later; with wait=off the guest boots immediately
+        # and a fast app can print its ready-marker before the reader attaches
+        # (the marker is then dropped and the caller waits forever). The old
+        # 5 s Shell startup countdown used to cover that gap by accident; the
+        # -delay 0 launcher removed it, exposing the latent race. QEMU is still
+        # bounded by the `timeout` wrapper below, so a caller that never connects
+        # can't hang past --timeout.
         CMD+=(
             -no-reboot
-            -chardev "socket,id=serial0,path=$SERIAL_SOCKET,server=on,wait=off"
+            -chardev "socket,id=serial0,path=$SERIAL_SOCKET,server=on,wait=on"
             -serial chardev:serial0
             -display none
         )
     else
         CMD+=(-nographic -no-reboot)
     fi
-    ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
+    finalize_qemu_cmd
+    # Serial destination. When the caller asked for --serial-log, write serial
+    # DIRECTLY to their path (which they own and which lives OUTSIDE our $TMPDIR)
+    # rather than to $LOG-in-$TMPDIR plus a symlink. The self-clean below rm's
+    # $TMPDIR the instant the guest exits, so a serial log kept inside it would
+    # vanish out from under a caller that reads the transcript AFTER the guest
+    # is gone (the common "guest resets/exits on its own, then grep the log"
+    # pattern). A caller-owned path survives the cleanup untouched. With no
+    # --serial-log the internal $LOG is fine — that caller opted out of a
+    # persistent transcript, so losing it on cleanup is expected.
+    BG_SERIAL_DEST="${SERIAL_LOG:-$LOG}"
+    # Pre-create the destination so we fail LOUD, before launch, if the caller's
+    # --serial-log path isn't writable (e.g. a missing parent dir). Otherwise the
+    # subshell's `> "$BG_SERIAL_DEST"` open would fail, `|| :` would swallow it,
+    # qemu would never start, and we'd report a dead subshell PID as if it were a
+    # live guest. ($LOG lives in $TMPDIR, which always exists, so the no-serial-log
+    # case can't trip this.)
+    if ! : > "$BG_SERIAL_DEST" 2>/dev/null; then
+        echo "ERROR: cannot write --serial-log '$BG_SERIAL_DEST' (missing dir?)" >&2
+        exit 1
+    fi
+    # Self-clean the state dir when the guest exits (stop, crash, or the timeout
+    # wrapper firing). --background returns immediately so it can't use an EXIT
+    # trap (the disk/serial must outlive THIS script), but the detached subshell
+    # can rm $TMPDIR once qemu is gone — tying cleanup to the guest's real
+    # lifetime. Without this, every --background run orphaned its ~40 MB
+    # /dev/shm/axl-qemu.* dir forever. The reported PID still points at qemu
+    # (qemu_child_pid walks into the subshell), so consumers grep/kill it as
+    # before; the subshell just reaps and cleans.
+    # `|| :` so timeout's non-zero exit (124 on expiry, or the guest's own exit
+    # code) doesn't abort the subshell under `set -e` before the rm runs.
+    # The `>/dev/null 2>&1` on the SUBSHELL (not just the inner qemu) is
+    # load-bearing: the inner `> "$BG_SERIAL_DEST"` only redirects the
+    # timeout+qemu command, so without this the detached subshell would inherit
+    # run-qemu's own stdout and stderr and hold them open for the whole guest
+    # lifetime. A caller that captures our output via command substitution
+    # (out=$(run-qemu … --background …)) then blocks forever — the $() never
+    # sees EOF until the guest dies. The QEMU_PID=/SERIAL_LOG=/TMPDIR= lines
+    # below are echoed after this on run-qemu's real stdout, so they still reach
+    # the caller.
+    ( timeout "$TIMEOUT" "${CMD[@]}" > "$BG_SERIAL_DEST" 2>&1 < /dev/null || :; rm -rf "$TMPDIR" ) >/dev/null 2>&1 &
     WRAPPER_PID=$!
     QEMU_PID=$(qemu_child_pid "$WRAPPER_PID")
     if [[ -z "$QEMU_PID" ]]; then
@@ -1616,20 +1587,34 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # summarize, or fail the run on a spike. A caller that wants CPU data in
     # background mode should sample the emitted QEMU_PID itself.
 
-    # Copy serial log path if requested
-    if [[ -n "$SERIAL_LOG" ]]; then
-        # Create a symlink so the caller can find the log
-        ln -sf "$LOG" "$SERIAL_LOG"
-    fi
+    # No symlink needed: with --serial-log, qemu already writes serial straight
+    # to the caller's path (BG_SERIAL_DEST above); without it there is nothing to
+    # link. The old `ln -sf "$LOG" "$SERIAL_LOG"` pointed the caller's path into
+    # $TMPDIR, which the self-clean then deleted the moment the guest exited.
+
+    # A refused -netdev is fatal to QEMU and lands in the serial log within
+    # milliseconds. Catch it here rather than returning a QEMU_PID for a
+    # process that is already dead and letting the caller time out waiting
+    # for a guest that never had a network.
+    for _i in $(seq 1 20); do
+        kill -0 "$QEMU_PID" 2>/dev/null || break
+        grep -qa "Could not set up host forwarding rule" "$BG_SERIAL_DEST" 2>/dev/null && break
+        sleep 0.1
+    done
+    axl_report_hostfwd_failure "$BG_SERIAL_DEST" "run-qemu.sh --background" || exit 1
 
     echo "QEMU_PID=$QEMU_PID"
-    echo "SERIAL_LOG=$LOG"
+    echo "SERIAL_LOG=$BG_SERIAL_DEST"
+    for _hf in "${HOSTFWD_CHOSEN[@]}"; do
+        echo "$_hf"
+    done
     [[ -n "$SERIAL_SOCKET" ]] && echo "SERIAL_SOCKET=$SERIAL_SOCKET"
     [[ -n "$VIRTIOFSD_PID" ]] && echo "VIRTIOFSD_PID=$VIRTIOFSD_PID"
     echo "TMPDIR=$TMPDIR"
-    # Don't clean up — caller is responsible for killing QEMU (and
-    # virtiofsd, when --mount was used) and removing
-    # TMPDIR when done.
+    # TMPDIR is self-cleaned by the detached subshell above when the guest exits
+    # (see the launch site), so the caller only needs to kill QEMU (and
+    # virtiofsd, when --mount was used). TMPDIR is still reported for callers
+    # that read it while the guest runs.
 
 # Normal foreground mode
 else
@@ -1645,6 +1630,7 @@ else
     # process is still a child of the subshell. After a brief settle
     # delay (QEMU is up within ~100 ms typical, give it 1 s with
     # backoff for slow hosts), pgrep -P finds it.
+    finalize_qemu_cmd
     ( timeout "$TIMEOUT" "${CMD[@]}" > "$LOG" 2>&1 < /dev/null ) &
     WRAPPER_PID=$!
     QPID=""
@@ -1676,6 +1662,14 @@ else
         cp "$LOG" "$SERIAL_LOG_RAW"
     fi
 
+    # A hostfwd that could not bind makes QEMU refuse the whole -netdev and
+    # exit. The log is NOT empty in that case (it holds QEMU's error), so the
+    # guard below does not fire; and the non-raw output filter below slices
+    # only the region between "to continue." and "Reset with", which drops a
+    # startup error entirely — the run then exited 0 with no output at all.
+    # Diagnose it before either of those get a chance to hide it.
+    axl_report_hostfwd_failure "$LOG" "run-qemu.sh" || exit 1
+
     # If QEMU produced absolutely nothing, surface the failure
     # explicitly. Most common cause: stdin is a TTY and QEMU's
     # -nographic stdio multiplexer ate the boot — but we already
@@ -1701,7 +1695,11 @@ EOF
     if [[ "$RAW" == "true" ]]; then
         cat "$CLEAN"
     else
-        sed -n '/to continue\./,/^Reset with/p' "$CLEAN" | \
+        # App output runs from the start sentinel (or, if the launcher fell back
+        # to booting the Shell directly, the "...to continue." countdown prompt)
+        # down to the "Reset with" trailer. Strip the anchor lines themselves.
+        sed -n "/$APP_OUTPUT_SENTINEL\|to continue\./,/^Reset with/p" "$CLEAN" | \
+            grep -vF "$APP_OUTPUT_SENTINEL" | \
             grep -v "to continue\." | \
             grep -v "^Reset with"
     fi

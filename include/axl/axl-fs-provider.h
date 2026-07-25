@@ -89,21 +89,25 @@ extern "C" {
  * snake_case-land; UEFI consumers (Shell, Boot Manager) still see
  * the right error code (`EFI_NOT_FOUND` vs `EFI_DEVICE_ERROR` vs
  * `EFI_WRITE_PROTECTED` etc.).
+ *
+ * Follows the `Axl<Module>Status` convention: `AXL_FS_OK` is 0 and
+ * every error member is negative (mirrors `AxlStatus`), so
+ * `status != AXL_FS_OK` and `status < 0` both read as failure.
  */
 typedef enum {
-    AXL_FS_OK                   = 0,
-    AXL_FS_ERR_NOT_FOUND        = 1,   ///< → EFI_NOT_FOUND
-    AXL_FS_ERR_ACCESS_DENIED    = 2,   ///< → EFI_ACCESS_DENIED
-    AXL_FS_ERR_WRITE_PROTECTED  = 3,   ///< → EFI_WRITE_PROTECTED
-    AXL_FS_ERR_NO_SPACE         = 4,   ///< → EFI_VOLUME_FULL
-    AXL_FS_ERR_NOT_DIR          = 5,   ///< → EFI_INVALID_PARAMETER (open mode mismatch)
-    AXL_FS_ERR_IS_DIR           = 6,   ///< → EFI_INVALID_PARAMETER (write to dir)
-    AXL_FS_ERR_INVALID          = 7,   ///< → EFI_INVALID_PARAMETER
-    AXL_FS_ERR_NO_MEMORY        = 8,   ///< → EFI_OUT_OF_RESOURCES
-    AXL_FS_ERR_IO               = 9,   ///< → EFI_DEVICE_ERROR
-    AXL_FS_ERR_UNSUPPORTED      = 10,  ///< → EFI_UNSUPPORTED
-    AXL_FS_ERR_END_OF_FILE      = 11,  ///< → EFI_END_OF_FILE
-    AXL_FS_ERR_VOLUME_CORRUPTED = 12,  ///< → EFI_VOLUME_CORRUPTED
+    AXL_FS_OK                   =   0,
+    AXL_FS_ERR_NOT_FOUND        =  -1,  ///< → EFI_NOT_FOUND
+    AXL_FS_ERR_ACCESS_DENIED    =  -2,  ///< → EFI_ACCESS_DENIED
+    AXL_FS_ERR_WRITE_PROTECTED  =  -3,  ///< → EFI_WRITE_PROTECTED
+    AXL_FS_ERR_NO_SPACE         =  -4,  ///< → EFI_VOLUME_FULL
+    AXL_FS_ERR_NOT_DIR          =  -5,  ///< → EFI_INVALID_PARAMETER (open mode mismatch)
+    AXL_FS_ERR_IS_DIR           =  -6,  ///< → EFI_INVALID_PARAMETER (write to dir)
+    AXL_FS_ERR_INVALID          =  -7,  ///< → EFI_INVALID_PARAMETER
+    AXL_FS_ERR_NO_MEMORY        =  -8,  ///< → EFI_OUT_OF_RESOURCES
+    AXL_FS_ERR_IO               =  -9,  ///< → EFI_DEVICE_ERROR
+    AXL_FS_ERR_UNSUPPORTED      = -10,  ///< → EFI_UNSUPPORTED
+    AXL_FS_ERR_END_OF_FILE      = -11,  ///< → EFI_END_OF_FILE
+    AXL_FS_ERR_VOLUME_CORRUPTED = -12,  ///< → EFI_VOLUME_CORRUPTED
 } AxlFsStatus;
 
 /* Open-mode flags (`AXL_FS_OPEN_READ` / `_WRITE` / `_CREATE`) and

@@ -232,7 +232,7 @@ axl_spd_next(
 // Read + decode
 // ---------------------------------------------------------------------------
 
-int
+AxlStatus
 axl_spd_dump_raw(
     uint8_t   addr,
     uint8_t  *buf,
@@ -241,10 +241,10 @@ axl_spd_dump_raw(
     )
 {
     if (buf == NULL || len == NULL || cap == 0) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
     if (ensure_session() != 0) {
-        return AXL_ERR;
+        return AXL_UNSUPPORTED;   /* no SMBus controller — SPD unavailable here */
     }
     /* Codec selection — DDR5 SPD5118 hubs vs flat DDR4 EE1004 EEPROMs
      * have different register-vs-content mappings. The legacy heuristic
@@ -268,7 +268,7 @@ axl_spd_dump_raw(
      * through probe, accept the platform as DDR4-or-unknown). */
     uint8_t mem_type = 0;
     if (axl_smbus_read_byte(g_session, addr, 0x02, &mem_type) != AXL_OK) {
-        return AXL_ERR;
+        return AXL_NOT_FOUND;   /* slot did not respond — empty */
     }
     switch (mem_type) {
         case AXL_SPD_TYPE_DDR4:
@@ -287,7 +287,7 @@ axl_spd_dump_raw(
                     if (axl_smbus_read_byte(g_session, addr,
                                             (uint8_t)i, &buf[i]) != AXL_OK) {
                         if (i == 0) {
-                            return AXL_ERR;
+                            return AXL_NOT_FOUND;   /* slot empty */
                         }
                         *len = i;
                         return AXL_OK;
@@ -299,24 +299,25 @@ axl_spd_dump_raw(
     }
 }
 
-int
+AxlStatus
 axl_spd_read(
     uint8_t      addr,
     AxlSpdInfo  *out
     )
 {
     if (out == NULL) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
     uint8_t buf[AXL_SPD_RAW_MAX];
     size_t  len = 0;
-    if (axl_spd_dump_raw(addr, buf, sizeof(buf), &len) != AXL_OK) {
-        return AXL_ERR;
+    AxlStatus st = axl_spd_dump_raw(addr, buf, sizeof(buf), &len);
+    if (st != AXL_OK) {
+        return st;   /* surface the specific cause (empty slot / no bus) */
     }
     return axl_spd_decode(buf, len, out);
 }
 
-int
+AxlStatus
 axl_spd_decode(
     const uint8_t  *buf,
     size_t          len,
@@ -324,7 +325,7 @@ axl_spd_decode(
     )
 {
     if (buf == NULL || out == NULL || len < 3) {
-        return AXL_ERR;
+        return AXL_INVALID;
     }
     axl_memset(out, 0, sizeof(*out));
 

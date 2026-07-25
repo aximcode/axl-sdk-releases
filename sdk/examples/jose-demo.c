@@ -77,7 +77,7 @@ main(void)
     // -----------------------------------------------------------------
     // 1. Mint an ES256 key, sign a JWT, verify it against a claim policy.
     // -----------------------------------------------------------------
-    AxlPkKey *server = axl_pk_keygen(AXL_PK_ECDSA_P256);
+    AxlPkKey *server = axl_pk_key_new(AXL_PK_ECDSA_P256);
     check(server != NULL, "minted an ES256 server key");
 
     AxlJoseKey signer = { .pk = server };
@@ -168,9 +168,9 @@ main(void)
     // -----------------------------------------------------------------
     const char *msg = "{\"hello\":\"jose\"}";
 
-    AxlPkKey *es256 = axl_pk_keygen(AXL_PK_ECDSA_P256);
-    AxlPkKey *es384 = axl_pk_keygen(AXL_PK_ECDSA_P384);
-    AxlPkKey *rsa   = axl_pk_keygen(AXL_PK_RSA);
+    AxlPkKey *es256 = axl_pk_key_new(AXL_PK_ECDSA_P256);
+    AxlPkKey *es384 = axl_pk_key_new(AXL_PK_ECDSA_P384);
+    AxlPkKey *rsa   = axl_pk_key_new(AXL_PK_RSA);
     const uint8_t hmac_secret[] = "demo-hmac-secret-0123456789abcd";
 
     AxlJoseKey k_es256 = { .pk = es256 };

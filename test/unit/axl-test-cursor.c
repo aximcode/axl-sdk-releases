@@ -366,6 +366,29 @@ test_cursor_null_safety(void)
                "cursor: attach(NULL) returns 0");
 }
 
+/* C++ RAII autoptr — AXL_AUTOPTR(AxlCursor) must free the cursor at scope
+   exit. The scene buffer is borrowed (must outlive the cursor), so only the
+   cursor is scope-managed here. Live-allocation count proves the free ran. */
+static void
+test_autoptr_cursor(void)
+{
+    AxlGfxBuffer *scene = axl_gfx_buffer_new(64, 32);
+    test_check(scene != NULL, "autoptr: cursor scene buffer");
+
+    axl_cursor_free(axl_cursor_new(scene));   /* prime one-time init */
+
+    AxlMemStats before, after;
+    axl_mem_get_stats(&before);
+    {
+        AXL_AUTOPTR(AxlCursor) c = axl_cursor_new(scene);
+        test_check(c != NULL, "autoptr: cursor new");
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count, "autoptr: cursor freed at scope exit");
+
+    axl_gfx_buffer_free(scene);
+}
+
 int
 test_cursor_main(int argc, char **argv)
 {
@@ -380,6 +403,7 @@ test_cursor_main(int argc, char **argv)
     test_cursor_attach_tracking();
     test_cursor_attach_absolute();
     test_cursor_null_safety();
+    test_autoptr_cursor();
 
     return test_print_results();
 }

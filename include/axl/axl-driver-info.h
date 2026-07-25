@@ -202,7 +202,8 @@ axl_handle_list(
  * (which goes protocol → handles). Given a handle, returns the GUIDs of the
  * protocols *it* exposes. This is the core of the protocol-stack view: resolve
  * a NIC to its handle(s), list their protocol GUIDs, and name them with
- * @ref axl_net_protocol_name.
+ * @ref axl_protocol_guid_name (or @ref axl_net_protocol_name for short
+ * networking-stack labels).
  *
  * @return AXL_OK on success (@p count set; up to @p cap GUIDs written —
  *     @p count may exceed @p cap, signalling truncation). AXL_ERR on NULL
@@ -281,24 +282,68 @@ axl_handle_children(
 );
 
 /**
- * @brief Short name for a well-known UEFI protocol GUID (any kind).
+ * @brief Canonical spec identifier for a UEFI GUID.
  *
- * The Devices-tab counterpart to @ref axl_net_protocol_name(): a broader table
- * covering the common device / driver / bus / console protocols — DevicePath,
- * LoadedImage, DriverBinding, ComponentName2, SimpleFileSystem, BlockIo,
- * DiskIo, PciIo, GraphicsOutput, SerialIo, UsbIo, NvmExpressPassThru,
- * AtaPassThru, and more — plus everything @ref axl_net_protocol_name knows
- * (the networking stack, which it consults first). Always NUL-terminates
- * @p out on AXL_OK.
+ * Resolves @p guid to the exact name the UEFI/PI headers use — e.g.
+ * `"EFI_RAM_DISK_PROTOCOL"`, `"EFI_SIMPLE_FILE_SYSTEM_PROTOCOL"` — from a
+ * table generated from the same spec sources as the AXL UEFI headers
+ * (`include/uefi/generated/guid-names.h`, ~320 GUIDs). This is what the
+ * `lsproto` tool renders, and it is deliberately NOT the UEFI Shell's short
+ * label (`dh decode` prints `"RamDisk"`): the point is the spec spelling a
+ * developer greps the headers for.
  *
- * @return AXL_OK with the name written for a recognised GUID; AXL_ERR for an
- *     unknown GUID (the caller formats the raw GUID itself) or NULL args.
+ * A protocol GUID resolves to its protocol TYPE name (the macro minus the
+ * `_GUID` suffix: `EFI_RAM_DISK_PROTOCOL_GUID` → `"EFI_RAM_DISK_PROTOCOL"`).
+ * A non-protocol GUID identifier has no shorter canonical form and keeps its
+ * full name (`EFI_ACPI_TABLE_GUID` → `"EFI_ACPI_TABLE_GUID"`).
+ *
+ * Stateless: a linear scan over a small static table, no allocation, no global
+ * lifecycle — safe to call from anywhere, including early init. A caller that
+ * wants to name vendor / OEM GUIDs the spec table cannot (Dell platform
+ * protocols, say) layers its own lookup in front and falls back to this for the
+ * standard set.
+ *
+ * @return AXL_OK with the NUL-terminated name in @p out for a known GUID;
+ *     AXL_ERR for an unknown GUID (the caller formats the raw GUID itself),
+ *     NULL args, or a @p cap too small to hold the name (never a truncated,
+ *     mis-resolvable name reported as success).
  */
 int
 axl_protocol_guid_name(
-    const AxlGuid *guid,   ///< protocol GUID to name (non-NULL)
-    char          *out,    ///< [out] short-name buffer
-    size_t         cap     ///< capacity of @p out in bytes
+    const AxlGuid *guid,   ///< GUID to name (non-NULL)
+    char          *out,    ///< [out] receives the canonical spec identifier
+    size_t         cap     ///< capacity of @p out in bytes (>= 64 recommended)
+);
+
+/**
+ * @brief Number of GUIDs in the canonical spec-name table.
+ *
+ * The count backing @ref axl_protocol_guid_name — the whole set of UEFI/PI
+ * GUIDs AXL knows a name for, whether or not any are present on this system.
+ * Pair with @ref axl_protocol_name_at to enumerate the dictionary (e.g. the
+ * `lsproto -a` view, or a name → GUID reverse lookup).
+ *
+ * @return the row count (a build-time constant).
+ */
+size_t
+axl_protocol_name_count(void);
+
+/**
+ * @brief The @p index'th (GUID, canonical-name) row of the spec-name table.
+ *
+ * Rows are ordered by name, so an in-order walk yields the dictionary already
+ * sorted. The returned pointers are borrowed — they point into static
+ * program data, valid for the process lifetime, and the caller neither frees
+ * nor mutates them. Either output pointer may be NULL to ignore it.
+ *
+ * @return AXL_OK with @p guid / @p name set for an in-range @p index; AXL_ERR
+ *     when @p index >= @ref axl_protocol_name_count.
+ */
+int
+axl_protocol_name_at(
+    size_t          index,   ///< row number in [0, axl_protocol_name_count())
+    const AxlGuid **guid,    ///< [out] borrowed GUID pointer (may be NULL)
+    const char    **name     ///< [out] borrowed canonical name (may be NULL)
 );
 
 /**

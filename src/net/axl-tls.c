@@ -29,11 +29,11 @@ int  axl_tls_server_set_cert(const void *c, size_t cl, const void *k, size_t kl)
 { (void)c;(void)cl;(void)k;(void)kl; return AXL_ERR; }
 AxlTlsContext *axl_tls_accept(AxlTcp *s) { (void)s; return NULL; }
 AxlTlsContext *axl_tls_connect(AxlTcp *s, const char *h) { (void)s;(void)h; return NULL; }
-int  axl_tls_handshake(AxlTlsContext *c) { (void)c; return -1; }
-int  axl_tls_handshake_async(AxlTlsContext *c, AxlLoop *l)
-{ (void)c; (void)l; return -1; }
-int  axl_tls_read(AxlTlsContext *c, void *b, size_t s, size_t *o)
-{ (void)c;(void)b;(void)s;(void)o; return -1; }
+AxlTlsStatus axl_tls_handshake(AxlTlsContext *c) { (void)c; return AXL_TLS_ERR; }
+AxlTlsStatus axl_tls_handshake_async(AxlTlsContext *c, AxlLoop *l)
+{ (void)c; (void)l; return AXL_TLS_ERR; }
+AxlTlsStatus axl_tls_read(AxlTlsContext *c, void *b, size_t s, size_t *o)
+{ (void)c;(void)b;(void)s;(void)o; return AXL_TLS_ERR; }
 int  axl_tls_write(AxlTlsContext *c, const void *d, size_t l)
 { (void)c;(void)d;(void)l; return AXL_ERR; }
 int  axl_tls_write_async(AxlTlsContext *c, const void *d, size_t l,
@@ -655,11 +655,11 @@ log_handshake_failure(int ret)
     }
 }
 
-int
+AxlTlsStatus
 axl_tls_handshake(AxlTlsContext *ctx)
 {
     if (ctx == NULL) {
-        return -1;
+        return AXL_TLS_ERR;
     }
 
     int ret = mbedtls_ssl_handshake(&ctx->ssl);
@@ -672,7 +672,7 @@ axl_tls_handshake(AxlTlsContext *ctx)
             ctx->out_len = 0;
         }
         ctx->buffered_mode = false;
-        return 0;
+        return AXL_TLS_OK;
     }
 
     if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
@@ -683,18 +683,18 @@ axl_tls_handshake(AxlTlsContext *ctx)
                          TLS_SEND_TIMEOUT_MS);
             ctx->out_len = 0;
         }
-        return 1;  /* need more data */
+        return AXL_TLS_WANT_MORE;  /* need more data */
     }
 
     log_handshake_failure(ret);
-    return -1;
+    return AXL_TLS_ERR;
 }
 
 // ---------------------------------------------------------------------------
 // Read / Write
 // ---------------------------------------------------------------------------
 
-int
+AxlTlsStatus
 axl_tls_read(
     AxlTlsContext *ctx,
     void          *buf,
@@ -703,7 +703,7 @@ axl_tls_read(
     )
 {
     if (ctx == NULL || buf == NULL || out_len == NULL) {
-        return -1;
+        return AXL_TLS_ERR;
     }
 
     *out_len = 0;
@@ -712,16 +712,16 @@ axl_tls_read(
 
     if (ret > 0) {
         *out_len = (size_t)ret;
-        return 0;
+        return AXL_TLS_OK;
     }
     if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-        return -1;  /* connection closed */
+        return AXL_TLS_ERR;  /* connection closed */
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
-        return 1;  /* need more data */
+        return AXL_TLS_WANT_MORE;  /* need more data */
     }
 
-    return -1;
+    return AXL_TLS_ERR;
 }
 
 int
@@ -928,29 +928,29 @@ handshake_flush_async(AxlTlsContext *ctx, AxlLoop *loop)
     return AXL_OK;
 }
 
-int
+AxlTlsStatus
 axl_tls_handshake_async(AxlTlsContext *ctx, AxlLoop *loop)
 {
     if (ctx == NULL || loop == NULL) {
-        return -1;
+        return AXL_TLS_ERR;
     }
 
     int ret = mbedtls_ssl_handshake(&ctx->ssl);
 
     if (ret == 0) {
         if (handshake_flush_async(ctx, loop) != AXL_OK) {
-            return -1;
+            return AXL_TLS_ERR;
         }
         ctx->buffered_mode = false;
-        return 0;
+        return AXL_TLS_OK;
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
         ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-        return (handshake_flush_async(ctx, loop) == AXL_OK) ? 1 : -1;
+        return (handshake_flush_async(ctx, loop) == AXL_OK) ? AXL_TLS_WANT_MORE : AXL_TLS_ERR;
     }
 
     log_handshake_failure(ret);
-    return -1;
+    return AXL_TLS_ERR;
 }
 
 // ---------------------------------------------------------------------------

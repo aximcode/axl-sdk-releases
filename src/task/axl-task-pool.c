@@ -95,7 +95,7 @@ worker_proc(
             __sync_synchronize();          /* acquire — pair with submit's release
                                               so proc/arg/arena are visible */
             proc = slot->proc;
-            proc(slot->arg, slot->arena);
+            proc(slot->arena, slot->arg);
             __sync_synchronize();          /* release — task results visible before DONE */
             slot->state = SLOT_DONE;
         }
@@ -244,9 +244,9 @@ axl_task_pool_submit(
 
     /* Single-core fallback: run synchronously */
     if (pool->single_core || pool->slots == NULL) {
-        proc(arg, arena);
+        proc(arena, arg);
         if (on_complete != NULL) {
-            on_complete(arg, arena);
+            on_complete(arena, arg);
         }
         return id;
     }
@@ -289,8 +289,8 @@ axl_task_pool_poll(
         if (pool->slots[i].state == SLOT_DONE) {
             __sync_synchronize();          /* acquire — ensure task results visible */
             if (pool->slots[i].on_complete != NULL) {
-                pool->slots[i].on_complete(pool->slots[i].arg,
-                                           pool->slots[i].arena);
+                pool->slots[i].on_complete(pool->slots[i].arena,
+                                           pool->slots[i].arg);
             }
             pool->slots[i].on_complete = NULL;
             __sync_synchronize();          /* release — reap (on_complete read arg) before FREE */

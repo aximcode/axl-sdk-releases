@@ -118,9 +118,11 @@ The transport modules also expose their own native walk
 transport-specific commands. `axl_storage_next` is the union view that
 `AxlSmart` and the `smart` tool iterate.
 
-The union walk (`axl_storage_next` / `AxlStorageDev`) is part of `AxlSmart`
-(Phase 4); the per-transport `axl_<t>_next` walks ship with their modules.
-(Names firm up when the `AxlSmart` contract is drafted.)
+The union walk (`axl_storage_next` / `AxlStorageDev`) lives in its own
+`<axl/axl-storage.h>` (the device-enumeration layer of the storage family);
+`AxlSmart` (`<axl/axl-smart.h>`) layers `axl_smart_health` on top and includes
+it, so the walk-then-read pattern needs only the one include. The per-transport
+`axl_<t>_next` walks ship with their modules.
 
 ### Raw + typed, read-first
 
@@ -318,9 +320,10 @@ rather than being retrofitted.
 
 ## Resolved decisions
 
-1. **Union walk lives in `AxlSmart`** — `axl_storage_next` is part of the
-   `AxlSmart` rollup (the only thing that needs the union view); the three
-   transport modules keep their own native walks.
+1. **Union walk lives in `<axl/axl-storage.h>`** — `axl_storage_next` is the
+   device-enumeration layer of the storage family (`AxlSmart` includes it and
+   layers health on top); the three transport modules keep their own native
+   walks.
 2. **Absent-field encoding: per-field sentinels** (documented above) — no
    parallel `present` bitmask.
 3. **`mkfixture` refactors onto `AxlNvme` in Phase 1** — it is the second

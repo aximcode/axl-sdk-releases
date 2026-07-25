@@ -513,10 +513,10 @@ render(KbTune *kb)
     axl_gfx_draw_text(f, 16, H - 28, buf, AXL_GFX_WHITE, 1);
 }
 
-AXL_TOOL_MAIN(kbtune)
+static int
+run_kbtune(AxlArgs *a)
 {
-    (void)argc;
-    (void)argv;
+    (void)a;
 
     if (!axl_gfx_available()) {
         axl_printf("kbtune: no graphics output (headless). This tool needs a GOP "
@@ -577,4 +577,13 @@ AXL_TOOL_MAIN(kbtune)
                (unsigned)kb.tune[TUNE_DRAIN], (unsigned)kb.tune[TUNE_REDRAW],
                (unsigned long)kb.total, (unsigned long)kb.dropped);
     return 0;
+}
+
+AXL_TOOL_MAIN(kbtune)
+{
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name    = "kbtune",
+        .help    = "Interactive keyboard debounce tuner (needs a GOP console)",
+        .handler = run_kbtune,
+    });
 }

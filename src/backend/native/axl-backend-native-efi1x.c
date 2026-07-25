@@ -571,44 +571,6 @@ axl_efi1x_file_open(
 // fs<n> is this device path mapped as", iterate fs0..fsN and byte-compare.
 // ===================================================================
 
-/* Total device-path size in bytes, including the trailing END node. Bounded
-   walk; returns 0 on a malformed chain (Length < 4). */
-static size_t
-dp_total_bytes(const void *dp)
-{
-    const uint8_t *p = (const uint8_t *)dp;
-    size_t total = 0;
-    for (unsigned n = 0; n < 256 && p != NULL; n++) {
-        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
-        if (len < 4) {
-            return 0;
-        }
-        total += len;
-        if (p[0] == 0x7f) {   /* END node — included in the total */
-            break;
-        }
-        p += len;
-    }
-    return total;
-}
-
-static bool
-dp_bytes_equal(const void *a, const void *b)
-{
-    size_t sa = dp_total_bytes(a);
-    if (sa == 0 || sa != dp_total_bytes(b)) {
-        return false;
-    }
-    const uint8_t *pa = (const uint8_t *)a;
-    const uint8_t *pb = (const uint8_t *)b;
-    for (size_t i = 0; i < sa; i++) {
-        if (pa[i] != pb[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 int
 axl_efi1x_map_fs_name_from_dp(
     void   *device_path,
@@ -634,7 +596,7 @@ axl_efi1x_map_fs_name_from_dp(
         qname[k] = 0;
 
         void *dp = se->GetMap(qname);
-        if (dp == NULL || !dp_bytes_equal(dp, device_path)) {
+        if (dp == NULL || !axl_backend_dp_equal(dp, device_path)) {
             continue;
         }
         /* Match — build lowercase "fs<i>" (the old shell's own casing) in a

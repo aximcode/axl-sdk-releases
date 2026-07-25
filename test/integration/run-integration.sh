@@ -116,15 +116,22 @@ if [[ -z "${RUN_INTEGRATION_DIR:-}" && "${RUN_NO_BUILD:-0}" != "1" ]]; then
     fi
 fi
 
-# Run one test under a timeout. Each test gets a UNIQUE TEST_PORT_BASE derived
-# from its launch index, so no two tests — concurrent or not — share a host
-# port (strategy beta). Result code is written by the caller.
+# Run one test under a timeout. Host ports are NOT assigned here: each test
+# claims its own from the shared allocator in scripts/axl-common.sh (see
+# common-test.sh's test_port), which verifies each port is free right now and
+# holds it for the test's lifetime.
+#
+# This used to be `TEST_PORT_BASE=$((20000 + idx*200))`. That kept ONE
+# invocation's tests apart but nothing else: a second run-integration.sh —
+# another developer, a consumer repo's suite, a second agent — derives the
+# identical bases and collides on every one of them. Worse, the retry below
+# reused the same base, so a genuine collision was retried straight into it.
+# Leaving TEST_PORT_BASE unset is what routes both attempts through the
+# allocator, so a retry draws different ports.
 run_one() {  # <idx> <test_path>
-    local idx="$1" t="$2" name start dur rc port
+    local idx="$1" t="$2" name start dur rc
     name=$(basename "$t"); start=$SECONDS
-    port=$(( 20000 + idx*200 ))
-    TEST_PORT_BASE=$port \
-        timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
+    timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
         # Retry once. Most failures under the parallel pool are transient
@@ -134,8 +141,7 @@ run_one() {  # <idx> <test_path>
         # host drain briefly before the retry so the contention can ease.
         cp -f "$LOGDIR/$name.log" "$LOGDIR/$name.attempt1.log" 2>/dev/null
         sleep 3
-        TEST_PORT_BASE=$port \
-            timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
+        timeout "$TIMEOUT" bash "$t" --arch "$ARCH" > "$LOGDIR/$name.log" 2>&1
         rc=$?
         if [[ $rc -eq 0 ]]; then
             dur=$(( SECONDS - start ))

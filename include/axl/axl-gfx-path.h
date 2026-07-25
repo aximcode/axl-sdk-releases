@@ -55,6 +55,10 @@ axl_gfx_path_free(
     AxlGfxPath  *p   ///< path to free, or NULL
     );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlGfxPath, axl_gfx_path_free)
+#endif
+
 /// Clear all segments from @a p, retaining the allocation for reuse.
 ///
 /// After reset the path is empty (no subpaths, no current pen

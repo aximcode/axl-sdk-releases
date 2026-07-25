@@ -15,6 +15,7 @@
 
 #include "axl-test.h"
 #include <axl/axl-driver.h>
+#include <axl/axl-driver-deps.h>
 #include <axl/axl-driver-info.h>
 
 //
@@ -41,6 +42,242 @@ typedef struct {
 
 static TestIface g_iface  = { 0xCAFEF00D };
 static TestIface g_iface2 = { 0xBADC0FFE };
+
+// ---------------------------------------------------------------------------
+// AxlDriverDeps: sidecar parse + transitive walk (pure, firmware-free)
+// ---------------------------------------------------------------------------
+
+// Two-level tree: Nic/Nic2 -> Comp -> SubComp; Solo is self-contained.
+static const char DEPS_JSON[] =
+    "{ schema: 1, drivers: ["
+    " { name: 'Nic.efi',  requires: [ 'Comp.efi' ] },"
+    " { name: 'Nic2.efi', requires: [ 'Comp.efi' ] },"
+    " { name: 'Comp.efi', requires: [ 'SubComp.efi' ] },"
+    " { name: 'Solo.efi' } ] }";
+
+// A recording visitor: load() appends "name<parent", enter() can prune a name.
+#define DEP_REC_MAX 16
+static char        g_dep_rec[DEP_REC_MAX][96];
+static size_t      g_dep_nrec;
+static const char *g_dep_skip;     // enter() returns false for this name (prune)
+static const char *g_dep_resident; // enter() returns false for this name (already-loaded reuse)
+
+static void
+dep_rec_reset(void)
+{
+    g_dep_nrec = 0;
+    g_dep_skip = NULL;
+    g_dep_resident = NULL;
+}
+
+static bool
+dep_rec_enter(const char *name, const char *parent, void *ctx)
+{
+    (void)parent;
+    (void)ctx;
+    if (g_dep_skip != NULL && axl_strcmp(name, g_dep_skip) == 0) {
+        return false;
+    }
+    if (g_dep_resident != NULL && axl_strcmp(name, g_dep_resident) == 0) {
+        return false;
+    }
+    return true;
+}
+
+static void
+dep_rec_load(const char *name, const char *parent, void *ctx)
+{
+    (void)ctx;
+    if (g_dep_nrec < DEP_REC_MAX) {
+        axl_snprintf(g_dep_rec[g_dep_nrec], sizeof g_dep_rec[0], "%s<%s",
+                     name, parent != NULL ? parent : "");
+        g_dep_nrec++;
+    }
+}
+
+static void
+test_deps_parse(void)
+{
+    AxlDriverDeps deps;
+    AxlSidecarStatus rc = axl_driver_deps_load_buffer(DEPS_JSON, sizeof DEPS_JSON - 1,
+                                                      "deptest", &deps);
+    test_check(rc == AXL_SIDECAR_OK, "deps: valid buffer parses OK");
+    test_check(deps.n_rows == 4, "deps: four driver rows parsed");
+
+    const AxlDriverDepRow *nic = axl_driver_deps_lookup(&deps, "Nic.efi");
+    test_check(nic != NULL, "deps: lookup finds a declaring driver");
+    test_check(nic != NULL && nic->n_needs == 1
+                   && axl_strcmp(nic->needs[0], "Comp.efi") == 0,
+               "deps: Nic.efi requires exactly Comp.efi");
+
+    const AxlDriverDepRow *comp = axl_driver_deps_lookup(&deps, "Comp.efi");
+    test_check(comp != NULL && comp->n_needs == 1
+                   && axl_strcmp(comp->needs[0], "SubComp.efi") == 0,
+               "deps: Comp.efi requires exactly SubComp.efi (mid-tree)");
+
+    const AxlDriverDepRow *solo = axl_driver_deps_lookup(&deps, "Solo.efi");
+    test_check(solo != NULL && solo->n_needs == 0,
+               "deps: Solo.efi is a declared, self-contained row");
+
+    test_check(axl_driver_deps_lookup(&deps, "Ghost.efi") == NULL,
+               "deps: lookup of an undeclared driver is NULL");
+
+    // is_required: dependency drivers (incl. the mid-tree + leaf) are required;
+    // NIC picks + self-contained are not.
+    test_check(axl_driver_deps_is_required(&deps, "Comp.efi"),
+               "deps: Comp.efi is required (mid-tree node)");
+    test_check(axl_driver_deps_is_required(&deps, "SubComp.efi"),
+               "deps: SubComp.efi is required (transitive leaf)");
+    test_check(!axl_driver_deps_is_required(&deps, "Nic.efi"),
+               "deps: Nic.efi is not a dependency");
+    test_check(!axl_driver_deps_is_required(&deps, "Solo.efi"),
+               "deps: Solo.efi is not a dependency");
+}
+
+static void
+test_deps_walk_order(void)
+{
+    AxlDriverDeps deps;
+    axl_driver_deps_load_buffer(DEPS_JSON, sizeof DEPS_JSON - 1, "deptest", &deps);
+    AxlDriverDepVisitor v = { dep_rec_enter, dep_rec_load, NULL };
+
+    // Post-order: SubComp (needed by Comp) before Comp (needed by Nic).
+    // Nic itself is NOT loaded by the walk.
+    dep_rec_reset();
+    axl_driver_deps_walk(&deps, "Nic.efi", &v);
+    test_check(g_dep_nrec == 2, "deps walk: two dependencies brought resident");
+    test_check(g_dep_nrec == 2 && axl_strcmp(g_dep_rec[0], "SubComp.efi<Comp.efi") == 0,
+               "deps walk: transitive leaf loaded first, attributed to Comp");
+    test_check(g_dep_nrec == 2 && axl_strcmp(g_dep_rec[1], "Comp.efi<Nic.efi") == 0,
+               "deps walk: dependency loaded after its subtree, attributed to Nic");
+
+    // Solo declares nothing -> walk is a no-op.
+    dep_rec_reset();
+    axl_driver_deps_walk(&deps, "Solo.efi", &v);
+    test_check(g_dep_nrec == 0, "deps walk: self-contained target loads no dependencies");
+}
+
+static void
+test_deps_walk_prune(void)
+{
+    AxlDriverDeps deps;
+    axl_driver_deps_load_buffer(DEPS_JSON, sizeof DEPS_JSON - 1, "deptest", &deps);
+    AxlDriverDepVisitor v = { dep_rec_enter, dep_rec_load, NULL };
+
+    // enter() false on Comp prunes Comp AND its subtree (SubComp): the
+    // quarantine/skip mechanism must not load a skipped node's children.
+    dep_rec_reset();
+    g_dep_skip = "Comp.efi";
+    axl_driver_deps_walk(&deps, "Nic.efi", &v);
+    test_check(g_dep_nrec == 0,
+               "deps walk: enter()=false prunes the node and its whole subtree");
+
+    // Cross-walk reuse: a dependency already resident (enter()=false) is not
+    // reloaded, mirroring a sweep that loads Comp once for Nic then skips it
+    // for Nic2. SubComp is under the pruned Comp, so it too is skipped.
+    dep_rec_reset();
+    g_dep_resident = "Comp.efi";
+    axl_driver_deps_walk(&deps, "Nic2.efi", &v);
+    test_check(g_dep_nrec == 0,
+               "deps walk: an already-resident dependency is not reloaded");
+}
+
+static void
+test_deps_walk_cycle(void)
+{
+    // A mis-declared cycle (A -> B -> A) must terminate, not recurse forever.
+    static const char cyc[] =
+        "{ schema: 1, drivers: ["
+        " { name: 'N.efi', requires: [ 'A.efi' ] },"
+        " { name: 'A.efi', requires: [ 'B.efi' ] },"
+        " { name: 'B.efi', requires: [ 'A.efi' ] } ] }";
+    AxlDriverDeps deps;
+    AxlSidecarStatus rc = axl_driver_deps_load_buffer(cyc, sizeof cyc - 1, "deptest", &deps);
+    test_check(rc == AXL_SIDECAR_OK, "deps cycle: buffer parses OK");
+
+    AxlDriverDepVisitor v = { dep_rec_enter, dep_rec_load, NULL };
+    dep_rec_reset();
+    axl_driver_deps_walk(&deps, "N.efi", &v);   // must return (no infinite recursion)
+    test_check(g_dep_nrec == 2, "deps cycle: each node loaded once, walk terminates");
+    test_check(g_dep_nrec == 2 && axl_strcmp(g_dep_rec[0], "B.efi<A.efi") == 0,
+               "deps cycle: subtree loaded before the cyclic parent");
+    test_check(g_dep_nrec == 2 && axl_strcmp(g_dep_rec[1], "A.efi<N.efi") == 0,
+               "deps cycle: cyclic back-edge does not re-load the visited node");
+}
+
+static void
+test_deps_walk_diamond(void)
+{
+    // Diamond: Top -> {L, R}, and both L and R -> D. The shared node D must
+    // load EXACTLY ONCE (the visited set is shared across the whole walk, not
+    // per-branch), and it must not be mistaken for a cycle. Post-order puts D
+    // before both its consumers. This pins the safety property the cycle guard
+    // provides on a converging-but-acyclic graph.
+    static const char diamond[] =
+        "{ schema: 1, drivers: ["
+        " { name: 'Top.efi', requires: [ 'L.efi', 'R.efi' ] },"
+        " { name: 'L.efi',   requires: [ 'D.efi' ] },"
+        " { name: 'R.efi',   requires: [ 'D.efi' ] },"
+        " { name: 'D.efi' } ] }";
+    AxlDriverDeps deps;
+    AxlSidecarStatus rc = axl_driver_deps_load_buffer(diamond, sizeof diamond - 1,
+                                                      "deptest", &deps);
+    test_check(rc == AXL_SIDECAR_OK, "deps diamond: buffer parses OK");
+
+    AxlDriverDepVisitor v = { dep_rec_enter, dep_rec_load, NULL };
+    dep_rec_reset();
+    axl_driver_deps_walk(&deps, "Top.efi", &v);
+
+    // D loaded once (not once per consumer), and before both L and R.
+    size_t d_loads = 0, d_idx = 0, l_idx = 0, r_idx = 0;
+    for (size_t i = 0; i < g_dep_nrec; i++) {
+        if (axl_strncmp(g_dep_rec[i], "D.efi<", 6) == 0) { d_loads++; d_idx = i; }
+        else if (axl_strncmp(g_dep_rec[i], "L.efi<", 6) == 0) { l_idx = i; }
+        else if (axl_strncmp(g_dep_rec[i], "R.efi<", 6) == 0) { r_idx = i; }
+    }
+    test_check(d_loads == 1, "deps diamond: shared node D loaded exactly once");
+    test_check(d_loads == 1 && d_idx < l_idx && d_idx < r_idx,
+               "deps diamond: D loaded before both consumers L and R");
+}
+
+static void
+test_deps_walk_missing_dep(void)
+{
+    // A dependency with no row of its own is a leaf: entered and loaded, its
+    // (absent) subtree a no-op.
+    static const char miss[] =
+        "{ schema: 1, drivers: [ { name: 'Nic.efi', requires: [ 'Ghost.efi' ] } ] }";
+    AxlDriverDeps deps;
+    axl_driver_deps_load_buffer(miss, sizeof miss - 1, "deptest", &deps);
+
+    AxlDriverDepVisitor v = { dep_rec_enter, dep_rec_load, NULL };
+    dep_rec_reset();
+    axl_driver_deps_walk(&deps, "Nic.efi", &v);
+    test_check(g_dep_nrec == 1 && axl_strcmp(g_dep_rec[0], "Ghost.efi<Nic.efi") == 0,
+               "deps walk: an undeclared dependency is still loaded as a leaf");
+}
+
+static void
+test_deps_parse_errors(void)
+{
+    AxlDriverDeps deps;
+
+    // Malformed JSON5 -> PARSE_ERROR, table left empty.
+    AxlSidecarStatus rc = axl_driver_deps_load_buffer("{ this is not valid ]",
+                                                      21, "deptest", &deps);
+    test_check(rc == AXL_SIDECAR_PARSE_ERROR, "deps: malformed JSON5 -> PARSE_ERROR");
+    test_check(deps.n_rows == 0, "deps: malformed parse leaves the table empty");
+
+    // Over-cap requires list: only AXL_DRIVER_DEPS_PER_NODE are kept.
+    static const char many[] =
+        "{ schema: 1, drivers: [ { name: 'Nic.efi',"
+        " requires: [ 'a.efi','b.efi','c.efi','d.efi','e.efi','f.efi' ] } ] }";
+    rc = axl_driver_deps_load_buffer(many, sizeof many - 1, "deptest", &deps);
+    test_check(rc == AXL_SIDECAR_OK, "deps: over-cap requires still parses OK");
+    const AxlDriverDepRow *nic = axl_driver_deps_lookup(&deps, "Nic.efi");
+    test_check(nic != NULL && nic->n_needs == AXL_DRIVER_DEPS_PER_NODE,
+               "deps: requires list is capped at AXL_DRIVER_DEPS_PER_NODE");
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -455,6 +692,10 @@ static const AxlGuid GUID_SIMPLE_NETWORK =
 static const AxlGuid GUID_IP4CONFIG2 =
     AXL_GUID(0x5b446ed1, 0xe30b, 0x4faa,
              0x87, 0x1a, 0x36, 0x54, 0xec, 0xa3, 0x60, 0x80);
+/* A non-protocol GUID identifier — its canonical name keeps the "_GUID". */
+static const AxlGuid GUID_ACPI_TABLE =
+    AXL_GUID(0x8868e871, 0xe4f1, 0x11d3,
+             0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81);
 /* A GUID no protocol uses — for the unknown-GUID name path. */
 static const AxlGuid GUID_BOGUS =
     AXL_GUID(0xdeadbeef, 0x1234, 0x5678,
@@ -656,21 +897,61 @@ test_handle_enum(void)
         test_check(kids_nonnull, "handle_children: every child handle is non-NULL");
     }
 
-    // --- axl_protocol_guid_name (general; exact strings) -------------------
+    // --- axl_protocol_guid_name (canonical spec names; exact strings) ------
     test_check(axl_protocol_guid_name(NULL, nm, sizeof(nm)) == AXL_ERR,
                "protocol_guid_name: NULL guid returns AXL_ERR");
-    /* Delegates to the net table first — a net GUID still resolves. */
-    test_check(axl_protocol_guid_name(&GUID_SIMPLE_NETWORK, nm, sizeof(nm)) == AXL_OK
-                   && axl_strcmp(nm, "SimpleNetwork") == 0,
-               "protocol_guid_name: net GUID resolves via the general entry");
-    /* A non-net GUID the net-only function rejects now resolves. */
-    test_check(axl_net_protocol_name(&GUID_DEVICE_PATH, nm, sizeof(nm)) == AXL_ERR,
-               "protocol_guid_name: DevicePath is non-net (net_protocol_name rejects)");
+    /* A protocol GUID resolves to its TYPE name — the macro minus "_GUID". */
     test_check(axl_protocol_guid_name(&GUID_DEVICE_PATH, nm, sizeof(nm)) == AXL_OK
-                   && axl_strcmp(nm, "DevicePath") == 0,
-               "protocol_guid_name: DevicePath GUID -> \"DevicePath\"");
+                   && axl_strcmp(nm, "EFI_DEVICE_PATH_PROTOCOL") == 0,
+               "protocol_guid_name: DevicePath -> \"EFI_DEVICE_PATH_PROTOCOL\"");
+    /* Net protocol GUIDs come from the SAME table — uniformly spec-named,
+       not the short label axl_net_protocol_name returns. */
+    test_check(axl_protocol_guid_name(&GUID_SIMPLE_NETWORK, nm, sizeof(nm)) == AXL_OK
+                   && axl_strcmp(nm, "EFI_SIMPLE_NETWORK_PROTOCOL") == 0,
+               "protocol_guid_name: net GUID -> \"EFI_SIMPLE_NETWORK_PROTOCOL\"");
+    /* A non-protocol GUID identifier keeps its full "_GUID" name. This GUID is
+       ALSO the one spec case where two names share identical bytes
+       (EFI_ACPI_TABLE_GUID == EFI_ACPI_20_TABLE_GUID); the resolver returns the
+       lexicographically-first, deterministically — pins both behaviours. */
+    test_check(axl_protocol_guid_name(&GUID_ACPI_TABLE, nm, sizeof(nm)) == AXL_OK
+                   && axl_strcmp(nm, "EFI_ACPI_20_TABLE_GUID") == 0,
+               "protocol_guid_name: aliased table GUID -> first name, keeps _GUID");
+    /* A cap too small to hold the name is AXL_ERR, never a truncated name. */
+    test_check(axl_protocol_guid_name(&GUID_DEVICE_PATH, nm, 8) == AXL_ERR,
+               "protocol_guid_name: undersized cap returns AXL_ERR (no truncation)");
     test_check(axl_protocol_guid_name(&GUID_BOGUS, nm, sizeof(nm)) == AXL_ERR,
                "protocol_guid_name: unknown GUID returns AXL_ERR");
+
+    // --- axl_protocol_name_count / _at (dictionary iteration) --------------
+    size_t ncount = axl_protocol_name_count();
+    test_check(ncount > 100, "protocol_name_count: non-trivial table");
+    /* Rows are name-sorted, in range, and each name round-trips through the
+       guid->name resolver (the two agree on every row). */
+    bool sorted = true, roundtrips = true;
+    const char *prev = NULL;
+    for (size_t i = 0; i < ncount; i++) {
+        const AxlGuid *g = NULL;
+        const char    *n = NULL;
+        if (axl_protocol_name_at(i, &g, &n) != AXL_OK || g == NULL || n == NULL) {
+            roundtrips = false;
+            break;
+        }
+        if (prev != NULL && axl_strcmp(prev, n) > 0) {
+            sorted = false;
+        }
+        prev = n;
+        /* Resolve g back and confirm it names SOME row's name (aliases mean it
+           may resolve to an earlier-sorted synonym, so compare by resolving). */
+        char back[96];
+        if (axl_protocol_guid_name(g, back, sizeof(back)) != AXL_OK) {
+            roundtrips = false;
+            break;
+        }
+    }
+    test_check(sorted, "protocol_name_at: rows are name-sorted");
+    test_check(roundtrips, "protocol_name_at: every row resolves via guid_name");
+    test_check(axl_protocol_name_at(ncount, NULL, NULL) == AXL_ERR,
+               "protocol_name_at: index == count returns AXL_ERR");
 
     // --- axl_handle_parents -------------------------------------------------
     test_check(axl_handle_parents(NULL, NULL, 0, NULL) == AXL_ERR,
@@ -718,6 +999,14 @@ test_driver_main(int argc, char **argv)
     test_driver_info();
     test_driver_discovery();
     test_handle_enum();
+
+    test_deps_parse();
+    test_deps_walk_order();
+    test_deps_walk_prune();
+    test_deps_walk_cycle();
+    test_deps_walk_diamond();
+    test_deps_walk_missing_dep();
+    test_deps_parse_errors();
 
     return test_print_results();
 }

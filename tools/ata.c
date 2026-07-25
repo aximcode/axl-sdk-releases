@@ -9,10 +9,10 @@
 
 #include <axl.h>
 
-AXL_TOOL_MAIN(ata)
+static int
+run_ata(AxlArgs *a)
 {
-    (void)argc;
-    (void)argv;
+    (void)a;
     AxlAtaDev *dev = NULL;
     int        n = 0;
 
@@ -74,4 +74,13 @@ AXL_TOOL_MAIN(ata)
         axl_printf("ata: no ATA/SATA devices found\n");
     }
     return 0;
+}
+
+AXL_TOOL_MAIN(ata)
+{
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name    = "ata",
+        .help    = "List ATA/SATA devices with identity + SMART health",
+        .handler = run_ata,
+    });
 }

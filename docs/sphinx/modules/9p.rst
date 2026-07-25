@@ -1,0 +1,10 @@
+Axl9p — 9P2000.L client and server
+==================================
+
+.. include:: ../../../src/9p/README.md
+   :parser: myst_parser.sphinx_
+
+API Reference
+-------------
+
+.. doxygenfile:: axl-9p.h

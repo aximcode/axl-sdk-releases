@@ -62,14 +62,14 @@ static int
 collect_loaded_image(const AxlImageInfo *info, void *ctx)
 {
     (void)ctx;
-    if (g_image_count >= CRASH_MAX_IMAGES) {
+    if (g_image_count >= AXL_CRASH_MAX_IMAGES) {
         return 1;  /* stop early — table full */
     }
     g_image_table[g_image_count].base = (uint64_t)info->base;
     g_image_table[g_image_count].size = info->size;
     copy_basename(info->path,
                   g_image_table[g_image_count].name,
-                  CRASH_IMAGE_NAME_LEN);
+                  AXL_CRASH_IMAGE_NAME_LEN);
     g_image_count++;
     return 0;
 }
@@ -166,10 +166,10 @@ crash_exception_handler(
     (void)user;
 
     /* Static buffer -- no heap allocation in crash context */
-    static uint8_t   record_buf[CRASH_RECORD_MAX_SIZE];
-    static uint64_t  stack_frames[CRASH_MAX_FRAMES];
+    static uint8_t   record_buf[AXL_CRASH_RECORD_MAX_SIZE];
+    static uint64_t  stack_frames[AXL_CRASH_MAX_FRAMES];
 
-    CrashRecordHeader *hdr;
+    AxlCrashRecordHeader *hdr;
     uint8_t           *ptr;
     uint64_t           fault_addr;
     int                fault_image_idx;
@@ -187,15 +187,15 @@ crash_exception_handler(
        Host-side rsod-decode.py reads this field; the stored values
        are stable (the enum's numeric values are part of the SDK
        ABI). */
-    hdr = (CrashRecordHeader *)record_buf;
-    hdr->magic          = CRASH_RECORD_MAGIC;
-    hdr->version        = CRASH_RECORD_VERSION;
+    hdr = (AxlCrashRecordHeader *)record_buf;
+    hdr->magic          = AXL_CRASH_RECORD_MAGIC;
+    hdr->version        = AXL_CRASH_RECORD_VERSION;
     hdr->exception_type = (uint32_t)exc->kind;
 
     if (exc->arch == AXL_CPU_ARCH_X64) {
-        hdr->arch = CRASH_ARCH_X64;
+        hdr->arch = AXL_CRASH_ARCH_X64;
     } else {
-        hdr->arch = CRASH_ARCH_AARCH64;
+        hdr->arch = AXL_CRASH_ARCH_AARCH64;
     }
 
     /* Timestamp (best effort). axl_time_realtime is allocation-free —
@@ -208,11 +208,11 @@ crash_exception_handler(
                          (uint64_t)now.minute;
     }
 
-    ptr = record_buf + sizeof(CrashRecordHeader);
+    ptr = record_buf + sizeof(AxlCrashRecordHeader);
 
     /* --- Copy registers from the typed AxlCpuException --- */
     if (exc->arch == AXL_CPU_ARCH_X64) {
-        CrashRegsX64 *regs = (CrashRegsX64 *)ptr;
+        AxlCrashRegsX64 *regs = (AxlCrashRegsX64 *)ptr;
 
         regs->rip            = exc->regs.x64.rip;
         regs->rsp            = exc->regs.x64.rsp;
@@ -236,13 +236,13 @@ crash_exception_handler(
         regs->exception_data = exc->error_code;
 
         fault_addr  = exc->instruction_ptr;
-        ptr        += sizeof(CrashRegsX64);
+        ptr        += sizeof(AxlCrashRegsX64);
 
         frame_count = walk_stack_frames(exc->regs.x64.rbp,
                                         exc->regs.x64.rsp,
-                                        stack_frames, CRASH_MAX_FRAMES);
+                                        stack_frames, AXL_CRASH_MAX_FRAMES);
     } else {
-        CrashRegsAarch64 *regs = (CrashRegsAarch64 *)ptr;
+        AxlCrashRegsAarch64 *regs = (AxlCrashRegsAarch64 *)ptr;
 
         regs->elr  = exc->regs.aa64.elr;
         regs->sp   = exc->regs.aa64.sp;
@@ -268,31 +268,31 @@ crash_exception_handler(
         regs->spsr   = exc->regs.aa64.spsr;
 
         fault_addr  = exc->instruction_ptr;
-        ptr        += sizeof(CrashRegsAarch64);
+        ptr        += sizeof(AxlCrashRegsAarch64);
 
         frame_count = walk_stack_frames(exc->frame_ptr, exc->stack_ptr,
-                                        stack_frames, CRASH_MAX_FRAMES);
+                                        stack_frames, AXL_CRASH_MAX_FRAMES);
     }
 
     /* --- Faulting image (slot 0) + loaded image table --- */
     fault_image_idx = find_image_by_address(fault_addr);
 
     {
-        CrashImageEntry *img_entry;
+        AxlCrashImageEntry *img_entry;
         uint32_t         idx;
 
         /* Slot 0: faulting image (or zeroed if unknown) */
-        img_entry = (CrashImageEntry *)ptr;
+        img_entry = (AxlCrashImageEntry *)ptr;
         if (fault_image_idx >= 0) {
-            axl_memcpy(img_entry, &g_image_table[fault_image_idx], sizeof(CrashImageEntry));
+            axl_memcpy(img_entry, &g_image_table[fault_image_idx], sizeof(AxlCrashImageEntry));
         }
-        ptr += sizeof(CrashImageEntry);
+        ptr += sizeof(AxlCrashImageEntry);
 
         /* Remaining slots: full image table */
         for (idx = 0; idx < g_image_count; idx++) {
-            img_entry = (CrashImageEntry *)ptr;
-            axl_memcpy(img_entry, &g_image_table[idx], sizeof(CrashImageEntry));
-            ptr += sizeof(CrashImageEntry);
+            img_entry = (AxlCrashImageEntry *)ptr;
+            axl_memcpy(img_entry, &g_image_table[idx], sizeof(AxlCrashImageEntry));
+            ptr += sizeof(AxlCrashImageEntry);
         }
 
         hdr->image_count = g_image_count + 1;  /* faulting image + table */
@@ -323,7 +323,7 @@ crash_exception_handler(
     slot_size = sizeof(slot_idx);
     axl_nvstore_get("crashdump", "CrashDumpIdx",
                     &slot_idx, &slot_size);
-    slot_idx = slot_idx % CRASH_DUMP_SLOTS;
+    slot_idx = slot_idx % AXL_CRASH_DUMP_SLOTS;
 
     /* Build variable key: "CrashDump" + digit */
     var_key[9] = '0' + (char)slot_idx;

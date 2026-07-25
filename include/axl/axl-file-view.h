@@ -26,11 +26,47 @@
  * Read-only: the view never writes back. Intended for windowing large
  * files (logs, the original text of an out-of-core editor buffer) where
  * loading the whole file is undesirable.
+ *
+ * ## Consistency model: CLOSE-TO-OPEN
+ *
+ * The same guarantee NFS gives by default, and it is worth naming so you
+ * have a known model to reason with rather than a bespoke hedge:
+ *
+ *   - GUARANTEED — a freshly opened view sees the file's CURRENT
+ *     contents. Unconditionally: across EFI images, against a non-AXL
+ *     writer, against the UEFI Shell, against the firmware itself. This
+ *     needs no bookkeeping and nothing can defeat it — the open stats the
+ *     file itself, and a view's cached pages are keyed on its own
+ *     identity and dropped when it closes.
+ *
+ *     To see current data, RE-OPEN the view. That is the contract.
+ *
+ *   - NOT GUARANTEED — that a view ALREADY OPEN when a write happens will
+ *     notice. As a best effort it usually will, if the write went through
+ *     AXL in the same PE image: every AXL write path records that it
+ *     touched a file, and a view compares one integer per access, dropping
+ *     its pages and re-stat'ing only when the file it reads actually
+ *     moved. That costs a memory compare, not a firmware round trip, so it
+ *     is worth having. But it is an optimisation, not a promise.
+ *
+ * Do not build on the best-effort half. It does not fire for a writer in
+ * another PE image (libaxl is statically linked, so an application and a
+ * driver it loads have separate bookkeeping and neither sees the other's),
+ * nor for a non-AXL writer, nor for the Shell — and no amount of reading
+ * will reveal such a write. It is also only evaluated when the view is
+ * ASKED for data; a view nobody reads notices nothing. Re-open, or accept
+ * that what you hold may be stale.
+ *
+ * A consumer that wants the opposite — a length fixed at open, immune to
+ * later writes — pins the view with axl_file_view_set_pinned(). An editor
+ * buffer holding byte offsets into the original text, or an HTTP response
+ * body whose Content-Length was already sent, wants exactly that.
  */
 
 #ifndef AXL_FILE_VIEW_H
 #define AXL_FILE_VIEW_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
@@ -96,11 +132,90 @@ axl_file_view_close(
 );
 
 /**
- * @brief Total byte length of the underlying file.
+ * @brief Re-check the file, and report whether it can still be read.
+ *
+ * Runs the same best-effort check every read runs, so it does NOT make a
+ * view see a write it could not otherwise see — a writer in another PE
+ * image, a non-AXL writer or the Shell stays invisible either way. Only
+ * re-opening the view guarantees current contents (see the consistency
+ * model above).
+ *
+ * The reason to call it is the return value: an empty read cannot
+ * otherwise be told apart from a file that was deleted or renamed away
+ * under the view.
+ *
+ * On a pinned view this is a no-op that reports AXL_OK: a pin is a
+ * request not to move, and an explicit refresh does not override it.
+ *
+ * @return AXL_OK if the view can serve reads (whether or not anything
+ *     changed); AXL_ERR if the file could no longer be opened, in which
+ *     case the view reports size 0 and every read yields 0 bytes until
+ *     the path exists again.
+ */
+AXL_WARN_UNUSED int
+axl_file_view_refresh(
+    AxlFileView *v  ///< view (NULL → AXL_ERR)
+);
+
+/**
+ * @brief Freeze the length the view reports, or unfreeze it.
+ *
+ * Pin a view whose consumer has already committed to a length or to byte
+ * offsets — an HTTP body streamed under an already-sent Content-Length,
+ * an editor buffer indexing the original text — where picking up a
+ * concurrent write would corrupt the consumer rather than refresh it.
+ *
+ * A pin turns OFF the best-effort half of the consistency model for this
+ * view: it stops following writes it would otherwise have noticed. It
+ * does not, and cannot, add any guarantee about the file's bytes — under
+ * close-to-open there was never one to strengthen. So be precise, because
+ * a pin is NOT a snapshot. It bounds what the view REPORTS, not what it
+ * can DELIVER:
+ *
+ *   - GUARANTEED by the pin: the LENGTH stops moving. axl_file_view_size keeps
+ *     answering with what the view last observed, so a Content-Length
+ *     already on the wire stays honest and offset arithmetic derived from
+ *     that length stays self-consistent. This is what the consumers above
+ *     actually depend on.
+ *   - NOT guaranteed: the BYTES. Current file contents can still show
+ *     through, two ways:
+ *       - A page that is not resident yet is read from the file as it
+ *         stands when it is first touched.
+ *       - A page that IS resident can be evicted at any time.
+ *         AxlPageCache chooses its LRU victim across ALL frames with no
+ *         regard for owner or pin — evicting is what the module is for.
+ *         Reading past max_frames pages evicts the view's own earlier
+ *         pages, and in a shared cache another tenant can evict them
+ *         sooner. Whatever re-faults afterwards is filled from the file
+ *         as it stands then.
+ *
+ * So a pinned view CAN hand back post-write bytes for a region it
+ * revisits — consistent with close-to-open, not an exception to it. There
+ * is no cheap way to close that: UEFI has no file-snapshot primitive, so
+ * the only complete answer is to hold the whole file in memory — exactly
+ * what a windowed view exists to avoid. A consumer that genuinely cannot
+ * tolerate it must copy the file first.
+ *
+ * Unpinning does not immediately re-read; the next access does.
+ */
+void
+axl_file_view_set_pinned(
+    AxlFileView *v,   ///< view (NULL-safe)
+    bool         pin  ///< true: freeze the length; false: resume best-effort tracking
+);
+
+/**
+ * @brief Byte length of the file as this view currently understands it.
+ *
+ * The length observed when the view opened, which the best-effort check
+ * may have updated since (see the consistency model above) — so this may
+ * re-stat the file, and a write this view cannot see leaves it reporting
+ * the length from its own open. 0 if the file was deleted or renamed
+ * away.
  */
 size_t
 axl_file_view_size(
-    const AxlFileView *v  ///< view
+    AxlFileView *v  ///< view
 );
 
 /**
@@ -129,8 +244,10 @@ axl_file_view_read(
  * valid bytes available from @p offset to the end of that page's data.
  * To cross a page boundary, call again at @p offset + @p *avail.
  *
- * The pointer is valid only until the next call that may evict
- * (any read/page call). Do not free it.
+ * The pointer is valid only until the next call on this view — ANY of
+ * them, not only the ones that read. axl_file_view_size and
+ * axl_file_view_refresh run the coherence check too, and that drops every
+ * frame this view holds when the file has been written. Do not free it.
  *
  * @return pointer into a resident frame, or NULL if @p offset is at or
  *     past EOF (in which case @p *avail is set to 0).

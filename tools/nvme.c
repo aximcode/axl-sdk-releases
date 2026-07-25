@@ -46,10 +46,10 @@ print_smart(AxlHandle ctrl)
     }
 }
 
-AXL_TOOL_MAIN(nvme)
+static int
+run_nvme(AxlArgs *a)
 {
-    (void)argc;
-    (void)argv;
+    (void)a;
     AxlHandle ctrl = NULL;
     int       n = 0;
 
@@ -92,4 +92,13 @@ AXL_TOOL_MAIN(nvme)
         axl_printf("nvme: no NVMe controllers found\n");
     }
     return 0;
+}
+
+AXL_TOOL_MAIN(nvme)
+{
+    return axl_args_run(argc, argv, &(AxlArgsNode){
+        .name    = "nvme",
+        .help    = "List NVMe controllers with identity, SMART health + namespaces",
+        .handler = run_nvme,
+    });
 }

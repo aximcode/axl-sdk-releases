@@ -297,6 +297,10 @@ void start_conn_recv(AxlHttpServer *s, HttpConn *conn);
 bool on_conn_data(AxlTcp *sock, AxlStatus status, void *data);
 void dispatch_and_respond(AxlHttpServer *s, HttpConn *conn);
 void reset_connection(HttpConn *conn);
+/* Teardown variant: abortively closes the connection's socket (RST) so its
+   firmware teardown finalizes synchronously — used by
+   axl_http_server_free(., AXL_TEARDOWN_RESET) to release the listen port on return. */
+void reset_connection_abortive(HttpConn *conn);
 
 /* axl-http-request.c */
 void *grow_buffer(void *old, size_t old_len, size_t new_size);

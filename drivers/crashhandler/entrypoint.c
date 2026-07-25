@@ -13,12 +13,12 @@
 #include "crashhandler.h"
 
 /* GUIDs */
-AxlGuid g_crash_handler_variable_guid = CRASH_HANDLER_VARIABLE_GUID;
-AxlGuid g_crash_handler_protocol_guid = CRASH_HANDLER_PROTOCOL_GUID;
+AxlGuid g_crash_handler_variable_guid = AXL_CRASH_HANDLER_VARIABLE_GUID;
+AxlGuid g_crash_handler_protocol_guid = AXL_CRASH_HANDLER_PROTOCOL_GUID;
 
 /* Global state */
 AxlHandle               g_image_handle = NULL;
-CrashImageEntry         g_image_table[CRASH_MAX_IMAGES];
+AxlCrashImageEntry         g_image_table[AXL_CRASH_MAX_IMAGES];
 uint32_t                g_image_count  = 0;
 
 /* Sentinel protocol instance (value doesn't matter -- existence is the signal) */
@@ -73,7 +73,7 @@ crash_handler_main(AxlHandle image, AxlSystemTable *st)
        binding is per-image so we re-register on every load; the
        call is idempotent if another image in the same address
        space already bound it. */
-    if (axl_protocol_register_name(CRASH_HANDLER_PROTOCOL_NAME,
+    if (axl_protocol_register_name(AXL_CRASH_HANDLER_PROTOCOL_NAME,
                                    &g_crash_handler_protocol_guid)
         != AXL_OK) {
         axl_printf("CrashHandler: protocol-name bind failed\n");
@@ -81,7 +81,7 @@ crash_handler_main(AxlHandle image, AxlSystemTable *st)
     }
 
     /* 2. Idempotency -- check if we're already loaded */
-    if (axl_protocol_find(CRASH_HANDLER_PROTOCOL_NAME, &existing) == AXL_OK) {
+    if (axl_protocol_find(AXL_CRASH_HANDLER_PROTOCOL_NAME, &existing) == AXL_OK) {
         axl_printf("CrashHandler: already active\n");
         return AXL_ERR;
     }
@@ -124,7 +124,7 @@ crash_handler_main(AxlHandle image, AxlSystemTable *st)
     }
 
     /* 6. Install sentinel protocol on a new handle */
-    axl_protocol_register(CRASH_HANDLER_PROTOCOL_NAME,
+    axl_protocol_register(AXL_CRASH_HANDLER_PROTOCOL_NAME,
                           &sentinel,
                           &sentinel_handle);
 

@@ -107,6 +107,10 @@ axl_gfx_gradient_free(
     AxlGfxGradient  *g   ///< gradient to free, or NULL
     );
 
+#ifdef AXL_HAVE_AUTOPTR
+AXL_DEFINE_AUTOPTR_CLEANUP(AxlGfxGradient, axl_gfx_gradient_free)
+#endif
+
 /// Sample @a g at the center of pixel (@a x, @a y).
 ///
 /// Returns the interpolated color the fill helpers would paint at that

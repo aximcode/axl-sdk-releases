@@ -29,7 +29,7 @@ _Static_assert(sizeof(AxlGuid) == sizeof(EFI_GUID),
                "AxlGuid must be ABI-compatible with EFI_GUID");
 
 int
-axl_device_path_make_vendor(
+axl_device_path_new_vendor(
     const AxlGuid  *vendor_guid,
     AxlDevicePath **out
     )

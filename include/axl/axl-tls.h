@@ -44,6 +44,22 @@ typedef struct AxlTcp AxlTcp;
 typedef struct AxlLoop AxlLoop;
 
 /**
+ * @brief Outcome of a non-blocking TLS handshake or read.
+ *
+ * Unlike a plain error enum this carries a third, non-error state:
+ * `AXL_TLS_WANT_MORE` (positive) means the operation isn't finished and
+ * needs more transport data — re-arm the recv and call again. `AXL_TLS_OK`
+ * is 0 and the error is negative, so `status < 0` reads as failure and
+ * `status == AXL_TLS_WANT_MORE` as would-block (mirrors OpenSSL's
+ * WANT_READ idiom). Values match the legacy 0/1/-1 codes.
+ */
+typedef enum {
+    AXL_TLS_OK        =  0,  ///< operation complete / success
+    AXL_TLS_WANT_MORE =  1,  ///< more transport data needed; call again after recv
+    AXL_TLS_ERR       = -1   ///< error
+} AxlTlsStatus;
+
+/**
  * @brief Check if TLS support was compiled in.
  * @return true if AXL_TLS=1 was set at build time.
  */
@@ -130,11 +146,10 @@ axl_tls_connect(
  *
  * May need to be called multiple times if data isn't available yet.
  *
- * @return 0 on success (handshake complete),
- *         1 if more data needed (call again after recv),
- *         -1 on error.
+ * @return AXL_TLS_OK when the handshake is complete, AXL_TLS_WANT_MORE if
+ *     more data is needed (call again after recv), AXL_TLS_ERR on error.
  */
-int
+AxlTlsStatus
 axl_tls_handshake(
     AxlTlsContext *ctx   ///< TLS context
 );
@@ -151,10 +166,10 @@ axl_tls_handshake(
  * (stage the received ciphertext with axl_tls_stage_data() before calling)
  * so the whole handshake runs on the caller's loop.
  *
- * @return 0 on success (handshake complete), 1 if more data is needed
- *     (re-arm the recv and call again), -1 on error.
+ * @return AXL_TLS_OK when the handshake is complete, AXL_TLS_WANT_MORE if
+ *     more data is needed (re-arm the recv and call again), AXL_TLS_ERR on error.
  */
-int
+AxlTlsStatus
 axl_tls_handshake_async(
     AxlTlsContext *ctx,   ///< TLS context
     AxlLoop       *loop   ///< loop to send handshake output on
@@ -163,9 +178,10 @@ axl_tls_handshake_async(
 /**
  * @brief Read decrypted data from a TLS connection.
  *
- * @return 0 on success, -1 on error, 1 if more data needed.
+ * @return AXL_TLS_OK on success, AXL_TLS_WANT_MORE if more data is needed,
+ *     AXL_TLS_ERR on error.
  */
-int
+AxlTlsStatus
 axl_tls_read(
     AxlTlsContext *ctx,       ///< TLS context
     void          *buf,       ///< output buffer
