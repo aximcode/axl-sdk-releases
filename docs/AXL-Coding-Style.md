@@ -120,18 +120,35 @@ handed to a UEFI service that retains it:
 - `LoadOptions` / `LoadedImage->FilePath` and similar firmware-read
   fields.
 
-Using `axl_malloc` for those is a use-after-free: the leak tracker
-reclaims the block when the launcher exits while the firmware still
-references it. Conversely, memory the firmware allocated for you
-(`LocateHandleBuffer`, `ProtocolsPerHandle`, `QueryMode`,
-`GetMemoryMap`, `Usb*Descriptor`, …) must be released with
-`gBS->FreePool`, never `axl_free` — the two allocators are distinct
-pools. Never cross the streams: free firmware memory with `FreePool`
-and AXL memory with `axl_free`.
+Using `axl_malloc` for those is a bug on two counts. **Lifetime**: the
+leak tracker reclaims the block when the launcher exits while the firmware
+still references it — a use-after-free. **Layout**: `axl_malloc` prepends a
+bookkeeping header (a size word, plus fence-posts and list links under
+`AXL_MEM_DEBUG`), so the pointer it returns is *offset past* the start of
+the real `AllocatePool` block. When the firmware later `CoreFreePool`s that
+pointer it lands mid-block, fails the pool-head signature check, and
+ASSERTs (`[DxeCore] … Pool.c`) on DEBUG firmware — or silently corrupts the
+free list on RELEASE. Conversely, memory the firmware allocated for you
+(`LocateHandleBuffer`, `ProtocolsPerHandle`, `QueryMode`, `GetMemoryMap`,
+`Usb*Descriptor`, …) must be released with `gBS->FreePool`, never
+`axl_free` — the block has no AXL header for `axl_free` to find. Never
+cross the streams: free firmware memory with `FreePool` and AXL memory with
+`axl_free`.
 
-The base layer is the exception that proves the rule: `src/mem/` and
-the native backend implement `axl_malloc` *on top of* `AllocatePages`,
-so they call the firmware allocator directly by necessity.
+**Mark every deliberate firmware-pool call.** A raw `AllocatePool` /
+`FreePool` / `AllocatePages` / `FreePages` outside the base layer must
+carry a `/* axl-pool-direct: <reason> */` comment naming why the memory is
+firmware-owned — e.g. `freed by firmware`, `installed protocol interface`,
+`device path to LoadImage`, `firmware-returned buffer`. This is the
+allocation-axis analogue of the `axl-uefi-direct:` marker, and it is
+enforced: `scripts/check-dogfood.py` (`make check-dogfood`, in CI) fails on
+an *unmarked* raw pool call, so the default really is `axl_malloc` /
+`axl_free` and each firmware-pool exception is justified in place.
+
+The base layer is the exception that proves the rule: `src/mem/`, the
+native backend, and `src/crt0/` implement or bootstrap `axl_malloc` *on top
+of* `AllocatePages`, so they call the firmware allocator directly by
+necessity (and are exempt from the marker gate).
 
 ## File Naming
 
@@ -661,7 +678,10 @@ axl_hash_table_free(AxlHashTable *h);  ///< hash table (NULL-safe)
 ## Dogfooding
 
 AXL's own internals use the AXL API:
-- Allocate with `axl_malloc`/`axl_calloc`/`axl_free`
+- Allocate with `axl_malloc`/`axl_calloc`/`axl_free` — raw firmware
+  `AllocatePool`/`FreePool` only for firmware-owned memory, marked
+  `axl-pool-direct` and gated by `check-dogfood.py` (see *Memory Ownership*
+  above)
 - Report errors with `axl_printerr`
 - Build strings with `axl_string`
 - Use `axl_strlcpy`/`axl_strlcat` for bounded copies

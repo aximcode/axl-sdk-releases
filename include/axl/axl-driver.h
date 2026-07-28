@@ -391,6 +391,12 @@ axl_driver_disconnect(
  * BEFORE gBS->UnloadImage so a UnloadImage failure still doesn't leak
  * the copy.
  *
+ * Safe to call on an image the firmware already unloaded — it auto-unloads
+ * an image whose entry point returned an error (and any application). This
+ * detects that case, releases only the still-live AXL-tracked resources,
+ * skips the redundant UnloadImage, and returns AXL_OK; it never double-frees
+ * a synthesized device path the firmware already reclaimed.
+ *
  * @return AXL_OK on success, AXL_ERR on error.
  */
 int
@@ -776,6 +782,48 @@ axl_driver_ensure_from_path(
     const char    *driver_path,       ///< exact path to the driver .efi, e.g. "fs0:\\drivers\\x64\\my-dxe.efi"
     const void    *load_options,      ///< LoadOptions to install pre-Start (may be NULL)
     size_t         load_options_size  ///< size of @p load_options in bytes (0 if NULL)
+);
+
+/**
+ * @brief Ensure a protocol is registered by loading an EMBEDDED driver
+ *     image directly — **no disk search**.
+ *
+ * The embedded-blob sibling of axl_driver_ensure_from_path. Where
+ * axl_driver_ensure_with_embedded searches 4 disk paths and only falls
+ * back to the embedded blob on a miss, this loads the blob straight away.
+ * That matters for the "ship as one binary" model: the search looks at
+ * `<image_dir>/<driver_name>` first, so a stale loose driver an older
+ * install left beside the launcher would shadow the newer image baked into
+ * this binary. Loading the blob directly takes the search — and that
+ * hazard — out of the picture entirely, the mirror image of what
+ * axl_driver_ensure_from_path does for a pinned disk file.
+ *
+ * Resolution:
+ *   1. `LocateProtocol(protocol_guid)` — short-circuit if already
+ *      registered (same as the other variants; the published instance is
+ *      not the caller's to re-configure, so @p load_options is ignored on
+ *      this path — e.g. an OEM firmware-volume driver already dispatched).
+ *   2. LoadImage the blob from memory, install @p load_options if any,
+ *      `StartImage`, then verify the protocol got registered. If it did
+ *      not, the image is unloaded and this reports failure — no fallback.
+ *
+ * @param driver_name OPTIONAL: names the loaded image for `dh`/diagnostics
+ *     (and the synthesized device path). May be NULL — it is never used to
+ *     search, since there is no search.
+ *
+ * @return AXL_OK if the protocol is registered (was already, or after
+ *     loading the blob); AXL_NOT_FOUND if the blob failed to load, start,
+ *     or register; AXL_INVALID on a NULL @p protocol_guid / @p embedded_buf
+ *     or a zero @p embedded_len.
+ */
+AxlStatus
+axl_driver_ensure_embedded_only(
+    const AxlGuid       *protocol_guid,     ///< protocol GUID to look up (must be non-NULL)
+    const unsigned char *embedded_buf,      ///< embedded driver .efi bytes (must be non-NULL)
+    size_t               embedded_len,      ///< length of @p embedded_buf (must be > 0)
+    const char          *driver_name,       ///< optional image name for diagnostics (may be NULL)
+    const void          *load_options,      ///< LoadOptions to install pre-Start (may be NULL)
+    size_t               load_options_size  ///< size of @p load_options in bytes (0 if NULL)
 );
 
 /**

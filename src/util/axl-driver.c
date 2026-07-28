@@ -123,7 +123,7 @@ driver_append_file_to_vol_dp(
     size_t total = vol_dp_body + file_node_size + 4;
 
     void *out = NULL;
-    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out)
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out)  /* axl-pool-direct: device path for LoadImage */
         != EFI_SUCCESS || out == NULL)
     {
         return NULL;
@@ -361,7 +361,7 @@ driver_build_image_dp(
     size_t total       = vendor_node + mm_node + fp_node + 4 /* END */;
 
     void *out = NULL;
-    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out) != EFI_SUCCESS
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out) != EFI_SUCCESS  /* axl-pool-direct: installed loaded-image device path */
         || out == NULL)
     {
         return NULL;
@@ -449,9 +449,9 @@ image_dp_teardown(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
     }
     axl_bs()->UninstallProtocolInterface(
         handle, &EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID, dp);
-    axl_bs()->FreePool(dp);
+    axl_bs()->FreePool(dp);  /* axl-pool-direct: installed loaded-image device path */
     if (file_path != NULL) {
-        axl_bs()->FreePool(file_path);
+        axl_bs()->FreePool(file_path);  /* axl-pool-direct: LoadedImage FilePath copy */
     }
 }
 
@@ -460,7 +460,7 @@ image_dp_track(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
                EFI_DEVICE_PATH_PROTOCOL *file_path)
 {
     AxlImageDpRecord *rec = NULL;
-    if (axl_bs()->AllocatePool(EfiBootServicesData, sizeof(*rec),
+    if (axl_bs()->AllocatePool(EfiBootServicesData, sizeof(*rec),  /* axl-pool-direct: record installed as handle protocol */
                                (void **)&rec) != EFI_SUCCESS || rec == NULL) {
         rec = NULL;   /* AllocatePool may leave *rec untouched on failure */
     } else {
@@ -469,7 +469,7 @@ image_dp_track(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
         if (EFI_ERROR(axl_bs()->InstallProtocolInterface(
                 &handle, (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID,
                 EFI_NATIVE_INTERFACE, rec))) {
-            axl_bs()->FreePool(rec);
+            axl_bs()->FreePool(rec);  /* axl-pool-direct: record installed as handle protocol */
             rec = NULL;
         }
     }
@@ -487,27 +487,92 @@ image_dp_track(EFI_HANDLE handle, EFI_DEVICE_PATH_PROTOCOL *dp,
     }
 }
 
-/* Uninstall + free the synthesized device path for @p handle, if any. Called
- * from axl_driver_unload BEFORE UnloadImage so our protocol entries are removed
- * cleanly (the firmware's own uninstall of its stale internal pointer then
- * no-ops instead of mismatching). Works from any image — the record is read
- * off the handle, not a process-local table. */
-static void
+/* Uninstall + free the synthesized device path for @p handle, if any, and
+ * report whether the image is still loaded. Called from axl_driver_unload
+ * BEFORE UnloadImage so our protocol entries are removed cleanly (the
+ * firmware's own uninstall of its stale internal pointer then no-ops instead
+ * of mismatching). Works from any image — the record is read off the handle,
+ * not a process-local table.
+ *
+ * Liveness matters because the firmware auto-unloads some images out from
+ * under us: EDK2's CoreStartImage unloads an image whose DriverEntry returned
+ * an error (and unloads any application unconditionally), via
+ * CoreUnloadAndCloseImage, which CoreFreePool's Image->Info.FilePath and
+ * Image->LoadedImageDevicePath — the exact pool blocks our record tracks — and
+ * uninstalls the LoadedImage protocols. The HANDLE survives only because our
+ * private record protocol is still on it. So "the record is still here" is NOT
+ * proof the image is live; freeing rec->dp / rec->file_path again would be a
+ * double FreePool that corrupts the DXE pool (silent 100%-CPU wedge on RELEASE,
+ * a Pool.c signature ASSERT on DEBUG). Probe the LoadedImage protocol — which
+ * the firmware DID uninstall — and only tear down the device paths when the
+ * image is still alive. The probe is safe: this handle is still in the DB (our
+ * record keeps it there), and even a destroyed handle would only be compared
+ * by value in CoreValidateHandle, never dereferenced.
+ *
+ * Returns true if the caller should go on to UnloadImage the handle, false if
+ * there is nothing left to unload — either the firmware already unloaded the
+ * image, or the handle is not in the handle database at all (a stale or bogus
+ * handle is indistinguishable from an auto-unloaded one: both are simply gone).
+ * The EFI_INVALID_PARAMETER / EFI_UNSUPPORTED split used below to tell "gone"
+ * from "live but not an image" is an EDK2 property (CoreValidateHandle runs
+ * before the protocol lookup); firmware that reported EFI_UNSUPPORTED for a
+ * destroyed handle would just fall through to UnloadImage and get an error
+ * back, which is a safe degradation. */
+static bool
 image_dp_release(AxlDriverHandle handle)
 {
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    EFI_STATUS li_status = axl_efi_call(axl_bs()->HandleProtocol, 3,
+        (EFI_HANDLE)handle, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void **)&li);
+    bool image_alive = li_status == EFI_SUCCESS && li != NULL;
+
     AxlImageDpRecord *rec = NULL;
     if (axl_bs()->HandleProtocol((EFI_HANDLE)handle,
                                  (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID,
                                  (void **)&rec) != EFI_SUCCESS || rec == NULL) {
-        return;   /* not a synthesized-device-path image — nothing to do */
+        /* No synthesized device path to release — and no evidence this handle
+         * was ever an image WE loaded, so "no LoadedImage" is ambiguous here
+         * and only one of its two meanings may skip UnloadImage:
+         *   - the handle itself is gone (EFI_INVALID_PARAMETER out of
+         *     CoreValidateHandle): the firmware auto-unloaded an image nothing
+         *     was keeping alive, and there is nothing left to unload;
+         *   - the handle is live but carries no LoadedImage (EFI_UNSUPPORTED):
+         *     it is not an image at all. Let UnloadImage run and report the
+         *     real failure — claiming success for an unload we never performed
+         *     would hide a caller's bad handle.
+         * (The auto-unloaded-but-still-alive handle, the double-FreePool case
+         * this liveness probe exists for, always carries a record and is
+         * handled below.) */
+        return image_alive || li_status != EFI_INVALID_PARAMETER;
     }
 
-    /* The record GUID is private and never opened via OpenProtocol, so this
-     * uninstall cannot be denied; freeing rec below is therefore safe. */
+    /* Uninstall our private record unconditionally — that is what lets an
+     * already-orphaned handle finally be destroyed. The GUID is private and
+     * never opened via OpenProtocol, so this cannot be denied; freeing rec
+     * below is therefore safe. */
     axl_bs()->UninstallProtocolInterface(
         (EFI_HANDLE)handle, (EFI_GUID *)&AXL_IMAGE_DP_RECORD_GUID, rec);
-    image_dp_teardown((EFI_HANDLE)handle, rec->dp, rec->file_path);
-    axl_bs()->FreePool(rec);
+
+    if (image_alive) {
+        /* Normal path: firmware never touched either block — full teardown. */
+        image_dp_teardown((EFI_HANDLE)handle, rec->dp, rec->file_path);
+    } else {
+        /* The firmware auto-unloaded the image. It freed Image->Info.FilePath
+         * (== rec->file_path) inside CoreUnloadAndCloseImage, so freeing that
+         * again would be the double-free this whole guard exists to prevent —
+         * pass NULL to skip it. But it did NOT touch rec->dp: our synthesized
+         * LoadedImageDevicePath was installed with (Re)InstallProtocolInterface,
+         * which does not update the firmware's private Image->LoadedImageDevicePath
+         * field (NULL for a buffer load), so CoreUnloadAndCloseImage's
+         * `if (LoadedImageDevicePath != NULL)` guard skipped BOTH its uninstall
+         * and its free. So we must still uninstall + free rec->dp here, or it —
+         * and the orphaned handle it keeps alive — leak on every failed start,
+         * the exact leak this record was built to prevent. teardown's own
+         * li->FilePath=NULL write no-ops safely (LoadedImage is already gone). */
+        image_dp_teardown((EFI_HANDLE)handle, rec->dp, NULL);
+    }
+    axl_bs()->FreePool(rec);  /* axl-pool-direct: record installed as handle protocol */
+    return image_alive;
 }
 
 /* Give a freshly buffer-loaded image a real identity so the shell never
@@ -568,7 +633,7 @@ driver_apply_image_identity(
             EFI_NATIVE_INTERFACE, full);
     }
     if (EFI_ERROR(is)) {
-        axl_bs()->FreePool(full);
+        axl_bs()->FreePool(full);  /* axl-pool-direct: installed loaded-image device path */
         axl_warning("driver load: install loaded-image device path failed: 0x%llx",
                     (unsigned long long)is);
         return;
@@ -587,7 +652,7 @@ driver_apply_image_identity(
     EFI_DEVICE_PATH_PROTOCOL *file_path = NULL;
     void                     *fp_buf    = NULL;
     if (tail_size >= 4
-        && axl_bs()->AllocatePool(EfiBootServicesData, tail_size, &fp_buf)
+        && axl_bs()->AllocatePool(EfiBootServicesData, tail_size, &fp_buf)  /* axl-pool-direct: LoadedImage FilePath copy (firmware may free) */
                == EFI_SUCCESS
         && fp_buf != NULL)
     {
@@ -671,7 +736,7 @@ axl_driver_load(
             file_dp,         /* DevicePath */
             NULL, 0,         /* No source buffer; firmware reads via DP */
             &image);
-        axl_bs()->FreePool(file_dp);
+        axl_bs()->FreePool(file_dp);  /* axl-pool-direct: device path for LoadImage */
 
         if (!EFI_ERROR(status)) {
             *handle = (AxlDriverHandle)image;
@@ -780,7 +845,7 @@ axl_driver_connect(
     for (UINTN i = 0; i < count; i++) {
         axl_bs()->ConnectController(handles[i], NULL, NULL, TRUE);
     }
-    axl_bs()->FreePool(handles);
+    axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     return AXL_OK;
 }
 
@@ -876,7 +941,19 @@ axl_driver_unload(
        our protocol interface and free the pool while the handle is still
        valid. */
     load_options_release(handle);
-    image_dp_release(handle);
+
+    /* Release our tracked synthesized device path and learn whether the image
+       is still loaded. The firmware auto-unloads an image whose DriverEntry
+       returned an error (and any application) — driver_start_and_verify and
+       axl-net-driver-select both call us on exactly that error path. When the
+       image is already gone there is nothing left of ours to free (handled
+       above) and UnloadImage on the dead handle would only fail and mislead;
+       skip it. On firmware that does NOT auto-unload, image_dp_release reports
+       the image alive and we fall through to UnloadImage as before, so nothing
+       leaks either way. */
+    if (!image_dp_release(handle)) {
+        return AXL_OK;
+    }
 
     status = axl_bs()->UnloadImage((EFI_HANDLE)handle);
     if (EFI_ERROR(status)) {
@@ -1590,7 +1667,7 @@ axl_driver_load_sibling(
         EFI_HANDLE image = NULL;
         EFI_STATUS st = axl_bs()->LoadImage(FALSE, gImageHandle, sib_dp,
                                             NULL, 0, &image);
-        axl_bs()->FreePool(sib_dp);
+        axl_bs()->FreePool(sib_dp);  /* axl-pool-direct: device path for LoadImage */
         if (!EFI_ERROR(st)) {
             *out_handle = (AxlDriverHandle)image;
             return AXL_OK;
@@ -1790,6 +1867,43 @@ axl_driver_ensure_from_path(
      * to go looking. driver_start_and_verify unloads on failure. */
     if (driver_start_and_verify(drv, protocol_guid, driver_path,
                                 load_options, load_options_size) != AXL_OK) {
+        return AXL_NOT_FOUND;
+    }
+    return AXL_OK;
+}
+
+AxlStatus
+axl_driver_ensure_embedded_only(
+    const AxlGuid       *protocol_guid,
+    const unsigned char *embedded_buf,
+    size_t               embedded_len,
+    const char          *driver_name,
+    const void          *load_options,
+    size_t               load_options_size
+    )
+{
+    if (protocol_guid == NULL || embedded_buf == NULL || embedded_len == 0) {
+        return AXL_INVALID;
+    }
+
+    /* Same step-1 short-circuit as the searching variants: an already
+     * published protocol is not ours to re-configure, so load_options is
+     * deliberately ignored on this path. */
+    if (driver_protocol_registered(protocol_guid) == AXL_OK) {
+        axl_debug("driver ensure_embedded_only: protocol already registered, "
+                  "skipping embedded load");
+        return AXL_OK;
+    }
+
+    /* Load the blob directly — NO disk search, so a stale loose copy of
+     * driver_name beside the launcher cannot shadow it. driver_load_embedded
+     * synthesizes a device path from driver_name (may be NULL -> a sensible
+     * default) and unloads the image on a start/verify failure. */
+    if (driver_load_embedded(protocol_guid, embedded_buf, embedded_len,
+                             load_options, load_options_size,
+                             /* info */ NULL, driver_name) != AXL_OK) {
+        axl_warning("driver ensure_embedded_only: embedded driver (%zu bytes) "
+                    "failed to load or register", embedded_len);
         return AXL_NOT_FOUND;
     }
     return AXL_OK;

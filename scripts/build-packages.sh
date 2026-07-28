@@ -200,9 +200,12 @@ for arch in x64 aa64; do
     # debug-info objects the tool .efi links against; build `all`
     # first so those exist.
     make -C "$PROJECT_ROOT" ARCH="$arch" BUILD=RELEASE AXL_TLS=1 all tools > /dev/null
+    # Each BUILD has its own output tree, so ask make where this one landed
+    # rather than duplicating the naming rule.
+    arch_prefix=$(make -C "$PROJECT_ROOT" -s ARCH="$arch" BUILD=RELEASE AXL_TLS=1 print-prefix)
 
     TOOLS_STAGE=$(mktemp -d -t axl-tools-XXXXXX)
-    cp "$PROJECT_ROOT/out/native-$arch/tools/"*.efi "$TOOLS_STAGE/"
+    cp "$PROJECT_ROOT/$arch_prefix/tools/"*.efi "$TOOLS_STAGE/"
     echo "$PKG_VERSION" > "$TOOLS_STAGE/VERSION"
     # Stage the curated JSON5 sidecars next to the .efi binaries so
     # axl_*_ids_load's companion-path autodiscovery resolves them

@@ -21,6 +21,13 @@
 #                         axl_gfx_*-using app. Required on AARCH64
 #                         (`virt` machine has no default display);
 #                         harmless on X64. --screenshot implies this.
+#   --no-gpu / --headless Give the guest NO graphics adapter, so OVMF
+#                         exposes no GOP and axl_gfx_available() is false.
+#                         For logic/compute-only test runs: skips the
+#                         render pipeline (faster) and side-steps a false
+#                         CPU-spike from incidental full-screen rendering.
+#                         Mutually exclusive with --gpu/--screenshot/
+#                         --display/--gui (they need a framebuffer).
 #   --gui / --display gtk Open a GTK window for the guest's GOP framebuffer
 #                         (implies --gpu; serial stays on this terminal).
 #                         Rides X11 forwarding (ssh -Y + XQuartz). NOTE:
@@ -77,6 +84,9 @@
 #                         build that includes VirtioFsDxe (or a
 #                         standalone VirtioFsDxe.efi alongside the
 #                         firmware build). Default volume tag: hostfs.
+#   --workload SHAPE      'idle' (default) keeps the CPU-spike check; 'compute'
+#                         swaps it for a --max-duration budget
+#   --max-duration SECS   Fail (exit 9) if the run exceeds SECS
 #   --no-cpu-warn         Disable the CPU-spike check (on by default in the
 #                         default + --screenshot modes; samples QEMU's host
 #                         CPU after the firmware-boot warm-up and, on a
@@ -114,6 +124,12 @@ SCREENSHOT=""
 # device.  Harmless on X64 (q35 already provides GOP); the extra
 # device is a no-op there.  --screenshot implies --gpu automatically.
 ENABLE_GPU=false
+# --no-gpu / --headless gives the guest NO graphics adapter, so OVMF exposes no
+# GOP and axl_gfx_available() is false — for logic/compute-only test runs that
+# skip the render pipeline (faster, and side-steps an incidental full-screen
+# render tripping the CPU-spike gate). Opt-in; mutually exclusive with the
+# framebuffer modes below.
+NO_GPU=false
 NET=false
 NIC_MODEL=""        # default chosen later (virtio-net-pci); --nic-model overrides
 MAC_ADDR=""         # --mac XX:XX:XX:XX:XX:XX (HF4: replay a captured NIC MAC)
@@ -156,6 +172,9 @@ HOLDKEY_SEQ=""   # space-separated "qcode:ms" held keypresses (--screenshot, QMP
 # warm-up and warn carve-out are applied by cpu_policy_init "$ARCH" below (after
 # --arch is known). --cpu-threshold / --no-cpu-warn / --cpu-report still override,
 # because cpu_policy_init only fills a value a flag has not already set.
+# WORKLOAD picks WHICH gate applies to this run (see the case below): `idle`
+# keeps the CPU-sustain check, `compute` swaps it for a --max-duration budget.
+WORKLOAD="${WORKLOAD:-idle}"
 INTERACTIVE=false
 # --display BACKEND (or --gui = gtk): open a real graphical window for the
 # guest's GOP framebuffer instead of running headless. Over SSH this rides
@@ -184,6 +203,7 @@ while [[ $# -gt 0 ]]; do
         --raw)        RAW=true; shift ;;
         --screenshot) SCREENSHOT="$2"; shift 2 ;;
         --gpu)        ENABLE_GPU=true; shift ;;
+        --no-gpu|--headless) NO_GPU=true; shift ;;
         --display)    DISPLAY_BACKEND="$2"; shift 2 ;;
         --gui)        DISPLAY_BACKEND="gtk"; shift ;;
         --vnc)
@@ -229,6 +249,8 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gdb-halt)   GDB_HALT=true; shift ;;
         --debugcon)   DEBUGCON_LOG="$2"; shift 2 ;;
+        --workload) WORKLOAD="${2:-}"; shift 2 ;;
+        --max-duration) MAX_DURATION="${2:-}"; shift 2 ;;
         --no-cpu-warn) CPU_WARN=false; shift ;;
         --cpu-report) CPU_REPORT=true; shift ;;
         --cpu-threshold) CPU_THRESHOLD="$2"; shift 2 ;;
@@ -263,6 +285,13 @@ Options:
                            visual demos (the `virt` machine has no
                            default display device). Harmless on X64
                            (q35 already provides GOP).
+  --no-gpu / --headless    Give the guest NO graphics adapter: OVMF
+                           exposes no GOP and axl_gfx_available() is
+                           false. For logic/compute-only test runs —
+                           skips the render pipeline (faster) and
+                           side-steps a false CPU-spike from incidental
+                           full-screen rendering. Mutually exclusive
+                           with --gpu/--screenshot/--display/--gui.
   --gui / --display gtk    Open a GTK window for the guest's GOP
                            framebuffer. Implies --gpu; guest serial
                            stays on this terminal. Rides X11 forwarding
@@ -388,6 +417,18 @@ Options:
   --serial-socket PATH     (background mode) expose serial as a UNIX
                            socket so host scripts can inject input
                            (e.g. Ctrl-C via `printf '\x03' | socat ...`)
+  --workload SHAPE         Declare what shape this run is, which picks the
+                           gate that applies. 'idle' (default) keeps the
+                           CPU-spike check below -- right for an app that
+                           should be sitting at a prompt. 'compute' turns it
+                           off and REQUIRES --max-duration instead: a
+                           compute-bound guest pegs its vCPU from boot to exit,
+                           so the sampler is really measuring run length while
+                           reporting a spike.
+  --max-duration SECS      Fail (exit 9) if the run takes longer than SECS.
+                           A duration signal, reported as such -- it is what
+                           catches an accidental O(n^2) showing up as "the
+                           suite got slower".
   --no-cpu-warn            Disable the CPU-spike check. By default a sampler
                            watches QEMU's host CPU and, if it sustains ≥1.5
                            cores for ≥2 s after the firmware-boot warm-up
@@ -471,6 +512,22 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     # The CPU-spike WARN line would interleave with whatever the user
     # is reading. Disable the sampler unconditionally in interactive.
     CPU_WARN=false
+fi
+
+# --no-gpu: a GOP-less guest cannot also drive a framebuffer. Reject the
+# adapter-requiring modes, mirroring the --interactive/--display guards.
+# Checked on the RAW flags (before the --display block below, so its own
+# X11/$DISPLAY validation can't preempt this with a less-relevant error):
+# --gpu / --display / --gui need a framebuffer; --screenshot has none to read.
+if [[ "$NO_GPU" == "true" ]]; then
+    if [[ "$ENABLE_GPU" == "true" || -n "$DISPLAY_BACKEND" ]]; then
+        echo "ERROR: --no-gpu cannot be combined with --gpu/--display/--gui (they need a framebuffer)" >&2
+        exit 1
+    fi
+    if [[ -n "$SCREENSHOT" ]]; then
+        echo "ERROR: --no-gpu cannot be combined with --screenshot (nothing to capture without a GOP)" >&2
+        exit 1
+    fi
 fi
 
 # --display / --gui: open a graphical window for the guest's GOP
@@ -874,6 +931,29 @@ cp "$FW_VARS" "$TMPDIR/vars.fd"
 # script) gets the same check. cpu_policy_init picks the KVM/TCG-aware threshold +
 # warm-up + warn carve-out (one source of truth, shared with common-test.sh);
 # --cpu-threshold / --no-cpu-warn parsed above still override it.
+# --workload declares the SHAPE of this run, which decides WHICH gate applies.
+# `compute` must never mean "no gate": the duration signal is the only thing
+# the sampler could legitimately see for a compute-bound guest, and it is what
+# catches an accidental O(n^2) surfacing as "the suite got slower". So it
+# requires an explicit budget rather than defaulting to one that would be wrong
+# for every caller.
+case "$WORKLOAD" in
+    idle) ;;
+    compute)
+        if [[ -z "$MAX_DURATION" ]]; then
+            echo "ERROR: --workload compute requires --max-duration SECS" >&2
+            echo "       (it turns the CPU-sustain check off, so the budget is" >&2
+            echo "        what keeps the run gated at all)" >&2
+            exit 2
+        fi
+        CPU_WARN=false   # measuring duration instead -- see duration_summary
+        ;;
+    *)
+        echo "ERROR: --workload must be 'idle' or 'compute' (got '$WORKLOAD')" >&2
+        exit 2
+        ;;
+esac
+
 cpu_policy_init "$ARCH"
 
 
@@ -916,6 +996,18 @@ if [[ "$ENABLE_GPU" == "true" || -n "$SCREENSHOT" ]]; then
             ;;
         AARCH64) CMD+=(-device virtio-gpu-pci) ;;
     esac
+fi
+
+# --no-gpu: give the guest NO graphics adapter so OVMF exposes no GOP
+# (axl_gfx_available() == false). x64's q35 provides a built-in std-VGA by
+# default — that is why a plain run has a GOP — so it must be explicitly
+# disabled with `-vga none`. AARCH64's `virt` has no default display device, so
+# there is nothing to disable (a plain run is already GOP-less). Note this is
+# NOT what -nographic does: -nographic only detaches the HOST display; the guest
+# adapter/GOP stays. Mutually exclusive with --gpu/--screenshot/--display above,
+# so this never collides with the block that adds a device.
+if [[ "$NO_GPU" == "true" && "$ARCH" == "X64" ]]; then
+    CMD+=(-vga none)
 fi
 
 # --sendkey needs a keyboard.  X64's q35 has a PS/2 controller already;
@@ -1353,6 +1445,7 @@ if [[ -n "$SCREENSHOT" ]]; then
     # runs). A short SHOT_WAIT may kill QEMU before the warm-up clears -> no
     # post-warm-up data, so no detection (fail-safe): give the guest enough
     # SHOT_WAIT past the 10-15s warm-up to measure a spike.
+    RUN_START_MS=$(now_ms)   # --max-duration budget clock
     cpu_monitor_start "$QEMU_PID"
 
     # Pre-screenshot settle.  Decoupled from TIMEOUT so a caller can keep a
@@ -1445,6 +1538,12 @@ if [[ -n "$SCREENSHOT" ]]; then
     # did not already fail the run.
     cpu_spike_rc=0
     cpu_monitor_finish || cpu_spike_rc=$?
+    # The duration budget is the compute-shaped run's gate (see --workload).
+    # A spike verdict outranks it only because it is the more specific
+    # diagnosis; either way the run fails with its own distinct code.
+    if [[ "$cpu_spike_rc" == "0" ]]; then
+        duration_summary $(( $(now_ms) - RUN_START_MS )) || cpu_spike_rc=$?
+    fi
 
     if [[ -f "$TMPDIR/screenshot.ppm" ]]; then
         # QEMU's `screendump` always writes PPM. Convert to the format
@@ -1637,6 +1736,7 @@ else
     if [[ "$CPU_WARN" == "true" || "$CPU_REPORT" == "true" ]]; then
         QPID=$(qemu_child_pid "$WRAPPER_PID")
     fi
+    RUN_START_MS=$(now_ms)   # --max-duration budget clock
     cpu_monitor_start "$QPID"
     wait "$WRAPPER_PID" 2>/dev/null || true
 
@@ -1710,5 +1810,11 @@ EOF
     # (exit 1) has taken precedence.
     cpu_spike_rc=0
     cpu_monitor_finish || cpu_spike_rc=$?
+    # The duration budget is the compute-shaped run's gate (see --workload).
+    # A spike verdict outranks it only because it is the more specific
+    # diagnosis; either way the run fails with its own distinct code.
+    if [[ "$cpu_spike_rc" == "0" ]]; then
+        duration_summary $(( $(now_ms) - RUN_START_MS )) || cpu_spike_rc=$?
+    fi
     exit "$cpu_spike_rc"
 fi

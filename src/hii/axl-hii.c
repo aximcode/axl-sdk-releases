@@ -711,7 +711,7 @@ static void
 free_pool(void *p)
 {
     if (p != NULL) {
-        axl_efi_call(axl_bs()->FreePool, 1, p);
+        axl_efi_call(axl_bs()->FreePool, 1, p);  /* axl-pool-direct: ConfigRouting/ConfigAccess output string */
     }
 }
 

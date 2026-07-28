@@ -42,19 +42,23 @@ SHA=$(git rev-parse "${TARGET}^{commit}" 2>/dev/null) || {
 }
 
 # Which workflows must appear AND succeed before we render a verdict.
-# A tag push triggers CI + Release + Docs; their check suites are created
-# at slightly different times, so an early snapshot can contain only the
-# fast/finished ones (e.g. CI+Docs) while Release is still spinning up. If
-# we judged on that snapshot we would declare PASS before Release even
-# registered — exactly what burned the v1.2.0 cut. So we wait until every
-# EXPECTED workflow has a check suite AND none are still running.
+# A MAJOR tag push triggers Release + Docs (a minor/patch tag triggers only
+# Release); CI is NOT triggered by tags — it is dispatched + watched on main
+# BEFORE tagging (see docs/RELEASING.md §4b). Their check suites are created at
+# slightly different times, so an early snapshot can contain only the
+# fast/finished one (e.g. Docs) while Release is still spinning up. If we judged
+# on that snapshot we would declare PASS before Release even registered —
+# exactly what burned the v1.2.0 cut. So we wait until every EXPECTED workflow
+# has a check suite AND none are still running.
 #
-# Non-tag targets (a branch HEAD / bare sha) don't trigger Release, so we
-# only expect CI + Docs there. Override either with EXPECT_WORKFLOWS.
+# The tag default below assumes a MAJOR tag (Release + Docs). For a minor/patch
+# tag (Release only) or any other shape, pass EXPECT_WORKFLOWS — cut-release.sh
+# always does. Non-tag targets (a branch HEAD / bare sha) only see CI if you
+# dispatched it manually.
 if [[ -n "${EXPECT_WORKFLOWS:-}" ]]; then
     read -ra EXPECTED <<< "$EXPECT_WORKFLOWS"
 elif git rev-parse --verify --quiet "refs/tags/$TARGET" >/dev/null 2>&1; then
-    EXPECTED=(CI Release Docs)
+    EXPECTED=(Release Docs)
 else
     EXPECTED=(CI Docs)
 fi

@@ -184,7 +184,7 @@ collect_gcd(size_t *out_n)
     }
     MemIv *iv = axl_calloc(gn ? gn : 1, sizeof(*iv));
     if (iv == NULL) {
-        axl_bs()->FreePool(gmap);
+        axl_bs()->FreePool(gmap);  /* axl-pool-direct: GetMemorySpaceMap result */
         return NULL;
     }
     size_t k = 0;
@@ -198,7 +198,7 @@ collect_gcd(size_t *out_n)
         iv[k].attr = gmap[i].Attributes;
         k++;
     }
-    axl_bs()->FreePool(gmap);   /* firmware-allocated */
+    axl_bs()->FreePool(gmap);   /* firmware-allocated */  /* axl-pool-direct: GetMemorySpaceMap result */
     *out_n = k;
     return iv;
 }
@@ -598,7 +598,7 @@ build_io_regions(void)
         axl_free(iv);
         axl_free(out);
         if (gmap != NULL) {
-            axl_bs()->FreePool(gmap);
+            axl_bs()->FreePool(gmap);  /* axl-pool-direct: GetIoSpaceMap result */
         }
         return AXL_ERR;
     }
@@ -613,7 +613,7 @@ build_io_regions(void)
         k++;
     }
     if (gmap != NULL) {
-        axl_bs()->FreePool(gmap);
+        axl_bs()->FreePool(gmap);  /* axl-pool-direct: GetIoSpaceMap result */
     }
     axl_qsort(iv, k, sizeof(*iv), cmp_ioiv);
 

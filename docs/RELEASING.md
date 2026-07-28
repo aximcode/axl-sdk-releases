@@ -17,10 +17,12 @@ published release. By default it does **not** wait on CI (see the gate below).
 
 ### The gate is LOCAL — run the suite before you cut
 
-**CI is no longer a per-push gate.** `ci.yml` runs only on a **major tag
-(`vX.0.0`)** or a manual `workflow_dispatch` — a rare cross-OS backstop, to keep
-Actions minutes for the runs that matter. The **authoritative pre-release gate
-is the full suite run locally**, which is fast in parallel:
+**CI is no longer a per-push gate, and release tags do NOT trigger it.** `ci.yml`
+runs **only** on a manual `workflow_dispatch` — a rare cross-OS backstop, to keep
+Actions minutes for the runs that matter. (A release tag used to re-run CI on the
+exact commit already validated on `main` — pure duplication, ~38 min for an
+identical result — so that trigger was removed.) The **authoritative pre-release
+gate is the full suite run locally**, which is fast in parallel:
 
 ```sh
 make ARCH=x64 AXL_TLS=1 all tests tools axl-busybox   # one consistent-flag build
@@ -38,11 +40,12 @@ scripts/cut-release.sh X.Y.Z --dry-run  # preview, change nothing
 scripts/cut-release.sh X.Y.Z --ci-gate  # opt back in: wait for a (manually-triggered) CI run
 ```
 
-For a **major** release, trigger CI by hand first (Actions tab →
-`workflow_dispatch`, or it fires on the `vX.0.0` tag) for the fresh-OS backstop;
-`--ci-gate` makes the cut wait on it. The `--ci` flag on the runner excludes the
-`local-only` tests CI runners can't execute (patched-QEMU SMBus, usb-mouse
-pointer) — that's what CI runs.
+Before any release, trigger CI by hand on `main` (Actions tab →
+`workflow_dispatch`, or `gh workflow run ci.yml --ref main`) and watch it green —
+that commit IS the one you will tag, so this is the fresh-OS backstop. The tag no
+longer re-runs it. `--ci-gate` makes the cut dispatch CI on `main` and wait for it
+before tagging. The `--ci` flag on the runner excludes the `local-only` tests CI
+runners can't execute (patched-QEMU SMBus, usb-mouse pointer) — that's what CI runs.
 
 ### GitHub Actions trigger policy
 
@@ -51,14 +54,15 @@ you like — zero Actions minutes. The triggers are baked into the workflow file
 
 | Workflow | What | Triggers on |
 |---|---|---|
-| **ci.yml** | build + QEMU integration + lint | major tag `vX.0.0`, or manual (`workflow_dispatch`) |
+| **ci.yml** | build + QEMU integration + lint | **manual only** (`workflow_dispatch`) — dispatch on `main` before tagging |
 | **docs.yml** | Doxygen/Sphinx → Cloudflare Pages | major tag `vX.0.0`, or manual |
 | **release.yml** | build + publish `.deb`/`.rpm`/tarballs | **every** release tag `v*` (it's the publish step), or manual |
 
-So: a normal push runs nothing; a **patch/minor** release tag runs only
-`release.yml` (publish); a **major** (`vX.0.0`) tag also runs CI + Docs as a
-cross-OS backstop. `cut-release.sh` tells its watcher which to expect, so a
-minor/patch cut doesn't hang waiting for CI/Docs.
+So: a normal push runs nothing; **no** release tag runs CI (it was validated on
+`main` before the cut); a **patch/minor** release tag runs only `release.yml`
+(publish); a **major** (`vX.0.0`) tag also runs `docs.yml`. `cut-release.sh` tells
+its watcher which to expect (major → `Release Docs`, minor/patch → `Release`), so
+a cut never hangs waiting for a workflow that won't run.
 
 **Trigger a chain on demand** ("I specifically want it") — no push required:
 
@@ -96,27 +100,36 @@ a comment explaining its trigger).
   QMP-pointer-injection-capable host the GitHub runners don't provide, e.g.
   `test-input-modifiers-qemu.sh`); run those by hand before a release.
 
-- Both archs build clean against `BUILD=RELEASE`. Use a separate
-  `PREFIX` so the RELEASE-flagged `.o` files don't shadow the
-  in-tree DEBUG cache the integration tests above reuse — the
-  `.o` cache key is the `.c` timestamp only, not the `BUILD`
-  mode, so a same-prefix RELEASE compile leaves `.o` files newer
-  than the `.c` source and a subsequent default `make` reuses
-  them with the wrong flags. Symptom: the
-  `debug: alloc fill 0xDA` test fails (axl-mem.o built without
-  `-DAXL_MEM_DEBUG`). `scripts/install.sh` uses the `-release`
-  prefix internally for the same reason.
+- Both archs build clean against `BUILD=RELEASE`. **Each `BUILD` now gets
+  its own output tree automatically** (`out/native-<arch>-release`), so no
+  `PREFIX` override is needed and the two can coexist.
 
   ```sh
-  make ARCH=x64  BUILD=RELEASE PREFIX=out/native-x64-release
-  make ARCH=aa64 BUILD=RELEASE PREFIX=out/native-aa64-release
+  make ARCH=x64  BUILD=RELEASE
+  make ARCH=aa64 BUILD=RELEASE
   ```
+
+  This used to require a manual `PREFIX=out/native-<arch>-release`, because
+  the `.o` cache key is the `.c` timestamp only, not the `BUILD` mode: a
+  same-prefix RELEASE compile left `.o` files newer than their source, and a
+  subsequent default `make` reused them with the wrong flags. The symptom was
+  the `debug: alloc fill 0xDA` test failing (axl-mem.o built without
+  `-DAXL_MEM_DEBUG`) — a *phantom* regression that cost real debugging time
+  more than once, since `make tests` could not recover it either. Ask make
+  where a configuration's artefacts landed rather than hardcoding the path:
+
+  ```sh
+  make -s ARCH=x64 BUILD=RELEASE print-prefix     # -> out/native-x64-release
+  ```
+
+  `make clean` removes only the current configuration's tree; `make clean-all`
+  wipes every tree under `out/`.
 
 - TLS-enabled build is green if you touched anything in `src/net/`
   (release.yml hardcodes `AXL_TLS=1` for the published packages):
 
   ```sh
-  AXL_TLS=1 make ARCH=x64 BUILD=RELEASE PREFIX=out/native-x64-release
+  AXL_TLS=1 make ARCH=x64 BUILD=RELEASE
   ```
 
 - **clang-tidy is clean locally.** The CI workflow's `lint` job
@@ -236,12 +249,12 @@ release.yml workflow can race and check out the wrong commit.
 > scripts/lint.sh                                       # clang-tidy as CI runs it
 > ```
 
-For a **major** (`vX.0.0`) release you may want the cross-OS CI backstop *before*
-tagging — run `scripts/cut-release.sh X.Y.Z --ci-gate`, which dispatches CI on
-the release commit and waits for green before creating the tag. Without
-`--ci-gate`, the cut tags immediately (the local suite was the gate); for a major
-tag, CI + Docs then run automatically *on the tag* as a post-publish backstop,
-and `cut-release.sh` watches them.
+Get the cross-OS CI backstop *before* tagging — run
+`scripts/cut-release.sh X.Y.Z --ci-gate`, which dispatches CI on `main` (the
+release commit) and waits for green before creating the tag. Without `--ci-gate`,
+the cut tags immediately (the local suite was the gate). CI is **not** re-run by
+the tag; a **major** (`vX.0.0`) tag additionally triggers `docs.yml` as a
+post-publish step, and `cut-release.sh` watches Release (+ Docs on a major).
 
 Why the change: the suite is run locally before every release anyway, so a
 per-push CI gate was redundant cost. The two CI-only failures that burned v1.0.0

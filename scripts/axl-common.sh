@@ -929,6 +929,20 @@ CPU_SPIKE_EXIT="${CPU_SPIKE_EXIT:-8}"   # distinct exit code for a sustained spi
 CPU_WARN="${CPU_WARN:-}"
 CPU_THRESHOLD="${CPU_THRESHOLD:-}"
 
+# Wall-clock budget (seconds; empty = none) and its own exit code, kept
+# DISTINCT from the spike code so a caller can tell the two apart.
+#
+# Why a second signal at all: the sampler asks "is the guest holding
+# >=CPU_THRESHOLD cores past the warm-up". For an IDLE-shaped run -- an app that
+# should be sitting at a prompt -- that is a real spike detector, and it has
+# earned its keep. For a COMPUTE-shaped run it is not: a 1-vCPU KVM guest tops
+# out ~1.05 cores and a compute-bound binary holds that from boot to exit, so
+# the only free variable is how LONG the run is. It reports a spike while
+# measuring duration, and it fires on axl-sdk's own unit suite every x64 run.
+# So `--workload compute` swaps it for this: measure duration, say duration.
+MAX_DURATION="${MAX_DURATION:-}"
+DURATION_EXIT="${DURATION_EXIT:-9}"
+
 # CPU-spike sampler. Runs alongside QEMU sampling /proc/<pid>/stat
 # at 5 Hz after a warm-up window (firmware boot legitimately spins
 # while it walks PCI / loads drivers). Tracks peak host-CPU
@@ -1081,6 +1095,24 @@ qemu_child_pid() {
     done
     printf '%s' "$pid"
 }
+
+# duration_summary <elapsed_ms> -- enforce MAX_DURATION, if one is set.
+# Returns DURATION_EXIT on a breach so the caller can surface it as the run's
+# status, exactly as cpu_summary does for a spike. No budget set = no-op.
+duration_summary() {
+    local elapsed_ms="${1:-0}"
+    [[ -z "$MAX_DURATION" ]] && return 0
+    local budget_ms=$((MAX_DURATION * 1000))
+    if (( elapsed_ms > budget_ms )); then
+        printf "FAIL: duration budget exceeded - ran %d.%03ds (budget %ss)\n" \
+            $((elapsed_ms / 1000)) $((elapsed_ms % 1000)) "$MAX_DURATION" >&2
+        return "$DURATION_EXIT"
+    fi
+    return 0
+}
+
+# Milliseconds since the epoch, for the duration budget.
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
 # Start the background CPU sampler against a running QEMU pid. No-op (leaves the
 # globals empty) when both warn and report are off, or the pid is empty.

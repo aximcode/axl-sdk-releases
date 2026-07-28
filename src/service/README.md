@@ -131,6 +131,18 @@ complete deploy descriptor. Note `override_name` does NOT solve this: it substit
 a *name* into the same search, so it cannot separate two files that
 share a name.
 
+For the opposite deployment — "ship as one binary, never touch disk" —
+set `.embedded_only` instead: it loads the embedded `driver_blob`
+directly (via `axl_driver_ensure_embedded_only`) and skips the search
+entirely, so the stale-sibling shadow above can't happen from the disk
+side. It requires `driver_blob`/`driver_blob_len` (`driver_name` only
+names the loaded image) and is mutually exclusive with `driver_path`
+(setting both returns `AXL_ERR`):
+
+```c
+d.embedded_only = true;   /* use the baked-in blob, no disk search */
+```
+
 The symmetric stop verb is `axl_service_stop(&deploy)` — resolves
 the running image's handle via the protocol GUID and unloads it.
 `AXL_SERVICE_DRIVER` publishes the GUID on the driver image's own

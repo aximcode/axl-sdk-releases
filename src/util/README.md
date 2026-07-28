@@ -743,6 +743,17 @@ cover this: it substitutes a *name* into the same search, so it cannot
 separate two files that share a name.) `AxlServiceDeploy.driver_path`
 is the AxlService-level form of the same thing.
 
+`axl_driver_ensure_embedded_only` closes the same hazard from the other
+side: it loads the caller's **embedded blob directly**, with no disk
+search at all (short-circuiting on an already-registered protocol first,
+like the others). Reach for it in the "ship as one binary, never touch
+disk" model — the default search looks at `<image_dir>/<name>` first, so
+a stale loose driver an older install left beside the launcher would
+otherwise run in place of the newer image baked into the binary.
+`AxlServiceDeploy.embedded_only` is its AxlService-level form; it is
+mutually exclusive with `driver_path` (one skips disk for the blob, the
+other pins an exact disk file).
+
 For a launcher that must pair with an exact, version-pinned driver
 staged beside it (no fallback to `drivers/`, no cross-volume search),
 use `axl_shared_driver_locate_sibling` instead — see

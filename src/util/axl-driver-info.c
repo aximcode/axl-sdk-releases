@@ -122,9 +122,9 @@ controller_managed_by(EFI_HANDLE controller, EFI_HANDLE driver)
                 break;
             }
         }
-        axl_bs()->FreePool(info);
+        axl_bs()->FreePool(info);  /* axl-pool-direct: OpenProtocolInformation result */
     }
-    axl_bs()->FreePool(protos);
+    axl_bs()->FreePool(protos);  /* axl-pool-direct: ProtocolsPerHandle result */
     return managed;
 }
 
@@ -209,7 +209,7 @@ collect_unbound_nics(EFI_HANDLE *out, UINTN cap)
             out[found++] = hs[i];
         }
     }
-    axl_bs()->FreePool(hs);
+    axl_bs()->FreePool(hs);  /* axl-pool-direct: LocateHandleBuffer result */
     return found;
 }
 
@@ -303,9 +303,9 @@ axl_driver_list_loaded(AxlDriverInfo *out, size_t cap, size_t *count)
     }
 
     if (handles != NULL) {
-        axl_bs()->FreePool(handles);
+        axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     }
-    axl_bs()->FreePool(drivers);
+    axl_bs()->FreePool(drivers);  /* axl-pool-direct: LocateHandleBuffer result */
     return AXL_OK;
 }
 
@@ -371,9 +371,9 @@ controller_driver(EFI_HANDLE controller)
                 break;
             }
         }
-        axl_bs()->FreePool(info);
+        axl_bs()->FreePool(info);  /* axl-pool-direct: OpenProtocolInformation result */
     }
-    axl_bs()->FreePool(protos);
+    axl_bs()->FreePool(protos);  /* axl-pool-direct: ProtocolsPerHandle result */
     return drv;
 }
 
@@ -412,7 +412,7 @@ axl_pci_to_handle(AxlPciAddr addr, AxlHandle *out)
             break;
         }
     }
-    axl_bs()->FreePool(hs);
+    axl_bs()->FreePool(hs);  /* axl-pool-direct: LocateHandleBuffer result */
     return rc;
 }
 
@@ -517,7 +517,7 @@ axl_handle_list(const AxlGuid *protocol, AxlHandle *out, size_t cap,
         out[i] = (AxlHandle)hs[i];
     }
     *count = (size_t)nh;
-    axl_bs()->FreePool(hs);
+    axl_bs()->FreePool(hs);  /* axl-pool-direct: LocateHandleBuffer result */
     return AXL_OK;
 }
 
@@ -543,7 +543,7 @@ axl_handle_protocols(AxlHandle h, AxlGuid *out, size_t cap, size_t *count)
         axl_memcpy(&out[i], protos[i], sizeof(AxlGuid));
     }
     *count = (size_t)nproto;
-    axl_bs()->FreePool(protos);
+    axl_bs()->FreePool(protos);  /* axl-pool-direct: ProtocolsPerHandle result */
     return AXL_OK;
 }
 
@@ -656,9 +656,9 @@ collect_open_info(EFI_HANDLE controller, uint32_t attr_mask,
             }
             distinct++;
         }
-        axl_bs()->FreePool(info);
+        axl_bs()->FreePool(info);  /* axl-pool-direct: OpenProtocolInformation result */
     }
-    axl_bs()->FreePool(protos);
+    axl_bs()->FreePool(protos);  /* axl-pool-direct: ProtocolsPerHandle result */
     *count = distinct;
     return AXL_OK;
 }
@@ -757,9 +757,9 @@ handle_produces_child(EFI_HANDLE parent, EFI_HANDLE child)
                 break;
             }
         }
-        axl_bs()->FreePool(info);
+        axl_bs()->FreePool(info);  /* axl-pool-direct: OpenProtocolInformation result */
     }
-    axl_bs()->FreePool(protos);
+    axl_bs()->FreePool(protos);  /* axl-pool-direct: ProtocolsPerHandle result */
     return found;
 }
 
@@ -795,7 +795,7 @@ axl_handle_parents(AxlHandle controller, AxlHandle *out, size_t cap,
         }
         distinct++;
     }
-    axl_bs()->FreePool(hs);
+    axl_bs()->FreePool(hs);  /* axl-pool-direct: LocateHandleBuffer result */
     *count = distinct;
     return AXL_OK;
 }

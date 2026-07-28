@@ -467,17 +467,31 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
     if (deploy == NULL || deploy->service == NULL) {
         return AXL_ERR;
     }
-    /* Both of these serve the default resolution only: driver_name is the
-       filename the 4-path search looks for, and the blob is that search's
-       fallback. A pinned driver_path does neither, so neither field is read
-       on that branch and neither is required there. Requiring them anyway
-       would be a rule the code does not actually enforce a use for. */
-    if (deploy->driver_path == NULL
-        && (deploy->driver_name == NULL
-            || deploy->driver_blob == NULL
-            || deploy->driver_blob_len == 0))
-    {
+    /* embedded_only ("skip disk, use the blob") and driver_path ("use exactly
+       this disk file") are contradictory — fail fast on the misconfiguration
+       rather than silently honoring one. */
+    if (deploy->embedded_only && deploy->driver_path != NULL) {
+        axl_warning("service '%s': embedded_only and driver_path are mutually "
+                    "exclusive",
+                    deploy->service->name != NULL ? deploy->service->name
+                                                  : "(unnamed)");
         return AXL_ERR;
+    }
+    /* Required fields depend on the route. driver_name is the filename the
+       4-path search looks for and the blob is that search's fallback — so:
+         - pinned driver_path reads neither (both unrequired);
+         - embedded_only reads the blob directly (driver_name only names the
+           loaded image), so the blob is required but driver_name is not;
+         - the default search+embedded resolution needs both driver_name and
+           the blob. */
+    if (deploy->driver_path == NULL) {
+        bool need_name = !deploy->embedded_only;
+        if ((need_name && deploy->driver_name == NULL)
+            || deploy->driver_blob == NULL
+            || deploy->driver_blob_len == 0)
+        {
+            return AXL_ERR;
+        }
     }
 
     const AxlService *svc = deploy->service;
@@ -526,6 +540,18 @@ axl_service_start_embedded(const AxlServiceDeploy *deploy)
         return axl_driver_ensure_from_path(
             &svc_guid,
             deploy->driver_path,
+            load_opts_len > 0 ? load_opts : NULL,
+            load_opts_len);
+    }
+
+    /* Embedded-only: load the baked-in blob directly, skipping the disk search
+       so a stale loose <driver_name> beside the launcher cannot shadow it. */
+    if (deploy->embedded_only) {
+        return axl_driver_ensure_embedded_only(
+            &svc_guid,
+            deploy->driver_blob,
+            deploy->driver_blob_len,
+            deploy->driver_name,
             load_opts_len > 0 ? load_opts : NULL,
             load_opts_len);
     }

@@ -38,10 +38,11 @@ VERSION=""
 DRY_RUN=false
 ASSUME_YES=false
 RESUME=false
-CI_GATE=false   # CI now runs only on vX.0.0 tags / workflow_dispatch, NOT on
-                # every push, so the release gate is the LOCAL suite (see
-                # docs/RELEASING.md). --ci-gate opts back into waiting for a CI
-                # run on the release commit (e.g. one you triggered manually).
+CI_GATE=false   # CI runs only via workflow_dispatch (NOT on push, NOT on
+                # release tags), so the release gate is the LOCAL suite plus a
+                # manual CI dispatch on main watched green before tagging (see
+                # docs/RELEASING.md §4b). --ci-gate makes this script dispatch
+                # ci.yml on main and wait for it green before it tags.
 RELEASES_REPO="aximcode/axl-sdk-releases"
 
 for arg in "$@"; do
@@ -160,11 +161,12 @@ tag_and_publish() {
     git tag -a "$TAG" -m "$(make_tag_message)"
     git push origin "$TAG"
 
-    # CI + Docs trigger only on a MAJOR tag (vX.0.0); every release tag triggers
-    # Release. Tell the watcher which to expect so a minor/patch cut doesn't hang
-    # waiting for CI/Docs that never run.
+    # Docs triggers only on a MAJOR tag (vX.0.0); every release tag triggers
+    # Release. CI is NOT triggered by tags at all (it was pre-validated on main
+    # before this cut). Tell the watcher which to expect so it doesn't hang
+    # waiting for a workflow that never runs.
     local expect="Release"
-    [[ "$VERSION" =~ ^[0-9]+\.0\.0$ ]] && expect="CI Release Docs"
+    [[ "$VERSION" =~ ^[0-9]+\.0\.0$ ]] && expect="Release Docs"
     say "Watching $expect for $TAG"
     if ! EXPECT_WORKFLOWS="$expect" scripts/watch-release-runs.sh "$TAG"; then
         die "a release workflow did not succeed — see the output above and 'gh run list'"

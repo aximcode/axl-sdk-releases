@@ -3,6 +3,119 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.1.0 — 2026-07-27
+
+### Added
+
+- **`axl_gfx_buffer_fill_rect`** (`<axl/axl-gfx-surface.h>`) — a raw,
+  non-compositing rect fill on an off-screen buffer. Every *drawing*
+  primitive composites source-over onto a destination treated as opaque,
+  forcing the result's alpha to `0xFF`, so `axl_gfx_fill_rect` cannot lay
+  down a **translucent** value — a see-through veil written through it stops
+  being see-through. The only raw writer, `axl_gfx_buffer_clear`, is
+  whole-buffer. Consumers were hand-rolling a row loop over
+  `axl_gfx_buffer_pixels`. Like the rest of the `axl_gfx_buffer_*` family it
+  honors **no ambient graphics state** (not the clip stack, not the blend
+  mode, not the gamma flag) and behaves the same whether or not the buffer is
+  the current draw target; intersect with `axl_gfx_get_clip` yourself if you
+  want clipping. `axl_gfx_buffer_clear` is now its full-extent case.
+- **`AxlServiceDeploy.embedded_only`** + **`axl_driver_ensure_embedded_only`**
+  — load the embedded driver blob directly, skipping the disk search. The
+  embedded-side mirror of `axl_driver_ensure_from_path`, for a service that
+  ships its driver in-image and must not bind a stale copy found on disk.
+- **`run-qemu.sh --no-gpu`** (alias `--headless`) — start the guest with no
+  graphics adapter, so the firmware exposes no GOP and `axl_gfx_available()`
+  is false. A logic-only test then renders nothing at all, which is the fix
+  for a compute-bound test binary tripping the CPU gate by way of an
+  incidental full-screen render.
+- **`run-qemu.sh --workload idle|compute` + `--max-duration SECS`** — declare
+  the SHAPE of a run so the right gate applies. On a 1-vCPU KVM guest topping
+  out ~1.05 cores, a compute-bound binary holds the CPU threshold from boot to
+  exit, so the spike sampler is really measuring run *length* while reporting
+  a spike. `compute` turns the sustain check off and **requires** a wall-clock
+  budget instead — it can never mean "no gate" — failing with its own exit
+  code (9) and a message that says duration.
+
+### Changed
+
+- **A full-screen backdrop blur is ~3.7x faster** (1280x800, radius 12:
+  20.9 ms -> 5.6 ms, x64 under KVM). Three bit-exact changes, all validated
+  against the independent tent oracle in `gfx-simd-selftest.c`: the per-pixel
+  round-and-divide was **four int64 divisions per output pixel** — `div =
+  (radius+1)²` is a runtime value the compiler cannot strength-reduce, and it
+  was ~60% of the blur — now an exact Granlund-Montgomery multiply-shift
+  reciprocal; the second axis pass no longer strides down columns (one useful
+  pixel per cache line) but runs as a tiled transpose plus another unit-stride
+  row pass; and the row pass is SIMD-dispatched (SSE4.1 / NEON) over the four
+  BGRA channels. Note for anyone extending it: a running sum is *serial* along
+  the pass axis, so neighbouring pixels cannot be vectorised and AVX2 buys
+  nothing without restructuring to run several rows in lockstep.
+- **`axl_gfx_buffer_blur` is radius-independent** — O(w*h) per pass instead of
+  O(w*h*r), by factoring the tent kernel into two running-sum box passes. The
+  intermediate is carried at full precision, so the output is byte-identical
+  to the previous kernel. A large-radius veil now costs the same per pixel as
+  a small one.
+- **A change under a backdrop-blur veil re-blurs only its blur halo, not the
+  whole veil** (compositor E10). A blur is a bounded neighbourhood read: a
+  backdrop change moves the frost only within `radius`, and computing that
+  exactly needs raw backdrop only within `2*radius`. The present recomposites
+  that halo, writes back only the part the blur got exact, and restores the
+  collateral it painted over but did not change — so the frame is
+  byte-identical to a full re-blur. Measured: a 12x18 caret under a
+  full-screen 1280x800 veil went from **31.6 ms to 0.07 ms per present**. The
+  plan is declined, falling back to the whole-veil repaint, wherever it cannot
+  be proven equivalent: veils overlapping each other, a veil whose blit is
+  split by an opaque surface in front of it, more than 8 veils, an
+  OOM-degraded region, or any allocation failure.
+
+  > **Consumer note:** an opaque surface stacked in front of a veil (a modal
+  > dialog's card) splits the veil's blit and declines the fast path. Leaving
+  > that card non-opaque is measured at 116 µs/present versus 15614 µs with
+  > `axl_surface_set_opaque(true)`. The cost of doing so is one extra clipped
+  > blit of an already-composited surface.
+
+### Fixed
+
+- **A driver whose `DriverEntry` returned an error corrupted the DXE pool and
+  hung the machine** — a silent 100%-CPU spin on RELEASE, an `ASSERT
+  [DxeCore] Pool.c` on DEBUG. For a buffer-loaded image AXL synthesizes a
+  device path and tracks it in a private per-handle record; EDK2's
+  `CoreStartImage` auto-unloads an image whose entry point failed, freeing
+  `Image->Info.FilePath` — the same block — so cleanup freed it a second time.
+  Cleanup is now liveness-aware: it probes `EFI_LOADED_IMAGE_PROTOCOL`, which
+  the firmware's auto-unload reliably uninstalls, and skips only the block the
+  firmware already freed (it does **not** free the synthesized device path,
+  which the firmware leaves alone — skipping that would leak it and orphan the
+  handle on every failed start).
+- **`axl_driver_unload` no longer reports success for a handle that is not an
+  image.** "No `LOADED_IMAGE` on this handle" is ambiguous — it means both
+  "the firmware already auto-unloaded it" and "this was never an image" — and
+  returning `AXL_OK` for the second claims an unload that never happened. The
+  two are now distinguished by status: a destroyed handle answers
+  `EFI_INVALID_PARAMETER` (nothing to do), a live non-image handle answers
+  `EFI_UNSUPPORTED` (let `UnloadImage` run and surface the real failure).
+
+### Build
+
+- **Each `BUILD` gets its own output tree.** Objects are flag-dependent and
+  make cannot tell that a `.o` was compiled with different `CFLAGS` — the
+  cache key is the `.c` timestamp alone — so a `BUILD=RELEASE` compile left
+  objects newer than their sources and the next default `make` reused them
+  with the wrong flags. The symptom was a *phantom* test failure (`debug:
+  alloc fill 0xDA`, a DEBUG-only poison test running against a RELEASE
+  library) that `make tests` could not clear; only `make clean` did. `DEBUG`
+  keeps the historical `out/native-<arch>`, so nothing that names it changes;
+  anything else gets `out/native-<arch>-<build>` and the two coexist. New:
+  `make print-prefix` reports a configuration's directory (so callers stop
+  hardcoding it) and `make clean-all` wipes every tree.
+- **CI no longer re-runs on a release tag** — it was validated on `main`
+  before the cut, so the tag re-ran an identical ~38-minute matrix for an
+  identical result. Release tags run the publish workflow (and Docs on a
+  major); dispatch CI by hand on `main` before tagging.
+- Internal dogfooding gate: `axl_malloc` is the default allocator throughout
+  the library, and the remaining raw firmware-pool calls carry an explicit
+  `axl-pool-direct` marker so new ones cannot slip in unnoticed.
+
 ## 3.0.0 — 2026-07-25
 
 > **Consumers must fully REBUILD against this release, not relink.** Two of

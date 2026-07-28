@@ -106,6 +106,45 @@ axl_gfx_buffer_get_info(
 }
 
 int
+axl_gfx_buffer_fill_rect(
+    AxlGfxBuffer  *buf,
+    int32_t        x,
+    int32_t        y,
+    uint32_t       w,
+    uint32_t       h,
+    AxlGfxPixel    color
+    )
+{
+    if (buf == NULL) {
+        return AXL_ERR;
+    }
+    if (w == 0 || h == 0) {
+        return AXL_OK;                      /* empty extent: nothing to write */
+    }
+    /* Clamp to the buffer in int64 so a huge extent or a very negative
+       origin cannot wrap on the way in. */
+    int64_t x0 = x, y0 = y;
+    int64_t x1 = (int64_t)x + (int64_t)w;   /* half-open */
+    int64_t y1 = (int64_t)y + (int64_t)h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > (int64_t)buf->w) { x1 = (int64_t)buf->w; }
+    if (y1 > (int64_t)buf->h) { y1 = (int64_t)buf->h; }
+    if (x1 <= x0 || y1 <= y0) {
+        return AXL_OK;                      /* fully outside: nothing to write */
+    }
+    /* Raw stores — no clip, no blend mode, no gamma: the whole point is
+       that the caller's exact pixel value lands, alpha included. */
+    for (int64_t row = y0; row < y1; row++) {
+        AxlGfxPixel *p = &buf->pixels[(size_t)row * buf->w + (size_t)x0];
+        for (int64_t col = x0; col < x1; col++) {
+            *p++ = color;
+        }
+    }
+    return AXL_OK;
+}
+
+int
 axl_gfx_buffer_clear(
     AxlGfxBuffer  *buf,
     AxlGfxPixel    color
@@ -114,11 +153,7 @@ axl_gfx_buffer_clear(
     if (buf == NULL) {
         return AXL_ERR;
     }
-    size_t n = (size_t)buf->w * buf->h;
-    for (size_t i = 0; i < n; i++) {
-        buf->pixels[i] = color;
-    }
-    return AXL_OK;
+    return axl_gfx_buffer_fill_rect(buf, 0, 0, buf->w, buf->h, color);
 }
 
 AxlGfxPixel *
@@ -1784,7 +1819,7 @@ axl_gfx_query_mode(
     out->stride = mi->PixelsPerScanLine;
 
     /* QueryMode allocates the info via AllocatePool; the caller owns it. */
-    axl_bs()->FreePool(mi);
+    axl_bs()->FreePool(mi);  /* axl-pool-direct: GOP QueryMode info buffer */
     return AXL_OK;
 }
 

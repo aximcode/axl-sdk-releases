@@ -567,6 +567,177 @@ test_buffer_clear_null_safe(void)
                "buffer_clear(NULL): returns AXL_ERR");
 }
 
+/* --- axl_gfx_buffer_fill_rect: raw, non-compositing, no ambient state --- */
+
+/* Paint the whole buffer a known sentinel so any stray write shows up. */
+static void
+fill_rect_seed(AxlGfxBuffer *b, uint32_t w, uint32_t h)
+{
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    for (uint32_t i = 0; i < w * h; i++) {
+        p[i] = (AxlGfxPixel){0x11, 0x22, 0x33, 0x44};
+    }
+}
+
+static bool
+fill_rect_is_seed(const AxlGfxPixel *p)
+{
+    return p->blue == 0x11 && p->green == 0x22 && p->red == 0x33 && p->alpha == 0x44;
+}
+
+/* Count pixels differing from the sentinel — an unclamped implementation
+   scribbles outside the intended rect, and a count catches that where a
+   single probe would not. */
+static uint32_t
+fill_rect_touched(AxlGfxBuffer *b, uint32_t w, uint32_t h)
+{
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < w * h; i++) {
+        if (!fill_rect_is_seed(&p[i])) { n++; }
+    }
+    return n;
+}
+
+static void
+test_buffer_fill_rect_exact_alpha(void)
+{
+    /* THE reason this primitive exists: a translucent value must survive
+       verbatim. Every drawing primitive composites source-over onto a
+       destination treated as opaque, forcing alpha to 0xFF. */
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  veil = {0x10, 0x20, 0x30, 0x80};   /* half-transparent */
+    fill_rect_seed(b, 8, 4);
+    test_check(axl_gfx_buffer_fill_rect(b, 2, 1, 3, 2, veil) == AXL_OK,
+               "buffer_fill_rect: returns AXL_OK");
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    bool exact = true;
+    for (uint32_t y = 1; y < 3 && exact; y++) {
+        for (uint32_t x = 2; x < 5; x++) {
+            AxlGfxPixel q = p[y * 8 + x];
+            if (q.blue != 0x10 || q.green != 0x20 || q.red != 0x30 || q.alpha != 0x80) {
+                exact = false;
+                break;
+            }
+        }
+    }
+    test_check(exact, "buffer_fill_rect: writes the exact value, alpha 0x80 preserved");
+    test_check(fill_rect_touched(b, 8, 4) == 6,
+               "buffer_fill_rect: touches exactly the 3x2 rect (6 px)");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_clamps_negative_origin(void)
+{
+    /* A negative origin must clamp, not index before the buffer. */
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  c = {0x01, 0x02, 0x03, 0x04};
+    fill_rect_seed(b, 8, 4);
+    test_check(axl_gfx_buffer_fill_rect(b, -2, -1, 4, 3, c) == AXL_OK,
+               "buffer_fill_rect: negative origin returns AXL_OK");
+    /* Visible part is x 0..1, y 0..1 = 4 px. */
+    test_check(fill_rect_touched(b, 8, 4) == 4,
+               "buffer_fill_rect: negative origin clamps to 4 px, no underflow");
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    test_check(p[0].alpha == 0x04 && fill_rect_is_seed(&p[2]),
+               "buffer_fill_rect: negative origin fills from 0 and stops at the clamp");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_clamps_oversized(void)
+{
+    /* Wider AND taller than the buffer: fills all of it, writes nothing past. */
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  c = {0x09, 0x08, 0x07, 0x06};
+    fill_rect_seed(b, 8, 4);
+    test_check(axl_gfx_buffer_fill_rect(b, 6, 3, 100, 100, c) == AXL_OK,
+               "buffer_fill_rect: oversized extent returns AXL_OK");
+    test_check(fill_rect_touched(b, 8, 4) == 2,
+               "buffer_fill_rect: oversized extent clamps to the 2 px in range");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_noop_cases(void)
+{
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  c = {0xAA, 0xBB, 0xCC, 0xDD};
+    fill_rect_seed(b, 8, 4);
+    test_check(axl_gfx_buffer_fill_rect(b, 1, 1, 0, 3, c) == AXL_OK
+               && fill_rect_touched(b, 8, 4) == 0,
+               "buffer_fill_rect: zero width writes nothing");
+    test_check(axl_gfx_buffer_fill_rect(b, 1, 1, 3, 0, c) == AXL_OK
+               && fill_rect_touched(b, 8, 4) == 0,
+               "buffer_fill_rect: zero height writes nothing");
+    test_check(axl_gfx_buffer_fill_rect(b, 20, 20, 4, 4, c) == AXL_OK
+               && fill_rect_touched(b, 8, 4) == 0,
+               "buffer_fill_rect: rect fully outside writes nothing");
+    test_check(axl_gfx_buffer_fill_rect(b, -9, -9, 4, 4, c) == AXL_OK
+               && fill_rect_touched(b, 8, 4) == 0,
+               "buffer_fill_rect: rect fully before the origin writes nothing");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_matches_clear(void)
+{
+    /* A full-extent fill must be byte-identical to buffer_clear — true by
+       construction once clear is implemented on top of it. */
+    AxlGfxBuffer *a = axl_gfx_buffer_new(8, 4);
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  c = {0x12, 0x34, 0x56, 0x78};
+    axl_gfx_buffer_clear(a, c);
+    axl_gfx_buffer_fill_rect(b, 0, 0, 8, 4, c);
+    test_check(axl_memcmp(axl_gfx_buffer_pixels(a), axl_gfx_buffer_pixels(b),
+                          (size_t)8 * 4 * sizeof(AxlGfxPixel)) == 0,
+               "buffer_fill_rect: full extent is byte-identical to buffer_clear");
+    axl_gfx_buffer_free(a);
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_ignores_ambient_state(void)
+{
+    /* The design decision this pins: a buffer_* op honors NO ambient
+       graphics state, even when the buffer IS the current draw target.
+       A clip that would exclude the rect, a blend mode that would alter
+       the value, and the gamma flag must all be inert here. */
+    AxlGfxBuffer *b = axl_gfx_buffer_new(8, 4);
+    AxlGfxPixel  c = {0x40, 0x50, 0x60, 0x70};
+    fill_rect_seed(b, 8, 4);
+    axl_gfx_target_buffer(b);
+    axl_gfx_push_clip((AxlGfxClip){.x = 0, .y = 0, .w = 1, .h = 1});  /* excludes the rect */
+    axl_gfx_set_blend_mode(AXL_GFX_BLEND_MULTIPLY);
+    bool prev_gamma = axl_gfx_get_gamma_correct();
+    axl_gfx_set_gamma_correct(true);
+
+    int rc = axl_gfx_buffer_fill_rect(b, 4, 2, 2, 2, c);
+
+    axl_gfx_set_gamma_correct(prev_gamma);
+    axl_gfx_set_blend_mode(AXL_GFX_BLEND_OVER);
+    axl_gfx_pop_clip();
+    axl_gfx_target_buffer(NULL);
+
+    AxlGfxPixel *p = axl_gfx_buffer_pixels(b);
+    AxlGfxPixel  q = p[2 * 8 + 4];
+    test_check(rc == AXL_OK && q.blue == 0x40 && q.green == 0x50
+               && q.red == 0x60 && q.alpha == 0x70,
+               "buffer_fill_rect: ignores clip, blend mode and gamma");
+    test_check(fill_rect_touched(b, 8, 4) == 4,
+               "buffer_fill_rect: fills the whole rect despite an excluding clip");
+    axl_gfx_buffer_free(b);
+}
+
+static void
+test_buffer_fill_rect_null_safe(void)
+{
+    AxlGfxPixel  c = {0x01, 0x02, 0x03, 0x04};
+    test_check(axl_gfx_buffer_fill_rect(NULL, 0, 0, 1, 1, c) == AXL_ERR,
+               "buffer_fill_rect(NULL): returns AXL_ERR");
+}
+
 static void
 test_buffer_pixels_null_safe(void)
 {
@@ -6291,6 +6462,13 @@ test_gfx_main(
     test_buffer_get_info_null_safe();
     test_buffer_clear_fills_all_pixels();
     test_buffer_clear_null_safe();
+    test_buffer_fill_rect_exact_alpha();
+    test_buffer_fill_rect_clamps_negative_origin();
+    test_buffer_fill_rect_clamps_oversized();
+    test_buffer_fill_rect_noop_cases();
+    test_buffer_fill_rect_matches_clear();
+    test_buffer_fill_rect_ignores_ambient_state();
+    test_buffer_fill_rect_null_safe();
     test_buffer_pixels_null_safe();
     test_buffer_pixels_writable();
     test_target_buffer_redirects_fill();

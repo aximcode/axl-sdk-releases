@@ -429,7 +429,7 @@ axl_input_locate_physical_pointer(EFI_GUID *guid)
                use the first (the aggregator). */
             axl_bs()->HandleProtocol(handles[0], guid, &iface);
         }
-        axl_bs()->FreePool(handles);
+        axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     }
     if (iface == NULL) {
         /* LocateHandleBuffer failed outright — last resort. */
@@ -474,7 +474,7 @@ collect_pointers(EFI_GUID *guid, EFI_HANDLE *out, int max)
                 out[n++] = handles[i];
             }
         }
-        axl_bs()->FreePool(handles);
+        axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     }
     return n;
 }
@@ -597,7 +597,7 @@ probe_one_protocol(EFI_GUID *guid, const char *name, bool absolute,
     EFI_STATUS chp = axl_bs()->HandleProtocol(con_in, guid, &cin);
     probe_emit(buf, cap, len, "  ConsoleInHandle %s: %s\n", name,
                (chp == 0 && cin) ? "PRESENT (multiplexed here)" : "absent");
-    axl_bs()->FreePool(handles);
+    axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 }
 
 void

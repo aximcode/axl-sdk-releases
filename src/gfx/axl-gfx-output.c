@@ -175,7 +175,7 @@ axl_gfx_output_query_mode(
     }
 
     /* QueryMode allocates the info via AllocatePool; the caller owns it. */
-    axl_bs()->FreePool(mi);
+    axl_bs()->FreePool(mi);  /* axl-pool-direct: GOP QueryMode info buffer */
     if (!ok) {
         return AXL_ERR;
     }

@@ -377,7 +377,7 @@ axl_device_path_to_text(const void *device_path)
         return NULL;
     }
     char *utf8 = axl_ucs2_to_utf8(text);
-    axl_bs()->FreePool(text);
+    axl_bs()->FreePool(text);  /* axl-pool-direct: ConvertDevicePathToText result */
     return utf8;
 }
 

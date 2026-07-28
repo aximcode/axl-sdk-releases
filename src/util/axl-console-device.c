@@ -655,7 +655,7 @@ evict_other_conout_devices(AxlConsoleDevice *d)
             }
         }
     }
-    gBS->FreePool(handles);
+    gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 }
 
 /* Re-tag the handles we evicted and reconnect them, so ConSplitter re-adds the
@@ -771,7 +771,7 @@ evict_other_conin_devices(AxlConsoleDevice *d)
             }
         }
     }
-    gBS->FreePool(handles);
+    gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 }
 
 /* Re-tag + reconnect the evicted keyboards — the inverse of eviction, so
@@ -863,7 +863,7 @@ evict_pointer_devices(AxlConsoleDevice *d)
             evict_one_pointer_handle(d, handles[i]);
         }
     }
-    gBS->FreePool(handles);
+    gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 }
 
 /* Reinstall every cached pointer interface, so a guest that starts after teardown

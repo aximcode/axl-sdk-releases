@@ -18,6 +18,7 @@
 #include <axl/axl-cursor.h>
 #include <axl/axl-ntree.h>
 #include <axl/axl-input.h>
+#include <axl/axl-log.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-time.h>
 #include <axl/axl-mem.h>
@@ -93,6 +94,13 @@ struct AxlCompositor {
                                // a surface spanning N damage rects counts N times)
     uint32_t       occ_passes; // occlusion builds in the last composite/present
                                // (1 per present after the once-per-present hoist)
+    bool           blur_partial; // E10: this paint is a partial re-blur present,
+                                 // so a backdrop blur writes back only the part
+                                 // of its rect it got exact and the present
+                                 // restores the rest (see axl_compositor_present)
+    bool           blur_failed;  // E10: a backdrop blur could not allocate during
+                                 // this paint, so part of the frame is un-frosted
+                                 // and the present must put the snapshot back
 
     // --- C4: the seat (one wl_seat embedded in the compositor) ---
     int32_t        ptr_x, ptr_y;   // pointer position in output coords
@@ -121,6 +129,8 @@ struct AxlCompositor {
     uint32_t       frame_interval;   // tick period in ms
     AxlSourceId    frame_timer;      // loop source id (0 = not armed)
 };
+
+AXL_LOG_DOMAIN("compositor");
 
 #define SURF(ntnode) ((AxlSurface *)(ntnode)->data)
 
@@ -627,32 +637,113 @@ blur_cache_drop(AxlSurface *s)
     s->blur_cache_h   = 0;
 }
 
+// The radius axl_gfx_buffer_blur will actually use on a @w x @h buffer: it
+// clamps the radius to the buffer's larger side (past that, clamp-to-edge
+// sampling makes a bigger radius meaningless). Both E10 rect calculations have
+// to mirror it — and note they mirror it for DIFFERENT buffers: the halo for
+// the veil-sized one, `blur_valid_rect` for the sub-rect actually blurred.
+static uint32_t
+blur_clamped_radius(uint32_t w, uint32_t h, uint32_t radius)
+{
+    uint32_t maxd = (w > h) ? w : h;
+    return (radius > maxd) ? maxd : radius;
+}
+
+// Copy @sub — a sub-rect of @src_rect — from the packed scratch @src (laid out
+// as @src_rect, one row of src_rect.w pixels at a time) into the output at the
+// same absolute coords.
+static void
+blit_scratch(AxlCompositor *c, const AxlGfxPixel *src, AxlGfxClip src_rect,
+             AxlGfxClip sub)
+{
+    AxlGfxPixel *op = axl_gfx_buffer_pixels(c->output);
+    if (op == NULL) {
+        return;
+    }
+    for (uint32_t j = 0; j < sub.h; j++) {
+        AxlGfxPixel *drow = &op[(sub.y + (int32_t)j) * (int32_t)c->w + sub.x];
+        const AxlGfxPixel *srow = &src[(size_t)(sub.y - src_rect.y + (int32_t)j)
+                                       * src_rect.w + (sub.x - src_rect.x)];
+        axl_memcpy(drow, srow, (size_t)sub.w * sizeof(AxlGfxPixel));
+    }
+}
+
+// E10: the sub-rect of @v a blur over @r reproduces EXACTLY.
+//
+// The blur clamps at its own buffer's border, so a pixel closer than @radius
+// to an edge of @r replicates that edge instead of reading the true neighbours
+// beyond it. Where @r's edge IS @v's edge that replication is the intended
+// clamp; everywhere else it is a seam, so those pixels must not be written
+// back. A full-veil blur (@r == @v) is valid throughout, which keeps the
+// full-repaint path byte-identical.
+//
+// The erosion uses the radius as clamped for THIS rect, which for a sub-rect
+// can be smaller than the one a full-veil blur would use. That never yields a
+// wrongly-frosted pixel: a smaller clamp means radius > max(r.w, r.h), so
+// eroding by max(r.w, r.h) empties the result on any edge that is not the
+// veil's — and if all four are the veil's, the two clamps agree anyway.
+static AxlGfxClip
+blur_valid_rect(AxlGfxClip r, AxlGfxClip v, uint32_t radius)
+{
+    int32_t  rad = (int32_t)blur_clamped_radius(r.w, r.h, radius);
+    int32_t  x0 = r.x, y0 = r.y;
+    int32_t  x1 = r.x + (int32_t)r.w, y1 = r.y + (int32_t)r.h;
+    if (r.x != v.x)                        { x0 += rad; }
+    if (r.y != v.y)                        { y0 += rad; }
+    if (x1 != v.x + (int32_t)v.w)          { x1 -= rad; }
+    if (y1 != v.y + (int32_t)v.h)          { y1 -= rad; }
+    if (x1 <= x0 || y1 <= y0) {
+        return (AxlGfxClip){0, 0, 0, 0};
+    }
+    return (AxlGfxClip){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
+}
+
 // Blur the output region @r in place by @radius (E10 backdrop blur): extract
-// it to a scratch buffer, stack-blur, write back. On scratch-OOM the blur is
-// skipped (the surface is just un-frosted) — never fatal. The blur clamps at
-// @r's edges (the surface's own border).
+// it to a scratch buffer, stack-blur, write back. @v is the veil's whole
+// output-clipped rect (@r is @v or a sub-rect of it). Returns the region
+// actually written — see `blur_valid_rect`; the caller narrows its own blit to
+// it.
+//
+// On OOM the blur is skipped and the surface is left un-frosted — never fatal,
+// but during a partial re-blur that would be a lasting artifact (the recomposite
+// has already replaced the frost with raw backdrop, and later presents only
+// repaint their own halo), so it also raises `blur_failed` and the present puts
+// the whole frame back instead of flushing a half-frosted one.
 //
 // CACHE: a full-rect blur is expensive and recurs every present. When the
 // composited backdrop in @r is byte-identical to the last blur (a static modal
 // backdrop), reuse @s's stored blurred result instead of recomputing. The
 // compare is content-based, so it can never serve a stale blur: a changed
 // backdrop fails the memcmp and re-blurs. (The blur is the heavy multi-pass
-// cost; the per-frame memcmp + memcpy is a fraction of it.)
-static void
-blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, uint32_t radius)
+// cost; the per-frame memcmp + memcpy is a fraction of it.) A partial re-blur
+// skips the cache entirely — its rect changes shape frame to frame, so the
+// cache would be reallocated every present and never hit.
+static AxlGfxClip
+blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, AxlGfxClip v,
+                 uint32_t radius)
 {
     if (r.w == 0 || r.h == 0 || radius == 0) {
-        return;
+        return r;
     }
+    // Only a partial-re-blur present narrows the write-back: everywhere else
+    // (a full repaint, an occlusion-split blit) the clamp at @r's edge is the
+    // long-standing behaviour and the caller has nothing staged to restore.
+    const AxlGfxClip valid = c->blur_partial ? blur_valid_rect(r, v, radius) : r;
+    if (valid.w == 0 || valid.h == 0) {
+        return valid;   // nothing of this rect would survive: don't blur it
+    }
+    const bool cache = !c->blur_partial;
     AxlGfxBuffer *tmp = axl_gfx_buffer_new(r.w, r.h);
     if (tmp == NULL) {
-        return;   // OOM: skip the blur (degrade, not fatal)
+        c->blur_failed = true;
+        return valid;   // OOM: skip the blur (degrade, not fatal)
     }
     AxlGfxPixel *op = axl_gfx_buffer_pixels(c->output);
     AxlGfxPixel *tp = axl_gfx_buffer_pixels(tmp);
     if (op == NULL || tp == NULL) {
         axl_gfx_buffer_free(tmp);
-        return;
+        c->blur_failed = true;
+        return valid;
     }
     // Extract the backdrop region into the scratch (the blur source).
     for (uint32_t j = 0; j < r.h; j++) {
@@ -664,52 +755,47 @@ blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, uint32_t radius)
     const size_t bytes = (size_t)r.w * (size_t)r.h * sizeof(AxlGfxPixel);
 
     // Cache hit: same dims + identical source → reuse the stored blurred result.
-    if (s->blur_out_cache != NULL && s->blur_src_cache != NULL
+    if (cache && s->blur_out_cache != NULL && s->blur_src_cache != NULL
         && s->blur_cache_w == r.w && s->blur_cache_h == r.h) {
         AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
         AxlGfxPixel *oc = axl_gfx_buffer_pixels(s->blur_out_cache);
         if (sc != NULL && oc != NULL && axl_memcmp(sc, tp, bytes) == 0) {
-            for (uint32_t j = 0; j < r.h; j++) {
-                for (uint32_t i = 0; i < r.w; i++) {
-                    op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i] =
-                        oc[j * r.w + i];
-                }
-            }
+            blit_scratch(c, oc, r, valid);
             axl_gfx_buffer_free(tmp);
-            return;
+            return valid;
         }
     }
 
     // Cache miss: (re)size the cache to @r if needed, snapshot the source,
     // blur, store the result. A snapshot/alloc failure just disables caching
     // for this pass (still blurs correctly).
-    if (s->blur_cache_w != r.w || s->blur_cache_h != r.h) {
-        blur_cache_drop(s);
-        s->blur_src_cache = axl_gfx_buffer_new(r.w, r.h);
-        s->blur_out_cache = axl_gfx_buffer_new(r.w, r.h);
-        if (s->blur_src_cache != NULL && s->blur_out_cache != NULL) {
-            s->blur_cache_w = r.w;
-            s->blur_cache_h = r.h;
-        } else {
+    if (cache) {
+        if (s->blur_cache_w != r.w || s->blur_cache_h != r.h) {
             blur_cache_drop(s);
+            s->blur_src_cache = axl_gfx_buffer_new(r.w, r.h);
+            s->blur_out_cache = axl_gfx_buffer_new(r.w, r.h);
+            if (s->blur_src_cache != NULL && s->blur_out_cache != NULL) {
+                s->blur_cache_w = r.w;
+                s->blur_cache_h = r.h;
+            } else {
+                blur_cache_drop(s);
+            }
+        }
+        if (s->blur_src_cache != NULL) {
+            AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
+            if (sc != NULL) axl_memcpy(sc, tp, bytes);   // pre-blur snapshot (compare key)
         }
     }
-    if (s->blur_src_cache != NULL) {
-        AxlGfxPixel *sc = axl_gfx_buffer_pixels(s->blur_src_cache);
-        if (sc != NULL) axl_memcpy(sc, tp, bytes);   // pre-blur snapshot (compare key)
+    if (axl_gfx_buffer_blur(tmp, radius) != AXL_OK) {
+        c->blur_failed = true;   // its own scratch OOM'd: @tmp is still the raw extract
     }
-    axl_gfx_buffer_blur(tmp, radius);
-    if (s->blur_out_cache != NULL) {
+    if (cache && s->blur_out_cache != NULL) {
         AxlGfxPixel *oc = axl_gfx_buffer_pixels(s->blur_out_cache);
         if (oc != NULL) axl_memcpy(oc, tp, bytes);   // store blurred result
     }
-    for (uint32_t j = 0; j < r.h; j++) {
-        for (uint32_t i = 0; i < r.w; i++) {
-            op[(r.y + (int32_t)j) * (int32_t)c->w + r.x + (int32_t)i] =
-                tp[j * r.w + i];
-        }
-    }
+    blit_scratch(c, tp, r, valid);
     axl_gfx_buffer_free(tmp);
+    return valid;
 }
 
 // Clipped copy of @s's buffer into the output at @s's absolute pos,
@@ -719,8 +805,8 @@ surf_blit(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
 {
     int32_t ax, ay;
     surf_abs(s, &ax, &ay);
-    AxlGfxClip r = clip_intersect(clip_to_output(c, (AxlGfxClip){ax, ay, s->w, s->h}),
-                                  clip);
+    AxlGfxClip v = clip_to_output(c, (AxlGfxClip){ax, ay, s->w, s->h});
+    AxlGfxClip r = clip_intersect(v, clip);
     if (r.w == 0 || r.h == 0) {
         return;
     }
@@ -732,11 +818,16 @@ surf_blit(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
     c->composited++;
     // E10: frost the composited backdrop under @s before blitting its tint.
     // Back-to-front compositing means everything below @s is already in the
-    // output here, so blurring @r in place gives a true backdrop blur.
+    // output here, so blurring @r in place gives a true backdrop blur. The
+    // blur may decline part of @r (a partial re-blur is only exact away from
+    // the edges it clamped at), so the tint follows it down to what it wrote.
     if (s->backdrop_blur > 0) {
         // const cast: the blur cache is mutable per-surface scratch; surf_blit
         // is otherwise read-only on @s.
-        blur_output_rect(c, (AxlSurface *)s, r, s->backdrop_blur);
+        r = blur_output_rect(c, (AxlSurface *)s, r, v, s->backdrop_blur);
+        if (r.w == 0 || r.h == 0) {
+            return;
+        }
     }
     for (uint32_t j = 0; j < r.h; j++) {
         AxlGfxPixel       *drow = &dp[(r.y + (int32_t)j) * (int32_t)c->w + r.x];
@@ -1007,6 +1098,10 @@ axl_compositor_get_damage_region(const AxlCompositor *c)
 // backdrop, not a damage sub-rect (which would clamp mid-surface and seam).
 // Returns true if any such surface was found (the caller then composites the
 // damage bbox as one rect so banding can't split the surface).
+//
+// This is the CONSERVATIVE expansion: correct for any scene, but it re-blurs a
+// whole veil for any change under it. `veil_expand_halo` below is the cheap
+// path a present takes when it can prove the smaller region suffices.
 static bool
 backdrop_blur_expand(AxlCompositor *c, const AxlSurface *s)
 {
@@ -1028,6 +1123,225 @@ backdrop_blur_expand(AxlCompositor *c, const AxlSurface *s)
     return found;
 }
 
+// --- E10: the partial re-blur plan ----------------------------------------
+//
+// A full-screen frosted veil used to cost a FULL-screen re-blur on ANY damage
+// under it (~97% of a 1280x800 frame — a blinking caret repainted the world).
+// A blur is a bounded neighbourhood read, though, so only a bounded halo
+// around the change actually moves:
+//
+//   halo   (damage ∩ veil) ⊕ 2*radius, clipped to the veil — the raw backdrop
+//          the blur must re-read: one radius for how far the frost moves, one
+//          more for what each moved pixel samples. This is the rect the
+//          present recomposites, so the blur reads real backdrop rather than
+//          the previous frame's already-frosted output.
+//   valid  the recomposite eroded by the radius on every edge that is not the
+//          veil's own (`blur_valid_rect`) — the blur clamps at its buffer's
+//          border, so only there does it reproduce a full-veil re-blur.
+//   keep   recomposited but neither damaged nor re-frosted: collateral of
+//          painting a rect rather than a region. Saved before the paint and
+//          restored after, which is what makes the frame byte-identical to a
+//          full re-blur (the seam test in compositor-selftest.c pins this).
+//
+// The plan is taken only when it is provably equivalent; anything else falls
+// back to `backdrop_blur_expand`'s whole-veil repaint.
+#define COMP_MAX_VEILS 8
+
+typedef struct {
+    AxlGfxClip rect;     // output-clipped screen rect (the blur's clamp box)
+    uint32_t   radius;
+} VeilInfo;
+
+// Flatten the visible backdrop-blur surfaces into @out (hidden subtrees
+// skipped, exactly as collect_order does). Returns the number found, which may
+// EXCEED @max — the caller then declines the plan rather than reason from a
+// truncated list.
+static size_t
+veil_collect(const AxlCompositor *c, const AxlSurface *s, VeilInfo *out,
+             size_t max, size_t n)
+{
+    if (!s->visible) {
+        return n;
+    }
+    if (s->buf != NULL && s->backdrop_blur > 0) {
+        AxlGfxClip v = clip_to_output(c, surf_screen_rect(s));
+        if (v.w != 0 && v.h != 0) {
+            if (n < max) {
+                out[n].rect   = v;
+                out[n].radius = s->backdrop_blur;
+            }
+            n++;
+        }
+    }
+    for (const AxlNTree *child = s->node.children; child != NULL;
+         child = child->next) {
+        n = veil_collect(c, SURF(child), out, max, n);
+    }
+    return n;
+}
+
+// True if any two veils overlap. A veil over another blurs the LOWER one's
+// frosted output as its source — which a partial re-blur has only made exact
+// over `valid`. Overlapping veils therefore decline the plan and re-blur whole
+// rects, where every veil's output is exact everywhere.
+static bool
+veils_overlap(const VeilInfo *v, size_t n)
+{
+    for (size_t i = 0; i + 1 < n; i++) {
+        for (size_t j = i + 1; j < n; j++) {
+            AxlGfxClip x = clip_intersect(v[i].rect, v[j].rect);
+            if (x.w != 0 && x.h != 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Grow @bb by the blur halo of every veil the damage reaches (see above).
+// Returns true if any veil is involved.
+static bool
+veil_expand_halo(const AxlCompositor *c, const VeilInfo *v, size_t n,
+                 AxlGfxClip *bb)
+{
+    bool found = false;
+    for (size_t k = 0; k < n; k++) {
+        if (!axl_gfx_region_intersects_rect(c->damage, v[k].rect)) {
+            continue;
+        }
+        found = true;
+        uint32_t maxd = (v[k].rect.w > v[k].rect.h) ? v[k].rect.w : v[k].rect.h;
+        uint32_t rad  = (v[k].radius > maxd) ? maxd : v[k].radius;  // the blur's clamp
+        if (rad > maxd / 2) {
+            clip_union(bb, v[k].rect);   // the halo would span the veil anyway
+            continue;
+        }
+        AxlGfxClip hull = {0, 0, 0, 0};   // the damage under this veil
+        size_t nd = axl_gfx_region_num_rects(c->damage);
+        for (size_t i = 0; i < nd; i++) {
+            clip_union(&hull,
+                       clip_intersect(axl_gfx_region_get_rect(c->damage, i), v[k].rect));
+        }
+        int32_t g = (int32_t)rad * 2;
+        clip_union(bb, clip_intersect((AxlGfxClip){hull.x - g, hull.y - g,
+                                                   hull.w + 2u * (uint32_t)g,
+                                                   hull.h + 2u * (uint32_t)g},
+                                      v[k].rect));
+    }
+    return found;
+}
+
+// The conservative expansion over a complete veil list: union the FULL rect of
+// every veil the damage reaches, repeating until none is newly reached — an
+// expanded veil can bring another one into the damage, and the second must be
+// re-blurred (and flushed) whole too. Returns true if any veil was expanded.
+static bool
+veil_expand_full(AxlCompositor *c, const VeilInfo *v, size_t n)
+{
+    bool taken[COMP_MAX_VEILS] = { false };
+    bool found = false, again = true;
+    while (again) {
+        again = false;
+        for (size_t k = 0; k < n; k++) {
+            if (taken[k]
+                || !axl_gfx_region_intersects_rect(c->damage, v[k].rect)) {
+                continue;
+            }
+            axl_gfx_region_union_rect(c->damage, v[k].rect);
+            taken[k] = true;
+            found = again = true;
+        }
+    }
+    return found;
+}
+
+// True if some veil's blit is split by occlusion — an opaque surface in FRONT
+// of it leaves a visible region that is not the single rect veil ∩ @bb. Its
+// blur then runs per sub-rect and clamps at the occluder's edge instead of the
+// veil's, which `blur_valid_rect` cannot account for, so the plan is declined.
+static bool
+veil_split(const AxlCompositor *c, const CompVis *cv, AxlGfxClip bb)
+{
+    for (size_t k = 0; k < cv->m; k++) {
+        const AxlSurface *s = *(AxlSurface **)axl_array_get(cv->order, k);
+        if (s->backdrop_blur == 0) {
+            continue;
+        }
+        AxlGfxClip want = clip_intersect(clip_to_output(c, surf_screen_rect(s)), bb);
+        if (want.w == 0 || want.h == 0) {
+            continue;   // not painted this present
+        }
+        AxlGfxClip got = {0, 0, 0, 0};
+        size_t seen = 0, nr = axl_gfx_region_num_rects(cv->vis[k]);
+        for (size_t j = 0; j < nr; j++) {
+            AxlGfxClip part = clip_intersect(axl_gfx_region_get_rect(cv->vis[k], j), bb);
+            if (part.w != 0 && part.h != 0) {
+                got = part;
+                seen++;
+            }
+        }
+        if (seen != 1 || got.x != want.x || got.y != want.y
+            || got.w != want.w || got.h != want.h) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Build the plan's two regions: @changed — what this frame alters on screen
+// (the damage plus every veil's re-frosted rect), which is the flush set — and
+// @keep — recomposited but unaltered, saved and restored around the paint.
+// Both must come out EXACT: a lossy (bounding-box) degrade would flush stale
+// pixels or restore over fresh ones, so imprecision fails the plan.
+static bool
+veil_plan_regions(const AxlCompositor *c, const VeilInfo *v, size_t n,
+                  AxlGfxClip bb, AxlGfxRegion *changed, AxlGfxRegion *keep)
+{
+    if (axl_gfx_region_copy(changed, c->damage) != AXL_OK) {
+        return false;
+    }
+    for (size_t k = 0; k < n; k++) {
+        AxlGfxClip r = clip_intersect(v[k].rect, bb);
+        if (r.w == 0 || r.h == 0) {
+            continue;
+        }
+        if (axl_gfx_region_union_rect(changed,
+                blur_valid_rect(r, v[k].rect, v[k].radius)) != AXL_OK) {
+            return false;
+        }
+    }
+    axl_gfx_region_clear(keep);
+    if (axl_gfx_region_union_rect(keep, bb) != AXL_OK
+        || axl_gfx_region_subtract(keep, changed) != AXL_OK) {
+        return false;
+    }
+    return !axl_gfx_region_is_lossy(changed) && !axl_gfx_region_is_lossy(keep);
+}
+
+// Snapshot the output over @r into a fresh @r-shaped buffer, or NULL on OOM.
+// Taken before the paint so any part of @r the paint disturbs without changing
+// can be put back verbatim with blit_scratch (which reads exactly this
+// layout). Snapshotting the whole rect rather than just the parts expected to
+// need it is what lets a mid-paint blur failure restore the frame.
+static AxlGfxPixel *
+rect_snapshot(AxlCompositor *c, AxlGfxClip r)
+{
+    AxlGfxPixel *op = axl_gfx_buffer_pixels(c->output);
+    if (op == NULL || r.w == 0 || r.h == 0) {
+        return NULL;
+    }
+    AxlGfxPixel *snap = axl_malloc((size_t)r.w * (size_t)r.h * sizeof(AxlGfxPixel));
+    if (snap == NULL) {
+        return NULL;
+    }
+    for (uint32_t j = 0; j < r.h; j++) {
+        axl_memcpy(&snap[(size_t)j * r.w],
+                   &op[(r.y + (int32_t)j) * (int32_t)c->w + r.x],
+                   (size_t)r.w * sizeof(AxlGfxPixel));
+    }
+    return snap;
+}
+
 int
 axl_compositor_present(AxlCompositor *c)
 {
@@ -1038,12 +1352,29 @@ axl_compositor_present(AxlCompositor *c)
         return AXL_OK;   // nothing changed
     }
     // E10: a backdrop-blur surface whose rect intersects the damage must be
-    // recomposited over its FULL rect, not a damage sub-rect — else the blur
-    // clamps mid-surface and seams. Expand the damage to include such surfaces'
-    // full rects, and (if any) composite the damage bbox as ONE rect so the
-    // region banding can't split a veil into separately-blurred pieces.
-    bool veil = backdrop_blur_expand(c, &c->root);
-    size_t n = axl_gfx_region_num_rects(c->damage);
+    // recomposited over a rect its blur can read WHOLE, not a bare damage
+    // sub-rect — else the blur clamps mid-surface and seams. Try the partial
+    // plan (recomposite the blur halo, restore the collateral); fall back to
+    // expanding the damage over such surfaces' FULL rects. Either way, when a
+    // veil is involved the paint covers ONE rect so the region banding can't
+    // split a veil into separately-blurred pieces.
+    VeilInfo veils[COMP_MAX_VEILS];
+    size_t   found     = veil_collect(c, &c->root, veils, COMP_MAX_VEILS, 0);
+    bool     truncated = found > COMP_MAX_VEILS;   // more veils than `veils` holds
+    size_t   nveil     = truncated ? COMP_MAX_VEILS : found;
+    AxlGfxRegion *changed = NULL, *keep = NULL;
+    AxlGfxPixel  *saved   = NULL;
+    AxlGfxClip    bb      = axl_gfx_region_bounds(c->damage);
+    bool veil    = false;
+    bool partial = nveil != 0 && !truncated
+                   && !veils_overlap(veils, nveil)
+                   && veil_expand_halo(c, veils, nveil, &bb);
+    if (partial) {
+        veil    = true;
+        changed = axl_gfx_region_new();
+        keep    = axl_gfx_region_new();
+        partial = changed != NULL && keep != NULL;
+    }
     c->composited = 0;
     c->occ_passes = 0;
     // E3a: recomposite ONLY the damaged rects — areas that didn't change keep
@@ -1054,9 +1385,44 @@ axl_compositor_present(AxlCompositor *c)
     // the precomputed visible regions (§10).
     CompVis cv;
     bool ok = comp_vis_build(c, &cv);
+    if (partial && ok && veil_split(c, &cv, bb)) {
+        partial = false;
+    }
+    if (partial) {
+        partial = veil_plan_regions(c, veils, nveil, bb, changed, keep);
+    }
+    if (partial) {
+        saved   = rect_snapshot(c, bb);   // stage the whole recomposite rect
+        partial = saved != NULL;
+    }
+    if (!partial) {
+        // Declined: the long-standing whole-veil repaint, flushing the damage.
+        // (`saved` is necessarily NULL here — staging it is the last step.)
+        axl_gfx_region_free(changed);
+        axl_gfx_region_free(keep);
+        changed = NULL;
+        keep    = NULL;
+        if (truncated) {
+            // More veils than the plan array holds: walk the tree instead,
+            // repeatedly — expanding one veil can bring another into the
+            // damage, and that one must be re-blurred whole as well. Each pass
+            // takes at least one new veil, so `found` passes reach the fixpoint.
+            for (size_t pass = 0; pass < found; pass++) {
+                if (!backdrop_blur_expand(c, &c->root)) {
+                    break;
+                }
+                veil = true;
+            }
+        } else {
+            veil = veil_expand_full(c, veils, nveil);
+        }
+        bb = axl_gfx_region_bounds(c->damage);
+    }
+    c->blur_partial = partial;
+    c->blur_failed  = false;
+    size_t n = axl_gfx_region_num_rects(c->damage);
     if (veil) {
         // One full-coverage composite so no backdrop-blur surface is split.
-        AxlGfxClip bb = axl_gfx_region_bounds(c->damage);
         if (ok) { paint_clip_with_vis(c, &cv, bb); }
         else    { paint_clip_fallback(c, bb); }
     } else {
@@ -1066,20 +1432,44 @@ axl_compositor_present(AxlCompositor *c)
             else    { paint_clip_fallback(c, d); }
         }
     }
+    c->blur_partial = false;
     if (ok) {
         comp_vis_free(&cv);
     }
+    // Put back what the halo repaint scribbled over but did not change: those
+    // pixels still hold this frame's correct value from before the paint.
+    if (saved != NULL) {
+        if (c->blur_failed) {
+            // A blur could not allocate, so part of `bb` was recomposited to
+            // raw backdrop and never frosted. Restore the WHOLE snapshot and
+            // flush nothing: the frame is dropped, but the output stays a
+            // coherent frosted frame instead of keeping a lasting bright patch
+            // that later halo-sized presents would never repaint.
+            axl_warning("compositor: backdrop blur OOM - frame dropped");
+            blit_scratch(c, saved, bb, bb);
+            axl_gfx_region_clear(changed);
+        } else {
+            size_t nk = axl_gfx_region_num_rects(keep);
+            for (size_t i = 0; i < nk; i++) {
+                blit_scratch(c, saved, bb, axl_gfx_region_get_rect(keep, i));
+            }
+        }
+        axl_free(saved);
+    }
+    c->blur_failed = false;
     // C6: bracket the flush so the cursor is the top layer of THIS present,
     // atomically. lift folds the sprite INTO the output (so the damage rects
     // below carry it — no separate erase/redraw to the GOP, hence no flicker
     // at low present rates); drop unfolds, leaving the output cursor-clean for
     // the next partial-damage repaint. No-ops while the cursor is hidden.
     axl_cursor_lift(c->cursor);
-    // Flush each disjoint damage rect (E2): sparse changes far apart on screen
+    // Flush each disjoint changed rect (E2): sparse changes far apart on screen
     // present as small separate rects, not their spanning bounding box.
+    const AxlGfxRegion *flush = (changed != NULL) ? changed : c->damage;
     int r = AXL_OK;
-    for (size_t i = 0; i < n; i++) {
-        AxlGfxClip d = axl_gfx_region_get_rect(c->damage, i);
+    size_t nf = axl_gfx_region_num_rects(flush);
+    for (size_t i = 0; i < nf; i++) {
+        AxlGfxClip d = axl_gfx_region_get_rect(flush, i);
         if (axl_gfx_buffer_present_rect(c->output, (uint32_t)d.x, (uint32_t)d.y,
                                         (uint32_t)d.x, (uint32_t)d.y, d.w, d.h) != AXL_OK) {
             r = AXL_ERR;   // GOP unavailable (headless) — reported, not fatal
@@ -1089,6 +1479,8 @@ axl_compositor_present(AxlCompositor *c)
     // The frame is consumed regardless of whether the flush reached a GOP:
     // the output is up to date, so the damage clears either way.
     axl_gfx_region_clear(c->damage);
+    axl_gfx_region_free(changed);
+    axl_gfx_region_free(keep);
     return r;
 }
 

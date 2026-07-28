@@ -17,9 +17,25 @@ ARCH       ?= x64
 ifeq ($(filter $(ARCH),x64 aa64),)
   $(error invalid ARCH '$(ARCH)' -- must be 'x64' or 'aa64')
 endif
-PREFIX     ?= out/native-$(ARCH)
 TYPE       ?= app
 BUILD      ?= DEBUG
+
+# Each BUILD gets its OWN output tree. Objects are flag-dependent and make
+# cannot tell that a .o was compiled with different CFLAGS, so sharing one
+# directory silently mixes them: a `BUILD=RELEASE` bench run followed by a
+# plain `make tests` links DEBUG-only tests against a RELEASE libaxl.a and
+# reports failures that are pure artefact (`debug: alloc fill 0xDA` is the
+# one that bites, since AXL_MEM_DEBUG is off in RELEASE). `make tests` does
+# NOT recover it either — the objects look up to date — so the only fix used
+# to be remembering `make clean` between modes. Now the two trees coexist.
+# The default build keeps the historical path, so every script and doc that
+# names out/native-<arch> is unaffected; `make print-prefix` reports it for
+# anything that needs to find the other one.
+ifeq ($(BUILD),DEBUG)
+  PREFIX   ?= out/native-$(ARCH)
+else
+  PREFIX   ?= out/native-$(ARCH)-$(shell echo $(BUILD) | tr '[:upper:]' '[:lower:]')
+endif
 HOSTCC     ?= gcc
 AXL_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 
@@ -614,7 +630,8 @@ endif
 # read TLS_STATE=off, see the toggle, and WIPE the TLS tree (out/native-<arch>),
 # forcing a full rebuild. Exclude them (like clean/help) so a lint neither wipes
 # the tree nor rewrites the recorded state to confuse the next real build.
-NONCLEAN_GOALS := $(filter-out clean clean-tools help check-version \
+NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
+    print-prefix \
     check-ascii check-docs check-test-meta check-dogfood check-cxx-entry,\
     $(or $(MAKECMDGOALS),all))
 
@@ -654,7 +671,7 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-tools hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom embed-asset gfx-present-selftest cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke
+.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
@@ -1059,6 +1076,27 @@ $(PREFIX)/gfx-present-selftest.efi: $(BUILDDIR)/gfx-present-selftest.o $(LINK_CR
 $(BUILDDIR)/gfx-present-selftest.o: test/integration/gfx-present-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+# gfx-avail-probe.efi — reports GOP presence for test-no-gpu-qemu.sh.
+gfx-avail-probe: $(PREFIX)/gfx-avail-probe.efi
+	@echo "  Built: $(PREFIX)/gfx-avail-probe.efi"
+
+$(PREFIX)/gfx-avail-probe.efi: $(BUILDDIR)/gfx-avail-probe.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-avail-probe.o,$@)
+
+$(BUILDDIR)/gfx-avail-probe.o: test/integration/gfx-avail-probe.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# gfx-present-bench.efi — quantifies full-screen render cost (build vs present
+# vs memcpy floor) to confirm the "logic runs waste CPU rendering" claim.
+gfx-present-bench: $(PREFIX)/gfx-present-bench.efi
+	@echo "  Built: $(PREFIX)/gfx-present-bench.efi"
+
+$(PREFIX)/gfx-present-bench.efi: $(BUILDDIR)/gfx-present-bench.o $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/gfx-present-bench.o,$@)
+
+$(BUILDDIR)/gfx-present-bench.o: test/integration/gfx-present-bench.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 # ===================================================================
 # Build gfx-mode-selftest.efi — GOP display-mode enumerate/switch
 # round-trip.  Run under scripts/run-qemu.sh --gpu by
@@ -1459,6 +1497,59 @@ $(PREFIX)/service_demo.efi: $(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_de
 	$(call LINK_EFI_APP,$(BUILDDIR)/service-demo-app.o $(BLOB_OBJ_service_demo),$@)
 
 $(BUILDDIR)/service-demo-app.o: sdk/examples/service-demo.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# svc_startfail.efi + svc_startfail-dxe.efi — regression fixture for the
+# driver start-failure double-free (test-service-startfail-qemu.sh). Same
+# dual-compile-and-embed shape as service-demo; the driver's setup returns
+# AXL_ERR so the firmware auto-unloads the errored buffer-loaded image.
+# ===================================================================
+svc-startfail: $(PREFIX)/svc_startfail.efi $(PREFIX)/svc_startfail-dxe.efi
+	@echo "  Built: $(PREFIX)/svc_startfail.efi + svc_startfail-dxe.efi"
+
+$(PREFIX)/svc_startfail-dxe.efi: $(BUILDDIR)/svc-startfail-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/svc-startfail-dxe.o,$@)
+
+$(BUILDDIR)/svc-startfail-dxe.o: sdk/examples/svc-startfail.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+$(eval $(call EMBED_BLOB,svc_startfail,$(PREFIX)/svc_startfail-dxe.efi))
+
+$(PREFIX)/svc_startfail.efi: $(BUILDDIR)/svc-startfail-app.o $(BLOB_OBJ_svc_startfail) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/svc-startfail-app.o $(BLOB_OBJ_svc_startfail),$@)
+
+$(BUILDDIR)/svc-startfail-app.o: sdk/examples/svc-startfail.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# ===================================================================
+# svc_embonly.efi + svc_embonly-dxe.efi + svc_embonly-decoy-dxe.efi —
+# fixture for AxlServiceDeploy.embedded_only (test-service-embedded-only-
+# qemu.sh). Launcher embeds the REAL driver; the decoy (same service name,
+# -DDECOY marker) is staged as the disk-search filename to prove the search
+# is skipped. One source, three artifacts.
+# ===================================================================
+svc-embonly: $(PREFIX)/svc_embonly.efi $(PREFIX)/svc_embonly-dxe.efi $(PREFIX)/svc_embonly-decoy-dxe.efi
+	@echo "  Built: svc_embonly.efi + svc_embonly-dxe.efi + svc_embonly-decoy-dxe.efi"
+
+$(PREFIX)/svc_embonly-dxe.efi: $(BUILDDIR)/svc-embonly-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/svc-embonly-dxe.o,$@)
+
+$(BUILDDIR)/svc-embonly-dxe.o: sdk/examples/svc-embonly.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -c $< -o $@
+
+$(PREFIX)/svc_embonly-decoy-dxe.efi: $(BUILDDIR)/svc-embonly-decoy-dxe.o $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_DRIVER,$(BUILDDIR)/svc-embonly-decoy-dxe.o,$@)
+
+$(BUILDDIR)/svc-embonly-decoy-dxe.o: sdk/examples/svc-embonly.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DAXL_SERVICE_BUILD_DRIVER -DDECOY -c $< -o $@
+
+$(eval $(call EMBED_BLOB,svc_embonly,$(PREFIX)/svc_embonly-dxe.efi))
+
+$(PREFIX)/svc_embonly.efi: $(BUILDDIR)/svc-embonly-app.o $(BLOB_OBJ_svc_embonly) $(LINK_CRT0) $(PREFIX)/lib/libaxl.a
+	$(call LINK_EFI_APP,$(BUILDDIR)/svc-embonly-app.o $(BLOB_OBJ_svc_embonly),$@)
+
+$(BUILDDIR)/svc-embonly-app.o: sdk/examples/svc-embonly.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # ===================================================================
@@ -2525,8 +2616,20 @@ axl-busybox: all $(BUSYBOX_EFI)
 
 -include $(wildcard $(BUILDDIR)/*.d)
 
+# Report this configuration's output directory, so a caller that builds with
+# a non-default BUILD/ARCH can find the artefacts without duplicating the
+# naming rule (see the PREFIX block at the top).
+#   cp "$(make -s ARCH=x64 BUILD=RELEASE print-prefix)/tools/"*.efi ...
+print-prefix:
+	@echo $(PREFIX)
+
+# Removes THIS configuration's tree only ($(PREFIX)); a different BUILD or
+# ARCH keeps its own. `clean-all` wipes every tree.
 clean:
 	rm -rf $(PREFIX)
+
+clean-all:
+	rm -rf out
 
 # Targeted clean for tool binaries (uefi-devkit references this from
 # its `tools-clean` recipe — it doesn't want to wipe libaxl.a). Also

@@ -562,7 +562,7 @@ axl_ipmi_probe(AxlIpmiProbe *out)
     if (!EFI_ERROR(hc_st)) {
         out->smbus_hc_handle_count = (size_t)hc_count;
         if (hc_buf != NULL) {
-            gBS->FreePool(hc_buf);
+            gBS->FreePool(hc_buf);  /* axl-pool-direct: LocateHandleBuffer result */
         }
     }
 
@@ -579,7 +579,7 @@ axl_ipmi_probe(AxlIpmiProbe *out)
         out->i2c_master_protocol = (handle_count > 0);
         out->i2c_master_handle_count = (size_t)handle_count;
         if (handle_buf != NULL) {
-            gBS->FreePool(handle_buf);
+            gBS->FreePool(handle_buf);  /* axl-pool-direct: LocateHandleBuffer result */
         }
     }
 

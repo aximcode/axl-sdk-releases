@@ -41,7 +41,7 @@ run_model() {
     echo "=== CPU model: $model (expect tier $expect_tier) ==="
     timeout 90s "$PROJECT_DIR/scripts/run-qemu.sh" --timeout 50 \
         --qemu-arg -cpu --qemu-arg "$model" "$EFI" 2>&1 | tee "$log" \
-        | grep -iE "simd tier|timing|speedup|PASS:|FAIL:|GFX-SIMD-SELFTEST|mismatch|EXCEPTION" || true
+        | grep -iE "simd tier|timing|speedup|blur radius|PASS:|FAIL:|GFX-SIMD-SELFTEST|mismatch|EXCEPTION" || true
 
     local fail=0
     grep -qE "simd tier = $expect_tier\b" "$log" || { echo "  MISS: tier $expect_tier"; fail=1; }

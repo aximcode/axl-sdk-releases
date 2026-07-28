@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""check-dogfood.py — flag raw UEFI protocol / boot-service calls in library code.
+"""check-dogfood.py — dogfooding gates over AXL library code.
+
+Two independent axes, both gating (either can fail CI):
+
+  1. UEFI-call axis (a per-file ratchet, BASELINE below): library code should
+     route UEFI protocol / boot-service calls through `axl_efi_call` / a backend
+     function so every touchpoint stays enumerable and swappable.
+  2. Allocation axis (marker-based, POOL_RE / POOL_MARKER below): library code
+     dogfoods `axl_malloc` / `axl_free`; a RAW firmware `AllocatePool` /
+     `FreePool` / `AllocatePages` / `FreePages` is allowed only with an inline
+     `axl-pool-direct: <reason>` marker justifying the firmware-owned exception.
+
+The rest of this doc covers the UEFI-call axis.
+--- UEFI-call axis ---
+flag raw UEFI protocol / boot-service calls in library code.
 
 AXL's design rule (CLAUDE.md, "Backend Abstraction"): *all library code makes
 UEFI protocol and boot-service calls through the backend functions and the
@@ -68,6 +82,30 @@ ALLOW_MARKER = "axl-uefi-direct"
 # `axl_efi_call(p->Method, ...)` form has no call parens and is not matched.
 CALL_RE = re.compile(r"->\s*[A-Z][A-Za-z0-9_]*\s*\(")
 
+# ---------------------------------------------------------------------------
+# Allocation axis — dogfood axl_malloc/axl_free; every RAW firmware pool call
+# must justify itself.
+#
+# axl_malloc prepends a bookkeeping header, so the pointer it returns is not the
+# start of the underlying AllocatePool block. Memory the firmware frees, reads
+# at a fixed address, or itself allocated (LocateHandleBuffer, QueryMode,
+# GetMemorySpaceMap, Convert*DevicePath*, …) must therefore use raw
+# AllocatePool/FreePool — using axl_malloc/axl_free there corrupts the pool
+# (CoreFreePool ASSERT / use-after-free). See docs/AXL-Coding-Style.md,
+# "Memory Ownership".
+#
+# So the rule is: default to axl_malloc/axl_free; a raw firmware pool call is
+# allowed ONLY with an inline `axl-pool-direct: <reason>` marker naming why the
+# memory is firmware-owned. This gate fails on any UNMARKED raw pool call (no
+# baseline — mark every legitimate one, convert the rest). Matches both the
+# direct `->AllocatePool(` and the wrapped `axl_efi_call(p->FreePool, ...)`
+# forms via a word boundary instead of requiring call parens.
+POOL_RE = re.compile(r"->\s*(?:AllocatePool|FreePool|AllocatePages|FreePages)\b")
+POOL_MARKER = "axl-pool-direct"
+# src/mem implements axl_malloc on top of AllocatePages; backend/crt0 bootstrap
+# it — all three call the firmware allocator by necessity.
+POOL_EXEMPT_DIRS = ("src/backend/", "src/crt0/", "src/mem/")
+
 # Per-file baseline of KNOWN raw-UEFI-call sites (existing debt). A file absent
 # here must have ZERO; a file present must not EXCEED its number. Burn down by
 # routing the call through axl_efi_call / a backend function and lowering the
@@ -87,7 +125,7 @@ BASELINE: dict[str, int] = {
     "src/net/axl-mbedtls-platform.c": 1,
     "src/net/axl-net-dhcp.c": 4,
     "src/net/axl-udp.c": 17,
-    "src/posix/axl-app.c": 5,
+    "src/posix/axl-app.c": 2,
     "src/ramdisk/axl-ramdisk.c": 4,
     "src/smbus/axl-smbus-hc.c": 2,
     "src/smbus/axl-smbus-i2c.c": 2,
@@ -218,6 +256,56 @@ def collect() -> dict[str, list[tuple[int, str]]]:
     return result
 
 
+def scan_file_pool(path: Path) -> list[tuple[int, str]]:
+    """Return (line_no, source_line) for each RAW firmware pool call in `path`
+    that lacks the axl-pool-direct marker."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    code = blank_noncode(text)
+    raw_lines = text.splitlines()
+    findings: list[tuple[int, str]] = []
+    for lineno, code_line in enumerate(code.splitlines(), start=1):
+        if not POOL_RE.search(code_line):
+            continue
+        src = raw_lines[lineno - 1] if lineno - 1 < len(raw_lines) else ""
+        if POOL_MARKER in src:
+            continue
+        findings.append((lineno, src.strip()))
+    return findings
+
+
+def collect_pool() -> dict[str, list[tuple[int, str]]]:
+    """rel-path -> unmarked raw pool calls, over the non-exempt scan tree."""
+    result: dict[str, list[tuple[int, str]]] = {}
+    for path in sorted(SCAN_ROOT.rglob("*")):
+        if path.suffix not in EXTS or not path.is_file():
+            continue
+        rel = path.relative_to(ROOT).as_posix()
+        if any(rel.startswith(d) for d in POOL_EXEMPT_DIRS):
+            continue
+        findings = scan_file_pool(path)
+        if findings:
+            result[rel] = findings
+    return result
+
+
+def cmd_gate_pool(found: dict[str, list[tuple[int, str]]]) -> int:
+    if not found:
+        print("check-dogfood[pool]: clean — every raw firmware pool call carries "
+              "an axl-pool-direct marker.")
+        return 0
+    print("check-dogfood[pool]: raw firmware AllocatePool/FreePool/AllocatePages/"
+          "FreePages WITHOUT an `axl-pool-direct: <reason>` marker (dogfood "
+          "axl_malloc/axl_free, or mark the firmware-owned exception):")
+    total = 0
+    for rel in sorted(found):
+        for lineno, src in found[rel]:
+            print(f"  {rel}:{lineno}: {src}")
+            total += 1
+    print(f'\nFAIL: {total} unmarked raw pool call(s). See docs/AXL-Coding-Style.md '
+          '"Memory Ownership".')
+    return 1
+
+
 def cmd_report(found: dict[str, list[tuple[int, str]]]) -> int:
     total = 0
     for rel, findings in found.items():
@@ -288,11 +376,22 @@ def cmd_gate(found: dict[str, list[tuple[int, str]]]) -> int:
 
 def main(argv: list[str]) -> int:
     found = collect()
+    pool = collect_pool()
     if "--report" in argv:
-        return cmd_report(found)
+        cmd_report(found)
+        print()
+        ptotal = sum(len(f) for f in pool.values())
+        print(f"unmarked raw pool calls: {ptotal} in {len(pool)} files")
+        for rel in sorted(pool):
+            for lineno, src in pool[rel]:
+                print(f"    {rel}:{lineno}: {src}")
+        return 0
     if "--update-baseline" in argv:
         return cmd_update_baseline(found)
-    return cmd_gate(found)
+    # Both axes gate; combine exit codes so either can fail CI.
+    rc_uefi = cmd_gate(found)
+    rc_pool = cmd_gate_pool(pool)
+    return rc_uefi or rc_pool
 
 
 if __name__ == "__main__":

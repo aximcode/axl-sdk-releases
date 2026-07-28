@@ -50,6 +50,270 @@ fill(AxlSurface *s, uint32_t w, uint32_t h, AxlGfxPixel color)
     axl_gfx_target_buffer(NULL);
 }
 
+/* --- E10 backdrop-blur seam helpers ------------------------------------- */
+
+/* Paint @r in BOTH the live backdrop surface and the shadow copy that mirrors
+   it, then damage @r. The shadow is the oracle's input, so the two can never
+   drift. */
+static void
+bd_fill(AxlSurface *bd, AxlGfxBuffer *shadow, AxlGfxClip r, AxlGfxPixel col)
+{
+    axl_gfx_target_buffer(axl_surface_buffer(bd));
+    axl_gfx_fill_rect(r.x, r.y, r.w, r.h, col);
+    axl_gfx_target_buffer(shadow);
+    axl_gfx_fill_rect(r.x, r.y, r.w, r.h, col);
+    axl_gfx_target_buffer(NULL);
+    axl_surface_damage(bd, r);
+}
+
+/* Blur @veil's rect of @img in place, clamping at that rect's own edges —
+   exactly the full-veil re-blur a partial re-blur must reproduce. Called once
+   per veil back-to-front over a copy of the scene, this builds the oracle
+   frame. Returns false on OOM. */
+static bool
+blur_veil_rect(AxlGfxBuffer *img, uint32_t w, AxlGfxClip veil, uint32_t radius)
+{
+    AxlGfxPixel  *ip   = axl_gfx_buffer_pixels(img);
+    AxlGfxBuffer *crop = axl_gfx_buffer_new(veil.w, veil.h);
+    AxlGfxPixel  *cp2  = (crop != NULL) ? axl_gfx_buffer_pixels(crop) : NULL;
+    if (ip == NULL || cp2 == NULL) {
+        axl_gfx_buffer_free(crop);
+        return false;
+    }
+    for (uint32_t j = 0; j < veil.h; j++) {
+        for (uint32_t i = 0; i < veil.w; i++) {
+            cp2[j * veil.w + i] = ip[(size_t)(veil.y + (int32_t)j) * w + veil.x + (int32_t)i];
+        }
+    }
+    axl_gfx_buffer_blur(crop, radius);
+    for (uint32_t j = 0; j < veil.h; j++) {
+        for (uint32_t i = 0; i < veil.w; i++) {
+            ip[(size_t)(veil.y + (int32_t)j) * w + veil.x + (int32_t)i] = cp2[j * veil.w + i];
+        }
+    }
+    axl_gfx_buffer_free(crop);
+    return true;
+}
+
+/* Compare a captured frame against a reference over the WHOLE region — one
+   probe pixel cannot see a seam, which is the failure mode this guards.
+   Reports the first differing pixel and the total count. RGB only (the
+   framebuffer carries no meaningful alpha to read back). */
+static void
+check_frame_eq(const AxlGfxPixel *cap, const AxlGfxPixel *ref, uint32_t w,
+               uint32_t h, const char *label)
+{
+    uint32_t bad = 0;
+    uint32_t fx = 0, fy = 0;
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            if (!rgb_eq(cap[(size_t)y * w + x], ref[(size_t)y * w + x])) {
+                if (bad == 0) { fx = x; fy = y; }
+                bad++;
+            }
+        }
+    }
+    if (bad != 0) {
+        axl_printf("  %u/%u px differ; first (%u,%u) got %02x%02x%02x want %02x%02x%02x\n",
+                   bad, w * h, fx, fy,
+                   cap[(size_t)fy * w + fx].red, cap[(size_t)fy * w + fx].green,
+                   cap[(size_t)fy * w + fx].blue,
+                   ref[(size_t)fy * w + fx].red, ref[(size_t)fy * w + fx].green,
+                   ref[(size_t)fy * w + fx].blue);
+    }
+    check(bad == 0, label);
+}
+
+/* A fully transparent per-pixel-alpha surface with a backdrop blur. Because it
+   contributes no color of its own, the frame under it IS the blurred backdrop
+   — which is what makes the blur independently checkable. */
+static AxlSurface *
+new_blur_veil(AxlCompositor *c, AxlGfxClip r, uint32_t radius)
+{
+    AxlSurface *v = axl_surface_new(axl_compositor_root(c), r.w, r.h);
+    if (v == NULL) {
+        return NULL;
+    }
+    AxlGfxPixel *vp = axl_gfx_buffer_pixels(axl_surface_buffer(v));
+    if (vp == NULL) {
+        axl_surface_free(v);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < r.w * r.h; i++) {
+        vp[i] = AXL_GFX_RGBA(0, 0, 0, 0);
+    }
+    axl_surface_set_per_pixel_alpha(v, true);
+    axl_surface_move(v, r.x, r.y);
+    axl_surface_set_backdrop_blur(v, radius);
+    return v;
+}
+
+/* Present the pending damage, read the SCREEN back, and compare the whole
+   frame against an oracle rebuilt from the shadow scene: the veils blurred
+   back-to-front over their full rects. Reading the framebuffer (not the
+   compositor's output buffer) also pins the flush region — a partial re-blur
+   that forgets to flush a changed pixel shows up here as a stale capture. */
+static void
+present_check(AxlCompositor *c, AxlGfxBuffer *shadow, AxlGfxPixel *cap,
+              uint32_t w, uint32_t h, const AxlGfxClip *veils,
+              const uint32_t *radii, size_t nveil, const char *label)
+{
+    AxlGfxBuffer *ora = axl_gfx_buffer_new(w, h);
+    AxlGfxPixel  *op  = (ora != NULL) ? axl_gfx_buffer_pixels(ora) : NULL;
+    AxlGfxPixel  *sp  = axl_gfx_buffer_pixels(shadow);
+    if (op == NULL || sp == NULL) {
+        check(false, label);
+        axl_gfx_buffer_free(ora);
+        return;
+    }
+    axl_compositor_present(c);
+    if (axl_gfx_capture(cap, 0, 0, w, h) != AXL_OK) {
+        check(false, label);
+        axl_gfx_buffer_free(ora);
+        return;
+    }
+    axl_memcpy(op, sp, (size_t)w * h * sizeof(AxlGfxPixel));
+    for (size_t k = 0; k < nveil; k++) {
+        if (!blur_veil_rect(ora, w, veils[k], radii[k])) {
+            check(false, label);
+            axl_gfx_buffer_free(ora);
+            return;
+        }
+    }
+    check_frame_eq(cap, op, w, h, label);
+    axl_gfx_buffer_free(ora);
+}
+
+/* E10: a partial-damage present under a backdrop-blur veil must be pixel-for-
+   pixel identical to a full-veil re-blur. This is the guard the "re-blur only
+   the damage plus its blur halo" optimization rests on: the halo ring reads
+   the PREVIOUS frame's already-frosted pixels unless the implementation
+   handles it, which seams — and compounds frame over frame. Every case here
+   compares the ENTIRE frame, because a single probe pixel cannot see a seam. */
+static void
+test_backdrop_blur_seam(void)
+{
+    const uint32_t BW = 160, BH = 120, R = 8;
+    const AxlGfxPixel BASE = AXL_GFX_RGB(0x10, 0x18, 0x30);
+    const AxlGfxPixel WARM = AXL_GFX_RGB(0xE0, 0xD0, 0x40);
+    const AxlGfxPixel COOL = AXL_GFX_RGB(0x30, 0xC0, 0x80);
+    const AxlGfxPixel HOT  = AXL_GFX_RGB(0xFF, 0x00, 0x60);
+
+    AxlCompositor *c      = axl_compositor_new(BW, BH);
+    AxlGfxBuffer  *shadow = axl_gfx_buffer_new(BW, BH);
+    AxlGfxBuffer  *capbuf = axl_gfx_buffer_new(BW, BH);
+    AxlSurface    *bd     = (c != NULL)
+                          ? axl_surface_new(axl_compositor_root(c), BW, BH) : NULL;
+    if (c == NULL || shadow == NULL || capbuf == NULL || bd == NULL) {
+        check(false, "bdblur seam: scene allocated");
+        axl_gfx_buffer_free(shadow);
+        axl_gfx_buffer_free(capbuf);
+        axl_compositor_free(c);
+        return;
+    }
+    AxlGfxPixel *cap = axl_gfx_buffer_pixels(capbuf);
+
+    /* A plaid of hard edges in BOTH axes — high frequency, so a blur that
+       reads even one wrong source pixel moves the result visibly. */
+    bd_fill(bd, shadow, (AxlGfxClip){0, 0, BW, BH}, BASE);
+    for (int32_t x = 0; x + 8 <= (int32_t)BW; x += 16) {
+        bd_fill(bd, shadow, (AxlGfxClip){x, 0, 8, BH}, WARM);
+    }
+    for (int32_t y = 0; y + 6 <= (int32_t)BH; y += 24) {
+        bd_fill(bd, shadow, (AxlGfxClip){0, y, BW, 6}, COOL);
+    }
+
+    AxlGfxClip veil_r  = {0, 0, BW, BH};   /* full-screen veil (a modal dim) */
+    uint32_t   veil_rad = R;
+    AxlSurface *veil = new_blur_veil(c, veil_r, R);
+    check(veil != NULL, "bdblur seam: blur veil created");
+
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: full present matches the whole-frame blur oracle");
+
+    /* The core case: a small change under the veil. */
+    bd_fill(bd, shadow, (AxlGfxClip){60, 40, 12, 9}, HOT);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: a small partial damage matches the full-blur oracle");
+
+    /* Edges + corner: the blur clamps at the veil's own border, so a damage
+       that touches it must NOT be eroded away there. */
+    bd_fill(bd, shadow, (AxlGfxClip){0, 30, 10, 10}, WARM);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: damage on the veil's left edge stays exact");
+    bd_fill(bd, shadow, (AxlGfxClip){(int32_t)BW - 6, (int32_t)BH - 5, 6, 5}, HOT);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: damage in the bottom-right corner stays exact");
+
+    /* A single pixel — the smallest possible halo. */
+    bd_fill(bd, shadow, (AxlGfxClip){77, 60, 1, 1}, COOL);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: a 1x1 damage stays exact");
+
+    /* A damage larger than the blur radius in both axes. */
+    bd_fill(bd, shadow, (AxlGfxClip){40, 20, 70, 60}, BASE);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: a damage much larger than the radius stays exact");
+
+    /* Two disjoint damages in ONE frame. */
+    bd_fill(bd, shadow, (AxlGfxClip){5, 5, 8, 8}, HOT);
+    bd_fill(bd, shadow, (AxlGfxClip){140, 100, 10, 10}, WARM);
+    present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1,
+                  "bdblur seam: two disjoint damages in one frame stay exact");
+
+    /* Repeat over the SAME spot: re-blurring an already-frosted halo drifts a
+       little per frame, so the compounding is what catches it. */
+    for (int i = 0; i < 4; i++) {
+        char label[96];
+        bd_fill(bd, shadow, (AxlGfxClip){90, 70, 9, 7},
+                (i & 1) ? COOL : HOT);
+        axl_snprintf(label, sizeof(label),
+                     "bdblur seam: repeated re-blur of the same spot, pass %d", i + 1);
+        present_check(c, shadow, cap, BW, BH, &veil_r, &veil_rad, 1, label);
+    }
+    axl_surface_free(veil);
+
+    /* A DIALOG veil (not full-screen): the blur clamps at the dialog's edges,
+       and damage outside it must not disturb it. */
+    AxlGfxClip dlg_r   = {30, 20, 90, 70};
+    uint32_t   dlg_rad = R;
+    AxlSurface *dlg = new_blur_veil(c, dlg_r, R);
+    check(dlg != NULL, "bdblur seam: dialog veil created");
+    present_check(c, shadow, cap, BW, BH, &dlg_r, &dlg_rad, 1,
+                  "bdblur seam: dialog veil full present matches the oracle");
+    bd_fill(bd, shadow, (AxlGfxClip){20, 50, 30, 20}, HOT);   /* straddles the edge */
+    present_check(c, shadow, cap, BW, BH, &dlg_r, &dlg_rad, 1,
+                  "bdblur seam: damage straddling the dialog's edge stays exact");
+    bd_fill(bd, shadow, (AxlGfxClip){0, 100, 20, 15}, COOL);  /* fully outside */
+    present_check(c, shadow, cap, BW, BH, &dlg_r, &dlg_rad, 1,
+                  "bdblur seam: damage entirely outside the dialog stays exact");
+
+    /* Two OVERLAPPING veils: the upper one blurs the lower one's frosted
+       output, so its source is only valid where the lower one is. */
+    AxlGfxClip veils2[2] = { dlg_r, {60, 40, 90, 70} };
+    uint32_t   rads2[2]  = { R, 4 };
+    AxlSurface *dlg2 = new_blur_veil(c, veils2[1], rads2[1]);
+    check(dlg2 != NULL, "bdblur seam: second overlapping veil created");
+    present_check(c, shadow, cap, BW, BH, veils2, rads2, 2,
+                  "bdblur seam: stacked overlapping veils, full present");
+    bd_fill(bd, shadow, (AxlGfxClip){70, 55, 10, 10}, HOT);   /* under both */
+    present_check(c, shadow, cap, BW, BH, veils2, rads2, 2,
+                  "bdblur seam: damage under two stacked veils stays exact");
+
+    /* Damage under ONLY the upper veil, in the part that overhangs the lower
+       one. The lower veil is not reached until the upper one's rect has been
+       folded into the damage, so an expansion that visits each veil once (in
+       paint order, lower first) leaves the lower one to blur a sub-rect —
+       clamped mid-surface, which seams. Pins the fixpoint. */
+    bd_fill(bd, shadow, (AxlGfxClip){130, 95, 10, 10}, WARM);
+    present_check(c, shadow, cap, BW, BH, veils2, rads2, 2,
+                  "bdblur seam: damage reaching only the upper veil re-blurs the lower one");
+
+    axl_gfx_buffer_free(shadow);
+    axl_gfx_buffer_free(capbuf);
+    axl_compositor_free(c);
+}
+
 /* C6: a surface that requests a custom cursor shape on pointer enter — the
    per-surface-shape seam (§2.4). */
 static AxlCompositor  *g_comp;
@@ -192,6 +456,9 @@ main(int argc, char *argv[])
     axl_gfx_buffer_free(g_spr);
     axl_compositor_free(c);
     axl_gfx_buffer_free(cap);
+
+    /* E10: partial re-blur under a backdrop-blur veil (own scene + compositor). */
+    test_backdrop_blur_seam();
 
     axl_printf("COMPOSITOR-SELFTEST: %d passed, %d failed\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

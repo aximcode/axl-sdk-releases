@@ -338,6 +338,30 @@ it's the unconditional "swap" step. While a buffer target is active,
 the clip stack and alpha compositing apply against the buffer's pixel
 array using buffer-local coordinates.
 
+### Raw fills vs. drawn fills
+
+Every *drawing* primitive composites source-over onto a destination
+treated as opaque, so the result's alpha is forced to `0xFF`. That is
+right for painting, but it means `axl_gfx_fill_rect` cannot lay down a
+**translucent** value — a see-through veil written through it stops
+being see-through. `axl_gfx_buffer_fill_rect` is the raw counterpart:
+it overwrites, so the exact pixel value lands, alpha included.
+
+```c
+/* A 50%-black veil in a per-pixel-alpha surface buffer — stays 50%. */
+axl_gfx_buffer_fill_rect(veil, 0, 0, w, h, AXL_GFX_RGBA(0, 0, 0, 0x80));
+```
+
+Like the rest of the `axl_gfx_buffer_*` family it takes the buffer
+explicitly and honors **no ambient graphics state** — not the clip
+stack, not the blend mode, not the gamma-correct flag — and behaves the
+same whether or not the buffer is the current draw target. That split is
+deliberate: the `axl_gfx_*` draw family is the one that reads ambient
+state. Intersect with `axl_gfx_get_clip` yourself if you want the fill
+clipped. The rect is clamped to the buffer, so a negative origin or an
+oversized extent is safe. `axl_gfx_buffer_clear` is the full-extent
+special case, implemented on top of it.
+
 ### Present pipeline (direct framebuffer + dirty rectangles)
 
 `axl_gfx_buffer_present` writes the back-buffer straight to the GOP
@@ -476,15 +500,44 @@ darken. All four channels are blurred, **including alpha**, so it
 works on an alpha/shadow mask as well as on color content. `radius 0`
 is a no-op; the kernel is normalized (total intensity is preserved).
 
-The per-axis convolution is **SIMD-accelerated** via runtime dispatch
-on `axl_cpu_simd_tier()` — an AVX2 (256-bit, x86), SSE4.1 (x86), or
-NEON (AArch64) kernel, falling back to scalar on older CPUs. Every
-vectorized path is **bit-identical** to the scalar reference (only the
-per-tap multiply-accumulate is vectorized; the edge clamp and the
-final rounding divide stay scalar), so output never depends on which
-CPU ran it. On x86 the AVX2 path needs YMM state, which the dispatcher
-enables via `axl_cpu_enable_avx()` — see the
-``AxlCpu <cpu.html>``_ module for the detection/enable details.
+Each axis pass runs as two running-sum **box** passes rather than a
+direct tent convolution: the triangular kernel of half-width `radius`
+factors exactly into two box blurs, and a box blur is a sliding window
+(add the entering sample, subtract the leaving one). So each pass is
+**O(w·h) — independent of the radius**, and a full-screen backdrop veil
+at a large radius costs no more per pixel than a small one. The
+intermediate between the two boxes is carried at full integer
+precision, so the output is **bit-identical** to a direct
+triangular-kernel convolution — validated against an independent tent
+reference in `test/integration/gfx-simd-selftest.c`, which also asserts
+the cost stays flat as the radius grows.
+
+Three further things make the constant factor small, all bit-exact
+(the same tent reference guards them):
+
+- The per-pixel round-and-divide uses an exact **multiply-shift
+  reciprocal** instead of a division. `radius` is a runtime value, so
+  the compiler cannot strength-reduce `/ (radius+1)²` — and that was
+  four int64 divisions per output pixel, about 60% of a full-screen
+  blur.
+- The second axis runs as a **transpose plus another row pass**, not a
+  strided column walk. Striding down a column touches one useful pixel
+  per cache line, so the pass streams the whole image through the cache
+  once per column; the transpose is done in cache-sized tiles and costs
+  far less than the misses it removes.
+- The row pass is **SIMD-dispatched** (SSE4.1 / NEON) over the four
+  BGRA channels, which are exactly one 128-bit register of int32 lanes.
+  Note what is *not* parallel: a running sum is serial along the pass
+  axis, so — unlike a direct convolution, whose outputs are independent
+  — neighbouring pixels cannot be vectorised, and AVX2 would buy
+  nothing without restructuring to run several rows in lockstep. The
+  rounding step uses a 32-bit reciprocal so the high half of a widening
+  multiply IS the quotient; where that cannot be exact for the radius,
+  or the rung is absent, the scalar pass runs instead.
+
+Together they cut a full-screen blur to about a quarter (1280x800,
+radius 12: 20.9 ms → 5.6 ms, median of 5, x64 under KVM,
+`test/integration/gfx-present-bench.c`).
 
 ```c
 AxlGfxBuffer *b = axl_gfx_buffer_new(w, h);

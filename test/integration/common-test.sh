@@ -529,6 +529,20 @@ test_run_foreground() {
     wait "$_wrapper" 2>/dev/null || true
     test_cpu_check || true
     axl_report_hostfwd_failure "$TEST_LOG" "$(basename "$0")" || true
+
+    # A firmware DXE-core pool/heap ASSERT (e.g. a double-FreePool) is NEVER
+    # acceptable — the guest's allocator state is corrupt. DEBUG firmware prints
+    # "ASSERT [DxeCore] ... Pool.c(...)"; RELEASE just spins at 100% CPU. Fail
+    # the whole test here rather than let it be scored on other criteria: the
+    # driver start-failure double-free shipped precisely because a run that
+    # printed this line was still judged on later greps. Global, so every
+    # foreground QEMU test is covered. The EXIT trap still runs cleanup.
+    if grep -qaE 'ASSERT \[DxeCore\]' "$TEST_LOG" 2>/dev/null; then
+        echo "*** FAIL: firmware DXE-core ASSERT (pool/heap corruption) in" \
+             "$(basename "$0"):" >&2
+        grep -aE 'ASSERT \[DxeCore\]' "$TEST_LOG" | head -3 | sed 's/^/    /' >&2
+        exit 1
+    fi
 }
 
 # Resolve THIS test's QEMU pid. Matched by the test's own disk image path,

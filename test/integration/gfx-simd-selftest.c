@@ -2,21 +2,22 @@
 /* Copyright 2026 AximCode */
 
 /*
- * gfx-simd-selftest.c — validate + benchmark the SIMD-dispatched blur.
+ * gfx-simd-selftest.c — validate + benchmark the gfx blur + SIMD kernels.
  *
- * axl_gfx_buffer_blur() dispatches its inner convolution to an AVX2 /
- * SSE4.1 / NEON kernel per axl_cpu_simd_tier(); every kernel is meant
- * to be BIT-IDENTICAL to the scalar reference.  This app proves that on
- * whatever CPU model it runs under: it blurs a pseudo-random buffer via
- * the library (hardware path) and via an independent in-app scalar
- * reimplementation of the same triangular blur, and asserts the two
- * outputs are byte-for-byte equal.  It then times both to report the
- * speedup of the dispatched kernel over scalar.
+ * Blur: axl_gfx_buffer_blur() runs a running-sum box-box kernel that is
+ * O(w*h) (radius-independent) and BIT-IDENTICAL to the old direct
+ * triangular (tent) convolution.  This app proves that: it blurs a
+ * pseudo-random buffer via the library and via an independent in-app
+ * tent reimplementation (ref_blur), and asserts the two outputs are
+ * byte-for-byte equal — the guard that keeps the box-box refactor exact.
+ * It also benchmarks the blur across radii to show the cost is flat in r
+ * (a direct O(w*h*r) reversion would blow up ~linearly with the radius).
  *
- * Driven by test/integration/test-gfx-simd-qemu.sh under several QEMU
- * CPU models (qemu64 / Nehalem / Haswell) so each x86 dispatch rung
- * (scalar / SSE4.1 / AVX2) is validated.  NEON is validated by the
- * AArch64 unit run.
+ * SIMD: source-over blend still dispatches to an AVX2 / SSE / NEON kernel
+ * per axl_cpu_simd_tier(); this app validates it bit-exact vs the scalar
+ * axl_gfx_blend and benchmarks it.  Driven by
+ * test/integration/test-gfx-simd-qemu.sh under several QEMU CPU models
+ * (qemu64 / Nehalem / Haswell) so each x86 blend rung is exercised.
  *
  * Final line: "GFX-SIMD-SELFTEST: <N> passed, <M> failed".
  */
@@ -33,8 +34,9 @@ check(bool cond, const char *label)
     else      { g_fail++; axl_printf("FAIL: %s\n", label); }
 }
 
-/* Independent scalar reference — mirrors blur_pass_scalar in
- * src/gfx/axl-gfx-effects.c exactly (same clamp, weights, rounding). */
+/* Independent tent reference — the direct O(r) triangular convolution
+ * (same clamp, weights, rounding the box-box kernel must reproduce). This
+ * is the oracle: axl_gfx_buffer_blur's box-box output must equal it. */
 static void
 ref_pass(const AxlGfxPixel *src, AxlGfxPixel *dst,
          uint32_t w, uint32_t h, int r, bool horizontal)
@@ -129,9 +131,9 @@ main(int argc, char *argv[])
     }
     check(equal, "dispatched blur is bit-exact vs scalar reference");
 
-    /* Odd dimensions exercise the AVX2 two-pixel loop's scalar tail
-       column (and odd height on the vertical pass), which an even WxH
-       never reaches. */
+    /* Odd dimensions exercise the box-box edge handling on both axes
+       (a line whose length isn't a nice multiple), which an even WxH
+       can mask. The tent reference and the kernel must still agree. */
     {
         const uint32_t OW = 257, OH = 129;
         AxlGfxBuffer *olib = axl_gfx_buffer_new(OW, OH);
@@ -148,9 +150,41 @@ main(int argc, char *argv[])
                     olp[i].red  != oref[i].red  || olp[i].alpha != oref[i].alpha) oeq = false;
             }
         }
-        check(oeq, "dispatched blur bit-exact on odd dimensions (AVX2 tail)");
+        check(oeq, "blur bit-exact on odd dimensions (box-box edges)");
         axl_gfx_buffer_free(olib);
         axl_free(oref);
+    }
+
+    /* Thin strips and r >= len: the box-box seed/edge path (heavy clamp,
+       nI1 = len + r entries) differs from the interior sliding case and is
+       NOT reached by the blurs above (both have r < min dim). Verify a
+       single-pixel-wide/tall line and a strip narrower than the radius
+       stay bit-exact vs the tent reference. */
+    {
+        const uint32_t dims[][2] = { {1, 48}, {48, 1}, {3, 40}, {40, 2}, {2, 2} };
+        bool teq = true;
+        for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]) && teq; di++) {
+            uint32_t tw = dims[di][0], th = dims[di][1];
+            size_t   tn = (size_t)tw * th;
+            AxlGfxBuffer *tlib = axl_gfx_buffer_new(tw, th);
+            AxlGfxPixel  *tref = axl_malloc(tn * sizeof(AxlGfxPixel));
+            if (tlib == NULL || tref == NULL) {
+                teq = false;
+            } else {
+                AxlGfxPixel *tlp = axl_gfx_buffer_pixels(tlib);
+                fill_lcg(tlp, tn, 0xD00D0000u + (uint32_t)di);
+                for (size_t i = 0; i < tn; i++) tref[i] = tlp[i];
+                axl_gfx_buffer_blur(tlib, R);   /* R=16 >= len on the thin axis */
+                ref_blur(tref, tw, th, R);
+                for (size_t i = 0; i < tn && teq; i++) {
+                    if (tlp[i].blue != tref[i].blue || tlp[i].green != tref[i].green ||
+                        tlp[i].red  != tref[i].red  || tlp[i].alpha != tref[i].alpha) teq = false;
+                }
+            }
+            axl_gfx_buffer_free(tlib);
+            axl_free(tref);
+        }
+        check(teq, "blur bit-exact on thin strips and r >= len");
     }
 
     /* --- SIMD source-over blend: bit-exact vs axl_gfx_blend (public
@@ -261,6 +295,34 @@ main(int argc, char *argv[])
         axl_printf("speedup (scalar/dispatched) = %llu.%02llux\n",
                    (unsigned long long)(ref_us / lib_us),
                    (unsigned long long)((ref_us * 100 / lib_us) % 100));
+    }
+
+    /* --- radius independence: the box-box kernel is O(w*h), so blur cost
+       must stay roughly FLAT as the radius grows. The fill (buffer reset,
+       needed because blur is in-place) is kept OUTSIDE the timer so it
+       can't mask an O(r) reversion. A direct O(w*h*r) convolution would
+       scale ~linearly here (r=32 ≈ 8x the r=4 cost). --- */
+    {
+        const int      SITERS = 40;
+        const uint32_t radii[] = {4, 8, 16, 32};
+        uint64_t rus[4] = {0, 0, 0, 0};
+        for (size_t ri = 0; ri < 4; ri++) {
+            uint64_t acc = 0;
+            for (int it = 0; it < SITERS; it++) {
+                fill_lcg(lp, N, 0x9E37u + (uint32_t)ri);   /* untimed reset */
+                uint64_t a = axl_time_get_us();
+                axl_gfx_buffer_blur(lib, radii[ri]);
+                acc += axl_time_get_us() - a;
+            }
+            rus[ri] = acc;
+            axl_printf("blur radius %2u over %d iters: %lluus\n",
+                       radii[ri], SITERS, (unsigned long long)acc);
+        }
+        /* r=32 within 3x of r=4 -> cost is flat in r (O(w*h)); an O(w*h*r)
+           kernel would be ~8x. Require a measurable r=4 baseline so a
+           too-coarse timer can't divide-by-zero into a false pass. */
+        bool flat = (rus[0] > 0) && (rus[3] < rus[0] * 3);
+        check(flat, "blur cost is radius-independent (r=32 < 3x r=4)");
     }
 
     axl_gfx_buffer_free(lib);

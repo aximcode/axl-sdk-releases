@@ -327,7 +327,37 @@ axl_gfx_buffer_get_info(
     uint32_t            *out_h  ///< [out] height (NULL OK to skip)
     );
 
-/// Fill the entire buffer with @a color.
+/// Fill a buffer-local rect with @a color, OVERWRITING it — no
+/// compositing, so the exact pixel value lands, alpha included.  That is
+/// what every drawing primitive cannot do: they source-over onto a
+/// destination treated as opaque, forcing the result's alpha to 0xFF,
+/// which turns a translucent fill opaque.
+///
+/// Like the rest of the `axl_gfx_buffer_*` family this takes the buffer
+/// explicitly and honors NO ambient graphics state — not the
+/// @ref axl_gfx_push_clip stack, not the blend mode, not the
+/// gamma-correct flag — and behaves identically whether or not @a buf is
+/// the current draw target.  Intersect with @ref axl_gfx_get_clip
+/// yourself if you want the fill clipped.
+///
+/// The rect is clamped to the buffer, so a negative origin or an
+/// oversized extent is safe; a rect fully outside it, or one with zero
+/// width or height, writes nothing.  @ref axl_gfx_buffer_clear is the
+/// full-extent special case.
+///
+/// @return AXL_OK on success, AXL_ERR if @a buf is NULL.
+int
+axl_gfx_buffer_fill_rect(
+    AxlGfxBuffer  *buf,    ///< target buffer
+    int32_t        x,      ///< buffer-local left (may be negative)
+    int32_t        y,      ///< buffer-local top (may be negative)
+    uint32_t       w,      ///< width in pixels
+    uint32_t       h,      ///< height in pixels
+    AxlGfxPixel    color   ///< exact pixel value written, alpha included
+    );
+
+/// Fill the entire buffer with @a color — @ref axl_gfx_buffer_fill_rect
+/// over the buffer's full extent, with the same overwrite semantics.
 ///
 /// @return AXL_OK on success, AXL_ERR if @a buf is NULL.
 int

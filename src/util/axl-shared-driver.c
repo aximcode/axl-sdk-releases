@@ -165,7 +165,7 @@ axl_shared_driver_unload(
                     "expected 1; unloading the first only",
                     name, (unsigned long)handle_count);
     }
-    axl_bs()->FreePool(handles);
+    axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
 
     int rc = axl_driver_unload((AxlDriverHandle)driver_handle);
     if (rc != AXL_OK) {

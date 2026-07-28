@@ -353,6 +353,25 @@ typedef struct {
                                            ///< @c driver_blob are both unread
                                            ///< on this path and neither is
                                            ///< required.
+    bool                 embedded_only;    ///< OPTIONAL: load the embedded
+                                           ///< @c driver_blob DIRECTLY, skipping
+                                           ///< the disk search entirely. Use this
+                                           ///< for the "ship as one binary, never
+                                           ///< touch disk" model: the default
+                                           ///< resolution searches
+                                           ///< `<image_dir>/<driver_name>` FIRST,
+                                           ///< so a stale loose driver left beside
+                                           ///< the launcher by an older install
+                                           ///< silently shadows the newer embedded
+                                           ///< one — this flag closes that hole
+                                           ///< from the embedded side, as
+                                           ///< @c driver_path does from the disk
+                                           ///< side. Requires @c driver_blob /
+                                           ///< @c driver_blob_len; @c driver_name
+                                           ///< is used only to name the loaded
+                                           ///< image (optional). Mutually
+                                           ///< exclusive with @c driver_path
+                                           ///< (setting both is an error).
 } AxlServiceDeploy;
 
 /**
@@ -399,6 +418,16 @@ typedef struct {
  * `driver_blob` and `driver_blob_len` all feed the default resolution
  * only, so none of them is read — or required — when a path is
  * pinned; `service` and `driver_path` are the whole descriptor.
+ *
+ * **Embedded-only** (`deploy->embedded_only`): routes through
+ * axl_driver_ensure_embedded_only — the embedded `driver_blob` is loaded
+ * DIRECTLY, with no disk search at all. This closes the same stale-shadow
+ * hole as `driver_path` but from the other side: the default search looks
+ * at `<image_dir>/<driver_name>` first, so a loose driver an older install
+ * left beside the launcher would otherwise run in place of the newer blob
+ * baked into this binary. Requires `driver_blob`/`driver_blob_len`;
+ * `driver_name` only names the loaded image. `embedded_only` and
+ * `driver_path` are mutually exclusive — setting both returns AXL_ERR.
  *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading); AXL_ERR on serialize overflow or an incomplete deploy

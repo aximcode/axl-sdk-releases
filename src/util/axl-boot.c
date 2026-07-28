@@ -264,19 +264,19 @@ encode_load_option(
         }
         #undef MAX_DP_NODES
         if (!found_end) {
-            axl_bs()->FreePool(dp);
+            axl_bs()->FreePool(dp);  /* axl-pool-direct: ConvertTextToDevicePath result */
             axl_free(desc_w);
             return -1;
         }
         fp_len = (size_t)(p - (const uint8_t *)dp);
         fp_bytes = axl_malloc(fp_len);
         if (fp_bytes == NULL) {
-            axl_bs()->FreePool(dp);
+            axl_bs()->FreePool(dp);  /* axl-pool-direct: ConvertTextToDevicePath result */
             axl_free(desc_w);
             return -1;
         }
         axl_memcpy(fp_bytes, dp, fp_len);
-        axl_bs()->FreePool(dp);
+        axl_bs()->FreePool(dp);  /* axl-pool-direct: ConvertTextToDevicePath result */
     }
 
     /* Substitute the synthesized end-node when no real device

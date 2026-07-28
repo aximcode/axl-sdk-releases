@@ -211,7 +211,7 @@ fv_file_build_dp(
     size_t       total        = fv_dp_body + fw_node_size + 4;
 
     void *out = NULL;
-    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out) != EFI_SUCCESS
+    if (axl_bs()->AllocatePool(EfiBootServicesData, total, &out) != EFI_SUCCESS  /* axl-pool-direct: device path for LoadImage */
         || out == NULL)
     {
         return NULL;
@@ -265,7 +265,7 @@ axl_image_run_fv_file(
         dp,              /* FvFile DevicePath */
         NULL, 0,         /* firmware reads the section from the FV */
         &image);
-    axl_bs()->FreePool(dp);
+    axl_bs()->FreePool(dp);  /* axl-pool-direct: device path for LoadImage */
 
     if (EFI_ERROR(status) || image == NULL) {
         axl_warning("image_run_fv_file: LoadImage failed: 0x%llx",
@@ -365,7 +365,7 @@ axl_image_enumerate(
         }
     }
 
-    axl_bs()->FreePool(handles);
+    axl_bs()->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     return rc;
 }
 

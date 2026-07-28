@@ -731,20 +731,49 @@ beneath it — is blurred in place (the G6 `axl_gfx_buffer_blur` stack blur)
 BEFORE the surface's tint is blitted on top. Combine with `opacity < 255` /
 per-pixel-alpha (the veil tint) so the frosted backdrop shows through; the
 surface is excluded from occlusion (a translucent overlay). Scratch-OOM skips
-the blur (un-frosted, not fatal). **Present recomposites a backdrop-blur
-surface over its FULL rect, not a damage sub-rect** (`backdrop_blur_expand`
-unions the surface's full rect into the damage when it intersects, and a
-present that contains one composites the damage bbox as a single rect so the
-region banding can't split it) — otherwise a partial repaint (a caret blink in
-the dialog card above the veil) would blur a sub-rect clamped mid-surface and
-SEAM. So the blur always clamps at the surface's own edge (a near-fullscreen
-veil's = the screen edge → invisible). Test: an EXACT oracle — blur the same
-pattern independently with `axl_gfx_buffer_blur` and require a pixel-for-pixel
-match (off → sharp edge; on → matches the oracle + the sharp edge becomes a
-midtone), a PRESENT-path partial-damage repaint that still matches the
-full-blur oracle (no seam; discrimination-verified), and no-occlusion. Unblocks
-AGT C7 Phase 6 (delete the veil readback + the clip-aware-`clear()` constraint
-it forced).
+the blur (un-frosted, not fatal). **A present never re-blurs a bare damage
+sub-rect** — that would clamp the blur mid-surface and SEAM (a caret blink in
+the dialog card above the veil). Two ways out, and present takes the cheaper
+one whenever it can prove them equivalent:
+
+- *Partial re-blur (the fast path).* A blur is a bounded neighbourhood read,
+  so a change under the veil only moves the frost within `radius` of it, and
+  computing THAT exactly needs raw backdrop within `2*radius`. Present
+  recomposites the damage grown by `2*radius` and clipped to the veil (the
+  blur *halo*), `blur_valid_rect` writes back only the part of it the blur got
+  exact (the halo eroded by `radius`, except on edges that are the veil's own
+  — there the clamp is the intended one), and the collateral — recomposited
+  but neither damaged nor re-frosted — is saved before the paint and restored
+  after. The flush set is the damage plus the re-frosted rects, so an
+  untouched veil is not pushed to the GOP. Measured (`BENCH-COMP-CARET`, x64
+  RELEASE under KVM): a 12x18 caret under a full-screen 1280x800 veil went
+  from 31.6 ms to 0.09 ms per present. A blur that cannot allocate mid-paint
+  restores the whole snapshot and flushes nothing — the frame is dropped rather
+  than left with an un-frosted patch no later halo-sized present would repaint.
+- *Whole-veil re-blur (the fallback).* `backdrop_blur_expand` /
+  `veil_expand_full` union the surface's full rect into the damage. Taken when
+  the plan cannot be proven equivalent: veils that overlap each other (the
+  upper one's blur SOURCE is the lower one's frosted output, exact only where
+  the lower one re-frosted), a veil whose blit is split by an opaque surface
+  in front of it (its blur then clamps at the occluder's edge, which the
+  erosion cannot model), more than `COMP_MAX_VEILS` veils, or an allocation
+  failure anywhere in the plan — including an OOM-degraded (lossy) region,
+  which would flush stale pixels or restore over fresh ones.
+
+Either way a present that contains a veil composites ONE rect, so the region
+banding can't split a veil into separately-blurred pieces, and the blur always
+clamps at the surface's own edge (a near-fullscreen veil's = the screen edge →
+invisible). Test: an EXACT oracle — blur the same pattern independently with
+`axl_gfx_buffer_blur` and require a pixel-for-pixel match (off → sharp edge;
+on → matches the oracle + the sharp edge becomes a midtone), a PRESENT-path
+partial-damage repaint that still matches the full-blur oracle (no seam;
+discrimination-verified), and no-occlusion. On top of that
+`compositor-selftest.c` compares the WHOLE frame — read back from the
+framebuffer, so the flush set is pinned too — against the full-blur oracle
+across edge/corner/1x1/large/disjoint/repeated damages, a non-fullscreen
+dialog veil, and stacked overlapping veils; a single probe pixel cannot see a
+seam. Unblocks AGT C7 Phase 6 (delete the veil readback + the
+clip-aware-`clear()` constraint it forced).
 
 **Situational (deferred — consumer-gated, not yet phased):**
 - **Output scale (HiDPI)** — a global scale factor for high-DPI panels;

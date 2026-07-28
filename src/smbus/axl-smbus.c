@@ -94,7 +94,7 @@ try_each_handle(const EFI_GUID *guid,
             axl_smbus_free(cand);
         }
     }
-    gBS->FreePool(handles);
+    gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     return winner;
 }
 
@@ -185,7 +185,7 @@ visit_each_handle(const EFI_GUID *guid,
         axl_smbus_free(cand);
         visited++;
     }
-    gBS->FreePool(handles);
+    gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer result */
     return visited;
 }
 
