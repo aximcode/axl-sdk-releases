@@ -1599,8 +1599,14 @@ json_result_label(ProbeResult pr)
 static void
 json_result_selfcheck(const char *json, size_t len, const char *want_driver)
 {
+    /* STRICT, and that makes this a STRONGER self-check rather than merely a
+       consistent one. The claim being tested is that --json emits valid JSON
+       -- so parsing it back with the liberal dialect would happily accept a
+       regression that started emitting JSON5, which is exactly the failure
+       this exists to catch. The writer is initialized AXL_JSON_STRICT below;
+       this is the assertion that it stayed that way. */
     AxlJsonReader check;
-    if (!axl_json_parse(json, len, &check)) {
+    if (!axl_json_parse(json, len, AXL_JSON_STRICT, &check)) {
         axl_printf("netload: INTERNAL ERROR -- --json emitted unparsable JSON: %s\n", json);
         return;
     }
@@ -1651,7 +1657,7 @@ print_json_result(const DriverReport *r, const NetloadCfg *c)
 
     AXL_AUTOPTR(AxlString) json = axl_string_new(NULL);
     AxlJsonWriter w;
-    axl_json_writer_init(&w, json, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, json, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_kv_str(&w, "driver", r->name);
     axl_json_kv_str(&w, "method", c->st.have ? "static" : "dhcp");

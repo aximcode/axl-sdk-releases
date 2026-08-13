@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-jose.h:
+/** @file axl-jose.h
  *
  * JOSE — JSON Object Signing and Encryption: JWS (RFC 7515), JWT
  * (RFC 7519), and JWK (RFC 7517). A generic standards module for

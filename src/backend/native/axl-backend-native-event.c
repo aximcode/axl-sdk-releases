@@ -117,11 +117,20 @@ typedef struct {
     void   *ctx;
 } NotifyTimerCtx;
 
-#define NOTIFY_TIMER_TABLE_SIZE  16
+/* Shared by axl_loop_attach_driver's dispatch timers AND by every live
+   AxlTaskPool's before-ExitBootServices hook. Exhaustion is not just a
+   lost timer: a pool that cannot register its hook silently loses its
+   boot-hang protection on exactly the platforms that need it. */
+#define NOTIFY_TIMER_TABLE_SIZE  64
 
+/* Tracks every notify-bridged event, not only timers: the event-group
+   registration below shares the bridging context and the close path.
+   `is_timer` keeps close from issuing SetTimer(TimerCancel) against an
+   event that has no timer to cancel. */
 typedef struct {
     EFI_EVENT       handle;
     NotifyTimerCtx *ctx;
+    bool            is_timer;
     bool            active;
 } NotifyTimerEntry;
 
@@ -140,6 +149,81 @@ notify_timer_trampoline(
     }
 }
 
+/* Reserve a tracking slot and build the bridging context.
+
+   Split out because the two creators below differ only in which
+   CreateEvent flavour they call: everything around it -- reserving the
+   slot, bridging the firmware's (EFI_EVENT, void *) notify signature to
+   AXL's (void *ctx) shape, publishing into the table, and recording the
+   create in the double-close ring -- is identical, and a second copy is
+   a second place for the close path to go wrong.
+
+   The slot is reserved but NOT marked active, so a caller whose event
+   creation fails just calls notify_bridge_abort.
+
+   @return the bridging context, or NULL (table full / out of memory). */
+static NotifyTimerCtx *
+notify_bridge_reserve(
+    void  (*notify)(void *ctx),
+    void   *ctx,
+    size_t *slot_out
+    )
+{
+    NotifyTimerCtx *nc;
+    size_t          slot = NOTIFY_TIMER_TABLE_SIZE;
+
+    for (size_t i = 0; i < NOTIFY_TIMER_TABLE_SIZE; i++) {
+        if (!mNotifyTimerTable[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == NOTIFY_TIMER_TABLE_SIZE) {
+        axl_warning("notify table full (%d slots) - "
+                    "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
+                    NOTIFY_TIMER_TABLE_SIZE);
+        return NULL;
+    }
+
+    nc = (NotifyTimerCtx *)axl_malloc(sizeof(NotifyTimerCtx));
+    if (nc == NULL) {
+        return NULL;
+    }
+    nc->notify = notify;
+    nc->ctx    = ctx;
+    *slot_out  = slot;
+    return nc;
+}
+
+/* Discard a reservation whose event creation failed. The slot was never
+   marked active, so only the context needs undoing. */
+static void
+notify_bridge_abort(
+    NotifyTimerCtx *nc
+    )
+{
+    axl_free(nc);
+}
+
+/* Publish a created event into its reserved slot. */
+static void
+notify_bridge_publish(
+    size_t           slot,
+    EFI_EVENT        ev,
+    NotifyTimerCtx  *nc,
+    bool             is_timer,
+    AxlEventHandle  *event
+    )
+{
+    mNotifyTimerTable[slot].handle   = ev;
+    mNotifyTimerTable[slot].ctx      = nc;
+    mNotifyTimerTable[slot].is_timer = is_timer;
+    mNotifyTimerTable[slot].active   = true;
+
+    event_close_ring_record_create((void *)ev);
+    *event = (AxlEventHandle)ev;
+}
+
 int
 axl_backend_event_create_notify_timer(
     void   (*notify)(void *ctx),
@@ -150,34 +234,17 @@ axl_backend_event_create_notify_timer(
 {
     EFI_STATUS       status;
     EFI_EVENT        ev = NULL;
-    NotifyTimerCtx  *nc = NULL;
-    size_t           slot = NOTIFY_TIMER_TABLE_SIZE;
+    NotifyTimerCtx  *nc;
+    size_t           slot;
 
     if (notify == NULL || event == NULL || interval_100ns == 0) {
         return AXL_ERR;
     }
 
-    /* Reserve a tracking slot first — fail before allocating if the
-       table is full so we don't have to roll back the alloc. */
-    for (size_t i = 0; i < NOTIFY_TIMER_TABLE_SIZE; i++) {
-        if (!mNotifyTimerTable[i].active) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot == NOTIFY_TIMER_TABLE_SIZE) {
-        axl_warning("notify-timer table full (%d slots) - "
-                    "increase NOTIFY_TIMER_TABLE_SIZE if you hit this",
-                    NOTIFY_TIMER_TABLE_SIZE);
-        return AXL_ERR;
-    }
-
-    nc = (NotifyTimerCtx *)axl_malloc(sizeof(NotifyTimerCtx));
+    nc = notify_bridge_reserve(notify, ctx, &slot);
     if (nc == NULL) {
         return AXL_ERR;
     }
-    nc->notify = notify;
-    nc->ctx    = ctx;
 
     /* TPL_CALLBACK is the lowest TPL legal for an EVT_NOTIFY_SIGNAL
        event per UEFI 2.11 §7.1 (TPL_APPLICATION rejects with
@@ -190,23 +257,58 @@ axl_backend_event_create_notify_timer(
     status = gBS->CreateEvent(EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
                               notify_timer_trampoline, nc, &ev);
     if (EFI_ERROR(status)) {
-        axl_free(nc);
+        notify_bridge_abort(nc);
         return AXL_ERR;
     }
 
     status = gBS->SetTimer(ev, TimerPeriodic, interval_100ns);
     if (EFI_ERROR(status)) {
         gBS->CloseEvent(ev);
-        axl_free(nc);
+        notify_bridge_abort(nc);
         return AXL_ERR;
     }
 
-    mNotifyTimerTable[slot].handle = ev;
-    mNotifyTimerTable[slot].ctx    = nc;
-    mNotifyTimerTable[slot].active = true;
+    notify_bridge_publish(slot, ev, nc, true, event);
+    return AXL_OK;
+}
 
-    event_close_ring_record_create((void *)ev);
-    *event = (AxlEventHandle)ev;
+int
+axl_backend_event_create_before_exit_boot(
+    void (*notify)(void *ctx),
+    void  *ctx,
+    AxlEventHandle *event
+    )
+{
+    EFI_STATUS       status;
+    EFI_EVENT        ev = NULL;
+    NotifyTimerCtx  *nc;
+    size_t           slot;
+    EFI_GUID         group = gEfiEventBeforeExitBootServicesGuid;
+
+    if (notify == NULL || event == NULL) {
+        return AXL_ERR;
+    }
+
+    nc = notify_bridge_reserve(notify, ctx, &slot);
+    if (nc == NULL) {
+        return AXL_ERR;
+    }
+
+    /* TPL_CALLBACK, not TPL_NOTIFY. There is nothing to outrank: the
+       firmware's own ExitBootServices-group handlers are signalled after
+       this whole group regardless of TPL, which is the entire reason for
+       using the before-EBS group. Raising to TPL_NOTIFY would buy nothing
+       and cost I/O legality -- a handler that logs reaches the FAT driver,
+       whose lock asserts TPL <= TPL_CALLBACK, so the handler written to
+       prevent a hang at handoff could hang there itself. */
+    status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                                notify_timer_trampoline, nc, &group, &ev);
+    if (EFI_ERROR(status)) {
+        notify_bridge_abort(nc);
+        return AXL_ERR;
+    }
+
+    notify_bridge_publish(slot, ev, nc, false, event);
     return AXL_OK;
 }
 
@@ -281,7 +383,9 @@ axl_backend_event_close_dbg(
         if (mNotifyTimerTable[i].active &&
             mNotifyTimerTable[i].handle == (EFI_EVENT)event) {
             is_notify_timer = true;
-            gBS->SetTimer((EFI_EVENT)event, TimerCancel, 0);
+            if (mNotifyTimerTable[i].is_timer) {
+                gBS->SetTimer((EFI_EVENT)event, TimerCancel, 0);
+            }
             break;
         }
     }
@@ -313,18 +417,58 @@ axl_backend_event_set_timer(
    between passes. */
 #define EVENT_WAIT_RAISED_TPL_SPIN_US  200ULL
 
-bool
-axl_backend_at_raised_tpl(void)
+uintptr_t
+axl_backend_tpl_current(void)
 {
     /* Canonical read-current-TPL idiom: raise to the ceiling (always legal
        from any TPL) and immediately restore — RaiseTPL returns the entry
-       level. gBS->WaitForEvent returns EFI_UNSUPPORTED above
-       TPL_APPLICATION, so event_wait uses this to pick its CheckEvent
-       fallback, and the sync TCP wrappers use it to install a Poll() tick
-       only when one is actually needed. */
+       level. UEFI offers no direct read, so this pair IS the accessor.
+       Safe at TPL_HIGH_LEVEL: the raise is a no-op there and RestoreTPL
+       back to the same level touches neither the allocator nor the event
+       queue, which are the two things that hang at that level. */
     EFI_TPL tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
     gBS->RestoreTPL(tpl);
-    return tpl > TPL_APPLICATION;
+    return (uintptr_t)tpl;
+}
+
+bool
+axl_backend_at_raised_tpl(void)
+{
+    /* gBS->WaitForEvent returns EFI_UNSUPPORTED above TPL_APPLICATION, so
+       event_wait uses this to pick its CheckEvent fallback, and the sync
+       TCP wrappers use it to install a Poll() tick only when one is
+       actually needed. */
+    return axl_backend_tpl_current() > TPL_APPLICATION;
+}
+
+uintptr_t
+axl_backend_tpl_raise(uintptr_t level)
+{
+    /* RaiseTPL rejects a request BELOW the current level (it is a raise,
+       not a set), so clamp: a caller asking for less than it already has
+       gets the current level back and its paired restore stays a no-op.
+       Without this the pair would try to RESTORE UPWARD, which the
+       firmware treats as fatal misuse rather than an error return.
+
+       Read and raise inside ONE raise-to-ceiling window rather than
+       calling axl_backend_tpl_current() first. The obvious spelling —
+       read the level, then raise — costs two RestoreTPL transitions per
+       entry instead of one, and RestoreTPL is where the firmware
+       dispatches queued event notifications. axl_backend_enter_critical
+       runs on the console emit path, so handing it an extra dispatch
+       point (and the re-entrancy that comes with one) for every short
+       critical section is not a cost worth paying for a clamp. */
+    EFI_TPL prev   = gBS->RaiseTPL(TPL_HIGH_LEVEL);
+    EFI_TPL target = ((EFI_TPL)level > prev) ? (EFI_TPL)level : prev;
+
+    gBS->RestoreTPL(target);
+    return (uintptr_t)prev;
+}
+
+void
+axl_backend_tpl_restore(uintptr_t level)
+{
+    gBS->RestoreTPL((EFI_TPL)level);
 }
 
 uintptr_t
@@ -334,8 +478,13 @@ axl_backend_enter_critical(void)
        above TPL_APPLICATION (a foreground console writer), so raising here makes
        a short buffer update atomic against both. AllocatePool is still legal at
        TPL_NOTIFY, so a guarded append that grows its buffer stays within the
-       rules. RaiseTPL returns the entry level for a strict LIFO restore. */
-    return (uintptr_t)gBS->RaiseTPL(TPL_NOTIFY);
+       rules.
+
+       Via axl_backend_tpl_raise, not gBS->RaiseTPL directly: a caller
+       already above TPL_NOTIFY would otherwise ask the firmware to raise
+       DOWNWARD, which is fatal misuse rather than an error return. The
+       clamp lives in one place so both entry points get it. */
+    return axl_backend_tpl_raise(TPL_NOTIFY);
 }
 
 void

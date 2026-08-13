@@ -351,6 +351,48 @@ test_url_build(void)
         test_check(axl_strcmp(url, "http://host:9090/api") == 0, "URL build custom port");
         axl_free(url);
     }
+
+    //
+    // A URL longer than the 512-byte STACK buffer axl_url_build formats
+    // into. axl_snprintf returns the length it WOULD have written, so the
+    // old code allocated that much and then copied it back out of the
+    // 512-byte buffer -- reading past the end of the stack frame and
+    // splicing whatever was there into the returned string. An over-read,
+    // and an information leak into a value the caller hands onward.
+    //
+    // Found by test/fuzz/url_fuzz once it started calling the BUILDER; the
+    // parser-only harness could not reach this function at all.
+    //
+    {
+        char   longpath[700];
+        size_t i;
+
+        longpath[0] = '/';
+        for (i = 1; i < sizeof(longpath) - 1; i++) {
+            longpath[i] = 'a' + (char)(i % 26);
+        }
+        longpath[sizeof(longpath) - 1] = '\0';
+
+        url = axl_url_build("http", "example.com", 0, longpath);
+        test_check(url != NULL, "URL build oversize non-NULL");
+        if (url != NULL) {
+            /* Exact: scheme + host + the path we asked for, nothing else.
+               A stack over-read shows up as trailing garbage, which a
+               length check alone would miss if the garbage happened to
+               start with a NUL. */
+            const size_t want = axl_strlen("http://example.com")
+                                + axl_strlen(longpath);
+
+            test_check(axl_strlen(url) == want,
+                       "URL build oversize: length is exactly the URL, not "
+                       "the stack buffer's worth");
+            test_check(axl_strncmp(url, "http://example.com", 18) == 0
+                           && axl_strcmp(url + 18, longpath) == 0,
+                       "URL build oversize: the whole path survives, with no "
+                       "stack residue spliced in");
+            axl_free(url);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +576,353 @@ on_tcp_rearm_timeout(void *data)
     TcpRearmCtx *c = (TcpRearmCtx *)data;
     axl_loop_quit(c->loop);
     return AXL_SOURCE_REMOVE;
+}
+
+// ---------------------------------------------------------------------------
+// axl_tcp_send_async: a second send submitted while the first is in flight.
+//
+// The transport queues it; the caller is NOT required to serialize. Until the
+// token queue landed, this returned AXL_BUSY and every caller had to invent its
+// own serialisation — three did (axl-http-ws.c's frame queue, the
+// axl_tls_write_async floor, handshake_flush_async's resume) and four call
+// sites in axl-http-response.c did not, testing `!= AXL_OK` and resetting a
+// healthy connection instead. That dropped ~1 request in 3 under concurrent
+// TLS handshakes. See docs/AXL-Tcp-Queue-Design.md §1a.
+//
+// The assertion is on BOTH callbacks firing with AXL_OK, not merely on the
+// submit returning AXL_OK: a queue that accepts a token and then loses it
+// would pass the weaker check while hanging the caller forever.
+//
+// The third assertion pins FIFO callback ORDER. Retirement no longer calls the
+// consumer inline — it appends to a per-socket list drained on the next loop
+// tick (the SIGNAL_TOKEN port) — and a list that pushed at the head instead of
+// the tail would deliver a stream's completions backwards while every
+// status stayed AXL_OK.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int       fires;
+    AxlStatus status[2];
+    int       order[2];       /* slot ids, in the order their callbacks fired */
+    AxlLoop  *loop;
+} TcpSendQCtx;
+
+/* Per-send context so a callback can say WHICH send it belongs to. */
+typedef struct {
+    TcpSendQCtx *ctx;
+    int          id;          /* 1 = submitted first, 2 = submitted second */
+} TcpSendQSlot;
+
+static bool
+on_tcp_sendq_done(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpSendQSlot *slot = (TcpSendQSlot *)data;
+    TcpSendQCtx  *c    = slot->ctx;
+    (void)sock;
+    if (c->fires < 2) {
+        c->status[c->fires] = status;
+        c->order[c->fires]  = slot->id;
+    }
+    c->fires++;
+    if (c->fires >= 2) {
+        axl_loop_quit(c->loop);
+    }
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_sendq_timeout(void *data)
+{
+    TcpSendQCtx *c = (TcpSendQCtx *)data;
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_send_async_queued(void)
+{
+    AxlTcp     *client = NULL;
+    TcpSendQCtx ctx    = { 0 };
+    /* Distinct payloads, both alive until their callbacks fire — the buffers
+       are BORROWED by the transport for the whole queued lifetime, not copied
+       (design §3.1), so statics rather than stack temporaries. */
+    static const char first[]  = "queued-send-one";
+    static const char second[] = "queued-send-two";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(3, "TCP send_async queue (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(3, "TCP send_async queue (connect failed)");
+        return;
+    }
+
+    ctx.loop = axl_loop_new();
+    TcpSendQSlot slot1 = { .ctx = &ctx, .id = 1 };
+    TcpSendQSlot slot2 = { .ctx = &ctx, .id = 2 };
+
+    int rc1 = axl_tcp_send_async(client, first, sizeof(first) - 1,
+                                 ctx.loop, NULL, on_tcp_sendq_done, &slot1);
+    /* No loop iteration between the two: the first send is still in flight. */
+    int rc2 = axl_tcp_send_async(client, second, sizeof(second) - 1,
+                                 ctx.loop, NULL, on_tcp_sendq_done, &slot2);
+
+    test_check(rc1 == AXL_OK && rc2 == AXL_OK,
+               "TCP send_async: second submit is queued");
+
+    axl_loop_add_timeout(ctx.loop, 5000, on_tcp_sendq_timeout, &ctx);
+    axl_loop_run(ctx.loop);
+
+    test_check(ctx.fires == 2
+                   && ctx.status[0] == AXL_OK
+                   && ctx.status[1] == AXL_OK,
+               "TCP send_async: both sends complete AXL_OK");
+
+    test_check(ctx.order[0] == 1 && ctx.order[1] == 2,
+               "TCP send_async: callbacks fire in submission order");
+
+    /* Close before freeing the loop — axl_tcp_close removes sources stamped
+       with it (see test_tcp_recv_async_rearm). */
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+    axl_loop_free(ctx.loop);
+}
+
+// ---------------------------------------------------------------------------
+// Closing with a send still QUEUED must retire it, not strand it.
+//
+// EDK2 SockConnFlush runs SockFlushPendingToken over SndTokenList as well as
+// the processing list (design §3.5). Without that, a caller whose send never
+// reached the wire waits forever on a callback that cannot come, and its token
+// leaks. Sabotage found this untested: deleting the flush left the suite green,
+// because the queue-ordering test above closes only after both sends complete,
+// so the queue is empty by then.
+//
+// Deterministic without running the loop: no loop iteration happens between the
+// two submits, so the first still owns the active slot and the second is
+// necessarily queued; the flush is synchronous inside axl_tcp_close.
+//
+// BOTH halves are pinned, because the queue makes both easy to get wrong: the
+// QUEUED send and the ACTIVE one must each be retired with AXL_CANCELLED.
+// Until send callbacks were deferred, close could not fire the active one —
+// calling a consumer inline from inside teardown re-entered it
+// (on_response_sent -> reset_connection -> axl_tcp_close) and wedged the run —
+// so the active send's callback was silently dropped and its ciphertext copy
+// leaked with it. Retirement now schedules the callback instead of calling it,
+// which is what makes the symmetric contract (EDK2 SockConnFlush runs
+// SockFlushPendingToken over the processing list as well) implementable.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int       fires;
+    AxlStatus last;
+} TcpFlushCtx;
+
+static bool
+on_tcp_flush_cb(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpFlushCtx *c = (TcpFlushCtx *)data;
+    (void)sock;
+    c->fires++;
+    c->last = status;
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_send_async_flush_on_close(void)
+{
+    AxlTcp     *client = NULL;
+    TcpFlushCtx active = { 0 };
+    TcpFlushCtx queued = { 0 };
+    AxlLoop    *loop;
+    static const char a[] = "flush-active-send";
+    static const char b[] = "flush-queued-send";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP send_async close-flush (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(2, "TCP send_async close-flush (connect failed)");
+        return;
+    }
+
+    loop = axl_loop_new();
+    axl_tcp_send_async(client, a, sizeof(a) - 1, loop, NULL,
+                       on_tcp_flush_cb, &active);
+    axl_tcp_send_async(client, b, sizeof(b) - 1, loop, NULL,
+                       on_tcp_flush_cb, &queued);
+
+    /* Tear down with the second send still on the queue. */
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+
+    test_check(queued.fires == 1 && queued.last == AXL_CANCELLED,
+               "TCP send_async: close cancels a queued send");
+
+    /* The ACTIVE send across the same close. Its callback fires too — a send
+       that was ACCEPTED always gets exactly one callback, whichever list it
+       sat on when teardown started. The close drains what it scheduled before
+       returning, so this holds even though the loop is never run and is freed
+       immediately below. */
+    test_check(active.fires == 1 && active.last == AXL_CANCELLED,
+               "TCP send_async: close cancels the active send");
+
+    axl_loop_free(loop);
+}
+
+// ---------------------------------------------------------------------------
+// A send callback that closes its socket must not strand the send behind it.
+//
+// Shape: send A is on the wire, send B is queued behind it. A completes, B is
+// PROMOTED into the active slot, and only then does A's callback run and close
+// the socket. B is active by that point, so a teardown that retires only the
+// queued list drops its callback entirely — its caller waits forever with its
+// borrowed buffer pinned (design §6b defect 1). Barring promotion during close
+// does not help: the promotion already happened.
+//
+// The same test pins the re-entrancy half (defect 2). B's callback fires from
+// INSIDE axl_tcp_close and closes the socket again, which is ordinary consumer
+// code (on_response_sent -> reset_connection -> axl_tcp_close; s9p_on_send;
+// sdk/examples/tcp-echo-server.c). The nested close must not run a second
+// teardown over firmware state the outer one already released, and must not
+// free the socket while the outer close is still using it.
+//
+// Deterministic ordering: the deferred-callback drain runs at the TOP of a loop
+// iteration, before any event is waited on or dispatched, so A's completion
+// (iteration N) and A's callback (iteration N+1) can never be separated by B's
+// completion.
+// ---------------------------------------------------------------------------
+typedef struct {
+    AxlLoop  *loop;
+    int       a_fires;
+    int       b_fires;
+    AxlStatus a_status;
+    AxlStatus b_status;
+} TcpCloseCbCtx;
+
+static bool
+on_tcp_closecb_b(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpCloseCbCtx *c = (TcpCloseCbCtx *)data;
+    c->b_fires++;
+    c->b_status = status;
+    /* Re-entrant close, from a callback the close itself fired. RESET so the
+       teardown finalizes inline rather than deferring to a close event on a
+       loop this test is about to quit. */
+    axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_closecb_a(AxlTcp *sock, AxlStatus status, void *data)
+{
+    TcpCloseCbCtx *c = (TcpCloseCbCtx *)data;
+    c->a_fires++;
+    c->a_status = status;
+    axl_tcp_close(sock, AXL_TEARDOWN_RESET);
+    return AXL_SOURCE_REMOVE;
+}
+
+static bool
+on_tcp_closecb_timeout(void *data)
+{
+    TcpCloseCbCtx *c = (TcpCloseCbCtx *)data;
+    axl_loop_quit(c->loop);
+    return AXL_SOURCE_REMOVE;
+}
+
+static void
+test_tcp_send_close_from_send_callback(void)
+{
+    AxlTcp       *client = NULL;
+    TcpCloseCbCtx ctx    = { 0 };
+    static const char a[] = "closecb-send-active";
+    static const char b[] = "closecb-send-promoted";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP send_async close-from-callback (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(2, "TCP send_async close-from-callback (connect failed)");
+        return;
+    }
+
+    ctx.loop = axl_loop_new();
+    axl_tcp_send_async(client, a, sizeof(a) - 1, ctx.loop, NULL,
+                       on_tcp_closecb_a, &ctx);
+    axl_tcp_send_async(client, b, sizeof(b) - 1, ctx.loop, NULL,
+                       on_tcp_closecb_b, &ctx);
+
+    axl_loop_add_timeout(ctx.loop, 5000, on_tcp_closecb_timeout, &ctx);
+    axl_loop_run(ctx.loop);
+
+    test_check(ctx.a_fires == 1 && ctx.a_status == AXL_OK,
+               "TCP send_async: completed send reports AXL_OK to its callback");
+    test_check(ctx.b_fires == 1 && ctx.b_status == AXL_CANCELLED,
+               "TCP send_async: a close from a send callback retires the "
+               "promoted send");
+
+    /* No close here — on_tcp_closecb_a already closed the socket. */
+    axl_loop_free(ctx.loop);
+}
+
+// ---------------------------------------------------------------------------
+// The SYNC send must not block behind another caller's send.
+//
+// axl_tcp_send builds an ephemeral loop and runs it until its own send
+// completes. If another caller's send already owns the transport, this one is
+// queued — and the promotion that would start it is driven by the active
+// send's completion source, which sits on the OTHER caller's loop. That loop
+// is not running (this one is), so nothing advances and the wrapper waits out
+// its entire timeout, 10 s by default, before reporting failure (design §6b
+// defect 4).
+//
+// It refuses instead. A sync wrapper's contract is "done when I return", and
+// it cannot honour that behind a send whose progress it does not drive; the
+// caller learns immediately and can use the async API, which DOES queue. This
+// is the sync shell declining to queue, not the transport refusing a send —
+// axl_tcp_send_async still never refuses (design §3.2).
+//
+// Deterministic: `bg` is never run, so the first send necessarily still owns
+// the transport. Timed, because the failure mode being pinned is the DELAY —
+// a 3 s timeout burned to the last millisecond returns the same status.
+// ---------------------------------------------------------------------------
+static void
+test_tcp_send_sync_behind_async(void)
+{
+    AxlTcp     *client = NULL;
+    AxlLoop    *bg;
+    TcpFlushCtx bgctx = { 0 };
+    uint64_t    t0;
+    uint64_t    elapsed_us;
+    int         rc;
+    static const char first[]  = "sync-behind-async-first";
+    static const char second[] = "sync-behind-async-second";
+
+    if (!axl_net_is_available()) {
+        test_skip_n(2, "TCP sync send behind async (no network)");
+        return;
+    }
+    if (axl_tcp_connect(AXL_TEST_ECHO_HOST, 9999, &client) != AXL_OK) {
+        test_skip_n(2, "TCP sync send behind async (connect failed)");
+        return;
+    }
+
+    bg = axl_loop_new();
+    axl_tcp_send_async(client, first, sizeof(first) - 1, bg, NULL,
+                       on_tcp_flush_cb, &bgctx);
+
+    t0         = axl_time_get_us();
+    rc         = axl_tcp_send(client, second, sizeof(second) - 1, 3000);
+    elapsed_us = axl_time_get_us() - t0;
+
+    test_check(rc == AXL_ERR,
+               "TCP send (sync): refuses behind another caller's send");
+    test_check(elapsed_us < 1000ULL * 1000ULL,
+               "TCP send (sync): refusal is immediate, not a burnt timeout");
+
+    axl_tcp_close(client, AXL_TEARDOWN_GRACEFUL);
+    axl_loop_free(bg);
 }
 
 static void
@@ -4014,6 +4403,97 @@ test_http_request_helpers(void)
     AxlJsonReader  bad_reader = { 0 };
     test_check(!axl_http_request_get_json(&bad_req, &bad_reader),
                "request_get_json: rejects malformed JSON");
+
+    /* STRICT, and until now nothing checked it. The docstring promises RFC
+       8259 on the grounds that a request body comes from a client that may be
+       hostile — but "{not-json" above is refused by EVERY dialect, so it
+       cannot tell strict from liberal. This body is valid JSON5 and invalid
+       JSON, which is the only input that can. */
+    {
+        const char    *json5 = "{/*c*/ name: 'axl', port: 0x23, }";
+        AxlHttpRequest j5_req = { 0 };
+        AxlJsonReader  j5_reader = { 0 };
+
+        j5_req.body      = json5;
+        j5_req.body_size = axl_strlen(json5);
+        test_check(!axl_http_request_get_json(&j5_req, &j5_reader),
+                   "request_get_json: refuses JSON5 — a request body is "
+                   "strict RFC 8259, whatever dialect the caller could "
+                   "have named");
+    }
+}
+
+/* axl_http_response_get_json — the client-side mirror.
+ *
+ * Same contract as the request-side helper and the same reason for it: a
+ * response body arrives from a peer this process does not control. The point
+ * of the function existing at all is that the EASY call is the strict one, so
+ * the JSON5 row is the one that matters — the rest is NULL hygiene. */
+static void
+test_http_response_get_json(void)
+{
+    /* Happy path, and the reader really works afterwards. */
+    {
+        const char           *body = "{\"port\":9090,\"name\":\"axl\"}";
+        AxlHttpClientResponse resp = { 0 };
+        AxlJsonReader         r = { 0 };
+        int64_t               port = -1;
+
+        resp.body      = (void *)(size_t)body;
+        resp.body_size = axl_strlen(body);
+        test_check(axl_http_response_get_json(&resp, &r),
+                   "response_get_json: parses a valid JSON body");
+        test_check(axl_json_get_int(&r, "port", &port) && port == 9090,
+                   "response_get_json: the reader it fills is usable");
+        axl_json_free(&r);
+    }
+
+    /* THE row this function exists for. */
+    {
+        const char           *json5 = "{/*c*/ name: 'axl', port: 0x23, }";
+        AxlHttpClientResponse resp = { 0 };
+        AxlJsonReader         r = { 0 };
+
+        resp.body      = (void *)(size_t)json5;
+        resp.body_size = axl_strlen(json5);
+        test_check(!axl_http_response_get_json(&resp, &r),
+                   "response_get_json: refuses JSON5 from the network, which "
+                   "an AXL_JSON_RELAXED parse would have accepted");
+    }
+
+    /* Malformed under every dialect. */
+    {
+        const char           *bad = "{not-json";
+        AxlHttpClientResponse resp = { 0 };
+        AxlJsonReader         r = { 0 };
+
+        resp.body      = (void *)(size_t)bad;
+        resp.body_size = axl_strlen(bad);
+        test_check(!axl_http_response_get_json(&resp, &r),
+                   "response_get_json: rejects malformed JSON");
+    }
+
+    /* NULL and empty. A 204 No Content has a NULL body and must not be a
+       crash — it is the ordinary outcome of a DELETE. */
+    {
+        AxlHttpClientResponse empty = { 0 };
+        AxlJsonReader         r = { 0 };
+
+        test_check(!axl_http_response_get_json(&empty, &r),
+                   "response_get_json: an empty body (204) is false, "
+                   "not a crash");
+        test_check(!axl_http_response_get_json(NULL, &r),
+                   "response_get_json: NULL response returns false");
+        {
+            const char           *ok = "{\"a\":1}";
+            AxlHttpClientResponse resp = { 0 };
+
+            resp.body      = (void *)(size_t)ok;
+            resp.body_size = axl_strlen(ok);
+            test_check(!axl_http_response_get_json(&resp, NULL),
+                       "response_get_json: NULL out returns false");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7772,6 +8252,7 @@ test_net_main(
     test_http_parse_range();
     test_http_accepts();
     test_http_request_helpers();
+    test_http_response_get_json();
     test_http_add_routes_variadic();
 
     //
@@ -7833,6 +8314,10 @@ test_net_main(
     test_net_available();
     test_tcp_echo();
     test_tcp_recv_async_rearm();
+    test_tcp_send_async_queued();
+    test_tcp_send_async_flush_on_close();
+    test_tcp_send_close_from_send_callback();
+    test_tcp_send_sync_behind_async();
     test_http_round_trip();
     test_http_response_set_static();
     test_http_response_set_bytes();

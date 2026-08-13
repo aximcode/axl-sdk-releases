@@ -73,6 +73,7 @@
 #include <axl/axl-sys.h>
 #include <axl/axl-cpu.h>
 #include <axl/axl-nvstore.h>
+#include <axl/axl-var.h>
 #include <axl/axl-attempt.h>
 #include <axl/axl-io-port.h>
 #include <axl/axl-boot.h>

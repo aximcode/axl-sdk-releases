@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-ring-buf.h:
+/** @file axl-ring-buf.h
  *
  * Byte-oriented ring buffer (circular buffer) with power-of-2 sizing.
  * Three API layers, each building on the one below:
@@ -25,6 +24,8 @@
 
 #ifndef AXL_RING_BUF_H
 #define AXL_RING_BUF_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -54,7 +55,7 @@ struct AxlRingBuf {
     uint32_t  elem_size;  ///< fixed element size (0 = byte mode)
     uint64_t  pushes_total;  ///< cumulative bytes the producer attempted to push (private)
     uint64_t  pushes_lost;   ///< cumulative bytes invisible to consumer (private)
-    void    (*buf_free)(void *);  ///< buffer deallocator, or NULL if caller-owned
+    void    (*buf_free)(void *) AXL_CB_NOEXCEPT;  ///< buffer deallocator, or NULL if caller-owned
 };
 
 typedef struct AxlRingBuf AxlRingBuf;

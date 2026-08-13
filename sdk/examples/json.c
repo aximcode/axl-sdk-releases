@@ -18,10 +18,25 @@ main(int argc, char **argv)
 
     /* ---- Read ---- */
 
+    /* The dialect is a required argument, and choosing it is the interesting
+     * decision in this example. The rule:
+     *
+     *   AXL_JSON_STRICT   RFC 8259. Anything that crossed the NETWORK — an
+     *                     HTTP body, a WebSocket payload, a Redfish resource.
+     *                     A peer sending JSON5 is broken or probing.
+     *   AXL_JSON_RELAXED  the JSON5 superset: comments, trailing commas,
+     *                     unquoted keys, single quotes, hex literals. For
+     *                     files you read LOCALLY — config, sidecars — where a
+     *                     human writes a comment and that is a feature.
+     *
+     * This document is a literal we wrote ourselves, so strict is the honest
+     * answer. There is deliberately no default to fall into: a reader that
+     * accepts comments is a decision, not something you get by not asking.
+     */
     const char *input = "{\"name\":\"AXL\",\"version\":1,\"uefi\":true}";
     AxlJsonReader r;
 
-    if (!axl_json_parse(input, axl_strlen(input), &r)) {
+    if (!axl_json_parse(input, axl_strlen(input), AXL_JSON_STRICT, &r)) {
         axl_printf("error: JSON parse failed\n");
         return 1;
     }
@@ -48,7 +63,7 @@ main(int argc, char **argv)
     AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
     AxlJsonWriter w;
 
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
         axl_json_kv_str (&w, "greeting", "Hello from UEFI");
         axl_json_kv_uint(&w, "code",     200);
@@ -72,7 +87,7 @@ main(int argc, char **argv)
     /* ---- Write (pretty) ---- */
 
     axl_string_clear(out);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_obj_begin(&w);
         axl_json_kv_str (&w, "greeting", "Hello from UEFI");
         axl_json_kv_uint(&w, "code",     200);

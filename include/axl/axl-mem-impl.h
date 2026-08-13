@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-mem-impl.h:
+/** @file axl-mem-impl.h
  *
  * Implementation details for axl_malloc/free macros.
  * Do NOT include this directly — include axl/axl-mem.h instead.

@@ -461,9 +461,12 @@ one of the harder UEFI bugs to diagnose.
 Today `_axl_cleanup` ([src/posix/axl-app.c:92](https://github.com/aximcode/axl-sdk-releases/blob/main/src/posix/axl-app.c#L92))
 only:
 1. Frees the argv/argc it allocated in `_axl_init`.
-2. Under `AXL_MEM_DEBUG`, calls `axl_mem_dump_leaks()` — a
+2. Under `AXL_MEM_DEBUG`, dumps the leak report — a
    **diagnostic report**, not cleanup. It names what leaked; it
-   doesn't free anything.
+   doesn't free anything. (Since the leak gate landed this is
+   `_axl_mem_dump_leaks_at_exit()`, whose header omits the
+   `(live allocations)` infix that the public `axl_mem_dump_leaks()`
+   carries; the QEMU harness fails a run on the former.)
 
 Phase A7 fixes this by making the library responsible for
 firmware-facing resources it handed to the user, and for running

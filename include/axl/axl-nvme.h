@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-nvme.h:
+/** @file axl-nvme.h
  *
  * NVM Express device identity and health (SMART) over the firmware's
  * EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL. A Platform Access module (like

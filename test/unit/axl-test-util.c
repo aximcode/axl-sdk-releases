@@ -138,8 +138,11 @@ test_feof(void)
     }
 
     test_check(!axl_feof(s), "eof: not eof at start");
-    axl_fread(buf, 1, 64, s);  /* short read: returns 2 */
-    axl_fread(buf, 1, 1, s);   /* returns 0 → sets eof */
+    /* 2 bytes behind a 64-byte request: axl_fread loops, so it is the
+       0-length read at the end of ITS loop that sets eof. The second call
+       then has nothing left and returns 0 items. */
+    axl_fread(buf, 1, 64, s);
+    axl_fread(buf, 1, 1, s);
     test_check(axl_feof(s), "eof: eof after reading past end");
 
     axl_fseek(s, 0, AXL_SEEK_SET);
@@ -683,9 +686,7 @@ test_smbios(void)
                 } else {
                     /* String is short enough to fit; SKIP-balance the
                        three truncation-contract assertions. */
-                    for (int i = 0; i < 3; i++) {
-                        test_check(true, "smbios get_oem_string: SKIP balance (short string)");
-                    }
+                    test_skip_n(3, "smbios get_oem_string: short string");
                 }
 
                 /* NULL *required is allowed even on truncation: pass
@@ -698,8 +699,8 @@ test_smbios(void)
                     test_check(axl_smbios_get_oem_string(1, sentinel, 1, NULL) == AXL_ERR,
                                "smbios get_oem_string: NULL *required tolerated on truncation");
                 } else {
-                    test_check(true,
-                               "smbios get_oem_string: NULL *required SKIP balance (empty source)");
+                    test_skip_n(1, "smbios get_oem_string: NULL *required "
+                                   "(no non-empty OEM string to truncate)");
                 }
             }
 
@@ -726,9 +727,7 @@ test_smbios(void)
             test_check(axl_smbios_get_oem_string(1, buf, sizeof(buf),
                                                  NULL) == AXL_ERR,
                        "smbios get_oem_string: returns -1 with no Type 11");
-            for (int i = 0; i < 9; i++) {
-                test_check(true, "smbios get_oem_string: SKIP balance");
-            }
+            test_skip_n(9, "smbios get_oem_string");
         }
         AxlSmbiosOemStrings oem_bad;
         test_check(axl_smbios_read_oem_strings(bios, &oem_bad) == AXL_ERR,
@@ -1056,6 +1055,38 @@ test_time(void)
     char    buf[32];
     size_t  len;
 
+    /* axl_time_format_at renders a time the caller supplies, so for the first
+       time the format can be pinned EXACTLY. Every assertion below against
+       axl_time_format is a shape probe -- "has a T", "26 chars" -- precisely
+       because it reads a live clock and the value cannot be known. A shape
+       probe cannot catch a wrong field ORDER, a lost zero-pad, or a
+       truncated fraction; this can.
+       (This is what the dispatcher-stamps-once split bought: the renderer no
+       longer owns the reading.) */
+    const AxlRealtime fixed = {
+        .year = 2026, .month = 3, .day = 7,
+        .hour = 4, .minute = 5, .second = 9,
+        .nanosecond = 123456000u,
+    };
+    len = axl_time_format_at(&fixed, buf, sizeof(buf));
+    test_check(len == 26 && axl_strcmp(buf, "2026-03-07T04:05:09.123456") == 0,
+               "time: format_at renders an exact ISO 8601 timestamp");
+
+    /* A NULL time is not an error -- it renders the fixed-width placeholder,
+       so a transcript stays columnar instead of shifting every field after
+       it. This is the contract the log dispatcher relies on when the clock
+       cannot be read. */
+    len = axl_time_format_at(NULL, buf, sizeof(buf));
+    test_check(len == 26 && axl_strcmp(buf, "0000-00-00T00:00:00.000000") == 0,
+               "time: format_at renders a placeholder for a NULL time");
+
+    /* Degenerate buffers report 0 and write nothing usable. 27 is one short
+       of the 26 chars plus NUL, so it must be refused rather than truncated. */
+    test_check(axl_time_format_at(&fixed, NULL, 32) == 0,
+               "time: format_at rejects a NULL buffer");
+    test_check(axl_time_format_at(&fixed, buf, 27) == 0,
+               "time: format_at rejects a buffer one byte too small");
+
     len = axl_time_format(buf, sizeof(buf));
     test_check(len > 0, "time: format returns > 0");
 
@@ -1068,6 +1099,33 @@ test_time(void)
         }
     }
     test_check(has_t, "time: contains T separator");
+
+    // Exact shape: "YYYY-MM-DDThh:mm:ss.uuuuuu", 26 chars. Pinned so the
+    // sub-second work below cannot quietly change the layout.
+    test_check(len == 26, "time: format is exactly 26 chars");
+    test_check(buf[4] == '-' && buf[7] == '-' && buf[10] == 'T'
+               && buf[13] == ':' && buf[16] == ':' && buf[19] == '.',
+               "time: separators at the ISO 8601 positions");
+    bool digits = true;
+    for (size_t i = 20; i < 26; i++) {
+        if (buf[i] < '0' || buf[i] > '9') { digits = false; }
+    }
+    test_check(digits, "time: fractional field is 6 digits");
+
+    // The fractional field must carry real sub-second precision. Firmware
+    // leaves EFI_TIME.Nanosecond at 0 on every platform we test on, so
+    // deriving it from that alone stamps .000000 on every line and lines
+    // within one second cannot be ordered. axl_time_format falls back to the
+    // monotonic counter for exactly this reason (the caveat is that the
+    // fraction then comes from an unrelated epoch, so it can appear to run
+    // backwards inside one wallclock second -- ordering within a second is
+    // NOT implied). Two samples: a single one could legitimately be zero
+    // once in 10^6.
+    char buf2[32];
+    axl_time_format(buf2, sizeof(buf2));
+    bool frac_nonzero = axl_memcmp(buf + 20, "000000", 6) != 0
+                     || axl_memcmp(buf2 + 20, "000000", 6) != 0;
+    test_check(frac_nonzero, "time: fractional field carries sub-second precision");
 }
 
 /* RTC-write API (axl_time_set_realtime / axl_time_set_unix). Only the
@@ -1089,6 +1147,158 @@ test_time_set(void)
        call. */
     test_check(axl_time_set_unix((int64_t)253402300800LL) == AXL_ERR,
                "time: set_unix(year 10000) rejected (out of range)");
+
+    /* A REJECTED write must not damage the clock-read path. The backend's
+       RTC re-entrancy guard keeps a cached reading to serve a nested read
+       from, and an earlier draft of that guard invalidated the cache on
+       every SetTime -- including ones the firmware refused, where the clock
+       never moved and the cached value was still perfectly good. Losing it
+       there would make a subsequent nested read fail, which axl_time_format
+       renders as 0000-00-00T00:00:00.
+       Deterministic, and reachable through public headers: the three
+       rejections above return before any firmware call. */
+    AxlRealtime after_reject;
+    test_check(axl_time_realtime(&after_reject) == AXL_OK
+               && after_reject.year >= 2000,
+               "time: a rejected set leaves the read path intact");
+}
+
+/* RTC wake alarm.
+ *
+ * Firmware-lifecycle API, so the assertions are the SAFE ones: what this
+ * code decides before reaching firmware, and the platform-capability split.
+ * Nothing here double-disarms, programs a past time, or leaves an alarm
+ * armed behind it -- misuse of a runtime service is a hang or a #GP under
+ * UEFI, not a clean error return (feedback_uefi_firmware_test_hazards).
+ *
+ * The whole point of the API is that "no wake timer" and "wake timer
+ * broken" stay distinguishable, so the FIRST thing pinned is that a probe
+ * never answers AXL_ERR on a healthy box. QEMU/OVMF and real hardware
+ * differ on which of the two supported answers comes back, which is why
+ * the populated path is gated and balanced rather than asserted outright.
+ */
+/* Raw firmware memory map.
+ *
+ * The contract a consumer pins against an EDK2 oracle capture: uncoalesced,
+ * raw EFI type numbers, raw attribute bits. Each assertion below exists
+ * because the CLASSIFIED sibling (axl_mem_phys_region_*) gets it wrong for
+ * inventory -- it coalesces, and it folds the type into five buckets, so a
+ * per-type roll-up is unrecoverable from it.
+ */
+static void
+test_memmap_snapshot(void)
+{
+    AxlMemMapEntry *e     = (AxlMemMapEntry *)0xDEADBEEFul;   /* sentinel */
+    size_t          count = 99;
+
+    test_check(axl_memmap_snapshot(NULL, &count) == AXL_INVALID,
+               "memmap: NULL entries rejected");
+    test_check(count == 0, "memmap: count cleared on reject");
+    test_check(axl_memmap_snapshot(&e, NULL) == AXL_INVALID,
+               "memmap: NULL count rejected");
+    test_check(e == NULL, "memmap: entries cleared on reject");
+
+    e = NULL; count = 0;
+    test_check(axl_memmap_snapshot(&e, &count) == AXL_OK,
+               "memmap: snapshot succeeds");
+    test_check(count > 0 && e != NULL, "memmap: reports at least one region");
+
+    /* UNCOALESCED is the whole point, and it is testable rather than
+       assumed: the classified view merges adjacent same-class regions, so
+       the raw map must report strictly MORE entries than it does. A build
+       that quietly reused the coalescing collector would pass every other
+       assertion here. */
+    size_t classified = 0;
+    bool   have_class = (axl_mem_phys_region_count(&classified) == AXL_OK);
+    test_check(have_class && count > classified,
+               "memmap: raw map has more entries than the coalesced view");
+
+    /* Pages, not bytes -- a consumer renders both and derives size from
+       this. Zero-page descriptors are legal in the raw map, so the
+       assertion is on the FIELD being meaningful, not on every entry. */
+    bool sane = true;
+    for (size_t i = 0; i < count; i++) {
+        if (e[i].physical_start + e[i].number_of_pages * 4096ULL
+                < e[i].physical_start) {
+            sane = false;   /* wrapped: pages field is not pages */
+            break;
+        }
+    }
+    test_check(sane, "memmap: start + pages*4K never wraps");
+
+    /* Type names are the EDK2 spelling, which is what an oracle capture
+       compares against byte-for-byte. Pinned exactly, not by substring. */
+    test_check(axl_strcmp(axl_memmap_type_name(7), "ConventionalMemory") == 0,
+               "memmap: type 7 renders as ConventionalMemory");
+    test_check(axl_strcmp(axl_memmap_type_name(4), "BootServicesData") == 0,
+               "memmap: type 4 renders as BootServicesData");
+    test_check(axl_strcmp(axl_memmap_type_name(10), "ACPIMemoryNVS") == 0,
+               "memmap: type 10 renders as ACPIMemoryNVS");
+    test_check(axl_strcmp(axl_memmap_type_name(0), "ReservedMemoryType") == 0,
+               "memmap: type 0 renders as ReservedMemoryType");
+    /* OEM range: must not index off the end of the table. */
+    test_check(axl_strcmp(axl_memmap_type_name(0x70000000u), "Unknown") == 0,
+               "memmap: an OEM type renders as Unknown, not a stray read");
+
+    /* Every entry's type must render to something; a NULL here would be a
+       crash in any consumer formatting the map. */
+    bool all_named = true;
+    for (size_t i = 0; i < count; i++) {
+        const char *nm = axl_memmap_type_name(e[i].type);
+        if (nm == NULL || nm[0] == '\0') {
+            all_named = false;
+            break;
+        }
+    }
+    test_check(all_named, "memmap: every reported type has a name");
+
+    axl_free(e);
+}
+
+static void
+test_time_wakeup(void)
+{
+    /* All-NULL probe: the return code alone answers "has a wake timer",
+       which is the cheapest question a caller can ask. */
+    int probe = axl_time_get_wakeup(NULL, NULL, NULL);
+    test_check(probe == AXL_OK || probe == AXL_UNSUPPORTED,
+               "time wakeup: probe answers OK or UNSUPPORTED, never ERR");
+
+    if (probe == AXL_UNSUPPORTED) {
+        /* A platform with no wake timer must say so CONSISTENTLY -- the
+           read and the write cannot disagree about whether the hardware
+           exists. That is the one thing still worth asserting here, and it
+           needs no alarm to be programmed. */
+        test_check(axl_time_set_wakeup(NULL) == AXL_UNSUPPORTED,
+                   "time wakeup: disarm agrees the platform is unsupported");
+        /* 2, not 3. The supported path runs 4 assertions (probe + full read
+           + partial read + disarm); this branch runs 2 of its own (probe +
+           disarm-agrees), so 2 must be declared for the totals to match. */
+        test_skip_n(2, "time wakeup round-trip (platform has no wake timer)");
+        return;
+    }
+
+    /* Supported. Read the current state with every output requested. */
+    bool        enabled = false;
+    bool        pending = false;
+    AxlRealtime when    = { 0 };
+    test_check(axl_time_get_wakeup(&enabled, &pending, &when) == AXL_OK,
+               "time wakeup: full read succeeds");
+
+    /* Partial reads are the documented ergonomics, not an accident: a
+       caller that only wants "is it armed" should not have to supply a
+       calendar struct. */
+    bool only_enabled = false;
+    test_check(axl_time_get_wakeup(&only_enabled, NULL, NULL) == AXL_OK
+               && only_enabled == enabled,
+               "time wakeup: partial read matches the full read");
+
+    /* Disarm is idempotent and safe on a platform that supports it --
+       unlike a double UNREGISTER, SetWakeupTime(FALSE, NULL) frees
+       nothing and re-issuing it cannot dangle. Leaves the box with no
+       alarm armed, which is also the state the test found it in. */
+    test_check(axl_time_set_wakeup(NULL) == AXL_OK,
+               "time wakeup: disarm succeeds");
 }
 
 static void
@@ -1098,7 +1308,7 @@ test_time_sleep(void)
     uint64_t  after;
 
     before = axl_time_get_ms();
-    test_check(true, "time: get_ms returns");
+    test_survived("time: get_ms returns without faulting");
 
     axl_msleep(50);
     after = axl_time_get_ms();
@@ -1153,23 +1363,26 @@ test_time_get_us(void)
        by the monotonic checks above. */
     if (t1 > t0) {
         uint64_t elapsed = t1 - t0;
+        /* All three arms used to assert true under different labels, so the
+           block could not fail whatever get_us returned -- the one thing it
+           existed to check. Asserting `elapsed >= 1000` inside
+           `if (elapsed >= 1000)` would have been the same tautology in a new
+           spelling, so the surviving arm asserts an UPPER bound instead: a
+           2 ms stall measuring as more than 10 s means the frequency scale is
+           wrong, which is falsifiable and is a bug a lower bound cannot see. */
         if (elapsed >= 1000) {
-            test_check(true,
-                       "time: get_us elapsed >= 1ms after 2ms stall");
+            test_check(elapsed < 10ull * 1000 * 1000,
+                       "time: get_us elapsed >= 1ms and within a sane bound");
         } else {
-            /* TSC paused mid-Stall under host scheduling pressure
-               (KVM) or firmware Stall granularity; not a get_us
-               bug. SKIP-balance the assertion count. */
-            test_check(true,
-                       "time: get_us elapsed >= 1ms after 2ms stall "
-                       "(SKIP — TSC pause under host scheduler)");
+            /* TSC paused mid-Stall under host scheduling pressure (KVM), or
+               firmware Stall granularity. Not a get_us bug, and not
+               measurable here -- so declared, not asserted. */
+            test_skip_n(1, "time: get_us elapsed (TSC paused under the host "
+                           "scheduler)");
         }
     } else {
-        /* Calibration not available on this arch (counter returned
-           0) — elapsed is meaningless; SKIP-balance. */
-        test_check(true,
-                   "time: get_us elapsed >= 1ms after 2ms stall (SKIP "
-                   "— no cycle counter)");
+        /* No cycle counter on this arch, so elapsed is meaningless. */
+        test_skip_n(1, "time: get_us elapsed (no cycle counter)");
     }
 }
 
@@ -1193,10 +1406,7 @@ test_clock_gettime(void)
     if (rc_a != AXL_OK) {
         /* Architecture without a usable cycle counter. SKIP-balance
            the 7 populated-path assertions below. */
-        axl_printf("SKIP: clock_gettime MONOTONIC (no counter)\n");
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "clock_gettime: SKIP balance");
-        }
+        test_skip_n(7, "clock_gettime MONOTONIC (no counter)");
     } else {
         test_check(rc_a == AXL_OK,
                    "clock_gettime: MONOTONIC returns OK");
@@ -1244,10 +1454,7 @@ test_clock_gettime(void)
     AxlTimespec wall = {0, 0};
     int rc_w = axl_clock_gettime(AXL_CLOCK_REALTIME, &wall);
     if (rc_w != AXL_OK) {
-        axl_printf("SKIP: clock_gettime REALTIME (RTC unavailable)\n");
-        for (int i = 0; i < 2; i++) {
-            test_check(true, "clock_gettime REALTIME: SKIP balance");
-        }
+        test_skip_n(2, "clock_gettime REALTIME (RTC unavailable)");
     } else {
         test_check(rc_w == AXL_OK,
                    "clock_gettime: REALTIME returns OK");
@@ -1288,6 +1495,22 @@ test_env(void)
     val = axl_getenv("AXL_TEST_VAR");
     test_check(val == NULL, "env: unset var is gone");
     axl_free(val);
+
+    /* axl_diag_startup reads AXL_DIAG through axl_getenv, whose result is
+       OWNED. It used to drop that string on both the gated-off early return
+       and the fall-through, so every tool calling it leaked once per run for
+       as long as AXL_DIAG was set. The docstring even promised "no
+       allocation beyond the UTF-8 conversion buffers (auto-freed)" while it
+       did. Balance live allocations across a real, enabled call — the dump
+       output below is the price of testing the path that actually leaked. */
+    AxlMemStats diag_before, diag_after;
+    axl_setenv("AXL_DIAG", "1", true);
+    axl_mem_get_stats(&diag_before);
+    axl_diag_startup(0, NULL);
+    axl_mem_get_stats(&diag_after);
+    test_check(diag_after.count == diag_before.count,
+               "diag: startup with AXL_DIAG set releases everything it allocates");
+    axl_unsetenv("AXL_DIAG");
 
     /* Get missing */
     val = axl_getenv("AXL_NO_SUCH_VAR_XYZ");
@@ -1598,12 +1821,7 @@ test_volume_get_space(void)
     AxlVolume vols[8];
     size_t    filled = 0;
     if (axl_volume_enumerate(vols, 8, &filled) != AXL_OK || filled == 0) {
-        test_check(true, "vol space: no volumes enumerated - query SKIPPED");
-        test_check(true, "vol space: no volumes enumerated - total SKIPPED");
-        test_check(true, "vol space: no volumes enumerated - free SKIPPED");
-        test_check(true, "vol space: no volumes enumerated - handle SKIPPED");
-        test_check(true, "vol space: no volumes enumerated - agree SKIPPED");
-        test_check(true, "vol space: no volumes enumerated - absent SKIPPED");
+        test_skip_n(6, "vol space: no volumes enumerated - query SKIPPED");
         return;
     }
 
@@ -2070,7 +2288,7 @@ test_config(void)
 
     /* Free NULL is safe */
     axl_config_free(NULL);
-    test_check(true, "config: free(NULL) no crash");
+    test_survived("config: free(NULL) no crash");
 }
 
 /* The added min/max descriptor fields are SYNTHESIS-ONLY metadata (like
@@ -3184,7 +3402,7 @@ test_subcommand_dispatch(void)
     axl_subcommand_print_help(NULL, 0, "mytool");
     axl_subcommand_print_command_help(&cmds[0], "mytool");
     axl_subcommand_print_command_help(NULL, "mytool");
-    test_check(true, "subcommand: print fns don't crash");
+    test_survived("subcommand: print fns don't crash");
 }
 #pragma GCC diagnostic pop
 
@@ -3683,6 +3901,22 @@ test_protocol_registry(void)
                "protocol: register_name rejects NULL guid");
     test_check(axl_protocol_register_name("", &svc_a) != AXL_OK,
                "protocol: register_name rejects empty name");
+
+    // The name is stored inline in the fixed table (64 bytes with the NUL),
+    // so an over-long one is REJECTED rather than truncated — a truncated
+    // pin would silently answer to a name nobody registered. 63 chars is
+    // the longest that fits; 64 is one too many.
+    char name63[64], name64[65];
+    for (size_t i = 0; i < 63; i++) { name63[i] = 'n'; }
+    name63[63] = '\0';
+    for (size_t i = 0; i < 64; i++) { name64[i] = 'm'; }
+    name64[64] = '\0';
+    test_check(axl_protocol_register_name(name63, &svc_a) == AXL_OK,
+               "protocol: register_name accepts a 63-char name");
+    test_check(axl_protocol_register_name(name64, &svc_a) != AXL_OK,
+               "protocol: register_name rejects a 64-char name (no truncation)");
+    test_check(axl_protocol_register_name(name63, &svc_b) != AXL_OK,
+               "protocol: the 63-char name really was pinned, not truncated");
 
     // 2. Refuse to shadow built-in well-known names
     test_check(axl_protocol_register_name("smbios", &svc_a) != AXL_OK,
@@ -4450,7 +4684,7 @@ test_attempt(void)
     axl_attempt_log(&at, NULL);
     axl_attempt_quarantine(NULL, "x");
     axl_attempt_quarantine(&at, NULL);
-    test_check(true, "attempt: void entry points absorb NULL without faulting");
+    test_survived("attempt: void entry points absorb NULL without faulting");
 
     /* A name that can't be read back must not be written: axl_nvstore_get
        fails outright (not truncates) on an over-long value, so the breadcrumb
@@ -4465,21 +4699,8 @@ test_attempt(void)
        authenticated variable policy); skip cleanly rather than fail. */
     axl_attempt_clear(&at);
     if (!axl_attempt_begin(&at, "Aaa.efi")) {
-        axl_printf("SKIP: attempt round-trip (NVRAM write refused)\n");
+        test_skip_n(13, "attempt round-trip (NVRAM write refused)");
         /* Balance the 13 assertions in the populated branch. */
-        test_check(true, "attempt: SKIP balance 1");
-        test_check(true, "attempt: SKIP balance 2");
-        test_check(true, "attempt: SKIP balance 3");
-        test_check(true, "attempt: SKIP balance 4");
-        test_check(true, "attempt: SKIP balance 5");
-        test_check(true, "attempt: SKIP balance 6");
-        test_check(true, "attempt: SKIP balance 7");
-        test_check(true, "attempt: SKIP balance 8");
-        test_check(true, "attempt: SKIP balance 9");
-        test_check(true, "attempt: SKIP balance 10");
-        test_check(true, "attempt: SKIP balance 11");
-        test_check(true, "attempt: SKIP balance 12");
-        test_check(true, "attempt: SKIP balance 13");
         return;
     }
 
@@ -4579,10 +4800,8 @@ test_driver_load_dir_guarded(void)
 
     AxlAttempt at;
     if (axl_attempt_init(&at, "axltest-guard", &TEST_ATTEMPT_GUID) != AXL_OK) {
-        axl_printf("SKIP: load_dir_guarded live guard (namespace unavailable)\n");
+        test_skip_n(2, "load_dir_guarded live guard (namespace unavailable)");
         /* Balance the 2 assertions in the populated branch. */
-        test_check(true, "load_dir_guarded: SKIP balance 1");
-        test_check(true, "load_dir_guarded: SKIP balance 2");
         return;
     }
     n = 12345;
@@ -4603,6 +4822,28 @@ typedef struct {
     int   matches;
     char  last_key[64];
 } NvstoreIterCtx;
+
+/* Stops the walk on the first key, returning whatever value the test
+   planted. Exists to pin the EARLY-STOP contract: iter must hand the
+   caller's value back verbatim, including negative values that collide
+   with AXL_* constants -- a -8 from a callback must not be read as
+   AXL_NO_RESOURCES from the walk underneath. */
+typedef struct {
+    int  stop_with;   ///< value the callback returns
+    int  calls;       ///< times it was invoked
+} NvstoreStopCtx;
+
+static int
+nvstore_iter_stop_cb(
+    const char  *key,
+    void        *ctx
+    )
+{
+    (void)key;
+    NvstoreStopCtx *c = (NvstoreStopCtx *)ctx;
+    c->calls++;
+    return c->stop_with;
+}
 
 static int
 nvstore_iter_cb(
@@ -4636,8 +4877,17 @@ test_nvstore_roundtrip(void)
                              AXL_NV_PERSISTENT | AXL_NV_BOOT);
     if (rc != AXL_OK) {
         /* Some firmware reject app-namespace writes (e.g. with
-           authentication policies). Skip cleanly. */
-        axl_printf("SKIP: nvstore round-trip (set returned -1)\n");
+           authentication policies). Skip cleanly -- and BALANCED.
+           This guards the whole function, so a bare "SKIP:" here drops
+           all 44 assertions below with nothing declared in their place
+           and the ratchet fails on an image that is merely stricter,
+           not broken. The two nested skips further down were already
+           balanced; this outer one was not, which is the easy one to
+           miss precisely because it reads like an early return rather
+           than a skipped block. 44 = every test_check in this
+           function; the nested test_skip_n calls keep their own
+           sub-counts, so the total stays 44 either way. */
+        test_skip_n(44, "nvstore round-trip (app-namespace write refused)");
         return;
     }
     test_check(rc == AXL_OK, "nvstore: set app/AxlTestKey");
@@ -4666,6 +4916,25 @@ test_nvstore_roundtrip(void)
     int iter_rc = axl_nvstore_iter("app", nvstore_iter_cb, &ctx);
     test_check(iter_rc == 0, "nvstore: iter completes");
     test_check(ctx.matches >= 1, "nvstore: iter finds at least one key");
+
+    /* EARLY STOP. iter returns the callback's value verbatim and stops
+       walking. Both cases matter, and neither was covered before: a
+       plain positive stop, and a NEGATIVE stop whose value collides
+       with an AXL_* constant. iter runs on a shared walk that reports
+       its own failures as AXL_* codes, so a callback stopping with -8
+       must still come back as -8 and not be mistaken for the walk's
+       AXL_NO_RESOURCES. */
+    NvstoreStopCtx stop1 = { 1, 0 };
+    test_check(axl_nvstore_iter("app", nvstore_iter_stop_cb, &stop1) == 1,
+               "nvstore iter: returns the callback's stop value (1)");
+    test_check(stop1.calls == 1, "nvstore iter: stops on the first key");
+
+    NvstoreStopCtx stop2 = { AXL_NO_RESOURCES, 0 };
+    test_check(axl_nvstore_iter("app", nvstore_iter_stop_cb, &stop2)
+                   == AXL_NO_RESOURCES,
+               "nvstore iter: a callback stopping with -8 is not the walk's "
+               "own AXL_NO_RESOURCES");
+    test_check(stop2.calls == 1, "nvstore iter: negative stop also halts");
 
     /* axl_nvstore_get_alloc — heap-allocated read variant.
        Allocation succeeds, payload matches, byte one past the
@@ -4729,9 +4998,7 @@ test_nvstore_roundtrip(void)
     } else {
         /* Some firmware reject zero-byte SetVariable. SKIP-balance
            the three populated-path assertions. */
-        for (int i = 0; i < 3; i++) {
-            test_check(true, "nvstore get_alloc empty: SKIP balance");
-        }
+        test_skip_n(3, "nvstore get_alloc empty");
     }
 
     /* axl_nvstore_set_str / axl_nvstore_get_str — string-payload
@@ -4779,9 +5046,7 @@ test_nvstore_roundtrip(void)
     } else {
         /* Firmware refused our string write — SKIP-balance the 8
            populated-path assertions above. */
-        for (int i = 0; i < 8; i++) {
-            test_check(true, "nvstore set_str/get_str: SKIP balance");
-        }
+        test_skip_n(8, "nvstore set_str/get_str");
     }
 
     /* NULL-arg guards on set_str / get_str. */
@@ -4813,6 +5078,131 @@ test_nvstore_roundtrip(void)
     sz = sizeof(buf);
     test_check(axl_nvstore_get("app", key, buf, &sz) == AXL_ERR,
                "nvstore: get after delete returns -1");
+}
+
+// ---------------------------------------------------------------------------
+// AxlVar — unscoped UEFI variable inspection (read-only)
+// ---------------------------------------------------------------------------
+
+static void
+test_var_enumerate(void)
+{
+    AxlVarInfo *vars  = (AxlVarInfo *)0xDEADBEEFul;  /* deliberate sentinel */
+    size_t      count = 99;
+
+    /* NULL-arg guards, and the documented clearing of whichever out
+       param IS valid -- a caller that frees unconditionally must be
+       safe even on the reject path. */
+    test_check(axl_var_enumerate(NULL, &count) == AXL_INVALID,
+               "var enumerate: NULL vars rejected");
+    test_check(count == 0, "var enumerate: count cleared on NULL vars");
+    test_check(axl_var_enumerate(&vars, NULL) == AXL_INVALID,
+               "var enumerate: NULL count rejected");
+    test_check(vars == NULL, "var enumerate: vars cleared on NULL count");
+
+    /* The real walk. Every UEFI machine carries variables (PlatformLang,
+       ConOut, Timeout, ...), so an empty store here would itself be the
+       bug -- the contract permits count 0, the firmware does not produce
+       it. */
+    vars  = NULL;
+    count = 0;
+    test_check(axl_var_enumerate(&vars, &count) == AXL_OK,
+               "var enumerate: succeeds");
+    test_check(count > 0, "var enumerate: firmware reports at least one variable");
+    test_check(vars != NULL, "var enumerate: array non-NULL when count > 0");
+
+    bool all_named = (vars != NULL && count > 0);
+    for (size_t i = 0; vars != NULL && i < count; i++) {
+        if (vars[i].name == NULL || vars[i].name[0] == '\0') {
+            all_named = false;
+            break;
+        }
+    }
+    test_check(all_named, "var enumerate: every entry has a non-empty name");
+
+    /* Guards on read. Borrow a real vendor GUID from the walk so the
+       only thing under test is the argument validation. */
+    AxlGuid probe = { 0 };
+    if (vars != NULL && count > 0) {
+        probe = vars[0].vendor;
+    }
+    void   *rdata = NULL;
+    size_t  rsize = 0;
+    test_check(axl_var_read(NULL, &probe, NULL, &rdata, &rsize) == AXL_INVALID,
+               "var read: NULL name rejected");
+    test_check(axl_var_read("AxlNoSuchVar", NULL, NULL, &rdata, &rsize) == AXL_INVALID,
+               "var read: NULL vendor rejected");
+    test_check(axl_var_read("AxlNoSuchVar", &probe, NULL, &rdata, NULL) == AXL_INVALID,
+               "var read: non-NULL data with NULL size rejected");
+    test_check(axl_var_read("AxlNoSuchVar", &probe, NULL, &rdata, &rsize)
+                   == AXL_NOT_FOUND,
+               "var read: absent variable is NOT_FOUND, not ERR");
+
+    axl_free(vars);
+    vars  = NULL;
+    count = 0;
+
+    /* Round-trip against a variable we control. Firmware that refuses
+       app-namespace writes skips the whole populated block; keep the
+       balancer equal to its assertion count. */
+    const char  key[]     = "AxlVarProbe";
+    const char  payload[] = "VAR-PROBE";
+    if (axl_nvstore_set("app", key, payload, sizeof(payload),
+                        AXL_NV_PERSISTENT | AXL_NV_BOOT) != AXL_OK) {
+        test_skip_n(11, "var enumerate/read round-trip (app-namespace write refused)");
+        return;
+    }
+
+    test_check(axl_var_enumerate(&vars, &count) == AXL_OK,
+               "var enumerate: succeeds after write");
+
+    const AxlVarInfo *found = NULL;
+    for (size_t i = 0; vars != NULL && i < count; i++) {
+        if (axl_strcmp(vars[i].name, key) == 0) {
+            found = &vars[i];
+            break;
+        }
+    }
+    test_check(found != NULL,
+               "var enumerate: finds a variable written through nvstore");
+
+    /* The size is reported WITHOUT the payload having been read -- that
+       is the contract this pins. */
+    test_check(found != NULL && found->size == sizeof(payload),
+               "var enumerate: reports exact payload size");
+    test_check(found != NULL && (found->attrs & AXL_NV_PERSISTENT) != 0,
+               "var enumerate: reports PERSISTENT attribute");
+
+    /* Read it back using the GUID the WALK discovered, not one we
+       supplied -- that round-trip is the whole point of the header. */
+    uint32_t attrs = 0;
+    rdata = NULL;
+    rsize = 0;
+    int rc = (found != NULL)
+        ? axl_var_read(key, &found->vendor, &attrs, &rdata, &rsize)
+        : AXL_ERR;
+    test_check(rc == AXL_OK, "var read: succeeds with the enumerated GUID");
+    test_check((attrs & AXL_NV_PERSISTENT) != 0,
+               "var read: reports the attributes it was given");
+    test_check(rsize == sizeof(payload), "var read: size matches payload");
+    test_check(rdata != NULL && rsize == sizeof(payload)
+                   && axl_memcmp(rdata, payload, sizeof(payload)) == 0,
+               "var read: bytes match payload");
+    test_check(rdata != NULL && ((const uint8_t *)rdata)[rsize] == 0,
+               "var read: byte past payload is zero-extended");
+    axl_free(rdata);
+
+    /* Size-only form: no payload transferred, same size reported. */
+    size_t probe_size = 0;
+    int    prc = (found != NULL)
+        ? axl_var_read(key, &found->vendor, NULL, NULL, &probe_size)
+        : AXL_ERR;
+    test_check(prc == AXL_OK, "var read: size-only form succeeds with NULL data");
+    test_check(probe_size == sizeof(payload),
+               "var read: size-only form reports the same size");
+
+    axl_free(vars);
+    axl_nvstore_delete("app", key);
 }
 
 // ---------------------------------------------------------------------------
@@ -4910,11 +5300,7 @@ test_boot(void)
     if (set_rc != AXL_OK) {
         /* On firmware that still rejects, leave the rest as a
            single shape-pass to keep the test count stable. */
-        test_check(true, "boot: round-trip skipped on this firmware");
-        test_check(true, "boot: round-trip skipped on this firmware");
-        test_check(true, "boot: round-trip skipped on this firmware");
-        test_check(true, "boot: round-trip skipped on this firmware");
-        test_check(true, "boot: round-trip skipped on this firmware");
+        test_skip_n(5, "boot: round-trip skipped on this firmware");
         return;
     }
 
@@ -5136,11 +5522,8 @@ test_cpu_register_exception(void)
         test_check(axl_cpu_unregister_exception(valid) == AXL_OK,
                    "cpu_unregister: already-unregistered returns AXL_OK");
     } else {
-        axl_printf("SKIP: cpu_register live path (EFI_CPU_ARCH_PROTOCOL not published)\n");
+        test_skip_n(3, "cpu_register live path (EFI_CPU_ARCH_PROTOCOL not published)");
         /* Balance the 3 assertions in the populated branch. */
-        test_check(true, "cpu_register: SKIP balance 1");
-        test_check(true, "cpu_register: SKIP balance 2");
-        test_check(true, "cpu_register: SKIP balance 3");
     }
 
     /* Unregister out-of-range is AXL_ERR. KIND_MAX is the only
@@ -5370,8 +5753,7 @@ test_shell_launch(void)
     test_check(src != AXL_SHELL_NONE,
                "shell_locate: a Shell is available under OVMF/AAVMF");
     if (src == AXL_SHELL_FILE) {
-        axl_printf("SKIP: shell_locate FIRMWARE (a Shell.efi file is staged)\n");
-        test_check(true, "shell_locate: SKIP balance (Shell.efi file staged)");
+        test_skip_n(1, "shell_locate FIRMWARE (a Shell.efi file is staged)");
     } else {
         test_check(src == AXL_SHELL_FIRMWARE,
                    "shell_locate: firmware-embedded Shell found (no file staged)");
@@ -5524,6 +5906,7 @@ extern EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *
 _axl_console_tap_test_coninex(AxlConsoleTap *t);
 extern void _axl_console_tap_test_clear(void);
 extern void _axl_console_tap_test_puts(const char *ascii);
+extern void _axl_console_tap_test_puts16(const uint16_t *units);
 extern void _axl_console_tap_test_set_cursor(uint32_t col, uint32_t row);
 extern void _axl_console_tap_test_set_attr(uint32_t attr);
 extern void _axl_console_tap_test_enable_cursor(bool visible);
@@ -6609,6 +6992,48 @@ test_console_term_output(void)
     axl_console_term_free(t);
 }
 
+/* The grid's cell encode. A cell's bytes are handed straight to the glyph
+   renderer AND to the clipboard, so re-encoding a lone surrogate in its 3-byte
+   shape would put WTF-8 into both. Substitute U+FFFD, matching what the tap now
+   emits on the producer side and what every AXL decoder does with malformed
+   input. */
+static void
+test_console_term_utf8(void)
+{
+    static const char in_e9[]   = { (char)0xC3, (char)0xA9, '\0' };
+    static const char in_eur[]  = { (char)0xE2, (char)0x82, (char)0xAC, '\0' };
+    static const char in_sur[]  = { (char)0xED, (char)0xA0, (char)0x80, '\0' };
+    static const char e_fffd[]  = { (char)0xEF, (char)0xBF, (char)0xBD, '\0' };
+
+    AxlConsoleTermConfig cfg = { .cols = 20, .rows = 5 };
+    AxlConsoleTerm      *t   = axl_console_term_new(&cfg);
+    void                *u   = NULL;
+    const AxlConsoleOps *ops = axl_console_term_ops(t, &u);
+    char                 c[5];
+
+    ops->output_text(u, in_e9, 2);
+    test_check(_axl_console_term_test_cell(t, 0, 0, c, NULL, NULL)
+                   && axl_strcmp(c, in_e9) == 0,
+               "term-utf8: U+00E9 stored as C3 A9 in one cell");
+
+    ops->output_text(u, in_eur, 3);
+    test_check(_axl_console_term_test_cell(t, 0, 1, c, NULL, NULL)
+                   && axl_strcmp(c, in_eur) == 0,
+               "term-utf8: U+20AC stored as E2 82 AC in one cell");
+
+    ops->output_text(u, in_sur, 3);
+    test_check(_axl_console_term_test_cell(t, 0, 2, c, NULL, NULL)
+                   && axl_strcmp(c, e_fffd) == 0,
+               "term-utf8: a lone surrogate is stored as U+FFFD, not WTF-8");
+
+    uint32_t cr = 99, cc = 99;
+    _axl_console_term_test_cursor(t, &cr, &cc);
+    test_check(cr == 0 && cc == 3,
+               "term-utf8: three multi-byte codepoints occupied three cells");
+
+    axl_console_term_free(t);
+}
+
 /* Scrollback: lines that scroll off the top land in the history ring; scroll()
    navigates it with clamping. */
 static void
@@ -7328,6 +7753,77 @@ test_console_tap_sanitize(void)
 }
 
 // ---------------------------------------------------------------------------
+// The tap's UCS-2 -> UTF-8 encode. output_text is contractually a UTF-8 run
+// (axl-console-ops.h), and the console is UCS-2, so a lone surrogate CODE UNIT
+// has no UTF-8 spelling: encoding it in its 3-byte shape anyway is WTF-8, which
+// every conforming decoder downstream (a remote xterm, axl-console-term's grid,
+// the clipboard) refuses. Substitute U+FFFD instead of dropping, so the run
+// stays one cell per code unit -- the tap's own reported cell rule.
+// ---------------------------------------------------------------------------
+
+static void
+test_console_tap_utf8(void)
+{
+    /* Byte arrays, not escaped literals: the point is the exact wire bytes. */
+    static const char e_e9[]   = { (char)0xC3, (char)0xA9, '\0' };
+    static const char e_eur[]  = { (char)0xE2, (char)0x82, (char)0xAC, '\0' };
+    static const char e_fffd[] = { (char)0xEF, (char)0xBF, (char)0xBD, '\0' };
+
+    AxlConsoleTap *t = cm_tap_begin(80, 25, false, false, /*passthrough=*/false);
+
+    /* Non-ASCII BMP text is exactly what the tap carries that TerminalDxe's
+       ASCII-only wire could not, so both multi-byte arms need pinning. */
+    static const uint16_t u_e9[] = { 0x00E9, 0 };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_e9);
+    test_check(axl_strcmp(cm_cap, e_e9) == 0,
+               "tap-utf8: U+00E9 emits the 2-byte sequence C3 A9");
+
+    static const uint16_t u_eur[] = { 0x20AC, 0 };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_eur);
+    test_check(axl_strcmp(cm_cap, e_eur) == 0,
+               "tap-utf8: U+20AC emits the 3-byte sequence E2 82 AC");
+
+    static const uint16_t u_hi[] = { 0xD800, 0 };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_hi);
+    test_check(axl_strcmp(cm_cap, e_fffd) == 0,
+               "tap-utf8: a lone high surrogate emits U+FFFD, not 3-byte WTF-8");
+
+    static const uint16_t u_lo[] = { 0xDFFF, 0 };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_lo);
+    test_check(axl_strcmp(cm_cap, e_fffd) == 0,
+               "tap-utf8: a lone low surrogate emits U+FFFD, not 3-byte WTF-8");
+
+    /* U+FFFD itself is an ordinary 3-byte glyph -- the substitution must not be
+       reachable only by accident of the surrogate's byte length. */
+    static const uint16_t u_rep[] = { 0xFFFD, 0 };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_rep);
+    test_check(axl_strcmp(cm_cap, e_fffd) == 0,
+               "tap-utf8: a literal U+FFFD passes through unchanged");
+
+    /* Inline, mid-run: substituting keeps the byte run and the cursor in step.
+       Dropping would have advanced the column without emitting a glyph. */
+    _axl_console_tap_test_set_cursor(0, 0);
+    static const uint16_t u_mix[] = { 'a', 0xD800, 'b', 0 };
+    static const char     e_mix[] = { 'a', (char)0xEF, (char)0xBF, (char)0xBD,
+                                      'b', '\0' };
+    cm_cap_reset();
+    _axl_console_tap_test_puts16(u_mix);
+    test_check(axl_strcmp(cm_cap, e_mix) == 0,
+               "tap-utf8: the substitution sits inline between the run's glyphs");
+    int32_t col = -1, row = -1;
+    _axl_console_tap_test_get_cursor(t, &col, &row);
+    test_check(col == 3 && row == 0,
+               "tap-utf8: the substituted U+FFFD advances exactly one cell");
+
+    cm_tap_end(t);
+}
+
+// ---------------------------------------------------------------------------
 // The tap must OWN its SIMPLE_TEXT_OUTPUT_MODE when it is the only console
 // writer. REGRESSION: install did `my_conout = *orig_conout`, which aliases the
 // ORIGINAL's Mode pointer; the original driver is the only thing that maintains
@@ -7631,10 +8127,7 @@ test_image_verify_signature(void)
     if (rc != AXL_OK) {
         /* Test EFI not staged here — SKIP-balance the populated
            path's 6 assertions (4 sig fields + 2 CN-NULL pins). */
-        axl_printf("SKIP: image_verify (no AxlTestRuntime.efi)\n");
-        for (int i = 0; i < 6; i++) {
-            test_check(true, "image_verify: SKIP balance");
-        }
+        test_skip_n(6, "image_verify (no AxlTestRuntime.efi)");
         return;
     }
     test_check(rc == AXL_OK,
@@ -10886,6 +11379,7 @@ test_util_main(int argc, char **argv)
     test_attempt();
     test_driver_load_dir_guarded();
     test_nvstore_roundtrip();
+    test_var_enumerate();
     test_boot();
     test_app_boot_path();
     test_image_enumerate();
@@ -10913,6 +11407,7 @@ test_util_main(int argc, char **argv)
     test_console_device_pointer_evict();
     test_console_device_read_loop_revalidate();
     test_console_term_output();
+    test_console_term_utf8();
     test_console_term_scrollback();
     test_console_term_render();
     test_console_term_mouse_cursor();
@@ -10925,6 +11420,7 @@ test_util_main(int argc, char **argv)
     test_console_tap_shift_state_aliases();
     test_console_mirror_altscreen_input();
     test_console_tap_sanitize();
+    test_console_tap_utf8();
     test_console_mirror_owned_mode();
     test_tap_reports_one_cell_per_codepoint();
     test_tap_set_attribute_becomes_indexed_pen();
@@ -10936,6 +11432,8 @@ test_util_main(int argc, char **argv)
     test_hexdump();
     test_time();
     test_time_set();
+    test_time_wakeup();
+    test_memmap_snapshot();
     test_time_get_us();
     test_clock_gettime();
     test_time_sleep();

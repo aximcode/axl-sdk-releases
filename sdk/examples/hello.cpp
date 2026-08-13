@@ -21,15 +21,24 @@ public:
     }
 };
 
-// Static initializer — proves .init_array runs before main().
-const char *const kDefaultName = "world";
+// A real dynamic initializer: the constructor runs before main() via the
+// .init_array walker. This used to be `const char *const kDefaultName =
+// "world";` under the same comment -- a CONSTANT initializer, which emits no
+// constructor and no .init_array entry, so it proved nothing. It was still
+// claiming proof while --gc-sections was collecting .init_array outright and
+// no global constructor in any image ran at all.
+struct DefaultName {
+    const char *value;
+    DefaultName() : value("world") {}
+};
+const DefaultName kDefault;
 
 } // namespace
 
 int
 main(int argc, char **argv)
 {
-    const char *name = (argc < 2) ? kDefaultName : argv[1];
+    const char *name = (argc < 2) ? kDefault.value : argv[1];
 
     Greeter *g = new Greeter();
     g->greet(name);

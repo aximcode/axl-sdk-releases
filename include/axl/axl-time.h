@@ -38,7 +38,19 @@ extern "C" {
 /**
  * @brief Format current time as ISO 8601 with microseconds.
  *
- * Example: "2026-03-27T14:05:32.123456"
+ * Example: "2026-03-27T14:05:32.123456" — always 26 characters on success,
+ * so @p buf_size must be at least 28; a smaller buffer formats nothing and
+ * returns 0.
+ *
+ * The fractional field comes from `EFI_TIME.Nanosecond` when firmware
+ * supplies one, and otherwise from the monotonic counter -- firmware leaves
+ * Nanosecond at 0 on essentially every platform, which would stamp
+ * `.000000` on every line and make entries within the same second
+ * impossible to tell apart.
+ *
+ * @warning The fallback's fraction comes from an unrelated epoch, so within
+ *     a single wallclock second it can appear to run backwards. Treat the
+ *     field as sub-second PRECISION, not as an ordering key.
  *
  * @return characters written (excluding NUL), 0 on error.
  */
@@ -47,6 +59,7 @@ axl_time_format(
     char   *buf,     ///< destination buffer (at least 28 bytes)
     size_t  buf_size ///< size of buffer
 );
+
 
 // ===================================================================
 // POSIX-style clock_gettime
@@ -207,6 +220,29 @@ typedef struct {
     uint32_t nanosecond;        ///< 0-999,999,999
     int16_t  timezone_minutes;  ///< UTC offset, or AXL_TIME_TZ_UNSPECIFIED
 } AxlRealtime;
+/**
+ * @brief Render an ALREADY-READ time in the same format as
+ *     axl_time_format().
+ *
+ * The split exists so a caller that has a timestamp in hand can render it
+ * without taking a second, different reading — the log dispatcher stamps a
+ * record once and every sink formats that one value.
+ *
+ * A NULL @a t is not an error: it renders the same fixed-width
+ * "0000-00-00T00:00:00.000000" placeholder axl_time_format() uses when the
+ * clock is unreadable, so a transcript stays columnar instead of shifting
+ * every following field. That is what the log dispatcher passes when it
+ * could not stamp a record.
+ *
+ * @return characters written (excluding NUL); 0 only if @a buf is NULL or
+ *     @a buf_size is too small.
+ */
+size_t
+axl_time_format_at(
+    const AxlRealtime *t,        ///< time to render
+    char              *buf,      ///< destination buffer (at least 28 bytes)
+    size_t             buf_size  ///< size of buffer
+);
 
 /**
  * @brief Read the firmware real-time clock.
@@ -217,8 +253,23 @@ typedef struct {
  * hour/minute/second/nanosecond/timezone/dst) — consumers that
  * only need a packed timestamp pack the fields themselves.
  *
+ * @par Re-entrancy
+ * The UEFI spec makes GetTime/SetTime mutually exclusive and treats an
+ * INTERRUPTED call as busy, so a read issued from an event notify that
+ * preempted another clock read cannot go to firmware. Rather than fail,
+ * such a nested read is served from the last COMPLETED reading. Two
+ * consequences worth knowing:
+ *   - AXL_OK may carry a reading that was not taken just now. It is as old
+ *     as the last completed read, which for an app that rarely reads the
+ *     clock can be a long time.
+ *   - AXL_ERR is possible with healthy firmware, in the narrow window
+ *     before any read has completed (i.e. a nested read during the very
+ *     first one).
+ * A non-nested call is unaffected and always goes to firmware.
+ *
  * @return AXL_OK on success, AXL_ERR if the firmware reports a
- *     failure or @p out is NULL. On failure @p out is unmodified.
+ *     failure, @p out is NULL, or a nested read finds no completed
+ *     reading to serve. On failure @p out is unmodified.
  */
 int
 axl_time_realtime(
@@ -244,9 +295,17 @@ axl_time_realtime(
  * the write). Note `nanosecond` is passed through verbatim but most
  * firmware RTCs ignore it on a write (they advance once per second).
  *
- * @return AXL_OK on success, AXL_ERR if @p in is NULL or the
- *     firmware reports a failure (EFI_INVALID_PARAMETER /
- *     EFI_DEVICE_ERROR / EFI_UNSUPPORTED).
+ * @par Re-entrancy
+ * Shares the RTC exclusion described on axl_time_realtime(). A write
+ * cannot be served from a cached reading the way a read can, so a call
+ * issued from a notify that preempted another clock operation fails with
+ * AXL_ERR without reaching firmware. A rejected write leaves the clock —
+ * and the cached reading a nested read would be served — untouched.
+ *
+ * @return AXL_OK on success, AXL_ERR if @p in is NULL, the firmware
+ *     reports a failure (EFI_INVALID_PARAMETER / EFI_DEVICE_ERROR /
+ *     EFI_UNSUPPORTED), or the call is nested inside another RTC
+ *     operation.
  */
 int
 axl_time_set_realtime(
@@ -276,6 +335,62 @@ axl_time_set_realtime(
 int
 axl_time_set_unix(
     int64_t unix_secs    ///< seconds since 1970-01-01 00:00:00 UTC
+);
+
+/**
+ * @brief Read the RTC wake alarm.
+ *
+ * The alarm that powers the machine on at a programmed time. Every out
+ * parameter is optional — pass NULL to skip one, or all three to use
+ * this purely as a "does this platform have a wake timer" probe, which
+ * the return code answers on its own.
+ *
+ * @par Three outcomes, deliberately distinguishable
+ * A platform with no wake timer and a platform whose wake timer failed
+ * are different facts, and a caller surfacing them (an out-of-band
+ * management API, say) needs to tell them apart: "this box cannot do
+ * that" versus "this box is broken". Collapsing @c AXL_UNSUPPORTED into
+ * @c AXL_ERR would make an unsupported platform indistinguishable from
+ * a broken one. QEMU and real hardware differ here, so this is a
+ * routine distinction rather than a corner case.
+ *
+ * @par Re-entrancy
+ * Shares the RTC exclusion described on axl_time_realtime(): UEFI 2.11
+ * Table 8.1 makes GetTime / SetTime / GetWakeupTime / SetWakeupTime
+ * mutually exclusive as a group. A call nested inside another RTC
+ * operation fails with @c AXL_ERR without reaching firmware, rather
+ * than being served from a cache — an alarm reading has no equivalent
+ * of the last-known-time fallback a clock read can use.
+ *
+ * @return AXL_OK with the requested outputs filled;
+ *     AXL_UNSUPPORTED if the platform has no wake timer;
+ *     AXL_ERR on a firmware failure or a nested RTC call.
+ */
+int
+axl_time_get_wakeup(
+    bool        *enabled,  ///< [out] alarm is armed, or NULL to skip
+    bool        *pending,  ///< [out] alarm has fired since last read, or NULL
+    AxlRealtime *when      ///< [out] programmed alarm time, or NULL to skip
+);
+
+/**
+ * @brief Arm or disarm the RTC wake alarm.
+ *
+ * Pass a time to arm, or NULL to disarm. Disarming an alarm that was
+ * never armed is not an error.
+ *
+ * Same three-outcome contract and the same RTC group exclusion as
+ * axl_time_get_wakeup(). @p when is interpreted exactly as
+ * axl_time_set_realtime() interprets its argument, including the
+ * @c INT16_MIN timezone sentinel for "unspecified".
+ *
+ * @return AXL_OK on success; AXL_UNSUPPORTED if the platform has no
+ *     wake timer; AXL_ERR on a firmware failure, an out-of-range
+ *     @p when, or a nested RTC call.
+ */
+int
+axl_time_set_wakeup(
+    const AxlRealtime *when   ///< alarm time to program, or NULL to disarm
 );
 
 #ifdef __cplusplus

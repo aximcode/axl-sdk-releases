@@ -1,4 +1,9 @@
 /** @file smbus-hc-shim.c
+    axl-example: allow-uefi -- this is a DXE DRIVER that PRODUCES a UEFI
+    protocol, so it must implement that protocol's own types. Built for real
+    with `axl-cc --type driver`, which grants raw UEFI automatically; the
+    marker is how the compile-check gate knows to do the same.
+
     DXE driver that publishes EFI_I2C_MASTER_PROTOCOL on top of the
     QEMU q35 ICH9 SMBus host controller (PCI 8086:2930).
 

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-file-view.h:
+/** @file axl-file-view.h
  *
  * An mmap-like windowed view over a file.
  *

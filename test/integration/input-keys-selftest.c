@@ -23,7 +23,21 @@
    monitor `sendkey` (physical-keyboard / SimpleTextInputEx path) and
    three raw bytes over the serial socket (TerminalDxe path), which
    together expose the divergent Ctrl+letter encodings. */
+/* Overridable so a harness can drive a longer sequence without a second
+   copy of this app -- test-sendkey-load-qemu.sh sets it to match the key
+   count it injects. */
+#ifndef KEYS_EXPECTED
 #define KEYS_EXPECTED 5
+#endif
+
+/* In-app watchdog. Overridable for the same reason: run-qemu.sh's
+   injection fires at SHOT_WAIT (which defaults to TIMEOUT-3), so a
+   harness using a long --timeout needs this to outlive it or the app
+   quits before the first key is ever sent -- and then the keys land on
+   the Shell prompt behind it, which reads as "the guest lost them". */
+#ifndef WATCHDOG_MS
+#define WATCHDOG_MS 30000
+#endif
 
 typedef struct {
     AxlLoop *loop;
@@ -80,7 +94,7 @@ main(int argc, char **argv)
 
     /* Watchdog: never let the harness hang waiting on a key that the
        firmware never delivers. 30 s is generous for slow TCG boots. */
-    axl_loop_add_timeout(loop, 30000, on_watchdog, &st);
+    axl_loop_add_timeout(loop, WATCHDOG_MS, on_watchdog, &st);
 
     axl_printf("INPUT-READY\n");
     axl_loop_run(loop);

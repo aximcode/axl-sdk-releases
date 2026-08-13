@@ -8,6 +8,11 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef void FILE;
 
 int snprintf(char *buf, size_t size, const char *fmt, ...);
@@ -16,5 +21,9 @@ int fprintf(FILE *stream, const char *fmt, ...);
 
 #define stderr ((FILE *)0)
 #define stdout ((FILE *)0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

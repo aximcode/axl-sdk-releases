@@ -141,14 +141,37 @@ typedef EFI_STATUS (EFIAPI *SerialRwFn)(
 
 struct AxlSerial {
     EFI_SERIAL_IO_PROTOCOL *sio;
+    AxlHandle               handle;      ///< handle it was opened from (axl_serial_handle)
+    bool                    shared;      ///< opened via axl_serial_open_shared
+    AxlSerial              *next_open;   ///< intrusive open-port list (see mOpenPorts)
     AxlLoop                *loop;        ///< async-read loop (NULL = none)
     AxlSourceId             timer_src;   ///< async-read timer source id (0 = none)
     AxlSerialReadFn         cb;          ///< async-read callback
     void                   *user;        ///< async-read context
 };
 
-int
-axl_serial_open(AxlHandle handle, AxlSerial **out)
+/* Every open port in THIS image, threaded through the wrappers themselves.
+   Intrusive rather than a side table so there is no fixed cap to overflow
+   and no second allocation to fail: a port that could be opened can always
+   be tracked, which matters because the whole point is that an untracked
+   open is the corruption case. UEFI is single-threaded, so no locking. */
+static AxlSerial *mOpenPorts = NULL;
+
+/* The open claim on @handle, or NULL when free. */
+static AxlSerial *
+find_open(AxlHandle handle)
+{
+    for (AxlSerial *p = mOpenPorts; p != NULL; p = p->next_open) {
+        if (p->handle == handle) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Shared by axl_serial_open and axl_serial_open_shared. */
+static int
+serial_open_common(AxlHandle handle, AxlSerial **out, bool shared)
 {
     if (out == NULL) {
         return AXL_ERR;
@@ -158,17 +181,51 @@ axl_serial_open(AxlHandle handle, AxlSerial **out)
     if (sio == NULL) {
         return AXL_ERR;
     }
+    /* Exclusivity is decided by the FIRST open: an exclusive holder refuses
+       everyone, and a shared holder refuses only an exclusive claim. */
+    AxlSerial *held = find_open(handle);
+    if (held != NULL && (!shared || !held->shared)) {
+        return AXL_BUSY;
+    }
     AxlSerial *s = axl_malloc(sizeof(*s));
     if (s == NULL) {
         return AXL_ERR;
     }
     s->sio       = sio;
+    s->handle    = handle;
+    s->shared    = shared;
     s->loop      = NULL;
     s->timer_src = 0;
     s->cb        = NULL;
     s->user      = NULL;
+    s->next_open = mOpenPorts;
+    mOpenPorts   = s;
     *out = s;
     return AXL_OK;
+}
+
+int
+axl_serial_open(AxlHandle handle, AxlSerial **out)
+{
+    return serial_open_common(handle, out, false);
+}
+
+int
+axl_serial_open_shared(AxlHandle handle, AxlSerial **out)
+{
+    return serial_open_common(handle, out, true);
+}
+
+bool
+axl_serial_is_open(AxlHandle handle)
+{
+    return handle != NULL && find_open(handle) != NULL;
+}
+
+AxlHandle
+axl_serial_handle(const AxlSerial *s)
+{
+    return (s != NULL) ? s->handle : NULL;
 }
 
 void
@@ -177,9 +234,33 @@ axl_serial_close(AxlSerial *s)
     if (s == NULL) {
         return;
     }
+    /* Poison check: a closed port has its borrowed protocol pointer cleared
+       below, so a second close on the same pointer is a no-op instead of a
+       double free -- PROVIDED the allocator has not recycled the memory. See
+       the residual-hazard note on axl_serial_close in the header. */
+    if (s->sio == NULL) {
+        return;
+    }
     if (s->loop != NULL && s->timer_src != 0) {
         axl_loop_remove_source(s->loop, s->timer_src);
     }
+    /* Drop the claim before freeing, or the next open finds a dangling
+       entry and reports the port busy forever.
+       Unlink only if this really is a live entry: if it is absent, the
+       pointer is not a port we currently own and must not be freed. */
+    bool linked = false;
+    for (AxlSerial **pp = &mOpenPorts; *pp != NULL; pp = &(*pp)->next_open) {
+        if (*pp == s) {
+            *pp = s->next_open;
+            linked = true;
+            break;
+        }
+    }
+    if (!linked) {
+        return;
+    }
+    s->sio      = NULL;
+    s->next_open = NULL;
     axl_free(s);
 }
 

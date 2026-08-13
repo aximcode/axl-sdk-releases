@@ -47,13 +47,20 @@ SECTIONS
     */
    . = ALIGN(16);
    __init_array_start = .;
-   *(SORT(.init_array.*))
-   *(.init_array)
+   /* KEEP is load-bearing. Nothing REFERENCES an .init_array entry -- that is
+      the point of one -- so --gc-sections collects the section and the crt0
+      walker finds __init_array_start == __init_array_end and runs nothing.
+      A C++ global object's constructor then silently never runs: measured as
+      `magic=0x0` where the constructor sets 0xABCD, with no diagnostic
+      anywhere. It also kept ios_base::Init out of the image entirely, which
+      is why std::cout faulted in sentry() on a never-constructed stream. */
+   KEEP(*(SORT(.init_array.*)))
+   KEEP(*(.init_array))
    __init_array_end = .;
   . = ALIGN(16);
    __CTOR_LIST__ = .;
-   *(SORT(.ctors.*))
-   *(.ctors)
+   KEEP(*(SORT(.ctors.*)))
+   KEEP(*(.ctors))
    __CTOR_END__ = .;
   . = ALIGN(16);
    __DTOR_LIST__ = .;

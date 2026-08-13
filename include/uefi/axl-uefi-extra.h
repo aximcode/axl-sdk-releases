@@ -18,6 +18,14 @@
 #ifndef AXL_UEFI_EXTRA_H
 #define AXL_UEFI_EXTRA_H
 
+/* Guarded for the same reason as <uefi/axl-uefi.h>: this header is a second
+   doorway to the identical surface (it includes generated/all.h itself), so
+   leaving it open would make the umbrella's guard decorative. See that file
+   for what AXL_ALLOW_UEFI means and who is granted it. */
+#if !defined(AXL_ALLOW_UEFI)
+#  error "<uefi/...> is not available to applications. Use the axl_* API; build a driver with `axl-cc --type driver` (CMake: axl_add_driver), or pass `--allow-uefi` (CMake: ALLOW_UEFI) to opt in deliberately."
+#endif
+
 #include "generated/all.h"
 
 // ===================================================================
@@ -30,6 +38,15 @@
 // ===================================================================
 
 typedef struct _EFI_SHELL_PROTOCOL  EFI_SHELL_PROTOCOL;
+
+/* 2.2.31. Closes the handle in ALL cases, success or not -- so a caller must
+   never CloseFile() after this, and must not reuse the handle. Returns
+   EFI_WARN_DELETE_FAILURE (a WARNING, not an EFI_ERROR) when the handle was
+   closed but the file survived, which is why the caller below tests the status
+   for success rather than passing it through EFI_ERROR(). */
+typedef EFI_STATUS (EFIAPI *EFI_SHELL_DELETE_FILE)(
+    SHELL_FILE_HANDLE  FileHandle
+);
 
 typedef EFI_STATUS (EFIAPI *EFI_SHELL_OPEN_FILE_BY_NAME)(
     IN  CHAR16             *FileName,
@@ -266,7 +283,7 @@ struct _EFI_SHELL_PROTOCOL {
     EFI_SHELL_CREATE_FILE          CreateFile;            // 2.2.28 (USED)
     EFI_SHELL_READ_FILE            ReadFile;             // 2.2.29 (USED)
     EFI_SHELL_WRITE_FILE           WriteFile;            // 2.2.30 (USED)
-    void                          *DeleteFile;           // 2.2.31
+    EFI_SHELL_DELETE_FILE          DeleteFile;           // 2.2.31 (USED)
     EFI_SHELL_DELETE_FILE_BY_NAME  DeleteFileByName;     // 2.2.32 (USED)
     EFI_SHELL_GET_FILE_POSITION    GetFilePosition;      // 2.2.33 (USED)
     EFI_SHELL_SET_FILE_POSITION    SetFilePosition;      // 2.2.34 (USED)
@@ -437,6 +454,17 @@ static __attribute__((unused)) EFI_GUID gEfiConsoleInDeviceGuid =
 static __attribute__((unused)) EFI_GUID gEfiDxeServicesTableGuid =
     { 0x05ad34ba, 0x6f02, 0x4214,
       {0x95, 0x2e, 0x4d, 0xa0, 0x39, 0x8e, 0x2b, 0xb9} };
+
+// Before-ExitBootServices event group (UEFI 2.9, EFI_EVENT_GROUP_BEFORE_EXIT_
+// BOOT_SERVICES). The spec macro name does not end in "_GUID", so the
+// generator's auto-extractor skips it -- same situation as the DXE Services
+// table GUID above. Signalled BEFORE EFI_EVENT_GROUP_EXIT_BOOT_SERVICES, while
+// Boot Services are still fully usable, which is what makes it the correct hook
+// for quiescing AP workers: an ExitBootServices-group handler races the
+// firmware's own AP-relocation callback, and losing that race is a hang.
+static __attribute__((unused)) EFI_GUID gEfiEventBeforeExitBootServicesGuid =
+    { 0x8be0e274, 0x3970, 0x4b44,
+      {0x80, 0xc5, 0x1a, 0xb9, 0x50, 0x2f, 0x3b, 0xfc} };
 
 static __attribute__((unused)) EFI_GUID gEfiShellProtocolGuid =
     { 0x6302d008, 0x7f9b, 0x4f30,

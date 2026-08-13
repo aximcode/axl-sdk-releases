@@ -91,29 +91,31 @@ static VTermAllocatorFunctions vterm_allocator = {
     .free   = vterm_free_cb,
 };
 
+/* Re-encode one decoded codepoint into `out`, which has `avail` bytes free.
+ *
+ * What arrives here is NOT guaranteed to be a Unicode scalar value. libvterm's
+ * decoder folds the malformed input it catches to U+FFFD, but it only
+ * range-checks for OVERLONG forms (encoding.c), so a 4/5/6-byte sequence above
+ * U+10FFFF reaches putglyph carrying its raw value. axl_utf8_encode refuses
+ * those (and surrogates) rather than emitting the WTF-8/CESU-8 a hand-rolled
+ * ladder would.
+ *
+ * On a refusal we SUBSTITUTE U+FFFD rather than drop the codepoint. Dropping
+ * would silently shorten the run while info->width still advanced run_end, so
+ * the coalesced bytes and the cursor arithmetic would disagree and every
+ * following glyph on the line would be misplaced. Substituting also matches
+ * what libvterm itself does with the malformed input it does catch
+ * (UNICODE_INVALID == U+FFFD) and what every other AXL decoder does
+ * (axl_utf8_decode, the JSON reader/writer, the gfx text path). */
 static size_t
-encode_utf8(uint32_t cp, char *out)
+encode_glyph_utf8(uint32_t cp, char *out, size_t avail)
 {
-    if (cp < 0x80) {
-        out[0] = (char)cp;
-        return 1;
+    /* Sizing pass first: it returns 0 only for an unencodable codepoint, which
+       separates "cannot be represented" from "does not fit". */
+    if (axl_utf8_encode(cp, NULL, 0) == 0) {
+        cp = 0xFFFD;
     }
-    if (cp < 0x800) {
-        out[0] = (char)(0xC0 | (cp >> 6));
-        out[1] = (char)(0x80 | (cp & 0x3F));
-        return 2;
-    }
-    if (cp < 0x10000) {
-        out[0] = (char)(0xE0 | (cp >> 12));
-        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        out[2] = (char)(0x80 | (cp & 0x3F));
-        return 3;
-    }
-    out[0] = (char)(0xF0 | (cp >> 18));
-    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-    out[3] = (char)(0x80 | (cp & 0x3F));
-    return 4;
+    return axl_utf8_encode(cp, out, avail);
 }
 
 static AxlConsoleRect
@@ -205,7 +207,7 @@ adapter_putglyph(VTermGlyphInfo *info, VTermPos pos, void *u)
     char   glyph[AXL_VTERM_GLYPH_MAX];
     size_t g = 0;
     for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && info->chars[i]; i++) {
-        g += encode_utf8(info->chars[i], glyph + g);
+        g += encode_glyph_utf8(info->chars[i], glyph + g, sizeof glyph - g);
     }
 
     bool extend = v->run_active &&

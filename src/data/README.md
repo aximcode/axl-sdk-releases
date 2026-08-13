@@ -139,9 +139,10 @@ while (axl_hash_table_iter_next(&iter, &key, &value)) {
 
 ## AxlArray
 
-Dynamic array that stores elements by value (not pointers). Auto-grows
-on append. Supports indexed access, sorting, and removal. Matches
-GLib's GArray.
+Dynamic array with value and pointer modes. Auto-grows on append.
+Supports indexed access, sorting, removal, capacity reservation,
+buffer stealing and element destructors. Merges GLib's GArray and
+GPtrArray into one type; see the header for the deliberate divergences.
 
 ```c
 AXL_AUTOPTR(AxlArray) a = axl_array_new(sizeof(int));
@@ -156,6 +157,45 @@ axl_array_remove_index(a, 0);        // remove first element
 axl_array_remove_index_fast(a, 1);   // O(1) swap-with-last removal
 axl_array_set_size(a, 10);           // grow (zero-initialized)
 ```
+
+Pointer mode stores `void *` instead of copies — `axl_array_append_ptr`,
+`axl_array_get_ptr`, and friends.
+
+**Reserve capacity** when the size is roughly known, so the append loop
+pays no grow-and-copy:
+
+```c
+AxlArray *a = axl_array_sized_new(sizeof(int), 1000);   // g_array_sized_new
+```
+
+**Steal the buffer** to hand ownership of the elements to a caller. The
+array is left valid and EMPTY (`g_array_steal` semantics, not
+`g_array_free(arr, FALSE)`), so it stays usable and still needs freeing.
+`out_len` is an ELEMENT count:
+
+```c
+size_t n;
+int *block = axl_array_steal(a, &n);   // a is now empty but reusable
+...
+axl_free(block);
+axl_array_free(a);
+```
+
+**Element destructors.** Without one, `axl_array_free` releases only the
+buffer, so anything reached through a stored pointer leaks. There are two
+setters because this one type covers both of GLib's array types and cannot
+infer which convention you mean:
+
+```c
+axl_array_set_clear_func(a, my_clear);        // value mode: gets &element
+axl_array_set_ptr_free_func(a, axl_free_impl); // ptr mode: gets the pointer
+```
+
+Either hook runs on every path that discards an element — `free`, `clear`,
+`remove_index`, `remove_index_fast`, `remove_range`, and a *shrinking*
+`set_size` — but never on `axl_array_steal`, which transfers ownership
+rather than discarding it. Pass `axl_free_impl`, not `axl_free`: the latter
+is a macro and has no address to take.
 
 ## AxlList
 
@@ -364,6 +404,75 @@ codepoints, and out-of-range values all return 1 with
 `*out_codepoint = 0xFFFD` (REPLACEMENT CHARACTER) — the caller advances
 by 1 byte to resynchronize. End of string (NULL or `\0`) returns 0.
 
+### Per-codepoint encoding
+
+`axl_utf8_encode` is the reverse: one codepoint in, 1-4 UTF-8 bytes out,
+bounded by the room the caller actually has. It writes no NUL and
+reserves no room for one, so it composes into a larger buffer the way
+`axl_utf8_decode` reads out of one.
+
+```c
+char   buf[AXL_UTF8_MAX_LEN];
+size_t n = axl_utf8_encode(0x4E2D, buf, sizeof(buf));   // n == 3
+```
+
+Two rules make it safe to point at a wire format:
+
+- **Unencodable codepoints are refused, not approximated.** A UTF-16
+  surrogate (U+D800..U+DFFF) or anything above U+10FFFF writes nothing
+  and returns 0. Encoding them anyway yields CESU-8 / WTF-8, which
+  `axl_utf8_decode` — and every conforming decoder — hands back as
+  U+FFFD, so emitting it just moves the corruption downstream. A caller
+  that wants lenient behaviour substitutes U+FFFD itself.
+- **A sequence that does not fit is refused whole.** Never a partial
+  sequence, which would be ill-formed UTF-8 that the caller cannot
+  distinguish from a complete one afterwards.
+
+Both refusals return 0, which therefore always means "nothing was
+written". Passing `dst == NULL` measures instead of writing (returning
+the 1-4 bytes required, or 0 if the codepoint is unencodable), so a
+caller that needs to tell the two refusals apart measures first — see
+the worked loop in the `axl_utf8_encode` docstring, which re-measures
+after substituting because the replacement may not fit either.
+
+Note `axl_utf8_encode` reports a successful 1-byte encode for U+0000 —
+it is a valid scalar, and the function has no way to signal "valid but
+probably not what you want". Code assembling a NUL-terminated C string
+must therefore reject or substitute U+0000 *before* calling, because an
+interior NUL truncates the value for every `axl_strcmp` reader: an
+`"admin\0extra"` value compares equal to `"admin"`.
+
+The JSON string decoder does exactly that, and does it for **all three**
+spellings of an escaped NUL: `\u0000`, JSON5's `\0`, and JSON5's
+`\x00` each decode to U+FFFD rather than a NUL byte. The two JSON5
+arms used to write the raw byte — strict JSON never reaches them (its
+lexer whitelists only `" / \\ b f r n t u`), but JSON5 sidecars are
+user-replaceable via `--ids-file`, so "unreachable from strict JSON"
+was never a safety argument. All three now route through one appender,
+so they also cannot diverge on the buffer bound: the 3-byte
+replacement is refused whole when it does not fit, exactly as a decoded
+`\uXXXX` is.
+
+Only the ZERO byte is substituted in the `\xNN` arm; every other
+`\xNN` still writes its byte verbatim.
+
+Everything in the tree that turns a codepoint into UTF-8 routes through
+this one function: the JSON string decoder, the XML character-reference
+decoder (`&#N;` / `&#xH;`), `axl-vterm`'s glyph re-encoder, and both
+console paths (`axl-console-emit`'s UCS-2 → UTF-8 producer side and
+`axl-console-term`'s grid cell). The three that can be handed a value
+with no UTF-8 spelling substitute U+FFFD; XML instead raises a located
+parse error, because a character reference is *authored* text and
+quietly replacing it would hide a document bug rather than a wire
+glitch.
+
+One site deliberately does **not** use it: `AxlStream`'s UCS-2 wire
+transcode (`axl_stream_set_encoding`) keeps its own encoder. Its input
+is a UCS-2 code *unit*, not a Unicode scalar, and an unpaired surrogate
+is representable there — refusing it would turn a round-trippable code
+unit into a dropped one, and that round-trip is a documented promise.
+See `src/stream/README.md`.
+
 ### Case-Insensitive Operations
 
 `axl_strcasecmp`, `axl_strcasestr`, and `axl_strncasecmp` fold
@@ -411,6 +520,145 @@ the input string do NOT allocate:
 - `axl_strstr_len`, `axl_strrstr` (return pointer into haystack)
 - `axl_strchr` (return pointer into string)
 
+## Number Conversion
+
+Both directions, for both floats and integers, all in `<axl/axl-str.h>`.
+
+| direction | float | integer |
+|---|---|---|
+| string -> number | `axl_str_to_double`, `axl_str_to_float` | `axl_str_to_u64` / `_s64` (+ 32/16/8 variants) |
+| number -> string | `axl_double_to_str`, `axl_float_to_str` | `axl_u64_to_str`, `axl_s64_to_str` |
+
+```c
+#include <axl.h>
+
+double d;
+if (axl_str_to_double("3.14159", &d, NULL) == AXL_OK) {
+    char buf[AXL_DOUBLE_STR_MAX];
+    axl_double_to_str(d, buf, sizeof(buf));   // "3.14159"
+}
+
+char hex[AXL_U64_STR_MAX];
+axl_u64_to_str(255, 16, hex, sizeof(hex));    // "ff", no "0x" prefix
+```
+
+### The round-trip guarantee
+
+`axl_double_to_str` writes decimal text that parses back to the
+bit-identical double, and `axl_str_to_double` is the parser it is defined
+against. So `parse(print(x)) == x` for every finite double, with no
+trailing zeros — `100.0` renders `"100"`, not `"100.000"`.
+
+The **round trip is always exact; the length is very nearly always minimal
+but not guaranteed to be.** The digits come from Grisu2, which returns the
+shortest string *it* finds, and for a fraction of a percent of doubles a
+shorter one exists — `1e23` renders `"9.999999999999999e+22"` where
+`"1e+23"` would have round-tripped just as well. Closing that last gap
+needs Grisu3 or Ryu, i.e. a bignum fallback, and nothing here is worth
+that.
+
+`axl_float_to_str` is not "promote and print": it finds the shortest text
+that round-trips through the *same float*, which is usually much shorter
+(`0.1f` needs 1 significant digit as a float and 17 as a double). Read it
+back with `axl_str_to_float`. It also has **no** minimality gap — it
+searches upward from one significant digit and stops at the first length
+that round-trips, so the first hit is the smallest by construction (a
+~1e6-value sweep found no shorter rendering in any case).
+
+The parser is **correctly rounded** — the result is the double nearest the
+decimal value, ties to even, for inputs of any length. A fast path handles
+the common short cases with exact hardware arithmetic; anything it cannot
+prove exact falls back to exact decimal arithmetic rather than guessing.
+The integer pair shares its `base` parameter with `axl_str_to_u64`, so it
+round-trips at any radix 2..36.
+
+### Range errors write a value AND return AXL_ERR
+
+This is the one place the conversions diverge from the rest of the SDK's
+`AXL_OK` / `AXL_ERR` convention, and it is deliberate — it mirrors C's
+`strtod`, so a caller that only wants the saturated value can ignore the
+status:
+
+```c
+double d;
+int rc = axl_str_to_double("1e400", &d, NULL);
+// rc == AXL_ERR, and d == +infinity (the value is still written)
+```
+
+Underflow writes a signed zero the same way, so `"-1e-400"` gives `-0.0`.
+A **syntax** error is different: it leaves `*out` untouched and sets
+`*endptr` back to the start, so you can tell "not a number here" from
+"a number too big to represent."
+
+`axl_str_to_float` reports a range error the double parse could not see:
+`1e39` is a perfectly finite double that becomes `+inf` as a float.
+
+The two families place `endptr` differently on a **range** error, and the
+difference is load-bearing if you drive a tokenizer off it. The float pair
+leaves it **past the digits** — the number was consumed, only
+unrepresentable, which is what C99 `strtod` does on `ERANGE`. The integer
+pair **rewinds it to `nptr`** on overflow. Both are released and neither is
+changing.
+
+### Passing no endptr means strict
+
+Every parser in the family — both floats and all eight integers — treats a
+`NULL` `endptr` as "the whole string, or nothing":
+
+```c
+double d;
+axl_str_to_double("36.6C", &d, NULL);   // AXL_ERR, d untouched
+axl_str_to_double("36.6",  &d, NULL);   // AXL_OK,  d == 36.6
+
+const char *end;
+axl_str_to_double("36.6C", &d, &end);   // AXL_OK, d == 36.6, end -> "C"
+```
+
+Leading whitespace is still skipped; **trailing** whitespace is trailing
+content and fails, so `" 5 "` is an error. Passing `endptr` is how you opt
+into partial parsing. Strict outranks the range-error rule above: `"1e400"`
+writes `+inf` and returns `AXL_ERR`, but `"1e400xyz"` writes nothing at all.
+
+### `nan` has no sign here
+
+`"nan"`, `"inf"` and `"infinity"` all parse, case-insensitively. A sign on
+`inf` is applied — `"-inf"` gives negative infinity — but a sign on `nan` is
+consumed and **discarded**: `"-nan"` gives a *positive* NaN where glibc
+gives a negative one. Nothing in AXL contradicts that, because AXL has no
+signed-NaN surface: `axl_double_to_str`, `axl_float_to_str` and `%f` all
+render every NaN as `"nan"` with no sign, so the parser never has to read
+back text it did not write.
+
+### Buffer-too-small: check the return, not the buffer
+
+All four renderers follow `axl_snprintf`'s convention — as much as fits is
+written, the buffer is always NUL-terminated, and the return is the length
+the **whole** rendering would have had. So:
+
+```c
+if (axl_double_to_str(v, buf, sizeof(buf)) >= sizeof(buf)) {
+    /* truncated */
+}
+```
+
+The test matters more than usual here, because a truncated number is a
+different, entirely plausible number that the buffer alone cannot be told
+apart from a correct one: `axl_double_to_str(1e-300, buf, 5)` writes
+`"1e-3"`, which reparses cleanly as `0.001`. Pass a buffer of
+`AXL_DOUBLE_STR_MAX` / `AXL_U64_STR_MAX` / `AXL_S64_STR_MAX` and truncation
+is impossible. Note `AXL_S64_STR_MAX` is one byte larger than the unsigned
+one: `INT64_MIN` in base 2 is a sign plus 64 digits.
+
+### Where the accuracy contract lives
+
+These conversions are exact; `AxlMath` is not. `axl_sqrt`, `axl_sin` and
+friends target UI-coordinate accuracy, not `libm` bit-exactness, and say so
+in `src/math/README.md`. Do not read a guarantee from one into the other —
+`axl_str_to_double` being correctly rounded says nothing about what
+`axl_sin` returns. The predicates `axl_isnan` / `axl_isinf` /
+`axl_isfinite` and the `AXL_MATH_INF` / `AXL_MATH_NAN` constants live in
+`<axl/axl-math.h>` and are shared by both.
+
 ## AxlStrReader — Cursor-Based String Parser
 
 Symmetric counterpart to `AxlString` (the builder). A reader BORROWS a
@@ -451,16 +699,42 @@ if (axl_sscanf(str, "%u.%u.%u.%u%n", &a, &b, &c, &d, &consumed) != 4
 ```
 
 Supports the C99 conversions consumers actually need: `%c %d %i %u %o
-%x %X %s (with required width) %[set] %% %n`, length modifiers
-`hh h l ll z j`, and `*` assignment suppression.
+%x %X %s (with required width) %[set] %f %e %g %E %G %% %n`, length
+modifiers `hh h l ll z j`, and `*` assignment suppression.
+
+The float conversions route at `axl_str_to_double` / `axl_str_to_float`,
+so they are correctly rounded and accept `nan` / `inf` / `infinity`.
+Mind the C99 pointer types, which are the reverse of `printf`'s: plain
+`%f` takes a `float *` and `%lf` takes a `double *` — handing a
+`float *` to `%lf` writes 8 bytes into a 4-byte object. An out-of-range
+value such as `1e400` is a successful conversion storing the saturated
+IEEE result, the way C99 stores `HUGE_VAL`. An explicit field width is
+honoured: `%3lf` on `"3.14159"` reads `3.1` and leaves `4159` for the
+next conversion, with leading whitespace skipped before the width
+applies. A width above 256 returns `-1` rather than being clamped —
+that bound is a property of the format string, so it is checked up
+front; without a width nothing is staged and a mantissa of any length
+parses in full.
+
+Every conversion that takes a width caps it at `SIZE_MAX`, not just the
+float ones. Digits that would exceed `SIZE_MAX` return `-1`: the wrap is
+downward (2^64+1 would become a width of 1), so honouring it would mean
+converting a field the caller never asked for and reporting success.
 
 ## AxlString — String Builder
 
 Mutable auto-growing string builder, like GLib's `GString`. All strings
-are UTF-8. Supports append, prepend, insert, printf-style formatting, and
-truncation.
+are UTF-8. Supports append, prepend, insert, printf-style formatting,
+truncation, and — for callers that need to size or edit the buffer
+directly — `reserve` / `capacity` / `shrink_to_fit` / `resize` and a
+mutable `axl_string_data()`.
 
 Header: `<axl/axl-string.h>`
+
+C++ callers usually want `axl::string` (`<axl/axl-string.hpp>`) instead:
+an RAII wrapper over this builder with `std::string`'s interface, usable
+in a freestanding translation unit where `<string>` is unavailable. See
+`docs/sphinx/modules/cxx.rst`.
 
 ### Overview
 
@@ -491,7 +765,9 @@ char *result = axl_string_steal(b);  // b is now empty
 ```
 
 The builder can be reused after stealing — it starts empty with its
-allocated buffer released.
+allocated buffer released. (That was always the documented contract, but
+until recently the first append after a steal spun forever: `steal` left
+the capacity at 0 and `grow` sized the replacement by doubling it.)
 
 ### Error Handling
 
@@ -501,16 +777,30 @@ convention used by `axl_array_append`, `axl_hash_table_insert`, etc.
 
 ## AxlJson — JSON / JSON5
 
-JSON reader (jsmn-based) and writer. Parse JSON strings into a token
-tree, query values by key, and build JSON documents incrementally over
-an `AxlString`. A separate colored UEFI-console pretty-printer is
-provided for debug output.
+JSON reader and writer. Parse JSON strings into a token tree, query
+values by key, and build JSON documents incrementally over an
+`AxlString`. A separate colored UEFI-console pretty-printer is provided
+for debug output.
 
-The reader also accepts the [JSON5](https://json5.org) grammar
-superset — comments, trailing commas, single-quoted strings, unquoted
-keys, hex numbers — via an opt-in flag (see the **JSON5 Support**
-section below). The writer can emit trailing commas and JSON5
-comments via additional opt-in flags.
+One parser serves every dialect. With no flags set (`AXL_JSON_STRICT`)
+it is RFC 8259, verified against the
+[JSONTestSuite](https://github.com/nst/JSONTestSuite) conformance
+corpus; each `AXL_JSON_ALLOW_*` bit opens exactly one
+[JSON5](https://json5.org) extension on top of it — comments, trailing
+commas, single-quoted strings, unquoted keys, hex numbers (see the
+**JSON5 Support** section below).
+
+Reader and writer draw those bits from ONE flag space, so a dialect cannot
+mean two different things in the two directions. On the writer, though,
+only `AXL_JSON_ALLOW_TRAILING_COMMA` currently changes the output — the
+remaining dialect bits are reader-side today. The writer never emits an
+unquoted key or a single-quoted string even when those bits are set, and
+`axl_json_comment()` emits regardless of `AXL_JSON_ALLOW_COMMENTS`.
+
+The vendored jsmn that used to serve the strict path is gone. It was
+compiled without `JSMN_STRICT`, so the branch that was supposed to mean
+"strict" was the permissive one: measured against the corpus it wrongly
+accepted 99 of 186 must-reject documents.
 
 Header: `<axl/axl-json.h>`
 
@@ -521,9 +811,10 @@ AXL provides three independent JSON APIs:
 - **Reader** (`AxlJsonReader`) — parse a JSON string, extract values
   by key, iterate arrays.
 - **Writer** (`AxlJsonWriter`) — build JSON into an auto-growing
-  `AxlString`. Orthogonal calls (containers, keys, atoms) with a state
-  machine that handles comma placement and string escaping. Optional
-  pretty-print mode with 2-space indent.
+  `AxlString`, a fixed buffer, a stream, or a callback. Orthogonal calls
+  (containers, keys, atoms) with a state machine that handles comma
+  placement and string escaping. Optional pretty-print mode with 2-space
+  indent.
 - **Console printer** (`axl_json_console_print`) — colored,
   attribute-based pretty output to the UEFI console. Distinct from the
   writer's pretty-print flag (which produces buffer output, no colors).
@@ -534,7 +825,7 @@ AXL provides three independent JSON APIs:
 const char *json = "{\"name\":\"AXL\",\"version\":1,\"debug\":true}";
 AxlJsonReader r;
 
-if (!axl_json_parse(json, axl_strlen(json), &r)) {
+if (!axl_json_parse(json, axl_strlen(json), AXL_JSON_RELAXED, &r)) {
     axl_printerr("invalid JSON\n");
     return -1;
 }
@@ -559,10 +850,122 @@ axl_json_free(&r);
 
 `axl_json_parse` returns `false` on invalid syntax, unbalanced braces,
 or token-array allocation failure. Each `axl_json_get_*` returns
-`false` if the key is missing, the value has the wrong type, or (for
-strings) the caller buffer is too small. String values are copied into
+`false` if the key is missing or the value has the wrong type. A string
+value too long for the caller's buffer is **truncated, and the call still
+returns `true`** — the exception is `axl_json_get_number_str`, which refuses,
+because a clipped string is merely incomplete while a clipped number is a
+different number. String values are copied into
 the caller buffer — no zero-copy lifetime concerns. Always call
 `axl_json_free` on the reader; the token array is heap-allocated.
+
+#### Two accessor families, and asking what a value IS
+
+Accessors come in two shapes. `axl_json_get_*(r, key, ...)` reads a value **by
+key** out of an object. `axl_json_value_*(r, ...)` reads the reader's **own**
+value, which is what an array element or a bare-value document actually is —
+`axl_json_value_string` / `_int` / `_uint` / `_bool` / `_number_str` /
+`_array_begin` / `_type`. Each `get_X` is `axl_json_get_value` followed by the
+matching `value_X`, so the two families cannot drift apart.
+
+That is what makes `[1, 2, 3]` readable: `axl_json_array_next` hands back a
+sub-reader per element, and `axl_json_value_int` reads a bare number out of
+one.
+
+When the type is not known in advance, ask:
+
+```c
+switch (axl_json_get_type(&r, "field")) {         // or _value_type(&elem)
+case AXL_JSON_TYPE_NUMBER: ... break;
+case AXL_JSON_TYPE_STRING: ... break;
+case AXL_JSON_TYPE_NULL:   ... break;             // present, and null
+case AXL_JSON_TYPE_NONE:   ... break;             // absent — or a FAILED parse
+default: break;
+}
+```
+
+`AXL_JSON_TYPE_NONE` covers five situations, including a parse that failed and
+whose return value the caller ignored — that reports `NONE` for every key and
+means the opposite of an absent one, so check `axl_json_reader_error` when it
+matters. And `NUMBER` does not promise integrality: `axl_json_value_int`
+truncates `1.5` to `1` and returns true, so read the literal with
+`axl_json_value_number_str` when the distinction counts.
+
+#### Escaping and unescaping outside the reader
+
+`axl_json_escape_string` and `axl_json_decode_string` are the two directions of
+the same utility, usable without a reader or writer at all — for JSON text that
+arrived from somewhere else.
+
+```c
+char enc[128];
+int  e = axl_json_escape_string("he said \"hi\"", enc, sizeof(enc));
+/* enc is "he said \"hi\"" -- WITH the surrounding quotes */
+
+char dec[128];
+int  d = axl_json_decode_string(enc + 1, (size_t)e - 2, dec, sizeof(dec));
+/* skip the opening quote and drop two: the encoder brackets, the decoder
+   takes the inner content a JSON string token brackets */
+```
+
+The decoder resolves the JSON5 superset (`\0`, `\xNN`, `\'`, `\v`, line
+continuations) as well as the RFC 8259 set — the lexer is what refuses a JSON5
+escape in a strict document, so by the time bytes reach a decoder the dialect
+question is already settled.
+
+**It REFUSES truncation** (returns -1), unlike `axl_json_get_string`, which
+truncates and still succeeds. A caller here has no reader to interrogate
+afterwards, and a prefix cannot be recognised as short from its own contents.
+
+Size the output at `len * 3 / 2 + 1`. Decoding mostly shrinks, but it does not
+never grow: `\0` is two source bytes and decodes to the three of U+FFFD, so
+two bytes of source need four of output. Every other escape — `\xNN`,
+`\uXXXX`, the surrogate pairs — consumes at least as many bytes as it
+produces, which makes 3-to-2 the worst case over the whole set.
+
+#### What a string accessor hands back
+
+`axl_json_get_string` and `axl_json_value_string` resolve escapes into the
+caller's buffer. The guarantee is scoped precisely, because the reader is not
+the writer's mirror: **whatever AXL DECODES, it decodes to well-formed UTF-8,
+and it never writes an interior NUL. Raw source bytes are passed through
+unvalidated.**
+
+- `\uXXXX` decodes to UTF-8, 1–4 bytes. A surrogate PAIR combines into one
+  code point above the BMP, so U+1F600 comes back as its 4 bytes and not as
+  two 3-byte sequences.
+- A lone or bare `\u` surrogate becomes U+FFFD. The parser deliberately accepts
+  these (JSONTestSuite classifies them `i_`), so the accessor is what has to
+  refuse them.
+- All three spellings of a NUL — the four-zero `\u` escape, and JSON5's `\0`
+  and `\x00` — become U+FFFD.
+  The buffer is NUL-terminated, so an interior NUL would truncate the
+  value for every `axl_strcmp` caller and make `"admin\0extra"` compare equal
+  to `"admin"`. That is a string-smuggling primitive, and it is reachable from
+  attacker-influenced input (JWT headers and claims, JWKs, HTTP request
+  bodies).
+- JSON5's `\xNN` is ES5's `HexEscapeSequence`, i.e. the code UNIT U+00NN — so
+  `\xe9` decodes to the two bytes of U+00E9, not to a lone `0xE9`.
+- A value too long for the buffer truncates, as it always has — but **never in
+  the middle of a UTF-8 sequence**, and never by making a character vanish while
+  the characters after it survive. That holds for a decoded escape and for a raw
+  multi-byte sequence alike, and it holds however the sequence was spelled: as
+  raw bytes, as an escaped lead byte with unescaped continuations, or with every
+  byte escaped separately. If the last thing that fit was half a sequence, the
+  half is dropped.
+
+**What an ill-formed RAW byte does depends on the UTF-8 mode.** A lone `0x80`,
+or a UTF-8-encoded lone surrogate, is handed back exactly as found under
+`AXL_JSON_UTF8_RAW`; under `AXL_JSON_UTF8_REPAIR` — the default — it becomes
+U+FFFD, which makes the guarantee above unconditional rather than escape-only;
+and under `AXL_JSON_UTF8_STRICT` the document does not parse at all. Note
+`axl_json_parse` names `RAW`, so the no-flags entry point still passes bytes
+through. The WRITER honors the same field at emission: RAW writes the byte out
+verbatim, STRICT sets its sticky error, REPAIR substitutes. `ENSURE_ASCII`
+beats RAW, because escaping to `\uXXXX` needs a code point an ill-formed byte
+does not have.
+
+The document still PARSES in every case above: this is about what the accessor
+may hand back, not about the grammar.
 
 ### Writing JSON
 
@@ -576,7 +979,7 @@ object or an array.
 AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
 AxlJsonWriter w;
 
-axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+axl_json_writer_init(&w, out, AXL_JSON_STRICT);
 axl_json_obj_begin(&w);
     axl_json_kv_str (&w, "name",    "AXL");
     axl_json_kv_uint(&w, "version", 1);
@@ -599,13 +1002,293 @@ For convenience, `axl_json_kv_*` collapses a key + atomic value into
 one call (the dominant shape). Use `axl_json_key` followed by an atom
 or container when the value is a nested object/array.
 
+### Writer formatting flags
+
+| flag | effect |
+|---|---|
+| `AXL_JSON_INDENT(n)` | newlines plus `n` spaces per level. `INDENT(0)` is newlines with no indent — NOT the same as passing no indent flag, which is fully compact. The presence bit is what separates them. |
+| `AXL_JSON_COMPACT` | drops the space after `:`. Only meaningful WITH `INDENT`, because AXL's unindented output is already compact. |
+| `AXL_JSON_ESCAPE_SLASH` | writes `/` as `\/`, in keys and values alike. Opt-in: RFC 8259 permits both and requires neither. The use is embedding in a `<script>` block, where `</` would close the element early. |
+| `AXL_JSON_ENSURE_ASCII` | escapes every non-ASCII code point as `\uXXXX`, so the output is pure 7-bit ASCII. Non-BMP becomes a SURROGATE PAIR — U+1F600 is `\ud83d\ude00`, not one escape. Ill-formed input escapes as `\ufffd`. Applies to values, keys, and `axl_json_write_token` splices. |
+| `AXL_JSON_EMBED` | omits the OUTERMOST `{}` or `[]`. Nested containers keep theirs, and only a CONTAINER root is affected — a bare-primitive root, an `axl_json_raw` root, and a document with no container are all unchanged. |
+| `AXL_JSON_SORT_KEYS` | orders object members by key. `axl_json_write_token` ONLY — the streaming writer buffers nothing, so there is nothing to sort and the flag is a documented no-op there. |
+
+`AXL_JSON_SORT_KEYS` orders **byte-wise over the key's DECODED name**,
+shorter-first when one key is a prefix of another — code-point order for
+well-formed UTF-8, and the same notion of a key's identity that a by-key
+lookup uses. So `{"\u0062":1,"a":2}` sorts as `a` then `b`, because that
+escaped key names `b`; ordering the source spelling would sort it by the
+backslash (0x5C, which precedes `a`) and leave the document in its original
+order, looking untouched rather than wrong. Case is not folded,
+because byte order does not fold it — `Z` (0x5A) precedes `a` (0x61).
+
+Sorting **recurses** into nested objects, wherever they sit, including inside
+an array; array elements keep their order, which is data rather than key
+order. A key is re-emitted in its original source spelling — the flag decides
+the ORDER of members and rewrites none of them. Duplicate keys are all kept in
+the order the document listed them.
+
+Unlike the rest of the writer this allocates, proportional to the widest
+object being sorted; an object whose keys carry no escapes needs no decode
+buffer and borrows its names from the document. Allocation failure sets
+`AXL_JSON_ERR_NO_MEMORY` on the writer.
+
+`AXL_JSON_EMBED` is defined by an identity rather than by prose: **wrapping
+its output in the delimiter it omitted reproduces the unembedded output byte
+for byte.** So an indented document's leading and trailing newlines survive —
+they belong to the members, not to the braces. Suppressing them would look
+tidier and would break composition, which is the point of pinning it as an
+identity: the caller splicing the result between their own braces gets exactly
+what the writer produces on its own.
+
+```c
+axl_json_writer_init(&w, out, AXL_JSON_INDENT(2) | AXL_JSON_COMPACT);
+// {
+//   "a":1,
+//   "o":{
+//     "p":"x/y"
+//   }
+// }
+```
+
+### Reader flags — duplicate rejection and UTF-8
+
+`AXL_JSON_UTF8_STRICT` on the reader is settled at **parse time**: a document
+whose raw bytes are not well-formed UTF-8 fails the parse with
+`AXL_JSON_ERR_BAD_UTF8`, positioned at the first byte of the first ill-formed
+**sequence**, with line and column. An accessor returning `false` could not
+carry that, and a caller could not tell ill-formed from absent-key or
+buffer-too-small.
+
+It scans the **whole document**, not its string tokens — RFC 8259 §8.1 defines
+a JSON text as UTF-8, and a JSON5 comment body is the other place arbitrary
+bytes survive lexing. Everything outside a string or comment is ASCII by the
+grammar, so the wider scan rejects nothing a token walk would have accepted.
+
+It checks **raw bytes only**. A lone surrogate written as an escape
+(`"\ud800"`) is well-formed JSON syntax, is not rejected, and still decodes to
+U+FFFD. Keys are checked as readily as values.
+
+The field's fourth value is **reserved and refused**
+(`AXL_JSON_ERR_INVALID_ARGUMENT`). It is reachable by accident:
+`AXL_JSON_RELAXED` already names `UTF8_RAW`, so `AXL_JSON_RELAXED |
+AXL_JSON_UTF8_STRICT` ORs to it. Spell the dialect out —
+`AXL_JSON_JSON5 | AXL_JSON_UTF8_STRICT` — for a JSON5 parse that validates
+its encoding.
+
+`AXL_JSON_UTF8_REPAIR` and `AXL_JSON_UTF8_RAW` decide only which bytes an
+accessor hands back, so they are consumed lazily at `axl_json_get_string` time
+and never fail a parse. RAW hands an ill-formed document byte back exactly as
+found; REPAIR — the **default** — turns it into U+FFFD, which makes the
+reader's "whatever AXL decodes, it decodes to well-formed UTF-8" guarantee
+unconditional instead of escape-only.
+
+The mode is judged on the **decoded** bytes, not the source ones, and that is
+load-bearing. JSON5 lets any byte be escaped, so one character can arrive
+split across escapes and raw bytes — `\<C3>\<A9>` is U+00E9 as two
+separately-escaped bytes, and `<C3>\<80>` is a raw lead with an escaped
+continuation. Judging the source would see a lone lead in the second and
+destroy a character the decoder assembles correctly.
+
+Because the mode is consumed lazily, the reader stores it, and a sub-reader
+and both iterators inherit it. `axl_json_parse` resolves to
+`AXL_JSON_RELAXED`, which names `UTF8_RAW`, so the no-flags entry point passes
+bytes through; a parse that names no mode at all gets REPAIR.
+
+
+| flag | effect |
+|---|---|
+| `AXL_JSON_REJECT_DUPLICATES` | a repeated key in any one object fails the parse with `AXL_JSON_ERR_DUPLICATE_KEY`. |
+| `AXL_JSON_UTF8_STRICT` | a document that is not well-formed UTF-8 fails the parse with `AXL_JSON_ERR_BAD_UTF8`. |
+
+Without it a duplicate is **accepted** — RFC 8259 §4 calls repeated names
+"unpredictable" rather than invalid. What AXL does with one is worth knowing,
+because it is what the flag opts out of: a by-key accessor returns the **first**
+occurrence, and `axl_json_object_next` yields every one of them separately.
+("First" holds for any key a by-key lookup can match at all — an *escaped*
+key whose decoded name reaches 256 bytes is skipped by that lookup, so a
+later duplicate answers instead. This check has no such ceiling.)
+
+"The same key" means the same **decoded** name, so `{"\u0061":1,"a":2}` is a
+duplicate even though no two bytes of the two keys match — the same definition
+a by-key lookup already uses, and the one that cannot be evaded by escaping
+half of the pair. The check runs in every object at any depth, and
+independently per object: sibling objects may each carry the same key, and a
+nested object may reuse its parent's.
+
+Decoding is **lossy** where the document is unrepresentable, so two keys that
+differ can still collide: every spelling of a zero escape and every lone
+surrogate becomes U+FFFD, making `{"\u0000a":1,"\ufffda":2}` a
+duplicate. That follows the decoder the by-key accessors already use, so the
+two agree on what a name is — but it can reject a document whose keys are
+distinct as written.
+
+The error is positioned at the **second** key — specifically at its first name
+byte, inside the quotes when it has any, since a JSON5 unquoted key has none.
+
+This is the one reader flag that allocates, and only when set. Detection is by
+hash set rather than by comparing each key against its predecessors, which
+would be O(n²) per object — a worse algorithm on exactly the wide objects that
+motivate the check.
+
+### Encodings, BOMs and line endings
+
+The JSON layer is **UTF-8 only**, and deliberately: RFC 8259 §8.1 requires
+UTF-8 for interchange, so `axl_json_parse` neither sniffs nor transcodes, and
+a BOM-prefixed buffer is refused.
+
+UEFI is the "closed ecosystem" that sentence carves out, though, and UCS-2 is
+its native text form. That composes one layer down, in `AxlStream`:
+
+```c
+AxlStream *f = axl_fopen(path, "r");
+AxlStream *t = axl_text_stream_wrap(f);   // sniffs the BOM, sets the encoding
+AxlJsonSource src;
+axl_json_source_init_stream(&src, t);
+axl_json_parse_source(&src, AXL_JSON_STRICT, &r);
+```
+
+`axl_text_stream_wrap` consumes a `FF FE` / `FE FF` / `EF BB BF` BOM and picks
+the byte order; `axl_stream_set_encoding` does the same job when you already
+know the encoding — but note it does **not** skip a BOM, which then decodes to
+`U+FEFF` and fails the parse. Writing works the same way: set the sink stream
+to `AXL_ENC_UCS2_LE` and the writer's UTF-8 output lands as UCS-2 on the wire.
+
+**Both line endings read.** RFC 8259 §2 lists space, tab, LF and CR as
+whitespace, so LF, CRLF and lone-CR documents all parse to the same values,
+and an error's `line` counts lines rather than CR bytes. A JSON5 line comment
+terminates at a lone CR as well as at LF.
+
+### Reading a float
+
+`axl_json_get_double()` and `axl_json_value_double()` complete the scalar
+family — `double` was the only type whose caller had to fetch
+`axl_json_get_number_str()` and parse the token by hand.
+
+The WHOLE token must parse, unlike `axl_json_get_int()`, which truncates at
+the first non-digit so `1.5` yields 1. There is no sensible prefix of a float:
+JSON5's `0x1F` would otherwise read as 0 and stop at the `x`. Use
+`axl_json_get_int()` for hex.
+
+An out-of-range magnitude is a **failure**, not an infinity. The underlying
+`axl_str_to_double()` reports overflow as ±infinity and underflow as ±0.0
+together with its error; this accessor does not pass those on, so `1e400`
+returns false and leaves the caller's value untouched, exactly as an
+out-of-range integer does. A caller who wants the IEEE result can read the
+token with `axl_json_get_number_str()` and convert it.
+
+`NaN` and `Infinity` read back as themselves when `AXL_JSON_ALLOW_NAN_INF` let
+them into the document.
+
+### Rendering an error
+
+`axl_json_error_format()` turns an `AxlJsonError` into text. This is why the
+struct stores a position and not a message: formatting at failure time would
+run in the parser, in every build, and cap quality at a fixed buffer.
+
+```c
+char buf[AXL_JSON_ERROR_BUF_MAX];
+if (!axl_json_parse(doc, len, AXL_JSON_RELAXED, &r)) {
+    if (axl_json_error_format(axl_json_reader_error(&r), doc, len,
+                              buf, sizeof(buf)) > 0) {
+        // 3:10: ill-formed UTF-8
+        // "b": "caf?"
+        //          ^
+    }
+}
+```
+
+Size the buffer at `AXL_JSON_ERROR_BUF_MAX`: because the contract refuses
+rather than truncating, that is the only size guaranteed never to return `-1`
+— and the widest render is a full window of 4-byte characters, which is well
+past 256. On `-1` the buffer is left empty rather than partial, so printing it
+unconditionally is safe even if the check above is skipped.
+
+Pass `NULL` for the document to get the terse `3:9: ill-formed UTF-8` alone —
+which is also what a reader over a stream or callback source must use, since
+the bytes are gone by then. A line too long to quote is **windowed** around the
+column with `...` at each cut end; minified JSON is one line, so refusing would
+make this useless on the documents machines produce. A TAB is copied into the
+caret line as a TAB so the caret survives tab expansion. `AXL_JSON_OK` renders
+as `no error`, and a buffer too small is refused rather than truncated.
+
+The quote **substitutes `?` for every other control byte**. The document is
+untrusted and this text goes to a console: a raw ESC would carry an ANSI
+sequence out of a JSON body, a raw CR would return the cursor to column 0 and
+wreck both the quote and the caret, and an embedded NUL would end the buffer
+early so the returned length outran what a caller can read. One byte out per
+byte in, so the caret still lines up.
+
+`AXL_JSON_ERR_DIALECT` appends the flag that would have accepted the input —
+`1:9: feature needs a dialect flag (pass AXL_JSON_ALLOW_COMMENTS)`. It is the
+one recoverable code in the enum, and naming the code without the flag gives a
+caller the half it cannot act on.
+
+### Sources and sinks
+
+Where bytes come from and where they go are two mirrored vtables — a function
+pointer plus a context — rather than a family of entry points each with its own
+flags-and-error plumbing.
+
+```c
+axl_json_source_init_mem     (&src, json, len);   // zero-copy — the fast path
+axl_json_source_init_stream  (&src, stream);
+axl_json_source_init_callback(&src, fn, ctx, hint);
+axl_json_parse_source(&src, AXL_JSON_STRICT, &r);
+
+axl_json_sink_init_string  (&snk, out);           // what writer_init does
+axl_json_sink_init_buffer  (&snk, &state, buf, size);
+axl_json_sink_init_stream  (&snk, stream);
+axl_json_sink_init_callback(&snk, fn, ctx);
+axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+```
+
+Both are copied by value and need not outlive the call; whatever they point AT
+must outlive the reader or writer.
+
+**A contiguous source borrows; the others own.** `axl_json_source_init_mem` is
+`axl_json_parse` under another name — the tokens index straight into your
+buffer, which must therefore outlive the reader. A stream or callback source
+accumulates the document into a buffer the READER owns, released by
+`axl_json_free`, so a streamed parse is one object to free instead of two.
+It saves no memory: tokens are 32-bit offsets, so every byte has to stay
+resident at a stable position for the reader's life. The win is ergonomic.
+
+**A full buffer is not a write failure.** The buffer sink stores what fits,
+keeps counting, and `axl_json_writer_finish` reports `AXL_JSON_ERR_IO` once if
+anything was dropped — so a truncated document is never mistaken for a complete
+one, but the writer is not halted at the first byte over. That is what makes
+two-pass sizing work:
+
+```c
+AxlJsonSink    snk;
+AxlJsonBufSink st;
+AxlJsonWriter  w;
+
+axl_json_sink_init_buffer(&snk, &st, NULL, 0);   // sizing pass
+axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+build(&w);
+axl_json_writer_finish(&w);
+
+size_t need = axl_json_writer_needed(&w);        // true size, always
+char  *buf  = axl_malloc(need);                  // NOT NUL-terminated
+axl_json_sink_init_buffer(&snk, &st, buf, need);
+axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+build(&w);
+axl_json_writer_finish(&w);
+```
+
+A sink that is BROKEN is different and does halt at once: it returns `-1`
+instead of a short count. "The buffer is full" is a fact about the buffer;
+"the sink is broken" is a fact about the world.
+
 ### Pretty Printing
 
-Pass `AXL_JSON_WRITER_PRETTY` at init for 2-space-indent output with
+Pass `AXL_JSON_INDENT(n)` at init for n-space-indent output with
 newlines at every container and member boundary:
 
 ```c
-axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
 // ... same writer calls ...
 // {
 //   "name": "AXL",
@@ -626,15 +1309,58 @@ if (axl_json_array_begin(&r, "items", &iter)) {
     AxlJsonReader elem;
     while (axl_json_array_next(&iter, &elem)) {
         char value[32];
-        axl_json_get_string(&elem, NULL, value, sizeof(value));
+        axl_json_value_string(&elem, value, sizeof(value));
         axl_printf("  %s\n", value);
     }
 }
 ```
 
-For root-level arrays (`[{...}, {...}]`) use `axl_json_root_array_begin`
-instead. Element readers borrow the parent's token array — do not call
-`axl_json_free` on them.
+An element is read with the **own-value** family (`axl_json_value_string`,
+`_int`, `_uint`, `_bool`, `_number_str`, `_type`), not with the by-key
+getters: an element has no key. This example used to pass `NULL` as the key
+to `axl_json_get_string`, which returns false on the spot — a `NULL` key is
+rejected, deliberately, so that a lookup which returned nothing cannot
+silently turn into "operate on the root".
+
+Use `axl_json_value_array_begin` for a root-level or nested array
+(`[{...}, {...}]`). It replaced `axl_json_root_array_begin`, whose name was
+wrong on the sub-reader it was mostly called on.
+
+Element readers borrow the parent's tokens and document bytes and own
+neither, so `axl_json_free` on one is a harmless no-op — but they are valid
+only while the parent reader is.
+
+### Iterating Objects
+
+The only way to ask what keys an object *has* — every other accessor needs the
+key you are already looking for.
+
+```c
+// Parse: {"host":"axl","port":8080}
+AxlJsonObjectIter it;
+if (axl_json_value_object_begin(&r, &it)) {       // or _object_begin(&r, "cfg", &it)
+    char          key[64];
+    AxlJsonReader val;
+    while (axl_json_object_next(&it, key, sizeof(key), &val)) {
+        axl_printf("  %s = %d\n", key, (int)axl_json_value_type(&val));
+    }
+}
+```
+
+Pairs arrive in **document order**, not sorted, and a **duplicate key is
+yielded once per occurrence** — RFC 8259 permits duplicates and collapsing
+them here would hide the thing an iterating caller may be looking for.
+
+The key is **decoded** into your buffer, not borrowed: `{"\\u0041":1}` is a
+key named `A`, so handing back raw bytes would reproduce the `\uXXXX` corruption
+one layer up. A key too long is truncated and the pair is still yielded —
+ending the walk over one oversized key would lose every later pair. If you
+compare keys, size the buffer at least two bytes longer than the longest key
+you compare against and a false match is unrepresentable. Pass `NULL`/`0` for
+the key buffer to walk values only.
+
+`AxlJsonObjectIter` holds the document by value, like `AxlJsonArrayIter`, so
+reusing the value reader cannot retarget the iterator.
 
 ### Nested Objects
 
@@ -655,25 +1381,39 @@ if (axl_json_get_object(&r, "server", &server) &&
 The sub-reader composes with every accessor — `axl_json_get_string` /
 `_int` / `_uint` / `_bool`, `axl_json_array_begin`, and
 `axl_json_get_object` itself all operate relative to the nested object.
-Like array elements, the sub-reader borrows the parent's token array:
-do not call `axl_json_free` on it, and it stays valid only while the
-parent reader lives.
+Like array elements, the sub-reader borrows the parent's tokens and
+document bytes and owns neither, so `axl_json_free` on it is a harmless
+no-op — but it stays valid only while the parent reader lives.
+
+`axl_json_get_object` leaves `out` **untouched** when it returns false,
+which is what licenses seeding it with a default and narrowing only if the
+section turns out to be present:
+
+```c
+AxlJsonReader cfg = root;                  // default: read from the root
+axl_json_get_object(&root, "tls", &cfg);   // narrow only if "tls" is an object
+axl_json_get_int(&cfg, "port", &port);
+```
 
 ### Round-Trip Transforms
 
 `axl_json_write_token` splices an already-parsed token into the
-writer's output. The bridge writes string and key bytes verbatim from
-the source — jsmn keeps escape sequences in source form, so this
-preserves `\uXXXX`, escaped quotes, etc. without re-escaping. Useful
-for parse → mutate → re-emit flows:
+writer's output, changing as little as correctness allows. The lexer
+leaves escape sequences in source form, so `\uXXXX` and every other
+ASCII escape survive untouched. What does change: ill-formed UTF-8 is
+repaired, an unescaped `"` (only reachable from a JSON5 single-quoted
+token) is escaped, `\'` loses an escape that means nothing between
+double quotes, and `\<non-ASCII>` travels as one unit. Each of those
+was a real defect before it was handled — see decisions 34 and 36 in
+`docs/AXL-JSON-Design.md`. Useful for parse → mutate → re-emit flows:
 
 ```c
 AxlJsonReader r;
-axl_json_parse(input, input_len, &r);
+axl_json_parse(input, input_len, AXL_JSON_RELAXED, &r);
 
 AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
 AxlJsonWriter w;
-axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
 
 axl_json_obj_begin(&w);
     axl_json_kv_str(&w, "wrapped_in", "envelope");
@@ -693,10 +1433,20 @@ is sufficient.
 
 Sources of writer error:
 
-- **AxlString OOM** — auto-grow failed.
+- **Output failure** (`AXL_JSON_ERR_IO`) — the sink refused. That covers an
+  `AxlString` that could not grow, a stream that would not take the bytes, and
+  a callback that returned `-1`. A sink reports failure and not a reason, so
+  the writer does not guess at one; `AXL_JSON_ERR_NO_MEMORY` stays read-side,
+  where the allocation is AXL's own.
+- **A fixed buffer that filled up** — reported ONCE, by
+  `axl_json_writer_finish`, rather than at the first byte over. See
+  "Sources and sinks".
 - **Structural misuse** the writer can detect:
-  - emit a bare-primitive root (only objects and arrays are valid
-    JSON root values; matches `axl_json_parse`'s contract)
+  - emit a SECOND root value (one value is a document; two concatenated
+    values are not). A single bare-primitive root is legal — `42` and
+    `"text"` are complete JSON texts under RFC 8259 §2, and both the
+    reader and the writer treat them as such.
+  - emit a key at depth 0, where no object is open
   - emit a value outside any container after the root has closed
   - emit a key inside an array
   - emit a value when a key was expected in object context
@@ -708,19 +1458,74 @@ What the writer does **not** catch:
 
 - Duplicate keys in the same object — JSON technically allows them; the
   writer doesn't track emitted keys.
-- Non-UTF-8 bytes in `axl_json_str` — passed through escaping unchanged.
 - The contents of `axl_json_raw(&w, fragment)` — the caller asserts the
   fragment is valid JSON; the writer splices it as-is.
+
+#### String encoding
+
+Everything the writer emits is well-formed UTF-8, whatever the caller
+passes in — keys and values (NUL-terminated and counted), tokens spliced
+by `axl_json_write_token`, and comment bodies. A JSON text is defined
+over Unicode code points (RFC 8259 §8.1), so a single ill-formed sequence
+invalidates the whole document. Well-formed UTF-8 passes through
+byte-for-byte (§7 requires escaping only `"`, `\` and `0x00-0x1F`);
+ill-formed bytes become U+FFFD, one per bad byte, matching
+`axl_utf8_decode`'s resynchronization contract rather than adding a
+validator of its own.
+
+Callers do not need to pre-validate. Strings reaching a writer are
+routinely outside the caller's control:
+
+- `axl_smbios_get_string_utf8` returns a direct pointer into firmware
+  table memory — vendor tables carry latin-1 in the wild.
+- Anything truncated to a byte budget can be cut mid-sequence.
+  `axl_log`'s message buffer is one such producer.
+
+`axl_json_strn` / `axl_json_keyn` never read past `n`, so a sequence cut
+by the count is repaired rather than silently completed from whatever
+bytes follow it in the caller's buffer.
+
+`axl_json_write_token` keeps an ASCII escape verbatim — the parser keeps
+escape sequences in source form, so `\uXXXX` survives untouched. Ill-formed
+bytes ≥ 0x80 are replaced, and the three JSON5-only shapes above (an
+unescaped `"`, `\'`, and `\<non-ASCII>`) are rewritten into forms that
+mean the same thing between double quotes.
+This matters because the parser validates no encoding unless asked to
+(`AXL_JSON_UTF8_STRICT`): without that, a
+re-serialized document would carry a source document's bad bytes out.
+
+`axl_json_escape_string` behaves the same way. Note U+FFFD is 3 bytes
+where the input byte was 1, so ill-formed input can overflow an output
+buffer sized for the raw bytes; that returns `-1` like any other
+truncation.
 
 ### JSON5 Support
 
 [JSON5](https://json5.org) is a strict superset of JSON aimed at
 human-edited config files. AXL accepts the JSON5 grammar on the reader
-side via an opt-in flag, and emits JSON5-flavored extras (trailing
-commas, comments) on the writer side via additional flags. Strict
-callers see no behavior change.
+side and emits JSON5-flavored extras (trailing commas, comments) on the
+writer side, both driven by the same flag bits.
 
-**Reader — opt in with `AXL_JSON_PARSER_JSON5`:**
+**Every reader entry point NAMES its dialect.** `axl_json_parse` and
+`axl_json_load_file` take the flags word as a parameter; there is no
+default and no no-flags twin. Both used to have one, defaulting to
+`AXL_JSON_RELAXED` because `0` would have meant strict — which made the
+liberal dialect something you got by not asking. Pass `AXL_JSON_RELAXED`
+for the whole JSON5 grammar, `AXL_JSON_STRICT` to validate as RFC 8259.
+
+`AXL_JSON_STRICT` means it. Unquoted keys, hex literals, single quotes and
+trailing commas were accepted under it before P3, because strict parsing ran
+on a permissively-compiled jsmn; they are refused now that everything runs
+on the one lexer.
+
+**Flags are one 64-bit `AxlJsonFlags` space shared by reader and writer**, so
+a dialect means the same thing in both directions. Each JSON5 feature has its
+own `AXL_JSON_ALLOW_*` bit and `AXL_JSON_JSON5` is the OR of all of them — a
+consumer that wants comments in its config files need not also accept
+single-quoted strings and hex literals. Presets: `AXL_JSON_STRICT` (0, RFC
+8259), `AXL_JSON_JSON5`, `AXL_JSON_RELAXED`.
+
+**Reader — opt in with `AXL_JSON_JSON5`:**
 
 ```c
 const char *cfg =
@@ -734,8 +1539,8 @@ const char *cfg =
     "}\n";
 
 AxlJsonReader r;
-if (!axl_json_parse_flags(cfg, axl_strlen(cfg),
-                          AXL_JSON_PARSER_JSON5, &r)) {
+if (!axl_json_parse(cfg, axl_strlen(cfg),
+                    AXL_JSON_JSON5, &r)) {
     /* parse error */
 }
 /* All the standard accessors (axl_json_get_string,
@@ -751,8 +1556,8 @@ AxlJsonReader  r;
 void          *raw;
 size_t         raw_len;
 
-if (axl_json_load_file_flags("jedec.json5", AXL_JSON_PARSER_JSON5,
-                             &r, &raw, &raw_len)) {
+if (axl_json_load_file("jedec.json5", AXL_JSON_JSON5,
+                       &r, &raw, &raw_len)) {
     /* ... use r ... */
     axl_json_free(&r);
     axl_free(raw);
@@ -766,20 +1571,141 @@ JSON5 features the parser accepts:
 - Single-quoted strings (`'text'`)
 - Unquoted (identifier-name) object keys
 - Hex number literals (`0x...`) and `+` / `-` number prefix
-- Extended string escapes: `\'`, `\v`, `\0`, `\x##`, line continuations
+- Extended string escapes: `\'`, `\v`, `\0`, `\x##`, line continuations.
+  `\0` and `\x00` decode to U+FFFD, not a NUL — see
+  **UTF-8 Encoding** above for why an interior NUL is refused.
 
-Strict callers (`axl_json_parse`, no flags) still go through the
-existing jsmn-based path and reject JSON5 input. The JSON5 path is
-strictly opt-in.
+Every flag value goes through the same parser, so each of those features
+is gated individually: `AXL_JSON_ALLOW_COMMENTS` alone permits comments
+and nothing else. `test/unit/axl-test-data.c` proves it with an N×N
+rejection matrix — search `matrix:` — whose load-bearing half is the
+negative one, since a lexer that ignored the flag word entirely would
+pass every positive case.
 
-**Writer — emit JSON5 extras with `AXL_JSON_WRITER_TRAILING_COMMAS`
+**`AXL_JSON_STRICT` is RFC 8259**, verified against all 316 embedded
+JSONTestSuite cases in `test/unit/axl-test-json-conformance.c`: every
+`y_` accepted, every `n_` rejected. It rejects what the standard forbids
+and nothing more — a bare-primitive root and duplicate object keys are
+both accepted, because RFC 8259 permits them.
+
+Two deliberate narrowings, both documented at their assertion:
+
+- **Nesting is bounded** to `AXL_JSON_DEPTH_DEFAULT` (32) levels, raisable
+  to `AXL_JSON_DEPTH_MAX` (256) via `AXL_JSON_DEPTH(n)`. This was a stack
+  budget: the parser was recursive descent, so nesting depth was stack
+  depth, and AXL is freestanding with no guard page — unbounded, the
+  corpus's 100000-nested-array document needed ~12.8 MB of stack and
+  *faulted* instead of failing. Removing the bound was tried, and the test
+  binary stalled; the crash was real, not hypothetical.
+
+  Since P12e neither face recurses. The scanner tracks one bit per open
+  container (32 bytes covers all 256 levels); the whole-document face adds
+  8 bytes per open container, heap-allocated per parse and sized to the
+  *resolved* limit — 256 bytes at the default 32. So the bound is now a
+  policy number. It stays because accepting arbitrary nesting is still a
+  choice a caller should make deliberately, not because the alternative is
+  a fault.
+- **A UTF-16 or BOM-prefixed document is refused.** RFC 8259 §8.1
+  requires UTF-8 for interchange and AXL does not sniff or transcode.
+
+Until the granular redesign's P3 phase, strict parsing ran on a vendored
+jsmn compiled without `JSMN_STRICT` — i.e. the branch that was supposed
+to mean "strict" was the permissive one. It refused exactly one of the
+eight JSON5 features (a `\x` escape) and tolerated the rest, and it
+rejected a comment only *before* the root: `{"a":1 /* c */}` parsed, and
+`{/* c */"a":1}` "parsed" into a garbage token tree, so the key was
+silently unretrievable — accept **and** misparse. That is what deleting
+it fixed. See `docs/AXL-JSON-Design.md`.
+
+**Scanner — pull events instead of building a document.**
+
+`AxlJsonScanner` is the streaming read face. It walks the same grammar
+as `axl_json_parse` — the whole-document face *is* this scanner run to
+completion — but retains nothing: O(depth) memory rather than
+O(tokens), so reading one key out of a large sidecar never materializes
+the rest of it.
+
+```c
+AxlJsonSource  src;
+AxlJsonScanner s;
+AxlJsonEvent   ev;
+
+axl_json_source_init_mem(&src, doc, len);
+axl_json_scanner_init(&s, &src, AXL_JSON_JSON5);
+while (axl_json_scanner_next(&s, &ev) && ev.kind != AXL_JSON_EV_EOF) {
+    if (ev.kind == AXL_JSON_EV_KEY && axl_json_event_equals(&ev, "port")) {
+        axl_json_scanner_next(&s, &ev);        // the value follows its key
+        break;                                 // stop; nothing is owed
+    }
+    axl_json_scanner_skip(&s);                 // discard this subtree
+}
+if (axl_json_scanner_error(&s)->code != AXL_JSON_OK) { /* ... */ }
+axl_json_scanner_free(&s);                     // required even here
+```
+
+Four things that are easy to get wrong from the outside:
+
+- **`ev.text` is borrowed, short-lived and NOT NUL-terminated.** It is
+  raw source bytes with escapes intact, valid only until the next
+  `next()`. Use `ev.len`, `axl_json_event_string()` to decode, or
+  `axl_json_event_equals()` to compare without a buffer.
+- **`ev.depth` counts containers OUTSIDE the event**, so a container's
+  BEGIN and its matching END report the same number. That is what makes
+  `begin.depth == end.depth` the way to match them.
+- **`AXL_JSON_EV_EOF` is a document BOUNDARY, not end of input.** Keep
+  calling `next()` and you get the next document's events, which is all
+  NDJSON needs — no flag. `false` means exhausted *or* failed; ask
+  `axl_json_scanner_error()` which.
+- **`_free()` is required** even for a contiguous source, which allocates
+  nothing today. Demanding it now is what lets a stream mode start owning
+  a buffer later without auditing callers.
+
+Trailing bytes are the caller's policy here. `axl_json_parse` is
+the caller that wants exactly one document, which is why
+`AXL_JSON_ERR_TRAILING` comes from it and never from the scanner.
+
+**Over a PULL source** — an `AxlJsonSource` with a `read` function instead
+of a contiguous view — the scanner owns a window it refills, and memory is
+**O(largest single token)** rather than O(document):
+
+```c
+axl_json_source_init_callback(&src, my_read, my_ctx, 0);
+axl_json_scanner_init(&s, &src, AXL_JSON_JSON5);
+while (axl_json_scanner_next(&s, &ev)) { ... }   // identical loop
+axl_json_scanner_free(&s);                       // now really frees something
+```
+
+The event stream does not depend on the chunking: the same bytes give the
+same events, and the same error code, offset, line and column, whether they
+arrive all at once or one byte at a time. That is asserted by sweeping a
+differential across chunk sizes, not merely intended.
+
+A token that straddles a refill is **re-scanned from its start** rather than
+resumed mid-way — the rule .NET's `Utf8JsonReader` documents and expat
+implements — so the five leaf scanners are shared with the contiguous path
+instead of forked into resumable state machines. Consequences worth knowing:
+
+- A single token must fit in the window, which grows to fit it. A comment
+  counts as a token, so a 10 MB block comment costs 10 MB.
+- `AXL_JSON_ERR_IO` (the read function returned -1) and
+  `AXL_JSON_ERR_NO_MEMORY` (the window could not grow) join the codes this
+  face can produce. Neither is reachable over a contiguous view.
+- `axl_json_scanner_consumed()` counts what the GRAMMAR consumed, which is
+  less than what was pulled — the scanner reads ahead, and those bytes are
+  inside it. There is no handing the remainder elsewhere; keep scanning with
+  the same scanner.
+- Pass `NULL`/`0` for the document to `axl_json_error_format()`: `offset` is
+  input-relative and the bytes it names have usually scrolled out of the
+  window, so any chunk you still hold is a different coordinate space.
+
+**Writer — emit JSON5 extras with `AXL_JSON_ALLOW_TRAILING_COMMA`
 and `axl_json_comment`:**
 
 ```c
 AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
 AxlJsonWriter w;
 axl_json_writer_init(&w, out,
-    AXL_JSON_WRITER_PRETTY | AXL_JSON_WRITER_TRAILING_COMMAS);
+    AXL_JSON_INDENT(2) | AXL_JSON_ALLOW_TRAILING_COMMA);
 
 axl_json_obj_begin(&w);
     axl_json_comment(&w, "generated — do not edit by hand");
@@ -814,18 +1740,37 @@ benefit.
 
 #### JSON5 conformance notes
 
-AXL's JSON5 support is scoped to the features that matter for
-firmware-edited sidecar configs (the in-tree consumer is
-`tools/memspd.c` reading `share/jedec.json5`). The following parts
-of the [json5.org](https://json5.org) spec are intentionally
-**not** supported:
+`Infinity`, `-Infinity`, `NaN` and `-NaN` ARE lexed, behind
+`AXL_JSON_ALLOW_NAN_INF` (`+Infinity` and `+NaN` need
+`AXL_JSON_ALLOW_PLUS_SIGN` as well — the sign is that flag's feature).
 
-- **`Infinity`, `-Infinity`, `NaN`** — AXL is freestanding UEFI
-  with no `libm`. There's no `axl_json_get_double` accessor, so
-  IEEE 754 special values would be lex-only and unretrievable.
-  `axl_json_get_int` on a fractional or scientific-notation token
-  truncates at the first non-digit character (pre-existing
-  strict-mode behavior, unchanged): `{x: 1.5}` returns `1`.
+This is deliberately NOT IEEE 754 support, and the distinction is the whole
+of it: AXL JSON has no `axl_json_get_double`, so there is no accessor these
+could be converted *for*. Not that a `double` is unrepresentable — `axl_dtoa`
+is public in `axl-format.h` and `%f`/`%e`/`%g` exist. What is missing is the
+READ side, correctly-rounded decimal-to-double, which has no `strtod`
+equivalent here. They are primitive TOKENS, reachable
+only as text via `axl_json_get_number_str()`. `axl_json_get_int` and
+`axl_json_get_uint` refuse them outright — there is no integer they could
+mean.
+
+`axl_json_get_number_str` is the general escape hatch for any number those two
+must refuse, not just these: a literal wider than 64 bits, a fraction, an
+exponent. It hands back the document's own bytes, so `1e10` stays `"1e10"` and
+is never normalized to `"10000000000"`. It refuses rather than truncates when
+the buffer is too small, unlike `axl_json_get_string` — a clipped string is
+incomplete, a clipped number is a different number.
+
+`axl_json_get_int` on a fractional or scientific-notation token still
+truncates at the first non-digit (long-standing behavior, unchanged):
+`{x: 1.5}` returns `1`. The integral part is bounds-checked, so
+`{x: 12345678901234567890.5}` is rejected rather than wrapped — and
+`get_number_str` is how you read it losslessly.
+
+The rest of AXL's JSON5 support is scoped to what matters for firmware-edited
+sidecar configs (the in-tree consumer is `tools/memspd.c` reading
+`share/jedec.json5`). These parts of the [json5.org](https://json5.org) spec
+are intentionally **not** supported:
 
 - **Unicode `IdentifierName` for unquoted keys** — only the ASCII
   subset (`[A-Za-z_$][A-Za-z0-9_$]*`) is recognized. Keys with
@@ -838,11 +1783,12 @@ of the [json5.org](https://json5.org) spec are intentionally
   insignificant. Documents using Unicode separators as whitespace
   will fail to parse.
 
-These gaps are deliberate — adding lex support for tokens that
-can't be retrieved (floats) or for grammar that no firmware tool
-actually authors (Unicode identifier keys) would expand the
-attack surface and surprise consumers without unlocking new use
-cases. Open an issue if a real consumer needs any of these and
+These gaps are deliberate — adding lex support for grammar that no firmware
+tool actually authors (Unicode identifier keys, Unicode whitespace) would
+expand the attack surface and surprise consumers without unlocking new use
+cases. Note this rationale no longer covers "tokens that can't be retrieved":
+`axl_json_get_number_str` retrieves any number losslessly, which is what made
+`AXL_JSON_ALLOW_NAN_INF` worth having. Open an issue if a real consumer needs any of these and
 they can be revisited.
 
 ### Console Output
@@ -892,7 +1838,7 @@ Two independent APIs:
 AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
 AxlXmlWriter w;
 
-axl_xml_writer_init(&w, out, AXL_XML_WRITER_DEFAULT);
+axl_xml_writer_init(&w, out, AXL_XML_DEFAULT);
 axl_xml_writer_prologue(&w);
 axl_xml_writer_start_element(&w, "D:multistatus");
 axl_xml_writer_attribute(&w, "xmlns:D", "DAV:");
@@ -909,8 +1855,20 @@ if (!axl_xml_writer_error(&w)) {
 }
 ```
 
-Pass `AXL_XML_WRITER_PRETTY` at init for 2-space indent + newlines
-between child elements; text-only elements stay on one line.
+Pass `AXL_XML_INDENT(n)` at init for an `n`-space indent + newlines between
+child elements; text-only elements stay on one line. `AXL_XML_DEFAULT` (zero)
+is compact, and `AXL_XML_INDENT(0)` is a different thing again — newlines with
+a zero-width indent, which is why the presence bit is separate from the width.
+
+**`AxlXmlFlags` shares its layout with `AxlJsonFlags` deliberately.**
+`AXL_XML_INDENT` is bit-for-bit `AXL_JSON_INDENT`, so handing one writer the
+other's indent request is simply correct rather than a trap. It used to be a
+trap: `AXL_XML_WRITER_PRETTY` was `1 << 0`, the same bit as
+`AXL_JSON_ALLOW_COMMENTS`, and because both are plain integers in C the mistake
+compiled and silently asked for something else. A distinct typedef would not
+have helped — `uint64_t` is `uint64_t` — so the fix is that the same bit means
+the same thing, plus `axl_xml_writer_init` refusing any bit XML does not
+define (`AXL_XML_KNOWN_MASK`) instead of ignoring it.
 
 ### Reading XML
 

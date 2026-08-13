@@ -26,6 +26,10 @@ size_t strlen(const char *s) { return axl_strlen(s); }
 int    strcmp(const char *a, const char *b) { return axl_strcmp(a, b); }
 int    strncmp(const char *a, const char *b, size_t n) { return axl_strncmp(a, b, n); }
 int    memcmp(const void *a, const void *b, size_t n) { return axl_memcmp(a, b, n); }
+/* Not one of the four intrinsics gcc assumes freestanding, but libstdc++'s
+   char_traits<char>::find calls it out of line -- so every std::string_view
+   search (and therefore axl::string's, which forwards to it) needs this. */
+void  *memchr(const void *s, int c, size_t n) { return axl_memchr(s, c, n); }
 char  *strchr(const char *s, int c) { return axl_strchr(s, c); }
 char  *strstr(const char *h, const char *n) { return axl_strstr(h, n); }
 char  *strncpy(char *d, const char *s, size_t n) { return axl_strncpy(d, s, n); }

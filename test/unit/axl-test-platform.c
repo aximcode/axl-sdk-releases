@@ -184,8 +184,7 @@ test_acpi_fadt_children(void)
         test_check(axl_acpi_checksum_ok(dsdt),
                    "acpi: DSDT checksum valid");
     } else {
-        test_check(true, "acpi: DSDT detail SKIP balance");
-        test_check(true, "acpi: DSDT detail SKIP balance");
+        test_skip_n(2, "acpi: no DSDT surfaced by this firmware");
     }
 
     /* Both must appear in the unfiltered walk too (single source). */
@@ -212,7 +211,7 @@ test_acpi_fadt_children(void)
         test_check((uint64_t)(uintptr_t)dsdt == want,
                    "acpi: surfaced DSDT is the FADT's DSDT pointer");
     } else {
-        test_check(true, "acpi: DSDT-pointer SKIP balance");
+        test_skip_n(1, "acpi: no FADT/DSDT pair to cross-check");
     }
 
     /* FACS is surfaced iff the FADT actually points to one — x86 OVMF
@@ -246,7 +245,7 @@ test_acpi_fadt_children(void)
     } else {
         test_check(t0 != NULL && axl_memcmp(t0->signature, "DSDT", 4) == 0,
                    "acpi: DSDT is first in the walk (no FACS)");
-        test_check(true, "acpi: FADT-order SKIP balance (no FACS)");
+        test_skip_n(1, "acpi: FADT points at no FACS, so no walk ordering to check");
     }
 }
 
@@ -587,10 +586,7 @@ test_pci_get_header_subsystem(void)
         test_check(axl_pci_get_subsystem(bridge, &svid, &sdid) == AXL_ERR,
                    "pci get_subsystem: rejects Type 1 bridge");
     } else {
-        axl_printf("SKIP: pci get_header_type/get_subsystem bridge path "
-                   "(no PCI-PCI bridge in topology)\n");
-        test_check(true, "pci get_header_type bridge: SKIP balance");
-        test_check(true, "pci get_subsystem bridge: SKIP balance");
+        test_skip_n(2, "pci get_header_type/get_subsystem bridge path (no PCI-PCI bridge in topology)");
     }
 }
 
@@ -703,9 +699,7 @@ test_pci_tree_walker(void)
         test_check(match,
                    "pci tree: child bus == bridge.secondary from bridge_info");
     } else {
-        test_check(true, "pci tree: SKIP — no bridges in topology (3 balancers)");
-        test_check(true, "pci tree: SKIP balance");
-        test_check(true, "pci tree: SKIP balance");
+        test_skip_n(3, "pci tree: SKIP — no bridges in topology (3 balancers)");
     }
 
     /* Early stop: callback returning non-zero must propagate to
@@ -736,15 +730,12 @@ test_pci_ids_db(void)
        NULL here exercises that lookup path. */
     AxlSidecarStatus rc = axl_pci_ids_load(NULL);
     if (rc != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: pci-ids load (no companion file staged)\n");
-        /* Balance: 7 conditional test_checks below (rc==0, intel,
-           q35, unknown vendor, unknown device, second-load, after-free). */
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "pci-ids: SKIP balance");
-        }
+        /* SIX below: intel, q35, unknown vendor, unknown device,
+           second-load, after-free. There was a seventh asserting rc == 0,
+           which the `if` above had already established -- deleted. */
+        test_skip_n(6, "pci-ids: no companion pci-ids.json5 staged");
         return;
     }
-    test_check(rc == 0, "pci-ids: companion-path load succeeds");
 
     /* Known entries from share/pci-ids.json5. The exact strings are
        part of the contract — if the file content changes, fix the
@@ -923,10 +914,7 @@ test_pci_ids_subsys_db(void)
        the DB isn't loaded (e.g. when test EFI is launched outside
        the integration runner). */
     if (axl_pci_ids_load(NULL) != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: pci-ids subsys_db (no companion file staged)\n");
-        for (int i = 0; i < 2; i++) {
-            test_check(true, "pci-ids subsys: SKIP balance");
-        }
+        test_skip_n(2, "pci-ids subsys_db (no companion file staged)");
         return;
     }
 
@@ -999,7 +987,7 @@ test_pci_class_db_handle(void)
 
     axl_pci_class_close(db);
     axl_pci_class_close(NULL);
-    test_check(true, "pci class_db: close + close(NULL) OK");
+    test_survived("pci class_db: close + close(NULL) OK");
 
     /* Schema 2 — hierarchical: subclasses nest under bases, progs
        nest under subclasses. Lookups resolve to the same composite
@@ -1118,19 +1106,16 @@ test_pci_class_db_singleton_overrides(void)
        into prod tools). The test-only file is the override that
        proves the loader-applied lookup actually fires.
 
-       Populated path runs 6 conditional checks below: 'overlay
-       loaded', '[overlay] marker', 'codes outside overlay still
-       hit compiled-in', 'second load no-op', 'free reverts',
-       'missing file -1'. */
+       Populated path runs 5 conditional checks below: '[overlay] marker',
+       'codes outside overlay still hit compiled-in', 'second load no-op',
+       'free reverts', 'missing file -1'. (There was a sixth, 'overlay
+       loaded', asserting the AXL_SIDECAR_OK the `if` below had already
+       established -- deleted, so this count and the skip's are both 5.) */
     AxlSidecarStatus rc = axl_pci_class_load("pci-class-test.json5");
     if (rc != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: pci class_db (no test overlay staged)\n");
-        for (int i = 0; i < 6; i++) {
-            test_check(true, "pci class_db: SKIP balance");
-        }
+        test_skip_n(5, "pci class_db (no test overlay staged)");
         return;
     }
-    test_check(true, "pci class_db: overlay loaded");
 
     /* The test fixture redefines 0x060000 (Host bridge) — a stable
        triple in the compiled-in table — with an "[overlay]" marker
@@ -1240,10 +1225,7 @@ test_pci_format_name(void)
     /* Cases 1-3 use the staged singleton DB. SKIP-balanced when
        no companion DB is present. */
     if (axl_pci_ids_load(NULL) != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: pci format_name (no companion DB staged)\n");
-        for (int i = 0; i < 3; i++) {
-            test_check(true, "pci format_name: SKIP balance");
-        }
+        test_skip_n(3, "pci format_name (no companion DB staged)");
         return;
     }
 
@@ -1414,7 +1396,7 @@ test_pci_ids_handle_buffer(void)
     /* Close is NULL-safe. */
     axl_pci_ids_close(h);
     axl_pci_ids_close(NULL);
-    test_check(true, "pci-ids handle: close + close(NULL) OK");
+    test_survived("pci-ids handle: close + close(NULL) OK");
 }
 
 static void
@@ -1482,8 +1464,7 @@ test_pci_ids_load_failure_modes(void)
        when the fixture isn't present. */
     AxlSidecarStatus rc = axl_pci_ids_load("pci-ids-malformed.json5");
     if (rc == AXL_SIDECAR_FILE_MISSING) {
-        axl_printf("SKIP: pci-ids load PARSE_ERROR (malformed fixture not staged)\n");
-        test_check(true, "pci-ids load: SKIP balance for PARSE_ERROR path");
+        test_skip_n(1, "pci-ids load PARSE_ERROR (malformed fixture not staged)");
     } else {
         test_check(rc == AXL_SIDECAR_PARSE_ERROR,
                    "pci-ids load: malformed JSON5 returns PARSE_ERROR");
@@ -1716,8 +1697,16 @@ test_pci_vpd_iter(void)
         int rc = axl_pci_vpd_iter(*p, vpd_iter_count_cb, &n);
         if (rc == 0 && n > 0) {
             tried_real = true;
-            test_check(true,
-                       "pci vpd_iter: walked VPD on real device");
+            /* A second walk must report the same keyword count. The obvious
+               assertion here asserted a literal true labelled "walked VPD
+               on real device", which restated the `if` above and so could
+               not fail. Re-walking is a property the loop has NOT already
+               established: it catches a VPD reader that consumes or advances
+               state it should not. */
+            int again = 0;
+            test_check(axl_pci_vpd_iter(*p, vpd_iter_count_cb, &again) == 0
+                       && again == n,
+                       "pci vpd_iter: a second walk reports the same count");
             /* Verify early-stop: callback's non-zero return propagates. */
             test_check(axl_pci_vpd_iter(*p, vpd_iter_stop_cb, NULL) == 42,
                        "pci vpd_iter: cb non-zero return propagates");
@@ -1725,12 +1714,7 @@ test_pci_vpd_iter(void)
         }
     }
     if (!tried_real) {
-        axl_printf("SKIP: pci vpd_iter (no device with VPD on this bus)\n");
-        /* Balance: 2 checks ran in the populated path, 0 in skip. Add
-           2 trivial passing checks so the ratchet doesn't drift between
-           QEMU images. */
-        test_check(true, "pci vpd_iter: SKIP balance 1");
-        test_check(true, "pci vpd_iter: SKIP balance 2");
+        test_skip_n(2, "pci vpd_iter: no device with VPD on this bus");
     }
 }
 
@@ -1754,10 +1738,7 @@ test_usb_enumerate(void)
            QEMU test runner injects qemu-xhci + usb-mouse so the
            populated branch is what CI exercises. Balance the count
            against the populated branch (3 checks). */
-        axl_printf("SKIP: usb_enumerate (no EFI_USB_IO_PROTOCOL handles)\n");
-        test_check(true, "usb enumerate: SKIP balance 1");
-        test_check(true, "usb enumerate: SKIP balance 2");
-        test_check(true, "usb enumerate: SKIP balance 3");
+        test_skip_n(3, "usb_enumerate (no EFI_USB_IO_PROTOCOL handles)");
         return;
     }
     test_check(count > 0, "usb: next finds at least one interface");
@@ -1776,12 +1757,7 @@ test_usb_get_vid_pid(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_vid_pid (no USB devices)\n");
-        test_check(true, "usb vid_pid: SKIP balance 1");
-        test_check(true, "usb vid_pid: SKIP balance 2");
-        test_check(true, "usb vid_pid: SKIP balance 3");
-        test_check(true, "usb vid_pid: SKIP balance 4");
-        test_check(true, "usb vid_pid: SKIP balance 5");
+        test_skip_n(5, "usb_get_vid_pid (no USB devices)");
         return;
     }
 
@@ -1817,13 +1793,7 @@ test_usb_get_class(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_class (no USB devices)\n");
-        test_check(true, "usb get_class: SKIP balance 1");
-        test_check(true, "usb get_class: SKIP balance 2");
-        test_check(true, "usb get_class: SKIP balance 3");
-        test_check(true, "usb get_class: SKIP balance 4");
-        test_check(true, "usb get_class: SKIP balance 5");
-        test_check(true, "usb get_class: SKIP balance 6");
+        test_skip_n(6, "usb_get_class (no USB devices)");
         return;
     }
 
@@ -1954,10 +1924,7 @@ test_usb_get_string(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_string (no USB devices)\n");
-        for (int i = 0; i < 5; i++) {
-            test_check(true, "usb get_string: SKIP balance");
-        }
+        test_skip_n(5, "usb_get_string (no USB devices)");
         return;
     }
 
@@ -1997,10 +1964,7 @@ test_usb_get_manufacturer(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_manufacturer (no USB devices)\n");
-        for (int i = 0; i < 3; i++) {
-            test_check(true, "usb get_manufacturer: SKIP balance");
-        }
+        test_skip_n(3, "usb_get_manufacturer (no USB devices)");
         return;
     }
 
@@ -2024,10 +1988,7 @@ test_usb_get_product(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_product (no USB devices)\n");
-        for (int i = 0; i < 3; i++) {
-            test_check(true, "usb get_product: SKIP balance");
-        }
+        test_skip_n(3, "usb_get_product (no USB devices)");
         return;
     }
 
@@ -2049,10 +2010,7 @@ test_usb_get_serial(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_serial (no USB devices)\n");
-        for (int i = 0; i < 4; i++) {
-            test_check(true, "usb get_serial: SKIP balance");
-        }
+        test_skip_n(4, "usb_get_serial (no USB devices)");
         return;
     }
 
@@ -2138,10 +2096,7 @@ test_usb_tree_walker(void)
        (tablet behind hub), max_depth >= 1, plus early-stop and
        NULL-fn guards. */
     if (rc == -1 || t.n_visits == 0) {
-        axl_printf("SKIP: usb_tree_walker (no USB stack)\n");
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "usb tree_walker: SKIP balance");
-        }
+        test_skip_n(7, "usb_tree_walker (no USB stack)");
         return;
     }
     test_check(rc == 0, "usb tree_walker: clean walk returns 0");
@@ -2175,10 +2130,7 @@ test_usb_get_device_info(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_device_info (no USB devices)\n");
-        for (int i = 0; i < 5; i++) {
-            test_check(true, "usb device_info: SKIP balance");
-        }
+        test_skip_n(5, "usb_get_device_info (no USB devices)");
         return;
     }
 
@@ -2205,10 +2157,7 @@ test_usb_get_num_endpoints(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_num_endpoints (no USB devices)\n");
-        for (int i = 0; i < 4; i++) {
-            test_check(true, "usb num_endpoints: SKIP balance");
-        }
+        test_skip_n(4, "usb_get_num_endpoints (no USB devices)");
         return;
     }
 
@@ -2230,10 +2179,7 @@ test_usb_get_port_info(void)
 {
     AxlUsbAddr *u = axl_usb_next(NULL);
     if (u == NULL) {
-        axl_printf("SKIP: usb_get_port_info (no USB devices)\n");
-        for (int i = 0; i < 8; i++) {
-            test_check(true, "usb port_info: SKIP balance");
-        }
+        test_skip_n(8, "usb_get_port_info (no USB devices)");
         return;
     }
 
@@ -2454,6 +2400,67 @@ test_serial_io(void)
         axl_serial_close(sp);
     }
 
+    /* --- Exclusivity: a second open of one UART must not silently succeed ---
+       Two subsystems in one image each holding a "port" that is the same UART
+       is not interleaved output, it is corruption: the one that calls
+       axl_driver_disconnect_handle first detaches the drivers underneath a
+       protocol pointer the other is still writing through. Open is therefore
+       EXCLUSIVE, and sharing has to be asked for by name. Per-image only --
+       the registry is this image's static state and cannot see another
+       image's opens. */
+    /* Poisoned, not NULL: `second == NULL` would otherwise hold whether or
+       not open() honours its "leaves out NULL" contract. */
+    AxlSerial *poison = (AxlSerial *)(uintptr_t)0x1;
+    AxlSerial *excl = NULL, *second = poison;
+    test_check(!axl_serial_is_open(first),
+               "serial excl: is_open false before any open");
+    test_check(axl_serial_open(first, &excl) == AXL_OK && excl != NULL,
+               "serial excl: first open succeeds");
+    test_check(axl_serial_is_open(first),
+               "serial excl: is_open true while held");
+    test_check(axl_serial_open(first, &second) == AXL_BUSY && second == NULL,
+               "serial excl: second open returns AXL_BUSY, leaves out NULL");
+    second = poison;
+    test_check(axl_serial_open_shared(first, &second) == AXL_BUSY
+               && second == NULL,
+               "serial excl: shared open refused while an EXCLUSIVE open holds it");
+
+    /* The port's handle is retained, so every handle-taking query
+       (get_mode, get_control) is reachable from the open port alone -- a
+       consumer no longer has to keep the enumeration index around just to
+       read back before a read-modify-write. */
+    test_check(axl_serial_handle(excl) == first,
+               "serial excl: the open port reports the handle it came from");
+    test_check(axl_serial_handle(NULL) == NULL,
+               "serial excl: handle(NULL) is NULL");
+    AxlSerialMode rmw;
+    test_check(axl_serial_get_mode(axl_serial_handle(excl), &rmw) == AXL_OK,
+               "serial excl: read-modify-write is expressible from the port alone");
+
+    axl_serial_close(excl);
+    test_check(!axl_serial_is_open(first),
+               "serial excl: close releases the claim");
+    test_check(axl_serial_open(first, &excl) == AXL_OK,
+               "serial excl: reopen after close succeeds");
+    axl_serial_close(excl);
+
+    /* Deliberate sharing still works, but only among sharers. */
+    AxlSerial *sh1 = NULL, *sh2 = NULL, *ex3 = poison;
+    test_check(axl_serial_open_shared(first, &sh1) == AXL_OK && sh1 != NULL,
+               "serial excl: shared open succeeds on a free port");
+    test_check(axl_serial_open_shared(first, &sh2) == AXL_OK && sh2 != NULL,
+               "serial excl: a second SHARED open is allowed");
+    test_check(axl_serial_open(first, &ex3) == AXL_BUSY && ex3 == NULL,
+               "serial excl: exclusive open refused while shared opens exist");
+    axl_serial_close(sh1);
+    test_check(axl_serial_is_open(first),
+               "serial excl: still open while the other sharer holds it");
+    axl_serial_close(sh2);
+    test_check(!axl_serial_is_open(first),
+               "serial excl: released when the last sharer closes");
+    test_check(!axl_serial_is_open((AxlHandle)&local_marker),
+               "serial excl: is_open false for a non-serial handle");
+
     /* Byte-I/O error contract (safe negatives — return on the guard before
        any firmware call). */
     static const uint8_t one[1] = { 0 };
@@ -2660,9 +2667,7 @@ test_tpm(void)
            populated branch. */
         test_check(axl_tpm_get_capability(&cap) == AXL_ERR,
                    "tpm: get_capability returns AXL_ERR when absent");
-        for (int i = 0; i < 6; i++) {
-            test_check(true, "tpm: SKIP balance (no TPM under default QEMU)");
-        }
+        test_skip_n(6, "tpm: no TPM under default QEMU");
     }
 
     /* Endorsement Key public read. NULL out_len is always an error. */
@@ -2822,11 +2827,7 @@ test_tpm_seal(void)
         test_check(axl_tpm_seal(secret, sizeof secret, pcrs, 1, &blob, &blob_len,
                                 NULL) == AXL_ERR,
                    "tpm seal: AXL_ERR without a TPM");
-        test_check(true, "tpm seal: SKIP balance (no TPM)");
-        test_check(true, "tpm seal: SKIP balance (no TPM)");
-        test_check(true, "tpm seal: SKIP balance (no TPM)");
-        test_check(true, "tpm seal: SKIP balance (no TPM)");
-        test_check(true, "tpm seal: SKIP balance (no TPM)");
+        test_skip_n(5, "tpm seal: no TPM");
     }
 }
 
@@ -2920,15 +2921,13 @@ test_ramdisk(void)
         /* No RAM-disk protocol and no embedded blob (e.g. AAVMF/aa64):
            create fails cleanly, list still works (reports none). Balance
            to the same 10 checks as the round-trip branch. */
-        test_check(true, "ramdisk: ensure_driver reports no protocol (SKIP balance)");
+        test_skip_n(1, "ramdisk: ensure_driver reports no protocol");
         test_check(axl_ramdisk_create(RD_TEST_LABEL, 4, NULL) == AXL_UNSUPPORTED,
                    "ramdisk: create returns AXL_UNSUPPORTED with no protocol");
         size_t n = 99;
         test_check(axl_ramdisk_list(NULL, 0, &n) == AXL_OK && n == 0,
                    "ramdisk: list succeeds with zero disks when none exist");
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "ramdisk: SKIP balance (no RAM-disk protocol)");
-        }
+        test_skip_n(7, "ramdisk: no RAM-disk protocol");
     }
 }
 
@@ -2986,8 +2985,7 @@ test_ramdisk_register_image(void)
             /* Caller owns the buffer: we free it, not unregister. */
             axl_free_pages(phys, RD_IMG_PAGES);
         } else {
-            test_check(true, "ramdisk: register_image SKIP balance (page alloc failed)");
-            test_check(true, "ramdisk: register_image SKIP balance (page alloc failed)");
+            test_skip_n(2, "ramdisk: page alloc failed");
         }
     } else {
         /* No protocol (AAVMF/aa64): register fails cleanly with the out
@@ -2997,7 +2995,7 @@ test_ramdisk_register_image(void)
         test_check(axl_ramdisk_register_image(img, sizeof(img),
                    AXL_RAMDISK_DISK, &dpx) == AXL_UNSUPPORTED && dpx == NULL,
                    "ramdisk: register_image returns AXL_UNSUPPORTED with no protocol");
-        test_check(true, "ramdisk: register_image SKIP balance (no RAM-disk protocol)");
+        test_skip_n(1, "ramdisk: no RAM-disk protocol");
     }
 }
 
@@ -3121,7 +3119,7 @@ test_usb_ids_handle_buffer(void)
 
     axl_usb_ids_close(h);
     axl_usb_ids_close(NULL);
-    test_check(true, "usb-ids handle: close + close(NULL) OK");
+    test_survived("usb-ids handle: close + close(NULL) OK");
 }
 
 static void
@@ -3236,13 +3234,9 @@ test_usb_ids_singleton(void)
        by the integration runner. SKIP-balanced when not staged. */
     AxlSidecarStatus rc = axl_usb_ids_load(NULL);
     if (rc != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: usb-ids load (no companion usb-ids.json5)\n");
-        for (int i = 0; i < 4; i++) {
-            test_check(true, "usb-ids singleton: SKIP balance");
-        }
+        test_skip_n(3, "usb-ids load (no companion usb-ids.json5)");
         return;
     }
-    test_check(true, "usb-ids load: autodiscover succeeds");
 
     /* share/usb-ids.json5 carries Adomax (the QEMU usb-mouse vendor)
        at 0x0627 and a few common vendors. Pin Adomax exactly. */
@@ -3272,11 +3266,8 @@ test_pci_dump(void)
     size_t   ok       = 0;
     int rc = axl_pci_dump(root, buf, 64, &ok);
     if (rc != AXL_OK) {
-        axl_printf("SKIP: pci_dump (host bridge unreachable)\n");
         /* Balance: 7 checks ran in the populated path. */
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "pci dump: SKIP balance");
-        }
+        test_skip_n(7, "pci_dump (host bridge unreachable)");
         return;
     }
     test_check(rc == AXL_OK, "pci dump: host bridge succeeds");
@@ -3513,12 +3504,8 @@ test_pci_capabilities(void)
             test_check(br.subordinate >= br.secondary,
                        "pci bridge_info: subordinate >= secondary");
         } else {
-            /* No PCI-PCI bridge on this image — runner config drift.
-               Balance against the populated path so the ratchet stays
-               stable. */
-            test_check(true, "pci bridge_info: SKIP — no bridge in topology");
-            test_check(true, "pci bridge_info: SKIP balance");
-            test_check(true, "pci bridge_info: SKIP balance");
+            /* No PCI-PCI bridge on this image — runner config drift. */
+            test_skip_n(3, "pci bridge_info: no bridge in topology");
         }
     }
 
@@ -3609,9 +3596,7 @@ test_pci_cap_chain_nonmonotonic(void)
         test_check(has_ssid,
                    "pci cap chain: root port exposes subsystem-IDs cap (0x0D) deep in chain");
     } else {
-        test_check(true, "pci cap chain: SKIP — no pcie-root-port in topology");
-        test_check(true, "pci cap chain: SKIP balance");
-        test_check(true, "pci cap chain: SKIP balance");
+        test_skip_n(3, "pci cap chain: no pcie-root-port in topology");
     }
 
     /* virtio endpoint (vendor 0x1AF4): MSI-X (head) -> ... -> PCI-Express,
@@ -3639,9 +3624,7 @@ test_pci_cap_chain_nonmonotonic(void)
         test_check(has_msix,
                    "pci cap chain: virtio endpoint exposes MSI-X cap (0x11) at the head");
     } else {
-        test_check(true, "pci cap chain: SKIP — no virtio endpoint with caps");
-        test_check(true, "pci cap chain: SKIP balance");
-        test_check(true, "pci cap chain: SKIP balance");
+        test_skip_n(3, "pci cap chain: no virtio endpoint with caps");
     }
 }
 
@@ -3671,14 +3654,16 @@ test_io_port(void)
     uint16_t w = axl_io_port_read16(0x70);
     uint32_t d = axl_io_port_read32(0x70);
     (void)w; (void)d;
-    test_check(true, "io_port: read16/32 don't fault");
+    test_survived("io_port: read16/32 don't fault");
 #else
-    /* AArch64: the public symbols are compiled out. Emit the same
-       number of "passed" lines as the x86 path so the cross-arch
-       ratchet stays balanced; a single SKIP line would create a
-       count differential. */
-    test_check(true, "io_port: not applicable on AArch64");
-    test_check(true, "io_port: declarations gated out at compile time");
+    /* AArch64: the public symbols are compiled out entirely. Declared rather
+       than padded with two invented passes.
+       TWO, matching the x86 arm above exactly (the BCD check and the
+       read16/32 survival probe). Set to 1 while converting this, and the
+       AARCH64 ratchet caught it immediately -- which is the whole argument for
+       declaring the count instead of trusting a hand-kept run of padding
+       lines to stay the right length. */
+    test_skip_n(2, "io_port: x86-only, symbols compiled out on AArch64");
 #endif
 }
 
@@ -3699,7 +3684,7 @@ test_mem_phys(void)
                "mem_phys: read32(NULL out) returns -1");
     /* unmap(NULL) is a no-op — must not crash. */
     axl_mem_phys_unmap(NULL, 0);
-    test_check(true, "mem_phys: unmap(NULL) no-op");
+    test_survived("mem_phys: unmap(NULL) no-op");
 
     /* Map an SMBIOS table (its address is published by firmware,
        so we know it's a real, readable physical region). Read the
@@ -3707,11 +3692,13 @@ test_mem_phys(void)
        the values must match. */
     AxlSmbiosHeader *bios = axl_smbios_find(AXL_SMBIOS_TYPE_BIOS_INFO);
     if (bios == NULL) {
-        axl_printf("SKIP: mem_phys (no SMBIOS to anchor on)\n");
-        /* keep the test count stable: emit equivalent shape passes */
-        test_check(true, "mem_phys: real-region read SKIPPED (no SMBIOS)");
-        test_check(true, "mem_phys: one-shot read SKIPPED (no SMBIOS)");
-        test_check(true, "mem_phys: search SKIPPED (no SMBIOS)");
+        /* NINE, not the 3 the old padding declared. The populated branch
+           below runs: one-shot read8, map+deref agreement, search-finds,
+           search-miss returns -1, search-miss clears the match, and four
+           argument-validation searches. The old count was wrong by 6 and the
+           conversion inherited it -- caught by counting the sibling branch,
+           which is the one review step a declared count actually requires. */
+        test_skip_n(9, "mem_phys: no SMBIOS table to anchor a known-good read on");
         return;
     }
     uintptr_t bios_phys = (uintptr_t)bios;
@@ -3779,13 +3766,9 @@ test_mem_phys_round_trip(void)
 {
     uint64_t phys = 0;
     if (axl_alloc_pages(1, &phys) != AXL_OK || phys == 0) {
-        axl_printf("SKIP: mem_phys round-trip (alloc_pages failed)\n");
-        for (int i = 0; i < 13; i++) {
-            test_check(true, "mem_phys round-trip: SKIP balance");
-        }
+        test_skip_n(12, "mem_phys round-trip: alloc_pages failed");
         return;
     }
-    test_check(true, "mem_phys round-trip: alloc_pages succeeds");
 
     volatile uint8_t  *p = (volatile uint8_t *)(uintptr_t)phys;
     /* Pre-zero to make sure the read-back is reading what we wrote
@@ -3866,10 +3849,8 @@ test_mem_region(void)
 {
     uint64_t pg = 0;
     if (axl_alloc_pages(1, &pg) != AXL_OK || pg == 0) {
-        axl_printf("SKIP: mem_region (alloc_pages failed)\n");
-        for (int i = 0; i < MEM_REGION_TESTS; i++) {
-            test_check(true, "mem_region: SKIP balance");
-        }
+        test_skip_n(MEM_REGION_TESTS,
+                    "mem_region: alloc_pages failed, no known-RAM page to probe");
         return;
     }
     const uintptr_t ram = (uintptr_t)pg;   /* page-aligned, guaranteed RAM */
@@ -3986,16 +3967,14 @@ test_get_memory_size(void)
     UINT32 desc_ver = 0;
     if (gBS->GetMemoryMap(&map_size, NULL, &map_key, &desc_size, &desc_ver)
             != EFI_BUFFER_TOO_SMALL || desc_size == 0) {
-        axl_printf("SKIP: get_memory_size (GetMemoryMap unavailable)\n");
-        test_check(true, "get_memory_size: SKIP balance");
-        test_check(true, "get_memory_size: SKIP balance");
+        test_skip_n(2, "get_memory_size (GetMemoryMap unavailable)");
         return;
     }
     map_size += desc_size * 8;
     uint8_t *map = axl_malloc(map_size);
     test_check(map != NULL, "get_memory_size: map buffer allocated");
     if (map == NULL) {
-        test_check(true, "get_memory_size: SKIP balance");
+        test_skip_n(1, "get_memory_size: map buffer allocation failed");
         return;
     }
     uint64_t expected = 0;
@@ -4148,10 +4127,7 @@ test_rng(void)
            short by one against the populated count, which surfaced as
            a CI ratchet failure when the runner's OVMF didn't publish
            EFI_RNG_PROTOCOL but local OVMF did. */
-        test_check(true, "rng: protocol not published — bytes test SKIPPED");
-        test_check(true, "rng: protocol not published — second fill SKIPPED");
-        test_check(true, "rng: protocol not published — distinct test SKIPPED");
-        test_check(true, "rng: protocol not published — non-zero test SKIPPED");
+        test_skip_n(4, "rng: protocol not published — bytes test SKIPPED");
         return;
     }
     test_check(rc == AXL_OK, "rng: bytes(32) succeeds");
@@ -4358,7 +4334,7 @@ test_spd_ids_handle_buffer(void)
 
     axl_spd_ids_close(h);
     axl_spd_ids_close(NULL);
-    test_check(true, "spd-ids handle: close + close(NULL) OK");
+    test_survived("spd-ids handle: close + close(NULL) OK");
 }
 
 static void
@@ -4446,13 +4422,9 @@ test_spd_ids_singleton(void)
        the integration runner. SKIP-balanced when not staged. */
     AxlSidecarStatus rc = axl_spd_ids_load(NULL);
     if (rc != AXL_SIDECAR_OK) {
-        axl_printf("SKIP: spd-ids load (no companion jedec.json5)\n");
-        for (int i = 0; i < 7; i++) {
-            test_check(true, "spd-ids singleton: SKIP balance");
-        }
+        test_skip_n(6, "spd-ids load (no companion jedec.json5)");
         return;
     }
-    test_check(true, "spd-ids load: autodiscover succeeds");
 
     /* share/jedec.json5 carries Micron at 0x002C with the long form
        'Micron Technology'. Pin the exact string — substring matches
@@ -4506,13 +4478,14 @@ test_smbios_table_range(void)
     if (rc != 0) {
         /* No SMBIOS table on this firmware (rare; bare aa64 OVMF
            sometimes ships without one). Maintain stable test count. */
-        axl_printf("SKIP: smbios_table_range (no SMBIOS table)\n");
-        test_check(true, "smbios_table_range: SKIPPED (no table)");
-        test_check(true, "smbios_table_range: SKIPPED (no table)");
-        test_check(true, "smbios_table_range: SKIPPED (no table)");
+        test_skip_n(3, "smbios_table_range: no SMBIOS table on this firmware");
         return;
     }
-    test_check(rc == 0, "smbios_table_range: returns 0 on success");
+    /* No `test_check(rc == 0, ...)` here: the `if` above already returned on
+       rc != 0, so asserting it could not fail. Same tautology as the four
+       assert-a-literal deletions, just spelled with an expression -- which
+       is why check-tautology's grep cannot catch this class and counting the
+       sibling branch is still the review step that matters. */
     test_check(start != NULL && end != NULL,
                "smbios_table_range: out pointers populated");
 
@@ -4526,7 +4499,7 @@ test_smbios_table_range(void)
         test_check(p >= start && p < end,
                    "smbios_table_range: contains addr of axl_smbios_find result");
     } else {
-        test_check(true, "smbios_table_range: no Type 0 to cross-check (skip)");
+        test_skip_n(1, "smbios_table_range: no Type 0 record to cross-check");
     }
 
     /* NULL-out parameters get rejected. */
@@ -4544,10 +4517,7 @@ test_smbios_entry_point(void)
     if (rc != 0) {
         /* No SMBIOS table on this firmware (rare). Maintain stable
            test count. */
-        axl_printf("SKIP: smbios_entry_point (no SMBIOS table)\n");
-        test_check(true, "smbios_entry_point: SKIPPED (no table)");
-        test_check(true, "smbios_entry_point: SKIPPED (no table)");
-        test_check(true, "smbios_entry_point: SKIPPED (no table)");
+        test_skip_n(3, "smbios_entry_point (no SMBIOS table)");
         return;
     }
     test_check(rc == 0, "smbios_entry_point: returns 0 on success");

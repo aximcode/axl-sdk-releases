@@ -1171,3 +1171,27 @@ axl_http_download(AxlHttpClient *c, const char *url,
     axl_http_client_response_free(resp);
     return result;
 }
+
+bool
+axl_http_response_get_json(const AxlHttpClientResponse *resp,
+                           AxlJsonReader *out)
+{
+    if (resp == NULL || out == NULL || resp->body == NULL
+        || resp->body_size == 0) {
+        return false;
+    }
+    /* STRICT, for the same reason axl_http_request_get_json() is: this body
+     * came off the network from a peer we do not control. The request side has
+     * had that guard since it was written; the response side had no helper at
+     * all, so every caller reached for axl_json_parse(), which back then took
+     * no dialect and defaulted to the liberal one -- the sidecar dialect on
+     * network input. That is not a hypothetical: it is what rfbrowse did to
+     * Redfish bodies from a remote BMC. The default is gone (the dialect is a
+     * parameter now), but the helper still matters, because the rule should
+     * be the shape of the API and not a thing each caller remembers.
+     *
+     * Borrowing rather than copying, exactly as the request side does: the
+     * reader indexes resp->body, so the response must outlive it. */
+    return axl_json_parse((const char *)resp->body, resp->body_size,
+                          AXL_JSON_STRICT, out);
+}

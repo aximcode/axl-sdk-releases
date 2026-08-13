@@ -57,20 +57,31 @@ axl_log_clear_domain_level("net");
 Route log messages to a custom function:
 
 ```c
-void my_handler(int level, const char *domain,
-                const char *message, void *data) {
+void my_handler(int level, const char *domain, const char *message,
+                const AxlRealtime *stamp, void *data) {
     // Write to a network socket, store in a buffer, etc.
 }
 
 axl_log_add_handler(my_handler, my_context);
 ```
 
+`stamp` is the instant the DISPATCHER recorded for the record, read once
+and handed to every sink, so two sinks never disagree about when one
+record happened. Render it with `axl_time_format_at()`, or read the
+fields directly for a machine-readable form. It is NULL only when the
+clock could not be read.
+
+Do not call `axl_time_realtime()` inside a handler to get "the" time:
+that is a second reading of a different instant, and on a handler reached
+from an event notify it re-enters the RTC the dispatcher already
+serialized.
+
 ## Ring Buffer
 
 Capture the last N messages in memory for crash reports or diagnostics:
 
 ```c
-AxlLogRing *ring = axl_log_ring_new(100);  // keep last 100 messages
+AxlLogRing *ring = axl_log_ring_new(100, 256);  // last 100 msgs, 256 B each
 axl_log_ring_attach(ring);
 
 // ... application runs ...
@@ -103,3 +114,62 @@ buffer, removes the internal handler, closes the file. NULL-safe on
 not-attached state. The typical AxlService pattern is:
 attach in driver `setup`, detach in driver `teardown`, before
 firmware UnloadImage tears the per-image static state down.
+
+## Serial Logging
+
+Write the same lines to a UART — the channel that survives a headless
+box, a wedged HTTP server, or a console the firmware has redirected
+elsewhere:
+
+```c
+AxlSerial *port = NULL;                          /* consumer owns the port */
+if (axl_serial_open(axl_serial_next(NULL), &port) != AXL_OK) {
+    return;                                      /* AXL_BUSY = someone else has it */
+}
+axl_log_serial_attach(port, AXL_LOG_INFO);       /* cap what reaches the wire */
+// ... log messages now also go out the UART, CRLF-terminated ...
+axl_log_serial_detach();                         /* does NOT close the port */
+axl_serial_close(port);
+```
+
+Lines use the **same format as the file sink's**, with CRLF endings: both
+build them with the same internal formatter, so a transcript read off a
+terminal lines up with one read out of a log file. (The only difference
+beyond the ending is where a maximal line truncates — the longer terminator
+leaves one byte less for the message.)
+
+The port is **caller-owned** — attach neither opens nor closes it, and it
+must outlive the attachment. That keeps port selection, line settings and
+lifetime with the consumer, and lets a consumer that already has the port
+open (a SOL bridge, say) share it deliberately.
+
+`max_level` is not a nicety: writes are synchronous and 115200 baud is
+about 11 KB/s, so an uncapped `trace` stream throttles the caller's event
+loop behind the UART. The file sink can afford to skip this; a serial sink
+cannot.
+
+The handler runs from the log dispatcher, which is **not re-entrant** and
+may be at **raised TPL**. It allocates nothing, logs nothing, and performs
+a single write per line — dropping the remainder of a short write rather
+than retrying, because a log line must never stall the caller. Losing the
+tail of one line beats wedging the box that was logging it.
+
+Not retrying removes the spin, but **not the block**. The write is
+synchronous against the port's own timeout, and firmware frequently leaves
+that 0 — which several implementations read as "wait indefinitely". A port
+that never drains then stalls the caller's loop on every line. **Bound it
+before attaching:**
+
+```c
+AxlSerialMode m;
+if (axl_serial_get_mode(axl_serial_handle(port), &m) == AXL_OK) {
+    m.timeout = 250000;                            /* microseconds */
+    axl_serial_set_mode(port, &m);                 /* ... modify, write back */
+}
+axl_log_serial_attach(port, AXL_LOG_INFO);
+```
+
+Read-modify-write, not a fresh struct: `axl_serial_set_mode` takes the whole
+`AxlSerialMode` and treats a zero field as "device default", so a partly
+filled one silently re-rates the port. For scale, a full 640-byte line takes
+about 55 ms at 115200 8N1.

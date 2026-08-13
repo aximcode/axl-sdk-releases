@@ -27,6 +27,11 @@ AxlNvStore
 
 .. doxygenfile:: axl-nvstore.h
 
+AxlVar (unscoped UEFI variable inspection)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. doxygenfile:: axl-var.h
+
 AxlDriver
 ~~~~~~~~~
 

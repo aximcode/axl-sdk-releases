@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-args.h:
+/** @file axl-args.h
  *
  * Declarative command-line parser for AXL tools. A tool declares a
  * static AxlArgsNode tree (program name + flags + positionals +
@@ -153,6 +152,8 @@
 #ifndef AXL_ARGS_H
 #define AXL_ARGS_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -274,7 +275,7 @@ typedef struct AxlArgsNode AxlArgsNode;
  * entering @c axl_loop_run; never call @c axl_args_get_* from a
  * loop callback.
  */
-typedef int (*AxlVerbHandler)(AxlArgs *args);
+typedef int (*AxlVerbHandler)(AxlArgs *args) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Optional pre-handler hook. Called once at this node's level
@@ -284,7 +285,7 @@ typedef int (*AxlVerbHandler)(AxlArgs *args);
  *     (config files, opening sessions). When stacked across nested
  *     levels, parent's @c pre_run runs before child's.
  */
-typedef void (*AxlPreRunFunc)(AxlArgs *args);
+typedef void (*AxlPreRunFunc)(AxlArgs *args) AXL_CB_NOEXCEPT;
 
 /**
  * @brief A single node in the args tree. Same type at every level —
@@ -515,8 +516,8 @@ axl_args_get_int(
  */
 int
 axl_args_get_uint_offset(
-    AxlArgs    *args,
-    const char *name,
+    AxlArgs    *args,       ///< parsed argument set
+    const char *name,       ///< flag or positional name
     uint64_t   *out_value   ///< [out] base + offset
 );
 

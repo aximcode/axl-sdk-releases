@@ -236,7 +236,7 @@ axl_usb_get_num_endpoints(
  *    parent (root hub or an intermediate hub); the last element of the
  *    chain. This is what the app cannot derive on its own. For a device
  *    attached directly to the root hub this equals the whole path.
- *  - @p port_path — the full chain rendered as `'.'`-joined port
+ *  - @p port_path — the full chain rendered as @c '.'-joined port
  *    numbers, root first (e.g. `"4"` for a root-port device, `"4.1"`
  *    for a device on port 1 of a hub on root port 4). Linux `lsusb -t`
  *    / sysfs port-path shape. Always NUL-terminated; truncated
@@ -482,7 +482,7 @@ typedef int (*AxlUsbTreeFn)(
     AxlUsbAddr   addr,
     unsigned     depth,
     void        *ctx
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Walk the USB topology in tree order, depth-first per bus.
@@ -629,9 +629,9 @@ axl_usb_ids_device_name(
  * @{
  */
 typedef int (*AxlUsbIdsVendorFn)(uint16_t vid,
-                                 const char *name, void *ctx);
+                                 const char *name, void *ctx) AXL_CB_NOEXCEPT;
 typedef int (*AxlUsbIdsDeviceFn)(uint16_t vid, uint16_t pid,
-                                 const char *name, void *ctx);
+                                 const char *name, void *ctx) AXL_CB_NOEXCEPT;
 
 int
 axl_usb_ids_foreach_vendor(

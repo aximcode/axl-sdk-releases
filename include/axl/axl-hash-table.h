@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-hash-table.h:
+/** @file axl-hash-table.h
  *
  * GLib-style hash table with generic keys. FNV-1a hashing, chained
  * collision resolution, automatic resize at 75% load factor.
@@ -46,6 +45,8 @@
 #ifndef AXL_HASH_TABLE_H
 #define AXL_HASH_TABLE_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -63,17 +64,17 @@ typedef struct AxlHashTable AxlHashTable;
 // ---------------------------------------------------------------------------
 
 /// Hash function: compute a hash value from a key.
-typedef size_t (*AxlHashFunc)(const void *key);
+typedef size_t (*AxlHashFunc)(const void *key) AXL_CB_NOEXCEPT;
 
 /// Equality function: return true if two keys are equal.
-typedef bool (*AxlEqualFunc)(const void *a, const void *b);
+typedef bool (*AxlEqualFunc)(const void *a, const void *b) AXL_CB_NOEXCEPT;
 
 /// Callback for axl_hash_table_foreach (GLib: GHFunc).
 typedef void (*AxlHashTableForeachFunc)(
     const void *key,   ///< entry key
     void       *value, ///< entry value
     void       *data   ///< opaque callback data
-);
+) AXL_CB_NOEXCEPT;
 
 /// Predicate for axl_hash_table_foreach_remove (GLib: GHRFunc).
 /// Return true to remove the entry.
@@ -81,7 +82,7 @@ typedef bool (*AxlHashTableForeachRemoveFunc)(
     const void *key,   ///< entry key
     void       *value, ///< entry value
     void       *data   ///< opaque callback data
-);
+) AXL_CB_NOEXCEPT;
 
 /// Predicate for axl_hash_table_find (GLib: GHRFunc).
 /// Return true when the entry is the one being searched for.
@@ -89,7 +90,7 @@ typedef bool (*AxlHashTableFindFunc)(
     const void *key,   ///< entry key
     void       *value, ///< entry value
     void       *data   ///< opaque callback data
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Built-in hash and equality functions

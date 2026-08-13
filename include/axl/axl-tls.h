@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-tls.h:
+/** @file axl-tls.h
  *
  * TLS support using mbedTLS. Optional — requires AXL_TLS=1 at build time.
  * When not available, all functions return -1/NULL/false.

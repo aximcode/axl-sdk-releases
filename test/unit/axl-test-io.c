@@ -126,7 +126,128 @@ test_buffer(void)
 
     // NULL close is safe
     axl_fclose(NULL);
-    test_check(true, "buffer: fclose(NULL) no crash");
+    test_survived("buffer: fclose(NULL) no crash");
+}
+
+/* The buffer backend is built through the PUBLIC axl_stream_open_custom, so
+   its stream now owns a heap COPY of the label "buffer" rather than pointing
+   at a literal -- axl_fclose has to release that copy as well as the context.
+   Nothing above can see the difference (axl_stream_name still answers
+   "buffer"), which is exactly why it needs an assertion of its own: a missed
+   free here is invisible to every other test in this file.
+
+   The steal path gets the same treatment because it is the one shape where
+   the context reaches close half-emptied: axl_bufsteal hands the caller the
+   data pointer and leaves NULL behind, so close frees a NULL and the label
+   copy is then the only allocation left to get wrong. */
+static void
+test_buffer_stream_ownership(void)
+{
+    AxlMemStats  before, after, after_steal;
+    AxlStream   *s;
+    void        *stolen;
+    size_t       size;
+    int          flush_rc;
+
+    /* Warm any first-use lazy state so the baseline measures steady state. */
+    axl_fclose(axl_bufopen());
+
+    axl_mem_get_stats(&before);
+    s = axl_bufopen();
+    test_check(s != NULL, "bufown: open a buffer stream");
+    if (s == NULL) {
+        return;
+    }
+    axl_fclose(s);
+    axl_mem_get_stats(&after);
+
+    test_check(after.count == before.count,
+               "bufown: open+close returns the allocation count to its baseline");
+    test_check(after.bytes == before.bytes,
+               "bufown: ... and the allocated bytes with it");
+
+    s = axl_bufopen();
+    axl_write(s, "hello", 5);
+    stolen = axl_bufsteal(s, &size);
+    test_check(stolen != NULL && size == 5, "bufown: steal hands over the bytes");
+    axl_free(stolen);
+    axl_fclose(s);
+    axl_mem_get_stats(&after_steal);
+
+    test_check(after_steal.count == before.count,
+               "bufown: close after a steal still releases everything else");
+    test_check(after_steal.bytes == before.bytes,
+               "bufown: ... bytes too");
+
+    /* The eighth vtable slot. The six capability queries pin read/write/
+       seek/tell/pread/pwrite arrived through the ops copy and the checks
+       above pin close, which leaves `flush`: the buffer backend supplies
+       none, and a NULL flush slot is contractually AXL_OK, not an error. */
+    s = axl_bufopen();
+    flush_rc = axl_fflush(s);
+    axl_fclose(s);
+    test_check(flush_rc == AXL_OK,
+               "bufown: a buffer stream has no flush op, and that is AXL_OK");
+}
+
+/* The same ownership question for the two backends that followed the buffer
+   onto axl_stream_open_custom: axl_fopen and axl_text_stream_wrap. Both now
+   hold a heap COPY of their label ("file", "text") rather than pointing at a
+   literal, so axl_fclose has one more allocation to release -- and nothing
+   else in this file can see the difference, because axl_stream_name answers
+   identically either way. Same shape as test_buffer_stream_ownership, and the
+   same reason: a missed free here is invisible to every other assertion.
+   (The compressing writer's twin lives with the compress tests in
+   axl-test-data.c, next to the codec it drives.) */
+static void
+test_migrated_stream_ownership(void)
+{
+    static const char *const path = "fs0:\\axl_test_own.tmp";
+    AxlMemStats  before, after;
+    AxlStream   *s;
+    AxlStream   *src;
+    AxlStream   *txt;
+
+    /* Warm the lazy state on the SAME path first -- the write-gen registry
+       interns a slot per path on first use, and counting that as a leak would
+       make this fail for a reason that has nothing to do with the label. */
+    s = axl_fopen(path, "w");
+    axl_fclose(s);
+
+    axl_mem_get_stats(&before);
+    s = axl_fopen(path, "w");
+    test_check(s != NULL, "migown: open a file stream");
+    if (s != NULL) {
+        axl_fclose(s);
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count,
+               "migown: file open+close returns the allocation count to baseline");
+    test_check(after.bytes == before.bytes,
+               "migown: ... and the allocated bytes with it");
+
+    /* The wrapper BORROWS its source, so src is opened outside the measured
+       window and closed after it: what is being weighed is the wrapper alone,
+       label included. */
+    src = axl_bufopen();
+    axl_write(src, "plain ascii, no BOM", 19);
+    axl_fseek(src, 0, AXL_SEEK_SET);
+    txt = axl_text_stream_wrap(src);   /* warm, then discard */
+    axl_fclose(txt);
+    axl_fseek(src, 0, AXL_SEEK_SET);
+
+    axl_mem_get_stats(&before);
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL, "migown: wrap a source in a text stream");
+    if (txt != NULL) {
+        axl_fclose(txt);
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count,
+               "migown: text wrap+close returns the allocation count to baseline");
+    test_check(after.bytes == before.bytes,
+               "migown: ... and the allocated bytes with it");
+    axl_fclose(src);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +394,38 @@ test_file(void)
     test_check(finfo.mtime_unix > 0,
                "file: info.mtime_unix non-zero after write");
     axl_file_delete("fs0:\\axl_mt.tmp");
+
+    /* --- deleting a path that is not there.
+       #
+       Two assertions, and the SECOND is the one that matters. EDK2's
+       EfiShellDeleteFileByName opens its target with EfiShellCreateFile
+       (ShellPkg/Application/Shell/ShellProtocol.c), so on the modern-shell
+       path a delete of an absent name CREATED a zero-length file, deleted
+       it, and honestly reported EFI_SUCCESS. A pure-cleanup call therefore
+       performed a WRITE -- which can fail on a read-only or full volume,
+       and bumps axl_file_gen_bump() for a file that never existed.
+       #
+       The STATUS is the whole test, and the obvious second assertion does
+       not work. "Delete an absent path, then assert it still does not
+       exist" was the suggested way to catch the create -- but
+       DeleteFileByName creates AND deletes, so the path is absent
+       afterwards under both the broken and the fixed implementation.
+       Measured: that assertion passed against the BROKEN code. The
+       transient write is simply not observable through this API after the
+       fact, so the status is what pins it: the fixed path opens without
+       CREATE, which is exactly why it can report NOT_FOUND at all.
+       #
+       This runs under OVMF's shell, so it exercises the modern-shell
+       branch. The no-shell branch already opened without CREATE and
+       returned an error, which is how the two came to disagree -- the
+       behaviour depended on whether a modern shell was present.
+       #
+       Reported by a SoftBMC session via /api/files/delete, which forwarded
+       a 200 {"status":"ok"} for a path that never existed while
+       /api/files/rename correctly reported 404 on the same input. */
+    test_check(axl_file_delete("fs0:\\axl_absent.tmp") == AXL_NOT_FOUND,
+               "file: delete of an absent path is NOT_FOUND, not a false OK "
+               "for a file the call itself created");
 
     /* --- axl_file_move: same-directory case falls through to rename
        (fast atomic-on-FAT path); cross-directory case does the
@@ -596,9 +749,7 @@ test_stdout_tee(void)
 
         axl_fclose(tee2);
     } else {
-        for (int i = 0; i < 2; i++) {
-            test_check(true, "stdout_tee: SKIP balance (tee2 alloc)");
-        }
+        test_skip_n(2, "stdout_tee: replacement tee could not be opened");
     }
 
     /* Final cleanup. */
@@ -689,7 +840,7 @@ test_console_read_key(void)
        it twice for idempotency. */
     axl_console_flush_input();
     axl_console_flush_input();
-    test_check(true, "console flush_input: idempotent on empty queue");
+    test_survived("console flush_input: idempotent on empty queue");
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1440,51 @@ test_encoding_roundtrips(void)
                   "A", 1,
                   wire, sizeof(wire));
     }
+
+}
+
+/* A lone surrogate keeps its BMP shape in BOTH directions. This is the
+   DOCUMENTED permissive policy (axl-stream.h AxlEncoding: "surrogate halves in
+   reads -> transcoded in their BMP shape (U+D800..U+DFFF round-trip as a 3-byte
+   UTF-8 sequence)"; src/stream/README.md says the same), not an oversight. The
+   wire here is UCS-2, where an unpaired code unit is perfectly representable, so
+   routing the transcode through axl_utf8_encode -- which refuses a surrogate,
+   correctly, because it encodes Unicode SCALARS -- would silently turn a
+   round-trippable code unit into a dropped one.
+
+   Spelled out with its own labels rather than through roundtrip() because the
+   read direction is the half that a consolidation would break, and a failure
+   there needs to say why it is deliberate. */
+static void
+test_encoding_surrogate_policy(void)
+{
+    const uint8_t utf8_sur[] = { 0xED, 0xA0, 0x80 };   /* the U+D800 BMP shape */
+    const uint8_t wire[]     = { 0x00, 0xD8 };         /* UCS-2 LE code unit   */
+
+    AxlStream *s = axl_bufopen();
+    if (s == NULL) {
+        test_fail("encoding: surrogate policy needs a buffer stream");
+        return;
+    }
+    axl_stream_set_encoding(s, AXL_ENC_UCS2_LE);
+
+    test_check(axl_write(s, utf8_sur, sizeof(utf8_sur)) == (axl_ssize_t)sizeof(utf8_sur),
+               "encoding: a lone surrogate is accepted on write, not refused");
+
+    size_t      got_n;
+    const void *got = axl_bufdata(s, &got_n);
+    test_check(got_n == sizeof(wire) && test_memcmp(got, wire, sizeof(wire)) == 0,
+               "encoding: a lone surrogate reaches the UCS-2 wire as one code unit");
+
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    char        back[16];
+    axl_ssize_t r = axl_read(s, back, sizeof(back));
+    test_check(r == (axl_ssize_t)sizeof(utf8_sur)
+                   && test_memcmp(back, utf8_sur, sizeof(utf8_sur)) == 0,
+               "encoding: reading it back restores the 3-byte shape (permissive "
+               "by design — do NOT route this through axl_utf8_encode)");
+
+    axl_fclose(s);
 }
 
 static void
@@ -1494,6 +1690,268 @@ test_text_stream_wrap_write_only_src(void)
        instead refuse the wrap. */
     test_check(axl_text_stream_wrap(axl_stdout) == NULL,
                "text_stream: wrap of write-only stream returns NULL");
+}
+
+/* 16 bytes of headerless UCS-2 LE ("hello!!!") -- content the classifier
+   detects on its own, so a refusal below is never an artefact of the source
+   having nothing to classify. */
+static const uint8_t mUcs2Hello[16] = {
+    'h', 0, 'e', 0, 'l', 0, 'l', 0,
+    'o', 0, '!', 0, '!', 0, '!', 0,
+};
+
+/* Build a rewound buffer stream over mUcs2Hello. */
+static AxlStream *
+make_ucs2_source(void)
+{
+    AxlStream *s = axl_bufopen();
+
+    axl_write(s, mUcs2Hello, sizeof mUcs2Hello);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    return s;
+}
+
+/* The wrapper owns the decode for the stream it wraps: a source that already
+   has one is refused, because both would be deciding what the wire means and
+   the classifier would be handed decoded text. Pinned at BOTH ends --
+   construction, and every read, since a caller can reach around a live
+   wrapper and set an encoding on its source. */
+static void
+test_text_stream_wrap_owns_the_decode(void)
+{
+    AxlStream  *src;
+    AxlStream  *txt;
+    AxlStream  *outer;
+    char        rd[32];
+    axl_ssize_t n;
+
+    /* 1) A source that decodes is refused, and the refusal is inert: the
+          source keeps its encoding AND its position, which is what says the
+          classifier never got as far as probing it. */
+    src = make_ucs2_source();
+    axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+    test_check(axl_text_stream_wrap(src) == NULL,
+               "textown: a UCS-2-decoding source is refused");
+    test_check(axl_stream_get_encoding(src) == AXL_ENC_UCS2_LE,
+               "textown: the refusal leaves the source's encoding alone");
+    axl_memset(rd, 0, sizeof rd);
+    n = axl_read(src, rd, sizeof rd);
+    test_check(n == 8 && test_memcmp(rd, "hello!!!", 8) == 0,
+               "textown: and the refused source still reads from byte zero");
+    axl_fclose(src);
+
+    /* 2) Not keyed on one value -- AXL_ENC_ASCII destroys bytes rather than
+          decoding them, and is refused on the same terms. */
+    src = make_ucs2_source();
+    axl_stream_set_encoding(src, AXL_ENC_ASCII);
+    test_check(axl_text_stream_wrap(src) == NULL,
+               "textown: an ASCII-decoding source is refused too");
+    axl_fclose(src);
+
+    /* 3) The refusal is uniform: being interactive decides how a wrapper
+          behaves, not whether one may exist. */
+    src = make_ucs2_source();
+    axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+    axl_stream_set_interactive(src, true);
+    test_check(axl_text_stream_wrap(src) == NULL,
+               "textown: an interactive source that decodes is refused as well");
+    axl_fclose(src);
+
+    /* 4) The documented lend-and-restore idiom, executed so the advice
+          cannot rot away from the behaviour. */
+    src = make_ucs2_source();
+    axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+    {
+        AxlEncoding saved = axl_stream_get_encoding(src);
+        axl_stream_set_encoding(src, AXL_ENC_UTF8);
+        txt = axl_text_stream_wrap(src);
+        test_check(txt != NULL, "textown: lending the source undecoded permits the wrap");
+        if (txt != NULL) {
+            axl_memset(rd, 0, sizeof rd);
+            n = axl_read(txt, rd, sizeof rd);
+            test_check(n == 8 && test_memcmp(rd, "hello!!!", 8) == 0,
+                       "textown: and the wrapper classifies it exactly as before");
+            axl_fclose(txt);
+        }
+        axl_stream_set_encoding(src, saved);
+        test_check(axl_stream_get_encoding(src) == AXL_ENC_UCS2_LE,
+                   "textown: the restore puts the source back as it was");
+    }
+    axl_fclose(src);
+
+    /* 5) A text wrapper may itself be wrapped whatever its classifier
+          settled on -- otherwise a generic "read this as text" helper would
+          work on ASCII input and fail on UTF-16, i.e. the composition would
+          depend on the bytes in the file underneath. */
+    src = make_ucs2_source();
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL && axl_stream_get_encoding(txt) == AXL_ENC_UCS2_LE,
+               "textown: the inner wrapper classified the source as UCS-2 LE");
+    if (txt != NULL) {
+        outer = axl_text_stream_wrap(txt);
+        test_check(outer != NULL,
+                   "textown: a text wrapper is wrappable despite its own encoding");
+        if (outer != NULL) {
+            axl_memset(rd, 0, sizeof rd);
+            n = axl_read(outer, rd, sizeof rd);
+            test_check(n == 8 && test_memcmp(rd, "hello!!!", 8) == 0,
+                       "textown: and the double wrap decodes exactly once");
+            axl_fclose(outer);
+        }
+        axl_fclose(txt);
+    }
+    axl_fclose(src);
+
+    /* ... and it is decode-ONCE rather than "the outer re-sniffs raw bytes
+       and happens to agree". A 2-byte body is below the headerless-sniff
+       minimum, so an outer wrapper reading the inner one's wire would see
+       `41 00`, classify it as plain bytes and emit BOTH -- the answer
+       depending on how much text the file held. Reading the inner through
+       axl_read gets "A", already decoded, and the outer correctly does
+       nothing. */
+    {
+        static const uint8_t bom_a[4] = { 0xFFu, 0xFEu, 'A', 0 };
+        bool ok = false;
+
+        src   = make_buf_with(bom_a, sizeof bom_a);
+        txt   = axl_text_stream_wrap(src);
+        outer = (txt != NULL) ? axl_text_stream_wrap(txt) : NULL;
+        if (outer != NULL) {
+            axl_memset(rd, 0, sizeof rd);
+            n  = axl_read(outer, rd, sizeof rd);
+            ok = (n == 1 && rd[0] == 'A');
+        }
+        test_check(ok, "textown: a short UTF-16 body survives the double wrap");
+        axl_fclose(outer);   /* all three are NULL-safe */
+        axl_fclose(txt);
+        axl_fclose(src);
+    }
+
+    /* ... and the outer must not CLASSIFY what the inner already decoded.
+       Sixteen UTF-16 LE code units alternating ASCII with U+0000 decode to
+       UTF-8 that alternates ASCII with a NUL byte -- exactly the shape the
+       headerless sniff looks for. An outer wrapper re-running the classifier
+       over that would call it UCS-2 LE and decode a second time, silently
+       eating all eight NUL characters. So over a text wrapper the outer skips
+       classification entirely and passes the inner's output through. */
+    {
+        static const uint8_t nul_ucs2[32] = {
+            'A', 0, 0, 0, 'B', 0, 0, 0, 'C', 0, 0, 0, 'D', 0, 0, 0,
+            'E', 0, 0, 0, 'F', 0, 0, 0, 'G', 0, 0, 0, 'H', 0, 0, 0,
+        };
+        static const uint8_t decoded[16] = {
+            'A', 0, 'B', 0, 'C', 0, 'D', 0, 'E', 0, 'F', 0, 'G', 0, 'H', 0,
+        };
+        bool ok = false;
+
+        src   = make_buf_with(nul_ucs2, sizeof nul_ucs2);
+        txt   = axl_text_stream_wrap(src);
+        outer = (txt != NULL) ? axl_text_stream_wrap(txt) : NULL;
+        if (outer != NULL) {
+            axl_memset(rd, 0, sizeof rd);
+            n  = axl_read(outer, rd, sizeof rd);
+            ok = (n == 16 && test_memcmp(rd, decoded, 16) == 0);
+        }
+        test_check(ok, "textown: embedded NULs are not re-sniffed by a second wrap");
+        axl_fclose(outer);
+        axl_fclose(txt);
+        axl_fclose(src);
+    }
+
+    /* 6) Reaching around a LIVE wrapper fails the read rather than serving
+          doubly-decoded text -- and it fails with the classifier's probe
+          bytes still in hand, which is what makes the failure unconditional
+          instead of "after the buffered bytes run out". */
+    src = make_ucs2_source();
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL, "textown: wrap an undecoded source");
+    if (txt != NULL) {
+        axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+        axl_memset(rd, 0, sizeof rd);
+        test_check(axl_read(txt, rd, sizeof rd) == -1,
+                   "textown: a decoder set on a wrapped source fails the next read");
+        test_check(axl_ferror(txt) == true,
+                   "textown: and the failure is sticky on the wrapper");
+
+        /* The check is live, not latched: put the source back and the
+           wrapper works again, probe bytes intact. */
+        axl_stream_set_encoding(src, AXL_ENC_UTF8);
+        axl_clearerr(txt);
+        axl_memset(rd, 0, sizeof rd);
+        n = axl_read(txt, rd, sizeof rd);
+        test_check(n == 8 && test_memcmp(rd, "hello!!!", 8) == 0,
+                   "textown: restoring the source revives the wrapper, probe intact");
+        axl_fclose(txt);
+    }
+    axl_fclose(src);
+}
+
+/* The one promise in the wrapper's contract whose mechanism sits ABOVE the
+   wrapper: when a decoder appears on the source, axl_ferror() goes true and
+   reads return -1 only ONCE THE WRAPPER'S OWN decoded leftovers have drained.
+   Those leftovers live in read_transcode's in_pending, which the wrapper's
+   read guard cannot see -- which is why the docstring says "once drained"
+   rather than "immediately", and why that sentence needs an assertion behind
+   it rather than a plausible reading. */
+static void
+test_text_stream_wrap_conflict_drains_leftovers(void)
+{
+    /* U+20AC behind a UTF-16 LE BOM: three UTF-8 bytes out of one wire code
+       unit, so a one-byte read leaves exactly two in flight. */
+    static const uint8_t bom_euro[4] = { 0xFFu, 0xFEu, 0xACu, 0x20u };
+    AxlStream  *src = make_buf_with(bom_euro, sizeof bom_euro);
+    AxlStream  *txt = axl_text_stream_wrap(src);
+    uint8_t     rd[8];
+    uint8_t     b = 0;
+    axl_ssize_t n;
+
+    test_check(txt != NULL, "textlefto: wrap a BOM'd UTF-16 source");
+    if (txt != NULL) {
+        test_check(axl_read(txt, &b, 1) == 1 && b == 0xE2u,
+                   "textlefto: one byte out, two held back");
+
+        axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+        axl_memset(rd, 0, sizeof rd);
+        n = axl_read(txt, rd, sizeof rd);
+        test_check(n == 2 && rd[0] == 0x82u && rd[1] == 0xACu,
+                   "textlefto: the held-back bytes still come out");
+        test_check(axl_ferror(txt) == true,
+                   "textlefto: and that same read already raises the error flag");
+        test_check(axl_read(txt, rd, sizeof rd) == -1,
+                   "textlefto: the read after the leftovers is the -1");
+        axl_fclose(txt);
+    }
+    axl_fclose(src);
+}
+
+/* The wrapper reads its source through the PUBLIC axl_read, so the source's
+   own sticky flags track what the wrapper did to it. Neither of these held
+   while the wrapper reached below axl_read -- the file even carried a comment
+   claiming the error state was on the source when nothing set it. */
+static void
+test_text_stream_wrap_marks_its_source(void)
+{
+    AxlStream  *src;
+    AxlStream  *txt;
+    size_t      drained = 0;
+    axl_ssize_t got;
+    char        rd[32];
+
+    src = axl_bufopen();
+    axl_write(src, "plain ascii, no BOM", 19);
+    axl_fseek(src, 0, AXL_SEEK_SET);
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL, "textflags: wrap a buffer source");
+    if (txt != NULL) {
+        while ((got = axl_read(txt, rd, sizeof rd)) > 0) {
+            drained += (size_t)got;
+        }
+        test_check(drained == 19, "textflags: the wrapper delivered the whole source");
+        test_check(axl_feof(src) == true,
+                   "textflags: and the source it read to the end reports EOF");
+        axl_fclose(txt);
+    }
+    axl_fclose(src);
 }
 
 static void
@@ -1869,7 +2327,7 @@ test_ferror_clearerr(void)
 
     /* clearerr on NULL is a no-op (no crash). */
     axl_clearerr(NULL);
-    test_check(true, "ferror: clearerr(NULL) no crash");
+    test_survived("ferror: clearerr(NULL) no crash");
 
     axl_fclose(s);
 }
@@ -2166,17 +2624,7 @@ test_write_paths_report_a_failed_flush(void)
     if (!ff_fs_up()) {
         /* No shell to map the published volume through, so it cannot be
            reached by path at all. One balancer per assertion below. */
-        axl_printf("SKIP: flush-fail write paths (no shell map for the "
-                   "published volume)\n");
-        test_check(true, "flush-fail: set_contents SKIP balance");
-        test_check(true, "flush-fail: write_atomic status SKIP balance");
-        test_check(true, "flush-fail: write_atomic target SKIP balance");
-        test_check(true, "flush-fail: write_atomic temp SKIP balance");
-        test_check(true, "flush-fail: move status SKIP balance");
-        test_check(true, "flush-fail: move source SKIP balance");
-        test_check(true, "flush-fail: atomic recovery status SKIP balance");
-        test_check(true, "flush-fail: atomic recovery temp SKIP balance");
-        test_check(true, "flush-fail: truncate SKIP balance");
+        test_skip_n(9, "flush-fail write paths (no shell map for the published volume)");
         return;
     }
 
@@ -2453,6 +2901,2051 @@ test_stream_interactive_flag(void)
 }
 
 // ---------------------------------------------------------------------------
+// Custom backends (axl_stream_open_custom) + capability queries + the
+// global fault-injection hooks.
+//
+// INJECTION DISCIPLINE, and it is not optional: the hooks are global and
+// test_check() itself writes to axl_stdout, which goes through the very
+// sink boundary being injected. So every test below is written as
+//
+//     arm -> act, capturing results into locals -> disarm -> assert
+//
+// Asserting while armed would let a PASS line consume the tick (and lose
+// the PASS line into the bargain). This is exactly the non-reentrancy the
+// header warns about, met in the first consumer.
+// ---------------------------------------------------------------------------
+
+/* Recording test backend. Static rather than automatic so the close counter
+   survives axl_fclose() and can still be asserted afterwards. */
+typedef struct {
+    uint8_t   data[256];
+    size_t    len;          /* bytes currently held */
+    size_t    read_pos;     /* next byte test_sink_read serves */
+    /* Max bytes moved per backend call (0 = whatever is asked for). A socket
+       or ring buffer short-transfers as a matter of course; this is how a
+       test gets that behaviour REPEATEDLY, which the one-shot
+       axl_stream_short_next_write hook cannot express. */
+    size_t    chunk;
+    unsigned  write_calls;
+    unsigned  read_calls;
+    unsigned  flush_calls;
+    unsigned  close_calls;
+    unsigned  pread_calls;
+    unsigned  pwrite_calls;
+    unsigned  seek_calls;
+    unsigned  tell_calls;
+    void     *close_ctx;
+} TestSink;
+
+static TestSink mSink;
+
+static void
+test_sink_reset(void)
+{
+    axl_memset(&mSink, 0, sizeof mSink);
+}
+
+/* Clamp a caller's byte count to the sink's per-call chunk limit. */
+static size_t
+test_sink_chunked(const TestSink *t, size_t count)
+{
+    return (t->chunk != 0 && count > t->chunk) ? t->chunk : count;
+}
+
+static axl_ssize_t
+test_sink_write(void *ctx, const void *buf, size_t count)
+{
+    TestSink *t    = (TestSink *)ctx;
+    size_t    room = sizeof t->data - t->len;
+    size_t    want = test_sink_chunked(t, count);
+    size_t    n    = (want < room) ? want : room;
+
+    t->write_calls++;
+    axl_memcpy(t->data + t->len, buf, n);
+    t->len += n;
+    return (axl_ssize_t)n;
+}
+
+static axl_ssize_t
+test_sink_read(void *ctx, void *buf, size_t count)
+{
+    TestSink *t     = (TestSink *)ctx;
+    size_t    avail = t->len - t->read_pos;
+    size_t    want  = test_sink_chunked(t, count);
+    size_t    n     = (want < avail) ? want : avail;
+
+    t->read_calls++;
+    axl_memcpy(buf, t->data + t->read_pos, n);
+    t->read_pos += n;
+    return (axl_ssize_t)n;
+}
+
+static axl_ssize_t
+test_sink_pread(void *ctx, void *buf, size_t count, size_t offset)
+{
+    TestSink *t = (TestSink *)ctx;
+    size_t    n;
+
+    t->pread_calls++;
+    if (offset >= t->len) {
+        return 0;
+    }
+    n = t->len - offset;
+    if (count < n) {
+        n = count;
+    }
+    axl_memcpy(buf, t->data + offset, n);
+    return (axl_ssize_t)n;
+}
+
+/* Always-failing positional read. test_sink_pread has no failure input of its
+   own (an offset past the end is a legal 0), and the injection hooks
+   deliberately leave positional I/O alone, so reaching axl_pread's error path
+   needs a backend that simply says -1. */
+static axl_ssize_t
+test_sink_pread_fail(void *ctx, void *buf, size_t count, size_t offset)
+{
+    (void)buf;
+    (void)count;
+    (void)offset;
+    ((TestSink *)ctx)->pread_calls++;
+    return -1;
+}
+
+static axl_ssize_t
+test_sink_pwrite(void *ctx, const void *buf, size_t count, size_t offset)
+{
+    TestSink *t = (TestSink *)ctx;
+    size_t    n;
+
+    t->pwrite_calls++;
+    if (offset >= sizeof t->data) {
+        return -1;
+    }
+    n = sizeof t->data - offset;
+    if (count < n) {
+        n = count;
+    }
+    axl_memcpy(t->data + offset, buf, n);
+    if (offset + n > t->len) {
+        t->len = offset + n;
+    }
+    return (axl_ssize_t)n;
+}
+
+static int
+test_sink_seek(void *ctx, int64_t offset, int whence)
+{
+    (void)offset;
+    (void)whence;
+    ((TestSink *)ctx)->seek_calls++;
+    return 0;
+}
+
+static int64_t
+test_sink_tell(void *ctx)
+{
+    TestSink *t = (TestSink *)ctx;
+    t->tell_calls++;
+    return (int64_t)t->len;
+}
+
+static int
+test_sink_flush(void *ctx)
+{
+    ((TestSink *)ctx)->flush_calls++;
+    return 0;
+}
+
+static void
+test_sink_close(void *ctx)
+{
+    TestSink *t = (TestSink *)ctx;
+    t->close_calls++;
+    t->close_ctx = ctx;
+}
+
+/* A fresh zeroed ops block. A function rather than repeating the macro so a
+   test can re-arm the same variable without a compound literal. */
+static AxlStreamOps
+test_ops_empty(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+    return ops;
+}
+
+static void
+test_stream_custom_roundtrip(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         rd[8];
+
+    test_sink_reset();
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    ops.close = test_sink_close;
+
+    s = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(s != NULL, "custom: open_custom returns a stream");
+    if (s == NULL) {
+        return;
+    }
+
+    test_check(axl_write(s, "hello", 5) == 5,
+               "custom: axl_write reaches the backend and returns its count");
+    test_check(mSink.len == 5 && test_memcmp(mSink.data, "hello", 5) == 0,
+               "custom: the backend received the exact bytes");
+
+    axl_memset(rd, 0, sizeof rd);
+    test_check(axl_read(s, rd, sizeof rd) == 5,
+               "custom: axl_read returns the backend's count");
+    test_check(test_memcmp(rd, "hello", 5) == 0,
+               "custom: axl_read returns the exact bytes");
+
+    axl_fclose(s);
+    test_check(mSink.close_calls == 1,
+               "custom: axl_fclose calls close exactly once");
+    test_check(mSink.close_ctx == (void *)&mSink,
+               "custom: close receives the ctx the caller supplied");
+}
+
+static void
+test_stream_custom_capabilities(void)
+{
+    AxlStreamOps ops;
+    AxlStream   *s;
+
+    test_check(axl_stream_can_read(NULL)   == false, "caps: NULL can_read false");
+    test_check(axl_stream_can_write(NULL)  == false, "caps: NULL can_write false");
+    test_check(axl_stream_can_seek(NULL)   == false, "caps: NULL can_seek false");
+    test_check(axl_stream_can_tell(NULL)   == false, "caps: NULL can_tell false");
+    test_check(axl_stream_can_pread(NULL)  == false, "caps: NULL can_pread false");
+    test_check(axl_stream_can_pwrite(NULL) == false, "caps: NULL can_pwrite false");
+
+    /* Write-only: every other query must read false. */
+    ops = test_ops_empty();
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_write(s)  == true,  "caps: can_write true when write is set");
+    test_check(axl_stream_can_read(s)   == false, "caps: can_read false when read is NULL");
+    test_check(axl_stream_can_seek(s)   == false, "caps: can_seek false when seek is NULL");
+    test_check(axl_stream_can_tell(s)   == false, "caps: can_tell false when tell is NULL");
+    test_check(axl_stream_can_pread(s)  == false, "caps: can_pread false when pread is NULL");
+    test_check(axl_stream_can_pwrite(s) == false, "caps: can_pwrite false when pwrite is NULL");
+    axl_fclose(s);
+
+    /* Read-only. */
+    ops = test_ops_empty();
+    ops.read = test_sink_read;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_read(s)  == true,  "caps: can_read true when read is set");
+    test_check(axl_stream_can_write(s) == false, "caps: can_write false when write is NULL");
+    axl_fclose(s);
+
+    /* seek WITHOUT tell — the pair a single shared query would have hidden. */
+    ops = test_ops_empty();
+    ops.write = test_sink_write;
+    ops.seek  = test_sink_seek;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_seek(s) == true,  "caps: can_seek true with seek and no tell");
+    test_check(axl_stream_can_tell(s) == false, "caps: can_tell false with seek and no tell");
+    axl_fclose(s);
+
+    /* tell WITHOUT seek. */
+    ops = test_ops_empty();
+    ops.write = test_sink_write;
+    ops.tell  = test_sink_tell;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_tell(s) == true,  "caps: can_tell true with tell and no seek");
+    test_check(axl_stream_can_seek(s) == false, "caps: can_seek false with tell and no seek");
+    axl_fclose(s);
+
+    /* pread WITHOUT pwrite, and the mirror. */
+    ops = test_ops_empty();
+    ops.read  = test_sink_read;
+    ops.pread = test_sink_pread;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_pread(s)  == true,  "caps: can_pread true with pread and no pwrite");
+    test_check(axl_stream_can_pwrite(s) == false, "caps: can_pwrite false with pread and no pwrite");
+    axl_fclose(s);
+
+    ops = test_ops_empty();
+    ops.write  = test_sink_write;
+    ops.pwrite = test_sink_pwrite;
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(axl_stream_can_pwrite(s) == true,  "caps: can_pwrite true with pwrite and no pread");
+    test_check(axl_stream_can_pread(s)  == false, "caps: can_pread false with pwrite and no pread");
+    axl_fclose(s);
+
+    /* The built-ins these queries exist to stop being incidentally true. */
+    test_check(axl_stream_can_write(axl_stdout) == true,  "caps: axl_stdout can write");
+    test_check(axl_stream_can_read(axl_stdout)  == false, "caps: axl_stdout cannot read");
+    test_check(axl_stream_can_read(axl_stdin)   == true,  "caps: axl_stdin can read");
+    test_check(axl_stream_can_write(axl_stdin)  == false, "caps: axl_stdin cannot write");
+
+    s = axl_bufopen();
+    test_check(axl_stream_can_read(s) && axl_stream_can_write(s)
+               && axl_stream_can_seek(s) && axl_stream_can_tell(s)
+               && axl_stream_can_pread(s) && axl_stream_can_pwrite(s),
+               "caps: a buffer stream reports every capability");
+    axl_fclose(s);
+}
+
+static void
+test_stream_custom_rejects_bad_ops(void)
+{
+    AxlStreamOps good = test_ops_empty();
+    AxlStreamOps bad;
+
+    test_sink_reset();
+    good.write = test_sink_write;
+    good.close = test_sink_close;
+
+    test_check(axl_stream_open_custom(&mSink, NULL, "x") == NULL,
+               "custom: NULL ops rejected");
+
+    bad = good;
+    bad.struct_size = 0;
+    test_check(axl_stream_open_custom(&mSink, &bad, "x") == NULL,
+               "custom: struct_size 0 rejected");
+
+    /* One operation short of the published struct. Deliberately NOT the
+       8-byte header prefix: a prefix that small copies no read and no write,
+       so the neither-read-nor-write guard would reject it even with the size
+       floor removed, and the test would pass for the wrong reason. At
+       one-slot-short the read and write slots ARE present, so only the floor
+       can refuse it. */
+    bad = good;
+    bad.struct_size = (uint32_t)(sizeof(AxlStreamOps) - sizeof(void (*)(void)));
+    test_check(axl_stream_open_custom(&mSink, &bad, "x") == NULL,
+               "custom: struct_size one operation short of frozen v1 rejected");
+
+    bad = good;
+    bad.version = 0;
+    test_check(axl_stream_open_custom(&mSink, &bad, "x") == NULL,
+               "custom: version 0 rejected");
+
+    bad = good;
+    bad.version = AXL_STREAM_OPS_VERSION + 1u;
+    test_check(axl_stream_open_custom(&mSink, &bad, "x") == NULL,
+               "custom: a version this library does not know is rejected");
+
+    bad = test_ops_empty();
+    bad.close = test_sink_close;
+    test_check(axl_stream_open_custom(&mSink, &bad, "x") == NULL,
+               "custom: ops with neither read nor write rejected");
+
+    /* The whole point of the ownership clause: a refused open must leave the
+       caller's ctx untouched, so close never runs and ctx is still theirs. */
+    test_check(mSink.close_calls == 0,
+               "custom: a refused open never calls close");
+}
+
+/* ---------------------------------------------------------------------------
+   axl_stream_ctx — the accessor half of the custom-backend contract.
+
+   A backend author wanting a STREAM-KEYED accessor (the shape axl_bufdata has)
+   must recover their ctx from a stream they were handed. The getter hands it
+   back only when the caller proves, by naming its own operations, which
+   backend it expects -- because an unchecked `void *` getter is precisely the
+   type-confusion that made axl_bufdata a 16-byte heap overwrite before
+   d5b0d739.
+
+   Two properties carry the safety argument and both are asserted below:
+   matching SHAPE is never enough (only the same function POINTERS pass), and
+   every built-in stream is structurally unreachable because its operations are
+   file-static and no consumer can name them.
+   --------------------------------------------------------------------------- */
+
+/* A second, unrelated consumer backend. Same SHAPE as the TestSink ops --
+   read + write + close -- and a different ctx type, which is exactly the
+   confusion the ops check has to refuse. */
+typedef struct {
+    unsigned  reads;
+    unsigned  writes;
+} OtherSink;
+
+static OtherSink mOther;
+
+static axl_ssize_t
+other_sink_read(void *ctx, void *buf, size_t count)
+{
+    (void)buf;
+    (void)count;
+    ((OtherSink *)ctx)->reads++;
+    return 0;   /* always EOF; the test only counts that it was reached */
+}
+
+static axl_ssize_t
+other_sink_write(void *ctx, const void *buf, size_t count)
+{
+    (void)buf;
+    ((OtherSink *)ctx)->writes++;
+    return (axl_ssize_t)count;
+}
+
+/* The docstring's worked idiom, VERBATIM and executed.
+   A docstring example is shipped code -- it gets copy-pasted -- and this one
+   carries the rule the whole API rests on: build the ops in ONE place and use
+   it for both the open and the query. Running it here is what stops the
+   header's advice and the header's behaviour drifting apart. */
+typedef struct {
+    size_t  dropped;
+} IdiomSink;
+
+static IdiomSink mIdiomSink;
+
+static axl_ssize_t
+idiom_sink_write(void *ctx, const void *buf, size_t count)
+{
+    (void)buf;
+    ((IdiomSink *)ctx)->dropped += count;
+    return (axl_ssize_t)count;
+}
+
+static void
+idiom_sink_close(void *ctx)
+{
+    (void)ctx;
+}
+
+static AxlStreamOps
+idiom_sink_ops(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    ops.write = idiom_sink_write;
+    ops.close = idiom_sink_close;
+    return ops;
+}
+
+static AxlStream *
+idiom_sink_open(IdiomSink *sink)
+{
+    AxlStreamOps ops = idiom_sink_ops();
+
+    return axl_stream_open_custom(sink, &ops, "my-sink");
+}
+
+static size_t
+idiom_sink_dropped(const AxlStream *s)
+{
+    AxlStreamOps  ops  = idiom_sink_ops();
+    IdiomSink    *sink = (IdiomSink *)axl_stream_ctx(s, &ops);
+
+    return (sink != NULL) ? sink->dropped : 0;
+}
+
+static void
+test_stream_ctx_docstring_idiom(void)
+{
+    AxlStream *s;
+    AxlStream *foreign;
+
+    axl_memset(&mIdiomSink, 0, sizeof mIdiomSink);
+    s = idiom_sink_open(&mIdiomSink);
+    test_check(s != NULL, "stream_ctx idiom: the constructor opens");
+    if (s == NULL) {
+        return;
+    }
+
+    test_check(axl_write(s, "hello", 5) == 5,
+               "stream_ctx idiom: the sink takes the bytes");
+    test_check(idiom_sink_dropped(s) == 5,
+               "stream_ctx idiom: the stream-keyed accessor reads its own ctx");
+
+    /* Only ONE non-NULL operation identifies this backend (write; close is the
+       other). The docstring claims one file-static function is enough, so a
+       foreign stream must still be refused -- and 0 is what the idiom's own
+       NULL branch returns. */
+    foreign = axl_bufopen();
+    test_check(foreign != NULL, "stream_ctx idiom: foreign stream opened");
+    if (foreign != NULL) {
+        axl_write(foreign, "world", 5);
+        test_check(idiom_sink_dropped(foreign) == 0,
+                   "stream_ctx idiom: a foreign stream reads as zero, not garbage");
+        axl_fclose(foreign);
+    }
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_ctx_roundtrip(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *a;
+    AxlStream   *b;
+
+    test_sink_reset();
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    ops.close = test_sink_close;
+
+    a = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(a != NULL, "stream_ctx: custom stream opened");
+    if (a == NULL) {
+        return;
+    }
+
+    test_check(axl_stream_ctx(a, &ops) == (void *)&mSink,
+               "stream_ctx: returns the exact ctx the stream was opened with");
+
+    /* The returned pointer is the LIVE context, not a copy: a write through
+       the stream must be visible through what the getter handed back. */
+    {
+        TestSink *got = (TestSink *)axl_stream_ctx(a, &ops);
+        unsigned  before = (got != NULL) ? got->write_calls : 0u;
+        axl_write(a, "z", 1);
+        test_check(got != NULL && got->write_calls == before + 1u,
+                   "stream_ctx: the ctx is live, not a snapshot");
+    }
+
+    /* Every stream from one backend matches -- the question the accessor asks
+       is "is this one of MINE", not "is this THAT one". */
+    b = axl_stream_open_custom(&mSink, &ops, "my-sink-2");
+    test_check(b != NULL, "stream_ctx: a second stream on the same ops opened");
+    if (b != NULL) {
+        test_check(axl_stream_ctx(b, &ops) == (void *)&mSink,
+                   "stream_ctx: a second stream from the same backend matches too");
+        axl_fclose(b);
+    }
+
+    axl_fclose(a);
+}
+
+static void
+test_stream_ctx_refuses_mismatched_ops(void)
+{
+    AxlStreamOps ops   = test_ops_empty();
+    AxlStreamOps probe;
+    AxlStream   *s;
+    AxlStream   *other;
+
+    test_sink_reset();
+    ops.read   = test_sink_read;
+    ops.write  = test_sink_write;
+    ops.pread  = test_sink_pread;
+    ops.close  = test_sink_close;
+
+    s = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(s != NULL, "stream_ctx: mismatch fixture opened");
+    if (s == NULL) {
+        return;
+    }
+
+    /* SHAPE is not identity. Same three slots occupied, one of them a
+       different function -- and test_sink_pread_fail has the identical
+       signature, so nothing but the pointer distinguishes them. */
+    probe = ops;
+    probe.pread = test_sink_pread_fail;
+    test_check(axl_stream_ctx(s, &probe) == NULL,
+               "stream_ctx: one differing slot refuses, same shape or not");
+
+    /* A SUBSET: the caller forgot a slot the stream has. */
+    probe = ops;
+    probe.pread = NULL;
+    test_check(axl_stream_ctx(s, &probe) == NULL,
+               "stream_ctx: ops missing a slot the stream has is refused");
+
+    /* A SUPERSET: the caller claims a slot the stream does not have. */
+    probe = ops;
+    probe.pwrite = test_sink_pwrite;
+    test_check(axl_stream_ctx(s, &probe) == NULL,
+               "stream_ctx: ops claiming a slot the stream lacks is refused");
+
+    /* Another consumer's backend entirely, live at the same time. Each must
+       see its own stream and refuse the other's -- the case that decides
+       whether this is safe to hand to consumers at all, since the two
+       contexts are different TYPES. */
+    axl_memset(&mOther, 0, sizeof mOther);
+    probe = test_ops_empty();
+    probe.read  = other_sink_read;
+    probe.write = other_sink_write;
+    probe.close = test_sink_close;
+    other = axl_stream_open_custom(&mOther, &probe, "other-sink");
+    test_check(other != NULL, "stream_ctx: a second backend's stream opened");
+    if (other != NULL) {
+        test_check(axl_stream_ctx(s, &probe) == NULL,
+                   "stream_ctx: a different backend's ops are refused");
+        test_check(axl_stream_ctx(other, &ops) == NULL,
+                   "stream_ctx: and the refusal is symmetric");
+        test_check(axl_stream_ctx(other, &probe) == (void *)&mOther,
+                   "stream_ctx: each backend still reaches its own ctx");
+        axl_fclose(other);
+    }
+
+    /* The refusal is inert -- the stream still works. */
+    test_check(axl_write(s, "ok", 2) == 2,
+               "stream_ctx: a refused stream is undamaged and still writable");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_ctx_rejects_bad_args(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStreamOps bad;
+    AxlStream   *s;
+
+    test_sink_reset();
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    ops.close = test_sink_close;
+
+    s = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(s != NULL, "stream_ctx: bad-args fixture opened");
+    if (s == NULL) {
+        return;
+    }
+
+    test_check(axl_stream_ctx(NULL, &ops) == NULL,
+               "stream_ctx: NULL stream refused");
+    test_check(axl_stream_ctx(s, NULL) == NULL,
+               "stream_ctx: NULL ops refused");
+
+    /* An ops with neither read nor write is refused on the same terms
+       open_custom refuses it, so an empty AXL_STREAM_OPS_INIT can never be
+       used as a probe. Nothing in the tree has both slots NULL today, so
+       without this guard the empty probe is safe only by accident -- and the
+       capability queries next door exist precisely because properties that
+       are only incidentally true get asserted and then break. */
+    bad = test_ops_empty();
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: an ops with neither read nor write refused");
+    bad = test_ops_empty();
+    bad.close = test_sink_close;
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: a close-only ops is still refused");
+
+    /* The same header validation open_custom applies, for the same reason:
+       struct_size bounds the copy, so a garbage one must not be trusted. */
+    bad = ops;
+    bad.struct_size = 0;
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: struct_size 0 refused");
+
+    bad = ops;
+    bad.struct_size = (uint32_t)(sizeof(AxlStreamOps) - sizeof(void (*)(void)));
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: struct_size one operation short of v1 refused");
+
+    bad = ops;
+    bad.version = 0;
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: version 0 refused");
+
+    bad = ops;
+    bad.version = AXL_STREAM_OPS_VERSION + 1u;
+    test_check(axl_stream_ctx(s, &bad) == NULL,
+               "stream_ctx: an unknown version refused");
+
+    /* A struct_size LARGER than this library's is the forward-skew case and
+       must still match: the extra slots are beyond what AXL copied at open
+       time, so they are ignored on both sides, exactly as open_custom does. */
+    bad = ops;
+    bad.struct_size = (uint32_t)(sizeof(AxlStreamOps) + 3u * sizeof(void (*)(void)));
+    test_check(axl_stream_ctx(s, &bad) == (void *)&mSink,
+               "stream_ctx: a newer caller's larger struct_size still matches");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_ctx_refuses_builtins(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlMemStats  before, after;
+    AxlStream   *buf;
+    AxlStream   *file;
+    AxlStream   *txt;
+    AxlStream   *custom;
+
+    /* No ops a consumer can build name a built-in's operations -- they are all
+       file-static -- so the strongest probe available from out here is a
+       fully-populated one. It must still be refused by every built-in. */
+    test_sink_reset();
+    ops.read   = test_sink_read;
+    ops.write  = test_sink_write;
+    ops.pread  = test_sink_pread;
+    ops.pwrite = test_sink_pwrite;
+    ops.seek   = test_sink_seek;
+    ops.tell   = test_sink_tell;
+    ops.flush  = test_sink_flush;
+    ops.close  = test_sink_close;
+
+    buf = axl_bufopen();
+    test_check(buf != NULL, "stream_ctx: buffer stream opened");
+    if (buf != NULL) {
+        test_check(axl_stream_ctx(buf, &ops) == NULL,
+                   "stream_ctx: a buffer stream's BufCtx is unreachable");
+        /* And the refusal is inert. */
+        test_check(axl_write(buf, "ok", 2) == 2,
+                   "stream_ctx: the refused buffer stream still writes");
+        axl_fclose(buf);
+    }
+
+    file = axl_fopen("fs0:\\axl_ctxkind.tmp", "w");
+    test_check(file != NULL, "stream_ctx: file stream opened");
+    if (file != NULL) {
+        test_check(axl_stream_ctx(file, &ops) == NULL,
+                   "stream_ctx: a file stream's FileCtx is unreachable");
+        axl_fclose(file);
+    }
+
+    /* The static console streams are not heap objects at all. */
+    test_check(axl_stream_ctx(axl_stdout, &ops) == NULL,
+               "stream_ctx: a static console stream is unreachable");
+
+    /* A text wrapper OVER a consumer's custom stream. Its ctx is the inner
+       AxlStream, not the consumer's context, so the wrapper must be refused
+       even though the stream underneath would match -- the same rule
+       axl_bufdata applies to a wrapper over a buffer. */
+    axl_mem_get_stats(&before);
+    custom = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(custom != NULL, "stream_ctx: wrapper fixture opened");
+    if (custom != NULL) {
+        txt = axl_text_stream_wrap(custom);
+        test_check(txt != NULL, "stream_ctx: text wrapper opened");
+        if (txt != NULL) {
+            test_check(axl_stream_ctx(txt, &ops) == NULL,
+                       "stream_ctx: a text wrapper over a custom stream is refused");
+            /* A text wrapper owns NOTHING below it: text_stream_close frees
+               the wrapper's own context and deliberately never touches src,
+               because the caller keeps the source and is even permitted to
+               close it FIRST. So both need closing -- and the allocation
+               baseline below is what keeps that from silently rotting back
+               into a leak. */
+            axl_fclose(txt);
+        }
+        axl_fclose(custom);
+    }
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count,
+               "stream_ctx: closing the wrapper AND its source leaks nothing");
+}
+
+static void
+test_stream_ctx_null_context(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+
+    /* A backend with no state at all. Documented as indistinguishable from a
+       refusal, which costs nothing because there is nothing to recover -- but
+       it must not crash, and the stream must still work. */
+    ops.write = other_sink_write;
+    s = axl_stream_open_custom(NULL, &ops, "stateless");
+    test_check(s != NULL, "stream_ctx: a stream over a NULL ctx opens");
+    if (s != NULL) {
+        test_check(axl_stream_ctx(s, &ops) == NULL,
+                   "stream_ctx: a NULL ctx reads as a refusal");
+        axl_fclose(s);
+    }
+}
+
+/* axl_bufdata/axl_bufsteal are keyed on the STREAM, so they have to recover a
+   BufCtx from s->ctx. A NULL check cannot tell them whether that ctx really IS
+   a BufCtx: hand either one a file stream and it reinterprets a FileCtx as a
+   BufCtx, reads a `len` out of whatever field lands at that offset, and hands
+   back a pointer built from unrelated bytes -- silently, and for bufsteal
+   destructively, since it then writes NULL over the file backend's fields.
+
+   The discriminator is the same one axl_compress_writer_finish uses: a vtable
+   slot only this backend installs. buf_read is file-static, so no consumer can
+   name it and no other backend can hold it. */
+static void
+test_buffer_accessors_reject_foreign_streams(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlMemStats  before, after;
+    AxlStream   *file;
+    AxlStream   *custom;
+    AxlStream   *txt;
+    AxlStream   *buf;
+    const void  *data;
+    void        *stolen;
+    size_t       size;
+    char         rd[8];
+
+    /* A file stream: the shape the accessors are most likely to meet by
+       mistake, since it is the other thing axl_fopen-style code hands around. */
+    file = axl_fopen("fs0:\\axl_bufkind.tmp", "w");
+    test_check(file != NULL, "bufkind: file stream opened");
+    if (file != NULL) {
+        size = 0xDEADu;
+        data = axl_bufdata(file, &size);
+        test_check(data == NULL, "bufkind: bufdata refuses a file stream");
+        test_check(size == 0xDEADu,
+                   "bufkind: a refused bufdata leaves the caller's size alone");
+
+        size   = 0xDEADu;
+        stolen = axl_bufsteal(file, &size);
+        test_check(stolen == NULL, "bufkind: bufsteal refuses a file stream");
+        test_check(size == 0xDEADu,
+                   "bufkind: a refused bufsteal leaves the caller's size alone");
+
+        /* And the refusal must be inert: the file stream still works. */
+        test_check(axl_write(file, "ok", 2) == 2,
+                   "bufkind: the refused stream is undamaged and still writable");
+        axl_fclose(file);
+    }
+
+    /* A consumer-built custom stream. Its ctx is a TestSink, not a BufCtx. */
+    test_sink_reset();
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    ops.close = test_sink_close;
+    custom = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(custom != NULL, "bufkind: custom stream opened");
+    if (custom != NULL) {
+        test_check(axl_bufdata(custom, &size) == NULL,
+                   "bufkind: bufdata refuses a consumer custom stream");
+        test_check(axl_bufsteal(custom, &size) == NULL,
+                   "bufkind: bufsteal refuses a consumer custom stream");
+        axl_fclose(custom);
+    }
+
+    /* A text wrapper OVER a buffer stream: its ctx is the inner AxlStream, not
+       the BufCtx, so the underlying stream being a buffer does not help. */
+    axl_mem_get_stats(&before);
+    buf = axl_bufopen();
+    axl_write(buf, "hello", 5);
+    txt = axl_text_stream_wrap(buf);
+    test_check(txt != NULL, "bufkind: text wrapper opened over a buffer stream");
+    if (txt != NULL) {
+        test_check(axl_bufdata(txt, &size) == NULL,
+                   "bufkind: bufdata refuses a text wrapper over a buffer");
+        test_check(axl_bufsteal(txt, &size) == NULL,
+                   "bufkind: bufsteal refuses a text wrapper over a buffer");
+        /* The wrapper still reads through to the buffer it wraps. */
+        axl_memset(rd, 0, sizeof rd);
+        test_check(axl_read(txt, rd, sizeof rd) == 5
+                   && test_memcmp(rd, "hello", 5) == 0,
+                   "bufkind: the refused wrapper still reads its inner buffer");
+        /* Closing the wrapper does NOT close the buffer under it -- the
+           wrapper owns nothing below itself (see axl_text_stream_wrap). */
+        axl_fclose(txt);
+    }
+    axl_fclose(buf);
+    axl_mem_get_stats(&after);
+    test_check(after.count == before.count,
+               "bufkind: closing the wrapper AND its buffer leaks nothing");
+
+    /* The right kind is untouched: both accessors still work end to end. */
+    buf = axl_bufopen();
+    axl_write(buf, "kept", 4);
+    size = 0;
+    data = axl_bufdata(buf, &size);
+    test_check(data != NULL && size == 4 && test_memcmp(data, "kept", 4) == 0,
+               "bufkind: bufdata still serves a real buffer stream");
+    size   = 0;
+    stolen = axl_bufsteal(buf, &size);
+    test_check(stolen != NULL && size == 4 && test_memcmp(stolen, "kept", 4) == 0,
+               "bufkind: bufsteal still serves a real buffer stream");
+    axl_free(stolen);
+    axl_fclose(buf);
+
+    /* The pre-existing NULL guards must survive the added check. */
+    test_check(axl_bufdata(NULL, &size)  == NULL, "bufkind: bufdata(NULL) is NULL");
+    test_check(axl_bufsteal(NULL, &size) == NULL, "bufkind: bufsteal(NULL) is NULL");
+}
+
+static void
+test_stream_name(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    AxlStream   *src;
+    AxlStream   *txt;
+
+    ops.write = test_sink_write;
+
+    test_check(axl_strcmp(axl_stream_name(NULL), "") == 0,
+               "name: a NULL stream yields the empty string");
+
+    s = axl_stream_open_custom(&mSink, &ops, "my-sink");
+    test_check(s != NULL && axl_strcmp(axl_stream_name(s), "my-sink") == 0,
+               "name: a custom stream reports its label");
+    axl_fclose(s);
+
+    s = axl_stream_open_custom(&mSink, &ops, NULL);
+    test_check(s != NULL && axl_strcmp(axl_stream_name(s), "") == 0,
+               "name: a NULL label yields the empty string");
+    axl_fclose(s);
+
+    s = axl_bufopen();
+    test_check(axl_strcmp(axl_stream_name(s), "buffer") == 0, "name: buffer stream");
+    axl_fclose(s);
+
+    src = axl_bufopen();
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL && axl_strcmp(axl_stream_name(txt), "text") == 0,
+               "name: text wrapper stream");
+    axl_fclose(txt);
+    axl_fclose(src);
+
+    s = axl_fopen("fs0:\\axl_test_name.tmp", "w");
+    test_check(s != NULL && axl_strcmp(axl_stream_name(s), "file") == 0,
+               "name: file stream");
+    axl_fclose(s);
+    axl_file_delete("fs0:\\axl_test_name.tmp");
+
+    src = axl_bufopen();
+    s   = axl_gzip_writer(src, 6);
+    test_check(s != NULL && axl_strcmp(axl_stream_name(s), "compress") == 0,
+               "name: compressing writer stream");
+    axl_fclose(s);
+    axl_fclose(src);
+
+    test_check(axl_strcmp(axl_stream_name(axl_stdout), "stdout") == 0,
+               "name: axl_stdout");
+    test_check(axl_strcmp(axl_stream_name(axl_stderr), "stderr") == 0,
+               "name: axl_stderr");
+    test_check(axl_strcmp(axl_stream_name(axl_stdin), "stdin") == 0,
+               "name: axl_stdin");
+    test_check(axl_strcmp(axl_stream_name(axl_stdout_raw), "stdout-raw") == 0,
+               "name: axl_stdout_raw");
+    test_check(axl_strcmp(axl_stream_name(axl_stderr_raw), "stderr-raw") == 0,
+               "name: axl_stderr_raw");
+}
+
+static void
+test_stream_inject_write_failure(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    axl_ssize_t  w1, w2, w3, w4, w5;
+    unsigned     calls_after_fail, calls_after_pass;
+    bool         err_after_fail;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "inject");
+    test_check(s != NULL, "inject: open a write-only injection target");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_stream_fail_next_write(1);
+    w1               = axl_write(s, "x", 1);
+    calls_after_fail = mSink.write_calls;
+    err_after_fail   = axl_ferror(s);
+    axl_clearerr(s);
+    w2               = axl_write(s, "y", 1);
+    calls_after_pass = mSink.write_calls;
+
+    test_check(w1 == -1, "inject: the armed backend write fails");
+    test_check(calls_after_fail == 0, "inject: the backend was never called");
+    test_check(err_after_fail == true,
+               "inject: the injected failure sets the sticky error flag");
+    test_check(w2 == 1, "inject: the counter disarms after firing");
+    test_check(calls_after_pass == 1, "inject: the next write reaches the backend");
+
+    /* n=2: earlier writes succeed, the Nth fails. */
+    test_sink_reset();
+    axl_stream_fail_next_write(2);
+    w3 = axl_write(s, "a", 1);
+    w4 = axl_write(s, "b", 1);
+    axl_clearerr(s);
+    test_check(w3 == 1,  "inject: n=2 lets the first write through");
+    test_check(w4 == -1, "inject: n=2 fails the second write");
+    test_check(mSink.len == 1 && mSink.data[0] == 'a',
+               "inject: only the un-failed byte reached the backend");
+
+    /* 0 disarms a pending arm. */
+    axl_stream_fail_next_write(1);
+    axl_stream_fail_next_write(0);
+    w5 = axl_write(s, "c", 1);
+    test_check(w5 == 1, "inject: arming with 0 disarms a pending failure");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_inject_short_write(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    axl_ssize_t  w1, w2, w3;
+    size_t       len1;
+    bool         err1;
+    unsigned     calls3;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "short");
+    test_check(s != NULL, "short: open a write-only injection target");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_stream_short_next_write(1, 2);
+    w1   = axl_write(s, "hello", 5);
+    len1 = mSink.len;
+    err1 = axl_ferror(s);
+    test_check(w1 == 2, "short: the armed write accepts only the limit");
+    test_check(len1 == 2 && test_memcmp(mSink.data, "he", 2) == 0,
+               "short: the backend genuinely received only those bytes");
+    test_check(err1 == false, "short: a short write is not an error");
+
+    /* limit is clamped against the backend call's own count. */
+    test_sink_reset();
+    axl_stream_short_next_write(1, 99);
+    w2 = axl_write(s, "hi", 2);
+    test_check(w2 == 2, "short: a limit above the count is clamped to it");
+
+    /* limit 0 — accepted nothing, still not an error. */
+    test_sink_reset();
+    axl_stream_short_next_write(1, 0);
+    w3     = axl_write(s, "hi", 2);
+    calls3 = mSink.write_calls;
+    axl_stream_short_next_write(0, 0);
+    test_check(w3 == 0, "short: a limit of 0 accepts nothing");
+    test_check(calls3 == 0, "short: a limit of 0 never reaches the backend");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_inject_short_write_buffered(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    axl_ssize_t  w1;
+    unsigned     calls_after_write;
+    int          flush1, flush2;
+    size_t       len_after_stall;
+    bool         err_after_stall;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "retain");
+    test_check(s != NULL, "retain: open a buffered injection target");
+    if (s == NULL) {
+        return;
+    }
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 64);
+
+    w1                = axl_write(s, "abcdef", 6);
+    calls_after_write = mSink.write_calls;
+    axl_stream_short_next_write(1, 0);
+    flush1            = axl_fflush(s);
+    len_after_stall   = mSink.len;
+    err_after_stall   = axl_ferror(s);
+    axl_clearerr(s);
+    flush2            = axl_fflush(s);
+
+    test_check(w1 == 6, "retain: the buffered write accepts everything");
+    test_check(calls_after_write == 0, "retain: buffering defers the backend call");
+    test_check(flush1 == AXL_ERR, "retain: a zero-progress flush reports failure");
+    test_check(len_after_stall == 0, "retain: no bytes reached the backend");
+    /* A stall retains the tail and returns AXL_ERR, so axl_ferror must agree
+       — axl_fclose's drain discards the return value, and without the flag
+       nothing anywhere would record that bytes never left. */
+    test_check(err_after_stall == true,
+               "retain: a zero-progress flush also sets the sticky error flag");
+    test_check(flush2 == AXL_OK, "retain: the retried flush succeeds");
+    test_check(mSink.len == 6 && test_memcmp(mSink.data, "abcdef", 6) == 0,
+               "retain: the retained tail flushes intact and in order");
+
+    /* A short write WITH progress is retried inside the same flush. */
+    test_sink_reset();
+    axl_write(s, "abcdef", 6);
+    axl_stream_short_next_write(1, 3);
+    flush1 = axl_fflush(s);
+    axl_stream_short_next_write(0, 0);
+    test_check(flush1 == AXL_OK, "retain: a partial flush loops to completion");
+    test_check(mSink.write_calls == 2,
+               "retain: the flush loop issued a second backend write");
+    test_check(mSink.len == 6 && test_memcmp(mSink.data, "abcdef", 6) == 0,
+               "retain: the partial flush wrote every byte in order");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_inject_read_failure(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[8];
+    axl_ssize_t  r1, r2;
+    unsigned     calls1;
+    bool         err1;
+
+    test_sink_reset();
+    axl_memcpy(mSink.data, "hello", 5);
+    mSink.len = 5;
+    ops.read  = test_sink_read;
+    s = axl_stream_open_custom(&mSink, &ops, "reader");
+    test_check(s != NULL, "inject: open a read-only injection target");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_stream_fail_next_read(1);
+    r1     = axl_read(s, buf, sizeof buf);
+    calls1 = mSink.read_calls;
+    err1   = axl_ferror(s);
+    axl_clearerr(s);
+    r2     = axl_read(s, buf, sizeof buf);
+
+    test_check(r1 == -1, "inject: the armed backend read fails");
+    test_check(calls1 == 0, "inject: the backend read was never called");
+    test_check(err1 == true, "inject: a read failure sets the sticky error flag");
+    test_check(r2 == 5, "inject: the read counter disarms after firing");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_inject_flush_failure(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *no_flush;
+    AxlStream   *with_flush;
+    int          f_null, f_armed, f_disarmed;
+    unsigned     calls_after_armed;
+
+    test_sink_reset();
+    ops.write  = test_sink_write;
+    no_flush   = axl_stream_open_custom(&mSink, &ops, "no-flush");
+    ops.flush  = test_sink_flush;
+    with_flush = axl_stream_open_custom(&mSink, &ops, "with-flush");
+    test_check(no_flush != NULL && with_flush != NULL,
+               "inject: open both flush injection targets");
+    if (no_flush == NULL || with_flush == NULL) {
+        axl_fclose(no_flush);
+        axl_fclose(with_flush);
+        return;
+    }
+
+    /* A NULL flush never reaches the injection point, so the tick is NOT
+       consumed and fires on the next stream that does have one. */
+    axl_stream_fail_next_flush(1);
+    f_null            = axl_fflush(no_flush);
+    f_armed           = axl_fflush(with_flush);
+    calls_after_armed = mSink.flush_calls;
+    f_disarmed        = axl_fflush(with_flush);
+
+    test_check(f_null == AXL_OK,
+               "inject: a NULL-flush stream flushes OK and consumes no tick");
+    test_check(f_armed == AXL_ERR,
+               "inject: the still-armed tick fires on the next real flush");
+    test_check(calls_after_armed == 0, "inject: the backend flush was never called");
+    test_check(f_disarmed == AXL_OK, "inject: the flush counter disarms after firing");
+    test_check(mSink.flush_calls == 1, "inject: the next flush reaches the backend");
+
+    axl_fclose(no_flush);
+    axl_fclose(with_flush);
+}
+
+static void
+test_stream_inject_buffering_defers_the_tick(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    axl_ssize_t  w1;
+    bool         err_after_write, err_after_flush;
+    int          flush1;
+    unsigned     calls_after_write;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "deferred");
+    test_check(s != NULL, "defer: open a buffered injection target");
+    if (s == NULL) {
+        return;
+    }
+    axl_stream_set_buffering(s, AXL_STREAM_BUF_FULL, 64);
+
+    axl_stream_fail_next_write(1);
+    w1                = axl_write(s, "abc", 3);
+    calls_after_write = mSink.write_calls;
+    err_after_write   = axl_ferror(s);
+    flush1            = axl_fflush(s);
+    err_after_flush   = axl_ferror(s);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(s);
+
+    test_check(w1 == 3, "defer: a write that only fills the buffer still succeeds");
+    test_check(calls_after_write == 0, "defer: it consumes no tick and calls no backend");
+    test_check(err_after_write == false, "defer: and reports no error");
+    test_check(flush1 == AXL_ERR, "defer: the armed failure fires at the flush instead");
+    test_check(err_after_flush == true, "defer: the flush failure is sticky");
+
+    axl_fclose(s);
+}
+
+static void
+test_stream_inject_counts_per_code_point(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *u8;
+    AxlStream   *w;
+    axl_ssize_t  a1, a2, b1;
+    bool         err_b;
+
+    ops.write = test_sink_write;
+
+    /* UTF-8 (the default) is one backend write per axl_write, so n=2 lets a
+       two-byte write through whole and fires on the NEXT axl_write. */
+    test_sink_reset();
+    u8 = axl_stream_open_custom(&mSink, &ops, "utf8");
+    test_check(u8 != NULL, "codepoint: open the UTF-8 target");
+    if (u8 == NULL) {
+        return;
+    }
+    axl_stream_fail_next_write(2);
+    a1 = axl_write(u8, "ab", 2);
+    a2 = axl_write(u8, "c", 1);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(u8);
+    axl_fclose(u8);
+
+    test_check(a1 == 2, "codepoint: UTF-8 spends one tick per axl_write");
+    test_check(a2 == -1, "codepoint: so the second axl_write is the one that fires");
+
+    /* A non-UTF-8 encoding issues one backend write PER CODE POINT, so the
+       same n=2 fires part-way through a single two-character write. */
+    test_sink_reset();
+    w = axl_stream_open_custom(&mSink, &ops, "ucs2");
+    test_check(w != NULL, "codepoint: open the UCS-2 target");
+    if (w == NULL) {
+        return;
+    }
+    axl_stream_set_encoding(w, AXL_ENC_UCS2_LE);
+    axl_stream_fail_next_write(2);
+    b1    = axl_write(w, "ab", 2);
+    err_b = axl_ferror(w);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(w);
+
+    test_check(b1 == 1, "codepoint: a non-UTF-8 write spends one tick per code point");
+    test_check(mSink.len == 2 && mSink.data[0] == 'a' && mSink.data[1] == 0,
+               "codepoint: only the first code point reached the wire");
+    test_check(err_b == true, "codepoint: the transcode failure is sticky");
+
+    axl_fclose(w);
+}
+
+static void
+test_stream_inject_short_write_transcodes_atomically(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *w;
+    axl_ssize_t  n1, n2;
+    unsigned     calls1;
+    size_t       len1, len2;
+    bool         err2;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    w = axl_stream_open_custom(&mSink, &ops, "ucs2-short");
+    test_check(w != NULL, "atomic: open the UCS-2 short-write target");
+    if (w == NULL) {
+        return;
+    }
+    axl_stream_set_encoding(w, AXL_ENC_UCS2_LE);
+
+    /* A wire code unit is indivisible: half a UCS-2 pair on the wire
+       desynchronises every later unit, so the transcode must finish the unit
+       rather than count a short write as a whole code point emitted. */
+    axl_stream_short_next_write(1, 1);
+    n1     = axl_write(w, "ab", 2);
+    calls1 = mSink.write_calls;
+    len1   = mSink.len;
+    axl_stream_short_next_write(0, 0);
+
+    test_check(n1 == 2, "atomic: a short wire write still accepts both input bytes");
+    test_check(calls1 == 3,
+               "atomic: the shorted unit was finished by a second backend write");
+    test_check(len1 == 4 && mSink.data[0] == 'a' && mSink.data[1] == 0
+               && mSink.data[2] == 'b' && mSink.data[3] == 0,
+               "atomic: no wire byte was dropped");
+
+    /* And a genuine stall is a failure, not a silently vanished code point. */
+    test_sink_reset();
+    axl_stream_short_next_write(1, 0);
+    n2   = axl_write(w, "ab", 2);
+    err2 = axl_ferror(w);
+    len2 = mSink.len;
+    axl_stream_short_next_write(0, 0);
+    axl_clearerr(w);
+
+    test_check(n2 == -1, "atomic: a zero-progress wire write fails rather than drops");
+    test_check(err2 == true, "atomic: and sets the sticky error flag");
+    test_check(len2 == 0, "atomic: with no wire bytes emitted at all");
+
+    axl_fclose(w);
+}
+
+static void
+test_stream_inject_console_costs_one_tick_per_write(void)
+{
+    axl_ssize_t w1, w2;
+
+    /* axl_stdout / axl_stderr are UTF-8 AxlStreams: their UCS-2 conversion
+       happens INSIDE console_write, i.e. BELOW the sink boundary. So a
+       console write costs exactly one tick however long the string is. The
+       per-code-point rule applies to axl_stream_set_encoding, not to these —
+       pinned here because "the console is UCS-2" is the obvious wrong guess.
+       Both payloads end in '\n': these bytes land on the same serial console
+       the harness scrapes PASS/FAIL from, and an unterminated write would
+       glue itself to the front of the next PASS line and lose it. */
+    axl_stream_fail_next_write(2);
+    w1 = axl_write(axl_stderr, "abcd\n", 5);
+    w2 = axl_write(axl_stderr, "\n", 1);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(axl_stderr);
+
+    test_check(w1 == 5, "console: a five-character console write costs one tick");
+    test_check(w2 == -1, "console: so the very next console write is the one that fires");
+}
+
+static void
+test_stream_inject_reaches_the_text_wrapper_source(void)
+{
+    AxlStream  *src;
+    AxlStream  *other;
+    AxlStream  *txt;
+    char        buf[64];
+    axl_ssize_t got, n1, n2;
+    size_t      drained = 0;
+    bool        err1;
+
+    src   = axl_bufopen();
+    other = axl_bufopen();
+    axl_write(src, "plain text\n", 11);
+    axl_fseek(src, 0, AXL_SEEK_SET);
+    axl_write(other, "zz", 2);
+    axl_fseek(other, 0, AXL_SEEK_SET);
+    txt = axl_text_stream_wrap(src);
+    test_check(txt != NULL, "textinject: wrap a buffer source");
+    if (txt == NULL) {
+        axl_fclose(src);
+        axl_fclose(other);
+        return;
+    }
+
+    /* Drain the classifier's pushback so the injected read lands on the
+       SOURCE's backend rather than on already-buffered probe bytes. */
+    while ((got = axl_read(txt, buf, sizeof buf)) > 0) {
+        drained += (size_t)got;
+    }
+    test_check(drained == 11, "textinject: the wrapper delivers the whole source");
+
+    /* n=2: the first tick is the wrapper's own backend read, the second is
+       the source read the wrapper issues from inside it. Both are backend
+       reads, so both must be injected — otherwise the wrapper's source-error
+       branch is unreachable AND the unspent tick ambushes a later stream. */
+    axl_stream_fail_next_read(2);
+    n1   = axl_read(txt, buf, sizeof buf);
+    err1 = axl_ferror(txt);
+    n2   = axl_read(other, buf, sizeof buf);
+    axl_stream_fail_next_read(0);
+
+    test_check(n1 == -1, "textinject: the wrapper's source read is injected too");
+    test_check(err1 == true, "textinject: and the failure is sticky on the wrapper");
+    /* The wrapper issues that source read through the PUBLIC axl_read, so the
+       source records the failure as well -- it does not vanish into a call
+       that reached below the source's own flag handling. */
+    test_check(axl_ferror(src) == true, "textinject: and on the source it failed on");
+    test_check(n2 == 2, "textinject: the tick was spent, not left armed for a later read");
+
+    axl_fclose(txt);
+    axl_fclose(src);
+    axl_fclose(other);
+}
+
+static void
+test_stream_inject_skips_the_tee(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *tee;
+    axl_ssize_t  w1, w2;
+    unsigned     calls1, calls2;
+    int          set_rc;
+
+    test_sink_reset();
+    ops.write = test_sink_write;
+    tee = axl_stream_open_custom(&mSink, &ops, "tee");
+    test_check(tee != NULL, "tee: open a custom stream to tee onto");
+    if (tee == NULL) {
+        return;
+    }
+    set_rc = axl_stream_set_stderr_tee(tee);
+
+    /* n=2. The primary write spends the first tick. If the tee spent the
+       second, the next primary write would succeed — so this pins the
+       exclusion, and the tee's own call counter pins that it still ran. */
+    axl_stream_fail_next_write(2);
+    w1     = axl_write(axl_stderr, "\n", 1);
+    calls1 = mSink.write_calls;
+    w2     = axl_write(axl_stderr, "\n", 1);
+    calls2 = mSink.write_calls;
+    axl_stream_fail_next_write(0);
+    axl_clearerr(axl_stderr);
+    axl_stream_set_stderr_tee(NULL);
+
+    test_check(set_rc == AXL_OK, "tee: installed the custom tee on axl_stderr");
+    test_check(w1 == 1, "tee: the first primary write succeeds");
+    test_check(calls1 == 1, "tee: the tee received those bytes");
+    test_check(w2 == -1,
+               "tee: the tee consumed no tick, so the next primary write fires it");
+    test_check(calls2 == 2, "tee: and the tee still received the second write");
+
+    axl_fclose(tee);
+}
+
+static void
+test_stream_inject_leaves_positional_io_alone(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    axl_ssize_t  p1, w1;
+
+    test_sink_reset();
+    ops.write  = test_sink_write;
+    ops.pwrite = test_sink_pwrite;
+    ops.pread  = test_sink_pread;
+    s = axl_stream_open_custom(&mSink, &ops, "positional");
+    test_check(s != NULL, "positional: open a positional-capable target");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_stream_fail_next_write(1);
+    p1 = axl_pwrite(s, "z", 1, 0);
+    w1 = axl_write(s, "q", 1);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(s);
+
+    test_check(p1 == 1, "positional: axl_pwrite is never injected");
+    test_check(w1 == -1,
+               "positional: the tick was still armed for the sequential write");
+
+    axl_fclose(s);
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 over a short-transferring backend (axl_fread / axl_fwrite).
+//
+// Both are documented "Like fread()/fwrite()", and C's have always looped
+// until the item count is satisfied. Against the built-in backends that was
+// invisible -- none of them short-transfers -- but a custom backend makes a
+// short transfer contractually legal, and a one-shot helper then returns a
+// short item count its caller cannot tell apart from EOF.
+// ---------------------------------------------------------------------------
+
+static void
+test_fread_loops_over_short_reads(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[16];
+    size_t       got;
+    unsigned     calls;
+    bool         eof_after;
+
+    test_sink_reset();
+    axl_memcpy(mSink.data, "abcdefgh", 8);
+    mSink.len   = 8;
+    mSink.chunk = 3;                  /* three bytes per backend read */
+    ops.read = test_sink_read;
+    s = axl_stream_open_custom(&mSink, &ops, "chunked-reader");
+    test_check(s != NULL, "freadloop: open a chunked reader");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_memset(buf, 0, sizeof buf);
+    got       = axl_fread(buf, 1, 8, s);
+    calls     = mSink.read_calls;
+    eof_after = axl_feof(s);
+
+    test_check(got == 8, "freadloop: a short-reading backend still yields every item");
+    test_check(test_memcmp(buf, "abcdefgh", 8) == 0,
+               "freadloop: the bytes arrive intact and in order");
+    test_check(calls == 3, "freadloop: it took three backend reads to get there");
+    test_check(eof_after == false,
+               "freadloop: a fully satisfied request never touches eof");
+
+    axl_fclose(s);
+}
+
+static void
+test_fread_returns_complete_items_only(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[32];
+    size_t       got;
+    unsigned     calls;
+    bool         eof_after, err_after;
+
+    /* 13 bytes behind a 5-byte chunk, read as 4-byte items: three complete
+       items and a one-byte tail. C counts the complete items only. */
+    test_sink_reset();
+    axl_memcpy(mSink.data, "0123456789abc", 13);
+    mSink.len   = 13;
+    mSink.chunk = 5;
+    ops.read = test_sink_read;
+    s = axl_stream_open_custom(&mSink, &ops, "partial-item");
+    test_check(s != NULL, "freaditem: open a chunked reader");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_memset(buf, 0, sizeof buf);
+    got       = axl_fread(buf, 4, 4, s);     /* 16 bytes wanted, 13 available */
+    calls     = mSink.read_calls;
+    eof_after = axl_feof(s);
+    err_after = axl_ferror(s);
+
+    test_check(got == 3, "freaditem: a partial trailing item is not counted");
+    test_check(test_memcmp(buf, "0123456789ab", 12) == 0,
+               "freaditem: the three complete items are intact");
+    test_check(buf[12] == 'c' && buf[13] == 0,
+               "freaditem: the uncounted tail byte is still delivered, C-style");
+    test_check(calls == 4, "freaditem: 5 + 5 + 3 bytes, then the 0 that ends it");
+    test_check(eof_after == true, "freaditem: the ending 0-read sets eof");
+    test_check(err_after == false, "freaditem: and running out is not an error");
+
+    axl_fclose(s);
+}
+
+static void
+test_fread_stops_on_a_backend_error(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[16];
+    size_t       got;
+    unsigned     calls;
+    bool         err_after;
+
+    test_sink_reset();
+    axl_memcpy(mSink.data, "abcdefgh", 8);
+    mSink.len   = 8;
+    mSink.chunk = 3;
+    ops.read = test_sink_read;
+    s = axl_stream_open_custom(&mSink, &ops, "failing-reader");
+    test_check(s != NULL, "freaderr: open a chunked reader");
+    if (s == NULL) {
+        return;
+    }
+
+    /* Two backend reads land 6 bytes, the third fails. Three complete
+       2-byte items survive; the error is on the sticky flag, which is what
+       tells the caller this short count was not EOF. */
+    axl_memset(buf, 0, sizeof buf);
+    axl_stream_fail_next_read(3);
+    got       = axl_fread(buf, 2, 4, s);
+    calls     = mSink.read_calls;
+    err_after = axl_ferror(s);
+    axl_stream_fail_next_read(0);
+    axl_clearerr(s);
+
+    test_check(got == 3, "freaderr: the items read before the error are kept");
+    test_check(test_memcmp(buf, "abcdef", 6) == 0, "freaderr: and their bytes are intact");
+    test_check(calls == 2, "freaderr: the failed read never reached the backend");
+    test_check(err_after == true,
+               "freaderr: the sticky error flag distinguishes this from EOF");
+
+    axl_fclose(s);
+}
+
+static void
+test_fwrite_loops_over_short_writes(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    size_t       got;
+    unsigned     calls;
+    bool         err_after;
+
+    test_sink_reset();
+    mSink.chunk = 3;                  /* three bytes per backend write */
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "chunked-writer");
+    test_check(s != NULL, "fwriteloop: open a chunked writer");
+    if (s == NULL) {
+        return;
+    }
+
+    got       = axl_fwrite("abcdefgh", 1, 8, s);
+    calls     = mSink.write_calls;
+    err_after = axl_ferror(s);
+
+    test_check(got == 8, "fwriteloop: a short-accepting backend still takes every item");
+    test_check(mSink.len == 8 && test_memcmp(mSink.data, "abcdefgh", 8) == 0,
+               "fwriteloop: every byte reached the sink, in order");
+    test_check(calls == 3, "fwriteloop: it took three backend writes to get there");
+    test_check(err_after == false, "fwriteloop: a short write is not an error");
+
+    axl_fclose(s);
+}
+
+static void
+test_fwrite_stops_when_the_sink_accepts_nothing(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    size_t       got;
+    unsigned     calls;
+    bool         err_after;
+
+    /* Room for exactly five more bytes, handed over two at a time: 2, 2, 1,
+       then 0. A 0 is a legal "accepted nothing" (see AxlStreamOps), NOT an
+       error -- and with no way to wait for the sink to drain, retrying it
+       would only spin. So the first 0 ends the loop and the caller gets a
+       short item count with axl_ferror() still false. */
+    test_sink_reset();
+    mSink.len   = sizeof mSink.data - 5;
+    mSink.chunk = 2;
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "stalling-writer");
+    test_check(s != NULL, "fwritestall: open a nearly-full writer");
+    if (s == NULL) {
+        return;
+    }
+
+    got       = axl_fwrite("abcdefgh", 2, 4, s);
+    calls     = mSink.write_calls;
+    err_after = axl_ferror(s);
+
+    test_check(got == 2, "fwritestall: the complete items the sink took are reported");
+    test_check(calls == 4, "fwritestall: 2 + 2 + 1 bytes, then the 0 that ends it");
+    test_check(err_after == false,
+               "fwritestall: a stalled sink is a short count, not an error");
+    test_check(mSink.len == sizeof mSink.data
+               && test_memcmp(mSink.data + sizeof mSink.data - 5, "abcde", 5) == 0,
+               "fwritestall: the accepted bytes are contiguous and in order");
+
+    axl_fclose(s);
+}
+
+static void
+test_fwrite_does_not_retry_a_stalled_sink(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    size_t       got;
+    unsigned     calls;
+
+    /* A sink with no room at all returns 0 forever. The loop must ask once
+       and give up: this test not finishing IS the failure. */
+    test_sink_reset();
+    mSink.len = sizeof mSink.data;
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "full-writer");
+    test_check(s != NULL, "fwriteretry: open a full writer");
+    if (s == NULL) {
+        return;
+    }
+
+    got   = axl_fwrite("ab", 1, 2, s);
+    calls = mSink.write_calls;
+
+    test_check(got == 0, "fwriteretry: a sink that takes nothing yields no items");
+    test_check(calls == 1, "fwriteretry: the loop asked exactly once and stopped");
+
+    axl_fclose(s);
+}
+
+static void
+test_fwrite_stops_on_a_backend_error(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    size_t       got;
+    unsigned     calls;
+    bool         err_after;
+
+    test_sink_reset();
+    mSink.chunk = 2;
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "failing-writer");
+    test_check(s != NULL, "fwriteerr: open a chunked writer");
+    if (s == NULL) {
+        return;
+    }
+
+    axl_stream_fail_next_write(3);
+    got       = axl_fwrite("abcdefgh", 2, 4, s);
+    calls     = mSink.write_calls;
+    err_after = axl_ferror(s);
+    axl_stream_fail_next_write(0);
+    axl_clearerr(s);
+
+    test_check(got == 2, "fwriteerr: the items written before the error are reported");
+    test_check(calls == 2, "fwriteerr: the failed write never reached the backend");
+    test_check(mSink.len == 4 && test_memcmp(mSink.data, "abcd", 4) == 0,
+               "fwriteerr: and only the accepted bytes reached the sink");
+    test_check(err_after == true, "fwriteerr: the failure is on the sticky flag");
+
+    axl_fclose(s);
+}
+
+static void
+test_fread_fwrite_reject_an_overflowing_request(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         big[256];
+    size_t       huge = (SIZE_MAX / 2) + 1;   /* huge * 3 wraps */
+    size_t       got_r, got_w;
+    unsigned     reads, writes;
+
+    test_sink_reset();
+    axl_memset(big, 'x', sizeof big);
+    axl_memcpy(mSink.data, "abcdefgh", 8);
+    mSink.len = 8;
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "overflow");
+    test_check(s != NULL, "fovf: open a read/write target");
+    if (s == NULL) {
+        return;
+    }
+
+    /* size * count is the loop bound AND the byte count handed to the
+       backend. Wrapped, it bears no relation to the caller's buffer, so the
+       request is refused outright rather than serviced at the wrong size. */
+    got_r  = axl_fread(big, huge, 3, s);
+    reads  = mSink.read_calls;
+    got_w  = axl_fwrite(big, huge, 3, s);
+    writes = mSink.write_calls;
+
+    test_check(got_r == 0, "fovf: an overflowing fread reads nothing");
+    test_check(reads == 0, "fovf: and never reaches the backend");
+    test_check(got_w == 0, "fovf: an overflowing fwrite writes nothing");
+    test_check(writes == 0, "fovf: and never reaches the backend either");
+
+    axl_fclose(s);
+}
+
+// ---------------------------------------------------------------------------
+// Positional I/O and the sticky flags.
+// ---------------------------------------------------------------------------
+
+static void
+test_positional_io_sets_the_error_flag(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[8];
+    axl_ssize_t  ok_r, zero_r, ok_w, bad_w, bad_r;
+    bool         err_ok, eof_zero, err_zero, err_bad_w, err_bad_r;
+
+    test_sink_reset();
+    axl_memcpy(mSink.data, "hello", 5);
+    mSink.len  = 5;
+    ops.read   = test_sink_read;
+    ops.pread  = test_sink_pread;
+    ops.pwrite = test_sink_pwrite;
+    s = axl_stream_open_custom(&mSink, &ops, "positional-flags");
+    test_check(s != NULL, "pflags: open a positional target");
+    if (s == NULL) {
+        return;
+    }
+
+    ok_r   = axl_pread(s, buf, 5, 0);
+    ok_w   = axl_pwrite(s, "Z", 1, 0);
+    err_ok = axl_ferror(s);
+    test_check(ok_r == 5, "pflags: a positional read succeeds");
+    test_check(ok_w == 1, "pflags: a positional write succeeds");
+    test_check(err_ok == false, "pflags: neither sets the error flag when it works");
+
+    /* A 0-length pread deliberately does NOT set eof. Positional I/O has no
+       stream position, so "the stream is at end" is not what reading nothing
+       at some offset means -- and axl_read()'s next call is unaffected by it. */
+    zero_r   = axl_pread(s, buf, 5, 99);
+    eof_zero = axl_feof(s);
+    err_zero = axl_ferror(s);
+    test_check(zero_r == 0, "pflags: a pread past the end reads nothing");
+    test_check(eof_zero == false, "pflags: ... and deliberately does not set eof");
+    test_check(err_zero == false, "pflags: ... nor the error flag");
+
+    bad_w     = axl_pwrite(s, "z", 1, sizeof mSink.data);
+    err_bad_w = axl_ferror(s);
+    axl_clearerr(s);
+    test_check(bad_w == -1, "pflags: a pwrite the backend refuses returns -1");
+    test_check(err_bad_w == true, "pflags: ... and sets the sticky error flag");
+
+    axl_fclose(s);
+
+    ops.pread = test_sink_pread_fail;
+    s = axl_stream_open_custom(&mSink, &ops, "failing-pread");
+    test_check(s != NULL, "pflags: open a failing-pread target");
+    if (s == NULL) {
+        return;
+    }
+    bad_r     = axl_pread(s, buf, 4, 0);
+    err_bad_r = axl_ferror(s);
+    axl_clearerr(s);
+    test_check(bad_r == -1, "pflags: a pread the backend refuses returns -1");
+    test_check(err_bad_r == true, "pflags: ... and sets the sticky error flag");
+
+    axl_fclose(s);
+}
+
+// ---------------------------------------------------------------------------
+// axl_stream_init as the ground-state re-establisher for the five statics.
+//
+// The five console streams live in .data, so every piece of mutable state a
+// caller leaves on one outlives that caller -- for the whole image, and in a
+// resident driver for every later dispatch. axl_stream_init only re-pointed
+// the globals; it now resets what it publishes, with the SAME helper axl_fclose
+// uses so there is exactly one notion of "ground state".
+// ---------------------------------------------------------------------------
+
+static void
+test_stream_init_resets_the_static_streams(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *stdin_before = axl_stdin;
+    AxlStream   *tee;
+    AxlStream   *txt_before;
+    AxlStream   *txt_after;
+    unsigned     calls_buffered, calls_after_init, calls_detached;
+    size_t       len_after_init;
+
+    /* The failure this exists for. axl_text_stream_wrap refuses a source that
+       already decodes, so a decoder left on axl_stdin by a tool that died
+       before restoring it makes axl_stdin_text() return NULL permanently.
+       Done FIRST, before the tee below: the refusal logs at debug level, and
+       that log line goes to axl_stderr. */
+    axl_stream_set_encoding(axl_stdin, AXL_ENC_UCS2_LE);
+    txt_before = axl_stdin_text();
+    test_check(txt_before == NULL,
+               "streaminit: a decoder left on axl_stdin breaks axl_stdin_text");
+    axl_fclose(txt_before);   /* NULL-safe; only reached if the refusal broke */
+
+    /* The rest of the state a departing caller can leave behind: pending
+       buffered output, a tee, and the interactive mark. One init must clear
+       all of them -- and must DRAIN the pending bytes rather than drop them,
+       which is what a custom-backend tee makes observable from out here. */
+    test_sink_reset();
+    ops.write = test_sink_write;
+    tee = axl_stream_open_custom(&mSink, &ops, "init-tee");
+    test_check(tee != NULL, "streaminit: open a tee to observe through");
+    if (tee == NULL) {
+        return;
+    }
+    axl_stream_set_stderr_tee(tee);
+    axl_stream_set_buffering(axl_stderr, AXL_STREAM_BUF_FULL, 64);
+    axl_stream_set_interactive(axl_stdin, true);
+    axl_write(axl_stderr, "buffered\n", 9);
+    calls_buffered = mSink.write_calls;
+
+    axl_stream_init();
+
+    calls_after_init = mSink.write_calls;
+    len_after_init   = mSink.len;
+    /* The tee is gone, so this write reaches the console only -- which is what
+       stops a static outliving the tee stream closed at the end. */
+    axl_write(axl_stderr, "\n", 1);
+    calls_detached = mSink.write_calls;
+
+    test_check(calls_buffered == 0,
+               "streaminit: the buffered write reached no backend");
+    test_check(calls_after_init == 1,
+               "streaminit: axl_stream_init drained it rather than dropping it");
+    test_check(len_after_init == 9
+               && test_memcmp(mSink.data, "buffered\n", 9) == 0,
+               "streaminit: ... with the bytes intact");
+    test_check(calls_detached == 1, "streaminit: ... and dropped the tee");
+    test_check(axl_stream_get_buffering(axl_stderr) == AXL_STREAM_BUF_NONE,
+               "streaminit: ... and left axl_stderr unbuffered");
+    test_check(axl_stream_get_encoding(axl_stdin) == AXL_ENC_UTF8,
+               "streaminit: ... and axl_stdin back at UTF-8");
+    test_check(axl_stream_get_interactive(axl_stdin) == false,
+               "streaminit: ... and its interactive mark cleared");
+    test_check(axl_stdin == stdin_before,
+               "streaminit: the globals still point at the same statics");
+
+    /* And the whole point: the wrapper works again.
+
+       The set_interactive here is a harness guard, not part of the contract
+       under test. Construction classifies a non-interactive source by reading
+       a probe from it, and under the test harness axl_stdin may be the console
+       pseudo-file -- a blocking read there would wedge this binary and every
+       later one in the same boot. The refusal above is checked BEFORE that
+       short-circuit and uniformly for interactive sources, so suppressing the
+       probe costs the assertion nothing. */
+    axl_stream_set_interactive(axl_stdin, true);
+    txt_after = axl_stdin_text();
+    test_check(txt_after != NULL,
+               "streaminit: ... so axl_stdin_text works again after a re-init");
+    axl_fclose(txt_after);
+    axl_stream_set_interactive(axl_stdin, false);
+
+    /* Unhook explicitly rather than trusting the behaviour under test: if the
+       reset ever regresses, the tee would otherwise be freed while axl_stderr
+       still points at it and every LATER test in this binary would fail for a
+       reason that has nothing to do with itself. */
+    axl_stream_set_stderr_tee(NULL);
+    axl_stream_set_buffering(axl_stderr, AXL_STREAM_BUF_NONE, 0);
+    axl_fclose(tee);
+}
+
+// ---------------------------------------------------------------------------
+// axl_fclose on the five static console streams.
+//
+// Registered LAST on purpose: before the guard existed this handed a .data
+// address to axl_free(), and the firmware's reaction to that is not something
+// the tests after it should have to survive.
+// ---------------------------------------------------------------------------
+
+static void
+test_fclose_leaves_the_static_streams_usable(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *tee;
+    axl_ssize_t  w_after;
+    unsigned     calls_buffered, calls_after_close;
+    unsigned     calls_detached, calls_reattached;
+    size_t       len_after_close;
+    int          set_rc;
+
+    /* axl_stdout lives in .data, so freeing it would corrupt the heap -- and
+       axl_stream_init() hands the same pointer out again, so it has to stay
+       usable. The payload is a bare newline: these bytes land on the serial
+       console the harness scrapes PASS/FAIL from. Closing twice because
+       "close it unconditionally" implies closing it idempotently. */
+    axl_fclose(axl_stdout);
+    axl_fclose(axl_stdout);
+    w_after = axl_write(axl_stdout, "\n", 1);
+    test_check(w_after == 1, "fclosestatic: axl_stdout still writes after two fcloses");
+    test_check(axl_strcmp(axl_stream_name(axl_stdout), "stdout") == 0,
+               "fclosestatic: ... and is still itself");
+
+    /* The other three, including the only static with a read side. */
+    axl_fclose(axl_stdin);
+    axl_fclose(axl_stdout_raw);
+    axl_fclose(axl_stderr_raw);
+    test_check(axl_stream_can_read(axl_stdin) == true,
+               "fclosestatic: axl_stdin can still read after fclose");
+    test_check(axl_strcmp(axl_stream_name(axl_stdin), "stdin") == 0,
+               "fclosestatic: ... and is still itself");
+    test_check(axl_stream_can_write(axl_stdout_raw) == true
+               && axl_stream_can_write(axl_stderr_raw) == true,
+               "fclosestatic: both raw console statics can still write");
+
+    /* The buffered case is the one with teeth: fclose frees wbuf, so a static
+       left in LINE/FULL mode would write through a freed buffer next time.
+       A custom-backend tee counts the backend writes, which is how the reset
+       is observable at all from outside. */
+    test_sink_reset();
+    ops.write = test_sink_write;
+    tee = axl_stream_open_custom(&mSink, &ops, "fclose-tee");
+    test_check(tee != NULL, "fclosestatic: open a tee to observe through");
+    if (tee == NULL) {
+        return;
+    }
+    set_rc = axl_stream_set_stderr_tee(tee);
+    axl_stream_set_buffering(axl_stderr, AXL_STREAM_BUF_FULL, 64);
+    axl_write(axl_stderr, "buffered\n", 9);
+    calls_buffered    = mSink.write_calls;
+    axl_fclose(axl_stderr);
+    calls_after_close = mSink.write_calls;
+    len_after_close   = mSink.len;
+    /* The close dropped the tee, so this write reaches the console only --
+       which is what stops axl_stderr outliving the tee stream closed below. */
+    w_after           = axl_write(axl_stderr, "\n", 1);
+    calls_detached    = mSink.write_calls;
+    /* Re-attach and write again: the tee sees it IMMEDIATELY, which is how
+       "the stream came back unbuffered" is visible (a stream still in FULL
+       mode would hold this byte until a flush). */
+    axl_stream_set_stderr_tee(tee);
+    axl_write(axl_stderr, "\n", 1);
+    calls_reattached  = mSink.write_calls;
+    axl_stream_set_stderr_tee(NULL);
+
+    test_check(set_rc == AXL_OK, "fclosestatic: installed the tee on axl_stderr");
+    test_check(calls_buffered == 0, "fclosestatic: the buffered write reached no backend");
+    test_check(calls_after_close == 1, "fclosestatic: fclose drained it");
+    test_check(len_after_close == 9 && test_memcmp(mSink.data, "buffered\n", 9) == 0,
+               "fclosestatic: ... with the bytes intact");
+    test_check(w_after == 1, "fclosestatic: axl_stderr still writes afterwards");
+    test_check(calls_detached == 1, "fclosestatic: ... but the tee was dropped by the close");
+    test_check(calls_reattached == 2,
+               "fclosestatic: ... and it came back unbuffered, so a re-attached tee sees the write");
+
+    axl_fclose(tee);
+}
+
+static void
+test_fclose_frees_a_heap_stream(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlMemStats  before, after;
+    AxlStream   *s;
+
+    /* The inverse of the guard above: a heap stream must still be FREED. If
+       a future constructor forgot to route through axl_stream_new, on_heap
+       would be false and axl_fclose would silently leak the stream plus its
+       name copy -- invisible to every other assertion here. */
+    test_sink_reset();
+    ops.write = test_sink_write;
+    ops.close = test_sink_close;
+    axl_mem_get_stats(&before);
+    s = axl_stream_open_custom(&mSink, &ops, "leak-check");
+    test_check(s != NULL, "fcloseheap: open a custom stream");
+    if (s == NULL) {
+        return;
+    }
+    axl_fclose(s);
+    axl_mem_get_stats(&after);
+
+    test_check(after.count == before.count,
+               "fcloseheap: fclose returns the allocation count to its baseline");
+    test_check(after.bytes == before.bytes,
+               "fcloseheap: ... and the allocated bytes with it");
+    test_check(mSink.close_calls == 1, "fcloseheap: the backend close still ran");
+}
+
+static void
+test_fread_fwrite_zero_sized_requests(void)
+{
+    AxlStreamOps ops = test_ops_empty();
+    AxlStream   *s;
+    char         buf[8];
+    size_t       r_zero_size, r_zero_count, w_zero_size, w_zero_count;
+    unsigned     calls;
+
+    test_sink_reset();
+    axl_memcpy(mSink.data, "hello", 5);
+    mSink.len = 5;
+    ops.read  = test_sink_read;
+    ops.write = test_sink_write;
+    s = axl_stream_open_custom(&mSink, &ops, "zero-request");
+    test_check(s != NULL, "fzero: open a read/write target");
+    if (s == NULL) {
+        return;
+    }
+
+    r_zero_size  = axl_fread(buf, 0, 4, s);
+    r_zero_count = axl_fread(buf, 4, 0, s);
+    w_zero_size  = axl_fwrite("x", 0, 4, s);
+    w_zero_count = axl_fwrite("x", 4, 0, s);
+    calls        = mSink.read_calls + mSink.write_calls;
+
+    test_check(r_zero_size == 0 && r_zero_count == 0,
+               "fzero: a zero size or count reads no items");
+    test_check(w_zero_size == 0 && w_zero_count == 0,
+               "fzero: a zero size or count writes no items");
+    test_check(calls == 0, "fzero: and none of them reaches the backend");
+
+    axl_fclose(s);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2464,6 +4957,8 @@ test_io_main(int argc, char **argv)
 
     test_console();
     test_buffer();
+    test_buffer_stream_ownership();
+    test_migrated_stream_ownership();
     test_file();
     test_file_writer();
     test_file_write_atomic();
@@ -2485,6 +4980,7 @@ test_io_main(int argc, char **argv)
     test_encoding_default_passthrough();
     test_encoding_invalid_arg();
     test_encoding_roundtrips();
+    test_encoding_surrogate_policy();
     test_encoding_ascii_high_byte_replaced();
     test_encoding_ascii_high_byte_read();
     test_encoding_tiny_buffer_drains_leftovers();
@@ -2494,6 +4990,9 @@ test_io_main(int argc, char **argv)
     test_encoding_set_clears_pending();
     test_fseek_clears_pending();
     test_text_stream_wrap_write_only_src();
+    test_text_stream_wrap_owns_the_decode();
+    test_text_stream_wrap_conflict_drains_leftovers();
+    test_text_stream_wrap_marks_its_source();
     test_readline_max();
     test_line_reader();
     test_walk_lines();
@@ -2503,6 +5002,42 @@ test_io_main(int argc, char **argv)
     test_stream_buffering();
     test_stream_buffering_fclose_flush();
     test_stream_interactive_flag();
+    test_stream_custom_roundtrip();
+    test_stream_custom_capabilities();
+    test_stream_custom_rejects_bad_ops();
+    test_stream_ctx_roundtrip();
+    test_stream_ctx_docstring_idiom();
+    test_stream_ctx_refuses_mismatched_ops();
+    test_stream_ctx_rejects_bad_args();
+    test_stream_ctx_refuses_builtins();
+    test_stream_ctx_null_context();
+    test_buffer_accessors_reject_foreign_streams();
+    test_stream_name();
+    test_stream_inject_write_failure();
+    test_stream_inject_short_write();
+    test_stream_inject_short_write_buffered();
+    test_stream_inject_read_failure();
+    test_stream_inject_flush_failure();
+    test_stream_inject_buffering_defers_the_tick();
+    test_stream_inject_counts_per_code_point();
+    test_stream_inject_short_write_transcodes_atomically();
+    test_stream_inject_console_costs_one_tick_per_write();
+    test_stream_inject_reaches_the_text_wrapper_source();
+    test_stream_inject_skips_the_tee();
+    test_stream_inject_leaves_positional_io_alone();
+    test_fread_loops_over_short_reads();
+    test_fread_returns_complete_items_only();
+    test_fread_stops_on_a_backend_error();
+    test_fwrite_loops_over_short_writes();
+    test_fwrite_stops_when_the_sink_accepts_nothing();
+    test_fwrite_does_not_retry_a_stalled_sink();
+    test_fwrite_stops_on_a_backend_error();
+    test_fread_fwrite_reject_an_overflowing_request();
+    test_fread_fwrite_zero_sized_requests();
+    test_positional_io_sets_the_error_flag();
+    test_stream_init_resets_the_static_streams();
+    test_fclose_frees_a_heap_stream();
+    test_fclose_leaves_the_static_streams_usable();
 
     return test_print_results();
 }

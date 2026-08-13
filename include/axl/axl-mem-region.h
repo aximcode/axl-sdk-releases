@@ -390,6 +390,77 @@ axl_io_write_range(
     uint32_t     access_width   ///< per-access width: 1, 2, or 4
 );
 
+// ---------------------------------------------------------------------------
+// Raw firmware memory map
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief One firmware memory-map descriptor, exactly as reported.
+ *
+ * The UNCOOKED sibling of @ref AxlMemRegion. That type is a *classified*
+ * view — adjacent same-class regions coalesced, the firmware's memory
+ * type folded into five buckets — which is right for deciding "may I
+ * touch this address" and wrong for inventory: the fold is lossy, and
+ * `EfiConventionalMemory`, `EfiLoaderData` and `EfiBootServicesData` all
+ * land in @ref AXL_MEM_REGION_RAM, so a per-type roll-up cannot be
+ * recovered from it.
+ *
+ * Nothing here is coalesced, reclassified, or pre-decoded: @a type is
+ * the raw EFI memory type number and @a attribute the raw
+ * `EFI_MEMORY_*` bitmask, so a caller rendering its own flag list gets
+ * the bits the firmware actually set.
+ */
+typedef struct {
+    uint32_t  type;             ///< raw EFI memory type number
+    uint64_t  physical_start;   ///< first byte of the region
+    uint64_t  number_of_pages;  ///< length in 4 KiB pages
+    uint64_t  attribute;        ///< raw EFI_MEMORY_* bitmask
+} AxlMemMapEntry;
+
+/**
+ * @brief Snapshot the firmware memory map, uncoalesced.
+ *
+ * One entry per descriptor the firmware reports, in the order it
+ * reports them. Release the whole result with a single axl_free() on
+ * @p entries. On failure @p entries is set to NULL and @p count to 0,
+ * so a caller that frees unconditionally is safe.
+ *
+ * @par Self-consistency
+ * The array is internally consistent — it comes from a single
+ * `GetMemoryMap` call — but it is a point-in-time copy that may be
+ * stale the moment it returns, because taking it allocates and
+ * allocation perturbs the map. Treat it as a report, not a lock.
+ *
+ * @return AXL_OK on success; AXL_INVALID if @p entries or @p count is
+ *     NULL; AXL_NO_RESOURCES if the result could not be allocated;
+ *     AXL_ERR if the firmware query failed.
+ */
+int
+axl_memmap_snapshot(
+    AxlMemMapEntry **entries,  ///< [out] receives the array (non-NULL)
+    size_t          *count     ///< [out] receives the element count (non-NULL)
+);
+
+/**
+ * @brief Stable name for a raw EFI memory type.
+ *
+ * The UEFI enumerator without its `Efi` prefix — `EfiConventionalMemory`
+ * renders as `"ConventionalMemory"`, `EfiACPIMemoryNVS` as
+ * `"ACPIMemoryNVS"`. Exported so every consumer spells these the same
+ * way; the alternative is each one reimplementing the switch and
+ * disagreeing about the awkward ones.
+ *
+ * Never returns NULL. A type outside the spec's range — firmware is
+ * permitted to define OEM types from 0x70000000 — renders as
+ * `"Unknown"` rather than reading off the end of a table.
+ *
+ * @return a static, never-NULL name for @p type.
+ */
+const char *
+axl_memmap_type_name(
+    uint32_t type   ///< raw EFI memory type number
+);
+
 #ifdef __cplusplus
 }
 #endif

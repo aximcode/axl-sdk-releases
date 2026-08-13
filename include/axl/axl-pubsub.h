@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-pubsub.h:
+/** @file axl-pubsub.h
  *
  * Publish/subscribe event bus with deferred delivery, owned by
  * the event loop.
@@ -28,6 +27,8 @@
 #ifndef AXL_PUBSUB_H
 #define AXL_PUBSUB_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -46,7 +47,7 @@ typedef struct AxlLoop AxlLoop;
 typedef void (*AxlPubsubCallback)(
     void *event_data, ///< data from axl_pubsub_publish (may be NULL)
     void *user_data   ///< opaque data from axl_pubsub_subscribe
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Explicitly register a named topic.

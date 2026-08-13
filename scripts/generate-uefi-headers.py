@@ -966,6 +966,15 @@ axl_efi_guid_equal(const EFI_GUID *a, const EFI_GUID *b)
 # Header file wrapper
 # ===================================================================
 
+# Applications must not reach EDK2 by including a generated header directly;
+# see include/uefi/axl-uefi.h for who is granted AXL_ALLOW_UEFI and why.
+_UEFI_APP_GUARD = """#if !defined(AXL_ALLOW_UEFI)
+#  error "<uefi/...> is not available to applications. Use the axl_* API; \
+build a driver with `axl-cc --type driver` (CMake: axl_add_driver), or pass \
+`--allow-uefi` (CMake: ALLOW_UEFI) to opt in deliberately."
+#endif"""
+
+
 def header_wrap(name: str, content: str, includes: list[str] | None = None,
                 description: str = "") -> str:
     guard = f"AXL_UEFI_GEN_{name.upper().replace('-', '_').replace('.', '_')}"
@@ -1400,6 +1409,12 @@ def main() -> int:
         all_lines.append(f'#include "{hdr}"')
     all_lines.append('#include "guids.h"')
     all_lines.append("")
+
+    # The umbrella carries the same application guard as the hand-written
+    # <uefi/axl-uefi.h>. Emitted HERE rather than hand-edited into all.h,
+    # because all.h is regenerated from spec HTML and a manual edit would be
+    # silently lost on the next run -- taking the guard with it.
+    all_lines = [_UEFI_APP_GUARD, ""] + all_lines
 
     (output_dir / "all.h").write_text(
         header_wrap("all.h", "\n".join(all_lines),

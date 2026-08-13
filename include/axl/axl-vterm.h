@@ -122,6 +122,12 @@ axl_vterm_free(
  * returns — call @ref axl_vterm_flush at a repaint boundary to force the tail run
  * out. No-op if @p v or @p bytes is NULL.
  *
+ * @p bytes is untrusted input and need not be well-formed UTF-8. What reaches
+ * @ref AxlConsoleOps::output_text always is: ill-formed input becomes U+FFFD
+ * REPLACEMENT CHARACTER, including the over-range codepoints (above U+10FFFF)
+ * that libvterm's own decoder passes through. A consumer never has to defend
+ * against a surrogate or an over-long sequence arriving in a run.
+ *
  * @param v     handle.
  * @param bytes terminal bytes (xterm/VT); need not be NUL-terminated.
  * @param len   number of bytes.

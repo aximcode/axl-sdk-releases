@@ -225,9 +225,7 @@ test_scram(void)
                                      axl_strlen(RFC_CLIENT_FIRST),
                                      sf3, sizeof sf3, &st3);
     if (rrc != AXL_OK) {
-        axl_printf("SKIP: axl_scram_server_first (no EFI_RNG_PROTOCOL)\n");
-        test_check(true, "scram: public server_first SKIP balance");
-        test_check(true, "scram: public server_first SKIP balance");
+        test_skip_n(2, "axl_scram_server_first (no EFI_RNG_PROTOCOL)");
     } else {
         /* Client nonce preserved, then a fresh 24-char server nonce. */
         test_check(axl_strncmp(sf3, "r=" RFC_CLIENT_NONCE, 2 + 20) == 0,
@@ -284,9 +282,7 @@ test_scram_client(void)
     char cf[AXL_SCRAM_MAX_MESSAGE];
     int r1 = axl_scram_client_first("user", cf, sizeof cf, &rc_cs);
     if (r1 != AXL_OK) {
-        axl_printf("SKIP: scram round-trip (no EFI_RNG_PROTOCOL)\n");
-        test_check(true, "scram client: round-trip SKIP balance");
-        test_check(true, "scram client: round-trip SKIP balance");
+        test_skip_n(2, "scram round-trip (no EFI_RNG_PROTOCOL)");
         return;
     }
 

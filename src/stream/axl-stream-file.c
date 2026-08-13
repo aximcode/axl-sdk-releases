@@ -17,7 +17,6 @@
 #include <axl/axl-runtime.h>
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
-#include "axl-stream-internal.h"
 #include "../fs/axl-file-gen.h"
 AXL_LOG_DOMAIN("stream");
 
@@ -207,9 +206,31 @@ file_close(void *ctx)
 // Constructor
 // ---------------------------------------------------------------------------
 
+/* The file backend's operations. Built here rather than assigned inline so
+   the block stays driven by AXL_STREAM_OPS_INIT — a slot added to
+   AxlStreamOps starts out NULL rather than uninitialised, whatever the
+   struct grows into. There is only one caller today; the buffer backend's
+   twin has two, because a stream-keyed accessor has to name the same set. */
+static AxlStreamOps
+file_ops(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    ops.read   = file_read;
+    ops.write  = file_write;
+    ops.pread  = file_pread;
+    ops.pwrite = file_pwrite;
+    ops.seek   = file_seek;
+    ops.tell   = file_tell;
+    ops.flush  = file_flush;
+    ops.close  = file_close;
+    return ops;
+}
+
 AxlStream *
 axl_fopen(const char *path, const char *mode)
 {
+    AxlStreamOps ops = file_ops();
     unsigned short *wide_path;
     AxlFileHandle handle;
     uint64_t open_mode;
@@ -269,23 +290,15 @@ axl_fopen(const char *path, const char *mode)
         axl_backend_file_set_position(handle, 0xFFFFFFFFFFFFFFFFULL);
     }
 
-    s = axl_stream_new();
+    s = axl_stream_open_custom(f, &ops, "file");
     if (s == NULL) {
+        /* A refused open never calls `close`, so the context is still ours
+           to release — the same contract a consumer gets. file_close IS that
+           release and nothing more (shut the handle, free the struct), so
+           calling it directly cannot drift from what close does. */
         axl_warning("allocation failed");
-        axl_backend_file_close(&handle);
-        axl_free(f);
+        file_close(f);
         return NULL;
     }
-
-    s->ctx    = f;
-    s->read   = file_read;
-    s->write  = file_write;
-    s->pread  = file_pread;
-    s->pwrite = file_pwrite;
-    s->seek   = file_seek;
-    s->tell   = file_tell;
-    s->flush  = file_flush;
-    s->close  = file_close;
-
     return s;
 }

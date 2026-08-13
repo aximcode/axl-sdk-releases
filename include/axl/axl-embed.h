@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-embed.h:
+/** @file axl-embed.h
  *
  * Helper macros for declaring and using arbitrary binary blobs
  * embedded into a UEFI image at link time. The framework is

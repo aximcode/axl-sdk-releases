@@ -7,8 +7,9 @@ Headers:
 
 - `<axl/axl-sys.h>` — System operations (reset, GUID, device map refresh)
 - `<axl/axl-env.h>` — Environment variables and working directory
-- `<axl/axl-time.h>` — Wall-clock time (read + set the RTC) and monotonic timestamps
+- `<axl/axl-time.h>` — Wall-clock time (read + set the RTC), the RTC wake alarm, and monotonic timestamps
 - `<axl/axl-nvstore.h>` — Portable NVRAM key-value storage
+- `<axl/axl-var.h>` — Unscoped UEFI variable inspection (read-only, every vendor GUID)
 - `<axl/axl-boot.h>` — Boot-option management (Boot####/BootOrder/BootNext/BootCurrent)
 - `<axl/axl-io-port.h>` — x86 I/O port access (`in`/`out`)
 - `<axl/axl-driver.h>` — Driver binding and lifecycle
@@ -97,6 +98,40 @@ if (axl_nvstore_get_alloc("global", "PlatformLang", &buf, &sz) == 0) {
 allow 0-byte values, succeeds with `sz == 0` and a 1-byte NUL
 allocation; UEFI's `SetVariable(size=0)` means "delete" so the
 empty path doesn't surface there).
+
+### AxlNvStore vs AxlVar — which one you want
+
+These look adjacent and are not interchangeable. The difference is
+which direction the vendor GUID flows:
+
+| | `axl_nvstore_iter()` | `axl_var_enumerate()` |
+|---|---|---|
+| scope | ONE namespace | every variable on the box |
+| vendor GUID | an **input** — must be registered first | an **output**, discovered by the walk |
+| writes | yes (`axl_nvstore_set`) | none, by design |
+
+Reach for `<axl/axl-nvstore.h>` to read or write settings you already
+know the name and namespace of. Reach for `<axl/axl-var.h>` to
+inventory what a machine actually carries — boot order, Secure Boot
+state, OEM configuration — without knowing the GUIDs in advance:
+
+```c
+AxlVarInfo *vars;
+size_t count;
+if (axl_var_enumerate(&vars, &count) == AXL_OK) {
+    for (size_t i = 0; i < count; i++) {
+        axl_printf("%s (%zu bytes)\n", vars[i].name, vars[i].size);
+    }
+    axl_free(vars);          // one free — names live in the same block
+}
+```
+
+Enumeration never reads payloads; it reports each variable's size so a
+caller can decide what to fetch, then `axl_var_read()` fetches the one
+it wants. That is a contract rather than an optimization — a machine
+can carry megabytes of variable data, and an inventory listing must not
+pull it into memory. Both surfaces run the same underlying walk, so
+they cannot drift in what they report.
 
 #### Vendor Namespaces
 
@@ -207,6 +242,67 @@ axl_mem_phys_read32(0xE0000, &signature);
 `axl_mem_phys_search` does a byte-by-byte scan for a needle
 within a mapped region — useful for finding signatures inside
 firmware blobs.
+
+#### Two views of the memory map — pick by what you are asking
+
+`<axl/axl-mem-region.h>` exposes the firmware map twice, and they
+are not interchangeable:
+
+| | `axl_mem_phys_region_*` (`AxlMemRegion`) | `axl_memmap_snapshot` (`AxlMemMapEntry`) |
+|---|---|---|
+| question | "may I touch this address?" | "what is on this machine?" |
+| type | 5 buckets (RAM/RESERVED/ACPI/MMIO/UNMAPPED) | raw EFI type number |
+| adjacent regions | coalesced | left alone |
+| length | bytes | 4 KiB pages |
+| attributes | informational | raw `EFI_MEMORY_*` bitmask |
+
+The classification is deliberately lossy: `EfiConventionalMemory`,
+`EfiLoaderData` and `EfiBootServicesData` all become
+`AXL_MEM_REGION_RAM`, which is exactly right for an access-policy
+decision and makes a per-type roll-up **unrecoverable**. Inventory —
+anything that renders a memory-map table or compares against a
+firmware oracle — wants the raw view, and `axl_memmap_type_name()`
+so every consumer spells `"ConventionalMemory"` the same way.
+
+```c
+AxlMemMapEntry *e;
+size_t n;
+if (axl_memmap_snapshot(&e, &n) == AXL_OK) {
+    for (size_t i = 0; i < n; i++) {
+        axl_printf("%-24s %016llx  %llu pages\n",
+                   axl_memmap_type_name(e[i].type),
+                   (unsigned long long)e[i].physical_start,
+                   (unsigned long long)e[i].number_of_pages);
+    }
+    axl_free(e);          // one free covers the whole snapshot
+}
+```
+
+### RTC Wake Alarm
+
+`axl_time_get_wakeup()` / `axl_time_set_wakeup()` read and program the
+alarm that powers a machine on at a set time. Three outcomes stay
+distinguishable on purpose — `AXL_OK`, `AXL_UNSUPPORTED` (no wake
+timer on this platform) and `AXL_ERR` (there is one and it failed) —
+because "cannot" and "broken" are different answers for anything
+surfacing this out-of-band. QEMU and real hardware differ here.
+
+```c
+bool enabled, pending;
+AxlRealtime when;
+switch (axl_time_get_wakeup(&enabled, &pending, &when)) {
+case AXL_OK:          /* armed? pending? when? */ break;
+case AXL_UNSUPPORTED: /* platform has no wake timer */ break;
+default:              /* it has one and the read failed */ break;
+}
+
+axl_time_set_wakeup(NULL);     // disarm
+```
+
+All four calls join the RTC mutual-exclusion group (UEFI 2.11
+Table 8.1) that `axl_time_realtime()` documents: GetTime, SetTime,
+GetWakeupTime and SetWakeupTime cannot overlap, so a call nested
+inside another RTC operation fails rather than reaching firmware.
 
 ### Watchdog
 

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-list.h:
+/** @file axl-list.h
  *
  * Doubly-linked list. GLib GList equivalent.
  * Node struct is exposed for direct traversal:
@@ -16,6 +15,8 @@
 
 #ifndef AXL_LIST_H
 #define AXL_LIST_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -34,7 +35,7 @@ extern "C" {
 typedef void *(*AxlCopyFunc)(
     const void *src,       ///< source data to copy
     void       *user_data  ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // AxlList — doubly-linked list node

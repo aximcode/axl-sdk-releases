@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-http-client.h:
+/** @file axl-http-client.h
  *
  * HTTP client with GET, POST, PUT, DELETE, and file download.
  *
@@ -31,6 +30,7 @@
 #include <stdint.h>
 #include <axl/axl-macros.h>
 #include <axl/axl-hash-table.h>
+#include <axl/axl-json.h>       /* AxlJsonReader — axl_http_response_get_json */
 #include <axl/axl-bytes.h>
 
 #ifdef __cplusplus
@@ -143,7 +143,7 @@ typedef void (*AxlHttpClientDoneFn)(
     AxlHttpClientResponse *resp,  ///< response (callback owns it — free it), or NULL on failure
     AxlStatus              st,    ///< AXL_OK, or an error / timeout / AXL_CANCELLED
     void                  *user   ///< opaque context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Asynchronous HTTP GET — the async peer of axl_http_get.
@@ -276,7 +276,7 @@ typedef int (*AxlRequestBodyStreamer)(
     void   *out_buf,
     size_t  out_buf_size,
     size_t *out_size
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Issue an HTTP request with a streaming request body.
@@ -309,16 +309,16 @@ typedef int (*AxlRequestBodyStreamer)(
  */
 int
 axl_http_request_streaming(
-    AxlHttpClient          *c,
+    AxlHttpClient          *c,             ///< client
     const char             *method,        ///< "PUT", "POST", etc.
-    const char             *url,
+    const char             *url,           ///< absolute request URL
     AxlRequestBodyStreamer  streamer,      ///< producer callback
     void                   *ctx,           ///< opaque, passed to streamer + cleanup
     void                  (*cleanup_fn)(void *ctx),  ///< optional finalizer (NULL = none)
     size_t                  total_size,    ///< body length in bytes; (size_t)-1 = chunked
-    const char             *content_type,
-    AxlHashTable           *extra_headers,
-    AxlHttpClientResponse **out_resp
+    const char             *content_type,  ///< Content-Type header (NULL = none)
+    AxlHashTable           *extra_headers, ///< extra request headers (NULL = none)
+    AxlHttpClientResponse **out_resp       ///< receives response
 );
 
 /**
@@ -341,13 +341,13 @@ axl_http_request_streaming(
  */
 int
 axl_http_request_stream_file(
-    AxlHttpClient          *c,
-    const char             *method,
-    const char             *url,
+    AxlHttpClient          *c,              ///< client
+    const char             *method,         ///< "PUT", "POST", etc.
+    const char             *url,            ///< absolute request URL
     const char             *path,           ///< local file path (UTF-8)
-    const char             *content_type,
-    AxlHashTable           *extra_headers,
-    AxlHttpClientResponse **out_resp
+    const char             *content_type,   ///< Content-Type header (NULL = none)
+    AxlHashTable           *extra_headers,  ///< extra request headers (NULL = none)
+    AxlHttpClientResponse **out_resp        ///< receives response
 );
 
 /**
@@ -377,6 +377,50 @@ axl_http_client_response_get_bytes(
 #ifdef AXL_HAVE_AUTOPTR
 AXL_DEFINE_AUTOPTR_CLEANUP(AxlHttpClientResponse, axl_http_client_response_free)
 #endif
+
+/**
+ * @brief Parse a response body as JSON.
+ *
+ * The client-side mirror of axl_http_request_get_json(), and it exists for the
+ * same reason: a response body arrives off the network from a peer this
+ * process does not control, so the dialect must be RFC 8259 and the EASY call
+ * must be the strict one.
+ *
+ * Without this, the obvious thing to write is
+ * `axl_json_parse(resp->body, resp->body_size, AXL_JSON_RELAXED, &r)` — which is the LIBERAL
+ * entry point, and quietly accepts comments, unquoted keys, single quotes, hex
+ * literals and trailing commas from whatever answered the socket. That is not
+ * hypothetical: it is what `rfbrowse` did to Redfish bodies from a remote BMC
+ * until 2026-08-03, and the reviewer of that fix noted the real defect was the
+ * missing helper rather than the call sites. A rule enforced by review gets
+ * re-broken; a rule enforced by the shape of the API does not.
+ *
+ * So a comment, an unquoted key, a single-quoted string, a hex literal or a
+ * trailing comma in the body is a parse error here. A caller that genuinely
+ * wants a lenient body — talking to a service known to emit JSON5 — can still
+ * parse @c resp->body itself through axl_json_parse() with any dialect.
+ * The point is that leniency becomes the thing you ASK for.
+ *
+ * @par Lifetime
+ *
+ * The reader references @c resp->body directly rather than copying it, exactly
+ * as the request-side helper does. Do not free the response while the reader
+ * is in use — with AXL_AUTOPTR on the response that ordering is easy to get
+ * wrong, because the reader outlives the scope-exit free unless you free it
+ * first. Call axl_json_free() on @a out when done.
+ *
+ * @return @c true on success, with @a out populated. @c false on a NULL
+ *     argument, an empty body, or a JSON parse error — the same three
+ *     outcomes axl_http_request_get_json() reports, and it does not
+ *     distinguish them, because a caller who cannot parse the body has the
+ *     same recovery in all three.
+ */
+bool
+axl_http_response_get_json(
+    const AxlHttpClientResponse *resp,  ///< response from axl_http_get() etc
+    AxlJsonReader               *out    ///< [out] reader to fill (caller owns;
+                                        ///< free with axl_json_free())
+);
 
 /**
  * @brief Download a URL to a local file.

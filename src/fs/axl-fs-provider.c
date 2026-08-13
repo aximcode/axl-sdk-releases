@@ -983,10 +983,12 @@ axl_fs_provider_unpublish(void *handle)
        (self->dead || self->pub == NULL) guard at the top of every
        thunk_* path returns EFI_DEVICE_ERROR cleanly without
        dereferencing the soon-to-be-freed Publication. The thunk
-       memory itself stays allocated forever — UEFI consumers may
-       hold stale EFI_FILE_PROTOCOL pointers indefinitely (rare in
-       practice, but the spec doesn't bound it). v1 punt; v2 can
-       reclaim on the consumer's eventual Close. */
+       memory itself is NOT freed here — UEFI consumers may hold stale
+       EFI_FILE_PROTOCOL pointers indefinitely (rare in practice, but
+       the spec doesn't bound it), so the reclaim point is the
+       consumer's eventual Close, which thunk_close performs whether
+       the thunk is live or orphaned. A consumer that never Closes
+       keeps the thunk; that is its choice, not a punt here. */
     while (pub->open_first != NULL) {
         FileThunk *f = pub->open_first;
         if (f->backing != NULL) {

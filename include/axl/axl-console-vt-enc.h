@@ -2,7 +2,7 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-console-vt-enc.h
-    The REMOTE sink for @ref AxlConsoleOps: serialize a console's structured
+    The REMOTE sink for @ref AxlConsoleOps "AxlConsoleOps": serialize a console's structured
     operations into the UTF-8 + ANSI/VT byte stream an xterm-class terminal
     understands, and hand it to a caller-supplied sink.
 
@@ -74,7 +74,7 @@ typedef void (*AxlConsoleVtSinkFn)(
     const char *bytes,  ///< output bytes (NOT NUL-terminated)
     size_t      len,    ///< number of bytes
     void       *user    ///< sink context (cfg->user)
-);
+) AXL_CB_NOEXCEPT;
 
 /** @brief Encoder configuration (copied). */
 typedef struct {

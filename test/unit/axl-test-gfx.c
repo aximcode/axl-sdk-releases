@@ -519,7 +519,7 @@ static void
 test_buffer_free_null_safe(void)
 {
     axl_gfx_buffer_free(NULL);   /* must not crash */
-    test_check(true, "buffer_free: NULL is safe (no crash)");
+    test_survived("buffer_free: NULL is safe (no crash)");
 }
 
 static void
@@ -537,6 +537,103 @@ test_buffer_get_info_null_safe(void)
     test_check(axl_gfx_buffer_get_info(b, NULL, &h) == AXL_OK && h == 25,
                "buffer_get_info: out_w NULL is OK; out_h gets height");
     axl_gfx_buffer_free(b);
+}
+
+/* The SIMD tier must be resolved ONCE PER BLEND, not once per scanline.
+ *
+ * axl_cpu_simd_tier() is deliberately uncached -- it has to answer for the
+ * core asking -- so each call runs several CPUID leaves plus XGETBV. CPUID is
+ * unconditionally intercepted under virtualisation, so each one is a VM exit.
+ * Called per row it made a full-screen alpha blend pay ~800 x 6 exits, which
+ * reached a consumer as a compositor repaint going 0 -> 1.75s and took a
+ * cross-repo bisect to find. Nothing in the suite could see it.
+ *
+ * Pinned as a RATIO rather than a wall-clock ceiling, because an absolute
+ * number would encode this machine's speed and rot (and would have to be
+ * loose enough on a loaded host to stop discriminating). The same total pixel
+ * work is done two ways:
+ *
+ *   batched : ONE blend of H rows        -> 1 tier query when hoisted, H when not
+ *   split   : H blends of ONE row each   -> H tier queries either way
+ *
+ * Hoisted, `batched` skips (H-1) queries and is dramatically faster. Per-row,
+ * the two do identical work and the times converge. So "batching helps" IS the
+ * property, and it needs no calibration.
+ *
+ * X64-ONLY. On aarch64 the dispatch reads the cached feature vector with no
+ * CPUID at all, so both forms cost the same and the ratio cannot discriminate
+ * -- asserting it there would be a test that cannot fail.
+ */
+static void
+test_blend_tier_resolved_per_operation(void)
+{
+#if defined(__x86_64__)
+    const uint32_t W = 64, H = 512;
+    AxlGfxBuffer  *b = axl_gfx_buffer_new(W, H);
+    test_check(b != NULL, "blend tier: scratch buffer allocated");
+    if (b == NULL) {
+        return;
+    }
+
+    const AxlGfxPixel half = {0x80, 0x40, 0x20, 0x80};   /* alpha 0x80 -> OVER */
+    axl_gfx_target_buffer(b);
+
+    /* Warm every path once so first-call costs land outside the timings. */
+    axl_gfx_fill_rect(0, 0, W, H, half);
+
+    uint64_t t0 = axl_time_get_us();
+    for (int rep = 0; rep < 8; rep++) {
+        axl_gfx_fill_rect(0, 0, W, H, half);          /* batched */
+    }
+    uint64_t t_batched = axl_time_get_us() - t0;
+
+    t0 = axl_time_get_us();
+    for (int rep = 0; rep < 8; rep++) {
+        for (uint32_t row = 0; row < H; row++) {
+            axl_gfx_fill_rect(0, row, W, 1, half);    /* split */
+        }
+    }
+    uint64_t t_split = axl_time_get_us() - t0;
+
+    axl_gfx_target_buffer(NULL);
+    axl_gfx_buffer_free(b);
+
+    /* The assertion INVERTED when the tier gained its BSP memo, and that is
+       the point rather than an accident.
+     *
+     * Hoisting alone made the query once-per-operation, and this test used to
+     * pin that by requiring `split` (H operations) to be much SLOWER than
+     * `batched` (1 operation) -- H queries against one. A consumer then showed
+     * once-per-operation was still ruinous for them, because their compositor
+     * issues ~10^5 small blends per repaint, so the per-operation query never
+     * amortised.
+     *
+     * With the memo, neither form pays CPUID at all on the BSP, so the two
+     * converge and the old assertion would now FAIL. Splitting still costs
+     * more -- H times the per-call loop and bounds work -- just not the
+     * order-of-magnitude more that a CPUID storm produced. 20x is far above
+     * that residue and far below the ~100x a per-operation query gave. */
+    test_check(t_split < t_batched * 20,
+               "blend tier: splitting a blend by rows costs no CPUID storm "
+               "(tier memoised on the BSP, not re-queried per operation)");
+
+    /* Retirement must not change the ANSWER, only the cost. A memo that
+       returned a different tier than the live query would be the #UD this
+       whole mechanism exists to avoid -- and a consumer has now reproduced
+       that fault empirically, so it is not theoretical.
+     *
+     * Last in this function on purpose: retirement is permanent, so asserting
+       it earlier would silently disable the memo for the timing check above
+       and leave that check measuring nothing. */
+    AxlSimdTier memoised = axl_cpu_simd_tier();
+    axl_cpu_simd_memo_invalidate();
+    AxlSimdTier live = axl_cpu_simd_tier();
+    test_check(memoised == live,
+               "blend tier: the memo returns exactly what the live query does");
+#else
+    test_skip_n(3, "blend tier per-operation (x86-only: no CPUID in the "
+                   "aarch64 dispatch, so the ratio cannot discriminate)");
+#endif
 }
 
 static void
@@ -6306,6 +6403,61 @@ test_gfx_output_contract(void)
     }
 }
 
+/* A fresh buffer must be zeroed.
+ *
+ * src/gfx/README.md's blur example renders "a shape" and then blurs, and
+ * axl_gfx_buffer_blur reads the WHOLE buffer -- so whatever the allocator
+ * handed back gets smeared into the shape's halo and presented. Undefined
+ * bytes there leak heap to the GOP and corrupt the intended visual, and
+ * anyone following the documented example gets both.
+ *
+ * Detecting "uninitialized" needs care, because a fresh heap block is often
+ * incidentally zero and the test would pass for the wrong reason.
+ *
+ * What actually makes this discriminate: unit tests build BUILD=DEBUG, which
+ * defines AXL_MEM_DEBUG, and axl_malloc_impl then fills every allocation with
+ * AXL_ALLOC_FILL (0xDA). So an un-zeroed buffer is deterministically 0xDA
+ * here, not merely "probably not zero".
+ *
+ * The dirty-then-reallocate dance below is the fallback for a RELEASE build,
+ * where that fill is compiled out and the test would otherwise depend on the
+ * allocator handing the same block back -- which UEFI does not guarantee.
+ * Keep it, but the 0xDA fill is the reason this is reliable. */
+static void
+test_gfx_buffer_new_zeroed(void)
+{
+    const uint32_t W = 32, H = 32;
+    const size_t   N = (size_t)W * H;
+
+    AxlGfxBuffer *dirty = axl_gfx_buffer_new(W, H);
+    test_check(dirty != NULL, "buffer zero-init: setup allocation");
+    if (dirty == NULL) {
+        return;
+    }
+    AxlGfxPixel *dp = axl_gfx_buffer_pixels(dirty);
+    for (size_t i = 0; i < N; i++) {
+        dp[i] = (AxlGfxPixel){ 0xDE, 0xAD, 0xBE, 0xEF };
+    }
+    axl_gfx_buffer_free(dirty);
+
+    AxlGfxBuffer *b = axl_gfx_buffer_new(W, H);
+    test_check(b != NULL, "buffer zero-init: allocation");
+    if (b == NULL) {
+        return;
+    }
+
+    const AxlGfxPixel *bp = axl_gfx_buffer_pixels(b);
+    size_t nonzero = 0;
+    for (size_t i = 0; i < N; i++) {
+        if (bp[i].blue != 0 || bp[i].green != 0 ||
+            bp[i].red  != 0 || bp[i].alpha != 0) {
+            nonzero++;
+        }
+    }
+    test_check(nonzero == 0, "buffer zero-init: every pixel starts at 0");
+    axl_gfx_buffer_free(b);
+}
+
 // ---------------------------------------------------------------------------
 // C++ RAII autoptr — AXL_AUTOPTR must free each gfx handle at scope exit.
 // Runtime proof: live-allocation count returns to baseline after the scope.
@@ -6666,6 +6818,8 @@ test_gfx_main(
     test_gfx_output_contract();
     test_gfx_output_inventory_contract();
 
+    test_gfx_buffer_new_zeroed();
+    test_blend_tier_resolved_per_operation();
     test_autoptr_gfx();
 
     return test_print_results();

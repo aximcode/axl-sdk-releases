@@ -136,7 +136,7 @@ mem_read(AxlFsProviderFile *f, void *buf, size_t *inout_size)
 }
 
 static AxlFsStatus
-mem_read_dir(AxlFsProviderFile *f, AxlFsProviderInfo *out, bool *out_end)
+mem_read_dir(AxlFsProviderFile *f, AxlFsEntry *out, bool *out_end)
 {
     if (g_files[f->cursor].name == NULL) {
         *out_end = true;
@@ -145,8 +145,12 @@ mem_read_dir(AxlFsProviderFile *f, AxlFsProviderInfo *out, bool *out_end)
     const MemFile *e = &g_files[f->cursor];
     f->cursor++;
 
+    /* Zero first: AxlFsEntry is versioned and grows, so a provider that fills
+       only the fields it knows about leaves the rest defined rather than
+       whatever was on the caller's stack. */
+    axl_memset(out, 0, sizeof(*out));
     out->struct_size = sizeof(*out);
-    out->version     = AXL_FS_PROVIDER_VERSION;
+    out->version     = AXL_FS_ENTRY_VERSION;
     axl_strlcpy(out->name, e->name, sizeof(out->name));
     out->size       = axl_strlen(e->content);
     out->mtime_unix = 0;
@@ -169,10 +173,11 @@ mem_seek(AxlFsProviderFile *f, uint64_t pos)
 }
 
 static AxlFsStatus
-mem_get_info(AxlFsProviderFile *f, AxlFsProviderInfo *out)
+mem_get_info(AxlFsProviderFile *f, AxlFsEntry *out)
 {
+    axl_memset(out, 0, sizeof(*out));
     out->struct_size = sizeof(*out);
-    out->version     = AXL_FS_PROVIDER_VERSION;
+    out->version     = AXL_FS_ENTRY_VERSION;
     out->mtime_unix  = 0;
     if (f->is_root) {
         out->name[0]    = '\0';

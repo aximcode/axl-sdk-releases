@@ -21,6 +21,7 @@
 #include <axl/axl-log.h>
 #include <axl/axl-loop.h>
 #include <axl/axl-time.h>
+#include "axl-gfx-internal.h"
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-array.h>
@@ -47,11 +48,16 @@ struct AxlSurface {
     uint32_t       w, h;      // size
     bool           visible;
     bool           opaque;    // occlusion hint (fully covers its rect opaquely)
-    uint8_t        opacity;   // constant alpha (255 = opaque copy; <255 = blend)
-    bool           per_pixel_alpha; // at opacity 255, source-over the buffer's
-                                    // OWN per-pixel alpha instead of a straight
-                                    // copy (opaque body + soft alpha edges in
-                                    // one surface — popups, the dialog veil)
+    uint8_t        opacity;   // constant alpha, INHERITED: what the blit and
+                              // the occlusion gate use is the EFFECTIVE value
+                              // (this times every ancestor's — E11,
+                              // surf_effective_opacity), so a surface's own 255
+                              // still blends if an ancestor is translucent
+    bool           per_pixel_alpha; // at an EFFECTIVE opacity of 255, source-over
+                                    // the buffer's OWN per-pixel alpha instead of
+                                    // a straight copy (opaque body + soft alpha
+                                    // edges in one surface — popups, the veil).
+                                    // Below that the blend path runs regardless.
     AxlGfxBuffer  *buf;       // back-buffer (NULL for the root)
 
     // --- C4: the seat ---
@@ -371,7 +377,7 @@ axl_surface_new(AxlSurface *parent, uint32_t w, uint32_t h)
         axl_free(s);
         return NULL;
     }
-    axl_gfx_buffer_clear(s->buf, AXL_GFX_RGBA(0, 0, 0, 0));
+    /* no clear: axl_gfx_buffer_new zero-fills, which IS transparent black. */
     s->node.data = s;
     s->comp      = parent->comp;
     s->w         = w;
@@ -510,6 +516,30 @@ axl_surface_set_opacity(AxlSurface *s, uint8_t opacity)
     }
     s->opacity = opacity;
     mark_damage(s->comp, surf_subtree_bounds(s));
+}
+
+// E11: opacity is a scene-graph property — a surface is composited at its own
+// value scaled by every ancestor's, root included, so one call fades a whole
+// subtree (the dialog veil + card). Each link truncates the same way the blit
+// does, so effective_opacity and the blitted alpha can never disagree.
+//
+// Walked, not cached: the depth is 2-4, this is once per blit RECT (never per
+// pixel), and a cached field would need invalidating on set_parent and
+// surface_new — state that can desync for no measurable gain.
+static uint8_t
+surf_effective_opacity(const AxlSurface *s)
+{
+    uint32_t a = 255;
+    for (const AxlNTree *n = &s->node; n != NULL; n = n->parent) {
+        a = (a * SURF(n)->opacity) / 255;
+    }
+    return (uint8_t)a;
+}
+
+uint8_t
+axl_surface_effective_opacity(const AxlSurface *s)
+{
+    return s != NULL ? surf_effective_opacity(s) : 0;
 }
 
 void
@@ -733,7 +763,9 @@ blur_output_rect(AxlCompositor *c, AxlSurface *s, AxlGfxClip r, AxlGfxClip v,
         return valid;   // nothing of this rect would survive: don't blur it
     }
     const bool cache = !c->blur_partial;
-    AxlGfxBuffer *tmp = axl_gfx_buffer_new(r.w, r.h);
+    /* uninit: the extract loop below writes every pixel of @tmp before the
+     * blur reads it, so zeroing here is dead work on a per-present path. */
+    AxlGfxBuffer *tmp = axl_gfx_internal_buffer_new_uninit(r.w, r.h);
     if (tmp == NULL) {
         c->blur_failed = true;
         return valid;   // OOM: skip the blur (degrade, not fatal)
@@ -829,16 +861,20 @@ surf_blit(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
             return;
         }
     }
+    // E11: the surface fades with its ancestors, so the blit scales by the
+    // EFFECTIVE opacity — a 255 surface under a translucent parent is not a
+    // straight copy.
+    const uint8_t op = surf_effective_opacity(s);
     for (uint32_t j = 0; j < r.h; j++) {
         AxlGfxPixel       *drow = &dp[(r.y + (int32_t)j) * (int32_t)c->w + r.x];
         const AxlGfxPixel *srow = &sp[(r.y + (int32_t)j - ay) * (int32_t)s->w
                                       + (r.x - ax)];
-        if (s->opacity == 255 && !s->per_pixel_alpha) {
+        if (op == 255 && !s->per_pixel_alpha) {
             for (uint32_t i = 0; i < r.w; i++) {
                 drow[i] = srow[i];          // opaque: straight copy
             }
         } else {
-            // Source-over with the buffer's alpha scaled by the surface
+            // Source-over with the buffer's alpha scaled by the effective
             // opacity (gamma-correct per the global setting).  Two cases land
             // here: a translucent surface (opacity < 255 → whole-surface fade,
             // per-pixel alpha further scaled), and a per-pixel-alpha surface at
@@ -846,7 +882,7 @@ surf_blit(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
             // alpha blends untouched: opaque body, soft alpha edges, fully
             // transparent gaps show through).
             for (uint32_t i = 0; i < r.w; i++) {
-                uint8_t a = (uint8_t)(((uint32_t)srow[i].alpha * s->opacity) / 255);
+                uint8_t a = (uint8_t)(((uint32_t)srow[i].alpha * op) / 255);
                 drow[i] = axl_gfx_composite(drow[i],
                               AXL_GFX_RGBA(srow[i].red, srow[i].green, srow[i].blue, a));
             }
@@ -870,14 +906,16 @@ surf_composite(AxlCompositor *c, const AxlSurface *s, AxlGfxClip clip)
 }
 
 // The screen rect a surface opaquely covers (an occluder), or empty.
-// Only an opacity==255 + opaque + NON-per-pixel-alpha surface occludes — that
-// blit path is a straight copy, so the whole rect is opaque; a translucent
-// (<255) surface or a per-pixel-alpha surface (opaque body but transparent /
-// soft-alpha gaps — popups, the veil) can't occlude what's behind it.
+// Only an EFFECTIVE-opacity-255 + opaque + NON-per-pixel-alpha surface
+// occludes — that blit path is a straight copy, so the whole rect is opaque; a
+// translucent (<255) surface or a per-pixel-alpha surface (opaque body but
+// transparent / soft-alpha gaps — popups, the veil) can't occlude what's
+// behind it. Effective, not own (E11): a surface faded by an ancestor blends
+// like a directly-faded one, so it must not cull like an opaque one either.
 static AxlGfxClip
 surf_opaque_rect(const AxlCompositor *c, const AxlSurface *s)
 {
-    if (!s->opaque || s->opacity != 255 || s->per_pixel_alpha
+    if (!s->opaque || surf_effective_opacity(s) != 255 || s->per_pixel_alpha
         || s->backdrop_blur > 0) {
         return (AxlGfxClip){0, 0, 0, 0};   // translucent / overlay → no occlude
     }
@@ -980,6 +1018,31 @@ comp_vis_build(AxlCompositor *c, CompVis *cv)
     cv->vis = vis;
     cv->m   = m;
 
+    /* Front-to-back (order is back-to-front, so k counts down).
+     *
+     * A BACKDROP-BLUR SURFACE, AND EVERYTHING BEHIND IT, IS EXEMPT FROM
+     * CULLING. Two reasons, and the second is a correctness one:
+     *
+     *  - Culling the veil itself holes its visible region, so it blits as the
+     *    rects around the occluder instead of one. E10's partial re-blur is
+     *    only exact away from the edges it clamped at, so a split veil makes
+     *    it decline and fall back to blurring the WHOLE veil: measured 15614
+     *    us/present with an opaque card over a veil versus 116 us without.
+     *    The hint made the frame 134x slower, so the only way to get a fast
+     *    modal dialog was to lie about the card being opaque.
+     *  - Culling what is BEHIND the veil is worse than slow. The blur reads
+     *    the composited backdrop, and it reads a NEIGHBOURHOOD: an unpainted
+     *    hole under the occluder would bleed outward through the blur radius
+     *    and show up OUTSIDE the occluder's rect, where nothing covers it.
+     *
+     * This trades occlusion culling for blur locality wherever the two
+     * conflict. That is the right way round: culling saves a copy of the
+     * pixels it skips, while a declined partial re-blur costs a full-veil
+     * blur -- orders of magnitude more per pixel.
+     *
+     * Note surf_opaque_rect already refuses to let a blur surface BE an
+     * occluder. This is the other half: it must also not be occluded. */
+    bool blur_below = false;
     for (size_t k = m; k-- > 0; ) {
         const AxlSurface *s = *(AxlSurface **)axl_array_get(cv->order, k);
         vis[k] = axl_gfx_region_new();
@@ -987,14 +1050,24 @@ comp_vis_build(AxlCompositor *c, CompVis *cv)
             goto fail;
         }
         if (axl_gfx_region_union_rect(vis[k], clip_to_output(c, surf_screen_rect(s)))
-                != AXL_OK
-            || axl_gfx_region_subtract(vis[k], occluded) != AXL_OK) {
+                != AXL_OK) {
             goto fail;
         }
-        AxlGfxClip op = surf_opaque_rect(c, s);
-        if (op.w != 0 && op.h != 0
-            && axl_gfx_region_union_rect(occluded, op) != AXL_OK) {
+        const bool exempt = blur_below || s->backdrop_blur > 0;
+        if (!exempt && axl_gfx_region_subtract(vis[k], occluded) != AXL_OK) {
             goto fail;
+        }
+        if (s->backdrop_blur > 0) {
+            blur_below = true;   /* everything deeper is exempt too */
+        }
+        /* Once exempt, further occluders cannot cull anything, so stop
+         * paying to accumulate them. */
+        if (!blur_below) {
+            AxlGfxClip op = surf_opaque_rect(c, s);
+            if (op.w != 0 && op.h != 0
+                && axl_gfx_region_union_rect(occluded, op) != AXL_OK) {
+                goto fail;
+            }
         }
     }
     axl_gfx_region_free(occluded);

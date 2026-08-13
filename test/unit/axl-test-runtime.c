@@ -550,6 +550,106 @@ test_argv_drop_semantics(void)
 }
 
 // ---------------------------------------------------------------------------
+// TPL balance
+//
+// Only SAFE levels are exercised. TPL_HIGH_LEVEL is deliberately absent:
+// at that level a pool allocation or a console write HANGS rather than
+// failing, so a test that reached it would wedge the whole binary — and
+// test-axl.sh runs every binary in ONE boot under ONE timeout, so the
+// hang would starve every later test too.
+// ---------------------------------------------------------------------------
+
+static void
+test_tpl_raise_restore_round_trip(void)
+{
+    unsigned base = axl_tpl_current();
+    unsigned prev = axl_tpl_raise(AXL_TPL_NOTIFY);
+
+    test_check(prev == base, "tpl: raise returns the previous level");
+    test_check(axl_tpl_current() == AXL_TPL_NOTIFY,
+               "tpl: current reads back the raised level");
+
+    axl_tpl_restore(prev);
+    test_check(axl_tpl_current() == base, "tpl: restore returns to baseline");
+
+    /* Nested raise/restore, strictly LIFO. */
+    unsigned p1 = axl_tpl_raise(AXL_TPL_CALLBACK);
+    unsigned p2 = axl_tpl_raise(AXL_TPL_NOTIFY);
+    test_check(p2 == AXL_TPL_CALLBACK, "tpl: nested raise sees the inner level");
+    axl_tpl_restore(p2);
+    test_check(axl_tpl_current() == AXL_TPL_CALLBACK,
+               "tpl: inner restore drops one level only");
+    axl_tpl_restore(p1);
+    test_check(axl_tpl_current() == base, "tpl: outer restore returns to baseline");
+
+    /* Asking to "raise" below the current level must not lower it —
+       otherwise the paired restore would raise, which UEFI rejects. */
+    unsigned p3 = axl_tpl_raise(AXL_TPL_NOTIFY);
+    unsigned p4 = axl_tpl_raise(AXL_TPL_CALLBACK);
+    test_check(axl_tpl_current() == AXL_TPL_NOTIFY,
+               "tpl: raise to a LOWER level leaves the level alone");
+    axl_tpl_restore(p4);
+    axl_tpl_restore(p3);
+    test_check(axl_tpl_current() == base, "tpl: level intact after no-op raise");
+}
+
+static void
+test_tpl_current_is_application_in_foreground(void)
+{
+    test_check(axl_tpl_current() == AXL_TPL_APPLICATION,
+               "tpl: a foreground app runs at TPL_APPLICATION");
+}
+
+static void
+test_tpl_restore_baseline_is_noop_when_balanced(void)
+{
+    unsigned leaked = 0xFFFFu;
+
+    test_check(axl_tpl_restore_baseline(&leaked) == false,
+               "tpl: restore_baseline reports false when already balanced");
+    test_check(leaked == 0xFFFFu,
+               "tpl: out_leaked is left untouched when balanced");
+    test_check(axl_tpl_restore_baseline(NULL) == false,
+               "tpl: restore_baseline accepts a NULL out pointer");
+    test_check(axl_tpl_current() == AXL_TPL_APPLICATION,
+               "tpl: a balanced restore_baseline changes nothing");
+}
+
+static void
+test_tpl_restore_baseline_repairs_a_leaked_raise(void)
+{
+    unsigned leaked = 0;
+
+    /* Leak a raise on purpose — the shape an unwind through a raw
+       RaiseTPL frame leaves behind, and the shape that wedges the
+       machine when it reaches the shell. */
+    (void)axl_tpl_raise(AXL_TPL_NOTIFY);
+
+    test_check(axl_tpl_restore_baseline(&leaked) == true,
+               "tpl: restore_baseline reports the repair");
+    test_check(leaked == AXL_TPL_NOTIFY,
+               "tpl: restore_baseline names the level that was leaked");
+    test_check(axl_tpl_current() == AXL_TPL_APPLICATION,
+               "tpl: the machine is back at baseline after the repair");
+
+    /* And it is idempotent — a second call finds nothing to do. */
+    test_check(axl_tpl_restore_baseline(NULL) == false,
+               "tpl: repair is idempotent");
+
+    /* A leak from the LOWEST raised level is repaired too. CALLBACK
+       wedges the shell exactly like NOTIFY does, so it must not be
+       treated as harmless. */
+    (void)axl_tpl_raise(AXL_TPL_CALLBACK);
+    leaked = 0;
+    test_check(axl_tpl_restore_baseline(&leaked) == true,
+               "tpl: a leaked TPL_CALLBACK is repaired, not tolerated");
+    test_check(leaked == AXL_TPL_CALLBACK,
+               "tpl: restore_baseline names TPL_CALLBACK");
+    test_check(axl_tpl_current() == AXL_TPL_APPLICATION,
+               "tpl: baseline restored after a CALLBACK leak");
+}
+
+// ---------------------------------------------------------------------------
 // Entry Point
 // ---------------------------------------------------------------------------
 
@@ -587,6 +687,11 @@ test_runtime_main(
     test_universal_b_survives_unrelated_page_flag();
 
     test_argv_drop_semantics();
+
+    test_tpl_raise_restore_round_trip();
+    test_tpl_current_is_application_in_foreground();
+    test_tpl_restore_baseline_is_noop_when_balanced();
+    test_tpl_restore_baseline_repairs_a_leaked_raise();
 
     return test_print_results();
 }

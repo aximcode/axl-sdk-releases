@@ -92,6 +92,34 @@
 #  define AXL_MATH_FMA(a, b, c)  ((a) * (b) + (c))
 #endif
 
+// ===================================================================
+// IEEE-754 special values
+// ===================================================================
+
+bool
+axl_isnan(
+    double  x
+    )
+{
+    return x != x;   /* the only value unequal to itself */
+}
+
+bool
+axl_isinf(
+    double  x
+    )
+{
+    return !axl_isnan(x) && (x > AXL_MATH_DBL_MAX || x < -AXL_MATH_DBL_MAX);
+}
+
+bool
+axl_isfinite(
+    double  x
+    )
+{
+    return !axl_isnan(x) && !axl_isinf(x);
+}
+
 double
 axl_floor(
     double  x

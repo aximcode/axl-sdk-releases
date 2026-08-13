@@ -44,6 +44,8 @@
 #ifndef AXL_SHARED_DRIVER_H
 #define AXL_SHARED_DRIVER_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 
 #include <axl/axl-sys.h>
@@ -68,7 +70,7 @@ extern "C" {
  * name (as in @c int @c main); parse args/verb from @c argv[1].
  */
 typedef struct {
-    int (*run)(int argc, char **argv);   ///< per-dispatch entry (== int main); argv[0] is the program name, verb/args from argv[1]
+    int (*run)(int argc, char **argv) AXL_CB_NOEXCEPT;   ///< per-dispatch entry (== int main); argv[0] is the program name, verb/args from argv[1]
 } AxlSharedDriverVtable;
 
 /**

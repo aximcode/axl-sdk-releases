@@ -225,7 +225,7 @@ typedef struct {
 typedef int (*AxlImageIterFn)(
     const AxlImageInfo *info,
     void               *ctx
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Walk every currently-loaded image, invoking @p cb once per image.

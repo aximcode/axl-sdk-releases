@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-rb-tree.h:
+/** @file axl-rb-tree.h
  *
  * A generic, intrusive, augmentable red-black tree.
  *
@@ -69,7 +68,7 @@ struct AxlRBNode {
  * children already hold correct aggregates. May be NULL (a plain
  * balanced tree with no augmentation).
  */
-typedef void (*AxlRBRecompute)(AxlRBNode *node, void *user);
+typedef void (*AxlRBRecompute)(AxlRBNode *node, void *user) AXL_CB_NOEXCEPT;
 
 /**
  * AxlRBTree:
@@ -186,6 +185,53 @@ axl_rb_next(
 AxlRBNode *
 axl_rb_prev(
     const AxlRBNode *node  ///< node
+);
+
+/**
+ * @brief Verify every red-black invariant, for tests and debugging.
+ *
+ * An in-order walk proves the tree is SORTED; it says nothing about
+ * whether it is BALANCED. A tree that has degenerated into a linked
+ * list still yields correct answers to every query, just in O(n) — so
+ * a traversal-based test passes while the structure the tree exists
+ * for is gone. This is the check that notices.
+ *
+ * Verified, in order:
+ *   1. the root is black, and has no parent;
+ *   2. every node's `left`/`right` child names it as `parent`;
+ *   3. no red node has a red child;
+ *   4. every root-to-leaf path has the same black height;
+ *   5. the node count matches an in-order walk (no cycles, nothing
+ *      orphaned).
+ *
+ * O(n) and allocation-free, so it is usable inside a loop that mutates
+ * the tree — which is exactly how a rebalancing bug gets localised to
+ * the operation that caused it rather than discovered later.
+ *
+ * @return true if every invariant holds (an empty tree trivially
+ *     passes); false otherwise, with the first failure logged at
+ *     warning level.
+ */
+bool
+axl_rb_check_invariants(
+    const AxlRBTree *t  ///< tree
+);
+
+/**
+ * @brief Black height of the tree, or -1 if it is not uniform.
+ *
+ * The count of black NODES on any root-to-NULL path, not counting the
+ * NULL leaf itself -- so a single black root is 1, and an empty tree is 0.
+ * The tree's own balance metric. Exposed separately from axl_rb_check_invariants()
+ * because a test that ASSERTS a bound ("stays under 2*log2(n+1)")
+ * catches a tree drifting toward degenerate while every invariant
+ * still technically holds.
+ *
+ * @return black height (0 for an empty tree), or -1 if paths disagree.
+ */
+int
+axl_rb_black_height(
+    const AxlRBTree *t  ///< tree
 );
 
 #ifdef __cplusplus

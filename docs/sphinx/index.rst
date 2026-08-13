@@ -24,6 +24,11 @@ AXL SDK
    :maxdepth: 2
    :caption: Modules
 
+   modules/cxx
+   modules/arena-allocator
+   modules/cxx-string
+   modules/cxx-ostream
+   modules/cxx-istream
    modules/mem
    modules/debug
    modules/math

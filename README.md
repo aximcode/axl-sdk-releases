@@ -83,13 +83,31 @@ int main(int, char **) {
 $ axl-c++ hello.cpp -o hello.efi
 ```
 
-Compile-time hard defaults: `-std=c++20 -fno-exceptions -fno-rtti
--fno-threadsafe-statics` (freestanding-UEFI link can't satisfy
-libsupc++).  Usable libstdc++ subset is header-only: `<array>`,
+Compile-time hard defaults: `-std=c++23 -fno-exceptions -fno-rtti
+-fno-threadsafe-statics`.
+
+**Freestanding (default) vs `--hosted`.** The difference is which
+libstdc++ headers you may include, not which libc you link.
+Freestanding gives you the C++23 freestanding subset — `<array>`,
 `<span>`, `<string_view>`, `<type_traits>`, `<utility>`, `<optional>`,
-`<variant>`, `<expected>`, etc.  AArch64 needs the ARM bare-metal
-`aarch64-none-elf-g++` toolchain — `scripts/install-arm-toolchain.sh`
-fetches it.
+`<variant>`, `<expected>`, and the language-support headers
+`<exception>`, `<typeinfo>`, `<new>`. `axl-c++ --hosted` additionally
+makes `std::vector`, `std::string`, `std::map` and
+`std::unordered_map` work, on both arches:
+
+```console
+$ axl-c++ --hosted containers.cpp -o app.efi
+```
+
+Either way the SDK links **no `libstdc++.a`** — AXL supplies the
+eleven functions that used to require it, so nothing of GCC's runtime
+library is redistributed. `--hosted` costs only `memcpy`, `memmove`,
+`memset`, `memcmp` and `strlen`, which `libaxl.a` already defines.
+Full rationale and the measured header table:
+[`AXL-Cxx-Design.md` §6a](docs/AXL-Cxx-Design.md).
+
+AArch64 needs the ARM bare-metal `aarch64-none-elf-g++` toolchain —
+`scripts/install-arm-toolchain.sh` fetches it.
 
 See [`AXL-SDK-Design.md` §"C++ support"](docs/AXL-SDK-Design.md) +
 [`AXLMM-Design.md` §"Toolchain & constraints"](docs/AXLMM-Design.md)
@@ -397,7 +415,11 @@ axl-cc --type driver mydriver.c -o mydriver.efi
   `EFI_SYSTEM_TABLE` to `int main(int argc, char **argv)`.
 - **`axl.cmake`** — CMake integration via `axl_add_app()`.
 - **`include/uefi/`** — auto-generated UEFI type definitions from
-  the UEFI spec HTML. No dependency on EDK2 headers.
+  the UEFI spec HTML. No dependency on EDK2 headers. **Not available to
+  applications**: these headers require `AXL_ALLOW_UEFI`, which `axl-cc`
+  grants to `--type driver` / `--type runtime` and to an explicit
+  `--allow-uefi` (CMake: `axl_add_driver`, or `ALLOW_UEFI` on
+  `axl_add_app`).
 
 ### Optional: TLS
 

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-socket-client.h:
+/** @file axl-socket-client.h
  *
  * High-level socket client. Performs DNS resolution and TCP connection
  * in a single call. Reusable — one client can connect to multiple

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-runtime.h:
+/** @file axl-runtime.h
  *
  * AXL runtime surface — the pieces an app interacts with around its
  * own lifecycle and interruptibility. The runtime is the library
@@ -25,6 +24,7 @@
 #ifndef AXL_RUNTIME_H
 #define AXL_RUNTIME_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include <axl/axl-sys.h>   /* AxlGuid for axl_efi_find_config_table */
@@ -119,6 +119,111 @@ axl_efi_find_config_table(
  */
 size_t
 axl_registry_count(void);
+
+// ---------------------------------------------------------------------------
+// Task priority level (TPL) balance
+// ---------------------------------------------------------------------------
+
+/**
+ * @name Task priority levels
+ *
+ * The four levels UEFI defines, as plain unsigned values so the public
+ * API carries no firmware types. Higher masks more: at
+ * #AXL_TPL_HIGH_LEVEL only calls that touch neither the pool allocator
+ * nor the event queue still work — `Stall` and `CheckEvent` do, while
+ * `AllocatePool`, `CreateEvent`, `SetTimer`, `CloseEvent` and console
+ * output all HANG rather than returning an error. Raising is a
+ * commitment to restore.
+ * @{
+ */
+#define AXL_TPL_APPLICATION  4u   ///< normal foreground execution
+#define AXL_TPL_CALLBACK     8u   ///< event-notify / driver-pump dispatch
+#define AXL_TPL_NOTIFY      16u   ///< highest level pool allocation is legal
+#define AXL_TPL_HIGH_LEVEL  31u   ///< interrupts masked; almost nothing works
+/** @} */
+
+/**
+ * @brief The task priority level the caller is executing at.
+ *
+ * One of the `AXL_TPL_*` values (the firmware may also report an
+ * intermediate level; treat the result as an ordered magnitude, not an
+ * enum). Cheap — one raise/restore pair, because UEFI offers no direct
+ * read.
+ *
+ * @return the current level; #AXL_TPL_APPLICATION in a normal
+ *     foreground path.
+ */
+unsigned
+axl_tpl_current(void);
+
+/**
+ * @brief Raise the task priority level, returning the level to restore.
+ *
+ * Brackets a short critical section: while raised, nothing at or below
+ * @a level can preempt. Pair STRICTLY LIFO with @ref axl_tpl_restore on
+ * the same call stack, and keep the section short — no blocking, no I/O.
+ *
+ * Do not raise above #AXL_TPL_NOTIFY unless the body genuinely touches
+ * neither the allocator nor the event queue: at #AXL_TPL_HIGH_LEVEL a
+ * pool allocation or a console write does not fail, it HANGS.
+ *
+ * Lowering is not possible through this call — asking for a level below
+ * the current one leaves the level unchanged and returns it, so the
+ * paired @ref axl_tpl_restore is still correct.
+ *
+ * @return the previous level, to hand to @ref axl_tpl_restore.
+ */
+unsigned
+axl_tpl_raise(
+    unsigned level   ///< level to raise to, e.g. #AXL_TPL_NOTIFY
+);
+
+/**
+ * @brief Restore the level returned by @ref axl_tpl_raise.
+ *
+ * Must be called on the same call stack, LIFO, exactly once per raise.
+ * A raise whose restore is skipped is fatal — see
+ * @ref axl_tpl_restore_baseline for what that costs and how AXL
+ * contains it.
+ */
+void
+axl_tpl_restore(
+    unsigned previous   ///< the value @ref axl_tpl_raise returned
+);
+
+/**
+ * @brief Restore the task priority level to the application baseline.
+ *
+ * A raise that is never restored is unrecoverable, not merely untidy:
+ * returning to the shell above #AXL_TPL_APPLICATION wedges the machine
+ * — measured at #AXL_TPL_CALLBACK as well as #AXL_TPL_NOTIFY, so every
+ * raised level is fatal. On AArch64 the firmware names it
+ * (`ASSERT Image->Tpl == gEfiCurrentTpl`) and then deadloops; on x64 a
+ * release build says nothing at all and simply spins.
+ *
+ * AXL calls this first thing in `_axl_cleanup`, before any console or
+ * allocator use, so an app that leaks a raise is REPAIRED and told
+ * about it rather than hanging.
+ *
+ * **The baseline is #AXL_TPL_APPLICATION, always** — this is for code
+ * that knows it started at the application level, which means an app,
+ * not a callback. Do NOT call it from a notify function or a driver
+ * tick: the firmware legitimately entered those at #AXL_TPL_CALLBACK or
+ * #AXL_TPL_NOTIFY, so this would un-nest the firmware's own raise and
+ * report a defect that is not there. To bound a suspect region inside a
+ * callback, capture @ref axl_tpl_current on entry and compare against it
+ * on exit, restoring with @ref axl_tpl_restore.
+ *
+ * This lowers the level; it never raises. If the caller is already at
+ * baseline it does nothing and reports false.
+ *
+ * @return true if the level was above baseline and has been restored,
+ *     false if it was already at #AXL_TPL_APPLICATION or below.
+ */
+bool
+axl_tpl_restore_baseline(
+    unsigned *out_leaked   ///< [out] optional; the level found, untouched when false
+);
 
 #ifdef __cplusplus
 }

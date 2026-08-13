@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-crypto.h:
+/** @file axl-crypto.h
  *
  * Generic public-key signature verification. A detached-signature
  * verifier over the mbedTLS that AXL links when built with AXL_TLS=1.

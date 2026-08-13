@@ -97,8 +97,8 @@ typedef enum {
  *
  * Performs the same sequence axl-sdk modules previously hand-rolled:
  * existence-check via axl_file_info (so we can distinguish
- * "missing" from "parse failed"), then axl_json_load_file_flags
- * with the @c AXL_JSON_PARSER_JSON5 grammar.
+ * "missing" from "parse failed"), then axl_json_load_file
+ * with the @c AXL_JSON_JSON5 grammar.
  *
  * On @c AXL_SIDECAR_OK, the caller owns @p r and @p *out_raw and must
  * release them with axl_json_free followed by @c axl_free

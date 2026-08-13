@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-ipmi.h:
+/** @file axl-ipmi.h
  *
  * Local BMC access via IPMI transports (KCS, SSIF, EDKII vendor
  * protocol, Dell vendor protocol). Auto-detects the best available
@@ -181,7 +180,7 @@ typedef int (*AxlIpmiSendRaw)(
     size_t           req_len,
     uint8_t         *resp,
     size_t          *resp_len
-    );
+    ) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Open an IPMI session backed by a caller-supplied transport
@@ -333,9 +332,10 @@ typedef struct {
 } AxlIpmiSelEntry;
 
 int axl_ipmi_sel_get_entry(
-    AxlIpmiSession    *session,
+    AxlIpmiSession    *session,       ///< open IPMI session
     uint16_t           record_id,     ///< 0x0000 = first, 0xFFFF = last
-    AxlIpmiSelEntry   *out
+    AxlIpmiSelEntry   *out            ///< [out] receives the entry (envelope decoded;
+                                      ///< `record` stays the raw 16 bytes)
     );
 
 /**

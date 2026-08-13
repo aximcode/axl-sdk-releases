@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-config.h:
+/** @file axl-config.h
  *
  * Live object property bag. Declare typed options once in a
  * descriptor table; mutate at runtime via axl_config_set;
@@ -113,7 +112,7 @@ typedef int (*AxlConfigApplyFunc)(
     void       *target,  ///< opaque pointer from axl_config_new
     const char *key,     ///< option key
     const char *value    ///< new value (string)
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Create a config object from descriptors.

@@ -520,10 +520,19 @@ static bool parse_script(const char *text, size_t len)
         case 'a': case 'i': case 'c':
             c->text = parse_text(&p);
             break;
+        /* `:` DEFINES a label; `b`/`t`/`T` REFERENCE one. Both parse a bare
+           token, so the bodies coincide -- but they are opposite sides of the
+           same relation, and the rest of the file depends on telling them
+           apart: resolve_labels() scans for `:` to find a target and for
+           b/t/T to fix one up, and the executor skips a `:` while the others
+           jump. Folding them into one case list would read as "same command",
+           which is precisely what is not true. */
+        // NOLINTBEGIN(bugprone-branch-clone)
         case ':': c->text = parse_token(&p); break;       /* label name */
         case 'b': case 't': case 'T':
             c->text = parse_token(&p);                    /* may be empty => end */
             break;
+        // NOLINTEND(bugprone-branch-clone)
         case 'r': case 'R': case 'w': case 'W':
             c->text = parse_filename(&p);
             break;
@@ -612,8 +621,15 @@ static bool addr_one_match(const Addr *a)
     case A_RE:   return addr_re_match(a->re);
     case A_STEP: return a->step > 0 ? (line_no >= a->n && (line_no - a->n) % a->step == 0)
                                     : (line_no == a->n);
+    /* Same answer, different questions. A_ZERO is `0` used as a RANGE START
+       (`0,/re/`), which by construction never matches a line on its own --
+       cmd_selected() handles it explicitly rather than through here. `default`
+       is the unreachable-enum guard. Merging them would lose the record that
+       A_ZERO is a case someone thought about. */
+    // NOLINTBEGIN(bugprone-branch-clone)
     case A_ZERO: return false;                 /* only meaningful as a range start */
     default:     return false;
+    // NOLINTEND(bugprone-branch-clone)
     }
 }
 

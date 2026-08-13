@@ -64,7 +64,10 @@ void axl_stream_init(void);
 unsigned long long axl_backend_resolve_exit_status(int rc);
 
 #ifdef AXL_MEM_DEBUG
-void axl_mem_dump_leaks(void);
+/* Declared in src/mem/axl-mem-internal.h; hand-declared here for the same
+ * reason as the hooks above — this stub links against libaxl.a but does not
+ * pull in the runtime's internal headers. */
+void _axl_mem_dump_leaks_at_exit(void);
 #endif
 
 /* User's application entry point. */
@@ -91,7 +94,7 @@ _AxlEntry(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     _axl_args_free();
 
 #ifdef AXL_MEM_DEBUG
-    axl_mem_dump_leaks();
+    _axl_mem_dump_leaks_at_exit();
 #endif
 
     /* A pending axl_set_exit_status (if any) overrides the rc->status map, so

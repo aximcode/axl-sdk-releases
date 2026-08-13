@@ -1484,11 +1484,7 @@ static void
 test_piece_tree_save_reports_a_failed_flush(void)
 {
     if (!ff_fs_up()) {
-        axl_printf("SKIP: piece_tree save flush-fail (no shell map for the "
-                   "published volume)\n");
-        test_check(true, "pt flush-fail: save status SKIP balance");
-        test_check(true, "pt flush-fail: target SKIP balance");
-        test_check(true, "pt flush-fail: dirty SKIP balance");
+        test_skip_n(3, "piece_tree save flush-fail (no shell map for the published volume)");
         return;
     }
 

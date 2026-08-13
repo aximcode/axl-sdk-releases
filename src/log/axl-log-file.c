@@ -13,6 +13,7 @@
 #include <axl/axl-str.h>
 #include <axl/axl-mem.h>
 #include "../fs/axl-file-gen.h"
+#include "axl-log-line.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,16 +21,6 @@
 
 #define FILE_BUF_SIZE   4096
 #define FLUSH_THRESHOLD (FILE_BUF_SIZE * 3 / 4)
-
-// ---------------------------------------------------------------------------
-// Position tracker for manual line building
-// ---------------------------------------------------------------------------
-
-typedef struct {
-    char   *buf;
-    size_t  pos;
-    size_t  size;
-} BufCtx;
 
 // ---------------------------------------------------------------------------
 // Global State (single file handler)
@@ -41,75 +32,8 @@ static size_t             mFileBufPos  = 0;
 static uint32_t           mFileGenKey  = 0;   /* write registry slot for the log path */
 
 // ---------------------------------------------------------------------------
-// Level Tags
-// ---------------------------------------------------------------------------
-
-static const char *mFileLevelTag[] = {
-    "ERROR",
-    "WARN ",
-    "INFO ",
-    "DEBUG",
-    "TRACE"
-};
-
-// ---------------------------------------------------------------------------
 // Internal Helpers
 // ---------------------------------------------------------------------------
-
-static size_t
-format_timestamp(char *buf, size_t buf_size)
-{
-    AxlTime time;
-
-    if (axl_backend_get_time(&time) != AXL_OK) {
-        axl_strlcpy(buf, "0000-00-00T00:00:00.000000 ", buf_size);
-        return axl_strlen(buf);
-    }
-
-    unsigned y = time.year, mo = time.month, d = time.day;
-    unsigned h = time.hour, mi = time.minute, s = time.second;
-    /* Prefer the monotonic counter for sub-second precision —
-       firmware Nanosecond is 0 on every platform we test on. */
-    unsigned us = time.nanosecond / 1000;
-    if (us == 0) {
-        uint64_t mono = axl_backend_get_monotonic_us();
-        if (mono > 0) {
-            us = (unsigned)(mono % 1000000u);
-        }
-    }
-
-    int p = 0;
-    buf[p++] = '0' + (y / 1000) % 10;
-    buf[p++] = '0' + (y / 100) % 10;
-    buf[p++] = '0' + (y / 10) % 10;
-    buf[p++] = '0' + y % 10;
-    buf[p++] = '-';
-    buf[p++] = '0' + mo / 10;
-    buf[p++] = '0' + mo % 10;
-    buf[p++] = '-';
-    buf[p++] = '0' + d / 10;
-    buf[p++] = '0' + d % 10;
-    buf[p++] = 'T';
-    buf[p++] = '0' + h / 10;
-    buf[p++] = '0' + h % 10;
-    buf[p++] = ':';
-    buf[p++] = '0' + mi / 10;
-    buf[p++] = '0' + mi % 10;
-    buf[p++] = ':';
-    buf[p++] = '0' + s / 10;
-    buf[p++] = '0' + s % 10;
-    buf[p++] = '.';
-    buf[p++] = '0' + (us / 100000) % 10;
-    buf[p++] = '0' + (us / 10000) % 10;
-    buf[p++] = '0' + (us / 1000) % 10;
-    buf[p++] = '0' + (us / 100) % 10;
-    buf[p++] = '0' + (us / 10) % 10;
-    buf[p++] = '0' + us % 10;
-    buf[p++] = ' ';
-    buf[p] = '\0';
-
-    return (size_t)p;
-}
 
 /* THE one place log records reach the file handle. The buffered drain and
    the oversized-record bypass both go through here so that the write
@@ -188,56 +112,19 @@ append_to_buffer(const char *data, size_t len)
 }
 
 static void
-file_handler(int level, const char *domain, const char *message, void *data)
+file_handler(int level, const char *domain, const char *message,
+             const AxlRealtime *stamp, void *data)
 {
-    char ts_buf[32];
     char line_buf[640];
 
     (void)data;
 
-    format_timestamp(ts_buf, sizeof (ts_buf));
-
-    BufCtx bc = { line_buf, 0, sizeof (line_buf) };
-
-    /* Build the line manually: timestamp [LEVEL] domain: message\n */
-    size_t ts_len = axl_strlen(ts_buf);
-    axl_memcpy(line_buf + bc.pos, ts_buf, ts_len);
-    bc.pos += ts_len;
-
-    if (level >= 0 && level <= AXL_LOG_TRACE) {
-        line_buf[bc.pos++] = '[';
-        const char *tag = mFileLevelTag[level];
-        size_t tag_len = axl_strlen(tag);
-        axl_memcpy(line_buf + bc.pos, tag, tag_len);
-        bc.pos += tag_len;
-        line_buf[bc.pos++] = ']';
-        line_buf[bc.pos++] = ' ';
+    size_t len = axl_log_format_line(line_buf, sizeof(line_buf), level,
+                                     domain, message, stamp, "\n");
+    if (len == 0) {
+        return;
     }
-
-    if (domain != NULL) {
-        size_t dlen = axl_strlen(domain);
-        if (bc.pos + dlen + 2 < sizeof (line_buf) - 2) {
-            axl_memcpy(line_buf + bc.pos, domain, dlen);
-            bc.pos += dlen;
-            line_buf[bc.pos++] = ':';
-            line_buf[bc.pos++] = ' ';
-        }
-    }
-
-    if (message != NULL) {
-        size_t mlen = axl_strlen(message);
-        size_t avail = sizeof (line_buf) - bc.pos - 2;
-        if (mlen > avail) {
-            mlen = avail;
-        }
-        axl_memcpy(line_buf + bc.pos, message, mlen);
-        bc.pos += mlen;
-    }
-
-    line_buf[bc.pos++] = '\n';
-    line_buf[bc.pos] = '\0';
-
-    append_to_buffer(line_buf, bc.pos);
+    append_to_buffer(line_buf, len);
 }
 
 // ---------------------------------------------------------------------------

@@ -6,4 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/axl-cc" -x c++ "$@"
+# Pass our own name through: exec leaves $0 as axl-cc's path (a #! script takes
+# argv from the kernel, so `exec -a` cannot rename it), and without this the
+# help, --version and error messages all name axl-cc instead of what the user
+# actually ran.
+AXL_CC_PROGNAME="$(basename "$0")" exec "$SCRIPT_DIR/axl-cc" -x c++ "$@"

@@ -296,8 +296,13 @@ axl_gfx_recommended_scale(void);
 /// screen in one operation.
 typedef struct AxlGfxBuffer AxlGfxBuffer;
 
-/// Allocate an off-screen buffer.  Pixels are uninitialized — call
-/// axl_gfx_buffer_clear before first use if you want a known background.
+/// Allocate an off-screen buffer, zero-filled (transparent black).
+///
+/// Zeroed rather than left undefined because the buffer-wide readers —
+/// axl_gfx_buffer_blur and the compositor — read every pixel, not just the
+/// ones you drew. Undefined bytes would be smeared into a shape's halo and
+/// presented, leaking heap contents to the display. Call
+/// axl_gfx_buffer_clear if you want a different background.
 ///
 /// @return new buffer (caller frees with axl_gfx_buffer_free), or NULL
 ///         on allocation failure or invalid dimensions (w == 0 or h == 0).

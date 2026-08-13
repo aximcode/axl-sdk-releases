@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-socket.h:
+/** @file axl-socket.h
  *
  * Unified socket abstraction. AxlSocket wraps AxlTcp (stream) and
  * AxlUdp (datagram) behind a single API. Blocking and async
@@ -77,7 +76,7 @@ typedef bool (*AxlSocketCallback)(
     AxlSocket *sock,    ///< socket
     AxlStatus  status,  ///< AXL_OK on success, AXL_ERR on error, AXL_CANCELLED on cancel
     void      *data     ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Lifecycle

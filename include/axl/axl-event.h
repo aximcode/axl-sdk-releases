@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-event.h:
+/** @file axl-event.h
  *
  * Foundational one-shot latch. Wraps a UEFI event with signalled /
  * reset state. The building block for producer-waiter rendezvous

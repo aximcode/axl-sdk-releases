@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-xml.h:
+/** @file axl-xml.h
  *
  * Streaming XML writer + pull-token reader. Caller-managed
  * namespaces: the writer treats qnames like `D:multistatus` as
@@ -37,14 +36,103 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 /**
- * AxlXmlWriterFlags:
+ * AxlXmlFlags:
  *
- * Flags passed to axl_xml_writer_init.
+ * One 64-bit flag word for the XML writer, laid out to AGREE WITH
+ * #AxlJsonFlags wherever the two express the same idea.
+ *
+ * @par Why the layout is shared
+ *
+ * It was `AxlXmlWriterFlags`, a 2-value enum whose `AXL_XML_WRITER_PRETTY`
+ * was `1 << 0` — the same bit as `AXL_JSON_ALLOW_COMMENTS`. Both are plain
+ * integers in C, so `axl_json_writer_init(&w, out, AXL_XML_WRITER_PRETTY)`
+ * COMPILED and silently asked for JSON comments; gcc even suggested the XML
+ * name when a removed JSON one was used.
+ *
+ * A separate typedef does NOT fix that. `typedef uint64_t AxlXmlFlags` and
+ * `typedef uint64_t AxlJsonFlags` are the SAME TYPE to a C compiler, so the
+ * mistake still compiles. What fixes it is that **the same bit now means the
+ * same thing**: #AXL_XML_INDENT and `AXL_JSON_INDENT` are bit-for-bit
+ * identical, so handing one writer the other's indent request is not a trap,
+ * it is simply correct. Cross-use is either right or diagnosable — never
+ * silently a different feature.
+ *
+ * The other half is that XML defines nothing in JSON's dialect range (bits
+ * 0-9), and axl_xml_writer_init() REFUSES any bit it does not define. So a
+ * stray `AXL_JSON_ALLOW_COMMENTS` reaching the XML writer sets the sticky
+ * error rather than doing something arbitrary.
+ *
+ * @note The reverse direction is weaker, and honestly so: `axl_json_writer_init`
+ *     validates only the UTF-8 field's reserved value, not unknown bits
+ *     generally, so an XML-only flag reaching it would be ignored rather than
+ *     refused. There are no XML-only flags today — the whole XML vocabulary is
+ *     shared — so nothing can currently take that path.
+ * @{
  */
-typedef enum {
-    AXL_XML_WRITER_DEFAULT = 0,         ///< compact output (no indent / no newlines)
-    AXL_XML_WRITER_PRETTY  = 1u << 0,   ///< 2-space indent + newlines between elements
-} AxlXmlWriterFlags;
+typedef uint64_t AxlXmlFlags;
+
+/// Compact output: no indent, no newlines between elements.
+#define AXL_XML_DEFAULT      ((AxlXmlFlags)0)
+
+/** Set by #AXL_XML_INDENT; distinguishes "no indent requested" (compact) from
+ *  `AXL_XML_INDENT(0)` (newlines, zero indent). Bit 17, matching
+ *  `AXL_JSON_HAS_INDENT`. */
+#define AXL_XML_HAS_INDENT   ((AxlXmlFlags)1 << 17)
+
+/// Widest indent the packed field can hold. Matches `AXL_JSON_INDENT_MAX`.
+#define AXL_XML_INDENT_MAX   63u
+
+/** Pretty-print with @a n spaces per level, and newlines between elements.
+ *
+ * `AXL_XML_INDENT(2)` is what `AXL_XML_WRITER_PRETTY` used to mean, byte for
+ * byte — the width was hardcoded at 2, and making it a parameter is what the
+ * shared layout buys for free.
+ *
+ * CLAMPS to #AXL_XML_INDENT_MAX rather than masking, for the reason
+ * `AXL_JSON_INDENT` does: masking wraps an over-large width to a SMALLER one
+ * (64 would become 0, i.e. no indent at all), which is a silent wrong answer
+ * for a caller that computed the width at runtime. Clamping is wrong in a way
+ * you can see.
+ *
+ * A MACRO, so it stays a constant expression usable in a file-scope
+ * initializer and a C++ `constexpr`. That costs evaluating @a n twice — use
+ * axl_xml_indent() for a side-effecting or runtime width. */
+#define AXL_XML_INDENT(n)                                                   \
+    (AXL_XML_HAS_INDENT |                                                   \
+     ((AxlXmlFlags)((uint32_t)(n) > AXL_XML_INDENT_MAX                      \
+                    ? AXL_XML_INDENT_MAX : (uint32_t)(n)) << 32))
+
+/// The indent WIDTH field as a mask over the flags word (bits 32-37).
+#define AXL_XML_INDENT_MASK  ((AxlXmlFlags)0x3F << 32)
+
+/// Extract the indent width (0 when #AXL_XML_HAS_INDENT is clear).
+#define AXL_XML_INDENT_OF(f) \
+    ((uint32_t)((((AxlXmlFlags)(f)) & AXL_XML_INDENT_MASK) >> 32))
+
+/** Every bit the XML writer defines. Anything outside this is refused by
+ *  axl_xml_writer_init() — which is what stops a JSON dialect bit from
+ *  arriving here and meaning nothing in particular. */
+#define AXL_XML_KNOWN_MASK   (AXL_XML_HAS_INDENT | AXL_XML_INDENT_MASK)
+
+/**
+ * @brief Single-evaluation form of #AXL_XML_INDENT, for a runtime width.
+ *
+ * Same clamping, but evaluates @a n once. Not a constant expression; prefer
+ * the macro when you need one. Mirrors axl_json_indent().
+ *
+ * @return the flags word for an @a n-space indent.
+ */
+static inline AxlXmlFlags
+axl_xml_indent(
+    uint32_t  n    ///< spaces per level; clamped to #AXL_XML_INDENT_MAX
+)
+{
+    if (n > AXL_XML_INDENT_MAX) {
+        n = AXL_XML_INDENT_MAX;
+    }
+    return AXL_XML_HAS_INDENT | ((AxlXmlFlags)n << 32);
+}
+/** @} */
 
 /// Maximum open-tag nesting the writer's balance stack tracks.
 /// Exceeding this sets the sticky error flag.
@@ -67,7 +155,7 @@ typedef enum {
  */
 typedef struct {
     AxlString  *out;                                 ///< backing store (caller-owned)
-    uint32_t    flags;                               ///< AxlXmlWriterFlags
+    AxlXmlFlags flags;                               ///< AxlXmlFlags in effect
     uint32_t    depth;                               ///< current open-tag depth (0..MAX)
     bool        in_start_tag;                        ///< inside `<foo`, attrs/text/close pending
     bool        prologue_emitted;                    ///< prologue may only be emitted once
@@ -89,12 +177,16 @@ typedef struct {
  * The writer appends to @p out — it does not clear it. To reuse a
  * string between writes, the caller calls axl_string_clear
  * before init.
+ *
+ * @p flags outside #AXL_XML_KNOWN_MASK set the sticky error immediately, so a
+ * flag from another module's vocabulary is refused rather than ignored. See
+ * #AxlXmlFlags for why that matters and what it does not cover.
  */
 void
 axl_xml_writer_init(
     AxlXmlWriter *w,      ///< writer to initialize
     AxlString    *out,    ///< destination string (caller-owned)
-    uint32_t      flags   ///< AxlXmlWriterFlags bitmask
+    AxlXmlFlags   flags   ///< #AXL_XML_DEFAULT or #AXL_XML_INDENT(n)
 );
 
 /**
@@ -349,7 +441,7 @@ axl_xml_reader_attr(
  */
 bool
 axl_xml_reader_error(
-    const AxlXmlReader *r,
+    const AxlXmlReader *r,       ///< reader
     uint32_t           *line,    ///< [out, optional] 1-based line of the error
     uint32_t           *col,     ///< [out, optional] 1-based column of the error
     const char        **msg      ///< [out, optional] static error message
@@ -383,7 +475,7 @@ axl_xml_reader_free(
  */
 const char *
 axl_xml_token_local_name(
-    const AxlXmlToken *tok,
+    const AxlXmlToken *tok,      ///< token
     size_t            *out_len   ///< [out] local-name byte length (NULL OK)
 );
 

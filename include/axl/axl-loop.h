@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-loop.h:
+/** @file axl-loop.h
  *
  * AxlLoop — event loop with timer, keyboard, idle, protocol
  * notification, and raw event sources. The model maps directly
@@ -19,6 +18,8 @@
 #ifndef AXL_LOOP_H
 #define AXL_LOOP_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,7 +30,7 @@
 extern "C" {
 #endif
 
-typedef struct AxlLoop AxlLoop;
+typedef struct AxlLoop AxlLoop;   ///< Opaque event loop.
 
 /**
  * AxlSourceId:
@@ -90,7 +91,7 @@ typedef struct {
  */
 typedef bool (*AxlLoopCallback)(
     void *data ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * AxlKeyCallback:
@@ -103,7 +104,7 @@ typedef bool (*AxlLoopCallback)(
 typedef bool (*AxlKeyCallback)(
     AxlInputKey key, ///< key data
     void       *data ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Lifecycle

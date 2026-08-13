@@ -10,6 +10,11 @@
 #ifndef AXL_UEFI_GEN_ALL_H
 #define AXL_UEFI_GEN_ALL_H
 
+#if !defined(AXL_ALLOW_UEFI)
+#  error "<uefi/...> is not available to applications. Use the axl_* API; build a driver with `axl-cc --type driver` (CMake: axl_add_driver), or pass `--allow-uefi` (CMake: ALLOW_UEFI) to opt in deliberately."
+#endif
+
+
 #include "calling.h"
 #include "types.h"
 #include "status.h"

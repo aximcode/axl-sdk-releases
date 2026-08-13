@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-udp.h:
+/** @file axl-udp.h
  *
  * UDP datagram sockets. Fire-and-forget send, request-response
  * send-receive, and async loop-integrated receive.
@@ -127,7 +126,7 @@ typedef bool (*AxlUdpSendCallback)(
     AxlUdp *sock,    ///< socket
     AxlStatus     status,  ///< AXL_OK / AXL_ERR / AXL_CANCELLED
     void         *data     ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Async send — initiates Transmit, callback on completion.
@@ -332,7 +331,7 @@ typedef bool (*AxlUdpCallback)(
     const AxlIPv4Address *from,       ///< sender address (NULL on err/cancel)
     uint16_t              from_port,  ///< sender port (0 on err/cancel)
     void                 *user_data   ///< caller context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Async receive — fires @p cb for each incoming datagram via

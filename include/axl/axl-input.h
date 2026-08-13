@@ -359,7 +359,7 @@ axl_input_ctrl_letter(uint32_t unicode, uint32_t modifiers);
 typedef bool (*AxlInputCallback)(
     const AxlInputEvent  *event,  ///< [in] event payload (valid only during call)
     void                 *data    ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 // ===================================================================
 // Source registration (axl-loop integration)
@@ -421,9 +421,9 @@ axl_input_attach_mouse(
 ///         mouse source is already attached).
 AxlSourceId
 axl_input_attach_mouse_ifaces(
-    AxlLoop           *loop,
-    AxlInputCallback   cb,
-    void              *data,
+    AxlLoop           *loop,     ///< loop to poll on (must be non-NULL)
+    AxlInputCallback   cb,       ///< invoked for each event (must be non-NULL)
+    void              *data,     ///< opaque, passed back to @p cb (may be NULL)
     void *const       *ifaces,   ///< array of EFI_SIMPLE_POINTER_PROTOCOL* (as void*)
     int                n         ///< count of @p ifaces (1..AXL_MAX_POINTER_IFACES)
     );

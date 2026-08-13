@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-efi-status.h:
+/** @file axl-efi-status.h
  *
  * AXL aliases for the firmware-defined `EFI_STATUS` wire-format
  * return type, plus the most common UEFI 2.11 Appendix D error

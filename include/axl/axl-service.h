@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-service.h:
+/** @file axl-service.h
  *
  * Driver-shaped lifecycle wrapper over AxlLoop. An AxlService is
  * the typed shape for a long-running event loop: a setup callback
@@ -44,6 +43,8 @@
 
 #ifndef AXL_SERVICE_H
 #define AXL_SERVICE_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -92,7 +93,7 @@ extern "C" {
  * @return AXL_OK if the service is ready to dispatch; AXL_ERR on any
  *     setup failure (consumer has already cleaned up).
  */
-typedef int (*AxlServiceSetup)(AxlLoop *loop, void *user);
+typedef int (*AxlServiceSetup)(AxlLoop *loop, void *user) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Teardown callback — releases what setup built.
@@ -107,7 +108,7 @@ typedef int (*AxlServiceSetup)(AxlLoop *loop, void *user);
  * `axl_service_stop` returning AXL_ERR with the SDK's
  * EFI_ACCESS_DENIED warning at axl-driver.c.
  */
-typedef int (*AxlServiceTeardown)(void *user);
+typedef int (*AxlServiceTeardown)(void *user) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Service descriptor
@@ -236,7 +237,7 @@ axl_service_attach_driver(
  */
 int
 axl_service_detach_driver(
-    AxlLoop          *loop,
+    AxlLoop          *loop,    ///< loop the dispatch was attached to
     const AxlService *svc      ///< accepted but currently only NULL-checked;
                                ///< reserved for future per-service detach work
                                ///< and kept in the signature for source-compat

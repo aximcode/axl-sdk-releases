@@ -12,6 +12,32 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
 SDK_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Toolchain locations come from ONE file so this driver, the Makefile and the
+# GENERATED axl-config.cmake cannot drift -- the same three-build-path split
+# check-flag-parity polices for compile flags. It sits beside this script in a
+# source tree and under share/axl/ when installed from a package, so try both
+# rather than assuming a layout.
+#
+# Sourcing is best-effort on purpose: a pure-C build must not fail over a
+# missing C++ toolchain manifest. The C++ path below errors if the resolved
+# compiler is empty, which is where a missing conf actually matters.
+for _axl_conf in "$SCRIPT_DIR/axl-toolchains.conf" \
+                 "$SDK_DIR/share/axl/axl-toolchains.conf"; do
+    if [[ -r "$_axl_conf" ]]; then
+        # shellcheck source=/dev/null
+        . "$_axl_conf"
+        break
+    fi
+done
+
+# The name to print in --help / --version / diagnostics. axl-c++ `exec`s this
+# script, and exec leaves $0 as the SCRIPT's path (a #! interpreter takes argv
+# from the kernel, so `exec -a` cannot rename it) — so the alias passes its own
+# name through the environment instead. Without this, `axl-c++ --help` printed
+# "Usage: axl-cc ...", telling the user to run a different command than the one
+# they invoked.
+AXL_PROG="${AXL_CC_PROGNAME:-$(basename "$0")}"
+
 ARCH="x64"
 TYPE="app"
 BUILD="release"
@@ -23,6 +49,26 @@ RUN=false
 RUN_ARGS=()
 SOURCES=()
 CFLAGS_EXTRA=()
+# -std is tracked PER LANGUAGE rather than in the shared CFLAGS_EXTRA. Those
+# extras are expanded AFTER the baked-in flags on both compile lines, so a C
+# standard passed by the caller used to land on the g++ line as well:
+# `g++ -std=c++23 ... -std=gnu2x` draws "valid for C/ObjC but not for C++",
+# which -Werror (also forwarded) turns into a hard error. Measured, both.
+#
+# C deliberately gets NO default here, unlike C++. The library itself is built
+# -std=gnu2x, but that does not propagate to consumers and does not need to:
+# the public headers compile clean under -std=gnu17 -Wall -Wextra, and the two
+# C23 spellings they do use -- `[[nodiscard]]` and `[[noreturn]]` via
+# axl-macros.h -- are honoured by gcc as an extension in the older C modes
+# (verified: -Wunused-result fires identically under gnu17 and gnu2x). Pinning
+# a standard here would instead RISK breaking consumers, since C23 makes bool /
+# true / false / nullptr keywords and redefines `()` in a declaration.
+STD_C=()
+STD_CXX=(-std=c++23)
+# Distinguishes a caller-supplied C++ standard from the default above, so the
+# reachability check can complain about the former without ever tripping on
+# the latter (every pure-C build carries the default).
+STD_CXX_SET=false
 LDFLAGS_USER=()
 EMBEDS=()
 SERVICE_NAME=""
@@ -37,12 +83,41 @@ FORCE_LANG=""
 # consumers build their own .a libraries that then link via a
 # subsequent axl-cc invocation.
 COMPILE_ONLY=false
+# --hosted: compile C++ translation units as HOSTED rather than freestanding.
+#
+# libstdc++ refuses <vector>/<string>/<map>/<unordered_map> under
+# -ffreestanding, at bits/requires_hosted.h. Two things lift that, and only
+# together: dropping -ffreestanding (NOT -D_GLIBCXX_HOSTED=1, which the header
+# does not consult), and dropping the compat header shims -- include/compat's
+# `typedef void FILE` collides with the real <stdio.h> that hosted libstdc++
+# pulls in, and that collision is what blocks <string> and <memory>.
+#
+# -ffreestanding is per-TU and appending -fhosted after it does NOT override
+# it, so this cannot be a flag the caller passes through -- it has to change
+# what axl-cc builds.
+#
+# C sources are untouched: libaxl.a stays freestanding, and a mixed image
+# links and runs. The whole libc footprint of a hosted TU using vector +
+# string + map + unordered_map is memcpy, memmove, memset, memcmp and strlen,
+# all of which libaxl.a already defines.
+HOSTED=false
+ALLOW_UEFI=false
 # --depfile <path>: axl-cc-owned dependency-file generation. Compiles the BARE
 # source unchanged (object stays bit-identical) and writes <path> as a Make
-# dependency file whose dependency paths are ABSOLUTE — unlike a forwarded
-# `-MMD -MF` (which emits compile-cwd-relative paths). Absolute paths let
-# CMake's add_custom_command(DEPFILE ...) (CMP0116) resolve them regardless of
-# its relative base. Empty = disabled.
+# dependency file whose dependency paths are all ABSOLUTE. That lets CMake's
+# add_custom_command(DEPFILE ...) (CMP0116) resolve them regardless of its
+# relative base. Empty = disabled.
+#
+# Neither forwarded gcc flag gives you that, for two DIFFERENT reasons — gcc
+# records each prerequisite exactly as it RESOLVED it, and the SDK reaches the
+# compile via -isystem:
+#   -MMD  skips system headers, so it omits the SDK headers ENTIRELY. Not
+#         awkward paths — no SDK dependency tracking at all.
+#   -MD   does list them, but the file is MIXED: relative for a relative -I
+#         (and for the source itself), absolute for -isystem and for the
+#         toolchain's own headers. Mixed is what CMake cannot rebase.
+# For plain make either forwarded form works — make resolves both, so this
+# option is aimed at CMake. Pinned by test/integration/test-axl-cc-flags.sh.
 DEPFILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -56,6 +131,8 @@ while [[ $# -gt 0 ]]; do
         --embed)    EMBEDS+=("$2"); shift 2 ;;
         --service)  SERVICE_NAME="$2"; shift 2 ;;
         --depfile)  DEPFILE="$2"; shift 2 ;;
+        --hosted)   HOSTED=true; shift ;;
+        --allow-uefi) ALLOW_UEFI=true; shift ;;
         -x)         FORCE_LANG="$2"; shift 2 ;;
         -c)         COMPILE_ONLY=true; shift ;;
         --run)      RUN=true; shift
@@ -78,7 +155,13 @@ while [[ $# -gt 0 ]]; do
         -I*|-D*|-W*|-Wno-*)
             CFLAGS_EXTRA+=("$1"); shift ;;
         -std=*)
-            CFLAGS_EXTRA+=("$1"); shift ;;
+            # Route by language so a C standard never reaches g++ (and vice
+            # versa). Both C++ spellings are `c++NN` / `gnu++NN`.
+            case "${1#-std=}" in
+                c++*|gnu++*) STD_CXX=("$1"); STD_CXX_SET=true ;;
+                *)           STD_C=("$1") ;;
+            esac
+            shift ;;
         -f*)
             CFLAGS_EXTRA+=("$1"); shift ;;
         # Compiler flags that take a SEPARATE arg token (dependency-file
@@ -89,28 +172,32 @@ while [[ $# -gt 0 ]]; do
         --version)
             VER=$(cat "$SDK_DIR/share/axl/version" 2>/dev/null || echo "unknown")
             DATE=$(cat "$SDK_DIR/share/axl/build-date" 2>/dev/null || echo "unknown")
-            echo "axl-cc $VER (gcc, built $DATE)"
+            echo "$AXL_PROG $VER (gcc, built $DATE)"
             exit 0 ;;
         -h|--help)
             # Quoted delimiter: the body is literal — an unquoted <<HELP
             # would run the backticked `ar rcs` in the examples as a
             # command substitution (printing ar's usage instead of ours).
-            cat <<'HELP'
-axl-cc -- compile C or C++ source to UEFI binary (.efi)
+            # @PROG@ is substituted afterwards by sed rather than by the shell,
+            # so the invoked name reaches the text without giving up that
+            # protection.
+            cat <<'HELP' | sed "s|@PROG@|$AXL_PROG|g"
+@PROG@ -- compile C or C++ source to UEFI binary (.efi)
 
-Usage: axl-cc [OPTIONS] source.c [source2.cpp ...] [-o output.efi]
-       axl-cc [OPTIONS] source.c --run [run-qemu args...]
+Usage: @PROG@ [OPTIONS] source.c [source2.cpp ...] [-o output.efi]
+       @PROG@ [OPTIONS] source.c --run [run-qemu args...]
 
 Sources are dispatched per file extension: .c → gcc; .cpp / .cc /
-.cxx → g++ (with -fno-exceptions -fno-rtti -std=c++20 baked in).
-Mixed C/C++ projects work naturally — pass all sources, axl-cc
+.cxx → g++ (with -fno-exceptions -fno-rtti -std=c++23 baked in).
+Mixed C/C++ projects work naturally — pass all sources, @PROG@
 picks the right compiler per file.  Use -x c++ to force C++ mode
 for files with non-standard extensions.
 
 C++ compilation requires the bare-metal toolchain on AArch64
-(install via scripts/install-arm-toolchain.sh) and host g++ on
-x64.  axl-cc auto-appends libaxl-cxx.a to the link line when any
-C++ source is compiled; pure-C builds skip this.
+(install via `axl-install-toolchain aa64`) and host g++ on x64.
+Set AXL_AA64_GXX / AXL_X64_GXX to override either.  @PROG@
+auto-appends libaxl-cxx.a to the link line when any C++ source
+is compiled; pure-C builds skip this.
 
 Options:
   --arch x64|aa64       Target architecture (default: x64)
@@ -137,14 +224,44 @@ Options:
                         AXL_SERVICE(svc) macro in the source. -o is
                         ignored; output goes to NAME{,-dxe}.efi in
                         the current directory.
+                        RTTI: pass -frtti to enable typeid and
+                        dynamic_cast. Works with --hosted, where
+                        libstdc++.a supplies the type_info vtables and
+                        __dynamic_cast. A freestanding -frtti build
+                        COMPILES but does not link -- those live in
+                        libsupc++, which a firmware image does not
+                        carry. Off by default: the type_info objects
+                        cost image size for every polymorphic class.
+  --allow-uefi          Permit <uefi/axl-uefi.h> in an APPLICATION.
+                        Raw UEFI is off by default for apps -- the
+                        header refuses to compile without it, so
+                        reaching EDK2 takes a deliberate flag that is
+                        visible on the build line instead of an
+                        #include buried in a source file. Drivers
+                        (--type driver) are granted it automatically,
+                        since implementing a protocol means using that
+                        protocol's types. Prefer an axl_* API; if none
+                        covers your case, that gap is worth reporting.
+
+  --hosted              Compile C++ sources as HOSTED instead of
+                        freestanding, and link the toolchain's
+                        libstdc++.a. This is what makes std::vector,
+                        std::string, std::map and std::unordered_map
+                        usable: libstdc++ refuses them under
+                        -ffreestanding at bits/requires_hosted.h.
+                        Affects C++ only -- C sources and libaxl.a
+                        stay freestanding, and a mixed image links.
+                        Still -fno-exceptions / -fno-rtti: a failed
+                        allocation or a bad at() HALTS (see
+                        axl::arena_allocator for paths that must not).
   -x LANG               Force language for subsequent sources: 'c' or
                         'c++'. Default is per-file by extension.
   -c                    Compile only; skip the link / objcopy /
                         pe-set-debug steps.  Each source becomes a
                         single .o.  Lets consumers build their own
                         .a libraries (via `ar rcs`) that subsequent
-                        axl-cc invocations link against.  Pre-built
-                        .o and .a files passed to axl-cc are linked
+                        @PROG@ invocations link against.  Pre-built
+                        .o and .a files passed to @PROG@ are linked
                         straight through (not re-compiled), enabling
                         the same staged-build pattern.
   --run                 Build and run in QEMU (remaining args passed to run-qemu.sh)
@@ -154,7 +271,9 @@ Options:
   -DNAME[=VALUE]        Define preprocessor macro
   -Wfoo / -Wno-foo      Warning flags
   -ffoo                 Compiler flags
-  -std=...              C/C++ standard (default: gnu2x for C, c++20 for C++)
+  -std=...              C/C++ standard. Applied to the matching language only,
+                        so it is safe in a mixed C/C++ build. C++ defaults to
+                        c++23; C is left at the compiler's own default.
   -<flag>               Any other single-dash flag is forwarded to the
                         compiler (C and C++) -- e.g. -O2, -g3, -pedantic, and
                         gcc dependency-generation flags (-MMD -MP -MF <f>
@@ -166,33 +285,49 @@ Options:
                         unchanged (objects stay bit-identical). One source: DEST
                         is the .d path. Multiple sources: DEST is a directory
                         and each object gets <base>.d inside it. Use this for
-                        CMake add_custom_command(DEPFILE ...); a plain forwarded
-                        -MMD/-MF emits compile-cwd-relative paths CMake misses.
+                        CMake add_custom_command(DEPFILE ...): forwarded -MMD
+                        omits SDK headers entirely (they arrive via -isystem,
+                        which -MMD skips), and forwarded -MD does list them but
+                        gives a MIXED relative/absolute file CMake cannot
+                        rebase. For plain make, either forwarded form is fine.
   -v, --verbose         Print compiler/linker commands
   --version             Show version and build info
   -h, --help            Show this help
 
 Examples:
-  axl-cc hello.c -o hello.efi
-  axl-cc hello.cpp -o hello.efi
-  axl-cc --debug hello.c -o hello.efi
-  axl-cc main.cpp legacy.c -o app.efi      # mixed C/C++
-  axl-cc -x c++ hello.c -o hello.efi       # force C++ mode
-  axl-cc hello.c --run
-  axl-cc --embed mydriver.efi=my_driver launch.c -o launch.efi
-  axl-cc --service my-service service.c
-  axl-cc -c lib1.cpp -o lib1.o                 # compile-only
+  @PROG@ hello.c -o hello.efi
+  @PROG@ hello.cpp -o hello.efi
+  @PROG@ --debug hello.c -o hello.efi
+  @PROG@ main.cpp legacy.c -o app.efi      # mixed C/C++
+  @PROG@ -x c++ hello.c -o hello.efi       # force C++ mode
+  @PROG@ hello.c --run
+  @PROG@ --hosted containers.cpp -o app.efi  # std::vector / map / string
+  @PROG@ --embed mydriver.efi=my_driver launch.c -o launch.efi
+  @PROG@ --service my-service service.c
+  @PROG@ -c lib1.cpp -o lib1.o                 # compile-only
   ar rcs libfoo.a lib1.o lib2.o                # archive your sources
-  axl-cc hello.cpp libfoo.a -o hello.efi       # link against your .a
+  @PROG@ hello.cpp libfoo.a -o hello.efi       # link against your .a
 
 Toolchain: gcc (C), g++ (C++)
 HELP
+            # Invoked through the alias, the extension-dispatch text above is
+            # only half true — -x c++ is already in effect, so say so rather
+            # than leaving the reader to reconcile it.
+            if [[ "$AXL_PROG" == "axl-c++" ]]; then
+                cat <<'CPPALIAS'
+
+Note: axl-c++ is axl-cc with -x c++ already applied, so EVERY source
+compiles as C++ regardless of its extension — the per-extension dispatch
+described above does not apply. Use axl-cc for extension-based dispatch
+(including mixed C/C++ in one command).
+CPPALIAS
+            fi
             exit 0 ;;
         # Unknown --long option: an axl-cc typo, not a compiler flag. Fail
         # clearly rather than forwarding it to gcc/ld or treating it as a source.
         --*)
             echo "ERROR: unknown option: $1" >&2
-            echo "       (run 'axl-cc --help' for axl-cc options)" >&2
+            echo "       (run '$AXL_PROG --help' for $AXL_PROG options)" >&2
             exit 1 ;;
         # Any other single-dash flag we don't consume ourselves is a compiler
         # flag — forward it (matches the gcc/clang driver convention). Covers
@@ -230,9 +365,35 @@ if [[ -n "$SERVICE_NAME" ]]; then
     [[ "$BUILD"   == "debug" ]]   && fwd+=("--debug")
     [[ "$RUNTIME" == "minimal" ]] && fwd+=("--minimal-runtime")
     [[ "$VERBOSE" == "true" ]]    && fwd+=("--verbose")
+    # --hosted must survive the re-invocation, or `--service NAME --hosted`
+    # silently builds both passes freestanding and fails at
+    # bits/requires_hosted.h with no mention of the flag the caller passed.
+    [[ "$HOSTED"  == "true" ]]    && fwd+=("--hosted")
+    # --allow-uefi and -x have the same "survives the re-invocation"
+    # requirement as --hosted, and neither was forwarded. Without the first,
+    # pass 2 (the app) dies on the <uefi/…> #error telling the user to pass a
+    # flag they DID pass. Without the second, `axl-c++ --service` -- which is
+    # axl-cc with `-x c++` pre-applied -- compiled every source with gcc as C.
+    [[ "$ALLOW_UEFI" == "true" ]] && fwd+=("--allow-uefi")
+    [[ -n "$FORCE_LANG" ]]        && fwd+=("-x" "$FORCE_LANG")
     for x in ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"}; do
         fwd+=("$x")
     done
+    # -std lives in its own per-language arrays, NOT in CFLAGS_EXTRA, so it has
+    # to be forwarded explicitly or both sub-builds silently fall back to the
+    # defaults -- a `--service NAME -std=c++20` would compile as c++23 with no
+    # mention of the flag the caller passed. Same failure mode --hosted has
+    # above, same reason it is listed there.
+    #
+    # Only what the CALLER supplied. Forwarding the c++23 DEFAULT would hand
+    # the child an explicit C++ standard it never asked for, and the child's
+    # own reachability check would then reject a pure-C service outright.
+    for x in ${STD_C[@]+"${STD_C[@]}"}; do
+        fwd+=("$x")
+    done
+    if [[ "$STD_CXX_SET" == "true" ]]; then
+        fwd+=("${STD_CXX[@]}")
+    fi
 
     # Pass 1: driver image
     "$SCRIPT_DIR/axl-cc" "${fwd[@]}" \
@@ -335,8 +496,37 @@ if [[ "$VERBOSE" == "true" ]]; then
     echo "[axl-cc] arch=$ARCH type=$TYPE build=$BUILD toolchain=gcc entry=$ENTRY output=$OUTPUT" >&2
 fi
 
+# Stack-smashing detection, on by default. `-mstack-protector-guard=global` is
+# the load-bearing half on x86-64: GCC otherwise reads the canary from
+# %fs:0x28, glibc's TLS block, which UEFI never sets up -- so the plain flag
+# faults instead of protecting. AArch64 already defaults to the global symbol.
+# libaxl.a supplies __stack_chk_guard and __stack_chk_fail.
+#
+# Opt out per invocation with -fno-stack-protector: consumer flags are appended
+# after these, and the last -f wins.
+STACK_PROTECTOR="-fstack-protector-strong -mstack-protector-guard=global"
+
 TMPDIR="/tmp/axl-cc-$$"
 mkdir -p "$TMPDIR"
+
+# Raw UEFI access is granted per IMAGE TYPE, not to everyone with the include
+# path. <uefi/axl-uefi.h> refuses to compile without AXL_ALLOW_UEFI, so an
+# ordinary application can no longer acquire the EDK2 surface by typing an
+# #include -- it has to say so, and then the intent is visible on the build
+# line instead of buried three headers down.
+#
+# Every NON-APP image type is granted it unconditionally -- driver AND runtime.
+# Producing or interposing on a protocol means implementing that protocol's own
+# types, so a shim cannot be written without them and asking for a flag would
+# be noise. Testing `!= app` rather than `== driver` on purpose: a runtime
+# driver is the image MOST likely to need raw UEFI (EFI_RUNTIME_SERVICES,
+# SetVirtualAddressMap), and denying it would push the author toward
+# `--type driver`, which silently builds subsystem 11 instead of 12 -- an image
+# the firmware does not keep resident past ExitBootServices.
+UEFI_DEFINE=()
+if [[ "$TYPE" != "app" || "$ALLOW_UEFI" == "true" ]]; then
+    UEFI_DEFINE=(-DAXL_ALLOW_UEFI)
+fi
 
 # Architecture-specific settings
 case "$ARCH" in
@@ -344,7 +534,13 @@ case "$ARCH" in
           GCC_ARCH="-mno-red-zone -march=x86-64"
           EFI_LDS="$SDK_DIR/lib/axl/elf_x86_64_efi.lds"
           GCC_CRT0="$LIB_DIR/axl-crt0-gcc-x86_64.o"
-          GXX_BIN="g++" ;;
+          # Host g++, deliberately. x64 C++ is freestanding-only today and the
+          # host compiler serves it; adopting AXL's own x86_64-elf toolchain
+          # (AXL_X64_GXX_DEFAULT in axl-toolchains.conf) is task T2 in
+          # AXL-Cxx-Design.md 6a-PLAN, not a side effect of this lookup.
+          # The override is still honoured, so a bare-metal toolchain can be
+          # selected explicitly today.
+          GXX_BIN="${AXL_X64_GXX:-g++}" ;;
     aa64) CROSS="aarch64-linux-gnu-"; PE_TARGET="pei-aarch64-little"
           # -ffixed-x18: UEFI AArch64 binding (UEFI 2.11 §2) reserves
           # x18 as the platform register; without this flag GCC's
@@ -359,7 +555,7 @@ case "$ARCH" in
           # AArch64 C++ uses ARM's bare-metal cross because the
           # Linux-ABI cross's libstdc++ headers pull hosted typedefs.
           # See docs/ROADMAP.md axlmm Toolchain section.
-          GXX_BIN="/opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-g++" ;;
+          GXX_BIN="${AXL_AA64_GXX:-${AXL_AA64_GXX_DEFAULT:-}}" ;;
 esac
 
 # Per-source language detection.  Returns "cpp" or "c" on stdout.
@@ -376,26 +572,83 @@ detect_lang() {
     esac
 }
 
-# Quick scan: any C++ in the source list?  Drives toolchain validation
-# + libaxl-cxx.a auto-link below.  Cheap loop — sources are few.
+# Quick scan: which languages are in the source list?  HAS_CPP drives
+# toolchain validation + libaxl-cxx.a auto-link below; both drive the -std
+# reachability check that follows.  Cheap loop — sources are few.
 HAS_CPP=false
+HAS_C=false
 for src in "${COMPILE_SOURCES[@]}"; do
     if [[ "$(detect_lang "$src")" == "cpp" ]]; then
         HAS_CPP=true
-        break
+    else
+        HAS_C=true
     fi
 done
 
+# A caller-supplied -std that NO source in this build can use would otherwise
+# be dropped in silence, because -std is routed per language. Two ways in:
+# `axl-c++` (which is axl-cc with `-x c++` pre-applied, fixing every source to
+# C++) and plain extension dispatch (`axl-cc -std=gnu2x foo.cpp`). Before the
+# per-language split the compiler itself rejected the mismatch with a clear
+# message; silently building at the wrong standard is strictly worse than that,
+# so say it here.
+#
+# Only when something is actually being COMPILED. A link-only invocation has no
+# source to match against, and passing one flag set to both compile and link
+# steps is an ordinary Makefile pattern -- erroring there would break callers
+# for no benefit.
+if [[ ${#COMPILE_SOURCES[@]} -gt 0 ]]; then
+    if [[ ${#STD_C[@]} -gt 0 && "$HAS_C" == "false" ]]; then
+        echo "ERROR: ${STD_C[*]} names a C standard, but every source in this" >&2
+        echo "       build compiles as C++. Use a c++NN / gnu++NN standard." >&2
+        rm -rf "$TMPDIR"
+        exit 1
+    fi
+    if [[ "$STD_CXX_SET" == "true" && "$HAS_CPP" == "false" ]]; then
+        echo "ERROR: ${STD_CXX[*]} names a C++ standard, but every source in" >&2
+        echo "       this build compiles as C. Use a cNN / gnuNN standard." >&2
+        rm -rf "$TMPDIR"
+        exit 1
+    fi
+fi
+
 # Validate C++ toolchain ONLY when actually needed.  Pure-C builds
-# never reach this; missing g++ is invisible to them.
-if [[ "$HAS_CPP" == "true" ]]; then
-    if [[ ! -x "$GXX_BIN" ]] && ! command -v "$GXX_BIN" &>/dev/null; then
+# never reach this; missing g++ is invisible to them.  --hosted needs
+# it even with no .cpp on this command line, because the link resolves
+# libstdc++.a through `$GXX_BIN -print-file-name`.
+if [[ "$HAS_CPP" == "true" || "$HOSTED" == "true" ]]; then
+    if [[ -z "$GXX_BIN" ]] || { [[ ! -x "$GXX_BIN" ]] && ! command -v "$GXX_BIN" &>/dev/null; }; then
         if [[ "$ARCH" == "aa64" ]]; then
-            echo "ERROR: C++ source detected; aarch64-none-elf-g++ not found at $GXX_BIN" >&2
-            echo "       Install the ARM bare-metal toolchain via:" >&2
-            echo "         scripts/install-arm-toolchain.sh" >&2
+            if [[ -z "$GXX_BIN" ]]; then
+                echo "ERROR: C++ source detected, but no AArch64 compiler is configured." >&2
+                echo "       axl-toolchains.conf was not found beside this script or in" >&2
+                echo "       $SDK_DIR/share/axl/ -- the install may be incomplete." >&2
+            else
+                echo "ERROR: C++ source detected; aarch64-none-elf-g++ not found at $GXX_BIN" >&2
+            fi
+            # Name the installer that EXISTS here. A package install has no
+            # scripts/ directory, so pointing a .deb/.rpm user at
+            # "scripts/install-toolchain.sh" is a dead end -- which is exactly
+            # what this message used to do.
+            if [[ -x "$SDK_DIR/bin/axl-install-toolchain" ]]; then
+                echo "       Install the ARM bare-metal toolchain via:" >&2
+                echo "         axl-install-toolchain aa64" >&2
+            elif [[ -x "$SCRIPT_DIR/install-toolchain.sh" ]]; then
+                echo "       Install the ARM bare-metal toolchain via:" >&2
+                echo "         scripts/install-toolchain.sh aa64" >&2
+            fi
+            echo "       Or set AXL_AA64_GXX to an aarch64-none-elf g++." >&2
         else
-            echo "ERROR: C++ source detected; g++ not found in PATH" >&2
+            # Name the compiler actually configured. Saying "g++ not found in
+            # PATH" when AXL_X64_GXX points at a missing binary is false --
+            # g++ IS in PATH -- and hides the value that needs fixing.
+            if [[ "$GXX_BIN" == "g++" ]]; then
+                echo "ERROR: C++ source detected; g++ not found in PATH" >&2
+                echo "       Or set AXL_X64_GXX to an x86-64 g++." >&2
+            else
+                echo "ERROR: C++ source detected; compiler not found at $GXX_BIN" >&2
+                echo "       (from AXL_X64_GXX)" >&2
+            fi
         fi
         rm -rf "$TMPDIR"
         exit 1
@@ -419,7 +672,7 @@ PE_SET_DEBUG="$SDK_DIR/bin/pe-set-debug"
 
 # Compile.  Per-source: dispatch to gcc (.c) or g++ (.cpp).  The C++
 # flag set is constrained per docs/ROADMAP.md axlmm Toolchain section:
-# -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++20 are
+# -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++23 are
 # hard defaults baked in here — consumers cannot opt in to exceptions
 # or RTTI because the link won't satisfy libsupc++ symbols.
 OBJS=()
@@ -476,26 +729,41 @@ for src in "${COMPILE_SOURCES[@]}"; do
     fi
 
     if [[ "$(detect_lang "$src")" == "cpp" ]]; then
+        # Hosted differs from freestanding in exactly two places, and both
+        # are removals: -ffreestanding, and the compat shim include path.
+        # $GCC_ARCH stays either way -- dropping it is how a hosted spike
+        # picked up AVX from a -march=x86-64-v3 default and #UD'd under a
+        # firmware that runs with CR4.OSXSAVE clear.
+        CXX_MODE_FLAGS=(-ffreestanding)
+        CXX_MODE_INCS=(-isystem "$SDK_DIR/include/axl-sdk"
+                       -isystem "$SDK_DIR/include/axl-sdk/compat")
+        if [[ "$HOSTED" == "true" ]]; then
+            CXX_MODE_FLAGS=()
+            CXX_MODE_INCS=(-isystem "$SDK_DIR/include/axl-sdk")
+        fi
         run_cmd "$GXX_BIN" \
-            -ffreestanding -fshort-wchar -fno-builtin \
-            -fno-stack-protector -fno-omit-frame-pointer -fpic $GCC_ARCH \
+            ${CXX_MODE_FLAGS[@]+"${CXX_MODE_FLAGS[@]}"} \
+            -fshort-wchar -fno-builtin \
+            $STACK_PROTECTOR -fno-omit-frame-pointer -fpic $GCC_ARCH \
             -fno-exceptions -fno-rtti -fno-threadsafe-statics \
-            -std=c++20 \
+            "${STD_CXX[@]}" \
             -ffunction-sections -fdata-sections \
             $OPT_FLAGS -Wall \
             -DAXL_BACKEND_NATIVE \
-            -isystem "$SDK_DIR/include/axl-sdk" \
-            -isystem "$SDK_DIR/include/axl-sdk/compat" \
+            ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"} \
+            "${CXX_MODE_INCS[@]}" \
             ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
             ${DEP_ARGS[@]+"${DEP_ARGS[@]}"} \
             -c "$src" -o "$obj" || { echo "ERROR: C++ compilation failed: $src" >&2; rm -rf "$TMPDIR"; exit 1; }
     else
         run_cmd ${CROSS}gcc \
             -ffreestanding -fshort-wchar -fno-builtin \
-            -fno-stack-protector -fno-omit-frame-pointer -fpic $GCC_ARCH \
+            ${STD_C[@]+"${STD_C[@]}"} \
+            $STACK_PROTECTOR -fno-omit-frame-pointer -fpic $GCC_ARCH \
             -ffunction-sections -fdata-sections \
             $OPT_FLAGS -Wall \
             -DAXL_BACKEND_NATIVE \
+            ${UEFI_DEFINE[@]+"${UEFI_DEFINE[@]}"} \
             -isystem "$SDK_DIR/include/axl-sdk" \
             -isystem "$SDK_DIR/include/axl-sdk/compat" \
             ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} \
@@ -642,8 +910,91 @@ SO_FILE="$TMPDIR/output.so"
 # definitions satisfy C++-emitted references; libaxl.a then satisfies
 # axl-cxxabi-ops.cpp's own undefined references (axl_malloc / axl_free
 # / axl_print / axl_exit).  Pure-C builds skip libaxl-cxx.a entirely.
+#
+# --hosted needs NO libstdc++.a. It used to name the toolchain's archive for
+# the handful of members the associative containers pull out of line, and
+# those were measured down to exactly two -- tree.o and hash_bytes.o.
+# src/runtime/axl-cxx-rbtree.cpp and axl-cxx-hash.cpp supply both, so the
+# archive is off the line entirely.
+#
+# That is not a size optimisation. Redistributing libstdc++ is the ONE act the
+# GCC Runtime Library Exception does not cover (shipping the produced .efi is
+# unambiguously fine; shipping the runtime library as a library is not), so
+# not linking it is what lets the SDK be self-contained without taking on
+# GPL-3 obligations. See AXL-Cxx-Design.md section 8.
+#
+# It also removes the --hosted prerequisite that a matching libstdc++-static
+# be installed, which was a real setup failure on both arches.
+#
+# --hosted implies the C++ archives even with zero .cpp sources on this
+# command line: `axl-cc -c --hosted a.cpp` followed by `axl-cc --hosted a.o -o
+# app.efi` is the staged build the -c flag exists for, and the link half sees
+# only an object.
 CXX_LIB_ARGS=()
-[[ "$HAS_CPP" == "true" ]] && CXX_LIB_ARGS+=("$LIB_DIR/libaxl-cxx.a")
+if [[ "$HAS_CPP" == "true" || "$HOSTED" == "true" ]]; then
+    CXX_LIB_ARGS+=("$LIB_DIR/libaxl-cxx.a")
+fi
+# Normally empty: nothing from libstdc++.a is linked any more.
+#
+# The ONE exception is -frtti. typeid and dynamic_cast need
+# __cxxabiv1::__class_type_info's vtables and __dynamic_cast, which live in
+# libsupc++ inside libstdc++.a, and those are a much larger surface than the
+# eleven functions rbtree+hash replaced. RTTI is opt-in and off by default, so
+# the DEFAULT link stays self-contained; a consumer who asks for -frtti opts
+# into needing an installed libstdc++ on their own machine.
+#
+# That distinction is the whole point: what the GCC Runtime Library Exception
+# does not cover is US REDISTRIBUTING the runtime library. A consumer linking
+# their own installed copy is not that, and the .efi they produce is Target
+# Code, which RLE section 1 covers unambiguously.
+STDCXX_LIB=""
+# RTTI_LINK is true when -frtti is on THIS command line, or when any input
+# object carries an RTTI artefact. The flag only ever appears on the COMPILE
+# line, so the staged flow this script documents --
+#   axl-c++ -c --hosted -frtti a.cpp -o a.o
+#   axl-c++    --hosted        a.o   -o app.efi
+# -- reaches the link with an empty CFLAGS_EXTRA and used to fail on mangled
+# __dynamic_cast / __class_type_info names that never mention the flag.
+RTTI_LINK="false"
+if printf '%s\n' ${CFLAGS_EXTRA[@]+"${CFLAGS_EXTRA[@]}"} | grep -qx -- "-frtti"; then
+    RTTI_LINK="true"
+else
+    # Objects reaching the link: freshly compiled ones and any handed to us.
+    # A failure to read them leaves RTTI_LINK false, which is exactly the
+    # pre-existing behaviour -- this can only ADD detection, never remove it.
+    _rtti_objs=(${OBJS[@]+"${OBJS[@]}"} ${PREBUILT_OBJS[@]+"${PREBUILT_OBJS[@]}"})
+    if [[ ${#_rtti_objs[@]} -gt 0 ]] &&
+       "${NM_BIN:-nm}" -u "${_rtti_objs[@]}" 2>/dev/null \
+         | grep -q "__class_type_info\|__dynamic_cast"; then
+        RTTI_LINK="true"
+    fi
+fi
+if [[ "$HOSTED" == "true" && "$RTTI_LINK" == "true" ]]; then
+    STDCXX_LIB="$("$GXX_BIN" -print-file-name=libstdc++.a 2>/dev/null || true)"
+    if [[ ! -f "$STDCXX_LIB" ]]; then
+        echo "ERROR: -frtti --hosted needs libstdc++.a for the type_info" >&2
+        echo "       vtables and __dynamic_cast; $GXX_BIN could not locate it" >&2
+        echo "       (got: '${STDCXX_LIB:-<nothing>}')" >&2
+        if [[ "$ARCH" == "aa64" ]]; then
+            echo "       Install the ARM bare-metal toolchain via 'axl-install-toolchain aa64'" >&2
+        else
+            echo "       On Fedora/RHEL: dnf install libstdc++-static" >&2
+        fi
+        echo "       Without -frtti no libstdc++ is needed at all." >&2
+        rm -rf "$TMPDIR"; exit 1
+    fi
+    CXX_LIB_ARGS+=("$STDCXX_LIB")
+fi
+# The group costs a re-scan and is only needed when a third, mutually
+# dependent archive is present. With just libaxl-cxx.a and libaxl.a the order
+# below is already correct: libaxl-cxx.a references axl_malloc, libaxl.a
+# satisfies it.
+LIB_GROUP_OPEN=()
+LIB_GROUP_CLOSE=()
+if [[ -n "$STDCXX_LIB" ]]; then
+    LIB_GROUP_OPEN=(--start-group)
+    LIB_GROUP_CLOSE=(--end-group)
+fi
 
 # --version-script localizes every symbol but the entry point. `-shared`
 # otherwise exports all globals into the dynamic symbol table and treats them
@@ -665,12 +1016,15 @@ run_cmd ${CROSS}ld -nostdlib -shared -Bsymbolic \
     $CRT0_OBJS \
     "${OBJS[@]}" \
     ${PREBUILT_OBJS[@]+"${PREBUILT_OBJS[@]}"} \
+    ${LIB_GROUP_OPEN[@]+"${LIB_GROUP_OPEN[@]}"} \
     ${CXX_LIB_ARGS[@]+"${CXX_LIB_ARGS[@]}"} \
-    "$LIB_DIR/libaxl.a" || { echo "ERROR: linking failed" >&2; rm -rf "$TMPDIR"; exit 1; }
+    "$LIB_DIR/libaxl.a" \
+    ${LIB_GROUP_CLOSE[@]+"${LIB_GROUP_CLOSE[@]}"} \
+    || { echo "ERROR: linking failed" >&2; rm -rf "$TMPDIR"; exit 1; }
 
 run_cmd ${CROSS}objcopy \
     -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
-    -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir \
+    -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir \
     --output-target="$PE_TARGET" --subsystem=$SUBSYSTEM \
     "$SO_FILE" "$OUTPUT" || { echo "ERROR: objcopy failed" >&2; rm -rf "$TMPDIR"; exit 1; }
 

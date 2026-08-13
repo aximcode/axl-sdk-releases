@@ -170,7 +170,7 @@ axl_console_tap_inject_key(
  * **This is how you break a nested Shell.** When @c input_capture is set the tap
  * owns the console's key queue *and* its notify registry, and UEFI fires notifies
  * at queue-insert time. The Shell registers Ctrl+C four ways — @a unicode of
- * `'c'` or `3`, each crossed with @ref AXL_CONSOLE_LEFT_CONTROL_PRESSED and
+ * @c 'c' or `3`, each crossed with @ref AXL_CONSOLE_LEFT_CONTROL_PRESSED and
  * @ref AXL_CONSOLE_RIGHT_CONTROL_PRESSED, all OR'd with
  * @ref AXL_CONSOLE_SHIFT_STATE_VALID. The match rule (UEFI 2.11 §12.2.5) compares
  * @a scan and @a unicode exactly, then treats a registered shift/toggle state of 0

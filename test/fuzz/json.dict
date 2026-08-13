@@ -1,0 +1,60 @@
+# libFuzzer dictionary for json_fuzz.
+#
+# Structure and punctuation a mutator finds on its own; multi-byte KEYWORDS it
+# effectively cannot. `-Infinity` is nine specific bytes, so random mutation
+# reaches it about never — and every one of those keywords gates a distinct
+# branch in parse_literal/parse_number, which is exactly the code a fuzzer is
+# there to reach.
+#
+# Measured: without this file a 25-second run does not notice
+# parse_number's at-end-of-window guard being deleted, because it never
+# generates a `-Infinity` to cut. With it, the same run does.
+#
+# Use with:  ./json_fuzz CORPUS -dict=json.dict
+
+# --- RFC 8259 ---------------------------------------------------------------
+"true"
+"false"
+"null"
+"{}"
+"[]"
+"\"\""
+":"
+","
+"1e10"
+"-0"
+"0.5"
+
+# --- escapes: the sub-grammar that resumes worst across a chunk boundary ----
+"\\u0041"
+"\\ud83d\\ude00"
+"\\ud800"
+"\\t"
+"\\/"
+
+# --- JSON5 keywords, each behind its own ALLOW_* flag -----------------------
+"NaN"
+"-NaN"
+"Infinity"
+"-Infinity"
+"+Infinity"
+"0x1F"
+"+1"
+".5"
+"5."
+
+# --- JSON5 syntax -----------------------------------------------------------
+"'"
+"//"
+"/*"
+"*/"
+"\\x41"
+"\\'"
+"\\v"
+"\\0"
+
+# --- shapes that stress the whole-document face -----------------------------
+"{\"a\":1}"
+"[1,2,3]"
+"{a:1,}"
+"[1,]"

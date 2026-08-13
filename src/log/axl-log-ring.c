@@ -76,8 +76,13 @@ get_timestamp(void)
 }
 
 static void
-ring_handler(int level, const char *domain, const char *message, void *data)
+ring_handler(int level, const char *domain, const char *message,
+             const AxlRealtime *stamp, void *data)
 {
+    /* Deliberately unused: the ring keys entries on raw monotonic-us
+       (get_timestamp below), which is strictly ordered, where the wallclock
+       stamp is not. Not an oversight. */
+    (void)stamp;
     AxlLogRing *ring = (AxlLogRing *)data;
     uint32_t stride = ring->entry_stride;
 

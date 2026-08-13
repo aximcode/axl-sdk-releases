@@ -13,13 +13,14 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-log.h>
 #include <axl/axl-string.h>
+#include <axl/axl-str.h>     /* axl_utf8_encode — the one codepoint->UTF-8 encoder */
 #include <axl/axl-clipboard.h>
 #include <axl/axl-cursor.h>  /* dogfood the shared software mouse-cursor overlay */
 #include <uefi/axl-uefi.h>   /* handle_hotkey reads the opaque key as EFI_KEY_DATA */
 
 AXL_LOG_DOMAIN("conterm");
 
-#define TERM_CELL_MAX       4    /* bytes of UTF-8 per cell (BMP: <=3, + NUL room) */
+#define TERM_CELL_MAX       AXL_UTF8_MAX_LEN   /* bytes of UTF-8 per cell */
 #define TERM_DEFAULT_COLS   80
 #define TERM_DEFAULT_ROWS   25
 #define TERM_DEFAULT_SCROLLBACK 1000   /* history rows when cfg is 0 */
@@ -237,20 +238,19 @@ grid_put_cp(AxlConsoleTerm *t, uint32_t cp)
     }
     if ((uint32_t)t->cur_col >= t->cols) { t->cur_col = 0; grid_newline(t); }
 
+    /* A cell's bytes go straight to the glyph renderer AND to the clipboard, so
+       a codepoint with no UTF-8 spelling -- a lone surrogate, which term_output_text
+       will happily decode out of a WTF-8 producer -- must not be re-encoded in its
+       3-byte shape. axl_utf8_encode refuses it; substitute U+FFFD rather than blank
+       the cell, so the glyph run stays aligned with the cursor arithmetic below and
+       the reader sees the same replacement character every other AXL decoder emits.
+       cell->utf8 is AXL_UTF8_MAX_LEN, so a 0 return means only "unencodable". */
     TermCell *cell = cell_at(t, t->cur_row, t->cur_col);
-    if (cp < 0x80) {
-        cell->utf8[0] = (char)cp;
-        cell->len = 1;
-    } else if (cp < 0x800) {
-        cell->utf8[0] = (char)(0xC0 | (cp >> 6));
-        cell->utf8[1] = (char)(0x80 | (cp & 0x3F));
-        cell->len = 2;
-    } else {
-        cell->utf8[0] = (char)(0xE0 | (cp >> 12));
-        cell->utf8[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        cell->utf8[2] = (char)(0x80 | (cp & 0x3F));
-        cell->len = 3;
+    size_t    n    = axl_utf8_encode(cp, cell->utf8, sizeof(cell->utf8));
+    if (n == 0) {
+        n = axl_utf8_encode(0xFFFD, cell->utf8, sizeof(cell->utf8));
     }
+    cell->len = (uint8_t)n;
     cell->fg = t->pen_fg;
     cell->bg = t->pen_bg;
     mark_dirty(t, t->cur_row);

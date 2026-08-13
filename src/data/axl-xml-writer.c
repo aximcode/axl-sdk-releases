@@ -129,17 +129,30 @@ append_escaped_attr(AxlXmlWriter *w, const char *s)
     }
 }
 
-/* Emit pretty-mode line break + indent at @p depth (2 spaces per
-   level). No-op when not in pretty mode. */
+/* True when the caller asked for indentation at all.
+   The PRESENCE bit, not the width: AXL_XML_INDENT(0) is a real request for
+   newlines with a zero-width indent, and testing the width alone would read it
+   as "compact" and drop the newlines. That distinction is the whole reason
+   AXL_XML_HAS_INDENT exists as a separate bit. */
+static bool
+is_pretty(const AxlXmlWriter *w)
+{
+    return (w->flags & AXL_XML_HAS_INDENT) != 0;
+}
+
+/* Emit pretty-mode line break + indent at @p depth. No-op when not pretty. */
 static void
 pretty_break(AxlXmlWriter *w, uint32_t depth)
 {
-    if ((w->flags & AXL_XML_WRITER_PRETTY) == 0 || w->error) {
+    if (!is_pretty(w) || w->error) {
         return;
     }
     append_c(w, '\n');
+    const uint32_t width = AXL_XML_INDENT_OF(w->flags);
     for (uint32_t i = 0; i < depth; i++) {
-        append(w, "  ");
+        for (uint32_t j = 0; j < width; j++) {
+            append_c(w, ' ');
+        }
     }
 }
 
@@ -160,7 +173,7 @@ close_open_start_tag_with_gt(AxlXmlWriter *w)
 // ---------------------------------------------------------------------------
 
 void
-axl_xml_writer_init(AxlXmlWriter *w, AxlString *out, uint32_t flags)
+axl_xml_writer_init(AxlXmlWriter *w, AxlString *out, AxlXmlFlags flags)
 {
     if (w == NULL) {
         return;
@@ -172,7 +185,15 @@ axl_xml_writer_init(AxlXmlWriter *w, AxlString *out, uint32_t flags)
     w->prologue_emitted     = false;
     w->doctype_emitted      = false;
     w->any_element_emitted  = false;
-    w->error                = (out == NULL);
+    /* A bit outside the XML vocabulary is REFUSED rather than ignored.
+       Ignoring it is exactly what let AXL_XML_WRITER_PRETTY and
+       AXL_JSON_ALLOW_COMMENTS be the same bit for as long as they were: a flag
+       from the wrong module arrived, meant something, and nobody found out.
+       Latched into the sticky error, so the first write is a no-op and
+       axl_xml_writer_error() reports it -- the same way every other misuse in
+       this writer surfaces. */
+    w->error                = (out == NULL)
+                              || (flags & ~(AxlXmlFlags)AXL_XML_KNOWN_MASK) != 0;
     w->had_text_bits        = 0;
     w->had_child_bits       = 0;
     for (uint32_t i = 0; i < AXL_XML_WRITER_MAX_DEPTH; i++) {
@@ -405,7 +426,7 @@ axl_xml_writer_end_element(AxlXmlWriter *w)
     w->depth = top;
 
     /* Trailing newline after the root element closes (pretty mode). */
-    if (w->depth == 0 && (w->flags & AXL_XML_WRITER_PRETTY) != 0) {
+    if (w->depth == 0 && is_pretty(w)) {
         append_c(w, '\n');
     }
 }

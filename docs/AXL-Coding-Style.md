@@ -226,6 +226,44 @@ surface. Comments may reference vendor-specific renderings as
 *examples* (so consumers know the typed-reader translation
 recipe), but never bake them into the returned string.
 
+## Includes — include the header, do not forward-declare it
+
+If a public header uses another module's type in its API, **`#include` that
+module's header.** Do not forward-declare the type to avoid the include.
+
+```c
+/* WRONG — dodges the include */
+typedef struct AxlStream AxlStream;
+
+/* RIGHT */
+#include <axl/axl-stream.h>
+```
+
+Forward declarations ARE used throughout `include/axl/*.h`, and that is not a
+contradiction: they declare the header's **own** opaque handle —
+`typedef struct AxlArray AxlArray;` in `axl-array.h`,
+`typedef struct AxlArgs AxlArgs;` in `axl-args.h`. That is an opacity
+technique, and it is the only thing a forward declaration is for here. Using
+one to skip an `#include` of a *different* module's header is a different
+thing and is not the convention: `axl-compress.h` and `axl-tar.h` both take an
+`AxlStream` in their API, and both include `<axl/axl-stream.h>`.
+
+Two practical notes:
+
+- Check for an include cycle first (`grep '#include <axl/'` in the header you
+  are about to include). There has not been one yet — the public headers form a
+  shallow graph — but a cycle is the one case where a forward declaration is
+  the right answer, and it should be justified in a comment when it happens.
+- **C permits redefining a typedef to the same type** (C11 §6.7p3 onward, so
+  every standard this project has ever built under), which means a forward
+  declaration left behind *alongside* the include compiles silently — through
+  the build and both doc gates. When you switch from one to the other, grep to
+  confirm the old form is gone.
+
+Do not pre-emptively prune the include graph for build-time reasons. The
+umbrella `axl.h` includes everything anyway, and no measurement has ever shown
+it to matter.
+
 ## Source File Layout
 
 Every `.c` and `.h` file starts with a two-line SPDX/copyright block,
@@ -665,15 +703,42 @@ axl_hash_table_lookup(
 );
 ```
 
-For simple functions with 0-1 parameters, keep the signature on one line:
+A function that takes NO parameters keeps its signature on one line —
+there is nothing to document beside `void`:
 
 ```c
 /**
- * @brief Free a hash table. Keys freed; values NOT freed.
+ * @brief Create a new hash table with string keys.
+ *
+ * @return new AxlHashTable, or NULL on allocation failure.
+ */
+AxlHashTable *
+axl_hash_table_new(void);
+```
+
+**A single parameter still goes multi-line.** The trailing `///<` doc
+has to sit beside the parameter, and on a one-liner it ends up after
+the `);` where it reads as a comment on the declaration rather than on
+the argument — and it wraps badly the moment the doc is longer than a
+few words:
+
+```c
+/**
+ * @brief Free a hash table and all entries.
  */
 void
-axl_hash_table_free(AxlHashTable *h);  ///< hash table (NULL-safe)
+axl_hash_table_free(
+    AxlHashTable *h  ///< hash table (NULL-safe)
+);
 ```
+
+This rule is descriptive, not aspirational: across the public headers
+551 one-parameter declarations are multi-line against 6 that are not,
+while 89 zero-parameter declarations are one-line against 15 that are
+not. The version of this section that told you to collapse 0-1
+parameters onto one line was contradicted by its own worked example —
+`axl_hash_table_free` has been multi-line in `axl-hash-table.h` all
+along.
 
 ## Dogfooding
 

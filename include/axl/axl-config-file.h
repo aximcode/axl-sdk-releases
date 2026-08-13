@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-config-file.h:
+/** @file axl-config-file.h
  *
  * Free-form `key=value` config-file map. Parses a text file into a flat
  * string map and serves typed getters that fall back to a caller-supplied

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-text-buffer.h:
+/** @file axl-text-buffer.h
  *
  * A growable, editable byte buffer with an integral line index, tuned
  * for an interactive text editor: load a file once, then many small

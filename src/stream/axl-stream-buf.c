@@ -10,7 +10,6 @@
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-log.h>
-#include "axl-stream-internal.h"
 AXL_LOG_DOMAIN("io");
 
 #define BUF_INITIAL  256
@@ -155,11 +154,34 @@ buf_close(void *ctx)
 // Constructor
 // ---------------------------------------------------------------------------
 
+/* The buffer backend's operations, filled in ONE place.
+   The constructor opens with these and the accessors below name them again to
+   recover the context, so they must be the same set -- a helper rather than
+   two literal blocks is what guarantees that, and it keeps both sides driven
+   by AXL_STREAM_OPS_INIT so a future slot cannot be forgotten on one side. */
+static AxlStreamOps
+buf_ops(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    /* `flush` stays as AXL_STREAM_OPS_INIT left it: an in-memory buffer holds
+       nothing onward-bound, and a NULL flush slot is contractually AXL_OK. */
+    ops.read   = buf_read;
+    ops.write  = buf_write;
+    ops.pread  = buf_pread;
+    ops.pwrite = buf_pwrite;
+    ops.seek   = buf_seek;
+    ops.tell   = buf_tell;
+    ops.close  = buf_close;
+    return ops;
+}
+
 AxlStream *
 axl_bufopen(void)
 {
-    AxlStream *s;
-    BufCtx *b;
+    AxlStreamOps  ops = buf_ops();
+    AxlStream    *s;
+    BufCtx       *b;
 
     b = axl_new(BufCtx);
     if (b == NULL) {
@@ -178,41 +200,56 @@ axl_bufopen(void)
     b->alloc    = BUF_INITIAL;
     b->read_pos = 0;
 
-    s = axl_stream_new();
+    s = axl_stream_open_custom(b, &ops, "buffer");
     if (s == NULL) {
+        /* A refused open never calls `close`, so releasing the context is
+           still ours to do -- the same contract a consumer gets. */
         axl_warning("allocation failed");
         axl_free(b->data);
         axl_free(b);
         return NULL;
     }
-
-    s->ctx    = b;
-    s->read   = buf_read;
-    s->write  = buf_write;
-    s->pread  = buf_pread;
-    s->pwrite = buf_pwrite;
-    s->seek   = buf_seek;
-    s->tell   = buf_tell;
-    s->flush  = NULL;
-    s->close  = buf_close;
-
     return s;
 }
 
 // ---------------------------------------------------------------------------
 // Buffer-specific accessors
+//
+// Both are keyed on the STREAM and have to recover the context from it. That
+// used to require axl-stream-internal.h, which made this pair the one thing
+// the public custom-backend contract could not express -- a consumer could
+// build the backend but not the accessors. axl_stream_ctx closed that, and
+// this file is the dogfooding proof: it names no private header and reaches
+// its context exactly the way a consumer's would.
+//
+// A NULL check cannot stand in for the ops check -- every stream has a ctx --
+// so without it a file stream's FileCtx got read as a BufCtx: `len` came out
+// of whatever field landed at that offset, `data` was the firmware file
+// handle, and axl_bufsteal then zeroed a 32-byte BufCtx over a 16-byte
+// FileCtx, a write past the end of the allocation. All of it silent.
 // ---------------------------------------------------------------------------
+
+/* Recover the BufCtx, or NULL if @a s is not one of ours.
+   The buffer backend's operations are all file-static, so no stream built
+   anywhere else can present them and no consumer can even name them -- the
+   same unspoofability the old direct vtable comparison had, now expressed
+   through the public getter. */
+static BufCtx *
+buf_ctx(AxlStream *s)
+{
+    AxlStreamOps ops = buf_ops();
+
+    return (BufCtx *)axl_stream_ctx(s, &ops);
+}
 
 const void *
 axl_bufdata(AxlStream *s, size_t *size)
 {
-    BufCtx *b;
+    BufCtx *b = buf_ctx(s);
 
-    if (s == NULL || s->ctx == NULL) {
+    if (b == NULL) {
         return NULL;
     }
-
-    b = (BufCtx *)s->ctx;
     if (size != NULL) {
         *size = b->len;
     }
@@ -222,14 +259,13 @@ axl_bufdata(AxlStream *s, size_t *size)
 void *
 axl_bufsteal(AxlStream *s, size_t *size)
 {
-    BufCtx *b;
-    char *data;
+    BufCtx *b = buf_ctx(s);
+    char   *data;
 
-    if (s == NULL || s->ctx == NULL) {
+    if (b == NULL) {
         return NULL;
     }
 
-    b = (BufCtx *)s->ctx;
     data = b->data;
     if (size != NULL) {
         *size = b->len;

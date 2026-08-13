@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-url.h:
+/** @file axl-url.h
  *
  * URL parser and builder.
  */

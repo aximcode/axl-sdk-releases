@@ -160,8 +160,14 @@ print_redfish_error(
         return;
     }
 
+    /* STRICT, never AXL_JSON_RELAXED. This body came off the network from a
+       BMC we do not control, and a Redfish service never sends JSON5 -- so
+       accepting it would be applying the sidecar dialect to untrusted input.
+       Same rule and same reasoning as axl_http_request_get_json() on the
+       server side, and make check-json-dialect now enforces it here. */
     AxlJsonReader ctx;
-    if (!axl_json_parse((const char *)body, body_size, &ctx)) {
+    if (!axl_json_parse((const char *)body, body_size,
+                        AXL_JSON_STRICT, &ctx)) {
         axl_printf("rfbrowse: HTTP %zu\n", status_code);
         return;
     }
@@ -197,7 +203,7 @@ session_login(
     // Build login JSON
     AXL_AUTOPTR(AxlString) json_str = axl_string_new(NULL);
     AxlJsonWriter jw;
-    axl_json_writer_init(&jw, json_str, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&jw, json_str, AXL_JSON_STRICT);
     axl_json_obj_begin(&jw);
     axl_json_kv_str(&jw, "UserName", user);
     axl_json_kv_str(&jw, "Password", password);
@@ -390,8 +396,11 @@ get_members(
         return -1;
     }
 
+    /* Through the helper, not axl_json_parse() by hand: the helper IS the
+       strict response parse, and a tool in this tree spelling the flags out
+       longhand is how the next one learns to pick its own dialect here. */
     AxlJsonReader ctx;
-    if (!axl_json_parse(resp->body, resp->body_size, &ctx)) {
+    if (!axl_http_response_get_json(resp, &ctx)) {
         axl_printf("rfbrowse: failed to parse JSON response\n");
         return -1;
     }

@@ -157,7 +157,7 @@ handle_client(int argc, char **argv)
 
     AXL_AUTOPTR(AxlString) body = axl_string_new(NULL);
     AxlJsonWriter jw;
-    axl_json_writer_init(&jw, body, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&jw, body, AXL_JSON_STRICT);
 
     if (axlk_http_read_request_line(fd, scratch, sizeof(scratch),
                                     method, sizeof(method),

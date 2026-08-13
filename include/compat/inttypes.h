@@ -7,6 +7,11 @@
 
 #include <stdint.h>
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define PRId32  "d"
 #define PRId64  "lld"
 #define PRIu32  "u"
@@ -15,5 +20,9 @@
 #define PRIx64  "llx"
 #define PRIX32  "X"
 #define PRIX64  "llX"
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

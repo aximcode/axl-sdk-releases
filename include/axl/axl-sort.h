@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-sort.h:
+/** @file axl-sort.h
  *
  * In-place sort over a raw element buffer — the qsort(3) shape, but
  * with a fixed worst case. The engine is an introsort (median-of-three

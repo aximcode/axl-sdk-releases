@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-cpu.h:
+/** @file axl-cpu.h
  *
  * Typed CPU exception handling. Backend-neutral abstraction over
  * UEFI's `EFI_CPU_ARCH_PROTOCOL.RegisterInterruptHandler` and the
@@ -182,7 +181,7 @@ typedef struct {
 typedef void (*AxlCpuExceptionFn)(
     const AxlCpuException *exc,
     void                  *user
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Register an exception handler for @p kind.
@@ -232,6 +231,15 @@ axl_cpu_unregister_exception(
  * execute*; for AVX, "can execute" still requires a one-time state
  * enable (see `axl_cpu_enable_avx`) before the YMM registers are
  * usable without a \#UD fault.
+ *
+ * **Describes the machine, not the calling core.** Detection runs once,
+ * on whichever processor asks first, and the result is shared. On a
+ * hybrid part (performance + efficiency cores with different ISAs) the
+ * core you are running on may not have everything listed here. Code
+ * dispatched to an AP should therefore gate vector work on
+ * `axl_cpu_enable_avx` / `axl_cpu_enable_avx512`, which answer for the
+ * core that calls them. Querying from an AP is safe — publication is
+ * synchronised — but the answer is still the machine's, not the core's.
  *
  * Most consumers want `axl_cpu_simd_tier` (a single ordered value
  * for kernel dispatch) rather than these individual bits.
@@ -324,9 +332,13 @@ axl_cpu_features(void);
  *
  * **Per-logical-processor.** `CR4`/`XCR0` are per-CPU; code that runs
  * AVX kernels on application processors (via MP services) must call
- * this on each AP as well as the BSP.
+ * this on each AP as well as the BSP. The capability gate is a live
+ * `CPUID` on the calling core rather than a read of the cached
+ * `axl_cpu_features` vector, which describes whichever core populated
+ * it first — on a hybrid part those disagree, and trusting the cache
+ * would mean writing `XCR0.YMM` on a core with no AVX, which \#GPs.
  *
- * No-op returning `false` when the CPU lacks AVX (or on non-x86),
+ * No-op returning `false` when this core lacks AVX (or on non-x86),
  * leaving `axl_cpu_simd_tier` at `AXL_SIMD_SSE41`/`BASELINE`.
  *
  * @return `true` if AVX is usable after the call (already-enabled
@@ -348,8 +360,10 @@ axl_cpu_enable_avx(void);
  *
  * Note: `axl_cpu_simd_tier` tops out at `AXL_SIMD_AVX2` — that is the
  * widest tier AXL's own kernels use. AVX-512 is exposed for consumers
- * who write their own AVX-512 code: check `avx512f` et al. in
- * `axl_cpu_features`, call this to enable, then run.
+ * who write their own AVX-512 code: call this and branch on the result.
+ * Branch on the return value, not on `avx512f` in `axl_cpu_features` —
+ * the feature vector describes the machine, this answers for the core
+ * you are on, and only the latter decides whether the instruction runs.
  *
  * @return `true` if AVX-512 is usable after the call (already-enabled
  *     counts), `false` if the CPU has no AVX-512 to enable (or non-x86).
@@ -365,10 +379,58 @@ axl_cpu_enable_avx512(void);
  * present, else `AXL_SIMD_BASELINE` (SSE2, always). aarch64:
  * `AXL_SIMD_BASELINE` (NEON). Does not change CPU state.
  *
+ * **Resolve this once per operation — never per row, pixel or element.**
+ * The answer is deliberately *not* cached, because it must describe the
+ * core that is asking rather than the machine (that is the whole reason
+ * to prefer it over `axl_cpu_features`). Live means `CPUID`: on x86 one
+ * call here executes several leaves, and paired with
+ * `axl_cpu_enable_avx` a dispatch check costs 4 `CPUID` plus 2 `XGETBV`.
+ *
+ * Under virtualisation `CPUID` is unconditionally intercepted, so each
+ * one is a VM exit — roughly a microsecond under KVM, against a few
+ * cycles for the vector work it is guarding. AXL shipped exactly this
+ * mistake: a per-scanline blend kernel called it per row, and a
+ * 1280x800 alpha blend paid ~800 x 6 VM exits. It reached a consumer as
+ * a compositor whose post-key repaint went from ~0 to 1.75 s, and cost a
+ * bisect across three repositories to find.
+ *
+ * Hoist it to the enclosing blit / fill / decode entry point and pass
+ * the chosen kernel down. In UEFI boot services there is no preemption
+ * and no scheduler, so the BSP cannot migrate mid-call and the answer
+ * cannot change underneath a single operation. An AP worker is the one
+ * place a kernel genuinely runs off-BSP — there, resolve it once per
+ * task, on the task's own core.
+ *
  * @return the highest currently-usable `AxlSimdTier`.
  */
 AxlSimdTier
 axl_cpu_simd_tier(void);
+
+/**
+ * @brief Retire the SIMD-tier memo — call before running code on another
+ *     processor by any route AXL does not own.
+ *
+ * `axl_cpu_simd_tier` memoises its answer while the BSP is provably the
+ * only core executing AXL code: UEFI boot services has no scheduler and
+ * no preemption, so with no AP ever dispatched the BSP cannot migrate
+ * and one cached answer *is* this core's answer. That makes the query
+ * free in a hot path instead of several `CPUID` leaves — which, under
+ * virtualisation where every `CPUID` is a VM exit, is the difference
+ * between a usable dispatch check and a ruinous one.
+ *
+ * AXL's own AP dispatch retires the memo automatically. Call this
+ * yourself **before** the first time you run code on another processor
+ * through `EFI_MP_SERVICES_PROTOCOL` directly, or through anything else
+ * that steps outside AXL. Retirement is permanent and cheap: every
+ * later call simply does the live query again, which is what the
+ * function did unconditionally before.
+ *
+ * Skipping it on a hybrid part is a \#UD, not a mis-report — an
+ * efficiency core would be handed the performance core's AVX2 verdict
+ * and execute a 256-bit kernel it does not implement.
+ */
+void
+axl_cpu_simd_memo_invalidate(void);
 
 // ---------------------------------------------------------------------------
 // Processor topology (MP-services inventory)

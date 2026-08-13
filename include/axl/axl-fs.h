@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-fs.h:
+/** @file axl-fs.h
  *
  * Filesystem operations — path-based file and directory APIs,
  * volume enumeration, file metadata. Mirrors the POSIX split:
@@ -256,7 +255,7 @@ axl_file_is_dir(
  * @param total total bytes (0 if unknown)
  * @param ctx   caller context pointer
  */
-typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx);
+typedef void (*AxlProgressFunc)(uint64_t done, uint64_t total, void *ctx) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Open-mode flags + attribute bitmask
@@ -351,7 +350,23 @@ axl_file_info(
 /**
  * @brief Delete a file.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * Deleting a path that does not exist is #AXL_NOT_FOUND, not success — the
+ * same answer axl_file_rename() has always given for the same input, and the
+ * two disagreeing is how this was noticed.
+ *
+ * It also does not CREATE the file on the way to answering. That is worth
+ * stating because it used to: EDK2's `EfiShellDeleteFileByName` opens its
+ * target with `EfiShellCreateFile`, so on the modern-shell path a delete of an
+ * absent name produced a zero-length file, removed it, and honestly reported
+ * success. A pure-cleanup call therefore performed a WRITE — which can fail on
+ * a read-only or nearly full volume, or one whose media just went away. The
+ * no-shell path never did this, so the behaviour also depended on whether a
+ * modern shell was present; both now open without `CREATE`.
+ *
+ * @return #AXL_OK on success, #AXL_NOT_FOUND if @a path does not exist,
+ *     #AXL_ERR if it exists and could not be removed. As everywhere in AXL,
+ *     treat ANY negative value as failure; the split is there for callers that
+ *     map a status onto something else (an HTTP 404 versus a 500).
  */
 int
 axl_file_delete(
@@ -572,7 +587,7 @@ typedef int (*AxlDirWalkFn)(
     const char        *full_path,
     const AxlFsEntry  *entry,
     void              *user
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Recursively walk a directory tree.
@@ -629,8 +644,9 @@ axl_dir_list_json(
  * @brief Get the filesystem volume label for a path.
  *
  * The label belongs to the volume, so every spelling of one volume
- * answers the same: `"fs0:"`, `"fs0:\\"` and `"fs0:\\dir\\file.txt"` are
- * equivalent, and @p path need not exist — an absent file resolves to
+ * answers the same: `"fs0:"` — with or without a trailing backslash —
+ * and `"fs0:\\dir\\file.txt"` are equivalent, and @p path need not
+ * exist — an absent file resolves to
  * its volume's label rather than failing. A path with no volume prefix
  * is resolved against the current working directory; a path naming a
  * volume too long to resolve fails rather than falling back to it.
@@ -662,10 +678,10 @@ axl_volume_get_label_by_handle(
  *
  * The intended use is a pre-flight check — "will this write fit?" —
  * so the query is answered by the volume ROOT, not by @p path itself:
- * @p path need not exist. `"fs0:"`, `"fs0:\\"` and
- * `"fs0:\\EFI\\BOOT\\new.efi"` all report the same volume. A @p path
- * with no volume prefix is resolved against the current working
- * directory.
+ * @p path need not exist. `"fs0:"` — with or without a trailing
+ * backslash — and `"fs0:\\EFI\\BOOT\\new.efi"` all report the same
+ * volume. A @p path with no volume prefix is resolved against the
+ * current working directory.
  *
  * Either out-parameter may be NULL to skip it; passing NULL for both
  * asks for nothing and is an error. Only the figures you actually ask

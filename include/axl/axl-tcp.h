@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-tcp.h:
+/** @file axl-tcp.h
  *
  * TCP socket abstraction. Blocking and async (event-driven) APIs.
  * Async functions integrate with AxlLoop for non-blocking I/O.
@@ -187,6 +186,18 @@ axl_tcp_accept(
 /**
  * @brief Send data over a connected TCP socket.
  *
+ * Blocks until the bytes are on the wire, the timeout expires, or the
+ * send fails.
+ *
+ * **This call does not queue.** If another send on @p sock is still
+ * pending — one an event loop is driving via @ref axl_tcp_send_async —
+ * this returns `AXL_ERR` immediately rather than waiting its turn. A
+ * synchronous wrapper's contract is "finished when I return", and it
+ * cannot honour that behind a send whose progress a different loop
+ * drives; waiting would burn the whole timeout and send nothing. Use
+ * @ref axl_tcp_send_async, which queues, when a socket has more than
+ * one writer.
+ *
  * @return AXL_OK on success, AXL_ERR on failure or timeout.
  */
 int
@@ -244,6 +255,18 @@ axl_tcp_poll(
  * the AxlTcp struct lives until the firmware signals close-complete. With
  * @ref AXL_TEARDOWN_RESET the finalize is synchronous and `sock` is freed on
  * return. Either way, do not touch `sock` after this returns.
+ *
+ * **Every pending send is retired before this returns.** Each accepted
+ * @ref axl_tcp_send_async — the one on the wire and every one queued behind
+ * it — gets its callback with `AXL_CANCELLED`, so no caller is left waiting
+ * on a callback that cannot come and no borrowed buffer stays pinned. Those
+ * callbacks run inside this call, since the loop may be freed the moment it
+ * returns.
+ *
+ * **Closing again is a no-op.** A socket is torn down once; a second close
+ * (typically from a send callback this one just fired) returns without
+ * touching it. New sends and receives on a closed socket are refused with
+ * `AXL_ERR` rather than armed against released firmware state.
  */
 void
 axl_tcp_close(
@@ -333,7 +356,7 @@ typedef bool (*AxlTcpCallback)(
     AxlTcp   *sock,   ///< socket (may be NULL — see per-op docs)
     AxlStatus status, ///< AXL_OK, AXL_ERR, or AXL_CANCELLED
     void     *data    ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Async connect — initiates TCP connection, returns immediately.
@@ -448,21 +471,55 @@ axl_tcp_recv_get_size(
  *
  * The buffer must stay valid until the callback fires.
  *
- * **No preemption.** Calling this while a previous send is still
- * in flight returns -1. To interrupt an in-flight send, pass an
- * `AxlCancellable` to the original call and signal it; the cancel
- * callback fires cleanly with `AXL_CANCELLED`. Alternatively,
- * `axl_tcp_close(sock)` tears down every pending op at once.
+ * **Sends are QUEUED, so callers need not serialize.** Submitting
+ * while a previous send is still in flight accepts this one and
+ * transmits it when its turn comes, FIFO. Callers used to have to
+ * invent their own serialisation; several did, and the ones that
+ * instead read the old refusal as a hard failure reset healthy
+ * connections. See docs/AXL-Tcp-Queue-Design.md.
+ *
+ * **The buffer is borrowed for the whole wait, not just the
+ * transmit.** A queued send holds @a buf until ITS callback fires,
+ * which may be well after later code has run.
+ *
+ * **A send is never refused for capacity.** There is no "try
+ * again later" status: the call either accepts the send (and its
+ * callback will fire exactly once) or fails outright with
+ * `AXL_ERR` — the socket is closed, an argument is invalid, or the
+ * token could not be allocated — in which case the callback does
+ * NOT fire. Callers therefore need no retry path. This follows
+ * EDK2's socket layer, whose `SockSend` buffers rather than
+ * rejecting; the watermarks decide submit-now vs defer, they are
+ * not a rejection threshold. A transport that refuses the bytes
+ * is reported the same way a transport that drops them is:
+ * through the callback, with `AXL_ERR`.
+ *
+ * **The callback is deferred, always.** It never runs inside this
+ * call, and never inside the completion handling of another send —
+ * it is queued for the event loop's next iteration (EDK2 signals
+ * its tokens the same way, via `gBS->SignalEvent`). So a callback
+ * may do whatever it likes to the socket, `axl_tcp_close`
+ * included, without tripping over a transport operation still in
+ * progress underneath it. The transmission itself is not delayed:
+ * the next queued send is handed to the firmware immediately, and
+ * only the notification waits for the tick.
+ *
+ * **Cancel works while queued, too.** Signalling the
+ * `AxlCancellable` retires the send whether it is on the wire or
+ * still waiting, firing the callback with `AXL_CANCELLED`.
+ * `axl_tcp_close(sock)` likewise retires every pending send,
+ * in-flight and queued alike, so a caller is never left waiting on
+ * a callback that cannot come.
  *
  * **Cancel leaves the socket connected.** On cancel the callback
  * fires with (sock, AXL_CANCELLED, data) — the sock is still a
  * valid connected TCP socket. Partial bytes may have been
  * transmitted before cancel took effect; the caller should treat
  * the send outcome as unknown and resync at the application level
- * if needed.
+ * if needed. (A send cancelled while still QUEUED put nothing on
+ * the wire.)
  *
- * @return AXL_OK if initiated, AXL_ERR on immediate failure or if a send is
- *   already in flight.
+ * @return AXL_OK if accepted (submitted or queued), AXL_ERR on failure.
  */
 int
 axl_tcp_send_async(

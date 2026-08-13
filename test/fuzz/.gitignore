@@ -9,3 +9,8 @@ leak-*
 timeout-*
 oom-*
 slow-unit-*
+
+# Per-harness seed-replay logs from `make check-fuzz-link`. Removed on every
+# exit path of that gate, but a Ctrl-C'd run leaves one behind, and an
+# untracked DOTFILE is exactly what `git add -A` sweeps up unnoticed.
+*.seedlog

@@ -78,7 +78,7 @@ typedef void (*AxlConsoleSinkFn)(
     const char *bytes,  ///< output bytes (NOT NUL-terminated)
     size_t      len,    ///< number of bytes
     void       *user    ///< sink context (cfg->user)
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Console-mirror configuration.

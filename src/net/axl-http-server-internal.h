@@ -114,13 +114,14 @@ typedef struct {
     char            *ws_path;         ///< path for broadcast matching
     uint8_t         *ws_partial_buf;  ///< incomplete frame buffer
     size_t           ws_partial_len;
-    /* Outbound send queue (the ws-broadcast-over-TLS desync fix). ALL outbound
-       WS frames — broadcast, axl_ws_send, pong — go through this per-connection
-       FIFO so they SERIALIZE over the one-send-in-flight transport instead of
-       being encrypted-then-dropped (which advances the TLS write seqno for a
-       record never put on the wire, desyncing the stream). Frames are enqueued
-       PRE-encryption; only the head is encrypted, at flush time, so a
-       drop-on-overflow drops a raw frame and never desyncs. */
+    /* Outbound send queue. It began as the ws-broadcast-over-TLS desync fix,
+       back when the transport refused a second send and the refused frame had
+       already advanced the TLS write seqno. The transport queues now, so this
+       FIFO's remaining job is the one nothing below it does: LOSSY, bounded,
+       frame-aware back-pressure. ALL outbound WS frames — broadcast,
+       axl_ws_send, pong — go through it, enqueued PRE-encryption with only the
+       head handed down at a time, so a drop-on-overflow sheds a raw frame and
+       never desyncs the stream. */
     WsOutNode       *ws_out_head;
     WsOutNode       *ws_out_tail;
     size_t           ws_out_count;

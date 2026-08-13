@@ -473,6 +473,33 @@ axl_tcp_accept_async(listener, loop, /*cancel=*/NULL, on_client, NULL);
 axl_loop_run(loop);
 ```
 
+**Sends are queued; their callbacks are deferred.**
+
+`axl_tcp_send_async` never refuses a send and never asks the caller to
+serialize. A send submitted while another is on the wire is accepted
+and transmitted when its turn comes, FIFO; the return value is
+`AXL_OK` for accepted and `AXL_ERR` only for a send that was rejected
+outright (closed socket, bad argument, allocation failure), in which
+case no callback fires. A transport that refuses the bytes reports
+that the same way a transport that drops them does — through the
+callback, with `AXL_ERR`.
+
+The callback itself never runs inside `axl_tcp_send_async` or inside
+another send's completion handling: it is queued for the loop's next
+iteration, which is how EDK2's socket layer signals its own tokens.
+So a send callback may do anything to the socket, `axl_tcp_close`
+included, without tripping over a transport operation still in
+progress underneath it. Transmission is not delayed by this — the next
+queued send is handed to the firmware immediately, and only the
+notification waits for the tick.
+
+`axl_tcp_close` retires every pending send, the one on the wire and
+every one queued behind it, firing each callback with `AXL_CANCELLED`
+before it returns. An accepted send therefore always gets exactly one
+callback, which is what lets a caller free the buffer it lent the
+transport. Closing an already-closed socket is a no-op, so a callback
+fired by a close may itself close.
+
 **Session-scoped cancellation:**
 
 Every `axl_tcp_*_async` call accepts an optional `AxlCancellable *`.

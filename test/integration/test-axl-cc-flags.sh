@@ -37,6 +37,23 @@ if [[ ! -x "$AXL_CC" || ! -d "$LIB_DIR" ]]; then
     exit 2
 fi
 
+# The artifact under test is the STAGED copy, and nothing in the suite re-stages
+# it: run-integration.sh's prebuild builds the library but never runs
+# install.sh. So an edit to scripts/axl-cc that was never installed leaves this
+# test silently exercising the PREVIOUS driver and reporting on it.
+#
+# That is not hypothetical. A sabotage run staged its own broken axl-cc; the
+# restore put the SOURCE back byte-identically (and said so), the staged copy
+# kept the defect, and the next suite run failed on a "regression" that existed
+# only in out/bin. Same shape as a stale .efi surviving a libaxl.a-only rebuild.
+# install.sh copies this file verbatim, so a plain compare is the right check.
+if ! cmp -s "$PROJECT_DIR/scripts/axl-cc" "$AXL_CC"; then
+    echo "ERROR: staged $AXL_CC is STALE — it differs from scripts/axl-cc." >&2
+    echo "       This test would report on the staged copy, not your edit." >&2
+    echo "       Run 'scripts/install.sh --arch x64' first." >&2
+    exit 2
+fi
+
 SRC="$PROJECT_DIR/sdk/examples/hello.c"
 [[ -f "$SRC" ]] || { echo "FAIL: source missing: $SRC"; exit 1; }
 
@@ -100,6 +117,55 @@ bogus_rc=$?
 [[ "$bogus_rc" -ne 0 ]] && grep -qi "unknown option" "$WORK/bogus.log"
 check "$?" "unknown --long option errors clearly (rc=$bogus_rc)"
 
+# 4b. The axl-c++ alias names ITSELF, not axl-cc. It `exec`s axl-cc, which
+# leaves $0 as axl-cc's path, so the name has to be passed through the
+# environment — easy to drop, and the symptom (help telling you to run a
+# different command than the one you ran) is quiet. All text-only, so no C++
+# toolchain is required and these run unconditionally.
+#
+# Also pins that axl-c++ ships alongside axl-cc UNCONDITIONALLY: it is a
+# dependency-free wrapper, and withholding it on a C-only install replaces
+# axl-cc's precise "libaxl-cxx.a is missing, run ./scripts/install.sh --cpp"
+# with the shell's bare "command not found".
+CXX_DRV="$(dirname "$AXL_CC")/axl-c++"
+[[ -x "$CXX_DRV" ]]
+check "$?" "axl-c++ is installed alongside axl-cc (unconditional wrapper)"
+
+if [[ -x "$CXX_DRV" ]]; then
+    # Capture to files and grep those, never `--help | grep -q`: help is
+    # produced by a `cat | sed` pipeline, so a short-circuiting grep -q can
+    # SIGPIPE the writer and pipefail then reports the whole pipeline failed.
+    # That races on output size and produced an intermittent red here.
+    "$CXX_DRV" --help    >"$WORK/cxxhelp.txt" 2>&1
+    "$CXX_DRV" --version >"$WORK/cxxver.txt"  2>&1
+    "$AXL_CC"  --help    >"$WORK/cchelp.txt"  2>&1
+    "$CXX_DRV" --bogus-option x.cpp >"$WORK/cxxbogus.log" 2>&1
+
+    [[ "$(head -1 "$WORK/cxxhelp.txt")" == axl-c++\ * ]]
+    check "$?" "axl-c++ --help identifies itself as axl-c++"
+    grep -q '^Usage: axl-c++ ' "$WORK/cxxhelp.txt"
+    check "$?" "axl-c++ --help Usage line names axl-c++"
+    grep -q '^axl-c++ ' "$WORK/cxxver.txt"
+    check "$?" "axl-c++ --version names axl-c++"
+    grep -q "run 'axl-c++ --help'" "$WORK/cxxbogus.log"
+    check "$?" "axl-c++ unknown-option error names axl-c++"
+    # ...and axl-cc still names itself, i.e. the substitution is per-invocation
+    # rather than hardcoded the other way. The alias note must NOT leak into it.
+    [[ "$(head -1 "$WORK/cchelp.txt")" == axl-cc\ * ]] \
+        && ! grep -q 'axl-c++ is axl-cc with' "$WORK/cchelp.txt" \
+        && ! grep -q '@PROG@' "$WORK/cchelp.txt" "$WORK/cxxhelp.txt"
+    check "$?" "axl-cc --help names axl-cc, omits the alias note, no stray @PROG@"
+else
+    # Balanced SKIP count (5) — see feedback_balancer_count.
+    for _m in "axl-c++ --help identifies itself as axl-c++" \
+              "axl-c++ --help Usage line names axl-c++" \
+              "axl-c++ --version names axl-c++" \
+              "axl-c++ unknown-option error names axl-c++" \
+              "axl-cc --help names axl-cc, omits the alias note, no stray @PROG@"; do
+        echo "SKIP: $_m (axl-c++ not installed)"
+    done
+fi
+
 # 5. --depfile: emit ABSOLUTE dependency paths while compiling the BARE source
 # (object must stay bit-identical to a no-depfile compile — Makefile<->CMake
 # bit-parity). Use a local header so the .d has a relative dep to absolutize,
@@ -131,6 +197,48 @@ check "$?" "every dependency path in the depfile is absolute (stray: ${bad:-none
 grep -qF "$DW/t.h" "$DW/t.d" 2>/dev/null && [[ -f "$DW/t.h" ]]
 check "$?" "local header t.h is listed as an absolute existing path"
 
+# 5b. Why --depfile exists at all: pin what the two FORWARDED gcc flags do with
+# SDK headers, because that is the reason --help gives a consumer for choosing
+# between them, and a silent drift in it would send them the wrong way.
+#
+# The SDK arrives via -isystem, so:
+#   -MMD skips system headers => it lists NO axl-sdk header whatsoever (the
+#        consumer gets zero SDK dependency tracking, not merely awkward paths);
+#   -MD  lists them, absolute, while the relative source stays relative => a
+#        MIXED file, which is what CMake's DEPFILE cannot rebase.
+#
+# Host-independent by construction: it asserts a COUNT (zero vs non-zero) and
+# the coexistence of one relative and one absolute prerequisite, never a
+# particular path — so it does not depend on the host gcc's include layout.
+# The relative side is the source name itself, which is relative because the
+# compile runs from its own directory.
+SDW="$WORK/depsys"
+mkdir -p "$SDW"
+printf '#include <axl.h>\nint sdkdep(void){ return 0; }\n' > "$SDW/s.c"
+
+( cd "$SDW" && "$AXL_CC" -c -MMD -MF s-mmd.d s.c -o s-mmd.o ) >"$SDW/mmd.log" 2>&1
+mmd_rc=$?
+( cd "$SDW" && "$AXL_CC" -c -MD  -MF s-md.d  s.c -o s-md.o  ) >"$SDW/md.log" 2>&1
+md_rc=$?
+[[ "$mmd_rc" -eq 0 && "$md_rc" -eq 0 ]]
+check "$?" "forwarded -MMD and -MD both compile an SDK TU (rc=$mmd_rc/$md_rc)"
+
+dep_tokens() { tr -d '\\' < "$1" | tr ' \t' '\n' | grep -vxE '.*:|' || true; }
+
+mmd_sdk=$(dep_tokens "$SDW/s-mmd.d" | grep -c 'include/axl-sdk/')
+[[ "$mmd_rc" -eq 0 && -s "$SDW/s-mmd.d" && "$mmd_sdk" -eq 0 ]]
+check "$?" "forwarded -MMD lists NO SDK headers — they come via -isystem (found $mmd_sdk)"
+
+md_sdk=$(dep_tokens "$SDW/s-md.d" | grep -c 'include/axl-sdk/')
+[[ "$md_sdk" -gt 0 ]]
+check "$?" "forwarded -MD does list SDK headers (found $md_sdk)"
+
+# Mixed: at least one relative and at least one absolute prerequisite, same file.
+md_rel=$(dep_tokens "$SDW/s-md.d" | grep -cvE '^/')
+md_abs=$(dep_tokens "$SDW/s-md.d" | grep -cE '^/')
+[[ "$md_rel" -gt 0 && "$md_abs" -gt 0 ]]
+check "$?" "forwarded -MD yields a MIXED depfile ($md_rel relative + $md_abs absolute)"
+
 # 6. Bit-parity: --depfile must NOT perturb the object vs a bare compile.
 ( cd "$DW" && "$AXL_CC" -c t.c -o t-nodep.o ) >"$DW/nodep.log" 2>&1
 cmp -s "$DW/t.o" "$DW/t-nodep.o"
@@ -152,6 +260,98 @@ ms_rc=$?
 [[ "$ms_rc" -eq 0 && -f "$MD/out/a.d" && -f "$MD/out/b.d" ]] \
     && grep -qF "$MD/t.h" "$MD/out/a.d" && grep -qF "$MD/t.h" "$MD/out/b.d"
 check "$?" "multi-source --depfile <dir> writes per-object absolute .d files (rc=$ms_rc)"
+
+# 9. -std is routed to the LANGUAGE IT NAMES, not into the shared extras.
+#
+# The extras are expanded after the baked-in flags on both compile lines, so a
+# C standard used to land on the g++ line too:
+# `g++ -std=c++23 ... -std=gnu2x` draws "valid for C/ObjC but not for C++",
+# which -Werror (also forwarded) turns into a hard error. Splitting it per
+# language fixes that but opens two silent failures instead -- a dropped -std
+# in the --service re-invocation, and a C standard parked where an `-x c++`
+# build never reads it. All three are pinned here.
+SD="$DW/std"; mkdir -p "$SD"
+printf '#include <axl.h>\nint axl_c_side(void){ return 0; }\n' > "$SD/s.c"
+printf 'int axl_cpp_side(){ return 0; }\n'                     > "$SD/s.cpp"
+
+# The C++ cases need a working C++ toolchain (host g++ for x64, ARM's
+# bare-metal cross for aa64). Probe once by compiling, rather than guessing
+# from a path: a staged-but-broken toolchain would otherwise turn these into
+# confusing failures instead of honest skips.
+HAVE_CXX_TOOLCHAIN=false
+if ( cd "$SD" && "$AXL_CC" -c s.cpp -o probe.o ) >"$SD/probe.log" 2>&1; then
+    HAVE_CXX_TOOLCHAIN=true
+fi
+
+# 9a. A C standard with -Werror must not reach the C++ compiler. The fixture
+# MUST contain a C++ source: with only .c input the g++ line never runs, a
+# leaked flag has nothing to break, and the check passes against the very bug
+# it is written for (confirmed -- the first version of this test did not fail
+# under a sabotage that put -std back into the shared extras). Grep for the
+# exact diagnostic, because "the build failed" is a different claim from
+# "the flag leaked".
+if [[ "$HAVE_CXX_TOOLCHAIN" == "true" ]]; then
+    # cd + no -o: multi-source -c wants a directory destination (see case 8).
+    ( cd "$SD" && "$AXL_CC" -std=gnu2x -Werror -c s.c s.cpp ) >"$SD/c.log" 2>&1
+    std_c_rc=$?
+    [[ "$std_c_rc" -eq 0 ]] && ! grep -q "valid for C/ObjC but not for C++" "$SD/c.log"
+    check "$?" "-std=<C> in a mixed C/C++ build never reaches g++ (rc=$std_c_rc)"
+else
+    check 0 "SKIP: no C++ toolchain — mixed-build -std leak check not run"
+fi
+
+# 9d. The same silent drop reachable by extension dispatch rather than -x:
+# a C standard with only .cpp sources can never be applied.
+if [[ "$HAVE_CXX_TOOLCHAIN" == "true" ]]; then
+    "$AXL_CC" -std=gnu2x -c "$SD/s.cpp" -o "$SD/s3.o" >"$SD/only.log" 2>&1
+    only_rc=$?
+    [[ "$only_rc" -ne 0 ]] && grep -q "names a C standard" "$SD/only.log"
+    check "$?" "-std=<C> with only C++ sources errors instead of dropping (rc=$only_rc)"
+else
+    check 0 "SKIP: no C++ toolchain — extension-dispatch -std check not run"
+fi
+
+# 9b. axl-c++ forces -x c++ on EVERY source, so a C standard can never be
+# applied. It must say so: before the split g++ rejected it with a clear
+# message, and a silent build at the wrong standard is strictly worse.
+if [[ -x "$CXX_DRV" ]]; then
+    "$CXX_DRV" -std=gnu17 -c "$SD/s.cpp" -o "$SD/s2.o" >"$SD/x.log" 2>&1
+    xmm_rc=$?
+    [[ "$xmm_rc" -ne 0 ]] && grep -q "names a C standard" "$SD/x.log"
+    check "$?" "axl-c++ -std=<C> errors clearly instead of dropping it (rc=$xmm_rc)"
+else
+    # Balancer: the populated path above contributes one check, so the skip
+    # path must too, or the ratchet drifts by arch.
+    check 0 "SKIP: axl-c++ absent — -std=<C> mismatch check not run"
+fi
+
+# 9c. --service re-invokes axl-cc TWICE (driver, then launcher app); -std lives
+# outside CFLAGS_EXTRA now, so it must be forwarded explicitly or both passes
+# silently fall back to the default. --verbose echoes each compile, so grep the
+# command lines rather than trusting that a successful build used the flag.
+#
+# Uses the real service example, not a stub: a fixture with no AXL_SERVICE_DRIVER
+# fails pass 1 on an undefined DriverEntry, pass 2 never runs, and the check
+# then proves only half of what its name claims. Two occurrences is the
+# assertion — one per pass.
+#
+# cd into the work dir: --service writes NAME.efi / NAME-dxe.efi (and .so) to
+# the CWD under fixed names, which is the repo root when the suite runs.
+# The service NAME is load-bearing, not arbitrary: --service NAME generates the
+# embed symbols axl_embedded_NAME{,_end}, and service-demo.c references
+# axl_embedded_service_demo by hand. A mismatched name fails pass 1 on those
+# undefined symbols — which looks like an -std problem and is not.
+SVC_SRC="$PROJECT_DIR/sdk/examples/service-demo.c"
+if [[ -f "$SVC_SRC" ]]; then
+    ( cd "$SD" && "$AXL_CC" --verbose --service service_demo -std=gnu2x "$SVC_SRC" ) \
+        >"$SD/svc.log" 2>&1
+    svc_rc=$?
+    svc_n=$(grep -c -- "-std=gnu2x" "$SD/svc.log")
+    [[ "$svc_rc" -eq 0 && "$svc_n" -ge 2 ]]
+    check "$?" "--service forwards -std to BOTH sub-builds (rc=$svc_rc, seen ${svc_n}x)"
+else
+    check 0 "SKIP: sdk/examples/service-demo.c absent — --service -std check not run"
+fi
 
 echo "--- results ---"
 echo "axl-cc flag passthrough: $pass passed, $fail failed"

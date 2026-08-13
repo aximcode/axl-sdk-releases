@@ -306,6 +306,21 @@ axl_url_free(AxlUrl *url)
 // axl_url_build
 // ---------------------------------------------------------------------------
 
+/* Format the URL into @a out, which may be too small: the return is the
+ * length the whole URL NEEDS, exactly as axl_snprintf reports it. Factored
+ * out so the oversize path can re-run the identical formatting into an
+ * exact-sized buffer instead of a second, drifting copy of it. */
+static size_t
+url_format(char *out, size_t size, const char *scheme, const char *host,
+           uint16_t port, uint16_t default_port, const char *path)
+{
+    if (port != 0 && port != default_port) {
+        return axl_snprintf(out, size, "%s://%s:%u%s", scheme, host, port,
+                            path);
+    }
+    return axl_snprintf(out, size, "%s://%s%s", scheme, host, path);
+}
+
 char *
 axl_url_build(const char *scheme, const char *host, uint16_t port,
               const char *path)
@@ -335,15 +350,26 @@ axl_url_build(const char *scheme, const char *host, uint16_t port,
     //
     // Build: scheme://host[:port]path
     //
-    if (port != 0 && port != default_port) {
-        len = axl_snprintf(buf, sizeof(buf), "%s://%s:%u%s", scheme, host, port, use_path);
-    } else {
-        len = axl_snprintf(buf, sizeof(buf), "%s://%s%s", scheme, host, use_path);
-    }
+    // The stack buffer is a fast path, not the bound. axl_snprintf reports
+    // the length the URL WOULD need regardless of the buffer it was given,
+    // so a URL longer than `buf` used to allocate that full length and then
+    // copy it back out of the 512-byte buffer -- reading past the end of the
+    // stack frame and splicing whatever followed into the returned string.
+    // A path of a few hundred bytes is enough, and the result went straight
+    // to a caller. Over-length now re-formats into the exact allocation.
+    //
+    len = url_format(buf, sizeof(buf), scheme, host, port, default_port,
+                     use_path);
 
     result = axl_malloc(len + 1);
-    if (result != NULL) {
+    if (result == NULL) {
+        return NULL;
+    }
+    if (len < sizeof(buf)) {
         axl_memcpy(result, buf, len + 1);
+    } else {
+        (void)url_format(result, len + 1, scheme, host, port, default_port,
+                         use_path);
     }
 
     return result;

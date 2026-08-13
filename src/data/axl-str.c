@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include "../backend/axl-backend.h"
 #include <axl/axl-log.h>
+#include <axl/axl-math.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-format.h>
@@ -986,6 +987,60 @@ axl_utf8_decode(
     #undef UTF8_IS_CONT
 }
 
+size_t
+axl_utf8_encode(
+    uint32_t   codepoint,
+    char      *dst,
+    size_t     dst_size
+    )
+{
+    size_t need;
+
+    /* A UTF-16 surrogate is not a Unicode scalar value and nothing above
+       U+10FFFF has an encoding at all. Both are refused rather than emitted
+       as the CESU-8 / WTF-8 and 5-byte forms the ladder below would happily
+       produce — axl_utf8_decode rejects exactly those byte sequences, so
+       emitting one would break the round-trip this call is the other half of. */
+    if ((codepoint >= 0xD800 && codepoint <= 0xDFFF) || codepoint > 0x10FFFF) {
+        return 0;
+    }
+
+    need = (codepoint < 0x80)    ? 1 :
+           (codepoint < 0x800)   ? 2 :
+           (codepoint < 0x10000) ? 3 : 4;
+
+    if (dst == NULL) {
+        return need;        /* sizing pass — dst_size is not consulted */
+    }
+    if (dst_size < need) {
+        /* All or nothing. A partial sequence is ill-formed UTF-8, and the
+           caller cannot tell it from a complete one after the fact. */
+        return 0;
+    }
+
+    switch (need) {
+    case 1:
+        dst[0] = (char)codepoint;
+        break;
+    case 2:
+        dst[0] = (char)(0xC0 | (codepoint >> 6));
+        dst[1] = (char)(0x80 | (codepoint & 0x3F));
+        break;
+    case 3:
+        dst[0] = (char)(0xE0 | (codepoint >> 12));
+        dst[1] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        dst[2] = (char)(0x80 | (codepoint & 0x3F));
+        break;
+    default:
+        dst[0] = (char)(0xF0 | (codepoint >> 18));
+        dst[1] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        dst[2] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        dst[3] = (char)(0x80 | (codepoint & 0x3F));
+        break;
+    }
+    return need;
+}
+
 // ---------------------------------------------------------------------------
 // UTF-8 -> UCS-2
 // ---------------------------------------------------------------------------
@@ -1741,4 +1796,414 @@ axl_strtou64_with_offset(
     if (off_val > UINT64_MAX - base_val) { return AXL_ERR; }
     *out = base_val + off_val;
     return AXL_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-buffer emit -- shared by all four *_to_str renderers
+// ---------------------------------------------------------------------------
+
+/* Copy the @a src_len characters at @a src into @a buf, writing at most
+ * @a bufsz - 1 of them and always NUL-terminating. @a bufsz must be >= 1.
+ *
+ * This is axl_vsnprintf's convention, which the four public docstrings
+ * commit to: the return is the length the WHOLE rendering would have
+ * had, so `ret >= bufsz` is the caller's truncation test. One helper for
+ * all four keeps that promise literally identical across them.
+ *
+ * @return @a src_len -- the full length, however little of it fit. */
+static size_t
+emit_result(
+    char       *buf,
+    size_t      bufsz,
+    const char *src,
+    size_t      src_len
+    )
+{
+    size_t n = (src_len < bufsz - 1) ? src_len : bufsz - 1;
+
+    axl_memcpy(buf, src, n);
+    buf[n] = '\0';
+    return src_len;
+}
+
+// ---------------------------------------------------------------------------
+// Integer -> string (round-trip pair for axl_str_to_u64 / axl_str_to_s64)
+// ---------------------------------------------------------------------------
+
+/* Render @a value in @a base BACKWARDS into @a out, filling down from
+ * out[cap - 1] and writing no NUL; the text is out[return .. cap).
+ * Filling backwards is the natural direction (digits come out least
+ * significant first) and lets axl_s64_to_str prepend its sign without a
+ * second pass. @a base must be 2..36. @a cap must be at least 64 for
+ * the DIGITS -- base 2, the widest spelling, is exactly 64 digits for a
+ * 64-bit value -- and at least 65 for a caller that prepends a sign,
+ * because axl_s64_to_str does that with `out[--pos]` on the returned
+ * index: at cap == 64 with INT64_MIN in base 2 that index is 0 and the
+ * decrement wraps to SIZE_MAX. Callers pass AXL_U64_STR_MAX (65) and
+ * AXL_S64_STR_MAX (66), so both hold with a byte to spare; this comment
+ * is the only guard, so keep it true if a third caller appears.
+ *
+ * Deliberately not shared with format_uint() in axl-format.c: that one
+ * lives in the zero-dependency AxlFormatLib (which exists to break the
+ * Log -> Data cycle), has a 16-entry digit table because %x/%u are its
+ * only bases, and does not NUL-terminate.
+ *
+ * @return index of the first character written. */
+static size_t
+u64_digits_rev(
+    uint64_t  value,
+    int       base,
+    char     *out,
+    size_t    cap
+    )
+{
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    size_t pos = cap;
+
+    /* do/while so 0 renders as "0" rather than nothing. */
+    do {
+        out[--pos] = digits[value % (uint64_t)base];
+        value /= (uint64_t)base;
+    } while (value != 0);
+
+    return pos;
+}
+
+size_t
+axl_u64_to_str(
+    uint64_t  value,
+    int       base,
+    char     *buf,
+    size_t    bufsz
+    )
+{
+    char   tmp[AXL_U64_STR_MAX];
+    size_t pos;
+
+    if (buf == NULL || bufsz == 0) {
+        return 0;
+    }
+    if (base < 2 || base > 36) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    pos = u64_digits_rev(value, base, tmp, sizeof(tmp));
+    return emit_result(buf, bufsz, tmp + pos, sizeof(tmp) - pos);
+}
+
+size_t
+axl_s64_to_str(
+    int64_t   value,
+    int       base,
+    char     *buf,
+    size_t    bufsz
+    )
+{
+    char     tmp[AXL_S64_STR_MAX];
+    size_t   pos;
+    uint64_t mag;
+
+    if (buf == NULL || bufsz == 0) {
+        return 0;
+    }
+    if (base < 2 || base > 36) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    if (value < 0) {
+        /* Two steps so INT64_MIN survives: -(value + 1) is in range for
+         * every negative int64_t, and the missing unit is added back
+         * after the conversion to unsigned. Negating INT64_MIN as a
+         * signed value is undefined. */
+        mag = (uint64_t)(-(value + 1)) + 1u;
+    } else {
+        mag = (uint64_t)value;
+    }
+
+    pos = u64_digits_rev(mag, base, tmp, sizeof(tmp));
+    if (value < 0) {
+        tmp[--pos] = '-';
+    }
+    return emit_result(buf, bufsz, tmp + pos, sizeof(tmp) - pos);
+}
+
+// ---------------------------------------------------------------------------
+// Double / float -> string (round-trip pair for axl_str_to_double)
+// ---------------------------------------------------------------------------
+
+/* Assemble @a digits (@a ndig significant digits, decimal point at
+ * @a decpt per the axl_dtoa convention, negative if @a neg) into @a out
+ * following the %g-style rule: exponential when the decimal exponent is
+ * < -4 or >= 17, fixed otherwise. @a out must have room for the
+ * AXL_DOUBLE_STR_MAX worst case; the caller owns NUL-termination.
+ *
+ * @return number of bytes written to @a out. */
+static size_t
+assemble_decimal(
+    char       *out,
+    const char *digits,
+    int         ndig,
+    int         decpt,
+    int         neg
+    )
+{
+    size_t pos = 0;
+    int    exp = decpt - 1;
+    int    i;
+
+    if (neg) {
+        out[pos++] = '-';
+    }
+
+    if (exp < -4 || exp >= 17) {
+        /* Scientific: d[.ddd...]e+NN, minimum 2 exponent digits. */
+        int  aexp = (exp < 0) ? -exp : exp;
+        char edig[3];
+        int  elen;
+
+        out[pos++] = digits[0];
+        if (ndig > 1) {
+            out[pos++] = '.';
+            axl_memcpy(out + pos, digits + 1, (size_t)(ndig - 1));
+            pos += (size_t)(ndig - 1);
+        }
+        out[pos++] = 'e';
+        out[pos++] = (exp < 0) ? '-' : '+';
+
+        if (aexp >= 100) {
+            edig[0] = (char)('0' + aexp / 100);
+            edig[1] = (char)('0' + (aexp / 10) % 10);
+            edig[2] = (char)('0' + aexp % 10);
+            elen = 3;
+        } else {
+            edig[0] = (char)('0' + aexp / 10);
+            edig[1] = (char)('0' + aexp % 10);
+            elen = 2;
+        }
+        axl_memcpy(out + pos, edig, (size_t)elen);
+        pos += (size_t)elen;
+    } else if (decpt <= 0) {
+        /* 0.00...digits, -decpt leading fractional zeros. */
+        out[pos++] = '0';
+        out[pos++] = '.';
+        for (i = 0; i < -decpt; i++) {
+            out[pos++] = '0';
+        }
+        axl_memcpy(out + pos, digits, (size_t)ndig);
+        pos += (size_t)ndig;
+    } else if (decpt < ndig) {
+        /* digits split by the point: decpt whole digits, then the rest. */
+        axl_memcpy(out + pos, digits, (size_t)decpt);
+        pos += (size_t)decpt;
+        out[pos++] = '.';
+        axl_memcpy(out + pos, digits + decpt, (size_t)(ndig - decpt));
+        pos += (size_t)(ndig - decpt);
+    } else {
+        /* Integer: all digits, then trailing zeros, no decimal point. */
+        axl_memcpy(out + pos, digits, (size_t)ndig);
+        pos += (size_t)ndig;
+        for (i = 0; i < decpt - ndig; i++) {
+            out[pos++] = '0';
+        }
+    }
+
+    return pos;
+}
+
+/* The shared numeric engine behind both axl_double_to_str and the
+ * non-finite path of axl_float_to_str: nan/inf handling + axl_dtoa +
+ * assemble_decimal. @a out must have room for AXL_DOUBLE_STR_MAX.
+ *
+ * @return number of bytes written to @a out. */
+static size_t
+double_to_str_core(
+    double  value,
+    char   *out
+    )
+{
+    char digits[AXL_DTOA_BUF_MIN];
+    int  decpt;
+    int  neg;
+    int  ndig;
+
+    if (axl_isnan(value)) {
+        axl_memcpy(out, "nan", 3);
+        return 3;
+    }
+
+    if (axl_isinf(value)) {
+        size_t pos = 0;
+        if (value < 0.0) { out[pos++] = '-'; }
+        axl_memcpy(out + pos, "inf", 3);
+        return pos + 3;
+    }
+
+    decpt = 1;
+    neg = 0;
+    ndig = axl_dtoa(value, digits, sizeof(digits), &decpt, &neg);
+    if (ndig <= 0) {
+        digits[0] = '0';
+        digits[1] = '\0';
+        ndig = 1;
+        decpt = 1;
+        neg = 0;
+    }
+
+    return assemble_decimal(out, digits, ndig, decpt, neg);
+}
+
+size_t
+axl_double_to_str(
+    double  value,
+    char   *buf,
+    size_t  bufsz
+    )
+{
+    char tmp[AXL_DOUBLE_STR_MAX];
+    size_t len;
+
+    if (buf == NULL || bufsz == 0) {
+        return 0;
+    }
+
+    len = double_to_str_core(value, tmp);
+    return emit_result(buf, bufsz, tmp, len);
+}
+
+/* Round the @a *ndig significant digits in @a d (decimal point at
+ * @a *decpt, per the axl_dtoa convention) to @a want significant digits,
+ * round-half-to-even, then strip any trailing zeros the rounding
+ * created. @a want must be in [1, *ndig). Updates @a *ndig / @a *decpt
+ * in place; @a d must have room for one extra digit (a carry out of the
+ * leading digit, e.g. 999 -> 1000). */
+static void
+round_sig_digits(
+    char *d,
+    int  *ndig,
+    int  *decpt,
+    int   want
+    )
+{
+    int  orig_ndig = *ndig;
+    bool round_up;
+    char next = d[want];
+    int  n, i;
+
+    if (next > '5') {
+        round_up = true;
+    } else if (next < '5') {
+        round_up = false;
+    } else {
+        bool exactly_half = true;
+        for (i = want + 1; i < orig_ndig; i++) {
+            if (d[i] != '0') { exactly_half = false; break; }
+        }
+        round_up = exactly_half ? (((d[want - 1] - '0') % 2) != 0) : true;
+    }
+
+    n = want;
+    if (round_up) {
+        i = n - 1;
+        while (i >= 0 && d[i] == '9') {
+            d[i] = '0';
+            i--;
+        }
+        if (i >= 0) {
+            d[i]++;
+        } else {
+            /* Carried out of the leading digit: shift right, prepend '1'. */
+            int j;
+            for (j = n; j > 0; j--) { d[j] = d[j - 1]; }
+            d[0] = '1';
+            n++;
+            (*decpt)++;
+        }
+    }
+
+    /* Strip trailing zeros the rounding produced (canonical shortest form). */
+    while (n > 1 && d[n - 1] == '0') {
+        n--;
+    }
+    d[n] = '\0';
+    *ndig = n;
+}
+
+size_t
+axl_float_to_str(
+    float   value,
+    char   *buf,
+    size_t  bufsz
+    )
+{
+    double d = (double)value;
+    char   tmp[AXL_DOUBLE_STR_MAX];
+    size_t len;
+
+    if (buf == NULL || bufsz == 0) {
+        return 0;
+    }
+
+    if (axl_isnan(d) || axl_isinf(d)) {
+        /* Non-finite spellings are width-independent, so the double
+         * engine's answer is already the float's. Assign rather than
+         * return so both paths leave through the single emit below --
+         * one exit, one truncation convention. */
+        len = double_to_str_core(d, tmp);
+    } else {
+        /* Shortest text that round-trips through axl_str_to_double + a
+         * (float) cast: search increasing significant-digit counts,
+         * correctly rounded at each length, and stop at the first that
+         * reproduces @a value bit-for-bit. 9 (FLT_DECIMAL_DIG) always
+         * suffices for IEEE-754 binary32, so the loop is bounded there
+         * even when the double's own shortest form needs more. */
+        char digits[AXL_DTOA_BUF_MIN];
+        int  decpt = 1;
+        int  neg = 0;
+        int  ndig = axl_dtoa(d, digits, sizeof(digits), &decpt, &neg);
+        char best[AXL_DTOA_BUF_MIN];
+        int  best_ndig, best_decpt;
+        int  want;
+
+        if (ndig <= 0) {
+            digits[0] = '0';
+            digits[1] = '\0';
+            ndig = 1;
+            decpt = 1;
+            neg = 0;
+        }
+
+        best_ndig = ndig;
+        best_decpt = decpt;
+        axl_memcpy(best, digits, (size_t)ndig + 1);
+
+        for (want = 1; want < ndig && want <= 9; want++) {
+            char   cand[AXL_DTOA_BUF_MIN];
+            int    cand_ndig = ndig;
+            int    cand_decpt = decpt;
+            char   probe[AXL_DOUBLE_STR_MAX];
+            size_t probe_len;
+            double back;
+
+            axl_memcpy(cand, digits, (size_t)ndig + 1);
+            round_sig_digits(cand, &cand_ndig, &cand_decpt, want);
+
+            probe_len = assemble_decimal(probe, cand, cand_ndig, cand_decpt, neg);
+            probe[probe_len] = '\0';
+
+            if (axl_str_to_double(probe, &back, NULL) == AXL_OK
+                && (float)back == value)
+            {
+                best_ndig = cand_ndig;
+                best_decpt = cand_decpt;
+                axl_memcpy(best, cand, (size_t)cand_ndig + 1);
+                break;
+            }
+        }
+
+        len = assemble_decimal(tmp, best, best_ndig, best_decpt, neg);
+    }
+
+    return emit_result(buf, bufsz, tmp, len);
 }

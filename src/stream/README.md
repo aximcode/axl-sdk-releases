@@ -2,8 +2,10 @@
 
 `AxlStream` is the polymorphic byte-source/sink — modeled on POSIX
 `<stdio.h>`'s `FILE *`. It wraps a vtable over file handles, memory
-buffers, the console, the BOM-detecting text decoder, etc. All
-public functions that take `AxlStream *` live in this module.
+buffers, the console, the BOM-detecting text decoder, etc. The set is
+not closed: `axl_stream_open_custom` lets a consumer supply its own
+backend on the same footing as the built-ins (see *Custom Backends*).
+All public functions that take `AxlStream *` live in this module.
 
 For path-based filesystem operations (read whole file, dir walk,
 volume enumerate, stat), see the sibling **AxlFs** module
@@ -186,6 +188,43 @@ if (f != NULL) {
 }
 ```
 
+### `axl_fread` / `axl_fwrite` count ITEMS, and they loop
+
+Both behave like C's, which means they **loop** until the requested item
+count is satisfied. A backend is allowed to transfer less than it was
+asked for — a socket or ring buffer does so routinely — so one call to the
+backend is not enough, and a caller who received a short item count would
+have no way to tell a legal short transfer from end of input. After the
+loop, only a real ending can shorten the result:
+
+| Return < `count` | What it means | How to tell |
+|---|---|---|
+| `axl_fread` | end of input, or a read error | `axl_feof` / `axl_ferror` |
+| `axl_fwrite` | sink error | `axl_ferror` is **true** |
+| `axl_fwrite` | sink accepted nothing more (try again later) | `axl_ferror` is **false** |
+
+A `0` from a backend write is a legal "accepted nothing" rather than an
+error, and `axl_fwrite` stops at the first one instead of retrying —
+nothing can drain the sink while the loop holds the CPU, so a retry would
+only spin. Resume from the returned item count at your own cadence.
+
+That resume rule is for an **unbuffered** stream. Under `LINE`/`FULL` the
+bytes are copied into the stream's buffer before any sink call, so a stall
+surfaces as a hard error (the "try again" row cannot occur) *and the bytes
+stay queued for the next flush* — resending from the returned count would
+duplicate them. On a buffered stream a short return means "ask
+`axl_fflush` what happened", not "resume from byte N".
+
+Only **complete** items are counted; a partial trailing item is not,
+though for `axl_fread` its bytes are still in your buffer. Use `size == 1`
+when you care about the exact byte count. `size * count` overflowing is
+refused outright (0 items, nothing reaches the backend).
+
+The loop is the *right* semantics but not always the semantics you want: a
+filter reading an interactive console with `axl_fread(buf, 1, 4096, in)`
+blocks until 4096 bytes have been typed. Streaming code wants `axl_read`
+(and this is why `tr` uses it).
+
 ## Output Buffering
 
 By default every AxlStream is **unbuffered** — each write goes straight to
@@ -217,9 +256,9 @@ auto-buffered output could be silently lost, and a line-buffered prompt
 before a read could stall unseen. Buffering is therefore strictly opt-in,
 and **you own the final flush**: `axl_fflush` drains the buffer *and*
 pushes the sink; `axl_fclose` drains and frees but never calls the sink's
-flush, so it is not a substitute (spelled out below). Because
-`axl_stdout` / `axl_stderr` are never `fclose`d, code that buffers them
-must `axl_fflush` before it exits.
+flush, so it is not a substitute (spelled out below). Nothing closes
+`axl_stdout` / `axl_stderr` for you at exit, so code that buffers them
+must `axl_fflush` before it goes.
 
 On a **file** stream `axl_fflush` does double duty: it drains the AXL-side
 buffer *and* pushes the firmware's own cache through to the volume, so a
@@ -256,6 +295,28 @@ axl_fclose(buf);
 
 `axl_stream_init` populates five globals: `axl_stdout`, `axl_stderr`,
 `axl_stdin`, `axl_stdout_raw`, `axl_stderr_raw`.
+
+All five are **statically allocated**, and `axl_fclose` knows it: closing
+one drains any buffered output and resets it, but does not destroy it — the
+pointer stays valid and the stream keeps working. Generic code handed an
+arbitrary `AxlStream` can close it without first checking whether it
+happens to be one of these. "Resets" means the **ground state**: unbuffered,
+UTF-8, no tee, not interactive, `eof`/`err` clear, no half-transcoded bytes.
+Any configuration you applied is gone and must be re-applied — and dropping
+the tee is deliberate, since it is what stops the stream outliving a tee
+stream you close next.
+
+`axl_stream_init` establishes that same ground state — one shared helper, so
+the two cannot drift — and only then publishes the globals. Being `.data`,
+these five carry whatever the last caller left on them for the life of the
+image; a decoder left on `axl_stdin` makes every later `axl_stdin_text()`
+return NULL, and in a resident driver that is every later dispatch, not one
+run. On the first call the reset is invisible (the statics start at ground);
+what it buys is that a **second** call is a real reset, which is the
+supported way back after code that configured a standard stream did not
+restore it. Pending buffered output is drained, not dropped. Nothing calls
+it per dispatch, so a resident driver that wants a clean slate between
+launcher invocations has to call it itself.
 
 For shell pipe invocations (`tool1 | tool2`) the LHS output is
 captured by the shell into a stream that becomes the RHS's StdIn, so
@@ -383,6 +444,283 @@ UTF-16 code-unit shape, not the proper UTF-8 4-byte form. Almost
 all real-world UEFI Shell content is BMP-only ASCII / Latin-1 /
 common scripts; a follow-up can add full SMP support if a real
 consumer needs it.
+
+That permissiveness is the reason this transcode keeps its own
+codepoint encoder rather than calling `axl_utf8_encode`, which
+refuses a surrogate because it encodes Unicode *scalars*. A UCS-2
+wire carries code *units*, where an unpaired half is representable,
+so routing this path through the shared encoder would silently drop
+a code unit the wire can hold. Pinned by
+`encoding: reading it back restores the 3-byte shape` in
+`test/unit/axl-test-io.c`.
+
+## Custom Backends
+
+`AxlStream` is not a closed set. `axl_stream_open_custom` builds a
+stream from your own byte operations — a socket, a ring buffer, a UEFI
+protocol, a deliberately-failing test double — and everything AXL layers
+on top comes for free:
+
+```c
+static axl_ssize_t my_write(void *ctx, const void *buf, size_t count);
+static void        my_close(void *ctx);
+
+AxlStreamOps ops = AXL_STREAM_OPS_INIT;   /* always start here */
+ops.write = my_write;
+ops.close = my_close;
+
+AxlStream *s = axl_stream_open_custom(sink, &ops, "my-sink");
+axl_fprintf(s, "hello %s\n", who);        /* printf, encoding, buffering, tee */
+axl_fclose(s);                            /* calls my_close(sink) exactly once */
+```
+
+This is not a second-tier path bolted on beside the built-ins: **every
+constructor AXL publishes is built with exactly the call above** —
+`axl_bufopen`, `axl_fopen`, `axl_text_stream_wrap` and
+`axl_compress_writer` all fill an `AxlStreamOps` and hand it to
+`axl_stream_open_custom`, with the same operations they always used.
+Anything they give you — `axl_fprintf`, seeking, positional I/O,
+`axl_stream_name`, the capability queries — a stream you build here gets
+on the same terms. Only the five static console streams (`axl_stdout` and
+friends) are constructed differently, because they are objects in `.data`
+rather than allocations and so cannot come out of a constructor at all.
+
+A backend supplies **raw byte movement only**. The UTF-8 → wire
+transcode, LINE/FULL buffering, the stdout tee, the interactive hint and
+the sticky `eof`/`err` flags all sit *above* these operations. Three
+consequences that catch people out:
+
+- The bytes an operation sees are always **wire-side**. On write the
+  transcode has already happened; on read it happens after you return.
+  A backend never needs to know the stream's encoding.
+- **One `axl_write` is not one backend `write`.** It is with the defaults
+  (`AXL_ENC_UTF8` + `AXL_STREAM_BUF_NONE`), but LINE/FULL buffering
+  coalesces and a non-UTF-8 encoding issues one call **per code point**.
+- `flush` is **not** called before `close`, so a backend holding bytes of
+  its own must push them from `close`.
+
+Zero-initialize with `AXL_STREAM_OPS_INIT` and fill in only what you
+support. A NULL slot means "unsupported", but what the caller then sees
+differs per slot:
+
+| NULL slot | what the caller sees |
+|---|---|
+| `read` / `write` | `-1` from `axl_read` / `axl_write` |
+| `pread` / `pwrite` | `-1` from `axl_pread` / `axl_pwrite` |
+| `seek` | `AXL_ERR` from `axl_fseek` |
+| `tell` | `-1` from `axl_ftell` |
+| `flush` | **`AXL_OK`** — nothing to push is not an error |
+| `close` | no-op |
+
+**Return contract.** `read`/`write`/`pread`/`pwrite` return bytes
+transferred; a count *less than requested is legal and is not an error*,
+and `0` from `read` is end of input. `seek`/`flush` return 0, `tell`
+returns the offset, and all three return `-1` on error. `-1` is the only
+defined failure value — every other negative is **reserved** (dispatch
+treats all negatives as errors but propagates the value unchanged, which
+leaves room for a future "try again later" without encoding it as a lie).
+
+Short transfers cost a backend author nothing, because they are handled
+above the vtable: `axl_fread` / `axl_fwrite` loop until the item count is
+met, and a buffered flush retains whatever the sink declined. Move what
+you can and return it.
+
+**Ownership.** `ctx` belongs to the backend; `axl_fclose` calls
+`ops->close(ctx)` exactly once, after draining buffered output. If
+`axl_stream_open_custom` returns NULL, `close` is **not** called and `ctx`
+is still yours. `ops` and `name` are both copied, so the ops struct may
+live on the stack.
+
+#### Recovering the context — `axl_stream_ctx`
+
+A backend often wants a **stream-keyed accessor**, the shape `axl_bufdata`
+has: one handle in, the answer out. That needs the context back from a
+stream you were *handed*, not from one you kept — otherwise the
+constructor must return two things and every caller must carry both.
+
+`axl_stream_ctx` does it, and it takes your operations as well as the
+stream:
+
+```c
+size_t my_sink_dropped(AxlStream *s) {
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+    ops.write = my_sink_write;
+    ops.close = my_sink_close;
+    MySink *sink = (MySink *)axl_stream_ctx(s, &ops);
+    return (sink != NULL) ? sink->dropped : 0;
+}
+```
+
+**The `ops` argument is the safety property, not boilerplate.** The context
+comes back only if the stream was opened with a matching set of operations;
+any other stream is a NULL return. A bare `axl_stream_ctx(s)` would hand a
+*file* stream's private context to code about to cast it — which is not
+hypothetical, because `axl_bufdata` shipped with exactly that hole:
+reinterpreting a 16-byte context as a 32-byte one and zeroing it wrote past
+the end of the allocation and took the running image down, silently.
+
+Every slot holds the address of a function *you* wrote, so matching **shape**
+is never enough — a stream with the same read/write/seek/tell signature but
+different functions is refused. A match means "this came out of my
+constructor", which is what an accessor needs before it casts. It does not
+mean "this is *that* stream": every stream from one backend matches, which is
+correct, since they all carry a context of the same type. Telling individual
+streams apart is the context's own job.
+
+Built-in streams are **structurally** out of reach rather than excluded by a
+rule: the file, buffer, text, compress and console backends' operations are
+file-static, so no `ops` you can build will ever match one. There is no
+spelling of this call that reaches a `FileCtx`.
+
+Two more things worth knowing. A backend opened with a NULL context is
+indistinguishable from a refusal — which costs nothing, since it has nothing
+to recover. And version skew resolves exactly as it does for
+`axl_stream_open_custom`, because both go through the same normalisation: a
+caller that opens and queries with the same struct always matches itself.
+
+This diverges from glibc's `fopencookie` and BSD's `funopen`, which withhold
+the cookie entirely. The divergence is deliberate and narrow: those APIs have
+no versioned operations struct and therefore no token a caller could use to
+prove which backend it means, so withholding was their only safe option. AXL
+already copies such a struct at open time, so it can offer the getter *with*
+the check — and still does not offer it without.
+
+`axl_bufdata`/`axl_bufsteal` are built on exactly this call, and that is the
+proof it is sufficient: `src/stream/axl-stream-buf.c` names no private header
+and reaches its context the same way your code does. So do
+`axl-stream-file.c` and `axl-compress-stream.c`.
+
+#### Wrapping another stream — the filter rule
+
+A backend whose context is *another `AxlStream`* — a filter, a tee, an
+encoding sniffer, a compressor — builds and serves itself through the calls
+above like any other, and moves bytes through its peer with the ordinary
+public `axl_read` / `axl_write`. There is one rule, and it is the reason AXL
+publishes **no** "read below a stream's decode" call:
+
+> **A filter that moves opaque bytes through another stream requires that
+> stream to be at `AXL_ENC_UTF8`.** Not because the bytes are text, but
+> because any other setting means that stream is transforming them, and a
+> filter's bytes are not characters.
+
+At `AXL_ENC_UTF8` — the default, and where every stream starts — `axl_read`
+and `axl_write` **are** the wire calls: the encoding layer is a passthrough
+and dispatch goes straight to the backend. So the capability that looks
+missing is not missing; it is spelled "require the peer undecoded". Set the
+encoding on **your** stream, which is where a caller reads from anyway.
+
+Refuse a peer that breaks the rule rather than reaching past it. All three
+in-tree filters do so at construction, and the plain form is:
+
+```c
+if (axl_stream_get_encoding(peer) != AXL_ENC_UTF8) {
+    return NULL;                     /* refuse; leave the peer untouched */
+}
+```
+
+- `axl_text_stream_wrap` would otherwise decode a second time, on top of what
+  the source already decoded. It re-checks on every **read**, because a caller
+  can reach around a live wrapper and set an encoding on its source; the check
+  is live rather than latched, so restoring the source revives the wrapper.
+  Its check is the plain form plus one exemption: *another text wrapper* is
+  accepted — recognised via `axl_stream_ctx` — because its output is UTF-8 by
+  construction, so that whether a text stream can be wrapped again does not
+  depend on the bytes in the file underneath it. Over such a source the new
+  wrapper does **not** classify; re-sniffing already-decoded text is the
+  double decode by another route, since decoded UCS-2 containing `U+0000`
+  alternates ASCII with NUL bytes and looks exactly like headerless UCS-2.
+- `axl_compress_writer` / `axl_compress_reader` would otherwise transcode
+  DEFLATE bytes code point by code point. The writer re-checks when it
+  finalizes, since that is when the sink is actually written.
+
+A refusal is **inert**: the peer keeps its encoding *and* its position, which
+is what distinguishes "refused" from "read it, mangled it and failed".
+
+`src/stream/axl-stream-text.c` names no private header — it constructs with
+`axl_stream_open_custom`, reads with `axl_read`, and identifies its own kind
+with `axl_stream_ctx`. Nothing in `src/stream/` has a construction or
+composition path you lack.
+
+**Versioning.** `AXL_STREAM_OPS_INIT` stamps `struct_size` and `version`,
+and AXL copies `min(ops->struct_size, sizeof(AxlStreamOps))`. That
+survives skew in both directions: an older caller against a newer library
+leaves the newer slots NULL (unsupported, always safe), and a newer caller
+against an older library has its extra slots ignored rather than read out
+of bounds. A `struct_size` below the first published version, or a
+`version` the library does not know, is rejected with NULL.
+
+### Capability queries
+
+Generic code that accepts any `AxlStream` can ask before it calls, instead
+of discovering `-1` and having to guess whether that meant "unsupported"
+or "failed":
+
+```c
+if (axl_stream_can_seek(s)) { axl_fseek(s, 0, AXL_SEEK_SET); }
+```
+
+`axl_stream_can_read`, `_can_write`, `_can_seek`, `_can_tell`,
+`_can_pread`, `_can_pwrite` each mirror one vtable slot's NULL check —
+they are deliberately **independent**. `seek` and `tell` are separate
+slots, so a ring buffer can report a position it cannot seek to; likewise
+a read-only mapping has `pread` without `pwrite`.
+
+`axl_stream_name(s)` returns the label passed to
+`axl_stream_open_custom`, or the built-in name for a stream AXL
+constructed. The built-in set is closed: `"file"`, `"buffer"`, `"text"`,
+`"compress"`, `"stdout"`, `"stderr"`, `"stdin"`, `"stdout-raw"`,
+`"stderr-raw"`. It is never NULL — `""` when the stream has no name.
+
+### Fault injection
+
+A custom backend can already fail on demand, but only where the test
+*constructs* the stream. For a function that opens its own file, or that
+operates on an `AxlStream` handed to it, there are four global hooks —
+the `AxlStream` counterpart of `axl_mem_fail_next_alloc`, and they work on
+**every** stream including the built-ins:
+
+```c
+axl_stream_fail_next_write(1);
+test_check(axl_fprintf(s, "x") < 0, "the sink error is reported");
+axl_stream_fail_next_write(0);              /* disarm in teardown */
+```
+
+```c
+void axl_stream_fail_next_write (size_t n);
+void axl_stream_fail_next_read  (size_t n);
+void axl_stream_fail_next_flush (size_t n);
+void axl_stream_short_next_write(size_t n, size_t limit);
+```
+
+`short_next_write` produces a **short** write rather than a failed one —
+the case with no `AxlMem` analogue, because a partial allocation is not a
+thing. `limit` is clamped against the backend call's own count and may be
+`0`, which is the "accepted nothing, try again" result that drives the
+buffered path's retain-the-tail branch.
+
+The counter ticks **once per call into the backend's operation, not once
+per `axl_write`**, and the three ways those differ are the whole reason to
+read this paragraph:
+
+- Under `AXL_STREAM_BUF_LINE` / `_FULL`, a write that only fills the
+  buffer reaches no backend and consumes no tick — the armed failure
+  fires at the eventual flush.
+- With a non-UTF-8 encoding the transcode issues one backend write **per
+  code point**, so one `axl_write` of an n-character string consumes n
+  ticks. That is about `axl_stream_set_encoding`, *not* about the console:
+  `axl_stdout` and `axl_stderr` are UTF-8 streams whose UCS-2 conversion
+  happens inside their backend, below the injection point, so a console
+  write costs one tick however long the string is.
+- Writes to a stdout/stderr **tee never consume a tick**; only the primary
+  sink is injected. `axl_pread`/`axl_pwrite` are never injected at all.
+
+If the armed operation never reaches a backend the counter **stays armed**
+and fires on a later, unrelated operation — always disarm with `0`. The
+hooks are not reentrancy-safe: a callback that writes at raised TPL can
+consume the armed tick, so arm and observe within one non-reentrant
+sequence. In practice that means capturing results into locals and
+asserting *after* disarming, since a test framework's own PASS line is
+itself a write.
 
 ## File Operations
 

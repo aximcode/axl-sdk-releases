@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-app.h:
+/** @file axl-app.h
  *
  * Application-runtime accessors. Today: argv[0] capture for tools
  * that need their own invocation path (sidecar discovery, "where am

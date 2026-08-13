@@ -17,7 +17,10 @@ deps/*
 !deps/libvterm
 *.pyc
 __pycache__/
-tests/.last-pass-count
+# Per-configuration ratchet baselines. The default (no AXL_TLS) baseline at
+# test/integration/.last-pass-count IS tracked -- it is the shared gate. The
+# AXL_TLS variant is a local artifact of a non-default build, so it is not.
+test/integration/.last-pass-count.tls
 *.o
 *.dll
 *.map
@@ -30,13 +33,15 @@ tests/.last-pass-count
 .wrangler/
 .cache/
 compile_commands.json
+# ctags / etags indexes — per-developer, regenerated on demand
+tags
+TAGS
 *.imp
 SCRATCH.md
 .vscode/
 .env
 .envrc
 .env.*
-CLAUDE.md
 .claude/settings.local.json
 # Hardware-fixture captures (HF1+) — machine-specific, often contain
 # identifying data (serials, MACs, OEM strings). Local-only by default;
@@ -51,3 +56,26 @@ docs/handoffs/
 
 # Local-only docs (lab access, credentials-adjacent notes) — not distributable
 local/
+test/integration/.last-pass-count.tls
+
+# libFuzzer artifacts. The seed corpora are hand-written and tracked;
+# anything the fuzzer discovers or crashes on is not.
+test/fuzz/crash-*
+test/fuzz/leak-*
+test/fuzz/oom-*
+test/fuzz/timeout-*
+
+# libFuzzer artifacts from a harness run started outside test/fuzz. The gate
+# passes -artifact_prefix so its own failures land in test/fuzz/, but a manual
+# run from the repo root drops them HERE, where `git add -A` would sweep them
+# into a commit.
+/crash-*
+/leak-*
+/timeout-*
+/oom-*
+/slow-unit-*
+
+# Toolchain build artefacts — the recipe is tracked, the output is not.
+toolchain/*/work/
+toolchain/*/out/
+toolchain/*/build.log

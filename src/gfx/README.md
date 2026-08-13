@@ -456,7 +456,13 @@ position, visibility, opacity, an optional input region, and a place in a
 scene-graph tree: each surface has an optional parent, a child's position
 is relative to its parent, and stacking is tree pre-order (a node, then
 its children on top). Raising / moving / hiding / destroying a surface
-acts on its whole subtree.
+acts on its whole subtree, and so does opacity — a surface composites at
+its own value times every ancestor's (`axl_surface_effective_opacity`),
+so one `axl_surface_set_opacity` fades a group together. Note that this
+multiplies down per surface: each still blends over whatever is already
+beneath it, so mid-fade a child blends over its own already-faded parent
+rather than over the parent's backdrop. It is not an offscreen group
+fade; the endpoints are the same either way.
 
 ```c
 AxlCompositor *c = axl_compositor_new(1280, 800);
@@ -540,10 +546,13 @@ radius 12: 20.9 ms → 5.6 ms, median of 5, x64 under KVM,
 `test/integration/gfx-present-bench.c`).
 
 ```c
-AxlGfxBuffer *b = axl_gfx_buffer_new(w, h);
+AxlGfxBuffer *b = axl_gfx_buffer_new(w, h);   /* zero-filled */
 axl_gfx_target_buffer(b);
     /* ... render a shape ... */
 axl_gfx_target_buffer(NULL);
+/* blur reads the WHOLE buffer, not just what you drew — which is why
+   axl_gfx_buffer_new zero-fills: the halo blends against transparent
+   black rather than whatever the allocator last held. */
 axl_gfx_buffer_blur(b, 8);            /* CSS filter: blur(8px) */
 axl_gfx_buffer_present(b, 0, 0);
 axl_gfx_buffer_free(b);

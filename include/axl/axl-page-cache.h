@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-page-cache.h:
+/** @file axl-page-cache.h
  *
  * A fixed-capacity LRU cache of equal-sized pages, backed by a
  * caller-supplied fill function. The cache owns a pool of page frames;
@@ -66,7 +65,7 @@ typedef int64_t (*AxlPageFillFunc)(
     void   *dst,         ///< frame buffer (cap bytes)
     size_t  cap,         ///< frame capacity == page size
     void   *user         ///< opaque cookie from axl_page_cache_new
-);
+) AXL_CB_NOEXCEPT;
 
 /// Cache counters (monotonic; reset by axl_page_cache_clear).
 typedef struct {

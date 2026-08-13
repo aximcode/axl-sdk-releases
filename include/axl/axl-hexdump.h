@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-hexdump.h:
+/** @file axl-hexdump.h
  *
  * Formatted hex+ASCII dump with configurable grouping.
  * Supports direct console output and log integration.

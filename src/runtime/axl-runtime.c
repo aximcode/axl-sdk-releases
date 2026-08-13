@@ -12,6 +12,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "../mem/axl-mem-internal.h"
 #include "../posix/axl-app-internal.h"
 #include "axl-atexit-internal.h"
 #include "axl-cxxabi-internal.h"
@@ -179,6 +180,51 @@ _axl_init(void *image_handle, void *system_table)
     _axl_cxxabi_run_init_array();
 }
 
+unsigned
+axl_tpl_current(void)
+{
+    return (unsigned)axl_backend_tpl_current();
+}
+
+unsigned
+axl_tpl_raise(
+    unsigned  level
+    )
+{
+    return (unsigned)axl_backend_tpl_raise((uintptr_t)level);
+}
+
+void
+axl_tpl_restore(
+    unsigned  previous
+    )
+{
+    axl_backend_tpl_restore((uintptr_t)previous);
+}
+
+bool
+axl_tpl_restore_baseline(
+    unsigned  *out_leaked
+    )
+{
+    unsigned  now = (unsigned)axl_backend_tpl_current();
+
+    if (now <= AXL_TPL_APPLICATION) {
+        return false;
+    }
+
+    /* Repair BEFORE reporting. Above TPL_NOTIFY the log path itself
+       would hang (it allocates and writes the console), so a diagnostic
+       emitted from inside the leak would be the last thing that ever
+       ran. */
+    axl_backend_tpl_restore((uintptr_t)AXL_TPL_APPLICATION);
+
+    if (out_leaked != NULL) {
+        *out_leaked = now;
+    }
+    return true;
+}
+
 void
 _axl_cleanup(void)
 {
@@ -191,6 +237,31 @@ _axl_cleanup(void)
         return;
     }
     mCleanupRan = true;
+
+    /* FIRST, before any console write, allocation or callback below.
+     * An image that returns above TPL_APPLICATION wedges the machine —
+     * measured at TPL_CALLBACK as well as TPL_NOTIFY, so every raised
+     * level is fatal. AArch64 firmware names it (`ASSERT Image->Tpl ==
+     * gEfiCurrentTpl`) and deadloops; an x64 release build says nothing
+     * and simply spins. Repairing here turns an unrecoverable hang into
+     * a logged defect, and it must precede the rest of cleanup because
+     * at TPL_HIGH_LEVEL the logging itself would hang. */
+    if (axl_tpl_restore_baseline(NULL)) {
+        /* Reported through the raw console writer, NOT axl_error. The
+         * repair itself is 158 bytes; an axl_error here cost a further
+         * 550-1060 in every C-only image, because it drags the whole
+         * formatting path into apps that never log otherwise (measured:
+         * hexdump +710, grep +1222, while apps already logging paid
+         * +198). The Ctrl-C notice below already links this writer, so
+         * the diagnostic is now close to free -- and the point of it is
+         * that a wedge becomes a NAMED failure, which one fixed line
+         * does as well as a formatted one. The level is spelled out by
+         * hand for the same reason. */
+        axl_backend_console_write_err(
+            (const unsigned short *)
+            L"\r\nAXL: exited at a raised TPL -- a raise was never "
+            L"restored. Restored it; the machine stays usable.\r\n");
+    }
 
     /* Universal Ctrl-C notice: if the run was interrupted and the app did not
      * install its own handler (which owns its messaging), announce the break on
@@ -227,6 +298,6 @@ _axl_cleanup(void)
     _axl_registry_sweep();
 
 #ifdef AXL_MEM_DEBUG
-    axl_mem_dump_leaks();
+    _axl_mem_dump_leaks_at_exit();
 #endif
 }

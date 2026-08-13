@@ -81,8 +81,12 @@ axl_sidecar_open_file(
     if (axl_file_info(path, &finfo) != AXL_OK) {
         return AXL_SIDECAR_FILE_MISSING;
     }
-    if (!axl_json_load_file_flags(path, AXL_JSON_PARSER_JSON5,
-                                  r, out_raw, NULL))
+    /* json-dialect: local-file -- a sidecar is shipped beside the binary and
+       hand-edited, which is exactly the case design decision 40 reserves the
+       liberal dialect for. This is THE liberal parse in the library, and it
+       is concentrated here so nothing else has to reach for one. */
+    if (!axl_json_load_file(path, AXL_JSON_JSON5,
+                            r, out_raw, NULL))
     {
         return AXL_SIDECAR_PARSE_ERROR;
     }
@@ -99,7 +103,10 @@ axl_sidecar_open_buffer(
     if (r == NULL || json5 == NULL || len == 0) {
         return AXL_SIDECAR_PARSE_ERROR;
     }
-    if (!axl_json_parse_flags(json5, len, AXL_JSON_PARSER_JSON5, r)) {
+    /* json-dialect: local-file -- the buffer form of the same sidecar, for a
+       caller that already holds the bytes (an embedded blob). Same source,
+       same dialect; see axl_sidecar_open_file above. */
+    if (!axl_json_parse(json5, len, AXL_JSON_JSON5, r)) {
         return AXL_SIDECAR_PARSE_ERROR;
     }
     return AXL_SIDECAR_OK;

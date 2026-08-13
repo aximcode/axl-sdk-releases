@@ -283,6 +283,17 @@ axl_str_reader_take_ident(
 // sscanf — see the header for the conversion list.
 // ===========================================================================
 
+/* Largest explicit field width a float conversion will honour. A width
+ * bounds the field, so honouring one means staging that many bytes; the
+ * bound has to live somewhere, and the format string is the only place
+ * it can be checked before any input is touched. 256 is deliberate:
+ * axl_vsscanf already carries a `bool table[256]` frame for %[set], so
+ * a 256-byte char buffer is proportionate to what this function already
+ * spends, and 256 digits is an order of magnitude past the 17 a double
+ * round-trips in — no plausible fixed-width float field comes near it.
+ * A wider width returns -1 rather than being quietly clamped. */
+#define SCAN_FLOAT_WIDTH_MAX  256u
+
 /* Width modifiers parsed from a conversion specifier. */
 typedef enum {
     SCAN_LEN_DEFAULT,    /* int / unsigned int / etc. */
@@ -405,11 +416,29 @@ axl_vsscanf(
         bool suppress = false;
         if (*f == '*') { suppress = true; f++; }
 
-        /* Optional max-width. */
+        /* Optional max-width.
+         *
+         * The accumulator has to be checked BEFORE it wraps. A width that
+         * does not fit in size_t cannot describe any buffer the caller
+         * could have passed, so it is a malformed FORMAT STRING, and the
+         * wrap is silently downward: 2^64+1 becomes 1, 2^64 becomes 0.
+         * Every consumer below then clamps that plausible-looking width
+         * against the input, finds the clamp harmless, and reports a
+         * successful conversion of the wrong field -- memory-safe and
+         * completely wrong, which is the failure mode nothing else in the
+         * build would catch. -1 is the answer %s without a width already
+         * gives, and like every other malformed-format -1 in this function
+         * it discards the count of conversions completed earlier in the
+         * same call; the format is nonsense, so there is no partial
+         * result worth reporting.
+         *
+         * Leading zeros never trip this: max_width stays 0 through them. */
         size_t max_width = 0;
         bool   have_width = false;
         while (*f >= '0' && *f <= '9') {
-            max_width = max_width * 10 + (size_t)(*f - '0');
+            size_t digit = (size_t)(*f - '0');
+            if (max_width > (SIZE_MAX - digit) / 10) { return -1; }
+            max_width = max_width * 10 + digit;
             have_width = true;
             f++;
         }
@@ -559,6 +588,101 @@ axl_vsscanf(
                     SCAN_STORE_SIGNED(sv, len, ap);
                 } else {
                     SCAN_STORE_UNSIGNED(v, len, ap);
+                }
+                conversions++;
+                break;
+            }
+
+            case 'f': case 'e': case 'g':
+            case 'E': case 'G': {
+                /* Float conversions. C99 has %f taking a `float *` and
+                 * %lf a `double *` — the REVERSE of printf, where %f
+                 * takes a double by default argument promotion. Route
+                 * the two at axl_str_to_float / axl_str_to_double so
+                 * the double->float narrowing keeps exactly one
+                 * implementation in the tree.
+                 *
+                 * Only the default and 'l' modifiers mean anything
+                 * here; %hf, %llf and friends are not C99 and are
+                 * rejected loudly rather than silently taken as one of
+                 * the two. %Lf never reaches this switch at all: 'L'
+                 * matches no length modifier above, so conv becomes 'L'
+                 * and hits default. AXL has no long double, and that
+                 * rejection is deliberate. */
+                if (len != SCAN_LEN_DEFAULT && len != SCAN_LEN_LONG) {
+                    return -1;
+                }
+                bool is_double = (len == SCAN_LEN_LONG);
+                /* An explicit field width caps the field at N bytes —
+                 * the same semantics %Nc and %Ns already carry.
+                 * Truncating to N when the caller wrote %Nf IS what %Nf
+                 * means, and N comes from the FORMAT STRING, so
+                 * bounding the field is an up-front, deterministic
+                 * decision rather than a truncation risk pushed onto
+                 * untrusted input. An absurd N is a format-string
+                 * property too, so it is rejected loudly here instead
+                 * of being honoured with a heap copy (which would put
+                 * an allocation-failure path into sscanf) or silently
+                 * ignored. */
+                if (have_width && max_width > SCAN_FLOAT_WIDTH_MAX) {
+                    return -1;
+                }
+
+                /* LOAD-BEARING for the width: leading whitespace is not
+                 * part of the field, so it has to be stepped over
+                 * before N is counted — otherwise "   3.14159" under
+                 * %3lf stages three spaces and fails to parse. Without
+                 * a width this call would be redundant, since
+                 * axl_str_to_double skips its own leading whitespace. */
+                axl_str_reader_skip_ws(&r);
+
+                /* Without a width there is no staging copy and none is
+                 * needed: this reader is always built by
+                 * axl_str_reader_init above, which sets
+                 * end = str + axl_strlen(str), so *r.end is the input's
+                 * own NUL. The parse physically cannot run past it and
+                 * `endptr` therefore lands at or before r.end. That same
+                 * NUL is why an already-exhausted reader needs no
+                 * separate early-out: r.p == r.end parses an empty
+                 * string, which is the syntax error handled below. A
+                 * mantissa of any length parses in full on this path.
+                 *
+                 * With a width the field is capped at N, which the check
+                 * above has already bounded, so a buffer sized to that
+                 * bound truncates nothing the caller did not ask for. */
+                char        tmp[SCAN_FLOAT_WIDTH_MAX + 1];
+                const char *src = r.p;
+                if (have_width) {
+                    size_t avail = (size_t)(r.end - r.p);
+                    size_t n = (avail < max_width) ? avail : max_width;
+                    for (size_t i = 0; i < n; i++) { tmp[i] = r.p[i]; }
+                    tmp[n] = '\0';
+                    src = tmp;
+                }
+                const char  *fend = src;
+                double       dv = 0.0;
+                float        fv = 0.0f;
+                if (is_double) {
+                    axl_str_to_double(src, &dv, &fend);
+                } else {
+                    axl_str_to_float(src, &fv, &fend);
+                }
+                /* A RANGE error ("1e400") consumed the field and wrote
+                 * the saturated IEEE value, so it counts as a completed
+                 * conversion — C99 stores +/-HUGE_VAL and sets ERANGE,
+                 * and this family's rule is that a range error still
+                 * writes the value. Only a SYNTAX error, which consumes
+                 * nothing and leaves endptr at the start, ends the
+                 * scan. */
+                if (fend == src) { return conversions; }
+                /* Advance by what was actually consumed, which can be
+                 * fewer bytes than the width allowed. */
+                r.p += (size_t)(fend - src);
+                if (suppress) { break; }
+                if (is_double) {
+                    *va_arg(ap, double *) = dv;
+                } else {
+                    *va_arg(ap, float *) = fv;
                 }
                 conversions++;
                 break;

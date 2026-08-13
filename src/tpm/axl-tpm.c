@@ -155,6 +155,10 @@ ek_template(TpmWr *w, AxlTpmEkAlg alg)
 static size_t
 ek_extract_unique(TpmRd *r, AxlTpmEkAlg alg, uint8_t *out, size_t out_cap)
 {
+    /* The shape is read from the response's own TPMT_PUBLIC.type below, not
+       from `alg`; the parameter stays for symmetry with ek_derive's signature
+       and so a future template-specific parse has it to hand. */
+    (void)alg;
     rd16(r);                 /* outPublic TPM2B size (outer) */
     uint16_t type = rd16(r); /* TPMT_PUBLIC.type */
     rd16(r);                 /* nameAlg */

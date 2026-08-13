@@ -668,6 +668,69 @@ test_jwt(void)
                               &payload, &plen, NULL) == AXL_ERR,
                "jwt_verify: expect_aud with no aud claim -> AXL_ERR");
     axl_free(tok);
+
+    /* A payload that is not a JSON OBJECT -> AXL_ERR, even with a policy that
+       requires no claims at all.
+       RFC 7519 §7.2 requires a JWT claims set to be an object. This became
+       reachable when the reader stopped requiring an object-or-array root: a
+       bare `42` now PARSES, and every axl_json_get_* against a non-object root
+       returns false, which an empty policy cannot tell from "claim absent" --
+       so a validly-signed non-JWT verified. The empty policy is the whole
+       point of the case; with any required claim it would fail anyway and the
+       test would pass for the wrong reason. */
+    {
+        AxlJwtPolicy p_any = { .now = NOW };
+        struct { const char *body; const char *what; } nonobj[] = {
+            { "42",      "jwt_verify: bare-number payload -> AXL_ERR" },
+            { "\"abc\"", "jwt_verify: bare-string payload -> AXL_ERR" },
+            { "null",    "jwt_verify: bare-null payload -> AXL_ERR" },
+            { "true",    "jwt_verify: bare-true payload -> AXL_ERR" },
+            { "[1,2]",   "jwt_verify: array payload -> AXL_ERR" },
+        };
+        for (size_t i = 0; i < sizeof(nonobj) / sizeof(nonobj[0]); i++) {
+            char *t = hs256_sign(secret, slen, nonobj[i].body);
+            test_check(t != NULL &&
+                       axl_jwt_verify(t, axl_strlen(t), &k, hs256, 1, &p_any,
+                                      &payload, &plen, NULL) == AXL_ERR,
+                       nonobj[i].what);
+            axl_free(t);
+        }
+        /* The control: the SAME empty policy must still accept a real object
+           payload. Without this the five above would pass against a
+           jwt_verify that rejected everything. */
+        char *t_ok = hs256_sign(secret, slen, "{\"sub\":\"s\"}");
+        test_check(t_ok != NULL &&
+                   axl_jwt_verify(t_ok, axl_strlen(t_ok), &k, hs256, 1, &p_any,
+                                  &payload, &plen, NULL) == AXL_OK,
+                   "jwt_verify: object payload + empty policy -> AXL_OK");
+        axl_free(payload); payload = NULL;
+        axl_free(t_ok);
+    }
+
+    /* JOSE intake is STRICT RFC 8259, never AXL_JSON_RELAXED.
+       These structures are attacker-influenced and RFC 7515/7517/7519 define
+       them as ordinary JSON; a JOSE parser that also took JSON5 would let a
+       second component reading the same signed bytes with a conforming parser
+       derive a different document. Signed correctly, so only the dialect is
+       under test. */
+    {
+        struct { const char *body; const char *what; } j5[] = {
+            { "{/* c */\"sub\":\"s\"}", "jwt_verify: comment in payload -> AXL_ERR" },
+            { "{sub:\"s\"}",            "jwt_verify: unquoted key in payload -> AXL_ERR" },
+            { "{'sub':'s'}",            "jwt_verify: single quotes in payload -> AXL_ERR" },
+            { "{\"sub\":\"s\",}",       "jwt_verify: trailing comma in payload -> AXL_ERR" },
+            { "{\"n\":0x10}",           "jwt_verify: hex literal in payload -> AXL_ERR" },
+        };
+        AxlJwtPolicy p_any = { .now = NOW };
+        for (size_t i = 0; i < sizeof(j5) / sizeof(j5[0]); i++) {
+            char *t = hs256_sign(secret, slen, j5[i].body);
+            test_check(t != NULL &&
+                       axl_jwt_verify(t, axl_strlen(t), &k, hs256, 1, &p_any,
+                                      &payload, &plen, NULL) == AXL_ERR,
+                       j5[i].what);
+            axl_free(t);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +751,83 @@ test_jwk(void)
     /* Private material must never be exported. */
     test_check(jwk != NULL && axl_strstr(jwk, "\"d\"") == NULL,
                "jwk_export_public: omits private `d`");
+
+    /* A JWK must be strict RFC 8259, not JSON5. Same reasoning as the JWT
+       payload: a JWKS is fetched over the network, so this is adversary-
+       reachable input, and RFC 7517 defines a JWK as a JSON object.
+
+       Built by MUTATING the valid exported JWK above rather than hand-writing
+       a stub, because the obvious stubs do not discriminate. `{kty:"EC"}` and
+       `42` are rejected whatever the dialect -- they carry no usable key
+       material, so axl_jwk_parse returns NULL on the missing-member path and
+       the assertion passes even against the liberal parser it is meant to
+       catch. (Verified: with the strict parse sabotaged back to
+       axl_json_parse, stub-based assertions still passed. These do not.)
+
+       Each mutation below is valid JSON5 and invalid RFC 8259, and otherwise
+       a complete, parseable EC public key. */
+    if (jwk != NULL) {
+        const size_t jwk_len = axl_strlen(jwk);
+
+        /* Leading block comment: object and members untouched. */
+        AxlString *commented = axl_string_new("/* c */");
+        axl_string_append(commented, jwk);
+        test_check(axl_jwk_parse(axl_string_str(commented),
+                                 axl_string_len(commented), NULL, NULL) == NULL,
+                   "jwk_parse: leading comment (JSON5) -> NULL");
+        axl_string_free(commented);
+
+        /* Trailing comma before the closing brace. */
+        if (jwk_len > 0 && jwk[jwk_len - 1] == '}') {
+            AxlString *trailing = axl_string_new(NULL);
+            axl_string_append_len(trailing, jwk, jwk_len - 1);
+            axl_string_append(trailing, ",}");
+            test_check(axl_jwk_parse(axl_string_str(trailing),
+                                     axl_string_len(trailing),
+                                     NULL, NULL) == NULL,
+                       "jwk_parse: trailing comma (JSON5) -> NULL");
+            axl_string_free(trailing);
+        }
+
+        /* Wrapped in an array: valid key material, but RFC 7517 says a JWK is
+           an object. NOTE this one does NOT discriminate the strict parse --
+           an array root makes every axl_json_get_* miss anyway, so it is
+           rejected either way (confirmed under the sabotage run). Kept as a
+           behavioral pin, not as evidence for the dialect: it would catch a
+           future change that started accepting an array here. */
+        AxlString *wrapped = axl_string_new("[");
+        axl_string_append(wrapped, jwk);
+        axl_string_append(wrapped, "]");
+        test_check(axl_jwk_parse(axl_string_str(wrapped),
+                                 axl_string_len(wrapped), NULL, NULL) == NULL,
+                   "jwk_parse: array-wrapped JWK -> NULL");
+        axl_string_free(wrapped);
+
+        /* The control: unmutated, it must still parse. Without this the three
+           above would pass against a jwk_parse that rejected everything. */
+        AxlPkKey *control = axl_jwk_parse(jwk, jwk_len, NULL, NULL);
+        test_check(control != NULL,
+                   "jwk_parse: the unmutated JWK still parses");
+        axl_pk_key_free(control);
+
+        /* Same for a JWK Set, whose own root must be an object too. */
+        AxlString *set = axl_string_new("{\"keys\":[");
+        axl_string_append(set, jwk);
+        axl_string_append(set, "]}");
+        AxlJwks *ok_set = axl_jwks_parse(axl_string_str(set),
+                                         axl_string_len(set));
+        test_check(ok_set != NULL, "jwks_parse: strict JWK Set parses");
+        axl_jwks_free(ok_set);
+
+        AxlString *set5 = axl_string_new("/* c */{\"keys\":[");
+        axl_string_append(set5, jwk);
+        axl_string_append(set5, "]}");
+        test_check(axl_jwks_parse(axl_string_str(set5),
+                                  axl_string_len(set5)) == NULL,
+                   "jwks_parse: leading comment (JSON5) -> NULL");
+        axl_string_free(set5);
+        axl_string_free(set);
+    }
 
     char       *kid = NULL;
     AxlJoseAlg  alg = (AxlJoseAlg)0;
@@ -896,7 +1036,19 @@ test_jose_main(int argc, char **argv)
     test_jwt();
     test_jwk();
 #else
+    /* Fail-closed behavior is the ONLY thing testable without TLS, and it is
+       worth testing -- but it is ~7 assertions standing in for ~95. Name each
+       group that did not run, so the footer says "SKIPPED" and the harness can
+       refuse the run under TEST_REQUIRE_TLS=1. Without this the binary reports
+       "13 passed, 0 failed" and reads as a complete pass. */
     test_jose_fail_closed();
+    test_skip("jose: JWS ES256/RS256/HS256 known-answer vectors (needs AXL_TLS=1)");
+    test_skip("jose: JWS ES384/PS256 recognized-but-unimplemented (needs AXL_TLS=1)");
+    test_skip("jose: JWS rejection matrix — alg confusion, mixed allow-list (needs AXL_TLS=1)");
+    test_skip("jose: JWS sign/verify round-trip (needs AXL_TLS=1)");
+    test_skip("jose: JWT claims policy — exp/nbf/iss/aud, non-object payload, "
+              "strict-dialect intake (needs AXL_TLS=1)");
+    test_skip("jose: JWK/JWKS parse, export, strict-dialect intake (needs AXL_TLS=1)");
 #endif
 
     return test_print_results();

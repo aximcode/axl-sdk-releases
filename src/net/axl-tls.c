@@ -51,7 +51,6 @@ bool axl_tls_pending(AxlTlsContext *c) { (void)c; return false; }
 // ===================================================================
 
 #include "../backend/axl-backend.h"
-#include "axl-tcp-internal.h"   /* axl_tcp_send_in_flight */
 #include "axl-http-client-tls.h" /* register the HTTP client's TLS ops */
 #include <axl/axl-atexit.h>
 #include <axl/axl-log.h>
@@ -348,15 +347,14 @@ axl_tls_generate_self_signed(
     /* Validity: now to +10 years (dynamic from system time) */
     {
         char not_before[16], not_after[16];
-        EFI_TIME t;
+        AxlTime  t;
         uint16_t start_year = 2025, end_year = 2035;
 
-        if (gRT != NULL &&
-            axl_efi_call(gRT->GetTime, 2, &t, NULL) == 0 &&
-            t.Year >= 2020)
-        {
-            start_year = t.Year;
-            end_year   = t.Year + 10;
+        /* Through the backend for its RTC re-entrancy guard -- see
+         * axl_backend_get_time. */
+        if (axl_backend_get_time(&t) == AXL_OK && t.year >= 2020) {
+            start_year = (uint16_t)t.year;
+            end_year   = (uint16_t)(t.year + 10);
         }
         axl_snprintf(not_before, sizeof(not_before),
                      "%04u0101000000", (unsigned)start_year);
@@ -755,11 +753,20 @@ axl_tls_write(
 // Async write (encrypt + async TCP send)
 // ---------------------------------------------------------------------------
 
-/* Wrapper context for axl_tls_write_async completion */
-typedef struct {
-    AxlTcpCallback  user_cb;
-    void           *user_data;
-    void           *enc_buf;
+/* Wrapper context for axl_tls_write_async completion.
+
+   Held no back-pointer to the TLS context since the AxlTcp send queue
+   landed. It used to carry one (`tls`, plus `loop`) so that a handshake
+   flush REFUSED for "a prior send is in flight" could be resumed from
+   this completion — `0a9f81fe`. The transport now queues that send
+   instead of refusing it, so there is nothing to resume, and the
+   back-pointer's own use-after-free hazard (a completion running after
+   axl_tls_free, guarded by severing the pointer in the destructor) goes
+   with it. docs/AXL-Tcp-Queue-Design.md §6 step 2. */
+typedef struct TlsWriteAsyncCtx {
+    AxlTcpCallback           user_cb;
+    void                    *user_data;
+    void                    *enc_buf;
 } TlsWriteAsyncCtx;
 
 static bool
@@ -768,8 +775,10 @@ tls_write_async_done(AxlTcp *sock, AxlStatus status, void *data)
     TlsWriteAsyncCtx *wctx = (TlsWriteAsyncCtx *)data;
     AxlTcpCallback    cb      = wctx->user_cb;
     void             *cb_data = wctx->user_data;
+
     axl_free(wctx->enc_buf);
     axl_free(wctx);
+
     if (cb != NULL) {
         cb(sock, status, cb_data);  /* TLS write is one-shot */
     }
@@ -790,19 +799,20 @@ axl_tls_write_async(
         return AXL_ERR;
     }
 
-    /* Floor against TLS-stream desync (the ws-broadcast-over-TLS bug):
-       axl_tcp_send_async is strictly one-send-in-flight, and mbedtls_ssl_write
-       below ADVANCES the TLS write sequence number and emits an encrypted
-       record. If we encrypted now and the send were then rejected (a prior
-       send still pending), that record would be dropped with the seqno already
-       consumed — desyncing the stream and breaking the connection. So bail
-       BEFORE touching the SSL context when a send is in flight. Returns a
-       DISTINCT AXL_BUSY (not AXL_ERR) so a caller can re-queue/retry; the SSL
-       context is left untouched. Well-behaved callers serialize via their own
-       outbound queue (see the WS per-connection queue) and never hit this. */
-    if (axl_tcp_send_in_flight(ctx->sock)) {
-        return AXL_BUSY;
-    }
+    /* No capacity floor here any more.
+       mbedtls_ssl_write below ADVANCES the TLS write sequence number and emits
+       a record, so the invariant is "never encrypt what the transport will not
+       accept" — a submit refused after encrypting drops a record whose seqno
+       is already spent and desyncs the stream (the ws-broadcast-over-TLS bug).
+       The floor enforced that by refusing up front.
+
+       axl_tcp_send_async no longer refuses AT ALL: it queues, as EDK2's
+       SockSend does, failing only on allocation. So the invariant is satisfied
+       by construction and the floor has nothing left to test. It previously
+       tested axl_tcp_send_in_flight, which fired for any outstanding send —
+       usually the handshake's own final flight — and cost roughly one request
+       in two under concurrent handshakes (design §1a).
+       docs/AXL-Tcp-Queue-Design.md §6 step 3. */
 
     /* mbedtls_ssl_write emits at most one record (<= OUT_CONTENT_LEN
        plaintext) per call, so a body larger than one record needs several
@@ -830,14 +840,20 @@ axl_tls_write_async(
     ctx->buffered_mode = true;
     ctx->out_len = 0;
 
-    /* Invariant guard (the 4563aabf desync): we are about to advance the TLS
-       write sequence number via mbedtls_ssl_write, which is irreversible. The
-       floor above already returned AXL_BUSY if a TCP send were in flight, so
-       this must hold here. If a future edit reaches the seqno advance without
-       that floor, catch it at the cause — not as a downstream stream desync a
-       consumer's integration surfaces days later. */
-    AXL_DEBUG_ASSERT_MSG(!axl_tcp_send_in_flight(ctx->sock),
-                         "TLS seqno advance with a TCP send in flight");
+    /* The invariant behind the 4563aabf desync still holds, but it is no
+       longer "no TCP send is in flight".
+       mbedtls_ssl_write below advances the TLS write sequence number, which is
+       irreversible, so a record must never be encrypted and then DROPPED. That
+       used to be possible because a submit could be refused, hence the old
+       floor and an assert that no send was outstanding.
+
+       axl_tcp_send_async now queues instead of refusing, so a send being in
+       flight is the NORMAL case here and asserting against it would fire on
+       healthy traffic. The record cannot be dropped: the submit below either
+       succeeds or fails outright, and a failure tears the connection down
+       rather than continuing on a desynced stream. Nothing left to assert that
+       is both true and useful, so the assert goes with the floor.
+       docs/AXL-Tcp-Queue-Design.md §6 step 3. */
 
     /* Write all bytes, one record per mbedtls_ssl_write (it returns the
        count written, which is capped at one record). */
@@ -894,11 +910,12 @@ axl_tls_write_async(
 
 /* Flush the buffered handshake output (out_buf) asynchronously on @p loop,
    taking ownership of a copy so the buffer can be reused immediately.
-   @p out_len is consumed only once the send is accepted, so a rejected
-   submission (e.g. a prior flight's send still in flight) leaves the
-   buffered bytes intact rather than dropping them. This assumes lock-step
-   handshake flights — true for a server handshake, where each flight
-   follows a client round-trip and the prior send has long drained. */
+   @p out_len is consumed only once the send is accepted, so a failed
+   submission leaves the buffered bytes intact rather than dropping them.
+   A send is no longer refused for capacity — the transport queues it behind
+   whatever is on the wire — so that path now means a real failure (an
+   allocation, a closed socket), not "try again when the prior flight
+   drains". */
 static int
 handshake_flush_async(AxlTlsContext *ctx, AxlLoop *loop)
 {
@@ -918,10 +935,16 @@ handshake_flush_async(AxlTlsContext *ctx, AxlLoop *loop)
     wctx->user_cb   = NULL;
     wctx->user_data = NULL;
     wctx->enc_buf   = copy;
-    if (axl_tcp_send_async(ctx->sock, copy, n, loop, NULL,
-                           tls_write_async_done, wctx) != AXL_OK) {
+
+    int rc = axl_tcp_send_async(ctx->sock, copy, n, loop, NULL,
+                                tls_write_async_done, wctx);
+    if (rc != AXL_OK) {
         axl_free(copy);
         axl_free(wctx);
+        /* No AXL_BUSY case any more: axl_tcp_send_async accepts or fails,
+           it never refuses for capacity. A failure here is a real failure. */
+        axl_warning("tls: handshake flush failed to submit %llu byte(s)",
+                    (unsigned long long)n);
         return AXL_ERR;   /* out_len left intact — bytes not lost */
     }
     ctx->out_len = 0;     /* consumed only on a successful submission */
@@ -938,7 +961,12 @@ axl_tls_handshake_async(AxlTlsContext *ctx, AxlLoop *loop)
     int ret = mbedtls_ssl_handshake(&ctx->ssl);
 
     if (ret == 0) {
-        if (handshake_flush_async(ctx, loop) != AXL_OK) {
+        int frc = handshake_flush_async(ctx, loop);
+        /* The AXL_BUSY branch that used to sit here -- "final flight is
+           buffered behind an in-flight send, stay in handshake state and
+           re-enter" -- is gone with the deferral. The transport queues the
+           flight, so a successful flush means it is on its way. */
+        if (frc != AXL_OK) {
             return AXL_TLS_ERR;
         }
         ctx->buffered_mode = false;
@@ -946,7 +974,12 @@ axl_tls_handshake_async(AxlTlsContext *ctx, AxlLoop *loop)
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
         ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-        return (handshake_flush_async(ctx, loop) == AXL_OK) ? AXL_TLS_WANT_MORE : AXL_TLS_ERR;
+        int frc = handshake_flush_async(ctx, loop);
+        /* AXL_BUSY was accepted here alongside AXL_OK because a deferred
+           flush was not a failure. handshake_flush_async can no longer
+           return it — the transport does not refuse — so AXL_OK is the
+           whole success case. */
+        return (frc == AXL_OK) ? AXL_TLS_WANT_MORE : AXL_TLS_ERR;
     }
 
     log_handshake_failure(ret);
@@ -974,6 +1007,14 @@ axl_tls_free(AxlTlsContext *ctx)
        advisory; the TCP FIN that follows (axl_tcp_close) plus HTTP's own
        message framing convey the close. buffered_mode makes tls_bio_send
        accumulate instead of send; the buffer is freed unsent below. */
+    /* No write-completion back-pointer to disarm any more. It existed only
+       so a DEFERRED handshake flush could be resumed from the completion
+       (`0a9f81fe`), and it carried its own use-after-free hazard —
+       do_reset_connection frees this context BEFORE axl_tcp_close cancels
+       the send, so the completion can run afterwards. The AxlTcp send
+       queue removed the deferral, so the pointer, the severing, and the
+       hazard all go together. docs/AXL-Tcp-Queue-Design.md §6 step 2. */
+
     ctx->buffered_mode = true;
     ctx->out_len = 0;
     mbedtls_ssl_close_notify(&ctx->ssl);

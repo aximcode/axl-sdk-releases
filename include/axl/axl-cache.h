@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-cache.h:
+/** @file axl-cache.h
  *
  * TTL cache with LRU eviction. Fixed-size slots, string keys,
  * opaque fixed-size values. Thread-safe: no (single-threaded UEFI).

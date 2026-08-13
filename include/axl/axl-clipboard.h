@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-clipboard.h:
+/** @file axl-clipboard.h
  *
  * A process-global cut/copy/paste clipboard.
  *

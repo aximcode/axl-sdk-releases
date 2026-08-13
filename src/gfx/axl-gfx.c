@@ -49,10 +49,11 @@ struct AxlGfxBuffer {
  * graphics-driver-level state — same precedent as the clip stack. */
 static AxlGfxBuffer *target_buf = NULL;
 
-AxlGfxBuffer *
-axl_gfx_buffer_new(
+static AxlGfxBuffer *
+buffer_new_common(
     uint32_t  w,
-    uint32_t  h
+    uint32_t  h,
+    bool      zeroed
     )
 {
     if (w == 0 || h == 0) {
@@ -62,7 +63,17 @@ axl_gfx_buffer_new(
     if (b == NULL) {
         return NULL;
     }
-    b->pixels = axl_malloc((size_t)w * h * sizeof(*b->pixels));
+    /* w * h cannot overflow (two uint32_t into a 64-bit size_t on both
+     * targets), but the * sizeof(AxlGfxPixel) could -- and the original
+     * `axl_malloc(w * h * sizeof(px))` wrapped it silently, yielding a
+     * short allocation. Check it on both paths. */
+    const size_t n = (size_t)w * h;
+    if (n > SIZE_MAX / sizeof(*b->pixels)) {
+        axl_free(b);
+        return NULL;
+    }
+    b->pixels = zeroed ? axl_calloc(n, sizeof(*b->pixels))
+                       : axl_malloc(n * sizeof(*b->pixels));
     if (b->pixels == NULL) {
         axl_free(b);
         return NULL;
@@ -71,6 +82,28 @@ axl_gfx_buffer_new(
     b->h = h;
     b->damage = (AxlGfxClip){0, 0, 0, 0};  /* clean */
     return b;
+}
+
+AxlGfxBuffer *
+axl_gfx_buffer_new(
+    uint32_t  w,
+    uint32_t  h
+    )
+{
+    /* Zeroed: axl_gfx_buffer_blur and the compositor read the WHOLE buffer,
+     * so undefined bytes get smeared into a shape's halo and presented --
+     * leaking heap to the GOP and corrupting the visual. The documented blur
+     * example in src/gfx/README.md hits exactly that. */
+    return buffer_new_common(w, h, true);
+}
+
+AxlGfxBuffer *
+axl_gfx_internal_buffer_new_uninit(
+    uint32_t  w,
+    uint32_t  h
+    )
+{
+    return buffer_new_common(w, h, false);
 }
 
 void
@@ -968,31 +1001,51 @@ blend_row_over_neon(
 
 #endif
 
-/* Dispatch a source-over constant-color row blend to the best SIMD
- * variant.  Bit-identical to blend_row_over_scalar on every path. */
-static void
-blend_row_over(
+/* A source-over constant-color row kernel. Bit-identical output on every
+ * variant; they differ only in width. */
+typedef void (*BlendRowOverFn)(
     AxlGfxPixel  *line,
     uint32_t      n,
     AxlGfxPixel   color
-    )
+);
+
+/* Pick the best row kernel for the CALLING core.
+ *
+ * Resolve this ONCE PER OPERATION, never per row. axl_cpu_simd_tier() is
+ * a deliberately live query -- it answers for the core asking, which is
+ * what keeps dispatch correct on a hybrid part where the core running
+ * this blit has less ISA than the machine does. Live means CPUID, and
+ * together with axl_cpu_enable_avx() one call here executes 4 CPUID
+ * leaves plus 2 XGETBV.
+ *
+ * Under virtualisation CPUID is unconditionally intercepted, so each of
+ * those is a VM exit (~1 us under KVM). Called per row, a 1280x800 blend
+ * paid ~800 x 6 exits -- and it did, until now: a consumer bisected
+ * their compositor's post-key repaint latency going 0 -> 1.75s at 6-way
+ * parallelism to exactly this call sitting inside the row loop. Their
+ * suite had a 1.5s settle, so the regression presented three repos away
+ * as a flaky screenshot harness.
+ *
+ * Once per operation is EXACTLY as correct as once per row here: UEFI
+ * boot services has no preemption and no scheduler, so the BSP cannot
+ * migrate cores mid-call, and the answer cannot change underneath a
+ * single blit. */
+static BlendRowOverFn
+blend_row_over_kernel(void)
 {
 #if defined(__x86_64__)
-    if (axl_cpu_enable_avx() && axl_cpu_features()->avx2) {
-        blend_row_over_avx2(line, n, color);
-        return;
+    if (axl_cpu_enable_avx() && axl_cpu_simd_tier() >= AXL_SIMD_AVX2) {
+        return blend_row_over_avx2;
     }
     if (axl_cpu_features()->sse2) {   /* always true on x86-64 */
-        blend_row_over_sse2(line, n, color);
-        return;
+        return blend_row_over_sse2;
     }
 #elif defined(__aarch64__)
     if (axl_cpu_features()->neon) {   /* always true on ARMv8-A */
-        blend_row_over_neon(line, n, color);
-        return;
+        return blend_row_over_neon;
     }
 #endif
-    blend_row_over_scalar(line, n, color);
+    return blend_row_over_scalar;
 }
 
 /* CPU-side blend fill into the active target buffer.  Each destination
@@ -1014,8 +1067,12 @@ buffer_blend_pixels(
        correct mode and the non-OVER modes fall to the scalar composite
        (gamma decode/encode can't run through the sRGB SIMD kernel). */
     if (blend_mode_current == AXL_GFX_BLEND_OVER && !gamma_correct_current) {
+        /* Resolved once for the whole rectangle -- see
+           blend_row_over_kernel() for why per-row was a VM-exit storm and
+           why once-per-operation is equally correct here. */
+        const BlendRowOverFn blend_row = blend_row_over_kernel();
         for (uint32_t row = 0; row < h; row++) {
-            blend_row_over(&b->pixels[(y + row) * b->w + x], w, color);
+            blend_row(&b->pixels[(y + row) * b->w + x], w, color);
         }
         return;
     }

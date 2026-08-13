@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-gfx-region.h:
+/** @file axl-gfx-region.h
  *
  * `AxlGfxRegion` — an EXACT set of non-overlapping rectangles with set
  * algebra (union / subtract / intersect), the role `pixman` plays in a

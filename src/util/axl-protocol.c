@@ -50,8 +50,20 @@ static const EFI_GUID TCG2_PROTOCOL_GUID = {
    custom protocol names. */
 #define AXL_PROTOCOL_CUSTOM_MAX 16
 
+/* Longest custom name the registry stores, NUL included.
+ *
+ * The name lives INLINE rather than as an axl_strdup. A registration is
+ * process-lifetime by contract — there is no axl_protocol_unregister_name —
+ * so a heap copy has no owner and nowhere to be released, and it duly showed
+ * up in the teardown leak report the QEMU harness now gates on
+ * (test_check_leaks, test/integration/common-test.sh). Inline storage is the
+ * fix at the source rather than an exemption in the gate: it makes the
+ * unfreeable allocation not exist. It also deletes an OOM path. The cost is
+ * this cap, which the table's already-fixed capacity makes unsurprising. */
+#define AXL_PROTOCOL_NAME_MAX 64
+
 typedef struct {
-    char     *name;
+    char      name[AXL_PROTOCOL_NAME_MAX];
     EFI_GUID  guid;
     bool      active;
 } CustomEntry;
@@ -160,7 +172,8 @@ axl_protocol_register_name(
     const AxlGuid *guid
     )
 {
-    if (name == NULL || guid == NULL || *name == '\0') {
+    if (name == NULL || guid == NULL || *name == '\0'
+        || axl_strlen(name) >= AXL_PROTOCOL_NAME_MAX) {
         return AXL_ERR;
     }
 
@@ -186,14 +199,6 @@ axl_protocol_register_name(
         return AXL_ERR;
     }
 
-    /* Allocate before mutating any registry state — leaves the
-       table untouched on OOM so the next call sees the same
-       capacity rather than wasting a slot. */
-    char *copy = axl_strdup(name);
-    if (copy == NULL) {
-        return AXL_ERR;
-    }
-
     /* Find an inactive slot, or append a new one. */
     size_t slot = AXL_PROTOCOL_CUSTOM_MAX;
     for (size_t i = 0; i < custom_count; i++) {
@@ -204,13 +209,13 @@ axl_protocol_register_name(
     }
     if (slot == AXL_PROTOCOL_CUSTOM_MAX) {
         if (custom_count >= AXL_PROTOCOL_CUSTOM_MAX) {
-            axl_free(copy);
             return AXL_ERR;
         }
         slot = custom_count++;
     }
 
-    custom_table[slot].name = copy;
+    axl_strlcpy(custom_table[slot].name, name,
+                sizeof(custom_table[slot].name));
     axl_memcpy(&custom_table[slot].guid, guid, sizeof(EFI_GUID));
     custom_table[slot].active = true;
     return AXL_OK;

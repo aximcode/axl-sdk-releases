@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-defer.h:
+/** @file axl-defer.h
  *
  * Deferred work queue owned by the event loop.
  *
@@ -21,6 +20,8 @@
 #ifndef AXL_DEFER_H
 #define AXL_DEFER_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -38,7 +39,7 @@ typedef struct AxlLoop AxlLoop;
  */
 typedef void (*AxlDeferCallback)(
     void *data ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Schedule deferred work for the next loop tick.

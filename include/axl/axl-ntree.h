@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-ntree.h:
+/** @file axl-ntree.h
  *
  * Generic n-ary tree. GLib GNode equivalent.
  *
@@ -23,6 +22,8 @@
 
 #ifndef AXL_NTREE_H
 #define AXL_NTREE_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -80,7 +81,7 @@ typedef enum {
 typedef bool (*AxlNTreeTraverseFunc)(
     AxlNTree *node,  ///< the visited node
     void     *user   ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * AxlNTreeForeachFunc:
@@ -90,7 +91,7 @@ typedef bool (*AxlNTreeTraverseFunc)(
 typedef void (*AxlNTreeForeachFunc)(
     AxlNTree *node,  ///< the visited child
     void     *user   ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Create / destroy

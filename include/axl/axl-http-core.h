@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-http-core.h:
+/** @file axl-http-core.h
  *
  * Low-level HTTP/1.1 parsing helpers shared by axl-http-server,
  * axl-http-client, and consumer code (proxies, middleware, custom

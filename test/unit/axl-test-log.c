@@ -35,8 +35,12 @@ static char    custom_handler_msg[256];
 
 /* New-style handler signature (no EFIAPI, standard C types) */
 static void
-custom_handler(int level, const char *domain, const char *message, void *data)
+custom_handler(int level, const char *domain, const char *message,
+               const AxlRealtime *stamp, void *data)
 {
+    (void)stamp;
+    (void)domain;
+    (void)data;
     custom_handler_calls++;
     custom_handler_level = (size_t)level;
     if (message != NULL) {
@@ -44,9 +48,111 @@ custom_handler(int level, const char *domain, const char *message, void *data)
     }
 }
 
+/* Two sinks that record the stamp they were handed, so a single record can be
+   compared across them. */
+static AxlRealtime  stamp_a, stamp_b;
+static bool         stamp_a_seen, stamp_b_seen, stamp_a_null, stamp_b_null;
+
+static bool stamp_second_rolled;
+
+static void
+stamp_handler_a(int level, const char *domain, const char *message,
+                const AxlRealtime *stamp, void *data)
+{
+    (void)level; (void)domain; (void)message; (void)data;
+    stamp_a_seen = true;
+    if (stamp == NULL) { stamp_a_null = true; return; }
+    stamp_a = *stamp;
+
+    /* Cross a wallclock second boundary before returning, so the NEXT sink
+       runs in a different second than this one.
+       This is what makes the test discriminate at RUNTIME rather than only
+       at compile time: under the old read-it-yourself behaviour handler B
+       would take its own reading here and land on the later second, so the
+       "same instant" assertion below would fail. Under stamp-once it cannot,
+       because B is handed the value the dispatcher already captured.
+       Waits on the MONOTONIC counter and reads the RTC exactly once at the
+       end, rather than polling GetTime in a tight loop -- that hammered CMOS
+       with thousands of reads from inside a log handler, which is a lot of
+       firmware pressure to introduce into a shared test boot for a signal one
+       read can give. Any window longer than a second must contain a
+       boundary. */
+    const uint64_t deadline = axl_time_get_us() + 1100000ull;
+    while (axl_time_get_us() < deadline) {
+        /* spin on the monotonic counter only */
+    }
+    AxlRealtime after;
+    if (axl_time_realtime(&after) == AXL_OK && after.second != stamp->second) {
+        stamp_second_rolled = true;
+    }
+}
+
+static void
+stamp_handler_b(int level, const char *domain, const char *message,
+                const AxlRealtime *stamp, void *data)
+{
+    (void)level; (void)domain; (void)message; (void)data;
+    stamp_b_seen = true;
+    if (stamp == NULL) { stamp_b_null = true; return; }
+    stamp_b = *stamp;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/* The dispatcher must read the clock ONCE per record and hand the same value
+   to every sink.
+   Before this, each sink stamped itself: N sinks meant N firmware GetTime
+   calls per record, and -- the part that actually corrupts a transcript --
+   two sinks could land on opposite sides of a second boundary and disagree
+   about when one record happened. Correlating a serial transcript against a
+   file log then silently misaligns.
+   Comparing two handlers is what makes this discriminate: asserting a single
+   handler merely "got a plausible stamp" would pass just as well against the
+   old read-it-yourself behaviour. */
+static void
+test_dispatch_stamps_once(void)
+{
+    stamp_a_seen = stamp_b_seen = false;
+    stamp_a_null = stamp_b_null = false;
+    stamp_second_rolled = false;
+
+    /* Checked: the handler table is global and capped (MAX_HANDLERS 8). If a
+       previous test leaked a slot these adds fail silently, neither handler
+       runs, and the comparisons below then pass against zeroed statics --
+       three of four assertions green while testing nothing. */
+    bool added = (axl_log_add_handler(stamp_handler_a, NULL) == AXL_OK) &&
+                 (axl_log_add_handler(stamp_handler_b, NULL) == AXL_OK);
+
+    axl_info("one record, two sinks");
+
+    axl_log_remove_handler(stamp_handler_a);
+    axl_log_remove_handler(stamp_handler_b);
+
+    test_check(added, "stamp: both handlers registered");
+    test_check(stamp_a_seen && stamp_b_seen,
+               "stamp: both sinks received the record");
+    if (!added || !stamp_a_seen || !stamp_b_seen) {
+        return;   /* comparing zeroed statics proves nothing */
+    }
+    test_check(!stamp_a_null && !stamp_b_null,
+               "stamp: the dispatcher supplied a timestamp");
+    test_check(stamp_a.year   == stamp_b.year   &&
+               stamp_a.month  == stamp_b.month  &&
+               stamp_a.day    == stamp_b.day    &&
+               stamp_a.hour   == stamp_b.hour   &&
+               stamp_a.minute == stamp_b.minute &&
+               stamp_a.second == stamp_b.second &&
+               stamp_a.nanosecond == stamp_b.nanosecond,
+               "stamp: every sink sees the SAME instant for one record");
+    test_check(stamp_a.year >= 2000 && stamp_a.month >= 1 && stamp_a.month <= 12,
+               "stamp: the supplied time is a real reading");
+    /* Without this the "same instant" check above is vacuous: if the second
+       never rolled, both sinks would agree even under per-sink reads. */
+    test_check(stamp_second_rolled,
+               "stamp: the wallclock second rolled while the first sink ran");
+}
 
 /**
   Test 1: Default level is INFO -- DEBUG should be suppressed.
@@ -151,6 +257,17 @@ test_suppress_console(void)
 
     axl_info("suppressed console test");
     test_check(custom_handler_calls == 1, "suppress console: handler still fires");
+
+    /* Restore. Suppression used to be one-way, which silenced this binary's
+       console for the rest of the run — including AXL's teardown memory
+       verdict, leaving the harness leak gate structurally blind to
+       AxlTestLog alone. Nothing in-guest can observe a console write, so
+       the assertion that this line took effect is NOT here: it is the
+       per-binary verdict requirement in test_check_leaks
+       (test/integration/common-test.sh), which fails the run if AxlTestLog
+       reaches teardown without printing one. Delete this line and that
+       gate goes red. */
+    axl_log_set_console_enabled(true);
 
     axl_log_remove_handler(custom_handler);
 }
@@ -365,15 +482,135 @@ test_file_handler(void)
 
 /* Distinct callback per slot so axl_log_remove_handler can pop them
  * one at a time rather than nuking everything at once. */
-static void noop_h0(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h1(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h2(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h3(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h4(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h5(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h6(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h7(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
-static void noop_h8(int l, const char *d, const char *m, void *x) { (void)l;(void)d;(void)m;(void)x; }
+static void noop_h0(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h1(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h2(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h3(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h4(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h5(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h6(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h7(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+static void noop_h8(int l, const char *d, const char *m, const AxlRealtime *s, void *x)
+{ (void)l;(void)d;(void)m;(void)s;(void)x; }
+
+/* The serial sink shares its line builder with the file sink, so the FORMAT
+   is pinned here through the file sink (which a unit test can read back).
+   Driving the serial sink itself is deliberately NOT attempted: the unit
+   runner boots -nographic with the guest's UART redirected to the harness's
+   own transcript, so a sink writing to it would corrupt the very output the
+   results are parsed from. What is left for the serial API are the safe
+   negatives -- the errors its own validation produces before any firmware
+   call. See feedback_uefi_firmware_test_hazards. */
+static void
+test_serial_sink_contract(void)
+{
+    void   *buf = NULL;
+    size_t  len = 0;
+
+    /* Exact line format, so the shared-builder refactor cannot drift it:
+           2026-03-27T14:05:32.123456 [INFO ] dom: msg\n
+       Offsets are fixed because the timestamp is fixed-width. */
+    bool have_fixture = axl_log_file_attach("axl-test-logfmt.log") == 0;
+    test_check(have_fixture, "log line: fmt fixture attached");
+    if (have_fixture) {
+    axl_log(AXL_LOG_INFO, "dom", "msg");
+    /* A message longer than the line buffer pins the TRUNCATION policy --
+       the half of the builder the extraction actually changed, and the one
+       an off-by-one in the domain gate shows up in. */
+    char big[900];
+    for (size_t i = 0; i < sizeof(big) - 1; i++) { big[i] = 'x'; }
+    big[sizeof(big) - 1] = '\0';
+    axl_log(AXL_LOG_INFO, "dom", "%s", big);
+    /* A long DOMAIN is the case that actually reaches the line buffer's
+       limit -- the dispatcher caps the MESSAGE long before 640, but not the
+       domain. At the exact boundary the domain must be dropped rather than
+       emitted, because emitting it would leave zero room and the record
+       would degenerate into a domain with no message. */
+    char dom[602];
+    for (size_t i = 0; i < sizeof(dom) - 1; i++) { dom[i] = 'd'; }
+    dom[sizeof(dom) - 1] = '\0';
+    axl_log(AXL_LOG_INFO, dom, "ZZZ");
+    axl_log_flush();
+    axl_log_file_detach();
+    }
+
+    if (axl_file_get_contents("axl-test-logfmt.log", &buf, &len) != AXL_OK) {
+        test_check(false, "log line: fmt fixture readable");
+        buf = NULL;
+    }
+    if (buf != NULL) {
+    const char *ln = (const char *)buf;
+    /* Measure the FIRST line, not the file: robust if the fixture path
+       survives from an earlier run and gets appended to. */
+    size_t line_len = 0;
+    while (line_len < len && ln[line_len] != '\n') {
+        line_len++;
+    }
+    if (line_len < len) {
+        line_len++;                       /* include the LF */
+    }
+    test_check(line_len == 26 + 1 + 8 + 5 + 3 + 1,
+               "log line: exact length (ts + space + tag + domain + msg + LF)");
+    bool shape = len > 40
+              && ln[4] == '-' && ln[7] == '-' && ln[10] == 'T'
+              && ln[13] == ':' && ln[16] == ':' && ln[19] == '.'
+              && ln[26] == ' ';
+    test_check(shape, "log line: timestamp is fixed-width with a trailing space");
+    test_check(shape && axl_strncmp(ln + 27, "[INFO ] dom: msg\n", 17) == 0,
+               "log line: [LEVEL] domain: message + LF, exactly");
+    /* Second record: the oversized message must be truncated to exactly fill
+       the line, never dropped and never overrun. */
+    const char *l2 = ln + line_len;
+    size_t l2_len = 0;
+    while ((size_t)(l2 - ln) + l2_len < len && l2[l2_len] != '\n') {
+        l2_len++;
+    }
+    if ((size_t)(l2 - ln) + l2_len < len) {
+        l2_len++;
+    }
+    test_check(l2_len > 27 + 8 + 5 && l2_len <= 640 - 1
+               && l2[l2_len - 1] == '\n'
+               && axl_strncmp(l2 + 27, "[INFO ] dom: xxx", 16) == 0,
+               "log line: an oversized message truncates, keeping tag + domain");
+
+    /* Third record: the domain-gate boundary. Whatever the builder decides
+       about the domain, the record must still END with the message -- an
+       off-by-one that emits the domain with no room left produces a
+       "<domain>: \n" line instead, which this catches. */
+    const char *l3 = l2 + l2_len;
+    size_t l3_len = 0;
+    while ((size_t)(l3 - ln) + l3_len < len && l3[l3_len] != '\n') {
+        l3_len++;
+    }
+    test_check(l3_len >= 4 && axl_strncmp(l3 + l3_len - 3, "ZZZ", 3) == 0,
+               "log line: a domain that would fill the line never displaces the message");
+    axl_free(buf);
+    }
+
+    /* Safe negatives for the serial sink. */
+    test_check(axl_log_serial_attach(NULL, AXL_LOG_INFO) == AXL_ERR,
+               "serial sink: attach(NULL) returns AXL_ERR");
+    /* Detaching when nothing is attached must be a genuine no-op -- not
+       merely crash-free. A detach that removed a handler unconditionally
+       would evict somebody ELSE's, which is invisible unless you check that
+       a bystander still receives records. */
+    custom_handler_calls = 0;
+    axl_log_add_handler(custom_handler, NULL);
+    axl_log_serial_detach();      /* nothing attached */
+    axl_log_serial_detach();      /* and again */
+    axl_log(AXL_LOG_WARNING, "test", "bystander");
+    test_check(custom_handler_calls == 1,
+               "serial sink: detach with nothing attached leaves other handlers registered");
+    axl_log_remove_handler(custom_handler);
+}
 
 static void
 test_add_handler_overflow(void)
@@ -511,6 +748,61 @@ test_axl_log_level_env(void)
     test_check(custom_handler_calls == 1,
                "axl_log_set_level after env: programmatic call wins");
 
+    /* 9. Length cap: an over-long value is ignored WHOLE, not applied up to
+     * the cut. The two halves differ by one padding entry, so the only
+     * variable is length — and the trailing "debug" is the probe: applied
+     * under the cap, absent over it. A prefix-truncating implementation
+     * would pass the first half and ALSO pass the second (the tail entry
+     * silently vanishing is indistinguishable from a config that took), so
+     * the pair is what makes this discriminating. */
+    char envbuf[320];
+    size_t env_n = 0;
+    for (int i = 0; i < 35; i++) {                 /* 35 * 7 = 245 bytes */
+        axl_memcpy(envbuf + env_n, "x:info,", 7);
+        env_n += 7;
+    }
+    axl_memcpy(envbuf + env_n, "debug", 6);        /* + NUL -> 250 bytes */
+    axl_log_set_level(AXL_LOG_INFO);
+    axl_setenv("AXL_LOG_LEVEL", envbuf, true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "test", "under the cap");
+    test_check(custom_handler_calls == 1,
+               "AXL_LOG_LEVEL: a 250-byte value is applied");
+
+    axl_memcpy(envbuf + 245, "x:info,debug", 13);  /* + NUL -> 257 bytes */
+    axl_log_set_level(AXL_LOG_INFO);
+    axl_setenv("AXL_LOG_LEVEL", envbuf, true);
+    axl_log_init_from_env();
+    custom_handler_calls = 0;
+    axl_log(AXL_LOG_DEBUG, "test", "over the cap");
+    test_check(custom_handler_calls == 0,
+               "AXL_LOG_LEVEL: a 257-byte value is ignored whole, not truncated");
+    axl_log_set_domain_level("x", -1);
+
+    /* 10. Reading the variable must not allocate.
+     *
+     * axl_getenv hands back an OWNED heap copy, and AxlLog cannot free one
+     * (axl-mem.c logs through this module, so calling axl_free from here
+     * closes the circular dependency the module layout exists to avoid).
+     * Reading AXL_LOG_LEVEL through it therefore leaked one string per
+     * image, every image, for as long as the variable was set — the
+     * teardown leak report showed it. The fix reads the shell's own
+     * storage via the backend and decodes into a stack buffer; this pins
+     * "allocates nothing", which is the property that makes it correct
+     * rather than merely tidy. The value is "info" so that whatever it
+     * does apply lands on the level this function's cleanup restores
+     * anyway. */
+    axl_setenv("AXL_LOG_LEVEL", "info", true);
+    AxlMemStats env_before, env_after;
+    axl_mem_get_stats(&env_before);
+    axl_log_init_from_env();
+    axl_mem_get_stats(&env_after);
+    test_check(env_after.count == env_before.count,
+               "AXL_LOG_LEVEL: init_from_env allocates nothing");
+    test_check(env_after.total_count == env_before.total_count,
+               "AXL_LOG_LEVEL: init_from_env does not even transiently allocate");
+
     /* Cleanup so other tests start fresh */
     axl_log_remove_handler(custom_handler);
     axl_unsetenv("AXL_LOG_LEVEL");
@@ -539,7 +831,9 @@ test_log_main(int argc, char **argv)
     test_ring_overflow();
     test_ring_clear();
     test_file_handler();
+    test_serial_sink_contract();
     test_add_handler_overflow();
+    test_dispatch_stamps_once();
     test_axl_log_level_env();
 
     return test_print_results();

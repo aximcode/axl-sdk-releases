@@ -3,6 +3,351 @@
 All notable changes to the AXL SDK are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## 3.2.0 — 2026-08-12
+
+### Breaking
+
+- **Every public callback typedef is now `noexcept` in C++.** 171 of them
+  across the public headers carry `AXL_CB_NOEXCEPT`, which expands to
+  `noexcept` in C++ and to nothing in C. **C consumers are unaffected.** A C++
+  consumer passing a callback must add `noexcept` to its definition:
+
+  ```cpp
+  // before
+  static void on_frame(void *user, uint64_t ms) { ... }
+  // after
+  static void on_frame(void *user, uint64_t ms) noexcept { ... }
+  ```
+
+  Inline lambdas need it too, and in practice that is the commoner idiom:
+
+  ```cpp
+  auto exit_cb = [](void *data) noexcept -> bool { ... };
+  ```
+
+  Since C++17 `noexcept` is part of a function's type, so a throwing callback
+  no longer converts and the compiler reports it at the call site.
+
+  **Scale, from migrating a real consumer:** the AGT toolkit (206 C++ files)
+  needed `noexcept` on 45 files -- free functions, static member trampolines,
+  two `AxlConsoleOps`/`AxlArgsNode` tables, and 18 inline lambdas. Mechanical,
+  but not one-line: build with `make -k` to collect every site at once rather
+  than one compile at a time.
+
+  **Why:** AXL invokes consumer callbacks from its own C frames, and those
+  frames carry no landing pads, so an exception unwinding through them runs
+  **no cleanup at all** — measured, a leaked `RaiseTPL` climbed 0 -> 16, and
+  returning to the shell above `TPL_APPLICATION` wedges the machine at every
+  raised level, silently on x64. That is a hung box rather than a bad exit
+  code, which is why this is a compile error instead of a convention.
+
+  **If you want to throw**, catch at your own boundary and return a status —
+  measured clean (TPL restored, error propagated, nothing unwound through a
+  libaxl frame). This is the same trampoline pattern glibmm uses for GTK
+  signal handlers, and for the same reason: GLib is likewise built without
+  `-fexceptions` (verified: `libglib-2.0` has `.eh_frame` but no
+  `.gcc_except_table`), so its `g_autoptr` cleanups would not run either.
+  glibmm hides the trampoline in generated code; AXL has no generated wrapper
+  layer, so the boundary is enforced by the type system instead.
+
+  See `docs/AXL-Cxx-Design.md` §6b.
+
+- **Applications can no longer include `<uefi/...>`.** The generated UEFI
+  headers now refuse to compile unless `AXL_ALLOW_UEFI` is defined, which
+  makes "the public API is EFI-free" a property of the build rather than of
+  discipline. Previously `uefi/` shipped inside the SDK include directory and
+  `axl-cc` put that on `-isystem`, so any application could reach the whole
+  EDK2 surface by typing an `#include`.
+
+  Nothing changes for drivers: `axl-cc --type driver` and `--type runtime`
+  (CMake `axl_add_driver`) grant it automatically, because producing or
+  interposing on a protocol means implementing that protocol's own types.
+
+  An application that genuinely needs raw firmware access opts in explicitly:
+
+  ```sh
+  axl-cc --allow-uefi myapp.c -o myapp.efi
+  ```
+  ```cmake
+  axl_add_app(myapp myapp.c ALLOW_UEFI)
+  ```
+
+  The intent is that the opt-in is visible on the build line instead of buried
+  in a source file. Prefer an `axl_*` API; a gap worth an escape hatch is worth
+  reporting.
+
+
+- **`axl_json_parse` and `axl_json_load_file` take the dialect as a
+  parameter**, and the `_flags` twins beside them are gone:
+
+  ```c
+  bool axl_json_parse(const char *json, size_t len,
+                      AxlJsonFlags flags, AxlJsonReader *r);
+  bool axl_json_load_file(const char *path, AxlJsonFlags flags,
+                          AxlJsonReader *r, void **out_buf, size_t *out_len);
+  ```
+
+  The flags word sits before the out-param, matching
+  `axl_json_parse_source()` and `axl_json_scanner_init()`.
+
+  **Migrating is not "add a `0`".** `AXL_JSON_STRICT` *is* `0`, but the old
+  no-flags entry points deliberately defaulted to **`AXL_JSON_RELAXED`** —
+  so inserting a zero compiles clean and silently switches the call from
+  the JSON5 superset to RFC 8259, changing which documents parse *and*
+  which ill-formed bytes are repaired (RELAXED names `AXL_JSON_UTF8_RAW`;
+  STRICT does not). Existing `axl_json_parse(doc, len, &r)` becomes
+  `axl_json_parse(doc, len, AXL_JSON_RELAXED, &r)` to preserve behaviour
+  exactly. An existing `axl_json_parse_flags(doc, len, f, &r)` is a pure
+  rename.
+
+  The arity change is the migration mechanism: every call site is a compile
+  error until it states the dialect it had been getting.
+
+- **Renamed**, with no behavioural change:
+  `axl_json_indent_flags` → **`axl_json_indent`**,
+  `axl_json_depth_flags` → **`axl_json_depth`**,
+  `axl_json_type_of` → **`axl_json_get_type`**.
+
+- **Removed `axl_json_root_array_begin`** — use
+  `axl_json_value_array_begin(r, iter)`, which is the same call under a name
+  that does not lie. Both read the reader's own value, and a sub-reader
+  handed back by `axl_json_array_next()` has no "root", which is exactly
+  where the old name got used.
+
+- **Removed `axl_json_extract_string`** — use `axl_json_parse` +
+  `axl_json_get_string`, which is what it did.
+
+- **Removed the container-scoped writer overrides**
+  `axl_json_obj_begin_flags` / `axl_json_arr_begin_flags`, and the
+  `AXL_JSON_SCOPED_MASK` that described what they accepted.
+  `axl_json_obj_begin(w)` / `axl_json_arr_begin(w)` are unchanged and still
+  take one argument. There is no replacement and none is planned; see
+  `docs/AXL-JSON-Design.md` decision 41 for why a merged
+  `axl_json_obj_begin(w, flags)` cannot work (the override *replaced*
+  per-value formatting, so `0` was a meaningful value and cannot also mean
+  "no override").
+
+- **`AxlJsonWriter` shrinks by ~2 KB** and its layout changes. The
+  `saved_flags[AXL_JSON_WRITER_MAX_DEPTH]` array existed only to restore a
+  scoped override, so it went with the feature. The struct is caller-placed,
+  usually on the stack, and this is a firmware SDK — recompile consumers.
+
+### Added
+
+**C++ is a first-class surface, and the SDK links no `libstdc++.a`.**
+
+- `axl::cout` / `axl::cin` / `axl::cerr`, and `axl::string` — standalone with
+  SSO, not a skin over another string.
+- **The standard containers run under UEFI.** `axl-c++ --hosted` makes
+  `std::vector` / `string` / `map` / `unordered_map`, `std::list` and
+  `std::shared_ptr` work on both arches. The advice that came out of measuring
+  it: do not write containers, use these.
+- `libaxl-cxx.a` supplies what the toolchain's libstdc++ needs from us —
+  every `operator new` / `delete` form (nothrow and aligned included), the five
+  `std::__throw_*`, `ceil`, and AXL's own `_Prime_rehash_policy`. Eleven
+  functions were the whole gap.
+- **Exceptions work on both arches**, with LLVM libunwind vendored and built
+  AVX-free, and RTTI enabled. The answer turned out to be the toolchain:
+  `scripts/install-toolchain` builds an `x86_64-elf` bare-metal compiler so x64
+  matches aa64.
+- `axl-c++` ships in the packages unconditionally — it is a dependency-free
+  `exec axl-cc -x c++` wrapper, and without `libaxl-cxx.a` it names the install
+  step that is missing rather than failing obscurely.
+
+**JSON: one engine, four faces** (the redesign, P1–P15 — see
+`docs/AXL-JSON-Design.md`).
+
+- **One 64-bit `AxlJsonFlags` space** shared by reader and writer, with each
+  JSON5 sub-flag honoured individually rather than as a bundle.
+- **One parser for every dialect** — jsmn is gone, and a conformance gate keeps
+  the single engine honest.
+- **A pull scanner** (`axl_json_scanner_*`) over the same grammar, scanning
+  from a source through a refill window, so a document larger than memory is a
+  loop rather than a special case.
+- **Source and sink**: eight I/O entry points built from two vtables.
+- **Structured parse errors** — code and position, plus
+  `axl_json_error_format()` to render them.
+- Reader: `REJECT_DUPLICATES`; `UTF8_STRICT` / `UTF8_REPAIR` / `UTF8_RAW`;
+  NaN/Infinity; a lossless way to read any number; `axl_json_get_double`;
+  object iteration that makes a discovered key usable; the string decoder is
+  public.
+- Writer: `COMPACT`, `ESCAPE_SLASH`, `EMBED`, `SORT_KEYS` (ordered by the
+  DECODED key), `ENSURE_ASCII` with surrogate pairs; the depth cap moves 32 →
+  256; every writer path guarantees well-formed UTF-8 out.
+- `axl_http_response_get_json()` — the strict-by-default response parse
+  (network JSON is strict in both directions; decision 40).
+
+**Streams take consumer-supplied backends.** `axl_stream_open_custom()` plus
+the `axl_stream_ctx()` accessor complete the contract, and the built-in
+backends are built through the same public constructor rather than beside it.
+
+**Numbers and strings, correctly rounded.** `axl_str_to_double` /
+`axl_str_to_float` (Clinger fast path with an exact decimal fallback),
+`axl_double_to_str`, `axl_u64_to_str` / `axl_s64_to_str`, `%f` / `%e` / `%g` in
+`axl_sscanf`, `axl_utf8_encode` to complete the codepoint pair, and the IEEE
+nan/inf predicate surface in AxlMath.
+
+**Elsewhere**
+
+- AxlArray moves closer to GArray: `sized_new`, `steal`, element destructors.
+- RTC wake alarm, and the raw firmware memory map.
+- Unscoped UEFI variable inspection, and nvstore gets its walk back.
+- A serial log sink, on one shared line builder; serial `open` is now
+  EXCLUSIVE and a port answers for its own handle.
+- Opacity inherits down the surface tree (gfx E11).
+
+### Changed
+
+- **AxlTcp queues outbound sends, and never refuses one for capacity.**
+  `axl_tcp_send_async` used to reject a second send while one was in flight, so
+  every caller had to invent its own serialisation — three did, and the four
+  submit sites that instead read the refusal as fatal reset healthy connections
+  under load. It now accepts the send and transmits it when its turn comes,
+  FIFO. `AXL_BUSY` is gone from its return set: `AXL_OK` means accepted
+  (submitted or queued, and its callback will fire exactly once), `AXL_ERR`
+  means rejected outright (closed socket, bad argument, allocation failure) and
+  no callback follows. A transport that refuses the bytes now reports that the
+  same way a transport that drops them does — through the callback. Ported from
+  EDK2's socket layer; see `docs/AXL-Tcp-Queue-Design.md`.
+
+- **A send callback is deferred to the event loop, never called inline.** It
+  does not run inside `axl_tcp_send_async`, nor inside another send's
+  completion — it is queued for the loop's next iteration, which is how EDK2
+  signals its own tokens (`gBS->SignalEvent`). So a callback may do whatever it
+  likes to the socket, `axl_tcp_close` included, without tripping over a
+  transport operation still in progress underneath it. Transmission is not
+  delayed: the next queued send goes to the firmware immediately, and only the
+  notification waits for the tick.
+
+- **`axl_tcp_close` retires every pending send** — the one on the wire and
+  every one queued behind it — firing each callback with `AXL_CANCELLED` before
+  it returns, so an accepted send always gets exactly one callback and a
+  borrowed buffer is always released. Closing an already-closed socket is a
+  no-op, and sends or receives started on a closed socket are refused rather
+  than armed against firmware state that is already released.
+
+- **`axl_tcp_send` (the synchronous wrapper) declines to queue.** Behind
+  another caller's send it returns `AXL_ERR` immediately instead of waiting its
+  turn: a sync call's contract is "finished when I return", and it cannot
+  honour that behind a send whose progress a different loop drives. Use
+  `axl_tcp_send_async` when a socket has more than one writer.
+
+- The blend path resolves its SIMD tier once per blend rather than once per
+  scanline, and the SIMD dispatch check is memoised while the BSP is provably
+  alone.
+
+- `AxlHashTable` indexes by mask instead of a runtime modulo.
+
+- The tree builds as `-std=gnu2x` / C++23 — the newest standards the cross
+  compiler accepts (`gnu23` is the same language mode under a spelling gcc 13
+  rejects).
+
+- `axl_json_reader_error()`, `axl_json_source_init_mem()` and
+  `axl_json_parse_source()` docstrings now reference `axl_json_parse()`
+  where they referenced the removed twin. No behaviour change.
+
+### Fixed
+
+- **~1 request in 3 was dropped under concurrent TLS handshakes.** A server
+  that had its own handshake flight still in flight refused the response send,
+  and four submit sites in `axl-http-response.c` read that retryable status as
+  fatal and reset a healthy connection. The client saw `curl` error 56.
+  Measured at ~50% failure of a 24-connection gate; 0 of 6 runs after the fix.
+- **A WebSocket frame's TLS ciphertext leaked on every teardown-mid-send.**
+  `axl_tcp_close` cancelled the transport token without firing the callback
+  that frees the encrypted copy, and this layer keeps exactly one frame in
+  flight, so a TLS frame at teardown was always the one that leaked.
+- `axl_file_delete()` CREATED the path it was asked to remove, when that path
+  did not exist.
+- **No C++ global constructor had ever run.** Nothing references an
+  `.init_array` entry, so `--gc-sections` collected the section — silently, for
+  as long as the C++ layer existed. The linker scripts `KEEP()` it now, and a
+  ctor fixture in the suite fails if that regresses.
+- A latent AArch64 relocation-table split (`DT_RELA` across two sections, which
+  the crt0 walked past the end of); `-frtti` was the first workload to trigger
+  it. Gated by `make check-reloc-coverage`.
+- JSON string accessors did not decode `\uXXXX` — shipped corruption. Also
+  fixed: JSON5 `\0` / `\x00` smuggling an interior NUL, `\xNN` treated as a raw
+  byte rather than ES5's code unit, a `\<CR><LF>` line continuation counted as
+  two terminators, truncation leaving half a UTF-8 sequence, and every
+  non-ASCII byte dropped on platforms where `char` is signed.
+- `axl_dtoa` read past `kPow10`; `axl_sscanf`'s field-width accumulator could
+  overflow.
+- Leaks: `axl_getenv` treated an owned string as borrowed, `AXL_LOG_LEVEL` was
+  never freed, `axl_stream_init` published statics it did not reset, two
+  wrapper sources were left open, and a JOSE test discarded an owned key.
+- The RTC was re-entered from a notify function; an ordinary serial
+  double-close is harmless now.
+- Four AP worker-pool defects, against real MP Services semantics rather than
+  assumed ones.
+- `axl_tls` collapsed a retryable send refusal into a fatal handshake error.
+
+- **`sdk/examples/memfs.c` did not compile.** It still named
+  `AxlFsProviderInfo`, a type renamed to `AxlFsEntry` some time ago; the
+  example was reachable by no build rule and no test, so nothing noticed.
+  It also left `AxlFsEntry.alloc_size` uninitialised, which the fix closes
+  by zeroing the whole versioned struct the way the in-tree providers do.
+- **`make check-tautology` wiped the build tree.** It was missing from the
+  Makefile's `NONCLEAN_GOALS`, so running it after an `AXL_TLS=1` build read
+  `TLS_STATE=off`, saw a toggle, and deleted `$(BUILDDIR)/*.o` plus
+  `libaxl.a`. In `verify.sh` that make job runs *concurrently* with both
+  arch builds, so it deleted objects out from under them mid-build.
+
+### Build
+
+- **A teardown memory leak now fails the QEMU run.** `test_check_leaks` greps
+  every test binary's serial log for the leak report and requires each binary
+  to print a verdict at all — a gate that cannot see is worse than none. It
+  found three library leaks on the day it landed.
+- **`scripts/sabotage.sh`** — snapshot, apply, run, restore, and verify the
+  file is byte-identical again. Restoring by hand had produced two wrong
+  answers in this tree: a `sed -i.bak` restore gives the source the backup's
+  older mtime so `make` skips the rebuild, and a sed that matches nothing
+  leaves the suite green in a way that reads as "no test covers this".
+- **New gates**, each catching something that had already happened:
+  `check-dep-tracking` (`CXXFLAGS` lacked `-MD -MP` for the whole life of the
+  C++ layer, so a header edit rebuilt nothing), `check-no-avx`,
+  `check-flag-parity`, `check-reloc-coverage`, `check-bss-clear`,
+  `check-cxx-entry`, `check-json-dialect`, `check-uefi-scope`, `check-nul`,
+  `check-test-registered`.
+- **The rebuild signature covers flags AND the compiler**, not just the
+  `AXL_TLS` toggle. Editing `CFLAGS_BASE` used to rebuild nothing, which
+  produced four wrong readings while the stack protector was added; naming a
+  different `CXX` used to reuse host-g++ objects, so a suite run "with the
+  bare-metal toolchain" silently measured the host one.
+- The stack protector is ON (`-fstack-protector-strong
+  -mstack-protector-guard=global`, the second half load-bearing on x64), with
+  `test-stack-guard-qemu.sh` failing if it silently stops applying.
+- `scripts/lint.sh` runs clang `-Wall -Wextra` over every TU (12 warnings gcc
+  never emitted, one of them a real `-Wformat` defect), clang-tidy over `src/`,
+  and `bugprone-*` over `test/unit/` and `tools/`.
+- `scripts/verify.sh` runs the whole gate set concurrently and prints one
+  table; the lint-gate list has one definition (`LINT_GATES`) instead of two
+  that drifted.
+- `run-qemu.sh` types when the GUEST is ready rather than when a wall clock
+  says so, gates capture on the guest too, and no longer leaks its state dir or
+  its guest on `--background`.
+- CI repairs: `-std=gnu2x` (gcc 13 rejects `gnu23`), `safe.directory` for the
+  container lint job over a uid-1001 checkout, a wall-clock budget of the
+  runner's own, and `install.sh --cpp` requiring a toolchain only for the arch
+  being built — the integration job had never passed that step.
+
+- **New gate `make check-examples`** — compiles every `sdk/examples/*.c`
+  and `*.cpp` against the current public headers. 20 of the 51 examples were
+  reachable by no build rule and no test, yet
+  `scripts/build-packages.sh` copies them verbatim into the `.deb` and
+  `.rpm`, so the first person to compile one was a consumer. Compile-only
+  (~2.5 s); the link and runtime stay covered by the Makefile rules and
+  `test/integration/test-axl-cc-*.sh`. Fails if it finds fewer than 20
+  sources, so a broken glob cannot report clean forever.
+- **The lint-gate list has one definition.** `LINT_GATES` in the Makefile is
+  the source of truth; `verify.sh` reads it back via
+  `make -s print-lint-gates` instead of keeping a second copy. The two had
+  drifted, which is how `check-tautology` came to be a build-wiping gate,
+  and `check-cxx-entry` came to be a gate `verify.sh` never ran. Both are
+  fixed by construction, and `verify.sh` now refuses to run if the list
+  comes back near-empty.
+
 ## 3.1.0 — 2026-07-27
 
 ### Added
@@ -972,8 +1317,11 @@ dogfooding lint gate. No breaking API changes.
 
 - **`axl-cc -c --depfile <dest>`** — writes Make dependency file(s) with
   **absolute** dependency paths while compiling the *bare* source(s) unchanged
-  (objects stay bit-identical to a no-depfile compile). A plain forwarded
-  `-MMD -MF` emits compile-cwd-relative paths, which CMake's
+  (objects stay bit-identical to a no-depfile compile). Neither forwarded gcc
+  flag gives that: `-MMD` skips system headers, so it omits the SDK's entirely
+  (they arrive via `-isystem`), and `-MD` lists them but records each path as
+  gcc *resolved* it — relative for a relative `-I`, absolute for `-isystem` and
+  toolchain headers — i.e. a MIXED file, which CMake's
   `add_custom_command(DEPFILE …)` (CMP0116) resolves against the *binary* dir
   and so misses — `--depfile` makes per-object header tracking work under CMake
   without perturbing the Makefile↔CMake bit-parity that bare-source compilation

@@ -96,6 +96,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- Firmware selection --------------------------------------------------
+# STOCK OVMF DELIVERS NO usb-mouse POINTER EVENTS. Against it every
+# assertion here fails INCLUDING the baseline, which reads like an SDK
+# regression and is not one. The triage rule: baseline failing too means a
+# firmware/delivery problem; only the modifier/wheel assertions failing
+# means a real bug in the modifier-stamping path.
+#
+# So pick a mouse-capable build explicitly rather than inheriting whatever
+# is installed -- the installed blob has been reverted to stock more than
+# once, and patching it back changes every QEMU boot on this box, including
+# other people's sessions. This keeps the override local to this test.
+#
+# Override order: OVMF_CODE (set it yourself and we do not touch it) ->
+# AXL_OVMF_MOUSE -> the conventional local path.
+if [[ -z "${OVMF_CODE:-}" ]]; then
+    for _cand in "${AXL_OVMF_MOUSE:-}" \
+                 "$HOME/projects/qemu/ovmf-mouse/edk2-x86_64-code.fd"; do
+        [[ -n "$_cand" && -f "$_cand" ]] || continue
+        export OVMF_CODE="$_cand"
+        # The patched blob is code-only; pair it with the stock vars store.
+        # Its lowercase -code.fd name does not match axl-common.sh's
+        # ${OVMF_CODE%_CODE.fd}_VARS.fd derivation, so set this explicitly.
+        if [[ -z "${OVMF_VARS:-}" ]]; then
+            for _v in "$HOME/projects/qemu/install/share/qemu/edk2-i386-vars.fd" \
+                      "${_cand%-code.fd}-vars.fd"; do
+                [[ -f "$_v" ]] && { export OVMF_VARS="$_v"; break; }
+            done
+        fi
+        break
+    done
+fi
+
+if [[ -z "${OVMF_CODE:-}" || -z "${OVMF_VARS:-}" ]]; then
+    echo "=== SKIP ($ARCH): no mouse-capable OVMF available ==="
+    echo "  Stock OVMF builds out UsbMouseDxe, so it delivers no pointer"
+    echo "  events at all and every assertion here would fail — including the"
+    echo "  baseline, which would look like an SDK bug rather than a missing"
+    echo "  firmware feature."
+    echo "  Point AXL_OVMF_MOUSE at a patched edk2-x86_64-code.fd, or set"
+    echo "  OVMF_CODE and OVMF_VARS directly."
+    exit 0
+fi
+echo "  firmware: $OVMF_CODE"
+
 # Prereqs
 if ! command -v socat >/dev/null 2>&1; then
     echo "ERROR: socat is required for this test" >&2

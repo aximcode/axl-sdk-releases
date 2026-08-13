@@ -168,10 +168,13 @@ axl_mbedtls_entropy_poll(
     /* Fallback: weak entropy from time + monotonic counter */
     axl_debug("hardware RNG unavailable, using weak entropy fallback");
     uint64_t seed = 0;
-    EFI_TIME et;
-    if (gRT != NULL && axl_efi_call(gRT->GetTime, 2, &et, NULL) == 0) {
-        seed = et.Nanosecond;
-        seed ^= ((uint64_t)et.Second << 32) | (et.Minute << 16) | et.Hour;
+    AxlTime  et;
+    /* Through the backend, not gRT->GetTime directly: the backend carries the
+     * RTC re-entrancy guard, and entropy seeding is reachable from a TLS
+     * handshake driven off an event callback. */
+    if (axl_backend_get_time(&et) == AXL_OK) {
+        seed = et.nanosecond;
+        seed ^= ((uint64_t)et.second << 32) | (et.minute << 16) | et.hour;
     }
 
     uint64_t mono = 0;

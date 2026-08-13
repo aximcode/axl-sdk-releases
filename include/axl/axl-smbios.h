@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-smbios.h:
+/** @file axl-smbios.h
  *
  * UEFI SMBIOS helpers — string extraction and table lookup.
  */

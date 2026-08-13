@@ -34,14 +34,130 @@ AXL_LOG_DOMAIN("io");
    callbacks accumulate into a stack scratch buffer instead of hitting
    axl_write per chunk.) */
 
+/* Frozen byte size of the FIRST published AxlStreamOps. A caller offering
+   less than this is offering a struct no released AXL ever emitted, so it is
+   refused. This is deliberately a literal and NOT sizeof(AxlStreamOps): once
+   a v2 grows the struct, v1's size can no longer be derived from it. The
+   static_assert below is what keeps the literal honest while v1 IS current —
+   and on a future ABI where the layout differs (a 32-bit port, say) it fails
+   the build, which is the right place to decide what v1 means there. */
+#define AXL_STREAM_OPS_SIZE_V1  72u
+
+_Static_assert(sizeof(AxlStreamOps) == AXL_STREAM_OPS_SIZE_V1,
+               "AxlStreamOps v1 is a frozen 72-byte layout; a change here is "
+               "an ABI break that needs a new AXL_STREAM_OPS_VERSION");
+
 // ---------------------------------------------------------------------------
 // Stream allocation
 // ---------------------------------------------------------------------------
 
-AxlStream *
+/* Allocate a stream with the default field initializers. Now that every
+   constructor in the tree builds through axl_stream_open_custom, this has
+   exactly ONE caller and no longer needs to be visible to the backends -- so
+   it is static, and the private header no longer publishes it. */
+static AxlStream *
 axl_stream_new(void)
 {
-    return axl_new(AxlStream);
+    AxlStream *s = axl_new(AxlStream);
+
+    if (s != NULL) {
+        s->on_heap = true;   /* the one place a stream becomes freeable */
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// The sink boundary — the single funnel through which this file calls a
+// backend's read/write/flush, and therefore the one place fault injection
+// applies. Injecting at the PUBLIC API instead would be wrong twice over:
+// stream_write_buffered returns `count` unconditionally, so an API-level
+// short write would fabricate a count the buffered path can never emit; and
+// an API-level failure would return -1 without reaching the sticky `err`
+// flag, the flush-prefix retain logic, or the tee — bypassing exactly the
+// propagation these hooks exist to test.
+//
+// Counters tick per BACKEND call, so buffering defers a tick to the flush
+// and a non-UTF-8 encoding spends one per code point. Both are contractual
+// (see axl-stream.h) and fall out of funnelling here rather than per-site.
+//
+// Nothing in here logs: axl_debug would re-enter axl_write and recurse
+// straight back into this function. AxlMem can afford the diagnostic on its
+// own injected failure; a stream sink cannot.
+// ---------------------------------------------------------------------------
+
+static size_t  mFailNextWrite;
+static size_t  mFailNextRead;
+static size_t  mFailNextFlush;
+static size_t  mShortNextWrite;
+static size_t  mShortNextWriteLimit;
+
+/* Tick a one-shot injection counter. Returns true when THIS call is the
+   armed one (and leaves the counter disarmed). */
+static bool
+inject_fires(size_t *counter)
+{
+    if (*counter == 0) {
+        return false;
+    }
+    (*counter)--;
+    return *counter == 0;
+}
+
+/* Call the backend's write. @p inject is false for the stdout/stderr tee —
+   the tee is a secondary sink, and letting it spend a tick would let the
+   primary write escape injection while the error was swallowed anyway. It is
+   the ONLY caller that passes false. */
+static axl_ssize_t
+sink_write(AxlStream *s, const void *buf, size_t count, bool inject)
+{
+    /* Both counters tick, independently, on every INJECTED backend write —
+       each is its own "Nth backend write" count, exactly as documented. Tick
+       before acting so an armed failure does not silently skip the short
+       counter and slide it one call to the right. `inject` short-circuits so
+       the tee ticks neither. */
+    bool fail    = inject && inject_fires(&mFailNextWrite);
+    bool shorted = inject && inject_fires(&mShortNextWrite);
+
+    if (fail) {
+        return -1;
+    }
+    if (shorted) {
+        /* A GENUINE short write: the backend really is handed only `limit`
+           bytes, so what it received matches what we report. A limit of 0
+           means "accepted nothing" and skips the backend entirely rather
+           than bothering it with a zero-length call. */
+        count = (mShortNextWriteLimit < count) ? mShortNextWriteLimit : count;
+        if (count == 0) {
+            return 0;
+        }
+    }
+    return s->write(s->ctx, buf, count);
+}
+
+/* Call the backend's read. There is no read-side tee, so every read site
+   injects. File-static like its write and flush siblings: the text wrapper
+   used to need it exported, to read its source below that source's own
+   transcode, and now requires the source undecoded instead -- so axl_read IS
+   that wire read and no caller outside this file remains. */
+static axl_ssize_t
+sink_read(AxlStream *s, void *buf, size_t count)
+{
+    if (inject_fires(&mFailNextRead)) {
+        return -1;
+    }
+    return s->read(s->ctx, buf, count);
+}
+
+/* Call the backend's flush. Reached only after the buffered drain, and only
+   when the backend actually has a flush operation — a NULL one never gets
+   here, so an armed tick survives to the next stream that does. */
+static int
+sink_flush(AxlStream *s)
+{
+    if (inject_fires(&mFailNextFlush)) {
+        return -1;
+    }
+    return s->flush(s->ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +438,7 @@ static AxlStream mStdout = {
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
+    .name   = "stdout",
 };
 
 static AxlStream mStderr = {
@@ -331,6 +448,7 @@ static AxlStream mStderr = {
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
+    .name   = "stderr",
 };
 
 /**
@@ -467,6 +585,7 @@ static AxlStream mStdin = {
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
+    .name   = "stdin",
 };
 
 /* Shared raw-bytes write for the binary console sinks. axl_stdout_raw and
@@ -522,6 +641,7 @@ static AxlStream mStdoutRaw = {
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
+    .name   = "stdout-raw",
 };
 
 /* stderr binary sink — identical to console_write_raw but over the shell
@@ -542,6 +662,7 @@ static AxlStream mStderrRaw = {
     .pread  = NULL,
     .pwrite = NULL,
     .close  = NULL,
+    .name   = "stderr-raw",
 };
 
 AxlStream *axl_stdout     = NULL;
@@ -550,9 +671,36 @@ AxlStream *axl_stdin      = NULL;
 AxlStream *axl_stdout_raw = NULL;
 AxlStream *axl_stderr_raw = NULL;
 
+/* Defined down with the buffering machinery it drains through, but needed
+   here: axl_stream_init and axl_fclose must agree on what "ground state"
+   means, and two hand-written copies of that list would drift. */
+static void
+stream_reset_to_ground(
+    AxlStream *s
+    );
+
 void
 axl_stream_init(void)
 {
+    /* Reset before publishing, not merely re-point. The five live in .data,
+       so every mutable field a caller leaves on one outlives that caller for
+       the whole image -- an encoding on axl_stdin makes axl_stdin_text() fail
+       for good (axl_text_stream_wrap refuses a source that already decodes),
+       a stale `tee` outlives the tee stream, a buf_mode still claiming
+       LINE/FULL writes through a buffer nobody owns any more.
+       On the FIRST call this changes nothing: the statics start zeroed, which
+       IS the ground state, so the drain finds nothing and the frees are on
+       NULL. It is a second call that gains meaning -- and gains the right
+       one, because the reset DRAINS pending output rather than discarding it,
+       exactly as axl_fclose on a static does. What it does discard is
+       configuration, which is what "initialize the standard streams" asks
+       for. */
+    stream_reset_to_ground(&mStdout);
+    stream_reset_to_ground(&mStderr);
+    stream_reset_to_ground(&mStdin);
+    stream_reset_to_ground(&mStdoutRaw);
+    stream_reset_to_ground(&mStderrRaw);
+
     axl_stdout     = &mStdout;
     axl_stderr     = &mStderr;
     axl_stdin      = &mStdin;
@@ -695,7 +843,7 @@ pull_wire(AxlStream *s, uint8_t *out, size_t n)
 {
     size_t got = 0;
     while (got < n) {
-        axl_ssize_t r = s->read(s->ctx, out + got, n - got);
+        axl_ssize_t r = sink_read(s, out + got, n - got);
         if (r < 0) return -1;
         if (r == 0) break;
         got += (size_t)r;
@@ -789,24 +937,44 @@ utf8_lead_len(uint8_t lead)
     return 1;   /* invalid lead → Latin-1 fallback */
 }
 
-/* Emit one wire char for @p code in the stream's encoding. Sets
-   s->err and returns -1 on backend write error. */
+/* Push exactly @p n wire bytes, looping on short writes.
+   A wire code unit is INDIVISIBLE: half a UCS-2 pair on the wire
+   desynchronises every later unit, so "the sink took 1 of 2 bytes" cannot be
+   reported upward as a code point written — write_transcode's caller would
+   count the input byte as accepted and the missing half would never be
+   retried. So a short write is finished here, and only a genuine stall (no
+   progress) is an error. Sets s->err and returns -1 on either failure. */
 static int
-emit_wire(AxlStream *s, uint32_t code)
+emit_wire_bytes(AxlStream *s, const uint8_t *wire, size_t n, bool inject)
 {
-    if (s->encoding == AXL_ENC_ASCII) {
-        uint8_t b = (code < 0x80) ? (uint8_t)code : (uint8_t)'?';
-        if (s->write(s->ctx, &b, 1) < 0) {
+    size_t sent = 0;
+    while (sent < n) {
+        axl_ssize_t w = sink_write(s, wire + sent, n - sent, inject);
+        if (w <= 0) {
             s->err = true;
             return -1;
         }
-        return 0;
+        sent += (size_t)w;
+    }
+    return 0;
+}
+
+/* Emit one wire char for @p code in the stream's encoding. Sets
+   s->err and returns -1 on backend write error. @p inject is threaded
+   through from write_transcode — see sink_write. */
+static int
+emit_wire(AxlStream *s, uint32_t code, bool inject)
+{
+    uint8_t wire[2];
+
+    if (s->encoding == AXL_ENC_ASCII) {
+        wire[0] = (code < 0x80) ? (uint8_t)code : (uint8_t)'?';
+        return emit_wire_bytes(s, wire, 1, inject);
     }
 
     /* UCS-2: codepoints above U+FFFF replaced with '?' (no surrogate
        pair encoding — UCS-2 is BMP-only by design). */
     uint16_t cu = (code <= 0xFFFFu) ? (uint16_t)code : (uint16_t)'?';
-    uint8_t  wire[2];
     if (s->encoding == AXL_ENC_UCS2_LE) {
         wire[0] = (uint8_t)(cu & 0xFFu);
         wire[1] = (uint8_t)(cu >> 8);
@@ -814,20 +982,17 @@ emit_wire(AxlStream *s, uint32_t code)
         wire[0] = (uint8_t)(cu >> 8);
         wire[1] = (uint8_t)(cu & 0xFFu);
     }
-    if (s->write(s->ctx, wire, 2) < 0) {
-        s->err = true;
-        return -1;
-    }
-    return 0;
+    return emit_wire_bytes(s, wire, 2, inject);
 }
 
 /* Write with transcoding (UTF-8 → wire encoding). Returns the count
    of input bytes accepted (== @p count if no backend error; bytes
    may be flushed to the wire OR carried as out_pending for the next
    call). On backend error returns the partial count, or -1 if no
-   input bytes were accepted. */
+   input bytes were accepted. @p inject is false only on the tee path
+   — see sink_write. */
 static axl_ssize_t
-write_transcode(AxlStream *s, const void *buf, size_t count)
+write_transcode(AxlStream *s, const void *buf, size_t count, bool inject)
 {
     const uint8_t *in = (const uint8_t *)buf;
     size_t         i  = 0;
@@ -903,7 +1068,7 @@ write_transcode(AxlStream *s, const void *buf, size_t count)
             }
         }
 
-        if (emit_wire(s, code) < 0) {
+        if (emit_wire(s, code, inject) < 0) {
             return i ? (axl_ssize_t)i : -1;
         }
 
@@ -941,7 +1106,7 @@ axl_read(AxlStream *s, void *buf, size_t count)
     if (s->encoding != AXL_ENC_UTF8) {
         n = read_transcode(s, buf, count);
     } else {
-        n = s->read(s->ctx, buf, count);
+        n = sink_read(s, buf, count);
     }
     if (n == 0) {
         s->eof = true;
@@ -963,9 +1128,9 @@ stream_write_now(AxlStream *s, const void *buf, size_t count)
     axl_ssize_t n;
 
     if (s->encoding != AXL_ENC_UTF8) {
-        n = write_transcode(s, buf, count);
+        n = write_transcode(s, buf, count, true);
     } else {
-        n = s->write(s->ctx, buf, count);
+        n = sink_write(s, buf, count, true);
         if (n < 0) {
             s->err = true;
         }
@@ -977,14 +1142,16 @@ stream_write_now(AxlStream *s, const void *buf, size_t count)
        directly) so the tee's encoding gets honored, but we read
        s->tee into a local first to avoid recursing into the tee's
        own tee (accidental loops double-write once instead of
-       cascading). */
+       cascading). The tee is also the one sink that opts OUT of fault
+       injection: a tee that spent the armed tick would let the primary
+       write escape while its own error was swallowed anyway. */
     if (s->tee != NULL) {
         AxlStream *t = s->tee;
         if (t->write != NULL) {
             if (t->encoding != AXL_ENC_UTF8) {
-                write_transcode(t, buf, count);
+                write_transcode(t, buf, count, false);
             } else {
-                axl_ssize_t tn = t->write(t->ctx, buf, count);
+                axl_ssize_t tn = sink_write(t, buf, count, false);
                 if (tn < 0) {
                     t->err = true;
                 }
@@ -1012,7 +1179,12 @@ stream_flush_prefix(AxlStream *s, size_t k)
         axl_ssize_t n = stream_write_now(s, s->wbuf + written, k - written);
         if (n <= 0) {
             /* No progress: retain everything from `written` on and fail.
-               stream_write_now already set s->err on a negative return. */
+               stream_write_now sets s->err on a NEGATIVE return, but a legal
+               zero-byte short write is not negative — and a stalled flush
+               still means bytes did not leave. Set it here so axl_ferror
+               agrees with this AXL_ERR: axl_fclose's drain discards the
+               return value, so the flag is the only surviving record. */
+            s->err = true;
             size_t rem = s->wbuf_len - written;
             if (written > 0 && rem > 0) {
                 axl_memmove(s->wbuf, s->wbuf + written, rem);
@@ -1115,13 +1287,30 @@ axl_write(AxlStream *s, const void *buf, size_t count)
     return stream_write_buffered(s, buf, count);
 }
 
+/* The sticky-flag rule for positional I/O, shared by both directions:
+   a negative return is a stream error and sets `err`, exactly as axl_read /
+   axl_write do — but a SHORT (including zero-length) transfer sets NOTHING.
+   In particular it does not set `eof`: positional I/O does not consult or
+   move the stream position, so "the backend had nothing at that offset" says
+   nothing about whether the stream is at its end. Unsupported (a NULL slot)
+   returns -1 without touching `err` too, matching axl_read's NULL-op path —
+   "this stream cannot do that" is not a failure of this stream. */
+static axl_ssize_t
+positional_result(AxlStream *s, axl_ssize_t n)
+{
+    if (n < 0) {
+        s->err = true;
+    }
+    return n;
+}
+
 axl_ssize_t
 axl_pread(AxlStream *s, void *buf, size_t count, size_t offset)
 {
     if (s == NULL || s->pread == NULL) {
         return -1;
     }
-    return s->pread(s->ctx, buf, count, offset);
+    return positional_result(s, s->pread(s->ctx, buf, count, offset));
 }
 
 axl_ssize_t
@@ -1130,43 +1319,116 @@ axl_pwrite(AxlStream *s, const void *buf, size_t count, size_t offset)
     if (s == NULL || s->pwrite == NULL) {
         return -1;
     }
-    return s->pwrite(s->ctx, buf, count, offset);
+    return positional_result(s, s->pwrite(s->ctx, buf, count, offset));
 }
 
 // ---------------------------------------------------------------------------
 // Layer 2: fread/fwrite/fclose/fprintf/readline
 // ---------------------------------------------------------------------------
 
+/* Byte total for an item request, or 0 if size * count would wrap. The
+   product is both the loop bound and the count handed to the backend, so a
+   wrapped one asks for a transfer that bears no relation to the caller's
+   buffer — refuse it outright, exactly as axl_calloc refuses the same
+   arithmetic. */
+static size_t
+items_to_bytes(size_t size, size_t count)
+{
+    if (size == 0 || count == 0 || count > SIZE_MAX / size) {
+        return 0;
+    }
+    return size * count;
+}
+
 size_t
 axl_fread(void *buf, size_t size, size_t count, AxlStream *s)
 {
-    axl_ssize_t n;
+    size_t total = items_to_bytes(size, count);
+    size_t done  = 0;
 
-    if (size == 0 || count == 0) {
+    if (total == 0) {
         return 0;
     }
 
-    n = axl_read(s, buf, size * count);
-    if (n <= 0) {
-        return 0;
+    /* Loop, because "like fread()" has always meant it: a backend is allowed
+       to transfer less than asked (AxlStreamOps), and a caller who cannot
+       tell a short read from EOF has no way to recover. Terminates because
+       every iteration either ends the loop or moves `done` forward by at
+       least one: 0 means end of input (axl_read set `eof`), -1 means error
+       (it set `err`), and anything else is progress. */
+    while (done < total) {
+        axl_ssize_t n = axl_read(s, (uint8_t *)buf + done, total - done);
+        if (n <= 0) {
+            break;
+        }
+        done += (size_t)n;
     }
-    return (size_t)n / size;
+    /* Complete items only, C-style. A partial trailing item is not counted,
+       though its bytes ARE in the caller's buffer. */
+    return done / size;
 }
 
 size_t
 axl_fwrite(const void *buf, size_t size, size_t count, AxlStream *s)
 {
-    axl_ssize_t n;
+    size_t total = items_to_bytes(size, count);
+    size_t done  = 0;
 
-    if (size == 0 || count == 0) {
+    if (total == 0) {
         return 0;
     }
 
-    n = axl_write(s, buf, size * count);
-    if (n <= 0) {
-        return 0;
+    /* Same loop, and the same termination argument with one addition: a
+       backend write of 0 is a legal "accepted nothing, try again later"
+       rather than an error, and retrying it here would spin — nothing can
+       drain the sink while this loop holds the CPU, and AxlStream has no way
+       to wait for it. So the first zero ends the loop and the caller sees a
+       short item count with axl_ferror() still false, which is precisely the
+       "retry at your own cadence" signal. -1 ends it with `err` set. */
+    while (done < total) {
+        axl_ssize_t n = axl_write(s, (const uint8_t *)buf + done, total - done);
+        if (n <= 0) {
+            break;
+        }
+        done += (size_t)n;
     }
-    return (size_t)n / size;
+    return done / size;
+}
+
+/* Back to the ground state a freshly-built stream starts in: unbuffered,
+   UTF-8, no tee, not interactive, no half-transcoded bytes, flags clear.
+
+   Tidiness for a stream about to be freed; load-bearing for one that is not,
+   because a stream that survives must not carry ANY of the previous
+   generation's state into the next — a buf_mode still claiming LINE/FULL
+   would write through the buffer just released, a retained half-codepoint in
+   out_pending would splice itself onto the next write, and a `tee` pointer
+   would outlive the tee stream the caller closes next.
+
+   Pending output is DRAINED, not dropped: this is a reset, not a discard. A
+   sink error there has no return path (both callers are void — a caller that
+   needs to observe one flushes explicitly first, see the axl_fclose docs),
+   and the sticky `err` it sets is cleared below along with everything else,
+   which is right: the stream really is back at its ground state. */
+static void
+stream_reset_to_ground(
+    AxlStream *s
+    )
+{
+    (void)stream_drain(s);
+    axl_free(s->wbuf);
+
+    s->wbuf          = NULL;
+    s->wbuf_cap      = 0;
+    s->wbuf_len      = 0;
+    s->buf_mode      = AXL_STREAM_BUF_NONE;
+    s->tee           = NULL;
+    s->encoding      = AXL_ENC_UTF8;
+    s->in_pending_n  = 0;
+    s->out_pending_n = 0;
+    s->interactive   = false;
+    s->eof           = false;
+    s->err           = false;
 }
 
 void
@@ -1175,13 +1437,31 @@ axl_fclose(AxlStream *s)
     if (s == NULL) {
         return;
     }
-    /* Drain buffered output before teardown, then free the buffer. A sink
-       error here can't be reported through this void return — a caller that
-       needs to observe it flushes explicitly first (see axl_fclose docs). */
-    (void)stream_drain(s);
-    axl_free(s->wbuf);
+    stream_reset_to_ground(s);
+
+    if (!s->on_heap) {
+        /* One of the five console statics (axl_stdout et al.). They live in
+           .data, so freeing one corrupts the heap, and axl_stream_init hands
+           the very same pointers out again — they have to survive this and
+           stay usable.
+
+           Returning here also skips `close` and the owned-name free, which is
+           deliberate rather than incidental: a static outlives the call, so
+           releasing its ctx would leave a live stream wired to freed state.
+           Neither applies to the five (no ctx, no heap name), and if a future
+           static ever grows one, leaking it beats using it after free. */
+        return;
+    }
     if (s->close != NULL) {
         s->close(s->ctx);
+    }
+    /* Only the axl_stream_open_custom path heap-copies the label, so the flag
+       is what keeps this from freeing .rodata. Note "built-in" is NOT the
+       test -- every constructor goes through the public one now and so owns
+       its copy like any consumer's stream. What is left pointing at a literal
+       is the static console streams, which fill the struct directly. */
+    if (s->name_owned) {
+        axl_free((void *)(uintptr_t)s->name);
     }
     axl_free(s);
 }
@@ -1503,7 +1783,7 @@ axl_fflush(AxlStream *s)
     if (s->flush == NULL) {
         return AXL_OK;
     }
-    return s->flush(s->ctx);
+    return sink_flush(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +1878,238 @@ bool
 axl_stream_get_interactive(AxlStream *s)
 {
     return (s != NULL) && s->interactive;
+}
+
+// ---------------------------------------------------------------------------
+// Custom backends
+// ---------------------------------------------------------------------------
+
+/* Validate an AxlStreamOps header and take a NORMALISED copy of it.
+
+   Shared by axl_stream_open_custom and axl_stream_ctx, and the sharing is
+   load-bearing rather than tidiness: the getter compares a caller's ops
+   against what the constructor STORED, so if the two ever disagreed about
+   what a given ops block means, a backend would stop recognising its own
+   stream across a header bump. One function, one answer.
+
+   @return false if the ops block is unusable at all: a bad struct_size or
+       version, or neither read nor write. */
+static bool
+stream_ops_normalize(AxlStreamOps *out, const AxlStreamOps *ops)
+{
+    size_t n;
+
+    /* struct_size and version are read unconditionally — the struct is
+       assumed large enough to hold them, which is inherent to the pattern
+       (a size field cannot protect the read of itself) and is documented
+       on the public functions. */
+    if (ops->struct_size < AXL_STREAM_OPS_SIZE_V1) {
+        return false;
+    }
+    if (ops->version == 0 || ops->version > AXL_STREAM_OPS_VERSION) {
+        return false;
+    }
+
+    /* Copy min(theirs, ours): a newer caller's extra slots are ignored
+       rather than read out of bounds, and an older caller's absent slots
+       stay NULL, which every dispatch site already reads as unsupported.
+
+       The memset is UNREACHABLE TODAY and deliberately kept. v1's frozen size
+       equals sizeof(AxlStreamOps) — the static_assert above pins that — so the
+       floor check has already refused everything the memcpy would leave
+       partially written, and no test can exercise it (verified: removing it
+       fails nothing). It goes live the moment a v2 grows the struct, and then
+       it is load-bearing rather than defensive: without it the new slots would
+       be compared against, and INSTALLED FROM, uninitialised stack. The
+       static_assert is the tripwire that forces this to be re-read then. */
+    axl_memset(out, 0, sizeof *out);
+    n = (ops->struct_size < sizeof *out) ? (size_t)ops->struct_size : sizeof *out;
+    axl_memcpy(out, ops, n);
+
+    /* A stream that can neither read nor write is a programming error, not a
+       degenerate case worth supporting. Checked HERE rather than only in the
+       constructor so axl_stream_ctx inherits it: otherwise an empty
+       AXL_STREAM_OPS_INIT would be a legal probe, refused today only because
+       no stream happens to have both slots NULL. That is the kind of
+       incidentally-true property the capability queries next door exist to
+       stop people resting on. */
+    if (out->read == NULL && out->write == NULL) {
+        return false;
+    }
+    return true;
+}
+
+AxlStream *
+axl_stream_open_custom(
+    void               *ctx,
+    const AxlStreamOps *ops,
+    const char         *name
+    )
+{
+    AxlStreamOps  copy;
+    AxlStream    *s;
+    char         *name_copy = NULL;
+
+    if (ops == NULL) {
+        return NULL;
+    }
+    if (!stream_ops_normalize(&copy, ops)) {
+        return NULL;
+    }
+
+    s = axl_stream_new();
+    if (s == NULL) {
+        return NULL;
+    }
+    if (name != NULL) {
+        name_copy = axl_strdup(name);
+        if (name_copy == NULL) {
+            /* Every failure exit above and here leaves ctx alone and never
+               calls close — the header promises the caller still owns it. */
+            axl_free(s);
+            return NULL;
+        }
+    }
+
+    s->ctx        = ctx;
+    s->read       = copy.read;
+    s->write      = copy.write;
+    s->pread      = copy.pread;
+    s->pwrite     = copy.pwrite;
+    s->seek       = copy.seek;
+    s->tell       = copy.tell;
+    s->flush      = copy.flush;
+    s->close      = copy.close;
+    s->name       = name_copy;
+    s->name_owned = (name_copy != NULL);
+    return s;
+}
+
+void *
+axl_stream_ctx(
+    const AxlStream    *s,
+    const AxlStreamOps *ops
+    )
+{
+    AxlStreamOps want;
+
+    if (s == NULL || ops == NULL) {
+        return NULL;
+    }
+    if (!stream_ops_normalize(&want, ops)) {
+        return NULL;
+    }
+
+    /* EVERY operation slot, not one privileged slot. axl_bufdata's internal
+       check can name a single file-static function because it is inside the
+       backend; a public getter cannot, and there is no slot to privilege
+       anyway -- a write-only sink has no read, a read-only source no write.
+       Comparing the whole set also makes the answer "this stream came out of
+       the constructor that owns these operations", which is the question an
+       accessor actually needs answered before it casts. */
+    /* MAINTENANCE NOTE for a future additive bump: this list must name every
+       operation slot AxlStreamOps has. A slot added to the struct but not
+       added here does not fail a test -- it silently weakens the
+       discriminator, because two streams differing only in that slot would
+       start matching each other. The _Static_assert on AXL_STREAM_OPS_SIZE_V1
+       fires on any size change and is the tripwire that forces this to be
+       re-read. */
+    if (want.read   != s->read
+        || want.write  != s->write
+        || want.pread  != s->pread
+        || want.pwrite != s->pwrite
+        || want.seek   != s->seek
+        || want.tell   != s->tell
+        || want.flush  != s->flush
+        || want.close  != s->close) {
+        return NULL;
+    }
+
+    /* Deliberately no `ctx != NULL` guard: a NULL context and a refusal are
+       the same answer, which the header states, and a backend with no context
+       has nothing to recover. */
+    return s->ctx;
+}
+
+const char *
+axl_stream_name(const AxlStream *s)
+{
+    if (s == NULL || s->name == NULL) {
+        return "";
+    }
+    return s->name;
+}
+
+// ---------------------------------------------------------------------------
+// Capability queries. Each mirrors its dispatch site's own NULL check and
+// nothing more — axl_stream_can_seek is `seek != NULL` alone, because seek
+// and tell are separate slots and a backend may legitimately have one.
+// ---------------------------------------------------------------------------
+
+bool
+axl_stream_can_read(const AxlStream *s)
+{
+    return s != NULL && s->read != NULL;
+}
+
+bool
+axl_stream_can_write(const AxlStream *s)
+{
+    return s != NULL && s->write != NULL;
+}
+
+bool
+axl_stream_can_seek(const AxlStream *s)
+{
+    return s != NULL && s->seek != NULL;
+}
+
+bool
+axl_stream_can_tell(const AxlStream *s)
+{
+    return s != NULL && s->tell != NULL;
+}
+
+bool
+axl_stream_can_pread(const AxlStream *s)
+{
+    return s != NULL && s->pread != NULL;
+}
+
+bool
+axl_stream_can_pwrite(const AxlStream *s)
+{
+    return s != NULL && s->pwrite != NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection. Arming is trivial; the semantics live at the sink
+// boundary above.
+// ---------------------------------------------------------------------------
+
+void
+axl_stream_fail_next_write(size_t n)
+{
+    mFailNextWrite = n;
+}
+
+void
+axl_stream_fail_next_read(size_t n)
+{
+    mFailNextRead = n;
+}
+
+void
+axl_stream_fail_next_flush(size_t n)
+{
+    mFailNextFlush = n;
+}
+
+void
+axl_stream_short_next_write(size_t n, size_t limit)
+{
+    mShortNextWrite      = n;
+    mShortNextWriteLimit = limit;
 }
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,9 @@ Headers:
 | Free a long-lived resource on any exit path | `axl_atexit(fn, data)` |
 | Share a loop across modules | `axl_loop_default()` |
 | Wait inside a callback without starving the outer loop | `axl_loop_iterate_until(loop, done, timeout_us)` |
+| Serialize a short critical section against a pump callback | `axl_tpl_raise(AXL_TPL_NOTIFY)` / `axl_tpl_restore(prev)` |
+| Ask what priority level I am running at | `axl_tpl_current()` |
+| Contain a suspect region that may leave the level raised | `axl_tpl_restore_baseline(&leaked)` |
 
 **Library re-entrancy guarantee.** `axl_yield()`, when a default loop exists,
 runs one non-blocking dispatch of it (the yield-as-scheduler idiom) — so it can
@@ -104,6 +107,16 @@ between them. `_axl_cleanup` has a reentrancy guard: if
 
 `_axl_cleanup` runs these in order:
 
+0. **TPL repair** — `axl_tpl_restore_baseline`. An image that returns
+   above `TPL_APPLICATION` wedges the machine: measured at
+   `TPL_CALLBACK` as well as `TPL_NOTIFY`, so *every* raised level is
+   fatal, and on x64 a release firmware says nothing and simply spins
+   (AArch64 at least asserts `Image->Tpl == gEfiCurrentTpl` first).
+   This runs before everything below it because at `TPL_HIGH_LEVEL`
+   the reporting would itself hang — `AllocatePool`, `CreateEvent`,
+   `SetTimer`, `CloseEvent` and console output all block rather than
+   failing. So the level is repaired first and the defect logged
+   after, which turns an unrecoverable hang into a named error.
 1. **atexit callbacks** (LIFO) — `_axl_atexit_run_all`. User
    callbacks may free resources that would otherwise show up in
    the sweep.
@@ -115,7 +128,12 @@ between them. `_axl_cleanup` has a reentrancy guard: if
    of live entries, each logged with user `file:line` and closed
    via the appropriate `_free`.
 5. **Heap leak report** (AXL_MEM_DEBUG only) --
-   `axl_mem_dump_leaks`. Release-mode auto-free of heap is
+   `_axl_mem_dump_leaks_at_exit`, the teardown-flavoured
+   `axl_mem_dump_leaks` (its header omits the diagnostic form's
+   `(live allocations)` infix, which is how the QEMU harness tells a
+   verdict from a running program's dump). Runs LAST on purpose:
+   everything above it is a reclaim step, so anything still live here
+   has no owner left. Release-mode auto-free of heap is
    deferred (see [`docs/AXL-Lifecycle.md` §10.1](https://github.com/aximcode/axl-sdk-releases/blob/main/docs/AXL-Lifecycle.md#101-release-mode-heap-auto-sweep)).
 
 ## Caller attribution

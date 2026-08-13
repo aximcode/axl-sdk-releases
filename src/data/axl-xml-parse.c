@@ -248,7 +248,10 @@ encode_utf8(AxlXmlReader *r, uint32_t cp)
        premature NUL termination of C-string views) and to the UTF-16
        surrogate range U+D800..U+DFFF (invalid as standalone
        codepoints; encoding them as 3-byte UTF-8 produces invalid
-       UTF-8). Reject both. */
+       UTF-8). Reject both HERE rather than leaning on axl_utf8_encode:
+       it refuses the surrogate too, but a refusal is only a 0 return,
+       and XML wants a located parse error. U+0000 it encodes happily
+       (one 0x00 byte), which is exactly the truncation §4.1 forbids. */
     if (cp == 0) {
         set_error(r, "character reference to U+0000 is forbidden");
         return false;
@@ -257,23 +260,28 @@ encode_utf8(AxlXmlReader *r, uint32_t cp)
         set_error(r, "character reference to UTF-16 surrogate is forbidden");
         return false;
     }
-    if (cp < 0x80) {
-        return scratch_append_byte(r, (char)cp);
-    } else if (cp < 0x800) {
-        return scratch_append_byte(r, (char)(0xC0 | (cp >> 6))) &&
-               scratch_append_byte(r, (char)(0x80 | (cp & 0x3F)));
-    } else if (cp < 0x10000) {
-        return scratch_append_byte(r, (char)(0xE0 | (cp >> 12))) &&
-               scratch_append_byte(r, (char)(0x80 | ((cp >> 6) & 0x3F))) &&
-               scratch_append_byte(r, (char)(0x80 | (cp & 0x3F)));
-    } else if (cp < 0x110000) {
-        return scratch_append_byte(r, (char)(0xF0 | (cp >> 18))) &&
-               scratch_append_byte(r, (char)(0x80 | ((cp >> 12) & 0x3F))) &&
-               scratch_append_byte(r, (char)(0x80 | ((cp >> 6)  & 0x3F))) &&
-               scratch_append_byte(r, (char)(0x80 | (cp & 0x3F)));
+    char   enc[AXL_UTF8_MAX_LEN];
+    size_t n = axl_utf8_encode(cp, enc, sizeof(enc));
+    if (n == 0) {
+        /* AXL_UTF8_MAX_LEN cannot be too small for one codepoint, and the two
+           guards above already took the surrogates, so a 0 here means only
+           "above U+10FFFF". decode_entity rejects that while accumulating, so
+           this arm is the belt to that brace rather than a live path -- kept
+           because encode_utf8 is the function that knows the encodable range,
+           and a caller that stops range-checking should still get an error
+           rather than a silently dropped character. */
+        set_error(r, "numeric character reference out of Unicode range");
+        return false;
     }
-    set_error(r, "numeric character reference out of Unicode range");
-    return false;
+    /* Grow once for the whole sequence. Appending byte by byte could fail
+       partway on OOM and leave a TRUNCATED sequence in the scratch -- the same
+       ill-formed UTF-8 the guards above exist to prevent. */
+    if (!scratch_grow_to(r, r->scratch_len + n)) {
+        return false;
+    }
+    axl_memcpy(r->scratch + r->scratch_len, enc, n);
+    r->scratch_len += n;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

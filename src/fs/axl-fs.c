@@ -23,7 +23,6 @@
 #include <axl/axl-fs.h>
 #include <axl/axl-path.h>
 #include <axl/axl-sys.h>
-#include "../stream/axl-stream-internal.h"
 #include "axl-file-gen.h"
 AXL_LOG_DOMAIN("fs");
 
@@ -345,7 +344,13 @@ axl_file_delete(const char *path)
 
     rc = axl_backend_file_delete((const unsigned short *)wide_path);
     axl_free(wide_path);
-    axl_file_gen_bump(path);
+    /* Only on SUCCESS. The bump was unconditional, so a delete of a path that
+       does not exist invalidated every generation-keyed cache entry for it --
+       for a file that was never there and never removed. Nothing changed, so
+       nothing should be dirtied. */
+    if (rc == AXL_OK) {
+        axl_file_gen_bump(path);
+    }
     return rc;
 }
 

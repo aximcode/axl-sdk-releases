@@ -56,7 +56,7 @@ are not calls and are not matched.
 
 Exit status is non-zero on a regression, so it can gate CI. Usage:
 
-    scripts/check-dogfood.py                # ratchet gate over src/
+    scripts/check-dogfood.py                # ratchet gate over src/ + tools/
     scripts/check-dogfood.py --report       # list every site, ignore BASELINE
     scripts/check-dogfood.py --update-baseline  # print a ready-to-paste BASELINE
 """
@@ -68,8 +68,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SCAN_ROOT = ROOT / "src"
+# tools/ is scanned alongside src/ because it is code consumers read and copy.
+# The rule "AXL dogfoods its own API" was enforced only where the library
+# lives, so nothing stopped a tool from demonstrating the raw firmware calls
+# the library exists to replace. Widening found 48 of 51 tools/ files already
+# clean; the three protocol shims carry real debt and are RECORDED in BASELINE
+# below rather than rewritten -- see the note there.
+#
+# sdk/examples/ is deliberately NOT here yet. It is the other tree consumers
+# copy from and it ships in the .deb/.rpm, but two of its files use UEFI
+# directly (smbus-hc-shim.c, pointer-tune-demo.c) including two unmarked raw
+# pool frees, so adding it is a separate change with its own markers and
+# baseline, not a one-line scope bump.
+SCAN_ROOTS = (ROOT / "src", ROOT / "tools")
 EXTS = {".c", ".h"}
+
+
+def scan_paths() -> list[Path]:
+    """Every candidate path across all scanned roots, in a stable order."""
+    out: list[Path] = []
+    for root in SCAN_ROOTS:
+        out.extend(root.rglob("*"))
+    return sorted(out)
+
 
 # Direct EFI is the *purpose* of these trees, so they are exempt wholesale.
 EXEMPT_DIRS = ("src/backend/", "src/crt0/")
@@ -141,13 +162,22 @@ BASELINE: dict[str, int] = {
     "src/util/axl-image-verify.c": 2,
     "src/util/axl-image.c": 10,
     "src/util/axl-mem-region.c": 8,
-    "src/util/axl-nvstore.c": 5,
+    "src/util/axl-nvstore.c": 4,
     "src/util/axl-protocol.c": 2,
     "src/util/axl-rng.c": 2,
     "src/util/axl-shared-driver.c": 2,
     "src/util/axl-shell.c": 3,
     "src/util/axl-sys.c": 5,
     "src/util/axl-watchdog.c": 1,
+    # tools/ debt, recorded when the scan was widened to cover it. All three
+    # are protocol SHIMS rather than ordinary apps -- kbtune-drv reinstalls
+    # SIMPLE_TEXT_INPUT and chains to the original vtable, fbcon-drv publishes
+    # a presence GUID, fbcon locates and unloads resident images -- so raw EFI
+    # is closer to their purpose than to a drift. Ratcheted, not rewritten:
+    # they may not GAIN calls, which is what the widening was for.
+    "tools/fbcon-drv.c": 5,
+    "tools/fbcon.c": 3,
+    "tools/kbtune-drv.c": 27,
 }
 
 
@@ -244,7 +274,7 @@ def is_exempt(rel: str) -> bool:
 def collect() -> dict[str, list[tuple[int, str]]]:
     """rel-path -> findings, over the non-exempt scan tree."""
     result: dict[str, list[tuple[int, str]]] = {}
-    for path in sorted(SCAN_ROOT.rglob("*")):
+    for path in scan_paths():
         if path.suffix not in EXTS or not path.is_file():
             continue
         rel = path.relative_to(ROOT).as_posix()
@@ -276,7 +306,7 @@ def scan_file_pool(path: Path) -> list[tuple[int, str]]:
 def collect_pool() -> dict[str, list[tuple[int, str]]]:
     """rel-path -> unmarked raw pool calls, over the non-exempt scan tree."""
     result: dict[str, list[tuple[int, str]]] = {}
-    for path in sorted(SCAN_ROOT.rglob("*")):
+    for path in scan_paths():
         if path.suffix not in EXTS or not path.is_file():
             continue
         rel = path.relative_to(ROOT).as_posix()

@@ -41,6 +41,17 @@
 
     The wrapper does NOT take ownership of @p src — the caller is
     responsible for closing both eventually.
+
+    **The source must present its bytes undecoded** — see the contract in
+    axl-stream.h. This file names NO private header: it builds its stream
+    through the public `axl_stream_open_custom`, reads its source through the
+    public `axl_read`, and recognises another wrapper through the public
+    `axl_stream_ctx`. That is the whole of it, so a consumer can write this
+    file's equivalent out of tree with nothing withheld — which is why AXL
+    publishes no "read below a stream's decode" call. Requiring the source at
+    AXL_ENC_UTF8, where `axl_read` IS the wire read, is what makes one
+    unnecessary, and refusing anything else is what makes the double decode
+    unreachable rather than merely discouraged.
 **/
 
 #include <stddef.h>
@@ -48,7 +59,6 @@
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-stream.h>
-#include "axl-stream-internal.h"
 #include <axl/axl-log.h>
 
 AXL_LOG_DOMAIN("io-text");
@@ -68,7 +78,13 @@ typedef struct {
        before any further src reads. Up to PROBE_SIZE. */
     uint8_t     pushback[PROBE_SIZE];
     size_t      pushback_n;
+    /* Latch for the "someone gave the source a decoder" diagnostic. The
+       condition is re-checked on EVERY read, so an unlatched log would
+       flood a read loop with the same line. */
+    bool        conflict_logged;
 } TextStreamCtx;
+
+static AxlStreamOps text_stream_ops(void);
 
 /* Strict headerless-UCS-2 sniff: classify @p bytes (length @p n) by
    the position of NUL bytes. Returns AXL_ENC_UCS2_LE / AXL_ENC_UCS2_BE
@@ -94,12 +110,64 @@ sniff_ucs2(const uint8_t *bytes, size_t n)
     return AXL_ENC_UTF8;
 }
 
+/* Whether @p s hands out its bytes UNDECODED, i.e. whether axl_read on it is
+   the wire read this wrapper's classifier needs. Two sources qualify:
+
+     - a stream at AXL_ENC_UTF8, where axl_read dispatches straight to the
+       backend and the encoding layer is a passthrough; and
+
+     - another text wrapper, whose output is UTF-8 BY CONSTRUCTION whatever
+       encoding its own classifier settled on, so reading it decodes exactly
+       once. Recognised through the PUBLIC axl_stream_ctx, which answers "was
+       this stream opened with my operations" -- text_stream_read is file
+       static, so nothing else can present that set. Without this case,
+       whether a text stream could be wrapped again would depend on the bytes
+       in the file underneath it: ASCII input leaves the inner wrapper at
+       AXL_ENC_UTF8 and UTF-16 input does not.
+
+   Anything else is transforming its bytes -- decoding them (UCS-2) or
+   destroying them (ASCII maps every high byte to '?') -- and the classifier
+   must see the wire. */
+static bool
+source_is_undecoded(AxlStream *s)
+{
+    AxlStreamOps ops;
+
+    /* Answered before the ops block is built, deliberately. This runs on
+       every read, and for a UCS-2 wrapper `read_transcode` drives that read
+       two WIRE BYTES at a time — so it is per-2-bytes-of-input, not per
+       caller read, and the common answer must not cost an 80-byte struct
+       fill that only the nested-wrapper case needs. */
+    if (axl_stream_get_encoding(s) == AXL_ENC_UTF8) {
+        return true;
+    }
+    ops = text_stream_ops();
+    return axl_stream_ctx(s, &ops) != NULL;
+}
+
 static axl_ssize_t
 text_stream_read(void *vctx, void *buf, size_t count)
 {
     TextStreamCtx *c   = (TextStreamCtx *)vctx;
     uint8_t       *out = (uint8_t *)buf;
     size_t         emitted = 0;
+
+    /* Re-checked on every read, and BEFORE anything is served -- including
+       this wrapper's own probe pushback. A caller can reach around a live
+       wrapper and set an encoding on its source, and then both are decoding.
+       Serving the buffered bytes first would push the failure several reads
+       into the future, and a partially-filled buffer would report it as a
+       successful SHORT read instead, i.e. not at all. Live rather than
+       latched: putting the source back revives the wrapper with its probe
+       bytes untouched, because this returns before consuming any of them. */
+    if (!source_is_undecoded(c->src)) {
+        if (!c->conflict_logged) {
+            c->conflict_logged = true;
+            axl_debug("text wrapper: an encoding was set on the wrapped source"
+                      " -- refusing to decode it twice");
+        }
+        return -1;
+    }
 
     if (count == 0) {
         return 0;
@@ -117,12 +185,15 @@ text_stream_read(void *vctx, void *buf, size_t count)
         return (axl_ssize_t)emitted;
     }
 
-    /* Then forward to src. If src errors after we've already emitted
-       pushback bytes, surface a partial success — the err state is
-       on src (caller can re-read it), and the next call will see the
-       error directly. We deliberately don't carry an error sticky
-       bit on the wrapper for this case. */
-    axl_ssize_t got = c->src->read(c->src->ctx, out + emitted, count - emitted);
+    /* Then forward to src, through the PUBLIC read — src is at AXL_ENC_UTF8
+       (or is itself a wrapper), so this is the wire read and the bytes are
+       the same ones the old below-the-transcode call returned. What it adds
+       is that src's own sticky flags now record what we did to it. If src
+       errors after we've already emitted pushback bytes, surface a partial
+       success: the err state IS on src, so the caller can see it, and the
+       next call will hit the error directly. We deliberately don't carry an
+       error sticky bit on the wrapper for this case. */
+    axl_ssize_t got = axl_read(c->src, out + emitted, count - emitted);
     if (got < 0) {
         return emitted ? (axl_ssize_t)emitted : got;
     }
@@ -136,28 +207,60 @@ text_stream_close(void *vctx)
     axl_free(vctx);
 }
 
+/* The text wrapper's operations. Read-only: a wrapper that classified the
+   source's encoding has nothing to say about writing it back, so `write` and
+   everything below it stay as AXL_STREAM_OPS_INIT left them. */
+static AxlStreamOps
+text_stream_ops(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    ops.read  = text_stream_read;
+    ops.close = text_stream_close;
+    return ops;
+}
+
 AxlStream *
 axl_text_stream_wrap(AxlStream *src)
 {
-    if (src == NULL || src->read == NULL) {
-        /* Write-only sources (e.g. axl_stdout) have nothing to probe;
-           refuse to wrap rather than crash on the eager read. */
+    AxlStreamOps ops = text_stream_ops();
+
+    if (!axl_stream_can_read(src)) {
+        /* NULL, or a write-only source (e.g. axl_stdout) with nothing to
+           probe; refuse to wrap rather than crash on the eager read. */
         return NULL;
     }
-    AxlStream *s = axl_stream_new();
-    if (s == NULL) {
+    if (!source_is_undecoded(src)) {
+        /* The source already decodes, so the classifier below would be
+           handed decoded text where the wire belongs. Refused BEFORE the
+           allocation and before any read, which is what lets the header
+           promise the refusal is inert: src keeps its encoding AND its
+           position. Uniform, including for an interactive source — the
+           short-circuit further down decides how a wrapper BEHAVES, not
+           whether one may exist. Logged, because the setting is often made
+           by unrelated code on a stream that is shared -- axl_stdin is a
+           .data object, so it holds what the last caller left on it until
+           someone calls axl_stream_init (or axl_fclose) to put it back. */
+        axl_debug("text wrapper: refusing a source that already decodes"
+                  " -- lend it at AXL_ENC_UTF8 or read it directly");
         return NULL;
     }
     TextStreamCtx *c = axl_calloc(1, sizeof(TextStreamCtx));
     if (c == NULL) {
-        axl_free(s);
         return NULL;
     }
     c->src = src;
 
-    s->ctx   = c;
-    s->read  = text_stream_read;
-    s->close = text_stream_close;
+    AxlStream *s = axl_stream_open_custom(c, &ops, "text");
+    if (s == NULL) {
+        /* A refused open never calls `close`, so the context is ours to
+           release — and text_stream_close IS that release and nothing more,
+           so calling it directly cannot drift from what close does. (The
+           compressing writer next door has to spell its cleanup out instead,
+           because its close finalizes on the way past.) */
+        text_stream_close(c);
+        return NULL;
+    }
 
     /* Interactive / no-EOF sources are already UTF-8 and line-cooked: there
        is no BOM and no headerless UCS-2 to classify, and — critically — they
@@ -179,13 +282,29 @@ axl_text_stream_wrap(AxlStream *src)
         return s;
     }
 
-    /* Eager classification — read up to PROBE_SIZE bytes from src
-       directly (the wrapper's read isn't wired through axl_read yet,
-       so this is wire-side regardless of how src is configured). */
+    /* A source that is ITSELF a text wrapper has already been classified, and
+       its output is UTF-8 by definition — so there is nothing left to
+       classify, and classifying anyway would be actively wrong. The
+       classifier's input would be DECODED text, and decoded UCS-2 whose
+       content contains U+0000 characters is UTF-8 that alternates ASCII with
+       NUL bytes, which is precisely the pattern the headerless sniff fires
+       on. It would decode a second time and eat every NUL. So skip straight
+       to a passthrough: the wrapper forwards, and the inner one's verdict
+       stands. (This is also why source_is_undecoded accepts a wrapper at all
+       — reading one through axl_read decodes exactly once.) */
+    if (axl_stream_ctx(src, &ops) != NULL) {
+        return s;
+    }
+
+    /* Eager classification — read up to PROBE_SIZE bytes from src. The
+       public read IS the wire read here: src was refused above unless it
+       hands its bytes over undecoded. Note this leaves src's own eof/err
+       reflecting the probe, which the header documents — a source shorter
+       than the probe window is already at EOF once wrapped. */
     uint8_t probe[PROBE_SIZE];
     size_t  n = 0;
     while (n < PROBE_SIZE) {
-        axl_ssize_t got = src->read(src->ctx, probe + n, PROBE_SIZE - n);
+        axl_ssize_t got = axl_read(src, probe + n, PROBE_SIZE - n);
         if (got <= 0) break;
         n += (size_t)got;
     }

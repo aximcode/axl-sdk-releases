@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-digest.h:
+/** @file axl-digest.h
  *
  * Message digest checksums: MD5, SHA-1, SHA-256. Mirrors GLib's
  * GChecksum API. Standalone implementations with no external

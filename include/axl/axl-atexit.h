@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-atexit.h:
+/** @file axl-atexit.h
  *
  * POSIX-flavored cleanup registry. Callbacks registered via
  * axl_atexit run in LIFO order (last-registered-first-run) during
@@ -29,6 +28,8 @@
 #ifndef AXL_ATEXIT_H
 #define AXL_ATEXIT_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -41,7 +42,7 @@ extern "C" {
  * Cleanup callback. @a data is the opaque pointer supplied at
  * registration time. Runs on the main thread during _axl_cleanup.
  */
-typedef void (*AxlAtexitFn)(void *data);
+typedef void (*AxlAtexitFn)(void *data) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Register a callback to run during _axl_cleanup.

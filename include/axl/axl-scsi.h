@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-scsi.h:
+/** @file axl-scsi.h
  *
  * SCSI / SAS device identity, geometry, and health over the firmware's
  * EFI_EXT_SCSI_PASS_THRU_PROTOCOL. A Platform Access module and the SCSI arm

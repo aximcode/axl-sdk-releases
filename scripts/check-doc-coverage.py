@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """check-doc-coverage.py — flag public headers missing from the Sphinx docs.
 
-Every public header (`include/axl/*.h`) should have its API rendered in the
+Every public header (`include/axl/*.h` and `*.hpp`) should have its API
+rendered in the
 generated reference, which means it must be named in a `.. doxygenfile:: <h>`
 directive somewhere under `docs/sphinx/`. When a new header lands without that
 wiring, its whole API silently vanishes from the docs — exactly the drift this
@@ -52,9 +53,15 @@ TODO: set[str] = set()
 
 
 def referenced_headers() -> set[str]:
-    """Headers named in any `.. doxygenfile:: <name>.h` directive."""
+    """Headers named in any `.. doxygenfile:: <name>.h[pp]` directive."""
     refs: set[str] = set()
-    pattern = re.compile(r"doxygenfile::\s*(\S+\.h)")
+    # `\.h(?:pp)?` -- literal ".h" with an OPTIONAL "pp", so both extensions
+    # match. Note `\.hpp?` is a different and wrong thing: it means ".hp" plus
+    # an optional "p", which stops matching plain .h altogether. A bare `\.h`
+    # is wrong the other way -- it captures "axl-vector.h" out of
+    # "axl-vector.hpp" and then never matches the real filename, reporting
+    # every .hpp as undocumented while looking like it had checked them.
+    pattern = re.compile(r"doxygenfile::\s*(\S+\.h(?:pp)?)")
     for rst in SPHINX_DIR.rglob("*.rst"):
         for match in pattern.finditer(rst.read_text(encoding="utf-8")):
             refs.add(Path(match.group(1)).name)
@@ -64,6 +71,7 @@ def referenced_headers() -> set[str]:
 def main() -> int:
     refs = referenced_headers()
     headers = sorted(p.name for p in HEADER_DIR.glob("*.h"))
+    headers += sorted(p.name for p in HEADER_DIR.glob("*.hpp"))
 
     missing = [
         h for h in headers

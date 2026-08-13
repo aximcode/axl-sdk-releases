@@ -637,6 +637,19 @@ test_crypto_main(int argc, char **argv)
     test_cipher();
     test_ecdh();
 
+#ifndef AXL_HAVE_TLS
+    /* Each function above still runs without TLS, but only to assert its
+       fail-closed path -- roughly 20 assertions standing in for roughly 87.
+       Name what did not run, so the footer says "SKIPPED" rather than looking
+       like a clean sweep, and so TEST_REQUIRE_TLS=1 can refuse the run. */
+    test_skip("crypto: ECDSA/RSA key handles — keygen, serialize, sign, verify "
+              "(needs AXL_TLS=1)");
+    test_skip("crypto: PK verify known-answer vectors (needs AXL_TLS=1)");
+    test_skip("crypto: AEAD seal/open — AES-GCM, ChaCha20-Poly1305 (needs AXL_TLS=1)");
+    test_skip("crypto: AES-CTR stream cipher (needs AXL_TLS=1)");
+    test_skip("crypto: ECDH key agreement, both curves (needs AXL_TLS=1)");
+#endif
+
     return test_print_results();
 }
 

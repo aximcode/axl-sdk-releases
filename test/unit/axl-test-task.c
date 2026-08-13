@@ -101,6 +101,7 @@ task_test_proc(AxlArena *arena, void *arg)
 {
     size_t *result;
 
+    (void)arg;
     task_ran = true;
 
     if (arena != NULL) {
@@ -114,6 +115,8 @@ task_test_proc(AxlArena *arena, void *arg)
 static void
 task_test_complete(AxlArena *arena, void *arg)
 {
+    (void)arena;
+    (void)arg;
     complete_fired = true;
 }
 
@@ -294,6 +297,7 @@ static void
 async_test_done(AxlArena *arena, void *data)
 {
     (void)arena;
+    (void)data;
     async_done_fired = true;
 }
 

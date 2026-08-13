@@ -33,7 +33,9 @@ axl_diag_startup(
      * activated framework-wide via `set AXL_DIAG 1` rather than
      * each tool reserving a `-v` slot for it. Frees `-v` to carry
      * Linux-counterpart semantics (e.g. `grep -v` = invert match). */
-    const char *diag = axl_getenv("AXL_DIAG");
+    /* Owned copy, not the shell's live string — see axl_getenv. Both the
+     * early return and the fall-through have to release it. */
+    AXL_AUTO_FREE char *diag = axl_getenv("AXL_DIAG");
     if (diag == NULL || *diag == '\0') {
         return;
     }

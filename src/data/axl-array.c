@@ -30,6 +30,14 @@ struct AxlArray {
     size_t    element_size;
     size_t    length;
     size_t    capacity;
+    /* Element destructor, or NULL to borrow. GArray and GPtrArray are merged
+       into this one type, so the array cannot infer which convention the
+       caller wants — clear_is_ptr records which of the two setters supplied
+       it. Value mode hands the callback the element's ADDRESS; pointer mode
+       hands it the STORED pointer. Guessing wrong in pointer mode would free
+       into our own buffer, which is why it is recorded rather than sniffed. */
+    AxlDestroyNotify clear_func;
+    bool             clear_is_ptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -46,8 +54,10 @@ ensure_capacity(AxlArray *a)
         return 0;
     }
 
-    new_cap = a->capacity * 2;
-    new_buf = axl_calloc(1, new_cap * a->element_size);
+    /* capacity 0 is reachable after axl_array_steal(), which hands the buffer
+       away and leaves the array empty-but-usable. Doubling 0 stays 0. */
+    new_cap = (a->capacity != 0) ? a->capacity * 2 : INITIAL_CAPACITY;
+    new_buf = axl_calloc(new_cap, a->element_size);   /* two factors: see sized_new */
     if (new_buf == NULL) {
         axl_error("failed to resize array to %zu elements", new_cap);
         return -1;
@@ -64,6 +74,27 @@ ensure_capacity(AxlArray *a)
     return 0;
 }
 
+/* Run the element destructor over [start, start+count), if one is set.
+   Call BEFORE the slots are moved over or the length is reduced. */
+static void
+clear_elements(AxlArray *a, size_t start, size_t count)
+{
+    size_t i;
+
+    if (a->clear_func == NULL) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        void *slot = a->buffer + (start + i) * a->element_size;
+
+        if (a->clear_is_ptr) {
+            a->clear_func(*(void **)slot);   /* the stored pointer */
+        } else {
+            a->clear_func(slot);             /* the element itself */
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -71,7 +102,14 @@ ensure_capacity(AxlArray *a)
 AxlArray *
 axl_array_new(size_t element_size)
 {
+    return axl_array_sized_new(element_size, 0);
+}
+
+AxlArray *
+axl_array_sized_new(size_t element_size, size_t reserved)
+{
     AxlArray *a;
+    size_t    cap = (reserved != 0) ? reserved : INITIAL_CAPACITY;
 
     if (element_size == 0) {
         return NULL;
@@ -84,10 +122,16 @@ axl_array_new(size_t element_size)
     }
 
     a->element_size = element_size;
-    a->capacity = INITIAL_CAPACITY;
+    a->capacity = cap;
     a->length = 0;
 
-    a->buffer = axl_calloc(1, INITIAL_CAPACITY * element_size);
+    /* Two factors, NOT axl_calloc(1, cap * element_size): pre-multiplying here
+       would wrap silently and hand back a tiny buffer while a->capacity kept
+       the huge value, so the first append would write past the allocation.
+       Passing them separately is what lets axl_calloc's own
+       `size > SIZE_MAX / count` guard actually fire. `reserved` is
+       caller-controlled, so this is reachable in one call. */
+    a->buffer = axl_calloc(cap, element_size);
     if (a->buffer == NULL) {
         axl_warning("buffer allocation failed");
         axl_free(a);
@@ -98,12 +142,65 @@ axl_array_new(size_t element_size)
 }
 
 void
+axl_array_set_clear_func(AxlArray *a, AxlDestroyNotify clear_func)
+{
+    if (a == NULL) {
+        return;
+    }
+
+    a->clear_func = clear_func;
+    a->clear_is_ptr = false;
+}
+
+int
+axl_array_set_ptr_free_func(AxlArray *a, AxlDestroyNotify free_func)
+{
+    /* Refuse a value-mode array rather than reinterpret it: dereferencing a
+       struct slot as a void* and freeing the result corrupts the heap. */
+    if (a == NULL || a->element_size != sizeof (void *)) {
+        return AXL_ERR;
+    }
+
+    a->clear_func = free_func;
+    a->clear_is_ptr = (free_func != NULL);
+    return AXL_OK;
+}
+
+void *
+axl_array_steal(AxlArray *a, size_t *out_len)
+{
+    void *buf;
+
+    if (a == NULL) {
+        if (out_len != NULL) {
+            *out_len = 0;
+        }
+        return NULL;
+    }
+
+    buf = a->buffer;
+    if (out_len != NULL) {
+        *out_len = a->length;   /* ELEMENTS, matching axl_array_len */
+    }
+
+    /* g_array_steal, not g_array_free(arr, FALSE): the array survives, empty
+       and reusable. No clear_func here — ownership TRANSFERS to the caller.
+       capacity 0 is why ensure_capacity and set_size both seed from 0. */
+    a->buffer = NULL;
+    a->length = 0;
+    a->capacity = 0;
+
+    return buf;
+}
+
+void
 axl_array_free(AxlArray *a)
 {
     if (a == NULL) {
         return;
     }
 
+    clear_elements(a, 0, a->length);
     axl_free(a->buffer);
     axl_free(a);
 }
@@ -184,6 +281,7 @@ axl_array_clear(AxlArray *a)
         return;
     }
 
+    clear_elements(a, 0, a->length);
     a->length = 0;
 }
 
@@ -235,6 +333,8 @@ axl_array_remove_index(AxlArray *a, size_t index)
         return AXL_ERR;
     }
 
+    clear_elements(a, index, 1);   /* before the slot is overwritten */
+
     if (index < a->length - 1) {
         axl_memcpy(a->buffer + index * a->element_size,
                  a->buffer + (index + 1) * a->element_size,
@@ -251,6 +351,8 @@ axl_array_remove_index_fast(AxlArray *a, size_t index)
     if (a == NULL || index >= a->length) {
         return AXL_ERR;
     }
+
+    clear_elements(a, index, 1);   /* before the last element lands on it */
 
     if (index < a->length - 1) {
         axl_memcpy(a->buffer + index * a->element_size,
@@ -273,6 +375,8 @@ axl_array_remove_range(AxlArray *a, size_t index, size_t len)
         return AXL_ERR;
     }
 
+    clear_elements(a, index, len);   /* before the survivors shift down */
+
     if (index + len < a->length) {
         axl_memcpy(a->buffer + index * a->element_size,
                  a->buffer + (index + len) * a->element_size,
@@ -291,6 +395,7 @@ axl_array_set_size(AxlArray *a, size_t len)
     }
 
     if (len <= a->length) {
+        clear_elements(a, len, a->length - len);   /* the discarded tail */
         a->length = len;
         return AXL_OK;
     }
@@ -300,11 +405,14 @@ axl_array_set_size(AxlArray *a, size_t len)
         size_t    new_cap = a->capacity;
         uint8_t  *new_buf;
 
+        if (new_cap == 0) {
+            new_cap = INITIAL_CAPACITY;   /* post-steal; *= 2 would spin forever */
+        }
         while (new_cap < len) {
             new_cap *= 2;
         }
 
-        new_buf = axl_calloc(1, new_cap * a->element_size);
+        new_buf = axl_calloc(new_cap, a->element_size);   /* two factors: see sized_new */
         if (new_buf == NULL) {
             axl_error("failed to resize array to %zu elements", new_cap);
             return AXL_ERR;

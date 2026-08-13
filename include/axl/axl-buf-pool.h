@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-buf-pool.h:
+/** @file axl-buf-pool.h
  *
  * Preallocated buffer pool with zero-copy get/put.
  *

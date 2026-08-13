@@ -11,6 +11,8 @@
 #ifndef AXL_SYS_H
 #define AXL_SYS_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -185,7 +187,7 @@ typedef int (*AxlDevicePathFn)(
     uint8_t      subtype,
     const void  *node,
     void        *user
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Walk a device-path node chain with bounded-step safety.
@@ -399,6 +401,11 @@ axl_handle_get_protocol(
  * registering a name already in the built-in well-known table
  * (e.g. "smbios", "simple-fs"), returns `AXL_ERR`. Names are
  * copied internally; @p name does not need to outlive the call.
+ * The copy is stored inline in the fixed table, so a name of 64
+ * bytes or more (NUL included) is rejected with `AXL_ERR` rather
+ * than truncated — protocol names are identifiers, and silently
+ * pinning a different string than the caller asked for would make
+ * every later lookup miss.
  *
  * Process-lifetime: the registration persists for the lifetime of
  * the running image. There is no `axl_protocol_unregister_name`;

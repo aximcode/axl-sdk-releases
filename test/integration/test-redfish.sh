@@ -54,6 +54,9 @@ rfbrowse.efi http://10.0.2.2:${MOCK_PORT} --raw systems
 echo [test-badpass]
 rfbrowse.efi http://10.0.2.2:${MOCK_PORT} -u admin -p wrong system
 
+echo [test-json5-rejected]
+rfbrowse.efi http://10.0.2.2:${MOCK_PORT} --members /redfish/v1/JSON5Trap
+
 echo [TEST DONE]
 NSHEOF
 
@@ -139,6 +142,18 @@ check_section "test-noauth" "401" "No-auth GET returns 401"
 
 # Test 6: Bad password — should fail
 check_section "test-badpass" "401" "Bad password rejected"
+
+# Test 7: a JSON5 response body must be REFUSED.
+#
+# A Redfish service should never send JSON5, so a client that accepts it is
+# applying the wrong dialect to untrusted network input. Driven through
+# --members because that is where rfbrowse actually PARSES: --raw echoes the
+# body without looking at it, and the non-raw display path is a character-level
+# colorizer that does not validate either. Pointed at the mock's /JSON5Trap
+# route, whose body is valid JSON5 (comment, unquoted key, trailing comma) and
+# invalid JSON.
+check_section "test-json5-rejected" "failed to parse JSON response" \
+    "A JSON5 response body is refused, not parsed"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed ($TEST_ARCH)"

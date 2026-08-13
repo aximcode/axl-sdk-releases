@@ -73,6 +73,36 @@ main(int argc, char *argv[])
     axl_printf("MP-POOL: %zu workers; %d waves x %d tasks\r\n",
                W, WAVES, N_CHUNKS);
 
+    /* Worker slots come from a fixed static pool, not the heap, because an
+       AP may write to its slot after the pool that dispatched it is gone.
+       That makes slot RECLAIM a real failure mode with no other symptom:
+       a release that forgets to return slots leaves the table permanently
+       consumed, and only a later pool notices — by silently coming up with
+       fewer workers, or none. Cycle the pool and require the worker count
+       to come back identical. */
+    axl_task_pool_free(pool);
+    /* Enough cycles to consume the whole table if nothing is reclaimed —
+       anything less and a release that reclaims nothing still finds free
+       entries and the check passes vacuously. */
+    const int reclaim_cycles = (int)(AXL_TASK_MAX_WORKERS / W) + 2;
+    for (int cycle = 0; cycle < reclaim_cycles; cycle++) {
+        AxlTaskPool *p2 = axl_task_pool_new();
+        size_t W2 = (p2 != NULL) ? axl_task_pool_worker_count(p2) : 0;
+        if (W2 != W) {
+            axl_printf("MP-POOL: FAIL slot reclaim: cycle=%d workers=%zu "
+                       "expected=%zu\r\n", cycle, W2, W);
+            axl_task_pool_free(p2);
+            return 1;
+        }
+        axl_task_pool_free(p2);
+    }
+    pool = axl_task_pool_new();
+    if (pool == NULL || axl_task_pool_worker_count(pool) != W) {
+        axl_printf("MP-POOL: FAIL pool unusable after reclaim cycles\r\n");
+        axl_task_pool_free(pool);
+        return 1;
+    }
+
     uint64_t invalid_submits = 0;   /* available() over-report signature */
     uint64_t corrupt_waves   = 0;   /* a wave where not every task ran    */
     bool     stalled         = false;

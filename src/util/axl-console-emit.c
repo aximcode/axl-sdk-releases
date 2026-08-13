@@ -8,6 +8,7 @@
 **/
 
 #include "axl-console-emit.h"
+#include <axl/axl-str.h>   /* axl_utf8_encode — the one codepoint->UTF-8 encoder */
 
 // ---------------------------------------------------------------------------
 // Structured-op emit helpers. Only the ops a SIMPLE_TEXT_OUTPUT source can
@@ -75,8 +76,17 @@ sanitize_char(CHAR16 c)
 }
 
 /* Emit a UCS-2 string as UTF-8, chunked, no truncation. BMP only -- the UEFI
-   console is UCS-2 (no surrogate pairs); a lone surrogate code unit would be
-   emitted as its 3-byte form, which the console never produces in practice. */
+   console is UCS-2, so there are no surrogate PAIRS to combine.
+
+   A lone surrogate CODE UNIT therefore has no Unicode scalar value, and emitting
+   its 3-byte shape anyway is WTF-8 -- which `output_text` may not carry, being
+   contractually a UTF-8 run (axl-console-ops.h). No real firmware produces one,
+   but "the producer cannot" is not a reason for the encoder to be able to.
+   axl_utf8_encode refuses it; we SUBSTITUTE U+FFFD rather than drop, because the
+   tap reports CELLS_ONE_PER_CODEPOINT and track_cursor advances a column for that
+   same code unit, so dropping would desync the emitted bytes from the cursor for
+   the rest of the line. Substituting is also what libvterm (UNICODE_INVALID),
+   axl_utf8_decode and the JSON reader/writer do with input they cannot represent. */
 static void
 emit_output_text(AxlConsoleEmit *e, const CHAR16 *s)
 {
@@ -86,21 +96,13 @@ emit_output_text(AxlConsoleEmit *e, const CHAR16 *s)
     char   buf[256];
     size_t n = 0;
     for (; *s != 0; s++) {
-        unsigned c = (unsigned)sanitize_char(*s);
-        char     tmp[3];
-        size_t   tn;
-        if (c < 0x80) {
-            tmp[0] = (char)c;
-            tn = 1;
-        } else if (c < 0x800) {
-            tmp[0] = (char)(0xC0 | (c >> 6));
-            tmp[1] = (char)(0x80 | (c & 0x3F));
-            tn = 2;
-        } else {
-            tmp[0] = (char)(0xE0 | (c >> 12));
-            tmp[1] = (char)(0x80 | ((c >> 6) & 0x3F));
-            tmp[2] = (char)(0x80 | (c & 0x3F));
-            tn = 3;
+        /* tmp is AXL_UTF8_MAX_LEN, which cannot be too small for one codepoint,
+           so a 0 return means "unencodable" and never "did not fit". */
+        char     tmp[AXL_UTF8_MAX_LEN];
+        size_t   tn = axl_utf8_encode((uint32_t)sanitize_char(*s),
+                                      tmp, sizeof(tmp));
+        if (tn == 0) {
+            tn = axl_utf8_encode(0xFFFD, tmp, sizeof(tmp));
         }
         if (n + tn > sizeof(buf)) {
             e->ops->output_text(e->user, buf, n);

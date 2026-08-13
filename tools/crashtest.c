@@ -54,8 +54,13 @@ typedef struct {
     uint32_t    attempts[4];
 } CrashContext;
 
-/* Globals — exercises global variable display */
+/* Globals — exercises global variable display. g_default_config is read by
+   nothing in this program ON PURPOSE: it exists so the crash handler / debugger
+   has a populated struct global to render. __attribute__((used)) states that
+   intent to the compiler, so it survives -fdata-sections + --gc-sections and
+   does not read as dead code to a warning pass. */
 static volatile int         g_run_count;
+__attribute__((used))
 static volatile TestConfig  g_default_config = {
     .name       = "default",
     .version    = 1,

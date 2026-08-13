@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-storage.h:
+/** @file axl-storage.h
  *
  * Cross-transport storage device enumeration + identity — the device-walk
  * layer of the storage-access family (see docs/AXL-Storage-Design.md). It

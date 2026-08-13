@@ -18,6 +18,7 @@
 
 #include <axl/axl-math.h>
 #include <axl/axl-gfx-types.h>
+#include <axl/axl-gfx-surface.h>   /* AxlGfxBuffer */
 #include <uefi/axl-uefi.h>   /* EFI_GRAPHICS_PIXEL_FORMAT */
 
 /* Opaque public types referenced below (full defs in the public
@@ -116,6 +117,26 @@ const AxlGfxVertex *
 axl_gfx_internal_path_verts(
     const AxlGfxPath  *p,
     size_t            *out_n
+    );
+
+/// Allocate an off-screen buffer WITHOUT zeroing it.
+///
+/// axl_gfx_buffer_new zero-fills, because its callers routinely read pixels
+/// they never wrote (blur and the compositor read the whole buffer). This
+/// variant skips that pass and is ONLY for internal sites that provably
+/// overwrite every pixel before any read -- the compositor's per-present
+/// blur scratch being the one that matters, where the zeroing is dead work
+/// on a hot path and axl-mem's byte-at-a-time fill is not cheap.
+///
+/// If you are not certain every pixel is written first, use the public
+/// axl_gfx_buffer_new.
+///
+/// @return new buffer (free with axl_gfx_buffer_free), or NULL on
+///         allocation failure or a zero dimension.
+AxlGfxBuffer *
+axl_gfx_internal_buffer_new_uninit(
+    uint32_t  w,
+    uint32_t  h
     );
 
 #endif /* AXL_GFX_INTERNAL_H */

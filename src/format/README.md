@@ -61,6 +61,23 @@ typedef void (*AxlWriteFunc)(const char *data, size_t len, void *ctx);
 | `%zu` | `size_t` | `axl_printf("%zu", len)` |
 | `%c` | char | `axl_printf("%c", ch)` |
 | `%p` | pointer | `axl_printf("%p", ptr)` |
+| `%f` / `%F` | fixed-point double | `axl_printf("%.2f", 3.14159)` |
+| `%e` / `%E` | exponential double | `axl_printf("%e", 1.5e300)` |
+| `%g` / `%G` | shorter of the two | `axl_printf("%g", 0.0001)` |
 | `%%` | literal `%` | `axl_printf("100%%")` |
 
 Width and zero-padding are supported: `%08x`, `%-20s`, `%5d`.
+
+## Floating Point
+
+The float conversions are built on `axl_dtoa` (Grisu2) — one shortest-digits
+conversion feeds all three styles — so there is no `libm` dependency and no
+arbitrary-precision arithmetic. `%f`/`%e` round that shortest digit string to
+the requested precision, which is accurate to roughly 15 significant digits;
+that is the accepted tradeoff of the design, and it is documented on
+`axl_snprintf` itself. `%f` rounds half-up rather than glibc's half-to-even.
+
+**For bit-exact round-tripping of a double, do not use `%f`/`%g`.** Use
+`axl_double_to_str` (`<axl/axl-str.h>`), which emits the shortest text that
+parses back to the identical double via `axl_str_to_double`. The printf
+family is for humans; the conversion family is for data.

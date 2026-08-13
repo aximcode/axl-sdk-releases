@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-async.h:
+/** @file axl-async.h
  *
  * AP-offloaded async work queue with main-loop integration.
  *

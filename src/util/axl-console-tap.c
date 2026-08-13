@@ -810,6 +810,26 @@ _axl_console_tap_test_puts(const char *ascii)
     wrap_out_string(&g_tap->my_conout, buf);
 }
 
+/* The wide sibling of _axl_console_tap_test_puts: pushes UCS-2 code units
+   verbatim, so a test can drive the non-ASCII half of the encoder (multi-byte
+   BMP text, and the lone surrogate code unit no real firmware produces).
+   NUL-terminated, which costs nothing here because 0x0000 is not a code unit
+   OutputString can carry either. */
+void
+_axl_console_tap_test_puts16(const uint16_t *units)
+{
+    if (g_tap == NULL || units == NULL) {
+        return;
+    }
+    CHAR16 buf[256];
+    size_t i = 0;
+    for (; units[i] != 0 && i < (sizeof(buf) / sizeof(buf[0])) - 1; i++) {
+        buf[i] = (CHAR16)units[i];
+    }
+    buf[i] = 0;
+    wrap_out_string(&g_tap->my_conout, buf);
+}
+
 /* A stub physical ConIn whose ReadKeyStroke returns a key when armed — used to
    prove input_passthrough=false never reads the physical keyboard. */
 static bool s_stub_conin_armed;

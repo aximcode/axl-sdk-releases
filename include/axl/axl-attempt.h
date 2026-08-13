@@ -92,7 +92,7 @@ extern "C" {
  * fields before first use. The strings are stored as pointers, not
  * copied, and must outlive the AxlAttempt.
  *
- * The three lists are stored as `'\n'`-separated NUL-terminated
+ * The three lists are stored as newline-separated NUL-terminated
  * strings in three separate non-volatile variables. Sizing matters:
  * a value larger than its bound cannot be read back at all (the
  * underlying read fails rather than truncating), so lists are trimmed
@@ -270,7 +270,7 @@ axl_attempt_is_quarantined(
 );
 
 /**
- * @brief Read the whole quarantine list as one `'\n'`-separated string.
+ * @brief Read the whole quarantine list as one newline-separated string.
  *
  * Renders the raw stored value. @p out is NUL-terminated on a true
  * return.
@@ -302,7 +302,7 @@ axl_attempt_log(
 );
 
 /**
- * @brief Read the whole result log as one `'\n'`-separated string.
+ * @brief Read the whole result log as one newline-separated string.
  *
  * @p out is NUL-terminated on a true return.
  *

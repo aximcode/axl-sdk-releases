@@ -452,7 +452,7 @@ test_9p_server_reply_codec(void)
     // Rwalk(tag, nwqid=2, two qids of 13 bytes each)
     axl_9p_msg_begin(&w, buf, sizeof(buf), AXL_9P_RWALK, 1);
     axl_9p_w_u16(&w, 2);
-    for (int q = 0; q < 2; q++) { for (int b = 0; b < AXL_9P_QID_LEN; b++) axl_9p_w_u8(&w, (uint8_t)(q*13+b)); }
+    for (int q = 0; q < 2; q++) { for (unsigned b = 0; b < AXL_9P_QID_LEN; b++) axl_9p_w_u8(&w, (uint8_t)(q*13+b)); }
     n = axl_9p_msg_finish(&w);
     test_check(n == 7 + 2 + 2 * AXL_9P_QID_LEN, "server-codec: Rwalk length = hdr + nwqid + 2*qid");
     axl_9p_r_init(&r, buf, n);
@@ -1128,20 +1128,7 @@ test_9p_view_coherence(void)
                    "9p view coherence: the next refresh reports the SAME thing (no EIO-then-EBADF)");
     } else {
         /* No writable fs0: here -- one balancer per check above. */
-        test_check(true, "9p view coherence: fresh-view length SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: original bytes SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: rewrite SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: new length SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: new read length SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: new bytes SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: cased rewrite SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: cased write reaches view SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: unrelated write SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: unrelated write leaves view SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: unrelated cleanup SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: delete SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: refresh reports gone SKIPPED (fs0: not writable)");
-        test_check(true, "9p view coherence: repeat refresh SKIPPED (fs0: not writable)");
+        test_skip_n(14, "9p view coherence: fs0: not writable");
     }
 
     axl_9p_server_free(srv);
@@ -1175,10 +1162,7 @@ test_9p_dir_is_empty(void)
         axl_dir_rmdir(kDir);
     } else {
         /* No writable fs0: here -- one balancer per check above. */
-        test_check(true, "9p dir empty: fresh directory SKIPPED (fs0: not writable)");
-        test_check(true, "9p dir empty: inner file creation SKIPPED (fs0: not writable)");
-        test_check(true, "9p dir empty: non-empty directory SKIPPED (fs0: not writable)");
-        test_check(true, "9p dir empty: emptied directory SKIPPED (fs0: not writable)");
+        test_skip_n(4, "9p dir empty: fs0: not writable");
     }
 }
 
@@ -1280,15 +1264,7 @@ test_9p_fid_release_closes_open_state(void)
         axl_file_delete(kFile);
     } else {
         /* No writable fs0: here -- one balancer per conditional above. */
-        test_check(true, "9p fid release: file-fid view SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: file-fid write stream SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: directory-fid iterator SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: reset_all leak check SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: slot reuse SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: clunk leak check SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: clunked slot reuse SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: reap leak check SKIPPED (fs0: not writable)");
-        test_check(true, "9p fid release: reap slot state SKIPPED (fs0: not writable)");
+        test_skip_n(9, "9p fid release: fs0: not writable");
     }
 
     axl_9p_server_free(srv);
@@ -1313,12 +1289,7 @@ static void
 test_9p_clunk_reports_a_failed_flush(void)
 {
     if (!ff_fs_up()) {
-        axl_printf("SKIP: 9p clunk flush-fail (no shell map for the "
-                   "published volume)\n");
-        test_check(true, "9p clunk flush-fail: write fid SKIP balance");
-        test_check(true, "9p clunk flush-fail: status SKIP balance");
-        test_check(true, "9p clunk flush-fail: slot SKIP balance");
-        test_check(true, "9p clunk flush-fail: control SKIP balance");
+        test_skip_n(4, "9p clunk flush-fail (no shell map for the published volume)");
         return;
     }
 
@@ -1349,9 +1320,7 @@ test_9p_clunk_reports_a_failed_flush(void)
                    "9p clunk flush-fail: a fid with no write stream clunks clean");
     } else {
         test_check(false, "9p clunk flush-fail: server over the fixture volume");
-        test_check(true, "9p clunk flush-fail: status SKIP balance");
-        test_check(true, "9p clunk flush-fail: slot SKIP balance");
-        test_check(true, "9p clunk flush-fail: control SKIP balance");
+        test_skip_n(3, "9p clunk flush-fail: status");
     }
 
     axl_9p_server_free(srv);
@@ -1438,6 +1407,10 @@ test_9p_main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+    /* See axl-test-vterm.c: without this header the harness cannot bracket
+       this binary, so neither the stall detector nor the per-binary leak
+       verdict check covers it. */
+    test_print_header("Axl9p");
 
     test_codec_roundtrip();
     test_codec_byte_layout();

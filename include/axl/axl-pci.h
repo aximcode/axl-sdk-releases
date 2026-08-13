@@ -464,7 +464,7 @@ typedef int (*AxlPciTreeFn)(
     unsigned    depth,
     bool        is_bridge,
     void       *ctx
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Walk the PCI topology in tree order, depth-first per segment.
@@ -778,11 +778,11 @@ axl_pci_ids_subsys_name(
  * @{
  */
 typedef int (*AxlPciIdsVendorFn)(uint16_t vid,
-                                 const char *name, void *ctx);
+                                 const char *name, void *ctx) AXL_CB_NOEXCEPT;
 typedef int (*AxlPciIdsDeviceFn)(uint16_t vid, uint16_t did,
-                                 const char *name, void *ctx);
+                                 const char *name, void *ctx) AXL_CB_NOEXCEPT;
 typedef int (*AxlPciIdsSubsysFn)(uint16_t svid, uint16_t sdid,
-                                 const char *name, void *ctx);
+                                 const char *name, void *ctx) AXL_CB_NOEXCEPT;
 /** @} */
 
 /**

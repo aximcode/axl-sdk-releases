@@ -718,7 +718,7 @@ assumptions).
   feature, not bug. The goal is that *no current consumer code
   path* needs them.
 - **Hiding from advanced consumers.** A power user who wants
-  direct UEFI control can still `#include <uefi/axl-uefi.h>` and
+  direct UEFI control can still `#include <uefi/axl-uefi.h>` (an application must now opt in: `axl-cc --allow-uefi`, CMake `ALLOW_UEFI`; drivers are granted it by image type) and
   call `gBS->...` — axl-sdk doesn't break that. It just stops
   *requiring* it.
 

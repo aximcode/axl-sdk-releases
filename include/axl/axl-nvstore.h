@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-nvstore.h:
+/** @file axl-nvstore.h
  *
  * Platform-agnostic non-volatile key-value storage.
  *
@@ -235,7 +234,7 @@ axl_nvstore_get_attrs(
 typedef int (*AxlNvstoreIterFn)(
     const char *key,   ///< variable name (UTF-8)
     void       *ctx    ///< caller-supplied context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Iterate all keys in a namespace.

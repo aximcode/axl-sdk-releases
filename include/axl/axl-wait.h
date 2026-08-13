@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-wait.h:
+/** @file axl-wait.h
  *
  * Interruptible wait helpers built on AxlLoop.
  *
@@ -73,7 +72,7 @@ void axl_usleep(uint64_t microseconds);
  */
 typedef bool (*AxlCondFn)(
     void *ctx  ///< opaque caller context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * AxlTickFn:
@@ -84,7 +83,7 @@ typedef bool (*AxlCondFn)(
  */
 typedef void (*AxlTickFn)(
     void *ctx  ///< opaque caller context
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Tier 2 — zero-callback convenience

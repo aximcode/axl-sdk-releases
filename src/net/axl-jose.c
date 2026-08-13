@@ -115,6 +115,61 @@ axl_jwk_export_public(const AxlPkKey *key, const char *kid)
 #define JOSE_RSA_N_MAX    512u  /* modulus cap: 4096-bit RSA = 512 bytes. */
 
 // -------------------------------------------------------------------
+// JSON intake — strict, and always a JSON object.
+// -------------------------------------------------------------------
+
+/* Parse a JOSE structure: a JWS protected header, a JWT claims set, a JWK,
+ * or a JWK Set.
+ *
+ * AXL_JSON_STRICT, deliberately, and not AXL_JSON_RELAXED -- the dialect the
+ * SDK reserves for sidecars and config files it did not write. Every
+ * document reaching this function is the opposite case: base64url-decoded
+ * bytes from a token or a JWKS endpoint, i.e. attacker-influenced, and
+ * RFC 7515/7517/7519 all define these structures as ordinary JSON. A JOSE
+ * parser that also accepted comments, unquoted keys, single-quoted strings
+ * and hex literals would be a parser-differential hazard: the JWS signature
+ * covers the base64url TEXT, not our token tree, so any other component
+ * validating the same authenticated bytes with a conforming parser could read
+ * a different document out of them. AXL_JSON_STRICT is exactly the
+ * "attacker-influenced input" case axl-json.h tells callers to use it for.
+ *
+ * The object requirement is the second half, and it is not redundant. A JSON
+ * text is any value (RFC 8259 §2), so `42` and `"x"` parse -- but RFC 7519
+ * §7.2 requires a JWT claims set to be a JSON OBJECT, and RFC 7517 the same
+ * for a JWK. Without this check a validly-signed token whose payload decodes
+ * to `42` verifies: every axl_json_get_* against a non-object root returns
+ * false, which a policy requiring no claims cannot distinguish from "claim
+ * absent". Under a container-root-only reader that was impossible; once the
+ * reader started accepting a bare primitive it had to be said out loud.
+ *
+ * Spelled as a byte test rather than a reader predicate because AxlJson has
+ * no root-type accessor. Safe and exact: under AXL_JSON_STRICT the only bytes
+ * that may precede the root are RFC 8259 whitespace, so the first byte that
+ * is not one of those four IS the root's first byte.
+ *
+ * @return true if @a json is a strict-JSON object, with @a r filled.
+ */
+static bool
+jose_parse_object(const char *json, size_t len, AxlJsonReader *r)
+{
+    if (!axl_json_parse(json, len, AXL_JSON_STRICT, r)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        const char c = json[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            continue;
+        }
+        if (c == '{') {
+            return true;
+        }
+        break;
+    }
+    axl_json_free(r);
+    return false;
+}
+
+// -------------------------------------------------------------------
 // Algorithm names + family.
 // -------------------------------------------------------------------
 
@@ -249,7 +304,7 @@ header_alg(const char *seg, size_t seg_len, AxlJoseAlg *alg_out)
 
     AxlJsonReader r = { 0 };
     bool          ok = false;
-    if (axl_json_parse((const char *)hdr, hdr_len, &r)) {
+    if (jose_parse_object((const char *)hdr, hdr_len, &r)) {
         char alg[16] = { 0 };
         if (axl_json_get_string(&r, "alg", alg, sizeof(alg))) {
             ok = alg_from_name(alg, alg_out);
@@ -556,7 +611,7 @@ axl_jwt_verify(const char *token, size_t token_len, const AxlJoseKey *key,
     }
 
     AxlJsonReader claims = { 0 };
-    if (!axl_json_parse((const char *)payload, payload_len, &claims)
+    if (!jose_parse_object((const char *)payload, payload_len, &claims)
         || !jwt_check_claims(&claims, policy)) {
         axl_json_free(&claims);
         axl_free(payload);
@@ -684,7 +739,7 @@ axl_jwk_parse(const char *json, size_t len, char **kid_out, AxlJoseAlg *alg_out)
         return NULL;
     }
     AxlJsonReader r = { 0 };
-    if (!axl_json_parse(json, len, &r)) {
+    if (!jose_parse_object(json, len, &r)) {
         return NULL;
     }
     AxlPkKey *key = jwk_from_reader(&r, kid_out, alg_out);
@@ -699,7 +754,7 @@ axl_jwks_parse(const char *json, size_t len)
         return NULL;
     }
     AxlJsonReader r = { 0 };
-    if (!axl_json_parse(json, len, &r)) {
+    if (!jose_parse_object(json, len, &r)) {
         return NULL;
     }
 
@@ -777,7 +832,7 @@ axl_jwk_export_public(const AxlPkKey *key, const char *kid)
 
     AxlString    *out = axl_string_new(NULL);
     AxlJsonWriter w;
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
 
     if (alg == AXL_PK_ECDSA_P256 || alg == AXL_PK_ECDSA_P384) {

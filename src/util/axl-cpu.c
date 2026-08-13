@@ -385,7 +385,40 @@ axl_cpu_unregister_exception(AxlCpuExceptionKind kind)
 // state UEFI does not enable, hence the explicit opt-in.
 
 static AxlCpuFeatures g_features;
-static bool           g_features_done = false;
+
+/* One-shot detection state. A plain bool is not enough: axl_cpu_features()
+   is reachable from an AP (an AxlTaskProc asking what it may execute), so
+   publication has to be a single ordered transition rather than a
+   read-modify-write any core can lose. */
+enum {
+    DETECT_NONE    = 0,
+    DETECT_RUNNING = 1,
+    DETECT_DONE    = 2
+};
+static volatile uint32_t g_features_state = DETECT_NONE;
+
+/* Backstop on waiting for another core's detect() to publish. detect()
+   is a handful of CPUID instructions, so any real wait is microseconds;
+   this only bounds the case where the detecting core never returns. */
+#define DETECT_WAIT_SPINS  1000000u
+
+/* BSP-only memo for the per-core dispatch queries -- see the long note on
+   axl_cpu_simd_tier below. Declared here because axl_cpu_enable_avx, further
+   down, is the other half of the same dispatch check and shares the guard. */
+static bool          g_simd_memo_valid   = false;
+static bool          g_avx_memo_valid    = false;
+static bool          g_avx_memo_enabled  = false;
+static volatile bool g_simd_memo_retired = false;
+
+static inline void
+cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+}
 
 #if defined(__x86_64__)
 
@@ -512,23 +545,107 @@ avx_active_here(void)
     return (read_xcr0() & 0x4ull) != 0;   /* XCR0 bit 2 = AVX/YMM state */
 }
 
+/* Does THIS logical processor support AVX + XSAVE, right now?
+
+   A live CPUID rather than a read of the cached feature vector. The
+   cache holds whatever core ran detect() first; on a hybrid part the
+   calling core need not have the same ISA. Gating the XCR0 write on the
+   cache is a fault, not a mis-report: setting XCR0.YMM (bit 2) on a core
+   without AVX #GPs. One CPUID inside a function that is already writing
+   control registers is not a cost worth optimising away. */
+static bool
+avx_supported_here(void)
+{
+    uint32_t a, b, c, d;
+
+    cpuid_count(1, 0, &a, &b, &c, &d);
+    return (c & (1u << 28)) != 0     /* AVX   */
+        && (c & (1u << 26)) != 0;    /* XSAVE */
+}
+
+/* AVX2 on THIS logical processor.
+
+   axl_cpu_simd_tier gates kernel dispatch on this rather than on the
+   cached vector's avx2 bit. Enabling AVX state and having AVX2 are
+   different questions: a core can pass avx_supported_here and still
+   lack AVX2, and dispatching a 256-bit integer kernel there is a #UD. */
+static bool
+avx2_supported_here(void)
+{
+    uint32_t a, b, c, d;
+    uint32_t max_leaf;
+
+    if (!avx_supported_here()) {
+        return false;
+    }
+    cpuid_count(0, 0, &max_leaf, &b, &c, &d);
+    if (max_leaf < 7) {
+        return false;
+    }
+    cpuid_count(7, 0, &a, &b, &c, &d);
+    return (b & (1u << 5)) != 0;     /* AVX2 */
+}
+
+/* AVX-512 Foundation on THIS logical processor. Same reasoning as
+   avx_supported_here; the CPUID.0xD state-component check in
+   axl_cpu_enable_avx512 is complementary, not a substitute — it
+   answers "can XSETBV manage this state", not "does this core have
+   the ISA". */
+static bool
+avx512_supported_here(void)
+{
+    uint32_t a, b, c, d;
+    uint32_t max_leaf;
+
+    cpuid_count(0, 0, &max_leaf, &b, &c, &d);
+    if (max_leaf < 7) {
+        return false;
+    }
+    cpuid_count(7, 0, &a, &b, &c, &d);
+    return (b & (1u << 16)) != 0;    /* AVX-512F */
+}
+
 bool
 axl_cpu_enable_avx(void)
 {
-    const AxlCpuFeatures *f = axl_cpu_features();
-    if (!f->avx || !f->xsave) {
-        return false;
+    /* Same BSP-only memo as axl_cpu_simd_tier, and for the same reason: the
+       two are called together as one dispatch check, so memoising only the
+       tier leaves this half paying CPUID + XGETBV per operation -- measured
+       as the ENTIRE remaining cost once the tier was cached. Enabling is
+       idempotent and the state is per-core and sticky, so on a core already
+       enabled the answer holds until an AP dispatch retires the memo. */
+    if (g_avx_memo_valid && !g_simd_memo_retired) {
+        return g_avx_memo_enabled;
     }
-    if (avx_active_here()) {
-        return true;   /* idempotent — already enabled on this CPU */
+
+    bool enabled;
+    if (!avx_supported_here()) {
+        enabled = false;
+    } else if (avx_active_here()) {
+        enabled = true;          /* idempotent — already enabled on this CPU */
+    } else {
+        /* CR4.OSXSAVE (bit 18) lets XGETBV/XSETBV run and signals OS
+           support for extended state. */
+        write_cr4(read_cr4() | (1ull << 18));
+        /* XCR0 bits 0 (x87), 1 (SSE), 2 (AVX/YMM) — SSE must stay set
+           alongside AVX or XSETBV #GPs. */
+        write_xcr0(read_xcr0() | 0x7ull);
+        enabled = true;
+        /* The tier just CHANGED on this core: axl_cpu_simd_tier gates AVX2 on
+           avx_active_here(), which was false a moment ago and is true now. A
+           memo taken before this point says SSE41 and would survive the very
+           transition that invalidates it -- caught by the pre-existing
+           enable_avx test, which queries the tier both sides of the enable.
+           The core did not change, so the AP guard does not cover this; the
+           STATE changed, and only this function can change it. */
+        g_simd_memo_valid = false;
     }
-    /* CR4.OSXSAVE (bit 18) lets XGETBV/XSETBV run and signals OS
-       support for extended state. */
-    write_cr4(read_cr4() | (1ull << 18));
-    /* XCR0 bits 0 (x87), 1 (SSE), 2 (AVX/YMM) — SSE must stay set
-       alongside AVX or XSETBV #GPs. */
-    write_xcr0(read_xcr0() | 0x7ull);
-    return true;
+
+    if (!g_simd_memo_retired) {
+        g_avx_memo_enabled = enabled;
+        g_avx_memo_valid   = true;
+    }
+    return enabled;
 }
 
 /* Are the AVX-512 state components (opmask + ZMM_Hi256 + Hi16_ZMM)
@@ -545,8 +662,7 @@ avx512_active_here(void)
 bool
 axl_cpu_enable_avx512(void)
 {
-    const AxlCpuFeatures *f = axl_cpu_features();
-    if (!f->avx512f || !f->xsave) {
+    if (!avx512_supported_here() || !avx_supported_here()) {
         return false;
     }
     /* CPUID.0xD.0:EAX advertises which XSAVE state components the
@@ -629,6 +745,12 @@ avx_active_here(void)
     return false;   /* no AVX on AArch64 */
 }
 
+static bool
+avx2_supported_here(void)
+{
+    return false;   /* no AVX2 outside x86 */
+}
+
 #else
 
 static void
@@ -654,32 +776,131 @@ avx_active_here(void)
     return false;
 }
 
+static bool
+avx2_supported_here(void)
+{
+    return false;   /* no AVX2 outside x86 */
+}
+
 #endif
 
 const AxlCpuFeatures *
 axl_cpu_features(void)
 {
-    if (!g_features_done) {
-        detect();
-        g_features_done = true;
+    /* Fast path still needs the acquire. `&g_features` is a fixed static
+       address, so there is no address dependency carrying the ordering:
+       nothing stops the compiler hoisting a plain read of g_features.*
+       above this volatile test (volatile orders volatile accesses against
+       each other, not against ordinary ones), and nothing stops aarch64
+       reordering the two loads in hardware. */
+    if (__atomic_load_n(&g_features_state, __ATOMIC_ACQUIRE) == DETECT_DONE) {
+        return &g_features;
     }
+
+    /* Exactly one core runs detect(). The plain `if (!done) { detect();
+       done = true; }` this replaces was not safe to call from an AP: two
+       cores could run detect() concurrently, and a third could observe
+       done == true before the field writes landed. Worse on a hybrid
+       part, where two cores racing do not even compute the same answer,
+       so an interleaving could publish a vector no single core has. */
+    if (__sync_bool_compare_and_swap(&g_features_state,
+                                     DETECT_NONE, DETECT_RUNNING)) {
+        detect();
+        __sync_synchronize();      /* release — fields visible before the flag */
+        g_features_state = DETECT_DONE;
+    } else {
+        /* Bounded. Every other cross-CPU wait in the SDK has a ceiling,
+           and this one can wedge the BSP with no diagnostic: if the core
+           that won the CAS is terminated inside detect() -- which is
+           exactly what firmware does to a straggling AP -- the state is
+           stuck at DETECT_RUNNING forever and nothing ever resets it.
+           On expiry, detect locally: the result is idempotent and the
+           caller only ever needed an answer, not the shared cache. */
+        size_t spins;
+
+        for (spins = 0; spins < DETECT_WAIT_SPINS; spins++) {
+            if (__atomic_load_n(&g_features_state,
+                                __ATOMIC_ACQUIRE) == DETECT_DONE) {
+                return &g_features;
+            }
+            cpu_relax();
+        }
+
+        axl_warning("CPU feature detection never published; detecting "
+                    "locally");
+        detect();
+        __sync_synchronize();
+    }
+
     return &g_features;
+}
+
+/* Per-call CPUID is the honest answer and, in a hot path, a ruinous one.
+ *
+ * axl_cpu_simd_tier() must describe the CALLING core -- that is the whole
+ * reason it exists rather than reading the cached feature vector -- so it
+ * runs live CPUID. Under virtualisation every CPUID is a VM exit, and a
+ * consumer measured ~1.5s per keystroke from it even after the dispatch was
+ * hoisted out of the row loop to once per operation: their compositor issues
+ * on the order of 10^5 small blends per repaint, so "once per operation" is
+ * nowhere near once per screen.
+ *
+ * The memo below is exact rather than approximate, and rests on a property
+ * UEFI actually guarantees: with no AP ever dispatched, the BSP is the only
+ * core executing AXL code, and the BSP cannot migrate -- there is no
+ * scheduler and no preemption in boot services. So until something starts an
+ * AP, one cached answer IS this core's answer, and serving it costs no CPUID
+ * at all.
+ *
+ * The moment an AP is dispatched that stops holding: two cores with possibly
+ * different ISAs are live, and a shared answer could hand an E-core the
+ * P-core's AVX2 verdict -- the #UD that 7e9b5b97 fixed and that a consumer
+ * has since reproduced empirically. From that point the memo is retired
+ * permanently and every caller pays the live query again. Permanently,
+ * because AXL's AP workers are long-lived: there is no point at which they
+ * are known to be finished, so re-enabling could only ever be a guess.
+ */
+static AxlSimdTier  g_simd_memo_tier    = AXL_SIMD_SCALAR;
+
+void
+axl_cpu_simd_memo_invalidate(void)
+{
+    g_simd_memo_retired = true;
+    g_simd_memo_valid   = false;
+    g_avx_memo_valid    = false;
 }
 
 AxlSimdTier
 axl_cpu_simd_tier(void)
 {
+    if (g_simd_memo_valid && !g_simd_memo_retired) {
+        return g_simd_memo_tier;
+    }
+
     const AxlCpuFeatures *f = axl_cpu_features();
-    if (f->avx2 && avx_active_here()) {
-        return AXL_SIMD_AVX2;
+    /* avx2_supported_here, not f->avx2: the cached vector describes the
+       core that ran detection first. This function decides which
+       instructions a caller will execute, so it has to answer for the
+       core asking -- on a hybrid part the two disagree and the cached
+       answer dispatches a 256-bit kernel into a #UD. */
+    AxlSimdTier tier;
+    if (avx2_supported_here() && avx_active_here()) {
+        tier = AXL_SIMD_AVX2;
+    } else if (f->sse41) {
+        tier = AXL_SIMD_SSE41;
+    } else if (f->sse2 || f->neon) {
+        tier = AXL_SIMD_BASELINE;
+    } else {
+        tier = AXL_SIMD_SCALAR;
     }
-    if (f->sse41) {
-        return AXL_SIMD_SSE41;
+
+    /* Only memoise while the BSP is provably the only core running AXL
+       code. After an AP dispatch this stays retired. */
+    if (!g_simd_memo_retired) {
+        g_simd_memo_tier  = tier;
+        g_simd_memo_valid = true;
     }
-    if (f->sse2 || f->neon) {
-        return AXL_SIMD_BASELINE;
-    }
-    return AXL_SIMD_SCALAR;
+    return tier;
 }
 
 // ---------------------------------------------------------------------------

@@ -775,6 +775,81 @@ dialog veil, and stacked overlapping veils; a single probe pixel cannot see a
 seam. Unblocks AGT C7 Phase 6 (delete the veil readback + the
 clip-aware-`clear()` constraint it forced).
 
+**E11 — Opacity inherits down the surface tree. DONE.** `axl_surface_set_opacity`
+was strictly per-surface: the blit scaled by `s->opacity` with no parent term,
+so the tree — already load-bearing for lifetime (children die with the parent),
+stacking, damage, and hit-testing — was ignored by the one property a scene
+graph normally propagates. A consumer fading a group (a dialog veil plus the
+card hoisted onto its own child surface, which `b1fcfbbe` made practical by
+letting an opaque card sit in front of a veil without collapsing the partial
+re-blur) had to ramp every surface in the group in lockstep by hand: N calls
+per animation frame that must never diverge, one invariant in N places.
+
+**The effective opacity of a surface is its own value times every ancestor's,
+up to and including the root** (`(a*b)/255` per link, truncating — the same
+rounding the blit already uses). Default 255 everywhere, so the product is the
+identity and nothing pre-existing changes. `surf_opaque_rect` gates on the
+EFFECTIVE value, which is what keeps a faded subtree from culling the scene
+behind it — the surface is no longer a straight copy, so it cannot occlude,
+exactly as a directly-faded one cannot. Computed by a parent walk at blit time
+rather than a cached field: the depth is 2–4, it is once per blit *rect* (not
+per pixel), and a cache would need invalidating on `set_parent` and
+`surface_new` — state that can desync for no measurable gain.
+`axl_surface_effective_opacity(s)` exposes the product (Qt's
+`effectiveOpacity()`).
+
+The effective value is always ≤ the own value, so the occlusion gate can only
+get MORE conservative — E11 can never promote a translucent surface to an
+occluder, which is the direction that would break correctness. It can lose
+culling, though, and this compositor has been bitten twice by exactly that
+shape (the 134x and 354x whole-veil re-blur regressions), so state the cost
+plainly: **for the duration of a subtree fade, no surface in that subtree
+occludes.** Fading a container that wraps many `opaque` surfaces therefore
+composites all of them per-pixel every frame of the animation. That is the
+right trade — occlusion is an optimization, never correctness (E3b) — and it is
+transient, but a consumer fading a large opaque subtree should benchmark it
+rather than assume the cull survives. The E10 veil paths are unaffected either
+way: `blur_below` / `s->backdrop_blur` exemptions and `veil_split` all key on
+`backdrop_blur`, never on opacity, so `b1fcfbbe` stays fixed regardless of any
+ancestor's opacity.
+
+*This is a behavior change to a shipped call*, taken deliberately over adding a
+second `set_subtree_opacity` scalar. One concept beats two, and the prior art is
+unanimous that the one concept propagates: Qt's Graphics View multiplies
+`opacity` down the item tree and offers non-propagation only as an opt-out flag
+(`ItemDoesntPropagateOpacityToChildren` — precisely our old behavior, demoted to
+a special case); CSS `opacity` groups; wlroots has only leaf
+`wlr_scene_buffer_set_opacity` and its maintainers' stated direction for this
+exact case is "specify the opacity of an entire subtree". Nobody ships two
+opacity scalars. The change is safe in practice because no caller anywhere —
+the two unit tests, `compositor-selftest.c`, or the toolkit's dialog ramp — sets
+opacity on a surface that has children. The opt-out flag is NOT built: zero
+callers, and it is a purely additive follow-on if one appears. Note the code
+already half-believed in inheritance — `set_opacity` damaged
+`surf_subtree_bounds(s)`, dead conservatism that this makes correct.
+
+**What this does NOT do, stated plainly: it is not a group fade.** Multiplying
+down is algebraically identical to ramping each surface by hand — it removes the
+bookkeeping, not the compositing difference. For an opaque card over a tinted
+veil over a backdrop `B`, at ramp `α`, inherited opacity gives
+`(1-α)·[(1-αv)B + αv·V] + α·C` whereas a true group fade gives `(1-α)·B + α·C`:
+mid-ramp the fading card shows the *tinted* backdrop through it, not the raw
+one. The endpoints agree (`α=0` → raw backdrop, `α=1` → the full dialog), so
+this is a different curve, not a defect. A true group fade needs an offscreen
+subtree render seeded with the backdrop (so `backdrop_blur` still has real
+pixels to frost) and one blend at `α` — tractable, but a per-subtree scratch
+buffer per present, and no consumer has asked for the curve. Deferred, and the
+docstring must not imply otherwise.
+
+Test: default-255 regression guard (every existing opacity assertion holds);
+parent 128 × child 128 → effective 64, exact, against a pixel oracle AND
+`effective_opacity`; the product reaches grandchildren; on a leaf it is
+identical to the old behavior; a faded subtree still does not cull behind it
+(`composited_count`); root opacity fades the whole scene; a surface reparented
+under a translucent parent picks up its factor. Plus an EXACT whole-frame
+oracle for a nested case in the E10 style — a probe pixel cannot see an error
+confined to the parent/child overlap.
+
 **Situational (deferred — consumer-gated, not yet phased):**
 - **Output scale (HiDPI)** — a global scale factor for high-DPI panels;
   cheap, but no consumer is asking yet.
@@ -796,6 +871,7 @@ clip-aware-`clear()` constraint it forced).
 | **E8 — Per-pixel-alpha blit** ✅`d7091409` | `axl_surface_set_per_pixel_alpha` — a 255-opacity surface blends its buffer's OWN alpha (opaque body + soft/transparent gaps, the popup case) and is excluded from occlusion. Reopens the E3b deferral. | E3b blit + occlusion | unit (body/gap/edge/no-cull, exact-value) |
 | **E9 — Chain pointer grabs** ✅ | `axl_compositor_pointer_grab_chain` — confinement spans the union of a contiguous chain-grab run (popup chains: menu → submenu); exclusive `pointer_grab` unchanged (modals). | C5 grab stack | unit (lower-chain-grab routes; modal/nested/LIFO stay green) |
 | **E10 — Backdrop blur** ✅ | `axl_surface_set_backdrop_blur` — blurs the composited backdrop under a surface (the dialog veil), excluded from occlusion; reuses the G6 stack blur | E8 blit + occlusion, `axl_gfx_buffer_blur` | unit (exact blur-oracle match + no-cull) |
+| **E11 — Opacity inherits down the tree** ✅ | `axl_surface_set_opacity` becomes a scene-graph property: effective = own × every ancestor's (root included); `axl_surface_effective_opacity` exposes the product; occlusion gates on the effective value. Behavior change to a shipped call (Qt/CSS semantics); NOT a group fade — same curve as ramping by hand, minus the bookkeeping. | C1 tree, E8 blit + occlusion | unit (default-255 guard, 128×128→64 exact, grandchildren, no-cull, reparent) + whole-frame oracle for a nested case |
 
 **Sequencing.** E1 first (prove the primitive — **spike now**, settle the
 API, then land test-first). E5 ideally read **before/during** E2–E3 so the
@@ -824,7 +900,12 @@ caught the input bug.
 - **Opaque only when fully opaque.** `scene_node_opaque_region` contributes
   nothing unless `opacity == 1` (and, for a rect, `color[3] == 1`) — matching
   our `opacity == 255` gate in `surf_opaque_rect`. A translucent node can't
-  occlude in either compositor.
+  occlude in either compositor. (E11 later made ours the *effective* opacity —
+  own times every ancestor's. wlroots has no equivalent to check against:
+  opacity there is leaf-only, `wlr_scene_buffer_set_opacity`, with no
+  tree-node opacity to inherit from. Its maintainers' stated direction for
+  the group case is nonetheless "specify the opacity of an entire subtree",
+  so the divergence is one of maturity, not of model.)
 - **Region algebra is the substrate.** wlroots leans on `pixman_region32`
   everywhere (visible, opaque, damage); we built `AxlGfxRegion` (E1) for the
   same role. Confirmed this is the load-bearing primitive.

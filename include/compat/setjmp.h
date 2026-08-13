@@ -15,9 +15,18 @@
 #ifndef AXL_COMPAT_SETJMP_H
 #define AXL_COMPAT_SETJMP_H
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef long  jmp_buf[8];
 
 int   setjmp(jmp_buf env);
 void  longjmp(jmp_buf env, int val);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AXL_COMPAT_SETJMP_H */

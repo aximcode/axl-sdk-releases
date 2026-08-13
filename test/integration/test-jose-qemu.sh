@@ -44,7 +44,7 @@ trap cleanup EXIT
 # under TCG (no KVM) on CI runners.
 timeout 200s "$PROJECT_DIR/scripts/run-qemu.sh" --timeout 170 \
     "$EFI" 2>&1 | tee "$LOG" \
-    | grep -iE "jws|jwt|jwk|jose|Results:|EXCEPTION|leak report" || true
+    | grep -iE "jws|jwt|jwk|jose|Results:|EXCEPTION|leak report|bytes at 0x" || true
 
 fail=0
 

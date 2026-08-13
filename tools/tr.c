@@ -394,12 +394,18 @@ run_tr(AxlArgs *a)
         return 1;
     }
 
-    /* Byte stream: delete, translate, then squeeze — GNU's order. */
+    /* Byte stream: delete, translate, then squeeze — GNU's order.
+
+       axl_read, not axl_fread: a filter translates whatever has arrived and
+       moves on. axl_fread would block until the whole 4 KiB is in hand (it
+       loops, as fread must), which on an interactive console means nothing
+       comes out until the user has typed a page. GNU tr reads raw for the
+       same reason. */
     int  prev = -1;    /* last byte EMITTED, for squeeze */
     uint8_t inbuf[4096];
-    size_t got;
-    while ((got = axl_fread(inbuf, 1, sizeof(inbuf), in)) > 0) {
-        for (size_t i = 0; i < got; i++) {
+    axl_ssize_t got;
+    while ((got = axl_read(in, inbuf, sizeof(inbuf))) > 0) {
+        for (size_t i = 0; i < (size_t)got; i++) {
             uint8_t b = inbuf[i];
             if (del && in1[b]) {
                 continue;

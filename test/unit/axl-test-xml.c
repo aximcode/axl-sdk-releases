@@ -5,6 +5,7 @@
 #include "axl-test.h"
 
 #include <axl/axl-xml.h>
+#include <axl/axl-json.h>   /* the alignment is asserted against it */
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -31,7 +32,7 @@ test_writer_empty(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_finish(&w);
     test_check(!axl_xml_writer_error(&w), "empty: no error");
     test_check(axl_string_len(s) == 0, "empty: zero output");
@@ -43,7 +44,7 @@ test_writer_self_closing(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "foo");
     axl_xml_writer_end_element(&w);
     axl_xml_writer_finish(&w);
@@ -57,7 +58,7 @@ test_writer_text(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "foo");
     axl_xml_writer_text(&w, "hello");
     axl_xml_writer_end_element(&w);
@@ -72,7 +73,7 @@ test_writer_attribute(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "foo");
     axl_xml_writer_attribute(&w, "bar", "baz");
     axl_xml_writer_end_element(&w);
@@ -87,7 +88,7 @@ test_writer_multi_attributes(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "foo");
     axl_xml_writer_attribute(&w, "a", "1");
     axl_xml_writer_attribute(&w, "b", "2");
@@ -105,7 +106,7 @@ test_writer_nested(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_start_element(&w, "b");
     axl_xml_writer_end_element(&w);
@@ -121,7 +122,7 @@ test_writer_pretty(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_PRETTY);
+    axl_xml_writer_init(&w, s, AXL_XML_INDENT(2));
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_start_element(&w, "b");
     axl_xml_writer_text(&w, "x");
@@ -141,7 +142,7 @@ test_writer_text_escape(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     axl_xml_writer_text(&w, "a<b>c&d");
     axl_xml_writer_end_element(&w);
@@ -162,7 +163,7 @@ test_writer_text_quotes_pass_through(void)
        quotes. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     axl_xml_writer_text(&w, "a\"b'c");
     axl_xml_writer_end_element(&w);
@@ -178,7 +179,7 @@ test_writer_attr_escape(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     axl_xml_writer_attribute(&w, "k", "a&b<c\"d");
     axl_xml_writer_end_element(&w);
@@ -194,7 +195,7 @@ test_writer_prologue(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_prologue(&w);
     axl_xml_writer_start_element(&w, "root");
     axl_xml_writer_end_element(&w);
@@ -211,7 +212,7 @@ test_writer_doctype(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_doctype(&w, "DellDiag", "DellDiag.dtd");
     axl_xml_writer_start_element(&w, "DellDiag");
     axl_xml_writer_end_element(&w);
@@ -228,7 +229,7 @@ test_writer_doctype_bare(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_doctype(&w, "root", NULL);
     axl_xml_writer_start_element(&w, "root");
     axl_xml_writer_end_element(&w);
@@ -244,7 +245,7 @@ test_writer_textn(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     /* Pass a bigger buffer; only the first 5 chars matter. */
     axl_xml_writer_textn(&w, "abcdefghij", 5);
@@ -261,7 +262,7 @@ test_writer_mixed_content(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "p");
     axl_xml_writer_text(&w, "hello ");
     axl_xml_writer_start_element(&w, "b");
@@ -281,7 +282,7 @@ test_writer_close_without_start(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_end_element(&w);
     axl_xml_writer_finish(&w);
     test_check(axl_xml_writer_error(&w),
@@ -294,7 +295,7 @@ test_writer_attribute_outside_start_tag(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_text(&w, "x");          /* closes start tag */
     axl_xml_writer_attribute(&w, "k", "v"); /* INVALID — too late */
@@ -310,7 +311,7 @@ test_writer_prologue_late(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_prologue(&w);  /* INVALID — must precede elements */
     axl_xml_writer_end_element(&w);
@@ -325,7 +326,7 @@ test_writer_doctype_late(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_doctype(&w, "x", NULL);  /* INVALID — must precede elements */
     axl_xml_writer_end_element(&w);
@@ -340,7 +341,7 @@ test_writer_unclosed_at_finish(void)
 {
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_finish(&w);  /* never closed <a> */
     test_check(axl_xml_writer_error(&w),
@@ -354,7 +355,7 @@ test_writer_pretty_deep(void)
     /* 3-level pretty nesting locks the indent escalation. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_PRETTY);
+    axl_xml_writer_init(&w, s, AXL_XML_INDENT(2));
     axl_xml_writer_start_element(&w, "a");
     axl_xml_writer_start_element(&w, "b");
     axl_xml_writer_start_element(&w, "c");
@@ -376,7 +377,7 @@ test_writer_text_empty(void)
     /* text("") is a documented no-op; element still self-closes. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     axl_xml_writer_text(&w, "");
     axl_xml_writer_end_element(&w);
@@ -392,7 +393,7 @@ test_writer_attr_empty_name(void)
     /* Empty attribute name is rejected with sticky error. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "x");
     axl_xml_writer_attribute(&w, "", "value");
     axl_xml_writer_end_element(&w);
@@ -408,7 +409,7 @@ test_writer_prologue_plus_doctype(void)
     /* Prologue then doctype, in either order before any element. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_prologue(&w);
     axl_xml_writer_doctype(&w, "root", "root.dtd");
     axl_xml_writer_start_element(&w, "root");
@@ -430,7 +431,7 @@ test_writer_max_depth(void)
        should leave us at the cap and the sticky error set. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     for (int i = 0; i < AXL_XML_WRITER_MAX_DEPTH; i++) {
         axl_xml_writer_start_element(&w, "d");
     }
@@ -439,6 +440,12 @@ test_writer_max_depth(void)
     axl_xml_writer_start_element(&w, "overflow");
     test_check(axl_xml_writer_error(&w),
                "max-depth: over-cap sets sticky error");
+    /* axl_xml_writer_finish is the ONLY thing that releases the strdup'd
+       element-name stack, error path included — walking away from a writer
+       with 64 names on it leaked all 64 (caught by the teardown leak gate,
+       test/integration/common-test.sh). Nothing about the sticky error
+       excuses skipping it. */
+    axl_xml_writer_finish(&w);
     axl_string_free(s);
 }
 
@@ -450,7 +457,7 @@ test_writer_propfind_shape(void)
        emit_entry. */
     AxlString    *s = axl_string_new(NULL);
     AxlXmlWriter  w;
-    axl_xml_writer_init(&w, s, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
     axl_xml_writer_start_element(&w, "D:multistatus");
     axl_xml_writer_attribute(&w, "xmlns:D", "DAV:");
     axl_xml_writer_start_element(&w, "D:response");
@@ -681,6 +688,30 @@ test_reader_numeric_entities(void)
                t.type == AXL_XML_TOKEN_TEXT &&
                text_eq(&t, "AB"),
                "reader-numeric-entities: &#65;&#x42; → AB");
+    axl_xml_reader_free(r);
+}
+
+/* The 2-, 3- and 4-byte arms of the character-reference encoder. Only the
+   1-byte arm (&#65;) had coverage, so a botched encode above U+007F would have
+   gone unnoticed by the whole binary. Written as byte arrays rather than
+   escaped literals so the assertion pins the exact wire bytes. */
+static void
+test_reader_multibyte_entities(void)
+{
+    static const char expect[] = {
+        (char)0xC3, (char)0xA9,                                     /* U+00E9  */
+        (char)0xE2, (char)0x82, (char)0xAC,                         /* U+20AC  */
+        (char)0xF0, (char)0x9F, (char)0x98, (char)0x80,             /* U+1F600 */
+        '\0'
+    };
+    AxlXmlReader *r = reader_from("<x>&#xE9;&#x20AC;&#x1F600;</x>");
+    AxlXmlToken   t;
+    axl_xml_reader_next(r, &t);  /* START */
+    test_check(axl_xml_reader_next(r, &t) &&
+               t.type == AXL_XML_TOKEN_TEXT &&
+               t.text_len == sizeof(expect) - 1 &&
+               text_eq(&t, expect),
+               "reader-multibyte-entities: 2/3/4-byte references encode exactly");
     axl_xml_reader_free(r);
 }
 
@@ -1147,6 +1178,119 @@ test_reader_propfind_roundtrip(void)
     axl_xml_reader_free(r);
 }
 
+/* --- AxlXmlFlags: the alignment contract ------------------------------- */
+
+/* The indent WIDTH is a parameter now; it was hardcoded at 2. Asserted as
+   whole documents, not substrings: the newlines and leading spaces ARE the
+   thing under test, and a substring match steps over exactly them. */
+static void
+test_writer_indent_width(void)
+{
+    struct { uint32_t n; const char *want; } row[] = {
+        { 0, "<a>\n<b>x</b>\n</a>\n"     },
+        { 1, "<a>\n <b>x</b>\n</a>\n"    },
+        { 2, "<a>\n  <b>x</b>\n</a>\n"   },
+        { 4, "<a>\n    <b>x</b>\n</a>\n" },
+    };
+    for (size_t i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+        AxlString    *s = axl_string_new(NULL);
+        AxlXmlWriter  w;
+        axl_xml_writer_init(&w, s, axl_xml_indent(row[i].n));
+        axl_xml_writer_start_element(&w, "a");
+        axl_xml_writer_start_element(&w, "b");
+        axl_xml_writer_text(&w, "x");
+        axl_xml_writer_end_element(&w);
+        axl_xml_writer_end_element(&w);
+        axl_xml_writer_finish(&w);
+        test_check(!axl_xml_writer_error(&w) && str_equals(s, row[i].want),
+                   "xmlflags: the indent WIDTH is honoured, not hardcoded at 2");
+        axl_string_free(s);
+    }
+}
+
+/* AXL_XML_DEFAULT (zero) is compact, and INDENT(0) is NOT the same thing.
+   That difference is the whole reason HAS_INDENT is a separate bit. */
+static void
+test_writer_default_is_compact(void)
+{
+    AxlString    *s = axl_string_new(NULL);
+    AxlXmlWriter  w;
+    axl_xml_writer_init(&w, s, AXL_XML_DEFAULT);
+    axl_xml_writer_start_element(&w, "a");
+    axl_xml_writer_start_element(&w, "b");
+    axl_xml_writer_text(&w, "x");
+    axl_xml_writer_end_element(&w);
+    axl_xml_writer_end_element(&w);
+    axl_xml_writer_finish(&w);
+    test_check(!axl_xml_writer_error(&w) && str_equals(s, "<a><b>x</b></a>"),
+               "xmlflags: AXL_XML_DEFAULT is compact - no newline, no indent");
+    axl_string_free(s);
+
+    s = axl_string_new(NULL);
+    axl_xml_writer_init(&w, s, AXL_XML_INDENT(0));
+    axl_xml_writer_start_element(&w, "a");
+    axl_xml_writer_start_element(&w, "b");
+    axl_xml_writer_text(&w, "x");
+    axl_xml_writer_end_element(&w);
+    axl_xml_writer_end_element(&w);
+    axl_xml_writer_finish(&w);
+    test_check(!axl_xml_writer_error(&w)
+               && str_equals(s, "<a>\n<b>x</b>\n</a>\n"),
+               "xmlflags: INDENT(0) means newlines with ZERO indent, which is "
+               "why HAS_INDENT is a separate bit");
+    axl_string_free(s);
+}
+
+/* The point of the realignment: the bit that used to mean "XML pretty" is
+   JSON's ALLOW_COMMENTS, and XML must now REFUSE it rather than pretty-print. */
+static void
+test_writer_refuses_foreign_flags(void)
+{
+    AxlString    *s = axl_string_new(NULL);
+    AxlXmlWriter  w;
+
+    axl_xml_writer_init(&w, s, (AxlXmlFlags)1 << 0);  /* AXL_JSON_ALLOW_COMMENTS */
+    test_check(axl_xml_writer_error(&w),
+               "xmlflags: a bit XML does not define is REFUSED, not ignored - "
+               "bit 0 is JSON's ALLOW_COMMENTS and used to mean XML pretty");
+    axl_string_free(s);
+
+    s = axl_string_new(NULL);
+    axl_xml_writer_init(&w, s, AXL_XML_INDENT(2) | ((AxlXmlFlags)1 << 12));
+    test_check(axl_xml_writer_error(&w),
+               "xmlflags: a foreign bit ALONGSIDE a valid one is refused too, "
+               "so a partial request cannot half-apply");
+    axl_string_free(s);
+}
+
+/* The alignment asserted as an identity rather than described in a comment:
+   if these drift, handing one writer the other's indent stops being correct
+   and becomes a silent trap again. */
+static void
+test_flags_agree_with_json(void)
+{
+    test_check(AXL_XML_INDENT(2) == AXL_JSON_INDENT(2)
+               && AXL_XML_INDENT(7) == AXL_JSON_INDENT(7),
+               "xmlflags: AXL_XML_INDENT is bit-for-bit AXL_JSON_INDENT, which "
+               "is what makes cross-use correct instead of silent");
+    test_check(AXL_XML_HAS_INDENT == AXL_JSON_HAS_INDENT
+               && AXL_XML_INDENT_MASK == AXL_JSON_INDENT_MASK
+               && AXL_XML_INDENT_MAX == AXL_JSON_INDENT_MAX,
+               "xmlflags: and so are the presence bit, the width mask and the "
+               "maximum");
+    test_check((AXL_XML_KNOWN_MASK & 0x3FFu) == 0,
+               "xmlflags: XML defines no bit in JSON's dialect range, so a "
+               "dialect flag can never mean something here");
+    test_check(AXL_XML_INDENT_OF(AXL_XML_INDENT(64)) == AXL_XML_INDENT_MAX
+               && AXL_XML_INDENT_OF(axl_xml_indent(1000)) == AXL_XML_INDENT_MAX,
+               "xmlflags: an over-large width CLAMPS; masking would wrap it to "
+               "a SMALLER indent");
+    uint32_t    side = 3;
+    AxlXmlFlags once = axl_xml_indent(side++);
+    test_check(side == 4 && once == AXL_XML_INDENT(3),
+               "xmlflags: axl_xml_indent evaluates n exactly once");
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1165,6 +1309,10 @@ test_xml_main(int argc, char **argv)
     test_writer_multi_attributes();
     test_writer_nested();
     test_writer_pretty();
+    test_writer_indent_width();
+    test_writer_default_is_compact();
+    test_writer_refuses_foreign_flags();
+    test_flags_agree_with_json();
     test_writer_text_escape();
     test_writer_text_quotes_pass_through();
     test_writer_attr_escape();
@@ -1195,6 +1343,7 @@ test_xml_main(int argc, char **argv)
     test_reader_mixed_content();
     test_reader_named_entities();
     test_reader_numeric_entities();
+    test_reader_multibyte_entities();
     test_reader_attr_entity();
     test_reader_comment_skip();
     test_reader_pi_skip();

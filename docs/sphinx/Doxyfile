@@ -7,7 +7,7 @@ PROJECT_BRIEF          = "AximCode Library for UEFI"
 
 # Input
 INPUT                  = ../../include/axl
-FILE_PATTERNS          = *.h
+FILE_PATTERNS          = *.h *.hpp
 RECURSIVE              = NO
 EXCLUDE_PATTERNS       = *-impl.h
 
@@ -30,10 +30,15 @@ INPUT_FILTER           = ./doxy-filter.sh
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = NO
+# AXL_CB_NOEXCEPT is stripped like the other decorators: Breathe hands the
+# typedef to Sphinx's C domain, which cannot parse a trailing token after
+# the parameter list and emits "Invalid C declaration" for every callback
+# that carries it. The contract is documented in prose on the macro itself.
 PREDEFINED             = EFIAPI= \
                          __attribute__(x)= \
                          AXL_WARN_UNUSED= \
-                         AXL_NORETURN=
+                         AXL_NORETURN= \
+                         AXL_CB_NOEXCEPT=
 
 # Output — XML only (Breathe consumes this)
 GENERATE_XML           = YES
@@ -53,6 +58,12 @@ EXCLUDE_SYMBOLS        = AXL_WARN_UNUSED \
 QUIET                  = YES
 WARN_IF_UNDOCUMENTED   = NO
 WARN_NO_PARAMDOC       = NO
+# Zero-warning gate. check-doc-coverage.py catches a header with no
+# doxygenfile directive; it cannot see a dangling \ref, a half-documented
+# parameter list, or a malformed code span. Those accumulated to 27
+# distinct warnings precisely because nothing failed on them.
+# FAIL_ON_WARNINGS reports every warning, then exits non-zero.
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
 SORT_MEMBER_DOCS       = NO
 SHOW_INCLUDE_FILES     = NO
 FULL_PATH_NAMES        = NO

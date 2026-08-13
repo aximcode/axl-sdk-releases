@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-radix-tree.h:
+/** @file axl-radix-tree.h
  *
  * Radix tree (compact prefix tree) with string keys. Supports exact
  * lookup, longest-prefix lookup, insert, remove, and iteration.

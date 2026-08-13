@@ -126,7 +126,7 @@ typedef bool (*AxlFvFileFn)(
     const AxlGuid *file_guid,
     uint8_t        file_type,
     void          *ctx
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Enumerate every file in a firmware volume, by name GUID.

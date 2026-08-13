@@ -41,9 +41,16 @@ cast at the boundary.
 | `axl_sqrt` | Newton's method internally; negative input clamps to 0 |
 | `axl_fmod` | `x - trunc(x/y) * y`; zero-divisor returns 0 |
 | `axl_sin` / `axl_cos` | 6-term Taylor with constant-time range reduction |
+| `axl_isnan` / `axl_isinf` / `axl_isfinite` | IEEE-754 special-value predicates |
 
 Constants `AXL_MATH_PI`, `AXL_MATH_HALF_PI`, `AXL_MATH_TWO_PI` are exposed as
-macros for trig callers that want pinned-precision values.
+macros for trig callers that want pinned-precision values. `AXL_MATH_INF`,
+`AXL_MATH_NAN`, `AXL_MATH_DBL_MAX`, and `AXL_MATH_DBL_TRUE_MIN` expose the
+IEEE-754 special values and range limits (built via division rather than
+`<float.h>`/`INFINITY`, which the freestanding build has neither of).
+**Never compare against `AXL_MATH_NAN` with `==`** — NaN is unequal to
+itself by definition, so `x == AXL_MATH_NAN` is always false regardless of
+whether `x` is NaN; use `axl_isnan(x)` instead.
 
 ## Accuracy
 
@@ -54,6 +61,7 @@ macros for trig callers that want pinned-precision values.
 | `sqrt` | ~1e-12 | 10 Newton iterations |
 | `fmod` | ~1e-12 | Truncated quotient |
 | `sin`, `cos` | ~1e-7 | 6-term Taylor through `x¹¹/11!` |
+| `isnan`, `isinf`, `isfinite` | exact | pure comparisons, no approximation |
 
 ## Hardware fast paths
 

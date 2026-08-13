@@ -27,6 +27,17 @@
     int    pen_pixel = axl_floori(p.x);   // round-down to int pixel
     double phase    = axl_sin(t * 2.0);   // animation easing
     @endcode
+
+    ACCURACY CONTRACT — read before mixing this module with the
+    conversion APIs.  AxlMath is deliberately APPROXIMATE: its
+    results are good to roughly double precision for non-extreme
+    inputs, which is right for UI coordinates and easing curves and
+    wrong for anything that must round-trip.  The string/number
+    conversions in <axl/axl-str.h> (axl_str_to_double,
+    axl_double_to_str) are by contrast CORRECTLY ROUNDED and
+    bit-exact.  Scaling a value you parsed exactly by axl_pow(10, n)
+    silently discards the exactness you just paid for; use the
+    conversion APIs for serialization and this module for geometry.
 **/
 
 #ifndef AXL_MATH_H
@@ -64,6 +75,57 @@ extern "C" {
 
 /// Radians → degrees conversion factor (180 / π).
 #define AXL_MATH_RAD_TO_DEG 57.29577951308232
+
+// ===================================================================
+// IEEE-754 special values
+// ===================================================================
+
+/// Positive infinity. Built by division rather than a literal — the
+/// freestanding build has no <float.h> and no INFINITY macro.
+#define AXL_MATH_INF            (1.0 / 0.0)
+
+/// A quiet NaN. Note NaN != NaN, so never compare against this;
+/// use axl_isnan().
+#define AXL_MATH_NAN            (0.0 / 0.0)
+
+/// Largest finite double, 2^1024 - 2^971.
+#define AXL_MATH_DBL_MAX        1.7976931348623157e308
+
+/// Smallest positive SUBNORMAL double, 2^-1074.
+#define AXL_MATH_DBL_TRUE_MIN   4.9406564584124654e-324
+
+/**
+ * @brief True if @a x is NaN (Not a Number).
+ *
+ * NaN is the only value that compares unequal to itself, which is
+ * exactly how this is implemented — no libm, no bit inspection.
+ *
+ * @return true if @a x is NaN.
+ */
+bool
+axl_isnan(
+    double  x  ///< value to test
+);
+
+/**
+ * @brief True if @a x is positive or negative infinity.
+ *
+ * @return true if @a x is +inf or -inf.
+ */
+bool
+axl_isinf(
+    double  x  ///< value to test
+);
+
+/**
+ * @brief True if @a x is neither NaN nor infinite.
+ *
+ * @return true if @a x is a finite number (including zero and subnormals).
+ */
+bool
+axl_isfinite(
+    double  x  ///< value to test
+);
 
 // ===================================================================
 // Rounding / sign

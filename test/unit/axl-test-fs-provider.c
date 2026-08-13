@@ -579,6 +579,19 @@ test_force_close_on_unpublish(void)
     EFI_STATUS s = fh->Read(fh, &sz, b);
     test_check(s == EFI_DEVICE_ERROR,
                "fs-provider: stale handle Read returns DEVICE_ERROR");
+
+    /* Closing an ORPHANED handle still reclaims its thunk. Unpublish
+       deliberately leaves the thunk allocated — a UEFI consumer may hold the
+       EFI_FILE_PROTOCOL pointer indefinitely and the spec does not bound
+       that — so Close is the only reclaim point, and a test that walks away
+       without calling it leaks (which is exactly what the teardown leak gate
+       caught here). Close after the orphan step touches no Publication and
+       makes no provider call; per UEFI 2.11 13.5.4 it must still say
+       SUCCESS. Nothing may dereference fh or root after this point. */
+    test_check(fh->Close(fh) == EFI_SUCCESS,
+               "fs-provider: Close on an orphaned handle returns SUCCESS");
+    test_check(root->Close(root) == EFI_SUCCESS,
+               "fs-provider: Close reclaims the orphaned root thunk");
 }
 
 static void
@@ -863,7 +876,7 @@ liar_read(AxlFsProviderFile *file, void *buf, size_t *inout_size)
     size_t avail = (file->cursor < LIAR_FILE_SIZE)
                  ? (LIAR_FILE_SIZE - file->cursor) : 0u;
     size_t n = (*inout_size < avail) ? *inout_size : avail;
-    axl_memcpy(buf, LIAR_FILE_BODY + file->cursor, n);
+    axl_memcpy(buf, &LIAR_FILE_BODY[file->cursor], n);
     file->cursor += n;
     *inout_size = n;
     return AXL_FS_OK;
@@ -991,12 +1004,7 @@ test_truncate_over_size_ignoring_provider(void)
         test_check(axl_volume_unmap(map) == AXL_OK,
                    "liar-fs: test mapping removed");
     } else {
-        axl_printf("SKIP: liar-fs truncate (no shell map for the "
-                   "published volume)\n");
-        test_check(true, "liar-fs: truncate SKIP balance");
-        test_check(true, "liar-fs: truncate SKIP balance");
-        test_check(true, "liar-fs: truncate SKIP balance");
-        test_check(true, "liar-fs: truncate SKIP balance");
+        test_skip_n(4, "liar-fs truncate (no shell map for the published volume)");
     }
 
     axl_fs_provider_unpublish(handle);

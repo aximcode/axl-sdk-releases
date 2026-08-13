@@ -432,7 +432,7 @@ on_propfind(AxlHttpRequest *req, AxlHttpResponse *resp, void *data)
     }
 
     AxlXmlWriter xw;
-    axl_xml_writer_init(&xw, out, AXL_XML_WRITER_DEFAULT);
+    axl_xml_writer_init(&xw, out, AXL_XML_DEFAULT);
     axl_xml_writer_prologue(&xw);
     axl_xml_writer_start_element(&xw, "D:multistatus");
     axl_xml_writer_attribute(&xw, "xmlns:D", "DAV:");

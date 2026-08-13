@@ -1588,7 +1588,10 @@ load_sibling_via_shell_path(
     )
 {
     const char *argv0 = axl_app_argv0();
-    const char *path  = axl_getenv("path");
+    /* axl_getenv hands back an OWNED copy, not the shell's live string —
+     * every return below is an exit from this function, so the ownership
+     * has to be attached to the variable rather than remembered. */
+    AXL_AUTO_FREE char *path = axl_getenv("path");
     if (argv0 == NULL || argv0[0] == '\0' || path == NULL) {
         return AXL_NOT_FOUND;
     }

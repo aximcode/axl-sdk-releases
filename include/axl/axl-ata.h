@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-ata.h:
+/** @file axl-ata.h
  *
  * ATA/SATA device identity and health (SMART) over the firmware's
  * EFI_ATA_PASS_THRU_PROTOCOL. A Platform Access module and the ATA arm of

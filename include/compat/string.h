@@ -8,6 +8,11 @@
 
 #include <stddef.h>
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void  *memcpy(void *dst, const void *src, size_t n);
 void  *memset(void *s, int c, size_t n);
 void  *memmove(void *dst, const void *src, size_t n);
@@ -18,5 +23,9 @@ int    strncmp(const char *a, const char *b, size_t n);
 char  *strncpy(char *dst, const char *src, size_t n);
 char  *strchr(const char *s, int c);
 char  *strstr(const char *haystack, const char *needle);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

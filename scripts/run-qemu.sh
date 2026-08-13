@@ -166,6 +166,10 @@ BOOT_TARGET=false   # --boot-target: stage the app AS \EFI\BOOT\BOOTx64.EFI (the
                     # how a console-hosting app (axterm, SoftBMC) really ships.
 EFI_ARGS=()
 SENDKEY_SEQ=""   # space-separated QEMU monitor key tokens to inject (--screenshot)
+SENDKEY_AFTER="" # ERE the guest must print on serial before --sendkey types
+SENDKEY_SETTLE_MS=""  # trailing settle after the last key (default 1500)
+SCREENSHOT_AFTER=""   # ERE the guest must print (post-injection) before capture
+SCREENSHOT_AFTER_COUNT="" # wait for the Nth match, not the first (default 1)
 SENDMOUSE_SEQ="" # space-separated "fx,fy[,click]" absolute-pointer moves (--screenshot, QMP)
 HOLDKEY_SEQ=""   # space-separated "qcode:ms" held keypresses (--screenshot, QMP)
 # CPU-spike detection knobs come from axl-common.sh; the KVM/TCG-aware threshold,
@@ -228,6 +232,10 @@ while [[ $# -gt 0 ]]; do
         --hostfwd)    HOSTFWDS+=("$2"); shift 2 ;;
         --extra)      EXTRA_FILES+=("$2"); shift 2 ;;
         --sendkey)    SENDKEY_SEQ+=" $2"; shift 2 ;;
+        --sendkey-after) SENDKEY_AFTER="$2"; shift 2 ;;
+        --sendkey-settle) SENDKEY_SETTLE_MS="$2"; shift 2 ;;
+        --screenshot-after) SCREENSHOT_AFTER="$2"; shift 2 ;;
+        --screenshot-after-count) SCREENSHOT_AFTER_COUNT="$2"; shift 2 ;;
         --sendmouse)  SENDMOUSE_SEQ+=" $2"; shift 2 ;;
         --holdkey)    HOLDKEY_SEQ+=" $2"; shift 2 ;;
         --qemu-arg)   EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
@@ -362,6 +370,59 @@ Options:
                            "h i spc t h e r e", "ctrl-s", "ret") after the
                            app is up, then capture. Repeatable; auto-adds
                            a USB keyboard on aarch64.
+  --sendkey-after ERE      With --sendkey: wait until the guest prints a line
+                           matching ERE on serial BEFORE typing, instead of
+                           typing at SHOT_WAIT. Use it whenever the host may
+                           be loaded: SHOT_WAIT is a wall clock and does not
+                           move when the guest boots slower, so the leading
+                           keystrokes land before the app binds ConIn and the
+                           app sees a truncated sequence. Have the app print a
+                           marker once it is ready and gate on that. Bounded
+                           by --timeout; on expiry it types anyway and warns.
+  --sendkey-settle MS      With --sendkey: how long to wait after the LAST key
+                           before capturing, for the app to process and
+                           repaint. Default 1500. This is a wall clock and does
+                           not move when the host slows down -- prefer
+                           --screenshot-after, and reach for this only when the
+                           guest cannot print a marker.
+  --screenshot-after ERE   With --screenshot: wait until the guest prints a
+                           line matching ERE AFTER the keys are injected, then
+                           capture. The trailing-edge counterpart to
+                           --sendkey-after: gates the capture on the guest
+                           having stopped writing the framebuffer rather than
+                           on a timer. Without it, `screendump` can read a
+                           frame mid-write and produce a TORN capture whose
+                           widgets disagree with each other.
+                           THE MARKER MUST IDENTIFY THE FINAL PAINT. An app
+                           that repaints after every key emits its marker at
+                           key 1; that match lands past the offset and
+                           satisfies this gate immediately, capturing the torn
+                           frame it was meant to prevent. Either make the
+                           marker self-identifying (e.g. "PAINT n=3" and match
+                           that exact line) or use --screenshot-after-count.
+                           Only matches output produced after injection began,
+                           so a stale earlier marker cannot satisfy it.
+                           Bounded by --timeout; on expiry it captures anyway
+                           and warns.
+  --screenshot-after-count N
+                           With --screenshot-after: wait for the Nth match past
+                           the injection point instead of the first, so an app
+                           whose marker is dumb ("painted") still gets a correct
+                           gate. Default 1. If the pattern ends up matching MORE
+                           than N times the run warns, because that means the
+                           capture was gated on an earlier paint.
+                           PREFER A SELF-IDENTIFYING MARKER. This ordinal counts
+                           PAINTS, host-side, so it needs you to know how many
+                           paints an interaction causes -- and paints are
+                           routinely NOT 1:1 with keys: fades, repaints issued
+                           part-way through a handler, and a deliberate
+                           opacity-0 frame all break it, each of which a
+                           consumer hit in practice. A marker naming the INPUT
+                           ("PAINT n=20") splits the problem the right way: the
+                           host says which KEY to wait for, the guest decides
+                           when that key has settled, and neither side has to
+                           model the other's frame cadence. Use this flag when
+                           you cannot change the guest.
   --sendmouse "fx,fy[,click]"
                            With --screenshot: move the absolute pointer to
                            screen-fraction (fx,fy) in [0,1] via QMP (a
@@ -727,10 +788,39 @@ if [[ -n "$_axl_tmp_base" ]]; then
     # what makes this safe under the parallel integration pool: a dir in its
     # brief create-then-stage window is seconds old, so it can never be mistaken
     # for a leak and rm'd out from under a concurrent run.
+    #
+    # Depth 2, not 1. During a parallel run this makes no difference: the
+    # runner exports its axl-itest.* base AS $AXL_QEMU_TMPDIR, so the per-guest
+    # dirs sit at depth 1 from here. The blind spot is AFTERWARDS -- once that
+    # run is gone, a later standalone invocation searches /dev/shm, where the
+    # same dirs are at depth 2 under a leftover axl-itest.*/. At depth 1 a leak
+    # from a hard-killed parallel run could never be swept, which is exactly
+    # how five orphans sat for three days.
     while IFS= read -r local_d; do
         [[ -n "$local_d" ]] || continue
         pgrep -af -- "$local_d" >/dev/null 2>&1 || rm -rf "$local_d"
-    done < <(find "$_axl_tmp_base" -maxdepth 1 -type d -name 'axl-qemu.*' -mmin +10 2>/dev/null)
+    done < <(find "$_axl_tmp_base" -maxdepth 2 -type d -name 'axl-qemu.*' -mmin +10 2>/dev/null)
+    # Then the parent bases the loop above may have just emptied. `rmdir`, not
+    # `rm -rf`: it removes a base only if nothing is left in it, so a base
+    # still holding a live guest's dir is left alone even if the age and pgrep
+    # guards were somehow both wrong.
+    #
+    # Emptying a base refreshes its mtime, so it fails the -mmin +10 guard on
+    # THIS pass and is collected by a later one. That two-pass behaviour is
+    # deliberate, not an oversight: dropping the age guard here would let a
+    # standalone run rmdir another run's freshly-created base during the window
+    # between its mktemp and its first worker populating it. An empty directory
+    # costs an inode; the race costs a whole run.
+    #
+    # Note the pgrep guard is conservative by construction: it matches any
+    # process whose command line merely CONTAINS the path, so an unrelated
+    # shell that echoes or greps the path defers the sweep. That errs toward
+    # keeping a dead dir rather than removing a live one, which is the right
+    # direction for a defence-in-depth sweep.
+    while IFS= read -r local_b; do
+        [[ -n "$local_b" ]] || continue
+        pgrep -af -- "$local_b" >/dev/null 2>&1 || rmdir "$local_b" 2>/dev/null
+    done < <(find "$_axl_tmp_base" -maxdepth 1 -type d -name 'axl-itest.*' -mmin +10 2>/dev/null)
     TMPDIR=$(mktemp -d -p "$_axl_tmp_base" axl-qemu.XXXXXXXX)
 else
     TMPDIR=$(mktemp -d)
@@ -1448,25 +1538,143 @@ if [[ -n "$SCREENSHOT" ]]; then
     RUN_START_MS=$(now_ms)   # --max-duration budget clock
     cpu_monitor_start "$QEMU_PID"
 
+    # Send one HMP monitor command, and CHECK that it went.
+    #
+    # socat's exit status used to be discarded here (`>/dev/null 2>&1`, no
+    # test), so a send that never reached QEMU was indistinguishable from a
+    # delivered keystroke. That is the failure mode that makes a harness bug
+    # present as an application bug: input silently missing, with nothing in
+    # any log to say so. Retry briefly, then say so loudly.
+    mon_cmd() {
+        local cmd="$1" tries=0
+        while (( tries < 3 )); do
+            if printf '%s\n' "$cmd" \
+                 | socat -t 2 - "UNIX-CONNECT:$MONSOCK" >/dev/null 2>&1; then
+                return 0
+            fi
+            tries=$(( tries + 1 ))
+            sleep 0.2
+        done
+        echo "[run-qemu] monitor send FAILED after 3 tries: $cmd" >&2
+        return 1
+    }
+
+    # Same, for QMP. Each socat connection is a fresh session, so capabilities
+    # are re-negotiated per call; payload lines are passed as arguments.
+    qmp_cmd() {
+        local tries=0
+        while (( tries < 3 )); do
+            if { printf '%s\n' '{"execute":"qmp_capabilities"}'
+                 printf '%s\n' "$@"; } \
+                 | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1; then
+                return 0
+            fi
+            tries=$(( tries + 1 ))
+            sleep 0.2
+        done
+        echo "[run-qemu] QMP send FAILED after 3 tries" >&2
+        return 1
+    }
+
+    # Both gates below sample at 0.25s, so report EXACT quarter-seconds plus the
+    # raw tick count rather than whole seconds. This is not cosmetic: with
+    # --sendkey-settle 0 the gate's wait time is the only readout of guest
+    # post-key repaint latency anyone has, and a consumer measured ~1s for their
+    # heaviest cases against a 1500ms default -- a margin that thin is invisible
+    # at 1s granularity, and it is exactly the margin that closes under load.
+    # ${1:-0}, not $1: an unset argument would interpolate to nothing and hand
+    # awk a bare `/4`, i.e. an unterminated-regexp syntax error on stderr in
+    # place of a number. Callers always pass an initialised counter, so this is
+    # belt-and-braces -- but a diagnostic line that can emit a parse error is a
+    # poor instrument, and this one is about to be used as a bisect metric.
+    _ticks_secs() { awk "BEGIN{printf \"%.2f\", ${1:-0}/4}"; }
+
     # Pre-screenshot settle.  Decoupled from TIMEOUT so a caller can keep a
     # safe kill-timeout but capture sooner: set SHOT_WAIT to the seconds the
     # guest needs to boot + render (the visual suite tunes this).  Default =
     # the old TIMEOUT-3 behaviour.
     WAIT="${SHOT_WAIT:-$((TIMEOUT - 3))}"
     [[ $WAIT -lt 3 ]] && WAIT=3
-    sleep "$WAIT"
+    if [[ $WAIT -ge $TIMEOUT ]]; then
+        # These two are separate knobs that share one budget, and raising the
+        # wait to give a loaded guest more time silently eats the kill margin
+        # -- the run dies mid-capture and reports as a timeout, not as a wait
+        # that was set too long. Say which knob is wrong instead.
+        echo "[run-qemu] WARNING: SHOT_WAIT ($WAIT s) >= --timeout ($TIMEOUT s):" \
+             "QEMU will be killed at or before the capture. Raise --timeout." >&2
+    fi
+
+    # --sendkey-after REGEX: wait for the GUEST to say it is ready, instead of
+    # guessing with a wall clock.
+    #
+    # This is the fix for keystrokes going missing under host load. Injection
+    # used to start at SHOT_WAIT, a fixed timer that does not move when the
+    # host slows down -- so a loaded guest that booted slower had its FIRST
+    # keys typed at the Shell prompt before the app bound ConIn, and the app
+    # saw a truncated sequence. Measured: at SHOT_WAIT=8 under 8 busy loops the
+    # app received 9 of 10 keys ('a' lost); at 40, 10 of 10. Same load, same
+    # binaries. The keys were never dropped in transit -- they were typed too
+    # early, which reads as an application bug and is not one.
+    #
+    # Gating on a marker the guest prints makes delivery independent of how
+    # busy the host is, which is the property worth having. Bounded so a guest
+    # that never prints it cannot hang the run; on expiry it types anyway and
+    # says why, leaving the old behaviour as the degraded case rather than a
+    # silent one.
+    if [[ -n "$SENDKEY_AFTER" ]]; then
+        _sk_log="${SERIAL_LOG:-$LOG}"
+        _sk_cap=$(( TIMEOUT - 5 )); [[ $_sk_cap -lt 5 ]] && _sk_cap=5
+        _sk_cap_ticks=$(( _sk_cap * 4 ))   # the loop sleeps 0.25s per tick
+        _sk_ticks=0
+        # grep -a: the serial capture can carry a stray NUL, and one NUL makes
+        # GNU grep call the whole file binary -- -q would still answer, but the
+        # habit is what keeps the diagnostics below readable.
+        while ! /usr/bin/grep -qaE "$SENDKEY_AFTER" "$_sk_log" 2>/dev/null; do
+            if (( _sk_ticks >= _sk_cap_ticks )); then
+                echo "[run-qemu] WARNING: --sendkey-after '$SENDKEY_AFTER' not seen" \
+                     "in ${_sk_cap}s; typing anyway (keys may be lost)" >&2
+                break
+            fi
+            sleep 0.25
+            _sk_ticks=$(( _sk_ticks + 1 ))
+        done
+        echo "[run-qemu] --sendkey-after: guest ready after $(_ticks_secs $_sk_ticks)s" "($_sk_ticks ticks)" >&2
+        sleep 0.5   # let the app finish the paint that followed its marker
+    else
+        sleep "$WAIT"
+    fi
 
     # --sendkey: inject key tokens via the monitor once the app is up, then
     # let it settle/repaint before the dump.  Generous per-key delay (TCG is
     # slow on aarch64) so no keystroke is dropped.
+    # Byte offset into the serial log BEFORE any key is typed. --screenshot-after
+    # matches only beyond this, so a marker the app printed earlier (a readiness
+    # line, a previous interaction) cannot satisfy the gate and let the capture
+    # race ahead exactly as it does today.
+    _sa_log="${SERIAL_LOG:-$LOG}"
+    _sa_offset=$(stat -c %s "$_sa_log" 2>/dev/null || echo 0)
+
     if [[ -n "$SENDKEY_SEQ" ]]; then
         key_delay=0.4
         [[ "$ARCH" == "AARCH64" ]] && key_delay=1.0
         for key in $SENDKEY_SEQ; do
-            echo "sendkey $key" | socat -t 2 - "UNIX-CONNECT:$MONSOCK" >/dev/null 2>&1
+            mon_cmd "sendkey $key" || true
             sleep "$key_delay"
         done
-        sleep 1.5   # let the app process + repaint before capture
+
+        # Trailing settle: let the app PROCESS and REPAINT before the dump.
+        #
+        # This is a wall clock with the same weakness --sendkey-after removed
+        # from the front of this block: it does not move when the host slows
+        # down. Measured here, the guest finishes RECEIVING the last key ~1.2s
+        # before the dump under both spinner and 6-VM load, so delivery is not
+        # the exposure -- REPAINT is, and a consumer whose repaint is heavy
+        # (a syntax scanner over a style buffer, say) can still be mid-frame.
+        #
+        # --screenshot-after below is the real answer: gate on the guest.
+        # This knob stays for consumers that cannot emit a marker, and the
+        # default preserves the historical 1.5s exactly.
+        sleep "$(awk "BEGIN{printf \"%.3f\", ${SENDKEY_SETTLE_MS:-1500}/1000}")"
     fi
 
     # --holdkey "qcode:ms": press a key DOWN, hold it for ms, then release — via
@@ -1485,15 +1693,9 @@ if [[ -n "$SCREENSHOT" ]]; then
                 echo "[run-qemu] --holdkey: bad spec '$hk' (want QCODE:MS); skipping" >&2
                 continue
             fi
-            {
-                printf '%s\n' '{"execute":"qmp_capabilities"}'
-                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":true,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}"
-            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+            qmp_cmd "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":true,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}" || true
             sleep "$(awk "BEGIN{printf \"%.3f\", $hk_ms/1000}")"
-            {
-                printf '%s\n' '{"execute":"qmp_capabilities"}'
-                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":false,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}"
-            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+            qmp_cmd "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"key\",\"data\":{\"down\":false,\"key\":{\"type\":\"qcode\",\"data\":\"$hk_code\"}}}]}}" || true
         done
         sleep 1.5   # let the reader drain the synthesised repeats before capture
     fi
@@ -1509,17 +1711,83 @@ if [[ -n "$SCREENSHOT" ]]; then
             IFS=',' read -r fx fy click <<<"$m"
             vx=$(awk "BEGIN{printf \"%d\", $fx*32767}")
             vy=$(awk "BEGIN{printf \"%d\", $fy*32767}")
-            {
-                printf '%s\n' '{"execute":"qmp_capabilities"}'
-                printf '%s\n' "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$vx}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$vy}}]}}"
-                if [[ "$click" == "click" ]]; then
-                    printf '%s\n' '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":true}}]}}'
-                    printf '%s\n' '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":false}}]}}'
-                fi
-            } | socat -t 2 - "UNIX-CONNECT:$QMPSOCK" >/dev/null 2>&1
+            if [[ "$click" == "click" ]]; then
+                qmp_cmd \
+                    "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$vx}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$vy}}]}}" \
+                    '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":true}}]}}' \
+                    '{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"button":"left","down":false}}]}}' || true
+            else
+                qmp_cmd \
+                    "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$vx}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$vy}}]}}" || true
+            fi
             sleep "$move_delay"
         done
         sleep 1.5   # let the app process the motion + repaint before capture
+    fi
+
+    # --screenshot-after ERE [--screenshot-after-count N]: wait for the guest to
+    # say it has finished painting, instead of trusting the trailing settle.
+    #
+    # Symmetric with --sendkey-after. The failure it prevents is not "the last
+    # keystroke was lost" -- no keystroke is lost. It is that `screendump` reads
+    # the framebuffer with no synchronisation while the guest is still writing
+    # it, so a single capture can be TORN: a consumer measured one frame whose
+    # hex pane reflected 2 of 3 keys while its status bar and inspector
+    # reflected 0 of 3, disagreeing with each other. No settle VALUE expresses
+    # "has stopped writing"; only the guest knows.
+    #
+    # COUNT exists because paints are CONTINUOUS during typing. An app that
+    # repaints after every key emits a "painted" marker at key 1, which lands
+    # past _sa_offset and satisfies a first-match gate the instant it is
+    # reached -- capturing the very torn frame the gate exists to prevent, and
+    # being green by construction. Waiting for the Nth match fixes that without
+    # asking the guest to say WHICH paint it just finished.
+    #
+    # Moving _sa_offset cannot substitute: after the last key races the guest
+    # painting inside the trailing key_delay (a paint that already happened is
+    # never seen -> timeout + spurious warning every run), and before the last
+    # key just matches key N-1. Every positional variant races; an ordinal does
+    # not.
+    #
+    # Counting is done past _sa_offset so this composes with the stale-marker
+    # guard rather than replacing it.
+    if [[ -n "$SCREENSHOT_AFTER" ]]; then
+        _sa_want="${SCREENSHOT_AFTER_COUNT:-1}"
+        if [[ ! "$_sa_want" =~ ^[0-9]+$ ]] || (( _sa_want < 1 )); then
+            echo "[run-qemu] --screenshot-after-count: '$_sa_want' is not a positive" \
+                 "integer; using 1" >&2
+            _sa_want=1
+        fi
+        _sa_cap=$(( TIMEOUT - 3 )); [[ $_sa_cap -lt 3 ]] && _sa_cap=3
+        _sa_ticks=0
+        _sa_cap_ticks=$(( _sa_cap * 4 ))
+        _sa_seen=0
+        while :; do
+            _sa_seen=$(tail -c "+$(( _sa_offset + 1 ))" "$_sa_log" 2>/dev/null \
+                         | /usr/bin/grep -acE "$SCREENSHOT_AFTER" || true)
+            (( _sa_seen >= _sa_want )) && break
+            if (( _sa_ticks >= _sa_cap_ticks )); then
+                echo "[run-qemu] WARNING: --screenshot-after '$SCREENSHOT_AFTER' seen" \
+                     "$_sa_seen time(s), wanted $_sa_want, in ${_sa_cap}s;" \
+                     "capturing anyway (frame may be mid-repaint)" >&2
+                break
+            fi
+            sleep 0.25
+            _sa_ticks=$(( _sa_ticks + 1 ))
+        done
+        echo "[run-qemu] --screenshot-after: $_sa_seen/$_sa_want match(es)" \
+             "after $(_ticks_secs $_sa_ticks)s ($_sa_ticks ticks)" >&2
+        # A marker that has ALREADY fired more times than we waited for means
+        # the gate stopped at an earlier paint and the guest kept going -- the
+        # green-by-construction trap. Say so; a silent false green here is
+        # worse than no gate, because it looks measured.
+        if (( _sa_seen > _sa_want )); then
+            echo "[run-qemu] WARNING: '$SCREENSHOT_AFTER' matched $_sa_seen times but the" \
+                 "gate waited for $_sa_want. If your app emits this marker per REPAINT," \
+                 "pass --screenshot-after-count $_sa_seen or make the marker" \
+                 "self-identifying (e.g. 'PAINT n=3'); otherwise the capture was gated" \
+                 "on an EARLIER paint." >&2
+        fi
     fi
 
     for try in 1 2 3; do
@@ -1594,10 +1862,15 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # abort, …) leak QEMU and the next run's hostfwd binding fails
     # silently with "server did not start".
     #
-    # `timeout` reparents the command, but QEMU stays a direct child
-    # of the wrapper subshell — `pgrep -P` finds it the same way the
-    # foreground branch does, so anything that grabs QEMU_PID for
-    # later kill/screenshot still works.
+    # What `QEMU_PID=` below actually reports is the `timeout` pid, NOT
+    # QEMU's: GNU timeout fork+execs the command, so the guest is a
+    # GRANDCHILD of the wrapper subshell and `pgrep -P "$WRAPPER_PID"`
+    # can only ever reach `timeout`. The name is historical and callers
+    # parse it, so it stays — and it stays a usable handle, because
+    # `timeout` forwards signals to its child, so kill/kill -0 on it
+    # behave as callers expect. Anything that needs the REAL qemu pid
+    # (for /proc sampling, say) must walk one more level down with
+    # `pgrep -P "$QEMU_PID"`.
     if [[ -n "$SERIAL_SOCKET" ]]; then
         # Serial as a UNIX socket the host can open to read output AND
         # write input. Drop -nographic (it implies serial=stdio) in
@@ -1654,11 +1927,20 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # trap (the disk/serial must outlive THIS script), but the detached subshell
     # can rm $TMPDIR once qemu is gone — tying cleanup to the guest's real
     # lifetime. Without this, every --background run orphaned its ~40 MB
-    # /dev/shm/axl-qemu.* dir forever. The reported PID still points at qemu
-    # (qemu_child_pid walks into the subshell), so consumers grep/kill it as
-    # before; the subshell just reaps and cleans.
+    # /dev/shm/axl-qemu.* dir forever.
+    #
+    # The `rm` belongs to a TRAP, not to a trailing command. As a trailing
+    # command it was the last statement of a killable subshell: signal the
+    # subshell (the exact case a `timeout`-wrapped caller produces on expiry)
+    # and the guest was still reaped correctly by the watchdog below — orphans
+    # do not die with their parent — but the `rm` never ran, leaking ~42 MB
+    # with nothing left holding it. The trap covers the signalled paths as well
+    # as the normal one, mirroring the foreground branch's own trap above.
+    # Cleanup is NOT pulled earlier by this: bash defers a trap until the
+    # running foreground command returns, so the `rm` still happens after
+    # `timeout` (and therefore the guest) is done, never under a live guest.
     # `|| :` so timeout's non-zero exit (124 on expiry, or the guest's own exit
-    # code) doesn't abort the subshell under `set -e` before the rm runs.
+    # code) doesn't abort the subshell under `set -e` before the trap runs.
     # The `>/dev/null 2>&1` on the SUBSHELL (not just the inner qemu) is
     # load-bearing: the inner `> "$BG_SERIAL_DEST"` only redirects the
     # timeout+qemu command, so without this the detached subshell would inherit
@@ -1668,7 +1950,31 @@ elif [[ "$BACKGROUND" == "true" ]]; then
     # sees EOF until the guest dies. The QEMU_PID=/SERIAL_LOG=/TMPDIR= lines
     # below are echoed after this on run-qemu's real stdout, so they still reach
     # the caller.
-    ( timeout "$TIMEOUT" "${CMD[@]}" > "$BG_SERIAL_DEST" 2>&1 < /dev/null || :; rm -rf "$TMPDIR" ) >/dev/null 2>&1 &
+    # Tie the guest's life to its watchdog with PR_SET_PDEATHSIG. Killing the
+    # cleanup-owner subshell leaves an orphaned `timeout` that still fires, so
+    # the guest is bounded — but SIGKILL the watchdog too and nothing bounds it
+    # at all: it survives at ppid 1 forever, and because it carries its state
+    # dir in argv, the stale-dir sweeper above (which skips any dir a live
+    # process references) can never collect that dir either. The leak protects
+    # itself. PR_SET_PDEATHSIG survives the execve into QEMU, so however
+    # `timeout` dies the kernel takes the guest with it, and the sweeper gets
+    # its shot. This does NOT shorten a normal --background guest: the death
+    # signal is tied to `timeout`, which lives the guest's whole lifetime, not
+    # to run-qemu.sh (which exits immediately by design).
+    #
+    # setpriv is util-linux >= 2.33; probed rather than assumed, because this
+    # script runs on CI runners and dev boxes alike and must not gain a hard
+    # dependency. `command -v` alone is not enough — an older setpriv exists
+    # but rejects --pdeathsig, and a launch that fails at exec is worse than
+    # the leak — so the probe actually runs the flag once. No setpriv, or no
+    # --pdeathsig support: fall back to the plain invocation, which is still
+    # bounded by `timeout` in every case except a SIGKILLed watchdog.
+    PDEATH=()
+    if command -v setpriv >/dev/null 2>&1 && setpriv --pdeathsig KILL true >/dev/null 2>&1; then
+        PDEATH=(setpriv --pdeathsig KILL)
+    fi
+    ( trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP
+      timeout "$TIMEOUT" "${PDEATH[@]}" "${CMD[@]}" > "$BG_SERIAL_DEST" 2>&1 < /dev/null || : ) >/dev/null 2>&1 &
     WRAPPER_PID=$!
     QEMU_PID=$(qemu_child_pid "$WRAPPER_PID")
     if [[ -z "$QEMU_PID" ]]; then

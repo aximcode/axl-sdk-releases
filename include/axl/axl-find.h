@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-find.h:
+/** @file axl-find.h
  *
  * Byte-substring search over an abstract random-access byte source.
  *
@@ -61,7 +60,7 @@ typedef struct {
 typedef struct AxlByteReader AxlByteReader;
 struct AxlByteReader {
     /// Total number of bytes the reader can serve.
-    size_t (*length)(const AxlByteReader *r);
+    size_t (*length)(const AxlByteReader *r) AXL_CB_NOEXCEPT;
 
     /// Copy up to @p len bytes starting at logical @p offset into
     /// @p buf, returning the number actually copied (fewer than @p len
@@ -71,7 +70,7 @@ struct AxlByteReader {
         size_t               offset,
         void                *buf,
         size_t               len
-    );
+    ) AXL_CB_NOEXCEPT;
 
     /// OPTIONAL zero-copy fast path: if `[offset, offset + len)` is
     /// stored contiguously, return a direct pointer to those bytes;
@@ -81,7 +80,7 @@ struct AxlByteReader {
         const AxlByteReader *r,
         size_t               offset,
         size_t               len
-    );
+    ) AXL_CB_NOEXCEPT;
 
     void *ctx;  ///< implementation data (opaque to the engine)
 };

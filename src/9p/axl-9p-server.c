@@ -75,6 +75,16 @@ s9p_reap_impl(S9pConn *conn, bool abortive)
 
     axl_debug("9p: connection %s closed", conn->client_addr);
 
+    /* Mark the slot dead BEFORE the close, which now retires this connection's
+       pending sends and runs s9p_on_send with AXL_CANCELLED. That callback
+       reaps on a non-OK status, so it would re-enter this function mid-teardown
+       — the !active guard above turns that into the no-op it should be, instead
+       of a second pass whose safety rested on the memset below having already
+       NULLed the buffer pointers. Nothing between here and that memset reads
+       `active`, and a slot cannot be handed to a new client in the middle of a
+       callback (accepts are dispatched by the loop, not from here). */
+    conn->active = false;
+
     s9p_fid_reset_all(conn);
     if (conn->sock != NULL) {
         if (abortive) {
@@ -108,10 +118,16 @@ s9p_reap(S9pConn *conn)
    establishes the idiom of reaping on a failed send (peer likely gone).
    txbuf is free again once this fires, so this is also where a connection
    whose drain paused on tx_busy resumes -- s9p_pump picks the framing loop
-   back up at the next buffered message. Reaping (here or anywhere) never
-   routes back through this callback: axl_tcp_close removes the send's loop
-   source without invoking it, so an inactive conn can only be seen if a
-   caller reaped between arming and completion; the guard below covers it. */
+   back up at the next buffered message.
+
+   NOTE, changed by the AxlTcp send queue: reaping CAN now route back through
+   this callback. axl_tcp_close used to remove the send's loop source without
+   invoking it; it now retires every pending send with AXL_CANCELLED so an
+   accepted send is not left without a callback
+   (docs/AXL-Tcp-Queue-Design.md §3.5). Safe: send callbacks are deferred, and
+   a close from inside one re-enters an already-torn-down socket, which
+   returns without freeing it (§6b defect 2). The !active guard below still
+   earns its keep for the ordinary "already reaped" case. */
 static bool
 s9p_on_send(AxlTcp *sock, AxlStatus status, void *data)
 {

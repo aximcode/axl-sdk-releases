@@ -20,6 +20,14 @@ typedef long long time_t;
 
 typedef long long mbedtls_time_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 time_t time(time_t *timer);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

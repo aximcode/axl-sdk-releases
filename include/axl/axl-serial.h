@@ -155,16 +155,30 @@ typedef void (*AxlSerialReadFn)(
     const void *data,  ///< received bytes (library-owned, valid for the call)
     size_t      len,   ///< number of bytes (always > 0)
     void       *user   ///< caller context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
- * @brief Open a serial port for byte I/O.
+ * @brief Open a serial port for byte I/O, EXCLUSIVELY.
  *
  * @p handle is a serial-I/O handle from axl_serial_next. The port's current
  * line settings are left as-is (call axl_serial_set_mode to change them).
  *
- * @return AXL_OK with @p out set; AXL_ERR on NULL args, a handle that does
- *     not publish the serial-I/O protocol, or allocation failure.
+ * The open is exclusive: while this image holds the port, a second
+ * axl_serial_open (or axl_serial_open_shared) for the same handle fails with
+ * AXL_BUSY. Two subsystems each holding a "port" that is the same UART is
+ * not merely interleaved output — whichever one calls
+ * axl_driver_disconnect_handle first detaches the port's drivers underneath
+ * a protocol pointer the other is still writing through. That failure is
+ * silent, so sharing must be asked for by name: see axl_serial_open_shared.
+ *
+ * @warning Scope is THIS IMAGE. The claim lives in the library's static
+ *     state, so it cannot see a port another loaded image has open. It
+ *     resolves collisions between subsystems of one program, which is where
+ *     they are both most likely and least visible.
+ *
+ * @return AXL_OK with @p out set; AXL_BUSY if the port is already open in
+ *     this image (@p out is left NULL); AXL_ERR on NULL args, a handle that
+ *     does not publish the serial-I/O protocol, or allocation failure.
  */
 int
 axl_serial_open(
@@ -173,10 +187,75 @@ axl_serial_open(
 );
 
 /**
+ * @brief Open a serial port that other subsystems may also hold.
+ *
+ * Identical to axl_serial_open except that it coexists with other SHARED
+ * opens of the same handle. Use it only where sharing is deliberate and the
+ * writers coordinate — a diagnostic log sink alongside a console, say.
+ *
+ * Still refuses (AXL_BUSY) when an EXCLUSIVE open holds the port: the holder
+ * asked for exclusivity and gets it. Sharing is therefore all-or-nothing per
+ * port, established by the first open.
+ *
+ * @return AXL_OK with @p out set; AXL_BUSY if an exclusive open holds the
+ *     port; AXL_ERR as for axl_serial_open.
+ */
+int
+axl_serial_open_shared(
+    AxlHandle   handle,   ///< handle from axl_serial_next
+    AxlSerial **out       ///< [out] open port on success
+);
+
+/**
+ * @brief Is this handle already open as a serial port in this image?
+ *
+ * Lets a consumer decline, or share deliberately, instead of discovering the
+ * collision as corrupted output. Note that a check followed by an open is
+ * two steps: prefer acting on axl_serial_open's AXL_BUSY, which cannot go
+ * stale between the question and the answer.
+ *
+ * @return true while any open (exclusive or shared) is outstanding.
+ */
+bool
+axl_serial_is_open(
+    AxlHandle handle   ///< handle from axl_serial_next
+);
+
+/**
+ * @brief The handle an open port was opened from.
+ *
+ * Every pre-open query in this header takes an AxlHandle (axl_serial_get_mode,
+ * axl_serial_get_control), so without this a caller holding only the open port
+ * had to retain the enumeration index purely to read back — which a
+ * read-modify-write of one line setting requires, since axl_serial_set_mode
+ * takes the whole struct and reads a zero field as "device default".
+ *
+ * @return the handle, or NULL if @p s is NULL.
+ */
+AxlHandle
+axl_serial_handle(
+    const AxlSerial *s   ///< open port (NULL-safe)
+);
+
+/**
  * @brief Close a serial port opened by axl_serial_open.
  *
  * Removes any axl_serial_read_async source and frees the wrapper. Does not
  * reset the underlying firmware port. NULL-safe.
+ *
+ * @warning Do not close the same port twice. Two guards make the common
+ *     case a harmless no-op -- a closed port's protocol pointer is cleared,
+ *     and a pointer absent from the open-port list is never freed -- but
+ *     NEITHER survives the allocator recycling the address. If a later
+ *     axl_serial_open lands on the freed address, a stale second close
+ *     matches the NEW port, unlinks it and frees it, silently releasing a
+ *     live port's claim.
+ *
+ *     That residual hazard cannot be closed while the API hands out a raw
+ *     pointer: any check has to read through the very pointer whose
+ *     validity is in question. A generation-tagged opaque handle would fix
+ *     it properly and is tracked in docs/ROADMAP.md. Until then, treat the
+ *     pointer as dead the moment this returns.
  */
 void
 axl_serial_close(

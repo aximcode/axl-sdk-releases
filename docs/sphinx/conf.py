@@ -38,6 +38,18 @@ suppress_warnings = [
     # The underlying source has no real duplicates; this is purely
     # a Breathe rendering artifact for unnamed enums.
     "duplicate_declaration.c",
+    # The C++ counterpart, and the same kind of artifact. Breathe emits the
+    # enclosing `namespace axl` as a declaration on EVERY page that documents
+    # an axl:: header, so the second such page is always a "duplicate" of the
+    # first. Two headers live in that namespace today (axl-cxx.hpp,
+    # axl-arena-allocator.hpp) and every future one adds another copy.
+    #
+    # Putting them on a single page does not help -- it trades this for a
+    # docutils "Duplicate ID: namespaceaxl" ERROR plus a duplicate-target
+    # warning, which is strictly worse. What this hides is a genuine duplicate
+    # C++ declaration, which the compiler would reject long before Sphinx saw
+    # it; the headers are compiled by check-examples and lint.sh.
+    "duplicate_declaration.cpp",
 ]
 source_suffix = {
     ".rst": "restructuredtext",

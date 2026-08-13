@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-tree.h:
+/** @file axl-tree.h
  *
  * Balanced sorted map. GLib GTree equivalent, AVL-backed.
  *
@@ -22,6 +21,8 @@
 
 #ifndef AXL_TREE_H
 #define AXL_TREE_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -43,7 +44,7 @@ typedef bool (*AxlTreeForeachFunc)(
     void *key,    ///< entry key
     void *value,  ///< entry value
     void *user    ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // Create / destroy

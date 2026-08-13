@@ -22,6 +22,8 @@
 #ifndef AXL_DRIVER_H
 #define AXL_DRIVER_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 
 #include <axl/axl-sys.h>
@@ -160,7 +162,7 @@ typedef struct {
     /// and openable BY_DRIVER. Return true to manage @p controller. Keep it
     /// side-effect-free — Supported is a pure query the firmware may run
     /// against many controllers.
-    bool (*supported)(AxlHandle controller, void *ctx);
+    bool (*supported)(AxlHandle controller, void *ctx) AXL_CB_NOEXCEPT;
 
     /// Start managing @p controller. AXL has already opened @c binds
     /// BY_DRIVER (claiming ownership) and hands you the bound interface as
@@ -169,12 +171,12 @@ typedef struct {
     /// unavoidable raw-EFI-type touch. Initialise the device, publish any
     /// child protocols. Return AXL_OK on success; on any other value AXL
     /// rolls back (CloseProtocol) and reports failure to ConnectController.
-    int (*start)(AxlHandle controller, void *iface, void *ctx);
+    int (*start)(AxlHandle controller, void *iface, void *ctx) AXL_CB_NOEXCEPT;
 
     /// Stop managing @p controller (DisconnectController / driver unload).
     /// Tear down what start built (uninstall child protocols, quiesce the
     /// device). AXL closes @c binds afterward. Return AXL_OK on success.
-    int (*stop)(AxlHandle controller, void *ctx);
+    int (*stop)(AxlHandle controller, void *ctx) AXL_CB_NOEXCEPT;
 
     /// Borrowed context passed to every callback (NULL if unused). Shared
     /// across all controllers this driver manages — key per-controller state
@@ -490,7 +492,12 @@ axl_driver_init(
  *     subsequent `LocateProtocol` calls hand consumers a stale
  *     vtable and the next dispatch faults.
  *   - Heap allocations made via `axl_malloc` are not auto-freed.
- *     `axl_mem_dump_leaks` (DEBUG builds) prints what was missed.
+ *     Call `axl_mem_dump_leaks` (DEBUG builds) at the end of your
+ *     unload callback to see what was missed. Note a driver has no
+ *     `_axl_cleanup`, so it never prints the teardown verdict an
+ *     `AXL_APP` does — the report you get is the diagnostic form,
+ *     headed `(live allocations)`, and AXL's QEMU harness does not
+ *     score it. Read it yourself.
  *   - Events / timers created via the AxlLoop or backend layer
  *     stay live; close them with the matching `_close` calls.
  *
@@ -807,10 +814,6 @@ axl_driver_ensure_from_path(
  *      `StartImage`, then verify the protocol got registered. If it did
  *      not, the image is unloaded and this reports failure — no fallback.
  *
- * @param driver_name OPTIONAL: names the loaded image for `dh`/diagnostics
- *     (and the synthesized device path). May be NULL — it is never used to
- *     search, since there is no search.
- *
  * @return AXL_OK if the protocol is registered (was already, or after
  *     loading the blob); AXL_NOT_FOUND if the blob failed to load, start,
  *     or register; AXL_INVALID on a NULL @p protocol_guid / @p embedded_buf
@@ -821,7 +824,9 @@ axl_driver_ensure_embedded_only(
     const AxlGuid       *protocol_guid,     ///< protocol GUID to look up (must be non-NULL)
     const unsigned char *embedded_buf,      ///< embedded driver .efi bytes (must be non-NULL)
     size_t               embedded_len,      ///< length of @p embedded_buf (must be > 0)
-    const char          *driver_name,       ///< optional image name for diagnostics (may be NULL)
+    const char          *driver_name,       ///< OPTIONAL image name for `dh`/diagnostics and the
+                                            ///< synthesized device path. May be NULL — never used
+                                            ///< to search, since there is no search.
     const void          *load_options,      ///< LoadOptions to install pre-Start (may be NULL)
     size_t               load_options_size  ///< size of @p load_options in bytes (0 if NULL)
 );

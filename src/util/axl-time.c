@@ -59,46 +59,87 @@ civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
 // Public API — formatting
 // ---------------------------------------------------------------------------
 
+/* Shared renderer. Takes the time as a VALUE so the log dispatcher can stamp
+   a record once and have every sink render that same instant -- see
+   axl_time_format_at. */
+static size_t
+format_realtime(const AxlRealtime *t, char *buf, size_t buf_size)
+{
+    size_t   pos = 0;
+    unsigned usec;
+
+    /* Format: YYYY-MM-DDThh:mm:ss.uuuuuu */
+    pos += format_uint(buf + pos, buf_size - pos, t->year, 4);
+    buf[pos++] = '-';
+    pos += format_uint(buf + pos, buf_size - pos, t->month, 2);
+    buf[pos++] = '-';
+    pos += format_uint(buf + pos, buf_size - pos, t->day, 2);
+    buf[pos++] = 'T';
+    pos += format_uint(buf + pos, buf_size - pos, t->hour, 2);
+    buf[pos++] = ':';
+    pos += format_uint(buf + pos, buf_size - pos, t->minute, 2);
+    buf[pos++] = ':';
+    pos += format_uint(buf + pos, buf_size - pos, t->second, 2);
+    buf[pos++] = '.';
+    /* Prefer EFI_TIME.Nanosecond, but firmware leaves it 0 on every platform
+       we test on, which stamps .000000 on every line and makes lines within
+       one second impossible to order. Fall back to the monotonic counter.
+       CAVEAT: the fraction then comes from an unrelated epoch, so it can
+       appear to run backwards inside one wallclock second -- it conveys
+       precision, NOT ordering. */
+    usec = t->nanosecond / 1000;
+    /* Trigger on the firmware reporting NOTHING, not on the microseconds
+       rounding to zero: a genuine 0 < nanosecond < 1000 is a real reading and
+       keeping it beats substituting an unrelated epoch's fraction. */
+    if (t->nanosecond == 0) {
+        uint64_t mono = axl_backend_get_monotonic_us();
+        if (mono > 0) {
+            usec = (unsigned)(mono % 1000000u);
+        }
+    }
+    pos += format_uint(buf + pos, buf_size - pos, usec, 6);
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* The "clock unavailable" rendering, kept fixed-width so a transcript stays
+   columnar rather than shifting every following field. */
+static size_t
+format_unavailable(char *buf, size_t buf_size)
+{
+    const char *zero = "0000-00-00T00:00:00.000000";
+    size_t i;
+    for (i = 0; zero[i] != '\0' && i < buf_size - 1; i++) {
+        buf[i] = zero[i];
+    }
+    buf[i] = '\0';
+    return i;
+}
+
+size_t
+axl_time_format_at(const AxlRealtime *t, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size < 28) {
+        return 0;
+    }
+    if (t == NULL) {
+        return format_unavailable(buf, buf_size);
+    }
+    return format_realtime(t, buf, buf_size);
+}
+
 size_t
 axl_time_format(char *buf, size_t buf_size)
 {
-    AxlTime time;
-    size_t pos = 0;
-    unsigned usec;
+    AxlRealtime now;
 
     if (buf == NULL || buf_size < 28) {
         return 0;
     }
-
-    if (axl_backend_get_time(&time) != AXL_OK) {
-        /* Fallback: zero timestamp */
-        const char *zero = "0000-00-00T00:00:00.000000";
-        size_t i;
-        for (i = 0; zero[i] != '\0' && i < buf_size - 1; i++) {
-            buf[i] = zero[i];
-        }
-        buf[i] = '\0';
-        return i;
+    if (axl_time_realtime(&now) != AXL_OK) {
+        return format_unavailable(buf, buf_size);
     }
-
-    /* Format: YYYY-MM-DDThh:mm:ss.uuuuuu */
-    pos += format_uint(buf + pos, buf_size - pos, time.year, 4);
-    buf[pos++] = '-';
-    pos += format_uint(buf + pos, buf_size - pos, time.month, 2);
-    buf[pos++] = '-';
-    pos += format_uint(buf + pos, buf_size - pos, time.day, 2);
-    buf[pos++] = 'T';
-    pos += format_uint(buf + pos, buf_size - pos, time.hour, 2);
-    buf[pos++] = ':';
-    pos += format_uint(buf + pos, buf_size - pos, time.minute, 2);
-    buf[pos++] = ':';
-    pos += format_uint(buf + pos, buf_size - pos, time.second, 2);
-    buf[pos++] = '.';
-    usec = time.nanosecond / 1000;
-    pos += format_uint(buf + pos, buf_size - pos, usec, 6);
-    buf[pos] = '\0';
-
-    return pos;
+    return format_realtime(&now, buf, buf_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -231,4 +272,44 @@ axl_time_set_unix(int64_t unix_secs)
     rt.flags            = 0;
     rt.timezone_minutes = 0;  /* RTC ends up holding UTC */
     return axl_time_set_realtime(&rt);
+}
+
+int
+axl_time_get_wakeup(bool *enabled, bool *pending, AxlRealtime *when)
+{
+    AxlTime t = { 0 };
+    int rc = axl_backend_get_wakeup(enabled, pending,
+                                    (when != NULL) ? &t : NULL);
+    if (rc != AXL_OK || when == NULL) {
+        return rc;
+    }
+    when->year             = t.year;
+    when->month            = t.month;
+    when->day              = t.day;
+    when->hour             = t.hour;
+    when->minute           = t.minute;
+    when->second           = t.second;
+    when->nanosecond       = t.nanosecond;
+    when->timezone_minutes = t.timezone_minutes;
+    when->flags            = t.daylight ? AXL_TIME_FLAG_DAYLIGHT : 0;
+    return AXL_OK;
+}
+
+int
+axl_time_set_wakeup(const AxlRealtime *when)
+{
+    if (when == NULL) {
+        return axl_backend_set_wakeup(NULL);   /* disarm */
+    }
+    AxlTime t = { 0 };
+    t.year             = when->year;
+    t.month            = when->month;
+    t.day              = when->day;
+    t.hour             = when->hour;
+    t.minute           = when->minute;
+    t.second           = when->second;
+    t.nanosecond       = when->nanosecond;
+    t.timezone_minutes = when->timezone_minutes;
+    t.daylight         = (when->flags & AXL_TIME_FLAG_DAYLIGHT) ? 1 : 0;
+    return axl_backend_set_wakeup(&t);
 }

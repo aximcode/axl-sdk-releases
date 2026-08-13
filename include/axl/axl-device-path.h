@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-device-path.h:
+/** @file axl-device-path.h
  *
  * Surfaces the small handful of UEFI-device-path primitives that
  * consumers building publishers (filesystem, block-io, vendor

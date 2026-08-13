@@ -296,6 +296,25 @@ axl_backend_console_text_set_mode(
 // Time
 // ===================================================================
 
+/* Re-entrancy guard for the RTC service family. UEFI 2.11 section 8.1,
+ * Table 8.1 makes GetTime / SetTime / GetWakeupTime / SetWakeupTime mutually
+ * exclusive as a GROUP, so one flag covers all of them -- guarding GetTime
+ * against only itself would still let a nested SetTime through.
+ *
+ * SCOPE, stated honestly: this covers the INTERRUPTED case on the BSP, which
+ * is the reachable one (a timer notify preempting a caller's own clock read).
+ * Section 8.1 also forbids a runtime service that is "active on another
+ * processor", and a plain flag cannot cover that -- an AxlTaskProc running on
+ * an AP (see axl-task-pool.c) that reads the clock is a caller error under
+ * that same rule, and was one before this guard existed.
+ *
+ * volatile because these are written by one flow of control and read by
+ * another that preempts it asynchronously -- the same reason
+ * g_axl_interrupted is volatile in axl-signal.c. */
+static volatile bool  mRtcBusy      = false;
+static volatile bool  mHaveLastTime = false;
+static AxlTime        mLastTime;
+
 /**
  * @brief Get the current date/time from firmware.
  *
@@ -313,8 +332,43 @@ axl_backend_get_time(
         return AXL_ERR;
     }
 
+    /* RE-ENTRANCY GUARD. UEFI 2.11 section 8.1, Table 8.1 forbids re-entering
+     * GetTime() while a GetTime/SetTime/GetWakeupTime/SetWakeupTime call is
+     * busy -- and "busy" explicitly includes INTERRUPTED, not merely
+     * in-progress on another agent.
+     *
+     * That is reachable here, not theoretical: code at TPL_APPLICATION is
+     * inside gRT->GetTime(), the timer interrupt fires, a notify function runs
+     * at TPL_CALLBACK and logs, and the log handler stamps a timestamp -- so
+     * GetTime() is entered while the interrupted call is still open. The spec
+     * says the result is undefined; EDK2's PcRtc trips its EfiAcquireLock
+     * ASSERT on a DEBUG build.
+     *
+     * Serve the nested call from the last good reading instead. That value is
+     * as old as the last COMPLETED read -- not one call old -- so an app whose
+     * only other clock read is infrequent can be served a correspondingly old
+     * stamp. Still better than undefined behaviour, and better than failing
+     * the nested call, which would drop the timestamp off exactly the log
+     * records emitted from notify context.
+     *
+     * No atomics: notifies are dispatched on the BSP and TPL provides the
+     * mutual exclusion, so this is a plain flag on a single flow of control. */
+    if (gRT == NULL) {
+        return AXL_ERR;
+    }
+
+    if (mRtcBusy) {
+        if (!mHaveLastTime) {
+            return AXL_ERR;
+        }
+        *time = mLastTime;
+        return AXL_OK;
+    }
+
+    mRtcBusy = true;
     status = gRT->GetTime(&efi_time, NULL);
     if (EFI_ERROR(status)) {
+        mRtcBusy = false;
         return AXL_ERR;
     }
 
@@ -331,6 +385,16 @@ axl_backend_get_time(
     time->timezone_minutes = (efi_time.TimeZone == 2047)
         ? INT16_MIN
         : (int16_t)efi_time.TimeZone;
+
+    /* Publish the cache and only THEN release the guard. Clearing the flag
+     * first would leave a window in which a notify takes a fresh, newer
+     * reading and publishes it, after which this call overwrites the cache
+     * with its own OLDER value -- so a later nested read could be stamped
+     * earlier than a record already written. Ordering is what prevents a
+     * timestamp going backwards. */
+    mLastTime     = *time;
+    mHaveLastTime = true;
+    mRtcBusy      = false;
     return AXL_OK;
 }
 
@@ -365,7 +429,144 @@ axl_backend_set_time(
         ? 2047
         : time->timezone_minutes;
 
+    /* Same family, same exclusion (see axl_backend_get_time). A write cannot
+     * be served from cache the way a read can, so a nested call fails rather
+     * than silently not setting the clock. */
+    if (mRtcBusy) {
+        return AXL_ERR;
+    }
+
+    mRtcBusy = true;
     status = gRT->SetTime(&efi_time);
+    if (!EFI_ERROR(status)) {
+        /* The caller just told us what the clock reads, so publish that
+         * rather than invalidating -- it leaves no window in which a nested
+         * read has nothing to answer with. On FAILURE the clock did not
+         * change, so the existing cache is still valid and is kept; throwing
+         * it away would punish a rejected write with a dead timestamp. */
+        mLastTime     = *time;
+        mHaveLastTime = true;
+    }
+    mRtcBusy = false;
+    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+}
+
+/* EFI_TIME -> AxlTime, shared by the clock and alarm readers so the two
+   cannot drift in how they map the timezone sentinel. */
+static void
+efi_time_to_axl(
+    const EFI_TIME  *in,
+    AxlTime         *out
+    )
+{
+    out->year       = in->Year;
+    out->month      = in->Month;
+    out->day        = in->Day;
+    out->hour       = in->Hour;
+    out->minute     = in->Minute;
+    out->second     = in->Second;
+    out->nanosecond = in->Nanosecond;
+    out->daylight   = in->Daylight;
+    out->timezone_minutes = (in->TimeZone == 2047)
+        ? INT16_MIN
+        : (int16_t)in->TimeZone;
+}
+
+/**
+ * @brief Read the RTC wake alarm.
+ */
+int
+axl_backend_get_wakeup(
+    bool     *enabled,
+    bool     *pending,
+    AxlTime  *when
+    )
+{
+    EFI_TIME    efi_time = { 0 };
+    BOOLEAN     efi_enabled = FALSE;
+    BOOLEAN     efi_pending = FALSE;
+    EFI_STATUS  status;
+
+    if (gRT == NULL) {
+        return AXL_ERR;
+    }
+    /* Same RTC group as GetTime/SetTime (UEFI 2.11 Table 8.1). Unlike a
+     * clock read there is no cached answer to fall back on -- an alarm has
+     * no last-known-good equivalent -- so a nested call fails outright. */
+    if (mRtcBusy) {
+        return AXL_ERR;
+    }
+
+    mRtcBusy = true;
+    status = gRT->GetWakeupTime(&efi_enabled, &efi_pending, &efi_time);
+    mRtcBusy = false;
+
+    /* EFI_UNSUPPORTED is a fact about the platform, not a failure: this box
+     * has no wake timer. Kept distinct so a caller can say "cannot" rather
+     * than "broken". */
+    if (status == EFI_UNSUPPORTED) {
+        return AXL_UNSUPPORTED;
+    }
+    if (EFI_ERROR(status)) {
+        return AXL_ERR;
+    }
+
+    if (enabled != NULL) {
+        *enabled = (efi_enabled != FALSE);
+    }
+    if (pending != NULL) {
+        *pending = (efi_pending != FALSE);
+    }
+    if (when != NULL) {
+        efi_time_to_axl(&efi_time, when);
+    }
+    return AXL_OK;
+}
+
+/**
+ * @brief Arm (when != NULL) or disarm (when == NULL) the RTC wake alarm.
+ */
+int
+axl_backend_set_wakeup(
+    const AxlTime  *when
+    )
+{
+    EFI_TIME    efi_time = { 0 };
+    EFI_STATUS  status;
+
+    if (gRT == NULL) {
+        return AXL_ERR;
+    }
+    if (mRtcBusy) {
+        return AXL_ERR;
+    }
+
+    if (when != NULL) {
+        efi_time.Year       = when->year;
+        efi_time.Month      = when->month;
+        efi_time.Day        = when->day;
+        efi_time.Hour       = when->hour;
+        efi_time.Minute     = when->minute;
+        efi_time.Second     = when->second;
+        efi_time.Nanosecond = when->nanosecond;
+        efi_time.Daylight   = when->daylight;
+        efi_time.TimeZone   = (when->timezone_minutes == INT16_MIN)
+            ? 2047
+            : when->timezone_minutes;
+    }
+
+    mRtcBusy = true;
+    /* Disarm passes Enable=FALSE with a NULL time, which the spec permits
+     * only in that direction -- an arm with no time is a caller error the
+     * firmware would reject anyway. */
+    status = (when != NULL)
+        ? gRT->SetWakeupTime(TRUE, &efi_time)
+        : gRT->SetWakeupTime(FALSE, NULL);
+    mRtcBusy = false;
+
+    if (status == EFI_UNSUPPORTED) {
+        return AXL_UNSUPPORTED;
+    }
     return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
 }
 
@@ -936,14 +1137,58 @@ axl_backend_file_delete(
         if (no_shell_file_open(path,
                                AXL_FILE_MODE_READ | AXL_FILE_MODE_WRITE,
                                0, &file) != AXL_OK) {
-            return AXL_ERR;
+            return AXL_NOT_FOUND;
         }
         status = file->Delete(file);
         return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
     }
 
-    status = shell->DeleteFileByName((CHAR16 *)path);
-    return EFI_ERROR(status) ? AXL_ERR : AXL_OK;
+    /* Open-then-delete, NOT shell->DeleteFileByName().
+     *
+     * EDK2's EfiShellDeleteFileByName opens its target with
+     * EfiShellCreateFile (ShellPkg/Application/Shell/ShellProtocol.c), so
+     * deleting a name that does not exist CREATED a zero-length file, deleted
+     * it, and honestly reported EFI_SUCCESS. Three things wrong with that, in
+     * increasing order of how much they matter:
+     *
+     *   - the caller cannot tell "I removed it" from "there was nothing
+     *     there", and axl_file_rename() on the same input already answered
+     *     correctly, so the two disagreed;
+     *   - a pure-CLEANUP call performed a WRITE. On a read-only or nearly
+     *     full volume, or one whose media just went away, that can fail --
+     *     and when it succeeds it is I/O nobody asked for;
+     *   - the no-shell branch above opens WITHOUT create and refused, so the
+     *     behaviour depended on whether a modern shell was present.
+     *
+     * This uses the shell's OWN OpenFileByName and DeleteFile rather than
+     * casting a SHELL_FILE_HANDLE to EFI_FILE_PROTOCOL*, so it assumes
+     * nothing about how the shell represents a handle -- EfiShellOpenFileByName
+     * forwards its OpenMode to InternalOpenFileDevicePath unchanged, so
+     * omitting EFI_FILE_MODE_CREATE really does mean "do not create".
+     *
+     * Probing with a stat first would also have worked and was the reported
+     * suggestion, but it costs a second open and leaves a window where the
+     * file appears between the probe and the delete -- in which
+     * DeleteFileByName would create it again. Removing the create at the
+     * source has neither problem.
+     */
+    {
+        SHELL_FILE_HANDLE handle = NULL;
+
+        status = shell->OpenFileByName((CHAR16 *)path, &handle,
+                                       AXL_FILE_MODE_READ
+                                       | AXL_FILE_MODE_WRITE);
+        if (EFI_ERROR(status) || handle == NULL) {
+            return AXL_NOT_FOUND;
+        }
+        /* DeleteFile closes the handle in EVERY case, so there is no
+           CloseFile() here and `handle` must not be touched again. It
+           returns EFI_WARN_DELETE_FAILURE -- a WARNING, which EFI_ERROR()
+           reads as SUCCESS -- when the handle was closed but the file
+           survived, so success is tested for explicitly. */
+        status = shell->DeleteFile(handle);
+        return (status == EFI_SUCCESS) ? AXL_OK : AXL_ERR;
+    }
 }
 
 /* GetFileInfo for an already-open handle, shell-agnostic. On the modern shell

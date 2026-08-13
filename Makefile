@@ -67,23 +67,56 @@ LD_ELF     = $(CROSS)ld
 AR         = $(CROSS)ar
 OBJCOPY    = $(CROSS)objcopy
 
-# C++ toolchain — only consulted when AXL_CPP=1.  AArch64 uses ARM's
-# bare-metal "none-elf" cross because the Linux-ABI cross's libstdc++
-# headers pull hosted typedefs from <bits/c++config.h> (see
-# docs/ROADMAP.md axlmm spec).  X64 uses host g++ (same convention as
-# axl-cc's host gcc).  Pinned version matches Dell ePSA per CPP1
-# validation findings.
+# C++ toolchain.  AArch64 uses ARM's bare-metal "none-elf" cross because the
+# Linux-ABI cross's libstdc++ headers pull hosted typedefs from
+# <bits/c++config.h> (see docs/ROADMAP.md axlmm spec).  X64 uses host g++ (same
+# convention as axl-cc's host gcc).
+#
+# CXX and the C++ flags are set UNCONDITIONALLY, not under `ifdef AXL_CPP`.
+# They used to be guarded, and the consequence was not that the C++ gates were
+# skipped -- it was that they ran with the wrong compiler and NO flags.
+# check-examples and check-cxx-entry both expand `$(CXX) $(CXXFLAGS_BASE)`,
+# and verify.sh and CI invoke them without AXL_CPP=1, so CXX fell back to
+# make's builtin `g++` and CXXFLAGS_BASE expanded to nothing. Every C++
+# example was therefore compiled HOSTED, at gnu++17, with exceptions and RTTI
+# enabled and without $(GCC_ARCH) -- i.e. under none of the constraints a
+# consumer actually gets, by the gate whose entire job is to prove they hold.
+#
+# The `ifdef` still guards what it should: a hard error when a real C++ BUILD
+# is asked for and the toolchain is missing.
+# Toolchain locations live in ONE file, shared verbatim with scripts/axl-cc
+# and the generated axl-config.cmake -- see scripts/axl-toolchains.conf for why
+# its KEY=VALUE subset is both valid make and valid sh. `-include` so a tree
+# missing it still builds C.
+-include $(dir $(lastword $(MAKEFILE_LIST)))scripts/axl-toolchains.conf
+
+ifeq ($(ARCH),aa64)
+  # ARM_TOOLCHAIN stays supported as the older override spelling; AXL_AA64_GXX
+  # is the one axl-cc and install.sh honour, so both resolve here.
+  # $(or ...) not ?=, so an EMPTY override falls back rather than yielding an
+  # empty CXX. `?=` counts an environment-defined empty string as defined.
+  ifdef ARM_TOOLCHAIN
+    CXX = $(or $(AXL_AA64_GXX),$(ARM_TOOLCHAIN)/bin/aarch64-none-elf-g++)
+  else
+    CXX = $(or $(AXL_AA64_GXX),$(AXL_AA64_GXX_DEFAULT))
+  endif
+else
+  CXX = $(or $(AXL_X64_GXX),g++)
+endif
+
 ifdef AXL_CPP
   ifeq ($(ARCH),aa64)
-    ARM_TOOLCHAIN ?= /opt/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
-    CXX = $(ARM_TOOLCHAIN)/bin/aarch64-none-elf-g++
     ifeq ($(wildcard $(CXX)),)
-      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-arm-toolchain.sh)
+      $(error AXL_CPP=1 needs $(CXX) — run ./scripts/install-toolchain.sh aa64)
     endif
   else
-    CXX = g++
-    ifeq ($(shell command -v g++ 2>/dev/null),)
-      $(error AXL_CPP=1 needs g++ in PATH)
+    # Check $(CXX), NOT g++. Once AXL_X64_GXX can point at a bare-metal
+    # toolchain, testing for host g++ passes on a box that has one and lacks
+    # the other -- and the build then dies deep in a recipe with a bare
+    # "No such file or directory" instead of here, which is the guard's only
+    # job. `command -v` covers a bare name on PATH; wildcard covers a path.
+    ifeq ($(or $(wildcard $(CXX)),$(shell command -v $(CXX) 2>/dev/null)),)
+      $(error AXL_CPP=1 needs $(CXX) — not found on PATH or at that path)
     endif
   endif
 endif
@@ -107,12 +140,42 @@ EFI_VERSION_SCRIPT = scripts/efi-localize.ver
 LDFLAGS_EFI = -nostdlib -shared -Bsymbolic --no-warn-rwx-segments --no-undefined \
               --gc-sections --version-script=$(EFI_VERSION_SCRIPT)
 
-CFLAGS_BASE = -std=gnu2x \
+# Stack-smashing detection. `-mstack-protector-guard=global` is the load-bearing
+# half on x86-64: GCC otherwise reads the canary from %fs:0x28, glibc's TLS
+# block, which UEFI never sets up -- so the default form faults instead of
+# protecting, and that is why this was off. AArch64 already defaults to the
+# global symbol. src/runtime/axl-stack-guard.c supplies the value and handler.
+#
+# -strong rather than -all: -all protects every function with any local at a
+# real size cost, -strong covers arrays, address-taken locals and register
+# spills, which is where linear overflows land.
+STACK_PROTECTOR = -fstack-protector-strong -mstack-protector-guard=global
+
+# -std=gnu2x, NOT gnu23. They select the SAME language mode -- gcc maps c2x/
+# gnu2x onto c23/gnu23 -- so this spelling costs no feature, no diagnostic and
+# no codegen difference. What it buys is gcc 13, which rejects `gnu23` outright
+# ("did you mean -std=gnu2x?") and so cannot build this tree at all. gcc 13 is
+# what Ubuntu 24.04 LTS ships, which is both the GitHub runner image and the
+# machine that builds our own downstream consumer. Verified: the full tree
+# compiles clean on gcc 13 under gnu2x, both arches.
+#
+# This has now flipped twice (3cfd6be4 -> c5a9127f -> eaa188de) and the second
+# flip broke CI for ~2 weeks unnoticed, because CI is dispatch-only. Before
+# "modernising" the spelling a third time, check what `gcc -dumpversion` says
+# on ubuntu-latest -- the bare-metal C++ toolchains (14.3, both arches) accept
+# either spelling and do NOT constrain this choice.
+#
+# -DAXL_ALLOW_UEFI: this tree IS the backend -- src/, tools/ and the tests all
+# legitimately speak UEFI, and <uefi/axl-uefi.h> now refuses to compile without
+# it so that ordinary applications cannot reach EDK2 by typing an #include.
+# axl-cc grants it per image type (drivers yes, apps only with --allow-uefi).
+CFLAGS_BASE = -std=gnu2x -DAXL_ALLOW_UEFI \
               -ffreestanding -fshort-wchar \
-              -fno-stack-protector -fno-builtin \
+              -fno-builtin \
               -fno-math-errno -fno-trapping-math \
               -fno-omit-frame-pointer \
               -fpic $(GCC_ARCH) \
+              $(STACK_PROTECTOR) \
               -Wall \
               -DAXL_BACKEND_NATIVE
 
@@ -133,21 +196,44 @@ else
                  -ffunction-sections -fdata-sections
 endif
 
-# C++ flag set for libaxl-cxx.a (and any future C++ source under src/).
-# Matches the hard defaults baked into axl-cc's C++ path — no
-# exceptions, no RTTI, no thread-safe statics, C++20 minimum.  See
-# docs/ROADMAP.md "axlmm Toolchain" section.
-ifdef AXL_CPP
-CXXFLAGS_BASE = -std=c++20 \
+# C++ flag set for libaxl-cxx.a, for any C++ source under src/, and for the
+# check-examples / check-cxx-entry gates.  Matches the hard defaults baked into
+# axl-cc's C++ path — no exceptions, no RTTI, no thread-safe statics, C++23.
+# Unconditional: see the CXX comment above for what guarding it cost.
+CXXFLAGS_BASE = -std=c++23 \
                 -ffreestanding -fshort-wchar \
-                -fno-stack-protector -fno-builtin \
+                -fno-builtin \
                 -fno-omit-frame-pointer \
                 -fno-exceptions -fno-rtti -fno-threadsafe-statics \
                 -fpic $(GCC_ARCH) \
+                $(STACK_PROTECTOR) \
                 -Wall \
                 -DAXL_BACKEND_NATIVE
-CXXFLAGS      = $(CXXFLAGS_BASE) $(CFLAGS_BUILD)
-endif
+# -MD -MP for the same reason CFLAGS carries them, and it was missing here for
+# as long as the C++ layer existed: no .cpp object had ANY header dependency,
+# so editing axl-cxx.hpp (or any .hpp) rebuilt nothing and the next run tested
+# the previous binary. That is not a slow-build annoyance, it is a wrong-answer
+# generator -- it made a sabotage of axl-istream.hpp read as UNDETECTED when
+# the code was never recompiled. On CXXFLAGS, not CXXFLAGS_BASE: check-examples
+# and check-cxx-entry compile throwaway objects with the BASE set and would
+# scatter .d files outside $(BUILDDIR).
+CXXFLAGS      = $(CXXFLAGS_BASE) $(CFLAGS_BUILD) -MD -MP
+
+# The same set as axl-c++ --hosted gives a consumer translation unit: drop
+# -ffreestanding so libstdc++ stops refusing the containers, drop the header
+# directories that SHADOW a real libc header, and KEEP $(GCC_ARCH) -- dropping
+# that is how a hosted spike picked up AVX from this host's -march=x86-64-v3
+# default and #UD'd under UEFI.
+#
+# TWO directories shadow, not one. include/compat's `typedef void FILE` against
+# the real <stdio.h> is the known one. deps/lzma/errno.h is the other, and it
+# is stealthier: nothing includes it directly, but `#include <string>` reaches
+# ext/string_conversions.h, which needs errno -- and gets a vendored stub with
+# no ERANGE in it. A consumer never sees this, because the staged SDK include
+# tree contains neither directory; only an in-tree hosted compile does.
+CXXFLAGS_HOSTED_BASE = $(filter-out -ffreestanding,$(CXXFLAGS_BASE))
+CXXFLAGS_HOSTED      = $(filter-out -ffreestanding,$(CXXFLAGS))
+INCLUDES_HOSTED      = $(filter-out -Iinclude/compat -Ideps/lzma,$(INCLUDES))
 
 ifeq ($(ARCH),aa64)
   GCC_CRT0 = $(BUILDDIR)/axl-crt0-gcc-aarch64.o
@@ -162,7 +248,7 @@ LINK_CRT0   = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ)
 LINK_CRT0_T = $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ)
 
 OBJCOPY_SECTIONS = -j .text -j .sdata -j .data -j .bss -j .dynamic -j .dynsym \
-                   -j .rel -j .rela -j .reloc -j .rodata -j .dbgdir
+                   -j .rel -j .rela -j .rela.dyn -j .reloc -j .rodata -j .dbgdir
 
 # Host tool: patches PE debug data directory after objcopy
 PE_SET_DEBUG = $(BUILDDIR)/pe-set-debug
@@ -270,9 +356,12 @@ LIB_SOURCES = \
     src/mem/axl-arena.c \
     src/format/axl-format.c \
     src/format/axl-dtoa.c \
+    src/format/axl-strtod.c \
     src/log/axl-log.c \
     src/log/axl-log-ring.c \
+    src/log/axl-log-line.c \
     src/log/axl-log-file.c \
+    src/log/axl-log-serial.c \
     src/data/axl-str.c \
     src/data/axl-str-bmh.c \
     src/data/axl-str-base64.c \
@@ -290,8 +379,9 @@ LIB_SOURCES = \
     src/data/axl-slist.c \
     src/data/axl-queue.c \
     src/data/axl-json-parse.c \
-    src/data/axl-json5-parse.c \
+    src/data/axl-json-lex.c \
     src/data/axl-json-build.c \
+    src/data/axl-json-io.c \
     src/data/axl-json-print.c \
     src/data/axl-xml-writer.c \
     src/data/axl-xml-parse.c \
@@ -337,6 +427,7 @@ LIB_SOURCES = \
     src/util/axl-sys.c \
     src/util/axl-version.c \
     src/util/axl-nvstore.c \
+    src/util/axl-var.c \
     src/util/axl-attempt.c \
     src/util/axl-io-port.c \
     src/util/axl-boot.c \
@@ -508,6 +599,7 @@ LIB_SOURCES = \
     src/runtime/axl-registry.c \
     src/runtime/axl-runtime.c \
     src/runtime/axl-signal.c \
+    src/runtime/axl-stack-guard.c \
     src/vterm/axl-vterm.c \
     src/vterm/axl-console-screen.c \
     deps/libvterm/src/vterm.c \
@@ -585,13 +677,66 @@ LIB_OBJS   = $(patsubst %.c,$(BUILDDIR)/%.o,$(notdir $(LIB_SOURCES)))
 # libaxl-cxx.a contents — built only when AXL_CPP=1.  Pure-C consumers
 # never see this archive.  Contents must keep C-linkage symbols out
 # (those go in axl-cxxabi.c → libaxl.a).
-LIB_CXX_SOURCES = src/runtime/axl-cxxabi-ops.cpp
+#
+# axl-cxx-libm.cpp, axl-cxx-rehash.cpp, axl-cxx-rbtree.cpp and
+# axl-cxx-hash.cpp exist for `axl-c++ --hosted` consumers. None is referenced
+# by a freestanding C++ build, so none is pulled from the archive by one -- an
+# archive member only arrives when some symbol in it is still undefined.
+#
+# rbtree + hash are what let --hosted drop libstdc++.a ENTIRELY: measured,
+# they were the only two members still being pulled (tree.o and
+# hash_bytes.o). See AXL-Cxx-Design.md section 8 -- redistributing the runtime
+# library is the one act the GCC Runtime Library Exception does not cover.
+LIB_CXX_SOURCES = src/runtime/axl-cxxabi-ops.cpp \
+                  src/runtime/axl-cxx-libm.cpp \
+                  src/runtime/axl-cxx-rehash.cpp \
+                  src/runtime/axl-cxx-rbtree.cpp \
+                  src/runtime/axl-cxx-hash.cpp \
+                  src/runtime/axl-cxx-string-inst.cpp \
+                  src/runtime/axl-cxx-list.cpp
 LIB_CXX_OBJS    = $(patsubst %.cpp,$(BUILDDIR)/%.o,$(notdir $(LIB_CXX_SOURCES)))
 
 ifdef AXL_CPP
 LIBAXL_CXX_TARGET = $(PREFIX)/lib/libaxl-cxx.a
 else
 LIBAXL_CXX_TARGET =
+endif
+
+# libaxl-cxxrt.a -- the EXCEPTIONS build's glue, and the ALTERNATIVE to
+# libaxl-cxx.a rather than a companion to it. See src/cxxrt/axl-cxxrt.c: the
+# bare-metal toolchain's libstdc++/libsupc++ already define 51 of the 54
+# symbols libaxl-cxx.a exports, so the two cannot appear in one link.
+#
+# Built with the BARE-METAL compiler, not $(CC): it has to agree with the
+# libstdc++ it is glue for -- newlib's headers, its size_t, its _impure_ptr.
+# Building it with the host compiler would produce an archive that links and
+# then disagrees about types at the ABI boundary.
+#
+# Gated on that toolchain actually being installed, so a tree without one
+# still builds everything else. AXL_CXXRT_CC is resolved from the same
+# manifest as every other toolchain path (scripts/axl-toolchains.conf).
+ifeq ($(ARCH),aa64)
+  # Same ladder as CXX above, ARM_TOOLCHAIN included: resolving these two
+  # differently would build libaxl-cxx.a and libaxl-cxxrt.a with DIFFERENT
+  # toolchains, which is precisely the ABI-boundary mismatch using the
+  # bare-metal compiler is meant to prevent.
+  ifdef ARM_TOOLCHAIN
+    AXL_CXXRT_CC = $(or $(AXL_AA64_GXX),$(ARM_TOOLCHAIN)/bin/aarch64-none-elf-g++)
+  else
+    AXL_CXXRT_CC = $(or $(AXL_AA64_GXX),$(AXL_AA64_GXX_DEFAULT))
+  endif
+else
+  # The manifest DEFAULT, not $(CXX): x64's CXX still falls back to host g++
+  # (flipping that is T2's remaining half), but this archive is glue for the
+  # bare-metal libstdc++ and is meaningless built by anything else.
+  AXL_CXXRT_CC = $(or $(AXL_X64_GXX),$(AXL_X64_GXX_DEFAULT))
+endif
+AXL_CXXRT_CC := $(patsubst %g++,%gcc,$(AXL_CXXRT_CC))
+
+ifneq ($(wildcard $(AXL_CXXRT_CC)),)
+LIBAXL_CXXRT_TARGET = $(PREFIX)/lib/libaxl-cxxrt.a
+else
+LIBAXL_CXXRT_TARGET =
 endif
 
 # ===================================================================
@@ -624,25 +769,112 @@ endif
 # `make clean*` and `make help` shouldn't trip the state-change wipe,
 # nor write the state file (we don't want a clean-tools call to alter
 # the recorded state and confuse the next real build).
-# The pure-lint gates (check-ascii/-docs/-test-meta/-dogfood/-cxx-entry) build no
-# libaxl.a and leave no binary that could go stale against its ABI, but they run
-# WITHOUT AXL_TLS — so a bare `make check-ascii` after an AXL_TLS=1 build used to
-# read TLS_STATE=off, see the toggle, and WIPE the TLS tree (out/native-<arch>),
-# forcing a full rebuild. Exclude them (like clean/help) so a lint neither wipes
-# the tree nor rewrites the recorded state to confuse the next real build.
+# The pure-lint gates build no libaxl.a and leave no binary that could go stale
+# against its ABI, but they run WITHOUT AXL_TLS — so a bare `make <gate>` after
+# an AXL_TLS=1 build reads TLS_STATE=off, sees the toggle, and WIPES the TLS
+# tree (out/native-<arch>), forcing a full rebuild. Exclude them (like
+# clean/help) so a lint neither wipes the tree nor rewrites the recorded state
+# to confuse the next real build.
+#
+# Missing one of these is not a slow rebuild, it is a DATA RACE: verify.sh runs
+# its make job CONCURRENTLY with both arch builds, so an unexcluded gate deletes
+# $(BUILDDIR)/*.o and libaxl.a out from under them. check-tautology was missing
+# and did exactly that — 311 objects and the archive, mid-build — while
+# verify.sh's header promised "Nothing collides on disk".
+#
+# So the list is defined ONCE here and verify.sh reads it back via
+# `make -s print-lint-gates`, rather than keeping a second copy that can drift
+# from this one. That drift WAS the bug; a comment saying "keep them in sync"
+# would only have described it.
+#
+# check-nx-compat and check-bss-clear are deliberately absent: both take built
+# artifacts as prerequisites, so they are not pure lints and cannot run beside a
+# build. They stay out of verify.sh's make job for the same reason.
+LINT_GATES := check-ascii check-docs check-test-meta check-dogfood \
+    check-cxx-entry check-nul check-test-registered check-tautology \
+    check-fuzz-link check-examples check-json-dialect check-flag-parity \
+    check-dep-tracking check-cb-noexcept check-toolchain-conf check-uefi-scope
+
+print-lint-gates:
+	@echo $(LINT_GATES)
+
+# `print-%`, not the two names individually: check-dep-tracking's probe
+# includes this Makefile and asks it to expand a flag variable, so its
+# MAKECMDGOALS is print-CFLAGS etc. Naming only print-prefix and
+# print-lint-gates left that GRANDCHILD make outside the exclusion, so it ran
+# the build-state block below -- and verify.sh runs the gate job concurrently
+# with both arch builds, so a signature mismatch there WIPES $(BUILDDIR)/*.o
+# and libaxl.a mid-build. Demonstrated, not theorised. It is the same failure
+# check-tautology caused, and the reason MAKE_CHECKS is derived from
+# LINT_GATES rather than kept as a second list.
 NONCLEAN_GOALS := $(filter-out clean clean-all clean-tools help check-version \
-    print-prefix \
-    check-ascii check-docs check-test-meta check-dogfood check-cxx-entry,\
+    print-% $(LINT_GATES),\
     $(or $(MAKECMDGOALS),all))
 
+# The recorded state is a SIGNATURE, not just the AXL_TLS toggle, because two
+# different things invalidate the objects and only one of them was covered:
+#
+#   AXL_TLS  changes WHICH sources compile (mbedtls joins LIB_SOURCES).
+#   CFLAGS   changes HOW they compile -- and an object does NOT depend on the
+#            Makefile, so editing CFLAGS_BASE rebuilds NOTHING. `make` prints
+#            the new flags on the one file it happens to recompile and leaves
+#            the other 200 objects built the old way.
+#   CC/CXX   changes WHICH COMPILER emits them. AXL_X64_GXX, AXL_AA64_GXX and
+#            ARM_TOOLCHAIN all repoint $(CXX), and the bare-metal toolchain
+#            compiles against newlib's headers where the host g++ uses
+#            glibc's. Left uncovered, `AXL_X64_GXX=... AXL_CPP=1 make` reused
+#            host-built objects and a full-suite run "with the new toolchain"
+#            silently measured the old one.
+#
+# The second cost real time and produced four wrong readings while the stack
+# protector was being added, including "0 objects instrumented" on a build
+# whose command line plainly carried -fstack-protector-strong, and a sabotage
+# that looked UNDETECTED because the restored source was never rebuilt. It is
+# the same failure mode as the AXL_TLS toggle -- stale objects that make
+# believes are current -- so it gets the same treatment rather than a second
+# mechanism.
+#
+# BUILD (DEBUG/RELEASE) is already isolated: it selects its own PREFIX, so the
+# two never share objects. ARCH likewise.
+#
+# Hashed rather than stored whole: the flag string is ~300 characters and the
+# point is only whether it CHANGED.
 ifneq ($(NONCLEAN_GOALS),)
-TLS_STATE := $(if $(AXL_TLS),on,off)
-TLS_STATE_FILE := $(BUILDDIR)/.axl-tls-state
+#
+# Written with $(file ...) and hashed from disk rather than piped through a
+# shell, because the flags are not shell-safe: AXL_TLS=1 adds
+# -DMBEDTLS_CONFIG_FILE='<axl-mbedtls-config.h>', whose embedded quotes end
+# the argument and leave `<axl-mbedtls-config.h>` as a REDIRECT. The first
+# version of this hashed the empty string under AXL_TLS=1 -- a signature that
+# is constant is a check that never fires, and it announced itself only
+# because e3b0c44298fc is the recognisable SHA-256 of "".
+#
+# .axl-flags stays on disk on purpose: it is the COMPILER PAIR followed by the
+# exact flag set the objects beside it were built with, which is the first
+# thing worth reading when a build looks wrong.
+#
+# $(CC) and $(CXX) lead it, not just the flags. Selecting a different COMPILER
+# changes the objects at least as much as changing a flag does. Left out,
+# `AXL_X64_GXX=... AXL_CPP=1 make` reused objects the HOST compiler built and a
+# full-suite run "with the new toolchain" silently measured the old one: the
+# same wrong-reading this signature already exists to prevent for CFLAGS.
+#
+# It captures the compiler's SPELLING, not its identity -- `CC = $(CROSS)gcc`
+# is a bare name, so an in-place host gcc upgrade or a ccache shim appearing on
+# PATH hashes identically and rebuilds nothing. That is the cheap 90%: it
+# catches a compiler selected by a different NAME, which is how every toolchain
+# override in this tree works. Hashing `$(CC) -dumpversion` would close the
+# rest at the price of a machine-dependent .axl-flags.
+$(shell mkdir -p $(BUILDDIR))
+$(file >$(BUILDDIR)/.axl-flags,$(CC) $(CXX) $(AXL_CXXRT_CC) $(CFLAGS) $(CXXFLAGS) $(INCLUDES))
+BUILD_FLAG_SIG := $(shell sha256sum $(BUILDDIR)/.axl-flags | cut -c1-12)
+TLS_STATE := tls=$(if $(AXL_TLS),on,off) flags=$(BUILD_FLAG_SIG)
+TLS_STATE_FILE := $(BUILDDIR)/.axl-build-state
 PREV_TLS_STATE := $(shell cat $(TLS_STATE_FILE) 2>/dev/null)
 
 ifneq ($(TLS_STATE),$(PREV_TLS_STATE))
 ifneq ($(PREV_TLS_STATE),)
-$(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage)
+$(info build state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, libaxl.a, all .efi/.so under $(PREFIX) to avoid stale-archive linkage and stale-flag objects)
 # Wipe everything that links against libaxl.a. The earlier targeted
 # wipe missed test binaries (which live at $(PREFIX)/AxlTest*.efi —
 # root of PREFIX, not tools/) AND example binaries (hello.efi,
@@ -654,7 +886,7 @@ $(info AXL_TLS state changed: $(PREV_TLS_STATE) -> $(TLS_STATE); wiping .o, liba
 # producing baffling failures like "alloc fill 0xDA" tripping on
 # freshly-malloced memory. Blanket-wipe everything that could
 # reference the libaxl.a ABI; rebuilds are cheap.
-$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
+$(shell rm -f $(BUILDDIR)/*.o $(PREFIX)/lib/libaxl.a $(PREFIX)/lib/libaxl-cxx.a $(PREFIX)/lib/libaxl-cxxrt.a $(PREFIX)/*.efi $(PREFIX)/*.so $(PREFIX)/tools/*.efi $(PREFIX)/tools/*.so $(PREFIX)/drivers/*.efi $(PREFIX)/drivers/*.so)
 endif
 $(shell mkdir -p $(BUILDDIR) && echo $(TLS_STATE) > $(TLS_STATE_FILE))
 endif
@@ -671,13 +903,13 @@ CRT0_MINIMAL_OBJ = $(BUILDDIR)/axl-crt0-minimal.o
 # Default target
 # ===================================================================
 
-.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-nx-compat check-bss-clear driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke
+.PHONY: all clean clean-all clean-tools print-prefix hello gfx-demo gfx-window pointer-demo pointer-tune-demo cursor-demo frame-anim-demo keytrace input-demo driver smbus-hc-shim binding-driver crashhandler crashtest radix-demo ring-buf-demo event-demo cancellable-demo runtime-demo echo-server tcp-echo-server echo-client echo-server-sync kernel-poc axlk-echo-server axlk-hwinfo-server axlk-bootconfig-server axlk-reqlog-server tests tools check-version check-ascii check-cxx-entry check-test-meta check-docs check-dogfood check-tautology check-nx-compat check-bss-clear check-no-avx check-reloc-coverage check-nul check-test-registered check-fuzz-link check-flag-parity check-dep-tracking check-examples check-json-dialect driver-leak-test driver-identity-test driver-parent-leak-test volume-map-test stdio-bridge-reap-test stdio-bridge-liveness-test stdio-bridge-fix stdio-bridge-self stdio-bridge-leak sd-ergo sd-sibling sd-sibling-probe sd-sibling-driver-a sd-sibling-driver-b io-streams cpu-spin-fixture service-demo service-demo-custom svc-startfail svc-embonly embed-asset gfx-present-selftest gfx-avail-probe cursor-selftest exit-status-selftest exit-status-selftest-minimal compositor-selftest compositor-bench cpu-simd-selftest cpu-topology-selftest task-pool-mp-selftest time-settime-selftest http-plain-selftest gfx-simd-selftest console-text-mode-selftest console-reshape-selftest console-device-smoke console-device-restore-smoke console-device-wide-smoke console-device-input-smoke console-device-input-restore-smoke console-device-wide-restore-smoke console-device-cycle-smoke fs-path-selftest fs-read kbprobe axbench kbtune-drv kbtune-drv-test fbcon pin-svc image-path-test shell-launcher 9p 9p-mount-selftest 9p-server-selftest flushfail-fs-driver console-device-passthrough-smoke cxx-streams-selftest
 
 # Pin the default goal so rule order can't turn check-version (or
 # any future helper target) into the default by accident.
 .DEFAULT_GOAL := all
 
-all: check-version $(PREFIX)/lib/libaxl.a $(LIBAXL_CXX_TARGET) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
+all: check-version $(PREFIX)/lib/libaxl.a $(LIBAXL_CXX_TARGET) $(LIBAXL_CXXRT_TARGET) $(GCC_CRT0) $(RELOC_OBJ) $(DEBUG_INFO_OBJ) $(CRT0_OBJ) $(CRT0_MINIMAL_OBJ) $(PE_SET_DEBUG)
 	@echo ""
 	@echo "  AXL library built (gcc, $(ARCH))"
 	@echo "  Library:  $(PREFIX)/lib/libaxl.a"
@@ -721,6 +953,36 @@ check-cxx-entry:
 check-test-meta:
 	@bash test/integration/lib/discover.sh --lint
 
+# No assertion may be spelled `test_check(true, ...)`. It reports PASS while
+# evaluating nothing, so it inflates the count with a result nobody produced
+# and, worse, reads as coverage. There were 210 of them; every one was either
+# padding to keep the pass-count ratchet stable across QEMU images, a
+# "does not crash" probe, or a claim the enclosing `if` had already
+# established. Each has a proper spelling now:
+#
+#   padding for an absent device -> test_skip_n(n, why)   (declares the count)
+#   "did not fault / no-op"      -> test_survived(name)
+#   gated out by the build       -> test_skip(name)       (separate baseline)
+#   a claim about a value        -> assert the value
+#
+# A grep, because the compiler cannot see the difference and the suite going
+# green says nothing about an assertion that cannot fail.
+check-tautology:
+	@: 'Match anywhere on the line, then drop comment lines. Anchoring to line'
+	@: 'start instead was tried and let `foo(); test_check(true, ...)` through --'
+	@: 'verified by sabotage. The exclusion is what spares the primitives'\'''
+	@: 'own docstrings, which have to quote the banned form to explain it.'
+	@hits=$$(grep -rn 'test_check(true' test/unit/ \
+	         | grep -vE ':[[:space:]]*(\*|//|/\*)' || true); \
+	if [ -n "$$hits" ]; then \
+	  echo "check-tautology: FAIL — assertions that evaluate nothing:"; \
+	  echo "$$hits" | sed 's/^/    /'; \
+	  echo "  Use test_skip_n(n, why) / test_survived(name) / test_skip(name),"; \
+	  echo "  or assert the value. See test/unit/axl-test.h."; \
+	  exit 1; \
+	fi; \
+	echo "check-tautology: clean — no test_check(true, ...) in the unit suite."
+
 # Verify every public header is wired into the Sphinx reference (catches a
 # new header landing without docs). Prose staleness is a workflow concern.
 check-docs:
@@ -734,6 +996,224 @@ check-docs:
 # scripts/check-dogfood.py.
 check-dogfood:
 	@python3 scripts/check-dogfood.py
+
+# Verify no tracked TEXT file carries a literal NUL byte. Writing a
+# backslash-u-0000 / backslash-x-00 escape through an editing tool can insert
+# the BYTE instead of the source text, turning a .c or .md binary: git shows no
+# diff, grep skips it, review sees nothing. Extension-denylist based (see
+# scripts/check-nul.py); ~30 ms over the whole index, so it is cheap enough to
+# sit in front of every build.
+check-nul:
+	@python3 scripts/check-nul.py
+
+# Verify every object compiled from C or C++ is built with -MD -MP. Without
+# them the object has NO header dependency, so editing a header rebuilds
+# nothing and the next run tests the PREVIOUS binary -- a wrong-answer
+# generator, not a slow-build annoyance. CXXFLAGS was missing them for the
+# entire life of the C++ layer, and it made a sabotage of axl-istream.hpp
+# report as UNDETECTED because the code was never recompiled.
+#
+# The .axl-build-state signature does NOT cover this: it hashes which FLAGS
+# an object was built with, not which HEADERS it depends on.
+check-dep-tracking:
+	@python3 scripts/check-dep-tracking.py
+
+# check-cb-noexcept -- two halves, and both are load-bearing.
+#
+# The COMPILE half proves AXL_CB_NOEXCEPT actually rejects a throwing
+# callback. A fixture that only checked the accepting case would pass
+# identically for a header where the macro expands to nothing -- and it is
+# empty in C by design, so a stray #undef, a missing <axl/axl-macros.h> or
+# a C++ std below 17 all quietly turn the contract back into a comment.
+#
+# The STRUCTURAL half proves every callback declaration carries it. The
+# fixture can only speak for the two declarations it names, so without
+# this a NEW callback added without the macro sails through a green gate.
+.PHONY: check-cb-noexcept
+check-cb-noexcept:
+	@obj=$$(mktemp --suffix=.o); \
+	$(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat \
+	    -c test/cb-noexcept-fixture.cpp -o $$obj 2>/dev/null || \
+	  { echo "check-cb-noexcept: FAIL -- a noexcept callback was REJECTED"; \
+	    $(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat \
+	        -c test/cb-noexcept-fixture.cpp -o $$obj 2>&1 | head -5 | sed 's/^/    /'; \
+	    rm -f $$obj; exit 1; }; \
+	if $(CXX) $(CXXFLAGS_BASE) -Iinclude -Iinclude/compat -DEXPECT_REJECT \
+	    -c test/cb-noexcept-fixture.cpp -o $$obj 2>/dev/null; then \
+	  echo "check-cb-noexcept: FAIL -- a THROWING callback was ACCEPTED;"; \
+	  echo "    AXL_CB_NOEXCEPT is not reaching the typedefs (missing"; \
+	  echo "    <axl/axl-macros.h>, or the C++ std is below C++17)"; \
+	  rm -f $$obj; exit 1; \
+	fi; \
+	rm -f $$obj; \
+	python3 scripts/check-cb-noexcept.py include/axl
+
+# Verify every `test_*` function defined in test/unit/*.c is actually reached.
+# An unregistered test compiles, prints nothing, and cannot move the pass-count
+# ratchet -- it reads as coverage while providing none, and nothing else in the
+# build can see it (it is static, so -Wunused-function fires only sometimes).
+# Counts calls, function-pointer table entries and AXL_APP as registration;
+# comments, string labels and forward declarations do NOT count.
+check-test-registered:
+	@python3 scripts/check-test-registered.py
+
+# Verify every JSON parse in src/ and tools/ names AXL_JSON_STRICT unless it is
+# explicitly marked as reading a LOCAL file. Design decision 40: anything
+# crossing the network is strict RFC 8259 in both directions, because a peer
+# that sends JSON5 is either broken or probing. That rule was written in this
+# tree and, until now, enforced only in a consumer -- SoftBMC built a source
+# lint for it after a mutation build showed a JSON5 `PUT /api/users/admin`
+# demoting the administrator account. See scripts/check-json-dialect.py.
+check-json-dialect:
+	@python3 scripts/check-json-dialect.py
+
+# Verify every sdk/examples/* source still COMPILES against the current public
+# headers.
+#
+# 20 of the 51 examples were reachable by no build rule and no test at all --
+# they are copied verbatim into the .deb / .rpm by scripts/build-packages.sh,
+# so the first person to compile one was a consumer. That is not hypothetical:
+# commit 1b88001a renamed AxlFsProviderInfo to AxlFsEntry across the tree and
+# left sdk/examples/memfs.c behind, and it stayed broken because nothing ever
+# fed it to a compiler.
+#
+# Compile-only, so this is about API DRIFT and nothing else -- the examples the
+# Makefile and test/integration/test-axl-cc-*.sh already build keep covering
+# the link and the runtime. Objects go to a private prefix rather than
+# $(BUILDDIR), so the gate cannot collide with the concurrent arch builds
+# verify.sh runs beside it.
+# CHECK_EX_SRCDIR is overridable so the "found nothing" arm below is reachable
+# from a test rather than merely asserted:
+#   make check-examples CHECK_EX_SRCDIR=/tmp/empty   # must FAIL
+# A `.cpp` example carrying the marker `axl-example: hosted` in a comment is
+# compiled the way `axl-c++ --hosted` would compile it (no -ffreestanding, no
+# compat shims, $(GCC_ARCH) kept) instead of freestanding. Without the marker
+# a hosted example fails at bits/requires_hosted.h, which is the correct
+# answer for one that is NOT meant to be hosted.
+CHECK_EX_SRCDIR = sdk/examples
+CHECK_EX_DIR    = out/check-examples
+CHECK_EX_MIN    = 20
+
+# Examples compile as a CONSUMER would: without -DAXL_ALLOW_UEFI. Reusing
+# CFLAGS_BASE meant the gate granted itself raw-UEFI access the SDK denies an
+# application, so an example that no consumer could build still reported
+# "compiles". A file that legitimately needs it says so in its own text, the
+# same way `axl-example: hosted` already works.
+# The C filter is the live one. CXXFLAGS_BASE is written out independently and
+# never carried -DAXL_ALLOW_UEFI, so its filter-out removes nothing today --
+# kept so the three stay symmetric if that ever changes, not because it is
+# currently protecting anything.
+CFLAGS_EXAMPLE          = $(filter-out -DAXL_ALLOW_UEFI,$(CFLAGS_BASE))
+CXXFLAGS_EXAMPLE        = $(filter-out -DAXL_ALLOW_UEFI,$(CXXFLAGS_BASE))
+CXXFLAGS_HOSTED_EXAMPLE = $(filter-out -DAXL_ALLOW_UEFI,$(CXXFLAGS_HOSTED_BASE))
+
+check-examples:
+	@mkdir -p $(CHECK_EX_DIR); \
+	srcs=$$(ls $(CHECK_EX_SRCDIR)/*.c $(CHECK_EX_SRCDIR)/*.cpp 2>/dev/null); \
+	n=$$(printf '%s\n' $$srcs | grep -c . || true); \
+	if [ $$n -lt $(CHECK_EX_MIN) ]; then \
+	  echo "check-examples: FAIL — found $$n source(s) under $(CHECK_EX_SRCDIR),"; \
+	  echo "  fewer than the $(CHECK_EX_MIN) expected. A gate that compiles nothing"; \
+	  echo "  reports clean forever, so too few is a failure, not a pass."; \
+	  exit 1; \
+	fi; \
+	fail=0; \
+	for src in $$srcs; do \
+	  inc="$(INCLUDES)"; \
+	  case $$src in \
+	    *.cpp) cc="$(CXX) $(CXXFLAGS_EXAMPLE)"; \
+	           if grep -q 'axl-example: hosted' $$src; then \
+	             cc="$(CXX) $(CXXFLAGS_HOSTED_EXAMPLE)"; inc="$(INCLUDES_HOSTED)"; \
+	           fi ;; \
+	    *)     cc="$(CC) $(CFLAGS_EXAMPLE)" ;; \
+	  esac; \
+	  if grep -q 'axl-example: allow-uefi' $$src; then \
+	    cc="$$cc -DAXL_ALLOW_UEFI"; \
+	  fi; \
+	  if ! $$cc $(CFLAGS_BUILD) $$inc -c $$src \
+	       -o $(CHECK_EX_DIR)/$$(basename $$src).o 2>$(CHECK_EX_DIR)/err; then \
+	    echo "check-examples: FAIL — $$src"; \
+	    sed 's/^/    /' $(CHECK_EX_DIR)/err; fail=1; \
+	  fi; \
+	done; \
+	rm -f $(CHECK_EX_DIR)/err; \
+	if [ $$fail -ne 0 ]; then \
+	  echo "  Examples ship in the distro packages — a consumer compiles these."; \
+	  exit 1; \
+	fi; \
+	echo "check-examples: clean — $$n $(CHECK_EX_SRCDIR) sources compile."
+
+# libFuzzer is clang-only, so this gate does not follow $(CC). Override to
+# point at a specific clang: make check-fuzz-link FUZZ_CC=/opt/llvm/bin/clang
+FUZZ_CC ?= clang
+
+# Verify the host-side fuzz harnesses still LINK (test/fuzz).
+#
+# Those harnesses are deliberately outside the default build: libFuzzer and
+# AddressSanitizer need a host toolchain the freestanding UEFI build cannot
+# use. Nothing else in the tree referenced test/fuzz, though, and that is
+# precisely how json_fuzz came to sit un-linkable for months while the JSON
+# parser it targets was rewritten underneath it -- so ASan/LSan coverage of
+# the JSON read path was silently ZERO through the whole flag redesign, and
+# two OOM defects there had to be caught by code review instead.
+#
+# Linking is the cheap half of "the fuzzers still work", so it runs as a gate;
+# a long FUZZING session stays opt-in (see test/fuzz/README.md). The binaries
+# exist once built, so the gate also replays each committed seed corpus at
+# -runs=0 -- deterministic, no mutation, ~0.1s, and it upgrades the claim from
+# "it links" to "it links and the seeds are still clean under ASan".
+#
+# Always builds from clean: test/fuzz/Makefile lists only .c prerequisites, so
+# an incremental build would happily report success on a binary stale against a
+# changed header -- which is the exact drift this gate exists to catch. ~3s.
+# No -j here: it inherits the caller's jobserver, and forcing -jN inside a
+# submake makes GNU make drop the jobserver with a warning on stderr.
+#
+# -artifact_prefix keeps a reproducer from a FAILING run inside test/fuzz/,
+# where .gitignore already covers crash-*/leak-*/oom-* and `make -C test/fuzz
+# clean` removes them. libFuzzer otherwise drops it in the CURRENT directory,
+# which for a gate run from the repo root means an unignored crash-<sha> file
+# sitting where `git add -A` would sweep it into a commit.
+#
+# Skips when clang is absent so a gcc-only checkout can still run the gate set
+# -- but ONLY as a developer convenience. Under CI (or AXL_FUZZ_REQUIRED=1) a
+# missing clang is a FAILURE, because a gate that silently cannot see is worse
+# than no gate: it would report green forever while enforcing nothing, which is
+# the same trap CLAUDE.md calls out for the leak checker.
+check-fuzz-link:
+	@if command -v $(FUZZ_CC) >/dev/null 2>&1; then \
+	    $(MAKE) -s -C test/fuzz clean >/dev/null 2>&1; \
+	    t0=$$(date +%s%3N); \
+	    if $(MAKE) -s -C test/fuzz CC=$(FUZZ_CC) >/dev/null; then \
+	        t1=$$(date +%s%3N); \
+	        times=""; \
+	        for h in url json ipmi; do \
+	            s=$$(date +%s%3N); \
+	            if ! test/fuzz/$${h}_fuzz -runs=0 -artifact_prefix=test/fuzz/ \
+	                 test/fuzz/$${h}_corpus/ \
+	                 >/dev/null 2>test/fuzz/.$${h}.seedlog; then \
+	                echo "check-fuzz-link: FAIL — $${h}_fuzz crashed on its own seed corpus."; \
+	                head -30 test/fuzz/.$${h}.seedlog; rm -f test/fuzz/.*.seedlog; \
+	                exit 1; \
+	            fi; \
+	            e=$$(date +%s%3N); \
+	            n=$$(ls test/fuzz/$${h}_corpus | wc -l); \
+	            times="$$times $${h}=$$((e-s))ms/$${n}"; \
+	        done; \
+	        rm -f test/fuzz/.*.seedlog; \
+	        echo "check-fuzz-link: clean — 3 harnesses link; seeds replay [build $$((t1-t0))ms;$$times seeds]."; \
+	    else \
+	        echo "check-fuzz-link: FAIL — a harness in test/fuzz no longer links."; \
+	        $(MAKE) -C test/fuzz CC=$(FUZZ_CC) 2>&1 | tail -25; \
+	        exit 1; \
+	    fi; \
+	elif [ -n "$(AXL_FUZZ_REQUIRED)$${CI:-}" ]; then \
+	    echo "check-fuzz-link: FAIL — $(FUZZ_CC) not found, and CI / AXL_FUZZ_REQUIRED"; \
+	    echo "  says this gate must actually run. Install clang or set FUZZ_CC."; \
+	    exit 1; \
+	else \
+	    echo "check-fuzz-link: SKIP — $(FUZZ_CC) not found (libFuzzer is clang-only)."; \
+	fi
 
 # Verify the PE post-processor stamped NX_COMPAT (the produced images are
 # W^X-clean, so they must advertise NX compatibility for Secure-Boot /
@@ -749,6 +1229,103 @@ check-nx-compat: $(PREFIX)/cpu-topology-selftest.efi $(PREFIX)/SmbusHcShim.efi
 # checks it loads both clear bounds (_bss / _bss_end). The current ARCH's crt0.
 check-bss-clear: $(GCC_CRT0)
 	@python3 scripts/check-bss-clear.py $(GCC_CRT0)
+
+# Verify no VEX/EVEX-encoded instruction reached a produced image. UEFI runs
+# with CR4.OSXSAVE clear, so an AVX instruction is #UD at runtime -- and the
+# fault reads like a pointer bug (CR2 = 0 is the tell that it is not one).
+#
+# Not a hypothetical: this host's gcc defaults to -march=x86-64-v3, so ANY
+# compile that loses $(GCC_ARCH) emits VEX for plain scalar double math, and
+# the distro's own libstdc++.a carries 49 VEX instructions in
+# hashtable_c++0x.o. The same mechanism produced two separate wrong
+# conclusions before it was root-caused.
+#
+# libaxl.a rather than a hand-picked .efi list: objdump disassembles every
+# archive member, so ONE prerequisite covers every library translation unit
+# instead of only the ones a chosen image happens to link. The linked image
+# adds the crt0 and the link itself. The hosted-C++ path -- the one that links
+# a third-party archive built to someone else's baseline -- is covered where
+# it is produced, by test-cxx-hosted-qemu.sh.
+#
+# The .so, not the .efi: objcopy does not carry .symtab into the PE image, and
+# without symbols the check cannot tell a dispatched AVX routine
+# (blend_row_over_avx2) from an accidental one. Same code, both files.
+#
+# Deliberately NOT in LINT_GATES, for the same reason as check-nx-compat and
+# check-bss-clear above: it takes built artifacts as prerequisites, so it is
+# not a pure lint and cannot run beside a build. CI runs it explicitly.
+CHECK_NO_AVX_TARGETS = $(PREFIX)/lib/libaxl.a $(PREFIX)/cpu-topology-selftest.so \
+    $(LIBAXL_CXX_TARGET)
+
+#
+# $(LIBAXL_CXX_TARGET) is EMPTY without AXL_CPP=1, and libaxl-cxx.a holds the
+# two objects this gate was written for -- axl-cxx-rehash.o and
+# axl-cxx-libm.o, the ones that exist precisely because the distro's
+# hashtable_c++0x.o carries AVX. A bare `make check-no-avx` therefore scanned
+# everything EXCEPT them and printed "clean", which is the failure mode this
+# gate is supposed to prevent in other people's code. Same shape as
+# check-fuzz-link: say so loudly when running degraded, and refuse outright
+# under CI, where nothing is watching the output.
+check-no-avx: $(PREFIX)/lib/libaxl.a $(PREFIX)/cpu-topology-selftest.efi \
+              $(LIBAXL_CXX_TARGET)
+	@if [ -z "$(LIBAXL_CXX_TARGET)" ]; then \
+	    if [ -n "$$CI" ] || [ -n "$$AXL_CPP_REQUIRED" ]; then \
+	        echo "check-no-avx: FAIL — built without AXL_CPP=1, so libaxl-cxx.a"; \
+	        echo "  was NOT scanned. Its axl-cxx-rehash.o / axl-cxx-libm.o are the"; \
+	        echo "  objects this gate exists for. Run: make AXL_CPP=1 check-no-avx"; \
+	        exit 1; \
+	    fi; \
+	    echo "check-no-avx: DEGRADED — no AXL_CPP=1, so libaxl-cxx.a was not"; \
+	    echo "  scanned. For full coverage: make AXL_CPP=1 check-no-avx"; \
+	fi; \
+	python3 scripts/check-no-avx.py $(CHECK_NO_AVX_TARGETS)
+
+# Verify the relocation table the crt0 walks is whole and reaches the image.
+#
+# axl-reloc.c reads DT_RELA / DT_RELASZ and walks that many bytes -- it cannot
+# notice the bytes stopped being relocations partway through. On AArch64 an
+# -frtti link produced TWO relocation sections at non-contiguous addresses
+# while DT_RELA pointed at the first and DT_RELASZ counted both; the image
+# faulted before main with virtual calls working and only type_info broken.
+# Also catches the objcopy half: `-j` takes EXACT section names, so renaming
+# the output section without updating the -j list drops every relocation.
+check-reloc-coverage: $(PREFIX)/cpu-topology-selftest.efi
+	@python3 scripts/check-reloc-coverage.py $(PREFIX)/cpu-topology-selftest.efi
+
+# The three build paths (Makefile, axl-cc, the CMake package install.sh
+# generates) each carry their own copy of the compile flags and the objcopy -j
+# list. A pure lint -- reads files, builds nothing -- so it belongs in
+# LINT_GATES and can run beside a build.
+check-flag-parity:
+	@python3 scripts/check-flag-parity.py
+
+# check-toolchain-conf -- the same anti-drift argument as check-flag-parity,
+# applied to WHERE the C++ cross compilers live rather than which flags they
+# get. The AArch64 path was spelled out in five places (this Makefile,
+# scripts/axl-cc, twice in scripts/install.sh -- one of them inside the
+# GENERATED axl-config.cmake -- and the installer); adding x64 would have made
+# ten. Now all of them read scripts/axl-toolchains.conf, and this asserts both
+# that no build-critical file restates a path and that the manifest's own
+# repeated spellings agree. Docs are not scanned: prose quoting a path
+# describes it rather than depends on it.
+.PHONY: check-toolchain-conf
+check-toolchain-conf:
+	@python3 scripts/check-toolchain-conf.py
+
+# check-uefi-scope -- the contract check-dogfood cannot make. That gate matches
+# CALLS (`->PascalCase(`); this one matches TYPES, constants and `#include
+# <uefi/...>`, which is how UEFI actually reaches consumer code. `uefi/` ships
+# inside include/axl-sdk/ and axl-cc puts that on -isystem, so every consumer
+# has always been able to include it and nothing said so.
+#
+# include/axl/ is held at ZERO with no allowlist -- it is at zero today, so the
+# gate starts green and can only catch a regression. tools/ and sdk/examples/
+# may use UEFI but must DECLARE it: the point is not to forbid a protocol shim
+# from naming the protocol, it is that `rg EFI_ tools` should mean "these ten
+# declared it" rather than "who knows".
+.PHONY: check-uefi-scope
+check-uefi-scope:
+	@python3 scripts/check-uefi-scope.py
 
 check-version:
 	@file_ver=$$(cat VERSION); \
@@ -886,10 +1463,57 @@ $(BUILDDIR)/%.o: src/vterm/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # C++ pattern for src/runtime/*.cpp.  Only reachable when AXL_CPP=1
-# (the only .cpp source in libaxl-cxx.a today lives here).
+# (every .cpp source in libaxl-cxx.a lives here).
 ifdef AXL_CPP
 $(BUILDDIR)/%.o: src/runtime/%.cpp | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# axl-cxx-rehash.cpp defines two members of a libstdc++ class, so it has to
+# include <unordered_map> -- which the freestanding rule above cannot do. It
+# gets the same treatment axl-c++ --hosted gives a consumer TU, and for the
+# same two reasons: -ffreestanding makes bits/requires_hosted.h refuse the
+# header, and include/compat's `typedef void FILE` collides with the real
+# <stdio.h> that hosted libstdc++ pulls in.
+#
+# $(GCC_ARCH) is NOT dropped. Dropping it is exactly how a spike picked up AVX
+# from this host's -march=x86-64-v3 default and #UD'd under firmware that runs
+# with CR4.OSXSAVE clear -- the fault this file exists to prevent. `make
+# check-no-avx` covers the result.
+#
+# An explicit rule, so it wins over the pattern rule above. CXXFLAGS_HOSTED /
+# INCLUDES_HOSTED are defined beside CXXFLAGS_BASE, so this rule and the
+# check-examples gate cannot drift apart.
+# The hosted-flags group. Each of these includes a libstdc++ header that
+# bits/requires_hosted.h refuses under -ffreestanding, so each needs the same
+# treatment axl-c++ --hosted gives a consumer TU: -ffreestanding dropped, and
+# include/compat off the include path because its `typedef void FILE`
+# collides with the real <stdio.h> behind those headers.
+#
+# Done with TARGET-SPECIFIC VARIABLES over the pattern rule above, not by
+# repeating a recipe five times. The obvious-looking alternative is WRONG and
+# was briefly committed here:
+#
+#     $(BUILDDIR)/a.o: src/runtime/a.cpp | $(BUILDDIR)
+#     $(BUILDDIR)/b.o: src/runtime/b.cpp | $(BUILDDIR)
+#     	$(CXX) $(CXXFLAGS_HOSTED) ... -c $< -o $@
+#
+# make reads that as TWO rules of which only the LAST has a recipe; the others
+# fall back to the freestanding pattern rule and fail to compile. It looked
+# fine because the objects were already up to date -- only lint.sh's build
+# into a throwaway prefix, which forces every TU to compile fresh, exposed it.
+#
+# $(GCC_ARCH) is retained through CXXFLAGS_HOSTED. Dropping it is how a spike
+# picked up AVX from this host's -march=x86-64-v3 default and #UD'd under
+# firmware running with CR4.OSXSAVE clear. CXXFLAGS_HOSTED also inherits
+# -MD -MP through its filter-out, so these do not dodge check-dep-tracking.
+HOSTED_CXX_OBJS = $(BUILDDIR)/axl-cxx-rehash.o \
+                  $(BUILDDIR)/axl-cxx-rbtree.o \
+                  $(BUILDDIR)/axl-cxx-hash.o \
+                  $(BUILDDIR)/axl-cxx-string-inst.o \
+                  $(BUILDDIR)/axl-cxx-list.o
+
+$(HOSTED_CXX_OBJS): CXXFLAGS := $(CXXFLAGS_HOSTED)
+$(HOSTED_CXX_OBJS): INCLUDES := $(INCLUDES_HOSTED)
 endif
 
 $(BUILDDIR)/%.o: src/crt0/%.c | $(BUILDDIR)
@@ -961,6 +1585,25 @@ $(PREFIX)/lib/libaxl.a: $(LIB_OBJS) $(PE_SET_DEBUG) | $(PREFIX)/lib
 # AXL_CPP=1; pure-C builds never reach this rule.
 ifdef AXL_CPP
 $(PREFIX)/lib/libaxl-cxx.a: $(LIB_CXX_OBJS) | $(PREFIX)/lib
+	@rm -f $@
+	$(AR) rcs $@ $^
+endif
+
+# Compiled with the bare-metal toolchain's C driver and -ffreestanding: this
+# is glue, not application code, and it must not pull newlib's own headers for
+# the symbols it is REPLACING.
+ifneq ($(LIBAXL_CXXRT_TARGET),)
+$(BUILDDIR)/axl-cxxrt-%.o: src/cxxrt/axl-cxxrt-%.c | $(BUILDDIR)
+	$(AXL_CXXRT_CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# TWO members, not one: every C++ link pulls the allocator half (operator new
+# calls malloc), and archive members are all-or-nothing. Merged, that link
+# would also drag axl-cxxrt-eh.o's reference to __eh_frame_start -- which only
+# the exceptions linker script defines -- and --no-undefined would reject it
+# before --gc-sections could collect the unreferenced function holding it.
+# Split, the bridge is usable without opting into the eh machinery.
+$(PREFIX)/lib/libaxl-cxxrt.a: $(BUILDDIR)/axl-cxxrt-alloc.o \
+                              $(BUILDDIR)/axl-cxxrt-eh.o | $(PREFIX)/lib
 	@rm -f $@
 	$(AR) rcs $@ $^
 endif
@@ -1160,6 +1803,32 @@ $(PREFIX)/fs-path-selftest.efi: $(BUILDDIR)/fs-path-selftest.o $(LINK_CRT0) $(PR
 
 $(BUILDDIR)/fs-path-selftest.o: test/integration/fs-path-selftest.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# cxx-streams-selftest.efi — axl::cout / axl::cin / axl::cerr and axl::string
+# (test-cxx-streams-qemu.sh). Built HERE rather than only by axl-c++ because
+# scripts/install.sh stages RELEASE, where AXL_MEM_DEBUG is off and there is
+# no leak accounting at all — and axl::cin deliberately has no destructor, so
+# its buffers are freed by an axl_atexit hook and nothing else. A leak gate
+# that cannot see is worse than none. The test ALSO builds this same source
+# with the staged axl-c++, which is what proves the consumer toolchain path.
+#
+# Freestanding: CXXFLAGS_BASE keeps -ffreestanding, so this is the
+# configuration the stream layer exists for. Needs AXL_CPP=1 for
+# libaxl-cxx.a (operator new/delete and the std:: halt stubs).
+cxx-streams-selftest: $(PREFIX)/cxx-streams-selftest.efi
+	@echo "  Built: $(PREFIX)/cxx-streams-selftest.efi"
+
+$(PREFIX)/cxx-streams-selftest.efi: $(BUILDDIR)/cxx-streams-selftest.o \
+                                    $(LINK_CRT0) $(PREFIX)/lib/libaxl.a \
+                                    $(LIBAXL_CXX_TARGET)
+	$(LD_ELF) $(LDFLAGS_EFI) -T $(EFI_LDS) \
+	    -o $(@:.efi=.so) $(LINK_CRT0) $(BUILDDIR)/cxx-streams-selftest.o \
+	    $(PREFIX)/lib/libaxl.a $(LIBAXL_CXX_TARGET) $(PREFIX)/lib/libaxl.a
+	$(OBJCOPY) $(OBJCOPY_SECTIONS) --output-target=$(PE_TARGET) --subsystem=10 $(@:.efi=.so) $@
+	$(PE_SET_DEBUG) $@
+
+$(BUILDDIR)/cxx-streams-selftest.o: test/integration/cxx-streams-selftest.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # kbprobe.efi — keyboard event-timing probe + the F1/F3/F2 reader for the kbtune
 # bounce A/B (test-kbtune-bounce-qemu.sh, driven by run-qemu --holdkey).
@@ -2294,7 +2963,8 @@ TESTS = AxlTestMem AxlTestString AxlTestIO AxlTestLog \
         AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind \
         AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion \
         AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart \
-        AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p
+        AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p \
+        AxlTestJsonConformance AxlTestJsonCorpus
 
 TEST_EFIS = $(patsubst %,$(PREFIX)/%.efi,$(TESTS))
 
@@ -2350,6 +3020,8 @@ $(eval $(call BUILD_TEST,AxlTestHii,axl-test-hii))
 $(eval $(call BUILD_TEST,AxlTestAuth,axl-test-auth))
 $(eval $(call BUILD_TEST,AxlTestFw,axl-test-fw))
 $(eval $(call BUILD_TEST,AxlTest9p,axl-test-9p))
+$(eval $(call BUILD_TEST,AxlTestJsonConformance,axl-test-json-conformance))
+$(eval $(call BUILD_TEST,AxlTestJsonCorpus,axl-test-json-corpus))
 
 # ===================================================================
 # Tools (standalone UEFI utilities)

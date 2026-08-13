@@ -99,6 +99,45 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# RAPID RECONNECT: N back-to-back handshakes, no delay between them.
+#
+# Two independent sessions reported curl exiting 35 (SSL connect error) and 56
+# on a request issued immediately after a previous one to an AXL TLS server —
+# one inside SoftBMC's test.sh, one against a stock build. Neither could show
+# it on demand, so this exists to turn "I saw it once" into a reproducer or
+# rule the theory out.
+#
+# Every request already carries `Connection: close`, so each iteration is a
+# FRESH TCP connection and a FRESH handshake — which is the scenario. The four
+# requests above are the same shape and pass, so if this is rate-dependent it
+# needs depth, not variety.
+#
+# Reported as a count rather than pass/fail-per-iteration: one flake in 40 is
+# the finding, and 40 separate assertions would drown it.
+# ---------------------------------------------------------------------------
+# Overridable so a suspected flake can be chased at depth without changing
+# what CI pays for every run: AXL_TLS_RECONNECT_N=500 ./test-https.sh
+RECONNECT_N=${AXL_TLS_RECONNECT_N:-40}
+rc_fail=0
+declare -A rc_seen=()
+for _i in $(seq 1 $RECONNECT_N); do
+    curl -s --insecure -H "Connection: close" --max-time 5 \
+         -o /dev/null "${BASE_URL}/plain"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rc_fail=$((rc_fail + 1))
+        rc_seen[$rc]=$(( ${rc_seen[$rc]:-0} + 1 ))
+    fi
+done
+if [[ $rc_fail -eq 0 ]]; then
+    pass "$RECONNECT_N back-to-back TLS handshakes, no failures"
+else
+    detail=""
+    for k in "${!rc_seen[@]}"; do detail+=" curl($k)x${rc_seen[$k]}"; done
+    fail "TLS rapid reconnect: $rc_fail/$RECONNECT_N failed —$detail"
+fi
+
+# ---------------------------------------------------------------------------
 # WebSocket over TLS (wss): inbound client->server frames must reach the
 # handler. Regression for the TLS drain mis-routing decrypted WS frames into
 # header_buf (select_decrypt_buf checked !headers_done before is_websocket).
@@ -162,6 +201,47 @@ else:
 s.close()
 PYEOF
 )
+
+# ---------------------------------------------------------------------------
+# Concurrent handshakes on one loop.
+#
+# Regression for AXL_BUSY being collapsed into a fatal error: when two
+# handshakes interleave on a shared AxlLoop, a recv for a connection can be
+# dispatched while that same socket's send completion is still queued, so the
+# next flight hits axl_tcp_send_async with send_source still set. That returns
+# AXL_BUSY -- retryable, bytes still buffered -- which handshake_flush_async
+# turned into AXL_TLS_ERR, and the server killed a healthy connection.
+#
+# Sequential HTTPS cannot observe this at any request count: one connection at
+# a time never contends the loop, so the "lock-step flights" assumption holds
+# and the prior send has always drained. The requests below MUST be backgrounded
+# and overlapping -- serialising them makes this check vacuous.
+# ---------------------------------------------------------------------------
+CONC_ROUNDS=6
+CONC_WIDTH=4
+conc_total=0
+conc_ok=0
+for _round in $(seq 1 $CONC_ROUNDS); do
+    conc_codes=$(for _i in $(seq 1 $CONC_WIDTH); do
+        # -w always emits exactly one line (000 on connect/handshake
+        # failure), so no `|| echo` fallback -- that double-counts a
+        # failing request and inflates the total.
+        ( curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}\n' \
+              "${BASE_URL}/plain" 2>/dev/null || true ) &
+    done; wait)
+    while IFS= read -r _code; do
+        conc_total=$((conc_total + 1))
+        [[ "$_code" == "200" ]] && conc_ok=$((conc_ok + 1))
+    done <<< "$conc_codes"
+done
+
+if [[ $conc_total -ne $((CONC_ROUNDS * CONC_WIDTH)) ]]; then
+    fail "concurrent HTTPS: harness collected $conc_total/$((CONC_ROUNDS * CONC_WIDTH)) results"
+elif [[ $conc_ok -eq $conc_total ]]; then
+    pass "concurrent HTTPS handshakes: $conc_ok/$conc_total OK (width $CONC_WIDTH)"
+else
+    fail "concurrent HTTPS handshakes: only $conc_ok/$conc_total OK (width $CONC_WIDTH)"
+fi
 
 echo ""
 printf "HTTPS tests: %d passed, %d failed (%s)\n" "$PASS" "$FAIL" "$TEST_ARCH"

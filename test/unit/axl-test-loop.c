@@ -5,8 +5,54 @@
 #include "axl-test.h"
 #include <axl/axl-log.h>
 #include <axl/axl-loop.h>
+#include <axl/axl-time.h>
 #include <axl/axl-wait.h>
 #include <uefi/axl-uefi.h>
+
+/* WHY gBS->Stall AND NOT axl_usleep, throughout this file.
+   axl_usleep/axl_msleep are the right answer nearly everywhere -- they idle
+   the CPU on a one-shot timer instead of spinning, and this file already
+   includes <axl/axl-wait.h> for other reasons. But they are built ON AxlLoop:
+   axl_usleep -> axl_wait_ms -> _axl_event_wait_timeout_with_tick, which calls
+   axl_loop_new(), axl_loop_add_timeout() and axl_loop_run(). Delaying with
+   the subject under test is circular, and the failure it invites is not a
+   wrong answer but a HANG: a loop defect that stops the wait returning never
+   returns here either, and test-axl.sh runs every unit binary in ONE QEMU
+   boot under ONE timeout, so one hung binary starves every later one.
+   gBS->Stall always returns, so a broken loop fails loudly and locally.
+   axl-wait.h names axl_backend_stall as the primitive for exactly this case,
+   but it is backend-internal and tests use public headers only. The spin
+   costs well under a second across this file; a hung suite costs the run. */
+
+/* AxlLoop's internal keypress drain period (POLL_INTERVAL_MS in
+   src/loop/axl-loop-internal.h), in microseconds. Duplicated rather than
+   exported -- it is an implementation detail the library is free to retune.
+
+   The constraint is ONE-DIRECTIONAL, so state it rather than claim the test
+   is retune-proof: this value must be <= the library's period. Set HIGHER
+   than the library's, the "was I preempted past a whole period" NOTE stops
+   firing when it should, so a host stall becomes indistinguishable from the
+   loop defect this test exists to catch. Set LOWER it is merely conservative
+   -- the NOTE fires more readily, and the `2 *` Stall further below must
+   still exceed one real period, which a lower value keeps true only while it
+   stays above half the library's. If POLL_INTERVAL_MS ever drops below 10,
+   drop this with it. */
+#define POLL_INTERVAL_US            (10u * 1000u)
+
+/* Bounds for the phase-pinning spins in test_keypress_drain_non_blocking.
+   BOTH are needed. The wall-clock budget is the real limit (5 poll periods is
+   ample for a tick that arrives every one), but axl_time_get_us() reports 0
+   when the counter frequency is unavailable, and a spin with no backstop
+   wedges QEMU -- which under test-axl.sh runs every binary in ONE boot under
+   ONE timeout, so a wedge here starves every later binary. The iteration cap
+   is that backstop, and it is sized rather than rounded: one iteration is a
+   firmware CheckEvent, call it 1-10 us, and the budget to cover is 5 periods
+   = 50 ms, so 200k iterations spans ~0.2-2 s. That comfortably overshoots the
+   budget on any host fast enough to run this suite while staying far inside
+   the single shared timeout test-axl.sh gives the whole boot -- which 2M
+   iterations, at the slow end, would not. */
+#define KEYPRESS_SPIN_BUDGET_US     (5u * POLL_INTERVAL_US)
+#define KEYPRESS_SPIN_ITERS         200000u
 
 // ---------------------------------------------------------------------------
 // Test 1: Timer fires N times then quits
@@ -1194,6 +1240,47 @@ on_keypress_drain(AxlInputKey key, void *data)
     return AXL_SOURCE_CONTINUE;
 }
 
+/* Dispatch non-blocking until it returns @p want, bounded by BOTH a wall-clock
+   budget and an iteration cap. Returns true if @p want was observed.
+
+   Two bounds because either alone can fail open: the clock reads 0 on a host
+   without a usable counter frequency, and an unbounded iteration count wedges
+   QEMU -- test-axl.sh runs every binary in ONE boot under ONE timeout, so a
+   spin here would starve every binary after it. */
+static bool
+keypress_spin_until(AxlLoop *loop, int want, uint64_t *at_us)
+{
+    uint64_t started_us = axl_time_get_us();
+
+    for (unsigned i = 0; i < KEYPRESS_SPIN_ITERS; i++) {
+        /* Stamped BEFORE the call, and reported for the one that succeeds.
+           A dispatch that returns 0 has already RUN the source -- including
+           the firmware key-drain -- so a timestamp taken afterwards would
+           exclude exactly the segment a caller needs to measure. */
+        uint64_t before_us = axl_time_get_us();
+        int      rc        = axl_loop_dispatch(loop, false);
+
+        if (rc == want) {
+            if (at_us != NULL) {
+                *at_us = before_us;
+            }
+            return true;
+        }
+        /* A quit latches rc < 0 forever -- neither 0 nor 1 -- so without this
+           both spins burn their whole bound before anyone hears about it. */
+        if (rc < 0) {
+            return false;
+        }
+        if (started_us != 0) {
+            uint64_t now_us = axl_time_get_us();
+            if (now_us != 0 && now_us - started_us > KEYPRESS_SPIN_BUDGET_US) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 static void
 test_keypress_drain_non_blocking(void)
 {
@@ -1219,19 +1306,90 @@ test_keypress_drain_non_blocking(void)
            budget every tick.
        No Stall and NO test_check (serial I/O) between the two dispatches on
        purpose: the "not re-armed yet" invariant holds only while under
-       POLL_INTERVAL_MS (10 ms) of wall-clock elapses between them. Two
-       consecutive gBS->CheckEvent calls run in microseconds, but a PASS line
-       printed to a slow serial console between them can exceed 10 ms and re-arm
-       the periodic timer — which is exactly what made this assertion flaky on
-       CI's slower (non-KVM) boot. Keeping all I/O out of the window makes it
-       boot-speed-independent (the two CheckEvent calls are microseconds apart,
-       far under the 10 ms period, on any boot). The firmware queue is empty here, so the
-       callback never fires — what is under test is that the source is reachable
-       at all, and gated to one drain per tick. */
-    gBS->Stall(20000);   /* > POLL_INTERVAL_MS (10) */
-    int first_dispatch  = axl_loop_dispatch(loop, false);
-    int second_dispatch = axl_loop_dispatch(loop, false);
-    test_check(first_dispatch == 0,
+       POLL_INTERVAL_MS (10 ms) of wall-clock elapses between them.
+
+       Measuring that window's DURATION was the previous hardening, and it is
+       the wrong measurement. The selection is gated on
+       axl_backend_event_check(loop->poll_timer) (axl-loop.c), i.e. CheckEvent
+       on a PERIODIC timer: the timer signals once per period and that signal
+       PERSISTS until a check consumes it. So the signal the first dispatch
+       consumes may have been waiting almost a full period already -- a
+       dispatch returning 0 says a tick fired at some unknown point in the
+       past, NOT that one just fired. The time left before the next tick is
+       therefore an arbitrary 0..period, and a short window landing near the
+       end of it sees the timer signal again, legitimately. The second dispatch
+       returns 0, and the sampler prints nothing because the window itself
+       looked fine. That is the residual: red once in a loaded verify.sh,
+       against 26 green runs of this same code standalone (idle, under CPU
+       hogs, and under a concurrent verify.sh) -- rare enough that it was never
+       reproduced on demand, which is why this is fixed by construction rather
+       than by tuning a threshold against a measurement.
+
+       So PIN THE PHASE instead of timing it. Drain to idle, then spin until
+       the next tick selects the source -- the instant that dispatch returns 0
+       a tick has just fired, so very nearly a full period remains before the
+       next one, whatever the host is doing. The pair of calls that follows is
+       then bounded by the loop's own period rather than by host scheduling.
+
+       The gap is still measured, because a preemption longer than a whole
+       poll period would still invalidate the assertion and must be said out
+       loud rather than reported as a loop defect. The difference is that the
+       measurement now guards the window it is actually about.
+
+       The firmware queue is empty here, so the callback never fires — what is
+       under test is that the source is reachable at all, and gated to one
+       drain per tick. */
+    int      second_dispatch = 0;
+    uint64_t gap_us          = 0;
+    uint64_t tick_at_us      = 0;
+
+    /* Drain whatever is already selected, leaving the loop idle. */
+    bool drained = keypress_spin_until(loop, 1, NULL);
+    /* Pin the phase: the tick that flips this back to 0 has just fired, and
+       tick_at_us stamps the moment just before that dispatch consumed it. */
+    bool synced  = drained && keypress_spin_until(loop, 0, &tick_at_us);
+
+    second_dispatch   = axl_loop_dispatch(loop, false);
+    uint64_t ended_us = axl_time_get_us();
+
+    /* The measured window runs from BEFORE the pinning dispatch (so it covers
+       that dispatch's own firmware key-drain, where a preemption is just as
+       fatal to the invariant) through the second dispatch. axl_time_get_us()
+       reports 0 when the counter frequency is unavailable; a guard that cannot
+       see is worse than no guard, so that is reported rather than read as a
+       clean gap of 0. */
+    bool clock_ok = (tick_at_us != 0 && ended_us != 0);
+    if (clock_ok) {
+        gap_us = ended_us - tick_at_us;
+    }
+
+    /* Ordered so the most explanatory NOTE wins. A failed sync is reported
+       first but must NOT quote the budget as though it were enforced -- with
+       the clock unavailable the spin is bounded only by its iteration cap. */
+    if (!synced) {
+        axl_printf("  NOTE: keypress drain: no poll tick observed (drained=%d)"
+                   "; bound was %llu us%s. The assertion below never reached "
+                   "its precondition\n",
+                   (int)drained,
+                   (unsigned long long)KEYPRESS_SPIN_BUDGET_US,
+                   (axl_time_get_us() == 0)
+                       ? " but the clock is unavailable, so only the iteration"
+                         " cap applied"
+                       : "");
+    } else if (!clock_ok) {
+        axl_printf("  NOTE: keypress drain: axl_time_get_us() is unavailable, "
+                   "so the post-tick gap could not be measured; the assertion "
+                   "below is running unguarded\n");
+    } else if (gap_us >= POLL_INTERVAL_US) {
+        axl_printf("  NOTE: keypress drain: the host preempted us for %llu us "
+                   "(>= one %llu us period) between the tick and the check; "
+                   "the assertion below is measuring a loaded host, not the "
+                   "loop\n",
+                   (unsigned long long)gap_us,
+                   (unsigned long long)POLL_INTERVAL_US);
+    }
+
+    test_check(synced,
                "loop: non-blocking dispatch drains keypress on the poll tick");
     test_check(keypress_drain_calls == 0,
                "loop: empty key queue -> keypress callback not invoked");
@@ -1239,14 +1397,14 @@ test_keypress_drain_non_blocking(void)
                "loop: keypress is not re-selected before the next poll tick");
 
     /* The next tick re-arms it (the poll timer is periodic). */
-    gBS->Stall(20000);
+    gBS->Stall(2 * POLL_INTERVAL_US);
     test_check(axl_loop_dispatch(loop, false) == 0,
                "loop: keypress is re-selected on the following poll tick");
 
     /* A loop with no keypress source must not consume the poll timer: an
        empty non-blocking dispatch still reports "nothing pending". */
     axl_loop_remove_source(loop, id);
-    gBS->Stall(20000);
+    gBS->Stall(2 * POLL_INTERVAL_US);
     test_check(axl_loop_dispatch(loop, false) == 1,
                "loop: no keypress source -> non-blocking dispatch stays idle");
 

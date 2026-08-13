@@ -445,7 +445,7 @@ test_fw_open_close(void)
 
     /* NULL-safe close */
     axl_fw_close(NULL);
-    test_check(true, "fw: close(NULL) does not crash");
+    test_survived("fw: close(NULL) does not crash");
 
     /* NULL image: axl_fw_root returns NULL */
     test_check(axl_fw_root(NULL) == NULL, "fw: root(NULL) == NULL");

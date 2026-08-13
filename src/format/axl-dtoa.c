@@ -2,22 +2,37 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-dtoa.c
-    Shortest round-trippable double->decimal conversion via Grisu2.
+    Short round-trippable double->decimal conversion via Grisu2.
 
     Grisu2 (Loitsch, "Printing Floating-Point Numbers Quickly and
-    Accurately with Integers", PLDI 2010) produces the shortest decimal
+    Accurately with Integers", PLDI 2010) produces a short decimal
     digit string that round-trips back to the original double, using
     only 64-bit integer arithmetic plus a small cached table of powers
     of ten — no bignum, no libm, no libc. It is the engine behind the
     %f / %e / %g conversions in axl-format.c.
 
-    Grisu2 is shortest-but-not-always-optimally-rounded: for a tiny
-    fraction of inputs a different shortest string of equal length
-    exists; both still round-trip. (Grisu3 adds a fallback to guarantee
-    optimal rounding; we don't need it for formatting.) The output is
-    a digit string + decimal-point position, the David-Gay dtoa shape,
-    which lets the caller render fixed (%f), scientific (%e), or
-    shortest (%g) from one conversion.
+    THE ROUND TRIP IS ALWAYS EXACT; THE LENGTH IS NOT ALWAYS MINIMAL.
+    Grisu2 is the "shortest we can prove without a bignum" tier: for a
+    fraction of a percent of doubles (0.082% over a 2,000,000-value
+    sweep of random bit patterns) a strictly SHORTER string also
+    round-trips — 1e23 comes out as "9999999999999999" with decpt 23
+    where "1" with decpt 24 would do. Grisu3 adds the fallback that
+    closes this, at the cost of the bignum path; formatting does not
+    need it, so the contract to state downstream is "round-trips
+    exactly, very nearly always minimal", never a bare "shortest". The
+    output is a digit string + decimal-point position, the David-Gay
+    dtoa shape, which lets the caller render fixed (%f), scientific
+    (%e), or shortest (%g) from one conversion.
+
+    Length is a separate axis from ROUNDING, and only the latter moved
+    in the widening of kPow10 (see digit_gen): at its own length the
+    string is now the correctly-rounded one for 99.94% of that same
+    random-bit-pattern corpus, against 72.40% while the refinement step
+    was being skipped. The length distribution is untouched —
+    refinement walks the last digit, it never removes one. (Every
+    percentage in this file is over random bit patterns unless it says
+    otherwise; a corpus weighted toward human-scale decimals scores
+    much better on both axes.)
 
     This is the standard reference formulation; the cached-powers table
     is the well-known one shared by V8, RapidJSON, and the
@@ -136,8 +151,11 @@ normalized_boundaries(double value, DiyFp *m_minus, DiyFp *m_plus)
 // ===================================================================
 // Cached powers of ten as DiyFp (the standard Grisu table: 87 entries,
 // decimal exponents -348..340 in steps of 8). Significands f[i] and
-// exponents e[i]. get_cached_power indexes this in [1, 86] across the
-// entire finite-double range, so no bounds guard is needed.
+// exponents e[i]. get_cached_power indexes this in [6, 84] across the
+// entire finite-double range, so no bounds guard is needed. That range
+// is exhaustive, not sampled: it comes from running get_cached_power
+// over every w_p.e a double can produce, [-1137, 960]. The fractional
+// loop's bound argument in digit_gen depends on it.
 // ===================================================================
 
 static const uint64_t kCachedPowers_F[] = {
@@ -208,10 +226,39 @@ get_cached_power(int e, int *K)
 // Digit generation
 // ===================================================================
 
-static const uint32_t kPow10[] = {
-    1, 10, 100, 1000, 10000, 100000, 1000000,
-    10000000, 100000000, 1000000000,
+/* 10^0 .. 10^19 — every power of ten a uint64_t holds (10^20 does not).
+ * Two loops index it: the integer loop below, which cannot exceed 8,
+ * and the fractional loop, which reaches 16. See the bound arguments
+ * at the two call sites for why neither can run off the end. */
+static const uint64_t kPow10[] = {
+    1ULL,
+    10ULL,
+    100ULL,
+    1000ULL,
+    10000ULL,
+    100000ULL,
+    1000000ULL,
+    10000000ULL,
+    100000000ULL,
+    1000000000ULL,
+    10000000000ULL,
+    100000000000ULL,
+    1000000000000ULL,
+    10000000000000ULL,
+    100000000000000ULL,
+    1000000000000000ULL,
+    10000000000000000ULL,
+    100000000000000000ULL,
+    1000000000000000000ULL,
+    10000000000000000000ULL,
 };
+
+/* A tripwire under the bound arguments below, not a substitute for
+ * them: the fractional index reaches 16, so trimming this table to
+ * "the entries something obviously uses" would reintroduce exactly the
+ * out-of-range .rodata read f23e571b was fixing, silently. */
+_Static_assert(sizeof(kPow10) / sizeof(kPow10[0]) >= 17,
+               "digit_gen's fractional index reaches 16");
 
 static int
 count_decimal_digit32(uint32_t n)
@@ -278,8 +325,23 @@ digit_gen(DiyFp W, DiyFp Mp, uint64_t delta, char *buffer, int *len, int *K)
         uint64_t tmp = ((uint64_t)p1 << -one.e) + p2;
         if (tmp <= delta) {
             *K += kappa;
+            /* kappa is post-decrement here, so this indexes kPow10 in
+             * [0, 8]: reaching index 9 would need an initial kappa of
+             * 10, i.e. p1 >= 10^9, and p1 = Mp.f >> -one.e peaks at
+             * 798,336,123 — an exhaustive figure, since at a fixed
+             * exponent one.e is fixed and Mp.f rises with the
+             * significand, so p1 peaks at the largest significand of
+             * each exponent. Index 8 IS reached (by subnormals around
+             * 1e-317; 0x000000000134D761 is one), which is why this is
+             * argued rather than measured — a 44,000,000-value random
+             * sweep sees only index 0, those subnormals being roughly
+             * 2^-30 of the bit space.
+             *
+             * 10^kappa << -one.e cannot overflow either: it is the
+             * place value of the last emitted digit, so it is at most
+             * p1_initial << -one.e <= Mp.f < 2^64. */
             grisu_round(buffer, *len, delta, tmp,
-                        (uint64_t)kPow10[kappa] << -one.e, wp_w.f);
+                        kPow10[kappa] << -one.e, wp_w.f);
             return;
         }
     }
@@ -296,13 +358,93 @@ digit_gen(DiyFp W, DiyFp Mp, uint64_t delta, char *buffer, int *len, int *K)
         kappa--;
         if (p2 < delta) {
             *K += kappa;
-            /* idx = -kappa is the fractional-iteration count. The
-             * shortest decimal of any finite double has <= 17 digits,
-             * and the loop terminates well before idx reaches 10, so
-             * kPow10[idx] (entries 0..9) is always in bounds — verified
-             * empirically by the DBL_MAX/DBL_MIN/subnormal tests, which
-             * drive this loop to its deepest realistic point. */
-            int idx = -kappa;
+            /* idx = -kappa counts the fractional iterations. Each one
+             * multiplied p2 and delta by 10, so wp_w — the distance
+             * from the value to its upper boundary — has to be scaled
+             * by the same 10^idx before grisu_round can compare them.
+             * That is what kPow10[idx] supplies.
+             *
+             * idx routinely runs past 10: measured over a 10,000,000-
+             * double sweep it reaches 16, with ~70% of conversions at
+             * 10 or above. While kPow10 was a uint32 table those were
+             * all past its end (10^10 does not fit in 32 bits), so
+             * f23e571b clamped the multiplier to 0 for them. That was
+             * safe — a zero multiplier makes grisu_round's first loop
+             * condition false, so the digits are returned unrefined,
+             * and refinement only walks the last digit toward a closer
+             * value INSIDE the same rounding interval; Grisu2 is
+             * allowed to return a non-optimally-rounded shortest
+             * string, never a wrong one. But it meant the refinement
+             * was skipped for ~70% of all conversions, and only 72.40%
+             * of 2,000,000 random doubles came out correctly rounded
+             * at their own length.
+             *
+             * The clamp bound was the table size, 10, and not
+             * RapidJSON's 9, and that difference was load-bearing:
+             * idx == 9 is a live case (12.47% of conversions), and
+             * clamping one entry early changed the digits of 4.6% of
+             * all conversions, almost always AWAY from the correctly
+             * rounded value. The reason given for it at the time —
+             * that AXL keeps count_decimal_digit32's 9- and 10-digit
+             * branches, which RapidJSON comments out, so the integer
+             * branch above indexes kPow10[9] — was wrong. Those
+             * branches are indeed kept and the 9-digit one is live,
+             * but the integer branch's index tops out at 8 (see the
+             * argument there); kPow10[9] is unreachable from it. What
+             * made the bound matter was the FRACTIONAL index alone.
+             *
+             * The table is uint64_t 10^0..10^19 now, so there is no
+             * clamp and every conversion is refined: 99.94% correctly
+             * rounded over the same 2,000,000 doubles. Round-trip was
+             * exact before the widening and is exact after — this buys
+             * shortest-digit optimality, not correctness.
+             *
+             * Two bounds keep the widened table in range. Both rest on
+             * one.f = 1 << -Mp.e with Mp.e in [-60, -34], which holds
+             * for EVERY double: w_p.e spans [-1137, 960] across the
+             * whole format, and get_cached_power over that closed range
+             * yields table indices [6, 84] and product exponents inside
+             * those two bounds. So one.f <= 2^60.
+             *
+             *  - delta < 10 * one.f here, which both other bounds use.
+             *    delta is delta0 * 10^idx, and p2 is masked to < one.f
+             *    every iteration. For idx >= 2 the previous iteration
+             *    did not return, so delta0 * 10^(idx-1) <= p2 < one.f.
+             *    For idx == 1 — reachable, by subnormals — the base
+             *    case comes from the integer loop instead: it falls
+             *    through to here only after failing tmp <= delta at
+             *    kappa == 0, where p1 is 0 and tmp is exactly p2, so
+             *    delta0 < p2 < one.f. Either way the last multiply by
+             *    10 lands delta under 10 * one.f, and since one.f <=
+             *    2^60 that is < 2^64: delta cannot itself wrap before
+             *    the comparison that ends the loop.
+             *
+             *  - idx <= 16, so the read is in range with 3 entries to
+             *    spare. From the above, 10^idx < 10 * one.f / delta0.
+             *    delta0 >= 764: m+ - m- is at least 1536 units of w
+             *    (1536 when v.f is the hidden bit, 2048 for any other
+             *    normal, and 2^(63-k) >= 2048 for a subnormal whose
+             *    significand has k+1 bits — 54 distinct values in all,
+             *    up to 2^63, so "1536 or 2048" would be a normals-only
+             *    claim), scaled by the cached power's >= 1/2, less the
+             *    2 units grisu2 trims and up to 2 for diy_fp_mul's
+             *    rounding. Measured minimum 768. So 10^idx < 10 * 2^60
+             *    / 764, i.e. idx <= 16 — exactly the maximum measured
+             *    over 44,000,000 conversions (2..16 on random bit
+             *    patterns, 1..16 once subnormals are swept too).
+             *
+             *  - wp_w.f * kPow10[idx] cannot overflow uint64_t.
+             *    wp_w.f = Wp.f - W.f <= Wp.f - Wm.f = delta0 because
+             *    W.f >= Wm.f: w.f - w_m.f is 512, 1024 or (subnormal)
+             *    2^(62-k) >= 2048 units, which the cached power's
+             *    >= 1/2 scaling leaves at >= 254 — far more than the
+             *    +1 grisu2 adds to Wm.f plus diy_fp_mul's <= 2 ulp. So
+             *    the product is at most delta0 * 10^idx = delta < 10 *
+             *    one.f <= 1.15e19, under UINT64_MAX = 1.84e19. Checked
+             *    in 128-bit arithmetic over the same sweep: the largest
+             *    delta reaching here was 1.146e19, just inside the
+             *    bound, and the largest product 6.66e18. */
+            const int idx = -kappa;
             grisu_round(buffer, *len, delta, p2, one.f,
                         wp_w.f * kPow10[idx]);
             return;

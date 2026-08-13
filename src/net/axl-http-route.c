@@ -209,6 +209,7 @@ static_file_handler(
     void             *data
     )
 {
+    (void)req;              /* the path is baked into @a data at route time */
     axl_http_response_set_file(resp, (const char *)data);
     return AXL_OK;
 }

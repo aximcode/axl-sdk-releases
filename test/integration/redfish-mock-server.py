@@ -166,7 +166,30 @@ class RedfishHandler(BaseHTTPRequestHandler):
         token = self.headers.get("X-Auth-Token")
         return token == MOCK_TOKEN
 
+    def send_raw(self, code: int, body: bytes) -> None:
+        """Send a body VERBATIM, bypassing json.dumps.
+
+        json.dumps cannot emit JSON5, and the point of /JSON5Trap is to serve
+        something a strict reader must refuse.
+        """
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("OData-Version", "4.0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
+        # A body that is valid JSON5 and invalid JSON: a comment, a trailing
+        # comma and an unquoted key. A Redfish service should never send this,
+        # which is the point -- a client that ACCEPTS it is applying the wrong
+        # dialect to untrusted network input, and this route is the only way to
+        # tell from the outside.
+        if self.path == "/redfish/v1/JSON5Trap":
+            self.send_raw(200, b'{\n  // not valid JSON\n  Name: "trap",\n}\n')
+            return
+
         # Public routes (no auth)
         if self.path in PUBLIC_ROUTES:
             self.send_json(200, PUBLIC_ROUTES[self.path])

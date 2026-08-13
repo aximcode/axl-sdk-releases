@@ -69,20 +69,23 @@ axl_http_server_add_websocket_ex(AxlHttpServer *s, const char *path,
 // ---------------------------------------------------------------------------
 // Per-connection outbound frame queue — the ws-broadcast-over-TLS desync fix.
 //
-// axl_tcp_send_async is strictly one-send-in-flight, and axl_tls_write_async
-// advances the TLS write sequence number at ENCRYPT time. So two outbound
-// frames racing a single async completion used to encrypt-then-drop the second
-// — emitting a record the seqno had already consumed but which never reached
-// the wire — desyncing the TLS stream and wedging the server loop. (The
-// console-mirror echoes one keystroke as >=3 back-to-back broadcasts, hitting
-// this on the first key.)
+// axl_tcp_send_async used to REFUSE a second send while one was in flight, and
+// axl_tls_write_async advances the TLS write sequence number at ENCRYPT time.
+// So two outbound frames racing a single async completion used to
+// encrypt-then-drop the second — emitting a record the seqno had already
+// consumed but which never reached the wire — desyncing the TLS stream and
+// wedging the server loop. (The console-mirror echoes one keystroke as >=3
+// back-to-back broadcasts, hitting this on the first key.)
 //
-// Every outbound WS frame — broadcast, axl_ws_send, pong — now goes through
-// this per-connection FIFO. Frames are enqueued PRE-encryption; only the head
-// is sent at a time (encrypted at flush, for TLS), and the next is pumped from
-// the send-completion callback, so frames SERIALIZE instead of racing. Lossy
-// back-pressure (drop-oldest on overflow) drops a RAW frame before
-// mbedtls_ssl_write ever runs, so an overflow can never desync the stream.
+// The transport queues sends now, so SERIALISATION is no longer this queue's
+// job — but the queue stays, because it was doing a second one that has no
+// equivalent below it (design §6c). Every outbound WS frame — broadcast,
+// axl_ws_send, pong — is enqueued PRE-encryption and only the head is handed
+// down at a time; keeping one frame in flight is what leaves the rest
+// DROPPABLE. Lossy back-pressure (drop-oldest on overflow) sheds a RAW frame
+// before mbedtls_ssl_write ever runs, so an overflow can never desync the
+// stream, and a frame already given to the transport is beyond reach of the
+// drop policy — which is why exactly one is.
 // ---------------------------------------------------------------------------
 
 #define WS_OUT_MAX_FRAMES  1024u
@@ -185,15 +188,10 @@ ws_outq_pump(HttpConn *conn)
         return;
     }
     conn->ws_out_inflight = false;
-    if (rc == AXL_BUSY) {
-        /* A non-queue send is somehow in flight on this sock. The SSL context
-           is untouched (the axl_tls_write_async floor), so the head is intact
-           and stays queued for a later pump. The queue owns every send after
-           the upgrade, so this should not occur — degrade safely rather than
-           desync or drop. */
-        return;
-    }
-    /* Real submission failure (encrypt error / Transmit refused). Tear down. */
+    /* The AXL_BUSY branch that stood here is gone: neither
+       axl_tcp_send_async nor axl_tls_write_async refuses a send any more —
+       they accept or fail (docs/AXL-Tcp-Queue-Design.md §3.2). So a non-OK
+       return is now unambiguously a real failure. */
     reset_connection(conn);
 }
 
@@ -260,13 +258,22 @@ ws_outq_clear(HttpConn *conn)
         return;
     }
     /* Frees every queued frame including the in-flight head: its async send was
-       just cancelled by axl_tcp_close (reset_connection runs close first), so
-       head->data is no longer referenced. NOTE: a TLS in-flight frame's
-       CIPHERTEXT lives in a TlsWriteAsyncCtx that axl_tcp_close cancels without
-       firing tls_write_async_done — so that wctx + enc buffer leak. This is the
-       same bounded "one frame per teardown-mid-send" leak axl_tls_free has long
-       accepted (the airtight fix — axl_tcp_close flushing on_send(CANCELLED) —
-       re-enters reset_connection via on_response_sent). Not a wedge or UAF. */
+       just retired by axl_tcp_close (reset_connection runs close first), so
+       head->data is no longer referenced.
+
+       This used to note a bounded leak, twice over: a TLS in-flight frame's
+       CIPHERTEXT lives in a TlsWriteAsyncCtx that axl_tcp_close cancelled
+       WITHOUT firing tls_write_async_done, so that wctx + enc buffer were lost,
+       one frame per teardown-mid-send. This layer keeps exactly one frame
+       outstanding, so a TLS frame at teardown was ALWAYS the active one — the
+       case the queue's first cut still did not cover.
+
+       FIXED once send callbacks became deferred: close retires the ACTIVE send
+       as well as the queued ones, tls_write_async_done runs with AXL_CANCELLED
+       and frees both. The reason it could not be done before was that firing a
+       callback inline from teardown re-entered it via on_response_sent ->
+       reset_connection -> axl_tcp_close; a deferred callback re-entering a
+       closed socket is a no-op instead. docs/AXL-Tcp-Queue-Design.md §6b. */
     WsOutNode *n = conn->ws_out_head;
     while (n != NULL) {
         WsOutNode *next = n->next;
@@ -321,9 +328,9 @@ axl_http_server_ws_broadcast(AxlHttpServer *s, const char *path,
             continue;
         }
 
-        /* Serialize through the connection's outbound queue (it copies the
-           frame), so a burst of broadcasts can't race the one-send-in-flight
-           transport and desync TLS. */
+        /* Through the connection's outbound queue (it copies the frame), so
+           a burst of broadcasts is delivered in order and stays subject to the
+           queue's drop-oldest policy for as long as it is undelivered. */
         if (ws_outq_enqueue(conn, frame, frame_len) != AXL_OK) {
             axl_warning("ws broadcast enqueue failed for conn %zu", i);
         }
@@ -628,9 +635,9 @@ axl_ws_send(AxlWsConn *ws_conn, size_t opcode, const void *data, size_t size)
         return AXL_ERR;
     }
 
-    /* Serialize through the connection's outbound queue (it copies the frame),
-       so back-to-back sends can't race the one-send-in-flight transport and
-       desync TLS. */
+    /* Through the connection's outbound queue (it copies the frame), so
+       back-to-back sends are delivered in order and stay subject to the
+       queue's drop-oldest policy for as long as they are undelivered. */
     int rc = ws_outq_enqueue(conn, frame, frame_len);
     axl_free(frame);
     return rc;

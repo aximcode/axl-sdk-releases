@@ -41,13 +41,20 @@ SECTIONS
 
    . = ALIGN(16);
    __init_array_start = .;
-   *(SORT(.init_array.*))
-   *(.init_array)
+   /* KEEP is load-bearing. Nothing REFERENCES an .init_array entry -- that is
+      the point of one -- so --gc-sections collects the section and the crt0
+      walker finds __init_array_start == __init_array_end and runs nothing.
+      A C++ global object's constructor then silently never runs: measured as
+      `magic=0x0` where the constructor sets 0xABCD, with no diagnostic
+      anywhere. It also kept ios_base::Init out of the image entirely, which
+      is why std::cout faulted in sentry() on a never-constructed stream. */
+   KEEP(*(SORT(.init_array.*)))
+   KEEP(*(.init_array))
    __init_array_end = .;
   . = ALIGN(16);
    __CTOR_LIST__ = .;
-   *(SORT(.ctors.*))
-   *(.ctors)
+   KEEP(*(SORT(.ctors.*)))
+   KEEP(*(.ctors))
    __CTOR_END__ = .;
   . = ALIGN(16);
    __DTOR_LIST__ = .;
@@ -94,7 +101,24 @@ SECTIONS
   . = ALIGN(4096);
   .dynamic  : { *(.dynamic) }
   . = ALIGN(4096);
-  .rela :
+  /* Named `.rela.dyn`, NOT `.rela`, and that is load-bearing on this arch.
+     ld synthesizes its dynamic relocations into an internal section called
+     `.rela.dyn`. An output section of the same name absorbs it; an output
+     section called `.rela` does not always, and when it does not the result
+     is TWO relocation sections at non-contiguous addresses while DT_RELA
+     points at the first and DT_RELASZ counts BOTH. The crt0 walks DT_RELASZ
+     bytes from DT_RELA (src/crt0/axl-reloc.c), runs off the end of the first
+     section, and applies whatever follows as relocations.
+
+     That is not theoretical: it is what an `-frtti` link produced here, and
+     the image faulted before main with virtual calls working and only
+     type_info access broken. x86-64 does not split -- its script keeps the
+     `.rela` name deliberately, since renaming a demonstrably-correct layout
+     buys nothing. `make check-reloc-coverage` asserts the invariant on both.
+
+     The crt0 finds relocations by address (DT_RELA), never by section name,
+     so only objcopy's -j list cares what this is called. */
+  .rela.dyn :
   {
     *(.rela.text*)
     *(.rela.data*)

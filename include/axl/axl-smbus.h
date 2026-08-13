@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-smbus.h:
+/** @file axl-smbus.h
  *
  * SMBus / I2C block access for UEFI applications. Dispatches on the
  * first available firmware-provided transport:
@@ -85,7 +84,7 @@ axl_smbus_new(void);
  *
  * @return session handle, or NULL if no enumeration step succeeded.
  */
-typedef bool (*AxlSmbusProbeFn)(AxlSmbus *s, void *user);
+typedef bool (*AxlSmbusProbeFn)(AxlSmbus *s, void *user) AXL_CB_NOEXCEPT;
 
 AxlSmbus *
 axl_smbus_new_with_probe(
@@ -108,7 +107,7 @@ typedef void (*AxlSmbusVisitFn)(
     AxlSmbus     *s,       ///< transient session for this controller
     size_t        index,   ///< 0-based visit order
     void         *user     ///< opaque pointer forwarded to visit
-    );
+    ) AXL_CB_NOEXCEPT;
 
 size_t
 axl_smbus_visit_all(

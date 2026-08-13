@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-signal.h:
+/** @file axl-signal.h
  *
  * POSIX-flavored interrupt handler API. The axl_signal_* namespace
  * was freed up pre-1.0 (see the axl_pubsub_* rename) specifically
@@ -64,7 +63,7 @@ extern "C" {
  * ExecutionBreak event fires. Do not allocate, do not block, do not
  * call Boot Services that mutate state. Set a flag, log, return.
  */
-typedef void (*AxlSignalHandler)(void);
+typedef void (*AxlSignalHandler)(void) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Install a handler fired on Ctrl-C. Overrides the default

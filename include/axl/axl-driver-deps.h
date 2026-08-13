@@ -54,6 +54,8 @@
 #ifndef AXL_DRIVER_DEPS_H
 #define AXL_DRIVER_DEPS_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -125,7 +127,7 @@ typedef struct {
      * against cycles on its own, so returning @c true on a cyclic graph
      * is safe.
      */
-    bool (*enter)(const char *name, const char *parent, void *ctx);
+    bool (*enter)(const char *name, const char *parent, void *ctx) AXL_CB_NOEXCEPT;
 
     /**
      * Bring dependency @p name (required by @p parent) resident. Called
@@ -134,7 +136,7 @@ typedef struct {
      * before the walk's target — binds. Called only for names @c enter
      * returned @c true for (or all names, if @c enter is NULL). Required.
      */
-    void (*load)(const char *name, const char *parent, void *ctx);
+    void (*load)(const char *name, const char *parent, void *ctx) AXL_CB_NOEXCEPT;
 
     void *ctx;   ///< borrowed context passed to both callbacks (NULL if unused)
 } AxlDriverDepVisitor;
@@ -145,14 +147,14 @@ typedef struct {
  * Opens `<@p dir>\<@p filename>` via @ref axl_sidecar_open_file,
  * validates the required `schema` field against @p schema_tag (schema
  * version 1), and walks the `drivers` array into @p out. Each array
- * object contributes one @ref AxlDriverDepRow: its `name` string and
+ * object contributes one @ref AxlDriverDepRow "AxlDriverDepRow": its `name` string and
  * its `requires` array of dependency basenames.
  *
  * The on-disk format is caller-defined: @p filename and @p schema_tag
  * are both parameters, so two tools with different sidecars never
  * collide and neither name is baked into the library. Bounds
  * (@ref AXL_DRIVER_DEPS_MAX rows, @ref AXL_DRIVER_DEPS_PER_NODE
- * dependencies each, @ref AXL_DRIVER_DEP_NAME_MAX-byte names) are
+ * dependencies each, @ref AXL_DRIVER_DEP_NAME_MAX "AXL_DRIVER_DEP_NAME_MAX"-byte names) are
  * enforced by dropping the overflow with a warning; a nameless entry or
  * an empty dependency string is skipped. @p out is zeroed first, so a
  * missing or malformed file leaves it empty (@c n_rows == 0) — the safe

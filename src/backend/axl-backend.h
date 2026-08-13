@@ -223,6 +223,39 @@ axl_backend_set_time(
     );
 
 /**
+ * @brief Read the RTC wake alarm
+ *     (EFI_RUNTIME_SERVICES.GetWakeupTime).
+ *
+ * Members of the same mutually-exclusive RTC group as
+ * @ref axl_backend_get_time (UEFI 2.11 Table 8.1), and guarded by the
+ * same flag. Out parameters are optional.
+ *
+ * @return AXL_OK; AXL_UNSUPPORTED if the platform has no wake timer;
+ *     AXL_ERR on firmware failure or a nested RTC call.
+ */
+int
+axl_backend_get_wakeup(
+    bool     *enabled,  ///< (out, optional) alarm armed
+    bool     *pending,  ///< (out, optional) alarm has fired
+    AxlTime  *when      ///< (out, optional) programmed alarm time
+    );
+
+/**
+ * @brief Arm or disarm the RTC wake alarm
+ *     (EFI_RUNTIME_SERVICES.SetWakeupTime).
+ *
+ * NULL @p when disarms. Same RTC group exclusion as
+ * @ref axl_backend_get_wakeup.
+ *
+ * @return AXL_OK; AXL_UNSUPPORTED if the platform has no wake timer;
+ *     AXL_ERR on firmware failure or a nested RTC call.
+ */
+int
+axl_backend_set_wakeup(
+    const AxlTime  *when   ///< alarm time, or NULL to disarm
+    );
+
+/**
  * @brief Read a high-resolution monotonic counter, in microseconds.
  *
  * Uses the architecture's cycle counter (x86 TSC / aarch64
@@ -923,6 +956,28 @@ axl_backend_event_create_notify_timer(
     );
 
 /**
+ * @brief Register a notify to run just before ExitBootServices.
+ *
+ * Uses the UEFI 2.9 `EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES` group,
+ * which is signalled while Boot Services are still fully usable, rather
+ * than the ExitBootServices group itself. That distinction matters for
+ * anything holding APs: the firmware's own AP-relocation handler is in
+ * the ExitBootServices group, notification order within a group is not
+ * specified, and losing that race means the firmware spins forever
+ * waiting for an AP that is still inside consumer code.
+ *
+ * Pair with `axl_backend_event_close`.
+ *
+ * @return AXL_OK on success, AXL_ERR on error or table-full.
+ */
+int
+axl_backend_event_create_before_exit_boot(
+    void  (*notify)(void *ctx),  ///< notify function (TPL_CALLBACK)
+    void   *ctx,                 ///< opaque context passed to @p notify
+    AxlEventHandle *event        ///< (out) receives event handle
+    );
+
+/**
  * @brief Close an event. NULL-safe.
  *
  * DIAG-WRAPPED 2026-04-27: every call site routes through
@@ -999,6 +1054,40 @@ axl_backend_event_check(
  */
 bool
 axl_backend_at_raised_tpl(void);
+
+/**
+ * @brief The task priority level the caller is executing at.
+ *
+ * UEFI has no read accessor, so this is a raise-to-ceiling / restore
+ * pair — cheap, and legal from any level including @c TPL_HIGH_LEVEL.
+ *
+ * @return the current @c EFI_TPL as a plain integer.
+ */
+uintptr_t
+axl_backend_tpl_current(void);
+
+/**
+ * @brief Raise to @p level, returning the level to restore.
+ *
+ * Clamps: a request at or below the current level leaves the level
+ * unchanged and returns it, so the paired @ref axl_backend_tpl_restore
+ * never tries to restore UPWARD (which the firmware treats as fatal
+ * misuse rather than an error return).
+ *
+ * @return the previous level, for @ref axl_backend_tpl_restore.
+ */
+uintptr_t
+axl_backend_tpl_raise(
+    uintptr_t level   ///< level to raise to
+);
+
+/**
+ * @brief Restore the level returned by @ref axl_backend_tpl_raise.
+ */
+void
+axl_backend_tpl_restore(
+    uintptr_t level   ///< level to restore to
+);
 
 /**
  * @brief Enter a brief critical section by raising to a serialization TPL.
@@ -1236,9 +1325,23 @@ axl_backend_mp_init(
     );
 
 /**
- * @brief Dispatch a worker procedure on an AP (non-blocking).
+ * @brief Dispatch a persistent worker procedure on an AP.
  *
- * @return AXL_OK on success, AXL_ERR on error.
+ * @a proc is expected never to return; the AP runs it until the caller
+ * stops it by other means. Dispatch is non-blocking where the firmware
+ * allows it, falling back to a short blocking call on firmware that
+ * refuses non-blocking mode (ArmPsciMpServicesDxe does so after
+ * EFI_EVENT_GROUP_READY_TO_BOOT). Either way this returns promptly with
+ * the worker left running.
+ *
+ * Success means the AP is running @a proc. A @a proc that returns
+ * immediately is reported as an error, since it is not usable as a
+ * persistent worker.
+ *
+ * The caller must stop every started worker before axl_backend_mp_cleanup,
+ * which reclaims the per-AP firmware state the dispatch left behind.
+ *
+ * @return AXL_OK if the AP is running @a proc, AXL_ERR otherwise.
  */
 int
 axl_backend_mp_start_ap(

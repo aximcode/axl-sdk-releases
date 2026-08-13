@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-str.h:
+/** @file axl-str.h
  *
  * String utilities. All char * functions operate on UTF-8 strings
  * (which are a superset of ASCII). Case-insensitive operations
@@ -785,7 +784,7 @@ axl_strv_equal(
 );
 
 // ---------------------------------------------------------------------------
-// UTF-8 iteration
+// UTF-8 codepoint decode / encode
 // ---------------------------------------------------------------------------
 
 /**
@@ -820,6 +819,75 @@ size_t
 axl_utf8_decode(
     const char  *s,              ///< UTF-8 source (NUL-terminated)
     uint32_t    *out_codepoint   ///< [out] decoded codepoint, or 0xFFFD on invalid
+);
+
+/** Longest UTF-8 sequence axl_utf8_encode can produce, in bytes. A
+    destination of this size can never be too small for one codepoint. */
+#define AXL_UTF8_MAX_LEN 4
+
+/**
+ * @brief Encode one Unicode codepoint as UTF-8.
+ *
+ * The reverse of axl_utf8_decode. Writes the 1-4 byte sequence for
+ * @a codepoint into @a dst and returns the number of bytes written. No
+ * NUL terminator is written and none is reserved: like axl_utf8_decode,
+ * this operates on one codepoint inside a larger buffer, so @a dst_size
+ * is the room available for BYTES and terminating is the caller's job.
+ * (Contrast axl_ucs2_to_utf8_buf, whose @a dst_size includes the NUL it
+ * always writes.) @a dst may point into a buffer being consumed ahead of
+ * it — nothing is read back from @a dst, so in-place shrinking rewrites
+ * such as unescaping are safe.
+ *
+ * Behavior:
+ *   - Well-formed scalar (U+0000..U+D7FF or U+E000..U+10FFFF): writes
+ *     1/2/3/4 bytes and returns that count. U+0000 encodes as a single
+ *     0x00 byte, NOT as the overlong 0xC0 0x80 "Modified UTF-8" form
+ *     that axl_utf8_decode rejects.
+ *   - Sizing pass (@a dst is NULL): writes nothing, ignores @a dst_size,
+ *     and returns the byte count the sequence WOULD need (1-4). This is
+ *     also the validity query — see the 0 return below.
+ *   - Unencodable codepoint: a UTF-16 surrogate (U+D800..U+DFFF) or
+ *     anything above U+10FFFF writes nothing and returns 0, in the
+ *     sizing pass too. Surrogates are not Unicode scalar values;
+ *     encoding them anyway produces the CESU-8 / WTF-8 that
+ *     axl_utf8_decode — and any conforming decoder — refuses. A caller
+ *     that wants lenient behavior substitutes U+FFFD itself and encodes
+ *     that.
+ *   - Sequence does not fit (@a dst is non-NULL and @a dst_size is below
+ *     the required count, including @a dst_size 0): writes NOTHING and
+ *     returns 0. Never a partial sequence, which would leave ill-formed
+ *     UTF-8 in the caller's buffer — the same discipline axl_utf16_to_utf8
+ *     applies at its truncation boundary.
+ *
+ * U+0000 is a successful 1-byte encode, so a caller assembling a
+ * NUL-terminated C string must reject or substitute it *before* calling:
+ * an interior NUL truncates the value for every axl_strcmp reader, and
+ * this function cannot signal the difference.
+ *
+ * A 0 return therefore always means "nothing was written". To tell an
+ * unencodable codepoint from a full buffer, measure first — and note the
+ * substituted codepoint has to be re-measured, since @a avail may not fit
+ * it either:
+ *
+ *     size_t need = axl_utf8_encode(cp, NULL, 0);
+ *     if (need == 0) {                        // unencodable — substitute
+ *         cp   = 0xFFFD;
+ *         need = axl_utf8_encode(cp, NULL, 0);
+ *     }
+ *     if (need > avail) {
+ *         break;                              // buffer full — stop cleanly
+ *     }
+ *     p     += axl_utf8_encode(cp, p, avail);
+ *     avail -= need;
+ *
+ * @return bytes written (1-4); bytes required when @a dst is NULL; or 0
+ *     if @a codepoint is unencodable or the sequence does not fit.
+ */
+size_t
+axl_utf8_encode(
+    uint32_t   codepoint,  ///< Unicode codepoint to encode
+    char      *dst,        ///< destination, or NULL to measure
+    size_t     dst_size    ///< bytes available at @a dst (no NUL reserved)
 );
 
 // ---------------------------------------------------------------------------
@@ -1131,6 +1199,281 @@ axl_strtou64_with_offset(
     uint64_t   *out   ///< [out] parsed value (base + offset)
 );
 
+/**
+ * Buffer size that always holds axl_u64_to_str's output.
+ *
+ * Worst case is base 2: 64 binary digits plus the NUL.
+ */
+#define AXL_U64_STR_MAX  65
+
+/**
+ * Buffer size that always holds axl_s64_to_str's output.
+ *
+ * One byte MORE than AXL_U64_STR_MAX, because INT64_MIN in base 2 is a
+ * '-' followed by 64 binary digits. The two sizes differ; do not reuse
+ * the unsigned one for the signed call.
+ */
+#define AXL_S64_STR_MAX  66
+
+/**
+ * @brief Render an unsigned 64-bit integer in @p base.
+ *
+ * The reverse of axl_str_to_u64(), sharing its @p base parameter
+ * (2..36, digits '0'..'9' then lowercase 'a'..'z'), so the two
+ * round-trip at any radix. No "0x" prefix is emitted -- add one
+ * yourself if you want axl_str_to_u64's base-0 auto-detection to see
+ * it on the way back. Base 0 itself is REJECTED here: it selects
+ * auto-detection when PARSING and has no meaning when RENDERING.
+ *
+ * Truncation follows the convention axl_snprintf(), axl_strlcpy() and
+ * axl_format_bytes() already use: as much as fits is written, @p buf is
+ * always NUL-terminated, and the return is the length the WHOLE
+ * rendering would have had. So `ret >= bufsz` means the text was cut
+ * short and `ret < bufsz` means it is complete -- the test matters
+ * here, because a truncated integer is a different, entirely plausible
+ * integer that the buffer alone cannot be told apart from a correct
+ * one. (The UTF conversions in this header do NOT follow it: they
+ * return bytes WRITTEN, so the same test is unreliable there -- it
+ * can fire on a complete conversion and stay silent on a truncated
+ * one.) Pass a buffer of AXL_U64_STR_MAX (65 bytes: 64 binary
+ * digits plus the NUL) and truncation is impossible.
+ *
+ * Whenever @p buf is non-NULL and @p bufsz is at least 1, @p buf is
+ * NUL-terminated on return -- on the rejected-base path too -- so a
+ * caller that ignores the return value still reads a valid string.
+ *
+ * @return length of the full rendering excluding the NUL, whatever
+ *     @p bufsz is; 0 if @p buf is NULL, @p bufsz is 0, or @p base is
+ *     out of range. No successful rendering is empty, so 0 stays an
+ *     unambiguous "nothing could be rendered".
+ */
+size_t
+axl_u64_to_str(
+    uint64_t  value,  ///< value to render
+    int       base,   ///< radix, 2..36
+    char     *buf,    ///< [out] destination
+    size_t    bufsz   ///< capacity including the NUL
+);
+
+/**
+ * @brief Render a signed 64-bit integer in @p base.
+ *
+ * Like axl_u64_to_str with a leading '-' for negative values. The
+ * magnitude is taken in unsigned arithmetic so INT64_MIN renders
+ * correctly rather than overflowing on negation.
+ *
+ * Same base range, same axl_snprintf()-style truncation convention
+ * (`ret >= bufsz` means truncated) and same guarantee that @p buf is
+ * NUL-terminated whenever it has room for one byte. The buffer size
+ * that always fits is AXL_S64_STR_MAX, one byte more than the unsigned
+ * form needs because of the sign.
+ *
+ * @return length of the full rendering excluding the NUL, whatever
+ *     @p bufsz is; 0 if @p buf is NULL, @p bufsz is 0, or @p base is
+ *     out of range.
+ */
+size_t
+axl_s64_to_str(
+    int64_t   value,  ///< value to render
+    int       base,   ///< radix, 2..36
+    char     *buf,    ///< [out] destination
+    size_t    bufsz   ///< capacity including the NUL
+);
+
+/**
+ * @brief Parse a decimal floating-point number, correctly rounded.
+ *
+ * Skips leading whitespace, then accepts an optional sign, decimal
+ * digits with an optional '.', and an optional 'e'/'E' exponent with
+ * its own optional sign. Also accepts "nan", "inf" and "infinity",
+ * case-insensitively, matching POSIX strtod and g_ascii_strtod. Hex
+ * float literals (0x1.8p3) are NOT accepted.
+ *
+ * A sign on "inf" IS applied -- "-inf" gives negative infinity. A sign
+ * on "nan" is CONSUMED but NOT applied: "-nan" gives a POSITIVE NaN
+ * where glibc gives a negative one. Nothing in AXL contradicts that,
+ * because AXL has no signed-NaN surface at all -- axl_double_to_str(),
+ * axl_float_to_str() and %f each render every NaN as "nan" with no
+ * sign, so this parser never has to read back text it did not write.
+ *
+ * With NO @p endptr the parse is STRICT: the whole string must be
+ * consumed or it is an error, exactly the rule axl_str_to_u64() and
+ * the rest of the integer family enforce. "36.6C" and "3.5.7" fail
+ * here and leave @p out untouched, which is the syntax-error rule.
+ * Leading whitespace is still skipped, but TRAILING whitespace is
+ * trailing content and fails -- " 5 " is an error, matching
+ * axl_str_to_u64("123 ", 10, &v, NULL). Pass @p endptr to opt into
+ * partial parsing, which is what a tokenizer wants.
+ *
+ * The result is CORRECTLY ROUNDED: it is the double nearest the exact
+ * decimal value, ties to even. That makes it the exact inverse of
+ * axl_double_to_str() — parse(print(x)) reproduces x bit-for-bit for
+ * every finite double.
+ *
+ * There is no locale to worry about: the freestanding build has none,
+ * so the decimal separator is always '.'. Do not add a locale hook.
+ *
+ * RANGE ERRORS STILL WRITE @p out, unlike the integer members of this
+ * family. Overflow yields +/-infinity and underflow yields +/-0.0 —
+ * the correct IEEE results — together with AXL_ERR, because with no
+ * errno that is the only way to give the caller both the value and the
+ * fact that it saturated. A SYNTAX error leaves @p out untouched.
+ * Strict mode outranks the range-error rule: "1e400xyz" writes nothing
+ * at all, where "1e400" on its own writes +infinity.
+ *
+ * A range error leaves @p endptr PAST the digits, because the number
+ * WAS fully consumed -- it is only unrepresentable. That is what C99
+ * strtod does on ERANGE. THE INTEGER FAMILY DIFFERS: axl_str_to_u64()
+ * and friends REWIND @p endptr to @p nptr on overflow, so a tokenizer
+ * driven off @p endptr must know which of the two it is holding.
+ * Neither behaviour is changing; both are released.
+ *
+ * "nan" and "inf" in the INPUT are values, not errors: AXL_OK.
+ *
+ * @return AXL_OK on success, AXL_ERR on syntax error or range error.
+ */
+int
+axl_str_to_double(
+    const char  *nptr,    ///< number string
+    double      *out,     ///< [out] parsed value
+    const char **endptr   ///< [out, optional] past last consumed char
+);
+
+/**
+ * @brief Parse a decimal floating-point number into a float.
+ *
+ * Same grammar, same whitespace rule, same @p endptr contract and same
+ * range-error convention as axl_str_to_double() — parse as a double,
+ * then narrow. The STRICT rule carries over unchanged too: with no
+ * @p endptr the whole string must be consumed, so "2.5xyz" and "1.5 "
+ * are errors that leave @p out untouched, and that outranks the
+ * range-error write ("1e39zz" writes nothing, "1e39" writes +inf).
+ * Narrowing rounds a second time, so the result is the
+ * float nearest the decimal value in all but the vanishingly rare
+ * double-rounding cases; axl_float_to_str() sidesteps this on the way
+ * out by verifying each candidate through a path that is
+ * value-identical to this one (axl_str_to_double() then a `(float)`
+ * cast). In those same rare cases the RANGE FLAG can misfire too: an
+ * input that the first rounding lands exactly on the float overflow or
+ * subnormal tie point saturates on the second, so an in-range value
+ * comes back as AXL_ERR -- "3.4028235677973366e38" yields +infinity
+ * and AXL_ERR where FLT_MAX and AXL_OK are correct. Hitting either tie
+ * point takes 17 or more significant digits, so axl_float_to_str()'s
+ * output, 9 digits at most, provably cannot reach one.
+ *
+ * A value too large for float yields +/-infinity and AXL_ERR, and one
+ * too small yields +/-0.0 and AXL_ERR, matching axl_str_to_double()'s
+ * rule that a range error still WRITES @p out. A double-range input
+ * that merely exceeds float range is a range error here even though it
+ * parsed cleanly as a double.
+ *
+ * @return AXL_OK on success, AXL_ERR on syntax error or range error.
+ */
+int
+axl_str_to_float(
+    const char  *nptr,    ///< number string
+    float       *out,     ///< [out] parsed value
+    const char **endptr   ///< [out, optional] past last consumed char
+);
+
+/**
+ * Buffer size that always holds axl_double_to_str's output.
+ *
+ * Worst case is 25 bytes: sign, leading digit, '.', 16 more digits,
+ * 'e', exponent sign, 3 exponent digits, NUL. 32 leaves margin.
+ */
+#define AXL_DOUBLE_STR_MAX  32
+
+/**
+ * @brief Render a double as short round-trippable decimal text.
+ *
+ * The exact inverse of axl_str_to_double(): the text this writes parses
+ * back to bit-identical @p value for every finite double. THE
+ * ROUND TRIP IS ALWAYS EXACT; the LENGTH is very nearly always minimal
+ * but is not guaranteed to be. The digits come from axl_dtoa (Grisu2),
+ * which returns the shortest string IT can find, and for a fraction of
+ * a percent of doubles a shorter one exists -- 1e23 renders
+ * "9.999999999999999e+22" where "1e+23" would have round-tripped.
+ * (Grisu3 or Ryu would close that gap at the cost of a bignum
+ * fallback; nothing in AXL needs the last digit.) Trailing zeros are
+ * never emitted either way -- 100.0 renders "100", not "100.000".
+ *
+ * axl_float_to_str() has no such gap: it searches upward from one
+ * significant digit and stops at the first length that round-trips, so
+ * its answer is minimal by construction -- a ~1e6-value float sweep
+ * found no case where a shorter rendering existed.
+ *
+ * Chooses exponential notation when the decimal exponent is < -4 or
+ * >= 17, fixed notation otherwise -- the same rule as printf's %g, and
+ * what a human reading a config file expects. Round-trip holds either
+ * way; this only affects readability.
+ *
+ * NaN renders "nan", infinities "inf" / "-inf", matching what
+ * axl_str_to_double() accepts, so those round-trip as text too.
+ *
+ * Truncation follows the convention axl_snprintf(), axl_strlcpy() and
+ * axl_format_bytes() already use, and that axl_u64_to_str() documents
+ * in full: as much as fits is written, @p buf is always
+ * NUL-terminated, and the return is the length the WHOLE text would
+ * have had, so `ret >= bufsz` means it was cut short. Test it --
+ * truncated numeric text reparses cleanly into a plausible wrong value
+ * far more often than it fails, as "1e-300" cut to "1e-3" reading back
+ * as 0.001 shows. Pass a buffer of AXL_DOUBLE_STR_MAX and truncation is
+ * impossible.
+ *
+ * @return length of the full text excluding the NUL, whatever @p bufsz
+ *     is; 0 if @p buf is NULL or @p bufsz is 0. Every double renders at
+ *     least one character, so 0 never collides with a real length.
+ */
+size_t
+axl_double_to_str(
+    double  value,  ///< value to render
+    char   *buf,    ///< [out] destination buffer
+    size_t  bufsz   ///< capacity of @p buf including the NUL
+);
+
+/**
+ * @brief Render a float as the shortest decimal text that round-trips
+ *     through the SAME FLOAT -- shorter than what axl_double_to_str
+ *     would need for the promoted value.
+ *
+ * The way to read the result back is axl_str_to_float(), and that is
+ * exactly the round-trip this function guarantees:
+ * `(float)parsed == value`. Reading it with axl_str_to_double() plus a
+ * `(float)` cast lands on the same value but not the same error
+ * signal -- text outside float range still parses cleanly AS A DOUBLE,
+ * so only the float form reports the range error.
+ * Deliberately NOT "promote to double, call axl_double_to_str": most
+ * floats are ugly numbers once widened (0.1f as a double needs 17
+ * digits to round-trip AS A DOUBLE), even though "0.1" alone already
+ * round-trips as a float. This searches increasing significant-digit
+ * counts (1..9 -- 9 is the count that always suffices for IEEE-754
+ * binary32) and keeps the shortest, correctly rounded at each length,
+ * that survives the round-trip above. Searching upward is why
+ * "shortest" is literal here where axl_double_to_str() has to hedge:
+ * the first length that round-trips is by definition the smallest one,
+ * so there is no Grisu2-style near-miss to fall into.
+ *
+ * Same notation rule as axl_double_to_str (exponential when the
+ * decimal exponent is < -4 or >= 17), and the same nan / inf / -inf
+ * spellings.
+ *
+ * Same axl_snprintf()-style truncation convention as
+ * axl_double_to_str(): as much as fits is written, @p buf is always
+ * NUL-terminated, and `ret >= bufsz` means the text was cut short.
+ * Pass a buffer of AXL_DOUBLE_STR_MAX and truncation is impossible
+ * (the float form is never longer than the double worst case).
+ *
+ * @return length of the full text excluding the NUL, whatever @p bufsz
+ *     is; 0 if @p buf is NULL or @p bufsz is 0.
+ */
+size_t
+axl_float_to_str(
+    float   value,  ///< value to render
+    char   *buf,    ///< [out] destination buffer
+    size_t  bufsz   ///< capacity of @p buf including the NUL
+);
+
 // ---------------------------------------------------------------------------
 // AxlStrReader — cursor-based string parser
 //
@@ -1255,8 +1598,9 @@ axl_str_reader_consume_str(
  */
 bool
 axl_str_reader_take_until(
-    AxlStrReader   *r,
-    char            delim,
+    AxlStrReader   *r,        ///< reader
+    char            delim,    ///< byte to stop at (consumed, but excluded
+                              ///< from the returned slice)
     const char    **out,      ///< [out, optional] start of the slice
     size_t         *out_len   ///< [out, optional] slice length
 );
@@ -1270,8 +1614,8 @@ axl_str_reader_take_until(
  */
 bool
 axl_str_reader_take_while(
-    AxlStrReader   *r,
-    bool          (*pred)(char),
+    AxlStrReader   *r,        ///< reader
+    bool          (*pred)(char),  ///< takes bytes while this returns true
     const char    **out,      ///< [out, optional] start of the slice
     size_t         *out_len   ///< [out, optional] slice length
 );
@@ -1293,7 +1637,7 @@ axl_str_reader_take_while(
  */
 bool
 axl_str_reader_take_u64(
-    AxlStrReader  *r,
+    AxlStrReader  *r,       ///< reader
     int            base,    ///< 0 (auto-detect), 16 (with optional 0x), or 2..36
     uint64_t      *out      ///< [out] parsed value
 );
@@ -1307,7 +1651,7 @@ axl_str_reader_take_u64(
  */
 bool
 axl_str_reader_take_ident(
-    AxlStrReader   *r,
+    AxlStrReader   *r,       ///< reader
     const char    **out,     ///< [out, optional]
     size_t         *out_len  ///< [out, optional]
 );
@@ -1334,17 +1678,65 @@ axl_str_reader_take_ident(
 //               so the destination buffer can be bounded — the SDK does
 //               not allow unbounded %s.
 //   %[set]      run of chars matching the set (^set negates)
+//   %f, %e, %g  decimal floating point; %E and %G are the same
+//   %E, %G      conversions. See the pointer-type note below.
 //   %n          assigns the number of bytes consumed so far (no input read)
 //
 // Length modifiers: hh, h, l, ll, z (for size_t), j (for intmax_t).
 // For unsigned types, the same modifiers apply.
 //
+// FLOAT POINTER TYPES, which are the part callers get wrong: C99 has
+// plain %f/%e/%g/%E/%G taking a `float *` and the 'l' modifier
+// (%lf/%le/%lg/%lE/%lG) taking a `double *`. That is the REVERSE of
+// printf, where %f takes a double by default argument promotion. Both
+// ways of getting it wrong are silent, and they fail differently:
+// passing a `float *` to %lf writes 8 bytes into a 4-byte object and
+// clobbers whatever sits next to it, while passing a `double *` to a
+// plain %f writes only 4 of the 8 bytes and leaves the other half of
+// the double uninitialized - a wrong value rather than a wrong write.
+// No other length modifier is accepted: %hf, %llf and friends
+// are not C99 and return -1 rather than being silently taken as one of
+// the two. %Lf (long double) returns -1 as well, deliberately - AXL has
+// no long double type.
+//
+// Float parsing is axl_str_to_double / axl_str_to_float, so it is
+// CORRECTLY ROUNDED and accepts the same grammar: an optional sign,
+// digits with an optional '.', an optional e/E exponent, and the words
+// "nan", "inf" and "infinity" case-insensitively. Hex float literals
+// (0x1p3) are not accepted, matching those functions.
+//
+// An OUT-OF-RANGE value such as "1e400" is a SUCCESSFUL conversion: it
+// stores the saturated IEEE result (+/-infinity on overflow, +/-0.0 on
+// underflow) and counts, which is what C99 does when it stores
+// +/-HUGE_VAL and sets ERANGE. AXL has no errno, so the saturation flag
+// is not reported here - call axl_str_to_double directly if you need to
+// tell "1e400" from a real infinity. Only a SYNTAX error, which
+// consumes nothing, ends the scan.
+//
+// An explicit field width caps the field at N bytes, the same way %Nc
+// and %Ns bound theirs: %3lf on "3.14159" reads 3.1 and leaves "4159"
+// for the next conversion. Leading whitespace is skipped BEFORE the
+// width applies, so it never counts against N, and the cursor advances
+// by the bytes actually consumed rather than by N. A width above 256
+// returns -1 - bounding the field means staging that many bytes, and an
+// absurd N is a property of the FORMAT STRING, so it is checked up
+// front and rejected loudly instead of being clamped. Without a width
+// nothing is staged at all and a mantissa of any length parses in full.
+//
+// A field width is capped at SIZE_MAX on every conversion that takes
+// one, not just the float ones: a width whose digits exceed SIZE_MAX
+// cannot describe any buffer a caller could have passed, so it is
+// -1 rather than a width silently reduced by the wrap.
+//
 // Suppressing assignment with '*' (e.g. %*d) is supported and the
 // conversion is performed but not stored.
 //
 // Returns count of successfully completed *and assigned* conversions,
-// or -1 on a malformed format (e.g. %s without width, unrecognized
-// conversion). NULL @a str returns -1.
+// or -1 on a malformed format (e.g. %s without width, a field width
+// above SIZE_MAX, a float width above 256, unrecognized conversion).
+// NULL @a str returns -1. A malformed format is -1 for the WHOLE call
+// even when earlier conversions in the same format already stored
+// their values -- the count is not partially reported.
 // ---------------------------------------------------------------------------
 
 /**

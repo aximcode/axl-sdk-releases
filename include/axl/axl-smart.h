@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-smart.h:
+/** @file axl-smart.h
  *
  * Normalized cross-transport storage health — the synthesis layer over
  * AxlNvme / AxlAta / AxlScsi, and Phase 4 of the storage-access family (see

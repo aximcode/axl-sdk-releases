@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-net.h:
+/** @file axl-net.h
  *
  * Networking umbrella header. Includes socket layer, TCP, UDP, URL,
  * HTTP server, HTTP client, and network utilities.
@@ -248,7 +247,7 @@ typedef void (*AxlNetResolveDoneFn)(
     const AxlIPv4Address *addr,  ///< resolved address (borrowed), or NULL on failure
     AxlStatus             st,    ///< AXL_OK, an error, timeout, or AXL_CANCELLED
     void                 *user   ///< opaque context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Resolve a hostname to an IPv4 address asynchronously on @p loop.
@@ -395,7 +394,7 @@ typedef struct {
 
 /// Callback shape for AxlNetAutoOpts.on_driver. @p ctx is opaque, passed through
 /// from AxlNetAutoOpts.on_driver_ctx.
-typedef void (*AxlNetDriverCb)(const AxlNetDriverEvent *ev, void *ctx);
+typedef void (*AxlNetDriverCb)(const AxlNetDriverEvent *ev, void *ctx) AXL_CB_NOEXCEPT;
 
 /// Options for axl_net_auto_init_opts. ZERO-INITIALIZE, then set only what you
 /// need: a zeroed struct means AUTO NIC + DHCP + firmware-first-then-SWEEP_DIR of

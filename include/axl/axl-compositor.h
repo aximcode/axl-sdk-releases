@@ -39,6 +39,8 @@
 #ifndef AXL_COMPOSITOR_H
 #define AXL_COMPOSITOR_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -346,19 +348,49 @@ axl_surface_set_visible(
 );
 
 /**
- * @brief Set the surface's constant opacity (255 = opaque, 0 = fully
- *        transparent). Default 255.
+ * @brief Set the surface's opacity (255 = opaque, 0 = fully transparent).
+ *        Default 255. INHERITED by the surface's descendants.
  *
- * At 255 the surface is composited as an opaque rectangle (a fast copy).
- * Below 255 it is alpha-blended over whatever is beneath it — the
- * translucent veil / dim case — gamma-correct per the global
- * axl_gfx_set_gamma_correct setting; the effective per-pixel alpha is the
- * buffer's alpha scaled by this opacity. Marks the surface region damaged.
+ * Opacity is a scene-graph property: it applies to @p s AND everything
+ * below it. A surface is composited at its EFFECTIVE opacity — its own
+ * value multiplied by every ancestor's, up to and including the root (see
+ * axl_surface_effective_opacity). Setting one value therefore fades a whole
+ * subtree together, which is the dialog (veil + card) case; the default of
+ * 255 everywhere makes the product the identity, so a surface with no
+ * translucent ancestor behaves exactly as if opacity were per-surface.
+ *
+ * At an effective 255 the surface is composited as an opaque rectangle (a
+ * fast copy). Below 255 it is alpha-blended over whatever is beneath it —
+ * the translucent veil / dim case — gamma-correct per the global
+ * axl_gfx_set_gamma_correct setting; the per-pixel alpha applied is the
+ * buffer's alpha scaled by the effective opacity. A surface whose effective
+ * opacity is below 255 never occludes, so nothing behind a faded subtree is
+ * culled. Marks the surface's subtree damaged.
+ *
+ * This multiplies down per surface; it is NOT a group fade. Each surface
+ * still blends against whatever is already beneath it, so mid-fade a child
+ * blends over its own already-faded parent rather than over the parent's
+ * backdrop. The endpoints are the same either way.
  */
 void
 axl_surface_set_opacity(
     AxlSurface  *s,        ///< surface
     uint8_t      opacity   ///< 0 (transparent) .. 255 (opaque)
+);
+
+/**
+ * @brief The opacity the surface is actually composited at — its own value
+ *        times every ancestor's, up to and including the root.
+ *
+ * Each link multiplies as @c (a*b)/255, matching the arithmetic the blit
+ * uses, so the result is exact rather than an approximation of one: a
+ * surface at 128 under a parent at 128 reports 64. Returns 0 for NULL.
+ *
+ * @return 0 (fully transparent) .. 255 (fully opaque)
+ */
+uint8_t
+axl_surface_effective_opacity(
+    const AxlSurface  *s   ///< surface
 );
 
 /**
@@ -378,10 +410,11 @@ axl_surface_set_opaque(
 /**
  * @brief Honor the buffer's OWN per-pixel alpha at full (255) opacity.
  *
- * Normally a surface at @c opacity 255 is composited as a straight copy
- * (per-pixel buffer alpha ignored — the fast opaque path), and only
- * @c opacity < 255 alpha-blends.  Setting this makes a 255-opacity surface
- * instead source-over its buffer's own alpha channel: an OPAQUE body
+ * Normally a surface at an EFFECTIVE @c opacity of 255 (its own value and
+ * every ancestor's) is composited as a straight copy (per-pixel buffer alpha
+ * ignored — the fast opaque path), and only a lower effective opacity
+ * alpha-blends.  Setting this makes a surface at an effective 255 instead
+ * source-over its buffer's own alpha channel: an OPAQUE body
  * (alpha 255 pixels), soft ANTI-ALIASED / shadow edges (partial alpha), and
  * fully transparent gaps (alpha 0 — what's beneath shows through), all in one
  * surface, with NO whole-surface dimming.  This is the popup / dropdown /
@@ -409,8 +442,8 @@ axl_surface_set_per_pixel_alpha(
  * surface is blitted on top. Combine with @c opacity < 255 or
  * axl_surface_set_per_pixel_alpha so the frosted backdrop shows through the
  * translucent tint: a dialog veil with NO back-buffer readback in the
- * consumer. A fully-opaque straight-copy surface (opacity 255 + no per-pixel
- * alpha) would overwrite the frosted backdrop entirely, so backdrop blur is
+ * consumer. A fully-opaque straight-copy surface (effective opacity 255 + no
+ * per-pixel alpha) would overwrite the frosted backdrop entirely, so blur is
  * only meaningful on a translucent surface. A backdrop-blur surface is excluded
  * from occlusion culling (it is a translucent overlay). Marks the surface's
  * subtree damaged.
@@ -531,12 +564,12 @@ axl_surface_from_output(
  */
 typedef struct {
     /// Pointer entered the surface, now at surface-local (@p x, @p y).
-    void (*enter)(void *user, int32_t x, int32_t y);
+    void (*enter)(void *user, int32_t x, int32_t y) AXL_CB_NOEXCEPT;
     /// Pointer left the surface.
-    void (*leave)(void *user);
+    void (*leave)(void *user) AXL_CB_NOEXCEPT;
     /// Pointer moved to surface-local (@p x, @p y). @p modifiers is the live
     /// AXL_INPUT_MOD_* state from the originating event.
-    void (*motion)(void *user, int32_t x, int32_t y, uint32_t modifiers);
+    void (*motion)(void *user, int32_t x, int32_t y, uint32_t modifiers) AXL_CB_NOEXCEPT;
     /// A button changed: @p button is the AXL_INPUT_BUTTON_* bit that
     /// transitioned, @p pressed its new state, at surface-local (@p x, @p y).
     /// @p modifiers is the live AXL_INPUT_MOD_* state; @p click_count is the
@@ -547,16 +580,16 @@ typedef struct {
     /// same per-event @p click_count / @p dragging.
     void (*button)(void *user, uint32_t button, bool pressed,
                    int32_t x, int32_t y,
-                   uint32_t modifiers, uint32_t click_count, bool dragging);
+                   uint32_t modifiers, uint32_t click_count, bool dragging) AXL_CB_NOEXCEPT;
     /// Scroll/axis motion by (@p dx, @p dy) notch ticks. @p modifiers is the
     /// live AXL_INPUT_MOD_* state (e.g. Shift+wheel for horizontal scroll).
-    void (*axis)(void *user, int32_t dx, int32_t dy, uint32_t modifiers);
+    void (*axis)(void *user, int32_t dx, int32_t dy, uint32_t modifiers) AXL_CB_NOEXCEPT;
     /// Key event routed to the keyboard-focus surface (C5).
-    void (*key)(void *user, const AxlInputEvent *ev);
+    void (*key)(void *user, const AxlInputEvent *ev) AXL_CB_NOEXCEPT;
     /// Surface gained keyboard focus (C5).
-    void (*focus_in)(void *user);
+    void (*focus_in)(void *user) AXL_CB_NOEXCEPT;
     /// Surface lost keyboard focus (C5).
-    void (*focus_out)(void *user);
+    void (*focus_out)(void *user) AXL_CB_NOEXCEPT;
 } AxlSurfaceListener;
 
 /**
@@ -700,7 +733,7 @@ axl_compositor_detach_touch(
 /// runs, so the callback may safely re-grab / close popups.
 typedef void (*AxlGrabDismissFunc)(
     void *user   ///< the @p user passed to axl_compositor_pointer_grab
-);
+) AXL_CB_NOEXCEPT;
 
 /// Maximum nesting depth of the pointer-grab stack (a deep popup chain).
 #define AXL_COMPOSITOR_GRAB_MAX  16
@@ -894,7 +927,7 @@ axl_compositor_set_cursor_image(
 typedef void (*AxlFrameCallback)(
     void      *user,     ///< the @p user passed to axl_surface_request_frame
     uint64_t   time_ms   ///< monotonic frame time in milliseconds
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Request a one-shot frame callback for @p s (Wayland

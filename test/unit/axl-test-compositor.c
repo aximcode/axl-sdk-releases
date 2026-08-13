@@ -345,6 +345,143 @@ test_compositor_opacity(void)
     axl_compositor_free(c);
 }
 
+/* E11: opacity is a scene-graph property — a surface composites at its own
+   value times every ancestor's, root included. Pins the multiply (exact),
+   that it reaches grandchildren through a fully-opaque intermediate, that a
+   faded subtree still cannot cull, that reparenting picks the factor up, and
+   — the one a probe pixel cannot check — a WHOLE-FRAME exact oracle for a
+   nested parent/child pair whose rects only partly overlap. */
+static void
+test_compositor_inherited_opacity(void)
+{
+    const AxlGfxPixel RED  = AXL_GFX_RGB(0xC0, 0x20, 0x20);  /* backdrop */
+    const AxlGfxPixel VEIL = AXL_GFX_RGB(0x10, 0x10, 0x10);  /* parent   */
+    const AxlGfxPixel CARD = AXL_GFX_RGB(0x20, 0x40, 0xE0);  /* child    */
+
+    AxlCompositor *c = axl_compositor_new(SW, SH);
+    AxlSurface *root = axl_compositor_root(c);
+    AxlSurface *b = axl_surface_new(root, SW, SH);
+    fill_surface(b, SW, SH, RED);
+
+    /* P covers 10..70 x 10..50; C (P's child) covers 50..90 x 30..60, so the
+       frame has a parent-only band, an overlap, and a child-only band. */
+    AxlSurface *p = axl_surface_new(root, 60, 40);
+    axl_surface_move(p, 10, 10);
+    fill_surface(p, 60, 40, VEIL);
+    AxlSurface *cd = axl_surface_new(p, 40, 30);
+    axl_surface_move(cd, 40, 20);          /* surface-local → abs (50,30) */
+    fill_surface(cd, 40, 30, CARD);
+
+    test_check(axl_surface_effective_opacity(NULL) == 0,
+               "inherit: effective_opacity(NULL) is 0");
+    test_check(axl_surface_effective_opacity(root) == 255
+               && axl_surface_effective_opacity(p) == 255
+               && axl_surface_effective_opacity(cd) == 255,
+               "inherit: default is 255 all the way down (identity product)");
+
+    /* The multiply, exact: 128 under 128 is 64, not 128 and not 127. */
+    axl_surface_set_opacity(p, 128);
+    axl_surface_set_opacity(cd, 128);
+    test_check(axl_surface_effective_opacity(p) == 128,
+               "inherit: a root child's effective opacity is its own");
+    test_check(axl_surface_effective_opacity(cd) == 64,
+               "inherit: 128 under a 128 parent composites at 64");
+
+    /* Reaches a GRANDCHILD through a fully-opaque intermediate — a
+       direct-parent-only implementation would report 255 here. */
+    axl_surface_set_opacity(cd, 255);
+    AxlSurface *g = axl_surface_new(cd, 20, 10);
+    fill_surface(g, 20, 10, CARD);
+    test_check(axl_surface_effective_opacity(g) == 128,
+               "inherit: a grandchild inherits through an opaque parent");
+    axl_surface_set_opacity(g, 128);
+    test_check(axl_surface_effective_opacity(g) == 64,
+               "inherit: a grandchild's own value multiplies with the chain");
+    axl_surface_free(g);
+
+    /* Reparenting picks up the new chain; back under the root drops it. */
+    AxlSurface *r = axl_surface_new(root, 10, 10);
+    test_check(axl_surface_effective_opacity(r) == 255,
+               "inherit: a fresh root child is 255");
+    axl_surface_set_parent(r, p);
+    test_check(axl_surface_effective_opacity(r) == 128,
+               "inherit: reparenting under a faded parent picks up its factor");
+    axl_surface_set_parent(r, root);
+    test_check(axl_surface_effective_opacity(r) == 255,
+               "inherit: reparenting back to the root drops the factor");
+    axl_surface_free(r);
+
+    /* WHOLE-FRAME exact oracle. Every output pixel computed independently:
+       the opaque backdrop, then the parent at 128, then the child at 64 over
+       whatever the parent left. An error confined to the 50..70 x 30..50
+       overlap is invisible to a probe pixel but not to this. */
+    axl_surface_set_opacity(cd, 128);
+    axl_compositor_composite(c);
+    bool frame_ok = true;
+    for (int32_t y = 0; y < SH && frame_ok; y++) {
+        for (int32_t x = 0; x < SW; x++) {
+            AxlGfxPixel want = RED;   /* b is a full-cover opaque copy */
+            if (x >= 10 && x < 70 && y >= 10 && y < 50) {
+                want = axl_gfx_composite(want, AXL_GFX_RGBA(0x10, 0x10, 0x10, 128));
+            }
+            if (x >= 50 && x < 90 && y >= 30 && y < 60) {
+                want = axl_gfx_composite(want, AXL_GFX_RGBA(0x20, 0x40, 0xE0, 64));
+            }
+            if (!rgb_eq(scan_at(c, x, y), want)) {
+                frame_ok = false;
+                break;
+            }
+        }
+    }
+    test_check(frame_ok, "inherit: whole frame matches the nested-opacity oracle");
+
+    /* The oracle above is only meaningful if the three bands actually differ
+       — otherwise it would pass against a compositor that ignored opacity. */
+    AxlGfxPixel only_p  = scan_at(c, 20, 20);   /* parent, no child */
+    AxlGfxPixel overlap = scan_at(c, 60, 40);   /* parent + child   */
+    AxlGfxPixel only_cd = scan_at(c, 80, 55);   /* child, no parent */
+    test_check(!rgb_eq(only_p, overlap) && !rgb_eq(overlap, only_cd)
+               && !rgb_eq(only_p, only_cd) && !rgb_eq(only_p, RED),
+               "inherit: parent-only, overlap and child-only bands all differ");
+
+    /* A faded subtree must not cull: flag the child a full-cover opaque and
+       confirm the backdrop and parent are still blitted (3 surfaces, not 1). */
+    axl_surface_resize(cd, SW, SH);
+    axl_surface_move(cd, -10, -10);   /* surface-local → abs (0,0), full cover */
+    axl_surface_set_opaque(cd, true);
+    axl_surface_set_opacity(cd, 255); /* own value 255; effective 128 via p */
+    test_check(axl_surface_effective_opacity(cd) == 128,
+               "inherit: a 255 child under a 128 parent is still faded");
+    axl_compositor_composite(c);
+    test_check(axl_compositor_composited_count(c) == 3,
+               "inherit: a subtree faded by its parent never culls beneath it");
+
+    /* A subtree at 0 contributes nothing AND still does not cull. */
+    axl_surface_set_opacity(p, 0);
+    test_check(axl_surface_effective_opacity(cd) == 0,
+               "inherit: a subtree under a 0 parent is fully transparent");
+    axl_compositor_composite(c);
+    /* Sample where cd's buffer still holds OPAQUE content — resize preserved
+       only the old 40x30 top-left, and cd now sits at abs (0,0), so (20,20)
+       is opaque card while (50,40) would be cleared-transparent and would
+       read RED whatever the opacity did. */
+    test_check(rgb_eq(scan_at(c, 20, 20), RED),
+               "inherit: a subtree at 0 leaves the backdrop untouched");
+    test_check(axl_compositor_composited_count(c) == 3,
+               "inherit: a subtree at 0 still does not cull the backdrop");
+
+    /* Root opacity fades the entire scene (the root is in the chain). */
+    axl_surface_set_opacity(p, 255);
+    axl_surface_set_opacity(root, 128);
+    test_check(axl_surface_effective_opacity(b) == 128,
+               "inherit: root opacity reaches every top-level surface");
+    test_check(axl_surface_effective_opacity(cd) == 128,
+               "inherit: root opacity reaches a nested surface");
+    axl_surface_set_opacity(root, 255);
+
+    axl_compositor_free(c);
+}
+
 /* Per-pixel alpha at full opacity: an opaque body, a transparent gap, and a
    half-alpha edge in one surface, blended over an opaque backdrop. The popup /
    dropdown / tooltip case (opaque panel + soft drop shadow). */
@@ -643,6 +780,100 @@ test_compositor_occlusion_hoist(void)
 /* E10 — backdrop blur: a translucent surface frosts the composited backdrop
    beneath it (the dialog veil). Oracle: blur the same pattern independently
    and require an exact match, so the assertion pins the kernel, not a vibe. */
+/* An OPAQUE surface in front of a backdrop-blur veil must not split the
+   veil's blit.
+   The scene is a modal dialog: backdrop, a blur veil over all of it, and an
+   opaque card on top. Marking the card `opaque` is a pure hint -- it says
+   nothing about what the frame should LOOK like -- but it used to hole the
+   veil's visible region, so the veil blitted as the 4 rects around the card
+   instead of 1, and E10's partial re-blur declined and fell back to blurring
+   the whole veil. Measured 15614 us/present opaque vs 116 us non-opaque, so
+   the only way to get a fast modal was to lie about the card being opaque.
+
+   Two assertions, because either alone is weak:
+     - composited_count pins the STRUCTURE (one blit for the veil, not four).
+       Each region rect costs one surf_blit call, so a split is publicly
+       visible through this counter.
+     - a WHOLE-FRAME compare against the same scene with the card non-opaque
+       pins that the hint still changes nothing visible. A hint that alters
+       pixels is a bug however fast it is, and a single probe pixel would miss
+       a halo bleeding out from under the card. */
+static void
+test_compositor_opaque_over_blur_no_split(void)
+{
+    const AxlGfxPixel BLK = AXL_GFX_RGB(0x00, 0x00, 0x00);
+    const AxlGfxPixel WHT = AXL_GFX_RGB(0xFF, 0xFF, 0xFF);
+    const AxlGfxPixel CRD = AXL_GFX_RGB(0x20, 0x40, 0x80);
+    const uint32_t    R   = 6;
+    const size_t      N   = (size_t)SW * SH;
+
+    /* Card centred so it holes the veil on all four sides -- the worst case
+       for splitting, and the one a real modal produces. */
+    const int32_t cx = SW / 4, cy = SH / 4;
+    const uint32_t cw = SW / 2, ch = SH / 2;
+
+    AxlGfxPixel *snap = axl_malloc(N * sizeof(AxlGfxPixel));
+    test_check(snap != NULL, "opaque-over-blur: snapshot allocation");
+    if (snap == NULL) {
+        return;
+    }
+
+    uint32_t blitted_hint = 0, blitted_plain = 0;
+
+    for (int pass = 0; pass < 2; pass++) {
+        const bool hint = (pass == 0);   /* pass 0: card marked opaque */
+
+        AxlCompositor *c = axl_compositor_new(SW, SH);
+        AxlSurface *b = axl_surface_new(axl_compositor_root(c), SW, SH);
+        AxlSurface *v = axl_surface_new(axl_compositor_root(c), SW, SH);
+        AxlSurface *card = axl_surface_new(axl_compositor_root(c), cw, ch);
+
+        axl_gfx_target_buffer(axl_surface_buffer(b));
+        axl_gfx_fill_rect(0, 0, SW, SH, BLK);
+        axl_gfx_fill_rect(SW / 2, 0, SW / 2, SH, WHT);
+        axl_gfx_target_buffer(NULL);
+
+        /* Transparent veil: output is exactly the blurred backdrop. */
+        AxlGfxPixel *vp = axl_gfx_buffer_pixels(axl_surface_buffer(v));
+        for (size_t i = 0; i < N; i++) { vp[i] = AXL_GFX_RGBA(0, 0, 0, 0); }
+        axl_surface_set_per_pixel_alpha(v, true);
+        axl_surface_set_backdrop_blur(v, R);
+
+        axl_gfx_target_buffer(axl_surface_buffer(card));
+        axl_gfx_fill_rect(0, 0, cw, ch, CRD);
+        axl_gfx_target_buffer(NULL);
+        axl_surface_move(card, cx, cy);
+        axl_surface_set_opaque(card, hint);
+
+        axl_compositor_composite(c);
+        uint32_t blitted = axl_compositor_composited_count(c);
+        if (hint) { blitted_hint = blitted; } else { blitted_plain = blitted; }
+
+        AxlGfxPixel *out = axl_gfx_buffer_pixels(axl_compositor_output(c));
+        if (hint) {
+            axl_memcpy(snap, out, N * sizeof(AxlGfxPixel));
+        } else {
+            size_t diff = 0;
+            for (size_t i = 0; i < N; i++) {
+                if (!rgb_eq(snap[i], out[i])) { diff++; }
+            }
+            test_check(diff == 0,
+                       "opaque-over-blur: the opaque hint changes no pixel "
+                       "anywhere in the frame");
+        }
+        axl_compositor_free(c);
+    }
+
+    /* 3 surfaces, each blitted once. An opaque card that holes the veil turns
+       the veil's 1 blit into 4, so the hinted pass would report 6, not 3. */
+    test_check(blitted_hint == blitted_plain,
+               "opaque-over-blur: the hint does not add blits (veil not split)");
+    test_check(blitted_hint == 3,
+               "opaque-over-blur: each of the 3 surfaces blits exactly once");
+
+    axl_free(snap);
+}
+
 static void
 test_compositor_backdrop_blur(void)
 {
@@ -2011,6 +2242,7 @@ test_compositor_main(int argc, char **argv)
     test_compositor_reparent();
     test_compositor_occlusion();
     test_compositor_opacity();
+    test_compositor_inherited_opacity();
     test_compositor_per_pixel_alpha();
     test_compositor_damage();
     test_compositor_damage_region();
@@ -2047,6 +2279,7 @@ test_compositor_main(int argc, char **argv)
     test_seat_destroy_purges();
     test_seat_grab_nulls();
 
+    test_compositor_opaque_over_blur_no_split();
     test_seat_cursor();
 
     return test_print_results();

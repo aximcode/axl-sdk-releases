@@ -182,6 +182,59 @@ a comment explaining its trigger).
   reproduce per-file). A bare `xargs -0 clang-tidy` (batched)
   is the flaky form — don't use it.
 
+  **What `scripts/lint.sh` covers, and what it deliberately does not.**
+  It runs three passes over one `bear`-generated compile database:
+
+  1. `clang -fsyntax-only -Wall -Wextra` over every project TU
+     (`scripts/check-clang-warnings.py`). The tree builds with **gcc**, and
+     clang-*tidy* reports `.clang-tidy`'s checks, not the clang frontend's
+     own `-W` diagnostics — so before this pass a clang-only compiler
+     warning had nowhere to surface, and a `-Wformat` "zero field width"
+     reached a commit that way. One category is suppressed:
+     `-Wmissing-field-initializers` (60 of the 75 `-Wextra` findings; in C a
+     partial initializer zero-fills the rest by language guarantee, so it is
+     a style opinion, not a defect signal). Everything else `-Wextra` brings
+     is enforced.
+  2. clang-tidy over `src/` — the full `.clang-tidy` config.
+  3. clang-tidy over `test/unit/` **and `tools/`** — **`bugprone-*` only**
+     (`--checks='-clang-analyzer-*'`, which subtracts the analyzer from the
+     shared config so the disabled-check list stays single-sourced).
+
+  Pass 3 is narrowed on purpose, and the numbers are why. Both directories
+  are **0** findings at `bugprone-*` and both are far from clean at the full
+  config, for the same reason with different specifics:
+
+  | Scope | `bugprone-*` | full config | what the difference is |
+  |---|---|---|---|
+  | `test/unit/` | 0 | ~40 | the analyzer objecting to what unit tests do deliberately — casting `99` to an enum to pin the bad-enum error path, indexing a buffer the test has already asserted non-NULL |
+  | `tools/` | 0 | 10 | 4 × `security.PointerSub` on ordinary buffer arithmetic, 2 × garbage-value in `mkfixture.c`/`sysinfo.c`, and a `core.DivideZero` in `crashtest.c` — a tool whose entire purpose is to divide by zero |
+
+  Enabling the analyzer over either would mean a red gate or ~50
+  suppressions that bury the real findings.
+
+  `tools/` was measured at **3** `bugprone-*` findings before it was turned
+  on, and the three were resolved individually rather than waived as a
+  group:
+
+  - `tools/sysinfo.c` — `bugprone-switch-missing-default-case` on the SMBIOS
+    memory-type decode. A real, if trivial, omission: **fixed** with an
+    explicit `default: break;`, which is also the clearer code, since the
+    switch is over a raw firmware byte and unlisted values are the expected
+    case rather than an oversight.
+  - `tools/sed.c` ×2 — `bugprone-branch-clone`, both *semantically distinct*
+    cases that happen to share an implementation (`:` label-definition vs the
+    `b`/`t`/`T` jumps; `A_ZERO` vs `default`). Merging them would delete
+    intent, so each carries a **targeted** `NOLINTBEGIN/END(bugprone-branch-clone)`
+    with the reason written out above it — the same shape `src/format/axl-format.c`
+    already uses for its `long` / `long long` `va_arg` branches. The check
+    stays enabled everywhere else.
+
+  **Not covered (measured, deferred — not an oversight):**
+  - `test/integration/`, `test/fuzz/` — absent from the compile database
+    (`make tests tools` does not build them), so clang-tidy falls back to
+    default flags and emits nonsense `'foo.h' file not found` errors rather
+    than real analysis. Getting them into the DB is the prerequisite.
+
 ## Cut the release
 
 ### 1. Bump the version
@@ -436,9 +489,12 @@ package contains:
 
 - C bits (always): `axl-cc` driver, `libaxl.a` per arch,
   `axl.h` + `axl/*.h` headers, CRT0 objects, linker scripts,
-  CMake config, pkg-config, JSON5 sidecars.
-- C++ bits (when toolchain present at build time): `axl-c++`
-  driver, `libaxl-cxx.a` per arch.  `libaxl-cxx.a` doesn't link
+  CMake config, pkg-config, JSON5 sidecars.  The `axl-c++` driver
+  is here too — it is a dependency-free `exec axl-cc -x c++`
+  wrapper, so it ships unconditionally; without `libaxl-cxx.a` it
+  simply reports which install step is missing.
+- C++ bits (when toolchain present at build time): `libaxl-cxx.a`
+  per arch.  `libaxl-cxx.a` doesn't link
   libstdc++ so there's no runtime-dependency escalation on the
   package — pure-C consumers can ignore the extra files.
 

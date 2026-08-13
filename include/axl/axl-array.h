@@ -1,12 +1,38 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-array.h:
+/** @file axl-array.h
  *
  * Growable dynamic array. Two modes:
  *   - Value mode: stores copies of fixed-size elements.
  *   - Pointer mode: stores void* pointers (element_size = sizeof(void*)).
+ *
+ * @section array_glib Relationship to GLib's GArray
+ *
+ * This container tracks @c GArray closely, so the places it deliberately
+ * diverges are recorded here rather than left to look like oversights:
+ *
+ * - **No ref/unref.** GLib refcounts a @c GArray. AXL does not, because a
+ *   refcount shared across CPUs needs atomics and AXL runs @c AxlTaskProc on
+ *   application processors. Single-owner is the rule; hand ownership over with
+ *   axl_array_steal() instead of sharing it. Do not add refcounting here.
+ * - **Element destructors are set, not passed at construction.** Every other
+ *   AXL container takes its destructor at construction (@c
+ *   axl_hash_table_new_full) or at the terminal call (@c axl_list_free_full).
+ *   This one follows @c GArray instead, because GLib's own hooks are setters
+ *   and the merged type needs two of them. It is the one place AxlArray
+ *   diverges from AXL convention rather than toward it.
+ * - **@c GArray and @c GPtrArray are merged into one type**, with @c _ptr
+ *   variants (axl_array_append_ptr() and friends) rather than a second type.
+ *   Fewer types to learn; the cost is that the array cannot infer which mode
+ *   it is in, which is why element cleanup needs the two distinct hooks
+ *   described at axl_array_set_clear_func().
+ * - **axl_array_get() is a function**, not GLib's typed @c g_array_index
+ *   macro, and **axl_array_len() is a function**, not a public @c ->len field.
+ *   Both deliberate: the struct stays opaque and there is no macro
+ *   type-punning.
+ * - **One element at a time.** There is no bulk @c append_vals /
+ *   @c insert_vals / @c prepend_vals; no caller has needed them.
  */
 
 #ifndef AXL_ARRAY_H
@@ -35,11 +61,118 @@ axl_array_new(
 );
 
 /**
+ * @brief Create a new array with capacity reserved up front.
+ *
+ * Identical to axl_array_new() but pre-sizes the internal buffer, so a
+ * caller that already knows roughly how many elements are coming pays no
+ * grow-and-copy cost. The array still starts EMPTY — @p reserved is capacity,
+ * not length. Matches @c g_array_sized_new.
+ *
+ * A @p reserved of 0 behaves exactly like axl_array_new().
+ *
+ * @return new AxlArray, or NULL on failure. Free with axl_array_free().
+ */
+AxlArray *
+axl_array_sized_new(
+    size_t element_size,  ///< size of each element in bytes
+    size_t reserved       ///< elements to reserve capacity for (0 = default)
+);
+
+/**
  * @brief Free a dynamic array and its internal buffer.
+ *
+ * Calls the clear / free hook on every remaining element if one is set —
+ * see axl_array_set_clear_func(). With no hook set, only the buffer and the
+ * array itself are released, so anything reached only through a stored
+ * pointer LEAKS: either set a hook or free the elements yourself first.
  */
 void
 axl_array_free(
     AxlArray *a  ///< array (NULL-safe)
+);
+
+/**
+ * @brief Set the destructor for elements stored by VALUE.
+ *
+ * The array calls @p clear_func with a pointer to the element SLOT — i.e. the
+ * same thing axl_array_get() returns — for every element it discards. Use
+ * this when an element is a struct that owns something.
+ *
+ * @warning In POINTER mode this is almost never what you want, and the
+ * mistake is dangerous rather than merely wrong: passing @c axl_free here
+ * would free the slot's ADDRESS, which points into the middle of the array's
+ * own buffer. Use axl_array_set_ptr_free_func() for pointer mode.
+ *
+ * The hook runs on every path that discards an element, matching GLib:
+ * axl_array_free(), axl_array_clear(), axl_array_remove_index(),
+ * axl_array_remove_index_fast(), axl_array_remove_range(), and a SHRINKING
+ * axl_array_set_size(). It does NOT run on axl_array_steal() — that transfers
+ * ownership to the caller rather than discarding it.
+ *
+ * Setting either hook replaces any previously set hook of either kind.
+ * Passing NULL clears it (elements are then borrowed).
+ */
+void
+axl_array_set_clear_func(
+    AxlArray         *a,          ///< array
+    AxlDestroyNotify  clear_func  ///< called with a pointer TO the element, or NULL
+);
+
+/**
+ * @brief Set the destructor for elements stored as POINTERS.
+ *
+ * The array calls @p free_func with the STORED POINTER — the same thing
+ * axl_array_get_ptr() returns — for every element it discards, so
+ * @c axl_free_impl is the natural argument. (Pass @c axl_free_impl, not
+ * @c axl_free: the latter is a macro and cannot be taken as a function
+ * pointer. This matches how every other AXL container is handed a
+ * destructor.) This is the @c g_ptr_array_set_free_func
+ * half of the pair; see axl_array_set_clear_func() for the value-mode half
+ * and for the full list of paths the hook runs on.
+ *
+ * Requires an element size of exactly @c sizeof(void*); a value-mode array is
+ * rejected rather than reinterpreted, because misreading a struct as a
+ * pointer and freeing it would corrupt the heap.
+ *
+ * Setting either hook replaces any previously set hook of either kind.
+ * Passing NULL clears it (elements are then borrowed).
+ *
+ * @return AXL_OK, or AXL_ERR if @p a is NULL or its element size is not
+ *     @c sizeof(void*).
+ */
+int
+axl_array_set_ptr_free_func(
+    AxlArray         *a,         ///< array (element_size must be sizeof(void*))
+    AxlDestroyNotify  free_func  ///< called with the STORED pointer, or NULL
+);
+
+/**
+ * @brief Hand the internal buffer to the caller and empty the array.
+ *
+ * Ownership of the element block transfers to the caller, who must release it
+ * with axl_free(). The array itself stays VALID and reusable — appending
+ * after a steal works and simply allocates a fresh buffer. This is
+ * @c g_array_steal, NOT @c g_array_free(arr, FALSE): the array is emptied,
+ * not destroyed, so axl_array_free() is still required eventually.
+ *
+ * @p out_len receives the ELEMENT COUNT, matching axl_array_len() — not a
+ * byte count. Multiply by your own element size if you need bytes.
+ *
+ * No clear/free hook runs: this is a transfer of ownership, not a discard.
+ * The block is NOT shrunk to fit, so it may be larger than
+ * @p out_len * element_size — free it, do not assume its size.
+ *
+ * Stealing an array that currently holds no buffer — which happens only after
+ * a previous steal, since construction always allocates — returns NULL with
+ * @p out_len set to 0. Stealing a merely EMPTY array returns its (valid,
+ * unused) block.
+ *
+ * @return the element buffer, or NULL if @p a is NULL.
+ */
+void *
+axl_array_steal(
+    AxlArray *a,       ///< array
+    size_t   *out_len  ///< receives the element COUNT (may be NULL)
 );
 
 #ifdef AXL_HAVE_AUTOPTR
@@ -110,6 +243,9 @@ axl_array_len(
 
 /**
  * @brief Remove all elements. Does not free the internal buffer.
+ *
+ * Runs the clear / free hook on each discarded element if one is set —
+ * see axl_array_set_clear_func().
  */
 void
 axl_array_clear(
@@ -181,6 +317,9 @@ axl_array_sort(
 /**
  * @brief Remove the element at @p index, shifting remaining elements left.
  *
+ * Runs the clear / free hook on each discarded element if one is set —
+ * see axl_array_set_clear_func().
+ *
  * @return AXL_OK on success, AXL_ERR if index is out of range.
  */
 int
@@ -191,6 +330,9 @@ axl_array_remove_index(
 
 /**
  * @brief Remove the element at @p index by swapping with the last element.
+ *
+ * Runs the clear / free hook on each discarded element if one is set —
+ * see axl_array_set_clear_func().
  *
  * O(1) but does not preserve order.
  *
@@ -204,6 +346,9 @@ axl_array_remove_index_fast(
 
 /**
  * @brief Remove @p len elements starting at @p index, shifting remaining left.
+ *
+ * Runs the clear / free hook on each discarded element if one is set —
+ * see axl_array_set_clear_func().
  *
  * @return AXL_OK on success, AXL_ERR if the range is out of bounds.
  */
@@ -219,7 +364,8 @@ axl_array_remove_range(
  *
  * If growing, new elements are zero-initialized. If growing beyond
  * capacity, the internal buffer is reallocated. If shrinking, length
- * is reduced without reallocating.
+ * is reduced without reallocating and the clear / free hook runs on each
+ * discarded element if one is set — see axl_array_set_clear_func().
  *
  * @return AXL_OK on success, AXL_ERR on allocation failure.
  */

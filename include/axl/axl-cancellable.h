@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-cancellable.h:
+/** @file axl-cancellable.h
  *
  * Generic cancellation primitive for async operations. Parallels
  * GLib's GCancellable, mapped onto AXL's single-threaded event loop.

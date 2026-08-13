@@ -22,7 +22,9 @@
  * aggregates. Net cost stays O(log n).
  */
 
+#include <axl/axl-log.h>
 #include <axl/axl-rb-tree.h>
+AXL_LOG_DOMAIN("rbtree");
 
 static inline void
 aug(AxlRBTree *t, AxlRBNode *n)
@@ -384,4 +386,154 @@ axl_rb_prev(const AxlRBNode *node)
         n = n->parent;
     }
     return n->parent;
+}
+
+// ---------------------------------------------------------------------------
+// Invariant checking
+// ---------------------------------------------------------------------------
+//
+// An in-order walk proves SORTED, not BALANCED -- a tree degenerated into a
+// list answers every query correctly, just in O(n). These are what notice.
+
+/* A valid red-black tree of n nodes has height <= 2*log2(n+1), so 128 covers
+   any tree that could fit in addressable memory many times over. A CORRUPT
+   one has no such bound, and this function's whole job is to run on corrupt
+   input -- on a UEFI stack, which is small. */
+#define RB_MAX_DEPTH   128
+/* Calls, not nodes. A corrupted node whose two children are the SAME node
+   passes every structural check and doubles the call count per level, so a
+   ~50-node graph is 2^50 calls with no cycle to detect. */
+#define RB_MAX_VISITS  (1u << 24)
+
+/* Recursive black-height check. Returns the black height of the subtree, or
+   -1 if any invariant fails at or below @a n.
+   BOTH bounds are load-bearing and neither is the count check at the end of
+   axl_rb_check_invariants -- that one runs AFTER this returns, so it bounds
+   nothing. An earlier revision of this comment claimed otherwise; the
+   measured failure was a stack overflow at 3000 nodes on a 128 KB stack. */
+static int
+rb_check(
+    const AxlRBNode  *n,
+    size_t           *seen,
+    unsigned          depth
+    )
+{
+    int left_bh;
+    int right_bh;
+
+    if (n == NULL) {
+        return 0;   /* NULL leaves are black but are not counted; see below */
+    }
+
+    if (depth > RB_MAX_DEPTH) {
+        axl_warning("depth exceeded %u -- tree is corrupt or degenerate",
+                    RB_MAX_DEPTH);
+        return -1;
+    }
+    if (*seen > RB_MAX_VISITS) {
+        axl_warning("visited more than %u nodes -- structure is not a tree",
+                    RB_MAX_VISITS);
+        return -1;
+    }
+
+    (*seen)++;
+
+    if (n->left != NULL && n->left->parent != n) {
+        axl_warning("left child does not point back to its parent");
+        return -1;
+    }
+    if (n->right != NULL && n->right->parent != n) {
+        axl_warning("right child does not point back to its parent");
+        return -1;
+    }
+
+    if (n->color == AXL_RB_RED) {
+        if ((n->left != NULL && n->left->color == AXL_RB_RED) ||
+            (n->right != NULL && n->right->color == AXL_RB_RED)) {
+            axl_warning("red node has a red child");
+            return -1;
+        }
+    }
+
+    left_bh = rb_check(n->left, seen, depth + 1);
+    if (left_bh < 0) {
+        return -1;
+    }
+    right_bh = rb_check(n->right, seen, depth + 1);
+    if (right_bh < 0) {
+        return -1;
+    }
+
+    if (left_bh != right_bh) {
+        axl_warning("black height differs (%d vs %d)", left_bh, right_bh);
+        return -1;
+    }
+    return left_bh + (n->color == AXL_RB_BLACK ? 1 : 0);
+}
+
+/* Nodes reachable by an in-order walk, which follows parent links out of the
+   subtree -- so it disagrees with the recursive count exactly when something
+   is orphaned or cyclic. */
+static size_t
+rb_walk_count(
+    const AxlRBTree  *t
+    )
+{
+    size_t     n = 0;
+    AxlRBNode *it;
+
+    for (it = axl_rb_first(t); it != NULL; it = axl_rb_next(it)) {
+        n++;
+        if (n > RB_MAX_VISITS) {
+            break;      /* the caller's count comparison reports the mismatch */
+        }
+    }
+    return n;
+}
+
+bool
+axl_rb_check_invariants(const AxlRBTree *t)
+{
+    size_t  seen = 0;
+    size_t  walked;
+
+    if (t == NULL) {
+        return false;
+    }
+    if (t->root == NULL) {
+        return true;
+    }
+
+    if (t->root->parent != NULL) {
+        axl_warning("root has a parent");
+        return false;
+    }
+    if (t->root->color != AXL_RB_BLACK) {
+        axl_warning("root is not black");
+        return false;
+    }
+    if (rb_check(t->root, &seen, 0) < 0) {
+        return false;
+    }
+
+    walked = rb_walk_count(t);
+    if (walked != seen) {
+        axl_warning("in-order walk saw %zu nodes, structure has %zu",
+                    walked, seen);
+        return false;
+    }
+    return true;
+}
+
+int
+axl_rb_black_height(const AxlRBTree *t)
+{
+    size_t  seen = 0;
+    int     bh;
+
+    if (t == NULL || t->root == NULL) {
+        return 0;
+    }
+    bh = rb_check(t->root, &seen, 0);
+    return bh < 0 ? -1 : bh;
 }

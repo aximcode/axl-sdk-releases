@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-format.h:
+/** @file axl-format.h
  *
  * Callback-driven printf engine. Format text directly into any sink
  * (buffer, network socket, file, hash) without intermediate allocation.
@@ -11,7 +10,7 @@
  * and axl_string_append_printf. Exposed for consumers who need
  * custom formatting targets.
  *
- * Supports: %d %i %u %x %X %s %c %p %%
+ * Supports: %d %i %u %x %X %s %c %p %f %F %e %E %g %G %%
  * Length modifiers: l ll z
  * Flags: 0 - + (space)
  * Width: N or *
@@ -20,6 +19,8 @@
 
 #ifndef AXL_FORMAT_H
 #define AXL_FORMAT_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stddef.h>
 #include <stdarg.h>
@@ -39,7 +40,7 @@ typedef void (*AxlWriteFunc)(
     const char *data,  ///< output bytes (not NUL-terminated)
     size_t      len,   ///< number of bytes
     void       *ctx    ///< caller-provided context
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Format with va_list into a write callback.
@@ -88,19 +89,24 @@ axl_format(
 ) __attribute__((format(printf, 3, 4)));
 
 /**
- * Minimum @p bufsz for axl_dtoa: the shortest decimal representation
- * of any IEEE-754 double needs at most 17 significant digits; +1 for
- * the NUL terminator axl_dtoa writes.
+ * Minimum @p bufsz for axl_dtoa: a round-trippable decimal
+ * representation of any IEEE-754 double needs at most 17 significant
+ * digits; +1 for the NUL terminator axl_dtoa writes.
  */
 #define AXL_DTOA_BUF_MIN  18
 
 /**
- * @brief Shortest round-trippable decimal digits of a double (Grisu2).
+ * @brief Short round-trippable decimal digits of a double (Grisu2).
  *
- * Converts the finite double @p value to the *shortest* string of
- * decimal digits that, when read back, reproduces @p value exactly
- * (round-trip). This is the engine behind %f / %e / %g and the
- * primitive a consumer needs to serialize a double without losing
+ * Converts the finite double @p value to a short string of decimal
+ * digits that, when read back, reproduces @p value exactly. THE
+ * ROUND TRIP IS ALWAYS EXACT; the DIGIT COUNT is Grisu2's best effort
+ * and not a proven minimum -- for a fraction of a percent of doubles a
+ * shorter string would also have round-tripped (1e23 comes back as
+ * "9999999999999999" with decpt 23, where "1" with decpt 24 works).
+ * Guaranteeing minimality means Grisu3 or Ryu, i.e. a bignum fallback,
+ * which nothing here needs. This is the engine behind %f / %e / %g and
+ * the primitive a consumer needs to serialize a double without losing
  * precision.
  *
  * Output is split into three pieces so the caller can render any C
@@ -117,13 +123,13 @@ axl_format(
  *   - @p out_neg receives true for a negative @p value (including
  *     -0.0), false otherwise.
  *
- * Zero yields "0" with @p *out_decpt == 1. The result is the
- * canonical shortest form: trailing zeros are not emitted (100.0 is
- * "1" with decpt 3, not "100").
+ * Zero yields "0" with @p *out_decpt == 1. The result is canonical in
+ * that trailing zeros are never emitted (100.0 is "1" with decpt 3,
+ * not "100").
  *
- * @p value MUST be finite. NaN and +/-infinity are NOT handled here
- * (callers detect them first — `v != v` for NaN, `|v| > DBL_MAX` for
- * infinity); passing one returns 0.
+ * @p value MUST be finite. NaN and +/-infinity are NOT handled here —
+ * test with axl_isfinite() from <axl/axl-math.h> first; passing one
+ * returns 0.
  *
  * No allocation, no libm, no libc. Uses a ~1.3KB cached-powers table.
  *

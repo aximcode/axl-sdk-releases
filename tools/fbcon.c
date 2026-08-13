@@ -45,7 +45,9 @@ reap_resident_fbcon(void)
                 reaped++;
             }
         }
-        gBS->FreePool(handles);
+        /* axl_free would walk back to a bookkeeping header that was never
+           written, and corrupt the pool. */
+        gBS->FreePool(handles);  /* axl-pool-direct: LocateHandleBuffer allocated it */
     }
     return reaped;
 }

@@ -28,6 +28,53 @@ BSP (main core)              APs (worker cores)
 `axl_fopen`, or any UEFI protocol function. They can only access
 memory (including the arena allocator, which uses lock-free CAS).
 
+**AP SIMD state is per-core.** `CR4.OSXSAVE` and `XCR0` are not shared
+between processors, so AVX enabled on the BSP is not enabled on a
+worker. A task that executes AVX without calling `axl_cpu_enable_avx()`
+on that core takes a `#UD`:
+
+```c
+void compute(AxlArena *arena, void *arg) {
+    if (axl_cpu_enable_avx()) {
+        // AVX is live on THIS core now
+    }
+}
+```
+
+It is idempotent and reads live hardware state, so only the first task
+on a given core pays for the enable. Note that `axl_cpu_features()`
+describes the machine, while the `axl_cpu_enable_*` functions answer for
+the calling core — on a hybrid CPU those differ, so branch on the
+return value rather than the feature bits.
+
+**Workers are stopped before OS handoff.** The pool registers a
+before-ExitBootServices handler that parks its workers, because an AP
+still spinning in consumer code when the firmware hands off can hang the
+boot outright (the firmware's own AP-relocation handler waits for an
+acknowledgement that never comes). After it fires the pool keeps
+working, synchronously.
+
+**A worker slot is not the worker's memory.** The two are easy to
+conflate, and they have opposite lifetimes:
+
+| | Worker slot | `AxlArena` |
+|---|---|---|
+| What it is | The pool's per-AP control block — task pointer, state word, flags | The memory a task actually allocates from |
+| How big | Fixed, one cache line; one per AP | **Whatever you pass** to `axl_arena_new(capacity)` |
+| Who sizes it | Nobody — it follows the AP count | You do, per arena |
+| Where it lives | Fixed storage, capped by `AXL_TASK_MAX_WORKERS` | Heap |
+
+So the cap bounds how many workers can run at once (256 — a machine with
+more enabled APs uses the first 256 and warns), **not** how much memory a
+task may use. The slot holds only an `AxlArena *`; give tasks arenas as
+large as you like, and different arenas to different tasks.
+
+Slots live in fixed storage rather than the heap because the firmware may
+deliver a dispatched AP into its worker *after* the pool that dispatched
+it has been freed. Heap memory cannot express that lifetime: freeing the
+slot is a cross-CPU use-after-free, and keeping it is an allocator leak.
+A slot whose AP never acknowledged exit is simply never reissued.
+
 ### Arena Allocator
 
 Lock-free bump allocator for AP-safe memory. Pre-allocates a contiguous

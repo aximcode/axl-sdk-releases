@@ -46,10 +46,17 @@ timeout 90 "$RUN_QEMU" --arch "$TEST_ARCH" --nsh "$NSH" \
 pass=0; fail=0
 check() { if [[ "$1" == "0" ]]; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: $2"; fail=$((fail+1)); fi; }
 
-[[ -f "$SHOT" ]]; check "$?" "kbtune produced a GOP screenshot"
+# `[[ cond ]]; check "$?"` is unsafe here: common-test.sh runs under `set -e`
+# and this script does NOT `set +e` (unlike the axl-cc/install tests, which do),
+# so a FAILING assertion would kill the run before its own FAIL line, taking
+# every later check and the summary with it. An assertion that cannot report
+# its own failure is worse than no assertion.
+_ck=0; [[ -f "$SHOT" ]] || _ck=1
+check "$_ck" "kbtune produced a GOP screenshot"
 # A rendered HUD PNG is several KB; a blank/crashed framebuffer compresses tiny.
 sz=$(stat -c %s "$SHOT" 2>/dev/null || echo 0)
-[[ "$sz" -gt 4096 ]]; check "$?" "screenshot is a non-blank HUD (${sz} bytes > 4096)"
+_ck=0; [[ "$sz" -gt 4096 ]] || _ck=1
+check "$_ck" "screenshot is a non-blank HUD (${sz} bytes > 4096)"
 
 echo "--- results ---"
 echo "kbtune GOP smoke: $pass passed, $fail failed"

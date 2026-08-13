@@ -22,18 +22,55 @@ old size.
 In debug builds (`-DAXL_MEM_DEBUG`, the default for `make`):
 
 - **Fill patterns**: newly allocated memory is filled with `0xDA`;
-  freed memory is filled with `0xDD`. Use-after-free often manifests
-  as reads of `0xDD`.
-- **Fence-post guards**: 8 bytes of `0xFD` are placed before and after
-  each allocation. `axl_mem_check(ptr)` verifies these guards.
+  freed memory is filled with `0xDF`. Use-after-free often manifests
+  as reads of `0xDF`.
+- **Fence-post guards**: three `size_t` sentinels bracket the user
+  region — `0xC0C0AB1B` at the head and again just before the body,
+  `0xFACADE69` after it. `axl_mem_check(ptr)` verifies all three; a
+  tail mismatch specifically means an overflow.
 - **File/line tracking**: each allocation records `__FILE__` and
   `__LINE__` for leak reports.
 - **Leak reporting**: `axl_mem_dump_leaks()` prints all outstanding
-  allocations with their sizes and source locations.
+  allocations with their sizes and source locations, under the header
+  `=== AxlMem leak report (live allocations): ... ===`. AXL prints the
+  same list from its own teardown path (`_axl_cleanup`, or the minimal
+  CRT0), and there the header drops the infix — by then atexit
+  callbacks and the tier-1 sweep have run, so what is still live IS
+  leaked. That one token is the difference between a diagnostic and a
+  verdict, and the QEMU harness fails a test run on the verdict form
+  (`test_check_leaks` in `test/integration/common-test.sh`). Call
+  `axl_mem_dump_leaks()` freely; it will not fail anybody's build.
 - **OOM fault injection**: `axl_mem_fail_next_alloc(N)` arms the Nth
   subsequent allocation to return NULL without touching the backend.
   Used by unit tests to exercise caller-side error paths (rollback,
   cleanup, error logging) that would otherwise be unreachable.
+- **Free quarantine**: `axl_free` holds the block briefly instead of
+  returning it to the firmware immediately, then re-checks it on the
+  way out. On by default in debug (16 blocks, capped at 64 KiB total
+  and at one block per 64 KiB so a large allocation cannot pin the
+  heap); `axl_mem_set_quarantine(n)` resizes it, and `0` disables it
+  *and drains what is held* — which is how a test forces the pending
+  checks to run now. `axl_mem_corruption_count()` returns the running
+  total for tests to assert on; the log is what a human reads.
+
+  This exists because the leak report answers only one of the two
+  questions. It sees memory that was never freed, and is blind **by
+  construction** to memory freed too early — a block released while
+  still referenced produces no leak at all. The quarantine makes that
+  half observable:
+
+  - **use-after-free write** — the `0xDF` fill no longer reads back
+    when the block is evicted, reported with the original allocation
+    site.
+  - **double free** — the block is still held, so the second free is
+    refused rather than releasing the firmware pool twice. Checked
+    *before* the fences, because once a block has gone back to the
+    firmware, re-reading its header to validate anything is itself
+    undefined.
+
+  A quarantined block has already left the live list, so holding it
+  never inflates the leak report, and the teardown path drains the
+  ring before printing its verdict.
 
 In release builds (`make BUILD=RELEASE`), these features are disabled
 and the allocator has minimal overhead.

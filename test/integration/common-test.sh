@@ -19,6 +19,43 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$TESTS_DIR")")"
 source "$PROJECT_DIR/scripts/axl-common.sh"
 
+# AXL_TLS: warn only when a toggle is actually imminent.
+#
+# run-integration.sh exports AXL_TLS=1 for the whole suite. A test run BY HAND
+# with it unset toggles the flag, and the Makefile's state-change rule wipes
+# every .o, libaxl.a and .efi under the prefix. The failure that produces is
+# badly misleading: the link goes looking for crt0/reloc objects the wipe just
+# removed and the test reports "driver build failed", which reads like a code
+# error rather than a flag toggle. (Cost an hour to diagnose once.)
+#
+# Two things this deliberately is NOT:
+#
+#   - not `export AXL_TLS="${AXL_TLS:-1}"`. test-axl.sh sources this file too,
+#     and defaulting the flag changes which sources the unit suite builds --
+#     measured, 8820 -> 8964 tests. Silently moving the number the whole
+#     project ratchets on is not a convenience default's job. (test-axl.sh:28
+#     runs its own make with no AXL_TLS, which is why CI -- despite building
+#     AXL_TLS=1 -- also lands on 8820.)
+#
+#   - not an unconditional warning. test-axl.sh runs constantly with the flag
+#     unset and that is CORRECT there, so warning every time would be noise
+#     advising a change that moves the count.
+#
+# The precise condition is "the recorded state says on and we are about to
+# make it off", which the Makefile already tracks in .axl-tls-state.
+if [[ -z "${AXL_TLS:-}" ]]; then
+    _axl_tls_arch=x64
+    [[ "${1:-}" == *AARCH64* || "${*:-}" == *AARCH64* ]] && _axl_tls_arch=aa64
+    _axl_tls_state="$PROJECT_DIR/out/native-$_axl_tls_arch/build/.axl-tls-state"
+    if [[ -r "$_axl_tls_state" && "$(cat "$_axl_tls_state" 2>/dev/null)" == "on" ]]; then
+        echo "note: the build tree was last built with AXL_TLS=1 and this run has" >&2
+        echo "      it unset, so make will WIPE and rebuild it (watch for 'cannot" >&2
+        echo "      find axl-crt0-*.o' if that races). Prefer AXL_TLS=1 when running" >&2
+        echo "      a single integration test by hand -- that is what the suite uses." >&2
+    fi
+    unset _axl_tls_arch _axl_tls_state
+fi
+
 # State variables (set by helpers)
 TEST_ARCH="X64"
 TEST_TMPDIR=""
@@ -584,6 +621,22 @@ test_cpu_check() {
     return 0
 }
 
+# Suppress the CPU advisory for a suite where the spike is STRUCTURAL.
+#
+# The sampler cannot tell AXL's CPU use from the firmware's, and for a suite
+# whose cost is dominated by firmware boot the warning fires on every single
+# run (observed 6/6 on x64: peak ~1.05-1.10 cores, sustained 4.6-5.8s against
+# a 2s threshold). A warning that always fires is not a signal, it is noise
+# that teaches people to skim past the summary -- so such a suite opts out and
+# uses TEST_MAX_DURATION instead, which measures something actionable.
+#
+# This does NOT weaken the sampler elsewhere: run-qemu.sh still fails on a
+# spike (CPU_SPIKE_EXIT), test-cpu-spike-qemu.sh still covers the machinery,
+# and any test can still opt into failing with TEST_CPU_SPIKE_FAIL=1.
+test_cpu_advisory_off() {
+    CPU_WARN=false
+}
+
 # Run QEMU in background. Sets TEST_QEMU_PID.
 #
 # QEMU's own stderr lands in TEST_LOG alongside the guest serial stream, so a
@@ -716,19 +769,212 @@ test_slice_log() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Memory-leak gate
+# ---------------------------------------------------------------------------
+#
+# Every AXL image prints a leak verdict from its teardown path (_axl_cleanup,
+# or the minimal CRT0) under AXL_MEM_DEBUG: either "mem: no leaks detected" or
+# a report listing every block still live AFTER atexit callbacks and the tier-1
+# registry sweep have run. Nothing frees anything after that point, so a report
+# there is a leak, full stop.
+#
+# Until this gate existed nothing read those lines. Two leaked streams sat in
+# test/unit/axl-test-io.c until a human happened to read the code, and the
+# measurement that produced this function found five more the same way.
+#
+# The two anchors below are load-bearing and are pinned on the guest side:
+#
+#   TEST_LEAK_MARKER      The teardown report. axl_mem_dump_leaks() called by a
+#                         RUNNING program prints "=== AxlMem leak report (live
+#                         allocations): ..." instead — live blocks are not
+#                         leaked blocks, and a diagnostic dump must not fail a
+#                         run. That infix is asserted exactly by test_leak_dump
+#                         (test/unit/axl-test-mem.c), so collapsing the two
+#                         spellings back together breaks a unit test rather
+#                         than silently unarming this grep.
+#
+#   TEST_LEAK_OK_MARKER   The clean verdict. Used as a POSITIVE CONTROL: a
+#                         guest that reached teardown printed one marker or the
+#                         other, so an ABSENT verdict means this gate saw
+#                         nothing rather than nothing being wrong. Every cause
+#                         is reported as a failure (the message enumerates
+#                         them). A gate that silently no-ops is worse than no
+#                         gate; that is the whole point of the exercise.
+#
+# The control is applied PER BINARY when the log carries "=== Results:"
+# footers, and whole-log otherwise. Per-binary is what catches the interesting
+# case: AxlTestLog used to silence its console mid-run and never restore it, so
+# that one binary's verdict never reached the serial log and a leak in it would
+# have been invisible while 38 siblings kept a whole-log control green.
+#
+# TEST_SKIP_LEAK_GATE=1 opts a suite out (RELEASE guests, or a scenario whose
+# whole subject is a crash before teardown). Say why at the call site.
+TEST_LEAK_MARKER='=== AxlMem leak report:'
+TEST_LEAK_OK_MARKER='mem: no leaks detected'
+
+# Verdict on TEST_CLEAN_LOG. Returns 0 clean, 1 on leaks or a blind gate.
+# Caller must have run test_clean_log.
+test_check_leaks() {
+    if [[ "${TEST_SKIP_LEAK_GATE:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    local n_leak n_ok rc=0
+    n_leak=$(grep -acF "$TEST_LEAK_MARKER" "$TEST_CLEAN_LOG" || true)
+    n_ok=$(grep -acF "$TEST_LEAK_OK_MARKER" "$TEST_CLEAN_LOG" || true)
+
+    # --- positive control -------------------------------------------------
+    #
+    # Keyed on the "=== Results:" FOOTER, not the "=== NAME Tests ===" header:
+    # a footer is what says a binary ran to completion, and the verdict is the
+    # next thing it prints. Keying on the header instead would let a binary
+    # that forgot to print one merge into its predecessor's window, so the
+    # predecessor's verdict would vouch for both -- precisely the silent blind
+    # spot this control exists to remove. (Two binaries were in that state
+    # until the headers went into axl-test-vterm.c / axl-test-9p.c.) The
+    # header is used only to NAME the offender; a nameless one still counts.
+    local silent
+    if grep -qa '=== Results:' "$TEST_CLEAN_LOG"; then
+        silent=$(awk -v leak="$TEST_LEAK_MARKER" -v ok="$TEST_LEAK_OK_MARKER" '
+            match($0, /=== .+ Tests ===/) {
+                name = $0
+                sub(/.*=== /, "", name); sub(/ Tests ===.*/, "", name)
+                cur = name
+            }
+            /=== Results:/ {
+                if (pending) { print label }
+                n++
+                label = (cur == "" ? sprintf("(binary #%d, no \"=== NAME Tests ===\" header)", n) : cur)
+                cur = ""; pending = 1
+                next
+            }
+            # Only AFTER a footer: the teardown verdict is printed once main
+            # has returned, so a mid-run axl_mem_dump_leaks() is not one.
+            pending && (index($0, leak) || index($0, ok)) { pending = 0 }
+            END { if (pending) print label }
+        ' "$TEST_CLEAN_LOG")
+    elif (( n_leak == 0 && n_ok == 0 )); then
+        silent="(the whole run)"
+    fi
+
+    if [[ -n "${silent:-}" ]]; then
+        echo ""
+        echo "FAIL: the leak gate saw NO memory verdict from:"
+        local _b
+        while IFS= read -r _b; do echo "      - $_b"; done <<< "$silent"
+        echo "  An AXL_APP image prints one at teardown under AXL_MEM_DEBUG."
+        echo "  Absent, the guest is one of:"
+        echo "    - a RELEASE build (the Makefile defines AXL_MEM_DEBUG only"
+        echo "      for BUILD=DEBUG);"
+        echo "    - an image that silenced the console and never restored it"
+        echo "      (axl_log_set_console_enabled), or raised the log level"
+        echo "      above INFO so the clean verdict is filtered;"
+        echo "    - an AXL_DRIVER, which has no _axl_cleanup and so never"
+        echo "      emits a teardown verdict at all;"
+        echo "    - a fault before teardown;"
+        echo "    - a wording change in src/mem/axl-mem.c that this grep"
+        echo "      anchors on."
+        echo "  Fix it or set TEST_SKIP_LEAK_GATE=1 with a reason — do NOT"
+        echo "  leave the gate blind."
+        rc=1
+    fi
+
+    # --- the verdict itself ----------------------------------------------
+    if (( n_leak == 0 )); then
+        return "$rc"
+    fi
+
+    #
+    # Attribute each report to the test binary that was running, the same way
+    # the stalled-binary detector does: the most recent "=== NAME Tests ==="
+    # header. Guests that print no header (a tool, a demo) report the binary
+    # as "?" — the file:line in the block is the actionable part regardless.
+    #
+    echo ""
+    echo "*** FAIL: memory leaked at teardown. These blocks were still live"
+    echo "    after atexit callbacks and the tier-1 registry sweep, so nothing"
+    echo "    was ever going to free them:"
+    awk -v marker="$TEST_LEAK_MARKER" '
+        index($0, "=== ") && index($0, " Tests ===") {
+            name = $0
+            sub(/.*=== /, "", name); sub(/ Tests ===.*/, "", name)
+            cur = name
+        }
+        index($0, marker) {
+            on = 1; shown = 0; hidden = 0
+            printf "      binary: %s\n", (cur == "" ? "?" : cur)
+        }
+        on {
+            line = $0
+            sub(/^.*\[WARN\][ \t]*mem: /, "", line)
+            # Cap the per-block listing: one call site repeated 64 times
+            # (a loop that leaks) buries every OTHER report under it.
+            if (line ~ /^  \[/ && ++shown > MAXROWS) { hidden++; next }
+            if (index(line, "=== end leak report ===") && hidden > 0) {
+                printf "        (... %d more allocations)\n", hidden
+            }
+            print "        " line
+        }
+        /=== end leak report ===/ { on = 0 }
+    ' MAXROWS=8 "$TEST_CLEAN_LOG"
+    echo "    A leak in a test is a test bug; a leak in src/ is a library"
+    echo "    defect. Do not widen this gate to make it green."
+    return 1
+}
+
 # Count PASS/FAIL from cleaned serial log, print results, exit with status
 test_count_results() {
     test_clean_log
 
-    local pass fail
-    pass=$(grep -c '^PASS:' "$TEST_CLEAN_LOG" || true)
-    fail=$(grep -c '^FAIL:' "$TEST_CLEAN_LOG" || true)
+    #
+    # EVERY grep over TEST_CLEAN_LOG passes -a. The serial capture can carry a
+    # stray NUL (firmware noise before our first output -- AARCH64 does it
+    # reliably), and one NUL anywhere makes GNU grep call the whole file binary.
+    # The consequence is split, which is what makes it nasty:
+    #
+    #   -c   still counts every match, so the ratchet numbers stay CORRECT
+    #   -q   still exits 0 on a post-NUL match, so the assert gate still fires
+    #   line output prints matches until the NUL, then "binary file matches"
+    #
+    # So the counts are right while the listings are silently truncated -- a
+    # report that shows "19 group(s) SKIPPED" above a list of 2. That is how
+    # this was found: the SKIP list is the only view of which groups are
+    # arch-gated, and a truncated one hides balancer drift behind a number that
+    # still looks healthy. test_check_leaks (grep -acF / grep -qa) already got
+    # this right; the rest did not. Uniform -a, so no reader has to know which
+    # greps happen to survive binary detection and which quietly do not.
+    #
+    local pass fail skip tls_skips skipped_asserts ratchet_total
+    pass=$(grep -ac '^PASS:' "$TEST_CLEAN_LOG" || true)
+    fail=$(grep -ac '^FAIL:' "$TEST_CLEAN_LOG" || true)
+    skip=$(grep -acE '^SKIP(\[[0-9]+\])?:' "$TEST_CLEAN_LOG" || true)
+    tls_skips=$(grep -ac '^SKIP:.*AXL_TLS' "$TEST_CLEAN_LOG" || true)
 
-    grep -E '^(PASS|FAIL):' "$TEST_CLEAN_LOG" | while IFS= read -r line; do
+    #
+    # Assertions DECLARED skipped by test_skip_n, i.e. "SKIP[n]:". These are
+    # topology gates -- a device this QEMU image or this machine does not have
+    # -- where both outcomes share one baseline, so the count has to be made up
+    # or the ratchet drifts between images.
+    #
+    # It used to be made up with padding: ~170 test_check(true, "... SKIP
+    # balance") calls, one per assertion the populated path would have run.
+    # Those are indistinguishable from the assert-nothing anti-pattern the
+    # project bans and they inflated the pass count with results nobody
+    # produced. Now the count is declared and added here instead.
+    #
+    # Bare "SKIP:" (no [n]) is the build-configuration form, which gets its own
+    # baseline file and so must NOT be added in.
+    #
+    skipped_asserts=$(sed -n 's/^SKIP\[\([0-9]\+\)\]:.*/\1/p' "$TEST_CLEAN_LOG" \
+        | awk '{ t += $1 } END { print t + 0 }')
+    ratchet_total=$((pass + skipped_asserts))
+
+    grep -aE '^(PASS|FAIL|SKIP(\[[0-9]+\])?):' "$TEST_CLEAN_LOG" | while IFS= read -r line; do
         echo "  $line"
     done
 
-    grep -E '^=== Results:' "$TEST_CLEAN_LOG" || true
+    grep -aE '^=== Results:' "$TEST_CLEAN_LOG" || true
 
     #
     # Per-binary wall-clock timing (requires ts-prefixed log; see
@@ -817,8 +1063,80 @@ test_count_results() {
     elapsed_frac=$((elapsed_ms % 1000))
 
     echo ""
-    printf "Results: %d passed, %d failed (%s) in %d.%03ds\n" \
-        "$pass" "$fail" "$TEST_ARCH" "$elapsed_s" "$elapsed_frac"
+    if (( skip > 0 )); then
+        printf "Results: %d passed, %d failed, %d group(s) SKIPPED (%d assertions) (%s) in %d.%03ds\n" \
+            "$pass" "$fail" "$skip" "$skipped_asserts" "$TEST_ARCH" \
+            "$elapsed_s" "$elapsed_frac"
+    else
+        printf "Results: %d passed, %d failed (%s) in %d.%03ds\n" \
+            "$pass" "$fail" "$TEST_ARCH" "$elapsed_s" "$elapsed_frac"
+    fi
+
+    #
+    # SKIPPED groups. A `#ifdef`-gated test block that compiles to nothing is
+    # invisible in a pass count -- the default build has no TLS, so AxlTestJose
+    # and AxlTestCrypto drop ~190 assertions and still report "0 failed". That
+    # read as success once already and new assertions were called green having
+    # never executed.
+    #
+    # So skips are always announced, and TEST_REQUIRE_TLS=1 turns a TLS-gated
+    # skip into a failure. Not the default: a build with no mbedtls submodule is
+    # a supported, everyday configuration, and a suite that went red for it
+    # would just teach everyone to ignore red. The completeness gates before a
+    # commit or a release are what should set it.
+    #
+    if (( skip > 0 )); then
+        echo ""
+        echo "*** $skip test GROUP(S) SKIPPED ($skipped_asserts assertions declared):"
+        grep -aE '^SKIP(\[[0-9]+\])?:' "$TEST_CLEAN_LOG" | sed -E 's/^SKIP(\[[0-9]+\])?:/    /'
+        if (( tls_skips > 0 )); then
+            if [[ "${TEST_REQUIRE_TLS:-0}" == "1" ]]; then
+                echo ""
+                echo "FAIL: TEST_REQUIRE_TLS=1 but $tls_skips group(s) need AXL_TLS=1."
+                echo "      Rebuild with TLS and re-run:"
+                echo "        git submodule update --init --depth 1 deps/mbedtls"
+                echo "        AXL_TLS=1 make ARCH=${_native_arch:-x64} all tests"
+                echo "        AXL_TLS=1 $0"
+                return 1
+            fi
+            echo ""
+            echo "    ^ build with AXL_TLS=1 to run these; set TEST_REQUIRE_TLS=1"
+            echo "      to make skipping them a failure."
+        fi
+    fi
+
+    # Leak verdict. Folded into the final exit (and into the baseline write
+    # below) rather than exiting here, so a run that both leaks and drops its
+    # count still reports both.
+    local leak_rc=0
+    test_check_leaks || leak_rc=1
+
+    #
+    # Wall-clock BUDGET. Distinct from test_run_foreground's timeout, which is
+    # a hang detector -- a suite that creeps to just under it passes silently,
+    # which is exactly how a slow regression hides. This is the ratchet's
+    # time-shaped sibling: TEST_MAX_DURATION is the number that must not drift
+    # up unnoticed. Named to match run-qemu.sh's --max-duration / MAX_DURATION
+    # and AGT's AGT_MAX_DURATION rather than inventing a third spelling for one
+    # concept across sibling repos. (test-axl.sh builds its own QEMU command
+    # instead of shelling out to run-qemu.sh, so it cannot just pass the flag.)
+    #
+    # Deliberately generous. The host drifts ~10% run to run and the box is
+    # shared, so a budget tight enough to catch a 5% regression would be
+    # flaky, and a flaky gate is worse than none. Set it to roughly 2x the
+    # observed time and treat a breach as "something got materially slower",
+    # not "shave 3 seconds".
+    #
+    if [[ -n "${TEST_MAX_DURATION:-}" && "${TEST_SKIP_RATCHET:-0}" != "1" ]]; then
+        if (( elapsed_s > TEST_MAX_DURATION )); then
+            echo ""
+            echo "FAIL: suite took ${elapsed_s}s, over the ${TEST_MAX_DURATION}s budget."
+            echo "  This is a wall-clock ratchet, not a hang timeout — something"
+            echo "  got materially slower. Profile it, or raise TEST_MAX_DURATION"
+            echo "  in the caller deliberately (and say why in the commit)."
+            return 1
+        fi
+    fi
 
     #
     # Ratchet: fail if test count dropped from last known good run.
@@ -827,14 +1145,43 @@ test_count_results() {
     # clobber the canonical test-axl.sh baseline with their smaller
     # pass counts.
     #
+    # The baseline is PER TLS CONFIGURATION, because the two configurations run
+    # different numbers of tests: with AXL_TLS=1 the AxlTestJose and
+    # AxlTestCrypto blocks compile in and the count jumps by ~160. Sharing one
+    # file meant a single TLS run wrote the higher number and then every
+    # ordinary non-TLS run failed the ratchet -- "expected at least 8789 but
+    # only 8628 ran", which reads exactly like a regression and is not one.
+    # That happened; the committed baseline had to be repaired by hand.
+    #
+    # Keyed off the run's own evidence (a TLS-gated SKIP means TLS is absent)
+    # rather than off $AXL_TLS, so building with TLS and forgetting to export
+    # the variable when invoking the suite cannot select the wrong baseline.
+    #
     if [[ "${TEST_SKIP_RATCHET:-0}" != "1" ]]; then
+        # One baseline PER BUILD CONFIGURATION. AXL_TLS changes which sources
+        # are compiled and therefore how many tests exist -- measured, 8820
+        # without it and 8964 with. Sharing one file across both is a trap
+        # with teeth, because the baseline is rewritten after every green run
+        # (below): a single AXL_TLS=1 run silently raises it to 8964, and the
+        # next ordinary run then fails with "expected at least 8964 tests but
+        # only 8820 ran" -- a message that blames the tests for what is
+        # actually a stale baseline from a different configuration. That cost
+        # real time to diagnose once; the suffix makes it unrepresentable.
+        #
+        # The default (no AXL_TLS) keeps the unsuffixed name so the committed
+        # baseline stays valid and CI is unaffected.
         local baseline_file="$TESTS_DIR/.last-pass-count"
+        if (( tls_skips == 0 )); then
+            baseline_file="$TESTS_DIR/.last-pass-count.tls"
+        fi
         if [[ -f "$baseline_file" ]]; then
             local expected
             expected=$(cat "$baseline_file")
-            if [[ $pass -lt $expected ]]; then
+            if [[ $ratchet_total -lt $expected ]]; then
                 echo ""
-                echo "FAIL: expected at least $expected tests but only $pass ran"
+                echo "FAIL: expected at least $expected tests but only $ratchet_total ran"
+                echo "      ($pass passed + $skipped_asserts declared-skipped)"
+                echo "      (baseline: $(basename "$baseline_file"))"
                 if [[ -n "$stalled" ]]; then
                     echo "      Culprit (no Results footer): $(echo "$stalled" | paste -sd, -)"
                 else
@@ -843,12 +1190,14 @@ test_count_results() {
                 exit 1
             fi
         fi
-        if [[ $fail -eq 0 && $pass -gt 0 ]]; then
-            echo "$pass" > "$baseline_file"
+        # A leaking run is not a green run, so it does not get to raise the
+        # bar either -- same reasoning as the $fail guard beside it.
+        if [[ $fail -eq 0 && $pass -gt 0 && $leak_rc -eq 0 ]]; then
+            echo "$ratchet_total" > "$baseline_file"
         fi
     fi
 
-    if [[ $fail -eq 0 && $pass -gt 0 ]]; then
+    if [[ $fail -eq 0 && $pass -gt 0 && $leak_rc -eq 0 ]]; then
         exit 0
     else
         exit 1
@@ -902,10 +1251,10 @@ test_liveness_probe() {
 # invariant was violated at its cause. Cleans the serial log first.
 test_refute_debug_assert() {
     test_clean_log
-    if grep -q 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG"; then
+    if grep -qa 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG"; then
         test_host_fail "no AXL_DEBUG_ASSERT fired"
         echo "    --- offending markers ---"
-        grep 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG" | sed 's/^/    /'
+        grep -a 'AXL_DEBUG_ASSERT FAILED' "$TEST_CLEAN_LOG" | sed 's/^/    /'
     else
         test_host_pass "no AXL_DEBUG_ASSERT fired (invariants held)"
     fi

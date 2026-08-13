@@ -160,7 +160,7 @@ write_header(
        spaces, then write it as 6 octal digits + NUL + space. */
     axl_memset(hdr + 148, ' ', 8);
     unsigned sum = 0;
-    for (int i = 0; i < AXL_TAR_BLOCK; i++) { sum += hdr[i]; }
+    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) { sum += hdr[i]; }
     put_octal((char *)hdr + 148, 7, sum);  // 6 digits + NUL at [154]
     hdr[155] = ' ';
 
@@ -313,7 +313,7 @@ axl_tar_reader_next(
         return AXL_ERR;  // truncated / EOF before a full header
     }
     bool allzero = true;
-    for (int i = 0; i < AXL_TAR_BLOCK; i++) {
+    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
         if (hdr[i] != 0) { allzero = false; break; }
     }
     if (allzero) { return AXL_ERR; }  // end-of-archive marker
@@ -321,7 +321,7 @@ axl_tar_reader_next(
     /* Verify the header checksum (chksum field treated as spaces). */
     uint64_t stored = get_octal((char *)hdr + 148, 8);
     unsigned sum = 0;
-    for (int i = 0; i < AXL_TAR_BLOCK; i++) {
+    for (unsigned i = 0; i < AXL_TAR_BLOCK; i++) {
         sum += (i >= 148 && i < 156) ? (unsigned)' ' : hdr[i];
     }
     if ((uint64_t)sum != stored) { return AXL_ERR; }

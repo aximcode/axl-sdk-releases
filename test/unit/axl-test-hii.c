@@ -285,13 +285,9 @@ test_value_roundtrip(void)
        skipping. */
     if (!find_question_anywhere(HII_WRITABLE_PROMPT, &f, &q, &x) ||
         x.type != AXL_HII_ONE_OF || x.read_only) {
-        axl_printf("SKIP: writable question '%s' not present\n",
+        axl_printf("  detail: writable question '%s' not present\n",
                    HII_WRITABLE_PROMPT);
-        test_check(true, "hii value: round-trip SKIP balance");
-        test_check(true, "hii value: round-trip SKIP balance");
-        test_check(true, "hii value: round-trip SKIP balance");
-        test_check(true, "hii value: round-trip SKIP balance");
-        test_check(true, "hii value: round-trip SKIP balance");
+        test_skip_n(5, "hii value: round-trip");
         return;
     }
 

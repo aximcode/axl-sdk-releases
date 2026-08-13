@@ -21,7 +21,19 @@
 #include <axl/axl-compress.h>
 #include <axl/axl-stream.h>
 #include <axl/axl-mem.h>
-#include "axl-stream-internal.h"
+
+/* The filter rule from axl-stream.h, applied to the peer these filters move
+   bytes through. A compressed stream is BINARY: a peer at any encoding but
+   AXL_ENC_UTF8 transcodes it code point by code point, which on the write
+   side produces an archive no decompressor can read while every call still
+   reports success, and on the read side hands axl_decompress rubble and a
+   failure that says nothing about the real cause. Refusing is the only
+   answer that names the mistake — a filter's bytes are not characters. */
+static bool
+peer_is_untranscoded(AxlStream *s)
+{
+    return axl_stream_get_encoding(s) == AXL_ENC_UTF8;
+}
 
 // ---------------------------------------------------------------------------
 // Compressing writer
@@ -41,6 +53,14 @@ writer_do_finish(CompressWriterCtx *c)
 {
     if (c->finished) {
         return c->finish_rc;
+    }
+    /* Re-checked here and not only at construction: this is the moment the
+       compressed bytes actually move, and the sink can have acquired an
+       encoding since. Deliberately NOT latched into finish_rc — the writer is
+       still finalizable once the sink is put back, matching how the text
+       wrapper treats the same mistake. */
+    if (!peer_is_untranscoded(c->sink)) {
+        return AXL_ERR;
     }
     c->finished = true;
 
@@ -91,22 +111,44 @@ compress_writer_close(void *vctx)
     axl_free(c);
 }
 
+/* The compressing writer's operations, filled in ONE place — the constructor
+   opens with these and axl_compress_writer_finish names them again to recover
+   the context, so the two must be the same set. A helper rather than two
+   literal blocks is what guarantees that: a slot added to one and not the
+   other would not fail to compile, it would silently make every finish() call
+   answer "not one of mine".
+
+   `flush` stays NULL from AXL_STREAM_OPS_INIT deliberately, and it is not an
+   oversight to revisit: the accumulated plaintext cannot go onward until it is
+   compressed, and compressing is a one-shot that also finalizes. Pushing at
+   flush time would end the stream. A NULL flush slot is contractually AXL_OK,
+   which is the right answer for "nothing can move yet". */
+static AxlStreamOps
+compress_writer_ops(void)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    ops.write = compress_writer_write;
+    ops.close = compress_writer_close;
+    return ops;
+}
+
 AxlStream *
 axl_compress_writer(AxlCompressFormat fmt, AxlStream *sink, int level)
 {
     if (sink == NULL
         || (fmt != AXL_COMPRESS_GZIP && fmt != AXL_COMPRESS_ZLIB
-            && fmt != AXL_COMPRESS_DEFLATE_RAW)) {
+            && fmt != AXL_COMPRESS_DEFLATE_RAW)
+        || !peer_is_untranscoded(sink)) {
         return NULL;
     }
 
+    AxlStreamOps       ops   = compress_writer_ops();
     AxlStream         *accum = axl_bufopen();
     CompressWriterCtx *c     = axl_calloc(1, sizeof(CompressWriterCtx));
-    AxlStream         *s     = axl_stream_new();
-    if (accum == NULL || c == NULL || s == NULL) {
+    if (accum == NULL || c == NULL) {
         axl_fclose(accum);
         axl_free(c);
-        axl_free(s);
         return NULL;
     }
 
@@ -115,20 +157,34 @@ axl_compress_writer(AxlCompressFormat fmt, AxlStream *sink, int level)
     c->fmt   = fmt;
     c->level = level;
 
-    s->ctx   = c;
-    s->write = compress_writer_write;
-    s->close = compress_writer_close;
+    AxlStream *s = axl_stream_open_custom(c, &ops, "compress");
+    if (s == NULL) {
+        /* A refused open never calls `close`, so releasing the context is
+           ours. Spelled out rather than delegated to compress_writer_close:
+           that callback FINALIZES on the way out, so calling it here would
+           emit an empty compressed member into the sink for a stream that
+           never existed. The file backend can delegate; this one must not. */
+        axl_fclose(c->accum);
+        axl_free(c);
+        return NULL;
+    }
     return s;
 }
 
 int
 axl_compress_writer_finish(AxlStream *s)
 {
-    /* Identify a compressing writer by its write vtable slot. */
-    if (s == NULL || s->write != compress_writer_write) {
+    /* Identify a compressing writer by its operations. Both slots are
+       file-static, so no stream built anywhere else can present them --
+       the same unspoofability the old direct vtable comparison had, now
+       expressed through the public getter. */
+    AxlStreamOps       ops = compress_writer_ops();
+    CompressWriterCtx *c   = (CompressWriterCtx *)axl_stream_ctx(s, &ops);
+
+    if (c == NULL) {
         return AXL_ERR;
     }
-    return writer_do_finish((CompressWriterCtx *)s->ctx);
+    return writer_do_finish(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +196,11 @@ axl_compress_reader(AxlCompressFormat fmt, AxlStream *src)
 {
     if (src == NULL
         || (fmt != AXL_COMPRESS_GZIP && fmt != AXL_COMPRESS_ZLIB
-            && fmt != AXL_COMPRESS_DEFLATE_RAW)) {
+            && fmt != AXL_COMPRESS_DEFLATE_RAW)
+        || !peer_is_untranscoded(src)) {
+        /* Refused before the drain below, so a rejected source is left at the
+           position the caller handed it over at. Otherwise "refused" and
+           "read it all and failed to decode it" would be indistinguishable. */
         return NULL;
     }
 

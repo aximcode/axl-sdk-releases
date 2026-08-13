@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-log.h:
+/** @file axl-log.h
  *
  * Domain-based logging with level filtering, custom handlers,
  * ring buffer storage, and file output.
@@ -18,6 +17,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <axl/axl-macros.h>
+#include <axl/axl-time.h>   /* AxlRealtime for AxlLogHandler */
 
 #ifdef __cplusplus
 extern "C" {
@@ -147,6 +147,12 @@ axl_log_set_domain_level(
  * `DEBUG` all parse the same). Unrecognized levels and malformed
  * entries are silently ignored — no log churn during init.
  *
+ * A value longer than 255 bytes (UTF-8) is ignored **whole**, not
+ * applied up to the cut: a truncated list would silently drop its
+ * tail entry, and that is indistinguishable from a list that was
+ * applied in full. The parser can act on at most 8 domains of 15
+ * characters, so the cap is well past anything usable.
+ *
  * Per-domain configuration is the larger value-add over a CLI
  * flag — keeps `-d` / `-v` / `--debug` namespace free for
  * tool-specific use. Mirrors the @c RUST_LOG / @c GST_DEBUG /
@@ -161,13 +167,26 @@ axl_log_init_from_env(void);
 
 /**
  * @brief Custom log handler callback.
+ *
+ * @a stamp is the instant the DISPATCHER recorded for this record, read
+ * once and handed to every sink. Two sinks therefore always agree about
+ * when a record happened — which they did not when each read the clock
+ * itself, since two reads can straddle a second boundary and silently
+ * misalign a serial transcript against a file log.
+ *
+ * It is NULL only when the clock could not be read at all; format it with
+ * axl_time_format_at(), or use the fields directly for a machine-readable
+ * form. Do not call axl_time_realtime() here to get "the" time: that is a
+ * second reading of a different instant, and on a handler reached from a
+ * notify function it is the re-entrancy the dispatcher already resolved.
  */
 typedef void (*AxlLogHandler)(
-    int         level,    ///< log level
-    const char *domain,   ///< module name (may be NULL)
-    const char *message,  ///< formatted message (no prefix, no newline)
-    void       *data      ///< opaque callback data
-);
+    int                level,    ///< log level
+    const char        *domain,   ///< module name (may be NULL)
+    const char        *message,  ///< formatted message (no prefix, no newline)
+    const AxlRealtime *stamp,    ///< when the record was made (NULL if no clock)
+    void              *data      ///< opaque callback data
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Add a global handler.
@@ -210,9 +229,27 @@ axl_log_remove_handler(
 );
 
 /**
+ * @brief Turn default console output on or off (on by default).
+ *
+ * Handlers added with @ref axl_log_add_handler are unaffected either
+ * way — this controls only AXL's own write to the firmware console.
+ *
+ * Turning it back on matters more than it looks: the console is where
+ * AXL prints its teardown memory-leak verdict, so an image that
+ * silences the console and never restores it also silences the one
+ * line saying whether it leaked. Prefer bracketing a quiet section
+ * with `false` / `true` over silencing for the whole run.
+ */
+void
+axl_log_set_console_enabled(
+    bool enable  ///< true to write log records to the console
+);
+
+/**
  * @brief Suppress default console output.
  *
- * Call after adding custom handlers.
+ * Call after adding custom handlers. Equivalent to
+ * `axl_log_set_console_enabled(false)`, which is also how you undo it.
  */
 void
 axl_log_suppress_console(void);
@@ -350,6 +387,80 @@ void
 axl_log_ring_clear(
     AxlLogRing *ring  ///< ring to empty
 );
+
+/* Forward-declared rather than including <axl/axl-serial.h>: the serial sink
+   is one function, and a log consumer should not pull in the whole serial
+   API to declare it. Matches axl-serial.h's own typedef exactly. */
+typedef struct AxlSerial AxlSerial;
+
+// ---------------------------------------------------------------------------
+// Serial handler
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Register a log handler that writes formatted lines to an open
+ *     serial port.
+ *
+ * The UART is the channel that survives a headless box, a wedged HTTP
+ * server, or a console the firmware has redirected elsewhere. Lines are
+ * formatted identically to axl_log_file_attach's apart from CRLF endings
+ * (serial terminals; the longer terminator also leaves one byte less for a
+ * maximal message) -- both build them with the same internal formatter, so a
+ * transcript read off a terminal lines up with one read out of a log file.
+ *
+ * The port is CALLER-owned: this neither opens nor closes it, and it must
+ * outlive the attachment. That keeps port selection, line settings and
+ * lifetime with the consumer, and lets a consumer that already has the port
+ * open share it deliberately.
+ *
+ * @p max_level is not a nicety. Writes are synchronous and 115200 baud is
+ * about 11 KB/s, so an uncapped trace stream throttles the caller's event
+ * loop behind the UART.
+ *
+ * The handler runs from the log dispatcher, which is not re-entrant and may
+ * be at raised TPL: it allocates nothing, logs nothing, and performs a
+ * single write per line, dropping the remainder of a short write rather than
+ * retrying -- a log line must never stall the caller.
+ *
+ * @note Records carry a timestamp, but this sink no longer reads the clock
+ *     to get one -- the dispatcher stamps each record once and hands the
+ *     value to every sink. That read goes through the backend's RTC
+ *     re-entrancy guard, so logging from a notify function that preempted
+ *     the caller's own clock read is safe: it is served from the last
+ *     completed reading rather than re-entering GetTime(), which the UEFI
+ *     spec forbids while a call is merely INTERRUPTED. The cost is a stamp
+ *     that may be as old as that reading. See axl_time_realtime().
+ *
+ * @warning Not retrying removes the spin, but not the BLOCK. The underlying
+ *     write is synchronous against the port's own timeout, and firmware
+ *     frequently leaves that field 0 -- which several implementations read as
+ *     "wait indefinitely". A port that never drains (hardware flow control
+ *     with nothing asserting CTS is the realistic case on an opt-in
+ *     diagnostic port) then stalls the caller's loop on every line. The
+ *     port's write timeout bounds how long one line can block the caller:
+ *     set it with axl_serial_set_mode BEFORE attaching if the port may not
+ *     drain. As a scale, a full 640-byte line takes ~55 ms at 115200 8N1.
+ *
+ * Single-sink-at-a-time, mirroring the file sink: attaching while a port is
+ * already attached transparently replaces it.
+ *
+ * @return AXL_OK on success; AXL_ERR on a NULL port or if the handler table
+ *     is full.
+ */
+int
+axl_log_serial_attach(
+    AxlSerial  *port,      ///< open port from axl_serial_open (caller-owned)
+    int         max_level  ///< cap for the wire (AXL_LOG_ERROR..AXL_LOG_TRACE)
+);
+
+/**
+ * @brief Detach the handler installed by axl_log_serial_attach.
+ *
+ * Does NOT close the port -- it is caller-owned. Symmetric with
+ * axl_log_file_detach; idempotent, safe when nothing is attached.
+ */
+void
+axl_log_serial_detach(void);
 
 // ---------------------------------------------------------------------------
 // File handler

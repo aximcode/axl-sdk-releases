@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-queue.h:
+/** @file axl-queue.h
  *
  * Double-ended queue built on AxlList. GLib GQueue equivalent.
  * O(1) push/pop at both ends. Struct is exposed for direct access.

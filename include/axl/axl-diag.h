@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-diag.h:
+/** @file axl-diag.h
  *
  * Diagnostic helpers for tools — dump image-launch state, probe
  * protocol registration. Intended to be called from a tool's

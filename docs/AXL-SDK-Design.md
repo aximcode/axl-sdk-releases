@@ -20,7 +20,12 @@ PI 1.x specifications via `scripts/generate-uefi-headers.py` +
 under `include/uefi/generated/` for any consumer that does need to
 reach into raw UEFI types (driver authors, interop code), but
 applications never see them — the public `axl/*.h` surface is
-EFI-free. Spec updates are a manifest edit + regeneration; there's
+EFI-free. That last clause is now ENFORCED, not merely intended: the
+generated headers require `AXL_ALLOW_UEFI`, granted by `axl-cc` to
+`--type driver` / `--type runtime` and to an explicit `--allow-uefi`
+(CMake: `axl_add_driver`, or `ALLOW_UEFI` on `axl_add_app`). Before
+that guard, `uefi/` sat inside the SDK's `-isystem` directory and any
+application could reach EDK2 by typing an `#include`. Spec updates are a manifest edit + regeneration; there's
 no vendored EDK2 tree to merge against.
 
 ## Vision
@@ -259,6 +264,36 @@ discussion, see [`AXL-Concurrency.md`](https://github.com/aximcode/axl-sdk-relea
 | aarch64-linux-gnu-gcc | AARCH64 cross-compiler |
 | GNU ld | Linker |
 | objcopy | ELF → PE/COFF conversion |
+| `install -C` | Content-comparing install (see below) |
+
+#### Reinstalling unchanged sources must be a filesystem no-op
+
+`install.sh` is not a one-shot packaging step — a consumer building against a
+checkout typically reinstalls the SDK on **every** build (an order-only
+`sdk-sync` prerequisite is the common shape). That makes install-time mtime
+churn a correctness problem for the consumer's build graph, not a cosmetic one:
+SDK headers reach the compiler via `-isystem`, so gcc lists them in `-MD`
+depfiles, and an unconditional `cp` refreshes every one of them on every run.
+Measured: 145 of the 150 SDK headers in a single depfile went stale after a
+no-op reinstall, so every no-op consumer build recompiled essentially its whole
+tree. Consumers were pushed into hand-rolled content fingerprints to survive it.
+
+So the contract is: **a reinstall whose inputs have not changed touches
+nothing.** Every copy goes through `install -C` (compare content; leave an
+identical destination completely alone), and every *generated* file — the
+per-arch `.pc`, `axl-config.cmake`, `share/axl/{backend,version,build-date}` —
+goes through the `write_if_changed` helper, which is the same idea for content
+produced on the fly rather than copied.
+
+`install -C` rather than `cp -u`: `cp -u` compares **mtimes**, so a destination
+that is newer than its source but differs in content is silently left in place
+— a hand-edited installed header, or a prefix restored from a backup, would
+never be repaired. Content comparison is the semantics that matches the intent,
+and both GNU and BSD `install` implement `-C` that way.
+
+Pinned by `test/integration/test-install-idempotent.sh`, whose discriminating
+gate corrupts an installed file *and* makes it newer than its source: an
+over-eager skip fails it, and so does `cp -u`.
 
 ### Consumer-time (axl-cc)
 

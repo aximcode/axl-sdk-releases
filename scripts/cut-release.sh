@@ -83,7 +83,14 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------
 say "Preconditions for $TAG"
 command -v gh >/dev/null   || die "gh (GitHub CLI) not found"
-gh auth status >/dev/null 2>&1 || die "gh not authenticated (gh auth login)"
+# Ask the API, not `gh auth status`. Status reports on EVERY configured
+# account and exits non-zero if ANY of them has a bad token — so one stale
+# login left over from another identity blocks a release while every gh call
+# this script makes would have worked fine against the active account. A
+# `gh api user` round-trip tests exactly what we depend on: that the active
+# account can reach the API.
+gh api user -q .login >/dev/null 2>&1 \
+    || die "gh cannot reach the API as the active account (gh auth login)"
 
 [[ "$(git branch --show-current)" == "main" ]] || die "not on branch main"
 

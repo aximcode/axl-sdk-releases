@@ -7,6 +7,11 @@
 
 #include <stddef.h>
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void *calloc(size_t n, size_t size);
 void  free(void *ptr);
 /* malloc / realloc declarations exist solely so that system headers
@@ -16,5 +21,9 @@ void  free(void *ptr);
  * `axl_malloc` / `axl_realloc`. */
 void *malloc(size_t size);
 void *realloc(void *ptr, size_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

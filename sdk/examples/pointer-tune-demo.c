@@ -1,6 +1,11 @@
 /*
  * pointer-tune-demo.c -- LIVE absolute-pointer tuning over a GOP framebuffer.
  *
+ * axl-example: allow-uefi -- reads EFI_SIMPLE_POINTER_MODE off the raw
+ * protocol to show the hardware resolution AxlInput normalises away, which is
+ * the whole point of a tuning bench. An APP, so a consumer building it needs
+ * `axl-cc --allow-uefi` (or ALLOW_UEFI in CMake) -- deliberately visible.
+ *
  * The remote-console "catch-up lag" tuning bench.  Drag a pointer into the
  * window and the crosshair follows it; on firmware (or QEMU's usb-tablet over
  * VNC) that queues absolute-pointer states FIFO, a fast drag trails and the

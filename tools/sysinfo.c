@@ -293,6 +293,12 @@ show_mem_info(void)
                         case 27: type_str = "LPDDR4"; break;
                         case 34: type_str = "DDR5"; break;
                         case 35: type_str = "LPDDR5"; break;
+                        /* Every other SMBIOS memory-type code keeps the
+                           "Unknown" the variable was initialised with. Spelled
+                           out rather than left implicit: this switch is over a
+                           raw byte from firmware, so unlisted values are the
+                           EXPECTED case, not an oversight. */
+                        default: break;
                     }
 
                     uint16_t speed = *(uint16_t *)(raw + 0x15);

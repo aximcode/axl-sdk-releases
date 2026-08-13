@@ -99,6 +99,25 @@ if [[ -n "$SHARD" ]]; then
     TESTS=("${mine[@]}")
 fi
 
+# Warn when --timeout is too tight for what was selected. stderr only, so
+# --list's stdout stays machine-parseable. Every test declares
+# an `est=` in its test-meta header, and a test that blows the wall clock is
+# reported as a TIMEOUT with no hint that the limit -- not the test -- was the
+# problem. Under the parallel pool a test routinely takes well over its est
+# (that is why run_one retries at all), so the bar is 2x rather than 1x.
+if [[ ${#TESTS[@]} -gt 0 ]]; then
+    _max_est=0; _max_est_name=""
+    for t in "${TESTS[@]}"; do
+        _e=$(test_meta_field "$t" est 2>/dev/null)
+        [[ "$_e" =~ ^[0-9]+$ ]] || continue
+        if [[ "$_e" -gt "$_max_est" ]]; then _max_est="$_e"; _max_est_name=$(basename "$t"); fi
+    done
+    if [[ "$_max_est" -gt 0 && "$TIMEOUT" -lt $(( _max_est * 2 )) ]]; then
+        echo "warning: --timeout ${TIMEOUT}s is tight for $_max_est_name (est=${_max_est}s)." >&2
+        echo "         Under -j${JOBS} a test commonly exceeds its est; consider --timeout $(( _max_est * 2 ))s or more." >&2
+    fi
+fi
+
 if [[ $LIST_ONLY -eq 1 ]]; then
     [[ ${#TESTS[@]} -gt 0 ]] && printf '%s\n' "${TESTS[@]}"
     exit 0
@@ -156,8 +175,18 @@ run_one() {  # <idx> <test_path>
     # Failure/timeout (twice): replay the test's captured output (logs live in
     # an ephemeral dir that CI discards, so surface the reason inline). Tail
     # keeps the job log readable when many tests fail at once.
-    [[ $rc -eq 124 ]] && echo "  $name TIMEOUT ${dur}s (after retry)" \
-                      || echo "  $name FAIL ${dur}s (after retry)"
+    if [[ $rc -eq 124 ]]; then
+        # Name the declared est: a TIMEOUT is ambiguous between "the test hung"
+        # and "the limit was too low for it", and the metadata already knows.
+        local est; est=$(test_meta_field "$t" est 2>/dev/null)
+        if [[ "$est" =~ ^[0-9]+$ ]]; then
+            echo "  $name TIMEOUT ${dur}s (after retry; test declares est=${est}s, limit was ${TIMEOUT}s)"
+        else
+            echo "  $name TIMEOUT ${dur}s (after retry)"
+        fi
+    else
+        echo "  $name FAIL ${dur}s (after retry)"
+    fi
     echo "    --- $name output (last 25 lines) ---"
     tail -n 25 "$LOGDIR/$name.log" 2>/dev/null | sed 's/^/    | /'
     echo "    --- end $name ---"
@@ -183,10 +212,134 @@ fi
 # Job pool: at most JOBS tests in flight. Each finished test writes its exit
 # status (0 = pass) to results/<idx>; we tally after the barrier.
 results=$(mktemp -d)
-trap 'rm -rf "$results"; [[ "$own_qtmp" == 1 ]] && rm -rf "$AXL_QEMU_TMPDIR"' EXIT INT TERM
+
+# Cleaning up a signalled run has two halves, and both are needed.
+#
+# Half 1 -- the workers. They are background jobs, so the runner exiting does
+# NOT stop them. Left alive they see their test "fail", hit run_one's
+# retry-once path, and relaunch a guest INTO the tree that was just deleted,
+# recreating the leak moments after it was cleaned. They cannot be matched by
+# command line (a subshell shares this script's argv), so they are tracked by
+# PID and killed by descent -- the test script, its `timeout` wrapper and the
+# guest all sit below them.
+WORKERS=()
+
+# STOP before descending, KILL after. Signalling a worker's child first and the
+# worker second loses a race: the retry path sees the child die and relaunches,
+# and the replacement appears after the walk has already passed that branch. A
+# stopped process cannot fork, which closes the race rather than narrowing it.
+# KILL, not TERM, because a STOPped process does not act on TERM until it is
+# continued.
+_kill_tree() {
+    local pid="$1" c
+    kill -STOP "$pid" 2>/dev/null
+    for c in $(pgrep -P "$pid" 2>/dev/null); do
+        _kill_tree "$c"
+    done
+    kill -KILL "$pid" 2>/dev/null
+}
+
+kill_worker_trees() {
+    local pid
+    for pid in "${WORKERS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        _kill_tree "$pid"
+    done
+}
+
+# Half 2 -- the guests, reaped BEFORE their disks are removed and never after.
+# A guest that outlives its disk keeps it open as a DELETED inode: the
+# directory is gone, so every directory-based check reports clean while tmpfs
+# cannot reclaim the pages. `du` cannot see it; only a `df` delta can. 365 MB
+# accumulated that way from five orphans of a single interrupted run.
+#
+# This is a belt-and-braces pass for anything the worker walk missed (a guest
+# already reparented to init, say). Two filters, and BOTH matter:
+#
+#   - the run's own temp dir, which every guest carries on its command line via
+#     `-drive file=$TMPDIR/...`; and
+#   - the process actually being a guest.
+#
+# The second is not redundant. `pgrep -f` matches any process whose command
+# line merely CONTAINS the path, which in practice includes an editor, a
+# grep, or an agent shell that happens to mention it -- killing one of those
+# would be far worse than the leak. run-qemu.sh's sweeper can use the path
+# alone because a false match there means "don't delete" (harmless); here a
+# false match would mean "kill it", so the comm check is what keeps this from
+# being the blanket `pkill qemu-system` it must never become.
+_guest_pids() {
+    local base="$1" pid comm
+    for pid in $(pgrep -f -- "$base" 2>/dev/null); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        case "$comm" in
+            qemu-system*|virtiofsd) echo "$pid" ;;
+        esac
+    done
+}
+
+reap_pool() {
+    local base="$1" i pids
+    [[ -n "$base" ]] || return 0
+    pids=$(_guest_pids "$base"); [[ -n "$pids" ]] || return 0
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null
+    # Bounded wait, then escalate. Without the wait, the rm below can still
+    # beat a slow guest and recreate the very leak this exists to prevent.
+    for ((i = 0; i < 40; i++)); do
+        pids=$(_guest_pids "$base"); [[ -n "$pids" ]] || return 0
+        sleep 0.25
+    done
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null
+    sleep 0.2
+}
+
+# Note what is NOT here: kill_worker_trees. On a normal exit the pool has
+# already been reaped by `wait`, so those PIDs are stale -- and a stale PID is
+# not merely a no-op to signal, it may have been RECYCLED to an unrelated
+# process by then (this box wraps its PID counter routinely). Killing by
+# remembered PID is only safe on the signal path, where the workers are known
+# to still be ours. reap_pool stays: it resolves live processes by path AND
+# comm every time, so it has no stale-PID exposure and still catches a guest
+# that somehow outlived a clean run.
+_cleanup() {
+    reap_pool "${AXL_QEMU_TMPDIR:-}"
+    rm -rf "$results"
+    [[ "$own_qtmp" == 1 ]] && rm -rf "$AXL_QEMU_TMPDIR"
+    return 0
+}
+
+# One handler for both signals, so the selftest's SIGTERM case exercises the
+# identical body the SIGINT path uses. (It cannot drive SIGINT directly: a
+# background job of a non-interactive shell starts with SIGINT *ignored*
+# -- /proc SigIgn carries bit 2 -- and bash cannot trap a signal ignored on
+# entry, so `kill -INT` at the runner is swallowed. A terminal Ctrl-C is a
+# different delivery: it reaches the whole foreground process group, where the
+# runner is not a background job and this trap does fire.)
+#
+# The signal handlers exit; the EXIT handler preserves the script's own status.
+# Without an explicit exit, bash runs the handler and then RESUMES the `wait`
+# below, so a signalled runner would delete the tree and keep running.
+_signal_exit() {
+    trap - EXIT
+    kill_worker_trees
+    _cleanup
+    exit "$1"
+}
+trap '_rc=$?; _cleanup; exit $_rc' EXIT
+trap '_signal_exit 130' INT
+trap '_signal_exit 143' TERM
+# HUP and PIPE deliberately get no handler of their own. Measured: bash runs
+# the EXIT trap even for untrapped fatal signals, so `... | head -3` (SIGPIPE)
+# and a closed terminal (SIGHUP) already clean up through the line above.
+# Adding traps for them would look protective while changing nothing but the
+# exit status. SIGKILL is the one that truly escapes; run-qemu.sh's stale-dir
+# sweeper is the net for it.
+
 idx=0; running=0
 for t in "${TESTS[@]}"; do
     ( run_one "$idx" "$t"; echo $? > "$results/$idx" ) &
+    WORKERS+=($!)
     idx=$((idx+1)); running=$((running+1))
     if [[ $running -ge $JOBS ]]; then
         wait -n 2>/dev/null || true

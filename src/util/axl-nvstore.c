@@ -6,6 +6,7 @@
 **/
 
 #include "../backend/axl-backend.h"
+#include "axl-var-internal.h"
 #include <axl/axl-nvstore.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
@@ -88,23 +89,11 @@ axl_to_efi_attrs(
     return attrs;
 }
 
-static uint32_t
-efi_to_axl_attrs(
-    UINT32  attrs
-    )
-{
-    uint32_t flags = 0;
-    if (attrs & EFI_VARIABLE_NON_VOLATILE) {
-        flags |= AXL_NV_PERSISTENT;
-    }
-    if (attrs & EFI_VARIABLE_BOOTSERVICE_ACCESS) {
-        flags |= AXL_NV_BOOT;
-    }
-    if (attrs & EFI_VARIABLE_RUNTIME_ACCESS) {
-        flags |= AXL_NV_RUNTIME;
-    }
-    return flags;
-}
+/* The EFI -> AXL direction lives in axl-var.c as
+   axl_var_attrs_from_efi(), shared with axl_var_enumerate() so the two
+   surfaces cannot disagree about the same variable's attributes. Only
+   the write direction below is nvstore-specific -- axl-var.h is
+   read-only by design. */
 
 // ---------------------------------------------------------------------------
 // Public API — registration
@@ -426,13 +415,43 @@ axl_nvstore_get_attrs(
     if (status != EFI_BUFFER_TOO_SMALL && EFI_ERROR(status)) {
         return AXL_ERR;
     }
-    *attrs = efi_to_axl_attrs(efi_attrs);
+    *attrs = axl_var_attrs_from_efi(efi_attrs);
     return AXL_OK;
 }
 
 // ---------------------------------------------------------------------------
 // Public API — iteration
 // ---------------------------------------------------------------------------
+
+/* The caller's return value travels in cb_rc, never in the walk's own
+   return value. axl_var_walk answers only "did the walk work"; a
+   caller stopping with -8 is theirs to interpret, not something to
+   confuse with AXL_NO_RESOURCES. */
+typedef struct {
+    const AxlGuid    *target;   /* namespace GUID to match */
+    AxlNvstoreIterFn  cb;       /* caller's callback */
+    void             *ctx;      /* caller's context */
+    int               cb_rc;    /* caller's return value, verbatim */
+} NvstoreIterBridge;
+
+static bool
+nvstore_iter_bridge_cb(
+    const unsigned short *wname,
+    const char           *name,
+    const AxlGuid        *vendor,
+    void                 *ctx
+    )
+{
+    (void)wname;
+    NvstoreIterBridge *b = (NvstoreIterBridge *)ctx;
+
+    if (!axl_guid_equal(vendor, b->target)) {
+        return true;                   /* different namespace — keep going */
+    }
+
+    b->cb_rc = b->cb(name, b->ctx);
+    return (b->cb_rc == 0);            /* non-zero from the caller stops it */
+}
 
 int
 axl_nvstore_iter(
@@ -451,70 +470,16 @@ axl_nvstore_iter(
         return AXL_ERR;
     }
 
-    /* Working buffer for variable names. UEFI variable names are
-       UCS-2; most are short, so 256 chars (512 bytes) is plenty for
-       typical use. We grow if the firmware reports a longer name. */
-    size_t          name_chars = 256;
-    unsigned short *wname = axl_malloc(name_chars * sizeof(unsigned short));
-    if (wname == NULL) {
-        return AXL_ERR;
+    /* The walk itself lives in axl-var.c and is shared with
+       axl_var_enumerate() -- see axl-var-internal.h for why there is
+       exactly one copy of it. This surface is that walk behind a
+       vendor-GUID predicate. */
+    NvstoreIterBridge bridge = { (const AxlGuid *)target, cb, ctx, 0 };
+    int rc = axl_var_walk(nvstore_iter_bridge_cb, &bridge);
+
+    if (rc != AXL_OK) {
+        return AXL_ERR;                /* firmware walk or allocation failed */
     }
-    wname[0] = 0;
-    EFI_GUID iter_guid = { 0 };
-
-    char utf8_key[256];
-    int  cb_rc = 0;
-
-    while (1) {
-        UINTN      name_size = name_chars * sizeof(unsigned short);
-        EFI_STATUS status = axl_rt()->GetNextVariableName(
-            &name_size,
-            wname,
-            &iter_guid);
-
-        if (status == EFI_NOT_FOUND) {
-            break;
-        }
-        if (status == EFI_BUFFER_TOO_SMALL) {
-            /* name_size was updated to the required size in bytes */
-            size_t new_chars = (name_size / sizeof(unsigned short)) + 1;
-            unsigned short *bigger = axl_malloc(new_chars * sizeof(unsigned short));
-            if (bigger == NULL) {
-                axl_free(wname);
-                return AXL_ERR;
-            }
-            axl_memcpy(bigger, wname, name_chars * sizeof(unsigned short));
-            axl_free(wname);
-            wname = bigger;
-            name_chars = new_chars;
-            continue;
-        }
-        if (EFI_ERROR(status)) {
-            axl_free(wname);
-            return AXL_ERR;
-        }
-
-        /* Filter by GUID match */
-        bool match = true;
-        const uint8_t *pa = (const uint8_t *)&iter_guid;
-        const uint8_t *pb = (const uint8_t *)target;
-        for (size_t i = 0; i < sizeof(EFI_GUID); i++) {
-            if (pa[i] != pb[i]) {
-                match = false;
-                break;
-            }
-        }
-        if (!match) {
-            continue;
-        }
-
-        axl_ucs2_to_utf8_buf(wname, utf8_key, sizeof(utf8_key));
-        cb_rc = cb(utf8_key, ctx);
-        if (cb_rc != 0) {
-            break;
-        }
-    }
-
-    axl_free(wname);
-    return cb_rc;
+    /* Completed (cb_rc 0), or the caller stopped it (cb_rc theirs). */
+    return bridge.cb_rc;
 }

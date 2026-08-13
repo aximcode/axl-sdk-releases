@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-inet-address.h:
+/** @file axl-inet-address.h
  *
  * IPv4 address and socket address types. AxlInetAddress wraps an IP
  * address with parsing, formatting, and comparison. AxlSocketAddress

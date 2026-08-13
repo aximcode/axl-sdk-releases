@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-subcommand.h:
+/** @file axl-subcommand.h
  *
  * @deprecated Use axl_args_run from `<axl/axl-args.h>` instead.
  *     AxlArgs's multi-verb mode (`AxlArgsApp.verbs[]`) strictly subsumes
@@ -52,6 +51,8 @@
 #ifndef AXL_SUBCOMMAND_H
 #define AXL_SUBCOMMAND_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -64,7 +65,7 @@ extern "C" {
 /// dispatcher rewrites it from the parent's argv so subcommand
 /// implementations don't need to know about the parent's name). Use
 /// AxlConfig or hand-written parsing on the remaining args.
-typedef int (*AxlSubcommandFn)(int argc, char **argv);
+typedef int (*AxlSubcommandFn)(int argc, char **argv) AXL_CB_NOEXCEPT;
 
 /// One entry in a subcommand table. Define a static array of these
 /// (or allocate dynamically — the dispatcher doesn't care) and pass it

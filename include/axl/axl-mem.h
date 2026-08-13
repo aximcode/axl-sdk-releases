@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-mem.h:
+/** @file axl-mem.h
  *
  * Memory allocation with dmalloc-inspired debug features.
  *
@@ -223,8 +222,15 @@ void axl_mem_get_stats(
 /**
  * @brief Print all outstanding allocations to the log (debug builds).
  *
- * Each leaked block is reported with its size, file, and line number.
- * No-op in release builds.
+ * Each block is reported with its size, file, and line number. No-op in
+ * release builds.
+ *
+ * The blocks listed are the ones ALIVE at the call site, which for a
+ * running program is not the same thing as leaked — so the report is
+ * headed `=== AxlMem leak report (live allocations): ... ===` to keep it
+ * apart from the verdict AXL prints during process teardown, and AXL's
+ * own QEMU test harness fails a run only on the latter. Call this freely
+ * for diagnostics.
  */
 void axl_mem_dump_leaks(void);
 
@@ -262,6 +268,69 @@ bool axl_mem_check(
 void axl_mem_fail_next_alloc(
     size_t n  ///< fail the Nth next alloc (1 = next, 0 = disabled)
 );
+
+/**
+ * @brief Delay the release of freed blocks so a premature free is caught.
+ *
+ * The leak report can only see memory that was never freed. It is blind
+ * by construction to the opposite defect — memory freed too early — and
+ * that one is the more dangerous: a block freed while still referenced
+ * produces no leak, corrupts quietly, and surfaces somewhere unrelated.
+ *
+ * With a quarantine of @a blocks, `axl_free` fills the block with
+ * `0xDF`, holds it, and hands it back to the firmware only once it is
+ * evicted — at which point the fill is re-checked. Two defects become
+ * detectable:
+ *
+ *   - **use-after-free write** — the `0xDF` fill no longer reads back,
+ *     reported with the block's original allocation site.
+ *   - **double free** — the block is still in the quarantine, so the
+ *     second free is refused instead of releasing the pool twice.
+ *
+ * Both are **windowed, not absolute**: they hold only while the block is
+ * still in the ring. Once it has been evicted — by @a blocks later
+ * frees, by the byte cap, or by a drain — a second free of that pointer
+ * is once again undetectable and corrupts, exactly as it did before this
+ * existed. Detecting every double free would need a permanent record of
+ * every block ever freed, which is a different and far heavier feature.
+ * A bigger ring widens the window; it does not close it.
+ *
+ * DEBUG builds only, and on by default there with a 16-block ring; a
+ * release build ignores this and reports zero. Requests are CLAMPED to
+ * 32 blocks and to 64 KiB in total, and a single block larger than the
+ * whole byte budget is never held at all — one allocation must not be
+ * able to pin the heap. Passing 0 disables quarantining AND drains what
+ * is held, which is also how a test forces the pending checks to run
+ * now.
+ *
+ * @ref axl_mem_dump_leaks drains first, so a resident driver — which has
+ * no `_axl_cleanup` and never prints the teardown verdict — still gets
+ * its use-after-free checks run and its held pool released.
+ *
+ * @code
+ * axl_mem_set_quarantine(16);
+ * char *p = axl_malloc(32);
+ * axl_free(p);
+ * p[0] = 'X';                      // use-after-free
+ * axl_mem_set_quarantine(0);       // drain -> the write is reported
+ * @endcode
+ */
+void axl_mem_set_quarantine(
+    size_t blocks  ///< blocks to hold; 0 disables and drains
+);
+
+/**
+ * @brief Number of heap corruptions detected so far (debug builds).
+ *
+ * Counts fence-post violations, use-after-free writes caught on
+ * quarantine eviction, and refused double frees. Monotonic for the life
+ * of the program. Always 0 in release builds.
+ *
+ * Each corruption is also logged with the offending block's original
+ * file and line, so this counter is for tests to assert on — the log is
+ * what a human reads.
+ */
+size_t axl_mem_corruption_count(void);
 
 #ifdef __cplusplus
 }

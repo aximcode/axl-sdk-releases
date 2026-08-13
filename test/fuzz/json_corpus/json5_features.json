@@ -1,0 +1,15 @@
+{
+  // line comment
+  /* block */
+  unquoted: 'single',
+  hex: 0xDEADBEEF,
+  plus: +1,
+  lead: .5,
+  nan: NaN,
+  inf: -Infinity,
+  esc: "\x41\v\0\'end",
+  cont: "a\
+b",
+  tab: "col1	col2",
+  trail: [1,2,3,],
+}

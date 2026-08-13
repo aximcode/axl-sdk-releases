@@ -81,4 +81,125 @@ overlap=$(comm -12 <(printf '%s\n' "$a" | grep -v '^$') <(printf '%s\n' "$b" | g
 if [[ "$union" == "$allset" ]]; then echo "  PASS: shards cover the full set"; else echo "  FAIL: shard union != full set"; fail=1; fi
 if [[ -z "$overlap" ]]; then echo "  PASS: shards do not overlap"; else echo "  FAIL: shard overlap: $overlap"; fail=1; fi
 
+# --- a signalled runner must reap the guest pool BEFORE removing the tree ---
+# The runner exports one shared AXL_QEMU_TMPDIR and every worker launches a
+# guest underneath it. If the signal trap rm -rf's that tree without first
+# killing the guests, each survivor keeps its disk open as a DELETED inode:
+# the directory is gone, so every directory-based check says "clean", while
+# tmpfs cannot reclaim the pages. 365 MB accumulated that way before anyone
+# noticed. df sees it; du cannot -- which is why the assertion below is a df
+# delta and not a check that the directory went away.
+sig_check() {
+    local signal="$1" sstub sout base held delta_kb rpid rc=0
+    sstub=$(mktemp -d); sout=$(mktemp -d)
+    # Two stand-ins, because the runner reaps by two different mechanisms and
+    # a test that only covered one would let the other rot:
+    #
+    #   A: an ordinary descendant of the worker -- caught by the PID walk.
+    #   B: orphaned to init and named qemu-system-*, so it passes the
+    #      reaper's comm filter. This is the shape the real orphans had
+    #      (PPID 1), and only reap_pool can get it.
+    #
+    # B is launched as `( setsid ... & )`, not a bare `setsid ... &`. setsid
+    # changes the SESSION, not the parent: on its own the guest stays a child
+    # of the stub and the PID walk reaches it anyway, so the assertion would
+    # pass without reap_pool existing at all. The throwaway subshell exits
+    # immediately, which is what actually reparents it to init. Sabotage
+    # caught this -- the first version passed with reap_pool deleted.
+    #
+    # `tail -f` is the body of B: it holds the disk open AND carries the path
+    # in argv, which are the two properties the reaper depends on. A shell
+    # script could not be used -- /proc/PID/comm would read `bash`.
+    cp "$(command -v tail)" "$sstub/qemu-system-selftest"
+    cat > "$sstub/test-guest-qemu.sh" <<STUB
+#!/bin/bash
+echo "\$AXL_QEMU_TMPDIR" > "$sout/base"
+d="\$AXL_QEMU_TMPDIR/axl-qemu.\$\$"
+mkdir -p "\$d"
+dd if=/dev/zero of="\$d/a.img" bs=1M count=32 status=none
+dd if=/dev/zero of="\$d/b.img" bs=1M count=32 status=none
+bash -c 'exec 9< "\$1/a.img"; sleep 300' _ "\$d" &
+( setsid "$sstub/qemu-system-selftest" -f "\$d/b.img" >/dev/null 2>&1 & )
+echo ready > "$sout/ready.\$\$"
+sleep 300
+STUB
+    chmod +x "$sstub"/*.sh "$sstub/qemu-system-selftest"
+
+    local before_kb; before_kb=$(df -k --output=used /dev/shm | tail -1)
+    RUN_INTEGRATION_DIR="$sstub" ./run-integration.sh -j1 --timeout 120 >/dev/null 2>&1 &
+    rpid=$!
+    # Wait for the stand-in guest to be holding its disk open.
+    for _ in $(seq 1 100); do
+        compgen -G "$sout/ready.*" >/dev/null 2>&1 && break
+        sleep 0.2
+    done
+    base=$(cat "$sout/base" 2>/dev/null)
+
+    # Signal only the runner -- that is the `timeout` case, and the one that
+    # produced the observed orphans. (A terminal Ctrl-C hits the whole process
+    # group, so the workers die of their own accord and the bug is masked.)
+    kill -"$signal" "$rpid" 2>/dev/null
+    # Bounded wait, then escalate the way `timeout --kill-after` does. The
+    # handler exits on its own now, so this normally completes in one pass;
+    # it exists so a regression that leaves the runner spinning fails the
+    # assertion instead of hanging the suite.
+    local exited=0
+    for _ in $(seq 1 40); do
+        kill -0 "$rpid" 2>/dev/null || { exited=1; break; }
+        sleep 0.25
+    done
+    if [[ "$exited" -eq 0 ]]; then
+        kill -9 "$rpid" 2>/dev/null
+    fi
+    wait "$rpid" 2>/dev/null
+    sleep 1
+
+    # 1. No survivor may still reference the run's tree.
+    held=$(pgrep -af -- "$base" 2>/dev/null | grep -cv 'run-integration' || true)
+    # 2. The tree itself must be gone.
+    local tree_gone=1; [[ -n "$base" && -e "$base" ]] && tree_gone=0
+    # 3. tmpfs must actually be reclaimed -- the deleted-inode check. This is
+    #    the one a directory-existence assertion cannot make.
+    local after_kb; after_kb=$(df -k --output=used /dev/shm | tail -1)
+    delta_kb=$(( after_kb - before_kb ))
+
+    if [[ "$held" -ne 0 ]]; then
+        echo "  FAIL: SIG$signal left $held process(es) holding $base"
+        pgrep -af -- "$base" 2>/dev/null | grep -v 'run-integration' | sed 's/^/         /'
+        rc=1
+    fi
+    [[ "$tree_gone" -eq 1 ]] || { echo "  FAIL: SIG$signal left the tree $base behind"; rc=1; }
+    if [[ "$delta_kb" -gt 8192 ]]; then
+        echo "  FAIL: SIG$signal leaked ${delta_kb} KB of /dev/shm (deleted inodes)"
+        rc=1
+    fi
+    # Never leave our own strays behind, pass or fail. Two handles are needed:
+    # the guest stand-ins carry the /dev/shm base, the stub test scripts carry
+    # the stub dir.
+    [[ -n "$base" ]] && { pkill -f -- "$base" 2>/dev/null; sleep 0.5; rm -rf "$base"; }
+    pkill -f -- "$sstub" 2>/dev/null
+    sleep 0.3
+    rm -rf "$sstub" "$sout"
+    if [[ "$rc" -eq 0 ]]; then
+        echo "  PASS: SIG$signal reaps the pool, removes the tree, reclaims tmpfs"
+    else
+        fail=1
+    fi
+}
+# SIGTERM only, and that is not a gap. SIGTERM is the delivery that actually
+# produced the orphans (a `timeout` wrapper expiring, which signals just the
+# runner), and run-integration.sh routes both signals through one _signal_exit
+# body, so this covers the SIGINT path's logic too.
+#
+# SIGINT genuinely cannot be driven from here: bash starts a background job of
+# a non-interactive shell with SIGINT ignored (/proc/PID/status SigIgn bit 2),
+# and a signal ignored on entry cannot be trapped -- so `kill -INT` at the
+# runner is swallowed and the assertion would be measuring the harness, not
+# the runner. A terminal Ctrl-C reaches the whole foreground process group
+# instead, where the trap does fire.
+sig_check TERM
+# No HUP/PIPE cases: bash runs the EXIT trap for untrapped fatal signals too,
+# so they exercise the same body as TERM and cannot fail independently of it.
+# Verified by sabotage -- deleting per-signal HUP/PIPE handlers changed nothing.
+
 [[ $fail -eq 0 ]] && echo "runner selftest: OK" || { echo "runner selftest: FAILED"; exit 1; }

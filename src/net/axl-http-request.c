@@ -536,5 +536,17 @@ axl_http_request_get_json(const AxlHttpRequest *req, AxlJsonReader *out)
     if (req == NULL || out == NULL || req->body == NULL || req->body_size == 0) {
         return false;
     }
-    return axl_json_parse((const char *)req->body, req->body_size, out);
+    /* STRICT, never AXL_JSON_RELAXED. A request body is the one JSON a server
+     * never wrote: it arrives off the network from a client that may be
+     * hostile, which is precisely the case axl-json.h names AXL_JSON_STRICT
+     * for. The liberal dialect exists so the SDK can read sidecars and config
+     * files it did not write -- a different situation with a different threat
+     * model, and conflating them would make every AXL HTTP server quietly
+     * accept JSON5 from anyone who could reach it. It was conflated by
+     * DEFAULT until 2026-08-04, when the dialect became a parameter.
+     *
+     * A handler that genuinely wants a lenient body can still parse req->body
+     * itself with whatever dialect it chooses. */
+    return axl_json_parse((const char *)req->body, req->body_size,
+                          AXL_JSON_STRICT, out);
 }

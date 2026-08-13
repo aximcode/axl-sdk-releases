@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-http-server.h:
+/** @file axl-http-server.h
  *
  * HTTP server with routing, middleware pipeline, WebSocket,
  * authentication, response caching, and upload streaming.
@@ -10,6 +9,8 @@
 
 #ifndef AXL_HTTP_SERVER_H
 #define AXL_HTTP_SERVER_H
+
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -81,7 +82,7 @@ typedef struct {
     /// Set body / body_size / body_static via the setter rather than
     /// touching these fields directly.
     int          (*streamer)(void *ctx, void *out_buf, size_t out_buf_size,
-                             size_t *out_size);
+                             size_t *out_size) AXL_CB_NOEXCEPT;
 
     /// Opaque user data passed to streamer on each invocation.
     /// Owned by the caller; lifetime managed via streamer_cleanup.
@@ -92,7 +93,7 @@ typedef struct {
     /// connection reset before EOF). Receives streamer_ctx so
     /// the caller can close files / free buffers. NULL means the
     /// streamer self-cleans via its EOF / error transitions.
-    void         (*streamer_cleanup)(void *ctx);
+    void         (*streamer_cleanup)(void *ctx) AXL_CB_NOEXCEPT;
 
     /// Total response body size in bytes. Used as Content-Length when
     /// known. Pass `(size_t)-1` to signal unknown length — the
@@ -113,7 +114,7 @@ typedef int (*AxlHttpHandler)(
     AxlHttpRequest  *req,   ///< incoming request
     AxlHttpResponse *resp,  ///< response to fill in
     void            *data   ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Middleware callback. Return 0 to continue pipeline, -1 to
@@ -125,7 +126,7 @@ typedef int (*AxlHttpMiddleware)(
     AxlHttpRequest  *req,   ///< incoming request
     AxlHttpResponse *resp,  ///< response to fill in
     void            *data   ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // HTTP Server
@@ -385,13 +386,17 @@ axl_http_request_wants_json(
 /**
  * @brief Parse the request body as JSON.
  *
- * Calls axl_json_parse on @c req->body / @c req->body_size.
  * The reader references the body buffer directly — do not free
  * @c req->body while the reader is in use, and call @c axl_json_free
  * on @p out when done.
  *
- * Strict RFC 8259. For JSON5, parse manually with
- * axl_json_parse_flags.
+ * STRICT RFC 8259 (@c AXL_JSON_STRICT), deliberately NOT the liberal
+ * axl_json_parse(): a request body arrives off the network from a client that
+ * may be hostile, and that is the case @c AXL_JSON_STRICT exists for. So a
+ * comment, an unquoted key, a single-quoted string, a hex literal or a
+ * trailing comma in the body is a parse error here. A handler that genuinely
+ * wants a lenient body can parse @c req->body itself with any dialect via
+ * axl_json_parse().
  *
  * @return true on success (@p out populated and ready for
  *     @c axl_json_object_get / etc); false on NULL inputs, empty
@@ -527,7 +532,7 @@ typedef int (*AxlResponseStreamer)(
     void   *out_buf,
     size_t  out_buf_size,
     size_t *out_size
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Optional finalizer called when a streaming response ends.
@@ -541,7 +546,7 @@ typedef int (*AxlResponseStreamer)(
  *
  * @param ctx the same @c ctx pointer registered with the streamer.
  */
-typedef void (*AxlResponseCleanup)(void *ctx);
+typedef void (*AxlResponseCleanup)(void *ctx) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Set a streaming response body via producer callback.
@@ -569,19 +574,28 @@ typedef void (*AxlResponseCleanup)(void *ctx);
  * streamer overrides any prior body assignment (and frees a
  * previously-set non-static body).
  *
+ * Item size 1 in the axl_fread below is load-bearing: it makes the
+ * item count the BYTE count, which is what @p out_size means. Any
+ * other item size would silently drop the partial trailing item that
+ * axl_fread does not count but does write.
+ *
  * @code
  * static int file_streamer(void *ctx, void *buf, size_t cap, size_t *out)
  * {
- *     AxlFile *f = (AxlFile *)ctx;
- *     return axl_fread(f, buf, cap, out);
+ *     AxlStream *f = (AxlStream *)ctx;
+ *     *out = axl_fread(buf, 1, cap, f);
+ *     // A short read is EOF (*out == 0 ends the response) unless the
+ *     // stream errored, which is the only case the dispatcher must
+ *     // hear about.
+ *     return axl_ferror(f) ? AXL_ERR : AXL_OK;
  * }
- * static void file_close(void *ctx) { axl_fclose((AxlFile *)ctx); }
+ * static void file_close(void *ctx) { axl_fclose((AxlStream *)ctx); }
  *
- * AxlFile *f = axl_fopen("fs0:/big.iso", "r");
- * uint64_t size = 0;
- * axl_file_size(f, &size);
+ * AxlStream *f = axl_fopen("fs0:/big.iso", "r");
+ * AxlFsEntry st;
+ * if (f == NULL || axl_file_info("fs0:/big.iso", &st) != AXL_OK) { ... }
  * axl_http_response_set_streamer(resp, file_streamer, f, file_close,
- *                                (size_t)size, "application/octet-stream");
+ *                                (size_t)st.size, "application/octet-stream");
  * @endcode
  */
 void
@@ -740,7 +754,7 @@ typedef int (*AxlWsHandler)(
     const void *frame,      ///< frame data (NULL for CONNECT/DISCONNECT)
     size_t     frame_size,  ///< frame data size
     void       *data        ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Register a WebSocket endpoint.
@@ -758,13 +772,13 @@ axl_http_server_add_websocket(
 /**
  * @brief Broadcast data to all connected WebSocket clients on a path.
  *
- * Each client's frame is queued on a per-connection outbound FIFO and sent
- * one at a time (the transport is one-send-in-flight, and over TLS frames must
- * serialize or the stream desyncs), so a burst of broadcasts is delivered
- * in order without racing. Under sustained back-pressure (a slow client) the
- * queue is bounded and drops the oldest *unsent* frames — lossy by design,
- * which suits a live feed (a console mirror, a metrics stream); a consumer
- * that needs every byte must apply its own flow control.
+ * Each client's frame is queued on a per-connection outbound FIFO and handed
+ * to the transport one at a time, so a burst of broadcasts is delivered in
+ * order without racing. Holding one frame in flight is what keeps the rest
+ * DROPPABLE: under sustained back-pressure (a slow client) the queue is
+ * bounded and sheds the oldest *unsent* frames — lossy by design, which suits
+ * a live feed (a console mirror, a metrics stream); a consumer that needs
+ * every byte must apply its own flow control.
  *
  * @return AXL_OK on success, AXL_ERR on failure.
  */
@@ -798,7 +812,7 @@ typedef int (*AxlAuthCallback)(
     AxlHttpRequest *req,       ///< incoming request
     AxlAuthInfo    *auth_out,  ///< receives authentication info on success
     void           *data       ///< opaque caller data
-);
+) AXL_CB_NOEXCEPT;
 
 /// Route auth flags, passed to every `*_auth` registration function.
 /// Any non-zero value requires the server's auth callback
@@ -905,7 +919,7 @@ typedef int (*AxlWsConnHandler)(
     const void *frame,      ///< frame data (NULL for CONNECT/DISCONNECT)
     size_t      frame_size, ///< frame data size
     void       *data        ///< per-endpoint opaque (from registration)
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Register a WebSocket endpoint with per-connection callbacks + auth.
@@ -944,9 +958,9 @@ axl_http_server_add_websocket_ex(
  * AXL_WS_DISCONNECT handler has returned.
  *
  * Like axl_http_server_ws_broadcast, frames are queued on the connection's
- * outbound FIFO and serialized over the one-send-in-flight transport, so
- * back-to-back sends are delivered in order (and never desync TLS); the queue
- * is bounded and drops oldest-unsent under sustained back-pressure. A single
+ * outbound FIFO and handed down one at a time, so back-to-back sends are
+ * delivered in order; the queue is bounded and drops oldest-unsent under
+ * sustained back-pressure. A single
  * frame whose framed size exceeds the per-connection outbound budget (512 KB)
  * is REJECTED with AXL_ERR rather than admitted — chunk a larger payload into
  * multiple sends yourself (one oversized frame could otherwise wedge the
@@ -1120,7 +1134,7 @@ typedef int (*AxlUploadHandler)(
     size_t           chunk_size,  ///< chunk size (0 on final/abort call)
     void            *data,        ///< opaque caller data
     bool             aborted      ///< true on connection teardown mid-upload
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Register a streaming upload route.
@@ -1241,29 +1255,29 @@ typedef struct {
     /// PROPFIND backing — list children of a directory.
     int  (*list_dir)(void *user, const char *path,
                      AxlFsEntry *out, size_t max,
-                     size_t *count);
+                     size_t *count) AXL_CB_NOEXCEPT;
 
     /// Stat — for PROPFIND on a single resource.
     int  (*stat)(void *user, const char *path,
-                 AxlFsEntry *out);
+                 AxlFsEntry *out) AXL_CB_NOEXCEPT;
 
     /// Streaming read — drives axl_http_response_set_streamer for GET.
     int  (*read_open)(void *user, const char *path,
-                      uint64_t offset, void **out_ctx);
+                      uint64_t offset, void **out_ctx) AXL_CB_NOEXCEPT;
     int  (*read_chunk)(void *ctx, void *buf, size_t buf_size,
-                       size_t *bytes_read);
-    void (*read_close)(void *ctx);
+                       size_t *bytes_read) AXL_CB_NOEXCEPT;
+    void (*read_close)(void *ctx) AXL_CB_NOEXCEPT;
 
     /// Streaming write — drives the upload-route chunk handler for PUT.
-    int  (*write_open)(void *user, const char *path, void **out_ctx);
-    int  (*write_chunk)(void *ctx, const void *data, size_t len);
-    int  (*write_close)(void *ctx, bool aborted);
+    int  (*write_open)(void *user, const char *path, void **out_ctx) AXL_CB_NOEXCEPT;
+    int  (*write_chunk)(void *ctx, const void *data, size_t len) AXL_CB_NOEXCEPT;
+    int  (*write_close)(void *ctx, bool aborted) AXL_CB_NOEXCEPT;
 
     /// Lifecycle — MKCOL / DELETE / MOVE / COPY.
-    int  (*mkdir)(void *user, const char *path);
-    int  (*remove)(void *user, const char *path);
+    int  (*mkdir)(void *user, const char *path) AXL_CB_NOEXCEPT;
+    int  (*remove)(void *user, const char *path) AXL_CB_NOEXCEPT;
     int  (*move)(void *user, const char *src, const char *dst,
-                 bool overwrite);
+                 bool overwrite) AXL_CB_NOEXCEPT;
     /// COPY: replicate @p src to @p dst, leaving @p src in place.
     /// @p depth is 0 (collection itself only, no contents) or -1
     /// (infinity / deep). The SDK rejects Depth: 1 before reaching
@@ -1272,11 +1286,11 @@ typedef struct {
     /// also set stat — the SDK pre-stats @p src when stat is
     /// wired.
     int  (*copy)(void *user, const char *src, const char *dst,
-                 bool overwrite, int depth);
+                 bool overwrite, int depth) AXL_CB_NOEXCEPT;
 
     /// Content-Type hint for GET responses (optional). Returning
     /// NULL or omitting the callback uses application/octet-stream.
-    const char *(*content_type)(void *user, const char *path);
+    const char *(*content_type)(void *user, const char *path) AXL_CB_NOEXCEPT;
 
     /// Optional: produce a content digest for end-to-end integrity
     /// verification (RFC 3230). When wired AND the client sends a
@@ -1305,7 +1319,7 @@ typedef struct {
     /// the value across their first Range read.
     int  (*digest)(void *user, const char *path,
                    const char *algo,
-                   char *out_hex, size_t hex_size);
+                   char *out_hex, size_t hex_size) AXL_CB_NOEXCEPT;
 
     /// Optional last-call hook to mutate the response before the
     /// SDK hands it to the dispatcher for wire send. Fires AFTER
@@ -1326,7 +1340,7 @@ typedef struct {
     /// wire the @c digest callback instead — the SDK already does
     /// the Want-Digest parsing.
     void (*before_response)(void *user, AxlHttpRequest *req,
-                            AxlHttpResponse *resp);
+                            AxlHttpResponse *resp) AXL_CB_NOEXCEPT;
 } AxlWebDavOps;
 
 /**
@@ -1346,7 +1360,7 @@ typedef struct {
  */
 int
 axl_http_server_add_webdav(
-    AxlHttpServer       *s,
+    AxlHttpServer       *s,         ///< server
     const char          *prefix,    ///< URL prefix, e.g. "/dav"
     const AxlWebDavOps  *ops,       ///< callback table (copied)
     void                *user_data  ///< opaque, passed back to ops
@@ -1368,7 +1382,7 @@ axl_http_server_add_webdav(
  */
 int
 axl_http_server_add_webdav_auth(
-    AxlHttpServer       *s,
+    AxlHttpServer       *s,          ///< server
     const char          *prefix,     ///< URL prefix, e.g. "/dav"
     const AxlWebDavOps  *ops,        ///< callback table (copied)
     void                *user_data,  ///< opaque, passed back to ops
@@ -1490,7 +1504,7 @@ axl_fs_webdav_ops(void);
  */
 int
 axl_http_server_serve_fs(
-    AxlHttpServer *s,
+    AxlHttpServer *s,          ///< server
     const char    *prefix,     ///< URL prefix, e.g. "/dav"
     const char    *fs_root,    ///< filesystem base path (e.g. "FS0:")
     uint32_t       flags,      ///< AXL_SERVE_FS_* access flags

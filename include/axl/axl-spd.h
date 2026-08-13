@@ -321,7 +321,7 @@ axl_spd_ids_vendor_name(
  *     iteration and propagates as the iter rc.
  * @{
  */
-typedef int (*AxlSpdIdsVendorFn)(uint16_t code, const char *name, void *ctx);
+typedef int (*AxlSpdIdsVendorFn)(uint16_t code, const char *name, void *ctx) AXL_CB_NOEXCEPT;
 
 int
 axl_spd_ids_foreach_vendor(

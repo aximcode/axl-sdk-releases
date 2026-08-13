@@ -9,15 +9,21 @@
     operation, register the event with the caller's AxlLoop, and fire
     the user callback from the event handler. When an AxlCancellable
     is supplied, a second loop source is registered on the
-    cancellable's event — on signal, the op's on_*_cancel handler
-    tears everything down via the shared axl_tcp_*_drop_sources helper
-    and fires the user callback with status=AXL_CANCELLED. The sync
+    cancellable's event — on signal, the op's cancel handler tears
+    everything down via the shared axl_tcp_*_drop_sources helper and
+    fires the user callback with status=AXL_CANCELLED. The sync
     wrappers in axl-tcp-sync.c sit on top of these.
 
-    Contract: on_*_complete and on_*_cancel BOTH route through the
-    same _drop_sources helper so completion- and cancel-source
+    Contract: on_*_complete and the cancel handlers BOTH route through
+    the same _drop_sources helper so completion- and cancel-source
     teardown are symmetric — a slip in one path does not leave the
     loop with an orphaned source.
+
+    SEND IS THE EXCEPTION, in two ways. Sends are QUEUED (one EFI token
+    in flight, the rest waiting in FIFO order), and a send's callback is
+    not called from its completion handler at all: it is DEFERRED to the
+    loop's next iteration, the port of EDK2's SIGNAL_TOKEN. See the
+    retirement section below and docs/AXL-Tcp-Queue-Design.md.
 
     Callback return value: user callbacks return bool. For accept/recv
     the value controls re-arming (true = keep armed, false = stop).
@@ -25,6 +31,7 @@
     discard the return with (void).
 **/
 
+#include <axl/axl-defer.h>
 #include <axl/axl-mem.h>
 #include <axl/axl-str.h>
 #include <axl/axl-log.h>
@@ -203,6 +210,9 @@ axl_tcp_accept_async(
 
     if (listener == NULL || loop == NULL || cb == NULL || !listener->is_listener) {
         return AXL_ERR;
+    }
+    if (listener->closed) {
+        return AXL_ERR;    /* torn down — see axl_tcp_recv_async */
     }
 
     //
@@ -431,6 +441,12 @@ axl_tcp_recv_async(
     if (sock == NULL || buf == NULL || size == 0 || loop == NULL || cb == NULL) {
         return AXL_ERR;
     }
+    /* Refuse rather than arm firmware state this socket has already released.
+       Reachable from a send callback the teardown itself fired — a keep-alive
+       server re-arms its recv from exactly there (start_conn_recv). */
+    if (sock->closed) {
+        return AXL_ERR;
+    }
 
     //
     // Cancel any pending recv before starting a new one
@@ -557,19 +573,19 @@ axl_tcp_recv_async(
    the shared one-send-in-flight path and wedges the single-threaded loop. */
 #define TCP_SEND_CHUNK_MAX  (32u * 1024u)
 
-/* Arm the next Transmit for the current send: submit
-   min(TCP_SEND_CHUNK_MAX, remaining) bytes from send_ptr + send_off, reusing
-   tx_token/tx_event. Returns the EFI Transmit status. Does NOT touch the loop
-   source — the caller owns source lifecycle. */
+/* Arm the next Transmit for the active send: submit
+   min(TCP_SEND_CHUNK_MAX, remaining) bytes from where the last chunk stopped,
+   reusing tx_token/tx_event. Returns the EFI Transmit status. Does NOT touch
+   the loop source — the caller owns source lifecycle. */
 static EFI_STATUS
 tcp_send_arm_chunk(AxlTcp *sock)
 {
-    size_t remaining = sock->send_total - sock->send_off;
-    size_t chunk     = (remaining < TCP_SEND_CHUNK_MAX)
-                       ? remaining : TCP_SEND_CHUNK_MAX;
+    AxlTcpToken *tok   = sock->send_active;
+    size_t       chunk = (tok->remaining < TCP_SEND_CHUNK_MAX)
+                         ? tok->remaining : TCP_SEND_CHUNK_MAX;
 
     sock->tx_frag.FragmentLength = (uint32_t)chunk;
-    sock->tx_frag.FragmentBuffer = (void *)(sock->send_ptr + sock->send_off);
+    sock->tx_frag.FragmentBuffer = (void *)(tok->buf + (tok->len - tok->remaining));
 
     axl_memset(&sock->tx_data, 0, sizeof(sock->tx_data));
     sock->tx_data.Push             = true;
@@ -588,30 +604,386 @@ tcp_send_arm_chunk(AxlTcp *sock)
     return axl_efi_call(sock->tcp4->Transmit, 2, sock->tcp4, &sock->tx_token);
 }
 
+static bool on_send_complete(void *data);
+static bool on_send_token_cancel(void *data);
+static void tcp_send_promote(AxlTcp *sock);
+
+/* Append an accepted send. Port of EDK2 SockBufferToken into SndTokenList.
+   The caller's buffer is BORROWED, not copied — EDK2's NetbufFromExt wraps
+   rather than copies (design §3.1), so a send costs one small token and no
+   data copy. Every send lands here first, including the one that is about to
+   be promoted straight out again: that is what keeps the retirement path
+   allocation-free (see AxlTcpToken). */
+static int
+tcp_send_enqueue(
+    AxlTcp         *sock,
+    const void     *buf,
+    size_t          size,
+    AxlLoop        *loop,
+    AxlCancellable *cancel,
+    AxlTcpCallback  cb,
+    void           *data
+    )
+{
+    AxlTcpToken *tok = axl_malloc(sizeof(*tok));
+
+    if (tok == NULL) {
+        return AXL_ERR;
+    }
+    tok->next          = NULL;
+    tok->sock          = sock;
+    tok->buf           = (const uint8_t *)buf;
+    tok->len           = size;
+    tok->remaining     = size;
+    tok->cb            = cb;
+    tok->cb_data       = data;
+    tok->cancel        = cancel;
+    tok->loop          = loop;
+    tok->cancel_source = 0;
+    tok->status        = AXL_OK;
+    tok->done_defer    = 0;
+    tok->done_source   = 0;
+
+    /* Arm cancellation NOW, before the token can be promoted, and keep the one
+       source until retirement — port of EDK2 SockCancelToken, which walks
+       SndTokenList (the deferred list) as well as the processing one.
+       Load-bearing: axl_tcp_send (sync) passes a stack SyncResult, an
+       ephemeral loop and a cancellable, and frees all three on return. Its
+       timeout can only retire this token — and run cb while that frame is
+       still alive — if the cancellable is live while QUEUED. Design §3.6 / §7.
+       One source for both states also removes the re-arm-at-promotion step,
+       and with it a failure path that could leave a promoted send
+       uncancellable. */
+    if (cancel != NULL) {
+        tok->cancel_source = axl_loop_add_event(
+            loop, _axl_cancellable_event(cancel),
+            on_send_token_cancel, tok);
+        if (tok->cancel_source == 0) {
+            /* Refuse rather than accept an uncancellable token: the caller
+               would have no way to reclaim its context. */
+            axl_free(tok);
+            return AXL_ERR;
+        }
+    }
+
+    if (sock->send_queued_tail != NULL) {
+        sock->send_queued_tail->next = tok;
+    } else {
+        sock->send_queued_head = tok;
+    }
+    sock->send_queued_tail  = tok;
+    sock->send_queued_bytes += size;
+    return AXL_OK;
+}
+
+/* Unlink @p tok from the queue. Returns false if it was not on it. */
+static bool
+tcp_send_unlink(AxlTcp *sock, AxlTcpToken *tok)
+{
+    AxlTcpToken **pp = &sock->send_queued_head;
+    AxlTcpToken  *prev = NULL;
+
+    while (*pp != NULL) {
+        if (*pp == tok) {
+            *pp = tok->next;
+            if (sock->send_queued_tail == tok) {
+                sock->send_queued_tail = prev;
+            }
+            sock->send_queued_bytes -= tok->len;
+            tok->next = NULL;
+            return true;
+        }
+        prev = *pp;
+        pp   = &(*pp)->next;
+    }
+    return false;
+}
+
+/* Pop the head token, or NULL. */
+static AxlTcpToken *
+tcp_send_dequeue(AxlTcp *sock)
+{
+    AxlTcpToken *tok = sock->send_queued_head;
+
+    if (tok == NULL) {
+        return NULL;
+    }
+    sock->send_queued_head = tok->next;
+    if (sock->send_queued_head == NULL) {
+        sock->send_queued_tail = NULL;
+    }
+    sock->send_queued_bytes -= tok->len;
+    tok->next = NULL;
+    return tok;
+}
+
+// ---- retirement: the port of EDK2's SIGNAL_TOKEN ---------------------------
+//
+// EDK2 retires a token with SIGNAL_TOKEN (SockImpl.h:23), which is
+// gBS->SignalEvent: it QUEUES the consumer's notify rather than calling it, so
+// no consumer code ever runs inside the transport's own call stack. AXL's
+// equivalent is axl_defer, whose queue the loop drains at the TOP of its next
+// iteration — before it waits on or dispatches anything else.
+//
+// That is what makes the rest of this file safe to write. A send callback may
+// axl_tcp_close and free the socket, and while callbacks ran inline every
+// ordering of "retire, promote, signal" had either a use-after-free or a
+// dropped callback in it: promote-then-signal loses the callback of a send
+// promoted behind the caller's back, signal-then-promote frees the socket
+// before the promote, and barring promotion during teardown only helps when
+// the close starts first (design §6b). Nothing runs inline now, so there is no
+// ordering left to get wrong.
+// ---------------------------------------------------------------------------
+
+/* Release @p tok, cancelling everything still pointing AT it: its cancel
+   source and its scheduled delivery. Both sit on loops that may outlive this
+   socket, so neither may outlive the token. */
+static void
+tcp_send_free_token(AxlTcpToken *tok)
+{
+    if (tok->cancel_source > 0) {
+        axl_loop_remove_source(tok->loop, tok->cancel_source);
+    }
+    if (tok->done_defer != 0) {
+        axl_defer_cancel(tok->loop, tok->done_defer);
+    }
+    if (tok->done_source != 0) {
+        axl_loop_remove_source(tok->loop, tok->done_source);
+    }
+    axl_free(tok);
+}
+
+/* Unlink @p tok from the retired list. False if it was not on it. */
+static bool
+tcp_send_done_unlink(AxlTcp *sock, AxlTcpToken *tok)
+{
+    AxlTcpToken *prev = NULL;
+    AxlTcpToken *cur;
+
+    for (cur = sock->send_done_head; cur != NULL; prev = cur, cur = cur->next) {
+        if (cur != tok) {
+            continue;
+        }
+        if (prev != NULL) {
+            prev->next = tok->next;
+        } else {
+            sock->send_done_head = tok->next;
+        }
+        if (sock->send_done_tail == tok) {
+            sock->send_done_tail = prev;
+        }
+        tok->next = NULL;
+        return true;
+    }
+    return false;
+}
+
+/* Run the callbacks of an ALREADY-DETACHED list of retired tokens. `sock` is
+   only ever passed to a callback here, never dereferenced afterwards, so a
+   callback that closes the socket cannot pull the walk out from under itself —
+   and finalize_sock defers its free until the outermost delivery is done. */
+static void
+tcp_send_deliver(AxlTcp *sock, AxlTcpToken *list)
+{
+    bool outer = !sock->send_draining;
+
+    sock->send_draining = true;
+    while (list != NULL) {
+        AxlTcpToken    *tok    = list;
+        AxlTcpCallback  cb     = tok->cb;
+        void           *udata  = tok->cb_data;
+        AxlStatus       status = tok->status;
+
+        list = tok->next;
+        tcp_send_free_token(tok);
+        cb(sock, status, udata);  /* send is one-shot; return value ignored */
+    }
+
+    if (!outer) {
+        return;      /* a nested delivery leaves the flags to the outermost */
+    }
+    sock->send_draining = false;
+    if (sock->free_deferred) {
+        /* A close ran from one of the callbacks above and finished its
+           teardown, but could not free the socket while this walk was still
+           handing it out. finalize_sock left that to us. */
+        axl_free(sock);
+    }
+}
+
+/* Deliver ONE retired token — what its own loop calls when the schedule made
+   at retirement comes up. */
+static void
+tcp_send_deliver_one(AxlTcpToken *tok)
+{
+    AxlTcp *sock = tok->sock;
+
+    if (!tcp_send_done_unlink(sock, tok)) {
+        return;   /* close got there first; the token is long gone */
+    }
+    tcp_send_deliver(sock, tok);
+}
+
+static void
+tcp_send_done_defer_cb(void *data)
+{
+    AxlTcpToken *tok = (AxlTcpToken *)data;
+
+    tok->done_defer = 0;   /* being consumed right now: no longer cancellable */
+    tcp_send_deliver_one(tok);
+}
+
+static bool
+tcp_send_done_timer_cb(void *data)
+{
+    AxlTcpToken *tok = (AxlTcpToken *)data;
+
+    tok->done_source = 0;  /* one-shot: the loop drops it on return */
+    tcp_send_deliver_one(tok);
+    return AXL_SOURCE_REMOVE;
+}
+
+/* Park @p tok on the retired list with @p status. Never calls the callback,
+   and never schedules one — the close path delivers what it parks itself. The
+   token must already be off both the queue and the active slot. */
+static void
+tcp_send_park(AxlTcp *sock, AxlTcpToken *tok, AxlStatus status)
+{
+    if (tok->cancel_source > 0) {
+        /* Dropped here rather than at the free, so a cancellable firing
+           between now and the delivery cannot re-retire a token that is
+           already spoken for. */
+        axl_loop_remove_source(tok->loop, tok->cancel_source);
+        tok->cancel_source = 0;
+    }
+    tok->status = status;
+    tok->next   = NULL;
+
+    if (sock->send_done_tail != NULL) {
+        sock->send_done_tail->next = tok;
+    } else {
+        sock->send_done_head = tok;
+    }
+    sock->send_done_tail = tok;
+}
+
+/* Retire @p tok: park it, then ask ITS OWN loop to deliver the callback on the
+   loop's next iteration. */
+static void
+tcp_send_retire(AxlTcp *sock, AxlTcpToken *tok, AxlStatus status)
+{
+    tcp_send_park(sock, tok, status);
+
+    tok->done_defer = axl_defer(tok->loop, tcp_send_done_defer_cb, tok);
+    if (tok->done_defer != 0) {
+        return;
+    }
+    /* The loop's defer ring is full (~42 entries, shared with every other user
+       of it). Fall back to a one-shot timer, which draws on a different pool —
+       something has to carry this callback, and there may be no later send to
+       piggy-back on: axl_tcp_send's ephemeral loop can only be quit BY this
+       delivery. 1ms, since the loop rejects a 0 delay. */
+    tok->done_source = axl_loop_add_timeout(tok->loop, 1,
+                                            tcp_send_done_timer_cb, tok);
+    if (tok->done_source == 0) {
+        /* Defer ring AND source table both full. The token stays parked, and
+           axl_tcp_close delivers it before the socket is freed. Late, never
+           lost — but late enough to be worth a line. */
+        axl_error("async send: cannot schedule the completion callback "
+                  "(defer queue and source table both full)");
+    }
+}
+
+void
+axl_tcp_send_drain_done(AxlTcp *sock)
+{
+    AxlTcpToken *list = sock->send_done_head;
+
+    sock->send_done_head = NULL;
+    sock->send_done_tail = NULL;
+    tcp_send_deliver(sock, list);
+}
+
+/* Arm @p tok as the active send. On failure the token is retired with
+   AXL_ERR — a transport that refuses one send must still tell that send's
+   caller, and must not park every send behind it (design §6b defect 5). */
+static bool
+tcp_send_arm_token(AxlTcp *sock, AxlTcpToken *tok)
+{
+    sock->send_active = tok;
+    sock->async_loop  = tok->loop;
+
+    if (sock->tx_token.CompletionToken.Event == NULL) {
+        EFI_EVENT tx_event = NULL;
+        if (axl_backend_event_create((AxlEventHandle *)&tx_event) != AXL_OK) {
+            axl_error("async send: cannot create event");
+            goto arm_failed;
+        }
+        sock->tx_token.CompletionToken.Event = tx_event;
+    }
+
+    if (EFI_ERROR(tcp_send_arm_chunk(sock))) {
+        axl_debug("async Transmit failed to arm %zu byte(s)", tok->len);
+        goto arm_failed;
+    }
+
+    sock->send_source = axl_loop_add_event(
+        tok->loop,
+        (AxlEventHandle)sock->tx_token.CompletionToken.Event,
+        on_send_complete, sock);
+    if (sock->send_source == 0) {
+        axl_error("async send: cannot register event with loop");
+        /* The firmware still holds the token and would DMA the borrowed
+           buffer after we have declared the send dead, and the next send
+           would reuse tx_token while it is still outstanding. */
+        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
+                     &sock->tx_token.CompletionToken);
+        goto arm_failed;
+    }
+    return true;
+
+arm_failed:
+    sock->send_active = NULL;
+    tcp_send_retire(sock, tok, AXL_ERR);
+    return false;
+}
+
+/* Hand the head of the queue to the transport. Port of EDK2
+   SockProcessSndToken. AXL keeps exactly one EFI token in flight (design §2),
+   so at most one send is armed here and the next promotion happens from that
+   send's own completion; the loop only spins while tokens are failing to arm. */
+static void
+tcp_send_promote(AxlTcp *sock)
+{
+    while (sock->send_active == NULL && !sock->closed) {
+        AxlTcpToken *tok = tcp_send_dequeue(sock);
+
+        if (tok == NULL || tcp_send_arm_token(sock, tok)) {
+            return;
+        }
+    }
+}
+
 static bool
 on_send_complete(void *data)
 {
-    AxlTcp         *sock = data;
-    EFI_STATUS      status;
-    AxlTcpCallback  cb;
-    void           *cb_data;
-    AxlStatus       cb_status;
+    AxlTcp      *sock = data;
+    AxlTcpToken *tok  = sock->send_active;
+    EFI_STATUS   status;
 
     axl_efi_call(sock->tcp4->Poll, 1, sock->tcp4);
 
     status = sock->tx_token.CompletionToken.Status;
     if (!EFI_ERROR(status)) {
         /* UEFI Transmit tokens are all-or-nothing per submission: this
-           completion means the whole submitted chunk was accepted. Advance
-           by exactly that chunk's length (recomputed from the pre-advance
-           offset — identical to what tcp_send_arm_chunk just submitted). */
-        size_t sent = sock->send_total - sock->send_off;
-        if (sent > TCP_SEND_CHUNK_MAX) {
-            sent = TCP_SEND_CHUNK_MAX;
-        }
-        sock->send_off += sent;
+           completion means the whole submitted chunk was accepted. Retire
+           exactly that chunk's length — identical to what tcp_send_arm_chunk
+           just submitted. */
+        size_t sent = (tok->remaining < TCP_SEND_CHUNK_MAX)
+                      ? tok->remaining : TCP_SEND_CHUNK_MAX;
+        tok->remaining -= sent;
 
-        if (sock->send_off < sock->send_total) {
+        if (tok->remaining > 0) {
             /* More to go — re-arm the next chunk on the SAME tx_event and keep
                this loop source (AXL_SOURCE_CONTINUE); the user callback fires
                only after the final chunk completes. */
@@ -620,7 +992,7 @@ on_send_complete(void *data)
                 return AXL_SOURCE_CONTINUE;
             }
             axl_error("async send: chunk re-arm failed at %zu/%zu: %llx",
-                      sock->send_off, sock->send_total,
+                      tok->len - tok->remaining, tok->len,
                       (unsigned long long)status);
             /* fall through: report the re-arm failure as a send failure */
         }
@@ -628,24 +1000,22 @@ on_send_complete(void *data)
         axl_error("async send failed: %llx", (unsigned long long)status);
     }
 
-    cb_status = EFI_ERROR(status) ? AXL_ERR : AXL_OK;
-
-    //
-    // Remove loop source BEFORE calling user callback
-    //
-    cb = sock->on_send;
-    cb_data = sock->send_data;
-    /* Drop BOTH completion and cancel sources — same reason as recv. */
+    sock->send_active = NULL;
     axl_tcp_send_drop_sources(sock);
-
-    cb(sock, cb_status, cb_data);  /* send is one-shot; return value ignored */
+    tcp_send_retire(sock, tok, EFI_ERROR(status) ? AXL_ERR : AXL_OK);
+    /* Promote immediately: only the NOTIFICATION is deferred, so the wire
+       keeps moving at full rate while the callback waits for the next tick. */
+    tcp_send_promote(sock);
     return AXL_SOURCE_REMOVE;
 }
 
-/*
- * Cancel an armed send. Same contract as recv cancel — sock stays
- * valid, caller's callback fires with AXL_CANCELLED.
- */
+bool
+axl_tcp_send_pending(const AxlTcp *sock)
+{
+    return sock != NULL
+           && (sock->send_active != NULL || sock->send_queued_head != NULL);
+}
+
 void
 axl_tcp_send_drop_sources(AxlTcp *sock)
 {
@@ -653,31 +1023,100 @@ axl_tcp_send_drop_sources(AxlTcp *sock)
         axl_loop_remove_source(sock->async_loop, sock->send_source);
         sock->send_source = 0;
     }
-    if (sock->send_cancel_source > 0) {
-        axl_loop_remove_source(sock->async_loop,
-                               sock->send_cancel_source);
-        sock->send_cancel_source = 0;
+}
+
+/* A cancellable fired on a send. Port of SockCancelToken, which handles a
+   token on either list: cancel the transport token if this send is the one on
+   the wire, then retire it with AXL_CANCELLED. Same contract as recv cancel —
+   the socket stays valid and connected. */
+static bool
+on_send_token_cancel(void *data)
+{
+    AxlTcpToken *tok  = data;
+    AxlTcp      *sock = tok->sock;
+
+    if (sock->send_active == tok) {
+        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
+                     &sock->tx_token.CompletionToken);
+        sock->send_active = NULL;
+        axl_tcp_send_drop_sources(sock);
+        tcp_send_retire(sock, tok, AXL_CANCELLED);
+        /* Without this the queue would stall: promotion otherwise only ever
+           happens from a normal completion, so cancelling the ACTIVE send left
+           every token behind it waiting for a callback that could not come. */
+        tcp_send_promote(sock);
+    } else if (tcp_send_unlink(sock, tok)) {
+        tcp_send_retire(sock, tok, AXL_CANCELLED);
     }
+    /* Neither list holds it: already retired, and its callback is queued or
+       has run. Nothing to do. */
+    return AXL_SOURCE_REMOVE;
 }
 
 bool
-axl_tcp_send_in_flight(const AxlTcp *sock)
+axl_tcp_send_drop_token(AxlTcp *sock, AxlTcpCallback cb, void *cb_data)
 {
-    return sock != NULL && sock->send_source > 0;
+    AxlTcpToken *tok = sock->send_active;
+
+    /* On the wire: cancel the transport token and start the next send — the
+       same sequence a cancellable takes, minus the callback. */
+    if (tok != NULL && tok->cb == cb && tok->cb_data == cb_data) {
+        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
+                     &sock->tx_token.CompletionToken);
+        sock->send_active = NULL;
+        axl_tcp_send_drop_sources(sock);
+        tcp_send_free_token(tok);
+        tcp_send_promote(sock);
+        return true;
+    }
+    for (tok = sock->send_queued_head; tok != NULL; tok = tok->next) {
+        if (tok->cb == cb && tok->cb_data == cb_data) {
+            (void)tcp_send_unlink(sock, tok);
+            tcp_send_free_token(tok);
+            return true;
+        }
+    }
+    /* Retired but not yet delivered — the completion was dispatched and the
+       loop stopped before its callback came up. Same dead context, same
+       treatment; freeing the token cancels the delivery it had scheduled. */
+    for (tok = sock->send_done_head; tok != NULL; tok = tok->next) {
+        if (tok->cb == cb && tok->cb_data == cb_data) {
+            (void)tcp_send_done_unlink(sock, tok);
+            tcp_send_free_token(tok);
+            return true;
+        }
+    }
+    return false;
 }
 
-static bool
-on_send_cancel(void *data)
+void
+axl_tcp_send_flush(AxlTcp *sock, AxlStatus status)
 {
-    AxlTcp         *sock  = data;
-    AxlTcpCallback  cb    = sock->on_send;
-    void           *udata = sock->send_data;
+    AxlTcpToken *tok = sock->send_active;
 
-    axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                 &sock->tx_token.CompletionToken);
-    axl_tcp_send_drop_sources(sock);
-    cb(sock, AXL_CANCELLED, udata);  /* cancel is terminal; return value ignored */
-    return AXL_SOURCE_REMOVE;
+    /* PARK rather than retire: these callbacks are delivered below, in this
+       call, so scheduling each on its loop first would only mean cancelling it
+       again a line later — and on a socket with a deep queue that is a burst of
+       defer-ring churn for nothing.
+
+       The ACTIVE send first — FIFO, it was accepted before everything queued
+       behind it. Its transport token is cancelled by the caller. */
+    if (tok != NULL) {
+        sock->send_active = NULL;
+        tcp_send_park(sock, tok, status);
+    }
+    while ((tok = tcp_send_dequeue(sock)) != NULL) {
+        tcp_send_park(sock, tok, status);
+    }
+
+    /* One pass covers everything: no callback delivered here can add another
+       retirement, because the socket is already marked closed and a send from
+       one of them is refused rather than accepted.
+
+       `sock` is still alive on return — the only close a callback could have
+       triggered is a nested one, which returns without finalizing (see
+       tcp_close_impl). */
+    axl_tcp_send_drain_done(sock);
 }
 
 int
@@ -691,89 +1130,50 @@ axl_tcp_send_async(
     void           *data
     )
 {
-    EFI_STATUS  status;
-    EFI_EVENT   tx_event;
+    size_t queued_before;
 
     if (sock == NULL || buf == NULL || size == 0 || loop == NULL || cb == NULL) {
         return AXL_ERR;
     }
-
-    //
-    // Reject preemption: if a send is already pending, the caller
-    // must cancel it (via the AxlCancellable passed to the original
-    // send, or via axl_tcp_close) and wait for the cancel callback
-    // to fire before starting a new send. Firing the old callback
-    // inline here was UAF-prone: old_cb could call axl_tcp_close,
-    // freeing sock before the subsequent `sock->on_send = cb`
-    // assignment.
-    //
-    if (sock->send_source > 0) {
-        /* One-send-in-flight: a prior send hasn't completed. Distinct AXL_BUSY
-           (not AXL_ERR) so a caller serializing its own sends can re-queue and
-           retry rather than treat it as a hard failure — symmetric with
-           axl_tls_write_async's floor. (All current callers test != AXL_OK, so
-           this is a strict refinement.) */
-        axl_debug("async send: previous send still pending - caller must serialize");
-        return AXL_BUSY;
-    }
-
-    sock->on_send    = cb;
-    sock->send_data  = data;
-    sock->async_loop = loop;
-
-    /* Chunk-chain state: the send is submitted as bounded Transmits (see
-       tcp_send_arm_chunk / on_send_complete). The caller's buffer is borrowed
-       until the whole send completes — the same lifetime the single-Transmit
-       path already required. */
-    sock->send_ptr   = (const uint8_t *)buf;
-    sock->send_total = size;
-    sock->send_off   = 0;
-
-    //
-    // Create the send event if not already created
-    //
-    if (sock->tx_token.CompletionToken.Event == NULL) {
-        tx_event = NULL;
-        if (axl_backend_event_create((AxlEventHandle *)&tx_event) != AXL_OK) {
-            axl_error("async send: cannot create event");
-            return AXL_ERR;
-        }
-
-        sock->tx_token.CompletionToken.Event = tx_event;
-    }
-
-    //
-    // Submit the first (possibly only) chunk. tcp_send_arm_chunk sets up
-    // tx_frag/tx_data/tx_token, clears any stale event signal, and Transmits.
-    //
-    status = tcp_send_arm_chunk(sock);
-    if (EFI_ERROR(status)) {
-        axl_debug("async Transmit: %llx", (unsigned long long)status);
+    /* Refuse rather than arm firmware state this socket has already released.
+       Reachable from a callback the teardown itself fired. */
+    if (sock->closed) {
         return AXL_ERR;
     }
 
-    sock->send_source = axl_loop_add_event(
-        loop,
-        (void *)sock->tx_token.CompletionToken.Event,
-        on_send_complete,
-        sock
-        );
-    if (sock->send_source == 0) {
-        axl_error("async send: cannot register event with loop");
-        axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
-                     &sock->tx_token.CompletionToken);
+    /* ACCEPTED, never refused. Port of EDK2 SockSend (SockInterface.c: "process
+       this sending token now or buffer it only?"), which below low-water
+       buffers into SndTokenList and returns EFI_SUCCESS — its only failure is
+       EFI_OUT_OF_RESOURCES from the token allocation. So every send is queued
+       and then offered to the transport: if the slot is free this promotes
+       straight through and Transmits before returning, and if it is not, these
+       bytes wait their turn behind the sends accepted before them.
+
+       An earlier cut of this returned AXL_BUSY at high-water. That single
+       deviation is what kept AXL_BUSY handling alive everywhere above:
+       axl_tls_write_async needed a capacity floor before encrypting, the WS
+       layer needed a buffer-on-refusal path, and the four submit sites in
+       axl-http-response.c had to interpret a status they got wrong (§1a). Not
+       refusing at all deletes that whole class of caller complexity, which is
+       the point of the design. docs/AXL-Tcp-Queue-Design.md §3.2. */
+    queued_before = sock->send_queued_bytes;
+    if (tcp_send_enqueue(sock, buf, size, loop, cancel, cb, data) != AXL_OK) {
         return AXL_ERR;
     }
+    tcp_send_promote(sock);
 
-    if (cancel != NULL) {
-        sock->send_cancel_source = axl_loop_add_event(
-            loop,
-            _axl_cancellable_event(cancel),
-            on_send_cancel,
-            sock
-            );
+    /* The queue is unbounded by design (§3.2), so nothing above fails for
+       depth — but a queue growing without limit means the peer is not
+       draining, and that is worth seeing rather than discovering as memory
+       pressure. Measured AFTER the promotion, so a send that went straight to
+       the wire never counts; logged once per crossing, not per send. */
+    if (sock->send_queued_bytes >= TCP_SEND_QUEUE_WARN_BYTES &&
+        queued_before < TCP_SEND_QUEUE_WARN_BYTES) {
+        axl_warning("async send: outbound queue past %u KiB (%zu bytes, peer "
+                    "not draining)",
+                    TCP_SEND_QUEUE_WARN_BYTES / 1024u,
+                    sock->send_queued_bytes);
     }
-
     return AXL_OK;
 }
 

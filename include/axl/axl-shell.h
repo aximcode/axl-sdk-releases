@@ -158,7 +158,7 @@ axl_shell_locate(void);
 /**
  * @brief Every place a real UEFI Shell is available, reported independently.
  *
- * The richer companion to @ref AxlShellSource: where that enum collapses to
+ * The richer companion to @ref AxlShellSource "AxlShellSource": where that enum collapses to
  * a single file-first verdict — a locatable `Shell.efi` file *masks* the
  * firmware-embedded Shell entirely — this reports each source on its own, so
  * a consumer with an FV-first policy (launch the firmware Shell by default,

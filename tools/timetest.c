@@ -29,9 +29,11 @@ run_timetest(AxlArgs *a)
     axl_printf("Calibration: first call = %llu us, second call = %llu us\n",
                (unsigned long long)t0, (unsigned long long)t1);
 
-    /* Capture deltas across known sleeps. axl_msleep takes ms and
-       calls gBS->Stall(ms*1000) under the hood, so the measured
-       delta should be very close to the requested interval. */
+    /* Capture deltas across known sleeps. axl_msleep is event-driven, not a
+       busy-wait: it goes through axl_wait_ms -> a one-shot timer source on a
+       private AxlLoop, so the CPU idles for the duration. The measured delta
+       should still be very close to the requested interval, but it is bounded
+       below by the firmware timer's granularity rather than by a spin. */
     struct {
         unsigned ms;
         const char *label;

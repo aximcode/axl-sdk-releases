@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-compress.h:
+/** @file axl-compress.h
  *
  * AxlCompress — DEFLATE-family compression (RFC 1951) with gzip
  * (RFC 1952) and zlib (RFC 1950) framing. Backed by a vendored
@@ -137,8 +136,18 @@ axl_decompress(
  * is finalized/closed. Composes with anything — a file stream, an
  * in-memory buffer (axl_bufopen), a tar writer's backing stream.
  *
+ * **@p sink must be at AXL_ENC_UTF8**, the default; any other setting is
+ * refused with NULL. A compressed stream is binary, and a sink that
+ * transcodes would rewrite it code point by code point into an archive that
+ * no decompressor can read — while every call still reported success. This is
+ * the filter rule stated at axl_stream_set_encoding(); set the encoding on
+ * whatever your own code reads back, never on a filter's peer. The check is
+ * repeated when the writer finalizes, because that is when the sink is
+ * actually written and the setting may have changed since.
+ *
  * @return a write stream (free with axl_fclose), or NULL on bad
- *     arguments or allocation failure.
+ *     arguments, a @p sink that is not at AXL_ENC_UTF8, or allocation
+ *     failure.
  */
 AxlStream *
 axl_compress_writer(
@@ -151,13 +160,24 @@ axl_compress_writer(
  * @brief Finalize a compressing writer: compress everything written so
  *        far and emit the framed stream to its sink.
  *
- * Idempotent — a second call is a no-op that returns the same status.
+ * Idempotent ONCE IT HAS RUN: after a success, or after a compression or
+ * sink-write failure, a second call is a no-op returning the same status.
+ * A refusal caused by the sink's ENCODING is the exception and is not
+ * latched — nothing was emitted and nothing was consumed, so the writer
+ * stays open, still accepts writes, and finalizes normally once the sink is
+ * put back at AXL_ENC_UTF8. That mirrors the live (unlatched) check
+ * axl_text_stream_wrap() applies to the same mistake.
+ *
  * axl_fclose() calls this implicitly if it wasn't called explicitly,
  * but only an explicit call can report a compression or sink-write
- * failure to the caller.
+ * failure to the caller — and that now includes losing the WHOLE payload
+ * when the sink is transcoding: the implicit finalize refuses, and
+ * axl_fclose() returns void, so a caller that only closes gets no archive
+ * and no signal. Finalize explicitly if that matters.
  *
  * @return AXL_OK on success; AXL_ERR if @p s is not a compressing
- *     writer, or on compression / sink-write failure.
+ *     writer, if its sink has since been given an encoding (see
+ *     axl_compress_writer), or on compression / sink-write failure.
  */
 int
 axl_compress_writer_finish(
@@ -175,8 +195,20 @@ axl_compress_writer_finish(
  * @p src is borrowed and read to EOF but not closed — the caller still
  * owns and closes it.
  *
+ * **@p src must be at AXL_ENC_UTF8**, the default; any other setting is
+ * refused with NULL, before @p src is read at all — which is what separates
+ * a refusal from "drained it, transcoded it into rubble and failed to decode
+ * it". The mirror of the axl_compress_writer() rule: a source that
+ * transcodes hands this function decoded text where compressed bytes should
+ * be, and the decode failure that follows says nothing about the real cause.
+ * There is no exemption for a text wrapper here, unlike
+ * axl_text_stream_wrap(): a compressed stream is not text, so a wrapper that
+ * settled on UCS-2 is refused like any other decoder.
+ * @see axl_stream_set_encoding
+ *
  * @return a read stream over the plaintext (free with axl_fclose), or
- *     NULL on a decode error or allocation failure.
+ *     NULL on a @p src that is not at AXL_ENC_UTF8, a decode error, or
+ *     allocation failure.
  */
 AxlStream *
 axl_compress_reader(

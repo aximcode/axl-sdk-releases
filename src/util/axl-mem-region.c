@@ -109,10 +109,26 @@ classify_gcd(EFI_GCD_MEMORY_TYPE type)
 
 // Allocate + fill an interval array from the EFI memory map. Returns the
 // interval count via *out_n (0 on failure); caller frees *out_iv.
-static MemIv *
-collect_efi(size_t *out_n)
+/* The two-call GetMemoryMap dance, in ONE place.
+ *
+ * Both consumers of the firmware map need it -- the classified region view
+ * below and the raw snapshot at the end of this file -- and each of the two
+ * calls is a raw firmware touchpoint the dogfood gate enumerates. A second
+ * copy would double that count for no reason and give the two views separate
+ * chances to drift on the slack, the stride or the error handling.
+ *
+ * On success returns the descriptor buffer (caller axl_free()s it) and sets
+ * *out_size / *out_desc; returns NULL on any failure.
+ */
+static uint8_t *
+fetch_efi_memory_map(
+    size_t *out_size,
+    size_t *out_desc
+    )
 {
-    *out_n = 0;
+    *out_size = 0;
+    *out_desc = 0;
+
     size_t map_size = 0, map_key = 0, desc_size = 0;
     UINT32 desc_ver = 0;
     EFI_STATUS s = axl_bs()->GetMemoryMap(&map_size, NULL, &map_key,
@@ -120,7 +136,9 @@ collect_efi(size_t *out_n)
     if (s != EFI_BUFFER_TOO_SMALL || desc_size == 0) {
         return NULL;
     }
-    map_size += desc_size * 8;   /* slack for growth across the two calls */
+    /* Slack: allocating below perturbs the very map just measured, so the
+       second call can legitimately need more room than the first reported. */
+    map_size += desc_size * 8;
     uint8_t *map = axl_malloc(map_size);
     if (map == NULL) {
         return NULL;
@@ -129,6 +147,20 @@ collect_efi(size_t *out_n)
                                &map_key, &desc_size, &desc_ver);
     if (EFI_ERROR(s)) {
         axl_free(map);
+        return NULL;
+    }
+    *out_size = map_size;
+    *out_desc = desc_size;
+    return map;
+}
+
+static MemIv *
+collect_efi(size_t *out_n)
+{
+    *out_n = 0;
+    size_t map_size = 0, desc_size = 0;
+    uint8_t *map = fetch_efi_memory_map(&map_size, &desc_size);
+    if (map == NULL) {
         return NULL;
     }
     size_t n = map_size / desc_size;
@@ -805,4 +837,100 @@ axl_io_write_range(uintptr_t port, size_t len, const void *buf,
     (void)port; (void)len; (void)buf; (void)access_width;
     return AXL_ERR;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Raw firmware memory map (uncoalesced, unclassified)
+// ---------------------------------------------------------------------------
+
+/* Spec order, indexed by EFI_MEMORY_TYPE. The strings are the UEFI
+   enumerator minus its "Efi" prefix -- that spelling is what an EDK2
+   oracle emits, and a consumer doing byte-parity against one has no
+   latitude here. */
+static const char * const g_efi_mem_type_names[] = {
+    "ReservedMemoryType",       /*  0 */
+    "LoaderCode",               /*  1 */
+    "LoaderData",               /*  2 */
+    "BootServicesCode",         /*  3 */
+    "BootServicesData",         /*  4 */
+    "RuntimeServicesCode",      /*  5 */
+    "RuntimeServicesData",      /*  6 */
+    "ConventionalMemory",       /*  7 */
+    "UnusableMemory",           /*  8 */
+    "ACPIReclaimMemory",        /*  9 */
+    "ACPIMemoryNVS",            /* 10 */
+    "MemoryMappedIO",           /* 11 */
+    "MemoryMappedIOPortSpace",  /* 12 */
+    "PalCode",                  /* 13 */
+    "PersistentMemory",         /* 14 */
+    "UnacceptedMemoryType",     /* 15 */
+};
+
+const char *
+axl_memmap_type_name(
+    uint32_t type
+    )
+{
+    if (type < (sizeof(g_efi_mem_type_names) / sizeof(g_efi_mem_type_names[0]))) {
+        return g_efi_mem_type_names[type];
+    }
+    /* Firmware may define OEM types from 0x70000000 and OS types from
+       0x80000000. Naming them is not this function's business, but
+       indexing the table with one would be a read off the end. */
+    return "Unknown";
+}
+
+int
+axl_memmap_snapshot(
+    AxlMemMapEntry **entries,
+    size_t          *count
+    )
+{
+    if (entries != NULL) {
+        *entries = NULL;
+    }
+    if (count != NULL) {
+        *count = 0;
+    }
+    if (entries == NULL || count == NULL) {
+        return AXL_INVALID;
+    }
+
+    size_t map_size = 0, desc_size = 0;
+    uint8_t *map = fetch_efi_memory_map(&map_size, &desc_size);
+    if (map == NULL) {
+        return AXL_ERR;
+    }
+
+    size_t n = map_size / desc_size;
+    if (n == 0) {
+        axl_free(map);
+        return AXL_ERR;          /* a machine with no memory map is a failure */
+    }
+
+    AxlMemMapEntry *out = axl_calloc(n, sizeof(*out));
+    if (out == NULL) {
+        axl_free(map);
+        return AXL_NO_RESOURCES;
+    }
+
+    /* Stride by desc_size, never sizeof(EFI_MEMORY_DESCRIPTOR): the
+       firmware is free to report a LARGER descriptor than this build's
+       struct, and indexing as an array would then walk misaligned.
+       Zero-page descriptors are kept -- this is the raw map, and
+       dropping entries would change the count a consumer compares
+       against an oracle. */
+    for (size_t i = 0; i < n; i++) {
+        EFI_MEMORY_DESCRIPTOR *d =
+            (EFI_MEMORY_DESCRIPTOR *)(map + i * desc_size);
+        out[i].type            = (uint32_t)d->Type;
+        out[i].physical_start  = d->PhysicalStart;
+        out[i].number_of_pages = d->NumberOfPages;
+        out[i].attribute       = d->Attribute;
+    }
+
+    axl_free(map);
+    *entries = out;
+    *count   = n;
+    return AXL_OK;
 }

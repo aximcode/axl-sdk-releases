@@ -48,6 +48,43 @@ axl_serial_read(s, buf, sizeof buf, &got);   // non-blocking; got may be 0
 axl_serial_close(s);
 ```
 
+### One UART, one owner
+
+`axl_serial_open` is **exclusive**: while this image holds a port, a second
+open of the same handle returns `AXL_BUSY` and leaves the out-param NULL.
+
+That is not fussiness about interleaved output. The wrapper is a thin skin
+over one `EFI_SERIAL_IO_PROTOCOL*`, so two subsystems each holding "a port"
+that is the same UART share firmware state — and whichever one calls
+`axl_driver_disconnect_handle` first detaches the port's drivers underneath a
+protocol pointer the other is still writing through. That is a
+use-after-detach, and before this it happened silently.
+
+Sharing is available, but has to be asked for by name:
+
+```c
+if (axl_serial_open(h, &s) == AXL_BUSY) { /* someone else owns it */ }
+
+axl_serial_open_shared(h, &s);   // coexists with other SHARED opens only
+bool taken = axl_serial_is_open(h);
+```
+
+Sharing is all-or-nothing per port, decided by the first open: an exclusive
+holder refuses everyone, and a shared holder refuses an exclusive claim.
+Prefer acting on `AXL_BUSY` over asking `axl_serial_is_open` first — a check
+followed by an open is two steps, and the answer can go stale between them.
+
+**Scope is this image.** The claim lives in the library's static state, so it
+cannot see a port another loaded image has open. It resolves collisions
+between subsystems of one program, which is where they are both most likely
+and least visible.
+
+`axl_serial_handle(s)` returns the handle a port was opened from, so the
+handle-taking queries (`axl_serial_get_mode`, `axl_serial_get_control`) are
+reachable from an open port alone — which a read-modify-write of one line
+setting needs, since `axl_serial_set_mode` takes the whole struct and reads a
+zero field as "device default".
+
 `EFI_SERIAL_IO` exposes no receive event, so for loop-driven input
 `axl_serial_read_async(s, loop, poll_ms, cb, user)` registers a timer
 that drains the port each tick and calls `cb` with whatever arrived

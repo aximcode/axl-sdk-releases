@@ -245,7 +245,7 @@ in DEBUG builds). RELEASE builds have only the size header for realloc.
 | Alloc fill | `0xDA` | Expose use-before-init |
 | Free fill | `0xDF` | Expose use-after-free |
 | File/line tracking | `__FILE__`, `__LINE__` via macros | Pinpoint leak and corruption sources |
-| Leak report | `axl_mem_dump_leaks()` | Log all unfreed with file:line |
+| Leak report | `axl_mem_dump_leaks()` (diagnostic, headed `(live allocations)`) / `_axl_mem_dump_leaks_at_exit()` (teardown verdict, gated on by the QEMU harness) | Log all unfreed with file:line |
 | Fence validation | `axl_mem_check(ptr)` | Validate a pointer's fence-posts on demand |
 | Stats | `axl_mem_get_stats()` | Live count/bytes + lifetime totals |
 

@@ -17,6 +17,195 @@ Legend: `[x]` done · `[-]` in progress · `[ ]` pending.
 Library / SDK foundations:
 - [AXL-Design.md](AXL-Design.md) — library design (phases, API spec, style)
 - [AXL-SDK-Design.md](AXL-SDK-Design.md) — SDK (toolchain, packaging)
+- [AXL-Cxx-Stdlib-Handoff.md](AXL-Cxx-Stdlib-Handoff.md) — **DONE 2026-08-06.**
+  `axl-c++ --hosted` ships, and `std::vector` / `std::string` / `std::map` /
+  `std::unordered_map` run under UEFI on both arches
+  (`test/integration/test-cxx-hosted-qemu.sh`). **§8's distribution question
+  CLOSED 2026-08-08: the SDK is self-contained and links no `libstdc++.a` at
+  all.** `--hosted` was pulling exactly two members (`tree.o`,
+  `hash_bytes.o`); `src/runtime/axl-cxx-rbtree.cpp` and `axl-cxx-hash.cpp`
+  supply those eleven functions clean-room under Apache-2.0, so the one act
+  the GCC Runtime Library Exception does not cover — redistributing the
+  runtime library — simply does not arise. `-frtti` remains the exception and
+  links the consumer's own installed archive.
+
+  **Not the same as "everything links"**, and the first commit message said
+  "eleven functions were the whole gap", which was wrong. `std::list` and
+  `shared_ptr`/`make_shared` still do not link — pre-existing, not
+  regressions, and now one clean undefined symbol instead of an `_Unwind_*`
+  cascade. Surveyed in AXL-Cxx-Stdlib-Surface.md §3b.
+
+  `axl_rb_check_invariants()` / `axl_rb_black_height()` joined the public
+  RB-tree API on the way: every RB test verified the tree by in-order walk,
+  which proves SORTED and says nothing about BALANCED, so a tree degenerated
+  into a list passed them all. Sabotage confirmed the gap was real — dropping
+  one recolour in the erase fixup leaves `std::map` answering every query
+  correctly while the structure is gone
+- **FIXED 2026-08-06 (aa64 relocation split).** An aa64 link producing BOTH a
+  linker-synthesized `.rela.dyn` and the script-placed `.rela` at
+  non-contiguous addresses was mis-relocated at boot: `DT_RELA` pointed at the
+  first, `DT_RELASZ` counted both, and the crt0 walk ran off the end and
+  applied the following bytes as relocations. Naming the output section
+  `.rela.dyn` makes ld absorb its own internal section instead of orphaning
+  it. `make check-reloc-coverage` is the standing guard, and RTTI now runs on
+  both arches
+- [AXL-Cxx-Streams-Handoff.md](AXL-Cxx-Streams-Handoff.md) — **DONE 2026-08-07.**
+  `axl::cout` / `axl::cin` / `axl::cerr` over `axl_printf` / `axl_readline`,
+  plus **`axl::string`** — which the handoff did not anticipate. `std::`
+  iostreams are out (measured: links, then #PF on a never-constructed
+  `std::cout`), and the `axl::` spelling mirrors `std::` because `axl::err` is
+  already taken. The `>>` failure model settled on BOTH paths over one sticky
+  state: `if (!axl::cin)` for the chained form, `read<T>() -> axl::result<T>`
+  for the checked one, with `read<T>()` setting the same bit so a loop over an
+  overflowing token terminates. 75 assertions on each arch
+  (`test/integration/test-cxx-streams-qemu.sh`).
+
+  `axl::string` exists because the handoff's premise held only half: `<string>`
+  is gated behind `bits/requires_hosted.h`, so the FREESTANDING configuration
+  the whole layer targets has no owning string for `>>` to fill. It carries
+  `std::string`'s interface and forwards the search family to
+  `std::string_view` (freestanding, so those are libstdc++'s own algorithms). This reverses one sentence in `axl-cxx.hpp`'s file docs, which
+  said there should never be an `axl::string` — true on `--hosted`, and the
+  header now says which half applies where.
+
+  **`axl::string` re-shaped 2026-08-08.** It shipped as a skin over
+  `AxlString`, which `AXL-Cxx-Design.md` §4.5 had already measured and
+  rejected ("GO for the structure, NO-GO for the skin") — I had not read that
+  section before choosing the shape. Now standalone with a 23-byte
+  small-string optimisation, sized so `\EFI\BOOT\BOOTX64.EFI` stays inline.
+  Same benchmark before and after on one box, N=200000: ctor 33279 -> 4790 us
+  (6.9x), copy 31120 -> 3324 us (9.4x). `AxlString` keeps the streaming-builder
+  job §4.5 measured it tied on.
+
+  The staged pre-commit review found **13 further bugs against a green
+  suite** — four of them regressions this work introduced. Chief among them:
+  fixing the `grow()` spin made the buffer-less paths SUCCEED where they had
+  hung, but nothing wrote the terminator into that first allocation, turning a
+  hang into a silent heap overread across `reserve()` and all three
+  `prepend` variants. Full account in the handoff's §6b.
+
+  Four latent bugs surfaced on the way and are fixed here: `axl_string_steal()`
+  followed by any append **spun forever** (`grow()` sized the replacement by
+  doubling a capacity the steal had set to 0); `len + need + 1` could wrap and
+  let `grow()` "succeed" without resizing; `s += s.str()` read the buffer
+  `grow()` had just reallocated; and **`CXXFLAGS` carried no `-MD -MP`**, so no
+  `.cpp` object had ever had a header dependency — editing any `.hpp` rebuilt
+  nothing, which made a sabotage of `axl-istream.hpp` read as UNDETECTED
+- [AXL-Cxx-Unwinder-U1-Handoff.md](AXL-Cxx-Unwinder-U1-Handoff.md) — session
+  handoff from the C++ arc: repo state, what shipped, and the traps.
+  **Its "U1 is BLOCKED on the exceptions decision" framing is superseded** —
+  the decision was taken 2026-08-10 (YES, with the C-boundary invariant);
+  see `AXL-Cxx-Unwinder-Design.md` §2-RESULT
+- [AXL-Cxx-Toolchain-Handoff.md](AXL-Cxx-Toolchain-Handoff.md) — **START
+  HERE for the C++ toolchain work. WORKING 2026-08-10, 7 commits
+  unpushed.** Real `try`/`catch` plus `std::vector`/`string`/`map` and
+  `<stdexcept>` run under UEFI on BOTH arches, 7/7 under QEMU, with no
+  host packages, no vendored runtime and no hand-written ABI layer. The
+  fix was not a runtime: it was building an `x86_64-elf` **bare-metal
+  toolchain** (`toolchain/`) so x64 matches what aa64 already had from
+  ARM. Everything that failed did so because x64 was borrowing the
+  host's glibc-targeted g++, whose libsupc++ keeps `__cxa_eh_globals` in
+  `__thread` storage and reads a stack canary from `%fs:0x28` — neither
+  of which UEFI provides. **Nothing is wired into the build yet**, and
+  `AXL-Cxx-Design.md` §6a-PLAN's "T2 BLOCKED" is now stale
+
+- [AXL-Newlib-Investigation.md](AXL-Newlib-Investigation.md) — **the
+  MEASUREMENTS behind the direction above; its "NOT SCHEDULED" status and its
+  `_sbrk` blocker are both superseded by AXL-Libc-Substrate-Design.md.**
+  Originally recorded because the option surfaced while solving the C++
+  exception problem. Newlib as the libc substrate with the GLib-shaped
+  `axl_*` API layered on top: the API identity and the substrate are
+  orthogonal. Licence verified permissive (BSD-family, Red Hat + UC
+  Regents, no copyleft). The libgloss port is 35 hooks, and nine of them
+  are file operations `src/fs/axl-fs.c` already implements against the
+  same `EFI_FILE_PROTOCOL`. **The blocker is `_sbrk`**: a linear-heap
+  model against `AllocatePool` would carve a fixed arena, making the
+  firmware's memory map inaccurate and costing the allocator
+  instrumentation the leak gate depends on. So the question worth spiking
+  is newlib-minus-malloc. Already proven in passing: newlib's HEADERS
+  plus AXL's implementations ran containers and exceptions 7/7 on aa64.
+  **That `_sbrk` objection is answered by inverting the allocator** rather
+  than bridging to it — see the design doc — and newlib-minus-malloc is no
+  longer merely "worth spiking": `src/cxxrt/` is a working instance of it
+
+- [AXL-Libc-Substrate-Design.md](AXL-Libc-Substrate-Design.md) — **DIRECTION
+  AGREED 2026-08-11.** `axl_*` sits on newlib the way GLib sits on libc, with
+  the ALLOCATOR inverted rather than replaced: AXL's allocator keeps its
+  implementation and takes the STANDARD NAMES, so `malloc` is AXL's over
+  `AllocatePool` and `axl_malloc` is the same allocator plus call-site
+  attribution. That removes `_sbrk` from the picture entirely, which is what
+  `AXL-Newlib-Investigation.md` §4 called the blocker — no carved arena, the
+  firmware's memory map stays accurate, and the leak gate keeps working. It
+  also makes third-party allocations (mbedtls, lzma, stb, newlib) tracked for
+  the first time. `src/cxxrt/` is already the first working instance.
+  **OPEN:** does newlib's `printf` reintroduce the Log -> Data cycle AxlFormat
+  exists to break? That measurement decides how deep the substrate goes
+- [AXL-Cxx-Unwinder-Design.md](AXL-Cxx-Unwinder-Design.md) — **U0 DONE 2026-08-09.**
+  Tier 2 (the unwinder) reframed by measurement: our own `-fno-exceptions`
+  objects reference **zero** `_Unwind_*` symbols, so three of the four things
+  the tier claims to unblock need no unwinder at all. `std::list` + `sort` +
+  `reverse` is already **proven running under QEMU** against five clean-room
+  `_List_node_base` functions with no `libstdc++.a` — the same pattern as
+  `tree.o`/`hash_bytes.o`. Phase U0 finishes that and is worth doing
+  regardless. The actual unwinder is TWO libraries (level 1 `_Unwind_*` plus
+  level 2 `__cxa_*`/personality), and it reverses `axl-cxx.hpp`'s
+  "`-fno-exceptions` is not negotiable" — a decision before it is a project.
+  **§2 DECIDED YES 2026-08-10; U1 SUPERSEDED 2026-08-10.** Neither library is
+  vendored nor written: a bare-metal `x86_64-elf` toolchain supplies both
+  levels, matching what aa64 already had from ARM, and real `try`/`catch` plus
+  `std::vector`/`string`/`map` now run **7/7 under QEMU on both arches**.
+  `deps/libunwind`, `src/cxxabi/` and `check-cxxabi-oracle` were removed as
+  the level-2 track they served is cancelled. **PENDING:** none of it is wired
+  into `axl-cc`/`axl-c++` or the Makefile — the runs were hand-linked — and a
+  libstdc++ emergency-pool leak must be cleared before it can ship, because
+  the leak gate is a hard gate. See
+  [AXL-Cxx-Toolchain-Handoff.md](AXL-Cxx-Toolchain-Handoff.md)
+- [AXL-Cxx-Stdlib-Surface.md](AXL-Cxx-Stdlib-Surface.md) — **measured**
+  table of which STL facilities work freestanding, which need
+  `--hosted`, which are opt-in (`-frtti`), and what the remaining "no"s
+  would actually cost — in symbols, not adjectives. Four tiers, only one
+  of which is a real wall (glibc's locale subsystem)
+- [AXL-Cxx-Design.md](AXL-Cxx-Design.md) — **C0 + C1 SHIPPED 2026-08-06.** The
+  layer writes neither containers nor algorithms: the standard supplies both,
+  and what AXL supplies underneath them is `operator new`/`delete` over
+  `axl_malloc`, the five `std::__throw_*` entry points `-fno-exceptions` calls
+  instead of throwing, a `ceil` shim (x64 only — aa64 folds it to `frintp`),
+  its own `_Prime_rehash_policy` so `std::unordered_map` links without an
+  AVX-carrying archive member, and `axl::arena_allocator` for paths that must
+  not halt on OOM. §4's spikes of which C structures to
+  build ON versus BESIDE stand as the reasoning that got there: `AxlHashTable` skins at
+  measured parity, `AxlTree` loses 1.4x on lookup to a templated AVL, and an
+  `AxlArray` skin is memory-UNSAFE for non-trivial `T` (demonstrated
+  use-after-free), and an `AxlString` skin loses 9x on short-string
+  construct/copy because it cannot express inline storage. Three no-go
+  verdicts, three different reasons, none predicting the others
+- [AXL-Distribution-Design.md](AXL-Distribution-Design.md) — DRAFT: how the SDK is
+  packaged, installed, discovered and version-pinned; the missing tarball and
+  CMake toolchain file; consuming an unreleased checkout
+- [AXL-Float-Conversion-Design.md](AXL-Float-Conversion-Design.md) — IMPLEMENTED 2026-07-31
+  (21 commits on `3be79c4a`): correctly-rounded string <-> double, the integer reverse,
+  `%f/%e/%g` in `axl_sscanf`, and one truncation convention across the renderers ·
+  [AXL-Float-Conversion-Plan.md](AXL-Float-Conversion-Plan.md) — the implementation plan
+- [AXL-Stream-Backend-Design.md](AXL-Stream-Backend-Design.md) — IMPLEMENTED 2026-07-31:
+  AxlStream opened to consumer-supplied backends (`AxlStreamOps` +
+  `axl_stream_open_custom`), capability queries, and the sink-boundary fault
+  injection that reaches its backend-error paths. §8b landed on top: the Layer-2
+  helpers loop over short transfers, positional I/O sets `err`, and `axl_fclose`
+  stopped trying to free the static console streams. §11 migrated `axl_bufopen`
+  onto the public constructor and §12 closed the last gap with
+  `axl_stream_ctx` — a consumer can now build a stream-keyed accessor, and
+  `axl-stream-buf.c` no longer includes any private header. §13 finished the
+  job: `axl_fopen`, `axl_text_stream_wrap` and `axl_compress_writer` are built
+  through the public constructor too, so nothing fills `struct AxlStream`
+  directly except the static console streams. §14 closed the one gap §13
+  recorded — a wrapper reading below its source's transcode — with **no new
+  public API**: filters require their peer at `AXL_ENC_UTF8`, where the public
+  `axl_read`/`axl_write` ARE the wire calls, and refuse anything else. The
+  private header now exports nothing and has one consumer, and the same rule
+  fixed two live corruption bugs in the compress filters
+- [AXL-AP-Worker-Pool-Handoff.md](AXL-AP-Worker-Pool-Handoff.md) — HANDOFF: per-core
+  XCR0/AVX enable on APs, and the arch-divergent StartupAllAPs semantics a persistent
+  AP worker pool runs into (from NightRun's MP-Services bring-up)
 - [AXL-Native-Backend-Design.md](AXL-Native-Backend-Design.md) — the native UEFI backend / CRT0
 - [AXL-Coding-Style.md](AXL-Coding-Style.md) · [AXL-Lifecycle.md](AXL-Lifecycle.md) · [AXL-Concurrency.md](AXL-Concurrency.md)
 - [AXLMM-Design.md](AXLMM-Design.md) — C++ (`libaxl-cxx`) bindings plan
@@ -28,7 +217,42 @@ Library / SDK foundations:
 Subsystems:
 - Drivers: [AXL-Driver-Authoring-Design.md](AXL-Driver-Authoring-Design.md) · [AXL-Driver-Authoring-Guide.md](AXL-Driver-Authoring-Guide.md) · [AXL-Shared-Driver-Recipe.md](AXL-Shared-Driver-Recipe.md) · [AXL-Network-Driver-Bundle-Design.md](AXL-Network-Driver-Bundle-Design.md)
 - Graphics / UI: [AXL-Compositor-Design.md](AXL-Compositor-Design.md) · [AXL-Pointer-Cursor-Design.md](AXL-Pointer-Cursor-Design.md) · [AXL-Display-Design.md](AXL-Display-Design.md) · [AXL-Transform-Design.md](AXL-Transform-Design.md) · [AXL-Rich-UI-Plan.md](AXL-Rich-UI-Plan.md)
-- Data: [AXL-PieceTree-Design.md](AXL-PieceTree-Design.md) · [AXL-RBTree-Design.md](AXL-RBTree-Design.md) · [AXL-Config-Design.md](AXL-Config-Design.md)
+- Data: [AXL-JSON-Design.md](AXL-JSON-Design.md) — JSON redesign. **All phases done except P13**:
+  one parser, `AXL_JSON_STRICT` is RFC 8259 verified against JSONTestSuite,
+  granular JSON5 dialect flags, `get_number_str` + `ALLOW_NAN_INF`. Extended
+  2026-07-29 by an API-completeness review against Jansson / JSON-GLib / yyjson
+  → **two engines, four faces** (scan and emit are the engines; whole-document
+  forms are conveniences over them), no reference counting, structured
+  `AxlJsonError`, source/sink abstraction for Jansson I/O parity, one
+  `AxlJsonType` vocabulary, and a deferred pull scanner. Execution order in the
+  doc: `\uXXXX` decode fix ✅ → P9 errors ✅ → P10 source/sink ✅ → P11 type +
+  `value_*` mirror + object iteration + public `axl_json_decode_string` ✅ →
+  P5 writer formatting ✅ → P6 `ENSURE_ASCII` + `SORT_KEYS` ✅ → P7 reader
+  `REJECT_DUPLICATES` + all three UTF-8 modes on read ✅ → P8 container-scoped
+  writer overrides ✅ → P15 `axl_json_error_format` ✅ → P14
+  `axl_json_get_double` ✅ → P12 pull scanner ✅ → P13 incremental input ✅.
+  **All phases done.** P13 landed 2026-08-03: `AxlJsonScanner` reads from a
+  pull `AxlJsonSource` through a window it owns and refills, at O(largest
+  token) rather than O(document). A token straddling a refill is re-scanned
+  from its start rather than resumed, so the five leaf scanners stay shared
+  with the contiguous path — the design doc's premise that this needed a
+  resumable sub-token state machine did not survive its own event contract
+  (decision 39). P12 landed 2026-08-02/03 in six steps — scanner over refactored leaves, a 4.1M-case
+  differential against the old parser, the writer's depth cap to 256, then the
+  whole-document face rebuilt on the scanner and the 440-line recursive-descent
+  parser DELETED. Recursion is gone from both faces, so `AXL_JSON_DEPTH` is now
+  a policy number rather than a stack budget.
+  Fuzzing of the read path was RESTORED 2026-08-02: `test/fuzz/json_fuzz` had
+  not linked for months, so ASan/LSan coverage of JSON reads was zero for the
+  whole redesign. It now builds against the real string substrate, runs a
+  matrix of read flags rather than two bare dialects, and `make check-fuzz-link`
+  (in `scripts/verify.sh`) keeps it from rotting again. Extended the same day to
+  fuzz BOTH directions with oracles (write -> re-read -> compare, and
+  plain-vs-`ENSURE_ASCII` spellings must decode alike), which immediately found
+  four real writer defects — decisions 34-36 — plus a stack over-read in
+  `axl_url_build`, which formats into a 512-byte stack buffer and then copied
+  back the length `axl_snprintf` said it WOULD have needed ·
+  [AXL-PieceTree-Design.md](AXL-PieceTree-Design.md) · [AXL-RBTree-Design.md](AXL-RBTree-Design.md) · [AXL-Config-Design.md](AXL-Config-Design.md)
 - Networking: [2026-07-19-axl-9p-design.md](superpowers/specs/2026-07-19-axl-9p-design.md) — Axl9p 9P2000.L client + server + `fsN:` mount bridge
 - Hardware fixtures / test: [AXL-Hardware-Fixture-Design.md](AXL-Hardware-Fixture-Design.md) · [HW-Testing-Workflow.md](HW-Testing-Workflow.md)
 
@@ -155,6 +379,39 @@ firmware's. **All five phases DONE** (2026-07-19 → 2026-07-22).
 Grouped, terse; **detail lives in the linked design doc or
 [ROADMAP-Archive.md](ROADMAP-Archive.md)**. Most are opportunistic / low-priority.
 
+- **Distribution & consumption model** — [AXL-Distribution-Design.md](AXL-Distribution-Design.md).
+  Package, install, discover and version-pin the SDK the way a real
+  cross-toolchain does (tarball, CMake toolchain file, build dir vs install
+  prefix), keeping the unreleased-checkout workflow first-class. **DRAFT; not
+  started, nothing decided** — scope, phasing, decisions already taken,
+  recorded blockers and six open questions all live in the design doc.
+
+- **Backdrop-blur cache: stop paying for a hit** — `blur_output_rect`
+  (`src/gfx/axl-compositor.c`) extracts the whole veil rect with a scalar
+  per-pixel loop (stride arithmetic, not a `memcpy`) and only THEN `memcmp`s it
+  against the cached source to decide the blur can be skipped. For a
+  full-screen veil that is ~8 MB extracted pixel-by-pixel plus an 8 MB compare
+  **every present**, just to discover nothing changed. A damage-derived
+  validity signal — did any damage intersect the region beneath this veil? —
+  would skip both. Note caching is disabled entirely on the partial path
+  (`cache = !c->blur_partial`), so this only bites the full-repaint path, which
+  is rarer now that consumers present damage rather than coalescing to FULL.
+  Measure before and after with `test/integration/gfx-present-bench.c`.
+
+- **Generation-tagged opaque handles for caller-held objects** — `axl_serial_close`
+  is the known case: two guards make an ordinary double-close a no-op (a closed
+  port's protocol pointer is cleared, and a pointer absent from the open-port
+  list is never freed), but neither survives the allocator recycling the
+  address. If a later `axl_serial_open` lands on the freed address, a stale
+  second close matches the NEW port, unlinks it and frees it — silently
+  releasing a live port's claim. **No check through a raw pointer can close
+  this**, because the check must dereference the very pointer whose validity is
+  in question. The fix is an opaque handle carrying an index + generation
+  counter, validated against a table, so a stale handle is detectable rather
+  than merely unlikely. Public API change; worth doing across the caller-held
+  object types together rather than one at a time. Documented as a `@warning`
+  on `axl_serial_close` until then.
+
 - **Sync→async API split — build on demand** (→ [AXL-Concurrency.md § "Extending
   the model"](AXL-Concurrency.md#extending-the-model-which-apis-go-async-and-when)):
   the net stack's sync-wraps-async shape applies to any op that blocks on
@@ -188,8 +445,36 @@ Grouped, terse; **detail lives in the linked design doc or
   gfx int-vs-void audited (defensible convention, carve-outs documented), axl-shm flags
   enum-wrapped (F), the gfx handle-family autoptr gap closed (B), and axl-port renamed to
   axl-io-port.h (guard/prefix/filename aligned). Remaining: only the consumer-repo update.
-- **Networking layering — POSIX-shaped substrate (revisit; do not build
-  speculatively):** today the real transport substrate is `AxlTcp`/`AxlUdp`
+- **AxlTcp send/receive token queues (ACTIVE):** `docs/AXL-Tcp-Queue-Design.md`.
+  Ports EDK2's socket-layer token queue so `axl_tcp_send_async` stops returning
+  `AXL_BUSY` for "a prior send is in flight" — it survives only as genuine
+  backpressure at `high_water`. Success criterion is DELETING the three ad-hoc
+  serialisation mechanisms the absence of a queue forced (WS outbound queue, the
+  `axl_tls_write_async` BUSY floor, `handshake_flush_async`'s resume).
+  Not a cleanup: the ad-hoc approach is still producing new instances of one
+  defect. `0a9f81fe` fixed the `!= AXL_OK` misclassification in
+  `handshake_flush_async`; the identical test survives at FOUR submit sites in
+  `axl-http-response.c` (`:361`, `:410`, `:616`, `:662`) and drops a healthy
+  connection whenever the TLS handshake's final write is still in flight.
+  Measured 2026-08-12: `test-https.sh`'s concurrent-handshake gate fails ~1 run
+  in 3 on an idle box (`23/24 OK (width 4)`, client `curl 56`, server
+  `rc=-10 = AXL_BUSY`). That is a FLOOR — `:361` resets with no warning, so the
+  instrumentation that produced the number cannot see it. Left unpatched
+  deliberately — a direct patch would be a FOURTH mechanism. The gate is the
+  design's own acceptance test (§6 step 2), it is RED today, and `verify.sh`
+  does not run it (only `run-integration.sh` does), so nothing in the fast loop
+  observes either the red or a later regression.
+- **Networking layering — POSIX-shaped substrate (revisit; DEFERRED to the
+  C++/newlib toolchain work, 2026-08-12):** deliberately sequenced AFTER the
+  substrate/toolchain track, which carries its own layering changes (see
+  `docs/AXL-Libc-Substrate-Design.md`) — settling both at once avoids two
+  independent refactors of the same boundary disagreeing. Explicitly NOT a
+  prerequisite for the token queues above: `AXL-Tcp-Queue-Design.md` §4 keeps
+  the queue free of new public API precisely so it does not prejudge this, and
+  the queue fixes the `AXL_BUSY` defect class that this item would not touch.
+  Original note follows.
+
+  Today the real transport substrate is `AxlTcp`/`AxlUdp`
   (async, loop/callback-driven over EFI_TCP4/UDP4) and `AxlSocket` is a *BSD-compat
   veneer alongside* the protocols — HTTP/WS/9p build on `AxlTcp` directly, the
   inverse of the POSIX "everything on sockets" layering. This is a deliberate
@@ -223,6 +508,19 @@ Grouped, terse; **detail lives in the linked design doc or
 ---
 
 ## Done / decided (one-liners, full detail in Archive)
+
+- **`AxlXml` flags adopted the `AxlJsonFlags` shape** (2026-08-04) —
+  `AxlXmlWriterFlags` + `AXL_XML_WRITER_DEFAULT/PRETTY` + `uint32_t flags`
+  became `AxlXmlFlags` (typedef'd `uint64_t`) with `AXL_XML_DEFAULT` and
+  `AXL_XML_INDENT(n)`. `AXL_XML_WRITER_PRETTY` was `1 << 0`, the same bit as
+  `AXL_JSON_ALLOW_COMMENTS`, so passing one to the other compiled and silently
+  meant something else. A distinct typedef does NOT fix that in C, so the fix
+  is that the **same bit means the same thing** — `AXL_XML_INDENT` is
+  bit-for-bit `AXL_JSON_INDENT`, asserted in the suite — plus
+  `axl_xml_writer_init` refusing any bit outside `AXL_XML_KNOWN_MASK`. The
+  indent width stopped being hardcoded at 2 as a side effect. `ENSURE_ASCII`
+  for XML (numeric character references) is deliberately NOT in this change:
+  it is a new escaping feature, not an alignment, and belongs on its own.
 
 - **Phase B2 Redfish** — *no library module*; shipped `rfbrowse.efi` (HTTP client
   + JSON cover it). Extract a session helper later if SoftBMC needs one.

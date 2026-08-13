@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-macros.h:
+/** @file axl-macros.h
  *
  * Compiler attribute macros. Zero dependencies.
  * Equivalent to GLib's gmacros.h.
@@ -88,6 +87,51 @@ typedef enum {
     }
 
 #define AXL_AUTOPTR(Type)  __attribute__((cleanup(_axl_autoptr_cleanup_##Type))) Type *
+
+// ---------------------------------------------------------------------------
+// Callback exception boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks a callback type AXL invokes from its own C frames.
+ *
+ * Expands to `noexcept` in C++ and to nothing in C, which makes the
+ * contract a COMPILE ERROR rather than a documented hope:
+ *
+ * @code
+ * error: invalid conversion from 'int (*)(void*)'
+ *        to 'AxlHashTableForeachFunc' {aka 'int (*)(void*) noexcept'}
+ * @endcode
+ *
+ * The contract is that an exception must never leave a callback, because
+ * the frames it would unwind through are AXL's own C. Those frames are
+ * compiled `-fno-exceptions` and carry no landing pads, so an unwind
+ * crossing them runs NO cleanup: every `AXL_AUTO_FREE` in the path
+ * leaks, and — measured — a `RaiseTPL` in the path is never restored,
+ * which wedges the machine on return to the shell at *any* raised level.
+ *
+ * Since C++17 `noexcept` is part of a function's type, so a throwing
+ * callback simply will not convert. A consumer that wants to use
+ * exceptions catches at its own boundary and returns a status instead:
+ *
+ * @code
+ * extern "C" int on_row(void *ctx) noexcept
+ * {
+ *     try { return do_work(ctx); }
+ *     catch (const std::exception &e) { record(ctx, e); return -1; }
+ *     catch (...)                     { return -1; }
+ * }
+ * @endcode
+ *
+ * A throw that escapes anyway calls `std::terminate` at the throw point
+ * — fatal, but loud and located, rather than a silent wedge. GCC also
+ * warns at compile time (`-Wterminate`) when it can see the throw.
+ */
+#if defined(__cplusplus)
+#  define AXL_CB_NOEXCEPT  noexcept
+#else
+#  define AXL_CB_NOEXCEPT
+#endif
 
 // ---------------------------------------------------------------------------
 // Steal pointer (GLib: g_steal_pointer)

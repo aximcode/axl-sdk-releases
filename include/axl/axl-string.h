@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-string.h:
+/** @file axl-string.h
  *
  * Mutable auto-growing string builder, like GLib's GString.
  * All strings are UTF-8 (char *).
@@ -48,11 +47,19 @@ axl_string_new(
 /**
  * @brief Create a new string builder with pre-reserved capacity.
  *
+ * @a reserve is counted the same way axl_string_capacity() and
+ * axl_string_reserve() count: USABLE CONTENT bytes, excluding the NUL
+ * terminator. So `axl_string_capacity(axl_string_new_size(n)) >= n`, and
+ * appending @a reserve bytes to the result cannot reallocate.
+ *
+ * A very small @a reserve is rounded up to an internal floor.
+ *
  * @return a new AxlString, or NULL on allocation failure.
+ *     Free with axl_string_free().
  */
 AxlString *
 axl_string_new_size(
-    size_t reserve  ///< initial capacity in bytes
+    size_t reserve  ///< usable content bytes to make room for
 );
 
 /**
@@ -143,6 +150,23 @@ axl_string_insert(
 );
 
 /**
+ * @brief Insert exactly @a len bytes from @a data at @a pos.
+ *
+ * Like axl_string_insert() but length-counted, so the inserted bytes
+ * may contain embedded NULs and need not be NUL-terminated. If @a pos
+ * >= current length, equivalent to axl_string_append_len().
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure.
+ */
+int
+axl_string_insert_len(
+    AxlString  *b,    ///< string builder
+    size_t      pos,  ///< byte offset to insert at
+    const char *data, ///< bytes to insert (not necessarily NUL-terminated)
+    size_t      len   ///< number of bytes
+);
+
+/**
  * @brief Remove @a len bytes starting at @a pos.
  *
  * If @a pos >= current length, no-op. If pos + len exceeds the
@@ -171,12 +195,38 @@ axl_string_truncate(
 );
 
 /**
+ * @brief Set the length to exactly @a len, padding with @a fill.
+ *
+ * Shrinks like axl_string_truncate() when @a len is below the current
+ * length; when it is above, appends `len - current` copies of @a fill.
+ * The buffer is always NUL-terminated at the new length.
+ *
+ * Note @a fill may be `'\0'`, which produces a string carrying interior
+ * NULs — axl_string_len() still reports @a len, but every `char *`
+ * reader of axl_string_str() stops at the first one.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure or NULL @a b.
+ */
+int
+axl_string_resize(
+    AxlString *b,   ///< string builder
+    size_t     len, ///< new length in bytes
+    char       fill ///< byte to pad with when growing
+);
+
+/**
  * @brief Overwrite content at @a pos with @a s.
  *
  * If pos + strlen(s) exceeds the current length, the string is
- * grown to accommodate.
+ * grown to accommodate. @a pos == the current length is an append.
  *
- * @return AXL_OK on success, AXL_ERR on allocation failure.
+ * A @a pos PAST the end is rejected rather than accepted: it would
+ * leave a gap of uninitialized bytes that axl_string_len() counts and
+ * axl_string_str() cannot see. This matches `g_string_overwrite`, which
+ * requires `pos <= len`.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure, on a @a pos
+ *     past the end, or if `pos + strlen(s)` is not representable.
  */
 int
 axl_string_overwrite(
@@ -209,9 +259,77 @@ axl_string_len(
 );
 
 /**
+ * @brief Get the current string content for in-place modification.
+ *
+ * The mutable twin of axl_string_str(). Writes through the returned
+ * pointer are visible to the builder, so this is the way to edit bytes
+ * that are already there — it does NOT change the length, and writing
+ * at or past axl_string_len() bytes overruns the buffer.
+ *
+ * The pointer is owned by the builder and is invalidated by anything
+ * that can reallocate (append, prepend, insert, reserve, resize).
+ *
+ * Unlike axl_string_str(), which returns the literal `""` so that
+ * printing a NULL builder is safe, this returns NULL when there is no
+ * buffer to hand out — a writable pointer to a literal would not be.
+ *
+ * @return mutable NUL-terminated buffer, or NULL if @a b is NULL or
+ *     owns no buffer (after axl_string_steal()).
+ */
+char *
+axl_string_data(
+    AxlString *b  ///< string builder
+);
+
+/**
+ * @brief Bytes of content the buffer holds before it must grow.
+ *
+ * Excludes the byte reserved for the NUL terminator, so appending
+ * exactly `capacity - len` bytes is the most that can happen without
+ * a reallocation.
+ *
+ * @return usable capacity in bytes, or 0 if @a b is NULL.
+ */
+size_t
+axl_string_capacity(
+    const AxlString *b  ///< string builder
+);
+
+/**
+ * @brief Ensure the buffer can hold @a capacity bytes without growing.
+ *
+ * Never shrinks and never changes the content or the length. A
+ * @a capacity at or below the current one is a no-op.
+ *
+ * @return AXL_OK on success, AXL_ERR on allocation failure or NULL @a b.
+ */
+int
+axl_string_reserve(
+    AxlString *b,       ///< string builder
+    size_t     capacity ///< bytes of content to make room for
+);
+
+/**
+ * @brief Release capacity beyond what the content needs.
+ *
+ * Shrinks the buffer to `len + 1` bytes. The content and length are
+ * unchanged; any pointer from axl_string_str() or axl_string_data() is
+ * invalidated.
+ *
+ * A failed shrink is not an error: the builder keeps its larger buffer
+ * and stays entirely usable, which is the same latitude
+ * `std::string::shrink_to_fit` has.
+ */
+void
+axl_string_shrink_to_fit(
+    AxlString *b  ///< string builder
+);
+
+/**
  * @brief Transfer ownership of the internal string to the caller.
  *
- * The builder is left empty (len=0). Caller frees with axl_free().
+ * The builder is left empty (len=0) and owns no buffer — it stays
+ * usable, and the next append allocates a fresh one.
  *
  * @return the string, or NULL if empty/allocation failed.
  */

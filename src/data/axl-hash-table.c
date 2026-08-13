@@ -24,6 +24,33 @@ AXL_LOG_DOMAIN("hash");
 // ---------------------------------------------------------------------------
 
 #define INITIAL_BUCKETS  64
+
+/* The bucket index is a MASK, not a modulo -- `hash & (bucket_count - 1)`
+   rather than `hash % bucket_count`. Equivalent only while bucket_count is a
+   power of two, and worth the constraint: the modulo is a hardware divide on
+   every lookup, insert and remove. Measured at N=8k on a warm heap: hit
+   86 -> 81 us, miss 100 -> 87 us -- small, near run-to-run noise, and worth
+   doing because it is strictly less work with no behavioural difference at
+   all rather than because the number is large. (A cold-heap comparison first
+   suggested -12% on hit; that was measurement error, not a result.)
+   What a non-power-of-two costs is DISTRIBUTION, not correctness, and the
+   distinction is worth stating because the obvious guess is the other one:
+   `hash & (count - 1)` yields at most count-1, so the index is always in
+   range, and insert and lookup derive it identically, so a key is always
+   found where it was put. What breaks is that the mask can only produce
+   indices matching its own bit pattern. At count 192 the mask is 191, which
+   has no bit 6 -- so buckets 64 through 127 can never be selected, and a
+   third of the table sits empty no matter what is inserted.
+   Chains lengthen; nothing is lost. Verified by sabotage: growing `* 3`
+   leaves the suite green.
+   So the static assert below is a PERFORMANCE guard, and it earns its place
+   for exactly that reason -- silently using a fraction of the buckets is the
+   kind of regression no test notices. Growth stays `<< 1` for the same
+   reason, spelled as a shift so the property is visible at the site. */
+_Static_assert((INITIAL_BUCKETS & (INITIAL_BUCKETS - 1)) == 0,
+               "INITIAL_BUCKETS must be a power of two: the bucket index is a "
+               "mask, so a non-power-of-two leaves most buckets unreachable "
+               "and degrades every chain");
 #define LOAD_FACTOR_NUM  3
 #define LOAD_FACTOR_DEN  4
 
@@ -181,7 +208,10 @@ resize(struct AxlHashTable *table)
     hash_node  *next;
     size_t      idx;
 
-    new_count = table->bucket_count * 2;
+    /* A SHIFT, so "stays a power of two" is visible here rather than inferred
+       from a multiply. The mask index needs it for distribution -- see
+       INITIAL_BUCKETS. */
+    new_count = table->bucket_count << 1;
     new_buckets = axl_calloc(1, new_count * sizeof(hash_node *));
     if (new_buckets == NULL) {
         axl_error("failed to resize bucket array to %llu",
@@ -193,7 +223,7 @@ resize(struct AxlHashTable *table)
         node = table->buckets[i];
         while (node != NULL) {
             next = node->next;
-            idx = table->hash_func(node->key) % new_count;
+            idx = table->hash_func(node->key) & (new_count - 1);
             node->next = new_buckets[idx];
             new_buckets[idx] = node;
             node = next;
@@ -398,7 +428,7 @@ hash_table_insert_or_replace(
         return AXL_HASH_TABLE_ERR;
     }
 
-    idx = h->hash_func(key) % h->bucket_count;
+    idx = h->hash_func(key) & (h->bucket_count - 1);
 
     for (node = h->buckets[idx]; node != NULL; node = node->next) {
         if (h->equal_func(node->key, key)) {
@@ -428,7 +458,7 @@ hash_table_insert_or_replace(
     // New entry — check resize
     if (h->entry_count * LOAD_FACTOR_DEN >= h->bucket_count * LOAD_FACTOR_NUM) {
         resize(h);
-        idx = h->hash_func(key) % h->bucket_count;
+        idx = h->hash_func(key) & (h->bucket_count - 1);
     }
 
     node = axl_malloc(sizeof(hash_node));
@@ -489,7 +519,7 @@ axl_hash_table_lookup(
         return NULL;
     }
 
-    idx = h->hash_func(key) % h->bucket_count;
+    idx = h->hash_func(key) & (h->bucket_count - 1);
 
     for (node = h->buckets[idx]; node != NULL; node = node->next) {
         if (h->equal_func(node->key, key)) {
@@ -513,7 +543,7 @@ axl_hash_table_contains(
         return false;
     }
 
-    idx = h->hash_func(key) % h->bucket_count;
+    idx = h->hash_func(key) & (h->bucket_count - 1);
 
     for (node = h->buckets[idx]; node != NULL; node = node->next) {
         if (h->equal_func(node->key, key)) {
@@ -538,7 +568,7 @@ axl_hash_table_remove(
         return false;
     }
 
-    idx = h->hash_func(key) % h->bucket_count;
+    idx = h->hash_func(key) & (h->bucket_count - 1);
     prev = &h->buckets[idx];
 
     for (node = *prev; node != NULL; prev = &node->next, node = node->next) {
@@ -569,7 +599,7 @@ axl_hash_table_steal(
         return false;
     }
 
-    idx = h->hash_func(key) % h->bucket_count;
+    idx = h->hash_func(key) & (h->bucket_count - 1);
     prev = &h->buckets[idx];
 
     for (node = *prev; node != NULL; prev = &node->next, node = node->next) {

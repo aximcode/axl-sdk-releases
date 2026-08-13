@@ -44,7 +44,7 @@ test_malloc(void)
 
     // NULL free is safe
     axl_free(NULL);
-    test_check(true, "free(NULL): no crash");
+    test_survived("free(NULL): no crash");
 }
 
 static void
@@ -189,12 +189,12 @@ test_debug_features(void)
     axl_free(p);
 
 #else
-    /* RELEASE: axl_mem_check always returns true. Two assertions
-       here to balance the DEBUG branch's two so the ratchet count
-       stays stable across build modes (per
-       feedback_balancer_count). */
+    /* RELEASE: axl_mem_check always returns true, so only one of the DEBUG
+       branch's two assertions has an analogue here. The second is DECLARED
+       skipped rather than padded with an invented pass, which keeps the
+       cross-build-mode count stable the same way without claiming a result. */
     test_check(axl_mem_check(NULL), "release: axl_mem_check returns true");
-    test_check(true, "release: SKIP balance — AXL_MEM_DEBUG not set");
+    test_skip_n(1, "mem release: leak accounting (AXL_MEM_DEBUG not set)");
 #endif
 }
 
@@ -219,18 +219,74 @@ test_stats(void)
     test_check(final.bytes == before.bytes, "stats: bytes decrements on free");
 }
 
+/* First WARNING the "mem" domain emits, captured verbatim. The handler
+ * runs inside the log dispatcher, which is not re-entrant and forbids
+ * allocating — axl_strlcpy into a static buffer is all it does. */
+static char g_leak_hdr[192];
+static bool g_leak_hdr_seen;
+
+static void
+leak_hdr_handler(
+    int                level,
+    const char        *domain,
+    const char        *message,
+    const AxlRealtime *stamp,
+    void              *data
+    )
+{
+    (void)level; (void)domain; (void)stamp; (void)data;
+    if (g_leak_hdr_seen || message == NULL) {
+        return;
+    }
+    g_leak_hdr_seen = true;
+    axl_strlcpy(g_leak_hdr, message, sizeof(g_leak_hdr));
+}
+
 static void
 test_leak_dump(void)
 {
-    /* Verify axl_mem_dump_leaks() runs without crashing. The dump
-     * lists allocations alive at the call site, which here are the
-     * AXL runtime's own bookkeeping (argv, registry slot array, atexit
-     * slot array). They are NOT real leaks — they are released at
-     * process teardown. The log will show a "leak report" with these
-     * runtime allocations; that is expected. */
-    axl_printf("(expected: dump lists AXL runtime's own argv/registry/atexit state)\n");
+    /* Pin the header axl_mem_dump_leaks() prints, EXACTLY.
+     *
+     * The blocks it lists here are the AXL runtime's own bookkeeping
+     * (argv, registry slot array, atexit slot array) — alive, not
+     * leaked, released at teardown. That is precisely why this report
+     * must stay distinguishable from the teardown one: the QEMU harness
+     * (test_check_leaks in test/integration/common-test.sh) fails a run
+     * on "=== AxlMem leak report:" and MUST NOT fail on this line. The
+     * "(live allocations)" infix is what keeps the two apart, so it is
+     * asserted here rather than left to a comment. */
+    AxlMemStats  live;
+    char         expect[192];
+
+    g_leak_hdr[0]   = '\0';
+    g_leak_hdr_seen = false;
+    test_check(axl_log_add_domain_handler("mem", AXL_LOG_WARNING,
+                                          leak_hdr_handler, NULL) == AXL_OK,
+               "leak dump: capture handler installed");
+
+    axl_mem_get_stats(&live);
     axl_mem_dump_leaks();
-    test_check(true, "leak dump: no crash");
+    axl_log_remove_handler(leak_hdr_handler);
+
+#ifdef AXL_MEM_DEBUG
+    axl_snprintf(expect, sizeof(expect),
+                 "=== AxlMem leak report (live allocations): "
+                 "%zu allocations, %zu bytes ===",
+                 live.count, live.bytes);
+    test_check(live.count > 0,
+               "leak dump: the runtime's own state is alive at the call site");
+    test_check(axl_strcmp(g_leak_hdr, expect) == 0,
+               "leak dump: header carries the (live allocations) infix");
+#else
+    /* RELEASE: the whole report compiles out, so nothing reaches the
+       handler. Two assertions to balance the DEBUG branch's two (per
+       feedback_balancer_count) — and both are real, not padding. */
+    (void)expect;
+    test_check(!g_leak_hdr_seen,
+               "release: dump_leaks emits no report");
+    test_check(g_leak_hdr[0] == '\0',
+               "release: dump_leaks leaves the capture buffer untouched");
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +414,99 @@ test_container_macros(void)
 }
 
 // ---------------------------------------------------------------------------
+// Free quarantine — catching the defect the leak report cannot see
+// ---------------------------------------------------------------------------
+
+static void
+test_quarantine(void)
+{
+#ifdef AXL_MEM_DEBUG
+    size_t   before;
+    size_t   after;
+    uint8_t *p;
+    uint8_t *held;
+    int      i;
+
+    /* A clean alloc/free cycle through the quarantine must report
+       nothing. Without this the "detected a corruption" assertions
+       below would pass for a quarantine that flags everything. */
+    axl_mem_set_quarantine(8);
+    before = axl_mem_corruption_count();
+    for (i = 0; i < 24; i++) {
+        p = (uint8_t *)axl_malloc(16);
+        axl_free(p);
+    }
+    axl_mem_set_quarantine(0);
+    test_check(axl_mem_corruption_count() == before,
+               "quarantine: clean alloc/free churn reports no corruption");
+
+    /* Use-after-free WRITE, caught when the block is evicted. The
+       block must still be held at the moment of the write, so the
+       ring is drained only afterwards. */
+    axl_mem_set_quarantine(8);
+    before = axl_mem_corruption_count();
+    held = (uint8_t *)axl_malloc(32);
+    axl_free(held);
+    held[7] = 0x5A;                       /* deliberate use-after-free */
+    axl_mem_set_quarantine(0);            /* drain -> eviction checks the fill */
+    after = axl_mem_corruption_count();
+    test_check(after == before + 1,
+               "quarantine: use-after-free write detected on eviction");
+
+    /* Double free: the block is still quarantined, so the second free
+       is refused rather than releasing the pool twice. */
+    axl_mem_set_quarantine(8);
+    before = axl_mem_corruption_count();
+    p = (uint8_t *)axl_malloc(24);
+    axl_free(p);
+    axl_free(p);                          /* deliberate double free */
+    after = axl_mem_corruption_count();
+    test_check(after == before + 1,
+               "quarantine: double free refused and counted");
+    axl_mem_set_quarantine(0);
+
+    /* Quarantined blocks are NOT leaks: they have left the live list,
+       so holding them must not move the allocation count. A quarantine
+       that inflated the leak report would fail every run. */
+    {
+        AxlMemStats qbefore;
+        AxlMemStats qafter;
+        axl_mem_set_quarantine(8);
+        axl_mem_get_stats(&qbefore);
+        p = (uint8_t *)axl_malloc(48);
+        axl_free(p);
+        axl_mem_get_stats(&qafter);
+        test_check(qafter.count == qbefore.count,
+                   "quarantine: held block does not count as live");
+        axl_mem_set_quarantine(0);
+    }
+
+    /* No "disabled" sub-test. The only discriminating probe would be
+       that a double free goes UNCAUGHT with the quarantine off — which
+       means performing a real double free, corrupting the pool to prove
+       a negative. The weaker probes that remain (re-reading an unchanged
+       counter, or re-checking that the live count balances) pass just as
+       well for an implementation that ignores set_quarantine(0)
+       entirely, so they are absent rather than present-and-hollow.
+       set_quarantine(0)'s drain IS covered — every assertion above
+       depends on it to force eviction. */
+
+    /* Restore the build default so anything appended after this test —
+       and every later test binary sharing the image — runs with the
+       quarantine the library actually ships with. */
+    axl_mem_set_quarantine(16);
+#else
+    /* RELEASE has no fences, no fill and no quarantine, so three of the
+       four DEBUG assertions have no analogue. Declared skipped rather
+       than padded with invented passes. */
+    axl_mem_set_quarantine(8);
+    test_check(axl_mem_corruption_count() == 0,
+               "release: corruption count is always zero");
+    test_skip_n(3, "mem release: quarantine (AXL_MEM_DEBUG not set)");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -378,6 +527,7 @@ test_mem_main(int argc, char **argv)
     test_stats();
     test_leak_dump();
     test_oom_allocator_primitives();
+    test_quarantine();
 
     return test_print_results();
 }

@@ -56,7 +56,7 @@ typedef struct {
     uint32_t       y;               ///< origin y
     uint32_t       w;               ///< width  (0 = to the target/GOP edge)
     uint32_t       h;               ///< height (0 = to the target/GOP edge)
-    void (*on_zoom)(void *user, int32_t delta); ///< Ctrl+wheel via handle_pointer; NULL = ignore
+    void (*on_zoom)(void *user, int32_t delta) AXL_CB_NOEXCEPT; ///< Ctrl+wheel via handle_pointer; NULL = ignore
     void          *cb_user;         ///< opaque context passed to @a on_zoom
     bool           mouse_cursor;    ///< draw a software mouse-cursor overlay (@ref AxlCursor,
                                     ///< built-in arrow) tracking @ref axl_console_term_set_pointer.
@@ -286,15 +286,14 @@ axl_console_term_hide_pointer(
  * @brief Offer a key to the terminal's built-in hotkeys: Shift+PgUp / Shift+PgDn
  *     scroll a page back / forward, Ctrl+Shift+C copies the selection. Its signature
  *     matches the device `key_filter` so it can be wired as one directly.
- * @param key firmware key record (an `EFI_KEY_DATA *` passed opaquely, as the device
- *     `key_filter` delivers it).
  * @return true if the key was a recognized hotkey (consume it — do not forward to
  *     the shell); false otherwise.
  */
 bool
 axl_console_term_handle_hotkey(
     AxlConsoleTerm *t,     ///< instance (NULL-safe)
-    const void     *key    ///< opaque firmware key record (EFI_KEY_DATA *)
+    const void     *key    ///< firmware key record — an `EFI_KEY_DATA *` passed
+                           ///< opaquely, as the device `key_filter` delivers it
 );
 
 #ifdef __cplusplus

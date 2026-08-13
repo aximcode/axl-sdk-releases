@@ -10,6 +10,14 @@
 // Hash Table Tests
 // ---------------------------------------------------------------------------
 
+/* Proves AXL_JSON_INDENT stays a CONSTANT EXPRESSION: a file-scope
+   initializer will not compile against a function-call form, and nothing
+   else in the suite would catch the regression -- C99 lets automatic
+   aggregates take non-constant initializers, so every in-function use
+   compiles either way. */
+static const AxlJsonFlags kIndentConstExpr =
+    AXL_JSON_INDENT(2) | AXL_JSON_COMPACT;
+
 static size_t foreach_count;
 
 static void
@@ -72,19 +80,49 @@ test_hash(void)
 
     // --- Resize test with axl_hash_table_new (copied string keys) ---
 
+    /* Enough entries to force SEVERAL resizes (64 buckets, grow at 75%), and
+       EVERY key is checked rather than the first and last.
+       Checking two of them cannot see a bucket-index defect: the index is
+       derived from the hash, so a wrong derivation scatters SOME keys and
+       leaves others where they were. The property this pins is that INSERT
+       and LOOKUP agree on the index across a resize — which is what actually
+       breaks if one of the seven index sites in axl-hash-table.c is changed
+       and the others are not. (It does NOT pin bucket_count's power-of-two
+       property: that governs distribution, not correctness, and no test can
+       see it. A static assert guards it at the source instead.) */
     t = axl_hash_table_new_str();
-    for (size_t i = 0; i < 128; i++) {
+    for (size_t i = 0; i < 1024; i++) {
         char key_buf[16];
-        axl_snprintf(key_buf, sizeof(key_buf), "key%03u", (unsigned)i);
+        axl_snprintf(key_buf, sizeof(key_buf), "key%04u", (unsigned)i);
         axl_hash_table_insert(t, key_buf, (void *)(size_t)(i + 1));
     }
-    test_check(axl_hash_table_size(t) == 128, "hash: 128 entries after bulk insert");
+    test_check(axl_hash_table_size(t) == 1024,
+               "hash: 1024 entries after bulk insert");
 
-    got = axl_hash_table_lookup(t, "key000");
-    test_check(got == (void *)(size_t)1, "hash: get key000 after resize");
+    size_t found = 0;
+    for (size_t i = 0; i < 1024; i++) {
+        char key_buf[16];
+        axl_snprintf(key_buf, sizeof(key_buf), "key%04u", (unsigned)i);
+        if (axl_hash_table_lookup(t, key_buf) == (void *)(size_t)(i + 1)) {
+            found++;
+        }
+    }
+    test_check(found == 1024,
+               "hash: EVERY key round-trips across several resizes");
 
-    got = axl_hash_table_lookup(t, "key127");
-    test_check(got == (void *)(size_t)128, "hash: get key127 after resize");
+    /* The negative half. Without it a table that returned a non-NULL value for
+       anything would pass the positive check by construction. */
+    size_t absent = 0;
+    for (size_t i = 0; i < 1024; i++) {
+        char key_buf[16];
+        axl_snprintf(key_buf, sizeof(key_buf), "nope%04u", (unsigned)i);
+        if (axl_hash_table_lookup(t, key_buf) == NULL) {
+            absent++;
+        }
+    }
+    test_check(absent == 1024,
+               "hash: and 1024 absent keys all miss, so the hit count above "
+               "is not vacuous");
 
     axl_hash_table_free(t);
 }
@@ -640,7 +678,7 @@ test_json_parse(void)
     // Flat object
     const char *json = "{\"name\":\"devkit\",\"version\":42,\"debug\":true}";
 
-    ok = axl_json_parse(json, axl_strlen(json), &r);
+    ok = axl_json_parse(json, axl_strlen(json), AXL_JSON_RELAXED, &r);
     test_check(ok, "json parse: valid");
 
     ok = axl_json_get_string(&r, "name", str_buf, sizeof(str_buf));
@@ -662,12 +700,8 @@ test_json_parse(void)
     axl_json_free(&r);
 
     // Invalid JSON
-    ok = axl_json_parse("not json", 8, &r);
+    ok = axl_json_parse("not json", 8, AXL_JSON_RELAXED, &r);
     test_check(!ok, "json parse: invalid returns false");
-
-    // One-shot convenience
-    ok = axl_json_extract_string(json, axl_strlen(json), "name", str_buf, sizeof(str_buf));
-    test_check(ok && axl_strcmp(str_buf, "devkit") == 0, "json parse: extract string");
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +735,7 @@ test_json_get_object(void)
           "\"count\":3"
         "}";
 
-    ok = axl_json_parse(json, axl_strlen(json), &r);
+    ok = axl_json_parse(json, axl_strlen(json), AXL_JSON_RELAXED, &r);
     test_check(ok, "json get_object: parse");
 
     // Navigate one level into a named nested object.
@@ -799,8 +833,8 @@ test_json_get_object(void)
     // JSON5-parsed readers navigate identically.
     const char *j5 =
         "{ db: { url: 'pg://x', pool: { max: 16 } } }";
-    ok = axl_json_parse_flags(j5, axl_strlen(j5),
-                              AXL_JSON_PARSER_JSON5, &r);
+    ok = axl_json_parse(j5, axl_strlen(j5),
+                              AXL_JSON_JSON5, &r);
     test_check(ok, "json get_object: JSON5 parse");
 
     ok = axl_json_get_object(&r, "db", &server) &&
@@ -837,8 +871,8 @@ test_json5_parse(void)
         "  debug: true,\n"              // trailing comma below
         "}\n";
 
-    ok = axl_json_parse_flags(j5, axl_strlen(j5),
-                              AXL_JSON_PARSER_JSON5, &r);
+    ok = axl_json_parse(j5, axl_strlen(j5),
+                              AXL_JSON_JSON5, &r);
     test_check(ok, "json5 parse: comments + trailing comma + unquoted keys");
 
     ok = axl_json_get_string(&r, "name", str_buf, sizeof(str_buf));
@@ -856,11 +890,101 @@ test_json5_parse(void)
 
     axl_json_free(&r);
 
+    // --- Integer overflow: reject, do not wrap --------------------------
+    // Both accumulators ran unbounded into an int64_t: the hex branch as
+    // `v = (v << 4) | n` and the decimal branch as `v = v * 10 + digit`.
+    // Past the width that is silent wraparound to a WRONG value with no
+    // diagnostic (and, being signed, undefined behaviour on the way there)
+    // — the same shape as the signed-char bug 6ee757cd fixed. The sidecars
+    // that ship in-tree hold 16-bit IDs, but --ids-file makes them
+    // user-replaceable, so the input is not trusted.
+    //
+    // Boundary pairs: the largest value that must still parse, next to the
+    // first that must not. A bound that is off by one fails exactly one of
+    // each pair, which a single over-large case could not detect.
+    struct { const char *json; bool want_ok; int64_t want; const char *what; } ovf[] = {
+        { "{ v: 0x7FFFFFFFFFFFFFFF }",   true,  INT64_MAX, "hex INT64_MAX parses" },
+        { "{ v: 0x8000000000000000 }",   false, 0, "hex INT64_MAX+1 rejected" },
+        { "{ v: 0xFFFFFFFFFFFFFFFF }",   false, 0, "hex 2^64-1 rejected (wrapped to -1)" },
+        { "{ v: 0x10000000000000000 }",  false, 0, "hex 2^64 rejected (wrapped to 0)" },
+        { "{ v: -0x8000000000000000 }",  true,  INT64_MIN, "hex INT64_MIN parses" },
+        { "{ v: -0x8000000000000001 }",  false, 0, "hex INT64_MIN-1 rejected" },
+        { "{ v: 9223372036854775807 }",  true,  INT64_MAX, "decimal INT64_MAX parses" },
+        { "{ v: 9223372036854775808 }",  false, 0, "decimal INT64_MAX+1 rejected" },
+        { "{ v: -9223372036854775808 }", true,  INT64_MIN, "decimal INT64_MIN parses" },
+        { "{ v: 99999999999999999999 }", false, 0, "decimal 20-digit rejected" },
+    };
+    for (size_t oi = 0; oi < sizeof(ovf) / sizeof(ovf[0]); oi++) {
+        AxlJsonReader ovr;
+        int64_t       got = 0x5A5A5A5A;   /* poison: a no-write must not pass */
+        bool          parsed = axl_json_parse(ovf[oi].json,
+                                                    axl_strlen(ovf[oi].json),
+                                                    AXL_JSON_JSON5, &ovr);
+        /* Assert the PARSE separately from the accessor: a rejection by the
+         * JSON5 lexer would otherwise be indistinguishable from the bound
+         * doing its job, and these cases would keep passing while testing
+         * nothing if the lexer ever gained a digit-count cap. */
+        test_check(parsed, ovf[oi].what);
+        bool got_ok = parsed && axl_json_get_int(&ovr, "v", &got);
+        if (parsed) axl_json_free(&ovr);
+        /* On rejection *value must be untouched, so pin the poison too —
+         * `want_ok ||` alone would leave the reject cases asserting nothing
+         * about the out-param. */
+        test_check(got_ok == ovf[oi].want_ok
+                   && (ovf[oi].want_ok ? got == ovf[oi].want
+                                       : got == 0x5A5A5A5A),
+                   ovf[oi].what);
+    }
+
+    // Same bound through axl_json_parse — one parser now serves every
+    // dialect, so this exercises the same decimal branch reached above and
+    // the whole literal arrives as one primitive token either way. Kept
+    // because the ENTRY POINT differs, and the bound is the accessor's.
+    {
+        const char *big = "{\"v\": 9223372036854775808}";
+        AxlJsonReader sr;
+        int64_t       sv = 0x5A5A5A5A;
+        test_check(axl_json_parse(big, axl_strlen(big), AXL_JSON_RELAXED, &sr),
+                   "json overflow: strict parser accepts the document");
+        test_check(!axl_json_get_int(&sr, "v", &sv) && sv == 0x5A5A5A5A,
+                   "json overflow: strict path rejects INT64_MAX+1 too");
+        axl_json_free(&sr);
+    }
+
+    // axl_json_get_uint takes a uint64_t*, so the whole unsigned range is
+    // representable in its out-param — it used to route through int64_t and
+    // silently cap at INT64_MAX, which is exactly the half a firmware sidecar
+    // needs for a 64-bit mask or physical address.
+    {
+        struct { const char *json; bool want_ok; uint64_t want; const char *what; } u[] = {
+            { "{ v: 0xFFFFFFFFFFFFFFFF }",   true,  UINT64_MAX, "uint: hex UINT64_MAX parses" },
+            { "{ v: 18446744073709551615 }", true,  UINT64_MAX, "uint: decimal UINT64_MAX parses" },
+            { "{ v: 0x10000000000000000 }",  false, 0, "uint: 2^64 rejected" },
+            { "{ v: 18446744073709551616 }", false, 0, "uint: decimal 2^64 rejected" },
+            { "{ v: 0x8000000000000000 }",   true,  (uint64_t)INT64_MAX + 1u,
+              "uint: reaches past INT64_MAX" },
+            { "{ v: -1 }",                   false, 0, "uint: negative rejected" },
+        };
+        for (size_t ui = 0; ui < sizeof(u) / sizeof(u[0]); ui++) {
+            AxlJsonReader ur;
+            uint64_t      got = 0x5A5A5A5A5A5A5A5AULL;
+            bool parsed = axl_json_parse(u[ui].json, axl_strlen(u[ui].json),
+                                               AXL_JSON_JSON5, &ur);
+            test_check(parsed, u[ui].what);
+            bool got_ok = parsed && axl_json_get_uint(&ur, "v", &got);
+            if (parsed) axl_json_free(&ur);
+            test_check(got_ok == u[ui].want_ok
+                       && (u[ui].want_ok ? got == u[ui].want
+                                         : got == 0x5A5A5A5A5A5A5A5AULL),
+                       u[ui].what);
+        }
+    }
+
     // Trailing comma in array, hex with negative, x-escape in string
     const char *j5_arr =
         "{ items: [1, 2, 0x10, -0xFF,], greeting: \"hi\\x21\", }";
-    ok = axl_json_parse_flags(j5_arr, axl_strlen(j5_arr),
-                              AXL_JSON_PARSER_JSON5, &r);
+    ok = axl_json_parse(j5_arr, axl_strlen(j5_arr),
+                              AXL_JSON_JSON5, &r);
     test_check(ok, "json5 parse: array trailing comma + signed hex + \\x escape");
 
     AxlJsonArrayIter it;
@@ -880,19 +1004,30 @@ test_json5_parse(void)
 
     axl_json_free(&r);
 
-    // Strict parser must STILL reject JSON5 input
-    ok = axl_json_parse(j5, axl_strlen(j5), &r);
-    test_check(!ok, "json5 parse: strict mode still rejects JSON5");
+    /* STRICT must still reject JSON5 input -- but it has to be ASKED for now.
+       This used to call axl_json_parse(), which is no longer the strict entry
+       point: it means AXL_JSON_RELAXED, so it accepts this document. Left
+       pointing at the same document via the flags form, because "strict
+       rejects JSON5" is exactly the property worth keeping an assertion on;
+       only the way to request strictness changed. */
+    ok = axl_json_parse(j5, axl_strlen(j5), AXL_JSON_STRICT, &r);
+    test_check(!ok, "json5 parse: STRICT still rejects JSON5");
+
+    /* And the other half of that change, or "strict rejects it" would pass
+       against a parser that rejected the document for everyone. */
+    ok = axl_json_parse(j5, axl_strlen(j5), AXL_JSON_RELAXED, &r);
+    test_check(ok, "json5 parse: AXL_JSON_RELAXED accepts it");
+    if (ok) { axl_json_free(&r); }
 
     // Default flags == strict
-    ok = axl_json_parse_flags(j5, axl_strlen(j5),
-                              AXL_JSON_PARSER_DEFAULT, &r);
-    test_check(!ok, "json5 parse: AXL_JSON_PARSER_DEFAULT == strict");
+    ok = axl_json_parse(j5, axl_strlen(j5),
+                              AXL_JSON_STRICT, &r);
+    test_check(!ok, "json5 parse: AXL_JSON_STRICT == strict");
 
     // Strict JSON parses correctly via the JSON5 path too (superset)
     const char *strict = "{\"a\":1,\"b\":[true,null]}";
-    ok = axl_json_parse_flags(strict, axl_strlen(strict),
-                              AXL_JSON_PARSER_JSON5, &r);
+    ok = axl_json_parse(strict, axl_strlen(strict),
+                              AXL_JSON_JSON5, &r);
     test_check(ok, "json5 parse: accepts strict JSON unchanged");
     ok = axl_json_get_int(&r, "a", &int_val);
     test_check(ok && int_val == 1, "json5 parse: strict accessors work");
@@ -900,9 +1035,883 @@ test_json5_parse(void)
 
     // Malformed JSON5 fails (unterminated block comment)
     const char *bad = "{ /* never closed \n a: 1 }";
-    ok = axl_json_parse_flags(bad, axl_strlen(bad),
-                              AXL_JSON_PARSER_JSON5, &r);
+    ok = axl_json_parse(bad, axl_strlen(bad),
+                              AXL_JSON_JSON5, &r);
     test_check(!ok, "json5 parse: unterminated block comment rejected");
+}
+
+// ---------------------------------------------------------------------------
+// \uXXXX decoding in the string ACCESSORS (regression, shipped in v3.1.0)
+//
+// decode_json_string had no `case 'u':`, so every \uXXXX fell through to the
+// default "copy the character after the backslash" arm: "\u0041" came back as
+// "u0041". The lexer validates the escape, so the document parsed, no error
+// was raised, and the caller got wrong bytes — accept-and-corrupt, the worst
+// shape a parser bug takes.
+//
+// It survived because both existing \u tests exercise the WRITER (which
+// splices escape bytes verbatim, correctly), never the decoder. Every
+// get_string test used escape-free ASCII.
+//
+// Exact bytes throughout — a substring check would accept "u0041" inside a
+// longer string, which is the very failure being pinned.
+// ---------------------------------------------------------------------------
+
+static void
+test_json_unicode_escapes(void)
+{
+    AxlJsonReader r;
+    char          buf[64];
+
+    // One case, one document. Parse strictly unless noted; \uXXXX is valid in
+    // both dialects and both route through the same decoder.
+    #define U_CASE(doc, want, msg)                                            \
+        do {                                                                  \
+            const char *_d = (doc);                                           \
+            axl_memset(buf, 0, sizeof(buf));                                  \
+            test_check(axl_json_parse(_d, axl_strlen(_d), AXL_JSON_RELAXED, &r)                 \
+                       && axl_json_get_string(&r, "a", buf, sizeof(buf))      \
+                       && axl_strcmp(buf, (want)) == 0, (msg));               \
+            axl_json_free(&r);                                                \
+        } while (0)
+
+    U_CASE("{\"a\":\"\\u0041\"}",  "A",            "json \\u: basic BMP decodes to 1-byte UTF-8");
+    U_CASE("{\"a\":\"x\\u0041y\"}", "xAy",         "json \\u: mid-string, neighbours intact");
+    U_CASE("{\"a\":\"\\u00e9\"}",  "\xc3\xa9",     "json \\u: U+00E9 is 2-byte UTF-8");
+    U_CASE("{\"a\":\"\\u20ac\"}",  "\xe2\x82\xac", "json \\u: U+20AC is 3-byte UTF-8");
+    U_CASE("{\"a\":\"\\uFFFF\"}",  "\xef\xbf\xbf", "json \\u: max BMP is still 3 bytes");
+
+    // Surrogate PAIR combines into one code point above the BMP. Decoding the
+    // halves separately would give two 3-byte sequences, not this.
+    U_CASE("{\"a\":\"\\ud83d\\ude00\"}", "\xf0\x9f\x98\x80",
+           "json \\u: surrogate pair combines to U+1F600 (4-byte UTF-8)");
+    U_CASE("{\"a\":\"A\\ud83d\\ude00B\"}", "A\xf0\x9f\x98\x80" "B",
+           "json \\u: surrogate pair mid-string keeps its neighbours");
+
+    // Lone surrogates are ill-formed UTF-16. The parse side accepts them
+    // (JSONTestSuite classifies these i_), so the accessor is what must never
+    // hand back ill-formed UTF-8: substitute U+FFFD.
+    U_CASE("{\"a\":\"\\ud83d\"}",  "\xef\xbf\xbd", "json \\u: lone HIGH surrogate becomes U+FFFD");
+    U_CASE("{\"a\":\"\\udc00\"}",  "\xef\xbf\xbd", "json \\u: bare LOW surrogate becomes U+FFFD");
+    U_CASE("{\"a\":\"\\ud83dZ\"}", "\xef\xbf\xbd" "Z",
+           "json \\u: high surrogate not followed by \\u becomes U+FFFD, Z kept");
+    U_CASE("{\"a\":\"\\ud83d\\u0041\"}", "\xef\xbf\xbd" "A",
+           "json \\u: high surrogate followed by a NON-surrogate \\u keeps both");
+
+    // \u0000 must never become an interior NUL: the buffer is NUL-terminated,
+    // so one would truncate the string for every axl_strcmp caller and make
+    // "admin\u0000extra" compare equal to "admin" — a string-smuggling
+    // primitive reachable from JWT/JWK/HTTP input.
+    U_CASE("{\"a\":\"\\u0000\"}",   "\xef\xbf\xbd", "json \\u: \\u0000 becomes U+FFFD, not a NUL");
+    U_CASE("{\"a\":\"a\\u0000b\"}", "a\xef\xbf\xbd" "b",
+           "json \\u: \\u0000 mid-string keeps both neighbours");
+
+    // The smuggling assertion stated directly: length must be 5, not 1.
+    axl_memset(buf, 0, sizeof(buf));
+    const char *nul_doc = "{\"a\":\"a\\u0000b\"}";
+    test_check(axl_json_parse(nul_doc, axl_strlen(nul_doc), AXL_JSON_RELAXED, &r)
+               && axl_json_get_string(&r, "a", buf, sizeof(buf))
+               && axl_strlen(buf) == 5,
+               "json \\u: \\u0000 does not truncate the decoded string");
+    axl_json_free(&r);
+
+    // JSON5 routes through the same decoder — pin it so a dialect split can't
+    // silently regress one side.
+    axl_memset(buf, 0, sizeof(buf));
+    const char *j5 = "{a:'\\u20ac'}";
+    test_check(axl_json_parse(j5, axl_strlen(j5), AXL_JSON_JSON5, &r)
+               && axl_json_get_string(&r, "a", buf, sizeof(buf))
+               && axl_strcmp(buf, "\xe2\x82\xac") == 0,
+               "json \\u: JSON5 mode decodes \\uXXXX identically");
+    axl_json_free(&r);
+
+    // The OTHER affected accessor. axl_json_value_string shares the decoder,
+    // so it must agree — including on the pair case.
+    AxlJsonArrayIter it;
+    AxlJsonReader    elem;
+    const char      *arr = "{\"a\":[\"\\u00e9\",\"\\ud83d\\ude00\"]}";
+    char             e0[32] = {0}, e1[32] = {0};
+    bool             got0 = false, got1 = false;
+    if (axl_json_parse(arr, axl_strlen(arr), AXL_JSON_RELAXED, &r)
+        && axl_json_array_begin(&r, "a", &it)) {
+        if (axl_json_array_next(&it, &elem)) got0 = axl_json_value_string(&elem, e0, sizeof(e0));
+        if (axl_json_array_next(&it, &elem)) got1 = axl_json_value_string(&elem, e1, sizeof(e1));
+    }
+    test_check(got0 && axl_strcmp(e0, "\xc3\xa9") == 0,
+               "json \\u: value_string decodes a BMP escape");
+    test_check(got1 && axl_strcmp(e1, "\xf0\x9f\x98\x80") == 0,
+               "json \\u: value_string combines a surrogate pair");
+    axl_json_free(&r);
+
+    // --- buffer bound -------------------------------------------------------
+    // A decoded code point is 1-4 bytes but the loop guard only reserves ONE,
+    // so the new branch must check before writing. Truncation is the existing
+    // convention for an over-long value (the plain-byte path has always
+    // truncated silently and returned true); what must NEVER happen is a
+    // PARTIAL UTF-8 sequence, which is the same ill-formed output the
+    // lone-surrogate rule exists to prevent.
+    const char *emoji = "{\"a\":\"\\ud83d\\ude00\"}";   // 4 bytes + NUL = 5
+
+    char exact[5];
+    axl_memset(exact, 0, sizeof(exact));
+    test_check(axl_json_parse(emoji, axl_strlen(emoji), AXL_JSON_RELAXED, &r)
+               && axl_json_get_string(&r, "a", exact, sizeof(exact))
+               && axl_strcmp(exact, "\xf0\x9f\x98\x80") == 0,
+               "json \\u: a buffer of exactly 5 holds the 4-byte code point");
+    axl_json_free(&r);
+
+    char tight[4];   // one byte too small for the code point + NUL
+    axl_memset(tight, 0xAA, sizeof(tight));
+    test_check(axl_json_parse(emoji, axl_strlen(emoji), AXL_JSON_RELAXED, &r)
+               && axl_json_get_string(&r, "a", tight, sizeof(tight))
+               && axl_strcmp(tight, "") == 0,
+               "json \\u: a too-small buffer emits NO partial sequence");
+    axl_json_free(&r);
+
+    // A zero-size buffer. Before the fix the guard `out < dst_size - 1`
+    // underflowed to SIZE_MAX here and the terminator was written out of
+    // bounds; there is no in-tree caller that passes 0, but the accessor is
+    // public. Canary the byte after so a stray write is visible.
+    char zero[2];
+    zero[0] = (char)0x5A;
+    zero[1] = (char)0x5A;
+    test_check(axl_json_parse(emoji, axl_strlen(emoji), AXL_JSON_RELAXED, &r)
+               && !axl_json_get_string(&r, "a", zero, 0)
+               && zero[0] == (char)0x5A,
+               "json \\u: a zero-size buffer fails and writes nothing");
+    axl_json_free(&r);
+
+    // Same bound, but with content before it — the prefix survives and the
+    // code point that would overflow is dropped whole, not split.
+    char part[6];
+    axl_memset(part, 0xAA, sizeof(part));
+    const char *pre = "{\"a\":\"ab\\ud83d\\ude00\"}";
+    test_check(axl_json_parse(pre, axl_strlen(pre), AXL_JSON_RELAXED, &r)
+               && axl_json_get_string(&r, "a", part, sizeof(part))
+               && axl_strcmp(part, "ab") == 0,
+               "json \\u: an overflowing code point is dropped whole, prefix kept");
+    axl_json_free(&r);
+
+    #undef U_CASE
+}
+
+// ---------------------------------------------------------------------------
+// Three spellings of an unrepresentable NUL, ONE overflow policy
+//
+// decode_json_string is where two independent fixes met: main's \uXXXX decode
+// (0352d185) and this branch's JSON5 \0 / \x00 hardening. Both substitute
+// U+FFFD, and both were right about that — but they disagreed on what happens
+// when the substitution does not FIT.
+//
+// The \u arm drops the code point whole and stops the loop. The \0 and \x00
+// arms emitted nothing and KEPT GOING, so a tight buffer made the replacement
+// vanish from the MIDDLE of a string while its successors survived:
+// "a\0b" came back as "ab". That reads \0 as "nothing" rather than
+// "unrepresentable" — a quieter version of the same smuggling primitive the
+// substitution exists to block, and it differs from plain truncation, which is
+// this accessor's documented convention for a value that will not fit.
+//
+// So the three spellings are asserted SIDE BY SIDE rather than each in its own
+// section: the claim being pinned is that they agree, and a per-spelling test
+// cannot express that. \x00 had no test at all on either branch.
+// ---------------------------------------------------------------------------
+
+static void
+test_json_nul_escape_union(void)
+{
+    // Three documents differing only in HOW the NUL is spelled. The \u form is
+    // legal in every dialect; \0 and \x00 are JSON5 and need
+    // ALLOW_EXTRA_ESCAPES, which AXL_JSON_RELAXED carries. All three must
+    // reach the same answer through the same decoder.
+    //
+    // Three buffer sizes per spelling, because the disagreement was entirely
+    // about the bound:
+    //   32 - everything fits
+    //    5 - 'a' + the 3-byte U+FFFD + NUL, so the trailing 'b' does not
+    //    4 - one byte short of the substitution itself
+    //
+    // Split literals throughout: "\xBDb" would lex as ONE out-of-range hex
+    // escape and swallow the 'b', since 'b' is itself a hex digit.
+    struct { const char *doc; size_t size; const char *want; const char *msg; }
+    row[] = {
+        { "{\"a\":\"a\\u0000b\"}", 32, "a\xEF\xBF\xBD" "b",
+          "nul union: \\u0000 decodes to U+FFFD, exact, no truncation" },
+        { "{\"a\":\"a\\0b\"}",     32, "a\xEF\xBF\xBD" "b",
+          "nul union: \\0 decodes to U+FFFD, exact, no truncation" },
+        { "{\"a\":\"a\\x00b\"}",   32, "a\xEF\xBF\xBD" "b",
+          "nul union: \\x00 decodes to U+FFFD, exact, no truncation" },
+
+        { "{\"a\":\"a\\u0000b\"}",  5, "a\xEF\xBF\xBD",
+          "nul union: \\u0000 fills a 5-byte buffer, 'b' is cut" },
+        { "{\"a\":\"a\\0b\"}",      5, "a\xEF\xBF\xBD",
+          "nul union: \\0 fills a 5-byte buffer, 'b' is cut" },
+        { "{\"a\":\"a\\x00b\"}",    5, "a\xEF\xBF\xBD",
+          "nul union: \\x00 fills a 5-byte buffer, 'b' is cut" },
+
+        { "{\"a\":\"a\\u0000b\"}",  4, "a",
+          "nul union: \\u0000 too big for the buffer truncates THERE" },
+        { "{\"a\":\"a\\0b\"}",      4, "a",
+          "nul union: \\0 too big for the buffer truncates THERE "
+          "(it must not vanish and let 'b' through)" },
+        { "{\"a\":\"a\\x00b\"}",    4, "a",
+          "nul union: \\x00 too big for the buffer truncates THERE "
+          "(it must not vanish and let 'b' through)" },
+
+        /* The SINGLE-QUOTED, unquoted-key spelling, carried over from the
+           equivalent test `main` grew independently (aba93d54) while this
+           branch was doing the same work. That test was dropped in the merge
+           -- it is written against AXL_JSON_PARSER_JSON5, a constant P1
+           removed, and its claims are the rows above -- but it reached the
+           decoder through a different lexer path, and losing an input SHAPE is
+           a real coverage loss even when the assertion is a duplicate. Its
+           "admin"/"extra" payload is kept verbatim: the point of that wording
+           is that a truncated read compares equal to "admin". */
+        { "{a:'admin\\0extra'}",   32, "admin\xEF\xBF\xBD" "extra",
+          "nul union: single-quoted \\0 keeps both neighbours, so a "
+          "truncated read cannot pass for \"admin\"" },
+        { "{a:'admin\\x00extra'}", 32, "admin\xEF\xBF\xBD" "extra",
+          "nul union: single-quoted \\x00 keeps both neighbours too" },
+    };
+    size_t n = sizeof(row) / sizeof(row[0]);
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        AxlJsonReader r;
+        char          buf[32];
+
+        // The 0xAA prefill is load-bearing twice: a missing terminator makes
+        // axl_strcmp run into it and mismatch, and the byte AT the declared
+        // size catches a one-past-the-end terminator, which is the exact bug
+        // the removed `dst_size - 1` underflow used to cause.
+        axl_memset(buf, (char)0xAA, sizeof(buf));
+        test_check(axl_json_parse(row[i].doc, axl_strlen(row[i].doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_get_string(&r, "a", buf, row[i].size)
+                   && axl_strcmp(buf, row[i].want) == 0
+                   && (row[i].size == sizeof(buf)
+                       || buf[row[i].size] == (char)0xAA),
+                   row[i].msg);
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON5 line continuations, including the CRLF PAIR
+//
+// ES5 LineContinuation is `\` followed by a LineTerminatorSequence, and that
+// sequence is <LF>, <CR>, <LS>, <PS>, or the PAIR <CR><LF>. The lexer consumed
+// exactly TWO bytes for any `\<anychar>`, so `\<CR><LF>` left the LF behind as
+// a raw character -- which then tripped the "no raw control character in a
+// string" rule, and the whole document was rejected.
+//
+// decode_json_string already handled the pair correctly (`case '\r'` consumes
+// a following LF), so the two halves disagreed: the decoder knew CRLF was one
+// terminator and the lexer did not. Nothing caught it because a CRLF document
+// is awkward to write as a C literal and no test had one.
+//
+// Found by json5/json5-tests on that corpus's FIRST run through
+// test-json-corpus-qemu.sh -- exactly the class of gap an external suite
+// exists to close, and one no amount of reading our own code had surfaced.
+// ---------------------------------------------------------------------------
+
+static void
+test_json5_line_continuations(void)
+{
+    struct { const char *doc; const char *want; const char *msg; } row[] = {
+        { "{a:'line 1 \\\nline 2'}", "line 1 line 2",
+          "continuation: \\<LF> joins the lines" },
+        { "{a:'line 1 \\\rline 2'}", "line 1 line 2",
+          "continuation: \\<CR> joins the lines" },
+        /* The regression. <CR><LF> is ONE line terminator, so the escape must
+           consume all three bytes; consuming two leaves a raw LF behind. */
+        { "{a:'line 1 \\\r\nline 2'}", "line 1 line 2",
+          "continuation: \\<CR><LF> is ONE terminator, not CR plus a raw LF" },
+    };
+    size_t n = sizeof(row) / sizeof(row[0]);
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        AxlJsonReader r;
+        char          buf[64];
+
+        axl_memset(buf, 0, sizeof(buf));
+        test_check(axl_json_parse(row[i].doc, axl_strlen(row[i].doc),
+                                        AXL_JSON_JSON5, &r)
+                   && axl_json_get_string(&r, "a", buf, sizeof(buf))
+                   && axl_strcmp(buf, row[i].want) == 0,
+                   row[i].msg);
+        axl_json_free(&r);
+    }
+
+    /* The other half, and the reason this is a pair of assertions rather than
+       one: widening the continuation rule must NOT make a raw newline legal
+       inside a string. Both RFC 8259 and ES5 forbid that, and a fix that
+       simply stopped checking control characters would pass every row above. */
+    {
+        const char   *raw = "{a:'line 1 \nline 2'}";
+        AxlJsonReader r;
+        bool          got = axl_json_parse(raw, axl_strlen(raw),
+                                                 AXL_JSON_JSON5, &r);
+        if (got) { axl_json_free(&r); }
+        test_check(!got,
+                   "continuation: a RAW newline in a string is still rejected");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An accessor never hands back a BROKEN code point
+//
+// Two holes the \0/\uXXXX reconciliation left behind, both found by the review
+// pass, and both about input the decoder fully understands -- so neither is
+// P7's read-side UTF-8 validation work:
+//
+//  1. `\xNN` emitted a RAW byte. JSON5 inherits ES5's HexEscapeSequence, where
+//     `\xE9` is the code UNIT U+00E9 and encodes as the two bytes C3 A9. AXL
+//     emitted a lone 0xE9, which is not valid UTF-8 in any encoding -- an
+//     ESCAPE producing ill-formed output, from a decoder that had just grown a
+//     helper whose whole purpose is to prevent that. The two existing \x
+//     assertions pin \x21 and \x41, both ASCII, so nothing noticed.
+//
+//  2. Truncation split a multi-byte sequence. `{"a":"<U+20AC>"}` into three
+//     bytes gave E2 82 + NUL -- the same ill-formed output append_bytes
+//     refuses for a decoded escape, on the path that carries essentially all
+//     real text.
+//
+// Hole 2 took two attempts, and the difference is what the rows below are
+// organized around. The first attempt made each raw RUN atomic on the way in
+// (measure a lead byte plus its continuation bytes, refuse the run whole). That
+// fixed the common case and missed the general one: two ADJACENT one-byte units
+// can concatenate into a sequence no arm ever saw as a unit -- `\<C3>\<A9>`
+// (each byte escaped separately, what a naive byte-oriented escaper emits for
+// U+00E9) or `<C3>\<80>` (raw lead, escaped continuation). A cut between those
+// two units still split a sequence the untruncated decode had whole.
+//
+// So the mechanism is now ONE post-hoc trim over the bytes actually written,
+// and the atomic-run measurement is gone as redundant -- every truncation row
+// below fails when the trim is removed, which is what proved it. Consequence
+// worth knowing: no row here discriminates "grouping", because there is no
+// grouping and no lookahead at all.
+//
+// What is NOT changed, and is asserted so the fix cannot creep into it:
+// ill-formed RAW bytes that FIT still pass through untouched. The reader
+// validates no encoding (see AXL_JSON_UTF8_* on read, P7). The trim only ever
+// removes a sequence AXL's own bound cut in half.
+// ---------------------------------------------------------------------------
+
+static void
+test_json_accessor_utf8_integrity(void)
+{
+    struct { const char *doc; size_t size; const char *want; const char *msg; }
+    row[] = {
+        // --- 1. \xNN is a code unit, not a byte -----------------------------
+        { "{\"a\":\"\\x21\"}", 32, "!",
+          "utf8 integrity: \\x21 is ASCII, one byte, unchanged" },
+        { "{\"a\":\"\\xe9\"}", 32, "\xC3\xA9",
+          "utf8 integrity: \\xe9 is code unit U+00E9, encoded as 2 bytes" },
+        { "{\"a\":\"\\xff\"}", 32, "\xC3\xBF",
+          "utf8 integrity: \\xff is code unit U+00FF, not a lone 0xFF" },
+        { "{\"a\":\"\\xe9\"}",  2, "",
+          "utf8 integrity: \\xe9 that will not fit is refused WHOLE" },
+        { "{\"a\":\"\\xe9\"}",  3, "\xC3\xA9",
+          "utf8 integrity: \\xe9 fits in exactly 3 bytes" },
+
+        // --- 2. a raw sequence is never split by OUR bound -----------------
+        // U+20AC EURO SIGN, 3 bytes. Hex escapes, never literal UTF-8 in a C
+        // literal -- check-ascii forbids that.
+        { "{\"a\":\"\xE2\x82\xAC\"}", 32, "\xE2\x82\xAC",
+          "utf8 integrity: a raw 3-byte sequence survives a big buffer" },
+        { "{\"a\":\"\xE2\x82\xAC\"}",  4, "\xE2\x82\xAC",
+          "utf8 integrity: a raw 3-byte sequence fits in exactly 4 bytes" },
+        { "{\"a\":\"\xE2\x82\xAC\"}",  3, "",
+          "utf8 integrity: a raw 3-byte sequence is refused WHOLE, not split" },
+        { "{\"a\":\"a\xE2\x82\xAC\"}", 4, "a",
+          "utf8 integrity: an overflowing raw sequence truncates after 'a'" },
+        { "{\"a\":\"\xC3\xA9\"}",       2, "",
+          "utf8 integrity: a raw 2-byte sequence is refused WHOLE" },
+        { "{\"a\":\"\xC3\xA9\"}",       3, "\xC3\xA9",
+          "utf8 integrity: a raw 2-byte sequence fits in exactly 3 bytes" },
+
+        // --- 3. ill-formed RAW bytes are still passed through --------------
+        // The reader validates no encoding, so none of these changes shape.
+        { "{\"a\":\"\x80\"}",     32, "\x80",
+          "utf8 integrity: a raw orphan continuation byte passes through" },
+        { "{\"a\":\"\xC3\"}",     32, "\xC3",
+          "utf8 integrity: a raw truncated lead byte passes through" },
+        { "{\"a\":\"\xC3z\"}",    32, "\xC3" "z",
+          "utf8 integrity: a lead byte with no continuation keeps the next "
+          "character" },
+
+        // --- 4. an ESCAPED lead byte, continuations unescaped ---------------
+        // JSON5's `\<anychar>` rule (ES5 NonEscapeCharacter) lets any byte be
+        // escaped, and an ES5 escape covers a CHARACTER, not a byte -- so
+        // `\<C3><A9>` is one escaped U+00E9 written across two source bytes.
+        // Found by a host-side property test over 1.15M (input, buffer-size)
+        // pairs; no hand-written case in this file reached it.
+        //
+        // Only the size-2 row discriminates. The untruncated output is the same
+        // two bytes in the same order however the decoder gets there, so the 32-
+        // and 3-byte rows are regression cover. Verified by sabotage.
+        { "{\"a\":\"\\\xC3\xA9\"}", 32, "\xC3\xA9",
+          "utf8 integrity: an escaped lead byte + its continuation decode as "
+          "one character" },
+        { "{\"a\":\"\\\xC3\xA9\"}",  3, "\xC3\xA9",
+          "utf8 integrity: an escaped 2-byte character fits in exactly 3 bytes" },
+        { "{\"a\":\"\\\xC3\xA9\"}",  2, "",
+          "utf8 integrity: an escaped 2-byte character is refused WHOLE, not "
+          "split after the lead" },
+
+        // --- 5. two ADJACENT one-byte units can form a sequence -------------
+        // The case that killed the atomic-run approach, because no single arm
+        // ever sees these as one unit:
+        //
+        //   \<C3>\<A9>   both bytes escaped separately -- what a naive
+        //                byte-oriented escaper emits for U+00E9
+        //   <C3>\<80>    a raw lead byte, then an escaped continuation
+        //
+        // Truncation BETWEEN the two units split a sequence the untruncated
+        // output had whole. It does NOT matter that these sources are themselves
+        // ill-formed UTF-8: the test is whether truncation introduced
+        // ill-formedness the full decode did not have. An earlier version of
+        // this reasoning waved exactly these away as "ill-formed source, so
+        // pass-through applies" -- wrong, because pass-through is about bytes
+        // AXL was HANDED, not about a sequence AXL assembled and then broke.
+        { "{\"a\":\"\\\xC3\\\xA9\"}", 32, "\xC3\xA9",
+          "utf8 integrity: two separately-escaped bytes decode to one "
+          "character" },
+        { "{\"a\":\"\\\xC3\\\xA9\"}",  3, "\xC3\xA9",
+          "utf8 integrity: two separately-escaped bytes fit in exactly 3" },
+        { "{\"a\":\"\\\xC3\\\xA9\"}",  2, "",
+          "utf8 integrity: a cut BETWEEN two separately-escaped bytes trims "
+          "the half-sequence" },
+        { "{\"a\":\"\xC3\\\x80\"}",   32, "\xC3\x80",
+          "utf8 integrity: a raw lead plus an escaped continuation decodes "
+          "whole" },
+        { "{\"a\":\"\xC3\\\x80\"}",    2, "",
+          "utf8 integrity: a cut between a raw lead and an escaped "
+          "continuation trims the half-sequence" },
+        // Four bytes, each escaped on its own: U+1F600 needs 5 with the NUL.
+        { "{\"a\":\"\\\xF0\\\x9F\\\x98\\\x80\"}", 32, "\xF0\x9F\x98\x80",
+          "utf8 integrity: four separately-escaped bytes decode to one "
+          "4-byte character" },
+        { "{\"a\":\"\\\xF0\\\x9F\\\x98\\\x80\"}",  4, "",
+          "utf8 integrity: a 4-byte character escaped byte-by-byte is trimmed "
+          "whole, not left as 3 bytes" },
+
+        // --- 6. trim only what WE cut, never a byte that simply fit ---------
+        // The trim looks at bytes already written, so on its own it cannot tell
+        // "this lead byte was cut off from its continuations" from "this lead
+        // byte never had any". It guessed the former and threw away a byte that
+        // legitimately fit -- inconsistent with this file's own 32-byte row
+        // asserting that `<C3>z` keeps BOTH bytes: at size 32 the 0xC3 is
+        // legitimate output, so at size 2 it must still be.
+        //
+        // Fixed by asking the SOURCE what the next decoded byte would be, and
+        // trimming only when it is a continuation byte. Exhaustively measured
+        // at ~17% of truncation boundaries over an adversarial byte alphabet
+        // before the fix -- data loss, though never an ill-formed emission.
+        { "{\"a\":\"\xC3z\"}",        2, "\xC3",
+          "utf8 integrity: a lead byte whose successor CANNOT complete it "
+          "survives truncation" },
+        { "{\"a\":\"ab\xE0XY\"}",     4, "ab\xE0",
+          "utf8 integrity: a 3-byte lead followed by non-continuations is kept "
+          "at the bound" },
+        // The other side of the same rule: a COMPLETE sequence must not be
+        // trimmed just because a continuation byte happens to follow it.
+        { "{\"a\":\"\xC3\xA9\x80\"}", 3, "\xC3\xA9",
+          "utf8 integrity: a complete sequence is kept when an orphan "
+          "continuation follows" },
+
+        // A raw high byte immediately before an ESCAPE. This row was written to
+        // discriminate the atomic-run version's one subtle rule -- count the
+        // continuation bytes that are THERE, never the count the lead byte
+        // declares, or the following `\` gets swallowed and stops being an
+        // escape. That mechanism is gone, and with no lookahead the hazard
+        // cannot recur, so the row is now regression cover rather than a
+        // discriminator. Kept deliberately: it is the shape that would break
+        // first if lookahead is ever reintroduced.
+        { "{\"a\":\"\xC3\\n\"}",  32, "\xC3\n",
+          "utf8 integrity: a raw high byte before an escape leaves the escape "
+          "intact" },
+    };
+    size_t n = sizeof(row) / sizeof(row[0]);
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        AxlJsonReader r;
+        char          buf[32];
+
+        axl_memset(buf, (char)0xAA, sizeof(buf));
+        test_check(axl_json_parse(row[i].doc, axl_strlen(row[i].doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_get_string(&r, "a", buf, row[i].size)
+                   && axl_strcmp(buf, row[i].want) == 0
+                   && (row[i].size == sizeof(buf)
+                       || buf[row[i].size] == (char)0xAA),
+                   row[i].msg);
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P9 — a failure says WHAT went wrong, WHERE, and how to fix it
+//
+// Three claims, each with its own rows below.
+//
+//  1. The CODE distinguishes classes a caller acts on differently. The
+//     load-bearing split is INCOMPLETE vs UNEXPECTED_BYTE: "send more bytes"
+//     and "this will never parse" are opposite instructions.
+//
+//  2. The POSITION is usable. offset is a byte index; column counts
+//     CHARACTERS, so a caret lines up on a line with non-ASCII before the
+//     error. Byte and character columns are equal on ASCII, so a test that
+//     only uses ASCII cannot tell them apart -- hence the multibyte row.
+//
+//  3. A DIALECT miss names the flag that would have accepted it. This is the
+//     only recoverable class, and naming the flag is what makes it so.
+//
+// Three sites had to be restructured to make claim 3 true rather than
+// mostly-true; they tested the flag BEFORE recognising the feature, so by the
+// time they failed they no longer knew what had been attempted. The tell was
+// an asymmetry -- `-NaN` reported a dialect miss and `NaN` reported "unknown
+// literal", for one flag. Those rows are marked.
+// ---------------------------------------------------------------------------
+
+static void
+test_json_error_reporting(void)
+{
+    struct {
+        const char      *doc;
+        AxlJsonFlags     flags;
+        AxlJsonErrorCode code;
+        AxlJsonFlags     flag;   /* expected missing_flag, 0 if not DIALECT */
+        const char      *msg;
+    } row[] = {
+        // --- INCOMPLETE: ran out of input --------------------------------
+        { "{\"a\":1",        AXL_JSON_STRICT, AXL_JSON_ERR_INCOMPLETE, 0,
+          "err: unterminated object is INCOMPLETE" },
+        { "[1,2",            AXL_JSON_STRICT, AXL_JSON_ERR_INCOMPLETE, 0,
+          "err: unterminated array is INCOMPLETE" },
+        { "\"abc",           AXL_JSON_STRICT, AXL_JSON_ERR_INCOMPLETE, 0,
+          "err: unterminated string is INCOMPLETE" },
+        { "{\"a\":\"\\u00",  AXL_JSON_STRICT, AXL_JSON_ERR_INCOMPLETE, 0,
+          "err: \\u escape running off the end is INCOMPLETE, not BAD_ESCAPE" },
+        { "{\"a\":1}/*",     AXL_JSON_JSON5,  AXL_JSON_ERR_INCOMPLETE, 0,
+          "err: unterminated block comment is INCOMPLETE" },
+
+        // --- BAD_ESCAPE: the other half of the same two sites -------------
+        { "{\"a\":\"\\uZZZZ\"}", AXL_JSON_STRICT, AXL_JSON_ERR_BAD_ESCAPE, 0,
+          "err: \\u with non-hex digits is BAD_ESCAPE, not INCOMPLETE" },
+        { "{a:'\\xZZ'}",     AXL_JSON_JSON5,  AXL_JSON_ERR_BAD_ESCAPE, 0,
+          "err: \\x with non-hex digits is BAD_ESCAPE" },
+
+        // --- BAD_NUMBER ---------------------------------------------------
+        { "{\"a\":01}",      AXL_JSON_STRICT, AXL_JSON_ERR_BAD_NUMBER, 0,
+          "err: leading zero is BAD_NUMBER" },
+        { "{\"a\":1e}",      AXL_JSON_STRICT, AXL_JSON_ERR_BAD_NUMBER, 0,
+          "err: empty exponent is BAD_NUMBER" },
+
+        // --- UNEXPECTED_BYTE: no flag can rescue these --------------------
+        { "{\"a\":tru}",     AXL_JSON_STRICT, AXL_JSON_ERR_UNEXPECTED_BYTE, 0,
+          "err: a broken literal is UNEXPECTED_BYTE" },
+        { "{\"a\":\"x\ny\"}", AXL_JSON_JSON5, AXL_JSON_ERR_UNEXPECTED_BYTE, 0,
+          "err: a raw LF in a string is UNEXPECTED_BYTE (no flag allows it)" },
+
+        // --- TRAILING -----------------------------------------------------
+        { "{} junk",         AXL_JSON_STRICT, AXL_JSON_ERR_TRAILING, 0,
+          "err: content after a complete value is TRAILING" },
+
+        // --- DEPTH --------------------------------------------------------
+        { "[[[[[1]]]]]",     AXL_JSON_STRICT | AXL_JSON_DEPTH(2),
+          AXL_JSON_ERR_DEPTH, 0, "err: past the depth bound is DEPTH" },
+
+        // --- DIALECT: every one names its flag ----------------------------
+        { "{\"a\":1}//c",    AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_COMMENTS,
+          "err: a comment names ALLOW_COMMENTS" },
+        { "{'a':1}",         AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_SINGLE_QUOTES,
+          "err: a single-quoted KEY names ALLOW_SINGLE_QUOTES" },
+        { "{\"a\":1,}",      AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_TRAILING_COMMA,
+          "err: a trailing comma names ALLOW_TRAILING_COMMA "
+          "(was 'expected object key (got 0x7D)')" },
+        { "{a:1}",           AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_UNQUOTED_KEYS,
+          "err: an unquoted key names ALLOW_UNQUOTED_KEYS" },
+        { "{\"a\":+5}",      AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_PLUS_SIGN,
+          "err: a leading + names ALLOW_PLUS_SIGN" },
+        { "{\"a\":.5}",      AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_LEADING_POINT,
+          "err: a leading point names ALLOW_LEADING_POINT" },
+        { "{\"a\":-NaN}",    AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_NAN_INF,
+          "err: SIGNED NaN names ALLOW_NAN_INF" },
+
+        // RESTRUCTURED. Each of these reported a generic code before P9,
+        // while its sibling above reported DIALECT -- one feature diagnosed
+        // two ways depending on a sign, a quote position, or a flag check
+        // that ran too early.
+        { "{\"a\":NaN}",     AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_NAN_INF,
+          "err: UNSIGNED NaN names ALLOW_NAN_INF too (was 'unknown literal')" },
+        { "{\"a\":'x'}",     AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_SINGLE_QUOTES,
+          "err: a single-quoted VALUE names ALLOW_SINGLE_QUOTES "
+          "(was 'unexpected char')" },
+        { "{\"a\":0x1A}",    AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_HEX,
+          "err: a hex literal names ALLOW_HEX (was a separator error, "
+          "reported at the wrong place)" },
+        { "{\"a\":\"x\ty\"}", AXL_JSON_STRICT, AXL_JSON_ERR_DIALECT,
+          AXL_JSON_ALLOW_EXTRA_WHITESPACE,
+          "err: a raw TAB names ALLOW_EXTRA_WHITESPACE, unlike a raw LF" },
+    };
+    size_t n = sizeof(row) / sizeof(row[0]);
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        AxlJsonReader       r;
+        const AxlJsonError *e;
+        bool                ok;
+
+        ok = axl_json_parse(row[i].doc, axl_strlen(row[i].doc),
+                                  row[i].flags, &r);
+        e  = axl_json_reader_error(&r);
+        test_check(!ok && e->code == row[i].code
+                   && e->missing_flag == row[i].flag,
+                   row[i].msg);
+        if (ok) { axl_json_free(&r); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P9 — position, consumed(), and the paths that used to report nothing
+// ---------------------------------------------------------------------------
+
+static void
+test_json_error_position(void)
+{
+    AxlJsonReader       r;
+    const AxlJsonError *e;
+
+    // --- column counts CHARACTERS, not bytes -----------------------------
+    // The ONLY row here that can tell the two apart. On pure ASCII they are
+    // equal, so every other position assertion in this file would pass just
+    // as well against a byte-counting implementation. The 'é' is two bytes,
+    // so a byte column reports 13 where a character column reports 12.
+    {
+        const char *doc = "{\"\xC3\xA9\":1,\"x\":tru}";
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                         AXL_JSON_STRICT, &r),
+                   "err pos: the multibyte document is rejected");
+        e = axl_json_reader_error(&r);
+        test_check(e->offset == 12,
+                   "err pos: offset is a BYTE index (12)");
+        test_check(e->column == 12,
+                   "err pos: column is a CHARACTER count (12, not 13)");
+        test_check(e->line == 1, "err pos: single-line document is line 1");
+    }
+
+    // --- line and column on a multi-line document ------------------------
+    {
+        const char *doc = "{\n  \"a\": tru\n}";
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                         AXL_JSON_STRICT, &r),
+                   "err pos: the multi-line document is rejected");
+        e = axl_json_reader_error(&r);
+        test_check(e->line == 2,   "err pos: line counts newlines (2)");
+        test_check(e->column == 8, "err pos: column restarts after a newline (8)");
+    }
+
+    // --- a SUCCESSFUL parse reports OK and a zeroed position --------------
+    {
+        const char *doc = "{\"a\":1}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT, &r),
+                   "err pos: a good document parses");
+        e = axl_json_reader_error(&r);
+        test_check(e->code == AXL_JSON_OK && e->offset == 0
+                   && e->line == 0 && e->column == 0
+                   && e->missing_flag == 0,
+                   "err pos: success leaves the error fully zeroed");
+        axl_json_free(&r);
+    }
+}
+
+static void
+test_json_reader_consumed(void)
+{
+    AxlJsonReader r;
+
+    // Trailing whitespace is NOT counted: the next document starts at or
+    // after this offset, so a caller that skips whitespace itself does not
+    // have it counted twice.
+    {
+        const char *doc = "{\"a\":1}   ";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT, &r)
+                   && axl_json_reader_consumed(&r) == 7,
+                   "consumed: stops at the root value, excluding trailing space");
+        axl_json_free(&r);
+    }
+
+    // The point of the accessor: NDJSON. Parse one value, learn where it
+    // stopped, parse the next from there. Asserted as an actual round trip
+    // rather than as a number, because the number alone would not show that
+    // the offset is USABLE as a restart point.
+    {
+        const char *doc = "{\"a\":1} {\"b\":2}";
+        size_t      at;
+        int64_t     v = 0;
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                         AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_TRAILING,
+                   "consumed: a second document trailing the first is TRAILING");
+        at = axl_json_reader_consumed(&r);
+        test_check(at == 8, "consumed: on failure it is where we stopped");
+
+        test_check(axl_json_parse(doc + at, axl_strlen(doc) - at,
+                                        AXL_JSON_STRICT, &r)
+                   && axl_json_get_int(&r, "b", &v) && v == 2,
+                   "consumed: resuming from it parses the NEXT document");
+        axl_json_free(&r);
+    }
+
+    // A STRING root. The token convention is NOT uniform: [start, end)
+    // brackets a string's INNER content, so `end` is the index OF the closing
+    // quote, while OBJECT/ARRAY/PRIMITIVE store one-past. Reading `end`
+    // uniformly under-reported by one byte -- and only for strings, which is
+    // why every other row here passed. Found by review, not by these tests.
+    {
+        const char *doc = "\"hello\"";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT, &r)
+                   && axl_json_reader_consumed(&r) == 7,
+                   "consumed: a STRING root counts its closing quote");
+        axl_json_free(&r);
+    }
+
+    // The failure that off-by-one produced, stated as the loop it broke:
+    // resuming ON the closing quote reports a spurious INCOMPLETE.
+    {
+        const char *doc = "\"a\" \"b\"";
+        size_t      at;
+        char        buf[8];
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT, &r) == false
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_TRAILING,
+                   "consumed: two string documents trail");
+        at = axl_json_reader_consumed(&r);
+        test_check(axl_json_parse(doc + at, axl_strlen(doc) - at,
+                                        AXL_JSON_STRICT, &r)
+                   && axl_json_value_string(&r, buf, sizeof(buf))
+                   && axl_strcmp(buf, "b") == 0,
+                   "consumed: an NDJSON loop over STRING documents resumes");
+        axl_json_free(&r);
+    }
+
+    test_check(axl_json_reader_consumed(NULL) == 0,
+               "consumed: NULL reader answers 0");
+}
+
+static void
+test_json_error_argument_paths(void)
+{
+    AxlJsonReader r;
+    AxlJsonWriter w;
+
+    // These three paths returned false WITHOUT TOUCHING the reader before P9,
+    // so a caller following the docstring read stack garbage. Poisoned first
+    // so "untouched" cannot masquerade as a pass.
+    axl_memset(&r, 0xAA, sizeof(r));
+    test_check(!axl_json_parse(NULL, 10, AXL_JSON_STRICT, &r)
+               && axl_json_reader_error(&r)->code
+                  == AXL_JSON_ERR_INVALID_ARGUMENT,
+               "err args: a NULL document reports INVALID_ARGUMENT");
+
+    axl_memset(&r, 0xAA, sizeof(r));
+    test_check(!axl_json_parse("{}", 0, AXL_JSON_STRICT, &r)
+               && axl_json_reader_error(&r)->code
+                  == AXL_JSON_ERR_INVALID_ARGUMENT,
+               "err args: a zero length reports INVALID_ARGUMENT");
+
+    {
+        AxlJsonReader lr;
+        void         *buf = NULL;
+        size_t        blen = 0;
+
+        axl_memset(&lr, 0xAA, sizeof(lr));
+        test_check(!axl_json_load_file("fs0:\\axl_no_such_file.json", AXL_JSON_RELAXED,
+                                       &lr, &buf, &blen)
+                   && axl_json_reader_error(&lr)->code == AXL_JSON_ERR_IO,
+                   "err args: a file that will not open reports IO");
+    }
+
+    test_check(axl_json_reader_error(NULL)->code == AXL_JSON_OK,
+               "err args: a NULL reader yields a dereferenceable OK record");
+
+    // --- the writer half --------------------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_OK,
+                   "err args: a freshly initialised writer reads OK");
+    }
+    axl_memset(&w, 0xAA, sizeof(w));
+    axl_json_writer_init(&w, NULL, AXL_JSON_STRICT);
+    test_check(axl_json_writer_error_info(&w)->code
+               == AXL_JSON_ERR_INVALID_ARGUMENT,
+               "err args: a writer with no backing store reports "
+               "INVALID_ARGUMENT");
+    test_check(axl_json_writer_error_info(NULL)->code == AXL_JSON_OK,
+               "err args: a NULL writer yields a dereferenceable OK record");
+
+    // A REAL writer failure, which is the case the accessor exists for and
+    // the one it got wrong: 21 sites latched the sticky bool and exactly one
+    // set a code, so this reported OK for every genuine error. The pre-existing
+    // "misuse sets error" test could not catch it -- it only checked the bool.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        const AxlJsonError    *e;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_arr_begin(&w);
+        axl_json_key(&w, "nope");        /* a key inside an ARRAY */
+        e = axl_json_writer_error_info(&w);
+        test_check(axl_json_writer_error(&w)
+                   && e->code == AXL_JSON_ERR_WRITER_STATE,
+                   "err writer: a key inside an array reports WRITER_STATE, "
+                   "not OK");
+    }
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        uint32_t               d;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        for (d = 0; d <= AXL_JSON_WRITER_MAX_DEPTH; d++) {
+            axl_json_arr_begin(&w);
+        }
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_DEPTH,
+                   "err writer: nesting past the cap reports DEPTH");
+    }
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_key(&w, NULL);
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "err writer: a NULL key reports INVALID_ARGUMENT, "
+                   "distinct from state misuse");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,7 +1932,7 @@ test_json_load_file(void)
                "json_load_file: set_contents seeds the fixture");
 
     /* Successful load. */
-    test_check(axl_json_load_file(path, &r, &raw, &raw_len),
+    test_check(axl_json_load_file(path, AXL_JSON_RELAXED, &r, &raw, &raw_len),
                "json_load_file: load + parse succeeds");
     test_check(raw != NULL && raw_len == sizeof(json) - 1,
                "json_load_file: out_buf populated, out_len matches file size");
@@ -939,7 +1948,7 @@ test_json_load_file(void)
     /* Failure path: missing file leaves out_buf NULL and returns false. */
     AxlJsonReader r2  = { 0 };
     void         *raw2 = (void *)0xdead;   /* sentinel; impl must overwrite */
-    test_check(!axl_json_load_file("fs0:\\__definitely_missing__.tmp",
+    test_check(!axl_json_load_file("fs0:\\__definitely_missing__.tmp", AXL_JSON_RELAXED,
                                    &r2, &raw2, NULL),
                "json_load_file: missing file returns false");
     test_check(raw2 == NULL,
@@ -961,7 +1970,7 @@ test_json_build(void)
 
     // Build a simple object
     AxlString *out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_kv_str(&w, "name", "devkit");
     axl_json_kv_int(&w, "version", 42);
@@ -975,7 +1984,7 @@ test_json_build(void)
 
     // Round-trip: parse what we built
     const char *built = axl_string_str(out);
-    test_check(axl_json_parse(built, len, &r), "json build: round-trip parse");
+    test_check(axl_json_parse(built, len, AXL_JSON_RELAXED, &r), "json build: round-trip parse");
     test_check(axl_json_get_string(&r, "name", str_buf, sizeof(str_buf))
                && axl_strcmp(str_buf, "devkit") == 0,
                "json build: round-trip name");
@@ -989,7 +1998,7 @@ test_json_build(void)
 
     // Structural-misuse test: emit a key inside an array (should set sticky error)
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_arr_begin(&w);
     axl_json_key(&w, "bad");        // illegal: key inside array
     axl_json_writer_finish(&w);
@@ -998,7 +2007,7 @@ test_json_build(void)
 
     // Nested: array of strings, object with named array
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
         axl_json_key(&w, "items");
         axl_json_arr_begin(&w);
@@ -1016,7 +2025,7 @@ test_json_build(void)
 
     // Pretty mode
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_obj_begin(&w);
     axl_json_kv_str(&w, "name", "AXL");
     axl_json_kv_uint(&w, "version", 1);
@@ -1030,9 +2039,10 @@ test_json_build(void)
 
     // Bridge: write_token splices a parsed sub-document
     const char *src = "{\"a\":1,\"b\":[2,3]}";
-    test_check(axl_json_parse(src, axl_strlen(src), &r), "json bridge: parse src");
+    test_check(axl_json_parse(src, axl_strlen(src), AXL_JSON_RELAXED, &r),
+               "json bridge: parse src");
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
         axl_json_key(&w, "wrapped");
         axl_json_write_token(&w, &r, 0);   // splice entire src doc
@@ -1047,10 +2057,10 @@ test_json_build(void)
 
     // Bridge: \uXXXX escapes round-trip verbatim
     const char *uesc = "{\"k\":\"a\\u00e9b\"}";
-    test_check(axl_json_parse(uesc, axl_strlen(uesc), &r),
+    test_check(axl_json_parse(uesc, axl_strlen(uesc), AXL_JSON_RELAXED, &r),
                "json bridge: parse escape src");
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_write_token(&w, &r, 0);
     axl_json_writer_finish(&w);
     test_check(!axl_json_writer_error(&w),
@@ -1060,17 +2070,24 @@ test_json_build(void)
     axl_json_free(&r);
     axl_string_free(out);
 
-    // Top-level atom rejection (matches parser's bare-primitive rejection)
+    /* A top-level atom is a DOCUMENT, not a misuse. This assertion was the
+       inverse, and its comment said it "matches parser's bare-primitive
+       rejection" -- a rule RFC 4627 imposed, RFC 8259 §2 dropped in 2014, and
+       P3 removed from the reader. Inverted rather than deleted: the writer
+       agreeing with the reader about what a document is only stays true if
+       something checks it. Exact string, so this cannot pass on `{...}`. */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_str(&w, "lonely");
-    test_check(axl_json_writer_error(&w),
-               "json build: top-level atom is rejected");
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w) &&
+               axl_strcmp(axl_string_str(out), "\"lonely\"") == 0,
+               "json build: a top-level atom is a document");
     axl_string_free(out);
 
     // Empty containers in pretty mode emit no internal whitespace
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_obj_begin(&w);
     axl_json_obj_end(&w);
     axl_json_writer_finish(&w);
@@ -1078,8 +2095,197 @@ test_json_build(void)
                "json build: pretty empty object is {}");
     axl_string_free(out);
 
+    // UTF-8 passes through byte-for-byte. `char` is SIGNED on both targets, so
+    // reading a byte into one puts 0x80-0xFF in -128..-1 — which satisfies the
+    // "skip control characters" test and silently ate every non-ASCII byte.
+    // RFC 8259 §7 requires escaping only '"', '\\' and 0x00-0x1F, so the raw
+    // bytes are correct output. Exact compares, and every quoting path is
+    // covered: keys and values, NUL-terminated and counted.
+    const char *EM   = "em\xE2\x80\x94""dash";      /* U+2014 */
+    const char *CJK  = "\xE4\xB8\xAD\xE6\x96\x87";  /* U+4E2D U+6587 */
+    const char *HIGH = "\xC2\x80\xC3\xBF";          /* U+0080, U+00FF — the boundary */
+
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "msg", EM);            /* emit_quoted, value */
+        axl_json_key(&w, CJK);                     /* emit_quoted, key   */
+        axl_json_str(&w, HIGH);
+        axl_json_keyn(&w, CJK, axl_strlen(CJK));   /* emit_quoted_n, key */
+        axl_json_strn(&w, EM, axl_strlen(EM));     /* emit_quoted_n, val */
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w), "json utf8: no error");
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"msg\":\"em\xE2\x80\x94""dash\","
+                          "\"\xE4\xB8\xAD\xE6\x96\x87\":\"\xC2\x80\xC3\xBF\","
+                          "\"\xE4\xB8\xAD\xE6\x96\x87\":\"em\xE2\x80\x94""dash\"}") == 0,
+               "json utf8: writer emits every non-ASCII byte verbatim");
+
+    // Round-trip it back out, so this pins the whole path a consumer uses
+    // (SoftBMC's GET /api/logs was losing the dash between these two points).
+    test_check(axl_json_parse(axl_string_str(out),
+                              axl_string_len(out), AXL_JSON_RELAXED, &r),
+               "json utf8: round-trip parse");
+    test_check(axl_json_get_string(&r, "msg", str_buf, sizeof(str_buf))
+               && axl_strcmp(str_buf, EM) == 0,
+               "json utf8: round-trip preserves the em dash");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    // Same defect, third site: the standalone escaper.
+    char esc[64];
+    test_check(axl_json_escape_string(EM, esc, sizeof(esc)) > 0
+               && axl_strcmp(esc, "\"em\xE2\x80\x94""dash\"") == 0,
+               "json utf8: escape_string keeps non-ASCII bytes");
+
+    // Control characters are still dropped — the fix must not widen the skip
+    // set into a pass-everything.
+    test_check(axl_json_escape_string("a\x01\x1F""b", esc, sizeof(esc)) > 0
+               && axl_strcmp(esc, "\"ab\"") == 0,
+               "json utf8: real control chars are still skipped");
+
+    // ---- Ill-formed UTF-8 in => valid JSON out -----------------------------
+    // Letting non-ASCII bytes through (above) means an ill-formed sequence now
+    // reaches the output verbatim, and RFC 8259 §8.1 documents are defined over
+    // Unicode CODE POINTS — so a lone continuation byte makes the whole document
+    // invalid and strict consumers reject it. The writer is the boundary that
+    // owes the format's guarantee, so it substitutes U+FFFD.
+    //
+    // Reachable two ways today, neither hypothetical:
+    //   1. axl_log's buf_write truncates at a raw byte count (axl-log.c:55),
+    //      so a message crossing MSG_BUF_SIZE mid-sequence leaves a partial one.
+    //   2. axl_smbios_get_string_utf8 hands back raw firmware bytes unvalidated;
+    //      vendor tables carry latin-1 in the wild.
+    //
+    // Recovery matches axl_utf8_decode's documented contract exactly — consume
+    // ONE byte per ill-formed byte and resynchronize — so the JSON path adds no
+    // validator of its own. That yields one U+FFFD per bad byte rather than one
+    // per maximal subpart; both are conformant (Unicode's maximal-subpart rule
+    // is a recommendation), and the difference only shows on input that is
+    // already corrupt.
+    // Truncated 3-byte sequence at end of string — the log-truncation shape.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "msg", "em\xE2\x80");
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"msg\":\"em\xEF\xBF\xBD\xEF\xBF\xBD\"}") == 0,
+               "json utf8: truncated sequence becomes U+FFFD");
+    axl_string_free(out);
+
+    // Lone continuation byte mid-string, and a lone lead byte.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "cont", "a\x80""b");
+        axl_json_kv_str(&w, "over", "\xC0\xAF");        /* overlong '/' */
+        axl_json_kv_str(&w, "surr", "\xED\xA0\x80");    /* U+D800 surrogate */
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"cont\":\"a\xEF\xBF\xBD""b\","
+                          "\"over\":\"\xEF\xBF\xBD\xEF\xBF\xBD\","
+                          "\"surr\":\"\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\"}") == 0,
+               "json utf8: orphan/overlong/surrogate all become U+FFFD");
+    axl_string_free(out);
+
+    // A 4-byte astral sequence is WELL-formed and must survive verbatim — the
+    // failure mode of an over-broad fix is mangling valid input.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "emoji", "\xF0\x9F\x98\x80");   /* U+1F600 */
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"emoji\":\"\xF0\x9F\x98\x80\"}") == 0,
+               "json utf8: valid 4-byte astral sequence passes verbatim");
+    axl_string_free(out);
+
+    // Counted path: the sequence is cut by n, NOT by a NUL. The bytes past n
+    // are present and valid in the underlying buffer, so a writer that decodes
+    // without bounding on n emits a well-formed em dash and passes for the
+    // wrong reason. Mutating INWARD like this is what makes the assertion
+    // discriminate.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_keyn(&w, "em\xE2\x80\x94""k", 4);   /* key   — cuts U+2014 */
+        axl_json_strn(&w, EM, 4);                    /* value — cuts U+2014 */
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"em\xEF\xBF\xBD\xEF\xBF\xBD\":"
+                          "\"em\xEF\xBF\xBD\xEF\xBF\xBD\"}") == 0,
+               "json utf8: counted path never decodes past n");
+    axl_string_free(out);
+
+    // Third quoting path: the standalone escaper.
+    test_check(axl_json_escape_string("em\xE2\x80", esc, sizeof(esc)) > 0
+               && axl_strcmp(esc, "\"em\xEF\xBF\xBD\xEF\xBF\xBD\"") == 0,
+               "json utf8: escape_string substitutes U+FFFD too");
+
+    // The substitute is 3 bytes where the input was 1, so it must respect the
+    // caller's buffer and report overflow rather than write past it.
+    char tiny[8];
+    test_check(axl_json_escape_string("\x80\x80\x80", tiny, sizeof(tiny)) == -1,
+               "json utf8: escape_string reports overflow when U+FFFD grows past the buffer");
+
+    // Round-trip: the whole point is that a strict consumer can parse it back.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "msg", "em\xE2\x80");
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_json_parse(axl_string_str(out), axl_string_len(out), AXL_JSON_RELAXED, &r)
+               && axl_json_get_string(&r, "msg", str_buf, sizeof(str_buf))
+               && axl_strcmp(str_buf, "em\xEF\xBF\xBD\xEF\xBF\xBD") == 0,
+               "json utf8: repaired document round-trips");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    // axl_json_write_token splices source bytes verbatim so it preserves the
+    // original \uXXXX representation — but the lexer validates no UTF-8 on the
+    // way in (that is AXL_JSON_UTF8_* work, still to land on the read side),
+    // so a re-serialized document carried ill-formed bytes straight back out.
+    // Reached via axl_json_parse, which is AXL_JSON_RELAXED and therefore
+    // carries UTF8_RAW — the case this repair exists for. The
+    // splice must repair without escaping: every JSON escape byte is ASCII, so
+    // "\\u00e9" and friends must survive untouched.
+    const char *BAD_DOC = "{\"k\xE2\x80\":\"v\x80\",\"esc\":\"a\\u00e9\\\"b\"}";
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    test_check(axl_json_parse(BAD_DOC, axl_strlen(BAD_DOC), AXL_JSON_RELAXED, &r),
+               "json utf8: ill-formed source document still parses");
+    axl_json_write_token(&w, &r, 0);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{\"k\xEF\xBF\xBD\xEF\xBF\xBD\":\"v\xEF\xBF\xBD\","
+                          "\"esc\":\"a\\u00e9\\\"b\"}") == 0,
+               "json utf8: write_token repairs key and value, keeps escapes verbatim");
+    axl_json_free(&r);
+    axl_string_free(out);
+
+    // A comment body is not a "string", but it lands in the same document and
+    // an ill-formed byte there invalidates it just the same.
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+    axl_json_obj_begin(&w);
+        axl_json_comment(&w, "note \x80 here");
+        axl_json_kv_int(&w, "n", 1);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(axl_strcmp(axl_string_str(out),
+                          "{/* note \xEF\xBF\xBD here */\"n\":1}") == 0,
+               "json utf8: comment body is repaired too");
+    axl_string_free(out);
+
+    out = axl_string_new(NULL);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_arr_begin(&w);
     axl_json_arr_end(&w);
     axl_json_writer_finish(&w);
@@ -1089,7 +2295,7 @@ test_json_build(void)
 
     // Numeric boundary: INT64_MIN
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_kv_int(&w, "min", INT64_MIN);
     axl_json_obj_end(&w);
@@ -1101,7 +2307,7 @@ test_json_build(void)
 
     // Numeric boundary: UINT64_MAX
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_kv_uint(&w, "max", UINT64_MAX);
     axl_json_obj_end(&w);
@@ -1113,7 +2319,7 @@ test_json_build(void)
 
     // Writer in error state no-ops subsequent calls
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_arr_begin(&w);
     axl_json_key(&w, "bad");        // sets sticky error
     size_t len_at_error = axl_string_len(out);
@@ -1127,7 +2333,7 @@ test_json_build(void)
 
     // axl_json_raw(NULL) sets sticky error
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_key(&w, "x");
     axl_json_raw(&w, NULL);
@@ -1137,7 +2343,7 @@ test_json_build(void)
 
     // axl_json_kv_strn for non-NUL-terminated values
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     const char *not_terminated = "abcXYZ";   // pretend len-3 slice
     axl_json_obj_begin(&w);
     axl_json_kv_strn(&w, "k", not_terminated, 3);
@@ -1159,9 +2365,963 @@ test_json5_build(void)
     AxlJsonReader r;
     AxlString    *out;
 
+    /* --- P1 migration baseline -------------------------------------------
+       Pins the EXACT output of every flag the AxlJsonFlags redesign replaces,
+       written against the OLD constants and passing BEFORE the rename. The
+       clean break is supposed to change names and nothing else, and "nothing
+       else" is only a claim until something compares bytes across it.
+       Migration table (docs/AXL-JSON-Design.md):
+         AXL_JSON_WRITER_DEFAULT         -> AXL_JSON_STRICT
+         AXL_JSON_WRITER_PRETTY          -> AXL_JSON_INDENT(2)
+         AXL_JSON_WRITER_TRAILING_COMMAS -> AXL_JSON_ALLOW_TRAILING_COMMA
+         AXL_JSON_PARSER_DEFAULT         -> AXL_JSON_STRICT
+         AXL_JSON_PARSER_JSON5           -> AXL_JSON_JSON5
+       The assertions below now use the NEW names; they passed against the OLD
+       ones in 60d38100, which is what makes them a before/after proof rather
+       than a fresh snapshot of whatever the code does today.
+       Each case nests two levels, so indentation depth is pinned rather than
+       just "there are newlines". */
+    {
+        struct { AxlJsonFlags flags; const char *want; const char *what; } mig[] = {
+            { AXL_JSON_STRICT,
+              "{\"n\":1,\"a\":[2,3],\"o\":{\"k\":\"v\"}}",
+              "migration baseline: DEFAULT is compact" },
+            { AXL_JSON_INDENT(2),
+              "{\n  \"n\": 1,\n  \"a\": [\n    2,\n    3\n  ],\n"
+              "  \"o\": {\n    \"k\": \"v\"\n  }\n}",
+              "migration baseline: PRETTY is 2-space, nested" },
+            { AXL_JSON_ALLOW_TRAILING_COMMA,
+              "{\"n\":1,\"a\":[2,3,],\"o\":{\"k\":\"v\",},}",
+              "migration baseline: TRAILING_COMMAS at every depth" },
+            { AXL_JSON_INDENT(2) | AXL_JSON_ALLOW_TRAILING_COMMA,
+              "{\n  \"n\": 1,\n  \"a\": [\n    2,\n    3,\n  ],\n"
+              "  \"o\": {\n    \"k\": \"v\",\n  },\n}",
+              "migration baseline: PRETTY + TRAILING_COMMAS compose" },
+        };
+        for (size_t mi = 0; mi < sizeof(mig) / sizeof(mig[0]); mi++) {
+            AxlString    *mo = axl_string_new(NULL);
+            AxlJsonWriter mw;
+            axl_json_writer_init(&mw, mo, mig[mi].flags);
+            axl_json_obj_begin(&mw);
+                axl_json_kv_int(&mw, "n", 1);
+                axl_json_key(&mw, "a");
+                axl_json_arr_begin(&mw);
+                    axl_json_int(&mw, 2);
+                    axl_json_int(&mw, 3);
+                axl_json_arr_end(&mw);
+                axl_json_key(&mw, "o");
+                axl_json_obj_begin(&mw);
+                    axl_json_kv_str(&mw, "k", "v");
+                axl_json_obj_end(&mw);
+            axl_json_obj_end(&mw);
+            axl_json_writer_finish(&mw);
+            test_check(!axl_json_writer_error(&mw) &&
+                       axl_strcmp(axl_string_str(mo), mig[mi].want) == 0,
+                       mig[mi].what);
+            axl_string_free(mo);
+        }
+
+        /* Reader side: the same document under each parser flag. STRICT must
+           REJECT the JSON5 spelling, or "JSON5 still works" would pass against
+           a parser that had quietly become permissive for everyone. */
+        const char *strict_doc = "{\"a\":1}";
+        const char *json5_doc  = "{ a: 0x10, /* c */ }";
+        AxlJsonReader mr;
+        int64_t mv = 0;
+        test_check(axl_json_parse(strict_doc, axl_strlen(strict_doc),
+                                        AXL_JSON_STRICT, &mr),
+                   "migration baseline: PARSER_DEFAULT accepts strict JSON");
+        axl_json_free(&mr);
+        /* These six were a CHARACTERIZATION of jsmn: compiled without
+           JSMN_STRICT it was permissive, so four of them recorded a "strict"
+           mode that TOLERATED unquoted keys, hex, single quotes and a trailing
+           comma. P3 deleted jsmn and routed every dialect through the one
+           lexer, so all four invert -- and that inversion is the phase's
+           headline behavior change, which is why they stay here as assertions
+           rather than being deleted. The two that already rejected still do.
+
+           Note what did NOT invert: a bare-primitive root. jsmn refused `42`
+           and so did the lexer, but RFC 8259 §2 makes any value a document, so
+           that shared behavior was a shared BUG. Pinned as accepted below. */
+        struct { const char *doc; bool strict_ok; const char *what; } sd[] = {
+            { "{ a: 1 }",          false,
+              "strict: rejects an unquoted key (was tolerated by jsmn)" },
+            { "{ \"a\": 0x10 }",   false,
+              "strict: rejects a hex literal (was tolerated by jsmn)" },
+            { "{ 'a': 1 }",        false,
+              "strict: rejects single quotes (was tolerated by jsmn)" },
+            { "{ \"a\": 1, }",     false,
+              "strict: rejects a trailing comma (was tolerated by jsmn)" },
+            { "// c\n{ \"a\": 1 }", false,
+              "strict: rejects a COMMENT (unchanged from jsmn)" },
+            { "{ \"a\": 1",         false,
+              "strict: rejects an unterminated object (unchanged from jsmn)" },
+        };
+        for (size_t si = 0; si < sizeof(sd) / sizeof(sd[0]); si++) {
+            AxlJsonReader sr;
+            bool got = axl_json_parse(sd[si].doc, axl_strlen(sd[si].doc),
+                                            AXL_JSON_STRICT, &sr);
+            if (got) { axl_json_free(&sr); }
+            test_check(got == sd[si].strict_ok, sd[si].what);
+        }
+        test_check(axl_json_parse(json5_doc, axl_strlen(json5_doc),
+                                        AXL_JSON_JSON5, &mr)
+                   && axl_json_get_int(&mr, "a", &mv) && mv == 0x10,
+                   "migration baseline: PARSER_JSON5 accepts JSON5");
+        axl_json_free(&mr);
+    }
+
+    /* --- AxlJsonFlags packing ---------------------------------------------
+       AXL_JSON_INDENT(n) packs a width into bits 32+ of the same word that
+       carries ~20 boolean flags. Two things must hold or the whole space is
+       unsafe, and neither is visible from output alone. */
+    {
+        /* Round-trip over the FULL declared range, not a sample. An off-by-one
+           mask (0x1F instead of 0x3F) passes for every n < 32. */
+        bool rt_ok = true, presence_ok = true;
+        for (uint32_t n = 0; n <= 63; n++) {
+            AxlJsonFlags f = AXL_JSON_INDENT(n);
+            if (AXL_JSON_INDENT_OF(f) != n)          { rt_ok = false; }
+            if ((f & AXL_JSON_HAS_INDENT) == 0)      { presence_ok = false; }
+        }
+        test_check(rt_ok, "flags: INDENT_OF(INDENT(n)) == n for every n in 0..63");
+
+        /* CLAMPS, does not mask. Masking would turn 64 into 0 -- a wider
+           request silently becoming "no indent at all" -- which is the wrong
+           answer a caller computing a width from config would get. */
+        test_check(AXL_JSON_INDENT_OF(AXL_JSON_INDENT(64)) == 63 &&
+                   AXL_JSON_INDENT_OF(AXL_JSON_INDENT(1000)) == 63,
+                   "flags: INDENT(n) clamps above the max instead of wrapping to 0");
+        /* The macro must stay a CONSTANT EXPRESSION -- a file-scope
+           initializer proves it, and nothing else in the suite would (C99
+           lets automatic aggregates take non-constant initializers, so every
+           in-function use compiles either way). */
+        test_check(AXL_JSON_INDENT_OF(kIndentConstExpr) == 2 &&
+                   (kIndentConstExpr & AXL_JSON_COMPACT) != 0,
+                   "flags: INDENT(n) is usable in a constant expression");
+        /* The single-evaluation form, for a runtime/side-effecting width. */
+        uint32_t side = 3;
+        AxlJsonFlags once = axl_json_indent(side++);
+        test_check(side == 4 && AXL_JSON_INDENT_OF(once) == 3,
+                   "flags: axl_json_indent evaluates n exactly once");
+        test_check(axl_json_indent(1000) == AXL_JSON_INDENT(1000),
+                   "flags: macro and function forms agree, both clamped");
+        test_check(presence_ok, "flags: INDENT(n) always sets the presence bit");
+
+        /* The presence bit is the ONLY thing separating "no indent" from
+           INDENT(0) -- both have a zero width field. If these ever compare
+           equal, compact and newlines-at-zero-indent become indistinguishable. */
+        test_check(AXL_JSON_INDENT(0) != AXL_JSON_STRICT,
+                   "flags: INDENT(0) is distinguishable from no-indent");
+        test_check(AXL_JSON_INDENT_OF(AXL_JSON_STRICT) == 0,
+                   "flags: INDENT_OF is 0 when no indent was requested");
+
+        /* No collision: the widest indent OR'd with every boolean flag we
+           define. Each must still read back, and the width must survive. */
+        const AxlJsonFlags all_bools =
+            AXL_JSON_JSON5 | AXL_JSON_COMPACT | AXL_JSON_ENSURE_ASCII |
+            AXL_JSON_ESCAPE_SLASH | AXL_JSON_EMBED | AXL_JSON_SORT_KEYS |
+            AXL_JSON_REJECT_DUPLICATES |
+            AXL_JSON_EXTENDED | AXL_JSON_UTF8_STRICT;
+        const AxlJsonFlags mixed = all_bools | AXL_JSON_INDENT(63);
+        test_check(AXL_JSON_INDENT_OF(mixed) == 63,
+                   "flags: a full boolean set does not disturb the indent width");
+
+        /* TWO packed fields now share bits 32+. Neither may bleed into the
+           other, and neither into the booleans -- an off-by-one shift or a
+           too-wide mask is invisible until a caller combines them. */
+        const AxlJsonFlags both_packed =
+            all_bools | AXL_JSON_INDENT(63) | AXL_JSON_DEPTH(AXL_JSON_DEPTH_MAX);
+        test_check(AXL_JSON_INDENT_OF(both_packed) == 63 &&
+                   AXL_JSON_DEPTH_OF(both_packed) == AXL_JSON_DEPTH_MAX,
+                   "flags: indent and depth fields read back independently");
+        test_check(AXL_JSON_DEPTH_OF(AXL_JSON_INDENT(63)) == 0,
+                   "flags: a maximal indent leaves the depth field clear");
+        test_check(AXL_JSON_INDENT_OF(AXL_JSON_DEPTH(AXL_JSON_DEPTH_MAX)) == 0,
+                   "flags: a maximal depth leaves the indent field clear");
+        test_check((AXL_JSON_DEPTH(AXL_JSON_DEPTH_MAX) & 0xFFFFFFFFu) == 0,
+                   "flags: the depth field is clear of every boolean bit");
+
+        /* Round-trip over the whole declared range, not a sample: an 0x1FF
+           mask instead of 0x3FF reads 256 back as 0, i.e. "use the default",
+           which is a silently WRONG limit rather than a visible failure. */
+        bool depth_rt = true;
+        for (uint32_t n = 0; n <= AXL_JSON_DEPTH_MAX; n++) {
+            if (AXL_JSON_DEPTH_OF(AXL_JSON_DEPTH(n)) != n) { depth_rt = false; }
+        }
+        test_check(depth_rt,
+                   "flags: DEPTH_OF(DEPTH(n)) == n for every n in 0..MAX");
+        test_check(AXL_JSON_DEPTH_OF(AXL_JSON_DEPTH(AXL_JSON_DEPTH_MAX + 1))
+                       == AXL_JSON_DEPTH_MAX &&
+                   AXL_JSON_DEPTH_OF(AXL_JSON_DEPTH(100000)) == AXL_JSON_DEPTH_MAX,
+                   "flags: DEPTH(n) clamps above the max instead of wrapping");
+        test_check(AXL_JSON_DEPTH_OF(AXL_JSON_STRICT) == 0,
+                   "flags: DEPTH_OF is 0 (meaning default) when none requested");
+        uint32_t dside = 7;
+        AxlJsonFlags donce = axl_json_depth(dside++);
+        test_check(dside == 8 && AXL_JSON_DEPTH_OF(donce) == 7,
+                   "flags: axl_json_depth evaluates n exactly once");
+        test_check(axl_json_depth(100000) == AXL_JSON_DEPTH(100000),
+                   "flags: DEPTH macro and function forms agree, both clamped");
+
+        /* DISJOINTNESS, one flag at a time. The obvious spelling --
+           `(all_bools | INDENT(63)) & all_bools == all_bools` -- is a
+           tautology: (A|B)&A == A for ANY A and B, so it passes even against a
+           flag space with duplicate bits. Accumulating and checking for an
+           already-present bit is what actually detects a collision. */
+        const AxlJsonFlags each[] = {
+            AXL_JSON_ALLOW_COMMENTS, AXL_JSON_ALLOW_TRAILING_COMMA,
+            AXL_JSON_ALLOW_UNQUOTED_KEYS, AXL_JSON_ALLOW_SINGLE_QUOTES,
+            AXL_JSON_ALLOW_HEX, AXL_JSON_ALLOW_EXTRA_ESCAPES,
+            AXL_JSON_ALLOW_PLUS_SIGN, AXL_JSON_ALLOW_LEADING_POINT,
+            AXL_JSON_ALLOW_NAN_INF,
+            AXL_JSON_COMPACT, AXL_JSON_ENSURE_ASCII, AXL_JSON_ESCAPE_SLASH,
+            AXL_JSON_EMBED, AXL_JSON_SORT_KEYS, AXL_JSON_HAS_INDENT,
+            AXL_JSON_REJECT_DUPLICATES,
+            AXL_JSON_EXTENDED,
+        };
+        AxlJsonFlags seen = 0;
+        bool disjoint = true;
+        for (size_t fi = 0; fi < sizeof(each) / sizeof(each[0]); fi++) {
+            if ((seen & each[fi]) != 0) { disjoint = false; }
+            seen |= each[fi];
+        }
+        test_check(disjoint, "flags: every boolean flag occupies its own bit");
+        test_check((seen & AXL_JSON_UTF8_MASK) == 0,
+                   "flags: no boolean flag lands in the UTF-8 field");
+        test_check(AXL_JSON_INDENT_OF(seen) == 0,
+                   "flags: no boolean flag lands in the indent field");
+        test_check(AXL_JSON_DEPTH_OF(seen) == 0,
+                   "flags: no boolean flag lands in the depth field");
+
+        /* The dialect bits must stay disjoint from every non-dialect flag.
+           P3 removed the routing this once protected -- every document now
+           goes to the one lexer -- but the property still matters: the lexer
+           tests `flags & AXL_JSON_ALLOW_x` per feature, so a non-dialect flag
+           overlapping bits 0-9 would silently open a grammar extension. */
+        test_check((AXL_JSON_JSON5 & (AXL_JSON_COMPACT | AXL_JSON_ENSURE_ASCII |
+                                      AXL_JSON_ESCAPE_SLASH | AXL_JSON_EMBED |
+                                      AXL_JSON_SORT_KEYS | AXL_JSON_HAS_INDENT |
+                                      AXL_JSON_REJECT_DUPLICATES |
+                                      AXL_JSON_EXTENDED |
+                                      AXL_JSON_UTF8_MASK)) == 0,
+                   "flags: the dialect mask is disjoint from every non-dialect flag");
+
+        /* The UTF-8 field is a FIELD, so the three modes must be mutually
+           exclusive values -- not bits that can both be set. */
+        test_check(AXL_JSON_UTF8_OF(AXL_JSON_UTF8_REPAIR) == AXL_JSON_UTF8_REPAIR &&
+                   AXL_JSON_UTF8_OF(mixed) == AXL_JSON_UTF8_STRICT,
+                   "flags: UTF8_OF extracts the mode, masking the rest away");
+        test_check(AXL_JSON_UTF8_RAW != AXL_JSON_UTF8_STRICT &&
+                   (AXL_JSON_UTF8_RAW & AXL_JSON_UTF8_STRICT) != AXL_JSON_UTF8_STRICT,
+                   "flags: RAW and STRICT are distinct field VALUES, not combinable bits");
+
+        /* Presets compose as documented. */
+        test_check((AXL_JSON_RELAXED & AXL_JSON_JSON5) == AXL_JSON_JSON5,
+                   "flags: RELAXED includes all of JSON5");
+        test_check(AXL_JSON_STRICT == 0,
+                   "flags: STRICT is the zero word");
+    }
+
+    /* INDENT(n) must honor n. Widths other than 2 on purpose: the migration
+       baseline uses INDENT(2), which is exactly the width at which a
+       hardcoded two-space indent is indistinguishable from a correct one.
+       Also pins INDENT(0) -- newlines, no indent -- which is the case the
+       presence bit exists to separate from "compact". */
+    {
+        struct { AxlJsonFlags f; const char *want; const char *what; } ind[] = {
+            { AXL_JSON_INDENT(0),
+              "{\n\"a\": [\n1\n]\n}",
+              "indent: INDENT(0) is newlines with no indent" },
+            { AXL_JSON_INDENT(1),
+              "{\n \"a\": [\n  1\n ]\n}",
+              "indent: INDENT(1) is one space per level" },
+            { AXL_JSON_INDENT(4),
+              "{\n    \"a\": [\n        1\n    ]\n}",
+              "indent: INDENT(4) is four spaces per level" },
+        };
+        for (size_t ii = 0; ii < sizeof(ind) / sizeof(ind[0]); ii++) {
+            AxlString    *io = axl_string_new(NULL);
+            AxlJsonWriter iw;
+            axl_json_writer_init(&iw, io, ind[ii].f);
+            axl_json_obj_begin(&iw);
+                axl_json_key(&iw, "a");
+                axl_json_arr_begin(&iw);
+                    axl_json_int(&iw, 1);
+                axl_json_arr_end(&iw);
+            axl_json_obj_end(&iw);
+            axl_json_writer_finish(&iw);
+            test_check(axl_strcmp(axl_string_str(io), ind[ii].want) == 0,
+                       ind[ii].what);
+            axl_string_free(io);
+        }
+    }
+
+    /* --- P2: the sub-flag REJECTION MATRIX --------------------------------
+       The load-bearing test of the whole granular design, and the reason it
+       is a matrix rather than a list.
+
+       The obvious test -- "flag X accepts feature X" -- is worthless on its
+       own: the lexer used to be monolithic, so an implementation that ignores
+       the flag word entirely and accepts all of JSON5 passes every positive
+       case. What discriminates is the NEGATIVE half: flag X must REJECT
+       features Y != X. Verified by sabotage before landing — with the gates
+       stubbed to `true`, the diagonal still passes and 56 off-diagonal cells
+       fail.
+
+       ALLOW_NAN_INF is absent from the matrix on purpose, even though P4 made
+       it gate something: its feature is a bare WORD, not punctuation, so a row
+       here would test the keyword table rather than the number lexer the other
+       eight share. It gets its own block below, with both endpoints. */
+    {
+        struct { AxlJsonFlags flag; const char *doc; const char *name; } feat[] = {
+            { AXL_JSON_ALLOW_COMMENTS,       "{\"a\":1 /* c */}",  "comments" },
+            { AXL_JSON_ALLOW_TRAILING_COMMA, "{\"a\":1,}",         "trailing-comma" },
+            { AXL_JSON_ALLOW_UNQUOTED_KEYS,  "{a:1}",              "unquoted-key" },
+            { AXL_JSON_ALLOW_SINGLE_QUOTES,  "{\"a\":'v'}",        "single-quotes" },
+            { AXL_JSON_ALLOW_HEX,            "{\"a\":0x10}",       "hex" },
+            { AXL_JSON_ALLOW_EXTRA_ESCAPES,  "{\"a\":\"\\x41\"}",   "extra-escapes" },
+            { AXL_JSON_ALLOW_PLUS_SIGN,      "{\"a\":+5}",         "plus-sign" },
+            { AXL_JSON_ALLOW_LEADING_POINT,  "{\"a\":.5}",         "leading-point" },
+        };
+        const size_t nf = sizeof(feat) / sizeof(feat[0]);
+
+        size_t diag_ok = 0, offdiag_ok = 0, diag_bad = 0, offdiag_bad = 0;
+        for (size_t row = 0; row < nf; row++) {
+            for (size_t col = 0; col < nf; col++) {
+                AxlJsonReader mr;
+                bool got = axl_json_parse(feat[col].doc,
+                                                axl_strlen(feat[col].doc),
+                                                feat[row].flag, &mr);
+                if (got) { axl_json_free(&mr); }
+                const bool want = (row == col);
+                if (want) { got ? diag_ok++ : diag_bad++; }
+                else      { got ? offdiag_bad++ : offdiag_ok++; }
+            }
+        }
+        test_check(diag_bad == 0 && diag_ok == nf,
+                   "matrix: each ALLOW_* flag accepts its OWN feature");
+        test_check(offdiag_bad == 0 && offdiag_ok == nf * (nf - 1),
+                   "matrix: each ALLOW_* flag REJECTS every other feature");
+
+        /* Per row as well as in aggregate. The two assertions above collapse
+           56 cells into one boolean: when a cell breaks you learn only that
+           SOMETHING moved and get to re-derive which. One check per row names
+           the flag, which is why feat[].name exists. */
+        for (size_t row = 0; row < nf; row++) {
+            size_t rejected = 0;
+            for (size_t col = 0; col < nf; col++) {
+                if (row == col) { continue; }
+                AxlJsonReader mr;
+                bool got = axl_json_parse(feat[col].doc,
+                                                axl_strlen(feat[col].doc),
+                                                feat[row].flag, &mr);
+                if (got) { axl_json_free(&mr); } else { rejected++; }
+            }
+            char label[96];
+            axl_snprintf(label, sizeof(label),
+                         "matrix row: %s rejects the other %zu features",
+                         feat[row].name, nf - 1);
+            test_check(rejected == nf - 1, label);
+        }
+
+        /* Two bits at once, to pin that the gates compose independently
+           rather than sharing a latch: both named features accepted, the
+           other six still refused. */
+        {
+            size_t both_ok = 0, others_rejected = 0;
+            const AxlJsonFlags two = AXL_JSON_ALLOW_COMMENTS | AXL_JSON_ALLOW_HEX;
+            for (size_t i = 0; i < nf; i++) {
+                AxlJsonReader mr;
+                bool got = axl_json_parse(feat[i].doc,
+                                                axl_strlen(feat[i].doc), two, &mr);
+                if (got) { axl_json_free(&mr); }
+                const bool named = (feat[i].flag == AXL_JSON_ALLOW_COMMENTS ||
+                                    feat[i].flag == AXL_JSON_ALLOW_HEX);
+                if (named && got)        { both_ok++; }
+                if (!named && !got)      { others_rejected++; }
+            }
+            test_check(both_ok == 2 && others_rejected == nf - 2,
+                       "matrix: two flags compose — both accepted, the rest refused");
+        }
+
+        /* Endpoints. STRICT must reject all eight -- that is the property the
+           old jsmn-backed "strict" mode did NOT have. */
+        size_t strict_rejected = 0, json5_accepted = 0;
+        for (size_t i = 0; i < nf; i++) {
+            AxlJsonReader sr, jr;
+            if (!axl_json_parse(feat[i].doc, axl_strlen(feat[i].doc),
+                                      AXL_JSON_STRICT, &sr)) {
+                strict_rejected++;
+            } else { axl_json_free(&sr); }
+            if (axl_json_parse(feat[i].doc, axl_strlen(feat[i].doc),
+                                     AXL_JSON_JSON5, &jr)) {
+                json5_accepted++;
+                axl_json_free(&jr);
+            }
+        }
+        test_check(json5_accepted == nf,
+                   "matrix: AXL_JSON_JSON5 accepts every feature");
+
+        /* THE proof that P3 did what it claims. This read `== 1` for as long
+           as AXL_JSON_STRICT routed to jsmn: compiled permissively, jsmn
+           refused exactly one of the eight (the \x escape) and tolerated an
+           interior comment, a trailing comma, an unquoted key, single quotes,
+           hex, a leading '+' and a leading '.'. One parser later it is all
+           eight. Pinned as the exact number, not `> 1` or `>= nf` -- a bound
+           would keep passing if a future change quietly re-opened one. */
+        test_check(strict_rejected == nf,
+                   "matrix: AXL_JSON_STRICT refuses all 8 (one parser, no jsmn)");
+
+        /* ALLOW_NAN_INF is now the ninth gated feature, so it joins the
+           endpoints: JSON5 accepts it, STRICT refuses it. This assertion used
+           to read `!nan_ok` under JSON5 -- the RED P4 was written against. */
+        const char *nan_doc = "{\"a\":NaN}";
+        AxlJsonReader nr;
+        bool nan_ok = axl_json_parse(nan_doc, axl_strlen(nan_doc),
+                                           AXL_JSON_JSON5, &nr);
+        if (nan_ok) { axl_json_free(&nr); }
+        test_check(nan_ok, "matrix: NaN is accepted under JSON5");
+        bool nan_strict = axl_json_parse(nan_doc, axl_strlen(nan_doc),
+                                               AXL_JSON_STRICT, &nr);
+        if (nan_strict) { axl_json_free(&nr); }
+        test_check(!nan_strict, "matrix: NaN is refused under STRICT");
+    }
+
+    /* --- P4: ALLOW_NAN_INF, and get_number_str as the way to read one -------
+       Not IEEE support. AXL is freestanding with no libm and no double
+       accessor, so NaN/Infinity are lexed as primitive TOKENS and are
+       reachable only as text. get_int/get_uint must refuse them -- there is no
+       integer they could mean -- which is exactly why the text accessor has to
+       exist alongside the flag rather than after it. */
+    {
+        /* Each spelling, and which flags it needs. `+Infinity` needs
+           ALLOW_PLUS_SIGN too: the leading `+` is that flag's feature, so
+           ALLOW_NAN_INF alone must NOT be enough. That pair is the
+           discriminating case -- a lexer that folded the sign into NAN_INF
+           passes every other row here. */
+        struct { const char *doc; AxlJsonFlags f; bool ok; const char *what; } ni[] = {
+            { "{\"a\":NaN}",        AXL_JSON_ALLOW_NAN_INF, true,
+              "nan_inf: NaN with the flag" },
+            { "{\"a\":Infinity}",   AXL_JSON_ALLOW_NAN_INF, true,
+              "nan_inf: Infinity with the flag" },
+            { "{\"a\":-Infinity}",  AXL_JSON_ALLOW_NAN_INF, true,
+              "nan_inf: -Infinity with the flag ('-' is RFC-legal on numbers)" },
+            { "{\"a\":-NaN}",       AXL_JSON_ALLOW_NAN_INF, true,
+              "nan_inf: -NaN with the flag (ES5 permits a sign on either word)" },
+            { "{\"a\":NaN}",        AXL_JSON_STRICT,        false,
+              "nan_inf: NaN without the flag" },
+            { "{\"a\":Infinity}",   AXL_JSON_STRICT,        false,
+              "nan_inf: Infinity without the flag" },
+            { "{\"a\":-Infinity}",  AXL_JSON_STRICT,        false,
+              "nan_inf: -Infinity without the flag" },
+            { "{\"a\":+Infinity}",  AXL_JSON_ALLOW_NAN_INF, false,
+              "nan_inf: +Infinity needs ALLOW_PLUS_SIGN as well" },
+            { "{\"a\":+Infinity}",
+              AXL_JSON_ALLOW_NAN_INF | AXL_JSON_ALLOW_PLUS_SIGN, true,
+              "nan_inf: +Infinity with both flags" },
+            /* Not a licence for any bare word: only these two. */
+            { "{\"a\":Inf}",        AXL_JSON_ALLOW_NAN_INF, false,
+              "nan_inf: `Inf` is not a literal even with the flag" },
+            { "{\"a\":nan}",        AXL_JSON_ALLOW_NAN_INF, false,
+              "nan_inf: lowercase `nan` is not a literal (case-sensitive)" },
+            { "{\"a\":NaNa}",       AXL_JSON_ALLOW_NAN_INF, false,
+              "nan_inf: `NaNa` is rejected, not lexed as NaN + junk" },
+            { "{\"a\":Infinity2}",  AXL_JSON_ALLOW_NAN_INF, false,
+              "nan_inf: `Infinity2` is rejected, not lexed as Infinity + junk" },
+        };
+        for (size_t i = 0; i < sizeof(ni) / sizeof(ni[0]); i++) {
+            AxlJsonReader r2;
+            bool got = axl_json_parse(ni[i].doc, axl_strlen(ni[i].doc),
+                                            ni[i].f, &r2);
+            if (got) { axl_json_free(&r2); }
+            test_check(got == ni[i].ok, ni[i].what);
+        }
+
+        /* get_int / get_uint must refuse a NaN/Infinity token. Without this,
+           "lexed as a token" could quietly mean get_int returns 0. */
+        {
+            const char *d = "{\"n\":NaN,\"i\":-Infinity}";
+            AxlJsonReader r2;
+            int64_t  iv = 12345;
+            uint64_t uv = 54321;
+            test_check(axl_json_parse(d, axl_strlen(d),
+                                            AXL_JSON_ALLOW_NAN_INF, &r2),
+                       "nan_inf: document with NaN and -Infinity parses");
+            test_check(!axl_json_get_int(&r2, "n", &iv) && iv == 12345,
+                       "nan_inf: get_int refuses NaN and leaves the out param");
+            test_check(!axl_json_get_uint(&r2, "n", &uv) && uv == 54321,
+                       "nan_inf: get_uint refuses NaN and leaves the out param");
+            test_check(!axl_json_get_int(&r2, "i", &iv) && iv == 12345,
+                       "nan_inf: get_int refuses -Infinity");
+            /* And they ARE reachable, as text, exactly as spelled. */
+            char nb[16] = { 0 };
+            test_check(axl_json_get_number_str(&r2, "n", nb, sizeof(nb)) &&
+                       axl_strcmp(nb, "NaN") == 0,
+                       "number_str: NaN comes back as \"NaN\"");
+            test_check(axl_json_get_number_str(&r2, "i", nb, sizeof(nb)) &&
+                       axl_strcmp(nb, "-Infinity") == 0,
+                       "number_str: -Infinity comes back as \"-Infinity\"");
+            axl_json_free(&r2);
+        }
+
+        /* VERBATIM: the text must be the document's bytes, not a normalization
+           of them -- `1e10` must NOT come back as "10000000000".
+           Most of these are values get_int and get_uint both have to refuse
+           (wider than 64 bits, fractional, exponent-bearing). Not all: `d20`
+           (12345678901234567890) fits uint64_t and only get_int refuses it, and
+           `hex`/`plus`/`lead` are perfectly readable as integers. They are here
+           for the SPELLING, which is the property under test. */
+        {
+            const char *d =
+                "{\"big\":18446744073709551616,"          /* 2^64 */
+                "\"huge\":1180591620717411303424,"        /* 2^70 */
+                "\"d20\":12345678901234567890,"
+                "\"frac\":1.5,"
+                "\"exp\":1e10,"
+                "\"tz\":0.50,"
+                "\"negexp\":-2.5E-3,"
+                "\"plus\":+5,"
+                "\"hex\":0x1F,"
+                "\"lead\":.5}";
+            struct { const char *key; const char *want; } v[] = {
+                { "big",    "18446744073709551616" },
+                { "huge",   "1180591620717411303424" },
+                { "d20",    "12345678901234567890" },
+                { "frac",   "1.5" },
+                { "exp",    "1e10" },
+                { "tz",     "0.50" },
+                { "negexp", "-2.5E-3" },
+                { "plus",   "+5" },
+                { "hex",    "0x1F" },
+                { "lead",   ".5" },
+            };
+            AxlJsonReader r2;
+            test_check(axl_json_parse(d, axl_strlen(d),
+                                            AXL_JSON_JSON5, &r2),
+                       "number_str: the wide/fractional/JSON5 document parses");
+            size_t exact = 0;
+            for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+                char buf[40] = { 0 };
+                if (axl_json_get_number_str(&r2, v[i].key, buf, sizeof(buf)) &&
+                    axl_strcmp(buf, v[i].want) == 0) {
+                    exact++;
+                } else {
+                    axl_printf("  number_str MISMATCH %s: got \"%s\" want \"%s\"\n",
+                               v[i].key, buf, v[i].want);
+                }
+            }
+            test_check(exact == sizeof(v) / sizeof(v[0]),
+                       "number_str: every literal comes back byte-for-byte");
+
+            /* The values get_uint CAN represent are still its job -- this
+               accessor is an escape hatch, not a replacement. */
+            uint64_t uv = 0;
+            test_check(!axl_json_get_uint(&r2, "big", &uv),
+                       "number_str: get_uint still refuses 2^64 (the reason this exists)");
+
+            /* Buffer sizing. "1.5" needs 4 bytes with the NUL; 4 must work and
+               3 must fail, and on failure the buffer is UNTOUCHED -- a partial
+               number is a different number, so truncating like get_string does
+               would defeat the whole point. */
+            char tight[4] = { 0 };
+            test_check(axl_json_get_number_str(&r2, "frac", tight, 4) &&
+                       axl_strcmp(tight, "1.5") == 0,
+                       "number_str: a buffer exactly big enough succeeds");
+            char small[8];
+            axl_memset(small, 'Z', sizeof(small));
+            test_check(!axl_json_get_number_str(&r2, "frac", small, 3),
+                       "number_str: one byte too small returns false");
+            test_check(small[0] == 'Z' && small[1] == 'Z' && small[2] == 'Z',
+                       "number_str: a too-small buffer is left UNTOUCHED, not truncated");
+
+            /* Not a number: true/false/null are primitive tokens too, and an
+               accessor named _number_str returning "true" would be a trap. */
+            axl_json_free(&r2);
+            const char *d2 = "{\"t\":true,\"n\":null,\"s\":\"12\",\"o\":{},\"a\":[]}";
+            test_check(axl_json_parse(d2, axl_strlen(d2),
+                                            AXL_JSON_STRICT, &r2),
+                       "number_str: the non-number document parses");
+            char nb[16];
+            size_t refused = 0;
+            const char *keys[] = { "t", "n", "s", "o", "a", "missing" };
+            for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+                axl_memset(nb, 'Z', sizeof(nb));
+                if (!axl_json_get_number_str(&r2, keys[i], nb, sizeof(nb))
+                    && nb[0] == 'Z') {
+                    refused++;
+                }
+            }
+            test_check(refused == sizeof(keys) / sizeof(keys[0]),
+                       "number_str: refuses true/null/string/object/array/absent");
+
+            /* NULL-argument contract, matching every other accessor. */
+            test_check(!axl_json_get_number_str(NULL, "frac", nb, sizeof(nb)) &&
+                       !axl_json_get_number_str(&r2, NULL, nb, sizeof(nb)) &&
+                       !axl_json_get_number_str(&r2, "frac", NULL, sizeof(nb)) &&
+                       !axl_json_get_number_str(&r2, "frac", nb, 0),
+                       "number_str: NULL reader/key/buf and size 0 all return false");
+            axl_json_free(&r2);
+        }
+
+        /* Through a SUB-READER, from both get_object and array_next. A
+           sub-reader borrows the parent's token array rebased, so an accessor
+           that got the rebasing wrong would read a neighbouring token -- and
+           "correct by inspection" is how that stays unnoticed. */
+        {
+            const char *d = "{\"o\":{\"v\":1e99},\"a\":[{\"v\":-Infinity}]}";
+            AxlJsonReader r2, sub, elem;
+            AxlJsonArrayIter it;
+            char nb[24] = { 0 };
+            test_check(axl_json_parse(d, axl_strlen(d),
+                                            AXL_JSON_JSON5, &r2),
+                       "number_str: nested document parses");
+            test_check(axl_json_get_object(&r2, "o", &sub) &&
+                       axl_json_get_number_str(&sub, "v", nb, sizeof(nb)) &&
+                       axl_strcmp(nb, "1e99") == 0,
+                       "number_str: reads through a get_object sub-reader");
+            nb[0] = '\0';
+            test_check(axl_json_array_begin(&r2, "a", &it) &&
+                       axl_json_array_next(&it, &elem) &&
+                       axl_json_get_number_str(&elem, "v", nb, sizeof(nb)) &&
+                       axl_strcmp(nb, "-Infinity") == 0,
+                       "number_str: reads through an array element sub-reader");
+            axl_json_free(&r2);
+        }
+
+        /* `NaN` and `Infinity` are VALUE literals, not a new key syntax. An
+           unquoted key goes through the identifier lexer, so the words must
+           still need ALLOW_UNQUOTED_KEYS and must read back as plain key text.
+           Unpinned, a future keyword-table change could quietly special-case
+           them in key position. */
+        {
+            const char *d = "{NaN:1,Infinity:2}";
+            AxlJsonReader r2;
+            int64_t v = 0;
+            test_check(!axl_json_parse(d, axl_strlen(d),
+                                             AXL_JSON_ALLOW_NAN_INF, &r2),
+                       "nan_inf: NaN as an unquoted KEY still needs ALLOW_UNQUOTED_KEYS");
+            test_check(axl_json_parse(d, axl_strlen(d),
+                                            AXL_JSON_ALLOW_NAN_INF |
+                                            AXL_JSON_ALLOW_UNQUOTED_KEYS, &r2),
+                       "nan_inf: NaN as an unquoted key parses with that flag");
+            test_check(axl_json_get_int(&r2, "NaN", &v) && v == 1,
+                       "nan_inf: a key spelled NaN is ordinary key text");
+            test_check(axl_json_get_int(&r2, "Infinity", &v) && v == 2,
+                       "nan_inf: a key spelled Infinity is ordinary key text");
+            axl_json_free(&r2);
+        }
+    }
+
+    /* --- P3: a bare primitive IS a document (RFC 8259 §2) -----------------
+       Both parsers used to require an object-or-array root, a rule RFC 4627
+       imposed and RFC 8259 (2014) dropped. It was the ONLY thing making
+       AXL_JSON_STRICT reject a conformance case -- 8 of JSONTestSuite's `y_`
+       files are bare roots -- so "strict" was stricter than the standard it
+       names. AXL_JSON_DECODE_ANY existed to unlock this and is now removed:
+       there is nothing left to unlock. */
+    {
+        struct { const char *doc; const char *what; } root[] = {
+            { "42",      "bare int" },
+            { "-0.5e3",  "bare real" },
+            { "true",    "bare true" },
+            { "false",   "bare false" },
+            { "null",    "bare null" },
+            { "\"asd\"", "bare string" },
+            { "\"\"",    "bare empty string" },
+            { " \"a\" ", "bare string with surrounding space" },
+        };
+        size_t accepted = 0;
+        for (size_t ri = 0; ri < sizeof(root) / sizeof(root[0]); ri++) {
+            AxlJsonReader rr;
+            if (axl_json_parse(root[ri].doc, axl_strlen(root[ri].doc),
+                                     AXL_JSON_STRICT, &rr)) {
+                accepted++;
+                axl_json_free(&rr);
+            } else {
+                axl_printf("  bare root REJECTED: %s\n", root[ri].what);
+            }
+        }
+        test_check(accepted == sizeof(root) / sizeof(root[0]),
+                   "root: STRICT accepts every bare-primitive document");
+
+        /* Readable, not merely parseable. axl_json_value_string is the only
+           accessor that can reach a bare-string root, and its docstring now
+           promises exactly that -- so the promise gets an assertion. */
+        AxlJsonReader sr;
+        char sv[16] = { 0 };
+        test_check(axl_json_parse("\"hi\"", 4, AXL_JSON_STRICT, &sr) &&
+                   axl_json_value_string(&sr, sv, sizeof(sv)) &&
+                   axl_strcmp(sv, "hi") == 0,
+                   "root: a bare-string document reads back through value_string");
+        axl_json_free(&sr);
+
+        /* Accepting a bare root must not make the object accessors lie about
+           one: a key lookup against `42` has no answer and must say so. */
+        AxlJsonReader ir;
+        int64_t iv = 0;
+        test_check(axl_json_parse("42", 2, AXL_JSON_STRICT, &ir),
+                   "root: bare int parses");
+        test_check(!axl_json_get_int(&ir, "a", &iv),
+                   "root: get_int on a bare-root document finds no key");
+        test_check(!axl_json_value_array_begin(&ir, &(AxlJsonArrayIter){ 0 }),
+                   "root: value_array_begin refuses a bare-primitive root");
+        axl_json_free(&ir);
+
+        /* Still rejected: garbage after a bare root, and a truncated literal.
+           A root relaxation must not become "parse a prefix and stop". */
+        struct { const char *doc; const char *what; } bad[] = {
+            { "42 43",  "root: two bare values are not one document" },
+            { "truex",  "root: a truncated literal is still rejected" },
+            { "nul",    "root: an incomplete null is still rejected" },
+            { "42abc",  "root: trailing garbage after a bare number is rejected" },
+        };
+        for (size_t bi = 0; bi < sizeof(bad) / sizeof(bad[0]); bi++) {
+            AxlJsonReader br;
+            bool got = axl_json_parse(bad[bi].doc, axl_strlen(bad[bi].doc),
+                                            AXL_JSON_STRICT, &br);
+            if (got) { axl_json_free(&br); }
+            /* Per case, not a running total. Asserting a cumulative counter
+               against `bi + 1` reports a FAILURE for every case AFTER the
+               first real one, because the counter stays permanently one
+               behind -- so a maintainer reads three extra failures that are
+               not failures, and the label no longer names the broken case. */
+            test_check(!got, bad[bi].what);
+        }
+    }
+
+    /* --- P3: the WRITER emits a bare-primitive root too -------------------
+       Reader and writer have to agree on what a document is, which is the
+       whole point of the shared flag space. check_atom_context used to refuse
+       any atom at depth 0, justified in a comment by "mirror axl_json_parse,
+       which requires the root token to be an object or array" -- the rule P3
+       deletes. Leaving the writer alone would have meant a reader that parses
+       `42` and a writer that cannot emit it, with a comment citing a rule that
+       no longer exists. EXACT whole-document compares, per the output-format
+       rule: a substring match would pass on `{"a":42}` too. */
+    {
+        struct { const char *want; int kind; const char *what; } wr[] = {
+            { "42",     0, "writer: a bare int is a document" },
+            { "\"hi\"", 1, "writer: a bare string is a document" },
+            { "true",   2, "writer: a bare true is a document" },
+            { "null",   3, "writer: a bare null is a document" },
+        };
+        for (size_t wi = 0; wi < sizeof(wr) / sizeof(wr[0]); wi++) {
+            AxlString    *wo = axl_string_new(NULL);
+            AxlJsonWriter ww;
+            axl_json_writer_init(&ww, wo, AXL_JSON_STRICT);
+            switch (wr[wi].kind) {
+            case 0:  axl_json_int(&ww, 42);    break;
+            case 1:  axl_json_str(&ww, "hi");  break;
+            case 2:  axl_json_bool(&ww, true); break;
+            default: axl_json_null(&ww);       break;
+            }
+            axl_json_writer_finish(&ww);
+            test_check(!axl_json_writer_error(&ww) &&
+                       axl_strcmp(axl_string_str(wo), wr[wi].want) == 0,
+                       wr[wi].what);
+            axl_string_free(wo);
+        }
+
+        /* A second value at depth 0 is still an error -- "one value" is the
+           relaxation, not "a stream of values". begin_item already had this
+           guard; the assertion pins that allowing the first did not disarm it. */
+        {
+            AxlString    *wo = axl_string_new(NULL);
+            AxlJsonWriter ww;
+            axl_json_writer_init(&ww, wo, AXL_JSON_STRICT);
+            axl_json_int(&ww, 1);
+            axl_json_int(&ww, 2);
+            axl_json_writer_finish(&ww);
+            test_check(axl_json_writer_error(&ww) &&
+                       axl_strcmp(axl_string_str(wo), "1") == 0,
+                       "writer: a second root value sets the error, emits nothing more");
+            axl_string_free(wo);
+        }
+
+        /* A key at depth 0 is still an error: relaxing the ATOM rule must not
+           relax the structural one. */
+        {
+            AxlString    *wo = axl_string_new(NULL);
+            AxlJsonWriter ww;
+            axl_json_writer_init(&ww, wo, AXL_JSON_STRICT);
+            axl_json_key(&ww, "k");
+            axl_json_writer_finish(&ww);
+            test_check(axl_json_writer_error(&ww),
+                       "writer: a key at depth 0 is still a misuse");
+            axl_string_free(wo);
+        }
+
+        /* Round-trip through the bridge: a bare-root document parses, and
+           axl_json_write_token re-emits it byte-identically. This is the
+           reader/writer agreement stated as one assertion. */
+        {
+            const char *docs[] = { "42", "\"hi\"", "true", "null", "-0.5e3" };
+            size_t round_ok = 0;
+            for (size_t ri = 0; ri < sizeof(docs) / sizeof(docs[0]); ri++) {
+                AxlJsonReader rr;
+                if (!axl_json_parse(docs[ri], axl_strlen(docs[ri]),
+                                          AXL_JSON_STRICT, &rr)) {
+                    continue;
+                }
+                AxlString    *wo = axl_string_new(NULL);
+                AxlJsonWriter ww;
+                axl_json_writer_init(&ww, wo, AXL_JSON_STRICT);
+                axl_json_write_token(&ww, &rr, 0);
+                axl_json_writer_finish(&ww);
+                if (!axl_json_writer_error(&ww) &&
+                    axl_strcmp(axl_string_str(wo), docs[ri]) == 0) {
+                    round_ok++;
+                }
+                axl_string_free(wo);
+                axl_json_free(&rr);
+            }
+            test_check(round_ok == sizeof(docs) / sizeof(docs[0]),
+                       "writer: every bare-root document round-trips byte-identically");
+        }
+    }
+
+    /* The parser's HONORING of the depth field -- the boundary either side of
+       DEPTH_DEFAULT, a raised and a lowered bound, and the two recursion bombs
+       JSONTestSuite ships -- lives in test/unit/axl-test-json-conformance.c.
+       Deliberately a separate binary: the failure mode there is a stack
+       overflow, which in UEFI is a #GP or a hang rather than a failed
+       assertion, and would starve every later binary in the shared QEMU boot. */
+
+    /* --- P3: the no-flags entry points are LIBERAL ------------------------
+       axl_json_parse() and axl_json_load_file() take no flags word, so `0`
+       would have meant STRICT -- and a firmware SDK reading a sidecar or an
+       API response it does not control is better served by "read whatever you
+       were handed". They use AXL_JSON_RELAXED. This is what makes P3 a
+       widening change rather than a restricting one: every document that
+       parsed before still parses, and comments now parse too. */
+    {
+        const char *j5 = "{ a: 0x10, /* c */ b: 'v', }";
+        AxlJsonReader lr;
+        int64_t la = 0;
+        char lb[8] = { 0 };
+        test_check(axl_json_parse(j5, axl_strlen(j5), AXL_JSON_RELAXED, &lr) &&
+                   axl_json_get_int(&lr, "a", &la) && la == 0x10 &&
+                   axl_json_get_string(&lr, "b", lb, sizeof(lb)) &&
+                   axl_strcmp(lb, "v") == 0,
+                   "liberal: axl_json_parse accepts a full JSON5 document");
+        axl_json_free(&lr);
+
+        /* And the discriminating half: the SAME document under the flags form
+           with STRICT must be refused. Without this, "parse is liberal" would
+           pass against a parser that had become permissive for everyone. */
+        AxlJsonReader xr;
+        bool strict_got = axl_json_parse(j5, axl_strlen(j5),
+                                               AXL_JSON_STRICT, &xr);
+        if (strict_got) { axl_json_free(&xr); }
+        test_check(!strict_got,
+                   "liberal: the same document under STRICT is refused");
+
+        /* Ill-formed UTF-8 in a string does not stop the parse. Pinned for
+           what it actually is -- CURRENT behavior under EVERY flag value --
+           and not, as an earlier comment here claimed, as evidence that
+           RELAXED's UTF8_RAW bit is doing something. It is not: the reader
+           validates no encoding yet (UTF-8 modes on read are a later phase),
+           so this passes identically under AXL_JSON_STRICT and could never
+           have discriminated the two. Asserting both spellings is what makes
+           that explicit rather than implied, and it is the RED that the
+           read-side UTF8_STRICT mode will have to turn. */
+        /* REGRESSION, and the reason the liberal DEFAULT needed a second look
+           while there was one. `\0` is a legal JSON5 escape and
+           AXL_JSON_RELAXED carries ALLOW_EXTRA_ESCAPES -- so the moment
+           axl_json_parse defaulted to it, a document that named no dialect at
+           all could ask an accessor to write an interior NUL into a
+           NUL-TERMINATED buffer. Every axl_strcmp then sees only the prefix:
+           "admin\0extra" compared EQUAL to "admin", which is a string
+           smuggling primitive, and it is reachable from JWT headers/claims,
+           JWKs and HTTP request bodies. The vendored jsmn refused every
+           non-RFC-8259 escape, so this could not arise before.
+           decode_json_string now substitutes U+FFFD, so the byte cannot
+           truncate. Asserted as an EXACT string, since the whole failure mode
+           is a prefix comparing equal. */
+        {
+            const char *nuldoc = "{\"user\":\"admin\\0extra\"}";
+            AxlJsonReader nr;
+            char nv[32] = { 0 };
+            bool nok = axl_json_parse(nuldoc, axl_strlen(nuldoc), AXL_JSON_RELAXED, &nr) &&
+                       axl_json_get_string(&nr, "user", nv, sizeof(nv));
+            test_check(nok && axl_strcmp(nv, "admin") != 0,
+                       "escape: a \\0 escape cannot truncate a string to a prefix");
+            test_check(nok && /* Split literal: "\xBDe" would lex as ONE hex escape (0xBDE, out of
+                          range) and swallow the `e` -- gcc warns, and the warning
+                          was the failure. */
+                       axl_strcmp(nv, "admin\xEF\xBF\xBD" "extra") == 0,
+                       "escape: \\0 decodes to U+FFFD, exact");
+            if (nok) { axl_json_free(&nr); }
+        }
+
+        const char *rawdoc = "{\"a\":\"\x80\"}";
+        AxlJsonReader rr;
+        bool raw_liberal = axl_json_parse(rawdoc, axl_strlen(rawdoc), AXL_JSON_RELAXED, &rr);
+        if (raw_liberal) { axl_json_free(&rr); }
+        bool raw_strict = axl_json_parse(rawdoc, axl_strlen(rawdoc),
+                                               AXL_JSON_STRICT, &rr);
+        if (raw_strict) { axl_json_free(&rr); }
+        test_check(raw_liberal && raw_strict,
+                   "liberal: ill-formed UTF-8 parses under BOTH dialects "
+                   "(the reader validates no encoding yet)");
+    }
+
+    /* --- P2 parser bugs, each found by the review pass -------------------
+       All four were reachable with a SINGLE dialect flag set, which is what
+       made them P2's to fix: the phase's whole claim is that one flag permits
+       one feature, and each of these was a feature permitted by no flag at
+       all. */
+    {
+        struct { const char *doc; AxlJsonFlags f; bool ok; const char *what; } bug[] = {
+            /* \v and \f are ES5 whitespace, not RFC 8259 whitespace. */
+            { "{\"a\":\v1}", AXL_JSON_ALLOW_COMMENTS, false,
+              "bug: \\v whitespace needs ALLOW_EXTRA_WHITESPACE" },
+            { "{\"a\":\f1}", AXL_JSON_ALLOW_COMMENTS, false,
+              "bug: \\f whitespace needs ALLOW_EXTRA_WHITESPACE" },
+            { "{\"a\":\v1}", AXL_JSON_ALLOW_EXTRA_WHITESPACE, true,
+              "bug: \\v whitespace accepted WITH the flag" },
+
+            /* Leading zeros: illegal under RFC 8259 AND ES5, so ungated. */
+            { "{\"a\":01}",  AXL_JSON_JSON5, false,
+              "bug: leading zero rejected even under full JSON5" },
+            { "{\"a\":-01}", AXL_JSON_JSON5, false,
+              "bug: leading zero rejected after a sign" },
+            { "{\"a\":0}",   AXL_JSON_JSON5, true,
+              "bug: a bare 0 is still legal" },
+            { "{\"a\":0.5}", AXL_JSON_JSON5, true,
+              "bug: 0.5 is still legal (0 then a fraction)" },
+
+            /* Raw control chars in strings: TAB is ES5-legal and gated;
+               LF and CR are illegal under both specs, always. */
+            { "{\"a\":\"x\ty\"}", AXL_JSON_ALLOW_COMMENTS, false,
+              "bug: raw TAB in a string needs ALLOW_EXTRA_WHITESPACE" },
+            { "{\"a\":\"x\ty\"}", AXL_JSON_ALLOW_EXTRA_WHITESPACE, true,
+              "bug: raw TAB in a string accepted WITH the flag" },
+            { "{\"a\":\"x\ny\"}", AXL_JSON_JSON5, false,
+              "bug: raw LF in a string rejected even under full JSON5" },
+            { "{\"a\":\"x\ry\"}", AXL_JSON_JSON5, false,
+              "bug: raw CR in a string rejected even under full JSON5" },
+
+            /* An unterminated trailing block comment used to be ACCEPTED:
+               skip_ws's error was discarded, and pos landed exactly on len. */
+            { "{\"a\":1}/*",   AXL_JSON_JSON5, false,
+              "bug: unterminated trailing block comment is rejected" },
+            { "{\"a\":1}/* */", AXL_JSON_JSON5, true,
+              "bug: a CLOSED trailing block comment is still fine" },
+        };
+        for (size_t bi = 0; bi < sizeof(bug) / sizeof(bug[0]); bi++) {
+            AxlJsonReader br;
+            bool got = axl_json_parse(bug[bi].doc, axl_strlen(bug[bi].doc),
+                                            bug[bi].f, &br);
+            if (got) { axl_json_free(&br); }
+            test_check(got == bug[bi].ok, bug[bi].what);
+        }
+    }
+
     /* Trailing commas, compact */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_TRAILING_COMMAS);
+    axl_json_writer_init(&w, out, AXL_JSON_ALLOW_TRAILING_COMMA);
     axl_json_obj_begin(&w);
     axl_json_kv_int(&w, "a", 1);
     axl_json_kv_int(&w, "b", 2);
@@ -1171,9 +3331,9 @@ test_json5_build(void)
     test_check(axl_strcmp(axl_string_str(out), "{\"a\":1,\"b\":2,}") == 0,
                "json5 build: trailing comma in compact object");
     /* And the JSON5 reader accepts it. */
-    test_check(axl_json_parse_flags(axl_string_str(out),
+    test_check(axl_json_parse(axl_string_str(out),
                                     axl_string_len(out),
-                                    AXL_JSON_PARSER_JSON5, &r),
+                                    AXL_JSON_JSON5, &r),
                "json5 build: trailing-comma output round-trips through JSON5 reader");
     axl_json_free(&r);
     axl_string_free(out);
@@ -1181,7 +3341,7 @@ test_json5_build(void)
     /* Trailing commas, pretty */
     out = axl_string_new(NULL);
     axl_json_writer_init(&w, out,
-        AXL_JSON_WRITER_PRETTY | AXL_JSON_WRITER_TRAILING_COMMAS);
+        AXL_JSON_INDENT(2) | AXL_JSON_ALLOW_TRAILING_COMMA);
     axl_json_arr_begin(&w);
     axl_json_int(&w, 1);
     axl_json_int(&w, 2);
@@ -1193,7 +3353,7 @@ test_json5_build(void)
 
     /* Comment between values, pretty */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_obj_begin(&w);
     axl_json_kv_str(&w, "name", "AXL");
     axl_json_comment(&w, "version comes from build system");
@@ -1210,16 +3370,16 @@ test_json5_build(void)
     test_check(axl_strcmp(axl_string_str(out), expected_pretty) == 0,
                "json5 build: pretty comment between values exact output");
     /* JSON5 reader accepts it. */
-    test_check(axl_json_parse_flags(axl_string_str(out),
+    test_check(axl_json_parse(axl_string_str(out),
                                     axl_string_len(out),
-                                    AXL_JSON_PARSER_JSON5, &r),
+                                    AXL_JSON_JSON5, &r),
                "json5 build: pretty comment output round-trips");
     axl_json_free(&r);
     axl_string_free(out);
 
     /* Comment in compact mode emits inline / * ... * / */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_comment(&w, "header");
     axl_json_kv_int(&w, "x", 7);
@@ -1232,7 +3392,7 @@ test_json5_build(void)
     /* Comment-as-last-item must still get the closing brace on its own line
        in pretty mode. */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_PRETTY);
+    axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
     axl_json_obj_begin(&w);
     axl_json_kv_int(&w, "x", 1);
     axl_json_comment(&w, "trailing note");
@@ -1246,7 +3406,7 @@ test_json5_build(void)
     /* Comment sanitization: embedded newline truncates; embedded close-comment
        sequence in compact mode is split. */
     out = axl_string_new(NULL);
-    axl_json_writer_init(&w, out, AXL_JSON_WRITER_DEFAULT);
+    axl_json_writer_init(&w, out, AXL_JSON_STRICT);
     axl_json_obj_begin(&w);
     axl_json_comment(&w, "a*/b");           // close-comment in middle
     axl_json_kv_int(&w, "k", 1);
@@ -1256,6 +3416,5023 @@ test_json5_build(void)
                           "{/* a* /b */\"k\":1}") == 0,
                "json5 build: compact comment sanitizes embedded close-comment");
     axl_string_free(out);
+}
+
+// ---------------------------------------------------------------------------
+// JSON Sink Tests (P10)
+// ---------------------------------------------------------------------------
+
+/* ONE document, built by ONE function, written into every sink. The sinks are
+   then checked against each OTHER rather than each against its own hand-typed
+   expectation -- a per-sink expectation string can be edited to match whatever
+   that sink happens to produce, which is how a formatting regression hides in
+   a green suite. */
+#define JSON_SINK_DOC      "{\"name\":\"devkit\",\"version\":42,\"ok\":true}"
+#define JSON_SINK_DOC_LEN  (sizeof(JSON_SINK_DOC) - 1)
+
+static void
+build_sink_doc(AxlJsonWriter *w)
+{
+    axl_json_obj_begin(w);
+    axl_json_kv_str(w, "name", "devkit");
+    axl_json_kv_int(w, "version", 42);
+    axl_json_kv_bool(w, "ok", true);
+    axl_json_obj_end(w);
+}
+
+/* A custom AxlStream BACKEND under test control.
+ *
+ * This is what closes the one hole P10 shipped with. The stream sink's
+ * "accepted less than asked" path was untestable when AxlStream had a closed
+ * set of four backends, none of which short-transfers; axl_stream_open_custom
+ * makes short transfers contractually legal AND constructible, so the path is
+ * now reachable from a unit test rather than only from a real socket. */
+typedef struct {
+    char         buf[256];
+    size_t       used;
+    size_t       bite;   ///< most bytes to accept per call; 0 accepts none
+    bool         fail;   ///< report -1 instead: the backend is broken
+    unsigned int calls;
+} StreamBackend;
+
+static axl_ssize_t
+sbe_write(void *ctx, const void *buf, size_t count)
+{
+    StreamBackend *b = (StreamBackend *)ctx;
+    size_t         take;
+
+    b->calls++;
+    if (b->fail) {
+        return -1;
+    }
+    take = (count < b->bite) ? count : b->bite;
+    if (take > sizeof(b->buf) - b->used) {
+        take = sizeof(b->buf) - b->used;
+    }
+    axl_memcpy(b->buf + b->used, buf, take);
+    b->used += take;
+    return (axl_ssize_t)take;
+}
+
+/* Wire a StreamBackend up as a stream. `close` is left NULL because the
+   context is the caller's stack object, and a NULL close slot is documented
+   as a no-op rather than an error. */
+static AxlStream *
+open_backend(StreamBackend *b)
+{
+    AxlStreamOps ops = AXL_STREAM_OPS_INIT;
+
+    ops.write = sbe_write;
+    return axl_stream_open_custom(b, &ops, "json-test-sink");
+}
+
+/* A callback sink under test control: it records what it was handed and how
+   many times, and each variant returns a different one of the three outcomes
+   an AxlJsonWriteFn can report. */
+typedef struct {
+    char         buf[256];
+    size_t       used;
+    unsigned int calls;
+} SinkProbe;
+
+static void
+probe_store(SinkProbe *p, const char *buf, size_t n)
+{
+    for (size_t i = 0; i < n && p->used < sizeof(p->buf); i++) {
+        p->buf[p->used++] = buf[i];
+    }
+}
+
+/* Takes everything: the ordinary case. */
+static axl_ssize_t
+probe_write_all(void *ctx, const char *buf, size_t len)
+{
+    SinkProbe *p = (SinkProbe *)ctx;
+
+    p->calls++;
+    probe_store(p, buf, len);
+    return (axl_ssize_t)len;
+}
+
+/* Broken: must HALT the writer at the first refusal. */
+static axl_ssize_t
+probe_write_fail(void *ctx, const char *buf, size_t len)
+{
+    SinkProbe *p = (SinkProbe *)ctx;
+
+    (void)buf;
+    (void)len;
+    p->calls++;
+    return -1;
+}
+
+/* Full, not broken: takes half of every fragment. The writer must keep going
+   and keep counting, and report only at finish. */
+static axl_ssize_t
+probe_write_short(void *ctx, const char *buf, size_t len)
+{
+    SinkProbe   *p    = (SinkProbe *)ctx;
+    const size_t take = len / 2;
+
+    p->calls++;
+    probe_store(p, buf, take);
+    return (axl_ssize_t)take;
+}
+
+/* Claims MORE than it was given. A sink bug, and one the writer must refuse
+   rather than clamp: clamping would let `written` reach `needed` and finish()
+   would then certify a document that may have been truncated. */
+static axl_ssize_t
+probe_write_over(void *ctx, const char *buf, size_t len)
+{
+    SinkProbe *p = (SinkProbe *)ctx;
+
+    (void)buf;
+    p->calls++;
+    return (axl_ssize_t)len + 1;
+}
+
+static void
+test_json_sinks(void)
+{
+    AxlJsonWriter w;
+
+    // --- the string sink, reached the long way ----------------------------
+    // writer_init_sink + sink_init_string IS writer_init. If the two entry
+    // points can disagree, every other sink test is measuring the wrong thing.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonSink            snk;
+
+        axl_json_sink_init_string(&snk, out);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        const size_t n = axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out), JSON_SINK_DOC) == 0,
+                   "sink string: writer_init_sink builds the same document as "
+                   "writer_init");
+        test_check(n == JSON_SINK_DOC_LEN
+                   && axl_json_writer_written(&w) == JSON_SINK_DOC_LEN
+                   && axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN,
+                   "sink string: finish, written and needed all agree when "
+                   "nothing is dropped");
+    }
+
+    // --- finish() counts THIS writer's bytes, not the string's length -----
+    // It used to return axl_string_len(out), and every call site in the tree
+    // happens to pass a fresh AxlString, so the two agreed everywhere and the
+    // change was invisible. Pinned with a PRE-POPULATED string, which is the
+    // only shape that can tell them apart.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new("PREFIX");
+        AxlJsonSink            snk;
+
+        axl_json_sink_init_string(&snk, out);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_obj_end(&w);
+        const size_t n = axl_json_writer_finish(&w);
+
+        test_check(n == 2 && axl_json_writer_written(&w) == 2
+                   && axl_json_writer_needed(&w) == 2,
+                   "sink string: finish counts what THIS writer emitted, not "
+                   "what was already in the string");
+        test_check(axl_strcmp(axl_string_str(out), "PREFIX{}") == 0,
+                   "sink string: the writer APPENDS — it does not clear the "
+                   "caller's string");
+    }
+
+    // --- the sink is COPIED, and need not outlive init --------------------
+    // The header promises this explicitly, and the previous draft of the
+    // contract could not honor it: its buffer sink kept state inside the sink
+    // and had to pass a self-pointer as its own context.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+
+        {
+            AxlJsonSink tmp;
+
+            axl_json_sink_init_string(&tmp, out);
+            axl_json_writer_init_sink(&w, &tmp, AXL_JSON_STRICT);
+            /* Scribble it the way a dead stack frame would. */
+            axl_memset(&tmp, 0xAA, sizeof(tmp));
+        }
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out), JSON_SINK_DOC) == 0,
+                   "sink copy: overwriting the caller's sink after init "
+                   "changes nothing");
+    }
+
+    // --- buffer sink at size 0: the load-bearing case ---------------------
+    // If a full buffer latched the sticky error, the writer would halt at the
+    // FIRST fragment and `needed` could only ever report that fragment. Two-
+    // pass sizing would then be impossible and this test says so by execution.
+    {
+        AxlJsonSink    snk;
+        AxlJsonBufSink st;
+
+        axl_json_sink_init_buffer(&snk, &st, NULL, 0);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        const size_t n = axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN,
+                   "sink buffer: a zero-sized sink still counts the WHOLE "
+                   "document");
+        test_check(axl_json_writer_written(&w) == 0 && n == 0 && st.used == 0,
+                   "sink buffer: nothing is stored at size 0");
+        test_check(axl_json_writer_error(&w)
+                   && axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO,
+                   "sink buffer: finish reports IO once for a document that "
+                   "did not fit");
+    }
+
+    // --- two-pass sizing, end to end --------------------------------------
+    {
+        AxlJsonSink    snk;
+        AxlJsonBufSink st;
+
+        axl_json_sink_init_buffer(&snk, &st, NULL, 0);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        const size_t need = axl_json_writer_needed(&w);
+        char        *buf  = axl_malloc(need);
+
+        axl_json_sink_init_buffer(&snk, &st, buf, need);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        const size_t n = axl_json_writer_finish(&w);
+
+        test_check(buf != NULL && !axl_json_writer_error(&w)
+                   && n == need && st.used == need
+                   && axl_memcmp(buf, JSON_SINK_DOC, need) == 0,
+                   "sink buffer: sizing pass then an exact allocation writes "
+                   "the whole document with no error");
+        axl_free(buf);
+    }
+
+    // --- EVERY capacity, not a hand-picked one ----------------------------
+    // The invariant comes from what a byte sink IS, not from how this one is
+    // written: at capacity k the buffer holds exactly the document's first
+    // min(k, needed) bytes, nothing lands past k, and the error fires exactly
+    // when something was dropped.
+    //
+    // Claimed for every k because ONE k proves too little, and sabotage is how
+    // that was found: a sink that drops a straddling fragment WHOLE instead of
+    // storing the part that fits passed a hand-written "one byte short" test,
+    // because this document's last fragment is one byte and k = len-1 lands
+    // exactly on a fragment boundary. Only a k that CUTS a fragment can tell
+    // the two apart, and sweeping is how you stop having to guess which k does.
+    {
+        size_t bad_cap = (size_t)-1;
+
+        for (size_t cap = 0; cap <= JSON_SINK_DOC_LEN + 2; cap++) {
+            AxlJsonSink    snk;
+            AxlJsonBufSink st;
+            char           buf[JSON_SINK_DOC_LEN + 4];
+            const size_t   want = (cap < JSON_SINK_DOC_LEN)
+                                      ? cap : JSON_SINK_DOC_LEN;
+
+            axl_memset(buf, '#', sizeof(buf));
+            axl_json_sink_init_buffer(&snk, &st, buf, cap);
+            axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+            build_sink_doc(&w);
+            axl_json_writer_finish(&w);
+
+            if (!(axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN
+                  && axl_json_writer_written(&w) == want
+                  && st.used == want
+                  && axl_memcmp(buf, JSON_SINK_DOC, want) == 0
+                  && buf[want] == '#'
+                  && axl_json_writer_error(&w) == (cap < JSON_SINK_DOC_LEN))) {
+                bad_cap = cap;
+                break;
+            }
+        }
+        test_check(bad_cap == (size_t)-1,
+                   "sink buffer: at every capacity the buffer holds exactly "
+                   "the document's leading min(size, needed) bytes, nothing "
+                   "past it, and errors exactly when it truncated");
+    }
+
+    // --- callback sink, taking everything ---------------------------------
+    {
+        SinkProbe   p = { .used = 0, .calls = 0 };
+        AxlJsonSink snk;
+
+        axl_json_sink_init_callback(&snk, probe_write_all, &p);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && p.used == JSON_SINK_DOC_LEN
+                   && axl_memcmp(p.buf, JSON_SINK_DOC, JSON_SINK_DOC_LEN) == 0,
+                   "sink callback: the concatenated fragments are the "
+                   "document");
+        test_check(p.calls > 1,
+                   "sink callback: the writer streams — a document arrives as "
+                   "several fragments, not one");
+    }
+
+    // --- callback sink that is BROKEN: halts at once ----------------------
+    {
+        SinkProbe   p = { .used = 0, .calls = 0 };
+        AxlJsonSink snk;
+
+        axl_json_sink_init_callback(&snk, probe_write_fail, &p);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO,
+                   "sink callback: -1 latches IO");
+        test_check(p.calls == 1,
+                   "sink callback: -1 HALTS — the writer does not keep pushing "
+                   "at a sink that said it is broken");
+        test_check(axl_json_writer_needed(&w) == 0
+                   && axl_json_writer_error_info(&w)->offset == 0,
+                   "sink callback: the failing fragment is not counted, so the "
+                   "error offset is where the writer got TO");
+    }
+
+    // --- callback sink that is merely FULL: keeps going --------------------
+    // The distinction the whole design rests on. A short count must not halt.
+    {
+        SinkProbe   p = { .used = 0, .calls = 0 };
+        AxlJsonSink snk;
+
+        axl_json_sink_init_callback(&snk, probe_write_short, &p);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(p.calls > 1,
+                   "sink callback: a short count does NOT halt the writer");
+        test_check(axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN,
+                   "sink callback: a short count still counts the whole "
+                   "document");
+        test_check(axl_json_writer_written(&w) < JSON_SINK_DOC_LEN
+                   && axl_json_writer_written(&w) == p.used,
+                   "sink callback: written is the sum of what the sink "
+                   "actually took");
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO,
+                   "sink callback: the drop is reported once, at finish");
+    }
+
+    // --- callback sink that over-reports -----------------------------------
+    {
+        SinkProbe   p = { .used = 0, .calls = 0 };
+        AxlJsonSink snk;
+
+        axl_json_sink_init_callback(&snk, probe_write_over, &p);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO
+                   && p.calls == 1,
+                   "sink callback: a count larger than the fragment is refused "
+                   "as a broken sink, not clamped");
+    }
+
+    // --- stream sink -------------------------------------------------------
+    {
+        AxlStream  *s = axl_bufopen();
+        AxlJsonSink snk;
+        size_t      size = 0;
+
+        axl_json_sink_init_stream(&snk, s);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        const char *data = (const char *)axl_bufdata(s, &size);
+
+        test_check(!axl_json_writer_error(&w) && size == JSON_SINK_DOC_LEN
+                   && data != NULL
+                   && axl_memcmp(data, JSON_SINK_DOC, JSON_SINK_DOC_LEN) == 0,
+                   "sink stream: the stream holds exactly the document");
+        axl_fclose(s);
+    }
+
+    // --- a stream backend that accepts ONE byte per call ------------------
+    // The whole document must still land: axl_fwrite loops until the request
+    // is satisfied, which is precisely what "short transfers are handled
+    // above the backend" means. A sink that issued one raw axl_write and
+    // treated a short count as a malfunction would truncate here.
+    //
+    // One byte, not four. Four passed against the UNFIXED sink, because the
+    // writer's longest fragment is the 4-byte literal `true` and nothing
+    // straddled -- the same hand-picked-boundary trap the buffer-capacity
+    // sweep was written to escape. A bite of 1 is short for every fragment
+    // the writer can emit except a single delimiter.
+    {
+        StreamBackend b = { .used = 0, .bite = 1, .fail = false, .calls = 0 };
+        AxlStream    *s = open_backend(&b);
+        AxlJsonSink   snk;
+
+        axl_json_sink_init_stream(&snk, s);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && b.used == JSON_SINK_DOC_LEN
+                   && axl_memcmp(b.buf, JSON_SINK_DOC, JSON_SINK_DOC_LEN) == 0,
+                   "sink stream: a backend taking one byte at a time still "
+                   "receives the whole document");
+        test_check(axl_json_writer_written(&w) == JSON_SINK_DOC_LEN
+                   && axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN,
+                   "sink stream: a short BACKEND transfer is not a short "
+                   "write — the counters see a complete document");
+        axl_fclose(s);
+    }
+
+    // --- a backend that accepts NOTHING, without being broken -------------
+    // axl_ferror() is what separates the two, and it is the reason this sink
+    // can no longer map every short write to -1: "would not take more right
+    // now" is a documented, non-error outcome of a custom backend.
+    {
+        StreamBackend b = { .used = 0, .bite = 0, .fail = false, .calls = 0 };
+        AxlStream    *s = open_backend(&b);
+        AxlJsonSink   snk;
+
+        axl_json_sink_init_stream(&snk, s);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_needed(&w) == JSON_SINK_DOC_LEN
+                   && axl_json_writer_written(&w) == 0,
+                   "sink stream: a backend that takes nothing is FULL, not "
+                   "broken — the writer keeps counting the document");
+        test_check(b.calls > 1,
+                   "sink stream: and the writer is not halted by it");
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO,
+                   "sink stream: the drop is reported once, at finish");
+        axl_fclose(s);
+    }
+
+    // --- a backend that is genuinely BROKEN -------------------------------
+    {
+        StreamBackend b = { .used = 0, .bite = 4, .fail = true, .calls = 0 };
+        AxlStream    *s = open_backend(&b);
+        AxlJsonSink   snk;
+
+        axl_json_sink_init_stream(&snk, s);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        build_sink_doc(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_error_info(&w)->code == AXL_JSON_ERR_IO
+                   && axl_json_writer_needed(&w) == 0 && b.calls == 1,
+                   "sink stream: a backend reporting -1 HALTS the writer at "
+                   "the first fragment");
+        axl_fclose(s);
+    }
+
+    // --- a stream that cannot be written at all ---------------------------
+    // axl_stdin has no write slot. That is a CALLER bug, not backpressure,
+    // and the write path cannot tell the difference for itself: axl_write
+    // answers -1 at its own NULL-slot guard without setting the stream's
+    // error flag, so axl_ferror() stays false and it looks exactly like a
+    // backend that took nothing. Hence the check belongs at init, where the
+    // honest code is INVALID_ARGUMENT.
+    {
+        AxlJsonSink snk;
+
+        axl_json_sink_init_stream(&snk, axl_stdin);
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        const size_t n = axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink stream: a stream with no write capability is refused "
+                   "at init, not misread as backpressure");
+        test_check(n == 0 && axl_json_writer_written(&w) == 0
+                   && axl_json_writer_needed(&w) == 0,
+                   "sink stream: and nothing is counted or emitted through it");
+    }
+
+    // --- argument paths -----------------------------------------------------
+    {
+        AxlJsonSink    snk;
+        AxlJsonBufSink st;
+        char           buf[8];
+
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, NULL, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error(&w)
+                   && axl_json_writer_error_info(&w)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink args: a NULL sink reports INVALID_ARGUMENT, not IO");
+
+        snk.write = NULL;
+        snk.ctx   = NULL;
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error(&w)
+                   && axl_json_writer_error_info(&w)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink args: a sink with no write function reports "
+                   "INVALID_ARGUMENT");
+
+        /* A buffer sink with nowhere to keep its own state is the same caller
+           bug, and must be refused at init rather than dereferenced later. */
+        axl_json_sink_init_buffer(&snk, NULL, buf, sizeof(buf));
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink args: a buffer sink with no state object is refused "
+                   "at init");
+
+        /* A capacity with no buffer under it. The zero-size sizing pass says
+           NULL is legitimate; NULL with room to write is a caller bug. */
+        axl_json_sink_init_buffer(&snk, &st, NULL, 16);
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink args: a NULL buffer with a non-zero size is refused, "
+                   "while NULL at size 0 is the sizing pass");
+
+        axl_json_sink_init_stream(&snk, NULL);
+        axl_memset(&w, 0xAA, sizeof(w));
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "sink args: a stream sink with no stream is refused at "
+                   "init");
+
+        test_check(axl_json_writer_written(NULL) == 0
+                   && axl_json_writer_needed(NULL) == 0,
+                   "sink args: the counters are NULL-safe");
+
+        axl_json_sink_init_string(NULL, NULL);
+        axl_json_sink_init_buffer(NULL, &st, buf, sizeof(buf));
+        axl_json_sink_init_stream(NULL, NULL);
+        axl_json_sink_init_callback(NULL, probe_write_all, NULL);
+        test_survived("sink args: a NULL sink initializer is a no-op");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON Source Tests (P10)
+// ---------------------------------------------------------------------------
+
+#define JSON_SRC_DOC "{\"k\":\"AAAA\",\"n\":7}"
+/* Offset of the first byte INSIDE the "AAAA" value. The zero-copy tests
+   mutate it behind the reader's back: a borrowing reader sees the new byte,
+   a reader that copied does not. */
+#define JSON_SRC_PAYLOAD 6
+
+/* A pull source under test control. It hands the document over in small
+   BITES so the reader's accumulate-and-grow loop is genuinely exercised
+   rather than swallowing the document in one read, and each flag turns on
+   one of the ways a read function can misbehave. */
+typedef struct {
+    const char  *doc;
+    size_t       len;
+    size_t       pos;
+    size_t       bite;   ///< most bytes to hand over per call
+    unsigned int calls;
+    bool         fail;   ///< report -1 once something has been read
+    bool         over;   ///< claim MORE bytes than the buffer can hold
+} SrcProbe;
+
+static axl_ssize_t
+probe_read(void *ctx, void *buf, size_t max)
+{
+    SrcProbe *p = (SrcProbe *)ctx;
+    size_t    n;
+
+    p->calls++;
+    if (p->fail && p->calls >= 2) {
+        return -1;
+    }
+    if (p->over) {
+        return (axl_ssize_t)max + 1;   /* writes nothing; claims everything */
+    }
+    n = p->len - p->pos;
+    if (n > max) {
+        n = max;
+    }
+    if (n > p->bite) {
+        n = p->bite;
+    }
+    axl_memcpy(buf, p->doc + p->pos, n);
+    p->pos += n;
+    return (axl_ssize_t)n;
+}
+
+static void
+src_probe_init(SrcProbe *p, const char *doc, size_t len, size_t bite)
+{
+    p->doc   = doc;
+    p->len   = len;
+    p->pos   = 0;
+    p->bite  = bite;
+    p->calls = 0;
+    p->fail  = false;
+    p->over  = false;
+}
+
+static void
+test_json_sources(void)
+{
+    AxlJsonSource src;
+    AxlJsonReader r;
+    char          val[16];
+    int64_t       num;
+
+    // --- the contiguous source: the fast path, unchanged ------------------
+    {
+        axl_json_source_init_mem(&src, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1);
+        num = 0;
+        test_check(axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "AAAA") == 0
+                   && axl_json_get_int(&r, "n", &num) && num == 7,
+                   "source mem: parses exactly what axl_json_parse "
+                   "parses");
+        axl_json_free(&r);
+    }
+
+    // --- and it BORROWS ---------------------------------------------------
+    // Zero-copy stated as behaviour rather than as a claim about the
+    // implementation: mutate the caller's buffer after the parse and the
+    // reader must see the new byte. A reader that copied cannot pass this,
+    // and no field has to be peeked at to find out.
+    {
+        char doc[] = JSON_SRC_DOC;
+
+        axl_json_source_init_mem(&src, doc, sizeof(doc) - 1);
+        axl_json_parse_source(&src, AXL_JSON_STRICT, &r);
+        doc[JSON_SRC_PAYLOAD] = 'B';
+        test_check(axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "BAAA") == 0,
+                   "source mem: BORROWS — a mutation to the caller's buffer "
+                   "shows through the reader, so nothing was copied");
+        axl_json_free(&r);
+    }
+
+    // --- the stream source COPIES, and the reader owns the copy -----------
+    {
+        char        doc[] = JSON_SRC_DOC;
+        AxlMemStats before, after;
+        AxlStream  *s;
+
+        /* The snapshot has to bracket the STREAM too, not just the parse: it
+           is taken before axl_bufopen() and read after axl_fclose(), so the
+           stream's own allocations cancel instead of showing up as a negative
+           and making the comparison meaningless. */
+        axl_mem_get_stats(&before);
+        s = axl_bufopen();
+        axl_fwrite(doc, 1, sizeof(doc) - 1, s);
+        axl_fseek(s, 0, AXL_SEEK_SET);
+
+        axl_json_source_init_stream(&src, s);
+        const bool ok = axl_json_parse_source(&src, AXL_JSON_STRICT, &r);
+
+        /* Scribble the ORIGINAL. A reader that borrowed the stream's buffer
+           would be unaffected by this, so the check that bites is the one
+           below it -- this only proves the caller's array is not the
+           reader's. */
+        axl_memset(doc, '?', sizeof(doc));
+        test_check(ok && axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "AAAA") == 0,
+                   "source stream: reads the whole document out of a stream");
+
+        axl_json_free(&r);
+        axl_fclose(s);
+        axl_mem_get_stats(&after);
+        test_check(after.count == before.count && after.bytes == before.bytes,
+                   "source stream: axl_json_free releases the bytes the reader "
+                   "accumulated — a streamed parse is ONE object to free");
+    }
+
+    // --- the callback source, handed the document one byte at a time ------
+    {
+        SrcProbe p;
+
+        src_probe_init(&p, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1, 1);
+        axl_json_source_init_callback(&src, probe_read, &p, 0);
+        num = 0;
+        test_check(axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "AAAA") == 0
+                   && axl_json_get_int(&r, "n", &num) && num == 7,
+                   "source callback: one byte per read still assembles the "
+                   "whole document");
+        test_check(p.calls > sizeof(JSON_SRC_DOC) - 1,
+                   "source callback: the reader kept pulling until EOF rather "
+                   "than trusting the first read");
+        axl_json_free(&r);
+    }
+
+    // --- a size hint must change nothing but the allocation pattern -------
+    {
+        SrcProbe p;
+
+        src_probe_init(&p, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1, 4);
+        axl_json_source_init_callback(&src, probe_read, &p,
+                                      sizeof(JSON_SRC_DOC) - 1);
+        test_check(axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "AAAA") == 0,
+                   "source callback: an exact size hint parses the same "
+                   "document");
+        axl_json_free(&r);
+
+        /* A hint that LIES short must not truncate the document -- it is a
+           hint about allocation, not a promise about length. */
+        src_probe_init(&p, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1, 4);
+        axl_json_source_init_callback(&src, probe_read, &p, 2);
+        test_check(axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_get_string(&r, "k", val, sizeof(val))
+                   && axl_strcmp(val, "AAAA") == 0,
+                   "source callback: a hint smaller than the document does not "
+                   "truncate it");
+        axl_json_free(&r);
+    }
+
+    // --- a read that FAILS is IO, not INCOMPLETE --------------------------
+    // The distinction the signed return type exists for: INCOMPLETE tells a
+    // caller to come back with more bytes, which is right after a short read
+    // and wrong after a dead socket.
+    {
+        SrcProbe    p;
+        AxlMemStats before, after;
+
+        axl_mem_get_stats(&before);
+        src_probe_init(&p, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1, 4);
+        p.fail = true;
+        axl_json_source_init_callback(&src, probe_read, &p, 0);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_IO,
+                   "source callback: a read error reports IO, not INCOMPLETE");
+        axl_json_free(&r);
+        axl_mem_get_stats(&after);
+        test_check(after.count == before.count && after.bytes == before.bytes,
+                   "source callback: a parse abandoned mid-READ leaves nothing "
+                   "allocated behind it");
+    }
+
+    // --- input that simply runs out is INCOMPLETE -------------------------
+    {
+        static const char kCut[] = "{\"k\":\"AAA";
+        SrcProbe          p;
+        AxlMemStats       before, after;
+
+        axl_mem_get_stats(&before);
+        src_probe_init(&p, kCut, sizeof(kCut) - 1, 4);
+        axl_json_source_init_callback(&src, probe_read, &p, 0);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INCOMPLETE,
+                   "source callback: input that ends mid-value reports "
+                   "INCOMPLETE");
+        axl_json_free(&r);
+        axl_mem_get_stats(&after);
+        /* A DIFFERENT cleanup path from the mid-read failure above, and
+           sabotage is what showed they are different: this one read its bytes
+           successfully and then failed in the PARSER, so the accumulated
+           buffer is released by axl_json_parse_source rather than by the read
+           loop. Leaking it left every test green. */
+        test_check(after.count == before.count && after.bytes == before.bytes,
+                   "source callback: a document that ARRIVED and then failed "
+                   "to parse releases its bytes too");
+
+        /* An empty stream is the same story at offset 0: a document that has
+           not arrived yet, NOT a caller who passed a bad argument. */
+        src_probe_init(&p, kCut, 0, 4);
+        axl_json_source_init_callback(&src, probe_read, &p, 0);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INCOMPLETE,
+                   "source callback: a source that yields no bytes at all is "
+                   "INCOMPLETE, not INVALID_ARGUMENT");
+        axl_json_free(&r);
+    }
+
+    // --- a read function that over-reports --------------------------------
+    // It claims more bytes than the buffer it was handed. Believing it would
+    // advance the accumulator past the allocation -- a heap overflow driven
+    // by a caller's own callback, so it is refused rather than trusted.
+    {
+        SrcProbe p;
+
+        src_probe_init(&p, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1, 4);
+        p.over = true;
+        axl_json_source_init_callback(&src, probe_read, &p, 0);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_IO,
+                   "source callback: a read claiming more than the buffer "
+                   "holds is refused, not believed");
+        axl_json_free(&r);
+    }
+
+    // --- a stream that cannot be READ -------------------------------------
+    // axl_stdout has no read function, so axl_read answers -1 immediately.
+    // Without this, a source whose stream DIES mid-document could have been
+    // mapped to EOF and the truncated document would have parsed clean — the
+    // accept-and-corrupt failure this library keeps refusing.
+    {
+        axl_json_source_init_stream(&src, axl_stdout);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_IO,
+                   "source stream: a stream that cannot be read reports IO, "
+                   "not an empty document");
+        axl_json_free(&r);
+    }
+
+    // --- argument paths ----------------------------------------------------
+    {
+        AxlJsonSource empty = { NULL, 0, NULL, NULL, 0 };
+
+        /* The mirror of "a stream sink with no stream is refused at init".
+           Left to the read this would surface as IO — the code for the world
+           being broken — when it is a caller bug. */
+        axl_json_source_init_stream(&src, NULL);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "source args: a stream source with no stream is refused as "
+                   "INVALID_ARGUMENT, matching the sink");
+
+        /* Empty input is answered differently by the two modes ON PURPOSE,
+           and both sides are pinned so the asymmetry cannot drift into being
+           accidental: a pull source that yields nothing is INCOMPLETE (above)
+           because the bytes may still be coming, while a caller who says
+           "here is the document" and hands over zero bytes made a mistake. */
+        axl_json_source_init_mem(&src, JSON_SRC_DOC, 0);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "source args: a contiguous source of length 0 is "
+                   "INVALID_ARGUMENT, where an empty PULL source is "
+                   "INCOMPLETE");
+
+        test_check(!axl_json_parse_source(&empty, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "source args: a source with neither a view nor a read "
+                   "function is refused, not dereferenced");
+
+        test_check(!axl_json_parse_source(NULL, AXL_JSON_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "source args: a NULL source reports INVALID_ARGUMENT");
+
+        axl_json_source_init_mem(&src, JSON_SRC_DOC, sizeof(JSON_SRC_DOC) - 1);
+        test_check(!axl_json_parse_source(&src, AXL_JSON_STRICT, NULL),
+                   "source args: a NULL reader fails without writing "
+                   "anywhere");
+
+        axl_json_source_init_mem(NULL, JSON_SRC_DOC, 1);
+        axl_json_source_init_stream(NULL, NULL);
+        axl_json_source_init_callback(NULL, probe_read, NULL, 0);
+        test_survived("source args: a NULL source initializer is a no-op");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The own-value mirror (P11) — the phase exists because [1,2,3] was unreadable
+// ---------------------------------------------------------------------------
+
+static void
+test_json_value_mirror(void)
+{
+    AxlJsonReader    r, elem, sub;
+    AxlJsonArrayIter it;
+    char             buf[32];
+    int64_t          i64;
+    uint64_t         u64;
+    bool             b;
+
+    // --- THE headline: a bare-number array ---------------------------------
+    // Only axl_json_value_string existed, so array_next handed back a
+    // sub-reader per element and nothing could read a number out of one.
+    {
+        const char *doc = "[1,2,3]";
+        int64_t     sum = 0;
+        int         n   = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_array_begin(&r, &it),
+                   "value mirror: a bare-number array opens");
+        while (axl_json_array_next(&it, &elem)) {
+            if (axl_json_value_int(&elem, &i64)) {
+                sum += i64;
+            }
+            n++;
+        }
+        test_check(n == 3 && sum == 6,
+                   "value mirror: [1,2,3] reads as 1, 2, 3 — the gap this "
+                   "phase exists to close");
+        axl_json_free(&r);
+    }
+
+    // --- the rest of the mirror, one element per type ----------------------
+    {
+        const char *doc = "[7, 18446744073709551615, true, \"s\", 1.5, null, "
+                          "[9], {\"k\":1}]";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_array_begin(&r, &it),
+                   "value mirror: mixed-type array opens");
+
+        /* 7 */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NUMBER
+                   && axl_json_value_int(&elem, &i64) && i64 == 7
+                   && axl_json_value_uint(&elem, &u64) && u64 == 7u,
+                   "value mirror: an integer reads as NUMBER, int and uint");
+
+        /* UINT64_MAX — the half a narrowing accessor cannot reach */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_uint(&elem, &u64)
+                   && u64 == 18446744073709551615ull
+                   && !axl_json_value_int(&elem, &i64),
+                   "value mirror: uint covers the full 64-bit range where int "
+                   "must refuse");
+
+        /* true */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_BOOL
+                   && axl_json_value_bool(&elem, &b) && b
+                   && !axl_json_value_int(&elem, &i64),
+                   "value mirror: a bool reads as BOOL, and not as a number");
+
+        /* "s" */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_STRING
+                   && axl_json_value_string(&elem, buf, sizeof(buf))
+                   && axl_strcmp(buf, "s") == 0
+                   && !axl_json_value_number_str(&elem, buf, sizeof(buf)),
+                   "value mirror: a string reads as STRING, and _number_str "
+                   "refuses it");
+
+        /* 1.5 — the documented trap: NUMBER, but value_int TRUNCATES */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NUMBER
+                   && axl_json_value_int(&elem, &i64) && i64 == 1
+                   && axl_json_value_number_str(&elem, buf, sizeof(buf))
+                   && axl_strcmp(buf, "1.5") == 0,
+                   "value mirror: 1.5 is NUMBER and value_int TRUNCATES it to "
+                   "1 — the literal is how you see that");
+
+        /* null */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NULL
+                   && !axl_json_value_bool(&elem, &b),
+                   "value mirror: null reads as NULL and is not a bool");
+
+        /* [9] — nested array, walked with the same call */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_ARRAY,
+                   "value mirror: a nested array reads as ARRAY");
+        {
+            AxlJsonArrayIter inner;
+
+            test_check(axl_json_value_array_begin(&elem, &inner)
+                       && axl_json_array_next(&inner, &sub)
+                       && axl_json_value_int(&sub, &i64) && i64 == 9,
+                       "value mirror: and opens with the same call, no root "
+                       "required");
+        }
+
+        /* {"k":1} — an element that IS an object needs no value_object */
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_OBJECT
+                   && axl_json_get_int(&elem, "k", &i64) && i64 == 1,
+                   "value mirror: an object element is already an object "
+                   "context — the by-key getters apply directly");
+
+        test_check(!axl_json_array_next(&it, &elem),
+                   "value mirror: the array ends after its eight elements");
+        axl_json_free(&r);
+    }
+
+    // --- a STRING that looks like a number is still a string --------------
+    // The token-type guard is what enforces this, and sabotage showed nothing
+    // else did: every other case here hands value_int a PRIMITIVE token, so
+    // removing the guard was invisible. Drop it and `"123"` reads as 123 —
+    // JSON's one real type distinction, quietly erased.
+    {
+        const char *doc = "[\"123\", \"1.5\", \"true\"]";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_array_begin(&r, &it),
+                   "value mirror: quoted-number array opens");
+
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_STRING
+                   && !axl_json_value_int(&elem, &i64)
+                   && !axl_json_value_uint(&elem, &u64)
+                   && !axl_json_value_number_str(&elem, buf, sizeof(buf))
+                   && axl_json_value_string(&elem, buf, sizeof(buf))
+                   && axl_strcmp(buf, "123") == 0,
+                   "value mirror: \"123\" is a STRING — no numeric accessor "
+                   "reads it, and the string one does");
+        test_check(axl_json_array_next(&it, &elem)
+                   && !axl_json_value_int(&elem, &i64),
+                   "value mirror: \"1.5\" likewise refuses value_int");
+        test_check(axl_json_array_next(&it, &elem)
+                   && !axl_json_value_bool(&elem, &b)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_STRING,
+                   "value mirror: \"true\" is a STRING, not a bool");
+        axl_json_free(&r);
+    }
+
+    // --- NaN and Infinity type as NUMBER, and null is not confused with them
+    // This is what pins the ORDER inside value_type. The number test is
+    // positive (first byte is a digit, sign, '.', 'N' or 'I') and must run
+    // BEFORE the literal letters; a letter-first order would have to know
+    // about NaN/Infinity by name and would silently reclassify whatever is
+    // added to the lexer's literal table next. Nothing else in this file
+    // reaches those two capitals.
+    {
+        const char *doc = "[NaN, Infinity, -Infinity, null]";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_ALLOW_NAN_INF, &r)
+                   && axl_json_value_array_begin(&r, &it),
+                   "value mirror: a NaN/Infinity array parses under its flag");
+
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NUMBER
+                   && axl_json_value_number_str(&elem, buf, sizeof(buf))
+                   && axl_strcmp(buf, "NaN") == 0,
+                   "value mirror: NaN is a NUMBER, not an unknown literal");
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NUMBER,
+                   "value mirror: Infinity is a NUMBER");
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NUMBER,
+                   "value mirror: -Infinity is a NUMBER, sign and all");
+        test_check(axl_json_array_next(&it, &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NULL,
+                   "value mirror: lowercase null is still NULL beside them — "
+                   "the literal table is case-exact");
+        axl_json_free(&r);
+    }
+
+    // --- an EMPTY array opens true ----------------------------------------
+    {
+        const char *doc = "[]";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_array_begin(&r, &it)
+                   && !axl_json_array_next(&it, &elem),
+                   "value mirror: an empty array OPENS, then yields nothing — "
+                   "false would have meant 'not an array'");
+        axl_json_free(&r);
+    }
+
+    // --- get_value and get_type -------------------------------------------
+    {
+        const char *doc = "{\"n\":1,\"s\":\"x\",\"z\":null,\"o\":{},\"a\":[]}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r), "value mirror: "
+                   "object parses");
+
+        test_check(axl_json_get_type(&r, "n") == AXL_JSON_TYPE_NUMBER
+                   && axl_json_get_type(&r, "s") == AXL_JSON_TYPE_STRING
+                   && axl_json_get_type(&r, "z") == AXL_JSON_TYPE_NULL
+                   && axl_json_get_type(&r, "o") == AXL_JSON_TYPE_OBJECT
+                   && axl_json_get_type(&r, "a") == AXL_JSON_TYPE_ARRAY,
+                   "value mirror: get_type names all five types");
+
+        // The distinction the enum is built to preserve.
+        test_check(axl_json_get_type(&r, "z") == AXL_JSON_TYPE_NULL
+                   && axl_json_get_type(&r, "nope") == AXL_JSON_TYPE_NONE,
+                   "value mirror: present-but-null is NOT absent");
+
+        // get_value descends to any type, null included, which is the other
+        // way to draw that same line.
+        test_check(axl_json_get_value(&r, "z", &elem)
+                   && axl_json_value_type(&elem) == AXL_JSON_TYPE_NULL
+                   && !axl_json_get_value(&r, "nope", &elem),
+                   "value mirror: get_value reaches a null and refuses an "
+                   "absent key");
+
+        test_check(axl_json_get_value(&r, "n", &elem)
+                   && axl_json_value_int(&elem, &i64) && i64 == 1,
+                   "value mirror: get_value + value_int is what get_int is");
+        axl_json_free(&r);
+    }
+
+    // --- every way to get NONE, including the one that means the opposite --
+    {
+        const char   *bad = "{oops";
+        AxlJsonReader empty;
+
+        axl_memset(&empty, 0, sizeof(empty));
+        test_check(axl_json_value_type(NULL) == AXL_JSON_TYPE_NONE
+                   && axl_json_get_type(NULL, "k") == AXL_JSON_TYPE_NONE
+                   && axl_json_value_type(&empty) == AXL_JSON_TYPE_NONE,
+                   "value mirror: NULL and empty readers are NONE, not a "
+                   "garbage type");
+
+        test_check(!axl_json_parse(bad, axl_strlen(bad),
+                                         AXL_JSON_STRICT, &r)
+                   && axl_json_get_type(&r, "anything") == AXL_JSON_TYPE_NONE
+                   && axl_json_reader_error(&r)->code != AXL_JSON_OK,
+                   "value mirror: a FAILED parse reports NONE for every key, "
+                   "and only the error record says so");
+        axl_json_free(&r);
+    }
+
+    // --- a FALSE return must not have written the out-param ---------------
+    // The whole by-key family promises "untouched on false", and the refactor
+    // that routed get_object through get_value broke it for that one member:
+    // get_value borrows as soon as the KEY exists, so a key holding the wrong
+    // type left `out` already overwritten. It licenses this idiom, which
+    // silently retargeted at the wrong node:
+    //
+    //     AxlJsonReader cfg = root;            // default: look in the root
+    //     axl_json_get_object(&root, "tls", &cfg);   // narrow IF present
+    //     axl_json_get_int(&cfg, "port", &port);
+    {
+        const char *doc = "{\"o\":{\"port\":8080},\"s\":\"str\",\"n\":1}";
+        AxlJsonReader keep;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r), "value mirror: "
+                   "out-param document parses");
+
+        test_check(axl_json_get_object(&r, "o", &keep)
+                   && axl_json_get_int(&keep, "port", &i64) && i64 == 8080,
+                   "value mirror: get_object narrows to the nested object");
+
+        /* Each of these must FAIL and leave `keep` pointing where it was. */
+        test_check(!axl_json_get_object(&r, "s", &keep)
+                   && axl_json_get_int(&keep, "port", &i64) && i64 == 8080,
+                   "value mirror: a key holding a STRING leaves out untouched");
+        test_check(!axl_json_get_object(&r, "n", &keep)
+                   && axl_json_get_int(&keep, "port", &i64) && i64 == 8080,
+                   "value mirror: a key holding a NUMBER leaves out untouched");
+        test_check(!axl_json_get_object(&r, "absent", &keep)
+                   && axl_json_get_int(&keep, "port", &i64) && i64 == 8080,
+                   "value mirror: an absent key leaves out untouched");
+        axl_json_free(&r);
+    }
+
+    // --- argument paths ----------------------------------------------------
+    {
+        const char *doc = "{\"k\":1}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r), "value mirror: "
+                   "arg-path document parses");
+
+        /* get_type on a reader whose own value is not an object: one of the
+           five documented NONE causes, and the only one with no other test. */
+        {
+            const char   *arr = "[1,2,3]";
+            AxlJsonReader ar;
+
+            test_check(axl_json_parse(arr, axl_strlen(arr), AXL_JSON_RELAXED, &ar)
+                       && axl_json_get_type(&ar, "k") == AXL_JSON_TYPE_NONE
+                       && !axl_json_get_value(&ar, "k", &elem),
+                       "value mirror: looking a key up in a non-object is "
+                       "NONE, not a crash");
+            axl_json_free(&ar);
+        }
+
+        test_check(!axl_json_value_array_begin(&r, NULL),
+                   "value mirror: value_array_begin refuses a NULL iterator");
+        test_check(!axl_json_get_value(&r, NULL, &elem)
+                   && !axl_json_get_value(&r, "k", NULL)
+                   && !axl_json_get_value(NULL, "k", &elem),
+                   "value mirror: get_value refuses NULL arguments — a NULL "
+                   "key never means 'my own value'");
+        test_check(!axl_json_value_int(NULL, &i64)
+                   && !axl_json_value_uint(NULL, &u64)
+                   && !axl_json_value_bool(NULL, &b)
+                   && !axl_json_value_number_str(NULL, buf, sizeof(buf))
+                   && !axl_json_value_array_begin(NULL, &it),
+                   "value mirror: the own-value family is NULL-safe");
+
+        /* A sub-reader owns nothing, so freeing one must be a no-op that
+           leaves the parent usable — the contract that stops an implementer
+           copying owns_json into it and double-freeing. */
+        test_check(axl_json_get_value(&r, "k", &elem), "value mirror: "
+                   "sub-reader taken");
+        axl_json_free(&elem);
+        test_check(axl_json_get_int(&r, "k", &i64) && i64 == 1,
+                   "value mirror: freeing a sub-reader does not disturb the "
+                   "parent");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Object iteration (P11) — the only way to ask what keys an object HAS
+// ---------------------------------------------------------------------------
+
+static void
+test_json_object_iter(void)
+{
+    AxlJsonReader     r, val, sub;
+    AxlJsonObjectIter it;
+    char              key[32];
+    int64_t           i64;
+
+    // --- document order, mixed value types --------------------------------
+    {
+        /* The container sits in the MIDDLE on purpose. With it last,
+           `remaining` ends the walk whatever `pos` is, so deleting the
+           nested-child skip loop entirely still produced a, b, c -- the
+           assertion below read as coverage it did not have. */
+        const char *doc = "{\"a\":1,\"c\":[7,8],\"b\":\"x\"}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: an object opens");
+
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "a") == 0
+                   && axl_json_value_int(&val, &i64) && i64 == 1,
+                   "obj iter: first pair is a=1");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "c") == 0
+                   && axl_json_value_type(&val) == AXL_JSON_TYPE_ARRAY,
+                   "obj iter: second pair is c, an array");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "b") == 0
+                   && axl_json_value_type(&val) == AXL_JSON_TYPE_STRING,
+                   "obj iter: third pair is b — the array's elements did not "
+                   "leak into the walk as pairs of their own");
+        test_check(!axl_json_object_next(&it, key, sizeof(key), &val),
+                   "obj iter: exactly three pairs");
+        axl_json_free(&r);
+    }
+
+    // --- the key is DECODED, not a raw view -------------------------------
+    // A borrowed raw view would reproduce the \uXXXX corruption phase A
+    // existed to fix, one layer up: this key is spelled with an escape and
+    // its NAME is "A".
+    {
+        const char *doc = "{\"\\u0041\":1,\"b\\u0000c\":2}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: escaped-key object opens");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "A") == 0
+                   && axl_json_value_int(&val, &i64) && i64 == 1,
+                   "obj iter: \\u0041 decodes to the key A");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "b\xEF\xBF\xBD" "c") == 0,
+                   "obj iter: an escaped NUL in a key becomes U+FFFD, as it "
+                   "does in a value — the key decoder is the same one");
+        axl_json_free(&r);
+    }
+
+    // --- JSON5 unquoted and single-quoted keys ----------------------------
+    // Not an opt-in corner: axl_json_parse is RELAXED, so this is the DEFAULT
+    // dialect. The key token brackets the bare identifier with no quotes to
+    // strip, which the decoder has to handle unchanged.
+    {
+        const char *doc = "{a:1,'b c':2,'d\\'e':3}";
+        int64_t     v1 = 0, v2 = 0, v3 = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: a JSON5 object opens");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "a") == 0
+                   && axl_json_value_int(&val, &v1) && v1 == 1,
+                   "obj iter: an UNQUOTED JSON5 key reads as its identifier");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "b c") == 0
+                   && axl_json_value_int(&val, &v2) && v2 == 2,
+                   "obj iter: a single-quoted key reads without its quotes");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "d'e") == 0
+                   && axl_json_value_int(&val, &v3) && v3 == 3,
+                   "obj iter: and an escaped quote inside one decodes");
+        axl_json_free(&r);
+    }
+
+    // --- duplicate keys are yielded separately -----------------------------
+    {
+        const char *doc = "{\"a\":1,\"a\":2}";
+        int64_t     first = 0, second = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it)
+                   && axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_json_value_int(&val, &first)
+                   && axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_json_value_int(&val, &second)
+                   && !axl_json_object_next(&it, key, sizeof(key), &val),
+                   "obj iter: a duplicate key yields TWO pairs, not one");
+        test_check(first == 1 && second == 2,
+                   "obj iter: and both values arrive, in document order");
+        axl_json_free(&r);
+    }
+
+    // --- an EMPTY object opens true ----------------------------------------
+    {
+        const char *doc = "{}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it)
+                   && !axl_json_object_next(&it, key, sizeof(key), &val),
+                   "obj iter: an empty object OPENS, then yields nothing");
+        axl_json_free(&r);
+    }
+
+    // --- by key, and over a nested object ---------------------------------
+    {
+        const char *doc = "{\"outer\":{\"p\":10,\"q\":20},\"other\":1}";
+        int64_t     sum = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_object_begin(&r, "outer", &it),
+                   "obj iter: object_begin descends by key");
+        while (axl_json_object_next(&it, key, sizeof(key), &val)) {
+            if (axl_json_value_int(&val, &i64)) {
+                sum += i64;
+            }
+        }
+        test_check(sum == 30,
+                   "obj iter: the nested object's two members are walked, and "
+                   "the sibling key is not");
+        axl_json_free(&r);
+    }
+
+    // --- NULL key_buf walks values only ------------------------------------
+    {
+        const char *doc = "{\"a\":1,\"b\":2}";
+        int64_t     sum = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: values-only object opens");
+        while (axl_json_object_next(&it, NULL, 0, &val)) {
+            if (axl_json_value_int(&val, &i64)) {
+                sum += i64;
+            }
+        }
+        test_check(sum == 3,
+                   "obj iter: a NULL key buffer walks the values and skips "
+                   "the keys");
+        axl_json_free(&r);
+    }
+
+    // --- a key too long is TRUNCATED, reported, and the walk continues -----
+    // Ending iteration over one oversized key would lose every later pair, so
+    // the pair is yielded — but a prefix cannot be recognised as short from
+    // its own contents, so the caller is TOLD.
+    {
+        const char *doc = "{\"averylongkeyname\":1,\"z\":2}";
+        char        small[8];   /* 7 chars + NUL */
+        int64_t     zval = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: long-key object opens");
+        test_check(axl_json_object_next(&it, small, sizeof(small), &val)
+                   && axl_json_object_iter_error(&it)->code
+                      == AXL_JSON_ERR_TRUNCATED
+                   && axl_json_value_int(&val, &i64) && i64 == 1,
+                   "obj iter: an oversized key reports TRUNCATED and the pair "
+                   "is still yielded");
+        test_check(axl_json_object_next(&it, small, sizeof(small), &val)
+                   && axl_strcmp(small, "z") == 0
+                   && axl_json_object_iter_error(&it)->code == AXL_JSON_OK
+                   && axl_json_value_int(&val, &zval) && zval == 2,
+                   "obj iter: the walk continues, and the code RESETS on a "
+                   "key that fits — it is per-pair, not sticky");
+        axl_json_free(&r);
+    }
+
+    // --- the false match the report exists to prevent ----------------------
+    // A multi-byte character is refused WHOLE, so a truncation can land
+    // several bytes short of the buffer. "userés" in a 6-byte buffer decodes
+    // to exactly "user" — indistinguishable from the real key "user" by
+    // content alone. Measured before the fix: 700 of 1000 generated keys
+    // collided with a 4-byte target at the buffer size the docstring then
+    // claimed was safe.
+    {
+        const char *doc = "{\"user\\u00e9s\":1}";
+        char        small[6];
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it)
+                   && axl_json_object_next(&it, small, sizeof(small), &val),
+                   "obj iter: multi-byte-key object yields its pair");
+        test_check(axl_strcmp(small, "user") == 0,
+                   "obj iter: the truncated key is byte-identical to a "
+                   "DIFFERENT real key — content alone cannot tell");
+        test_check(axl_json_object_iter_error(&it)->code
+                   == AXL_JSON_ERR_TRUNCATED,
+                   "obj iter: and only the reported code distinguishes them");
+        axl_json_free(&r);
+    }
+
+    // --- a key discovered by iteration ROUND-TRIPS into the by-key family --
+    // token_equals compared RAW source bytes while object_next decodes, so an
+    // escaped key was findable only by its raw spelling — and a plain RFC 8259
+    // \t was enough. Object iteration is what made that contradiction live:
+    // it is the only way to LEARN a key, and the obvious next move is to
+    // use one.
+    {
+        const char *doc = "{\"\\u0041\":1,\"tab\\tkey\":2,\"plain\":3}";
+        int         round = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it),
+                   "obj iter: escaped-key round-trip object opens");
+        while (axl_json_object_next(&it, key, sizeof(key), &val)) {
+            AxlJsonReader back;
+
+            if (axl_json_object_iter_error(&it)->code == AXL_JSON_OK
+                && axl_json_get_value(&r, key, &back)
+                && axl_json_value_int(&back, &i64)) {
+                round++;
+            }
+        }
+        test_check(round == 3,
+                   "obj iter: every discovered key finds its own value again "
+                   "through get_value — decoded names, both directions");
+        axl_json_free(&r);
+    }
+
+    // --- and the by-key family answers to the DECODED name -----------------
+    {
+        const char *doc = "{\"a\\u0042c\":1,\"tab\\tkey\":2}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r), "obj iter: "
+                   "escaped-key lookup document parses");
+        test_check(axl_json_get_int(&r, "aBc", &i64) && i64 == 1,
+                   "obj iter: {\"a\\u0042c\":1} is found by the name aBc");
+        test_check(axl_json_get_int(&r, "tab\tkey", &i64) && i64 == 2,
+                   "obj iter: a plain RFC 8259 \\t in a key is findable too");
+        test_check(!axl_json_get_int(&r, "a\\u0042c", &i64),
+                   "obj iter: and NOT by its raw source spelling");
+        axl_json_free(&r);
+    }
+
+    // --- reusing the VALUE reader must not retarget the iterator ----------
+    // The reason this type holds the document by value. AxlJsonArrayIter had
+    // to be FIXED into that shape; this one was written from it.
+    {
+        const char       *doc = "{\"a\":{\"n\":1},\"b\":{\"n\":2}}";
+        AxlJsonObjectIter inner;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+                   && axl_json_value_object_begin(&r, &it)
+                   && axl_json_object_next(&it, key, sizeof(key), &val),
+                   "obj iter: alias setup — first pair taken");
+        test_check(axl_json_value_object_begin(&val, &inner),
+                   "obj iter: an inner iterator opens on that value");
+        test_check(axl_json_object_next(&it, key, sizeof(key), &val)
+                   && axl_strcmp(key, "b") == 0,
+                   "obj iter: the outer walk reuses the value reader");
+        test_check(axl_json_object_next(&inner, key, sizeof(key), &sub)
+                   && axl_strcmp(key, "n") == 0
+                   && axl_json_value_int(&sub, &i64) && i64 == 1,
+                   "obj iter: the inner iterator still yields ITS object's "
+                   "member — value 1, not the reused reader's 2");
+        axl_json_free(&r);
+    }
+
+    // --- argument paths ----------------------------------------------------
+    {
+        const char   *doc = "{\"a\":1}";
+        const char   *arr = "[1,2]";
+        AxlJsonReader ar;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r), "obj iter: "
+                   "arg-path document parses");
+        test_check(!axl_json_value_object_begin(&r, NULL)
+                   && !axl_json_value_object_begin(NULL, &it)
+                   && !axl_json_object_begin(&r, NULL, &it)
+                   && !axl_json_object_begin(&r, "a", &it),
+                   "obj iter: NULL args are refused, and so is a key whose "
+                   "value is not an object");
+
+        test_check(axl_json_parse(arr, axl_strlen(arr), AXL_JSON_RELAXED, &ar)
+                   && !axl_json_value_object_begin(&ar, &it),
+                   "obj iter: an ARRAY is not an object");
+        axl_json_free(&ar);
+
+        test_check(!axl_json_object_begin(&r, "nosuchkey", &it),
+                   "obj iter: object_begin refuses an ABSENT key, distinctly "
+                   "from a key of the wrong type");
+
+        /* iter untouched on false, the same promise get_object makes. */
+        {
+            AxlJsonObjectIter keep;
+            AxlJsonReader     kv;
+
+            test_check(axl_json_value_object_begin(&r, &keep)
+                       && !axl_json_object_begin(&r, "nosuchkey", &keep)
+                       && !axl_json_value_object_begin(&ar, &keep)
+                       && axl_json_object_next(&keep, key, sizeof(key), &kv)
+                       && axl_strcmp(key, "a") == 0,
+                       "obj iter: a failed begin leaves the iterator "
+                       "untouched and still walkable");
+        }
+
+        test_check(axl_json_value_object_begin(&r, &it)
+                   && !axl_json_object_next(&it, key, sizeof(key), NULL)
+                   && !axl_json_object_next(NULL, key, sizeof(key), &val),
+                   "obj iter: next refuses a NULL value out-param or iterator");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The public string decoder (P11) — the inverse of axl_json_escape_string
+// ---------------------------------------------------------------------------
+
+static void
+test_json_decode_string(void)
+{
+    char buf[64];
+
+    // --- the escape set, including the JSON5 superset ----------------------
+    {
+        struct { const char *src; const char *want; const char *msg; } row[] = {
+            { "plain", "plain", "decode: an escape-free string is itself" },
+            { "a\\u0041b", "aAb", "decode: \\uXXXX resolves" },
+            { "\\ud83d\\ude00", "\xF0\x9F\x98\x80",
+              "decode: a surrogate PAIR combines into one 4-byte code point, "
+              "not two 3-byte sequences" },
+            { "\\ud83d", "\xEF\xBF\xBD",
+              "decode: a LONE surrogate becomes U+FFFD" },
+            { "a\\u0000b", "a\xEF\xBF\xBD" "b",
+              "decode: an escaped NUL becomes U+FFFD, never an interior NUL" },
+            { "a\\0b", "a\xEF\xBF\xBD" "b",
+              "decode: JSON5 \\0 likewise" },
+            { "a\\x00b", "a\xEF\xBF\xBD" "b",
+              "decode: and JSON5 \\x00" },
+            { "\\x41", "A", "decode: \\xNN is the code unit U+00NN" },
+            { "q\\\"q", "q\"q", "decode: an escaped quote" },
+            { "t\\tb", "t\tb", "decode: the RFC 8259 whitespace escapes" },
+            { "s\\'q", "s'q", "decode: JSON5 \\' " },
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            const int n = axl_json_decode_string(row[i].src,
+                                                 axl_strlen(row[i].src),
+                                                 buf, sizeof(buf));
+            test_check(n > 0 && axl_strcmp(buf, row[i].want) == 0
+                       && (size_t)n == axl_strlen(row[i].want),
+                       row[i].msg);
+        }
+    }
+
+    // --- it is the inverse of the encoder, across the quotes ---------------
+    {
+        const char *original = "he said \"hi\"\n\tand left";
+        char        enc[128];
+        const int   e = axl_json_escape_string(original, enc, sizeof(enc));
+
+        /* escape_string writes WITH quotes; the decoder takes the inner form,
+           so the round trip skips the opening quote and drops two. */
+        test_check(e > 2 && enc[0] == '"' && enc[e - 1] == '"',
+                   "decode: the encoder brackets its output in quotes");
+        const int d = axl_json_decode_string(enc + 1, (size_t)e - 2,
+                                             buf, sizeof(buf));
+        test_check(d > 0 && axl_strcmp(buf, original) == 0,
+                   "decode: escape then decode reproduces the original "
+                   "exactly");
+    }
+
+    // --- truncation is REFUSED, unlike axl_json_get_string -----------------
+    // A caller here has no reader to interrogate, so a silent prefix would be
+    // a value that compares equal to the wrong thing.
+    {
+        const char *src = "abcdefgh";
+        char        small[4];
+
+        axl_memset(small, (char)0xAA, sizeof(small));
+        test_check(axl_json_decode_string(src, axl_strlen(src),
+                                          small, sizeof(small)) == -1,
+                   "decode: a result too long for the buffer returns -1 "
+                   "rather than a prefix");
+
+        /* A multi-byte unit is refused WHOLE — the case where a length check
+           alone cannot detect the shortfall. `é` is two bytes, so a 3-byte
+           buffer holds it exactly and a 2-byte one cannot hold it at all;
+           both are asserted, because the boundary is the whole point. */
+        test_check(axl_json_decode_string("\\u00e9", 6, small, 3) == 2
+                   && axl_strcmp(small, "\xC3\xA9") == 0,
+                   "decode: a 2-byte code point fits a 3-byte buffer exactly");
+        test_check(axl_json_decode_string("\\u00e9", 6, small, 2) == -1,
+                   "decode: and is refused whole by a 2-byte one, never split "
+                   "into half a sequence");
+    }
+
+    // --- exact fit, and the empty string -----------------------------------
+    {
+        test_check(axl_json_decode_string("abc", 3, buf, 4) == 3
+                   && axl_strcmp(buf, "abc") == 0,
+                   "decode: len+1 is enough for an ESCAPE-FREE string");
+        test_check(axl_json_decode_string("", 0, buf, sizeof(buf)) == 0
+                   && buf[0] == '\0',
+                   "decode: an empty string decodes to an empty string");
+    }
+
+    // --- a decode CAN grow, so len+1 is not a sufficient bound -------------
+    // JSON5 `\0` is the one escape that expands: two source bytes in, the
+    // three bytes of U+FFFD out. Every other form shrinks or holds. The
+    // docstring used to promise "a decode never grows a string, so len + 1
+    // always suffices" and a caller who believed it got a spurious -1 on
+    // input it had sized correctly by the documented rule.
+    //
+    // The escape-set table above already decodes `a\0b` -- 4 bytes in, 5 out
+    // -- and could not catch this because it decodes into a 64-byte buffer.
+    // Growth was visible in the DATA and invisible to the ASSERTION.
+    {
+        char tight[4];
+
+        test_check(axl_json_decode_string("\\0", 2, tight, 3) == -1,
+                   "decode: len+1 is REFUSED for \\0, which grows 2 bytes "
+                   "into 3");
+        test_check(axl_json_decode_string("\\0", 2, tight, 4) == 3
+                   && axl_strcmp(tight, "\xEF\xBF\xBD") == 0,
+                   "decode: the documented len*3/2+1 bound holds it exactly");
+    }
+
+    // --- sweep the bound, at BOTH parities ---------------------------------
+    // A hand-picked length lands wherever it lands. Two things have to be
+    // swept: the ratio only bites when `\0` is DENSE, and `len * 3 / 2` only
+    // TRUNCATES when len is odd -- so an all-pairs sweep, which is necessarily
+    // even, never exercises the formula's riskiest arithmetic at all.
+    //
+    // The densest input at each length is floor(len/2) `\0` pairs plus, when
+    // the length is odd, one 1:1 filler byte.
+    {
+        enum { SWEEP_PAIRS = 12 };
+        char   src[SWEEP_PAIRS * 2 + 1];
+        char   out[SWEEP_PAIRS * 3 + 2];
+        char   want[SWEEP_PAIRS * 3 + 2];
+        size_t len;
+        bool   all_fit   = true;
+        bool   all_exact = true;
+
+        for (len = 1; len <= SWEEP_PAIRS * 2; len++) {
+            const size_t pairs = len / 2;
+            const size_t bound = len * 3 / 2 + 1;
+            size_t       i;
+            size_t       w = 0;
+            int          n;
+
+            for (i = 0; i < pairs; i++) {
+                src[i * 2]     = '\\';
+                src[i * 2 + 1] = '0';
+                want[w++]      = (char)0xEF;
+                want[w++]      = (char)0xBF;
+                want[w++]      = (char)0xBD;
+            }
+            if (len % 2 != 0) {
+                src[len - 1] = 'z';
+                want[w++]    = 'z';
+            }
+            want[w] = '\0';
+
+            /* The BYTES, not just the length: three arbitrary bytes per `\0`
+               would satisfy a length-only check while decoding wrongly. */
+            n = axl_json_decode_string(src, len, out, bound);
+            if (n != (int)w || axl_strcmp(out, want) != 0) {
+                all_fit = false;
+            }
+            /* And one byte less must fail, or the bound is loose rather than
+               tight -- a loose bound would let this pass while still
+               mis-documenting the real requirement. */
+            if (axl_json_decode_string(src, len, out, bound - 1) != -1) {
+                all_exact = false;
+            }
+        }
+        test_check(all_fit,
+                   "decode: len*3/2+1 holds the densest input at every length "
+                   "1..24, bytes and all");
+        test_check(all_exact,
+                   "decode: and is TIGHT -- one byte less is refused at every "
+                   "one of them, odd lengths included");
+    }
+
+    // --- argument paths ----------------------------------------------------
+    {
+        test_check(axl_json_decode_string(NULL, 3, buf, sizeof(buf)) == -1
+                   && axl_json_decode_string("abc", 3, NULL, sizeof(buf)) == -1
+                   && axl_json_decode_string("abc", 3, buf, 0) == -1,
+                   "decode: NULL arguments and a zero-sized buffer are "
+                   "refused");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer formatting (P5) — COMPACT, ESCAPE_SLASH, EMBED
+//
+// Exact WHOLE-DOCUMENT compares throughout, per the workflow's output rule: a
+// substring match would let most of the regressions these guard through.
+// ---------------------------------------------------------------------------
+
+/* One nested document, built identically under every flag set, so the flags
+   are compared against each OTHER and not each against its own expectation. */
+static void
+build_fmt_doc(AxlJsonWriter *w)
+{
+    axl_json_obj_begin(w);
+    axl_json_kv_int(w, "a", 1);
+    axl_json_key(w, "o");
+    axl_json_obj_begin(w);
+    axl_json_kv_str(w, "p", "x/y");
+    axl_json_key(w, "d");
+    axl_json_obj_begin(w);
+    axl_json_kv_int(w, "z", 2);
+    axl_json_obj_end(w);
+    axl_json_obj_end(w);
+    axl_json_obj_end(w);
+}
+
+/* An ARRAY root, so the EMBED identity is asserted for both delimiters. It
+   was previously checked only for `{}`, with the bracket case a separate
+   hardcoded string outside the loop. */
+static void
+build_fmt_arr(AxlJsonWriter *w)
+{
+    axl_json_arr_begin(w);
+    axl_json_int(w, 1);
+    axl_json_arr_begin(w);
+    axl_json_str(w, "n/a");
+    axl_json_arr_end(w);
+    axl_json_arr_end(w);
+}
+
+/* EMBED's defining identity: wrapping the embedded output in the delimiter it
+   omitted must reproduce the unembedded output byte for byte. Asserted per
+   flag set rather than folded into one boolean, so a failure names the
+   setting that broke rather than only that something did. */
+static void
+fmt_embed_identity(void (*build)(AxlJsonWriter *), AxlJsonFlags flags,
+                   char open_ch, char close_ch, const char *msg)
+{
+    AXL_AUTOPTR(AxlString) plain = axl_string_new(NULL);
+    AXL_AUTOPTR(AxlString) emb   = axl_string_new(NULL);
+    AXL_AUTOPTR(AxlString) wrap  = axl_string_new(NULL);
+    AxlJsonWriter          w;
+
+    axl_json_writer_init(&w, plain, flags);
+    build(&w);
+    axl_json_writer_finish(&w);
+
+    axl_json_writer_init(&w, emb, flags | AXL_JSON_EMBED);
+    build(&w);
+    axl_json_writer_finish(&w);
+
+    axl_string_append_c(wrap, open_ch);
+    axl_string_append(wrap, axl_string_str(emb));
+    axl_string_append_c(wrap, close_ch);
+
+    test_check(axl_strcmp(axl_string_str(wrap), axl_string_str(plain)) == 0,
+               msg);
+}
+
+static void
+fmt_check(AxlJsonFlags flags, const char *want, const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter          w;
+
+    axl_json_writer_init(&w, out, flags);
+    build_fmt_doc(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w)
+               && axl_strcmp(axl_string_str(out), want) == 0, msg);
+}
+
+static void
+test_json_writer_format(void)
+{
+    // --- the baseline, and the presence bit ------------------------------
+    // INDENT(0) must NOT equal "no indent flag": newlines with zero indent
+    // versus fully compact. If they match, the presence bit is broken — which
+    // is the whole reason it exists.
+    fmt_check(AXL_JSON_STRICT,
+              "{\"a\":1,\"o\":{\"p\":\"x/y\",\"d\":{\"z\":2}}}",
+              "fmt: no indent flag is fully compact");
+    fmt_check(AXL_JSON_INDENT(0),
+              "{\n\"a\": 1,\n\"o\": {\n\"p\": \"x/y\",\n\"d\": {\n\"z\": 2\n}\n}\n}",
+              "fmt: INDENT(0) is newlines with ZERO indent, not compact — the "
+              "presence bit is what tells them apart");
+    fmt_check(AXL_JSON_INDENT(2),
+              "{\n  \"a\": 1,\n  \"o\": {\n    \"p\": \"x/y\",\n    \"d\": {\n      \"z\": 2\n    }\n  }\n}",
+              "fmt: INDENT(2) indents each level by two");
+    fmt_check(AXL_JSON_INDENT(1),
+              "{\n \"a\": 1,\n \"o\": {\n  \"p\": \"x/y\",\n  \"d\": {\n"
+              "   \"z\": 2\n  }\n }\n}",
+              "fmt: INDENT(1) — one space per level, three levels deep");
+    fmt_check(AXL_JSON_INDENT(8),
+              "{\n        \"a\": 1,\n        \"o\": {\n"
+              "                \"p\": \"x/y\",\n                \"d\": {\n"
+              "                        \"z\": 2\n                }\n"
+              "        }\n}",
+              "fmt: INDENT(8) honours its width at every depth");
+
+    // --- COMPACT ----------------------------------------------------------
+    fmt_check(AXL_JSON_STRICT | AXL_JSON_COMPACT,
+              "{\"a\":1,\"o\":{\"p\":\"x/y\",\"d\":{\"z\":2}}}",
+              "fmt: COMPACT alone changes nothing — AXL's unindented output "
+              "is already compact, unlike Jansson's");
+    fmt_check(AXL_JSON_INDENT(2) | AXL_JSON_COMPACT,
+              "{\n  \"a\":1,\n  \"o\":{\n    \"p\":\"x/y\",\n    \"d\":{\n      \"z\":2\n    }\n  }\n}",
+              "fmt: INDENT(2) | COMPACT keeps the newlines and drops the "
+              "space after the colon");
+
+    // --- ESCAPE_SLASH -----------------------------------------------------
+    fmt_check(AXL_JSON_STRICT | AXL_JSON_ESCAPE_SLASH,
+              "{\"a\":1,\"o\":{\"p\":\"x\\/y\",\"d\":{\"z\":2}}}",
+              "fmt: ESCAPE_SLASH writes / as \\/ in a value");
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        /* Keys too, not just values — they go through the same quoting path
+           and a fix applied to one is easy to forget on the other. */
+        axl_json_writer_init(&w, out, AXL_JSON_ESCAPE_SLASH);
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "a/b", 1);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out), "{\"a\\/b\":1}") == 0,
+                   "fmt: ESCAPE_SLASH applies to KEYS as well as values");
+    }
+
+    // --- EMBED, and the identity that defines it --------------------------
+    fmt_check(AXL_JSON_STRICT | AXL_JSON_EMBED,
+              "\"a\":1,\"o\":{\"p\":\"x/y\",\"d\":{\"z\":2}}",
+              "fmt: EMBED drops the outermost braces and nothing else — the "
+              "NESTED object keeps its own");
+    fmt_check(AXL_JSON_INDENT(2) | AXL_JSON_EMBED,
+              "\n  \"a\": 1,\n  \"o\": {\n    \"p\": \"x/y\",\n    \"d\": {\n      \"z\": 2\n    }\n  }\n",
+              "fmt: EMBED | INDENT(2) keeps every member's indentation, and "
+              "the newlines that belong to the members rather than the braces");
+
+    // The contract stated as an executable identity, per setting and for BOTH
+    // root delimiters.
+    fmt_embed_identity(build_fmt_doc, AXL_JSON_STRICT, '{', '}',
+                       "fmt: EMBED identity holds for an object root, compact");
+    fmt_embed_identity(build_fmt_doc, AXL_JSON_INDENT(0), '{', '}',
+                       "fmt: EMBED identity holds at INDENT(0)");
+    fmt_embed_identity(build_fmt_doc, AXL_JSON_INDENT(2), '{', '}',
+                       "fmt: EMBED identity holds at INDENT(2)");
+    fmt_embed_identity(build_fmt_doc, AXL_JSON_INDENT(8), '{', '}',
+                       "fmt: EMBED identity holds at INDENT(8)");
+    fmt_embed_identity(build_fmt_doc, AXL_JSON_INDENT(2) | AXL_JSON_COMPACT,
+                       '{', '}',
+                       "fmt: EMBED identity holds at INDENT(2) | COMPACT");
+    fmt_embed_identity(build_fmt_doc,
+                       AXL_JSON_RELAXED | AXL_JSON_ALLOW_TRAILING_COMMA,
+                       '{', '}',
+                       "fmt: EMBED identity holds with a TRAILING COMMA");
+    fmt_embed_identity(build_fmt_arr, AXL_JSON_STRICT, '[', ']',
+                       "fmt: EMBED identity holds for an ARRAY root, compact");
+    fmt_embed_identity(build_fmt_arr, AXL_JSON_INDENT(2), '[', ']',
+                       "fmt: EMBED identity holds for an ARRAY root, indented");
+
+    // --- ESCAPE_SLASH on the SPLICE path ----------------------------------
+    // The flag's stated purpose is embedding in a <script> block, where `</`
+    // closes the element early. "Parse a document I do not control, re-emit
+    // it into a page" is exactly that use case — and axl_json_write_token was
+    // the one path where the flag did nothing, in keys and values alike.
+    //
+    // An already-escaped `\/` in the source must stay ONE escape, not become
+    // `\\/`: the splice sees source-form bytes, so the backslash and the byte
+    // after it travel together.
+    {
+        const char            *doc = "{\"k/1\":\"a/b\",\"e\":\"x\\/y\"}";
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonReader          r;
+        AxlJsonWriter          w;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r),
+                   "fmt: splice source parses");
+        axl_json_writer_init(&w, out, AXL_JSON_ESCAPE_SLASH);
+        axl_json_write_token(&w, &r, 0);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out),
+                              "{\"k\\/1\":\"a\\/b\",\"e\":\"x\\/y\"}") == 0,
+                   "fmt: ESCAPE_SLASH reaches write_token — keys and values "
+                   "both, and an existing \\/ is not double-escaped");
+        axl_json_free(&r);
+    }
+
+    // --- a COMMENT body is not string content ------------------------------
+    // Exact whole-document compare, not a substring probe: a substring match
+    // would still pass if the rest of the document were mangled, which is the
+    // regression this is meant to catch.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        /* ESCAPE_SLASH alone, NOT via AXL_JSON_RELAXED: that preset carries
+           AXL_JSON_ALLOW_TRAILING_COMMA, which the writer honours, so the
+           document would end `,}` and the comparison would be about two
+           things at once. */
+        axl_json_writer_init(&w, out, AXL_JSON_ESCAPE_SLASH);
+        axl_json_obj_begin(&w);
+        axl_json_comment(&w, "see http://example.com");
+        axl_json_kv_str(&w, "u", "http://example.com");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out),
+                              "{/* see http://example.com */"
+                              "\"u\":\"http:\\/\\/example.com\"}") == 0,
+                   "fmt: ESCAPE_SLASH escapes a VALUE's slashes and leaves a "
+                   "comment body alone — comments are not string content");
+    }
+
+    // --- an EMBEDded ARRAY root -------------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_EMBED);
+        axl_json_arr_begin(&w);
+        axl_json_int(&w, 1);
+        axl_json_int(&w, 2);
+        axl_json_arr_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out), "1,2") == 0,
+                   "fmt: EMBED drops a root ARRAY's brackets too, not just "
+                   "an object's braces");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A comment at depth 0 (regression)
+//
+// axl_json_comment set needs_comma unconditionally, including at depth 0 where
+// there is no sibling to separate. begin_item's "a second value at depth 0 is
+// not valid JSON" guard then fired on the very next value, so a FILE-HEADER
+// comment — the most common JSON5 comment shape there is — poisoned the
+// document: WRITER_STATE, and the output stopped at the comment.
+//
+// Every pre-existing comment test writes inside a container, which is why
+// nothing caught it.
+// ---------------------------------------------------------------------------
+
+static void
+test_json_comment_depth0(void)
+{
+    // --- a leading comment, then the document ------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_comment(&w, "header");
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "a", 1);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "/* header */{\"a\":1}") == 0,
+                   "comment d0: a file-header comment does not poison the "
+                   "document that follows it");
+    }
+
+    // --- the same, pretty (the `//` form) ----------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_INDENT(2));
+        axl_json_comment(&w, "header");
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "a", 1);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "// header\n{\n  \"a\": 1\n}") == 0,
+                   "comment d0: the line-comment form is TERMINATED before "
+                   "the value — `// header{` swallowed the brace");
+
+        /* The point is not the bytes, it is that they parse. A `//` comment
+           runs to end of line, so the unterminated form produced a document
+           whose opening brace was inside the comment. */
+        {
+            AxlJsonReader rr;
+            int64_t       av = 0;
+
+            test_check(axl_json_parse(axl_string_str(out),
+                                      axl_strlen(axl_string_str(out)), AXL_JSON_RELAXED, &rr)
+                       && axl_json_get_int(&rr, "a", &av) && av == 1,
+                       "comment d0: and the result actually PARSES back");
+            axl_json_free(&rr);
+        }
+    }
+
+    // --- but a SECOND root value is still refused --------------------------
+    // The reason the fix cannot simply clear needs_comma at depth 0: after the
+    // root value it is what makes a second one an error, and a trailing
+    // comment must not launder that away.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_obj_end(&w);
+        axl_json_comment(&w, "trailing");
+        axl_json_int(&w, 42);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_writer_error_info(&w)->code
+                   == AXL_JSON_ERR_WRITER_STATE,
+                   "comment d0: a comment AFTER the root does not license a "
+                   "second root value");
+    }
+
+    // --- two leading comments ----------------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_comment(&w, "one");
+        axl_json_comment(&w, "two");
+        axl_json_int(&w, 7);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "/* one *//* two */7") == 0,
+                   "comment d0: consecutive header comments, then a bare "
+                   "root value");
+    }
+
+    // --- inside a container, unchanged -------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "a", 1);
+        axl_json_comment(&w, "mid");
+        axl_json_kv_int(&w, "b", 2);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "{\"a\":1,/* mid */\"b\":2}") == 0,
+                   "comment d0: a comment INSIDE a container still separates "
+                   "its siblings with exactly one comma");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-line comment bodies (regression)
+//
+// comment_body returned at the first newline, so everything after it was
+// SILENTLY DROPPED — in both forms. Half-justified: a raw newline really would
+// break out of a `//` line comment, but the answer to that is to start a new
+// `// ` line, not to discard the text. A `/* */` block has no such hazard at
+// all; newlines are legal inside one, and AXL could READ a multi-line block
+// comment it could not WRITE.
+// ---------------------------------------------------------------------------
+
+/* Build, then assert the exact bytes AND that they parse back — the bytes
+   were never the point; a comment that eats the document is. */
+static void
+comment_check(AxlJsonFlags flags, const char *text, const char *want,
+              const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter          w;
+    AxlJsonReader          r;
+    int64_t                v  = 0;
+    bool                   ok;
+
+    axl_json_writer_init(&w, out, flags);
+    axl_json_obj_begin(&w);
+    axl_json_comment(&w, text);
+    axl_json_kv_int(&w, "k", 1);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+
+    ok = !axl_json_writer_error(&w)
+         && axl_strcmp(axl_string_str(out), want) == 0;
+
+    /* Liberal parse: comments need ALLOW_COMMENTS, which axl_json_parse has. */
+    ok = ok && axl_json_parse(axl_string_str(out),
+                              axl_strlen(axl_string_str(out)), AXL_JSON_RELAXED, &r)
+            && axl_json_get_int(&r, "k", &v) && v == 1;
+    axl_json_free(&r);
+    test_check(ok, msg);
+}
+
+static void
+test_json_comment_multiline(void)
+{
+    // --- the BLOCK form keeps its newlines --------------------------------
+    comment_check(AXL_JSON_STRICT, "line one\nline two",
+                  "{/* line one\nline two */\"k\":1}",
+                  "comment ml: a block comment carries newlines through — it "
+                  "is what the reader already accepts");
+
+    comment_check(AXL_JSON_STRICT, "one\ntwo\nthree",
+                  "{/* one\ntwo\nthree */\"k\":1}",
+                  "comment ml: three lines, all of them");
+
+    // --- the LINE form starts a new `// ` per line ------------------------
+    comment_check(AXL_JSON_INDENT(2), "line one\nline two",
+                  "{\n  // line one\n  // line two\n  \"k\": 1\n}",
+                  "comment ml: a line comment continues onto a new `// ` line "
+                  "at the same indent, rather than dropping the rest");
+
+    // --- CRLF is ONE line break -------------------------------------------
+    comment_check(AXL_JSON_INDENT(2), "one\r\ntwo",
+                  "{\n  // one\n  // two\n  \"k\": 1\n}",
+                  "comment ml: <CR><LF> is one terminator, not two — no blank "
+                  "comment line between them");
+
+    // --- a blank line in the middle survives ------------------------------
+    comment_check(AXL_JSON_INDENT(2), "one\n\ntwo",
+                  "{\n  // one\n  //\n  // two\n  \"k\": 1\n}",
+                  "comment ml: an intentional blank line becomes an empty "
+                  "comment line, not a dropped one");
+
+    // --- a TRAILING newline leaves no dangling marker ---------------------
+    comment_check(AXL_JSON_INDENT(2), "one\n",
+                  "{\n  // one\n  \"k\": 1\n}",
+                  "comment ml: a trailing newline does not emit an empty "
+                  "`//` with nothing after it");
+    comment_check(AXL_JSON_STRICT, "one\n",
+                  "{/* one\n */\"k\":1}",
+                  "comment ml: the block form keeps a trailing newline, which "
+                  "is just a byte inside the comment");
+
+    // --- the close-comment split still applies across lines ---------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_comment(&w, "one\nend */ after");
+        axl_json_kv_int(&w, "k", 1);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out),
+                              "{/* one\nend * / after */\"k\":1}") == 0,
+                   "comment ml: a close-comment sequence on a LATER line is "
+                   "still split — the sanitizer did not stop at line one");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ENSURE_ASCII (P6) — the surrogate-pair boundary
+//
+// The design doc calls this the fiddliest piece of the redesign, because
+// `\uXXXX` carries 16 bits and a non-BMP code point needs a PAIR. The
+// boundary is asserted exactly rather than sampled.
+// ---------------------------------------------------------------------------
+
+static void
+ascii_check(const char *utf8, const char *want, const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter          w;
+
+    axl_json_writer_init(&w, out, AXL_JSON_ENSURE_ASCII);
+    axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "k", utf8);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w)
+               && axl_strcmp(axl_string_str(out), want) == 0, msg);
+}
+
+/* Write one ill-formed byte under @a flags and compare the whole document. */
+static void
+wr_utf8_check(AxlJsonFlags flags, const char *value, const char *want,
+              const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter          w;
+
+    axl_json_writer_init(&w, out, flags);
+    axl_json_obj_begin(&w);
+    axl_json_kv_str(&w, "k", value);
+    axl_json_obj_end(&w);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w)
+               && axl_strcmp(axl_string_str(out), want) == 0, msg);
+}
+
+/* Parse @a doc, expect FAILURE, and compare the whole rendered diagnostic. */
+static void
+errfmt_check(const char *doc, AxlJsonFlags flags, bool quote,
+             const char *want, const char *msg)
+{
+    AxlJsonReader r;
+    char          buf[256];
+    int           n;
+
+    if (axl_json_parse(doc, axl_strlen(doc), flags, &r)) {
+        axl_json_free(&r);
+        test_check(false, msg);
+        return;
+    }
+    n = axl_json_error_format(axl_json_reader_error(&r),
+                              quote ? doc : NULL,
+                              quote ? axl_strlen(doc) : 0,
+                              buf, sizeof(buf));
+    test_check(n > 0 && axl_strcmp(buf, want) == 0
+               && (size_t)n == axl_strlen(want), msg);
+    axl_json_free(&r);
+}
+
+// ---------------------------------------------------------------------------
+// Writer -> reader round trip: what we emit must PARSE, not merely match
+// ---------------------------------------------------------------------------
+//
+// The formatting-flag tests assert exact bytes, which pins WHAT we emit and
+// says nothing about whether it is valid JSON. Those are different
+// properties, and every flag added in P5, P6 and P8 had only the first. A
+// writer that emitted a stray comma, an unterminated escape or a broken
+// surrogate pair would satisfy an exact-string test that was updated to match
+// it — the assertion moves with the bug.
+//
+// One document, built identically under every flag set, read back and checked
+// value by value. Two flags deliberately do NOT produce a parseable document
+// and are pinned separately below.
+
+/* The document every round-trip row builds. Deliberately carries a slash (for
+   ESCAPE_SLASH), a 2-byte character (for ENSURE_ASCII), a negative number, a
+   nested object and an array — so a flag that mangles any one of those is
+   caught by the value checks rather than by the parse alone. */
+static void
+rt_build(AxlJsonWriter *w)
+{
+    axl_json_obj_begin(w);
+    axl_json_kv_str(w, "path", "a/b");
+    /* 2-byte AND 4-byte. The 4-byte one is what makes the ENSURE_ASCII
+       row exercise a SURROGATE PAIR — with only `caf\xC3\xA9` a broken pair
+       slips through this pass entirely, which a sabotage demonstrated. */
+    axl_json_kv_str(w, "text", "caf\xC3\xA9 \xF0\x9F\x98\x80");
+    /* A quote and a control character: the two things that MUST be escaped
+       for the output to be valid at all. Without them a writer that stopped
+       escaping would still produce a parseable document, and this whole pass
+       would be checking nothing an exact-string test does not already. */
+    axl_json_kv_str(w, "esc", "he said \"hi\"\nand left");
+    axl_json_kv_int(w, "n", -42);
+    axl_json_key(w, "arr");
+    axl_json_arr_begin(w);
+    axl_json_int(w, 1);
+    axl_json_str(w, "x/y");
+    axl_json_arr_end(w);
+    axl_json_key(w, "obj");
+    axl_json_obj_begin(w);
+    axl_json_kv_bool(w, "flag", true);
+    axl_json_obj_end(w);
+    axl_json_obj_end(w);
+}
+
+/* Every value rt_build wrote, read back off @a r. */
+static bool
+rt_verify(const AxlJsonReader *r)
+{
+    AxlJsonReader    sub;
+    AxlJsonArrayIter it;
+    AxlJsonReader    elem;
+    char             buf[48];
+    int64_t          n    = 0;
+    bool             flag = false;
+    int64_t          e0   = 0;
+
+    if (!axl_json_get_string(r, "path", buf, sizeof(buf))
+        || axl_strcmp(buf, "a/b") != 0) {
+        return false;       /* ESCAPE_SLASH must survive the round trip */
+    }
+    if (!axl_json_get_string(r, "text", buf, sizeof(buf))
+        || axl_strcmp(buf, "caf\xC3\xA9 \xF0\x9F\x98\x80") != 0) {
+        return false;       /* ENSURE_ASCII must be LOSSLESS, not lossy */
+    }
+    if (!axl_json_get_string(r, "esc", buf, sizeof(buf))
+        || axl_strcmp(buf, "he said \"hi\"\nand left") != 0) {
+        return false;       /* escaping is what keeps the document valid */
+    }
+    if (!axl_json_get_int(r, "n", &n) || n != -42) {
+        return false;
+    }
+    if (!axl_json_get_object(r, "obj", &sub)
+        || !axl_json_get_bool(&sub, "flag", &flag) || !flag) {
+        return false;       /* nesting survived the indent changes */
+    }
+    if (!axl_json_array_begin(r, "arr", &it)
+        || !axl_json_array_next(&it, &elem)
+        || !axl_json_value_int(&elem, &e0) || e0 != 1) {
+        return false;
+    }
+    if (!axl_json_array_next(&it, &elem)
+        || !axl_json_value_string(&elem, buf, sizeof(buf))
+        || axl_strcmp(buf, "x/y") != 0) {
+        return false;
+    }
+    return true;
+}
+
+/* Build under @a wflags, parse back under @a rflags, check every value. */
+static void
+rt_check(AxlJsonFlags wflags, AxlJsonFlags rflags, const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonWriter          w;
+    AxlJsonReader          r;
+    bool                   ok;
+
+    axl_json_writer_init(&w, out, wflags);
+    rt_build(&w);
+    axl_json_writer_finish(&w);
+    if (axl_json_writer_error(&w)) {
+        test_check(false, msg);
+        return;
+    }
+    ok = axl_json_parse(axl_string_str(out),
+                              axl_strlen(axl_string_str(out)), rflags, &r)
+         && rt_verify(&r);
+    axl_json_free(&r);
+    test_check(ok, msg);
+}
+
+// ---------------------------------------------------------------------------
+// Encoding and line endings on the JSON boundary
+// ---------------------------------------------------------------------------
+//
+// The JSON layer is UTF-8 only and says so: a UTF-16 or BOM-prefixed document
+// is one of the two DELIBERATE narrowings axl_json_parse documents, on
+// the grounds that RFC 8259 §8.1 requires UTF-8 for interchange and AXL does
+// not sniff or transcode. UEFI, though, is exactly the "closed ecosystem" that
+// sentence carves out, and UCS-2 is its native text form — the shell's pipes
+// use it.
+//
+// Both are true at once because the transcoding lives one layer down, in
+// AxlStream. These tests pin the composition, which nothing did: the only
+// UCS-2 tests in the tree were compress filters REFUSING a transcoding peer.
+
+/* Build a buffer stream holding @a n raw bytes, rewound and ready to read. */
+static AxlStream *
+enc_bytes_stream(const void *bytes, size_t n)
+{
+    AxlStream *s = axl_bufopen();
+
+    if (s == NULL) {
+        return NULL;
+    }
+    axl_fwrite(bytes, 1, n, s);
+    axl_fflush(s);
+    axl_fseek(s, 0, AXL_SEEK_SET);
+    return s;
+}
+
+/* Parse whatever @a s yields and check `{"a":1,"b":"x"}` came through. */
+static bool
+enc_parse_and_verify(AxlStream *s, AxlJsonFlags flags)
+{
+    AxlJsonSource src;
+    AxlJsonReader r;
+    char          buf[16];
+    int64_t       a  = 0;
+    bool          ok;
+
+    axl_json_source_init_stream(&src, s);
+    ok = axl_json_parse_source(&src, flags, &r)
+         && axl_json_get_int(&r, "a", &a) && a == 1
+         && axl_json_get_string(&r, "b", buf, sizeof(buf))
+         && axl_strcmp(buf, "x") == 0;
+    axl_json_free(&r);
+    return ok;
+}
+
+static void
+test_json_encoding_boundary(void)
+{
+    /* `{"a":1,"b":"x"}` as UCS-2, both byte orders, and with a BOM. */
+    static const unsigned char le[] = {
+        0x7B,0x00, 0x22,0x00, 0x61,0x00, 0x22,0x00, 0x3A,0x00, 0x31,0x00,
+        0x2C,0x00, 0x22,0x00, 0x62,0x00, 0x22,0x00, 0x3A,0x00, 0x22,0x00,
+        0x78,0x00, 0x22,0x00, 0x7D,0x00
+    };
+    static const unsigned char be[] = {
+        0x00,0x7B, 0x00,0x22, 0x00,0x61, 0x00,0x22, 0x00,0x3A, 0x00,0x31,
+        0x00,0x2C, 0x00,0x22, 0x00,0x62, 0x00,0x22, 0x00,0x3A, 0x00,0x22,
+        0x00,0x78, 0x00,0x22, 0x00,0x7D
+    };
+
+    // --- WRITING JSON onto a UCS-2 wire ------------------------------------
+    {
+        AxlStream          *s = axl_bufopen();
+        AxlJsonSink         snk;
+        AxlJsonWriter       w;
+        const unsigned char *raw;
+        size_t              n = 0;
+
+        axl_stream_set_encoding(s, AXL_ENC_UCS2_LE);
+        axl_json_sink_init_stream(&snk, s);
+        axl_json_writer_init_sink(&w, &snk, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "a", 1);
+        axl_json_kv_str(&w, "b", "x");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        axl_fflush(s);
+
+        raw = axl_bufdata(s, &n);
+        test_check(!axl_json_writer_error(&w) && raw != NULL
+                   && n == sizeof(le)
+                   && axl_memcmp(raw, le, sizeof(le)) == 0,
+                   "encoding: the writer's UTF-8 output lands as UCS-2 LE on "
+                   "the wire — the transcode is the stream's, not JSON's");
+        axl_fclose(s);
+    }
+
+    // --- READING a UCS-2 document, both byte orders ------------------------
+    {
+        AxlStream *s = enc_bytes_stream(le, sizeof(le));
+
+        axl_stream_set_encoding(s, AXL_ENC_UCS2_LE);
+        test_check(enc_parse_and_verify(s, AXL_JSON_STRICT),
+                   "encoding: a UCS-2 LE document parses through a stream "
+                   "source, values intact");
+        axl_fclose(s);
+    }
+    {
+        AxlStream *s = enc_bytes_stream(be, sizeof(be));
+
+        axl_stream_set_encoding(s, AXL_ENC_UCS2_BE);
+        test_check(enc_parse_and_verify(s, AXL_JSON_STRICT),
+                   "encoding: and UCS-2 BE too — the rarer order is not the "
+                   "untested one");
+        axl_fclose(s);
+    }
+
+    // --- the BOM: refused by JSON, consumed by the text wrapper ------------
+    // Both halves of the documented position, so neither can drift. A UEFI
+    // tool writing a UCS-2 file almost always emits FF FE first, and without
+    // the wrapper that arrives as a stray U+FEFF ahead of the `{`.
+    {
+        unsigned char bom_le[2 + sizeof(le)];
+        AxlStream    *raw_s;
+        AxlStream    *txt;
+
+        bom_le[0] = 0xFF;
+        bom_le[1] = 0xFE;
+        axl_memcpy(bom_le + 2, le, sizeof(le));
+
+        /* Declaring the encoding by hand does NOT skip the BOM: it decodes to
+           U+FEFF, which is not whitespace, so the parse fails. */
+        raw_s = enc_bytes_stream(bom_le, sizeof(bom_le));
+        axl_stream_set_encoding(raw_s, AXL_ENC_UCS2_LE);
+        test_check(!enc_parse_and_verify(raw_s, AXL_JSON_STRICT),
+                   "encoding: a BOM is NOT skipped by set_encoding alone — it "
+                   "decodes to U+FEFF and the document is refused");
+        axl_fclose(raw_s);
+
+        /* The text wrapper is what consumes it, and it detects the order too,
+           so the caller does not have to know. */
+        raw_s = enc_bytes_stream(bom_le, sizeof(bom_le));
+        txt   = axl_text_stream_wrap(raw_s);
+        test_check(txt != NULL && enc_parse_and_verify(txt, AXL_JSON_STRICT),
+                   "encoding: axl_text_stream_wrap consumes the BOM and picks "
+                   "the byte order, and then the document parses");
+        axl_fclose(txt);
+        axl_fclose(raw_s);
+    }
+    {
+        /* Same for a UTF-8 BOM, which is the shape a Windows-authored config
+           arrives in. JSON refuses it directly; the wrapper eats it. */
+        static const unsigned char u8bom[] = {
+            0xEF,0xBB,0xBF, '{','"','a','"',':','1',',',
+            '"','b','"',':','"','x','"','}'
+        };
+        AxlJsonReader r;
+        AxlStream    *raw_s;
+        AxlStream    *txt;
+
+        test_check(!axl_json_parse((const char *)u8bom, sizeof(u8bom), AXL_JSON_RELAXED, &r),
+                   "encoding: a UTF-8 BOM in a contiguous buffer is REFUSED — "
+                   "AXL does not sniff, as the contract says");
+        axl_json_free(&r);
+
+        raw_s = enc_bytes_stream(u8bom, sizeof(u8bom));
+        txt   = axl_text_stream_wrap(raw_s);
+        test_check(txt != NULL && enc_parse_and_verify(txt, AXL_JSON_STRICT),
+                   "encoding: and the wrapper consumes it, leaving a document "
+                   "that parses");
+        axl_fclose(txt);
+        axl_fclose(raw_s);
+    }
+}
+
+static void
+test_json_line_endings(void)
+{
+    // --- CRLF and LF are both accepted, and mean the same thing ------------
+    // RFC 8259 §2 lists space, tab, LF and CR as whitespace, so a CRLF
+    // document is ordinary JSON rather than a tolerated deviation. Asserted
+    // as an EQUIVALENCE: the same document under both endings must read back
+    // identically, which a test of CRLF alone would not show.
+    {
+        const char *lf   = "{\n  \"a\": 1,\n  \"b\": \"x\"\n}";
+        const char *crlf = "{\r\n  \"a\": 1,\r\n  \"b\": \"x\"\r\n}";
+        AxlJsonReader r;
+        char          buf[16];
+        int64_t       a  = 0;
+        bool          lf_ok;
+        bool          crlf_ok;
+
+        lf_ok = axl_json_parse(lf, axl_strlen(lf), AXL_JSON_RELAXED, &r)
+                && axl_json_get_int(&r, "a", &a) && a == 1
+                && axl_json_get_string(&r, "b", buf, sizeof(buf))
+                && axl_strcmp(buf, "x") == 0;
+        axl_json_free(&r);
+
+        a = 0;
+        buf[0] = '\0';
+        crlf_ok = axl_json_parse(crlf, axl_strlen(crlf), AXL_JSON_RELAXED, &r)
+                  && axl_json_get_int(&r, "a", &a) && a == 1
+                  && axl_json_get_string(&r, "b", buf, sizeof(buf))
+                  && axl_strcmp(buf, "x") == 0;
+        axl_json_free(&r);
+
+        test_check(lf_ok && crlf_ok,
+                   "line endings: LF and CRLF documents both parse to the "
+                   "same values — CR is whitespace, not a tolerated quirk");
+    }
+
+    // --- a lone CR is whitespace too ---------------------------------------
+    // Classic Mac line endings, and the case a "\\r\\n only" implementation
+    // would get wrong.
+    {
+        const char   *cr = "{\r  \"a\": 1\r}";
+        AxlJsonReader r;
+        int64_t       a  = 0;
+
+        test_check(axl_json_parse(cr, axl_strlen(cr), AXL_JSON_RELAXED, &r)
+                   && axl_json_get_int(&r, "a", &a) && a == 1,
+                   "line endings: a lone CR is whitespace as well — RFC 8259 "
+                   "lists it, so CR-only documents are not a special case");
+        axl_json_free(&r);
+    }
+
+    // --- the error position counts LINES, not CR bytes ---------------------
+    // A CRLF document must not report line 5 for what a human sees as line 3.
+    {
+        const char         *doc = "{\r\n  \"a\": 1,\r\n  \"b\" 2\r\n}";
+        AxlJsonReader       r;
+        const AxlJsonError *e;
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r),
+                   "line endings: the malformed CRLF document is refused");
+        e = axl_json_reader_error(&r);
+        test_check(e->line == 3,
+                   "line endings: and it is reported on line 3 — the CR does "
+                   "not count as a line of its own");
+        axl_json_free(&r);
+    }
+
+    // --- a JSON5 line comment ends at a LONE CR ----------------------------
+    // CRLF proves nothing here: the comment would end at the LF anyway, with
+    // the CR harmlessly inside its body. Only a CR-only ending makes the
+    // terminator load-bearing — without it the comment swallows the rest of
+    // the document. A sabotage of the CR branch passed the CRLF version.
+    {
+        const char   *doc = "{// note\r\"a\":1}";
+        AxlJsonReader r;
+        int64_t       a   = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_ALLOW_COMMENTS, &r)
+                   && axl_json_get_int(&r, "a", &a) && a == 1,
+                   "line endings: a JSON5 line comment terminates at a LONE "
+                   "CR, so the member after it is not swallowed");
+        axl_json_free(&r);
+    }
+}
+
+static void
+test_json_writer_roundtrip(void)
+{
+    // --- every formatting flag produces a document that PARSES -------------
+    rt_check(AXL_JSON_STRICT, AXL_JSON_STRICT,
+             "roundtrip: compact output parses back with every value intact");
+    rt_check(AXL_JSON_INDENT(0), AXL_JSON_STRICT,
+             "roundtrip: INDENT(0) — newlines at zero indent");
+    rt_check(AXL_JSON_INDENT(2), AXL_JSON_STRICT,
+             "roundtrip: INDENT(2)");
+    rt_check(AXL_JSON_INDENT(8), AXL_JSON_STRICT,
+             "roundtrip: INDENT(8) — a wide indent is still whitespace");
+    rt_check(AXL_JSON_COMPACT, AXL_JSON_STRICT,
+             "roundtrip: COMPACT alone");
+    rt_check(AXL_JSON_INDENT(2) | AXL_JSON_COMPACT, AXL_JSON_STRICT,
+             "roundtrip: INDENT(2) | COMPACT — newlines without the space "
+             "after the colon");
+    rt_check(AXL_JSON_ESCAPE_SLASH, AXL_JSON_STRICT,
+             "roundtrip: ESCAPE_SLASH — `\\/` is a valid escape and decodes "
+             "back to a plain slash");
+    rt_check(AXL_JSON_ENSURE_ASCII, AXL_JSON_STRICT,
+             "roundtrip: ENSURE_ASCII — the escaped form decodes back to the "
+             "SAME bytes, so the escaping is lossless");
+    rt_check(AXL_JSON_INDENT(2) | AXL_JSON_ESCAPE_SLASH
+             | AXL_JSON_ENSURE_ASCII, AXL_JSON_STRICT,
+             "roundtrip: all three per-value flags at once");
+
+    // --- the JSON5 writer output needs a JSON5 reader -----------------------
+    // A trailing comma is the one thing the writer emits that strict JSON
+    // refuses, so this row is also the proof that the dialect bit is doing
+    // something on BOTH sides.
+    rt_check(AXL_JSON_ALLOW_TRAILING_COMMA,
+             AXL_JSON_ALLOW_TRAILING_COMMA,
+             "roundtrip: a trailing-comma document parses back under "
+             "ALLOW_TRAILING_COMMA");
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+
+        axl_json_writer_init(&w, out, AXL_JSON_ALLOW_TRAILING_COMMA);
+        rt_build(&w);
+        axl_json_writer_finish(&w);
+        test_check(!axl_json_parse(axl_string_str(out),
+                                         axl_strlen(axl_string_str(out)),
+                                         AXL_JSON_STRICT, &r),
+                   "roundtrip: and STRICT REFUSES it — the round trip is "
+                   "dialect-matched, not accidental");
+        axl_json_free(&r);
+    }
+
+    // --- SORT_KEYS goes through write_token, so it round-trips there -------
+    {
+        const char            *doc = "{\"c\":1,\"a\":{\"z\":2,\"y\":3}}";
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+        AxlJsonReader          back;
+        AxlJsonReader          sub;
+        int64_t                c = 0;
+        int64_t                y = 0;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r),
+                   "roundtrip: the sort source parses");
+        axl_json_writer_init(&w, out, AXL_JSON_SORT_KEYS);
+        axl_json_write_token(&w, &r, 0);
+        axl_json_writer_finish(&w);
+        axl_json_free(&r);
+
+        /* Reordering members must not change what the document SAYS. */
+        test_check(axl_json_parse(axl_string_str(out),
+                                  axl_strlen(axl_string_str(out)), AXL_JSON_RELAXED, &back)
+                   && axl_json_get_int(&back, "c", &c) && c == 1
+                   && axl_json_get_object(&back, "a", &sub)
+                   && axl_json_get_int(&sub, "y", &y) && y == 3,
+                   "roundtrip: SORT_KEYS output parses and every key still "
+                   "reads back, nested ones included");
+        axl_json_free(&back);
+    }
+
+    // --- EMBED does NOT produce a document, and that is the contract -------
+    // Wrapping its output in the delimiter it omitted must reproduce a
+    // parseable document. That is the identity EMBED is defined by, checked
+    // here as validity rather than as bytes.
+    {
+        AXL_AUTOPTR(AxlString) emb  = axl_string_new(NULL);
+        AXL_AUTOPTR(AxlString) whole = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+
+        axl_json_writer_init(&w, emb, AXL_JSON_EMBED);
+        rt_build(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_parse(axl_string_str(emb),
+                                   axl_strlen(axl_string_str(emb)), AXL_JSON_RELAXED, &r),
+                   "roundtrip: EMBED output is NOT a document on its own — "
+                   "the outer braces are gone by design");
+        axl_json_free(&r);
+
+        axl_string_append(whole, "{");
+        axl_string_append(whole, axl_string_str(emb));
+        axl_string_append(whole, "}");
+        test_check(axl_json_parse(axl_string_str(whole),
+                                  axl_strlen(axl_string_str(whole)), AXL_JSON_RELAXED, &r)
+                   && rt_verify(&r),
+                   "roundtrip: but wrapped in the delimiter it omitted it "
+                   "parses, with every value intact");
+        axl_json_free(&r);
+    }
+
+    // --- UTF8_RAW deliberately emits text that is not well-formed JSON -----
+    // RFC 8259 defines a JSON text over Unicode code points, so a raw
+    // ill-formed byte makes the document invalid BY THE SPEC. Our own reader
+    // accepts it anyway unless UTF8_STRICT is asked for — that asymmetry is
+    // real, deliberate, and pinned here because nothing else states it.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+        char                   buf[16];
+
+        axl_json_writer_init(&w, out, AXL_JSON_UTF8_RAW);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "k", "a\x80z");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(!axl_json_writer_error(&w)
+                   && axl_json_parse(axl_string_str(out),
+                                           axl_strlen(axl_string_str(out)),
+                                           AXL_JSON_UTF8_RAW, &r)
+                   && axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf, "a\x80z") == 0,
+                   "roundtrip: UTF8_RAW round-trips its bytes exactly — read "
+                   "and write agree, which is the whole point of the mode");
+        axl_json_free(&r);
+
+        test_check(!axl_json_parse(axl_string_str(out),
+                                         axl_strlen(axl_string_str(out)),
+                                         AXL_JSON_UTF8_STRICT, &r),
+                   "roundtrip: and UTF8_STRICT refuses it, because that "
+                   "output is not well-formed JSON text by RFC 8259");
+        axl_json_free(&r);
+    }
+
+    // --- REPAIR is the mode that keeps the output valid --------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+        char                   buf[16];
+
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);   /* REPAIR is zero */
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "k", "a\x80z");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_parse(axl_string_str(out),
+                                        axl_strlen(axl_string_str(out)),
+                                        AXL_JSON_UTF8_STRICT, &r)
+                   && axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf, "a\xEF\xBF\xBDz") == 0,
+                   "roundtrip: REPAIR output survives even a UTF8_STRICT "
+                   "parse — repairing is what keeps the document valid");
+        axl_json_free(&r);
+    }
+}
+
+static void
+test_json_get_double(void)
+{
+    // --- the ordinary shapes, exact ----------------------------------------
+    // Bit-exact comparisons: a float test that allows an epsilon cannot tell
+    // correct rounding from nearly-correct, which is the whole property the
+    // underlying parser promises.
+    {
+        struct { const char *doc; double want; const char *msg; } row[] = {
+            { "{\"v\":1.5}",    1.5,    "a plain fraction" },
+            { "{\"v\":-2.25}", -2.25,   "a negative fraction" },
+            { "{\"v\":0}",      0.0,    "an integral literal, as a double" },
+            { "{\"v\":1e3}",    1000.0, "scientific notation" },
+            { "{\"v\":1E-2}",   0.01,   "a negative exponent" },
+            { "{\"v\":0.1}",    0.1,    "the NEAREST double, not drifted" },
+            { "{\"v\":123456789.125}", 123456789.125,
+              "more precision than a float holds" },
+        };
+        size_t i;
+        bool   all_exact = true;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            double        got = 42.0;
+
+            if (!axl_json_parse(row[i].doc, axl_strlen(row[i].doc), AXL_JSON_RELAXED, &r)) {
+                all_exact = false;
+                axl_json_free(&r);
+                continue;
+            }
+            if (!axl_json_get_double(&r, "v", &got) || got != row[i].want) {
+                all_exact = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_exact,
+                   "get_double: every ordinary shape reads back bit-exact — "
+                   "integral, fractional, signed and scientific");
+    }
+
+    // --- the WHOLE token must parse ----------------------------------------
+    // This is what separates it from get_int, which truncates at the first
+    // non-digit so `1.5` yields 1. There is no sensible prefix of a float, and
+    // JSON5's hex literal is the case that makes it concrete: `0x1F` would
+    // otherwise parse as 0 and stop at the `x`, handing back a number the
+    // document does not contain.
+    {
+        AxlJsonReader r;
+        double        got = 42.0;
+        int64_t       n   = 0;
+
+        test_check(axl_json_parse("{\"v\":0x1F}", 10,
+                                        AXL_JSON_JSON5, &r),
+                   "get_double: the JSON5 hex document parses");
+        test_check(!axl_json_get_double(&r, "v", &got) && got == 42.0,
+                   "get_double: a hex literal is REFUSED, not read as 0 — the "
+                   "token must parse entirely");
+        test_check(axl_json_get_int(&r, "v", &n) && n == 31,
+                   "get_double: and get_int is where hex still works, so the "
+                   "refusal costs the caller nothing");
+        axl_json_free(&r);
+    }
+
+    // --- NaN and Infinity round-trip when the dialect allowed them ---------
+    // The lexer is the dialect gate; by the time a token reaches the accessor
+    // it is already permitted. Both spellings are checked because the decimal
+    // parser matches them case-insensitively and tries "infinity" before
+    // "inf" — if it stopped at "inf" the whole-token rule would reject the
+    // JSON5 spelling outright.
+    {
+        struct { const char *doc; const char *msg; bool want_inf;
+                 bool want_neg; } row[] = {
+            { "{\"v\":Infinity}",
+              "get_double: JSON5 Infinity reads back as an infinity", true,
+              false },
+            { "{\"v\":-Infinity}",
+              "get_double: and -Infinity keeps its sign", true, true },
+        };
+        size_t i;
+        AxlJsonReader r;
+        double        got;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            got = 0.0;
+            if (!axl_json_parse(row[i].doc, axl_strlen(row[i].doc),
+                                      AXL_JSON_JSON5, &r)) {
+                test_check(false, row[i].msg);
+                axl_json_free(&r);
+                continue;
+            }
+            test_check(axl_json_get_double(&r, "v", &got)
+                       && axl_isinf(got)
+                       && ((got < 0.0) == row[i].want_neg),
+                       row[i].msg);
+            axl_json_free(&r);
+        }
+
+        got = 0.0;
+        test_check(axl_json_parse("{\"v\":NaN}", 9, AXL_JSON_JSON5, &r)
+                   && axl_json_get_double(&r, "v", &got) && axl_isnan(got),
+                   "get_double: JSON5 NaN reads back as a NaN — the parser "
+                   "matches the spelling case-insensitively");
+        axl_json_free(&r);
+    }
+
+    // --- out of range is a FAILURE, not an infinity ------------------------
+    // axl_str_to_double reports overflow as the correct IEEE result together
+    // with its error. This accessor does not pass that on: a `true` return
+    // has to keep meaning "you got the number that is in the document".
+    {
+        struct { const char *doc; const char *msg; } row[] = {
+            { "{\"v\":1e400}",      "1e400 (overflow)" },
+            { "{\"v\":-1e400}",     "-1e400 (overflow, negative)" },
+            { "{\"v\":1e-400}",     "1e-400 (UNDERFLOW — a different "
+                                     "branch of the parser from overflow)" },
+            { "{\"v\":-1e-400}",    "-1e-400 (underflow, negative)" },
+        };
+        size_t i;
+        bool   all_refused = true;
+        char   why[128];
+
+        axl_snprintf(why, sizeof(why),
+                     "get_double: an out-of-range magnitude is refused with "
+                     "the caller's value untouched, over and under");
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            double        got = 42.0;
+
+            if (!axl_json_parse(row[i].doc, axl_strlen(row[i].doc), AXL_JSON_RELAXED, &r)) {
+                all_refused = false;
+                axl_json_free(&r);
+                continue;
+            }
+            if (axl_json_get_double(&r, "v", &got) || got != 42.0) {
+                all_refused = false;   /* refused AND left untouched */
+                axl_snprintf(why, sizeof(why),
+                             "get_double: NOT refused: %s", row[i].msg);
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_refused, why);
+    }
+
+    // --- a LONG literal is not a shorter one -------------------------------
+    // The first version copied the token into a fixed 64-byte buffer and
+    // refused anything longer, on the reasoning that "the longest meaningful
+    // form is well under 40 characters". Legal JSON has no length limit on a
+    // number, and axl-strtod.c sizes its own accumulator for a ~768-digit
+    // significand — it was built for exactly these. `1.` and seventy zeros is
+    // 1.0, and refusing it reported a valid document as "not a number".
+    //
+    // Swept across the old boundary rather than probed at one length, because
+    // a single case lands wherever it lands: this is the sweep that found the
+    // defect.
+    {
+        size_t pad;
+        bool   all_read = true;
+        char   why[160];
+
+        axl_snprintf(why, sizeof(why),
+                     "get_double: a literal of any length reads back — the "
+                     "value is the number, not the byte count");
+
+        for (pad = 55; pad <= 80; pad++) {
+            AXL_AUTOPTR(AxlString) doc = axl_string_new(NULL);
+            AxlJsonReader          r;
+            double                 got = 42.0;
+            size_t                 i;
+
+            /* `1.` + `pad` zeros: exactly 1.0 however long it is written. */
+            axl_string_append(doc, "{\"v\":1.");
+            for (i = 0; i < pad; i++) {
+                axl_string_append(doc, "0");
+            }
+            axl_string_append(doc, "}");
+
+            if (!axl_json_parse(axl_string_str(doc),
+                                axl_strlen(axl_string_str(doc)), AXL_JSON_RELAXED, &r)
+                || !axl_json_get_double(&r, "v", &got) || got != 1.0) {
+                all_read = false;
+                axl_snprintf(why, sizeof(why),
+                             "get_double: a %zu-digit fraction was refused or "
+                             "misread", pad);
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_read, why);
+    }
+
+    // --- negative zero keeps its sign --------------------------------------
+    // `got != want` cannot see this: -0.0 == 0.0 is true, so the sign has to
+    // be tested directly or a lost sign passes every other row here.
+    {
+        AxlJsonReader r;
+        double        got = 1.0;
+        uint64_t      bits = 0;
+
+        test_check(axl_json_parse("{\"v\":-0.0}", 10, AXL_JSON_RELAXED, &r)
+                   && axl_json_get_double(&r, "v", &got) && got == 0.0,
+                   "get_double: -0.0 reads back as a zero");
+        /* The sign lives in the top bit; there is no axl_signbit, and an
+           equality test cannot see it because -0.0 == 0.0. */
+        axl_memcpy(&bits, &got, sizeof(bits));
+        test_check((bits >> 63) == 1u,
+                   "get_double: and it KEEPS its sign — an equality check "
+                   "alone cannot tell -0.0 from +0.0");
+        axl_json_free(&r);
+    }
+
+    // --- the JSON5 number shapes the dialect permits -----------------------
+    // Hex is the one the docstring names, so these are the ones that could
+    // regress silently under the whole-token rule.
+    {
+        struct { const char *doc; double want; } row[] = {
+            { "{\"v\":+5}",   5.0  },
+            { "{\"v\":.5}",   0.5  },
+            { "{\"v\":5.}",   5.0  },
+        };
+        size_t i;
+        bool   all_read = true;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            double        got = 42.0;
+
+            if (!axl_json_parse(row[i].doc, axl_strlen(row[i].doc),
+                                      AXL_JSON_JSON5, &r)
+                || !axl_json_get_double(&r, "v", &got)
+                || got != row[i].want) {
+                all_read = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_read,
+                   "get_double: JSON5 +5, .5 and 5. all parse WHOLE — the "
+                   "rule that refuses hex must not refuse these");
+    }
+
+    // --- value_double on a CONTAINER, directly -----------------------------
+    // The type guard is otherwise only reached through get_double on a
+    // string, so nothing exercises it for an object or an array.
+    {
+        AxlJsonReader r;
+        AxlJsonReader sub;
+        double        got = 42.0;
+
+        test_check(axl_json_parse("{\"o\":{\"a\":1},\"n\":1.5}", 21, AXL_JSON_RELAXED, &r),
+                   "get_double: the container document parses");
+        test_check(axl_json_get_value(&r, "o", &sub)
+                   && !axl_json_value_double(&sub, &got) && got == 42.0,
+                   "value_double: an OBJECT is refused with the value "
+                   "untouched, like every non-primitive");
+        axl_json_free(&r);
+    }
+
+    // --- what is not a number ----------------------------------------------
+    {
+        AxlJsonReader r;
+        double        got = 42.0;
+        const char   *doc = "{\"s\":\"1.5\",\"b\":true,\"n\":null}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r),
+                   "get_double: the non-number document parses");
+        test_check(!axl_json_get_double(&r, "s", &got)
+                   && !axl_json_get_double(&r, "b", &got)
+                   && !axl_json_get_double(&r, "n", &got)
+                   && !axl_json_get_double(&r, "absent", &got)
+                   && got == 42.0,
+                   "get_double: a string, a bool, a null and an absent key "
+                   "are all refused with the value untouched");
+        axl_json_free(&r);
+    }
+
+    // --- the own-value mirror agrees with the by-key form ------------------
+    // P11's rule: get_X is get_value + value_X, so the two cannot drift.
+    {
+        AxlJsonReader r;
+        AxlJsonReader v;
+        AxlJsonArrayIter it;
+        AxlJsonReader elem;
+        double        by_key = 0.0;
+        double        by_val = 0.0;
+
+        test_check(axl_json_parse("{\"v\":2.5,\"a\":[0.5,1e400]}", 25, AXL_JSON_RELAXED, &r),
+                   "get_double: the mirror document parses");
+        test_check(axl_json_get_double(&r, "v", &by_key)
+                   && axl_json_get_value(&r, "v", &v)
+                   && axl_json_value_double(&v, &by_val)
+                   && by_key == by_val && by_key == 2.5,
+                   "value_double: the own-value form agrees with the by-key "
+                   "form exactly");
+
+        /* And an ARRAY element, which has no key to look up at all. */
+        by_val = 42.0;
+        test_check(axl_json_array_begin(&r, "a", &it)
+                   && axl_json_array_next(&it, &elem)
+                   && axl_json_value_double(&elem, &by_val)
+                   && by_val == 0.5,
+                   "value_double: an array element reads as a double");
+        /* The second element overflows: refused there too, same rule. */
+        by_val = 42.0;
+        test_check(axl_json_array_next(&it, &elem)
+                   && !axl_json_value_double(&elem, &by_val)
+                   && by_val == 42.0,
+                   "value_double: and the mirror refuses an out-of-range "
+                   "element on the same terms");
+        axl_json_free(&r);
+    }
+
+    // --- argument handling --------------------------------------------------
+    {
+        AxlJsonReader r;
+        double        got = 42.0;
+
+        test_check(axl_json_parse("{\"v\":1.5}", 9, AXL_JSON_RELAXED, &r),
+                   "get_double: the argument document parses");
+        test_check(!axl_json_get_double(NULL, "v", &got)
+                   && !axl_json_get_double(&r, NULL, &got)
+                   && !axl_json_get_double(&r, "v", NULL)
+                   && !axl_json_value_double(NULL, &got)
+                   && got == 42.0,
+                   "get_double: NULL arguments are refused, value untouched");
+        axl_json_free(&r);
+    }
+}
+
+static void
+test_json_error_format(void)
+{
+    // --- the terse form, which is all a machine needs ----------------------
+    errfmt_check("{\"a\" 1}", AXL_JSON_STRICT, false,
+                 "1:6: unexpected byte",
+                 "errfmt: terse form is LINE:COL: message");
+
+    // --- and the quoted form, with the caret under the column --------------
+    errfmt_check("{\"a\" 1}", AXL_JSON_STRICT, true,
+                 "1:6: unexpected byte\n"
+                 "{\"a\" 1}\n"
+                 "     ^",
+                 "errfmt: quoting the line puts the caret under the column");
+
+    // --- the offending LINE, not the first one -----------------------------
+    errfmt_check("{\n  \"a\": 1,\n  \"b\" 2\n}", AXL_JSON_STRICT, true,
+                 "3:7: unexpected byte\n"
+                 "  \"b\" 2\n"
+                 "      ^",
+                 "errfmt: a multi-line document quotes the OFFENDING line and "
+                 "counts the column within it");
+
+    // --- a TAB in the line is carried into the caret line ------------------
+    errfmt_check("{\n\t\"b\" 2\n}", AXL_JSON_STRICT, true,
+                 "2:6: unexpected byte\n"
+                 "\t\"b\" 2\n"
+                 "\t    ^",
+                 "errfmt: a TAB is copied into the caret line as a TAB, so "
+                 "the caret survives tab expansion");
+
+    // --- a multi-byte character is ONE column ------------------------------
+    errfmt_check("{\"\xC3\xA9\xC3\xA9\": 1 2}", AXL_JSON_STRICT, true,
+                 "1:10: unexpected byte\n"
+                 "{\"\xC3\xA9\xC3\xA9\": 1 2}\n"
+                 "         ^",
+                 "errfmt: a 2-byte character counts as ONE column, so the "
+                 "caret does not drift right");
+
+    // --- a TAB *after* a multi-byte character ------------------------------
+    // The case that makes the caret walk characters rather than bytes. The
+    // count of cells is the column either way, so only a tab whose position
+    // the byte walk has not yet reached exposes the difference: walking bytes
+    // spends two steps inside the 2-byte character and puts the second TAB one
+    // cell late. A sabotage proved no other row here catches it.
+    errfmt_check("{\n\t\"\xC3\xA9\":\t1 2\n}", AXL_JSON_STRICT, true,
+                 "2:9: unexpected byte\n"
+                 "\t\"\xC3\xA9\":\t1 2\n"
+                 "\t    \t  ^",
+                 "errfmt: a TAB that FOLLOWS a multi-byte character still "
+                 "lands in the right cell — the caret walks characters");
+
+    // --- CRLF: the trailing CR is not quoted -------------------------------
+    // It would otherwise end the quote and shift the terminal.
+    errfmt_check("{\r\n\"b\" 2\r\n}", AXL_JSON_STRICT, true,
+                 "2:5: unexpected byte\n"
+                 "\"b\" 2\n"
+                 "    ^",
+                 "errfmt: a CRLF line is quoted without its CR");
+
+    // --- OK is not an error and says so ------------------------------------
+    {
+        AxlJsonReader r;
+        char          buf[64];
+
+        test_check(axl_json_parse("{\"a\":1}", 7, AXL_JSON_RELAXED, &r),
+                   "errfmt: the successful parse succeeds");
+        test_check(axl_json_error_format(axl_json_reader_error(&r),
+                                         "{\"a\":1}", 7, buf, sizeof(buf)) > 0
+                   && axl_strcmp(buf, "no error") == 0,
+                   "errfmt: an OK record renders as `no error` alone — no "
+                   "0:0 position, and no quote even with a document");
+        axl_json_free(&r);
+    }
+
+    // --- DIALECT names the flag that would have accepted the input ---------
+    // The one recoverable code in the enum, and the reason the record carries
+    // a fifth field. Reporting the code without the flag delivers the half a
+    // caller cannot act on.
+    errfmt_check("{\"a\":1} // note", AXL_JSON_STRICT, false,
+                 "1:9: feature needs a dialect flag "
+                 "(pass AXL_JSON_ALLOW_COMMENTS)",
+                 "errfmt: DIALECT names the flag to re-parse with");
+
+    // --- the quote is SANITISED, because the document is untrusted ---------
+    // This text goes to a console, and the library parses JSON off the
+    // network. A raw ESC would carry an ANSI sequence out of a JSON body; a
+    // raw CR would return the cursor to column 0 and wreck the quote and the
+    // caret together; an embedded NUL would end the buffer early, making the
+    // returned length longer than the caller can read.
+    {
+        struct { const char *doc; size_t len; const char *want;
+                 const char *msg; } row[] = {
+            { "{\"a\":\"x\x1By\"}", 11,
+              "1:8: unexpected byte\n{\"a\":\"x?y\"}\n       ^",
+              "errfmt: an ESC in the document becomes ? in the quote" },
+            { "{\"a\":\"x\ry\"}", 11,
+              "1:8: unexpected byte\n{\"a\":\"x?y\"}\n       ^",
+              "errfmt: a mid-line CR becomes ? — it would otherwise return "
+              "the cursor and wreck the caret" },
+            { "{\"a\":\"x\0y\"}", 11,
+              "1:8: unexpected byte\n{\"a\":\"x?y\"}\n       ^",
+              "errfmt: an embedded NUL becomes ? — otherwise buf would end "
+              "early and the length would outrun it" },
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            char          buf[160];
+            int           n;
+
+            if (axl_json_parse(row[i].doc, row[i].len,
+                                     AXL_JSON_STRICT, &r)) {
+                axl_json_free(&r);
+                test_check(false, row[i].msg);
+                continue;
+            }
+            n = axl_json_error_format(axl_json_reader_error(&r), row[i].doc,
+                                      row[i].len, buf, sizeof(buf));
+            test_check(n > 0 && axl_strcmp(buf, row[i].want) == 0
+                       && (size_t)n == axl_strlen(buf), row[i].msg);
+            axl_json_free(&r);
+        }
+    }
+
+    // --- a long line is WINDOWED, not refused ------------------------------
+    // Minified JSON is one line and is what machines emit, so refusing to
+    // quote it would make this useless on exactly those documents. Asserted
+    // as an exact document: the window's markers, its width and the caret
+    // offset inside it are all arithmetic no substring probe would reach.
+    {
+        AXL_AUTOPTR(AxlString) doc = axl_string_new(NULL);
+        AxlJsonReader          r;
+        char                   buf[AXL_JSON_ERROR_BUF_MAX];
+        size_t                 i;
+        const char            *nl1;
+        const char            *nl2;
+
+        axl_string_append(doc, "{");
+        for (i = 0; i < 20; i++) {
+            char pair[24];
+
+            axl_snprintf(pair, sizeof(pair), "\"a%02zu\":%zu,", i, i);
+            axl_string_append(doc, pair);
+        }
+        axl_string_append(doc, "\"bad\" 1,");
+        for (i = 0; i < 20; i++) {
+            char pair[24];
+
+            axl_snprintf(pair, sizeof(pair), "\"z%02zu\":%zu,", i, i);
+            axl_string_append(doc, pair);
+        }
+        axl_string_append(doc, "\"end\":0}");
+
+        test_check(!axl_json_parse(axl_string_str(doc),
+                                         axl_strlen(axl_string_str(doc)),
+                                         AXL_JSON_STRICT, &r),
+                   "errfmt: the long document fails to parse");
+        test_check(axl_json_error_format(axl_json_reader_error(&r),
+                                         axl_string_str(doc),
+                                         axl_strlen(axl_string_str(doc)),
+                                         buf, sizeof(buf)) > 0,
+                   "errfmt: the long document renders");
+
+        nl1 = axl_strchr(buf, '\n');
+        nl2 = (nl1 != NULL) ? axl_strchr(nl1 + 1, '\n') : NULL;
+        test_check(nl1 != NULL && nl2 != NULL
+                   && axl_strncmp(nl1 + 1, "...", 3) == 0
+                   && axl_strncmp(nl2 - 3, "...", 3) == 0,
+                   "errfmt: a long line is windowed, with ... marking BOTH "
+                   "cut ends");
+        /* The quote is the window plus its two markers, and the caret line
+           opens with three spaces standing in for the leading marker so the
+           caret still lines up under the source, not under the `...`. */
+        test_check(nl2 != NULL
+                   && (size_t)(nl2 - nl1 - 1) == AXL_JSON_ERROR_QUOTE_MAX + 6
+                   && axl_strncmp(nl2 + 1, "   ", 3) == 0,
+                   "errfmt: the window is exactly QUOTE_MAX wide plus its "
+                   "markers, and the caret line pads under them");
+        {
+            /* And the caret sits where the window puts it: the column is
+               centred, so it lands QUOTE_MAX/2 characters into the window,
+               after the three spaces for the marker. */
+            const char *caret = axl_strchr(nl2 + 1, '^');
+
+            test_check(caret != NULL
+                       && (size_t)(caret - (nl2 + 1))
+                          == 3 + AXL_JSON_ERROR_QUOTE_MAX / 2,
+                       "errfmt: and the caret is offset by col - skipped, not "
+                       "by the raw column");
+        }
+        axl_json_free(&r);
+    }
+
+    // --- every code renders its OWN words ----------------------------------
+    // Exact strings, not "at least three characters". An earlier version of
+    // this asked only that something non-empty came back, which the
+    // fallthrough `return "unclassified failure"` satisfies for ANY code — so
+    // it would have passed for a code with no case at all, and swapping two
+    // messages did not fail it either. Review caught both.
+    {
+        struct { AxlJsonErrorCode code; const char *want; } row[] = {
+            { AXL_JSON_ERR_UNKNOWN,          "1:1: unclassified failure" },
+            { AXL_JSON_ERR_INCOMPLETE,       "1:1: input ended early" },
+            { AXL_JSON_ERR_UNEXPECTED_BYTE,  "1:1: unexpected byte" },
+            { AXL_JSON_ERR_BAD_ESCAPE,       "1:1: bad string escape" },
+            { AXL_JSON_ERR_BAD_NUMBER,       "1:1: bad number" },
+            { AXL_JSON_ERR_BAD_UTF8,         "1:1: ill-formed UTF-8" },
+            { AXL_JSON_ERR_DEPTH,            "1:1: nesting too deep" },
+            { AXL_JSON_ERR_TRAILING,         "1:1: trailing content" },
+            { AXL_JSON_ERR_DUPLICATE_KEY,    "1:1: duplicate key" },
+            { AXL_JSON_ERR_IO,               "1:1: I/O failure" },
+            { AXL_JSON_ERR_NO_MEMORY,        "1:1: out of memory" },
+            { AXL_JSON_ERR_WRITER_STATE,     "1:1: writer used out of order" },
+            { AXL_JSON_ERR_INVALID_ARGUMENT, "1:1: invalid argument" },
+            { AXL_JSON_ERR_TRUNCATED,        "1:1: value did not fit" },
+        };
+        size_t i;
+        bool   all_exact = true;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonError e = { row[i].code, 0, 1, 1, 0 };
+            char         buf[128];
+
+            if (axl_json_error_format(&e, NULL, 0, buf, sizeof(buf)) <= 0
+                || axl_strcmp(buf, row[i].want) != 0) {
+                all_exact = false;
+            }
+        }
+        test_check(all_exact,
+                   "errfmt: every code renders its own exact words — a "
+                   "swapped or missing message fails, not just a blank one");
+    }
+
+    // --- the buffer bound, swept -------------------------------------------
+    // The single riskiest line in the formatter, and it had no test: an
+    // off-by-one there is a real out-of-bounds write the whole suite passed
+    // through. Sweeping every size up to just past the exact fit walks the
+    // boundary instead of guessing at it.
+    {
+        const char   *doc = "{\"a\" 1}";
+        AxlJsonReader r;
+        char          full[128];
+        int           want;
+        size_t        size;
+        bool          all_sane = true;
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                         AXL_JSON_STRICT, &r),
+                   "errfmt: the bound-sweep document fails to parse");
+        want = axl_json_error_format(axl_json_reader_error(&r), doc,
+                                     axl_strlen(doc), full, sizeof(full));
+
+        for (size = 1; size <= (size_t)want + 2; size++) {
+            char   buf[128];
+            size_t k;
+            int    n;
+
+            axl_memset(buf, (char)0xAA, sizeof(buf));
+            n = axl_json_error_format(axl_json_reader_error(&r), doc,
+                                      axl_strlen(doc), buf, size);
+            if (size < (size_t)want + 1) {
+                /* Must refuse — and still be printable, which is where this
+                   deliberately differs from its two siblings. */
+                if (n != -1 || buf[0] != '\0') {
+                    all_sane = false;
+                }
+            } else if (n != want || axl_strcmp(buf, full) != 0) {
+                all_sane = false;
+            }
+            for (k = size; k < sizeof(buf); k++) {
+                if (buf[k] != (char)0xAA) {
+                    all_sane = false;   /* wrote past the size it was given */
+                }
+            }
+        }
+        test_check(all_sane,
+                   "errfmt: at every size 1..n+2 it refuses below the exact "
+                   "fit, succeeds at it, and never writes past the size");
+        axl_json_free(&r);
+    }
+
+    // --- AXL_JSON_ERROR_BUF_MAX is a size that cannot fail -----------------
+    // Because the contract refuses rather than truncating, a caller otherwise
+    // has no way to pick a size that is guaranteed to work — and the widest
+    // render is a full window of 4-byte characters.
+    {
+        AXL_AUTOPTR(AxlString) doc = axl_string_new(NULL);
+        AxlJsonReader          r;
+        char                   buf[AXL_JSON_ERROR_BUF_MAX];
+        size_t                 i;
+
+        axl_string_append(doc, "{\"");
+        for (i = 0; i < 120; i++) {
+            axl_string_append(doc, "\xF0\x9F\x98\x80");
+        }
+        axl_string_append(doc, "\" 1}");
+        test_check(!axl_json_parse(axl_string_str(doc),
+                                         axl_strlen(axl_string_str(doc)),
+                                         AXL_JSON_STRICT, &r),
+                   "errfmt: the widest document fails to parse");
+        test_check(axl_json_error_format(axl_json_reader_error(&r),
+                                         axl_string_str(doc),
+                                         axl_strlen(axl_string_str(doc)),
+                                         buf, sizeof(buf)) > 0,
+                   "errfmt: a buffer of AXL_JSON_ERROR_BUF_MAX never returns "
+                   "-1, even on a full window of 4-byte characters");
+        axl_json_free(&r);
+    }
+
+    // --- a non-NULL document with len 0 is the terse form ------------------
+    {
+        AxlJsonError e = { AXL_JSON_ERR_INCOMPLETE, 0, 2, 3, 0 };
+        char         buf[64];
+
+        test_check(axl_json_error_format(&e, "{}", 0, buf, sizeof(buf)) > 0
+                   && axl_strcmp(buf, "2:3: input ended early") == 0,
+                   "errfmt: len 0 is treated like a NULL document");
+    }
+
+    // --- a column past the end of the line still gets its caret ------------
+    // Not reachable from a parser-produced record, but a caller may build one,
+    // and the padding loop that handles it had no test.
+    {
+        AxlJsonError e = { AXL_JSON_ERR_INCOMPLETE, 3, 1, 8, 0 };
+        char         buf[64];
+
+        test_check(axl_json_error_format(&e, "{}", 2, buf, sizeof(buf)) > 0
+                   && axl_strcmp(buf, "1:8: input ended early\n{}\n       ^")
+                      == 0,
+                   "errfmt: a column past end-of-line pads out to it rather "
+                   "than stopping short");
+    }
+
+    // --- an offset past the document is clamped ----------------------------
+    // The backing array deliberately runs PAST @a len and holds newlines
+    // there. Without the clamp the line scan walks into them, picks a line
+    // start beyond the document and quotes nothing — and, in a real caller,
+    // reads memory it was never given. A document that simply ends at len
+    // cannot show this: there is nothing past it to misread.
+    {
+        const char   backing[] = "{}\n\nXX";
+        AxlJsonError e = { AXL_JSON_ERR_INCOMPLETE, 5, 1, 3, 0 };
+        char         buf[64];
+
+        test_check(axl_json_error_format(&e, backing, 2, buf, sizeof(buf)) > 0
+                   && axl_strcmp(buf, "1:3: input ended early\n{}\n  ^") == 0,
+                   "errfmt: an offset past @a len is clamped to it — the scan "
+                   "never looks at bytes beyond the document");
+    }
+
+    // --- argument handling --------------------------------------------------
+    {
+        AxlJsonError e = { AXL_JSON_ERR_INCOMPLETE, 0, 1, 1, 0 };
+        char         buf[64];
+        char         tiny[4];
+
+        test_check(axl_json_error_format(NULL, NULL, 0, buf, sizeof(buf)) == -1
+                   && axl_json_error_format(&e, NULL, 0, NULL,
+                                            sizeof(buf)) == -1
+                   && axl_json_error_format(&e, NULL, 0, buf, 0) == -1,
+                   "errfmt: NULL arguments and a zero-sized buffer are "
+                   "refused");
+        tiny[0] = (char)0xAA;
+        test_check(axl_json_error_format(&e, NULL, 0, tiny, sizeof(tiny)) == -1
+                   && tiny[0] == '\0',
+                   "errfmt: a buffer too small is REFUSED, not truncated — "
+                   "and left empty rather than partial");
+    }
+}
+
+static void
+test_json_writer_utf8_mode(void)
+{
+    // --- REPAIR is the default and is what the writer always did ----------
+    wr_utf8_check(AXL_JSON_STRICT, "a\x80z", "{\"k\":\"a\xEF\xBF\xBDz\"}",
+                  "wr utf8: REPAIR substitutes U+FFFD — the writer's standing "
+                  "guarantee that its output is well-formed");
+
+    // --- RAW copies the byte out verbatim ---------------------------------
+    // The point of the mode: a field carrying firmware bytes round-trips.
+    // The result is deliberately NOT well-formed JSON text, which is why it
+    // has to be asked for by name.
+    wr_utf8_check(AXL_JSON_UTF8_RAW, "a\x80z", "{\"k\":\"a\x80z\"}",
+                  "wr utf8: RAW writes the ill-formed byte out as it came in");
+    wr_utf8_check(AXL_JSON_UTF8_RAW, "caf\xC3\xA9",
+                  "{\"k\":\"caf\xC3\xA9\"}",
+                  "wr utf8: and leaves well-formed input alone, as every mode "
+                  "does");
+
+    // --- RAW cannot survive ENSURE_ASCII ----------------------------------
+    // Escaping to \uXXXX needs a CODE POINT, and an ill-formed byte has
+    // none. The two flags are in direct conflict and ENSURE_ASCII wins,
+    // because its guarantee is the one that would otherwise be silently
+    // broken. Documented, and pinned here so it cannot drift into "RAW wins".
+    wr_utf8_check(AXL_JSON_UTF8_RAW | AXL_JSON_ENSURE_ASCII, "a\x80z",
+                  "{\"k\":\"a\\ufffdz\"}",
+                  "wr utf8: RAW + ENSURE_ASCII escapes as \\ufffd — there is "
+                  "no code point to escape, so RAW cannot win");
+
+    // --- STRICT refuses ----------------------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_UTF8_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "k", "a\x80z");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_json_writer_error(&w)
+                   && axl_json_writer_error_info(&w)->code
+                      == AXL_JSON_ERR_BAD_UTF8,
+                   "wr utf8: STRICT sets the sticky error rather than writing "
+                   "something it cannot vouch for");
+    }
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_UTF8_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "k", "caf\xC3\xA9");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "{\"k\":\"caf\xC3\xA9\"}") == 0,
+                   "wr utf8: STRICT passes well-formed input through "
+                   "untouched — it is a check, not a transform");
+    }
+
+    // --- the RESERVED field value is refused, not read as REPAIR -----------
+    // RAW is 1 and STRICT is 2, so naming both ORs to the reserved value by
+    // accident rather than by inventing a constant. Accepting it would
+    // silently mean REPAIR — the mode disabled by the act of asking for two.
+    // The reader refuses it at parse; the writer must agree at init.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out,
+                             AXL_JSON_UTF8_RAW | AXL_JSON_UTF8_STRICT);
+        test_check(axl_json_writer_error(&w)
+                   && axl_json_writer_error_info(&w)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "wr utf8: writer_init refuses the reserved UTF-8 field "
+                   "value — one rule for the reader and the writer");
+    }
+}
+
+static void
+test_json_ensure_ascii(void)
+{
+    // --- the BMP boundary, exact ------------------------------------------
+    ascii_check("\xEF\xBF\xBF", "{\"k\":\"\\uffff\"}",
+                "ensure_ascii: U+FFFF is a SINGLE escape — the last code "
+                "point that fits in one");
+    ascii_check("\xF0\x90\x80\x80", "{\"k\":\"\\ud800\\udc00\"}",
+                "ensure_ascii: U+10000 is the FIRST surrogate pair");
+    ascii_check("\xF4\x8F\xBF\xBF", "{\"k\":\"\\udbff\\udfff\"}",
+                "ensure_ascii: U+10FFFF is the maximum pair");
+    ascii_check("\xF0\x9F\x98\x80", "{\"k\":\"\\ud83d\\ude00\"}",
+                "ensure_ascii: U+1F600 emoji becomes its documented pair");
+
+    // --- the low boundary and the 2/3-byte forms --------------------------
+    ascii_check("\xC2\x80", "{\"k\":\"\\u0080\"}",
+                "ensure_ascii: U+0080, the first non-ASCII code point");
+    ascii_check("\xC3\xA9", "{\"k\":\"\\u00e9\"}",
+                "ensure_ascii: a 2-byte code point, lowercase hex");
+    ascii_check("\xE4\xB8\xAD", "{\"k\":\"\\u4e2d\"}",
+                "ensure_ascii: a 3-byte CJK code point");
+
+    // --- pure ASCII is byte-identical with and without the flag -----------
+    {
+        AXL_AUTOPTR(AxlString) with    = axl_string_new(NULL);
+        AXL_AUTOPTR(AxlString) without = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, with, AXL_JSON_ENSURE_ASCII);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "a/b", "plain \"quoted\"\ttext");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        axl_json_writer_init(&w, without, AXL_JSON_STRICT);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "a/b", "plain \"quoted\"\ttext");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_strcmp(axl_string_str(with),
+                              axl_string_str(without)) == 0,
+                   "ensure_ascii: pure ASCII input is byte-identical with and "
+                   "without the flag");
+    }
+
+    // --- KEYS are escaped too ---------------------------------------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_ENSURE_ASCII);
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "\xC3\xA9", 1);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out), "{\"\\u00e9\":1}") == 0,
+                   "ensure_ascii: an object KEY is escaped like any other "
+                   "string");
+    }
+
+    // --- ill-formed input escapes as \ufffd -------------------------------
+    // The writer repairs to U+FFFD first, so this is that rule seen through
+    // the flag rather than a second one.
+    ascii_check("a\xFFz", "{\"k\":\"a\\ufffdz\"}",
+                "ensure_ascii: an ill-formed byte becomes the ESCAPED "
+                "replacement, not a raw one");
+
+    // --- the SPLICE path, and an escape already in the source -------------
+    {
+        const char            *doc = "{\"k\":\"\xC3\xA9 and \\u00e9\"}";
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonReader          r;
+        AxlJsonWriter          w;
+
+        test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r),
+                   "ensure_ascii: splice source parses");
+        axl_json_writer_init(&w, out, AXL_JSON_ENSURE_ASCII);
+        axl_json_write_token(&w, &r, 0);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out),
+                              "{\"k\":\"\\u00e9 and \\u00e9\"}") == 0,
+                   "ensure_ascii: reaches write_token — a raw code point is "
+                   "escaped and one already escaped is left alone");
+        axl_json_free(&r);
+    }
+
+    // --- a JSON5 `\<non-ASCII>` escape on the splice path -----------------
+    //
+    // The case above uses `\u00e9`, an escape made entirely of ASCII, which
+    // is why it never caught this: the writer copies an ASCII run verbatim
+    // and the pair survives by accident. Under ALLOW_EXTRA_ESCAPES the
+    // payload can be a RAW multi-byte character instead, and then the
+    // backslash is an escape INTRODUCER whose payload ENSURE_ASCII is about
+    // to rewrite. Emitting the introducer and then re-encoding the payload
+    // separately turns `\<char>` into `\\uXXXX` — a literal backslash
+    // followed by text — which is a different value.
+    //
+    // Found by test/fuzz/json_fuzz's representation oracle, not by hand.
+    {
+        /* `\` + a raw 2-byte character. */
+        const char            *doc = "{\"k\":\"\\\xC3\xA9\"}";
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonReader          r;
+        AxlJsonWriter          w;
+        char                   val[16];
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_JSON5, &r),
+                   "ensure_ascii: `\\<2-byte char>` source parses under JSON5");
+        axl_json_writer_init(&w, out, AXL_JSON_ENSURE_ASCII);
+        axl_json_write_token(&w, &r, 0);
+        axl_json_writer_finish(&w);
+        test_check(axl_strcmp(axl_string_str(out), "{\"k\":\"\\u00e9\"}") == 0,
+                   "ensure_ascii: a `\\<raw char>` escape re-encodes as ONE "
+                   "escape, not a literal backslash plus text");
+        axl_json_free(&r);
+
+        /* And it still means the same character. */
+        test_check(axl_json_parse(axl_string_str(out),
+                                        axl_string_len(out),
+                                        AXL_JSON_JSON5, &r),
+                   "ensure_ascii: `\\<2-byte char>` output re-parses");
+        test_check(axl_json_get_string(&r, "k", val, sizeof(val))
+                       && axl_strcmp(val, "\xC3\xA9") == 0,
+                   "ensure_ascii: `\\<raw char>` still decodes to that "
+                   "character after the round trip");
+        axl_json_free(&r);
+    }
+
+    // --- a SINGLE-QUOTED source token spliced into a double-quoted one -----
+    //
+    // The splice re-quotes with `"` but copies the content verbatim, and
+    // inside single quotes a `"` needs no escape — so `{a:'v"w'}` came out as
+    // {"a":"v"w"}, which is not JSON in any dialect. The mirror case is `\'`,
+    // an escape that is legal inside single quotes and invalid in a strict
+    // double-quoted string.
+    //
+    // Written STRICT deliberately: the point is that a JSON5 document can be
+    // converted to strict JSON, which is the main reason to re-emit at all.
+    // Found by test/fuzz/json_fuzz's round-trip oracle.
+    {
+        const struct {
+            const char *doc;
+            const char *want;
+            const char *msg;
+        } rows[] = {
+            { "{a:'v\"w'}", "{\"a\":\"v\\\"w\"}",
+              "splice: a double quote inside a SINGLE-quoted value is escaped "
+              "when re-emitted between double quotes" },
+            { "{'k\"x':1}", "{\"k\\\"x\":1}",
+              "splice: the same for a single-quoted KEY" },
+            { "{a:'v\\'w'}", "{\"a\":\"v'w\"}",
+              "splice: `\\'` loses an escape that only single quotes needed, "
+              "rather than emitting one strict JSON rejects" },
+        };
+
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+            AxlJsonReader          r;
+            AxlJsonWriter          w;
+
+            if (!axl_json_parse(rows[i].doc, axl_strlen(rows[i].doc),
+                                      AXL_JSON_JSON5, &r)) {
+                /* Both arms must emit the SAME number of assertions, or a
+                   parse regression would move the pass count instead of
+                   failing outright. */
+                test_check(false, rows[i].msg);
+                test_check(false,
+                           "splice: the re-emitted document parses as STRICT "
+                           "JSON");
+                continue;
+            }
+            axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+            axl_json_write_token(&w, &r, 0);
+            axl_json_writer_finish(&w);
+            axl_json_free(&r);
+
+            test_check(axl_strcmp(axl_string_str(out), rows[i].want) == 0,
+                       rows[i].msg);
+
+            /* And the result must be readable as STRICT JSON, which is the
+               property the exact string above is a proxy for. */
+            AxlJsonReader back;
+            test_check(axl_json_parse(axl_string_str(out),
+                                            axl_string_len(out),
+                                            AXL_JSON_STRICT, &back),
+                       "splice: the re-emitted document parses as STRICT JSON");
+            axl_json_free(&back);
+        }
+    }
+
+    // --- the same, but four bytes, which is where it also SPLIT ------------
+    //
+    // ESCAPE_SLASH pairs the backslash with the next BYTE. On a 4-byte
+    // character that cuts the sequence after the lead byte, so the three
+    // continuation bytes are orphaned and each repairs to U+FFFD — and the
+    // lead byte is emitted RAW, which breaks ENSURE_ASCII's one promise.
+    // Both flag settings must produce the same single escape pair.
+    {
+        const char *doc = "{\"k\":\"\\\xF0\x9F\x8C\x80\"}";
+        const AxlJsonFlags rows[] = {
+            AXL_JSON_ENSURE_ASCII,
+            AXL_JSON_ENSURE_ASCII | AXL_JSON_ESCAPE_SLASH,
+        };
+
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+            AxlJsonReader          r;
+            AxlJsonWriter          w;
+
+            test_check(axl_json_parse(doc, axl_strlen(doc),
+                                            AXL_JSON_JSON5, &r),
+                       "ensure_ascii: `\\<4-byte char>` source parses");
+            axl_json_writer_init(&w, out, rows[i]);
+            axl_json_write_token(&w, &r, 0);
+            axl_json_writer_finish(&w);
+            axl_json_free(&r);
+
+            test_check(axl_strcmp(axl_string_str(out),
+                                  "{\"k\":\"\\ud83c\\udf00\"}") == 0,
+                       i == 0
+                           ? "ensure_ascii: `\\<4-byte char>` becomes one "
+                             "surrogate PAIR"
+                           : "ensure_ascii+escape_slash: the backslash pairs "
+                             "with the whole CHARACTER, not one byte");
+
+            /* ENSURE_ASCII's entire promise, asserted directly: a raw lead
+               byte leaking out is exactly what the byte-wise pairing did. */
+            bool pure = true;
+            for (size_t b = 0; b < axl_string_len(out); b++) {
+                if ((unsigned char)axl_string_str(out)[b] >= 0x80) {
+                    pure = false;
+                }
+            }
+            test_check(pure,
+                       i == 0 ? "ensure_ascii: output is pure ASCII"
+                              : "ensure_ascii+escape_slash: output is pure "
+                                "ASCII — no raw lead byte escapes");
+        }
+    }
+
+    // --- and the result still round-trips to the same TEXT ----------------
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+        AxlJsonReader          r;
+        char                   buf[32];
+
+        axl_json_writer_init(&w, out, AXL_JSON_ENSURE_ASCII);
+        axl_json_obj_begin(&w);
+        axl_json_kv_str(&w, "k", "\xF0\x9F\x98\x80");
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+
+        test_check(axl_json_parse(axl_string_str(out),
+                                  axl_strlen(axl_string_str(out)), AXL_JSON_RELAXED, &r)
+                   && axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf, "\xF0\x9F\x98\x80") == 0,
+                   "ensure_ascii: the escaped pair decodes back to the SAME "
+                   "4-byte code point — escaping is lossless");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SORT_KEYS (P6) — write_token only; the streaming writer buffers nothing
+// ---------------------------------------------------------------------------
+
+/* Parse @a doc in @a dialect and re-emit the whole thing through
+   axl_json_write_token under @a wflags, comparing the WHOLE document.
+   write_token is the only path SORT_KEYS reaches, so every ordering
+   assertion goes through here. */
+static void
+sort_check(const char *doc, AxlJsonFlags dialect, AxlJsonFlags wflags,
+           const char *want, const char *msg)
+{
+    AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+    AxlJsonReader          r;
+    AxlJsonWriter          w;
+
+    if (!axl_json_parse(doc, axl_strlen(doc), dialect, &r)) {
+        test_check(false, msg);
+        return;
+    }
+    axl_json_writer_init(&w, out, wflags);
+    axl_json_write_token(&w, &r, 0);
+    axl_json_writer_finish(&w);
+    test_check(!axl_json_writer_error(&w)
+               && axl_strcmp(axl_string_str(out), want) == 0, msg);
+    axl_json_free(&r);
+}
+
+static void
+test_json_sort_keys(void)
+{
+    // --- the baseline: WITHOUT the flag, source order survives -------------
+    // Asserted first and separately. Every expectation below is "sorted"
+    // rather than "different", and that only means something if the unsorted
+    // path is known to preserve what the document said.
+    sort_check("{\"c\":1,\"a\":2,\"b\":3}", AXL_JSON_STRICT, AXL_JSON_STRICT,
+               "{\"c\":1,\"a\":2,\"b\":3}",
+               "sort: without SORT_KEYS the source order is preserved");
+
+    // --- flat, and the nested object that proves it recurses ---------------
+    sort_check("{\"c\":1,\"a\":2,\"b\":3}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":2,\"b\":3,\"c\":1}",
+               "sort: a flat object comes out in key order");
+    sort_check("{\"z\":{\"q\":1,\"b\":2},\"a\":3}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":3,\"z\":{\"b\":2,\"q\":1}}",
+               "sort: a NESTED object is sorted too — sorting recurses");
+    /* The nested container LAST as well as first: a container at the end is
+       where a skip-loop bug hides, because the member count ends the walk
+       whatever the skip does. */
+    sort_check("{\"b\":{\"y\":1,\"x\":2},\"a\":0}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":0,\"b\":{\"x\":2,\"y\":1}}",
+               "sort: and when the nested object sorts to the END, where a "
+               "mis-skipped subtree would not be noticed");
+    sort_check("[{\"b\":1,\"a\":2},{\"d\":3,\"c\":4}]", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "[{\"a\":2,\"b\":1},{\"c\":4,\"d\":3}]",
+               "sort: objects INSIDE an array are sorted, each on its own");
+
+    // --- what must NOT be reordered ----------------------------------------
+    // TWO members, deliberately. A one-member object never reaches the sorted
+    // path at all (the `size > 1` early-out), so `{"k":[3,1,2]}` would assert
+    // nothing about SORT_KEYS — it would exercise the unsorted walk and pass
+    // however the sorted one behaved. A review caught exactly that.
+    sort_check("{\"k\":[3,1,2],\"a\":0}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS,
+               "{\"a\":0,\"k\":[3,1,2]}",
+               "sort: array elements keep their order — that is data, not "
+               "key order");
+
+    // --- the sorted walk must SKIP a subtree it does not sort ---------------
+    // These are what cover token_subtree_end's array arm. Without them the
+    // whole arm could be deleted and every other case here still passes: the
+    // member walk only has to step over an array when one is the value of an
+    // object big enough to sort.
+    sort_check("{\"b\":[1,[2,3],4],\"a\":0}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":0,\"b\":[1,[2,3],4]}",
+               "sort: a NESTED array inside a sorted object is stepped over "
+               "whole — the member after it is still found");
+    sort_check("{\"b\":[{\"y\":1,\"x\":2}],\"a\":0}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":0,\"b\":[{\"x\":2,\"y\":1}]}",
+               "sort: an object inside an array inside a sorted object is "
+               "itself sorted");
+    sort_check("{\"b\":[],\"a\":0}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS,
+               "{\"a\":0,\"b\":[]}",
+               "sort: an EMPTY array value — the zero-trip skip loop");
+
+    // --- an ILL-FORMED key sorts by the name it will actually carry --------
+    //
+    // The docstring promises order over the DECODED name, and only ESCAPED
+    // keys were being decoded. A key holding a raw ill-formed byte is not
+    // escaped, so it was sorted by source bytes — while being EMITTED with
+    // UTF-8 repair applied. Those disagree: 0xFF sorts AFTER 0xF0 as a raw
+    // byte, but its repaired name U+FFFD (EF BF BD) sorts BEFORE it.
+    //
+    // The visible consequence is that sorting stopped being idempotent —
+    // re-sorting the writer's own output produced a different order — which
+    // is the one thing this flag exists to guarantee. Found by
+    // test/fuzz/json_fuzz's round-trip oracle.
+    sort_check("{\"\xFF\":1,\"\xF0\x9F\x98\x80\":2}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS,
+               "{\"\xEF\xBF\xBD\":1,\"\xF0\x9F\x98\x80\":2}",
+               "sort: an ill-formed key orders by its REPAIRED name, the one "
+               "it is emitted under");
+
+    // A key whose decode GROWS. JSON5's `\0` is two source bytes and names
+    // U+FFFD (three), so a sort buffer sized for "decoding never shrinks or
+    // grows" overflows or refuses. Sizing it at len+1 made SORT_KEYS fail
+    // outright on this document — a regression caught by review, not by the
+    // fuzzer, whose round-trip oracle skips any document the writer errors on.
+    // U+FFFD (EF BF BD) sorts AFTER `z`, which is the decoded-name order.
+    sort_check("{'\\0':1,'z':2}", AXL_JSON_JSON5, AXL_JSON_SORT_KEYS,
+               "{\"z\":2,\"\\0\":1}",
+               "sort: a key whose decode GROWS still fits its buffer, and "
+               "orders by the name it grew into");
+
+    // Under UTF8_RAW no repair happens, so the raw bytes ARE the emitted
+    // bytes and sorting by them is correct — 0xFF sorts last. Pins that the
+    // fix is mode-aware rather than an unconditional decode.
+    sort_check("{\"\xFF\":1,\"\xF0\x9F\x98\x80\":2}",
+               AXL_JSON_STRICT | AXL_JSON_UTF8_RAW,
+               AXL_JSON_SORT_KEYS | AXL_JSON_UTF8_RAW,
+               "{\"\xF0\x9F\x98\x80\":2,\"\xFF\":1}",
+               "sort: under UTF8_RAW the raw bytes are the emitted bytes, so "
+               "they are what orders");
+    sort_check("{\"b\":{},\"a\":0}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS,
+               "{\"a\":0,\"b\":{}}",
+               "sort: an EMPTY object value — the same, on the object arm");
+
+    // --- keys differing only in case ---------------------------------------
+    // Byte order, so the whole uppercase run precedes the whole lowercase
+    // one. A case-FOLDING sort would interleave them as A,a,B,b and a
+    // case-insensitive one would leave the pairs in source order.
+    sort_check("{\"b\":1,\"A\":2,\"a\":3,\"B\":4}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"A\":2,\"B\":4,\"a\":3,\"b\":1}",
+               "sort: case is not folded — every uppercase key precedes "
+               "every lowercase one");
+
+    // --- sorted by the DECODED name, not the source spelling ---------------
+    // The discriminating case for the whole decode path. `\u0062` NAMES `b`,
+    // so it must sort AFTER `a`. Compared as source bytes it would sort
+    // FIRST, because `\` is 0x5C and `a` is 0x61 — and the document would
+    // come out in its original order, looking untouched rather than wrong.
+    sort_check("{\"\\u0062\":1,\"a\":2}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS,
+               "{\"a\":2,\"\\u0062\":1}",
+               "sort: an escaped key sorts by its DECODED name, and re-emits "
+               "in its original source spelling");
+    /* Source deliberately NOT already in order: an input that arrives sorted
+       passes whether or not the flag does anything. */
+    sort_check("{\"\\u0043\":3,\"B\":2,\"\\u0041\":1}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"\\u0041\":1,\"B\":2,\"\\u0043\":3}",
+               "sort: escaped and plain keys interleave by decoded name — "
+               "A, B, C from two different spellings");
+
+    // --- a prefix sorts before what extends it -----------------------------
+    sort_check("{\"ab\":1,\"a\":2,\"abc\":3}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":2,\"ab\":1,\"abc\":3}",
+               "sort: a key that is a PREFIX of another sorts first");
+
+    // --- duplicate keys keep their source order ----------------------------
+    // Three duplicates with DISTINCT values, so a reordering is visible;
+    // two would have a 50% chance of looking correct by luck.
+    sort_check("{\"b\":9,\"a\":1,\"a\":2,\"a\":3}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS, "{\"a\":1,\"a\":2,\"a\":3,\"b\":9}",
+               "sort: duplicate keys are all kept, in the order the document "
+               "listed them");
+
+    /* ...but that case CANNOT exercise the comparator's tie-break, and a
+       sabotage proved it: axl_qsort runs pure insertion sort at or below
+       INSERTION_THRESHOLD (16) and insertion sort is stable, so any object
+       small enough to read comfortably keeps source order whether the
+       tie-break is there or not. Deleting the tie-break left the case above
+       green.
+
+       Twenty members past that threshold, every one of them the SAME key,
+       so the run reaches introsort's partitioning — where equal elements are
+       swapped across the pivot and source order survives only because the
+       comparator refuses to call any two members equal. Output must be
+       byte-identical to input, which is why one string serves as both. */
+    {
+        const char *dup20 =
+            "{\"k\":0,\"k\":1,\"k\":2,\"k\":3,\"k\":4,\"k\":5,\"k\":6,"
+            "\"k\":7,\"k\":8,\"k\":9,\"k\":10,\"k\":11,\"k\":12,\"k\":13,"
+            "\"k\":14,\"k\":15,\"k\":16,\"k\":17,\"k\":18,\"k\":19}";
+
+        sort_check(dup20, AXL_JSON_STRICT, AXL_JSON_SORT_KEYS, dup20,
+                   "sort: twenty identical keys past the insertion-sort "
+                   "threshold keep source order — the tie-break, not luck");
+    }
+
+    // --- the degenerate sizes ----------------------------------------------
+    sort_check("{}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS, "{}",
+               "sort: an empty object is unchanged");
+    sort_check("{\"a\":1}", AXL_JSON_STRICT, AXL_JSON_SORT_KEYS, "{\"a\":1}",
+               "sort: a one-member object is unchanged");
+
+    // --- fully reversed, wide enough that a partial sort would show ---------
+    // NOT a collector-growth case: axl_array_sized_new reserves exactly the
+    // member count and the array takes exactly that many appends, so the
+    // grow path is unreachable for ANY input here.
+    sort_check("{\"j\":9,\"i\":8,\"h\":7,\"g\":6,\"f\":5,\"e\":4,\"d\":3,"
+               "\"c\":2,\"b\":1,\"a\":0}", AXL_JSON_STRICT,
+               AXL_JSON_SORT_KEYS,
+               "{\"a\":0,\"b\":1,\"c\":2,\"d\":3,\"e\":4,\"f\":5,\"g\":6,"
+               "\"h\":7,\"i\":8,\"j\":9}",
+               "sort: ten members in exactly reverse order come out exactly "
+               "forward");
+
+    // --- JSON5 unquoted keys sort too, and quote on the way out ------------
+    sort_check("{c:1,a:2,b:3}", AXL_JSON_JSON5, AXL_JSON_SORT_KEYS,
+               "{\"a\":2,\"b\":3,\"c\":1}",
+               "sort: JSON5 unquoted keys sort by the same name and are "
+               "quoted on output");
+
+    // --- composes with the formatting flags ---------------------------------
+    sort_check("{\"c\":1,\"a\":{\"y\":1,\"x\":2}}", AXL_JSON_STRICT,
+               AXL_JSON_INDENT(2) | AXL_JSON_SORT_KEYS,
+               "{\n  \"a\": {\n    \"x\": 2,\n    \"y\": 1\n  },\n  \"c\": 1\n}",
+               "sort: INDENT(2) | SORT_KEYS — sorted AND correctly indented "
+               "at every depth");
+
+    // --- on a STREAMING write it is a documented no-op ----------------------
+    // Pinned rather than assumed. Nothing is buffered, so there is nothing to
+    // sort; the risk is a future implementation quietly acquiring an opinion
+    // here, which this would catch.
+    {
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter          w;
+
+        axl_json_writer_init(&w, out, AXL_JSON_SORT_KEYS);
+        axl_json_obj_begin(&w);
+        axl_json_kv_int(&w, "c", 1);
+        axl_json_kv_int(&w, "a", 2);
+        axl_json_kv_int(&w, "b", 3);
+        axl_json_obj_end(&w);
+        axl_json_writer_finish(&w);
+        test_check(!axl_json_writer_error(&w)
+                   && axl_strcmp(axl_string_str(out),
+                                 "{\"c\":1,\"a\":2,\"b\":3}") == 0,
+                   "sort: a STREAMING write is emission-ordered — SORT_KEYS "
+                   "is a no-op there, and stays one");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REJECT_DUPLICATES (P7) — reader-side, opt-in, by DECODED key name
+// ---------------------------------------------------------------------------
+
+/* Parse @a doc with @a flags and assert it FAILS with @a code at @a offset.
+   Position is asserted, not just the code: "some error was reported" is the
+   assertion this phase most needs not to make. */
+static void
+dup_reject_check(const char *doc, AxlJsonFlags flags, size_t offset,
+                 const char *msg)
+{
+    AxlJsonReader       r;
+    const bool          ok = axl_json_parse(doc, axl_strlen(doc),
+                                                  flags, &r);
+    const AxlJsonError *e  = axl_json_reader_error(&r);
+
+    test_check(!ok && e->code == AXL_JSON_ERR_DUPLICATE_KEY
+               && e->offset == offset, msg);
+    axl_json_free(&r);
+}
+
+static void
+test_json_reject_duplicates(void)
+{
+    // --- WITHOUT the flag: pin what a duplicate does today -----------------
+    // Undocumented before this phase, and it is the behavior the flag opts
+    // out of, so it is pinned first and separately. RFC 8259 §4 permits
+    // repeated names; AXL accepts them.
+    {
+        AxlJsonReader r;
+        int64_t       n = 0;
+
+        test_check(axl_json_parse("{\"a\":1,\"a\":2}", 13, AXL_JSON_RELAXED, &r),
+                   "dup: without the flag a repeated key PARSES — RFC 8259 "
+                   "permits it");
+        test_check(axl_json_get_int(&r, "a", &n) && n == 1,
+                   "dup: and a by-key accessor returns the FIRST occurrence");
+        axl_json_free(&r);
+
+        /* The escaped spelling resolves to the same name, so this is the
+           same document as far as any accessor is concerned. */
+        test_check(axl_json_parse("{\"\\u0061\":1,\"a\":2}", 18, AXL_JSON_RELAXED, &r),
+                   "dup: an ESCAPED duplicate parses too, without the flag");
+        test_check(axl_json_get_int(&r, "a", &n) && n == 1,
+                   "dup: and `\\u0061` is findable as `a` — the two keys name "
+                   "the same thing");
+        axl_json_free(&r);
+    }
+
+    // --- WITH the flag: the same documents are refused ----------------------
+    // Offset is the SECOND key's first NAME byte — inside the quotes, not the
+    // opening quote. A JSON5 unquoted key has no quote, and one rule that
+    // holds for every spelling beats two that differ by a byte.
+    dup_reject_check("{\"a\":1,\"a\":2}", AXL_JSON_REJECT_DUPLICATES, 8,
+                     "dup: REJECT_DUPLICATES fails the parse, positioned at "
+                     "the SECOND key");
+    dup_reject_check("{\"\\u0061\":1,\"a\":2}", AXL_JSON_REJECT_DUPLICATES, 13,
+                     "dup: an escaped key duplicates a plain one — compared "
+                     "by DECODED name, so escaping does not evade the check");
+    dup_reject_check("{\"a\":1,\"\\u0061\":2}", AXL_JSON_REJECT_DUPLICATES, 8,
+                     "dup: and in the other direction, plain then escaped");
+
+    // --- it is per OBJECT, and it reaches every depth -----------------------
+    {
+        AxlJsonReader r;
+
+        test_check(axl_json_parse("{\"x\":{\"a\":1},\"y\":{\"a\":2}}", 25,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: two SIBLING objects may each carry the same key — "
+                   "the check is per object, not per document");
+        axl_json_free(&r);
+    }
+    dup_reject_check("{\"x\":{\"a\":1,\"a\":2}}", AXL_JSON_REJECT_DUPLICATES,
+                     13,
+                     "dup: a duplicate NESTED one level down is still caught");
+    dup_reject_check("{\"x\":[{\"a\":1,\"a\":2}]}", AXL_JSON_REJECT_DUPLICATES,
+                     14,
+                     "dup: and inside an object inside an array");
+
+    // --- a member's VALUE is stepped over WHOLE -----------------------------
+    // Both of these turn on the member walk skipping a subtree rather than
+    // assuming two tokens per member. A sabotage replacing the skip with
+    // `next += 2` passed every other case here, so these are what make the
+    // walk load-bearing.
+    {
+        AxlJsonReader r;
+
+        /* A nested object may reuse its PARENT's key: different objects,
+           different scopes. A two-token stride would walk into the child and
+           see the inner `a` as a second member of the outer object — a false
+           duplicate in a document that is perfectly legal. */
+        test_check(axl_json_parse("{\"a\":{\"a\":1},\"b\":2}", 19,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: a nested object may REUSE its parent's key — scopes "
+                   "are per object, not per path");
+        axl_json_free(&r);
+    }
+    /* And the converse: a real duplicate sitting AFTER a multi-token value.
+       A two-token stride lands on an array ELEMENT, which is not a string, so
+       the walk gives up and the duplicate goes unreported. */
+    dup_reject_check("{\"x\":[1,2],\"a\":3,\"a\":4}",
+                     AXL_JSON_REJECT_DUPLICATES, 18,
+                     "dup: a duplicate AFTER an array-valued member is still "
+                     "found — the array is stepped over, not walked into");
+
+    // --- what must still parse ---------------------------------------------
+    {
+        AxlJsonReader r;
+
+        test_check(axl_json_parse("{\"a\":1,\"b\":2,\"c\":3}", 19,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: distinct keys are unaffected");
+        axl_json_free(&r);
+        test_check(axl_json_parse("{}", 2,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: an empty object is unaffected");
+        axl_json_free(&r);
+        /* Repeated VALUES are not repeated keys, and an array has no keys at
+           all — a check that walked tokens rather than object members could
+           confuse the two. */
+        /* TWO members: a one-member object is short-circuited before the
+           member walk runs, so it could not tell us anything about how array
+           elements are treated. */
+        test_check(axl_json_parse("{\"k\":[1,1,1],\"j\":[1,1]}", 23,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: repeated array ELEMENTS are not duplicate keys");
+        axl_json_free(&r);
+        test_check(axl_json_parse("{\"a\":\"a\",\"b\":\"b\"}", 17,
+                                        AXL_JSON_REJECT_DUPLICATES, &r),
+                   "dup: a key equal to a sibling's VALUE is not a duplicate "
+                   "— only keys are compared");
+        axl_json_free(&r);
+    }
+
+    // --- only the FIRST duplicate is reported -------------------------------
+    // A documented clause, and one a "report the last one found" bug would
+    // satisfy just as well without the offset being asserted.
+    dup_reject_check("{\"a\":1,\"b\":2,\"b\":3,\"a\":4}",
+                     AXL_JSON_REJECT_DUPLICATES, 14,
+                     "dup: with two duplicate pairs, the FIRST to complete is "
+                     "reported — the second `b`, not the second `a`");
+    dup_reject_check("{\"a\":1,\"a\":2,\"a\":3}", AXL_JSON_REJECT_DUPLICATES, 8,
+                     "dup: three occurrences report the SECOND, not the last");
+
+    // --- the degenerate key -------------------------------------------------
+    dup_reject_check("{\"\":1,\"\":2}", AXL_JSON_REJECT_DUPLICATES, 7,
+                     "dup: two EMPTY-string keys are duplicates — a zero "
+                     "length must not read as 'no key'");
+
+    // --- the outer walk keeps going past a CLEAN object ---------------------
+    dup_reject_check("{\"x\":{\"a\":1,\"b\":2},\"y\":{\"c\":3,\"c\":4}}",
+                     AXL_JSON_REJECT_DUPLICATES, 31,
+                     "dup: a duplicate in the SECOND sibling object is found — "
+                     "a clean first object does not end the search");
+
+    // --- JSON5 unquoted keys: POSITION, not just the code -------------------
+    // The unquoted spelling is the one the "first name byte, not the opening
+    // quote" rule exists for, so it is the one whose offset most needs pinning.
+    dup_reject_check("{a:1,a:2}", AXL_JSON_JSON5 | AXL_JSON_REJECT_DUPLICATES,
+                     5,
+                     "dup: an unquoted JSON5 key reports its own first byte — "
+                     "there is no quote to point at");
+    dup_reject_check("{a:1,\"a\":2}",
+                     AXL_JSON_JSON5 | AXL_JSON_REJECT_DUPLICATES, 6,
+                     "dup: and the quoted partner reports INSIDE its quotes");
+
+    // --- both sides of the linear/hash threshold ----------------------------
+    // Detection switches strategy at DUP_LINEAR_MAX (8) members and the table
+    // resizes again past 48, so a single width would exercise one path and
+    // silently leave the others unproven. Sweeping 2..60 members crosses both.
+    {
+        size_t width;
+        bool   all_clean  = true;
+        bool   all_caught = true;
+
+        for (width = 2; width <= 60; width++) {
+            AXL_AUTOPTR(AxlString) ok  = axl_string_new(NULL);
+            AXL_AUTOPTR(AxlString) bad = axl_string_new(NULL);
+            AxlJsonWriter          w;
+            AxlJsonReader          r;
+            size_t                 i;
+            char                   key[16];
+
+            /* distinct keys — must parse */
+            axl_json_writer_init(&w, ok, AXL_JSON_STRICT);
+            axl_json_obj_begin(&w);
+            for (i = 0; i < width; i++) {
+                axl_snprintf(key, sizeof(key), "k%02zu", i);
+                axl_json_kv_uint(&w, key, (uint64_t)i);
+            }
+            axl_json_obj_end(&w);
+            axl_json_writer_finish(&w);
+            if (!axl_json_parse(axl_string_str(ok),
+                                      axl_strlen(axl_string_str(ok)),
+                                      AXL_JSON_REJECT_DUPLICATES, &r)) {
+                all_clean = false;
+            }
+            axl_json_free(&r);
+
+            /* same, with the LAST key repeating the first — the longest
+               possible distance between the pair at this width */
+            axl_json_writer_init(&w, bad, AXL_JSON_STRICT);
+            axl_json_obj_begin(&w);
+            for (i = 0; i < width; i++) {
+                axl_snprintf(key, sizeof(key), "k%02zu",
+                             i + 1 == width ? (size_t)0 : i);
+                axl_json_kv_uint(&w, key, (uint64_t)i);
+            }
+            axl_json_obj_end(&w);
+            axl_json_writer_finish(&w);
+            if (axl_json_parse(axl_string_str(bad),
+                                     axl_strlen(axl_string_str(bad)),
+                                     AXL_JSON_REJECT_DUPLICATES, &r)
+                || axl_json_reader_error(&r)->code
+                   != AXL_JSON_ERR_DUPLICATE_KEY) {
+                all_caught = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_clean,
+                   "dup: distinct keys parse at every width 2..60 — across "
+                   "the linear/hash switch and the table's resize");
+        test_check(all_caught,
+                   "dup: and a first/last repeat is caught at every one of "
+                   "those widths");
+    }
+
+    // --- out of memory must fail the parse, never accept it -----------------
+    // A strictness flag that fails OPEN is worse than one that is absent: the
+    // caller believes the document was checked. Review found exactly that —
+    // an unchecked axl_hash_table_add return let an OOM parse succeed AND
+    // leak the key. Every allocation index is swept because the paths differ
+    // (the hash table, its buckets, each decoded key), and any one of them
+    // failing must give the same answer.
+    {
+        const char *doc = "{\"k00\":0,\"k01\":1,\"k02\":2,\"k03\":3,\"k04\":4,"
+                          "\"k05\":5,\"k06\":6,\"k07\":7,\"k08\":8,\"k09\":9,"
+                          "\"k00\":99}";
+        unsigned    n;
+        bool        never_accepted = true;
+
+        for (n = 1; n <= 40; n++) {
+            AxlJsonReader r;
+            bool          ok;
+
+            axl_mem_fail_next_alloc(n);
+            ok = axl_json_parse(doc, axl_strlen(doc),
+                                      AXL_JSON_REJECT_DUPLICATES, &r);
+            axl_mem_fail_next_alloc(0);
+            /* Either the allocation failure was reported, or the parse got
+               far enough to see the duplicate. Never success. */
+            if (ok) {
+                never_accepted = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(never_accepted,
+                   "dup: a document WITH a duplicate is never accepted, "
+                   "whichever of the first 40 allocations fails");
+    }
+
+    // --- JSON5 unquoted keys are keys too -----------------------------------
+    {
+        AxlJsonReader r;
+
+        test_check(!axl_json_parse("{a:1,a:2}", 9,
+                                         AXL_JSON_JSON5
+                                         | AXL_JSON_REJECT_DUPLICATES, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_DUPLICATE_KEY,
+                   "dup: JSON5 unquoted keys duplicate by the same rule");
+        axl_json_free(&r);
+        /* A quoted key and an unquoted one naming the same thing. */
+        test_check(!axl_json_parse("{a:1,\"a\":2}", 11,
+                                         AXL_JSON_JSON5
+                                         | AXL_JSON_REJECT_DUPLICATES, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_DUPLICATE_KEY,
+                   "dup: across the quoted/unquoted spellings as well");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AXL_JSON_UTF8_REPAIR / _RAW on READ (P7) — accessor-time, DECODED bytes
+// ---------------------------------------------------------------------------
+
+/* Parse @a doc under @a mode and compare the whole decoded value of key "a".
+   One helper for both modes, so a row can be stated as "these bytes in, those
+   bytes out" without the mode changing anything else about the call. */
+static void
+utf8_read_check(const char *doc, AxlJsonFlags mode, const char *want,
+                const char *msg)
+{
+    AxlJsonReader r;
+    char          buf[64];
+
+    if (!axl_json_parse(doc, axl_strlen(doc), AXL_JSON_JSON5 | mode,
+                              &r)) {
+        test_check(false, msg);
+        return;
+    }
+    test_check(axl_json_get_string(&r, "a", buf, sizeof(buf))
+               && axl_strcmp(buf, want) == 0, msg);
+    axl_json_free(&r);
+}
+
+static void
+test_json_utf8_repair_read(void)
+{
+    // --- RAW hands ill-formed bytes back; REPAIR substitutes ---------------
+    // The same document under both modes, so the difference is the mode and
+    // nothing else.
+    utf8_read_check("{\"a\":\"x\x80y\"}", AXL_JSON_UTF8_RAW, "x\x80y",
+                    "utf8 repair: RAW hands an orphan continuation back as "
+                    "found");
+    utf8_read_check("{\"a\":\"x\x80y\"}", AXL_JSON_UTF8_REPAIR,
+                    "x\xEF\xBF\xBDy",
+                    "utf8 repair: REPAIR turns it into U+FFFD");
+
+    // REPAIR is the ZERO value, so naming no mode must behave as REPAIR.
+    utf8_read_check("{\"a\":\"x\x80y\"}", 0, "x\xEF\xBF\xBDy",
+                    "utf8 repair: and REPAIR is what naming no mode gets — "
+                    "it is the zero value");
+
+    // --- one replacement per ill-formed BYTE, resynchronising --------------
+    utf8_read_check("{\"a\":\"\x80\x80\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xEF\xBF\xBD\xEF\xBF\xBD",
+                    "utf8 repair: two bad bytes give two replacements, not "
+                    "one run collapsed into one");
+    utf8_read_check("{\"a\":\"\xC3\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xEF\xBF\xBD",
+                    "utf8 repair: a truncated lead byte at end of string");
+    utf8_read_check("{\"a\":\"\xC3z\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xEF\xBF\xBDz",
+                    "utf8 repair: a lead with no continuation keeps the "
+                    "character that followed it");
+
+    // --- well-formed input is untouched under BOTH modes -------------------
+    utf8_read_check("{\"a\":\"\xE2\x82\xAC\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xE2\x82\xAC",
+                    "utf8 repair: a well-formed 3-byte sequence is not "
+                    "touched by REPAIR");
+    utf8_read_check("{\"a\":\"\xF0\x9F\x98\x80\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xF0\x9F\x98\x80",
+                    "utf8 repair: nor a 4-byte one");
+
+    // --- the ASSEMBLED characters must survive REPAIR ----------------------
+    // This is why the mode is judged on DECODED bytes. JSON5 lets any byte be
+    // escaped, so a character can arrive split across escapes and raw bytes.
+    // A repair that looked at the SOURCE would see a lone lead in each of
+    // these and destroy a character AXL assembles correctly.
+    utf8_read_check("{\"a\":\"\\\xC3\\\xA9\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xC3\xA9",
+                    "utf8 repair: two separately-escaped bytes still assemble "
+                    "into one character under REPAIR");
+    utf8_read_check("{\"a\":\"\xC3\\\x80\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xC3\x80",
+                    "utf8 repair: a RAW lead plus an ESCAPED continuation "
+                    "still assembles — judging the source would break it");
+    utf8_read_check("{\"a\":\"\\\xF0\\\x9F\\\x98\\\x80\"}",
+                    AXL_JSON_UTF8_REPAIR, "\xF0\x9F\x98\x80",
+                    "utf8 repair: four separately-escaped bytes assemble into "
+                    "one 4-byte character under REPAIR");
+
+    // --- escapes keep their own rules --------------------------------------
+    utf8_read_check("{\"a\":\"\\ud800\"}", AXL_JSON_UTF8_RAW,
+                    "\xEF\xBF\xBD",
+                    "utf8 repair: a lone surrogate ESCAPE is U+FFFD even "
+                    "under RAW — that rule is not the UTF-8 mode's");
+    utf8_read_check("{\"a\":\"\\xe9\"}", AXL_JSON_UTF8_REPAIR,
+                    "\xC3\xA9",
+                    "utf8 repair: \\xNN is still the code UNIT U+00NN, not a "
+                    "raw byte to be repaired");
+
+    // --- inheritance is asserted with RAW, which is NOT the zero value -----
+    // REPAIR is 0, so asserting that a sub-reader REPAIRS proves nothing: the
+    // destination is an uninitialised stack struct, and deleting the
+    // inheritance line still passes whenever that slot happens to be zero.
+    // A review caught exactly that. RAW is non-zero, so these fail unless the
+    // mode was really carried across.
+    {
+        AxlJsonReader     r;
+        AxlJsonReader     sub;
+        AxlJsonObjectIter it;
+        AxlJsonReader     val;
+        AxlJsonArrayIter  ait;
+        AxlJsonReader     elem;
+        char              kbuf[32];
+        char              vbuf[32];
+        const char       *doc = "{\"o\":{\"a\":\"x\x80y\"}}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_RAW, &r)
+                   && axl_json_get_object(&r, "o", &sub)
+                   && axl_json_get_string(&sub, "a", vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "x\x80y") == 0,
+                   "utf8 repair: a SUB-READER inherits RAW — it does not fall "
+                   "back to the zero value, which is REPAIR");
+        axl_json_free(&r);
+
+        doc = "{\"o\":{\"k\x80\":\"v\x80\"}}";
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_RAW, &r)
+                   && axl_json_object_begin(&r, "o", &it)
+                   && axl_json_object_next(&it, kbuf, sizeof(kbuf), &val)
+                   && axl_strcmp(kbuf, "k\x80") == 0
+                   && axl_json_value_string(&val, vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "v\x80") == 0,
+                   "utf8 repair: the OBJECT iterator inherits RAW, key and "
+                   "value alike");
+        axl_json_free(&r);
+
+        doc = "{\"a\":[\"x\x80y\"]}";
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_RAW, &r)
+                   && axl_json_array_begin(&r, "a", &ait)
+                   && axl_json_array_next(&ait, &elem)
+                   && axl_json_value_string(&elem, vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "x\x80y") == 0,
+                   "utf8 repair: and so does the ARRAY iterator");
+        axl_json_free(&r);
+    }
+
+    // --- a repaired key is findable by the name iteration reported ----------
+    // The contradiction token_equals exists to remove, in its UTF-8 form: the
+    // by-key fast path compared raw bytes without consulting the mode, so a
+    // key holding an ill-formed byte iterated as `k<U+FFFD>` and then could
+    // not be looked up under that name. Whether it worked depended on how the
+    // DOCUMENT happened to spell the byte, which is no rule at all.
+    {
+        AxlJsonReader     r;
+        AxlJsonObjectIter it;
+        AxlJsonReader     val;
+        char              kbuf[32];
+        char              vbuf[32];
+        AxlJsonReader     obj;
+        const char       *doc = "{\"o\":{\"k\x80\":\"v\"}}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_REPAIR, &r)
+                   && axl_json_get_object(&r, "o", &obj),
+                   "utf8 repair: document with a raw bad byte in the KEY "
+                   "parses");
+        test_check(axl_json_object_begin(&r, "o", &it)
+                   && axl_json_object_next(&it, kbuf, sizeof(kbuf), &val)
+                   && axl_strcmp(kbuf, "k\xEF\xBF\xBD") == 0,
+                   "utf8 repair: iteration reports the REPAIRED key name");
+        test_check(axl_json_get_string(&obj, kbuf, vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "v") == 0,
+                   "utf8 repair: and that exact name feeds back into a by-key "
+                   "lookup — the two agree on what the key IS");
+        axl_json_free(&r);
+    }
+
+    // --- REJECT_DUPLICATES names keys the same way the accessors do ---------
+    // Two keys that differ only in bytes REPAIR collapses. Under REPAIR they
+    // name the same thing, so they are duplicates — and the answer must not
+    // depend on whether the object crossed DUP_LINEAR_MAX and switched from
+    // the linear path to the hash one.
+    {
+        AxlJsonReader r;
+        bool          both_reject = true;
+        bool          both_accept = true;
+        size_t        pad;
+
+        for (pad = 0; pad <= 12; pad++) {
+            AXL_AUTOPTR(AxlString) doc = axl_string_new(NULL);
+            size_t                 i;
+            char                   key[16];
+
+            /* "\xC3" and "\xC4" are distinct raw bytes that BOTH repair to
+               U+FFFD, so REPAIR must call them one key. `pad` walks the
+               member count across the linear/hash threshold. */
+            axl_string_append(doc, "{\"\xC3\":1,\"\xC4\":2");
+            for (i = 0; i < pad; i++) {
+                axl_snprintf(key, sizeof(key), ",\"p%02zu\":0", i);
+                axl_string_append(doc, key);
+            }
+            axl_string_append(doc, "}");
+
+            if (axl_json_parse(axl_string_str(doc),
+                                     axl_strlen(axl_string_str(doc)),
+                                     AXL_JSON_UTF8_REPAIR
+                                     | AXL_JSON_REJECT_DUPLICATES, &r)) {
+                both_reject = false;
+            }
+            axl_json_free(&r);
+
+            /* Under RAW they are two different keys, at every width. */
+            if (!axl_json_parse(axl_string_str(doc),
+                                      axl_strlen(axl_string_str(doc)),
+                                      AXL_JSON_UTF8_RAW
+                                      | AXL_JSON_REJECT_DUPLICATES, &r)) {
+                both_accept = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(both_reject,
+                   "utf8 repair: two keys that REPAIR collapses are "
+                   "duplicates "
+                   "at every width — linear path and hash path agree");
+        test_check(both_accept,
+                   "utf8 repair: and under RAW they stay two distinct keys, "
+                   "also at every width");
+    }
+
+    // --- an ill-formed KEY does not fabricate an out-of-memory --------------
+    // The replacement is 3 bytes where the source byte was 1, so the key
+    // decode buffer's bound has to allow 3x. It allowed 3/2 — correct until
+    // REPAIR existed — and the duplicate check then refused valid documents
+    // with AXL_JSON_ERR_NO_MEMORY.
+    {
+        AxlJsonReader r;
+        const char   *doc = "{\"\x80\x80\\t\":1,\"b\":2}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_REPAIR
+                                        | AXL_JSON_REJECT_DUPLICATES, &r),
+                   "utf8 repair: a key of ill-formed bytes does not overflow "
+                   "the decode bound and report a false NO_MEMORY");
+        axl_json_free(&r);
+    }
+
+    // --- the repair's own bound: growth that will not fit ------------------
+    // The one branch here that can corrupt memory if it is wrong, and the one
+    // no other row reaches — every buffer above is far larger than its input.
+    // Sweeping small sizes walks the refusal boundary instead of guessing it.
+    {
+        const char *doc = "{\"a\":\"\x80\x80\"}";
+        size_t      size;
+        bool        all_sane = true;
+
+        for (size = 1; size <= 10; size++) {
+            AxlJsonReader r;
+            char          buf[16];
+            size_t        k;
+
+            axl_memset(buf, (char)0xAA, sizeof(buf));
+            buf[0] = '\0';   /* a refused call may not write; measure that */
+            if (!axl_json_parse(doc, axl_strlen(doc),
+                                      AXL_JSON_UTF8_REPAIR, &r)) {
+                all_sane = false;
+                break;
+            }
+            (void)axl_json_get_string(&r, "a", buf, size);
+            axl_json_free(&r);
+
+            /* Whatever fit, it must be NUL-terminated inside the buffer, hold
+               only whole replacements, and never have touched a byte past
+               the size it was given. */
+            if (axl_strlen(buf) >= size) {
+                all_sane = false;
+            }
+            for (k = size > 0 ? size : 1; k < sizeof(buf); k++) {
+                if (buf[k] != (char)0xAA) {
+                    all_sane = false;
+                }
+            }
+            /* 3 = the byte length of U+FFFD; spelled out because the
+               internal constant is not a public header. */
+            if (axl_strlen(buf) % 3 != 0) {
+                all_sane = false;   /* a replacement was split */
+            }
+        }
+        test_check(all_sane,
+                   "utf8 repair: at buffer sizes 1..10 the result is always "
+                   "NUL-terminated, whole-replacement only, and writes "
+                   "nothing "
+                   "past the size given");
+    }
+
+    // --- the old block, kept: REPAIR through a sub-reader and iterator -----
+    {
+        AxlJsonReader     r;
+        AxlJsonReader     sub;
+        AxlJsonObjectIter it;
+        AxlJsonReader     val;
+        char              kbuf[32];
+        char              vbuf[32];
+        const char       *doc = "{\"o\":{\"a\":\"x\x80y\"}}";
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_REPAIR, &r),
+                   "utf8 repair: nested document parses");
+        test_check(axl_json_get_object(&r, "o", &sub)
+                   && axl_json_get_string(&sub, "a", vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "x\xEF\xBF\xBDy") == 0,
+                   "utf8 repair: a SUB-READER repairs too — the mode is "
+                   "inherited, not left at the default");
+        axl_json_free(&r);
+
+        doc = "{\"o\":{\"k\x80\":\"v\x80\"}}";
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_UTF8_REPAIR, &r),
+                   "utf8 repair: document with a bad byte in the KEY parses");
+        test_check(axl_json_object_begin(&r, "o", &it)
+                   && axl_json_object_next(&it, kbuf, sizeof(kbuf), &val)
+                   && axl_strcmp(kbuf, "k\xEF\xBF\xBD") == 0
+                   && axl_json_value_string(&val, vbuf, sizeof(vbuf))
+                   && axl_strcmp(vbuf, "v\xEF\xBF\xBD") == 0,
+                   "utf8 repair: the object ITERATOR repairs both key and "
+                   "value");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AXL_JSON_UTF8_STRICT on READ (P7) — parse-time, raw bytes only
+// ---------------------------------------------------------------------------
+
+static void
+test_json_utf8_strict_read(void)
+{
+    const AxlJsonFlags STRICT_UTF8 = AXL_JSON_STRICT | AXL_JSON_UTF8_STRICT;
+
+    // --- the same document under each mode ---------------------------------
+    // One input, three outcomes, each pinned exactly. `\x80` is a bare
+    // continuation byte: no lead, so it cannot begin any sequence.
+    {
+        const char   *doc = "{\"k\":\"a\x80z\"}";
+        AxlJsonReader r;
+        char          buf[16];
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT, &r),
+                   "utf8 read: REPAIR (the zero value) still PARSES an "
+                   "ill-formed document — it is not a validity mode");
+        axl_json_free(&r);
+
+        test_check(axl_json_parse(doc, axl_strlen(doc),
+                                        AXL_JSON_STRICT | AXL_JSON_UTF8_RAW,
+                                        &r)
+                   && axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf, "a\x80z") == 0,
+                   "utf8 read: RAW parses and hands the bad byte back "
+                   "verbatim");
+        axl_json_free(&r);
+
+        {
+            const AxlJsonError *e;
+
+            test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                             STRICT_UTF8, &r),
+                       "utf8 read: STRICT REFUSES the document");
+            e = axl_json_reader_error(&r);
+            test_check(e->code == AXL_JSON_ERR_BAD_UTF8 && e->offset == 7,
+                       "utf8 read: STRICT reports BAD_UTF8 at the first bad "
+                       "BYTE, not at the string or the document");
+            axl_json_free(&r);
+        }
+    }
+
+    // --- position is a real position ----------------------------------------
+    // Line and column, not just an offset — the whole argument for settling
+    // this at parse time rather than in an accessor that can only say `false`.
+    {
+        const char         *doc = "{\n  \"a\": 1,\n  \"b\": \"\xC3\x28\"\n}";
+        AxlJsonReader       r;
+        const AxlJsonError *e;
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc),
+                                         STRICT_UTF8, &r),
+                   "utf8 read: a truncated 2-byte sequence is refused");
+        e = axl_json_reader_error(&r);
+        test_check(e->code == AXL_JSON_ERR_BAD_UTF8
+                   && e->line == 3 && e->column == 9,
+                   "utf8 read: with line and column, not merely an offset");
+        axl_json_free(&r);
+    }
+
+    // --- KEYS are checked too, not only values ------------------------------
+    {
+        const char   *doc = "{\"k\xE2\x80\":1}";
+        AxlJsonReader r;
+
+        test_check(!axl_json_parse(doc, axl_strlen(doc), STRICT_UTF8, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_BAD_UTF8,
+                   "utf8 read: an ill-formed KEY is refused as readily as a "
+                   "value");
+        axl_json_free(&r);
+    }
+
+    // --- what STRICT must NOT reject ----------------------------------------
+    // It is an encoding check on the bytes present, not a code-point policy.
+    {
+        AxlJsonReader r;
+        char          buf[16];
+
+        test_check(axl_json_parse("{\"k\":\"\\ud800\"}", 14,
+                                        STRICT_UTF8, &r),
+                   "utf8 read: a lone surrogate as an ESCAPE is well-formed "
+                   "JSON syntax and is NOT refused");
+        test_check(axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf, "\xEF\xBF\xBD") == 0,
+                   "utf8 read: it still decodes to U+FFFD, as under any mode");
+        axl_json_free(&r);
+
+        /* 2-, 3- AND 4-byte. The 3-byte case is not decoration: a sabotage
+           that broke the 3-byte ACCEPT branch left every other assertion in
+           this function green, because no other document here feeds the
+           checker a well-formed 3-byte sequence. */
+        test_check(axl_json_parse(
+                       "{\"k\":\"caf\xC3\xA9 \xE2\x82\xAC \xF0\x9F\x98\x80\"}",
+                       22, STRICT_UTF8, &r)
+                   && axl_json_get_string(&r, "k", buf, sizeof(buf))
+                   && axl_strcmp(buf,
+                                 "caf\xC3\xA9 \xE2\x82\xAC \xF0\x9F\x98\x80") == 0,
+                   "utf8 read: well-formed 2-, 3- and 4-byte sequences pass "
+                   "untouched");
+        axl_json_free(&r);
+
+        /* The exact ceiling. U+10FFFF is the last legal code point and its
+           successor differs by one byte, so this pair pins the bound itself
+           rather than the lead-byte range that catches \xF5 and above. */
+        test_check(axl_json_parse("{\"k\":\"\xF4\x8F\xBF\xBF\"}", 12,
+                                        STRICT_UTF8, &r),
+                   "utf8 read: U+10FFFF, the highest legal code point, is "
+                   "accepted");
+        axl_json_free(&r);
+        test_check(!axl_json_parse("{\"k\":\"\xF4\x90\x80\x80\"}", 12,
+                                         STRICT_UTF8, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_BAD_UTF8,
+                   "utf8 read: and one code point past it is not");
+        axl_json_free(&r);
+    }
+
+    // --- the ill-formed shapes, swept --------------------------------------
+    // One hand-picked bad byte proves one branch of the lead-byte ladder.
+    // Each row is a DIFFERENT way to be ill-formed, so a validator that
+    // handled only orphan continuations would pass the first and fail here.
+    {
+        struct { const char *bytes; const char *msg; } row[] = {
+            { "\x80",         "orphan continuation byte" },
+            { "\xC3",         "2-byte lead with nothing after it" },
+            { "\xE2\x80",     "3-byte lead, one continuation short" },
+            { "\xF0\x9F\x98", "4-byte lead, one continuation short" },
+            { "\xC0\xAF",     "2-byte overlong encoding of '/'" },
+            { "\xE0\x80\xAF", "3-byte overlong — a different branch" },
+            { "\xF0\x80\x80\xAF", "4-byte overlong — a third branch" },
+            { "\xED\xA0\x80", "a surrogate encoded as raw bytes" },
+            { "\xF5\x80\x80\x80", "beyond U+10FFFF" },
+            { "\xFE",         "a byte no UTF-8 sequence may contain" },
+        };
+        size_t i;
+        bool   all_refused = true;
+        bool   all_parse   = true;
+        char   refused_msg[128];
+
+        axl_snprintf(refused_msg, sizeof(refused_msg),
+                     "utf8 read: STRICT refuses every ill-formed shape — "
+                     "orphan, truncated, overlong, surrogate, out-of-range, "
+                     "impossible");
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            char          doc[32];
+
+            axl_snprintf(doc, sizeof(doc), "{\"k\":\"%s\"}", row[i].bytes);
+            if (axl_json_parse(doc, axl_strlen(doc), STRICT_UTF8, &r)
+                || axl_json_reader_error(&r)->code != AXL_JSON_ERR_BAD_UTF8) {
+                /* Name the ROW in the assertion text. An aggregate that
+                   says only "one of these eight" sends the next reader back
+                   to count them by hand, and the identifier is right here. */
+                if (all_refused) {
+                    axl_snprintf(refused_msg, sizeof(refused_msg),
+                                 "utf8 read: STRICT did NOT refuse: %s",
+                                 row[i].msg);
+                }
+                all_refused = false;
+            }
+            axl_json_free(&r);
+
+            /* And every one of them must still PARSE without STRICT, or the
+               check has leaked into the grammar. */
+            if (!axl_json_parse(doc, axl_strlen(doc), AXL_JSON_STRICT,
+                                      &r)) {
+                all_parse = false;
+            }
+            axl_json_free(&r);
+        }
+        test_check(all_refused, refused_msg);
+        test_check(all_parse,
+                   "utf8 read: and WITHOUT it every one of them still "
+                   "parses — the check did not leak into the grammar");
+    }
+
+    // --- a JSON5 COMMENT body is document bytes too -------------------------
+    // The reason this validates the whole document rather than its string
+    // tokens: a comment is the one other place arbitrary bytes survive
+    // lexing, skip_ws walks it looking only for the terminator, and the
+    // WRITER already repairs comment bodies. A token-only scan let these
+    // through, so the two sides disagreed about the same document.
+    {
+        AxlJsonReader      r;
+        const AxlJsonFlags j5 = AXL_JSON_JSON5 | AXL_JSON_UTF8_STRICT;
+
+        const char *blk = "{\"k\":1} /* \xC3 */";
+
+        test_check(!axl_json_parse(blk, axl_strlen(blk), j5, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_BAD_UTF8,
+                   "utf8 read: an ill-formed byte in a BLOCK comment is "
+                   "refused");
+        axl_json_free(&r);
+        test_check(!axl_json_parse("// \x80\n{\"k\":1}", 12, j5, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_BAD_UTF8,
+                   "utf8 read: and in a LINE comment, before the document "
+                   "even opens");
+        axl_json_free(&r);
+    }
+
+    // --- the reserved mode value is refused, not silently ignored -----------
+    // AXL_JSON_RELAXED already names UTF8_RAW, so `RELAXED | UTF8_STRICT` ORs
+    // to the reserved value 3. Left undefined that reads as "not STRICT" and
+    // hands back an unvalidated parse from a flags word that asked for
+    // validation — the feature disabled by the act of requesting it.
+    {
+        AxlJsonReader r;
+
+        test_check(!axl_json_parse("{\"k\":\"a\x80z\"}", 12,
+                                         AXL_JSON_RELAXED
+                                         | AXL_JSON_UTF8_STRICT, &r)
+                   && axl_json_reader_error(&r)->code
+                      == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "utf8 read: RELAXED | UTF8_STRICT is the RESERVED field "
+                   "value and is refused, never silently un-checked");
+        axl_json_free(&r);
+    }
+
+    // --- UTF-8 is checked BEFORE duplicate keys -----------------------------
+    // Pinned because it is a documented ordering, and because an ill-formed
+    // byte makes a key's decoded name meaningless — reporting a duplicate
+    // derived from one would be a worse answer, not merely a different one.
+    {
+        AxlJsonReader r;
+
+        const char *both = "{\"a\":1,\"a\":2,\"z\":\"\x80\"}";
+
+        test_check(!axl_json_parse(both, axl_strlen(both),
+                                         STRICT_UTF8
+                                         | AXL_JSON_REJECT_DUPLICATES, &r)
+                   && axl_json_reader_error(&r)->code == AXL_JSON_ERR_BAD_UTF8,
+                   "utf8 read: with BOTH checks on, the encoding error wins "
+                   "even though the duplicate comes first in the document");
+        axl_json_free(&r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON Iterator Aliasing (P11)
+// ---------------------------------------------------------------------------
+
+static void
+test_json_iter_aliasing(void)
+{
+    /* An iterator must not be retargeted by the caller REUSING the element
+       reader it was built from. The iterator used to store a raw
+       `const AxlJsonReader *` into the caller's struct and re-dereference it
+       on every next(), so the sequence below walked element 1's tokens with
+       element 0's indices — a silently wrong answer, with nothing freed and
+       nothing to fault on, which is why ASan and valgrind both see a clean
+       run. Found by design review, not by any test.
+
+       String elements because a bare number in an array is not readable yet;
+       the rest of P11 fixes that, and this has to land FIRST so
+       AxlJsonObjectIter does not mirror the broken shape. */
+    const char      *doc = "[[\"a\",\"b\"],[\"c\",\"d\"]]";
+    AxlJsonReader    r, elem, sub;
+    AxlJsonArrayIter outer, inner;
+    char             buf[8];
+
+    test_check(axl_json_parse(doc, axl_strlen(doc), AXL_JSON_RELAXED, &r)
+               && axl_json_value_array_begin(&r, &outer)
+               && axl_json_array_next(&outer, &elem),
+               "iter alias: an array of arrays yields its first element");
+
+    /* inner is built from elem while elem describes ["a","b"] ... */
+    test_check(axl_json_value_array_begin(&elem, &inner),
+               "iter alias: an inner iterator opens on that element");
+
+    /* ... and now the caller reuses elem for the NEXT outer element, which is
+       the ordinary way to walk an array and must not disturb `inner`.
+
+       Asserting that elem really was RETARGETED, not merely that next()
+       returned true: the retargeting IS the condition the assertions below
+       test against, so a regression that returned true without writing
+       `element` would leave elem describing ["a","b"], let every later
+       assertion pass, and report green having never built the scenario. */
+    {
+        AxlJsonArrayIter check;
+        AxlJsonReader    probe;
+        char             cbuf[8];
+
+        test_check(axl_json_array_next(&outer, &elem)
+                   && axl_json_value_array_begin(&elem, &check)
+                   && axl_json_array_next(&check, &probe)
+                   && axl_json_value_string(&probe, cbuf, sizeof(cbuf))
+                   && axl_strcmp(cbuf, "c") == 0,
+                   "iter alias: the outer walk retargets the element reader "
+                   "onto the second array");
+    }
+
+    test_check(axl_json_array_next(&inner, &sub)
+               && axl_json_value_string(&sub, buf, sizeof(buf))
+               && axl_strcmp(buf, "a") == 0,
+               "iter alias: the inner iterator still yields ITS array's first "
+               "element, not the reused reader's");
+    test_check(axl_json_array_next(&inner, &sub)
+               && axl_json_value_string(&sub, buf, sizeof(buf))
+               && axl_strcmp(buf, "b") == 0,
+               "iter alias: and its second, so the whole inner walk survives "
+               "the reuse");
+    test_check(!axl_json_array_next(&inner, &sub),
+               "iter alias: the inner iterator stops after its own two "
+               "elements");
+
+    axl_json_free(&r);
+
+    /* The same, entered by KEY. Every production call site in the tree uses
+       axl_json_array_begin rather than the root form — and none of them can
+       trigger the bug, because each finishes its inner loop before the outer
+       next() reuses the element reader, which is exactly why this stayed
+       latent long enough for a design review to find it rather than a user. */
+    {
+        const char      *keyed = "{\"a\":[[\"x\",\"y\"],[\"z\"]]}";
+        AxlJsonReader    kr, kelem, ksub;
+        AxlJsonArrayIter kouter, kinner;
+        char             kbuf[8];
+
+        test_check(axl_json_parse(keyed, axl_strlen(keyed), AXL_JSON_RELAXED, &kr)
+                   && axl_json_array_begin(&kr, "a", &kouter)
+                   && axl_json_array_next(&kouter, &kelem)
+                   && axl_json_value_array_begin(&kelem, &kinner)
+                   && axl_json_array_next(&kouter, &kelem)
+                   && axl_json_array_next(&kinner, &ksub)
+                   && axl_json_value_string(&ksub, kbuf, sizeof(kbuf))
+                   && axl_strcmp(kbuf, "x") == 0,
+                   "iter alias: the by-key entry point survives the reuse too");
+        axl_json_free(&kr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2058,7 +9235,7 @@ test_cache(void)
     /* NULL safety */
     test_check(axl_cache_new(0, 4, 100) == NULL, "cache: new zero slots");
     axl_cache_free(NULL);  /* no crash */
-    test_check(true, "cache: free(NULL) no crash");
+    test_survived("cache: free(NULL) no crash");
 
     axl_cache_free(c);
 }
@@ -2508,6 +9685,123 @@ test_rb_tree(void)
         axl_rb_erase(&t, it);
     }
     test_check(axl_rb_tree_is_empty(&t), "rbtree: empty after erasing all");
+    test_check(axl_rb_check_invariants(&t), "rbtree: empty tree passes invariants");
+    test_check(axl_rb_black_height(&t) == 0, "rbtree: empty tree black height 0");
+
+    /* EXACT, not a bound. The bound below is so slack that an off-by-one
+       passed it unnoticed -- the function counted the NULL leaf and so
+       returned bh+1, never 1, jumping 0 -> 2. A single black root is 1. */
+    AxlRBTree t1;
+    axl_rb_tree_init(&t1, NULL, NULL);
+    rb_pool2[0].key = 42;
+    rb_pool2[0].val = 42;
+    rb_insert_key(&t1, &rb_pool2[0]);
+    test_check(axl_rb_black_height(&t1) == 1,
+               "rbtree: a single black root has black height exactly 1");
+    test_check(axl_rb_check_invariants(&t1), "rbtree: one-node tree is valid");
+    axl_rb_erase(&t1, &rb_pool2[0].node);
+    test_check(axl_rb_black_height(&t1) == 0,
+               "rbtree: back to 0 after erasing the only node");
+
+    /* The DEPTH bound. rb_check recurses per level, and its job is to run on
+       CORRUPT input -- where height is unbounded -- on a small UEFI stack. A
+       hand-built degenerate left spine must be REFUSED, not recursed into
+       until the stack gives out. */
+    AxlRBTree deep;
+    axl_rb_tree_init(&deep, NULL, NULL);
+    deep.root = &rb_pool[0].node;
+    rb_pool[0].node.parent = NULL;
+    rb_pool[0].node.left = NULL;
+    rb_pool[0].node.right = NULL;
+    rb_pool[0].node.color = AXL_RB_BLACK;
+    for (size_t d = 1; d < 300; d++) {
+        rb_pool[d].node.parent = &rb_pool[d - 1].node;
+        rb_pool[d].node.left   = NULL;
+        rb_pool[d].node.right  = NULL;
+        rb_pool[d].node.color  = AXL_RB_BLACK;
+        rb_pool[d - 1].node.left = &rb_pool[d].node;
+    }
+    test_check(!axl_rb_check_invariants(&deep),
+               "rbtree: a 300-deep spine is REFUSED, not recursed into");
+
+    /* The public invariant checker. Every test above this point verifies the
+       tree by IN-ORDER WALK, which proves it is sorted and says nothing about
+       whether it is balanced -- a tree degenerated into a linked list answers
+       every one of them correctly. Rebuild and check the structure itself,
+       after every single mutation, so a rebalancing bug is localised to the
+       operation that caused it. */
+    AxlRBTree ti;
+    axl_rb_tree_init(&ti, NULL, NULL);
+    uint32_t ilcg = 987u;
+    size_t   icount = 0;
+    bool     all_ok = true;
+    for (int attempts = 0; icount < 300 && attempts < 100000; attempts++) {
+        ilcg = ilcg * 1103515245u + 12345u;
+        int key = (int)((ilcg >> 8) % 100000u);
+        bool dup = false;
+        for (size_t j = 0; j < icount; j++) {
+            if (rb_pool[j].key == key) { dup = true; break; }
+        }
+        if (dup) { continue; }
+        rb_pool[icount].key = key;
+        rb_pool[icount].val = (int)icount;
+        rb_insert_key(&ti, &rb_pool[icount]);
+        icount++;
+        if (!axl_rb_check_invariants(&ti)) { all_ok = false; break; }
+    }
+    test_check(all_ok && icount == 300,
+               "rbtree: invariants hold after every one of 300 inserts");
+
+    /* Black height must stay within the red-black bound, 2*log2(n+1). For
+       n=300 that is 16 -- a tree drifting toward degenerate breaks this long
+       before it breaks an invariant. */
+    int bh = axl_rb_black_height(&ti);
+    test_check(bh > 0 && bh <= 16,
+               "rbtree: black height within the 2*log2(n+1) bound");
+
+    all_ok = true;
+    for (size_t i = 0; i < 300; i += 3) {
+        axl_rb_erase(&ti, &rb_pool[i].node);
+        if (!axl_rb_check_invariants(&ti)) { all_ok = false; break; }
+    }
+    test_check(all_ok, "rbtree: invariants hold after every erase");
+
+    /* POSITIVE CONTROL. A checker that always returned true would have passed
+       everything above. Corrupt one colour and it must say so -- then put it
+       back, because the tree is reused below. */
+    AxlRBNode *victim = axl_rb_first(&ti);
+    while (victim != NULL && victim->color != AXL_RB_BLACK) {
+        victim = axl_rb_next(victim);
+    }
+    if (victim != NULL) {
+        victim->color = AXL_RB_RED;
+        test_check(!axl_rb_check_invariants(&ti),
+                   "rbtree: checker DETECTS a corrupted colour");
+        victim->color = AXL_RB_BLACK;
+        test_check(axl_rb_check_invariants(&ti),
+                   "rbtree: checker passes again once restored");
+    } else {
+        test_check(false, "rbtree: no black node found for the control");
+    }
+
+    /* A severed parent link is the other corruption class -- structure
+       rather than colour. */
+    AxlRBNode *child = ti.root->left != NULL ? ti.root->left : ti.root->right;
+    if (child != NULL) {
+        AxlRBNode *saved = child->parent;
+        child->parent = NULL;
+        test_check(!axl_rb_check_invariants(&ti),
+                   "rbtree: checker DETECTS a severed parent link");
+        child->parent = saved;
+        test_check(axl_rb_check_invariants(&ti),
+                   "rbtree: checker passes again once relinked");
+    } else {
+        test_check(false, "rbtree: root had no child for the control");
+    }
+
+    while ((it = axl_rb_first(&ti)) != NULL) {
+        axl_rb_erase(&ti, it);
+    }
 
     // NULL recompute = plain balanced tree (no augmentation work).
     AxlRBTree t2;
@@ -2789,7 +10083,7 @@ test_radix_tree(void)
     test_check(axl_radix_tree_lookup(NULL, "x") == NULL, "radix: lookup NULL tree");
     test_check(axl_radix_tree_insert(NULL, "x", NULL) == AXL_ERR, "radix: insert NULL tree");
     axl_radix_tree_free(NULL);
-    test_check(true, "radix: free(NULL) no crash");
+    test_survived("radix: free(NULL) no crash");
 
     axl_radix_tree_free(t);
 }
@@ -3742,7 +11036,7 @@ test_ring_buf(void)
     test_check(axl_ring_buf_new(0) == NULL, "ring: new(0) returns NULL");
     test_check(axl_ring_buf_get_readable(NULL) == 0, "ring: readable(NULL)");
     axl_ring_buf_free(NULL);
-    test_check(true, "ring: free(NULL) no crash");
+    test_survived("ring: free(NULL) no crash");
 
     axl_ring_buf_free(rb);
 }
@@ -4955,6 +12249,13 @@ test_compress_writer(void)
                "compress writer: finish on non-writer rejected");
     axl_fclose(plainbuf);
 
+    /* ... and on no stream at all. The NULL guard used to be written out in
+       axl_compress_writer_finish; it now rides on axl_stream_ctx refusing a
+       NULL stream, so it is worth an assertion of its own rather than trust
+       in a call one layer down. */
+    test_check(axl_compress_writer_finish(NULL) == AXL_ERR,
+               "compress writer: finish on NULL rejected");
+
     /* Implicit finalize on close: no explicit finish, fclose must flush
        a valid stream to the sink. Sink is closed after the writer. */
     AxlStream *sink2 = axl_bufopen();
@@ -4973,6 +12274,134 @@ test_compress_writer(void)
         axl_free(plain);
     }
     axl_fclose(sink2);
+}
+
+/* The compressing writer is built through the PUBLIC axl_stream_open_custom,
+   so its stream owns a heap COPY of the label "compress" rather than pointing
+   at a literal, and axl_fclose has to release that as well as the context. No
+   other assertion in this file can see the difference -- the round-trips above
+   pass identically whether or not the label leaks -- so it needs its own.
+
+   The sink is inside the measured window on purpose: close finalizes, which
+   compresses into the sink, so the sink's own growth is part of what has to
+   come back. Everything opened here is closed here, so the count must land
+   exactly on its baseline. */
+static void
+test_compress_writer_ownership(void)
+{
+    const char  *data = "ownership payload ownership payload ownership payl";
+    AxlMemStats  before, after;
+    AxlStream   *sink;
+    AxlStream   *w;
+
+    /* Warm the codec's first-use state so the baseline is steady state. */
+    sink = axl_bufopen();
+    w    = axl_gzip_writer(sink, AXL_COMPRESS_LEVEL_DEFAULT);
+    axl_write(w, data, 50);
+    axl_fclose(w);
+    axl_fclose(sink);
+
+    axl_mem_get_stats(&before);
+    sink = axl_bufopen();
+    w    = axl_gzip_writer(sink, AXL_COMPRESS_LEVEL_DEFAULT);
+    test_check(w != NULL, "compown: open a compressing writer");
+    if (w != NULL) {
+        axl_write(w, data, 50);
+        axl_fclose(w);
+    }
+    axl_fclose(sink);
+    axl_mem_get_stats(&after);
+
+    test_check(after.count == before.count,
+               "compown: writer open+close returns the allocation count to baseline");
+    test_check(after.bytes == before.bytes,
+               "compown: ... and the allocated bytes with it");
+}
+
+/* The filter rule from axl-stream.h, on the compressing pair: a peer that
+   transcodes rewrites DEFLATE bytes code point by code point, so the filter
+   refuses one rather than producing an archive nothing can read while every
+   call reports success. The writer checks twice -- at construction, and again
+   when it finalizes, because that is when the sink is actually written. */
+static void
+test_compress_filters_refuse_a_transcoding_peer(void)
+{
+    const char *data = "payload for the transcoding-peer checks";
+    size_t      len  = 39;
+    AxlStream  *sink;
+    AxlStream  *src;
+    AxlStream  *w;
+    size_t      n;
+
+    /* 1) A writer over a sink that transcodes is refused at construction,
+          and the refusal is inert -- the sink keeps its setting and is
+          still usable. */
+    sink = axl_bufopen();
+    axl_stream_set_encoding(sink, AXL_ENC_UCS2_LE);
+    test_check(axl_gzip_writer(sink, AXL_COMPRESS_LEVEL_DEFAULT) == NULL,
+               "compfilter: a writer over a transcoding sink is refused");
+    test_check(axl_stream_get_encoding(sink) == AXL_ENC_UCS2_LE,
+               "compfilter: and the refusal leaves the sink's encoding alone");
+    axl_fclose(sink);
+
+    /* 2) A reader over a source that transcodes is refused on the same
+          terms -- the mirror, and the one that would otherwise report a
+          decode error that says nothing about the real cause. The source
+          holds a VALID gzip member, so a NULL here can only be the refusal:
+          feeding junk would have returned NULL for the ordinary decode
+          reason and proved nothing. */
+    {
+        void   *gz  = NULL;
+        size_t  gzn = 0;
+        AxlStream *r;
+
+        test_check(axl_compress(AXL_COMPRESS_GZIP, data, len,
+                                AXL_COMPRESS_LEVEL_DEFAULT, &gz, &gzn) == AXL_OK,
+                   "compfilter: fixture -- a real gzip member to feed it");
+        src = axl_bufopen();
+        axl_write(src, gz, gzn);
+        axl_free(gz);
+        axl_fseek(src, 0, AXL_SEEK_SET);
+
+        axl_stream_set_encoding(src, AXL_ENC_UCS2_LE);
+        test_check(axl_gzip_reader(src) == NULL,
+                   "compfilter: a reader over a transcoding source is refused");
+        /* A NULL alone does not distinguish "refused" from "drained the
+           source, transcoded it into rubble and failed to decode it" -- the
+           unfixed path returns NULL too. The source's POSITION does: a
+           refusal never reads it. */
+        test_check(axl_ftell(src) == 0 && axl_feof(src) == false,
+                   "compfilter: and it did not read the source to find out");
+
+        /* Same bytes, same position, encoding cleared -- it decodes. That is
+           what makes the line above measure the refusal and not the data. */
+        axl_stream_set_encoding(src, AXL_ENC_UTF8);
+        axl_fseek(src, 0, AXL_SEEK_SET);
+        r = axl_gzip_reader(src);
+        test_check(r != NULL,
+                   "compfilter: and the same source undecoded reads fine");
+        axl_fclose(r);
+        axl_fclose(src);
+    }
+
+    /* 3) The sink can acquire an encoding AFTER the writer was built, and
+          finalize is the moment the bytes actually move -- so it checks
+          again, and refuses rather than emitting a corrupt member. */
+    sink = axl_bufopen();
+    w    = axl_gzip_writer(sink, AXL_COMPRESS_LEVEL_DEFAULT);
+    test_check(w != NULL, "compfilter: a writer over a clean sink is built");
+    if (w != NULL) {
+        axl_write(w, data, len);
+        axl_stream_set_encoding(sink, AXL_ENC_UCS2_LE);
+        test_check(axl_compress_writer_finish(w) == AXL_ERR,
+                   "compfilter: finish refuses a sink that gained an encoding");
+        n = 0;
+        axl_bufdata(sink, &n);
+        test_check(n == 0, "compfilter: and nothing corrupt was written to it");
+        axl_stream_set_encoding(sink, AXL_ENC_UTF8);
+        axl_fclose(w);
+    }
+    axl_fclose(sink);
 }
 
 static void
@@ -5308,6 +12737,297 @@ test_hash_get_keys_values(void)
     axl_hash_table_free(t);
 }
 
+// ---------------------------------------------------------------------------
+// axl_array_sized_new / axl_array_steal / element-cleanup hooks
+//
+// Closer alignment with GArray. steal has g_array_steal semantics — the array
+// is EMPTIED, not destroyed — and out_len is an ELEMENT COUNT, which is where
+// an element-vs-byte confusion would show up.
+// ---------------------------------------------------------------------------
+
+// Cleanup-hook probes. Counters are file-static so the callbacks can be plain
+// functions matching AxlDestroyNotify.
+static int  ck_calls;
+static int  ck_sum;      // sum of the int VALUES the value-mode hook saw
+static void *ck_last_ptr;
+
+static void
+ck_value_hook(void *slot)
+{
+    ck_calls++;
+    ck_sum += *(int *)slot;   // slot points AT the element
+}
+
+static void
+ck_ptr_hook(void *stored)
+{
+    ck_calls++;
+    ck_last_ptr = stored;     // the STORED pointer, not the slot
+}
+
+static void
+ck_reset(void)
+{
+    ck_calls = 0;
+    ck_sum = 0;
+    ck_last_ptr = NULL;
+}
+
+static void
+test_array_sized_steal_clear(void)
+{
+    AxlArray *a;
+    size_t    n;
+    int       v;
+
+    // --- axl_array_sized_new -------------------------------------------
+    AxlMemStats m0, m1;
+    size_t      sized_allocs, unsized_allocs;
+
+    // Count ALLOCATIONS, not just correctness. Contents-survive assertions
+    // pass just as well against a sized_new that ignores `reserved`, so they
+    // pin nothing; the whole point of the hint is the regrow chain it removes.
+    axl_mem_get_stats(&m0);
+    a = axl_array_sized_new(sizeof(int), 1000);
+    for (v = 0; v < 1000; v++) {
+        axl_array_append(a, &v);
+    }
+    axl_mem_get_stats(&m1);
+    sized_allocs = m1.total_count - m0.total_count;
+    test_check(a != NULL && axl_array_len(a) == 1000
+               && *(int *)axl_array_get(a, 0) == 0
+               && *(int *)axl_array_get(a, 999) == 999,
+               "array sized_new: 1000 appends land in order");
+    axl_array_free(a);
+
+    axl_mem_get_stats(&m0);
+    a = axl_array_new(sizeof(int));
+    for (v = 0; v < 1000; v++) {
+        axl_array_append(a, &v);
+    }
+    axl_mem_get_stats(&m1);
+    unsized_allocs = m1.total_count - m0.total_count;
+    axl_array_free(a);
+
+    // Exactly two: the struct and one buffer. No grow-and-copy at all.
+    test_check(sized_allocs == 2,
+               "array sized_new: 1000 appends cost 2 allocations, zero regrows");
+    test_check(unsized_allocs > sized_allocs,
+               "array sized_new: the unsized array really does regrow (control)");
+
+    a = axl_array_sized_new(sizeof(int), 1000);
+    test_check(a != NULL && axl_array_len(a) == 0,
+               "array sized_new: reserves capacity but starts EMPTY");
+    axl_array_free(a);
+
+    // `reserved` is caller-controlled, so reserved * element_size must not be
+    // allowed to wrap. It used to: axl_calloc(1, cap * es) hid the product
+    // from axl_calloc's own guard, so the array kept the huge capacity while
+    // holding a tiny buffer and the FIRST append wrote past it.
+    test_check(axl_array_sized_new(16, (SIZE_MAX / 16) + 1) == NULL,
+               "array sized_new: a reserved*element_size overflow is refused");
+    test_check(axl_array_sized_new(2, SIZE_MAX) == NULL,
+               "array sized_new: SIZE_MAX elements is refused, not wrapped");
+
+    a = axl_array_sized_new(sizeof(int), 0);
+    v = 7;
+    test_check(a != NULL && axl_array_append(a, &v) == AXL_OK
+               && axl_array_len(a) == 1,
+               "array sized_new: reserved 0 behaves like axl_array_new");
+    axl_array_free(a);
+    test_check(axl_array_sized_new(0, 16) == NULL,
+               "array sized_new: element_size 0 is rejected");
+
+    // --- axl_array_steal -----------------------------------------------
+    // Element size deliberately > 1 so out_len being a BYTE count would show.
+    a = axl_array_new(sizeof(int64_t));
+    int64_t w;
+    w = 10; axl_array_append(a, &w);
+    w = 20; axl_array_append(a, &w);
+    w = 30; axl_array_append(a, &w);
+
+    n = 999;
+    int64_t *stolen = axl_array_steal(a, &n);
+    test_check(stolen != NULL && n == 3,
+               "array steal: out_len is the ELEMENT count, not bytes (3, not 24)");
+    test_check(stolen != NULL && stolen[0] == 10 && stolen[1] == 20 && stolen[2] == 30,
+               "array steal: the handed-back block holds the elements");
+    test_check(axl_array_len(a) == 0,
+               "array steal: the array is left EMPTY");
+
+    // g_array_steal, not g_array_free(arr, FALSE): still valid, still usable.
+    w = 40;
+    test_check(axl_array_append(a, &w) == AXL_OK
+               && axl_array_len(a) == 1
+               && *(int64_t *)axl_array_get(a, 0) == 40,
+               "array steal: the array stays VALID and reusable afterwards");
+    // The stolen block is independent of the array's new buffer.
+    test_check(stolen[0] == 10,
+               "array steal: the stolen block is unaffected by later appends");
+    axl_free(stolen);
+
+    // Steal twice in a row — the second must not hand back the first block.
+    void *s1 = axl_array_steal(a, &n);
+    test_check(n == 1, "array steal: second steal reports the new length");
+    n = 999;
+    void *s2 = axl_array_steal(a, &n);
+    test_check(n == 0, "array steal: stealing an already-emptied array gives len 0");
+    test_check(s2 == NULL,
+               "array steal: a second steal hands back NULL, never the first block");
+    axl_free(s1);
+    axl_free(s2);
+    axl_array_free(a);
+
+    // Steal from a freshly-created array. Note this is NOT the buffer-less
+    // path — construction always allocates — it is the length-0 path.
+    a = axl_array_new(sizeof(int));
+    n = 999;
+    void *empty = axl_array_steal(a, &n);
+    test_check(n == 0, "array steal: empty array reports 0 elements");
+    axl_free(empty);
+    test_check(axl_array_steal(a, NULL) == NULL,
+               "array steal: a NULL out_len is accepted (already-stolen gives NULL)");
+    axl_array_free(a);
+    test_check(axl_array_steal(NULL, &n) == NULL,
+               "array steal: NULL array yields NULL");
+
+    // --- value-mode clear hook, on EVERY discarding path ----------------
+    // free
+    ck_reset();
+    a = axl_array_new(sizeof(int));
+    v = 1; axl_array_append(a, &v);
+    v = 2; axl_array_append(a, &v);
+    axl_array_set_clear_func(a, ck_value_hook);
+    axl_array_free(a);
+    test_check(ck_calls == 2 && ck_sum == 3, "array clear_func: runs on free");
+
+    // clear
+    ck_reset();
+    a = axl_array_new(sizeof(int));
+    axl_array_set_clear_func(a, ck_value_hook);
+    v = 4; axl_array_append(a, &v);
+    v = 5; axl_array_append(a, &v);
+    axl_array_clear(a);
+    test_check(ck_calls == 2 && ck_sum == 9 && axl_array_len(a) == 0,
+               "array clear_func: runs on clear");
+
+    // remove_index
+    ck_reset();
+    v = 6; axl_array_append(a, &v);
+    v = 7; axl_array_append(a, &v);
+    axl_array_remove_index(a, 0);
+    test_check(ck_calls == 1 && ck_sum == 6,
+               "array clear_func: runs on remove_index, for the removed element");
+
+    // remove_index_fast
+    ck_reset();
+    v = 8; axl_array_append(a, &v);          // [7,8]
+    axl_array_remove_index_fast(a, 0);       // discards 7
+    test_check(ck_calls == 1 && ck_sum == 7,
+               "array clear_func: runs on remove_index_fast");
+
+    // remove_range
+    ck_reset();
+    axl_array_clear(a);
+    ck_reset();
+    v = 1; axl_array_append(a, &v);
+    v = 2; axl_array_append(a, &v);
+    v = 3; axl_array_append(a, &v);
+    axl_array_remove_range(a, 0, 2);
+    test_check(ck_calls == 2 && ck_sum == 3,
+               "array clear_func: runs on remove_range, once per element");
+
+    // shrinking set_size discards; growing set_size must NOT
+    ck_reset();
+    axl_array_clear(a);
+    ck_reset();
+    v = 5; axl_array_append(a, &v);
+    v = 6; axl_array_append(a, &v);
+    axl_array_set_size(a, 1);
+    test_check(ck_calls == 1 && ck_sum == 6,
+               "array clear_func: runs on a SHRINKING set_size");
+    ck_reset();
+    axl_array_set_size(a, 8);
+    test_check(ck_calls == 0, "array clear_func: does NOT run on a growing set_size");
+
+    // steal transfers ownership, so it must NOT run the hook
+    ck_reset();
+    axl_array_set_size(a, 0);
+    ck_reset();
+    v = 9; axl_array_append(a, &v);
+    void *taken = axl_array_steal(a, &n);
+    test_check(ck_calls == 0 && n == 1,
+               "array clear_func: does NOT run on steal (ownership transfers)");
+    axl_free(taken);
+    axl_array_free(a);
+
+    // --- pointer-mode free hook -----------------------------------------
+    // The hook must receive the STORED pointer, not the slot's address. If it
+    // got the slot, passing axl_free would free into the array's own buffer.
+    ck_reset();
+    a = axl_array_new(sizeof(void *));
+    test_check(axl_array_set_ptr_free_func(a, ck_ptr_hook) == AXL_OK,
+               "array ptr_free_func: accepted on a pointer-mode array");
+    char *owned = axl_malloc(8);
+    axl_array_append_ptr(a, owned);
+    void *slot_addr = axl_array_get(a, 0);
+    axl_array_clear(a);
+    test_check(ck_calls == 1 && ck_last_ptr == owned && ck_last_ptr != slot_addr,
+               "array ptr_free_func: receives the STORED pointer, not the slot");
+    axl_free(owned);
+    axl_array_free(a);
+
+    // Real ownership over REAL heap pointers, with the release actually
+    // observed. An earlier draft of this block ran axl_free_impl and asserted
+    // nothing at all — stubbing set_ptr_free_func to ignore its argument left
+    // it green. Count the frees AND release for real, so both halves are
+    // pinned: allocations outstanding must return to the pre-block level.
+    // (a) The hook runs once per stored element. Sentinel pointers, never
+    // dereferenced or freed, so this block owns nothing.
+    ck_reset();
+    a = axl_array_new(sizeof(void *));
+    axl_array_set_ptr_free_func(a, ck_ptr_hook);
+    axl_array_append_ptr(a, (void *)0x1000);
+    axl_array_append_ptr(a, (void *)0x2000);
+    axl_array_clear(a);
+    test_check(ck_calls == 2,
+               "array ptr_free_func: hook runs once per stored pointer");
+    axl_array_free(a);
+
+    // (b) Real ownership over REAL heap pointers, with the release OBSERVED.
+    // An earlier draft ran axl_free_impl and asserted nothing — stubbing
+    // set_ptr_free_func to ignore its argument left it green. Balancing the
+    // live-allocation count is what makes the free itself load-bearing.
+    AxlMemStats o0, o1;
+    axl_mem_get_stats(&o0);
+    a = axl_array_new(sizeof(void *));
+    axl_array_set_ptr_free_func(a, axl_free_impl);
+    axl_array_append_ptr(a, axl_malloc(16));
+    axl_array_append_ptr(a, axl_malloc(16));
+    axl_array_free(a);
+    axl_mem_get_stats(&o1);
+    test_check(o1.count == o0.count,
+               "array ptr_free_func: axl_free_impl really releases the elements");
+
+    // A value-mode array is REJECTED rather than reinterpreted.
+    a = axl_array_new(sizeof(int));
+    test_check(axl_array_set_ptr_free_func(a, axl_free_impl) == AXL_ERR,
+               "array ptr_free_func: rejected when element_size != sizeof(void*)");
+    test_check(axl_array_set_ptr_free_func(NULL, axl_free_impl) == AXL_ERR,
+               "array ptr_free_func: NULL array is rejected");
+    axl_array_free(a);
+
+    // Setting either hook replaces the other; NULL clears.
+    ck_reset();
+    a = axl_array_new(sizeof(void *));
+    axl_array_set_ptr_free_func(a, ck_ptr_hook);
+    axl_array_set_clear_func(a, NULL);
+    axl_array_append_ptr(a, (void *)0x1234);
+    axl_array_clear(a);
+    test_check(ck_calls == 0, "array hooks: setting NULL clears a previously set hook");
+    axl_array_free(a);
+}
+
 static void
 test_array_insert_prepend(void)
 {
@@ -5632,6 +13352,1610 @@ test_bytes_slice(void)
     axl_bytes_unref(s2);   // releases s1 -> p2 in turn
 }
 
+// ---------------------------------------------------------------------------
+// Pull scanner (P12)
+// ---------------------------------------------------------------------------
+
+/* Render a whole scan as one line: `{@0/d0 KEY(a)@1/d1 ...`.
+ *
+ * A single exact-string assertion over the WHOLE event stream, rather than one
+ * per event. Kind, text, offset and depth all have to be right simultaneously
+ * or the line differs -- and per CLAUDE.md an exact whole-document assertion is
+ * what a substring check would let slip. */
+/* Append to @a out, refusing rather than overflowing.
+ *
+ * axl_snprintf returns the length it WOULD have written, so the natural
+ * `n += axl_snprintf(...)` walks n past the buffer and hands the next call
+ * `out + n` (out of bounds) with an underflowed size. It does not fire on
+ * today's short fixtures, which is precisely why it would first surface in
+ * UEFI, with no guard page, on some later longer one.
+ *
+ * @return false when the text did not fit, so a truncated render can never be
+ *     compared as if it were the whole scan. */
+static bool
+scan_put(char *out, size_t size, size_t *n, const char *fmt, ...)
+{
+    va_list ap;
+    int     w;
+
+    if (*n >= size) {
+        return false;
+    }
+    va_start(ap, fmt);
+    w = axl_vsnprintf(out + *n, size - *n, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= size - *n) {
+        return false;
+    }
+    *n += (size_t)w;
+    return true;
+}
+
+/* Drain a scanner into @a out. Shared by the contiguous and the pull-mode
+ * checks below, so a chunking differential compares two SCANS rather than two
+ * renderers. */
+static bool
+scan_drain(AxlJsonScanner *s, char *out, size_t size)
+{
+    AxlJsonEvent ev;
+    size_t       n = 0;
+
+    out[0] = '\0';
+    while (axl_json_scanner_next(s, &ev)) {
+        static const char *kinds[] = { "EOF", "{", "}", "[", "]",
+                                       "KEY", "STR", "NUM", "BOOL", "NUL" };
+
+        if (!scan_put(out, size, &n, "%s", kinds[ev.kind])
+            || (ev.text != NULL
+                && !scan_put(out, size, &n, "(%.*s)", (int)ev.len, ev.text))
+            || !scan_put(out, size, &n, "@%u/d%u ", (unsigned)ev.offset,
+                         ev.depth)) {
+            return false;
+        }
+    }
+    /* The final verdict rides along, so a scan that STOPPED early cannot
+       compare equal to one that finished.
+     *
+     * The POSITION rides along only on a failure, and that asymmetry is
+     * deliberate rather than lazy: a successful scan leaves the record
+     * zeroed, so appending "@0 0:0" to every passing row would be noise --
+     * while on a failure the offset, line and column are the whole point, and
+     * they are what the chunking differential below compares. A scan that
+     * carried line and column wrongly across a refill differs HERE and
+     * nowhere else. */
+    {
+        const AxlJsonError *e = axl_json_scanner_error(s);
+
+        if (e->code == AXL_JSON_OK) {
+            return scan_put(out, size, &n, "|e0");
+        }
+        /* missing_flag rides along too. Without it a reclassification that
+           kept the CODE and dropped the remedy -- exactly what lex_fail's
+           window rule does when it fires -- is invisible to this oracle and
+           to the chunking differential built on it. */
+        return scan_put(out, size, &n, "|e%d@%u %u:%u f%llx", (int)e->code,
+                        (unsigned)e->offset, e->line, e->column,
+                        (unsigned long long)e->missing_flag);
+    }
+}
+
+static void
+scan_check(const char *doc, AxlJsonFlags flags, const char *want,
+           const char *msg)
+{
+    AxlJsonSource  src;
+    AxlJsonScanner s;
+    char           out[1024];
+
+    axl_json_source_init_mem(&src, doc, axl_strlen(doc));
+    if (!axl_json_scanner_init(&s, &src, flags)) {
+        test_check(false, msg);
+        return;
+    }
+    test_check(scan_drain(&s, out, sizeof(out))
+                   && axl_strcmp(out, want) == 0, msg);
+    axl_json_scanner_free(&s);
+}
+
+/* A pull source that hands back at most @c chunk bytes per call.
+ *
+ * @c calls is counted so a test can assert the scanner asked more than once
+ * -- otherwise a "chunked" fixture whose chunk exceeded the document would
+ * silently be testing the contiguous path under another name. */
+typedef struct {
+    const char *data;
+    size_t      len;
+    size_t      pos;
+    size_t      chunk;
+    unsigned    calls;
+    axl_ssize_t fail_at;   /* return -1 on this call (1-based), 0 to never */
+    bool        overclaim; /* report more bytes than were written */
+} ChunkSrc;
+
+static axl_ssize_t
+chunk_read(void *ctx, void *buf, size_t max)
+{
+    ChunkSrc *cs = (ChunkSrc *)ctx;
+    size_t    n;
+
+    cs->calls++;
+    if (cs->fail_at != 0 && (axl_ssize_t)cs->calls == cs->fail_at) {
+        return -1;
+    }
+    n = cs->len - cs->pos;
+    if (n > max) {
+        n = max;
+    }
+    if (n > cs->chunk) {
+        n = cs->chunk;
+    }
+    if (n > 0) {
+        axl_memcpy(buf, cs->data + cs->pos, n);
+    }
+    cs->pos += n;
+    if (cs->overclaim) {
+        /* Widened BEFORE the add, not after: `(axl_ssize_t)(max + 1)`
+           computes in size_t and casts the result, which clang-tidy flags as
+           either ineffective or lossy -- and on a max of SIZE_MAX it would
+           wrap to 0 rather than over-report. */
+        return (axl_ssize_t)max + 1;   /* a lie the scanner must refuse */
+    }
+    return (axl_ssize_t)n;
+}
+
+/* Scan @a doc through a pull source delivering @a chunk bytes per read, and
+ * render the result exactly as the contiguous path renders it. */
+static bool
+scan_pull(const char *doc, AxlJsonFlags flags, size_t chunk, char *out,
+          size_t size, unsigned *out_calls)
+{
+    AxlJsonSource  src;
+    AxlJsonScanner s;
+    ChunkSrc       cs;
+    bool           ok;
+
+    axl_memset(&cs, 0, sizeof(cs));
+    cs.data  = doc;
+    cs.len   = axl_strlen(doc);
+    cs.chunk = chunk;
+
+    /* hint deliberately left 0: it is an expected TOTAL, and the window must
+       not be sized from it. */
+    axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+    if (!axl_json_scanner_init(&s, &src, flags)) {
+        return false;
+    }
+    ok = scan_drain(&s, out, size);
+    axl_json_scanner_free(&s);
+    if (out_calls != NULL) {
+        *out_calls = cs.calls;
+    }
+    return ok;
+}
+
+/* A digest of a whole scan: a count per event kind, an FNV-1a over every
+ * event's offset, depth and text, and the final error record.
+ *
+ * The render above is better to read and is what pins small documents. This
+ * exists for documents BIGGER than the scanner's window, where a full render
+ * would not fit in any reasonable buffer -- and those are the only documents
+ * that exercise straddling at all, so it is not an optional extra.
+ *
+ * Sensitive to one byte moving anywhere, and compared only against the
+ * CONTIGUOUS digest of the same document, which the assertions above already
+ * pin. */
+static bool
+scan_digest(AxlJsonScanner *s, char *out, size_t size)
+{
+    unsigned            counts[10];
+    uint32_t            h = 2166136261u;
+    AxlJsonEvent        ev;
+    const AxlJsonError *e;
+    size_t              i;
+    size_t              n = 0;
+
+    axl_memset(counts, 0, sizeof(counts));
+    while (axl_json_scanner_next(s, &ev)) {
+        if ((size_t)ev.kind < sizeof(counts) / sizeof(counts[0])) {
+            counts[ev.kind]++;
+        }
+        h = (h ^ (uint32_t)ev.offset) * 16777619u;
+        h = (h ^ ev.depth)            * 16777619u;
+        h = (h ^ (uint32_t)ev.len)    * 16777619u;
+        for (i = 0; i < ev.len; i++) {
+            h = (h ^ (unsigned char)ev.text[i]) * 16777619u;
+        }
+    }
+    for (i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        if (!scan_put(out, size, &n, "%u,", counts[i])) {
+            return false;
+        }
+    }
+    e = axl_json_scanner_error(s);
+    return scan_put(out, size, &n, "h%08x|e%d@%u %u:%u f%llx", (unsigned)h,
+                    (int)e->code, (unsigned)e->offset, e->line, e->column,
+                    (unsigned long long)e->missing_flag);
+}
+
+/* Compare pull against contiguous for a document too big to render whole.
+ *
+ * This is the sweep that actually reaches the straddling path. The window is
+ * at least a kilobyte and a refill FILLS it, so every fixture shorter than
+ * that is delivered entire on the first refill and never straddles anything
+ * -- the chunk size only changes how many times the source is called. Proven
+ * the hard way: removing the at-end-of-input guard from parse_number left the
+ * small-document sweep completely green. */
+static void
+scan_big_sweep(const char *doc, AxlJsonFlags flags, const char *label)
+{
+    static const size_t chunks[] = { 1, 7, 64, 997, 4096 };
+    AxlJsonSource  src;
+    AxlJsonScanner s;
+    ChunkSrc       cs;
+    char           want[128];
+    size_t         i;
+
+    axl_json_source_init_mem(&src, doc, axl_strlen(doc));
+    if (!axl_json_scanner_init(&s, &src, flags)
+        || !scan_digest(&s, want, sizeof(want))) {
+        axl_json_scanner_free(&s);
+        test_check(false, label);
+        return;
+    }
+    axl_json_scanner_free(&s);
+
+    for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        char got[128];
+        char msg[192];
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data  = doc;
+        cs.len   = axl_strlen(doc);
+        cs.chunk = chunks[i];
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_snprintf(msg, sizeof(msg), "%s [chunk %u]", label,
+                           (unsigned)chunks[i]);
+        if (!axl_json_scanner_init(&s, &src, flags)) {
+            test_check(false, msg);
+            continue;
+        }
+        test_check(scan_digest(&s, got, sizeof(got))
+                       && axl_strcmp(got, want) == 0, msg);
+        axl_json_scanner_free(&s);
+    }
+}
+
+/* THE P13 test: the event stream must not depend on the chunking.
+ *
+ * Swept, not hand-picked. Chunk size 1 is the one that matters -- it puts
+ * EVERY byte on a refill boundary, so a leaf that mistakes the end of the
+ * window for the end of the input fails immediately and at the first token,
+ * rather than at whatever offset a 4096 happens to land on. The larger sizes
+ * are there because a bug in the compaction arithmetic hides at chunk 1
+ * (nothing ever straddles by more than a byte).
+ *
+ * The comparison is against the CONTIGUOUS render of the same bytes, so this
+ * asserts the property rather than a transcription of it -- and it covers the
+ * error offset, line and column too, which is where a botched line/column
+ * carry across a refill shows up and nowhere else. */
+static void
+scan_chunk_sweep(const char *doc, AxlJsonFlags flags, const char *label)
+{
+    static const size_t chunks[] = { 1, 2, 3, 5, 7, 64, 4096 };
+    AxlJsonSource  src;
+    AxlJsonScanner s;
+    char           want[1024];
+    size_t         i;
+
+    axl_json_source_init_mem(&src, doc, axl_strlen(doc));
+    if (!axl_json_scanner_init(&s, &src, flags)
+        || !scan_drain(&s, want, sizeof(want))) {
+        axl_json_scanner_free(&s);
+        test_check(false, label);
+        return;
+    }
+    axl_json_scanner_free(&s);
+
+    for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        char     got[1024];
+        char     msg[192];
+        unsigned calls = 0;
+
+        (void)axl_snprintf(msg, sizeof(msg), "%s [chunk %u]", label,
+                           (unsigned)chunks[i]);
+        test_check(scan_pull(doc, flags, chunks[i], got, sizeof(got), &calls)
+                       && axl_strcmp(got, want) == 0, msg);
+    }
+}
+
+static void
+test_json_scanner(void)
+{
+    // --- the shapes, with depth pinned on every event --------------------
+    //
+    // depth is "containers OUTSIDE this event", so a BEGIN and its matching
+    // END report the SAME number. That is the property callers match on, and
+    // the opposite convention is equally defensible -- which is exactly why
+    // it is pinned here rather than left to whatever the code happened to do.
+    scan_check("{\"a\":1}", AXL_JSON_STRICT,
+               "{@0/d0 KEY(a)@1/d1 NUM(1)@5/d1 }@6/d0 EOF@7/d0 |e0",
+               "scan: object — BEGIN and its END report the same depth");
+    scan_check("[1,2]", AXL_JSON_STRICT,
+               "[@0/d0 NUM(1)@1/d1 NUM(2)@3/d1 ]@4/d0 EOF@5/d0 |e0",
+               "scan: array elements sit one level in");
+    scan_check("[]", AXL_JSON_STRICT, "[@0/d0 ]@1/d0 EOF@2/d0 |e0",
+               "scan: an EMPTY array closes without a value in between");
+    scan_check("{}", AXL_JSON_STRICT, "{@0/d0 }@1/d0 EOF@2/d0 |e0",
+               "scan: an EMPTY object closes without a key in between");
+    scan_check("42", AXL_JSON_STRICT, "NUM(42)@0/d0 EOF@2/d0 |e0",
+               "scan: a bare primitive is a whole document");
+    scan_check("{\"a\":{\"b\":[true,null]}}", AXL_JSON_STRICT,
+               "{@0/d0 KEY(a)@1/d1 {@5/d1 KEY(b)@6/d2 [@10/d2 "
+               "BOOL(true)@11/d3 NUL(null)@16/d3 ]@20/d2 }@21/d1 }@22/d0 "
+               "EOF@23/d0 |e0",
+               "scan: nesting walks in and back out through the bitmap");
+
+    // --- text spans the INNER content, which is what the decoder takes ----
+    scan_check("\"hi\"", AXL_JSON_STRICT, "STR(hi)@0/d0 EOF@4/d0 |e0",
+               "scan: a string event's text excludes the quotes, and its "
+               "offset points AT the opening quote");
+
+    // --- the dialect reaches the scanner, through the same leaves --------
+    scan_check("{a:1,}", AXL_JSON_JSON5,
+               "{@0/d0 KEY(a)@1/d1 NUM(1)@3/d1 }@5/d0 EOF@6/d0 |e0",
+               "scan: JSON5 unquoted key and trailing comma");
+    /* e10 is AXL_JSON_ERR_DIALECT — the numbering is pinned deliberately, so
+       inserting an enumerator mid-list has to be looked at rather than
+       absorbed. */
+    scan_check("{a:1,}", AXL_JSON_STRICT,
+               "{@0/d0 |e10@1 1:2 f4",
+               "scan: the same document under STRICT stops at the key with a "
+               "DIALECT miss");
+
+    // --- a MISSING value is not a trailing comma --------------------------
+    //
+    // SCAN_ST_VALUE is reached two ways: after `,` in an ARRAY (where a
+    // closer really is a trailing comma) and after `:` in an OBJECT (where a
+    // value is mandatory). Accepting `}` in that state served only the second
+    // case, so `{"a":}` parsed clean under ALLOW_TRAILING_COMMA — and it
+    // breaks the event stream's own rule that a KEY is always followed by its
+    // value, which the document builder is about to depend on.
+    scan_check("{\"a\":}", AXL_JSON_ALLOW_TRAILING_COMMA,
+               "{@0/d0 KEY(a)@1/d1 |e3@5 1:6 f0",
+               "scan: a missing value is refused even when trailing commas "
+               "are allowed");
+    scan_check("[1,]", AXL_JSON_ALLOW_TRAILING_COMMA,
+               "[@0/d0 NUM(1)@1/d1 ]@3/d0 EOF@4/d0 |e0",
+               "scan: an array's trailing comma still closes");
+    /* And the object form goes through SCAN_ST_OBJ_KEY, which must ALSO keep
+       the parser's recoverable diagnosis when the flag is absent. */
+    scan_check("{\"a\":1,}", AXL_JSON_ALLOW_TRAILING_COMMA,
+               "{@0/d0 KEY(a)@1/d1 NUM(1)@5/d1 }@7/d0 EOF@8/d0 |e0",
+               "scan: an object's trailing comma closes when allowed");
+    scan_check("{\"a\":1,}", AXL_JSON_STRICT,
+               "{@0/d0 KEY(a)@1/d1 NUM(1)@5/d1 |e10@7 1:8 f2",
+               "scan: and without the flag it is a DIALECT miss with a named "
+               "remedy, not a bare unexpected byte");
+
+    // --- EOF is a document boundary, not the end of the input ------------
+    //
+    // The whole reason next() returns true for EV_EOF: an NDJSON caller keeps
+    // pulling and gets the second document. Nothing about this needed a flag.
+    scan_check("{\"a\":1} {\"b\":2}", AXL_JSON_STRICT,
+               "{@0/d0 KEY(a)@1/d1 NUM(1)@5/d1 }@6/d0 EOF@7/d0 "
+               "{@8/d0 KEY(b)@9/d1 NUM(2)@13/d1 }@14/d0 EOF@15/d0 |e0",
+               "scan: NDJSON — a second document follows the first EOF");
+
+    // --- failures classify through the shared leaves ---------------------
+    scan_check("{\"a\":}", AXL_JSON_STRICT, "{@0/d0 KEY(a)@1/d1 |e3@5 1:6 f0",
+               "scan: a missing value stops the scan where the byte is");
+    scan_check("[1,", AXL_JSON_STRICT, "[@0/d0 NUM(1)@1/d1 |e2@3 1:4 f0",
+               "scan: input ending mid-container is INCOMPLETE, not EOF");
+
+    // --- a document deeper than 32 can now be RE-EMITTED ------------------
+    //
+    // The reader accepted 256 levels; the writer's bitmap was one uint32_t,
+    // so anything past 32 parsed fine and then could not be written back.
+    // Read-then-re-emit is the writer's main job, so the asymmetry made a
+    // whole band of legal documents one-way.
+    {
+        char           deep[256];
+        AxlJsonReader  r;
+        AXL_AUTOPTR(AxlString) out = axl_string_new(NULL);
+        AxlJsonWriter  w;
+        size_t         i;
+        const size_t   levels = 40;
+
+        for (i = 0; i < levels; i++) {
+            deep[i] = '[';
+        }
+        deep[levels] = '1';
+        for (i = 0; i < levels; i++) {
+            deep[levels + 1 + i] = ']';
+        }
+        deep[levels * 2 + 1] = '\0';
+
+        test_check(axl_json_parse(deep, axl_strlen(deep),
+                                        AXL_JSON_DEPTH(64), &r),
+                   "writer depth: a 40-level document parses");
+        axl_json_writer_init(&w, out, AXL_JSON_STRICT);
+        axl_json_write_token(&w, &r, 0);
+        axl_json_writer_finish(&w);
+        test_check(!axl_json_writer_error(&w),
+                   "writer depth: ...and re-emits without hitting the cap");
+        test_check(axl_strcmp(axl_string_str(out), deep) == 0,
+                   "writer depth: byte-identical round trip at 40 levels");
+        axl_json_free(&r);
+    }
+
+    // --- running OUT of input is INCOMPLETE, on both faces ---------------
+    //
+    // `{"a"` ends after the key. The recursive parser tested `pos >= len ||
+    // json[pos] != ':'` in one condition and reported UNEXPECTED_BYTE for
+    // both, so "there is no byte" was diagnosed as "this byte is wrong". The
+    // distinction is load-bearing: INCOMPLETE is the one code more input can
+    // clear, which is what P13 resumes from. Found by differential-probing
+    // the two faces against each other.
+    {
+        AxlJsonReader r;
+
+        test_check(!axl_json_parse("{\"a\"", 4, AXL_JSON_STRICT, &r),
+                   "parse: a document ending after a key is rejected");
+        test_check(axl_json_reader_error(&r)->code == AXL_JSON_ERR_INCOMPLETE,
+                   "parse: ...as INCOMPLETE — more bytes could finish it — "
+                   "not as an unexpected byte that is not there");
+        axl_json_free(&r);
+    }
+    scan_check("{\"a\"", AXL_JSON_STRICT, "{@0/d0 KEY(a)@1/d1 |e2@4 1:5 f0",
+               "scan: and the scanner agrees, which is what makes the two "
+               "faces substitutable");
+
+    // --- a scan failure carries a POSITION the formatter can render -------
+    //
+    // line/column are documented 1-based, and axl_json_error_format() prints
+    // them verbatim — leaving them zero rendered "0:0:" with the caret at
+    // column 0, from the one face that has no other way to fill them in.
+    {
+        const char    *doc = "{\n  \"a\": 1,\n  \"b\": @\n}";
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        char           buf[AXL_JSON_ERROR_BUF_MAX];
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = doc;
+        src.len  = axl_strlen(doc);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        while (axl_json_scanner_next(&s, &ev)) {
+            /* run to the failure */
+        }
+        test_check(axl_json_scanner_error(&s)->line == 3
+                       && axl_json_scanner_error(&s)->column == 8,
+                   "scan: a failure records a 1-based line and column, not "
+                   "zeros");
+        (void)axl_json_error_format(axl_json_scanner_error(&s), doc,
+                                    axl_strlen(doc), buf, sizeof(buf));
+        test_check(axl_strncmp(buf, "3:8:", 4) == 0,
+                   "scan: and the shared formatter renders it, rather than "
+                   "printing 0:0:");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- depth is a policy number now, not a stack budget ----------------
+    //
+    // 200 levels through a bitmap. Under recursive descent this is ~29 KB of
+    // frames; here it is 25 bytes of bitmap, which is the entire argument for
+    // the container bitmap.
+    {
+        char   deep[512];
+        size_t i;
+
+        for (i = 0; i < 200; i++) {
+            deep[i] = '[';
+        }
+        deep[200] = '1';
+        for (i = 0; i < 200; i++) {
+            deep[201 + i] = ']';
+        }
+        deep[401] = '\0';
+
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        uint32_t       deepest = 0;
+        int            events  = 0;
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = deep;
+        src.len  = axl_strlen(deep);
+        test_check(axl_json_scanner_init(&s, &src,
+                                         AXL_JSON_DEPTH(256)),
+                   "scan: a 256-level bound initializes");
+        while (axl_json_scanner_next(&s, &ev)) {
+            if (ev.depth > deepest) {
+                deepest = ev.depth;
+            }
+            events++;
+        }
+        test_check(deepest == 200 && events == 402
+                       && axl_json_scanner_error(&s)->code == AXL_JSON_OK,
+                   "scan: 200 levels deep with no recursion — the bitmap is "
+                   "the whole cost");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- skip: the reason the streaming face exists ----------------------
+    {
+        const char    *doc = "{\"skipme\":[1,[2,3],{\"x\":9}],\"want\":7}";
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        int64_t        got = 0;
+        bool           found = false;
+        bool           saw_inner = false;
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = doc;
+        src.len  = axl_strlen(doc);
+        test_check(axl_json_scanner_init(&s, &src, AXL_JSON_STRICT),
+                   "scan: skip fixture initializes");
+        while (axl_json_scanner_next(&s, &ev)) {
+            if (ev.kind != AXL_JSON_EV_KEY) {
+                continue;
+            }
+            if (axl_json_event_equals(&ev, "x")) {
+                /* Inside the subtree that was skipped. Seeing it means skip
+                   stopped early -- which the "found && got == 7" assertion
+                   below CANNOT see, because the outer loop just keeps going
+                   and still reaches "want". Sabotaging skip's termination
+                   depth proved that gap, so the miss is asserted directly. */
+                saw_inner = true;
+            }
+            if (axl_json_event_equals(&ev, "skipme")) {
+                /* Pull the value's BEGIN, then discard the subtree whole. */
+                (void)axl_json_scanner_next(&s, &ev);
+                test_check(axl_json_scanner_skip(&s),
+                           "scan: skip consumes the subtree");
+            } else if (axl_json_event_equals(&ev, "want")) {
+                char buf[16];
+
+                (void)axl_json_scanner_next(&s, &ev);
+                if (axl_json_event_string(&ev, buf, sizeof(buf)) > 0) {
+                    got   = (int64_t)(buf[0] - '0');
+                    found = true;
+                }
+            }
+        }
+        test_check(found && got == 7,
+                   "scan: reading one key past a nested subtree still finds "
+                   "the key that follows it");
+        test_check(!saw_inner,
+                   "scan: skip consumed the WHOLE subtree — a key nested "
+                   "inside it never surfaced");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- skip() is a NO-OP on anything but a container --------------------
+    //
+    // The docstring promises a caller may call it on any event without first
+    // asking which kind it was. It did not: `want = depth` means "run to the
+    // end of the innermost OPEN container", which is only the subtree when
+    // the last event was a BEGIN. After a KEY it swallowed every remaining
+    // member — and "pull a key, compare, skip if it is not mine" is the
+    // idiom the header sells twice.
+    {
+        const char    *doc = "{\"a\":1,\"b\":2}";
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        bool           saw_b = false;
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = doc;
+        src.len  = axl_strlen(doc);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        (void)axl_json_scanner_next(&s, &ev);            /* { */
+        (void)axl_json_scanner_next(&s, &ev);            /* KEY a */
+        test_check(axl_json_scanner_skip(&s),
+                   "scan: skip after a KEY succeeds");
+        while (axl_json_scanner_next(&s, &ev)) {
+            if (ev.kind == AXL_JSON_EV_KEY
+                && axl_json_event_equals(&ev, "b")) {
+                saw_b = true;
+            }
+        }
+        test_check(saw_b,
+                   "scan: skip after a KEY consumes only that member — the "
+                   "NEXT key is still reachable");
+        axl_json_scanner_free(&s);
+    }
+    {
+        /* After a scalar element, skip must not eat the rest of the array. */
+        const char    *doc = "[1,2]";
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = doc;
+        src.len  = axl_strlen(doc);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        (void)axl_json_scanner_next(&s, &ev);            /* [ */
+        (void)axl_json_scanner_next(&s, &ev);            /* 1 */
+        test_check(axl_json_scanner_skip(&s),
+                   "scan: skip after a scalar succeeds");
+        test_check(axl_json_scanner_next(&s, &ev)
+                       && ev.kind == AXL_JSON_EV_NUMBER,
+                   "scan: skip after a scalar is a NO-OP — the next element "
+                   "is still delivered");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- event_equals compares DECODED, and cannot truncate --------------
+    scan_check("{\"\\u0062\":1}", AXL_JSON_STRICT,
+               "{@0/d0 KEY(\\u0062)@1/d1 NUM(1)@10/d1 }@11/d0 EOF@12/d0 |e0",
+               "scan: a key's text is its SOURCE spelling, escapes intact");
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        const char    *doc = "{\"\\u0062\":1}";
+
+        axl_memset(&src, 0, sizeof(src));
+        src.data = doc;
+        src.len  = axl_strlen(doc);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        (void)axl_json_scanner_next(&s, &ev);   /* { */
+        (void)axl_json_scanner_next(&s, &ev);   /* the key */
+        test_check(axl_json_event_equals(&ev, "b"),
+                   "scan: event_equals matches the DECODED name, so an "
+                   "escaped key answers to what it names");
+        test_check(!axl_json_event_equals(&ev, "\\u0062"),
+                   "scan: and NOT to its source spelling");
+        test_check(axl_json_event_type(&ev) == AXL_JSON_TYPE_STRING,
+                   "scan: a KEY maps into the type vocabulary as a string");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- a refused init is still SAFE to use and to free -----------------
+    {
+        AxlJsonScanner s;
+        AxlJsonEvent   ev;
+        AxlJsonSource  bad;
+
+        axl_memset(&bad, 0, sizeof(bad));   /* neither view nor read fn */
+        test_check(!axl_json_scanner_init(&s, &bad, AXL_JSON_STRICT),
+                   "scan: a source with no view and no read function is "
+                   "refused");
+        test_check(axl_json_scanner_error(&s)->code
+                       == AXL_JSON_ERR_INVALID_ARGUMENT,
+                   "scan: and the refusal is recorded, not just returned");
+        test_check(!axl_json_scanner_next(&s, &ev),
+                   "scan: next() on a refused scanner reports no event "
+                   "rather than reading a garbage window");
+        axl_json_scanner_free(&s);   /* must not free a garbage pointer */
+        test_survived("scan: freeing a refused scanner is safe");
+    }
+
+    // --- P13: a pull source produces the SAME events, at any chunking -----
+    //
+    // The property, asserted rather than described. Each fixture puts a
+    // different leaf's edge case on every possible boundary, because the
+    // sweep runs chunk size 1.
+    //
+    // This is what the at-end-of-INPUT signal exists for. Three leaves treat
+    // running out of bytes as a legitimate end of token -- a number, an
+    // identifier and a line comment -- so without it `{"n":123}` chunked at 7
+    // emits NUM(12) and then meets `3}` as a fresh value, and `true` cut in
+    // half is reported as an unexpected byte rather than an incomplete one.
+    scan_chunk_sweep("{\"a\":1}", AXL_JSON_STRICT,
+                     "pull: the smallest object");
+    scan_chunk_sweep("{\"n\":123,\"m\":-4.5e-3}", AXL_JSON_STRICT,
+                     "pull: a number is not finished just because the window "
+                     "is");
+    scan_chunk_sweep("[true,false,null]", AXL_JSON_STRICT,
+                     "pull: a keyword split across chunks is INCOMPLETE, not "
+                     "an unexpected byte");
+    scan_chunk_sweep("{\"s\":\"a\\u00e9b\\tc\"}", AXL_JSON_STRICT,
+                     "pull: an escape straddling a boundary survives");
+    scan_chunk_sweep("[[1,[2,[3,[4]]]],{\"k\":{\"j\":[]}}]", AXL_JSON_STRICT,
+                     "pull: nesting walks in and out identically");
+    scan_chunk_sweep("{a:1,b:0x1F,c:NaN,d:Infinity,e:'q',}", AXL_JSON_JSON5,
+                     "pull: JSON5 unquoted keys, hex, NaN/Infinity and single "
+                     "quotes");
+    scan_chunk_sweep("{/*x*/a:1,//y\n b:2}", AXL_JSON_JSON5,
+                     "pull: a comment is re-scanned whole rather than resumed "
+                     "inside");
+    // Non-ASCII on purpose: column counts CHARACTERS, and a multi-byte
+    // sequence can straddle a refill. The continuation-byte test is
+    // byte-local, so the carried count must come out the same either way --
+    // and the error position in the render is the only thing that shows it.
+    scan_chunk_sweep("{\"\xC3\xA9\xC3\xA9\":1,\"b\":@}", AXL_JSON_STRICT,
+                     "pull: a failure's line and column survive the bytes "
+                     "scrolling out of the window");
+    scan_chunk_sweep("[1,\n2,\n3,\n@]", AXL_JSON_STRICT,
+                     "pull: and the LINE count survives too");
+    // Failures must land in the same place, not merely be failures.
+    scan_chunk_sweep("{\"a\":1,}", AXL_JSON_STRICT,
+                     "pull: a dialect miss keeps its offset and its flag");
+    scan_chunk_sweep("{\"a\"", AXL_JSON_STRICT,
+                     "pull: a truncated document is INCOMPLETE at the end of "
+                     "the input");
+    scan_chunk_sweep("   ", AXL_JSON_STRICT,
+                     "pull: a whitespace-only input exhausts cleanly");
+
+    // --- P13: the source is asked more than once --------------------------
+    //
+    // Without this the sweep proves nothing: a chunk larger than the document
+    // makes the pull path deliver everything in one read, which is the
+    // contiguous path wearing a callback.
+    {
+        char     out[1024];
+        unsigned calls = 0;
+
+        test_check(scan_pull("{\"a\":1,\"b\":2}", AXL_JSON_STRICT, 1, out,
+                             sizeof(out), &calls)
+                       && calls > 1,
+                   "pull: a one-byte-at-a-time source is genuinely read many "
+                   "times");
+    }
+
+    // --- P13: the input channel's own failures ----------------------------
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        char           out[256];
+
+        // A read error is AXL_JSON_ERR_IO (e11), never INCOMPLETE: "the
+        // socket died" and "the document was truncated" are opposite
+        // instructions, which is why AxlJsonReadFn returns a SIGNED count.
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data = "{\"a\":1}";
+        cs.len  = 7;
+        cs.chunk = 2;
+        cs.fail_at = 1;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        test_check(axl_json_scanner_init(&s, &src, AXL_JSON_STRICT),
+                   "pull: init does not read, so a doomed source still "
+                   "initializes");
+        test_check(scan_drain(&s, out, sizeof(out))
+                       && axl_strcmp(out, "|e11@0 1:1 f0") == 0,
+                   "pull: a read error is IO, not INCOMPLETE");
+        axl_json_scanner_free(&s);
+
+        // A source claiming more bytes than it was offered would have written
+        // past the window. Refused, not believed.
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data = "{\"a\":1}";
+        cs.len  = 7;
+        cs.chunk = 2;
+        cs.overclaim = true;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        test_check(scan_drain(&s, out, sizeof(out))
+                       && axl_strcmp(out, "|e11@0 1:1 f0") == 0,
+                   "pull: a read reporting more than it was offered is "
+                   "refused rather than trusted");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- P13: documents BIGGER than the window, which is where tokens
+    //          actually straddle a refill ------------------------------------
+    //
+    // Everything above is smaller than the window, so the first refill
+    // delivers it whole and nothing straddles. These are the assertions that
+    // reach the re-scan path, and the ones that fail when a leaf mistakes the
+    // end of the window for the end of the input.
+    //
+    // Built here rather than written out: the point is the LENGTH, and the
+    // lengths are chosen to walk a token across the window boundary rather
+    // than to land on it once.
+    {
+        static char big[6144];
+        size_t      pad;
+
+        // 1. A single token far longer than the window, so the window has to
+        //    GROW rather than merely compact. This is the one case where a
+        //    compaction that freed nothing must double the buffer.
+        {
+            size_t n = 0;
+            size_t i;
+
+            n += (size_t)axl_snprintf(big + n, sizeof(big) - n, "{\"k\":\"");
+            for (i = 0; i < 3000; i++) {
+                big[n++] = (char)('a' + (i % 26));
+            }
+            n += (size_t)axl_snprintf(big + n, sizeof(big) - n, "\"}");
+            big[n] = '\0';
+            scan_big_sweep(big, AXL_JSON_STRICT,
+                           "pull: a 3000-byte string forces the window to "
+                           "grow, and reads back identically");
+        }
+
+        // 2. Many SMALL tokens spread past several window boundaries, so
+        //    numbers, keys and punctuation each land across a refill at some
+        //    point. The odd element width is deliberate -- a round one would
+        //    align every boundary to the same place in the pattern.
+        {
+            size_t n = 0;
+            int    i;
+
+            big[n++] = '[';
+            for (i = 0; i < 400; i++) {
+                n += (size_t)axl_snprintf(big + n, sizeof(big) - n,
+                                          "%s{\"k%d\":%d.%de%d}",
+                                          i ? "," : "", i, i, i % 97, i % 7);
+            }
+            big[n++] = ']';
+            big[n]   = '\0';
+            scan_big_sweep(big, AXL_JSON_STRICT,
+                           "pull: hundreds of small tokens across many "
+                           "refills, every one re-scanned correctly");
+        }
+
+        // 3. Keywords and JSON5 shapes pushed across a boundary by padding
+        //    that grows one byte at a time, so `true`, `NaN`, `Infinity` and
+        //    an unquoted key each straddle the window at SOME padding length.
+        //    A single fixture would only ever cut one of them.
+        //
+        //    The RANGE is the whole test. It was 1016..1032, which sounds
+        //    like "around the 1024 boundary" and is not: at those paddings
+        //    the first boundary lands inside the leading STRING or inside
+        //    `true`, and after the first refill the base jumps to the
+        //    straddling token so the remaining ~50 bytes all fit. Every other
+        //    keyword was never cut at any padding in that range. `NaN` needs
+        //    pad ~1002 and `-Infinity` pad 983..990 -- and widening to cover
+        //    them turned this RED on 8 paddings, which is how two shipped
+        //    bugs were found. Do not narrow it back.
+        for (pad = 960; pad <= 1040; pad++) {
+            char   msg[128];
+            size_t n = 0;
+            size_t i;
+
+            big[n++] = '[';
+            big[n++] = '"';
+            for (i = 0; i < pad; i++) {
+                big[n++] = 'p';
+            }
+            big[n++] = '"';
+            n += (size_t)axl_snprintf(big + n, sizeof(big) - n,
+                                      ",true,false,null,NaN,Infinity,"
+                                      "-Infinity,0x1F,{u:'v'},.5]");
+            big[n] = '\0';
+            (void)axl_snprintf(msg, sizeof(msg),
+                               "pull: keywords straddle the window at pad %u",
+                               (unsigned)pad);
+            {
+                AxlJsonSource  src;
+                AxlJsonScanner s;
+                ChunkSrc       cs;
+                char           want[128];
+                char           got[128];
+
+                axl_json_source_init_mem(&src, big, n);
+                (void)axl_json_scanner_init(&s, &src, AXL_JSON_JSON5);
+                if (!scan_digest(&s, want, sizeof(want))) {
+                    axl_json_scanner_free(&s);
+                    test_check(false, msg);
+                    continue;
+                }
+                axl_json_scanner_free(&s);
+
+                axl_memset(&cs, 0, sizeof(cs));
+                cs.data  = big;
+                cs.len   = n;
+                cs.chunk = 4096;
+                axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+                (void)axl_json_scanner_init(&s, &src, AXL_JSON_JSON5);
+                test_check(scan_digest(&s, got, sizeof(got))
+                               && axl_strcmp(got, want) == 0, msg);
+                axl_json_scanner_free(&s);
+            }
+        }
+
+        // 4. A comment longer than the window. It is skipped, not emitted, so
+        //    it is the one "token" whose size the bound is stated for.
+        {
+            size_t n = 0;
+            size_t i;
+
+            n += (size_t)axl_snprintf(big + n, sizeof(big) - n, "[1,/*");
+            for (i = 0; i < 2500; i++) {
+                big[n++] = 'c';
+            }
+            n += (size_t)axl_snprintf(big + n, sizeof(big) - n, "*/2]");
+            big[n] = '\0';
+            scan_big_sweep(big, AXL_JSON_JSON5,
+                           "pull: a comment longer than the window is skipped "
+                           "whole, never resumed inside");
+        }
+    }
+
+    // --- P13: a source carrying BOTH a view and a read function -----------
+    //
+    // Not a third mode: the header says `data` selects the view. Left
+    // ambiguous it was a NULL dereference -- the window path saw a read
+    // function and refilled against a buffer the contiguous path never
+    // allocated -- and where it survived it scanned the document TWICE, once
+    // from the view and again from the callback as a second NDJSON document.
+    // The pre-P13 code could not reach this because it refused every pull
+    // source outright.
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        char           out[256];
+        char           want[256];
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data  = "[true";      /* cut mid-keyword, to force a refill */
+        cs.len   = 5;
+        cs.chunk = 2;
+
+        axl_json_source_init_mem(&src, "[true", 5);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        (void)scan_drain(&s, want, sizeof(want));
+        axl_json_scanner_free(&s);
+
+        src.read = chunk_read;   /* both fields set, on purpose */
+        src.ctx  = &cs;
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        test_check(scan_drain(&s, out, sizeof(out))
+                       && axl_strcmp(out, want) == 0,
+                   "pull: a source with BOTH a view and a read function is "
+                   "the view, not a crash and not two documents");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- P13: an I/O failure AFTER the window has moved -------------------
+    //
+    // The earlier IO row fails on the FIRST read, where base is still 0 and
+    // the offset arithmetic cannot be wrong. This one fails on the SECOND,
+    // after compaction has advanced base -- the only way to catch a position
+    // rebased against the wrong origin.
+    //
+    // Laid out so the answer is computable rather than observed: `[`, then
+    // 1000 spaces (settled by skip_ws, so compaction drops them and base
+    // becomes exactly 1001), then a number long enough to run off the 1024
+    // window. The refill that number provokes is where read #2 fails, and
+    // s->pos is 0 by then -- so a correct report is 1001 and a report of 0
+    // is base being lost.
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        static char    doc[1200];
+        char           out[256];
+        size_t         n = 0;
+        size_t         i;
+
+        doc[n++] = '[';
+        for (i = 0; i < 1000; i++) {
+            doc[n++] = ' ';
+        }
+        for (i = 0; i < 100; i++) {
+            doc[n++] = (char)('0' + (i % 10));
+        }
+        doc[n++] = ']';
+        doc[n]   = '\0';
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data    = doc;
+        cs.len     = n;
+        cs.chunk   = 4096;   /* one read fills the window; the SECOND fails */
+        cs.fail_at = 2;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        test_check(scan_drain(&s, out, sizeof(out))
+                       && axl_strcmp(out, "[@0/d0 |e11@1001 1:1002 f0") == 0,
+                   "pull: an I/O failure after compaction reports the input "
+                   "offset, not one rebased against a moved window");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- P13: the BOUND, measured rather than asserted in prose -----------
+    //
+    // The header promises O(largest single token), not O(document). Peak
+    // allocation is the only way to check that, and whitespace is the case
+    // that used to break it: skip_ws anchored a refill at the START of the
+    // insignificant run, so a stream of spaces doubled the window forever.
+    // 200 KB of spaces reached a 256 KB window.
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        static char    spaces[200000];
+        AxlJsonEvent   ev;
+        AxlMemStats    st;
+        size_t         before;
+        size_t         peak;
+
+        axl_memset(spaces, ' ', sizeof(spaces) - 3);
+        spaces[sizeof(spaces) - 3] = '4';
+        spaces[sizeof(spaces) - 2] = '2';
+        spaces[sizeof(spaces) - 1] = '\0';
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data  = spaces;
+        cs.len   = axl_strlen(spaces);
+        cs.chunk = 4096;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+
+        axl_mem_get_stats(&st);
+        before = st.bytes;
+        peak   = before;
+        while (axl_json_scanner_next(&s, &ev)) {
+            axl_mem_get_stats(&st);
+            if (st.bytes > peak) {
+                peak = st.bytes;
+            }
+        }
+        test_check(axl_json_scanner_error(&s)->code == AXL_JSON_OK
+                       && peak - before < 65536,
+                   "pull: 200 KB of leading whitespace does not grow the "
+                   "window -- settled whitespace is DROPPED, not re-scanned");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- P13: consumed() over a pull source -------------------------------
+    //
+    // It had no test at all, in either mode, despite a header contract making
+    // specific claims. It counts what the GRAMMAR consumed, which is less
+    // than what was pulled.
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        AxlJsonEvent   ev;
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data  = "{\"a\":1}   ";
+        cs.len   = 10;
+        cs.chunk = 3;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        while (axl_json_scanner_next(&s, &ev)
+               && ev.kind != AXL_JSON_EV_EOF) {
+            /* run to the document boundary */
+        }
+        test_check(axl_json_scanner_consumed(&s) == 7,
+                   "pull: consumed() stops at the root value, excluding the "
+                   "trailing whitespace the scanner had already pulled");
+        axl_json_scanner_free(&s);
+    }
+
+    // --- P13: an EMPTY pull source matches an empty contiguous one --------
+    //
+    // The scanner's own contract says a false return with AXL_JSON_OK means
+    // "genuinely exhausted", and that must not depend on which mode delivered
+    // the nothing. It briefly did: the read loop stops at a FULL window
+    // without asking again, so an input ending exactly on a boundary had not
+    // latched end-of-input, and the next refill reported "no progress" while
+    // holding an INCOMPLETE one re-run away from being OK.
+    //
+    // (The WHOLE-DOCUMENT face still answers INCOMPLETE for an empty stream.
+    // That is axl_json_parse_source's rule -- a document with no value in it
+    // -- not the scanner's, and the two are documented apart.)
+    {
+        AxlJsonSource  src;
+        AxlJsonScanner s;
+        ChunkSrc       cs;
+        char           out[128];
+
+        axl_memset(&cs, 0, sizeof(cs));
+        cs.data  = "";
+        cs.len   = 0;
+        cs.chunk = 8;
+        axl_json_source_init_callback(&src, chunk_read, &cs, 0);
+        (void)axl_json_scanner_init(&s, &src, AXL_JSON_STRICT);
+        test_check(scan_drain(&s, out, sizeof(out))
+                       && axl_strcmp(out, "|e0") == 0,
+                   "pull: an empty source exhausts cleanly, exactly as an "
+                   "empty contiguous one does");
+        axl_json_scanner_free(&s);
+    }
+
+    // Input ending EXACTLY on a window boundary. The shape that lost whole
+    // documents: a root-level number of exactly 1024 digits produced no
+    // events at all, because end-of-input had not been latched when the
+    // window filled and the next refill called that "no progress".
+    {
+        static char digits[1200];
+        size_t      i;
+
+        for (i = 0; i < 1024; i++) {
+            digits[i] = (char)('1' + (i % 9));
+        }
+        digits[1024] = '\0';
+        scan_big_sweep(digits, AXL_JSON_STRICT,
+                       "pull: an input ending exactly on a window boundary "
+                       "still produces its events");
+    }
+
+    // --- P13: NDJSON over a pull source -----------------------------------
+    //
+    // EV_EOF is a document boundary, so the second document simply follows
+    // the first -- no flag, and now no contiguous buffer either.
+    scan_chunk_sweep("{\"a\":1} {\"b\":2} 3", AXL_JSON_STRICT,
+                     "pull: concatenated documents keep coming, with an EOF "
+                     "between each");
+}
+// ---------------------------------------------------------------------------
+// P12e — the whole-document face over the scanner
+//
+// axl_json_parse is to become a scan loop plus a builder stack. Three
+// things that makes newly fragile, none of which the assertions already here
+// were written to catch:
+//
+//  1. The TRAILING REGION is policy the scanner deliberately does not have.
+//     After the root value the scanner reports a document BOUNDARY and stops
+//     judging; "only insignificant text remains" has to be asked separately,
+//     and the two ways of failing that question are different answers a
+//     caller acts on differently -- a skip_ws failure names a DIALECT flag to
+//     pass, a second document is TRAILING and resumable. From outside the
+//     event stream they are indistinguishable, which is exactly why they are
+//     pinned here rather than left to the implementation.
+//
+//  2. A document with NO root value at all. The scanner calls that clean
+//     exhaustion (it is what terminates an NDJSON loop) and returns false
+//     with AXL_JSON_OK; the whole-document face must call it INCOMPLETE. A
+//     face that simply propagated the scanner's verdict would ACCEPT a
+//     whitespace-only document -- silently, with no tokens. The face must
+//     also still CONSULT that verdict, or it converts every failure BEFORE
+//     the root value into a bogus INCOMPLETE.
+//
+//  3. `start`, `end` and `size`, which the event stream states nowhere. Leaf
+//     bounds come from ev.text/ev.len, a container's from its BEGIN and END
+//     offsets, and `size` from counting children.
+//
+// Errors are pinned as an exact whole-record render rather than by code
+// alone, because the offset is what a caller resumes or points a caret from
+// and a code-only assertion lets it drift.
+// ---------------------------------------------------------------------------
+
+/* Render a REJECTED parse as `@<offset> <terse diagnostic>`.
+ *
+ * The diagnostic comes from axl_json_error_format() with no document, which
+ * renders line, column, the code's own words and -- for a dialect miss -- the
+ * name of the flag that would have accepted the input. Offset is prepended
+ * because that is the one field the formatter does not show and the one
+ * axl_json_reader_consumed() hands to the next parse.
+ *
+ * Offset and column are NOT independent on a single-line ASCII document:
+ * both faces DERIVE line and column from the offset, so there `column ==
+ * offset + 1` and the `@` prefix discriminates nothing. It earns its place on
+ * the multi-line row below, and it becomes load-bearing in P13, where offset
+ * carries the window base while line and column are counted window-relative.
+ *
+ * The reader is deliberately NOT freed on this path. A rejected parse must
+ * own nothing, so there is nothing to release -- and freeing anyway would let
+ * a future builder that leaked its token array into a failed reader pass the
+ * teardown leak gate. */
+static bool
+err_render(const AxlJsonReader *r, char *out, size_t size)
+{
+    char terse[AXL_JSON_ERROR_BUF_MAX];
+    int  n;
+
+    if (axl_json_error_format(axl_json_reader_error(r), NULL, 0, terse,
+                              sizeof(terse)) < 0) {
+        return false;
+    }
+    /* Not `n += axl_snprintf(...)`: it returns the length it WOULD have
+       written, so accumulating walks past the buffer. Formatted in one call
+       instead, and the width checked afterwards. */
+    n = axl_snprintf(out, size, "@%u %s",
+                     (unsigned)axl_json_reader_consumed(r), terse);
+    return n > 0 && (size_t)n < size;
+}
+
+static void
+parse_err_check(const char *doc, AxlJsonFlags flags, const char *want,
+                const char *msg)
+{
+    AxlJsonReader r;
+    char          out[AXL_JSON_ERROR_BUF_MAX + 32];
+
+    if (axl_json_parse(doc, axl_strlen(doc), flags, &r)) {
+        axl_json_free(&r);
+        test_check(false, msg);   /* it was supposed to be REJECTED */
+        return;
+    }
+    test_check(err_render(&r, out, sizeof(out))
+                   && axl_strcmp(out, want) == 0, msg);
+}
+
+/* Render a parsed document's STRUCTURE by walking it with the public
+ * iterators, then compare the whole line exactly.
+ *
+ * Not axl_json_write_token(): that walks by token type and size, so it cannot
+ * see a container's `end` at all. The iterators CAN -- axl_json_object_next()
+ * and axl_json_array_next() skip a member's nested children by comparing each
+ * following token's start against the value's `end`.
+ *
+ * What that catches is asymmetric, and worth stating so the rows below do not
+ * claim more than they prove. An `end` one byte too LONG swallows the next
+ * sibling. An `end` one byte too SHORT is invisible for a non-root container:
+ * the skip loop breaks on `start >= end`, and the byte at `end - 1` is the
+ * closing delimiter, where no token can begin. The ROOT container's `end` is
+ * pinned directly, through axl_json_reader_consumed() in the `|c` suffix, so
+ * a UNIFORM off-by-one is caught there.
+ *
+ * `size` shows up as the member count, and only when the container is
+ * FOLLOWED by something: at the end of a token array both iterators run out
+ * and stop in the right place whatever the count says.
+ */
+static bool
+shape_scalar(const AxlJsonReader *r, char *out, size_t size, size_t *n)
+{
+    char buf[64];
+
+    switch (axl_json_value_type(r)) {
+    case AXL_JSON_TYPE_STRING:
+        /* axl_json_value_string() TRUNCATES and still returns true, so a
+           value that did not fit would render short and then compare equal to
+           a `want` pasted from that same short output -- a fixture pinning
+           its own bug. Refused instead. */
+        if (!axl_json_value_string(r, buf, sizeof(buf))
+            || axl_strlen(buf) >= sizeof(buf) - 1) {
+            return false;
+        }
+        return scan_put(out, size, n, "\"%s\"", buf);
+    case AXL_JSON_TYPE_NUMBER:
+        /* The literal, VERBATIM. Reading it as a double would hide a token
+           whose [start,end) drifted onto a neighbouring byte. This accessor
+           REFUSES rather than truncating, so it needs no length guard. */
+        if (!axl_json_value_number_str(r, buf, sizeof(buf))) {
+            return false;
+        }
+        return scan_put(out, size, n, "%s", buf);
+    case AXL_JSON_TYPE_BOOL: {
+        bool v = false;
+
+        if (!axl_json_value_bool(r, &v)) {
+            return false;
+        }
+        return scan_put(out, size, n, "%s", v ? "true" : "false");
+    }
+    case AXL_JSON_TYPE_NULL:
+        return scan_put(out, size, n, "null");
+    default:
+        return false;
+    }
+}
+
+static bool
+shape_render(const AxlJsonReader *r, char *out, size_t size, size_t *n)
+{
+    AxlJsonType t = axl_json_value_type(r);
+
+    if (t == AXL_JSON_TYPE_OBJECT) {
+        AxlJsonObjectIter it;
+        AxlJsonReader     v;
+        char              key[64];
+        bool              first = true;
+
+        if (!scan_put(out, size, n, "{")
+            || !axl_json_value_object_begin(r, &it)) {
+            return false;
+        }
+        while (axl_json_object_next(&it, key, sizeof(key), &v)) {
+            /* A key too long is truncated and the pair still yielded, with
+               the truncation reported ONLY here -- see the accessor's own
+               warning that a prefix cannot be recognised as short from its
+               own contents. Unchecked, an oversized key renders as a shorter
+               one and the row silently pins the wrong name.
+
+               Keys are written unquoted, so this render is ambiguous for a
+               key containing `,`, `:` or `}`. No fixture below uses one; a
+               row that needs one should quote them here first. */
+            if (axl_json_object_iter_error(&it)->code != AXL_JSON_OK
+                || !scan_put(out, size, n, "%s%s:", first ? "" : ",", key)
+                || !shape_render(&v, out, size, n)) {
+                return false;
+            }
+            first = false;
+        }
+        return scan_put(out, size, n, "}");
+    }
+    if (t == AXL_JSON_TYPE_ARRAY) {
+        AxlJsonArrayIter it;
+        AxlJsonReader    e;
+        bool             first = true;
+
+        if (!scan_put(out, size, n, "[")
+            || !axl_json_value_array_begin(r, &it)) {
+            return false;
+        }
+        while (axl_json_array_next(&it, &e)) {
+            if (!scan_put(out, size, n, "%s", first ? "" : ",")
+                || !shape_render(&e, out, size, n)) {
+                return false;
+            }
+            first = false;
+        }
+        return scan_put(out, size, n, "]");
+    }
+    return shape_scalar(r, out, size, n);
+}
+
+static void
+shape_check(const char *doc, AxlJsonFlags flags, const char *want,
+            const char *msg)
+{
+    AxlJsonReader r;
+    char          out[512];
+    size_t        n = 0;
+
+    out[0] = '\0';
+    if (!axl_json_parse(doc, axl_strlen(doc), flags, &r)) {
+        test_check(false, msg);   /* it was supposed to PARSE */
+        return;
+    }
+    if (!shape_render(&r, out, sizeof(out), &n)
+        || !scan_put(out, sizeof(out), &n, "|c%u",
+                     (unsigned)axl_json_reader_consumed(&r))) {
+        axl_json_free(&r);
+        test_check(false, msg);
+        return;
+    }
+    test_check(axl_strcmp(out, want) == 0, msg);
+    axl_json_free(&r);
+}
+
+static void
+test_json_document_face(void)
+{
+    // --- the trailing region: two failures the event stream cannot tell apart
+    //
+    // Both stop with the root value already complete. What separates them is
+    // whether skip_ws itself refused (a DIALECT miss, which names a flag and
+    // is recoverable) or whether insignificant text simply ran out and
+    // something else was there (TRAILING, resumable via
+    // axl_json_reader_consumed). Merging them would hand a caller the half it
+    // cannot act on.
+    parse_err_check("1 //c", AXL_JSON_STRICT,
+                    "@2 1:3: feature needs a dialect flag "
+                    "(pass AXL_JSON_ALLOW_COMMENTS)",
+                    "docface: a comment after the root names ALLOW_COMMENTS, "
+                    "not 'trailing content'");
+    parse_err_check("1 ,", AXL_JSON_STRICT, "@2 1:3: trailing content",
+                    "docface: a byte no document can start with is TRAILING");
+    parse_err_check("1 2", AXL_JSON_STRICT, "@2 1:3: trailing content",
+                    "docface: a well-formed SECOND document is TRAILING too "
+                    "-- the scanner would happily scan it");
+    // The row the `@offset` prefix exists for: three lines, so the offset and
+    // the column are no longer the same number off by one. Every other row
+    // here is single-line ASCII, where they move in lockstep and the prefix
+    // adds nothing.
+    parse_err_check("{\n  \"a\": 1\n} x", AXL_JSON_STRICT,
+                    "@13 3:3: trailing content",
+                    "docface: offset counts BYTES from the start of the "
+                    "input while column restarts each line");
+
+    // The same trailing region, this time LEGAL. A comment there is not junk
+    // when the dialect allows it, and consumed() still reports where the
+    // VALUE ended rather than where the comment did.
+    shape_check("1 //c", AXL_JSON_JSON5, "1|c1",
+                "docface: a permitted trailing comment is skipped, and "
+                "consumed() still stops at the value");
+    shape_check("1 /*c*/ ", AXL_JSON_JSON5, "1|c1",
+                "docface: a permitted trailing BLOCK comment likewise");
+    // The one that a `pos != len` check alone gets wrong. Spelled `1 /*`
+    // rather than `1 /*c` deliberately: a comment-open at the very END
+    // advances pos to exactly len, so "is there anything left?" answers NO
+    // and the truncated document is ACCEPTED unless skip_ws's own refusal is
+    // checked. With a byte after the `/*` the position check catches it
+    // anyway, which makes that spelling a passenger -- verified by sabotage,
+    // where only this one notices.
+    parse_err_check("1 /*", AXL_JSON_JSON5, "@4 1:5: input ended early",
+                    "docface: a trailing comment-open at end of input is "
+                    "INCOMPLETE, not a silently accepted document");
+
+    // --- no root value at all --------------------------------------------
+    //
+    // The scanner calls this clean exhaustion and returns false with OK,
+    // because that is what ends an NDJSON loop. The whole-document face must
+    // NOT propagate that verdict: there is no value, so there is no document.
+    parse_err_check("   ", AXL_JSON_STRICT, "@3 1:4: input ended early",
+                    "docface: a whitespace-only document is INCOMPLETE, not "
+                    "an empty success");
+    parse_err_check("/*c*/", AXL_JSON_JSON5, "@5 1:6: input ended early",
+                    "docface: a comment-only document is INCOMPLETE");
+    // ...and the mirror image, which is the half a face that synthesises
+    // INCOMPLETE from "no root token" would destroy. Here the scan fails
+    // BEFORE any value, so the scanner's own classification is the good one
+    // and must be consulted rather than overwritten. Both rows above would
+    // still pass if it were not, because for them INCOMPLETE is the right
+    // answer by luck.
+    parse_err_check("//c", AXL_JSON_STRICT,
+                    "@0 1:1: feature needs a dialect flag "
+                    "(pass AXL_JSON_ALLOW_COMMENTS)",
+                    "docface: a comment BEFORE the root still names its "
+                    "flag, rather than becoming a bogus INCOMPLETE");
+
+    // --- interior failures keep their position ---------------------------
+    //
+    // The two faces reach these through structurally different code -- the C
+    // stack unwinding through lex_fail, versus scan_fail over an explicit
+    // state machine -- and nothing else in the suite pins where they land.
+    parse_err_check("{\"a\":1", AXL_JSON_STRICT, "@6 1:7: input ended early",
+                    "docface: a truncated object reports the end of input");
+    parse_err_check("{\"a\":}", AXL_JSON_STRICT, "@5 1:6: unexpected byte",
+                    "docface: a missing value points AT the brace that "
+                    "arrived instead of it");
+    parse_err_check("[1,", AXL_JSON_STRICT, "@3 1:4: input ended early",
+                    "docface: a truncated array likewise");
+
+    // --- the builder reconstructs `start`, `end` and `size` ---------------
+    shape_check("{\"a\":1}", AXL_JSON_STRICT, "{a:1}|c7",
+                "docface: an object round-trips through the builder");
+    shape_check("[1,2,3]", AXL_JSON_STRICT, "[1,2,3]|c7",
+                "docface: an array's elements survive in order -- an "
+                "under-counted size drops the tail");
+    shape_check("{}", AXL_JSON_STRICT, "{}|c2",
+                "docface: an empty object is one token, and its end is past "
+                "the brace");
+    shape_check("[]", AXL_JSON_STRICT, "[]|c2",
+                "docface: an empty array likewise");
+    // An EMPTY container's size is only observable once something follows it:
+    // alone at the end of a token array, the iterators run out and stop in
+    // the right place whatever the count says.
+    shape_check("{\"a\":{},\"b\":1}", AXL_JSON_STRICT, "{a:{},b:1}|c14",
+                "docface: an over-counted EMPTY object would swallow the "
+                "pair after it");
+    // The shape that catches a container `end` one byte too long: the
+    // iterator skips a member's nested children by comparing their start
+    // against the VALUE's end, so the pair AFTER a nested container is the
+    // first casualty.
+    shape_check("{\"a\":{\"b\":[1,{\"c\":2}]},\"d\":3}", AXL_JSON_STRICT,
+                "{a:{b:[1,{c:2}]},d:3}|c29",
+                "docface: a member FOLLOWING a nested container is still "
+                "found, which is what a container's `end` is for");
+    shape_check("[[1,2],[3],[]]", AXL_JSON_STRICT, "[[1,2],[3],[]]|c14",
+                "docface: sibling arrays do not bleed into one another");
+    // Object and array counting are different rules on the same field: an
+    // object counts KEYS, an array counts ELEMENTS. A builder that increments
+    // on every child gives the inner object a size of 4.
+    //
+    // The inner object must be FOLLOWED by a sibling for that to be visible.
+    // On `{"a":1,"b":2}` alone an over-count is invisible -- the iterator
+    // runs out of tokens and stops at the right place anyway -- so that
+    // spelling catches only an under-count while claiming to catch both.
+    // Verified by sabotage: `size = pair_count * 2` leaves the flat document
+    // passing and makes this one yield `z` as a third member of the inner
+    // object.
+    shape_check("{\"o\":{\"a\":1,\"b\":2},\"z\":9}", AXL_JSON_STRICT,
+                "{o:{a:1,b:2},z:9}|c25",
+                "docface: an object's size counts members, not tokens -- an "
+                "over-count walks into the following sibling");
+
+    // --- the token array GROWS mid-document, with a container still open --
+    //
+    // The array starts at 16 entries and doubles by allocating a new block
+    // and freeing the old one. This document reaches 20 tokens, and the
+    // reallocation lands while the inner object is OPEN -- so a builder that
+    // remembered its containers as AxlJsonTok POINTERS rather than indices
+    // patches freed memory here, and nowhere else in this file: every other
+    // fixture stays under 16 tokens.
+    shape_check("[0,1,2,3,4,5,6,7,8,9,10,11,{\"k\":1,\"m\":2},13,14]",
+                AXL_JSON_STRICT,
+                "[0,1,2,3,4,5,6,7,8,9,10,11,{k:1,m:2},13,14]|c47",
+                "docface: a container held open across the token array's "
+                "growth is still patched correctly");
+
+    // --- dialect features reach the builder through the same events -------
+    //
+    // The trailing comma must not be counted as an element, and the array it
+    // closes is FOLLOWED by a sibling so an over-count is visible: at the end
+    // of the token array it would not be.
+    shape_check("{a:[1,],b:2}", AXL_JSON_JSON5, "{a:[1],b:2}|c12",
+                "docface: a JSON5 trailing comma adds no element, and an "
+                "over-count would yield the next key as one");
+    shape_check("{a:1,b:'x',c:0xFF,d:NaN,}", AXL_JSON_JSON5,
+                "{a:1,b:\"x\",c:0xFF,d:NaN}|c25",
+                "docface: unquoted keys, single quotes, hex and NaN all "
+                "build the same tree a quoted document would");
+    // A string token's [start,end) brackets the INNER content, so its `end`
+    // is the index OF the closing quote while a container's is one PAST the
+    // brace. The builder reconstructs both from ev.text, which is the only
+    // field carrying the distinction -- ev.offset points at the quote.
+    shape_check("\"hi\"", AXL_JSON_STRICT, "\"hi\"|c4",
+                "docface: a STRING root counts its closing quote");
+    shape_check("'hi'", AXL_JSON_JSON5, "\"hi\"|c4",
+                "docface: and a single-quoted root, whose closing quote is a "
+                "different byte");
+    shape_check("{\"a\":\"\",\"b\":\"x\"}", AXL_JSON_STRICT,
+                "{a:\"\",b:\"x\"}|c16",
+                "docface: an EMPTY string is a zero-length span, not a "
+                "missing one");
+    // Source length and decoded length differ here, in both directions: the
+    // key is 6 source bytes decoding to 1 character, the value 4 decoding to
+    // 3. A builder sizing a span from the DECODED length lands mid-document.
+    shape_check("{\"\\u0041\":\"a\\tb\"}", AXL_JSON_STRICT,
+                "{A:\"a\tb\"}|c17",
+                "docface: a span is measured in SOURCE bytes, not decoded "
+                "ones");
+
+    // --- the post-passes still see a correctly built array ----------------
+    //
+    // AXL_JSON_REJECT_DUPLICATES walks the finished tokens through
+    // axl_json_tok_subtree_end, which consumes `size` RECURSIVELY -- a
+    // stricter oracle than the iterators, and one that mis-pairs keys in
+    // exactly the last-child positions where they are blind.
+    parse_err_check("{\"o\":{\"a\":1,\"a\":2},\"z\":3}",
+                    AXL_JSON_STRICT | AXL_JSON_REJECT_DUPLICATES,
+                    "@13 1:14: duplicate key",
+                    "docface: the duplicate-key pass walks the built array by "
+                    "size and finds the SECOND of the offending pair");
+    shape_check("{\"o\":{\"a\":1,\"b\":2},\"z\":3}",
+                AXL_JSON_STRICT | AXL_JSON_REJECT_DUPLICATES,
+                "{o:{a:1,b:2},z:3}|c25",
+                "docface: and accepts the same shape with distinct keys, so "
+                "the row above is not passing on a mis-walk");
+
+    // --- the depth bound is reported where the container OPENS ------------
+    parse_err_check("[[[[[1]]]]]", AXL_JSON_STRICT | AXL_JSON_DEPTH(2),
+                    "@2 1:3: nesting too deep",
+                    "docface: DEPTH points at the bracket that exceeded the "
+                    "bound, not at the value inside it");
+
+    // --- running out of memory still reports a POSITION -------------------
+    //
+    // The face makes TWO allocations, where the recursive parser made one:
+    // the builder stack up front, then the token array as it doubles. Both
+    // are covered here, because the second one reported line 0 column 0 --
+    // AxlJsonError documents both as 1-based and axl_json_error_format()
+    // prints them verbatim, so an out-of-memory rendered as "0:0:" with the
+    // caret at column 0, out of contract. It came from assigning err.code
+    // directly instead of recording through scan_fail(), which is the only
+    // thing in the lexer that derives line and column.
+    //
+    // Found by review rather than by a test, because nothing else in the
+    // suite injects an allocation failure into a parse.
+    {
+        const struct {
+            unsigned    nth;
+            const char *want;
+            const char *msg;
+        } row[] = {
+            { 1, "@0 1:1: out of memory",
+              "docface: a builder-stack OOM is positioned at the start of "
+              "the document" },
+            { 2, "@1 1:2: out of memory",
+              "docface: a token-array OOM is positioned where the scan had "
+              "reached, not at 0:0" },
+        };
+        const char *doc = "{\"a\":1}";
+        size_t      i;
+
+        for (i = 0; i < sizeof(row) / sizeof(row[0]); i++) {
+            AxlJsonReader r;
+            char          out[AXL_JSON_ERROR_BUF_MAX + 32];
+            bool          parsed;
+
+            /* Armed as late as possible and disarmed immediately: the counter
+               is global and counts EVERY axl_malloc, so anything between
+               these two lines would shift which allocation fails. */
+            axl_mem_fail_next_alloc(row[i].nth);
+            parsed = axl_json_parse(doc, axl_strlen(doc),
+                                          AXL_JSON_STRICT, &r);
+            axl_mem_fail_next_alloc(0);
+
+            if (parsed) {
+                axl_json_free(&r);
+                test_check(false, row[i].msg);   /* the OOM never fired */
+                continue;
+            }
+            test_check(err_render(&r, out, sizeof(out))
+                           && axl_strcmp(out, row[i].want) == 0,
+                       row[i].msg);
+        }
+    }
+}
+
 static void
 test_bytes_compare(void)
 {
@@ -5695,6 +15019,7 @@ test_data_main(int argc, char **argv)
     test_hash_get_keys_values();
     test_array();
     test_array_extended();
+    test_array_sized_steal_clear();
     test_array_insert_prepend();
     test_hmac_rfc_vectors();
     test_hmac_edge_cases();
@@ -5709,9 +15034,39 @@ test_data_main(int argc, char **argv)
     test_json_parse();
     test_json_get_object();
     test_json5_parse();
+    test_json_unicode_escapes();
+    test_json_nul_escape_union();
+    test_json5_line_continuations();
+    test_json_error_reporting();
+    test_json_error_position();
+    test_json_reader_consumed();
+    test_json_error_argument_paths();
+    test_json_accessor_utf8_integrity();
     test_json_load_file();
     test_json_build();
     test_json5_build();
+    test_json_sinks();
+    test_json_sources();
+    test_json_value_mirror();
+    test_json_object_iter();
+    test_json_decode_string();
+    test_json_writer_format();
+    test_json_comment_depth0();
+    test_json_comment_multiline();
+    test_json_ensure_ascii();
+    test_json_writer_utf8_mode();
+    test_json_error_format();
+    test_json_get_double();
+    test_json_writer_roundtrip();
+    test_json_encoding_boundary();
+    test_json_line_endings();
+    test_json_scanner();
+    test_json_document_face();
+    test_json_sort_keys();
+    test_json_reject_duplicates();
+    test_json_utf8_strict_read();
+    test_json_utf8_repair_read();
+    test_json_iter_aliasing();
     test_json_print();
     test_slist();
     test_list();
@@ -5783,6 +15138,8 @@ test_data_main(int argc, char **argv)
     test_compress_interop_inbound();
     test_compress_errors();
     test_compress_writer();
+    test_compress_writer_ownership();
+    test_compress_filters_refuse_a_transcoding_peer();
     test_compress_reader();
     test_checksum_type_length();
 

@@ -493,6 +493,23 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
         return AXL_ERR;
     }
 
+    /* This wrapper does not queue. Behind another caller's send it would be
+       accepted, queued, and then never started: the promotion is driven by the
+       ACTIVE send's completion source, which sits on that caller's loop, and
+       the loop running here is this call's ephemeral one. The result was the
+       full timeout burned with nothing sent (design §6b defect 4) — worse than
+       the fail-fast this restores, because the caller learns 10 s late.
+
+       Not a transport refusal: axl_tcp_send_async still accepts every send
+       (design §3.2). It is the SYNCHRONOUS shell declining a job it cannot
+       finish inside its own call, which is what §7 means by "the sync wrapper
+       must opt OUT of queueing". A socket with more than one writer wants the
+       async API. */
+    if (axl_tcp_send_pending(sock)) {
+        axl_debug("sync send: another send owns the transport - refusing");
+        return AXL_ERR;
+    }
+
     if (timeout_ms == 0) {
         timeout_ms = 10000;
     }
@@ -535,15 +552,27 @@ axl_tcp_send(AxlTcp *sock, const void *data, size_t size, size_t timeout_ms)
     axl_loop_run(loop);
     tcp_sync_disarm_poll_tick(loop, poll_src);
 
+    /* The loop can return with the send still outstanding — Ctrl-C, or any
+       other source quitting it — and everything the token points at dies on
+       the next three lines: the cancellable its cancel source is armed on, the
+       loop that source and its drain sit on, and the `r` frame its callback
+       would write into. The timeout path leaves nothing behind (the cancel
+       retires it), so this is the abnormal exit only; drop the token without
+       its callback, which is exactly the case axl_tcp_send_drop_token exists
+       for. r.status stays AXL_ERR: the send did not complete. */
+    if (!r.done) {
+        (void)axl_tcp_send_drop_token(sock, on_sync_complete, &r);
+    }
+
     axl_cancellable_free(cancel);
     axl_loop_free(loop);
     sock->async_loop = saved_loop;
 
-    /* on_send_complete / on_send_cancel already zero send_source /
-       send_cancel_source on every send path (so axl_tcp_send_in_flight stays
-       accurate). Even if one didn't, source ids are now process-globally
-       unique (axl-loop.c), so a stale id can't collide with another loop's
-       source — no post-teardown clearing needed here. */
+    /* Every send path routes its source teardown through
+       axl_tcp_send_drop_sources, so send_source is already zero. Even if one
+       didn't, source ids are process-globally unique (axl-loop.c), so a stale
+       id can't collide with another loop's source — no post-teardown clearing
+       needed here. */
 
     return r.status;
 }
@@ -683,6 +712,19 @@ finalize_sock(AxlTcp *sock)
     if (sock->tcp_sb != NULL && sock->tcp_handle != NULL) {
         axl_efi_call(sock->tcp_sb->DestroyChild, 2, sock->tcp_sb,
                      sock->tcp_handle);
+    }
+    /* A retired-send drain is walking this socket's callbacks and still hands
+       `sock` to each of them — freeing here would hand the rest a dangling
+       pointer. The drain does the free once its last callback has returned
+       (axl_tcp_send_drain_done). Clear the firmware handles on the way out:
+       the teardown above already released them, and a later callback asking
+       this socket for, say, its peer address must get a clean failure rather
+       than a call into a destroyed child. */
+    if (sock->send_draining) {
+        sock->tcp4          = NULL;
+        sock->tcp_handle    = NULL;
+        sock->free_deferred = true;
+        return;
     }
     axl_free(sock);
 }
@@ -879,6 +921,20 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
         return;
     }
 
+    /* A socket is torn down ONCE. The second call is not hypothetical: this
+       close retires every pending send and runs their callbacks before it
+       returns, and closing the socket from a send callback is ordinary
+       consumer code (on_response_sent -> reset_connection -> axl_tcp_close,
+       s9p_on_send, sdk/examples/tcp-echo-server.c). Re-running the teardown
+       would Cancel and Close firmware state this call has already released,
+       submit a second close token, and — on the paths that finalize inline —
+       free the socket while this call is still using it.
+       docs/AXL-Tcp-Queue-Design.md §6b defect 2. */
+    if (sock->closed) {
+        return;
+    }
+    sock->closed = true;
+
     /* A GRACEFUL EFI_TCP4.Close() at a raised TPL hard-wedges the loop when the
        connection still has un-flushed outbound TCP data. Close() (AbortOnClose
        FALSE) flushes the send buffer and drives the active-close FIN handshake
@@ -972,14 +1028,7 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
         sock->rx_token.CompletionToken.Event = NULL;
     }
 
-    if (sock->send_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->send_source);
-        sock->send_source = 0;
-    }
-    if (sock->send_cancel_source > 0) {
-        axl_loop_remove_source(sock->async_loop, sock->send_cancel_source);
-        sock->send_cancel_source = 0;
-    }
+    axl_tcp_send_drop_sources(sock);
     if (sock->tcp4 != NULL && sock->tx_token.CompletionToken.Event != NULL) {
         axl_efi_call(sock->tcp4->Cancel, 2, sock->tcp4,
                      &sock->tx_token.CompletionToken);
@@ -987,6 +1036,25 @@ tcp_close_impl(AxlTcp *sock, bool abortive)
             (AxlEventHandle)sock->tx_token.CompletionToken.Event);
         sock->tx_token.CompletionToken.Event = NULL;
     }
+    /* Retire every pending send — port of EDK2 SockConnFlush, which runs
+       SockFlushPendingToken over the PROCESSING list as well as SndTokenList.
+       Both halves matter, for the same reason: an accepted send's callback
+       must always fire, or its caller waits forever with its borrowed buffer
+       pinned — and the ciphertext copy axl_tls_write_async frees from that
+       callback leaks with it. docs/AXL-Tcp-Queue-Design.md §3.5.
+
+       The ACTIVE send is included because a send the caller merely QUEUED can
+       have been promoted into that slot behind their back. Firing its callback
+       was not implementable while callbacks ran inline: it re-entered teardown
+       (on_response_sent -> reset_connection -> axl_tcp_close) and wedged the
+       run. It is implementable now — the callbacks are retired first and run
+       from one drain, and the re-entrant close they trigger returns at the
+       `closed` guard above rather than tearing this socket down twice.
+
+       Synchronous, unlike every other retirement: the caller's loop may be
+       freed the moment this returns (test_tcp_send_async_flush_on_close does
+       exactly that), so a callback left for the next tick would never run. */
+    axl_tcp_send_flush(sock, AXL_CANCELLED);
 
     if (sock->connect_source > 0) {
         axl_loop_remove_source(sock->async_loop, sock->connect_source);

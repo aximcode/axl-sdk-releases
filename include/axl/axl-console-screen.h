@@ -84,7 +84,7 @@ typedef void (*AxlConsoleScreenSink)(
     const char *bytes,  ///< serialized VT bytes (not NUL-terminated)
     size_t      len,    ///< byte count for this chunk
     void       *user    ///< opaque context from the snapshot call
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Create a screen model of @p rows x @p cols cells.

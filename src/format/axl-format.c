@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <axl/axl-format.h>
+#include <axl/axl-math.h>
 
 // ---------------------------------------------------------------------------
 // Number formatting
@@ -267,7 +268,7 @@ emit_float(AxlWriteFunc write_fn, void *ctx, double value, char conv,
     char echar = is_upper ? 'E' : 'e';
 
     /* NaN: no sign. */
-    if (value != value) {
+    if (axl_isnan(value)) {
         const char *s = is_upper ? "NAN" : "nan";
         int pad = width > 3 ? width - 3 : 0;
         if (!flag_left) { write_chars(write_fn, ctx, ' ', (size_t)pad); }
@@ -282,7 +283,7 @@ emit_float(AxlWriteFunc write_fn, void *ctx, double value, char conv,
     else if (flag_space) { sign = ' '; }
 
     /* Infinity. */
-    if (value > 1.7976931348623157e308) {
+    if (axl_isinf(value)) {
         const char *s = is_upper ? "INF" : "inf";
         int body = 3 + (sign ? 1 : 0);
         int pad  = width > body ? width - body : 0;

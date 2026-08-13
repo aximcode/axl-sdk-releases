@@ -29,11 +29,15 @@ make -C "$PROJECT_DIR" \
     ARCH="$_native_arch" ${TOOLCHAIN:+TOOLCHAIN=$TOOLCHAIN} all tests 2>&1 | tail -3
 
 NATIVE_DIR="$PROJECT_DIR/out/native-$_native_arch"
-TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p)
+TEST_APPS=(AxlTestMem AxlTestString AxlTestIO AxlTestLog AxlTestData AxlTestUtil AxlTestLoop AxlTestSmbus AxlTestTask AxlTestNet AxlTestIpmi AxlTestPlatform AxlTestEvent AxlTestRuntime AxlTestXml AxlTestFsProvider AxlTestGfx AxlTestTruetype AxlTestPixmap AxlTestMath AxlTestInput AxlTestFileView AxlTestPieceTree AxlTestFind AxlTestDriver AxlTestCursor AxlTestCompositor AxlTestGfxRegion AxlTestCrypto AxlTestJose AxlTestNvme AxlTestAta AxlTestScsi AxlTestSmart AxlTestHii AxlTestAuth AxlTestFw AxlTestVterm AxlTest9p AxlTestJsonConformance)
 # Tests deliberately NOT in the default run, each with a reason. The
 # guard below treats anything here as accounted-for.
 TEST_APPS_SKIP=(
     AxlTestCpuIdle   # ~3s perf workload; run only by test-cpu-idle.sh
+    # Needs the external corpora mounted from deps/ (gitignored) and its case
+    # count moves with what has been fetched, which the ratchet cannot accept.
+    # Run by test-json-corpus-qemu.sh, from the bucket that opts out.
+    AxlTestJsonCorpus
 )
 
 # Debug override: TEST_APPS_ONLY="AxlTestGfx AxlTestTruetype" runs a subset
@@ -133,6 +137,15 @@ EOF
 test_build_image
 
 echo "=== AXL Integration Tests ($TEST_ARCH) ==="
+
+# The unit suite's CPU profile is dominated by firmware boot, so the sampler's
+# advisory fired on every run and told us nothing actionable. Measure wall
+# clock instead -- same trade run-qemu.sh makes for its duration gate.
+test_cpu_advisory_off
+# ~47s on both arches as of 8500 tests. 2x that: a breach means something got
+# materially slower, not that the box was busy. Raise it deliberately, in a
+# commit that says why.
+TEST_MAX_DURATION="${TEST_MAX_DURATION:-95}"
 
 test_build_qemu_cmd
 # AxlTestNet does several "self-connect" tests against the guest's

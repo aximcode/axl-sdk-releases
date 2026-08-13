@@ -756,6 +756,83 @@ test_vterm_cursor_jump_flushes_the_run(void)
     axl_vterm_free(v);
 }
 
+/* The adapter re-encodes libvterm's decoded codepoints back to UTF-8, and what
+ * it re-encodes is NOT guaranteed to be a Unicode scalar value: libvterm's
+ * decoder folds surrogates to U+FFFD but lets an over-long-range 4/5/6-byte
+ * form through with its raw value (encoding.c only range-checks for overlongs).
+ * "\xF4\x90\x80\x80" decodes to U+110000 -- one past the last scalar value --
+ * and reaches putglyph. Re-encoding it verbatim would put ill-formed UTF-8 on
+ * the wire for every downstream consumer of output_text. The contract is
+ * U+FFFD, matching what libvterm itself substitutes for the malformed input it
+ * DOES catch. */
+static void
+test_vterm_out_of_range_codepoint_becomes_replacement(void)
+{
+    VtermProbe p = {0};
+    AxlVterm *v = NULL;
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
+    axl_vterm_feed(v, "\xF4\x90\x80\x80", 4);   /* U+110000: above U+10FFFF */
+    axl_vterm_flush(v);
+
+    test_check(p.text_calls == 1, "over-range codepoint still emits one run");
+    test_check(axl_strcmp(p.text, "\xEF\xBF\xBD") == 0,
+               "U+110000 is re-encoded as U+FFFD, not as ill-formed UTF-8");
+    axl_vterm_free(v);
+}
+
+/* Same defect through libvterm's 5-byte legacy form, whose value cannot fit a
+ * 4-byte sequence at all: U+200000 would have written a 0xF8 lead byte plus
+ * three continuation bytes -- not merely out of range, but structurally
+ * impossible UTF-8. */
+static void
+test_vterm_five_byte_form_becomes_replacement(void)
+{
+    VtermProbe p = {0};
+    AxlVterm *v = NULL;
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
+    axl_vterm_feed(v, "\xF8\x88\x80\x80\x80", 5);   /* U+200000 */
+    axl_vterm_flush(v);
+
+    test_check(p.text_calls == 1, "5-byte legacy form still emits one run");
+    test_check(axl_strcmp(p.text, "\xEF\xBF\xBD") == 0,
+               "U+200000 is re-encoded as U+FFFD");
+    axl_vterm_free(v);
+}
+
+/* The guard above must not over-reject: a legitimate astral-plane codepoint is
+ * still a 4-byte sequence and must round-trip byte for byte. */
+static void
+test_vterm_astral_codepoint_round_trips(void)
+{
+    VtermProbe p = {0};
+    AxlVterm *v = NULL;
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
+    axl_vterm_feed(v, "\xF0\x9F\x98\x80", 4);   /* U+1F600 GRINNING FACE */
+    axl_vterm_flush(v);
+
+    test_check(p.text_calls == 1, "astral codepoint emits one run");
+    test_check(axl_strcmp(p.text, "\xF0\x9F\x98\x80") == 0,
+               "U+1F600 round-trips byte for byte");
+    axl_vterm_free(v);
+}
+
+/* U+10FFFF is the LAST scalar value -- the boundary the over-range guard must
+ * sit above, not on. Paired with the U+110000 case this pins the exact edge. */
+static void
+test_vterm_last_scalar_value_round_trips(void)
+{
+    VtermProbe p = {0};
+    AxlVterm *v = NULL;
+    v = axl_vterm_new(25, 80, &probe_ops, &p);
+    axl_vterm_feed(v, "\xF4\x8F\xBF\xBF", 4);   /* U+10FFFF */
+    axl_vterm_flush(v);
+
+    test_check(p.text_calls == 1, "U+10FFFF emits one run");
+    test_check(axl_strcmp(p.text, "\xF4\x8F\xBF\xBF") == 0,
+               "U+10FFFF round-trips byte for byte");
+    axl_vterm_free(v);
+}
+
 static void
 test_vterm_sgr_truecolor_becomes_rgb_pen(void)
 {
@@ -1607,6 +1684,11 @@ test_vterm_main(
 {
     (void)argc;
     (void)argv;
+    /* The header is not decoration: the harness brackets each binary between
+       this line and its Results footer, and a binary without one is invisible
+       to both the stalled-binary detector and the per-binary leak verdict
+       check (test_check_leaks, test/integration/common-test.sh). */
+    test_print_header("AxlVterm");
 
     test_vterm_new_uses_axl_heap();
     test_putglyph_positions_and_width();
@@ -1625,6 +1707,10 @@ test_vterm_main(
     test_vterm_char_width_zero_for_combining();
     test_vterm_coalesces_glyphs_into_one_run();
     test_vterm_cursor_jump_flushes_the_run();
+    test_vterm_out_of_range_codepoint_becomes_replacement();
+    test_vterm_five_byte_form_becomes_replacement();
+    test_vterm_astral_codepoint_round_trips();
+    test_vterm_last_scalar_value_round_trips();
     test_vterm_sgr_truecolor_becomes_rgb_pen();
     test_vterm_declined_scrollrect_decomposes_to_moverect_and_erase();
     test_vterm_accepted_scrollrect_suppresses_decomposition();

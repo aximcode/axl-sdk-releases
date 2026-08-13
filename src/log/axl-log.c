@@ -12,7 +12,6 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include "../backend/axl-backend.h"
-#include <axl/axl-env.h>
 #include <axl/axl-log.h>
 #include <axl/axl-str.h>
 #include <axl/axl-format.h>
@@ -127,13 +126,12 @@ get_effective_level(const char *domain)
 }
 
 static void
-print_console_timestamp(void)
+print_console_timestamp(const AxlRealtime *stamp)
 {
-    AxlTime time;
-
-    if (axl_backend_get_time(&time) != AXL_OK) {
+    if (stamp == NULL) {
         return;
     }
+    const AxlRealtime time = *stamp;
 
     char buf[24];
     int pos = 0;
@@ -163,13 +161,10 @@ print_console_timestamp(void)
        For machine ordering use AxlLogEntry.timestamp from the ring
        handler, which uses raw monotonic-us and is strictly
        monotonic. */
+    /* Already normalized by the dispatcher (see log_dispatch) -- render it.
+       Taking our own monotonic reading here is what made the console and the
+       file sink print different fractions for one record. */
     unsigned usec = time.nanosecond / 1000;
-    if (usec == 0) {
-        uint64_t mono = axl_backend_get_monotonic_us();
-        if (mono > 0) {
-            usec = (unsigned)(mono % 1000000u);
-        }
-    }
     if (usec > 0) {
         buf[pos++] = '.';
         buf[pos++] = '0' + ((usec / 100000) % 10);
@@ -197,6 +192,42 @@ log_dispatch(int level, const char *domain, const char *func,
 {
     unsigned short wide[MSG_BUF_SIZE];
 
+    /* Stamp the record ONCE, here, and hand the same value to the console and
+     * to every sink. Each sink used to read the clock itself, which cost N
+     * firmware GetTime calls per record for N sinks and -- worse -- let two
+     * sinks land on opposite sides of a second boundary, so a serial
+     * transcript and a file log disagreed about when one record happened.
+     *
+     * Only read it if something will render it: a service that suppresses the
+     * console and attaches only the ring sink used to make ZERO firmware
+     * GetTime calls per record, and an RTC read is CMOS I/O plus a UIP wait on
+     * EDK2's PcRtc -- not free, and this runs on every record that clears the
+     * level filter. */
+    AxlRealtime        stamp;
+    const AxlRealtime *stampp = NULL;
+    if ((mConsoleEnabled && mConsoleTimestamp) || mHandlerCount > 0) {
+        if (axl_time_realtime(&stamp) == AXL_OK) {
+            /* Substitute the sub-second fraction HERE, once, rather than in
+             * each renderer. Firmware leaves Nanosecond at 0 on every platform
+             * we test on, so each sink's own fallback fired per record and
+             * took its OWN monotonic reading -- three different fractions for
+             * one record. Agreeing on the second while disagreeing on the
+             * microseconds is the same corruption one digit further down.
+             *
+             * Trigger on the firmware reporting NOTHING, not on the value
+             * rounding to zero: a genuine 0 < nanosecond < 1000 is a real
+             * reading and beats an unrelated epoch's fraction. As ever, the
+             * fraction is sub-second PRECISION, not an ordering key. */
+            if (stamp.nanosecond == 0) {
+                uint64_t mono = axl_backend_get_monotonic_us();
+                if (mono > 0) {
+                    stamp.nanosecond = (uint32_t)((mono % 1000000u) * 1000u);
+                }
+            }
+            stampp = &stamp;
+        }
+    }
+
     // Console output
     if (mConsoleEnabled && axl_st() != NULL &&
         (axl_st()->StdErr != NULL || axl_st()->ConOut != NULL)) {
@@ -205,7 +236,7 @@ log_dispatch(int level, const char *domain, const char *func,
         }
 
         if (mConsoleTimestamp) {
-            print_console_timestamp();
+            print_console_timestamp(stampp);
         }
 
         if (level <= AXL_LOG_TRACE) {
@@ -319,7 +350,7 @@ log_dispatch(int level, const char *domain, const char *func,
                 continue;
             }
         }
-        mHandlers[i](level, domain, msg_buf, mHandlerData[i]);
+        mHandlers[i](level, domain, msg_buf, stampp, mHandlerData[i]);
     }
 
     // Fatal level check
@@ -579,8 +610,42 @@ apply_one_entry(const char *p, const char *end)
 void
 axl_log_init_from_env(void)
 {
-    const char *v = axl_getenv("AXL_LOG_LEVEL");
-    if (v == NULL || *v == '\0') {
+    /* Read the raw shell value rather than axl_getenv, which returns an
+     * OWNED heap copy this module has no way to release: AxlLog must not
+     * call axl_free (axl-mem.c logs through us, and closing that loop is
+     * the circular dependency the whole module layout exists to avoid).
+     * Not freeing it is not an option either — it leaked once per image
+     * for as long as AXL_LOG_LEVEL was set, which the teardown leak
+     * report duly showed. The backend hands back a BORROWED pointer into
+     * the shell's own storage, and axl_ucs2_to_utf8_buf decodes it into
+     * this frame, so the whole path allocates nothing. */
+    char buf[256];
+    const unsigned short *wide =
+        axl_backend_shell_getenv((const unsigned short *)L"AXL_LOG_LEVEL");
+    if (wide == NULL) {
+        return;
+    }
+
+    /* Refuse a value too long for the frame instead of taking the prefix.
+     * axl_ucs2_to_utf8_buf truncates at a CODEPOINT boundary, which for a
+     * comma-separated list lands mid-ENTRY: "...,mem:off" clipped to
+     * "...,mem:of" parses as an unknown keyword, which this function
+     * deliberately ignores in silence — so a half-applied configuration
+     * would look exactly like a fully-applied one. Ignoring the whole
+     * value is at least ONE coherent behavior, and it is documented.
+     * 255 bytes is far past what the parser can act on anyway: the table
+     * holds 8 domains of at most 15 characters. */
+    size_t need = 1;
+    for (const unsigned short *p = wide; *p != 0; p++) {
+        need += (*p < 0x80) ? 1 : (*p < 0x800) ? 2 : 3;
+    }
+    if (need > sizeof(buf)) {
+        return;
+    }
+
+    axl_ucs2_to_utf8_buf(wide, buf, sizeof(buf));
+    const char *v = buf;
+    if (*v == '\0') {
         return;
     }
     /* Walk comma-separated entries. */
@@ -669,9 +734,15 @@ axl_log_remove_handler(AxlLogHandler handler)
 }
 
 void
+axl_log_set_console_enabled(bool enable)
+{
+    mConsoleEnabled = enable;
+}
+
+void
 axl_log_suppress_console(void)
 {
-    mConsoleEnabled = false;
+    axl_log_set_console_enabled(false);
 }
 
 void

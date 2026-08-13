@@ -34,6 +34,8 @@
 #ifndef AXL_CONSOLE_DEVICE_H
 #define AXL_CONSOLE_DEVICE_H
 
+#include <axl/axl-macros.h>   /* AXL_CB_NOEXCEPT on callback declarations */
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -74,7 +76,7 @@ typedef struct {
     uint32_t min_gap_ms;        ///< (read_physical only) drop ANY key arriving within this
                                 ///< gap of the previous one. 0 = OFF (default). Same gating
                                 ///< caveat as @a debounce_ms.
-    bool (*key_filter)(void *user, const void *key);
+    bool (*key_filter)(void *user, const void *key) AXL_CB_NOEXCEPT;
                                 ///< (read_physical only) peek each physical key the read loop
                                 ///< reads BEFORE it is forwarded to the shell; return true to
                                 ///< CONSUME it (the shell never sees it) -- e.g. a terminal

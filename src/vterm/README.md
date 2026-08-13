@@ -27,7 +27,7 @@ shape the tap could never implement, so it is the wrong contract for a
 two-producer world. Layer 2's push op-stream is the only shape both producers
 speak.
 
-Two consequences of binding Layer 2 that this adapter absorbs so the consumer
+Three consequences of binding Layer 2 that this adapter absorbs so the consumer
 does not:
 
 - **Glyph coalescing.** libvterm's `putglyph` is a *positioned single glyph*, but
@@ -44,6 +44,18 @@ does not:
   so a burst of `setpenattr` collapses into one `set_pen`. This is the deliberate
   "Layer 2.5" slice: a minimal piece of Layer 3's bookkeeping, done once here
   instead of in every consumer.
+
+- **Re-encoding, and the fact that it can fail.** `putglyph` hands over decoded
+  *codepoints*, while `output_text` carries *bytes*, so the adapter re-encodes.
+  libvterm's decoder folds the malformed input it catches to U+FFFD, but it only
+  range-checks for overlong forms — a 4/5/6-byte sequence above U+10FFFF arrives
+  here with its raw value. Re-encoding that verbatim would put ill-formed UTF-8
+  on the wire, so the adapter routes every codepoint through
+  `axl_utf8_encode()`, which refuses both over-range values and surrogates, and
+  **substitutes U+FFFD** for anything it refuses. Substituting rather than
+  dropping keeps the byte run and the cell-advance arithmetic in agreement, and
+  matches what libvterm itself does with the malformed input it catches.
+  **`output_text` is therefore always well-formed UTF-8**, whatever was fed in.
 
 ## Two load-bearing returns
 

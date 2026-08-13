@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-net-opts.h:
+/** @file axl-net-opts.h
  *
  * Canonical option bag and bring-up helper for AXL-consuming tools
  * and services that take the same NIC / local-IP / port options on

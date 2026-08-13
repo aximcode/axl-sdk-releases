@@ -2,9 +2,13 @@
 /* Copyright 2026 AximCode */
 
 /** @file axl-stream-internal.h
-    Internal AxlStream layout — shared between the stream backends
-    (file, buffer, text wrapper, console) and the dispatch logic in
-    `axl-stream.c`. Not a public header.
+    Internal AxlStream layout, with exactly ONE consumer: `axl-stream.c`, the
+    dispatch logic and console backend that owns this struct. It exports no
+    functions at all — every backend and wrapper in `src/stream/` (file,
+    buffer, text, compress) builds and serves itself through the PUBLIC
+    `axl_stream_open_custom` / `axl_stream_ctx` / `axl_read` and names nothing
+    in here, so `src/stream/` has no construction or composition path a
+    consumer lacks. See the design doc §11–§14. Not a public header.
 **/
 
 #ifndef AXL_STREAM_INTERNAL_H
@@ -57,10 +61,25 @@ struct AxlStream {
        so an interactive source is never over-read. See the
        line-discipline note in axl-stream.h. */
     bool                interactive;
+    /* Diagnostic label reported by axl_stream_name(), drawn from the closed
+       set the public header publishes ("file", "buffer", ...). Which of the
+       two storage shapes a stream gets follows from HOW it was built, not
+       from what it is: anything routed through axl_stream_open_custom gets a
+       heap copy, and that is now EVERY constructor -- the only literals left
+       are the five static console streams below, which fill this struct
+       directly because they are objects in .data rather than allocations.
+       name_owned is the discriminator, and axl_fclose frees only when it is
+       set, so a literal is never handed to axl_free. NULL reads as "". */
+    const char         *name;
+    bool                name_owned;   /* name is a heap copy — free on close */
+    /* True for every stream axl_stream_new() built, i.e. everything a
+       constructor hands back. The five console streams (axl_stdout and
+       friends) are STATIC objects in .data and leave this false, which is
+       what stops axl_fclose from handing a non-heap address to axl_free.
+       The safe default is deliberate: a new static that forgets the field
+       is still never freed, whereas a flag meaning "static" would have to be
+       remembered to avoid heap corruption. */
+    bool                on_heap;
 };
-
-/* Allocate a stream with the default field initializers. Used by
-   every backend constructor (file, buffer, text wrapper). */
-AxlStream *axl_stream_new(void);
 
 #endif /* AXL_STREAM_INTERNAL_H */

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 AximCode */
 
-/**
- * axl-fs-provider.h:
+/** @file axl-fs-provider.h
  *
  * Filesystem-publisher abstraction. Lets a consumer publish a
  * UEFI-visible filesystem (Shell `dir fsN:`, LoadImage from
@@ -185,7 +184,7 @@ typedef AxlFsStatus (*AxlFsProviderOpen)(
     unsigned            attributes,     ///< AXL_FS_ATTR_* bitmask (CREATE only)
     AxlFsProviderFile **out,            ///< [out] new file handle
     bool               *out_is_dir      ///< [out] true if @p utf8_path is a directory
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Close a previously-opened file handle.
@@ -198,7 +197,7 @@ typedef AxlFsStatus (*AxlFsProviderOpen)(
  * `EFI_FILE_CLOSE` returns `EFI_SUCCESS` regardless, per UEFI 2.11
  * §13.5.4.
  */
-typedef AxlFsStatus (*AxlFsProviderClose)(AxlFsProviderFile *file);
+typedef AxlFsStatus (*AxlFsProviderClose)(AxlFsProviderFile *file) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Read bytes from a regular-file handle.
@@ -213,7 +212,7 @@ typedef AxlFsStatus (*AxlFsProviderRead)(
     AxlFsProviderFile *file,
     void              *buf,             ///< caller-supplied buffer
     size_t            *inout_size       ///< [in] requested / [out] read; 0 = EOF
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Read one directory entry.
@@ -230,7 +229,7 @@ typedef AxlFsStatus (*AxlFsProviderReadDir)(
     AxlFsProviderFile *file,
     AxlFsEntry *out,             ///< [out] entry; valid only if !*out_end
     bool              *out_end          ///< [out] true if no more entries
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Write bytes to a regular-file handle.
@@ -244,7 +243,7 @@ typedef AxlFsStatus (*AxlFsProviderWrite)(
     AxlFsProviderFile *file,
     const void        *buf,
     size_t            *inout_size
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Seek to an absolute byte offset.
@@ -257,7 +256,7 @@ typedef AxlFsStatus (*AxlFsProviderWrite)(
 typedef AxlFsStatus (*AxlFsProviderSeek)(
     AxlFsProviderFile *file,
     uint64_t           position
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Delete the file referenced by @p file.
@@ -270,7 +269,7 @@ typedef AxlFsStatus (*AxlFsProviderSeek)(
  * NULL in the vtable means delete is unsupported (thunk returns
  * `EFI_WARN_DELETE_FAILURE`).
  */
-typedef AxlFsStatus (*AxlFsProviderDelete)(AxlFsProviderFile *file);
+typedef AxlFsStatus (*AxlFsProviderDelete)(AxlFsProviderFile *file) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Flush pending writes for @p file.
@@ -278,7 +277,7 @@ typedef AxlFsStatus (*AxlFsProviderDelete)(AxlFsProviderFile *file);
  * NULL in the vtable means flush is a no-op (thunk returns
  * `EFI_SUCCESS`).
  */
-typedef AxlFsStatus (*AxlFsProviderFlush)(AxlFsProviderFile *file);
+typedef AxlFsStatus (*AxlFsProviderFlush)(AxlFsProviderFile *file) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Populate @p out with this file's metadata.
@@ -290,7 +289,7 @@ typedef AxlFsStatus (*AxlFsProviderFlush)(AxlFsProviderFile *file);
 typedef AxlFsStatus (*AxlFsProviderGetInfo)(
     AxlFsProviderFile *file,
     AxlFsEntry *out
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Apply changes to this file's metadata.
@@ -308,7 +307,7 @@ typedef AxlFsStatus (*AxlFsProviderGetInfo)(
 typedef AxlFsStatus (*AxlFsProviderSetInfo)(
     AxlFsProviderFile       *file,
     const AxlFsEntry *in
-);
+) AXL_CB_NOEXCEPT;
 
 /**
  * @brief Optional volume-level info callback.
@@ -323,7 +322,7 @@ typedef AxlFsStatus (*AxlFsProviderSetInfo)(
 typedef AxlFsStatus (*AxlFsProviderVolumeInfoFn)(
     void                    *backend_ctx,
     AxlFsProviderVolumeInfo *out
-);
+) AXL_CB_NOEXCEPT;
 
 // ---------------------------------------------------------------------------
 // The provider vtable

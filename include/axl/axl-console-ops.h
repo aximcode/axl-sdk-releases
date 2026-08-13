@@ -36,12 +36,12 @@ extern "C" {
  * @{
  */
 #define AXL_CONSOLE_SHIFT_STATE_VALID      0x80000000u ///< the KeyShiftState field is valid
-#define AXL_CONSOLE_RIGHT_SHIFT_PRESSED    0x00000001u
-#define AXL_CONSOLE_LEFT_SHIFT_PRESSED     0x00000002u
-#define AXL_CONSOLE_RIGHT_CONTROL_PRESSED  0x00000004u
-#define AXL_CONSOLE_LEFT_CONTROL_PRESSED   0x00000008u
-#define AXL_CONSOLE_RIGHT_ALT_PRESSED      0x00000010u
-#define AXL_CONSOLE_LEFT_ALT_PRESSED       0x00000020u
+#define AXL_CONSOLE_RIGHT_SHIFT_PRESSED    0x00000001u ///< right Shift is held
+#define AXL_CONSOLE_LEFT_SHIFT_PRESSED     0x00000002u ///< left Shift is held
+#define AXL_CONSOLE_RIGHT_CONTROL_PRESSED  0x00000004u ///< right Ctrl is held
+#define AXL_CONSOLE_LEFT_CONTROL_PRESSED   0x00000008u ///< left Ctrl is held
+#define AXL_CONSOLE_RIGHT_ALT_PRESSED      0x00000010u ///< right Alt is held
+#define AXL_CONSOLE_LEFT_ALT_PRESSED       0x00000020u ///< left Alt is held
 /** @} */
 
 /**
@@ -219,7 +219,7 @@ typedef struct {
  *
  * From the tap, `output_text` carries UTF-8 decoded from the console's UCS-2,
  * **sanitized** the way the firmware sanitizes it: EDK2's `TerminalConOut.c` accepts
- * only printable `0x20..0x7F` plus `{NUL, BS, TAB, LF, CR}` and substitutes `'?'`
+ * only printable `0x20..0x7F` plus `{NUL, BS, TAB, LF, CR}` and substitutes @c '?'
  * for everything else. A UEFI application therefore cannot push raw VT escapes
  * through `OutputString`, and neither can it through this op — forwarding `ESC`
  * verbatim would diverge from firmware semantics and hand any app that prints a
@@ -233,13 +233,13 @@ typedef struct {
      * A consumer that leaves this NULL must assume
      * @ref AXL_CONSOLE_CELLS_ONE_PER_CODEPOINT.
      */
-    void (*set_cell_rule)(void *user, AxlConsoleCellRule rule);
+    void (*set_cell_rule)(void *user, AxlConsoleCellRule rule) AXL_CB_NOEXCEPT;
 
     /** @brief Screen cleared to the current pen's background; cursor home. */
-    void (*clear_screen)(void *user);
+    void (*clear_screen)(void *user) AXL_CB_NOEXCEPT;
 
     /** @brief Absolute cursor move (0-based). */
-    void (*set_cursor)(void *user, int32_t row, int32_t col);
+    void (*set_cursor)(void *user, int32_t row, int32_t col) AXL_CB_NOEXCEPT;
 
     /**
      * @brief A cursor-relative run of UTF-8 text (NOT NUL-terminated).
@@ -247,13 +247,13 @@ typedef struct {
      * Drawn with the pen most recently latched by @c set_pen. Advances the cursor.
      * See the cell-boundary discussion above.
      */
-    void (*output_text)(void *user, const char *utf8, size_t len);
+    void (*output_text)(void *user, const char *utf8, size_t len) AXL_CB_NOEXCEPT;
 
     /** @brief Latch the graphic rendition. @c pen is only valid for this call. */
-    void (*set_pen)(void *user, const AxlConsolePen *pen);
+    void (*set_pen)(void *user, const AxlConsolePen *pen) AXL_CB_NOEXCEPT;
 
     /** @brief Text mode changed (UEFI mode number). Tap-only; `axl-vterm` never calls it. */
-    void (*set_mode)(void *user, uint32_t mode);
+    void (*set_mode)(void *user, uint32_t mode) AXL_CB_NOEXCEPT;
 
     /**
      * @brief The console grid changed size, in character cells.
@@ -285,7 +285,7 @@ typedef struct {
      *
      * Optional. `axl-vterm` never calls it.
      */
-    void (*resize)(void *user, uint32_t cols, uint32_t rows);
+    void (*resize)(void *user, uint32_t cols, uint32_t rows) AXL_CB_NOEXCEPT;
 
     /**
      * @brief Erase a rectangle to the current pen's background.
@@ -297,7 +297,7 @@ typedef struct {
      * unconditionally (libvterm `vterm.c:383` has no NULL guard, unlike its
      * @c moverect call at `vterm.c:369`).
      */
-    void (*erase)(void *user, AxlConsoleRect rect, bool selective);
+    void (*erase)(void *user, AxlConsoleRect rect, bool selective) AXL_CB_NOEXCEPT;
 
     /**
      * @brief Blit @c src onto @c dest. Both rects have identical dimensions.
@@ -311,10 +311,10 @@ typedef struct {
      *
      * The tap never calls this. Optional (NULL ⇒ the caller falls back to erase).
      */
-    void (*moverect)(void *user, AxlConsoleRect dest, AxlConsoleRect src);
+    void (*moverect)(void *user, AxlConsoleRect dest, AxlConsoleRect src) AXL_CB_NOEXCEPT;
 
     /** @brief BEL. */
-    void (*bell)(void *user);
+    void (*bell)(void *user) AXL_CB_NOEXCEPT;
 
     /**
      * @brief Scroll @c rect by @c downward rows and @c rightward cols.
@@ -331,7 +331,7 @@ typedef struct {
      * The tap never calls this. NULL is equivalent to always declining, except that
      * `axl-vterm` then skips straight to the decomposition.
      */
-    int (*scrollrect)(void *user, AxlConsoleRect rect, int32_t downward, int32_t rightward);
+    int (*scrollrect)(void *user, AxlConsoleRect rect, int32_t downward, int32_t rightward) AXL_CB_NOEXCEPT;
 
     /**
      * @brief Set a terminal property. Replaces the former `enable_cursor`/`alt_screen`.
@@ -347,7 +347,7 @@ typedef struct {
      *
      * @c val is only valid for the duration of the call.
      */
-    int (*set_term_prop)(void *user, AxlConsoleProp prop, const AxlConsoleValue *val);
+    int (*set_term_prop)(void *user, AxlConsoleProp prop, const AxlConsoleValue *val) AXL_CB_NOEXCEPT;
 
     /**
      * @brief Clear the consumer's scrollback history (xterm `CSI 3J`).
@@ -358,7 +358,7 @@ typedef struct {
      * (NULL ⇒ `CSI 3J` is a no-op). The visible screen is unaffected — only the
      * off-screen history the consumer owns (libvterm keeps none itself).
      */
-    void (*clear_scrollback)(void *user);
+    void (*clear_scrollback)(void *user) AXL_CB_NOEXCEPT;
 } AxlConsoleOps;
 
 #ifdef __cplusplus
